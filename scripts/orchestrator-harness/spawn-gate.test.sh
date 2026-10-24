@@ -147,7 +147,7 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # load gate at the spawn point, and its rc=76 refusal is handled explicitly (exit 75, nothing
 # consumed) — but no load gate of its OWN, so it belongs in this list by name, not silently.
 # `scripts/orchestrator-harness/lane-exec.sh` (#2163) is the launcher that `exec`s pi (declared below).
-EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/lane-exec.sh scripts/orchestrator-harness/merge-one.sh scripts/review-pr.sh scripts/orchestrator-harness/spawn-gate.sh"
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/lane-exec.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
 got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"

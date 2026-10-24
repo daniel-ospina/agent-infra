@@ -1489,13 +1489,16 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 #     internal `LANES` keeps a lower bound ONLY so the numeric consumers stay numeric; the
 #     dispatch lines print `LANES_DISPLAY` too, so no line in the cycle reintroduces a `0` for a
 #     read that did not happen.
-# ⛔ THE FALLBACK IS A DURABLE-TERMINAL COUNT, NEVER `tmux ls` (#2163 review r8, P1). It used to be
-# `tmux ls | grep -c '^lane-'` with `LANES_UNKNOWN=0`, which is NOT the population it replaced: on a
-# Linux CELL tmux is never the launcher (`wt_launcher` selects `terminal` and refuses `none`,
-# worker-terminal.sh — "on a cell a tmux window is the measured 21-line death"), so the expression
-# reads **0 on a busy cell**, `LANES_UNKNOWN` stays 0, the `lanes_unknown` arm never fires and
+# ⛔ THE FALLBACK IS THE LAUNCH SURFACE'S OWN WORKER COUNT, NOT `tmux ls` (#2163 review r8, P1; reason
+# corrected in cycle 2). It used to be `tmux ls | grep -c '^lane-'` with `LANES_UNKNOWN=0`, which is NOT
+# the population it replaced: `tmux ls` sees ONE of the TWO launch surfaces. Where the cmux daemon
+# answers, `wt_launcher` selects `terminal` and every harness lane is a durable cmux terminal
+# (worker-terminal.sh), so the expression reads **0 on a busy box**; `LANES_UNKNOWN` stays 0, the
+# `lanes_unknown` arm never fires and
 # `[ "$LANES" -ge "$MAX_LANES" ]` is false — the controller then dispatches onto a box that is
-# already full, the exact #2159 OOM direction `lane-reap.sh` exists to close. `wt_count` answers for
+# already full, the exact #2159 OOM direction `lane-reap.sh` exists to close. (tmux IS the launcher
+# where the cmux daemon does not answer — on a launchd Mac AND on a cell, #2210 — so the defect is
+# the single surface, not tmux itself.) `wt_count` answers for
 # EVERY launcher (cmux durable terminals, launchd tmux sessions and the records of both) and treats a
 # worker it cannot measure as LIVE, so it cannot under-count either.
 LANES_UNKNOWN=0

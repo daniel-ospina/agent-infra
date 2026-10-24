@@ -187,10 +187,12 @@ SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$
 OR="${OR:-}"
 
 # ── the worker census (agent-infra#2210) ────────────────────────────────────────────────────────
-# ⛔ THE TMUX NAME MATCH IS DEAD ON A CELL. The harness spawns workers into cmux DURABLE TERMINALS
-# there (worker-terminal.sh's header records the measurement), so `tmux ls | grep -c '^lane-'` answers
-# 0 while lanes run — and this file used that answer to decide whether it may delete caches under a
-# live lane, and to report `lanes:` in `status`. Both read a confident 0 for a busy box.
+# ⛔ THE TMUX NAME MATCH IS DEAD WHERE THE CMUX DAEMON ANSWERS. There the harness spawns workers into
+# cmux DURABLE TERMINALS (worker-terminal.sh's header records the measurement), so
+# `tmux ls | grep -c '^lane-'` answers 0 while lanes run — and this file used that answer to decide
+# whether it may delete caches under a live lane, and to report `lanes:` in `status`. Both read a
+# confident 0 for a busy box. (tmux IS the launch surface where the daemon does NOT answer — on a
+# launchd Mac and on a cell alike, agent-infra#2210 — so the defect is the single surface, not tmux.)
 # The count comes from the launcher module's own census, and UNKNOWN (exit 3) is NOT zero: every
 # caller treats it as "workers may be live", which is the direction that cannot destroy a live lane.
 worker_census() { # stdout: the live worker count; exit 3 when no answer can be had
@@ -1947,9 +1949,12 @@ cmd_check() {
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
   # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
-  # calls it for the process pass. A $O without it still runs (the census falls back to the tmux count
-  # and the doctor says so in its pass line) — which is exactly the "leaked lanes are not judged"
-  # state this list exists to refuse before `start` reports success.
+  # calls it for the process pass. A $O without it still runs (the census falls back to the launch
+  # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
+  # terminals AND tmux sessions (launchd Mac or cell, #2210); `tmux ls` alone sees one of the two
+  # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
+  # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
+  # reports success.
   for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done

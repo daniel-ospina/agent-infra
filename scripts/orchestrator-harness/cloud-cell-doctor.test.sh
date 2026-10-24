@@ -655,6 +655,41 @@ case "$OUT" in
   *) ok 'doctor: the failed-unit outcome has its own wording (an operator can tell it from a transient)' ;;
 esac
 
+# ⛔ THE rc-5 ARM CARRIES ITS OWN SLOT, AND THE SLOT IS DISCRIMINATED (#2163 review r8, P1). The arm
+# used `[ "$rrc" -eq 0 ] && rrc=1` — it only ever RAISED a zero — so a nested reap that recorded
+# cannot-verify (3) swallowed a unit that had CONVERGED TO FAILED and the pass said "cannot verify"
+# over a cell with NO dispatcher. `[ "$RC5" -ne 0 ]` above cannot see that: it passes for 1 AND 3, so
+# a revert to the old shape keeps the suite green. This leg pins the SLOT: rc=5 + an abstaining reap
+# must be rc=1, not 3. RED on revert: fold rc 5 back into `[ "$rrc" -eq 0 ] && rrc=1` and RC5A becomes 3.
+say_case "a FAILED unit OUTRANKS a nested reap's cannot-verify (rc=5 + abstain -> rc=1, not 3)"
+reset_tmux; reset_ps; reset_state; rm -f "$T/sup/calls"
+: > "$T/o/state/roles/.desired"; rm -f "$T/o/.orch.lock" "$T/o/heartbeat"
+printf '5\n' > "$T/sup/rc"
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_ABSTAIN=2 doc doctor; RC5A="$RC"
+rm -f "$T/sup/rc"
+# ⛔ PIN THE PRECONDITION, or the leg cannot tell "the slot held" from "there was nothing to hold":
+# if the abstain plumbing ever stops reaching the doctor's nested reap, `rrc` is 0 and BOTH the old and
+# the new shape yield 1 — the pin would decay silently. The stored reap row is the measurable datum
+# (the doctor truncates the nested result to 160 chars, so `abstained=` is NOT readable from $OUT).
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "3" ] \
+  && ok 'doctor: precondition — the nested reap recorded cannot-verify (3)' \
+  || bad "doctor: the nested reap did NOT record cannot-verify (last_rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")) — this leg proves nothing about dominance"
+[ "$RC5A" -eq 1 ] \
+  && ok 'doctor: a FAILED unit records rc=1 even when the nested reap is cannot-verify (3)' \
+  || bad "doctor: the nested reap's cannot-verify swallowed the FAILED unit (rc=$RC5A, want 1) — the exact defect this arm's own comment names"
+# ⛔ THE *RECORDED PASS LINE* IS THE ARTIFACT, not the log echo: `result=` carries `unit FAILED — no
+# dispatcher`, while `CONVERGED TO FAILED` is log-only wording. Asserting the log token alone cannot
+# see a dropped `result` — the row is what a later reader/sweep reads.
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/doctor.state")" in
+  *'unit FAILED'*) ok 'doctor: …and the RECORDED pass line still names the unit FAILED (not just the log)' ;;
+  *) bad "doctor: the FAILED unit is missing from the recorded pass line — $(sed -n 's/^last_result=//p' "$T/o/state/roles/doctor.state")" ;;
+esac
+case "$OUT" in
+  *'CONVERGED TO FAILED'*) ok 'doctor: …and the operator-facing log names it CONVERGED TO FAILED' ;;
+  *) bad "doctor: the FAILED unit vanished from the log — $OUT" ;;
+esac
+
 # ⛔ A LIVE LOOP RECORD IS NOT A LIVE CONTROLLER (review P0, #2402). The pre-fix
 # `service_controller_present` fell back to `loop_alive`, which reads the DOCTOR's own loop.pid — a
 # tautology in `loop` mode (the only mode a cell runs), so a cell whose controller had DIED read

@@ -219,7 +219,7 @@ echo "== EXEC (lane-exec.sh execs pi; no wrapper survives)"
 # a nested-quote `$( … )` continued across lines (a false positive on a read-only test), and there
 # is nothing to prove by keeping that shape.
 run_exec() { # <stub-out> <log> <prompt>
-  PATH="$T/bin:$PATH" PI_STUB_OUT="$1" bash "$EXEC" --log "$2" --prompt "$3"
+  PATH="$T/bin:$PATH" PI_STUB_OUT="$1" PI_LANE_MODEL="" PI_LANE_PROVIDER="" bash "$EXEC" --log "$2" --prompt "$3"
 }
 run_exec "$T/pi.out" "$T/logs/exec.log" "hello prompt" >/dev/null 2>&1
 rc=$?
@@ -234,8 +234,18 @@ wait "$launcher_pid"
 agent_pid="$(sed -n 's/^pid=//p' "$T/pi2.out" | head -1)"
 eq "$agent_pid" "$launcher_pid" "the launcher's pid IS the agent's pid (exec, not a fork)"
 if kill -0 "$launcher_pid" 2>/dev/null; then bad "no process remains after the turn"; else ok "no process remains after the turn"; fi
-has "$(cat "$T/pi.out")" "args=-p --provider deepseek --model deepseek-v4-flash --no-session hello prompt" \
-  "the canonical headless invocation is passed through"
+has "$(cat "$T/pi.out")" "args=-p --provider deepseek --model deepseek-flash --no-session hello prompt" \
+  "the canonical headless invocation is passed through, with the fleet's RESOLVED default model"
+# ⛔ THE RESOLVED PAIR IS NAMED IN THE LOG (#2208): a lane must not run a different model than its
+# reviewer, and an ambient override must be visible in the artifact rather than only in the argv.
+has "$(cat "$T/logs/exec.log")" "[agent] provider=deepseek model=deepseek-flash" \
+  "the log names the resolved provider/model before the exec"
+# …and the resolution is REAL, not a new literal: an override reaches the argv (driven, not grepped).
+PI_LANE_MODEL=deepseek-v4-pro PI_LANE_PROVIDER=deepseek PATH="$T/bin:$PATH" PI_STUB_OUT="$T/pi3.out" \
+  bash "$EXEC" --log "$T/logs/exec3.log" --prompt "override prompt" >/dev/null 2>&1
+has "$(cat "$T/pi3.out")" "--model deepseek-v4-pro" "a PI_LANE_MODEL override reaches pi's argv"
+has "$(cat "$T/logs/exec3.log")" "[agent] provider=deepseek model=deepseek-v4-pro" \
+  "…and the log names the overridden model, not the default"
 has "$(cat "$T/logs/exec.log")" "[lane-exec]" "the log carries the launcher's own first line"
 has "$(sed -n 's/^prompt=//p' "$T/pi.out")" "hello prompt" "the inline prompt is passed verbatim"
 hasnt "$(sed -n 's/^args=//p' "$T/pi.out")" "--no-session --no-session" "extra args are appended, never duplicated"
@@ -330,9 +340,12 @@ eq "$rc" "0" "CAP: [cap] names the census SOURCE, so a LAUNCHER count is never p
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 # ⛔ THE LAUNCH SURFACE'S OWN CENSUS IS A STUB, AND IT IS DISCRIMINATING (#2163 review r8, P1). The
 # loop's fallback must be `wt_count lane-` (worker-terminal.sh: durable terminals AND tmux sessions,
-# every launcher) and NOT `tmux ls | grep -c '^lane-'`: on a Linux cell tmux is never the launcher, so
-# the tmux expression reads **0 on a busy cell** and the capacity gate stops binding. The stub answers
-# only for the `lane-` prefix, so a call with another argument (or none) reads 0 and fails the leg.
+# every launcher) and NOT `tmux ls | grep -c '^lane-'`: that sees ONE of the TWO launch surfaces, so
+# where the cmux daemon ANSWERS (`wt_launcher` selects `terminal`) the tmux expression reads **0 on a
+# busy box** and the capacity gate stops binding. (tmux IS the launcher where the daemon does not
+# answer — on a launchd Mac AND on a cell, #2210 — so the defect is the single surface, not tmux.)
+# The stub answers only for the `lane-` prefix, so a call with another argument (or none) reads 0 and
+# fails the leg.
 WT_COUNT_CALLS="$T/wt-count.calls"
 : > "$WT_COUNT_CALLS"
 # ⛔ THE ARGUMENT IS RECORDED IN A FILE, not a shell variable: `LANES="$(wt_count lane-)"` runs the
@@ -368,14 +381,17 @@ eq "$LANES_UNKNOWN" "1" "CAP: a wholly unreadable census refuses work"
 eq "$LANES_TOTAL/$ZOMBIES" "?/?" "CAP: unknown totals stay unknown, never 0"
 # The transition arm: no lane-reap.sh at all -> the LAUNCHER's own worker census, LABELLED. Re-source
 # the block so the missing-script resolution runs again (it happens at definition time).
-# ⛔ THE FIXTURE IS THE CELL SHAPE, and it is the whole point of the leg (#2163 review r8, P1):
-# `tmux ls` reports NO lane sessions (on a cell tmux is never the launcher — worker-terminal.sh
-# refuses it), while the launcher census reports 5 live lanes. The tmux double therefore prints NOTHING
+# ⛔ THE FIXTURE IS THE CMUX-ANSWERS SHAPE, and it is the whole point of the leg (#2163 review r8,
+# P1; shape corrected in cycle 3): the daemon answers, so the lanes are DURABLE TERMINALS and `tmux ls`
+# reports NO lane sessions while the launcher census reports 5 live lanes. (tmux IS the launcher where
+# the daemon does not answer — launchd Mac and cell alike, #2210 — so this stub is one of the two
+# shapes, not "the cell shape".) The tmux double therefore prints NOTHING
 # and the expected value comes from `wt_count`, so an implementation that fell back to `tmux ls` reads
 # 0 and this leg goes RED — the direction that dispatches onto a full box.
 cat > "$T/bin/tmux" <<'SH'
 #!/bin/bash
-# A CELL: the tmux server has no lane sessions at all (it is not the launcher here).
+# The cmux-answer shape: the daemon answers, so no lane lives in tmux and the tmux read is 0
+# (tmux IS the launcher where the daemon does not answer — #2210).
 exit 0
 SH
 chmod +x "$T/bin/tmux"

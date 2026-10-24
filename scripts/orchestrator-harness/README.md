@@ -1769,12 +1769,14 @@ lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|terminals|
 * **zombie** — the box's `Z`-state processes. A box full of corpses otherwise reads as busy.
 * **`lanes_src=`** — where the number came from: `census` (this instrument), `unknown` (it ran but
   could not answer), `terminals` (the LAUNCH SURFACE's own worker census — `wt_count lane-` from
-  `worker-terminal.sh`, launcher-agnostic: durable cmux terminals AND launchd tmux sessions, used only
+  `worker-terminal.sh`, launcher-agnostic: durable cmux terminals AND tmux sessions (launchd Mac or
+  cell, #2210), used only
   while a `$O` predates `lane-reap.sh`; named once in the controller log and labelled here, never
-  printed as if it were a census). ⛔ The transition value is NOT `tmux ls | grep -c '^lane-'`: on a
-  Linux cell tmux is never the launcher (`wt_launcher` selects the cmux `terminal` surface and refuses
-  `none` rather than tmux — "a tmux window is the measured 21-line death"), so that expression reads
-  **0 on a busy cell** and the `MAX_LANES` gate stops binding, which is the #2159 OOM direction.
+  printed as if it were a census). ⛔ The transition value is NOT `tmux ls | grep -c '^lane-'`: that
+  sees ONE of the TWO launch surfaces, so on a box where the cmux daemon answers (`wt_launcher` selects
+  the `terminal` surface) it reads **0 on a busy box** and the `MAX_LANES` gate stops binding, which is
+  the #2159 OOM direction. (tmux IS the launcher where the cmux daemon does not answer — on a launchd
+  Mac AND on a cell, #2210 — so the defect is the single surface, not tmux itself.)
 * **`lanes=?/?`** — the census cannot be verified: unreadable (`ps`/`lsof` failed), ambiguous (two
   distinct lane logs), or an unidentifiable pipe identity (the reads succeeded but the platform
   prints no per-pipe name, so a `tee` cannot be shown to be the lane's own writer). `?` is not `0`: "ps is broken" and "nothing is

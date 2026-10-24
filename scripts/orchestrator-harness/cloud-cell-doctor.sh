@@ -2148,7 +2148,10 @@ run_doctor() {
         # failed unit is exactly what `--status` prints as unsupervised, so this pass must not certify it.
         log "[doctor] controller restart NOT launched — ${CONTROLLER_UNIT:-the controller unit} has CONVERGED TO FAILED (start limit): this cell has NO dispatcher and only a human re-arm brings it back"
         result="$result; controller restart not launched (unit FAILED — no dispatcher)"
-        [ "$rrc" -eq 0 ] && rrc=1
+        # ⛔ ITS OWN SLOT, like the `else` arm below (#2163 review r8, P1): `[ "$rrc" -eq 0 ] && rrc=1`
+        # only RAISES a zero, so a nested reap that recorded cannot-verify (3) would swallow this
+        # failure and the pass would say "cannot verify" over a cell whose unit has converged to failed.
+        src_rc=1
       elif [ "$rc" -eq 4 ]; then
         # ⛔ THE SERVICE MANAGER OWNS A CONTROLLER IT HAS STOPPED (review P1, #2402). `start` answers rc 4
         # when an AUTOMATED restart would have to re-arm a unit the manager reports not active — a
