@@ -324,28 +324,79 @@ for _n in 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
   mkdir -p "$FIX/tests/t$_n"
   printf '#!/bin/bash\nexit 0\n' >"$FIX/tests/t$_n/run.sh"
 done
-cheap_runner "$FIX/scripts/runner-nosweep.sh" "tests/t*/run.sh"
-awk '{ if ($0 ~ /^SWEEP_GLOBS=\(/) { print "SWEEP_GLOBS=()"; next } print }' \
+cheap_runner "$FIX/scripts/runner-presweep.sh" "tests/t*/run.sh"
+# ⛔ `SWEEP_GLOBS=""` and NOT `SWEEP_GLOBS=()`: the runner sets `set -uo pipefail`, and under
+# bash 3.2 (macOS `/bin/bash`) expanding an EMPTY ARRAY is an "unbound variable" error, which would
+# take this arm red locally for a reason of its own — `--list-sweeps` names the shell, not the sweep
+# floor. A defined-but-empty scalar expands to one blank line, which the guard filters out, so both
+# bash 3.2 and 5.x report 0 targets (#2754, kept from main across the derivation rewrite).
+# ⛔ The mutant is built from `runner-presweep.sh` (14 hermetic targets, sweep declaration INTACT),
+# and never from `runner-cheap.sh` — that one discovers a SINGLE stand-in, which is below the guard's
+# MIN_SUITES floor of 14. The arms below that need to rebuild a sweep declaration therefore rebuild
+# it from presweep too: after this mutation the `SWEEP_GLOBS=(…)` form is gone by design.
+cp "$FIX/scripts/runner-presweep.sh" "$FIX/scripts/runner-nosweep.sh"
+awk '{ if ($0 ~ /^SWEEP_GLOBS=\(/) { print "SWEEP_GLOBS=\"\""; next } print }' \
   "$FIX/scripts/runner-nosweep.sh" >"$TMP/runner-nosweep.tmp" && mv "$TMP/runner-nosweep.tmp" "$FIX/scripts/runner-nosweep.sh"
-if cmp -s "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-nosweep.sh"; then
+if cmp -s "$FIX/scripts/runner-presweep.sh" "$FIX/scripts/runner-nosweep.sh"; then
   fail "the no-sweep mutation did not change the file"
 else
+  # (a) the mutant is VALID shell — a syntax error here would make the arm's red meaningless
+  if bash -n "$FIX/scripts/runner-nosweep.sh" 2>"$TMP/runner-nosweep.syntax"; then
+    pass "the no-sweep mutant is VALID shell (bash -n clean)"
+  else
+    fail "the no-sweep mutant is not valid shell: $(cat "$TMP/runner-nosweep.syntax")"
+  fi
+  # (b) the mutation is SURGICAL — the mutant lists the same shards, line for line, as the runner it
+  # was built from. ⛔ Measure the INPUTS: two `--list` invocations that both fail compare equal under
+  # `cmp -s`, so asserting only the comparison would pass having read nothing (the exact class this
+  # change is about). The list must be non-empty — 14 is the guard's own MIN_SUITES floor.
+  bash "$FIX/scripts/runner-presweep.sh" --list >"$TMP/sweeps-real-list.txt" 2>&1
+  real_list_rc=$?
+  bash "$FIX/scripts/runner-nosweep.sh" --list >"$TMP/sweeps-mutant-list.txt" 2>&1
+  mutant_list_rc=$?
+  real_list_n="$(grep -c . "$TMP/sweeps-real-list.txt" || true)"
+  if [ "$real_list_rc" -ne 0 ] || [ "$real_list_n" -lt 14 ]; then
+    fail "the fixture runner's own --list is unreadable (rc $real_list_rc, $real_list_n line(s)) — the comparison below would measure nothing"
+  elif [ "$mutant_list_rc" -ne 0 ]; then
+    fail "the no-sweep mutant's --list exited $mutant_list_rc — it cannot be compared to the real list"
+  elif cmp -s "$TMP/sweeps-real-list.txt" "$TMP/sweeps-mutant-list.txt"; then
+    pass "the no-sweep mutant keeps the shard list intact ($real_list_n shard(s), only the sweep declaration moved)"
+  else
+    fail "the no-sweep mutant ALSO changed the shard list: $(diff "$TMP/sweeps-real-list.txt" "$TMP/sweeps-mutant-list.txt" | head -3 | tr '\n' ' ')"
+  fi
+  # (c) …and it really declares no sweeps: 0 non-blank lines from its own `--list-sweeps`
+  bash "$FIX/scripts/runner-nosweep.sh" --list-sweeps >"$TMP/sweeps-mutant-sweeps.txt" 2>&1
+  if [ "$(grep -c . "$TMP/sweeps-mutant-sweeps.txt" || true)" -eq 0 ]; then
+    pass "the no-sweep mutant declares 0 sweep target(s) — the neuter is behavioural"
+  else
+    fail "the no-sweep mutant still declares sweeps: $(tr '\n' ' ' <"$TMP/sweeps-mutant-sweeps.txt")"
+  fi
   guard_rc "$MAIN" "$PR" "$FIX/scripts/runner-nosweep.sh"
   if [ "$RC" -eq 2 ] && grep -q 'syntax target' <<<"$OUT"; then
     pass "a runner with no sweeps exits 2 — the syntax half cannot go uncovered in silence"
   else
     fail "a runner with no sweeps returned rc $RC (want 2, naming the sweeps): $OUT"
   fi
-  # (d) NON-VACUITY — the same $TMP path with the sweep list NON-EMPTY (one real glob, everything
-  # else byte-identical) must PASS. Without this the red above could be attributable to the guard
-  # being handed a file outside the checkout rather than to the emptied list.
+  # (d) NON-VACUITY — the same CHEAP fixture runner with the sweep list NON-EMPTY (one real glob,
+  # everything else byte-identical) must PASS. Without this the red above could be attributable to
+  # the guard being handed a file outside the checkout rather than to the emptied list.
+  # ⛔ THE MUTANT LIVES INSIDE THE FIXTURE CHECKOUT, NEVER IN BARE `$TMP` (#2609 review, found by
+  # this arm going red after the derivation landed). The runner anchors discovery to the tree it
+  # LIVES in, so a copy at `$TMP/runner-onesweep.sh` has no `scripts/` beside it, its `--list`
+  # refuses with rc 2 ("shard list is unreadable") and the control measures that refusal instead of
+  # the sweep floor — the same reason arms 5 and 6b already write `$FIX/scripts/*`.
+  # ⛔ …AND IT DISCOVERS THE FIXTURE'S 14 hermetic targets (`tests/t*/run.sh`), not the real order and
+  # not `$CHEAP` (ONE stand-in): the guard's floor is 14, so a one-shard runner is refused for the
+  # FLOOR and the control would be red for a reason that is not the emptied sweep list. Rebuilt from
+  # `runner-presweep.sh` (the 14-target copy taken BEFORE the sweep declaration was emptied, so the
+  # `SWEEP_GLOBS=(…)` form is still there to substitute) rather than from `runner-cheap.sh`.
   awk '
     /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=(\"scripts/*.sh\")"; next }
     { print }
-  ' "$RUNNER" >"$TMP/runner-onesweep.sh"
-  guard_rc "$MAIN" "$PR" "$TMP/runner-onesweep.sh"
+  ' "$FIX/scripts/runner-presweep.sh" >"$FIX/scripts/runner-onesweep.sh"
+  guard_rc "$MAIN" "$PR" "$FIX/scripts/runner-onesweep.sh"
   if [ "$RC" -eq 0 ]; then
-    pass "control: the same temp-dir path with ONE sweep target PASSES (rc 0) — the red is the emptied list"
+    pass "control: the same fixture path with ONE sweep target PASSES (rc 0) — the red is the emptied list"
   else
     fail "control: a runner with one sweep target returned rc $RC (want 0): $OUT"
   fi
@@ -357,11 +408,11 @@ else
   awk '
     /^  printf .*SWEEP_GLOBS\[@\]/ { print "  :"; next }
     { print }
-  ' "$RUNNER" >"$TMP/runner-silentsweeps.sh"
-  if cmp -s "$RUNNER" "$TMP/runner-silentsweeps.sh"; then
+  ' "$FIX/scripts/runner-onesweep.sh" >"$FIX/scripts/runner-silentsweeps.sh"
+  if cmp -s "$FIX/scripts/runner-onesweep.sh" "$FIX/scripts/runner-silentsweeps.sh"; then
     fail "the silent-sweeps mutation did not change the file"
   else
-    guard_rc "$MAIN" "$PR" "$TMP/runner-silentsweeps.sh"
+    guard_rc "$MAIN" "$PR" "$FIX/scripts/runner-silentsweeps.sh"
     if [ "$RC" -eq 2 ] && grep -q 'syntax target' <<<"$OUT"; then
       pass "a runner whose declaration is intact but whose --list-sweeps prints nothing still exits 2 (the list is READ, not grepped)"
     else
@@ -380,6 +431,15 @@ awk '
   skip { next }
   { print }
 ' "$RUNNER" >"$FIX/scripts/runner-noshards-but-sweeps.sh"
+# ⛔ THE MUTANT MUST BE VALID SHELL (#2754, kept from main across the derivation rewrite). An
+# unparseable mutant would make the red below a SYNTAX failure wearing the floor's message: the arm
+# would pass while measuring nothing about the floor. `bash -n` is the check; the mutant is written
+# into $FIX (inside a checkout) because the runner derives its root from its own location.
+if bash -n "$FIX/scripts/runner-noshards-but-sweeps.sh"; then
+  pass "the empty-discovery mutant is VALID shell (bash -n clean)"
+else
+  fail "the empty-discovery mutant is not valid shell"
+fi
 guard_rc "$MAIN" "$PR" "$FIX/scripts/runner-noshards-but-sweeps.sh"
 if [ "$RC" -eq 2 ]; then
   pass "the shard floor fires even while the sweep floor is satisfied (rc 2)"
@@ -873,13 +933,29 @@ echo "8am. THE FAILING SHARD IS NAMED — deleting the naming must turn this arm
 # sentinels CANNOT pin it (the sentinel is deliberately not a listed shard, so a name would be a
 # false report on a green run). Non-vacuity is built in: the same fixture with `shard_fail` deleted
 # must print NO name, and still exit 1.
+#
+# ⛔ THE FIXTURE IS A TREE, NOT A REWRITTEN LIST (agent-infra#2609 + #2643 interaction, found by
+# THIS arm). #2643 landed on main while the list was still ENUMERATED there, so its fixture rewrote
+# `run_shard <path>` lines in a copy of the runner left in `$TMP`. Under DERIVATION there is no such
+# line to rewrite, and `-` this is the part that fails silently `-` a copy sitting outside a tree
+# anchors its own discovery to the wrong root and refuses (rc 2, list EMPTY), so the arm measured
+# the refusal instead of the naming. The layout below mirrors §12's PROBE: a real fixture root the
+# copy LIVES in, with discovery narrowed to the two committed stand-ins, one passing and one failing.
 NAMED_FAIL="tests/ci-lane-parity/stand-in-fail.sh"
-awk -v cheap="$CHEAP" -v failing="$NAMED_FAIL" '
-  /^run_shard / && $2 !~ /^\"/ { n++; if (n == 1) { print "run_shard " failing; next } }
-  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
+NAMED_FIX="$TMP/named-fixture"
+mkdir -p "$NAMED_FIX/scripts" "$NAMED_FIX/tests/ci-lane-parity"
+# Non-empty sweep: the fixture runner refuses to report success over a sweep that parsed nothing.
+printf '#!/bin/bash\n:\n' >"$NAMED_FIX/scripts/sweepable.sh"
+cp "$ROOT/$CHEAP" "$NAMED_FIX/$CHEAP"
+cp "$ROOT/$NAMED_FAIL" "$NAMED_FIX/$NAMED_FAIL"
+# `stand-in-*.sh` matches BOTH, so the passing shard proves the run is not only its failure.
+awk -v g="tests/ci-lane-parity/stand-in-*.sh" '
+  /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"" g "\" )"; skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
   { print }
-' "$RUNNER" >"$TMP/runner-onefail.sh"
-env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$TMP/runner-onefail.sh" >"$TMP/runner-onefail.out" 2>&1
+' "$RUNNER" >"$NAMED_FIX/scripts/runner-named.sh"
+env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-onefail.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-onefail.out")"
 if [ "$RC" -eq 1 ] && grep -qF "❌ FAILED SHARD: $NAMED_FAIL" <<<"$OUT"; then
@@ -894,11 +970,11 @@ else
 fi
 # NON-VACUITY: same fixture, the naming call deleted. The run must STILL fail (the counter is
 # untouched) and must print NO name — so an arm that passed on any failing run would be caught.
-sed 's/\[ "$shard_errors" -ne "$shard_err0" \] && shard_fail "$1"; //' "$TMP/runner-onefail.sh" >"$TMP/runner-onefail-noname.sh"
-if cmp -s "$TMP/runner-onefail.sh" "$TMP/runner-onefail-noname.sh"; then
+sed 's/\[ "$shard_errors" -ne "$shard_err0" \] && shard_fail "$1"; //' "$NAMED_FIX/scripts/runner-named.sh" >"$NAMED_FIX/scripts/runner-noname.sh"
+if cmp -s "$NAMED_FIX/scripts/runner-named.sh" "$NAMED_FIX/scripts/runner-noname.sh"; then
   fail "the no-name mutation did not change the fixture (the naming call moved — update this arm's sed)"
 else
-  env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$TMP/runner-onefail-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
+  env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-onefail-noname.out")"
   if [ "$RC" -eq 1 ] && ! grep -qF 'FAILED SHARD' <<<"$OUT"; then
@@ -1382,15 +1458,20 @@ echo "8am. ATTRIBUTION — a failed shard is NAMED in the verdict, not only coun
 #       while naming nothing. Without (c), (a) could be satisfied by any future line that happens to
 #       print a path.
 PASS_SHARD="tests/ci-lane-parity/stand-in-shard.sh"
-FAIL_SHARD="tests/ci-lane-parity/stand-in-shard-fail.sh"
-awk -v pass="$PASS_SHARD" -v fails="$FAIL_SHARD" '
-  /^run_shard / && $2 !~ /^\"/ { n++; print "run_shard " (n == 2 ? fails : pass); next }
-  { print }
-' "$RUNNER" >"$TMP/runner-named.sh"
-if cmp -s "$RUNNER" "$TMP/runner-named.sh"; then
-  fail "the attribution fixture rewrote no run_shard line"
+FAIL_SHARD="tests/ci-lane-parity/stand-in-fail.sh"   # the failing file arm 8am above copies in
+# ⛔ PORTED TO DERIVATION. This fixture used to rewrite `run_shard <path>` lines in a copy of the
+# runner left in `$TMP` — there is no such line any more, and a copy sitting OUTSIDE a tree anchors
+# its own discovery to the wrong root and refuses (rc 2, EMPTY list), which would measure the refusal
+# instead of the naming. So this arm reuses the tree fixture arm 8am above already built
+# (`$NAMED_FIX`: a passing and a failing stand-in, discovery narrowed to `stand-in-*.sh`).
+if [ ! -f "$NAMED_FIX/scripts/runner-named.sh" ]; then
+  fail "the attribution fixture is missing — arm 8am above must build \$NAMED_FIX before this arm"
+elif ! grep -qF 'stand-in-*.sh' "$NAMED_FIX/scripts/runner-named.sh" 2>/dev/null; then
+  fail "the attribution fixture was not narrowed to the stand-ins — this arm would run the real list"
 else
-  $FIXTURE_BOUND bash "$TMP/runner-named.sh" >"$TMP/runner-named.out" 2>&1
+  # ⛔ RUN IT WHERE IT LIVES. A copy moved to `$TMP` anchors discovery to `$TMP` and refuses (rc 2,
+  # EMPTY list); the fixture is only a fixture inside its own tree.
+  $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-named.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-named.out")"
   # The verdict block is everything from the `N bash shard(s) failed` line on: the per-shard line is
@@ -1413,11 +1494,11 @@ else
   # contains the failing path and `! grep -qF "$FAIL_SHARD" <<<"$OUT"` would fail this arm on every
   # commit, reddening `bash-suites` for the very reason it exists to attribute.
   awk '{ if ($0 ~ /^shard_record_failure\(\) \{/) { print "shard_record_failure() { :; }"; next } print }' \
-    "$TMP/runner-named.sh" >"$TMP/runner-noname.sh"
+    "$NAMED_FIX/scripts/runner-named.sh" >"$NAMED_FIX/scripts/runner-noname.sh"
   if cmp -s "$TMP/runner-named.sh" "$TMP/runner-noname.sh"; then
     fail "the no-name mutation did not change the fixture"
   else
-    $FIXTURE_BOUND bash "$TMP/runner-noname.sh" >"$TMP/runner-noname.out" 2>&1
+    $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-noname.sh" >"$TMP/runner-noname.out" 2>&1
     RC=$?
     NONAME_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-noname.out")"
     if [ "$RC" -eq 1 ] && ! grep -qF "$FAIL_SHARD" <<<"$NONAME_VERDICT"; then
@@ -1445,18 +1526,25 @@ echo "8an. ATTRIBUTION — a SWEEP failure is named too, so a MIXED run has no u
 # The fixture: every `run_shard` points at the PASSING stand-in (so the run is red ONLY because of the
 # sweep), and SWEEP_GLOBS is narrowed to a temp dir holding one file with a syntax error. Assert the
 # broken file is NAMED in the verdict block and that the run does NOT fall back to `could NOT be named`.
-BROKEN_DIR="$TMP/sweep-broken"
-mkdir -p "$BROKEN_DIR"
-printf 'if then\n' >"$BROKEN_DIR/broken.sh"
-awk -v pass="$PASS_SHARD" -v dir="$BROKEN_DIR" '
-  /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=(\"" dir "/*.sh\")"; next }
-  /^run_shard / && $2 !~ /^\"/ { print "run_shard " pass; next }
+# ⛔ PORTED TO DERIVATION. The old fixture rewrote `SWEEP_GLOBS` and every `run_shard <path>`
+# line in a copy of the runner left in `$TMP`. There is no such list line any more, and a copy
+# outside a tree refuses (rc 2, EMPTY list) — which would measure the refusal, not the sweep naming.
+# So the fixture is a TREE: one passing shard, and a syntax-sweep target with a real syntax error.
+SWEEP_FIX="$TMP/sweepname-fixture"
+mkdir -p "$SWEEP_FIX/scripts" "$SWEEP_FIX/tests/ci-lane-parity"
+printf 'if then\n' >"$SWEEP_FIX/scripts/broken.sh"
+printf '#!/bin/bash\nexit 0\n' >"$SWEEP_FIX/tests/ci-lane-parity/pass.sh"
+awk '\
+  /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"tests/ci-lane-parity/pass.sh\" )"; skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
+  /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=(\"scripts/*.sh\")"; next }
   { print }
-' "$RUNNER" >"$TMP/runner-sweepname.sh"
-if cmp -s "$RUNNER" "$TMP/runner-sweepname.sh"; then
-  fail "the sweep-attribution fixture rewrote neither SWEEP_GLOBS nor a run_shard line"
+' "$RUNNER" >"$SWEEP_FIX/scripts/runner-sweepname.sh"
+if cmp -s "$RUNNER" "$SWEEP_FIX/scripts/runner-sweepname.sh"; then
+  fail "the sweep-attribution fixture rewrote neither SWEEP_GLOBS nor SUITE_GLOBS"
 else
-  $FIXTURE_BOUND bash "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepname.out" 2>&1
+  $FIXTURE_BOUND bash "$SWEEP_FIX/scripts/runner-sweepname.sh" >"$TMP/runner-sweepname.out" 2>&1
   RC=$?
   SWEEP_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepname.out")"
   if [ "$RC" -eq 1 ] && grep -qF "broken.sh" <<<"$SWEEP_VERDICT"; then
@@ -1472,8 +1560,8 @@ else
   # RED CONTROL: gut the recorder that the SWEEP calls, and the same run must go back to the count-only
   # verdict — proving this arm pins the sweep's naming rather than any other line that prints a path.
   awk '{ if ($0 ~ /^shard_named_failure\(\) \{/) { print "shard_named_failure() { :; }"; next } print }' \
-    "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepnoname.sh"
-  $FIXTURE_BOUND bash "$TMP/runner-sweepnoname.sh" >"$TMP/runner-sweepnoname.out" 2>&1
+    "$SWEEP_FIX/scripts/runner-sweepname.sh" >"$SWEEP_FIX/scripts/runner-sweepnoname.sh"
+  $FIXTURE_BOUND bash "$SWEEP_FIX/scripts/runner-sweepnoname.sh" >"$TMP/runner-sweepnoname.out" 2>&1
   RC2=$?
   SWEEP_NONAME="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepnoname.out")"
   if [ "$RC2" -eq 1 ] && ! grep -qF "broken.sh" <<<"$SWEEP_NONAME" && grep -q 'could NOT be named' <<<"$SWEEP_NONAME"; then
@@ -1637,7 +1725,7 @@ printf '#!/bin/bash\nexit 3\n' >"$PROBE/tests/zzz-fail/run.sh"
 FAILRUN="$( cd "$PROBE" && bash scripts/runner.sh 2>&1 )"
 RC="$?"
 if [ "$RC" -eq 1 ] && grep -q 'SHARD FAILED (rc 3): tests/zzz-fail/run.sh' <<<"$FAILRUN" \
-   && grep -q '^   - tests/zzz-fail/run.sh$' <<<"$FAILRUN"; then
+   && grep -qE '^❌ failing shard\(s\): .*zzz-fail/run\.sh' <<<"$FAILRUN"; then
   pass "a failing shard is NAMED inline and in the summary (rc 1, not an anonymous count)"
 else
   fail "a failing shard was not named (rc $RC): $(tr '\n' '|' <<<"$FAILRUN")"

@@ -193,7 +193,11 @@ if [ "${1:-}" = "--list" ]; then
 fi
 
 if [ "${1:-}" = "--list-sweeps" ]; then
-  printf '%s\n' "${SWEEP_GLOBS[@]}"
+  # `${SWEEP_GLOBS[@]+…}` and not a bare expansion: bash 3.2 (macOS) treats `"${A[@]}"` on an
+  # EMPTY array under `set -u` as an unbound variable, so this line exited 1 for an emptied list and
+  # `check-ci-lane-parity`’s §6 fixture reported "the lane’s own sweep list is unreadable" instead of
+  # the no-sweeps floor it was measuring. The same idiom guards SUITE_GLOBS above.
+  printf '%s\n' ${SWEEP_GLOBS[@]+"${SWEEP_GLOBS[@]}"}
   exit 0
 fi
 
