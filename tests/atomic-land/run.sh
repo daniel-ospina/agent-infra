@@ -2853,10 +2853,15 @@ if true; then
     # carries exactly ONE match, so an awk rewritten to keep the FIRST (`if (d=="") d=$0`) would keep
     # them all green while an abort reverted to the benign `Killed` line a fixture prints legitimately —
     # misattribution on the one path whose whole job is attribution (#1185).
-    printf 'Killed\nscenario 7d done\nbash: line 7: FOO: unbound variable\n' >"$_sv/twomatch.log"
+    # ⛔ AND THE BENIGN LINE COMES AFTER THE MATCH (final review, #2623). With the match last, "awk keeps
+    # the last MATCH" and "keeps the last LINE" produce the SAME string, so dropping the pattern list —
+    # or reverting to `tail -1` — would pass every arm while an abort reported a fixture's own benign
+    # line. Measured: with this ordering, filter-drop / dead-awk / first-match mutants each go red.
+    printf 'Killed\nbash: line 7: FOO: unbound variable\nscenario 7d done\n' >"$_sv/twomatch.log"
     _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=1 mutation_verdict twomatch 1 2>&1)"
     case "$_o" in
-      *"last diagnostic: "*"unbound variable"*) pass "verdict arm: with TWO matches the report keeps the NEAREST THE DEATH, not the first" ;;
+      *"last diagnostic: "*"scenario 7d done"*) fail "verdict arm: the report took the LAST LINE, not the last MATCH — the pattern list is inert (got: $_o)" ;;
+      *"last diagnostic: "*"unbound variable"*) pass "verdict arm: with TWO matches the report keeps the NEAREST THE DEATH, not the first, and never a benign trailing line" ;;
       *) fail "verdict arm: a two-match log reported the wrong diagnostic (got: $_o)" ;;
     esac
     printf 'Terminated\n' >"$_sv/killed.log"

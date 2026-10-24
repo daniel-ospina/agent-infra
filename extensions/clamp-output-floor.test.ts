@@ -310,11 +310,14 @@ test("resolvePiRoot honors an explicit PI_ROOT", () => {
 test("detectSourcePatch reports PRESENT for a PATCHED bundle (hermetic fixture)", () => {
 	// The positive arm used to be the LIVE install only, so the detector's "present" answer was
 	// pinned nowhere else — and a box whose pi is unpatched or upgraded failed here for a reason that
-	// has nothing to do with this checkout. Measured 2026-10-24, same JOB (`verify`), nine commits
-	// apart with NONE of them touching `extensions/`: 616d44a0 (GitHub-hosted runner, `GitHub Actions
-	// 1000589718`) PASSED and d1024c5d (self-hosted `ai-runner-cell1-x64-1`) FAILED — the diff between
-	// them is EMPTY for this file (`git rev-list --count 616d44a0..d1024c5d` → 9;
-	// `git log --oneline 616d44a0..d1024c5d -- extensions/` → 0 commits), so the two boxes
+	// has nothing to do with this checkout. Measured 2026-10-24 on the same JOB (`verify`): one run
+	// PASSED on a GitHub-hosted runner (`GitHub Actions 1000589718`) and another FAILED on the
+	// self-hosted cell runner (`ai-runner-cell1-x64-1`), nine commits apart with NONE of them touching
+	// `extensions/` — so this file is byte-identical in both, and the boxes differ in their pi install,
+	// not in the code. Cited by JOB URL, not by sha: those shas were orphaned when this branch was
+	// rebuilt on a newer main, and a citation a reader cannot resolve is not evidence.
+	//   pass: https://github.com/daniel-ospina/agent-infra/actions/runs/40059449222/job/120769571300
+	//   fail: https://github.com/daniel-ospina/agent-infra/actions/runs/40066552774/job/120790915754
 	// differ in their pi install, not in the code: a host dependency wearing a test's clothes, and one
 	// that reddens every PR's evaluated tree (§4.5 of the merge rail) whichever runner picks the job.
 	// The detector's answer is now pinned against a FIXTURE, exactly as its negative control is.
