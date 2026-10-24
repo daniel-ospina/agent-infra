@@ -1588,6 +1588,34 @@ def test_capture_never_writes_the_default_state_path():
 
 
 @test
+def test_the_alert_is_sent_through_safe_send_in_NOTICE_mode():
+    """#2258 cycle 7, P2 — the ONE line that makes the alert path work had no pin: delete `--notice`
+    from `send_message` and every suite in this repo stayed green (231/0 and 233/0 measured), while
+    the fleet's only controller alert would be refused 80 by the research-first gate on every poll.
+    A pin that the flag is USED is the difference between "safe-send.sh has a notice mode" (which
+    brief-gate.test.sh proves) and "the canary reaches for it" — this file's own recurring defect."""
+    m = load()
+    tmp = tempfile.mkdtemp(prefix="oc-notice-")
+    try:
+        cfg = m.Cfg(state_path=os.path.join(tmp, "s.json"))
+        seen = []
+
+        class RecordingSh(object):
+            def sh(self, cmd, timeout=None):
+                seen.append(cmd)
+                return 0, "sent + consumed"
+
+        delivered, detail = m.send_message("STALE PR: 999 has not moved\n", cfg, RecordingSh(),
+                                           dry_run=False, ws="WS-UUID", label="outcome-canary")
+        assert delivered is True, detail
+        assert len(seen) == 1, seen
+        assert seen[0].rstrip().endswith("--notice"), seen[0]
+        assert "safe-send.sh" in seen[0] and "WS-UUID" in seen[0], seen[0]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
 def test_a_brief_gate_refusal_is_a_REFUSAL_not_an_ambiguous_send():
     """#2258 review cycle 5, P1: safe-send.sh exits 78 (validator missing) / 80 (brief refused) BEFORE it
     probes the pane, so nothing was consumed and a retry is free — the same fact rc 3 carries. Neither was
@@ -5287,6 +5315,10 @@ MUTATIONS = [
     ("the brief gate's own refusal codes fall through to AMBIGUOUS, so one refusal silences an alert forever",
      '    if rc in (2, 3, 78, 80):', '    if rc in (2, 3):',
      "test_a_brief_gate_refusal_is_a_REFUSAL_not_an_ambiguous_send"),
+    ("the alert is sent with a bare send, so the research-first gate refuses every alert with 80",
+     'bash %s %s %s %s --notice" % (_q(script), _q(ws), _q(label), _q(path))',
+     'bash %s %s %s %s" % (_q(script), _q(ws), _q(label), _q(path))',
+     "test_the_alert_is_sent_through_safe_send_in_NOTICE_mode"),
     ("a started controller is proved only by the log, never by the heartbeat",
      "        advanced = log_advanced or hb_advanced", "        advanced = log_advanced",
      "test_a_respawn_is_proved_by_the_HEARTBEAT_when_the_log_is_slow"),
