@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off NO CI run site in either lane (pre-existing; tracked in agent-infra#2610) - wiring it is a coverage decision, not a side effect of a refactor
 # watch-truncation.test.sh — self-check for scripts/watch-truncation.sh
 # (#373). Synthetic fixtures, no real sessions. Run:
 #   bash scripts/watch-truncation.test.sh

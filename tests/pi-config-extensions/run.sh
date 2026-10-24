@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off runs in a dedicated job in BOTH lanes (ci.yml `pi-config-extensions`, ci-main `pi-config-extensions-guard`) - a shard here would be the duplicate run site #2439 removed
 # #498/#502 — pi-config extension-farm parity gate tests.
 #
 # Exercises scripts/check-pi-config-extensions.sh semantics against
