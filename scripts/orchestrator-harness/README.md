@@ -2620,7 +2620,10 @@ One reader now answers — `claims.sh`'s `claim_snapshot_verdict`, which calls `
 
 Freshness is part of the verdict, not a separate guard: `claim_snapshot` writes a
 `#claim-snapshot\t<read_at>\t<ok|failed>\t<refs>` header, and a snapshot older than
-`CLAIM_SNAPSHOT_MAX_AGE` (900 s, ~7 cycles) or written from a failed fetch reads `claim-unreadable`.
+`CLAIM_SNAPSHOT_MAX_AGE` (900 s, ≈3.75 cycles at the shipped `CYC=240`) or written from a failed
+fetch reads `claim-unreadable`. A snapshot whose WRITE failed is never published at all — the
+previous one is kept and the fetch reported failed, because a 0-byte snapshot has no header and
+would otherwise read as "nothing is claimed".
 
 **Two signals, merged, never intersected.** Selection keeps the LOCAL evidence it always had — a live
 process whose cwd is the head's checkout, a live merge lock — and adds the registry. Either one can
