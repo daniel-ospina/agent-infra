@@ -3160,7 +3160,14 @@ if true; then
   # `mutate_and_expect_fail` line moves both sides of it. Bump this when you add a class; that a
   # deletion has to walk past a number is the whole point (same doctrine as the shard runner's
   # `MIN_SUITES` floor).
-  MUTATION_FLOOR=65
+  # ⛔ BUMP THIS WHEN YOU ADD A CLASS. The floor is the ONLY guard that sees a DELETED
+  # `mutate_and_expect_fail` line (the queue→drain comparison structurally cannot — deleting
+  # one moves both sides of it together, see the note at the guards below). A floor left
+  # BELOW the population makes that guard inert for every class added after it: measured
+  # 2026-10-24, `--queue` raised the population 65 → 71 while the floor stayed at 65, so
+  # deleting all six Q mutations reported `71 → 65 ≥ 65` and stayed green — the coverage
+  # they carry would have gone silently (review finding, PR #2536).
+  MUTATION_FLOOR=71
   mutation_drain() { # run the queued mutations in batches, reporting each by name
     local total="${#MUT_QUEUE[@]}" i=0 k n name src rc LOGF=""
     local -a pids names
