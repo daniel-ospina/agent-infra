@@ -135,6 +135,20 @@ RECENT_DATE="2026-09-13T12:00:00+00:00"  # 2 days before NOW
 mkdir -p "$T/bin"
 cat >"$T/bin/ps" <<'SHIM'
 #!/usr/bin/env bash
+# ── SEQUENCED MODE (review round 1): the removal-time live re-probe must be able to observe a table
+# that CHANGED since classification — otherwise "re-read the probes" and "re-run the rule over the old
+# snapshot" are indistinguishable, and the re-probe would be an inert gate. Only the full enumeration
+# advances the sequence; any other ps call keeps the static behaviour below.
+case " $* " in
+  *"-axo"*)
+    if [ -n "${FAKE_PS_SEQ_DIR:-}" ]; then
+        N=0; [ -f "$FAKE_PS_SEQ_DIR/.n" ] && N="$(cat "$FAKE_PS_SEQ_DIR/.n")"
+        N=$((N + 1)); printf '%s' "$N" >"$FAKE_PS_SEQ_DIR/.n"
+        if [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then cat "$FAKE_PS_SEQ_DIR/$N"; exit 0; fi
+        last="$(ls "$FAKE_PS_SEQ_DIR" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
+        if [ -n "$last" ] && [ -f "$FAKE_PS_SEQ_DIR/$last" ]; then cat "$FAKE_PS_SEQ_DIR/$last"; exit 0; fi
+    fi ;;
+esac
 echo "1 0 /sbin/launchd"
 # The ANCESTOR LINK FOR THE REAPER ITSELF. `self_pid_tree_load` walks `pid -> ppid` through this
 # table starting at the reaper's own pid, so without a row for it SELF_PIDS holds the reaper alone
@@ -1230,7 +1244,7 @@ rm -f "$T/$ENV/cnt-a"
 OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATE/.env" \
     FAKE_LATE_COUNTER="$T/$ENV/cnt-a" FAKE_LATE_ON=1 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A21a a late ignored file is a PRESERVE (exit 0, never exit 4)"
-assert_contains "$OUT" "PRESERVED — removal-time clean re-check not clean (ignored-artifact)" \
+assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (ignored-artifact)" \
     "A21a the late change is surfaced on stdout with the re-check's actual verdict"
 assert_contains "$(footer $ENV)" "LATE_PRESERVE=1" "A21a the footer counts the late preserve"
 assert_contains "$(footer $ENV)" "REMOVED=0" "A21a nothing was removed"
@@ -1279,7 +1293,7 @@ OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-slow-nth-status" FAKE_STATUS_COUNTER="$T/$EN
     FAKE_SLOW_STATUS_ON=2 FAKE_STATUS_SLEEP=3 REAP_WT_STATUS_TIMEOUT=1 \
     run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A21d a timing-out removal-time re-check is a PRESERVE, not a failure"
-assert_contains "$OUT" "removal-time clean re-check not clean (status-timeout)" \
+assert_contains "$OUT" "removal-time re-check kept it (status-timeout)" \
     "A21d the banner names status-timeout"
 assert_absent "$OUT" "the checkout changed" \
     "A21d an unevaluable probe is NOT reported as a checkout change"
@@ -1842,6 +1856,36 @@ else
     kill "$IDLE_PID" 2>/dev/null; wait "$IDLE_PID" 2>/dev/null
 fi
 rm -f "$T/$ENV.fifo"
+
+# ── G2721g: THE HOLDER RULE IS ASKED AGAIN AT REMOVAL TIME (review round 1) ───────────────────
+# `remove_one` re-reads the probe tables and re-applies the SAME rule before the first delete, because
+# a shell demoted as idle can pick up a child (i.e. start working) while the pass is still running.
+# Without the re-read the check would be inert — PS_OUT/CWD_OUT are one snapshot, so re-running the
+# rule over them can never observe a change — and the log would claim a check that never happened.
+# The sequenced ps shim is what makes the two readings differ: #1 has no holder (classified
+# `reclaimable`), #2 shows a live `python3` whose argv holds the checkout (a lane that came back).
+ENV=G2721g; REPO="$(mk_repo $ENV)"
+WT_TOU="$(add_named_wt "$REPO" "$ENV-tou" feat/g2721g-tou)"
+mkdir -p "$WT_TOU/.venv"; printf 'x\n' >"$WT_TOU/.venv/marker"
+mkdir -p "$T/seq-g7"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}" >"$T/seq-g7/1"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n9401 1 /usr/bin/python3 %s/.venv/bin/python\n' \
+    "${REAP_WT_SELF_PID:-1}" "$(cd "$WT_TOU" && pwd -P)" >"$T/seq-g7/2"
+rm -f "$T/seq-g7/.n"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g7" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (live-refound)" \
+    "G2721g a holder that is live AGAIN at removal time STOPS the delete"
+assert_dir "$WT_TOU" "G2721g …the checkout survives, with the live lane still in it"
+assert_contains "$(cat "$T/$ENV/reap.log" 2>/dev/null)" "live AGAIN (live-process" \
+    "G2721g …and the log names the holder that was re-found, not just a code"
+# The NEGATIVE control: the same fixture with no holder at either reading still removes — otherwise the
+# arm above would pass on a reaper that simply never deletes anything.
+WFINAL="$(add_named_wt "$REPO" "$ENV-clean" feat/g2721g-clean)"
+mkdir -p "$WFINAL/.venv"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g7-gone" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_nodir "$WFINAL" "G2721g …and a checkout with no holder at either reading is still removed (the control)"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

@@ -354,7 +354,7 @@ ck "the recorded elapsed is a non-negative INTEGER, not merely present (f5='${f5
 # ── 8) the gate RE-READS at the spawn, and a refusal is not a `pi` exit status ───
 # This is the whole point of the port: a chain-<N> worker dispatched on a quiet box may open its PR
 # 90 minutes later, and the reading that governs is the one taken at the spawn.
-got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" bash -c '
+got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   MAX_LOAD=10
@@ -378,7 +378,7 @@ ck "a spawn re-reads load (quiet dispatch, spiked spawn -> refused: '${got:-<non
 mkdir -p "$TMP/bin75"
 printf '#!/bin/sh\nexit 75\n' > "$TMP/bin75/pi"
 chmod +x "$TMP/bin75/pi"
-got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" bash -c '
+got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   load1() { printf "0"; }
@@ -893,6 +893,7 @@ ck "POSITIVE CONTROL: the SAME box with 15k spare pids is ALLOWED (the arm is no
 run_fork() { # run_fork <procs> <max> [<max-load>] [<disk-floor>]
   PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD="${3:-999999999}" \
   DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB="${4:-1}" \
+  DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
   bash -c '
     FAKE_PROCS="$5"; FAKE_MAX="$6"
     . "$1" 2>/dev/null
@@ -962,7 +963,7 @@ row="$(tail -1 "$TMP/O/state/disk.tsv" 2>/dev/null)"
 f4="$(printf '%s' "$row" | cut -f4)"; f5="$(printf '%s' "$row" | cut -f5)"
 nf="$(printf '%s' "$row" | awk -F'\t' '{print NF}')"
 case "$f4" in ''|*[!0-9]*) rc=1 ;; *) rc=0 ;; esac
-[ "$rc" -eq 0 ] && [ "$nf" = "7" ] && [ "$f5" = "$TMP" ]; rc=$?
+[ "$rc" -eq 0 ] && [ "$nf" = "8" ] && [ "$f5" = "$TMP" ]; rc=$?
 ck "a refusal records the MEASURED reading + path in disk.tsv (nf=$nf, free='${f4:-<none>}', path='${f5:-<none>}')" $rc
 
 # The WARN band: inside it the agent STILL STARTS — the warning is the point, not a second refusal.
@@ -991,14 +992,16 @@ ck "...and an unreadable probe is ANNOUNCED, so a misconfigured path is not sile
 echo
 echo "── THE HEADROOM GATE (#2721): a lane's own tree against the space it has left ──"
 
-# drive_hd <path> <tree-mb> <reserve-mb> [<kind>] — the same rig as drive_disk, with the lane's cost
-# supplied EXPLICITLY so the verdict is decided by arithmetic rather than by this host's free space.
-drive_hd() { # drive_hd <path> <tree-mb> <reserve-mb> [<kind>]
-  local path="$1" tree="$2" reserve="$3" kind="${4:-}"
+# drive_hd <path> <tree-mb> <self-mb> <reserve-mb> [<kind>] — the same rig as drive_disk, with the
+# lane's costs supplied EXPLICITLY so the verdict is decided by arithmetic rather than by this host's
+# free space. THREE terms because the gate has three: marginal tree, worst case (sharing lost), and
+# the reserve that must survive the worst case.
+drive_hd() { # drive_hd <path> <tree-mb> <self-mb> <reserve-mb> [<kind>]
+  local path="$1" tree="$2" self="$3" reserve="$4" kind="${5:-}"
   : > "$PI_LOG"
   PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
   DISK_GATE_PATH="$path" DISK_MIN_FREE_MB=1 DISK_WARN_FREE_MB=9999999 \
-  DISK_LANE_TREE_MB="$tree" DISK_LANE_RESERVE_MB="$reserve" KIND="$kind" \
+  DISK_LANE_TREE_MB="$tree" DISK_LANE_SELF_MB="$self" DISK_LANE_RESERVE_MB="$reserve" KIND="$kind" \
   bash -c '
     . "$1"
     cd "$5" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
@@ -1010,7 +1013,7 @@ drive_hd() { # drive_hd <path> <tree-mb> <reserve-mb> [<kind>]
 
 # POSITIVE CONTROL: a lane whose tree fits (tree 0) is ADMITTED. Without it, every refusal below
 # would pass on a gate that refuses unconditionally — the inert-gate mirror of the same defect.
-res="$(drive_hd "$TMP" 0 0)"; rc=$?
+res="$(drive_hd "$TMP" 0 0 0)"; rc=$?
 [ "$res" = "rc=0 started=1" ]; rc=$?
 ck "a lane whose tree FITS is admitted ($res)" $rc
 
@@ -1019,12 +1022,12 @@ ck "a lane whose tree FITS is admitted ($res)" $rc
 # run CI (a roomy one) would ADMIT here and report a false RED on the refusal it is supposed to pin.
 # The same idiom as the unreachable floor above (`DISK_MIN_FREE_MB=9999999`).
 : > "$LOG"
-res="$(drive_hd "$TMP" 9999999 9999999)"; rc=$?
+res="$(drive_hd "$TMP" 9999999 9999999 9999999)"; rc=$?
 [ "$res" = "rc=77 started=0" ]; rc=$?
 ck "DISK-NOHEADROOM: a lane whose tree + reserve exceeds free space is REFUSED (77) and nothing starts ($res)" $rc
 grep -q 'DISK-NOHEADROOM' "$LOG"; rc=$?
 ck "the refusal is NAMED 'DISK-NOHEADROOM', so it is not read as the load or the floor gate" $rc
-{ grep -q 'needs 9999999MB' "$LOG" && grep -q 'keep 9999999MB free' "$LOG" && grep -q '19999998MB is required' "$LOG"; }; rc=$?
+{ grep -q 'costs up to 9999999MB' "$LOG" && grep -q 'keep 9999999MB free' "$LOG" && grep -q '19999998MB is required' "$LOG"; }; rc=$?
 ck "it states BOTH terms and their sum, so the arithmetic can be checked from the log alone" $rc
 grep -q 'disk_min_free_mb=' "$LOG"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
@@ -1034,14 +1037,14 @@ ck "...and it says waiting will not clear it, so an operator is not sent to a lo
 
 # THE OTHER DIRECTION — a tree that fits is admitted even inside the WARN band, i.e. the headroom gate
 # is a predicate and not a second, unconditional refusal.
-res="$(drive_hd "$TMP" 1 1)"; rc=$?
+res="$(drive_hd "$TMP" 1 1 1)"; rc=$?
 [ "$res" = "rc=0 started=1" ]; rc=$?
 ck "a small tree is admitted (the headroom gate is a predicate, not a blanket refusal) ($res)" $rc
 
 # ⛔ NO EXEMPTION BY KIND — a `fixer` provisions a FRESH worktree in adopt-fix.sh, so it pays the same
 # tree cost as a creation lane. Asserted in the refusing direction, because that is the claim.
 : > "$LOG"
-res="$(drive_hd "$TMP" 9999999 9999999 fixer)"; rc=$?
+res="$(drive_hd "$TMP" 9999999 9999999 9999999 fixer)"; rc=$?
 [ "$res" = "rc=77 started=0" ]; rc=$?
 ck "a FIXER lane is NOT exempt from the headroom gate (it provisions a fresh worktree too) ($res)" $rc
 
@@ -1049,34 +1052,102 @@ ck "a FIXER lane is NOT exempt from the headroom gate (it provisions a fresh wor
 # agent-infra lane and a tortoise lane). Driven through the shipped `disk_lane_costs`, not re-derived.
 mkdir -p "$TMP/uvtarget"
 printf 'version = 1\n' > "$TMP/uvtarget/uv.lock"
-got="$(bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
-[ "$got" = "350 6144" ]; rc=$?
-ck "a target with uv.lock derives the MEASURED python pair (want '350 6144', got '${got:-<none>}')" $rc
-got="$(bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP")"
-[ "$got" = "64 1024" ]; rc=$?
-ck "a target with no install step derives the harness pair (want '64 1024', got '${got:-<none>}')" $rc
-got="$(bash -c '. "$1"; DISK_LANE_TREE_MB=912 DISK_LANE_RESERVE_MB=5; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
-[ "$got" = "912 5" ]; rc=$?
-ck "an operator OVERRIDE wins over the derived pair — a cell that measured differently can say so (got '${got:-<none>}')" $rc
-got="$(bash -c '. "$1"; DISK_LANE_TREE_MB=abc DISK_LANE_RESERVE_MB=; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
-[ "$got" = "350 6144" ]; rc=$?
+got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
+[ "$got" = "350 6144 2000" ]; rc=$?
+ck "a target with a python marker derives the MEASURED python triple: marginal 350, worst case 6144, reserve 2000 (want '350 6144 2000', got '${got:-<none>}')" $rc
+mkdir -p "$TMP/noinstall"
+got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/noinstall")"
+[ "$got" = "64 64 2000" ]; rc=$?
+ck "a target with no install step derives the harness triple (want '64 64 2000', got '${got:-<none>}')" $rc
+got="$(DISK_MIN_FREE_MB=1000 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
+[ "$got" = "350 6144 4000" ]; rc=$?
+ck "...and the RESERVE tracks the cell's own warning band rather than a fourth constant to keep in sync (floor 1000 -> want '350 6144 4000', got '${got:-<none>}')" $rc
+got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; DISK_LANE_TREE_MB=912 DISK_LANE_SELF_MB=4000 DISK_LANE_RESERVE_MB=5; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
+[ "$got" = "912 4000 5" ]; rc=$?
+ck "an operator OVERRIDE wins over the derived triple — a cell that measured differently can say so (got '${got:-<none>}')" $rc
+got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; DISK_LANE_TREE_MB=abc DISK_LANE_SELF_MB= DISK_LANE_RESERVE_MB=; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
+[ "$got" = "350 6144 2000" ]; rc=$?
 ck "a NON-NUMERIC override is NOT an override: it derives, so a typo cannot disarm the gate (got '${got:-<none>}')" $rc
 
+# ⛔ `uv.lock` ALONE WAS A FALSE PASS (review round 1, P2): a pip/poetry/pdm service, or a monorepo
+# whose lock sits one level down, installs the same ~5.7 GB venv but derived the 64 MB HARNESS pair —
+# admitted with ~1 GB of headroom, i.e. exactly the class this gate exists to close.
+mkdir -p "$TMP/piptarget" "$TMP/monorepo/backend"
+printf 'flask\n' > "$TMP/piptarget/requirements.txt"
+printf '[tool.poetry]\n' > "$TMP/monorepo/backend/pyproject.toml"
+got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/piptarget")"
+[ "$got" = "350 6144 2000" ]; rc=$?
+ck "a pip target (requirements.txt, no uv.lock) derives the PYTHON triple, not the harness one (got '${got:-<none>}')" $rc
+got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/monorepo")"
+[ "$got" = "350 6144 2000" ]; rc=$?
+ck "a MONOREPO whose lock sits one level down is detected too, so its lane is not admitted on 1 GB of headroom (got '${got:-<none>}')" $rc
+
 # THE PREDICATE's boundaries, including the unreadable fail-open (it must match the floor's polarity).
-bash -c '. "$1"; disk_headroom_ok 100 50 50' _ "$GATE"; rc=$?
-ck "free == tree + reserve is ADMITTED (the boundary is inclusive)" $rc
-bash -c '. "$1"; disk_headroom_ok 99 50 50' _ "$GATE"; rc=$?
+bash -c '. "$1"; disk_headroom_ok 100 50 50 50' _ "$GATE"; rc=$?
+ck "free == max(tree, self) + reserve is ADMITTED (the boundary is inclusive)" $rc
+bash -c '. "$1"; disk_headroom_ok 99 50 50 50' _ "$GATE"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
-ck "one MB under tree + reserve is REFUSED" $rc
-bash -c '. "$1"; disk_headroom_ok "" 50 50' _ "$GATE"; rc=$?
+ck "one MB under max(tree, self) + reserve is REFUSED" $rc
+# ⛔ THE WORST CASE IS WHAT BINDS (review round 1, P2). The first version admitted on the MARGINAL
+# tree, so a lane on a cell with 6,300 MB free passed, then materialised 5,772 MB of unshared venv and
+# left ~500 MB — below the 2.2 GB cell-4 wedged at, with the header claiming the reserve was intact.
+bash -c '. "$1"; disk_headroom_ok 6300 350 6144 2000' _ "$GATE"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "a lane that FITS MARGINALLY but would not fit UNSHARED is REFUSED (8144MB needed, 6300MB free)" $rc
+bash -c '. "$1"; disk_headroom_ok 8144 350 6144 2000' _ "$GATE"; rc=$?
+ck "...and is ADMITTED exactly at the worst-case bound (marginal 350MB first, worst case 6144MB + 2000MB reserve)" $rc
+bash -c '. "$1"; disk_headroom_ok "" 50 50 50' _ "$GATE"; rc=$?
 ck "an UNREADABLE reading fails OPEN, matching disk_ok/disk_low — a probe that cannot answer is not pressure" $rc
 
 # THE ALLOWED RUN RECORDS THE NUMBERS (fields 6-7), so "how close did we get" is answerable later.
 : > "$TMP/O/state/disk.tsv"
-res="$(drive_hd "$TMP" 7 11)"; rc=$?
+res="$(drive_hd "$TMP" 7 13 11)"; rc=$?
 row="$(tail -1 "$TMP/O/state/disk.tsv" 2>/dev/null)"
-{ [ "$res" = "rc=0 started=1" ] && [ "$(printf '%s' "$row" | cut -f6)" = "7" ] && [ "$(printf '%s' "$row" | cut -f7)" = "11" ]; }; rc=$?
-ck "an ALLOWED run records the lane's tree + reserve in disk.tsv, so the series answers 'how close' (row='${row}')" $rc
+{ [ "$res" = "rc=0 started=1" ] && [ "$(printf '%s' "$row" | cut -f6)" = "7" ] && [ "$(printf '%s' "$row" | cut -f7)" = "13" ] && [ "$(printf '%s' "$row" | cut -f8)" = "11" ]; }; rc=$?
+ck "an ALLOWED run records marginal tree + worst case + reserve in disk.tsv, so the series separates 'what it cost' from 'what it would have cost' (row='${row}')" $rc
+
+# ── THE ADVANCE WARNING MUST BE ABLE TO FIRE ON A PYTHON TARGET (review round 1, P2) ──────────────
+# The band (`DISK_WARN_FREE_MB`, 4x the floor) sits ENTIRELY below a python lane's admission bound
+# (~8144 MB), so any readable value inside it is refused by the arm above and `disk_low` is
+# unreachable: the "a device that fills SILENTLY is the defect" instrument was inert on exactly the
+# cell class this gate targets, and the FIRST signal an operator got was the refusal. The warning that
+# can fire is "within one marginal lane tree of the bound". Driven with a STUBBED `df` so the free
+# reading is chosen by the test instead of by this host — the same reason every other arm here avoids
+# a real measurement.
+mkdir -p "$TMP/bindf"
+printf '#!/bin/sh\navail=$(( ${FAKE_DF_AVAIL_MB:-0} * 1024 ))\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "fake 9999999 0 $avail 1%% /"\n' > "$TMP/bindf/df"
+chmod +x "$TMP/bindf/df"
+# free 150MB, tree 100, worst case 0, reserve 0 => need 100: admitted, and 150 < 100 + 100.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=150 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 DISK_WARN_FREE_MB=1 \
+  DISK_LANE_TREE_MB=100 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+    . "$1"
+    cd "$3" || exit 2
+    LOG="$2"; PROMPT="$4"
+    run_agent 1 "$LOG" "$PROMPT" "advance warning" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$FIXREPO" "$PROMPT" 2>/dev/null)"; rc=$?
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "one lane's-worth of headroom left still ADMITS this spawn ($res)" $rc
+grep -q 'within one lane of the headroom bound' "$LOG"; rc=$?
+ck "...and WARNS that the NEXT lane will be refused DISK-NOHEADROOM — the warning fires where the band cannot reach" $rc
+grep -q 'NEEDLESS-NOISE-SENTINEL' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and the warning is not the refusal in disguise (the agent really started)" $rc
+# ... and the same reading with room for three lanes says nothing.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=1000 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 DISK_WARN_FREE_MB=1 \
+  DISK_LANE_TREE_MB=100 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+    . "$1"
+    cd "$3" || exit 2
+    LOG="$2"; PROMPT="$4"
+    run_agent 1 "$LOG" "$PROMPT" "advance warning quiet" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$FIXREPO" "$PROMPT" 2>/dev/null)"
+[ "$res" = "rc=0 started=1" ] && ! grep -q 'within one lane' "$LOG"; rc=$?
+ck "with room for several lanes the advance warning does NOT fire — it is a threshold, not a constant ($res)" $rc
 
 # ⛔ A NON-EMPTY BUT NON-NUMERIC READING IS "UNREADABLE" TOO, AND MUST BE ANNOUNCED (review round 1,
 # P2). `disk_ok`/`disk_low` BOTH classify a non-numeric reading as unreadable and fail open on it, but
