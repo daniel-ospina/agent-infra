@@ -1135,17 +1135,44 @@ check_disk_reaper() {
   [ -n "$reaper" ] || die "disk-reaper.sh not found (looked at \$DISK_REAPER, \$HOME/.pi/agent/scripts, and beside this script) — a cell whose disk is never reaped stops dispatching at ~97%% used"
   [ -n "$installer" ] || die "install-disk-reaper-timer.sh not found — cannot schedule the disk reaper, and an unscheduled reaper never runs unattended"
 
+  # ⛔ TELL THE INSTALLER WHICH REPO TO SCAN (measured on a fresh CI runner, 2026-10-24). The installer's
+  # own fallback list is AMBIENT ($REPO / $TORTOISE_REPO / $WORKDIR / $AGENT_INFRA_PATH) and, on a box
+  # carrying none of them, it REFUSES — "no repo resolved on this box — the venv and worktree classes
+  # would fail closed every pass" — so this check died and the cell could NEVER be certified, on exactly
+  # the box that had just cloned its checkout. The refusal is right; the silence was not: this script
+  # already KNOWS the checkout ($WORKDIR, verified or cloned by check_repo), so it says so.
+  # WHAT IT SCANS: the operator's explicit list if there is one, else THIS cell's verified checkout.
+  # NEVER an ambient $REPO / $AGENT_INFRA_PATH, which name the HARNESS or a developer's checkout: a
+  # reaper scoped at a repo the cell does not own deletes work the cell is not responsible for.
+  # ⛔ AND AN EMPTY LIST IS NOT "THE INSTALLER WILL REFUSE" (measured by review, 2026-10-24): the
+  # installer treats an EMPTY `DISK_REAPER_REPOS` exactly like an unset one and falls through to ITS
+  # OWN ambient list (`$REPO`, `$TORTOISE_REPO`, `$WORKDIR`, `$AGENT_INFRA_PATH`), so passing "" would
+  # have handed it the operator's shell — the adoption this check exists to prevent, on the one path
+  # where the cell could not name a repo for itself (an interrupted clone that leaves a `.git`
+  # `check_repo`'s `[ -d ]` accepts but git does not). So this REFUSES instead, by name.
+  local rp_repos rp_cand
+  if [ -n "${DISK_REAPER_REPOS:-}" ]; then
+    rp_repos="$DISK_REAPER_REPOS"                 # the operator's list, verbatim (colon-joined; the installer parses it)
+  else
+    rp_repos="${WORKDIR:-}"
+    case "$rp_repos" in
+      /*) git -C "$rp_repos" rev-parse --git-dir >/dev/null 2>&1 || rp_repos="" ;;
+      *) rp_repos="" ;;
+    esac
+    [ -n "$rp_repos" ] || die "the cell's checkout (${WORKDIR:-<unset>}) is not a usable git repository, and no DISK_REAPER_REPOS was given — refusing to schedule a reaper whose scan list would fall back to an AMBIENT repo (\$REPO / \$AGENT_INFRA_PATH name the harness or a developer's checkout, not this cell). Fix the checkout at that path, or set DISK_REAPER_REPOS explicitly."
+  fi
+
   rc=0
   # TEMPLATES_DIR from the SAME checkout the layer came from: the farmed installer copy lives at
   # $HOME/.pi/agent/scripts, whose ../templates does not exist, so without this the templates are
   # "missing" on exactly the cell that was just provisioned.
-  out="$(DISK_REAPER="$reaper" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
+  out="$(DISK_REAPER="$reaper" DISK_REAPER_REPOS="$rp_repos" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
          bash "$installer" --install 2>&1)" || rc=$?
   printf '%s\n' "$out" | sed 's/^/    /'
   [ "$rc" -eq 0 ] || die "the disk reaper timer could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager) before this cell is used"
 
   rc=0
-  out="$(DISK_REAPER="$reaper" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
+  out="$(DISK_REAPER="$reaper" DISK_REAPER_REPOS="$rp_repos" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
          bash "$installer" --status 2>&1)" || rc=$?
   [ "$rc" -eq 0 ] || die "the disk reaper timer is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
   next="$(printf '%s\n' "$out" | sed -n 's/^next_run=//p' | head -1)"
@@ -1222,6 +1249,65 @@ check_harness_apply() {
   ok "harness activation scheduled — timer next=${next:-?} (record: ${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply.status)"
 }
 
+# ── controller: the SERVICE that keeps the dispatcher alive (agent-infra#2402) ──────────────────
+# The controller lived and died as a tmux SESSION, and a tmux session has nothing above it: when the box
+# emptied, the last session closed, the tmux server exited and the dispatcher was gone — the cell read as
+# a healthy idle box (measured 2026-10-23 on cell-1). `install-controller-service.sh` puts it under a
+# systemd unit with `Restart=always`; this check RUNS that verb and READS IT BACK, exactly as
+# `check_disk_reaper` does for the timer. ⛔ A CELL WHOSE CONTROLLER HAS NOTHING ABOVE IT IS REFUSED, not
+# certified: `CELL READY` over a box that stops dispatching the moment it empties is the false PASS this
+# script exists to remove — and the installer is never invoked anywhere else, so without this the fix is
+# inert on every cell the bring-up provisions.
+check_controller_service() {
+  local installer="" cand out rc
+  # macOS is REFUSED by the installer ON PURPOSE: the launchd agent already has `KeepAlive`, so a second
+  # supervisor there would be a second dispatcher on one queue. Running the installer would only produce
+  # a false red against a healthy Mac.
+  # ⛔ BUT "REFUSED THE INSTALLER" IS NOT "VERIFIED SUPERVISED" (review P2, #2402). This arm used to
+  # print `ok "controller supervised by the launchd agent"` without reading anything at all — an
+  # assertion, not a check, which is the same "a claim nobody measured" shape #2402 exists to remove.
+  # It is NOT made a hard refusal: launching a `launchctl print gui/$UID/com.eldato.orchestrator-loop`
+  # read here would refuse a healthy Mac on any context where that read is unavailable, and this PR's
+  # scope deliberately excludes the macOS path. So the claim is withdrawn and the gap is NAMED instead
+  # of hidden — the bring-up certifies the cell, and it says exactly what it did not look at.
+  # ⛔ `warn`, NOT `ok` (review P2, #2402): `ok "…NOT VERIFIED…"` printed a GREEN line for something no read
+  # produced, so the pass tally counted a pass over an unread surface — the "claim nobody measured" shape in
+  # miniature, on the one arm whose whole point is that nothing was measured.
+  if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+    warn "controller supervision on macOS is NOT VERIFIED by this check — the launchd agent (com.eldato.orchestrator-loop) is out of scope here and nothing in this run read launchctl; verify with: launchctl print gui/\$UID/com.eldato.orchestrator-loop"
+    return 0
+  fi
+  for cand in "${CONTROLLER_SERVICE_INSTALLER:-}" \
+              "${HOME:-}/.pi/agent/scripts/install-controller-service.sh" \
+              "${LAYER_ROOT:-}/scripts/install-controller-service.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-controller-service.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
+  done
+  [ -n "$installer" ] || die "install-controller-service.sh not found (looked at \$CONTROLLER_SERVICE_INSTALLER, \$HOME/.pi/agent/scripts, \$LAYER_ROOT/scripts, and beside this script) — the controller would stay a tmux session with nothing above it (#2402): it survives until the box empties, and then it is gone with no signal"
+  # ⛔ THE LAYER THE BRING-UP ALREADY TRUSTS IS THE ONE TO RUN (review P1, #2402). This script is normally
+  # pushed STANDALONE into /tmp, so "beside this script" proves nothing, and the installer is not in the
+  # farm list — a cell provisioned the documented way therefore found nothing here and DIED at this check
+  # (killing every bring-up). $LAYER_ROOT/scripts is the checkout check_operational_layer just installed.
+  # The supervisor is resolved from the SAME checkout: the installer prefers $HOME/.pi/agent/scripts, and a
+  # stale copy there predating ORCH_FOREGROUND would hand the unit a launcher that exits 0.
+  local layer_sup="${LAYER_ROOT:+$LAYER_ROOT/scripts/cloud-cell-supervisor.sh}"
+  [ -n "$layer_sup" ] && [ -f "$layer_sup" ] || layer_sup=""
+  local -a cenv=(TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}")
+  [ -n "$layer_sup" ] && cenv+=("ORCH_SUPERVISOR=$layer_sup")
+
+  rc=0
+  # TEMPLATES_DIR from the SAME checkout the layer came from (the farmed installer copy lives at
+  # $HOME/.pi/agent/scripts, whose ../templates does not exist) — same rule as check_disk_reaper.
+  out="$(env "${cenv[@]}" bash "$installer" --install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" -eq 0 ] || die "the controller service could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager with linger) before this cell is used; an unsupervised controller dies with the last lane"
+
+  rc=0
+  out="$(env "${cenv[@]}" bash "$installer" --status 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] || die "the controller service is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+  ok "controller supervised — eldato-orchestrator.service is enabled and active (Restart=always: a dead controller comes back without a human; stop it with 'cloud-cell-supervisor.sh stop')"
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -1259,7 +1345,11 @@ main() {
       # after the scheduler work — and the reading is what the operator needs from the refusal.
       check_swap
       check_disk_reaper
+      # Both schedulers/supervisors are installed AFTER the layer exists: each installer is resolved
+      # FROM that layer (the harness-apply one from #2416, the controller one from #2402), so measuring
+      # either earlier would probe a directory that has not been populated yet.
       check_harness_apply
+      check_controller_service
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
