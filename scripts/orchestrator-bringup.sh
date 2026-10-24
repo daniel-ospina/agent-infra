@@ -1006,6 +1006,23 @@ launchd_job_for_state_dir() {
     # dir's job wherever its program lives. A job that merely lives under $O is not (the stack
     # supervisor, heartbeat, nightwatch, pr-doctor all do) — see the comment below.
     job_o="$(printf '%s' "$flat" | sed -n 's:.*<key>O</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
+    # ⛔ AN AUXILIARY IS NEVER THIS STATE DIR'S CONTROLLER, WHATEVER IT DECLARES. The shipped watchdog
+    # template declares EXACTLY this state dir (`templates/launchd/com.eldato.controller-watchdog.plist`
+    # `O` = `{{HOME}}/orchestrator`, which IS the Mac's `$O`) while its program lives under
+    # AGENT_INFRA_PATH — outside `$O`. So before this line, the `O` question alone counted the WATCHDOG
+    # as a controller, and on a box where the documented activation path had installed it
+    # (`install-launchd.sh`, ACTIVATION-MATRIX row 8) the scan returned TWO jobs and `start` refused
+    # "TWO launchd jobs" — `harness-up up` could not run on the very box this pin work exists for, and
+    # a watchdog is not a second controller (#2231 review).
+    # ⛔ AND IT IS AN EXCLUSION LIST, NOT AN ALLOW-LIST OF CONTROLLER NAMES: the box's controller shapes
+    # are open-ended — the stack supervisor (`$O/supervisor.sh`), an operator's renamed loop — and an
+    # allow-list makes them stop owning their OWN state dir, which silently turns a duplicate-controller
+    # refusal (#1761) into an adoption. The marker still has to be read from the DECLARATION (that is
+    # what makes a PIN-programmed loop visible at all, #2231), so what this narrows is which PROGRAMS
+    # may claim it.
+    case "$(basename "${prog:-}")" in
+      watchdog-loop.sh|orchestrator-heartbeat.sh|heartbeat-loop.sh|nightwatch.sh|pr-doctor.py) continue ;;
+    esac
     if [ "$job_o" != "$O" ]; then
       case "$prog" in "$O"/*) ;; *) continue ;; esac
     fi
