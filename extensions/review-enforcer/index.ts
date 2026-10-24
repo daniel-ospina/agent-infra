@@ -2467,6 +2467,30 @@ function hasApiWriteFlagAnywhere(scan: { tokens: string[] }): boolean {
  * read-only coreutils vocabulary instead would refuse the loop variables and globs that every
  * triage loop contains — the false positive #2204 exists to remove.
  */
+/**
+ * Programs whose ARGUMENTS can ship or mutate something no reviewer saw, so a command that
+ * RUNS one is not a read even when the word `git` never appears.
+ *
+ * #2204's rule (1) refuses any command that MENTIONS git, which closes the git-shaped writes.
+ * It does not close a remote write spelled WITHOUT git — measured at zero dispatches beside a
+ * `gh pr view` read (fresh review, P2), each certified as a read and each really shipping:
+ *   … ; curl -s -X PUT -H "Authorization: token $T" --data @c.json https://api.github.com/…
+ *   … ; npm publish --access public
+ *   … ; rsync -a ./ host:/srv/app/
+ * ⛔ THIS IS A DENY LIST, SO IT IS INCOMPLETE BY CONSTRUCTION. The fail-closed form is a POSITIVE
+ * allowlist of command-position words, which is a larger change than #2204 makes; the residual is
+ * filed as a follow-up rather than implied closed by this set.
+ */
+const REMOTE_WRITE_PROGRAMS = new Set([
+  "curl", "wget", "http", "https", "httpie", "nc", "ncat", "netcat", "socat",
+  "npm", "npx", "pnpm", "yarn", "bun",
+  "pip", "pip3", "gem", "cargo", "dotnet",
+  "rsync", "scp", "sftp", "ftp", "sshpass",
+  "aws", "gcloud", "az", "fly", "flyctl", "vercel", "netlify", "heroku",
+  "docker", "podman", "kubectl", "helm", "terraform", "ansible", "ansible-playbook",
+  "hub", "tea", "glab",
+]);
+
 function isUnreadableProgramWord(w: string): boolean {
   if (w === "") return false;
   if (w.includes("/")) return true;
@@ -2474,8 +2498,37 @@ function isUnreadableProgramWord(w: string): boolean {
   return (
     SHELL_PAYLOAD_RUNNERS.has(w) ||
     STDIN_PROGRAM_RUNNERS.has(w) ||
-    STDIN_PROGRAM_INTERPRETER_RE.test(w)
+    STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
+    REMOTE_WRITE_PROGRAMS.has(w)
   );
+}
+
+/**
+ * Is token `i` the FILE TARGET of a redirection that belongs to a command already present
+ * (`done > /tmp/out.txt`), as opposed to a word the shell will RUN (`> /dev/null /bin/bash`)?
+ *
+ * ⛔ THE OLD TEST WAS `REDIRECTION_TOKEN.test(tok(i - 1))`, AND IT WAS A P0 BYPASS (#2206 review).
+ * Separators are stripped from TOKENS and survive only in the GAP, so in
+ * `done >/dev/null; /bin/bash /tmp/x.sh` the previous TOKEN of `/bin/bash` is the redirection
+ * `>/dev/null` although a `;` sits between them. The program check was therefore skipped and the
+ * script RAN — a command certified "Read-only … the ≥1-dispatch floor covers writes, not reads"
+ * that executed an unreviewed `/tmp/x.sh` (reproduced through the real `tool_call` handler).
+ *
+ * The target is now recognised POSITIONALLY: directly attached to its operator, ending its
+ * segment, and with a command before the operator to attach the redirection to.
+ */
+function isTrailingRedirectTarget(scan: ScanTokens, i: number): boolean {
+  if (i < 1) return false;
+  if (!REDIRECTION_TOKEN.test(scan.tokens[i - 1])) return false;
+  // A separator between the operator and this word starts a NEW command, so this word is not a
+  // target — it is whatever that new command runs.
+  if (/[;&|(){!\n\r]/.test(scan.gaps[i] ?? "")) return false;
+  // A target ENDS its segment; a word followed by more command words is not one.
+  if (i + 1 < scan.tokens.length && !/[;&|\n\r]/.test(scan.gaps[i + 1] ?? "")) return false;
+  // `> /dev/null /bin/bash`: the operator has no command to attach to, so the word after it is the
+  // command, not a target (the shell runs `/bin/bash` there).
+  if (i < 2) return false;
+  return !/[;&|(){!\n\r]/.test(scan.gaps[i - 1] ?? "");
 }
 
 /**
@@ -2538,11 +2591,41 @@ const READ_PIPELINE_FILTERS = new Set([
  * `print > "f"` / `"cmd" | getline` do the same. An ordinary print script (`3,12p`, `s/a/b/`,
  * `NR>1`) matches none of these and stays a read.
  */
+/**
+ * Per-filter flags that turn a data filter into a program runner or an in-place writer.
+ *
+ * `-f`/`--file` puts the SCRIPT out of the command text, which is the only thing the
+ * `DATA_FILTER_SCRIPT_EXECUTES` check can read. `rg --pre=<PROGRAM>` runs that program to
+ * preprocess every file it searches. `sed -i`/`--in-place` and `awk -i inplace` WRITE.
+ * `awk -E`/`--exec` is gawk's second `-f` spelling. Each is a measured bypass (#2206 review).
+ *
+ * Letters are matched only on an all-letters short bundle (`-n`, `-ni`), so `awk -F,` and
+ * `sed -n '3,12p'` stay reads; `-F` (field separator) is deliberately NOT in awk's set.
+ */
+// ⛔ A `Map`, NOT a `Record` OBJECT (#2206 review, P1 — caught by this suite's own
+// `gh constructor view 2` / `gh toString pr view 1` pins). A plain object lookup returns
+// `Object.prototype.constructor` for the word `constructor`, so `badLong.test` threw out of the
+// gate instead of returning a verdict. The same hazard exists for `__proto__` and `toString`.
+const PIPELINE_FILTER_FORBIDDEN_LETTERS = new Map<string, string>([
+  ["sed", "if"],
+  ["awk", "fEi"],
+]);
+const PIPELINE_FILTER_FORBIDDEN_LONG = new Map<string, RegExp>([
+  ["sed", /^--(?:in-place|file)/],
+  ["awk", /^--(?:file|exec|include)/],
+  ["rg", /^--pre/], // `--pre=<PROGRAM>` runs it; `--pre-glob` only pairs with it
+]);
+
 const DATA_FILTER_SCRIPT_EXECUTES =
   // The sed `e`/`w`/`W` COMMAND. The preceder class includes the QUOTES: a script is normally
   // written `sed '1e /tmp/x.sh'`, so the address is preceded by `'` and an anchor of `;{}` +
   // whitespace alone missed every real spelling of it (caught by re-running the probe).
-  /(^|[;{}\s'"])([0-9$,/]*)\s*[ewW](\s|;|$)|s\/(?:\\.|[^\\/])*\/(?:\\.|[^\\/])*\/[a-z]*[ew]|system\s*\(|\b(?:print|printf)\b[^;{}]*[>|]|\|\s*getline/;
+  // ⛔ THE TRAILING CLASS IS NOT `(\s|;|$)` ANY MORE (#2206 review, P1). That anchor certified
+  // three executing spellings as reads at zero dispatches — `sed '1{p;e}'` (`e` before `}`),
+  // `sed -n 'e'` (`e` before the closing quote) and `sed 'w/tmp/f'` (`w` before `/`) — because the
+  // character AFTER the command letter was a quote, a brace or a slash and none of them matched.
+  // A sed/awk script command letter terminates at whitespace, `;`, `}`, a quote, `/`, `\\` or EOL.
+  /(^|[;{}\s'"])([0-9$,/]*)\s*[ewW]([\s;}$'"\/\\]|$)|s\/(?:\\.|[^\\/])*\/(?:\\.|[^\\/])*\/[a-z]*[ew]|system\s*\(|\b(?:print|printf)\b[^;{}]*[>|]|\|\s*getline/;
 
 /**
  * Is the token at `k` part of a command substitution (`$(…)` or a backtick body)?
@@ -2594,19 +2677,30 @@ export function readsOnlyGhRead(command: string): boolean {
     // its stdin is data, so `… | sed -n '3,12p'`, `… | awk 'NR>1'` and `… | jq .body` run nothing
     // (refusing them refused the ordinary `gh pr view … --json body | jq -r .body` read — fresh
     // review, P2). The pipeline case is judged by the shell/interpreter test in (4), not here.
-    const pipedIn = /(^|[^|])\|([^|]|$)/.test(scan.gaps[i] ?? "");
-    // A WORD FRAGMENT after a substitution/brace close is not a program: in
-    // `gh api repos/o/r/commits/$(git rev-parse HEAD)/check-runs` the `/check-runs` token is the
-    // tail of the endpoint, and reading its leading `/` as an absolute path refused a plain read
-    // (measured on the real blocked-command corpus). Only a fragment ATTACHED to the closer is
-    // exempt — a genuine `/usr/bin/gh pr view` still follows whitespace and keeps the refusal.
-    const attachedToClose = /[)}\]]$/.test((scan.gaps[i] ?? "").trimEnd());
+    const gapBefore = scan.gaps[i] ?? "";
+    const pipedIn = /(^|[^|])\|([^|]|$)/.test(gapBefore);
+    // A WORD FRAGMENT directly attached to a substitution/brace close is not a program: in
+    // `gh api repos/o/r/commits/$(cat sha)/check-runs` the `/check-runs` token is the tail of the
+    // endpoint, and reading its leading `/` as an absolute path refused a plain read (measured on
+    // the real blocked-command corpus).
+    //
+    // ⛔ BUT BOTH CLAUSES HERE WERE BYPASSES (#2206 review, P0), because they only asked whether
+    // the fragment LOOKED attached:
+    //   • `.trimEnd()` made `$(…) /bin/bash` (a SPACE after the closer) count as attached, so a
+    //     whitespace-separated program after any substitution was exempted;
+    //   • nothing required the fragment to be a path CONTINUATION, so `$(echo /bin/)sh` was
+    //     exempted too — and that token is not a fragment, it completes `/bin/sh` across the
+    //     closer. It ran (reproduced through the real handler).
+    // The exemption is now: DIRECTLY attached, a path continuation, and not completing an absolute
+    // path that was split before the closer.
+    const attachedToClose =
+      /[)}\]]$/.test(gapBefore) && /^\//.test(t) && !/\/$/.test(tok(i - 1));
     if (
       !pipedIn &&
       !attachedToClose &&
+      !isTrailingRedirectTarget(scan, i) &&
       isCommandPositionAt(scan, i) &&
       !REDIRECTION_TOKEN.test(t) &&
-      !REDIRECTION_TOKEN.test(tok(i - 1)) &&
       isUnreadableProgramWord(word(i))
     ) return false;
     // Shell STRUCTURE (`{ …; }`, a subshell's parens, `[ … ]`) is not a program. Its BODY is scanned
@@ -2664,10 +2758,44 @@ export function readsOnlyGhRead(command: string): boolean {
   for (let i = 1; i < scan.tokens.length; i++) {
     if (isData(i)) continue;
     if (!/(^|[^|])\|([^|]|$)/.test(scan.gaps[i] ?? "")) continue;
-    if (isData(i - 1)) continue;
+    // ⛔ NO `isData(i - 1)` SKIP (#2206 review, P1). It was meant to stop a QUOTED argument that
+    // precedes the pipe from looking like a stage, but it skipped the STAGE CHECK ITSELF: one data
+    // token was enough to certify `… gh pr view $n --json "body" | sort -o <file>` as a read, and
+    // `sort -o` really wrote — it overwrote a repo's `.git/hooks/pre-commit` from a command the
+    // gate had just declared read-only (reproduced through the real handler). The `isData(i)` test
+    // above already governs the STAGE token; what precedes the pipe is irrelevant to that test.
     const w = word(i);
     if (!READ_PIPELINE_FILTERS.has(w)) return false;
     if (w === "sed" || w === "awk") sedOrAwkStage = true;
+  }
+
+  // (4b) A data filter is only a data filter while its FLAGS cannot name a program or open an
+  // output file. This runs over EVERY position (a pipeline STAGE and a plain COMMAND), because the
+  // script check below reads the command TEXT and a flag can put the script out of its reach.
+  //
+  // ⛔ EACH ENTRY IS A MEASURED BYPASS (#2206 review, P1), certified as a read at zero dispatches
+  // and then really running/writing:
+  //   … | rg --pre=/tmp/pre.sh needle dir      rg RUNS the preprocessor on every file it searches
+  //   … | awk -f /tmp/ship.awk                 the script is out of band; it ran `git push`
+  //   … | sed -n -f /tmp/ship.sed              same
+  //   … | sed -i 's/a/b/' f , awk -i inplace   WRITES the named file
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (isData(i)) continue;
+    const w = word(i);
+    const badLetters = PIPELINE_FILTER_FORBIDDEN_LETTERS.get(w) ?? "";
+    const badLong = PIPELINE_FILTER_FORBIDDEN_LONG.get(w);
+    if (badLetters === "" && badLong === undefined) continue;
+    const last = endOfSegment(i);
+    for (let k = i + 1; k <= last; k++) {
+      // Quoted or not, the shell passes a flag through verbatim, so this loop does NOT skip data.
+      const ft = word(k);
+      if (badLong !== undefined && badLong.test(ft)) return false;
+      if (
+        badLetters !== "" &&
+        /^-[A-Za-z]+$/.test(ft) &&
+        [...ft.slice(1)].some((ch) => badLetters.includes(ch))
+      ) return false;
+    }
   }
   // ⛔ THE SCRIPT IS DATA ON THIS SCAN, SO IT IS READ FROM THE TEXT. `sed '1e /tmp/x.sh'` is ONE
   // quoted token, and the tokenizer splits quoted regions on `(`/`{`/`;` too, so a stage-by-stage

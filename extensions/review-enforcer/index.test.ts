@@ -2769,6 +2769,15 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     // only values that can name a program.
     // The flag allowlist must not refuse ordinary read flags -- including values, `=` spellings and
     // combined shorts.
+    // ⛔ THE COUNTERPART TO THE BYPASS BLOCK IN THE NEGATIVE TABLE (#2206 re-review). Each of these
+    // sits NEXT TO a closed bypass, so a fix that simply refused the whole construct would red
+    // here instead of silently re-creating #2204's false positive:
+    `gh pr view 1 | awk -F, '{print $2}'`, // `-F,` is a field separator, NOT awk's `-f` script file
+    `gh pr view 1 | sed -n '3,12p'`, // …the ordinary print script stays a read
+    `gh pr view 1 | rg -n needle /tmp/src`, // rg without `--pre` runs nothing
+    `for n in 1 2; do gh pr view $n; done > /tmp/out.txt`, // a redirect TARGET is not a program
+    `for n in 1 2; do gh pr view $n; done 2>/dev/null`, // …nor is `2>/dev/null`
+    `for pr in 1; do sha=$(gh api repos/o/r/pulls/$pr --jq .head.sha); echo "$sha"; done`,
   ];
   for (const cmd of reads) {
     ok(readsOnlyGhRead(cmd), `POSITIVE READ expected (would be refused at 0 dispatches): ${cmd}`);
@@ -2954,6 +2963,43 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     // which assembles its words with no `-`-prefixed text to match.
     'gh api "repos/$(printf \'%s\' x)" --jq .x',
     "gh api `printf -- '-%s%s' X POST` repos/o/r/pulls/1/merge",
+    // ─── FRESH REVIEW #2 (P0/P1): SIX BYPASSES, EACH REPRODUCED THROUGH THE REAL `tool_call`
+    // HANDLER AT ZERO DISPATCHES AND EACH REALLY RUNNING OR WRITING. Every one below was
+    // certified as "Read-only command — the ≥1-dispatch floor covers writes, not reads" by the
+    // code that shipped before this block existed, so a missing entry here is not a missing nice-
+    // to-have: it is a reviewer-bypass primitive. The comments name WHICH conjunct was wrong.
+    //
+    // (1) P0 — the redirect/closer exemptions asked only whether a fragment LOOKED attached.
+    // Separators live in the GAP, so `/bin/bash`'s previous TOKEN was the redirection `>/dev/null`
+    // although a `;` sat between them, and `.trimEnd()` let a SPACE after `)` count as attached.
+    "for n in 1; do gh pr view $n; done >/dev/null; /bin/bash /tmp/x.sh",
+    "for n in 1; do gh pr view $n; done 2>/dev/null; python3 /tmp/x.py",
+    // the closer case: `$(echo /bin/)sh` is NOT a fragment, it completes `/bin/sh` across the `)`
+    "for n in 1; do gh pr view $n; done; $(echo /bin/)sh -c 'touch /tmp/x'",
+    // (2) P1 — `if (isData(i - 1)) continue` skipped the STAGE check itself: one quoted argument
+    // before the pipe certified the stage. This one overwrote a repo's `.git/hooks/pre-commit`.
+    'for n in 1 2; do gh pr view $n --json "body" | sort -o /tmp/f; done',
+    'for n in 1 2; do gh pr view $n --json "body" | tee /tmp/f; done',
+    'for n in 1 2; do gh pr view $n --json "body" | sort --compress-program=/tmp/c.sh; done',
+    // (3) P1 — the sed/awk script check cannot read a script delivered OUT OF BAND by `-f`, and
+    // its `(\s|;|$)` anchor missed `}` , a quote and `/`. The awk script below ran `git push`.
+    "for n in 1 2; do gh pr view $n | awk -f /tmp/ship.awk; done",
+    "for n in 1 2; do gh pr view $n | sed -n -f /tmp/ship.sed; done",
+    `gh pr view 1 | sed '1{p;e}'`,
+    `gh pr view 1 | sed -n 'e'`,
+    `gh pr view 1 | sed 'w/tmp/f'`,
+    // in-place writers, and gawk's second `-f`/exec spelling
+    `gh pr view 1 | sed -i 's/a/b/' /tmp/f`,
+    `gh pr view 1 | awk -i inplace '{print}' /tmp/f`,
+    `gh pr view 1 | awk -E /tmp/x.awk`,
+    // (4) P1 — `rg` is allowlisted but `--pre=<PROGRAM>` RUNS that program on every file searched.
+    // This is exactly the lesson `77d4c9a74` applied to git flags, not applied to the filters.
+    "for n in 1; do gh pr view $n; done | rg --pre=/tmp/pre.sh needle /tmp/src",
+    "gh pr view 1 | rg --pre /tmp/pre.sh needle /tmp/src",
+    // (5) P2 — a remote write spelled WITHOUT the word `git`; rule (1) never sees it.
+    `for n in 1; do gh pr view $n; done; curl -s -X PUT -H "Authorization: token $T" --data '{"content":"eA=="}' https://api.github.com/repos/o/r/contents/x`,
+    "for n in 1; do gh pr view $n; done; npm publish --access public",
+    "for n in 1; do gh pr view $n; done; rsync -a ./ host:/srv/app/",
   ];
   for (const cmd of writes) {
     ok(!readsOnlyGhRead(cmd), `NOT a read (must keep the floor's decision): ${cmd}`);
