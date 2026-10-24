@@ -714,9 +714,29 @@ fi
 # its recorder is still correct (the script falls back to the sibling, then to
 # $DEST/scripts/record-review.sh, and REFUSES loudly when neither is executable),
 # but the two are one workflow and belong in one farm.
-merge_gate_srcs=(record-review.sh review-pr.sh)
+#
+# #984 — THE ARGV-LEVEL `gh` SHIM AND THE EVIDENCE VERIFIER IT DEMANDS. The review-enforcer
+# prepends `EXTENSION_DIR/../../scripts/gh-shim` to PATH on every bash call
+# (`resolveGhShimDir()`), and the SAME expression means two different things by platform:
+#   * on a laptop the extensions are kept as farm SYMLINKS into this checkout (the loop above),
+#     so node's module resolution follows the link and `../..` IS the checkout — the shim is
+#     found without ever being installed;
+#   * on a cloud cell the extensions are real COPIES, so `../..` is `~/.pi/agent` and the shim
+#     must exist at `~/.pi/agent/scripts/gh-shim/gh`.
+# Nothing farmed that directory, so every cell lane logged
+#   `#984 argv-level gh shim not found — only the string scanner is active`
+# and ran the merge gate DEGRADED — no argv inspection at all, which is the documented ceiling
+# of a string scanner (`--ad""min`, `$'--admin'`, `xargs {}`) — while the box reported its layer
+# verified. Farming the shim HERE is what makes the two platforms the SAME gate rather than two
+# copies that drift: cell-install.sh PARSES these arrays and keeps no list of its own.
+# `gh-shim/gh` is a NESTED name (the shim lives in a directory of its own), and the verifier must
+# land as its `../verify-admin-merge-evidence.sh` sibling — the shim resolves the verifier from
+# its own location and fails CLOSED without it, so shipping one without the other produces a gate
+# that refuses EVERY admin merge.
+merge_gate_srcs=(record-review.sh review-pr.sh gh-shim/gh verify-admin-merge-evidence.sh)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0
+merge_gate_names=""
 for base in "${merge_gate_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
   f="$INFRA_ROOT/scripts/$base"
@@ -725,6 +745,9 @@ for base in "${merge_gate_srcs[@]}"; do
     continue
   fi
   dest="$DEST/scripts/$base"
+  # A NESTED farm entry (gh-shim/gh) needs its parent directory: `cp -f` into a missing parent
+  # fails, and the rest of the farm would still report success.
+  mkdir -p "$(dirname "$dest")" || { echo "ERROR: cannot create $(dirname "$dest") for farm entry $base" >&2; exit 1; }
   if [ -L "$dest" ]; then
     echo "    replacing farm symlink with real copy: $base"
     rm -f "$dest"
@@ -740,8 +763,11 @@ for base in "${merge_gate_srcs[@]}"; do
     farm_missing+="scripts/$base (chmod +x failed)"$'\n'
   fi
   merge_gate_copied=$((merge_gate_copied+1))
+  merge_gate_names+="${merge_gate_names:+, }$base"
 done
-echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh + review-pr.sh, #562)"
+# DERIVED from the array, never hard-coded: a summary that omits a name it farmed misreports the
+# farm, and the suite pins every declared entry against this line (#1897 precedent).
+echo "    scripts merge-gate farm: $merge_gate_copied copied (${merge_gate_names:-none} — #562, #984, #2287)"
 
 # ── the pi spawn-point gate (#1884) ──────────────────────────────────────────
 # Installed as `pi` — not as a farmed script — because that is the whole point: `spawn-gate.sh` is
