@@ -214,6 +214,28 @@ FILE pointing at `<main>/.git/worktrees/<name>`) inside one of those roots: `/tm
 would otherwise be a dispatch target — acceptance without evidence. Measured, the `/tmp/wt-*` lanes
 in the reap log are real linked worktrees, so nothing real is lost.
 
+⛔ **Stated boundary: the name is also a GATE, and unknown provenance resolves to the OWNER.** The
+`wt-<slug>` arm requires both the anchored name *and* the worktree artifact. So a **real** linked
+worktree directly under a fleet root whose name is anything else — `/tmp/w9516`, `/tmp/p9660-resid`,
+`/tmp/l9400` — does **not** match, and is PROTECTED. Measured on this box: **25 of the 33** real
+linked `/tmp` worktrees in `state/pi-reap-worktrees.log` are classified that way. Those lanes are not
+dispatchable, and a report line for one says "not a fleet worktree — PROTECTED as the owner's own
+work", which is the fail-closed answer, not a measurement of ownership.
+
+This is deliberate, and the tempting repair is the defect. Dropping the name and accepting any real
+linked worktree at depth 1 would re-open exactly what this section exists to close: `git worktree add
+~/tortoise-wip fix/x` produces that shape, so the owner's own scratch work would become a dispatch
+target, a pr-doctor `reset --hard` target, and a heartbeat typing target — the `Personal website`
+incident re-created. Pinned by
+`test_a_real_worktree_in_a_fleet_root_is_still_not_a_lane_without_the_NAME`; do not flip that test.
+
+Neither spelling is the real question, in *either* direction. Both need **provenance** — a durable
+record of which worktrees the *fleet* created — which is **agent-infra#2213**. The only such record
+today is `$O/bg/<name>.started`, and measurement shows it names only `<repo>/.worktrees/prd-*`, so it
+cannot yet adjudicate these. Until that registry exists, an unprovenanced worktree is the owner's: a
+wrong refusal costs a lane one dispatch cycle, a wrong acceptance types into someone's uncommitted
+work. Loud in the report, safe in the direction that matters.
+
 **A bare cell checkout is not a lane.** `/tmp/cell-ai`, `/tmp/cell-t3` (a main checkout, `.git` a
 DIR) are PROTECTED: work is dispatched into *worktrees*, never into a cell's main checkout.
 
@@ -222,7 +244,10 @@ absence of evidence, and the fail-closed direction for *may I type into this?* i
 predicate is `_is_fleet_worktree()` in `scripts/lane-actions.py`, unit-tested against both
 directions: a worktree `git worktree add` created under a fleet root (a `.git` FILE pointing at
 `<main>/.git/worktrees/<name>`) → fleet; the same name with no such pointer, or the owner's project
-path → owner.
+path → owner. A path carrying an embedded NUL is **rejected before resolution**, not caught after it:
+`realpath` only raises for a NUL from Python 3.10, while the 3.9 interpreter the orchestrator scripts
+run returns the poisoned string — so a cwd nobody could read would otherwise decide its own
+classification from its own first segment (`agent-infra#2219`, review round 11).
 
 **Deploy order.** Identity reads the `cwd` field that `lane-status.py` publishes, and the two
 files deploy independently. `lane-status.py` must land first: until it does, every row carries no
@@ -271,6 +296,11 @@ happens **after** `git worktree list` and the liveness probe, and **before** the
    written on there are 0 spawn markers and 40+ live lanes under `.worktrees`, so a registry-only
    rule would empty LIST 1 — the silent failure the same file legislates against. Pinned by
    `test_an_owners_own_real_worktree_is_the_documented_boundary`.
+   **The same root has a second, opposite symptom, and it is NOT a reason to widen the rule:** a real
+   linked worktree under a fleet root whose name is not `wt-<slug>` reads PROTECTED (§2a, measured
+   **25 of 33** in the reap log), so those lanes are not dispatchable. Widening to "any real linked
+   worktree at depth 1" would fix that by accepting the owner's own scratch work instead — the
+   failure in the paragraph above, which is the more expensive one. Both are #2213.
 2. **Three senders still decide by name** (#2214): `turn-classify.py`'s `NEVER_NUDGE`,
    `orchestrator-heartbeat.sh`'s `free=`/`wip=` capacity list, and `orch-send.sh`'s map-row
    refusal. They predate this rule and each holds a *different* datum (a session file, a Bash

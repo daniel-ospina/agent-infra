@@ -1069,6 +1069,16 @@ def _rp(path: str) -> str:
     own answer (the same fail-closed rule the lane classifier's `_real` uses)."""
     if not isinstance(path, str) or not path:
         return ""
+    # ⛔ REJECT AN EMBEDDED NUL EXPLICITLY, DO NOT CATCH IT (review round 11, P2, MEASURED). On
+    # Python **3.9** `realpath` does not raise for a NUL — `islink()` swallows it — so the path came
+    # back unchanged and `_is_spawn_target`'s `p.startswith(root + os.sep)` arm accepted it `by
+    # construction`, making a poisoned path a spawn target. `/usr/bin/python3` here is 3.9.6 and it is
+    # the interpreter the orchestrator scripts invoke; CI pins 3.12, where the `except` fires, so the
+    # suite was green while the deployed runtime failed open. Must stay in step with the lane
+    # classifier's `_real` (pinned by `test_identity_evidence_never_raises_on_a_poisoned_path` and
+    # `test_is_spawn_target_accepts_only_fleet_shaped_worktrees`).
+    if "\x00" in path:
+        return ""
     try:
         return os.path.realpath(path)
     except (OSError, ValueError):

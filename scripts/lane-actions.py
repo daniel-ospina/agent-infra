@@ -441,6 +441,24 @@ def _is_fleet_wt_dir(path):
     return False
 
 
+# ⛔ STATED BOUNDARY, AND IT IS FAIL-CLOSED ON PURPOSE (review round 11, P1, MEASURED). A REAL linked
+# worktree directly under a fleet root whose name is not `wt-<slug>` (`/tmp/w9516`, `/tmp/p9660-resid`,
+# `/tmp/l9400`) does NOT match the arm above, so it reads PROTECTED — the owner's. Measured on this box:
+# 25 of the 33 real linked `/tmp` worktrees in `state/pi-reap-worktrees.log` are classified that way.
+#
+# The tempting fix is to drop the name and accept any real linked worktree at depth 1. DO NOT: that is
+# the reverse failure, and it is the one this PR exists to prevent. `git worktree add ~/tortoise-wip
+# fix/x` produces exactly that shape, so the owner's own scratch work would become a dispatch target,
+# a pr-doctor `reset --hard` target, and a heartbeat typing target — the `Personal website` incident
+# re-created. The pin is `test_a_real_worktree_in_a_fleet_root_is_still_not_a_lane_without_the_NAME`.
+#
+# Neither spelling is the real question. Both directions need PROVENANCE — a durable record of which
+# worktrees the fleet itself created — which is agent-infra#2213 (`_spawn_marker_worktrees` is the only
+# such record today, and measurement shows it names only `<repo>/.worktrees/prd-*`, so it cannot yet
+# adjudicate these). Until that registry exists, unknown provenance resolves to the owner: refusing to
+# type into someone's work is the cheap error, dispatching into it is not. Filed, not forgotten.
+
+
 def _real(path):
     """The resolved absolute path, or **None** when it cannot be resolved. NEVER raises.
 
@@ -456,6 +474,18 @@ def _real(path):
     `wt-` first segment and read as FLEET). Every caller turns None into "no evidence".
     """
     if not isinstance(path, str) or not path:
+        return None
+    # ⛔ REJECT AN EMBEDDED NUL EXPLICITLY, DO NOT CATCH IT (review round 11, P2, MEASURED).
+    # `posixpath.realpath` only RAISES `ValueError` for a NUL from 3.10; on **3.9** it goes through
+    # `islink()`, which swallows it, and returns the string unchanged. `/usr/bin/python3` here is
+    # 3.9.6 and it is what `heartbeat-loop.sh` / `orchestrator-heartbeat.sh` run these files with, so
+    # the `except ValueError` below pinned a 3.12-only behaviour: measured, `_real('/tmp/cell-home/
+    # wt-1\x00bad')` returned the poisoned spelling on 3.9, and `_is_fleet_wt_dir` then read its
+    # `wt-` first segment as FLEET — the exact "poisoned cwd decides its own classification" failure
+    # this docstring says it prevents. CI pins 3.12, so the suite was green while the deployed
+    # runtime was unguarded. A NUL can never appear in a real path, so testing for it is sound on
+    # every interpreter and does not depend on which one is running.
+    if "\x00" in path:
         return None
     try:
         return os.path.realpath(path)
@@ -639,8 +669,11 @@ def lane_identity(row, markers=None):
     for m in sorted(marks):
         if _under(cwd, m):
             return "FLEET", ("its session cwd %s carries a fleet spawn marker (%s)" % (cwd, m))
-    return "OWNER", ("its session cwd %s is NOT a fleet worktree -- PROTECTED as the owner's "
-                     "own work" % cwd)
+    return "OWNER", ("its session cwd %s is NOT a demonstrable fleet worktree -- PROTECTED "
+                     "(fail-closed). This asserts the RULE, not ownership: a real linked worktree "
+                     "outside the `wt-<slug>` shape lands here too, because unknown provenance "
+                     "resolves to the owner (agent-infra#2213) -- refusing costs a dispatch cycle, "
+                     "accepting types into someone's uncommitted work" % cwd)
 
 
 # ── STEP 1: does the process exist? (strict attribution or NO SIGNAL) ──────────────────────
