@@ -528,16 +528,41 @@ check "the same install succeeds with no foreign loop (rc=0)" 0 "$?"
     || bad "the control arm did not install into the fixture (out: $(tr -d '\n' <"$TMP/census-gone.out" | cut -c1-220))"
 
 echo "── the farm declares what the unit execs ──"
-for f in pr-repair-loop.sh install-repair-service.sh; do
-    # ⛔ NO PIPE INTO `grep -q` (scripts/check-no-sigpipe-grep.sh): a quiet grep exits on the first match
-    # and the producer takes SIGPIPE, so under `set -o pipefail` a MATCH can read as a failure. Capture and
-    # test in the shell.
-    farm_line="$(grep -oE 'fleet_srcs=\([^)]*\)' "$ROOT/pi-bootstrap/setup.sh" 2>/dev/null || true)"
-    case "$farm_line" in
-        *" $f "*|*" $f)"*) ok "setup.sh's farm set declares $f" ;;
-        *) bad "setup.sh's farm set does NOT declare $f — the unit would exec a file no cell installs" ;;
+# ⛔ NO PIPE INTO `grep -q` (scripts/check-no-sigpipe-grep.sh): a quiet grep exits on the first match and
+# the producer takes SIGPIPE, so under `set -o pipefail` a MATCH can read as a failure. Capture and test in
+# the shell. ⛔ AND THE CAPTURE MUST BE ANCHORED (review of this PR): unanchored, the same file's DOC
+# COMMENT contains `fleet_srcs=\(…\)` as prose, so a mention could satisfy a declaration assertion. The
+# delimiter set also has to cover EVERY legal position in the array — first, middle, last — because a
+# `case` pattern cannot use `[[:space:](]` (a bracket expression inside a pattern is a syntax error).
+farm_declares() { # <script basename> <setup.sh path> -> 0 declares / 1 does not
+    local f="$1" file="$2" line
+    line="$(grep -E '^fleet_srcs=\(' "$file" 2>/dev/null || true)"
+    case "$line" in
+        *"($f "*|*" $f "*|*" $f)"*) return 0 ;;
+        *) return 1 ;;
     esac
+}
+for f in pr-repair-loop.sh install-repair-service.sh; do
+    farm_declares "$f" "$ROOT/pi-bootstrap/setup.sh" \
+        && ok "setup.sh's farm set declares $f" \
+        || bad "setup.sh's farm set does NOT declare $f — the unit would exec a file no cell installs"
 done
+# ...and the assertion discriminates: first position, last position, absent, and a PROSE mention only.
+printf 'fleet_srcs=(%s other.sh)\n' pr-repair-loop.sh >"$TMP/farm-first.sh"
+printf 'fleet_srcs=(other.sh %s)\n' pr-repair-loop.sh >"$TMP/farm-last.sh"
+printf 'fleet_srcs=(other.sh)\n' >"$TMP/farm-absent.sh"
+printf '# a doc comment that says fleet_srcs=(pr-repair-loop.sh other.sh)\nfleet_srcs=(other.sh)\n' \
+    >"$TMP/farm-prose.sh"
+farm_declares pr-repair-loop.sh "$TMP/farm-first.sh" && ok "the declaration check finds FIRST position" \
+    || bad "the declaration check misses first position (a legal, still-declared array)"
+farm_declares pr-repair-loop.sh "$TMP/farm-last.sh" && ok "the declaration check finds LAST position" \
+    || bad "the declaration check misses last position"
+farm_declares pr-repair-loop.sh "$TMP/farm-absent.sh" \
+    && bad "the declaration check PASSES on an array that does not list the script" \
+    || ok "the declaration check refutes an array that does not list the script"
+farm_declares pr-repair-loop.sh "$TMP/farm-prose.sh" \
+    && bad "a PROSE mention outside the array satisfies the declaration check" \
+    || ok "a PROSE mention outside the array does not satisfy the declaration check"
 
 echo
 if [ "$FAIL" -eq 0 ]; then
