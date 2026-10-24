@@ -772,6 +772,84 @@ async function partB() {
     expectTrue("B9v-cont3: baseline restored to the original for the remaining suites (#1144 F3 control)",
       restoreBaseline === undefined, `handler returned ${JSON.stringify(restoreBaseline)}`);
 
+    // ── B9w–B9z: #2277 — a lane rooted ELSEWHERE can advance a hub, but only
+    // on a MEASURED fast-forward proof ────────────────────────────────────
+    // Measured 2026-10-21 on the agent-infra hub itself: `0 ahead / 76 behind
+    // origin/main`, clean, and BOTH lossless recovery verbs refused — so the
+    // fleet ran a 76-commit-stale rail (#2264's `--expect-head` absent from the
+    // checkout) and no lane rooted outside that repo could advance it. The
+    // allowance required baseline.repoKey === the sync op's repoKey, which such
+    // a lane can never satisfy; the arm now decides on a live measurement.
+    const ffOrigin = join(tmp, "ff-origin.git");
+    // #2581 — the bare repo is EMPTY, so the branch the clones below check out is named by
+    // `init.defaultBranch` from the box's EFFECTIVE config (this suite replaces HOME before it
+    // loads, so only the system/ambient channel reaches it). Where it is unset (a CI runner, a
+    // fresh cell) git names it `master`, `git push -q origin main` below fails on the refspec, and
+    // the suite reads as a regression. Name the branch in the FIXTURE (`-b main`), not on the box.
+    execSync(`git init -q --bare -b main "${ffOrigin}"`, { stdio: "ignore" });
+    const ffSeed = join(tmp, "ff-seed");
+    execSync(`git clone -q "${ffOrigin}" "${ffSeed}"`, { stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: ffSeed, stdio: "ignore" });
+    writeFileSync(join(ffSeed, "a.txt"), "a\n");
+    execSync("git add a.txt && git commit -qm c1 && git push -q origin main", { cwd: ffSeed, stdio: "ignore" });
+    const ffHub = join(tmp, "ff-hub");
+    execSync(`git clone -q "${ffOrigin}" "${ffHub}"`, { stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: ffHub, stdio: "ignore" });
+    // origin gains a commit the hub has NOT integrated → strictly behind.
+    writeFileSync(join(ffSeed, "b.txt"), "b\n");
+    execSync("git add b.txt && git commit -qm c2 && git push -q origin main", { cwd: ffSeed, stdio: "ignore" });
+    execSync("git fetch -q origin", { cwd: ffHub, stdio: "ignore" });
+    const ffBehindCount = execSync("git rev-list --count HEAD..@{upstream}", { cwd: ffHub, encoding: "utf8" }).trim();
+    expectTrue(`B9w-pre: the foreign hub fixture is strictly BEHIND its upstream (commits behind: ${ffBehindCount})`,
+      ffBehindCount === "1", `rev-list count = ${ffBehindCount}`);
+
+    const ffForeign = await callBash(`git -C ${ffHub} pull --ff-only`);
+    expectTrue("B9w: a lane with NO baseline for that repo CAN advance a clean, strictly-behind default branch (`git -C <hub> pull --ff-only`) (#2277)",
+      ffForeign === undefined, `handler returned ${JSON.stringify(ffForeign)} — the measured proof was not admitted`);
+
+    const ffExplicit = await callBash(`git -C ${ffHub} pull --ff-only origin main`);
+    expectTrue("B9x: an EXPLICIT source ref is REFUSED on the foreign arm (the target must provably BE the upstream) (#2277)",
+      !!ffExplicit && ffExplicit.block === true && /#1144/.test(ffExplicit.reason ?? ""),
+      `handler returned ${JSON.stringify(ffExplicit)}`);
+
+    const ffNoFf = await callBash(`git -C ${ffHub} pull`);
+    expectTrue("B9x2: a bare `pull` on the foreign hub is REFUSED (not a provable fast-forward) (#2277)",
+      !!ffNoFf && ffNoFf.block === true, `handler returned ${JSON.stringify(ffNoFf)}`);
+
+    const ffEqual = join(tmp, "ff-equal");
+    execSync(`git clone -q "${ffOrigin}" "${ffEqual}"`, { stdio: "ignore" });
+    const ffUpToDate = await callBash(`git -C ${ffEqual} pull --ff-only`);
+    expectTrue("B9y: an UP-TO-DATE checkout is REFUSED on the foreign arm (nothing to fast-forward — this is not a blanket allowance) (#2277)",
+      !!ffUpToDate && ffUpToDate.block === true, `handler returned ${JSON.stringify(ffUpToDate)}`);
+
+    writeFileSync(join(ffHub, "dirty.txt"), "x\n");
+    const ffDirty = await callBash(`git -C ${ffHub} pull --ff-only`);
+    expectTrue("B9y2: a DIRTY foreign hub is REFUSED (the clean-tree read covers the checkout the op MOVES) (#2277)",
+      !!ffDirty && ffDirty.block === true, `handler returned ${JSON.stringify(ffDirty)}`);
+    execSync("git clean -qfd", { cwd: ffHub, stdio: "ignore" });
+
+    // A LOCAL branch with an upstream it is strictly behind: the ONLY reason to
+    // refuse is that it is not the checkout's default branch (that is the
+    // discriminator for the check).
+    execSync("git checkout -q -b feat/local", { cwd: ffHub, stdio: "ignore" });
+    execSync("git branch -q --set-upstream-to=origin/main feat/local", { cwd: ffHub, stdio: "ignore" });
+    const ffBehindBranch = execSync("git rev-list --count HEAD..@{upstream}", { cwd: ffHub, encoding: "utf8" }).trim();
+    expectTrue(`B9y3-pre: the non-default branch fixture is behind ITS OWN upstream (commits behind: ${ffBehindBranch})`,
+      ffBehindBranch === "1", `rev-list count = ${ffBehindBranch}`);
+    const ffOffBranch = await callBash(`git -C ${ffHub} pull --ff-only`);
+    expectTrue("B9y3: a foreign hub on a NON-default branch is REFUSED (#2277)",
+      !!ffOffBranch && ffOffBranch.block === true, `handler returned ${JSON.stringify(ffOffBranch)}`);
+    // Back on the default branch, now DIVERGED (a local commit + one upstream
+    // commit the local tip does not contain).
+    execSync("git checkout -q main", { cwd: ffHub, stdio: "ignore" });
+    writeFileSync(join(ffHub, "local.txt"), "l\n");
+    execSync("git add local.txt && git commit -qm local-divergence", { cwd: ffHub, stdio: "ignore" });
+    const ffDiverged = await callBash(`git -C ${ffHub} pull --ff-only`);
+    expectTrue("B9z: a DIVERGED foreign hub is REFUSED (that is `hub-worktree.sh refresh`'s shape, not this arm) (#2277)",
+      !!ffDiverged && ffDiverged.block === true && /#1144/.test(ffDiverged.reason ?? ""),
+      `handler returned ${JSON.stringify(ffDiverged)}`);
+    console.log((ffDiverged?.reason ?? "(no reason)").split("\n").map((l) => `     | ${l}`).join("\n"));
+
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
     // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE
     // script whose only path-shaped content is a markdown code span inside a

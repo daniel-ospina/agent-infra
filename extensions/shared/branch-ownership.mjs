@@ -1305,6 +1305,95 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
 }
 
 /**
+ * #2277 — the MEASURED fast-forward proof for a checkout this session does NOT
+ * own (its baseline was recorded in a different repo, or never recorded at all).
+ *
+ * The sync allowance used to require `scopeOwnRepo` — baseline.repoKey === the
+ * sync op's repoKey — so a session rooted anywhere else could NEVER advance a
+ * clean hub, even by the one operation that cannot lose a commit. Measured
+ * 2026-10-21 on the agent-infra hub: `0 ahead / 76 behind origin/main`, clean,
+ * and both lossless recovery verbs refused (`merge --ff-only`, and
+ * `restore --staged` for the residue) — while `hub-worktree.sh`'s own header
+ * calls `git pull --ff-only` "M4-sanctioned recovery". The fleet therefore ran
+ * a 76-commit-stale rail (no `--expect-head` in `scripts/record-review.sh`).
+ *
+ * Ownership is a PROXY for "this move cannot hurt another session"; the effect
+ * below is the property itself, measured on the live checkout, and it is
+ * strictly stronger for the data-loss question:
+ *
+ *   default branch  — `refs/remotes/origin/HEAD` names a branch and the
+ *                     checkout is on it. Read, never assumed: no hardcoded
+ *                     "main".
+ *   upstream        — the branch has a configured upstream (`@{upstream}`
+ *                     resolves), so `pull`/`merge` with no source ref target
+ *                     exactly that commit.
+ *   ancestor        — `git merge-base --is-ancestor HEAD @{upstream}` (rc 0):
+ *                     the local tip is IN the upstream history, so the move
+ *                     cannot move backwards and cannot rewrite or drop a
+ *                     commit. A diverged or ahead hub fails this and stays
+ *                     refused (that is `hub-worktree.sh refresh`'s shape).
+ *
+ * Anything unmeasurable (no cwd, git error, no remote HEAD, no upstream) fails
+ * closed. The CLEAN-TREE precondition is measured by the caller
+ * (`_checkoutTreeClean`) so this helper stays a pure history question.
+ *
+ * @param {string|null|undefined} cwd — the sync op's RESOLVED checkout
+ * @param {string|null|undefined} branch — its current branch (from the same read)
+ * @returns {{ok: boolean, why?: string, branch?: string, upstream?: string}}
+ */
+export function fastForwardOntoUpstreamProof(cwd, branch) {
+  if (!cwd) return { ok: false, why: "the sync target checkout cannot be resolved" };
+  const run = (cmd) => execSync(cmd, { encoding: "utf-8", cwd, timeout: 5000 }).trim();
+  // The allowance is about the SHARED MAIN checkout (the one every session of
+  // that repo sees). A linked worktree has its own HEAD and is not this arm's
+  // business — refuse it rather than widen the surface.
+  let gitDir = "";
+  try {
+    gitDir = run("git rev-parse --git-dir");
+  } catch {
+    return { ok: false, why: "the checkout's git dir cannot be resolved" };
+  }
+  if (gitDir.includes("/worktrees/") || gitDir.endsWith("/worktrees")) {
+    return { ok: false, why: "the target is a LINKED WORKTREE, not the shared main checkout" };
+  }
+  let def = null;
+  try {
+    def = run("git symbolic-ref --quiet --short refs/remotes/origin/HEAD").replace(/^origin\//, "");
+  } catch {
+    def = null;
+  }
+  if (!def) {
+    return { ok: false, why: "the checkout has no refs/remotes/origin/HEAD, so its default branch cannot be measured" };
+  }
+  if (!branch || branch !== def) {
+    return { ok: false, why: `the checkout is on "${branch ?? "HEAD"}", not its default branch "${def}"` };
+  }
+  let head = null;
+  let upstream = null;
+  try {
+    head = run("git rev-parse --verify --quiet HEAD");
+    upstream = run("git rev-parse --verify --quiet '@{upstream}'");
+  } catch {
+    return { ok: false, why: "the checked-out branch has no configured upstream, so the fast-forward target is unknown" };
+  }
+  if (!head || !upstream) {
+    return { ok: false, why: "the checked-out branch has no configured upstream, so the fast-forward target is unknown" };
+  }
+  if (head === upstream) {
+    return { ok: false, why: `the checkout already equals its upstream (${head.slice(0, 8)}), so there is no fast-forward to make` };
+  }
+  try {
+    execSync("git merge-base --is-ancestor HEAD '@{upstream}'", { cwd, stdio: "ignore", timeout: 5000 });
+  } catch {
+    return {
+      ok: false,
+      why: `HEAD is not an ancestor of "${def}"@{upstream} — the checkout has diverged or is ahead, so a fast-forward cannot apply`,
+    };
+  }
+  return { ok: true, branch: def, upstream };
+}
+
+/**
  * Ownership allowance (agent-infra main, own baseline branch):
  *   merge/pull/rebase → #1144: EFFECT-gated, never verb-gated. The sync arm
  *     fires only when the caller supplies an `effect` record proving the
@@ -1389,16 +1478,34 @@ export function syncEffectAllowed(effect) {
   if (!effect || typeof effect !== "object") return false;
   const p = effect.parsedEffect;
   if (!p || typeof p !== "object") return false;
-  return effect.scopeOwnRepo === true
-    && effect.treeClean === true
+  const provable = effect.treeClean === true
     && effect.onlyGitInvocation === true
     && p.leavesDirty !== true
     && p.unverifiable !== true
     && p.ffOnly === true
     && p.rebaseEffect !== true;
+  if (!provable) return false;
+  // #2277: two ways to establish that this fast-forward is safe, and BOTH keep
+  // every effect condition above:
+  //   scopeOwnRepo          — the op acts on the session's OWN baseline repo
+  //                           (its branch-identity test stays in
+  //                           ownershipAllowed, unchanged from #1144).
+  //   foreignHubFastForward — a FOREIGN (or unbaselined) checkout, admitted
+  //                           only on a MEASURED proof that it is clean, on its
+  //                           own default branch, with HEAD an ancestor of that
+  //                           branch's upstream and no explicit source ref
+  //                           (see fastForwardOntoUpstreamProof).
+  return effect.scopeOwnRepo === true || effect.foreignHubFastForward === true;
 }
 
 export function ownershipAllowed({ opKind, currentBranch, baselineBranch, targets, syncSource, ownedBranches, effect }) {
+  const isSync = opKind === "merge" || opKind === "pull" || opKind === "rebase";
+  // #2277: a sync op proven to be a PURE fast-forward onto the checkout's own
+  // upstream needs no session baseline — requiring one is exactly the bug this
+  // issue names (a lane rooted in another repo could never advance a clean
+  // hub). The proof, not ownership, establishes the branch identity here; the
+  // own-repo arm below is untouched.
+  if (isSync && effect?.foreignHubFastForward === true && syncEffectAllowed(effect)) return true;
   if (!baselineBranch) return false;
   if (currentBranch !== baselineBranch) return false;
   switch (opKind) {

@@ -254,6 +254,31 @@ function checkLane(label, workflowFile, jobName) {
     process.exit(2);
   }
 
+  // The GUARD-COVERING jobs: every job in this workflow whose steps RUN this guard or its mutation
+  // self-test must be unconditional and blocking, wherever those steps live. This is NAME-FREE on
+  // purpose — it follows the steps, so a rename or a regroup cannot drop the coverage, and a synthetic
+  // fixture with no guard steps is not refused for the absence of a job name.
+  const guardMentioning = [];
+  for (const [id, j] of Object.entries(wf.jobs || {})) {
+    if (!j || typeof j !== "object") continue;
+    const mentionsGuard = (j.steps || []).some((s) =>
+      typeof s?.run === "string" && (s.run.includes("check-ci-lane-parity") || s.run.includes("ci-lane-parity/run.sh"))
+    );
+    if (mentionsGuard) guardMentioning.push([id, j]);
+  }
+  for (const [id, j] of guardMentioning) {
+    const gbad = [...refusalKeys(j)];
+    for (const step of j.steps || []) gbad.push(...refusalKeys(step));
+    const guniq = [...new Set(gbad)];
+    if (guniq.length > 0) {
+      err(
+        `${label}: job '${id}' runs the lane-parity guard or its mutation self-test and carries one of [${guniq.join(" ")}] — a conditional, a non-blocking failure, or a CI_LANE_* input on the job that runs the guard switches the guard off while THIS check stays green; exiting 2`
+      );
+      process.exit(2);
+    }
+    note(`   ✅ ${label}: job '${id}' runs the guard and is unconditional and blocking`);
+  }
+
   // THE CALL SITE. The step's `run` value must BE the bare call — ONE logical line, exactly it.
   // A value carrying extra lines (a folded scalar, a script with other commands, a heredoc body)
   // is a MENTION, not the call: refused rather than counted, because only a bare call's exit code
