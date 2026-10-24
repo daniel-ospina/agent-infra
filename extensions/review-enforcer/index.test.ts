@@ -7210,6 +7210,14 @@ const SPAWN_REFUSED = {
   retryable: false,
   error: "bad cwd",
 };
+/** A pre-spawn provider-latch halt (builtin-tools' haltDispatchResult): the dispatch never ran. */
+const SPAWN_LATCH = {
+  model: "deepseek-v4-flash",
+  provider: "deepseek",
+  failoverHalt: true,
+  haltAttempted: false,
+  haltReason: "halt",
+};
 
 /**
  * The one-line verdict a monitor greps — imported, NOT re-typed (review of #2665): a hardcoded
@@ -7299,6 +7307,36 @@ testAsync("#spawngate 2b — the MICRO tier takes the same capacity verdict (its
         const blocks = readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block");
         equal(blocks[0].reason, "review_gate_unspawnable");
         equal(blocks[0].tier, "micro", "the row still records the tier it was judged under");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#spawngate 2i — a PROVIDER LATCH is reported as durable state, never as an argument to fix", async () => {
+  // The end-to-end half of the shared suite's F7: a latch halt genuinely produces no verdict, so
+  // it must NOT be counted (same false PASS), but the remedy it renders has to match the cause —
+  // sending the lane to "fix the refused argument (cwd / session id)" for an exhausted provider
+  // family spends the retry budget on an unchanged dispatch (review of #2665, P2).
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_LATCH });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "a latch halt does not satisfy the floor");
+        const reason = (r as any).reason as string;
+        ok(reason.includes(UNSPAWNABLE_TOKEN), "the verdict is greppable");
+        ok(/LATCH OBSERVED/.test(reason), "names the latch it read");
+        ok(!/fix the refused argument/.test(reason), "never renders the argument remedy");
+        ok(!/less loaded moment/.test(reason), "and never blames load for a durable latch");
+        const blocks = readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block");
+        equal(blocks[0].reason, "review_gate_unspawnable", "the same mechanical reason, so monitors are unchanged");
       } finally {
         process.env.PI_MODE = prevMode;
       }

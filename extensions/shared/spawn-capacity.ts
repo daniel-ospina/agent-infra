@@ -193,6 +193,13 @@ export function classifySpawnOutcome(result: SpawnResultLike | null | undefined)
     }
     const bad = results.find((r) => r && typeof r === "object" && subagentResultFailed(r));
     if (bad) {
+      // ⚠️ DECLARED DIVERGENCE, kept fail-CLOSED (non-blocking finding on #2665). `subagent`'s
+      // PARALLEL mode returns SUCCESS when only SOME workers fail, so a batch that yielded two real
+      // reviewer verdicts and one flaky worker is refused here as "0 reviewer verdicts counted" —
+      // stricter than the producer, deliberately: this gate cannot tell which entry carried the
+      // verdict, and counting the batch would re-open the false PASS the module exists to close.
+      // The cost is a re-dispatch, not an unreviewed push. Closing it needs per-entry prompt
+      // identity from the producer (the same missing marker as #2665's residual), not a guess here.
       const why =
         typeof bad.exitCode === "number" && bad.exitCode !== 0
           ? `exitCode=${bad.exitCode}`
@@ -278,14 +285,27 @@ function num(v: number | null): string {
  * Per-attempt CLASSES, never a first-match: a ledger can hold a cut child AND a breaker refusal,
  * and a first-match rule made one of them unreachable (measured by review: `[failed,
  * circuit_open]` rendered the breaker as an argument to fix).
+ *
+ * ⛔ FOUR classes, not three, and `latch` is one of them (review of #2665, P2). A provider-latch
+ * halt (`failoverHalt` with `haltReason: "halt" | "blocked"`) is emitted BEFORE a child exists
+ * for every dispatch while a provider family is latched/exhausted. Routing it with the other
+ * pre-spawn refusals produced "fix the refused argument (cwd / session id) — the IDENTICAL
+ * dispatch is refused again", which is false on both halves: the cause is a durable latch, and
+ * the identical dispatch SUCCEEDS once it clears. `circuit_open` had already been split out for
+ * exactly this reason; the latch is the more common shape (balance / leg exhaustion).
  */
-export type SpawnFaultClass = "capacity" | "breaker" | "refusal" | "mixed";
+export type SpawnFaultClass = "capacity" | "breaker" | "latch" | "refusal" | "mixed";
 
-/** The three per-attempt predicates, named so the renderer and the class agree by construction. */
-/** The class ONE attempt belongs to — the single definition both the classifier-set and the
- *  caller's bounded ledger use, so "which class survives the window" cannot drift from
- *  "which class decides the remedy". */
-export function attemptClass(a: SpawnAttempt): "capacity" | "breaker" | "refusal" {
+/** The class ONE attempt belongs to — the single definition both the class-set and the caller's
+ *  bounded ledger use, so "which class survives the window" cannot drift from "which class
+ *  decides the remedy". */
+export function attemptClass(a: SpawnAttempt): "capacity" | "breaker" | "latch" | "refusal" {
+  // ⛔ The PRODUCER'S marker outranks the outcome label (review of #2665, P2): `failoverHalt` is
+  // set exclusively on the halt paths (pre-spawn halt, and a halt after an attempt = legs/family
+  // exhausted), so a `failed` carrying it is a durable-latch failure, not a cut child. Testing
+  // the generic outcome first filed the mid-loop halt as CAPACITY and told the lane to retry it on
+  // "a less loaded moment", which the halt cause does not support.
+  if (/failoverHalt=true/.test(a.evidence)) return "latch";
   if (a.outcome === "cut" || a.outcome === "failed") return "capacity";
   if (a.outcome === "refused" && /circuit_open/.test(a.evidence)) return "breaker";
   return "refusal";
@@ -294,30 +314,43 @@ export function attemptClass(a: SpawnAttempt): "capacity" | "breaker" | "refusal
 export function faultClasses(attempts: readonly SpawnAttempt[]): {
   capacity: boolean;
   breaker: boolean;
+  latch: boolean;
   refusal: boolean;
   /** The last attempt of each class, for the evidence line. */
   breakerAt: SpawnAttempt | null;
+  latchAt: SpawnAttempt | null;
   refusalAt: SpawnAttempt | null;
 } {
   let breakerAt: SpawnAttempt | null = null;
+  let latchAt: SpawnAttempt | null = null;
   let refusalAt: SpawnAttempt | null = null;
   let capacity = false;
   for (const a of attempts) {
     const cls = attemptClass(a);
     if (cls === "capacity") capacity = true;
     else if (cls === "breaker") breakerAt = a;
+    else if (cls === "latch") latchAt = a;
     else refusalAt = a;
   }
-  return { capacity, breaker: breakerAt !== null, refusal: refusalAt !== null, breakerAt, refusalAt };
+  return {
+    capacity,
+    breaker: breakerAt !== null,
+    latch: latchAt !== null,
+    refusal: refusalAt !== null,
+    breakerAt,
+    latchAt,
+    refusalAt,
+  };
 }
 
 /** The single fault class this ledger supports. */
 export function spawnFaultClass(attempts: readonly SpawnAttempt[]): SpawnFaultClass {
   const c = faultClasses(attempts);
-  const present = [c.capacity, c.breaker, c.refusal].filter(Boolean).length;
+  const present = [c.capacity, c.breaker, c.latch, c.refusal].filter(Boolean).length;
   if (present > 1) return "mixed";
   if (c.capacity) return "capacity";
   if (c.breaker) return "breaker";
+  if (c.latch) return "latch";
   return "refusal";
 }
 
@@ -328,6 +361,8 @@ export function spawnFaultLabel(cls: SpawnFaultClass): string {
       return "CAPACITY fault";
     case "breaker":
       return "SPAWN-PATH fault (dispatch breaker open)";
+    case "latch":
+      return "SPAWN-PATH fault (provider latch / leg exhaustion)";
     case "refusal":
       return "SPAWN-SIDE refusal (refused before a child existed)";
     case "mixed":
@@ -360,10 +395,34 @@ export function describeSpawnCapacity(
   // anything else is worth trying, so it outranks a retry; with capacity present the load/retry
   // story is then the honest one. The per-class EVIDENCE lines below are emitted independently of
   // this choice, so a mixed ledger reports every class it observed.
-  const remedy: "capacity" | "breaker" | "argument" =
-    cls === "breaker" || (cls === "mixed" && c.breaker) ? "breaker" : c.capacity ? "capacity" : "argument";
+  // Priority is the gating CONDITION, not frequency: a latch and a breaker are durable STATE that
+  // must clear before a retry is worth spending, then capacity owns the retry, and the argument
+  // class is last because it is the only one the lane can fix directly.
+  const remedy: "capacity" | "breaker" | "latch" | "argument" =
+    cls === "latch" || (cls === "mixed" && c.latch)
+      ? "latch"
+      : cls === "breaker" || (cls === "mixed" && c.breaker)
+        ? "breaker"
+        : c.capacity
+          ? "capacity"
+          : "argument";
+  // ⛔ `haltAttempted` SPLITS THE LATCH SENTENCE (VGATE round 9, P1). The producer's own contract
+  // (builtin-tools' HaltDispatchResult) is that `attempted: true` marks a halt AFTER a leg actually
+  // dispatched — its text then reports the leg that ran instead of claiming no dispatch. So a
+  // mid-loop latch must NOT be told "before a child existed": `haltAttempted=false` is the only
+  // shape that supports the pre-spawn clause. This module renders a claim only where the evidence
+  // line it printed beside it says the same thing (the #2349 discipline).
+  const latchAttempted = /haltAttempted=true/.test(c.latchAt?.evidence ?? "");
+  const latchClause = latchAttempted
+    ? "AFTER a leg ran and exhausted it"
+    : "before a child existed";
+  const latchClauseLower = latchAttempted
+    ? "after a leg ran and exhausted it"
+    : "before a child existed";
   // The header states the fault class the LEDGER supports — conditioned on the same classes, so a
-  // refusal-only ledger cannot be told its child came back, and a mixed one claims neither.
+  // refusal-only ledger cannot be told its child came back, a latch-only one cannot be told
+  // "several classes failed", and a mixed one claims neither (review of #2665: the header and the
+  // label disagreed on a latch-only ledger).
   const headline =
     cls === "capacity"
       ? "a `task`/`subagent` dispatch WAS ATTEMPTED and its child never returned a verdict"
@@ -371,7 +430,9 @@ export function describeSpawnCapacity(
         ? "a `task`/`subagent` dispatch WAS ATTEMPTED and refused BEFORE a child existed"
         : cls === "breaker"
           ? "a `task`/`subagent` dispatch WAS ATTEMPTED and the dispatch breaker refused it before a child existed"
-          : "a `task`/`subagent` dispatch WAS ATTEMPTED and produced no reviewer verdict — several spawn classes failed (see ATTEMPTS)";
+          : cls === "latch"
+            ? `a \`task\`/\`subagent\` dispatch WAS HALTED ${latchClause} because a provider family is latched/exhausted`
+            : "a `task`/`subagent` dispatch WAS ATTEMPTED and produced no reviewer verdict — several spawn classes failed (see ATTEMPTS)";
   const lines = [
     `${SPAWN_UNSPAWNABLE_TOKEN} — ${n} sub-agent spawn ATTEMPT(s), 0 reviewer verdicts counted.`,
     `   → This is a ${spawnFaultLabel(cls)}, NOT a compliance one: ${headline},`,
@@ -396,13 +457,25 @@ export function describeSpawnCapacity(
       " — reviewer bounds are load-scaled 1x (<8), 2x (8-15), 3x (>=16)."
   );
   // ── per-class EVIDENCE, each emitted only when that class was observed ──────────────
-  if (c.capacity) {
+  if (remedy === "latch") {
+    lines.push(
+      "     A provider family is latched/exhausted: that is durable STATE, and it clears on its own",
+      "     schedule — it is not load, and it is not an argument you can fix."
+    );
+  } else if (c.capacity) {
     lines.push(
       "     A loaded box legitimately stretches every attempt: a spawn that never gets a first",
       "     message is what load does to a provider request, not evidence that the reviewer was skipped."
     );
   } else {
     lines.push("     No attempt in this ledger was cut or exhausted, so load scaling is NOT the cause here.");
+  }
+  if (c.latch) {
+    lines.push(
+      `   → LATCH OBSERVED (${c.latchAt?.evidence ?? "failoverHalt=true"}): the dispatch was HALTED ${latchClauseLower}`,
+      "     because the provider family is latched/exhausted. The IDENTICAL dispatch",
+      "     succeeds once the latch clears (the balance poller clears it on verified positive balance)."
+    );
   }
   if (c.breaker) {
     lines.push(
@@ -411,10 +484,13 @@ export function describeSpawnCapacity(
     );
   }
   if (c.refusal) {
-    lines.push(
-      `   → REFUSAL OBSERVED (${c.refusalAt?.evidence ?? "status=refused"}): a pre-spawn refusal (cwd / session`,
-      "     id) — NOT a load effect, and re-dispatching the SAME argument is refused again."
-    );
+    // The gloss is derived from the EVIDENCE, not assumed (review of #2665): the refusal class also
+    // holds `results=[]` (an invalid subagent request), and telling a lane to fix "the cwd / session
+    // id" for that is the wrong-remedy failure this module exists to remove.
+    const gloss = /results=\[\]/.test(c.refusalAt?.evidence ?? "")
+      ? "an invalid subagent REQUEST (mode / parallel count / agent name) — no child was ever intended"
+      : "a pre-spawn refusal (cwd / session id) — NOT a load effect, and re-dispatching the SAME argument is refused again";
+    lines.push(`   → REFUSAL OBSERVED (${c.refusalAt?.evidence ?? "status=refused"}): ${gloss}`);
   }
   lines.push(
     "   → WHAT THIS GATE READ: the `task`/`subagent` result DETAILS of this session (the `key=value`",
@@ -429,18 +505,29 @@ export function describeSpawnCapacity(
       `     ${SPAWN_UNSPAWNABLE_TOKEN} with the ATTEMPTS + MACHINE lines above and hand the lane back.`
     );
     lines.push(
-      remedy === "breaker"
-        ? "     The review is still REQUIRED: whoever re-dispatches must WAIT for the breaker to close"
-        : remedy === "capacity"
-          ? "     The review is still REQUIRED: whoever re-dispatches must place it where a child can"
-          : "     The review is still REQUIRED: whoever re-dispatches must first fix the refused argument"
+      remedy === "latch"
+        ? "     The review is still REQUIRED: whoever re-dispatches must wait for the latch to clear"
+        : remedy === "breaker"
+          ? "     The review is still REQUIRED: whoever re-dispatches must WAIT for the breaker to close"
+          : remedy === "capacity"
+            ? "     The review is still REQUIRED: whoever re-dispatches must place it where a child can"
+            : "     The review is still REQUIRED: whoever re-dispatches must first fix the refused argument"
     );
     lines.push(
-      remedy === "breaker"
-        ? "     (state, not an argument), then dispatch again."
-        : remedy === "capacity"
-          ? "     get a first message (load-gate: scripts/load-gate.mjs)."
-          : "     named above (cwd / session id)."
+      remedy === "latch"
+        ? "     (or move the dispatch to a provider family that is not exhausted), then dispatch again."
+        : remedy === "breaker"
+          ? "     (state, not an argument), then dispatch again."
+          : remedy === "capacity"
+            ? "     get a first message (load-gate: scripts/load-gate.mjs)."
+            : "     named above (cwd / session id)."
+    );
+  } else if (remedy === "latch") {
+    lines.push(
+      `   → SUSPEND AND POLL (attempt ${n} of ${SPAWN_ATTEMPT_CAP}): the dispatch was halted ${latchClauseLower}`,
+      "     because the provider family is latched/exhausted. The identical dispatch succeeds",
+      "     once the latch clears — do NOT edit the argument, and do NOT retry in a loop (the",
+      "     balance poller clears the latch on verified positive balance)."
     );
   } else if (remedy === "breaker") {
     lines.push(

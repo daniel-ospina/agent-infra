@@ -13,6 +13,7 @@ import {
   classifySpawnOutcome,
   describeSpawnCapacity,
   spawnFaultClass,
+  attemptClass,
   readMachineCapacity,
   _setMachineCapacityOverride,
   SPAWN_ATTEMPT_CAP,
@@ -337,6 +338,56 @@ test("MIXED ledger: breaker state is never rendered as an argument to fix (F6 pr
   // The forbidden claim: the breaker described as an argument that will be refused again.
   ok(!/REFUSAL OBSERVED \(status=circuit_open\)/.test(t), "circuit_open is never filed as an argument refusal");
   ok(/MACHINE/.test(t) && /legitimately stretches every attempt/.test(t), "the capacity half is still explained");
+});
+
+test("F7: a PROVIDER LATCH halt is durable state, never 'fix the argument' (review of #2665, P2)", () => {
+  // A pre-spawn halt (`failoverHalt` with `haltReason` halt|blocked) is emitted for EVERY dispatch
+  // while a provider family is latched/exhausted. Grouped with the other pre-spawn refusals it
+  // rendered "fix the refused argument (cwd / session id) … the IDENTICAL dispatch is refused
+  // again" — false twice over: the cause is a latch, and the identical dispatch SUCCEEDS once it
+  // clears. Both shapes (pre-spawn halt, mid-loop halt) must route to the latch remedy.
+  const pre: SpawnAttempt = {
+    tool: "task",
+    outcome: "refused",
+    evidence: "failoverHalt=true haltAttempted=false haltReason=halt",
+  };
+  equal(spawnFaultClass([pre]), "latch", "a pre-spawn halt is its own class");
+  const below = render([pre]);
+  ok(/provider latch \/ leg exhaustion/.test(below), "names the latch");
+  ok(/LATCH OBSERVED \(failoverHalt=true haltAttempted=false/.test(below), "carries the evidence");
+  ok(/SUSPEND AND POLL \(attempt 1 of 3\)/.test(below), "the ACTION is wait-and-poll, not retry the same call");
+  ok(/SUCCEEDS once the latch clears|succeeds once the latch clears/.test(below), "says the identical dispatch succeeds later");
+  ok(!/fix the refused argument/.test(below), "never sends the lane to fix an argument");
+  ok(!/refused again/.test(below), "never claims a retry is refused again");
+  ok(!/less loaded moment/.test(below), "and never blames load for a durable latch");
+  ok(/HALTED before a child existed/.test(below), "the pre-spawn clause is backed by haltAttempted=false");
+  // Mid-loop halt (a child existed, legs exhausted during failover) is the same CLASS — but it must
+  // NOT inherit the pre-spawn CLAUSE (VGATE round 9, P1): the producer states `attempted: true`
+  // means a leg actually dispatched, so "HALTED before a child existed" would be a claim beside an
+  // evidence line that says the opposite.
+  const mid: SpawnAttempt = { tool: "task", outcome: "failed", evidence: "failoverHalt=true haltAttempted=true" };
+  equal(attemptClass(mid), "latch", "the mid-loop halt is the same class");
+  const midText = render([mid]);
+  ok(/AFTER a leg ran and exhausted it/.test(midText), "says a leg DID run");
+  ok(!/before a child existed/.test(midText), "and never claims no child existed");
+  ok(/SUSPEND AND POLL/.test(midText), "same durable-state remedy");
+  const atCap = render([pre, pre, pre]);
+  ok(/wait for the latch to clear/.test(atCap), "the cap advice names the latch");
+  ok(!/fix the refused argument/.test(atCap), "…and not an argument");
+  // A latch outranks a cut child: the latch is the gating condition, so retrying is still wrong.
+  const mixedLatch = render([
+    { tool: "task", outcome: "cut", evidence: "killed=true" },
+    pre,
+  ]);
+  ok(/SUSPEND AND POLL/.test(mixedLatch), "a mixed ledger with a latch waits rather than retrying");
+});
+
+test("the refusal gloss is derived from the EVIDENCE, not assumed (review of #2665)", () => {
+  const invalidReq = render([{ tool: "subagent", outcome: "refused", evidence: "results=[]" }]);
+  ok(/invalid subagent REQUEST/.test(invalidReq), "results=[] is diagnosed as an invalid request");
+  ok(!/cwd \/ session id/.test(invalidReq), "…and not as a cwd/session-id refusal");
+  const cwd = render([{ tool: "task", outcome: "refused", evidence: "status=invalid-cwd" }]);
+  ok(/cwd \/ session id/.test(cwd), "a real pre-spawn refusal keeps the cwd/session-id gloss");
 });
 
 test("an ARGUMENT refusal (invalid-cwd) still gets the argument remedy — the split is not a blanket", () => {
