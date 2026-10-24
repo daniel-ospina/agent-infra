@@ -2479,7 +2479,8 @@ function hasApiWriteFlagAnywhere(scan: { tokens: string[] }): boolean {
  *   … ; rsync -a ./ host:/srv/app/
  * ⛔ THIS IS A DENY LIST, SO IT IS INCOMPLETE BY CONSTRUCTION. The fail-closed form is a POSITIVE
  * allowlist of command-position words, which is a larger change than #2204 makes; the residual is
- * filed as a follow-up rather than implied closed by this set.
+ * filed as #2755 (`osascript -e 'do shell script …'`, `rm -rf <dir>`, and `alias x=/tmp/p.sh; x`
+ * are each certified a read at zero dispatches today) rather than implied closed by this set.
  */
 const REMOTE_WRITE_PROGRAMS = new Set([
   "curl", "wget", "http", "https", "httpie", "nc", "ncat", "netcat", "socat",
@@ -2517,6 +2518,81 @@ function isUnreadableProgramWord(w: string): boolean {
  * The target is now recognised POSITIONALLY: directly attached to its operator, ending its
  * segment, and with a command before the operator to attach the redirection to.
  */
+/**
+ * Is token `i` the COMMAND WORD of its own simple command — i.e. is the first word the shell
+ * would resolve as a program here?
+ *
+ * ⛔ `isCommandPositionAt` CANNOT ANSWER THIS, AND ASSUMING IT DID WAS A P0 BYPASS (#2206 cycle-3
+ * review). It reads the IMMEDIATELY preceding token, so a redirection whose TARGET is a separate
+ * word puts that target between the operator and the program:
+ *
+ *     for n in 1; do gh pr view $n; done; > a /bin/bash /tmp/x.sh
+ *
+ * `/bin/bash`'s previous token is `a`, which is neither a separator nor an introducer, so
+ * `isCommandPositionAt` said "not a command position" — while bash opens `a`, then RUNS `/bin/bash`
+ * as the command of that segment. The command was certified `Read-only … the ≥1-dispatch floor
+ * covers writes, not reads` and the script RAN (reproduced through the real `tool_call` handler).
+ * Adding the target to the redirection spellings is not enough: the same hole is reached through
+ * `2>&1`'s `&`-residue, so the question is answered POSITIONALLY instead.
+ *
+ * A word is the command word when everything between it and its segment start is EXCUSED: a
+ * redirection operator, a word that is some operator's TARGET, an assignment prefix (`FOO=1`) or a
+ * reserved word (`done`). The first word that is none of those is the command; every word after it
+ * is an argument, and an argument is data to the shell — `gh pr view 1 > a /bin/bash` passes
+ * `/bin/bash` to `gh`, it never runs it.
+ */
+function isSimpleCommandWordAt(scan: ScanTokens, i: number): boolean {
+  const isSeparator = (gap: string | undefined): boolean => /[;&|(){!\n\r]/.test(gap ?? "");
+  const reservedWord = /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/;
+  const assignmentPrefix = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/;
+  let j = i - 1;
+  while (j >= 0) {
+    const t = scan.tokens[j] ?? "";
+    // A word directly after a redirection operator is that operator's TARGET, so it is never a
+    // command word: `> a /bin/bash` opens `a` and then still needs its command. Consume the pair.
+    if (j >= 1 && REDIRECTION_TOKEN.test(scan.tokens[j - 1] ?? "")) {
+      j -= 2;
+      continue;
+    }
+    const excused =
+      REDIRECTION_TOKEN.test(t) ||
+      assignmentPrefix.test(shellWord(t)) ||
+      reservedWord.test(shellWord(t));
+    if (!excused) return false; // a real word precedes → `i` is an ARGUMENT, not a program
+    // A separator BEFORE this excused token means nothing earlier belongs to this command.
+    if (isSeparator(scan.gaps[j])) return true;
+    j--;
+  }
+  return true;
+}
+
+/**
+ * Is there an UNQUOTED single `|` in the gap before token `i`?
+ *
+ * ⛔ THE PIPE TEST READ THE RAW GAP, SO A QUOTED `|` COUNTED AS A PIPE (#2206 cycle-3 review, P1).
+ * The tokenizer splits on the character, so in the fleet's ordinary triage read
+ *
+ *     gh pr view $n --json comments --jq '.[] | .body'
+ *
+ * the quoted filter becomes the tokens `.[]`, `|`, `body'`, and the stage test then read `body` as a
+ * pipeline STAGE — which is not a readable filter, so the read was refused. Same for
+ * `grep -E 'open|closed'`. The shell runs neither as a pipe: both sit inside quotes, which the
+ * shared parser's own `mask` (`unquotedMask`, #966) already records per character, so the test
+ * consults it rather than re-deriving quote state here.
+ */
+function hasUnquotedPipeInGap(scan: ScanTokens, i: number): boolean {
+  const gap = scan.gaps[i] ?? "";
+  if (!gap.includes("|")) return false;
+  const gapStart = (scan.starts[i] ?? 0) - gap.length;
+  for (let k = 0; k < gap.length; k++) {
+    if (gap[k] !== "|") continue;
+    if (scan.mask[gapStart + k] !== true) continue; // inside quotes → data, not a pipe
+    if (gap[k - 1] === "|" || gap[k + 1] === "|") continue; // `||` is a separator, not a pipe
+    return true;
+  }
+  return false;
+}
+
 function isTrailingRedirectTarget(scan: ScanTokens, i: number): boolean {
   if (i < 1) return false;
   if (!REDIRECTION_TOKEN.test(scan.tokens[i - 1])) return false;
@@ -2706,10 +2782,14 @@ export function readsOnlyGhRead(command: string): boolean {
     // (refusing them refused the ordinary `gh pr view … --json body | jq -r .body` read — fresh
     // review, P2). The pipeline case is judged by the shell/interpreter test in (4), not here.
     const gapBefore = scan.gaps[i] ?? "";
-    const pipedIn = /(^|[^|])\|([^|]|$)/.test(gapBefore);
+    const pipedIn = hasUnquotedPipeInGap(scan, i);
     // A WORD FRAGMENT directly attached to a substitution close is not necessarily a program: in
-    // `gh api repos/o/r/commits/$(gh api repos/x --jq .sha)/check-runs` the `/check-runs` token is
-    // the tail of the endpoint ARGUMENT.
+    // `gh pr view $(gh api repos/x --jq .a)/x` the `/x` token is the tail of a view ARGUMENT.
+    // ⛔ The earlier example of this shape was `gh api repos/o/r/commits/$(gh api repos/x --jq
+    // .sha)/check-runs`, and it does NOT hold: the `gh api` arm refuses ANY substitution in its
+    // argument list (`hasSubstitutionAt`), deliberately, because an `echo`-fed flag is a write
+    // (`gh api repos/x $(echo -f title=pwn)`). So the api spelling is refused by that arm before
+    // this exemption can be reached — the exemption is live only for the non-api read verbs.
     //
     // ⛔ EVERY LEXICAL VERSION OF THIS TEST WAS A P0 BYPASS (#2206 review, two rounds). Round 1
     // exempted anything whose gap merely ENDED in `)` (`.trimEnd()`), so `$(…) /bin/bash` with a
@@ -2734,23 +2814,21 @@ export function readsOnlyGhRead(command: string): boolean {
     // ⛔ A QUOTED WORD IN COMMAND POSITION IS STILL THE COMMAND (#2206 review, P0) — see the loop
     // header. This is the ONLY question a data token owes; below here the raw token is read for
     // constructs and substitutions, which a quoted region is data to.
+    // ⛔ ONE COPY, AND `isSimpleCommandWordAt` IS WHY (#2206 cycle-3 review, P0 + P2). The
+    // redirection-clause of `isCommandPositionAt` reads only the token IMMEDIATELY before the word,
+    // so `> a /bin/bash` slipped through: the target `a` sat between the operator and the program.
+    // The predicate is now answered positionally (see `isSimpleCommandWordAt`), and the SECOND,
+    // byte-identical copy of this condition that used to follow the `isData` skip is deleted — it
+    // could never be reached (same inputs, same expression), and it read as a class covered twice.
     if (
       !pipedIn &&
       !attachedToClose &&
       !isTrailingRedirectTarget(scan, i) &&
-      isCommandPositionAt(scan, i) &&
+      (isCommandPositionAt(scan, i) || isSimpleCommandWordAt(scan, i)) &&
       !REDIRECTION_TOKEN.test(t) &&
       isUnreadableProgramWord(word(i))
     ) return false;
     if (isData(i)) continue;
-    if (
-      !pipedIn &&
-      !attachedToClose &&
-      !isTrailingRedirectTarget(scan, i) &&
-      isCommandPositionAt(scan, i) &&
-      !REDIRECTION_TOKEN.test(t) &&
-      isUnreadableProgramWord(word(i))
-    ) return false;
     // Shell STRUCTURE (`{ …; }`, a subshell's parens, `[ … ]`) is not a program. Its BODY is scanned
     // on its own, so skipping the brace neither widens nor narrows what runs — `{ cut …; } | tr …`
     // was refused only because `{` sat in a command position (measured on the corpus).
@@ -2808,7 +2886,7 @@ export function readsOnlyGhRead(command: string): boolean {
     // stage word, and a quoted stage is still executed: `gh pr view 1 | "sort" -o /tmp/f` was
     // certified a read. The pipe test below is what identifies a stage; whether the word was written
     // with quotes is irrelevant to what the shell runs.
-    if (!/(^|[^|])\|([^|]|$)/.test(scan.gaps[i] ?? "")) continue;
+    if (!hasUnquotedPipeInGap(scan, i)) continue;
     // ⛔ NO `isData(i - 1)` SKIP (#2206 review, P1). It was meant to stop a QUOTED argument that
     // precedes the pipe from looking like a stage, but it skipped the STAGE CHECK ITSELF: one data
     // token was enough to certify `… gh pr view $n --json "body" | sort -o <file>` as a read, and
@@ -5713,7 +5791,8 @@ export function dispatchFloorMessage(tier: string, role: ReviewerRole = "self"):
           "pre-flight writes when the issue carried no complexity label. That is an UNDETERMINED tier, " +
           "not a stricter one: the ≥1-dispatch floor is uniform (#485), so the same dispatch satisfies " +
           "it at every tier."
-        : "read from the tier marker (/tmp/agent-issue-complexity), which the pre-flight wrote.";
+        : "read from the tier marker (/tmp/agent-issue-complexity); this extension can see the " +
+          "marker's CONTENT, not who wrote it.";
   const recovery =
     role === "reviewer"
       ? [

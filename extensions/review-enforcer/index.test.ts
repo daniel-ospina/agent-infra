@@ -2764,6 +2764,15 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     `gh pr view 1863 --json body | sed -n '3,12p'`,
     `gh pr view 1863 --json body | awk 'NR>1'`,
     `gh pr view 1863 --json body | jq -r .body`,
+    // ⛔ A QUOTED `|` IS NOT A PIPE (#2206 cycle-3 review, P1). The tokenizer splits on the raw
+    // character, so `'.[] | .body'` became the tokens `.[]`, `|`, `body'` and the stage test read
+    // `body` as a STAGE — refusing the fleet's ordinary triage read. These are the shapes the PR's
+    // own headline claim is about (`for … do gh pr view $n …` plus a filter), so a fix that refuses
+    // them has not delivered claim 1. The write-shaped twins below stay refused.
+    `for n in 1; do gh pr view $n --json comments --jq '.[] | .body'; done`,
+    `for n in 1; do gh pr view $n; done 2>/dev/null | grep -E 'open|closed'`,
+    `gh pr list | grep -E 'open|closed'`,
+    `for n in 1; do gh pr view $n; done | jq -r '.[] | .body'`,
     // The positive allowlist must still certify the reads a triage loop runs beside them.
     // …and a PLAIN setting or a directory on a read verb is still a read: the config guard refuses
     // only values that can name a program.
@@ -2983,6 +2992,17 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     // Separators live in the GAP, so `/bin/bash`'s previous TOKEN was the redirection `>/dev/null`
     // although a `;` sat between them, and `.trimEnd()` let a SPACE after `)` count as attached.
     "for n in 1; do gh pr view $n; done >/dev/null; /bin/bash /tmp/x.sh",
+    // ⛔ #2206 CYCLE-3 REVIEW P0 — A REDIRECTION **TARGET** BETWEEN THE OPERATOR AND THE PROGRAM.
+    // `isCommandPositionAt` reads only the token immediately before the word, so the target `a`
+    // demoted `/bin/bash` out of command position while bash ran it. Each of these was measured
+    // CERTIFIED at zero dispatches (read=true, isGitOp=true) through the real predicate, and the
+    // shell really executed the program. The question is now answered positionally
+    // (`isSimpleCommandWordAt`), because the same hole is reached through `2>&1`'s `&`-residue.
+    "for n in 1; do gh pr view $n; done; > a /bin/bash /tmp/x.sh",
+    "for n in 1; do gh pr view $n; done; 2> a /bin/bash /tmp/x.sh",
+    "for n in 1; do gh pr view $n; done; > a 2>&1 /bin/bash /tmp/x.sh",
+    "for n in 1; do gh pr view $n; done; > out.txt python3 -c 'print(1)'",
+    "for n in 1; do gh pr view $n; done; > a ./push.sh",
     "for n in 1; do gh pr view $n; done 2>/dev/null; python3 /tmp/x.py",
     // the closer case: `$(echo /bin/)sh` is NOT a fragment, it completes `/bin/sh` across the `)`
     "for n in 1; do gh pr view $n; done; $(echo /bin/)sh -c 'touch /tmp/x'",
