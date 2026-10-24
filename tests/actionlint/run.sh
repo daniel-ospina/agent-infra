@@ -448,7 +448,9 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-cancel-continuation-comment.yml" "$CFIX/push-concurrency-flow-child-ok.yml" \
   "$CFIX/pr-concurrency-flow-child.yml" \
   "$CFIX/pr-flow-format.yml" "$CFIX/pr-flow-capital.yml" "$CFIX/push-flow-false-capital.yml" \
-  "$CFIX/push-group-continuation-eof.yml" "$CFIX/pr-run-json.yml" "$CFIX/pr-group-hash-quoted.yml" "$CFIX/push-on-sequence-ok.yml"
+  "$CFIX/push-group-continuation-eof.yml" "$CFIX/pr-run-json.yml" "$CFIX/pr-group-hash-quoted.yml" "$CFIX/push-on-sequence-ok.yml" \
+  "$CFIX/pr-group-apostrophe-comment.yml" "$CFIX/pr-on-column0-sequence.yml" \
+  "$CFIX/pr-on-sequence-mapping.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -491,6 +493,7 @@ for pair in \
   "push-job-quoted-key.yml R0" \
   "pr-flow-group-comma-sha.yml R1" \
   "push-on-sequence.yml R2" \
+  "push-job-apostrophe-name.yml R0" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
@@ -554,6 +557,70 @@ if [ "$(head -c 3 "$CFIX/push-bom.yml" | od -An -tx1 | tr -d ' \n')" = "efbbbf" 
   pass "push-bom.yml still begins with a UTF-8 BOM"
 else
   fail "push-bom.yml lost its BOM — the arm no longer tests what it claims"
+fi
+
+# A sequence-of-mappings entry must be read as its KEY. Files mode does not arm the `pr_seen`
+# vacuity check, so an exit-0 assertion alone left this unpinned: recording `- pull_request:` as a
+# trigger NAMED `pull_request:` still exits 0 while reporting zero PR entry points (#2674).
+conc_run 0 "a sequence entry that is a mapping is read as its key" --table "$CFIX/pr-on-sequence-mapping.yml"
+grep -q 'pull_request:' "$OUT" \
+  && { fail "the sequence entry was recorded as a trigger named 'pull_request:'"; sed 's/^/      /' "$OUT"; } \
+  || pass "the sequence entry is not a trigger named 'pull_request:'"
+grep -q '1 PR entry point(s)' "$OUT" \
+  && pass "the sequence entry counts as one PR entry point" \
+  || { fail "the sequence entry was not counted as a PR entry point"; sed 's/^/      /' "$OUT"; }
+
+# An exempt guard that DROPS its PR trigger and gains a `concurrency:` block must still be refused.
+# Gating the stale-exemption arm on "is this still PR-triggered" made both R4 arms unreachable at
+# once: the bookkeeping arm was satisfied by the scan and this one by the missing trigger
+# (#2660 round 9).
+EXEMPT_TREE="$(mktemp -d "${TMPDIR:-/tmp}/wfconc-exempt.XXXXXX")"
+mkdir -p "$EXEMPT_TREE/.github/workflows"
+for f in harness-single-source.yml workflow-lock.yml ci.yml; do
+  cp "$ROOT/.github/workflows/$f" "$EXEMPT_TREE/.github/workflows/" 2>/dev/null || true
+done
+cat >"$EXEMPT_TREE/.github/workflows/pipeline-compliance.yml" <<'YAML'
+# guard #2474 rationale kept
+name: Pipeline compliance
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: pipeline-compliance-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+YAML
+conc_run 1 "an exempt guard that gained concurrency WITHOUT a PR trigger is RED" --root "$EXEMPT_TREE"
+grep -q 'is an EXEMPT GUARD' "$OUT" \
+  && pass "the stale exemption is named even without a PR trigger" \
+  || { fail "the stale exemption survived because the guard lost its PR trigger"; sed 's/^/      /' "$OUT"; }
+
+# An exempt guard that R0 refuses is NOT also "never scanned": one cause, one diagnostic.
+cat >"$EXEMPT_TREE/.github/workflows/pipeline-compliance.yml" <<'YAML'
+# guard #2474 rationale kept
+name: Pipeline compliance
+on:
+  pull_request:
+concurrency:
+  group: pipeline-compliance-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    concurrency: {group: x, cancel-in-progress: true}
+    steps:
+      - run: echo ok
+YAML
+conc_run 1 "an exempt guard refused by R0 is RED" --root "$EXEMPT_TREE"
+if grep -q 'no such PR-triggered workflow was scanned' "$OUT"; then
+  fail "an R0-refused guard was ALSO reported as never scanned (two causes, one file)"
+  sed 's/^/      /' "$OUT"
+else
+  pass "the R0-refused guard is not also reported as never scanned"
 fi
 
 # R0 has several causes and each must be NAMED: one message for all of them described two files as

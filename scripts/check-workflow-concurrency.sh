@@ -268,12 +268,25 @@ function stripcomment(s,   out, i, n, c, q, nx) {
     }
     out = out c
   }
+  # UNCLOSED quote: a PLAIN scalar may contain an apostrophe, so the quote was never a scalar at all.
+  # Fall back to the whitespace rule rather than treating the rest of the line as string content —
+  # otherwise a real comment is kept as part of the value (round 9).
+  if (q != "") return stripcomment_simple(s)
   return out
+}
+# stripcomment_simple(s) — the pre-quote-aware rule, used only when a quote never closes.
+function stripcomment_simple(s,   i, n) {
+  n = length(s)
+  for (i = 2; i <= n; i++) {
+    if (substr(s, i, 1) == "#" && substr(s, i - 1, 1) ~ /[ \t]/) return substr(s, 1, i - 1)
+  }
+  if (substr(s, 1, 1) == "#") return ""
+  return s
 }
 # mask_quoted(s) — the text with the CONTENTS of quoted VALUES blanked, for matching that must not
 # fire on a string literal (a `run:` value containing JSON). A quoted scalar followed by `:` is a
-# KEY, not a value — it stays visible, or `'concurrency': {…}` would hide the very block being looked
-# for (round 8, P1).
+# KEY, not a value — it stays visible, or a quoted concurrency key would hide the very block being
+# looked for (round 8, P1).
 function mask_quoted(s,   out, i, n, c, q, nx, start, seg, j) {
   out = ""; n = length(s); q = ""; start = 0
   for (i = 1; i <= n; i++) {
@@ -295,6 +308,10 @@ function mask_quoted(s,   out, i, n, c, q, nx, start, seg, j) {
     if (c == DQ || c == SQ) { q = c; start = i; continue }
     out = out c
   }
+  # UNCLOSED quote: a plain scalar with an apostrophe, not a string. Returning the raw line keeps the
+  # job-level search able to SEE a key that follows it — an apostrophe in a job name hid a cancelling
+  # job-level block completely (round 9, P1).
+  if (q != "") return s
   return out
 }
 # splitqv(v, arr) — split a flow mapping on commas that are NOT inside a quoted scalar. Splitting on
@@ -434,6 +451,10 @@ BEGIN {
   }
 
   if (line ~ /^[^ \t]/) {                 # a TOP-LEVEL key (column 0)
+    if (cur == "on" && line ~ /^-[ \t]/) {        # a sequence entry at its parent key indent
+      seqk = substr(line, 2); sub(/[ \t]*:.*$/, "", seqk)
+      addtrigger(seqk); next
+    }
     cur = "?"
     if (match(line, "^" KEYPAT)) {
       cur = substr(line, 1, RLENGTH)
@@ -477,7 +498,10 @@ BEGIN {
   if (cur == "on") {
     ind = lineindent
     key = substr(line, ind + 1)
-    if (key ~ /^-[ \t]/) { addtrigger(substr(key, 2)); next }   # `on:` written as a block sequence
+    if (key ~ /^-[ \t]/) {                        # `on:` written as a block sequence
+      sub(/^-[ \t]+/, "", key); sub(/[ \t]*:.*$/, "", key)
+      addtrigger(key); next
+    }
     if (match(key, "^" KEYPAT)) {
       if (onindent < 0) { onindent = ind }
       if (ind == onindent) {             # a NESTED key (branches:, types:, inputs:) is not a trigger
@@ -614,11 +638,16 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
   fi
 
   # ---- R1 / R4: PR entry points ------------------------------------------------------------
+  # The stale-exemption arm is NOT gated on the file still being PR-triggered: a guard that DROPS its
+  # PR trigger and gains a `concurrency:` block is exactly the regression the exemption must not
+  # survive, and gating it on `is_pr` made both arms unreachable — the bookkeeping arm was satisfied
+  # by the scan and this one by the missing trigger (round 9, P1).
+  if is_exempt "$fname" && [ "$hasconc" -eq 1 ]; then
+    fail "$fname: is an EXEMPT GUARD (#$EXEMPT_ISSUE) but now declares \`concurrency:\` — if the rail has been fixed, remove it from EXEMPT_FILES in scripts/check-workflow-concurrency.sh in the same change; if not, this re-arms the #$EXEMPT_ISSUE fail-open [R4]"
+  fi
+
   if [ "$is_pr" -eq 1 ]; then
     if is_exempt "$fname"; then
-      if [ "$hasconc" -eq 1 ]; then
-        fail "$fname: is an EXEMPT GUARD (#$EXEMPT_ISSUE) but now declares \`concurrency:\` — if the rail has been fixed, remove it from EXEMPT_FILES in scripts/check-workflow-concurrency.sh in the same change; if not, this re-arms the #$EXEMPT_ISSUE fail-open [R4]"
-      fi
       if [ -f "$ROOT/.github/workflows/$fname" ] && ! grep -q "#$EXEMPT_ISSUE" "$ROOT/.github/workflows/$fname"; then
         fail "$fname: is EXEMPT in this check but no longer carries its \`#$EXEMPT_ISSUE\` rationale — an exception without its reason is how a fail-open becomes folklore [R4]"
       fi
