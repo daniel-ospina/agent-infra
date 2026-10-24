@@ -40,6 +40,13 @@ for f in "$DRIFT" "$SHARDS"; do
   [ -s "$f" ] || { echo "❌ missing $f — this suite grades the shipped file, so it cannot run"; exit 2; }
 done
 command -v git >/dev/null 2>&1 || { echo "❌ git not found — cannot build the fixture repo"; exit 2; }
+# ⛔ THE FIXTURE MUST HASH THE WAY THE GRADED SCRIPT DOES, or it stamps a FALSE record on a box without
+# `sha256sum`: the pipeline would emit nothing, `awk` would still exit 0, and the stamp would carry the
+# EMPTY-INPUT digest — so a missing tool would surface as "a post-install hand edit" instead of as a tool
+# error. `check-deployed-drift.sh` resolves `sha256sum`, else `shasum -a 256`; do the same and refuse.
+SHA_CMD="sha256sum"
+command -v sha256sum >/dev/null 2>&1 || SHA_CMD="shasum -a 256"
+command -v ${SHA_CMD%% *} >/dev/null 2>&1 || { echo "❌ neither sha256sum nor shasum is available — the fixture cannot write a truthful stamp"; exit 2; }
 
 PASS=0; FAIL=0
 ck() { if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1)); else printf '  ❌ %s\n' "$1"; FAIL=$((FAIL+1)); fi; }
@@ -65,7 +72,7 @@ deploy() {
   rm -rf "$O"; mkdir -p "$O"
   cp "$REPO/scripts/orchestrator-harness/a.sh" "$REPO/scripts/orchestrator-harness/b.sh" "$O/" || return 1
   local payload
-  payload="$( ( cd "$O" && for f in *.sh; do sha256sum "$f"; done ) | sha256sum | awk '{print $1}' )"
+  payload="$( ( cd "$O" && for f in *.sh; do $SHA_CMD "$f"; done ) | $SHA_CMD | awk '{print $1}' )"
   printf '{\n "commit": "%s",\n "payloadSha256": "%s",\n "agentInfraDirty": false\n}\n' \
     "$HEAD1" "$payload" > "$O/.agent-infra-stamp.json"
 }
