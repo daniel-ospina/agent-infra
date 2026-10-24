@@ -569,6 +569,23 @@ BEGIN {
   # A job written as a FLOW mapping (`build: {…, concurrency: {…}}`) hides the key from the line test
   # above, so it is looked for anywhere a flow mapping can put it (round 7, P2).
   if (match(mask_quoted(line), "[\\[{,][ \t]*" QCH "?concurrency" QCH "?[ \t]*:")) { joblevel = 1; next }
+  # The masked form hides quoted regions, and two apostrophes in ONE flow job mapping can pair around
+  # a real key: `build: {runs-on: x, name: shard-a-with-a-quote, concurrency: {..}, note: the-other}`
+  # masked the `concurrency:` away, so a cancelling JOB-level block reported GREEN. When the raw text
+  # has a key the mask hides, the mask cannot be attributed — refuse rather than read it as absent.
+  # Exclusive of `run:`/`with:`/`script:`-style values, where a quoted blob legitimately contains a
+  # colon key (a shell echo of a JSON object), which is what this line test used to mask
+  # (#2660 round 15).
+  sl_raw = stripcomment(line)
+  if (!match(mask_quoted(line), "[\\[{,][ \t]*" QCH "?concurrency" QCH "?[ \t]*:") &&
+      match(sl_raw, "[\\[{,][ \t]*" QCH "?concurrency" QCH "?[ \t]*:") &&
+      sl_raw !~ /^[ \t]*[A-Za-z_-][A-Za-z0-9_-]*[ \t]*:[ \t]*(echo|cat|printf|sh|bash)/ &&
+      scalarindent < 0 &&
+      sl_raw !~ /^[ \t]*(-[ \t]+)*(run|with|script|shell|env|description)[ \t]*:/) {
+    concbad = 1
+    concwhy = "a \`concurrency:\` key is present in the raw text but sits inside a quoted region this reader cannot attribute"
+    next
+  }
 
   if (cur == "concurrency") {
     t = trim(line)
@@ -732,7 +749,8 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
         # style placeholders plus github.workflow, where a
         # template-level sed cannot reach it (its `}` closes the pattern first). Comparing the raw
         # template refused two DIFFERENT workflows as sharing one group (round 11, P2).
-        resolved="${group//'github.workflow'/$identity}"
+        resolved="$(printf '%s' "$group" | sed -e "s/github\.workflow_ref/${fname}_wfref/g")"
+        resolved="$(printf '%s' "$resolved" | sed -e "s/github\.workflow\([^_]\)/$identity\1/g" -e "s/^github\.workflow$/$identity/")"
         resolved="$(printf '%s' "$resolved" | sed -E 's/\$\{\{[[:space:]]*([^}]*[^}[:space:]])[[:space:]]*\}\}/${{ \1 }}/g')"
         printf '%s\t%s\n' "$resolved" "$fname" >>"$TMP_GROUPS"
         # A per-commit variable makes every head (and every retry) its own group, so the block cancels
@@ -741,8 +759,9 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
         # `github.run_id` alongside the PR number reported GREEN (round 4, P1). The list is a SUFFIX
         # test, not a closed set of spellings: `github.event.pull_request.head.sha` (the canonical
         # per-head key) contains no `github.sha` substring and passed before (round 4, P1).
-        case "$group" in
-          *'.sha'*|*'github.workflow_sha'*|*'run_id'*|*'run_number'*|*'run_attempt'*|*'head_commit.id'*)
+        exprs="$(printf '%s' "$group" | grep -o '\${{[^}]*}}' | tr '\n' ' ')"
+        case "$exprs" in
+          *'.sha'*|*'_sha'*|*'run_id'*|*'run_number'*|*'run_attempt'*|*'head_commit.id'*)
             fail "$fname: \`concurrency.group\` ('$group') carries a PER-COMMIT variable — every head/attempt becomes its own group, so the block cancels nothing at all (an inert gate). Key it on \`github.ref\` / \`github.head_ref\` alone [R1]" ;;
           *)
             if has_trigger "$triggers" pull_request_target; then

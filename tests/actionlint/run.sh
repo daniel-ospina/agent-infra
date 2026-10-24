@@ -455,7 +455,8 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/push-flow-apostrophe-false.yml" "$CFIX/push-on-flow-apostrophes-false.yml" \
   "$CFIX/pr-workflow-ref.yml" "$CFIX/push-flow-apostrophe-plain-false.yml" \
   "$CFIX/pr-group-underscore-sha.yml" "$CFIX/push-flow-apostrophe-dash-pair-false.yml" \
-  "$CFIX/pr-group-workflow-ref-alone.yml"
+  "$CFIX/pr-group-workflow-ref-alone.yml" "$CFIX/pr-workflow-ref-same-name-a.yml" \
+  "$CFIX/pr-workflow-ref-same-name-b.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -510,6 +511,8 @@ for pair in \
   "push-flow-apostrophe-dash.yml R2" \
   "push-flow-apostrophe-pair.yml R2" \
   "push-flow-apostrophe-dash-pair.yml R2" \
+  "pr-group-merge-commit-sha.yml R1" \
+  "push-job-flow-apostrophe.yml R0" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
@@ -639,6 +642,18 @@ if grep -q 'declared by more than one PR workflow' "$OUT"; then
   sed 's/^/      /' "$OUT"
 else
   pass "the format() pair is not refused as sharing a group"
+fi
+
+# Two workflows with the SAME `name:` keyed on `github.workflow_ref` are disjoint at runtime: the ref
+# carries the workflow FILE. Refusing them was a false red whose message quoted a group nothing
+# evaluates (#2660 round 15).
+conc_run 0 "same name, workflow_ref: two disjoint groups" \
+  "$CFIX/pr-workflow-ref-same-name-a.yml" "$CFIX/pr-workflow-ref-same-name-b.yml"
+if grep -q 'declared by more than one PR workflow' "$OUT"; then
+  fail "the same-named workflow_ref pair was refused as sharing a group"
+  sed 's/^/      /' "$OUT"
+else
+  pass "the same-named workflow_ref pair is two groups"
 fi
 
 # An exempt guard that DROPS its PR trigger and gains a `concurrency:` block must still be refused.
