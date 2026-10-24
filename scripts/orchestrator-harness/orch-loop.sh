@@ -305,33 +305,6 @@ if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real ||
 # is the "one startup line nobody reads" failure.
 # `nochk-resolve.py` is genuinely ONE ARM: without it a NOCHECKS PR is named `READ-FAILED: the arm
 # produced no verdict` and re-read next cycle — degraded, honest, not fatal — so that one only warns.
-# ⛔ THE LOG DIRECTORY IS MADE FIRST (review P3, agent-infra#2719): this message fires exactly on a
-# fresh or partially re-seeded `$O`, which is exactly when `$O/logs` may not exist yet — writing the
-# warning before the `mkdir -p` below meant the ONE case it exists for was the one where the redirect
-# failed and the warning vanished. Same order the repo-slug.sh fatal paths use.
-mkdir -p "$O/logs" 2>/dev/null || true
-_CK_PY="$O/check-class.py"; [ -f "$_CK_PY" ] || _CK_PY="$_HERE_RS/check-class.py"
-_NCHK_PY="$O/nochk-resolve.py"; [ -f "$_NCHK_PY" ] || _NCHK_PY="$_HERE_RS/nochk-resolve.py"
-[ -f "$_CK_PY" ] || _CK_PY=""
-[ -f "$_NCHK_PY" ] || _NCHK_PY=""
-# ⛔ A FUNCTION, NOT AN INLINE BLOCK (review P1, agent-infra#2719): an inline guard is run by nothing —
-# downgrading this `exit 78` to `:` left every suite green — and this repo's convention is to extract
-# and DRIVE its startup guards. `nochk-resolve.test.sh` extracts this function and runs it.
-nochk_require_classifier() { # <check-class.py|""> <nochk-resolve.py|""> <O> <harness-dir>; exits 78
-  _ck="$1"; _nchk="$2"; _o="$3"; _hd="${4:-<unresolved>}"
-  if [ -z "$_ck" ]; then
-    _fatal_nock="FATAL check-class.py not found (looked in $_o and $_hd) — every PR's classification would be EMPTY (no merge, no fixer, no reviewer), so the controller refuses to start; re-seed it: bash $_o/deploy-harness.sh --src <harness checkout> --o $_o"
-    echo "orch-loop: $_fatal_nock" >&2
-    printf '%s [startup] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_fatal_nock" >> "$_o/logs/orch-loop.log" 2>/dev/null || true
-    exit 78
-  fi
-  if [ -z "$_nchk" ]; then
-    printf '%s [startup] ⚠️ NOCHECKS ARM ABSENT: nochk-resolve.py was not found in %s or %s — a NOCHECKS PR is NAMED as "the arm produced no verdict" and re-read next cycle (never silently, never spun); re-seed the harness (deploy-harness.sh)\n' \
-      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_o" "$_hd" >> "$_o/logs/orch-loop.log" 2>/dev/null || true
-  fi
-  return 0
-}
-nochk_require_classifier "$_CK_PY" "$_NCHK_PY" "$O" "$_HERE_RS"
 
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
@@ -391,6 +364,37 @@ safe_ref() {
   case "${1:-}" in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac
   git -C "$REPO" check-ref-format --branch "$1" >/dev/null 2>&1
 }
+
+# ⛔ THIS BLOCK SITS BELOW `safe_ref()` ON PURPOSE (agent-infra#2719). Several shipped suites
+# extract a one-line helper with `sed -n "/^$1()/,/^}/p"`; `is_num()` is such a one-liner, so its
+# extraction runs to the NEXT `^}` — anything placed above that brace is swallowed into those
+# fixtures, and this block is evaluated in their `set -u` subshell (measured: placing it higher
+# took capacity-transfer.test.sh from 90/0 to 89/4 with `_HERE_RS: unbound variable`). Below the
+# brace, every peer extraction is unchanged.
+# ⛔ THE LOG DIRECTORY IS MADE FIRST (review P3, agent-infra#2719): this message fires exactly on a
+# fresh or partially re-seeded `$O`, which is exactly when `$O/logs` may not exist yet — writing the
+# warning before the `mkdir -p` below meant the ONE case it exists for was the one where the redirect
+# failed and the warning vanished. Same order the repo-slug.sh fatal paths use.
+mkdir -p "$O/logs" 2>/dev/null || true
+_CK_PY="$O/check-class.py"; [ -f "$_CK_PY" ] || _CK_PY="$_HERE_RS/check-class.py"
+_NCHK_PY="$O/nochk-resolve.py"; [ -f "$_NCHK_PY" ] || _NCHK_PY="$_HERE_RS/nochk-resolve.py"
+[ -f "$_CK_PY" ] || _CK_PY=""
+[ -f "$_NCHK_PY" ] || _NCHK_PY=""
+# ⛔ THE STARTUP GUARD LIVES IN ITS OWN MODULE (review P1, agent-infra#2719), for a reason that is
+# measured rather than stylistic: several shipped suites extract a ONE-LINE helper with
+# `sed -n "/^$1()/,/^}/p"`, so ANY new function with a closing `}` above that point silently re-points
+# their extraction — inserting this guard inline took `capacity-transfer.test.sh` from 90/0 to 89/4
+# (`_HERE_RS: unbound variable` from the swallowed text). `$O` first, the running script's own
+# directory second, the same look-here order repo-authority.sh gets.
+if [ -f "$O/nochk-guard.sh" ]; then . "$O/nochk-guard.sh"
+elif [ -f "${_HERE_RS:-}/nochk-guard.sh" ]; then . "${_HERE_RS:-}/nochk-guard.sh"
+fi
+# ⛔ THE MODULE ITSELF CANNOT BE ABSENT: without it the guard below would be a "command not found"
+# (127) and the loop would carry on with an unclassified sweep — the fail-open this guard exists to
+# prevent, one layer up.
+command -v nochk_require_classifier >/dev/null 2>&1 \
+  || { _fatal_guard="FATAL nochk-guard.sh is missing (looked in $O and ${_HERE_RS:-<unresolved>}) — the controller cannot prove it can classify a single PR, so it refuses to start; re-seed it: bash $O/deploy-harness.sh --src <harness checkout> --o $O"; echo "orch-loop: $_fatal_guard" >&2; printf '%s [startup] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_fatal_guard" >> "$O/logs/orch-loop.log" 2>/dev/null || true; exit 78; }
+nochk_require_classifier "$_CK_PY" "$_NCHK_PY" "$O" "$_HERE_RS"
 
 # shq <value> -> a POSIX-sh-safe single-quoted word.
 # ⛔ NOT `printf %q`. bash's %q emits `$'…'` for any byte outside [[:print:]], and `$'…'` is NOT a
@@ -4716,6 +4720,16 @@ while true; do
         # ⛔ A LITERAL, NOT A BRACKET EXPRESSION. `[ "${_NR#*[post=failed]}" != "$_NR" ]` reads
         # `[post=failed]` as a CHARACTER CLASS, so the test matched every detail that contains any of
         # those letters — i.e. always — and the arm never parked at all (measured: 4 assertions red).
+        elif case "$_NR" in *"[post=ok-nomarker]"*) true ;; *) false ;; esac; then
+          # The verdict WAS published; the marker that stops a second comment could not be written.
+          # park_ctrl is the terminator, so the comment cannot be published again.
+          if park_ctrl "$PR" "${HEAD_N:-}" "NOCHECKS-UNRESOLVABLE: ${_NR} (published once; the posted marker could not be written)"; then
+            echo "#$PR PARKED — NOCHECKS-UNRESOLVABLE was published once and its marker could not be written: ${_NR}" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (parked so the verdict cannot be published twice)"
+          else
+            echo "#$PR NOCHECKS-UNRESOLVABLE published once, the marker write FAILED and the park write FAILED: ${_NR}" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (post marker unwritable; park write failed)"
+          fi
         elif case "$_NR" in *"[post=failed-inert]"*) true ;; *) false ;; esac; then
           # ⛔ THE BOUND ITSELF IS BROKEN (state/ unwritable): the post cannot be counted, so it cannot be
           # bounded — and an unbounded comment loop is worse than a named dead end. Park it, and say so.

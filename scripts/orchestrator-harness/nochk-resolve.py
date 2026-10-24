@@ -348,12 +348,22 @@ def already_posted(state_dir: str, pr: int, sha: str) -> bool:
     return os.path.exists(counter_path(state_dir, pr, sha) + ".posted")
 
 
-def mark_posted(state_dir: str, pr: int, sha: str) -> None:
+def mark_posted(state_dir: str, pr: int, sha: str) -> bool:
+    """Record that this head's verdict was published. False when it could not be.
+
+    ⛔ THIS IS THE ONE WRITE THAT GUARDS AN IRREVERSIBLE PUBLIC ACTION (review P3, agent-infra#2719).
+    It used to swallow its failure, and `already_posted()` is the ONLY thing that stops a second
+    comment — so a marker that cannot be created re-posted the verdict on EVERY terminal cycle while
+    the ledger said `[post=ok]` (measured: 2 terminal cycles -> 2 comments). A failed marker now
+    reports `ok-nomarker`, which the sweep treats as terminal-and-parked: the verdict WAS published
+    once, and the bounded thing to do is stop, not to publish it again.
+    """
     try:
         with open(counter_path(state_dir, pr, sha) + ".posted", "w") as f:
             f.write("1\n")
+        return True
     except Exception:
-        pass
+        return False
 
 
 def post_unresolvable(repo: str, pr: int, sha: str, detail: str, evidence: str,
@@ -555,7 +565,12 @@ def absent(repo: str, pr: int, args: argparse.Namespace, req: str, rgate: str) -
         # take the WAIT branch for ever, which is the unbounded wait this bound exists to end. Absence
         # of evidence takes the COUNTED path, which still needs `attempt_bound` cycles before anything
         # terminal can happen.
-        if not old and n <= wait_cycles and (age is None or age <= args.inflight_bound_min):
+        # ⛔ AN INERT COUNTER MUST NOT WAIT FOR EVER (review P3, agent-infra#2719): with `state/`
+        # unwritable, `n` is 1 on every cycle, so `n <= wait_cycles` is permanently true and the WAIT
+        # branch returned before the INERT disclosure — measured, 8 consecutive WAITs with no name for
+        # the broken bound. The WAIT is therefore allowed only when the counter actually advanced.
+        if (counted and not old and n <= wait_cycles
+                and (age is None or age <= args.inflight_bound_min)):
             return (
                 f"WAIT:{moved} a run is executing and has produced no check-run yet "
                 f"({r.get('name')} run {r.get('id')} {r.get('status')}"
@@ -624,9 +639,10 @@ def absent(repo: str, pr: int, args: argparse.Namespace, req: str, rgate: str) -
             if already_posted(args.state_dir, pr, sha):
                 post = "already-posted"
             elif post_unresolvable(repo, pr, sha, detail, evidence, inflight=bool(inflight)):
-                mark_posted(args.state_dir, pr, sha)
+                # The verdict IS published; the marker only records that. If the marker cannot be
+                # written we must still not publish it again, so the sweep parks on this token.
+                post = "ok" if mark_posted(args.state_dir, pr, sha) else "ok-nomarker"
                 prune_heads(args.state_dir, pr, sha)
-                post = "ok"
             else:
                 # ⛔ A FAILED POST IS BOUNDED TOO (review P2, agent-infra#2719). `[post=failed]` refuses
                 # to park (the park would make the miss permanent and silent), but without a counter the
