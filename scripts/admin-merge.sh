@@ -1150,7 +1150,9 @@ fetch_run_failed_job_names() {
 # only read for a run already known to be failed, where an unfinished job is not the
 # failure the log was fetched for; every NAMED non-red is excluded for the same reason.
 
-# named_unattributable_runs <provenance> <base-ref> — THE NAMED REFUSAL (#2610).
+# named_unattributable_runs <unattributed-file> <base-ref> <expected-count> — THE NAMED
+# REFUSAL (#2610). `<unattributed-file>` is the collector's `--unattributed` output, NOT
+# `--provenance`: see the ⛔ note above the body.
 #
 # WHY THIS EXISTS. The step-1c refusal (a failing run whose log yielded no failure
 # identity) used to report a COUNT — "2 of 2 failing PR run(s) yielded NO parseable
@@ -1186,17 +1188,33 @@ fetch_run_failed_job_names() {
 # yield ids — so naming from it would label a contributing run as unattributable. The
 # subset is written by `collect_union_rows`, the one place that decides `extracted`.
 named_unattributable_runs() {
-  local unattributed="${1:-}" base="${2:-}" line runref run_id names name kind
-  local base_reds base_status base_total
+  local unattributed="${1:-}" base="${2:-}" expected="${3:-}" line runref run_id names name kind
+  local base_reds base_status base_total red_names named_count
   [ -s "$unattributed" ] || return 0
-  # The base's own surface, through the ONE probe (#1261) — never a second reader.
-  check_surface_probe "$base" "the base branch '$base'" 1
-  base_status="${MAIN_HEALTH_STATUS:-}"
-  base_total="${MAIN_HEALTH_TOTAL:-}"
-  # `<name>\t<classification>` for every red the base's surface carried.
-  base_reds="$(printf '%s\n' "${MAIN_HEALTH_ALL_REDS:-}" | sed '/^$/d' | sort -u)"
-  say_err "   The failing run(s), NAMED — each check below is one whose failed-step log"
-  say_err "   yielded no failure identity, so it entered NEITHER side of the comparison:"
+  named_count="$(grep -c '[^[:space:]]' "$unattributed" 2>/dev/null || printf '0')"
+  # The base's own surface, through the ONE probe (#1261) — never a second reader. A base
+  # ref that could NOT be resolved is not a ref to probe: passing '' would have made the
+  # reader assert "'X' IS red on ''" about a branch nobody resolved, so the ref is checked
+  # and the UNANSWERED arm (below) is what speaks.
+  base_status=""
+  base_total=""
+  base_reds=""
+  if [ -n "$base" ]; then
+    check_surface_probe "$base" "the base branch '$base'" 1
+    base_status="${MAIN_HEALTH_STATUS:-}"
+    base_total="${MAIN_HEALTH_TOTAL:-}"
+    # `<name>\t<classification>` for every red the base's surface carried.
+    base_reds="$(printf '%s\n' "${MAIN_HEALTH_ALL_REDS:-}" | sed '/^$/d' | sort -u)"
+  fi
+  # THE COUNT IS CROSS-CHECKED, never assumed (#2610 review, P3-5): the refusal above prints
+  # `N of M`, and this list is the SUBJECT of that count. A subset that is short of it would
+  # otherwise read as a complete account of the unattributable runs.
+  if [ -n "$expected" ] && [ "$named_count" != "$expected" ]; then
+    say_err "   ⚠️  the collector published $named_count unattributable run(s) where the refusal"
+    say_err "   counted ${expected} — this list is INCOMPLETE, so read it as a sample, not as the set"
+  fi
+  say_err "   The failing run(s), NAMED (${named_count}) — each check below is one whose failed-step"
+  say_err "   log yielded no failure identity, so it entered NEITHER side of the comparison:"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     runref="${line##*$'\t'}"
@@ -1216,17 +1234,29 @@ named_unattributable_runs() {
       [ -n "$name" ] || continue
       say_err "   • run $run_id — check '${name}' — no parseable failure identity in its log"
       case "$base_status" in
+        "") 
+          say_err "       base: the base ref could NOT be resolved, so the counterpart question is"
+          say_err "       UNANSWERED, not answered 'no'"
+          ;;
         green|red)
           # `kind` is the classification the probe already made, so an EXEMPTED base red
           # is reported as the red it is — with the reason it did not block there.
-          kind="$(printf '%s\n' "$base_reds" | awk -F'\t' -v n="$name" '$1 == n { print $2; exit }')"
+          # ⛔ THE NAME GOES OUT OF BAND (#2610 review, P3-3): `awk -v n="$name"` processes
+          # backslash escapes in the assignment, so a check named `win\build` would be
+          # compared as `winbuild` and answered "no counterpart" when the base carries it.
+          kind="$(printf '%s\n' "$base_reds" | NR_NAME="$name" awk -F'\t' '$1 == ENVIRON["NR_NAME"] { print $2; exit }')"
           if [ -n "$kind" ]; then
             say_err "       base: '${name}' IS red on '${base}' (${kind}) — the same check NAME fails on"
             say_err "       both surfaces; the decision still compares IDENTITIES, and this run has none"
           else
             say_err "       base: NO BASE COUNTERPART FOR THIS CHECK — '${name}' is not among the"
             say_err "       ${base_total:-?} check(s) the base surface reports, of which these NAME(s) are"
-            say_err "       red: $(printf '%s\n' "$base_reds" | cut -f1 | sed '/^$/d' | paste -sd, - | sed 's/^$/none/')"
+            # ⛔ `paste` emits NO line for zero input lines, so a `sed 's/^$/none/'` AFTER it is
+            # dead code — the empty base (a GREEN base, the common case) printed `red: ` and
+            # nothing (#2610 review, P2-1). Default the CAPTURE, and print the whole answer on
+            # one line so neither half can be missing while the other is present.
+            red_names="$(printf '%s\n' "$base_reds" | cut -f1 | sed '/^$/d' | paste -sd, -)"
+            say_err "       red: ${red_names:-none}"
           fi
           ;;
         *)
@@ -6354,8 +6384,11 @@ main() {
     # that ends the run — no cost on any path that proceeds.
     local named_base_ref
     named_base_ref="$(resolve_base_ref "$PR" ${repo_args[@]+"${repo_args[@]}"})"
-    [ -n "$named_base_ref" ] || named_base_ref="main"
-    named_unattributable_runs "$TMP/pr-unattributed.txt" "$named_base_ref" || true
+    # NOT defaulted to `main`: a failed read is not a base, and asserting a red is "on main"
+    # about a ref the rail never resolved is a claim about reality it did not measure
+    # (#2610 review, P3-4). Empty reaches the reader's UNANSWERED arm.
+    named_unattributable_runs "$TMP/pr-unattributed.txt" "$named_base_ref" \
+      "$((pr_examined - pr_extracted))" || true
     exit 1
   fi
 

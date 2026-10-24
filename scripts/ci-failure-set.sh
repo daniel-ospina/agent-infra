@@ -1253,10 +1253,18 @@ collect_union_signatures() {
 # vanished here would be an id the decision never sees, which is fail-OPEN.
 # `--per-run` writes the per-run id sets detect_rotating_identity() consumes.
 # `--unattributed` (#2610) writes the examined failing runs that yielded NO identity —
-# from THIS function, because it is the one that decides `extracted`. Every arm below
-# that leaves a run unextracted writes the runref there (the zero-job arm #1482, the
-# pruned-log arm #7131, and the ordinary empty-ids arm). `--provenance` cannot stand
-# in: it holds every examined run, including the ones that DID contribute.
+# from THIS function, because it is the one that decides `extracted`. The arms below that
+# leave a run unextracted AND let the capture continue write the runref there: the
+# zero-job arm (#1482) and the ordinary empty-ids arm. `--provenance` cannot stand in: it
+# holds every examined run, including the ones that DID contribute.
+#
+# ⛔ THE PRUNED-LOG ARM (#7131) IS NOT ONE OF THEM, and the comment on it says so rather
+# than implying coverage: `run_failed_job_ids` returns 1 both for "the job list could not
+# be read" and for "read fine, no failed job", and this function treats 1 as fatal — so a
+# pruned log naming no failed job REFUSES THE WHOLE CAPTURE (the caller's extract gate),
+# and no named 1c refusal is reached for it. Making that arm live needs a distinguishable
+# status from `run_failed_job_ids` (2 = read, nothing failed), which is a behaviour change
+# in the capture with its own test; it is deliberately NOT bundled here.
 collect_union_rows() {
   local lane_file="$1" provenance="$2" report="$3" per_run="$4" unattr="${5:-}"
   local tmp_ids="" tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
