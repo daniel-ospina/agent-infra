@@ -1167,14 +1167,22 @@ pi_gate_real() { # pi_gate_real <self-path>
   return 1
 }
 
-# pi_gate_ledger <verdict> <load> <max> <cwd> <caller> — one append-only row per pi invocation.
+# pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<mem_avail_mb> <mem_floor_mb>] — one
+# append-only row per pi invocation.
 # ALLOWED runs are recorded too, for the reason the disk ledger states: a series that records only
 # refusals cannot answer "how close did we get", which is the question that would have caught both
-# incidents early. Fields: epoch, verdict, load, max_load, pid, ppid, KIND, TAG, cwd, caller.
+# incidents early. Fields: epoch, verdict, load, max_load, pid, ppid, KIND, TAG, cwd, caller,
+# mem_avail, mem_floor.
+# ⛔ THE MEMORY COLUMNS ARE APPENDED, NEVER INSERTED (#2387 review P3). The load/max pair alone left
+# the memory figure persisted NOWHERE for the shim-only population (merge-one's reviewers, hand-written
+# runners, interactive sessions) — the binding reading was written only to stderr, and `mem-avail.tsv`
+# (which run_agent writes) carries the reading of a DIFFERENT moment. Appending keeps every existing
+# `cut -f1-10` reader working (that is why they are last) and `-` marks "not taken", so an absent
+# reading cannot be read as a number.
 # It writes to $HOME/.pi/agent/state (the durable per-box state dir that already holds locks/,
 # reviews/ and audit/) rather than to `$O`, because a hand-written runner — the exact caller this
 # mode exists for — is under no obligation to have `$O` set.
-pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller>
+pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<mem_avail> <mem_floor>]
   local dir f
   [ -n "${HOME:-}" ] || return 0
   dir="$HOME/.pi/agent/state"
@@ -1190,8 +1198,9 @@ pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller>
   if [ -f "$f" ] && [ "$(wc -c < "$f" 2>/dev/null || printf '0')" -ge "$PI_GATE_LEDGER_MAX_BYTES" ]; then
     mv -f "$f" "$f.1" 2>/dev/null || :
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%s)" "${1:-}" "${2:-}" "${3:-}" "$$" "${PPID:-0}" "${KIND:-}" "${TAG:-}" "${4:-}" "${5:-}" \
+    "${6:--}" "${7:--}" \
     >> "$f" 2>/dev/null || return 0
 }
 
@@ -1210,7 +1219,9 @@ pi_gate_refusal_count() {
 
 # pi_shim_main <argv…> — `pi`, as the spawn point sees it.
 # It never returns: the allow path `exec`s (so this process IS the agent, with no extra shell in the
-# tree and the caller's own signals/fds intact), and the refusal path exits PI_GATE_REFUSED.
+# tree and the caller's own signals/fds intact), and the refusal path exits PI_GATE_MEM_REFUSED (a
+# memory refusal, added in #2387) or PI_GATE_REFUSED (load). BOTH are spawn-point codes and neither
+# may be reported to an operator as the other: the remedies differ.
 pi_shim_main() {
   local self real load cwd caller n item mav mem_line mem_rc
   self="${BASH_SOURCE[0]}"
@@ -1249,12 +1260,24 @@ pi_shim_main() {
       "$mem_line" "$item" "$cwd" "$caller" >&2
     printf '[pi-gate]   refusal #%s, recorded durably in %s/.pi/agent/state/spawn-gate.tsv — nothing was consumed: no model call, no session\n' \
       "$(( n + 1 ))" "${HOME:-<no HOME>}" >&2
-    # The remedy names BOTH routes for the load arm's reason, and the second route is the one an
-    # operator needs on a box that is genuinely out of memory: a lane must be allowed to FINISH (or to
-    # be stopped deliberately), and an operator who must start a pi anyway has the absolute path.
-    printf '[pi-gate]   remedy: re-dispatch when resident lanes finish and release their working set (this will NOT clear by waiting for load to fall); operator rescue is the real pi by absolute path (%s), or a deliberate MEM_MIN_AVAIL_MB / MAX_LOAD\n' \
-      "$real" >&2
-    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller"
+    # ⛔ ONE REMEDY PER STATE (review P2). LOW and UNREADABLE are both refusals but they CLEAR
+    # DIFFERENTLY: a LOW floor clears when resident lanes finish, and nothing will ever finish to fix a
+    # BROKEN PROBE. Printing the wait-for-lanes advice for an unreadable probe — as this arm used to —
+    # sends the operator to wait for an event that cannot arrive, and it contradicted `run_agent`'s own
+    # arm for the same state. This is the shim, i.e. the only gate merge-one's reviewers and hand-run
+    # `pi`s ever meet, so a wrong remedy here is a wrong remedy for the population the arm exists for.
+    if [ "$mem_rc" -eq 2 ]; then
+      printf '[pi-gate]   remedy: the PROBE is broken, not the box — every spawn re-reads the same failed probe, so this will NOT clear by waiting (for lanes OR for load). Make /proc/meminfo readable, or make `vm_stat` work on this host, and the gate reads a real number again; operator rescue meanwhile is the real pi by absolute path (%s)\n' \
+        "$real" >&2
+    else
+      # The remedy names BOTH routes, for the load arm's reason: a lane must be allowed to FINISH (or to
+      # be stopped deliberately), and an operator who must start a pi anyway has the absolute path.
+      printf '[pi-gate]   remedy: re-dispatch when resident lanes finish and release their working set (this will NOT clear by waiting for load); operator rescue is the real pi by absolute path (%s), or a deliberate MEM_MIN_AVAIL_MB / MAX_LOAD\n' \
+        "$real" >&2
+    fi
+    # The reading and the floor ARE persisted (review P3): the load/max pair below cannot answer "how
+    # close to the floor", which is the question this gate exists to make answerable after the fact.
+    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB"
     exit "$PI_GATE_MEM_REFUSED"
   fi
   if ! can_spawn "$load"; then
@@ -1271,10 +1294,10 @@ pi_shim_main() {
     # fix. See STATED LIMITS.
     printf '[pi-gate]   remedy: re-dispatch when the 1-min load falls below %s; operator rescue is the real pi by absolute path (%s) or an explicit MAX_LOAD\n' \
       "$MAX_LOAD" "$real" >&2
-    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller"
+    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB"
     exit "$PI_GATE_REFUSED"
   fi
-  pi_gate_ledger allowed "$load" "$MAX_LOAD" "$cwd" "$caller"
+  pi_gate_ledger allowed "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB"
   exec "$real" "$@"
 }
 

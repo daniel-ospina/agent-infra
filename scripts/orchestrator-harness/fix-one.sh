@@ -326,7 +326,11 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # deliberately), not to wait for a load reading. Tolerant reference like the disk one, so a
     # caller run against an older $O/spawn-gate.sh (file-by-file seeding) degrades instead of
     # aborting under `set -u` before the refund below.
-    why="memory gate: available memory is below MEM_MIN_AVAIL_MB (one pi lane plus one pytest shard, measured) — this clears when resident lanes finish, NOT by waiting for load"
+    # ⛔ NO DERIVATION CLAIM HERE (review P3). This line used to say "(one pi lane plus one pytest shard,
+    # measured)" — the derivation of the SHIPPED DEFAULT, not of whatever `MEM_MIN_AVAIL_MB` currently
+    # holds. An operator who set the floor directly read a false arithmetic in the one log they have;
+    # the gate's own `[mem-gate] REFUSED` line, three lines up, states which case applies.
+    why="memory gate: available memory is below MEM_MIN_AVAIL_MB — this clears when resident lanes finish, NOT by waiting for load (the [mem-gate] line in this log carries the reading, the floor and how the floor was derived)"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi

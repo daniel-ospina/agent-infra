@@ -952,6 +952,43 @@ ck "§LB chain-merge.sh maps a 'mem' record to exit 73 (got $BOUNDED_RC) — not
 grep -q 'refused at the mem gate' "$O/logs/chain-107.log"; rc=$?
 ck "§LB …and NAMES the memory gate, not the load one (the load wording is not universal)" $rc
 
+# ── the POST-MERGE-ONE reporting arms (#2387 review P3) ──────────────────────────────────────
+# The arms above cover the refusal RECORD (the lane's own path). This one covers the other place a
+# refusal reaches an operator: merge-one.sh exits 73 on a memory refusal and 75 on a load one, and
+# this block used to test `rc = 75` only — so a memory refusal propagated the right code and said
+# NOTHING, on the very path (a chain with no controller running) the line exists to cover.
+# $O/merge-one.sh is a stub that exits the code under test; `gh pr list` fabricates a PR so the chain
+# reaches the merge step at all.
+mkdir -p "$TMP/bin-pr"
+cat > "$TMP/bin-pr/gh" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in "pr list") printf '2591\n' ;; esac
+exit 0
+STUB
+chmod +x "$TMP/bin-pr/gh"
+for _pair in "73:MEMORY" "75:load"; do
+  _code="${_pair%%:*}"; _word="${_pair##*:}"
+  cat > "$O/merge-one.sh" <<STUB
+#!/usr/bin/env bash
+exit $_code
+STUB
+  chmod +x "$O/merge-one.sh"
+  acquire_claim 108
+  run_bounded 30 env O="$O" CHAIN_POLLS=2 CHAIN_POLL_SECS=1 PATH="$TMP/bin-pr:$PATH" \
+    CHAIN_CLAIM_COMMIT="$(chain_gen 108)" \
+    bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 108 feat/108-tm
+  { [ "$BOUNDED_RC" -eq "$_code" ] && grep -q "reviewer NOT started (${_word}" "$O/logs/chain-108.log"; }; rc=$?
+  ck "§LB a merge-one rc=$_code is NAMED as the $_word gate refusal (exit $BOUNDED_RC) — the post-merge step reports what the code means" $rc
+  # ⛔ AND THE MEMORY ARM MUST NOT BORROW THE LOAD REMEDY: a memory floor does not clear when the box
+  # quietens, and telling an operator to watch a 1-min average is the false-cause class #2387 exists
+  # for. Read from THIS pass's log, before the next iteration overwrites it.
+  if [ "$_code" = "73" ]; then
+    grep -q 'will NOT clear by waiting for load' "$O/logs/chain-108.log"; rc=$?
+    ck "§LB …and the memory line says it will NOT clear by waiting for load (the two remedies differ)" $rc
+  fi
+done
+rm -f "$O/merge-one.sh"
+
 # ── the derivation, driven directly, so the SIZING RULE is a measurement and not a slogan ──
 # Little's law in practice: L_max = λW. 40 landings/24h with a 24h lead budget allows 40 open; with a
 # 48h budget it allows 80. A fixed count could not tell agent-infra (0.6/h) from tortoise (2.6/h).

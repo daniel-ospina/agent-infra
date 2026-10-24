@@ -150,9 +150,9 @@ run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" 
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
-# A gate refusal reports AGENT_LOAD_REFUSED (75), AGENT_MEM_REFUSED (73) or AGENT_DISK_REFUSED (77);
-# AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
-# namespace and could exit any of those itself (#1720).
+# A gate refusal reports AGENT_LOAD_REFUSED (75), AGENT_MEM_REFUSED (73), AGENT_DISK_REFUSED (77) or
+# AGENT_LAND_BACKLOG (74); AGENT_STARTED is authoritative rather than the exit code, because `pi`
+# shares the 0–255 status namespace and could exit any of those itself (#1720).
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
   # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns
@@ -210,7 +210,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # ⛔ THE MEMORY GATE'S OWN NAME (#2387), for the disk branch's reason: an operator told "load"
     # watches a 1-min average that is fine while the OOM killer takes their lanes. The reading, the
     # floor and the arithmetic are on the `[mem-gate] REFUSED` line in the same log.
-    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB (one pi lane plus one pytest shard, measured). This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool. (The reading, the floor and how the floor was derived — a measured reserve, or an operator-set MEM_MIN_AVAIL_MB — are on the [mem-gate] REFUSED line in this log.)" >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
     # remedy is not on this box at all). An operator told "load gate" here waits for a box that is

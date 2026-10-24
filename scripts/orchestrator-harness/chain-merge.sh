@@ -239,13 +239,19 @@ fi
 echo "[chain $N] PR #$PR found — starting merge chain $(date)" >> "$LOG"
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$LOG" 2>&1
 rc=$?
-# A load refusal (75) is not a failure of the work: nothing ran and nothing was consumed. Name it
+# A capacity refusal is not a failure of the work: nothing ran and nothing was consumed. Name it
 # HERE, in the log the operator reads for this chain — the reviewer's own line is inside
 # merge-$PR.log, and on a box with no controller running nothing else would ever re-dispatch it.
+# ⛔ ONE CAUSE PER CODE (#2387 review P3): this block used to test `rc = 75` only, so a memory
+# refusal — merge-one.sh's own PI_GATE_MEM_REFUSED arm now exits 73 — propagated the right code and
+# said NOTHING, on the very path (chain-<N>, no controller running) the line exists to cover. The
+# remedies differ, so they are separate arms rather than a shared "capacity" sentence: a load floor
+# clears when the box quietens, a memory floor only when resident lanes finish or are stopped.
 echo "[chain $N] merge-one rc=$rc $(date)" >> "$LOG"
-if [ "$rc" = "75" ]; then
-  echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG"
-fi
+case "$rc" in
+  75) echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG" ;;
+  73) echo "[chain $N] reviewer NOT started (MEMORY gate) — nothing was consumed. Re-run this chain when resident lanes have finished and released their working set (this will NOT clear by waiting for load); the reading, the floor and its derivation are on the [mem-gate] REFUSED line in merge-$PR.log" >> "$LOG" ;;
+esac
 echo "[chain $N] done $(date)" >> "$LOG"
 # ⛔ EXIT WITH merge-one.sh's STATUS (#1720 review). This script used to end on the `echo …done…`
 # above, so `$?` was the STATUS OF `echo` — always 0 — and a caller doing `chain-merge.sh … && next`
