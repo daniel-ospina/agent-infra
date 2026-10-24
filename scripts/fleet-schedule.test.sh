@@ -776,6 +776,29 @@ kill -0 "$newpid" 2>/dev/null && ok "the started loop is alive" || bad "the loop
 run "$GOOD" --stop >/dev/null 2>&1
 kill "$recycled" 2>/dev/null
 
+# ── 13b. --stop must not SIGNAL a recycled pid ───────────────────────────────────────────────
+# The mirror of 13 on the kill side: `loop_pid()` answers "is that pid alive", and after the loop
+# died its number can be recycled onto an unrelated process (a lane, the controller, the
+# supervisor). Without the command-line check --stop SIGTERMs it and reports "loop stopped", i.e.
+# it kills someone else's work and calls that a successful shutdown.
+case_ "13b. --stop refuses a recycled pid instead of signalling the process that now owns it"
+state_reset "$GOOD"
+sleep 60 & bystander=$!; echo "$bystander" >> "$T/pids"
+printf '%s\n' "$bystander" > "$FLEET_SCHEDULE_STATE/loop.pid"
+out="$(run "$GOOD" --stop)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--stop exits 0 over a recycled pid (a no-op, not an error)" \
+  || bad "--stop failed over a recycled pid (rc=$rc): $out"
+kill -0 "$bystander" 2>/dev/null \
+  && ok "the unrelated process was NOT killed" \
+  || bad "--stop SIGTERMed a process that is not fleet-schedule --loop"
+[ -f "$FLEET_SCHEDULE_STATE/loop.pid" ] \
+  && bad "the stale pidfile survived (the next reader sees the same false 'running')" \
+  || ok "the stale pidfile was repaired"
+[ -f "$FLEET_SCHEDULE_STATE/OFF" ] \
+  && ok "the OFF switch was still set (the decision is recorded)" \
+  || bad "--stop did not record the OFF decision"
+kill "$bystander" 2>/dev/null
+
 # ── 14. --install must not race the loop's first tick ──────────────────────────────────────
 case_ "14. --install verifies a HEALTHY install whose loop is still in its first pass"
 RACE="$FIX/race"; mkdir -p "$RACE"; cp "$GOOD/RETIRED" "$RACE/RETIRED"
@@ -873,6 +896,18 @@ out="$(run_v15 1800)"; rc=$?
   || bad "a marker with no started excused the stale tick indefinitely (rc=$rc): $out"
 grep -q 'BUSY' <<<"$out" && bad "a startless marker was reported as a running job: $out" \
   || ok "no startless marker is reported as a running job"
+# ⛔ AND A START DATED IN THE FUTURE IS NOT AN EXEMPTION EITHER. The clamp is computed FROM the
+# marker's own `started`, so a future-dated one yields a future deadline and `now <= deadline`
+# holds for the whole span — a wedged loop certified as busy for years. It needs no corruption:
+# the writer stamps `time.time()`, so a backward clock step during a run (VM resume, NTP
+# correcting a fast RTC — the cases the stamp arm already refuses) leaves a SIGKILL-surviving
+# marker future-dated, and a restored state dir does it too.
+busy_marker $((5 * 365 * 86400)) $((5 * 365 * 86400))
+out="$(run_v15 1800)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a FUTURE-dated start is dropped, not an exemption for years (rc=1)" \
+  || bad "a marker dated years ahead excused the stale tick (rc=$rc): $out"
+grep -q 'BUSY' <<<"$out" && bad "a future-dated marker was reported as a running job: $out" \
+  || ok "no future-dated marker is reported as a running job"
 kill "$fakepid" 2>/dev/null
 
 # ── 16. an annual (multi-entry) calendar must keep a NEXT occurrence ───────────────────────
