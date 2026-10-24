@@ -90,6 +90,23 @@ shard_listed=0
 shard_time=0
 shard_slowest_secs=0
 shard_slowest=""
+# ── ATTRIBUTION (#2643) ───────────────────────────────────────────────────────────────────────────
+# `shard_failed_list` is the NAMES of the listed shards that raised `shard_errors`, joined by `, `.
+# it this runner's whole verdict was a COUNT: four shards were red on main on 2026-10-24 and four PR
+# slices each printed `❌ 1 bash shard(s) failed`, so the only way to learn WHICH suite was red was to
+# download an 18,695-line job log and bisect it against the runner's own `▸ <secs> <path>` rows. The
+# merge rail needs a failure IDENTITY, and a count is not one.
+#
+# ⛔ DERIVED FROM THE COUNTER, NEVER A SECOND `||` CLAUSE. `shard_err0` is sampled before the shard
+# runs and the name fires on the DELTA (`shard_errors -ne shard_err0`), so any future way of counting
+# a failure still names the shard. `tests/ci-lane-parity/run.sh` arm 8am proves it by deleting this
+# branch's naming call (`… && shard_fail "$1"; `) and requiring the name to vanish from the verdict,
+# and arm 8h proves the failure-recording arm is load-bearing by deleting the literal
+# ` || shard_errors=$((shard_errors + 1))`.
+#
+# It records only LISTED shards (`shard_is_listed`) — the same rule `shard_note` uses — so the
+# self-check sentinels below, which deliberately fail, cannot print a bogus name.
+shard_err_before=0
 
 # The list length, read from the same `run_shard` lines `--list` prints (one source). Needed
 # BEFORE the run now: it bounds the slice arithmetic and marks where the sentinels begin.
@@ -160,12 +177,14 @@ trap 'rm -f "$shard_ran_log"' EXIT
 # the per-failure line is the only name the log will ever carry.
 # LISTED shards only: the runtime sentinel at the end of this file deliberately runs a failing stub,
 # and a green run must never print a FAILED SHARD line for it (`shard_is_listed` is 0 there).
+# ⛔ ONE NAME, ONE CHAIN (#2643 + #2648). `shard_fail` is the name the execution line calls, and it
+# delegates to `shard_record_failure`, which gates on the path being a LISTED shard and prints through
+# `shard_named_failure`. The chain exists so that EITHER mutation arm kills the name: arm 8am deletes
+# the call and gutting `shard_record_failure()` also removes it — while the ACCUMULATOR
+# (`shard_failed_list`) is the one main's recap reads. Two independent recorders would each have to be
+# gutted for the name to disappear, which is exactly the vacuous arm the tests refuse.
 shard_failed_list=""
-shard_fail() {
-  [ "$shard_is_listed" = 1 ] || return 0
-  shard_failed_list="${shard_failed_list}${shard_failed_list:+, }$1"
-  echo "❌ FAILED SHARD: $1"
-}
+shard_fail() { shard_record_failure "$1"; }
 
 slice_skips() {
   slice_pos=$shard_listed
@@ -178,6 +197,27 @@ slice_skips() {
   shard_skipped=$((shard_skipped + 1))
   return 0
 }
+
+# shard_record_failure <path> — the ATTRIBUTION half of the failure arm: remember the shard's name and
+# say it at the point of failure, in the context of the suite's own output, so a reader (and the log
+# parses the rail does on a 40-minute job) never has to bisect a slice by its timing rows.
+#
+# A helper, not an inline printf, for the same reason `shard_note` is: it keeps the execution line one
+# statement-chain. It is deliberately `: `-able — gutting the body leaves the failure COUNTED and the
+# run red, only nameless — which is exactly the mutation `tests/ci-lane-parity/run.sh` arm 8am needs in
+# order to prove the name is not being printed by something else. That mutation replaces THIS ONE
+# LINE, so the body must stay on it (a multi-line body would be left dangling at top level and the
+# fixture would fail for a reason it did not choose).
+#
+# ⛔ TWO RECORDERS, TWO GATES (#2643 review cycle 3). `shard_record_failure` gates on the path being a
+# LISTED shard, so the self-check sentinels (a mktemp `exit 1` file) cannot print a bogus name. The
+# syntax sweep has no such gate and must not need one: its path is real, and it is a failure the rail
+# has to be able to attribute. Naming only the shard LOOP left a MIXED run — one listed shard plus a
+# `bash -n` failure — yielding exactly ONE identity, so the rail's step-1c `examined > extracted`
+# check passed and the un-named file vanished from a certificate that then named no residual. A red
+# file the rail cannot name is the class this whole file exists to refuse.
+shard_named_failure() { shard_failed_list="${shard_failed_list}${shard_failed_list:+, }$1"; printf '❌ FAILED SHARD: %s\n' "$1"; }
+shard_record_failure() { [ "$shard_is_listed" = 1 ] || return 0; shard_named_failure "$1"; }
 
 # shard_note <path> <seconds> — the per-shard timing row, and the running total/slowest. Separate
 # from run_shard so the execution line stays one readable statement-chain (the mutation pins replace
@@ -225,8 +265,11 @@ swept=0
 # instead. The second counter below is therefore charged from the same DELTA idiom rather than by
 # rewriting the recorder into another group, so a reader who trusts §8h keeps seeing exactly what
 # §8h covers.
+# ⛔ …AND THE SWEEP NAMES TOO (#2648): the same DELTA that charges `sweep_errors` also names the file,
+# so a mixed run has no un-named red. It stays gated on `sweep_name` (the sentinel is a mktemp path,
+# not a shard) and the bare `|| shard_errors=$((shard_errors + 1))` literal stays intact for §8h.
 sweep_errors=0
-sweep_file() { swept=$((swept + 1)); shard_err0=$shard_errors; bash -n "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_errors" -ne "$shard_err0" ] && sweep_errors=$((sweep_errors + 1)); }
+sweep_file() { swept=$((swept + 1)); shard_err0=$shard_errors; bash -n "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_errors" -ne "$shard_err0" ] && { sweep_errors=$((sweep_errors + 1)); [ "${sweep_name:-1}" = 1 ] && shard_named_failure "$1"; }; }
 
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
 # keeps the line count but points the list at a /tmp stub would report every shard as passed having
@@ -432,8 +475,11 @@ fi
 sentinel_sweep="$(mktemp)"
 printf 'if then\n' >"$sentinel_sweep"
 before_sweep_err=$shard_errors
+before_failed_shards="$shard_failed_list"
 before_sweep_errors=$sweep_errors
+sweep_name=0          # the sentinel is a mktemp path, not a shard — it must not print a name
 sweep_file "$sentinel_sweep"
+sweep_name=1
 rm -f "$sentinel_sweep"
 if [ "$shard_errors" -ne $((before_sweep_err + 1)) ]; then
   echo "❌ the sweep arm is broken — a file with a syntax error would not fail this run"
@@ -443,6 +489,7 @@ fi
 # assumes the sentinel incremented, and this file's whole discipline is that an assumption about a
 # counter is what a refactor invalidates.
 shard_errors=$before_sweep_err
+shard_failed_list=$before_failed_shards
 sweep_errors=$before_sweep_errors
 swept=$((swept - 1))
 
@@ -469,25 +516,33 @@ shard_listed=$before_listed
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
-  # The recap (#2643). Three shapes, each REPORTED from what was counted — never inferred from what is
-  # absent: a failing shard is named; a failing syntax sweep named its own file at the `bash -n` line;
-  # and a failure with NEITHER means the naming arm is broken, which is a defect in this runner and must
-  # say so rather than blame a subsystem it never looked at.
+  # ⛔ THE VERDICT NAMES WHAT IT COUNTED (#2643). A red slice's log ends here, and the merge rail reads
+  # its failure identity from the `❌ FAILED SHARD: <path>` line printed at the point of failure
+  # (`scripts/ci_exemption.py`'s bash-shard pass); `❌ 1 bash shard(s) failed` alone is a red with no
+  # owner. Three shapes, each REPORTED from what was counted — never inferred from what is absent: a
+  # failing shard is named; a failing syntax sweep named its own file at the `bash -n` line; and a
+  # failure with NEITHER means the naming arm is broken, which is a defect in THIS runner and must say
+  # `could NOT be named` rather than blame a subsystem it never looked at.
   if [ -n "$shard_failed_list" ]; then
     echo "❌ failing shard(s): $shard_failed_list"
     # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT. `shard_errors` counts BOTH failing shards and failing
-    # syntax sweeps; the list above names only the former. Printing "2 failed" beside one name reads as
-    # a missing name — and the missing half is exactly what the recap exists to stop hunting for.
+    # syntax sweeps; the list above names them together. Printing "2 failed" beside one name reads as a
+    # missing name — and the missing half is exactly what the recap exists to stop hunting for.
     if [ "$sweep_errors" -gt 0 ]; then
-      echo "❌ …and $sweep_errors of them are SYNTAX-SWEEP failures, not shards — each named at its own 'bash -n' line"
+      if [ "$sweep_errors" -eq "$shard_errors" ]; then
+        echo "❌ every failure above is a SYNTAX-SWEEP failure, named at its own 'bash -n' line"
+      else
+        echo "❌ …and $sweep_errors of them are SYNTAX-SWEEP failures, not shards — each named at its own 'bash -n' line"
+      fi
     fi
   elif [ "$sweep_errors" -eq "$shard_errors" ] && [ "$sweep_errors" -gt 0 ]; then
-    echo "❌ every failure above is a syntax-sweep failure, named at its own 'bash -n' line"
+    # The sweep counted the failure but its name never reached the list: the naming arm is broken.
+    echo "❌ every failure above is a syntax-sweep failure, and its file could NOT be named at its own 'bash -n' line — the naming arm is not wired for it. This is a defect in scripts/run-bash-shards.sh, not in the swept file."
   else
     # Mixed AND unnamed: a broken naming arm alongside a failing sweep. Do NOT claim the sweep caused
     # everything — measure it. (Final review: this branch used to say "every failure above is a
     # syntax-sweep failure", which sent triage to fix the sweep and lose the unnamed shard with it.)
-    echo "❌ no shard is named, and $((shard_errors - sweep_errors)) of the $shard_errors failure(s) is/are NOT a syntax sweep — the naming arm is not wired for them. This is a defect in scripts/run-bash-shards.sh, not in the shard: read the per-shard output above for the path."
+    echo "❌ $((shard_errors - sweep_errors)) of these failure(s) could NOT be named — a counting path with no path of its own raised them (this is the backstop: the shard loop AND the syntax sweep both name themselves, so a defect in scripts/run-bash-shards.sh is the likely cause)"
   fi
   exit 1
 fi
