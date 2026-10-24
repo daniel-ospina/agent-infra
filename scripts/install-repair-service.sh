@@ -312,9 +312,16 @@ cmd_install() {
         # login — the #2402 lifetime defect this whole capability removes — and the installer would
         # otherwise print is-active/is-enabled green over a supervisor that cannot survive a session
         # teardown. A warning that does not stop the install is a false PASS with a footnote.
-        if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
-            die "REFUSING: user scope without linger — this unit dies with the last login, so it is not activation. Run: loginctl enable-linger $(id -un)   (or install a system unit)"
-        fi
+        # ⛔ NO PIPE INTO `grep -q` (scripts/check-no-sigpipe-grep.sh): a quiet grep exits on its first
+        # match, the producer takes SIGPIPE, and under `set -o pipefail` a MATCH reads as a failure — the
+        # check would invert exactly when linger IS enabled.
+        linger_row="$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null || true)"
+        case "$linger_row" in
+            *Linger=yes*) : ;;
+            *)
+                die "REFUSING: user scope without linger — this unit dies with the last login, so it is not activation. Run: loginctl enable-linger $(id -un)   (or install a system unit)"
+                ;;
+        esac
     fi
 
     # Install atomically at the platform's OWN install path, then reload/arm. `install` (not `cp`)
