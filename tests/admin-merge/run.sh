@@ -13814,6 +13814,49 @@ grep -q "run 9922" "$SCEN/err" \
 grep -q "run 9921" "$SCEN/err" \
   && fail "(f) it ALSO named run 9921, which DID yield an id — provenance was used as the subset" \
   || pass "(f) …and does NOT name run 9921, which contributed an id"
+# ── (h) A GREEN BASE — the COMMON case, and the one a `paste`-then-`sed` default misses.
+# `paste -sd, -` emits no line at all for zero input lines, so a `sed 's/^$/none/'` placed
+# AFTER it is dead code and the answer ends at `red: ` (#2610 review, P2-1). This arm is
+# the one that fails if that default regresses.
+new_scen named-refusal-greenbase
+HEAD_NG="f9f9000000000000000000000000000000000012"
+printf '%s\n' "$HEAD_NG" > "$SCEN/head"
+lane_fail "$HEAD_NG" 9931 > "$SCEN/runs-$HEAD_NG"
+: > "$SCEN/log-9931"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9931"
+write_pr_checks "$(check_run 5031 'bash-suites (5)' completed failure 9931)"
+main_green_surface
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) a green base with an unattributable PR run still BLOCKS (exit $rc)" \
+  || fail "(h) the refusal did not fire against a green base"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(h) …and still answers the base question BY NAME" \
+  || fail "(h) no counterpart answer against a green base: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -qE "^       red: none$" "$SCEN/err" \
+  && pass "(h) …printing 'red: none' for a base with no reds (not an empty 'red: ')" \
+  || fail "(h) the empty red list renders as nothing at all: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
+# ── (i) AN UNRESOLVED BASE REF IS NOT 'main'. A failed `pr view --json baseRefName` must
+# not be narrated as a claim about a branch nobody resolved.
+new_scen named-refusal-nobase
+HEAD_NB="f9f9000000000000000000000000000000000034"
+printf '%s\n' "$HEAD_NB" > "$SCEN/head"
+printf '\n' > "$SCEN/base-ref"                      # the resolution answers EMPTY
+lane_fail "$HEAD_NB" 9941 > "$SCEN/runs-$HEAD_NB"
+: > "$SCEN/log-9941"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9941"
+write_pr_checks "$(check_run 5041 'bash-suites (5)' completed failure 9941)"
+main_green_surface
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(i) an unresolvable base ref still refuses (exit $rc)" \
+  || fail "(i) the rail proceeded with no base ref"
+grep -q "the base ref could NOT be resolved" "$SCEN/err" \
+  && pass "(i) …saying the counterpart question is UNANSWERED" \
+  || fail "(i) an unresolved base ref was narrated as a claim about a branch: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "IS red on 'main'" "$SCEN/err" \
+  && fail "(i) it asserted a red is 'on main' about a base it never resolved" \
+  || pass "(i) …and asserts nothing about 'main'"
 # ── (g) THE SAME-NAME ARM. An arm that always answers "no counterpart" would pass (c) and
 # lie about this surface, so a blocking base red with the same NAME is its own case.
 new_scen named-refusal-shared
