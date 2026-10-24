@@ -25,6 +25,16 @@ import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
 import { redactCommand } from "../shared/redact-command.js";
+import {
+  attemptClass,
+  classifySpawnOutcome,
+  describeSpawnCapacity,
+  readMachineCapacity,
+  spawnFaultClass,
+  spawnFaultLabel,
+  SPAWN_UNSPAWNABLE_TOKEN,
+  type SpawnAttempt,
+} from "../shared/spawn-capacity.js";
 // #2148 — the reviewer requirement disclosed UP FRONT. The ≥1-dispatch rule and the merge-registry
 // gate were both correct and both spoke only at the finish line, so a lane did the whole job (rebase,
 // implement, test, push, PR) and was then refused. This module holds the disclosure's ONE wording
@@ -4423,6 +4433,17 @@ function tierLabel(tier: string): string {
 }
 
 /**
+ * Provenance of a tier label (#2204 (3)): `read` only when a tier marker actually NAMED a tier.
+ * `""` (no marker), `unknown` (the pre-flight's literal for an unlabeled issue) and `unlabeled` (the
+ * vocabulary's key for "no tier") are all UNDETERMINED — a marker containing the word `unlabeled`
+ * records that nobody determined a tier, and reading it as `read` would present the absence of a
+ * tier as a tier of its own, which is the defect #2204 (3) named (cycle-2 review, P2).
+ */
+export function tierSourceFor(tier: string): "read" | "undetermined" {
+  return tier === "" || tier === "unknown" || tier === "unlabeled" ? "undetermined" : "read";
+}
+
+/**
  * #2204 (3) — "`tier: unlabeled` must not read as the strictest tier": the refusal must
  * NAME the tier that triggered it, and say what `unlabeled` MEANS.
  *
@@ -4445,17 +4466,6 @@ function tierLabel(tier: string): string {
  * lane is now being told to do something it cannot do. The roles that do not dispatch get the
  * direct instruction they can act on (push/report), plus the same "your brief overrides this" hedge.
  */
-/**
- * Provenance of a tier label (#2204 (3)): `read` only when a tier marker actually NAMED a tier.
- * `""` (no marker), `unknown` (the pre-flight's literal for an unlabeled issue) and `unlabeled` (the
- * vocabulary's key for "no tier") are all UNDETERMINED — a marker containing the word `unlabeled`
- * records that nobody determined a tier, and reading it as `read` would present the absence of a
- * tier as a tier of its own, which is the defect #2204 (3) named (cycle-2 review, P2).
- */
-export function tierSourceFor(tier: string): "read" | "undetermined" {
-  return tier === "" || tier === "unknown" || tier === "unlabeled" ? "undetermined" : "read";
-}
-
 export function dispatchFloorMessage(tier: string, role: ReviewerRole = "self"): string {
   const base = tier === "micro" ? MICRO_BLOCK_MESSAGE : BLOCK_MESSAGE;
   const label = tierLabel(tier);
@@ -4502,6 +4512,46 @@ export function dispatchFloorMessage(tier: string, role: ReviewerRole = "self"):
   ].join("\n");
 }
 
+/**
+ * #2665 — the CAPACITY refusal: a DISTINCT block message, not an extra sentence on the
+ * compliance one.
+ *
+ * The two states are different faults with different remedies, and printing the wrong one
+ * sends the lane to the wrong action:
+ *
+ *   compliance (`BLOCK_MESSAGE`)   the lane never dispatched → dispatch a reviewer NOW
+ *   capacity   (this message)      a spawn was ATTEMPTED and produced no verdict → retry on a
+ *                                  box that can serve it, and at the cap, stop and report
+ *
+ * ⛔ This is TIGHTER than the pre-#2665 floor, never looser: the attempt no longer counts as
+ * a review (it used to, which let an unreviewed push through — `shared/spawn-capacity.ts`
+ * carries the measured false PASS), and the requirement itself is untouched.
+ */
+export function unspawnableMessage(
+  attempts: readonly SpawnAttempt[],
+  /** The session's true attempt total — the ledger is a bounded RENDERING window. */
+  total: number = attempts.length,
+): string {
+  return [
+    "✅ Review enforcement gate is working correctly.",
+    // ⛔ The header DERIVES its class from the same switch the body uses (review of #2665): the
+    // previous hardcoded "CAPACITY fault" contradicted a body that said "SPAWN-SIDE refusal" in
+    // the same message, and mislabelled a breaker as capacity.
+    `⛔ Blocked — a \`task\`/\`subagent\` spawn produced NO verdict; 0 reviewer verdicts counted`,
+    `   (${spawnFaultLabel(spawnFaultClass(attempts))}, not a compliance one).`,
+    ...describeSpawnCapacity(attempts, readMachineCapacity(), total),
+    "   → THE REQUIREMENT IS UNCHANGED: a reviewer verdict is still mandatory before this git op",
+    `     (${SPAWN_UNSPAWNABLE_TOKEN} is what the BOX did, not a waiver). The rail will also demand`,
+    `     the attestation at the FINAL head — ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
+  ].join("\n");
+}
+
+/**
+ * How many attempt records the session keeps for rendering. Bounded so a re-dispatch loop
+ * on a starved box cannot grow this state without limit; the TOTAL is counted separately
+ * (`spawnAttemptsTotal`) so the refusal never understates how many were made.
+ */
+export const SPAWN_ATTEMPT_KEEP = 10;
 // #485: uniform ≥1-dispatch policy declaration — every tier blocks at 0
 // dispatches. Declarative: consumed by the drift-pin test (fence ↔ export
 // compare in index.test.ts T2) only — the block decision is uniform, so no
@@ -4524,6 +4574,12 @@ export default function (pi: ExtensionAPI) {
     // ── State ──────────────────────────────────────
     let extensionEnabled = true;
     let dispatchCount = 0;
+    // #2665 — the ATTEMPT ledger, deliberately separate from `dispatchCount`. A spawn that
+    // returned no verdict is not a dispatch (the floor's datum is a reviewer VERDICT), but it
+    // IS evidence about the BOX, and the floor's refusal must be able to name it instead of
+    // telling a lane that tried that it never dispatched at all.
+    let spawnAttempts: SpawnAttempt[] = [];
+    let spawnAttemptsTotal = 0;
     // #1662 review: run_ids whose terminal `task_collect` already counted as a
     // reviewer dispatch. `task_collect` is idempotent (the same terminal run
     // can be reaped repeatedly), so without this a repeated collect inflates
@@ -4549,6 +4605,8 @@ export default function (pi: ExtensionAPI) {
     // ── session_start ──────────────────────────────
     pi.on("session_start", async (_event, _ctx) => {
       dispatchCount = 0;
+      spawnAttempts = [];
+      spawnAttemptsTotal = 0;
       countedCollectRuns.clear();
       preflightInjected = false;
       earlyPushNoticePrinted = false;
@@ -5089,6 +5147,24 @@ export default function (pi: ExtensionAPI) {
       // says the same thing in words.
       const tierClassification = tierSourceFor(tier);
       if (tier === "micro") {
+        // #2665: CAPACITY first — the fault is upstream of the tier, so the micro remediation
+        // (which is about WHICH reviewer to dispatch) would misdirect here.
+        if (spawnAttemptsTotal > 0) {
+          const fault = spawnFaultClass(spawnAttempts).toUpperCase();
+          console.error(
+            `[review-enforcer] ⛔ Blocked — spawn produced NO verdict, 0 reviewer verdicts counted (${fault}: ${spawnAttemptsTotal} attempt(s))`
+          );
+          for (const line of describeSpawnCapacity(spawnAttempts, readMachineCapacity(), spawnAttemptsTotal))
+            console.log(line);
+          logGateEvent("gate_block", {
+            reason: "review_gate_unspawnable",
+            tier: "micro",
+            spawn_attempts: spawnAttemptsTotal,
+            spawn_outcomes: spawnAttempts.map((a) => a.outcome),
+            command: auditCommand(command),
+          });
+          return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
+        }
         const floor = describeDispatchFloorRead(command, "micro", dispatchCount);
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
         for (const line of floor.lines) console.log(line);
@@ -5103,6 +5179,25 @@ export default function (pi: ExtensionAPI) {
         }); // #516: durable audit
         deliverBlockRecovery(tier, command);
         return { block: true, reason: dispatchFloorMessage("micro", reviewerRole), terminate: false };
+      }
+
+      // #2665: the lane that TRIED and could not get a verdict is a different state from the
+      // lane that never dispatched. Same floor, different verdict — see `unspawnableMessage`.
+      if (spawnAttemptsTotal > 0) {
+        const fault = spawnFaultClass(spawnAttempts).toUpperCase();
+        console.error(
+          `[review-enforcer] ⛔ Blocked — spawn produced NO verdict, 0 reviewer verdicts counted (${fault}: ${spawnAttemptsTotal} attempt(s))`
+        );
+        for (const line of describeSpawnCapacity(spawnAttempts, readMachineCapacity(), spawnAttemptsTotal))
+          console.log(line);
+        logGateEvent("gate_block", {
+          reason: "review_gate_unspawnable",
+          tier: tier === "" ? "unlabeled" : tier,
+          spawn_attempts: spawnAttemptsTotal,
+          spawn_outcomes: spawnAttempts.map((a) => a.outcome),
+          command: auditCommand(command), // #1492: the refused command, not just the reason
+        });
+        return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
       }
 
       const floor = describeDispatchFloorRead(command, tier, dispatchCount);
@@ -5159,7 +5254,6 @@ export default function (pi: ExtensionAPI) {
       if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
       if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
-      if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
       // #1662 review: `task_collect` is idempotent — every result carries the
       // `run_id` it reaped (`details: view`). Count each run's verdict once, so
       // re-collecting a finished lane cannot inflate the dispatch total (and
@@ -5172,6 +5266,72 @@ export default function (pi: ExtensionAPI) {
           countedCollectRuns.add(collectRunId);
         }
       }
+
+      // #2665: a spawn that produced NO VERDICT is an ATTEMPT, not a dispatch — classified BEFORE
+      // the background early-return, because a REFUSED background spawn (`status:"invalid-cwd"`
+      // with `background:true`, the #1662 shape) used to return as "no reviewers dispatched": the
+      // capacity-read-as-compliance mislabel this change exists to remove. Before the split, the
+      // counter below fired on ANY `task`/`subagent` result, so a retry-exhausted
+      // (`status:"failed"`), cut (`killed:true`) or pre-spawn-refused child satisfied the
+      // ≥1-dispatch floor and the lane's unreviewed `git push` was ALLOWED — a false PASS,
+      // measured (see `shared/spawn-capacity.ts`). The classification reads ONLY fields the
+      // producer set, and the evidence it read is carried into the audit row and the refusal.
+      const spawn = classifySpawnOutcome({
+        // A terminal `task_collect` result is a `TaskRunStatusView`: the CHILD's composed payload
+        // sits at `view.details`, and the run's own `status`/`reason` sit at the top level. Read
+        // BOTH (nested last, so the child's own `killed`/`exitCode` win), because classifying on
+        // the view alone re-opened the same fail-open one path over (review of #2665): the
+        // background status mapping reports a no-output `clean-empty` settle as `done`, so the
+        // view said "done" while the child's details carried `exitCode:0` with no output — and
+        // the FOREGROUND path already classifies that same shape as `cut`.
+        details: isTerminalCollect
+          ? {
+              ...(reviewDetails as Record<string, unknown>),
+              ...((typeof (reviewDetails as { details?: unknown })?.details === "object" &&
+              (reviewDetails as { details?: unknown }).details !== null
+                ? (reviewDetails as { details: Record<string, unknown> }).details
+                : {}) as Record<string, unknown>),
+            }
+          : (reviewDetails as Record<string, unknown> | undefined),
+        isError: (event as { isError?: unknown }).isError,
+      });
+      if (spawn.outcome !== "verdict") {
+        spawnAttemptsTotal++;
+        spawnAttempts.push({ tool: event.toolName, outcome: spawn.outcome, evidence: spawn.evidence });
+        // Bounded ledger WITH CLASS COVERAGE (review of #2665): dropping the oldest entry
+        // unconditionally let a breaker seen once age out of the window, after which a
+        // breaker-plus-failures ledger printed the CAPACITY "retry under less load" remedy. Drop
+        // the OLDEST entry whose class has a LATER duplicate, so every class that occurred
+        // survives the window. (A first-match drop was wrong in the not-found case: it evicted
+        // exactly the UNIQUE-class oldest the rule protects — measured [breaker, 11×failed].)
+        if (spawnAttempts.length > SPAWN_ATTEMPT_KEEP) {
+          let dropAt = -1;
+          for (let i = 0; i < spawnAttempts.length - 1; i++) {
+            const cls = attemptClass(spawnAttempts[i]);
+            if (spawnAttempts.slice(i + 1).some((a) => attemptClass(a) === cls)) {
+              dropAt = i;
+              break;
+            }
+          }
+          spawnAttempts.splice(dropAt >= 0 ? dropAt : 0, 1);
+        }
+        console.error(
+          `[review-enforcer] ⚠️ Sub-agent spawn produced NO verdict (${spawn.outcome}: ${spawn.evidence}) — ` +
+            `recorded as ATTEMPT ${spawnAttemptsTotal}, NOT counted as a dispatch (#2665)`
+        );
+        logGateEvent("review_spawn_no_verdict", {
+          tool: event.toolName,
+          outcome: spawn.outcome,
+          evidence: spawn.evidence,
+          spawn_attempts: spawnAttemptsTotal,
+          dispatch_count: dispatchCount,
+        });
+        return undefined;
+      }
+      // #1662: a `task({ background: true })` dispatch returns at DISPATCH — counting it would
+      // satisfy the ≥1-dispatch gate while the reviewer is still running. A verdict-less
+      // background result was classified ABOVE (as an attempt); this guards the COUNTING only.
+      if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
 
       dispatchCount++;
       console.log(
