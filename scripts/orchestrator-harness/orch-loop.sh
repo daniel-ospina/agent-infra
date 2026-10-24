@@ -1931,6 +1931,20 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # on a record that persists. Measured in review round 2: `unj: unbound variable`, exit 1.
   local listed="" judged="" queued="" col="" land="" unj="" sk_ck="" sk_dp="" sk_ld="" sk_co="" notr="" at="" reconciled=""
   local age=""
+  # ── THE CAUSE, THE FAILING SURFACE, AND WHAT THE SUPPRESSION COST (agent-infra#2183) ──────────
+  # `not_reached` is DERIVED, so before these keys existed the largest bucket on a starved cell was
+  # printed as `(limit)` — an instruction to raise LIMIT that the record itself contradicted when
+  # `limit=` appeared at its real value beside it. Measured on cell-1, 2026-10-20: 183 of 195
+  # candidates "not reached (limit)" where the true cause was a spent `RUN_BUDGET`. Each key is
+  # optional here (a record from an older writer simply omits it) and each is initialised, because
+  # under `set -u` a declared-but-unassigned local is UNBOUND and a missing key would crash the
+  # controller — the `unj: unbound variable` loop this block already records.
+  local stop="" limit="" unusable="" ck_rel="" ck_unjust="" ck_def="" ck_ref="" ck_sort="" stop_cf="" reason_cf=""
+  # ⛔ `repo=` IS A RECORD FIELD, NOT A RENDERED ONE (review P3, #2183). It exists so "is this pool
+  # the right repo" is answerable from the record — the `[cap]` line beside it already carries
+  # `@${OR}` — so the reader must NOT grow a local for it that nothing ever reads (a dead local that
+  # reads as "this is shown to the operator" while it is not).
+  local sk_q="" sk_d="" sk_p="" sk_l="" sk_c="" sk_cu="" sk_df="" sk_u=""
   is_num "$now" || now="$(date +%s)"
   [ -f "$O/state/refresh-funnel" ] && f="$(cat "$O/state/refresh-funnel" 2>/dev/null || true)"
   for kv in ${f:-}; do
@@ -1951,6 +1965,15 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       # a record predating either omits that part (no invented zero).
       skipped_collided) sk_co="$val" ;;
       not_reached) notr="$val" ;; at) at="$val" ;; reconciled) reconciled="$val" ;;
+      stop) stop="$val" ;; limit) limit="$val" ;; unusable) unusable="$val" ;;
+      checked_released) ck_rel="$val" ;; checked_unjustified) ck_unjust="$val" ;;
+      checked_deferred) ck_def="$val" ;; checked_refused) ck_ref="$val" ;;
+      checked_sort_failed) ck_sort="$val" ;;
+      stop_conflict) stop_cf="$val" ;; reason_conflict) reason_cf="$val" ;;
+      skipped_checked_queued) sk_q="$val" ;; skipped_checked_dispatched) sk_d="$val" ;;
+      skipped_checked_pr) sk_p="$val" ;; skipped_checked_lane) sk_l="$val" ;;
+      skipped_checked_claim) sk_c="$val" ;; skipped_checked_claim_unknown) sk_cu="$val" ;;
+      skipped_checked_deferred) sk_df="$val" ;; skipped_checked_unknown) sk_u="$val" ;;
     esac
   done
   # The queue depth is measured HERE, not taken from the refresh's record: it is this cycle's file.
@@ -1965,7 +1988,12 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       printf '[dispatch] %s queued of an UNRECORDED pool (state/refresh-funnel exists but is unreadable/empty) -> %s dispatched%s (queue=%s%s)\n' \
         "$backlog" "$k" "${held:+ | held: $held}" "$qtok" "$ynote"
     else
-      printf '[dispatch] %s queued of an UNRECORDED pool (no state/refresh-funnel — no refresh pass has recorded its funnel yet) -> %s dispatched%s (queue=%s%s)\n' \
+      # ⛔ "NO PASS HAS RUN" IS NOT WHAT AN ABSENT FUNNEL MEANS (review E-P2, cycle 4). A pass that
+      # refuses on the REST budget (or on provisioning) exits BEFORE writing the funnel, so a box that
+      # runs one every cycle and refuses it every cycle printed "no refresh pass has recorded its funnel
+      # yet" — a false statement about our own state on the exact box this patch is about. The honest
+      # reading is that no pass RECORDED a decomposition; the [refresh] cause is in the log.
+      printf '[dispatch] %s queued of an UNRECORDED pool (no state/refresh-funnel — no pass has recorded a decomposition; a pass that refused before listing writes none) -> %s dispatched%s (queue=%s%s)\n' \
         "$backlog" "$k" "${held:+ | held: $held}" "$qtok" "$ynote"
     fi
     return 0
@@ -2001,7 +2029,20 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   is_num "$col"      && parts+=("$col peer-owned (claim)")
   is_num "$land"     && parts+=("$land already landed")
   is_num "$unj"      && parts+=("$unj unjudged (pre-flight)")
-  is_num "$sk_ck"    && parts+=("$sk_ck blacklisted (checked)")
+  # ⛔ THE SUPPRESSION NOW SAYS WHY IT SUPPRESSED. `N blacklisted (checked)` was the same kind of
+  # unmeasured number as `not reached (limit)`: checked.txt short-circuits a candidate before any
+  # network call, so an operator had no way to see whether those N were waiting, dispatched, owned by
+  # a live lane, held by a peer's claim, or held by nothing at all. The breakdown sums to N by
+  # construction (the writer counts every reason, `unknown` included); a record without the keys —
+  # an older writer — keeps the old wording and invents no zero.
+  if is_num "$sk_ck"; then
+    if is_num "$sk_q" || is_num "$sk_d" || is_num "$sk_p" || is_num "$sk_l" \
+       || is_num "$sk_c" || is_num "$sk_cu" || is_num "$sk_df" || is_num "$sk_u"; then
+      parts+=("$sk_ck blacklisted (checked: queued ${sk_q:-0}, dispatched ${sk_d:-0}, pr ${sk_p:-0}, lane ${sk_l:-0}, claim ${sk_c:-0}, claim-unknown ${sk_cu:-0}, deferred ${sk_df:-0}, unknown ${sk_u:-0})")
+    else
+      parts+=("$sk_ck blacklisted (checked)")
+    fi
+  fi
   is_num "$sk_dp"    && parts+=("$sk_dp already dispatched")
   is_num "$sk_ld"    && parts+=("$sk_ld already landed (skipped)")
   # ⛔ PEER-HELD IS NOT "NOT REACHED" (review finding P2-1 for #2124). The refresh walks PAST a
@@ -2011,7 +2052,21 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # asserted about a pass whose `limit=` is printed right beside it at its real value. A record that
   # predates this key simply omits the part (no invented zero), and an older reader ignores it.
   is_num "$sk_co"    && parts+=("$sk_co peer-held (ledger skip)")
-  is_num "$notr"     && parts+=("$notr not reached (limit)")
+  # ── WHY THE WALK DID NOT REACH THEM (agent-infra#2183) ──────────────────────────────────────
+  # ⛔ `(limit)` WAS A CAUSE NOBODY MEASURED. The refresh wrote no stop reason at all, so this
+  # function asserted the one reading that tells an operator to raise LIMIT — about a pass whose
+  # `limit=` it prints at its real value in the same sentence, and whose actual stop was usually the
+  # `RUN_BUDGET` (pre-flight RUNS, a different budget) or a spent REST reserve. A record that
+  # predates `stop=` gets no invented cause; it says the cause was not recorded, which is the truth.
+  if is_num "$notr"; then
+    case "${stop:-}" in
+      limit)      parts+=("$notr not reached (slot limit: ${limit:-?} slot(s) filled)") ;;
+      run_budget) parts+=("$notr not reached (run budget: ${judged:-?} pre-flight run(s) spent, ${unj:-?} unjudged)") ;;
+      spend)      parts+=("$notr not reached (REST spend reserve)") ;;
+      none)       parts+=("$notr not reached (the walk reached the end of the pool)") ;;
+      *)          parts+=("$notr not reached (cause not recorded)") ;;
+    esac
+  fi
   local joined="" p
   for p in ${parts[@]+"${parts[@]}"}; do joined="${joined:+$joined, }$p"; done
   # A record that does not add up is NOT printed as a clean decomposition: the parts names what
@@ -2026,9 +2081,75 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     0) joined="${joined:+$joined, }UNRECONCILED (the parts do not sum to the pool)" ;;
     *) joined="${joined:+$joined, }UNRECONCILED (no reconciliation recorded — the parts are unverified)" ;;
   esac
-  printf '[dispatch] %s candidates -> %s -> %s dispatched%s (backlog=%s, queue=%s%s%s)\n' \
+  # ── APPENDED FACTS — ONE SEPARATOR, ALWAYS (`— `) ────────────────────────────────────────────
+  # ⛔ THE FAILING SURFACE IS THE POINT OF THE WHOLE RECORD ON A BROKEN CELL. `12 unjudged` says
+  # twelve runs produced nothing actionable; `— failing surface: issue-assignee-holder:12` says it
+  # was one surface failing twelve times, which is a different repair. Rendered only when the writer
+  # recorded something other than `none`, and never with an extra literal: the occurrence count is
+  # already inside the field.
+  local tail=""
+  case "${unusable:-}" in ''|none) : ;; *) tail="$tail — failing surface: $unusable" ;; esac
+  # ⛔ A FAILED REWRITE IS NOT "NOTHING WAS RELEASED". The writer publishes `checked_released=-`
+  # when the atomic `checked.txt` rewrite failed — the entries ARE still suppressed and nobody knows
+  # how many. Rendering that as nothing made a failed release indistinguishable from a quiet pass on
+  # the one line an operator reads, with the only contradicting evidence a WARN in the refresh log
+  # that this reader never sees.
+  case "${ck_rel:-}" in
+    # ⛔ ONE SENTINEL, MORE THAN ONE CAUSE (review A-P3, cycle 4). `-` is published when the count was
+    # not recorded — the `checked.txt` rewrite FAILED, the `state/checked-reap` write failed, or the
+    # record predates this pass. Naming the rewrite alone sent an operator to the wrong file.
+    -) tail="$tail — released from checked: UNKNOWN (the count was not recorded — see the refresh log)" ;;
+    *)
+      if is_num "$ck_rel" && [ "$ck_rel" -gt 0 ]; then
+        tail="$tail — $ck_rel released from checked"
+      fi ;;
+  esac
+  # ⛔ AN UNPROVEN SUPPRESSION IS SHOWN, NOT HIDDEN. An entry kept because the claim registry could
+  # not answer is not justified and not released; leaving it inside the checked total would make the
+  # line read as fully accounted for. `expected bound: 0` is the writer's own statement.
+  if is_num "$ck_unjust" && [ "$ck_unjust" -gt 0 ]; then
+    tail="$tail — UNPROVEN suppression: $ck_unjust checked entr(ies) with no proven fact"
+  fi
+  # ⛔ A BOUND THAT BINDS EVERY CYCLE IS A MEASUREMENT, NOT SILENCE (review E-P2, cycle 2). The reaper
+  # published `deferred=` and NOTHING read it, so a cell whose release cap was too small for its
+  # `checked.txt` — the one reading that says "raise CHECKED_RELEASE_MAX" — looked exactly like a cell
+  # with nothing to release. Only the residue is shown: `0` is the healthy quiet pass and has no line.
+  if is_num "$ck_def" && [ "$ck_def" -gt 0 ]; then
+    tail="$tail — $ck_def checked entr(ies) deferred by the release cap (a standing residue means CHECKED_RELEASE_MAX is too small for this cell)"
+  fi
+  # ⛔ A REFUSED CLASSIFICATION IS A STATEMENT, NOT AN ABSENT TAIL (review E-P2, cycle 3). Every
+  # refusal records `unjustified=-`, and `-` rendered as nothing — so a permanently undecodable
+  # `.pr_brs`, whose refusal is *designed* to repeat on every pass, produced a line byte-for-byte
+  # identical to a healthy quiet pass: the #2183 defect this whole patch exists to end, one layer in.
+  # The refusal now names the fact that could not be read.
+  case "${ck_ref:-}" in
+    ''|none) : ;;
+    # ⛔ A RELEASE MADE WITHOUT THE CLAIM READ IS A CAVEAT, NOT A REFUSAL (review). The fallback slug
+    # means the classification RAN and entries WERE released — on local facts only, because
+    # `$O/claims.sh` is not installed. Rendering it with the refusal sentence below would tell the
+    # operator "nothing could be released" about the one pass that released without the cross-box check.
+    claim-registry-absent) tail="$tail — checked release ran WITHOUT the claim registry (not installed on this box): released on LOCAL facts only, so a peer's cross-box claim would not have been seen" ;;
+    *) tail="$tail — checked classification REFUSED this pass ($ck_ref): nothing could be released" ;;
+  esac
+  # ⛔ AND A RELEASE THAT COULD NOT RUN IS NOT A CAP THAT BOUND (review E-P2, cycle 3): a failed
+  # `mktemp`/`sort` left every candidate `unknown`, and the only line an operator reads named
+  # `CHECKED_RELEASE_MAX` — the one knob that cannot help.
+  case "${ck_sort:-}" in
+    ''|'-'|0|None|none) : ;;
+    *) tail="$tail — checked release DID NOT RUN (the release sort failed): the suppression is unrevalidated this pass" ;;
+  esac
+  # ⛔ A CONTRADICTION BETWEEN THE CAUSE AND THE RESIDUE IS ITS OWN STATEMENT, never "the parts do not
+  # sum": the parts DID sum, and accusing the pool of an arithmetic failure about a pass whose
+  # arithmetic is fine would send the operator to the wrong place. `reconciled=` is left alone.
+  if is_num "$stop_cf" && [ "$stop_cf" -gt 0 ]; then
+    tail="$tail — STOP CONTRADICTION (the recorded cause and the residue disagree)"
+  fi
+  if is_num "$reason_cf" && [ "$reason_cf" -gt 0 ]; then
+    tail="$tail — CHECKED BREAKDOWN DOES NOT SUM (the record's own accounting is incomplete)"
+  fi
+  printf '[dispatch] %s candidates -> %s -> %s dispatched%s (backlog=%s, queue=%s%s%s)%s\n' \
     "${listed:-?}" "${joined:-no reason recorded}" "$k" \
-    "${held:+ | held: $held}" "$backlog" "$qtok" "${age:+, funnel ${age}m old}" "$ynote"
+    "${held:+ | held: $held}" "$backlog" "$qtok" "${age:+, funnel ${age}m old}" "$ynote" "$tail"
 }
 
 # ── the box's last gh RATE-LIMIT observation (#1988) ─────────────────────────────────────
@@ -2943,6 +3064,19 @@ while true; do
   # BEGIN sweep-listing (sweep-quota.test.sh extracts this block verbatim — keep it self-contained)
   NOW="$(date +%s)"
   SWEEP_LIST=""
+  # ⛔ THE ACTABLE ROW SET MUST OUTLIVE THE PROCESS, NOT JUST THE CYCLE (#2601). `SWEEP_LIST` is the
+  # ONLY actable row set the PR path has — `pr 	 branch 	 draft`, which is exactly what the arms
+  # need and exactly what `state/pr-meta.tsv` does NOT carry (that file holds `pr \t created_at`, for
+  # the selection order only). Before this, the file was memory-only, so any cycle that did not get a
+  # fresh 200 had ZERO actable rows and every counted PR got `wait "no per-PR read"`. Measured on the
+  # agent-infra controller 2026-10-23: 152 of 221 `[select]` lines were such cycles and the PR path
+  # acted ZERO times over 555 cycles while 70 PRs sat open. A 304 is GitHub asserting "identical to
+  # what you last cached", so the cached rows ARE this cycle's read — reusing them performs the read
+  # instead of dropping it, and the SWEEP_MAX_AGE floor above still bounds how long that can hold.
+  SWEEP_CACHED=0
+  # Named on every per-PR wait row when there is no actable row set, so the reason says WHICH thing
+  # was missing rather than "unchanged — 304 — or unreadable" (three different facts, one string).
+  SWEEP_CACHE_NOTE=""
   # Bound the DIGITS before any `[ … -gt … ]`. `[` ERRORS at or above 2**63 (the is_limit hazard this
   # file documents at the top), and an ERRORING `[` short-circuits a `&&` clamp into NOT firing — so a
   # 19-digit value would sail past the clamp. `is_num` is deliberately unbounded (it must accept a
@@ -2982,6 +3116,9 @@ while true; do
     # hammering the docs warn about — and every call would fail until then. The reset (or
     # Retry-After) is already recorded, so the sweep waits it out rather than burning attempts.
     echo "[sweep] ⛔ RATE-LIMITED — sweep DEFERRED for another $(( (DEFER_UNTIL - NOW + 59) / 60 ))m (until $(date -d "@$DEFER_UNTIL" '+%H:%M:%S' 2>/dev/null || date -r "$DEFER_UNTIL" '+%H:%M:%S' 2>/dev/null || echo "epoch $DEFER_UNTIL")). THIS CELL CANNOT MERGE, NOT IDLE." >> "$LOG"
+    # The cached rows are NOT read either: a deferred cycle made no request, so nothing vouches for
+    # them this cycle. Named on every per-PR row rather than folded into the generic string.
+    SWEEP_CACHE_NOTE="the sweep is DEFERRED (rate-limited until ${DEFER_UNTIL}) — no listing was requested, so no PR was read this cycle"
   else
     if SWEEP_RAW="$(gh api --paginate -i ${COND[@]+"${COND[@]}"} --jq \
         ".[]|{number,headRefName:.head.ref,isDraft:.draft,created:.created_at,sha:.head.sha}|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\t\(.created)\t\(.sha)\"" \
@@ -2996,11 +3133,45 @@ while true; do
     RL_RESET="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'x-ratelimit-reset')"
     RL_AFTER="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'retry-after')"
     if [ "$SWEEP_STATUS" = "304" ]; then
-      # Unchanged: GitHub does not charge a 304 to the primary rate limit, and the per-PR reads are
-      # skipped this cycle — an identical listing means an identical PR set. Bounded by SWEEP_MAX_AGE.
-      echo "[sweep] listing unchanged (304, etag sent) — no per-PR reads this cycle; next full sweep in <=$(( SWEEP_MAX_AGE - (NOW - LAST_FULL) ))s" >> "$LOG"
+      # Unchanged: GitHub does not charge a 304 to the primary rate limit. It IS the listing, though,
+      # so the rows are restored from the cache this cycle's 304 vouches for — an identical listing
+      # means an identical PR set, and the arms need that set to act on. Bounded by SWEEP_MAX_AGE:
+      # the conditional header is only sent while the last full sweep is younger than the floor.
+      if [ -s "$O/state/sweep-rows.tsv" ]; then
+        SWEEP_LIST="$(awk -F"$(printf '\t')" 'NF>=3 && $1 ~ /^[0-9]+$/ {print $1"\t"$2"\t"$3}' "$O/state/sweep-rows.tsv" 2>/dev/null || true)"
+        # `pr-meta.tsv` comes back with it: the selection ORDER reads it, and a cache restore that
+        # left it stale would order this cycle by another cycle's ages.
+        awk -F"$(printf '\t')" 'NF>=2 && $1 ~ /^[0-9]+$/ {print $1"\t"$2}' "$O/state/sweep-meta.tsv" > "$O/state/pr-meta.tsv" 2>/dev/null \
+          || : > "$O/state/pr-meta.tsv"
+        if [ -n "${SWEEP_LIST:-}" ]; then
+          SWEEP_CACHED=1
+          echo "[sweep] listing unchanged (304, etag sent) — restored $(printf '%s\n' "$SWEEP_LIST" | awk 'END{print NR+0}') actable row(s) from state/sweep-rows.tsv (age $(( NOW - LAST_FULL ))s <= ${SWEEP_MAX_AGE}s); per-PR reads run on them; next unconditional sweep in <=$(( SWEEP_MAX_AGE - (NOW - LAST_FULL) ))s" >> "$LOG"
+        else
+          # ⛔ AN EMPTY ACTABLE SET IS NOT A CORRUPT FILE (#2640 review, P2). `printf` writes a 1-byte
+          # file for a 200 that listed zero in-scope PRs, so `-s` passes and the parse yields zero
+          # rows — on the HEALTHIEST state (backlog drained, or nothing matching SCOPE/SEL). Naming
+          # corruption there would cry "CANNOT MERGE" every 304 cycle for the life of the box, so both
+          # readings are stated and neither is asserted.
+          SWEEP_CACHE_NOTE="the cached listing holds ZERO actable rows (state/sweep-rows.tsv: the backlog is drained or scope-filtered, or the file was truncated)"
+          echo "[sweep] 304 and state/sweep-rows.tsv holds ZERO actable rows — nothing to act on this cycle. That is the drained/scope-filtered state OR a truncated cache; both are named here rather than one being asserted. (Not an error by itself: the next 200 rewrites it.)" >> "$LOG"
+        fi
+      else
+        SWEEP_CACHE_NOTE="state/sweep-rows.tsv is missing/empty (a 304 vouches for a listing this box never cached)"
+        # ⛔ DROP THE VALIDATOR ON THE NO-CACHE PATH (#2640 review, P2). Leaving it meant every
+        # following cycle kept sending If-None-Match, kept getting 304, and kept having no cache —
+        # BLIND for up to SWEEP_MAX_AGE (~10 min, tens of cycles) with a log that said "once". This
+        # state is reachable on EVERY cell at the first cycle after an upgrade (the ETag survives it,
+        # the rows file does not), so it is the common case, not a corner. Without the ETag the next
+        # cycle sends no conditional header and gets a 200.
+        rm -f "$O/state/sweep-etag" 2>/dev/null || true
+        echo "[sweep] ⛔ 304 with NO CACHE — state/sweep-rows.tsv is missing/empty, so this cycle has no actable rows; the ETag has been DROPPED so the next cycle fetches unconditionally. Nothing is acted on, and the reason is written per PR." >> "$LOG"
+      fi
     elif [ "$SWEEP_RC" -ne 0 ]; then
       SWEEP_KIND="$(sweep_fail_kind "${SWEEP_RAW:-}" "$SWEEP_ERR")"
+      # ⛔ THE CACHE IS **NOT** SERVED HERE, DELIBERATELY. A failed listing is not an assertion that
+      # anything is unchanged, so acting on the last cached rows would be acting on a read the server
+      # never confirmed this cycle. The failure is named instead, and the row reason carries it.
+      SWEEP_CACHE_NOTE="the PR listing FAILED ($SWEEP_KIND) — the cached rows were NOT used, so no PR was read this cycle"
       if [ "$SWEEP_KIND" = "rate-limit" ]; then
         DEFER_UNTIL="$(sweep_defer_until "${SWEEP_RAW:-}")"
         printf '%s\n' "$DEFER_UNTIL" > "$O/state/sweep-defer-until"
@@ -3013,8 +3184,6 @@ while true; do
       # deferral is set HERE, before the NEXT call — gating after the listing would only stop
       # requests the listing has already paid for.
       SWEEP_ETAG_NEW="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'etag')"
-      [ -n "$SWEEP_ETAG_NEW" ] && printf '%s\n' "$SWEEP_ETAG_NEW" > "$O/state/sweep-etag"
-      printf '%s\n' "$NOW" > "$O/state/sweep-stamp"
       rm -f "$O/state/sweep-defer-until"
       # ⛔ THREE COLUMNS STAY THE CONTRACT (every reader below, and the sweep-quota suite, splits on
       # SWEEP_LIST's `pr \t branch \t draft`). The listing now also carries each PR's `created_at`
@@ -3024,6 +3193,22 @@ while true; do
       SWEEP_LIST="$(printf '%s\n' "${SWEEP_RAW:-}" | awk -F"$(printf '\t')" 'NF>=3 && $1 ~ /^[0-9]+$/ {print $1"\t"$2"\t"$3}')"
       printf '%s\n' "${SWEEP_RAW:-}" | awk -F"$(printf '\t')" 'NF>=5 && $1 ~ /^[0-9]+$/ {print $1"\t"$4}' > "$O/state/pr-meta.tsv" 2>/dev/null \
         || : > "$O/state/pr-meta.tsv"
+      # ⛔ PERSIST THE ACTABLE ROWS IN THE SAME BREATH AS THE VALIDATOR (#2601). The ETag is stored so
+      # the NEXT cycle can ask "unchanged?", and that question is worthless if the box cannot answer
+      # what it is unchanged FROM. Written after the projections so a partial write can never be newer
+      # than the ETag that vouches for it: `sweep-rows.tsv` (3 columns, the actable set) and
+      # `sweep-meta.tsv` (pr, created_at — what pr-meta.tsv is projected from on a restore).
+      printf '%s\n' "${SWEEP_LIST:-}" > "$O/state/sweep-rows.tsv" 2>/dev/null || : > "$O/state/sweep-rows.tsv"
+      printf '%s\n' "${SWEEP_RAW:-}" | awk -F"$(printf '\t')" 'NF>=5 && $1 ~ /^[0-9]+$/ {print $1"\t"$4}' > "$O/state/sweep-meta.tsv" 2>/dev/null \
+        || : > "$O/state/sweep-meta.tsv"
+      # ⛔ THE VALIDATOR IS WRITTEN **AFTER** THE ROWS IT VOUCHES FOR (#2640 review, P2). Before this,
+      # a teardown between the two writes left a NEW ETag beside the OLD rows and an advanced stamp,
+      # so the next cycle sent `If-None-Match: <new>` for up to SWEEP_MAX_AGE and answered the 304 with
+      # rows the server never confirmed — the exact "act on an unconfirmed read" the failure and
+      # deferral arms refuse. A teardown here at worst leaves an OLD ETag beside NEW rows: the next
+      # conditional request then comes back 200 and rewrites both, which is harmless.
+      [ -n "$SWEEP_ETAG_NEW" ] && printf '%s\n' "$SWEEP_ETAG_NEW" > "$O/state/sweep-etag"
+      printf '%s\n' "$NOW" > "$O/state/sweep-stamp"
       if is_num "${RL_REMAIN:-}" && [ "$RL_REMAIN" -le "$SWEEP_MIN_REMAIN" ]; then
         DEFER_UNTIL="$(sweep_defer_until "${SWEEP_RAW:-}")"
         printf '%s\n' "$DEFER_UNTIL" > "$O/state/sweep-defer-until"
@@ -3159,6 +3344,70 @@ while true; do
     # to derive, so the listing order stands and every row is marked UNKNOWN.
     SEL_ROWS="$(printf '%s\n' "${SWEEP_LIST:-}" | awk -F"$(printf '\t')" -v OFS="$(printf '\t')" 'NF>=3 {print $1,$2,$3,"UNKNOWN"}')"
   fi
+  # ── THE SWEEP'S PER-CYCLE WINDOW (agent-infra#2601) ────────────────────────────────────────────
+  # ⛔ A FULL SWEEP OF THIS BOX'S BACKLOG DOES NOT FIT IN ONE CYCLE, AND THAT IS WHY NOTHING ACTED.
+  # Each row costs at least two `gh pr view` calls (state, then headRefOid) plus whatever its class
+  # needs; measured 2026-10-23, the controller relaunches roughly every 12-45s while a 70-row sweep
+  # costs minutes, so the loop was torn down mid-sweep on every cycle that had rows at all — and
+  # `prdisp.tsv`/`prclass.tsv`/the `[pr]` summary never saw a completed pass (measured: 0 `act` rows
+  # and 0 `[pr] … acted` lines across 555 cycles). The arms are at the END of the loop, so a sweep
+  # that cannot finish cannot spawn, merge or review anything — ever.
+  # A rotating window makes progress bounded instead of all-or-nothing: K rows per cycle, resuming
+  # where the last cycle stopped, so every swept PR is visited within ceil(N/K) cycles and EVERY
+  # cycle's pass COMPLETES. K is a tunable (`SWEEP_ROWS_PER_CYCLE`), bounded like every other one.
+  # ⛔ ROWS OUTSIDE THE WINDOW ARE NOT SILENT AND ARE NOT "UNSWEPT": the parent names each one with
+  # the window it fell outside of, below. A bounded pass that says what it skipped is honest; an
+  # unbounded pass that never finishes is not.
+  # [sweep-window:begin] (extracted and DRIVEN by pr-path-reads.test.sh — keep the markers)
+  SWEEP_WINDOW_PR=""
+  SWEEP_WIN_NOTE=""
+  # ⛔ `SEL_WINDOW` IS PER-CYCLE STATE AND MUST BE RESET LIKE THE REST OF IT (#2640 review, P1).
+  # This block runs inside `while true`, so an un-reset value carries last cycle's rows into a cycle
+  # that read NOTHING: on a deferral, a failed listing, or a cache-less 304, `SEL_N` is 0, the window
+  # is never recomputed, and `${SEL_WINDOW:-$SEL_ROWS}` would then hand the sweep loop the PREVIOUS
+  # cycle's rows — `gh pr view`/`gh pr ready`/merge arms firing on a listing this cycle never read,
+  # which is exactly what the deferral and failure arms refuse. Measured shape: the arms would act on
+  # a read the server never confirmed, which is the one direction this file must never take.
+  SEL_WINDOW=""
+  SEL_N=0
+  [ -n "${SEL_ROWS:-}" ] && SEL_N="$(printf '%s\n' "$SEL_ROWS" | awk 'NF{n++} END{print n+0}')"
+  is_limit "${SWEEP_ROWS_PER_CYCLE:-}" || SWEEP_ROWS_PER_CYCLE=8
+  [ "${SWEEP_ROWS_PER_CYCLE:-0}" -ge 1 ] || SWEEP_ROWS_PER_CYCLE=8
+  if [ "$SEL_N" -gt 0 ]; then
+    SEL_CUR="$(cat "$O/state/sweep-cursor" 2>/dev/null || true)"
+    is_num "${SEL_CUR:-}" || SEL_CUR=0
+    [ "${#SEL_CUR}" -le 10 ] || SEL_CUR=0
+    # Clamp on READ: a corrupt or hand-edited cursor must rotate from the top, never index past the set.
+    [ "$SEL_CUR" -ge "$SEL_N" ] && SEL_CUR=0
+    if [ "$SEL_N" -le "$SWEEP_ROWS_PER_CYCLE" ]; then
+      # The whole set fits: no rotation needed, and the cursor stays where it is (leaving a stale
+      # cursor here would skip rows the moment the backlog grew past K again).
+      SEL_WINDOW="$SEL_ROWS"; SEL_CUR=0
+    else
+      SEL_WINDOW="$(printf '%s\n' "$SEL_ROWS" | awk -F"$(printf '\t')" -v k="$SWEEP_ROWS_PER_CYCLE" -v c="$SEL_CUR" \
+        'NF{n++; r[n]=$0} END{ if(n==0) exit; for(i=0;i<k && i<n;i++) print r[((c+i)%n)+1] }')"
+    fi
+    # ⛔ A WRAPPING WINDOW MUST NOT PRINT A RANGE THAT DOES NOT EXIST (#2640 review, P2). With
+    # N=20, K=8 and cursor 16 the covered rows are 17-20 and 1-4, but the naive end printed
+    # `window=17-24 of 20` — the one sentence an operator gets, naming row 24 of a 20-row set.
+    _wcount="$(printf '%s\n' "$SEL_WINDOW" | awk 'NF{n++} END{print n+0}')"
+    if [ $(( SEL_CUR + _wcount )) -gt "$SEL_N" ]; then
+      SWEEP_WIN_NOTE="window=$(( SEL_CUR + 1 ))-${SEL_N} then 1-$(( SEL_CUR + _wcount - SEL_N )) of $SEL_N (K=${SWEEP_ROWS_PER_CYCLE}/cycle, rotating; wrapped)"
+    else
+      SWEEP_WIN_NOTE="window=$(( SEL_CUR + 1 ))-$(( SEL_CUR + _wcount )) of $SEL_N (K=${SWEEP_ROWS_PER_CYCLE}/cycle, rotating)"
+    fi
+    SWEEP_WINDOW_PR="$(printf '%s\n' "$SEL_WINDOW" | awk -F"$(printf '\t')" 'NF && $1 ~ /^[0-9]+$/ {printf " %s", $1}') "
+    # ⛔ THE CURSOR IS NOT ADVANCED HERE (#2640 review, P1). It is advanced AFTER the pass, by the
+    # number of window rows that actually produced a disposition — see the block below the sweep
+    # loop. Advancing by K up front assumed the whole window was read, and the fix's own premise is
+    # that a cycle can be torn down mid-pass: with M of K rows read, the tail of every window was
+    # stepped over, and because the start positions then live in one residue class mod gcd(K,N), a
+    # whole class of PRs was NEVER read (`K=8, N=70, M=1` → 35 of 70, ever) while each of them was
+    # told "it is read within N cycles". Resuming at the unfinished row is the only honest step.
+    printf '%s\n' "$SEL_CUR" > "$O/state/sweep-cursor" 2>/dev/null || true
+    echo "[sweep] per-cycle window: $SWEEP_WIN_NOTE — every row is visited within $(( (SEL_N + SWEEP_ROWS_PER_CYCLE - 1) / SWEEP_ROWS_PER_CYCLE )) cycle(s)" >> "$LOG"
+  fi
+  # [sweep-window:end]
   # ── the funnel's inputs: ONE POPULATION PER CYCLE, from the RICHEST source that actually read ──
   # ⛔ THE PARTS AND THE TOTAL MUST COME FROM THE SAME READ (measured in the first live cycle of this
   # change: the line read `56 un-owned (5 owned)` beside `61 PRs` from one listing and `26 open` from
@@ -3318,7 +3567,53 @@ while true; do
   }
   # [prdisp:end]
 
-  printf '%s\n' "$SEL_ROWS" |
+
+  # ── SPAWN REFUSALS: A PER-CYCLE MEASUREMENT, NOT A LOG LINE (measured 2026-10-22) ───────────
+  # The controller can only advance the fleet through the launcher. When the launcher refuses, every
+  # spawn site below records a per-PR `wait` — and the cycle's own `[pr]`/`[dispatch]` line reads
+  # `N acted, M named wait(s)`, which is indistinguishable from a healthy busy cycle. MEASURED: 1,562
+  # refusals in one log (`cmux layout apply failed: … database or disk is full` — the registry volume
+  # at 100%) while `lanes=0 workers=5` printed every cycle for six hours and not one PR landed. The
+  # refusal record is written by the launcher (`wt_refusal_record`, worker-terminal.sh) and TRUNCATED
+  # here, before the sweep, so cycle N can never read cycle N-1's refusals as its own.
+  # ⛔ ONE RESOLVER, NOT TWO. The path comes from the launcher's OWN `wt_refused_file` when the module
+  # provides it (a stale `worker-terminal.sh` must not stop the controller — the guard above does not
+  # require this function, and a mixed deploy would otherwise refuse to run): with two independent
+  # spellings, a `WT_DIR` test seam made the writer record one file while this reader watched another,
+  # and the measurement would read 0 forever (the single-source class).
+  # [spawnref:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+  SPAWNREF=""; SPAWNREF_OK=1; SPAWNREF_WHY_BAD=""
+  if command -v wt_refused_file >/dev/null 2>&1; then
+    SPAWNREF="$(wt_refused_file)" 2>/dev/null
+  else
+    # ⛔ A STALE LAUNCHER MODULE IS NOT A MEASUREMENT OF ZERO. The guard at the top of this file does
+    # not require `wt_refused_file` (a mixed deploy must not stop the controller), so this state is
+    # reachable — and with no writer, "0 refusals" would be a claim about a record nothing fills.
+    SPAWNREF="$O/state/spawn-refused.tsv"
+    SPAWNREF_OK=0
+    SPAWNREF_WHY_BAD="the launcher module predates wt_refused_file, so nothing records refusals"
+  fi
+  if [ "${SPAWNREF_OK:-1}" = "1" ]; then
+    # ⛔ A TRUNCATE IS NOT A WRITE PROBE (review, cycle 2). `: > file` is allocation-free and SUCCEEDS
+    # on a full filesystem — the exact condition that causes refusals. So the probe is a SENTINEL ROW
+    # that must actually be written; its absence is what turns "0 refusals" into "UNMEASURED".
+    # ⛔ THE PROBE MUST BE THE SIZE OF A REAL ROW (review, cycle 3). A 13-byte probe passes on a volume
+    # with 13–250 bytes free and then every refusal row (up to ~250 B) is dropped: OK=1, N=0, no suffix
+    # — a MEASURED zero, which is the false PASS the probe exists to prevent. Pad it to the row bound.
+    _pr_probe="$(printf '%*s' 260 '' | tr ' ' x)"
+    if : > "$SPAWNREF" 2>/dev/null && printf '#\t%s\n' "$_pr_probe" >> "$SPAWNREF" 2>/dev/null; then :; else
+      SPAWNREF=/dev/null; SPAWNREF_OK=0
+      SPAWNREF_WHY_BAD="state/ is not writable (the probe row could not be written)"
+    fi
+  fi
+  SPAWNREF_BASE=0
+  if [ -s "${SPAWNREF:-/nonexistent}" ]; then
+    SPAWNREF_BASE="$(awk 'END{print NR+0}' "$SPAWNREF" 2>/dev/null)"
+  fi
+  is_num "${SPAWNREF_BASE:-}" || SPAWNREF_BASE=0
+  # [spawnref:end]
+
+  printf '%s\n' "${SEL_WINDOW:-$SEL_ROWS}" |
   while IFS="$(printf '\t')" read -r PR BR DRAFT OWN; do
     [ -z "${PR:-}" ] && continue
     # Skip anything that is not a plain integer PR / simple ref — never let API data reach a shell.
@@ -4300,6 +4595,40 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     esac
     # [acting-case:end]
   done
+  # [sweep-cursor:begin] (extracted and DRIVEN by pr-path-reads.test.sh — keep the markers)
+  # ── THE CURSOR ADVANCES BY WHAT WAS ACTUALLY READ, AFTER THE PASS (#2640) ─────────────────────
+  # ⛔ THE RESUME POINT IS THE UNFINISHED ROW, NOT THE START OF THE NEXT WINDOW. The sweep above is a
+  # pipeline (a killed cycle dies inside it), so the only proof a row was read is its `prdisp` row.
+  # Advancing by that count means an interrupted pass resumes where it stopped instead of stepping
+  # over the tail; a cycle killed before ANY row landed leaves the cursor where it was and the same
+  # window is retried (at-least-once — the honest direction, and a re-read is cheap next to a PR
+  # that is never read at all).
+  # The start row is read from state when this block is driven on its own (the window block above
+  # persists it there, and persisting the START -- not the next window -- is what makes a resume
+  # possible). `SEL_CUR` wins when both exist: it is this cycle's own read.
+  _cur="${SEL_CUR:-$(cat "$O/state/sweep-cursor" 2>/dev/null || true)}"
+  is_num "${_cur:-}" || _cur=0; [ "${#_cur}" -le 10 ] || _cur=0
+  [ "${_cur:-0}" -ge "${SEL_N:-1}" ] && _cur=0
+  if [ "${SEL_N:-0}" -gt 0 ] && [ -n "${SEL_WINDOW:-}" ] && [ "${SEL_N:-0}" -gt "${SWEEP_ROWS_PER_CYCLE:-0}" ]; then
+    _win_read="$(printf '%s\n' "${SEL_WINDOW:-}" | awk -F"$(printf '\t')" -v disp="$PRDISP" '
+      NF==0 {next}
+      { n++; split($0, f, "\t"); pr[++m]=f[1] }
+      END {
+        if (m == 0) { print 0; exit }
+        while ((getline line < disp) > 0) { split(line, g, "\t"); got[g[1]]=1 }
+        c = 0
+        for (i = 1; i <= m; i++) if (pr[i] in got) c++
+        print c
+      }' 2>/dev/null || echo 0)"
+    is_num "${_win_read:-}" || _win_read=0
+    if [ "$_win_read" -gt 0 ]; then
+      printf '%s\n' "$(( (_cur + _win_read) % SEL_N ))" > "$O/state/sweep-cursor" 2>/dev/null || true
+      echo "[sweep] cursor: $_win_read of the window's rows were read this cycle → next start row $(( (_cur + _win_read) % SEL_N + 1 )) of $SEL_N" >> "$LOG"
+    else
+      echo "[sweep] cursor: NONE of the window's rows produced a disposition — the cursor stays at row $(( _cur + 1 )) and the same window is retried next cycle (a pass that read nothing must not skip anything)" >> "$LOG"
+    fi
+  fi
+  # [sweep-cursor:end]
   # ── THE PR PATH'S OWN OUTCOME, IN ONE LINE (agent-infra#2126) ───────────────────────────────────
   # ⛔ THE LEDGER'S SECOND HALF, and it has to run in the PARENT: the sweep above is a pipeline, so
   # only the sidecar survived it. Every COUNTED un-owned PR that the sweep never saw gets its reason
@@ -4321,13 +4650,57 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     pr_owned "$_p" "$_osha" "$_obr" && continue
     grep -q "^${_p}"$'\t' "$PRDISP" 2>/dev/null && continue
     if [ -z "${SWEEP_LIST:-}" ]; then
-      disp "$_p" - - wait "no per-PR read this cycle (the open-PR listing was unchanged — 304 — or unreadable)"
+      # ⛔ THE REASON NAMES THE THING THAT WAS MISSING (#2601). "unchanged — 304 — or unreadable"
+      # collapsed three different facts into one string, so an operator could not tell a bounded
+      # cache-skip from a failed API call from a fresh state dir with no cache at all.
+      disp "$_p" - - wait "no per-PR read this cycle (${SWEEP_CACHE_NOTE:-the open-PR listing was unchanged — 304 — or unreadable})"
     else
-      disp "$_p" - - wait "not in this cycle's swept set (scope=$SCOPE_MODE; drafts and non-matching branches are filtered out)"
+      # ⛔ OUTSIDE THIS CYCLE'S WINDOW IS NOT "UNSWEPT" (#2601). The sweep is bounded so that a pass
+      # COMPLETES (see the window block above); a row it did not reach this cycle carries the window
+      # it fell outside of, plus when the rotation returns to it. Named, never silently dropped —
+      # and kept DISTINCT from "never in the swept set", which is a scope/draft fact, not a timing one.
+      _in_win=0; _in_swept=0
+      case "${SWEEP_WINDOW_PR:-}" in *" $_p "*) _in_win=1 ;; esac
+      printf '%s\n' "${SWEEP_LIST:-}" | awk -F"$(printf '\t')" -v p="$_p" '$1==p{f=1} END{exit f?0:1}' && _in_swept=1
+      if [ "$_in_win" = "1" ]; then
+        disp "$_p" - - wait "in this cycle's sweep window but the sweep recorded no disposition for it (re-read next cycle)"
+      elif [ "$_in_swept" = "1" ]; then
+        _k="${SWEEP_ROWS_PER_CYCLE:-8}"; is_limit "${_k:-}" || _k=8; [ "$_k" -ge 1 ] || _k=8
+        disp "$_p" - - wait "outside this cycle's sweep window (${SWEEP_WIN_NOTE:-SWEEP_ROWS_PER_CYCLE}); it is read within $(( (${SEL_N:-1} + _k - 1) / _k )) cycles"
+      else
+        disp "$_p" - - wait "not in this cycle's swept set (scope=$SCOPE_MODE; drafts and non-matching branches are filtered out)"
+      fi
     fi
   done
   # [prdisp-apply:end]
   # [prsum:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+  # ── THE ACTUATOR'S OWN ANSWER, BESIDE THE TALLY ─────────────────────────────────────────────
+  # ⛔ `N acted` MUST NEVER HIDE A REFUSED SPAWN. An "act" can be a draft-ready or an auto-arm that
+  # starts no worker; the refusal record is the only measurement of "did a lane actually start".
+  # Print the count and the launcher's OWN reason (never a guess) on every state of the line below,
+  # so `lanes=0` and "the loop is doing nothing" cannot again be printed without the cause beside it.
+  SPAWNREF_N=0; SPAWNREF_WHY=""
+  if [ "${SPAWNREF_OK:-1}" = "1" ] && [ -s "${SPAWNREF:-/nonexistent}" ]; then
+    _srn="$(awk 'END{print NR+0}' "$SPAWNREF" 2>/dev/null)"
+    is_num "${_srn:-}" || _srn=0
+    SPAWNREF_N=$(( _srn - ${SPAWNREF_BASE:-0} )); [ "$SPAWNREF_N" -lt 0 ] && SPAWNREF_N=0
+    # The probe row is `#`, never a worker name; skipping it keeps the reason the launcher's own.
+    SPAWNREF_WHY="$(awk -F"$(printf '\t')" 'NF>=2 && $1 != "#"{print $2; exit}' "$SPAWNREF" 2>/dev/null | cut -c1-200)"
+  fi
+  _refsuf=""
+  # ⛔ TWO HONESTY RULES ON THIS SUFFIX (review, cycle 1):
+  #  • NO ABSOLUTE CLAIM. "NO LANE COULD START" was printed beside "N worker(s) in flight" on any
+  #    PARTIAL refusal — a false statement on the operator's decision line. The count and the
+  #    launcher's words are the measurement; the conclusion is the reader's.
+  #  • `≥` AT THE CAP. The record is bounded at 200 rows per cycle, so a storm is 200 rows and an
+  #    exact count would understate it while reading as exact.
+  if [ "${SPAWNREF_OK:-1}" != "1" ]; then
+    _refsuf=" ⛔ refusal measurement UNAVAILABLE (${SPAWNREF_WHY_BAD:-state/ is not writable}) — any refused spawn this cycle is UNMEASURED"
+  elif [ "${SPAWNREF_N:-0}" -ge 200 ]; then
+    _refsuf=" ⛔ ≥200 spawn(s) REFUSED by the launcher (${SPAWNREF_WHY:-reason not recorded}) — the record is capped at 200 rows this cycle"
+  elif [ "${SPAWNREF_N:-0}" -gt 0 ]; then
+    _refsuf=" ⛔ ${SPAWNREF_N} spawn(s) REFUSED by the launcher (${SPAWNREF_WHY:-reason not recorded})"
+  fi
   # TALLY. `act` = an action this cycle ACTUALLY took (a worker spawned, a merge issued, an auto-arm,
   # a draft readied, a rerun); `wait` = a row with a printed reason. Both are counts of LEDGER ROWS,
   # not of un-owned PRs: the swept set also carries owned PRs (the sweep never filters the OWN column),
@@ -4352,7 +4725,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
   # that does not close this block exists to end. And if `state/` is unwritable the ledger is empty by
   # CONSTRUCTION: the outcome is then UNKNOWN, never "nothing happened".
   if [ "${PRDISP_OK:-1}" != "1" ]; then
-    echo "[pr] PR path: record UNWRITABLE (state/ is not writable) — this cycle's PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned PR(s) are counted" >>"$LOG"
+    echo "[pr] PR path: record UNWRITABLE (state/ is not writable) — this cycle's PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned PR(s) are counted${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="unknown (the PR record is unwritable — see the [pr] line)"
   elif [ "$PRDISP_ROWS" -eq 0 ]; then
     # ⛔ A ZERO ROW COUNT HAS TWO CAUSES AND THE COUNT CANNOT TELL THEM APART (review cycle 2, P2): no
@@ -4360,10 +4733,10 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     # so a full `state/` passes the `PRDISP_OK` probe at the top and then every `disp` fails). Naming
     # only the first would send an operator to repair the GraphQL listing when the state filesystem is
     # the broken thing. Both are stated; neither is asserted.
-    echo "[pr] PR path: NO ROWS — no per-PR disposition was recorded this cycle (either the listing returned no rows, or the record could not be written), so not one PR can be named; PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned remain (see the [select] population line)" >>"$LOG"
+    echo "[pr] PR path: NO ROWS — no per-PR disposition was recorded this cycle (either the listing returned no rows, or the record could not be written), so not one PR can be named; PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned remain (see the [select] population line)${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="none enumerable (no per-PR rows this cycle)"
   elif [ "$PRDISP_ACTS" -gt 0 ]; then
-    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- fix-) worker(s) in flight" >>"$LOG"
+    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- fix-) worker(s) in flight${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="#${PRDISP_FIRST}"
     [ -n "${PRDISP_FIRST:-}" ] || PR_FIRST_TOK="none named"
   else
@@ -4371,7 +4744,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     # one: no unit ran, and the dominant reason is named rather than inferred. It does NOT claim what
     # the issue path will do — the gate is decided further down, and a forward claim here would be the
     # same defect sign-reversed (all counted PRs parked is a state where the gate legitimately opens).
-    echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason${PRDISP_TOP:+ (most common: ${PRDISP_TOP})}" >>"$LOG"
+    echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason${PRDISP_TOP:+ (most common: ${PRDISP_TOP})}${_refsuf:-}" >>"$LOG"
     PR_FIRST_TOK="none acted — see the [pr] line"
   fi
   # ⛔ THE FUNNEL TAKES THE SAME THREE FACTS, INCLUDING WHETHER THEY WERE MEASURED AT ALL: 0 acts with a
@@ -4660,12 +5033,12 @@ PY
       if [ "$_lage" -lt 0 ]; then
         echo "[dispatch] DRAIN STALL UNMEASURED — the newest land marker (state/merged-*.done) is stamped ${_lage#-}m in the FUTURE, so the drain's age cannot be read. This is neither a stall nor an all-clear; ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
       elif [ "$_lage" -ge "$_stallmin" ]; then
-        echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work." >> "$LOG"
+        echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
       else
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
       fi
     elif [ "${_land_any:-0}" = "1" ]; then
-      echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work." >> "$LOG"
+      echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
     fi
     # [drain-health:end]
   fi
@@ -5024,6 +5397,30 @@ PY
       # `held:` clause and the reason survived only in the cycle record and a separate log line — the
       # sibling no-batch branch below passes it, so the two halves of one outcome printed differently.
       dispatch_funnel "$K" "$(queue_state_token)" "$GATE_WHY" "" "${Y:-0}" >> "$LOG"
+      # ⛔ THE ISSUE PATH SPAWNS AFTER THE `[dispatch]` LINE IS ALREADY PRINTED (review, cycle 1). The
+      # refusal count above is read at the end of the PR phase, so without this second read a refused
+      # issue-path spawn would be truncated by the NEXT cycle and never appear on any line — the same
+      # blindness this change removes, relocated to the path that is open when the PR queue is empty.
+      # [issueref:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+      if [ "${SPAWNREF_OK:-1}" = "1" ] && [ -n "${SPAWNREF:-}" ] && [ -s "${SPAWNREF:-/nonexistent}" ]; then
+        _irn="$(awk 'END{print NR+0}' "$SPAWNREF" 2>/dev/null)"; is_num "${_irn:-}" || _irn=0
+        # ⛔ THE DELTA, NOT THE TOTAL (review, cycle 2): the `[pr]` line already reported the PR
+        # phase's refusals, so printing the cumulative count here over-reports this path by exactly
+        # that number and hands it the PR phase's reason. Rows before `base + N` belong to that line.
+        _iid=$(( _irn - ${SPAWNREF_BASE:-0} - ${SPAWNREF_N:-0} ))
+        if [ "$_iid" -le 0 ] && [ "$_irn" -ge 201 ]; then
+          # ⛔ THE CAP IS NOT SILENCE (review, cycle 3): the writer stops at 200 refusal rows, so a
+          # storm that the PR phase already saturated leaves this path with nothing to add — and a
+          # refused issue path would be invisible. Say the measurement stopped instead.
+          echo "[dispatch] ⛔ the refusal record is at its 200-row cap, so any ISSUE-path refusal this cycle is UNMEASURED (the [pr] line reports ≥200)" >> "$LOG"
+        elif [ "$_iid" -gt 0 ]; then
+          _irw="$(awk -F"$(printf '\t')" -v b="$(( ${SPAWNREF_BASE:-0} + ${SPAWNREF_N:-0} ))" \
+                   'NR>b && NF>=2 && $1 != "#"{print $2; exit}' "$SPAWNREF" 2>/dev/null | cut -c1-200)"
+          [ "$_iid" -ge 200 ] && _iid="≥200"
+          echo "[dispatch] ⛔ ${_iid} spawn(s) REFUSED by the launcher (${_irw:-reason not recorded}) on the ISSUE path too — the launcher did not start them; see the [worker-terminal] REFUSED lines" >> "$LOG"
+        fi
+      fi
+      # [issueref:end]
     # ⛔ "backlog empty" IS A CLAIM, NOT A NEUTRAL FACT (agent-infra#1931). On its own it reads as
     # "the fleet has nothing to do", and the SAME line was printed when 223 candidates had been READ
     # and every one of them was filtered away (#2040) — the contradiction that hid a total dispatch
@@ -5043,6 +5440,13 @@ PY
     elif [ "${PRDISP_ROWS:-0}" -eq 0 ]; then _prtail="no per-PR rows this cycle — nothing could be named"
     elif [ "${PRDISP_ACTS:-0}" -gt 0 ]; then _prtail="${PRDISP_ACTS} acted, ${PRDISP_WAITS} named wait(s)"
     else _prtail="NO UNIT SPAWNED, ${PRDISP_WAITS} named wait(s) — see the [pr] line"; fi
+    # ⛔ THE ACTUATOR'S ANSWER RIDES THE GATE LINE (measured 2026-10-22). `lanes=0` with no reason is
+    # the line that let a 100%-full launcher volume freeze the fleet for six hours: this tail is the
+    # ONE place the operator (and the beat) reads, so the refusal count and the launcher's own words
+    # go here, not only into per-PR rows and a log nobody parses.
+    # [prtail:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+    _prtail="${_prtail}${_refsuf:-}"
+    # [prtail:end]
     dispatch_gate_line "$GATE_WHY" "$LANES" "$WORKERS" "$_prtail" >> "$LOG"
   fi
   heartbeat
@@ -5076,7 +5480,7 @@ PY
       bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
       || echo "[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable or the module is absent) — an absent record is NOT a healthy box: harness status reads it ABSENT/DEGRADED" >> "$LOG"
   else
-    echo "[cycle] ⚠️ cycle-record.sh is NOT available (looked in \$O and the script directory) — this cycle leaves NO proof it ran; harness status will read the box ABSENT, never HEALTHY. Re-seed: cp scripts/orchestrator-harness/*.sh \"\$O/\"" >> "$LOG"
+    echo "[cycle] ⚠️ cycle-record.sh is NOT available (looked in \$O and the script directory) — this cycle leaves NO proof it ran; harness status will read the box ABSENT, never HEALTHY. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \"$O\"" >> "$LOG"
   fi
 
   # ---- 3) background backlog refresh (locked, small, non-blocking) --------
