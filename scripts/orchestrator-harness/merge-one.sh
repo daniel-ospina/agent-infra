@@ -1078,13 +1078,20 @@ case "$LAST" in
     # bare job name for such a repo, because a context containing a space is refused outright by
     # `repo-authority.sh::_unrepresentable`, so suffix matching is the only form that can name it.
     #
-    # ⛔ AND A WIDENED MATCH IS NEVER DECIDED BY ROW ORDER (review P1). Stripping the caller prefix
-    # means two DIFFERENT rows can now canonicalise to the gate, so "the first one that matches" can
-    # take a green `ci / unit-test` and discard a RED row explicitly named `unit-test` — a false PASS
-    # on the very surface this arm made matchable, decided by the API's row order. The rule is
-    # worst-case: per NAME the newest attempt (a re-run is one job, not two verdicts — both attempts
-    # stay in this payload), then across distinct names the WORST state, which is the rule the
-    # controller already applies in orch-loop.sh (`all(v=='nonred' and c=='success' …)`).
+    # ⛔ AND A WIDENED MATCH IS NEVER DECIDED BY ROW ORDER. Stripping the caller prefix means two
+    # rows can canonicalise to the gate, so "the first one that matches" can take a green
+    # `ci / unit-test` and discard a RED row explicitly named `unit-test` — a false PASS on the very
+    # surface this arm made matchable, decided by the API's row order. EVERY row whose name is the
+    # gate counts and the WORST state decides: that is the rule the controller applies in
+    # orch-loop.sh (`all(v=="nonred" and c=="success" ...)`), so the two classifiers cannot disagree.
+    # ⚠️ THE COST OF THAT, STATED PLAINLY: a SUPERSEDED row keeps the gate refused. When a re-run
+    # leaves the earlier FAILURE in the payload (the cell adapter emits every attempt, unsorted and
+    # un-deduped) the gate reads RED even though the newest attempt is green; the controller refuses
+    # the same PR for the same reason, so this is the fleet's existing behaviour rather than a new
+    # one, and the remedy is a new head or a re-run whose row replaces the old one — the verdict names
+    # the STATE, so the operator can see which row is red. Supersession-aware reading needs a signal
+    # no transport here provides (agent-infra#2625): two earlier attempts at it produced the false
+    # PASSes above, so it is a decision, not a detail.
     # ⚠️ KNOWN DIVERGENCE, disclosed rather than hidden: orch-loop.sh's own classifier still matches
     # the gate name EXACTLY, so a `<caller> / <job>` gate reads PENDING/FAILED there and this worker is
     # reached only through the chain/fix/manual paths. Mirroring the normalisation in the controller is
@@ -1162,11 +1169,7 @@ case "$LAST" in
       # kept, then classified. Feeding gh straight into python would make gh's documented
       # rc(1)=a check failed / rc(8)=checks pending indistinguishable from a broken read, and the
       # classifier would then be reading whatever survived the pipe.
-      # `startedAt` is requested for ONE reason: a re-run leaves BOTH attempts in this payload (the
-      # same job name carrying `failure` and then `success` — the reading rule in AGENTS.md), so the
-      # newest attempt per name has to be resolvable, or "the worst row" would refuse a gate a re-run
-      # has already turned green.
-      gate_raw="$(gh pr checks "$PR" --repo "$OR" --json name,state,startedAt,workflow 2>"$gate_errf")"; gate_rc=$?
+      gate_raw="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>"$gate_errf")"; gate_rc=$?
       gate="$(printf '%s' "$gate_raw" | GATE_NAME="$REVIEW_GATE" python3 -c '
 import sys, json, os
 want = (os.environ.get("GATE_NAME") or "ai-review-gate").strip()
@@ -1230,34 +1233,27 @@ if not cands:
 # so `[{"ci / unit-test": SUCCESS}, {"unit-test": FAILURE}]` must not merge on the first row it sees:
 # the explicitly-required `unit-test` row is RED there, and a first-match loop reports SUCCESS while
 # discarding it — a FALSE PASS on the one surface this change made matchable at all, decided by the
-# the payload row order. Two rules instead: (1) per NAME keep the NEWEST attempt (a re-run is one job, not
-# two verdicts); (2) across distinct names take the WORST — the same worst-case rule the controller
-# applies in orch-loop.sh (`all(v=="nonred" and c=="success" for …)`).
-newest = {}
-for c in cands:
-    # ⛔ A ROW IS A JOB, AND A JOB IS (name, workflow) (review round 4 P2-1). Keying on the rendered
-    # NAME alone makes two DIFFERENT jobs collapse into one, and then the newer row speaks
-    # for both: `ai-review-gate` from `ci` (SUCCESS) and from `compliance` (FAILURE) is a RED gate that
-    # this loop would merge on. gh reports both an app slug and a workflow here; either distinguishes
-    # them. Two attempts of the SAME job share the key and are resolved by recency below.
-    k = (str(c.get("name") or "").strip(), str(c.get("workflow") or "").strip())
-    prev = newest.get(k)
-    if prev is None:
-        newest[k] = c
-        continue
-    a, b = str(c.get("startedAt") or ""), str(prev.get("startedAt") or "")
-    if a and b and a != b:
-        if a > b:
-            newest[k] = c
-    elif rank(state_of(c)) > rank(state_of(prev)):
-        # ⛔ RECENCY MUST NOT DECIDE WHEN IT CANNOT BE READ (review round 4 P2-1). With one start time
-        # absent — a QUEUED run is emitted with `startedAt: null`, and Go renders it `0001-01-01…` on
-        # the real gh — a `>` comparison silently keeps the OTHER row, so a green older attempt wins
-        # over a re-run that is still queued (a body edit re-runs this gate, so that pair is normal).
-        # No usable ordering → fail CLOSED: keep the worse of the two.
-        newest[k] = c
+# payload row order. So: EVERY row naming the gate is a candidate and the WORST one decides — the rule
+# the controller applies in orch-loop.sh (`all(v=="nonred" and c=="success" ...)`), so the two cannot
+# disagree. (Anything that DEDUPES rows — first-match, newest attempt per name, newest per
+# (name, workflow) — was tried and defeated by the transport; see the block below.)
 hit = None
-for c in newest.values():
+for c in cands:
+    # ⛔ WORST MATCHED ROW, AND NOTHING ELSE (final rule, review rounds 2-5). Every dedupe this loop
+    # tried was defeated by the transport it runs on:
+    #   · "first match" merged on a green `ci / unit-test` while a RED row named exactly `unit-test`
+    #     was present — the verdict decided by the API row order (round 2);
+    #   · "newest attempt per name" needed an orderable `startedAt`, and a QUEUED run carries `null`
+    #     through the cell adapter and the Go zero time `0001-01-01...` through real gh, so an older
+    #     pass won and the loop merged mid-re-run (round 4);
+    #   · keying that on `(name, workflow)` cannot tell two JOBS apart: `workflow` is the app slug
+    #     (`github-actions`) for every check run the cell adapter emits, and is EMPTY on real gh for
+    #     non-Actions checks, so a green `compliance` row could still speak for a red `ci` one
+    #     (round 5). `link`/run-id does separate them — but then the two attempts of one re-run separate too.
+    # No row may be discarded, so none of that is needed: every row whose name is the gate counts and
+    # the WORST state decides. That is the rule the controller already applies in orch-loop.sh
+    # (`all(v=="nonred" and c=="success" ...)`), so the two classifiers cannot disagree, and it is
+    # transport-independent — there is no field left to project, dedupe, sort or trust.
     if hit is None or rank(state_of(c)) > rank(state_of(hit)):
         hit = c
 st = state_of(hit)

@@ -34,8 +34,14 @@
 #                          already applies to job names.
 #   §2b a SUBSTRING must NOT match (`REVIEW_GATE=compliance` vs a row `pipeline-compliance`): the
 #                          round-12 review recorded substring matching as a §5.1 bypass.
-#   §3  an EMPTY surface → `gate=NO-SUCH-CHECK want=… saw=<none>`, after the ABSENT bound (not the CI
-#                          window), with the wait reason logged ONCE.
+#   §2c/§2d/§2e/§2g/§2h  EVERY row naming the gate counts and the WORST state decides: a green
+#                          look-alike never shadows a RED row, and a SUPERSEDED red keeps the gate
+#                          refused (the disclosed cost) — no dedupe, timestamp or workflow field.
+#   §3  an EMPTY surface → `gate=NOT YET KNOWN … the check surface was EMPTY`, on the FULL poll window
+#                          (an empty surface is the CI not having started, not a wrong gate NAME),
+#                          with the wait reason logged ONCE.
+#   §3b a NON-EMPTY surface with no row naming the gate → `gate=NO-SUCH-CHECK want=… saw=…`, after the
+#                          ABSENT bound (not the CI window), with the name-mismatch remedy.
 #   §4  a QUEUED gate    → `gate=NOT YET KNOWN want=…` at the poll bound, with the observed state.
 #   §1c the same failed read with the retry bound at 1 → the TERMINAL line itself carries stderr=
 #                          (anchored, so a verdict that drops the stderr cannot pass on the progress line).
@@ -126,7 +132,7 @@ EOF
 # ONE dispatch, so the mode names used by the arms below cannot drift from the worlds they name.
 # EXPORTED into the driven worker (a function body in a child bash cannot see the test's variables,
 # so every name it touches travels through the environment: MRG, PRCHECKS_MODE, FAKE_REQ, FAKE_HEAD).
-checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,state,startedAt` prints and returns
+checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,state` prints and returns
   case "$1" in
     success)   printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n' ;;
     fail)      printf 'gh-core-floor remaining=120 floor=800 resets_in=4m\n' >&2; return 1 ;;
@@ -137,14 +143,20 @@ checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,stat
     # A first-match loop takes whichever comes first in the payload and can merge on a red gate.
     shadow)    printf '[{"name":"ci / unit-test","state":"SUCCESS","startedAt":"2026-10-24T00:00:00Z"},{"name":"unit-test","state":"FAILURE","startedAt":"2026-10-24T00:00:02Z"}]\n' ;;
     twocaller) printf '[{"name":"a / unit-test","state":"SUCCESS","startedAt":"2026-10-24T00:00:00Z"},{"name":"b / unit-test","state":"FAILURE","startedAt":"2026-10-24T00:00:02Z"}]\n' ;;
-    # …while a RE-RUN is one job, not two verdicts: both attempts stay in the payload, and the newest
-    # must win or a gate a re-run already turned green is refused forever.
+    # …while a RE-RUN leaves BOTH attempts in the payload. The shipped rule counts every row naming the
+    # gate, so this one is REFUSED (§2e): the documented cost of never discarding a row. `startedAt`
+    # stays in these fixtures because it is what the cell adapter really emits — the point is that the
+    # rule must not depend on it.
     rerun)     printf '[{"name":"ai-review-gate","state":"FAILURE","startedAt":"2026-10-24T01:00:00Z"},{"name":"ai-review-gate","state":"SUCCESS","startedAt":"2026-10-24T02:00:00Z"}]\n' ;;
     nostate)   printf '[{"name":"ai-review-gate"}]\n' ;;
-    # §2f/§2g: A ROW IS A JOB, AND RECENCY MUST NOT DECIDE WHAT IT CANNOT READ. A queued re-run carries
-    # startedAt null; the same rendered name can also be published by two DIFFERENT workflows.
+    # §2f/§2g/§2h: A ROW IS A JOB, AND NO FIELD HERE CAN TELL TWO JOBS APART. A queued re-run carries
+    # startedAt null (and `0001-01-01...` on real gh); the same rendered name can be published by two
+    # workflows, or by two jobs the cell adapter reports under ONE app slug.
     queuevspass) printf '[{"name":"ai-review-gate","state":"SUCCESS","startedAt":"2026-10-24T01:00:00Z","workflow":"review"},{"name":"ai-review-gate","state":"QUEUED","startedAt":null,"workflow":"review"}]\n' ;;
     twoworkflows) printf '[{"name":"ai-review-gate","state":"SUCCESS","startedAt":"2026-10-24T02:00:00Z","workflow":"ci"},{"name":"ai-review-gate","state":"FAILURE","startedAt":"2026-10-24T01:00:00Z","workflow":"compliance"}]\n' ;;
+    # …and the shape the CELL ADAPTER actually emits: one name, one app slug for every row, one green
+    # and one red. No field distinguishes the two jobs here, which is why the rule is worst-wins.
+    fleetshape) printf '[{"name":"ai-review-gate","state":"SUCCESS","startedAt":"2026-10-24T02:00:00Z","workflow":"github-actions"},{"name":"ai-review-gate","state":"FAILURE","startedAt":"2026-10-24T01:00:00Z","workflow":"github-actions"}]\n' ;;
     empty)     printf '[]\n' ;;
     queued)    printf '[{"name":"ai-review-gate","state":"QUEUED"}]\n' ;;
     red)       printf '[{"name":"ai-review-gate","state":"FAILURE"}]\n' ;;
@@ -190,7 +202,14 @@ run_merge() { # run_merge [env assignments…] — drives the SHIPPED worker; lo
       esac
     }
     git() { return 0; }
-    rm() { printf 'rm %s\n' "$*" >> "${RM_LOG:-/dev/null}"; command rm "$@"; }
+    # ⛔ THE STUB REFUSES /dev/null INSTEAD OF FORWARDING IT (review round 5 P2). It used to record the
+    # call and then run it, so on a root box a regression to the old `rm -f /dev/null` cleanup would
+    # UNLINK the device node and only then report the failure — the suite would red while /dev stayed
+    # corrupted for the rest of the run, i.e. the fixture would inflict the exact damage the arm
+    # exists to catch.
+    rm() { printf 'rm %s\n' "$*" >> "${RM_LOG:-/dev/null}"
+           case "$*" in *"/dev/null"*) return 0 ;; esac
+           command rm "$@"; }
     export -f pi gh git rm
     # The worker's OWN defaults are the production path, so §0 drives it with NO tunables at all
     # (`WORKER_DEFAULTS=1`); every other arm pins a zero-second poll so the suite never waits.
@@ -336,6 +355,16 @@ log="$(mrglog)"
 q 'gate=FAILURE (RED' <<<"$log" && ok "§2g two workflows, one name: the WORST verdict wins" \
                                || bad "§2g two workflows, one name: not the worst verdict; log=$(tr '\n' ' ' <<<"$log")"
 
+# ── §2h the FLEET shape (one app slug on every row): the guarantee must not depend on a field that
+#         the cell adapter projects as a constant (round 5 P1) ─────────────────────────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=fleetshape GATE_POLL_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§2h fleet shape: refused (exit 4) — a green row cannot speak for a red one, whatever the transport calls the workflow" \
+                || bad "§2h fleet shape: rc=$rc — the rule depends on a field the cell adapter makes constant; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+q 'gate=FAILURE (RED' <<<"$log" && ok "§2h fleet shape: the WORST verdict wins" \
+                               || bad "§2h fleet shape: not the worst verdict; log=$(tr '\n' ' ' <<<"$log")"
+
 # ── §2d two callers exposing the same job name: decided by POLICY, not by payload order ────────
 mkmrg
 out="$(run_merge PRCHECKS_MODE=twocaller REVIEW_GATE=unit-test FAKE_REQ=unit-test GATE_POLL_TRIES=2)"; rc=$?
@@ -345,15 +374,18 @@ log="$(mrglog)"
 q 'gate=FAILURE (RED' <<<"$log" && ok "§2d two callers: the WORST of the rows naming the gate wins" \
                              || bad "§2d two callers: not the worst row; log=$(tr '\n' ' ' <<<"$log")"
 
-# ── §2e …but a RE-RUN of one job is not two verdicts: the newest attempt wins, so a re-run green is
-#          not refused (this is why startedAt is requested at all) ───────────────────
+# ── §2e a SUPERSEDED run keeps the gate refused — the DOCUMENTED cost of "no row may be discarded":
+#         the verdict names the state, so the operator can see which row is red (round 5) ─────────
 mkmrg
 out="$(run_merge PRCHECKS_MODE=rerun GATE_POLL_TRIES=2)"; rc=$?
 log="$(mrglog)"
-[ "$rc" -eq 0 ] && ok "§2e re-run gate: the NEWEST attempt (SUCCESS) is read → merged (exit 0)" \
-                || bad "§2e re-run gate: rc=$rc — a stale FAILURE row refused a gate the re-run turned green; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
-q 'gate=SUCCESS (try 1)' <<<"$log" && ok "§2e re-run gate: 'gate=SUCCESS (try 1)'" \
-                                      || bad "§2e re-run gate: no SUCCESS verdict; log=$(tr '\n' ' ' <<<"$log")"
+[ "$rc" -eq 4 ] && ok "§2e superseded run: refused (exit 4) — every row naming the gate counts, and one is RED" \
+                || bad "§2e superseded run: rc=$rc — a row naming the gate was discarded; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+nq 'MERGED' <<<"$log" && ok "§2e superseded run: nothing merged" || bad "§2e superseded run: the PR was merged"
+q 'gate=FAILURE (RED' <<<"$log" && ok "§2e superseded run: the verdict names the red STATE, so the operator can see which row to re-run" \
+                               || bad "§2e superseded run: the verdict does not name the state; log=$(tr '\n' ' ' <<<"$log")"
+q 'a re-run can flip this row' <<<"$log" && ok "§2e superseded run: the poll window still explains that a re-run can flip it" \
+                                        || bad "§2e superseded run: the transition line lost its explanation"
 
 # ── §3 an EMPTY surface is the CI NOT HAVING STARTED: a WAIT on the FULL CI window, refused only
 #       when that window expires — never the short "your gate name is wrong" bound (review P2-1) ──
@@ -636,32 +668,14 @@ if q 'if hit is None:$' "$(cat "$MUT3")"; then
 else
   bad "§9 mutation: the worst-case mutation did not apply (sed found no target) — inconclusive"
 fi
-MUT4="$TMP/block-norerun.sh"
-sed 's|    if a > b:|    if False:|' "$SLICE" > "$MUT4"
-if q '    if False:$' "$(cat "$MUT4")"; then
-  b_out="$(run_block "$MUT4" rerun)"
-  q 'gate=SUCCESS' <<<"$b_out" && bad "§10 mutation: without the newest-attempt rule the re-run gate STILL merges — §2e is vacuous" \
-                              || ok "§10 mutation: without the newest-attempt rule a stale FAILURE refuses the re-run green, so §2e goes RED"
+MUT4="$TMP/block-bestrow.sh"
+sed 's|if hit is None or rank(state_of(c)) > rank(state_of(hit)):|if hit is None or rank(state_of(c)) < rank(state_of(hit)):|' "$SLICE" > "$MUT4"
+if q 'rank(state_of(c)) < rank(state_of(hit))' "$(cat "$MUT4")"; then
+  b_out="$(run_block "$MUT4" shadow unit-test)"
+  q 'gate=SUCCESS' <<<"$b_out" && ok "§10 mutation: keeping the BEST row instead of the WORST lets the green look-alike win (dangerous verdict SUCCESS), so §2c goes RED" \
+                              || bad "§10 mutation: the best-row mutant still refused — §2c is vacuous"
 else
-  bad "§10 mutation: the newest-attempt mutation did not apply — inconclusive"
-fi
-MUT5="$TMP/block-tieorder.sh"
-sed 's|    if a and b and a != b:|    if a != b:|' "$SLICE" > "$MUT5"
-if q '    if a != b:$' "$(cat "$MUT5")"; then
-  b_out="$(run_block "$MUT5" queuevspass)"
-  q 'gate=SUCCESS' <<<"$b_out" && ok "§11 mutation: with recency deciding an UNREADABLE order the older pass wins over the queued re-run (dangerous verdict SUCCESS), so §2f's refusal assertion goes RED" \
-                              || bad "§11 mutation: the mutant still waited on the queued re-run — §2f is vacuous"
-else
-  bad "§11 mutation: the unreadable-order mutation did not apply (sed found no target) — inconclusive"
-fi
-MUT6="$TMP/block-namekey.sh"
-sed 's|    k = (str(c.get("name") or "").strip(), str(c.get("workflow") or "").strip())|    k = str(c.get("name") or "").strip()|' "$SLICE" > "$MUT6"
-if q '    k = str(c.get("name") or "").strip()$' "$(cat "$MUT6")"; then
-  b_out="$(run_block "$MUT6" twoworkflows)"
-  q 'gate=SUCCESS' <<<"$b_out" && ok "§12 mutation: keyed on the rendered NAME alone the newer green job speaks for the red one (dangerous verdict SUCCESS), so §2g's refusal assertion goes RED" \
-                              || bad "§12 mutation: the name-only key still refused — §2g is vacuous"
-else
-  bad "§12 mutation: the (name, workflow) mutation did not apply — inconclusive"
+  bad "§10 mutation: the best-row mutation did not apply (sed found no target) — inconclusive"
 fi
 
 printf '\n%s\n' "──────────────────────────────────────────────"
