@@ -150,9 +150,9 @@ run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" 
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
-# A gate refusal reports AGENT_LOAD_REFUSED (75) or AGENT_DISK_REFUSED (77); AGENT_STARTED is
-# authoritative rather than the exit code, because `pi` shares the 0–255 status namespace and could
-# exit 75 itself (#1720).
+# A gate refusal reports AGENT_LOAD_REFUSED (75), AGENT_MEM_REFUSED (73) or AGENT_DISK_REFUSED (77);
+# AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
+# namespace and could exit any of those itself (#1720).
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
   # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns

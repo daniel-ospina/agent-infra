@@ -1054,6 +1054,15 @@ mf4="$(printf '%s' "$mrow" | cut -f4)"; mf5="$(printf '%s' "$mrow" | cut -f5)"; 
 { [ "$mnf" = "5" ] && [ "$mf4" = "653" ] && [ "$mf5" = "2048" ]; }; rc=$?
 ck "a refusal records the MEASURED reading + floor in mem-avail.tsv (nf=$mnf, avail='${mf4:-<none>}', floor='${mf5:-<none>}')" $rc
 
+# ⛔ THE LINE MUST NOT PRINT A FALSE EQUATION (review P3). `MEM_MIN_AVAIL_MB` is a first-class knob, so
+# an operator who sets it directly would otherwise read `4096M (= mem_lane_reserve_mb=1024M x
+# mem_spawn_reserve_lanes=2)` — i.e. `4096 = 2048` — in the one line whose whole purpose is to let the
+# reader recompute the floor. Drive a deliberately operator-set floor and require it to SAY so.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem 653 4096)"
+{ [ "$res" = "rc=73 started=0" ] && grep -q 'mem_min_avail_mb=4096M (SET BY THE OPERATOR' "$LOG" && ! grep -q '4096M (=' "$LOG"; }; rc=$?
+ck "an OPERATOR-SET floor says so and does NOT print '4096M (= 1024M x 2)' — a false equation teaches the reader to distrust the line ($res)" $rc
+
 # ── UNREADABLE: FAIL CLOSED, and say the word ─────────────────────────────────────────────────────
 # The divergence from the disk gate is deliberate and has to be provable: an unreadable probe is NOT
 # "ample". A default here would be a reading that reads as data, which is the class this file's

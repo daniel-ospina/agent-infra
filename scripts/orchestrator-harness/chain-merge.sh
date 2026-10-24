@@ -105,13 +105,17 @@ cap_refusal_gate() { # -> prints `load|mem|disk|land` and returns 0 iff THIS dis
   # of turning the slack negative — it buys no slack, exactly as documented above.
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
-  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (75 load / 77 disk /
-  # 74 land-backlog), not a gate: an unrecognised value is reported as `load` because the refusal
-  # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
-  # fleet-wide idleness R8 removes. Field 2 is deliberately NOT consulted here — the yield window is
-  # the controller's business (`capacity_yield_live`), and an incoherent window must not make a proven
-  # refusal unreadable. README §7.2d states exactly this per-reader split.
-  case "${gate:-}" in disk) printf 'disk' ;; land) printf 'land' ;; *) printf 'load' ;; esac
+  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (75 load / 73 memory /
+  # 77 disk / 74 land-backlog), not a gate: an unrecognised value is reported as `load` because the
+  # refusal itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte
+  # is the fleet-wide idleness R8 removes. ⛔ `mem` MUST BE MAPPED, NOT LEFT TO THE DEFAULT (review P2):
+  # `lane.sh` writes it (agent-infra#2387), and falling through to `load` would name the load gate in
+  # the chain's log and exit 75 — sending the operator to watch a 1-min average that will never move
+  # while the OOM killer takes lanes, i.e. the exact wrong-cause class this field exists to remove.
+  # Field 2 is deliberately NOT consulted here — the yield window is the controller's business
+  # (`capacity_yield_live`), and an incoherent window must not make a proven refusal unreadable.
+  # README §7.2d states exactly this per-reader split.
+  case "${gate:-}" in disk) printf 'disk' ;; land) printf 'land' ;; mem) printf 'mem' ;; *) printf 'load' ;; esac
   return 0
 }
 
@@ -205,6 +209,10 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # anything. The exit code must differ for the same reason 75 and 77 differ from each other —
       # the remedy is different — and it must be a STOP here for the same reason: no PR can appear.
       land) _cap_rc=74 ;;
+      # 73 is spawn-gate.sh's AGENT_MEM_REFUSED (#2387): available memory is below the spawn gate's
+      # floor. A capacity refusal like load — a peer with free RAM can take the issue — but a
+      # DIFFERENT reading, so it exits with its own code rather than reporting 75.
+      mem)  _cap_rc="${AGENT_MEM_REFUSED:-73}" ;;
       *)    _cap_rc=75 ;;
     esac
     if [ "$_cap_gate" = "land" ]; then

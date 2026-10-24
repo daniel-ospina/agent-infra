@@ -364,7 +364,7 @@ mem_avail_mb() { # [<meminfo-file>]
 # be a silent hole, so the comparison is made explicitly in BOTH directions and anything else —
 # blank, non-numeric, or too long to compare — is UNREADABLE.
 mem_gate_verdict() { # <avail-mb>
-  local mb="${1:-}"
+  local mb="${1:-}" derive
   if [ -z "$mb" ]; then
     printf 'UNREADABLE MemAvailable — the probe answered nothing (no readable /proc/meminfo, and vm_stat did not answer), so there is no reading to compare against mem_min_avail_mb=%sM' "$MEM_MIN_AVAIL_MB"
     return 2
@@ -381,8 +381,21 @@ mem_gate_verdict() { # <avail-mb>
     return 2
   fi
   if [ "$mb" -lt "$MEM_MIN_AVAIL_MB" ]; then
-    printf 'LOW MemAvailable=%sM < mem_min_avail_mb=%sM (= mem_lane_reserve_mb=%sM x mem_spawn_reserve_lanes=%s: one pi lane plus one pytest shard, measured)' \
-      "$mb" "$MEM_MIN_AVAIL_MB" "$MEM_LANE_RESERVE_MB" "$MEM_SPAWN_RESERVE_LANES"
+    # ⛔ THE ARITHMETIC IS PRINTED ONLY WHEN IT IS THE ONE THAT PRODUCED THE FLOOR (review P3).
+    # `MEM_MIN_AVAIL_MB` is a first-class knob and the default is DERIVED from the two factors, so a
+    # blanket `(= reserve x lanes)` printed `4096M (= 1024M x 2)` for an operator who set 4096 — a
+    # false equation in the one line whose purpose is to let the reader recompute the floor against
+    # the box, and it would steer them to "fix" a reserve that is not what bound. When the floor IS
+    # the derivation the equation is printed; otherwise the derivation is printed as what it is, and
+    # the line says the factors did not bind.
+    derive=$(( 10#${MEM_LANE_RESERVE_MB:-1024} * 10#${MEM_SPAWN_RESERVE_LANES:-2} ))
+    if [ "$MEM_MIN_AVAIL_MB" = "$derive" ]; then
+      printf 'LOW MemAvailable=%sM < mem_min_avail_mb=%sM (= mem_lane_reserve_mb=%sM x mem_spawn_reserve_lanes=%s: one pi lane plus one pytest shard, measured)' \
+        "$mb" "$MEM_MIN_AVAIL_MB" "$MEM_LANE_RESERVE_MB" "$MEM_SPAWN_RESERVE_LANES"
+    else
+      printf 'LOW MemAvailable=%sM < mem_min_avail_mb=%sM (SET BY THE OPERATOR, not the shipped derivation — which is mem_lane_reserve_mb=%sM x mem_spawn_reserve_lanes=%s = %sM, so those factors are NOT what bound this refusal)' \
+        "$mb" "$MEM_MIN_AVAIL_MB" "$MEM_LANE_RESERVE_MB" "$MEM_SPAWN_RESERVE_LANES" "$derive"
+    fi
     return 1
   fi
   [ "$mb" -ge "$MEM_MIN_AVAIL_MB" ] || {
