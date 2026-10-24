@@ -154,6 +154,15 @@ checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,stat
     open)      printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n' ;;
     # A NON-EMPTY surface that simply does not carry the gate: a name mismatch (§3b).
     othername) printf '[{"name":"ci / lint","state":"SUCCESS"}]\n' ;;
+    # §3c: EMPTY on the first poll, then a surface that carries OTHER names only — the verdict must
+    # describe what was true AT THE BOUND (a name mismatch), never "the surface was EMPTY".
+    emptythenother) if [ "$(wc -l < "$MRG/checks.log")" -le 1 ]; then
+                      printf '[]\n'
+                    else
+                      printf '[{"name":"ci / lint","state":"SUCCESS"}]\n'
+                    fi ;;
+    # §1g: rows whose names are unusable — a MALFORMED surface, not a wrong gate name.
+    badrows)   printf '[null]\n' ;;
     *)         printf '[]\n' ;;
   esac
   return 0
@@ -364,6 +373,19 @@ n="$(polls)"
 [ "$n" -eq 2 ] && ok "§3b wrong name: bounded by GATE_ABSENT_TRIES (2 polls), NOT the 30-poll CI window" \
                || bad "§3b wrong name: $n polls (want 2) — a name mismatch still spins the whole window"
 
+# ── §3c EMPTY then OTHER names: the terminal verdict must describe the surface AT THE BOUND, never
+#         claim it was empty (round 3 P2-1) ─────────────────────────────────────────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=emptythenother GATE_ABSENT_TRIES=99 GATE_POLL_TRIES=3)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§3c empty-then-other: refused (exit 4)" || bad "§3c empty-then-other: rc=$rc"
+nq 'the check surface was EMPTY' <<<"$log" \
+  && ok "§3c empty-then-other: the verdict does NOT claim the surface was empty (it carried ci / lint at the bound)" \
+  || bad "§3c empty-then-other: the terminal line asserts an empty surface that stopped being empty; log=$(tr '\n' ' ' <<<"$log")"
+qF 'gate=NO-SUCH-CHECK want=ai-review-gate saw=ci / lint' <<<"$log" \
+  && ok "§3c empty-then-other: it says NO-SUCH-CHECK and names what the surface CARRIED — the name-mismatch diagnosis survives" \
+  || bad "§3c empty-then-other: the name-mismatch diagnosis was suppressed; log=$(tr '\n' ' ' <<<"$log")"
+
 # ── §4 a QUEUED gate: a WAIT, and at the bound NOT YET KNOWN with what it needed ────────────────
 mkmrg
 out="$(run_merge PRCHECKS_MODE=queued GATE_POLL_TRIES=3)"; rc=$?
@@ -414,6 +436,18 @@ qF 'the row named <ai-review-gate> was found but carries no state field' <<<"$lo
   || bad "§1f stateless row: the verdict misdescribes what was observed; log=$(tr '\n' ' ' <<<"$log")"
 nq 'never produced a check surface' <<<"$log" && ok "§1f stateless row: does not claim the read produced nothing" \
                                             || bad "§1f stateless row: reported as a transport failure contradicted by its own 'found' wording"
+
+# ── §1g a payload whose rows carry NO usable name is MALFORMED, not a wrong gate name (round 3 P2-3) ──
+mkmrg
+out="$(run_merge PRCHECKS_MODE=badrows GATE_READ_TRIES=2 GATE_ABSENT_TRIES=1)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§1g unnamed rows: refused (exit 4)" || bad "§1g unnamed rows: rc=$rc"
+qF 'gate=UNAVAILABLE rc=0' <<<"$log" && ok "§1g unnamed rows: reported as UNAVAILABLE (a surface with no usable row was never observed)" \
+                                     || bad "§1g unnamed rows: not reported as unreadable; log=$(tr '\n' ' ' <<<"$log")"
+q 'carries a usable name' <<<"$log" && ok "§1g unnamed rows: says the surface is MALFORMED" \
+                                     || bad "§1g unnamed rows: the verdict does not name the malformation"
+nq 'NO-SUCH-CHECK' <<<"$log" && ok "§1g unnamed rows: NOT reported as a wrong gate name (there was no row to name)" \
+                             || bad "§1g unnamed rows: sent the operator to fix the gate NAME for a malformed surface"
 
 # ── §4c a CANCELLED gate is NOT GREEN, not RED (the repo's own polarity) ──────────────────────
 mkmrg

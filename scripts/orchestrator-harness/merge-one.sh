@@ -1203,6 +1203,13 @@ if not rows:
     print("EMPTY saw=<none: the check surface is empty>")
     raise SystemExit(0)
 names = [str(c.get("name") or "").strip() for c in rows if isinstance(c, dict)]
+# ⛔ A SURFACE WHOSE ROWS CARRY NO USABLE NAME IS MALFORMED, NOT A WRONG GATE NAME (review round 3
+# P2-3). `[null]`, `["x","y"]` and `[{"name": null, …}]` all parse as a LIST, so they must not be
+# reported as "the surface carried checks, but none is named this gate" — there was no row to name.
+# Same class as the scalar payload above, one shape over: it is a TRANSPORT/shape failure.
+if not any(names):
+    print("UNREADABLE no row in the payload carries a usable name, so the check surface is malformed")
+    raise SystemExit(0)
 PEND    = ("IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "REQUESTED", "EXPECTED")
 NON_RED = ("CANCELLED", "STALE", "NEUTRAL", "SKIPPED")
 def state_of(c):
@@ -1298,7 +1305,7 @@ else:
           fi
           gate_unread=0; gate_absent=0 ;;
         ABSENT\ want=*)
-          gate_unread=0
+          gate_unread=0; gate_seen_empty=0
           gate_absent=$(( gate_absent + 1 ))
           if [ "$gate_absent" -ge "$GATE_ABSENT_TRIES" ]; then
             gate_verdict=ABSENT; gate_line="gate=NO-SUCH-CHECK ${gate#ABSENT } (absent on all $gate_absent poll(s), bound ${GATE_ABSENT_TRIES}) — the surface carried checks, but none is named this gate, so waiting cannot help; want= must match a row in saw= (a reusable-workflow job is reported as '<caller> / <job>', and want= must be the job name)"; break
@@ -1326,7 +1333,7 @@ else:
           gate_seen_empty=0
           case "$gate" in
             PENDING*) gate_kind=PENDING; gate_absent=0; gate_unread=0 ;;
-            *) gate_kind=UNREADABLE; gate_unread=$(( gate_unread + 1 ))
+            *) gate_kind=UNREADABLE; gate_unread=$(( gate_unread + 1 )); gate_absent=0
                if [ "$gate_unread" -ge "$GATE_READ_TRIES" ]; then
                  case "$gate" in
                    ROWUNREADABLE*) gate_verdict=UNAVAILABLE; gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#ROWUNREADABLE }' stderr=$gate_errline (bound $GATE_READ_TRIES) — the row was FOUND and carries no state, so this is a malformed check surface, not a state of the repo" ;;
@@ -1364,7 +1371,9 @@ else:
     # terminal state): NOT YET KNOWN, with what was needed and how long it was waited for.
     if [ -z "$gate_line" ]; then
       gate_verdict=UNKNOWN
-      if [ "${gate_seen_empty:-0}" = 1 ]; then
+      if [ "${gate_lastkind:-}" = ABSENT ]; then
+        gate_verdict=ABSENT; gate_line="gate=NO-SUCH-CHECK ${gate#ABSENT } (the poll window expired while the surface carried checks and none was named this gate) — want= must match a row in saw= (a reusable-workflow job is reported as '<caller> / <job>', and want= must be the job name)"
+      elif [ "${gate_seen_empty:-0}" = 1 ]; then
         gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='the check surface was EMPTY' after $gate_try poll(s) / ${gate_wait}s — CI never created a single check row for this head, so the gate was never observable; it needs a completed '$REVIEW_GATE' check in that window"
       else
         gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) / ${gate_wait}s — the gate was still in flight when the wait expired; it needs a completed '$REVIEW_GATE' check, which CI had not produced in that window"
