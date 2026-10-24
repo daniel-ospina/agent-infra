@@ -1078,11 +1078,26 @@ case "$LAST" in
     # bare job name for such a repo, because a context containing a space is refused outright by
     # `repo-authority.sh::_unrepresentable`, so suffix matching is the only form that can name it.
     #
-    # ⛔ A NOT-YET-CREATED CHECK IS A BOUNDED WAIT, NOT A SPIN TO ABORT. It gets its own, SMALLER
-    # bound (`GATE_ABSENT_TRIES`): a name mismatch never resolves, so letting it consume the whole CI
-    # window is the 15 minutes this issue measured. Its reason is logged ONCE, on the first poll and
-    # on every change of verdict — never 30 identical lines. At the bound the verdict says
-    # NO-SUCH-CHECK and prints what it WANTED and what the surface actually CARRIED.
+    # ⛔ AND A WIDENED MATCH IS NEVER DECIDED BY ROW ORDER (review P1). Stripping the caller prefix
+    # means two DIFFERENT rows can now canonicalise to the gate, so "the first one that matches" can
+    # take a green `ci / unit-test` and discard a RED row explicitly named `unit-test` — a false PASS
+    # on the very surface this arm made matchable, decided by the API's row order. The rule is
+    # worst-case: per NAME the newest attempt (a re-run is one job, not two verdicts — both attempts
+    # stay in this payload), then across distinct names the WORST state, which is the rule the
+    # controller already applies in orch-loop.sh (`all(v=='nonred' and c=='success' …)`).
+    # ⚠️ KNOWN DIVERGENCE, disclosed rather than hidden: orch-loop.sh's own classifier still matches
+    # the gate name EXACTLY, so a `<caller> / <job>` gate reads PENDING/FAILED there and this worker is
+    # reached only through the chain/fix/manual paths. Mirroring the normalisation in the controller is
+    # a separate change to a separate classifier (filed as agent-infra#2617), not part of this fix.
+    #
+    # ⛔ A NOT-YET-CREATED CHECK IS A BOUNDED WAIT, NOT A SPIN TO ABORT, AND IT IS TWO CASES. A surface
+    # that CARRIES checks but none named the gate is a name mismatch: it never resolves, so it gets its
+    # own SMALLER bound (`GATE_ABSENT_TRIES`), and at that bound the verdict says NO-SUCH-CHECK and prints
+    # what it WANTED and what the surface actually CARRIED. A surface that is EMPTY (no check row at all
+    # for this head) is the CI not having started: that one is charged against the FULL CI window — it
+    # resolves on its own, and refusing it early would refuse a gate that appears a minute later, which
+    # the pre-#2596 loop did not do. Either reason is logged ONCE, on the first poll and on every change
+    # of verdict — never 30 identical lines.
     #
     # ⛔ rc IS NOT A VERDICT (lander.sh's documented lesson): real `gh pr checks` exits 1 when a check
     # FAILED and 8 when checks are pending, while the REST shim exits 0. The PAYLOAD decides; rc is
@@ -1125,7 +1140,7 @@ case "$LAST" in
     [ "${GATE_ABSENT_TRIES:-0}" -ge 1 ] || GATE_ABSENT_TRIES=1
     [ "${GATE_READ_TRIES:-0}" -ge 1 ] || GATE_READ_TRIES=1
 
-    gate_verdict=""; gate_line=""; gate_try=0; gate_absent=0; gate_unread=0; gate_last=""; gate_lastkind=""
+    gate_verdict=""; gate_line=""; gate_try=0; gate_absent=0; gate_unread=0; gate_last=""; gate_lastkind=""; gate_seen_empty=0
     gate_wait=$(( GATE_POLL_TRIES * GATE_POLL_SECS ))
     # ⛔ THE FALLBACK IS NOT `/dev/null` (review P2-2). It was, and the cleanup below then ran
     # `rm -f /dev/null` on the boxes where `mktemp` can fail AND the worker is root (a cloud cell with a
@@ -1147,7 +1162,11 @@ case "$LAST" in
       # kept, then classified. Feeding gh straight into python would make gh's documented
       # rc(1)=a check failed / rc(8)=checks pending indistinguishable from a broken read, and the
       # classifier would then be reading whatever survived the pipe.
-      gate_raw="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>"$gate_errf")"; gate_rc=$?
+      # `startedAt` is requested for ONE reason: a re-run leaves BOTH attempts in this payload (the
+      # same job name carrying `failure` and then `success` — the reading rule in AGENTS.md), so the
+      # newest attempt per name has to be resolvable, or "the worst row" would refuse a gate a re-run
+      # has already turned green.
+      gate_raw="$(gh pr checks "$PR" --repo "$OR" --json name,state,startedAt 2>"$gate_errf")"; gate_rc=$?
       gate="$(printf '%s' "$gate_raw" | GATE_NAME="$REVIEW_GATE" python3 -c '
 import sys, json, os
 want = (os.environ.get("GATE_NAME") or "ai-review-gate").strip()
@@ -1176,17 +1195,55 @@ if rows is None:
 if not isinstance(rows, list):
     print("UNREADABLE the payload carries no check list")
     raise SystemExit(0)
+# ⛔ AN EMPTY SURFACE IS NOT A WRONG GATE NAME (review P2-1). `[]` means CI has not created a single
+# check row for this head YET — the block header calls that a WAIT — so it must be charged against
+# the CI window, not against the short "the gate name must be wrong" bound, and it must not inherit
+# the remedy "waiting cannot help". The two facts get two tokens.
+if not rows:
+    print("EMPTY saw=<none: the check surface is empty>")
+    raise SystemExit(0)
 names = [str(c.get("name") or "").strip() for c in rows if isinstance(c, dict)]
-hit = None
-for c in rows:
-    if isinstance(c, dict) and canon(c.get("name")) == want:
-        hit = c
-        break
-if hit is None:
-    saw = "|".join([n for n in names if n][:12]) or "<none: the check surface is empty>"
+PEND    = ("IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "REQUESTED", "EXPECTED")
+NON_RED = ("CANCELLED", "STALE", "NEUTRAL", "SKIPPED")
+def state_of(c):
+    return str(c.get("state") or "").strip().upper()
+def rank(s):
+    # Allow-list polarity: 0 is the only green, and EVERY other conclusion is red — an unrecognised
+    # or empty state must never fall through a gap (the merge-rail rule, applied here).
+    if s == "SUCCESS": return 0
+    if s in PEND:      return 2
+    if s in NON_RED:   return 3
+    return 4
+cands = [c for c in rows if isinstance(c, dict) and canon(c.get("name")) == want]
+if not cands:
+    saw = "|".join([n for n in names if n][:12]) or "<none>"
     print("ABSENT want=%s saw=%s" % (want, saw))
     raise SystemExit(0)
-st = str(hit.get("state") or "").strip().upper()
+# ⛔ NEVER FIRST-MATCH (review P1). Matching after stripping `<caller> / ` widens what can BE the gate,
+# so `[{"ci / unit-test": SUCCESS}, {"unit-test": FAILURE}]` must not merge on the first row it sees:
+# the explicitly-required `unit-test` row is RED there, and a first-match loop reports SUCCESS while
+# discarding it — a FALSE PASS on the one surface this change made matchable at all, decided by the
+# the payload row order. Two rules instead: (1) per NAME keep the NEWEST attempt (a re-run is one job, not
+# two verdicts); (2) across distinct names take the WORST — the same worst-case rule the controller
+# applies in orch-loop.sh (`all(v=="nonred" and c=="success" for …)`).
+newest = {}
+for c in cands:
+    n = str(c.get("name") or "").strip()
+    prev = newest.get(n)
+    if prev is None:
+        newest[n] = c
+        continue
+    a, b = str(c.get("startedAt") or ""), str(prev.get("startedAt") or "")
+    if a > b:
+        newest[n] = c
+    elif a == b and rank(state_of(c)) > rank(state_of(prev)):
+        # No usable ordering (both absent, or equal to the second): fail CLOSED, keep the worst.
+        newest[n] = c
+hit = None
+for c in newest.values():
+    if hit is None or rank(state_of(c)) > rank(state_of(hit)):
+        hit = c
+st = state_of(hit)
 # ⛔ NAMED POLARITY, NOT A DENY-LIST (review P2-3). A non-green state is not automatically a
 # FAILURE: `scripts/objective.py` records `NON_RED = {"cancelled", "stale"}` ("not green, but not
 # evidence of failure") and neutral/skipped are non-red by the same allow-list rule. Labelling a
@@ -1194,12 +1251,14 @@ st = str(hit.get("state") or "").strip().upper()
 # still refuse — the distinction here is the WORDING of the verdict, never the abort.
 if st == "SUCCESS":
     print("SUCCESS")
-elif st in ("IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "REQUESTED", "EXPECTED"):
+elif st in PEND:
     print("PENDING state=%s" % st)
-elif st in ("CANCELLED", "STALE", "NEUTRAL", "SKIPPED"):
+elif st in NON_RED:
     print("NOTGREEN state=%s" % st)
 elif not st:
-    print("UNREADABLE the matching row carries no state field")
+    # Its own token: the row WAS found (so this is not a transport failure, and the UNAVAILABLE
+    # wording "the read never produced a check surface" would be false here).
+    print("ROWUNREADABLE the row named %s was found but carries no state field, so its polarity is unknown" % ("<" + str(hit.get("name") or "").strip() + ">"))
 else:
     print("RED state=%s" % st)
 ' 2>>"$gate_errf")"; gate_pyrc=$?
@@ -1242,28 +1301,47 @@ else:
           gate_unread=0
           gate_absent=$(( gate_absent + 1 ))
           if [ "$gate_absent" -ge "$GATE_ABSENT_TRIES" ]; then
-            gate_verdict=ABSENT; gate_line="gate=NO-SUCH-CHECK ${gate#ABSENT } (absent on all $gate_absent poll(s), bound ${GATE_ABSENT_TRIES}) — no check named this gate exists, so waiting cannot help; want= must match a row in saw= (a reusable-workflow job is reported as '<caller> / <job>', and want= must be the job name)"; break
+            gate_verdict=ABSENT; gate_line="gate=NO-SUCH-CHECK ${gate#ABSENT } (absent on all $gate_absent poll(s), bound ${GATE_ABSENT_TRIES}) — the surface carried checks, but none is named this gate, so waiting cannot help; want= must match a row in saw= (a reusable-workflow job is reported as '<caller> / <job>', and want= must be the job name)"; break
           fi
           if [ "$gate_last" != "$gate" ]; then
             echo "[merge $PR] gate=NOT YET CREATED ${gate#ABSENT } (waiting, $gate_absent/$GATE_ABSENT_TRIES) — a not-yet-created check is a WAIT, not a failure" >> "$L.log"
             gate_last="$gate"; gate_lastkind=ABSENT
           fi ;;
-        PENDING\ state=*|UNREADABLE*)
+        EMPTY*)
+          # ⛔ THE CI HAS NOT STARTED FOR THIS HEAD — a WAIT, so it is the POLL bound that governs it,
+          # not the short "your gate name is wrong" bound (review P2-1). The pre-#2596 code waited the
+          # whole window here; charging an empty surface against GATE_ABSENT_TRIES would refuse at
+          # ~150 s a gate that appears at ~240 s — a refusal this change invented.
+          gate_unread=0; gate_absent=0; gate_seen_empty=1
+          if [ "$gate_last" != "$gate" ]; then
+            echo "[merge $PR] gate=NOT YET CREATED want=$REVIEW_GATE (the check surface is EMPTY at try $gate_try) — CI has created no check row for this head yet; a not-yet-created check is a WAIT, not a failure, so the full $GATE_POLL_TRIES poll(s) / ${gate_wait}s window applies" >> "$L.log"
+            gate_last="$gate"; gate_lastkind=EMPTY
+          fi ;;
+        PENDING\ state=*|UNREADABLE*|ROWUNREADABLE*)
           # An unparseable/absent payload counts against its OWN bound; a check that is merely
           # still running counts against the poll bound (it IS the CI wait this loop exists for).
           # Both counters are CONSECUTIVE: a parsed verdict proves the transport works, so a blip
           # before it must not be charged against a later one (#2593's lesson).
+          # NOTE: any non-EMPTY verdict proves CI has produced a surface, so `gate_seen_empty` clears.
+          gate_seen_empty=0
           case "$gate" in
             PENDING*) gate_kind=PENDING; gate_absent=0; gate_unread=0 ;;
             *) gate_kind=UNREADABLE; gate_unread=$(( gate_unread + 1 ))
                if [ "$gate_unread" -ge "$GATE_READ_TRIES" ]; then
-                 gate_verdict=UNAVAILABLE; gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#UNREADABLE }' stderr=$gate_errline (unreadable on all $gate_unread poll(s), bound $GATE_READ_TRIES) — the read never produced a check surface, so this is a TRANSPORT failure, not a state of the repo"; break
+                 case "$gate" in
+                   ROWUNREADABLE*) gate_verdict=UNAVAILABLE; gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#ROWUNREADABLE }' stderr=$gate_errline (bound $GATE_READ_TRIES) — the row was FOUND and carries no state, so this is a malformed check surface, not a state of the repo" ;;
+                   *)              gate_verdict=UNAVAILABLE; gate_line="gate=UNAVAILABLE rc=$gate_rc read='${gate#UNREADABLE }' stderr=$gate_errline (unreadable on all $gate_unread poll(s), bound $GATE_READ_TRIES) — the read never produced a check surface, so this is a TRANSPORT failure, not a state of the repo" ;;
+                 esac
+                 break
                fi ;;
           esac
           if [ "$gate_last" != "$gate" ] || [ "$gate_kind" != "$gate_lastkind" ]; then
             case "$gate_kind" in
               PENDING) echo "[merge $PR] gate=PENDING ${gate#PENDING } (try $gate_try) — CI is still running; waiting up to $GATE_POLL_TRIES poll(s) / ${gate_wait}s" >> "$L.log" ;;
-              *)       echo "[merge $PR] gate=UNREADABLE rc=$gate_rc read='${gate#UNREADABLE }' stderr=$gate_errline (try $gate_try/$GATE_READ_TRIES) — retrying a failed READ; nothing about the repo has been observed yet" >> "$L.log" ;;
+              *) case "$gate" in
+                   ROWUNREADABLE*) echo "[merge $PR] gate=UNREADABLE rc=$gate_rc read='${gate#ROWUNREADABLE }' stderr=$gate_errline (try $gate_try/$GATE_READ_TRIES) — the row was found but has no state to read; retrying" >> "$L.log" ;;
+                   *)              echo "[merge $PR] gate=UNREADABLE rc=$gate_rc read='${gate#UNREADABLE }' stderr=$gate_errline (try $gate_try/$GATE_READ_TRIES) — retrying a failed READ; nothing about the repo has been observed yet" >> "$L.log" ;;
+                 esac ;;
             esac
             gate_last="$gate"; gate_lastkind="$gate_kind"
           fi ;;
@@ -1286,7 +1364,11 @@ else:
     # terminal state): NOT YET KNOWN, with what was needed and how long it was waited for.
     if [ -z "$gate_line" ]; then
       gate_verdict=UNKNOWN
-      gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) / ${gate_wait}s — the gate was still in flight when the wait expired; it needs a completed '$REVIEW_GATE' check, which CI had not produced in that window"
+      if [ "${gate_seen_empty:-0}" = 1 ]; then
+        gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='the check surface was EMPTY' after $gate_try poll(s) / ${gate_wait}s — CI never created a single check row for this head, so the gate was never observable; it needs a completed '$REVIEW_GATE' check in that window"
+      else
+        gate_line="gate=NOT YET KNOWN want=$REVIEW_GATE last='${gate:-<nothing>}' after $gate_try poll(s) / ${gate_wait}s — the gate was still in flight when the wait expired; it needs a completed '$REVIEW_GATE' check, which CI had not produced in that window"
+      fi
     fi
     # ⛔ EXACTLY ONE terminal `gate=` line per run: every progress line above is a DIFFERENT kind
     # (`NOT YET CREATED` / `PENDING` / `UNREADABLE` / the RED transition), so the terminal verdict is

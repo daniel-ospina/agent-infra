@@ -126,13 +126,21 @@ EOF
 # ONE dispatch, so the mode names used by the arms below cannot drift from the worlds they name.
 # EXPORTED into the driven worker (a function body in a child bash cannot see the test's variables,
 # so every name it touches travels through the environment: MRG, PRCHECKS_MODE, FAKE_REQ, FAKE_HEAD).
-checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,state` prints and returns
+checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,state,startedAt` prints and returns
   case "$1" in
     success)   printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n' ;;
     fail)      printf 'gh-core-floor remaining=120 floor=800 resets_in=4m\n' >&2; return 1 ;;
     nothing)   return 1 ;;
     prefixed)  printf '[{"name":"ci / unit-test","state":"SUCCESS"},{"name":"ci / lint","state":"SUCCESS"}]\n' ;;
     substring) printf '[{"name":"pipeline-compliance","state":"SUCCESS"}]\n' ;;
+    # §2c/§2d: after the caller prefix is stripped, two DIFFERENT rows can canonicalise to the gate.
+    # A first-match loop takes whichever comes first in the payload and can merge on a red gate.
+    shadow)    printf '[{"name":"ci / unit-test","state":"SUCCESS","startedAt":"2026-10-24T00:00:00Z"},{"name":"unit-test","state":"FAILURE","startedAt":"2026-10-24T00:00:02Z"}]\n' ;;
+    twocaller) printf '[{"name":"a / unit-test","state":"SUCCESS","startedAt":"2026-10-24T00:00:00Z"},{"name":"b / unit-test","state":"FAILURE","startedAt":"2026-10-24T00:00:02Z"}]\n' ;;
+    # …while a RE-RUN is one job, not two verdicts: both attempts stay in the payload, and the newest
+    # must win or a gate a re-run already turned green is refused forever.
+    rerun)     printf '[{"name":"ai-review-gate","state":"FAILURE","startedAt":"2026-10-24T01:00:00Z"},{"name":"ai-review-gate","state":"SUCCESS","startedAt":"2026-10-24T02:00:00Z"}]\n' ;;
+    nostate)   printf '[{"name":"ai-review-gate"}]\n' ;;
     empty)     printf '[]\n' ;;
     queued)    printf '[{"name":"ai-review-gate","state":"QUEUED"}]\n' ;;
     red)       printf '[{"name":"ai-review-gate","state":"FAILURE"}]\n' ;;
@@ -143,6 +151,9 @@ checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,stat
                else
                  printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n'
                fi ;;
+    open)      printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n' ;;
+    # A NON-EMPTY surface that simply does not carry the gate: a name mismatch (§3b).
+    othername) printf '[{"name":"ci / lint","state":"SUCCESS"}]\n' ;;
     *)         printf '[]\n' ;;
   esac
   return 0
@@ -281,23 +292,77 @@ log="$(mrglog)"
 qF 'saw=pipeline-compliance' <<<"$log" && ok "§2b substring: the verdict names what the surface actually carried" \
                                       || bad "§2b substring: the surface was not reported; log=$(tr '\n' ' ' <<<"$log")"
 
-# ── §3 an EMPTY surface: NO-SUCH-CHECK after the ABSENT bound, reason logged once ───────────────
+# ── §2c a widened match is NEVER decided by row order (review P1: a green look-alike shadowed the
+#          RED gate) — the row explicitly named `unit-test` is FAILURE here ─────────────────────
 mkmrg
-out="$(run_merge PRCHECKS_MODE=empty GATE_ABSENT_TRIES=2 GATE_POLL_TRIES=30)"; rc=$?
+out="$(run_merge PRCHECKS_MODE=shadow REVIEW_GATE=unit-test FAKE_REQ=unit-test GATE_POLL_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§2c shadowed gate: refused (exit 4) — the RED row named exactly \`unit-test\` is not discarded" \
+                || bad "§2c shadowed gate: rc=$rc — a green 'ci / unit-test' shadowed the red 'unit-test' (FALSE PASS); log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+q 'gate=FAILURE (RED' <<<"$log" && ok "§2c shadowed gate: the verdict is the WORST matched row (FAILURE), not the first" \
+                             || bad "§2c shadowed gate: no FAILURE verdict; log=$(tr '\n' ' ' <<<"$log")"
+nq 'MERGED' <<<"$log" && ok "§2c shadowed gate: nothing merged" || bad "§2c shadowed gate: the PR was merged"
+
+# ── §2d two callers exposing the same job name: decided by POLICY, not by payload order ────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=twocaller REVIEW_GATE=unit-test FAKE_REQ=unit-test GATE_POLL_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§2d two callers: refused (exit 4) — one of the two rows naming the gate is red" \
+                || bad "§2d two callers: rc=$rc — the verdict followed the API's row order; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+q 'gate=FAILURE (RED' <<<"$log" && ok "§2d two callers: the WORST of the rows naming the gate wins" \
+                             || bad "§2d two callers: not the worst row; log=$(tr '\n' ' ' <<<"$log")"
+
+# ── §2e …but a RE-RUN of one job is not two verdicts: the newest attempt wins, so a re-run green is
+#          not refused (this is why startedAt is requested at all) ───────────────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=rerun GATE_POLL_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 0 ] && ok "§2e re-run gate: the NEWEST attempt (SUCCESS) is read → merged (exit 0)" \
+                || bad "§2e re-run gate: rc=$rc — a stale FAILURE row refused a gate the re-run turned green; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+q 'gate=SUCCESS (try 1)' <<<"$log" && ok "§2e re-run gate: 'gate=SUCCESS (try 1)'" \
+                                      || bad "§2e re-run gate: no SUCCESS verdict; log=$(tr '\n' ' ' <<<"$log")"
+
+# ── §3 an EMPTY surface is the CI NOT HAVING STARTED: a WAIT on the FULL CI window, refused only
+#       when that window expires — never the short "your gate name is wrong" bound (review P2-1) ──
+mkmrg
+out="$(run_merge PRCHECKS_MODE=empty GATE_ABSENT_TRIES=1 GATE_POLL_TRIES=3)"; rc=$?
 log="$(mrglog)"
 [ "$rc" -eq 4 ] && ok "§3 empty surface: refused (exit 4)" || bad "§3 empty surface: rc=$rc; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
-qF 'gate=NO-SUCH-CHECK want=ai-review-gate saw=<none: the check surface is empty>' <<<"$log" \
-  && ok "§3 empty surface: the verdict says NO-SUCH-CHECK, what it WANTED and what it SAW" \
+qF 'gate=NOT YET KNOWN want=ai-review-gate last=' <<<"$log" \
+  && ok "§3 empty surface: the verdict says NOT YET KNOWN and that the surface was EMPTY" \
   || bad "§3 empty surface: the verdict is not legible; log=$(tr '\n' ' ' <<<"$log")"
+qF 'the check surface was EMPTY' <<<"$log" \
+  && ok "§3 empty surface: …and says the surface itself was empty at the bound" \
+  || bad "§3 empty surface: the bound does not name the empty surface; log=$(tr '\n' ' ' <<<"$log")"
+q 'never created a single check row' <<<"$log" \
+  && ok "§3 empty surface: …and names the missing fact (CI created no row), not a wrong gate NAME" \
+  || bad "§3 empty surface: it does not say what was missing"
+nq 'NO-SUCH-CHECK' <<<"$log" && ok "§3 empty surface: never reported as NO-SUCH-CHECK (that blames the name for the CI not starting)" \
+                            || bad "§3 empty surface: an empty surface was reported as a wrong gate name"
 n="$(polls)"
-[ "$n" -eq 2 ] && ok "§3 empty surface: bounded by GATE_ABSENT_TRIES (2 polls), NOT the 30-poll CI window" \
-               || bad "§3 empty surface: $n polls (want 2) — a missing check still spins the whole window"
+[ "$n" -eq 3 ] && ok "§3 empty surface: bounded by the CI window (3 polls), NOT by GATE_ABSENT_TRIES=1 — a gate appearing later still merges" \
+               || bad "§3 empty surface: $n polls (want 3) — an empty surface was refused before the CI window"
 once="$(grep -c 'gate=NOT YET CREATED' <<<"$log")"
 [ "$once" -le 1 ] && ok "§3 empty surface: the wait reason is logged ONCE, not once per poll ($once line)" \
                   || bad "§3 empty surface: the reason was logged $once times (the 30-identical-lines defect)"
 qF 'gate=NOT YET CREATED want=ai-review-gate' <<<"$log" \
   && ok "§3 empty surface: the wait itself is named ('NOT YET CREATED'), so a slow workflow is distinguishable" \
   || bad "§3 empty surface: no NOT YET CREATED line"
+
+# ── §3b a NON-EMPTY surface with no row naming the gate IS a name mismatch: the short bound, and a
+#        remedy that fits (`waiting cannot help`) ───────────────────────────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=othername GATE_ABSENT_TRIES=2 GATE_POLL_TRIES=30)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§3b wrong name: refused (exit 4)" || bad "§3b wrong name: rc=$rc; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+qF 'gate=NO-SUCH-CHECK want=ai-review-gate saw=ci / lint' <<<"$log" \
+  && ok "§3b wrong name: NO-SUCH-CHECK naming what it WANTED and what the surface CARRIED" \
+  || bad "§3b wrong name: the verdict is not legible; log=$(tr '\n' ' ' <<<"$log")"
+q 'none is named this gate' <<<"$log" && ok "§3b wrong name: the remedy matches the fact (a name mismatch, not a slow CI)" \
+                                || bad "§3b wrong name: the remedy does not fit the observation"
+n="$(polls)"
+[ "$n" -eq 2 ] && ok "§3b wrong name: bounded by GATE_ABSENT_TRIES (2 polls), NOT the 30-poll CI window" \
+               || bad "§3b wrong name: $n polls (want 2) — a name mismatch still spins the whole window"
 
 # ── §4 a QUEUED gate: a WAIT, and at the bound NOT YET KNOWN with what it needed ────────────────
 mkmrg
@@ -336,6 +401,19 @@ qF 'gate=UNAVAILABLE rc=0' <<<"$log" && ok "§1d scalar payload: reported as UNA
                                      || bad "§1d scalar payload: not reported as unreadable; log=$(tr '\n' ' ' <<<"$log")"
 nq 'NO-SUCH-CHECK' <<<"$log" && ok "§1d scalar payload: NOT reported as a missing check (that would send the operator to fix the gate NAME)" \
                              || bad "§1d scalar payload: classified as NO-SUCH-CHECK — condition (a) reported as condition (b)"
+
+# ── §1f a row that IS the gate but carries no state: found, so it is not "the read never produced a
+#        surface" — its polarity is unknown and it says so ───────────────────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=nostate GATE_READ_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§1f stateless row: refused (exit 4) — an unreadable polarity is never green" \
+                || bad "§1f stateless row: rc=$rc"
+qF 'the row named <ai-review-gate> was found but carries no state field' <<<"$log" \
+  && ok "§1f stateless row: says the row WAS FOUND and had no state (so the operator does not go hunting a transport failure)" \
+  || bad "§1f stateless row: the verdict misdescribes what was observed; log=$(tr '\n' ' ' <<<"$log")"
+nq 'never produced a check surface' <<<"$log" && ok "§1f stateless row: does not claim the read produced nothing" \
+                                            || bad "§1f stateless row: reported as a transport failure contradicted by its own 'found' wording"
 
 # ── §4c a CANCELLED gate is NOT GREEN, not RED (the repo's own polarity) ──────────────────────
 mkmrg
@@ -486,6 +564,28 @@ if q 'if False:' "$(cat "$MUT2")"; then
                               || ok "§8 mutation: with canon() disabled the prefixed row no longer matches (§2 goes RED)"
 else
   bad "§8 mutation: the canon() mutation did not apply — inconclusive"
+fi
+
+MUT3="$TMP/block-firstmatch.sh"
+sed 's|if hit is None or rank(state_of(c)) > rank(state_of(hit)):|if hit is None:|' "$SLICE" > "$MUT3"
+if q 'if hit is None:$' "$(cat "$MUT3")"; then
+  b_out="$(run_block "$MUT3" shadow unit-test)"
+  # The mutant MUST now report SUCCESS on the shadowed case — that is exactly what §2c refuses, so the
+  # arm goes RED under this mutation. (Reading it the other way round is how a mutation control ends up
+  # "passing" while proving nothing.)
+  q 'gate=SUCCESS' <<<"$b_out" && ok "§9 mutation: with first-match restored the green look-alike WINS (dangerous verdict SUCCESS), so §2c's refusal assertion goes RED — worst-case is load-bearing" \
+                              || bad "§9 mutation: with first-match restored the block still refused — §2c is vacuous"
+else
+  bad "§9 mutation: the worst-case mutation did not apply (sed found no target) — inconclusive"
+fi
+MUT4="$TMP/block-norerun.sh"
+sed 's|    if a > b:|    if False:|' "$SLICE" > "$MUT4"
+if q '    if False:$' "$(cat "$MUT4")"; then
+  b_out="$(run_block "$MUT4" rerun)"
+  q 'gate=SUCCESS' <<<"$b_out" && bad "§10 mutation: without the newest-attempt rule the re-run gate STILL merges — §2e is vacuous" \
+                              || ok "§10 mutation: without the newest-attempt rule a stale FAILURE refuses the re-run green, so §2e goes RED"
+else
+  bad "§10 mutation: the newest-attempt mutation did not apply — inconclusive"
 fi
 
 printf '\n%s\n' "──────────────────────────────────────────────"
