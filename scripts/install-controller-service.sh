@@ -436,9 +436,17 @@ do_install() {
     # restart this arithmetic exists to exclude; `ORCH_START_TIMEOUT_SEC=060 ORCH_RESTART_SEC=200` printed a
     # remedy the very next guard refused (octal quotient, decimal comparison). Normalising here makes the
     # modelled, rendered and parsed numbers the same integer.
-    case "$RESTART_SEC" in 0?*) RESTART_SEC=$(( 10#$RESTART_SEC )) ;; esac
+    # ⛔ NORMALISE **AFTER** THE RANGE CHECK, AND BOUND THE LENGTH FIRST (review P1 round 16, #2402). `10#`
+    # does NOT fail on overflow — bash silently wraps modulo 2^64, so `018446744073709551631` became 15 and,
+    # normalised BEFORE the range test, was ACCEPTED and rendered as `RestartSec=15`: a value the operator
+    # never asked for, substituted without a word (the base commit refused it). The range test runs on the raw
+    # base-10 string (so `015` passes as 15), then the value is normalised so the arithmetic below cannot read
+    # it as octal; the length bound is what makes that safe.
+    [ "${#RESTART_SEC}" -le 9 ] \
+        || { err "REFUSING: ORCH_RESTART_SEC must be a small whole number of seconds (got '$RESTART_SEC') — nothing this large can fit a start-limit window"; return 1; }
     [ "$RESTART_SEC" -ge 1 ] 2>/dev/null \
         || { err "REFUSING: ORCH_RESTART_SEC must be >= 1 (got '$RESTART_SEC') — 0 is not a delay"; return 1; }
+    case "$RESTART_SEC" in 0?*) RESTART_SEC=$(( 10#$RESTART_SEC )) ;; esac
     # ⛔ THE ORPHAN CEILING MUST FIT `StartLimitBurst` ATTEMPTS INSIDE `StartLimitIntervalSec` — NOT MERELY
     # SIT BELOW IT (review P2, #2402). systemd refuses the start AFTER the burst is exceeded
     # (`systemd.unit(5)`: units "started more than burst times within an interval time span are not
@@ -460,8 +468,10 @@ do_install() {
     sl_burst="$(sed -n 's/^StartLimitBurst=//p' "$tpl" 2>/dev/null | head -1)"
     case "${sl_iv:-}" in ''|*[!0-9]*) sl_iv=300 ;; esac
     case "${sl_burst:-}" in ''|*[!0-9]*) sl_burst=3 ;; esac
-    # same base-10 normalisation as RESTART_SEC above: a zero-padded template value would otherwise be octal
-    # in the quotient and decimal in the comparison.
+    # same base-10 normalisation as RESTART_SEC, and the same ordering rule: the length bound and the range
+    # check come FIRST, so a padded value cannot wrap into an accepted one (review P1 round 16, #2402).
+    [ "${#sl_iv}" -le 9 ] || { err "REFUSING: the template's StartLimitIntervalSec is absurdly large ('$sl_iv')"; return 1; }
+    [ "${#sl_burst}" -le 6 ] || { err "REFUSING: the template's StartLimitBurst is absurdly large ('$sl_burst')"; return 1; }
     case "$sl_iv" in 0?*) sl_iv=$(( 10#$sl_iv )) ;; esac
     case "$sl_burst" in 0?*) sl_burst=$(( 10#$sl_burst )) ;; esac
     # ⛔ A BURST OF 0 IS "NO START LIMIT" — refuse it rather than divide by it (see the magnitude guard
@@ -473,6 +483,8 @@ do_install() {
     esac
     [ "$START_TIMEOUT_SEC" -ge 1 ] 2>/dev/null \
         || { err "REFUSING: ORCH_START_TIMEOUT_SEC must be >= 1 (got '$START_TIMEOUT_SEC')"; return 1; }
+    [ "${#START_TIMEOUT_SEC}" -le 9 ] \
+        || { err "REFUSING: ORCH_START_TIMEOUT_SEC must be a small whole number of seconds (got '$START_TIMEOUT_SEC')"; return 1; }
     case "$START_TIMEOUT_SEC" in 0?*) START_TIMEOUT_SEC=$(( 10#$START_TIMEOUT_SEC )) ;; esac
     # ⛔ THE RELATION IS DIVIDED, NEVER MULTIPLIED (review P2, #2402). The shape test above accepts a
     # 19-DIGIT value, and `sl_burst * (START_TIMEOUT_SEC + RESTART_SEC)` then WRAPS NEGATIVE — measured:
@@ -523,7 +535,11 @@ do_install() {
     # check below allows at most that minus the poll quantum and the per-attempt overhead (89) — so an
     # operator who split the budget instead of copying the example was refused by the same message that
     # told them they were fine. Computed ONCE here, used in both the sentence and the guard.
-    sl_sum_max=$(( (sl_iv - 1) / sl_burst - WAIT_QUANTUM_SEC - ATTEMPT_OVERHEAD_SEC ))
+    # ⛔ DERIVED FROM THE VALUE THE GUARD TESTS, NOT RE-DERIVED (review P2 round 16, #2402): a second
+    # expansion of the same quotient can drift the moment one of them is edited, which is exactly how the
+    # round-15 defect appeared. `sl_maxtime` is what `[ "$START_TIMEOUT_SEC" -le "$sl_maxtime" ]` enforces,
+    # so the sentence quotes that plus RestartSec and cannot disagree with it.
+    sl_sum_max=$(( sl_maxtime + RESTART_SEC ))
     if [ "$sl_maxtime" -lt 1 ]; then
         err "REFUSING: no orphan ceiling fits this start limit — StartLimitBurst=$sl_burst attempts inside StartLimitIntervalSec=${sl_iv}s leave nothing for RestartSec=${RESTART_SEC}s plus a >= 1s ceiling (the minimum window is ${sl_min_iv}s), so NO configuration would converge to failed."
         if [ "$sl_max_rs_at_ceiling" -ge 1 ]; then

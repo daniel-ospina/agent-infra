@@ -1311,7 +1311,13 @@ JR3_RC=0; JR3_OUT="$(EXTRA_ENV=ORCH_START_TIMEOUT_SEC=3074457345618258602 inst j
 [ "$JR3_RC" -ne 0 ] \
   && ok 'install: REFUSES a digits-only ORCH_START_TIMEOUT_SEC that overflows the arithmetic (19 digits, wraps negative under multiplication)' \
   || bad "install: accepted ORCH_START_TIMEOUT_SEC=3074457345618258602 — 3 × (x + 15) wraps NEGATIVE, so a multiplicative guard passes and the unit would restart forever — $JR3_OUT"
-case "$JR3_OUT" in *'Use ORCH_START_TIMEOUT_SEC <= 74s'*) ok 'install: the overflow refusal quotes the bound the guard enforced (74s — each attempt share of the window minus RestartSec, the 5 s poll quantum and the per-attempt overhead; not an optimistic 84 s)' ;; *) bad "install: the refusal did not quote the enforced bound ('<= 74s') — $JR3_OUT" ;; esac
+# The magnitude is refused by the LENGTH bound (review round 16) before any arithmetic can wrap, so the
+# refusal names the value rather than quoting a ceiling — the '<= 74s' quote is pinned by the zero-padded
+# arm below, where the value is small enough to reach the arithmetic.
+case "$JR3_OUT" in
+  *'small whole number of seconds'*|*'Use ORCH_START_TIMEOUT_SEC <= 74s'*) ok 'install: an oversized ceiling is REFUSED before the arithmetic can wrap (length bound), or quotes an enforceable bound' ;;
+  *) bad "install: an oversized ORCH_START_TIMEOUT_SEC was not refused by name — $JR3_OUT" ;;
+esac
 # ...and the boundary is INCLUSIVE: 74 s fits the relation WITH the quantum and overhead allowances
 # (3 × (74 + 15 + 5 + 5) = 297 < 300). A guard that refused its own recommended value would be a new false
 # red on every cell the message is meant to repair.
@@ -1412,6 +1418,47 @@ JQ2_RC=0; JQ2_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=29 inst jq2 --install --dry-run 
 [ "$JQ2_RC" -eq 0 ] \
   && ok 'install: ACCEPTS the quoted bound (29 s) with NOTHING ELSE changed — one knob, no second undocumented one' \
   || bad "install: refused the value its own refusal recommends (29 s at the default 60 s ceiling) — the remedy still needs a second knob: $JQ2_OUT"
+
+# ⛔ THE GUARD MODELS THE NUMBER SYSTEMD PARSES, AND ITS RULES ARE THE ENFORCED ONES (review P1/P2 round 16,
+# #2402). Three arms, one per defect found at round 15: a ZERO-PADDED RestartSec was read as OCTAL by the
+# quotient but DECIMAL by `[ ]` and systemd (so the remedy it printed made the burst unfillable), the "sum to
+# at most" sentence quoted the raw quotient while the guard allowed less, and an OUT-OF-RANGE padded value was
+# normalised BEFORE the range check, where `10#`'s silent modulo-2^64 wrap ACCEPTED it and rendered a
+# different number. Each goes RED on a revert.
+say_case 'a zero-padded bound is modelled in base 10 (the number the guard reads IS the number systemd runs)'
+JZ="$(arm_root jz)"; mk_systemctl "$JZ/bin" "$JZ/state" "$JZ/sc.log"
+JZ_RC=0; JZ_OUT="$(EXTRA_ENV="ORCH_RESTART_SEC=015 ORCH_START_TIMEOUT_SEC=100" inst jz --install 2>&1)" || JZ_RC=$?
+[ "$JZ_RC" -ne 0 ] \
+  && ok 'install: refuses a ceiling that does not fit at a zero-padded RestartSec (the burst must fill inside the window)' \
+  || bad "install: ACCEPTED 100 s at RestartSec=015 — read as octal 13 the cost looks like 3 × (100+13+10) = 369, but the real cost is 3 × 100 s at 15 s + 10 s = 375 vs a 285 s budget — $JZ_OUT"
+case "$JZ_OUT" in
+  *'Use ORCH_START_TIMEOUT_SEC <= 74s'*) ok 'install: the remedy is computed from DECIMAL 15 (74 s), not from octal 13 (76 s)' ;;
+  *) bad "install: the remedy was computed from the padded value's OCTAL reading — $JZ_OUT" ;;
+esac
+JZ2="$(arm_root jz2)"; mk_systemctl "$JZ2/bin" "$JZ2/state" "$JZ2/sc.log"
+JZ2_RC=0; JZ2_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=018446744073709551631 inst jz2 --install 2>&1)" || JZ2_RC=$?
+[ "$JZ2_RC" -ne 0 ] \
+  && ok 'install: refuses an out-of-range zero-padded RestartSec instead of silently wrapping it (10# wraps modulo 2^64)' \
+  || bad "install: ACCEPTED a padded 21-digit RestartSec — 10# wrapped it and a value the operator never asked for was rendered — $JZ2_OUT"
+
+say_case 'the stated "sum to at most" rule is the rule the guard enforces'
+JS="$(arm_root js)"; mk_systemctl "$JS/bin" "$JS/state" "$JS/sc.log"
+JS_RC=0; JS_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=200 inst js --install 2>&1)" || JS_RC=$?
+case "$JS_OUT" in
+  *'must sum to at most 89s'*) ok 'install: the sentence quotes the enforced sum bound (89 s), not the raw quotient (99 s)' ;;
+  *) bad "install: the sentence quotes a sum bound the next guard refuses — $JS_OUT" ;;
+esac
+# …and the split it describes is accepted at the boundary and refused one second over it.
+JS2="$(arm_root js2)"; mk_systemctl "$JS2/bin" "$JS2/state" "$JS2/sc.log"
+JS2_RC=0; JS2_OUT="$(EXTRA_ENV="ORCH_RESTART_SEC=44 ORCH_START_TIMEOUT_SEC=45" inst js2 --install 2>&1)" || JS2_RC=$?
+[ "$JS2_RC" -eq 0 ] \
+  && ok 'install: the split the sentence allows (44 + 45 = 89) is ACCEPTED' \
+  || bad "install: refused the split its own sentence allows (44 + 45) — $JS2_OUT"
+JS3="$(arm_root js3)"; mk_systemctl "$JS3/bin" "$JS3/state" "$JS3/sc.log"
+JS3_RC=0; JS3_OUT="$(EXTRA_ENV="ORCH_RESTART_SEC=45 ORCH_START_TIMEOUT_SEC=45" inst js3 --install 2>&1)" || JS3_RC=$?
+[ "$JS3_RC" -ne 0 ] \
+  && ok 'install: one second over that split (45 + 45 = 90) is REFUSED (the rule is a bound, not a coincidence)' \
+  || bad "install: accepted 90 s of ceiling+RestartSec — the burst no longer fits the window — $JS3_OUT"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §K — one staleness bound, two instruments (review P2, #2402)
