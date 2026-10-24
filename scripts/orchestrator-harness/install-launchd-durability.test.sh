@@ -909,12 +909,32 @@ mutating() { mutating_calls; }   # ONE definition (the two drifted apart once al
 fresh
 out="$(ORUN 2>&1)"; rc=$?
 assert_eq "$rc" "0" "plain install exits 0"
-[ -f "$PLIST" ] && ok "plain install rendered the plist" || bad "plain install rendered no plist"
+if [ -f "$PLIST" ]; then ok "plain install rendered the plist"; else bad "plain install rendered no plist"; fi
+# ⛔ XML VALIDITY IS ASSERTED HERE, WITHOUT plutil (agent-infra#1990 merge, 2026-10-24). `plutil -lint`
+# used to be the ONLY XML gate, and it is stubbed on Linux — so a template COMMENT containing `--`
+# (forbidden by the XML spec) shipped green on main: install.sh died `rendered plist is invalid` on a
+# mac while this suite reported PASS, because the very line below said the XML half "is not exercised
+# here". A stub makes the lint half a no-op, which is indistinguishable from success — so the gate
+# that matters (is the file PARSEABLE?) is asserted independently of the tool being stubbed.
+if [ -f "$PLIST" ]; then
+  # Strip the comment DELIMITERS first, then any `--` left is inside a comment and is illegal. Filtering
+  # whole LINES that contain `<!--` would miss a single-line comment (`<!-- a -- b -->`).
+  _dashes="$(sed -e 's|<!--||g' -e 's|-->||g' "$PLIST" | grep -n -- '--' || true)"
+  if [ -z "$_dashes" ]; then ok "the rendered plist carries no '--' inside an XML comment (XML forbids it; plutil -lint dies on exactly this)"
+  else bad "the rendered plist has '--' inside an XML comment, which XML forbids — plutil -lint would refuse this file: $_dashes"; fi
+  if command -v python3 >/dev/null 2>&1; then
+    _xmlwhy="$(python3 -c 'import sys,xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$PLIST" 2>&1)"
+    if [ -z "$_xmlwhy" ]; then ok "the rendered plist is WELL-FORMED XML (parsed by python3, NOT plutil — so this half IS exercised where plutil is stubbed)"
+    else bad "the rendered plist is NOT well-formed XML: $(printf '%s' "$_xmlwhy" | tail -1)"; fi
+  else
+    skipd "python3 is absent — the well-formedness half of §F is NOT exercised here (the '--'-in-comment check above still ran)"
+  fi
+fi
+if [ -n "${STUBBED_PLUTIL:-}" ]; then
+  ok "plutil was STUBBED on this platform — the <plutil>-only lint half is not exercised here, the launchd half and the python3 well-formedness half above are"
+fi
 if [ -z "$(mutating)" ]; then ok "plain install made ZERO mutating launchctl calls (a validation run cannot disturb a live controller)"
 else bad "plain install MUTATED launchd: $(mutating)"; fi
-if [ -n "${STUBBED_PLUTIL:-}" ]; then
-  ok "plutil was STUBBED on this platform — the XML-lint half of this section is not exercised here, the launchd half is"
-fi
 
 # --start with a healthy box: the job comes up and the start is PROVEN.
 fresh "$(( $(date +%s) - 5 ))"
