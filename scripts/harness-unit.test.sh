@@ -165,7 +165,7 @@ run() { # <verb> [extra argv…]
           BRINGUP_LOG="$BRINGUP_LOG" REFRESH_LOG="$REFRESH_LOG" \
           REFRESH_RELATION="${REFRESH_RELATION:-current}" BRINGUP_START_RC="${BRINGUP_START_RC:-0}" \
           HU_FORK_LIMITS_FILE="${FORKFILE:-$TMP/fork-generous}" \
-          HU_LANE_SILENT="${LANESILENT:-2400}" HU_NEXT_STALE="${NEXTSTALE:-900}" \
+          HARNESS_UP_LANE_SILENT="${LANESILENT:-2400}" HARNESS_UP_NEXT_STALE="${NEXTSTALE:-900}" \
           bash "$SCRIPTS/harness-up" "$_v" --repo "$REPO" --harness "$HARNESS" --no-fetch -o "$CELL/orchestrator" "$@" 2>&1 )"
   RC=$?
 }
@@ -238,6 +238,23 @@ ck "(A) an unmeasurable fork limit REFUSES the placement (never a fixed cap, nev
    "$(has "$cap_row" 'REFUSED' && has "$cap_row" 'fork/task headroom' && echo 0 || echo 1)"
 ck "(A) …and cannot-verify is BROKEN (rc=2, got $RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 
+# ⛔ AND IT REFUSES ON THE FORK DIMENSION **EVEN WHEN LOAD IS ALSO UNREADABLE** (review round 1): the
+# ordering was only half-applied — the capacity.sh `fork` verb sat first, but the SHIM's own fork read
+# sat below the `load_unreadable`/`ncpu_unreadable` refusals, so on a box with no capacity.sh beside the
+# launcher (the documented fallback) an unforkable box still answered "the load average could not be
+# read" and pointed the operator at the loadavg — the misdiagnosis #2293 exists to end. Both unreadable
+# at once is the arm that distinguishes the two orders: whichever refusal fires FIRST is the dimension
+# the operator is sent to look at.
+OUT="$( cd "$TMP" && PATH="$TMP/bin:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/bin/ps" PS_TABLE="$TMP/ps-live" HU_LOADAVG_FILE="$TMP/no-such-load" HU_NCPU=4 \
+        HARNESS_UP_OS=Linux HU_FORK_LIMITS_FILE="$TMP/does-not-exist" \
+        bash "$SCRIPTS/harness-up" status --repo "$REPO" --harness "$HARNESS" --no-fetch -o "$CELL/orchestrator" 2>&1 )"; RC=$?
+cap_both="$(row capacity)"
+ck "(A) with fork AND load unreadable the refusal is the FORK one, not the loadavg (the ordering, on the SHIM path) [$cap_both]" \
+   "$(has "$cap_both" 'fork/task headroom' && lacks "$cap_both" 'load average' && echo 0 || echo 1)"
+ck "(A) …and it is still BROKEN, never a lane count (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+
 # The record path (capacity.sh, the fleet instrument) is consumed — including its fork reading, which
 # comes from its OWN `fork` verb rather than from this launcher re-deriving `procs_max − procs`.
 # ⛔ THE STUB SPEAKS THE LANDED SCHEMA (`procs=`/`procs_max=`/`fork=`/`src=`, and `headroom=` from the
@@ -289,6 +306,30 @@ touch -t "$fresh" "$L/fix-4.log"
 run status
 ck "(C) with every live lane inside the bound the row is OK ($(row lanes))" \
    "$(row lanes | grep -q '4/4 live and advancing' && echo 0 || echo 1)"
+
+# ⛔ `chain-*` IS A LIVE LANE TOO (review round 1): `dispatch-merge.sh:217` spawns its
+# review→record→merge workers as `chain-<N>` via wt_spawn, and the controller's own census is
+# `wt_count lane- chain-`. This row's population pattern spelled `lane-*|merge-*|fix-*` and therefore
+# reported a live chain worker as `OK (no lane is live — 0 worker records …)` when it was the ONLY
+# worker — a false pass on the exact row that exists to stop false passes.
+printf '#!/bin/sh\n' > "$WS/run-chain-7.sh"; : > "$L/chain-7.log"; touch -t "$fresh" "$L/chain-7.log"
+rm -f "$WS"/run-*.sh; printf '#!/bin/sh\n' > "$WS/run-chain-7.sh"
+run status
+ck "(C) a live \`chain-*\` worker (dispatch-merge's own) is COUNTED, not reported as 'no lane is live' [$(row lanes)]" \
+   "$(row lanes | grep -q '1/1 live and advancing' && echo 0 || echo 1)"
+rm -f "$WS/run-chain-7.sh" "$L/chain-7.log"
+
+# ⛔ A NON-NUMERIC BOUND IS COERCED, NOT TRUSTED. `[ "$age" -le "$HU_LANE_SILENT" ]` with `abc` exits 2,
+# so the `if` takes its ELSE branch and EVERY live lane reads SILENT — the row inventing a problem. The
+# seam is the shipped name (`HARNESS_UP_LANE_SILENT`); the suite used to export `HU_LANE_SILENT`, which
+# the launcher overwrites from the HARNESS_UP_ form, so every bound arm here could only ever see 2400.
+for w in lane-1 merge-9; do printf '#!/bin/sh\n' > "$WS/run-$w.sh"; touch -t "$fresh" "$L/$w.log"; done
+LANESILENT=abc run status
+ck "(C) a non-numeric lane-silent bound falls back to the documented 2400 (live lanes stay ADVANCING) [$(row lanes)]" \
+   "$(lacks "$(row lanes)" 'SILENT past abc' && row lanes | grep -q '2/2 live and advancing' && echo 0 || echo 1)"
+LANESILENT=600 run status
+ck "(C) …and the bound is a real seam: at 600s the same two fresh lanes are inside it, so 2400 is not hard-coded" \
+   "$(row lanes | grep -q 'within 600s' && echo 0 || echo 1)"
 
 # ⛔ NO LIVE LANE IS NOT "EVERY LANE IS SILENT", and an ABSENT state dir is not "zero lanes": both
 # would be a claim about a measurement nobody made.
@@ -343,6 +384,36 @@ ck "(D) …and a stale log is LATE, never presented as the next decision" \
    "$(row next | grep -q 'LATE' && echo 0 || echo 1)"
 touch -t "$fresh" "$L/orch-loop.log"
 
+# ⛔ A LOG WITH NO DECISION LINE **YET** IS NOT CANNOT-VERIFY (review round 1). `orch-loop.sh:334`
+# appends `[startup] worker launcher=…` at boot, CYC (240 s) before the first `[select]` exists — so a
+# freshly started box has an EXISTING log with no decision line, and the first version of this row
+# answered UNKNOWN(2) there, which made `up` exit 2 AFTER A SUCCESSFUL START (measured: one `[startup]`
+# line, every other row green → `VERDICT: BROKEN (rc=2)`). Cannot-verify stays reserved for a
+# controller that SHOULD have decided.
+: > "$L/orch-loop.log"; printf '[startup] worker launcher=tmux (cmux=no, uname=Linux)\n' > "$L/orch-loop.log"
+touch -t "$fresh" "$L/orch-loop.log"
+run status
+ck "(D) a just-started controller (log carries only [startup]) reads STARTING — not the next decision [$(row next)]" \
+   "$(row next | grep -q 'STARTING' && echo 0 || echo 1)"
+ck "(D) …and that is not BROKEN: a successful start must never exit 2 because the log is young (rc=$RC)" \
+   "$([ "$RC" -le 1 ] && echo 0 || echo 1)"
+touch -t "$old" "$L/orch-loop.log"
+run status
+ck "(D) …while a log PAST the bound with still no decision line IS cannot-verify (a cycle should have decided) [$(row next)]" \
+   "$(row next | grep -q 'UNKNOWN' && [ "$RC" -eq 2 ] && echo 0 || echo 1)"
+
+# ⛔ AND THE BOUND ITSELF IS COERCED (review round 1): unvalidated, `[ "$age" -gt abc ]` exits 2, the `if`
+# takes its ELSE branch, and a FIVE-HOUR-OLD `[select]` line prints `OK` — the row's polarity inverted in
+# the fail-open direction, precisely when it should red.
+printf '[select] PR path: 1 acted; issues BLOCKED\n' > "$L/orch-loop.log"
+touch -t "$old" "$L/orch-loop.log"
+NEXTSTALE=abc run status
+ck "(D) a non-numeric next-stale bound falls back to the documented 900 (a 2h-old line is still LATE, never OK) [$(row next)]" \
+   "$(row next | grep -q 'LATE' && ! row next | grep -q 'OK:' && echo 0 || echo 1)"
+ck "(D) …so the verdict stays DEGRADED rather than flipping to HEALTHY on a bad knob (rc=$RC)" \
+   "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+touch -t "$fresh" "$L/orch-loop.log"
+
 # ══ (E) SELF-TEST IS PART OF STATUS AND READS THE LIVE TREE ═════════════════════════════════════
 run status
 ck "(E) the self-test row parses the live tree and names what it checked ($(row selftest))" \
@@ -366,6 +437,37 @@ ck "(F1) …and the heal is SAID, so an operator can see what moved" \
    "$(grep -q 'HEAL: started a controller' <<<"$OUT" && echo 0 || echo 1)"
 ck "(F1) …and no stop was issued (a heal never kills what is live)" \
    "$([ "$(grep -c '^stop' "$BRINGUP_LOG")" -eq 0 ] && echo 0 || echo 1)"
+
+# ⛔ THE START ARM MUST NOT MANUFACTURE THE DUPLICATE THE OTHER ARMS REFUSE TO HEAL (review round 1).
+# The loop row's census is SCOPED to this box's state dir + harness path; a controller executing code
+# the records never name — a hand-launched old worktree, `~/.cache/orc/main-orch-loop.sh` — is invisible
+# to it and visible to the exec row's ANY census. `orchestrator-bringup.sh`'s registry claim cannot
+# refuse it either (a hand-launched controller never registered). Starting on the MISSING arm alone
+# therefore put TWO controllers on one repo — double dispatch, two lanes on one PR — from the operator's
+# own "tell me the state" call. The heal must check the ANY census before it starts anything.
+printf '7777 bash /opt/old-clone/scripts/orch-loop.sh\n' > "$TMP/ps-foreign"
+: > "$BRINGUP_LOG"
+PS_TABLE="$TMP/ps-foreign" run status
+ck "(F1b) a controller live at a path the records do NOT name blocks the heal's start (no duplicate) [$(grep -c '^start' "$BRINGUP_LOG") start(s)]" \
+   "$([ "$(grep -c '^start' "$BRINGUP_LOG")" -eq 0 ] && echo 0 || echo 1)"
+ck "(F1b) …and it says so, naming the pid and whose decision stopping it is" \
+   "$(grep -q 'would DUPLICATE it' <<<"$OUT" && grep -q '7777' <<<"$OUT" && echo 0 || echo 1)"
+ck "(F1b) …while the loop row is still the reason it was considered (MISSING by the SCOPED census)" \
+   "$(row loop | grep -q 'MISSING' && echo 0 || echo 1)"
+
+# ⛔ AND AN AGED `relation=behind` IS NOT EVIDENCE FOR A REPAIR (review round 1): the refresh row calls
+# the same record LATE past `HU_REFRESH_STALE`, so the heal must apply the SAME test before it ACTS.
+# Otherwise a days-old `behind` still triggers a fetch + pin advance on a record the row beside it is
+# simultaneously calling stale — the "stale flag read as present-tense" class.
+: > "$REFRESH_LOG"
+printf 'relation=behind running=%s ref=%s pin=%s action=none fetch=ok rc=0 at=%s\n' \
+  "$S12" "$S12" "$S12" "$(date +%s)" > "$CELL/orchestrator/state/harness-refresh"
+touch -t "$(date -v-1d +%Y%m%d%H%M 2>/dev/null || date -d '-1 day' +%Y%m%d%H%M)" "$CELL/orchestrator/state/harness-refresh"
+PS_TABLE="$TMP/ps-none" run status
+ck "(F2b) an AGED relation=behind triggers NO pin advance (a recorded relation is not a live state) [$(wc -l < "$REFRESH_LOG") refresh call(s)]" \
+   "$([ "$(wc -l < "$REFRESH_LOG")" -eq 0 ] && echo 0 || echo 1)"
+ck "(F2b) …and the refusal says why, so an operator can tell it from 'nothing to do'" \
+   "$(grep -q 'NOT HEALED: the refresh record says relation=behind' <<<"$OUT" && echo 0 || echo 1)"
 
 # ⛔ `--no-heal` MUST BE A PURE READ. A status verb that repairs without being asked is a trap for the
 # operator who ran it to find out what was wrong.
