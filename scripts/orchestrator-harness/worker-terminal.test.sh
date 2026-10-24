@@ -1777,15 +1777,44 @@ export CMUX_TREE_ABSENT=1
 . "$1"
 echo "count=$(wt_count merge-)"
 echo "window=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo none)"
-echo "delta=$(($(cat "$WT_DIR/.wt-absent-since" 2>/dev/null || echo 0) - $(date +%s)))"
+# the file now carries TWO values ("<first_seen> <last_absent>"), so read the FIRST
+echo "delta=$(($(awk '{print $1}' "$WT_DIR/.wt-absent-since" 2>/dev/null || echo 0) - $(date +%s)))"
 SH
 out="$(bash "$TMP/q17.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O34" 2>&1)"
 # ⛔ AND THE STAMP MUST HAVE BEEN REWRITTEN, not merely kept (review round 13): with the stamp KEPT the
 # elapsed value is negative, so neither rule fires and `count=1`/`window=open` are equally true — the
 # old assertion was green on the pre-round-10 code. A rewritten stamp is within the window of NOW; the
 # seeded one was +7200.
-case "$out" in *"count=1"*"window=open"*"delta="+"7200"*) rc=1; echo "      stamp NOT rewritten: $out";; *"count=1"*"window=open"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+# ⛔ NUMERIC, NOT A PATTERN (review round 14 of #2653): `$(( ))` never prints a leading `+`, so the
+# previous `*"delta="+"7200"*` guard could not match and the arm was the tautology it claimed to replace
+# (deleting the future-stamp rule left it green). A REWRITTEN stamp is ~0; a KEPT one is +7200.
+_d=$(printf '%s\n' "$out" | sed -n 's/^delta=//p')
+if case "$out" in *"count=1"*"window=open"*) true ;; *) false ;; esac \
+   && [ -n "${_d:-}" ] && [ "${_d#-}" -lt 120 ] 2>/dev/null; then rc=0; else rc=1; echo "      $out"; fi
 ck "a FUTURE stamp (a clock step) is discarded instead of pinning the release" $rc
+
+# ⛔ CONTINUOUS ABSENCE MUST NOT LOOK STALE (review round 14 of #2653, P2). With a single FIRST-SEEN
+# stamp, an outage longer than `WT_ABSENT_STALE_MIN` re-opened the window every bound and the rows
+# flipped `dead` → `unknown` for a full window — a duty cycle instead of a fix (measured ~900s dead /
+# ~60s unknown, repeating). The file carries "<first_seen> <last_absent>": continuity is judged on the
+# LAST sample, confirmation on the FIRST, so a continuously observed absence stays confirmed.
+cat > "$TMP/q22.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_long\nworkspace=ws_long\n' > "$WT_DIR/worker-merge-86"
+now=$(date +%s)
+printf '%s %s\n' "$(( now - 5000 ))" "$(( now - 5 ))" > "$WT_DIR/.wt-absent-since"   # long outage, fresh sample
+export CMUX_TREE_ABSENT=1
+. "$1"
+echo "count=$(wt_count merge-)"
+echo "first=$(awk '{print $1}' "$WT_DIR/.wt-absent-since")"
+echo "last=$(awk '{print $2}' "$WT_DIR/.wt-absent-since")"
+SH
+out="$(bash "$TMP/q22.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O39" 2>&1)"
+_n=$(printf '%s\n' "$out" | sed -n 's/^count=//p')
+_fl=$(printf '%s\n' "$out" | sed -n 's/^last=//p')
+if [ "${_n:-1}" = "0" ] && [ -n "${_fl:-}" ]; then rc=0; else rc=1; echo "      $out"; fi
+ck "a CONTINUOUS outage stays confirmed (first_seen kept, last_absent refreshed — no duty cycle)" $rc
 
 # ⛔ A STALE STAMP CONFIRMS NOTHING (review round 9 of #2653, P1): the stamp records when an absent
 # owner was FIRST seen, and nothing requires it to belong to the current outage — after an up-period in

@@ -29,6 +29,14 @@ trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 ok()  { echo "  ✅ $1"; PASS=$((PASS+1)); }
 bad() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+clear_workers() {
+  local f
+  for f in "$TMP/O/state"/worker-* "$TMP/O/state/.wt-census"; do
+    [ -e "$f" ] && mv "$f" "$TMP/worker.spent.$RANDOM" 2>/dev/null
+  done
+  return 0
+}
+
 
 [ -f "$ORCH" ] || { echo "FATAL: $ORCH not found"; exit 1; }
 # ⛔ THE HOST'S OWN TMUX MUST NOT LEAK INTO THIS SUITE'S CENSUS (agent-infra#2653 review round 12).
@@ -479,13 +487,6 @@ clear_needsfix() { mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.spent.
 # the `lanes-in-use` fixture says 9, and a leftover `worker-merge-4242` made the same assertion read
 # `review lanes=10/9`. Records are files, so move the ones this fixture's PR could own out of the way —
 # `mv`, never `rm` on a `$TMP/…` path (#709).
-clear_workers() {
-  local f
-  for f in "$TMP/O/state"/worker-* "$TMP/O/state/.wt-census"; do
-    [ -e "$f" ] && mv "$f" "$TMP/worker.spent.$RANDOM" 2>/dev/null
-  done
-  return 0
-}
 clear_workers
 # The shipped park_ctrl WRITES parked/parkreason into the shared `$TMP/O/state`, so each park assertion
 # starts from a clean slate: a leftover `parked-4242` from an earlier drive would make the next

@@ -765,7 +765,7 @@ WT_ABSENT_STALE_MIN=$(( 4 * CYCN ))
 [ "$WT_ABSENT_STALE_MIN" -ge $(( 2 * WT_ABSENT_CONFIRM )) ] || WT_ABSENT_STALE_MIN=$(( 2 * WT_ABSENT_CONFIRM ))
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree tree_err tfile absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
+  local now ttl dir cache hdr tree tree_err tfile absent_now absent_since absent_last _cont _mage _wl nrc names probe_ok raw="" tbl="" f name kind id st
   # ⛔ A FAILED OR BACKWARDS CLOCK MUST NOT FREEZE THE MEMO (review round 13 of #2653, P2). `|| echo 0`
   # is the idiom round 12 removed from the absent arm: with `now=0` (or after a backwards clock step)
   # `now - at` is NEGATIVE, which is `< ttl`, so a memo is served FOREVER instead of for 10 s — the
@@ -782,7 +782,7 @@ wt_table() {
         case "${hdr#\# at=}" in
           ''|*[!0-9]*) : ;;
           *) if [ -n "$now" ]; then
-               _mage=$(( now - ${hdr#\# at=} ))
+               _mage=$(( now - 10#${hdr#\# at=} ))
                [ "$_mage" -ge 0 ] && [ "$_mage" -lt "$ttl" ] && { sed '1d' "$cache"; return 0; }
              fi ;;
         esac ;;
@@ -884,8 +884,21 @@ wt_table() {
         # and refuse to open a window on an unusable clock: the record stays UNKNOWN (fail-closed).
         case "$absent_now" in ''|*[!0-9]*) absent_now="" ;; esac
         if [ -z "$absent_now" ]; then :; else
-        absent_since="$(cat "$dir/.wt-absent-since" 2>/dev/null || true)"
+        # ⛔ TWO VALUES, BECAUSE ONE COULD NOT TELL "A GAP" FROM "STILL ABSENT" (review round 14 of
+        # #2653, P2). The file used to hold only FIRST-SEEN. With a single value, a CONTINUOUS outage
+        # longer than `WT_ABSENT_STALE_MIN` looked like a gap: the stamp aged past the bound, the
+        # staleness rule re-opened the window, and the rows flipped `dead` → `unknown` for a full
+        # `WT_ABSENT_CONFIRM` before confirming again — so the release was a DUTY CYCLE (measured at the
+        # defaults: ~900s dead, ~60s unknown, repeating), i.e. the 26h stall reduced to one cycle in four
+        # rather than ended. Format: "<first_seen> <last_absent>". A legacy single-value file (an older
+        # harness) reads as first_seen with an empty last_absent → treated as a gap → first sample, which
+        # is the safe reading for a file this build did not write.
+        absent_since=""; absent_last=""
+        if [ -f "$dir/.wt-absent-since" ]; then
+          read -r absent_since absent_last < "$dir/.wt-absent-since" 2>/dev/null || true
+        fi
         case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
+        case "$absent_last"  in ''|*[!0-9]*) absent_last=""  ;; esac
         # ⛔ `08` PASSES THE DIGIT GUARD AND THEN ABORTS THE ARITHMETIC (review round 8 of #2653, P2):
         # `$(( … ))` reads a leading zero as OCTAL, `08` is not octal, the expansion errors and the
         # FUNCTION ABORTS before printing a table — an EMPTY census, which every consumer reads as "the
@@ -917,11 +930,14 @@ wt_table() {
         # `WT_ABSENT_STALE_MIN` on any real clock, so it is discarded → first sample → fail-closed, and
         # epoch-zero / NTP-step inputs are covered by the same rule. (No suite writes a `0` stamp: every
         # fixture writes `now - N`.)
-        case "$absent_since" in
+        # The continuity datum is `last_absent` when the file carries two values (this build), else
+        # `first_seen` (a legacy stamp). A FUTURE value, or one older than the bound, breaks continuity.
+        _cont="${absent_last:-$absent_since}"
+        case "$_cont" in
           '') : ;;
-          *)  if [ "$absent_since" -gt "$absent_now" ] \
-                 || [ $(( absent_now - absent_since )) -gt "$WT_ABSENT_STALE_MIN" ]; then
-                absent_since=""
+          *)  if [ "$_cont" -gt "$absent_now" ] \
+                 || [ $(( absent_now - _cont )) -gt "$WT_ABSENT_STALE_MIN" ]; then
+                absent_since=""; absent_last=""
               fi ;;
         esac
         if [ -z "$absent_since" ]; then
@@ -934,7 +950,7 @@ wt_table() {
           # log — the same hazard this file just removed bash's own per-read diagnostic for. Named once
           # per process; the state is still visible in stderr and `$LOG`.
           # A successful write RE-ARMS the warning (the next inability to confirm is a new fact).
-          { printf '%s\n' "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null \
+          { printf '%s %s\n' "$absent_now" "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null \
             && rm -f "${TMPDIR:-/tmp}/.wt-warned-absent-window.$$" 2>/dev/null \
             || { _wl="${TMPDIR:-/tmp}/.wt-warned-absent-window.$$"
                  # ⛔ THE LATCH IS A FILE, NOT A VARIABLE (review round 10 of #2653, P2): every consumer
@@ -943,7 +959,13 @@ wt_table() {
                  # warning fired per read, ~12/cycle, ~1 MB/day into the append-only log. `$$` is the
                  # parent's pid and is stable across those subshells, so this file latches.
                  [ -e "$_wl" ] || { : >"$_wl" 2>/dev/null || true; wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED); logged once per process"; }; }
-          absent_since="$absent_now"
+          absent_since="$absent_now"; absent_last="$absent_now"
+        else
+          # CONTINUOUS absence: refresh ONLY the continuity datum, so the window never ages past the
+          # staleness bound while the outage lasts — and keep `first_seen`, which is what the two-sample
+          # confirmation measures.
+          { printf '%s %s\n' "$absent_since" "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null || true
+          absent_last="$absent_now"
         fi
         # ONE comparison, always: an ALREADY-ELAPSED stamp confirms on THIS sample — that is how an
         # operator declares "this outage has lasted", and how the fixtures say it. ⛔ THE KNOB'S `0` DOES
