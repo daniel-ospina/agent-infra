@@ -380,6 +380,27 @@ jobs:
         # second command in the step above — sequencing would suppress one
         # verdict when the other fails (the same rule as every suite here).
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
+      - name: Dispatch-preflight suite (zero-dep)
+        # The complementary question to the successor preflight above: that tool
+        # asks "is a predecessor still ALIVE", this one asks "is there anything
+        # left to LAND". Measured 2026-10-18: 12 of 15 dispatched worktrees sat on
+        # a HEAD that origin/main already contained, and ALL 12 produced +0 commits
+        # — a whole lane spent discovering there was nothing to do. The suite is
+        # zero-dep and hermetic (temp git repos, a refs/remotes/origin/main base,
+        # no network), and it carries its own RED control: seven mutations of the
+        # shipped file (an unreadable diff conflated with an error, the diff taken
+        # only against the merge-base, the own-delta check dropped, dirty files
+        # ignored, `--untracked-files=normal` dropped, an unreadable worktree
+        # answering HAS-WORK, an unresolvable base answering HAS-WORK) must each
+        # turn their paired leg RED.
+        # Visible, not merge-blocking, for the same reason as its sibling above:
+        # `pipeline-compliance` is the repo's only required check.
+        run: python3.12 tools/fleet/dispatch_preflight.test.py
+      - name: Dispatch-preflight mutation evidence (zero-dep)
+        # Its own step, not a second command in the step above — sequencing would
+        # suppress one verdict when the other fails (the rule every suite here
+        # follows).
+        run: python3.12 tools/fleet/dispatch_preflight.test.py --red-control
       - name: fleet-health REAPER-table suite (#1862, zero-dep)
         # #1862 — the restored orphan reaper (`com.eldato.pi-reap-orphans`) is installed
         # unconditionally by install-launchd.sh, but `fleet-health.py`'s `reaper_section()` reads a
