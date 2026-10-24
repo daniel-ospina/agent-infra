@@ -1878,8 +1878,9 @@ out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 an unreadable goal count is NOT-MEASURED, never 0" \
    "$(qF 'STANDING=NOT-MEASURED' "$MDF" && nq 'open P0=0' "$MDF" && echo 0 || echo 1)"
-ck "§27 ...and the reason it could not be read is printed" \
-   "$(qF 'no total_count' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the QUEUE line states its one reason once, not twice" \
+   "$([ "$(printf '%s\n' "$MDF" | grep -F 'queue:' | grep -oF 'no total_count' | wc -l)" -eq 1 ] \
+      && echo 0 || echo 1)"
 # ⛔ MARKERS-HOLD IS REACHABLE WITH AN UNREAD QUEUE (the standing is drift-only), so its action may
 # not say "queue read". Reverting that branch left the suite green - the sentence is only wrong in the
 # state the standing rule deliberately allows.
@@ -1981,6 +1982,12 @@ out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a box at the pin with controller=STOPPED cannot hold the marker" \
    "$(qF 'STANDING=MARKERS-BROKEN' "$MDF" && qF 'controller=STOPPED' "$MDF" && echo 0 || echo 1)"
+# ⛔ AND THE DEPLOY TABLE MAY NOT DISAGREE WITH THE GOALS BLOCK. The arm's own drift test compared the
+# pin and the relation only, so it printed `current` for a box it would not start - one section below
+# a goals block calling the same box MARKERS-BROKEN for the same reason, and it made the "our last
+# activation did not verify" attribution unreachable for the failure it describes.
+ck "§27 ...and the DEPLOY TABLE does not call that box current" \
+   "$(qF 'deployed-but-NOT-activated' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and the action NAMES the box and its reason (not the old \`[current]\` wording)" \
    "$(qF 'boxes run this cycle' "$MDF" && qF 'cell-1 (controller=STOPPED)' "$MDF" && echo 0 || echo 1)"
 # ...and the MACHINE surface must agree with the report: a consumer that re-derives the marker from
@@ -2098,6 +2105,36 @@ print(0 if ok else 1)
 PY3
 )"
 
+# ⛔ A MIXED FLEET IS NOT AN UNMEASURED ONE. `compared` requires every box to answer, so one
+# unanswered box used to void the measured verdicts in the action ("Nothing here is a verdict on a box"
+# over a box just measured off-pin) and defer a real repair behind "repair that read first".
+write_no_landing; reset_o
+printf 'harness: %s [behind] source=pin\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
+  "${OTHER:0:12}" > "$FX/box.offpin2.txt"
+cat > "$TMP/box-offpin2.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.offpin2.txt"
+STUB
+cat > "$TMP/box-dead.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "harness: UNREADABLE"
+exit 2
+STUB
+chmod +x "$TMP/box-offpin2.sh" "$TMP/box-dead.sh"
+printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-offpin2.sh" "$TMP/box-dead.sh" \
+  > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a mixed fleet keeps its measured verdict AND names the box that did not answer" \
+   "$(qF '0/1 PROBED box(es) run this cycle' "$MDF" && qF 'cell-1 (relation=behind' "$MDF" \
+      && qF '1 box(es) gave no answer' "$MDF" && nq 'Nothing here is a verdict on a box' "$MDF" \
+      && echo 0 || echo 1)"
+# ...and the box that answered NOTHING is given its own reason, not an invented comparison ("a
+# different commit from this cycle's main" was appended to a probe that printed no `harness:` line).
+ck "§27 ...and the unanswered box is not given a COMPARISON as its reason" \
+   "$(nq 'cell-2 (a different commit' "$MDF" \
+      && echo 0 || echo 1)"
+
 # ⛔ A NON-UTF-8 LEDGER IS A READING TOO. `UnicodeDecodeError` is a `ValueError`, so it escaped every
 # `except OSError` in this file: traceback, exit 1, no report, previous cycle's file left on disk.
 write_no_landing; reset_o
@@ -2180,7 +2217,7 @@ out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a local probe with no pin is UNREADABLE, and that states no fraction" \
    "$(qF 'local=UNREADABLE' "$MDF" && nq 'on this cycle' "$MDF" \
-      && qF '1 box(es) did not answer' "$MDF" && echo 0 || echo 1)"
+      && qF 'the probe returned nothing' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and LOCAL ONLY is printed as a reading, whichever branch the action takes" \
    "$(qF 'LOCAL ONLY — the inventory is absent' "$MDF" && echo 0 || echo 1)"
 # ⛔ ONCE, AND NOT IN THE ACTION: appended per-action it appeared twice in the pre-fix shape, and
@@ -2202,7 +2239,7 @@ chmod +x "$TMP/box-unread.sh"
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a box that did not ANSWER states no fraction (1/2 is a claim about both)" \
-   "$(nq 'on this cycle' "$MDF" && qF 'box(es) did not answer' "$MDF" && echo 0 || echo 1)"
+   "$(nq 'on this cycle' "$MDF" && qF 'gave no answer' "$MDF" && echo 0 || echo 1)"
 rm -f "$O/state/boxes.tsv"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════

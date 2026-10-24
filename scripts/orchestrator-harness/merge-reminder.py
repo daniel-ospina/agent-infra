@@ -1094,6 +1094,19 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                     # process — say so rather than print a `current` that cannot be proven.
                     entry["verdict"] = (f"UNPROVEN harness={d['harness'][:12]} [current] "
                                         f"source=stamp — records what was SEEDED, not what is RUNNING")
+                elif d["controller"] != "RUNNING":
+                    # ⛔ DEPLOYED IS NOT ACTIVATED, AND THIS ARM'S OWN TABLE SAID "current" FOR A BOX
+                    # IT WOULD NOT START: the pin agreed, the controller was STOPPED, and the row read
+                    # as healthy one section below a goals block calling the same box
+                    # `MARKERS-BROKEN — controller=STOPPED`. Two readers of one box inside one report
+                    # is the #1872/#1714 defect, and it is also why the "our last activation did not
+                    # verify" attribution below was unreachable for the exact failure it describes (a
+                    # `stop -> apply -> start` whose apply succeeded and whose start did not).
+                    entry["verdict"] = (f"deployed-but-NOT-activated — harness {d['harness'][:12]} "
+                                        f"[current] is the pin; controller="
+                                        f"{d['controller'] or '<unread>'} is not RUNNING (this arm does "
+                                        f"not start it: it cannot tell an operator's stop from its own "
+                                        f"failed activation)")
                 else:
                     entry["verdict"] = "current"
                 results.append(entry)
@@ -1826,16 +1839,22 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
         # and whose `start` fails). Counting it as `MARKERS-HOLD` reported the fleet as autonomous in
         # the one state the deploy arm exists to repair, so `controller != RUNNING` is a reason too.
         reasons: list[str] = []
-        if d["relation"] != "current":
-            reasons.append(f"relation={d['relation'] or '?'}")
-        if not main_sha:
-            reasons.append("main=UNREADABLE (not compared)")
-        elif d["harness"][:12] != main_sha[:12]:
-            reasons.append("a different commit from this cycle's main")
-        if d.get("source") == "stamp":
-            reasons.append("source=stamp(seeded, not running)")
-        if d["controller"] != "RUNNING":
-            reasons.append(f"controller={d['controller'] or '<unread>'}")
+        if not d["readable"] or not d["harness"]:
+            # ⛔ NOTHING WAS COMPARED FOR A BOX THAT DID NOT ANSWER. Falling through appended "a different
+            # commit from this cycle's main" to a probe that printed no `harness:` line at all — an
+            # invented comparison, in the reason list the action quotes.
+            reasons.append("the probe did not answer")
+        else:
+            if d["relation"] != "current":
+                reasons.append(f"relation={d['relation'] or '?'}")
+            if not main_sha:
+                reasons.append("main=UNREADABLE (not compared)")
+            elif d["harness"][:12] != main_sha[:12]:
+                reasons.append("a different commit from this cycle's main")
+            if d.get("source") == "stamp":
+                reasons.append("source=stamp(seeded, not running)")
+            if d["controller"] != "RUNNING":
+                reasons.append(f"controller={d['controller'] or '<unread>'}")
         rows.append({"box": name, "harness": d["harness"][:12], "relation": d["relation"],
                      "source": d.get("source", ""), "controller": d["controller"],
                      "roles": d["roles"], "readable": bool(d["readable"]),
@@ -1939,7 +1958,7 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
             r.get("inventory") == "empty" for r in drift) else
         "no `state/boxes.tsv` and no `box-status.sh`" if any(
             r.get("inventory") == "noprobe" for r in drift) else
-        f"{sum(1 for r in drift if not r.get('readable'))} box(es) did not answer")
+        "the probe returned nothing")
     currents = [r for r in drift if r.get("on_pin")]
     boxes_bad = [r for r in drift if not r.get("on_pin")]
     # ⛔ THE STANDING IS DECIDED BY THE DRIFT ALONE. A queue count that did not come back is its OWN
@@ -1985,14 +2004,21 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
                      "the cells")
     for r in drift:
         if r.get("inventory") in PLACEHOLDER:
-            lines.append(f"  ⚠️ harness: {r.get('note') or 'the box inventory could not be read'} — no "
-                         f"box was probed this cycle")
+            # ⛔ SAY IT ONCE. The readings line above already carries the reason (`not compared — …`);
+            # repeating the same sentence two lines apart was the round-7 complaint in the other
+            # direction, and making the noprobe note a bare FACT put the identical string in both.
+            lines.append(f"  ⚠️ harness: {r.get('note') or 'the box inventory could not be read'}"
+                         if r.get("inventory") == "unread" else
+                         "  ⚠️ harness: no box was probed this cycle")
     for name, why in unreadable:
         lines.append(f"  ⚠️ {name}: {why}")
     if qo_why or qm_why:
         # ONE line, not one per failed count: two identical `⚠️ queue:` lines said the same thing
         # twice and read like two separate failures.
-        lines.append("  ⚠️ queue: " + "; ".join(w for w in (qo_why, qm_why) if w))
+        # ⛔ DEDUPED: both counts read the same answer, so both reasons are the SAME string (“the 8-call
+        # goal bound is spent this cycle”) — the line said it twice, which is what the ONE-line rule
+        # above was introduced to stop.
+        lines.append("  ⚠️ queue: " + "; ".join(dict.fromkeys(w for w in (qo_why, qm_why) if w)))
     if not (qo_why or qm_why) and qo.isdigit() and qm.isdigit() and int(qm) < int(qo):
         # NOT a standing flip: how many of those open PRs are stale or drafts is not read here, so
         # calling this "the queue is behind" as a verdict would be inventing a threshold. It is
@@ -2021,7 +2047,24 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         # ⛔ NO COMPARISON WAS MADE WITHOUT `origin/main`, SO NO COUNT MAY BE STATED. "0/N boxes run
         # this cycle's main" is a measured claim; with the ref unreadable it is an invented one, and it
         # is printed in the paragraph the owner acts on.
-        head = (f"**Goal 2 (harness autonomy):** the boxes could not be compared — {why_not_compared} "
+        # ⛔ A MIXED FLEET IS NOT AN UNMEASURED ONE. `compared` requires EVERY box to answer, so one
+        # unanswered box used to void the measured verdicts in the paragraph the owner acts on
+        # ("Nothing here is a verdict on a box" over a box that had just been measured off-pin) and to
+        # defer a real repair behind "repair that read first".
+        measured = [r for r in drift if r.get("readable") and r.get("inventory") not in PLACEHOLDER]
+        measured_bad = [r for r in measured if not r.get("on_pin")]
+        mixed = (not compared) and bool(main_sha) and bool(measured)
+        bad_names = ", ".join(f"{r['box']} ({'; '.join(r.get('reasons') or ['not verified'])})"
+                              for r in measured_bad) or "<none>"
+        head = (f"**Goal 2 (harness autonomy):** {len(currents)}/{len(measured)} PROBED box(es) run "
+                f"this cycle's main, deployed AND activated — NOT all: {bad_names}. "
+                # \u26d4 THE COUNT IS IN THE SENTENCE, SO THE REASON IS THE FACT AND NOT A SECOND COUNT.
+                # "1 box(es) did not answer (1 box(es) did not answer)" was the duplication this
+                # sentence shipped with for one round.
+                f"{len(drift) - len(measured)} box(es) gave no answer ({why_not_compared}), so nothing "
+                f"is stated about them. "
+                if mixed else
+                f"**Goal 2 (harness autonomy):** the boxes could not be compared — {why_not_compared} "
                 f"— so repair that read first. Nothing here is a verdict on a box, and these rows may "
                 f"ALSO be stopped or unreadable for their own reasons: {drift_names}. "
                 if not compared else
