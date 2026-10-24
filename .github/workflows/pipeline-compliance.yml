@@ -85,13 +85,21 @@ jobs:
     #
     # ⛔ WHY THE RESERVATION IS OPT-IN, AND WHY THE FALLBACK IS THE *DEFAULT*. `runs-on` has NO
     #   fallback/OR semantics in GitHub Actions: a label list is ANDed, and a job whose labels
-    #   match no ONLINE runner queues FOREVER. Making `[self-hosted, Linux, X64, required-check]`
+    #   match no ONLINE runner does not run at all — it sits `queued` until GitHub cancels it (the
+    #   self-hosted job-queue limit is 24 h: "A job can be in the queue for 24 hours before it is
+    #   automatically cancelled"). Making `[self-hosted, Linux, X64, required-check]`
     #   the unconditional default would therefore mean (a) the repo's only required check is
     #   unsatisfiable until an operator labels a runner — the "worse than today" failure — and
     #   (b) every consumer that reuses this file via `workflow_call` (the header keeps that path
-    #   open) would queue forever on a label it has never heard of. So the default IS the
+    #   open) would stall on a label it has never heard of. So the default IS the
     #   fallback: `ubuntu-latest`, i.e. exactly today's behaviour. The reservation is engaged by
     #   one variable, and releasing it is the same one command.
+    #
+    # ⛔ AND THE 24 h CANCEL IS NOT A SAFE PLACE TO WAIT. A `cancelled` check is in `NON_RED_CONC`
+    #   (scripts/admin-merge.sh), so an engaged-but-unlabelled reservation would end as a NON-RED
+    #   required check rather than a visible `queued` one — the rail's own fail-open class
+    #   (#2474). That is the second reason the fallback is the default, and why §9.3 sets a 24 h
+    #   release deadline instead of telling an operator to watch for `queued`.
     #
     # ⛔ WHY NOT A SECOND JOB OR A MATRIX ARM. Branch protection requires the context to be named
     #   EXACTLY `pipeline-compliance`. A matrix arm renames the context to

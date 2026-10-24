@@ -93,14 +93,38 @@ function parseJobs(file) {
     }
     const job = /^  ([A-Za-z0-9_-]+):\s*$/.exec(line);
     if (job) {
-      current = { block: [line], runsOn: null, timeout: null };
+      current = { block: [line], runsOn: null, runsOnSeq: null, timeout: null, uses: false };
       jobs.set(job[1], current);
       continue;
     }
     if (!current) continue;
     current.block.push(line);
-    const ro = /^    runs-on:\s*(.+?)\s*$/.exec(line);
-    if (ro) current.runsOn = ro[1];
+    // A single-line `runs-on: <value>`.
+    const roInline = /^    runs-on:\s*(\S.*?)\s*$/.exec(line);
+    if (roInline) {
+      current.runsOn = roInline[1];
+      current.runsOnSeq = null;
+      continue;
+    }
+    // A BLOCK-SEQUENCE `runs-on:` (value on the following `- ` lines). Without this arm such a job
+    // parsed as `runsOn === null` and was SKIPPED by the T2 sweep — i.e. a second job could join
+    // the reservation (or leave ubuntu-latest) and the gate would still exit 0. That is the exact
+    // mutation T2 exists to catch, so the shape is collected, never skipped.
+    if (/^    runs-on:\s*$/.test(line)) {
+      current.runsOn = "";
+      current.runsOnSeq = [];
+      continue;
+    }
+    if (current.runsOnSeq) {
+      const item = /^\s+- +(.+?)\s*$/.exec(line);
+      if (item) {
+        current.runsOnSeq.push(item[1]);
+        current.runsOn = current.runsOnSeq.join(",");
+        continue;
+      }
+      current.runsOnSeq = null; // the sequence ended; fall through to the other keys
+    }
+    if (/^    uses:/.test(line)) current.uses = true;
     const to = /^    timeout-minutes:\s*(.+?)\s*$/.exec(line);
     if (to) current.timeout = to[1];
   }
@@ -147,16 +171,24 @@ if (!runsOn.includes(FALLBACK)) {
 }
 
 // T1b — the reservation value the expression's variable engages is DECLARED in the job's block,
-// and it names the reserved label.
+// and it PARSES to a label list that names the reserved label. Asserting against the bare constant
+// would be true by construction; this reads the declaration back out of the file.
 const blockText = job.block.join("\n");
 if (!blockText.includes(RESERVATION)) {
   fail(
     `T1 the reservation value ${RESERVATION} is not declared in the ${JOB_ID} job block — the ` +
       `operator's engage command must be reproducible from the workflow that consumes it`
   );
-}
-if (!RESERVATION.includes(`"${RESERVED_LABEL}"`)) {
-  fail(`T1 the declared reservation value does not name '${RESERVED_LABEL}'`);
+} else {
+  let declared;
+  try {
+    declared = JSON.parse(RESERVATION);
+  } catch {
+    cannot(`the declared reservation value is not JSON: ${RESERVATION}`);
+  }
+  if (!Array.isArray(declared) || !declared.includes(RESERVED_LABEL)) {
+    fail(`T1 the declared reservation value does not name '${RESERVED_LABEL}': ${RESERVATION}`);
+  }
 }
 
 // T4 — timeout-minutes.
@@ -193,7 +225,16 @@ for (const abs of [...workflowFiles.map((f) => path.join(WORKFLOWS_DIR, f)), wfA
   const parsed = parseJobs(abs);
   for (const [id, j] of parsed.jobs) {
     const r = j.runsOn;
-    if (r === null || r === undefined) continue; // reusable-workflow job (`uses:`) — not runnable here
+    // A reusable-workflow job (`uses:` and no `runs-on:`) owns no routing here. Anything ELSE with
+    // no readable routing is `cannot-measure`, never a skip: an unparsed `runs-on` is precisely how
+    // a second job would hide from this sweep.
+    if (r === null || r === undefined) {
+      if (j.uses) continue;
+      cannot(
+        `${path.basename(abs)} job '${id}' has no readable 'runs-on' and no 'uses:' — refusing to ` +
+          `treat an unparsed routing as exempt (an unparsed arm is how a second reservation hides)`
+      );
+    }
     const isReserved = r.includes(RESERVED_LABEL) || r.includes(VAR_NAME) || /fromJSON\(/.test(r);
     if (isReserved) {
       reservedJobs++;
@@ -230,18 +271,22 @@ if (reservedJobs !== 1) {
 
 // ── T5: the reproducible operational call ────────────────────────────────────────────────────
 const doc = readOrDie(DOC_FILE, "docs file");
-const docLines = doc.split("\n").join("\n");
-if (!/PUT\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels/.test(docLines)) {
+// The reservation label must be set by a DOCUMENTED runner-labels invocation (`POST` adds a custom
+// label; `PUT` replaces the whole custom set). Either is acceptable, but the call must be there and
+// it must name the reserved label on the same invocation site — a doc that merely mentions runner
+// labels is folklore.
+const LABELS_CALL = /(?:POST|PUT)\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels/;
+if (!LABELS_CALL.test(doc)) {
   fail(
-    `T5 ${DOC_FILE} carries no 'PUT …/actions/runners/<id>/labels' call — the reservation must be ` +
-      `reproducible, not folklore`
+    `T5 ${DOC_FILE} carries no 'POST|PUT …/actions/runners/<id>/labels' call — the reservation must ` +
+      `be reproducible, not folklore`
   );
 }
-// The label must appear on the SAME invocation site: find the PUT call and require the reserved
-// label within its argument block (a following `labels[]=` line), not merely somewhere in the doc.
-const putMatch = /PUT\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels([\s\S]{0,400})/.exec(docLines);
-if (putMatch && !putMatch[1].includes(`labels[]=${RESERVED_LABEL}`)) {
-  fail(`T5 the documented PUT /labels call does not set 'labels[]=${RESERVED_LABEL}' near it`);
+const labelsMatch = /(?:POST|PUT)\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels([\s\S]{0,400})/.exec(
+  doc
+);
+if (labelsMatch && !labelsMatch[1].includes(`labels[]=${RESERVED_LABEL}`)) {
+  fail(`T5 the documented runner-labels call does not set 'labels[]=${RESERVED_LABEL}' near it`);
 }
 if (!doc.includes(RESERVATION)) {
   fail(

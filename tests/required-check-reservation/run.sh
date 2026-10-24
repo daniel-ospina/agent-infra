@@ -16,7 +16,17 @@
 #   4. MUTANT: `timeout-minutes` is deleted                               → must FAIL (T4).
 #   5. MUTANT: the documented PUT /labels call is broken                  → must FAIL (T5).
 #   6. MUTANT: the doc's reservation value disagrees with the workflow    → must FAIL (T5).
-#   7. UNREADABLE workflow                                                → rc 2, never a pass.
+#   7. MUTANT: a second job hidden in a BLOCK-SEQUENCE `runs-on:`         → must FAIL (T2).
+#      A multi-line `runs-on:` parses to null in a naive reader, and a null routing looks exactly
+#      like a reusable-workflow (`uses:`) job unless it is handled — so this arm exists because its
+#      absence was how a second reservation could hide from T2 (found in review, reproduced).
+#   8. UNREADABLE workflow                                                → rc 2, never a pass.
+#
+# ON T2's STRICTNESS (deliberate): T2 pins EVERY other job in the tree to exactly `ubuntu-latest`,
+# not merely "must not join the reservation". That is intentional — the reservation's value is that
+# the advisory pool shrinks by exactly the reserved slots, so a PR that re-routes an advisory job
+# changes that arithmetic while looking unrelated. A future PR that legitimately needs a different
+# runner updates this suite in the same PR: the change is then visible in review, not silent.
 #
 # NOTES ON STYLE (same lessons as tests/ci-lane-parity/run.sh):
 #   * "does this output contain X" is `grep -q 'X' <<<"$OUT"`, never `printf … | grep -q` — under
@@ -121,7 +131,28 @@ else
 fi
 
 # ── 7. unreadable workflow → could-not-measure, never a pass ──────────────────────────────────
-run_expect 2 "7 UNREADABLE workflow exits 2 (never a vacuous pass)" "$TMP/absent.yml" "$DOC"
+node -e '
+  const fs = require("fs");
+  const src = fs.readFileSync(process.argv[1], "utf8");
+  const add = [
+    "",
+    "  sneaky-second-job:",
+    "    runs-on:",
+    "      - self-hosted",
+    "      - Linux",
+    "      - X64",
+    "      - required-check",
+    "    steps:",
+    "      - run: echo hi",
+    "",
+  ].join("\n");
+  fs.writeFileSync(process.argv[2], src + add);
+' "$WF" "$TMP/wf-blockseq.yml"
+
+# 7 — a second job whose `runs-on:` is a BLOCK SEQUENCE (not a single line).
+run_expect 1 "7 MUTANT a block-sequence second reservation job is REFUSED" "$TMP/wf-blockseq.yml" "$DOC"
+
+run_expect 2 "8 UNREADABLE workflow exits 2 (never a vacuous pass)" "$TMP/absent.yml" "$DOC"
 
 echo
 if [ "$fails" -ne 0 ]; then
