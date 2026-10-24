@@ -356,17 +356,34 @@ _beat_repo_evidence() {
   /usr/bin/python3 -c 'import plistlib,sys;e=(plistlib.load(open(sys.argv[1],"rb")).get("EnvironmentVariables") or {});print("\n".join(["%s=%s"%(k,(e.get(k) or "").strip()) for k in ("OR","REPO") if (e.get(k) or "").strip()]))' "$plist" 2>/dev/null || return 0
 }
 
-# The wiring the child depends on, split from the reader so each is testable on its own: fill OR and
-# REPO from the box's declaration ONLY when they are not already set (an operator pin, or a
-# supervisor-launched cell that already exported them, still wins).
+# The wiring the child depends on, split from the reader so each is testable on its own.
+#
+# ⛔ THE PLIST IS ONE DECLARATION, SO IT IS FILLED AS ONE (review cycle 4, P2). Filling OR and REPO
+# INDEPENDENTLY completed a half-pin from the box's declaration: an operator who re-pointed the
+# drain with `OR=other/repo` still received the plist's `REPO` — a checkout of a DIFFERENT repo — and
+# `resolve_repo()` then refused with "the launcher named two different repos" on every pass, for
+# ever, while the operator believed their pin had taken effect. That is the "armed but dispatching
+# nothing" failure this whole block exists to prevent, one input shape over. So:
+#   * nothing set        -> take both halves from the plist (it is one record of one repo);
+#   * OR set, REPO unset -> take the plist's REPO only when the plist agrees on the SLUG (a
+#                          re-point to another repo must not inherit a foreign checkout); with no
+#                          agreement the pass grades that repo's queue read-only, which is the
+#                          documented behaviour of an `OR`-only pin;
+#   * REPO set, OR unset -> leave OR alone: rank 3 reads that checkout's own `origin` and PROVES
+#                          the slug, which is strictly better evidence than an invented OR.
 _beat_pin_repo_evidence() {
-  if [ -z "${OR:-}" ] || [ -z "${REPO:-}" ]; then
-    local _ev _or _repo
-    _ev="$(_beat_repo_evidence "$HOME" 2>/dev/null || true)"
-    _or="$(printf '%s\n' "$_ev" | sed -n 's/^OR=//p' | head -1)"
-    _repo="$(printf '%s\n' "$_ev" | sed -n 's/^REPO=//p' | head -1)"
-    if [ -z "${OR:-}" ] && [ -n "$_or" ]; then export OR="$_or"; fi
-    if [ -z "${REPO:-}" ] && [ -n "$_repo" ]; then export REPO="$_repo"; fi
+  local _ev _pl_or _pl_repo
+  if [ -n "${OR:-}" ] && [ -n "${REPO:-}" ]; then return 0; fi
+  _ev="$(_beat_repo_evidence "$HOME" 2>/dev/null || true)"
+  [ -n "$_ev" ] || return 0
+  _pl_or="$(printf '%s\n' "$_ev" | sed -n 's/^OR=//p' | head -1)"
+  _pl_repo="$(printf '%s\n' "$_ev" | sed -n 's/^REPO=//p' | head -1)"
+  if [ -z "${OR:-}" ] && [ -z "${REPO:-}" ]; then
+    if [ -n "$_pl_or" ]; then export OR="$_pl_or"; fi
+    if [ -n "$_pl_repo" ]; then export REPO="$_pl_repo"; fi
+  elif [ -z "${REPO:-}" ] && [ -n "$_pl_or" ] && [ "$_pl_or" = "${OR:-}" ]; then
+    # the operator pinned the SAME repo the box declares -- its checkout is still that repo's.
+    if [ -n "$_pl_repo" ]; then export REPO="$_pl_repo"; fi
   fi
 }
 _beat_pin_repo_evidence

@@ -2106,6 +2106,18 @@ reporting `budget fix=0` for hours), and `_state_file()` is its ONE naming autho
 deliberately no default set: `--all-repos` with no `PR_DOCTOR_REPOS` refuses, because a filesystem
 scan would answer with whatever checkouts happen to exist, which is a default by another name.
 
+Two repo slugs may also collide on the tag that names their state: `acme/tools-api` and
+`acme-tools/api` both derive `acme-tools-api`, which would make one repo's cooldown rows decide
+the other's budget slots — a set with a colliding tag is refused before anything is read, and
+`repo_tag()` is the one spelling both the register name and that guard agree on.
+
+⚠️ **Declared residual — the dispatch ceiling is per REPO, not per pass.** `capacity()` and
+`pass_budgets()` are computed from the state of the repo being graded, so a `K`-repo set may place up
+to `K × (MAX_FIX + MAX_REVIEW)` in one invocation, and `--max N` means `N` per repo. It is bounded by
+finite `K` and by `spawn-gate.sh`'s own load and disk gates (every spawn still passes through
+`nonblocking-dispatch.sh` → `run_agent`), and one pass per repo is **#2281**'s subject, not this
+mode's. Said here because this section is where the next reader of the mode looks.
+
 ### WHICH CONTRACT A PASS JUDGES BY — resolved, or refused (agent-infra#2518)
 
 Resolving the repo is not the whole decision: `objective.py` also holds the **contract** a PR is

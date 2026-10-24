@@ -2643,8 +2643,15 @@ def test_the_beat_EXPORTS_the_repo_the_pinned_pass_will_grade(tmp_path):
 
     assert drive() == ["OR=daniel-ospina/agent-infra", "REPO=/co/ai"], (
         "the beat exported no repo evidence for the detached pass — the pinned launch would refuse")
-    # ⛔ AN OPERATOR PIN WINS: this is a FILL, not an override (#2235 is the other direction).
-    assert drive(OR="acme/pinned") == ["OR=acme/pinned", "REPO=/co/ai"], drive(OR="acme/pinned")
+    # ⛔ THE PLIST IS FILLED AS ONE DECLARATION (review cycle 4, P2). Filling REPO from the plist
+    # beside an operator's `OR` for a DIFFERENT repo hands `resolve_repo()` two disagreeing answers
+    # ("the launcher named two different repos") and the pass refuses for ever — while the operator
+    # believes the pin took effect. A re-point keeps its own rank and inherits NO foreign checkout.
+    assert drive(OR="acme/pinned") == ["OR=acme/pinned", "REPO="], drive(OR="acme/pinned")
+    # The same repo as the plist declares IS the same repo: its checkout is still evidence.
+    assert drive(OR="daniel-ospina/agent-infra") == ["OR=daniel-ospina/agent-infra", "REPO=/co/ai"]
+    # A REPO-only pin is left alone too: rank 3 proves the slug from that checkout's own origin.
+    assert drive(REPO="/only/co") == ["OR=", "REPO=/only/co"], drive(REPO="/only/co")
     # AND NOTHING IS INVENTED when the box declares nothing: the pass then refuses LOUDLY, naming
     # every source, which is the whole design — a default here would grade a repo nobody named.
     (home / "Library" / "LaunchAgents" / "com.eldato.orchestrator-loop.plist").unlink()
