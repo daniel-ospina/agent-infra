@@ -217,8 +217,14 @@ acquire_lock() {
         printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
         LOCK_HELD=1; return 0
     fi
-    owner="$(sed -n 's/^pid=//p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
-    started="$(sed -n 's/^started=//p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
+    # ⛔ THE TOKEN IS ONE LINE: `pid=<n> started=<epoch>`. Parsing `s/^pid=//` captures the whole
+    # tail (`"1234 started=5678"`), which `num` rejects — so the live-owner check never ran, the
+    # tokenless arm (anchored `^started=`) never matched either, and EVERY existing lock was declared
+    # stale and DELETED WHILE ITS OWNER WAS LIVE. That removed the only exclusion between two
+    # concurrent sweeps of one root: both classify the same directory, both remove it, and the loser
+    # reports a removal failure for something already gone. Capture the FIELDS, not the tail.
+    owner="$(sed -n 's/^.*pid=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
+    started="$(sed -n 's/.*started=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     if num "$owner" && kill -0 "$owner" 2>/dev/null; then
         say "SKIP reason=lock-held pid=$owner"
         return 3
@@ -247,7 +253,7 @@ trap release_lock EXIT
 # refusal: the one case this arm exists for is "the pin was there and I could not read it".
 PIN_PATHS=""; PIN_SHAS=""
 load_pin() {
-    local f="" cand
+    local f="" cand _pc _pr _pcan
     if [ -n "${REAP_AW_STAMP:-}" ]; then
         f="$REAP_AW_STAMP"
         [ -r "$f" ] || { say "SKIP reason=stamp-unreadable path=$f"; return 3; }
@@ -258,7 +264,27 @@ load_pin() {
         done
     fi
     [ -n "$f" ] && [ -f "$f" ] || return 0
-    PIN_PATHS="$(sed -n 's/.*"\([A-Za-z]*\)": *"\(\/[^"]*\)".*/\2/p' "$f" 2>/dev/null)"
+    # ⛔ THE KEY CLASS IS `[A-Za-z0-9_]*`, not `[A-Za-z]*`: a stamp key with an underscore or a digit
+    # (`harness_alias`, `worker2`) did not match at all, so its path was silently absent from the pin
+    # and the tree it named was reapable.
+    PIN_PATHS="$(sed -n 's/.*"\([A-Za-z0-9_]*\)": *"\(\/[^"]*\)".*/\2/p' "$f" 2>/dev/null)"
+    # ⛔ CANONICALISE THE PINS, KEEPING THE RAW SPELLING. Candidates are compared by their PHYSICAL
+    # path, so a stamp that names its tree through a symlink never matched the tree it names: on macOS
+    # (`/tmp` -> `/private/tmp`) the default `--root /tmp` makes every candidate `/private/tmp/…`,
+    # and the path arm of the pin was dead BY CONSTRUCTION there. Both spellings are kept, so the pin
+    # protects the tree however the stamp and the filesystem spell it.
+    if [ -n "$PIN_PATHS" ]; then
+        _pc=""
+        while IFS= read -r _pr; do
+            [ -n "$_pr" ] || continue
+            _pc="${_pc}${_pc:+
+}$_pr"
+            _pcan="$(lp_canon "$_pr")" || _pcan=""
+            [ -n "$_pcan" ] && [ "$_pcan" != "$_pr" ] && _pc="${_pc}${_pc:+
+}$_pcan"
+        done <<<"$PIN_PATHS"
+        PIN_PATHS="$_pc"
+    fi
     PIN_SHAS="$(sed -n 's/.*"commit": *"\([0-9a-f]\{7,40\}\)".*/\1/p' "$f" 2>/dev/null)"
     [ -n "$PIN_PATHS$PIN_SHAS" ] || { say "SKIP reason=stamp-unparseable path=$f"; return 3; }
     return 0
