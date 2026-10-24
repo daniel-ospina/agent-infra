@@ -2074,8 +2074,39 @@ ck "§27 ...and nothing was probed, so the standing is UNMEASURED (not MARKERS-B
 ck "§27 ...and --json explains WHY the row is a placeholder (note, not empty reasons)" \
    "$(run_sut --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["drift"][0]; print(0 if r["inventory"]=="unread" and "line is not" in r["note"] else 1)' 2>/dev/null \
       || echo 1)"
-ck "§27 ...and the row carries the short state token (boxes.tsv=UNREADABLE)" \
-   "$(qF 'boxes.tsv=UNREADABLE' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the row carries the short state token, NOT the sentence" \
+   "$(qF 'boxes.tsv=UNREADABLE' "$MDF" && nq 'boxes.tsv=UNREADABLE boxes.tsv' "$MDF" && echo 0 || echo 1)"
+
+# ⛔ THE THIRD PLACEHOLDER STATE. `noprobe` needs a missing `boxes.tsv` AND a missing `box-status.sh`
+# beside the script - unreachable from the shell path here (the probe ships with it), so it is driven
+# through `goal_progress` directly. Its reason is a FACT, not a sentence: it is embedded in two
+# templates that already say "not compared —" and "no box was probed (".
+ck "\u00a727 a NO-PROBE inventory names the fact once (no nested 'no box could be probed (…)')" \
+   "$(python3 - "$SUT" <<'PY3'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+row = {"box": "<inventory>", "harness": "", "relation": "", "readable": False, "on_pin": False,
+       "reasons": [], "inventory": "noprobe",
+       "note": "no `state/boxes.tsv` and no `box-status.sh` - nothing could be probed"}
+b = m.Budget("gh"); b.search_calls = m.GOAL_SEARCH_BUDGET
+lines, actions = m.goal_progress([row], b, "o/r", main_sha="a" * 12)
+txt = "\n".join(lines + actions)
+ok = ("boxes.tsv=NO-PROBE" in txt and "no box could be probed (" not in txt
+      and "STANDING=NOT-MEASURED" in txt and "on this cycle" not in txt)
+print(0 if ok else 1)
+PY3
+)"
+
+# ⛔ A NON-UTF-8 LEDGER IS A READING TOO. `UnicodeDecodeError` is a `ValueError`, so it escaped every
+# `except OSError` in this file: traceback, exit 1, no report, previous cycle's file left on disk.
+write_no_landing; reset_o
+printf '42 deadbeef 1 clean\n' > "$O/state/merge-reminder.attempts"
+printf '42 \xff\xfe 1 clean\n' >> "$O/state/merge-reminder.attempts"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "\u00a727 a non-UTF-8 ATTEMPTS ledger still produces a report (rc=0)" \
+   "$([ "$rc" -eq 0 ] && qF '**cycle:** ran' "$MDF" && echo 0 || echo 1)"
 
 # ⛔ A NON-UTF-8 INVENTORY IS AN UNREADABLE INVENTORY. A decode error is a `ValueError`, not an
 # `OSError`, so it used to escape every handler: traceback, exit 1, NO report written — and the
@@ -2095,7 +2126,8 @@ write_no_landing; reset_o
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 an EMPTY inventory says it lists no boxes (not 'absent', and no fraction)" \
-   "$(qF 'the inventory exists and lists NO boxes' "$MDF" && nq 'on this cycle' "$MDF" \
+   "$(qF 'the inventory exists and lists NO boxes' "$MDF" && qF 'boxes.tsv=NO-ROWS' "$MDF" \
+      && nq 'on this cycle' "$MDF" \
       && nq 'no \`state/boxes.tsv\`' "$MDF" && qF 'STANDING=NOT-MEASURED' "$MDF" && echo 0 || echo 1)"
 
 # ⛔ AN ABSENT INVENTORY IS NOT A ONE-BOX FLEET. goal 2 is "the local box AND all three cmux cells";
@@ -2125,7 +2157,13 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 row = {"box": "local", "harness": "a" * 12, "relation": "current", "source": "pin",
        "controller": "RUNNING(pid 1)", "roles": "idle", "readable": True, "on_pin": True,
        "reasons": [], "inventory": "absent", "note": ""}
-lines, actions = m.goal_progress([row], m.Budget("gh"), "o/r", main_sha="a" * 12)
+b = m.Budget("gh")
+# ⛔ THE BOUND IS SPENT, SO NOTHING IS SPAWNED: `Budget("gh")` resolves to the AMBIENT gh, and
+# `goal_progress` would make 7 authenticated search calls against the live API inside a suite whose
+# header promises "no network, no real gh" - 4.5 s per run, a 30 s hang per call on a bad network, and
+# goal-1 numbers taken from live tortoise data that no assertion reads.
+b.search_calls = m.GOAL_SEARCH_BUDGET
+lines, actions = m.goal_progress([row], b, "o/r", main_sha="a" * 12)
 txt = "\n".join(lines + actions)
 ok = ("STANDING=MARKERS-HOLD" in txt and "(1/1 on this cycle's main)" in txt
       and "LOCAL ONLY" in txt and "not compared" not in txt)
@@ -2145,6 +2183,10 @@ ck "§27 a local probe with no pin is UNREADABLE, and that states no fraction" \
       && qF '1 box(es) did not answer' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and LOCAL ONLY is printed as a reading, whichever branch the action takes" \
    "$(qF 'LOCAL ONLY — the inventory is absent' "$MDF" && echo 0 || echo 1)"
+# ⛔ ONCE, AND NOT IN THE ACTION: appended per-action it appeared twice in the pre-fix shape, and
+# a presence check cannot tell one from two.
+ck "§27 ...exactly ONCE per report (one readings line, never appended to an action)" \
+   "$([ "$(printf '%s\n' "$MDF" | grep -oF 'LOCAL ONLY' | wc -l)" -eq 1 ] && echo 0 || echo 1)"
 
 # ⛔ A BOX THAT DID NOT ANSWER IS NOT A BOX THAT DRIFTED. `0/1 on this cycle's main` asserts a version
 # for a box whose version was never read, and then orders it deployed.

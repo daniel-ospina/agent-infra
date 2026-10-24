@@ -195,6 +195,19 @@ CLEAN_VERDICTS = {"clean", "clean-micro", "clean-low"}
 GO, WAIT, REFUSE, UNREADABLE = "GO", "WAIT", "REFUSE", "UNREADABLE"
 
 
+def read_artifact(p: Path) -> str:
+    """Read a state file as text, surviving bytes that are not UTF-8.
+
+    ⛔ `UnicodeDecodeError` IS A `ValueError`, NOT AN `OSError`. Every `read_text()` in this file was
+    guarded with `except OSError`, so a non-UTF-8 ledger or lock file escaped `landing_cycle`'s
+    per-candidate handler, `main`'s `except (Skipped, OSError)` and `__main__`'s `except Skipped`:
+    traceback, exit 1, NO report written, and the PREVIOUS cycle's MERGE-REMINDER.md left on disk —
+    a silent stop for as long as the bytes stayed malformed. `errors="replace"` turns that into an
+    unreadable READING, which every caller already handles by name.
+    """
+    return p.read_text(errors="replace")
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -616,8 +629,8 @@ def claim_state(o: Path, repo_path: Path, pr: int, head: str) -> tuple[str, str]
     stale_note = ""
     if lock.exists():
         try:
-            pid = lock.read_text().strip()
-        except OSError:
+            pid = read_artifact(lock).strip()
+        except (OSError, ValueError):
             pid = "?"
         if not _pid_alive(pid):
             stale_note = f"stale-local-lock=<{lock}> pid={pid} dead"
@@ -719,8 +732,8 @@ def rail_state(o: Path, pr: int, ps_rows) -> tuple[str, str]:
     lock = o / "state" / f"mergeclaim-{pr}.lock"
     if lock.exists():
         try:
-            pid = lock.read_text().strip()
-        except OSError:
+            pid = read_artifact(lock).strip()
+        except (OSError, ValueError):
             pid = ""
         if pid and _pid_alive(pid):
             return f"running pid={pid}", f"rail=running pid={pid} (the landing lock {lock} is held by a LIVING pid)"
@@ -739,8 +752,8 @@ def rail_state(o: Path, pr: int, ps_rows) -> tuple[str, str]:
 def last_attempt(o: Path, pr: int, head: str) -> int:
     p = o / "state" / ATTEMPTS
     try:
-        text = p.read_text()
-    except OSError:
+        text = read_artifact(p)
+    except (OSError, ValueError):
         return 0
     found = 0
     for line in text.splitlines():
@@ -760,7 +773,7 @@ def record_attempt(o: Path, pr: int, head: str, verdict: str) -> None:
         with p.open("a") as fh:
             fh.write(f"{pr} {head[:40]} {int(time.time())} {verdict}\n")
         # Bounded history: the file exists to suppress a blind retry, not to become a disk leak.
-        lines = p.read_text().splitlines()[-400:]
+        lines = read_artifact(p).splitlines()[-400:]
         tmp = p.with_suffix(f".tmp.{os.getpid()}")
         tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
         os.replace(tmp, p)
@@ -976,8 +989,8 @@ def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int]:
     """
     p = o / "state" / DEPLOYS
     try:
-        text = p.read_text()
-    except OSError:
+        text = read_artifact(p)
+    except (OSError, ValueError):
         return 0, 0
     n, last = 0, 0
     to12 = to[:12]
@@ -1008,7 +1021,7 @@ def record_deploy(o: Path, box: str, frm: str, to: str, verdict: str) -> bool:
         with p.open("a") as fh:
             fh.write(f"{box}\t{frm[:12]}\t{to[:12]}\t{int(time.time())}\t"
                      f"{' '.join(verdict.split())}\n")
-        lines = p.read_text().splitlines()[-400:]
+        lines = read_artifact(p).splitlines()[-400:]
         tmp = p.with_suffix(f".tmp.{os.getpid()}")
         tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
         os.replace(tmp, p)
@@ -1389,8 +1402,8 @@ def _take_pid_lock(path: Path) -> tuple[bool, str]:
         return True, f"reaping (no usable pid, {age:.0f}s old)"
 
     try:
-        pid = path.read_text().strip()
-    except OSError:
+        pid = read_artifact(path).strip()
+    except (OSError, ValueError):
         pid = "?"
     ok, why = _reapable(pid)
     if not ok:
@@ -1442,8 +1455,8 @@ def _take_pid_lock(path: Path) -> tuple[bool, str]:
         os.write(rfd, f"{os.getpid()} {int(time.time())}".encode())
         os.close(rfd)
         try:
-            pid2 = path.read_text().strip()
-        except OSError:
+            pid2 = read_artifact(path).strip()
+        except (OSError, ValueError):
             pid2 = pid
         # The SAME window can open again between our first read and this one: the pid is re-read UNDER
         # the mutex precisely because a creator may have replaced the file — so the SAME rule decides.
@@ -1475,8 +1488,8 @@ def any_rail_live(o: Path, ps_rows) -> str:
     """
     for lock in sorted((o / "state").glob("mergeclaim-*.lock")):
         try:
-            pid = lock.read_text().strip()
-        except OSError:
+            pid = read_artifact(lock).strip()
+        except (OSError, ValueError):
             continue
         if pid and _pid_alive(pid):
             return f"{lock.name} pid={pid}"
@@ -1924,7 +1937,7 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         "the box inventory could not be read" if any(r.get("inventory") == "unread" for r in drift) else
         "the inventory exists and lists NO boxes" if any(
             r.get("inventory") == "empty" for r in drift) else
-        "no box could be probed (no inventory and no `box-status.sh`)" if any(
+        "no `state/boxes.tsv` and no `box-status.sh`" if any(
             r.get("inventory") == "noprobe" for r in drift) else
         f"{sum(1 for r in drift if not r.get('readable'))} box(es) did not answer")
     currents = [r for r in drift if r.get("on_pin")]
