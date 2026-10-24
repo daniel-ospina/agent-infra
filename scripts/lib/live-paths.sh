@@ -108,7 +108,14 @@ lp_census() { # <dir>
                                  # the ps arm emitted the value and DID match. The two arms disagreeing
                                  # about what a holder named is the one thing this library forbids,
                                  # and Linux was the arm that failed open.
-                                 *)  case "${_tok#*=}" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "${_tok#*=}" ;; esac ;;
+                                 # ⛔ BOTH SPELLINGS. Emitting only the value dropped the whole token when
+                                 # the `=` sits INSIDE a path component (`wt-eq/f=1.txt` → the value has no
+                                 # `/`), so a live holder naming the tree relatively through such a path
+                                 # became invisible and the tree was reaped — a regression this very fix
+                                 # introduced. The value covers `K=v/path`; the whole token covers
+                                 # `path/with=sign`; each is emitted only when path-like.
+                                 *)  case "${_tok#*=}" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "${_tok#*=}" ;; esac
+                                     case "$_tok" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "$_tok" ;; esac ;;
                              esac ;;
                         # ⛔ PATH-LIKE ONLY. Emitting every token exploded the table 100x on a real box
                         # (32,686 rows over 127 pids, measured) because a bare word (`sleep`, `--flag`,
@@ -150,7 +157,14 @@ lp_census() { # <dir>
                         # and leaving it out made the two arms disagree about what a holder "named"
                         n = split($i, kv, "=")
                         if (n == 2 && kv[2] ~ /^\//) { printf "arg\t%s\t%s\n", pid, kv[2]; continue }
-                        if (n == 2 && kv[2] !~ /^\//) { if (kv[2] ~ /\//) printf "relarg\t%s\t%s\n", pid, kv[2]; continue }
+                        # ⛔ BOTH SPELLINGS for n >= 2 as well: emitting only the value made the two arms
+                        # disagree again for `A=b=c/d` (the /proc arm emits the value, this arm emitted the
+                        # whole token), which is the invariant this file exists to hold.
+                        if (n >= 2) {
+                            if (kv[2] ~ /\//) printf "relarg\t%s\t%s\n", pid, kv[2]
+                            if ($i ~ /\//) printf "relarg\t%s\t%s\n", pid, $i
+                            continue
+                        }
                         if ($i ~ /\//) printf "relarg\t%s\t%s\n", pid, $i
                       } }'
             fi
@@ -220,7 +234,7 @@ lp_path_held() { # <census> <canonical-path>
 # was pointed at, so argv is a different witness from cwd.
 LP_NAME_WHY=""
 lp_path_named() { # <census> <canonical-path>
-    local f="$1" path="$2" kind pid p _pp base _cand _relpid _rpid _rtok _rcwd _rcomp _rcanon _rfull
+    local f="$1" path="$2" kind pid p _pp base _cand _relpid _rpid _rfork _rtok _rcwd _rcomp _rcanon _rfull
     base="${path##*/}"
     LP_NAME_WHY=""
     [ -n "$path" ] && [ -r "$f" ] || return 1
@@ -305,19 +319,26 @@ lp_path_named() { # <census> <canonical-path>
         }
         END { exit 1 }' "$f" 2>/dev/null)"
     if [ -z "$_relpid" ]; then
-        # A bounded second chance for a SYMLINKED relative prefix: only rows whose first path component
-        # exists under the holder's cwd (a symlink or a directory), capped so a table of thousands of
-        # args cannot turn this into thousands of forks — and every candidate pass pays it only when the
-        # lexical pass already found nothing.
-        _relpid="$(awk -F'\t' '$1 == "relarg" && $3 ~ /\// { print $2 "\t" $3 }' "$f" 2>/dev/null | head -200 | while IFS="$(printf '\t')" read -r _rpid _rtok; do
+        # A second chance for a SYMLINKED relative prefix (`rel-link/f.txt`, `rel-link` → the tree).
+        # ⛔ NO ROW CAP BEFORE THE CHEAP FILTER: capping the raw rows at 200 meant one chatty pid (a test
+        # runner with 200 paths) starved every later holder, and the arm failed open exactly where it
+        # was added to fail closed. Every row now gets ONE builtin `-L` stat (cheap), and only the rows
+        # that are actually symlinks spend a fork — capped at 50 so a pathological box cannot turn this
+        # into thousands of subprocesses.
+        _rfork=0
+        _relpid="$(awk -F'\t' '$1 == "relarg" && $3 ~ /\// { print $2 "\t" $3 }' "$f" 2>/dev/null | while IFS="$(printf '\t')" read -r _rpid _rtok; do
             [ -n "${_rpid:-}" ] || continue
             _rcwd="$(awk -F'\t' -v p="$_rpid" '$1=="cwd" && $2==p {print $3; exit}' "$f" 2>/dev/null)"
             [ -n "$_rcwd" ] || continue
             _rcomp="${_rtok%%/*}"
+            case "$_rtok" in "$_rcwd"/*) continue ;; esac
             [ -L "$_rcwd/$_rcomp" ] || [ -d "$_rcwd/$_rcomp" ] || continue
-            _rcanon="$(lp_canon "$_rcwd/$_rcomp")" || continue
+            _rcanon="$(lp_canon "$_rcwd/$_rcomp" 2>/dev/null)" || continue
+            [ -n "$_rcanon" ] || continue
             _rfull="${_rcanon%/}/${_rtok#*/}"
             if _lp_rel "$_rfull" "$path"; then printf '%s' "$_rpid"; exit 0; fi
+            _rfork=$((_rfork + 1))
+            [ "$_rfork" -ge 50 ] && exit 1
         done)"
     fi
     if [ -n "$_relpid" ]; then
