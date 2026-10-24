@@ -1468,7 +1468,7 @@ echo "── Q) an ABSENT session owner is a READING: nothing is listening, so n
 cat > "$TMP/q1.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
-export CMUX_TREE_ABSENT=1
+export CMUX_TREE_ABSENT=1 WT_ABSENT_CONFIRM=0
 printf 'kind=terminal\nid=term_stale1\nworkspace=ws_stale1\n' > "$WT_DIR/worker-merge-91"
 printf 'kind=terminal\nid=term_stale2\nworkspace=ws_stale2\n' > "$WT_DIR/worker-fix-92"
 . "$1"
@@ -1518,7 +1518,7 @@ for _msg in 'cannot connect to session socket /tmp/x.sock: No such file or direc
   cat > "$TMP/q3.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
-export CMUX_TREE_ABSENT=1 CMUX_TREE_ABSENT_MSG="$4"
+export CMUX_TREE_ABSENT=1 CMUX_TREE_ABSENT_MSG="$4" WT_ABSENT_CONFIRM=0
 printf 'kind=terminal
 id=term_live5
 workspace=ws_live5
@@ -1531,6 +1531,46 @@ SH
   case "$out" in *"alive=yes"*"count=1"*) rc=0 ;; *) rc=1 ;; esac
   ck "the WRAPPER with a different errno is still UNKNOWN: ${_msg##*: }" $rc
 done
+
+# ⛔ ONE SAMPLE IS NOT A STATE (review round 5 of #2653). A terminal record carries no pid, so the
+# absent-owner read is the ONLY thing that would justify deleting it — and a HARD-KILLED daemon never
+# closes its ptys or signals its children, so an orphaned worker can outlive the owner. A restart
+# window is seconds; the confirmation window is what keeps the 26h stall fixed without letting a single
+# refusal sample empty the census.
+cat > "$TMP/q4.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_ABSENT=1
+printf 'kind=terminal\nid=term_open1\nworkspace=ws_open1\n' > "$WT_DIR/worker-merge-97"
+. "$1"
+echo "first=$(wt_alive merge-97 && echo yes || echo no)/$(wt_count merge-)"
+echo "window=$([ -f "$WT_DIR/.wt-absent-since" ] && echo opened || echo none)"
+# a SECOND sample, still inside the window -> still UNKNOWN
+echo "second=$(wt_alive merge-97 && echo yes || echo no)/$(wt_count merge-)"
+# an old window -> CONFIRMED
+printf '%s\n' "$(( $(date +%s) - 600 ))" > "$WT_DIR/.wt-absent-since"
+echo "confirmed=$(wt_alive merge-97 && echo yes || echo no)/$(wt_count merge-)"
+SH
+out="$(bash "$TMP/q4.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O21" 2>&1)"
+case "$out" in *"first=yes/1"*"window=opened"*"second=yes/1"*"confirmed=no/0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "the absent owner is CONFIRMED by two samples: one refusal keeps the caps binding, an elapsed window frees them" $rc
+# …and a READABLE answer closes the window again (a restart must not inherit a stale verdict)
+cat > "$TMP/q5.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_ABSENT=1
+printf 'kind=terminal\nid=term_back1\nworkspace=ws_back1\n' > "$WT_DIR/worker-merge-98"
+. "$1"
+wt_table >/dev/null 2>&1 || true          # opens the window
+echo "window=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+unset CMUX_TREE_ABSENT; export CMUX_TREE_JSON='{"workspaces":[{"id":"ws_back1","name":"wt-merge-98"}],"screens":[{"id":"s1","workspace_id":"ws_back1","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_back1"}],"terminals":[{"id":"term_back1","running":true}]}'
+wt_table >/dev/null 2>&1 || true          # the FIRST read after the daemon answers again
+echo "after-read=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+echo "alive=$(wt_alive merge-98 && echo yes || echo no)"
+SH
+out="$(bash "$TMP/q5.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O22" 2>&1)"
+case "$out" in *"window=open"*"after-read=closed"*"alive=yes"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a READABLE census closes the absent window (a returning daemon is not judged by a stale one)" $rc
 
 echo
 echo "── H) the controller's capacity probes answer on BOTH platforms (agent-infra#1702) ──"

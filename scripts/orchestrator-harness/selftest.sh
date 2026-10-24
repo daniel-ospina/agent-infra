@@ -2586,8 +2586,11 @@ _slot_t=$(grep -E 'but NO [a-z-]+ slot \(' "$LOOP" | grep -cF '$(spawn_gate_tok)
 # token is satisfied by a COMMENT that mentions it — and this very function's comment block discusses
 # the token, so a decoy there would keep the check green while a real refusal line lost its evidence.
 # The comment 40 lines below names the same class; this is it.
-[ "$_slot_n" = "5" ] && [ "$_slot_t" = "$_slot_n" ] && rc=0 || { rc=1; echo "      $_slot_t of $_slot_n refusal line(s) print the token (expected 5 of 5)"; }
-ck "all five held-back-spawn lines print the gate evidence token (load-gate + mem-gate)" $rc
+# 5 -> 6 for agent-infra#2653: the review arm gained a refusal for a head that HAS findings at a full
+# fixer ceiling. It names the FIX side (a fixer is the remedy there, never a review), and it carries the
+# same gate token because the same two gates can have held the spawn.
+[ "$_slot_n" = "6" ] && [ "$_slot_t" = "$_slot_n" ] && rc=0 || { rc=1; echo "      $_slot_t of $_slot_n refusal line(s) print the token (expected 6 of 6)"; }
+ck "all six held-back-spawn lines print the gate evidence token (load-gate + mem-gate)" $rc
 sed -n '/^spawn_gate_tok() {/,/^}/p' "$LOOP" > "$TMP/spawntok.sh"
 if need "$TMP/spawntok.sh" "spawn_gate_tok() is extracted from the shipped loop"; then
   got="$(bash -c '. "$1"; L=3; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=100; MEM_UNKNOWN=0; spawn_gate_tok' _ "$TMP/spawntok.sh")"

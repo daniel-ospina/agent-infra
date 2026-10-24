@@ -419,6 +419,11 @@ drive GREEN rail 9 1
 [ "$(acts)" = "0" ] && grep -qi 'NO merge slot' "$TMP/d.log" \
   && ok "GREEN+rail at the merge-lane ceiling: refused and named" \
   || bad "GREEN+rail at the ceiling: acts=$(acts) — the refusal is still silent"
+# ⛔ THE NEEDS-FIX MARKER FROM THE DEFER DRIVE ABOVE MUST GO (agent-infra#2653 review round 5): with
+# findings on disk this arm now names the FIXER ceiling (correctly — a fixer is the remedy for a head
+# that has findings), so leaving the marker here would grade the wrong branch while still passing on
+# "refused". `mv`, not `rm` (#709).
+mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.t5.spent.$RANDOM" 2>/dev/null || true
 drive 'FAILED:ai-review-gate' rail 9 1
 [ "$(acts)" = "0" ] && grep -qi 'NO re-record slot' "$TMP/d.log" \
   && ok "review-gate red at the review-lane ceiling: refused and named" \
@@ -652,6 +657,35 @@ else
 fi
 mv "$TMP/O/state/parked-4242" "$TMP/parked.dir.$RANDOM" 2>/dev/null || true
 clear_revdisp
+
+# (l) A HEAD WITH FINDINGS NEVER REACHES THE REVIEW KEY (review round 5, P1). `_fix_eligible` is 0 when
+# the FIXER ceiling is full, and the chain used to fall through into the review key — which would CAP
+# and park that head with a reason claiming "the reviewer produced no usable verdict … a fixer has no
+# findings", when `state/needsfix-<PR>-<head>` exists ON DISK. That parks a PR a fixer could still
+# repair and points the operator at the wrong subsystem.
+clear_store; clear_revdisp; clear_parked; seed_revdisp abc1234 3
+NEEDSFIX=1; drive 'FAILED:ai-review-gate' rail 9 1; unset NEEDSFIX
+if [ "$(spawns)" = "0" ] && [ ! -e "$TMP/O/state/parked-4242" ] && grep -q 'NO fixer slot' "$TMP/d.log" \
+   && ! grep -q 'REVIEW-CAP' "$TMP/d.log"; then
+  ok "(l) findings + a full fixer ceiling names the FIXER slot — the review budget never bounds a NEEDS-FIX head"
+else
+  bad "(l) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.l.spent.$RANDOM" 2>/dev/null || true
+clear_revdisp; clear_parked
+
+# (m) an unwritable budget AND an unwritable PARK: the branch must not claim PARKED (review round 5,
+# P2) — that would be the inert bound wearing a green face, while the head buys another review.
+clear_store; clear_revdisp; clear_parked
+mkdir -p "$TMP/O/state/reviewdisp-4242" "$TMP/O/state/parked-4242"
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "1" ] && grep -q 'PARK DID NOT LAND' "$TMP/d.log" && ! grep -q '(PARKED)' "$TMP/d.log"; then
+  ok "(m) budget unwritable AND park unwritable: PARK DID NOT LAND, and the line does not claim PARKED"
+else
+  bad "(m) log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+mv "$TMP/O/state/reviewdisp-4242" "$TMP/revdisp.m.dir.$RANDOM" 2>/dev/null || true
+mv "$TMP/O/state/parked-4242" "$TMP/parked.m.dir.$RANDOM" 2>/dev/null || true
 
 # (d) the review-LANE cap still binds, and the refusal NAMES its holders and their age
 clear_store; clear_revdisp

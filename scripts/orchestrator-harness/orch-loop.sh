@@ -3881,6 +3881,13 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "parked: still needs fixes after $NF attempts — needs a human"
+            # ⛔ A HEAD WITH FINDINGS NEVER REACHES THE REVIEW KEY (review round 5 of #2653, P1). The
+            # chain falls through here whenever `_fix_eligible` is 0 — including "the FIXER ceiling is
+            # full" — and the review key would then CAP and park that head after MAX_REVIEW_TRIES
+            # re-records with a reason claiming "the reviewer produced no usable verdict … a fixer has no
+            # findings", when `state/needsfix-<PR>-<head>` exists ON DISK (it is what made `_rgs`
+            # NEEDS-FIX this cycle). That parks a PR the fixer could still repair, and sends the operator
+            # at the reviewer's budget instead of the fix capacity that actually blocked it.
             # ── THE (PR, HEAD) REVIEW KEY IS CONSULTED BEFORE CAPACITY (agent-infra#2653) ────────
             # ⛔ ORDER IS THE POINT. Capacity is a fact about the BOX; AT-HEAD and CAP are facts about
             # the REVIEW. Testing capacity first reports "review-lane ceiling reached" for a head that
@@ -3891,6 +3898,11 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             # HEAD; spending one on an empty `HEAD_N` (a failed `gh pr view … headRefOid`) records a
             # count under a key nobody can compare, buys up to MAX_REVIEW_TRIES paid reviews, and then
             # parks the PR with a reason claiming the budget when the real cause was an API read.
+            elif [ "$_rgs" = "NEEDS-FIX" ]; then
+              # Findings at this head, no fixer slot and no spawn gate: name the FIX side, which is what
+              # is actually exhausted, and never the review budget.
+              echo "#$PR NEEDS-FIX at head=${HEAD_N:-?} but NO fixer slot (fix lanes=$(wt_count fix-)/$MF; try: rm -f a stray $O/state/fixcount-$PR if the attempts were not real, $(spawn_gate_tok)) — a fixer is the remedy, a review is not" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: fix-lane ceiling $MF reached (findings exist — a fixer is the remedy)"
             elif [ -z "${HEAD_N:-}" ]; then
               echo "#$PR $V but the HEAD is UNREADABLE — no review dispatched (a review is head-scoped evidence; a review spent on an unnamed head cannot be keyed, compared, or recorded, and the budget would be spent against a key that means nothing)" >>"$LOG"
               disp "$PR" - "$V" wait "head unreadable — a review is not spent on a guess (re-read next cycle)"
@@ -3957,10 +3969,18 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
                 # #2653, P2): the counter IS the bound, so an unwritable one would re-buy a paid review
                 # every cycle. Named, and the head is parked so the loop stops rather than spending again.
                 if ! review_disp_record "$PR" "${HEAD_N:-}" "$(( ${_rvn:-0} + 1 ))"; then
-                  echo "#$PR review lane merge-$PR spawned, but state/reviewdisp-$PR CANNOT BE WRITTEN — the per-head review cap cannot be kept, so NO further review is dispatched for this head (PARKED). REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >>"$LOG"
-                  park_ctrl "$PR" "${HEAD_N:-}" "the review budget record state/reviewdisp-$PR cannot be written, so MAX_REVIEW_TRIES cannot bound this head — refusing further dispatch (a review was spent this cycle). Make $O/state writable, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
-                  # ONE row, and it is a WAIT: a second `disp` for the same PR would count one PR twice.
-                  disp "$PR" "${HEAD_N:-}" "$V" wait "review budget UNWRITABLE — parked so the cap cannot be outrun"
+                  echo "#$PR review lane merge-$PR spawned, but state/reviewdisp-$PR CANNOT BE WRITTEN — the per-head review cap cannot be kept, so NO further review is dispatched for this head (attempting to park it — the park's own outcome is reported below). REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >>"$LOG"
+                  # ⛔ AND THE PARK IS CHECKED TOO (review round 5 of #2653, P2): if the park did not
+                  # land, the PR is NOT bound — it re-enters this arm and buys another paid review every
+                  # cycle. Claiming PARKED over an unwritten `parked-<PR>` is the same inert-bound
+                  # failure the sibling branches (CAP, AT-HEAD-STUCK) already refuse.
+                  if park_ctrl "$PR" "${HEAD_N:-}" "the review budget record state/reviewdisp-$PR cannot be written, so MAX_REVIEW_TRIES cannot bound this head — refusing further dispatch (a review was spent this cycle). Make $O/state writable, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"; then
+                    # ONE row, and it is a WAIT: a second `disp` for the same PR would count one PR twice.
+                    disp "$PR" "${HEAD_N:-}" "$V" wait "review budget UNWRITABLE — parked so the cap cannot be outrun"
+                  else
+                    echo "#$PR review budget UNWRITABLE and the PARK DID NOT LAND (state/parked-$PR is unwritable) — this head is NOT bounded and will buy another review next cycle. REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf stray directories named reviewdisp-$PR / parked-$PR)" >>"$LOG"
+                    disp "$PR" "${HEAD_N:-}" "$V" wait "review budget UNWRITABLE and PARK DID NOT LAND — a human must look at this head"
+                  fi
                 else
                   echo "#$PR re-record" >>"$LOG"
                   disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker merge-$PR spawned (fresh review, attempt $(( ${_rvn:-0} + 1 ))/${MAX_REVIEW_TRIES:-3})"

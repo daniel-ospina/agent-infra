@@ -722,9 +722,13 @@ wt_tmux_names() {
 # never once hit (measured: three questions, three full `cmux tree` probes). The file carries its own
 # timestamp so this stays portable (no `stat` dialect in the hot path), it is written atomically, and
 # `wt_forget` removes it — a spawn or a close must never be answered from the census it invalidates.
+# WT_ABSENT_CONFIRM — how long an absent session owner must persist before its records are concluded
+# dead (agent-infra#2653, review round 5). Two samples, never one: see the arm in wt_table.
+WT_ABSENT_CONFIRM="${WT_ABSENT_CONFIRM:-60}"
+case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree tree_err nrc names probe_ok raw="" tbl="" f name kind id st
+  local now ttl dir cache hdr tree tree_err absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
   now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
@@ -780,11 +784,31 @@ wt_table() {
     # census on those deletes a lived worker's record and stops every cap binding, which is the P1
     # incident the tmux half's header records (`error connecting` = unreadable). A banner, a drifted
     # shape, `cmux: cannot read`, a missing binary (127) or any other failure stays UNKNOWN too.
+    # ⛔ AND ONE SAMPLE IS NOT A STATE (review round 5 of #2653; this repo's own rule: "a measurement
+    # artifact is not a state — never take a destructive action from a first-match reading"). Terminal
+    # records carry no pid, so once this read concludes `dead` the record can only be judged by the
+    # owner: a HARD-KILLED daemon never closes its ptys or signals its children, so an orphaned worker
+    # could still be running while the harness frees its slot and deletes its handle — and a restart
+    # window is seconds. So the absent answer is CONFIRMED by two samples at least WT_ABSENT_CONFIRM
+    # apart; the first one only opens the window (still UNKNOWN, caps binding), and a readable census
+    # closes it. Two controller cycles (CYC=240) always span the default, so the 26h stall is fixed
+    # while a single refusal sample cannot empty the census.
     case "$tree_err" in
       *'Connection refused'*|*'no server running'*)
-        probe_ok=1 ;;
+        absent_now="$(date +%s 2>/dev/null || echo 0)"
+        absent_since="$(cat "$dir/.wt-absent-since" 2>/dev/null || true)"
+        case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
+        if [ -z "$absent_since" ]; then
+          printf '%s\n' "$absent_now" > "$dir/.wt-absent-since" 2>/dev/null || true
+          absent_since="$absent_now"
+        fi
+        # ONE comparison, always: a zero (or already-elapsed) window confirms on THIS sample, which is
+        # what the suites and an operator debugging a box use; the default window needs a second sample.
+        [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1 ;;
     esac
   fi
+  # ANY readable answer closes the absent window: the owner came back (or was always there).
+  [ -n "$tree" ] && rm -f "$dir/.wt-absent-since" 2>/dev/null || true
   # Records. A terminal record is resolved by its TERMINAL ID first (the only handle the surface
   # grammar has), then by the workspace name (the layout grammar, and records predating the id).
   # An unreadable probe is UNKNOWN — never dead: see the polarity rule in the header.
