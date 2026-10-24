@@ -259,9 +259,19 @@ if [ "$1" = "api" ]; then
         # a rewritten sha): HTTP 404/422, a NON-ZERO exit, and the status on
         # STDERR, which is where `gh` puts it and where `review_surface_rows`
         # classifies it. rc 3 (positive evidence → refuse) must never be confused
-        # with a TRANSPORT failure (rc 1 → warn and proceed); §8.16 pins both.
+        # with a TRANSPORT failure (rc 1 → warn and proceed); §8.16 pins both,
+        # and pins a STATUS-BEARING transport failure (403 rate limit / 5xx)
+        # separately, because `gh` reports one too and the classifier keys on the
+        # status, not on its absence.
         if [ -n "${STUB_COMPARE_HTTP:-}" ]; then
-            printf 'gh: Not Found (HTTP %s)\n' "$STUB_COMPARE_HTTP" >&2
+            case "$STUB_COMPARE_HTTP" in
+                404) _why="Not Found" ;;
+                422) _why="Unprocessable Entity" ;;
+                403) _why="API rate limit exceeded" ;;
+                5*)  _why="Server Error" ;;
+                *)   _why="Error" ;;
+            esac
+            printf 'gh: %s (HTTP %s)\n' "$_why" "$STUB_COMPARE_HTTP" >&2
             exit 1
         fi
         printf 'mb\t%s\n' "${STUB_MERGE_BASE-cccccccccccccccccccccccccccccccccccccccc}"
@@ -554,10 +564,11 @@ echo "── 8. #513 clean-micro tier guard ────────────
 # genuine micro change has.
 #
 # It did not, and this suite went RED the moment the cap landed (measured:
-# PASS=644 FAIL=0 at aa6c1600f^ → PASS=622 FAIL=22 at aa6c1600f). The stub
-# answered the `pulls/<n>` meta read with `changed_files=1` (its `derived`
-# default, line 241) and the `compare/` read with a merge base and NO row
-# (line 260), so `review_surface_rows` returned rc 3 and the cap refused exit 4.
+# PASS=644 FAIL=0 at aa6c1600f^ → PASS=622 FAIL=22 at aa6c1600f). The stub's
+# meta arm answered `changed_files=1` (its `derived` default) and its `compare/`
+# arm answered with a merge base and NO row (it emits a row only when
+# `STUB_COMPARE`/`STUB_FILES` is set), so `review_surface_rows` returned rc 3 and
+# the cap refused exit 4.
 #
 # ⛔ THE REFUSAL WAS CORRECT — this is a FIXTURE fix, not a code fix (#2615).
 # `changed_files>=1` with an empty `.files[]` is not an answer GitHub gives, and
@@ -876,17 +887,25 @@ rm -rf "$T/labels"
 # CHANGED-PATH payload and the empty body only cost the carry-forward digest.
 # No vector in this suite exercised the cap at all — the only ones that did
 # lived in tests/record-review/run.sh §30viii/30ix/30x — so its arms could
-# collapse without a red. Each arm below asserts its own rc, its own wording,
-# and whether a record was written:
+# collapse without a red. Each arm below asserts its own rc and whether a record
+# was written; the WORDING is a class, not an arm: `review_surface_rows` returns
+# one rc per cause CLASS, so REFUSED (a compare 404/422) and INCONSISTENT (a
+# `mb` header with no row) are the SAME rc 3 and share its cause-list message —
+# they are pinned as one class with two causes, and the count/parity refusals
+# above them are the same class again. rc 0/1/2 each have wording of their own.
 #
 #   EMPTY        the API ANSWERED: 0 changed files            → rc 2, exit 4
-#   UNREADABLE   transport: gh failed with no HTTP status     → rc 1, WARN + record
+#   UNREADABLE   transport, no status / status-bearing 403/5xx → rc 1, WARN + record
 #   REFUSED      the API answered and REFUSED this revision    → rc 3, exit 4
 #   INCONSISTENT claims a surface and delivers no row          → rc 3, exit 4
 #
 # The split is load-bearing, not cosmetic: a transport blip must not strand a
 # legitimate micro record (fail-open), while a payload that cannot certify a
 # surface must never clear a tier that dispatches no reviewers (fail-closed).
+# Both halves of the refusal set are pinned: the classifier keys on
+# `HTTP (404|422)`, so a 422-only regression (a rewritten sha) would be invisible
+# to a 404-only vector — measured: narrowing that regex to `HTTP 404` left this
+# suite green before the 422 vector existed.
 echo "── 8.16 (#2615) the clean-micro surface cap tells its four outcomes apart ──"
 
 # EMPTY — the API answered with NO changed files. The `empty` status, not a
@@ -898,26 +917,56 @@ assert_contains "$RECORD_ERR" "has NO changed files, so there is no surface to c
 assert_not_contains "$RECORD_ERR" "could not read the changed paths" "8.16 empty: an answered-empty is NOT reported as a read failure"
 assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 empty: the EMPTY arm is distinct from the uncertifiable arm"
 
-# UNREADABLE — a TRANSPORT failure (gh exited non-zero with no HTTP status: a
-# rate-limit window, a 5xx, a dead socket). NOTHING was read, so the cap is
-# UNVERIFIED and the record PROCEEDS with a loud warning (the pre-existing
-# fail-open posture). If this ever starts refusing, a legitimate micro PR is
-# stranded on a network blip and told to pay for a full review.
+# UNREADABLE (1/2) — a TRANSPORT failure with NO status at all: `gh` exits
+# non-zero with empty stderr (a dead socket, a killed process). NOTHING was read,
+# so the cap is UNVERIFIED and the record PROCEEDS with a loud warning (the
+# pre-existing fail-open posture). If this ever starts refusing, a legitimate
+# micro PR is stranded on a network blip and told to pay for a full review.
 STUB_COMPARE_FAIL=1 STUB_BODY="Fixes #424361" STUB_LABELS="complexity:micro" run_micro_verdict 424361
 [ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a transport failure warns and PROCEEDS (rc 0)" || bad "8.16 unreadable: must proceed (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424361.json" ] && ok "8.16 unreadable: the record IS written (fail-open)" || bad "8.16 unreadable: no record written — a transport blip stranded a legitimate record"
 assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the warning names the READ failure"
 assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a read failure is NOT reported as an uncertifiable payload"
 
-# REFUSED — the API ANSWERED and refused this revision (HTTP 404: an unreachable
-# fork head, a rewritten sha). POSITIVE evidence, so it refuses: the surface of
-# THIS sha cannot be read, and a tier that dispatches no reviewers must not be
-# cleared on a guess. The wording must not blame the network.
+# UNREADABLE (2/2) — a TRANSPORT failure that DOES carry a status (a 403 rate
+# limit / a 5xx). `gh` reports those on stderr just as it reports a 404, so the
+# classifier must key on WHICH status, not on whether one is present: only
+# 404/422 refuse. This vector is the reason the stub's HTTP arm prints a
+# status-appropriate reason string.
+STUB_COMPARE_HTTP=503 STUB_BODY="Fixes #424365" STUB_LABELS="complexity:micro" run_micro_verdict 424365
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a status-bearing transport failure (503) PROCEEDS (rc 0)" || bad "8.16 unreadable: a 503 must proceed, not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424365.json" ] && ok "8.16 unreadable: the 503 record IS written" || bad "8.16 unreadable: a 503 stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 503 warning names the READ failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 503 is NOT reported as an uncertifiable payload"
+
+# UNREADABLE (3/3) — the OTHER rc-1 cause: the `pulls` meta read itself failed,
+# so the cap never reaches the compare. Same posture (warn, record proceeds), and
+# pinned because `review_surface_rows`' contract names three rc-1 causes while a
+# compare-only vector exercises one.
+STUB_META_FAIL=1 STUB_BODY="Fixes #424366" STUB_LABELS="complexity:micro" run_micro_verdict 424366
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a failed meta read PROCEEDS (rc 0)" || bad "8.16 unreadable: a failed meta read must proceed (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424366.json" ] && ok "8.16 unreadable: the record IS written after a failed meta read" || bad "8.16 unreadable: a failed meta read stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the failed-meta warning names the READ failure"
+
+# REFUSED (1/2) — the API ANSWERED and refused this revision (HTTP 404: an
+# unreachable fork head, a rewritten sha). POSITIVE evidence, so it refuses: the
+# surface of THIS sha cannot be read, and a tier that dispatches no reviewers must
+# not be cleared on a guess. The wording must not blame the network.
 STUB_COMPARE_HTTP=404 STUB_BODY="Fixes #424362" STUB_LABELS="complexity:micro" run_micro_verdict 424362
 [ "$RECORD_RC" = "4" ] && ok "8.16 refused: a compare 404 refuses (exit 4)" || bad "8.16 refused: must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424362.json" ] && ok "8.16 refused: no record written" || bad "8.16 refused: wrote a record over a refused revision"
 assert_contains "$RECORD_ERR" "cannot be certified" "8.16 refused: the refusal names the uncertifiable payload"
 assert_not_contains "$RECORD_ERR" "could not read the changed paths" "8.16 refused: an API REFUSAL is NOT reported as a transport failure"
+
+# REFUSED (2/2) — and the SAME class's other status, 422 (a rewritten sha).
+# The classifier's pattern is `HTTP (404|422)`, so a 404-only vector cannot see a
+# regression that drops 422 — measured: narrowing it to `HTTP 404` left this
+# suite green, which is a fail-open on the rewritten-sha class the cap exists for.
+STUB_COMPARE_HTTP=422 STUB_BODY="Fixes #424367" STUB_LABELS="complexity:micro" run_micro_verdict 424367
+[ "$RECORD_RC" = "4" ] && ok "8.16 refused: a compare 422 refuses (exit 4)" || bad "8.16 refused: a 422 must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424367.json" ] && ok "8.16 refused: no record written for a 422" || bad "8.16 refused: wrote a record over a 422-refused revision"
+assert_contains "$RECORD_ERR" "cannot be certified" "8.16 refused: the 422 refusal names the uncertifiable payload"
+assert_not_contains "$RECORD_ERR" "could not read the changed paths" "8.16 refused: a 422 is NOT reported as a transport failure"
 
 # INCONSISTENT — the payload CLAIMS a surface (changed_files=1) and delivers no
 # changed-path row. THIS IS TONIGHT'S SHAPE (#2615): the fixture produced it and
@@ -1399,9 +1448,19 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #      its own PR number, so a leftover record there would let the parse pass even
 #      if A's writer silently failed (the vacuity this block exists to close).
 #      424520-424523 is verified unused by every other vector in this file.
-#  (2) The env-prefix assignments LEAK: `VAR=val func` does not restore VAR if it
-#      was previously UNSET (bash semantics), so STUB_FILES/STUB_DIFF_FILE would
-#      persist into §10 and make its code-bearing vectors see a docs-only diff.
+#  (2) The env-prefix assignments: `VAR=val func` is NOT a leak — a prefix
+#      assignment before a FUNCTION call is restored when the call returns
+#      (measured on bash 5.2.21 and 3.2.57: previously-unset comes back unset,
+#      previously-set comes back at its old value; only SPECIAL BUILTINS keep it).
+#      The real cross-vector carrier in this file is the un-prefixed `export`
+#      INSIDE `run_record_diff_with`, which outlives the call. The `unset` below
+#      is kept as belt-and-braces for that carrier: if the export ever stopped
+#      being overridden, STUB_FILES/STUB_DIFF_FILE would persist into §10 and
+#      make its code-bearing vectors see a docs-only diff. §8.16's
+#      `run_micro_verdict` relies on the RESTORE half of the same semantics
+#      (`STUB_FILES="${STUB_FILES-$MICRO_SURFACE}"` must not leak a surface into
+#      the next vector); this note documented that behaviour backwards until a
+#      review measured it (#2615).
 unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA P2 MB
 
 # ─────────────────────────────────────────────────────────────────────────
