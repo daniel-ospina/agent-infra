@@ -1312,10 +1312,10 @@ OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-refused.sh" DOCTOR_WORKTREE_REAPER="$T/bi
        DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
        bash "$DOCTOR" hygiene 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "hygiene: a refused registry script does NOT fail the pass" || bad "hygiene: refused script made rc=$RC — $OUT"
-result_has "registry union REFUSED by the checkout-guard" && ok "hygiene: ...and the refusal is named in the role record" \
+result_has "registry union REFUSED — git surface defect (#2520)" && ok "hygiene: ...and the refusal is named in the role record" \
   || bad "hygiene: the refusal is silent — $OUT"
 case "$OUT" in *"UNION-RAN-ANYWAY"*) bad "hygiene: the union ran despite the refusal — the pre-check is not gating" ;; *) ok "hygiene: ...and the union is NOT run when the guard would withhold it" ;; esac
-case "$OUT" in *"checkout-guard"*) ok "hygiene: ...and the log names the GUARD, so the next agent need not rediscover #2520" ;; *) bad "hygiene: the log does not name the guard — $OUT" ;; esac
+case "$OUT" in *"git surface is DEFECTIVE"*) ok "hygiene: ...and the log names the DEFECT with its issue, so the next agent need not rediscover #2520" ;; *) bad "hygiene: the log does not name the defect — $OUT" ;; esac
 
 # ⛔ rc=3 IS NOT A REFUSAL, and the doctor must not say it is. surface-check answers 0 classify /
 # 5 would-refuse / 3 could-not-check; a box without `awk` is the third, and reporting it as "the
@@ -1341,6 +1341,30 @@ result_has "registry union NOT RUN — git surface could not be verified" && ok 
   || bad "hygiene: the rc=3 cause is not named in the role record — $OUT"
 case "$OUT" in *"UNION-RAN-ANYWAY"*) bad "hygiene: the union ran although its surface could not be verified" ;; *) ok "hygiene: ...and the union still does not run (fail closed)" ;; esac
 case "$OUT" in *"cause is NOT a guard refusal"*) ok "hygiene: ...and the log says the cause is NOT a guard refusal (no false attribution)" ;; *) bad "hygiene: rc=3 is reported as a guard refusal — $OUT" ;; esac
+
+# ⛔ AND NEITHER IS ANY OTHER NON-ZERO. The rc=3 arm closed one instance of one class: EVERY
+# non-zero that was not 3 fell into "the checkout-guard would withhold it". A bound firing (124), an
+# unparseable script (2) or a vanished interpreter (127) is not a guard refusal, and a log that says
+# it is sends the next lane to re-litigate the gate instead of fixing the fault.
+say_case "hygiene: a surface-check that did not answer (rc=124/127) is UNKNOWN cause, never a refusal"
+reset_state
+cat > "$T/bin/rs-unanswered.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check) echo "surface-check: bound fired" >&2; exit 124 ;;
+  union) echo "UNION-RAN-ANYWAY" >&2; exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/rs-unanswered.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-unanswered.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: an unanswered surface-check does NOT fail the pass" || bad "hygiene: rc=124 made rc=$RC — $OUT"
+result_has "registry union NOT RUN — surface-check rc=124, cause unknown" && ok "hygiene: ...and the record carries the rc and says the cause is UNKNOWN" \
+  || bad "hygiene: rc=124 is not reported honestly in the role record — $OUT"
+case "$OUT" in *"cause is UNKNOWN and is NOT a guard refusal"*) ok "hygiene: ...and the log refuses the guard attribution" ;; *) bad "hygiene: rc=124 is reported as a guard refusal — $OUT" ;; esac
+case "$OUT" in *"UNION-RAN-ANYWAY"*) bad "hygiene: the union ran although surface-check did not answer" ;; *) ok "hygiene: ...and the union still does not run (fail closed)" ;; esac
 
 say_case "hygiene: the registry step is SKIPPED when the seam says off, and the skip is visible"
 reset_state
