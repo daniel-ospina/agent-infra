@@ -2470,9 +2470,9 @@ S6_OUT="$(env -u CONTROLLER_USER_UNIT_DIR PATH="$S6/bin:$PATH" SYSTEMCTL="$S6/bi
           SCOPE=own HARNESS="" bash "$SUP" status 2>&1)"
 # ⛔ MATCH THE SUPERVISION ROW, NOT A SUBSTRING OF THE WHOLE REPORT: `status` also prints "gh: not installed"
 # and "NO RECORD" lines, and a loose match graded an unrelated answer as this arm's verdict.
-if printf '%s\n' "$S6_OUT" | grep -q 'supervision:.*NONE'; then
+if grep -q 'supervision:.*NONE' <<<"$S6_OUT"; then
   bad "invoker HOME: the USER unit at the INVOKER's \$HOME/.config/systemd/user was not found (CELL_HOME != HOME) — status claims nothing supervises an ENABLED unit: $S6_OUT"
-elif printf '%s\n' "$S6_OUT" | grep -q 'supervision:.*ACTIVE'; then
+elif grep -q 'supervision:.*ACTIVE' <<<"$S6_OUT"; then
   ok "invoker HOME: the USER unit is found through the INVOKER's HOME, not the re-pointed \$CELL_HOME"
 else
   bad "invoker HOME: status gave no supervision verdict at all for an enabled USER unit: $S6_OUT"

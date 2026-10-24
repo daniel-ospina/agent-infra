@@ -421,17 +421,31 @@ mkdir -p "$B/o/gh-limit"
 cat > "$B/harness/orch-loop.sh" <<STUB
 #!/bin/bash
 printf '%s|%s|%s|%s|%s\n' "\$HOME" "\$O" "\$SCOPE" "\$HARNESS_REPO" "\$PATH" > "$B/loop.env"
+# ⛔ A GLOBAL REPO MUST NOT SURVIVE INTO THE SERVICE-MANAGED CONTROLLER (review P1 round 18, #2402). Recorded
+# from the CONTROLLER's own environment, so this is the shipped fragment's effect and not a static read.
+printf '%s' "\${GH_REPO:-<unset>}" > "$B/loop.ghrepo"
 : > "$B/loop.ran"
 STUB
 chmod +x "$B/harness/orch-loop.sh"
+# ⛔ `GH_REPO` IS WHERE A PUSHED `keys.env` PUTS IT: this invocation's environment stands in for the file's
+# `set -a` source, which is exactly how the leak reached the exec'd controller.
 B_OUT="$(bnd env ORCH_FOREGROUND=1 CELL_HOME="$B/home" HOME="$B/home" O="$B/o" REPO="$B/repo" \
          OR="daniel-ospina/agent-infra" SCOPE=own ENV_FILE="$B/home/keys.env" \
+         GH_REPO=daniel-ospina/tortoise \
          HARNESS="$B/harness" HARNESS_REPO=daniel-ospina/agent-infra SUP_SELF="$SUP" \
          PATH="$B/bin:/usr/bin:/bin" \
          bash -c "start_doctor_loop() { : > '$B/doctor.called'; }; superseded() { return 1; }; $(cat "$FRAG"); printf 'NOT-EXECED\n'" 2>&1)"; B_RC=$?
 [ "$B_RC" -eq 0 ] && ok '§B: the fragment exits cleanly' || bad "§B: fragment rc=$B_RC — $B_OUT"
 [ -f "$B/loop.ran" ] && ok '§B: the controller RAN (the fragment exec\x27d it)' \
   || bad "§B: the controller never ran — $B_OUT"
+# ⛔ THE REPO IS PER-INVOCATION STATE, NOT A GLOBAL (review P1 round 18, #2402). The tmux path unsets it inside
+# its command string; this branch had no unset at all, and `exec` replaces the process, so the leak was
+# invisible to every static read. RED with the `unset GH_REPO` deleted from the fragment.
+B_GHREPO="$(cat "$B/loop.ghrepo" 2>/dev/null)"
+case "$B_GHREPO" in
+  '<unset>'|'') ok '§B: the controller does NOT inherit a global GH_REPO (keys.env cannot pick the repo a cell grades)' ;;
+  *) bad "§B: the controller inherited GH_REPO='$B_GHREPO' — every gh rail on this box would grade that repo and print ALREADY MERGED over zero work: $B_OUT" ;;
+esac
 case "$B_OUT" in
   *NOT-EXECED*) bad '§B: the fragment FORKED instead of exec\x27ing — the unit would own a launcher, not the controller' ;;
   *)            ok '§B: exec, not fork (the statement after the branch is unreachable)' ;;

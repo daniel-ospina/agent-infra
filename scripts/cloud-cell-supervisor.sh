@@ -2625,6 +2625,15 @@ cmd_start() {
     mkdir -p "$ROLES_DIR" 2>/dev/null && : > "$ROLES_DIR/.desired" 2>/dev/null || say "warn: could not record the desired running state at $ROLES_DIR/.desired"
     export HOME="$CELL_HOME" CELL_HOME O REPO OR SCOPE ENV_FILE SESSION
     export HARNESS_REPO HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_MATERIALISER="${SUP_SELF:-}"
+    # ⛔ AND THE GLOBAL REPO IS DROPPED ON THIS PATH TOO (review P1 round 18, #2402). The tmux path below
+    # unsets it inside its command string, and the doctor's string unsets its own copy — this branch had
+    # neither, so a `keys.env` carrying `GH_REPO=` (which `set -a; . "$ENV_FILE"` exports into THIS process)
+    # was inherited by the `exec`ed controller: every gh-driven rail on a service-managed cell then graded
+    # whatever repo keys.env named, printing `ALREADY MERGED` over zero work on the wrong repo (measured
+    # 2026-10-21, and the same class the rail's own #2235 fixes). `exec` REPLACES this process, so the unset
+    # has to happen before it — a later statement never runs. `unset` works whether or not the variable is
+    # exported, and the unit renders no `UnsetEnvironment=`.
+    unset GH_REPO
     # ⛔ THE gh-limit LAYER IS PART OF THE ENVIRONMENT, NOT OF THE TMUX PATH (#1988). The session string
     # below puts `$O/gh-limit` FIRST on PATH; in service mode there is no session string, so the same
     # export has to happen HERE or the controller silently loses the gh wrapper — every gh call
