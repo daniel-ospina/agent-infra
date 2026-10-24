@@ -698,6 +698,7 @@ inst20() { # inst20 <args...>
     LAUNCHCTL="$T/t20/bin/launchctl" LAUNCHCTL_CALLS="$T/t20/calls.log" \
     LAUNCHCTL_LOADED="$T/t20/loaded" \
     ELDATO_LAUNCHER_PY="$PY_HERE" ELDATO_LAUNCHER="$LAUNCHER_HERE" \
+    LAUNCHD_TEMPLATES_DIR="${LAUNCHD_TEMPLATES_DIR_OVERRIDE:-$HERE/../templates/launchd/reaper}" \
     bash "$INST" "$@"
 }
 OUT="$(inst20 --install 2>&1)"; RC=$?
@@ -712,6 +713,29 @@ assert_contains "$PLIST" "VENV_REAPER</key>" "T20 the delegates are PINNED (as i
 assert_contains "$PLIST" "pi-reap-worktrees-launchd.py" "T20 it launches through the TCC launcher, not bash"
 assert_contains "$PLIST" "BOUNDED_LIB</key>" "T20 the bounded library is PINNED for the piped (bash -s) start"
 assert_absent "$PLIST" "{{" "T20 every placeholder is resolved"
+# ⛔ THE RENDERED ARM MUST ACTUALLY RUN (review of #2354). The launcher pipes the script to
+# `/bin/bash -s`, where `BASH_SOURCE` is UNSET — so a wrapper that resolved its sibling reaper from
+# it refused on every tick: #2354's zero-reclaim reproduced by its own fix, with the job still
+# "installed". The pin is necessary; this leg proves it is sufficient, because nothing executed
+# disk-reaper-run.sh before.
+assert_contains "$PLIST" "DISK_REAPER</key>" "T20 the scheduled wrapper's TARGET is pinned for the piped start"
+WRAPPER_HERE="$HERE/disk-reaper-run.sh"
+if [ -f "$WRAPPER_HERE" ]; then
+    STUB="$T/t20/stub-reaper.sh"
+    cat >"$STUB" <<'STUBEOF'
+#!/bin/bash
+printf 'STUB-REAPER %s\n' "$*"
+STUBEOF
+    chmod +x "$STUB"
+    OUT="$(cd / && HOME="$T/t20/home" DISK_REAPER="$STUB" bash -s -- --apply <"$WRAPPER_HERE" 2>&1)"; RC=$?
+    assert_eq "$RC" "0" "T20 the wrapper RUNS under bash -s with DISK_REAPER pinned (the launchd arm)"
+    assert_contains "$OUT" "STUB-REAPER --apply" "T20 and it execs the PINNED reaper, not a sibling it cannot see"
+    OUT="$(cd / && env -u DISK_REAPER HOME="$T/t20/home" bash -s -- --apply <"$WRAPPER_HERE" 2>&1)"; RC=$?
+    assert_eq "$RC" "3" "T20 with BASH_SOURCE unset and no pin it REFUSES (never resolves to the CWD)"
+    assert_contains "$OUT" "DISK_REAPER" "T20 and the refusal names the pin that fixes it"
+else
+    bad "T20 scripts/disk-reaper-run.sh is missing — the scheduled entry point would be the raw reaper"
+fi
 assert_contains "$(cat "$T/t20/calls.log")" "bootstrap gui/" "T20 the agent is BOOTSTRAPPED, not just written"
 OUT="$(inst20 --status 2>&1)"; RC=$?
 assert_contains "$OUT" "installed=yes" "T20 --status reports the agent"

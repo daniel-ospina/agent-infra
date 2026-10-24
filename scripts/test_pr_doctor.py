@@ -4295,3 +4295,125 @@ def test_a_sibling_that_cannot_be_EXECUTED_is_also_a_recorded_refusal(tmp_path):
     assert rec["rc"] == 2, rec
     assert rec.get("read") == "seam", rec
     assert "could not be loaded" in rec["reason"], rec
+
+
+# ── THE CLASSIFIER AND THE DISPATCH REGISTER BELONG TO THE REPO THE DOCTOR WORKS ON ───────────
+# ⛔ TWO INDEPENDENT DEFECTS, ONE SHAPE: a module-level default stood in for an input.
+#
+#   1. `objective.py` reads its repo from `OBJECTIVE_REPO` at EXEC time and nothing shipped set it,
+#      so every call fell back to `daniel-ospina/tortoise`. MEASURED 2026-10-24 14:12Z on a doctor
+#      pointed at agent-infra: the classifier asked about tortoise's check-runs using agent-infra
+#      SHAs, GitHub answered `422 No commit found for SHA` for EVERY PR, all 58 read UNREADABLE, and
+#      the pass dispatched nothing -- while a direct `gh api .../commits/<sha>/check-runs` for the
+#      same sha returned 200 and 30 check-runs. The read was fine; the repo was wrong. (agent-infra#1989)
+#   2. `STATE` was one `pr-doctor.json` whose keys are PR NUMBERS, and `pass_budgets()` charges every
+#      row inside `STALE_DISPATCH_S` against a class ceiling. Two doctors therefore shared ONE
+#      register: the tortoise pass reported `inflight=17, budget fix=0` and `dispatched 0 of 4
+#      queued` on every pass for hours, while the in-flight workers were agent-infra's. (agent-infra#2700)
+#
+# Both are silent by construction: a wrong repo is a READ that answers with a refusal, and a shared
+# register is a BUDGET that answers with zero. Neither raises, and both look like the queue.
+
+def test_the_classifier_is_asked_about_the_repo_this_doctor_dispatches_for(monkeypatch):
+    """The classifier's repo is THIS pass's repo -- not a shipped default.
+
+    Drives the seam directly: `_objective()` execs `objective.py`, which reads `OBJECTIVE_REPO` at
+    exec time, so the value must be installed BEFORE the exec. Patching `pr.REPO` is what a doctor
+    pointed at another repo looks like from in here; before the fix the classifier answered
+    `daniel-ospina/tortoise` regardless.
+    """
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    monkeypatch.setattr(pr, "REPO", "daniel-ospina/agent-infra")
+    mod = pr._objective()
+    assert mod.REPO == "daniel-ospina/agent-infra", (
+        "the classifier resolved %r, but this pass dispatches for %r -- every check-run read would "
+        "be answered `422 No commit found for SHA`" % (mod.REPO, pr.REPO))
+
+
+def test_an_ambient_OBJECTIVE_REPO_cannot_outvote_the_repo_this_pass_dispatches_for(monkeypatch):
+    """FORCED, not `setdefault`. A disagreeing ambient value IS the defect, so it must lose.
+
+    A caller's environment is how the wrong repo arrived in the first place; deriving it from the
+    caller means two facts about one pass can silently disagree, and the pass reports a confident
+    verdict about a repo it is not working on.
+    """
+    monkeypatch.setenv("OBJECTIVE_REPO", "daniel-ospina/tortoise")
+    monkeypatch.setattr(pr, "REPO", "daniel-ospina/agent-infra")
+    assert pr._objective().REPO == "daniel-ospina/agent-infra"
+
+
+def test_the_dispatch_state_file_is_named_for_the_repo_and_derived_at_import(tmp_path):
+    """TWO DOCTORS, TWO REPOS, ONE STATE DIR: the register must not be shared.
+
+    Structural on purpose -- it imports the REAL file in a subprocess (the same shape as the
+    sibling-load test above), so it pins the import-time derivation AND the ordering: `STATE` reads
+    `REPO`, so a copy that defines it first dies with `NameError` before it reads anything.
+    """
+    import shutil
+    for name in ("pr-doctor.py", "objective.py"):
+        shutil.copy(pathlib.Path(__file__).with_name(name), tmp_path / name)
+    env = dict(os.environ, HOME=str(tmp_path))
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "import importlib.util, pathlib, sys;"
+         "p = pathlib.Path(sys.argv[1]);"
+         "s = importlib.util.spec_from_file_location('pd', str(p));"
+         "m = importlib.util.module_from_spec(s);"
+         "s.loader.exec_module(m);"
+         "print(m.STATE); print(m._state_file(m.REPO)); print(m._state_file('daniel-ospina/tortoise'));"
+         "print(m._state_file('someone-else/tortoise'))", str(tmp_path / "pr-doctor.py")],
+        capture_output=True, text=True, cwd=str(tmp_path), env=env, timeout=60)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    live, wired, same_owner, other_owner = [pathlib.Path(x).name for x in r.stdout.split()]
+    assert live == "pr-doctor-daniel-ospina-tortoise.json", (
+        "the dispatch register is %r: a single shared `pr-doctor.json` lets ONE repo's in-flight "
+        "rows consume ANOTHER repo's budget, and `pass_budgets()` then reports `budget fix=0` on "
+        "every pass while the workers it counted belong to a different repo (#2700)" % live)
+    # wiring, not a literal: the pass's register IS this function's answer for its own repo
+    assert live == wired
+    # and the name is the WHOLE slug, so another owner's `tortoise` cannot share this register
+    assert same_owner == "pr-doctor-daniel-ospina-tortoise.json"
+    assert other_owner == "pr-doctor-someone-else-tortoise.json" != same_owner
+
+
+def test_one_repos_inflight_rows_cannot_starve_another_repos_pass(tmp_path, monkeypatch):
+    """The measured symptom, as a predicate: a full register in repo A leaves repo B a full budget."""
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    cap = {"max_fix": 4, "max_review": 4}
+    # doctor A (tortoise): four workers in flight, all inside STALE_DISPATCH_S
+    monkeypatch.setattr(pr, "STATE", pr._state_file("daniel-ospina/tortoise"))
+    pr.save_state({str(n): {"action": "fix-ci", "at_epoch": pr.now()} for n in (101, 102, 103, 104)})
+    assert pr.pass_budgets(pr.load_state(), cap)["fix"] == 0, "the fixture did not fill its budget"
+    # doctor B (agent-infra): its own register, so none of A's rows are charged to it
+    monkeypatch.setattr(pr, "STATE", pr._state_file("daniel-ospina/agent-infra"))
+    assert pr.load_state() == {}, "doctor B read doctor A's dispatch register"
+    assert pr.pass_budgets(pr.load_state(), cap)["fix"] == 4
+
+
+def test_loading_the_classifier_does_not_rewrite_the_process_environment(monkeypatch):
+    """The force is for THIS read, not for the process (review, 2026-10-24).
+
+    `_objective()` also runs at IMPORT time, so a bare `os.environ[...] = REPO` leaves the variable
+    rewritten for every later consumer in the same process — and `scripts/pr-loop.py` carries its own
+    `_objective()`, so the two bind the same repo whichever one asked. A fix that installs a global
+    side effect to win a local read is the same class as the bug: one authority answering for
+    another. `objective.py` reads the variable only at exec, so restoring it is free.
+    """
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    monkeypatch.setattr(pr, "REPO", "daniel-ospina/agent-infra")
+    assert pr._objective().REPO == "daniel-ospina/agent-infra"
+    assert "OBJECTIVE_REPO" not in os.environ, "the classifier load leaked OBJECTIVE_REPO into the process"
+    # an ambient value that was there before is put back, not deleted
+    monkeypatch.setenv("OBJECTIVE_REPO", "some-other/thing")
+    assert pr._objective().REPO == "daniel-ospina/agent-infra"
+    assert os.environ["OBJECTIVE_REPO"] == "some-other/thing"
+
+
+def test_the_seam_asserts_the_classifiers_repo():
+    """The repo is what the whole plan is built on, so the seam must name it (#2518 P1).
+
+    Without the assertion, a sibling older than #1989 simply has no `REPO` to disagree with, and the
+    pass reads one repo's queue against another repo's classifier with no refusal anywhere. A named
+    seam failure is the only outcome that is not a confident verdict about the wrong repo.
+    """
+    assert "REPO" in pr._SEAM, pr._SEAM
