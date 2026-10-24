@@ -128,6 +128,26 @@ MERGE_READ_TIMEOUT="${MERGE_READ_TIMEOUT:-60}"
 MERGE_RETRY_S="${MERGE_RETRY_S:-3600}"
 HYGIENE_TIMEOUT="${HYGIENE_TIMEOUT:-600}"
 STALE_WORKTREE_DAYS="${STALE_WORKTREE_DAYS:-7}"
+# ── the cross-box review-record registry (agent-infra#2577) ──
+# `registry-sync.sh union` is ONE bounded step of the hygiene role: whole-step bound here, per-network-op
+# bound passed through to the script. The step runs LAST, behind the disk work, so a slow remote cannot
+# starve the prunes and the reaper ahead of it.
+# 300 s, MEASURED rather than guessed: on the reference box with 3,462 refs a converged `union` is
+# ~105-155 s end to end (29 s `pull`, 75 s `push`, plus the listing and fetch) now that the script
+# compares records by blob id in two batched git calls instead of two processes per record. A bound
+# BELOW the honest cost is not caution, it is an inert step — it would be killed mid-run every pass.
+# ⛔ A BLIND box (3,000 records to materialise) takes longer than any single-pass bound, and that is
+# SAFE BY CONSTRUCTION: the script writes each record as it finishes it and every later pass reads it
+# by blob id, so a killed pass makes CUMULATIVE progress and the next pass resumes further along. A
+# short bound therefore costs passes, never correctness — and the counts line makes that visible.
+DOCTOR_REGISTRY_SYNC_TIMEOUT="${DOCTOR_REGISTRY_SYNC_TIMEOUT:-300}"
+DOCTOR_REGISTRY_NET_TIMEOUT="${DOCTOR_REGISTRY_NET_TIMEOUT:-60}"
+# A path, or `off|none|0` to skip the step (the suites use `off`: this suite executes the role many
+# times and must never reach a real remote, the same reason atomic-land.sh carries its own seam).
+DOCTOR_REGISTRY_SYNC="${DOCTOR_REGISTRY_SYNC:-}"
+# The STORE is a checkout whose remote carries refs/reviews/*. Resolved at the step (NOT here):
+# $DOCTOR_REGISTRY_STORE, then $HARNESS_REPO, then $AGENT_INFRA_PATH, then the script's own parent.
+DOCTOR_REGISTRY_STORE="${DOCTOR_REGISTRY_STORE:-}"
 # auto = reap stale worktrees only when the box is under pressure (the measured failure is a FULL
 # disk, not an untidy one); dry-run = report only; apply = always armed. The shipped reaper's own
 # gates (clean / unreferenced / reachable / aged) still decide every individual removal.
@@ -167,7 +187,8 @@ DOCTOR_GRACE_S="${DOCTOR_GRACE_S:-300}"
 for _v in DOCTOR_INTERVAL MERGE_INTERVAL HYGIENE_INTERVAL LOOP_TICK REAP_MIN_S REAP_SAMPLE_S \
           CONTROLLER_STALE_S CONTROLLER_START_TIMEOUT RAIL_TIMEOUT MERGE_MAX_PRS MERGE_RETRY_S \
           HYGIENE_TIMEOUT STALE_WORKTREE_DAYS MIN_FREE_MB DOCTOR_GRACE_S REAP_TIMEOUT \
-          READ_CALL_TIMEOUT MERGE_BUDGET_S MERGE_READ_TIMEOUT HYGIENE_TMP_MIN_AGE_S; do
+          READ_CALL_TIMEOUT MERGE_BUDGET_S MERGE_READ_TIMEOUT HYGIENE_TMP_MIN_AGE_S \
+          DOCTOR_REGISTRY_SYNC_TIMEOUT DOCTOR_REGISTRY_NET_TIMEOUT; do
   num_ok "${!_v}" || { printf 'FATAL: %s must be a whole number 0..999999999 (got "%s")\n' "$_v" "${!_v}" >&2; exit 2; }
 done
 case "$HYGIENE_WORKTREES" in auto|dry-run|apply) ;; *) printf 'FATAL: HYGIENE_WORKTREES must be auto|dry-run|apply (got "%s")\n' "$HYGIENE_WORKTREES" >&2; exit 2 ;; esac
@@ -182,7 +203,8 @@ case "$HYGIENE_WORKTREES" in auto|dry-run|apply) ;; *) printf 'FATAL: HYGIENE_WO
 #     wedge test is vacuous and the reaper KILLS the live lane it exists to spare.
 #   REAP_MIN_S=0 — removes the age floor outright, so a lane younger than the window is eligible.
 for _v in READ_CALL_TIMEOUT REAP_TIMEOUT RAIL_TIMEOUT HYGIENE_TIMEOUT CONTROLLER_START_TIMEOUT MERGE_READ_TIMEOUT \
-          REAP_SAMPLE_S REAP_MIN_S HYGIENE_TMP_MIN_AGE_S; do
+          REAP_SAMPLE_S REAP_MIN_S HYGIENE_TMP_MIN_AGE_S DOCTOR_REGISTRY_SYNC_TIMEOUT \
+          DOCTOR_REGISTRY_NET_TIMEOUT; do
   [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 makes the bound vacuous: `timeout 0` runs with no timeout at all, a zero REAP_SAMPLE_S makes the two CPU observations simultaneous, a zero REAP_MIN_S removes the age floor, and a zero HYGIENE_TMP_MIN_AGE_S leaves a recycled pid as the ONLY proof a temp dir is idle) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
 done
 # The roles run IN SEQUENCE in ONE loop, so the legitimate gap between two passes of the same role is
@@ -1772,7 +1794,144 @@ run_hygiene() {
     result="${result}${result:+; }CANNOT-VERIFY: worktree reaper (pi-reap-worktrees.sh) not found"
     h_rc=3
   fi
-  # 6) THE `df` DELTA — before → after, signed, on the filesystem this pass reclaims from.
+  # 6) the cross-box review-record registry (#2577) — the sink that fails SILENTLY. A box whose
+  #    registry was never unioned reads its own few hundred records and calls every peer-reviewed PR
+  #    NO-RECORD; the rail's own union never rescues it, because the rail only unions a PR already
+  #    OFFERED to it and the merge role declines a PR it cannot see a record for. That is the fixed
+  #    point this step leaves.
+  #    ⛔ NOT FATAL, DELIBERATELY — the one sub-step of this role that does not turn a failure into
+  #    rc=3. The difference is the DIRECTION of the failure: an un-converged registry means the merge
+  #    role sees FEWER records and therefore declines to land, so it cannot manufacture a merge on
+  #    evidence it does not have (fail-closed at the consequence). A failed uv prune or worktree reap
+  #    is the opposite: this role claimed work it was asked to do and did not do it. So the pass stays
+  #    green and the COUNTS are logged, which is what #2577 asks for — a stalled sync is visible in
+  #    `refs=` vs `files=` long before it blocks a lane.
+  local rsync="" rs_out="" rs_refs="" rs_why="" rs_keys="" store=""
+  local -a rs_store_args=()
+  case "$DOCTOR_REGISTRY_SYNC" in
+    off|none|0)
+      log "[hygiene] review-registry union SKIPPED by request (DOCTOR_REGISTRY_SYNC=$DOCTOR_REGISTRY_SYNC)"
+      result="${result}${result:+; }registry union skipped (by request)" ;;
+    *)
+      for rsync in "${DOCTOR_REGISTRY_SYNC:-}" \
+                   "$CELL_HOME/.pi/agent/scripts/registry-sync.sh" \
+                   "${SUPERVISOR:+$(dirname "$SUPERVISOR")/registry-sync.sh}" \
+                   "$SELF_DIR/../registry-sync.sh" \
+                   "$REPO/scripts/registry-sync.sh"; do
+        [ -n "$rsync" ] && [ -f "$rsync" ] && break
+        rsync=""
+      done
+      if [ -z "$rsync" ]; then
+        # Not a refusal: the registry is not this role's job to INSTALL. But it must not vanish into a
+        # clean pass either, so the absence is named with every place that was searched.
+        log "[hygiene] WARN review-registry union NOT RUN — registry-sync.sh is not on this box (looked in \$DOCTOR_REGISTRY_SYNC, $CELL_HOME/.pi/agent/scripts, beside the supervisor, in $SELF_DIR/.. and in $REPO/scripts) — the review registry stays LOCAL-ONLY here (#2577)"
+        result="${result}${result:+; }registry union NOT RUN (script absent)"
+      elif [ "$dry" = "--dry-run" ]; then
+        log "[hygiene] WOULD run: registry-sync.sh union (the cross-box review-record registry, now counted in refs=/files=)"
+        result="${result}${result:+; }would union the review registry"
+      elif cell_stopped_midpass; then
+        result="${result}${result:+; }STOP arrived mid-pass — review-registry union skipped"
+      else
+        # The STORE resolution order is the cell bring-up's: the farmed copy has no repo above it, so
+        # name the checkout whose remote carries refs/reviews/*. No candidate = let registry-sync.sh
+        # resolve for itself rather than passing an empty --repo.
+        for store in "${DOCTOR_REGISTRY_STORE:-}" "${HARNESS_REPO:-}" "${AGENT_INFRA_PATH:-}"; do
+          [ -n "$store" ] && [ -d "$store" ] && break
+          store=""
+        done
+        rs_store_args=()
+        [ -n "$store" ] && rs_store_args=(--repo "$store")
+        # ⏤ #2520: ASK BEFORE RUNNING. A withheld invocation leaves NO exit status at all — the
+        # guard refuses the whole command — so no arm on the run's rc can report it. `surface-check`
+        # answers 0 surface-intact / 5 surface-defective / 3 cannot-check, and running it here is what
+        # makes a refused registry visible in the log instead of reading as a silent, permanent
+        # LOCAL-ONLY box. Cheap: it only reads the script's own source.
+        # ⛔ WHAT 0 DOES NOT MEAN: the guard has a SECOND content arm (#1484/#1485) that blocks a
+        # script whose content pushes/updates refs in a HUB-ROOTED session unless the script is on
+        # the guard's sanctioned list, and NO surface check can change that (#2621). A
+        # registry sync must push, so on a hub-rooted box the union is still withheld; the log below
+        # reports what this check actually verified, never "the guard will run it".
+        rs_out="$(run_bounded "$DOCTOR_REGISTRY_NET_TIMEOUT" bash "$rsync" surface-check 2>&1)"; rc=$?
+        if [ "$rc" -ne 0 ]; then
+          # ⛔ ONLY rc=5 IS A GUARD ATTRIBUTION. Every other non-zero was being folded into "the
+          # checkout-guard would withhold it" — but a bound firing (124), a script bash could not
+          # parse (2) or an interpreter/script that vanished (127) is NOT a guard refusal, and a log
+          # that names the guard sends the next lane to re-litigate the gate instead of fixing the
+          # fault. The union does not run on any of them (fail closed); only the STATEMENT differs,
+          # and each arm names the cause it actually has.
+          if [ "$rc" -eq 3 ]; then
+            log "[hygiene] WARN review-registry union NOT RUN — could not VERIFY the script's git surface (surface-check rc=3, NOT VERIFIED): the registry is UNCHANGED, not converged, and the cause is NOT a guard refusal: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
+            result="${result}${result:+; }registry union NOT RUN — git surface could not be verified"
+          elif [ "$rc" -eq 5 ]; then
+            log "[hygiene] WARN review-registry union NOT RUN — the script's git surface is DEFECTIVE (#2520, surface-check rc=5), so the guard would withhold every verb; the registry is UNCHANGED, not converged: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
+            result="${result}${result:+; }registry union REFUSED — git surface defect (#2520)"
+          else
+            log "[hygiene] WARN review-registry union NOT RUN — surface-check did NOT answer (rc=$rc: bound fired, unparseable script, or interpreter missing), so the cause is UNKNOWN and is NOT a guard refusal; the registry is UNCHANGED, not converged: $(printf '%s' "$rs_out" | tr '\n' ' ' | cut -c1-240)"
+            result="${result}${result:+; }registry union NOT RUN — surface-check rc=$rc, cause unknown"
+          fi
+        else
+        rs_why=""
+        # --dir is EXPLICIT: the registry the cell's LANES read is this HOME's, and a step that
+        # certified a registry nobody reads would be the same false green as no count at all.
+        rs_out="$(run_bounded "$DOCTOR_REGISTRY_SYNC_TIMEOUT" bash "$rsync" union \
+                   --dir "$CELL_HOME/.pi/agent/reviews" \
+                   ${rs_store_args[@]+"${rs_store_args[@]}"} \
+                   --timeout "$DOCTOR_REGISTRY_NET_TIMEOUT" --quiet 2>&1)"; rc=$?
+        # The convergence line (`<verb>: refs=N files=N added=N updated=N skipped=N`) is the whole
+        # reason the script grew it: ONE line in this log says whether the fleet's records arrived.
+        rs_refs="$(printf '%s\n' "$rs_out" | grep -E '^[a-z-]+: refs=' | tail -1)"
+        if [ -z "$rs_refs" ]; then
+          case "$rc" in
+            # ⛔ 143 IS THE BOUND FIRING ON A BOX WITH NO `timeout(1)`. `run_bounded` falls back to
+            # `bounded` (a watchdog: TERM then KILL), which leaves 143 — and stock macOS, which the
+            # script names as a supported box, has no `timeout`. Without 143 here a bound-killed
+            # union logged "FAILED … cause UNKNOWN" on exactly the platform the harness documents as
+            # the messy one, and the one datum that says "raise the bound / this box is too slow"
+            # (measured: watchdog-arm kill → 143) was replaced by a failure that looks like a push
+            # fault.
+            124|137|143) rs_refs="union TIMED OUT after ${DOCTOR_REGISTRY_SYNC_TIMEOUT}s (no summary printed)" ;;
+            *)     rs_refs="union rc=$rc with NO counts line — the registry state is UNKNOWN" ;;
+          esac
+        fi
+        case "$rc" in
+          0) log "[hygiene] review-registry $rs_refs"
+             result="${result}${result:+; }registry ${rs_refs#*: }" ;;
+          3|4) # ⛔ THE NUMBER THAT SAYS WHY IS ALREADY IN `$rs_out`. `skipped=` is the UNREADABLE
+             # class only, so a DIVERGENT registry logged "NOT a converged state … skipped=0" in one
+             # breath, and the conflicts count and the keys naming them were discarded even though
+             # the step held them — measured: `union: … conflicts=2 …` plus `2 record(s) DIVERGE at
+             # the same reviewed_at: …-3001 …-3002` logged as `registry rc=3 … skipped=0`. The
+             # script prints that verdict line itself, so the doctor carries it through instead of
+             # paraphrasing the state as "0 skipped".
+             # A SKIP VERDICT IS TWO LINES ("… were SKIPPED … — this is" + "NOT a converged state …"),
+             # so take the pair or the sentence dangles; a DIVERGE verdict is one line.
+             rs_why="$(printf '%s\n' "$rs_out" | grep -A1 -E 'record\(s\) (DIVERGE|were SKIPPED)' | tr '\n' ' ' | sed 's/   */ /g; s/ *$//')"
+             # ⛔ AND THE KEYS TO ACT ON. The script prints `⚠️ skip <key> — …` per defective record, and
+             # the doctor greps only the counts line and the verdict line, so the one datum an operator
+             # needs (WHICH records) was dropped. The verdict line names conflicts, not skips, and a
+             # skip on THIS box's own record is exactly the case the counts cannot express.
+             # ⛔ DEDUPE BEFORE THE CAP: the script prints one `⚠️ skip <key> —` line PER DIRECTION, so
+             # one defective record yields two identical keys and `tail -3` would cap LINES, hiding a
+             # distinct third key behind a duplicate (the same artefact this head removed from
+             # `conflicts=`/`unreadable=`).
+             rs_keys="$(printf '%s\n' "$rs_out" | sed -nE 's/.*skip ([^ ]+) —.*/\1/p' | awk '!seen[$0]++' | head -3 | tr '\n' ' ' | sed 's/ *$//')"
+             [ -n "$rs_why" ] || rs_why="no verdict line from the sync script"
+             [ -z "$rs_keys" ] || rs_why="$rs_why [keys: $rs_keys]"
+             log "[hygiene] WARN review-registry union rc=$rc — NOT a converged state ($rs_refs; $rs_why): nothing was overwritten, but a record this box cannot USE was skipped (on the store side or this box) or records DIVERGE here (#2374 rules 1/4). The merge role keeps treating a missing record as its own verdict."
+             result="${result}${result:+; }registry rc=$rc ${rs_refs#*: } ($rs_why)" ;;
+          # ⛔ A BOUND FIRING IS NOT A FAILURE. 124/137 are `timeout(1)`; 143 is the watchdog arm
+          # `run_bounded` uses where `timeout` does not exist (stock macOS). Folding all three into
+          # "union FAILED" told an operator to look for a push fault, when the actionable datum is
+          # "this box is too slow for the bound" — the only remedy that differs.
+          124|137|143) log "[hygiene] WARN review-registry union TIMED OUT rc=$rc after ${DOCTOR_REGISTRY_SYNC_TIMEOUT}s ($rs_refs) — the registry did NOT converge on this pass. Raise DOCTOR_REGISTRY_SYNC_TIMEOUT (or shrink the registry) and re-run; nothing was overwritten. Not fatal by design (#2577)."
+             result="${result}${result:+; }registry union TIMED OUT rc=$rc" ;;
+          *) log "[hygiene] WARN review-registry union FAILED rc=$rc ($rs_refs) — this box's registry did NOT converge, so a PR reviewed on a PEER still reads NO-RECORD in the merge role until a later pass succeeds. Not fatal by design (#2577): the failure direction is fewer records, which the merge role already treats as cannot-verify."
+             result="${result}${result:+; }registry union FAILED rc=$rc" ;;
+        esac
+        fi
+      fi ;;
+  esac
+  # 7) THE `df` DELTA — before → after, signed, on the filesystem this pass reclaims from.
   df_after="$(hyg_df_mb "$CELL_HOME")"
   if [ -n "$df_before" ] && [ -n "$df_after" ]; then
     log "[hygiene] df ($CELL_HOME): $(hyg_df_delta "$df_before" "$df_after")"

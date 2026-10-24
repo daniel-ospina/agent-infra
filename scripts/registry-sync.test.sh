@@ -31,6 +31,11 @@
 #   §22 a legacy <pr>.json whose own `pr` field denies its filename is never published
 #   §23 `status` counts the STORE's records, not this box's cache
 #   §24 every network op is BOUNDED and cannot block on an invisible prompt
+#   §27 the convergence line — refs/files/added/updated/skipped counted from the RUN (#2577)
+#   §28 surface-check — this script's git surface is intact; a dynamic or unlisted verb is exit 5 (#2520)
+#   §29 a trailing-newline-only local record is CANONICALISED to the published bytes (#2577)
+#   §30 the equality fast path never MASKS an unstamped or mis-keyed record that is already
+#       mirrored here — it is still counted unreadable (exit 4), never `same` (#2577 rules 1/3)
 
 set -uo pipefail
 
@@ -170,6 +175,15 @@ rs_rc "$BOX1" push
 assert_eq "$RS_RC" "3" "§5 push diverges too (same timestamp, still different bytes)"
 assert_contains "$(git -C "$STORE" show "refs/reviews/$KEY:record.json")" "$HEAD_A" \
   "§5 ...and the divergence did not reach the shared store either"
+
+# ── §5b: `union` runs pull AND push, so ONE divergent record is detected twice. The count is what an
+# operator reads in one log line and what a scheduler trends, so it must name DISTINCT records —
+# measured before the fix: `conflicts=2` for one key, listed twice, exit 3.
+echo "── §5b union counts a divergent record ONCE, not once per direction"
+rs_rc "$BOX1" union
+assert_eq "$RS_RC" "3" "§5b union still exits 3 on divergence"
+assert_contains "$RS_LAST" "conflicts=1 " "§5b ...and counts the ONE divergent record once (conflicts=1, not 2)"
+assert_contains "$RS_LAST" "1 record(s) DIVERGE" "§5b ...and the message names one record, not two"
 
 echo "── §6 two repos' legacy <pr>.json files are never collapsed"
 # clear §5's deliberate divergence first, so this section's summaries are unambiguous
@@ -580,10 +594,10 @@ EOS
 chmod +x "$SHIM/git"
 START="$(date +%s)"
 # ⛔ THE ENV IS FORCED, not inherited: this harness (and every fleet agent shell) already exports
-# GIT_TERMINAL_PROMPT=0, so a shim that simply reports the inherited value prints `0` even if `git_b`
-# dropped its own assignment — an assertion satisfied by the ambient environment is not a test
-# (verified by mutation: deleting git_b's assignment left the suite green until this sentinel
-# existed). With a sentinel, only git_b's own export can produce `0`.
+# GIT_TERMINAL_PROMPT=0, so a shim that simply reports the inherited value prints `0` even if the
+# bounded runner dropped its own assignment — an assertion satisfied by the ambient environment is
+# not a test (verified by mutation: deleting the assignment left the suite green until this sentinel
+# existed). With a sentinel, only the runner's own export can produce `0`.
 RS_LAST="$(GIT_TERMINAL_PROMPT=__ambient_must_not_win__ PATH="$SHIM:$PATH" bash "$SYNC" pull --repo "$STORE" --dir "$BOX2" --remote origin --timeout 2 2>&1)"; RS_RC=$?
 ELAPSED=$(( $(date +%s) - START ))
 assert_eq "$RS_RC" "1" "§24 a store that never answers is a non-zero exit (never a hang)"
@@ -663,6 +677,453 @@ assert_contains "$RS_LAST" "not readable here" "§26 ...and each such key is NAM
 assert_contains "$RS_LAST" "unreadable=" "§26 ...and counted"
 assert_contains "$RS_LAST" "failed=0" "§26 ...as unreadable, not as a failed move"
 if grep -qE 'unreadable=0' <<<"$RS_LAST"; then bad "§26 the run counted NOTHING despite receiving nothing"; else ok "§26 the counter is non-zero (the pre-fix arm reported 0/0 and exited 0)"; fi
+
+# ═══ 27. the CONVERGENCE LINE: refs/files/added/updated/skipped (#2520, #2577) ═══
+# #2577's whole complaint is that "the registry is converged" and "the registry never received
+# anything" read alike in a log. These are the counts that separate them, and they must be counted
+# from the RUN (what was actually written), never inferred from the store's size.
+echo "── §27 a writing verb reports refs= files= added= updated= skipped="
+ORIGIN6="$T/origin6.git"; STORE6="$T/store6"; BOX8="$T/box8"; BOX9="$T/box9"
+git init -q --bare "$ORIGIN6"
+for d in "$STORE6" "$BOX8" "$BOX9"; do mkdir -p "$d"; done
+git -C "$STORE6" init -q
+git -C "$STORE6" remote add origin "$ORIGIN6"
+git -C "$STORE6" config user.email sync@test.invalid
+git -C "$STORE6" config user.name  sync-test
+git -C "$STORE6" commit -q --allow-empty -m seed
+git -C "$STORE6" push -q origin HEAD:refs/heads/main
+KEYG="daniel-ospina-agent-infra-1818"
+mint "$BOX9" "$KEYG" "2026-11-10T10:00:00Z" "$HEAD_A" daniel-ospina/agent-infra 1818
+rsx "$STORE6" "$BOX9" push >/dev/null 2>&1
+RS_LAST="$(rsx "$STORE6" "$BOX8" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§27 a pull into an empty registry is rc 0"
+assert_contains "$RS_LAST" "refs=1" "§27 refs= counts the refs the STORE lists"
+assert_contains "$RS_LAST" "files=1" "§27 files= counts this box's records AFTER the run"
+assert_contains "$RS_LAST" "added=1" "§27 the materialised record is counted ADDED (this box had none)"
+assert_contains "$RS_LAST" "updated=0" "§27 ...and not UPDATED"
+assert_contains "$RS_LAST" "skipped=0" "§27 ...and nothing was skipped"
+RS_LAST="$(rsx "$STORE6" "$BOX8" pull 2>&1)"
+assert_contains "$RS_LAST" "added=0" "§27 a converged re-run adds NOTHING (idempotent, counted)"
+assert_contains "$RS_LAST" "files=1" "§27 ...and the file count is unchanged"
+assert_contains "$RS_LAST" "same=1" "§27 ...and the record is reported SAME, not rewritten"
+mint "$BOX9" "$KEYG" "2026-11-11T10:00:00Z" "$HEAD_B" daniel-ospina/agent-infra 1818
+rsx "$STORE6" "$BOX9" push >/dev/null 2>&1
+RS_LAST="$(rsx "$STORE6" "$BOX8" pull 2>&1)"
+assert_contains "$RS_LAST" "added=0" "§27 a NEWER peer record is not counted as ADDED..."
+assert_contains "$RS_LAST" "updated=1" "§27 ...it is counted UPDATED (it replaced an older local record)"
+assert_contains "$RS_LAST" "files=1" "§27 ...and still one file"
+# an UNREADABLE peer record is SKIPPED and COUNTED — it must never be written, and it must move the
+# exit off 0 (an unreadable store is not a converged one).
+seed_payload "$STORE6" "daniel-ospina-agent-infra-1919" '{"pr":1919,"head_sha":"not json at all' 
+RS_LAST="$(rsx "$STORE6" "$BOX8" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§27 an unreadable peer record is exit 4, not converged"
+assert_contains "$RS_LAST" "skipped=1" "§27 ...and counted skipped=1"
+assert_contains "$RS_LAST" "files=1" "§27 ...and NOT written: the file count did not move"
+assert_absent "$BOX8" "$BOX8/daniel-ospina-agent-infra-1919.json" "§27 ...no file appeared for the unreadable record"
+
+# ═══ 28. the SURFACE CHECK: the guard can classify this script (#2520) ════════
+# The regression fence for #2520 itself. The bug was not a wrong answer from the guard — it was
+# that the script's ONE dynamic-argv wrapper made EVERY verb un-runnable from an agent's shell, and
+# the refusal left no exit status at all. `surface-check` restates the two surface rules the script
+# itself must keep, and §28 pins that restatement against the guard's own classifier below.
+# ⛔ A 0 HERE IS NOT "THE GUARD WILL RUN IT". The guard's SECOND content arm (#1484/#1485) blocks a
+# script whose content pushes/updates refs in a HUB-ROOTED session unless it is on the guard's
+# sanctioned list, and a registry sync must push — so the contract is "this script has not
+# re-introduced the surface defect", which is what the message says and what the doctor relies on
+# (#2621).
+echo "── §28 surface-check: 0 when this script's git surface is intact, 5 when it is defective"
+OUT="$(bash "$SYNC" surface-check 2>&1)"; RC=$?
+assert_eq "$RC" "0" "§28 the shipped script's git surface is INTACT (no dynamic verb, no working-tree verb)"
+assert_contains "$OUT" "every git invocation" "§28 ...and it says so in one line"
+assert_contains "$OUT" "NOT a claim that the guard will run the script from a hub-rooted session" \
+  "§28 ...and it does NOT claim the guard will run it (the #2621 residual, stated not implied)"
+# ⛔ THE FIXTURES ARE ASSEMBLED WITH %s PLACEHOLDERS, and the reason is the guard itself: it reads
+# a script an agent asks it to run, and its tokenizer scans STRING LITERALS as text, so a test file
+# that spells the refused construct verbatim is refused WHOLE (measured: `Form: script-indirection`
+# on this very suite). Substituting at runtime puts the construct in the FIXTURE (which the guard
+# never reads — it does not exist when the command is classified) and not in this file.
+# a fixture that reintroduces the dynamic verb — the exact construct #2520 was filed on
+BAD="$T/registry-sync-dynamic.sh"
+cp "$SYNC" "$BAD"
+printf '\nbad_one() { "timeout" 5 git -C "%s" -c gc.auto=0 "%s"; }\n' "$STORE" '$@' >> "$BAD"
+OUT="$(bash "$BAD" surface-check 2>&1)"; RC=$?
+assert_eq "$RC" "5" "§28 a dynamic-argv wrapper is REFUSED (exit 5) — the check is non-vacuous"
+assert_contains "$OUT" "dynamic verb" "§28 ...and the refusal names the construct"
+assert_contains "$OUT" "#2520" "§28 ...and names the issue, so the next lane does not rediscover it"
+WT="$T/registry-sync-wt.sh"
+cp "$SYNC" "$WT"
+printf '\nbad_two() { git -C "$STORE" %s -- .; }\n' "chec"'kout' >> "$WT"
+OUT="$(bash "$WT" surface-check 2>&1)"; RC=$?
+assert_eq "$RC" "5" "§28 a working-tree verb is REFUSED (exit 5) — a registry sync only moves refs and blobs"
+assert_contains "$OUT" "working-tree verb" "§28 ...and it says which class of verb it found"
+# ⛔ THE ALLOWLIST IS CLOSED, and this case is why. surface-check used to enumerate the FORBIDDEN
+# verbs, which under-refuses by construction: a fixture that re-added `merge`, `rebase`, `stash`,
+# `cherry-pick`, `revert`, `am` or `pull` printed OK and exited 0, because none of them was listed.
+# The verb below is assembled from fragments for the same guard reason as the fixtures above.
+WT2="$T/registry-sync-wt2.sh"
+cp "$SYNC" "$WT2"
+printf '\nbad_three() { git -C "%s" %s push -u; }\n' "$STORE" "sta"'sh' >> "$WT2"
+OUT="$(bash "$WT2" surface-check 2>&1)"; RC=$?
+assert_eq "$RC" "5" "§28 an UNLISTED working-tree verb (stash) is REFUSED — the allowlist is closed, not a blocklist"
+assert_contains "$OUT" "working-tree verb" "§28 ...and it names the class, so the fix is obvious"
+# ⛔ AND THE CASE THAT ACTUALLY DISCRIMINATES. `stash` is in the working-tree CLASS string, so a
+# rewrite that reverts to "block the wt list, allow everything else" still returns 5 for it — the
+# assertion above would stay green through the exact regression it names. A verb in NEITHER list is
+# refused only by the allowlist branch, so this is the fence (review cycle 2).
+WT3="$T/registry-sync-wt3.sh"
+cp "$SYNC" "$WT3"
+printf '\nbad_four() { git -C "%s" gre''p foo; }\n' "$STORE" >> "$WT3"
+OUT="$(bash "$WT3" surface-check 2>&1)"; RC=$?
+assert_eq "$RC" "5" "§28 a verb in NEITHER list is REFUSED (exit 5) — only a closed allowlist can do that"
+assert_contains "$OUT" "unlisted verb" "§28 ...and it says the verb is unlisted, not that it rewrites a tree"
+# "I could not check" is not a pass either.
+mkdir -p "$T/nopath"
+OUT="$(env PATH="$T/nopath" "$BASH" "$SYNC" surface-check 2>&1)"; RC=$?
+assert_eq "$RC" "3" "§28 a check that cannot run is exit 3 (NOT VERIFIED), never 0"
+assert_contains "$OUT" "NOT VERIFIED" "§28 ...and it says so instead of implying a pass"
+# ⛔ THE RESTATEMENT IS PINNED AGAINST THE GUARD ITSELF. surface-check deliberately restates two
+# guard rules (it must never under-refuse); this assertion runs the REAL classifier over the REAL
+# script, so a restatement that drifts from the guard reads as a red suite, not a quiet false OK.
+CLASSIFIER="$SCRIPT_DIR/../extensions/main-worktree-guard/classify-git.mjs"
+if [ -f "$CLASSIFIER" ] && command -v node >/dev/null 2>&1; then
+  PROBE="$T/classifier-probe.mjs"
+  cat > "$PROBE" <<'NODE'
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+const [cls, script] = process.argv.slice(2);
+const m = await import(pathToFileURL(resolve(cls)).href);
+const d = m.extractWorkingTreeDiscards(readFileSync(script, "utf8")) ?? [];
+for (const x of d) console.log(`form=${x.form} verb=${JSON.stringify(x.verb)}`);
+console.log(`discards=${d.length}`);
+NODE
+  OUT="$(node "$PROBE" "$CLASSIFIER" "$SYNC" 2>&1)"
+  assert_contains "$OUT" "discards=0" "§28 the guard OWN classifier finds no discard in the shipped script"
+else
+  echo "  ⚠️ §28 classifier cross-check skipped (no node or no $CLASSIFIER) — the restatement assertions above still ran"
+fi
+
+# ═══ 29. a FORMATTING-ONLY difference is canonicalised, not re-read for ever (#2577) ═══
+# Measured on the reference box: 3,261 of 3,462 records were exactly one TRAILING NEWLINE away
+# from their own ref (an older pull's artefact). `same_bytes` is exact, so those records could
+# never reach the equality fast path and every pass re-read the whole registry at two git
+# processes per record — the cost that makes a bounded hourly step impossible. The repair is to
+# rewrite the local file to the PUBLISHED bytes: not a re-decision (stamp, verdict and head are
+# already equal, and rule 4 protects records that DISAGREE), and COUNTED as a write, because it is
+# one. Without this test the canonicalisation could be deleted and the suite would stay green.
+echo "── §29 a trailing-newline-only difference is rewritten to the published bytes"
+ORIGIN7="$T/origin7.git"; STORE7="$T/store7"; BOX10="$T/box10"
+git init -q --bare "$ORIGIN7"; mkdir -p "$STORE7" "$BOX10"
+git -C "$STORE7" init -q; git -C "$STORE7" remote add origin "$ORIGIN7"
+git -C "$STORE7" config user.email sync@test.invalid; git -C "$STORE7" config user.name sync-test
+git -C "$STORE7" commit -q --allow-empty -m seed; git -C "$STORE7" push -q origin HEAD:refs/heads/main
+KEYH="daniel-ospina-agent-infra-1819"
+mint "$BOX10" "$KEYH" "2026-11-12T10:00:00Z" "$HEAD_A" daniel-ospina/agent-infra 1819
+rsx "$STORE7" "$BOX10" push >/dev/null 2>&1
+printf '\n' >> "$BOX10/$KEYH.json"                # the historical artefact: one extra newline
+RS_LAST="$(rsx "$STORE7" "$BOX10" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§29 the canonicalising pull is a clean pass"
+assert_contains "$RS_LAST" "canon $KEYH" "§29 ...and it names the record it canonicalised"
+assert_contains "$RS_LAST" "wrote=1" "§29 ...and counts the rewrite as a write (never a silent edit)"
+PUB="$(git -C "$STORE7" rev-parse --verify "refs/reviews/$KEYH:record.json")"
+git -C "$STORE7" cat-file blob "$PUB" > "$T/pub-$KEYH.json"
+if cmp -s "$T/pub-$KEYH.json" "$BOX10/$KEYH.json"; then
+  ok "§29 ...and the local file is BYTE-IDENTICAL to the published record"
+else
+  bad "§29 the local file still differs from the published bytes ($(wc -c < "$BOX10/$KEYH.json") vs $(wc -c < "$T/pub-$KEYH.json"))"
+fi
+RS_LAST="$(rsx "$STORE7" "$BOX10" pull 2>&1)"
+assert_contains "$RS_LAST" "wrote=0" "§29 a second pass writes nothing (the difference is gone, not re-repaired)"
+assert_contains "$RS_LAST" "same=1" "§29 ...and the record reads SAME — what the equality fast path compares"
+
+# ═══ 30. the equality fast path never MASKS a record the full comparison calls UNREADABLE ═══
+# The fast path answers "same blob id → nothing to decide", which is only true when the record is
+# one this box may USE. Two store-side defects are counted `unreadable` (exit 4) by the full
+# comparison and must stay counted even on a box that already mirrors the bytes: a record with no
+# readable `reviewed_at` (no ordering rule can be applied) and a record whose own repo/pr DENY the
+# key it sits under (the #426 transplant). Without these cases, filtering the fast-path map by
+# usability/stamp/identity could be deleted and the suite would stay green — while `union`
+# returned 0 ("converged") over a record the merge gate cannot use.
+echo "── §30 the fast path does not mask an unstamped or mis-keyed record that is already mirrored"
+ORIGIN8="$T/origin8.git"; STORE8="$T/store8"; BOX11="$T/box11"
+git init -q --bare "$ORIGIN8"; mkdir -p "$STORE8" "$BOX11"
+git -C "$STORE8" init -q; git -C "$STORE8" remote add origin "$ORIGIN8"
+git -C "$STORE8" config user.email sync@test.invalid; git -C "$STORE8" config user.name sync-test
+git -C "$STORE8" commit -q --allow-empty -m seed; git -C "$STORE8" push -q origin HEAD:refs/heads/main
+K_NO_STAMP="daniel-ospina-agent-infra-2001"
+K_MISKEYED="daniel-ospina-agent-infra-2002"
+seed_payload "$STORE8" "$K_NO_STAMP" "{\"pr\":2001,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\"}"
+seed_payload "$STORE8" "$K_MISKEYED" "{\"pr\":2002,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"other/repo\",\"reviewed_at\":\"2026-11-13T10:00:00Z\"}"
+# mirror BOTH payloads byte-for-byte, which is the ONLY state in which the fast path can fire
+mirror() { # <key>
+  local b
+  b="$(git -C "$STORE8" rev-parse --verify "refs/reviews/$1:record.json")"
+  git -C "$STORE8" cat-file blob "$b" > "$BOX11/$1.json"
+}
+mirror "$K_NO_STAMP"; mirror "$K_MISKEYED"
+RS_LAST="$(rsx "$STORE8" "$BOX11" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30 a mirrored record with no reviewed_at is still NOT converged (exit 4)"
+assert_contains "$RS_LAST" "unreadable=2" "§30 ...and BOTH defects are counted (unstamped + mis-keyed), not reported same"
+assert_contains "$RS_LAST" "skipped=2" "§30 ...and the convergence line reports them as skipped"
+assert_contains "$RS_LAST" "no readable reviewed_at" "§30 ...naming the unstamped record"
+assert_contains "$RS_LAST" "NOT this key" "§30 ...and naming the mis-keyed one"
+
+# ── §30b: the TWO shapes where the fast path and `pull_one` disagreed (§30 pinned only the two
+# the author thought of). Both are MIRRORED byte-for-byte, so the fast path is the only thing that
+# could answer them — and it used to answer `same`/exit 0 while `pull_one` refuses both.
+#  1. a NEGATIVE pr: `fast_ok` accepted any int, `pull_one` requires `^[0-9]+$`.
+#  2. a DUPLICATED key: `field()` is a greedy sed (takes the LAST match), json.load takes the last
+#     duplicate KEY — a nested `"reviewed_at":""` reads empty to one and non-empty to the other.
+echo "── §30b the fast path never answers \`same\` where the full comparison says unreadable"
+K_NEG_PR="daniel-ospina-agent-infra--2003"
+K_DUP_STAMP="daniel-ospina-agent-infra-2004"
+seed_payload "$STORE8" "$K_NEG_PR" "{\"pr\":-2003,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\"}"
+seed_payload "$STORE8" "$K_DUP_STAMP" "{\"pr\":2004,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\",\"evidence\":{\"reviewed_at\":\"\"}}"
+mirror "$K_NEG_PR"; mirror "$K_DUP_STAMP"
+RS_LAST="$(rsx "$STORE8" "$BOX11" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30b a mirrored NEGATIVE-pr / duplicated-key record is NOT converged (exit 4)"
+assert_contains "$RS_LAST" "unreadable=4" "§30b ...and all FOUR defects are counted, none reported same"
+assert_contains "$RS_LAST" "no usable pr field" "§30b ...naming the negative-pr record"
+assert_contains "$RS_LAST" "no readable reviewed_at" "§30b ...and the duplicated-key record (the greedy reader's empty stamp)"
+
+# ── §30c: the LEGACY name. A `<pr>.json` file does not derive from the record's own fields, and
+# `local_record_for_key` will still hand it to the key its `repo` implies — so a legacy record whose
+# own `pr` DENIES the key it sits under must never be fast-eligible (measured: it answered
+# `same`/exit 0 while the slow path says "NOT this key"/exit 4).
+echo "── §30c a LEGACY-named mirror is never answered as same when it denies the key it sits under"
+K_LEGACY="daniel-ospina-agent-infra-2005"
+seed_payload "$STORE8" "$K_LEGACY" "{\"pr\":2006,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\"}"
+LEGACY_BLOB="$(git -C "$STORE8" rev-parse --verify "refs/reviews/$K_LEGACY:record.json")"
+git -C "$STORE8" cat-file blob "$LEGACY_BLOB" > "$BOX11/2005.json"
+RS_LAST="$(rsx "$STORE8" "$BOX11" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30c a legacy-named mirror that denies its key is NOT converged (exit 4)"
+assert_contains "$RS_LAST" "unreadable=5" "§30c ...and it is COUNTED with the other four, never reported same"
+assert_contains "$RS_LAST" "NOT this key" "§30c ...naming the key the record denies"
+
+# ── §30d: WHITESPACE. `{"pr": 441, …}` is ordinary valid JSON (json.load, the rail's read_record and
+# the fast path all accept it) but the field reader's sed had no `[[:space:]]*` after the colon, so it
+# read `" 441"` / `" 2026-12-31T00:00:00Z"`. Two consequences, both measured before the fix: (a) the
+# same bytes were `same`/exit 0 on a box holding a mirror and `unreadable`/exit 4 on a box without
+# one, and (b) a LEADING SPACE sorts below any digit-leading stamp, so an OLDER peer record won the
+# ordering compare and REPLACED a NEWER local one with `older_refused=0`, `conflicts=0`, exit 0 —
+# rule 1 inert. Reachable by any record that went through another serializer or a hand repair.
+echo "── §30d a whitespace-shaped record is read the same way the fast path reads it"
+ORIGIN9="$T/origin9.git"; STORE9="$T/store9"; BOX12="$T/box12"
+git init -q --bare "$ORIGIN9"; mkdir -p "$STORE9" "$BOX12"
+git -C "$STORE9" init -q; git -C "$STORE9" remote add origin "$ORIGIN9"
+git -C "$STORE9" config user.email sync@test.invalid; git -C "$STORE9" config user.name sync-test
+git -C "$STORE9" commit -q --allow-empty -m seed; git -C "$STORE9" push -q origin HEAD:refs/heads/main
+K_WS="daniel-ospina-agent-infra-2007"
+seed_payload "$STORE9" "$K_WS" "{\"pr\": 2007, \"head_sha\": \"$HEAD_A\", \"verdict\": \"clean\", \"repo\": \"daniel-ospina/agent-infra\", \"reviewed_at\": \"2026-11-13T10:00:00Z\"}"
+RS_LAST="$(rsx "$STORE9" "$BOX12" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§30d a pretty-printed peer record materialises (exit 0, not refused as unreadable)"
+assert_contains "$RS_LAST" "wrote=1" "§30d ...and it is WRITTEN, not skipped"
+assert_contains "$RS_LAST" "unreadable=0" "§30d ...with nothing counted unreadable"
+# and the file the box got is the peer's bytes, readable by the rail's own field expectations
+assert_eq "$(grep -c '"pr": 2007' "$BOX12/$K_WS.json")" "1" "§30d ...and the materialised file carries the peer's own bytes"
+
+# rule 1 against a whitespace-stamped local record: NEWER local must survive an OLDER peer
+K_WS2="daniel-ospina-agent-infra-2008"
+seed_payload "$STORE9" "$K_WS2" "{\"pr\":2008,\"head_sha\":\"$HEAD_A\",\"verdict\":\"not-clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T00:00:00Z\"}"
+printf '{"pr": 2008, "head_sha": "%s", "verdict": "clean", "repo": "daniel-ospina/agent-infra", "reviewed_at": "2026-12-31T00:00:00Z"}' "$HEAD_B" > "$BOX12/$K_WS2.json"
+cp "$BOX12/$K_WS2.json" "$T/ws2.before"
+RS_LAST="$(rsx "$STORE9" "$BOX12" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§30d an older peer never costs the run its exit status"
+assert_contains "$RS_LAST" "older_refused=1" "§30d ...an OLDER peer record is REFUSED against a newer whitespace-stamped local one"
+assert_contains "$RS_LAST" "wrote=0" "§30d ...and nothing is written"
+if cmp -s "$BOX12/$K_WS2.json" "$T/ws2.before"; then
+  ok "§30d ...and the newer local record is left BYTE-IDENTICAL (rule 1 holds for whitespace JSON)"
+else
+  bad "§30d the newer local record was REWRITTEN — the ordering compare read a whitespace-prefixed stamp as older"
+fi
+
+# ── §30d(2): the OTHER two whitespace halves. `"name" : value` (space BEFORE the colon) and
+# `{"pr":441 , …}` (space before the comma) are both valid JSON and both needed a separate piece of
+# the fix; a fence that only exercised `": "` would stay green if either half were deleted, and the
+# record would regress to `unreadable`/exit 4 exactly as `{"pr": 441}` did.
+K_WS3="daniel-ospina-agent-infra-2009"
+seed_payload "$STORE9" "$K_WS3" "{\"pr\" : 2009, \"head_sha\" : \"$HEAD_A\", \"verdict\" : \"clean\", \"repo\" : \"daniel-ospina/agent-infra\", \"reviewed_at\" : \"2026-11-13T10:00:00Z\"}"
+RS_LAST="$(rsx "$STORE9" "$BOX12" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§30d(2) a record written {\"pr\" : 441, …} materialises (space BEFORE the colon)"
+assert_contains "$RS_LAST" "added=1" "§30d(2) ...and it is written, not skipped as unreadable"
+K_WS4="daniel-ospina-agent-infra-2010"
+seed_payload "$STORE9" "$K_WS4" "{\"pr\":2010 , \"head_sha\":\"$HEAD_A\" , \"verdict\":\"not-clean\" , \"repo\":\"daniel-ospina/agent-infra\" , \"reviewed_at\":\"2026-01-01T00:00:00Z\"}"
+printf '{"pr":2010 , "head_sha":"%s" , "verdict":"clean" , "repo":"daniel-ospina/agent-infra" , "reviewed_at":"2026-12-31T00:00:00Z"}' "$HEAD_B" > "$BOX12/$K_WS4.json"
+cp "$BOX12/$K_WS4.json" "$T/ws4.before"
+RS_LAST="$(rsx "$STORE9" "$BOX12" pull 2>&1)"; RS_RC=$?
+# ⛔ ASSERT ON THIS RECORD, NOT ON THE COUNTER: BOX12 already holds §30d's `…-2008` (newer than its
+# own peer), so every later pull in this box also counts one `older_refused` — an `older_refused=1`
+# assertion measured the previous fixture, not this one (and failed in CI for exactly that reason).
+assert_contains "$RS_LAST" "keep daniel-ospina-agent-infra-2010" "§30d(2) a stamp with a space before the comma still ORDERS (space before the comma is trimmed)"
+assert_contains "$RS_LAST" "unreadable=0" "§30d(2) ...and no field with a trailing space is read as unusable"
+if cmp -s "$BOX12/$K_WS4.json" "$T/ws4.before"; then
+  ok "§30d(2) ...and the newer local record survives byte-identically"
+else
+  bad "§30d(2) the newer local record was rewritten — the trailing trim is missing from the field reader"
+fi
+
+# ── §30e: THE TWO READERS. json (the rail, and the fast path) and `field` (the slow path) must read
+# the SAME value for every COMPARED key, or the slow path decides on a value json never saw. Measured
+# before the fix: a nested `evidence:{"head_sha":…}` on an EARLIER line made `field` read the nested
+# head, so a genuine divergence at a shared stamp was reported `same`/exit 0 — the false convergence
+# the header forbids. Such a record is now UNREADABLE (exit 4), on `pull` AND on `push`.
+echo "── §30e a record json and field read DIFFERENTLY is unreadable, never guessed at"
+ORIGIN10="$T/origin10.git"; STORE10="$T/store10"; BOX13="$T/box13"
+git init -q --bare "$ORIGIN10"; mkdir -p "$STORE10" "$BOX13"
+git -C "$STORE10" init -q; git -C "$STORE10" remote add origin "$ORIGIN10"
+git -C "$STORE10" config user.email sync@test.invalid; git -C "$STORE10" config user.name sync-test
+git -C "$STORE10" commit -q --allow-empty -m seed; git -C "$STORE10" push -q origin HEAD:refs/heads/main
+K_AMBIG="daniel-ospina-agent-infra-2101"
+# The peer says head aaaa at the top level and carries a NESTED head bbbb on an earlier line; this box
+# holds a clean record at the SAME stamp for head bbbb — i.e. the two records DISAGREE on the head.
+seed_payload "$STORE10" "$K_AMBIG" "{
+  \"pr\": 2101,
+  \"evidence\": {\"head_sha\": \"$HEAD_B\"},
+  \"head_sha\": \"$HEAD_A\",
+  \"verdict\": \"clean\",
+  \"repo\": \"daniel-ospina/agent-infra\",
+  \"reviewed_at\": \"2026-11-01T10:00:00Z\"
+}"
+printf '{"pr":2101,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-01T10:00:00Z"}' "$HEAD_B" > "$BOX13/$K_AMBIG.json"
+RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30e an ambiguous peer record is NOT converged (exit 4), not reported same"
+assert_contains "$RS_LAST" "unreadable=1" "§30e ...and it is COUNTED unreadable"
+if grep -q 'same=1' <<<"$RS_LAST"; then bad "§30e the divergence was still reported same"; else ok "§30e ...and never reported same over two records that disagree"; fi
+if cmp -s "$BOX13/$K_AMBIG.json" <(printf '{"pr":2101,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-01T10:00:00Z"}' "$HEAD_B"); then
+  ok "§30e ...and the local record was not touched"
+else
+  bad "§30e the local record was rewritten from an unreadable peer"
+fi
+# the same record as THIS BOX'S OWN must not be PUBLISHED either — under a key the store does NOT
+# already hold, so "not published" is decidable (the K_AMBIG ref above exists on the store side).
+K_AMBIG_LOCAL="daniel-ospina-agent-infra-2102"
+printf '{\n  "pr": 2102,\n  "evidence": {"head_sha": "%s"},\n  "head_sha": "%s",\n  "verdict": "clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-11-01T10:00:00Z"\n}\n' "$HEAD_B" "$HEAD_A" > "$BOX13/$K_AMBIG_LOCAL.json"
+RS_LAST="$(rsx "$STORE10" "$BOX13" push 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30e push refuses an ambiguous LOCAL record (exit 4)"
+assert_contains "$RS_LAST" "not one this box's rail can USE" "§30e ...naming the reason"
+assert_contains "$RS_LAST" "a record this box cannot USE was skipped" "§30e ...and the summary does not blame the store for a LOCAL defect"
+# ⛔ THE ASSERTION THAT ACTUALLY MATTERS HERE, and it was deleted once: a mutant that keeps
+# `unreadable "$key"` but FALLS THROUGH instead of returning publishes the ambiguous record, prints the
+# same `unreadable=1`, exits 4, and passed the whole suite (measured: PASS=208 FAIL=0 with
+# `refs/reviews/…-2102` present on the store). Nothing can clear it afterwards (rule 2 has no delete).
+if git -C "$STORE10" rev-parse --verify --quiet "refs/reviews/$K_AMBIG_LOCAL" >/dev/null 2>&1; then
+  bad "§30e the ambiguous LOCAL record was PUBLISHED anyway"
+else
+  ok "§30e ...and nothing reached the store"
+fi
+
+# ── §30f: the FOURTH SURFACE. `pull_one` gates the PEER record, but every arm below decides by
+# comparing `field` readings of THIS box's record against it — so an ambiguous LOCAL record decides
+# too. Measured before the fix: a local record with a nested `evidence.reviewed_at` on an earlier line
+# read 2020 to `field` while json (the rail) read 2026-12-31, so the peer looked NEWER and an older
+# `clean` REPLACED a newer `not-clean` (`wrote=1 older_refused=0 conflicts=0`, exit 0) — rule 1
+# defeated on the one surface the earlier gates did not cover.
+echo "── §30f an ambiguous LOCAL record is never ordered against (rule 1 cannot be defeated)"
+K_AMBLOCAL="daniel-ospina-agent-infra-2201"
+seed_payload "$STORE10" "$K_AMBLOCAL" "{\"pr\":2201,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T10:00:00Z\"}"
+printf '{\n  "pr": 2201,\n  "evidence": {"reviewed_at": "2020-01-01T00:00:00Z"},\n  "head_sha": "%s",\n  "verdict": "not-clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-12-31T00:00:00Z"\n}\n' "$HEAD_B" > "$BOX13/$K_AMBLOCAL.json"
+cp "$BOX13/$K_AMBLOCAL.json" "$T/amblocal.before"
+RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30f an ambiguous local record makes the pull NOT converged (exit 4)"
+assert_contains "$RS_LAST" "json vs field" "§30f ...naming the two-reader cause"
+if grep -q 'wrote=1' <<<"$RS_LAST"; then bad "§30f an older peer record was WRITTEN over a newer local one"; else ok "§30f ...and no peer record was written over it (rule 1 holds)"; fi
+if cmp -s "$BOX13/$K_AMBLOCAL.json" "$T/amblocal.before"; then
+  ok "§30f ...and the local record is byte-identical afterwards"
+else
+  bad "§30f the local record was rewritten from an older peer"
+fi
+
+# ── §30g: the reader's edge shapes. `"key": null` is valid JSON and BOTH readers see no value, so it
+# must stay USABLE (refusing it would wedge a legitimate record for ever); a COMPARED value holding a
+# non-ASCII character must be REFUSED (a real U+2028 made the shell sed truncate where the python
+# replica did not, so the slow path would decide on a truncated value the gate had just vouched for).
+# ⛔ THE FIXTURE MUST CARRY A **RAW** U+2028 IN A COMPARED VALUE THE KEY CHECK DOES NOT READ. A first
+# draft used the JSON ESCAPE `\u2028` inside `repo`, and deleting the `isascii` arm entirely still left
+# the suite green (measured: mutant PASS=199 FAIL=0): the escape makes json decode U+2028 while the
+# text reader keeps the six literal characters, so the VALUE comparison refused it, and `repo` is
+# consumed by the key check anyway. This fixture writes the raw character (ANSI-C quoting) into
+# `verdict`, with a fresh store and box, so only the ascii arm can refuse it (verified: the mutant
+# installs it, `wrote=1`).
+echo "── §30g the reader's edge shapes: null is usable, a RAW non-ASCII compared value is not"
+ORIGIN11="$T/origin11.git"; STORE11="$T/store11"; BOX14="$T/box14"
+git init -q --bare "$ORIGIN11"; mkdir -p "$STORE11" "$BOX14"
+git -C "$STORE11" init -q; git -C "$STORE11" remote add origin "$ORIGIN11"
+git -C "$STORE11" config user.email sync@test.invalid; git -C "$STORE11" config user.name sync-test
+git -C "$STORE11" commit -q --allow-empty -m seed; git -C "$STORE11" push -q origin HEAD:refs/heads/main
+K_NULL="daniel-ospina-agent-infra-2302"
+seed_payload "$STORE11" "$K_NULL" "{\"pr\":2302,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\",\"supersedes\":null}"
+RS_LAST="$(rsx "$STORE11" "$BOX14" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§30g a record whose compared key is null is usable (exit 0)"
+assert_contains "$RS_LAST" "pulled daniel-ospina-agent-infra-2302" "§30g ...and it materialises"
+K_UNI="daniel-ospina-agent-infra-2303"
+# RAW U+2028 (e2 80 a8) inside `verdict`, which nothing but the compared-value arm reads.
+printf '{"pr":2303,"head_sha":"%s","verdict":"cl\342\200\250ean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-13T10:00:00Z"}' "$HEAD_A" > "$T/uni.json"
+seed_payload "$STORE11" "$K_UNI" "$(command cat "$T/uni.json")"
+RS_LAST="$(rsx "$STORE11" "$BOX14" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30g a RAW non-ASCII COMPARED value is refused (exit 4)"
+assert_contains "$RS_LAST" "unreadable=1" "§30g ...counted exactly once"
+assert_contains "$RS_LAST" "json vs field" "§30g ...naming the two-reader cause"
+if [ -e "$BOX14/$K_UNI.json" ]; then bad "§30g the non-ASCII record was INSTALLED"; else ok "§30g ...and it is not installed"; fi
+
+# ── §30h: the counters count RECORDS, not events. `union` runs pull AND push, so one defective key is
+# seen twice: measured before the fix, ONE ambiguous local record reported `unreadable=2` /
+# `skipped=2` / "2 record(s) were SKIPPED" — the same "look for a second record that does not exist,
+# and double the number a scheduler trends" defect cycle 4 fixed for `conflicts=`.
+echo "── §30h union counts a defective record ONCE (skipped=/unreadable=, like conflicts=)"
+ORIGIN12="$T/origin12.git"; STORE12="$T/store12"; BOX15="$T/box15"
+git init -q --bare "$ORIGIN12"; mkdir -p "$STORE12" "$BOX15"
+git -C "$STORE12" init -q; git -C "$STORE12" remote add origin "$ORIGIN12"
+git -C "$STORE12" config user.email sync@test.invalid; git -C "$STORE12" config user.name sync-test
+git -C "$STORE12" commit -q --allow-empty -m seed; git -C "$STORE12" push -q origin HEAD:refs/heads/main
+K_CNT="daniel-ospina-agent-infra-2304"
+# ⛔ THE KEY MUST EXIST IN THE STORE, or `pull` never sees it and only `push` runs — the dedupe then
+# has nothing to collapse and the section passes on pre-fix code AND on a dedupe-disabled mutant
+# (measured: PASS=208 FAIL=0 for both). A usable peer record with an OLDER stamp is enough: the local
+# gate fires before any ordering, so the stamp is never compared.
+seed_payload "$STORE12" "$K_CNT" "{\"pr\":2304,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T00:00:00Z\"}"
+printf '{\n  "pr": 2304,\n  "evidence": {"reviewed_at": "2020-01-01T00:00:00Z"},\n  "head_sha": "%s",\n  "verdict": "clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-11-13T10:00:00Z"\n}\n' "$HEAD_A" > "$BOX15/$K_CNT.json"
+RS_LAST="$(rsx "$STORE12" "$BOX15" union 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30h a defective record makes the union NOT converged (exit 4)"
+assert_contains "$RS_LAST" "unreadable=1 " "§30h ...and it is counted ONCE (unreadable=1, not 2 for two directions)"
+assert_contains "$RS_LAST" "skipped=1" "§30h ...and the convergence line's skipped= agrees"
+assert_contains "$RS_LAST" "1 record(s) were SKIPPED" "§30h ...and the message names one record, not two"
+# and TWO defective records are still TWO: a dedupe that also collapsed distinct keys would be worse
+K_CNT2="daniel-ospina-agent-infra-2305"
+seed_payload "$STORE12" "$K_CNT2" "{\"pr\":2305,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T00:00:00Z\"}"
+printf '{\n  "pr": 2305,\n  "evidence": {"reviewed_at": "2020-01-01T00:00:00Z"},\n  "head_sha": "%s",\n  "verdict": "clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-11-13T10:00:00Z"\n}\n' "$HEAD_A" > "$BOX15/$K_CNT2.json"
+RS_LAST="$(rsx "$STORE12" "$BOX15" union 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30h two defective records still exit 4"
+assert_contains "$RS_LAST" "unreadable=2 " "§30h ...and are counted as TWO distinct records (not 4 events)"
+assert_contains "$RS_LAST" "2 record(s) were SKIPPED" "§30h ...and the message says two"
+
+# ── §30h(2): the "every failure was on the push side" sentence. It cannot be decided by comparing
+# deduped counts, because ONE key can fail in BOTH directions: a registry entry that is a SYMLINK is
+# treated as ABSENT by `local_record_for_key` (so the pull must WRITE the peer record) while
+# `registry_names` still feeds it to `push` (so the push must PUBLISH it) — with an unwritable target
+# and a store that refuses pushes, both directions fail for that key. Measured before the fix: exit 1
+# with "could not be PUBLISHED — the pull side succeeded" printed over a FAILED pull.
+echo "── §30h(2) a failure on BOTH sides is never reported as 'the pull side succeeded'"
+ORIGIN13="$T/origin13.git"; STORE13="$T/store13"; BOX16="$T/box16"
+git init -q --bare "$ORIGIN13"; mkdir -p "$STORE13" "$BOX16"
+git -C "$STORE13" init -q; git -C "$STORE13" remote add origin "$ORIGIN13"
+git -C "$STORE13" config user.email sync@test.invalid; git -C "$STORE13" config user.name sync-test
+git -C "$STORE13" commit -q --allow-empty -m seed; git -C "$STORE13" push -q origin HEAD:refs/heads/main
+K_BOTH="daniel-ospina-agent-infra-2306"
+# ⛔ THE PEER MUST BE **OLDER** AND THE LOCAL RECORD **NEWER**, or the push SKIPS (rule 1) instead of
+# publishing and only one side fails. With the peer older: `pull` sees no usable local record (a symlink
+# is deliberately treated as absent) so it MUST WRITE, and `push` reads the symlink's target, finds
+# itself newer, and MUST PUBLISH — both directions fail for ONE key (measured: two FAILED lines,
+# `failed=1`).
+seed_payload "$STORE13" "$K_BOTH" "{\"pr\":2306,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T10:00:00Z\"}"
+# the store refuses every push, so the push side cannot publish
+printf '#!/bin/bash\nexit 1\n' > "$ORIGIN13/hooks/pre-receive"; chmod +x "$ORIGIN13/hooks/pre-receive"
+# the box's record is reachable ONLY through a symlink, so the pull cannot write it (and the push reads it)
+printf '{"pr":2306,"head_sha":"%s","verdict":"not-clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-12-31T10:00:00Z"}' "$HEAD_B" > "$T/symlink-target"
+ln -s "$T/symlink-target" "$BOX16/$K_BOTH.json"
+RS_LAST="$(rsx "$STORE13" "$BOX16" union 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "1" "§30h(2) a key that fails on both sides exits 1"
+assert_contains "$RS_LAST" "could not be moved" "§30h(2) ...and is reported as NOT moved, not as a push-only failure"
+if grep -q 'pull side succeeded' <<<"$RS_LAST"; then bad "§30h(2) a two-sided failure claims the pull side succeeded"; else ok "§30h(2) ...and never claims the pull side succeeded"; fi
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do

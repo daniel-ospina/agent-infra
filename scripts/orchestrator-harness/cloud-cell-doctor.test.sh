@@ -236,6 +236,13 @@ export DOCTOR_TEST_TMUX="$T/tmux" DOCTOR_TEST_PS="$T/ps" DOCTOR_TEST_GH="$T/gh"
 export DOCTOR_TEST_UV="$T/uv"
 export REAP_MIN_S=60 REAP_SAMPLE_S=2 DOCTOR_INTERVAL=1 MERGE_INTERVAL=1 HYGIENE_INTERVAL=1
 export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
+# ⛔ THE REGISTRY STEP IS OFF FOR THE SUITE BY DEFAULT. It runs the SHIPPED `registry-sync.sh` against
+# a real remote when it can find one, and this suite executes the hygiene role many times: without a
+# seam every one of those cases would reach github.com, pull the fleet's LIVE records into the
+# fixture HOME, and turn a hermetic suite into a network test. The dedicated case below turns it back
+# ON against a local bare origin (`rs/origin.git`), which is the same hermetic shape
+# `registry-sync.test.sh` uses. `off` is a SEAM, not a silence: the pass logs that it skipped.
+export DOCTOR_REGISTRY_SYNC=off
 mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv"
 
 doc() { # <role> [extra env assignments via env]
@@ -968,6 +975,229 @@ OUT="$(PATH="$T/binbad:$T/bin:$PATH" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh
   && result_has "uv cache prune FAILED" \
   && ok "hygiene: uv prune rc=1 -> the PASS is rc=3 (a failed prune cannot read green)" \
   || bad "hygiene: a failed uv prune produced rc=$RC — $OUT"
+
+# ── 18b) the cross-box review-record registry (agent-infra#2577) ────────────────────────────
+# The measured failure: a review minted on a PEER box is invisible to this box's merge role, and
+# nothing scheduled the union — the rail's own union only runs for a PR already offered to it, and a
+# PR with no visible record is never offered. So the record must arrive from the HYGIENE pass.
+say_case "hygiene: a peer-only review record becomes visible after ONE pass (and the counts are logged)"
+reset_state; reset_tmux; rm -f "$T/wt/calls"
+mkdir -p "$T/rs/o" "$T/rs/store" "$T/rs/peer" "$T/home/.pi/agent/reviews"
+rm -f "$T/home/.pi/agent/reviews"/*.json
+git init -q --bare "$T/rs/origin.git"
+git -C "$T/rs/store" init -q
+git -C "$T/rs/store" remote add origin "$T/rs/origin.git"
+git -C "$T/rs/store" config user.email doc@test.invalid
+git -C "$T/rs/store" config user.name  doc-test
+git -C "$T/rs/store" commit -q --allow-empty -m seed
+git -C "$T/rs/store" push -q origin HEAD:refs/heads/main
+RSKEY="daniel-ospina-agent-infra-2577"
+printf '{"pr":2577,"head_sha":"dddddddddddddddddddddddddddddddddddddddd","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-23T20:00:00Z"}\n' \
+  > "$T/rs/peer/$RSKEY.json"
+{ RSBLOB="$(git -C "$T/rs/store" hash-object -w "$T/rs/peer/$RSKEY.json")"
+  RSTREE="$(printf '100644 blob %s\trecord.json\n' "$RSBLOB" | git -C "$T/rs/store" mktree)"
+  RSCOMMIT="$(git -C "$T/rs/store" -c user.name=t -c user.email=t@t.invalid commit-tree "$RSTREE" -m peer)"
+  git -C "$T/rs/store" push -q origin "$RSCOMMIT:refs/reviews/$RSKEY"; }
+[ ! -f "$T/home/.pi/agent/reviews/$RSKEY.json" ] && ok "hygiene: precondition — this box has never seen the peer record" \
+  || bad "hygiene: the fixture registry already holds $RSKEY"
+OUT="$(DOCTOR_REGISTRY_SYNC="$HERE/../registry-sync.sh" DOCTOR_REGISTRY_STORE="$T/rs/store" \
+       DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" \
+       DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 DOCTOR_REGISTRY_SYNC_TIMEOUT=120 DOCTOR_REGISTRY_NET_TIMEOUT=30 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: the pass is rc=0 with the registry step in it" || bad "hygiene: pass rc=$RC — $OUT"
+if [ -f "$T/home/.pi/agent/reviews/$RSKEY.json" ] && cmp -s "$T/rs/peer/$RSKEY.json" "$T/home/.pi/agent/reviews/$RSKEY.json"; then
+  ok "hygiene: the PEER's record is materialised here BYTE-IDENTICALLY after ONE pass (the #2577 fixed point, left)"
+else
+  bad "hygiene: the peer record did not arrive — $(ls "$T/home/.pi/agent/reviews" 2>/dev/null | tr '\n' ' ')"
+fi
+case "$OUT" in *"refs=1 files="*"added=1"*) ok "hygiene: the pass LOGS the counts (refs=/files=/added=)" ;; *) bad "hygiene: no counts line in the pass log — $OUT" ;; esac
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" in *"registry refs="*) ok "hygiene: the counts reach the role RECORD, not just stdout" ;; *) bad "hygiene: state does not carry the counts — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" ;; esac
+
+say_case "hygiene: a FAILING registry sync leaves the pass SUCCESSFUL (rc 0) and logs the failure"
+reset_state
+# The fixture answers the two questions the step now asks: `surface-check` PASSES (the guard would
+# classify it), `union` FAILS. A fixture that failed both would exercise the REFUSED arm below
+# instead of this one — the two arms are distinguishable only because each verb is answered.
+cat > "$T/bin/rs-fail.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check) exit 0 ;;
+esac
+echo "union: cannot READ the 'origin' registry — it is UNKNOWN, not empty. Not syncing." >&2
+exit 1
+SH
+chmod +x "$T/bin/rs-fail.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-fail.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: a failed sync does NOT fail the pass (rc 0) — #2577 constraint 1" \
+  || bad "hygiene: a failed sync produced rc=$RC (want 0) — $OUT"
+result_has "registry union FAILED rc=1" && ok "hygiene: ...and the failure is LOGGED, naming rc" \
+  || bad "hygiene: the failed sync was silent — $OUT"
+result_has "did NOT converge" && ok "hygiene: ...and says what it means for a peer-reviewed PR here" \
+  || bad "hygiene: the log does not say the registry did not converge — $OUT"
+case "$OUT" in *"rc=3"*) bad "hygiene: the sync made the pass cannot-verify (it must not)" ;; *) ok "hygiene: ...and it does not turn the pass green-to-red on the merge role's behalf" ;; esac
+
+say_case "hygiene: a DIVERGENT registry logs WHY (conflicts + the keys), not just skipped=0"
+reset_state
+# `skipped=` is the unreadable class only, so a divergence is invisible in the counts line. Before
+# this case the step held `conflicts=2` and the keys in $rs_out and logged `skipped=0` beside
+# "NOT a converged state" — the one datum an operator needs (WHICH records diverge) was dropped.
+cat > "$T/bin/rs-diverge.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check) exit 0 ;;
+esac
+printf '%s\n' "union: wrote=2 pushed=0 same=2 older_refused=0 conflicts=2 unkeyed=0 unreadable=0 failed=0"
+printf '%s\n' "union: refs=4 files=4 added=2 updated=0 skipped=0"
+printf '%s\n' "registry-sync.sh: 2 record(s) DIVERGE at the same reviewed_at: daniel-ospina-agent-infra-3001 daniel-ospina-agent-infra-3002"
+exit 3
+SH
+chmod +x "$T/bin/rs-diverge.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-diverge.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: a divergent registry does NOT fail the pass" || bad "hygiene: divergence produced rc=$RC — $OUT"
+case "$OUT" in *"2 record(s) DIVERGE"*) ok "hygiene: ...and the log carries the script's DIVERGE verdict" ;; *) bad "hygiene: the divergence cause is dropped from the log — $OUT" ;; esac
+case "$OUT" in *"agent-infra-3001"*) ok "hygiene: ...naming the keys an operator must reconcile" ;; *) bad "hygiene: the diverging keys are not named — $OUT" ;; esac
+
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" in *"2 record(s) DIVERGE"*) ok "hygiene: ...and it reaches the role RECORD, not just stdout" ;; *) bad "hygiene: state drops the divergence reason — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" ;; esac
+
+say_case "hygiene: an rc=4 registry logs the SKIPPED keys ONCE each (never the same key per direction)"
+reset_state
+# The script prints one `⚠️ skip <key> —` line PER DIRECTION, so one defective record yields two
+# identical keys; a `tail -N` cap over LINES would hide a distinct third key behind a duplicate — the
+# same artefact this head removed from conflicts=/unreadable=. Two keys, each reported twice.
+cat > "$T/bin/rs-skip.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check) exit 0 ;;
+esac
+printf '%s\n' "  ⚠️ skip daniel-ospina-agent-infra-4001 — the LOCAL record is not one the rail can USE (json vs field); refusing to publish it." >&2
+printf '%s\n' "  ⚠️ skip daniel-ospina-agent-infra-4001 — this box's LOCAL record is not one the rail can USE, so no peer record can be ordered against it." >&2
+printf '%s\n' "  ⚠️ skip daniel-ospina-agent-infra-4002 — the peer's record is not one this box's rail can USE." >&2
+printf '%s\n' "union: wrote=0 pushed=0 same=0 older_refused=0 conflicts=0 unkeyed=0 unreadable=2 failed=0"
+printf '%s\n' "union: refs=2 files=2 added=0 updated=0 skipped=2"
+printf '%s\n' "registry-sync.sh: 2 record(s) were SKIPPED because they could not be read or ordered — this is"
+printf '%s\n' "  NOT a converged state (a record this box cannot USE was skipped, on the store side or this box). Nothing was overwritten."
+exit 4
+SH
+chmod +x "$T/bin/rs-skip.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-skip.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: an rc=4 registry does NOT fail the pass" || bad "hygiene: rc=4 produced rc=$RC — $OUT"
+case "$OUT" in *"4001"*"4002"*) ok "hygiene: ...and BOTH skipped keys reach the log" ;; *) bad "hygiene: the skipped keys are dropped — $OUT" ;; esac
+if [ "$(grep -o '4001' <<<"$OUT" | wc -l | tr -d ' ')" -le 2 ]; then
+  ok "hygiene: ...with no key repeated inside the [keys: …] datum"
+else
+  bad "hygiene: the same key is listed once per direction — $OUT"
+fi
+case "$OUT" in *"NOT a converged state"*) ok "hygiene: ...and the skip verdict is not truncated mid-sentence" ;; *) bad "hygiene: the skip verdict is cut at '— this is' — $OUT" ;; esac
+
+say_case "hygiene: a union killed by the BOUND (rc=143, no timeout(1)) is TIMED OUT, not FAILED-unknown"
+reset_state
+# `run_bounded` uses `timeout(1)` when present (124) and its own watchdog otherwise (143). Stock
+# macOS has no `timeout`, and 143 was not in the timeout arm, so a bound-killed union on the box the
+# harness documents as the messy one logged FAILED/cause-UNKNOWN.
+cat > "$T/bin/rs-143.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check) exit 0 ;;
+esac
+exit 143
+SH
+chmod +x "$T/bin/rs-143.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-143.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       DOCTOR_REGISTRY_SYNC_TIMEOUT=120 bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+case "$OUT" in *"TIMED OUT after 120s"*) ok "hygiene: rc=143 is reported as the BOUND firing (watchdog arm)" ;; *) bad "hygiene: rc=143 is not recognised as a timeout — $OUT" ;; esac
+case "$OUT" in *"union TIMED OUT rc=143"*) ok "hygiene: ...and it gets its own arm (raise the bound), not the FAILED one" ;; *) bad "hygiene: rc=143 has no TIMED OUT arm — $OUT" ;; esac
+case "$OUT" in *"union FAILED rc=143"*) bad "hygiene: rc=143 still masquerades as a push failure — $OUT" ;; *) ok "hygiene: ...and is never reported as a push failure" ;; esac
+
+# ⛔ #2520 IS THE ARM THAT CANNOT BE SEEN FROM AN EXIT STATUS. A withheld invocation never runs, so
+# the sync's rc says nothing at all; the step therefore asks `surface-check` FIRST. Without this
+# case the pre-check could be deleted and the suite would stay green — and a box whose farmed copy
+# is un-runnable would report a clean, silently LOCAL-ONLY registry for ever.
+say_case "hygiene: a script the checkout-guard would withhold is REPORTED, never run (and never fatal)"
+reset_state
+cat > "$T/bin/rs-refused.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check)
+    echo "surface-check: the CHECKOUT-GUARD would withhold this script (#709): a git invocation whose" >&2
+    echo "  verb it cannot bound makes EVERY verb here un-runnable. Exit 5 = REFUSED." >&2
+    exit 5 ;;
+  union) echo "UNION-RAN-ANYWAY" >&2; exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/rs-refused.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-refused.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: a refused registry script does NOT fail the pass" || bad "hygiene: refused script made rc=$RC — $OUT"
+result_has "registry union REFUSED — git surface defect (#2520)" && ok "hygiene: ...and the refusal is named in the role record" \
+  || bad "hygiene: the refusal is silent — $OUT"
+case "$OUT" in *"UNION-RAN-ANYWAY"*) bad "hygiene: the union ran despite the refusal — the pre-check is not gating" ;; *) ok "hygiene: ...and the union is NOT run when the guard would withhold it" ;; esac
+case "$OUT" in *"git surface is DEFECTIVE"*) ok "hygiene: ...and the log names the DEFECT with its issue, so the next agent need not rediscover #2520" ;; *) bad "hygiene: the log does not name the defect — $OUT" ;; esac
+
+# ⛔ rc=3 IS NOT A REFUSAL, and the doctor must not say it is. surface-check answers 0 classify /
+# 5 would-refuse / 3 could-not-check; a box without `awk` is the third, and reporting it as "the
+# guard withheld it" names a cause that never existed — leaving the real one unfixed for ever.
+say_case "hygiene: surface-check rc=3 is reported as NOT VERIFIED, never as a guard refusal"
+reset_state
+cat > "$T/bin/rs-unverifiable.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check)
+    echo "surface-check: could not read the source (awk rc=127) — exit 3 = NOT VERIFIED, never a pass." >&2
+    exit 3 ;;
+  union) echo "UNION-RAN-ANYWAY" >&2; exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/rs-unverifiable.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-unverifiable.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: an unverifiable surface does NOT fail the pass" || bad "hygiene: rc=3 made rc=$RC — $OUT"
+result_has "registry union NOT RUN — git surface could not be verified" && ok "hygiene: ...and the record says the surface could not be VERIFIED" \
+  || bad "hygiene: the rc=3 cause is not named in the role record — $OUT"
+case "$OUT" in *"UNION-RAN-ANYWAY"*) bad "hygiene: the union ran although its surface could not be verified" ;; *) ok "hygiene: ...and the union still does not run (fail closed)" ;; esac
+case "$OUT" in *"cause is NOT a guard refusal"*) ok "hygiene: ...and the log says the cause is NOT a guard refusal (no false attribution)" ;; *) bad "hygiene: rc=3 is reported as a guard refusal — $OUT" ;; esac
+
+# ⛔ AND NEITHER IS ANY OTHER NON-ZERO. The rc=3 arm closed one instance of one class: EVERY
+# non-zero that was not 3 fell into "the checkout-guard would withhold it". A bound firing (124), an
+# unparseable script (2) or a vanished interpreter (127) is not a guard refusal, and a log that says
+# it is sends the next lane to re-litigate the gate instead of fixing the fault.
+say_case "hygiene: a surface-check that did not answer (rc=124/127) is UNKNOWN cause, never a refusal"
+reset_state
+cat > "$T/bin/rs-unanswered.sh" <<'SH'
+#!/bin/bash
+case "$1" in
+  surface-check) echo "surface-check: bound fired" >&2; exit 124 ;;
+  union) echo "UNION-RAN-ANYWAY" >&2; exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/rs-unanswered.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/rs-unanswered.sh" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" \
+       DOCTOR_TEST_WT="$T/wt" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 \
+       bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: an unanswered surface-check does NOT fail the pass" || bad "hygiene: rc=124 made rc=$RC — $OUT"
+result_has "registry union NOT RUN — surface-check rc=124, cause unknown" && ok "hygiene: ...and the record carries the rc and says the cause is UNKNOWN" \
+  || bad "hygiene: rc=124 is not reported honestly in the role record — $OUT"
+case "$OUT" in *"cause is UNKNOWN and is NOT a guard refusal"*) ok "hygiene: ...and the log refuses the guard attribution" ;; *) bad "hygiene: rc=124 is reported as a guard refusal — $OUT" ;; esac
+case "$OUT" in *"UNION-RAN-ANYWAY"*) bad "hygiene: the union ran although surface-check did not answer" ;; *) ok "hygiene: ...and the union still does not run (fail closed)" ;; esac
+
+say_case "hygiene: the registry step is SKIPPED when the seam says off, and the skip is visible"
+reset_state
+OUT="$(DOCTOR_REGISTRY_SYNC=off DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+       DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" MIN_FREE_MB=1 bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "hygiene: DOCTOR_REGISTRY_SYNC=off is a clean pass" || bad "hygiene: off produced rc=$RC — $OUT"
+result_has "registry union skipped (by request)" && ok "hygiene: ...and the skip is named in the record (never a silent no-op)" \
+  || bad "hygiene: the skip is silent — $OUT"
 
 say_case "a stop that arrives MID-PASS suppresses the destructive steps it would have started"
 reset_state; : > "$T/o/state/roles/.desired"; reset_tmux; rm -f "$T/rail/calls"
