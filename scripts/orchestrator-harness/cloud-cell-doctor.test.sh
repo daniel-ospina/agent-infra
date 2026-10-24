@@ -55,11 +55,27 @@ git init -q "$T/repo" 2>/dev/null || true
 # `docker image prune -af` on every green run. Both decisions are driven, on real fixtures, by
 # `cloud-cell-doctor.hygiene.test.sh`; here they point at throwaway paths so no arm can reach the box.
 export HYGIENE_TMP_DIR="$T/tmp"
+# ⛔ …AND THE CWD CENSUS IS A SINK TOO (review round 7, P2). `live-ownership.sh` reads the RUNNER's real
+# process table, so a fixture that left `LO_CWD_PROBE` pointing at the host would make the hygiene pass
+# cannot-verify (rc=3) on any runner whose process table it cannot read — a false red about the platform
+# that says nothing about the code. The sibling hardening fixture pins it for the same reason; this one
+# previously pinned only the temp root and docker, so it was the one seam left on the host.
+cat > "$T/bin/cwdprobe" <<'SH'
+#!/bin/bash
+emit() { [ -n "$1" ] || return 0; printf '/proc/4242/cwd -> %s\n' "$1"; printf 'p4242\nn%s\n' "$1"; }
+emit "$FAKE_CWD"
+exit 0
+SH
+chmod +x "$T/bin/cwdprobe"
+export LO_CWD_PROBE="$T/bin/cwdprobe" FAKE_CWD="$T/nowhere-unheld"
 cat > "$T/bin/docker-stub" <<'SH'
 #!/bin/bash
 # `info` MUST succeed, or the sweep correctly reports "no daemon" and the arms around it stop being
 # about what they claim. The two prunes are no-ops: nothing here may touch a real daemon.
-case "${1:-}" in info) printf 'Server Version: stub\n'; exit 0 ;; esac
+case "${1:-}" in
+  info)    printf 'Server Version: stub\n'; exit 0 ;;
+  version) printf '29.1.3\n'; exit 0 ;;   # the volume verb is version-gated; a stub must answer it
+esac
 exit 0
 SH
 chmod +x "$T/bin/docker-stub"

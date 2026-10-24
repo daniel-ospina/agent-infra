@@ -103,6 +103,11 @@ case "${1:-}" in
       *" --format "*) printf '%s\n' "${S}/dockerroot"; exit 0 ;;
     esac
     printf 'Server Version: stub\n'; exit 0 ;;
+  # The volume verb is VERSION-GATED (#2573 review round 7): `docker volume prune` prunes only
+  # ANONYMOUS unused volumes from 23.0; before that it takes NAMED ones too. Every other arm therefore
+  # needs a modern server, and the gate's own arms override DOCKER_SERVER_VERSION.
+  version) case " $* " in *" --format "*) printf '%s\n' "${DOCKER_SERVER_VERSION-29.1.3}"; exit 0 ;; esac
+           printf 'Client: stub\nServer: Docker Engine\n'; exit 0 ;;
   image)  [ -f "$S/image_rc" ] && exit "$(cat "$S/image_rc")"; printf 'Total reclaimed space: 1.2GB\n'; exit 0 ;;
   volume) [ -f "$S/volume_rc" ] && exit "$(cat "$S/volume_rc")"; printf 'Total reclaimed space: 3.4GB\n'; exit 0 ;;
   *) exit 0 ;;
@@ -268,7 +273,7 @@ if [ ! -e "$T/tmp/cloud-cell-${DEAD}.AAAA" ]; then
 else
   bad "temp: a stale cloud-cell-* dir survived the pass"
 fi
-log_has "reaped $T/tmp/cloud-cell-${DEAD}.AAAA (proof: pid ${DEAD} from the name is not alive" \
+log_has "reaped $T/tmp/cloud-cell-${DEAD}.AAAA (proof: the name's token ${DEAD} is not a LIVE pid" \
   && ok "temp: the log STATES the proof (the pid it tested, and that it is gone)" \
   || bad "temp: the reaped dir was removed without naming the evidence — $(grep -F 'temp:' "$T/o/logs/doctor.log" 2>/dev/null | head -3)"
 grep -qx 'image prune -af'  "$T/docker/calls" 2>/dev/null \
@@ -282,7 +287,7 @@ grep -qx 'volume prune -f'  "$T/docker/calls" 2>/dev/null \
 # STOPPED CONTAINERS, a test's evidence), `builder prune` and `network prune` all sailed through the
 # arm while it claimed "only the two 'in use by nothing' verbs". Every recorded argv must now be one of
 # the three the role is allowed to run, so a NEW verb cannot be added without reddening this.
-DOCKER_BAD="$(grep -vx -e 'info' -e 'info --format {{.DockerRootDir}}' -e 'image prune -af' -e 'volume prune -f' \
+DOCKER_BAD="$(grep -vx -e 'info' -e 'info --format {{.DockerRootDir}}' -e 'version --format {{.Server.Version}}' -e 'image prune -af' -e 'volume prune -f' \
                        "$T/docker/calls" 2>/dev/null)"
 [ -z "$DOCKER_BAD" ] \
   && ok "docker: every docker argv is in the allowlist ('info', 'image prune -af', 'volume prune -f') — no 'system/container/builder/network prune'" \
@@ -615,6 +620,35 @@ result_has "docker daemon unreachable" && ok "docker: a DENIED socket is cannot-
                    || bad "docker: rc=$DOC_RC (want 3) — $(printf '%s' "$DOC_OUT" | tail -2)"
 grep -q 'prune' "$T/docker/calls" 2>/dev/null && bad "docker: a prune was attempted with no reachable daemon" \
                                               || ok "docker: no prune is attempted when the daemon cannot answer"
+
+say_case "docker: the VOLUME verb is version-gated — a pre-23 daemon prunes NAMED volumes too"
+# ⛔ THIS IS THE DATA-LOSS-SHAPED ARM (review round 7). `docker volume prune` removes only ANONYMOUS
+# unused volumes from 23.0 (that is why `-a/--all` exists); on an older daemon the same command takes
+# every UNUSED volume, NAMED ones included — the durable volume `docker compose down` preserves. The
+# pass runs hourly and unattended, so the verb must not be attempted where its set is unknown.
+reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"
+DOCKER_SERVER_VERSION=22.06.0-beta.0 doc hygiene
+grep -qx 'image prune -af' "$T/docker/calls" 2>/dev/null \
+  && ok "docker: on a pre-23 daemon the IMAGE prune still runs (unused images are safe at any version)" \
+  || bad "docker: the version gate suppressed the image prune too — $(cat "$T/docker/calls" 2>/dev/null)"
+grep -qx 'volume prune -f' "$T/docker/calls" 2>/dev/null \
+  && bad "docker: 'volume prune -f' ran against a pre-23 daemon — it prunes NAMED unused volumes there (durable data)" \
+  || ok "docker: 'volume prune -f' is NOT attempted on a pre-23 daemon (named volumes survive)"
+log_has "volume prune SKIPPED (server 22.06.0-beta.0 < 23.0" \
+  && ok "docker: …and the skip names the version and the reason" \
+  || bad "docker: the version skip is unexplained — $(grep -F 'docker:' "$T/o/logs/doctor.log" 2>/dev/null | head -3)"
+reset_state; reset_out; reset_calls
+DOCKER_SERVER_VERSION=29.1.3 doc hygiene
+grep -qx 'volume prune -f' "$T/docker/calls" 2>/dev/null \
+  && ok "docker: on a 23+ daemon the volume verb runs (anonymous-only by the daemon's own default)" \
+  || bad "docker: the volume prune was suppressed on a modern daemon — the gate is over-broad"
+reset_state; reset_out; reset_calls
+DOCKER_SERVER_VERSION="" doc hygiene
+grep -qx 'volume prune -f' "$T/docker/calls" 2>/dev/null \
+  && bad "docker: the volume verb ran with an UNREADABLE server version (blast radius unestablished)" \
+  || ok "docker: an unreadable server version skips the volume verb (fail-closed)"
+[ "$DOC_RC" -eq 3 ] && ok "docker: …and that is cannot-verify (rc=3), not a clean pass on a skipped verb" \
+                   || bad "docker: rc=$DOC_RC (want 3) — $(printf '%s' "$DOC_OUT" | tail -2)"
 
 say_case "temp: a walk that could not COMPLETE is not 'nothing newer inside' (fail-open)"
 reset_state; reset_out; reset_calls; : > "$T/tmux/sessions"

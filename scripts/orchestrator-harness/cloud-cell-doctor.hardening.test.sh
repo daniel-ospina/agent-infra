@@ -70,7 +70,10 @@ cat > "$T/bin/docker-stub" <<'SH'
 #!/bin/bash
 # `info` MUST succeed, or the sweep correctly reports "no daemon" and the arms around it stop being
 # about what they claim. The two prunes are no-ops: nothing here may touch a real daemon.
-case "${1:-}" in info) printf 'Server Version: stub\n'; exit 0 ;; esac
+case "${1:-}" in
+  info)    printf 'Server Version: stub\n'; exit 0 ;;
+  version) printf '29.1.3\n'; exit 0 ;;   # the volume verb is version-gated; a stub must answer it
+esac
 exit 0
 SH
 chmod +x "$T/bin/docker-stub"

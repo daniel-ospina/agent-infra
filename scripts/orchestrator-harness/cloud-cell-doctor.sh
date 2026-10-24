@@ -1382,7 +1382,7 @@ hygiene_tmp_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
     fi
     if [ "$dry" = "--dry-run" ]; then
       would=$((would + 1))
-      log "[hygiene] WOULD reap temp dir $d (proof: pid $tok from the name is not alive; untouched ${age}s)"
+      log "[hygiene] WOULD reap temp dir $d (proof: the name's token $tok is not a LIVE pid, it is untouched ${age}s — past the ${HYGIENE_TMP_MIN_AGE_S}s floor — and nothing inside it is newer)"
       continue
     fi
     if cell_stopped_midpass; then
@@ -1393,7 +1393,11 @@ hygiene_tmp_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
     # The ARTIFACT is the removal, not `rm`'s exit status.
     if rm -rf -- "$d" 2>/dev/null && [ ! -e "$d" ] && [ ! -L "$d" ]; then
       reaped=$((reaped + 1))
-      log "[hygiene] temp: reaped $d (proof: pid $tok from the name is not alive; untouched ${age}s)"
+      # ⛔ Name what was MEASURED (review round 7, P2). The name's token is not always a pid — the header
+      # documents `cloud-cell-1718.XXXXXX` (an ISSUE number) and `cloud-cell-test.XXXXXX` (no number) — so
+      # "pid $tok is not alive" claims an evidence the code may not have had, and it omits the gate that
+      # actually protects those spellings: the idle floor (plus the nested-write walk).
+      log "[hygiene] temp: reaped $d (proof: the name's token $tok is not a LIVE pid, it is untouched ${age}s — past the ${HYGIENE_TMP_MIN_AGE_S}s floor — and nothing inside it is newer)"
     else
       failed=$((failed + 1))
       log "[hygiene] CANNOT-VERIFY: could not remove $d — it is STILL THERE"
@@ -1422,7 +1426,7 @@ hygiene_tmp_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
 # A box with NO DAEMON holds zero bytes, which is a true "nothing to reclaim"; every other failure to
 # answer (permission, a broken socket) is cannot-verify, because a clean row would say we had pruned.
 hygiene_docker_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
-  local dry="${1:-}" derr root df_before df_after img_rc=0 vol_rc=0 last
+  local dry="${1:-}" derr root df_before df_after img_rc=0 vol_rc=0 last srv srv_major vol_note
   HYG_SUB_RC=0
   HYG_FRAG=""
   if ! command -v "$DOCKER_BIN" >/dev/null 2>&1; then HYG_FRAG='docker absent'; return 0; fi
@@ -1474,15 +1478,44 @@ hygiene_docker_sweep() { # <dry>; fragment in HYG_FRAG, verdict in HYG_SUB_RC
   [ -n "$root" ] && [ -d "$root" ] || root="$CELL_HOME"
   df_before="$(hyg_df_mb "$root")"
   run_bounded "$HYGIENE_TIMEOUT" "$DOCKER_BIN" image prune -af >"$O/logs/docker-prune.log" 2>&1; img_rc=$?
-  run_bounded "$HYGIENE_TIMEOUT" "$DOCKER_BIN" volume prune -f >>"$O/logs/docker-prune.log" 2>&1; vol_rc=$?
+  # ⛔ THE VOLUME VERB'S BLAST RADIUS IS DAEMON-VERSION DEPENDENT (review round 7, P2 — and it is the
+  # data-loss-shaped one). `docker volume prune` has removed ANONYMOUS unused volumes only since 23.0;
+  # `-a/--all` exists precisely because the default set CHANGED there. On an older daemon the same
+  # command takes every UNUSED volume, NAMED ones included — the durable volume `docker compose down`
+  # deliberately preserves — and this pass runs hourly, unattended, on boxes with free disk. So the verb
+  # is gated on the SERVER major; an unreadable version skips it and says so (fail-closed), because the
+  # safe direction here is "do not run a destructive verb whose set we could not establish".
+  srv="$("$DOCKER_BIN" version --format '{{.Server.Version}}' 2>/dev/null | head -1)"
+  srv_major="${srv%%.*}"
+  vol_note=""
+  case "$srv_major" in
+    ''|*[!0-9]*)
+      vol_note="volume prune SKIPPED (server version unreadable: '${srv:-none}')"
+      vol_rc=0 ;;
+    *)
+      if [ "$srv_major" -ge 23 ]; then
+        run_bounded "$HYGIENE_TIMEOUT" "$DOCKER_BIN" volume prune -f >>"$O/logs/docker-prune.log" 2>&1; vol_rc=$?
+        vol_note="volume prune rc=$vol_rc"
+      else
+        vol_rc=0
+        vol_note="volume prune SKIPPED (server $srv < 23.0 prunes NAMED unused volumes too — not a verb this role may run)"
+      fi ;;
+  esac
   df_after="$(hyg_df_mb "$root")"
   last="$(tail -2 "$O/logs/docker-prune.log" 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
-  log "[hygiene] docker: image prune rc=$img_rc volume prune rc=$vol_rc; df ($root): $(hyg_df_delta "$df_before" "$df_after"); docker's own report: ${last:-none}"
+  log "[hygiene] docker: image prune rc=$img_rc $vol_note; df ($root): $(hyg_df_delta "$df_before" "$df_after"); docker's own report: ${last:-none}"
   if [ "$img_rc" -ne 0 ] || [ "$vol_rc" -ne 0 ]; then
     HYG_FRAG="CANNOT-VERIFY: docker prune FAILED (image rc=$img_rc volume rc=$vol_rc)"
     HYG_SUB_RC=3
     return 0
   fi
+  case "$srv_major" in
+    ''|*[!0-9]*)
+      # The image prune ran; the volume verb did not, because its blast radius was not established.
+      HYG_FRAG="docker: images pruned; VOLUME PRUNE SKIPPED (server version unreadable) — df $(hyg_df_delta "$df_before" "$df_after")"
+      HYG_SUB_RC=3
+      return 0 ;;
+  esac
   HYG_FRAG="docker pruned (images+volumes); df $(hyg_df_delta "$df_before" "$df_after")"
 }
 
