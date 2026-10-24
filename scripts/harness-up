@@ -81,8 +81,13 @@
 # under `$CELL_HOME/harness/<sha12>` while the runtime reads something else entirely — the re-pin
 # reports success and advances nothing (#2216's own measured warning). So `up` refuses unless
 #     dirname(HARNESS_PIN_FILE) == HARNESS_PIN_DIR/<sha12(commit in HARNESS-PIN)>/scripts/orchestrator-harness
-# and that directory is readable and carries `orch-loop.sh`. On a box with no pin machinery (a Mac
-# whose `$O` is operator-synced) the check is SKIPPED WITH A REASON — never silently OK.
+# and that directory is readable and carries `orch-loop.sh`. On a box with no pin machinery at all the
+# check is SKIPPED WITH A REASON — never silently OK.
+# ⛔ A MAC IS NO LONGER SUCH A BOX (agent-infra#2231). Every Mac used to be, because the pin records
+# were CELL-ONLY: the Mac's launchd program was `$O/orch-loop.sh`, a copy, so there was nothing to
+# compare. `install.sh` now writes and enforces the same two records the cells use, and the pair
+# (`.harness-path`, `$HOME/.pi/agent/state/HARNESS-PIN`) is what this check reads on BOTH platforms —
+# so the skip below is for a box that has never been installed, not for "the Mac".
 set -uo pipefail
 
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -759,6 +764,14 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
       if [ ! -r "$PIN_SHA_FILE" ]; then
         say "pin: UNREADABLE — $PIN_SHA_FILE exists but cannot be read, so the harness this box is pinned to cannot be resolved"
         return 2
+      fi
+      # ⛔ `-e` IS TRUE FOR A DIRECTORY, and `head -1 <dir>` yields nothing — which this function then
+      # read as "ABSENT, the first start records it" (rc=0), i.e. the gate that authorises `up` passed a
+      # record whose commit cannot be read. Same rule install.sh states: an unreadable record is never an
+      # absent one.
+      if [ ! -f "$PIN_SHA_FILE" ]; then
+        say "pin: NOT A REGULAR FILE — $PIN_SHA_FILE exists but is not a regular file, so the harness this box is pinned to cannot be read (cannot-verify is never an absent pin)"
+        return 2
       fi ;;
   esac
   sha="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
@@ -796,6 +809,20 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
   fi
   if [ -n "$real_want" ] && [ "$real_want" = "$real_got" ]; then
     say "pin: OK — the pin, the pin root, and the dir the controller reads are the same tree ($real_got)"
+    return 0
+  fi
+  # ⛔ THE PIN-ROOT SHAPE IS A CONVENTION, NOT THE PROPERTY THAT MATTERS, AND DEMANDING IT FALSE-BLOCKS THE
+  # BOX agent-infra#2231 CREATES. `cloud-cell-supervisor.sh apply` answers `unchanged` — and writes NO
+  # record — when the box's checkout is ALREADY at the ref, precisely so an operator's checkout is never
+  # disturbed; install.sh (the Mac) then records THAT tree. On such a box the pin record, the sha record
+  # and the dir the controller execs all agree, and this function still said NOT MATERIALISED/BROKEN and
+  # `up` refused it (rc=3) — "installed" meaning "not startable". The shape was standing in for one
+  # fact — the dir is a worktree AT THE RECORDED COMMIT — so check that fact directly, and keep every
+  # other refusal (missing, unreadable, no orch-loop.sh) exactly as they are.
+  local got_head
+  got_head="$(git -C "$real_got" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || got_head=""
+  if [ -n "$got_head" ] && [ "$got_head" = "$sha" ]; then
+    say "pin: OK — the dir the controller reads ($real_got) is a worktree at the pinned commit ${sha:0:12} (it is not under $PIN_ROOT: the materialiser leaves a checkout that already IS the ref where it is)"
     return 0
   fi
   if [ -z "$real_want" ]; then
@@ -846,6 +873,55 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
 HU_ROWS=""
 hu_row() { HU_ROWS="$HU_ROWS$1|$2|$3|$4
 "; }
+
+# ── the BOX row: WHICH machine is answering, and WHICH PIN it is on (agent-infra#2231/#2232) ────
+# ⛔ "ALL MACHINES AUTONOMOUS" WAS UNANSWERABLE FROM ONE PLACE. Every row below describes a PROCESS on
+# this box; none of them names the box, and on a Mac none of them could name a pin at all (the pin
+# machinery was cell-only, so `status` printed `pin: SKIPPED (no pin machinery on this box)` and the
+# Mac was the one machine whose harness identity had no answer). The fleet is five boxes running the
+# same queue, so a status screen that cannot say "this is <host>, pinned to <sha>" forces an operator
+# to ssh into each one and hold five answers in their head — which is the shape that let the Mac drift
+# for as long as it did. With this row, `harness-status` on each box answers the same question in the
+# same shape, and the Mac is one of the boxes rather than the exception.
+#
+# Columns: PID column = the HOST (this box's identity), AGE column = the PIN (the sha it runs). Both
+# are data, not processes — stated in the row rather than faked as a pid/age.
+# rc: 0 a pin is named · 1 no pin recorded (the box runs SOMETHING unnamed: a degradation, not a pass)
+#     · 2 the pin record exists but cannot be read (cannot-verify, never a pass)
+hu_row_box() { # [strict-pin-dir]
+  local host sha host_src
+  # `scutil --get ComputerName` is macOS's user-visible name and needs no privilege; uname -n is the
+  # portable answer and is what the cells have. Neither is required for the verdict, so a failure is
+  # not a refusal — it must still be NAMED rather than printed as an empty column.
+  host="$(uname -n 2>/dev/null)"; [ -n "$host" ] || host="unknown"
+  host_src="uname -n"
+  if [ "$PLATFORM" = "mac" ] && command -v scutil >/dev/null 2>&1; then
+    local sc; sc="$(scutil --get ComputerName 2>/dev/null)"
+    [ -n "$sc" ] && { host="$sc"; host_src="scutil ComputerName"; }
+  fi
+  case "$(hu_path_state "$PIN_SHA_FILE")" in
+    unexaminable) hu_row box "$host" - "BROKEN (the pin record $PIN_SHA_FILE cannot be examined — cannot-verify is never a pass)"; return 2 ;;
+    absent)       hu_row box "$host" - "NO PIN (no $PIN_SHA_FILE: this box runs a harness nothing names; the Mac is pinned by install.sh, a cell by cloud-cell-supervisor.sh apply)"; return 1 ;;
+  esac
+  if [ ! -r "$PIN_SHA_FILE" ]; then
+    hu_row box "$host" '?' "BROKEN (the pin record $PIN_SHA_FILE exists but cannot be read)"; return 2
+  fi
+  # ⛔ `-e` IS TRUE FOR A DIRECTORY, and `head -1 <dir>` reads nothing — which the row below reported as
+  # "NO PIN (… is EMPTY)", i.e. it described an EMPTY FILE for a record that is not a file at all. Same
+  # rule the rest of this file now applies: an unreadable record is never an absent one.
+  if [ ! -f "$PIN_SHA_FILE" ]; then
+    hu_row box "$host" '?' "BROKEN (the pin record $PIN_SHA_FILE exists but is NOT A REGULAR FILE — cannot-verify is never an empty pin)"; return 2
+  fi
+  sha="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "$sha" ]; then
+    hu_row box "$host" - "NO PIN (the pin record $PIN_SHA_FILE is EMPTY: an empty pin reads as current to nothing, so this is not a pass)"; return 1
+  fi
+  # ⛔ THE SHA IS SHORTENED HERE FOR THE COLUMN ONLY; the row also prints the HARNESS DIR, because a
+  # sha without a path cannot be checked against what the controller execs (that comparison is the
+  # `pin:` line, which hu_verify_pin owns — one implementation, not two).
+  hu_row box "$host" "${sha:0:12}" "OK ($PLATFORM via $host_src; harness $HARNESS)"
+  return 0
+}
 
 # controller pids, SCOPED to this state dir AND to the harness path this box runs from. Both are
 # required: the cell controller's argv is `<harness>/orch-loop.sh`, not `$O/orch-loop.sh` (measured
@@ -1692,6 +1768,10 @@ cmd_down() {
 cmd_status() {
   local verdict=0 rc line name pid age state
   HU_ROWS=""
+  # The BOX row first: it is the row that says WHICH machine this answer is about, and (on every
+  # platform now, the Mac included) which pin it is on. It is a row and not a verdict, but a box with no
+  # pin is DEGRADED — an unnamed harness is the state this whole screen exists to make visible.
+  hu_row_box;       rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
   hu_row_loop;      rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
   # ⛔ THE EXEC ROW IS THE ANSWER TO "what is running vs what the pin says", and it is a row (not prose)
   # so its verdict reaches the ONE verdict line like every other component's.
