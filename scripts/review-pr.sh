@@ -1479,7 +1479,7 @@ function label(s,   a, b, pre, post, sl) {
       # numerals are included, and the bridge is written as OPTIONAL GROUPS rather than `{0,3}` because
       # mawk does not support interval expressions (measured: a `{0,3}` here compiles everywhere and
       # matches nothing under mawk, silently fail-open).
-      if (!negpre && pre ~ ("(^|[^[:alnum:]])(" numwords() "|[1-9][0-9]*)([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "[[:space:]-]*$")) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
+      if (!negpre && pre ~ ("(^|[^[:alnum:]])(" numwords() "|[1-9][0-9]*)([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?" "[[:space:]-]*[(]?[[:space:]-]*$")) { LS = a; LE = b; NOUN_CUE = 1; return 1 }
       # (c) A bare token with a LOCATION ANYWHERE AFTER IT — direction, not a bridge alphabet:
       # `Found one P1 in scripts/x.sh:12`, `Finding P1 at scripts/x.sh:12`, `P1: scripts/x.sh:12`,
       # `P1, in scripts/x.sh:12`, `P1 (see scripts/x.sh:12)`. Measured FAIL-OPEN (TWO fresh reviews
@@ -1752,7 +1752,11 @@ function clause_before(pre,   parts, n) {
   # (the separator may END the prefix, which is exactly what happens when the count follows it:
   # `we fixed the flaky test and 2 blocking defects remain` — pre ends at "and", so a trailing
   # `[[:space:]]` requirement missed it and the repair in the FIRST clause exempted the second, measured)
-  n = split(pre, parts, /[;,]|[[:space:]](and|but|however|yet|while|although)([[:space:]]|$)/)
+  # ⛔ AND EVERY SENTENCE BOUNDARY COUNTS (P1, ninth fresh review of #2288 — MEASURED: the set omitted
+  # `.`, `(`, `though`, `whereas`, so `fixed the P3 nit though 2 blocking defects remain` and
+  # `fixed the P3 nit (2 blocking defects remain)` recorded a SIGNED clean record — the same leak round
+  # seven fixed for `but`, one connector over). A full stop ends a clause as surely as a semicolon does.
+  n = split(pre, parts, /[.;:!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though)([[:space:]]|$)/)
   return parts[n]
 }
 function repair_led(cl,   n, w, i) {
@@ -1762,29 +1766,40 @@ function repair_led(cl,   n, w, i) {
   # `"", "verdict", "clean"` — the repair verb was UNREACHABLE on every verdict line, so
   # `**Verdict:** CLEAN — fixed the 2 issues from round 1.` refused while the same sentence on its own
   # line recorded). Up to three words may precede the verb ("The PR fixes", "We have also fixed").
-  k = 0
-  for (i = 1; i <= n; i++) {
-    if (w[i] == "") continue
-    k++
-    if (w[i] ~ repair_re) return 1
-    if (k >= 3) return 0
-  }
+  # ⛔ THE VERB MAY SIT ANYWHERE IN THE CLAUSE *BEFORE* THE COUNT, NOT WITHIN THREE WORDS (P2, ninth fresh
+  # review of #2288 — MEASURED over-block, each a PAID re-run: `**Verdict:** CLEAN — the PR fixes 2 bugs in
+  # the parser.`, `**Verdict:** CLEAN — this PR closes 2 issues.`,
+  # `**Verdict:** CLEAN — We have also fixed 2 issues found in review.` all refused, because the window
+  # counted the verdict DECORATION as words, so at most one content word could precede the verb. The
+  # CLAUSE BOUNDARY is what keeps a repair in one clause from exempting a live count in the next, so a
+  # positional window adds nothing and costs real prose.
+  for (i = 1; i <= n; i++) if (w[i] ~ repair_re) return 1
   return 0
 }
 BEGIN {
   # (the same class the severity scanner uses, so the two readers cannot drift: §BI-2 asserts it)
   num = "[0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many"
-  noun = "findings?|blockers?|issues?|defects?|bugs?|regressions?|vulnerabilit(y|ies)|violations?|problems?"
+  # (`failures?|errors?` were MISSING while the sibling scanner is fed `defect(s)` — P2, ninth fresh
+  # review of #2288: `CLEAN — 2 blocking failures remain.` recorded a signed clean record)
+  noun = "findings?|blockers?|issues?|defects?|bugs?|failures?|errors?|regressions?|vulnerabilit(y|ies)|violations?|problems?"
   repair = "(fixed|addressed|resolved|closed|removed|repaired|fix|fixes|fixing|address|addresses|addressing|close|closes|closing|resolve|resolves|resolving|remove|removes|removing|re-review|re-reviewed)"
   repair_re = "^(" repair ")$"
   # ⛔ NO INTERVAL EXPRESSIONS (P0, this lane — MEASURED: mawk does not support `{n,m}`, so the whole
   # classifier silently matched NOTHING under mawk and every pin in this guard flipped to fail-open on a
   # mawk-only box; the suite caught it only because it is run under both dialects). The bridges are
   # written out as optional groups instead, which every POSIX awk supports.
-  fwd = "(^|[^[:alnum:]])(" num ")([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?[[:space:]-]+(" noun ")([[:space:]-]+((was|is|are|were|has|have)[[:space:]-]+)?(" repair "))?"
-  mir = "(^|[^[:alnum:]])(" noun ")([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?[[:space:]]*([:=]|[[:space:]][-–—])[[:space:]]*(" num ")"
+  # ⛔ A PARENTHESISED COUNT IS STILL A COUNT (P0, ninth fresh review of #2288 — MEASURED, pre-existing and
+  # still open: both arms took a BARE numeral, so `two (2) blocking defects remain`,
+  # `2 (two) blocking defects remain`, `(2) blocking defects remain`, `blocking defects remaining: (2)` and
+  # `2 (P1) defects remain` each recorded a SIGNED clean record). `pnum` is the numeral OR a parenthesised
+  # numeral, and the zero test strips the brackets before reading the number.
+  pnum = "([(][[:space:]]*(" num ")[[:space:]]*[)])|(" num ")"
+  fwd = "(^|[^[:alnum:]])(" pnum ")([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]*[(][[:space:]]*p[0-3][[:space:]]*[)])?[[:space:]-]+(" noun ")([[:space:]-]+((was|is|are|were|has|have)[[:space:]-]+)?(" repair "))?"
+  mir = "(^|[^[:alnum:]])(" noun ")([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?[[:space:]]*([:=]|[[:space:]][-–—])[[:space:]]*(" pnum ")"
   # (the severity token is folded too: the line is lowercased above, so `P[0-3]` would never match)
-  mul = "(^|[^[:alnum:]])(([0-9]+)[[:space:]]*(×|x|\\*|times)[[:space:]]*(p[0-3])|(p[0-3])[[:space:]]*(×|x|\\*|times)[[:space:]]*([0-9]+))"
+  # (a PLURAL severity with a count is a count too: `P1s: 2` — P2, ninth fresh review of #2288, which
+  # recorded a signed clean record because neither reader knew the plural form)
+  mul = "(^|[^[:alnum:]])(([0-9]+)[[:space:]]*(×|x|\\*|times)[[:space:]]*(p[0-3])|(p[0-3])[[:space:]]*(×|x|\\*|times)[[:space:]]*([0-9]+)|p[0-3]s[[:space:]]*[:=][[:space:]]*[0-9]+)"
 }
 {
   # ⛔ CASE-FOLDED, because awk match() honours no -i (P0, seventh fresh review of #2288 — MEASURED:
@@ -1800,16 +1815,23 @@ BEGIN {
       frag = substr(rest, RSTART, RLENGTH)
       abs_end = off + RSTART + RLENGTH - 1
       pre = substr(line, 1, off + RSTART - 1)
+      # ⛔ CAPTURED BEFORE `off` MOVES (this lane — the first version read `off + RSTART` AFTER the
+      # advance, so `_head` was empty, the paren check never fired and the repair exemption still
+      # swallowed `fixed the P3 nit (2 blocking defects remain)`).
+      _head = substr(line, off + RSTART); sub(/^[[:space:]]+/, "", _head)
       rest = substr(rest, RSTART + RLENGTH)
       off = abs_end
       # a zero numeral is not a count: strip severity tokens first, then read the number
-      bare = frag; gsub(/[pP][0-3]/, "", bare)
+      bare = frag; gsub(/[pP][0-3]/, "", bare); gsub(/[()]/, " ", bare)
       dig = ""
       if (match(bare, /[0-9]+/)) dig = substr(bare, RSTART, RLENGTH)
       if (dig == "0") continue
       # a repair stated inside the match ("1 finding was fixed") is not a live count
       if (frag ~ ("(" repair ")$")) continue
-      cl = clause_before(pre)
+      # ⛔ AN OPENING PAREN STARTS A NEW CLAUSE (P1, ninth fresh review of #2288 — MEASURED:
+      # `fixed the P3 nit (2 blocking defects remain)` recorded clean because the parenthesis belongs to
+      # the MATCH, so the prefix still held the repair and the clause split never saw the boundary).
+      cl = (substr(_head, 1, 1) == "(") ? "" : clause_before(pre)
       # …and one stated at the head of THIS clause is not either
       if (repair_led(cl)) continue
       # ⛔ AN INDEFINITE ARTICLE NEEDS THE REPAIR ANYWHERE IN THE CLAUSE (P2, eighth fresh review of

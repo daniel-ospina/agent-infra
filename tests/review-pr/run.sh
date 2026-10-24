@@ -2472,6 +2472,49 @@ reset; printf '**Verdict:** CLEAN — a bug remains in the retry path.\n' > "$TM
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "  ...and 'a bug remains' still refuses (rc=$(rc_of))"
 reset
+# ⛔ A PARENTHESISED COUNT IS STILL A COUNT (P0, ninth fresh review of #2288 — MEASURED, still open before
+# this arm: every form below recorded a SIGNED clean record).
+for _cl in \
+  'I found two (2) blocking defects, both in the retry path.\
+**Verdict:** CLEAN' \
+  '**Verdict:** CLEAN — 2 (two) blocking defects remain.' \
+  '**Verdict:** CLEAN — (2) blocking defects remain.' \
+  '**Verdict:** CLEAN — blocking defects remaining: (2).' \
+  '**Verdict:** CLEAN — 2 (P1) defects remain.'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused (parenthesised count): $_cl (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# COUNTER-DIRECTION: a parenthesised ZERO is still a zero.
+reset; printf '**Verdict:** CLEAN — (0) blocking defects remain.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "…while a parenthesised ZERO records (rc=$(rc_of))"
+# ⛔ EVERY SENTENCE BOUNDARY ENDS A CLAUSE (P1, ninth fresh review of #2288 — MEASURED: the separator set
+# omitted `.`, `(`, `though`, `whereas`, so a repair in one sentence exempted a live count in the next).
+for _cl in \
+  '**Verdict:** CLEAN — fixed the P3 nit though 2 blocking defects remain in scripts/x.sh.' \
+  '**Verdict:** CLEAN — fixed the P3 nit (2 blocking defects remain).' \
+  '**Verdict:** CLEAN — resolved the P3 nit whereas 2 blocking defects remain.'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused (repair in an earlier sentence): $_cl (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# …and the repair verb may sit anywhere in its own clause, so ordinary prose records (P2, ninth review:
+# the three-word window counted the verdict decoration, so only ONE content word could precede it).
+for _cl in \
+  '**Verdict:** CLEAN — the PR fixes 2 bugs in the parser.' \
+  '**Verdict:** CLEAN — this PR closes 2 issues.' \
+  '**Verdict:** CLEAN — We have also fixed 2 issues found in review.'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "records clean (repair anywhere in its clause): $_cl (rc=$(rc_of))"
+done
+reset
 reset; printf '**Verdict:** CLEAN\n- Summary\n      - 2 blocking defects remain in scripts/x.sh\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…an indented nested-list count is refused (rc=$(rc_of))"
@@ -2726,6 +2769,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 773 ]; ck $? "assertion-count pin: >= 773 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 793 ]; ck $? "assertion-count pin: >= 793 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
