@@ -263,6 +263,9 @@ class ParseResult:
     #: FILE-COARSE, and an operator must be able to see that the comparison happened
     #: at file granularity rather than at test-id granularity.
     runner: list[str] = field(default_factory=list)
+    #: The subset of ``ids`` derived from `run-bash-shards.sh`'s `❌ failed shard: <path>`
+    #: attribution line (#2643) — one per failing bash shard, likewise FILE-COARSE.
+    bash_shard: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -405,10 +408,16 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
         # family replaces the other; both are produced from the same capture.
         runner_ids, _runner_signatures = runner_aggregate_failures(lines)
         ids.extend(runner_ids)
+        # Pass 6 — BASH SHARD attribution (#2643). `run-bash-shards.sh` names each failing
+        # shard now; without this pass a capture whose only failure evidence is those lines
+        # still reads as unattributable, so the rail's refusal would survive the fix.
+        shard_ids, _shard_signatures = bash_shard_failures(lines)
+        ids.extend(shard_ids)
     return ParseResult(
         ids=sorted(set(ids)), rejected=rejected, guard_steps=guard_steps,
         non_nodeid=sorted(set(non_nodeid)),
         runner=sorted(set(runner_ids)) if raw_log else [],
+        bash_shard=sorted(set(shard_ids)) if raw_log else [],
     )
 
 
@@ -1253,6 +1262,8 @@ class SignatureParse:
     non_nodeid: list[str] = field(default_factory=list)
     #: The RUNNER-AGGREGATE ids that entered ``ids`` — same reason (file-coarse).
     runner: list[str] = field(default_factory=list)
+    #: The BASH-SHARD ids that entered ``ids`` (#2643) — same reason (file-coarse).
+    bash_shard: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -1623,6 +1634,48 @@ _RUNNER_KEY_PREFIX = "runner::"
 _RUNNER_AGG_SIG = "runner-aggregate"
 
 
+#: A BASH SHARD's own attribution line — `scripts/run-bash-shards.sh` prints one per listed shard
+#: whose run raised its error counter (#2643): ``❌ failed shard: <path>``.
+#:
+#: WHY THIS EXISTS: that runner's verdict used to carry a COUNT and nothing else (``❌ N bash
+#: shard(s) failed``), so on 2026-10-24 four shards were red on `main` and every PR slice printed
+#: ``❌ 1 bash shard(s) failed`` — the rail refused with "yielded NO parseable failure identity" and
+#: the only way to learn WHICH suite was red was to hand-bisect an 18,695-line job log against the
+#: runner's own timeline rows. A red the rail cannot name is a freeze with no owner.
+#:
+#: ⛔ KEYED ON THE PATH, and only on the explicit ``failed shard:`` prefix — NOT on the bare
+#: ``❌   <path>`` rows that follow it in the verdict, which a parser cannot tell from any other
+#: indented line, and NOT on the ``▸ <secs> <path>`` timeline rows, which are printed for PASSING
+#: shards too (so keying there would make every green shard a "failure identity" and inflate the
+#: PR's failing set until nothing could ever certify). File-coarse for the same reason the runner
+#: aggregate above is: the shard's internal case names are not stable.
+_BASH_SHARD_RE = re.compile(r"^(?:❌|✗)\s*\*{0,2}\s*failed shard:\s*(?P<label>\S.*?)\s*$")
+_BASH_SHARD_KEY_PREFIX = "bash-shard::"
+_BASH_SHARD_SIG = "bash-shard"
+
+
+def bash_shard_failures(
+    text: str,
+) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(ids, {id: {signature}})`` for `run-bash-shards.sh`'s attribution lines (see `_BASH_SHARD_RE`).
+
+    ONE helper for BOTH doors, exactly as `non_nodeid_failures`, `guard_step_failures` and
+    `runner_aggregate_failures` are: the `ids` CLI and the `signatures` CLI must not disagree about
+    this universe OR its signature (an id signed by one door and not the other fails §4.6's subset
+    rule closed, so the identity would BLOCK instead of compare).
+    """
+    ids: list[str] = []
+    signatures: dict[str, frozenset[str]] = {}
+    for line in _log_lines(text):
+        m = _BASH_SHARD_RE.match(line)
+        if m is None:
+            continue
+        key = f"{_BASH_SHARD_KEY_PREFIX}{_slug(m.group('label'))}"
+        ids.append(key)
+        signatures[key] = frozenset({_BASH_SHARD_SIG})
+    return sorted(set(ids)), signatures
+
+
 def runner_aggregate_failures(
     text: str,
 ) -> tuple[list[str], dict[str, frozenset[str]]]:
@@ -1949,6 +2002,15 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
         signatures[key] = frozenset(sigs)
     id_list.extend(runner_keys)
 
+    # Pass 6 — BASH SHARD attribution (#2643). Same helper, same reason as Pass 5: without it the
+    # `signatures` door exits 1 on a capture whose only failure evidence is `run-bash-shards.sh`'s
+    # shard lines, and `ci-failure-set.sh` treats that as FATAL — so the rail's "no parseable failure
+    # identity" refusal would be RELOCATED here instead of removed.
+    shard_keys, shard_signatures = bash_shard_failures(text)
+    for key, sigs in shard_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(shard_keys)
+
     return SignatureParse(
         ids=sorted(set(id_list)),
         signatures=signatures,
@@ -1958,6 +2020,7 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
         guard_steps=guard_keys,
         non_nodeid=non_nodeid_keys,
         runner=runner_keys,
+        bash_shard=shard_keys,
     )
 
 
@@ -2122,7 +2185,8 @@ def _cmd_ids(args: argparse.Namespace) -> int:
         f"unattributable={len(parsed.rejected)} "
         f"guard-steps={len(parsed.guard_steps)} "
         f"non-nodeid={len(parsed.non_nodeid)} "
-        f"runner={len(parsed.runner)}",
+        f"runner={len(parsed.runner)} "
+        f"bash-shard={len(parsed.bash_shard)}",
         file=sys.stderr,
     )
     # A RUNNER-AGGREGATE identity is FILE-COARSE, and the operator must be able to see
@@ -2132,6 +2196,16 @@ def _cmd_ids(args: argparse.Namespace) -> int:
         print(
             f"ci-exemption: RUNNER-AGGREGATE failure ATTRIBUTED at FILE granularity "
             f"(a JS/TS suite's own '❌ <label>: N passed, M failed' line): {key}",
+            file=sys.stderr,
+        )
+    # A BASH-SHARD identity is FILE-COARSE too (one per failing suite), and it is reported
+    # for the same reason: #2643 exists because this capture had NO identity at all and the
+    # rail refused it, so an operator must be able to see that a shard — not a nodeid — is
+    # what the comparison was made on.
+    for key in parsed.bash_shard:
+        print(
+            f"ci-exemption: BASH-SHARD failure ATTRIBUTED at FILE granularity "
+            f"(run-bash-shards.sh's own '❌ failed shard: <path>' line): {key}",
             file=sys.stderr,
         )
     for key in parsed.guard_steps:
@@ -2175,12 +2249,18 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
         f"unattributed={len(parsed.unattributed)} "
         f"guard-steps={len(parsed.guard_steps)} "
         f"non-nodeid={len(parsed.non_nodeid)} "
-        f"runner={len(parsed.runner)}",
+        f"runner={len(parsed.runner)} "
+        f"bash-shard={len(parsed.bash_shard)}",
         file=sys.stderr,
     )
     for key in parsed.runner:
         print(
             f"ci-exemption: RUNNER-AGGREGATE failure ATTRIBUTED at FILE granularity: {key}",
+            file=sys.stderr,
+        )
+    for key in parsed.bash_shard:
+        print(
+            f"ci-exemption: BASH-SHARD failure ATTRIBUTED at FILE granularity: {key}",
             file=sys.stderr,
         )
     for key in parsed.non_nodeid:

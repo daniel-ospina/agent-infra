@@ -2598,6 +2598,66 @@ def test_runner_aggregate_reads_the_real_actions_capture_shape():
     ) == ([], {})
 
 
+# ==========================================================================
+# Pass 6 — BASH SHARD attribution (#2643)
+#
+# `scripts/run-bash-shards.sh` printed only `❌ N bash shard(s) failed`. Four shards were red on main
+# on 2026-10-24 and every PR slice printed `❌ 1 bash shard(s) failed`, so the rail refused with
+# "yielded NO parseable failure identity" — a red no instrument could name. The runner now emits
+# `❌ failed shard: <path>` per failing listed shard; these pin that the rail turns it into an
+# identity, through BOTH doors, and that it does NOT turn a passing shard into one.
+
+_BASH_SHARD_FAIL = "❌ failed shard: scripts/orchestrator-harness/worker-terminal.test.sh"
+
+
+def test_bash_shard_line_yields_an_identity():
+    ids, sigs = ci_exemption.bash_shard_failures(_BASH_SHARD_FAIL)
+    assert ids == ["bash-shard::scripts-orchestrator-harness-worker-terminal.test.sh"]
+    assert sigs[ids[0]] == frozenset({ci_exemption._BASH_SHARD_SIG})
+
+
+def test_bash_shard_ids_door_and_signatures_door_agree():
+    """§4.6 compares signatures; an id signed by one door only would fail closed and BLOCK."""
+    log = "\n".join([_BASH_SHARD_FAIL, "  ▸    18s  scripts/other.test.sh"])
+    parsed_ids = ci_exemption.parse_failed_ids(log, raw_log=True)
+    parsed_sigs = ci_exemption.parse_pr_failure_text(log)
+    assert parsed_ids.bash_shard == parsed_ids.ids == [
+        "bash-shard::scripts-orchestrator-harness-worker-terminal.test.sh"
+    ]
+    assert parsed_sigs.bash_shard == parsed_sigs.ids == parsed_ids.ids
+    assert parsed_sigs.signatures[parsed_ids.ids[0]] == frozenset(
+        {ci_exemption._BASH_SHARD_SIG}
+    )
+
+
+def test_bash_shard_timeline_and_verdict_rows_are_not_identities():
+    """⛔ THE FALSE-ATTRIBUTION DIRECTION, and the reason the pattern is anchored on `failed shard:`.
+
+    `shard_note` prints `▸ <secs> <path>` for EVERY listed shard — passing ones included — and the
+    verdict block repeats the failing path as an indented bare row. Keying on either would make a
+    green shard a "failure identity", inflating the PR's failing set until nothing could certify.
+    """
+    log = "\n".join([
+        "  ▸    55s  scripts/pi-reap-idle.test.sh",
+        "  ▸    18s  scripts/orchestrator-harness/worker-terminal.test.sh",
+        "❌ 1 bash shard(s) failed",
+        "❌ failing shard(s):",
+        "❌   scripts/orchestrator-harness/worker-terminal.test.sh",
+    ])
+    assert ci_exemption.bash_shard_failures(log) == ([], {})
+    assert ci_exemption.parse_failed_ids(log, raw_log=True).bash_shard == []
+
+
+def test_bash_shard_identity_never_contains_the_slice_or_a_count():
+    """The identity must be stable: the same shard red in slice 1/8 and in the unsharded lane is
+    ONE identity, or main's baseline could never match the PR's."""
+    sliced = "bash-suites (1)\tBash shards\t2026-10-24T03:57:16Z " + _BASH_SHARD_FAIL
+    unsharded = "script-validate\tUNKNOWN STEP\t2026-10-24T02:00:55Z " + _BASH_SHARD_FAIL
+    a, _ = ci_exemption.bash_shard_failures(sliced)
+    b, _ = ci_exemption.bash_shard_failures(unsharded)
+    assert a == b and len(a) == 1
+
+
 # ── #9331 · a MEASURED value is not a different failure ───────────────────
 #
 # THE DEFECT (tortoise #9331). `normalize_signature` masks addresses, UUIDs, hex

@@ -1208,6 +1208,78 @@ OUT="$(cat "$TMP/badflag.out")"
 if [ "$RC" -eq 2 ]; then pass "an unknown argument exits 2"; else fail "an unknown argument exited $RC (want 2)"; fi
 
 echo ""
+echo "8am. ATTRIBUTION — a failed shard is NAMED in the verdict, not only counted (#2643)"
+# ⛔ WHAT THIS ARM EXISTS FOR. On 2026-10-24 four shards were red on `main` and FOUR PR slices each
+# printed `❌ 1 bash shard(s) failed`; the merge rail refused the PR with "yielded NO parseable failure
+# identity", and the only way to learn which suite was red was to download an 18,695-line job log and
+# bisect it against this runner's own `▸ <secs> <path>` rows. A count is not an identity, so the
+# verdict now names its shards. Nothing asserted that, and nothing could: every existing arm here
+# asserts COUNTS and SETS (listed==executed, the slice's exact set, the sweep counter), and a red that
+# prints nothing still satisfies all of them.
+#
+# The fixture is the runner with EVERY `run_shard` line pointed at a hermetic stand-in, exactly as
+# arms 8d/8e/8h do — with ONE of them pointed at the failing stand-in, so the run is red for a reason
+# this arm chose. Three assertions, and the second and third are what make the first mean something:
+#   (a) the failing shard's PATH appears in the verdict block;
+#   (b) the PASSING stand-in's path does NOT appear there (a block that names every shard satisfies
+#       (a) while telling a reader nothing);
+#   (c) RED CONTROL — gut the recorder and the run must STILL fail (rc 1, the counter is untouched)
+#       while naming nothing. Without (c), (a) could be satisfied by any future line that happens to
+#       print a path.
+PASS_SHARD="tests/ci-lane-parity/stand-in-shard.sh"
+FAIL_SHARD="tests/ci-lane-parity/stand-in-shard-fail.sh"
+awk -v pass="$PASS_SHARD" -v fails="$FAIL_SHARD" '
+  /^run_shard / && $2 !~ /^\"/ { n++; print "run_shard " (n == 2 ? fails : pass); next }
+  { print }
+' "$RUNNER" >"$TMP/runner-named.sh"
+if cmp -s "$RUNNER" "$TMP/runner-named.sh"; then
+  fail "the attribution fixture rewrote no run_shard line"
+else
+  $FIXTURE_BOUND bash "$TMP/runner-named.sh" >"$TMP/runner-named.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-named.out")"
+  # The verdict block is everything from the `N bash shard(s) failed` line on: the per-shard line is
+  # printed mid-run and is NOT what a parser sees at the end, so assert on the block.
+  VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-named.out")"
+  if [ "$RC" -eq 1 ] && grep -qF "$FAIL_SHARD" <<<"$VERDICT"; then
+    pass "a failed shard is NAMED in the verdict block (rc 1)"
+  else
+    fail "the verdict did not name the failed shard (rc $RC): $VERDICT"
+  fi
+  if grep -qF "$PASS_SHARD" <<<"$VERDICT"; then
+    fail "the verdict names the PASSING stand-in too — a block naming every shard attributes nothing: $VERDICT"
+  else
+    pass "…and it names only the shard that actually failed"
+  fi
+  # RED CONTROL (c): the recorder's body replaced by `: ` — the failure is still COUNTED, so the run is
+  # still rc 1; only the name is gone. That is the shape that proves (a) is pinning the recorder.
+  # ⛔ ASSERTED ON THE VERDICT SLICE, NEVER ON `$OUT` (review cycle 1). `shard_note` prints a timeline
+  # row — `▸ 0s <path>` — for every listed shard whether it passed or failed, so the WHOLE log always
+  # contains the failing path and `! grep -qF "$FAIL_SHARD" <<<"$OUT"` would fail this arm on every
+  # commit, reddening `bash-suites` for the very reason it exists to attribute.
+  awk '{ if ($0 ~ /^shard_record_failure\(\) \{/) { print "shard_record_failure() { :; }"; next } print }' \
+    "$TMP/runner-named.sh" >"$TMP/runner-noname.sh"
+  if cmp -s "$TMP/runner-named.sh" "$TMP/runner-noname.sh"; then
+    fail "the no-name mutation did not change the fixture"
+  else
+    $FIXTURE_BOUND bash "$TMP/runner-noname.sh" >"$TMP/runner-noname.out" 2>&1
+    RC=$?
+    NONAME_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-noname.out")"
+    if [ "$RC" -eq 1 ] && ! grep -qF "$FAIL_SHARD" <<<"$NONAME_VERDICT"; then
+      pass "RED CONTROL: a gutted recorder still fails the run (rc 1) and names nothing in the verdict"
+    else
+      fail "with the recorder gutted the run returned rc $RC and/or named a shard in the verdict: $NONAME_VERDICT"
+    fi
+    # …and it must SAY SO rather than end on a bare count: an unnamed failure has to read as unnamed.
+    if grep -q 'could NOT be named' <<<"$NONAME_VERDICT"; then
+      pass "…and an unnamed failure says so, instead of ending as a silent count"
+    else
+      fail "an unnamed failure did not announce that it could not be named: $NONAME_VERDICT"
+    fi
+  fi
+fi
+
+echo ""
 echo "10. WIRING — a guard (or runner) nothing invokes protects nothing"
 for pair in "PR:$PR" "main:$MAIN"; do
   lane="${pair%%:*}"; wf="${pair#*:}"

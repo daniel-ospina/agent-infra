@@ -90,6 +90,24 @@ shard_listed=0
 shard_time=0
 shard_slowest_secs=0
 shard_slowest=""
+# ── ATTRIBUTION (#2643) ───────────────────────────────────────────────────────────────────────────
+# `failed_shards` is the NAMES of the listed shards that raised `shard_errors`, one per line. Without
+# it this runner's whole verdict was a COUNT: four shards were red on main on 2026-10-24 and four PR
+# slices each printed `❌ 1 bash shard(s) failed`, so the only way to learn WHICH suite was red was to
+# download an 18,695-line job log and bisect it against the runner's own `▸ <secs> <path>` rows. The
+# merge rail needs a failure IDENTITY, and a count is not one.
+#
+# ⛔ DERIVED FROM THE COUNTER, NEVER A SECOND `||` CLAUSE. `shard_err_before` is sampled before the
+# shard runs and the recorder fires on `shard_errors -gt shard_err_before`, so any future way of
+# counting a failure still names the shard — and `tests/ci-lane-parity/run.sh` arm 8h, which deletes
+# the literal ` || shard_errors=$((shard_errors + 1))` from the one-liner below to prove the
+# failure-recording arm is load-bearing, neuters the count AND the name in that one edit (arm 8am
+# requires the name to go with it).
+#
+# It records only LISTED shards (`shard_is_listed`) — the same rule `shard_note` uses — so the
+# self-check sentinels below, which deliberately fail, cannot print a bogus name.
+failed_shards=""
+shard_err_before=0
 
 # The list length, read from the same `run_shard` lines `--list` prints (one source). Needed
 # BEFORE the run now: it bounds the slice arithmetic and marks where the sentinels begin.
@@ -150,6 +168,18 @@ slice_skips() {
   return 0
 }
 
+# shard_record_failure <path> — the ATTRIBUTION half of the failure arm: remember the shard's name and
+# say it at the point of failure, in the context of the suite's own output, so a reader (and the log
+# parses the rail does on a 40-minute job) never has to bisect a slice by its timing rows.
+#
+# A helper, not an inline printf, for the same reason `shard_note` is: it keeps the execution line one
+# statement-chain. It is deliberately `: `-able — gutting the body leaves the failure COUNTED and the
+# run red, only nameless — which is exactly the mutation `tests/ci-lane-parity/run.sh` arm 8am needs in
+# order to prove the name is not being printed by something else. That mutation replaces THIS ONE
+# LINE, so the body must stay on it (a multi-line body would be left dangling at top level and the
+# fixture would fail for a reason it did not choose).
+shard_record_failure() { [ "$shard_is_listed" = 1 ] || return 0; failed_shards="${failed_shards}${failed_shards:+$'\n'}$1"; printf '❌ failed shard: %s\n' "$1"; }
+
 # shard_note <path> <seconds> — the per-shard timing row, and the running total/slowest. Separate
 # from run_shard so the execution line stays one readable statement-chain (the mutation pins replace
 # that whole line; everything they must disable has to live on it).
@@ -168,7 +198,7 @@ shard_note() {
 # anonymously) can be measured at all: until now no lane printed how long a shard took, so "which
 # shard is slow, which one hangs" was answerable only by watching a job's clock. It prints ONLY for
 # list lines (`shard_is_listed`), so the sentinels cannot print a bogus row.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; bash "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); }
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err_before=$shard_errors; bash "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_errors" -gt "$shard_err_before" ] && shard_record_failure "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -406,6 +436,24 @@ shard_listed=$before_listed
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
+  # ⛔ THE VERDICT NAMES ITS SHARDS (#2643). A red slice's log ends here, and the merge rail reads its
+  # failure identity from the `❌ failed shard: <path>` line printed at the point of failure
+  # (`scripts/ci_exemption.py` Pass 6); `❌ 1 bash shard(s) failed` alone is a red with no owner.
+  #
+  # One line per shard so a parser can take them independently — and the UNNAMED remainder is stated
+  # whenever the count EXCEEDS the names, never omitted. A MIXED run (one shard named, plus a failure
+  # the sweep or an unlisted path counted) would otherwise print `❌ 2 … failed` above a single name,
+  # which reads as a complete attribution — and the failure with no path of its own is the one a reader
+  # most needs told about.
+  named=0
+  [ -n "$failed_shards" ] && named="$(printf '%s\n' "$failed_shards" | grep -c .)"
+  if [ "$named" -gt 0 ]; then
+    echo "❌ failing shard(s):"
+    printf '%s\n' "$failed_shards" | sed 's/^/❌   /'
+  fi
+  if [ "$named" -ne "$shard_errors" ]; then
+    echo "❌ $((shard_errors - named)) of these failure(s) could NOT be named — counted with no listed shard recorded (the syntax sweep, or an unlisted path, raised them)"
+  fi
   exit 1
 fi
 if [ "$slice_count" -gt 0 ]; then
