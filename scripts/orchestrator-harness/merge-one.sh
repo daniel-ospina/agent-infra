@@ -1166,7 +1166,7 @@ case "$LAST" in
       # same job name carrying `failure` and then `success` — the reading rule in AGENTS.md), so the
       # newest attempt per name has to be resolvable, or "the worst row" would refuse a gate a re-run
       # has already turned green.
-      gate_raw="$(gh pr checks "$PR" --repo "$OR" --json name,state,startedAt 2>"$gate_errf")"; gate_rc=$?
+      gate_raw="$(gh pr checks "$PR" --repo "$OR" --json name,state,startedAt,workflow 2>"$gate_errf")"; gate_rc=$?
       gate="$(printf '%s' "$gate_raw" | GATE_NAME="$REVIEW_GATE" python3 -c '
 import sys, json, os
 want = (os.environ.get("GATE_NAME") or "ai-review-gate").strip()
@@ -1235,17 +1235,27 @@ if not cands:
 # applies in orch-loop.sh (`all(v=="nonred" and c=="success" for …)`).
 newest = {}
 for c in cands:
-    n = str(c.get("name") or "").strip()
-    prev = newest.get(n)
+    # ⛔ A ROW IS A JOB, AND A JOB IS (name, workflow) (review round 4 P2-1). Keying on the rendered
+    # NAME alone makes two DIFFERENT jobs collapse into one, and then the newer row speaks
+    # for both: `ai-review-gate` from `ci` (SUCCESS) and from `compliance` (FAILURE) is a RED gate that
+    # this loop would merge on. gh reports both an app slug and a workflow here; either distinguishes
+    # them. Two attempts of the SAME job share the key and are resolved by recency below.
+    k = (str(c.get("name") or "").strip(), str(c.get("workflow") or "").strip())
+    prev = newest.get(k)
     if prev is None:
-        newest[n] = c
+        newest[k] = c
         continue
     a, b = str(c.get("startedAt") or ""), str(prev.get("startedAt") or "")
-    if a > b:
-        newest[n] = c
-    elif a == b and rank(state_of(c)) > rank(state_of(prev)):
-        # No usable ordering (both absent, or equal to the second): fail CLOSED, keep the worst.
-        newest[n] = c
+    if a and b and a != b:
+        if a > b:
+            newest[k] = c
+    elif rank(state_of(c)) > rank(state_of(prev)):
+        # ⛔ RECENCY MUST NOT DECIDE WHEN IT CANNOT BE READ (review round 4 P2-1). With one start time
+        # absent — a QUEUED run is emitted with `startedAt: null`, and Go renders it `0001-01-01…` on
+        # the real gh — a `>` comparison silently keeps the OTHER row, so a green older attempt wins
+        # over a re-run that is still queued (a body edit re-runs this gate, so that pair is normal).
+        # No usable ordering → fail CLOSED: keep the worse of the two.
+        newest[k] = c
 hit = None
 for c in newest.values():
     if hit is None or rank(state_of(c)) > rank(state_of(hit)):
@@ -1355,7 +1365,7 @@ else:
         *)
           # The classifier itself produced nothing (python3 missing/killed). That is a transport
           # failure, and it must never read as `gate=` — say which one it was.
-          gate_unread=$(( gate_unread + 1 ))
+          gate_unread=$(( gate_unread + 1 )); gate_absent=0
           if [ "$gate_unread" -ge "$GATE_READ_TRIES" ]; then
             gate_verdict=UNAVAILABLE; gate_line="gate=UNAVAILABLE rc=$gate_rc pyrc=$gate_pyrc read='the classifier produced no verdict' stderr=$gate_errline (bound $GATE_READ_TRIES)"; break
           fi

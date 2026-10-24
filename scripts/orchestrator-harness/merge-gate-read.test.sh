@@ -141,6 +141,10 @@ checks_answer() { # checks_answer <mode> — what `gh pr checks --json name,stat
     # must win or a gate a re-run already turned green is refused forever.
     rerun)     printf '[{"name":"ai-review-gate","state":"FAILURE","startedAt":"2026-10-24T01:00:00Z"},{"name":"ai-review-gate","state":"SUCCESS","startedAt":"2026-10-24T02:00:00Z"}]\n' ;;
     nostate)   printf '[{"name":"ai-review-gate"}]\n' ;;
+    # §2f/§2g: A ROW IS A JOB, AND RECENCY MUST NOT DECIDE WHAT IT CANNOT READ. A queued re-run carries
+    # startedAt null; the same rendered name can also be published by two DIFFERENT workflows.
+    queuevspass) printf '[{"name":"ai-review-gate","state":"SUCCESS","startedAt":"2026-10-24T01:00:00Z","workflow":"review"},{"name":"ai-review-gate","state":"QUEUED","startedAt":null,"workflow":"review"}]\n' ;;
+    twoworkflows) printf '[{"name":"ai-review-gate","state":"SUCCESS","startedAt":"2026-10-24T02:00:00Z","workflow":"ci"},{"name":"ai-review-gate","state":"FAILURE","startedAt":"2026-10-24T01:00:00Z","workflow":"compliance"}]\n' ;;
     empty)     printf '[]\n' ;;
     queued)    printf '[{"name":"ai-review-gate","state":"QUEUED"}]\n' ;;
     red)       printf '[{"name":"ai-review-gate","state":"FAILURE"}]\n' ;;
@@ -311,6 +315,26 @@ log="$(mrglog)"
 q 'gate=FAILURE (RED' <<<"$log" && ok "§2c shadowed gate: the verdict is the WORST matched row (FAILURE), not the first" \
                              || bad "§2c shadowed gate: no FAILURE verdict; log=$(tr '\n' ' ' <<<"$log")"
 nq 'MERGED' <<<"$log" && ok "§2c shadowed gate: nothing merged" || bad "§2c shadowed gate: the PR was merged"
+
+# ── §2f a QUEUED re-run (no start time) beside an older SUCCESS must WAIT, not merge on the older
+#         verdict: recency that cannot be read is not evidence of recency (round 4 P2-1) ────────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=queuevspass GATE_POLL_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§2f queued re-run vs older pass: refused (exit 4) — an unreadable order is not an excuse to merge" \
+                || bad "§2f queued re-run vs older pass: rc=$rc — merged on the older attempt while the re-run was still queued; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+nq 'MERGED' <<<"$log" && ok "§2f queued re-run vs older pass: nothing merged" || bad "§2f queued re-run vs older pass: the PR was merged"
+q 'gate=PENDING state=QUEUED' <<<"$log" && ok "§2f queued re-run vs older pass: the observed state is QUEUED (the worse of the pair is kept)" \
+                           || bad "§2f queued re-run vs older pass: the verdict does not name the queued attempt; log=$(tr '\n' ' ' <<<"$log")"
+
+# ── §2g the same rendered name from two DIFFERENT workflows is two jobs: the RED one decides ─────
+mkmrg
+out="$(run_merge PRCHECKS_MODE=twoworkflows GATE_POLL_TRIES=2)"; rc=$?
+log="$(mrglog)"
+[ "$rc" -eq 4 ] && ok "§2g two workflows, one name: refused (exit 4) — the green job does not speak for the red one" \
+                || bad "§2g two workflows, one name: rc=$rc — the newer green job masked the red gate; log=$(tail -3 <<<"$log" | tr '\n' ' ')"
+q 'gate=FAILURE (RED' <<<"$log" && ok "§2g two workflows, one name: the WORST verdict wins" \
+                               || bad "§2g two workflows, one name: not the worst verdict; log=$(tr '\n' ' ' <<<"$log")"
 
 # ── §2d two callers exposing the same job name: decided by POLICY, not by payload order ────────
 mkmrg
@@ -620,6 +644,24 @@ if q '    if False:$' "$(cat "$MUT4")"; then
                               || ok "§10 mutation: without the newest-attempt rule a stale FAILURE refuses the re-run green, so §2e goes RED"
 else
   bad "§10 mutation: the newest-attempt mutation did not apply — inconclusive"
+fi
+MUT5="$TMP/block-tieorder.sh"
+sed 's|    if a and b and a != b:|    if a != b:|' "$SLICE" > "$MUT5"
+if q '    if a != b:$' "$(cat "$MUT5")"; then
+  b_out="$(run_block "$MUT5" queuevspass)"
+  q 'gate=SUCCESS' <<<"$b_out" && ok "§11 mutation: with recency deciding an UNREADABLE order the older pass wins over the queued re-run (dangerous verdict SUCCESS), so §2f's refusal assertion goes RED" \
+                              || bad "§11 mutation: the mutant still waited on the queued re-run — §2f is vacuous"
+else
+  bad "§11 mutation: the unreadable-order mutation did not apply (sed found no target) — inconclusive"
+fi
+MUT6="$TMP/block-namekey.sh"
+sed 's|    k = (str(c.get("name") or "").strip(), str(c.get("workflow") or "").strip())|    k = str(c.get("name") or "").strip()|' "$SLICE" > "$MUT6"
+if q '    k = str(c.get("name") or "").strip()$' "$(cat "$MUT6")"; then
+  b_out="$(run_block "$MUT6" twoworkflows)"
+  q 'gate=SUCCESS' <<<"$b_out" && ok "§12 mutation: keyed on the rendered NAME alone the newer green job speaks for the red one (dangerous verdict SUCCESS), so §2g's refusal assertion goes RED" \
+                              || bad "§12 mutation: the name-only key still refused — §2g is vacuous"
+else
+  bad "§12 mutation: the (name, workflow) mutation did not apply — inconclusive"
 fi
 
 printf '\n%s\n' "──────────────────────────────────────────────"
