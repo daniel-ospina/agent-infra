@@ -1641,18 +1641,38 @@ ck "an unwritable absent-window is NAMED (an inert release cannot pass as a boun
 # this arm now pins the remaining rule: on a read-only state dir the reply is still discarded.
 cat > "$TMP/q10.sh" <<'SH'
 set -u
-PATH="$2:$PATH"; O="$3"; mkdir -p "$O/state"
-printf 'kind=terminal\nid=term_rc1\nworkspace=ws_rc1\n' > "$O/state/worker-merge-96"
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_rc1\nworkspace=ws_rc1\n' > "$WT_DIR/worker-merge-96"
 export CMUX_TREE_JSON='{"workspaces":[],"screens":[],"tabs":[],"terminals":[]}' CMUX_TREE_JSON_RC=3
-chmod 500 "$O/state"                       # the capture CANNOT be written → the merged fallback runs
-WT_DIR="$O/state"; WT_TABLE_TTL=0
+# ⛔ FORCE THE CAPTURE TO BE UNOPENABLE, so the `else` arm (no stderr capture at all) is what runs.
+# `chmod 500` on the STATE dir was inert here: round 8 moved the capture to `$TMPDIR`, exactly the
+# assertion-inflation this arm had (it passed on origin/main too, i.e. it pinned nothing).
+TMPDIR="$O/nope/absent"
 . "$1"
 echo "alive=$(wt_alive merge-96 && echo yes || echo no)"
 echo "count=$(wt_count merge-)"
 SH
 out="$(bash "$TMP/q10.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O27" 2>&1)"
 case "$out" in *"alive=yes"*"count=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
-ck "a JSON reply with rc!=0 is UNKNOWN in the merged fallback too (no single-sample emptying)" $rc
+ck "with NO usable capture the probe still runs and an rc!=0 reply is UNKNOWN (never the census)" $rc
+
+# ⛔ A STALE STAMP CONFIRMS NOTHING (review round 9 of #2653, P1): the stamp records when an absent
+# owner was FIRST seen, and nothing requires it to belong to the current outage — after an up-period in
+# which NOTHING read the census (a deploy restart, a frozen cycle), the first sample of the next outage
+# used to confirm immediately, freeing every cap and letting `wt_close` delete a live worker's record.
+cat > "$TMP/q14.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_stale\nworkspace=ws_stale\n' > "$WT_DIR/worker-merge-92"
+printf '%s\n' "$(( $(date +%s) - 4000 ))" > "$WT_DIR/.wt-absent-since"   # far older than any gap
+export CMUX_TREE_ABSENT=1
+. "$1"
+echo "count=$(wt_count merge-)"
+echo "window=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo none)"
+SH
+out="$(bash "$TMP/q14.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O31" 2>&1)"
+case "$out" in *"count=1"*"window=open"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a STALE stamp re-opens the window instead of confirming on one sample" $rc
 
 # ⛔ AND THE KNOB IS NOT AN OFF-SWITCH (review round 7 of #2653, P2): `WT_ABSENT_CONFIRM=0` would
 # confirm on ONE sample — the conclusion the rule forbids — and any `export` could set it. It is

@@ -844,18 +844,34 @@ wt_table() {
         # turn it into `0` (an already-elapsed window) and confirm on the FIRST sample, which is the
         # single-sample conclusion this whole rule forbids.
         absent_now=$(( 10#${absent_now:-0} ))
+        # ⛔ NORMALISE A PRESENT STAMP BEFORE ANY ARITHMETIC (see the `08` note below): the stale check
+        # immediately below does subtraction, so an `08` would abort here instead of there.
+        if [ -n "$absent_since" ]; then absent_since=$(( 10#$absent_since )); fi
+        # ⛔ A STALE STAMP IS NOT CONTINUITY (review round 9 of #2653, P1). The stamp records when an
+        # absent owner was FIRST seen; nothing requires it to belong to the CURRENT outage. If the owner
+        # was absent at T0, came back while NOTHING read the census (a deploy restarted the controller, a
+        # cycle froze in a hung probe), and went absent again, the first sample of the later outage found
+        # an ancient stamp and confirmed immediately — a single-sample `dead`, which frees every cap and
+        # lets `wt_close` delete a live worker's record. A stamp older than any plausible sampling gap is
+        # therefore treated as the window's FIRST sample: re-stamped, not confirmed.
+        if [ "$absent_since" -gt 0 ] && [ $(( absent_now - absent_since )) -gt $(( 4 * 10#${CYC:-240} )) ]; then
+          absent_since=""
+        fi
         if [ -z "$absent_since" ]; then
           # ⛔ NAMED, NOT SWALLOWED (review round 6 of #2653, P2): if the window cannot be persisted
           # every sample restarts it, the comparison never elapses, and the census stays UNKNOWN for
           # ever — exactly the 26h stall this change exists to end, with nothing saying so. `wt_warn`
           # writes to stderr AND `$LOG`, which is where that stall would have been visible.
+          # ⛔ LATCHED (review round 9 of #2653, P2): the write fails on EVERY attempt, so an unlatched
+          # warning is ~250 B per census read (~12/cycle, ~1 MB/day) into the append-only, never-rotated
+          # log — the same hazard this file just removed bash's own per-read diagnostic for. Named once
+          # per process; the state is still visible in stderr and `$LOG`.
           { printf '%s\n' "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null \
-            || wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED)"
+            || { [ -n "${_WT_WARNED_ABSENT_WINDOW:-}" ] || { _WT_WARNED_ABSENT_WINDOW=1; wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED); this warning is logged once per process"; }; }
           absent_since="$absent_now"
         fi
         # ONE comparison, always: a zero (or already-elapsed) window confirms on THIS sample, which is
         # what the suites and an operator debugging a box use; the default window needs a second sample.
-        absent_since=$(( 10#${absent_since:-0} ))
         [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1 ;;
       # ⛔ ANY OTHER ANSWER CLOSES THE WINDOW TOO (review round 8 of #2653, P2). It used to close only
       # on a READABLE tree, so an answer that proves nothing either way — the
@@ -1164,6 +1180,11 @@ PY
   # census can still see its surface (so the slot is held) but `wt_close` has no `kind`/`id` to close it
   # with — the worker holds a slot forever and the reap can never free it. So a failed write closes the
   # terminal it just created and FAILS the spawn.
+  # ⛔ THE OWNER HAS ANSWERED BY HERE (a terminal id came back), so the absent window is stale whatever
+  # happens to the RECORD WRITE below: a failed `printf > worker-<name>` returns 1 at the check below,
+  # and clearing only on the success tail left the ancient stamp standing — a second route to a
+  # one-sample confirmation (review round 9 of #2653, P2).
+  rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true
   if ! printf 'kind=terminal\nid=%s\nworkspace=%s\ngrammar=%s\ncwd=%s\nrun=%s\ncreated=%s\n' \
     "$id" "${ws:-}" "$grammar" "$cwd" "$runf" "$(date +%s)" > "$dir/worker-$name" 2>/dev/null; then
     wt_warn "REFUSED $name: created terminal '$id' but could not record it in $dir — closing that terminal rather than leaving an untrackable worker behind"

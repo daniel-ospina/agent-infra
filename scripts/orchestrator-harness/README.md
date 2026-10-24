@@ -592,7 +592,7 @@ input to the environment contract.)
 Around the spawn, three properties hold:
 
 - **the concurrency caps still bind** — `wt_count` reads ONE census (`cmux tree --json` plus the tmux
-  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s (the absent-owner confirmation window is `WT_ABSENT_CONFIRM=60`s; both are overridable), because every caller reads it
+  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s (the absent-owner confirmation window is `WT_ABSENT_CONFIRM=60`s — overridable, but `0` is NOT "off": it is coerced to 60, because zero would confirm on ONE sample), because every caller reads it
   through a command substitution), and a worker is identified the way its launcher named it: by the
   `wt-<worker>` workspace for the layout grammar, and by its **terminal id** (recorded at spawn) for
   `surface new-terminal`, which takes no name. Its polarity is fail-CLOSED in BOTH halves: a `cmux
@@ -606,7 +606,7 @@ Around the spawn, three properties hold:
   two samples at least `WT_ABSENT_CONFIRM` (default 60 s) apart** — its records are **dead**; a single
   refusal only opens the window and keeps the caps binding (a hard-killed owner leaves pty children
   behind, and a restart window is seconds), while a readable census — or a successful terminal spawn,
-  which proves the owner answered — closes it again. This is the same polarity the tmux half already
+  which proves the owner answered — or ANY answer that is neither readable nor absent (a banner, the `cannot connect …: No such file or directory` wrapper) closes it again, and a stamp older than 4×`CYC` is treated as a first sample rather than a confirmed one. This is the same polarity the tmux half already
   applies to `no server running`. A daemon that ANSWERS with something
   undecodable (a banner, a drifted shape, `cmux: cannot read`) is still UNKNOWN and still pins every
   cap. Without that distinction there is no bound anywhere between "unreadable" and "slot held":
