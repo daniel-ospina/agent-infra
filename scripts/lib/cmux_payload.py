@@ -29,9 +29,11 @@ delivery verdict:
   * `VERIFIED`    — the payload's tail was appended to the lane's **session
 transcript** after the pre-send baseline. The transcript is where a submitted
 message is durably written, so it is the only source that certifies the ACT.
-  * `PANE_ONLY`   — the tail is visible on the surface but the transcript shows no
-such message after this send. That is the composer state (a dropped Enter, or an
-earlier message with the same body). **NOT a delivery verdict.**
+  * `PANE_ONLY`   — the tail is visible on the surface but no SUBMISSION evidence
+was found: the transcript shows no such message after this send, or no transcript
+could be consulted at all (no session binding, or a file that never appeared).
+That is the composer state (a dropped Enter, or an earlier message with the same
+body). **NOT a delivery verdict.**
   * `UNVERIFIED`  — no tail anywhere: a truncated prefix, an empty payload, or a
 surface we could not read.
   * `SUBMIT_FAILED` — the terminating Enter itself raised, so submission was
@@ -162,7 +164,17 @@ def resolve_session_file(workspace: str, run) -> str | None:
         return None
     home = os.path.expanduser("~")
     hits = glob.glob(f"{home}/.pi/agent/sessions/*/*{sid}*.jsonl")
-    return max(hits, key=os.path.getmtime) if hits else None
+    if not hits:
+        return None
+    try:
+        # ⛔ THE STAT IS INSIDE THE GUARD (#1881 review P2). A session file can vanish between the
+        # glob and the stat (a reaped session, a pruned worktree), and outside the try that OSError
+        # escaped this function, escaped `send_verified`, and killed the helper BEFORE the verdict
+        # was printed — so the caller saw an empty stdout and reported "SENT BUT NOT VERIFIED" for a
+        # send that may well have landed. A file we cannot stat is a file we cannot name.
+        return max(hits, key=os.path.getmtime)
+    except OSError:
+        return None
 
 
 def _decode_escaped(text: str) -> str:
@@ -297,8 +309,15 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     session_base = transcript_offset(session_file)
 
     try:
-        cmux("send", "--workspace", workspace, text)
+        sent = cmux("send", "--workspace", workspace, text)
     except Exception:                                          # noqa: BLE001
+        return UNVERIFIED, ""
+    # ⛔ A NON-ZERO `cmux` EXIT IS NOT A SEND (#1881 review P2). `_default_run` does not raise on a
+    # non-zero status, so the module's own docstring ("a non-zero `cmux` exit … folds into
+    # UNVERIFIED") described a branch that did not exist: the payload send's status was never read,
+    # and the Enter's was not either. A status we cannot read (None) is treated as non-zero-safe:
+    # only an explicit 0 passes.
+    if getattr(sent, "returncode", 0) != 0:
         return UNVERIFIED, ""
 
     sleep(2)
@@ -306,7 +325,12 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     try:
         # The terminating Enter. Sent as its own call so a payload that itself
         # ends in a newline does not submit the message twice.
-        cmux("send", "--workspace", workspace, "\n")
+        enter = cmux("send", "--workspace", workspace, "\n")
+        # ⛔ A NON-ZERO EXIT FROM THE ENTER IS A DROPPED ENTER (#1881 review P2). Only the raised
+        # case used to clear `entered`, so a `cmux` that exited 2 instead of raising left the flag
+        # True and the verdict PANE_ONLY — whose remedy is the re-send this flag exists to forbid.
+        if getattr(enter, "returncode", 0) != 0:
+            entered = False
     except Exception:                                          # noqa: BLE001
         # ⛔ AN ENTER THAT DID NOT HAPPEN IS NOT A DETAIL (#1881 review P0). This used to be
         # swallowed, and the loop below then found the payload ON THE PANE — the composer renders
@@ -333,12 +357,30 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
             screen = ""
         if screen_has_payload(screen, text, tail_chars):
             saw_tail = True
+        # ⛔ A TRANSCRIPT THAT DID NOT EXIST BEFORE THE SEND CAN STILL BE THE ONE THIS SEND WROTE
+        # (#1881 review P2). pi creates the session file on the first user message, so resolving the
+        # path only BEFORE the send made VERIFIED unreachable for a lane whose transcript this very
+        # send created — a permanent PANE_ONLY whose text claimed a check that never ran. Re-resolve
+        # while unresolved, with baseline 0: the file did not exist when the send began, so every
+        # byte in it was written by, or after, this send.
+        if not session_file:
+            session_file = resolve_session_file(workspace, run)
+            if session_file:
+                session_base = 0
         # SUBMISSION EVIDENCE, in order of strength. The transcript is where a submitted message is
         # durably written, so it is the only source that can certify the act; the pane can only show
         # that the text reached the composer. Checking the pane FIRST (as this did) let the weaker
         # source short-circuit the stronger one.
-        if session_file and transcript_has_payload(session_file, text, tail_chars,
-                                                   since_offset=session_base):
+        # ⛔ NO BASELINE, NO DELIVERY VERDICT (#1881 review P1). `transcript_offset` returns None
+        # when the transcript cannot be stat'ed, and `transcript_has_payload` treats a None
+        # `since_offset` as "search the last 2 MB" — which on a live lane can span DAYS, so an
+        # EARLIER message with the same body (a standing order, a nudge, the retry the recovery text
+        # prescribes) certified a LATER, truncated send. Passing None is the weaker read, and this is
+        # the one call site where the weaker read is a false PASS, so it is refused here rather than
+        # merely documented. Without a pre-send baseline the best available verdict is PANE_ONLY.
+        if (session_file and session_base is not None
+                and transcript_has_payload(session_file, text, tail_chars,
+                                           since_offset=session_base)):
             return VERIFIED, screen
         if time.monotonic() >= deadline:
             # A dropped Enter is reported as its own verdict: submission was never ATTEMPTED, so this

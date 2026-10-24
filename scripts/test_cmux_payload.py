@@ -115,7 +115,7 @@ def test_tail_marker_empty_payload_is_empty(P):
 
 # ── the core false-PASS boundary ──────────────────────────────────────────────
 
-def test_full_payload_on_screen_is_verified(P):
+def test_full_payload_on_screen_is_a_pane_match(P):
     assert P.screen_has_payload(f"some earlier output\n{LONG}\n", LONG) is True
 
 
@@ -247,6 +247,131 @@ def test_verified_requires_the_transcript_to_record_this_send(P, tmp_path, monke
 
     verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
     assert verdict == P.VERIFIED
+
+
+def test_a_missing_baseline_never_reaches_verified(P, tmp_path, monkeypatch):
+    """⛔ NO BASELINE, NO DELIVERY VERDICT (#1881 review P1). `transcript_offset` returns None when the
+    transcript cannot be stat'ed, and `transcript_has_payload` treats a None `since_offset` as "search
+    the last 2 MB". On a live lane that window spans DAYS, so an EARLIER identical message (a standing
+    order, a nudge, the retry the recovery text prescribes) certified a LATER, truncated send — the
+    occurrence-identity defect this PR exists to close, still live on the one path where the baseline
+    was unavailable. The weaker read is refused at the ONE call site where it would be a false PASS.
+
+    Fails on the pre-fix code: `session_base is None` still passed `since_offset=None` through."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    sess = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    # The SAME payload, from long before this send. Without a baseline it is indistinguishable from
+    # a message that just arrived — so it must not be usable as delivery evidence at all.
+    sess.write_text('{"type":"user","text":"' + LONG + '"}\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(P, "transcript_offset", lambda path: None)
+
+    run = _fake_cmux(f"working...\n{LONG}\n", surface_out=f"{sid}\n")
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict != P.VERIFIED, "a pre-existing occurrence certified a send with no baseline"
+    assert verdict == P.PANE_ONLY
+
+
+def test_a_nonzero_enter_exit_is_a_dropped_enter(P):
+    """⛔ A NON-ZERO EXIT IS NOT A SUCCESS (#1881 review P2). `_default_run` does not raise on a
+    non-zero status, and `entered` was only cleared in the EXCEPT arm — so a `cmux` whose Enter
+    returned 2 left the flag True and the verdict PANE_ONLY, whose remedy invites the duplicate
+    re-send the flag exists to forbid. The raised and the exit-status shapes are the same failure."""
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            run.n = getattr(run, "n", 0) + 1
+            if run.n >= 2:                       # the terminating Enter
+                return _Proc("", returncode=2)
+            return _Proc("OK")
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc(f"working...\n{LONG}\n")
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict == P.SUBMIT_FAILED
+    assert verdict != P.PANE_ONLY
+
+
+def test_a_nonzero_payload_send_exit_is_unverified(P):
+    """The module header says a non-zero `cmux` exit folds into UNVERIFIED. Before this pin that
+    branch did not exist: the payload send's status was never read, so a failed send went on to be
+    judged by the pane and could return PANE_ONLY for a message that was never typed."""
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            return _Proc("", returncode=1)
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc(f"working...\n{LONG}\n")
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict == P.UNVERIFIED
+
+
+def test_a_transcript_created_by_this_send_can_still_verify(P, tmp_path, monkeypatch):
+    """⛔ ONE RESOLUTION IS NOT ENOUGH (#1881 review P2). pi creates the session file on the first
+    user message, so resolving the path only BEFORE the send made VERIFIED unreachable for a lane
+    whose transcript this very send created — a permanent PANE_ONLY that then asserted a transcript
+    read that had never happened. Re-resolved in the loop, with baseline 0 (the file did not exist
+    when the send began, so every byte in it is this send's or later)."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    sess = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    monkeypatch.setenv("HOME", str(home))
+
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            if argv[-1] != "\n":                 # the payload send CREATES the transcript
+                sess.write_text('{"type":"user","text":"' + LONG + '"}\n', encoding="utf-8")
+            return _Proc("OK")
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc("pane scrolled past the message")
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            return _Proc(f"{sid}\n")
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict == P.VERIFIED
+
+
+def test_a_session_file_that_cannot_be_stat_ed_is_not_a_crash(P, tmp_path, monkeypatch):
+    """⛔ THE STAT IS INSIDE THE GUARD (#1881 review P2). A session file vanishing between the glob
+    and the `max(…, key=getmtime)` raised an OSError OUT of `resolve_session_file` → out of
+    `send_verified` → the helper died with no stdout, and the caller reported "SENT BUT NOT
+    VERIFIED" for a send that may well have landed. A file we cannot stat is a file we cannot name."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    (sessions / f"gone-{sid}.jsonl").write_text("x\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    def boom(path):
+        raise OSError("vanished between glob and stat")
+
+    monkeypatch.setattr(P.os.path, "getmtime", boom)
+
+    def run(argv, timeout=None):
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            return _Proc(f"{sid}\n")
+        return _Proc("")
+
+    assert P.resolve_session_file("ws-1", run) is None
+
+
+def test_the_pane_only_text_does_not_assert_a_transcript_that_was_never_read():
+    """The shell's PANE_ONLY arm claimed "the lane's transcript shows no such message" even when NO
+    transcript could be resolved — a claim about evidence that was never read, attached to a remedy
+    that invites a duplicate order. The text must name both branches."""
+    with open(_ORCH_SEND, encoding="utf8") as fh:
+        shell = fh.read()
+    pane_only = shell.split("PANE_ONLY)", 1)[1].split("*)", 1)[0]
+    flat = " ".join(pane_only.split())
+    assert "or no transcript could be consulted at all" in flat
 
 
 def test_a_previous_identical_message_does_not_certify_a_later_send(P, tmp_path):

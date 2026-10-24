@@ -197,8 +197,13 @@ case "$cmux_payload_verdict" in
     rm -f "$_cmux_payload_err"
     # The tail is on the surface but nothing proves SUBMISSION. The composer renders what it holds,
     # so a message that was typed and never submitted looks delivered.
-    echo "$LABEL: SENT BUT NOT SUBMITTED — the payload tail is VISIBLE on the pane, but the lane's"
-    echo "$LABEL:   transcript shows no such message after this send, so submission is NOT proven."
+    # ⛔ IT MUST NOT ASSERT A CHECK THAT DID NOT RUN (#1881 review P2). The old text claimed "the
+    # lane's transcript shows no such message" even when NO transcript could be resolved (no session
+    # binding, or a file this very send was about to create) — a claim about evidence we never read,
+    # attached to a remedy that invites a duplicate order. Name both branches instead.
+    echo "$LABEL: SENT BUT NOT SUBMITTED — the payload tail is VISIBLE on the pane, but no SUBMISSION"
+    echo "$LABEL:   evidence was found: the lane's transcript shows no such message after this send,"
+    echo "$LABEL:   or no transcript could be consulted at all. Delivery is therefore NOT proven."
     echo "$LABEL:   CHECK THE PANE FIRST; if the text is sitting in the composer, press Enter there."
     echo "$LABEL:   Re-send ONLY if the pane no longer holds it — a re-send can duplicate the order."
     exit 6 ;;
