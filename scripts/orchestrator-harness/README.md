@@ -606,7 +606,7 @@ Around the spawn, three properties hold:
   two samples at least `WT_ABSENT_CONFIRM` (default 60 s) apart** — its records are **dead**; a single
   refusal only opens the window and keeps the caps binding (a hard-killed owner leaves pty children
   behind, and a restart window is seconds), while a readable census — or a successful terminal spawn,
-  which proves the owner answered — or ANY answer that is neither readable nor absent (a banner, the `cannot connect …: No such file or directory` wrapper) closes it again, and a stamp older than 4×`CYC` is treated as a first sample rather than a confirmed one. This is the same polarity the tmux half already
+  which proves the owner answered — or ANY answer that is neither readable nor absent (a banner, the `cannot connect …: No such file or directory` wrapper) closes it again, and a stamp older than `WT_ABSENT_STALE_MIN` = **max(4×`CYC`, 2×`WT_ABSENT_CONFIRM`)** (never narrower than the window) — or one dated in the future — is treated as a first sample rather than a confirmed one. This is the same polarity the tmux half already
   applies to `no server running`. A daemon that ANSWERS with something
   undecodable (a banner, a drifted shape, `cmux: cannot read`) is still UNKNOWN and still pins every
   cap. Without that distinction there is no bound anywhere between "unreadable" and "slot held":

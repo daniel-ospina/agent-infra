@@ -729,6 +729,14 @@ wt_tmux_names() {
 # dead (agent-infra#2653, review round 5). Two samples, never one: see the arm in wt_table.
 WT_ABSENT_CONFIRM="${WT_ABSENT_CONFIRM:-60}"
 case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
+# ⛔ ZERO IS NOT "OFF", IT IS "CONFIRM ON ONE SAMPLE" (review round 7 of #2653, P2): any `export` could
+# set it, and a gate an export can defeat is not a gate (the same reasoning `wt_bounded` records for its
+# own `0`). An ALREADY-ELAPSED window is a different input and still confirms on this sample.
+# ⛔ AND IT IS COERCED **BEFORE** `WT_ABSENT_STALE_MIN` IS DERIVED (review round 11 of #2653): done the
+# other way round, `0` made the `2*window` floor 0, leaving `4*CYC` = 20s at the sanctioned `CYC=5` —
+# NARROWER than the 60s window it must be wider than, so every stamp was discarded as stale before it
+# could confirm and the release could never fire, silently.
+[ "$WT_ABSENT_CONFIRM" -gt 0 ] 2>/dev/null || WT_ABSENT_CONFIRM=60
 # ⛔ CYC IS READ BY THE STALENESS RULE BELOW, SO IT IS COERCED HERE, NOT ASSUMED (review round 10 of
 # #2653). This module is sourced by `dispatch-merge.sh` and `report.sh`, which do NOT coerce CYC for
 # it (`orch-loop.sh` repairs only its own shell), so a non-numeric value from the environment reaches
@@ -745,11 +753,6 @@ case "$CYC" in ''|*[!0-9]*) CYC=240 ;; esac
 # #2653 provides would silently never happen. Whichever is larger: 4 cycles, or twice the window.
 WT_ABSENT_STALE_MIN=$(( 4 * CYC ))
 [ "$WT_ABSENT_STALE_MIN" -ge $(( 2 * WT_ABSENT_CONFIRM )) ] || WT_ABSENT_STALE_MIN=$(( 2 * WT_ABSENT_CONFIRM ))
-# ⛔ ZERO IS NOT "OFF", IT IS "CONFIRM ON ONE SAMPLE" — the single-sample conclusion the whole rule
-# forbids, reachable by any `export` in the controller's environment (review round 7 of #2653, P2). A
-# gate that an export can defeat is not a gate; the same reasoning `wt_bounded` records for its own
-# `0`. An ALREADY-ELAPSED window is a different input and still confirms on this sample.
-[ "$WT_ABSENT_CONFIRM" -gt 0 ] 2>/dev/null || WT_ABSENT_CONFIRM=60
 WT_CENSUS=""
 wt_table() {
   local now ttl dir cache hdr tree tree_err tfile absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
@@ -849,6 +852,13 @@ wt_table() {
     case "$tree_err" in
       *'Connection refused'*|*'no server running'*)
         absent_now="$(date +%s 2>/dev/null || echo 0)"
+        # ⛔ A FAILED CLOCK MUST NOT EMPTY THE CENSUS OR POISON THE STAMP (review round 11 of #2653, P2):
+        # a `date` printing a diagnostic makes `$(( 10#… ))` error — `wt_table` aborts before printing,
+        # and an empty table is read as "no workers" — and the failure would then PERSIST the stamp `0`,
+        # which the read arm treats as an already-elapsed window, confirming on ONE real sample. Guard it
+        # and refuse to open a window on an unusable clock: the record stays UNKNOWN (fail-closed).
+        case "$absent_now" in ''|*[!0-9]*) absent_now="" ;; esac
+        if [ -z "$absent_now" ]; then :; else
         absent_since="$(cat "$dir/.wt-absent-since" 2>/dev/null || true)"
         case "$absent_since" in ''|*[!0-9]*) absent_since="" ;; esac
         # ⛔ `08` PASSES THE DIGIT GUARD AND THEN ABORTS THE ARITHMETIC (review round 8 of #2653, P2):
@@ -893,7 +903,9 @@ wt_table() {
           # warning is ~250 B per census read (~12/cycle, ~1 MB/day) into the append-only, never-rotated
           # log — the same hazard this file just removed bash's own per-read diagnostic for. Named once
           # per process; the state is still visible in stderr and `$LOG`.
+          # A successful write RE-ARMS the warning (the next inability to confirm is a new fact).
           { printf '%s\n' "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null \
+            && rm -f "${TMPDIR:-/tmp}/.wt-warned-absent-window.$$" 2>/dev/null \
             || { _wl="${TMPDIR:-/tmp}/.wt-warned-absent-window.$$"
                  # ⛔ THE LATCH IS A FILE, NOT A VARIABLE (review round 10 of #2653, P2): every consumer
                  # calls `wt_table` in a COMMAND SUBSTITUTION (`$(wt_table)`, `wt_table | awk`), i.e. in a
@@ -905,7 +917,8 @@ wt_table() {
         fi
         # ONE comparison, always: a zero (or already-elapsed) window confirms on THIS sample, which is
         # what the suites and an operator debugging a box use; the default window needs a second sample.
-        [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1 ;;
+        [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1
+        fi ;;
       # ⛔ ANY OTHER ANSWER CLOSES THE WINDOW TOO (review round 8 of #2653, P2). It used to close only
       # on a READABLE tree, so an answer that proves nothing either way — the
       # `cannot connect … No such file or directory` wrapper this module deliberately treats as UNKNOWN,
@@ -1234,7 +1247,6 @@ PY
   # spawns, which prove nothing about the cmux owner and are exactly what the controller keeps doing
   # during an outage — clearing there would restart the timer on every outage spawn and re-create the
   # 26h stall.
-  case "${kind:-}" in terminal|surface) rm -f "$(wt_dir)/.wt-absent-since" 2>/dev/null || true ;; esac
   wt_forget
   return 0
 }

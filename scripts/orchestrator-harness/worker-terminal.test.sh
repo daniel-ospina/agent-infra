@@ -1656,6 +1656,42 @@ out="$(bash "$TMP/q10.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O27" 2>&1)"
 case "$out" in *"alive=yes"*"count=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "with NO usable capture the probe still runs and an rc!=0 reply is UNKNOWN (never the census)" $rc
 
+# ⛔ THE LATCH MUST SURVIVE THE SUBSHELL (review round 11 of #2653, P2). Every consumer calls
+# `wt_table` in a command substitution, so round 9's in-shell variable latched nothing and the warning
+# fired per read. TWO reads, EACH THROUGH A SUBSTITUTION, must produce exactly ONE warning.
+cat > "$TMP/q19.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_lat\nworkspace=ws_lat\n' > "$WT_DIR/worker-merge-88"
+chmod 500 "$WT_DIR"
+export CMUX_TREE_ABSENT=1
+. "$1"
+a="$(wt_table 2>>"$O/warn.txt")"
+b="$(wt_table 2>>"$O/warn.txt")"
+chmod 700 "$WT_DIR"
+echo "warns=$(grep -c UNWRITABLE "$O/warn.txt" 2>/dev/null || echo 0)"
+echo "rows=$([ -n "$a" ] && [ -n "$b" ] && echo 2 || echo 0)"
+SH
+out="$(bash "$TMP/q19.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O36" 2>&1)"
+case "$out" in *"warns=1"*"rows=2"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "the unwritable-window warning latches ONCE across two \`\$(wt_table)\` subshells" $rc
+
+# ⛔ COERCION ORDER: `WT_ABSENT_CONFIRM=0` AND the documented small `CYC=5` TOGETHER (review round 11,
+# P1). Each alone passed; the combination left the staleness bound at 4x5=20s — narrower than the 60s
+# window — so every stamp was discarded before it could confirm. A 90s stamp must still confirm.
+cat > "$TMP/q20.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_ord\nworkspace=ws_ord\n' > "$WT_DIR/worker-merge-87"
+printf '%s\n' "$(( $(date +%s) - 90 ))" > "$WT_DIR/.wt-absent-since"
+export CMUX_TREE_ABSENT=1 CYC=5 WT_ABSENT_CONFIRM=0
+. "$1"
+echo "count=$(wt_count merge-)"
+SH
+out="$(bash "$TMP/q20.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O37" 2>&1)"
+case "$out" in *"count=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "WT_ABSENT_CONFIRM=0 + CYC=5 together still confirm (the bound is never narrower than the window)" $rc
+
 # ⛔ A BAD `CYC` MUST NOT EMPTY THE CENSUS (review round 10 of #2653, P1). The staleness rule does
 # arithmetic on CYC, which this module inherits from the environment (its consumers, `dispatch-merge.sh`
 # and `report.sh`, do not coerce it) — and an arithmetic-expansion error TERMINATES wt_table before it
