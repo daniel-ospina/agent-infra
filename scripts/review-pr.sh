@@ -1789,17 +1789,17 @@ function repair_led(cl,   n, w, i, low) {
   # `Fixes to the retry path leave 2 blocking defects unresolved.` opened with a repair word, so the
   # determiner-free noun escaped the closed subject list and recorded a signed clean record.)
   if (low ~ ("^(" repair ")[[:space:]]+(to|of|for|in|on|at|by|with)([^[:alnum:]]|$)")) return 0
-  # ⛔ …AND THE REPAIR MUST OBJECT THE COUNT (P0, second adversarial pass of #2288 — MEASURED: every
-  # paraphrase that put a count predicate between a repair lexeme and the counted NP recorded a signed
-  # clean record — `the guard that we fixed leaves 2 blocking defects unresolved`, `the check which the PR
-  # fixed still reports 2 …`, `Fix gaps leave 2 …`, `Removed code still leaves 2 …`, `Addressed items still
-  # expose 2 …`, `Closed PRs still show 2 …`, `Fixed-size buffer still yields 2 …`. Enumerating more noun
-  # shapes re-opens with the next paraphrase; the predicate between the verb and the count is the
-  # discriminator, and it is checked for BOTH grants — the bare one and the subject one — because the
-  # subject grant was the loophole the first attempt missed.)
+  # ⛔ …AND THE REPAIR MUST GOVERN THE COUNT BY ADJACENCY (P0, third adversarial pass of #2288 — MEASURED:
+  # a closed PREDICATE vocabulary is not a structural rule. It closed `… fixed leaves 2 blocking …` and left
+  # `Fixing the guard left 2 blocking defects unresolved.` recording a signed clean — one TENSE apart from a
+  # refused twin — plus `introduced`, `created`, `revealed`, `surfaced`, `means`, `depends`, `carries`. So the
+  # test is adjacency: after the repair lexeme the clause may hold only whitespace and an optional DETERMINER,
+  # because the counted NP must be the direct object of that verb. Every legitimate grant in the suite satisfies it
+  # (`Fixed the 3 issues`, `Closes the 2 issues`, `the PR fixes 2 bugs`), and an intervening verb of ANY
+  # tense cannot.)
   if (match(low, ("^(" repair ")")) || match(low, ("^(the pr|this pr|the branch|this branch|we|i|it)[[:space:]]+(" AUX ")*(" repair ")"))) {
-    if (substr(low, RSTART + RLENGTH) ~ /(leaves?|remains?|stays?|reports?|yields?|exposes?|shows?|blocks?|stalls?)([^[:alnum:]]|$)/) return 0
-    return 1
+    if (substr(low, RSTART + RLENGTH) ~ /^[[:space:]]*((the|a|an|this|that|these|those|its|their|our|my|your|all|both|any|every|each|no)[[:space:]]*)?$/) return 1
+    return 0
   }
   return 0
 }
