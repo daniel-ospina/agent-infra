@@ -1656,6 +1656,57 @@ out="$(bash "$TMP/q10.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O27" 2>&1)"
 case "$out" in *"alive=yes"*"count=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "with NO usable capture the probe still runs and an rc!=0 reply is UNKNOWN (never the census)" $rc
 
+# ⛔ A BAD `CYC` MUST NOT EMPTY THE CENSUS (review round 10 of #2653, P1). The staleness rule does
+# arithmetic on CYC, which this module inherits from the environment (its consumers, `dispatch-merge.sh`
+# and `report.sh`, do not coerce it) — and an arithmetic-expansion error TERMINATES wt_table before it
+# prints, which every consumer reads as "this box has no workers".
+cat > "$TMP/q15.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_cyc\nworkspace=ws_cyc\n' > "$WT_DIR/worker-merge-91b"
+printf '%s\n' "$(( $(date +%s) - 600 ))" > "$WT_DIR/.wt-absent-since"
+export CMUX_TREE_ABSENT=1 CYC=abc
+. "$1"
+echo "rows=$(wt_table | wc -l | tr -d ' ')"
+SH
+out="$(bash "$TMP/q15.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O32" 2>&1)"
+case "$out" in *"rows=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a non-numeric CYC cannot abort the census into an EMPTY table" $rc
+
+# ⛔ A SANCTIONED SMALL CYCLE MUST STILL CONFIRM (review round 10 of #2653, P2): CYC floors at 5, and
+# the staleness bound used to be 4xCYC (=20s) — narrower than the 60s confirmation window — so every
+# stamp was discarded before it could confirm and the release never happened (the 26h stall, silently).
+cat > "$TMP/q16.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_c5\nworkspace=ws_c5\n' > "$WT_DIR/worker-merge-90"
+# 90s: OLDER than 4xCYC (20s) but YOUNGER than the confirmation window's 2x floor (120s) — the stamp
+# must still confirm, which is exactly what a bound of 4xCYC alone would have destroyed.
+printf '%s\n' "$(( $(date +%s) - 90 ))" > "$WT_DIR/.wt-absent-since"
+export CMUX_TREE_ABSENT=1 CYC=5
+. "$1"
+echo "count=$(wt_count merge-)"
+SH
+out="$(bash "$TMP/q16.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O33" 2>&1)"
+case "$out" in *"count=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a small CYC (the documented floor) still confirms an absent owner (the bound is never narrower than the window)" $rc
+
+# ⛔ A FUTURE STAMP IS DISCARDED (review round 10 of #2653): after a clock step the subtraction is
+# negative, so neither rule fired and the release was pinned for the whole skew.
+cat > "$TMP/q17.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_fut\nworkspace=ws_fut\n' > "$WT_DIR/worker-merge-89"
+printf '%s\n' "$(( $(date +%s) + 7200 ))" > "$WT_DIR/.wt-absent-since"
+export CMUX_TREE_ABSENT=1
+. "$1"
+echo "count=$(wt_count merge-)"
+echo "window=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo none)"
+SH
+out="$(bash "$TMP/q17.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O34" 2>&1)"
+case "$out" in *"count=1"*"window=open"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a FUTURE stamp (a clock step) is discarded instead of pinning the release" $rc
+
 # ⛔ A STALE STAMP CONFIRMS NOTHING (review round 9 of #2653, P1): the stamp records when an absent
 # owner was FIRST seen, and nothing requires it to belong to the current outage — after an up-period in
 # which NOTHING read the census (a deploy restart, a frozen cycle), the first sample of the next outage
@@ -1700,8 +1751,9 @@ printf 'kind=terminal\nid=term_oct\nworkspace=ws_oct\n' > "$WT_DIR/worker-merge-
 printf '08\n' > "$WT_DIR/.wt-absent-since"          # a leading-zero stamp: NOT octal
 export CMUX_TREE_ABSENT=1
 . "$1"
-# ⛔ A ROW, NOT A COUNT: an `08` stamp is EPOCH 8, so it legitimately reads as an elapsed window and
-# its record as dead — what must NOT happen is the arithmetic aborting the function before it prints.
+# ⛔ A ROW, NOT A COUNT: epoch-8 is far older than the staleness bound, so since round 9 it is discarded
+# and the record reads `unknown` — what must NOT happen is the arithmetic aborting the function before it
+# prints (an empty table reads as "no workers anywhere").
 echo "rows=$(wt_table | wc -l | tr -d ' ')"
 SH
 out="$(bash "$TMP/q12.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O29" 2>&1)"
@@ -1729,6 +1781,25 @@ SH
 out="$(bash "$TMP/q13.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O30" 2>&1)"
 case "$out" in *"window-open=open"*"window-after-other=closed"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "an answer that is neither readable nor absent CLOSES the window (no single-sample confirmation later)" $rc
+
+# ⛔ AND THE CLEAR MUST SURVIVE A FAILED RECORD WRITE (review round 10 of #2653, P2). Round 9 moved the
+# clear BEFORE the record write because the owner has demonstrably answered by then; q8 only covers a
+# SUCCESSFUL spawn (where the later tail clears anyway), so dropping that line stayed green.
+mkdir -p "$TMP/home-q8b"; gh_hosts_fixture "$TMP/home-q8b"
+cat > "$TMP/q18.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_LOG="$4"; : > "$CMUX_LOG"
+WT_WORKER_HOME="$5"
+mkdir -p "$WT_DIR/worker-merge-79"                 # the RECORD path is a directory: the write must fail
+printf '%s\n' "$(( $(date +%s) - 600 ))" > "$WT_DIR/.wt-absent-since"
+. "$1"
+wt_spawn "merge-79" "/tmp" 'bash /tmp/w.sh 79 b o/r'; echo "spawn_rc=$?"
+echo "window-after=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+SH
+out="$(bash "$TMP/q18.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O35" "$TMP/cmux35.log" "$TMP/home-q8b" 2>&1)"
+case "$out" in *"spawn_rc=1"*"window-after=closed"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "the absent window closes even when the worker RECORD cannot be written (the owner answered)" $rc
 
 # ⛔ THE SPAWN-CLEAR NEEDS A PIN, OR A REFACTOR THAT FOLDS IT INTO wt_forget STAYS GREEN (review
 # round 7 of #2653). A terminal spawn PROVES the cmux owner answered, so it must close the absent

@@ -729,6 +729,22 @@ wt_tmux_names() {
 # dead (agent-infra#2653, review round 5). Two samples, never one: see the arm in wt_table.
 WT_ABSENT_CONFIRM="${WT_ABSENT_CONFIRM:-60}"
 case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
+# ⛔ CYC IS READ BY THE STALENESS RULE BELOW, SO IT IS COERCED HERE, NOT ASSUMED (review round 10 of
+# #2653). This module is sourced by `dispatch-merge.sh` and `report.sh`, which do NOT coerce CYC for
+# it (`orch-loop.sh` repairs only its own shell), so a non-numeric value from the environment reaches
+# `$(( 4 * 10#$CYC ))` — and an arithmetic-expansion error TERMINATES `wt_table` before it prints.
+# An empty table is read as "this box has no workers": the caps stop binding and `wt_close` deletes a
+# record it never looked at. `CYC` also floors at 5 (install.sh, orch-loop), so a legitimate small
+# cycle is preserved.
+CYC="${CYC:-240}"
+case "$CYC" in ''|*[!0-9]*) CYC=240 ;; esac
+[ "$CYC" -ge 1 ] 2>/dev/null || CYC=240
+# A stamp older than this is not continuity for the CURRENT outage: it is re-stamped, never confirmed.
+# ⛔ AND IT MUST BE WIDER THAN THE CONFIRMATION WINDOW (review round 10 of #2653), or a sanctioned
+# small cycle (`CYC` floors at 5) would discard every stamp before it could ever confirm — the release
+# #2653 provides would silently never happen. Whichever is larger: 4 cycles, or twice the window.
+WT_ABSENT_STALE_MIN=$(( 4 * CYC ))
+[ "$WT_ABSENT_STALE_MIN" -ge $(( 2 * WT_ABSENT_CONFIRM )) ] || WT_ABSENT_STALE_MIN=$(( 2 * WT_ABSENT_CONFIRM ))
 # ⛔ ZERO IS NOT "OFF", IT IS "CONFIRM ON ONE SAMPLE" — the single-sample conclusion the whole rule
 # forbids, reachable by any `export` in the controller's environment (review round 7 of #2653, P2). A
 # gate that an export can defeat is not a gate; the same reasoning `wt_bounded` records for its own
@@ -852,11 +868,22 @@ wt_table() {
         # was absent at T0, came back while NOTHING read the census (a deploy restarted the controller, a
         # cycle froze in a hung probe), and went absent again, the first sample of the later outage found
         # an ancient stamp and confirmed immediately — a single-sample `dead`, which frees every cap and
-        # lets `wt_close` delete a live worker's record. A stamp older than any plausible sampling gap is
-        # therefore treated as the window's FIRST sample: re-stamped, not confirmed.
-        if [ "$absent_since" -gt 0 ] && [ $(( absent_now - absent_since )) -gt $(( 4 * 10#${CYC:-240} )) ]; then
-          absent_since=""
-        fi
+        # lets `wt_close` delete a live worker's record.
+        # ⛔ AND A FUTURE STAMP IS NOT CONTINUITY EITHER (review round 10 of #2653): after an NTP step or
+        # a VM snapshot restore the subtraction is negative, so neither the staleness check nor the
+        # confirm test fires and the release is pinned for the whole skew — the stall this change ends,
+        # in the fail-closed direction. A non-monotonic stamp is discarded like a stale one.
+        # ⛔ AND THE EMPTINESS TEST IS A `case`, NOT `[ … -gt 0 ]` (review round 10): `[` on an empty
+        # value prints its own diagnostic on EVERY window opening — the per-read bash noise silenced
+        # everywhere else in this file. A stamp of literally `0` IS an already-elapsed window, kept.
+        case "$absent_since" in
+          '') : ;;
+          0)  : ;;
+          *)  if [ "$absent_since" -gt "$absent_now" ] \
+                 || [ $(( absent_now - absent_since )) -gt "$WT_ABSENT_STALE_MIN" ]; then
+                absent_since=""
+              fi ;;
+        esac
         if [ -z "$absent_since" ]; then
           # ⛔ NAMED, NOT SWALLOWED (review round 6 of #2653, P2): if the window cannot be persisted
           # every sample restarts it, the comparison never elapses, and the census stays UNKNOWN for
@@ -867,7 +894,13 @@ wt_table() {
           # log — the same hazard this file just removed bash's own per-read diagnostic for. Named once
           # per process; the state is still visible in stderr and `$LOG`.
           { printf '%s\n' "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null \
-            || { [ -n "${_WT_WARNED_ABSENT_WINDOW:-}" ] || { _WT_WARNED_ABSENT_WINDOW=1; wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED); this warning is logged once per process"; }; }
+            || { _wl="${TMPDIR:-/tmp}/.wt-warned-absent-window.$$"
+                 # ⛔ THE LATCH IS A FILE, NOT A VARIABLE (review round 10 of #2653, P2): every consumer
+                 # calls `wt_table` in a COMMAND SUBSTITUTION (`$(wt_table)`, `wt_table | awk`), i.e. in a
+                 # subshell, so an in-process variable was assigned and discarded on every read — the
+                 # warning fired per read, ~12/cycle, ~1 MB/day into the append-only log. `$$` is the
+                 # parent's pid and is stable across those subshells, so this file latches.
+                 [ -e "$_wl" ] || { : >"$_wl" 2>/dev/null || true; wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED); logged once per process"; }; }
           absent_since="$absent_now"
         fi
         # ONE comparison, always: a zero (or already-elapsed) window confirms on THIS sample, which is
