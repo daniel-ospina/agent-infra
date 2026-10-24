@@ -1381,7 +1381,7 @@ PRELUDE="$T/doctor-funcs.sh"
 CASELINE="$(grep -n '^case "${1:-status}" in$' "$DOCTOR" | head -1 | cut -d: -f1)"
 if [ -n "$CASELINE" ] && [ "$CASELINE" -gt 100 ]; then
   head -n "$((CASELINE - 1))" "$DOCTOR" > "$PRELUDE"
-  ok "bare-entry: the define-only prelude was extracted ($CASELINE lines of the doctor)"
+  ok "bare-entry: the define-only prelude was extracted ($((CASELINE - 1)) lines of the doctor, everything before the CLI dispatch at $CASELINE)"
 else
   bad "bare-entry: could not find the CLI dispatch line — this arm cannot run (head=-n '${CASELINE}')"
 fi
@@ -1428,13 +1428,14 @@ done <<<"$ROLES"
 # argument. `derived` is now an ANNOTATION printed under the verdict (the value embeds the positional
 # in a path or a concatenation), never a bucket that suppresses grading.
 audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a `derived` note
-  local body="$1" assign var val rd
+  local body="$1" assign var val rd seen=0 alln=0
   while read -r assign; do
     [ -n "$assign" ] || continue
     var="${assign%%=*}"; val="${assign#*=}"
     case "$val" in *'$'[1-9]*|*'${'[1-9]*) ;; *) continue ;; esac
     while read -r rd; do
       [ -n "$rd" ] || continue
+      seen=$((seen + 1))
       case "$rd" in
         '${'[1-9]*':-}') printf 'defaulted %s %s\n' "$var" "$rd" ;;
         '${'*':-'*)      printf 'invented %s %s\n' "$var" "$rd" ;;
@@ -1449,6 +1450,20 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a
       esac
     done < <(grep -oE '\$\{[1-9][^}]*\}|\$[1-9]' <<<"$val")
   done < <(grep -oE '([A-Za-z_][A-Za-z0-9_]*="[^"]*"|[A-Za-z_][A-Za-z0-9_]*=\$[^ ]*)' <<<"$body")
+  # ⛔ A POSITIONAL READ THE ASSIGNMENT SCAN CANNOT ATTRIBUTE IS A HARD FAIL, NOT A SILENCE
+  # (review P2). The assignment pattern cannot see through a nested quote: for
+  # `local n="$(printf %s "$1")"` the outer `="[^"]*"` stops at the inner quote, so the read was
+  # never graded — although it dies on an absent argument exactly like `local x="$1"`, and it IS
+  # inside this audit's declared scope ("every `local` binding of a positional"). The line's reads are
+  # therefore COUNTED and compared with the ones the parse produced; the difference is reported as
+  # `unparsed` (fail-closed) rather than dropped. Trailing ` # …` comments are stripped first so a
+  # comment that mentions `$1` cannot invent an unparsed read (`="#ff"` is unaffected: the strip
+  # needs WHITESPACE before the `#`).
+  alln="$(grep -oE '\$\{[1-9][^}]*\}|\$[1-9]' <<<"${body%%[[:space:]]#*}" | wc -l)"
+  while [ "$seen" -lt "$alln" ]; do
+    seen=$((seen + 1))
+    printf 'unparsed ? ?\n'
+  done
 }
 # The scanner's own contract on the shapes that matter, INCLUDING the ones earlier revisions missed.
 # ⛔ A BARE READ STAYS BARE THOUGH THE VALUE EMBEDS IT. `local d="$ROLES_DIR/.$1.lock"`,
@@ -1477,14 +1492,18 @@ bare|local dry="$1 "
 bare|local x="$1$2"
 bare|local d="$1" tmp="$1/.own.tmp.$$"
 EOF
+# …and the FAIL-CLOSED shape: a positional the assignment parse cannot attribute must be REPORTED,
+# not skipped. `local n="$(printf %s "$1")"` is the measured case.
+_unp="$(audit_line 'local n="$(printf %s "$1")"' | tr '\n' '|')"
+case "$_unp" in
+  *unparsed*) ok "audit[self-test]: a positional inside a nested substitution is reported UNPARSED (fail-closed), not silently skipped" ;;
+  *)          bad "audit[self-test]: a nested-substitution read produced '${_unp:-<nothing>}' — an unattributable read is being skipped, which is the silence this arm exists to prevent" ;;
+esac
 # …then the real file. The allowlist is (FUNCTION, NAME) pairs — see the P1 note above.
 REQUIRED_READS=" state_write:role state_write:rc state_write_rehearsal:role state_write_rehearsal:own \
  lock_claim:d lock_claim:tmp reclaim_lock:d role_lock:role role_unlock:d bounded:s run_bounded:s \
  pid_ident:pid human_above:pid attestation_clean:pr attestation_clean:head \
  controller_heartbeat_verdict:who role_row:role role_row:bound run_role_pass:role "
-# ⛔ EVERY ENTRY MUST NAME ITS FUNCTION. A bare `role`/`s`/`d` entry would restore the name-keyed
-# grandfathering this list was re-keyed to remove, and it would do it silently.
-BADENTRY=0
 # ⛔ EVERY ENTRY MUST NAME ITS FUNCTION. A bare `role`/`s`/`d` entry would restore the name-keyed
 # grandfathering this list was re-keyed to remove, and it would do it silently. The pattern is
 # `*:*` (HAS a colon) — the first version tested `*:*:*`, i.e. TWO colons, which no real entry has,
@@ -1500,7 +1519,15 @@ done
 # The enclosing function of a line, so a bare read is judged where it actually lives.
 func_for() { # <file> <line-number> -> the enclosing function's name (empty before the first one)
   local file="$1" want="$2" ln best=0
-  for ln in $(grep -nE '^[a-z_][a-z0-9_]*\(\) *\{' "$file" | cut -d: -f1); do
+  # ⛔ TWO ACCEPTED HEADER FORMS. Matching only `name() {` attributes a function whose brace sits on
+  # the NEXT line to the PRECEDING function — so its `local s="$1"` was graded against the
+  # predecessor's allowlist entry and passed with no decision (review P1, reproduced: `future_two()`,
+  # newline, `{`, `local s="$1"` → the suite stayed green). The header is the `name()` line; the
+  # brace may be on it or on the next one, and the name is read from the header either way.
+  # ⛔ NO `$` AFTER THE BRACE ARM: a trailing comment (`state_write_rehearsal() { # <role> …`) is
+  # normal in this file, and anchoring there silently dropped 22 of the 48 headers — which made a
+  # line resolve to the PRECEDING function, i.e. exactly the misattribution this fix removes.
+  for ln in $(grep -nE '^[a-z_][a-z0-9_]*\(\)([[:space:]]*\{|[[:space:]]*$)' "$file" | cut -d: -f1); do
     [ "$ln" -le "$want" ] || break
     best="$ln"
   done
@@ -1533,6 +1560,8 @@ audit_grade() { # <file> <emit 1|0>
                  [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) DEFAULTED to empty — absent means the caller's empty value" ;;
       invented)  bad_n=$((bad_n + 1))
                  [ "$emit" = 1 ] && bad "audit: $fn:$var (line $ln) defaults $rd to a NON-EMPTY value — absent must not invent a mode (a rehearsal would arm itself)" ;;
+      unparsed)  bad_n=$((bad_n + 1))
+                 [ "$emit" = 1 ] && bad "audit: $fn (line $ln) has a positional read the assignment scan CANNOT ATTRIBUTE — bind it on its own line so it can be judged; an unattributed read is ungraded" ;;
       derived)   AUDIT_DER=$((AUDIT_DER + 1))
                  [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) EMBEDS $rd in a larger value — a note; it is graded above, not excused" ;;
       *)         AUDIT_BARE=$((AUDIT_BARE + 1))
@@ -1559,10 +1588,9 @@ future_helper() {
   local s="$1" who="$2"
 }
 SH
-_emit_off() { :; }
 MT_BAD=0
-# `emit 0` is enough to keep the mutant's own failures out of the summary counters: every ok()/bad()
-# call site in audit_grade is guarded by `[ "$emit" = 1 ] &&`, so with emit=0 neither is ever invoked.
+# `emit 0` keeps the mutant's own failures out of the summary counters: every ok()/bad() call site in
+# audit_grade is guarded by `[ "$emit" = 1 ] &&`, so with emit=0 neither is ever invoked.
 audit_grade "$T/audit-mutant.sh" 0; MT_BAD=$?
 [ "$MT_BAD" -eq 2 ] && ok "audit[self-test]: a NEW helper reusing allowlisted NAMES is graded BAD twice (the key is function:name)" \
   || bad "audit[self-test]: the mutant graded $MT_BAD bad pair(s), want 2 — the allowlist is name-keyed again (or the walk lost the function)"
@@ -1580,6 +1608,11 @@ audit_grade "$DOCTOR" 1; BADSUM=$?
 [ "$((AUDIT_DEF + AUDIT_BARE + AUDIT_DER))" -ge 15 ] && [ "$AUDIT_DEF" -ge 4 ] \
   && ok "audit: classified $((AUDIT_DEF + AUDIT_BARE + AUDIT_DER)) positional reads ($AUDIT_DEF defaulted-to-empty, $AUDIT_REQ required, $AUDIT_DER embedding)" \
   || bad "audit: classified only $((AUDIT_DEF + AUDIT_BARE + AUDIT_DER)) reads ($AUDIT_DEF defaulted) — the scan is broken, so this arm proves nothing"
+# ⛔ EVERY LISTED PAIR MUST BE MATCHED. `AUDIT_REQ` was computed and only PRINTED, so a REQUIRED_READS
+# entry whose read later became `${1:-}` (or whose function was renamed) silently shrank coverage while
+# the suite stayed green — and a pair that never matches is a dead exemption (review P1).
+[ "$AUDIT_REQ" -eq "$_n" ] && ok "audit: all $_n REQUIRED_READS pairs are actually matched in the file (no stale or dead entry)" \
+  || bad "audit: AUDIT_REQ=$AUDIT_REQ but REQUIRED_READS lists $_n pair(s) — a listed read is no longer bare (coverage silently shrank) or is unreachable"
 # …and each dispatched role's mode read must BE the empty-defaulted one (the derived list again).
 while read -r _r _f; do
   [ -n "${_r:-}" ] || continue
@@ -1609,16 +1642,19 @@ killed lane-42 && ok "live: run_reap with NO argument REAPED the lane (empty mod
 
 # Arm E — the SAME rule the reap arm above proves, for the OTHER thing a live loop now really does:
 # a real-sized queue read must not GRIND. `run_merge` used to ask "is the answer empty?" with
-# `[ -z "${prs//[[:space:]]/}" ]`, which is SUPERLINEAR: measured on this cell's bash 5.2.21, this
-# repo's actual `pulls?state=open` payload (349 KB) spent 84s of PURE CPU inside that one builtin —
+# `[ -z "${prs//[[:space:]]/}" ]`, which is SUPERLINEAR: it is quadratic in the payload, so a real
+# queue answer already costs many seconds of PURE CPU inside that one builtin —
 # no syscalls, merge lock held, so MERGE_BUDGET_S could not bound it and the whole sequential loop
 # (doctor, reap, hygiene) stalled behind it on the first tick. cleanup-stale-branches.sh:694
 # documents the identical hole and its fix: a `case` glob, same set, O(n).
-# ⛔ TWO DIFFERENT NUMBERS, DELIBERATELY, AND THEY ARE NOT INTERCHANGEABLE (review P2): 349 KB / 84 s
-# is the measurement of the REAL queue answer; the fixture below is a SYNTHETIC 843 KiB (862,802
-# bytes, asserted below) and costs ~104 s in the same builtin. The fixture is deliberately larger
-# than the real payload so the pre-fix code cannot finish it inside the 30 s bound — the bound is
-# what DISCRIMINATES, so the fixture has to sit comfortably on the wrong side of it.
+# ⛔ TWO DIFFERENT NUMBERS, MEASURED SEPARATELY, AND NEITHER IS DERIVED FROM THE OTHER (review P2).
+# On this box, bash 5.2.21, the old empty-check inside one builtin: 322 KiB (330,246 B) → 14.5 s and
+# 843 KiB (the 862,802 B fixture below) → 99.8 s (2.6x bytes, 6.9x time — quadratic); the `case` glob
+# → 9 ms and 26 ms on the same two payloads. The fixture is deliberately larger than a real queue
+# answer so the PRE-FIX code cannot finish it inside the 30 s bound — the bound is what DISCRIMINATES,
+# so the fixture has to sit comfortably on the wrong side of it. (An earlier revision of this comment
+# quoted "349 KB → 84 s" as if it were this box's measurement; it is not reproducible here — 330 KB
+# costs 14.5 s — so it is gone rather than reconciled.)
 reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
 python3 - "$T/gh/prs.json" <<'PYJSON'
 import json, sys
