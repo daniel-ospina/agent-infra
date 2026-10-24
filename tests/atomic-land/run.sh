@@ -2746,13 +2746,20 @@ if true; then
   # first diagnostic in it — because "did not run to a verdict" with a section header as its only
   # evidence is the unattributable-failure class (#1185) that made this shard impossible to triage.
   mutation_verdict() { # <name> <rc>
-    local name="$1" rc="$2" verdict="$MUT/$1.verdict" waited=0 f c signame diag sig
-    while [ ! -f "$verdict" ] && [ "$waited" -lt "$MUTATION_VERDICT_WAIT" ] \
-          && [ "$MUTATION_VERDICT_BUDGET" -gt 0 ]; do
-      sleep 1; waited=$((waited + 1)); MUTATION_VERDICT_BUDGET=$((MUTATION_VERDICT_BUDGET - 1))
+    local name="$1" rc="$2" verdict="$MUT/$1.verdict" waited=0 f c signame diag sig present=0 cap
+    # `[ -s ]`, not `[ -f ]`: the writer OPENS the artifact a few syscalls before the write lands, and
+    # a child killed in that window leaves a ZERO-BYTE file — "exists" is not "has a verdict".
+    # ⛔ THE BUDGET IS A CAP ON THE WAIT, AND IT IS CHARGED ONLY WHEN NOTHING ARRIVES (below).
+    # Charging it for benign lateness — the measured ~3 s tail, and anything slower on a loaded
+    # runner — would let ordinary slowness exhaust it, and an exhausted budget turns every REMAINING
+    # child into an abort WITHOUT A SINGLE POLL: exactly the false red this function removes
+    # (measured: 8 s of benign lateness per batch → 5 phoney aborts at the tail of the drain).
+    while [ ! -s "$verdict" ] && [ "$waited" -lt "$MUTATION_VERDICT_WAIT" ] \
+          && [ "$waited" -lt "$MUTATION_VERDICT_BUDGET" ]; do
+      sleep 1; waited=$((waited + 1))
     done
     f=""; c=""
-    [ -f "$verdict" ] && read -r f c <"$verdict"
+    if [ -s "$verdict" ]; then present=1; read -r f c <"$verdict"; fi
     # An artifact that does not parse is not a verdict: treat it as absent (fail-closed).
     case "$f" in ''|*[!0-9]*) f=""; c="" ;; esac
     if [ -n "$f" ] && [ "$f" -gt 0 ]; then
@@ -2763,6 +2770,12 @@ if true; then
       fail "mutation $name did NOT redden the suite (class NOT covered) — its verdict artifact reports 0 of ${c:-?} test(s) failed"
       return 0
     fi
+    # ⚠️ Reaching here means NO USABLE ARTIFACT — the only path that spends the budget.
+    cap=""
+    if [ "$waited" -lt "$MUTATION_VERDICT_WAIT" ]; then
+      cap=" of a ${MUTATION_VERDICT_WAIT}s slot; the ${MUTATION_VERDICT_BUDGET}s drain budget is spent, so later children are not polled"
+    fi
+    MUTATION_VERDICT_BUDGET=$((MUTATION_VERDICT_BUDGET - waited))
     sig=""
     if [ "$rc" -gt 128 ]; then
       signame=""
@@ -2773,7 +2786,11 @@ if true; then
     # bash prints `Killed` for it, so "the first diagnostic in the log" would point at a fixture doing
     # its job. awk keeps the LAST match and needs no pipe (a `grep | tail -1` would SIGPIPE).
     diag="$(awk '/syntax error|unbound variable|command not found|Terminated|Killed/{d=$0} END{if (d != "") print d}' "$MUT/$name.log" 2>/dev/null)"
-    fail "mutation $name produced NO verdict artifact in ${waited}s (rc=$rc$sig) — its generated run never reached a verdict, so it covers nothing (log: $MUT/$name.log)${diag:+; last diagnostic: $diag}"
+    if [ "$present" = 1 ]; then
+      fail "mutation $name produced an UNREADABLE verdict artifact (<failures> <checks> expected), rc=$rc$sig — its generated run did not report a verdict, so it covers nothing (log: $MUT/$name.log)${diag:+; last diagnostic: $diag}"
+    else
+      fail "mutation $name produced NO verdict artifact in ${waited}s$cap (rc=$rc$sig) — its generated run never reached a verdict, so it covers nothing (log: $MUT/$name.log)${diag:+; last diagnostic: $diag}"
+    fi
     return 0
   }
   # ⛔ THE DECISION ITSELF, PINNED WITHOUT RUNNING 65 CHILDREN (#2622). `mutation_verdict` is the ONE
@@ -2820,6 +2837,28 @@ if true; then
     case "$_o" in
       *"class covered"*"4 of 290"*) pass "verdict arm: an artifact that lands AFTER the reaping wait is still read as coverage (the #2622 race)" ;;
       *) fail "verdict arm: the late-artifact race was read as an abort (got: $_o)" ;;
+    esac
+    # ⛔ A WAIT THAT SUCCEEDS MUST CHARGE NOTHING. (Review finding 1 on #2623: charging every waited
+    # second let ordinary slowness exhaust the budget, after which every remaining child was aborted
+    # unpolled — the same false red, reintroduced by the fix for it.) Called DIRECTLY, not through
+    # `$( )`: the budget lives in this shell, and a subshell would make the assertion vacuous.
+    ( sleep 2; printf '5 290\n' >"$_sv/late2.verdict" ) &
+    _vpid=$!
+    _b0="$MUTATION_VERDICT_BUDGET"
+    MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict late2 1 >/dev/null 2>&1
+    wait "$_vpid" 2>/dev/null
+    [ "$MUTATION_VERDICT_BUDGET" -eq "$_b0" ] \
+      && pass "verdict arm: a wait that SUCCEEDS charges nothing to the drain budget (benign lateness cannot starve later children)" \
+      || fail "verdict arm: a successful wait spent the drain budget ($_b0 -> $MUTATION_VERDICT_BUDGET) — enough benign lateness would false-abort every later child"
+    # ⛔ AND AN EXHAUSTED BUDGET MUST SAY SO, not report "in 0s … never reached a verdict" as if the
+    # child were at fault. Forced here by charging the budget down first.
+    _b1="$MUTATION_VERDICT_BUDGET"
+    MUTATION_VERDICT_BUDGET=0
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=20 mutation_verdict starved 1 2>&1)"
+    MUTATION_VERDICT_BUDGET="$_b1"
+    case "$_o" in
+      *"drain budget is spent"*) pass "verdict arm: an exhausted drain budget is NAMED in the abort (it does not read as the child's fault)" ;;
+      *) fail "verdict arm: an exhausted budget was not named (got: $_o)" ;;
     esac
   fi
   # Two perl traps have cost this harness real coverage (all four instances fixed
