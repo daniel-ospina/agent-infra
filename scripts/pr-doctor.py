@@ -179,10 +179,12 @@ OWNERSHIP_NOTE = ""
 #
 # So the same seam `objective.py` already grew for the SLUG (`OBJECTIVE_REPO`) is grown here for
 # both facts, and a caller that sets neither gets the previous behaviour byte for byte (the
-# property `test_pr_doctor.py`'s seam block pins). ⛔ `OBJECTIVE_REPO` IS NOT READ HERE: the
-# classifier reads it, and a caller that wants one repo for both must set both -- which is why
-# `pr-repair-loop.sh` exports the pair together rather than deriving one from the other. Deriving
-# would make a box's dispatch and its classification silently disagreeable again (#1872).
+# property `scripts/pr-repair-loop.test.sh`'s "pr-doctor's repo seams" block pins — NOT
+# `test_pr_doctor.py`, which only monkeypatches the attributes and never asserts these literals).
+# ⛔ `OBJECTIVE_REPO` IS NOT READ HERE: the classifier reads it, and a caller that wants one repo for
+# both must set both -- which is why `pr-repair-loop.sh` exports the pair together rather than
+# deriving one from the other. Deriving would make a box's dispatch and its classification silently
+# disagreeable again (#1872).
 REPO = os.environ.get("PR_DOCTOR_REPO") or "daniel-ospina/tortoise"
 REPO_DIR = (os.environ.get("PR_DOCTOR_REPO_DIR")
             or os.path.join(HOME, "Documents", "GitHub", "tortoise"))
