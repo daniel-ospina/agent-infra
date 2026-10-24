@@ -637,14 +637,20 @@ spawns passed `DISK_MIN_FREE_MB=500`, because a floor answers "is the filesystem
 is 4.5x that floor. `spawn-gate.sh`'s `run_agent` now also applies a **headroom** gate:
 
 ```
-ADMIT  iff  free_mb >= tree_mb + reserve_mb      (fresh `df` reading, at every spawn)
+ADMIT  iff  free_mb >= max(tree_mb, self_mb) + reserve_mb      (fresh `df` reading, at every spawn)
 REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM — …`  (AGENT_DISK_REFUSED, 77)
 ```
 
-`tree` is what ONE more lane costs. `reserve` is the headroom a spawn must leave behind. Both are
-**measured per target**, never one global constant: #1852 recorded that a single constant cannot serve
-an agent-infra lane (48 MB, no install) and a tortoise lane (5.7 GB of python), and a tortoise-sized
-floor would refuse every harness spawn on every cell — a false *block*, which is its own defect.
+`tree` is what ONE more lane costs *while the shared uv cache holds*; `self` is what the same lane
+costs when it does not (a pruned cache, `--link-mode=copy`, a cache on another mount); `reserve` is the
+headroom that must still be free **after** that worst case. `max(tree, self)` is not a redundancy: a
+gate that admitted on `tree + reserve` lets one lane eat the whole reserve and leaves the cell at
+~700 MB, which is below the 2,286 MB cell-4 wedged at. The three numbers are **measured per target**,
+never one global constant: #1852 recorded that a single constant cannot serve an agent-infra lane
+(48 MB, no install) and a tortoise lane (5.7 GB of python), and a tortoise-sized floor would refuse
+every harness spawn on every cell — a false *block*, which is its own defect. `reserve` defaults to the
+cell's own warning band (`DISK_WARN_FREE_MB` = 4x `DISK_MIN_FREE_MB`), so an admitted spawn can never
+be the one that drops the cell into the band its supervisor calls "filling".
 
 ### Measured (2026-10-24, 8-vCPU cell, `/dev/root` 128,828 MB, `uv` 0.12.5, warm uv cache)
 
@@ -661,17 +667,30 @@ cache** (`nlink=3` measured on every `site-packages/*.so`): those blocks belong 
 *cache state*, not of the lane — `pi-cache-reap.sh` prunes the cache under pressure, `--link-mode=copy`
 and a cache on another mount never share at all — so the gate ships both numbers:
 
-| target | `DISK_LANE_TREE_MB` (default) | `DISK_LANE_RESERVE_MB` (default) |
-|---|---|---|
-| `uv.lock` present (python lane) | **350** | **6144** (6 GiB = the 5,772 MB self-contained tree, rounded up) |
-| no install step (harness lane) | **64** | **1024** |
+| target | `DISK_LANE_TREE_MB` | `DISK_LANE_SELF_MB` | `DISK_LANE_RESERVE_MB` |
+|---|---|---|---|
+| python project (any package-manager marker, `uv.lock`/`pyproject.toml`/`requirements.txt`/`poetry.lock`/… here or one level down) | **350** | **6144** (6 GiB = the 5,772 MB self-contained tree, rounded up) | **2000** (the supervisor's warning band; admit iff free >= 8144) |
+| no install step (harness lane) | **64** | **64** | **2000** (admit iff free >= 2064) |
+
+`uv.lock` alone was the first discriminator and it was a **false pass**: a pip/poetry/pdm service, or a
+monorepo whose lock sits in `backend/`, installs the same ~5.7 GB venv and would have been admitted on
+the 64 MB harness pair. The detection fails toward the *expensive* pair on purpose — over-estimating a
+harness lane withholds a few spawns on an almost-full cell; under-estimating a python lane fills it.
+
+⚠️ **What the reserve does not buy.** The admission rule guarantees that the lane admitted *now* cannot
+consume the reserve even in its worst case. It does not guarantee `free >= reserve` for ever: a cell
+can lose the sharing regime wholesale (a `pi-cache-reap.sh --caches` sweep frees the cache but the NEXT
+sync re-materialises every venv it prunes), and the gate then refuses one lane at a time as the free
+space falls. That is the correct behaviour — the refusal is the signal — but it means the budget below
+is a *budget*, not a hard floor enforced by construction.
 
 ### The number the fleet must budget **per lane**
 
 * **316 MB/lane** on a cell whose shared uv cache is populated (measured above) — plus **~5.7 GB once**
   per cell for the cache itself.
-* **5,772 MB/lane** the moment the sharing is lost, which is why the reserve is 6 GiB and not 316 MB:
-  a budget built only on the marginal figure admits exactly the spawns that filled cell-4.
+* **5,772 MB/lane** the moment the sharing is lost, which is why admission is bounded by
+  `max(tree, self) + reserve` and not by the marginal figure: a budget built only on 316 MB admits
+  exactly the spawns that filled cell-4.
 * Consequence for the concurrency target (`MAX_LANES = vCPU * 5/2` = **20** on 8 vCPU): with sharing,
   20 lanes ≈ 6.3 GB + 5.7 GB cache + 6 GB reserve ≈ **18 GB**, which fits a 128 GB cell with room for
   the CI runners. **Without sharing, 20 lanes need 115 GB + the base image — it does not fit**, and the
@@ -689,8 +708,10 @@ df -Pm / | awk 'NR==2{print $3}'   # after the install   -> the marginal venv co
 du -sm .venv                       # the APPARENT figure (upper bound, never the budget)
 ```
 
-then set `DISK_LANE_TREE_MB` / `DISK_LANE_RESERVE_MB` for that cell, and say so where an operator
-will read it. `scripts/worktree-disk-probe.sh` classifies which byte regime the machine is in.
+then set `DISK_LANE_TREE_MB` / `DISK_LANE_SELF_MB` / `DISK_LANE_RESERVE_MB` for that cell, and say so
+where an operator will read it. `scripts/worktree-disk-probe.sh` classifies which byte regime the
+machine is in. The gate's own ledger (`$O/state/disk.tsv`) records all three per spawn, so a series
+always separates *what a lane cost* (field 6) from *what it would have cost with sharing lost* (field 7).
 
 ### The KEEP rule: a shell at a prompt is not a live lane
 
@@ -710,6 +731,13 @@ re-created env or checkout — never uncommitted or unpushed work. Every unprova
 demotion is named in the pass log (`stale-shell:` / `STALE-SHELL`) and in the row
 (`unref=stale-shell:<pids>`). `REAP_VENV_IDLE_SHELL=0` / `REAP_WT_IDLE_SHELL=0` restore the strict
 reading without editing a shipped script.
+
+The scan that applies the rule examines **every** holder (an idle shell and a working lane routinely
+share a checkout) and carries a per-record exclude list instead of mutating the probe output, so one
+verdict cannot consume the evidence the next one needs and a probe that keeps returning the same pid
+terminates instead of spinning. `pi-reap-worktrees.sh` also asks the rule again **at removal time**,
+re-reading the process and cwd tables first: a shell demoted as idle can pick up a child — i.e. start
+working again — while the pass is still running, and that is exactly when the delete must stop.
 
 ⛔ **A shared *environment* is not the fix, and was not adopted.** The recorded decision in
 `docs/ops/lane-venv-reaper-policy.md` rejects a machine-wide venv because `uv` installs the project in

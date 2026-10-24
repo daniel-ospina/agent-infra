@@ -261,14 +261,20 @@ disk_low() { # disk_low <free-mb>
 # So ONE python lane's MARGINAL cost, on a cell whose shared uv cache is populated, is ~316 MB. Its
 # venv's `du` is ~18x that because 28,730 of its files are HARDLINKED into that cache (`nlink>1`):
 # those blocks are charged to the cache, not to the lane, and deleting the venv releases ~124 MB.
-# The gate therefore needs TWO facts, and shipping only the first is the false PASS in the state
+# The gate therefore needs THREE facts, and shipping only the first is the false PASS in the state
 # that fills a cell:
-#   * TREE (350 MB)     — the marginal cost of ONE more python lane while the shared store holds.
-#   * RESERVE (6144 MB) — the headroom a spawn must LEAVE FREE, because the sharing is not
-#     guaranteed: `pi-cache-reap.sh` prunes that cache under pressure, and `uv --link-mode=copy` or a
-#     cache on another mount both materialise the venv for real. Then one lane is `du` 5,625 MB of
-#     venv + 147 MB of checkout = 5,772 MB, rounded to 6 GiB — and a budget built on the 316 MB
-#     figure alone would admit exactly the spawns that filled cell-4.
+#   * TREE (350 MB) — the MARGINAL cost of ONE more python lane while the shared uv cache holds.
+#     This is what a lane costs, and it is what the ledger records; it is NOT what admission is
+#     bounded by (see SELF).
+#   * SELF (6144 MB) — the WORST CASE for the same lane, when the sharing is not guaranteed:
+#     `pi-cache-reap.sh` prunes that cache under pressure, and `uv --link-mode=copy` or a cache on
+#     another mount both materialise the venv for real. Then one lane is `du` 5,625 MB of venv +
+#     147 MB of checkout = 5,772 MB, rounded to 6 GiB. Admission is bounded by THIS, because the
+#     lane admitted on the strength of the reserve is exactly the lane that eats it.
+#   * RESERVE (2000 MB default) — the headroom that must still be free AFTER that worst case, and it
+#     is the cell's own warning band (`DISK_WARN_FREE_MB` = 4x `MIN_FREE_MB`, the band
+#     `cloud-cell-supervisor.sh check` warns about), reused rather than invented: an admitted spawn
+#     must not be able to drop the cell into the band its own supervisor calls "filling".
 # ⛔ NOT ONE GLOBAL CONSTANT (#1852's recorded finding, reused): an agent-infra lane materialises
 # 48 MB and installs nothing, so a tortoise-sized floor would refuse every harness spawn on every
 # cell — a false BLOCK, which is its own defect class. The pair is derived from the TARGET: a
@@ -277,14 +283,21 @@ disk_low() { # disk_low <free-mb>
 # `df` used-delta (the recipe is in `docs/ops/disk-reaper.md`), never a guess: a guessed constant is
 # how this number was 7x wrong in the first place.
 #
-# THE ADMISSION RULE:  free_mb >= tree_mb + reserve_mb, read FRESH at every spawn. Because each
-# admitted spawn must leave the reserve untouched, N lanes can never eat the reserve one lane at a
-# time: the invariant is the one #2721 asks for (`lanes x tree < free - reserve`) without a lane
-# counter to drift out of step with reality — the free space already contains what the live lanes
-# spent. Evaluated per spawn, so a cell that drains frees slots by itself.
+# THE ADMISSION RULE:  free_mb >= max(tree_mb, self_mb) + reserve_mb, read FRESH at every spawn.
+# ⛔ `max(tree, self)` IS NOT A TYPO FOR `tree` (review round 1, P2 — the first version admitted on
+# `tree + reserve` and then said, in this same header, that a lane's worst case is 5,772 MB: the lane
+# admitted on the strength of a 6,144 MB reserve could consume 5,772 MB of it and leave ~700 MB, i.e.
+# BELOW the 2.2 GB cell-4 wedged at, while the comment claimed the reserve was untouched). With the
+# worst case in the predicate, an admitted lane can never do that, and because the reading is fresh at
+# EVERY spawn, N lanes still cannot eat the reserve one lane at a time: the invariant #2721 asks for
+# (`lanes x tree < free - reserve`) is enforced without a lane counter that can drift out of step
+# with reality — the free space already contains what the live lanes spent. Evaluated per spawn, so a
+# cell that drains frees slots by itself. On a healthy cell this admits one lane at a time until free
+# reaches `self + reserve`, which is the point: the LAST lane is the one that must still fit.
 # ⛔ THE UNREADABLE CASE FAILS OPEN, exactly as the floor's does and for the same reason: this runs in
 # a LIVE dispatch path, so a `df` that cannot answer must not stop every lane on the box for ever.
-# A READABLE reading below `tree + reserve` fails CLOSED, and the refusal is NAMED (`DISK-NOHEADROOM`)
+# A READABLE reading below `max(tree, self) + reserve` fails CLOSED, and the refusal is NAMED
+# (`DISK-NOHEADROOM`)
 # so an operator is never sent to a load remedy for a disk condition.
 #
 # ⛔ NO EXEMPTION BY `KIND`, DELIBERATELY — unlike the creation gate below. A `fixer`/`reviewer` there
@@ -292,27 +305,62 @@ disk_low() { # disk_low <free-mb>
 # a FRESH worktree for the PR it repairs, so a repair lane pays the same tree cost as a creation lane.
 # Exempting it would restore the hole this gate closes, and the exemption would be invisible.
 DISK_LANE_TREE_MB="${DISK_LANE_TREE_MB:-}"
+DISK_LANE_SELF_MB="${DISK_LANE_SELF_MB:-}"
 DISK_LANE_RESERVE_MB="${DISK_LANE_RESERVE_MB:-}"
 
-# disk_lane_costs <path> -> "<tree_mb> <reserve_mb>", MEASURED defaults derived from the target.
-# An EMPTY or non-numeric override is not an override: it derives, so a typo'd env cannot silently
-# turn the gate into "tree 0 + reserve 0" (admit always) — the inert-gate class the floor guards at
-# source time. An explicit `0` IS honoured: the test seam has to neutralise both halves in one place,
-# and an operator zeroing the reserve is making a stated choice.
-disk_lane_costs() { # disk_lane_costs <path>
-  local p="${1:-.}" tree reserve uv=0
-  [ -f "$p/uv.lock" ] && uv=1
-  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; elif [ "$uv" = 1 ]; then tree=350; else tree=64; fi
-  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; elif [ "$uv" = 1 ]; then reserve=6144; else reserve=1024; fi
-  printf '%s %s\n' "$tree" "$reserve"
+# python_target <path> — 0 when this path looks like a python project that will materialise a venv.
+# ⛔ `uv.lock` ALONE IS A FALSE PASS (review round 1, P2): `uv.lock` at the TOP LEVEL is only the
+# shape THIS repo's python lanes have. A pip/poetry/pdm project, a `requirements.txt` service, or a
+# monorepo whose lock sits in `backend/` all install ~5.7 GB of venv and would have derived the
+# 64MB harness pair, i.e. been admitted with 1.1 GB of headroom — exactly the class this gate
+# exists to close. The test is therefore "any package manager's marker, here or ONE level down",
+# and it fails toward the EXPENSIVE pair: over-estimating a harness lane's cost withholds a few
+# spawns on an almost-full cell, under-estimating a python lane's cost fills the cell.
+python_target() { # python_target <path>
+  local p="${1:-.}" f
+  for f in uv.lock poetry.lock pdm.lock Pipfile Pipfile.lock pyproject.toml setup.py setup.cfg requirements.txt; do
+    [ -e "$p/$f" ] && return 0
+  done
+  # One level down (a monorepo whose installable project is a subdirectory) — BOUNDED, and globs
+  # only: this runs in the dispatch path, so it must never walk a tree.
+  for f in "$p"/*/uv.lock "$p"/*/pyproject.toml "$p"/*/requirements.txt; do
+    [ -e "$f" ] && return 0
+  done
+  return 1
 }
 
-# disk_headroom_ok <free-mb> <tree-mb> <reserve-mb> — the ONE headroom predicate.
+# disk_lane_costs <path> -> "<tree_mb> <self_mb> <reserve_mb>", MEASURED defaults derived from the
+# target. An EMPTY or non-numeric override is not an override: it derives, so a typo'd env cannot
+# silently turn the gate into "0 + 0 + 0" (admit always) — the inert-gate class the floor guards at
+# source time. An explicit `0` IS honoured: the test seam neutralises all three in one place, and an
+# operator zeroing the reserve is making a stated choice.
+disk_lane_costs() { # disk_lane_costs <path>
+  local p="${1:-.}" tree self reserve py=0
+  python_target "$p" && py=1
+  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; elif [ "$py" = 1 ]; then tree=350; else tree=64; fi
+  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; elif [ "$py" = 1 ]; then self=6144; else self=64; fi
+  # The reserve DEFAULTS to this cell's own warning band, so it tracks `DISK_MIN_FREE_MB` instead of
+  # being one more number to keep in sync with it.
+  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve="$DISK_WARN_FREE_MB"; fi
+  printf '%s %s %s\n' "$tree" "$self" "$reserve"
+}
+
+# disk_lane_need <tree-mb> <self-mb> <reserve-mb> -> the MB a spawn must find free.
+# `max(tree, self)`: a lane costs `tree` when the shared store holds and `self` when it does not, and
+# admission must survive the second. Integer-only, and total for any input (`disk_lane_costs` always
+# prints three integers), so the predicate cannot fail into a "not a number" comparison.
+disk_lane_need() { # disk_lane_need <tree-mb> <self-mb> <reserve-mb>
+  local tree="${1:-0}" self="${2:-0}" reserve="${3:-0}" worst
+  if [ "$tree" -gt "$self" ]; then worst="$tree"; else worst="$self"; fi
+  printf '%s\n' "$(( worst + reserve ))"
+}
+
+# disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-mb> — the ONE headroom predicate.
 # Same unreadable polarity as disk_ok/disk_low: a reading we cannot take is not evidence of pressure.
-disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <reserve-mb>
-  local mb="${1:-}" tree="${2:-0}" reserve="${3:-0}"
+disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-mb>
+  local mb="${1:-}"
   disk_readable "$mb" || return 0
-  [ "$mb" -ge "$(( tree + reserve ))" ]
+  [ "$mb" -ge "$(disk_lane_need "${2:-0}" "${3:-0}" "${4:-0}")" ]
 }
 
 # 1-min load average, integer. Empty when the probe fails (see can_spawn).
@@ -1200,19 +1248,23 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # the refusal and the warning below all quote the SAME numbers — a gate that measures twice is a
   # gate whose report can disagree with its verdict.
   _lane_costs="$(disk_lane_costs "$dpath")"
-  _lane_tree="${_lane_costs%% *}"
-  _lane_reserve="${_lane_costs##* }"
-  _lane_need=$(( _lane_tree + _lane_reserve ))
+  _lane_tree="$(printf '%s' "$_lane_costs" | awk '{print $1}')"
+  _lane_self="$(printf '%s' "$_lane_costs" | awk '{print $2}')"
+  _lane_reserve="$(printf '%s' "$_lane_costs" | awk '{print $3}')"
+  _lane_need="$(disk_lane_need "${_lane_tree:-0}" "${_lane_self:-0}" "${_lane_reserve:-0}")"
   # DURABLE, and written for ALLOWED runs too — a series that only records refusals cannot answer
   # "how close did we get", which is the question that would have caught either incident early.
   # Same append-only shape as walltime.tsv; a refusal writes a row here (unlike walltime, where a
   # refusal would fabricate a zero-duration sample) because "the disk was below the floor" IS the
   # measurement. tab-separated: epoch, kind, tag, free MB, path, then (agent-infra#2721) the lane's
-  # tree cost and the reserve it is measured against. Fields 6-7 are APPENDED so every existing
-  # reader (`cut -f5`, `awk $4`) is unaffected.
+  # marginal tree cost, its worst case, and the reserve. Fields 6-8 are APPENDED so every existing
+  # reader (`cut -f5`, `awk $4`) is unaffected. BOTH costs are recorded because they answer different
+  # questions: 6 is "what did this lane actually cost", 7 is "what would it cost if the cache were
+  # pruned" — and a series holding only the first cannot tell a sharing failure from a lane that was
+  # never admitted.
   if [ -n "${O:-}" ]; then
     mkdir -p "$O/state" 2>/dev/null || true
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "${dfree:-?}" "$dpath" "$_lane_tree" "$_lane_reserve" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "${dfree:-?}" "$dpath" "$_lane_tree" "$_lane_self" "$_lane_reserve" \
       >> "$O/state/disk.tsv" 2>/dev/null || true
   fi
   # ⛔ AN UNREADABLE PROBE IS ANNOUNCED (review round 1, P2). The fail-open above is deliberate, but
@@ -1227,7 +1279,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # predicates accept it, so the same reading was "unreadable" here and "100MB" to the verdict being
   # announced. Both now call `disk_readable`, so agreement is structural rather than maintained.
   if ! disk_readable "$dfree"; then
-    echo "[disk-gate] WARN $label: could not read free space on $dpath — the disk floor CANNOT be enforced for this spawn. Check DISK_GATE_PATH, PATH and that 'df' works. Failing OPEN by design." >> "$log"
+    echo "[disk-gate] WARN $label: could not read free space on $dpath — the disk floor AND the lane headroom CANNOT be enforced for this spawn. Check DISK_GATE_PATH, PATH and that 'df' works. Failing OPEN by design." >> "$log"
   elif ! disk_ok "$dfree"; then
     echo "[disk-gate] REFUSED $label: only ${dfree}MB free on $dpath < disk_min_free_mb=$DISK_MIN_FREE_MB — no agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) and the controller re-dispatches" >> "$log"
     return "$AGENT_DISK_REFUSED"
@@ -1236,11 +1288,20 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # the disk; the number they were missing is THIS lane's own cost. The verdict is NAMED
   # (`DISK-NOHEADROOM`) and carries both terms, so the operator can tell "the box is out of room for
   # one more lane" from "the disk is full" and from "the box is busy" without reading this file.
-  elif ! disk_headroom_ok "$dfree" "$_lane_tree" "$_lane_reserve"; then
-    echo "[disk-gate] REFUSED $label: DISK-NOHEADROOM — one lane's tree needs ${_lane_tree}MB and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it" >> "$log"
+  elif ! disk_headroom_ok "$dfree" "$_lane_tree" "$_lane_self" "$_lane_reserve"; then
+    echo "[disk-gate] REFUSED $label: DISK-NOHEADROOM — this lane's tree costs up to ${_lane_self}MB (${_lane_tree}MB while the shared uv cache holds) and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it" >> "$log"
     return "$AGENT_DISK_REFUSED"
   elif disk_low "$dfree"; then
-    echo "[disk-gate] WARN $label: only ${dfree}MB free on $dpath (floor ${DISK_MIN_FREE_MB}MB, warn band ${DISK_WARN_FREE_MB}MB, one more lane needs ${_lane_need}MB = tree ${_lane_tree}MB + reserve ${_lane_reserve}MB) — a full disk is what breaks a cell first; reclaim with 'cloud-cell-supervisor.sh prune' before it fills" >> "$log"
+    echo "[disk-gate] WARN $label: only ${dfree}MB free on $dpath (floor ${DISK_MIN_FREE_MB}MB, warn band ${DISK_WARN_FREE_MB}MB, one more lane needs ${_lane_need}MB = worst case ${_lane_self}MB/marginal ${_lane_tree}MB + reserve ${_lane_reserve}MB) — a full disk is what breaks a cell first; reclaim with 'cloud-cell-supervisor.sh prune' before it fills" >> "$log"
+  elif [ "$dfree" -lt "$(( _lane_need + _lane_tree ))" ]; then
+    # ── THE ADVANCE WARNING CANNOT BE THE BAND (review round 1, P2) ────────────────────────────
+    # On a python target the band (floor 500 -> 2000) sits ENTIRELY below the admission bound
+    # (~8100), so any readable value inside it is refused above and `disk_low` is unreachable — the
+    # "a device that fills SILENTLY is the defect" instrument was inert on exactly the cell class
+    # this gate targets, and the first signal an operator got was the refusal. This arm is the
+    # warning that CAN fire: within one marginal lane tree of the bound, i.e. the next spawn after
+    # this one is the one that gets refused.
+    echo "[disk-gate] WARN $label: ${dfree}MB free on $dpath is within one lane of the headroom bound (an admitted spawn needs ${_lane_need}MB = worst case ${_lane_self}MB/marginal ${_lane_tree}MB + reserve ${_lane_reserve}MB) — the NEXT lane will be refused DISK-NOHEADROOM. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) while there is still room to do it" >> "$log"
   fi
   l="$(load1)"
   if ! can_spawn "$l"; then
