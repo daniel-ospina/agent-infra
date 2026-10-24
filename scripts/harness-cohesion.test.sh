@@ -92,6 +92,17 @@ cp "$REPO_FIX/scripts/orchestrator-harness"/*.sh "$TMP/home/orchestrator/"
 # `FLEET_PS`); the default stub prints NOTHING, and the running-controller case supplies a table.
 printf '#!/bin/sh\ncat "$PS_TABLE" 2>/dev/null\nexit 0\n' > "$TMP/ps-stub"; chmod +x "$TMP/ps-stub"
 : > "$TMP/ps-empty"
+# ⛔ THE CAPACITY DIMENSION IS A REQUIRED INPUT OF `up`, SO THE FIXTURES MUST SUPPLY IT (2026-10-24).
+# `up` now measures FORK HEADROOM before load and disk (#2293) and REFUSES (rc=3) when it cannot: "a
+# box that cannot prove it can fork must not be given lanes". These arms stub `HU_PS` for the process
+# CENSUS and give it an empty table, so the fork probe had nothing to count and the walk stopped at
+# capacity — before the self-test gate and the platform authority every one of them is about. Four
+# assertions went red for that reason alone (`self-test gate: the FAILING TEST IS NAMED`, and the
+# three DRIFT-reported-not-refused arms), which reads as a self-test regression and is not one.
+# The fork reading is supplied through the seam the launcher documents (`HU_FORK_LIMITS_FILE`), the
+# same way `PS_TABLE` supplies the census: generous limits, so fork never binds and the arms keep
+# testing what they name.
+printf 'cgroup-pids 100000 1000\nrlimit-nproc 100000 1000\nthreads-max 100000 1000\n' > "$TMP/fork-generous"
 
 run_drift() { # <args…> — PATH/HOME isolated so the box's real dirs cannot leak in
   OUT="$( cd "$TMP" && HOME="$TMP/home" CELL_HOME="$TMP/cell" HARNESS_PIN_DIR="$TMP/cell/harness" \
@@ -474,7 +485,7 @@ run_up() { # <fixture> <args…>
   local r="$1"; shift
   OUT="$( cd "$TMP" && FIX_LOG="$r/fix.log" HOME="$TMP/home" CELL_HOME="$TMP/cell" \
           DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
-          HU_PS="$TMP/ps-stub" \
+          HU_PS="$TMP/ps-stub" HU_FORK_LIMITS_FILE="$TMP/fork-generous" \
           bash "$r/scripts/harness-up" up --repo "$REPO_FIX" --harness "$r/scripts/orchestrator-harness" \
           "$@" 2>&1 )"
   RC=$?
@@ -600,6 +611,7 @@ printf '#!/usr/bin/env bash\necho "DRIFT: something differs"\nexit 1\n' > "$F6/s
 chmod +x "$F6/scripts/orchestrator-harness/check-deployed-drift.sh"
 OUT="$( cd "$TMP" && FIX_LOG="$F6/fix.log" HOME="$TMP/home" CELL_HOME="$CELL6" \
         DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HU_PS="$TMP/ps-stub" \
+        HU_FORK_LIMITS_FILE="$TMP/fork-generous" \
         bash "$F6/scripts/harness-up" up --repo "$REPO_FIX" --harness "$F6/scripts/orchestrator-harness" 2>&1 )"; RC=$?
 case "$OUT" in *"reports DRIFT"*) ck "a DRIFT self-test is REPORTED, not swallowed" 0 ;; *) ck "a DRIFT self-test is REPORTED, not swallowed [$(printf '%s' "$OUT" | tr '\n' ' ' | cut -c1-200)]" 1 ;; esac
 ck "a DRIFT self-test does not refuse the start (rc=$RC, not 3)" "$([ "$RC" -ne 3 ] && echo 0 || echo 1)"
