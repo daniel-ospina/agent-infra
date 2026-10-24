@@ -1991,6 +1991,11 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # The refusal now names the fact that could not be read.
   case "${ck_ref:-}" in
     ''|none) : ;;
+    # ⛔ A RELEASE MADE WITHOUT THE CLAIM READ IS A CAVEAT, NOT A REFUSAL (review). The fallback slug
+    # means the classification RAN and entries WERE released — on local facts only, because
+    # `$O/claims.sh` is not installed. Rendering it with the refusal sentence below would tell the
+    # operator "nothing could be released" about the one pass that released without the cross-box check.
+    claim-registry-absent) tail="$tail — checked release ran WITHOUT the claim registry (not installed on this box): released on LOCAL facts only, so a peer's cross-box claim would not have been seen" ;;
     *) tail="$tail — checked classification REFUSED this pass ($ck_ref): nothing could be released" ;;
   esac
   # ⛔ AND A RELEASE THAT COULD NOT RUN IS NOT A CAP THAT BOUND (review E-P2, cycle 3): a failed

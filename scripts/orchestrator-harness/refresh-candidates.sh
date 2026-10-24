@@ -1871,11 +1871,27 @@ def read_soft(name):
     except (OSError, UnicodeDecodeError):
         return None
 def publish(name, text):
-    """Write one state record atomically (write + rename), so a reader never sees a torn file."""
+    """Write one state record atomically (write + rename), so a reader never sees a torn file.
+    ⛔ CHECKED, like every sibling write in this block (review). `open()`/`os.replace()` were unguarded,
+    so ENOSPC mid-pass, EACCES, or a DIRECTORY where `state/checked-kept` /
+    `state/checked-release-candidates` should be raised out of this heredoc: `reap_rc` non-zero aborts the
+    pass with EXIT_TRANSIENT, on EVERY subsequent pass — the permanent no-dispatch loop that presents as
+    RUNNING, which is the exact class this change removes for `candidates.txt`/`checked.txt`. A publish
+    that cannot land now prints the NAMED refusal and takes the SAME rc it took before (a traceback became
+    an abort); what it no longer does is blame the blacklist rewrite for a state-file write."""
     tmp = os.path.join(ST, ".%s.%d" % (name, os.getpid()))
-    with open(tmp, "w") as fh:
-        fh.write(text)
-    os.replace(tmp, os.path.join(ST, name))
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, os.path.join(ST, name))
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        print("[reap] ABORT: cannot publish %s under %s (%s) — the classification is recorded there, so "
+              "this pass cannot report what it kept or released" % (name, ST, exc))
+        raise SystemExit(1)
 # ⛔ THE REAPER IS THE FIRST THING IN THIS SCRIPT THAT WRITES UNDER $O/state, AND ITS WRITES ARE
 # FAIL-CLOSED (a failure aborts the pass below). The directory is created earlier by
 # `gh_pass_cache_start`, but that mkdir is deliberately FAIL-OPEN (`if mkdir -p … 2>/dev/null`), so a
@@ -2433,10 +2449,21 @@ _ck_tmp="$O/.checked-decided.$$"
   # would cost a pass and a lost queue entry would not be recovered by aborting either.
   if awk -F'\t' '$2!="released"{print}' "$_ck_tmp" >> "$O/state/checked-kept" 2>/dev/null; then :
   else
-    echo "[reap] WARN: could not append the claim outcomes to $O/state/checked-kept — the dispatch line's checked breakdown will fall short of skipped_checked (shown as reason_conflict) rather than name a reason nobody verified"
+    # ⛔ NOT "shown as reason_conflict" (review): `CHECKED_REASONS` is built from this file, so a lost
+    # append leaves every suppressed number UNMATCHED and the walk's own `*)` arm counts it as
+    # `skipped_checked_unknown` — the eight counters still sum to `skipped_checked`, so `reason_conflict`
+    # (an invariant assert over those counters) stays 0 and cannot report this. Naming the wrong key sent
+    # an operator to a field that never moves.
+    echo "[reap] WARN: could not append the claim outcomes to $O/state/checked-kept — every entry it did not record is counted as skipped_checked_unknown (the breakdown still sums, so reason_conflict cannot show this) rather than name a reason nobody verified"
   fi
-  if printf 'released=%s deferred=%s unjustified=%s sort_failed=%s at=%s\n' \
-       "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "${_ck_sort_failed:-0}" "$(date +%s 2>/dev/null || echo 0)" \
+  # ⛔ `refused=` IS PUBLISHED HERE (review): the no-registry fallback above sets
+  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say a release was made WITHOUT the
+  # cross-box claim read — and nothing ever wrote it here, while the funnel's reader re-initialises the
+  # variable from THIS record. Measured before this line existed: `checked_refused=none` on a box with no
+  # `$O/claims.sh`, i.e. the one release that skipped the claim check was byte-identical on the operator
+  # line to a fully claim-checked one — the "a fact with no statement" defect this change exists to end.
+  if printf 'released=%s deferred=%s unjustified=%s refused=%s sort_failed=%s at=%s\n' \
+       "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "${CHECKED_REFUSED:-none}" "${_ck_sort_failed:-0}" "$(date +%s 2>/dev/null || echo 0)" \
        > "$O/state/.checked-reap.$$" 2>/dev/null \
      && mv "$O/state/.checked-reap.$$" "$O/state/checked-reap" 2>/dev/null; then :
   else
@@ -2938,7 +2965,7 @@ record_unusable() {   # <slug> [<reason>]
 unusable_summary() {
   [ -s "$UNUSABLE_LOG" ] || return 0
   awk -F'\t' '{ if (!($1 in n)) { order[++k]=$1 } n[$1]++ }
-              END { for (i=1;i<=k;i++) printf "%s%s:%d", (i>1?" ":""), order[i], n[order[i]] }' \
+              END { for (i=1;i<=k;i++) printf "%s%s:%d", (i>1?",":""), order[i], n[order[i]] }' \
     "$UNUSABLE_LOG" 2>/dev/null
 }
 unusable_cause() {    # the FIRST failure's own words, bounded so one log line stays readable

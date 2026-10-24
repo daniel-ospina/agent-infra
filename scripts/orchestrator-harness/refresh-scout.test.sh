@@ -3077,9 +3077,16 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   "5001 5002 5003 5004 5005 5006 ") ok "slots-before-skip: the six CLEAN candidates filled the window (in tier order) and the pass STOPPED" ;;
   *) bad "slots-before-skip: candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)' (want the six CLEAN ones)" ;;
 esac
-case "$OUT" in
-  *"SKIPPED"*) bad "slots-before-skip: a '>#N SKIPPED' line was printed AFTER the window was full — the stop must outrank the walk-past (that is the unbounded noise #1729 review P1 named): $(printf '%s\n' "$OUT" | grep -c 'SKIPPED') line(s)" ;;
-  *) ok "slots-before-skip: NO skip line is printed once the window is full — the stop fires before the ledger arm, so a full pass cannot emit a block of noise about candidates it will never reach" ;;
+# ⛔ THE ASSERTION IS THE WALK'S OWN MARKER, NOT THE WORD `SKIPPED` (review). The reaper prints
+# `[reap] SKIPPED (checked: the live-session list could not be read)` on a box whose session surface
+# cannot answer — and on such a box (CI: no `cmux` for the board's live-session store) this fixture
+# then counted ONE extra "skip line" that has nothing to do with the walk, reddening both arms below
+# while the ORDER they grade was correct. The stop-outranks-walk-past property is about `>#N SKIPPED`
+# lines, so that is what is counted.
+_slot_skip_lines() { printf '%s\n' "$OUT" | grep -cE '^\[refresh\] >#[0-9]+ SKIPPED'; }
+case "$(printf '%s\n' "$OUT" | grep -E '^\[refresh\] >#[0-9]+ SKIPPED')" in
+  "") ok "slots-before-skip: NO skip line is printed once the window is full — the stop fires before the ledger arm, so a full pass cannot emit a block of noise about candidates it will never reach" ;;
+  *) bad "slots-before-skip: a '>#N SKIPPED' line was printed AFTER the window was full — the stop must outrank the walk-past (that is the unbounded noise #1729 review P1 named): $(_slot_skip_lines) line(s)" ;;
 esac
 [ "$(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ')" = 6 ] \
   && ok "slots-before-skip: exactly 6 pre-flight runs — the three recorded-held tail candidates cost nothing" \
@@ -3091,7 +3098,7 @@ mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
 _led_seed "$D"
 RF_LIMIT=9 rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-b"
-n_skip_lines="$(printf '%s\n' "$OUT" | grep -c 'SKIPPED')"
+n_skip_lines="$(_slot_skip_lines)"
 [ "${n_skip_lines:-0}" -eq 3 ] && ok "slots-skip-control: with a wider window the ledger walk-past IS reached (3 skip lines) — the assertion above is non-vacuous" \
                             || bad "slots-skip-control: $n_skip_lines skip line(s) with a wide window (want 3) — the previous case proves nothing about the ORDER"
 case "$OUT" in
@@ -3730,6 +3737,16 @@ case "$OUT" in
   *"claim registry"*"NOT INSTALLED"*) ok "no registry: the fallback is LOUD (it names the missing registry)" ;;
   *) bad "no registry: the fallback released silently — output: $OUT" ;;
 esac
+# ⛔ AND THE RECORD SAYS WHICH CHECK WAS MISSING (review). The fallback sets
+# `CHECKED_REFUSED=claim-registry-absent` so the dispatch line can distinguish a release made WITHOUT
+# the cross-box claim read from a fully claim-checked one — and until this assertion existed, nothing
+# wrote that value into `state/checked-reap` and the funnel's reader re-initialised it from there, so
+# the funnel published `checked_refused=none` for the one release that skipped the claim check. A
+# passing assertion here is the only thing that keeps the assignment from going dead again.
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *checked_refused=claim-registry-absent*) ok "no registry: the funnel records WHY the release skipped the claim read (checked_refused=claim-registry-absent)" ;;
+  *) bad "no registry: the funnel says checked_refused=$(sed -n 's/.*checked_refused=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — a release made without the claim read is then indistinguishable from a claim-checked one" ;;
+esac
 
 # ── Control H — the release cap defers, and the CURSOR rotates past a permanently-held head ────
 # ⛔ TWO FIXTURES, because they prove different things and the first CANNOT prove the second: after a
@@ -3864,7 +3881,10 @@ mk_mktemp_fail "$D" ck-sorted
 printf '42\n43\n' > "$D/o/checked.txt"
 rf "$D" refresh
 case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
-  "released=0 deferred=0 unjustified=0 sort_failed=1"*) ok "failed sort: the record says the RELEASE DID NOT RUN, not that the cap deferred anything" ;;
+  # ⛔ `refused=` SITS BETWEEN `unjustified=` AND `sort_failed=` (review): the no-registry fallback's
+  # slug is published in this record, and this assertion pins the FIELD SET as well as the values — an
+  # exact match here is what keeps a future key from being added to the record without a reader.
+  "released=0 deferred=0 unjustified=0 refused=none sort_failed=1"*) ok "failed sort: the record says the RELEASE DID NOT RUN, not that the cap deferred anything" ;;
   *) bad "failed sort: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want sort_failed=1 and no 'deferred' count — 'deferred=2' names the cap as the cause of a release that never ran)" ;;
 esac
 case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
@@ -3884,7 +3904,7 @@ mk_tmux "$D"
 printf 'nonsense\nworse\n' > "$D/o/checked.txt"
 rf "$D" refresh
 case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
-  "released=0 deferred=0 unjustified=0 sort_failed=0"*) ok "empty decision file: nothing was claimed as deferred or released (an unparseable row cannot be asked)" ;;
+  "released=0 deferred=0 unjustified=0 refused=none sort_failed=0"*) ok "empty decision file: nothing was claimed as deferred or released (an unparseable row cannot be asked)" ;;
   *) bad "empty decision file: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=0 deferred=0 — a non-zero deferred would claim a later pass could ask a row that is not an issue number)" ;;
 esac
 
@@ -4111,6 +4131,62 @@ case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
   "released=1 "*) ok "duplicate row: one release, one count (a repeated row does not spend two slots)" ;;
   *) bad "duplicate row: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=1 — 'released=2' reports one entry twice and burns release capacity)" ;;
 esac
+
+# ── Control R — TWO failing surfaces are BOTH named (the count is not allowed to hide the second) ──
+# ⛔ THE FUNNEL VALUE IS ONE WHITESPACE-TOKENISED `key=value` FIELD, so a SPACE-joined summary
+# (`surface-a:1 surface-b:1`) is read back as `unusable=surface-a:1` plus a stray `surface-b:1` token
+# that matches no key and is DROPPED — the operator then repairs the first surface and the cell keeps
+# failing while the record blames the surface that was already fixed. The documented shape is
+# `<slug>:<n>,…`, and this fixture is what makes the separator a graded property instead of a comment:
+# revert the join to a space and the second surface disappears from the record below.
+mk_case unusable-two-surfaces
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+n = sys.argv[1] if len(sys.argv) > 1 else ""
+surf = "surface-a" if n == "42" else "surface-b"
+print("VERDICT: INCOMPLETE")
+print("INCOMPLETE SURFACES")
+print("  [%s] the stub could not answer" % surf)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" "42,43"
+mk_tmux "$D"
+rf "$D" refresh
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *"unusable=surface-a:1,surface-b:1"*) ok "two surfaces: BOTH are named in the funnel (the separator is a comma, so the reader keeps the second)" ;;
+  *) bad "two surfaces: the funnel says unusable=$(sed -n 's/.*unusable=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — a space-joined summary is truncated by the key=value reader and the second surface is silently dropped" ;;
+esac
+
+# ── Control S — a state record that CANNOT be published is a NAMED abort, not a traceback ────────
+# ⛔ `publish()` is the one write in the reaper block that was unguarded: `open()`/`os.replace()`
+# raising (ENOSPC mid-pass, EACCES, or a DIRECTORY where a state file belongs) escaped the heredoc,
+# made `reap_rc` non-zero and aborted the pass with EXIT_TRANSIENT — on EVERY later pass, i.e. the
+# permanent no-dispatch loop that presents as RUNNING, which is the class this change removes
+# elsewhere. The directory is the deterministic trigger (no full disk needed) and the assertion is the
+# NAMED refusal: revert the guard and this case reddens on the traceback, not on the rc (an uncaught
+# exception exits non-zero too, so rc alone would grade nothing).
+mk_case publish-unlandable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_tmux "$D"
+printf '42\n' > "$D/o/checked.txt"
+mkdir -p "$D/o/state/checked-kept"      # a DIRECTORY: os.replace(file, dir) raises, and that is the point
+rf "$D" refresh
+case "$OUT" in
+  *"cannot publish checked-kept"*) ok "unlandable publish: the failure is a NAMED refusal (not a bare traceback)" ;;
+  *) bad "unlandable publish: no named refusal in the log — output: $OUT" ;;
+esac
+case "$OUT" in
+  *Traceback*) bad "unlandable publish: a Python traceback escaped the heredoc — the operator gets a stack trace instead of the cause" ;;
+  *) ok "unlandable publish: nothing escaped as a traceback" ;;
+esac
+[ "$RC" -eq 1 ] && ok "unlandable publish: the pass refuses TRANSIENT (1), the same rc the unguarded write produced" \
+                || bad "unlandable publish: rc=$RC (want 1 — the refusal must not change the retry class)"
+grep -qx 42 "$D/o/candidates.txt" 2>/dev/null \
+  && bad "unlandable publish: #42 was queued although no classification could be recorded" \
+  || ok "unlandable publish: nothing was released or queued on a classification that could not be persisted"
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
