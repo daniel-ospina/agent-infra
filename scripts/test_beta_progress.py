@@ -935,6 +935,24 @@ def test_a_cross_origin_redirect_never_carries_the_token_to_the_new_host():
             s.server_close()
 
 
+def test_a_same_host_scheme_downgrade_is_refused_too():
+    """An ORIGIN is (scheme, host, port), so `https:` -> `http:` ON THE SAME HOST is still a
+    different origin -- and following it would re-send the PAT in CLEARTEXT. The stdlib check
+    in `http_error_302` only asserts the scheme is one it knows, never that it did not change,
+    so `netloc` alone passes this. Two loopback servers cannot express a scheme change, hence
+    this drives the handler directly."""
+    import urllib.request
+
+    req = urllib.request.Request("https://api.github.com/repos/o/r/pulls?state=open",
+                                 headers={"Authorization": "bearer gho_downgrade"})
+    assert bp._SameOriginOnly().redirect_request(
+        req, None, 302, "Found", {}, "http://api.github.com/repos/o/r/pulls2") is None, (
+        "a same-host scheme downgrade must be refused, not followed with the credential")
+    assert bp._SameOriginOnly().redirect_request(
+        req, None, 302, "Found", {}, "https://api.github.com/repos/o/r/pulls2") is not None, (
+        "a same-origin redirect must still be followed")
+
+
 # ── the fallback is a FALLBACK: a healthy GraphQL read pays for no REST ─────
 def test_both_graphql_reads_succeeding_never_pays_for_rest(monkeypatch, no_cache):
     """Measured mutant: making the fallback unconditional (`if True:`) left every test green.
