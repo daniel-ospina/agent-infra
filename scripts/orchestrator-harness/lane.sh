@@ -150,22 +150,25 @@ run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" 
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
-# A gate refusal reports AGENT_LOAD_REFUSED (75) or AGENT_DISK_REFUSED (77); AGENT_STARTED is
-# authoritative rather than the exit code, because `pi` shares the 0–255 status namespace and could
-# exit 75 itself (#1720).
+# A gate refusal reports AGENT_LOAD_REFUSED (75), AGENT_MEM_REFUSED (73), AGENT_DISK_REFUSED (77) or
+# AGENT_LAND_BACKLOG (74); AGENT_STARTED is authoritative rather than the exit code, because `pi`
+# shares the 0–255 status namespace and could exit any of those itself (#1720).
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
   # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `load`, `disk` and `land` are
-  # the three values the gate can refuse on, and each is chosen by the code its own caller already
-  # distinguishes, so the record can never disagree with the exit status.
+  # CAPACITY TRANSFER block above for the format and its two readers. `load`, `mem`, `disk` and `land`
+  # are the four values the gate can refuse on, and each is chosen by the code its own caller already
+  # distinguishes, so the record can never disagree with the exit status. `mem` (#2387) is transferable
+  # like `load` — a peer box with free RAM can run the work this box's memory floor refused — which is
+  # why it takes the capacity-transfer branch below and not the `land` stand-down one.
   if [ -n "${capacity_record:-}" ]; then
     case "$rc" in
       "${AGENT_DISK_REFUSED:-77}") _cap_gate=disk ;;
       "${AGENT_LAND_BACKLOG:-74}") _cap_gate=land ;;
+      "${AGENT_MEM_REFUSED:-73}") _cap_gate=mem ;;
       *)                          _cap_gate=load ;;
     esac
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
@@ -203,6 +206,11 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch.
   if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
     echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_MEM_REFUSED:-73}" ]; then
+    # ⛔ THE MEMORY GATE'S OWN NAME (#2387), for the disk branch's reason: an operator told "load"
+    # watches a 1-min average that is fine while the OOM killer takes their lanes. The reading, the
+    # floor and the arithmetic are on the `[mem-gate] REFUSED` line in the same log.
+    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool. (The reading, the floor and how the floor was derived — a measured reserve, or an operator-set MEM_MIN_AVAIL_MB — are on the [mem-gate] REFUSED line in this log.)" >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
     # remedy is not on this box at all). An operator told "load gate" here waits for a box that is

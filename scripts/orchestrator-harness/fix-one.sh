@@ -318,6 +318,19 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # survived.
   if [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
     why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
+  elif [ "$ar" = "${AGENT_MEM_REFUSED:-73}" ]; then
+    # ⛔ THE MEMORY GATE'S OWN WORDING (agent-infra#2387), for the reason the disk branch exists: the
+    # remedies differ and the wrong name sends the operator to the wrong number. "load" would have
+    # them watch a 1-min average on a box whose load is fine while the OOM killer takes lanes; the
+    # memory floor clears when resident lanes FINISH, so the action is to let them (or to stop one
+    # deliberately), not to wait for a load reading. Tolerant reference like the disk one, so a
+    # caller run against an older $O/spawn-gate.sh (file-by-file seeding) degrades instead of
+    # aborting under `set -u` before the refund below.
+    # ⛔ NO DERIVATION CLAIM HERE (review P3). This line used to say "(one pi lane plus one pytest shard,
+    # measured)" — the derivation of the SHIPPED DEFAULT, not of whatever `MEM_MIN_AVAIL_MB` currently
+    # holds. An operator who set the floor directly read a false arithmetic in the one log they have;
+    # the gate's own `[mem-gate] REFUSED` line, three lines up, states which case applies.
+    why="memory gate: available memory is below MEM_MIN_AVAIL_MB — this clears when resident lanes finish, NOT by waiting for load (the [mem-gate] line in this log carries the reading, the floor and how the floor was derived)"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi

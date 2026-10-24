@@ -764,6 +764,19 @@ err_has "NOT STARTED"; ck $? "…saying the reviewer never started"
 err_has "Nothing was consumed"; ck $? "…and that nothing was paid for"
 no_comment; ck $? "no comment posted"
 
+# ── §O2 the spawn point's MEMORY refusal is not a reviewer crash either (agent-infra#2387) ──
+# The shim exits PI_GATE_MEM_REFUSED=72 for the same kind of event (a capacity refusal that consumed
+# nothing) with a DIFFERENT remedy. Without its own arm a 72 fell into the rc!=0 branch, which names a
+# crashed/killed reviewer and tells the operator to re-run back into the same memory floor.
+echo; echo "§O2 spawn-point MEMORY refusal (rc=72) => exit 73, named as a capacity event"
+reset; printf '' > "$TMP/reviewer-out"; FIXTURE_PI_RC=72
+run "$SRC" 2284
+[ "$(rc_of)" = "73" ]; ck $? "exit 73 (its own code) not 6/75 (reviewer failure / load) (rc=$(rc_of))"
+err_has "NOT STARTED"; ck $? "…saying the reviewer never started"
+err_has "MEMORY gate"; ck $? "…naming the MEMORY gate, not the load one (the load wording is not universal)"
+err_has "Nothing was consumed"; ck $? "…and that nothing was paid for"
+no_comment; ck $? "no comment posted"
+
 # ── §P a prompt too large for one argv drops the diff instead of dying ──────
 echo; echo "§P an oversized diff never rides into one argv (truncated, with a fetch instruction)"
 reset; printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
