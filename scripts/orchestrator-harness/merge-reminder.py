@@ -206,7 +206,10 @@ class Skipped(Exception):
 def run(cmd, timeout=60, cwd=None):
     """Run a command with a hard bound. Returns (rc, stdout, stderr); rc 124 on timeout."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        # ⛔ `errors="replace"`: a command's non-UTF-8 output is a READING problem, and a UnicodeDecode
+        # error here would escape every handler (same class as the boxes.tsv decode above).
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, cwd=cwd)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, "", f"timeout after {timeout}s: {' '.join(cmd[:3])}"
@@ -772,7 +775,15 @@ def read_inventory(o: Path) -> list[tuple[str, str, str]]:
     rows: list[tuple[str, str, str]] = []
     if f.is_file():
         try:
-            for line in f.read_text().splitlines():
+            try:
+                text = f.read_text()
+            except UnicodeDecodeError as e:
+                # ⛔ A DECODE FAILURE IS AN UNREADABLE INVENTORY. It is a `ValueError`, not an
+                # `OSError`, so it escaped every handler above: traceback, exit 1, NO report written and
+                # the PREVIOUS cycle's MERGE-REMINDER.md left on disk — a silent stop for as long as the
+                # file stayed malformed, which is the exact false-pass shape this file is built against.
+                raise Skipped(f"UNREADABLE boxes.tsv — not valid UTF-8 ({e})")
+            for line in text.splitlines():
                 if not line.strip() or line.lstrip().startswith("#"):
                     continue
                 parts = line.split("\t")
@@ -1830,7 +1841,11 @@ def _drift_text(rows: list[dict]) -> str:
             # ⛔ A PLACEHOLDER ROW IS NOT A BOX. Printing it as `UNREADABLE` beside a fraction of it
             # ("0/1") read as one probed box that failed, so the report told the owner to deploy a box
             # that does not exist. It says what happened instead.
-            parts.append(f"boxes.tsv={r.get('note') or 'UNREADABLE'}")
+            # ⛔ A SHORT STATE TOKEN, NOT THE SENTENCE: `boxes.tsv=no `state/boxes.tsv`` asserts and
+            # denies the same file, and the sentence follows verbatim in the parenthetical one line
+            # below. The sentence lives in the ⚠️ line and in `why_not_compared`; this is the row.
+            parts.append("boxes.tsv=" + {"unread": "UNREADABLE", "empty": "NO-ROWS",
+                                         "noprobe": "NO-PROBE"}.get(r["inventory"], "UNREADABLE"))
         elif not r["readable"]:
             parts.append(f"{r['box']}=UNREADABLE")
         else:
@@ -1949,6 +1964,12 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
     if local_only:
         lines.append("  ⚠️ harness: no `state/boxes.tsv` — only THIS box was probed; the cells were "
                      "never read, so this is not 'the fleet is on the pin'")
+        # ⛔ ONE PLACE, EVERY BRANCH. Appended per-action it was present in two branches of three and
+        # the third (not-compared — the state a freshly installed box is in) never said the cells were
+        # never consulted; and the HOLD copy was unpinned, so deleting it left the suite green while a
+        # one-box read was stated as the fleet marker.
+        lines.append("  ⛔ harness: LOCAL ONLY — the inventory is absent, so nothing is known about "
+                     "the cells")
     for r in drift:
         if r.get("inventory") in PLACEHOLDER:
             lines.append(f"  ⚠️ harness: {r.get('note') or 'the box inventory could not be read'} — no "
@@ -1994,9 +2015,7 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
                 f"**Goal 2 (harness autonomy):** {len(currents)}/{len(drift)} boxes run this cycle's "
                 f"main, deployed AND activated — NOT all: {drift_names}. The SAME harness version on "
                 f"every box is the marker; deploy/activate it (the deploy arm below) before anything "
-                f"else, one box at a time. "
-                + ("⛔ LOCAL ONLY — the inventory is absent, so nothing is known about the cells. "
-                   if local_only else ""))
+                f"else, one box at a time. ")
         actions.append(head)
     elif goal2 == "MARKERS-HOLD":
         # ⛔ "queue read (…)" IS A MEASUREMENT CLAIM. The standing is decided by the DRIFT alone now
@@ -2007,10 +2026,8 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
                       "queue NOT read this cycle (see the ⚠️ line)")
         actions.append(
             f"**Goal 2 (harness autonomy):** markers HOLD — all {len(drift)} box(es) run this cycle's "
-            f"main, deployed AND activated; {queue_note}."
-            + (" ⛔ LOCAL ONLY — the inventory is absent, so nothing is known about the cells."
-               if local_only else "")
-            + " That is the marker, not proof: keep the queue moving and keep every cell on the pin.")
+            f"main, deployed AND activated; {queue_note}. That is the marker, not proof: keep the "
+            f"queue moving and keep every cell on the pin.")
     else:
         actions.append("**Goal 2 (harness autonomy):** UNMEASURED this cycle — no box was probed "
                        f"({why_not_compared}), so nothing about the fleet's version is asserted. Repair "

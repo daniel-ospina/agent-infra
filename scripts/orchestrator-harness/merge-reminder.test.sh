@@ -239,7 +239,12 @@ write_baseline() {
   printf 'local\tbash %s --o %s\tbash %s\n' "$TMP/box-status-stub.sh" "$O" "$TMP/box-activate.sh" > "$O/state/boxes.tsv"
 }
 run_sut() { # extra args…
-  env -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS \
+  # ⛔ HOME IS THE SUITE'S OWN AND NO AMBIENT PIN IS HONOURED. The synthesized LOCAL row runs the REAL
+  # `box-status.sh`, which takes its identity from `${HARNESS_PIN:-$HOME/.pi/agent/state/HARNESS-PIN}`:
+  # left ambient, the same suite passed on a box that HAS a pin and went red on a clean machine (and
+  # leaked the developer's sha into the report).
+  mkdir -p "$TMP/home"
+  env -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN HOME="$TMP/home" \
     FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
     python3 "$SUT" --o "$O" --reviews "$REV" --repo "$SLUG" --rail "$TMP/rail.sh" \
       --rail-wait-s 5 --verify-deploy-s 3 --retry-s 900 "$@"
@@ -2069,8 +2074,19 @@ ck "§27 ...and nothing was probed, so the standing is UNMEASURED (not MARKERS-B
 ck "§27 ...and --json explains WHY the row is a placeholder (note, not empty reasons)" \
    "$(run_sut --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["drift"][0]; print(0 if r["inventory"]=="unread" and "line is not" in r["note"] else 1)' 2>/dev/null \
       || echo 1)"
-ck "§27 ...and the row says boxes.tsv could not be read" \
-   "$(qF 'boxes.tsv=UNREADABLE boxes.tsv' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the row carries the short state token (boxes.tsv=UNREADABLE)" \
+   "$(qF 'boxes.tsv=UNREADABLE' "$MDF" && echo 0 || echo 1)"
+
+# ⛔ A NON-UTF-8 INVENTORY IS AN UNREADABLE INVENTORY. A decode error is a `ValueError`, not an
+# `OSError`, so it used to escape every handler: traceback, exit 1, NO report written — and the
+# PREVIOUS cycle's file left on disk, i.e. a silent stop for as long as the file stayed malformed.
+write_no_landing; reset_o
+printf 'cell-\xff\tbash x\t\n' > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a non-UTF-8 boxes.tsv is UNREADABLE (rc=0, a report is still written)" \
+   "$([ "$rc" -eq 0 ] && qF 'UNREADABLE boxes.tsv — not valid UTF-8' "$MDF" \
+      && qF 'STANDING=NOT-MEASURED' "$MDF" && echo 0 || echo 1)"
 
 # ⛔ A FILE THAT EXISTS AND LISTS NO ROWS IS ITS OWN STATE — not "absent" (which falls back to THIS
 # box) and not a `0/0` fraction over nothing.
@@ -2098,6 +2114,25 @@ out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 ...and is NOT announced when the inventory is there" \
    "$(nq 'only THIS box was probed' "$MDF" && nq 'LOCAL ONLY' "$MDF" && echo 0 || echo 1)"
+# ⛔ THE LOCAL ROW IS A PROBED BOX — asserted through `goal_progress` ITSELF, because the shell path
+# runs the REAL probe and therefore depends on the machine's pin. A synthesized `absent` row that IS
+# readable must be fractioned and must NOT be described as an unreadable read.
+ck "§27 a probed LOCAL-ONLY row is fractioned, HOLDs, and says LOCAL ONLY" \
+   "$(python3 - "$SUT" <<'PY2'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+row = {"box": "local", "harness": "a" * 12, "relation": "current", "source": "pin",
+       "controller": "RUNNING(pid 1)", "roles": "idle", "readable": True, "on_pin": True,
+       "reasons": [], "inventory": "absent", "note": ""}
+lines, actions = m.goal_progress([row], m.Budget("gh"), "o/r", main_sha="a" * 12)
+txt = "\n".join(lines + actions)
+ok = ("STANDING=MARKERS-HOLD" in txt and "(1/1 on this cycle's main)" in txt
+      and "LOCAL ONLY" in txt and "not compared" not in txt)
+print(0 if ok else 1)
+PY2
+)"
+
 # ⛔ THE LOCAL ROW IS A PROBED BOX. Excluding `absent` from `compared` made the DEFAULT path print
 # "not compared" beside the box it had just compared, and aim the remediation at a read that never
 # failed (the agent-infra default: nothing provisions `$O/state/boxes.tsv`).
@@ -2105,10 +2140,11 @@ write_no_landing; reset_o
 rm -f "$O/state/boxes.tsv"
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
-ck "§27 the LOCAL-ONLY box is still FRACTIONED (a probe is a probe)" \
-   "$(q 'on this cycle' "$MDF" && nq 'not compared' "$MDF" && echo 0 || echo 1)"
-ck "§27 ...and the action says LOCAL ONLY without claiming the read failed" \
-   "$(nq 'could not be compared' "$MDF" && qF 'LOCAL ONLY' "$MDF" && echo 0 || echo 1)"
+ck "§27 a local probe with no pin is UNREADABLE, and that states no fraction" \
+   "$(qF 'local=UNREADABLE' "$MDF" && nq 'on this cycle' "$MDF" \
+      && qF '1 box(es) did not answer' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and LOCAL ONLY is printed as a reading, whichever branch the action takes" \
+   "$(qF 'LOCAL ONLY — the inventory is absent' "$MDF" && echo 0 || echo 1)"
 
 # ⛔ A BOX THAT DID NOT ANSWER IS NOT A BOX THAT DRIFTED. `0/1 on this cycle's main` asserts a version
 # for a box whose version was never read, and then orders it deployed.
