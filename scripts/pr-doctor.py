@@ -93,7 +93,9 @@ os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.realpath(__file__))
 STATE_DIR = os.path.join(HOME, ".pi", "agent", "state")
-STATE = os.path.join(STATE_DIR, "pr-doctor.json")
+# ⛔ `STATE` IS DELIBERATELY NOT DEFINED HERE (agent-infra#2700): it is derived from `REPO`, and
+# `REPO` is defined ~70 lines below. It is assigned immediately after `REPO`/`REPO_DIR` -- a
+# definition ABOVE them raises `NameError` at import, i.e. every pass dies before it reads anything.
 # ⛔ THE IMPORT-TIME SNAPSHOT ONLY -- DO NOT USE FOR I/O (see `_log_path()`): a writer that reads
 # this constant writes the REAL log no matter what `STATE_DIR` was redirected to.
 LOG = os.path.join(STATE_DIR, "pr-doctor.log")
@@ -184,6 +186,56 @@ REPO = os.environ.get("PR_DOCTOR_REPO") or "daniel-ospina/tortoise"
 REPO_DIR = (os.environ.get("PR_DOCTOR_REPO_DIR")
             or os.path.join(HOME, "Documents", "GitHub", "tortoise"))
 
+
+# ⛔ THE DISPATCH REGISTER BELONGS TO ONE REPO, AND THE FILE NAME IS THE ONLY THING THAT SAYS SO
+# (agent-infra#2700, measured 2026-10-24). `pass_budgets()` charges EVERY state row still inside
+# `STALE_DISPATCH_S` against a class ceiling, and those rows are keyed by PR NUMBER -- which is not
+# unique across repos. With ONE `pr-doctor.json`, two doctors shared one register: the tortoise pass
+# counted agent-infra's in-flight workers as its own and reported `inflight=17, budget fix=0` and
+# `dispatched 0 of 4 queued` on every pass, for hours, while its own queue was free. A budget it
+# believed it had spent is indistinguishable from a budget it had spent -- `dispatched 0` is what an
+# empty queue looks like, which is exactly the ALIVE/IDLE confusion #2700 exists to remove.
+#
+# ⚠️ THIS SCOPES THE **REGISTER**, NOT THE WORKER IDENTITY. `dispatch()` still names a worker
+# `prd-<N>` under the box-global `$O/bg`, so two repos on one box still share one worker identity --
+# repo B's PR #N is skipped as "still running" because repo A's worker holds it, and a gate refusal
+# in repo A's `.rc` can be read as repo B's verdict. Same "keyed by PR number" class, one layer
+# down, and NOT closed here: filed as #2725 with the two measured outcomes. Do not read this comment
+# as saying the class is gone.
+#
+# ⚠️ THE ORDER OF THESE TWO DEFINITIONS IS LOAD-BEARING: `_state_file()` and `STATE` read `REPO`.
+#
+# ⛔ THE NAME CARRIES THE **WHOLE** SLUG, NOT ITS TAIL (review, 2026-10-24). `REPO.split("/")[-1]`
+# is owner-blind: `daniel-ospina/tortoise` and any other owner's `tortoise` -- a fork, a second org --
+# land on ONE register and the starvation above returns at org granularity, silently. Flattening the
+# full slug removes that collision class (any two owners with the same repo name). It does NOT make
+# the name injective, and the comment should not pretend otherwise: `foo-bar/baz` and `foo/bar-baz`
+# both flatten to `foo-bar-baz`. That residual needs two separate owners whose names differ only in
+# hyphen placement, and it is a silent collision if it ever happens -- so it is named here rather
+# than claimed away.
+#
+# ⚠️ COORDINATE WITH PR #2280 (`fix/pr-doctor-repo-resolution`), WHICH OWNS THIS SEAM AND NAMES ITS
+# REGISTER DIFFERENTLY: `pr-doctor.<slug>.json` (dot) for a multi-repo run, and the un-scoped
+# `pr-doctor.json` for a single-repo pass. **Whichever of the two lands second MUST reconcile the
+# name**, or one repo has two registers -- its cooldown and budget read from one while the other is
+# written, i.e. the same PR dispatched twice into the same worktree. That reconciliation is recorded
+# here, in the PR body, and on #2280/#2700; a silent second register is the #2700 bug at one remove.
+#
+# ⚠️ AND THE FIRST PASS AFTER THIS DEPLOY READS AN EMPTY REGISTER: the old `pr-doctor.json` is not read
+# (charging ITS rows -- both repos', keyed by PR number -- is the bug). Cooldowns therefore reset once.
+# That is SAFE BY CONSTRUCTION, not by luck: a PR whose worker is genuinely live is still caught by
+# `worker_live()` before any spawn, and an unreadable liveness refuses to spawn blind.
+def _state_file(repo: str) -> str:
+    """The dispatch register for `repo`, under the CURRENT `STATE_DIR` (read at CALL time).
+
+    `STATE` below is the import-time SNAPSHOT of this for the pass's own repo -- one authority for the
+    pass, one call-time form for anything that moves `STATE_DIR` or grades a second repo.
+    """
+    return os.path.join(STATE_DIR, "pr-doctor-%s.json" % repo.replace("/", "-"))
+
+
+STATE = _state_file(REPO)
+
 # ⛔ THE CLASSIFIER IS NOT OURS TO OWN (#1872, merged as #1930). `objective.py` owns the class
 # vocabulary, the check-run read, the attestation read and the predicate; this file owns the
 # DISPATCH. Loading it from beside this file (rather than copying a predicate, or importing a
@@ -191,10 +243,40 @@ REPO_DIR = (os.environ.get("PR_DOCTOR_REPO_DIR")
 # same answer to the same question -- measured 2026-10-16, the two copies DISAGREED ON 4 OF 11 OPEN
 # PRS (36%), each giving one PR two contradictory instructions.
 def _objective():
-    spec = importlib.util.spec_from_file_location(
-        "pr_doctor_objective", os.path.join(HERE, "objective.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)          # the `__main__` guard keeps this side-effect free
+    # ⛔ THE CLASSIFIER IS TOLD WHICH REPO BY THE ONE COMPONENT THAT KNOWS (agent-infra#1989,
+    # measured 2026-10-24 14:12Z). `objective.py` reads `OBJECTIVE_REPO` at EXEC time; nothing
+    # shipped set it, so it fell back to `daniel-ospina/tortoise`. A doctor pointed at ANY other repo
+    # then asked the classifier about tortoise's check-runs using the other repo's SHAs: GitHub
+    # answered `422 No commit found for SHA` for EVERY PR, every PR read UNREADABLE, and the pass
+    # refused to dispatch anything -- while a direct `gh api .../commits/<sha>/check-runs` for the
+    # SAME sha returned 200 and 30 check-runs. The read was fine; the repo was wrong.
+    #
+    # ⛔ FORCED, NOT `setdefault`. `REPO` is the authority for this process, and an ambient value that
+    # DISAGREES with it is the defect, not a preference to fall back from: a caller's environment is
+    # how the wrong repo arrived, so it must not be able to outvote the repo this pass dispatches for.
+    # Set BEFORE the exec, because that is when `objective.py` reads it (its module-level
+    # `REPO = os.environ.get("OBJECTIVE_REPO") or ...`, at the top of that file -- cited by SYMBOL,
+    # not by line: a line number here rots the moment either file gains a comment, and it did).
+    #
+    # ⛔ AND RESTORED AFTERWARDS (review, 2026-10-24). This runs at IMPORT time, so a bare assignment
+    # leaves `OBJECTIVE_REPO` rewritten for the rest of the process -- and anything else in that
+    # process that execs `objective.py` later (`scripts/pr-loop.py` carries its own `_objective()`, and
+    # the two are imported together by the test suite) then binds THIS file's repo whatever its own
+    # caller asked for. The rule is "an ambient value must lose for THIS read", not "this module owns
+    # the process's environment". `objective.py` reads the variable once, at exec (its module-level
+    # `REPO = ...`, see above), so restoring it cannot change what this classifier resolved.
+    _prev = os.environ.get("OBJECTIVE_REPO")
+    os.environ["OBJECTIVE_REPO"] = REPO
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "pr_doctor_objective", os.path.join(HERE, "objective.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)      # the `__main__` guard keeps this side-effect free
+    finally:
+        if _prev is None:
+            os.environ.pop("OBJECTIVE_REPO", None)
+        else:
+            os.environ["OBJECTIVE_REPO"] = _prev
     return mod
 
 
@@ -230,6 +312,12 @@ except BaseException as _exc:      # a sibling that cannot be executed, not mere
 # global is therefore set here and turned into a RECORDED refusal at the top of `main()`, where
 # `record_exit` exists (it is defined below this point, which is why the raise could not record).
 _SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES", "GH_BIN",
+         # ⛔ THE REPO IS PART OF THE SEAM (agent-infra#2518 P1, #2700). `_objective()` installs
+         # `OBJECTIVE_REPO` from this file's `REPO`, so the classifier's own `REPO` is the fact the
+         # whole dispatch plan is built on. A sibling OLDER than #1989 has no `REPO` attribute to
+         # disagree with, and asserting it here is what makes that refusal one named line instead of
+         # a pass that reads another repo's queue: #2518 records the drift as undetectable without it.
+         "REPO",
          # ⛔ AGED FROM #1926: a farmed pr-doctor.py beside a pre-#1926 objective.py must name
          # the missing symbol in ONE line rather than failing per PR after the queue was read.
          "FLIGHT_BOUND_MIN",
@@ -354,11 +442,16 @@ WORKER_STALE_SLACK_S = 15 * 60
 # review chain. `running` never dispatches.
 ACTION_CLASS = {"fix-ci": "fix", "rerun-checks": "fix", "resolve-conflict": "fix",
                 "blocked-by-rail": "fix", "record-review": "review", "call-rail": "review",
-                # ⛔ THE PRE-#1872 VOCABULARY, KEPT FOR THE STATE FILE ONLY. `~/.pi/agent/state/
-                # pr-doctor.json` still holds rows written by the old classifier; the pass below
-                # reads them for `STALE_DISPATCH_S` (90 min) after deploy. Without these keys an
-                # unknown class falls back to "fix", so a live review dispatch would silently
-                # over-charge the fix budget and under-charge the review one.
+                # ⛔ THE PRE-#1872 VOCABULARY, KEPT BECAUSE A ROW'S `action` IS DATA, NOT CODE. It was
+                # written by whatever version wrote the register, and this mapping decides which
+                # ceiling the row charges. Two things make it live, not vestigial: the shipped
+                # `test_inflight_consumes_its_own_class_budget` pins `failing`->fix and
+                # `unreviewed`->review (a row's action is not constrained to `CLASS_ORDER`), and any
+                # register this file is pointed at may predate #1872 -- #2700 scopes the register per
+                # repo, so a *pass* no longer reads the old `pr-doctor.json`, but `STATE` is a module
+                # seam that tests repoint (there is no flag or env var for it). An unknown name falls
+                # back to "fix", so without these a `ready`/`unreviewed` row would silently
+                # under-charge the REVIEW budget and a live review dispatch would ride the fix ceiling.
                 "failing": "fix", "no-checks": "fix",
                 "ready": "review", "unreviewed": "review"}
 
