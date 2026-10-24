@@ -881,7 +881,7 @@ assert_contains "$RS_LAST" "no readable reviewed_at" "§30b ...and the duplicate
 # `local_record_for_key` will still hand it to the key its `repo` implies — so a legacy record whose
 # own `pr` DENIES the key it sits under must never be fast-eligible (measured: it answered
 # `same`/exit 0 while the slow path says "NOT this key"/exit 4).
-echo "── §30c a LEGACY-named mirror is never `same` when it denies the key it sits under"
+echo "── §30c a LEGACY-named mirror is never answered as same when it denies the key it sits under"
 K_LEGACY="daniel-ospina-agent-infra-2005"
 seed_payload "$STORE8" "$K_LEGACY" "{\"pr\":2006,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\"}"
 LEGACY_BLOB="$(git -C "$STORE8" rev-parse --verify "refs/reviews/$K_LEGACY:record.json")"
