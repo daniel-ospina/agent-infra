@@ -1,8 +1,54 @@
 #!/usr/bin/env bash
 # Runs ONE lane's pi inside its own worktree (cwd must already be the worktree).
-#   lane.sh <issue> <branch> <owner/repo>
+#   lane.sh [--repo-dir <checkout>] [--repo <owner/name>] <issue> <branch> [<owner/name>]
+#
+# ⛔ THE TARGET REPO IS AN ARGUMENT, AND IT IS ASSERTED (agent-infra#2724/#2694). The positional
+# `<owner/name>` is the legacy spelling; `--repo` and `--repo-dir` are the explicit ones. There is NO
+# default: a lane with no target REFUSES (reason=no-target) rather than guessing from the brief.
+# After the worktree exists (this cwd) the lane reads its OWN origin and checkout identity and
+# refuses to start when they are not the target — a lattice of pre-build checks can only prove what
+# was asked for. A refusal is exit 72 and is logged as one `[repo-target]` line naming the repo, the
+# worktree and the result, so a wrong-repo lane is a grep rather than an investigation.
 set -u
-N="$1"; BR="$2"; OR="$3"
+N=""; BR=""; OR=""; _or_pos=""; _lt_pos=0
+LANE_REPO_DIR=""; LANE_REPO_SLUG=""
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --repo-dir)
+      [ $# -ge 2 ] || { echo "[lane] refusing: --repo-dir needs a checkout path" >&2; exit 78; }
+      LANE_REPO_DIR="$2"; shift 2 ;;
+    --repo)
+      [ $# -ge 2 ] || { echo "[lane] refusing: --repo needs an owner/name slug" >&2; exit 78; }
+      LANE_REPO_SLUG="$2"; shift 2 ;;
+    --)
+      shift
+      while [ $# -gt 0 ]; do
+        _lt_pos=$((_lt_pos + 1))
+        [ "$_lt_pos" -le 3 ] || { echo "[lane] refusing: too many positional arguments (expected <issue> <branch> [<owner/name>])" >&2; exit 78; }
+        case "$_lt_pos" in 1) N="$1" ;; 2) BR="$1" ;; 3) _or_pos="$1" ;; esac
+        shift
+      done ;;
+    -*) echo "[lane] refusing unknown option: $1" >&2; exit 78 ;;
+    *)
+      _lt_pos=$((_lt_pos + 1))
+      [ "$_lt_pos" -le 3 ] || { echo "[lane] refusing: too many positional arguments (expected <issue> <branch> [<owner/name>])" >&2; exit 78; }
+      case "$_lt_pos" in 1) N="$1" ;; 2) BR="$1" ;; 3) _or_pos="$1" ;; esac
+      shift ;;
+  esac
+done
+# A flag and a positional that disagree are a contradiction in the dispatch itself — refuse rather
+# than let one silently win.
+if [ -n "$LANE_REPO_SLUG" ] && [ -n "$_or_pos" ] && [ "$LANE_REPO_SLUG" != "$_or_pos" ]; then
+  echo "[lane] refusing: --repo '$LANE_REPO_SLUG' contradicts the positional target '$_or_pos'" >&2
+  exit 72
+fi
+OR="${LANE_REPO_SLUG:-$_or_pos}"
+# Validate the two values every artifact below is built from. lane.sh is also invoked by hand, and
+# `$N=../../x` would build a path outside $O/state (the same reason its capacity record is screened).
+case "${N:-}" in
+  ''|*[!0-9]*) echo "[lane] refusing non-numeric issue id: ${N:-<empty>}" >&2; exit 78 ;;
+esac
+[ -n "${BR:-}" ] || { echo "[lane] refusing: no branch named" >&2; exit 78; }
 # ⛔ EXPORTED, not just set: the SPAWN POINT (`pi` itself, agent-infra#1884) is a CHILD process, and a
 # shell variable it cannot see makes its refusal say "untagged" about the very item it just refused.
 # An operator reading "[pi-gate] REFUSED … item NOT started: <x>" must be able to name the lane.
@@ -27,6 +73,12 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # failure the portable probe exists to prevent.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[lane $N] FATAL: $SELF/spawn-gate.sh missing — refusing to start an ungated agent" >&2; exit 78; }
+# ⛔ THE REPO-IDENTITY GATE (agent-infra#2724/#2694). Required, not optional: a lane that cannot
+# prove which repository its worktree is has no business starting an agent in it. Missing helper =
+# FATAL, because a silently skipped assertion is exactly the "nothing refuses" failure being fixed.
+. "$SELF/repo-target.sh" || { echo "[lane $N] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
+command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
+  || { echo "[lane $N] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
 # (measured 2026-10-19: three lanes did the whole job, then were refused at the rail). A lane's gate is
@@ -55,6 +107,30 @@ export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELD
 export PI_MCP_SERVERS=none   # headless lanes use no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 echo "[lane $N] cwd=$(pwd) branch=$(git branch --show-current 2>/dev/null) $(date)" >> "$O/logs/lane-$N.log"
+# ── THE POST-BUILD ASSERTION, BEFORE ANY LANE ARTIFACT (agent-infra#2724/#2694) ─────────────────
+# The worktree exists (it is cwd). Read WHAT IT IS and refuse when it is not the target. The line is
+# written to the lane log AND echoed, so it is the one grep that answers "which repo did this lane
+# run in, and did anything check?". A valid target is mandatory: an absent one is a REFUSAL, not a
+# default (#1974: a shipped default is a path two programs invented).
+REPO_ASSERT_LINE="$(repo_target_assert "lane $N" "$PWD" "$OR" "$LANE_REPO_DIR")"; REPO_ASSERT_RC=$?
+printf '%s\n' "$REPO_ASSERT_LINE" | tee -a "$O/logs/lane-$N.log"
+if [ "$REPO_ASSERT_RC" -ne 0 ]; then
+  echo "[lane $N] NOT started: repo-target REFUSED (exit $REPO_ASSERT_RC) — no agent, no PR, nothing measured in the wrong repository" >> "$O/logs/lane-$N.log"
+  exit "$REPO_ASSERT_RC"
+fi
+# The branch half: a worktree of the right repo checked out on a DIFFERENT named branch is the
+# `prfixup` shape. A DETACHED HEAD is deliberately allowed — the cell template creates `worktree add
+# --detach` and the lane creates its branch at push time — so the branch assertion applies only when
+# HEAD is attached to a named branch.
+HEAD_BRANCH="$(git -C "$PWD" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+if [ -n "${BR:-}" ] && [ -n "$HEAD_BRANCH" ]; then
+  BRANCH_ASSERT_LINE="$(repo_target_branch_assert "lane $N" "$PWD" "$BR" "$OR")"; BRANCH_ASSERT_RC=$?
+  printf '%s\n' "$BRANCH_ASSERT_LINE" | tee -a "$O/logs/lane-$N.log"
+  if [ "$BRANCH_ASSERT_RC" -ne 0 ]; then
+    echo "[lane $N] NOT started: branch assertion REFUSED (exit $BRANCH_ASSERT_RC) — no agent started" >> "$O/logs/lane-$N.log"
+    exit "$BRANCH_ASSERT_RC"
+  fi
+fi
 # ONCE, up front, and to BOTH surfaces: the lane log (what an operator greps) and the lane's own
 # stdout (what the controller reads). The brief carries the long form; this is the one-line reminder
 # that the requirement exists at all, so no lane can discover it only by being refused at the rail.
