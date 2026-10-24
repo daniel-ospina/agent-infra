@@ -1289,6 +1289,33 @@ else
   bad "swap_target_mb() is no longer extractable from the shipped script"
 fi
 
+# ── 16) the ARMING PREDICATE, driven from the shipped function ────────────────────────────────
+# #2164: a cell reported CELL READY while every lane on it logged `#984 … only the string scanner is
+# active`. The ready path now conditions its claim on the layer's own activation line, and the
+# direction of that condition is the whole point — read backwards it certifies a DISARMED cell as
+# armed, which is the defect. Driven from the shipped predicate (extracted, not re-derived), and
+# driven in BOTH directions so a predicate that always answers the same way cannot pass.
+say_case "arming predicate: a DISARMED activation line is DEGRADED, an armed one is not"
+sed -n '/^gh_shim_disarmed() {/,/^}/p' "$BRINGUP" > "$T/shimsed.sh"
+if [ -s "$T/shimsed.sh" ]; then
+  ( . "$T/shimsed.sh"
+    armed='activation: gh shim PRESENT at /home/cell/.pi/agent/gate-bin/gh'
+    disarmed='activation: gh shim PRESENT at /home/cell/.pi/agent/gate-bin/gh (DISARMED: AGENT_GH_SHIM=0)'
+    absent='activation: (none) gh shim absent — string scanner only'
+    gh_shim_disarmed "$armed"    && printf '1' || printf '0'
+    gh_shim_disarmed "$disarmed" && printf '1' || printf '0'
+    gh_shim_disarmed "$absent"   && printf '1' || printf '0'
+  ) > "$T/shim.out"
+  got=$(cat "$T/shim.out")
+  # armed=0 (the caller's else: NOT degraded), DISARMED=1 (the caller's warn arm), absent=0 — an
+  # absent shim is settled by `--verify`'s rc=0 before this predicate is ever consulted.
+  [ "$got" = "010" ] \
+    && ok "armed->NOT degraded, DISARMED->DEGRADED, no activation line->not this predicate's call" \
+    || bad "the arming predicate is INVERTED or blind: got '$got', expected '010' (armed, DISARMED, absent)"
+else
+  bad "gh_shim_disarmed() is no longer extractable from the shipped script"
+fi
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIPPED=$SKIP"
