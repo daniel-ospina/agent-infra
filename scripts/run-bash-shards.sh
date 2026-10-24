@@ -162,14 +162,18 @@ trap 'rm -f "$shard_ran_log"' EXIT
 # for hours, `bash-suites` red on every PR head, and every lane re-derived those four from CI logs by
 # hand, over a 5-minute fix. The names were in the log all along; they were just not in the answer.
 #
-# ⛔ TWO READERS, TWO MECHANISMS — and the rail is served by the OTHER one. `run_shard` emits
+# ⛔ THREE READERS, AND THE RAIL NOW KNOWS ALL THREE (#2700). `run_shard` emits
 # `::error::bash shard failed: <path>`, a GitHub annotation, and `scripts/ci_exemption.py ids`
 # recognises it as a guard-step identity that CARRIES the shard path — measured on a log with two of
-# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. That is what
-# makes a red `bash-suites` step comparable to main's baseline PER SHARD, and it is NOT this block:
-# measured against the prose lines printed here, the same parser returns `ids=0` — they neither help
-# nor hurt it. Do not "fix" the rail here, and never delete the annotation while keeping these lines:
-# that would leave every lane unattributable again.
+# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. Since
+# #2648/#2700 the parser ALSO reads the two prose lines below as `bash-shard::<path>` family
+# identities: the per-shard `❌ FAILED SHARD: <path>` and the recap `❌ failing shard(s): <paths>`. The
+# earlier revision of this paragraph said "measured against the prose lines printed here, the same
+# parser returns `ids=0` — they neither help nor hurt it"; that was true before #2648 and is false
+# now, and a stale claim about the parser is exactly what a future lane reads before deciding whether
+# to touch the rail. **Do not "fix" the rail here, and never delete the annotation while keeping
+# these lines** — the annotation is the only one of the three that survives being taken out of the
+# step's own prose, and it is what keeps every lane attributable.
 #
 # Two prints, on purpose — and the REASON is the early exits: the recap below is reached only at the
 # END of a run, while this file has several `exit 1` paths ABOVE it (`shard target resolves outside
