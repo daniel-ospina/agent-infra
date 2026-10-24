@@ -1887,6 +1887,18 @@ for _a in awk gawk mawk nawk; do
   "$_a" -f "$TMP/scanner.awk" /dev/null 2> "$TMP/scanner.err"; sp=$?
   AWKS_TRIED="$AWKS_TRIED $_a"
   [ "$sp" = "0" ]; ck $? "…and COMPILES under $_a (rc=$sp)"
+  # ⛔ COMPILING IS NOT WORKING (P0, seventh fresh review of #2288 — MEASURED: a `{0,3}` bridge compiles
+  # everywhere but mawk does not SUPPORT interval expressions, so the count classifier matched NOTHING
+  # under mawk and this guard was silently fail-open on a mawk-only box — every pin went green-to-red
+  # only because the suite is run under both dialects). This probe drives the classifier FUNCTIONALLY
+  # under each awk: two fails it must catch and two it must not.
+  _cls="$(sed -n "/^COUNT_SCAN_AWK='/,/^'\$/p" "$SRC" | sed '1d;$d')"
+  printf '%s\n' "$_cls" > "$TMP/classifier.awk"
+  for _case in 'refuse|two blocking defects remain.' 'refuse|defects remaining: two.' 'refuse|p1 x 2 in scripts/x.sh.' 'accept|0 blocking findings.' 'accept|Fixed the 3 issues from round 1.'; do
+    _want="${_case%%|*}"; _line="${_case#*|}"
+    _got="$(printf '%s\n' "$_line" | $_a -f "$TMP/classifier.awk" 2>/dev/null)"
+    if [ "$_want" = "refuse" ]; then [ -n "$_got" ]; ck $? "…and the count classifier WORKS under $_a ($_line)"; else [ -z "$_got" ]; ck $? "…and stays quiet under $_a ($_line)"; fi
+  done
 done
 # ⛔ ONE DIALECT IS NOT "THE DIALECTS" (P2, third fresh review of #2288): the defect this arm exists
 # for was gawk refusing a program mawk accepted, so compiling under whichever `awk` PATH happens to
@@ -2371,6 +2383,70 @@ reset; printf '**Verdict:** CLEAN — P1 x 0 in scripts/x.sh.\n' > "$TMP/reviewe
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "  ...and 'P1 x 0' is a zero, not a count of one (rc=$(rc_of))"
 reset
+# ── §BJ the exemption is CLAUSE-SCOPED, and word numerals mirror ─────────────
+echo; echo "§BJ a repair in ONE clause does not exempt a live count in the NEXT"
+# ⛔ P0 (seventh fresh review of #2288 — MEASURED, each minted a SIGNED clean record): the exemption was
+# `^[^0-9]*(fixed|…)`, matched ANYWHERE before the first digit on the line, so a repair in one clause
+# exempted a live count in a later one. It is clause-scoped now, on `;`/`,` and the conjunctions.
+for _cl in \
+  '**Verdict:** CLEAN — closed the loop on the retry path, but 2 blocking defects remain in scripts/x.sh.' \
+  '**Verdict:** CLEAN — resolved the P3 nit; 2 blocking defects remain.' \
+  '**Verdict:** CLEAN — removed the dead code, and 2 blocking issues remain in scripts/y.sh:7.' \
+  'We fixed the flaky test and 2 blocking defects remain.\
+**Verdict:** CLEAN'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused (repair in another clause): $_cl (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# …and a repair stated FIRST, in the counting clause, still records (the direction that must not burn a
+# paid run) — including the inflected forms a clean report normally uses.
+for _cl in \
+  'Fixed the 3 issues from round 1.\
+**Verdict:** CLEAN' \
+  'The PR fixes 2 bugs in the parser.\
+**Verdict:** CLEAN' \
+  'This branch addresses 2 issues raised in review.\
+**Verdict:** CLEAN' \
+  'Closes the 2 issues it links.\
+**Verdict:** CLEAN'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "records clean (repair in the counting clause): $_cl (rc=$(rc_of))"
+done
+# ⛔ THE MIRROR ARM ACCEPTED DIGITS ONLY (P0, seventh fresh review of #2288 — MEASURED), while the
+# forward grammar it mirrors accepts word numerals. Both arms share one numeral class now.
+for _cl in \
+  '**Verdict:** CLEAN — blocking findings: two (scripts/x.sh:42).' \
+  '**Verdict:** CLEAN — defects remaining: two (scripts/x.sh:42, scripts/y.sh:7).'
+do
+  reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "refused (word-numeral mirror): $_cl (rc=$(rc_of))"
+  no_record; ck $? "    ...nothing recorded"
+done
+# ⛔ AND A FINDING INDENTED AS A NESTED LIST ITEM IS STILL A FINDING (P2, seventh fresh review of #2288
+# — MEASURED: four columns of indent dropped the line from the transcript map, so a normal nested
+# markdown bullet's count never reached the guard). The count channel now reads it; verdict SELECTION
+# still ignores it (a 4-column line is a code quotation).
+reset; printf '**Verdict:** CLEAN\n- Summary\n      - 2 blocking defects remain in scripts/x.sh\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…an indented nested-list count is refused (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+reset
+# ⛔ AN AUTHOR-SEEDED UNSIGNED MARKER CANNOT SATISFY THE DIFF CHECK (P2, seventh fresh review of #2288 —
+# MEASURED: accepting ANY same-head marker let a pre-seeded line with no `sig=` clear a signed marker
+# that attested a different diff — the PR body is author-writable, so that is the fail-open this check
+# exists to close). Where a signed marker exists, only signed ones vote.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF="$_PATCH"
+printf '\nreview recorded: reviews/2284.json verdict=clean @ %s diff=%s (%s)\n' "$HEAD_FIXTURE" "$DH" "$REPO_FIXTURE" >> "$TMP/body.md"
+FIXTURE_MARKER_DIFF="$(printf '%064d' 1)"
+run "$SRC" 2284
+[ "$(rc_of)" = "8" ]; ck $? "an UNSIGNED seeded marker cannot clear a signed one that attests another diff (rc=$(rc_of))"
+err_has "NOT the diff the reviewer read"; ck $? "  ...naming the mismatch"
+reset
 
 # ══ §BI-2 the count vocabulary cannot silently drift from the severity scanner's ══
 echo; echo "§BI-2 every finding noun the severity scanner knows is also countable"
@@ -2387,11 +2463,13 @@ _NOUNS="$(sed -n "${_NOUN_LINE}p" "$SRC" | sed -n 's/.*return "(\([^"]*\))".*/\1
 # MEASURED: the first version resolved to the prose comment above the regex, so deleting `defects?` from
 # the real alternation still printed `missing: none`). The count list lives on the `| grep -oiE` line
 # that follows the `_hit="$(printf` assignment.
-_HIT_LINE="$(grep -nF 'half([[:space:]-]+a)?' "$SRC" | grep -F 'grep -oiE' | head -1 | cut -d: -f1)"
-[ -n "$_HIT_LINE" ]; ck $? "the count guard's LIVE regex line was located (line ${_HIT_LINE:-<none>})"
+# ⛔ THE LIST NOW LIVES IN THE CLASSIFIER'S `noun = "..."` LINE (the bash regex it used to live in is
+# gone), and this still asserts the LIVE list rather than a comment quoting it.
+_HIT_LINE="$(grep -n '^  noun = "findings?' "$SRC" | head -1 | cut -d: -f1)"
+[ -n "$_HIT_LINE" ]; ck $? "the count classifier's LIVE noun list was located (line ${_HIT_LINE:-<none>})"
 _COUNT_LINE="$_HIT_LINE"
 [ -n "$_COUNT_LINE" ]; ck $? "the count guard's noun list was located (line ${_COUNT_LINE:-<none>})"
-_COUNT_TXT="$(sed -n "${_COUNT_LINE}p" "$SRC")"
+_COUNT_TXT="$(sed -n "${_COUNT_LINE}p" "$SRC" | sed -n 's/.*noun = "\([^"]*\)".*/\1/p' | tr '|' ' ')"
 _missing=""
 for _n in $_NOUNS; do
   case "$_n" in
@@ -2419,7 +2497,8 @@ reset
 # when §AP added 27 (count-in-words CLEAN + mutation, heading CLEAN, credential redaction + mutation,
 # and the SIGTERM/no-orphan arm), for the same reason: a pin with slack lets that section be deleted
 # silently.
-# Re-set to 722 when §BI added the no-cue fail-opens, the mirror form, the repair-first exemption and
+# Re-set to 762 when §BJ added the clause-scoped exemption, the word-numeral mirror, the indented-line
+# arm, the functional awk probe and the signed-marker arm (seventh fresh review). It was 722 when §BI added the no-cue fail-opens, the mirror form, the repair-first exemption and
 # the recorder-relative normalizer arm (sixth fresh review). It was 706 when §BI added the ASCII multipliers, the attributive-noun counter-directions and the
 # normalizer mutation control (fifth fresh review). It was 683 when §BI (the recorder-shaped diff= digest, the over-block counter-directions,
 # the `P<n> × n` inverse form and the noun-list drift tripwire) added 22 (fourth fresh review). It
@@ -2502,7 +2581,7 @@ _mut_step() { # <sed-expr> <label>
   cmp -s "$MC" "$MC.next" && { fail "the $2 mutation did not apply — this control proves NOTHING"; return 1; }
   mv "$MC.next" "$MC"
 }
-_mut_step 's/^\([[:space:]]*\)CLEAN_COUNT_WORDS="\$_one"; CLEAN_COUNT_LINE="\$_vl"; break$/\1: "$_one"/' 'per-match count assignment'
+_mut_step 's/^\([[:space:]]*\)CLEAN_COUNT_WORDS="\$(printf .*break$/\1:/' 'count-classifier call'
 if cmp -s "$SRC" "$MC"; then
   fail "the count-arm mutation did not apply - this control proves NOTHING"
 else
@@ -2606,6 +2685,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 722 ]; ck $? "assertion-count pin: >= 722 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 762 ]; ck $? "assertion-count pin: >= 762 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

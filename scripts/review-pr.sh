@@ -1128,11 +1128,18 @@ grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
                         # four spaces correctly exited 6. Expand tabs on a COPY (the printed line
                         # keeps the text as the reviewer wrote it).
                         t = ln[i]; gsub(/\t/, "    ", t)
-                        if (t ~ /^    /) continue
+                        # ⛔ AN INDENTED LINE IS STILL A LINE (P2, sixth fresh review of #2288 — MEASURED
+                        # fail-OPEN: `  - 2 blocking defects remain in scripts/x.sh` four columns in —
+                        # an ordinary nested markdown bullet — was dropped by this skip, so the COUNT
+                        # channel never saw it and a signed clean record was minted). The skip stays for
+                        # VERDICT SELECTION (a 4-column line is a code quotation, the declared residual)
+                        # but the line is emitted with a marker so the count channel still reads it, and
+                        # the verdict-shaped grep excludes the marker.
+                        if (t ~ /^    /) { print "\001" ln[i]; continue }
                         print ln[i]
                       }
                     }' | tr -d '\r' > "$RUN_DIR/survivors.txt"
-  grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$RUN_DIR/survivors.txt" > "$RUN_DIR/verdict-lines.txt"
+  grep -av $'^\001' "$RUN_DIR/survivors.txt" | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" > "$RUN_DIR/verdict-lines.txt"
   LAST_LINE="$(tail -1 "$RUN_DIR/verdict-lines.txt" 2>/dev/null)"
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS KEPT (P1/P2, fresh review of #2288): the
   # contradiction guard read only this LAST line, so a counted CLEAN — or an `ISSUES 2` — one line
@@ -1715,6 +1722,78 @@ fi
 # refused (rc 7, no record) where the pre-fix head recorded it. `was|is|are|were` is now allowed
 # before the participle. The direction stays fail-closed: a count with NO resolved participle still
 # refuses.
+# \u2550\u2550 COUNT_SCAN_AWK — the ONE classifier for "does this line report a non-zero count of findings?"
+# Three arms over one numeral class and one noun class:
+#   forward   <numeral> [up to 3 words] <noun> [copula] [repair]      e.g. "2 blocking defects remain"
+#   mirror    <noun> [up to 2 words] [:=] or [ -] <numeral>           e.g. "defects remaining: two"
+#   multiply  <severity> [× x X * times] <n>, or the reverse         e.g. "P1 x 2", "0 × P1"
+# A match is SKIPPED (not a count) when
+#   \u2022 its numeral is a ZERO — "0 defects", "P1 x 0", "findings: 0" all stay clean; or
+#   \u2022 the match itself ends in a repair verb — "1 finding was fixed"; or
+#   \u2022 the CLAUSE holding the count begins (within three words) with a repair verb —
+#     "Fixed the 3 issues from round 1.". The clause is everything after the last clause separator
+#     (`;`, `,`, and/but/however/yet/while/although), which is what keeps a repair in ONE clause from
+#     exempting a live count in the NEXT: "closed the loop, but 2 blocking defects remain" refuses.
+# Prints each offending fragment; prints nothing when the line reports no non-zero count.
+COUNT_SCAN_AWK='
+function clause_before(pre,   parts, n) {
+  # (the separator may END the prefix, which is exactly what happens when the count follows it:
+  # `we fixed the flaky test and 2 blocking defects remain` — pre ends at "and", so a trailing
+  # `[[:space:]]` requirement missed it and the repair in the FIRST clause exempted the second, measured)
+  n = split(pre, parts, /[;,]|[[:space:]](and|but|however|yet|while|although)([[:space:]]|$)/)
+  return parts[n]
+}
+function repair_led(cl,   n, w) {
+  n = split(cl, w, /[^[:alpha:]-]+/)
+  # up to three words may precede the verb ("The PR fixes", "We have also fixed")
+  for (i = 1; i <= 3 && i <= n; i++) if (w[i] ~ repair_re) return 1
+  return 0
+}
+BEGIN {
+  num = "[0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many"
+  noun = "findings?|blockers?|issues?|defects?|bugs?|regressions?|vulnerabilit(y|ies)|violations?|problems?"
+  repair = "(fixed|addressed|resolved|closed|removed|repaired|fix|fixes|fixing|address|addresses|addressing|close|closes|closing|resolve|resolves|resolving|remove|removes|removing|re-review|re-reviewed)"
+  repair_re = "^(" repair ")$"
+  # ⛔ NO INTERVAL EXPRESSIONS (P0, this lane — MEASURED: mawk does not support `{n,m}`, so the whole
+  # classifier silently matched NOTHING under mawk and every pin in this guard flipped to fail-open on a
+  # mawk-only box; the suite caught it only because it is run under both dialects). The bridges are
+  # written out as optional groups instead, which every POSIX awk supports.
+  fwd = "(^|[^[:alnum:]])(" num ")([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?[[:space:]-]+(" noun ")([[:space:]-]+((was|is|are|were|has|have)[[:space:]-]+)?(" repair "))?"
+  mir = "(^|[^[:alnum:]])(" noun ")([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?[[:space:]]*([:=]|[[:space:]][-–—])[[:space:]]*(" num ")"
+  # (the severity token is folded too: the line is lowercased above, so `P[0-3]` would never match)
+  mul = "(^|[^[:alnum:]])(([0-9]+)[[:space:]]*(×|x|\\*|times)[[:space:]]*(p[0-3])|(p[0-3])[[:space:]]*(×|x|\\*|times)[[:space:]]*([0-9]+))"
+}
+{
+  # ⛔ CASE-FOLDED, because awk match() honours no -i (P0, seventh fresh review of #2288 — MEASURED:
+  # Two defects, both in the guard: and Closes the 2 issues it links. recorded clean because the
+  # numeral/noun/repair classes are written lowercase and a capitalised sentence opener never matched).
+  # IGNORECASE is gawk-only, so the fold is explicit; the printed fragment is lowercase, which is fine
+  # in a refusal message.
+  line = tolower($0)
+  for (arm = 1; arm <= 3; arm++) {
+    re = (arm == 1) ? fwd : (arm == 2 ? mir : mul)
+    off = 0; rest = line
+    while (match(rest, re)) {
+      frag = substr(rest, RSTART, RLENGTH)
+      abs_end = off + RSTART + RLENGTH - 1
+      pre = substr(line, 1, off + RSTART - 1)
+      rest = substr(rest, RSTART + RLENGTH)
+      off = abs_end
+      # a zero numeral is not a count: strip severity tokens first, then read the number
+      bare = frag; gsub(/[pP][0-3]/, "", bare)
+      dig = ""
+      if (match(bare, /[0-9]+/)) dig = substr(bare, RSTART, RLENGTH)
+      if (dig == "0") continue
+      # a repair stated inside the match ("1 finding was fixed") is not a live count
+      if (frag ~ ("(" repair ")$")) continue
+      # …and one stated at the head of THIS clause is not either
+      if (repair_led(clause_before(pre))) continue
+      print frag
+    }
+  }
+}
+'
+
 refuse_counted_clean() {
   local _vl _vw _hit _hit2 _hit3 _one _dig _tail _bare _scan _src
   CLEAN_COUNT_WORDS=""; CLEAN_COUNT_LINE=""
@@ -1795,81 +1874,27 @@ refuse_counted_clean() {
     # or `fix` matches the `fix` inside `fixed` and eats a genuine repair participle)
     _scan="$(printf '%s' "$_vl" | sed -E 's/(bug|bugs|regression|regressions|defect|defects|issue|issues|finding|findings|problem|problems|violation|violations)[[:space:]-]+(fix|fixes|fixup|fixups|report|reports|test|tests|suite|suites|scan|scans|class|classes|count|counts|free|coverage|pass|passes|series)([^[:alnum:]]|$)/\2\3/g' 2>/dev/null)"
     [ -n "$_scan" ] || _scan="$_vl"
-    _hit="$(printf '%s' "$_scan" \
-      | grep -oiE '(^|[^[:alnum:]])([0-9]+|a|an|couple([[:space:]-]+of)?|half([[:space:]-]+a)?[[:space:]-]+dozen|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|dozen|single|sole|lone|several|multiple|many)([[:space:]-]+[[:alpha:]][[:alpha:]-]*){0,3}[[:space:]-]+(findings?|blockers?|issues?|defects?|bugs?|regressions?|vulnerabilit(y|ies)|violations?|problems?)([[:space:]-]+((was|is|are|were)[[:space:]-]+)?(fixed|addressed|resolved|closed|removed))?' 2>/dev/null \
-      | grep -viE '[[:space:]-](fixed|addressed|resolved|closed|removed)$' 2>/dev/null || true)"
-    # ⛔ THE INVERSE COUNT FORM (P2, fourth fresh review of #2288 — PRE-EXISTING on main, MEASURED:
-    # `**Verdict:** CLEAN — P1 × 2 in scripts/x.sh.` recorded clean on BOTH revisions, and this file
-    # already PARSES the `3 × P1` spelling for an ISSUES verdict, so the multiplier is a count the
-    # reviewer is entitled to write). `<severity> × <n>` puts the number where the `<count> <noun>`
-    # grammar cannot see it, so it gets its own arm rather than a wider bridge.
-    # ⛔ THE MULTIPLIER IS NOT ONLY THE `×` GLYPH (P1, fifth fresh review of #2288 — MEASURED fail-OPEN:
-    # `**Verdict:** CLEAN — P1 x 2 in scripts/x.sh.` recorded a SIGNED clean record while the `×` twin
-    # refused, and `P1 * 2` did too). This file's own ISSUES reader already honours `3x P2` and
-    # `[0-9]+[[:space:]]*[×x]`, so `x`/`X`/`*` and the word `times` are counts a reviewer may write.
-    # ⛔ THE MULTIPLIER IS AN ALTERNATION, NOT A BRACKET EXPRESSION (P2, this lane — MEASURED under
-    # `LANG=C LC_ALL=`): inside `[...]` the multi-byte `×` is a pair of BYTES that a C-locale regcomp
-    # does not match, so the very form this arm exists for went silent exactly where the suite was
-    # already being run in the C locale. As a plain alternative it matches in both locales.
-    # ⛔ AND THE COUNT GRAMMAR IS ORDER-BOUND, SO ITS MIRROR IS A SEPARATE ARM (P1, sixth fresh review of
-    # #2288 — MEASURED fail-OPEN on the VERDICT line itself, where nothing gates it:
-    # `**Verdict:** CLEAN — blocking findings: 2 in scripts/x.sh.` and
-    # `**Verdict:** CLEAN — defects remaining: 2 (scripts/x.sh:42, scripts/y.sh:7).` both recorded a
-    # SIGNED clean record, on main as well, so this is a remaining hole and not one this branch opened).
-    # The severity scanner already carries the same mirror arm for P tokens ((b4)) — a `P2: 2 findings`
-    # shape — so the two grammars had drifted one over; a colon/equals/dash separator is REQUIRED, or
-    # `issue 3 of the tracker` would read as a count.
-    _hit3="$(printf '%s' "$_scan" \
-      | grep -oiE '(^|[^[:alnum:]])(findings?|blockers?|issues?|defects?|bugs?|regressions?|vulnerabilit(y|ies)|violations?|problems?)([[:space:]]+[[:alpha:]][[:alpha:]-]*){0,2}[[:space:]]*([[:space:]]*[:=][[:space:]]*|[[:space:]]+[-—–][[:space:]]*)[0-9]+' 2>/dev/null || true)"
-    _hit2="$(printf '%s' "$_scan" \
-      | grep -oiE '(^|[^[:alnum:]])([0-9]+[[:space:]]*(×|x|X|\*|times)[[:space:]]*P[0-3]|P[0-3][[:space:]]*(×|x|X|\*|times)[[:space:]]*[0-9]+)' 2>/dev/null || true)"
-    if [ -n "$_hit2" ]; then _hit="${_hit:+$_hit
-}$_hit2"; fi
-    if [ -n "$_hit3" ]; then _hit="${_hit:+$_hit
-}$_hit3"; fi
+    # ⛔ ONE CLASSIFIER, THREE ARMS, AND A CLAUSE-SCOPED EXEMPTION (P0/P1, seventh fresh review of #2288 —
+    # all MEASURED, each either minting a SIGNED clean record or burning a paid run):
+    #   (a) the exemption was `^[^0-9]*(fixed|…)` — matched ANYWHERE before the first digit, so a repair
+    #       in one clause exempted a LIVE count in a later one:
+    #       `**Verdict:** CLEAN — closed the loop on the retry path, but 2 blocking defects remain in
+    #       scripts/x.sh.` recorded clean. It is clause-scoped now: the clause holding the count (split on
+    #       `;`, `,`, ` and `, ` but `, ` however `, ` yet `, ` while `, ` although `) must begin — within
+    #       three words — with a repair verb.
+    #   (b) the mirror arm accepted DIGITS only while the forward grammar it mirrors accepts word
+    #       numerals: `**Verdict:** CLEAN — blocking findings: two (scripts/x.sh:42).` recorded clean.
+    #       Both arms share ONE numeral class now.
+    #   (c) the repair vocabulary was past-participle-only, so a clean report describing what the PR does
+    #       NOW was refused: `The PR fixes 2 bugs in the parser.`, `This branch addresses 2 issues raised
+    #       in review.`, `Closes the 2 issues it links.`
+    # The arms are: forward `<numeral> … <noun>`, mirror `<noun> … [:=-] <numeral>`, and the multiplier
+    # `<severity> ×|x|*|times <n>` — every spelling as an ALTERNATION, because inside a bracket expression
+    # the multi-byte `×` does not match under `LANG=C` (measured).
+    _hit="$(printf '%s' "$_scan" | awk "$COUNT_SCAN_AWK" 2>/dev/null || true)"
     [ -n "$_hit" ] || continue
-    # ⛔ ON AN ORDINARY LINE A COUNT NEEDS A LIVE-FINDING CUE (P2, fourth fresh review of #2288 —
-    # MEASURED over-block, the direction that costs a PAID re-run: widening the channel to every
-    # survivor line made `Fixed the 3 issues from round 1.` refuse, because the resolved participle had
-    # to sit immediately after the noun). A verdict-shaped line is self-contradictory by construction,
-    # so there a non-zero count always refuses unless a repaired participle sits in the slot the regex
-    # already allows; an ordinary line is only a contradiction when the sentence says the findings are
-    # STILL there — remain(s|ing), unresolved, still, left, open, outstanding, blocking, found,
-    # located, pending. Both measured fail-opens of the third review (`I found two blocking issues:`,
-    # `2 defects remain`) carry a cue.
-    # ⛔ THE CUE LIST WAS THE WRONG SHAPE OF GUARD (P1, sixth fresh review of #2288 — MEASURED fail-OPEN:
-    # `Two defects, both in the guard:` then `**Verdict:** CLEAN`, and
-    # `Reviewed the whole diff. Two issues in the retry path.`, and `Noted 2 problems in the guard` all
-    # recorded a SIGNED clean record, because a fixed list of 11 words is a whitelist of sentences and a
-    # reviewer only has to phrase it differently). The contract is the FILE's own: a reported count of
-    # findings anywhere in the accepted region is a finding. So the default is REFUSE, and the only
-    # exemption is the one the protocol actually licenses — the line says it REPAIRED them, in the
-    # clause before the count (`Fixed the 3 issues from round 1.`). The repair participle immediately
-    # after the noun is exempted by the match filter above, and nothing else is.
-    if printf '%s' "$_scan" | grep -qiE '^[^0-9]*(fixed|addressed|resolved|closed|removed|repaired|re-review)' ; then
-      continue
-    fi
-    # ⛔ A ZERO IS NOT A COUNT (the counter-directions §AN/§AP pin): `CLEAN — 0 blocking findings`
-    # must keep recording, so each MATCH is read for its own number and a zero match is skipped —
-    # the line keeps being scanned rather than being exempted whole.
-    while IFS= read -r _one; do
-      [ -n "$_one" ] || continue
-      # ⛔ THE SEVERITY LABEL'S OWN DIGIT IS NOT THE COUNT (P2, fourth fresh review of #2288 — the
-      # `P1 × 2` arm read `P1` as the count and refused `0 × P1`, a zero multiplier): strip the `P<n>`
-      # tokens first, then the first number left is the count, in every form and both directions.
-      _bare="${_one//P[0-3]/}"
-      # …and in the MIRROR form (`defects remaining: 2`) the count is the LAST number, so both ends are
-      # read and the count is whichever exists: first form takes the head, mirror takes the tail. A
-      # zero at EITHER end is a zero report, which is what both spellings mean.
-      _dig="$(printf '%s' "$_bare" | grep -oE '[0-9]+' | head -1)"
-      _tail="$(printf '%s' "$_bare" | grep -oE '[0-9]+' | tail -1)"
-      [ -n "$_tail" ] && [ "$_dig" != "$_tail" ] && _dig="$_tail"
-      [ -n "$_dig" ] && [ "$_dig" -eq 0 ] && continue
-      CLEAN_COUNT_WORDS="$_one"; CLEAN_COUNT_LINE="$_vl"; break
-    done <<<"$_hit"
-    [ -n "$CLEAN_COUNT_WORDS" ] && break
+    CLEAN_COUNT_WORDS="$(printf '%s' "$_hit" | head -1)"; CLEAN_COUNT_LINE="$_vl"; break
   done < "$_src"
-  [ -n "$CLEAN_COUNT_WORDS" ] && break
   done
   if [ -n "$CLEAN_COUNT_WORDS" ]; then
     err "$PROG: the verdict is clean (spelled CLEAN, or ISSUES 0) and a verdict-shaped line ALSO reports a non-zero count of findings (\"$CLEAN_COUNT_WORDS\") — a line cannot be both, so this is a verdict of convenience, not a clean review."
@@ -2247,17 +2272,34 @@ marker_state() { # <body> -> signed | unsigned | absent
 # new arm going red for the WRONG reason): `MARKER_STATE="$(marker_state ...)"` runs in a subshell, so
 # the diff group it parsed died with it and the seam fell back to a live read that could itself fail.
 # The marker's `diff=` is therefore read by its own pass, here, with no network call.
-marker_diff_for() { # <body> -> the diff group of the marker bound to THIS pr/head/repo
-  local body="$1" line pr_re head_re repo_lc
+marker_diff_for() { # <body> -> the diff group of EVERY marker bound to THIS pr/head/repo
+  local body="$1" line pr_re head_re repo_lc signed=0
   pr_re="$PR"; head_re="$HEAD"; repo_lc="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
-  while IFS= read -r line; do
-    [[ "$line" =~ ^review\ recorded:\ reviews/([0-9]+)\.json\ verdict=(clean|clean-micro|clean-low)\ @\ ([0-9a-f]{40})(\ diff=[0-9a-f]{64})?\ \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)(\ sig=[0-9a-f]{64})?$ ]] || continue
-    [ "${BASH_REMATCH[1]}" = "$pr_re" ] || continue
-    [ "${BASH_REMATCH[3]}" = "$head_re" ] || continue
-    [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$repo_lc" ] || continue
-    printf '%s\n' "${BASH_REMATCH[4]# diff=}"
-    _seen=1
-  done <<<"$body"
+  # ⛔ SIGNED MARKERS WIN (P2, seventh fresh review of #2288 — MEASURED: accepting "any" same-head
+  # marker let an AUTHOR-SEEDED unsigned line — the PR body is author-writable — satisfy the diff check
+  # while the recorder's own signed marker attested a different diff, reopening exactly the case this
+  # check exists for). So when any marker at this head carries a `sig=`, only signed markers are read;
+  # an unsigned line cannot vote. Where NO marker is signed (a key-less recorder run, which is its own
+  # named refusal above), the unsigned ones are the only evidence there is and are used.
+  marker_scan() { # <body> <want-signed 0|1> -> diffs
+    local b="$1" want="$2" ln pre he rl
+    pre="$PR"; he="$HEAD"; rl="$repo_lc"
+    while IFS= read -r ln; do
+      [[ "$ln" =~ ^review\ recorded:\ reviews/([0-9]+)\.json\ verdict=(clean|clean-micro|clean-low)\ @\ ([0-9a-f]{40})(\ diff=[0-9a-f]{64})?\ \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)(\ sig=[0-9a-f]{64})?$ ]] || continue
+      [ "${BASH_REMATCH[1]}" = "$pre" ] || continue
+      [ "${BASH_REMATCH[3]}" = "$he" ] || continue
+      [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$rl" ] || continue
+      { [ "$want" = "0" ] || [ -n "${BASH_REMATCH[6]}" ]; } || continue
+      printf '%s\n' "${BASH_REMATCH[4]# diff=}"
+    done <<<"$b"
+  }
+  marker_scan "$body" 1 >/dev/null 2>&1 || true
+  if [ -n "$(marker_scan "$body" 1)" ]; then
+    marker_scan "$body" 1
+  else
+    marker_scan "$body" 0
+  fi
+  signed=0; : "$signed"
   # EVERY same-head marker is printed, not just the first (P3, sixth fresh review of #2288): a head can
   # carry two (an earlier recorder run, then a re-run the E_ALREADY message advises), and a first-match
   # read would keep seeing the STALE one and refuse forever.
