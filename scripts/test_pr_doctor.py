@@ -218,20 +218,25 @@ def test_max_override_is_a_hard_ceiling():
 # ── 2b. a SLOT belongs to a PROCESS, not to a record (agent-infra#2700 C5) ──────────────
 
 def _a_dead_pid() -> int:
-    """A pid that is PROVABLY gone: a reaped child of ours that has not been recycled.
+    """A pid that is PROVABLY gone -- and that can never be recycled into existence.
 
-    Measured at the moment of use (`os.kill(pid, 0)` raising ProcessLookupError), never assumed:
-    the pid space is shared, so a reaped pid can in principle be handed to an unrelated process
-    between the wait and the assertion. The retry loop makes that a non-event instead of a flake.
+    ⛔ NOT A REAPED CHILD (#2746 review round 3). This helper used to return a child's pid after
+    measuring it dead once; the pid is then written into a pid file and re-measured LATER, inside
+    `pass_budgets` -- and a pid recycled in that window reads `alive` BY DESIGN, so the assertion
+    would fail on a green tree with a message that blames the fix. On a box running forty lanes that
+    is the flake class this suite cannot afford.
+
+    `2**31 - 1` is above every platform's `pid_max` (Linux defaults to 4194304 and is capped below
+    2**22; macOS's is smaller), so no process can ever hold it and `kill` answers ESRCH for ever.
+    The probe is the assertion: if some platform ever did hand it out, this fails HERE, naming the
+    helper, instead of inside a test about budgets.
     """
-    for _ in range(20):
-        p = subprocess.Popen([sys.executable, "-c", "pass"])
-        p.wait()
-        try:
-            os.kill(p.pid, 0)
-        except ProcessLookupError:
-            return p.pid
-    pytest.fail("could not obtain a dead pid: every reaped child's pid was recycled")
+    sentinel = 2 ** 31 - 1
+    try:
+        os.kill(sentinel, 0)
+    except ProcessLookupError:
+        return sentinel
+    pytest.fail("pid %d exists on this box -- it cannot be used as a provably-dead pid" % sentinel)
 
 
 def test_a_finished_workers_row_does_not_hold_a_class_slot(tmp_path, monkeypatch):
@@ -352,9 +357,10 @@ def test_an_unreadable_pid_file_does_not_free_a_slot(tmp_path, monkeypatch):
 def test_a_directory_at_the_pid_path_neither_crashes_nor_frees_the_slot(tmp_path, monkeypatch):
     """An artifact of the wrong TYPE is unknown, not gone -- and not a hang either.
 
-    A directory is excluded by `_worker_pid_files`' `isfile` filter (so the read never sees it), and
-    the same filter is what keeps a FIFO from blocking `open()` forever with no writer. Both must
-    leave the slot held.
+    `_worker_pid_files` filters on `isfile`, which excludes a directory AND keeps a FIFO from
+    blocking `open()` forever with no writer. Both are asserted: the FIFO case is the one a
+    regression to `os.path.exists` would turn into a HUNG pass (worse than the crash this round-1
+    review already fixed), and it would otherwise pass this suite green.
     """
     now = 1_000_000.0
     bg = tmp_path / "bg"
@@ -364,6 +370,13 @@ def test_a_directory_at_the_pid_path_neither_crashes_nor_frees_the_slot(tmp_path
     b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)
     assert b["fix"] == 0, "a directory at the pid path freed a slot: %r" % (b,)
     assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+
+    fifo = bg / "prd-32.pid"
+    os.mkfifo(fifo)                       # POSIX only; this suite does not run on Windows
+    st["32"] = {"action": "fix-ci", "worker": "prd-32", "at_epoch": now}
+    b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)   # must not hang
+    assert b["fix"] == 0, "a FIFO at the pid path freed a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (2, 0, 2)
 
 
 def test_the_pass_line_reports_inflight_alive_and_unknown(monkeypatch, tmp_path):

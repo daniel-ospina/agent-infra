@@ -3093,7 +3093,8 @@ def main() -> int:
         stalls = stalled or {}
         if not dispatched:
             # ⚠️ THE CHECKS WORDING IS KEPT VERBATIM (a shipped test asserts it), and the surface
-            # holds are appended rather than folded in: they are the same AXIS (a read that did not            # happen) but a DIFFERENT read, and an operator chasing a stalled surface PR must not
+            # holds are appended rather than folded in: they are the same AXIS (a read that did not
+            # happen) but a DIFFERENT read, and an operator chasing a stalled surface PR must not
             # be sent to `gh pr checks`.
             _held = blind_surface + blind_partial + blind_abandoned
             _more = (" (%d usable-PR(s) still held for a changed-file read)" % _held
