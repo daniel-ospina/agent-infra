@@ -716,12 +716,17 @@ case "$(det "$OUT")" in *"[post=failed-inert]"*) ok "the uncountable post bound 
 # ══ CASE 26 — the STARTUP GUARD (a guard nothing runs is not a guard) ══════════════════════════
 case_ "case 26: a missing check-class.py is FATAL; a missing nochk-resolve.py only warns"
 GUARD="$TMP/guard.sh"
-sed -n '/^nochk_require_classifier() {/,/^}/p' "$HERE/orch-loop.sh" > "$GUARD"
+sed -n '/^nochk_require_classifier() {/,/^}/p' "$HERE/nochk-guard.sh" > "$GUARD"
 if [ -s "$GUARD" ] && grep -q 'exit 78' "$GUARD"; then
-  ok "the startup guard is extracted from the shipped loop"
+  ok "the startup guard is extracted from its shipped module"
 else
-  bad "nochk_require_classifier() is missing from orch-loop.sh — the FATAL path is untested"
+  bad "nochk_require_classifier() is missing from nochk-guard.sh — the FATAL path is untested"
 fi
+# ⛔ AND THE LOOP MUST CALL IT (review P3, agent-infra#2719): a guard that nothing invokes is the bug
+# this guard exists for. Extracting the DEFINITION can never see the call site, so it is pinned here.
+grep -q '^nochk_require_classifier "\$_CK_PY" "\$_NCHK_PY"' "$HERE/orch-loop.sh" \
+  && ok "…and orch-loop.sh actually CALLS it at startup" \
+  || bad "orch-loop.sh never calls nochk_require_classifier — a missing classifier would be silent"
 mkdir -p "$TMP/guardO/logs"
 ( . "$GUARD"; nochk_require_classifier "" "/x/nochk-resolve.py" "$TMP/guardO" "/x" ) >/dev/null 2>"$TMP/guard.err"
 RC=$?
