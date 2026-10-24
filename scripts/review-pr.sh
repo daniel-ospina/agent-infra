@@ -1756,7 +1756,7 @@ function clause_before(pre,   parts, n) {
   # `.`, `(`, `though`, `whereas`, so `fixed the P3 nit though 2 blocking defects remain` and
   # `fixed the P3 nit (2 blocking defects remain)` recorded a SIGNED clean record — the same leak round
   # seven fixed for `but`, one connector over). A full stop ends a clause as surely as a semicolon does.
-  n = split(pre, parts, /[.;:!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though)([[:space:]]|$)/)
+  n = split(pre, parts, /[.;:,!?()]|[[:space:]](and|but|however|yet|while|although|though|whereas|whilst|even though)([[:space:]]|$)/)
   return parts[n]
 }
 function repair_led(cl,   n, w, i, low) {
@@ -1782,10 +1782,14 @@ function repair_led(cl,   n, w, i, low) {
     if (low ~ /^clean([^[:alnum:]]|$)/) { sub(/^clean[^[:alnum:]]*/, "", low); continue }
   }
   if (low ~ ("^(" repair ")([^[:alnum:]]|$)")) return 1
-  # ⛔ OPTIONAL GROUPS, NEVER `{0,3}` (this lane, caught by mawk: the first version of this line used an
-  # interval expression, which mawk does not support — it compiled, matched nothing, and every legitimate
-  # repair on a verdict line went back to refusing)
-  if (low ~ ("^(the pr|this pr|the branch|this branch|we|i|it|that|both|all)" S S S "[[:space:]]+(" repair ")([^[:alnum:]]|$)")) return 1
+  # ⛔ THE BRIDGE IS A CLOSED AUXILIARY VOCABULARY, AND `that|both|all` ARE NOT SUBJECTS (P0, eleventh
+  # fresh review of #2288 — MEASURED: they are DETERMINERS, so `that fix leaves 2 blocking defects` and
+  # `both fixes leave …` matched with the bridge empty, and three free `[[:alpha:]-]+` bridge words let
+  # `I confirm the fix leaves …` and `we note the removed guard leaves …` through — five more signed
+  # clean records over stated blockers. Only a genuine subject plus auxiliaries may precede the verb.)
+  # ⛔ AND OPTIONAL GROUPS, NEVER `{0,3}` (mawk has no interval expressions: the first version of this
+  # line compiled, matched nothing, and every legitimate repair went back to refusing under mawk only)
+  if (low ~ ("^(the pr|this pr|the branch|this branch|we|i|it)[[:space:]]+(" AUX ")*(" repair ")([^[:alnum:]]|$)")) return 1
   return 0
 }
 BEGIN {
@@ -1806,7 +1810,7 @@ BEGIN {
   # `2 (P1) defects remain` each recorded a SIGNED clean record). `pnum` is the numeral OR a parenthesised
   # numeral, and the zero test strips the brackets before reading the number.
   # one optional alphabetic word, used for the subject-phrase bridge (see repair_led)
-  S = "([[:space:]]+[[:alpha:]-]+)?"
+  AUX = "(have|has|had|also|now|already|just|finally|then|both)[[:space:]]+"
   pnum = "([(][[:space:]]*(" num ")[[:space:]]*[)])|(" num ")"
   fwd = "(^|[^[:alnum:]])(" pnum ")([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]*[(][[:space:]]*p[0-3][[:space:]]*[)])?[[:space:]-]+(" noun ")([[:space:]-]+((was|is|are|were|has|have)[[:space:]-]+)?(" repair "))?"
   mir = "(^|[^[:alnum:]])(" noun ")([[:space:]]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]+[[:alpha:]][[:alpha:]-]*)?[[:space:]]*([:=]|[[:space:]][-–—])[[:space:]]*(" pnum ")"

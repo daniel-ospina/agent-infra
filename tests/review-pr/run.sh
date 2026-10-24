@@ -2510,7 +2510,12 @@ done
 for _cl in \
   '**Verdict:** CLEAN — the retry fix leaves 2 blocking defects unresolved.' \
   '**Verdict:** CLEAN — the removed guard leaves 1 blocking issue open.' \
-  '**Verdict:** CLEAN — the closed path leaves 2 blocking problems.'
+  '**Verdict:** CLEAN — the closed path leaves 2 blocking problems.' \
+  '**Verdict:** CLEAN — that fix leaves 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — both fixes leave 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — I confirm the fix leaves 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — we note the removed guard leaves 1 blocking issue open.' \
+  '**Verdict:** CLEAN — we fixed the nit, 2 blocking defects remain.'
 do
   reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
   run "$SRC" 2284
@@ -2783,6 +2788,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 799 ]; ck $? "assertion-count pin: >= 799 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 809 ]; ck $? "assertion-count pin: >= 809 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
