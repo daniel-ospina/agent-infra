@@ -76,11 +76,14 @@ for _wt_cand in "$O/worker-terminal.sh" "$(dirname "${BASH_SOURCE[0]:-$0}")/work
   [ -f "$_wt_cand" ] && { WT_MOD="$_wt_cand"; break; }
 done
 [ -n "${WT_MOD:-}" ] && . "$WT_MOD"
-# ⛔ The guard covers EVERY verb this script calls — `wt_launcher` (the startup/refusal line) and
-# `wt_count` (the final worker count) included, not only the three that look load-bearing: a module
-# that satisfies a narrower guard still leaves the controller printing `launcher=` and a false `0`.
-for _wt_v in wt_spawn wt_alive wt_close wt_launcher wt_count; do
-  command -v "$_wt_v" >/dev/null 2>&1 || { echo "dispatch-merge: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_close/wt_launcher/wt_count) — refusing to dispatch lanes that cannot be started or stopped; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"; exit 78; }
+# ⛔ The guard covers EVERY verb this script calls — `wt_launcher` (the startup/refusal line),
+# `wt_launcher_why` (which `wt_spawn` now calls to explain a `none` refusal) and `wt_count` (the final
+# worker count) included, not only the three that look load-bearing: a module that satisfies a narrower
+# guard still leaves the controller printing `launcher=` (with an EMPTY reason, the #2366 defect) and
+# a false `0`. ⚠️ The PARTIAL copy is the shape that bites — a wholly old module never references
+# `wt_launcher_why`, but a half-updated one does, and its refusal then ends `— why: `.
+for _wt_v in wt_spawn wt_alive wt_close wt_launcher wt_launcher_why wt_count; do
+  command -v "$_wt_v" >/dev/null 2>&1 || { echo "dispatch-merge: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_close/wt_launcher/wt_launcher_why/wt_count) — refusing to dispatch lanes that cannot be started or stopped; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"; exit 78; }
 done
 # ── the worktree/branch lifecycle (#2033) ─────────────────────────────────────────────────────
 # ⛔ SOURCED, NOT RE-IMPLEMENTED. Every lane worktree is created through `wt_provision`, which either

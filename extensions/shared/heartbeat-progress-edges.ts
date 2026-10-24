@@ -902,6 +902,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "#2032 — the age floor applied to a MERGED worktree head (default 0: merged is reclaimed the same day, because the merge is the proof the work landed and the tree is separately required to be clean). It REPLACES REAP_WT_AGED_DAYS for that row only; an UNMERGED head keeps the blanket floor, where age still separates a stale scratch checkout from work in progress. Set it equal to REAP_WT_AGED_DAYS to restore the pre-exemption behaviour. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used: the merge proves the work landed, and the tree is separately required to be clean, so age has nothing left to protect. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used. An UNMERGED head keeps the blanket floor — there age still separates a stale scratch checkout from work in progress. 0 restores the pre-exemption behaviour, so the exemption is visible and reversible rather than baked in.",
   },
   {
+    name: "REAP_WT_SCRATCH_AGE_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_SCRATCH_AGE_DAYS:-1}",
+    axis: "retention",
+    guardedBy: NONE,
+    note: "#2354 — the age floor for a LANE SCRATCH checkout (`wt-*` / `cell-wt-*` at any depth), 1 day. A dead lane's scratch dir is a throwaway, not the 7-day review surface a named issue branch is; the 7-day blanket floor held it (and its disk) for a week after the lane was gone, which is why the reaper reclaimed zero. It only ever CAPS DOWN (a value above the floor in force has no effect, so 14 cannot mean 'keep longer'), it never replaces a merged/patch-equivalent floor, and it touches AGE ONLY — every survival gate (clean / no live holder / no open PR / ref-holding) is unchanged, so a young-but-finished scratch dir is still reclaimed and an old-but-dirty one is not. Registered rather than exempted because it IS a retention bound in the same family as REAP_WT_AGED_DAYS/REAP_WT_MERGED_AGE_DAYS above, and a reader must be able to see the floor move.",
+  },
+  {
     name: "REAP_WT_MAX_DAYS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_MAX_DAYS:-1000000}",

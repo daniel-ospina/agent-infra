@@ -586,13 +586,15 @@ Two ordering rules in that contract are load-bearing, both measured (2026-10-22)
   not in tmux's `update-environment` list. So with a server in place, the credential must be in the
   worker's HOME/`keys.env` or in the server's own environment — either name, non-empty; else refused.
 
+A `none` verdict is **not** allowed to be mute: `wt_launcher_why` carries the probe's own answer (one call, stderr only) into the controller's `[startup]` line — `[startup] worker launcher=none (cmux=yes, uname=Linux) — cmux tree --json failed (rc=1): cmux: cmux-tui daemon binary not found at …` — and into `wt_spawn`'s `none` refusal (`REFUSED … — why: …`; the other thirteen `REFUSED` lines report their own failure directly and do not repeat it — fourteen in total, re-counted after the rebase onto main, which added four). Measured on cell-1, 2026-10-22 (agent-infra#2366): without it, `launcher=none` was indistinguishable from a tty gate, a `TERM` gate, a drifted probe shape or an absent daemon, and the diagnosis it was already holding took an investigation to re-derive. The suffix appears **only** for `none`; `tmux` on launchd and `terminal` on a cell are healthy states and are not stamped `failed:`. A `none` startup line costs **two** `cmux tree` calls (the verdict's and the reason's) — a pinned count, not a guess.
+
 There is **no env override** for the launcher: a gate an agent can defeat with an export is not a gate.
 (`WT_WORKER_HOME` is not a launcher override — it names the HOME that holds a worker's credentials, an
 input to the environment contract.)
 Around the spawn, three properties hold:
 
 - **the concurrency caps still bind** — `wt_count` reads ONE census (`cmux tree --json` plus the tmux
-  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s, because every caller reads it
+  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s (the absent-owner confirmation window is `WT_ABSENT_CONFIRM=60`s — overridable, but `0` is NOT "off": it is coerced to 60, because zero would confirm on ONE sample), because every caller reads it
   through a command substitution), and a worker is identified the way its launcher named it: by the
   `wt-<worker>` workspace for the layout grammar, and by its **terminal id** (recorded at spawn) for
   `surface new-terminal`, which takes no name. Its polarity is fail-CLOSED in BOTH halves: a `cmux
@@ -602,8 +604,12 @@ Around the spawn, three properties hold:
   ⛔ **but "cannot be read" is not "is not there", and the difference is the whole census.** An
   ABSENT session owner is a *reading*, not an unreadable one: a terminal lives inside the session
   owner, so `cmux tree` answering `cannot connect to session socket …: Connection refused` (empty
-  stdout, nothing listening) means no durable terminal exists, and its records are **dead** — the same
-  polarity the tmux half already applies to `no server running`. A daemon that ANSWERS with something
+  stdout, nothing listening) means no durable terminal exists, and once that answer is **CONFIRMED —
+  two samples at least `WT_ABSENT_CONFIRM` (default 60 s) apart** — its records are **dead**; a single
+  refusal only opens the window and keeps the caps binding (a hard-killed owner leaves pty children
+  behind, and a restart window is seconds), while a readable census — or a successful terminal spawn,
+  which proves the owner answered — or ANY answer that is neither readable nor absent (a banner, the `cannot connect …: No such file or directory` wrapper) closes it again, and a stamp older than `WT_ABSENT_STALE_MIN` = **max(4×`CYC`, 2×`WT_ABSENT_CONFIRM`)** (never narrower than the window) — or one dated in the future — is treated as a first sample rather than a confirmed one. This is the same polarity the tmux half already
+  applies to `no server running`. A daemon that ANSWERS with something
   undecodable (a banner, a drifted shape, `cmux: cannot read`) is still UNKNOWN and still pins every
   cap. Without that distinction there is no bound anywhere between "unreadable" and "slot held":
   measured 2026-10-24, a dead daemon left 18 stale worker records counted as 18 live workers for 26h,
@@ -639,7 +645,7 @@ kill is retried next cycle instead of being counted.
 |---|---|---|
 | `tmux` | the worker surface on macOS (the launchd surface) **and on a Linux cell** (where the guest cmux CLI cannot run), and half of the liveness census | `brew install tmux`. ⛔ A cloud cell DOES use it for workers — with the environment contract (`HOME` + `keys.env`); a tmux worker started without that contract is the measured `~21 log lines` death, and `worker-terminal.sh` refuses that spawn rather than starting it (see §2.1) |
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
-| `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in the shared `run_agent` (`spawn-gate.sh`, sourced by `lane.sh`/`fix-one.sh`) and in `merge-one.sh` — change them there |
+| `pi` on `PATH` | the worker runtime (`pi -p --provider ${PI_LANE_PROVIDER:-deepseek} --model ${PI_LANE_MODEL:-deepseek-flash}`) | the resolved default is `deepseek/deepseek-flash` — an id that exists (agent-infra#2208). Both halves are **env-overridable** (`PI_LANE_PROVIDER`, `PI_LANE_MODEL`), read in the shared `run_agent` (`spawn-gate.sh`, sourced by `lane.sh`/`fix-one.sh`/`nonblocking-dispatch.sh`) **and** in `merge-one.sh`'s own `run_agent` (the `chain-<N>` first-review path), which deliberately default identically — set them **in `keys.env`**, because the controller and doctor sessions re-source that file and do not inherit an ambient export. The resolved pair is written to each lane's log as `[agent] provider=… model=…`, and `cloud-cell-supervisor.sh check` REPORTS the pair and whether the box's `models.json` lists it. That report never refuses: pi merges its own built-in catalog with the box's list (and `modelOverrides`), so absence from the file is not proof the id fails — `pi --list-models <id>` is the authority |
 | `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
 | `python3` | `orch-loop.sh`'s required-check classifier and `fix-one.sh`'s failing-check list | absent, the classifier returns an empty verdict, no case arm matches, and **every PR is skipped in silence** |
 | `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra`; **gate mode only** — a repo that does not require the gate consumes no such marker, so `merge-one.sh` does not mint one there. A cell's `start` provisions it when the cell has none — see below |
@@ -3715,6 +3721,54 @@ the cells: `check` printed `CELL CAN RUN A CONTROLLER` over a tree that was not 
 and over a copy whose bytes matched `main` but which carried no git identity. The laptop is the
 same class with a worse starting point — no record at all — so its absence fails the check loudly
 instead of reading as healthy.
+
+### The Mac runs the PIN, not a home-dir copy (agent-infra#2231)
+
+**The defect, in one line.** The launchd job exec'd `$O/orch-loop.sh` — `~/orchestrator/orch-loop.sh`,
+a **copy** of a script this repo carries, in a directory that is not a git checkout at all
+(`git rev-parse --show-toplevel` there → `fatal: not a git repository`). The cells never had it: they
+exec `<pin root>/<sha12>/scripts/orchestrator-harness/orch-loop.sh`, a detached worktree **at the
+pinned commit**, recorded in `HARNESS-PIN`. So the Mac was the one machine whose harness identity had
+no answer — and the one whose fixes could vanish.
+
+**The parity table, as measured against the paths the Mac was configured to exec.** "In the repo" is
+a `file:line` for the *content*; the third column is the question that matters — whether the path the
+job NAMES is a tree the repo can be pinned to.
+
+| what the Mac runs | path it was configured with | the same content in the repo? | repo version vs the Mac's copy |
+|---|---|---|---|
+| controller program (`com.eldato.orchestrator-loop`) | `~/orchestrator/orch-loop.sh` | yes — `scripts/orchestrator-harness/orch-loop.sh` (named by `launchd.plist.template:11` **before** this change) | **stale**: `$O` is a deploy snapshot with no commit; the deployed copy measured behind main in `check-deployed-drift.sh` |
+| the controller's entrypoint *on this box's installed plist* | `~/orchestrator/launchd-controller.sh` | **NO — absent from every commit** (`docs/ops/ACTIVATION-MATRIX.md:43`, `git ls-tree origin/main` → absent) | home-only; the tmux/Full-Disk-Access wrapper §3.1 of `docs/ops/fleet-harness-baseline.md` describes; lifted by **PR #2020 (open, conflicting)** |
+| the 21 helpers the controller sources (`claims.sh`, `merge-one.sh`, …) | `~/orchestrator/<name>.sh` | yes — same directory | **stale** in both directions; `install.sh`'s `DRIFTED` list names them, and it only WARNS |
+| `~/Library/LaunchAgents/com.eldato.orchestrator-watchdog.plist` → `~/orchestrator/watchdog.sh` | absolute home path in the plist | **NO template ships it** — `git grep -l orchestrator-watchdog -- templates/launchd` → 0 (`ACTIVATION-MATRIX.md:44`) | home-only |
+| the beat's classifier | `~/.pi/agent/scripts/lane-status.py` | yes — `scripts/lane-status.py`, which now **carries the #1777 liveness text** (commit `7728022e`) | repo **current**; the farm exemption that says the live copy is ahead (`pi-bootstrap/setup.sh:394`, `tests/test-setup-no-nesting.sh:423`) is **stale in its reason** |
+| the beat loop / pr-doctor | `~/.pi/agent/scripts/heartbeat-loop.sh`, `pr-doctor.py` | yes — `scripts/heartbeat-loop.sh`, `scripts/pr-doctor.py` | byte-identical at the last measurement (`test-setup-no-nesting.sh:427`) |
+| `~/orchestrator/orchestrator-heartbeat.sh` (`com.eldato.harness-heartbeat`) | resolved from `$O` first (`RESOLVER_SET` in `scripts/orchestrator-bringup.sh`) | yes — `scripts/orchestrator-heartbeat.sh` | **stale** whenever `$O` is |
+| **`~/.cache/orc/main-orch-loop.sh`** | outside any `$O`, any pin and any installer | **NO — ZERO references in the repo** (`grep -rn 'main-orch-loop' .` → 0) | **worst row**: a controller-shaped script nothing in the repo creates, names, or replaces |
+
+**The two halves of the fix, and why it is not a second launcher.**
+
+1. **`install.sh` resolves the PIN and refuses anything else.** Before rendering, it reads the two
+   records the cells read — `.harness-path` (the dir) and `~/.pi/agent/state/HARNESS-PIN` (the sha) —
+   and requires the resolved directory to be a **`git worktree` at that commit** carrying
+   `orch-loop.sh`. When no pin is recorded it **materialises one through the cells' own materialiser**
+   (`cloud-cell-supervisor.sh apply --force --pin-only`); when the resolved dir is a copy, a different
+   commit, unreadable, or unexaminable, it **refuses (rc=78) naming both paths**. After rendering it
+   parses the plist back and refuses unless the `ProgramArguments` program IS
+   `<pin>/<entrypoint>`. The render therefore cannot name `$O`, `~/orchestrator` or `~/.cache/orc`,
+   and `$O` keeps its real job — the **worker** surface, exactly as on a cell.
+2. **`scripts/harness-up` gained a `box` row**, so `harness-status` names the machine AND the pin sha it
+   runs (`box | <host> | <sha12> | OK (darwin via scutil ComputerName; harness <pin dir>)`). The Mac is
+   now one of the boxes that answers "which harness?" in the same shape as a cell, instead of the
+   exception that printed `pin: SKIPPED (no pin machinery on this box)`.
+
+**What is deliberately NOT done here.** `deploy-mac-orchestrator.sh` still copies a staged tree into
+`$O` by `git archive` — it is the *worker* seed and it is idempotent; the controller no longer reads
+`$O`, so it can no longer be the thing that runs. And when a box's live entrypoint
+(`launchd-controller.sh`) is not in the pinned tree, the installer **refuses** rather than rendering
+the pin's `orch-loop.sh`: moving a Mac off that wrapper would silently drop the TCC workaround, so the
+content has to land (PR #2020) before the pin may replace it — the "do not delete before it is landed"
+rule, enforced mechanically.
 
 **Portability edits applied to the shipped loop.** Three per-box constants became overridable — with
 this box's values still the default for `OR` and `O`, and **no default in the scripts that refuse

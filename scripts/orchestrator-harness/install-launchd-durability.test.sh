@@ -885,8 +885,15 @@ ORUN() { # <extra args…>
   # ("no raw shell escaped into the banner text — unexpected: printf"). Measured while fixing #2102
   # on a box that exports the key; a clean CI runner has it unset, so the flake is local-only and was
   # never seen. The empty value selects the same "absent" branch as an unset one (`[ -n … ]`).
+  # ⛔ HARNESS=NOW REQUIRED, AND IT IS THE CHECKOUT ITSELF (agent-infra#2231). The installer no longer
+  # renders `$O/orch-loop.sh`; it renders the PINNED tree's program, so it must resolve a git worktree
+  # or REFUSE. Naming this checkout explicitly is the documented "pin a deliberate checkout" route: it
+  # is a real worktree with a HEAD, so the installer MENDs the two pin records under the sandbox HOME
+  # ($SHOME/.harness-path, $SHOME/.pi/agent/state/HARNESS-PIN) — read-only git, no worktree created,
+  # nothing outside $T is touched. Without it the materialiser would run `git worktree add` against
+  # THIS repository, which a test must never do.
   env HOME="$SHOME" O="$T/o" REPO="$(cd "$HARNESS/../.." && pwd)" OR="acme/widget" \
-    AI_REVIEW_GATE_KEY= \
+    HARNESS="$HARNESS" \
     ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLIST" \
     AI_REVIEW_GATE_KEY= \
     PATH="$SHOME/.local/share/pi-node/current/bin:$T/bin:$PATH" \
