@@ -166,8 +166,27 @@ OWNERSHIP_NOTE = ""
 # and `SNAPSHOT`/`SNAPSHOT_MAX_AGE_S` its published roster. This file spawns load-gated workers
 # instead and reads no roster at all, so the constants went with the path that used them -- a
 # constant nobody reads is how a retired path still looks alive.
-REPO = "daniel-ospina/tortoise"
-REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
+# ⛔ THE TARGET IS TWO FACTS, AND ON A CELL NEITHER HAD A WAY IN (agent-infra#2716, #1974).
+# Both were literals: the slug, and `$HOME/Documents/GitHub/tortoise`. On the Mac that path is the
+# checkout, so nothing was ever missing. On a Linux cell `HOME` is `/tmp/cell-home`, so
+# `REPO_DIR` resolved to a directory that does not exist -- `WORKTREE_ROOT` (below), every
+# `git -C REPO_DIR` read and every worktree `add` then failed on a path invented by two shipped
+# defaults, while the cell's actual checkout sat at `/tmp/cell-t3` (the fleet partition's own
+# record: `docs/ops/fleet-harness-baseline.md`, and #2700's per-cell table). A repair loop that
+# points at a non-existent checkout does not crash loudly: it reads nothing and reports
+# `UNREADABLE`, which is exactly the ALIVE/REFUSING/IDLE confusion #2700 exists to remove.
+#
+# So the same seam `objective.py` already grew for the SLUG (`OBJECTIVE_REPO`) is grown here for
+# both facts, and a caller that sets neither gets the previous behaviour byte for byte (the
+# property `scripts/pr-repair-loop.test.sh`'s "pr-doctor's repo seams" block pins — NOT
+# `test_pr_doctor.py`, which only monkeypatches the attributes and never asserts these literals).
+# ⛔ `OBJECTIVE_REPO` IS NOT READ HERE: the classifier reads it, and a caller that wants one repo for
+# both must set both -- which is why `pr-repair-loop.sh` exports the pair together rather than
+# deriving one from the other. Deriving would make a box's dispatch and its classification silently
+# disagreeable again (#1872).
+REPO = os.environ.get("PR_DOCTOR_REPO") or "daniel-ospina/tortoise"
+REPO_DIR = (os.environ.get("PR_DOCTOR_REPO_DIR")
+            or os.path.join(HOME, "Documents", "GitHub", "tortoise"))
 
 
 # ⛔ THE DISPATCH REGISTER BELONGS TO ONE REPO, AND THE FILE NAME IS THE ONLY THING THAT SAYS SO
