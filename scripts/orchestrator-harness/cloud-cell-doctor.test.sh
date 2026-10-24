@@ -1427,25 +1427,43 @@ done <<<"$ROLES"
 # were filed `derived` — ungraded ✅ notes — even though both are bare reads that die on an absent
 # argument. `derived` is now an ANNOTATION printed under the verdict (the value embeds the positional
 # in a path or a concatenation), never a bucket that suppresses grading.
-# ⛔ THE COMMENT STRIP IS QUOTE-AWARE (review P1). Stripping at the first whitespace-plus-`#` on the
-# line also truncated a value that CONTAINS that sequence: `local what="reap #$1 lane"` lost the read
-# from the scan AND from the count in one stroke, so no record and no `unparsed` — PASS=230, identical
-# to baseline, over a binding that dies under `set -u`. Because one string now feeds both halves, a
-# strip that is wrong is wrong twice. The scan therefore cuts only at a `#` that is preceded by
-# whitespace AND is OUTSIDE quotes; `="#ff"` stays intact either way.
-strip_comment() {
-  printf '%s\n' "$1" | awk '
-    { out = ""; qd = 0; qs = 0
-      for (i = 1; i <= length($0); i++) {
-        c = substr($0, i, 1)
-        if (c == "\\" && i < length($0)) { out = out c substr($0, i + 1, 1); i++; continue }
-        if (c == "\"" && !qs) qd = 1 - qd
-        else if (c == "\047" && !qd) qs = 1 - qs
-        if (c == "#" && !qd && !qs && i > 1 && substr($0, i - 1, 1) ~ /[ \t]/) break
-        out = out c
-      }
-      print out }'
+# ⛔ THE COMMENT STRIP IS QUOTE-AWARE, AND QUOTE TRACKING MUST MODEL `$( )` (review P1, twice).
+# Stripping at the first whitespace-plus-`#` truncated a value that CONTAINS that sequence
+# (`local what="reap #$1 lane"`): the read vanished from the SCAN and from the COUNT in one stroke, so
+# no record and no `unparsed` — PASS identical to baseline over a binding that dies under `set -u`.
+# A simple quote TOGGLE then failed the same way one level down: in
+# `local ok="$(printf %s " #pad")" n="$1"` the inner quote closes the toggle, but bash re-quotes
+# INSIDE `$( )`, so the strip fired and the line produced no record at all. This is therefore a state
+# machine with a DEPTH STACK: entering `$( )` saves the quoting state and starts unquoted, and the
+# matching `)` restores it. A `#` is a comment only at depth 0, unquoted, preceded by whitespace.
+# The program is written once to a file because it needs both quote characters, which cannot be nested
+# inside the shell's own quoting without becoming unreadable.
+STRIP_AWK="$T/strip-comment.awk"
+cat > "$STRIP_AWK" <<'AWK'
+{
+  out = ""; q = ""; depth = 0; n = length($0); i = 1
+  while (i <= n) {
+    c = substr($0, i, 1)
+    if (q == "'") { out = out c; if (c == "'") q = ""; i++; continue }
+    if (c == "\\" && q != "'") { out = out c substr($0, i + 1, 1); i += 2; continue }
+    if (q == "\"") {
+      if (c == "\"") { q = ""; out = out c; i++; continue }
+      if (c == "$" && substr($0, i + 1, 1) == "(") { stk[depth] = q; depth++; q = ""; out = out "$("; i += 2; continue }
+      out = out c; i++; continue
+    }
+    if (q == "`") { out = out c; if (c == "`") q = ""; i++; continue }
+    if (c == "\"") { q = "\""; out = out c; i++; continue }
+    if (c == "'") { q = "'"; out = out c; i++; continue }
+    if (c == "`") { q = "`"; out = out c; i++; continue }
+    if (c == "$" && substr($0, i + 1, 1) == "(") { stk[depth] = q; depth++; out = out "$("; i += 2; continue }
+    if (c == ")" && depth > 0) { depth--; q = stk[depth]; out = out c; i++; continue }
+    if (c == "#" && i > 1 && substr($0, i - 1, 1) ~ /[ \t]/ && depth == 0) break
+    out = out c; i++
+  }
+  print out
 }
+AWK
+strip_comment() { printf '%s\n' "$1" | awk -f "$STRIP_AWK"; }
 audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a `derived` note
   local body="$1" assign var val rd seen=0 alln=0
   # ⛔ ONE STRING FOR BOTH THE SCAN AND THE COUNT (review P1). The count used to strip a trailing
@@ -1524,6 +1542,7 @@ bare|local x="$1$2"
 bare|local n="${#1}"
 bare|local n="${!1}"
 bare|local what="reap #$1 lane"
+bare|local ok="$(printf %s " #pad")" n="$1"
 bare|local d="$1" tmp="$1/.own.tmp.$$"
 EOF
 # …and the FAIL-CLOSED shape: a positional the assignment parse cannot attribute must be REPORTED,
@@ -1566,7 +1585,10 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # ⛔ AND A TRAILING COMMENT BEFORE A NEXT-LINE BRACE (review P1, reproduced): `ZzFutureHelper()  #
   # note` + `{` on the following line is bash-legal, and an EOL-anchored next-line arm missed it, so
   # the read resolved to the PRECEDING function and PASS went 230→231 with the mutant's read ✅ under
-  # `run_bounded`. Both arms therefore accept an optional trailing comment.
+  # `run_bounded`. Both arms therefore accept an optional trailing comment — and the comment arm is
+  # `#.*`, not `#[^"]*`: a comment containing a quote (`# it says "hi"`) is still a comment, and with
+  # the narrower class that header was invisible too (review P1). The parens are `\([[:space:]]*\)`
+  # because `name( ) {` is bash-legal as well.
   # ⛔ IT IS "NEAREST PRECEDING", NOT "INNERMOST ENCLOSING" (review P2): there is no brace tracking,
   # so a line that comes AFTER a nested helper has closed still resolves to that helper. Today's two
   # nested helpers both sit after their function's only positional binding, so nothing is
@@ -1581,7 +1603,7 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # ⛔ AND IT IS CHECKED BOTH WAYS (fail-closed): a line that LOOKS like a definition by the BROAD
   # pattern but does not yield a name by the NARROW one is a header this resolver cannot attribute,
   # so it is reported rather than skipped — the same doctrine as `unparsed` for reads.
-  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\(\)([[:space:]]*\{|[[:space:]]*(#[^\"]*)?$)|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*\{|[[:space:]]*(#[^\"]*)?$)' "$file" | cut -d: -f1); do
+  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*\{|[[:space:]]*(#.*)?$)|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*\{|[[:space:]]*(#.*)?$)' "$file" | cut -d: -f1); do
     [ "$ln" -le "$want" ] || break
     best="$ln"
   done
@@ -1606,8 +1628,10 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   printf 'zz-dashed-name() {\n  local s="$1"\n}\n'
   printf 'ZzNextLine()\n{\n  local s="$1"\n}\n'
   printf 'ZzCommentBrace()  # a note\n{\n  local s="$1"\n}\n'
+  printf 'ZzSpacedParen( ) {\n  local s="$1"\n}\n'
+  printf 'ZzQuotedComment()  # it says "hi"\n{\n  local s="$1"\n}\n'
 } > "$T/hdr.sh"
-for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name ZzNextLine ZzCommentBrace; do
+for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name ZzNextLine ZzCommentBrace ZzSpacedParen ZzQuotedComment; do
   _got="$(func_for "$T/hdr.sh" "$(grep -nE "^[[:space:]]*(function[[:space:]]+)?${_want//-/\\-}" "$T/hdr.sh" | cut -d: -f1 | head -1)")"
   [ "$_got" = "$_want" ] && ok "func_for: header '$_want' resolves to itself (not to the preceding 'outer_fn')" \
     || bad "func_for: header '$_want' resolved to '${_got:-<nothing>}' — a read under it would be graded against the wrong function's allowlist"
@@ -1642,7 +1666,7 @@ audit_grade() { # <file> <emit 1|0>
       invented)  bad_n=$((bad_n + 1))
                  [ "$emit" = 1 ] && bad "audit: $fn:$var (line $ln) defaults $rd to a NON-EMPTY value — absent must not invent a mode (a rehearsal would arm itself)" ;;
       unparsed)  bad_n=$((bad_n + 1))
-                 [ "$emit" = 1 ] && bad "audit: $fn (line $ln) has a positional read the assignment scan CANNOT ATTRIBUTE — the read sits outside the quoted value it is looked for in (a split value like \"$D\"/\"$1.x\", a literal in single quotes, or an arithmetic). Rewrite it as one \"…$N…\" token so it can be judged; an unattributed read is ungraded" ;;
+                 [ "$emit" = 1 ] && bad "audit: $fn (line $ln) has a positional read the assignment scan CANNOT ATTRIBUTE — the read sits outside the quoted value it is looked for in (a split value like \"\$D\"/\"\$1.x\", a literal in single quotes, or an arithmetic). Rewrite it as one \"…\$N…\" token so it can be judged; an unattributed read is ungraded" ;;
       derived)   AUDIT_DER=$((AUDIT_DER + 1))
                  [ "$emit" = 1 ] && ok "audit: $fn:$var (line $ln) EMBEDS $rd in a larger value — a note; it is graded above, not excused" ;;
       *)         AUDIT_BARE=$((AUDIT_BARE + 1))
