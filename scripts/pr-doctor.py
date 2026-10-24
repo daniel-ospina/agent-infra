@@ -129,6 +129,11 @@ STATE = os.path.join(STATE_DIR, "pr-doctor.json")
 # ⛔ THE IMPORT-TIME SNAPSHOT ONLY -- DO NOT USE FOR I/O (see `_log_path()`): a writer that reads
 # this constant writes the REAL log no matter what `STATE_DIR` was redirected to.
 LOG = os.path.join(STATE_DIR, "pr-doctor.log")
+# ⛔ THE NAME `log()` ACTUALLY WRITES IS THIS ONE, AND IT IS LATE-BOUND ON PURPOSE. `_log_path()`
+# joins `STATE_DIR` with it AT CALL TIME, so a per-repo pass can write its own file without
+# freezing a directory -- which is the measured defect `_log_path()`'s docstring records. It is a
+# NAME, not a path, so redirecting `STATE_DIR` still redirects the write.
+LOG_BASENAME = "pr-doctor.log"
 # ⛔ THE PASS VERDICT, WHERE A READER THAT IS NOT launchd CAN SEE IT (2026-10-18).
 # `com.tortoise.pr-doctor` exits non-zero on every refusal, and that code is recorded by launchd,
 # but NOTHING in the fleet reads it: the two launchers are a detached heartbeat child (whose own
@@ -521,8 +526,16 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
     so a doctor scoped without it would read repo A's queue and repo B's checks, i.e. every head
     would be a 404 and every PR would classify blind. The state paths move too when more than one
     repo is graded in one process, so two repos' PR #42 cannot share a cooldown row.
+
+    ⛔ AND THE RUBRIC IS A SECOND FACT ABOUT A REPO, WHICH THIS FUNCTION CANNOT INVENT (see the
+    block comment on `_RUBRIC_REPO`). `objective.py`'s `REQUIRED` / `GATED_CHECKS` /
+    `SURFACE_PATHS` are that repo's declaration; moving `REPO` without them made a pass for repo B
+    judge B's queue by tortoise's declaration. So the rubric is NOT moved here -- an invented one
+    would be the same defect mirrored -- `contract_note()` decides OUT LOUD whether the rubric in
+    force belongs to `slug`, the answer is logged, and `dispatch()` refuses when it does not.
     """
-    global REPO, REPO_DIR, REPO_DIR_ERROR, WORKTREE_ROOT, STATE, STATUS, LOG, _WORKER_TAG
+    global REPO, REPO_DIR, REPO_DIR_ERROR, WORKTREE_ROOT, STATE, STATUS, LOG, LOG_BASENAME
+    global _WORKER_TAG
     REPO = slug
     REPO_DIR = checkout or ""
     WORKTREE_ROOT = os.path.join(REPO_DIR, ".worktrees") if REPO_DIR else ""
@@ -535,12 +548,18 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
         STATE = os.path.join(STATE_DIR, "pr-doctor.%s.json" % tag)
         STATUS = os.path.join(STATE_DIR, "pr-doctor.%s.status.json" % tag)
         LOG = os.path.join(STATE_DIR, "pr-doctor.%s.log" % tag)
+        # ⛔ THE LOG'S NAME MOVES THROUGH `LOG_BASENAME`, because `LOG` above is the import-time
+        # snapshot this file's own comment says must not be used for I/O: `log()` never read it,
+        # so every repo in a set appended to the ONE canonical file while the README promised a
+        # per-repo one.
+        LOG_BASENAME = "pr-doctor.%s.log" % tag
         _WORKER_TAG = tag + "-"
     else:
         # ⛔ A SINGLE-REPO PASS TOUCHES NO PATH. Its state/status/log ARE the canonical files, so
         # re-deriving them here would overwrite a caller's seam (`STATE_DIR`, `STATUS`) with a
         # second opinion about where they live -- the same "two authorities for one path" defect
         # `--status` was just given a single reader for.
+        LOG_BASENAME = "pr-doctor.log"
         _WORKER_TAG = ""
     # ⛔ THE AMBIENT SELECTOR IS PINNED TO THE RESOLVED REPO, IN THAT DIRECTION ONLY. Inheriting it
     # is the #2235 hazard; OVERRIDING it with the repo evidence already selected is safe, and it is
@@ -552,6 +571,9 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
     os.environ["GH_REPO"] = slug
     log("repo: %s (from %s; checkout %s)" % (slug, source, REPO_DIR or
                                               "NONE -- queue only, nothing can be spawned"))
+    # The rubric gets its own line: "which repo" and "judged by whose declaration" are two facts,
+    # and a pass that reports only the first cannot be audited for the second.
+    log(rubric_report())
 
 
 def worker_name(number) -> str:
@@ -635,6 +657,86 @@ GH = getattr(CLASSIFIER, "GH_BIN", "") or shutil.which("gh") or "gh"
 # that #1872 pinned a binary for. CLASSIFIER computed the pin; pass it through so this process keeps
 # calling that binary and still gets serialisation and the documented backoff.
 GH_LAYER_ENV = dict(getattr(CLASSIFIER, "GH_LAYER_ENV", {}) or {})
+
+# ⛔ THE REPO'S RUBRIC IS A SECOND FACT, AND THIS FILE MAY NOT ASSUME IT (review P1). `apply_repo()`
+# moves `REPO` on both sides, but `objective.py` ALSO holds the rubric every PR is judged by:
+# `REQUIRED` (its `REQUIRED_DEFAULT` -- seven TORTOISE contexts), `GATED_CHECKS` (= REQUIRED minus
+# `ai-review-gate`) and `SURFACE_PATHS` (tortoise's human-gated files). Moving only `REPO` means a
+# pass for another repo reads ITS queue and judges it by ANOTHER repo's declaration. MEASURED on
+# this tree with `apply_repo("daniel-ospina/agent-infra")` and an all-green, clean-attested check
+# list: `classify_pr` -> `rerun-checks`, i.e. the doctor dispatches a *re-trigger* at a fully green
+# PR (the six tortoise names are always `gated_absent`), `call-rail`/`record-review` are unreachable
+# for that repo at all, and `touches_surface()` is always False -- so a diff on the human-gated
+# surface is handed to the automated lander instead of to the owner.
+#
+# ⛔ SO THE RUBRIC'S SCOPE IS DECIDED PER PASS, OUT LOUD, AND THE ANSWER IS A NOTE, NOT A GUESS.
+# The seam that supplies a repo's own rubric already exists and is `objective.py`'s:
+# `OBJECTIVE_REQUIRED` (comma-separated contexts) and `OBJECTIVE_SURFACE` (comma-separated paths).
+# When they are supplied, the rubric IS the operator's declaration for any slug and nothing is
+# refused. When they are not, the built-ins are in force, and they describe exactly ONE repo -- the
+# one `objective.py`'s `REQUIRED_DEFAULT` comment names -- so ANY OTHER repo gets a note
+# (`contract_note()`, DERIVED from the resolved slug, never stored) and this file REFUSES TO
+# DISPATCH for it (`dispatch()`), instead of dispatching a wrong order it cannot check. The queue is still graded: that measurement is the one the fleet keeps losing,
+# and "I graded it and placed nothing, because I do not know its rubric" is a report.
+#
+# ⛔ WHY NOT READ BRANCH PROTECTION HERE. That read has ONE owner in this tree --
+# `scripts/orchestrator-harness/repo-authority.sh` -- and `objective.py` already consumes its answer
+# through the seam above. A second reader in this file could disagree with the merge rail about what
+# a repo requires, which is the #1764 defect that file exists for. Wiring the per-repo declaration
+# is agent-infra#2518; one doctor instance per repo is #2281.
+# ⚠️ DECLARED RESIDUAL: the seams are MACHINE-wide, so one `--all-repos` set cannot describe two
+# repos at once -- a set grading a repo whose rubric was not supplied is read-only by design.
+_RUBRIC_REPO = "daniel-ospina/tortoise"      # the repo `REQUIRED_DEFAULT` describes, NOT a target
+
+
+def _rubric_supplied() -> bool:
+    """True when the operator supplied a rubric through `objective.py`'s own seams.
+
+    Same rule as `objective._required_from_env()`: an EMPTY or whitespace-only value is "not
+    supplied", never "this repo requires nothing" -- the latter would make every PR
+    `call-rail`-eligible.
+    """
+    return bool((os.environ.get("OBJECTIVE_REQUIRED") or "").strip()) and bool(
+        (os.environ.get("OBJECTIVE_SURFACE") or "").strip())
+
+
+def contract_note(slug: str) -> str:
+    """Why the rubric this process holds is NOT `slug`'s ("" when it is, or when nothing is graded).
+
+    ⛔ IT IS DERIVED FROM THE RESOLVED SLUG, NEVER STORED. A module flag would be a second copy of
+    "which repo is this pass about", and the class of defect this file keeps removing is two
+    authorities for one fact: a leftover flag refuses (or worse, ALLOWS) the NEXT repo's dispatch
+    for a reason about a different repo -- measured here, it took 13 dispatch tests red before the
+    derivation replaced it.
+
+    The failure this prevents is a confident verdict about a declaration nobody read: without it,
+    `apply_repo('daniel-ospina/agent-infra')` classifies every PR by tortoise's seven required
+    contexts (`rerun-checks` at a fully green PR) and `touches_surface()` is always False.
+    """
+    if not slug:
+        return ""                       # nothing is being graded: no rubric to be wrong about
+    if _rubric_supplied():
+        return ""                       # the operator declared it; it applies to whatever slug
+    if slug.strip().lower() == _RUBRIC_REPO:
+        return ""                       # the built-ins ARE this repo's rubrics by construction
+    return ("the required-check set and human-gated surface paths %s is judged by are NOT supplied "
+            "to the classifier, and inheriting %s's would grade every PR by a declaration nobody "
+            "read (every green PR would classify `rerun-checks`, and `touches_surface()` would be "
+            "always False, so a surface-touching diff would go to the automated lander). Nothing "
+            "is dispatched for %s; its queue is still graded. Fix: supply "
+            "OBJECTIVE_REQUIRED='<ctx>,<ctx>' and OBJECTIVE_SURFACE='<path>,<path>'. "
+            "Tracked: agent-infra#2518" % (slug, _RUBRIC_REPO, slug))
+
+
+def rubric_report() -> str:
+    """The one line a pass logs about the rubric it is judging by -- and whose it is."""
+    note = contract_note(REPO)
+    if note:
+        return "rubric: REFUSING TO DISPATCH -- %s" % note
+    return ("rubric: required=%s surface=%s (from %s)"
+            % (",".join(getattr(CLASSIFIER, "REQUIRED", ()) or ()) or "none",
+               ",".join(getattr(CLASSIFIER, "SURFACE_PATHS", ()) or ()) or "none",
+               "the OBJECTIVE_* seams" if _rubric_supplied() else "objective.py built-ins"))
 
 # Guards
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
@@ -836,7 +938,13 @@ def _log_path() -> str:
     live job was being written by a test suite, and nothing in it said so. `STATUS` is NOT affected:
     tests patch it directly, so `record_exit` keeps honouring that seam.
     """
-    return os.path.join(STATE_DIR, "pr-doctor.log")
+    # ⛔ AND THE NAME IS RESOLVED HERE, FROM `LOG_BASENAME`, FOR THE SAME REASON ONE FIELD OVER.
+    # `apply_repo(multi=True)` used to assign a per-repo `LOG` that NOTHING read (`log()` went
+    # straight through this function), so every repo in an `--all-repos` set appended to the ONE
+    # canonical file while the README told an operator to look in
+    # `pr-doctor.<owner>-<name>.log`. Late-binding the NAME fixes that without reintroducing a
+    # frozen path: the directory is still read from `STATE_DIR` at call time.
+    return os.path.join(STATE_DIR, LOG_BASENAME)
 
 
 def log(msg: str) -> None:
@@ -2254,7 +2362,7 @@ later pass refuse this PR. Instead: make the change, verify it, and put the exac
 2. Get it REVIEWED in a fresh context: dispatch a `task` sub-agent (NEVER review your own work).
    Only a verbatim `NO ISSUES FOUND` is clean. Issues found -> fix -> RE-REVIEW.
 3. RECORD at the CURRENT head:
-   `scripts/record-review.sh {n} <HEAD_SHA> clean daniel-ospina/tortoise --evidence comment:<ID>`
+   `scripts/record-review.sh {n} <HEAD_SHA> clean {repo} --evidence comment:<ID>`
 4. MERGE it: `scripts/admin-merge.sh {n}`
 
 ⛔ Recording a review is NOT merging. Stopping between step 3 and 4 is what left PRs sitting for
@@ -2264,7 +2372,7 @@ later pass refuse this PR. Instead: make the change, verify it, and put the exac
 ⛔ If a check fails AFTER your fix: fix it again and continue. **Fixing is the normal path, not a blocker.**
 ⛔ `ai-review-gate=failure` is EXPECTED on a fresh PR and clears only by recording.
    `BLOCKED` / `UNSTABLE` merge states on a ready PR are NORMAL and are not reasons to hold.
-{push}""".format(n=n, push=push)
+{push}""".format(n=n, push=push, repo=REPO)
 
     if action == "call-rail":
         return """# MERGE #{n} — nothing else is needed
@@ -2641,6 +2749,16 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bo
     """
     n = pr["number"]
     name = worker_name(n)
+    # ⛔ AN UNKNOWN RUBRIC IS A REFUSAL, NOT A GUESS (see `contract_note()`). Every action this pass
+    # could order is DERIVED from a classification made against `REQUIRED`/`SURFACE_PATHS`, so if
+    # those describe another repo then every order in this pass is wrong in the same direction --
+    # `rerun-checks` at a green PR, and a surface-touching diff handed to the automated lander.
+    # This is a GATE-class refusal (`record=False`): it consumes nothing, records no cooldown row,
+    # and a pass that then places nothing reports EXIT_UNDELIVERABLE -- a loud, fixable verdict
+    # rather than a confident wrong order. Placed BEFORE the dry-run branch so `--dry-run` says the
+    # same thing a real pass would do.
+    if contract_note(REPO):
+        return False, contract_note(REPO), False
     if dry:
         # ⛔ A DRY RUN THAT SKIPS THE WORKTREE LIES ABOUT THE ONE STEP THAT BLOCKS. It used to
         # return here, so it reported "would spawn" precisely when the worktree was what would
@@ -2906,6 +3024,17 @@ def _print_state(path: str, label: str = "") -> None:
     """
     if label:
         print("== %s ==" % label)
+    # ⛔ AN EMPTY `path` IS A REFUSAL TO PRINT, NOT AN EMPTY RECORD. `_status_paths()` hands one
+    # through when the operator named a repo that has NO per-repo record; falling back to the
+    # canonical file here would print ANOTHER repo's rows under this repo's header -- the
+    # mis-attribution the two-record split exists to prevent.
+    if not path:
+        print("pr-doctor: NO per-repo record exists for the repo named above. The canonical "
+              "`pr-doctor.json` is NOT shown under its header: its rows carry no repo field, so "
+              "they could be ANOTHER repo's cooldowns, and printing them here would read as this "
+              "repo's state. Run `pr-doctor.py --status` with no `--repo` for the machine-wide "
+              "view, or wait for a pass that grades this repo (`--all-repos`).")
+        return
     if path == STATE:
         st = load_state()
     else:
@@ -2932,29 +3061,37 @@ def _status_paths(args) -> list[tuple[str, str]]:
 
     ⛔ THE LABEL NAMES THE FILE THE ROWS CAME FROM, because there are now two records and picking
     one silently is how an operator reads repo A's rows as repo B's. A SET reads each repo's own
-    file; one explicit `--repo` reads that repo's own file when an `--all-repos` run wrote it, and
-    otherwise the canonical file (which is where a single-repo pass records, by design -- the beat
-    reads it).
+    file; one explicit `--repo` reads that repo's own file when an `--all-repos` run wrote it --
+    and when it does not exist, NOTHING is printed for it (see `_print_state`): the previous
+    version substituted the CANONICAL file and headed its rows with the named repo's slug, which is
+    a printed lie whenever those rows belong to another repo (a single-repo pass, a hand-armed
+    `com.tortoise.pr-doctor`), and the canonical file has no repo field to filter on.
     """
-    # ⛔ NO EMPTY-FLAG FILTER HERE EITHER. `if s and s.strip()` discarded `--status --repo ""` and
+    # ⛔ ONE PARSER FOR BOTH WAYS AN ENTRY ARRIVES (#2518 review, P2). This branch used
+    # `_normalize_slug(explicit[0])` while the pass path used `split_repo_entry`, so
+    # `--status --repo owner/name=<checkout>` 
+    # refused as "not an owner/name slug" while the identical string worked everywhere else.
+    # NO EMPTY-FLAG FILTER HERE EITHER. `if s and s.strip()` discarded `--status --repo ""` and
     # silently read the canonical file instead -- the operator's word dropped and a default adopted,
     # the same shape the pass path refuses. A flag that was GIVEN is examined, empty or not.
     explicit = [s.strip() for s in args.repo]
     if not args.all_repos and len(explicit) <= 1:
         if not explicit:
             return [("", STATE)]      # ONE machine-wide view: the file the beat's readers read
-        slug = _normalize_slug(explicit[0])
+        slug_in, _hint = split_repo_entry(explicit[0])
+        slug = _normalize_slug(slug_in)
         if not slug:
             raise RepoUnresolved("--repo %r is not an owner/name slug" % explicit[0])
         per = os.path.join(STATE_DIR, "pr-doctor.%s.json" % slug.replace("/", "-"))
-        chosen = per if os.path.exists(per) else STATE
-        return [("%s (%s)" % (slug, os.path.basename(chosen)), chosen)]
+        if os.path.exists(per):
+            return [("%s (%s)" % (slug, os.path.basename(per)), per)]
+        return [("%s (no per-repo record)" % slug, "")]
     entries = configured_repos(explicit)
     if not entries:
         raise RepoUnresolved("--all-repos with no PR_DOCTOR_REPOS names no repo to read")
     out = []
     for entry in entries:
-        slug = _normalize_slug(entry.split("=", 1)[0])
+        slug = _normalize_slug(split_repo_entry(entry)[0])
         if not slug:
             # NAMED, not skipped: a silently dropped entry makes the list look complete while one
             # repo's record is missing from a read the operator asked for.
@@ -3007,8 +3144,9 @@ def _worst_rc(rcs: list[int]) -> int:
 
 def canonical_paths() -> None:
     """Point the state paths back at the files the fleet's readers read (ONE-repo layout)."""
-    global STATE, STATUS, LOG, _WORKER_TAG
+    global STATE, STATUS, LOG, LOG_BASENAME, _WORKER_TAG
     STATE, STATUS, LOG = _CANONICAL
+    LOG_BASENAME = "pr-doctor.log"
     _WORKER_TAG = ""
 
 

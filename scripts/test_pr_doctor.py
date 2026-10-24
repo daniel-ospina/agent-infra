@@ -100,6 +100,19 @@ def _clean_env(monkeypatch, tmp_path_factory):
     for k in ("MAX_FIX", "MAX_REVIEW", "REPO", "OR", "GH_REPO", "PR_DOCTOR_REPOS",
               "TORTOISE_REPO"):
         monkeypatch.delenv(k, raising=False)
+    # ⛔ AND THE RUBRIC'S SEAMS, BECAUSE `contract_note()` READS THEM AT CALL TIME (#2518). The
+    # suite names fake repos (`o/r`, `a/b`) and calls `dispatch()` directly; with no rubric supplied
+    # those are repos whose required set nobody declared, so `dispatch()` CORRECTLY refuses and 12
+    # dispatch tests go red for a reason that has nothing to do with what they pin. Supplying the
+    # seams here is the fixture's own contract ("a test never inherits the box's env") one field
+    # over: the default is a DECLARED rubric, and a test that wants the refusal deletes them.
+    # ⛔ `OBJECTIVE_REPO` IS DELETED, NOT INHERITED: this box exports it, so `objective.REPO` here is
+    # already a DIFFERENT repo from the one `REQUIRED_DEFAULT` describes -- the exact wrong-verdict
+    # shape `contract_note()` exists to refuse, and not something a test should pick up by accident.
+    for k in ("OBJECTIVE_REPO", "OBJECTIVE_REQUIRED", "OBJECTIVE_SURFACE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("OBJECTIVE_REQUIRED", "pricing-artifact")
+    monkeypatch.setenv("OBJECTIVE_SURFACE", "config/surface-manifest.yml")
     _iso = tmp_path_factory.mktemp("pr-doctor-state")
     monkeypatch.setattr(pr, "STATE_DIR", str(_iso), raising=False)
     monkeypatch.setattr(pr, "STATUS", str(_iso / "pr-doctor.status.json"), raising=False)
@@ -4941,3 +4954,160 @@ def test_status_with_an_empty_repo_flag_refuses(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "REFUSING" in out and "names no repository" not in out, out
     assert "==" not in out, "a refused flag read a record: %s" % out
+
+
+# ── the RUBRIC is a second fact about a repo (#2518 review) ──────────────────────────────────────
+# `apply_repo()` moves the SLUG on both sides, but `objective.py` also holds the declaration a PR is
+# JUDGED by (`REQUIRED`/`GATED_CHECKS`/`SURFACE_PATHS`). Moving one without the other is a confident
+# verdict about a declaration nobody read, which is the defect this whole change removes, one level
+# up. These tests pin the two halves: the brief no longer names another repo, and a repo whose
+# rubric was never supplied is REFUSED rather than graded by the wrong one.
+
+
+def test_the_workers_brief_records_the_review_against_the_repo_it_resolved():
+    """⛔ A PASS FOR REPO A MUST NOT HAND ITS WORKER A RECORD ORDER NAMING REPO B (review, P1).
+
+    `record-review.sh`'s 4th positional IS the repo, and the record's filename is derived from it. A
+    literal `daniel-ospina/tortoise` in the brief meant an agent-infra worker ran the order against
+    tortoise #42, where the stale-sha guard refuses it -- so an agent-infra item could never be
+    recorded or landed, while the pass re-dispatched it for ever. The `GH_REPO` pin cannot save it:
+    the brief names the other repo explicitly.
+    """
+    try:
+        pr.apply_repo(_REPO_A, "")
+        text = pr.brief(_pr(42), "fix-ci")
+    finally:
+        pr.canonical_paths()
+    assert "record-review.sh 42 <HEAD_SHA> clean %s " % _REPO_A in text, text[-1800:]
+    assert "clean daniel-ospina/tortoise " not in text, "the brief still names tortoise"
+
+
+def test_a_repo_whose_rubric_was_not_supplied_is_refused_not_graded(monkeypatch):
+    """⛔ AN UNKNOWN RUBRIC COSTS A REFUSAL, NEVER AN ORDER (review, P1).
+
+    MEASURED without this: `apply_repo("daniel-ospina/agent-infra")` + an all-green, clean-attested
+    check list classifies `rerun-checks`, because the six tortoise names are always `gated_absent` --
+    so the doctor re-triggers a fully green PR (staling its attestation) and can never land one, and
+    `touches_surface()` is always False so a surface-touching diff goes to the automated lander.
+    """
+    monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
+    monkeypatch.delenv("OBJECTIVE_SURFACE", raising=False)
+    try:
+        pr.apply_repo(_REPO_A, "")
+        note = pr.contract_note(pr.REPO)
+        assert "agent-infra#2518" in note, note
+        assert _REPO_A in note, note
+        # The refusal is a GATE-class refusal: nothing consumed, no state row, and the pass reports
+        # EXIT_UNDELIVERABLE rather than a confident wrong order.
+        assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False)
+        # …and a DRY RUN says the same thing, so an operator cannot read a plan the pass would refuse.
+        assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=True)[0] is False
+    finally:
+        pr.canonical_paths()
+
+
+def test_the_rubric_of_the_repo_it_describes_and_any_supplied_seam_both_clear_the_refusal(monkeypatch):
+    """The refusal is scoped, not blanket: it must not fire where the rubric IS the repo's.
+
+    Two ways that happens, and both are load-bearing. (1) The built-ins describe ONE repo — the one
+    `objective.py`'s `REQUIRED_DEFAULT` names — and refusing IT would kill the shipped single-repo
+    doctor (the launcher passes `OR=daniel-ospina/tortoise`). (2) The operator supplied a rubric
+    through the `OBJECTIVE_*` seam, which is how a consumer repo gets graded at all.
+    """
+    monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
+    monkeypatch.delenv("OBJECTIVE_SURFACE", raising=False)
+    try:
+        pr.apply_repo(_REPO_B, "")                       # the repo the built-ins describe
+        assert pr.contract_note(pr.REPO) == ""
+        assert pr.contract_note(_REPO_A) != ""
+        pr.canonical_paths()
+        monkeypatch.setenv("OBJECTIVE_REQUIRED", "pipeline-compliance")
+        monkeypatch.setenv("OBJECTIVE_SURFACE", "config/surface-manifest.yml")
+        pr.apply_repo(_REPO_A, "")                       # a declared rubric: any slug is gradable
+        assert pr.contract_note(pr.REPO) == ""
+        # ⛔ AND NOTHING IS GRADED WHEN NO REPO IS: the note is DERIVED from the resolved slug, so a
+        # call outside a pass cannot be refused for a reason about a previous one.
+        assert pr.contract_note("") == ""
+    finally:
+        pr.canonical_paths()
+
+
+def test_the_refusal_is_derived_so_the_next_repo_in_a_set_is_not_refused_for_the_last_ones_reason(monkeypatch):
+    """⛔ NO STORED FLAG: `--all-repos` grades repos in sequence, and a leftover would mis-attribute.
+
+    Measured while writing this: a module flag here took 13 dispatch tests red, because every later
+    `dispatch()` inherited the previous repo's verdict. The same leak in production would refuse (or
+    worse, ALLOW) repo B's dispatch for a reason about repo A.
+    """
+    monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
+    monkeypatch.delenv("OBJECTIVE_SURFACE", raising=False)
+    try:
+        pr.apply_repo(_REPO_A, "")
+        assert pr.contract_note(pr.REPO) != ""
+        pr.apply_repo(_REPO_B, "")
+        assert pr.contract_note(pr.REPO) == "", "repo B inherited repo A's refusal"
+    finally:
+        pr.canonical_paths()
+
+
+# ── the two records, and the per-repo log ────────────────────────────────────────────────────────
+
+
+def test_status_accepts_the_checkout_form_of_a_lone_repo_flag(monkeypatch, tmp_path, capsys):
+    """`--status --repo owner/name=<checkout>` is the same entry the PASS accepts (review, P2).
+
+    One parser for both ways an entry arrives: this branch normalised the RAW string, so a form that
+    worked in a pass (`test_a_lone_repo_flag_accepts_the_checkout_form`) and in a set refused here as
+    "not an owner/name slug".
+    """
+    _isolate_state(monkeypatch, tmp_path)
+    co = _checkout(tmp_path, "co-a", _REPO_A)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--status",
+                                      "--repo", "%s=%s" % (_REPO_A, co)])
+    assert pr.main() == 0
+    out = capsys.readouterr().out
+    assert "not an owner/name slug" not in out, out
+    assert _REPO_A in out, out
+
+
+def test_status_never_prints_another_repos_rows_under_a_named_repo(monkeypatch, tmp_path, capsys):
+    """⛔ THE CANONICAL FILE HAS NO REPO FIELD, SO IT CANNOT BE SHOWN AS A NAMED REPO'S (review, P2).
+
+    `--status --repo A` used to fall back to the canonical file and head it with A's slug. Those
+    rows are the LAST SINGLE-REPO pass's, for whatever repo that was, so after a tortoise pass an
+    agent-infra request printed tortoise's cooldowns under an agent-infra header -- the exact
+    mis-attribution the two-record split exists to prevent.
+    """
+    _isolate_state(monkeypatch, tmp_path)
+    with open(pr.STATE, "w") as f:
+        json.dump({"42": {"action": "fix-ci", "worker": "prd-42", "at": "2026-10-24T00:00:00Z"}}, f)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--status", "--repo", _REPO_A])
+    assert pr.main() == 0
+    out = capsys.readouterr().out
+    assert "prd-42" not in out, "another repo's row was printed under this repo's header: %s" % out
+    assert "NO per-repo record" in out, out
+
+
+def test_the_per_repo_log_is_the_file_the_readme_names(monkeypatch, tmp_path):
+    """⛔ `apply_repo(multi=True)` ASSIGNED A PATH NOTHING WROTE (review, P2).
+
+    `log()` resolves `_log_path()` at call time (the 2026-10-22 no-frozen-path fix), and that
+    function returned the CANONICAL name, so every repo in an `--all-repos` set appended to one file
+    while the README told an operator to look in `pr-doctor.<owner>-<name>.log`. The name is
+    late-bound for the same reason the directory is: a path frozen at import is a half-applied
+    redirect.
+    """
+    _isolate_state(monkeypatch, tmp_path)
+    try:
+        pr.apply_repo(_REPO_A, "", multi=True)
+        assert pr._log_path() == os.path.join(pr.STATE_DIR,
+                                              "pr-doctor.daniel-ospina-agent-infra.log")
+        pr.log("row-for-repo-a")
+        with open(pr._log_path()) as f:
+            assert "row-for-repo-a" in f.read()
+        canonical = os.path.join(pr.STATE_DIR, "pr-doctor.log")
+        assert not os.path.exists(canonical), "the per-repo line also hit the canonical log"
+        pr.canonical_paths()
+        assert pr._log_path() == canonical
+    finally:
+        pr.canonical_paths()
