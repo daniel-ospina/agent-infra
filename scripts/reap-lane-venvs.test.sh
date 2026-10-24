@@ -127,6 +127,15 @@ fi
 [ -n "${FAKE_PS_FAIL:-}" ] && exit 1
 [ -n "${FAKE_PS_SLEEP:-}" ] && sleep "$FAKE_PS_SLEEP"
 [ -n "${FAKE_PS_EMPTY:-}" ] && exit 0
+# ⛔ ARG-AWARE, because the sandbox's OTHER consumer is `proc_start_epoch` (review round 1): it asks
+# `ps -o etimes=` first and falls back to the BSD-style `ps -o etime=`. A shim that answered EVERY
+# invocation with the process table made that fallback unreachable — the zero-padded-`etime` parse
+# could not be driven at all, so its bug was invisible to this suite. These arms are matched before
+# the table output for exactly that reason.
+case " $* " in
+  *" -o etimes="*) [ -n "${FAKE_ETIMES:-}" ] && { printf '%s\n' "$FAKE_ETIMES"; exit 0; }; exit 1 ;;
+  *" -o etime="*)  [ -n "${FAKE_ETIME:-}" ]  && { printf '%s\n' "$FAKE_ETIME";  exit 0; }; exit 1 ;;
+esac
 if [ -n "${FAKE_PS_SEQ_DIR:-}" ] && [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then cat "$FAKE_PS_SEQ_DIR/$N"; exit 0; fi
 if [ -n "${FAKE_PS_TABLE:-}" ] && [ -f "$FAKE_PS_TABLE" ]; then cat "$FAKE_PS_TABLE"; exit 0; fi
 # The default is NON-EMPTY and matches nothing: an empty table is a probe FAILURE by design.
@@ -1026,6 +1035,74 @@ else
   kill "$IDLE_SHELL_PID" 2>/dev/null; wait "$IDLE_SHELL_PID" 2>/dev/null
 fi
 rm -f "$T/kfifo"
+
+# ── K5: EVERY holder is examined, and the scan TERMINATES (§2721 review round 1, P1+P2) ───────────
+# The first version advanced the scan by REWRITING THE PROBE TABLE, which was (a) unbounded — a failed
+# write on a full cell left the row in place and the loop never terminated, in the one state this
+# reaper exists for — and (b) shared, so a pid inside a nested worktree consumed the evidence another
+# worktree needed. Both defects reduce to "the scan must reach holder N+1 without mutating anything",
+# which is what this arm pins: THREE holders, the first two idle shells, the third a working one. The
+# verdict must be KEEP, it must come from the THIRD pid, and the pass must FINISH (a reintroduced
+# mutation loop hangs here instead of returning).
+RK5="$(newrepo k5)"
+W_K5="$(mkwt "$RK5" idle3)"
+mkfifo "$T/k5fifo"
+( cd "$W_K5" && exec bash -c 'read -r _x' < "$T/k5fifo" ) 2>/dev/null &
+K5A=$!
+( cd "$W_K5" && exec bash -c 'read -r _x' < "$T/k5fifo" ) 2>/dev/null &
+K5B=$!
+sleep 1
+K5_HEAD=$(( $(date +%s) + 600 ))
+GIT_AUTHOR_DATE="@$K5_HEAD" GIT_COMMITTER_DATE="@$K5_HEAD" \
+  git -C "$W_K5" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "two idle shells sat down first"
+( cd "$W_K5" && exec bash -c 'while :; do sleep 3600; done' ) 2>/dev/null &
+K5C=$!
+sleep 1
+if [ "$(readlink "/proc/$K5A/cwd" 2>/dev/null || true)" = "$(canon "$W_K5")" ] &&
+   [ "$(readlink "/proc/$K5C/cwd" 2>/dev/null || true)" = "$(canon "$W_K5")" ]; then
+  echo " K5 two IDLE shells then a WORKING holder: the verdict comes from the third, and the pass ends"
+  # The real drive: the FIRST two holders are demoted (named), the THIRD keeps the env, and the pass
+  # returns instead of spinning. `timeout` is the assertion that it TERMINATES — a hung pass fails.
+  out="$(timeout 300 env PS_BIN=/bin/ps LSOF_BIN="$(command -v lsof || true)" TMUX_BIN=/nonexistent/tmux \
+          DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" REAP_VENV_FREE_FLOOR_MB=2048 \
+          REAP_VENV_LOG="$T/reap-k5.log" bash "$REAPER" --worktree "$W_K5" --apply 2>&1)"; rc=$?
+  assert_eq "$rc" "0" "the pass completes (a reintroduced table-mutation loop would hang and time out)"
+  assert_contains "$out" "KEEP live-cwd" "the THIRD holder decides: a working shell still keeps the env"
+  exists "$W_K5/.venv" "so the env survives"
+  k5log="$(cat "$T/reap-k5.log" 2>/dev/null)"
+  assert_contains "$k5log" "stale-shell:" "the demoted holders are still NAMED in the pass log"
+  kill -9 "$K5C" 2>/dev/null; wait "$K5C" 2>/dev/null
+  for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    case "$_p" in "$K5A"|"$K5B") continue ;; esac
+    [ "$(readlink "/proc/$_p/cwd" 2>/dev/null)" = "$(canon "$W_K5")" ] && kill -9 "$_p" 2>/dev/null
+  done
+  sleep 1
+else
+  echo "  ⏭ SKIP K5: could not place the holders inside the worktree"
+fi
+kill "$K5A" "$K5B" 2>/dev/null; wait "$K5A" "$K5B" 2>/dev/null
+rm -f "$T/k5fifo"
+
+# ── K6: a ZERO-PADDED `ps -o etime` parses as DECIMAL, so the BSD fallback can demote at all ───────
+# `ps -o etime` prints zero-padded fields (`1:08:30`), and bash rejects `08` as a bad OCTAL constant:
+# the arithmetic ERRORED, the start time came back EMPTY, and the holder stayed live for ever — the
+# rule silently never fired on any host that reaches the fallback. The arm pins the HOURS component
+# specifically: HEAD is 1,000s in the past and the elapsed time is 1:08:30, so a parse that DROPS the
+# hours (start = now-510) reads the shell as YOUNGER than HEAD and keeps it — the mutant fails here.
+RK6="$(newrepo k6)"
+W_K6="$(mkwt "$RK6" etime)"
+mkvenv "$W_K6"
+K6_TS=$(( $(date +%s) - 1000 ))
+GIT_AUTHOR_DATE="@$K6_TS" GIT_COMMITTER_DATE="@$K6_TS" \
+  git -C "$W_K6" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD 1000s before this pass"
+printf '1 0 /sbin/launchd\n4242 1 /bin/bash\n' > "$T/k6-ps.txt"
+printf 'p4242\nn%s\n' "$(canon "$W_K6")" > "$T/k6-lsof.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/k6-ps.txt" FAKE_LSOF_TABLE="$T/k6-lsof.txt" \
+        FAKE_ETIME='1:08:30' REAP_VENV_PROC_ROOT="$T/no-proc" \
+        --worktree "$W_K6" --apply)"
+assert_contains "$out" "REAP" "a 1:08:30 idle shell that predates HEAD is demoted, so the env is reaped"
+absent "$W_K6/.venv" "the env was actually removed"
+assert_contains "$(cat "$T/reap.log" 2>/dev/null)" "stale-shell:" "…and the demotion is named"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
