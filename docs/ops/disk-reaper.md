@@ -572,8 +572,8 @@ REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM — …`  (AGENT_DISK
 costs when it does not (a pruned cache, `--link-mode=copy`, a cache on another mount); `reserve` is the
 headroom that must still be free **after** that worst case. `max(tree, self)` is not a redundancy: a
 gate that admitted on `tree + reserve` lets one lane eat the whole reserve and leaves the cell at
-~700 MB, which is below the 2,286 MB cell-4 wedged at. The three numbers are **measured per target**,
-never one global constant: #1852 recorded that a single constant cannot serve an agent-infra lane
+~700 MB, which is below the 2,286 MB cell-4 wedged at. `tree` and `self` are **measured per target**,
+never one global constant (`reserve` comes from the cell's own warning band): #1852 recorded that a single constant cannot serve an agent-infra lane
 (48 MB, no install) and a tortoise lane (5.7 GB of python), and a tortoise-sized floor would refuse
 every harness spawn on every cell — a false *block*, which is its own defect. `reserve` defaults to the
 cell's own warning band (`DISK_WARN_FREE_MB` = 4x `DISK_MIN_FREE_MB`), so an admitted spawn can never

@@ -171,6 +171,21 @@ exit 0
 SHIM
 cat >"$T/bin/lsof" <<'SHIM'
 #!/usr/bin/env bash
+# ── SEQUENCED MODE (review round 2): the cwd re-read at removal time must be able to FAIL after a good
+# pass-start read — that is the case where the witness set silently weakens and the removal would go
+# ahead on argv-only evidence. Only the cwd probe advances this sequence.
+case " $* " in
+  *"-d cwd"*)
+    if [ -n "${FAKE_LSOF_SEQ_DIR:-}" ]; then
+        N=0; [ -f "$FAKE_LSOF_SEQ_DIR/.n" ] && N="$(cat "$FAKE_LSOF_SEQ_DIR/.n")"
+        N=$((N + 1)); printf '%s' "$N" >"$FAKE_LSOF_SEQ_DIR/.n"
+        if [ -f "$FAKE_LSOF_SEQ_DIR/$N.fail" ]; then exit 1; fi
+        if [ -f "$FAKE_LSOF_SEQ_DIR/$N" ]; then cat "$FAKE_LSOF_SEQ_DIR/$N"; exit 0; fi
+        last="$(ls "$FAKE_LSOF_SEQ_DIR" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
+        if [ -n "$last" ] && [ -f "$FAKE_LSOF_SEQ_DIR/$last" ]; then cat "$FAKE_LSOF_SEQ_DIR/$last"; exit 0; fi
+        exit 1
+    fi ;;
+esac
 printf 'p9999\nn/usr/local\n'
 if [ -n "${FAKE_LSOF_CWD:-}" ]; then
     printf 'p%s\nn%s\n' "${FAKE_LSOF_CWD_PID:-4243}" "$FAKE_LSOF_CWD"
@@ -1886,6 +1901,26 @@ mkdir -p "$WFINAL/.venv"
 OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g7-gone" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
     run_reaper $ENV --apply --repo "$REPO" 2>&1)"
 assert_nodir "$WFINAL" "G2721g …and a checkout with no holder at either reading is still removed (the control)"
+
+# ── G2721h: a cwd re-read that FAILS after a good pass-start read PRESERVES (review round 2, P1) ──
+# `cwd_probe_load` always returns 0 and always reassigns the table, so a failed re-read used to leave
+# the removal running on ARGV-ONLY evidence and to clobber the pass's good table for every later row.
+# A lane's own `pi` has cwd = the worktree and argv = the installed path, so cwd is its ONLY witness:
+# proceeding deletes a live lane's checkout. The pass-start lsof here SUCCEEDS (a table that simply
+# does not match), the re-read FAILS, and the checkout must survive; the pre-fix tree removes it.
+ENV=G2721h; REPO="$(mk_repo $ENV)"
+WT_CWDF="$(add_named_wt "$REPO" "$ENV-fail" feat/g2721h-fail)"
+mkdir -p "$WT_CWDF/.venv"; printf 'x\n' >"$WT_CWDF/.venv/marker"
+mkdir -p "$T/seq-g8"
+printf 'p9999\nn/usr/local\n' >"$T/seq-g8/1"
+: >"$T/seq-g8/2.fail"
+OUT="$(FAKE_LSOF_SEQ_DIR="$T/seq-g8" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (live-probe-unavailable)" \
+    "G2721h a cwd re-read that degrades after a good pass-start read STOPS the delete"
+assert_dir "$WT_CWDF" "G2721h …the checkout survives (it would have gone on argv-only evidence)"
+assert_contains "$(cat "$T/$ENV/reap.log" 2>/dev/null)" "cwd re-probe degraded" \
+    "G2721h …and the log says WHICH probe was lost, so the weakened witness set is visible"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

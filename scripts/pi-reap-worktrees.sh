@@ -1366,7 +1366,7 @@ classify_one() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
-    local path="$1" sha="$2" eph entry target out rc crumb cverdict cpay rcanon
+    local path="$1" sha="$2" eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
 
     # Re-check #0 — THE HOLDER RULE, AGAIN, RIGHT BEFORE THE DELETE (review round 1): the
@@ -1385,7 +1385,25 @@ remove_one() {
         rm -f "$out"; return 2
     fi
     self_pid_tree_load
+    # ⛔ A DEGRADED CWD RE-READ MUST NOT SILENTLY WEAKEN THE WITNESS SET (review round 2, P1).
+    # `cwd_probe_load` ALWAYS returns 0 and ALWAYS reassigns CWD_OUT, setting CWD_DEGRADED when lsof
+    # fails — so a failed re-read here would (a) leave `live_cwd_for` reading an empty table, i.e. the
+    # removal would proceed on ARGV-ONLY evidence, and (b) clobber the pass's good table for every
+    # subsequent classification. A lane's own `pi` has cwd = the worktree and argv = the INSTALLED
+    # path, so cwd is that holder's ONLY witness: proceeding would delete a live lane's checkout.
+    # The distinction that matters is WHEN it degraded. If the pass started degraded (no lsof on this
+    # host) the removal path is argv-only BY DOCUMENTED DESIGN and the footer says so; if the pass HAD
+    # a cwd table and the re-read lost it, that is a new fact and the answer is preserve.
+    cwd_prev="$CWD_OUT"; cwd_prev_degraded="$CWD_DEGRADED"
     cwd_probe_load
+    if [ "$cwd_prev_degraded" = 0 ] && { [ "$CWD_DEGRADED" != 0 ] || [ ! -s "${CWD_OUT:-}" ]; }; then
+        [ -n "${CWD_OUT:-}" ] && rm -f "$CWD_OUT"
+        CWD_OUT="$cwd_prev"; CWD_DEGRADED="$cwd_prev_degraded"
+        REMOVE_SKIP_VERDICT="live-probe-unavailable"
+        log "REMOVE-SKIP $path the cwd re-probe degraded (lsof failed or returned nothing) AFTER a good pass-start read — nothing removed, preserved (fail-closed)"
+        rm -f "$out"; return 2
+    fi
+    [ -n "$cwd_prev" ] && [ "$cwd_prev" != "$CWD_OUT" ] && rm -f "$cwd_prev"
     if holders_live "$rcanon" "$path" "$sha"; then
         REMOVE_SKIP_VERDICT="live-refound"
         log "REMOVE-SKIP $path a holder is live AGAIN (${HL_VERDICT} pid=${HL_DETAIL}) since classification — nothing removed, preserved"
