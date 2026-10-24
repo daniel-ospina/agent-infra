@@ -4237,6 +4237,11 @@ nb_expand() { # nb_expand <script>
     # `$(...)` inside the unquoted heredoc — that is the bug class this rig exists for).
     # The rig renders it from the SHIPPED helper so the assertion below sees real text.
     REVIEWER_BRIEF="$(bash "$HERE/reviewer-preflight.sh" --brief harness)"
+    # #2325: lane.sh ALSO splices the landing-artifacts section as a precomputed variable. Rendered
+    # here from the SHIPPED helper for the same reason: under `set +u` an unset variable expands to
+    # nothing, so without this line every prompt this rig builds would silently lack the section and
+    # none of its backtick spans would be exercised.
+    LANDING_BRIEF="$(bash "$HERE/reviewer-preflight.sh" --landing-brief harness)"
     . "$NB/snip.sh" ) >/dev/null 2>&1
 }
 if nb_expand "$MERGE"; then
@@ -4260,6 +4265,14 @@ if nb_expand "$HERE/lane.sh"; then
     && grep -qF 'do NOT dispatch it' "$NB/o/logs/prompt-7.txt"; }; rc=$?
 else rc=1; fi
 ck "lane.sh's prompt CARRIES the #2148 reviewer step (requirement + record + rail, harness role)" $rc
+# #2325: and the LANDING ARTIFACTS section, from the same expanded artifact. A heredoc edit that
+# loses it (or a splice that quietly renders empty) goes red here rather than at a compliance gate.
+if nb_expand "$HERE/lane.sh"; then
+  { grep -qF '## Landing artifacts' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'Do NOT reach for "Refs #' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'scripts/admin-merge.sh <PR>' "$NB/o/logs/prompt-7.txt"; }; rc=$?
+else rc=1; fi
+ck "lane.sh's prompt CARRIES the #2325 landing artifacts ([a] issue ref line, [c] record command)" $rc
 if nb_expand "$HERE/fix-one.sh"; then
   { grep -qF 'Never search the filesystem for an interpreter' "$NB/log-fixer.txt" \
     && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/log-fixer.txt" \
