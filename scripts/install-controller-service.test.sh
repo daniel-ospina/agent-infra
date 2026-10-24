@@ -1845,7 +1845,10 @@ grep -qE '^heartbeat_age_s=[0-9]+' "$T/rb-status.out" \
 # An UNDATABLE MainPID fails CLOSED: the gate cannot prove the heartbeat's author, so it must not certify it.
 FC="$(arm_root fc)"; mk_systemctl "$FC/bin" "$FC/state" "$FC/sc.log"
 printf 'active\n' > "$FC/state/isactive_word"; : > "$FC/state/active"
-printf '4242\n' > "$FC/state/mainpid"                       # not a process on this box
+# A pid that cannot exist BY CONSTRUCTION: `4242` is only undatable on a box that has no such
+# process (and none that began after the heartbeat), which made this arm a false RED on hosts
+# where it is long-lived.
+printf '%s\n' "$(( $(cat /proc/sys/kernel/pid_max 2>/dev/null || printf 4194304) + 1 ))" > "$FC/state/mainpid"
 printf '%s\n' "$(( $(date +%s) - 100 ))" > "$FC/o/heartbeat"
 FC_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst fc --install > "$T/fc.out" 2>&1 || FC_RC=$?
 [ "$FC_RC" -ne 0 ] && ok 'install: an UNDATABLE MainPID fails CLOSED (an unprovable age never certifies)' \
@@ -1853,6 +1856,26 @@ FC_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst fc --install > "$T/fc.out
 grep -q 'cannot date MainPID' "$T/fc.out" \
   && ok 'install: and it SAYS why it refused to treat the unit as pre-active' \
   || bad "install: refused without naming the undatable MainPID: $(cat "$T/fc.out")"
+
+# A heartbeat INSTANT is validated before any age rule uses it: a future-dated (or corrupt) heartbeat in the
+# resolved dir made "the MainPID began before it" answer YES for every process, clearing the `since` binding
+# and certifying an install over a start that produced no controller (review P1, #2402).
+say_case "an implausible heartbeat instant does not certify a start (it is not a fresh one)"
+FB="$(arm_root fb)"; mk_systemctl "$FB/bin" "$FB/state" "$FB/sc.log"
+printf 'active\n' > "$FB/state/isactive_word"; : > "$FB/state/active"
+mkdir -p "$FB/o2"; printf '9999999999\n' > "$FB/o2/heartbeat"            # FUTURE-dated, in the resolved dir
+printf '%s\n' "$(( $(date +%s) - 100 ))" > "$FB/o/heartbeat"           # stale, in $O
+{
+  printf 'Environment=O=%s\n' "$FB/o"
+  printf 'Environment=ENV_FILE=%s\n' "$FB/home/keys.env"
+  printf 'Environment=CELL_HOME=%s\n' "$FB/home"
+} > "$FB/units/eldato-orchestrator.service"
+printf 'O=%s\n' "$FB/o2" > "$FB/home/keys.env"
+sleep 60 & FB_LATE=$!; printf '%s\n' "$FB_LATE" > "$FB/state/mainpid"
+FB_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst fb --install > "$T/fb.out" 2>&1 || FB_RC=$?
+kill "$FB_LATE" 2>/dev/null || true
+[ "$FB_RC" -ne 0 ] && ok 'install: a FUTURE-dated heartbeat is not a fresh one (the stale one still refuses)' \
+                   || bad "install: a future-dated heartbeat certified the install — every MainPID reads as 'began before it': $(cat "$T/fb.out")"
 
 # ── a copy that supervises ANOTHER state dir is not ours to replace (review P2, #2402) ──────────────
 # `installed_units` lists only OURS, so a foreign unit at the target path was invisible to the write

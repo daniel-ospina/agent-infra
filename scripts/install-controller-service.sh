@@ -275,6 +275,24 @@ unit_main_pid() {
 #   * a very long run overflows `$(( ))`.
 # So: force decimal, bound the length, require a plausible epoch instant, tolerate <=60s of skew, and clamp
 # the age at 0 (an age is seconds SINCE the write; it can never be negative).
+# ⛔ A HEARTBEAT INSTANT IS VALIDATED BEFORE ANY AGE RULE USES IT (review P1, #2402). `heartbeat_age` and
+# `_controller_proof_dir` both reject over-long, pre-epoch and FUTURE instants, because a heartbeat dated in
+# the future makes `now - t` negative and a DEAD controller reads as FRESH for ever. The `pre_active` gate
+# cannot skip that check: a corrupt or future-dated instant in the RESOLVED dir made `_proc_began_after`
+# answer "the MainPID began before it", which cleared the `since` binding and certified an install over a
+# start that produced no controller — the same false PASS, one input wider. Same four guards, one place.
+_heartbeat_epoch() { # <state dir> -> the plausible instant it records; nothing when absent or implausible
+    local hb="${1%/}/heartbeat" t now
+    [ -f "$hb" ] || return 1
+    t="$(tr -dc '0-9' < "$hb" 2>/dev/null)" || return 1
+    case "${t:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#t}" -le 12 ] || return 1
+    t=$(( 10#$t ))
+    [ "$t" -ge 1000000000 ] 2>/dev/null || return 1
+    now="$(date +%s)"
+    [ "$t" -le "$(( now + 60 ))" ] 2>/dev/null || return 1
+    printf '%s\n' "$t"
+}
 heartbeat_age() {    local dir="${1:-$O}" hb="${1:-$O}/heartbeat" t now age
     [ -f "$hb" ] || return 1
     t="$(tr -dc '0-9' <"$hb" 2>/dev/null)" || return 1
@@ -610,8 +628,7 @@ do_install() {
         _pre_hb=""
         for _pre_d in "${proof_o:-}" "$O"; do
             [ -n "${_pre_d:-}" ] || continue
-            [ -f "${_pre_d%/}/heartbeat" ] || continue
-            _pre_hb="$(tr -dc '0-9' < "${_pre_d%/}/heartbeat" 2>/dev/null || true)"
+            _pre_hb="$(_heartbeat_epoch "$_pre_d")" || _pre_hb=""
             [ -n "${_pre_hb:-}" ] && break
         done
         if [ -z "${_pre_hb:-}" ]; then
@@ -711,7 +728,9 @@ do_install() {
     say "  state:   $O   (env: $ENV_FILE)"
     say "  controller pid: $pid"
     local age
-    if age="$(heartbeat_age)"; then say "  heartbeat: ${age}s ago"; else say "  heartbeat: not yet (the loop writes $O/heartbeat after its first cycle)"; fi
+    # ⛔ NAME THE DIR THAT WAS READ (review P2, #2402): with a `keys.env` `O=` line the controller writes to
+    # the RESOLVED dir, and a report that points at $O sends the operator to a file nothing writes.
+    if age="$(heartbeat_age "${proof_o:-$O}")"; then say "  heartbeat: ${age}s ago"; else say "  heartbeat: not yet (the loop writes ${proof_o:-$O}/heartbeat after its first cycle)"; fi
     say "  stop it: bash $SUPERVISOR stop   |   supervise state: bash $0 --status"
     return 0
 }
@@ -822,7 +841,7 @@ do_status() {
         # the controller's can legitimately differ — and the first cycle writes the file minutes later
         # (CYC). Failing the verb over that was a false red on a healthy service-managed cell. The unit's
         # own MainPID is the proof that a controller is running; the heartbeat is a fresher fact, not a gate.
-        say "heartbeat_age_s=UNREADABLE (no READABLE $O/heartbeat — path read: \$O=$O; the file can be absent, or present with a value that is not a plausible instant (too small to be an epoch second, future-dated beyond 60s of skew, or over-long), and a keys.env 'O=' line moves the controller's state dir; the first cycle writes the file after one CYC)"
+        say "heartbeat_age_s=UNREADABLE (no READABLE $O/heartbeat — path read: \$O=$O, unit dir=${_st_o:-<same>}; the file can be absent, or present with a value that is not a plausible instant (too small to be an epoch second, future-dated beyond 60s of skew, or over-long), and a keys.env 'O=' line moves the controller's state dir; the first cycle writes the file after one CYC)"
         if [ "${pid:-0}" = "0" ]; then
             err "no heartbeat AND no MainPID — nothing is running under the unit: journalctl -u $UNIT_NAME -n 40"
             rc=1
