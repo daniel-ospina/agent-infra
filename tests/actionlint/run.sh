@@ -451,7 +451,8 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/push-group-continuation-eof.yml" "$CFIX/pr-run-json.yml" "$CFIX/pr-group-hash-quoted.yml" "$CFIX/push-on-sequence-ok.yml" \
   "$CFIX/pr-group-apostrophe-comment.yml" "$CFIX/pr-on-column0-sequence.yml" \
   "$CFIX/pr-on-sequence-mapping.yml" \
-  "$CFIX/pr-group-apostrophe-pair-ok.yml" "$CFIX/pr-multiline-value-ok.yml"
+  "$CFIX/pr-group-apostrophe-pair-ok.yml" "$CFIX/pr-multiline-value-ok.yml" \
+  "$CFIX/push-flow-apostrophe-false.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -497,6 +498,7 @@ for pair in \
   "push-job-apostrophe-name.yml R0" \
   "pr-group-apostrophe-pair-comment.yml R1" \
   "pr-multiline-value-sha.yml R1" \
+  "push-flow-apostrophe.yml R2" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
@@ -602,6 +604,17 @@ if grep -q 'no pull_request-triggered workflow was found' "$OUT"; then
   sed 's/^/      /' "$OUT"
 else
   pass "the unreadable workflow is not also reported as no PR workflow found"
+fi
+
+# Two different workflows using the canonical format() idiom are disjoint at runtime. Judging them by
+# the raw template text refused both (round 11, P2).
+conc_run 0 "the same format() template under two workflow names is two groups" \
+  "$CFIX/pr-workflow-format-a.yml" "$CFIX/pr-workflow-format-b.yml"
+if grep -q 'declared by more than one PR workflow' "$OUT"; then
+  fail "the format() pair was refused as sharing a group"
+  sed 's/^/      /' "$OUT"
+else
+  pass "the format() pair is not refused as sharing a group"
 fi
 
 # An exempt guard that DROPS its PR trigger and gains a `concurrency:` block must still be refused.

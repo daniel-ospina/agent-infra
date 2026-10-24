@@ -353,7 +353,7 @@ function splitqv(v, arr,   n, i, c, q, cur, len, nx) {
       }
       continue
     }
-    if (c == DQ || c == SQ) { q = c; cur = cur c; continue }
+    if ((c == DQ || c == SQ) && (at_val_start(v, i) || has_closing(v, i, c))) { q = c; cur = cur c; continue }
     if (c == ",") { arr[++n] = cur; cur = ""; continue }
     cur = cur c
   }
@@ -697,8 +697,12 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
         # only two literal spellings made the comparison read un-expanded templates — a correct pair
         # was refused as "they would cancel each other", and a genuinely shared group was missed
         # (round 5, P2). sed is anchored on `[^}]*` so two expressions on one line are two matches.
-        resolved="$(printf '%s' "$group" | sed -E 's/\$\{\{[[:space:]]*([^}]*[^}[:space:]])[[:space:]]*\}\}/${{ \1 }}/g')"
-        resolved="${resolved//'${{ github.workflow }}'/$identity}"
+        # The identity is the workflow NAME, so every reference to it must be resolved before two
+        # files are compared — including one inside `format('{0}-{1}', github.workflow, …)`, where a
+        # template-level sed cannot reach it (its `}` closes the pattern first). Comparing the raw
+        # template refused two DIFFERENT workflows as sharing one group (round 11, P2).
+        resolved="${group//'github.workflow'/$identity}"
+        resolved="$(printf '%s' "$resolved" | sed -E 's/\$\{\{[[:space:]]*([^}]*[^}[:space:]])[[:space:]]*\}\}/${{ \1 }}/g')"
         printf '%s\t%s\n' "$resolved" "$fname" >>"$TMP_GROUPS"
         # A per-commit variable makes every head (and every retry) its own group, so the block cancels
         # NOTHING — the exact defect it exists to prevent. This refusal must apply on BOTH paths: it
