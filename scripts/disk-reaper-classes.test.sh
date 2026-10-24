@@ -83,6 +83,13 @@ trap cleanup EXIT
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 REAL_GIT="$(command -v git)"
 export HOME="$T/home"; mkdir -p "$HOME"
+# ⛔ THE BOX'S OWN HARNESS ENV MUST NOT LEAK IN. A cell exports CELL_HOME, and a present-but-unparseable
+# stamp makes the owner REFUSE (exit 3): measured, the same fixture reaped with CELL_HOME unset and
+# printed `SKIP reason=stamp-unparseable` with it set. A case must fail for the code's reason, never the
+# box's — and the `REPO`/`AGENT_INFRA_PATH` fallbacks let the entry point scan the machine's real
+# checkouts instead of the fixture.
+unset CELL_HOME REAP_AW_STAMP REAP_AW_DIRTY REAP_DI_MARKERS REAP_DI_UNIT_DIRS \
+      DISK_REAPER_REPOS REPO TORTOISE_REPO AGENT_INFRA_PATH 2>/dev/null || true
 
 # ── fixtures ────────────────────────────────────────────────────────────────────────────────────
 # newbase <letter> — a UNIQUE fixture dir per invocation. Every case runs TWICE (real + mutant) and a
@@ -575,6 +582,37 @@ case_m() { # <owner-script>
     return $((CASE_FAIL > 0))
 }
 
+# ── N: a lane that ENTERS an old, clean worktree during the pass preserves it (re-probe, TOCTOU) ──
+# Liveness was read from ONE snapshot at pass start, and removal can run up to BUDGET later — a lane
+# entering the tree in that window used to lose it with a live cwd inside (measured: the witness's cwd
+# then read `<path> (deleted)`). The witness here is the tree BECOMING dirty between classification and
+# removal: a `git` stand-in answers CLEAN on the first `status` call and DIRTY on the next.
+case_n() { # <owner-script>
+    local owner="$1" base root repo wt out
+    base="$(newbase n)"; root="$base/scratch"
+    repo="$(mk_repo "$base")"
+    wt="$(mk_linked_wt "$repo" "$root" wt1 feat/n-toctou)"
+    age_path "$wt" 400
+    mkdir -p "$base/bin"
+    cat >"$base/bin/git" <<STUB
+#!/usr/bin/env bash
+[ "\$1" = "-C" ] || exec "$REAL_GIT" "\$@"
+[ "\$3" = "status" ] || exec "$REAL_GIT" "\$@"
+n=\$(cat "$base/count" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" >"$base/count"
+if [ "\$n" -ge 2 ]; then printf ' M became-dirty-during-pass\n'; exit 0; fi
+exec "$REAL_GIT" "\$@"
+STUB
+    chmod +x "$base/bin/git"
+    out="$(PATH="$base/bin:$PATH" REAL_GIT="$REAL_GIT" REAP_AW_STATE_DIR="$base/state" \
+           REAP_AW_ROOTS="$root" bash "$owner" --apply 2>&1)"
+    [ -n "${DRC_DEBUG:-}" ] && printf 'N\n%s\n' "$out" >&2
+    case_check "$([ -d "$wt" ] && echo 0 || echo 1)" \
+               "a tree that CHANGED during the pass is PRESERVED (the re-probe saw it)"
+    case_check "$(grep -qF 'reason=toctou' <<<"$out" && echo 0 || echo 1)" \
+               "and it is KEPT BY NAME with reason=toctou"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 MUT_A='s/if lp_path_held "\$CENSUS" "\$canon"; then/if false; then/'
 MUT_B='s/if remove_one "\$canon" "\$repo"; then/if false; then/'
@@ -590,6 +628,7 @@ MUT_J='s/kill -0/false/'
 MUT_K='s/^        AW_SETUP_FAIL=1$/        :/'
 MUT_L='s/_lp_rel "\$_cand" "\$path"/_lp_rel "" "$path"/'
 MUT_C2='s/^if \[ -n "\${REAP_AW_PROC_ROOT:-}" \] && /if false \&\& /'
+MUT_N='s/if ! toctou_preserve "\$canon"; then/if false; then/'
 MUT_M='s/if command -v "\$_lp_ps_probe" >\/dev\/null 2>\&1; then/command -v "$_lp_ps_probe" >\/dev\/null 2>\&1 || return 0; if true; then/'
 
 echo "── disk-reaper-classes.test.sh — #2542 classes ─────────────────────────────────────────────"
@@ -721,6 +760,14 @@ if cmp -s "$HERE/lib/live-paths.sh" "$T/mut-m/lib/live-paths.sh" || ! bash -n "$
 else
     chmod +x "$T/mut-m/reap-abandoned-worktrees.sh"
     expect_fail "M mutation: dropping the empty-table gate turns the case RED" case_m "$T/mut-m/reap-abandoned-worktrees.sh"
+fi
+
+expect_pass "N a tree that CHANGES during the pass is preserved (re-probe before removal)" case_n "$AW_OWNER"
+if apply_mutation "$AW_OWNER" "$T/mut-n/reap-abandoned-worktrees.sh" "$MUT_N"; then
+    ln -sfn "$HERE/lib" "$T/mut-n/lib"
+    expect_fail "N mutation: dropping the pre-removal re-probe turns the case RED" case_n "$T/mut-n/reap-abandoned-worktrees.sh"
+else
+    bad "N mutation could not be applied (the re-probe arm moved) — the case is not checking it any more"
 fi
 
 echo

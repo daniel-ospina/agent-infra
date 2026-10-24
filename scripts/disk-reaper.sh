@@ -1451,7 +1451,7 @@ reap_abandoned_arm() {
 
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" SKIP_NOTE="" REPO_ARM_OK=1
+    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" SKIP_NOTE="" REPO_ARM_OK=1 _rem WT_REMOVED=0
     # ⛔ NEITHER OF THESE IS A `return` ANY MORE (#2542). The class has TWO arms, and the abandoned
     # arm needs no repo and no registered-checkout policy: returning here made the class's ONLY working
     # arm skip itself on exactly the cell #2443 measured — the one with no `--repo`, where the disk
@@ -1473,8 +1473,17 @@ reap_worktree() {
         run_class bash "$WORKTREE_REAPER_PATH" "$(mode_flag)" --repo "$repo" --aged-days "$WT_AGED_DAYS"
         out="$CLASS_OUT"; rc="$CLASS_RC"
         a="$(free_kb_for_path "$repo")"
+        # ⛔ THE OWNER'S OWN LEDGER DECIDES ATTRIBUTION — `armed pass complete: REMOVED=<n>` is the datum
+        # it already publishes. Crediting the window's `df` change unconditionally let a pass with ZERO
+        # removals in BOTH arms report `freed_df=32MB verdict=ok` because another lane freed 32 MB
+        # (measured) — a false PASS, and the reason the identical rule the two new arms carry belongs
+        # here as well.
+        _rem="$(sed -n 's/.* REMOVED=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | tail -1)"
+        case "${_rem:-}" in ''|*[!0-9]*) _rem=0 ;; esac
+        WT_REMOVED=$((WT_REMOVED + _rem))
         if [ -n "$b" ] && [ -n "$a" ]; then
-            d=$(( (a - b) / 1024 )); raw=$((raw + d)); [ "$d" -lt 0 ] && d=0; freed=$((freed + d))
+            d=$(( (a - b) / 1024 )); raw=$((raw + d))
+            if [ "$_rem" -gt 0 ]; then [ "$d" -lt 0 ] && d=0; freed=$((freed + d)); fi
         else
             MEASURED=0
         fi
@@ -1523,6 +1532,16 @@ reap_worktree() {
         VERDICT_WT="$(class_verdict "$RC_WT")"
     else
         VERDICT_WT="misconfigured"
+    fi
+    # ⛔ CLASS LEVEL, OVER BOTH ARMS: a class that removed NOTHING in either arm does not get to claim
+    # the window's `df` change (measured: `freed_df=110MB` on a pass whose registered arm failed closed
+    # and whose abandoned arm found nothing, because two other lanes were writing).
+    if [ "$REPO_ARM_OK" = 1 ] && [ "$WT_REMOVED" = 0 ] && [ "$AW_REAPED" = 0 ] && ! is_dry; then
+        if [ "$raw" != 0 ]; then
+            _wn="nothing removed: the ${raw}MB df change belongs to another process (not attributed)"
+            case "; $NOTE_WT;" in *"; $_wn;"*) : ;; *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }$_wn" ;; esac
+        fi
+        freed=0
     fi
     DF_WT_OK="$MEASURED"; RAW_WT="$raw"
     # The skip ledger rides on the class line AND the pass record: a class that skipped a repo did LESS

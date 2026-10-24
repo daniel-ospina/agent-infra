@@ -205,7 +205,7 @@ unit_reference() { # <copy-path> -> prints the unit file that names it, rc 0
 FAMILIES=0; CAND=0; REAPED=0; KEPT=0; FAILED=0
 
 family() { # <parent-dir> <marker-rel>
-    local parent="$1" marker="$2" c copies="" n newest="" newest_mt=-1 mt age out cp_count=0 left other canon
+    local parent="$1" marker="$2" c copies="" n newest="" newest_mt=-1 mt age out cp_count=0 left other canon newest_tie=0
     for c in "$parent"/*/; do
         c="${c%/}"
         [ -d "$c" ] && [ ! -L "$c" ] || continue
@@ -230,8 +230,18 @@ family() { # <parent-dir> <marker-rel>
             return 0
         fi
         cp_count=$((cp_count + 1))
-        if [ "$mt" -gt "$newest_mt" ]; then newest_mt="$mt"; newest="$c"; fi
+        # ⛔ A TIE IS NOT A WINNER. Copies unpacked from the same release archive carry IDENTICAL marker
+        # mtimes — the normal install shape — and `-gt` then picked the survivor by glob order, so the
+        # copy an operator CONFIGURED (its `.runner`, its `_work`) could be the one removed while a
+        # pristine copy survived (measured: `keep-newest=…/runner-1`, `REAPED …/runner-3`). The family
+        # already has a keep-all arm for "which copy is newest is not provable"; a tie is that case.
+        if [ "$mt" -eq "$newest_mt" ]; then newest_tie=1; fi
+        if [ "$mt" -gt "$newest_mt" ]; then newest_mt="$mt"; newest="$c"; newest_tie=0; fi
     done <<<"$copies"
+    if [ "$newest_tie" = 1 ]; then
+        say "KEPT   $parent reason=newest-tied (two or more copies carry the SAME install-marker mtime, so which one must survive is not provable — the family is untouched; this is the shape of a release unpacked several times)"
+        KEPT=$((KEPT + 1)); return 0
+    fi
     if [ "$cp_count" -lt 2 ] || [ -z "$newest" ]; then
         say "KEPT   $parent reason=count-unprovable (copies=$cp_count, newest=${newest:-none}; family untouched)"
         KEPT=$((KEPT + 1)); return 0
