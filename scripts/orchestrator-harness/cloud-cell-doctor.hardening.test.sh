@@ -54,7 +54,30 @@ trap cleanup EXIT
 [ -f "$DOCTOR" ] && ok "shipped doctor present: $(basename "$DOCTOR")" || { bad "missing $DOCTOR"; exit 1; }
 [ -f "$SUP" ]    && ok "shipped supervisor present" || { bad "missing $SUP"; exit 1; }
 
-mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clients" "$T/ps"
+mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clients" "$T/ps" "$T/tmp"
+# $T/repo is a REAL checkout: the cache sweep enumerates worktree roots with `git worktree list`, and
+# an empty enumeration is cannot-verify (rc=3) by design, so a plain directory makes every hygiene arm
+# here assert against a pass that abstained instead of deciding (agent-infra#2573).
+git init -q "$T/repo" 2>/dev/null || true
+
+# ⛔ THE HYGIENE ROLE'S NEW SINKS ARE STUBBED IN THIS FIXTURE (agent-infra#2573). The doctor now reaps
+# stale `cloud-cell-*` dirs under $TMPDIR and prunes IDLE docker images/volumes, and a suite that left
+# those seams pointed at the HOST would delete a fixture of the operator's and run a real
+# `docker image prune -af` on every green run. Both decisions are driven, on real fixtures, by
+# `cloud-cell-doctor.hygiene.test.sh`; here they point at throwaway paths so no arm can reach the box.
+export HYGIENE_TMP_DIR="$T/tmp"
+cat > "$T/bin/docker-stub" <<'SH'
+#!/bin/bash
+# `info` MUST succeed, or the sweep correctly reports "no daemon" and the arms around it stop being
+# about what they claim. The two prunes are no-ops: nothing here may touch a real daemon.
+case "${1:-}" in
+  info)    printf 'Server Version: stub\n'; exit 0 ;;
+  version) printf '29.1.3\n'; exit 0 ;;   # the volume verb is version-gated; a stub must answer it
+esac
+exit 0
+SH
+chmod +x "$T/bin/docker-stub"
+export DOCTOR_DOCKER_BIN="$T/bin/docker-stub"
 
 # ── stubs ────────────────────────────────────────────────────────────────────────────────────────
 # tmux: sessions list, pane pid per session, attached clients per session, and a kill LOG so the
@@ -282,6 +305,21 @@ export DOCTOR_TEST_UV="$T/uv" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTO
 # The mid-pass `stop` hook in the tmux double bumps this (the file `stop` writes first), so an arm can
 # make a stop arrive DURING a pass that is already running.
 export DOCTOR_TEST_STOPGEN="$T/o/state/roles/.stop-generation"
+# The CWD CENSUS seam (`live-ownership.sh`). Without it the hygiene arms would read the RUNNER's real
+# process table: whether a root is "held" would depend on who is testing this, and the per-root
+# decision the arms assert would be a fact about the machine instead of about the fixture. One cwd,
+# inside $T/repo, so the repo root reads HELD (which is the arm's premise).
+cat > "$T/bin/cwdprobe" <<'SH'
+#!/bin/bash
+emit() { [ -n "$1" ] || return 0; printf '/proc/4242/cwd -> %s\n' "$1"; printf 'p4242\nn%s\n' "$1"; }
+emit "$FAKE_CWD"
+exit 0
+SH
+chmod +x "$T/bin/cwdprobe"
+# ⛔ DEFAULT: NOBODY IS IN THE REPO. Most hygiene arms need the sweep to actually RUN (one of them
+# injects a FAILING executor to prove the pass turns cannot-verify), so the held-root premise is opted
+# into per arm — `FAKE_CWD="$T/repo" doc hygiene` — instead of being the fixture's floor.
+export LO_CWD_PROBE="$T/bin/cwdprobe" FAKE_CWD="$T/nowhere-unheld"
 export REAP_MIN_S=60 REAP_SAMPLE_S=2 DOCTOR_INTERVAL=1 MERGE_INTERVAL=1 HYGIENE_INTERVAL=1
 export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
 mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/stat"
@@ -1216,17 +1254,25 @@ grep -q 'cache prune' "$T/uv/uv-calls" 2>/dev/null && ok "hygiene: ran 'uv cache
 grep -q -- '--dry-run' "$T/wt/calls" 2>/dev/null && ok "hygiene: a healthy disk leaves the worktree reaper in DRY-RUN" \
   || bad "hygiene: worktree reaper mode wrong — $(cat "$T/wt/calls" 2>/dev/null)"
 
-# ⛔ The worktree-root sweep DELETES `.venv`/`node_modules` at every worktree root, so its live-worker
-# guard is the one place where a failed read has a destructive consequence. Both halves are asserted:
-# a live worker SKIPS the sweep, and an UNREADABLE session list skips it too. Measured pre-fix on the
+# ⛔ The worktree-root sweep DELETES `.venv`/`node_modules` at every worktree root, so its live-holder
+# guard is the one place where a failed read has a destructive consequence. Both halves are asserted: a
+# root a live process HOLDS is not swept, and an UNREADABLE session list skips the sweep too.
+# (Review round 2, P2: this arm's title used to say "a live worker session suppresses the sweep" —
+# which described the CLAMP this change removes, and stayed green with the clamp restored. It now names
+# the cause the code actually decides on: the per-root census.) Measured pre-fix on the
 # second: `$(harness_sessions | awk …)` made the read's status awk's, so rc=3 became `0` — "no worker
 # is live" — and the pass invoked `prune --caches` and recorded `last_rc=0`.
 say_case "hygiene: a destructive sweep is never armed by a read it could not take"
 reset_tmux; reset_ps; reset_state; rm -f "$T/sup/calls" "$T/uv/uv-calls" "$T/wt/calls"
 mk_lane lane-42 0
-doc hygiene
-[ -s "$T/sup/calls" ] && bad "hygiene: swept the worktree caches while a worker session was LIVE — $(cat "$T/sup/calls")" \
-  || ok "hygiene: a live worker session suppresses the worktree cache sweep"
+# ⛔ THE SWEEP IS SUPPRESSED BY A PROVEN-HOSTILE ROOT, not by the session list: the census puts a live
+# process inside $T/repo, so the root is HELD. (Gating on the session count instead was the defect —
+# see the per-root note in the doctor.)
+FAKE_CWD="$T/repo" doc hygiene
+[ -s "$T/sup/calls" ] && bad "hygiene: swept a worktree root a live process HOLDS — $(cat "$T/sup/calls")" \
+  || ok "hygiene: a root a live process HOLDS is not swept"
+result_has "every root held" && ok "hygiene: …and the record names the reason (every root held)" \
+                             || bad "hygiene: the skip is attributed to no cause — $OUT"
 result_has "workers live" && ok "hygiene: says why the sweep was skipped" || bad "hygiene: no reason recorded — $OUT"
 [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = 0 ] \
   && ok "hygiene: a live worker is a DECISION on a read that succeeded, so the pass is clean (rc=0)" \
@@ -1322,7 +1368,12 @@ OUT="$(MERGE_READ_TIMEOUT=0 bash "$DOCTOR" merge 2>&1)"; RC=$?
 # of EVERY lane — including a LIVE one in a long model call (quiet log, flat CPU) — and that gate is
 # what the header names as the thing separating a wedge from a long call. REAP_MIN_S=0 removes the
 # age floor outright. Both were accepted, so both could kill the lane the reaper exists to spare.
-for _z in REAP_SAMPLE_S REAP_MIN_S; do
+# ⛔ HYGIENE_TMP_MIN_AGE_S belongs in this loop too (#2573): at 0 the age gate disappears and a
+# RECYCLED pid — the name's pid dead now, alive when the dir was written — is the only proof a temp dir
+# is idle, so a live suite's fixture becomes reap-able. The registry entry for the knob cites this
+# refusal as a guard (extensions/shared/heartbeat-progress-edges.ts), so an unpinned refusal is a
+# citation that can go stale silently.
+for _z in REAP_SAMPLE_S REAP_MIN_S HYGIENE_TMP_MIN_AGE_S; do
   OUT="$(env "$_z=0" bash "$DOCTOR" reap 2>&1)"; RC=$?
   [ "$RC" -eq 2 ] && result_has "must be > 0" \
     && ok "startup: a zero $_z is refused (0 makes the bound it configures vacuous)" \

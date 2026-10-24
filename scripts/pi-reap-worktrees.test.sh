@@ -161,6 +161,9 @@ cat >"$T/bin/gh" <<'SHIM'
 #!/usr/bin/env bash
 [ -n "${FAKE_GH_ARGS_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_GH_ARGS_LOG"
 [ -n "${FAKE_GH_FAIL:-}" ] && exit 1
+# FAKE_GH_EXIT carries an ARBITRARY exit code, so the auth arm (gh documents 4 as "requires
+# authentication") is testable — a real cell failure that `exit 1` cannot express.
+[ -n "${FAKE_GH_EXIT:-}" ] && exit "$FAKE_GH_EXIT"
 [ -n "${FAKE_GH_REFS:-}" ] && printf '%s\n' "$FAKE_GH_REFS"
 exit 0
 SHIM
@@ -414,6 +417,7 @@ run_reaper() {
     FAKE_LSOF_CWD="${FAKE_LSOF_CWD:-}" \
     FAKE_GH_REFS="${FAKE_GH_REFS:-}" \
     FAKE_GH_FAIL="${FAKE_GH_FAIL:-}" \
+    FAKE_GH_EXIT="${FAKE_GH_EXIT:-}" \
     FAKE_GH_ARGS_LOG="${FAKE_GH_ARGS_LOG:-}" \
     FAKE_LATE_FILE="${FAKE_LATE_FILE:-}" \
     FAKE_LATE_COUNTER="${FAKE_LATE_COUNTER:-}" \
@@ -566,8 +570,10 @@ assert_absent "$(row_for "$OUT" "$WT_NOPR")" "reason=open-pr" "G5b no false open
 FAKE_GH_REFS=""; FAKE_GH_FAIL=1
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "G5c gh unavailable with candidates => exit 3 (dry-run)"
-assert_contains "$OUT" "gh unavailable" "G5c abort names the unverifiable gate"
-assert_contains "$(cat "$T/$ENV/reap.log")" "gh unavailable with candidates" "G5c abort is logged"
+assert_contains "$OUT" "the open-PR gate cannot be verified" "G5c abort names the unverifiable gate"
+assert_contains "$OUT" "SKIPPED-REPO: skipped=" "G5c and names the repo it skipped, machine-readably (#2443)"
+assert_contains "$OUT" "reason=gh-error(rc=1)" "G5c a generic gh failure is NOT reported as an auth failure"
+assert_contains "$(cat "$T/$ENV/reap.log")" "open-PR gate unverifiable" "G5c abort is logged with its reason"
 OUT="$(run_reaper $ENV --apply --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "G5c armed gh-unavailable => exit 3"
 assert_dir "$WT_PR" "G5c armed abort removed nothing (PR branch kept)"
@@ -583,6 +589,28 @@ assert_contains "$(row_for "$OUT" "$WT_NA")" "reason=reclaimable" "G5d still rec
 "$REAL_GIT" -C "$REPO" remote add origin https://gitlab.com/o/r.git
 OUT="$(GH_BIN_OVERRIDE=/nonexistent/gh run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "G5e non-GitHub remote => N/A, not a permanent fail-closed abort"
+
+# ── G5f: an INSTALLED but UNAUTHENTICATED gh is named as such (#2443) ──
+# The measured cell failure: `/usr/bin/gh` present and working, but the pass's HOME held no
+# `~/.config/gh`, so `gh pr list` exited 4 (gh documents 4 as "requires authentication"). The old
+# abort said "gh unavailable or the origin-remote probe failed" — two causes it could not
+# distinguish, and neither of them the true one — so the fix was invisible to whoever read it. This
+# pins the token, the remedy's subject (HOME), and that nothing is deleted on the way out.
+ENV=G5f; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+WT_AUTH="$(add_named_wt "$REPO" "$ENV-a" feat/g5f-a)"
+FAKE_GH_EXIT=4 OUT="$(run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "G5f gh exit 4 (auth) with candidates => exit 3"
+assert_contains "$OUT" "reason=gh-not-authenticated(rc=4)" \
+    "G5f the abort names AUTHENTICATION, not 'gh unavailable'"
+assert_contains "$OUT" "skipped=$REPO" "G5f and names the repo it skipped"
+assert_contains "$OUT" "HOME" "G5f the remedy names the thing that is actually wrong (the pass's HOME/credentials)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "GH=auth" "G5f the pass record says GH=auth — a distinct state, not 'unavailable'"
+assert_absent "$OUT" "reason=reclaimable" "G5f NOTHING is classified reclaimable when the gate is unverifiable"
+FAKE_GH_EXIT=4 OUT="$(run_reaper $ENV --apply --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "G5f armed: still exit 3"
+assert_dir "$WT_AUTH" "G5f armed abort removed NOTHING on an unverifiable PR gate"
+FAKE_GH_EXIT=""
 
 # ── G6: aged gate + branch-retained removal path ───────────────────────
 ENV=G6; REPO="$(mk_repo $ENV)"
@@ -1079,7 +1107,10 @@ assert_contains "$(row_for "$OUT" "$WT_A19")" "reason=open-pr" \
 FAKE_GH_REFS="feat/a19-p" OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote" \
     run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "A19 a failing origin probe => exit 3 (never 'the PR gate is N/A')"
-assert_contains "$OUT" "gh unavailable" "A19 the abort names the unverifiable open-PR gate"
+assert_contains "$OUT" "the open-PR gate cannot be verified" "A19 the abort names the unverifiable open-PR gate"
+assert_contains "$OUT" "reason=origin-probe-failed(rc=1)" \
+    "A19 ... and names the PROBE, not `gh`, as the thing that failed (the remedies differ)"
+assert_absent "$OUT" "gh-not-authenticated" "A19 a git-level probe failure is never blamed on gh authentication"
 assert_absent "$OUT" "reason=reclaimable" \
     "A19 the open-PR candidate is NOT classified reclaimable on a broken probe"
 FAKE_GH_REFS="feat/a19-p" OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote" \
