@@ -1159,7 +1159,7 @@ check_disk_reaper() {
       /*) git -C "$rp_repos" rev-parse --git-dir >/dev/null 2>&1 || rp_repos="" ;;
       *) rp_repos="" ;;
     esac
-    [ -n "$rp_repos" ] || die "the cell's checkout (\${WORKDIR:-<unset>}) is not a usable git repository, and no DISK_REAPER_REPOS was given — refusing to schedule a reaper whose scan list would fall back to an AMBIENT repo (\$REPO / \$AGENT_INFRA_PATH name the harness or a developer's checkout, not this cell). Fix the checkout, or set DISK_REAPER_REPOS explicitly."
+    [ -n "$rp_repos" ] || die "the cell's checkout (${WORKDIR:-<unset>}) is not a usable git repository, and no DISK_REAPER_REPOS was given — refusing to schedule a reaper whose scan list would fall back to an AMBIENT repo (\$REPO / \$AGENT_INFRA_PATH name the harness or a developer's checkout, not this cell). Fix the checkout at that path, or set DISK_REAPER_REPOS explicitly."
   fi
 
   rc=0

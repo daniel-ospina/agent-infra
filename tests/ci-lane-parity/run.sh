@@ -772,7 +772,7 @@ awk -v cheap="$CHEAP" -v failing="$NAMED_FAIL" '
   /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
   { print }
 ' "$RUNNER" >"$TMP/runner-onefail.sh"
-$FIXTURE_BOUND bash "$TMP/runner-onefail.sh" >"$TMP/runner-onefail.out" 2>&1
+env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$TMP/runner-onefail.sh" >"$TMP/runner-onefail.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-onefail.out")"
 if [ "$RC" -eq 1 ] && grep -qF "❌ FAILED SHARD: $NAMED_FAIL" <<<"$OUT"; then
@@ -791,7 +791,7 @@ sed 's/\[ "$shard_errors" -ne "$shard_err0" \] && shard_fail "$1"; //' "$TMP/run
 if cmp -s "$TMP/runner-onefail.sh" "$TMP/runner-onefail-noname.sh"; then
   fail "the no-name mutation did not change the fixture (the naming call moved — update this arm's sed)"
 else
-  $FIXTURE_BOUND bash "$TMP/runner-onefail-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
+  env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$TMP/runner-onefail-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-onefail-noname.out")"
   if [ "$RC" -eq 1 ] && ! grep -qF 'FAILED SHARD' <<<"$OUT"; then

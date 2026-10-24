@@ -212,7 +212,17 @@ run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
 # checking no syntax at all. `swept` is asserted below, so the sweep loops must have done work.
 swept=0
-sweep_file() { swept=$((swept + 1)); bash -n "$1" || shard_errors=$((shard_errors + 1)); }
+# ⛔ SWEEP FAILURES ARE COUNTED SEPARATELY (#2643 review, 2026-10-24). `shard_errors` is the verdict
+# and covers BOTH classes, so a recap that DERIVES "the sweep half" by subtracting the named shards
+# is guessing: when the naming arm itself is broken, a failing SHARD opens the "all sweeps" branch and
+# points the reader at the wrong subsystem. One counter, incremented where the failure happens.
+# ⛔ AND THE ` || shard_errors=$((shard_errors + 1))` LITERAL MUST SURVIVE HERE (
+# `tests/ci-lane-parity/run.sh` §8h pins it by `sed` across BOTH functions). So the second counter is
+# charged from the same delta idiom `run_shard` uses, rather than by rewriting the recorder into a
+# `{ …; }` group: a grouped rewrite silently narrowed that pin to `run_shard` alone, meaning a
+# refactor could delete the sweep recorder and nothing would notice (caught by review, cycle 2).
+sweep_errors=0
+sweep_file() { swept=$((swept + 1)); shard_err0=$shard_errors; bash -n "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_errors" -ne "$shard_err0" ] && sweep_errors=$((sweep_errors + 1)); }
 
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
 # keeps the line count but points the list at a /tmp stub would report every shard as passed having
@@ -413,13 +423,18 @@ fi
 sentinel_sweep="$(mktemp)"
 printf 'if then\n' >"$sentinel_sweep"
 before_sweep_err=$shard_errors
+before_sweep_errors=$sweep_errors
 sweep_file "$sentinel_sweep"
 rm -f "$sentinel_sweep"
 if [ "$shard_errors" -ne $((before_sweep_err + 1)) ]; then
   echo "❌ the sweep arm is broken — a file with a syntax error would not fail this run"
   exit 1
 fi
+# Both counters are restored to their PRE-sentinel values (not decremented): a decrement silently
+# assumes the sentinel incremented, and this file's whole discipline is that an assumption about a
+# counter is what a refactor invalidates.
 shard_errors=$before_sweep_err
+sweep_errors=$before_sweep_errors
 swept=$((swept - 1))
 
 # Runtime self-check 3: the FAILURE-RECORDING arm must still be wired. Without this, a rewrite
@@ -445,21 +460,22 @@ shard_listed=$before_listed
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
-  # The recap (#2643). `shard_failed_list` is empty only when the failures were all SYNTAX-SWEEP
-  # failures (those name their own file at the `bash -n` line) — say so rather than printing a
-  # dangling label, and never let an empty list read as "no failing shard".
+  # The recap (#2643). Three shapes, each REPORTED from what was counted — never inferred from what is
+  # absent: a failing shard is named; a failing syntax sweep named its own file at the `bash -n` line;
+  # and a failure with NEITHER means the naming arm is broken, which is a defect in this runner and must
+  # say so rather than blame a subsystem it never looked at.
   if [ -n "$shard_failed_list" ]; then
     echo "❌ failing shard(s): $shard_failed_list"
-    # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT (#2643 review, 2026-10-24). `shard_errors` counts BOTH
-    # failing shards and failing syntax sweeps; the list above names only the former. Printing "2
-    # failed" beside one name reads as a missing name — and the missing half is exactly what the recap
-    # exists to stop hunting for. Counted from the list itself, not a second counter that could drift.
-    shard_named=$(printf '%s' "$shard_failed_list" | tr ',' '\n' | grep -c .)
-    if [ "$shard_errors" -gt "$shard_named" ]; then
-      echo "❌ …and $((shard_errors - shard_named)) of them are SYNTAX-SWEEP failures, not shards — each named at its own 'bash -n' line"
+    # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT. `shard_errors` counts BOTH failing shards and failing
+    # syntax sweeps; the list above names only the former. Printing "2 failed" beside one name reads as
+    # a missing name — and the missing half is exactly what the recap exists to stop hunting for.
+    if [ "$sweep_errors" -gt 0 ]; then
+      echo "❌ …and $sweep_errors of them are SYNTAX-SWEEP failures, not shards — each named at its own 'bash -n' line"
     fi
-  else
+  elif [ "$sweep_errors" -gt 0 ]; then
     echo "❌ no shard is named here — every failure above is a syntax-sweep failure, named at its own 'bash -n' line"
+  else
+    echo "❌ no shard is named here and no syntax sweep failed — the naming arm is NOT WIRED (a shard failed and nothing recorded its name). This is a defect in scripts/run-bash-shards.sh, not in the shard: read the per-shard output above for the path."
   fi
   exit 1
 fi
