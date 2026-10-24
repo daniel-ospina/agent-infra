@@ -1525,6 +1525,14 @@ check_fleet_tools_farmed() {
   else
     fail "$label: farmed map-sessions.py differs from (or is missing vs) tools/fleet/map-sessions.py"
   fi
+  # #1777 — the ref-claim reader. It imports the sibling liveness.py, so farming it
+  # without the classifier is the same loud exit-2 abort, and a stale copy means an
+  # operator reads a DIFFERENT claim polarity than the repo's.
+  if diff -q "$ROOT/tools/fleet/claim_lanes.py" "$DEST/scripts/fleet/claim_lanes.py" >/dev/null 2>&1; then
+    echo "ok: $label farmed claim_lanes.py == repo copy (#1777)"
+  else
+    fail "$label: farmed claim_lanes.py differs from (or is missing vs) tools/fleet/claim_lanes.py"
+  fi
   # The farmed driver must actually start from the farmed layout: it imports its
   # sibling classifier and forks the shared identity library. `--help` is the
   # read-only mode (no cmux call, no store read, no issue); the pinned
@@ -1927,8 +1935,28 @@ else
     esac
   done
 fi
-grep -q "scripts/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
-  || fail "run 1 did not report the fleet-tools farm copy (4 files, #1178)"
+# SAME DERIVATION for the fleet-tools farm (#1777 adds claim_lanes.py to it): the count comes from the
+# ARRAY, so a declared sixth tool cannot turn a correct farm into a red, and a summary that lies about
+# how many it copied is still caught.
+tools_decl="$(farm_array_entries fleet_tools | tr '\n' ' ')"
+tools_n="$(printf '%s\n' "$tools_decl" | wc -w | tr -d ' ')"
+if [ -z "${tools_n:-}" ] || [ "$tools_n" -eq 0 ]; then
+  fail "run 1: could not read the fleet_tools array from setup.sh — the fleet-tools farm assertion cannot be derived"
+else
+  tools_line="$(grep -m1 'scripts/fleet farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  case "$tools_line" in
+    *"scripts/fleet farm: $tools_n copied"*) ;;
+    *) fail "run 1 did not report the fleet-tools farm copy (expected $tools_n copied, #1178/#1777): ${tools_line:-<no fleet-tools farm line at all>}" ;;
+  esac
+  for tool_base in $tools_decl; do
+    # The summary spells the tools with HYPHENS (`lane-liveness`), the array with underscores.
+    tool_norm="$(printf '%s' "${tool_base%.py}" | tr '_' '-')"
+    case "$tools_line" in
+      *"$tool_norm"*) ;;
+      *) fail "run 1: the fleet-tools summary does not NAME the declared tool '$tool_base' — a summary that omits a tool it farmed misreports the farm (#1777)" ;;
+    esac
+  done
+fi
 check_tools_dir_clean "run1-final"
 
 # --- run 1b: #1277 legacy migration + durable regression guard -----------------
@@ -1941,7 +1969,7 @@ check_tools_dir_clean "run1-final"
 # the farm FAIL LOUD rather than recreate one.
 echo "== run 1b: legacy tools/fleet migration + tools/ regression guard (#1277)"
 mkdir -p "$DEST/tools/fleet"
-for f in lane_liveness.py liveness.py fleet-health.py map-sessions.py; do
+for f in lane_liveness.py liveness.py claim_lanes.py fleet-health.py map-sessions.py; do
   echo "# legacy farm replica (the pi boot-blocker)" > "$DEST/tools/fleet/$f"
 done
 if [ -f "$DEST/tools/fleet/lane_liveness.py" ]; then
