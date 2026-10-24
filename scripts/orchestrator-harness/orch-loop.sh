@@ -3581,7 +3581,7 @@ while true; do
     if [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ] && [ "${CLAIM_SNAPSHOT_WRITE:-}" = "ok" ]; then
       echo "[claims] snapshot read=ok refs=${CLAIM_SNAPSHOT_REFS:-?} max_age=${CLAIM_SNAPSHOT_MAX_AGE:-?}s" >> "$LOG"
     elif [ "${CLAIM_SNAPSHOT_FETCH:-}" = "ok" ]; then
-      echo "[claims] ⛔ snapshot write=failed (read=ok) — nothing was published, so the PREVIOUS snapshot is still in place and is believed until it is older than ${CLAIM_SNAPSHOT_MAX_AGE:-?}s, after which every selection answer is claim-unreadable. This is a WRITE failure under \$O/state (disk, permissions), not a network one: check the disk, not the registry" >> "$LOG"
+      echo "[claims] ⛔ snapshot write=failed (read=ok) — nothing was published, so the PREVIOUS snapshot is still in place — believed ONLY while that file's own header says ok and it is inside ${CLAIM_SNAPSHOT_MAX_AGE:-?}s, and claim-unreadable otherwise (or when there is no previous snapshot at all). This is a WRITE failure under \$O/state (disk, permissions), not a network one: check the disk, not the registry" >> "$LOG"
     elif [ "${CLAIM_SNAPSHOT_WRITE:-}" = "ok" ]; then
       echo "[claims] ⛔ claim-unreadable: the fetch did NOT answer (read=${CLAIM_SNAPSHOT_FETCH:-?} refs=${CLAIM_SNAPSHOT_REFS:-?}) — its failed header WAS published, so every selection answer this cycle is claim-unreadable: no PR is spawned or armed and no issue dispatched on the assumption that silence means freedom" >> "$LOG"
     else
