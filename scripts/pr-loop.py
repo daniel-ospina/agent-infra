@@ -108,7 +108,11 @@ def decide(klass, why):
     if klass == "call-rail":
         return "rail", None
     if klass == "rerun-checks":
-        return "rerun", None
+        # ⛔ CARRY THE REASON (#1926). It names WHICH check and HOW LONG it has been stuck
+        # (`python-ci-gate queued 150m`), which is the difference between "the required checks
+        # never got created" and "this one has been wedged for hours" -- two different repairs.
+        # Dropping it left the brief saying only "re-run the required checks".
+        return "rerun", (f"re-run {why}" if why else "re-run the required checks")
     if klass == "resolve-conflict":
         return "fix", "rebase on main, then record+rail"
     if klass == "record-review":

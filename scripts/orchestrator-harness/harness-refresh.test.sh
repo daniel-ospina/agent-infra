@@ -741,23 +741,99 @@ printf '#!/bin/bash\nexit 0\n'       > "$D/bin/tmux";   chmod +x "$D/bin/tmux"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/sleep";  chmod +x "$D/bin/sleep"
 printf '#!/bin/bash\necho load\n'    > "$D/bin/uptime"; chmod +x "$D/bin/uptime"
 for f in lane.sh merge-one.sh chain-merge.sh claims.sh; do : > "$D/O/$f"; done
-SPAWN="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="behind:111111111111" \
+# ⛔ THE CI-QUEUE READING THIS RIG MUST SUPPLY (#2296, cycle-3 P1). `dispatch-merge.sh` now reads the
+# CI queue before it dispatches a batch, and an UNREADABLE queue DEFERS (fail-closed — an unreadable
+# queue is not an empty one). This rig has no `gh`, so without a reading every line the three
+# assertions below assert would be deferred away and they would fail for a reason they do not test
+# (measured: 191 passed, 3 failed, all three of them this). The reading is SUPPLIED through the
+# module's documented `CIQ_GH` seam with a SHALLOW queue — the production precondition under which a
+# batch may run — rather than switching the gate off: a gate an env var can open is not a gate.
+cat > "$D/bin/gh-queue" <<'GHQ'
+#!/bin/sh
+case "$2" in
+  *status=queued*)      echo '{"total_count": 1}' ;;
+  *status=in_progress*) echo '{"total_count": 0}' ;;
+  *actions/runners*)    echo '{"total_count": 3, "runners": [{"status": "online", "busy": false}]}' ;;
+  *) exit 1 ;;
+esac
+GHQ
+chmod +x "$D/bin/gh-queue"
+SPAWN="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" HARNESS_TOKEN="behind:111111111111" \
         bash "$DM" "$D/repo" owner/repo 7 2>&1 | grep 'lane-7')"
 case "$SPAWN" in *"[harness=behind:111111111111]"*) ok "the lane-7 spawn line names the behind checkout" ;;
                   *) bad "the lane spawn line does not disclose it: '$SPAWN'" ;; esac
 # An ABSENT token must not read as "current": the default is the honest unknown.
-SPAWN2="$(PATH="$D/bin:$PATH" O="$D/O" bash "$DM" "$D/repo" owner/repo 8 2>&1 | grep 'lane-8')"
+SPAWN2="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" bash "$DM" "$D/repo" owner/repo 8 2>&1 | grep 'lane-8')"
 case "$SPAWN2" in *"[harness=unknown]"*) ok "an unsupplied token reads as unknown, never as current" ;;
                    *) bad "an absent token printed '$(printf '%s' "$SPAWN2" | tr -d '\n')'" ;; esac
 # ⛔ AND AN EMPTY TOKEN IS A REAL ANSWER (the box is current), NOT AN ABSENT ONE. `${TOKEN:-unknown}`
 # collapses the two, so every HEALTHY box stamped `[harness=unknown]` — the marker a reader needs in
 # order to spot a stale box would then be present always, and therefore read never.
-ALL9="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
+ALL9="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" HARNESS_TOKEN="" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
 case "$ALL9" in *harness=*) bad "an EMPTY (current) token still stamped a spawn line: '$(printf '%s' "$ALL9" | grep -o '\[harness=[^]]*\]' | head -1)'" ;;
                   *) ok "…and an EMPTY (current) token leaves BOTH spawn lines clean (lane- and chain-) — only UNSET is unknown" ;; esac
+
+# ⛔ A DEFERRED BATCH MUST UNDO WHAT THE CONTROLLER DID (#2296 cycle 4, P1). The controller CLAIMS
+# `refs/claims/issue-<N>` and appends the id to `dispatched.txt` BEFORE it calls this script, so an
+# early `exit 0` that only printed a line left every issue in the batch on a 3 h cross-box lease held
+# by a box that started nothing — and skipped by this box until the row was reaped. Measured here:
+# the claims are released and the rows are dropped, so the batch really is back in the pool.
+_CASE=$((_CASE+1)); echo "=== C2b: a CI-CONGESTED batch releases the claims and rows it never used ==="
+DQ="$T/c2b"; mkdir -p "$DQ/bin" "$DQ/O/state" "$DQ/repo"
+printf '#!/bin/bash\nexit 0\n' > "$DQ/bin/git";   chmod +x "$DQ/bin/git"
+printf '#!/bin/bash\nexit 0\n' > "$DQ/bin/tmux";  chmod +x "$DQ/bin/tmux"
+printf '#!/bin/bash\nexit 0\n' > "$DQ/bin/uptime"; chmod +x "$DQ/bin/uptime"
+# ⛔ NO EMPTY worker-terminal.sh IN THIS RIG (#2296 cycle 4 verification): an EMPTY module is worse
+# than none — `dispatch-merge.sh` prefers `$O/worker-terminal.sh` when it exists, finds no `wt_spawn`,
+# and exits 78 before any of the congestion logic below runs. Left absent, it falls through to the
+# sibling shipped module (which is what the neighbouring C2 case relies on too).
+# A claims module that records what it was asked to release — the assertion is on the CALL, because a
+# release that is attempted and fails is a different (loud) outcome the helper already reports.
+cat > "$DQ/O/claims.sh" <<'CLS'
+claim_issue_release_record() { echo "RELEASED $3" >> "$CLAIM_LOG"; return 0; }
+CLS
+printf '7\n9\n' > "$DQ/O/dispatched.txt"
+# DEEP: 999 queued against 2 runners => ceiling 4 => every batch defers.
+cat > "$DQ/bin/gh-queue" <<'GHQD'
+#!/bin/sh
+case "$2" in
+  *status=queued*)      echo '{"total_count": 999}' ;;
+  *status=in_progress*) echo '{"total_count": 1}' ;;
+  *actions/runners*)    echo '{"total_count": 2, "runners": [{"status": "online", "busy": true}, {"status": "online", "busy": true}]}' ;;
+  *) exit 1 ;;
+esac
+GHQD
+chmod +x "$DQ/bin/gh-queue"
+: > "$T/c2b-claims.log"
+DOUT="$(PATH="$DQ/bin:$PATH" O="$DQ/O" CIQ_GH="$DQ/bin/gh-queue" CLAIM_LOG="$T/c2b-claims.log" \
+        bash "$DM" "$DQ/repo" owner/repo 7 9 2>&1)"
+DRC=$?
+case "$DOUT" in *"nothing dispatched this run"*) ok "a congested queue defers the whole batch, and says so" ;;
+                 *) bad "the congested batch did not defer: $(printf '%s' "$DOUT" | tr '\n' ' ' | cut -c1-160)" ;; esac
+# ⛔ THE EXIT CODE IS THE CONTRACT (#2333 cycle 6 review, P2). The controller counts each issue as
+# DISPATCHED before it calls this script, so a deferral that exits 0 left the funnel printing
+# `-> N dispatched` and the cycle record `dispatched=N nothing=none` on the one cycle the gate
+# stopped everything. Reverting `exit 3` → `exit 0` used to leave every suite green: no arm read the
+# rc — this arm captured stdout (`DOUT="$( … )"`) and never read `$?` at all. ⛔ THE CAUSE IS THAT
+# NOBODY READ IT, AND THIS BLOCK IS THE COUNTER-EXAMPLE TO THE TWO OBVIOUS MISATTRIBUTIONS: `$( )`
+# does NOT discard a status (`X="$(cmd)"; rc=$?` preserves it — the `DOUT=…/DRC=$?` pair directly
+# above depends on exactly that), and there is no pipe in this block (`| grep 'lane-7'` lives in the
+# separate C2 spawn-line case, and the suite runs `set -uo pipefail` anyway, so a pipeline would
+# propagate a non-zero status). Recording either of those as the cause sends the next author to
+# restructure a capture that was never the problem (#1720: a log naming the wrong cause).
+case "$DRC" in 3) ok "…and it exits 3 — the code the controller reads to record dispatched=0 instead of counting it" ;;
+              *) bad "a deferred batch exited $DRC, not 3 — the controller would report the batch as DISPATCHED" ;; esac
+CLAIMS="$(cat "$T/c2b-claims.log" 2>/dev/null | tr '\n' ' ')"
+case "$CLAIMS" in *"RELEASED 7"*"RELEASED 9"*) ok "…and BOTH issue claims it never used are released (no 3 h stranded lease)" ;;
+                  *) bad "a deferred batch stranded its claims: released=[$CLAIMS] — every peer refuses those issues until the lease expires" ;; esac
+if [ -f "$DQ/O/dispatched.txt" ] && [ ! -s "$DQ/O/dispatched.txt" ]; then
+  ok "…and the dispatched.txt rows are dropped, so this box re-reads them next cycle (no turn consumed)"
+else
+  bad "a deferred batch left dispatched.txt rows: [$(tr '\n' ' ' < "$DQ/O/dispatched.txt" 2>/dev/null)] — this box skips free issues until the reaper prunes them"
+fi
 # The chain- line is a SECOND spawn path, and it used to stamp unconditionally: `[harness=]` on every
 # current box, which is exactly the always-present marker this design refuses.
-ALL7="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="behind:111111111111" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
+ALL7="$(PATH="$D/bin:$PATH" O="$D/O" CIQ_GH="$D/bin/gh-queue" HARNESS_TOKEN="behind:111111111111" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
 case "$ALL7" in *"chain-9"*"[harness=behind:111111111111]"*) ok "the CHAIN spawn line names the behind checkout too" ;;
                *) bad "the chain spawn line does not disclose it: $(printf '%s' "$ALL7" | tr '\n' ' ' | cut -c1-200)" ;; esac
 
@@ -1079,9 +1155,13 @@ chmod +x "$D/O/harness-refresh.sh"
 # No pipe: `grep … | grep -q` is the SIGPIPE false-negative idiom the repo's own guard rejects (a quiet
 # consumer exiting early can make the producer die with SIGPIPE under `pipefail`, and the assertion then
 # reads as a plain "no match"). awk reads the file once and exits on the first hit.
-_hr_call_ctx="$(awk '{ w[NR%4]=$0 }
-  /^  harness_refresh_cycle/ {
-    if (w[(NR-1)%4] ~ /_HR_DONE=0/ || w[(NR-2)%4] ~ /_HR_DONE=0/ || w[(NR-3)%4] ~ /_HR_DONE=0/) print "yes"
+# The reset is its own STATEMENT, not a one-liner: comments (and later per-cycle resets, e.g. the
+# #2308 refresh-resolution reset) legitimately sit between `_HR_DONE=0` and the call, so the look-back
+# must span the intervening block rather than a fixed 3 lines — a narrow window reported a FALSE RED
+# on a correct call site the moment a comment was added between the two statements.
+_hr_call_ctx="$(awk '{ w[NR%32]=$0 }
+  /^[[:space:]]*harness_refresh_cycle[[:space:]]*($|#)/ {
+    for (i=1; i<=24; i++) if (w[(NR-i)%32] ~ /_HR_DONE=0/) { print "yes"; exit }
     exit
   }' "$LOOP")"
 [ "$_hr_call_ctx" = yes ] \

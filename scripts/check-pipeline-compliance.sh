@@ -1919,7 +1919,10 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # is PR #1271's actual heading, the second is the same body's backticked
   # intended keyword.
   expect_hazard() {
-    local input="$1" intended="$(printf '%s' "${GH_REPO}#$2" | tr '[:upper:]' '[:lower:]')" want="$3" got
+    # Split declaration, then assignment: the declaration form hides the status of the
+    # substitution from `$?` (the `discarded-status` shape the repo now bans).
+    local input="$1" want="$3" got intended
+    intended="$(printf '%s' "${GH_REPO}#$2" | tr '[:upper:]' '[:lower:]')"
     got="$(scan_close_word_hazards "$input" "$intended")"
     if { [[ "$want" == "yes" && -n "$got" ]] || [[ "$want" == "no" && -z "$got" ]]; }; then
       printf '✅ scan_close_word_hazards(%q, %s) → hazards=%s\n' "$input" "$intended" "$want"
@@ -1930,7 +1933,10 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   }
   # The ADVISORY half. Never a failure, so a wrong answer here costs a note.
   expect_note() {
-    local input="$1" intended="$(printf '%s' "${GH_REPO}#$2" | tr '[:upper:]' '[:lower:]')" want="$3" got
+    # Split declaration, then assignment: the declaration form hides the status of the
+    # substitution from `$?` (the `discarded-status` shape the repo now bans).
+    local input="$1" want="$3" got intended
+    intended="$(printf '%s' "${GH_REPO}#$2" | tr '[:upper:]' '[:lower:]')"
     got="$(close_word_notes "$input" "$intended")"
     if { [[ "$want" == "yes" && -n "$got" ]] || [[ "$want" == "no" && -z "$got" ]]; }; then
       printf '✅ close_word_notes(%q, %s) → note=%s\n' "$input" "${GH_REPO}#$2" "$want"

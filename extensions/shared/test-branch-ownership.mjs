@@ -12,6 +12,7 @@ import {
   repoKey, readBranchState, localBranchExists, tokenize, extractGitInvocation, resolveEffectiveRepo,
   resolveRepoFromInv,
   classifyBranchOp, parseRefspecDst, decideM1, decideM2, decideM3, ownershipAllowed,
+  syncEffectAllowed, fastForwardOntoUpstreamProof,
   acquireRepoLock, releaseRepoLock, lockDir,
 } from "./branch-ownership.mjs";
 
@@ -996,6 +997,116 @@ ok("lock: child acquired", /CHILD_HELD=true/.test(child.stdout), child.stdout);
 const L5 = acquireRepoLock(lockKey, PID, { timeoutMs: 2500, retryMs: 100 });
 ok("lock: parent waits for child release then acquires", L5.held === true, JSON.stringify(L5));
 releaseRepoLock(lockKey, PID);
+
+// ── #2277: a lane rooted OUTSIDE a repo can advance it, but only on proof ──
+// Measured 2026-10-21 on the agent-infra hub: `0 ahead / 76 behind origin/main`,
+// clean, and BOTH lossless recovery verbs refused — so the fleet ran a
+// 76-commit-stale rail (#2264's `--expect-head` absent from the checkout). The
+// allowance required baseline.repoKey === the sync op's repoKey, which a lane
+// rooted in another repo can never satisfy. The replacement is a MEASURED
+// proof, and these assertions pin every way it can be unearned.
+{
+  // origin (bare) → seed clone → target clones, so upstream/refs/remotes exist.
+  const fOrigin = join(ROOT, "ff-origin.git");
+  // #2581 — the bare repo starts EMPTY, so the branch every clone below checks out is named by
+  // `init.defaultBranch` from the box's EFFECTIVE config (this suite reads the global channel,
+  // `~/.gitconfig`). Where it is unset (a CI runner, a fresh cell) git names it `master` and the
+  // fixture's own `git push -q origin main` below dies with `error: src refspec main does not
+  // match any` — a message that names the refspec, never the cause. Measured 2026-10-23: this
+  // file and main-worktree-guard/test-module-load.mjs were main's only two reds while both were
+  // green on a box whose config supplied the value. Name the branch in the FIXTURE (`-b main`,
+  // the repo-wide idiom): the suite's verdict is then a function of this commit, not the box.
+  git(ROOT, `init -q --bare -b main "${fOrigin}"`);
+  const seed = join(ROOT, "ff-seed");
+  git(ROOT, `clone -q "${fOrigin}" "${seed}"`);
+  git(seed, "config user.email t@bo.local && git config user.name bo-test");
+  writeFileSync(join(seed, "a.txt"), "a\n");
+  git(seed, "add a.txt && git commit -qm c1 && git push -q origin main");
+
+  const behind = join(ROOT, "ff-behind");
+  git(ROOT, `clone -q "${fOrigin}" "${behind}"`);
+  git(behind, "config user.email t@bo.local && git config user.name bo-test");
+  writeFileSync(join(seed, "b.txt"), "b\n");
+  git(seed, "add b.txt && git commit -qm c2 && git push -q origin main");
+  git(behind, "fetch -q origin");
+
+  const equal = join(ROOT, "ff-equal");
+  git(ROOT, `clone -q "${fOrigin}" "${equal}"`);
+
+  const bare = join(ROOT, "ff-bare");
+  // #2581 — unused fixture: created here and never referenced again, so it needs no pin. The set
+  // that DOES need one is the EMPTY-bare repos that get CLONED — in this file that is
+  // `ff-origin.git` alone (the `bare.git` at the top is a `clone --bare` of a non-empty repo and
+  // is used only as a git-dir/cwd target). Annotated because this is the file's second
+  // `init --bare`: a reader grepping for "the sites that need a pin" must not add one here or
+  // conclude the pin set is incomplete.
+  git(ROOT, `init -q --bare "${bare}"`);
+
+  const pBehind = fastForwardOntoUpstreamProof(behind, "main");
+  ok("#2277 proof: a clean checkout strictly BEHIND its upstream is proven fast-forwardable",
+    pBehind.ok === true, JSON.stringify(pBehind));
+  const pEqual = fastForwardOntoUpstreamProof(equal, "main");
+  ok("#2277 proof: a checkout already EQUAL to upstream is not admitted (nothing to fast-forward)",
+    pEqual.ok === false && /already equals its upstream/.test(pEqual.why ?? ""), JSON.stringify(pEqual));
+  const pWrongBranch = fastForwardOntoUpstreamProof(behind, "feat/other");
+  ok("#2277 proof: a non-default branch is refused (the hub's default branch is measured, not assumed)",
+    pWrongBranch.ok === false && /not its default branch/.test(pWrongBranch.why ?? ""), JSON.stringify(pWrongBranch));
+  git(behind, "checkout -q -b feat/ahead && echo local > local.txt && git add local.txt && git commit -qm local");
+  const pAhead = fastForwardOntoUpstreamProof(behind, "main");
+  ok("#2277 proof: an off-default branch carrying local work is refused",
+    pAhead.ok === false, JSON.stringify(pAhead));
+  git(behind, "checkout -q main && git merge -q --no-edit feat/ahead");
+  const pDiverged = fastForwardOntoUpstreamProof(behind, "main");
+  ok("#2277 proof: a DIVERGED default branch is refused (fast-forward cannot apply)",
+    pDiverged.ok === false && /diverged or is ahead/.test(pDiverged.why ?? ""), JSON.stringify(pDiverged));
+  const noUp = join(ROOT, "ff-no-upstream");
+  git(ROOT, `clone -q "${fOrigin}" "${noUp}"`);
+  git(noUp, "config user.email t@bo.local && git config user.name bo-test && git branch --unset-upstream");
+  const pNoUpstream = fastForwardOntoUpstreamProof(noUp, "main");
+  ok("#2277 proof: a branch with NO configured upstream is refused (unknown target)",
+    pNoUpstream.ok === false && /no configured upstream/.test(pNoUpstream.why ?? ""), JSON.stringify(pNoUpstream));
+  const pWorktree = fastForwardOntoUpstreamProof(WT, "feat/wt");
+  ok("#2277 proof: a LINKED WORKTREE is refused (this arm is the shared main checkout only)",
+    pWorktree.ok === false && /LINKED WORKTREE/.test(pWorktree.why ?? ""), JSON.stringify(pWorktree));
+  const pNoCwd = fastForwardOntoUpstreamProof(null, "main");
+  ok("#2277 proof: an unresolvable checkout is refused (fail closed)", pNoCwd.ok === false, JSON.stringify(pNoCwd));
+
+  // ── the predicate: the foreign arm must keep EVERY #1144 condition ──
+  const fEff = (parsed, over = {}) => ({
+    parsedEffect: { verb: "pull", ffOnly: true, rebaseEffect: false, leavesDirty: false, unverifiable: false, positionals: [], ...parsed },
+    onlyGitInvocation: true, scopeOwnRepo: false, treeClean: true, foreignHubFastForward: true, ...over,
+  });
+  ok("#2277: a PROVEN foreign fast-forward (clean, own default branch, ancestor) is ALLOWED",
+    syncEffectAllowed(fEff({})) === true);
+  ok("#2277: the foreign arm without the proof is REFUSED (the flag is not a bypass)",
+    syncEffectAllowed(fEff({}, { foreignHubFastForward: false })) === false);
+  ok("#2277: the foreign arm still requires ffOnly — a bare `pull` is REFUSED",
+    syncEffectAllowed(fEff({ ffOnly: false })) === false);
+  ok("#2277: the foreign arm still requires a CLEAN tree",
+    syncEffectAllowed(fEff({}, { treeClean: false })) === false);
+  ok("#2277: the foreign arm still requires the sync to be the ONLY git invocation",
+    syncEffectAllowed(fEff({}, { onlyGitInvocation: false })) === false);
+  ok("#2277: the foreign arm still refuses a rebase EFFECT",
+    syncEffectAllowed(fEff({ rebaseEffect: true })) === false);
+  ok("#2277: the foreign arm still refuses an UNVERIFIABLE flag proof",
+    syncEffectAllowed(fEff({ unverifiable: true })) === false);
+  ok("#2277: the foreign arm still refuses an op that leaves staged state",
+    syncEffectAllowed(fEff({ leavesDirty: true })) === false);
+  ok("#2277: the foreign arm still fails closed with NO parsed effect",
+    syncEffectAllowed({ ...fEff({}), parsedEffect: null }) === false);
+
+  // ownershipAllowed: the proof replaces the session-baseline requirement for a
+  // sync op ONLY — a session with no baseline at all is admitted here, which is
+  // the defect this issue names.
+  ok("#2277: ownershipAllowed admits a proven foreign fast-forward with NO session baseline",
+    ownershipAllowed({ opKind: "pull", currentBranch: "main", baselineBranch: null, effect: fEff({}) }) === true);
+  ok("#2277: ownershipAllowed still refuses it when the proof flag is absent",
+    ownershipAllowed({ opKind: "pull", currentBranch: "main", baselineBranch: null, effect: fEff({}, { foreignHubFastForward: false }) }) === false);
+  ok("#2277: the foreign arm does not launder a rewriting op (rebase) into the allowance",
+    ownershipAllowed({ opKind: "rebase", currentBranch: "main", baselineBranch: null, effect: fEff({ rebaseEffect: true }) }) === false);
+  ok("#2277: the foreign arm does not cover non-sync ops (push) with no baseline",
+    ownershipAllowed({ opKind: "push", currentBranch: "main", baselineBranch: null, targets: ["main"], effect: fEff({}) }) === false);
+}
 
 // cleanup
 rmSync(ROOT, { recursive: true, force: true });
