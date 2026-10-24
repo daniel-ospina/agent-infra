@@ -226,7 +226,7 @@ printf 'Filename\tType\tSize\tUsed\tPriority\n' > "$T/proc-swaps"   # header onl
 printf '60\n' > "$T/swappiness"                                     # the image default, so the pin is a CHANGE
 SWAP_LOG="$T/swap-calls.log"
 # `fallocate` allocates SPARSELY for the fixture (dd seek), so a 4 GiB request costs no disk here.
-printf '#!/bin/sh\nsz=""; prev=""; f=""\nfor a in "$@"; do [ "$prev" = "-l" ] && sz="$a"; f="$a"; prev="$a"; done\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "fallocate $sz $f" >> "$SWAP_STUB_LOG"\nn="${sz%M}"\ndd if=/dev/zero of="$f" bs=1048576 count=0 seek="$n" 2>/dev/null || : > "$f"\nexit 0\n' > "$STUB/fallocate"
+printf '#!/bin/sh\nsz=""; prev=""; f=""\nfor a in "$@"; do [ "$prev" = "-l" ] && sz="$a"; f="$a"; prev="$a"; done\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "fallocate $sz $f" >> "$SWAP_STUB_LOG"\nn="${sz%%M}"\ndd if=/dev/zero of="$f" bs=1048576 count=0 seek="$n" 2>/dev/null || : > "$f"\nexit 0\n' > "$STUB/fallocate"
 printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "mkswap $*" >> "$SWAP_STUB_LOG"\nexit 0\n' > "$STUB/mkswap"
 # `swapon <file>` appends a REAL /proc/swaps row (path, type, size_kb, used_kb, prio) to the fixture,
 # so the script's own reading of the swap record is what the case asserts on. `--show` is only there
@@ -306,8 +306,13 @@ br() {
   # BOTH provider keys the bring-up accepts (`cloud-cell-bringup.sh`: it refuses only when NEITHER is
   # set), so an ambient `ANTHROPIC_API_KEY` cannot stand in for the fixture's either — measured: with
   # only that key ambient, the pre-fix ordering arm PASSED locally for the wrong reason.
-  BR_OUT="$(env -u AGENT_INFRA_PATH -u TORTOISE_REPO -u DISK_REAPER_REPOS \
+  # `GH_REPO` too: an operator shell exporting the fleet's slug would let the "a GLOBAL GH_REPO pushed
+  # in keys.env is DROPPED" arm stay green even with its own post-source drop deleted (measured: the
+  # mutated bring-up still passed that arm as `GH_REPO=daniel-ospina/tortoise` ambient, and reddened
+  # without it). The one arm that needs an ambient slug asks for it by name.
+  BR_OUT="$(env -u AGENT_INFRA_PATH -u TORTOISE_REPO -u DISK_REAPER_REPOS -u GH_REPO \
             -u DEEPSEEK_API_KEY -u ANTHROPIC_API_KEY \
+            PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" GH_REPO="${BR_GH_REPO:-}" \
             PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
             CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
             GH_TOKEN_FILE="$TOK" GH_STUB_MODE="$1" CURL_STUB_MODE="$2" \
@@ -943,15 +948,16 @@ say_case "an OPERATOR-SHELL GH_REPO is DROPPED even when keys.env is ABSENT"
 # first cut only ran it AFTER sourcing, and a missing keys.env is a supported non-fatal path — so on
 # exactly the arm with no file to blame, an operator shell's sticky `GH_REPO` survived and every
 # check below graded another repo. Nothing in the suite covered it: every `br …` case writes
-# $T/keys.env first. Assert the DROP line on the no-file arm (the run still refuses later, at
-# check_operational_layer in this fixture — the ORDERING is what proves the drop happened before any
-# check ran). The provider key comes from the operator shell this arm models, via BR_EXTRA_ENV.
+# $T/keys.env first. Assert the DROP line on the no-file arm. Measured: with a provider key supplied (the
+# operator shell this arm models, via BR_EXTRA_ENV) a missing keys.env is the WARNING path — the run goes
+# on to `CELL READY` rc=0 — so the ordering assertion is this arm's only content, and the key is cleared
+# from the environment by `br()` rather than inherited.
 rm -f "$T/absent.env"
 # A PROVIDER KEY FROM THE OPERATOR SHELL, WHICH IS THIS ARM'S WHOLE PREMISE (no keys.env at all):
 # without one the run stops at `check_provider` and never reaches a repo-reading check, so the ordering
 # assertion has no second line to compare against - which is exactly how it failed on the runner
 # (`drop=3 check=none`) while passing on the author's box, where the key was exported.
-BR_ENV_FILE="$T/absent.env" GH_REPO="daniel-ospina/tortoise" BR_EXTRA_ENV="DEEPSEEK_API_KEY=fake" \
+BR_ENV_FILE="$T/absent.env" BR_GH_REPO="daniel-ospina/tortoise" BR_EXTRA_ENV="DEEPSEEK_API_KEY=fake" \
   br ok normal --check
 case "$BR_OUT" in
   *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "the operator-shell GH_REPO is dropped and NAMED with keys.env ABSENT" ;;
