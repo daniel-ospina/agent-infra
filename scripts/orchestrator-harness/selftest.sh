@@ -3508,6 +3508,21 @@ else
   ck "merged-not-closed.test.sh is present (the ported instrument has coverage)" 1
 fi
 
+# #2603: THE MERGE REMINDER'S ACTUATOR ARM. The reminder is a fleet-critical timer that until now
+# lived outside version control; its arm decides whether to spend a rail attempt, so its gates are
+# pinned here as well as in `scripts/run-bash-shards.sh` (CI runs both lanes from that one list —
+# this block is what makes `./selftest.sh` the single local command that covers it).
+if [ -f "$HERE/merge-reminder.test.sh" ]; then
+  if bash "$HERE/merge-reminder.test.sh" > "$TMP/merge-reminder.out" 2>&1; then
+    ck "merge-reminder.test.sh: the actuator arm is gated on evidence (#2603)" 0
+  else
+    ck "merge-reminder.test.sh: the actuator arm is gated on evidence (#2603)" 1
+    grep -E '❌|PASS=' "$TMP/merge-reminder.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "merge-reminder.test.sh is present (the actuator arm has coverage)" 1
+fi
+
 if [ -f "$HERE/refresh-scout.test.sh" ]; then
   if bash "$HERE/refresh-scout.test.sh" > "$TMP/refresh-scout.out" 2>&1; then
     ck "refresh-scout.test.sh: repo-aware scout provisioning + no silent retry (#1736)" 0
