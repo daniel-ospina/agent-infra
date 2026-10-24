@@ -49,13 +49,30 @@ fi
 
 # repo_target_slug <path> -> prints the worktree's `owner/name`, rc 1 when it cannot be read.
 # An empty answer is an ABSENCE, never a match: every caller treats rc 1 as a refusal.
+# ⛔ AMBIENT GIT ENV IS SCRUBBED (#2762 review, P1). `git -C <path>` fixes only the DIRECTORY git
+# starts in: GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR outrank it and redirect which repository the
+# config, HEAD and common-dir reads come from. Left in place, one exported GIT_DIR made this gate
+# certify a DIFFERENT repo as the target (T2/T3/T4 all failed open at once). Every identity read goes
+# through this helper, so no caller can re-introduce the forge by reading git directly.
+_repo_target_git() {
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE git "$@"
+}
+
 repo_target_slug() {
   local p="${1:-}" url
   [ -n "$p" ] && [ -d "$p" ] || return 1
   command -v repo_slug_from_remote >/dev/null 2>&1 || return 1
-  url="$(git -C "$p" remote get-url origin 2>/dev/null)" || return 1
+  url="$(_repo_target_git -C "$p" remote get-url origin 2>/dev/null)" || return 1
   [ -n "$url" ] || return 1
   repo_slug_from_remote "$url" 2>/dev/null
+}
+
+# repo_target_head_branch <path> -> prints the attached branch short name, empty when detached.
+# The SAME scrub as every other identity read (a lane's HEAD is an identity fact, not a convenience).
+repo_target_head_branch() {
+  local p="${1:-}"
+  [ -n "$p" ] && [ -d "$p" ] || return 1
+  _repo_target_git -C "$p" symbolic-ref -q --short HEAD 2>/dev/null || true
 }
 
 # repo_target_common_dir <path> -> prints the PHYSICAL `.git` directory shared by every worktree of
@@ -66,7 +83,7 @@ repo_target_slug() {
 repo_target_common_dir() {
   local p="${1:-}" d
   [ -n "$p" ] && [ -d "$p" ] || return 1
-  d="$(git -C "$p" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  d="$(_repo_target_git -C "$p" rev-parse --git-common-dir 2>/dev/null)" || return 1
   [ -n "$d" ] || return 1
   case "$d" in
     /*) : ;;
@@ -78,14 +95,11 @@ repo_target_common_dir() {
 # repo_target_valid_slug <owner/name> — the same shape repo-slug.sh accepts, so a target that is not
 # a slug ("tortoise", a path, an empty string) is REFUSED rather than compared to nothing.
 repo_target_valid_slug() {
-  case "${1:-}" in
-    ''|*/*/*|/*|*:*) return 1 ;;
-    */*) : ;;
-    *) return 1 ;;
-  esac
-  case "${1%%/*}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  case "${1#*/}"  in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  return 0
+  # ⛔ ONE OWNER FOR THE SHAPE RULE (#2762 review, P2): repo-slug.sh's `repo_slug_valid` is the same
+  # rule `repo_slug_from_remote` and `derive_or` use. A second hand-copy could drift and report a
+  # malformed target as `slug-mismatch` (the wrong cause) instead of `target-invalid`.
+  command -v repo_slug_valid >/dev/null 2>&1 || return 1
+  repo_slug_valid "${1:-}"
 }
 
 # repo_target_assert <label> <worktree> <target-slug> <target-dir>
@@ -97,13 +111,13 @@ repo_target_valid_slug() {
 # given; <target-dir> then supplies the identity comparison as well.
 repo_target_assert() {
   local label="${1:-dispatch}" wt="${2:-}" want="${3:-}" wantdir="${4:-}"
-  local slug="" wdir="" cw="" cwant="" reason="" human="" result="REFUSED"
+  local slug="" wdir="" cw="" cwant="" wreal="" wantreal="" want_derived=0 reason="" human="" result="REFUSED"
 
   # ── the worktree's ACTUAL identity, read from the worktree itself ──────────────────────────────
   if [ -z "$wt" ] || [ ! -d "$wt" ]; then
     reason="worktree-missing"
     human="the worktree '$wt' does not exist"
-  elif ! git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+  elif ! _repo_target_git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
     reason="worktree-not-a-repo"
     human="'$wt' is not a git work tree, so its repository cannot be proven"
   else
@@ -118,6 +132,8 @@ repo_target_assert() {
       human="no target repo was named — pass --repo <owner/name> and/or --repo-dir <checkout>; refusing to guess"
     elif [ -z "$want" ]; then
       # Only a directory was named: derive its slug from ITS origin (the directory is the binding).
+      # Remember that it was DERIVED: only then is a self-referential directory a tautology.
+      want_derived=1
       want="$(repo_target_slug "$wantdir" 2>/dev/null || true)"
       if [ -z "$want" ]; then
         reason="target-unreadable"
@@ -134,9 +150,27 @@ repo_target_assert() {
     if [ -z "$slug" ]; then
       reason="worktree-origin-unreadable"
       human="the worktree '$wdir' has no readable GitHub origin — cannot prove it is $want"
-    elif [ "$slug" != "$want" ]; then
+    elif [ "$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')" ]; then
+      # GitHub slugs are CASE-INSENSITIVE and the existing owner of this invariant folds case on
+      # purpose (cloud-cell-supervisor.sh's QUEUE_DECLARED/QUEUE_DERIVED comparison, the #1745 shape:
+      # a verbatim compare refused a pair `check` had just passed). A verbatim compare here would
+      # certify the cell healthy and then block EVERY dispatch on it (#2762 review, P1).
       reason="slug-mismatch"
       human="target $want, worktree is $slug — refusing to start a lane in the wrong repo"
+    fi
+  fi
+  # ⛔ A TARGET READ FROM THE ARTIFACT UNDER TEST CAN NEVER REFUSE (#2762 review, P2): when only a
+  # target DIRECTORY is named, its slug is derived from that directory — name the worktree itself and
+  # both halves compare the worktree with itself. Refuse the self-reference by name.
+  if [ -z "$reason" ] && [ -n "$wantdir" ] && [ "$want_derived" = "1" ]; then
+    wreal="$(cd "$wt" 2>/dev/null && pwd -P)"
+    wantreal="$(cd "$wantdir" 2>/dev/null && pwd -P)"
+    if [ -n "$wreal" ] && [ -n "$wantreal" ]; then
+      case "$wantreal" in
+        "$wreal"|"$wreal"/*)
+          reason="target-self"
+          human="the target dir '$wantdir' IS the worktree under test — a target derived from the artifact can never refuse; name the repo's main checkout instead" ;;
+      esac
     fi
   fi
   # The directory half is what distinguishes two CHECKOUTS OF THE SAME SLUG (a stale clone, a
@@ -172,17 +206,17 @@ repo_target_assert() {
 repo_target_branch_assert() {
   local label="${1:-dispatch}" wt="${2:-}" br="${3:-}" slug="${4:-}" head="" reason="" human=""
 
-  if [ -z "$wt" ] || [ ! -d "$wt" ] || ! git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
+  if [ -z "$wt" ] || [ ! -d "$wt" ] || ! _repo_target_git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; then
     reason="worktree-not-a-repo"
     human="the worktree '$wt' is not a git work tree, so branch '$br' cannot be proven to exist in $slug"
   elif [ -z "$br" ]; then
     reason="branch-unnamed"
     human="no branch was named"
-  elif ! git -C "$wt" rev-parse --verify -q "refs/heads/$br" >/dev/null 2>&1; then
+  elif ! _repo_target_git -C "$wt" rev-parse --verify -q "refs/heads/$br" >/dev/null 2>&1; then
     reason="branch-missing"
     human="branch '$br' does not exist in ${slug:-<unknown repo>} ($wt) — this is NOT a worktree materialisation failure; the branch belongs to another repo or was never pushed"
   else
-    head="$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+    head="$(_repo_target_git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null || true)"
     # A DETACHED HEAD is allowed on purpose: the cell launcher creates `worktree add --detach`, and
     # a detached lane that creates its branch at push time is a legitimate (measured) shape. What is
     # refused is a worktree checked out on a DIFFERENT named branch — the `prfixup` shape.
@@ -201,10 +235,12 @@ repo_target_branch_assert() {
   return "$REPO_TARGET_REFUSED"
 }
 
-# ⛔ A MISSING SLUG PARSER IS FATAL, NOT A WARNING. Without repo_slug_from_remote every worktree
-# origin is "unreadable" and every target is unreadable — which fails closed, but a caller could
-# read the repeated refusals as a repo problem. The caller's source guard turns this into exit 78.
-if ! command -v repo_slug_from_remote >/dev/null 2>&1; then
-  echo "repo-target.sh: FATAL — repo-slug.sh (repo_slug_from_remote) is missing beside $_REPO_TARGET_HERE; refusing to run an identity check that cannot read a slug" >&2
+# ⛔ A MISSING SLUG PARSER/VALIDATOR IS FATAL, NOT A WARNING. Without repo_slug_from_remote every
+# worktree origin is "unreadable" and every target is unreadable — which fails closed, but a caller
+# could read the repeated refusals as a repo problem. Without repo_slug_valid (#2762) a half-deployed
+# pair refuses every EXPLICIT slug as `target-invalid` — also fail-closed, but with the wrong cause.
+# The caller's source guard turns this into exit 78.
+if ! command -v repo_slug_from_remote >/dev/null 2>&1 || ! command -v repo_slug_valid >/dev/null 2>&1; then
+  echo "repo-target.sh: FATAL — repo-slug.sh (repo_slug_from_remote/repo_slug_valid) is missing or stale beside $_REPO_TARGET_HERE; refusing to run an identity check that cannot read a slug" >&2
   return 1 2>/dev/null || exit 1
 fi

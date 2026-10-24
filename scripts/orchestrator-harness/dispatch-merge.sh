@@ -66,6 +66,26 @@ release_issue_claim_unspawned() { # <issue>
   fi
   return 0
 }
+# ── THE OTHER HALF OF "NOTHING STARTED": DROP THE BLACKLIST ROWS (#2762 review, P1) ─────────────
+# The controller appends each id to `$O/dispatched.txt` and `.batch` BEFORE calling this script, so a
+# refusal that only releases the claim leaves a row that makes this box skip a FREE issue until the
+# reaper prunes it. The CI-queue deferral already did this correctly (and exits 3 so the cycle record
+# says `dispatched=0`); the repo-target refusals must do the same, or the funnel reports work that
+# never started. One helper, used by every refusal path.
+drop_dispatched_rows() {
+  local ids="" n tmp
+  for n in "$@"; do case "${n:-}" in ''|*[!0-9]*) continue ;; esac; ids="$ids $n"; done
+  [ -n "$ids" ] || return 0
+  [ -f "$O/dispatched.txt" ] || return 0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/dispatchmerge.XXXXXX" 2>/dev/null)" || return 0
+  if awk -v ids="$ids" 'BEGIN{n=split(ids,a," "); for(i=1;i<=n;i++) if(a[i]!="") drop[a[i]]=1} !($0 in drop)' \
+       "$O/dispatched.txt" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$O/dispatched.txt" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
+}
 # ── NO TARGET = REFUSED, AND THE CLAIMS ARE RELEASED (agent-infra#2724/#2694) ────────────────────
 # This runs AFTER `release_issue_claim_unspawned` is defined because the controller has ALREADY taken
 # `refs/claims/issue-<N>` for every id it handed us. "Nothing will start" must therefore also mean
@@ -74,11 +94,13 @@ release_issue_claim_unspawned() { # <issue>
 if [ -z "$OR" ]; then
   echo "dispatch-merge: REFUSED (no-target) — no owner/name repo was named. The target is a parameter, never a default or a guess (#1974/#2724); pass <repo-path> <owner/repo> <issue...>."
   for N in "$@"; do case "${N:-}" in ''|*[!0-9]*) continue ;; esac; release_issue_claim_unspawned "$N"; done
+  drop_dispatched_rows "$@"
   exit 72
 fi
 if [ -z "$REPO" ]; then
   echo "dispatch-merge: REFUSED (no-repo-dir) — no checkout path was named; refusing to guess which checkout the lanes belong to (#1974/#2724)."
   for N in "$@"; do case "${N:-}" in ''|*[!0-9]*) continue ;; esac; release_issue_claim_unspawned "$N"; done
+  drop_dispatched_rows "$@"
   exit 72
 fi
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
@@ -113,6 +135,7 @@ for _wt_v in wt_spawn wt_alive wt_close wt_launcher wt_launcher_why wt_count; do
 done
 cd "$REPO" || { echo "dispatch-merge: cannot cd into $REPO — releasing every claim in this batch (no lane and no chain can start here)"
   for N in "$@"; do release_issue_claim_unspawned "$N"; done
+  drop_dispatched_rows "$@"
   exit 1; }
 # Physical path, so every assertion and spawn below names the checkout even when the caller passed a
 # relative one (after `cd`, `$REPO` would otherwise resolve from INSIDE itself).
@@ -126,6 +149,7 @@ echo "$TARGET_LINE"
 if [ "$TARGET_RC" -ne 0 ]; then
   echo "dispatch-merge: REFUSED — the checkout $REPO_ABS is not $OR; no lane and no chain will start (exit $TARGET_RC)"
   for N in "$@"; do release_issue_claim_unspawned "$N"; done
+  drop_dispatched_rows "$@"
   exit "$TARGET_RC"
 fi
 git fetch origin main --quiet 2>/dev/null
@@ -173,22 +197,11 @@ if [ -f "$CIQ_MOD" ]; then
       # the `cd` failure above. Release the claims AND drop the rows: a row with no dispatch makes
       # this box skip a FREE issue until the reaper prunes it, which is a turn consumed for work that
       # never started.
-      _deferred_ids=""
       for N in "$@"; do
         case "${N:-}" in ''|*[!0-9]*) continue ;; esac
         release_issue_claim_unspawned "$N"
-        _deferred_ids="$_deferred_ids $N"
       done
-      if [ -n "$_deferred_ids" ] && [ -f "$O/dispatched.txt" ]; then
-        _dtmp="$(mktemp "${TMPDIR:-/tmp}/dispatchmerge.XXXXXX" 2>/dev/null)" || _dtmp=""
-        if [ -n "$_dtmp" ] && awk -v ids="$_deferred_ids" \
-             'BEGIN{n=split(ids,a," "); for(i=1;i<=n;i++) if(a[i]!="") drop[a[i]]=1} !($0 in drop)' \
-             "$O/dispatched.txt" > "$_dtmp" 2>/dev/null; then
-          mv -f "$_dtmp" "$O/dispatched.txt" 2>/dev/null || rm -f "$_dtmp"
-        else
-          [ -n "$_dtmp" ] && rm -f "$_dtmp"
-        fi
-      fi
+      drop_dispatched_rows "$@"
       echo "dispatch-merge: re-run when the queue has drained; a lane started now would queue behind it and its PR would invalidate any head-bound review record it produces"
       # ⛔ EXIT 3, NOT 0 (#2296 cycle 6, P2): the controller counted each of these issues as
       # DISPATCHED (`K`) before calling this script, so a plain `exit 0` left the funnel printing
@@ -236,6 +249,7 @@ for N in "$@"; do
   if [ "$LANE_REPO_RC" -ne 0 ] || [ "$LANE_BRANCH_RC" -ne 0 ]; then
     echo "#$N: REFUSED — the worktree built for this lane is not $OR; no lane, no chain, claim released (#2724/#2694)"
     release_issue_claim_unspawned "$N"
+    drop_dispatched_rows "$N"
     continue
   fi
   # #2216 brought a second disclosure into this line: WHICH harness the spawn was computed from, so a

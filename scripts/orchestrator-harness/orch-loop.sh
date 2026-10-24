@@ -5892,6 +5892,16 @@ PY
         echo "[dispatch] ci-queue gate DEFERRED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
         K=0; : > "$O/.batch"
         [ -n "${GATE_WHY:-}" ] || GATE_WHY="ci-queue(batch deferred)"
+      elif [ "$_dmrc" = "72" ]; then
+        # ⛔ A REPO-IDENTITY REFUSAL IS NOT A DISPATCH EITHER (#2762 review, P1). Same shape as the
+        # deferral arm above: `K` was incremented as each issue was CLAIMED, so without this branch a
+        # batch that `dispatch-merge.sh` refused with 72 is counted as `-> N dispatched` and written
+        # into the cycle record as `dispatched=N … nothing=none` — a permanent false PASS, because a
+        # wrong-repo pair does not clear by waiting. The claims are released and the rows dropped by
+        # dispatch-merge.sh itself; only the counting and `.batch` need undoing here.
+        echo "[dispatch] repo-target gate REFUSED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
+        K=0; : > "$O/.batch"
+        [ -n "${GATE_WHY:-}" ] || GATE_WHY="repo-target(refused: checkout is not the target)"
       fi
       # …and the deferral's reason rides the SAME funnel line (#2333 cycle 6 review, P2): arg 3 was
       # `""` while `GATE_WHY` had just been set, so the cycle's one `-> 0 dispatched` line dropped the
