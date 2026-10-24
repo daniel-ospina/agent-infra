@@ -1868,8 +1868,13 @@ BEGIN {
       dig = ""
       if (match(bare, /[0-9]+/)) dig = substr(bare, RSTART, RLENGTH)
       if (dig == "0") continue
-      # a repair stated inside the match ("1 finding was fixed") is not a live count
-      if (frag ~ ("(" repair ")$")) continue
+      # a repair stated inside the match ("1 finding was fixed") is not a live count — UNLESS the line
+      # then says the count is LIVE (P0, fourth adversarial pass of #2288 — MEASURED: an ATTRIBUTIVE
+      # participle inside the counted NP exempted it, so `the 2 blocking defects fixed in round 1 still
+      # remain` recorded a signed clean record. `fixed` there is a reduced relative, not a predicated
+      # repair, and the live cue that follows is what says so.)
+      _after0 = substr(line, off + RSTART + RLENGTH)
+      if (frag ~ ("(" repair ")$") && _after0 !~ /^[^.;:,!?()]*(remain|remains|still|open|unresolved|unfixed|outstanding|reopened|left)([^[:alnum:]]|$)/) continue
       # ⛔ AN OPENING PAREN STARTS A NEW CLAUSE (P1, ninth fresh review of #2288 — MEASURED:
       # `fixed the P3 nit (2 blocking defects remain)` recorded clean because the parenthesis belongs to
       # the MATCH, so the prefix still held the repair and the clause split never saw the boundary).
@@ -1881,9 +1886,15 @@ BEGIN {
       # `**Verdict:** CLEAN — a bug in the retry path was fixed in round 2.` refused once this branch
       # widened the noun list to `bugs?`). `a`/`an` is not a count unless something else says the
       # finding is live, and a repair verb in the clause is that something.
-      # (the repair may sit AFTER the match — `a bug in the retry path was fixed in round 2` — so for an
-      # article the whole LINE is searched; `a`/`an` with no repair anywhere still refuses)
-      if (frag ~ /^([^[:alnum:]]*)(a|an)([[:space:]-]|$)/ && line ~ ("(^|[^[:alnum:]])(" repair ")([^[:alnum:]]|$)")) continue
+      # (the repair may sit AFTER the match — `a bug in the retry path was fixed in round 2` — so the
+      # clause is searched on both sides of the count. ⛔ IT IS THE CLAUSE, NOT THE LINE (P0, fourth
+      # adversarial pass of #2288 — MEASURED: `a blocking defect remains, no fix applied.` recorded a
+      # signed clean record because the NOUN `fix` in another clause satisfied a line-wide search, and so
+      # did `a blocking defect remains. The fix is elsewhere.` and `Reviewed the fix; a blocking defect
+      # remains.`)
+      _aftcl = _after0
+      sub(/[.;:,!?()].*$/, "", _aftcl)
+      if (frag ~ /^([^[:alnum:]]*)(a|an)([[:space:]-]|$)/ && (cl " " _aftcl) ~ ("(^|[^[:alnum:]])(" repair ")([^[:alnum:]]|$)")) continue
       print frag
     }
   }
