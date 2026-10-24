@@ -1564,8 +1564,9 @@ say_case "final pass 3: an ABSENT mode is a LIVE pass — the loop's first tick 
 # ⛔ THE LOOP IS NO LONGER THE DISCRIMINATOR, AND THIS SUITE MUST NOT PRETEND IT IS. #2424 shipped
 # TWICE: this branch defaults the mode in each role (`local dry="${1:-}"`), while #2555 landed
 # separately and made the loop bind it explicitly (`run_role_pass doctor ""`). Both fixes are in the
-# merged tree, so Arm A below can no longer drive an unbound `$1` on its own — the arms that call the
-# roles DIRECTLY (B/C/D) are what pin the absent argument now. Arm A still earns its place: it pins
+# merged tree, so Arm A below can no longer drive an unbound `$1` on its own — Arms B and D, which
+# call the roles DIRECTLY with no argument, are what pin the absent shape now; Arm C pins it in the
+# SOURCE (it classifies `local` reads, it never calls a role). Arm A still earns its place: it pins
 # that every derived role records a LIVE pass on the loop's real tick.
 #
 # ⛔ THE ROLE SET IS DERIVED FROM THE DISPATCHER, NEVER SPELLED HERE. A hardcoded list covers the four
@@ -1626,7 +1627,8 @@ done <<<"$ROLES"
 
 # Arm B — every role entry point called with NO ARGUMENT AT ALL, sourced from the script's own
 # define-only prelude so `set -u` is the FILE's, not the suite's. Arm A can only reach the roles the
-# tick dispatches, and every CLI verb binds `$1`; only this arm exercises the absent shape directly.
+# tick dispatches, and every CLI verb binds `$1`, so the absent shape has to be driven directly —
+# this arm does it for every derived role, and Arm D does it for one (`bash -u -c … run_reap`).
 PRELUDE="$T/doctor-funcs.sh"
 CASELINE="$(grep -n '^case "${1:-status}" in$' "$DOCTOR" | head -1 | cut -d: -f1)"
 if [ -n "$CASELINE" ] && [ "$CASELINE" -gt 100 ]; then

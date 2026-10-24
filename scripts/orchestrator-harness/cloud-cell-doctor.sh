@@ -2543,11 +2543,10 @@ run_status() {
 # The default therefore lives in EACH ROLE (`local dry="${1:-}"`), not only in this dispatcher: the
 # invariant is "no mode means a live pass", not "this caller happens to pass one". That redundancy is
 # deliberate — #2424 shipped twice (#2555 also made the loop bind it explicitly, `run_role_pass doctor
-# ""`, which this merge brought in), and the roles keep the default so a FUTURE bare dispatch cannot
-# reintroduce the crash. `reap` is not bare-dispatched today (`run_doctor`'s nested
-# `run_role_pass reap "$dry"` and the CLI's `${dry}`
-# both bind it) and gets the same default anyway, so a future bare dispatch cannot reintroduce the
-# crash — and the invariant is testable at the role boundary, not through the loop's timing.
+# ""`, which this merge brought in) — so a FUTURE bare dispatch cannot reintroduce the crash, and the
+# invariant is testable at the role boundary rather than through the loop's timing. `reap` is not
+# bare-dispatched today (`run_doctor`'s nested `run_role_pass reap "$dry"` and the CLI's `${dry}` both
+# bind it) and gets the same default anyway, for that same future-proofing.
 # ⛔ The `[ "$dry" = "--dry-run" ]` branches are safe with an empty mode BY CONSTRUCTION: an empty
 # string equals `--dry-run` nowhere, so every rehearsal arm falls through to the live path.
 #
