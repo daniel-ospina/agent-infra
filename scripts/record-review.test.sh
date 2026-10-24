@@ -255,7 +255,7 @@ if [ "$1" = "api" ]; then
     # simulate a response with no merge base (→ refuse).
     if grep -qF -- "compare/" <<<"$*"; then
         [ "${STUB_COMPARE_FAIL:-0}" = "1" ] && exit 1
-        # #2472/#2982 — the API ANSWERING and REFUSING this revision (a fork head,
+        # #2470/#2472 — the API ANSWERING and REFUSING this revision (a fork head,
         # a rewritten sha): HTTP 404/422, a NON-ZERO exit, and the status on
         # STDERR, which is where `gh` puts it and where `review_surface_rows`
         # classifies it. rc 3 (positive evidence → refuse) must never be confused
@@ -572,13 +572,17 @@ echo "── 8. #513 clean-micro tier guard ────────────
 #
 # ⛔ THE REFUSAL WAS CORRECT — this is a FIXTURE fix, not a code fix (#2615).
 # `changed_files>=1` with an empty `.files[]` is not an answer GitHub gives, and
-# #2982's whole rule is that an EMPTY payload must never certify a changed-path
-# surface ("0 changed paths ⇒ no surface change" is the fail-open). Loosening
-# this arm to make the vectors pass is the #2982 defect coming back. The other
-# hypothesis is falsified by measurement: a 0-byte DIFF BODY is not refused at
-# all — with a truthful one-row surface and `/dev/null` as the diff, clean-micro
-# records rc 0 and only loses the carry-forward digest (a legacy sha-only
-# marker). §8.16 pins the cap's four outcomes apart, including the
+# the SURFACE CAP's own contract (#2470/#2472) is that an EMPTY payload must
+# never certify a changed-path surface ("0 changed paths ⇒ no surface change" is
+# the fail-open). Loosening this arm to make the vectors pass is that defect
+# coming back. (The #2982 citations elsewhere in this file are the DIFF-BINDING
+# sink — the sha-keyed carry-forward — not this contract; the empty-payload rule
+# arrived with the cap in #2472, and the 404/422 positive-evidence rule with
+# #2511. Cited correctly here so the next lane reads the rule where it lives.)
+# The competing hypothesis is falsified by measurement: a 0-byte DIFF BODY is not
+# refused at all — with a truthful one-row surface and `/dev/null` as the diff,
+# clean-micro records rc 0 and only loses the carry-forward digest (a legacy
+# sha-only marker). §8.16 pins the cap's four outcomes apart, including the
 # "claims-a-surface, delivers-none" shape as a REFUSAL, so it can never again be
 # read as a stale vector and "fixed" by loosening it.
 #
@@ -943,10 +947,28 @@ assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 503 
 # so the cap never reaches the compare. Same posture (warn, record proceeds), and
 # pinned because `review_surface_rows`' contract names three rc-1 causes while a
 # compare-only vector exercises one.
+# ⚠️ PINNED AS-IS, NOT AS SHOULD (#2628). The pulls read does
+# `2>/dev/null ... || return 1`, so it cannot tell a dead socket from a 401/403/
+# 5xx/404 — the #2511 review's P1, still unfixed and was untracked until #2628.
+# This vector therefore pins the CURRENT behaviour deliberately; when #2628 makes
+# that read status-aware (404/422 → rc 3), THIS assertion must change with it.
+# Do not read it as an endorsement.
 STUB_META_FAIL=1 STUB_BODY="Fixes #424366" STUB_LABELS="complexity:micro" run_micro_verdict 424366
 [ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a failed meta read PROCEEDS (rc 0)" || bad "8.16 unreadable: a failed meta read must proceed (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424366.json" ] && ok "8.16 unreadable: the record IS written after a failed meta read" || bad "8.16 unreadable: a failed meta read stranded a legitimate record"
 assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the failed-meta warning names the READ failure"
+
+# UNREADABLE (4/4) — and a rate-limit window (403), which `gh` reports WITH a
+# status. Pinned separately from the 503 because it is the shape a lane actually
+# hits and the one #2511's review measured as a false-refusal risk: if the
+# classifier ever widened to `HTTP 403`, a throttled compare would REFUSE and
+# strand a legitimate micro record. Measured: widening `HTTP (404|422)` to
+# include 403 now reds this vector.
+STUB_COMPARE_HTTP=403 STUB_BODY="Fixes #424368" STUB_LABELS="complexity:micro" run_micro_verdict 424368
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a rate-limited compare (403) PROCEEDS (rc 0)" || bad "8.16 unreadable: a 403 must proceed, not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424368.json" ] && ok "8.16 unreadable: the 403 record IS written" || bad "8.16 unreadable: a 403 stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 403 warning names the READ failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 403 is NOT reported as an uncertifiable payload"
 
 # REFUSED (1/2) — the API ANSWERED and refused this revision (HTTP 404: an
 # unreachable fork head, a rewritten sha). POSITIVE evidence, so it refuses: the
@@ -971,7 +993,7 @@ assert_not_contains "$RECORD_ERR" "could not read the changed paths" "8.16 refus
 # INCONSISTENT — the payload CLAIMS a surface (changed_files=1) and delivers no
 # changed-path row. THIS IS TONIGHT'S SHAPE (#2615): the fixture produced it and
 # the cap refused, correctly. Pinned as a REFUSAL so a future stale vector can
-# never be "fixed" by loosening this arm back into the #2982 fail-open.
+# never be "fixed" by loosening this arm back into the #2470/#2472 fail-open.
 STUB_CHANGED_FILES=1 STUB_FILES="" STUB_COMPARE="" STUB_BODY="Fixes #424363" STUB_LABELS="complexity:micro" run_micro_verdict 424363
 [ "$RECORD_RC" = "4" ] && ok "8.16 inconsistent: a claimed-but-absent surface refuses (exit 4)" || bad "8.16 inconsistent: must refuse — an empty payload must never certify a surface (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424363.json" ] && ok "8.16 inconsistent: no record written" || bad "8.16 inconsistent: certified a tier from an empty changed-path payload"
@@ -1452,15 +1474,18 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #      assignment before a FUNCTION call is restored when the call returns
 #      (measured on bash 5.2.21 and 3.2.57: previously-unset comes back unset,
 #      previously-set comes back at its old value; only SPECIAL BUILTINS keep it).
-#      The real cross-vector carrier in this file is the un-prefixed `export`
-#      INSIDE `run_record_diff_with`, which outlives the call. The `unset` below
-#      is kept as belt-and-braces for that carrier: if the export ever stopped
-#      being overridden, STUB_FILES/STUB_DIFF_FILE would persist into §10 and
-#      make its code-bearing vectors see a docs-only diff. §8.16's
-#      `run_micro_verdict` relies on the RESTORE half of the same semantics
-#      (`STUB_FILES="${STUB_FILES-$MICRO_SURFACE}"` must not leak a surface into
-#      the next vector); this note documented that behaviour backwards until a
-#      review measured it (#2615).
+#      Every runner here (`run_record_verdict`, `run_record_diff_with`) already
+#      performs its `export`s INSIDE its own `( … )` subshell, so under this
+#      model NOTHING a runner exports can escape the call either — measured: after
+#      a `run_record_diff_with` the four variables come back unset, or at their
+#      pre-set value.
+#      The carriers that DO need the `unset` below are the TOP-LEVEL exports:
+#      `export STUB_LABELS_DIR` / `export STUB_LABELS` in §8.9/§8.9a/§8.14/§8.15
+#      (each block unsets itself after use, and this line is the belt for the
+#      ones that return early). §8.16's `run_micro_verdict` relies on the RESTORE
+#      half of the same semantics — `STUB_FILES="${STUB_FILES-$MICRO_SURFACE}"`
+#      must not leak a surface into the next vector — and this note documented
+#      that behaviour backwards until a review measured it (#2615).
 unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA P2 MB
 
 # ─────────────────────────────────────────────────────────────────────────
