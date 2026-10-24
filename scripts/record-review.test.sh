@@ -1513,8 +1513,12 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #      EXPORTING that variable, whatever its previous value:
 #      `h(){ export W=inside; }; W=pre; W=pfx h` → W=inside (prev-unset → inside
 #      too), and even a bare `export W` leaves the TEMPORARY value behind
-#      (`j(){ export W; }; W=pre; W=pfx j` → W=pfx). Special builtins keep the
-#      value only under `set -o posix`, which this suite does not use.
+#      (`j(){ export W; }; W=pre; W=pfx j` → W=pfx). Special builtins OTHER than
+#      `export` keep the value only under `set -o posix`, which this suite does
+#      not use (`C=pre; C=pfx :` → C=pre here, C=pfx under --posix) — but `export`
+#      IS a special builtin and keeps it in BOTH modes (`A=pre; A=pfx export A`
+#      → A=pfx either way), so a top-level `VAR=… export VAR` idiom is not safe
+#      here on posix-mode grounds.
 #      That export case is exactly why every runner here does its `export`s
 #      INSIDE its own `( … )` subshell: nothing a runner exports can escape the
 #      call (measured: after a `run_record_diff_with` the four variables come back
