@@ -52,6 +52,23 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # under the pre-export PATH pins _NCPU=4 / MAX_LOAD=40 for every cell (the #1702 failure).
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[fix $PR] FATAL: $SELF/spawn-gate.sh missing — refusing to run an ungated fixer" >&2; exit 78; }
+# ── the worktree lifecycle helper (#2033) ──────────────────────────────────────────────────────
+# Sourced after spawn-gate for the same $SELF (a `$O` seed copies the whole directory).
+# ⛔ PROBED HERE, SOURCED ONLY WHERE IT IS NEEDED — AND THAT IS A CORRECTNESS REQUIREMENT (measured).
+# An eager `. … || exit 78` at THIS point runs before the load/disk refusal accounting further down,
+# which is where the controller's fixcount attempt is REFUNDED. `$O` is seeded file by file, so a new
+# caller against an older `$O` (missing this helper) is a documented, TOLERATED skew — the same skew
+# the AGENT_DISK_REFUSED tolerant reference below exists for. Exit 78 there would burn an attempt
+# without running a fixer, and three of those PARK a PR "needs a human", which is precisely the
+# agent-infra#1720 failure the refund exists to prevent. Measured: the shipped spawn-gate.test.sh
+# fixture went red with the eager source — "a STALE helper still REFUNDS a load refusal: rc=75,
+# fixcount 2->1 (rc=78, fixcount=2)". Only the materialise path below needs the helper, so the FATAL
+# moves there: the refusal is still hard, it just no longer preempts accounting that must always run.
+WT_LIFECYCLE_READY=0
+if [ -f "$SELF/wt-lifecycle.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$SELF/wt-lifecycle.sh" && WT_LIFECYCLE_READY=1
+fi
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless fixer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
@@ -62,11 +79,22 @@ WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^w
 echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
 [ -z "$WT" ] && {
   # Foreign (other-machine) branch: materialise a local worktree so the fixer has somewhere to work.
-  if git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
-    git worktree add ".worktrees/fix-$PR" "$BR" >> "$L.log" 2>&1
-  else
-    git fetch origin "$BR" --quiet >> "$L.log" 2>&1
-    git worktree add ".worktrees/fix-$PR" -b "$BR" "origin/$BR" >> "$L.log" 2>&1
+  # ⛔ THROUGH THE SHARED HELPER (#2033), not `git worktree add … || exit 1`. That shape left the
+  # branch behind when the add failed mid-checkout — and for this path the branch is one this box may
+  # have JUST created from `origin/$BR`, i.e. residue with no owner, which then blocks the PR's issue
+  # pre-flight on every box. `wt_provision` rolls back to a verified empty state, and ATTACHES an
+  # existing branch that holds commits instead of failing on "branch exists".
+  # The helper MUST be present on exactly this path (see the probe above): without its rollback, a
+  # failed add leaves the branch behind, which is the residue #2033 is about.
+  if [ "$WT_LIFECYCLE_READY" != 1 ]; then
+    echo "[fix $PR] FATAL: $SELF/wt-lifecycle.sh missing — refusing to materialise a worktree without its rollback (#2033)" >> "$L.log"
+    echo "[fix $PR] FATAL: $SELF/wt-lifecycle.sh missing — refusing to materialise a worktree without its rollback (#2033)" >&2
+    exit 78
+  fi
+  wt_provision "$REPO" ".worktrees/fix-$PR" "$BR" "origin/$BR"
+  if [ "$?" != 0 ]; then
+    echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
+    exit 1
   fi
   WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
   [ -z "$WT" ] && { echo "[fix $PR] ABORT: could not materialise a worktree for $BR" >> "$L.log"; exit 1; }

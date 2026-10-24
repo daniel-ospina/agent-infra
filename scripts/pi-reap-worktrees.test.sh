@@ -92,6 +92,25 @@
 #   prune-block scope        A23  (a present-dir revocable-ref row must NOT set
 #                                PRUNE_BLOCKED — the commit is held by a ref, so
 #                                deregistering the admin record cannot orphan it)
+#   lane residue + claims    A26a (0-ahead lane record, no claim => ghost-zero-ahead
+#                                AND the branch deleted by CAS, not `branch -D`)
+#                            A26b (the same record with a LIVE claim => preserved)
+#                            A26c (an UNREADABLE registry => claim-unverified,
+#                                fail-closed — never read as "nobody holds it")
+#                            A26d (a backup that does not verify => nothing removed,
+#                                exit 4)
+#                            A26e (the ref MOVES before deletion => branch kept)
+#   §2 ignored data          A26f (a gitignored `.env` is IN the verified backup —
+#                                `--exclude-standard` alone captured nothing and the
+#                                forced removal then deleted it)
+#   §4 record age            A26g (a checkout created seconds ago is PRESERVED by the
+#                                2h ghost floor and reports age 0h — the floor used to
+#                                read the BASE commit's date, i.e. main's tip age)
+#   §1 interrupted-add       A26h (a record locked `initializing` with an OLD mtime is
+#                                the interrupted-add class and is removed; on GNU the
+#                                BSD-first `stat -f %m || stat -c %Y` ladder made
+#                                `init_lock_age` return "" for EVERY input, so the class
+#                                was dead code on ubuntu CI / the cloud cells)
 
 set -uo pipefail
 
@@ -114,6 +133,8 @@ assert_dir()      { if [ -d "$1" ]; then ok "$2"; else bad "$2 (missing dir: $1)
 assert_nodir()    { if [ -d "$1" ]; then bad "$2 (still present: $1)"; else ok "$2"; fi; }
 assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1)"; fi; }
 assert_nofile()   { if [ -e "$1" ]; then bad "$2 (present: $1)"; else ok "$2"; fi; }
+assert_branch()   { if "$REAL_GIT" -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; then ok "$3"; else bad "$3 (no ref: $2)"; fi; }
+assert_nobranch() { if "$REAL_GIT" -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; then bad "$3 (ref still exists: $2)"; else ok "$3"; fi; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-worktree-test.XXXXXX")"
 # Resolve T once: git records RESOLVED worktree paths (/tmp/x is stored as
@@ -345,12 +366,48 @@ for a in "$@"; do
 done
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
+cat >"$T/bin/tar-empty" <<'SHIM'
+#!/usr/bin/env bash
+# TAR_BIN shim for A26d: writes an EMPTY archive and exits 0 — the shape of a backup
+# whose own verification MUST refuse (the tarball lists nothing). Nothing may be removed.
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "-czf" ] && out="$a"; prev="$a"; done
+[ -n "$out" ] && : >"$out"
+exit 0
+SHIM
+cat >"$T/bin/git-fail-claim-fetch" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26c: the claim-registry fetch FAILS, so the gate cannot be evaluated.
+# The scoped namespace makes this precise — the fetch into refs/pireap-claims/* is the only
+# call that touches it, so no other probe is disturbed.
+case " $* " in *"pireap-claims"*) exit 128 ;; esac
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+cat >"$T/bin/git-move-branch-on-2nd-ancestor" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26e: the SECOND `merge-base --is-ancestor` says "not an ancestor".
+# The first is classification's (commits_survive); the second is delete_lane_branch's
+# RE-PROOF at the moment of deletion. Simulating a commit that landed in between is the
+# TOCTOU the re-proof exists for: the branch must be KEPT, never deleted on a stale proof.
+for a in "$@"; do
+    if [ "$a" = "--is-ancestor" ]; then
+        c=0
+        [ -n "${MOVE_COUNTER:-}" ] && [ -f "$MOVE_COUNTER" ] && c="$(cat "$MOVE_COUNTER")"
+        c=$((c + 1))
+        [ -n "${MOVE_COUNTER:-}" ] && printf '%s\n' "$c" >"$MOVE_COUNTER"
+        [ "$c" -ge 2 ] && exit 1
+        break
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
 chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh" \
          "$T/bin/du" "$T/bin/rm-slow" "$T/bin/git-slow-prune" "$T/bin/git-slow-status" \
          "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
          "$T/bin/git-late-ignored" "$T/bin/git-slow-nth-status" "$T/bin/git-race-delete-a25" \
-         "$T/bin/git-list-fail-after-probes" "$T/bin/comm"
+         "$T/bin/git-list-fail-after-probes" "$T/bin/comm" "$T/bin/tar-empty" \
+         "$T/bin/git-fail-claim-fetch" "$T/bin/git-move-branch-on-2nd-ancestor"
 
 # ── fixture builders ───────────────────────────────────────────────────
 mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
@@ -385,6 +442,25 @@ commit_in_wt() { # <dir> <date> <label> — a commit with a chosen committer dat
         "$REAL_GIT" -C "$wt" commit -qm "wip $n"
 }
 
+# add_origin <repo> <env-name> — a bare origin. The claim registry lives in the TARGET
+# repo's ORIGIN, so a fixture that must exercise the claim gate needs one.
+add_origin() {
+    local repo="$1" envname="$2"
+    "$REAL_GIT" init -q --bare "$T/$envname/origin.git"
+    "$REAL_GIT" -C "$repo" remote add origin "$T/$envname/origin.git"
+    "$REAL_GIT" -C "$repo" push -q origin main
+}
+
+# add_claim <repo> <issue> <lease_epoch> — publish a claim in the shape claims.sh writes:
+# a `refs/claims/issue-<N>` ref whose commit message carries `lease_until=<epoch>`.
+add_claim() {
+    local repo="$1" issue="$2" lease="$3" c tree
+    tree="$("$REAL_GIT" -C "$repo" rev-parse 'HEAD^{tree}')" || return 1
+    c="$(GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" \
+        "$REAL_GIT" -C "$repo" commit-tree "$tree" -m "issue=$issue lease_until=$lease")" || return 1
+    "$REAL_GIT" -C "$repo" push -q origin "$c:refs/claims/issue-$issue"
+}
+
 # run_reaper <env-name> [args...] — fully shimmed invocation. EVERY seam is set
 # explicitly so an ambient value in the caller's shell cannot change a verdict.
 run_reaper() {
@@ -401,7 +477,10 @@ run_reaper() {
     REAP_WT_SCRATCH_AGE_DAYS="${REAP_WT_SCRATCH_AGE_DAYS_OVERRIDE:-1}" \
     REAP_WT_SCRATCH_GLOB="${REAP_WT_SCRATCH_GLOB_OVERRIDE:-wt-*|cell-wt-*}" \
     REAP_WT_MAX_DAYS=1000000 \
-    REAP_WT_MAIN_REF="" \
+    REAP_WT_MAIN_REF="${REAP_WT_MAIN_REF_OVERRIDE:-}" \
+    TAR_BIN="${TAR_BIN_OVERRIDE:-tar}" \
+    REAP_WT_BACKUP_DIR="${REAP_WT_BACKUP_DIR_OVERRIDE:-}" \
+    MOVE_COUNTER="${MOVE_COUNTER:-}" \
     REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}" \
     REAP_WT_PR_LIMIT=1000 \
     REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}" \
@@ -816,7 +895,10 @@ assert_nodir "$WT_GO" "A2 --apply removed the reclaimable worktree"
 assert_dir "$WT_KEEP" "A2 --apply left the too-recent worktree"
 assert_eq "$("$REAL_GIT" -C "$REPO" branch --list feat/a1-go | wc -l | tr -d ' ')" "1" \
     "A2 the branch ref SURVIVES (checkout-only removal)"
-assert_contains "$OUT" "REMOVED — branch/refs survive:" "A2 per-row removal states the refs survival mechanism"
+# The row must still NAME the survival mechanism (this fixture's branch is at main's tip, so it is
+# `merged`); the ref's survival is asserted on the line above. A LANE-owned branch is the one class
+# whose ref is also removed — pinned separately by L1/L3 below (#2033).
+assert_contains "$OUT" "REMOVED — checkout gone (refs=merged" "A2 per-row removal states the refs survival mechanism"
 assert_contains "$(footer $ENV)" "REMOVED=1" "A2 footer REMOVED=1"
 # idempotence — the log is rotated first, or the append-only log's EARLIER
 # REMOVED=0 line would satisfy this vacuously
@@ -1526,6 +1608,173 @@ assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNE-RECHECK-FAILED" \
 assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" "A25 fail-closed/comm: footer PRUNE_BLOCKED=1"
 assert_absent "$(cat "$T/$ENV/reap.log")" "PRUNED " "A25 fail-closed/comm: the prune did not run"
 
+# ══ A26: lane residue — the claim registry, the branch half, and the two datum errors ══
+# #2102 review §5: 640 lines of new DESTRUCTIVE logic (three new `remove` classes, the claim
+# gate, backup verification, `delete_lane_branch`, `remove_one_forced`, `BRANCH_KEPT → exit 4`)
+# had NO coverage in the shard that runs it, so the suite passed identically before and after.
+# Each arm below must be able to go RED; the two datum arms (§2, §4) were proven red against the
+# pre-fix script while this section was written.
+echo "lane residue: claim gate, branch deletion, backup and the two age/data datum fixes"
+# A checkout created SECONDS ago reads as this many days old, which is what makes the ghost and
+# WIP floors reachable at all: the floor is now the RECORD's age (§4), not the base commit's.
+# ⛔ BOTH ARE BASED ON THE REAL CLOCK, not on `$NOW`: a record's creation time is the real
+# filesystem time of the fixture, so a fake `now` in the PAST makes every record look unborn (and
+# `wt_created_ts` correctly abstains on a timestamp in the future). `NOW_FUTURE` is the real clock
+# plus 30 days — "a checkout created seconds ago, read a month later"; `NOW_REAL` is the real clock
+# and is what pins the §4 arm (a checkout seconds old must be PRESERVED by the 2h ghost floor).
+NOW_REAL="$(/bin/date +%s 2>/dev/null || date +%s)"
+NOW_FUTURE="$((NOW_REAL + 30 * 86400))"
+
+# ── A26a: 0-ahead lane record, no claim => ghost-zero-ahead + branch deleted by CAS ──
+ENV=A26a; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2601-tm)"
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A26a an armed pass over armless residue exits 0"
+assert_contains "$(row_for "$OUT" "$WT")" "reason=ghost-zero-ahead" \
+    "A26a a clean 0-ahead LANE branch is ghost residue"
+assert_nodir "$WT" "A26a the checkout is gone"
+assert_nobranch "$REPO" feat/2601-tm "A26a the 0-ahead BRANCH is deleted (the surface the pre-flight reads)"
+assert_contains "$(footer $ENV)" "BRANCH_DELETED=1" "A26a the footer counts the branch deletion"
+assert_contains "$(footer $ENV)" "CLAIMS=na" "A26a precondition: no origin => no registry => claim=absent"
+
+# ── A26b: the same record with a LIVE claim => PRESERVED (claim=lane) ─────────────────
+ENV=A26b; REPO="$(mk_repo $ENV)"; add_origin "$REPO" $ENV
+add_claim "$REPO" 2602 "$((NOW_FUTURE + 86400))"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2602-tm)"
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=live-claim" \
+    "A26b a LIVE claim vetoes the ghost class (a dispatch owns it)"
+assert_dir "$WT" "A26b the claimed checkout survives"
+assert_branch "$REPO" feat/2602-tm "A26b and its branch survives"
+assert_contains "$(footer $ENV)" "CLAIMS=ok" "A26b precondition: the registry WAS readable"
+
+# ── A26c: an UNREADABLE registry => claim-unverified, PRESERVED (fail-closed) ─────────
+ENV=A26c; REPO="$(mk_repo $ENV)"; add_origin "$REPO" $ENV
+add_claim "$REPO" 2603 "$((NOW_FUTURE + 86400))"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2603-tm)"
+rm -f "$T/$ENV/reap.log"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-claim-fetch" \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=claim-unverified" \
+    "A26c an unevaluable registry abstains instead of assuming 'nobody holds it'"
+assert_dir "$WT" "A26c the checkout survives an unreadable registry"
+assert_branch "$REPO" feat/2603-tm "A26c and its branch survives"
+assert_contains "$(footer $ENV)" "CLAIMS=unavailable" "A26c precondition: the registry was unreadable"
+
+# ── A26d: a backup that does NOT verify => nothing removed, exit 4 ────────────────────
+ENV=A26d; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2604-tm)"
+printf 'edited\n' >"$WT/base.txt"          # tracked modification => the WIP class
+printf 'loose\n' >"$WT/loose.txt"          # untracked => the tar half has content to lose
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 TAR_BIN_OVERRIDE="$T/bin/tar-empty" \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --reap-abandoned-wip --repo "$REPO")"; RC=$?
+assert_eq "$RC" "4" "A26d an unverified backup is a FAILED pass (exit 4)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "BACKUP-UNVERIFIED" \
+    "A26d the log names the failed verification"
+assert_contains "$(cat "$T/$ENV/reap.log")" "BACKUP-UNVERIFIED-KEEP" \
+    "A26d …and that nothing was removed because of it"
+assert_dir "$WT" "A26d the checkout is STILL THERE"
+assert_eq "$(cat "$WT/loose.txt" 2>/dev/null)" "loose" "A26d the untracked file survived"
+assert_branch "$REPO" feat/2604-tm "A26d the branch was not deleted either"
+assert_absent "$(cat "$T/$ENV/reap.log")" "REMOVED-FORCED" "A26d the forced removal never ran"
+
+# ── A26e: the ref MOVES between classification and deletion => branch KEPT ───────────
+# The TOCTOU the re-proof exists for: the checkout is still residue (it is removed), but
+# the BRANCH now holds work, so deleting it would destroy a commit.
+ENV=A26e; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2605-tm)"
+rm -f "$T/$ENV/reap.log" "$T/$ENV/move"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 MOVE_COUNTER="$T/$ENV/move" GIT_BIN_OVERRIDE="$T/bin/git-move-branch-on-2nd-ancestor" \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(cat "$T/$ENV/reap.log")" "moved-or-not-ancestor-of-main" \
+    "A26e the branch is KEPT when the ref no longer proves 0-ahead at deletion time"
+assert_branch "$REPO" feat/2605-tm "A26e the branch ref survives"
+assert_eq "$RC" "0" "A26e a benign branch keep is not a failed pass"
+assert_absent "$(footer $ENV)" "BRANCH_KEPT=1" "A26e …and is not counted as BRANCH_KEPT (that is exit 4)"
+
+# ── A26f: §2 — the backup must carry IGNORED, non-regenerable data ───────────────────
+# The reachable data-loss path: `clean_gate` returns `dirty` as soon as ANY tracked/untracked
+# entry exists and DISCARDS its ignored list, so one modified tracked file plus a gitignored
+# `.env` classified `dirty` → abandoned-wip → the backup verified on the diff → `worktree
+# remove --force` deleted the `.env`. Pre-fix this tarball did not contain `.env`.
+ENV=A26f; REPO="$(mk_repo $ENV)"
+printf '.env\n' >"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm ignore
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2606-tm)"
+printf 'edited\n' >"$WT/base.txt"
+printf 'SECRET=1\n' >"$WT/.env"            # IGNORED and non-regenerable: operator data
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_BACKUP_DIR_OVERRIDE="$T/$ENV/backups" \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --reap-abandoned-wip --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A26f the pass removes the abandoned WIP (its backup verified)"
+assert_nodir "$WT" "A26f the checkout is gone"
+TARBALL="$(ls "$T/$ENV/backups"/*/*.untracked.tar.gz 2>/dev/null | head -1)"
+if [ -n "$TARBALL" ]; then
+    ok "A26f a backup tarball was written"
+    assert_contains "$(tar -tzf "$TARBALL" 2>/dev/null)" ".env" \
+        "A26f the IGNORED .env is IN the verified backup (finding §2)"
+    assert_contains "$(tar -tzf "$TARBALL" 2>/dev/null | grep -F '.env' | head -1)" ".env" \
+        "A26f the entry is the ignored file, not a regenerable artifact"
+else
+    bad "A26f a backup tarball was written (none found under $T/$ENV/backups)"
+fi
+
+# ── A26g: §4 — the floors age the RECORD, not the base commit ────────────────────────
+# The review's fixture: `main`'s tip commit is old (OLD_DATE), the worktree was created
+# seconds ago. Pre-fix `head_ts` is that old commit, so `ghost age` printed ~76d and the 2h
+# floor could never preserve — the floor was decorative on this repo's normal state.
+ENV=A26g; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2607-tm)"
+rm -f "$T/$ENV/reap.log"
+NOW_G="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 60 ))"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_G" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=too-recent" \
+    "A26g a checkout created seconds ago is PRESERVED by the 2h ghost floor"
+assert_contains "$(row_for "$OUT" "$WT")" "ghost age 0h" \
+    "A26g the reported age is the RECORD's (~0h), not the base commit's (~76d)"
+assert_dir "$WT" "A26g the fresh checkout survives"
+assert_branch "$REPO" feat/2607-tm "A26g its branch survives"
+
+# ── A26h: §1 — an interrupted add is DETECTED and removed (the stat ladder) ──────────
+# `git worktree add` writes `<admin>/locked` = `initializing` for the duration of the add and
+# removes it when the checkout completes, so a surviving one is positive evidence the add never
+# returned. `init_lock_age` read the mtime with a BSD-FIRST ladder — `/usr/bin/stat -f %m || stat
+# -c %Y` — and GNU coreutils reads `-f` as "filesystem status" with `%m` as a second FILENAME: it
+# prints a filesystem block to stdout and exits 1, so the `||` branch ran INSIDE the same command
+# substitution and `$mtime` became "<block>\n<epoch>". The numeric guard then rejected it on every
+# input, `init_lock_age` returned "", and this class never fired on GNU/Linux — it fell through to
+# `preserve worktree-locked` for ever. The arm below is the falsifier: it must report
+# `interrupted-add` and REMOVE the record, which the pre-fix script cannot do on Linux.
+ENV=A26h; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-stale" feat/2608-tm)"
+printf 'partial\n' >"$WT/base.txt"            # an interrupted add reads dirty (files never written)
+ADMIN="$REPO/.git/worktrees/$ENV-stale"
+printf 'initializing' >"$ADMIN/locked"         # git's own marker for an add that never returned
+# POSIX `touch -t` (not GNU-only `-d`): far enough in the past to clear any floor.
+touch -t 202001010000 "$ADMIN/locked"
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=interrupted-add" \
+    "A26h an old 'initializing' lock is the interrupted-add class (not worktree-locked)"
+assert_absent "$(row_for "$OUT" "$WT")" "reason=worktree-locked" \
+    "A26h …and is NOT misread as a deliberate lock"
+assert_contains "$(cat "$T/$ENV/reap.log")" "REMOVED-FORCED $WT" \
+    "A26h the partial checkout is force-removed (after a verified backup)"
+assert_nodir "$WT" "A26h the interrupted add's checkout is gone"
+assert_eq "$RC" "0" "A26h a completed removal is not a failed pass"
+
 # ── N: the #2354 class — SQUASH-MERGED, DEAD-LANE SCRATCH, NESTED ─────
 # A squash merge rewrites the branch into ONE new commit on main, so ancestry is
 # FALSE forever; the evidence that the work landed is patch identity. These legs
@@ -1725,8 +1974,11 @@ mutate_reaper() { # <sed-expr> -> path of the mutant
 }
 
 # M1: drop the DIRTY gate => N2's merged+uncommitted fixture becomes reclaimable.
+# ⛔ The target is the PRESERVE, not the `dirty)` case label: agent-infra#2102 turned that label into a
+# multi-line block (abandoned-wip), so a one-line `dirty) …` pattern no longer matches and the harness
+# reports MUTATION-NOOP. The `.`s stand in for the literal backslash-t in the printf format.
 ENV=N1
-MUT1="$(mutate_reaper 's#^        dirty) .*#        dirty) eph="" ;;#')" || exit 1
+MUT1="$(mutate_reaper 's#^            printf..preserve..dirty.*#            : ;;#')" || exit 1
 OUT="$(REAPER="$MUT1" run_reaper $ENV --dry-run --repo "$T/$ENV/repo")"
 assert_absent "$(row_for "$OUT" "$WT_M")" "reason=dirty" "M1 mutation really removed the dirty gate"
 assert_contains "$(row_for "$OUT" "$WT_M")" "reason=reclaimable" \
@@ -1770,6 +2022,7 @@ assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "reason=too-recent" \
     "M5 WITHOUT set -f the decoy wt-999 steals the pattern, so N6 MEASURES the expansion fix"
 
 rm -f "$MUT1" "$MUT2" "$MUT3" "$MUT4" "$MUT5"
+
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
