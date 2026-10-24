@@ -103,7 +103,12 @@ lp_census() { # <dir>
                         /*) printf 'arg\t%s\t%s\n' "$_pid" "$_tok" ;;
                         *=*) case "${_tok#*=}" in
                                  /*) printf 'arg\t%s\t%s\n' "$_pid" "${_tok#*=}" ;;
-                                 *)  case "$_tok" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "$_tok" ;; esac ;;
+                                 # ⛔ THE VALUE, NOT THE WHOLE TOKEN: `GIT_DIR=wt-x/.git` emitted whole
+                                 # made the matcher join `cwd/GIT_DIR=wt-x/.git`, never matching — while
+                                 # the ps arm emitted the value and DID match. The two arms disagreeing
+                                 # about what a holder named is the one thing this library forbids,
+                                 # and Linux was the arm that failed open.
+                                 *)  case "${_tok#*=}" in */*) printf 'relarg\t%s\t%s\n' "$_pid" "${_tok#*=}" ;; esac ;;
                              esac ;;
                         # ⛔ PATH-LIKE ONLY. Emitting every token exploded the table 100x on a real box
                         # (32,686 rows over 127 pids, measured) because a bare word (`sleep`, `--flag`,
@@ -215,7 +220,7 @@ lp_path_held() { # <census> <canonical-path>
 # was pointed at, so argv is a different witness from cwd.
 LP_NAME_WHY=""
 lp_path_named() { # <census> <canonical-path>
-    local f="$1" path="$2" kind pid p _pp base _cand _relpid
+    local f="$1" path="$2" kind pid p _pp base _cand _relpid _rpid _rtok _rcwd _rcomp _rcanon _rfull
     base="${path##*/}"
     LP_NAME_WHY=""
     [ -n "$path" ] && [ -r "$f" ] || return 1
@@ -270,20 +275,51 @@ lp_path_named() { # <census> <canonical-path>
     # the row is a witness when `cwd + "/" + token` IS the candidate or sits under it — an exact
     # boundary, so `wt1-sibling` cannot match `wt1`, and a `..` component simply does not match (which
     # leaves the tree to the other arms: it is never reaped BECAUSE of the token).
+    # ⛔ THE JOIN MUST BE RESOLVED FIRST. A textual `cwd + "/" + token` is not a path: a holder naming
+    # `../wt-dotdot/f.txt` from a SIBLING directory produced `cwd/../wt-dotdot/f.txt`, which matched
+    # nothing — and the "other arms will see it" justification is false, because the holder's cwd is
+    # outside the tree, so no other arm can. `.`/`..` are collapsed lexically here (no subprocess);
+    # a relative SYMLINKED prefix (`rel-link/f.txt`, where `rel-link` → the tree) is resolved after,
+    # bounded, and only when the lexical pass found nothing.
     _relpid="$(awk -F'\t' -v cand="$path" '
+        function norm(p,   n, i, out, parts, k) {
+            n = split(p, parts, "/")
+            k = 0
+            for (i = 1; i <= n; i++) {
+                if (parts[i] == "" || parts[i] == ".") continue
+                if (parts[i] == "..") { if (k > 0) k--; continue }
+                out[++k] = parts[i]
+            }
+            if (k == 0) return "/"
+            r = ""
+            for (i = 1; i <= k; i++) r = r "/" out[i]
+            return r
+        }
         $1 == "cwd" { cwd[$2] = $3; next }
         $1 == "relarg" {
             if (!($2 in cwd)) next
             tok = $3
-            # A PATH-LIKE token only. A bare word (`sleep`, `180`) also "resolves" under a process
-            # whose cwd IS the candidate, and matching it reported `reason=argv-named` for a tree whose
-            # only witness was the cwd — stealing the reason from the arm that actually proved it.
             if (tok !~ /\//) next
-            if (tok ~ /(^|\/)\.\.(\/|$)/) next
-            full = cwd[$2] "/" tok
+            full = norm(cwd[$2] "/" tok)
             if (full == cand || index(full, cand "/") == 1) { print $2; exit 0 }
         }
         END { exit 1 }' "$f" 2>/dev/null)"
+    if [ -z "$_relpid" ]; then
+        # A bounded second chance for a SYMLINKED relative prefix: only rows whose first path component
+        # exists under the holder's cwd (a symlink or a directory), capped so a table of thousands of
+        # args cannot turn this into thousands of forks — and every candidate pass pays it only when the
+        # lexical pass already found nothing.
+        _relpid="$(awk -F'\t' '$1 == "relarg" && $3 ~ /\// { print $2 "\t" $3 }' "$f" 2>/dev/null | head -200 | while IFS="$(printf '\t')" read -r _rpid _rtok; do
+            [ -n "${_rpid:-}" ] || continue
+            _rcwd="$(awk -F'\t' -v p="$_rpid" '$1=="cwd" && $2==p {print $3; exit}' "$f" 2>/dev/null)"
+            [ -n "$_rcwd" ] || continue
+            _rcomp="${_rtok%%/*}"
+            [ -L "$_rcwd/$_rcomp" ] || [ -d "$_rcwd/$_rcomp" ] || continue
+            _rcanon="$(lp_canon "$_rcwd/$_rcomp")" || continue
+            _rfull="${_rcanon%/}/${_rtok#*/}"
+            if _lp_rel "$_rfull" "$path"; then printf '%s' "$_rpid"; exit 0; fi
+        done)"
+    fi
     if [ -n "$_relpid" ]; then
         LP_NAME_WHY="argv pid $_relpid (relative to its own cwd)"
         return 0
