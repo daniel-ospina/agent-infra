@@ -40,6 +40,35 @@ REFRESH="$HERE/refresh-candidates.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
+# shell_valid <path> — a stub this suite GENERATES must be NON-EMPTY and must PARSE, and if it is not
+# the suite must say so BY NAME, instead of leaving an opaque `line 1: syntax error` from an unnamed
+# temp file that tells a reader nothing about which assertion never ran.
+# ⛔ WHAT IT DOES NOT CATCH: `mk_gh`'s body is built with an INTERPOLATING heredoc (a backslash before
+# every dollar, so nothing expands), and
+# the measured failure of that construction is a stub that still PARSES while serving empty bodies —
+# `bash -n` returns 0 and the suite reddens on the assertions. `bash -n` proves a program parses and
+# nothing more; the interpolation class is defended by keeping those escapes right, not by this guard.
+# Keep the GUARD identical to the one in `refresh-spend.test.sh` — the two suites drive the same
+# shipped pass, so what counts as a runnable stub must not diverge. The ABORT line and the summary
+# shape below are deliberately each file's OWN (`❌`/`  N passed, M failed` here, `FAIL`/`refresh-spend:`
+# there): an abort must be formatted like the run it interrupted, not like its sibling's.
+shell_valid() { # <path>
+  local err
+  if [ ! -s "$1" ]; then
+    bad "generated stub is EMPTY: $1"
+  elif ! err="$(bash -n "$1" 2>&1)"; then
+    # `bash -n` prefixes EVERY line with the path it was given; drop the FIRST prefix so the header names
+    # the file (later lines keep their own prefix — that is bash's context line, and it is useful).
+    bad "generated stub is not valid shell: $1: ${err#*: }"
+  else
+    return 0
+  fi
+  # Say the suite STOPPED, in this file's own summary shape: a bare `0 passed, 1 failed` is
+  # indistinguishable from an ordinary one-assertion red and hides that the rest never ran.
+  echo "ABORT: refresh-quota stops here — every assertion after this point never ran (a generated stub could not run)"
+  printf '  %d passed, %d failed (ABORTED, not a complete run)\n' "$PASS" "$FAIL"
+  exit 1
+}
 T="$(mktemp -d "${TMPDIR:-/tmp}/refresh-quota.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 echo "==> refresh-candidates core-quota contract ($HERE)"
@@ -71,6 +100,18 @@ mk_case() {
   git init -q "$D/repo"
   git -C "$D/repo" remote add origin "$D/origin.git"
   printf '%s' "${2:-100}" > "$D/core"          # the scripted REST core budget
+  # ⛔ THE FIXTURE PROVISIONS THE CROSS-BOX CLAIM REGISTRY, because the shipped pass now REQUIRES it
+  # (agent-infra#2466 / #2534). A missing `$O/claims.sh` is `INCOMPLETE — never CLEAN`, so every
+  # candidate is unjudged and the pass ABORTS rc=1 — which reddens exactly the assertions below that
+  # check a pass DID work (`budget`, `starved`, `no-probe`): measured on #2534's head, 6 failures, all
+  # in those three cases. The stub answers "no claim" and issues no `gh` call, so CORE_CEILING still
+  # measures the board rebuild, which is what this shard is about. NOT the shipped `$HERE/claims.sh`: this fixture's repo
+  # is a plain directory with no origin, so the real `claim_issue_preflight` would have no refs to read
+  # and would answer INCOMPLETE — the same abort from the other side. (The sibling `refresh-scout.test.sh`
+  # runs the SHIPPED registry because its fixture builds a real bare origin; #2534 uses this same
+  # one-line stub in the one case there that needs a reader answering CLEAN.) The missing-registry
+  # polarity itself is pinned by `refresh-scout.test.sh` case (c), not here.
+  printf 'claim_issue_preflight() { return 0; }\n' > "$D/o/claims.sh"
 }
 
 # mk_gh <case-dir> <rows> [rate-body] — the `gh` stub. Answers the REST listings the shipped script
@@ -106,6 +147,7 @@ case "\$*" in
 esac
 SH
   chmod +x "$d/bin/gh.body"
+  shell_valid "$d/bin/gh.body"
   # The `-i` framing: headers + body, so `rest_list` can parse the status and the Link header.
   cat > "$d/bin/gh" <<'SH'
 #!/bin/bash
@@ -122,6 +164,7 @@ fi
 exec "$d/gh.body" "$@"
 SH
   chmod +x "$d/bin/gh"
+  shell_valid "$d/bin/gh"
 }
 
 # mk_tool <path> — the pre-flight stand-in. Charges the MODELED board rebuild unless the pass-scoped

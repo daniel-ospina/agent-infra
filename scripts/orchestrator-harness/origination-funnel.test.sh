@@ -1239,7 +1239,13 @@ mk_case fail-persist 42
 mk_tool_clean "$D"
 mkdir -p "$D/o/candidates.txt"      # a DIRECTORY where the queue file must be: the append cannot succeed
 rf "$D"
-[ "$RC" -eq 1 ] && ok "persist: the queue-append failure is TRANSIENT (rc=1)" || bad "persist: rc=$RC (want 1) — $OUT"
+# ⛔ rc=3, NOT 1 (review): this branch reclassified a `candidates.txt` that cannot be appended to on
+# ANY pass (a directory, or root-owned 444) from TRANSIENT to NOT PROVISIONABLE — the transient code
+# meant a full-cost pass every cycle for ever with no `.refresh-blocked`, i.e. the "cell reports
+# RUNNING and dispatches nothing" shape the patch refuses one file over. This assertion still pinned
+# the old class, so it is updated to the code's deliberate (and documented at the refusal) change.
+[ "$RC" -eq 3 ] && ok "persist: an unwritable queue file is NOT PROVISIONABLE (rc=3), so the retry stops instead of costing a pass per cycle" \
+                || bad "persist: rc=$RC (want 3 — a candidates.txt no pass can append to must stop the retry, not be re-attempted every cycle) — $OUT"
 [ "$(rec "$D" stage)" = "persist" ] && ok "persist: the record names the persist stage" \
   || bad "persist: record stage='$(rec "$D" stage)' (want persist)"
 case "$(rec "$D" cmd)" in
