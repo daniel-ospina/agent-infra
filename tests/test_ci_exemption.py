@@ -2736,6 +2736,10 @@ def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
         "collect-error::": "collect-error::tests/test_a.py",
         "runner::": "runner::tests-a.test.sh",
         "bash-shard::": "bash-shard::tests/a.test.sh",
+        # #1185 — this family is main's; it landed while this branch was open. The guard
+        # is this branch's, so the vector must carry it or the merge silently drops a
+        # family the row/rate doors already accept.
+        "pipeline-compliance::": "pipeline-compliance::c::some-subject",
     }
     producers = {
         v for k, v in vars(ci_exemption).items()
