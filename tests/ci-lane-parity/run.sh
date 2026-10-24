@@ -86,8 +86,9 @@ trap 'rm -rf "$TMP"' EXIT
 # Until this line changed, the fixture was the runner's own list with a few slow shards grepped
 # out (`runner-fast.sh`), and the pins executed it THREE times (8h, 8d, 8e) — after #2414 had
 # already stopped 8n/8q pointing at a repo-wide guard whose verdict cost ~9.6 s per invocation.
-# On `origin/main` (`6ae9d509`) that made this suite take 23m37s while its ~180 static arms ran in
-# under 40 s; the three fixture executions were the other 23 minutes, all of it RE-RUNNING suites
+# On `origin/main` (`6ae9d509`) that made this suite take 23m37s while its ~180 pass/fail branch
+# sites (90 assertions) ran in under 40 s; the three fixture executions were the other 23 minutes,
+# all of it RE-RUNNING suites
 # that the lane's own `Bash shards` step already runs on the same commit (#2439 recorded the same
 # duplicate-work class for other folded jobs).
 #

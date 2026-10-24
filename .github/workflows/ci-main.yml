@@ -381,7 +381,7 @@ jobs:
     # self-test.
     #
     # ⛔ THE 38m41s SELF-TEST FIGURE THIS COMMENT USED TO CARRY IS STALE, and the bound that was
-    # sized from it (70 min on a step that now runs in ~6-8 s) was protecting nothing. That
+    # sized from it (70 min on a step that now runs in ~6-9 s) was protecting nothing. That
     # measurement is PR #2412's (job 120365087427, 2026-10-23T10:25Z) and predates #2529
     # (`00814821`, 16:09Z same day), which stopped the self-test's fixture re-running the real
     # shard list. MEASURED AFTER #2529 (2026-10-24, this job, 8 successful main runs pulled from the

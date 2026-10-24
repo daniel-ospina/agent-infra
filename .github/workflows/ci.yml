@@ -1101,10 +1101,12 @@ jobs:
     # #1369's two guard steps, ONCE per PR — not once per slice. They lived in `bash-suites`
     # while it was a single job; inside a MATRIX they would run 8 times, and
     # `tests/ci-lane-parity/run.sh` executes, once per runtime pin, a fixture built from the
-    # runner's own lines with every `run_shard` rewritten to the hermetic
+    # runner's own lines with every `run_shard <path>` line rewritten to the hermetic
     # `tests/ci-lane-parity/stand-in-shard.sh` (there is no `runner-fast.sh` any more — #2529
-    # removed it). It costs ~8 s today, but it is a whole suite per slice: running it 8 times would
-    # buy nothing and would re-create this PR's own defect in the job that exists to catch it.
+    # removed it; the quoted `run_shard "$sentinel"` call survives the rewrite by design, so the
+    # failure-recording arm still has something to fail). It costs ~8 s today, but it is a whole
+    # suite per slice: running it 8 times would buy nothing and would re-create this PR's own
+    # defect in the job that exists to catch it.
     #
     # ⛔ NOT conditional and no `needs:` — `check-ci-lane-parity` refuses `if`/`needs`/
     # `continue-on-error` on the call-carrying job exactly so a lane cannot be made to look wired
