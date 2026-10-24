@@ -930,9 +930,8 @@ run_reap() {
       # `unverifiable` here as well counted ONE failed read twice: the shipped pass line read
       # `unverifiable=2` for a single garbled `count`, and `unverifiable=` is the field an operator
       # reads to decide whether the instrument is trustworthy. Rewrite only; the arm below owns the
-      # count and the rc — which is also why no input exists where a `pass_rc=3` here is the only
-      # escalation (measured: removing it alone changes nothing; removing it AND the one below reds
-      # `census-garble` at rc=0).
+      # count and the rc — and reverting that one turns the suite red (185 PASS / 2 FAIL, measured), so
+      # the escalation the classifier owns is pinned.
       *) census="lanes=?/? zombie=?" ;;
     esac
     # A `?` NUMERATOR with readable totals is the same abstention one lane at a time (`count` exits 3

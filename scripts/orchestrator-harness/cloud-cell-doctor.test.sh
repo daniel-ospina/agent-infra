@@ -229,7 +229,7 @@ case "${1:-}" in
   # a check that could not go red. `count` is the only producer of `lanes=`; `reap` says `trees=`.
   # DOCTOR_TEST_REAP_CENSUS=unreadable models the abstention the DOCTOR must escalate on: the reaper
   # could not take the read, so it prints `?` and exits 3. DOCTOR_TEST_REAP_CENSUS=garble models the
-  # OTHER classifier arm (`*)` in cloud-cell-doctor.sh:928): output that does not parse as a census at
+  # OTHER classifier arm (`*)` in cloud-cell-doctor.sh:936): output that does not parse as a census at
   # all — what an unexecutable tool or the `bounded 60` SIGKILL actually produce. Both arms were
   # untested before #2163 review cycle 6/7 (cycle 7 found the catch-all still unpinned).
   count) case "${DOCTOR_TEST_REAP_CENSUS:-}" in
