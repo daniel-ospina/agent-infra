@@ -2613,9 +2613,11 @@ run_status() {
 #   function bodies is the fix if a positional read outside a `local` ever carries a real hazard.
 #   Read this as "every `local` binding of a positional", never "every positional read in the file".
 # ⛔ AND `local` MUST BE THE LINE'S FIRST TOKEN. The walk greps `^[[:space:]]*local `, so a binding
-#   written inside a ONE-LINE function body (`f() { local x="$1"; }`) is not scanned either. None
-#   exists in this file today (`grep -nE '\{ *local '` is empty), and the style here is one binding
-#   per line — stated because a future one-liner would be invisible rather than graded.
+#   written inside a ONE-LINE function body (`f() { local x="$1"; }`) is not scanned either, and
+#   neither is the continuation half of a binding split over lines (`local s="$1" \` + `tmp="$2"`)
+#   — only the first line is seen (review P2). Neither exists in this file today (one binding per
+#   line, no continuations), and the style here is what keeps the walk complete: stated because a
+#   future one-liner or continuation would be invisible rather than graded.
 # ⛔ The suite (final pass 3) walks this MECHANICALLY, by VALUE, keyed by (FUNCTION, NAME) and over a
 #   DERIVED role list: `"${N:-}"` passes at any index, `"${N:-<anything>}"` FAILS (a non-empty default
 #   would let an absent argument arm a mode by itself), a bare `$N` must be a `function:name` pair on
