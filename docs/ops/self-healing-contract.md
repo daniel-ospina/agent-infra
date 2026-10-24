@@ -28,7 +28,7 @@ that cannot answer the middle one has not earned its place:
 2. **How a caller distinguishes ALIVE from REFUSING from IDLE** — the artifact, the token and the exit
    code a reader that never sees a terminal or `launchctl list` can act on. **This is the answer that
    was missing**, and it is not "the file exists" (all four machines pass that) nor "the unit is
-   active" (§3.2 measured both lying on the same box).
+   active" (§1.2 measured both lying on the same box).
 3. **What repairs it** — the specific remedy for REFUSING, per state.
 
 ⛔ **A capability whose refusal cannot be read from outside is a gap, and is named as one here** with
@@ -47,13 +47,13 @@ inventory table called the *broken* one. Every line below is output, not memory;
 
 | machine | channel | result |
 |---|---|---|
-| **cell-4** (this box) | local shell | **MEASURED, fully** (§1.3 A) |
+| **cell-4** (this box) | local shell | **MEASURED, fully** (§1.3) |
 | **cell-3** `vm-915c3930…` | `cmux vm exec shiny-rose-ocelot -- …` | ⛔ **UNREADABLE** — `cmux: link to 'shiny-rose-ocelot' exited`; `/tmp/cell-home/.cmux/peer-links/shiny-rose-ocelot.log`: `cmux-tui: no known daemon matches this route; connect with an invitation`. Filed: **#2345** |
 | **cell-1** `vm-efa6cc8fdb97…` | `cmux vm exec early-ivory-moth -- …` | ⛔ **UNREADABLE** — same failure, same log file |
-| **local Mac** | none | ⛔ **UNREADABLE — there is no channel from a cell to the Mac.** `cmux vm ls` lists only the three cloud cells; `cmux self peers` lists the other two cells; there is no ssh route. The only cross-box channel is the queue repo's origin (§3.10) |
+| **local Mac** | none | ⛔ **UNREADABLE — there is no channel from a cell to the Mac.** `cmux vm ls` lists only the three cloud cells; `cmux self peers` lists the other two cells; there is no ssh route. The only cross-box channel is `git` refs on the queue repo's origin (§3.10) |
 
 **This is itself the first contract finding, and it is not incidental:** the fleet's cross-box channel
-is `git` refs on the queue repo's origin (`capacity.sh` header: *"The fleet's boxes share exactly ONE
+is `git` refs on the queue repo's origin (`capacity.sh`'s header: *"The fleet's boxes share exactly ONE
 channel: the queue repo's origin"*). A capability audit run from a cell therefore **cannot inventory a
 peer machine** — only infer from what that peer published. That is sufficient for capacity (§3.10) and
 insufficient for everything else, so `C5` (per-machine parity) is blocked on a read channel as well as
@@ -62,17 +62,17 @@ measurement** — and is marked as such.
 
 ### 1.2 Corrections to the epic's inventory table (measurement wins; the table is not edited)
 
-| epic table row | measured 2026-10-24 | verdict |
+| epic row (or mandate item) | measured 2026-10-24 | verdict |
 |---|---|---|
-| cell-4 `eldato-orchestrator` **❌ inactive**, "and it still read as healthy" | **14:46:01Z** `systemctl is-active eldato-orchestrator` → `inactive`; `enabled` → `not-found`; `0` unit files. **14:50:22Z** → `active` (unit installed 14:47:43Z by #2402). Its `MainPID` is `cloud-cell-supervisor.sh start`, whose own log line is: `controller already running (pid 684873684873) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)` | **The row's proxy is wrong in BOTH directions.** At 14:46 an `inactive` unit sat over a **live** controller (pid 684873, `HEALTHY age=180`, `[dispatch]` cycle records, two live `merge-*` worker sessions). At 14:50 an `active` unit means a supervisor **waiting for a foreign pid**, while the running controller executes the **older** snapshot `d4ccaf6ee8e6` and the pin names `130638e40658`. "Unit is active" is not an effect test — measured on the box the epic cites. |
-| "precedence rule implemented **nowhere**" ❌❌❌❌ | `orch-loop.sh`, the comment above `mp_reason`: *"Merge priority: while any UN-OWNED PR remains, the box's work is the PR queue, not new PRs."* Shipped, and observable: cell-4's newest cycle record reads `dispatched=0 nothing=gate:merge-priority_(5_un-owned_of_13_open_PR(s)_—_PRs_before_issues)` | **Already implemented — and NOT as a threshold.** #2099 (owner ruling, 2026-10-18) *removed* the threshold: *"for as long as ANY workable un-owned PR remains, issues are not opened — no threshold, no age, no evidence arm"*. The epic's item 4 asks for "a threshold that is a measured number with a written rationale"; **that design is superseded by a recorded owner decision** and must not be re-introduced (see §5.1, `OVERRIDES:`). |
-| "universal dispatcher: **one seam does not exist**; two ad-hoc dispatchers with different gates" | `capacity.sh` (759 lines) ships `cap_probe_local` / `cap_publish` / `cap_read_fleet` / `cap_place`, is sourced each cycle by `orch-loop.sh` (from `$O`, falling back to its own directory), and every cycle writes `[capacity] placement=… place=… lpc_self=… ceiling_lpc=… bound=…`. Cell-4's cycle record: `placement=place placed_on=cmux bound=none lpc_self=57` | **The seam exists.** Its *real* defect is different and worse: **its fleet view collapses to one box** (§3.10, measured). |
-| "no machine except the Mac has an actuator that lands anything" | tortoise **16 PRs merged in the 8 h to 14:50Z**, two of them at **14:47:28Z** and **14:47:52Z**; agent-infra **11** in the same window; cell-4 held two live `merge-*` worker sessions at 14:46Z | **Cells do land work.** ⚠️ Attribution is the gap: **no landing record carries the box that landed it** (§3.3), so "can this machine land?" is unanswerable from the artifacts — which is the dispatcher's own question. |
-| `pr-doctor` **❌ on all cells** | cell-4: `pgrep -f '[p]r-doctor.py'` → `0`; `pr-doctor.log` mtime `2026-10-22T12:55:05Z` (2 days); `0` systemd/launchd units matching `pr-doctor` | ✅ **Confirmed on cell-4.** Peers `UNREADABLE` (§1.1). |
-| `auto-rail` actuator | a tree search for `auto-rail` and for `autorail` **and** `git log --all -S'auto-rail'` over the history → **0 source hits in either**; not in tortoise's tree or history either. (The citation first read `rg -ni 'auto-rail\|autorail'`, which cannot produce this finding: `rg` is Rust-regex, where `\|` is a LITERAL PIPE, so that command reports 0 hits whether or not the thing exists.) | ⛔ **Unattributable capability**: `com.tortoise.auto-rail` exists only as a launchd label on one machine, with **no source in any repo**. It cannot be repaired from a branch and cannot be audited off the Mac. See `C5`. |
-| "bulk dispatch: 16 workers onto a Mac at load 57" | Not present in the repo. The measured instance on record in `spawn-gate.sh`'s comment beginning *"There is no `lane.sh` in that path"* is **three lanes at load 258 on 10 cores** (`MAX_LOAD=100`) via a `tmux new-session` runner that never sourced the gate | ⚠️ **The epic's figure is UNVERIFIED here.** The *mechanism* it describes is real and documented (§3.9). |
+| `eldato-orchestrator` on cell-4 — the epic's false-PASS example: *"cell-4's controller unit is `inactive` and it still looked healthy in the fleet report"* | **14:46:01Z** `systemctl is-active eldato-orchestrator` → `inactive`; `enabled` → `not-found`; `0` unit files. **14:50:22Z** → `active` (unit installed 14:47:43Z by #2402), with `MainPID = /bin/bash …/cloud-cell-supervisor.sh start`, whose journal line is `controller already running (pid 684873684873) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)` | **The proxy is wrong in BOTH directions.** At 14:46 an `inactive` unit sat over a **live** controller (pid 684873, `HEALTHY age=180`, `[dispatch]` cycle records, live `merge-*` worker sessions — 3 at 14:46Z, 2 at 14:47Z). At 14:50 an `active` unit means a supervisor **waiting for a foreign pid**, while the running controller executes the **older** snapshot `d4ccaf6ee8e6` and the pin names `130638e40658`. "Unit is active" is not an effect test — measured on the box the epic cites. |
+| **precedence rule: ">N unmerged PRs ⇒ merging outranks new work"** — the epic's cell: *"❌ implemented nowhere"* | `orch-loop.sh`, the comment above `mp_reason`: *"Merge priority: while any UN-OWNED PR remains, the box's work is the PR queue, not new PRs."* Shipped, and observable: cell-4's newest cycle record reads `dispatched=0 nothing=gate:merge-priority_(5_un-owned_of_13_open_PR(s)_—_PRs_before_issues)` | **Already implemented — and NOT as a threshold.** #2099 (owner ruling, 2026-10-18) *removed* the threshold: *"for as long as ANY workable un-owned PR remains, issues are not opened — no threshold, no age, no evidence arm"*. The epic's mandate item 4 asks for "a threshold that is a measured number with a written rationale"; **that design is superseded by a recorded owner decision** and must not be re-introduced (see §6, `OVERRIDES:`). |
+| **universal dispatcher (one seam: place this lane on the machine with headroom)** — the epic's cell: *"❌ two ad-hoc scripts (`dispatch_generic.py`, `nonblocking-dispatch.sh`)"* | `capacity.sh` ships `cap_probe_local` / `cap_publish` / `cap_read_fleet` / `cap_place`, is sourced each cycle by `orch-loop.sh` (from `$O`, falling back to its own directory), and every cycle writes `[capacity] placement=… place=… lpc_self=… ceiling_lpc=… bound=…`. Cell-4's cycle record: `placement=place placed_on=cmux bound=none lpc_self=57` | **The seam exists.** Its *real* defect is different and worse: **its fleet view collapses to one box** (§3.10, measured). |
+| *"no machine except the Mac has an actuator that lands anything"* (the epic's own reading of its table) | tortoise **16 PRs merged in the 8 h to 14:50Z**, two of them at **14:47:28Z** and **14:47:52Z**; agent-infra **11** in the same window; cell-4 held live `merge-*` worker sessions at 14:46Z | **Cells do land work.** ⚠️ Attribution is the gap: **no landing record carries the box that landed it** (§3.3), so "can this machine land?" is unanswerable from the artifacts — which is the dispatcher's own question. |
+| **`pr-doctor` actually running** (epic: ❌ on every cell) | cell-4: `pgrep -f '[p]r-doctor.py'` → `0`; `pr-doctor.log` mtime `2026-10-22T12:55:05Z` (2 days); `0` systemd/launchd units matching `pr-doctor` | ✅ **Confirmed on cell-4.** Peers `UNREADABLE` (§1.1). |
+| **`auto-rail` actuator running** (epic: ✅ on the Mac, ❌ elsewhere) | a tree search for `auto-rail` and for `autorail`, plus `git log --all -S'auto-rail'` over the history → **0 source hits in either**; not in tortoise's tree or history either. (The citation first read `rg -ni 'auto-rail\|autorail'`, which cannot produce this finding: `rg` is Rust-regex, where `\|` is a LITERAL PIPE, so that command reports 0 hits whether or not the thing exists.) | ⛔ **Unattributable capability**: `com.tortoise.auto-rail` exists only as a launchd label on one machine, with **no source in any repo**. It cannot be repaired from a branch and cannot be audited off the Mac. See `C5`. |
+| the mandate's item 3, verbatim — *"a per-spawn gate let `pr-doctor` put 16 workers on a Mac already at load 57"* | no such measurement is recorded in the repo. The measured instance on record in `spawn-gate.sh`'s comment beginning *"There is no `lane.sh` in that path"* is **three lanes at load 258 on 10 cores** (`MAX_LOAD=100`) via a `tmux new-session` runner that never sourced the gate | ⚠️ **The epic's figure is UNVERIFIED here.** The *mechanism* it describes is real and documented (§3.9). |
 
-**The doubled pid is a second, independent finding:** the shipped emitter composes that phrase once (`_who="pid $(_pids_join "$_own")"` in `cloud-cell-supervisor.sh`, with the comment recording `"pid 15562491556249"` as the round-9 #2402 defect), so the **running** copy on this box predates that fix — the same skew §1.3 measures (pin `130638e40658`, running `d4ccaf6ee8e6`). The quote is verbatim from the journal at 14:47:43Z.
+**The doubled pid in the first row is a second, independent finding:** the shipped emitter composes that phrase once (`_who="pid $(_pids_join "$_own")"` in `cloud-cell-supervisor.sh`, with the comment recording `"pid 15562491556249"` as the round-9 #2402 defect), so the **running** copy on this box predates that fix — the same skew §1.3 measures (pin `130638e40658`, running `d4ccaf6ee8e6`). The quote is verbatim from the journal at 14:47:43Z.
 
 ### 1.3 Transcript — cell-4 (verbatim, the commands whose output is quoted above)
 
@@ -121,13 +121,22 @@ cmux-tui: no known daemon matches this route; connect with an invitation
 
 ## 2. The contract, in machine form
 
+**One convention before the properties: every citation in this file names a file, a symbol or a quoted
+line — never a line number, and never a live count.** A number rots the moment an unrelated edit lands
+above it or another shard is wired, and a design document whose pointers are wrong is worse than none: it
+sends the next lane to the wrong line with the authority of a citation. (The repo recorded the same
+lesson in `.github/workflows/harness-single-source.yml`, above its steps: *"No line numbers for the steps
+above, deliberately: citing them made THIS comment stale the moment it was inserted … A name survives an
+edit; a line number does not."* This document was corrected twice for ignoring it before the convention
+was written down here.)
+
 Three properties, and every capability below is graded against all three:
 
 | property | test | why it is the one that matters |
 |---|---|---|
 | **ALIVE** | the capability's *own record of the effect* is fresh and non-empty | a process, a unit state, a file's existence and a log's presence all pass while the effect is absent |
 | **REFUSING** | a **named** token, with a **reason** and a **next action**, on a surface a reader that is not a terminal can parse (stdout line, sidecar field, exit code) | this is the state the fleet could not see. `nothing to do` and `I could not read the world` must never share a bit |
-| **IDLE** | an **explicit** statement of emptiness (`why=none`, `nothing=none`, `queue is empty: …`) | "exit 0, printed nothing" is the shape that reads as health in every aggregate |
+| **IDLE** | an **explicit** statement of emptiness, in the vocabulary the writer actually emits — `nothing=no_candidate` (the controller), `queue is empty: no open non-draft PRs` (the repair actuator's reason) | "exit 0, printed nothing" is the shape that reads as health in every aggregate. ⛔ `nothing=none` is NOT an emptiness token: it means work WAS dispatched |
 
 Two corollaries, both learned the hard way and both encoded below:
 
@@ -137,7 +146,7 @@ Two corollaries, both learned the hard way and both encoded below:
 - **CANNOT-VERIFY IS NEVER A PASS.** `check-deployed-drift.sh`: *"AN ABSENT, UNREADABLE OR UNKNOWN
   IDENTITY IS `UNKNOWN`, AND CANNOT-VERIFY IS NEVER A PASS."* The same statement appears in
   `capacity.sh` (`probe_unreadable` ⇒ ineligible), `cycle-record.sh` (rc 2 for `ABSENT`/`UNREADABLE`),
-  and `cloud-cell-supervisor.sh`'s `worker_census` (`exit 3` when no answer can be had, *"UNKNOWN is
+  and `cloud-cell-supervisor.sh`'s `worker_census` (`exit 3` when no answer can be had, *"UNKNOWN (exit 3) is
   NOT zero"*).
 
 ---
@@ -154,12 +163,19 @@ place the batch, spawn workers, and **record what it decided** — for as long a
 
 **ALIVE vs REFUSING vs IDLE.** The record is `$O/state/cycles`, one line per cycle, written by
 `cycle-record.sh`; `cycle_verdict` grades its **newest** record and exits **0 HEALTHY · 1
-DEGRADED/FORK-STARVED · 2 ABSENT/UNREADABLE (never a pass)** (`cycle-record.sh`, its header `EXIT` line). The three states a
-caller must read apart live in the *fields*, not the verdict:
-`dispatched=<n> ids=…#…` = ALIVE (work placed); `dispatched=0 nothing=none` = IDLE (a readable world
-with nothing to do); `dispatched=0 nothing=gate:<name>(<reason>)` or `placement=fork_held` =
-**REFUSING, with the binding gate named** (`load=…>=max_load=…`, `capacity-placement(bound=…)`,
-`gate:merge-priority(<n> un-owned of <m> open PR(s))`, `fork_headroom`).
+DEGRADED/FORK-STARVED · 2 ABSENT/UNREADABLE (never a pass)** (`cycle-record.sh`, its header `EXIT` line).
+The three states a caller must read apart live in the *fields*, not the verdict:
+`dispatched=<n> nothing=none` = **ALIVE** (work placed); `dispatched=0 nothing=no_candidate` =
+**IDLE** (a readable world, nothing selected); `dispatched=0 nothing=gate:<name>(<reason>)` or
+`placement=fork_held` = **REFUSING, with the binding gate named** (`load=…>=max_load=…`,
+`capacity-placement(bound=…)`, `gate:merge-priority(<n> un-owned of <m> open PR(s))`,
+`fork_headroom`); `dispatched=0 nothing=placed_elsewhere:<n>` = the work went to a **peer box** (not a
+refusal and not idle — the placement seam did its job).
+⛔ **`nothing=none` is the ALIVE marker, never the IDLE one** — the writer states the rule in its own
+comment: *"`nothing=none` is printed only when something WAS dispatched, so an idle cycle can never read
+as a working one."* An earlier draft of this document had that backwards (it read IDLE from
+`nothing=none`), which would have made every working cycle read as idle and every idle one unreadable;
+the writer's branch order is the authority.
 ⛔ **The verdict alone cannot separate REFUSING from IDLE**: cell-4 printed `HEALTHY` with
 `dispatched=0` and a `gate:merge-priority` refusal. That is deliberate (a draining box *is* healthy)
 but it means **a reader that prints only the verdict is reading a cycling-ness test, not an effect
@@ -223,8 +239,8 @@ missing/short/non-hex is not "no record").
 ⛔ **Gap: nothing attributes a landing to the box that performed it** (no host in the land path), so
 "which machine can land" cannot be answered from artifacts — the dispatcher's own question. `C3`.
 
-**state.** cell-4: rail present at the pin and in the checkout (`head=d4ccaf6e` at measurement), and
-**landing** (2 merges at 14:47Z; 16 tortoise + 11 agent-infra in 8 h).
+**state.** cell-4: rail present at the pin and in the checkout, and **landing** (2 merges at 14:47Z; 16
+tortoise + 11 agent-infra in 8 h).
 
 ### 3.4 Drain loop — `lander.sh` / `merge-one.sh` / `chain-merge.sh`
 
@@ -241,7 +257,7 @@ documents as the thing its precedent got wrong.
 `reviewDecision: null`, `statusCheckRollup = PENDING` with 127 runs queued) — so the remedy is
 back-pressure (§3.16), not a retry.
 
-**state.** cell-4: two live `merge-*` sessions at 14:46Z.
+**state.** cell-4: live `merge-*` sessions at 14:46Z.
 
 ### 3.5 Review evidence — `record-review.sh`, `review-pr.sh`
 
@@ -261,7 +277,7 @@ IDLE does not apply — a review is requested, not scheduled.
 (`tests/record-review/run.sh` pins the carry), lane work REFUSES.
 
 **state.** NC on cell-4 (no review records produced there in the window measured); the capability is
-exercised and pinned in CI (§5.2).
+exercised and pinned in CI (§5.1).
 
 ### 3.6 Repair actuator — `scripts/pr-doctor.py`
 
@@ -342,10 +358,12 @@ IDLE does not apply (it gates, it does not act).
 ⛔ **This gate is PER SPAWN by design and that is the epic's structural complaint**: each invocation
 takes a fresh reading and holds no cross-spawn budget, so a bulk dispatch of N workers is admitted one
 at a time and can overshoot by up to N−1 workers. The measured incident on record is **three lanes at
-load 258 on 10 cores** through a runner that never sourced the gate. (The epic's "16 workers at load
-57" figure is not in the repo, §1.2.)
-⛔ **And the `task`/sub-agent fan-out does not pass through `PATH` at all** (`spawn-gate.sh`, the comment beginning *"THE `task`/SUB-AGENT DISPATCH IS ANOTHER SPAWN POINT"
-#1920), so the one fan-out path a modern lane actually uses is ungated.
+load 258 on 10 cores** through a runner that never sourced the gate. (The epic's own words — *"a
+per-spawn gate let `pr-doctor` put 16 workers on a Mac already at load 57"* — do not match any
+measurement recorded in the repo, §1.2.)
+⛔ **And the `task`/sub-agent fan-out does not pass through `PATH` at all** (`spawn-gate.sh`, the comment
+beginning *"THE `task`/SUB-AGENT DISPATCH IS ANOTHER SPAWN POINT"*, #1920), so the one fan-out path a
+modern lane actually uses is ungated.
 
 **What repairs it.** `disk` → prune (§3.15). `fork` → from outside the box. `load` → wait, or let
 placement (§3.10) move the work. `land-backlog` → drain (§3.4).
@@ -373,8 +391,7 @@ on the queue repo's origin, read with one `git ls-remote --refs`.
 measured directly (`$ hostname` → `cmux`), plus a **4-core box** publishing under that same key — cell-3 by
 **elimination, not by a read** (cell-1 and cell-4 are 8-core, and §1.1 says a peer cannot be inventoried
 from a cell; the numbers are `fleet-capacity.md`'s). Nothing overrides it — no deploy path sets
-`CAP_HOST`. So both publish under the SAME
-key, and `cap_publish` prunes
+`CAP_HOST`. So both publish under the SAME key, and `cap_publish` prunes
 `refs/boxes/<that host>/*` on every publish — **each box deletes its peers' records**. Evidence, in two
 halves:
 - this box's own probe: `host=cmux ncpu=8 …` — but `refs/boxes/cmux/1792853260-4-336-0-25297-4514-9-4692-1`
@@ -417,7 +434,7 @@ on the Mac with a healthy `[cap]` line — the baseline doc's §4 proof that a `
 deployment proof).
 
 **What repairs it.** A claimant whose box is gone → let `claim-reaper.sh` run; a claim that cannot be
-built → fix the cwd/identity (§3.14's `claim-cwd.test.sh` pins `git -C` from a cwd that is not a
+built → fix the cwd/identity (§3.11: `claim-cwd.test.sh` pins `git -C` from a cwd that is not a
 repo).
 
 **state.** NC on cell-4 (claims are repo-scoped; the box was merging rather than dispatching).
@@ -427,13 +444,18 @@ repo).
 **Promises.** (a) Keep the backlog pool non-empty from open P0/P1/P2 issues that pass pre-flight;
 (b) keep the box's harness **pin** truthful with `origin/main`.
 
-**ALIVE vs REFUSING vs IDLE.** `refresh-candidates.sh` appends CLEAN issues and records a per-reason
-funnel (`[dispatch] <listed> candidates -> … -> <n> dispatched`, and `state/refresh-funnel` for the
-decomposition) — IDLE is *"the funnel is empty AND every reason is named"*, never a bare empty file.
+**ALIVE vs REFUSING vs IDLE.** `refresh-candidates.sh` appends CLEAN issues and writes the per-reason record
+`state/refresh-funnel` (`listed=… judged=… queued=…` …), which `orch-loop.sh` RENDERS once as the
+`[dispatch] <listed> candidates -> … -> <n> dispatched` line. The state this contract requires of it:
+**IDLE is an empty funnel in which every reason is a NAMED counter**, never a bare empty file.
+
 The measured freeze that this pins: a refresh ABORTed mid-pass leaving a **partial** `candidates.txt`
 of 42 entries — and `42` is not `< 6`, so the old backlog trigger never fired again and the queue froze
-for **six hours**. `harness-refresh.sh` REFUSES with the pre-flight's own rc and communicates it
-(#2659); a failed refresh is not a silent success.
+for **six hours**. `refresh-candidates.sh` REFUSES with the pre-flight's OWN rc and carries its command
+and stderr line (#2659) — a failed refresh is never a silent success — while `harness-refresh.sh` reports its own
+outcomes by code — `0` current (nothing re-deployed), `10` advanced, `11` pin mended, `23` usage, `25`
+behind with no materialiser, `26` refuses without `--force` — each naming itself and touching nothing it
+cannot verify.
 
 **What repairs it.** A frozen pool → `refresh-candidates.sh` by hand and read the funnel; a pin that
 cannot advance → `cloud-cell-supervisor.sh apply`.
@@ -480,8 +502,8 @@ Pinned in CI by `selftest.sh` (its 15 `check-deployed-drift:` assertions — §5
 and compares it — against **`$REF`**. It never compares the running directory against the **PIN**. Measured
 today that skew is real: pin `130638e40658`, running `…/harness/d4ccaf6ee8e6/…orch-loop.sh` — the running
 directory matches an older commit, so a `$REF` comparison reports drift (correct) but cannot say "the pin and
-the runner disagree", which is the state that persists after a pin moves. `bin/harness`'s `exec` row covers
-it (#2286); this script does not. `C6`.
+the runner disagree", which is the state that persists after a pin moves. `scripts/harness-up`'s `exec` row covers
+it (#2286, pinned by `harness-surface.test.sh`); this script does not. `C6`.
 
 **What repairs it.** 1 → reinstall from the ref (`deploy-harness.sh`), then re-run. 2 → write the stamp
 / make the dir readable; a missing stamp is not "probably fine". A pin/process skew → restart the
@@ -499,8 +521,8 @@ never a `du` sum.
 a sink cannot be proven reclaimable. `spawn-gate.sh`'s disk floor and `cloud-cell-supervisor.sh`'s
 `cmd_check_disk` use **opposite polarity on purpose** (in a live dispatch path an unreadable `df` fails
 **open**, because failing closed would stop every lane on the box forever; at pre-flight it fails
-closed) — the reason is stated in `spawn-gate.sh`'s comment beginning *"THE POLARITY IS MIXED ON PURPOSE"*
-and must not be "unified".
+closed) — the reason is stated in `spawn-gate.sh`'s comment beginning *"THE POLARITY IS MIXED ON
+PURPOSE"* and must not be "unified".
 
 **What repairs it.** It is the repair. Its own failure mode is "reaped nothing because it could not
 prove it was safe" — which it must say.
@@ -549,7 +571,7 @@ is what §3.10's placement is for.
 | merge rail present | ✅ | NC | NC | REC ✅ |
 | **landing happens** | ✅ 2 merges at 14:47Z | NC | NC | REC ✅ |
 | landing **attributed to a box** | ❌ nowhere | ❌* | ❌* | ❌* |
-| `pr-doctor` running | ❌ (log 2 d old, 0 procs) | NC | NC | REC ✅ (launchd) |
+| `pr-doctor` running | ❌ (log 2 d old, 0 procs) | NC | NC | REC ✅ |
 | `pr-doctor` survives its session | ❌ no unit | NC | NC | REC ✅ (with TCC caveat) |
 | `nonblocking-dispatch` takes `prfix` | ✅ | NC | NC | NC |
 | `auto-rail` actuator | ❌* no source in any repo | ❌* | ❌* | REC (label only) |
@@ -621,13 +643,12 @@ is the gap list.
 - `merge-one.sh`, `dispatch-merge.sh`, `chain-merge.sh`, `fix-one.sh`, `adopt-fix.sh`
 - `repo-authority.sh` (copied by `landing-read.test.sh`, not graded), `repo-slug.sh`
 - `rail-refusal.sh` (asserted from inside `red-fixer.test.sh`)
-- `report.sh`, `box-status.sh` — driven, but neither has a suite of its own: `report.sh` from `test-gates.sh`, `box-status.sh` from `merge-reminder.test.sh` §16. ⛔ An earlier draft cited `landing-read.test.sh` / `harness-surface.test.sh`, which reference NEITHER (0 hits in both) — a false-coverage pointer in the document whose thesis is that false health reads are the defect
+- `report.sh` and `box-status.sh` — driven, but neither has a suite of its own: `report.sh` from `test-gates.sh`, `box-status.sh` from `merge-reminder.test.sh` §16
 - `launchd-controller.sh`, `launchd-cycle.sh` (their durability arm is `install-launchd-durability.test.sh`)
 
 None of these is a *new* finding (they are named here so the gap is a list, not a surprise); `C2` (#2708)
 owns the decision about which of them earns a test — starting from the ones whose inertness would be
 invisible, i.e. `merge-one.sh` and `dispatch-merge.sh`.
-
 
 ---
 
@@ -664,7 +685,7 @@ invisible, i.e. `merge-one.sh` and `dispatch-merge.sh`.
 | **C3** | **#2707** — the fleet view: a per-box identity + a transport that is not partitioned by work repo (and a `cap_place` that refuses to decide on a fleet of one) | C1 | needs a design decision with a measured basis; §3.10 carries the evidence |
 | **C4** | merge precedence — **already shipped** (#2099 / #2126 / #2203), observable, and pinned by `test-gates.sh` | — | **no child filed**: it exists. The epic's "threshold" phrasing is superseded by the #2099 ruling (§6) |
 | **C5** | **#2709** — per-machine parity + activation: `pr-doctor` and a land actuator on every cell, an `auto-rail` that has a source, and one parity surface | C1, C2, #2135, #2345, #1761 | blocked on a read channel (§1.1) and on the cell doctor's own inert role pass |
-| **C6** | **#2710** — "refusal is a verdict": a refusal carries a NAME, a REASON and a NEXT ACTION on every capability, and `UNKNOWN` is never a pass | C1, #2291 | `objective.py` exits 0 on `UNKNOWN` (§3.7) and `check-deployed-drift.sh` never compares the RUNNING snapshot to the pin (§3.14) |
+| **C6** | **#2710** — "refusal is a verdict": a refusal carries a NAME, a REASON and a NEXT ACTION on every capability, and `UNKNOWN` is never a pass | C1, #2291 | `objective.py` exits 0 on `UNKNOWN` (§3.7) and `check-deployed-drift.sh` compares the RUNNING dir to `$REF`, never to the PIN (§3.14) |
 
 Every child carries the same research mandate as the epic: **read
 `~/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md` → run the contradiction test → read the artifacts named
