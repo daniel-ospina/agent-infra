@@ -73,10 +73,15 @@ if [ -z "${DRAINER:-}" ]; then
         [ -f "$_c" ] && { DRAINER="$_c"; break; }
     done
 fi
-[ -n "${DRAINER:-}" ] || err "ai-drainer.sh not found (looked in this checkout and $HOME/.pi/agent/scripts) — nothing to schedule"
-[ -f "$DRAINER" ] || err "DRAINER=$DRAINER does not exist"
-[ -f "$TEMPLATES_DIR/$UNIT_SRC_SERVICE" ] || err "template not found: $TEMPLATES_DIR/$UNIT_SRC_SERVICE"
-[ -f "$TEMPLATES_DIR/$UNIT_SRC_TIMER" ] || err "template not found: $TEMPLATES_DIR/$UNIT_SRC_TIMER"
+# ⛔ EVERY PRE-FLIGHT ABORTS. `err` prints and returns 1, and at top level nothing consumed that
+# status (there is no `set -e`): a typo in DRAINER printed the error and then installed a unit whose
+# ExecStart does not exist, and a wrong TEMPLATES_DIR overwrote the ALREADY-WORKING units with empty
+# files — both reporting "ai-drainer scheduled". A refusal that does not stop the install is a
+# warning wearing a refusal's words.
+[ -n "${DRAINER:-}" ] || { err "ai-drainer.sh not found (looked in this checkout and $HOME/.pi/agent/scripts) — nothing to schedule"; exit 1; }
+[ -f "$DRAINER" ] || { err "DRAINER=$DRAINER does not exist"; exit 1; }
+[ -f "$TEMPLATES_DIR/$UNIT_SRC_SERVICE" ] || { err "template not found: $TEMPLATES_DIR/$UNIT_SRC_SERVICE"; exit 1; }
+[ -f "$TEMPLATES_DIR/$UNIT_SRC_TIMER" ] || { err "template not found: $TEMPLATES_DIR/$UNIT_SRC_TIMER"; exit 1; }
 
 # ── which systemctl, and therefore which unit dir ─────────────────────────────────────────────
 # System unit first (the cell's normal shape), user unit when systemd's user manager answers but
@@ -101,7 +106,12 @@ resolve_target || {
 [ -n "${SYSTEMCTL:-}" ] || SYSTEMCTL="$([ "$TARGET" = system ] && printf 'sudo -n systemctl' || printf 'systemctl --user')"
 
 render() { # <template> <dest>
-    local v
+    local v tmp
+    # ⛔ RENDER TO A TEMP FILE AND CHECK THE RESULT. Writing straight to "$2" let the shell truncate
+    # the destination BEFORE `sed` failed, and the only post-check (grep for `{{`) cannot match an
+    # EMPTY file — so `DRAINER_REPO_SLUG='a|b'` installed two zero-byte units, enabled the timer and
+    # printed "scheduled". The checks below are on the bytes that would actually be installed.
+    tmp="$2.tmp.$$"
     sed -e "s|{{USER}}|$(id -un)|g" \
         -e "s|{{HOME}}|$HOME_DIR|g" \
         -e "s|{{PATH}}|${PATH:-/usr/local/bin:/usr/bin:/bin}|g" \
@@ -113,11 +123,19 @@ render() { # <template> <dest>
         -e "s|{{MIN_SWAP_MB}}|${MIN_SWAP_MB:-700}|g" \
         -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-3000}|g" \
         -e "s|{{DRAINER}}|$DRAINER|g" \
-        "$1" >"$2"
-    # ⛔ A value carrying `|` or `&` would silently corrupt the rendered unit (sed replacement), and a
-    # leftover `{{…}}` means a placeholder nothing substituted — a unit that starts with a literal
-    # `{{HOME}}` in it. Both are refusals, never a warning.
-    if grep -q '{{' "$2"; then rm -f "$2"; err "unsubstituted placeholder remains in the rendered unit"; return 1; fi
+        "$1" >"$tmp" || { rm -f "$tmp"; err "sed could not render $1 (a value carries '|' or '&'?) — refusing to install a partial unit"; return 1; }
+    # A value carrying `|`/`&` corrupts the substitution; a leftover `{{…}}` means a placeholder
+    # nothing substituted. Both are refusals, and so is an empty result: a unit with no ExecStart
+    # enables, activates and then does nothing every 20 minutes.
+    if grep -q '{{' "$tmp"; then rm -f "$tmp"; err "unsubstituted placeholder remains in the rendered unit"; return 1; fi
+    if [ ! -s "$tmp" ]; then rm -f "$tmp"; err "rendered $1 is EMPTY — refusing to install it"; return 1; fi
+    case "$1" in
+        *.service) grep -q '^ExecStart=' "$tmp" \
+            || { rm -f "$tmp"; err "rendered service has no ExecStart — it would enable and do nothing"; return 1; } ;;
+        *.timer)   grep -q '^\[Timer\]' "$tmp" \
+            || { rm -f "$tmp"; err "rendered timer has no [Timer] section"; return 1; } ;;
+    esac
+    mv -f "$tmp" "$2"
 }
 
 say_status() {
@@ -136,16 +154,21 @@ case "$MODE" in
     --status) say_status "$UNIT_SRC_SERVICE" "$UNIT_SRC_TIMER"; exit 0 ;;
     --uninstall)
         $SYSTEMCTL disable --now "$UNIT_SRC_TIMER" >/dev/null 2>&1 || true
-        rm -f "$UNIT_DIR/$UNIT_SRC_TIMER" "$UNIT_DIR/$UNIT_SRC_SERVICE" || err "cannot remove the units from $UNIT_DIR"
+        # ⛔ A REMOVAL THAT DID NOT HAPPEN IS NOT AN UNINSTALL. `rm -f` returning non-zero printed the
+        # error and then announced "nothing dispatches from this cell any more", exit 0 — so an
+        # operator could believe a still-armed 20-minute dispatcher was gone.
+        rm -f "$UNIT_DIR/$UNIT_SRC_TIMER" "$UNIT_DIR/$UNIT_SRC_SERVICE" \
+            || { err "cannot remove the units from $UNIT_DIR — the timer is STILL ARMED"; exit 1; }
+        [ ! -f "$UNIT_DIR/$UNIT_SRC_TIMER" ] \
+            || { err "$UNIT_DIR/$UNIT_SRC_TIMER still exists after removal — it is STILL ARMED"; exit 1; }
         $SYSTEMCTL daemon-reload >/dev/null 2>&1 || true
         printf 'drainer timer removed — nothing dispatches from this cell any more\n'
         exit 0 ;;
 esac
 
-# The state dir must exist and be writable by THIS user: the unit runs as this user and every pass
-# would fail closed on an unwritable log dir.
-mkdir -p "$DRAINER_STATE/logs" 2>/dev/null || { err "cannot create $DRAINER_STATE/logs"; exit 1; }
-[ -w "$DRAINER_STATE" ] || { err "state dir $DRAINER_STATE is not writable by $(id -un)"; exit 1; }
+# ⛔ --dry-run MUST NOT CREATE ANYTHING — especially not the state dir, which is itself evidence the
+# `second-controller` inventory row reads. A preview that creates a directory is a preview that can
+# turn a box red. The checks run for a real install; the preview reports what it WOULD create.
 [ -z "$DRAINER_O" ] || [ -d "$DRAINER_O" ] || { err "DRAINER_O=$DRAINER_O does not exist — the pass would count zero lanes and dispatch as if the box were idle"; exit 1; }
 
 tmpd="$(mktemp -d)" || { err "mktemp failed"; exit 1; }
@@ -153,12 +176,39 @@ render "$TEMPLATES_DIR/$UNIT_SRC_SERVICE" "$tmpd/$UNIT_SRC_SERVICE" || exit 1
 render "$TEMPLATES_DIR/$UNIT_SRC_TIMER" "$tmpd/$UNIT_SRC_TIMER" || exit 1
 
 if [ "$MODE" = "--dry-run" ]; then
+    [ -w "$DRAINER_STATE" ] || printf 'would create %s/logs (it does not exist yet)\n' "$DRAINER_STATE"
     printf 'would install to %s (target %s):\n\n' "$UNIT_DIR" "$TARGET"
     sed 's/^/  /' "$tmpd/$UNIT_SRC_SERVICE" "$tmpd/$UNIT_SRC_TIMER"
     rm -rf "$tmpd"
     exit 0
 fi
 
+# The state dir must exist and be writable by THIS user: the unit runs as this user and every pass
+# would fail closed on an unwritable log dir.
+mkdir -p "$DRAINER_STATE/logs" 2>/dev/null || { rm -rf "$tmpd"; err "cannot create $DRAINER_STATE/logs"; exit 1; }
+[ -w "$DRAINER_STATE" ] || { rm -rf "$tmpd"; err "state dir $DRAINER_STATE is not writable by $(id -un)"; exit 1; }
+# ⛔ A USER UNIT WITH A `User=` LINE IS REJECTED BY systemd, and a user unit whose manager STOPS when
+# the last session ends fires only while an ssh session is open — an installed timer that schedules
+# nothing, the false PASS this installer refuses for the system target. The sibling installer carries
+# the same guard for the same reason; both must refuse rather than report green.
+if [ "$TARGET" = "user" ]; then
+    if grep -q '^User=' "$tmpd/$UNIT_SRC_SERVICE"; then
+        # grep -v, not `sed -i`: this file's editing rules forbid sed for line surgery, and a
+        # rendered temp unit must be rebuilt rather than edited in place.
+        grep -v '^User=' "$tmpd/$UNIT_SRC_SERVICE" >"$tmpd/svc.new" \
+            && mv -f "$tmpd/svc.new" "$tmpd/$UNIT_SRC_SERVICE"
+    fi
+    linger="$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null | sed 's/^Linger=//')"
+    if [ "$linger" != "yes" ]; then
+        loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+        linger="$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null | sed 's/^Linger=//')"
+    fi
+    if [ "$linger" != "yes" ]; then
+        rm -rf "$tmpd"
+        err "this box needs a USER unit, but lingering is '${linger:-unknown}' — the user manager stops when your last session ends, so the timer would fire now and never again. Enable it (loginctl enable-linger $(id -un), often needing root) or grant passwordless sudo for systemctl, then re-run."
+        exit 1
+    fi
+fi
 mkdir -p "$UNIT_DIR" 2>/dev/null || { rm -rf "$tmpd"; err "cannot create $UNIT_DIR (a system target needs sudo; a user target needs a home dir)"; exit 1; }
 for u in "$UNIT_SRC_SERVICE" "$UNIT_SRC_TIMER"; do
     if [ -f "$UNIT_DIR/$u" ] && cmp -s "$UNIT_DIR/$u" "$tmpd/$u"; then

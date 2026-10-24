@@ -72,7 +72,12 @@ REPO_SLUG="${REPO_SLUG:-daniel-ospina/agent-infra}"
 MAX_LANES="${MAX_LANES:-4}"
 MIN_SWAP_MB="${MIN_SWAP_MB:-700}"
 LANE_TIMEOUT="${LANE_TIMEOUT:-3000}"
-LANE_WAIT_MAX="${LANE_WAIT_MAX:-$((LANE_TIMEOUT + 100))}"
+# ⛔ NOT DERIVED HERE. `$((LANE_TIMEOUT + 100))` on a RAW value is an abort: `LANE_TIMEOUT=30m` makes
+# bash print "value too great for base", leaves this variable UNSET, and the `set -u` read in the
+# wait loop then kills the tick mid-lock — so the guard that holds the lock for the lane's life would
+# release it on the first iteration for every later tick. (`0300` is worse than an abort: it silently
+# arithmetics in OCTAL, giving a 292s bound against a 300s lane.) Defaulted AFTER validation, below.
+LANE_WAIT_MAX="${LANE_WAIT_MAX:-}"
 LANE_POLL_S="${LANE_POLL_S:-30}"
 PR_BUDGET="${PR_BUDGET:-6}"
 SLICE_WIDTH="${SLICE_WIDTH:-10}"
@@ -103,6 +108,7 @@ _num() { # <name> <value> <default>
 MAX_LANES="$(_num MAX_LANES "$MAX_LANES" 4)"
 MIN_SWAP_MB="$(_num MIN_SWAP_MB "$MIN_SWAP_MB" 700)"
 LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 3000)"
+# VALIDATE FIRST, THEN DERIVE: the fallback below is computed from the already-validated integer.
 LANE_WAIT_MAX="$(_num LANE_WAIT_MAX "$LANE_WAIT_MAX" "$((LANE_TIMEOUT + 100))")"
 LANE_POLL_S="$(_num LANE_POLL_S "$LANE_POLL_S" 30)"
 PR_BUDGET="$(_num PR_BUDGET "$PR_BUDGET" 6)"
@@ -133,14 +139,33 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     say "SKIP: drainer already running (pid $pid)"; exit 0
   fi
-  say "STALE lock from pid ${pid:-?} — reclaiming"
-  rm -rf "$LOCK"
+  # ⛔ RECLAIM IS ATOMIC — `mv`, never `rm -rf` followed by `mkdir`. That pair is a race with a
+  # measured failure: two ticks both fail `mkdir`, both read the dead pid, both log "reclaiming"; A
+  # `rm -rf`s and re-creates the lock, then B's `rm -rf` DELETES A'S FRESH LOCK and B's own `mkdir`
+  # succeeds — two lanes start, and A's exit trap later removes B's lock so a third can start too.
+  # `mv` succeeds for exactly ONE contender (a directory can be renamed once), so the loser re-tests
+  # the live holder instead of claiming it.
+  if mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then
+    say "STALE lock from pid ${pid:-?} — reclaimed atomically"
+    rm -rf "$LOCK.stale.$$" 2>/dev/null
+  else
+    pid="$(cat "$LOCK/pid" 2>/dev/null || printf '')"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      say "SKIP: drainer already running (pid $pid)"; exit 0
+    fi
+    say "SKIP: another tick at the lock reclaim race — it will dispatch, not this one"; exit 0
+  fi
   mkdir "$LOCK" 2>/dev/null || { say "SKIP: cannot take the lock at $LOCK"; exit 0; }
 fi
 cleanup() { rm -rf "$LOCK" 2>/dev/null; }
 trap cleanup EXIT INT TERM
 # The lock names ITS OWN holder, so a concurrent tick can tell a live drainer from a stale directory.
 printf '%s' "$$" >"$LOCK/pid" 2>/dev/null
+# ⛔ THE BEAT IS WRITTEN AS SOON AS THE TICK OWNS THE LOCK, BEFORE any guard that can skip. Its
+# inventory row reads this file as the freshness signal, and a skipped tick is the NORMAL steady state
+# on a swap-bound box — written only after a dispatch, every legitimate skip would read LATE for ever.
+beat() { printf '%s\n' "$(date +%s)" >"$AI/state/ai-drainer.beat" 2>/dev/null; }
+beat
 # ──8<── /lock-guard ───────────────────────────────────────────────────────────────────────────
 # ── GUARD 2: CAPACITY — the measured floor, not a guess ────────────────────────────────────────
 # (15 lanes drove swap to 586 MB against the harness's own 600 MB floor.)
@@ -163,12 +188,29 @@ if [ "$swap_free_mb" -lt 0 ]; then
   exit 1
 fi
 lanes=0
+# ⛔ LIVENESS BY ARGV SHAPE, NOT BY "THE COMMAND LINE STARTS WITH pi". The dispatchers this file
+# supports record the pid of a BACKGROUNDED SUBSHELL (`( … run_agent … ) &`), whose argv is
+# `bash …/nonblocking-dispatch.sh …` — `pi` is that subshell's CHILD. A `case "$c" in pi*)` therefore
+# counted ZERO lanes on every real dispatch, so MAX_LANES could never fire in the exact state it
+# exists for (a lane storm on a swap-bound box). Count a pidfile whose pid is ALIVE and whose argv
+# names the worker runtime or one of the dispatchers that spawns it; a dead or recycled pid counts 0.
+_counts_as_lane() { # <command-line>
+  local c="$1" w
+  [ -n "$c" ] || return 1
+  case "$c" in pi | pi\ *) return 0 ;; esac
+  for w in nonblocking-dispatch.sh bg-dispatch.sh lane.sh fix-one.sh merge-one.sh \
+           chain-merge.sh dispatch-merge.sh; do
+    case "$c" in *"$w"*) return 0 ;; esac
+  done
+  return 1
+}
 for f in "$O"/bg/*.pid; do
   [ -f "$f" ] || continue
   p="$(tr -dc '0-9' 2>/dev/null <"$f")"
   [ -n "$p" ] || continue
+  kill -0 "$p" 2>/dev/null || continue          # a dead pidfile is not a lane
   c="$("$PS" -p "$p" -o command= 2>/dev/null | head -1)"
-  case "$c" in pi | pi\ *) lanes=$((lanes + 1)) ;; esac
+  _counts_as_lane "$c" && lanes=$((lanes + 1))
 done
 if [ "$swap_free_mb" -lt "$MIN_SWAP_MB" ]; then
   say "SKIP: swap ${swap_free_mb}MB < ${MIN_SWAP_MB}MB floor"; exit 0
@@ -207,12 +249,29 @@ check. Report to \`$AI/logs/REPORT-drainer-\$(date +%H%M).md\`: per PR one line,
 BRIEFEOF
 
 wt="$AI/wt-drainer-$(date +%H%M%S)-$$"
+# ⛔ THE WORKTREE IS REMOVED ON EVERY EXIT PATH, because a tick is a fresh checkout: at the shipped
+# 20-minute cadence an unremoved one is ~72 checkouts/day plus a `.git/worktrees` record per run in
+# $SEED_REPO — the measured #1095 shape (407 worktrees / 179 GB, after which every git op fails).
+# A TIMEOUT is the one path that leaves it: the lane may still be writing in it, and deleting a live
+# lane's checkout is the P0 this fleet already paid for. Leftovers are pruned one per tick.
+rm_worktree() {
+  git -C "$SEED_REPO" worktree remove --force "$wt" >/dev/null 2>&1 \
+    || say "WARN: could not remove the worktree at $wt — a reaper will; it is named, not silent"
+}
+trap 'beat 2>/dev/null; rm_worktree; cleanup' EXIT INT TERM
+# Bounded prune of worktrees whose directories are already gone (one per tick, so it always terminates).
+git -C "$SEED_REPO" worktree prune >/dev/null 2>&1 || true
 if ! git -C "$SEED_REPO" worktree add -f "$wt" "$SEED_REF" >/dev/null 2>&1; then
   say "FAIL: cannot create a worktree at $wt from $SEED_REPO ($SEED_REF)"
   exit 1
 fi
 
-NAME="ai-drain-$(date +%H%M%S)"
+# ⛔ THE LANE NAME CARRIES THIS PID. A second-resolution name collides whenever two ticks dispatch in
+# the same wall-clock second (a hand-run copy beside the scheduled tick — a case this file's own
+# header names), and the dispatchers TRUNCATE `$O/bg/<name>.log` and `rm -f $O/bg/<name>.rc` on reuse:
+# the running lane's transcript is destroyed and its exit status is lost, so this tick would poll
+# ANOTHER lane's pid. Same shape as the worktree path above.
+NAME="ai-drain-$(date +%H%M%S)-$$"
 say "START: slice=$start swap=${swap_free_mb}MB lanes=$lanes worktree=$wt lane=$NAME dispatcher=$DISPATCH"
 if ! bash "$DISPATCH" "$NAME" "$wt" "$BRIEF" "$LANE_TIMEOUT" >>"$LOG" 2>&1; then
   say "FAIL: dispatcher refused ($DISPATCH)"
@@ -224,23 +283,46 @@ fi
 # first still runs. Poll the lane's own pid, bounded just above the lane's cap so a wedged lane
 # cannot hold this lock forever.
 lane_pid="$(tr -dc '0-9' 2>/dev/null <"$O/bg/$NAME.pid")"
-[ -n "$lane_pid" ] && printf '%s' "$lane_pid" >"$LOCK/pid" 2>/dev/null
-# ⛔ A BEAT WHILE WE HOLD THE LOCK, in its own file. A pass can legitimately last `LANE_TIMEOUT`
-# seconds, and the inventory row derives "fresh" from 2×this job's StartInterval — so a healthy
-# 50-minute pass would read LATE against its own 20-minute interval. The beat is the evidence that
-# the drainer is WAITING rather than gone, and it is one small file overwritten per poll instead of
-# ~100 log lines. `orchestrator-bringup.sh status` reads it as this job's freshness signal.
-beat() { printf '%s\n' "$(date +%s)" >"$AI/state/ai-drainer.beat" 2>/dev/null; }
-beat
+# ⛔ AN UNREADABLE LANE PID IS A FAILURE, NOT A ZERO-LENGTH WAIT. `$(tr … <"$O/bg/$NAME.pid")` masks
+# a missing file, and an empty pid made the wait loop skip entirely: the tick logged "DONE: lane ?
+# finished after 0s", released the lock and exited 0 while the lane it had just started was running
+# — the exact failure this file's header forbids, invisible to every reader because the exit was 0.
+if [ -z "$lane_pid" ]; then
+  say "FAIL: dispatcher returned but $O/bg/$NAME.pid is missing or unreadable — the lock's lifetime cannot be established, so this tick reports failure instead of a false clean"
+  exit 1
+fi
+printf '%s' "$lane_pid" >"$LOCK/pid" 2>/dev/null
+# A BEAT WHILE WE HOLD THE LOCK. A pass can legitimately last `LANE_TIMEOUT` seconds, and the
+# inventory row derives "fresh" from 2×this job's StartInterval — a healthy 50-minute pass would
+# otherwise read LATE against its own 20-minute interval. `beat()` is defined above, together with
+# the reason it is also written by every skip.
 waited=0
-while [ -n "$lane_pid" ] && kill -0 "$lane_pid" 2>/dev/null && [ "$waited" -lt "$LANE_WAIT_MAX" ]; do
+while kill -0 "$lane_pid" 2>/dev/null && [ "$waited" -lt "$LANE_WAIT_MAX" ]; do
   "$SLEEP_BIN" "$LANE_POLL_S"
   beat
   waited=$((waited + LANE_POLL_S))
 done
-if [ -n "$lane_pid" ] && kill -0 "$lane_pid" 2>/dev/null; then
-  say "TIMEOUT: lane $lane_pid still alive after ${waited}s — releasing the lock"
-else
-  say "DONE: lane ${lane_pid:-?} finished after ${waited}s — lock released"
+if kill -0 "$lane_pid" 2>/dev/null; then
+  # The lane outlived its own cap: leave its worktree (it may still be writing) and release the lock,
+  # because holding it longer would stop every future tick as well.
+  trap 'cleanup' EXIT INT TERM
+  say "TIMEOUT: lane $lane_pid still alive after ${waited}s — releasing the lock; worktree $wt left in place"
+  exit 0
 fi
+# ⛔ THE LANE'S OWN EXIT STATUS IS THE VERDICT. Both shipped dispatchers write `$O/bg/<name>.rc`, and
+# a spawn REFUSED by a gate (load / disk / land-backlog) dies in milliseconds — so "the pid is gone"
+# is not "the work happened". Without this read, a gate refusal is indistinguishable from a completed
+# lane: the tick logs DONE, exits 0, and the inventory row reads healthy while nothing was dispatched
+# (the "installed but inert" state this change exists to end).
+rc_file="$O/bg/$NAME.rc"
+rc="$(cat "$rc_file" 2>/dev/null || printf '')"
+if [ -z "$rc" ]; then
+  say "FAIL: lane $lane_pid vanished with NO exit status at $rc_file — it was refused or lost, not completed (see $O/bg/$NAME.log)"
+  exit 1
+fi
+if [ "$rc" != "0" ]; then
+  say "FAIL: lane $lane_pid exited $rc — see $O/bg/$NAME.log"
+  exit 1
+fi
+say "DONE: lane $lane_pid finished rc=0 after ${waited}s — lock released"
 exit 0

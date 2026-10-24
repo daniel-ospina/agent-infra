@@ -45,10 +45,15 @@
          schedulers — no third mechanism is invented, and the guards are identical because
          the guards are in the script.
 
-         StandardOutPath/ErrorPath are /tmp like every other template here: launchd opens
-         both files BEFORE exec and nothing creates $HOME/.pi/agent/state. They capture only
-         a death before the script can log; the durable record is $AI/logs/ai-drainer.log
-         (a skip, a start, a lane completion and a dispatcher failure each write a line).
+         ⛔ NO StandardOutPath/StandardErrorPath, deliberately — the convention every
+         self-logging job in this directory follows (lane-liveness, pi-cache-reap). This job
+         writes its own record: $AI/logs/ai-drainer.log for the decisions (skip / start /
+         done / fail) and $AI/state/ai-drainer.beat as its freshness signal. Declaring a
+         /tmp capture would make `scripts/lib/fleet-inventory.sh` date THAT file instead
+         (it prefers the plist's StandardOutPath over the row's own-log), and since this
+         script writes nothing to stdout on any normal path, a perfectly healthy drainer
+         would read LATE for ever — the false red that teaches operators to ignore the one
+         health screen they are meant to read.
 
          Rendered by scripts/install-launchd.sh (#304) — placeholders only. -->
     <key>Label</key>
@@ -71,9 +76,5 @@
     </dict>
     <key>StartInterval</key>
     <integer>1200</integer>
-    <key>StandardOutPath</key>
-    <string>/tmp/ai-drainer.launchd.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/ai-drainer.launchd.err</string>
 </dict>
 </plist>

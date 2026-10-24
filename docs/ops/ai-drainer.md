@@ -48,14 +48,33 @@ operator activates them on a box**, and both are in the fleet inventory so their
    would then start a SECOND lane against the same slice, and every tick would exit 0 — a lane storm
    no instrument reports.
 2. **capacity** — free swap below `MIN_SWAP_MB` (default 700), or `MAX_LANES` (default 4) already
-   running. An unreadable swap read is a **failure**, never a skip: a guard that could not be
-   evaluated must not look like a correctly-idle box.
+   running. A lane is counted from its pidfile by **argv shape**: both shipped dispatchers record the
+   pid of a *backgrounded subshell* whose command line is `bash …/nonblocking-dispatch.sh …` (`pi` is
+   its child), so a test for "the command line starts with `pi`" counts **zero** on every real
+   dispatch and the cap could never fire. An unreadable swap read is a **failure**, never a skip: a
+   guard that could not be evaluated must not look like a correctly-idle box.
 3. **rotation** — a cursor over the open list (`SLICE_WIDTH` per tick, wrapping at `SLICE_TOTAL`), so
    repeated ticks do not all work the same six PRs.
 
-`ai-drainer.test.sh` covers all three arms plus the launcher's refusals, and asserts arm (a) against a
-**mutation**: the same concurrency arm is re-run against a copy with the lock block deleted and must
-then FAIL (two lanes start). A guard test that cannot detect the guard's absence proves nothing.
+Two more properties are part of the same contract, because each one is a way for a tick to look
+successful while nothing happened:
+
+- **the lane's own exit status is the verdict.** Both dispatchers write `$O/bg/<name>.rc`; a spawn
+  refused by a gate dies in milliseconds, so "the pid is gone" is not "the work happened". No `.rc` →
+  the tick FAILS (refused or lost); `.rc != 0` → the tick FAILS and names the log. The lock is also
+  **not** released on a zero-length wait: an unreadable lane pidfile is a failure, not a free lock.
+- **the beat is written by every tick that ran**, including a skip — on a swap-bound box, SKIP is the
+  normal steady state, and a beat written only after a dispatch would make a correctly-idle job read
+  `LATE` for ever.
+- **the worktree is removed on every exit path** except a timeout (a lane may still be writing in it):
+  a fresh checkout per tick with nothing removing it is ~72/day of disk on a box that has already been
+  disk-bound.
+
+`ai-drainer.test.sh` covers all three guards, both tick verdicts, and the launcher's refusals, and
+asserts the concurrency arm against a **mutation**: the same arm is re-run against a copy with the
+lock block deleted and must then FAIL (two lanes start). A guard test that cannot detect the guard's
+absence proves nothing. A second arm drives the *reclaim* path directly — three ticks racing over one
+STALE lock must still start exactly one lane, which is the arm that catches a non-atomic reclaim.
 
 ## Activate on macOS
 
@@ -98,9 +117,13 @@ bash scripts/orchestrator-harness/install-drainer-timer.sh --status   # installe
 ```
 
 The timer is `OnUnitActiveSec=20min` (not `OnCalendar`) so the next tick is a fixed distance from the
-last real attempt instead of bunching skipped ticks after a long lane. `cloud-cell-bringup.sh` does
-**not** install it: a lane dispatcher is per-repo and costs model spend, so it is an explicit,
-per-cell operator step — the same shape as the disk reaper's arming.
+last real attempt instead of bunching skipped ticks after a long lane. The installer **aborts** on
+every failed pre-flight (a rendered unit is rejected if it is empty, has no `ExecStart`, or keeps a
+`{{placeholder}}`), reads the timer's `is-active` back after enabling it, and refuses a **user** unit
+whose manager will not linger — a user timer that stops with the last ssh session is an installed job
+that schedules nothing. `cloud-cell-bringup.sh` does **not** install it: a lane dispatcher is per-repo
+and costs model spend, so it is an explicit, per-cell operator step — the same shape as the disk
+reaper's arming.
 
 The second controller on a cell is the cell supervisor's business (`cloud-cell-supervisor.sh start`
 with `OR`/`O` for that repo); it needs no timer at all, and its inventory row says so
@@ -117,11 +140,21 @@ Two rows matter, and both are calibrated against the failure they exist for:
 | row | OK means | the state that is NOT OK |
 |---|---|---|
 | `ai-drainer` | job loaded, last exit 0, its own **beat** fresh within 2×1200s | `LATE` = installed and not running (nothing dispatches, nothing goes red); `MISSING` = the code is present and no job installs it |
-| `second-controller` | job loaded, ONE `orch-loop.sh` for its own state dir, heartbeat fresh | `MISSING` = loaded with nothing cycling, or a state dir with no job (hand-run, ends at reboot); `DUPLICATE` = two controllers on one dir |
+| `second-controller` | job loaded, ONE `orch-loop.sh` for its own state dir, heartbeat fresh | `MISSING` = loaded with nothing cycling, or a controller identity with no job (hand-run, ends at reboot); `DUPLICATE` = two controllers on one dir |
 
-The drainer's freshness file is `$AI/state/ai-drainer.beat`, written on every poll **while it holds its
-lock** — not its log, because a healthy 50-minute pass would otherwise read `LATE` against its own
-20-minute interval.
+Two details of that row are deliberate. Its state dir comes from the **job's own `O`**, not from the
+seam (an operator who activated it elsewhere would otherwise be judged against a directory the job
+does not use); and "a second controller was set up here" is evidenced by the `--init` artefact
+(`state/HARNESS-PIN`), **not** by the directory existing — `$HOME/orchestrator-ai` is also the
+drainer's default state dir, so the weaker test turned activating *only the drainer* into a red row
+instructing the operator to install a second controller.
+
+The drainer's freshness file is `$AI/state/ai-drainer.beat`, written as soon as the tick owns the lock
+and on every poll while it holds it — not its log, because a healthy 50-minute pass would otherwise
+read `LATE` against its own 20-minute interval. That is also why the plist declares **no**
+`StandardOutPath`: the inventory prefers a plist's capture path over the row's own file, and this
+script writes nothing to stdout on any normal path, so declaring one would date an untouched file and
+mark a healthy drainer `LATE` for ever.
 
 ## Known remaining gap (owned elsewhere)
 
