@@ -1920,12 +1920,32 @@ onto the new pin, deliberately: a self-restart mid-cycle is a liveness risk this
 
 ### 6.5.9 The reminder's actuator arm: a GO is a claim about evidence
 
-**The reminder.** One timer, every 600 s, answering three questions: what is closest to landing,
-what merged but is **not live** on a box, and what is red for the SAME reason across many PRs. It
-writes `$O/MERGE-REMINDER.md` and prints ONE line. Until #2603 that line read
+**The reminder.** One timer, every 600 s, answering **the owner's two goals first**, then three
+questions: what is closest to landing, what merged but is **not live** on a box, and what is red for
+the SAME reason across many PRs. It writes `$O/MERGE-REMINDER.md` and prints ONE line. Until #2603 that line read
 `#2579 (?) reds=0 [GREEN(wait:21)] :: …` — `(?)` for priority, and `GREEN` for a surface with
 twenty-one checks still in flight. Both read better than reality, so both are gone: every value is
 MEASURED, and an unread value says `UNREADABLE <reason>`.
+
+**The goals, and why they come FIRST.** The owner's ask (2026-10-24T04:10Z) was *"improve the reminder
+message so it reminds you of the goals properly"*, naming two: **(1) tortoise P0+P1 are DONE and
+MERGED** — a fix without a merged PR is not done — and **(2) the agent-infra harness runs
+AUTONOMOUSLY** — the full lifecycle on the local box AND all three cmux cells, the SAME harness
+version in main/local/every cell **deployed AND activated**, on both repos, with the PR queue not
+behind. So `## GOALS` states them, `## Where the goals stand this run` MEASURES them, and
+`## What to do (in GOAL order)` turns the readings into the next action.
+
+⛔ **The ORDER is the change, not the wording.** `main()` measures drift → the goals → the PR reads,
+in that order. The failure it fixes is measured: the PR reads ran first on 2026-10-24, spent the whole
+core budget (`8/8` at 04:22Z), and every goal line said *not measured* — a reminder that reported on
+PRs and forgot what the PRs are for. Drift is a LOCAL artifact read (no REST) and the goals spend the
+SEARCH quota, so this order cannot starve the landing arm.
+
+⛔ **A count that does not come back is `NOT-MEASURED`, never `0`** — zero is the claim that the goal
+is met. And the label filter must run SERVER-SIDE: `gh issue list --label P0 --json number` returns
+ONE PAGE, so a local `len()` counts the page and not the population. Measured on tortoise: a slice
+said `P0=4 · P1=5` while the label query answered **7 and 20** (>300 open issues). `_count` therefore
+asks `search/issues` for `total_count`, with the filter already applied by the server.
 
 **The arm.** The owner's ask (2026-10-23) was that the reminder lead to automated dispatch of the
 needed action, on the stated risk: *"we can merge and if it breaks then it's fast to repair, as long
@@ -1935,7 +1955,7 @@ these were read at the moment of action:
 
 | gate | reading | what a failure means |
 |---|---|---|
-| open, not draft, MERGEABLE | `pr=OPEN draft=no mergeable=MERGEABLE` | `mergeable: null` is GitHub saying "not computed yet" — `REFUSE(mergeable=unknown)` |
+| open, not draft, MERGEABLE | `pr=OPEN draft=no mergeable=MERGEABLE` | re-read from the SINGLE-PR endpoint, because the LIST endpoint answers `mergeable: null` for every PR (that inert gate is what made the arm never fire); `mergeable: null`/`NOT-READ` is a WAIT — `REFUSE(mergeable=unknown)` |
 | a record at the LIVE head | `attested@head=yes` | a record bound to an older head is `REFUSE(attested=stale)`; six PRs were caught in exactly that state |
 | quiet surface | `reds=0 in-flight=0` | `reds=0` with 21 in flight is a **WAIT** (`REFUSE(in-flight=21)` — #2522/#2592). The combined commit-status `state` is cross-checked against the entries READ — but `pending` with **zero** statuses is GitHub's EMPTY state for a check-run-only head, not truncation, and treating it as truncation made every real head UNREADABLE. The combined token is read with an ALLOW-LIST (`success` / `pending` / `failure`): `error` is a red-class value and an unnamed future token is never green, because a value this reader cannot classify must abstain rather than pass |
 | no live claim | `claim=none` | `refs/claims/pr-<N>`, `refs/claims/<N>-<head12>`; an unreadable claim store is an ABSTENTION |
@@ -2022,8 +2042,16 @@ counts the same five):
   what was SEEDED, not what is RUNNING, so a matching stamp reads `UNPROVEN` and activates nothing.
 
 **Costs, and how a skipped run is never an empty one.** `GET /rate_limit` FIRST (it is unmetered),
-then at most `REST_BUDGET = 8` metered calls: one open-PR listing and three per candidate (workflow
-runs, `check-runs?filter=all`, legacy statuses) for at most TWO candidates. Under
+then at most `REST_BUDGET = 9` metered core calls: one open-PR listing, then per candidate three
+surface reads (workflow runs, `check-runs?filter=all`, legacy statuses) plus one **single-PR read for
+mergeability** — the LIST endpoint never computes it (every open PR answers `null`: measured 10/10 on
+agent-infra, 2026-10-24), and reading that `null` as `REFUSE(mergeable=unknown)` made the whole arm
+INERT. A single-PR read that the budget cannot afford says `NOT-READ`, never an inherited value. The
+listing itself is one page of 100 and a FULL page is UNREADABLE by name, because it carries no
+`total_count` to prove it was not truncated (70 open PRs against a 30-row page hid 40 of them).
+The goal readings spend the SEARCH quota instead (`GOAL_SEARCH_BUDGET = 8`, counted in
+`budget.search_calls`) — a different limit on GitHub, so measuring the goals never spends a call the
+landing arm needed, and `REST_BUDGET` stays what this document says it is. Under
 `REST_RESERVE = 200` core calls the run is SKIPPED and SAYS SO (`skipped=rate-limited core=12/5000`,
 exit 3) — never `nothing to do`. The same exit and the same wording cover an unreadable PR listing.
 
@@ -2042,8 +2070,8 @@ arm and an operator line that merely mentioned the script. An entry written befo
 is still matched by its script path, and that legacy fallback is the only place the path is a key. An unreadable crontab is an
 abstention (exit 3) that rewrites nothing, rather than an empty crontab it would overwrite.
 
-**Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§26,
-202 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+**Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§28,
+230 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
 unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
 how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
 -l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the

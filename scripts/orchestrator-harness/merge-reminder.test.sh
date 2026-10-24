@@ -5,6 +5,7 @@
 #
 #   §1  attested at head + quiet surface (reds=0, in-flight=0) + no claim + no rail
 #         → DISPATCHES `admin-merge.sh <PR> --repo <slug>`, and records the attempt;
+#       (≤9 metered core calls: 1 listing + per candidate 3 surface reads + 1 mergeability read)
 #   §2  a record bound to an OLDER head                     → REFUSE(attested=stale), NO dispatch
 #   §3  `reds=0` with 3 checks in flight                     → REFUSE(in-flight=3), NO dispatch
 #   §4  a red group                                          → REFUSE(reds=1), NO dispatch
@@ -55,6 +56,19 @@
 #       reported a live controller as STOPPED), the systemd unit's ExecStart starts with the
 #       interpreter exactly once, uninstall spares an operator line that merely mentions the tag,
 #       and the darwin plist is rendered/loaded/removed with bootout BEFORE bootstrap.
+#
+#   §27 THE GOALS (owner, 2026-10-24): the report states both goals and MEASURES them — the counts
+#       are SERVER-SIDE label answers (a local slice undercounts: `P0=4 · P1=5` from a page vs 7 and
+#       20 from the label query), an unread count is NOT-MEASURED and never 0, a drifted cell BREAKS
+#       goal 2's marker by name, and the goal reads run BEFORE the PR reads (order pinned twice: on
+#       the wire, and in the report).
+#
+#   §28 the four defects a REVIEW of the arm found: the LIST endpoint's `mergeable: null` had made
+#       the arm inert (it is re-read per candidate on the single-PR endpoint, and a still-null answer
+#       stays a WAIT), a FULL page of the open-PR listing is a truncated read (`UNREADABLE pulls` —
+#       measured 70 open PRs against a 30-row page), the deploy bound is keyed on the TARGET and not
+#       on a `from` the action itself changes, and `--repo` naming a repo this checkout is not
+#       ABSTAINS instead of reading another repo's claim refs.
 #
 # HERMETIC: no network, no real gh, no real rail, no real scheduler. `gh`, `ps`, the rail and the
 # box probe are stubs on PATH / in a fixture; the CLAIM gate is driven against a REAL git repo with
@@ -114,13 +128,28 @@ MAIN12="${MAIN40:0:12}"
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 # stub gh — argv: api <path>
-echo "$2" >> "$FIXTURE/calls.txt"
+# SEARCH IS ITS OWN QUOTA (`resources.search`, 30/min - NOT `core`), so its calls are recorded in
+# their own file: `calls.txt` is the CORE budget whose bound §1 (<=8) and §10 (exactly 1) pin.
+rec="$FIXTURE/calls.txt"; case "$2" in search/*) rec="$FIXTURE/search-calls.txt" ;; esac
+echo "$2" >> "$rec"
+printf '%s\n' "$2" >> "$FIXTURE/seq.txt"
 case "$2" in
   rate_limit)                        cat "$FIXTURE/rate_limit.json" ;;
+  repos/*/pulls/[0-9]*)             cat "$FIXTURE/pull.json" ;;
   repos/*/pulls*)                    cat "$FIXTURE/pulls.json" ;;
   repos/*/actions/runs*)             cat "$FIXTURE/runs.json" ;;
   repos/*/check-runs*)               cat "$FIXTURE/checks.json" ;;
   repos/*/status*)                   cat "$FIXTURE/status.json" ;;
+  search/*)
+    # Server-side counts, answered per query: `pattern<TAB>count`, else one default answer.
+    if [ -f "$FIXTURE/search-map.tsv" ]; then
+      while IFS=$'\t' read -r pat n; do
+        [ -n "${pat:-}" ] || continue
+        case "$2" in *"$pat"*) printf '{"total_count":%s}\n' "$n"; exit 0 ;; esac
+      done < "$FIXTURE/search-map.tsv"
+    fi
+    if [ -f "$FIXTURE/search.json" ]; then cat "$FIXTURE/search.json"
+    else printf '{"total_count":0}\n'; fi ;;
   *) echo "stub gh: unexpected path $2" >&2; exit 1 ;;
 esac
 STUB
@@ -172,6 +201,10 @@ write_pulls() { # <mergeable:true|false|null> <draft:false|true>
   "mergeable":$1,"updated_at":"2026-10-23T04:00:00Z",
   "head":{"sha":"$HEAD"}}]
 JSON
+  # ⛔ THE LIST ENDPOINT NEVER COMPUTES mergeability (it answers null for every PR — measured 10/10
+  # on agent-infra, 2026-10-24), so the single-PR read is where a case states the truth. A case that
+  # wants `unknown` must write null in BOTH places, otherwise it is only testing the listing.
+  printf '{"number":42,"mergeable":%s,"mergeable_state":"clean"}\n' "$1" > "$FX/pull.json"
 }
 write_checks_quiet() {
   cat > "$FX/checks.json" <<JSON
@@ -191,7 +224,9 @@ JSON
   : > "$FX/status.json" && echo '{"state":"pending","statuses":[]}' > "$FX/status.json"
 }
 write_baseline() {
-  : > "$FX/calls.txt"; : > "$FX/ps.txt"; rm -f "$FX/rail-argv.txt" "$FX/activate.txt"
+  : > "$FX/calls.txt"; : > "$FX/ps.txt"; : > "$FX/search-calls.txt"; : > "$FX/seq.txt"
+  printf '{"total_count":0}\n' > "$FX/search.json"; rm -f "$FX/search-map.tsv"
+  rm -f "$FX/rail-argv.txt" "$FX/activate.txt"
   printf '{"resources":{"core":{"limit":5000,"remaining":4000,"reset":1893456000}}}\n' > "$FX/rate_limit.json"
   write_pulls true false
   write_checks_quiet
@@ -230,7 +265,7 @@ ck "§1 the line carries the MEASURED readings" "$(qF 'reds=0 in-flight=0 attest
 ck "§1 the attempt is recorded at this head" "$(grep -q "42 $HEAD " "$O/state/merge-reminder.attempts" 2>/dev/null && echo 0 || echo 1)"
 ck "§1 the reminder file was written" "$(qF 'Closest to landing' "$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)" && echo 0 || echo 1)"
 ck "§1 rate_limit was the FIRST gh call" "$(qF 'rate_limit' "$(head -1 "$FX/calls.txt")" && echo 0 || echo 1)"
-ck "§1 the REST budget was respected" "$([ "$(wc -l < "$FX/calls.txt")" -le 8 ] && echo 0 || echo 1)"
+ck "§1 the REST budget was respected" "$([ "$(wc -l < "$FX/calls.txt")" -le 9 ] && echo 0 || echo 1)"
 
 # ═══ §2 a record at an OLDER head is NOT a record ════════════════════════════════════════════════
 echo "-- §2 stale attestation"
@@ -335,13 +370,28 @@ ck "§9 the file reports the skip too" "$(qF '**SKIPPED:**' "$(cat "$O/MERGE-REM
 # restore the full stub
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
-echo "$2" >> "$FIXTURE/calls.txt"
+# SEARCH IS ITS OWN QUOTA (`resources.search`, 30/min - NOT `core`), so its calls are recorded in
+# their own file: `calls.txt` is the CORE budget whose bound §1 (<=8) and §10 (exactly 1) pin.
+rec="$FIXTURE/calls.txt"; case "$2" in search/*) rec="$FIXTURE/search-calls.txt" ;; esac
+echo "$2" >> "$rec"
+printf '%s\n' "$2" >> "$FIXTURE/seq.txt"
 case "$2" in
   rate_limit)                        cat "$FIXTURE/rate_limit.json" ;;
+  repos/*/pulls/[0-9]*)             cat "$FIXTURE/pull.json" ;;
   repos/*/pulls*)                    cat "$FIXTURE/pulls.json" ;;
   repos/*/actions/runs*)             cat "$FIXTURE/runs.json" ;;
   repos/*/check-runs*)               cat "$FIXTURE/checks.json" ;;
   repos/*/status*)                   cat "$FIXTURE/status.json" ;;
+  search/*)
+    # Server-side counts, answered per query: `pattern<TAB>count`, else one default answer.
+    if [ -f "$FIXTURE/search-map.tsv" ]; then
+      while IFS=$'\t' read -r pat n; do
+        [ -n "${pat:-}" ] || continue
+        case "$2" in *"$pat"*) printf '{"total_count":%s}\n' "$n"; exit 0 ;; esac
+      done < "$FIXTURE/search-map.tsv"
+    fi
+    if [ -f "$FIXTURE/search.json" ]; then cat "$FIXTURE/search.json"
+    else printf '{"total_count":0}\n'; fi ;;
   *) echo "stub gh: unexpected path $2" >&2; exit 1 ;;
 esac
 STUB
@@ -1456,13 +1506,28 @@ ck "§26e ...and the core pair is UNREADABLE, not None/None" \
 # the same fixture) see the same world they did before.
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
-echo "$2" >> "$FIXTURE/calls.txt"
+# SEARCH IS ITS OWN QUOTA (`resources.search`, 30/min - NOT `core`), so its calls are recorded in
+# their own file: `calls.txt` is the CORE budget whose bound §1 (<=8) and §10 (exactly 1) pin.
+rec="$FIXTURE/calls.txt"; case "$2" in search/*) rec="$FIXTURE/search-calls.txt" ;; esac
+echo "$2" >> "$rec"
+printf '%s\n' "$2" >> "$FIXTURE/seq.txt"
 case "$2" in
   rate_limit)                        cat "$FIXTURE/rate_limit.json" ;;
+  repos/*/pulls/[0-9]*)             cat "$FIXTURE/pull.json" ;;
   repos/*/pulls*)                    cat "$FIXTURE/pulls.json" ;;
   repos/*/actions/runs*)             cat "$FIXTURE/runs.json" ;;
   repos/*/check-runs*)               cat "$FIXTURE/checks.json" ;;
   repos/*/status*)                   cat "$FIXTURE/status.json" ;;
+  search/*)
+    # Server-side counts, answered per query: `pattern<TAB>count`, else one default answer.
+    if [ -f "$FIXTURE/search-map.tsv" ]; then
+      while IFS=$'\t' read -r pat n; do
+        [ -n "${pat:-}" ] || continue
+        case "$2" in *"$pat"*) printf '{"total_count":%s}\n' "$n"; exit 0 ;; esac
+      done < "$FIXTURE/search-map.tsv"
+    fi
+    if [ -f "$FIXTURE/search.json" ]; then cat "$FIXTURE/search.json"
+    else printf '{"total_count":0}\n'; fi ;;
   *) echo "stub gh: unexpected path $2" >&2; exit 1 ;;
 esac
 STUB
@@ -1750,6 +1815,161 @@ ck "§25b a rail that appears in the SECOND table read still refuses the dispatc
    "$(qF 'REFUSE(rail=running' "$out" && [ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
 ck "§25b (and the two reads really happened: $(wc -l < "$FX/ps-calls.txt") ps call(s))" \
    "$([ "$(wc -l < "$FX/ps-calls.txt")" -ge 2 ] && echo 0 || echo 1)"
+
+# ═══ §27 THE GOALS: the reminder says what the PRs are FOR, and MEASURES it ═════════════════════
+# Owner, 2026-10-24T04:10Z: "improve the reminder message so it reminds you of the goals properly".
+# The failure this pins is an ORDER failure: run the PR reads first and they spend the whole budget,
+# so the goal lines say "not measured" — a reminder that reports on the queue and forgets what the
+# queue is for.
+echo "-- §27 the goals: measured, server-side, BEFORE the PR reads"
+write_baseline; reset_o
+# ⛔ THE SERVER-SIDE ANSWERS ARE THE POINT. On tortoise a LOCAL `--json` slice of the issue listing
+# reported P0=4 · P1=5 on the same day the label query answered 7 and 20 (>300 open issues), so a
+# test that accepted either number would pin nothing. The map is matched against the QUERY the
+# reminder actually sent — which is also how "the filter ran on the server" is proven.
+printf '%s\t%s\n' \
+  'type:issue+state:open+label:P0' 7 \
+  'type:issue+state:open+label:P1' 20 \
+  'type:issue+state:closed+label:P0' 3 \
+  'type:issue+state:closed+label:P1' 9 \
+  'type:pr+is:merged+merged:' 4 \
+  'type:pr+state:open' 6 > "$FX/search-map.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 the report carries a GOALS section" \
+   "$(qF '## GOALS' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...naming BOTH goals" \
+   "$(qF 'tortoise P0+P1 are DONE and MERGED' "$MDF" && qF 'the agent-infra harness runs AUTONOMOUSLY' "$MDF" && echo 0 || echo 1)"
+ck "§27 'Where the goals stand this run' is measured, not restated" \
+   "$(qF '## Where the goals stand this run' "$MDF" && echo 0 || echo 1)"
+ck "§27 'What to do (in GOAL order)'" \
+   "$(qF '## What to do (in GOAL order)' "$MDF" && echo 0 || echo 1)"
+ck "§27 the counts are the SERVER-SIDE answers (P0=7 · P1=20, not the slice's 4/5)" \
+   "$(qF 'open P0=7' "$MDF" && qF 'open P1=20' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...goal 1 stands OPEN while those remain" \
+   "$(qF 'STANDING=OPEN' "$MDF" && echo 0 || echo 1)"
+ck "§27 the queue SHAPE is stated when more are open than landed today (6 open vs 4 merged)" \
+   "$(qF 'the queue is not shrinking at this rate' "$MDF" && echo 0 || echo 1)"
+ck "§27 the label filter was applied by the SERVER (a search query, not a local slice)" \
+   "$(qF 'search/issues?q=' "$(head -1 "$FX/search-calls.txt")" && qF 'label:P0' "$(cat "$FX/search-calls.txt")" && echo 0 || echo 1)"
+# ORDER — the whole point: goal reads BEFORE the PR reads.
+first_search="$(grep -n 'search/issues' "$FX/seq.txt" | head -1 | cut -d: -f1)"
+first_pulls="$(grep -n 'repos/.*/pulls' "$FX/seq.txt" | head -1 | cut -d: -f1)"
+ck "§27 ORDER: the goal reads precede the PR reads (search@${first_search:-none} pulls@${first_pulls:-none})" \
+   "$([ -n "$first_search" ] && [ -n "$first_pulls" ] && [ "$first_search" -lt "$first_pulls" ] && echo 0 || echo 1)"
+ck "§27 the goals block precedes the landing table in the report" \
+   "$(awk '/## Where the goals stand this run/{g=NR} /## 1. Closest to landing/{p=NR} END{exit !(g && p && g<p)}' \
+        "$O/MERGE-REMINDER.md" && echo 0 || echo 1)"
+ck "§27 the goal reads never spend the landing arm's CORE bound" \
+   "$([ "$(wc -l < "$FX/calls.txt")" -le 8 ] && echo 0 || echo 1)"
+
+# A count that could not be READ is NOT-MEASURED — never 0. "0 open P0" is a claim (the goal is
+# met), and it is exactly the claim this block exists to refuse to invent.
+write_baseline; reset_o
+printf '{"message":"Bad credentials"}\n' > "$FX/search.json"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 an unreadable goal count is NOT-MEASURED, never 0" \
+   "$(qF 'STANDING=NOT-MEASURED' "$MDF" && nq 'open P0=0' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the reason it could not be read is printed" \
+   "$(qF 'no total_count' "$MDF" && echo 0 || echo 1)"
+
+# GOAL 2's markers: every box on the pin, else the marker is BROKEN and the drifted box is NAMED.
+write_no_landing; reset_o
+printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
+  "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.current.txt"
+printf 'harness: %s [behind] source=pin\ncontroller: RUNNING(pid 4243)\nroles: idle\n' \
+  "${OTHER:0:12}" > "$FX/box.behind.txt"
+cat > "$TMP/box-cur.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.current.txt"
+STUB
+cat > "$TMP/box-behind.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.behind.txt"
+STUB
+chmod +x "$TMP/box-cur.sh" "$TMP/box-behind.sh"
+printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-cur.sh" "$TMP/box-behind.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a drifted cell BREAKS goal 2's marker" \
+   "$(qF 'STANDING=MARKERS-BROKEN' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the drifted box is NAMED with its reading" \
+   "$(qF "cell-2=${OTHER:0:12} [behind]" "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the count says 1/2 current, not 'autonomous'" \
+   "$(qF '1/2 current' "$MDF" && nq 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
+# All boxes current: the marker HOLDS, and the report says what that is worth (not proof).
+write_no_landing; reset_o
+printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-cur.sh" "$TMP/box-cur.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 every box on the pin ⇒ MARKERS-HOLD" \
+   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF '2/2 current' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and it says the marker is not proof of autonomy" \
+   "$(qF 'That is the marker, not proof' "$MDF" && echo 0 || echo 1)"
+rm -f "$O/state/boxes.tsv"
+
+# ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
+echo "-- §28 the arm the list endpoint had made inert"
+# ⛔ THE LISTING ANSWERS `mergeable: null` FOR EVERY PR (measured 2026-10-24: 10/10 on agent-infra),
+# so `REFUSE(mergeable=unknown)` on that reading made the whole arm INERT — a gate that could never
+# pass. The single-PR read populates the field; this case is the one that proves the arm can fire.
+write_baseline; reset_o
+write_pulls null false                                  # the listing: null, as GitHub really answers
+printf '{"number":42,"mergeable":true}\n' > "$FX/pull.json"
+out="$(run_sut)"; rc=$?
+ck "§28 a null in the LISTING is re-read on the single PR and DISPATCHES" \
+   "$(qF 'GO dispatched' "$out" && [ -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+ck "§28 ...and the reading shows the measured value, not the listing's null" \
+   "$(qF 'mergeable=MERGEABLE' "$out" && nq 'mergeable=UNKNOWN' "$out" && echo 0 || echo 1)"
+# A still-null single-PR answer stays a WAIT: GitHub computes it lazily, and "not computed yet" is
+# never a GO.
+write_baseline; reset_o
+write_pulls null false
+printf '{"number":42,"mergeable":null}\n' > "$FX/pull.json"
+out="$(run_sut)"; rc=$?
+ck "§28 a null on BOTH reads still refuses (mergeable=unknown)" \
+   "$(qF 'REFUSE(mergeable=unknown)' "$out" && [ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+echo "-- §28 a FULL page of PRs is a truncated read, not a queue"
+# agent-infra had 70 open PRs against the old 30-row page: 40 invisible, and an attested+quiet PR
+# below the cut could never be dispatched. A full page now SKIPS, by name, like the statuses page.
+write_baseline; reset_o
+{ printf '['; for i in $(seq 1 100); do
+    [ "$i" -gt 1 ] && printf ','
+    printf '{"number":%d,"title":"t","state":"open","draft":false,"mergeable":null,"updated_at":"2026-10-23T04:00:00Z","head":{"sha":"%s"}}' "$i" "$HEAD"
+  done; printf ']\n'; } > "$FX/pulls.json"
+out="$(run_sut)"; rc=$?
+ck "§28 a full page exits 3 (a truncated read is not an empty queue)" "$([ "$rc" -eq 3 ] && echo 0 || echo 1)"
+ck "§28 ...and names the truncation" "$(qF 'the listing filled its 100-row page' "$out" && echo 0 || echo 1)"
+ck "§28 NOTHING was dispatched from a truncated listing" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+echo "-- §28 the deploy bound is keyed on the TARGET, not on a from the action changes"
+# A box that creeps forward without arriving (diverged -> behind, a partial apply) changes its `from`
+# every cycle. Keyed on (box, from, to) the bound found no row and restarted it every 600s forever.
+write_no_landing; reset_o
+printf 'harness: %s [behind] source=pin\ncontroller: RUNNING(pid 5001)\nroles: idle\n' \
+  "${OTHER:0:12}" > "$FX/box.behind.txt"
+printf 'cell-x\tbash %s\tbash %s\n' "$TMP/box-behind.sh" "$TMP/box-activate.sh" > "$O/state/boxes.tsv"
+# a DIFFERENT from-sha at the SAME target, recorded seconds ago: the bound must still bind
+printf 'cell-x\t%s\t%s\t%s\tUNVERIFIED\n' "${HEAD:0:12}" "$MAIN12" "$(date +%s)" \
+  > "$O/state/merge-reminder.deploys"
+out="$(run_sut)"; rc=$?
+ck "§28 a recorded attempt at this TARGET still binds when the from-sha has moved" \
+   "$(qF 'WAIT(deploy-retry-after=' "$out" && [ ! -e "$FX/activate.txt" ] && echo 0 || echo 1)"
+rm -f "$O/state/boxes.tsv"
+
+echo "-- §28 the evidence is read from the TARGET repo, never a neighbouring checkout"
+# `--repo` names the target; the claim refs and origin/main live in the CHECKOUT's origin. A target
+# that disagrees with the checkout is an ABSTENTION, not a `claim=none`.
+write_baseline; reset_o
+git -C "$REPO_SRC" remote set-url origin https://github.com/someone-else/other-repo.git
+out="$(run_sut)"; rc=$?
+ck "§28 a target that is not this checkout's repo SKIPS (rc=$rc)" "$([ "$rc" -eq 3 ] && echo 0 || echo 1)"
+ck "§28 ...naming the mismatch and what it would have read" \
+   "$(qF 'MISMATCHED repo' "$out" && qF 'claim=none' "$out" && echo 0 || echo 1)"
+ck "§28 NOTHING was dispatched on evidence from another repo" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+git -C "$REPO_SRC" remote set-url origin "$TMP/origin.git"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

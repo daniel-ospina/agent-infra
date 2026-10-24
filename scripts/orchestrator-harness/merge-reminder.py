@@ -14,7 +14,13 @@
 #       1 = internal error
 #
 # ── WHAT THIS IS (and what it deliberately is not) ───────────────────────────────────────────────
-# It answers THREE questions, and spends a bounded REST budget doing it:
+# It answers the OWNER'S GOALS first, then THREE questions, and spends a bounded REST budget doing it:
+#   0. WHERE THE GOALS STAND — the two goals the queue exists to move (owner, 2026-10-24T04:10Z:
+#      "improve the reminder message so it reminds you of the goals properly"):
+#        (1) tortoise P0+P1 are DONE and MERGED — a fix without a merged PR is not done;
+#        (2) the harness runs AUTONOMOUSLY — the same version deployed AND activated on the local
+#            box and all three cells, on both repos, with the PR queue not behind.
+#      Measured (`goal_progress`), never restated, and MEASURED FIRST — see `main`'s ORDER rule.
 #   1. what is closest to landing (open PRs of the target repo, best-evidenced first);
 #   2. what merged but is NOT LIVE on the boxes (a merged fix that never reached a box has fixed
 #      nothing — the reminder's second half is the DEPLOY arm, #2416's sibling);
@@ -68,8 +74,14 @@
 #   * `GET /rate_limit` FIRST — it is UNMETERED on GitHub's primary limit — and if the core budget is
 #     under `REST_RESERVE` the run is SKIPPED and SAYS SO (`skipped=rate-limited core=…/… reset=…`),
 #     never rendered as an empty queue. (gh-limit.py's own doctrine, #1988.)
-#   * at most `REST_BUDGET = 8` metered calls: ONE open-PR listing plus THREE reads per candidate
-#     (workflow runs, check-runs `filter=all`, legacy statuses) for at most `--candidates` (2).
+#   * at most `REST_BUDGET = 9` metered calls: ONE open-PR listing, then per candidate THREE surface
+#     reads (workflow runs, check-runs `filter=all`, legacy statuses) plus ONE single-PR read for
+#     mergeability (the LIST endpoint never computes it — every PR answers `null`, which made this
+#     arm inert until it was re-read per candidate), for at most `--candidates` (2).
+#   * the GOAL readings spend the SEARCH quota, not the core one (a different limit on GitHub), so
+#     measuring the goals can never starve the landing arm: at most `GOAL_SEARCH_BUDGET = 8` search
+#     calls, counted separately (`budget.search_calls`). A count that does not come back is
+#     `NOT-MEASURED`, never `0` — zero is the claim that the goal is met (`_count`).
 #   * the deploy arm makes NO REST call at all: it reads artifacts on the boxes.
 #
 # ── THE DEPLOY ARM ─────────────────────────────────────────────────────────────────────────────
@@ -124,19 +136,40 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-REST_BUDGET = 8          # metered REST calls per run (rate_limit is exempt); see the header
+REST_BUDGET = 9          # metered REST calls per run (rate_limit is exempt); see the header
 REST_RESERVE = 200       # below this core budget the run is SKIPPED, not rendered as "nothing to do"
-DEFAULT_MAX_PRS = 30     # one page of the open-PR listing
-DEFAULT_CANDIDATES = 2   # 1 + 3*2 = 7 <= REST_BUDGET
-MAX_CANDIDATES = 2       # the budget ceiling, enforced (1 + 3*3 = 10 > 8)
+GOAL_SEARCH_BUDGET = 8   # SEARCH-quota calls per run for the goal readings. ⛔ A DIFFERENT BUCKET to
+#                          `core`: the search API has its own limit (30/min), so measuring the goals
+#                          never spends a call the landing arm needed. See `_count`.
+DEFAULT_MAX_PRS = 100    # one page of the open-PR listing — the API's own page size, not a slice of
+#                          it: the listing has no `total_count`, so a FULL page is UNREADABLE (below).
+DEFAULT_CANDIDATES = 2   # 1 + 4*2 = 9 <= REST_BUDGET
+MAX_CANDIDATES = 2       # the budget ceiling, enforced (1 + 4*3 = 13 > 9)
 RETRY_S = 900            # a refusal at THIS head is not retried blind inside this window
 RAIL_WAIT_S = 900        # how long the dispatch waits for the rail's own exit, to report its rc
 DEPLOY_VERIFY_S = 180    # how long the deploy arm waits for the artifact to prove the cycle
 STATE_MD = "MERGE-REMINDER.md"
 ATTEMPTS = "merge-reminder.attempts"
+
+# ── THE GOALS (owner, 2026-10-24T04:10Z: "improve the reminder message so it reminds you of the
+#    goals properly") ────────────────────────────────────────────────────────────────────────────
+# A reminder that reports on PRs and forgets what the PRs are FOR is a reminder that optimises the
+# QUEUE instead of the OBJECTIVE. So the goals are stated first in the report, and they are MEASURED
+# (`goal_progress`) rather than restated — a recap of what the owner said is not a reading.
+GOALS = (
+    ("Goal 1 — tortoise P0+P1 are DONE and MERGED",
+     "a fix without a MERGED PR is not done, it is in progress. Read: OPEN P0/P1 issues, the P0/P1 "
+     "issues CLOSED today, and tortoise PRs merged today."),
+    ("Goal 2 — the agent-infra harness runs AUTONOMOUSLY",
+     "the full lifecycle — pick up, PR, review, land, and FIX when red — on the local box AND all "
+     "three cmux cells, at the SAME harness version (main / local / every cell, deployed AND "
+     "activated), on BOTH repos, with the PR queue not behind."),
+)
+GOAL_REPO = "daniel-ospina/tortoise"     # goal 1 is measured on tortoise, whichever repo this runs for
 
 # A completed check run is NON-RED only for a conclusion named HERE (allow-list polarity, #1714): an
 # unrecognised token — a vendor's new conclusion, an empty one — is RED, never "neither".
@@ -190,13 +223,21 @@ def resolve_gh(o: Path) -> str:
 class Budget:
     """The metered REST budget. `rate_limit` is read FIRST and is exempt; every other call is
     counted, and a call that would exceed the budget raises rather than silently degrading the
-    answer (a truncated read is not a smaller answer, it is a wrong one)."""
+    answer (a truncated read is not a smaller answer, it is a wrong one).
+
+    ⛔ TWO BUCKETS, COUNTED SEPARATELY. `calls` is the CORE quota the landing arm spends (listing +
+    3 reads per candidate), and `search_calls` is the SEARCH quota the goal readings spend. They are
+    different limits on GitHub (5000/h vs 30/min), so folding the goals into `calls` would either
+    starve the goals or silently cut the landing arm's bound — and `REST_BUDGET` is a documented
+    invariant the suite pins."""
 
     def __init__(self, gh: str):
         self.gh = gh
         self.calls = 0
+        self.search_calls = 0
         self.core_remaining = None
         self.core_limit = None
+        self.search_remaining = None
         self.reset = None
 
     def rate_limit(self):
@@ -204,10 +245,16 @@ class Budget:
         if rc != 0:
             raise Skipped(f"UNREADABLE rate_limit rc={rc} {one_line(err)}")
         try:
-            core = json.loads(out)["resources"]["core"]
+            res = json.loads(out)["resources"]
+            core = res["core"]
             self.core_limit = int(core["limit"])
             self.core_remaining = int(core["remaining"])
             self.reset = int(core.get("reset") or 0)
+            # The SEARCH quota is a separate bucket; absent is UNKNOWN, never "plenty".
+            try:
+                self.search_remaining = int(res["search"]["remaining"])
+            except (KeyError, TypeError, ValueError):
+                self.search_remaining = None
         except (ValueError, KeyError, TypeError):
             raise Skipped("UNREADABLE rate_limit — the answer was not a JSON rate object")
         # The EXEMPT read above is the only call allowed below the reserve: a run with 12 calls left
@@ -235,6 +282,40 @@ def _iso(epoch) -> str:
 
 def one_line(text: str) -> str:
     return " ".join((text or "").split())[:200]
+
+
+def _count(budget: Budget, query: str) -> tuple[int | None, str]:
+    """How many issues/PRs the SEARCH answers for `query` — counted SERVER-SIDE. -> (count, why-not)
+
+    ⛔ THE LABEL FILTER MUST RUN SERVER-SIDE. `gh issue list --label P0 --json number` returns ONE
+    PAGE (30 by default), so counting the returned slice counts THE PAGE and not the population —
+    and the repos this measures are large. Measured on tortoise (2026-10-24): a local `--json`
+    slice reported `P0=4 · P1=5` while the label query answered **7 and 20**, because the repo has
+    more than 300 open issues. A goal line that undercounts is worse than no goal line at all: it
+    reports the goal as nearly met, and it does it in the one place a human looks for the answer.
+
+    The query goes into the PATH (`search/issues?q=…`) with no `-f` flag, so `gh api` issues a GET
+    with the filter already applied by the server. SEARCH is its own quota, so these calls are
+    counted in `budget.search_calls` and NEVER against `REST_BUDGET`.
+
+    -> `(None, why)` when the count could not be READ. A caller must render that as NOT MEASURED:
+    `0` is a claim that there are none, and this function never makes that claim.
+    """
+    if budget.search_calls >= GOAL_SEARCH_BUDGET:
+        return None, f"NOT-MEASURED (the {GOAL_SEARCH_BUDGET}-call goal bound is spent this cycle)"
+    if budget.search_remaining is not None and budget.search_remaining <= 0:
+        return None, "NOT-MEASURED (the search quota is exhausted)"
+    budget.search_calls += 1
+    # `+` for the term separator (not %20): GitHub treats both as a space, and a query whose
+    # separators survive legibly is one a human can read out of a log when it goes wrong.
+    path = "search/issues?q=" + urllib.parse.quote(query, safe=":/").replace("%20", "+")
+    rc, out, err = run([budget.gh, "api", path], timeout=30)
+    if rc != 0:
+        return None, f"UNREADABLE rc={rc} {one_line(err)}"
+    try:
+        return int(json.loads(out)["total_count"]), ""
+    except (ValueError, KeyError, TypeError):
+        return None, "UNREADABLE — the search answer carried no total_count"
 
 
 # ── the review record (a stale record is NOT a record) ─────────────────────────────────────────
@@ -844,13 +925,20 @@ DEPLOY_MAX_ATTEMPTS = 3
 
 
 def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int]:
-    """-> (attempts recorded for this box at this from->to pair, epoch of the LAST one).
+    """-> (attempts recorded for this box TOWARDS `to`, epoch of the LAST one).
 
     ⛔ A DEPLOY NEEDS A BOUND AS MUCH AS A MERGE DOES. Without one, a box that cannot reach
     `origin/main` — pinned `ahead` of it, `diverged` from it, or with an `apply` that never advances
     the pin — is stopped and started EVERY cycle, forever, because every gate that could stop it
     re-opens 600 s later (the deploy lock is released, roles go idle again, the controller comes back
     RUNNING). The ledger is what makes "this has been tried" a fact the next cycle can read.
+
+    ⛔ KEYED ON THE TARGET, NOT ON THE PAIR. The `from` side is a value the ACTION ITSELF CHANGES: an
+    activation that moves a box's pin at all (`diverged` -> `behind`, a partial `apply`) changes the
+    next cycle's `from`, so a `(box, from, to)` key finds no row, the WAIT and the count reset, and a
+    box that creeps forward without ever arriving is restarted every 600 s — the exact restart storm
+    this bound exists to prevent. `from` is still RECORDED (it is what makes the ledger readable),
+    it is just not part of the identity.
     """
     p = o / "state" / DEPLOYS
     try:
@@ -858,13 +946,13 @@ def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int]:
     except OSError:
         return 0, 0
     n, last = 0, 0
-    frm12, to12 = frm[:12], to[:12]
+    to12 = to[:12]
     for line in text.splitlines():
         # ⛔ TAB, NOT SPACE: a box name is human-authored (`name<TAB>status<TAB>activate`) and may
         # contain a space, which a whitespace split turns into a DIFFERENT key — so the bound would
         # never bind for that box and it would be restarted every cycle.
         parts = line.split("\t")
-        if len(parts) >= 4 and parts[0] == box and parts[1] == frm12 and parts[2] == to12:
+        if len(parts) >= 4 and parts[0] == box and parts[2] == to12:
             n += 1
             try:
                 last = max(last, int(parts[3]))
@@ -1137,8 +1225,10 @@ def decide(pr: dict, attest_state: str, attest_detail: str, surface: dict,
         return out
     if pr["mergeable"] != "MERGEABLE":
         # `mergeable: null` is GitHub saying "not computed yet" — UNKNOWN, and unknown is a WAIT.
-        out.update(verdict=f"{REFUSE}(mergeable={pr['mergeable'].lower()})",
-                   detail="GitHub does not report MERGEABLE (null = not computed yet)")
+        detail = ("the single-PR mergeability read was outside this cycle's REST budget — an unread "
+                  "value is a WAIT, never a GO" if pr["mergeable"] == "NOT-READ" else
+                  "GitHub does not report MERGEABLE (null = not computed yet)")
+        out.update(verdict=f"{REFUSE}(mergeable={pr['mergeable'].lower()})", detail=detail)
         return out
     if attest_state == UNREADABLE:
         out.update(verdict=f"{REFUSE}(attested=UNREADABLE)", detail=attest_detail)
@@ -1447,6 +1537,14 @@ def read_prs(budget: Budget, slug: str, max_prs: int) -> list[dict]:
         raise Skipped("UNREADABLE pulls — the answer was not JSON")
     if not isinstance(rows, list):
         raise Skipped("UNREADABLE pulls — the answer was not a JSON list")
+    if len(rows) >= max_prs:
+        # ⛔ A FULL PAGE IS A TRUNCATED READ, and this listing carries no `total_count` to prove
+        # otherwise. Measured 2026-10-24: agent-infra had 70 open PRs against a 30-row page, so 40
+        # were INVISIBLE — the rank denominators undercounted and an attested+quiet PR below the cut
+        # could never be dispatched. This file already refuses a full statuses page and a
+        # page-truncated check surface for the same reason; the listing was the one read that did not.
+        raise Skipped(f"UNREADABLE pulls — the listing filled its {max_prs}-row page, so the queue "
+                      f"may be truncated (raise --max-prs, or page the listing)")
     prs = []
     for r in rows:
         if not isinstance(r, dict):
@@ -1499,6 +1597,35 @@ def landing_cycle(args, o: Path, slug: str, repo_path: Path, budget: Budget):
         return [], False
     ranked = rank(prs, o, Path(args.reviews).expanduser(), slug)
     ps_rows = _ps_table()
+    # ⛔ MERGEABILITY IS NOT COMPUTED ON THE LIST ENDPOINT. `GET /pulls?state=open` answers
+    # `mergeable: null` for EVERY PR — measured 2026-10-24 on agent-infra, 10/10 open PRs, with
+    # `GET /pulls/<n>` returning `true` for the same heads. A null read as `REFUSE(mergeable=unknown)`
+    # therefore made this arm INERT: a gate that could never pass, forever, while the report looked
+    # like it was working. The single-PR read DOES populate the field, so every candidate this cycle
+    # actually reads re-reads it there, and a budget that cannot afford the read says `NOT-READ`
+    # rather than inheriting a value the server never calculated.
+    for p in ranked[: args.candidates]:
+        if p["mergeable"] != "UNKNOWN" or not p["head"]:
+            continue
+        try:
+            rc, out, _err = budget.api(f"repos/{slug}/pulls/{p['number']}")
+        except Skipped:
+            p["mergeable"] = "NOT-READ"
+            continue
+        if rc != 0:
+            p["mergeable"] = "NOT-READ"
+            continue
+        try:
+            detail = json.loads(out)
+        except ValueError:
+            detail = None
+        m = detail.get("mergeable") if isinstance(detail, dict) else None
+        if m is True:
+            p["mergeable"] = "MERGEABLE"
+        elif m is False:
+            p["mergeable"] = "CONFLICTING"
+        # A still-null answer stays UNKNOWN: GitHub computes mergeability lazily, and "not computed
+        # yet" is a WAIT — never a GO, and never an excuse to guess.
     surface_for: dict[int, dict | None] = {p["number"]: None for p in ranked}
     for p in ranked[: args.candidates]:
         if not p["head"]:
@@ -1585,9 +1712,163 @@ def landing_cycle(args, o: Path, slug: str, repo_path: Path, budget: Budget):
     return results, dispatched
 
 
+# ── the goals (measured BEFORE the PR reads) ───────────────────────────────────────────────
+
+def drift_rows(o: Path, main_sha: str) -> list[dict]:
+    """Where each box's harness stands WITHOUT ACTING — the cheap half of the deploy arm.
+
+    ⛔ MEASURED FIRST, BEFORE THE PR READS. The goals are what the PR queue is FOR, and a cycle that
+    spends its reads on the queue first reports on the queue and leaves the goals unmeasured — the
+    measured failure (2026-10-24): the PR reads took the whole core budget (`8/8` at 04:22Z) and
+    every goal line said "not measured". A reminder that reports on PRs and forgets what the PRs
+    are for is a reminder that optimises the queue instead of the objective.
+
+    This makes NO REST call — it reads artifacts on the boxes (`$O/state/boxes.tsv`, and
+    `box-status.sh` beside this script for the local box) — which is exactly why it can go first.
+
+    It NEVER raises: an unreadable inventory or a failed probe becomes a row that SAYS SO, because a
+    goal line silently missing the drifted cell reads like the cell is fine.
+    """
+    try:
+        boxes = read_inventory(o)
+    except Skipped as e:
+        return [{"box": "<inventory>", "harness": "", "relation": "", "readable": False,
+                 "note": str(e)}]
+    rows: list[dict] = []
+    for name, status_cmd, _activate in boxes:
+        d = probe_box(name, status_cmd)
+        rows.append({"box": name, "harness": d["harness"][:12], "relation": d["relation"],
+                     "readable": bool(d["readable"]), "note": ""})
+    return rows
+
+
+def _drift_text(rows: list[dict]) -> str:
+    if not rows:
+        return "NOT-MEASURED (no box inventory and no local probe)"
+    parts = []
+    for r in rows:
+        if not r["readable"]:
+            parts.append(f"{r['box']}=UNREADABLE")
+        else:
+            parts.append(f"{r['box']}={r['harness'] or '<none>'} [{r['relation'] or '?'}]")
+    return " · ".join(parts)
+
+
+def goal_progress(drift: list[dict], budget: Budget, slug: str,
+                  skipped: str = "") -> tuple[list[str], list[str]]:
+    """Measure BOTH goals. -> (the readings as markdown lines, what to do IN GOAL ORDER).
+
+    ⛔ A COUNT THAT COULD NOT BE READ IS `NOT-MEASURED`, NEVER `0`. Zero is a claim ("there are
+    none"), and the whole point of this block is that the claims are derived from a reading. Each
+    count is a SERVER-SIDE filter — see `_count` for why a local slice undercounts.
+
+    The standing words are deliberately not cheerwords:
+      `DONE`          every count read, and no open P0/P1 remains (goal 1 only);
+      `OPEN`          counts read, work remains;
+      `MARKERS-HOLD`  every box reports the main sha as `[current]` and the queue was read — the
+                      MARKERS hold. That is not proof of autonomy: a drifting box or a queue that
+                      grows faster than it lands breaks these markers first;
+      `MARKERS-BROKEN` a box is drifted/unreadable, or the queue could not be read;
+      `NOT-MEASURED`  the cycle never reached the goal read (a SKIPPED cycle), or the counts did
+                      not come back.
+    """
+    if skipped:
+        return ([f"- **{g}** — `STANDING=NOT-MEASURED` ({skipped})." for g, _why in GOALS],
+                ["Both goals are UNMEASURED this cycle (see the SKIPPED line) — fix the read first: "
+                 "an unmeasured goal is not a met one."])
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def c(query: str) -> tuple[str, str]:
+        n, why = _count(budget, query)
+        return ("NOT-MEASURED", why) if n is None else (str(n), "")
+
+    # Goal 1 — tortoise P0+P1 DONE and MERGED.
+    p0, p0_why = c(f"repo:{GOAL_REPO} type:issue state:open label:P0")
+    p1, p1_why = c(f"repo:{GOAL_REPO} type:issue state:open label:P1")
+    c0, c0_why = c(f"repo:{GOAL_REPO} type:issue state:closed label:P0 closed:>={today}")
+    c1, c1_why = c(f"repo:{GOAL_REPO} type:issue state:closed label:P1 closed:>={today}")
+    dm, dm_why = c(f"repo:{GOAL_REPO} type:pr is:merged merged:>={today}")
+    # Goal 2 — the harness runs autonomously: the SAME version everywhere, and a queue that moves.
+    qo, qo_why = c(f"repo:{slug} type:pr state:open")
+    qm, qm_why = c(f"repo:{slug} type:pr is:merged merged:>={today}")
+
+    unreadable = [(name, why) for name, why in (
+        ("P0 open", p0_why), ("P1 open", p1_why), ("P0 closed today", c0_why),
+        ("P1 closed today", c1_why), ("PRs merged today", dm_why)) if why]
+    if unreadable:
+        goal1 = "NOT-MEASURED"
+    elif p0 == "0" and p1 == "0":
+        goal1 = "DONE"
+    else:
+        goal1 = "OPEN"
+
+    currents = [r for r in drift if r["readable"] and r["relation"] == "current"]
+    boxes_bad = [r for r in drift if not r["readable"] or r["relation"] != "current"]
+    if not drift or qo_why or qm_why:
+        goal2 = "NOT-MEASURED"
+    elif boxes_bad:
+        goal2 = "MARKERS-BROKEN"
+    else:
+        goal2 = "MARKERS-HOLD"
+
+    lines = [
+        f"- **{GOALS[0][0]}** — `STANDING={goal1}`",
+        f"  {GOAL_REPO}: open P0={p0} · open P1={p1} · closed today P0={c0} · P1={c1} · "
+        f"PRs merged today={dm}",
+        f"- **{GOALS[1][0]}** — `STANDING={goal2}`",
+        f"  harness: {_drift_text(drift)} ({len(currents)}/{len(drift)} current)",
+        f"  queue ({slug}): open PRs={qo} · merged today={qm}",
+    ]
+    for name, why in unreadable:
+        lines.append(f"  ⚠️ {name}: {why}")
+    for why in (qo_why, qm_why):
+        if why:
+            lines.append(f"  ⚠️ queue: {why}")
+    if not (qo_why or qm_why) and qo.isdigit() and qm.isdigit() and int(qm) < int(qo):
+        # NOT a standing flip: how many of those open PRs are stale or drafts is not read here, so
+        # calling this "the queue is behind" as a verdict would be inventing a threshold. It is
+        # reported as the SHAPE, which is what "the queue not behind" is asking about.
+        lines.append(f"  ⚠️ queue shape: more open than landed today ({qo} open vs {qm} merged) — "
+                     f"the queue is not shrinking at this rate.")
+
+    actions: list[str] = []
+    if goal1 == "OPEN":
+        actions.append(
+            f"**Goal 1 ({GOAL_REPO} P0+P1):** {p0} P0 + {p1} P1 issues are still OPEN, "
+            f"{c0}+{c1} were closed today and {dm} PR(s) merged today. A fix without a MERGED PR is "
+            f"not done — land those PRs before starting new work on the goal.")
+    elif goal1 == "DONE":
+        actions.append(f"**Goal 1 ({GOAL_REPO} P0+P1):** DONE — no open P0/P1. Hold it: a new P0/P1 "
+                       f"issue re-opens the goal, and {dm} PR(s) merged today.")
+    else:
+        actions.append(f"**Goal 1 ({GOAL_REPO} P0+P1):** UNMEASURED this cycle — the counts did not "
+                       f"come back (see the ⚠️ lines). Repair the read; do not assume the goal holds.")
+
+    if goal2 == "MARKERS-BROKEN":
+        drift_names = ", ".join(r["box"] for r in boxes_bad) or "<unread>"
+        actions.append(
+            f"**Goal 2 (harness autonomy):** {len(currents)}/{len(drift)} boxes report `[current]` — "
+            f"NOT all: {drift_names}. The SAME harness version deployed AND activated everywhere is "
+            f"the marker; activate/deploy it (the deploy arm below) before anything else one box at a "
+            f"time.")
+    elif goal2 == "MARKERS-HOLD":
+        actions.append(
+            f"**Goal 2 (harness autonomy):** markers HOLD — all {len(drift)} box(es) report `[current]`, "
+            f"queue read ({qo} open, {qm} merged today). That is the marker, not proof: keep the queue "
+            f"moving and keep every cell on the pin.")
+    else:
+        actions.append("**Goal 2 (harness autonomy):** UNMEASURED this cycle — the boxes or the queue "
+                       "did not answer. Repair the read (below) instead of assuming the fleet is fine.")
+    actions.append("**Then, and only then, the PR table below:** it is the VEHICLE for the goals, not "
+                   "the objective. A PR that moves neither goal is work, not progress.")
+    return lines, actions
+
+
 # ── the written reminder ─────────────────────────────────────────────────────────────────────
 def compose(md: Path, slug: str, main_sha: str, budget: Budget,
-            landing: list[dict], deploy: list[dict], skipped: str, line: str) -> str:
+            landing: list[dict], deploy: list[dict], skipped: str, line: str,
+            goal_lines: list[str] | None = None,
+            goal_actions: list[str] | None = None) -> str:
     """Write the reminder file. -> "" on success, the failure reason otherwise (the caller turns it
     into a SKIPPED cycle: the file IS the deliverable)."""
     rows = []
@@ -1598,13 +1879,30 @@ def compose(md: Path, slug: str, main_sha: str, budget: Budget,
     for d in deploy:
         dep.append(f"| {d['box']} | {d['harness'][:12] or '<none>'} [{d['relation'] or '?'}] | "
                    f"{d['controller'] or '?'} | {d['roles'] or '?'} | {d['verdict']} |")
+    goals_block = chr(10).join(goal_lines or []) or (
+        "- **GOALS UNMEASURED** — this cycle did not reach the goal read (see the SKIPPED line).")
+    do_block = chr(10).join(f"{i}. {a}" for i, a in enumerate(goal_actions or [], start=1)) or (
+        "1. Both goals are UNMEASURED this cycle — repair the read before acting on the table below.")
     body = f"""# Merge reminder — {now_iso()}
 
 **Target:** `{slug}` · **origin/main:** `{main_sha[:12] or 'UNREADABLE'}` ·
 **REST:** {budget.calls}/{REST_BUDGET} metered (+1 exempt `rate_limit`) ·
+**search:** {budget.search_calls}/{GOAL_SEARCH_BUDGET} (the goal readings; a SEPARATE quota) ·
 **core:** {(str(budget.core_remaining) + '/' + str(budget.core_limit)) if budget.core_limit else 'UNREADABLE (rate_limit was not reached)'}
 
 {f'⛔ **SKIPPED:** {skipped}' if skipped else '**cycle:** ran'}
+
+## GOALS
+
+{chr(10).join(f'- **{g}** — {why}' for g, why in GOALS)}
+
+## Where the goals stand this run
+
+{goals_block}
+
+## What to do (in GOAL order)
+
+{do_block}
 
 ## One line
 
@@ -1869,6 +2167,26 @@ def repo_slug(repo_path: Path, explicit: str) -> str:
     raise Skipped("UNREADABLE repo — pass --repo owner/name (origin could not be read)")
 
 
+def github_origin(repo_path: Path) -> str:
+    """The CHECKOUT's own `owner/name` when `origin` is a github URL, else "".
+
+    ⛔ `--repo` NAMES THE TARGET; THE CHECKOUT NAMES WHERE THE EVIDENCE LIVES. They are different
+    questions, and nothing else couples them: `claim_state` runs `git ls-remote <repo_path>'s origin`
+    while `slug` comes from the flag, so `--repo daniel-ospina/tortoise` run from an agent-infra
+    checkout would read AGENT-INFRA's `refs/claims/*` and answer `claim=none` for a PR a peer box is
+    landing right now — a GO derived from a namespace it never read (and `main_sha` would compare
+    the boxes against the wrong `origin/main`).
+
+    "" means "cannot prove a mismatch" — a local path, a bare fixture origin, a mirror on another
+    host — and is not evidence of a match. Only a RESOLVED github slug that DIFFERS refuses.
+    """
+    rc, out, _ = run(["git", "-C", str(repo_path), "remote", "get-url", "origin"], timeout=15)
+    if rc != 0:
+        return ""
+    m = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", (out or "").strip())
+    return f"{m.group(1)}/{m.group(2)}" if m else ""
+
+
 def repo_path_of(o: Path) -> Path:
     explicit = os.environ.get("REPO")
     cands = [explicit] if explicit else []
@@ -1932,7 +2250,7 @@ def main(argv=None) -> int:
         return install_timer(o, args.interval, args.uninstall_timer)
 
     if args.candidates < 1 or args.candidates > MAX_CANDIDATES:
-        print(f"--candidates must be 1..{MAX_CANDIDATES} (the REST budget: 1 + 3*candidates <= {REST_BUDGET})",
+        print(f"--candidates must be 1..{MAX_CANDIDATES} (the REST budget: 1 + 4*candidates <= {REST_BUDGET})",
               file=sys.stderr)
         return 2
 
@@ -1948,15 +2266,35 @@ def main(argv=None) -> int:
     dispatched = False
     main = ""
     slug = args.repo or "<unresolved>"
+    drift: list[dict] = []
+    goal_lines: list[str] = []
+    goal_actions: list[str] = []
     # ONE try around the READS THAT CAN SKIP THE WHOLE CYCLE (repo identity, gh, the rate-limited
     # budget, the open-PR listing). A single candidate's surface failing inside landing_cycle is
     # handled there — it becomes an UNREADABLE reading for that PR, not a skipped cycle.
     try:
         repo_path = repo_path_of(o)
         slug = repo_slug(repo_path, args.repo)
+        own = github_origin(repo_path)
+        if own and slug and own.lower() != slug.lower():
+            # ⛔ REFUSE RATHER THAN GUESS. Every head-bound gate below reads evidence out of the
+            # CHECKOUT (`refs/claims/*`, `origin/main`), so a target that differs from the checkout
+            # means those gates were never asked about the PRs they are gating.
+            raise Skipped(
+                f"MISMATCHED repo — the target is {slug} but this checkout's origin is {own}, so the "
+                f"claim refs and origin/main would be read from the WRONG repo (a live cross-box "
+                f"claim would read as claim=none). Run this from {slug}'s checkout")
         main = main_sha(repo_path)
         budget = Budget(resolve_gh(o))
         budget.rate_limit()
+        # ⛔ ORDER: DRIFT → THE TWO GOALS → THE PR READS (owner's ask, 2026-10-24).
+        # The goals are what the PR queue is FOR. Measured failure without this order: the PR reads
+        # ran first, spent the whole core budget (`8/8` at 04:22Z), and every goal line said "not
+        # measured" — a reminder that reported on PRs and forgot what the PRs are for. Drift is a
+        # LOCAL artifact read (no REST), the goals spend the SEARCH quota (a different bucket), so
+        # neither can starve the landing arm's documented `REST_BUDGET`.
+        drift = drift_rows(o, main)
+        goal_lines, goal_actions = goal_progress(drift, budget, slug)
         landing, dispatched = landing_cycle(args, o, slug, repo_path, budget)
     except Skipped as e:
         skipped = str(e)
@@ -1968,6 +2306,14 @@ def main(argv=None) -> int:
         # already running, not a value a failed read gets to withdraw.
         skipped = f"UNREADABLE environment — {type(e).__name__}: {e}"
         landing = []
+    if not goal_lines:
+        # The cycle never REACHED the goal read (a Skipped rate limit, an unreadable repo, or a
+        # probe that failed inside `drift_rows`). It is REPORTED as unmeasured, with the reason —
+        # a goal block that is simply absent reads as "no work left", which is the false PASs this
+        # whole file exists to prevent.
+        goal_lines, goal_actions = goal_progress(
+            drift, budget, slug,
+            skipped=skipped or "the cycle did not reach the goal read")
     if not skipped:
         # The deploy arm runs AFTER the landing decision, and a landing dispatched this cycle
         # DEFERS it: restarting a controller under the rail we just started destroys that run.
@@ -1995,7 +2341,8 @@ def main(argv=None) -> int:
                 skipped = (skipped + "; " if skipped else "") + \
                     f"UNREADABLE environment — {type(e).__name__}: {e}"
     line = one_line_of(landing, deploy, skipped, dispatched)
-    err = compose(md, slug, main, budget, landing, deploy, skipped, line)
+    err = compose(md, slug, main, budget, landing, deploy, skipped, line,
+                  goal_lines, goal_actions)
     if err:
         # ⛔ THE REMINDER IS THE DELIVERABLE: a cycle whose file could not be written did not run,
         # whatever else it managed to do. Saying "ran" (exit 0) over a missing file is the same
@@ -2009,6 +2356,10 @@ def main(argv=None) -> int:
             "ts": now_iso(), "repo": slug, "main": main, "skipped": skipped,
             "rest_calls": budget.calls, "rest_budget": REST_BUDGET,
             "core": {"remaining": budget.core_remaining, "limit": budget.core_limit},
+            "search_calls": budget.search_calls, "search_budget": GOAL_SEARCH_BUDGET,
+            "goals": goal_lines, "goal_actions": goal_actions,
+            "drift": [{"box": r["box"], "harness": r["harness"],
+                       "relation": r["relation"], "readable": r["readable"]} for r in drift],
             "landing": [{"pr": r["pr"]["number"], "head": r["pr"]["head"], "rank": r["rank"],
                          "verdict": r["verdict"], "readings": r["readings"],
                          "detail": r["detail"], "dispatch": r.get("dispatch", False),
