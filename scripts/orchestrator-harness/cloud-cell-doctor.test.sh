@@ -1716,6 +1716,17 @@ cat > "$STRIP_AWK" <<'AWK'
 }
 AWK
 strip_comment() { printf '%s\n' "$1" | awk -f "$STRIP_AWK"; }
+# ⛔ ONE PATTERN, ONE VARIABLE (this class has now cost three rounds). The guard, the per-value
+# scan and the fail-closed counter each carried their own copy of the read pattern, and every round
+# found them out of step: `${#1}`/`${!1}` were in none of them, then `${01}` was in none of them.
+# `POSRE` is the single definition; a read shape added here is added everywhere by construction.
+# ⛔ AND THE BARE FORM DOES NOT ACCEPT LEADING ZEROS, while the braced form does. Bash reads `${01}`,
+# `${010}`, `${#01}`, `${!01}` and `${0123}` as positional reads (they die with `01: unbound
+# variable`), but unbraced `$01` is `$0` followed by `1`, not a read of arg 1 — so `0*` belongs only
+# inside `\${…}`. Reproduced (review P1): a `${01}` binding left the suite at PASS=235 with no record
+# and no `unparsed`. The `.` guard used to be a `case` with four hand-written arms; with five shapes
+# that is five places to forget, so it is a grep against this one pattern.
+POSRE='\$\{[#!]?0*[1-9][0-9]*[^}]*\}|\$[1-9][0-9]*'
 audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a `derived` note
   local body="$1" assign var val rd seen=0 alln=0
   # ⛔ ONE STRING FOR BOTH THE SCAN AND THE COUNT (review P1). The count used to strip a trailing
@@ -1727,7 +1738,7 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a
   while read -r assign; do
     [ -n "$assign" ] || continue
     var="${assign%%=*}"; val="${assign#*=}"
-    case "$val" in *'$'[1-9]*|*'${'[1-9]*|*'${#'[1-9]*|*'${!'[1-9]*) ;; *) continue ;; esac
+    grep -qE "$POSRE" <<<"$val" || continue
     while read -r rd; do
       [ -n "$rd" ] || continue
       seen=$((seen + 1))
@@ -1743,7 +1754,7 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a
         "$rd"|"\"$rd\"") ;;
         *) printf 'derived %s %s\n' "$var" "$rd" ;;
       esac
-    done < <(grep -oE '\$\{[#!]?[1-9][^}]*\}|\$[1-9]' <<<"$val")
+    done < <(grep -oE "$POSRE" <<<"$val")
   done < <(grep -oE '([A-Za-z_][A-Za-z0-9_]*="[^"]*"|[A-Za-z_][A-Za-z0-9_]*=\$[^ ]*)' <<<"$body")
   # ⛔ A POSITIONAL READ THE ASSIGNMENT SCAN CANNOT ATTRIBUTE IS A HARD FAIL, NOT A SILENCE
   # (review P2). The assignment pattern cannot see through a nested quote: for
@@ -1759,8 +1770,8 @@ audit_line() { # <text> -> "<verdict> <name> <read>" per positional read, then a
   # were blind to them — the assignment scan did not see the read, so it was never graded, AND the
   # `alln` counter below did not count it, so the fail-closed `unparsed` net could not fire either.
   # Reproduced (review P1): `local n="${#1}"` in a new function left the suite at FAIL=0 and the
-  # counters untouched. The two regexes below MUST stay identical for that net to mean anything.
-  alln="$(grep -oE '\$\{[#!]?[1-9][^}]*\}|\$[1-9]' <<<"$body" | wc -l)"
+  # counters untouched. `POSRE` above is the one definition all three use.
+  alln="$(grep -oE "$POSRE" <<<"$body" | wc -l)"
   while [ "$seen" -lt "$alln" ]; do
     seen=$((seen + 1))
     printf 'unparsed ? ?\n'
@@ -1795,6 +1806,9 @@ bare|local n="${#1}"
 bare|local n="${!1}"
 bare|local what="reap #$1 lane"
 bare|local ok="$(printf %s " #pad")" n="$1"
+bare|local n="${01}"
+bare|local n="${#01}"
+bare|local n="${!010}"
 bare|local d="$1" tmp="$1/.own.tmp.$$"
 EOF
 # …and the FAIL-CLOSED shape: a positional the assignment parse cannot attribute must be REPORTED,
@@ -1841,6 +1855,10 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # `#.*`, not `#[^"]*`: a comment containing a quote (`# it says "hi"`) is still a comment, and with
   # the narrower class that header was invisible too (review P1). The parens are `\([[:space:]]*\)`
   # because `name( ) {` is bash-legal as well.
+  # ⛔ AND A LINE-CONTINUED HEADER (review P1, reproduced): `ZzContHeader() \` and `{` on the next
+  # line is bash-legal, and missing it attributed the read to the PRECEDING function, where an
+  # allowlisted pair for the same NAME graded it REQUIRED (PASS 235→236). Hence the `\\[[:space:]]*$`
+  # arm, which accepts a trailing backslash as well as a trailing comment.
   # ⛔ IT IS "NEAREST PRECEDING", NOT "INNERMOST ENCLOSING" (review P2): there is no brace tracking,
   # so a line that comes AFTER a nested helper has closed still resolves to that helper. Today's two
   # nested helpers both sit after their function's only positional binding, so nothing is
@@ -1855,7 +1873,7 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   # ⛔ AND IT IS CHECKED BOTH WAYS (fail-closed): a line that LOOKS like a definition by the BROAD
   # pattern but does not yield a name by the NARROW one is a header this resolver cannot attribute,
   # so it is reported rather than skipped — the same doctrine as `unparsed` for reads.
-  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*\{|[[:space:]]*(#.*)?$)|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*\{|[[:space:]]*(#.*)?$)' "$file" | cut -d: -f1); do
+  for ln in $(grep -nE '^[[:space:]]*(function[[:space:]]+)?[^[:space:](){;]+[[:space:]]*\([[:space:]]*\)([[:space:]]*\{|[[:space:]]*\\[[:space:]]*$|[[:space:]]*(#.*)?$)|^[[:space:]]*function[[:space:]]+[^[:space:](){;]+([[:space:]]*\{|[[:space:]]*\\[[:space:]]*$|[[:space:]]*(#.*)?$)' "$file" | cut -d: -f1); do
     [ "$ln" -le "$want" ] || break
     best="$ln"
   done
@@ -1882,8 +1900,9 @@ func_for() { # <file> <line-number> -> the NEAREST PRECEDING header's name (empt
   printf 'ZzCommentBrace()  # a note\n{\n  local s="$1"\n}\n'
   printf 'ZzSpacedParen( ) {\n  local s="$1"\n}\n'
   printf 'ZzQuotedComment()  # it says "hi"\n{\n  local s="$1"\n}\n'
+  printf 'ZzContHeader() \\\n{\n  local s="$1"\n}\n'
 } > "$T/hdr.sh"
-for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name ZzNextLine ZzCommentBrace ZzSpacedParen ZzQuotedComment; do
+for _want in ZzFutureHelper ZzSpacedHelper ZzTightHelper ZzKeyword zz-dashed-name ZzNextLine ZzCommentBrace ZzSpacedParen ZzQuotedComment ZzContHeader; do
   _got="$(func_for "$T/hdr.sh" "$(grep -nE "^[[:space:]]*(function[[:space:]]+)?${_want//-/\\-}" "$T/hdr.sh" | cut -d: -f1 | head -1)")"
   [ "$_got" = "$_want" ] && ok "func_for: header '$_want' resolves to itself (not to the preceding 'outer_fn')" \
     || bad "func_for: header '$_want' resolved to '${_got:-<nothing>}' — a read under it would be graded against the wrong function's allowlist"
