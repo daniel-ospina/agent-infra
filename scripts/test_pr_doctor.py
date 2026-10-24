@@ -352,8 +352,9 @@ def test_an_unreadable_pid_file_does_not_free_a_slot(tmp_path, monkeypatch):
 def test_a_directory_at_the_pid_path_neither_crashes_nor_frees_the_slot(tmp_path, monkeypatch):
     """An artifact of the wrong TYPE is unknown, not gone -- and not a hang either.
 
-    `open()` on a FIFO would block forever (no writer), which is why `_worker_pid_files` filters on
-    `isfile`; a directory is handled by the read. Both must leave the slot held.
+    A directory is excluded by `_worker_pid_files`' `isfile` filter (so the read never sees it), and
+    the same filter is what keeps a FIFO from blocking `open()` forever with no writer. Both must
+    leave the slot held.
     """
     now = 1_000_000.0
     bg = tmp_path / "bg"
@@ -363,6 +364,52 @@ def test_a_directory_at_the_pid_path_neither_crashes_nor_frees_the_slot(tmp_path
     b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)
     assert b["fix"] == 0, "a directory at the pid path freed a slot: %r" % (b,)
     assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+
+
+def test_the_pass_line_reports_inflight_alive_and_unknown(monkeypatch, tmp_path):
+    """The self-report must be ON THE LINE, not merely in the dict (#2746 review round 2).
+
+    The three-state split is the whole operator-facing point of the change -- `inflight=16 (alive=0
+    unknown=0)` is what makes "sixteen records and nothing running" visible -- and nothing asserted
+    that the line carries it, so a later edit could drop `alive`/`unknown` from the message with the
+    whole suite green.
+    """
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    (bg / "prd-1.pid").write_text("%d\n" % dead)     # provably gone: frees its slot
+    (bg / "prd-2.pid").write_text("not-a-pid\n")     # unknown: holds it, and is reported as such
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    now = pr.now()
+    _rc, joined, _p = _drive_pass(
+        monkeypatch, [_pr(3)], ("fix-ci", "red", []),
+        state={"1": {"action": "fix-ci", "worker": "prd-1", "at_epoch": now},
+               "2": {"action": "fix-ci", "worker": "prd-2", "at_epoch": now}})
+    assert "inflight=2 (alive=0 unknown=1)" in joined, joined
+
+
+def test_a_zero_budget_held_by_unproven_rows_does_not_claim_saturation(monkeypatch, tmp_path):
+    """`no capacity budget` must not say "all in flight" over rows no process backs.
+
+    #2746 review round 2 measured the contradiction: `inflight=2 (alive=0 unknown=2)` on the pass
+    line and then "all of MAX_FIX+MAX_REVIEW is in flight" as the verdict -- the same
+    internally-consistent-and-false story the change exists to remove, one line lower.
+    """
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    for n in (1, 2):
+        (bg / ("prd-%d.pid" % n)).write_text("not-a-pid\n")        # unknown, twice
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "capacity", lambda: {"max_fix": 2, "max_review": 0})
+    now = pr.now()
+    _rc, joined, _p = _drive_pass(
+        monkeypatch, [_pr(9)], ("fix-ci", "red", []),
+        state={"1": {"action": "fix-ci", "worker": "prd-1", "at_epoch": now},
+               "2": {"action": "fix-ci", "worker": "prd-2", "at_epoch": now}})
+    assert "inhight=2" not in joined, joined          # guard against a typo'd field name
+    assert "inflight=2 (alive=0 unknown=2)" in joined, joined
+    assert "no capacity budget (inflight=2: alive=0 unproven=2)" in joined, joined
+    assert "is in flight" not in joined, joined
 
 
 def test_one_live_candidate_holds_the_slot_even_when_a_sibling_pid_file_is_dead(tmp_path, monkeypatch):

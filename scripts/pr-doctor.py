@@ -417,13 +417,16 @@ def capacity() -> dict:
 # resolved twice). An empty register, an unreadable pid file, a row with no `worker` at all -- all
 # read ALIVE.
 #
-# ⚠️ AND THE NAME IS NOT AN IDENTITY, WHICH IS WHERE THE FIRST VERSION OF THIS FIX DIED. The state row
-# stores the SHORT worker name (`prd-2035`) while the launcher writes a REPO-SCOPED pid file
-# (`prd-agent-infra-2035.pid`) -- the partitioning that stopped two doctors sharing one register
-# (#2700/#2725). An exact-name lookup found NOTHING, and "nothing found => assume alive" (the safe
-# direction) then faithfully preserved every ghost it was written to drop. So the TRAILING NUMBER is
-# matched as well. That over-matches deliberately: another repo's LIVE worker with the same PR number
-# keeps a slot (throughput), and it never frees one (a duplicate dispatch).
+# ⚠️ AND THE NAME IS NOT AN IDENTITY. This file's own `dispatch()` writes the SHORT worker name
+# (`prd-2035`, `name = "prd-%d" % n`) under a box-global `$O/bg`, but the repo-scoped form
+# (`prd-agent-infra-2035.pid`) is what the MULTI-REPO launcher writes (`worker_name()` in
+# `fix/pr-doctor-repo-resolution`, #2280) and what the Mac's deployed copy wrote in the measurement
+# above (`spawn prd-agent-infra-2027`). A doctor in that mode writes scoped pid files while a
+# register carried over from single-repo mode still holds short names -- and an exact-name lookup
+# then finds NOTHING, where "nothing found => assume alive" (the safe direction) faithfully keeps
+# every ghost. So the TRAILING NUMBER is matched as well. That over-matches deliberately: another
+# repo's LIVE worker with the same PR number keeps a slot (throughput), and it never frees one (a
+# duplicate dispatch).
 #
 # ⛔ AND THE SELF-REPORT NEEDS THREE STATES, NOT TWO (#2746 review). `alive` used to mean "not provably
 # gone", which counts a row with no `worker`, a row whose pid file was pruned, and a pid file we
@@ -493,7 +496,11 @@ def _worker_pid_files(worker: str) -> list:
     """
     exact = bg_path(worker, "pid")
     paths = [exact] if os.path.isfile(exact) else []
-    m = re.search(r"([0-9]+)\Z", worker)
+    # ⛔ BOUNDED, LIKE EVERY OTHER DIGIT PARSE IN THIS FILE: `int()` raises ValueError past
+    # 4300 characters (a ValueError, not an OSError -- it would abort the pass from inside the
+    # counter, the same class as the `UnicodeDecodeError` fixed in `_read_pid`). `dispatch()` writes
+    # `prd-<n>`, but the register is read back from JSON, so the row is not necessarily ours.
+    m = re.search(r"([0-9]{1,10})\Z", worker)
     if not m:
         return paths
     n = int(m.group(1))
@@ -554,19 +561,6 @@ def _worker_state(worker) -> str:
     # `gone` requires EVERY candidate to be readable AND dead. An unreadable sibling is not a free
     # slot: it could name the live worker we would then dispatch a second one alongside.
     return "gone" if readable and not unreadable else "unknown"
-    name = str(worker or "").strip()
-    if not name:
-        return True           # a row with no worker named: no evidence, so not gone
-    paths = _worker_pid_files(name)
-    if not paths:
-        return True           # no pid file at all is NOT proof of absence
-    for path in paths:
-        pid = _read_pid(path)
-        if pid is None:
-            return True       # a pid file we cannot read proves nothing
-        if _pid_running(pid):
-            return True       # one live candidate is enough; over-matching is the safe direction
-    return False              # every candidate exists, every one is readable, every pid is gone
 
 
 def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> dict:
@@ -3099,8 +3093,7 @@ def main() -> int:
         stalls = stalled or {}
         if not dispatched:
             # ⚠️ THE CHECKS WORDING IS KEPT VERBATIM (a shipped test asserts it), and the surface
-            # holds are appended rather than folded in: they are the same AXIS (a read that did not
-            # happen) but a DIFFERENT read, and an operator chasing a stalled surface PR must not
+            # holds are appended rather than folded in: they are the same AXIS (a read that did not            # happen) but a DIFFERENT read, and an operator chasing a stalled surface PR must not
             # be sent to `gh pr checks`.
             _held = blind_surface + blind_partial + blind_abandoned
             _more = (" (%d usable-PR(s) still held for a changed-file read)" % _held
@@ -3128,7 +3121,14 @@ def main() -> int:
             parts.append("ok")
         else:
             if budgets["total"] == 0:
-                parts.append("no capacity budget (all of MAX_FIX+MAX_REVIEW is in flight)")
+                # ⛔ AND IT NAMES THE SPLIT, because `total == 0` no longer means "saturated" (#2746
+                # review round 2). A ceiling can now be held entirely by rows whose worker is
+                # UNPROVEN, so "all of MAX_FIX+MAX_REVIEW is in flight" would be the same
+                # internally-consistent-and-false story this change removes, one line below the pass
+                # line that contradicts it: measured `inflight=2 (alive=0 unknown=2)` printing
+                # "all … is in flight" over ZERO processes.
+                parts.append("no capacity budget (inflight=%d: alive=%d unproven=%d)"
+                             % (budgets["inflight"], budgets["alive"], budgets["unknown"]))
             for k, v in sorted(stalls.items()):
                 if v:
                     parts.append("%s=%d" % (k, v))
