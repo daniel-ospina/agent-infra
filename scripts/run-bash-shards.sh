@@ -138,6 +138,35 @@ shard_ran_log="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-ran.$$")"
 : > "$shard_ran_log" 2>/dev/null || true
 trap 'rm -f "$shard_ran_log"' EXIT
 
+# ── NAMING THE FAILING SHARD (#2643) ──────────────────────────────────────────────────────────
+# The count alone is UNATTRIBUTABLE. `❌ 4 bash shard(s) failed` names no suite, so nobody reading
+# the job — human or agent — can tell WHICH body of work is red without walking tens of thousands of
+# lines up the log. Measured cost (2026-10-24): main and every PR carried the same four red shards
+# for hours, `bash-suites` red on every PR head, and every lane re-derived those four from CI logs by
+# hand, over a 5-minute fix. The names were in the log all along; they were just not in the answer.
+#
+# ⛔ TWO READERS, TWO MECHANISMS — and the rail is served by the OTHER one. `run_shard` emits
+# `::error::bash shard failed: <path>`, a GitHub annotation, and `scripts/ci_exemption.py ids`
+# recognises it as a guard-step identity that CARRIES the shard path — measured on a log with two of
+# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. That is what
+# makes a red `bash-suites` step comparable to main's baseline PER SHARD, and it is NOT this block:
+# measured against the prose lines printed here, the same parser returns `ids=0` — they neither help
+# nor hurt it. Do not "fix" the rail here, and never delete the annotation while keeping these lines:
+# that would leave every lane unattributable again.
+#
+# Two prints, on purpose — and the REASON is the early exits: the recap below is reached only at the
+# END of a run, while this file has several `exit 1` paths ABOVE it (`shard target resolves outside
+# this checkout`, `slice executed a DIFFERENT SET of shards`, and the two sentinels). On any of those
+# the per-failure line is the only name the log will ever carry.
+# LISTED shards only: the runtime sentinel at the end of this file deliberately runs a failing stub,
+# and a green run must never print a FAILED SHARD line for it (`shard_is_listed` is 0 there).
+shard_failed_list=""
+shard_fail() {
+  [ "$shard_is_listed" = 1 ] || return 0
+  shard_failed_list="${shard_failed_list}${shard_failed_list:+, }$1"
+  echo "❌ FAILED SHARD: $1"
+}
+
 slice_skips() {
   slice_pos=$shard_listed
   shard_listed=$((shard_listed + 1))
@@ -168,13 +197,36 @@ shard_note() {
 # anonymously) can be measured at all: until now no lane printed how long a shard took, so "which
 # shard is slow, which one hangs" was answerable only by watching a job's clock. It prints ONLY for
 # list lines (`shard_is_listed`), so the sentinels cannot print a bogus row.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; bash "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); }
+# ⛔ A FAILING SHARD MUST LEAVE AN IDENTITY THE MERGE RAIL CAN COMPARE (measured 2026-10-24: THREE
+# failing PR runs, `ids=0`, and `scripts/admin-merge.sh` refused with "yielded NO parseable failure
+# identity" — the block every lane hits while ANY suite on main is red). The rail's parser keys on a
+# pytest `FAILED <nodeid>` or an attributable guard-step `::error::` annotation (ci_exemption.py,
+# `guard_step_failures`), and this runner printed NEITHER: only `PASS=n FAIL=m` and
+# "❌ FAILURES — fix and re-run". A red suite on main therefore made every PR unattributable (#1185).
+# This annotation comes from THIS step, which the runner marks failed, so it is attributable by the
+# parser's own rules and names the suite — the rail can rate-compare it against main's baseline instead
+# of refusing. It does NOT weaken the comparison: a suite that fails here and is green on main is still
+# a PR-unique failure and still blocks.
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" || { shard_errors=$((shard_errors + 1)); [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
 # checking no syntax at all. `swept` is asserted below, so the sweep loops must have done work.
 swept=0
-sweep_file() { swept=$((swept + 1)); bash -n "$1" || shard_errors=$((shard_errors + 1)); }
+# ⛔ SWEEP FAILURES ARE COUNTED SEPARATELY (#2643 review, 2026-10-24). `shard_errors` is the verdict
+# and covers BOTH classes, so a recap that DERIVES "the sweep half" by subtracting the named shards
+# is guessing: when the naming arm itself is broken, a failing SHARD opens the "all sweeps" branch and
+# points the reader at the wrong subsystem. One counter, incremented where the failure happens.
+# ⛔ THE ` || shard_errors=$((shard_errors + 1))` LITERAL SURVIVES IN `sweep_file` because
+# `tests/ci-lane-parity/run.sh` §8h pins it by `sed` — and MEASURED, that `sed` changes ONLY
+# `sweep_file` (plus a comment). `run_shard`'s recorder is the grouped form main added on 2026-10-24
+# (`bash "$1" || { shard_errors=…; … echo "::error::…"; }`), so the sed never matched it, before or
+# after this branch; `run_shard`'s recorder is pinned by the runtime failure-recording sentinel
+# instead. The second counter below is therefore charged from the same DELTA idiom rather than by
+# rewriting the recorder into another group, so a reader who trusts §8h keeps seeing exactly what
+# §8h covers.
+sweep_errors=0
+sweep_file() { swept=$((swept + 1)); shard_err0=$shard_errors; bash -n "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_errors" -ne "$shard_err0" ] && sweep_errors=$((sweep_errors + 1)); }
 
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
 # keeps the line count but points the list at a /tmp stub would report every shard as passed having
@@ -241,6 +293,7 @@ run_shard scripts/checkout-hygiene/deepseek-balance-watch.test.sh          # #47
 run_shard scripts/checkout-hygiene/hub-state-check.test.sh                 # #1313 the DETECTOR (clean-but-stale PASS matrix)
 run_shard scripts/checkout-hygiene/hub-worktree.test.sh                    # #1309/#1313 the RECOVERY half
 run_shard scripts/install-launchd.test.sh                                  # #304 installer suite
+run_shard scripts/install-controller-service.test.sh                      # #2402 the cell's controller is a SERVICE, not a tmux session: the rendered unit (Restart=always — NOT on-failure, the measured case is an orderly exit 0 — a stated RestartSec, and a StartLimit window that can actually fill at that RestartSec), the FOREGROUND exec that puts the controller in the unit's cgroup with the gh-limit layer still first on PATH (#1988), start/stop/status cooperating with an enabled unit instead of producing two dispatchers on one queue (#1761), the installer's refusals (Darwin/launchd, no service manager, a bad RestartSec, an unresolved token) and its idempotency, and the restart policy BOTH ways — a SIGKILL comes back, an ORDERLY exit 0 comes back, and the same exit-0 controller is NOT restarted under on-failure (the negative control that makes the other two mean something)
 run_shard scripts/pi-reap-idle.test.sh                                     # #469 session reaper (fake PS/KILL/DATE shims)
 run_shard scripts/pi-task-session-prune.test.sh                            # #783 retention sweep (dry-run default)
 run_shard scripts/pi-cache-reap.test.sh                                    # #1987 the machine-global uv/npm/pip caches: an over-bound fixture MUST come back under it (prune first, escalate only with no live holder, and prove the shrink)
@@ -252,6 +305,7 @@ run_shard scripts/disk-reaper.test.sh                                     # #203
 run_shard scripts/worktree-disk-probe.test.sh                              # #1851 apparent-vs-real disk measurement (df used delta, per machine)
 run_shard scripts/cleanup-stale-branches.test.sh                          # #1787 local-branch reaper gates (the squash-merge-aware three gates, dry-run default)
 run_shard scripts/scratch-worktree.test.sh                                 # #1141 scratch-checkout helper
+run_shard scripts/bg-rescue-wip.test.sh                                    # #2045 THE CAP-KILL RESCUE: the archive carries CONTENT (read back from a bare remote, not just a ref), the branch and working tree and real index are NOT disturbed (a throwaway GIT_INDEX_FILE, safe under a live lane), a SECOND rescue after the grace period ACCUMULATES onto the first instead of being rejected non-fast-forward, an unreadable status / an unborn HEAD / a nested repo with no commit are each still archived (the fail-open that reported 'nothing at risk' on unrescuable work), a misrouted non-root path is refused, and an impossible push exits 2 saying the work is STILL ONLY ON THIS DISK. #2292: a WORKFLOW-SCOPE refusal is retried ONCE with the credential that can push (the clear-then-name keychain pair, asserted in order; no force, no config write at any origin; no prompt), a NON-workflow rejection is never retried (the stub would succeed on a second attempt, so a blanket retry shows up as a false success), a retry that is also refused reports BOTH causes without claiming a rescue, and the sha the success line claims is the sha origin's ref holds
 run_shard scripts/daily-backup.test.sh                                     # #907 the backup target is RESOLVED from the port it publishes and PROVEN to answer before any state exists; the LOAD_GATE_FORCE path runs; an incomplete backup dir is removed
 run_shard scripts/record-review.test.sh                                    # #1348 THE INCIDENT: runner-only rc=127 shipped green
 run_shard scripts/registry-sync.test.sh                                   # #2374 the review-record registry's cross-box replication: a record minted on ANOTHER box becomes visible, a NEWER record wins and an OLDER one is refused in both directions, an equal-reviewed_at disagreement is REPORTED and nothing is overwritten, an unattributable legacy <pr>.json is never collapsed into a repo's key, a second run changes nothing (digest-asserted), and an unreadable store is UNKNOWN rather than 'converged' (hermetic: a local bare origin IS the shared store)
@@ -268,6 +322,7 @@ run_shard scripts/fleet-inventory.test.sh                                   # #2
 run_shard scripts/orchestrator-harness/lander.test.sh                     # the versioned drain loop: a MERGEABLE+all-green PR is merged head-pinned, a PENDING one is NOT merged and NOT called failed (the measured case: 127 runs queued vs 5 in progress), a failing check is skipped and NAMED, a draft and a BLOCKED PR are reported with their reason, the CI queue depth is printed once per run even when nothing merges, and an unreadable board merges nothing — plus --nonvacuity, which deletes the pending arm and requires the PENDING assertion to break by name
 run_shard scripts/orchestrator-harness/cloud-cell-doctor.test.sh            # #1989 the cell's reap/doctor/merge/hygiene roles: a lane whose child is still writing is NOT reaped, a human-attached/terminal lane is NOT touched, the rail is gated on a clean attestation at the head with no blind retry, an unreadable read is cannot-verify, and `status` FAILS a started cell whose roles never ran
 run_shard scripts/orchestrator-harness/cloud-cell-doctor.hardening.test.sh  # #1989 the CLASSIFICATION invariant: every read a pass acts on answers 0/1/3, so a failed read never arrives as evidence (a kill is verified before it is counted, an unparseable process table or a DECREASING cpu reading is cannot-verify, an unreadable attestation never reads as "nothing to land", a bound-killed rail is not a refusal, a failed hygiene action is not a clean row, `--dry-run` keeps the WORSE verdict, and a role row's recorded rc reaches `status`'s exit status)
+run_shard scripts/orchestrator-harness/cloud-cell-doctor.hygiene.test.sh    # #2573 the DISK-RECLAIM contract, in BOTH directions in one fixture: a stale `cloud-cell-<pid>.<rand>` dir (dead pid + past the idle floor) is reaped and a LIVE one, a no-pid one and a fresh one are LEFT with their reasons; `docker image prune -af`/`volume prune -f` run and `system prune` never does; an abandoned checkout is reclaimed while an unpushed commit and a dirty tree are preserved (driven through the SHIPPED reaper on real git); the cache sweep excludes the root a live cwd census HOLDS and still sweeps the idle ones (a live worker no longer suppresses every root), an unreadable census is cannot-verify/3, and every pass reports a signed `df` BEFORE → AFTER delta instead of a `du` sum
 run_shard scripts/cloud-cell-bringup.test.sh                               # #1718 the pushed gh token must not outlive the bring-up, on ANY exit
 run_shard scripts/orchestrator-harness/refresh-scout.test.sh               # #1736 a cell on a non-Python repo must provision dispatch (or refuse loudly), never merge-only-and-silent; #2094 a peer-held candidate is counted WITHHELD *and* (the #1729 half, same verdict arm) written to the collision ledger in the SAME pass — the one assertion a merge resolution that keeps either side alone cannot pass
 run_shard scripts/orchestrator-harness/refresh-quota.test.sh               # #2022/#1736 follow-up + #1984/#2050 (the SAME shard, listed once — two lanes added it and the duplication was a lane-parity red): the refresh pass's per-pass API spend is BOUNDED — the board cache is enabled under the TOOL's seam (ONE rebuild per pass, not one per candidate), a starved pass judges FEWER candidates rather than none and still queues work, and a pass that can buy nothing NAMES the budget and refuses TRANSIENTLY (rc=1) instead of reporting an empty backlog — a budget that cannot buy one candidate refuses by name, and the refusal sits AFTER the `dispatched.txt` reaper, so a broke box still prunes its blacklist first (#2049/#1729 reconciled); an UNREADABLE budget is reported, not assumed (hermetic: stub gh, stub pre-flight, and a SCRIPTED core budget — no clock is faked, and this shard does NOT drive the board-cache TTL: `COLLISION_PREFLIGHT_BOARD_CACHE_TTL` expiry is reported, never exercised)
@@ -309,6 +364,7 @@ run_shard tests/gh-shim/run.sh                                             # #98
 run_shard tests/admin-merge-evidence-contract/run.sh                       # #1388 the ONE certificate contract, pinned against a REAL captured evidence comment rather than a hand-written fixture (bcbb7df renamed the producer's residual clause and BOTH gates kept requiring the old name — six days of fleet-wide refusals with every suite green). ⛔ MOVED HERE from ci.yml's `admin-merge` job by agent-infra#2439: the suite was the ONLY step there that was not already a shard, so folding it is what let that job go — and, unlike the job, this list runs in BOTH lanes, so the post-merge lane now runs it too (it previously ran at PR time only)
 run_shard tests/pipeline-compliance-fetch-stderr/run.sh                    # #1876 in the FETCH path: a warning on a SUCCESSFUL gh call is SURFACED, never parsed (stderr merged into the --jq stream turned it into "invalid character ... looking for beginning of value") and a FAILED call reports BLOCKED-BY-TOOLING, never a policy failure. Mutation included: the stderr-merged variant must fail
 run_shard tests/pi-shim/run.sh                                             # #1884 the SPAWN-POINT load gate: a caller that sources nothing is refused anyway (also driven end-to-end by the two pi-bootstrap installer suites above)
+run_shard scripts/orchestrator-harness/merge-reminder.test.sh              # #2603 the merge reminder's ACTUATOR ARM is gated on EVIDENCE: an attested-at-head + quiet + unclaimed + idle surface DISPATCHES `admin-merge.sh`, and every single gate failure refuses BY NAME (stale record, reds=0/in-flight=3, claim held, rail running) — plus the grouping rule (a re-run to success is not red; a same-named job in ANOTHER workflow cannot mask a red), the deploy arm's artifact-verified restart, `rate_limit` read FIRST with a thin budget spending nothing else, and two MUTANTS proving the gates are live (hermetic: stub gh/ps/rail, a real git claim ref)
 run_shard tests/search-cost/run.sh                                         # #1069 fleet search cost (also a per-PR job in ci.yml)
 run_shard tests/git-fixture-host-neutral/run.sh                           # agent-infra#2581: a fixture's verdict must not be a function of the BOX. main's own post-merge leg was red (check-run 120643122366) with two `FAILED extensions/…` annotations while both suites were green wherever the box's EFFECTIVE git config supplied `init.defaultBranch=main` — both built an EMPTY bare origin and cloned it, so the clone's branch came from that config (`master` when unset ⇒ `git push origin main` dies on `error: src refspec main does not match any`), and WHICH channel supplies it differs per suite (one reads the global `~/.gitconfig`, the other replaces HOME so only the system/ambient channel reaches it). The fixtures now name their own branch (`init --bare -b main`); this shard runs those suites with every ambient git-config source neutralised, plus two anti-vacuity arms (the child must provably read NO global config, failing with the actual `fatal:` message when the seam breaks; and an empty bare created with `-b main` must clone onto `main` in that environment). ⛔ In this list — not in a workflow step — because ci.yml/node-ci.yml/ci-main.yml are BYTE-LOCKED (scripts/check-workflow-lock.mjs) and a ci-main line would only run POST-MERGE, after the damage
 run_shard tests/beat-pair/run.sh                                           # #7957 H3 the recap/beat pair is BOUND, not merely written twice: a fresh recap beside a stale beat must SUPPRESS the act clause, never publish the previous tick's number (hermetic)
@@ -374,13 +430,18 @@ fi
 sentinel_sweep="$(mktemp)"
 printf 'if then\n' >"$sentinel_sweep"
 before_sweep_err=$shard_errors
+before_sweep_errors=$sweep_errors
 sweep_file "$sentinel_sweep"
 rm -f "$sentinel_sweep"
 if [ "$shard_errors" -ne $((before_sweep_err + 1)) ]; then
   echo "❌ the sweep arm is broken — a file with a syntax error would not fail this run"
   exit 1
 fi
+# Both counters are restored to their PRE-sentinel values (not decremented): a decrement silently
+# assumes the sentinel incremented, and this file's whole discipline is that an assumption about a
+# counter is what a refactor invalidates.
 shard_errors=$before_sweep_err
+sweep_errors=$before_sweep_errors
 swept=$((swept - 1))
 
 # Runtime self-check 3: the FAILURE-RECORDING arm must still be wired. Without this, a rewrite
@@ -406,6 +467,26 @@ shard_listed=$before_listed
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
+  # The recap (#2643). Three shapes, each REPORTED from what was counted — never inferred from what is
+  # absent: a failing shard is named; a failing syntax sweep named its own file at the `bash -n` line;
+  # and a failure with NEITHER means the naming arm is broken, which is a defect in this runner and must
+  # say so rather than blame a subsystem it never looked at.
+  if [ -n "$shard_failed_list" ]; then
+    echo "❌ failing shard(s): $shard_failed_list"
+    # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT. `shard_errors` counts BOTH failing shards and failing
+    # syntax sweeps; the list above names only the former. Printing "2 failed" beside one name reads as
+    # a missing name — and the missing half is exactly what the recap exists to stop hunting for.
+    if [ "$sweep_errors" -gt 0 ]; then
+      echo "❌ …and $sweep_errors of them are SYNTAX-SWEEP failures, not shards — each named at its own 'bash -n' line"
+    fi
+  elif [ "$sweep_errors" -eq "$shard_errors" ] && [ "$sweep_errors" -gt 0 ]; then
+    echo "❌ every failure above is a syntax-sweep failure, named at its own 'bash -n' line"
+  else
+    # Mixed AND unnamed: a broken naming arm alongside a failing sweep. Do NOT claim the sweep caused
+    # everything — measure it. (Final review: this branch used to say "every failure above is a
+    # syntax-sweep failure", which sent triage to fix the sweep and lose the unnamed shard with it.)
+    echo "❌ no shard is named, and $((shard_errors - sweep_errors)) of the $shard_errors failure(s) is/are NOT a syntax sweep — the naming arm is not wired for them. This is a defect in scripts/run-bash-shards.sh, not in the shard: read the per-shard output above for the path."
+  fi
   exit 1
 fi
 if [ "$slice_count" -gt 0 ]; then
