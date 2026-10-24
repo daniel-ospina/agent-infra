@@ -258,15 +258,16 @@ def test_a_finished_workers_row_does_not_hold_a_class_slot(tmp_path, monkeypatch
     b = pr.pass_budgets(st, cap, now_epoch=now)
     assert b["fix"] == 3, "three dead workers still hold the whole fix ceiling: %r" % (b,)
     assert b["used"] == 0
-    assert (b["inflight"], b["alive"]) == (3, 0), \
-        "the pass line must be able to say `inflight=3 (alive=0)`: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (3, 0, 0), \
+        "the pass line must be able to say `inflight=3 (alive=0 unknown=0)`: %r" % (b,)
+    assert b["used"] == b["alive"] + b["unknown"], "used is alive + unknown, always"
 
     # (2) a LIVE worker consumes exactly one slot (`os.getpid()` is this test process).
     (bg / "prd-14.pid").write_text("%d\n" % os.getpid())
     st["14"] = {"action": "fix-ci", "worker": "prd-14", "at_epoch": now}
     b = pr.pass_budgets(st, cap, now_epoch=now)
     assert b["fix"] == 2, "a live worker must cost exactly one slot: %r" % (b,)
-    assert (b["inflight"], b["alive"]) == (4, 1)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (4, 1, 0)
 
     # (3) NO pid file at all => UNKNOWN => still consumes one slot. This is the FAIL-CLOSED
     # direction and it is deliberate: freeing a slot we cannot disprove is a duplicate dispatch
@@ -274,7 +275,16 @@ def test_a_finished_workers_row_does_not_hold_a_class_slot(tmp_path, monkeypatch
     st["15"] = {"action": "fix-ci", "worker": "prd-15", "at_epoch": now}
     b = pr.pass_budgets(st, cap, now_epoch=now)
     assert b["fix"] == 1, "an unreadable liveness must NOT free a slot: %r" % (b,)
-    assert (b["inflight"], b["alive"]) == (5, 2)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (5, 1, 1), \
+        "an unproven row is `unknown`, NOT `alive` -- merging them is how the self-report lies: %r" % (b,)
+
+    # (4) the arithmetic is PER CLASS: a ghost REVIEW row frees the review budget and touches
+    # nothing in the fix budget (the ceiling it holds is decided by ACTION_CLASS, not by the pass).
+    (bg / "prd-16.pid").write_text("%d\n" % dead)
+    st["16"] = {"action": "record-review", "worker": "prd-16", "at_epoch": now}
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["review"]) == (1, 12), \
+        "a dead review worker must free a REVIEW slot only: %r" % (b,)
 
 
 def test_a_repo_scoped_pid_file_is_matched_by_the_short_row_name(tmp_path, monkeypatch):
@@ -312,9 +322,14 @@ def test_a_repo_scoped_pid_file_is_matched_by_the_short_row_name(tmp_path, monke
 def test_an_unreadable_pid_file_does_not_free_a_slot(tmp_path, monkeypatch):
     """Only a pid file that is READABLE may drop a slot; garbage is not evidence of absence.
 
-    The last two entries are not padding: `os.kill` raises `OverflowError` (NOT OSError) outside the
-    platform's pid range, so a pid file holding a ten-digit number would abort the whole pass from
-    inside the counter. Unknown-and-alive is the only safe reading there, too.
+    Every entry here is a real path to a real defect, not padding:
+      * `9999999999` / `2147483648` -- `os.kill` raises `OverflowError` (NOT OSError) outside the
+        platform's pid range, so a ten-digit pid file ABORTED the whole pass from inside the
+        counter until `_read_pid` range-checked it (#2746 review);
+      * `99999` -- an UNTERMINATED number is a mid-write prefix of `999999`, i.e. a different pid;
+        the launcher's `echo` always terminates, so an unterminated file is not a verdict;
+      * the non-UTF8 byte -- a strict text read raises `UnicodeDecodeError` (a ValueError, NOT an
+        OSError), which escaped every handler and crashed the pass (#2746 review).
     """
     now = 1_000_000.0
     bg = tmp_path / "bg"
@@ -322,11 +337,67 @@ def test_an_unreadable_pid_file_does_not_free_a_slot(tmp_path, monkeypatch):
     monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
     cap = {"max_fix": 1, "max_review": 1}
     st = {"21": {"action": "fix-ci", "worker": "prd-21", "at_epoch": now}}
-    for junk in ("", "not-a-pid\n", "0\n", "9999999999\n", "2147483648\n"):
+    for junk in ("", "not-a-pid\n", "0\n", "9999999999\n", "2147483648\n", "99999",
+                 "4242\n5678\n"):
         (bg / "prd-21.pid").write_text(junk)
         b = pr.pass_budgets(st, cap, now_epoch=now)
         assert b["fix"] == 0, "pid file %r freed a slot it could not disprove: %r" % (junk, b)
-        assert (b["inflight"], b["alive"]) == (1, 1)
+        assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+    (bg / "prd-21.pid").write_bytes(b"\xff\xfe not a pid\n")
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert b["fix"] == 0, "a non-UTF8 pid file crashed or freed a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+
+
+def test_a_directory_at_the_pid_path_neither_crashes_nor_frees_the_slot(tmp_path, monkeypatch):
+    """An artifact of the wrong TYPE is unknown, not gone -- and not a hang either.
+
+    `open()` on a FIFO would block forever (no writer), which is why `_worker_pid_files` filters on
+    `isfile`; a directory is handled by the read. Both must leave the slot held.
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    (bg / "prd-31.pid").mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    st = {"31": {"action": "fix-ci", "worker": "prd-31", "at_epoch": now}}
+    b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)
+    assert b["fix"] == 0, "a directory at the pid path freed a slot: %r" % (b,)
+    assert (b["inflight"], b["alive"], b["unknown"]) == (1, 0, 1)
+
+
+def test_one_live_candidate_holds_the_slot_even_when_a_sibling_pid_file_is_dead(tmp_path, monkeypatch):
+    """MIXED CANDIDATES: the fail-closed loop must look at ALL of them (#2746 review).
+
+    A regression that made the loop "first candidate wins" would free a slot while the short-named
+    file's live pid is still running -- the duplicate-dispatch direction. Both orders are asserted,
+    because the exact-name file sorts first in `_worker_pid_files` either way.
+    """
+    now = 1_000_000.0
+    dead = _a_dead_pid()
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    st = {"2035": {"action": "fix-ci", "worker": "prd-2035", "at_epoch": now}}
+
+    (bg / "prd-2035.pid").write_text("%d\n" % dead)                  # exact name: dead
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % os.getpid())  # scoped: LIVE
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["alive"]) == (0, 1), \
+        "a LIVE sibling pid file must hold the slot even though the exact-named one is dead: %r" % (b,)
+
+    (bg / "prd-2035.pid").write_text("%d\n" % os.getpid())            # exact name: LIVE
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)       # scoped: dead
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["alive"]) == (0, 1), \
+        "…and in the other order: %r" % (b,)
+
+    # One unreadable sibling is NOT a free slot either: it could name the live worker.
+    (bg / "prd-2035.pid").write_text("not-a-pid\n")
+    (bg / "prd-agent-infra-2035.pid").write_text("%d\n" % dead)
+    b = pr.pass_budgets(st, cap, now_epoch=now)
+    assert (b["fix"], b["alive"], b["unknown"]) == (0, 0, 1), \
+        "unreadable + dead must hold the slot as UNKNOWN, never drop it: %r" % (b,)
 
 
 # ── 3. the dispatch path is the BACKGROUND one, and it is LOAD-GATED ──────────────────────

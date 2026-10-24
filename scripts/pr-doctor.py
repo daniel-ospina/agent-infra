@@ -424,7 +424,21 @@ def capacity() -> dict:
 # direction) then faithfully preserved every ghost it was written to drop. So the TRAILING NUMBER is
 # matched as well. That over-matches deliberately: another repo's LIVE worker with the same PR number
 # keeps a slot (throughput), and it never frees one (a duplicate dispatch).
-_PID_RE = re.compile(r"\s*([0-9]{1,10})\s*\Z")
+#
+# ⛔ AND THE SELF-REPORT NEEDS THREE STATES, NOT TWO (#2746 review). `alive` used to mean "not provably
+# gone", which counts a row with no `worker`, a row whose pid file was pruned, and a pid file we
+# cannot parse the same as a running process -- so a register of sixteen workerless rows printed
+# `(alive=16)` over NOTHING, which is the misread this field exists to remove, merely asserted by the
+# field itself. `_worker_state` therefore answers `alive` (positive evidence: a readable pid that is
+# running), `gone` (a readable pid that is not), or `unknown` (no usable evidence), and the pass line
+# names all three. Only `gone` frees a slot.
+#
+# ⛔ THE PID FILE MUST BE TERMINATED, for the same reason `_RC_RE` requires it of an exit code: a
+# reader landing mid-write sees the prefix of the number (`99999` of `999999`), and a pid that is
+# very likely gone would free a LIVE worker's slot -- the one direction this must never fail in. The
+# launcher writes `echo "$PID" > "$PIDF"`, which always terminates; an unterminated file is treated
+# as unreadable, i.e. `unknown`, i.e. the slot is held.
+_PID_RE = re.compile(r"[ \t]*([0-9]{1,10})[ \t]*\n\Z")
 
 
 def _pid_running(pid: int) -> bool:
@@ -441,13 +455,18 @@ def _pid_running(pid: int) -> bool:
 def _read_pid(path: str):
     """The pid in `path`, or None when the file cannot be read or does not hold a usable one.
 
-    ⛔ THE RANGE CHECK IS NOT TIDINESS: `os.kill` raises `OverflowError` (not OSError) for a pid
-    outside the platform's range, so a pid file holding a ten-digit number would escape
-    `_pid_running`'s handler and ABORT THE PASS -- a garbage artifact promoted to a crash. An
-    out-of-range number is treated like any other unreadable pid: unknown, therefore alive.
+    ⛔ `errors="replace"` AND THE RANGE CHECK ARE NOT TIDINESS -- both close a path that ABORTS THE
+    PASS on a single garbage artifact (#2746 review, measured):
+      * text mode decodes strictly, so a non-UTF8 byte raises `UnicodeDecodeError`, which is a
+        `ValueError` and NOT an `OSError` -- it escaped every handler here, escaped `pass_budgets()`,
+        and reached `main()`'s `except BaseException` as `EXIT_CRASH` with zero dispatches, for
+        every pass, until a human deleted the file;
+      * `os.kill` raises `OverflowError` (also not OSError) outside the platform's pid range, so a
+        ten-digit pid file was the same bomb one line later.
+    Both are now ordinary "unreadable" readings: unknown, therefore alive.
     """
     try:
-        with open(path) as fh:
+        with open(path, errors="replace") as fh:
             data = fh.read(64)
     except OSError:
         return None
@@ -466,10 +485,14 @@ def _worker_pid_files(worker: str) -> list:
     (`bg/*-2035.pid`, i.e. `prd-agent-infra-2035.pid`). Leading zeros are tolerated; a PREFIX is not,
     because `-20350.pid` is PR 20350 and must never answer for PR 2035.
 
+    `isfile` rather than `exists`: a directory at the pid path is handled by the read, but a FIFO is
+    not -- `open()` on one BLOCKS with no writer, which would hang the pass on an artifact instead
+    of answering about it.
+
     Nothing here decides anything: an empty list is "no evidence", not "gone".
     """
     exact = bg_path(worker, "pid")
-    paths = [exact] if os.path.exists(exact) else []
+    paths = [exact] if os.path.isfile(exact) else []
     m = re.search(r"([0-9]+)\Z", worker)
     if not m:
         return paths
@@ -483,31 +506,54 @@ def _worker_pid_files(worker: str) -> list:
         if not mm or int(mm.group(1)) != n:
             continue
         p = os.path.join(ORCH_DIR, "bg", f)
-        if p not in paths:
+        if p not in paths and os.path.isfile(p):
             paths.append(p)
     return paths
 
 
-def _worker_alive(worker) -> bool:
-    """True unless the worker's own pid file PROVES it gone. UNKNOWN always reads ALIVE.
+def _worker_state(worker) -> str:
+    """`alive` | `unknown` | `gone` for the worker a state row names -- ONE reader, three states.
 
-    `False` is returned only when at least one pid file exists AND every pid file that belongs to
-    the worker is readable AND every pid in it is gone -- i.e. the slot is released on the process
-    table's word, never on the absence of a record.
+    `gone` is returned ONLY when at least one pid file exists AND every pid file that belongs to the
+    worker is readable AND every pid in it is gone: the slot is released on the process table's word,
+    never on the absence of a record. Everything else -- no name, no pid file, a pid file we cannot
+    read or parse -- is `unknown`, and the caller holds the slot, deliberately: a dead worker counted
+    in flight costs throughput (visible, and it expires in 90 min); a live worker counted dead costs
+    a SECOND WORKER ON THE SAME PR (invisible, and two agents sharing one index and one branch is how
+    a conflict gets resolved twice). `unknown` is reported separately so the pass line can say how
+    much of `inflight` is merely unproven.
 
-    The reading is taken from `$O/bg` (`bg_path`/`ORCH_DIR`, resolved at CALL time so a test can
-    point it at a temp directory), never from `worker_status()`: that shells out to
+    The reading comes from `$O/bg` (`bg_path`/`ORCH_DIR`, resolved at CALL time so a test can point
+    it at a temp directory), never from `worker_status()`: that shells out to
     `nonblocking-dispatch.sh --status` once per row, and this is a counter over up to MAX_FIX +
     MAX_REVIEW rows inside a pass that is already spending its gh budget.
 
-    ⚠️ A RECYCLED PID READS ALIVE, and that is intended: it costs one budget slot until
+    ⚠️ A RECYCLED PID READS `alive`, and that is intended: it costs one budget slot until
     `STALE_DISPATCH_S` expires, which is the cheap error. `worker_live()` bounds the same artifact by
     the `.started` stamp because a live spawn would COLLIDE with a recycled pid; a budget slot does
     not collide with anything.
 
-    Total: it never raises. Unreadable, absent, garbage and out-of-range are all "unknown", and
-    unknown is True here.
+    Total: it never raises.
     """
+    name = str(worker or "").strip()
+    if not name:
+        return "unknown"      # a row with no worker named: no evidence at all
+    paths = _worker_pid_files(name)
+    if not paths:
+        return "unknown"      # no pid file is NOT proof of absence
+    readable = False
+    unreadable = False
+    for path in paths:
+        pid = _read_pid(path)
+        if pid is None:
+            unreadable = True     # this one proves nothing -- and must not be skipped SILENTLY
+            continue
+        readable = True
+        if _pid_running(pid):
+            return "alive"        # one live candidate is enough; over-matching is the safe direction
+    # `gone` requires EVERY candidate to be readable AND dead. An unreadable sibling is not a free
+    # slot: it could name the live worker we would then dispatch a second one alongside.
+    return "gone" if readable and not unreadable else "unknown"
     name = str(worker or "").strip()
     if not name:
         return True           # a row with no worker named: no evidence, so not gone
@@ -530,14 +576,16 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
     state row still inside STALE_DISPATCH_S **whose worker still exists** consumes one slot of its
     class. `total_override` (the CLI `--max`) is an optional extra hard ceiling on the whole pass.
 
-    ⛔ THE ROW IS NOT THE WORKER (see the block above `_worker_alive`): a row whose pid file proves
+    ⛔ THE ROW IS NOT THE WORKER (see the block above `_worker_state`): a row whose pid file proves
     the worker gone is SKIPPED, so a register full of finished workers stops refusing the machine's
     capacity. `used`/`fix`/`review` count the slots actually consumed; `inflight` is the bookkeeping
-    count (every fresh row, ghosts included) and `alive` is how many of those the process table
-    backs, so a pass can say `inflight=16 (alive=0)` -- sixteen records and nothing running --
-    instead of reading as a full machine. That field is the self-report: a counter that cannot
-    distinguish ghosts from processes drifts in the safe direction and then refuses honestly and
-    wrongly, and nothing in its own output says so.
+    count (every fresh row, ghosts included), `alive` is how many of those the process table backs,
+    and `unknown` is how many are held for lack of proof -- so a pass can say
+    `inflight=16 (alive=0 unknown=0)` (sixteen records, sixteen provably dead) or
+    `inflight=16 (alive=0 unknown=16)` (sixteen records and no evidence either way) instead of
+    reading as a full machine. That field is the self-report: a counter that cannot distinguish
+    ghosts from processes drifts in the safe direction and then refuses honestly and wrongly, and
+    nothing in its own output says so.
 
     Pure with respect to its ARGUMENTS (`now_epoch` still pins the clock, and a test can assert the
     cap without a fleet); NOT pure with respect to the filesystem, deliberately -- `$O/bg/*.pid` is
@@ -546,21 +594,26 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
     if now_epoch is None:
         now_epoch = now()
     used = {"fix": 0, "review": 0}
-    inflight = alive = 0
+    inflight = alive = unknown = 0
     for k, v in st.items():
         if k.startswith("_") or v.get("action") == "closed":
             continue
         if now_epoch - v.get("at_epoch", 0) >= STALE_DISPATCH_S:
             continue
         inflight += 1
-        if not _worker_alive(v.get("worker")):
+        state = _worker_state(v.get("worker"))
+        if state == "gone":
             continue          # the worker is PROVABLY gone: the slot is free again
-        alive += 1
+        if state == "alive":
+            alive += 1
+        else:
+            unknown += 1      # held, because nothing proves it dead -- reported, never hidden
         used[ACTION_CLASS.get(v.get("action", ""), "fix")] += 1
     out = {c: max(0, cap["max_" + c] - used[c]) for c in ("fix", "review")}
     out["used"] = used["fix"] + used["review"]
     out["inflight"] = inflight
     out["alive"] = alive
+    out["unknown"] = unknown
     out["total"] = out["fix"] + out["review"]
     if total_override is not None:
         out["total"] = min(out["total"], max(0, total_override))
@@ -2985,15 +3038,16 @@ def main() -> int:
         counts[a] = counts.get(a, 0) + 1
     for a, c in skipped.items():
         counts["skipped-" + a] = c
-    # ⛔ `inflight` IS THE BOOKKEEPING, `alive` IS THE PROCESS TABLE (agent-infra#2700 C5). Printing
-    # only the first is what made a register full of finished workers read as a saturated machine:
-    # `inflight=16 (alive=0)` names the gap on the operator's own line. `used` is the slots actually
-    # consumed -- after this fix it equals `alive`, and it is what `budget fix=N` is derived from.
-    log("pass: %d open PRs :: %s (capacity fix=%d review=%d, inflight=%d (alive=%d), "
+    # ⛔ `inflight` IS THE BOOKKEEPING, `alive`/`unknown` ARE THE EVIDENCE (agent-infra#2700 C5).
+    # Printing only the first is what made a register full of finished workers read as a saturated
+    # machine: `inflight=16 (alive=0 unknown=0)` names the gap on the operator's own line, and
+    # `unknown` keeps "I could not prove it either way" from being silently counted as a process.
+    # `used` is the slots actually consumed (= alive + unknown).
+    log("pass: %d open PRs :: %s (capacity fix=%d review=%d, inflight=%d (alive=%d unknown=%d), "
         "budget fix=%d review=%d total=%d)" %
         (len(prs), " ".join("%s=%d" % kv for kv in sorted(counts.items())),
          cap["max_fix"], cap["max_review"], budgets["inflight"], budgets["alive"],
-         budgets["fix"], budgets["review"], budgets["total"]))
+         budgets["unknown"], budgets["fix"], budgets["review"], budgets["total"]))
 
     # ⛔ NO LANE-TABLE GATE. The old path read `lane-actions.py` and dispatched only to an idle
     # lane; with the fleet busy it printed "no idle lanes -- nothing dispatched this pass" and
