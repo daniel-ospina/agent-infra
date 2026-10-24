@@ -740,15 +740,66 @@ D="$T/c2"; mkdir -p "$D/bin" "$D/O" "$D/repo/.git" "$D/repo/.worktrees/tm-7" "$D
 # now asserts the checkout's origin before ANY lane work, so a stub that answers nothing makes the
 # batch refuse 72 and every spawn/chain assertion below goes empty — a registered shard red for a
 # reason it does not test. The origin read is the module's `config --local --get remote.origin.url`;
-# `--git-common-dir` answers "./.git" and `$D/repo/.git` exists, so the post-build dir half matches.
+# `--git-dir`/`--git-common-dir` answer an ABSOLUTE path ($D/repo/.git, which exists), so the
+# post-build dir half compares equal for the worktree and its checkout.
+# ⛔ AND IT MUST MATERIALISE A **USABLE** WORKTREE (#2033, measured 2026-10-24): it used to be a
+# blind `exit 0`, which was indistinguishable from production only while nothing verified the add.
+# `dispatch-merge.sh` now provisions through `wt_provision`, whose step 4 asks the checkout itself
+# (`symbolic-ref --short HEAD` == the branch, `rev-parse --verify HEAD` resolves) — so a blind stub
+# reported "add succeeded" over a checkout that DOES NOT EXIST, the rollback ran, and every issue was
+# skipped: `#7: worktree add reported success but the checkout is not usable — skipping (no lane, no
+# chain)`. All three C2 assertions then failed on an empty `grep 'lane-7'`, for a reason they do not
+# test (measured: 195 passed, 3 failed). So the stub emulates the PRODUCTION PRECONDITION — an add
+# that creates the ref and materialises the directory, which is what makes the post-check pass for
+# the right reason — instead of turning the verification off (a verification an env var can open is
+# not a verification; same rule as the CIQ_GH seam below).
 cat > "$D/bin/git" <<GITS
 #!/bin/bash
-case "\$*" in
-  *"config --local --get remote.origin.url"*) echo "https://github.com/owner/repo.git" ;;
+# A git that behaves like a REAL successful \`worktree add\`: the directory exists afterwards, the
+# record is LISTED by \`worktree list\`, and the checkout answers the branch/HEAD queries
+# \`wt_provision\` verifies — including on a SECOND dispatch of the same issue, where a real git
+# reports the existing worktree and the lifecycle REUSES it. It ALSO answers the repo-identity reads
+# (#2762) with an absolute common dir. Everything else exits 0 quietly (this rig drives the
+# DISCLOSURE on the spawn line, not git).
+d="\$PWD"
+if [ "\${1:-}" = "-C" ]; then d="\${2:-}"; shift 2 || true; fi
+case "\${1:-}" in
+  # repo_target_assert reads the checkout's origin BEFORE any lane work (#2762/#2724).
+  config)
+    if [ "\${2:-}" = "--local" ] && [ "\${3:-}" = "--get" ] && [ "\${4:-}" = "remote.origin.url" ]; then
+      echo "https://github.com/owner/repo.git"
+    fi ;;
   # ABSOLUTE, so the post-build dir half compares equal for the worktree and its checkout.
-  *"rev-parse --git-dir"*|*"rev-parse --git-common-dir"*) echo "$D/repo/.git" ;;
+  rev-parse)
+    case "\${2:-}" in
+      --git-dir|--git-common-dir) printf '%s\n' "$D/repo/.git" ;;
+    esac ;;
+  worktree)
+    case "\${2:-}" in
+      add)
+        shift 2
+        br=""
+        if [ "\${1:-}" = "-b" ]; then br="\${2:-}"; shift 2 || true; fi
+        p="\${1:-}"
+        if [ -n "\$p" ]; then
+          mkdir -p "\$p" && printf '%s\n' "\$br" > "\$p/.emulated-branch"
+          printf '%s %s\n' "\$p" "\$br" >> "\$d/.emulated-worktrees"
+        fi
+        ;;
+      list)
+        [ -f "\$d/.emulated-worktrees" ] || exit 0
+        while read -r p br; do
+          [ -n "\$p" ] || continue
+          printf 'worktree %s\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/%s\n\n' "\$p" "\$br"
+        done < "\$d/.emulated-worktrees"
+        ;;
+    esac
+    exit 0 ;;
+  symbolic-ref)
+    [ -f "\$d/.emulated-branch" ] || exit 1
+    cat "\$d/.emulated-branch" ;;
+  *) exit 0 ;;
 esac
-exit 0
 GITS
 chmod +x "$D/bin/git"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/tmux";   chmod +x "$D/bin/tmux"
