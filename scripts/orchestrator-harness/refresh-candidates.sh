@@ -2354,7 +2354,14 @@ unusable_summary() {
 }
 unusable_cause() {    # the FIRST failure's own words, bounded so one log line stays readable
   [ -s "$UNUSABLE_LOG" ] || return 0
-  awk -F'\t' 'NF>1 && $2!="" { print $2; exit }' "$UNUSABLE_LOG" 2>/dev/null | cut -c1-320
+  # ⛔ NO `$2 != ""` FILTER (review of #2401, second round). The datum snapshot is taken on the
+  # first `record_unusable` CALL, so skipping an empty-reason row (a verdict-less run with no
+  # output; a table row whose NOTE column was omitted — a shape the parser explicitly supports)
+  # made the "first cause" a DIFFERENT record than the datum describes: measured
+  # `tool_issue=42 tool_rc=0 stderr=none` beside a #43 refusal, asserting a healthy tool where the
+  # run exited 2. Both readers must name the same first record by construction; when its reason is
+  # empty the prose cause is legitimately absent and the datum alone carries the fact.
+  awk -F'\t' 'NF>1 { print $2; exit }' "$UNUSABLE_LOG" 2>/dev/null | cut -c1-320
 }
 # ── THE DATUM: WHICH COMMAND RAN, WHAT IT RETURNED, AND ITS OWN EXIT ──────────
 # ⛔ THE CAUSE IS THE PRODUCER'S PROSE, AND PROSE IS NOT A DATUM (#2401). The refusal above names the
@@ -2539,14 +2546,18 @@ while read -r N; do
   # the same text they always did.
   PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>"$PRE_ERR_FILE")"; PRE_RC=$?
   PRE_ERR_LINE="$(grep -m1 -v '^[[:space:]]*$' "$PRE_ERR_FILE" 2>/dev/null | cut -c1-200)"
-  # ⛔ THE WHOLE STDERR IS FOLDED BACK, NOT ONLY ITS FIRST LINE (review of #2401). Folding one
-  # line kept the RECORD field short while silently changing what every existing parser sees: a
-  # producer that writes its `INCOMPLETE SURFACES` block or its `VERDICT` on stderr (or a multi-line
-  # environment explanation on the rc-3 path, which `tail -3` then quotes) lost every line after the
-  # first, so `preflight_unusable_surfaces` found nothing and the record degraded to `unknown`. The
-  # fold is bounded (`tail -40`) only so a chatty producer cannot flood the captured variable.
+  # ⛔ THE WHOLE STDERR IS FOLDED BACK, NOT A BOUNDED SLICE (review of #2401, second round). The
+  # first attempt kept only the FIRST line; the second kept `tail -40`. Both are NARROWINGS relative
+  # to the `2>&1` this replaces, and `tail -40` is the dangerous one: a producer that writes its
+  # report to stderr and then >40 more lines loses its VERDICT line, falls out of the INCOMPLETE arm
+  # (which deliberately neither strikes nor clears) into the verdict-less arm — which INCREMENTS
+  # `retry-<N>` and, at RETRY_MAX, permanently appends the issue to `checked.txt`. That is the
+  # silent, invisible suppression #1716 removed, reachable by a CHATTY producer. Measured on the
+  # same fixture: `origin/main` -> `unusable=issue-assignee-holder:1`, never retired; `tail -40` ->
+  # `unusable=preflight-no-verdict:1`, `pretry=1`. A `cat` is exact parity with the old surface and
+  # adds no flood risk the old code did not already have.
   if [ -s "$PRE_ERR_FILE" ]; then
-    PRE="$PRE"$'\n'"$(tail -40 "$PRE_ERR_FILE" 2>/dev/null)"
+    PRE="$PRE"$'\n'"$(cat "$PRE_ERR_FILE" 2>/dev/null)"
   fi
   # ⛔ A tool that REFUSED TO RUN is a PROVISIONING failure, not a per-issue "no verdict". The
   # pre-flight's EXIT_USAGE (3) is how it reports an unusable environment — most importantly its

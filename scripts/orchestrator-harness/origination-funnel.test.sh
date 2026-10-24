@@ -287,11 +287,14 @@ if n == $fail_n:
     print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
     sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\\n")
     sys.exit(2)
-# ⛔ THE SECOND CANDIDATE ALSO RECORDS UNUSABLE, AND WITH A DIFFERENT DATUM ON PURPOSE (review of
-# #2401, R2). A verdict-less run (no VERDICT line, rc 0) exercises `record_unusable`'s
-# `preflight-no-verdict` arm, so "re-snapshot on every record" is graded: it would leave
-# `tool_rc=0`/`tool_issue=<this one>` beside the FIRST candidate's refusal. A degraded CLEAN would
-# NOT grade that — it bumps `V_UNJUDGED` without recording anything (mutation-proved green).
+# THE SECOND CANDIDATE ALSO RECORDS UNUSABLE, AND WITH A DIFFERENT DATUM ON PURPOSE (review of
+# #2401, R2). A verdict-less run (no VERDICT line, rc 0) exercises the record_unusable arm that
+# names 'preflight-no-verdict', so "re-snapshot on every record" is graded: it would leave
+# tool_rc=0 / tool_issue=<this one> beside the FIRST candidate's refusal. A degraded CLEAN would
+# NOT grade that - it bumps V_UNJUDGED without recording anything (mutation-proved green).
+# WARNING: NO BACKTICKS IN THIS BODY. The heredoc is UNQUOTED (it interpolates fail_n), so a
+# backticked span here is executed by the SHELL on every suite run - measured: five
+# 'command not found' lines on stderr while the suite still exited 0 (review of #2401).
 sys.exit(0)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
@@ -320,6 +323,50 @@ sys.exit(2)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 }
+# mk_tool_stderr_chatty <dir> — the whole report on stderr FOLLOWED BY 60 more stderr lines. This is
+# the #1716-class hazard a bounded fold introduced (review of #2401, second round): with `tail -40`
+# the report is dropped, the run falls out of the INCOMPLETE arm into the verdict-less one, and that
+# arm INCREMENTS `retry-<N>` — at RETRY_MAX a still-valid issue is appended to `checked.txt` and
+# suppressed forever, with the log reading "marked checked after 3 verdict-less attempts".
+mk_tool_stderr_chatty() {
+  local d="$1"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read")
+out = sys.stderr
+out.write("issue assignee/holder           INCOMPLETE  0     " + why + "\n")
+out.write("INCOMPLETE SURFACES\n")
+out.write("  [issue assignee/holder] " + why + "\n")
+out.write("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)\n")
+for i in range(60):
+    out.write("noise line %d\n" % i)
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+# mk_tool_silent_then_surface <dir> <fail-n> — the FIRST candidate is silent (rc 0, no output, so its
+# record's REASON is empty) and the SECOND fails on a surface. The datum and the "first cause" must
+# name the SAME record — the first one (review of #2401, second round): otherwise the record says
+# `tool_rc=0` beside a refusal, i.e. a healthy tool next to a failure.
+mk_tool_silent_then_surface() {
+  local d="$1" fail_n="$2"
+  cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<PY
+#!/usr/bin/env python3
+import sys
+n = int(sys.argv[1])
+if n == $fail_n:
+    sys.exit(0)          # silent: no VERDICT, no output
+why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read")
+print("issue assignee/holder           INCOMPLETE  0     " + why)
+print("INCOMPLETE SURFACES")
+print("  [issue assignee/holder] " + why)
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+sys.exit(2)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+
 # mk_tool_clean <dir> — a CLEAN verdict that also RECORDS the GH_REPO it ran under ($GHRELOG), the
 # only way to prove the pin reached the child — and, when `$TOMBREC`/`$TOMBLOG` are set, the state of the
 # outcome record AT THE MOMENT IT RUNS. That snapshot is how the tombstone is proved to be written
@@ -480,6 +527,33 @@ esac
 case "$(rec "$D" why)" in
   *"issue-assignee-holder"*) ok "stderr-report: and it reaches the persisted cause" ;;
   *) bad "stderr-report: the cause names no surface — '$(rec "$D" why)'" ;;
+esac
+
+# ── 1g) A CHATTY PRODUCER MUST NOT LOSE ITS VERDICT (#1716's class) ────────────
+# The fold must be PARITY with the `2>&1` it replaces, not a narrower slice: a bounded `tail -40`
+# drops the report of a producer that writes more than 40 stderr lines AFTER it, and the verdict-less
+# arm that follows INCREMENTS `retry-<N>` — the silent permanent suppression #1716 removed.
+mk_case fail-stderr-chatty 42
+mk_tool_stderr_chatty "$D"
+rf "$D"
+case "$(rec "$D" unusable)" in
+  *"issue-assignee-holder"*) ok "chatty: the report survives 60 trailing stderr lines" ;;
+  *) bad "chatty: a bounded fold lost the report — unusable='$(rec "$D" unusable)' (this is the #1716 retry/checked.txt path)" ;;
+esac
+[ -e "$D/o/state/pretry-42" ] \
+  && bad "chatty: the run fell into the verdict-less arm and INCREMENTED pretry-42 (it would be retired after RETRY_MAX)" \
+  || ok "chatty: and it never reaches the verdict-less arm that retires an issue"
+
+# ── 1h) THE DATUM AND THE FIRST CAUSE NAME THE SAME RECORD ─────────────────────
+mk_case fail-silent-first 42 43
+mk_tool_silent_then_surface "$D" 42
+rf "$D"
+[ "$(rec "$D" tool_issue)" = "42" ] \
+  && ok "same-record: the datum names the FIRST record (#42)" \
+  || bad "same-record: tool_issue='$(rec "$D" tool_issue)' (want 42)"
+case "$(rec "$D" why)" in
+  *"claim gate"*) bad "same-record: the first cause is #43's prose while the datum is #42's — the record contradicts itself" ;;
+  *) ok "same-record: and the first cause does not quote a LATER record" ;;
 esac
 
 # ── 1f) AND THE DATUM DOES NOT DISPLACE ITS PRE-EXISTING VOCABULARY ─────────────
