@@ -862,7 +862,7 @@ fi
 # The installer is driven from a STAGE copy so it cannot reach this checkout's neighbours, and so
 # the only scripts its `bash -n` sweep sees are the ones under test.
 STAGE="$T/stage"; mkdir -p "$STAGE"
-cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$STAGE/" 2>/dev/null
+cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$HARNESS/merge-reminder.py" "$STAGE/" 2>/dev/null
 SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin" \
   "$SHOME/.pi/agent/scripts"
 # install.sh probes the real binaries: gh (network), tmux, pi, uv.
