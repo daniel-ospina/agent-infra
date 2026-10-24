@@ -3644,7 +3644,7 @@ await test("#1770.2 a GATED step: 1 named park, coalesced repeats, then SEQUENCE
     });
     equal(logs.length, 0, "a post-verdict window logs nothing");
     equal(auditEntries.length, rowsBefore, "a post-verdict window writes nothing");
-    equal(timerCbs.length, timersBefore, "a post-verdict window does not re-arm");
+    equal(timerCbs.length, timersBefore + 1, "a post-verdict window re-arms (so a host that swallows process.exit is never left with no watchdog) but produces nothing");
     equal(linesBefore, 5, "(line count unchanged by the 4th window)");
     equal(shutdowns, 0, "shutdown is only attempted on the real (non-test) exit path");
   } finally { auditRelease(); }
@@ -4240,6 +4240,30 @@ await test("#1770.23 INTERACTIVE parity with main: pop for every machine gate, p
     { name: "checkpoint (WARN)", steps: [makeStep({ name: "c", gate: "checkpoint", token_phase: "implement" })], mode: "warn", park: false, pop: false },
     { name: "checkpoint (gate, stalled)", steps: [makeStep({ name: "c", gate: "checkpoint", token_phase: "implement" })], mode: "gate", park: true, pop: false },
   ];
+  // ⛔ MULTI-FRAME ordering (final review of cycle 9): main resolved a checkpoint
+  // ANYWHERE on the stack before popping, so a checkpoint below another gate frame
+  // is PARKED, never popped — the frame above it may be a step a person owns.
+  const stackCases: Array<{ name: string; below: Step; above: Step; park: boolean }> = [
+    { name: "checkpoint below human_approval", below: makeStep({ name: "c", gate: "checkpoint", token_phase: "implement" }), above: makeStep({ name: "h", gate: "human_approval" }), park: true },
+    { name: "checkpoint below verifier", below: makeStep({ name: "c", gate: "checkpoint", token_phase: "implement" }), above: makeStep({ name: "v", gate: "verifier" }), park: true },
+  ];
+  for (const c of stackCases) {
+    _resetStateForTest();
+    auditCapture();
+    _pushSkillForTest("/repo/skills/below/SKILL.md", [c.below], 0);
+    _pushSkillForTest("/repo/skills/above/SKILL.md", [c.above], 0);
+    _stackForTest()[0]!.stepStartedAt = Date.now() - 60 * 60 * 1000;
+    const depthBefore = _stackForTest().length;
+    await withEnv({ PI_MODE: undefined, AGENT_SEQUENCE_MODE: "gate" }, () => {
+      captureStart();
+      try { handleSequenceTimeout(); } finally { captureStop(); }
+    });
+    equal(auditEntries.filter((e) => e.event === "checkpoint_block_recovery").length, c.park ? 1 : 0, `${c.name}: the checkpoint below is parked (main's behaviour)`);
+    equal(_stackForTest().length, depthBefore, `${c.name}: NOTHING is popped from a stack containing a checkpoint`);
+    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, `${c.name}: never bounded`);
+    equal(_exitRequestsForTest().length, 0, `${c.name}: never an exit`);
+    auditRelease();
+  }
   for (const c of cases) {
     _resetStateForTest();
     auditCapture();

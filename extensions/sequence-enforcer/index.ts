@@ -676,14 +676,17 @@ export function handleSequenceTimeout(
   // popping at a human gate (main popped). Docs claim "unchanged"; this makes it
   // true.
   if (!print) {
-    if (stall.kind === "checkpoint") {
-      // Exactly main's condition: a checkpoint is parked only when the session is
-      // NOT warn and the step has actually stalled on the wall clock. (A VGATE
-      // reviewer of cycle 8 found this revision parked an interactive WARN
-      // checkpoint, which main did not — a divergence with no gating effect, but
-      // "unchanged" has to mean unchanged.)
-      if (mode !== "warn" && Date.now() - owner.stepStartedAt > WALL_CLOCK_STALL_MS) {
-        parkCheckpoint(owner, "checkpoint stall (sequence timeout)");
+    // ⛔ EXACTLY main's interactive logic (final review of cycle 9, blocker): the
+    // checkpoint is resolved with `findCheckpointGateOwner()` — ANYWHERE on the
+    // stack — BEFORE the pop, and a stack containing a checkpoint is never popped.
+    // Resolving the owner with the walk instead popped the TOP frame of a
+    // checkpoint+human / checkpoint+verifier stack, discarding a frame whose step a
+    // person owns and losing the checkpoint's read→pop protection.
+    const ckpt = findCheckpointGateOwner();
+    if (ckpt) {
+      const ckptStep = ckpt.steps[ckpt.stepIndex];
+      if (ckptStep?.gate === "checkpoint" && mode !== "warn" && Date.now() - ckpt.stepStartedAt > WALL_CLOCK_STALL_MS) {
+        parkCheckpoint(ckpt, "checkpoint stall (sequence timeout)");
       }
       sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
       return;
@@ -730,7 +733,15 @@ export function handleSequenceTimeout(
     }
   }
   // ── print mode, gated owner: bounded, coalesced, NAMED ──
-  if (unsatisfiableKeys.has(stallKey(owner))) return; // one verdict per stall — never re-arm, never repeat
+  if (unsatisfiableKeys.has(stallKey(owner))) {
+    // One verdict per stall. Re-arm anyway (final review of cycle 9, P3): in
+    // production the process exits within ~250 ms so this timer dies with it, but
+    // under a host that intercepts process.exit (or the NODE_ENV=test seam) the
+    // session continues and would otherwise be left with NO watchdog at all.
+    // Every later fire no-ops through this same guard.
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
+  }
   const parks = bumpParkStreak(owner);
   const { cause, remedy } = parkDiagnosis(ownerStep, mode);
   if (!parkAnnounced.has(stallKey(owner))) {
