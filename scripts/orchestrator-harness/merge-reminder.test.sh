@@ -21,7 +21,9 @@
 #       and a red job in workflow A is NOT masked by a green job of the SAME NAME in workflow B
 #       (the group key carries the workflow — #4877's conflation);
 #   §14 the DEPLOY arm: a drifted box with a role pass mid-flight REFUSES(roles=busy); with no pass
-#       mid-flight it dispatches the box's OWN activation verb and VERIFIES it by artifact;
+#       mid-flight it dispatches the box's OWN activation verb and VERIFIES it by artifact; PLUS the
+#       refusals a review reconstructed — `--no-act` (both arms), an unreadable `origin/main`, a
+#       STOPPED controller, a live landing attempt elsewhere on the box, and `source=stamp`;
 #   §15 NON-VACUITY: two MUTANTS of a copy of the shipped script — removing the claim gate, and
 #       removing the in-flight gate — must make §5 and §3 go RED respectively;
 #   §16 `box-status.sh` — the deploy arm's EVIDENCE — is driven directly: a pin at main reads
@@ -34,6 +36,13 @@
 #       RAIL'S OWN rc — a spawn is never assumed to be a success;
 #   §19 the local activation verb is PER PLATFORM: darwin ⇒ none (the cell supervisor refuses
 #       there, so a "restart" would be invented), linux ⇒ stop → apply → start.
+#   §20 the gates a REVIEW of the first version reconstructed: a DEAD-pid landing lock is REAPED (a
+#       stale flag, not a fence) while a live rail still refuses; an EXPIRED claim lease is free
+#       (claims.sh's contract); a page-truncated check surface is UNREADABLE, never reds=0; legacy
+#       statuses are ordered by TIME in both payload directions (and an undateable one is
+#       UNREADABLE); a record bound to another repo is not a record for this one;
+#   §21 the crontab arm (a box with no systemd): install VERIFIES the entry exists, the entry is
+#       quoted, and `--uninstall-timer` REMOVES it — the arm install can create.
 #
 # HERMETIC: no network, no real gh, no real rail, no real scheduler. `gh`, `ps`, the rail and the
 # box probe are stubs on PATH / in a fixture; the CLAIM gate is driven against a REAL git repo with
@@ -185,6 +194,13 @@ run_sut() { # extra args…
       --rail-wait-s 5 --verify-deploy-s 3 --retry-s 900 "$@"
 }
 reset_o() { rm -f "$O/state/mergeclaim-"*.lock "$O/state/merge-reminder.attempts"; }
+# A landing that REFUSES (its record is bound to an OLDER head), so the deploy arm is reached: a
+# dispatch in the same cycle defers that arm by design, which would hide the deploy gates under test.
+write_no_landing() {
+  write_baseline
+  printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-10-22T04:10:00Z"}\n' \
+    "$OTHER" "$SLUG" > "$REV/${SLUG//\//-}-42.json"
+}
 
 # ═══ §1 attested + quiet ⇒ DISPATCHES ═════════════════════════════════════════════════════════════
 echo "-- §1 attested at head + quiet surface"
@@ -242,7 +258,7 @@ ck "§4 NOTHING was dispatched" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || ech
 # ═══ §5 a held cross-box landing claim ═══════════════════════════════════════════════════════════
 echo "-- §5 claim held"
 write_baseline; reset_o
-printf 'owner=cell-2 lease_until=1893456000\n' > "$TMP/claimmsg"
+printf 'claim owner=cell-2 lease_until=1893456000 nonce=cafe\n' > "$TMP/claimmsg"
 CLAIM_SHA="$(git -C "$REPO_SRC" commit-tree -m "$(cat "$TMP/claimmsg")" "$(git -C "$REPO_SRC" rev-parse HEAD^{tree})")"
 git -C "$REPO_SRC" push --quiet origin "$CLAIM_SHA:refs/claims/pr-42" 2>/dev/null
 ck "§5 the fixture claim ref exists on origin" "$(git -C "$REPO_SRC" ls-remote --refs origin refs/claims/pr-42 | grep -q pr-42 && echo 0 || echo 1)"
@@ -378,16 +394,74 @@ out="$(run_sut --no-act)"; rc=$?
 ck "§14a a role pass mid-flight REFUSES the restart" "$(qF 'REFUSE(roles=busy:merge(pid=99,age=4s))' "$out" && echo 0 || echo 1)"
 ck "§14a the activation verb did NOT run" "$([ ! -e "$FX/activate.txt" ] && echo 0 || echo 1)"
 
+# ⛔ --no-act is the mode a human uses to INSPECT this file, so it must disarm BOTH arms. It once
+# armed the deploy arm: an "inspect first" run restarted the controller — the most disruptive action
+# in the file — and still reported VERIFIED. (A reviewer reconstructed it; the suite had asserted it.)
 write_baseline; reset_o
 printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING(pid 1)\nroles: idle\n' > "$FX/box.txt"
 out="$(run_sut --no-act)"; rc=$?
-ck "§14b the activation verb WAS dispatched" "$(qF 'activate-ran' "$(cat "$FX/activate.txt" 2>/dev/null)" && echo 0 || echo 1)"
-ck "§14b and VERIFIED by artifact (not by its exit code)" "$(qF "deploy: local=VERIFIED harness=$MAIN12 [current] controller=RUNNING" "$out" && echo 0 || echo 1)"
+ck "§14b --no-act does NOT activate the box (reminder-only covers both arms)" \
+   "$([ ! -e "$FX/activate.txt" ] && echo 0 || echo 1)"
+ck "§14b and it SAYS so, with the drift visible" \
+   "$(qF 'activate=skipped(--no-act' "$out" && qF 'DRIFTED' "$out" && echo 0 || echo 1)"
 
+# ...and with the arm ARMED (the default), the same box is activated and VERIFIED by artifact.
+write_no_landing; reset_o
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING(pid 1)\nroles: idle\n' > "$FX/box.txt"
+out="$(run_sut)"; rc=$?
+ck "§14c an ARMED cycle dispatches the box's OWN activation verb" \
+   "$(qF 'activate-ran' "$(cat "$FX/activate.txt" 2>/dev/null)" && echo 0 || echo 1)"
+ck "§14c and VERIFIES it by artifact, not by the command's exit code" \
+   "$(qF "deploy: local=VERIFIED harness=$MAIN12 [current] controller=RUNNING" "$out" && echo 0 || echo 1)"
+
+# A landing dispatched THIS cycle defers the restart: never instead of it, and never under it.
 write_baseline; reset_o
 printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING(pid 1)\nroles: idle\n' > "$FX/box.txt"
-out="$(run_sut)" >/dev/null; rc=$?
-ck "§14c a DISPATCHED LANDING defers the restart (never instead of it)" "$(grep -q 'activate-ran' "$FX/activate.txt" 2>/dev/null && echo 1 || echo 0)"
+out="$(run_sut)"; rc=$?
+ck "§14d a DISPATCHED LANDING defers the restart (never instead of it)" \
+   "$(grep -q 'activate-ran' "$FX/activate.txt" 2>/dev/null && echo 1 || echo 0)"
+
+# ...and so does a landing attempt another cycle started: `--interval` (600s) < `--rail-wait-s`
+# (900s), so overlapping cycles are reachable by construction.
+write_no_landing; reset_o
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING(pid 1)\nroles: idle\n' > "$FX/box.txt"
+printf '%s bash /tmp/h/admin-merge.sh 7 --repo %s\n' 4242 "$SLUG" > "$FX/ps.txt"
+out="$(run_sut)"; rc=$?
+ck "§14e a landing attempt LIVE on the box defers the restart" \
+   "$([ ! -e "$FX/activate.txt" ] && qF 'a landing attempt is live: admin-merge.sh pid=4242' "$out" && echo 0 || echo 1)"
+
+# An operator's stop is INTENT: `stop -> apply -> start` on a stopped cell would resurrect it.
+write_no_landing; reset_o
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: STOPPED\nroles: idle\n' > "$FX/box.txt"
+out="$(run_sut)"; rc=$?
+ck "§14f a STOPPED cell is not started behind the operator's back" \
+   "$([ ! -e "$FX/activate.txt" ] && qF 'activate=skipped(controller=STOPPED' "$out" && echo 0 || echo 1)"
+
+# The stamp records what was SEEDED; harness-refresh.sh states it does not prove what is RUNNING.
+# With the comparison agreeing, the honest reading is UNPROVEN — not `current`, and no activation.
+write_baseline; reset_o
+printf 'harness: %s [current] source=stamp\nstamp: %s    pin: EMPTY\ncontroller: RUNNING(pid 1)\nroles: idle\n' \
+  "$MAIN12" "$MAIN12" > "$FX/box.txt"
+out="$(run_sut)"; rc=$?
+ck "§14g a stamp-sourced identity is UNPROVEN, not a fabricated 'current'" \
+   "$(qF 'UNPROVEN' "$out" && qF 'source=stamp' "$out" && echo 0 || echo 1)"
+ck "§14g and it activates nothing" "$([ ! -e "$FX/activate.txt" ] && echo 0 || echo 1)"
+
+# An UNREADABLE origin/main licenses NOTHING: with an empty main every box reads as drifted, and the
+# verify loop would compare against the same empty value and never pass — a restart every cycle.
+ck "§14h an unreadable origin/main refuses the deploy arm instead of restarting the fleet" \
+   "$(python3 - "$SUT" "$O" <<'PYMOD'
+import importlib.util, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+o = Path(sys.argv[2])
+got = m.deploy_arm(o, "", False, 1, False, True)
+ok = (len(got) == 1 and got[0]["box"] == "<origin/main>"
+      and "UNREADABLE origin/main" in got[0]["verdict"])
+print(0 if ok else 1)
+PYMOD
+)"
 
 # ═══ §15 NON-VACUITY: the gates are what refuses, not a coincidence ═════════════════════════════
 echo "-- §15 mutation controls"
@@ -581,6 +655,126 @@ print(0 if ok else 1)
 PYMOD
 )"
 rm -f "$O/cloud-cell-supervisor.sh"
+
+# ═══ §20 the gates a REVIEW reconstructed, each one now pinned by a case ════════════════════════
+# A reviewer of the first version of this file built each of these from the code. They are kept here
+# as behaviour, because a gate nothing exercises is a gate that regresses silently.
+
+echo "-- §20a a DEAD-pid landing lock is a stale flag, not a permanent fence"
+# The lock is written by a 10-minute timer: a SIGKILL leaves it holding a pid nobody owns. Refusing on
+# it forever is the stale-flag class the fleet ruled is ours to fix (#8175) — so the arm reaps it,
+# and ONLY because the pid is provably dead and no landing attempt is live.
+write_baseline; reset_o
+printf '99999999\n' > "$O/state/mergeclaim-42.lock"
+out="$(run_sut)"; rc=$?
+ck "§20a the dead lock was reaped and the rail dispatched" \
+   "$(qF 'GO dispatched' "$out" && grep -qxF "42 --repo $SLUG" "$FX/rail-argv.txt" 2>/dev/null && echo 0 || echo 1)"
+
+echo "-- §20b a dead lock WITH a live rail is still rail=running (never a takeover)"
+write_baseline; reset_o
+printf '99999999\n' > "$O/state/mergeclaim-42.lock"
+printf '%s bash /tmp/h/admin-merge.sh 42 --repo %s\n' 777 "$SLUG" > "$FX/ps.txt"
+out="$(run_sut)"; rc=$?
+ck "§20b refusal names the LIVE rail, not the dead lock" \
+   "$(qF 'REFUSE(rail=running pid=777)' "$out" && echo 0 || echo 1)"
+ck "§20b nothing was dispatched" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+echo "-- §20c an EXPIRED cross-box claim is FREE (claims.sh's lease contract)"
+write_baseline; reset_o
+git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
+printf 'claim owner=cell-2 lease_until=1577836800 nonce=deadbeef\n' > "$TMP/claimmsg-old"
+OLD_SHA="$(git -C "$REPO_SRC" commit-tree -m "$(cat "$TMP/claimmsg-old")" "$(git -C "$REPO_SRC" rev-parse HEAD^{tree})")"
+git -C "$REPO_SRC" push --quiet origin "$OLD_SHA:refs/claims/pr-42" 2>/dev/null
+out="$(run_sut --json)"; rc=$?
+ck "§20c the reading says claim=none and names the expired lease" \
+   "$(qF 'claim=none' "$out" && qF 'expired claim refs/claims/pr-42' "$out" && echo 0 || echo 1)"
+ck "§20c an expired lease does not block the dispatch forever" \
+   "$(grep -qxF "42 --repo $SLUG" "$FX/rail-argv.txt" 2>/dev/null && echo 0 || echo 1)"
+git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
+
+echo "-- §20d a TRUNCATED check surface is UNREADABLE, never reds=0"
+write_baseline; reset_o
+cat > "$FX/checks.json" <<JSON
+{"total_count":150,"check_runs":[
+ {"id":101,"name":"lint","status":"completed","conclusion":"success","app":{"slug":"github-actions"},
+  "details_url":"https://github.com/$SLUG/actions/runs/9001/job/1"}]}
+JSON
+out="$(run_sut --json)"; rc=$?
+ck "§20d the page cut is DETECTED and named (150 total)" \
+   "$(qF 'REFUSE(UNREADABLE)' "$out" && qF 'of 150 entries' "$out" && echo 0 || echo 1)"
+ck "§20d nothing was dispatched from a partial read" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+echo "-- §20e legacy statuses are ordered by TIME, in both payload directions"
+# Newest entry FIRST in the array: a positional "newest last" reader keeps the OLD success and reads
+# green over a live red — which is a GO minted from a misread. The rail orders by updated_at; so here.
+write_baseline; reset_o
+cat > "$FX/status.json" <<JSON
+{"statuses":[
+ {"context":"vercel/deploy","state":"failure","created_at":"2026-10-23T05:00:00Z","updated_at":"2026-10-23T05:00:00Z"},
+ {"context":"vercel/deploy","state":"success","created_at":"2026-10-23T04:00:00Z","updated_at":"2026-10-23T04:00:00Z"}]}
+JSON
+out="$(run_sut)"; rc=$?
+ck "§20e a newer FAILURE beats an older success (red, no dispatch)" \
+   "$(qF 'REFUSE(reds=1)' "$out" && [ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+# The other direction must not manufacture a red: newer success over older failure is quiet.
+write_baseline; reset_o
+cat > "$FX/status.json" <<JSON
+{"statuses":[
+ {"context":"vercel/deploy","state":"success","created_at":"2026-10-23T05:00:00Z","updated_at":"2026-10-23T05:00:00Z"},
+ {"context":"vercel/deploy","state":"failure","created_at":"2026-10-23T04:00:00Z","updated_at":"2026-10-23T04:00:00Z"}]}
+JSON
+out="$(run_sut)"; rc=$?
+ck "§20e a newer SUCCESS beats an older failure (dispatches)" \
+   "$(qF 'GO dispatched' "$out" && echo 0 || echo 1)"
+
+echo "-- §20f a status that cannot be dated is UNREADABLE, not guessed"
+write_baseline; reset_o
+cat > "$FX/status.json" <<JSON
+{"statuses":[{"context":"vercel/deploy","state":"success"}]}
+JSON
+out="$(run_sut --json)"; rc=$?
+ck "§20f refusal names the undateable status" \
+   "$(qF 'REFUSE(UNREADABLE)' "$out" && qF 'neither updated_at nor created_at' "$out" && echo 0 || echo 1)"
+ck "§20f nothing was dispatched" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+echo "-- §20g an attestation bound to ANOTHER repo is not a record for this one"
+write_baseline; reset_o
+rm -f "$REV/${SLUG//\//-}-42.json"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"someone/else"}\n' "$HEAD" > "$REV/42.json"
+out="$(run_sut)"; rc=$?
+ck "§20g a foreign record does not satisfy the gate" \
+   "$(qF 'REFUSE(attested=none)' "$out" && [ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+# ...while the LEGACY repo-less spelling is still accepted (record-review.sh keeps those files), and
+# the head binding is what makes that safe. This is the honest residual, pinned as behaviour.
+printf '{"pr":42,"head_sha":"%s","verdict":"clean"}\n' "$HEAD" > "$REV/42.json"
+out="$(run_sut)"; rc=$?
+ck "§20g a repo-less legacy record at the LIVE head still attests (documented residual)" \
+   "$(qF 'attested@head=yes' "$out" && echo 0 || echo 1)"
+rm -f "$REV/42.json"
+
+# ═══ §21 the crontab arm: install VERIFIES, uninstall REMOVES what install can create ═══════════
+echo "-- §21 crontab timer (a box with no systemd)"
+mkdir -p "$TMP/cronbin"; : > "$FX/crontab.txt"
+cat > "$TMP/cronbin/crontab" <<'STUB'
+#!/bin/bash
+case "${1:-}" in
+  -l) /bin/cat "$FIXTURE/crontab.txt" 2>/dev/null; exit 0 ;;
+  -)  /bin/cat > "$FIXTURE/crontab.txt"; exit 0 ;;
+esac
+exit 2
+STUB
+chmod +x "$TMP/cronbin/crontab"
+H3="$TMP/home3"; mkdir -p "$H3"
+out3="$(env HOME="$H3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O" \
+        --install-timer --interval 600 2>&1)"; rc3=$?
+ck "§21 install with no systemd uses the crontab and VERIFIES it (rc=$rc3)" \
+   "$([ "$rc3" -eq 0 ] && qF 'tortoise-merge-reminder' "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+ck "§21 the entry is QUOTED (a path with a space must still run)" \
+   "$(qF "O='$O'" "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+env HOME="$H3" FIXTURE="$FX" PATH="$TMP/cronbin" "$PY3" "$SUT" --o "$O" \
+  --uninstall-timer >/dev/null 2>&1
+ck "§21 --uninstall-timer removes the crontab entry (the arm install created)" \
+   "$(grep -q 'tortoise-merge-reminder' "$FX/crontab.txt" 2>/dev/null && echo 1 || echo 0)"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

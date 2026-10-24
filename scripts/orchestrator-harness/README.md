@@ -1944,15 +1944,26 @@ these were read at the moment of action:
 ⛔ **The rail is the authority and this file never merges.** `admin-merge.sh` re-reads the surface
 with its own allow-list polarity, binds its evidence to one SHA, refuses a moved head and classifies
 main's reds by event. The reminder's check read is a COST gate — "is it worth spending a rail
-attempt?" — exactly the division of labour the cell doctor's `merge` role documents. A second
-opinion here would be the two-readers defect (#1872/#1714).
+attempt?" — and, **unlike the cell doctor's `merge` role, it reads the check surface itself**. That
+divergence is deliberate and worth stating plainly rather than dressing as precedent: the doctor
+refuses to classify checks at all ("a second opinion here is the two-readers defect", #1872/#1714),
+whereas the reminder does, because an unread surface costs a rail attempt every cycle. It is
+acceptable only because the reminder can do nothing but REFUSE — the rail re-reads everything and a
+wrong refusal dispatches nothing — and it is a **drift risk**: this classifier has to track
+`admin-merge.sh`'s grouping/polarity rule, and nothing pins the two together. It is a cost gate the
+doctor deliberately omits, not an endorsement of the doctor's division of labour.
 
 ⛔ **A stale record is not a record, and a threshold is not a gate.** `merge-one.sh` and the doctor
 take the local landing lock (`$O/state/mergeclaim-<PR>.lock`) before racing a head; the reminder
 takes the SAME lock with `O_EXCL` immediately before the spawn, so the first lander on this box wins
 and the loser refuses `rail=running`. It then WAITS (bounded, default 900 s) for the rail's own exit
-so the cycle reports the rail's rc rather than assuming its spawn was a success; past the bound it
-leaves the lock and says `still-running pid=…`, and the process scan remains the durable detector.
+so the cycle reports the rail's rc rather than assuming its spawn was a success; **past the bound it
+LEAVES the lock in place** (the fence survives the rail, which the process scan alone would not
+cover), and a later cycle reaps a DEAD-pid lock **only when no landing attempt is live** — the dead
+pid proves nobody holds the lock, not that no rail is in flight. A live pid is never reaped or taken
+over. The same re-verification applies to claims: an **expired lease is free**, exactly as
+`claims.sh`'s `_lease_is_live` defines it, because a box that died mid-review would otherwise block
+the PR forever; an unparseable lease stays LIVE (fail-closed), matching `_lease_unparseable`.
 Stated residual: two REMINDERS on two boxes with no claim held can both dispatch; the rail's
 `--match-head-commit` keeps that from landing an unanalysed head, and closing it properly means
 minting the cross-box claim — which is `merge-one.sh`'s job, not this timer's.
@@ -1966,6 +1977,21 @@ until `--verify-deploy-s` expires, else `deploy=<box>:UNVERIFIED` with the readi
 inventory (`$O/state/boxes.tsv`: `name<TAB>status-cmd<TAB>activate-cmd`), so a cell is driven through
 whatever remote path that box already uses — no new control surface is invented here.
 
+It refuses five things, each one a way an actuator becomes an incident:
+
+* **an UNREADABLE `origin/main`** — with an empty main every box reads as drifted, and the verify
+  loop compares against the same empty value and could never pass: a restart every cycle, forever;
+* **`--no-act`** — the reminder-only mode covers BOTH arms, because a controller restart is more
+  disruptive than the landing that mode already suppresses, and `--no-act` is how a human INSPECTS
+  the file before trusting it;
+* **a landing attempt live ANYWHERE on this box** — not only one this cycle dispatched. `--interval`
+  (600 s) is shorter than `--rail-wait-s` (900 s), so overlapping cycles are reachable by
+  construction and the second would restart the controller under the first one's rail. The deploy
+  arm also takes its own `state/merge-reminder-deploy.lock`, so two cycles never deploy at once;
+* **a STOPPED controller** — an absent `.desired` is the operator's intent, not drift;
+* **a `source=stamp` identity reported as `current`** — `harness-refresh.sh` states the stamp records
+  what was SEEDED, not what is RUNNING, so a matching stamp reads `UNPROVEN` and activates nothing.
+
 **Costs, and how a skipped run is never an empty one.** `GET /rate_limit` FIRST (it is unmetered),
 then at most `REST_BUDGET = 8` metered calls: one open-PR listing and three per candidate (workflow
 runs, `check-runs?filter=all`, legacy statuses) for at most TWO candidates. Under
@@ -1975,13 +2001,22 @@ exit 3) — never `nothing to do`. The same exit and the same wording cover an u
 **Timers.** `merge-reminder.py --install-timer [--interval S]` renders and LOADS the platform's own
 schedule and verifies it: launchd (`com.tortoise.merge-reminder`, `StartInterval`) on macOS, a
 systemd USER timer (`merge-reminder.timer`) on Linux, else a crontab entry — and a box with NONE of
-them exits 3 naming the remedy rather than installing nothing quietly. `--uninstall-timer` removes it.
+them exits 3 naming the remedy rather than installing nothing quietly. Every arm is verified by the
+ARTIFACT that schedules it (`launchctl print`, `systemctl is-active`, `crontab -l`) — a successful
+write is not a timer. `--uninstall-timer` removes **every** arm install can create (the unit, and
+the crontab entry on a box with no systemd) and verifies the removal, so uninstall cannot leave an
+arm firing behind a "nothing to remove".
 
-**Status: IMPLEMENTED and TESTED** (`merge-reminder.test.sh`, a CI shard in both lanes). Residual,
-named: the arm is ON by default (`--no-act` / `MERGE_REMINDER_ACT=0` for reminder-only), so a box
-that runs the timer WILL dispatch a rail on complete evidence — that is the feature, and the gate
-list above is what makes it safe; the review-record store it reads is this box's
-`~/.pi/agent/reviews`, so a peer box's verdict reaches it only through `registry-sync.sh`.
+**Status: IMPLEMENTED, TESTED for the arms this repo's CI can drive.** `merge-reminder.test.sh` is a
+shard in both lanes (§1–§21, 92 assertions) and drives the systemd and crontab paths end-to-end with
+stubbed schedulers, plus `box-status.sh`, every landing/deploy gate, and two mutation controls. The
+**launchd branch is implemented and deliberately NOT driven by the suite** — CI runs on Linux, and a
+macOS plist load cannot be faked honestly; that branch is validated by `plutil -lint` before a live
+plist is replaced, and its `bootout` is checked with `launchctl print`. Do not read "tested" as
+covering it. Residual, named: the arm is ON by default (`--no-act` / `MERGE_REMINDER_ACT=0` for
+reminder-only), so a box that runs the timer WILL dispatch a rail on complete evidence — that is the
+feature, and the gate list above is what makes it safe; the review-record store it reads is this
+box's `~/.pi/agent/reviews`, so a peer box's verdict reaches it only through `registry-sync.sh`.
 
 ---
 
