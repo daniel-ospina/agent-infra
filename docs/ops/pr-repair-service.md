@@ -69,7 +69,7 @@ class of lifetime #2402 removed for the controller and this unit removes for rep
    | `dispatched` | the dispatcher ran and returned 0 — work was placed, or the queue was genuinely empty |
    | `deferred` | the machine said not now; the reason carries the measurement (`disk-floor:3481<4096`, `load-ceiling:…`, `cap-zero`) |
    | `refusing` | a read a pass needs could not be taken, or the dispatcher itself refused (rc=2) — **never** "nothing to do" |
-   | `placed-undelivered` | the work was placed and no worker took it (pr-doctor rc=3) |
+   | `placed-undelivered` | the work was placed and no worker took it (pr-doctor rc=3) — the pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted |
    | `idle` | a `--dry-run` pass: measured and derived, dispatched nothing |
    | `skipped` | another pass held the lock, so this one attempted nothing. Written to its **own** file (`pr-repair.skip.json`) so a skipping process can never replace the lock holder's verdict; `--status` prints both |
 
@@ -113,7 +113,11 @@ bash scripts/install-repair-service.sh --status    # is-active, is-enabled, Exec
 bash scripts/install-repair-service.sh --uninstall # stop, disable, remove, verify gone
 ```
 
-`--install` verifies the farmed artifacts exist **before** the unit does, refuses when a
+`--install` verifies the farmed artifacts exist **before** the unit does, refuses an `ExecStart` under
+a **lane scratch checkout** (`.worktrees/…`, `/tmp/wt-*` — the #2697 shape: the unit dies when that lane
+is reaped, and a read-back cannot see it because the comparison is against the same variable that
+rendered it), refuses a **user-scope install without linger** (a unit that dies with the last login is
+not activation), refuses when a
 `pr-repair-loop.sh` from some other actor is already live on the box (two loops double-claim work), and
 then reads the manager back: `is-active=active` **and** `is-enabled=enabled` **and**
 `KillMode=process` **and** an `ExecStart` naming the farmed path. A mismatch is exit 1 with the observed

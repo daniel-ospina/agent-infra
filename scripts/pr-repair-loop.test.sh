@@ -32,6 +32,12 @@ INSTALLER="$HERE/install-repair-service.sh"
 PASS=0
 FAIL=0
 TMP="$(mktemp -d)" || { echo "FATAL: mktemp -d failed" >&2; exit 2; }
+# ⛔ HERMETIC AGAINST THE BOX (review of this PR): the loop falls back to `$CELL_HOME/keys.env`, sources
+# it and RE-DERIVES its tunables from it — so without this default, five arms became a function of the
+# host's own credential file (verified with a fixture that set REPAIR_DISK_FLOOR_MB). Every arm inherits
+# an EMPTY readable file; the arms that need a specific one override ENV_FILE explicitly.
+: >"$TMP/empty-keys.env"
+export ENV_FILE="$TMP/empty-keys.env"
 trap 'rm -rf "$TMP"' EXIT
 
 ok()   { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$*"; }
@@ -136,7 +142,7 @@ reason_is "dispatcher-refused"
 rm -f "$ROW"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-undeliver" \
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
-check "an UNDELIVERED dispatch is rc=0 but named" 0 "$?"
+check "an UNDELIVERED dispatch is rc=3 and named" 3 "$?"
 reason_is "no-worker-took-it"
 rm -f "$ROW" "$TMP/reap.out"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-ok" \
@@ -404,6 +410,20 @@ fi
 # an orphaned `sleep $INTERVAL_S` behind (measured before this fix: one survived every run).
 kill -TERM -- -"$LOOPPID" 2>/dev/null || kill "$LOOPPID" 2>/dev/null || true
 wait "$LOOPPID" 2>/dev/null || true
+
+# ⛔ A LANE-SCRATCH ExecStart IS REFUSED (#2697 shape, review of this PR): a unit exec'd from a lane
+# worktree dies when that worktree is reaped, and `readback` cannot see it because it compares the unit
+# against the same variable that rendered it.
+# (the fixture is the REAL shape — a linked worktree under a checkout's `.worktrees/`)
+mkdir -p "$TMP/repo/.worktrees/lane-7"
+cp "$ROOT/scripts/pr-repair-loop.sh" "$TMP/repo/.worktrees/lane-7/pr-repair-loop.sh"
+chmod +x "$TMP/repo/.worktrees/lane-7/pr-repair-loop.sh"
+env "${stub_scope[@]}" PR_REPAIR_SCRIPTS="$TMP/repo/.worktrees/lane-7" TEMPLATES_DIR="$ROOT/templates/systemd" \
+    "$INSTALLER" --dry-run >"$TMP/lanescratch.out" 2>&1
+check "an ExecStart under a lane scratch dir is REFUSED (rc≠0)" 1 "$?"
+grep -q 'LANE SCRATCH' "$TMP/lanescratch.out" \
+    && ok "the refusal names the #2697 hazard" \
+    || bad "the refusal does not name the lane-scratch hazard"
 
 echo "── the farm declares what the unit execs ──"
 for f in pr-repair-loop.sh install-repair-service.sh; do
