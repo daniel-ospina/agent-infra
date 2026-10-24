@@ -1764,7 +1764,15 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
         boxes = read_inventory(o)
     except Skipped as e:
         return [{"box": "<inventory>", "harness": "", "relation": "", "readable": False,
-                 "on_pin": False, "note": str(e)}]
+                 "on_pin": False, "reasons": [], "inventory": "unread", "note": str(e)}]
+    if not boxes:
+        # A file that EXISTS and lists no rows is its own state, not the same thing as an absent one
+        # (which falls back to THIS box). Reporting it as "no inventory and no local probe" claimed a
+        # fallback that was never taken, and `0/0 on this cycle's main` stated a comparison over
+        # nothing.
+        return [{"box": "<inventory>", "harness": "", "relation": "", "readable": False,
+                 "on_pin": False, "reasons": [], "inventory": "empty",
+                 "note": "the inventory exists and lists NO boxes"}]
     rows: list[dict] = []
     for name, status_cmd, _activate in boxes:
         # ⛔ A SUMMARY READ, BOUNDED SHORT: this probe runs BEFORE the landing decision, so an
@@ -1806,10 +1814,15 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
 
 def _drift_text(rows: list[dict]) -> str:
     if not rows:
-        return "NOT-MEASURED (no box inventory and no local probe)"
+        return "NOT-MEASURED (the box inventory was not read)"
     parts = []
     for r in rows:
-        if not r["readable"]:
+        if r.get("inventory") in ("unread", "empty"):
+            # ⛔ A PLACEHOLDER ROW IS NOT A BOX. Printing it as `UNREADABLE` beside a fraction of it
+            # ("0/1") read as one probed box that failed, so the report told the owner to deploy a box
+            # that does not exist. It says what happened instead.
+            parts.append(f"boxes.tsv={r.get('note') or 'UNREADABLE'}")
+        elif not r["readable"]:
             parts.append(f"{r['box']}=UNREADABLE")
         else:
             tag = f"{r['harness'] or '<none>'} [{r['relation'] or '?'}]"
@@ -1872,12 +1885,22 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
 
     # Only THIS box was probed, because the inventory is missing — the cells were never read.
     local_only = bool(drift) and all(r.get("inventory") == "absent" for r in drift)
+    # ⛔ A FRACTION NEEDS A COMPARISON AND REAL BOXES. No `origin/main` means nothing was compared; a
+    # placeholder row (`unread`/`empty`) means no box was probed at all, so "0/1" would invent both the
+    # numerator and the denominator.
+    compared = bool(drift) and bool(main_sha) and all(r.get("inventory") == "file" for r in drift)
+    why_not_compared = ("`origin/main` was unreadable" if not main_sha else
+                        "the box inventory could not be read" if any(
+                            r.get("inventory") == "unread" for r in drift) else
+                        "the inventory lists no boxes")
     currents = [r for r in drift if r.get("on_pin")]
     boxes_bad = [r for r in drift if not r.get("on_pin")]
     # ⛔ THE STANDING IS DECIDED BY THE DRIFT ALONE. A queue count that did not come back is its OWN
     # sub-note: folding it in here downgraded a MEASURED drift (a box provably off-pin) to
     # `NOT-MEASURED` on exactly the degraded cycles where the owner needs the drift reported.
-    if not drift:
+    if not drift or any(r.get("inventory") in ("unread", "empty") for r in drift):
+        # ⛔ A PLACEHOLDER ROW MEANS NO BOX WAS PROBED, so the honest standing is UNMEASURED — not
+        # MARKERS-BROKEN, which would name a box (`<inventory> (not verified)`) that does not exist.
         goal2 = "NOT-MEASURED"
     elif boxes_bad:
         goal2 = "MARKERS-BROKEN"
@@ -1896,8 +1919,8 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         f"PRs merged today={dm}",
         f"- **{GOALS[1][0]}** — `STANDING={goal2}`",
         "  harness: " + _drift_text(drift) +
-        (f" ({len(currents)}/{len(drift)} on this cycle's main)" if main_sha else
-         " (not compared — `origin/main` was unreadable)"),
+        (f" ({len(currents)}/{len(drift)} on this cycle's main)" if compared else
+         f" (not compared — {why_not_compared})"),
         f"  queue ({slug}): open PRs={qo} · merged today={qm}",
     ]
     if not main_sha:
@@ -1906,6 +1929,10 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
     if local_only:
         lines.append("  ⚠️ harness: no `state/boxes.tsv` — only THIS box was probed; the cells were "
                      "never read, so this is not 'the fleet is on the pin'")
+    for r in drift:
+        if r.get("inventory") in ("unread", "empty"):
+            lines.append(f"  ⚠️ harness: {r.get('note') or 'the box inventory could not be read'} — no "
+                         f"box was probed this cycle")
     for name, why in unreadable:
         lines.append(f"  ⚠️ {name}: {why}")
     if qo_why or qm_why:
@@ -1940,11 +1967,10 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         # ⛔ NO COMPARISON WAS MADE WITHOUT `origin/main`, SO NO COUNT MAY BE STATED. "0/N boxes run
         # this cycle's main" is a measured claim; with the ref unreadable it is an invented one, and it
         # is printed in the paragraph the owner acts on.
-        head = (f"**Goal 2 (harness autonomy):** the boxes could not be compared to `origin/main` "
-                f"(the ref was unreadable) — repair the read first. Nothing here is a verdict on a "
-                f"box, and these rows may ALSO be stopped or unreadable for their own reasons: "
-                f"{drift_names}. "
-                if not main_sha else
+        head = (f"**Goal 2 (harness autonomy):** the boxes could not be compared — {why_not_compared} "
+                f"— so repair that read first. Nothing here is a verdict on a box, and these rows may "
+                f"ALSO be stopped or unreadable for their own reasons: {drift_names}. "
+                if not compared else
                 f"**Goal 2 (harness autonomy):** {len(currents)}/{len(drift)} boxes run this cycle's "
                 f"main, deployed AND activated — NOT all: {drift_names}. The SAME harness version on "
                 f"every box is the marker; deploy/activate it (the deploy arm below) before anything "
@@ -1964,9 +1990,9 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
                if local_only else "")
             + " That is the marker, not proof: keep the queue moving and keep every cell on the pin.")
     else:
-        actions.append("**Goal 2 (harness autonomy):** UNMEASURED this cycle — the boxes did not "
-                       "answer (no inventory and no local probe), so nothing about the fleet's version "
-                       "is asserted. Repair the read instead of assuming the fleet is fine.")
+        actions.append("**Goal 2 (harness autonomy):** UNMEASURED this cycle — no box was probed "
+                       f"({why_not_compared}), so nothing about the fleet's version is asserted. Repair "
+                       f"the read instead of assuming the fleet is fine.")
     actions.append("**Then, and only then, the PR table below:** it is the VEHICLE for the goals, not "
                    "the objective. A PR that moves neither goal is work, not progress.")
     return lines, actions
@@ -2032,7 +2058,7 @@ GO (#2522/#2592); `attested@head=stale` means a record exists but was minted for
 
 | box | harness | controller | roles | verdict |
 |---|---|---|---|---|
-{chr(10).join(dep) if dep else ('| — | — | — | — | NOT-RUN (the cycle was skipped before the deploy arm) |' if skipped else '| — | — | — | — | no box inventory (`$O/state/boxes.tsv`) and no local probe |')}
+{chr(10).join(dep) if dep else ('| — | — | — | — | NOT-RUN (the cycle was skipped before the deploy arm) |' if skipped else '| — | — | — | — | no box was probed (see the goal-2 readings above for why) |')}
 
 A merged fix that is not live on a box has fixed nothing. The arm dispatches each box's OWN
 activation verb, never a hand restart, and only after the landing decision — and VERIFIES it by
@@ -2387,9 +2413,10 @@ def main(argv=None) -> int:
 
     md = o / STATE_MD
     skipped = ""
-    # ⛔ BOUND BEFORE THE GUARD: `repo_path_of` can raise, and the retry below dereferences it. An
-    # UnboundLocalError there replaced the caught OSError with a crash that wrote NO report — the
-    # defect class this guard exists for, one name to the right.
+    # ⛔ BOUND BEFORE THE GUARD because `repo_path_of` can raise, and an UnboundLocalError after the
+    # guard replaced the caught OSError with a crash that wrote NO report. (Nothing reads it outside the
+    # guard today — this is the guard against a future consumer dereferencing it unbound, not a claim
+    # about the current code.)
     repo_path: Path | None = None
     landing: list[dict] = []
     deploy: list[dict] = []

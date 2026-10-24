@@ -1999,6 +1999,7 @@ REALGIT="$(command -v git)"
 cat > "$BIN/git" <<STUB
 #!/usr/bin/env bash
 if [ "\${3:-}" = "rev-parse" ] && [ "\${4:-}" = "--verify" ] && [ "\${5:-}" = "origin/main" ]; then
+  date +%s%N >> "\$FIXTURE/mainstamps"
   n=\$(cat "\$FIXTURE/mainreads" 2>/dev/null || echo 0); n=\$((n+1))
   printf '%s' "\$n" > "\$FIXTURE/mainreads"
   [ "\$n" -le 2 ] && exit 128
@@ -2013,6 +2014,20 @@ out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a TRANSIENT unreadable origin/main is retried WITH BACKOFF (3 reads: \$(cat "$FX/mainreads"))" \
    "$([ "$(cat "$FX/mainreads" 2>/dev/null)" = "3" ] && echo 0 || echo 1)"
+# ⛔ THE NAME OF THE FIX IS "WITH BACKOFF", SO THAT IS WHAT IS MEASURED. Three calls issued back to
+# back are the exact shape the comment says recovers nothing; a mutant that dropped the sleep kept the
+# suite green until this assertion existed.
+ck "§27 ...and the retry is a GAP IN TIME (each gap >= MAIN_READ_BACKOFF_S)" \
+   "$(python3 - "$FX/mainstamps" <<'PY'
+import sys
+try:
+    t = [int(x) for x in open(sys.argv[1]).read().split()]
+except Exception:
+    print(1); raise SystemExit
+gaps = [(b - a) / 1e9 for a, b in zip(t, t[1:])]
+print(0 if len(gaps) == 2 and all(g >= 0.4 for g in gaps) else 1)
+PY
+)"
 ck "§27 ...so the goals judge the boxes against the sha the header prints" \
    "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF "$MAIN12" "$MDF" && nq 'UNREADABLE (not compared)' "$MDF" && echo 0 || echo 1)"
 
@@ -2032,9 +2047,32 @@ MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 an unreadable origin/main states NO comparison (\`not compared\`), never 0/N" \
    "$(qF 'not compared — `origin/main` was unreadable' "$MDF" && nq 'on this cycle' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and its action says so IN FULL and still NAMES the boxes" \
-   "$(qF 'repair the read first.' "$MDF" && qF 'cell-1 (main=UNREADABLE' "$MDF" \
+   "$(qF 'repair that read first.' "$MDF" && qF 'cell-1 (main=UNREADABLE' "$MDF" \
       && nq 'boxes run this cycle' "$MDF" && echo 0 || echo 1)"
 rm -f "$BIN/git"
+
+# ⛔ A PLACEHOLDER ROW IS NOT A BOX. When the inventory read fails, `drift` is ONE row that says so —
+# and stating "0/1 boxes run this cycle's main" over it invented a denominator and told the owner to
+# deploy a box that does not exist.
+write_no_landing; reset_o
+printf 'cell-1 no-tabs-here\n' > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 an unreadable inventory states NO fraction (no 0/1 over the placeholder)" \
+   "$(qF 'not compared — the box inventory could not be read' "$MDF" && nq 'on this cycle' "$MDF" \
+      && nq 'box(es) run this cycle' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the row says boxes.tsv could not be read" \
+   "$(qF 'boxes.tsv=UNREADABLE boxes.tsv' "$MDF" && echo 0 || echo 1)"
+
+# ⛔ A FILE THAT EXISTS AND LISTS NO ROWS IS ITS OWN STATE — not "absent" (which falls back to THIS
+# box) and not a `0/0` fraction over nothing.
+write_no_landing; reset_o
+: > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 an EMPTY inventory says it lists no boxes (not 'absent', not 0/0)" \
+   "$(qF 'the inventory exists and lists NO boxes' "$MDF" && nq '0/0' "$MDF" \
+      && nq 'no \`state/boxes.tsv\`' "$MDF" && qF 'STANDING=NOT-MEASURED' "$MDF" && echo 0 || echo 1)"
 
 # ⛔ AN ABSENT INVENTORY IS NOT A ONE-BOX FLEET. goal 2 is "the local box AND all three cmux cells";
 # `read_inventory` synthesises a single local row when boxes.tsv is gone, so MARKERS-* was printed over
