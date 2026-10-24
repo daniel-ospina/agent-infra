@@ -206,6 +206,12 @@ grep -q 'PI_RAN' "$PI_LOG"; ck $? "…and the stub pi really ran there too"
 # the FOREGROUND — the worker is backgrounded with `exec >/dev/null 2>&1`, so a refusal raised inside
 # it would leave no trace and the caller would report a launch that never happened.
 mkdir -p "$TMP/wt" "$TMP/bg-o/state" "$TMP/bg-o/gh-rest"
+# ⛔ THE DISPATCHER'S WORKTREE NEEDS A GITHUB ORIGIN TOO (review cycle 2, P1). `nonblocking-dispatch.sh`
+# `cd`s into it before `run_agent`, and `land_backlog_repo` derives owner/name from `$PWD`'s origin with
+# NO env fallback (`repo-slug.sh`), so a plain `mkdir` directory makes the LAND-BACKLOG gate refuse with
+# "UNREADABLE repo" and the worker exits 74 instead of launching (MEASURED: dispatcher rc=0, worker
+# rc=74, stub pi never ran, and only the last assertion below noticed).
+git init -q "$TMP/wt" && git -C "$TMP/wt" remote add origin https://github.com/owner/repo.git
 NB="$HERE/nonblocking-dispatch.sh"
 # ⛔ THE STUB `pi` GOES IN `$O/gh-rest`, AND THAT IS THE SCRIPT'S OWN SEAM, NOT A TRICK. The dispatcher
 # exports `/opt/homebrew/bin:/usr/local/bin` AT THE FRONT of PATH (for the reason its comment gives:
@@ -227,7 +233,7 @@ out="$( cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MA
 [ "$rc" -eq 0 ]; ck $? "POSITIVE CONTROL: nonblocking-dispatch.sh LAUNCHES for a valid brief ($(printf '%s' "$out" | tail -1))"
 # The worker is backgrounded; wait for its durable verdict rather than sleeping a guess.
 for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgok.rc" ] && break; sleep 0.1; done
-[ -s "$TMP/bg-o/bg/bgok.rc" ]; ck $? "…and the worker reached a durable exit status (the launch really happened)"
+[ "$(cat "$TMP/bg-o/bg/bgok.rc" 2>/dev/null)" = "0" ]; ck $? "…and the worker reached a SUCCESSFUL durable exit status (a 74 refusal also produces a file, so existence alone proves nothing)"
 grep -q 'PI_RAN' "$PI_LOG"; ck $? "…with the stub pi actually invoked"
 
 # ── orch-send.sh + safe-send.sh: the pane-order paths. Stub `cmux` records every call, so "refused"
