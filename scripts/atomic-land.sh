@@ -87,16 +87,63 @@
 #   * A draft → refuse before any CI work (`gh` refuses to merge a draft).
 #   * A changed/unprovable diff → the record step refuses (exit 3) → STOP.
 #   * The merge is `admin-merge.sh`, whose own evidence + decision own the
-#     merge; this script adds no merge path.
-#   * The merge is CONFIRMED by polling the PR's merged state — never inferred
-#     from the rail's exit status alone (#1359: the rail once printed "merged"
-#     while the PR was still open).
+#     merge; this script adds no merge path — except `--queue` below, which adds
+#     no merge either: it HANDS the PR to the Mergify merge queue and observes.
+#   * On the DIRECT path the merge is CONFIRMED by polling the PR's merged state
+#     — never inferred from the rail's exit status alone (#1359: the rail once
+#     printed "merged" while the PR was still open). `--queue` cannot confirm a
+#     merge and does not claim one: it reports what the QUEUE published, and exit
+#     0 there means the queue TOOK the PR (see `Exit:`), which is a different
+#     event from a merge.
 #   * `--dry-run` mutates nothing: no update, no record, no comment, no merge.
+#
+# --queue (opt-in, and the reason it exists)
+#   The default land step admin-merges THIS PR immediately, which costs one full CI
+#   cycle per PR — a head is certified on its own, and nothing re-uses that work for
+#   the next PR. `.mergify.yml` declares a merge queue whose `batch_size: 4` validates
+#   up to four PRs in ONE CI run on the composition that will actually land, which is
+#   the throughput the owner asked about.
+#
+#   MEASURED 2026-10-23, so the claim is a number and not an impression: 41 PRs landed
+#   in ~12h and NONE reports a Mergify/bot identity — every one is attributed to the
+#   fleet's own account, which is what a direct land looks like from the outside. (That
+#   field cannot attribute a MECHANISM: every session in the fleet authenticates as that
+#   same account, so it says "no bot merged these", NOT "this rail merged these".) The
+#   repo's auto-queue setting is not carrying the work either: the queue announced TWO
+#   enqueues in that span (#9528 on 10-22, #9604 on 10-23). So the queue is not starved
+#   of a CONFIG, it is starved of hand-offs, and this flag is the hand-off.
+#
+#   ⛔ Do not read that as "auto-queue is broken": it is a config the target repo owns
+#   and this rail does not touch. The number says the direct step is what lands.
+#
+#   `--queue` replaces the LAND step only, and in that path the rail also stops
+#   doing the two things the queue does better: it does NOT update the branch (Mergify
+#   merges it onto the current base inside `mergify/merge-queue/main` — #3016 Option 1)
+#   and it does NOT wait for the head's checks to go terminal (entry gates on the cheap
+#   `queue_conditions`; the heavy `python-ci-gate` is re-run on the composition). What
+#   still binds, unchanged: the accepted-verdict record at the CURRENT head, and a
+#   re-read of the head immediately before the hand-off — the record remains the gate.
+#
+#   ⛔ It touches NO check, NO branch protection and NO `strict`. Entry is
+#   `queue_conditions` in the target repo's `.mergify.yml`, which already includes
+#   `check-success=ai-review-gate` — the server-side enforcement of the very record
+#   this rail verified locally (#5433). `strict: true` is an OPEN DECISION (#3016)
+#   and this flag does not depend on it.
+#
+#   The fallback trigger is the target repo's DECLARATION, never a missing check-run:
+#   if its `.mergify.yml` declares no `queue_rules:` (or has no such file at all) the
+#   rail prints `QUEUE-NOT-ARMED` and falls back to the EXISTING land path — the whole
+#   path, its guards included — naming that it did. Do NOT "improve" this to trigger on
+#   an absent check-run: measured 2026-10-23, 3 of 12 open tortoise PRs had no Mergify
+#   run at their head while the queue was armed, so that test reports live work as
+#   unqueued. An UNREADABLE declaration stops instead of falling back.
+#   If the queue reports unmet entry conditions, the rail prints them verbatim and
+#   refuses — an entry refusal is a reported result, never a merge by another door.
 #
 # Usage:
 #   scripts/atomic-land.sh <PR> [--repo owner/repo] [--dry-run] [--no-wait]
 #                              [--wait-timeout S] [--poll S] [--max-rounds N]
-#                              [--no-cite] [-- <extra admin-merge flags>]
+#                              [--no-cite] [--queue] [-- <extra admin-merge flags>]
 #
 #   --repo owner/repo   repo for the gh calls (default: gh's own resolution)
 #   --dry-run           compute + print the plan; mutate NOTHING. The land step
@@ -111,11 +158,21 @@
 #                       a base advance mid-unit can return the PR to BEHIND, and
 #                       the carry-forward makes one more round safe.
 #   --no-cite           do not post the reuse citation comment after a carry-forward
+#   --queue             hand the PR to the Mergify merge queue instead of
+#                       admin-merging it now (see `--queue` above). Exits 0 once
+#                       the queue has TAKEN the PR; the merge itself lands later
+#                       and is the queue's artifact to prove, not this rail's.
 #   -- <flags>          passed through to admin-merge.sh (e.g. -- --merge)
 #
-# Exit: 0 = landed (or a --dry-run inspection completed); 1 = STOP (a named
-#       refusal — fresh review required, base red, checks not terminal, merge
-#       failed or unconfirmed); 2 = usage/config error.
+# Exit: 0 = landed (or a --dry-run inspection completed) — EXCEPT under `--queue`,
+#       where 0 means the merge queue has TAKEN the PR: it is queued, NOT merged,
+#       and the PR is still OPEN. Read the queue's state, not this code, for the
+#       merge. A caller must never record a PR as landed on exit 0 with `--queue`
+#       (#1359's false success, moved from the output into the documented
+#       interface);
+#       1 = STOP (a named refusal — fresh review required, base red, checks not
+#       terminal, merge failed or unconfirmed, queue paused or unreadable);
+#       2 = usage/config error.
 #
 # Env seams (tests):
 #   ATOMIC_LAND_GH          the gh command (default: gh)
@@ -137,6 +194,9 @@
 #   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a drifting head (a BEHIND enum, or
 #                               base drift on a landable state), ignoring the live
 #                               `strict` read (the #1565 fail-safe restore)
+#   ATOMIC_LAND_QUEUE_POLLS     with --queue, how many `--poll`-spaced reads to take
+#                               of the queue state while waiting for the queue to
+#                               take the PR (default: 20; 0 = read once, do not wait)
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
 # extensions/review-enforcer/index.ts. If that list widens, widen this one too.
@@ -161,10 +221,15 @@ CWD_URL=""
 DRY_RUN=0
 NO_WAIT=0
 NO_CITE=0
+QUEUE_MODE=0
+# Set when the PR was actually handed to the queue (so the merge is the queue's to
+# complete: `confirm_merged` would otherwise read "queued" as "not merged").
+QUEUE_HANDED=0
 WOULD_UPDATE=0
 WAIT_TIMEOUT=5400
 POLL=30
 MAX_ROUNDS=2
+QUEUE_POLLS="${ATOMIC_LAND_QUEUE_POLLS:-20}"
 MERGE_FLAGS=()
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -215,6 +280,7 @@ while [ $# -gt 0 ]; do
     --dry-run)      DRY_RUN=1; shift ;;
     --no-wait)      NO_WAIT=1; shift ;;
     --no-cite)      NO_CITE=1; shift ;;
+    --queue)        QUEUE_MODE=1; shift ;;
     --wait-timeout) WAIT_TIMEOUT="${2:-}"; shift 2 ;;
     --poll)         POLL="${2:-}"; shift 2 ;;
     --max-rounds)   MAX_ROUNDS="${2:-}"; shift 2 ;;
@@ -251,6 +317,10 @@ case "$POLL" in ''|*[!0-9]*) err "atomic-land: --poll must be a non-negative int
 case "$MAX_ROUNDS" in ''|*[!0-9]*) err "atomic-land: --max-rounds must be a positive integer"; exit 2 ;; esac
 [ "$MAX_ROUNDS" -ge 1 ] || { err "atomic-land: --max-rounds must be >= 1"; exit 2; }
 [ "$MAX_ROUNDS" -le 5 ] || { err "atomic-land: --max-rounds is bounded at 5"; exit 2; }
+case "$QUEUE_POLLS" in ''|*[!0-9]*) err "atomic-land: ATOMIC_LAND_QUEUE_POLLS must be a non-negative integer"; exit 2 ;; esac
+# Capped for the same reason as --poll: an unbounded multiplier turns a bounded
+# wait into a lock-holding loop.
+[ "$QUEUE_POLLS" -le 300 ] 2>/dev/null || { err "atomic-land: ATOMIC_LAND_QUEUE_POLLS is bounded at 300"; exit 2; }
 [ -x "$ADMIN_MERGE" ] || [ -f "$ADMIN_MERGE" ] || stop "no admin-merge.sh at $ADMIN_MERGE"
 [ -f "$RECORD_SH" ] || stop "no record-review.sh at $RECORD_SH"
 
@@ -894,6 +964,16 @@ verdict_accepted() {
 
 # ── step 1: update ───────────────────────────────────────────────────────
 do_update() { # 0 = updated, 3 = not behind (no-op)
+  if [ "$QUEUE_MODE" -eq 1 ]; then
+    # The queue updates the branch ITSELF, inside `mergify/merge-queue/main`, and
+    # validates that tree. Doing it here would move the head (staling the record we
+    # just verified), spend a full CI cycle at the head, and buy no mergeability the
+    # queue does not re-establish — the #7230 non-termination the direct path already
+    # records. 3 is the "nothing to do" code. This is #3016 Option 1, recorded in
+    # `.mergify.yml`: the queue replaces the update-lock, so the author does nothing.
+    say "atomic-land: [1/4] update — the queue performs the update itself (#3016); the head is left exactly as reviewed"
+    return 3
+  fi
   local before="$HEAD" after="" i t=0 behind="" stale_record=0 rec_rc=0
   case "$MERGE_STATE" in
     UNKNOWN|""|null)
@@ -1498,8 +1578,338 @@ The head moved by a base-only update, and \`record-review.sh\` re-recorded the p
     || err "atomic-land: ⚠️ could not post the reuse citation comment (non-fatal)"
 }
 
+# ── queue mode: hand the PR to the Mergify merge queue (#5215 owner question) ──
+#
+# WHY THIS EXISTS
+#   The land step below admin-merges ONE PR immediately. Its verdict is paid for
+#   with a full CI cycle at that PR's head, and none of that work is re-used for
+#   the next PR — so N landings cost N cycles. `.mergify.yml` declares a merge queue
+#   whose `batch_size: 4` validates up to four PRs in ONE CI run against the
+#   COMPOSITION that will actually land, which is exactly the mechanism the owner
+#   asked about. A queue helps only the PRs that are handed to it, and before this
+#   flag NOTHING handed one over: every landing THIS RAIL performs goes through its
+#   direct land step (`admin-merge.sh`), which is what `--queue` replaces.
+#   ⛔ Do not restate that as a claim about landings in general — see the measurement
+#   in the header: the data can say "no bot identity merged these", never "this
+#   mechanism merged them".
+#
+# WHAT IS READ, AND WHY IT IS THE AUTHORITY
+#   The queue publishes its own verdict on this head as a `Mergify Merge Queue`
+#   check-run carrying a machine-readable `itemprop` payload — `state`, `queued_at`,
+#   `queue_rule_name`, and the condition tree with each node's `match`. The rail
+#   reads THAT. It does not infer entry from `mergeStateStatus`, and it never treats
+#   "I posted the command" as "the PR is queued" (#1359: a send is not an artifact).
+#
+# WHAT IS NOT DONE HERE
+#   No check is bypassed, relaxed or edited; no branch protection is touched; no PR
+#   body is edited (a body edit wipes a review attestation recorded in it). Entry is
+#   `queue_conditions` in the TARGET repo's `.mergify.yml`, which already includes
+#   `check-success=ai-review-gate` — the server-side enforcement of the same record
+#   this rail verified locally (#5433). `strict: true` is an OPEN DECISION (#3016);
+#   nothing here reads or depends on it.
+#
+#   An entry REFUSAL is reported verbatim and the rail STOPS — it never falls back
+#   to admin-merging work the queue declined to take. The only fallback is the
+#   QUEUE-NOT-ARMED one, where the queue is ABSENT rather than unwilling.
+
+queue_check_run() { # -> line 1 "<id>\t<title>", then the summary VERBATIM.
+  #   "NONE" = the read SUCCEEDED and this head has no Mergify check-run.
+  #   "TRUNCATED" = the surface exceeded one page, so absence cannot be concluded.
+  # rc 1 = the read FAILED (never conflated with "no queue": a rate-limited or
+  # 403 read returns an empty body, and treating that as "Mergify is not installed"
+  # would route the PR to the admin path on a transient error).
+  #
+  # Two emitted values, not one tab-joined string: the summary is MARKDOWN (many
+  # lines), and a `cut -f3-` over it would keep only the field-3 column of the
+  # first line and would then suppress every following line that holds no tab —
+  # i.e. the body the state is decoded from.
+  #
+  # THE PAGE IS CHECKED, not re-paginated: `--jq` runs PER PAGE, so a paginated
+  # `sort_by(.id)|last` yields one "newest" row per page and the caller cannot tell
+  # which is newest. The surface is therefore read as ONE page and refused when
+  # `total_count` says it is not the whole surface — absence is a claim, and a
+  # partial read may not make it (#1261: a partial read is a failure to look).
+  local out
+  out="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs?per_page=100&filter=all" \
+    --jq 'if .total_count > 100 then "TRUNCATED"
+          else ([.check_runs[]
+                 | select((.app.slug // "") == "mergify")
+                 # ⛔ BY NAME TOO, not by app alone: Mergify publishes more than the
+                 # merge-queue run under the same app (configuration-change summaries
+                 # among them). Taking "the newest mergify run" let a summary run win,
+                 # whose payload carries no `state` — so a PR the queue genuinely HELD
+                 # decoded as unreadable and was reported as not taken.
+                 | select((((.name // "") + " " + (.output.title // "")) | test("merge queue"; "i")))]
+                | sort_by(.id) | last) as $r
+          | if $r == null then "NONE"
+            else "\($r.id)\t\($r.output.title // "")", ($r.output.summary // "") end end' \
+    2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+# Does the TARGET repo declare a merge queue at all? 0 = yes · 1 = positively no ·
+# 2 = could not read. The distinction matters: "no check-run on this head" is NOT
+# "no queue" — measured 2026-10-23, 3 of 12 open tortoise PRs had no Mergify run at
+# their head while the queue was installed and armed. The queue's DECLARATION is the
+# evidence of absence, and only a positive "no declaration" may take the fallback.
+queue_declared() {
+  local out="" rc=0 cfg=""
+  # ⛔ NO PIPELINE ON THE POLARITY. `printf | grep -q` runs under `set -o pipefail`:
+  # grep exits on the first match, printf takes EPIPE once the config exceeds the pipe
+  # buffer, and the PIPELINE then returns 141 — so `&& return 0` is skipped and a repo
+  # that DOES declare a queue is reported as having none. That is the one verdict
+  # allowed to take the fallback, i.e. a silent reversal of the operator's --queue on a
+  # large config (reproduced by review with a 400 KB file whose line 1 is `queue_rules:`).
+  # `case` matching has no such failure mode.
+  out="$(gh_ api "repos/$REPO/contents/.mergify.yml" --jq '.content' 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # ABSENT is not UNREADABLE: a 404 means the repo has no Mergify config at all, which
+    # is the "Mergify is not installed" case the fallback exists for. Anything else (403,
+    # rate limit, network) is an instrument failure and must NOT choose a land path.
+    case "$out" in
+      *"Not Found"*|*"HTTP 404"*) return 1 ;;
+    esac
+    return 2
+  fi
+  [ -n "$out" ] || return 2
+  cfg="$(printf '%s' "$out" | base64 -d 2>/dev/null)" || return 2
+  [ -n "$cfg" ] || return 2
+  # "Does not CONTAIN queue_rules:" is not evidence of anything unless the bytes are a
+  # config at all. A decodable-but-unparseable body (the contents API returns the literal
+  # `null` for a submodule; a corrupt/truncated body decodes to noise; BSD `base64 -d`
+  # EXITS 0 on undecodable input, so its status cannot be the guard) would otherwise
+  # answer "positively no queue" and take the fallback — the one verdict that reverses
+  # the operator's --queue. Require a plausible top-level YAML key first.
+  [[ "$cfg" =~ (^|$'\n')[A-Za-z_]+: ]] || return 2
+  case "$cfg" in
+    "queue_rules:"*|*$'\n'"queue_rules:"*) return 0 ;;
+  esac
+  return 1
+}
+
+# <document> -> "<state>\t<queued_at>\t<rule>\t<unmet (;)>"
+#
+# The document arrives as an ARGUMENT, never on stdin: the script itself is read
+# from stdin by `python3 - <<'PY'` (the idiom every other python call in this rail
+# uses), so a piped document would be consumed as script text and every state would
+# silently decode as empty — the read would look like "no queue" while the queue was
+# answering. A scenario pins that (17h-A).
+#
+# The `match` flags are the QUEUE's own computation, so "ready" is not re-derived
+# here: a leaf whose `match` is false is a condition the queue says is unmet. The
+# walk descends only into false branches, which is what keeps the satisfied
+# "any of [configuration change requirements]" group from reporting its two
+# deliberately-unmet leaves as blockers.
+queue_state_decode() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import base64, json, re, sys
+
+doc = sys.argv[1] if len(sys.argv) > 1 else ""
+state = queued = rule = ""
+# ⛔ base64URL, not base64: Mergify's real payload contains `-` and `_` (MEASURED
+# 2026-10-23 on tortoise#9604's paused run — the first cut of this decoder accepted
+# only `+/=` and so reported `unreadable` for a head whose queue verdict was
+# perfectly readable). The alphabet must accept both, and the decode must
+# translate: `b64decode` rejects a `-` even when the regex let it through.
+m = re.search(r'itemprop="mergify\.v1\.([A-Za-z0-9_+/=-]+)"', doc)
+meta = None
+if m:
+    raw = m.group(1).replace("-", "+").replace("_", "/")
+    raw += "=" * (-len(raw) % 4)
+    try:
+        meta = json.loads(base64.b64decode(raw).decode("utf-8", "replace"))
+    except Exception:
+        meta = None
+if meta:
+    state = str(meta.get("state") or "")
+    queued = str(meta.get("queued_at") or "")
+    rule = str(meta.get("queue_rule_name") or "")
+
+unmet = []
+def walk(node):
+    if not isinstance(node, dict) or node.get("match"):
+        return
+    subs = node.get("subconditions") or []
+    if not subs:
+        desc = str(node.get("description") or "").strip()
+        if desc:
+            unmet.append(desc)
+        return
+    for sub in subs:
+        walk(sub)
+
+if meta:
+    for cond in (meta.get("required_conditions") or []):
+        walk(cond)
+
+print("%s\t%s\t%s\t%s" % (state, queued, rule, ";".join(unmet)))
+PY
+}
+
+# Report the queue state observed for this head. One line, always the same shape,
+# so a log reader does not have to guess which fields were read.
+queue_report() { # <pr> <state> <queued_at> <rule> <unmet>
+  say "atomic-land: QUEUE #$1 — state=${2:-unreadable} rule=${4:-none} queued_at=${3:-none}"
+  if [ -n "${5:-}" ]; then
+    say "atomic-land: QUEUE #$1 — unmet entry conditions, as the queue reports them:"
+    printf '%s\n' "${5}" | tr ';' '\n' | while IFS= read -r c; do
+      [ -n "$c" ] && say "atomic-land:   • $c"
+    done
+  fi
+}
+
+do_queue_land() {
+  local row meta decoded state queued rule unmet i last_state=""
+  # ⛔ THERE IS NO land-step FALLBACK IN THIS FUNCTION, deliberately. Reaching the queue
+  # path with the queue unusable would mean the direct path's guards (wait_terminal,
+  # B10/B12 base certification) were already SKIPPED for this round, so calling the
+  # mandatory rail from here would land with them inert — the precise unsafe land those
+  # guards exist to prevent. "Fall back to the existing path" is therefore implemented as
+  # QUEUE_MODE=0 at STARTUP (see the probe in main), which runs that path whole.
+  if ! row="$(queue_check_run)"; then
+    stop "could not READ the merge queue state for #$PR at ${HEAD:0:12}… — refusing to treat an unreadable queue as an absent or an idle one (an empty body from a rate-limited read is not evidence about the queue)"
+  fi
+  meta="$(printf '%s\n' "$row" | head -1)"
+  case "$meta" in
+    TRUNCATED)
+      stop "the check-run surface at ${HEAD:0:12}… exceeds one page, so the queue's verdict for this head cannot be isolated — refusing to guess (a partial read is a failure to look, #1261)"
+      ;;
+    NONE)
+      # The read succeeded and Mergify has published no verdict for THIS head. That is
+      # not "no queue" (the declaration probe at startup decided that); it is "not
+      # evaluated yet", and the enqueue command is exactly what makes Mergify evaluate.
+      meta=""
+      ;;
+  esac
+
+  decoded="$(queue_state_decode "$(printf '%s\n' "$row" | tail -n +2)")"
+  state="$(printf '%s' "$decoded" | cut -f1)"
+  queued="$(printf '%s' "$decoded" | cut -f2)"
+  rule="$(printf '%s' "$decoded" | cut -f3)"
+  unmet="$(printf '%s' "$decoded" | cut -f4)"
+
+  # ── A PAUSED QUEUE IS A DELIBERATE STOP, NOT AN IDLE ONE ─────────────────────
+  # Mergify pauses a repository's queue by itself after a storm it judges harmful
+  # (measured 2026-10-23: "Stopping a batch-restart storm: repeated Restarted-from-batch
+  # cycles were minting a new merge-queue branch every ~100 seconds"), and a human can
+  # pause it too. Detected on the DECODED state first (machine-readable) and only then on
+  # the human title — a title-worded detector alone misses a pause whose wording changes,
+  # which is the failure mode a string match invites.
+  case "$state" in
+    *paused*|*Paused*|*suspend*|*Suspend*)
+      say "atomic-land: QUEUE-PAUSED — the merge queue for $REPO reports state=$state."
+      say "atomic-land: the queue's own words: ${meta#*$'\t'}"
+      stop "the merge queue is PAUSED, so #$PR was NOT enqueued and nothing was merged. A pause is a deliberate stop and this rail will not route around it; re-run once the queue is resumed"
+      ;;
+  esac
+  case "$meta" in
+    *paused*|*Paused*|*suspend*|*Suspend*|*"⏸"*)
+      say "atomic-land: QUEUE-PAUSED — the merge queue for $REPO is not accepting work."
+      say "atomic-land: the queue's own words: ${meta#*$'\t'}"
+      stop "the merge queue is PAUSED, so #$PR was NOT enqueued and nothing was merged. A pause is a deliberate stop and this rail will not route around it; re-run once the queue is resumed"
+      ;;
+  esac
+
+  # ── VERDICT POLARITY IS AN ALLOW-LIST ───────────────────────────────────────
+  # Only the states that MEAN the queue holds the PR may report success. An exclude list
+  # ("anything that is not waiting is queued") would report `paused`, `dequeued`,
+  # `cancelled` and any state Mergify adds later as a successful hand-off — the #1359
+  # false-success class, and the same allow-list rule the rail's own check-run reader uses.
+  case "$state" in
+    queued|in_place|merged)
+      queue_report "$PR" "$state" "$queued" "$rule" "$unmet"
+      say "atomic-land: the queue already holds #$PR — nothing to enqueue"
+      QUEUE_HANDED=1
+      return 0 ;;
+  esac
+
+  # The published verdict is a CACHE of the last evaluation: a PR whose conditions have
+  # since gone green still shows the old "waiting" with the old unmet leaves (measured on
+  # tortoise#9718 — every entry context `success` on the head, the run still listing them
+  # unmet). It is QUOTED, never decisive: the queue re-evaluates on the command, and the
+  # command cannot merge a PR the queue refuses.
+  if [ -n "$unmet" ]; then
+    queue_report "$PR" "${state:-waiting}" "$queued" "$rule" "$unmet"
+    say "atomic-land: NOTE — the queue's PUBLISHED verdict above is its last evaluation; asking the queue is the only fresh read."
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    queue_report "$PR" "${state:-waiting}" "$queued" "$rule" ""
+    say "atomic-land: (dry-run) would post '@Mergifyio queue' on #$PR and observe the queue state; nothing mutated"
+    return 0
+  fi
+
+  # The documented enqueue command. A COMMENT is the whole action: no check is touched,
+  # and the queue re-evaluates its own entry conditions server-side.
+  say "atomic-land: [4/4] land — enqueue #$PR into the merge queue (verdict before asking: ${state:-none-published})"
+  gh_ pr comment "$PR" ${repo_args[@]+"${repo_args[@]}"} --body '@Mergifyio queue' >/dev/null \
+    || stop "could not post the queue command on #$PR — nothing was enqueued"
+
+  # Wait for the queue to TAKE it. The read is the artifact; the comment was a send.
+  i=0
+  while :; do
+    if ! row="$(queue_check_run)"; then
+      stop "the queue state for #$PR became UNREADABLE while waiting — an unreadable hand-off is not evidence that it entered (#1359)"
+    fi
+    meta="$(printf '%s\n' "$row" | head -1)"
+    decoded="$(queue_state_decode "$(printf '%s\n' "$row" | tail -n +2)")"
+    state="$(printf '%s' "$decoded" | cut -f1)"
+    queued="$(printf '%s' "$decoded" | cut -f2)"
+    rule="$(printf '%s' "$decoded" | cut -f3)"
+    unmet="$(printf '%s' "$decoded" | cut -f4)"
+    last_state="$state"
+    # The queue can PAUSE mid-wait (measured 2026-10-23: a pause landed three seconds
+    # after an enqueue was posted). Re-read it here — the difference between "the queue
+    # refused this PR" and "the whole queue was switched off" is the difference between
+    # two fixes, and the second is nobody's to work around in this rail.
+    case "$state" in
+      *paused*|*Paused*|*suspend*|*Suspend*)
+        say "atomic-land: QUEUE-PAUSED — the merge queue for $REPO paused while #$PR was waiting."
+        say "atomic-land: the queue's own words: ${meta#*$'\t'}"
+        stop "the merge queue PAUSED during the hand-off, so #$PR was NOT enqueued and nothing was merged. Re-run once the queue is resumed; this rail does not route around a pause"
+        ;;
+    esac
+    case "$meta" in
+      *paused*|*Paused*|*suspend*|*Suspend*|*"⏸"*)
+        say "atomic-land: QUEUE-PAUSED — the merge queue for $REPO paused while #$PR was waiting."
+        say "atomic-land: the queue's own words: ${meta#*$'\t'}"
+        stop "the merge queue PAUSED during the hand-off, so #$PR was NOT enqueued and nothing was merged. Re-run once the queue is resumed; this rail does not route around a pause"
+        ;;
+    esac
+    # ALLOW-LIST: only these three states mean the queue holds the PR.
+    case "$state" in
+      queued|in_place|merged)
+        queue_report "$PR" "$state" "$queued" "$rule" ""
+        say "atomic-land: ✅ #$PR handed to the merge queue at ${HEAD:0:12}… — the queue owns the merge from here (exit 0 means ENQUEUED, not merged; #1359)"
+        QUEUE_HANDED=1
+        return 0 ;;
+    esac
+    i=$((i + 1))
+    [ "$i" -gt "$QUEUE_POLLS" ] && break
+    [ "$POLL" -gt 0 ] && sleep "$POLL"
+  done
+
+  queue_report "$PR" "${last_state:-unreadable}" "$queued" "$rule" "$unmet"
+  # A queue that is still WAITING has not refused anything — the rail has merely stopped
+  # waiting. Saying "REFUSED" here would send the operator to fix a condition that is
+  # only in progress, which is a different and much more expensive mistake than saying
+  # nothing. Only a state the allow-list does not recognise, and that is not `waiting`,
+  # is reported as the queue having answered and declined.
+  case "$last_state" in
+    waiting|unreadable|"")
+      stop "the queue did NOT TAKE #$PR within $QUEUE_POLLS poll(s) of ${POLL}s — it is still WAITING (state=${last_state:-unreadable}), listed above. Nothing was enqueued and nothing was merged; re-run the rail, or wait for the named condition" ;;
+    *)
+      stop "the queue ANSWERED with state=${last_state} for #$PR — not a state that means it holds the PR, so nothing was enqueued and nothing was merged. The queue's conditions are listed above" ;;
+  esac
+}
+
 # ── step 4: land (the mandated rail) + confirm ───────────────────────────
 do_land() {
+  if [ "$QUEUE_MODE" -eq 1 ]; then
+    do_queue_land
+    return $?
+  fi
   say "atomic-land: [4/4] land — admin-merge.sh $PR ${MERGE_FLAGS[*]:-}"
   local flags=()
   if [ "$DRY_RUN" -eq 1 ]; then flags+=(--dry-run); fi
@@ -1539,6 +1949,29 @@ sync_review_registry
 if ! read_record; then
   stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record. If the review ran on ANOTHER box, \`scripts/registry-sync.sh status\` names what this box is missing and \`scripts/registry-sync.sh pull\` MAY make it reachable once that box has LANDED or booted (#2374)."
 fi
+# ── DOES THE QUEUE PARTICIPATE AT ALL? (decided BEFORE anything is skipped) ──
+# This probe is what makes "fall back to the existing path" true rather than nominal.
+# Deciding it here, once, means the fallback sets QUEUE_MODE=0 and the WHOLE direct
+# path then runs — update, terminal wait, the B10/B12 base certification and only then
+# the mandatory rail. Deciding it inside the land step would call that rail with those
+# guards already skipped for the round, i.e. an unsafe land on the one path that is
+# supposed to be the safe, unchanged one.
+#
+# The evidence of absence is the target repo's OWN DECLARATION, never an empty
+# check-run read: measured 2026-10-23, 3 of 12 open tortoise PRs had no Mergify run at
+# their head while the queue was installed and armed, so "no run on this head" cannot
+# mean "no queue". An unreadable declaration is not a licence to fall back either —
+# an unreadable instrument must stop, not silently choose a different way to merge.
+if [ "$QUEUE_MODE" -eq 1 ]; then
+  queue_declared; qd=$?
+  case "$qd" in
+    0) say "atomic-land: --queue — $REPO declares a merge queue; the queue will own the merge" ;;
+    1) say "atomic-land: QUEUE-NOT-ARMED — $REPO declares NO merge queue in .mergify.yml"
+       say "atomic-land: falling back to the EXISTING land path (update → verify → record → the mandatory rail), unchanged; the queue does not participate"
+       QUEUE_MODE=0 ;;
+    *) stop "could not read $REPO's .mergify.yml, so whether a merge queue is armed is UNKNOWN — refusing to choose a land path on an unreadable instrument" ;;
+  esac
+fi
 if ! verdict_accepted "$RECORD_VERDICT"; then
   stop "the record for $REPO#$PR has verdict '$RECORD_VERDICT' — only [$ACCEPTED_VERDICTS] unlocks a merge"
 fi
@@ -1572,6 +2005,16 @@ while :; do
   CERT_BASE="$BASE"
   CERT_MB="$(merge_base_of "$BASE" "$HEAD")"
   CERT_BASE_TIP="$(base_tip)"
+  # Under --queue the base relation is the QUEUE's to establish (it merges onto the
+  # current base and runs `merge_conditions` on that tree), so the two captures below
+  # are not a certification this path can make or needs. They are seeded rather than
+  # skipped because both reads are also used by the DIRECT path's pre-land arms, which
+  # are simply not reached in queue mode; seeding keeps those guards' fail-closed
+  # polarity untouched for the path that does use them.
+  if [ "$QUEUE_MODE" -eq 1 ]; then
+    CERT_MB="${CERT_MB:-queue-mode: the queue binds the composition, not this head}"
+    CERT_BASE_TIP="${CERT_BASE_TIP:-queue-mode}"
+  fi
   if [ -z "$CERT_MB" ]; then
     stop "could not read the merge base of $BASE...${HEAD:0:12}… — refusing to certify without a base binding (B10)"
   fi
@@ -1584,8 +2027,47 @@ while :; do
   if [ -z "$CERT_BASE_TIP" ]; then
     stop "could not read the base tip of $BASE — refusing to certify without a base binding (B12)"
   fi
-  wait_terminal
+  if [ "$QUEUE_MODE" -eq 1 ]; then
+    # ⛔ NO BACKTICKS in this string: it is double-quoted, so a backticked span would run
+    # as a command substitution and silently lose its text (measured live: the line
+    # printed "composition that lands ()" and emitted `merge_conditions: command not
+    # found`). Quoting a config key is not worth a subshell.
+    say "atomic-land: [2/4] verify — skipped under --queue: the queue re-runs the required checks (merge_conditions) on the composition that lands, and gates entry on its own cheap conditions"
+  else
+    wait_terminal
+  fi
   if ! do_record; then exit 1; fi
+  # B9 UNDER --queue: the head must still not move between the RECORD and the
+  # HAND-OFF. The queue is asked about $HEAD specifically, so a push inside this
+  # window would enqueue bytes the record does not cover.
+  #
+  # The BASE ADVANCING is the queue's to re-establish (it merges onto the current base
+  # and re-runs the merge-time conditions on that tree), which is why the tip
+  # comparison is not repeated here. A base REPOINT is a different thing and IS
+  # checked even here: it makes the record's certified diff describe something other
+  # than what lands (agent-infra #1362 — every head-bound check still passes on an
+  # edit that changes the target branch), and the read is already being made.
+  if [ "$QUEUE_MODE" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    q_now_row="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json headRefOid,baseRefName --jq '"\(.headRefOid)\t\(.baseRefName)"' 2>/dev/null || true)"
+    q_now="$(printf '%s' "$q_now_row" | cut -f1)"
+    q_now_base="$(printf '%s' "$q_now_row" | cut -f2)"
+    if [ -z "$q_now" ] || [ -z "$q_now_base" ]; then
+      stop "could not re-resolve the head and base before the queue hand-off — refusing to enqueue unverified"
+    fi
+    if [ "$q_now_base" != "$CERT_BASE" ]; then
+      stop "the PR base was repointed ($CERT_BASE -> $q_now_base) after the record - the certified diff is no longer the diff that would be queued (B10); re-review and re-record against the new base"
+    fi
+    if [ "$q_now" != "$HEAD" ]; then
+      say "atomic-land: the head moved between the record (${HEAD:0:12}…) and the hand-off (${q_now:0:12}…) — the record no longer covers what would be queued"
+      resolve_state
+      if [ "$round" -lt "$MAX_ROUNDS" ]; then
+        HEAD="$q_now"
+        round=$((round + 1))
+        continue
+      fi
+      stop "the head moved between the record and the queue hand-off and no round remains — re-run the rail"
+    fi
+  fi
   # B9 — the head must not move between the RECORD and the LAND. The record binds
   # a sha and the land step uses `--admin` (bypassing the remote required check),
   # so a push inside this window would land bytes the record does not cover.
@@ -1593,7 +2075,7 @@ while :; do
   # verified. Every head-bound check still passes on a `gh pr edit --base`, while
   # what merges changes (agent-infra #1362). A base that merely ADVANCED does not
   # move the merge base, so it is not a repoint and is not refused.
-  if [ "$DRY_RUN" -eq 0 ]; then
+  if [ "$DRY_RUN" -eq 0 ] && [ "$QUEUE_MODE" -eq 0 ]; then
     pre="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} \
             --json headRefOid,baseRefName \
             --jq '"\(.headRefOid)\t\(.baseRefName)"' 2>/dev/null || true)"
@@ -1651,6 +2133,10 @@ while :; do
     fi
   fi
   if do_land; then
+    # A merge the QUEUE owns is not this rail's to confirm: a queued PR is still
+    # OPEN by design, and polling for `merged` here would read a correct hand-off as
+    # a failure. The queue's own check-run is the artifact (reported above).
+    if [ "$QUEUE_HANDED" -eq 1 ]; then exit 0; fi
     confirm_merged || exit 1
     exit 0
   fi
