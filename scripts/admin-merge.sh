@@ -1119,6 +1119,111 @@ unattributable_tokens_of() {
   return 0
 }
 
+# fetch_run_failed_job_names <run-id> — one FAILED job NAME per line.
+#
+# The NAMING sibling of `run_failed_job_ids` in scripts/ci-failure-set.sh, and it
+# carries the same jq projection on purpose: the Jobs API is the only place a run's
+# check NAMES are readable when its log yields no failure identity, and one
+# projection in two files is a convention, not a second implementation (the two
+# consumers of that projection are different programs, and #3756's one-parser rule
+# is about the FAILURE-IDENTITY parse, which stays in ci-failure-set.sh alone).
+#
+# The exit status is gh's: an unreadable job list is NOT an empty one, and the
+# caller must say which of the two it has.
+# shellcheck disable=SC2086
+fetch_run_failed_job_names() {
+  local run_id="$1" slug
+  if [ -n "$REPO" ]; then
+    slug="repos/$REPO/actions/runs/$run_id/jobs?per_page=100"
+  else
+    slug="repos/{owner}/{repo}/actions/runs/$run_id/jobs?per_page=100"
+  fi
+  $GH api "$slug" --paginate \
+    --jq '.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="startup_failure") | .name'
+}
+
+# named_unattributable_runs <provenance> <base-ref> — THE NAMED REFUSAL (#2610).
+#
+# WHY THIS EXISTS. The step-1c refusal (a failing run whose log yielded no failure
+# identity) used to report a COUNT — "2 of 2 failing PR run(s) yielded NO parseable
+# failure identity" — and name NOTHING: not the run, not the check that failed in it,
+# and not what the base carries under that name. Measured on agent-infra 2026-10-24:
+# three rails (#2430, #2608, #2623) refused with exactly that line for a head whose
+# surface was red on `bash-suites (1)/(2)/(3)/(5)/(7)`, and the subject of the refusal
+# had to be reconstructed by hand from `gh api`. A refusal that cannot name what it
+# refused reads as "unattributable" — the one conclusion this rail must never deliver
+# without evidence — and it is why the fleet re-runs the rail instead of fixing the
+# cause.
+#
+# WHAT IT ASKS, AND WHAT IT DOES NOT CLAIM. For each failed check it answers ONE
+# question: does the BASE's own measured surface carry a RED check of the same NAME?
+# That is the name question, answered from the base probe every other base read uses
+# (the `push` lane's own check names, so `script-validate` on a trigger-split repo
+# appears as itself). It does NOT claim a name match makes a red exempt: this rail's
+# base comparison is by FAILURE IDENTITY (the exemption decision), so a same-named
+# red is reported as context and an absent one is reported as an absent NAME — never
+# as "this red is the PR's". The two questions are stated apart on purpose, because
+# conflating them is how "no base counterpart" would become a silent exemption.
+#
+# A refusal whose only fact is a count is unfalsifiable from the operator's side; a
+# refusal that names its runs, its checks and its base answer can be checked, fixed,
+# or escalated. Costs one base-surface probe, on a path that terminates the run.
+named_unattributable_runs() {
+  local provenance="${1:-}" base="${2:-}" line runref run_id names name
+  local base_reds base_status base_total
+  [ -s "$provenance" ] || return 0
+  # The base's own surface, through the ONE probe (#1261) — never a second reader.
+  check_surface_probe "$base" "the base branch '$base'" 1
+  base_status="${MAIN_HEALTH_STATUS:-}"
+  base_total="${MAIN_HEALTH_TOTAL:-}"
+  # The base's BLOCKING red NAMES. `MAIN_HEALTH_RED_TS` is the structured form the
+  # staleness comparison already consumes; its first field IS the job name.
+  base_reds="$(printf '%s\n' "${MAIN_HEALTH_RED_TS:-}" | cut -f1 | sed '/^$/d' | sort -u)"
+  say_err "   The failing run(s), NAMED — each check below is one whose failed-step log"
+  say_err "   yielded no failure identity, so it entered NEITHER side of the comparison:"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    runref="${line##*$'\t'}"
+    run_id="${runref##*:}"
+    if ! names="$(fetch_run_failed_job_names "$run_id" 2>/dev/null)"; then
+      say_err "   • run $run_id — its JOB LIST could not be read (a read failure, which is not"
+      say_err "       an absence of checks; re-run the rail, and if it persists the API is the cause)"
+      continue
+    fi
+    if [ -z "$names" ]; then
+      say_err "   • run $run_id — no job in it reports a failure conclusion (the run failed"
+      say_err "       without a failed job: a startup or annotation failure)"
+      continue
+    fi
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      say_err "   • run $run_id — check '${name}' — no parseable failure identity in its log"
+      case "$base_status" in
+        green|red)
+          if printf '%s\n' "$base_reds" | grep -qxF -- "$name"; then
+            say_err "       base: '${name}' IS red on '${base}' — the same check NAME fails on both"
+            say_err "       surfaces; the decision still compares IDENTITIES, and this run has none"
+          else
+            say_err "       base: NO BASE COUNTERPART FOR THIS CHECK — '${name}' is not among the"
+            say_err "       red check NAME(s) measured on '${base}' (${base_total:-?} measured): $(printf '%s\n' "$base_reds" | sed '/^$/d' | paste -sd, - 2>/dev/null || printf 'none')"
+          fi
+          ;;
+        *)
+          say_err "       base: the base surface ('${base}') reads '${base_status:-unmeasured}' — the"
+          say_err "       counterpart question is UNANSWERED, not answered 'no'"
+          ;;
+      esac
+    done <<< "$names"
+  done < "$provenance"
+  say_err "   This rail's base comparison is by FAILURE IDENTITY (the exemption decision), not by"
+  say_err "   check name: an identity is what makes a red comparable to the base, and (with a"
+  say_err "   matching signature) exempt. NONE of the runs above yielded one, so nothing about them"
+  say_err "   is comparable yet — a name answer alone cannot exempt a red, and an absent name is not"
+  say_err "   a verdict. Remedy: make the failing step print a parseable identity — a"
+  say_err "   '::error::<message>' annotation or a 'FAILED <nodeid>' line — then re-run the rail."
+  return 0
+}
+
 # report_unattributable <parser-stderr-file> <label> — NAME the drops on stderr.
 # Returns 0 when nothing was dropped, 1 when anything was.
 report_unattributable() {
@@ -6223,6 +6328,16 @@ main() {
       say_err "   The parser DROPPED $(unattributable_count "$TMP/pr-drops.err") FAILED token(s) in these runs — not test ids, so NOT in the set:"
       unattributable_tokens "$TMP/pr-drops.err" | sed 's/^/      DROPPED: /' >&2
     fi
+    # ── THE REFUSAL MUST NAME ITS SUBJECT (#2610) ─────────────────────────────────
+    # A count is not a subject. The base ref is resolved HERE rather than reusing the
+    # §2C one, because §2C is downstream of this exit: passing a name-bound reader the
+    # base it must ask about is cheaper than moving the §2C probe (which §4.6's
+    # staleness anchor is timed against). One `pr view` + one base probe, on a path
+    # that ends the run — no cost on any path that proceeds.
+    local named_base_ref
+    named_base_ref="$(resolve_base_ref "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+    [ -n "$named_base_ref" ] || named_base_ref="main"
+    named_unattributable_runs "$TMP/pr-runs.txt" "$named_base_ref" || true
     exit 1
   fi
 
