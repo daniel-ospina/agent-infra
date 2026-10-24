@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- objective reminder (#2691): put the operator's objective back in front of the running agent
+         every 10 minutes. This template is the SCHEDULER; the pass itself is
+         scripts/objective-reminder.sh, which owns the byte budget and the delivery confirmation.
+
+         ⛔ WHY IT IS A JOB AND NOT A CONTROLLER TICK. The controller cycles, the lanes work, every
+         health predicate is green — and the fleet can still be optimising the wrong thing. Drift is
+         not a failure any process read can see; the only datum that catches it is the objective,
+         repeated into the agent's own surface. So the reminder must run even when (especially when)
+         nothing else looks wrong.
+
+         ⛔ THE PAYLOAD HAS A BYTE BUDGET AND THE SCRIPT REFUSES OVER IT (measured: ~969 B →
+         `Failed to write to socket (Broken pipe)`, ~520 B reliable; a ~750 B version silently stopped
+         delivering for three consecutive ticks). The budget is enforced INSIDE the script (MAX_BYTES,
+         rendered below) and not here, because the text is composed at run time; what this plist
+         guarantees is that the script is invoked on a clock so a REFUSED pass is LOUD (its log line,
+         and the inventory row) instead of invisible.
+
+         ⛔ DELIVERY IS CONFIRMED BY A TURN BOUNDARY, NOT BY THE SEND'S EXIT STATUS:
+         `latest_submitted_at` on the cmux workspace advances when the message becomes a TURN.
+         `latest_submitted_message` LAGS and produced a false UNSENT on a channel that was working;
+         the send's own exit 0 means bytes-on-a-socket, which is exactly the state a composer holding
+         the text is in. The script judges the send in the NEXT pass (the boundary lags), and the one
+         same-pass verdict it can prove is UNSENT (the payload is still in the composer).
+
+         ⛔ TCC / WHY THE TARGET IS THE CHECKOUT'S SCRIPT. `install-launchd.sh` hard-fails a job whose
+         ProgramArguments target does not resolve, so this job must not point at a farmed copy that
+         may not exist. It renders `{{AGENT_INFRA_PATH}}/scripts/objective-reminder.sh` from
+         resolve_infra_main() — this repo's MAIN checkout, worktree-safe — so the job moves with the
+         merge and survives a worktree teardown. (The farmed `~/.pi/agent/scripts/` copy is what a
+         CELL gets; see templates/systemd/ for that half.) The script is self-contained apart from an
+         OPTIONAL triage helper that it reads if present and skips if not.
+
+         ⛔ THE SURFACE IDS ARE WRITTEN OUT, NOT INHERITED. A launchd job gets neither the operator's
+         shell env nor its rc files, so an unset WS/SURFACE would fall back to the script's defaults —
+         and on a box with more than one workspace those defaults are whatever the script was born
+         with. They are pinned here so `cat` of the installed plist answers "which surface is being
+         reminded?" without reading code. Change them here, not in a shell profile.
+
+         ⛔ EXIT 0 ALWAYS, AND THE CAPTURE IS ONLY FOR A DEATH BEFORE THE LOG EXISTS. The reminder's
+         decision is its own bounded log ($HOME/.pi/agent/state/objective-reminder.log), which
+         `scripts/lib/fleet-inventory.sh` reads (freshness + the last verdict token: a trailing
+         `REFUSED`/`FAIL`/`UNSENT` is FAILING even though the exit code is 0 — that is the silent
+         stop this pair exists to surface). The /tmp capture below exists for the one case the script
+         cannot log: it did not start at all (a bash parse error, a missing interpreter) — the same
+         class of failure that took the controller down, so it must not be silent here either.
+
+         ⛔ ON A LINUX CELL there is no launchd and this template is not installed; the cell gets
+         templates/systemd/eldato-objective-reminder.{service,timer} through install-cell-timers.sh,
+         on the SAME systemd timer mechanism the cell already uses for its disk reaper. No second
+         scheduler is invented (no cron: `crontab` writes fail with EINTR on this Mac — recorded). -->
+    <key>Label</key>
+    <string>com.eldato.objective-reminder</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{AGENT_INFRA_PATH}}/scripts/objective-reminder.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>WS</key>
+        <string>443A7DFB-3A05-4318-9606-451C768D1874</string>
+        <key>SURFACE</key>
+        <string>0D4F1EFD-C705-468F-8D00-85ACA3FD1AB4</string>
+        <key>MAX_BYTES</key>
+        <string>420</string>
+    </dict>
+    <key>StartInterval</key>
+    <!-- 600s = 10 min: the cadence the live box was hand-armed at. Tighter would not help (the
+         objective does not change per minute) and costs a cmux round trip plus a read-screen each
+         time; looser lets a drifted objective stand for longer than one lane's lifetime. -->
+    <integer>600</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <!-- ⛔ Deliberately NOT RunAtLoad: a login/boot pass would race the agent's own startup and its
+         composer may not exist yet, which produces an UNSENT line for a box that is merely booting.
+         The first reminder is one interval after the job is loaded, and `install-launchd.sh`
+         bootstraps it immediately, so the wait is bounded by 10 minutes. -->
+    <!-- ⛔ /tmp, like every other template here: launchd opens both files BEFORE exec, and nothing
+         creates $HOME/.pi/agent/state for it. The durable record is the script's own log. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/objective-reminder.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/objective-reminder.launchd.err</string>
+</dict>
+</plist>

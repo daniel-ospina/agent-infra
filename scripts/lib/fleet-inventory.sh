@@ -786,6 +786,71 @@ fleet_row_pr_doctor() {
     "$FLEET_AGENT_SCRIPTS/pr-doctor.py" pr-doctor
 }
 
+# ── component: the objective reminder ─────────────────────────────────────────────────────────
+# ⛔ WHY IT NEEDS A ROW AT ALL: the reminder fails by ABSENCE. A pass that refuses an over-budget payload,
+# or whose submit keystroke was swallowed, exits 0 and writes one log line — so no launchd status, no
+# process count and no unit state shows it. The box then looks entirely healthy while the operator's
+# objective has not reached the agent for hours. That is the exact "silently off" shape this file exists
+# to end, so the row reads TWO data: the job's own freshness (the schedule it declares) AND the verdict
+# token the pass wrote last, because a running job is not a delivering one.
+#
+# The status vocabulary the pass writes (scripts/objective-reminder.sh):
+#   sent · previous reminder CONFIRMED delivered           → delivering
+#   BUDGET (triage dropped)                                → still delivering, noted
+#   REFUSED · FAIL · UNSENT · STILL-UNCONFIRMED · SKIP     → NOT delivering, whatever the exit code says
+# `STILL-UNCONFIRMED` is deliberately RED: the deferred confirmation exists because the boundary lags,
+# and a state that survives into the next pass is a channel that stopped working, not a slow one.
+_fleet_objective_reminder_log() { printf '%s\n' "$FLEET_AGENT_STATE/objective-reminder.log"; }
+
+fleet_row_objective_reminder() {
+  local log; log="$(_fleet_objective_reminder_log)"
+  local out state detail last verdict
+  case "$FLEET_PLATFORM" in
+    cell|linux)
+      # A cell has no launchd: both passes are systemd timers (install-cell-timers.sh), on the same
+      # mechanism the cell already uses for its disk reaper. The unit is judged by ITS OWN declaration
+      # (`OnUnitActiveSec=10min`), not by a constant invented here.
+      local unit="eldato-objective-reminder.timer" dir active="unknown"
+      if [ -f "/etc/systemd/system/$unit" ]; then
+        active="$(${FLEET_SYSTEMCTL:-systemctl} is-active "$unit" 2>/dev/null || true)"
+      elif [ -f "$FLEET_HOME/.config/systemd/user/$unit" ]; then
+        active="$(${FLEET_SYSTEMCTL:-systemctl} --user is-active "$unit" 2>/dev/null || true)"
+      else
+        if [ -f "${FLEET_INFRA_ROOT:-}/scripts/objective-reminder.sh" ] || [ -f "$FLEET_AGENT_SCRIPTS/objective-reminder.sh" ]; then
+          fleet_row objective-reminder "timer active, fresh verdict" "no timer unit" MISSING \
+            "the reminder's code IS on this box but no systemd timer installs it (looked for /etc/systemd/system/$unit and ~/.config/systemd/user/$unit) — nothing runs it; install with scripts/install-cell-timers.sh --install"; return 0
+        fi
+        fleet_row objective-reminder "timer active, fresh verdict" "not installed" SKIPPED \
+          "neither the timer unit nor the reminder script exists on this box — this component does not exist here (NOT a healthy reminder)"; return 0
+      fi
+      if [ "$active" != active ]; then
+        fleet_row objective-reminder "timer active, fresh verdict" "$unit: ${active:-unknown}" MISSING \
+          "the timer unit exists but is not active (is-active=${active:-unknown}) — it will never fire; enable it with: systemctl --user enable --now $unit"; return 0
+      fi
+      ;;
+    mac)
+      out="$(_fleet_row_launchd_job objective-reminder com.eldato.objective-reminder "" reminder "$log")"
+      state="$(printf '%s' "$out" | cut -f4)"
+      if [ "$state" != OK ]; then printf '%s\n' "$out"; return 0; fi
+      ;;
+    *)
+      fleet_row objective-reminder "loaded, fresh output, last verdict sent" "platform unknown" UNKNOWN \
+        "FLEET_PLATFORM/PLATFORM is unset, so whether this is a launchd job or a systemd timer cannot be determined — an unanswered question is not a pass"; return 0 ;;
+  esac
+  last="$(tail -1 "$log" 2>/dev/null || true)"
+  if [ -z "$last" ]; then
+    fleet_row objective-reminder "loaded, fresh output, last verdict sent" "job installed, no log line yet" LATE \
+      "the job is installed and has produced no line in $log — either it has not run yet or it dies before it can log (its /tmp launchd capture answers which); a reminder that has never spoken is not a working channel"; return 0
+  fi
+  verdict="$(printf '%s' "$last" | cut -f2- | sed 's/^[[:space:]]*//')"
+  case "$verdict" in
+    REFUSED*|FAIL*|UNSENT*|STILL-UNCONFIRMED*|SKIP*)
+      fleet_row objective-reminder "loaded, fresh output, last verdict sent" "last pass: ${verdict:0:60}" FAILING \
+        "the reminder RAN and did not deliver: '$verdict' (its exit code is 0 by design, so this log line is the only signal). REFUSED means the payload is over the byte budget (a ~969 B send failed Broken pipe; the fix is a shorter objective, never a bigger budget); UNSENT means the submit keystroke was swallowed; STILL-UNCONFIRMED twice means the surface ids are wrong. Log: $log"; return 0 ;;
+  esac
+  fleet_row objective-reminder "loaded, fresh output, last verdict sent" "last pass: ${verdict:0:60}" OK ""
+}
+
 # The reapers, one row each — a group row would hide which of them is dead, and their schedules
 # differ by two orders of magnitude (1h … 24h), so a single freshness bound would be a lie.
 # The OWN LOG each reaper writes, cited from the script that opens it — never inferred:
@@ -978,7 +1043,7 @@ fleet_rows() {
   fleet_row_heartbeat_loop
   fleet_row_cadence_timer
   fleet_row_pr_doctor
-  # The 3rd arg is the code the job runs, CITED FROM THE INSTALLED PLIST (not guessed): both the
+  fleet_row_objective_reminder  # The 3rd arg is the code the job runs, CITED FROM THE INSTALLED PLIST (not guessed): both the
   # worktree and the branch reaper are driven by the same wrapper, with a different --script.
   fleet_row_reaper com.tortoise.worktree-reaper pi-reap-worktrees.log "$FLEET_AGENT_SCRIPTS/pi-reap-worktrees-launchd.py"
   fleet_row_reaper com.tortoise.branch-reaper cleanup-stale-branches.log "$FLEET_AGENT_SCRIPTS/pi-reap-worktrees-launchd.py"
