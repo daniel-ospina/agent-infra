@@ -1028,6 +1028,20 @@ STUB_CHANGED_FILES=2 STUB_BODY="Fixes #424369" STUB_LABELS="complexity:micro" ru
 assert_contains "$RECORD_ERR" "the changed-path list is truncated or inconsistent" "8.16 parity: the refusal names the truncated/inconsistent list"
 assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 parity: the truncation arm has its own wording (not the rc-3 cause list)"
 
+# THE 300-ENTRY CEILING — the arm's OTHER disjunct, and it is a different failure
+# mode from the parity one above: the compare endpoint returns at most 300 entries
+# and does not paginate, so a diff AT the cap may have been silently shortened —
+# and `a diff that large is never micro` is the policy besides. Pinned separately
+# because each disjunct guards a different hole: the parity vector above catches a
+# COUNT MISMATCH, this one catches a COMPLETE-LOOKING 300-path diff, which the
+# `-ge 300` half refuses on size alone. Measured: deleting just `[ "$MICRO_DISTINCT"
+# -ge 300 ] ||` left this suite green before this vector existed, i.e. a 300-path
+# diff could have recorded clean-micro — the tier that dispatches no reviewers.
+STUB_CHANGED_FILES=300 STUB_FILES="$(seq -f 'docs/f%g.md' 1 300)" STUB_BODY="Fixes #424370" STUB_LABELS="complexity:micro" run_micro_verdict 424370
+[ "$RECORD_RC" = "4" ] && ok "8.16 ceiling: a 300-path diff refuses (exit 4)" || bad "8.16 ceiling: a 300-path diff must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424370.json" ] && ok "8.16 ceiling: no record written at the 300-entry cap" || bad "8.16 ceiling: certified a 300-path diff clean-micro"
+assert_contains "$RECORD_ERR" "the changed-path list is truncated or inconsistent" "8.16 ceiling: the refusal names the truncated/inconsistent list"
+
 # 9. #980 argv/env fail-closed guard ─────────────────────────────
 # The second-model flag/env surface was REMOVED. Its removal must fail CLOSED:
 # exit 2, a named message, and NO record written. The defect class it guards:
@@ -1492,15 +1506,18 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #      if A's writer silently failed (the vacuity this block exists to close).
 #      424520-424523 is verified unused by every other vector in this file.
 #  (2) The env-prefix assignments: `VAR=val func` is NOT a leak — a prefix
-#      assignment before a FUNCTION call is restored when the call returns,
-#      UNLESS the callee itself assigns/exports that variable (measured on bash
-#      5.2.21: plain callee → previously-unset comes back unset, previously-set
-#      at its old value; `f(){ export V=inside; }; V=p f` → V=inside). Special
-#      builtins keep the value only under `set -o posix`, which this suite does
-#      not use — both clauses matter, and the first is why every runner here does
-#      its `export`s INSIDE its own `( … )` subshell: nothing a runner exports can
-#      escape the call (measured: after a `run_record_diff_with` the four
-#      variables come back unset, or at their pre-set value).
+#      assignment before a FUNCTION call is restored when the call returns
+#      (measured on bash 5.2.21: previously-unset comes back unset, previously-set
+#      at its old value; a PLAIN assignment inside the callee is discarded either
+#      way). The one exception is narrow and measured: a callee that `export`s the
+#      variable while it was previously UNSET leaves that value behind
+#      (`h(){ export W=inside; }; W=p h` → W=inside; with W pre-set it comes back
+#      at its old value). Special builtins keep the value only under
+#      `set -o posix`, which this suite does not use. The exception is exactly why
+#      every runner here does its `export`s INSIDE its own `( … )` subshell:
+#      nothing a runner exports can escape the call (measured: after a
+#      `run_record_diff_with` the four variables come back unset, or at their
+#      pre-set value).
 #      The carriers that survive a call are the TOP-LEVEL exports: `export
 #      STUB_LABELS_DIR` / `export STUB_LABELS` in §8.9 / §8.9a / §8.9b / §8.14 /
 #      §8.15 (the five blocks that install a per-issue label map). Each unsets its
