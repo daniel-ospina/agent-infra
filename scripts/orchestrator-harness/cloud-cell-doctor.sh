@@ -925,7 +925,15 @@ run_reap() {
       # ⛔ A READ THE PASS COULD NOT TAKE IS NOT A PASS (#2163 review, P2). Recording `?` in the line
       # while leaving rc=0 is the "looks alive while doing nothing" class this role exists to remove:
       # the census is the only instrument that sees the population the session pass cannot.
-      *) census="lanes=?/? zombie=?"; unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+      # ⛔ AND IT IS COUNTED ONCE, BY THE NEXT CASE (#2163 review cycle 8, P2). This arm REWRITES the
+      # census into exactly the `?`-numerator shape the arm below escalates on, so incrementing
+      # `unverifiable` here as well counted ONE failed read twice: the shipped pass line read
+      # `unverifiable=2` for a single garbled `count`, and `unverifiable=` is the field an operator
+      # reads to decide whether the instrument is trustworthy. Rewrite only; the arm below owns the
+      # count and the rc — which is also why no input exists where a `pass_rc=3` here is the only
+      # escalation (measured: removing it alone changes nothing; removing it AND the one below reds
+      # `census-garble` at rc=0).
+      *) census="lanes=?/? zombie=?" ;;
     esac
     # A `?` NUMERATOR with readable totals is the same abstention one lane at a time (`count` exits 3
     # when a liveness age could not be read); it must not read as a clean pass either.
