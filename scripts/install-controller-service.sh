@@ -171,14 +171,26 @@ TARGET=""; UNIT_DIR=""; SC=""; WANTED_BY="multi-user.target"
 # so re-pointing `CONTROLLER_SYSTEM_UNIT_DIR` at a refused directory cannot make the guard agree with
 # itself. A directory OUTSIDE every systemd tree (a hermetic test fixture under `$TMPDIR`) is always
 # allowed: nothing boots it.
+normalize_path() { # <absolute path> — LEXICAL normalisation: drop `.`, collapse `..` and repeated slashes
+    local part out=""
+    local IFS=/
+    for part in $1; do
+        case "$part" in
+            ''|.) continue ;;
+            ..)   [ -n "$out" ] && out="${out%/*}"; continue ;;   # a pop above / is a no-op, as on the kernel
+        esac
+        out="$out/$part"
+    done
+    printf '%s\n' "${out:-/}"
+}
 canon_dir() { # <dir> — the path `mkdir -p` WOULD land on, physically
     local d="${1:-}" par base rest="" out=""
     [ -n "$d" ] || return 0
-    # ⛔ `readlink -f` FIRST, WHEN IT CAN ANSWER (re-review P1, #2666): it collapses `//` and resolves the
-    # whole chain. It cannot answer while ANY ancestor is missing, which is what the branches below cover —
-    # and the bash `pwd -P` they use preserves exactly TWO leading slashes (`cd //etc/systemd/user && pwd -P`
-    # → `//etc/systemd/user`), so a doubled-slash spelling used to miss every tree pattern AND be counted as
-    # a second copy by the resolved dedupe. Every branch therefore normalises a leading `//` on the way out.
+    # ⛔ `readlink -f` FIRST, WHEN IT CAN ANSWER (re-review P1, #2666): it resolves the whole chain physically.
+    # It cannot answer while ANY ancestor is missing, which is what the branches below cover — and bash's
+    # `pwd -P` preserves exactly TWO leading slashes (`cd //etc/systemd/user && pwd -P` → `//etc/systemd/user`),
+    # so a doubled-slash spelling used to miss every tree pattern AND be counted as a second copy by the
+    # resolved dedupe. (dash collapses them; the normalisation below is what makes both shells agree.)
     if command -v readlink >/dev/null 2>&1 && readlink -f -- "$d" >/dev/null 2>&1; then
         out="$(readlink -f -- "$d")"
     elif [ -d "$d" ]; then
@@ -186,8 +198,7 @@ canon_dir() { # <dir> — the path `mkdir -p` WOULD land on, physically
     else
         # ⛔ RESOLVE THE DEEPEST ANCESTOR THAT EXISTS AND APPEND THE REST (re-review P2, #2666). Resolving
         # only the immediate parent left the LITERAL when more than the leaf was missing, so the graded path
-        # was not the path the write landed on: `<tmp>/noexist/../etc/systemd/system.control` was admitted
-        # (the `..` never collapsed, no pattern matched) while `mkdir -p` created `<tmp>/etc/systemd/…`.
+        # was not the path the write landed on.
         par="$d"
         while [ -n "$par" ] && [ "$par" != "/" ] && [ "$par" != "." ] && [ ! -d "$par" ]; do
             base="$(basename "$par")"
@@ -199,7 +210,13 @@ canon_dir() { # <dir> — the path `mkdir -p` WOULD land on, physically
         fi
     fi
     [ -n "$out" ] || out="${d%/}"
-    case "$out" in //*) out="/${out#//}" ;; esac   # POSIX: a leading `//` is implementation-defined
+    # ⛔ AND THE `..` SEGMENTS IN THE REMAINDER ARE COLLAPSED LEXICALLY (re-review P1, #2666). Appending the
+    # remainder verbatim kept its `..`s, and the tree patterns cannot see through them: a chain that climbs
+    # PAST the resolved ancestor (`<tmp>/x/../../../../etc/systemd/system.control`) graded as a fixture path
+    # while `mkdir -p` created the directory inside `/etc/systemd`. Lexical is correct here and not a
+    # shortcut: the ancestor is already PHYSICAL, and the remainder does not exist yet, so there is no
+    # symlink left in it to follow. A `..` that pops above `/` is a no-op, exactly as on the kernel.
+    case "$out" in /*) out="$(normalize_path "$out")" ;; esac
     printf '%s\n' "$out"
 }
 unit_dir_under() { # <resolved dir> <root> — true when <dir> IS <root> or inside it (both resolved)

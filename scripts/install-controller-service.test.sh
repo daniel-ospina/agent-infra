@@ -1346,6 +1346,24 @@ for _dd in '/tmp/../etc/systemd/system.control' "$DD/missing/../usr/lib/systemd/
                                      || bad "$_dd was admitted — the graded path is not the write path — $_DD_OUT" ;;
   esac
 done
+# ⛔ A `..` CHAIN THAT CLIMBS PAST THE RESOLVED ANCESTOR (re-review P1, #2666). The missing-ancestor branch
+# duplicated the remainder VERBATIM, so its `..`s survived into the graded path where no tree pattern can see
+# them: `<tmp>/x/../../../../etc/systemd/system.control` graded as a fixture path while `mkdir -p` created
+# the directory INSIDE /etc/systemd. The remainder is now normalised lexically against the resolved ancestor.
+DD2="$(arm_root dd2)"; mk_systemctl "$DD2/bin" "$DD2/state" "$DD2/sc.log"
+_UP="$DD2/x/$(printf '../%.0s' $(seq 1 8))etc/systemd/system.control"
+UP_RC=0; UP_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_UP" inst dd2 --dry-run 2>&1)" || UP_RC=$?
+[ "$UP_RC" -ne 0 ] && ok 'a .. chain that climbs PAST the resolved ancestor is REFUSED (remainder normalised)' \
+                   || bad "a .. chain climbed to /etc/systemd and was still admitted — the write would land there — $UP_OUT"
+case "$UP_OUT" in
+  *'resolves to /etc/systemd/system.control'*) ok 'and the refusal names the path it climbed to' ;;
+  *) bad "the climbing-.. refusal does not name the resolved path — $UP_OUT" ;;
+esac
+# …and the lexically-normalised remainder must not REFUSE a path that merely climbs inside the fixture.
+_UPOK="$DD2/missing/x/../../units"
+UPO_RC=0; UPO_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_UPOK" inst dd2 --dry-run 2>&1)" || UPO_RC=$?
+[ "$UPO_RC" -eq 0 ] && ok 'a .. chain that stays inside the fixture is still ALLOWED (the rule is the resolved path)' \
+                    || bad "a fixture path with interior .. was refused — $UPO_OUT"
 # ⛔ AND THE PHYSICAL SPELLING OF A NOT-YET-EXISTING USER ROOT (re-review P2, #2666): with `$HOME` a symlink and
 # `~/.local/share/systemd` absent, the `$HOME` spelling was refused while its PHYSICAL spelling was admitted —
 # same directory, two verdicts. Both must resolve to the same root now.
