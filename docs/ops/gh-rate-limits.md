@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, gh-rate-limits, gh-limit
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2227, gh-rate-limits, gh-limit
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -29,6 +29,44 @@ concurrency per machine, and spaces call starts. A harness session resolves the 
 which resolves the next `gh` on PATH — including `gh-shim`, so the argv gate stays in the chain.
 Where both pace, the cost of a mutating call is one extra `>= 1 s` gap. Neither layer supersedes
 the other; changing one does not change the other's guarantee.
+
+## A serialised call is SLOW, not ABSENT — the readers must say which (#2227)
+
+Serialising per box is the correct remedy for the secondary limit, and it has a cost that is easy to
+misread: **latency becomes a function of how many lanes the box is running.** Measured 2026-10-20 on
+three cloud cells:
+
+| lanes on box | `gh pr view` |
+|---|---|
+| 13 | **63.0 s** |
+| 3 | 0.676 s |
+| — | 0.091 s (raw `curl` to `api.github.com` — network and account fine) |
+
+A reader whose timeout sits under that number does not bound the read, it **manufactures a false
+absence** — the beat printed `queue_read=BLIND(14/14 unread)`, `merged_24h=?` and
+`VERDICT=UNKNOWN (merge-rate read failed)` roughly hourly for data that was merely not served yet.
+
+The rules that follow from it, and where they live:
+
+- **The read budgets are derived from the measurement, never picked.** `objective.py`'s
+  `QUEUE_READ_MAX_S` (100 s) is 1.6x the measured worst case; `merge-queue.py`'s
+  `MERGE_RATE_TIMEOUT_S` (100 s) is the same. Changing either without the measurement is the same
+  mistake in the other direction.
+- **The reader CLIPS its cap to the caller's declared bound** (`OBJECTIVE_CALLER_BOUND_S`, set by
+  `heartbeat-loop.sh` and `lane-scan-fallback.sh` as `run_bounded`/`bounded` arguments). The reader
+  and the loop deploy separately (`heartbeat-loop.sh` is a declared, withheld farm entry, #1553), so
+  a new reader under an old 90 s loop reads for 66 s and still PRINTS. A budget above the caller's
+  kill is an inert bound: the process dies and writes no line at all.
+- **A slow read is DATA and says so; a failed read says why.** `queue_read=SLOW(waited=63.1s)`
+  carries real counts and no caveat; `queue_read=UNREADABLE(waited=100.4s, last_good=812s)` carries
+  `what it tried`, the wait, and the AGE of the last good sample, and **no counts at all** (#1869
+  still governs: a stale number never stands in for an unread one, and a stale value may be shown
+  only labelled with its age — `merge-queue.py` prints `last_good_rate=` and still refuses a
+  verdict).
+- **`BLIND` keeps its narrow meaning** (the merge state never came back readable), so a word that
+  covers "we waited 63 s and got an answer" cannot also cover "we never got an answer".
+- Bounds that a busy box can exceed are not bounds: `lane-status.py` caps the WORK it walks
+  (session files, pids, activity files) and reports `lane-status: SAMPLED …` when a cap bites.
 
 ## The layer that owns this now (#1988)
 
@@ -170,7 +208,7 @@ Two properties worth knowing before you debug it:
   `GH_LIMIT_NO_WAIT=1` makes the layer record the limit and return at once; EIGHT heartbeat tools set
   it (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`,
   `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`), because each one's own
-  bound is a per-CALL timeout in the 60-420 s range (or a `run_bounded` step of 20-90 s) that is
+  bound is a per-CALL timeout in the 60-420 s range (or a `run_bounded` step of 20-180 s) that is
   consumed by the layer's first documented wait of 60 s, or shared with every other call the step
   makes — the outcome is a timeout, and the box then reports `UNKNOWN`/`STALL` instead of the
   `RATE-LIMITED` verdict it can prove. (One of the eight — `pr-doctor.py` — is
