@@ -14,8 +14,16 @@ aboutObjects: agent-infra, issue-2402, orchestrator-controller, systemd, cloud-c
 The cell's orchestrator controller is started by `scripts/install-controller-service.sh`, which renders
 and installs **`eldato-orchestrator.service`** — a systemd unit whose main process *is* the controller.
 The cloud-cell bring-up **runs that installer and reads it back** (`scripts/cloud-cell-bringup.sh` →
-`check_controller_service`), so a provisioned cell is never certified `CELL READY` with nothing above
-its controller; macOS is skipped there because the launchd agent already has `KeepAlive`.
+`check_controller_service`), so a Linux cell is not certified `CELL READY` with nothing above its
+controller.
+
+⛔ **macOS is not verified there, and this page must not claim it is** (review P1, #2402). The bring-up
+**warns** and returns success: *"controller supervision on macOS is NOT VERIFIED by this check — the launchd
+agent (com.eldato.orchestrator-loop) is out of scope here and nothing in this run read launchctl"*. That is
+deliberate — a `launchctl` probe would refuse a healthy Mac whenever the read is unavailable — but it means
+the Mac's supervision is an **unmeasured** surface, not a checked one: verify it by hand with
+`launchctl print gui/$UID/com.eldato.orchestrator-loop`. The gap is named here rather than hidden behind the
+banner.
 
 ## Failure mode this exists for
 
@@ -47,8 +55,8 @@ is not a launcher for a session:
 | `ExecStart=/bin/bash <supervisor> start` + `Environment=ORCH_FOREGROUND=1` | `start` `exec`s `orch-loop.sh` **in the unit's own process**, so the unit's cgroup owns the controller's lifetime |
 | `Restart=always` | the measured case is an **orderly exit 0**. `on-failure` reproduces the defect byte for byte |
 | `RestartSec=15` | stated in the artifact, not inherited (`ORCH_RESTART_SEC` overrides; a whole number of seconds ≥ 1) |
-| `After=network-online.target`, `Wants=` | the first cycle reads GitHub and the candidate board; started early it records "no work" and sleeps a whole `CYC` |
-| `StartLimitIntervalSec=300` / `StartLimitBurst=3` | systemd's **default 10 s window can never fill** at one start per 15 s, so a configuration fault (no key, foreign controller, bad pin) would restart the box forever, re-running `cmd_check`'s network reads each time. Three failures inside five minutes converge to `failed`, which `--status` prints — and that only holds while the failures **fit** the window: `StartLimitBurst × (CONTROLLER_ORPHAN_TIMEOUT + RestartSec) < StartLimitIntervalSec`, enforced by the installer (below) |
+| `After=network-online.target`, `Wants=` | the first cycle reads GitHub and the candidate board, and `start` runs those reads as a **pre-flight** — offline, `cmd_check` fails and `start` exits non-zero before the loop runs. ⛔ **This ordering binds in the SYSTEM scope only**: `network-online.target` exists in the system manager (`/usr/lib/systemd/system/`) and NOT in a per-user manager, so a user-scope unit's dependency is dropped by systemd. Both scopes render the lines (one owner for the property) and the installer **says so** on a user-scope install: there, a boot without network can spend the three attempts and converge to `failed` |
+| `StartLimitIntervalSec=300` / `StartLimitBurst=3` | systemd's **default 10 s window can never fill** at one start per 15 s, so a configuration fault (no key, foreign controller, bad pin) would restart the box forever, re-running `cmd_check`'s network reads each time. Three failures inside five minutes converge to `failed`, which `--status` prints — and that only holds while the failures **fit** the window: `StartLimitBurst × (CONTROLLER_ORPHAN_TIMEOUT + RestartSec) < StartLimitIntervalSec`. ⛔ **An attempt also costs more than the ceiling**: the supervisor polls in 5 s steps (up to `+5 s`) and pays its own startup and `cmd_check` reads (`~5 s`), so the installer subtracts **both** and the enforced ceiling is `(interval−1)/burst − RestartSec − 5 − 5` = **74 s** at these defaults (not the 84 s the plain relation suggests). It refuses any value that does not fit, and quotes only the number it enforced |
 | `KillMode=process`, `TimeoutStopSec=30` | `orch-loop.sh` traps TERM and exits in ~0.1 s (#1715), so the controller stops on its own. **Not `mixed`**: with no tmux server running (the measured #2402 shape) the doctor's session forks the *server* inside this unit's cgroup, and `mixed` would SIGKILL every session on that per-user server — peer repos' controllers and operators' shells included — before `stop`'s ownership proof could run |
 | `TimeoutStartSec=60`, `Environment=CONTROLLER_ORPHAN_TIMEOUT=60` | `ExecStart` runs the **whole** of `start`, and service mode **waits** for a controller that is already running. The bound is the process's, **not** `TimeoutStartSec`'s: this unit is `Type=simple`, whose start job completes the moment the main process is forked (`systemd.service(5)`), so that directive cannot bound the wait — an earlier revision claimed it did and the real bound was the supervisor's 3600 s default, with the unit reading `active (running)` throughout. `CONTROLLER_ORPHAN_TIMEOUT` is the wait for a session that outlived its loop; an orphan never exits, so this start can never succeed. It must therefore be short enough that `StartLimitBurst` of those attempts **fit inside** `StartLimitIntervalSec` — `3 × (60 + 15) = 225 s < 300 s` — because systemd refuses the start **after** the burst is exceeded: at the old 120 s default the three failures spanned 405 s, the oldest start aged out of the window before the fourth was refused, and the unit restarted forever while every surface read supervised (`ORCH_START_TIMEOUT_SEC` overrides both; the installer refuses any value that does not fit the arithmetic) |
 | `Environment=CONTROLLER_HANDOVER_TIMEOUT=3600` | the wait for a controller this state dir **owns** and that is still running — the **migration** case, where the box being upgraded is landing PRs right now. Long on purpose: a short bound would fail the upgrade instead of adopting the running controller (`ORCH_HANDOVER_TIMEOUT_SEC` overrides; a whole number ≥ 1) |
@@ -71,10 +79,15 @@ Tried in order, and the reason is named in the output:
 (`scripts/orchestrator-harness/install.sh` + `launchd.plist.template`); a second supervisor there would
 be a second dispatcher on one queue.
 
-**`sudo` is refused, not degraded.** Run the installer as the operator, not with `sudo bash …`: the
-rendered unit takes `User=`, `HOME=`, `CELL_HOME=` and `O=` from the invoking shell, so an elevated run
-would install a root-owned controller with root's `keys.env` and `gh` auth — and, because it is
-enabled, `start` would delegate to it and the cell's own controller could never come up.
+**A root run is refused, not degraded — `sudo bash …` and every other spelling.** Run the installer as
+the operator, not as root: the rendered unit takes `User=`, `HOME=`, `CELL_HOME=` and `O=` from the
+invoking shell, so an elevated run would install a root-owned controller with root's `keys.env` and `gh`
+auth — and, because it is enabled, `start` would delegate to it and the cell's own controller could never
+come up. The refusal is on the **uid**, not on `SUDO_USER`: `su -`, a direct root login and a root-run
+provision are refused too (an earlier guard tested `uid 0 AND SUDO_USER`, so it admitted exactly those).
+`SUDO_USER` only selects the remedy sentence. A root-owned controller must be asked for explicitly with
+`CONTROLLER_ALLOW_ROOT=1`; the `SYSTEMD_UNIT_DIR` override (the test/operator seam that names a directory)
+is exempt, so the hermetic suite runs as any uid.
 
 ## The cooperation contract (`cloud-cell-supervisor.sh`)
 

@@ -13,8 +13,15 @@
 # uses): one verb that renders, installs and converges, and fails loudly rather than skipping.
 Description=eldato orchestrator controller — the cell's dispatcher (agent-infra#2402)
 Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/controller-service.md
-# The controller's first cycle reads GitHub and the candidate board. Started before the network is up it
-# records "no work" and then sleeps a whole CYC, so the ordering is load-bearing, not cosmetic.
+# The controller's first cycle reads GitHub and the candidate board, and `start` runs those reads as a
+# PRE-FLIGHT: offline, `cmd_check` fails and `start` exits non-zero BEFORE the loop ever runs, so the
+# ordering is load-bearing rather than cosmetic.
+# ⛔ AND IT BINDS ONLY IN THE SYSTEM SCOPE (review P1, #2402). `network-online.target` lives in the SYSTEM
+# manager only (`/usr/lib/systemd/system/`); a per-user manager ships default/basic/graphical-session/timers
+# and no network target, so a USER-scope unit's dependency is DROPPED by systemd rather than honoured. Both
+# scopes render these two lines (one template, one owner for the property), and the installer SAYS so when
+# it installs into the user scope: there a boot without network can spend all three attempts and converge
+# to `failed`, which nothing re-arms automatically by design — re-arm with `--install` or `start`.
 After=network-online.target
 Wants=network-online.target
 # ⛔ THE START LIMIT IS NAMED EXPLICITLY, because systemd's DEFAULT CANNOT FIRE HERE — leaving it
@@ -92,6 +99,13 @@ TimeoutStopSec=30
 #                                which is what makes the burst fill and the unit converge to `failed`. At one
 #                                start per `orphan + RestartSec`, "below the interval" is NOT enough — the
 #                                installer enforces the arithmetic for exactly that reason.
+#                                ⛔ AND AN ATTEMPT COSTS MORE THAN THE CEILING (review P2 round 16, #2402): the
+#                                supervisor polls in 5 s steps, so a T-second ceiling can cost T+5 s, and every
+#                                attempt also pays the supervisor's startup and `cmd_check` reads (another
+#                                ~5 s). The installer subtracts BOTH, so the ORPHAN CEILING it accepts is
+#                                `(interval-1)/burst - RestartSec - 5 - 5` — 74 s at these defaults, not the
+#                                84 s the plain relation suggests. Both allowances are named once, in
+#                                scripts/install-controller-service.sh.
 # `TimeoutStartSec=` is kept as the systemd-side counterpart of the orphan bound — it keeps the pair true if
 # this unit ever changes `Type=` — but it is not what enforces either bound today.
 TimeoutStartSec={{START_TIMEOUT_SEC}}

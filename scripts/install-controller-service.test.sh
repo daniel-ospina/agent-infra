@@ -201,8 +201,13 @@ STUB
 # hermetic suite, and this one would have been red on every cell it is meant to protect.
 inst() {
   local r="$T/$1"; shift
+  # ⛔ THE FIXTURE ASKS FOR A ROOT INSTALL EXPLICITLY (review P2 round 16, #2402). The installer now refuses
+  # ANY uid-0 run that did not ask (the old guard only refused when `SUDO_USER` was set, so `su -` and a
+  # root login installed a root-owned, enabled, unusable unit). This suite runs on root runners too, so the
+  # fixture carries the same explicit opt-in an operator would; the one arm that must SEE the refusal
+  # (`§G`, root is refused) runs `inst` with `EXTRA_ENV` unsetting it, so the rule is exercised, not bypassed.
   bnd env ORCH_SUPERVISOR="$SUP" SYSTEMCTL="$r/bin/systemctl" SYSTEMD_UNIT_DIR="$r/units" \
-      CONTROLLER_SYSTEM_UNIT_DIR="$r/units" \
+      CONTROLLER_SYSTEM_UNIT_DIR="$r/units" CONTROLLER_ALLOW_ROOT=1 \
       TEMPLATES_DIR="${TPL_DIR:-$(dirname "$TPL")}" HOME="$r/home" CELL_HOME="$r/home" \
       ENV_FILE="$r/home/keys.env" O="$r/o" PATH="$r/bin:$PATH" ELDATO_PLATFORM="${PLATFORM:-Linux}" \
       ${EXTRA_ENV:-} bash "$INST" "$@"
@@ -365,6 +370,26 @@ esac
 case "$UU_OUT" in
   *"WantedBy=default.target"*) ok 'user scope: the reported unit names its boot target' ;;
   *) bad 'user scope: the install does not report the boot target it rendered' ;;
+esac
+# ⛔ THE USER SCOPE MUST SAY THAT THE NETWORK ORDERING DOES NOT BIND THERE (review P1, #2402).
+# `network-online.target` exists only in the SYSTEM manager, so a per-user manager DROPS this unit's
+# `After=`/`Wants=` — the ordering the artifact advertises is not in force, `cmd_check`'s GitHub read fails on
+# an offline boot, three attempts fill the 300 s window, and the unit converges to `failed` (which nothing
+# re-arms automatically by design). The bound is disclosed at install time and the recovery is named; a
+# silent `After=` that systemd discarded is the "claim nobody measured" shape this PR exists to remove.
+case "$UU_OUT" in
+  *"does NOT bind in this (USER) scope"*) ok 'user scope: the install SAYS the network ordering does not bind here' ;;
+  *) bad "user scope: the install claims an ordering systemd drops in this scope, and says nothing — $UU_OUT" ;;
+esac
+case "$UU_OUT" in
+  *"--install\' or 'bash"*|*"re-arm with"*) ok 'user scope: and it names the re-arm path for a converged-to-failed unit' ;;
+  *) bad "user scope: the residual is disclosed without a recovery the operator can run — $UU_OUT" ;;
+esac
+# …and the SYSTEM scope must NOT carry that warning: it would teach operators to distrust a binding that is
+# real there, which is the same false claim pointing the other way.
+case "$A_OUT" in
+  *"does NOT bind"*) bad 'system scope: the user-scope ordering warning leaked into the SYSTEM scope install' ;;
+  *) ok 'system scope: no user-scope ordering warning (the dependency really binds there)' ;;
 esac
 # and a user manager with linger OFF must REFUSE rather than report a supervisor that dies at logout.
 printf '%s\n' '#!/bin/bash' 'case "$*" in *Linger*) printf "no\n" ;; *) exit 0 ;; esac' > "$US/bin/loginctl"
@@ -950,7 +975,7 @@ esac || bad "uninstall: a second run failed rc=$GU2_RC"
 GRT="$(arm_root gr)"; mk_systemctl "$GRT/bin" "$GRT/state" "$GRT/sc.log"
 printf '#!/bin/bash\ncase "$1" in\n  -u) echo 0 ;;\n  -un) exec /usr/bin/id -un ;;\n  *) exec /usr/bin/id "$@" ;;\nesac\n' > "$GRT/bin/id"
 chmod +x "$GRT/bin/id"
-GRT_RC=0; GRT_OUT="$(EXTRA_ENV=SUDO_USER=operator inst gr --install 2>&1)" || GRT_RC=$?
+GRT_RC=0; GRT_OUT="$(EXTRA_ENV="SUDO_USER=operator CONTROLLER_ALLOW_ROOT=0" inst gr --install 2>&1)" || GRT_RC=$?
 [ "$GRT_RC" -ne 0 ] && ok 'install: refuses an ELEVATED (sudo) invocation' \
                     || bad "install: installed a root-owned unit under sudo — $GRT_OUT"
 case "$GRT_OUT" in
@@ -959,6 +984,22 @@ case "$GRT_OUT" in
 esac
 [ -f "$GRT/units/eldato-orchestrator.service" ] && bad 'install: the root refusal WROTE a unit' \
                                               || ok 'install: the root refusal wrote nothing'
+# ⛔ AND THE OTHER SPELLINGS OF "root" ARE REFUSED TOO (review P2 round 16, #2402). The guard used to need
+# `SUDO_USER`, so `su -` / a root login / any root-run provision installed a root-owned ENABLED unit that
+# `start` then delegated to forever. The stub drops the last two chars of `id -u` output only for `-u`, so
+# this arm is the same root shape WITHOUT a stand-in — the shape that used to pass.
+GRU_RC=0; GRU_OUT="$(EXTRA_ENV="CONTROLLER_ALLOW_ROOT=0" inst gr --install 2>&1)" || GRU_RC=$?
+[ "$GRU_RC" -ne 0 ] && ok 'install: a root run with NO SUDO_USER (su -, root login) is refused too' \
+                    || bad "install: a uid-0 run with no SUDO_USER installed anyway — $GRU_OUT"
+case "$GRU_OUT" in
+  *"REFUSING to install as root"*) ok 'install: and that refusal still names the reason' ;;
+  *) bad "install: the no-SUDO_USER root refusal is unnamed — $GRU_OUT" ;;
+esac
+# ⛔ THE OVERRIDE IS REAL, NOT DECORATION: a root-only container must be able to ASK. This is the same
+# fixture WITH the opt-in, so it proves the refusal above is the opt-in and not a blanket "root is broken".
+GRO_RC=0; GRO_OUT="$(EXTRA_ENV="CONTROLLER_ALLOW_ROOT=1" inst gr --install 2>&1)" || GRO_RC=$?
+[ "$GRO_RC" -eq 0 ] && ok 'install: CONTROLLER_ALLOW_ROOT=1 IS the documented escape and it installs' \
+                    || bad "install: the documented CONTROLLER_ALLOW_ROOT=1 was refused — $GRO_OUT"
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §H — `--status`: the documented verification verb must not answer from a read it did not get
@@ -2007,6 +2048,33 @@ printf 'Environment=O=%s\n' "$FX/o" > "$FX/units/eldato-orchestrator.service"
 OW_RC=0; inst fx --install > "$T/ow.out" 2>&1 || OW_RC=$?
 [ "$OW_RC" -eq 0 ] && ok 'install: our OWN copy at the same path is still re-installed (ownership, not existence)' \
                    || bad "install: refused our own unit — the guard keys on existence instead of ownership: $(cat "$T/ow.out")"
+
+# ── a `keys.env` that spells the state dir in terms of $HOME resolves against the UNIT'S home ────
+# ⛔ THE BUG THIS PINS (review P2 round 16, #2402): the resolver evaluated the file with the CALLER's HOME,
+# so one unit file answered two different state dirs depending on who ran the verb — account B read account
+# A's unit as its OWN and `--status`/`--uninstall` acted on a foreign dispatcher. Discriminating by design:
+# the unit states `Environment=HOME=<uh>` and its keys.env spells `O=$HOME/o`, so the resolved answer is
+# `<uh>/o` when the unit's home is used and `<caller home>/o` when it is not. The rendered `O=` is a third,
+# unrelated dir, so neither the union nor the fallback can produce the expected string by accident.
+say_case 'a keys.env spelling O in terms of $HOME resolves against the UNIT home, not the caller’s'
+HM="$(arm_root hm)"; mk_systemctl "$HM/bin" "$HM/state" "$HM/sc.log"
+mkdir -p "$HM/uh" "$HM/otherhome"
+printf 'O=$HOME/o\n' > "$HM/uh/keys.env"
+{
+  printf 'Environment=O=%s\n' "$HM/otherhome/stated"
+  printf 'Environment=HOME=%s\n' "$HM/uh"
+  printf 'Environment=CELL_HOME=%s\n' "$HM/uh"
+  printf 'Environment=ENV_FILE=%s\n' "$HM/uh/keys.env"
+} > "$HM/units/eldato-orchestrator.service"
+HM_RC=0; inst hm --install > "$T/hm.out" 2>&1 || HM_RC=$?
+[ "$HM_RC" -ne 0 ] && ok 'home: a unit resolving to another state dir is refused (the fixture is foreign on purpose)' \
+                   || bad "home: installed over a unit that resolves elsewhere: $(cat "$T/hm.out")"
+grep -qF "$HM/uh/o" "$T/hm.out" \
+  && ok 'home: the resolved owner uses the UNIT’s Environment=HOME= (O=$HOME/o -> <unit home>/o)' \
+  || bad "home: the resolution did not use the unit's HOME — a foreign unit reads as this cell's: $(cat "$T/hm.out")"
+grep -qF "$HM/home/o" "$T/hm.out" \
+  && bad "home: the resolution used the CALLER's HOME — one unit file, two owners, depending on who asks: $(cat "$T/hm.out")" \
+  || ok 'home: and it does NOT use the caller’s HOME'
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"

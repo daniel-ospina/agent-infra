@@ -305,6 +305,14 @@ keyfile_has_key() {
 
 # LOCK is recomputed AFTER $ENV_FILE is sourced (below): keys.env may set $O, and a lock derived
 # from a stale $O makes `stop` release and announce the wrong path.
+# ⛔ THE INVOKER'S HOME IS CAPTURED BEFORE THE RE-POINT (review P2, #2402). The USER unit directory is the
+# INSTALLER's `$HOME/.config/systemd/user` (the installer writes there), but everything below re-points
+# `HOME` to `$CELL_HOME`. With CELL_HOME != HOME (a `CELL_HOME=` line in keys.env, or an installer invoked
+# as `CELL_HOME=… bash install-controller-service.sh`) every verb looked in `$CELL_HOME/.config/systemd/user`
+# while the unit sat in the operator's own home: `status` printed `supervision: NONE` over an ENABLED unit
+# and `stop` never issued the `systemctl stop` — the "reported stopped, still running" shape, one layer in.
+# Writer and readers must agree on ONE directory, so the pre-re-point value is kept deliberately.
+CONTROLLER_INVOKER_HOME="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"
 export HOME="$CELL_HOME"
 
 # Publish WORKER_ENV_NAMES into the tmux server's `update-environment`, APPENDING to whatever is
@@ -619,7 +627,7 @@ CONTROLLER_UNIT="${CONTROLLER_UNIT:-eldato-orchestrator.service}"
 controller_unit_copies() { # every copy on the box, system then user
   local d
   for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" \
-           "${CONTROLLER_USER_UNIT_DIR:-$HOME/.config/systemd/user}"; do
+           "${CONTROLLER_USER_UNIT_DIR:-${CONTROLLER_INVOKER_HOME:-$HOME}/.config/systemd/user}"; do
     [ -n "$d" ] && [ -f "$d/$CONTROLLER_UNIT" ] && printf '%s\n' "$d/$CONTROLLER_UNIT"
   done
   return 0
@@ -666,8 +674,8 @@ unit_rendered_owner() { # <unit file> -> the owner the unit RENDERS; nothing whe
   # A trailing slash is a spelling difference, not a different state dir.
   printf '%s\n' "${v%/}"
 }
-env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing when not evaluated
-  local f="$1" home="$2" rendered="$3" owner="" runner=() out=""
+env_file_owner_o() { # <envf> <unit_cell_home> <rendered_o> [<unit_home>] -> resolved O; nothing when not evaluated
+  local f="$1" home="$2" rendered="$3" unit_homeenv="${4:-}" owner="" runner=() out=""
   [ -n "${f:-}" ] && [ -r "$f" ] || return 1
   if [ "$(id -u)" = "0" ]; then
     # ⛔ THE TEST IS "WHO CAN WRITE IT", NOT "WHO OWNS IT" (review P2 round 9, #2402). Ownership alone missed
@@ -708,23 +716,34 @@ env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing wh
       runner=(runuser -u "$owner" --)
     fi
   fi
-  out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE bash -c '
+  # ⛔ THE UNIT'S OWN `HOME` IS PART OF THE EVALUATION (review P2, #2402). A `keys.env` may spell the state
+  # dir in terms of `$HOME` (`O=$HOME/orchestrator`), and the unit carries `Environment=HOME=` precisely
+  # because the controller resolves it that way. With HOME inherited from the CALLER, the same unit file
+  # resolved to the caller's home — measured: caller HOME=/tmp/cell-home -> /tmp/cell-home/orchestrator,
+  # caller HOME=/home/cellA -> /home/cellA/orchestrator — so cell B read cell A's unit as its OWN and
+  # `stop`/`--status`/`--uninstall` acted on another state dir's dispatcher. Set it from the unit, exactly
+  # like CELL_HOME/O above; an empty value means "the unit states no HOME", which keeps the caller's.
+  out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE -u HOME bash -c '
+      [ -z "$4" ] || HOME="$4"
       CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
       set -a; . "$1" >/dev/null 2>&1
       printf "%s" "${O:-}"
-    ' _ "$f" "${home:-}" "${rendered:-}" 2>/dev/null || true)"
+    ' _ "$f" "${home:-}" "${rendered:-}" "${unit_homeenv:-}" 2>/dev/null || true)"
   [ -n "${out:-}" ] || return 1
   printf '%s\n' "$out"
 }
 unit_owner_dir() { # <unit file>
-  local f="$1" rendered_o envf unit_home eff
+  local f="$1" rendered_o envf unit_home unit_homeenv eff
   [ -f "$f" ] || return 1
   rendered_o="$(unit_rendered_owner "$f")" || rendered_o=""
   envf="$(sed -n 's/^Environment=ENV_FILE=//p' "$f" 2>/dev/null | head -1)"
   unit_home="$(sed -n 's/^Environment=CELL_HOME=//p' "$f" 2>/dev/null | head -1)"
+  # the HOME the unit itself runs with — see env_file_owner_o's note: `O=$HOME/...` must resolve against the
+  # INSTALLING cell's home, not the caller's.
+  unit_homeenv="$(sed -n 's/^Environment=HOME=//p' "$f" 2>/dev/null | head -1)"
   eff=""
   if [ -n "${envf:-}" ]; then
-    eff="$(env_file_owner_o "$envf" "${unit_home:-}" "${rendered_o:-}")" || eff=""
+    eff="$(env_file_owner_o "$envf" "${unit_home:-}" "${rendered_o:-}" "${unit_homeenv:-}")" || eff=""
   fi
   [ -n "${eff:-}" ] || eff="${rendered_o:-}"
   [ -n "${eff:-}" ] || return 1
@@ -804,7 +823,7 @@ controller_unit_path() {
 sup_systemctl() { # <systemctl verb…>
   local sc user_scope=0
   if [ -n "${_UNIT_PATH:-}" ]; then
-    [ "$(dirname "$_UNIT_PATH")" = "${CONTROLLER_USER_UNIT_DIR:-$HOME/.config/systemd/user}" ] && user_scope=1
+    [ "$(dirname "$_UNIT_PATH")" = "${CONTROLLER_USER_UNIT_DIR:-${CONTROLLER_INVOKER_HOME:-$HOME}/.config/systemd/user}" ] && user_scope=1
   elif [ ! -f "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}/$CONTROLLER_UNIT" ]; then
     user_scope=1
   fi

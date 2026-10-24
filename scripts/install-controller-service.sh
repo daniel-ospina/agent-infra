@@ -413,16 +413,26 @@ _controller_proof_dir() { # <state dir> <not_before_epoch>
 # ── actions ───────────────────────────────────────────────────────────────────────────────────
 do_install() {
     local tpl tmpd changed=0 linger=0 pid rc pre_active=0 started_at="" proof_since=0 sl_iv sl_burst
-    # ⛔ REFUSE AN ELEVATED INSTALL (review P2, #2402). `sudo bash install-controller-service.sh` renders
-    # User=root / HOME=/root / O=/root/orchestrator, and verify_unit *requires* that — so the unit is green,
-    # runs as root with root's keys.env and gh auth, and, because it is ENABLED, a later `start` delegates
-    # to it and the cell's controller can never come up until someone runs --uninstall. The sibling this
-    # installer follows refuses exactly this; so does this one.
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
-        err "REFUSING to install as root (SUDO_USER=$SUDO_USER): the controller would run as root, with root's"
-        err "  keys.env, gh auth and state dir — and an enabled unit that fails stays enabled, so 'start' would"
-        err "  keep delegating to a controller that cannot run."
-        err "  Re-run as the operator: sudo -u $SUDO_USER -H bash $0 --install"
+    # ⛔ REFUSE ANY ROOT-RUN INSTALL, NOT JUST `sudo bash` (review P2 round 16, #2402). The guard used to test
+    # `id -u = 0 AND SUDO_USER set`, so it refused the one spelling that carries a stand-in and ADMITTED every
+    # other root run — `su -`, a direct root login, any root-run provision — which renders `User=root`,
+    # `HOME=/root`, `O=/root/orchestrator` and passes `verify_unit` (its `User=$(id -un)` IS root). That is the
+    # same outcome the paragraph above describes: a root-owned ENABLED unit with root's keys.env and gh auth,
+    # which a later `start` delegates to, so the cell's own controller can never come up. `SUDO_USER` only
+    # chooses the remedy sentence now; the refusal is on the uid.
+    # ⛔ AND AN EXPLICIT OVERRIDE EXISTS, because a root-only container is a real (if unsupported) shape: it
+    # must ASK, and the ask is named in the refusal rather than discovered by reading this script. The
+    # hermetic suite asks too (its `inst` fixture exports CONTROLLER_ALLOW_ROOT=1), so a suite run on a root
+    # runner exercises the SAME path an operator does instead of being exempted by a different rule.
+    if [ "$(id -u)" = "0" ] && [ "${CONTROLLER_ALLOW_ROOT:-0}" != "1" ]; then
+        err "REFUSING to install as root (uid 0${SUDO_USER:+, SUDO_USER=$SUDO_USER}): the controller would run as"
+        err "  root, with root's keys.env, gh auth and state dir — and an enabled unit that fails stays enabled, so"
+        err "  'start' would keep delegating to a controller that cannot run."
+        if [ -n "${SUDO_USER:-}" ]; then
+            err "  Re-run as the operator: sudo -u $SUDO_USER -H bash $0 --install"
+        fi
+        err "  If a root-owned controller is genuinely what you want, ask for it explicitly:"
+        err "    CONTROLLER_ALLOW_ROOT=1 bash $0 --install"
         return 1
     fi
     case "${RESTART_SEC:-}" in
@@ -789,6 +799,20 @@ do_install() {
     say "  unit:    $UNIT_NAME (Restart=always, RestartSec=${RESTART_SEC}s, After=network-online.target,"
     say "           WantedBy=$WANTED_BY,"
     say "           StartLimitBurst=3/300s so a configuration fault converges to 'failed' instead of looping)"
+    # ⛔ THE ORDERING DOES NOT BIND IN THE USER SCOPE, AND SAYING SO IS PART OF THE INSTALL (review P1,
+    # #2402). `network-online.target` exists only in the SYSTEM manager (`/usr/lib/systemd/system`); a
+    # per-user manager ships default/basic/graphical-session/timers and no network target, so systemd DROPS
+    # this unit's `After=`/`Wants=` dependency instead of honouring it. That is not cosmetic: `start` runs
+    # `cmd_check`'s GitHub read and exits non-zero when the box is offline, so a boot whose network is not up
+    # yet can spend all three attempts inside the 300 s window, converge to `failed`, and — by design — nothing
+    # re-arms a `failed` unit automatically. The bound is DISCLOSED here rather than hidden behind a dependency
+    # that silently vanished, and the recovery is named. The SYSTEM scope has the ordering.
+    if [ "$TARGET" = "user" ]; then
+        say "  ordering: ⚠️  After=/Wants=network-online.target does NOT bind in this (USER) scope — a per-user"
+        say "            manager ships no network-online.target, so systemd drops the dependency. A boot whose"
+        say "            network is not up yet can fill StartLimitBurst and converge to 'failed' with no unattended"
+        say "            recovery: re-arm with 'bash $0 --install' or 'bash $SUPERVISOR start'. The SYSTEM scope has it."
+    fi
     say "  exec:    /bin/bash $SUPERVISOR start   (ORCH_FOREGROUND=1 — the controller is the unit's main process)"
     say "  state:   $O   (env: $ENV_FILE)"
     say "  controller pid: $pid"
@@ -985,8 +1009,8 @@ unit_rendered_owner() { # <unit file> -> the owner the unit RENDERS; nothing whe
     # A trailing slash is a spelling difference, not a different state dir.
     printf '%s\n' "${v%/}"
 }
-env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing when not evaluated
-    local f="$1" home="$2" rendered="$3" owner="" runner=() out=""
+env_file_owner_o() { # <envf> <unit_cell_home> <rendered_o> [<unit_home>] -> resolved O; nothing when not evaluated
+    local f="$1" home="$2" rendered="$3" unit_homeenv="${4:-}" owner="" runner=() out=""
     [ -n "${f:-}" ] && [ -r "$f" ] || return 1
     if [ "$(id -u)" = "0" ]; then
         # ⛔ THE TEST IS "WHO CAN WRITE IT", NOT "WHO OWNS IT" (review P2 round 9, #2402). Ownership alone
@@ -1028,25 +1052,34 @@ env_file_owner_o() { # <envf> <unit_home> <rendered_o> -> resolved O; nothing wh
             runner=(runuser -u "$owner" --)
         fi
     fi
-    out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE bash -c '
+    # ⛔ THE UNIT'S OWN `HOME` IS PART OF THE EVALUATION (review P2, #2402). A `keys.env` may spell the state
+    # dir in terms of `$HOME` (`O=$HOME/orchestrator`), and the unit carries `Environment=HOME=` precisely
+    # because the controller resolves it that way. With HOME inherited from the CALLER, one unit file resolved
+    # to two different state dirs depending on who ran the verb — so account B read account A's unit as its
+    # OWN and `--status`/`--uninstall` acted on a foreign dispatcher. Keep this body identical to the
+    # supervisor's copy; an empty value keeps the caller's HOME.
+    out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE -u HOME bash -c '
+        [ -z "$4" ] || HOME="$4"
         CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
         set -a; . "$1" >/dev/null 2>&1
         printf "%s" "${O:-}"
-    ' _ "$f" "${home:-}" "${rendered:-}" 2>/dev/null || true)"
+    ' _ "$f" "${home:-}" "${rendered:-}" "${unit_homeenv:-}" 2>/dev/null || true)"
     [ -n "${out:-}" ] || return 1
     printf '%s\n' "$out"
 }
 unit_owner_dir() { # <unit file> -> the state dir it RESOLVES to; nothing when nothing is readable
-    local f="$1" rendered_o envf unit_home eff
+    local f="$1" rendered_o envf unit_home unit_homeenv eff
     [ -f "$f" ] || return 1
     rendered_o="$(unit_rendered_owner "$f")" || rendered_o=""
     envf="$(sed -n 's/^Environment=ENV_FILE=//p' "$f" 2>/dev/null | head -1)"
     unit_home="$(sed -n 's/^Environment=CELL_HOME=//p' "$f" 2>/dev/null | head -1)"
+    # the HOME the unit itself runs with — see env_file_owner_o's note (`O=$HOME/...`).
+    unit_homeenv="$(sed -n 's/^Environment=HOME=//p' "$f" 2>/dev/null | head -1)"
     eff=""
     if [ -n "${envf:-}" ]; then
         # A file with a top-level `exit` ends the subshell silently, and an empty answer falls back to the
         # rendered value — never to "no owner".
-        eff="$(env_file_owner_o "$envf" "${unit_home:-}" "${rendered_o:-}")" || eff=""
+        eff="$(env_file_owner_o "$envf" "${unit_home:-}" "${rendered_o:-}" "${unit_homeenv:-}")" || eff=""
     fi
     [ -n "${eff:-}" ] || eff="${rendered_o:-}"
     [ -n "${eff:-}" ] || return 1
