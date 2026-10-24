@@ -1281,6 +1281,127 @@ function heredocBodyIsData(line: string): boolean {
 }
 
 /**
+ * #1382 — THE COMPOUND FRAME a heredoc opener sits INSIDE, if any.
+ *
+ * `heredocBodyIsData` proves the body is stdin DATA for the opener's OWN consumer, and for a LONE
+ * simple command that is the whole story. A COMPOUND changes what happens to that consumer's
+ * STDOUT, and the masker did not model it. Measured at the landed head of this file (run through a
+ * real `bash`, each printing its marker — EXECUTIONS, not mentions):
+ *
+ *     if true; then             for x in 1; do              case x in
+ *     cat <<'EOF'               cat <<'EOF'                 x) cat <<'EOF'
+ *     gh pr merge 999 --admin   gh pr merge 999 --admin    gh pr merge 999 --admin
+ *     EOF                       EOF                        EOF
+ *     :                         done | bash                :;;
+ *     fi | bash                                            esac | bash
+ *
+ * In each, `| bash` receives the COMPOUND's stdout, so the body executes while the gate — reading the
+ * masked text — sees no `gh` word at all and returns before any check. Measured before this fix:
+ * `isGitOp(raw)` true, `isGitOp(maskHeredocData(raw))` false. That is a FAIL-OPEN in the one gate
+ * that guards every merge, and it is why the proof below is scoped: it holds for a lone command,
+ * not for a body whose stdout still has somewhere to go.
+ *
+ * A STACK, not a depth counter: a `case` ARM ends in `)` (`case x in x) …`), which a bare counter
+ * reads as closing a `(`, while a stack whose top is `case` ignores it. An unmatched closer is
+ * IGNORED rather than decrementing, so the error stays on the fail-CLOSED side — an unmatched `fi`
+ * can never make a deeper frame read as shallower.
+ *
+ * Conservative by construction: quoted text and `#` comments cannot open or close a frame, and
+ * anything the scan cannot read leaves frames OPEN, i.e. "no mask" — a refusal, the direction this
+ * file is allowed to be wrong in.
+ */
+type HeredocFrame = "if" | "loop" | "case" | "paren" | "brace";
+
+/** The words of one line that can open or close a shell frame, quotes and comments removed. */
+function heredocFrameTokens(line: string): string[] {
+  let quote: string | null = null;
+  let buf = "";
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      buf += " ";
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      buf += " ";
+      continue;
+    }
+    if (ch === "#" && (buf === "" || /\s$/.test(buf))) break; // comment: no frame after it
+    buf += ch;
+  }
+  return buf
+    .replace(/([(){}])/g, " $1 ")
+    .split(/[\s;&|]+/)
+    .filter((t) => t !== "");
+}
+
+/** Apply one line's frame openers/closers to the carried stack. */
+function heredocFramesAdvance(line: string, stack: HeredocFrame[]): void {
+  const top = () => stack[stack.length - 1];
+  for (const w of heredocFrameTokens(line)) {
+    if (w === "if") stack.push("if");
+    else if (w === "for" || w === "while" || w === "until" || w === "select") stack.push("loop");
+    else if (w === "case") stack.push("case");
+    else if (w === "(") stack.push("paren");
+    else if (w === "{") stack.push("brace");
+    else if (w === "fi") { if (top() === "if") stack.pop(); }
+    else if (w === "done") { if (top() === "loop") stack.pop(); }
+    else if (w === "esac") { if (top() === "case") stack.pop(); }
+    else if (w === ")") { if (top() === "paren") stack.pop(); }
+    else if (w === "}") { if (top() === "brace") stack.pop(); }
+  }
+}
+
+/**
+ * Is the heredoc opened on `openerIndex` inside a frame that is still OPEN there?
+ *
+ * The opener line's own PREFIX counts too (`{ cat <<'EOF'`): the `<<` is what delimits it.
+ */
+function heredocOpenerIsInsideFrame(lines: string[], openerIndex: number): boolean {
+  const stack: HeredocFrame[] = [];
+  // ⛔ THE SCAN MUST SKIP EARLIER HEREDOC BODIES. A body is DATA, so its text cannot close a frame —
+  // but reading it as shell code let ONE prose `fi` / `}` / `)` / `esac` inside an earlier body pop a
+  // frame bash still has open, after which this function reported "no frame" and the body below was
+  // masked while the shell executed it. Measured fail-OPEN (marker printed by a real `bash`, gate
+  // silent): `if true; then` / `cat <<'A' > notes.md` / `fi` / `A` / `cat <<'EOF'` … `EOF` / `:` /
+  // `fi | bash`. Deliberately the same opener reader `maskHeredocData` uses, so the two cannot
+  // disagree about which body exists.
+  const st: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
+  for (let n = 0; n < openerIndex; n++) {
+    const openers = heredocOpenersIn(lines[n], st);
+    heredocFramesAdvance(lines[n], stack);
+    if (openers.length === 0) continue;
+    for (const op of openers) {
+      let closed = false;
+      for (n++; n < openerIndex; n++) {
+        const probe = op.stripTabs ? lines[n].replace(/^\t+/, "") : lines[n];
+        if (probe === op.delim) {
+          closed = true;
+          break;
+        }
+      }
+      // The body never ended before the opener: the "opener" under test is inside a body, i.e. not
+      // an opener at all. Treat it as enclosed — nothing is masked, which is the safe direction.
+      if (!closed) return true;
+    }
+  }
+  const at = lines[openerIndex].indexOf("<<");
+  heredocFramesAdvance(at >= 0 ? lines[openerIndex].slice(0, at) : "", stack);
+  return stack.length > 0;
+}
+
+
+/**
  * #1382 — blank out every heredoc BODY (and its terminator) whose body is DATA, LENGTH-PRESERVING so
  * every offset a later reader holds stays valid.
  *
@@ -1331,6 +1452,27 @@ export function maskHeredocData(command: string): string {
     // file may be wrong in.
     if (endsWithContinuation(lines[i])) continue;
     if (lines.slice(0, i).some(endsWithContinuation)) continue;
+    // ⛔ A COMPOUND FRAME CAN HAND THE BODY TO A PROGRAM (#1382 — measured fail-OPEN in every
+    // keyword and bracket frame; see `HeredocFrame`). `if … cat <<'EOF' … EOF … fi | bash` gives the
+    // COMPOUND's stdout to bash, so the body EXECUTES while every rule below proves DATA for the
+    // WRONG consumer and the gate, reading masked text, returns before any check.
+    //
+    // ⛔ INSIDE A FRAME, NOTHING IS MASKED — deliberately, with NO attempt to test whether this
+    // particular frame's stdout reaches a program. A first version DID test it, and a fresh review
+    // measured seven ways past the test, every one an execution with the gate silent: a prose `fi`
+    // in an EARLIER heredoc body popping the frame; a POSIX `|` followed by a newline; `fi > f; bash
+    // f` on ONE line; `bash <(if … fi)` (the sink precedes the opener); `fi | $SHELL` (the program is
+    // a variable). Enumerating frame spellings × sink routes is a shell parser, and this file has
+    // already recorded that it cannot enumerate that class — `heredocPrefixIsUnprovable` moved from a
+    // depth counter to "ANY `$(` refuses the mask" for the same reason. So the boundary moves again:
+    // a frame means "not provable", and the body keeps the pre-change refusal.
+    //
+    // STATED COST, and it is a real one: a heredoc that IS data, written INSIDE a frame (`if …; then
+    // cat >> notes.md <<'EOF' … EOF; fi`), is no longer masked — so a framed report that quotes
+    // `gh pr merge` is refused again. That is a false POSITIVE, the direction this file is allowed to
+    // be wrong in; the alternative measured above is a silent admin merge. A lone writer with no
+    // enclosing frame — the reported shape — is untouched.
+    if (heredocOpenerIsInsideFrame(lines, i)) continue;
     if (!heredocBodyIsData(lines[i])) continue;
     const reader = heredocCommandWord(lines[i]);
     // ⛔ THE SHADOW SCAN STOPS AT THE OPENER LINE (#1382 review cycle 1, P2): it used to read the
