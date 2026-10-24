@@ -2023,6 +2023,77 @@ assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "reason=too-recent" \
 
 rm -f "$MUT1" "$MUT2" "$MUT3" "$MUT4" "$MUT5"
 
+# ── G2721: the idle-shell rule — a shell at a prompt is not a live lane ────────────────
+# WHY. `live-process`/`live-cwd` answer "is a process holding this checkout?" — and a shell that
+# `cd`'d in and never exited answers YES for ever. #2721 measured what that costs: 59 checkouts at
+# 5-6 GB each kept by `a live process has it as cwd`, on a cell that lost its disk and had to be
+# paused/resumed. The rule under test is NARROW: a holder is live UNLESS it is a shell that started
+# before the worktree's HEAD commit AND has no child process. BOTH arms below use REAL processes, the
+# REAL ps and the REAL lsof — a shim can only prove the matcher agrees with the shim — and they share
+# one fixture, so a gate that simply stopped reading cwd fails the control arm.
+echo ""
+echo "── G2721: the idle-shell rule (real bash, real ps, real lsof) ────────────────────────"
+ENV=G2721; REPO="$(mk_repo $ENV)"
+WT_IDLE="$(add_named_wt "$REPO" "$ENV-idle" feat/g2721-idle)"
+mkfifo "$T/$ENV.fifo"
+# The IDLE shell: blocked opening a fifo for read, no children, its cwd inside the checkout.
+( cd "$WT_IDLE" && exec bash -c 'read -r _x' < "$T/$ENV.fifo" ) 2>/dev/null &
+IDLE_PID=$!
+sleep 1
+# HEAD AFTER the shell sat down (the rule reads the COMMIT's own time, so the fixture stamps it ahead
+# by a stated margin rather than lie about a process start — only the kernel sets that).
+HTS=$(( $(date +%s) + 600 ))
+commit_in_wt "$WT_IDLE" "@$HTS" g2721
+# The AGE gate is driven by REAP_WT_NOW_EPOCH, so "now" is put after HEAD by more than the 7-day floor
+# without touching the shell/HEAD comparison under test.
+NOWV=$(( HTS + 8 * 86400 ))
+WT_IDLE_CANON="$(cd "$WT_IDLE" && pwd -P)"
+idle_cwd="$(readlink "/proc/$IDLE_PID/cwd" 2>/dev/null || true)"
+if [ "${idle_cwd:-}" = "$WT_IDLE_CANON" ]; then
+    # CONTROL: the SAME fixture, plus a shell WITH a child (a lane doing work). The scan must reach it
+    # even though the idle shell is listed first — that is the "examine every holder" property, and a
+    # `return` on the first match gets it wrong (reproduced while writing this).
+    ( cd "$WT_IDLE" && exec bash -c 'while :; do sleep 3600; done' ) 2>/dev/null &
+    BUSY_PID=$!
+    sleep 1
+    OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="$NOWV" PS_BIN_OVERRIDE=/bin/ps LSOF_BIN_OVERRIDE="$(command -v lsof)" \
+        run_reaper $ENV --dry-run --repo "$REPO")"
+    assert_contains "$(row_for "$OUT" "$WT_IDLE")" "reason=live-cwd" \
+        "G2721a a shell WITH a child is still a live holder (the control)"
+    # Kill the busy shell AND every leftover it forked: a `sleep` reparented when its parent dies keeps
+    # `cwd=$WT_IDLE` by inheritance and would decide the next arm as a NON-shell holder.
+    kill -9 "$BUSY_PID" 2>/dev/null; wait "$BUSY_PID" 2>/dev/null
+    for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        [ "$_p" = "$IDLE_PID" ] && continue
+        [ "$(readlink "/proc/$_p/cwd" 2>/dev/null)" = "$WT_IDLE_CANON" ] && kill -9 "$_p" 2>/dev/null
+    done
+    sleep 1
+    OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="$NOWV" PS_BIN_OVERRIDE=/bin/ps LSOF_BIN_OVERRIDE="$(command -v lsof)" \
+        run_reaper $ENV --dry-run --repo "$REPO")"
+    assert_contains "$(row_for "$OUT" "$WT_IDLE")" "reason=reclaimable" \
+        "G2721b an IDLE shell predating HEAD is DEMOTED — the checkout is reclaimable"
+    assert_contains "$(row_for "$OUT" "$WT_IDLE")" "unref=stale-shell:" \
+        "G2721c the row NAMES the demotion, so a reader can tell it from an unheld checkout"
+    assert_contains "$(cat "$T/$ENV/reap.log")" "STALE-SHELL" \
+        "G2721d …and the pass log states it, in the rule's own words"
+    # The SCHEDULE half: demotion alone must never remove a checkout. The other gates still decide, and
+    # `too-recent` is the gate every fresh lane hits.
+    OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="$NOWV" REAP_WT_AGED_DAYS_OVERRIDE=60 \
+        PS_BIN_OVERRIDE=/bin/ps LSOF_BIN_OVERRIDE="$(command -v lsof)" \
+        run_reaper $ENV --dry-run --repo "$REPO")"
+    assert_contains "$(row_for "$OUT" "$WT_IDLE")" "reason=too-recent" \
+        "G2721e a demoted holder is NOT authority to remove: the age gate still preserves this checkout"
+    # The SWITCH restores the strict reading without editing code.
+    OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="$NOWV" PS_BIN_OVERRIDE=/bin/ps LSOF_BIN_OVERRIDE="$(command -v lsof)" \
+        REAP_WT_IDLE_SHELL=0 run_reaper $ENV --dry-run --repo "$REPO")"
+    assert_contains "$(row_for "$OUT" "$WT_IDLE")" "reason=live-cwd" \
+        "G2721f REAP_WT_IDLE_SHELL=0 restores the strict reading (an operator can undo this)"
+    kill "$IDLE_PID" 2>/dev/null; wait "$IDLE_PID" 2>/dev/null
+else
+    echo "  ⏭ SKIP G2721a-f: could not place a shell with its cwd inside the worktree (got '${idle_cwd:-<none>}')"
+    kill "$IDLE_PID" 2>/dev/null; wait "$IDLE_PID" 2>/dev/null
+fi
+rm -f "$T/$ENV.fifo"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

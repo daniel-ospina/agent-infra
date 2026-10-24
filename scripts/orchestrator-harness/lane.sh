@@ -104,6 +104,15 @@ printf '%s\n' "$REVIEWER_PREFLIGHT" | tee -a "$O/logs/lane-$N.log"
 # class silently erases prompt text (agent-infra#1835). Precomputing keeps the expansion inert.
 REVIEWER_BRIEF="$(reviewer_brief_section harness)" || {
   echo "[lane $N] FATAL: reviewer_brief_section failed — refusing to start a lane whose brief omits the reviewer step" >&2; exit 78; }
+# ── the LANDING ARTIFACTS, disclosed for the same reason (#2325) ──────────────────────────────────
+# `pipeline-compliance` blocked 36 of 40 open agent-infra PRs and the count GREW faster than lanes
+# could be rescued (33 → 36 in one hour). The brief told a lane to READ the pipeline skills and
+# never to PRODUCE what they exist to create, so each lane finished real work, opened a PR, and was
+# refused — with its evidence retro-fitted afterwards. Same treatment as the reviewer step above:
+# rendered ONCE, spliced as a VARIABLE (never a `$(...)` inside the unquoted heredoc — #1835), and
+# FAIL LOUD if the helper cannot render it, because a brief that silently drops it is the defect.
+LANDING_BRIEF="$(landing_artifacts_brief_section harness)" || {
+  echo "[lane $N] FATAL: landing_artifacts_brief_section failed — refusing to start a lane whose brief omits the landing artifacts" >&2; exit 78; }
 
 # ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound in the test line
 # below. A lane's worktree normally HAS a `.venv`, but when it does not the agent used to hunt for an
@@ -125,13 +134,15 @@ Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:c
 ## Rules
 - The review/VGATE extensions are BYPASSED for you and you have NO "task" tool — do NOT dispatch. The PARENT runs the review gate.
 - Commit with \`git commit -F <message-file>\` (repo-unique temp path per AGENTS.md "Editing Rules"). Stage specific files; never \`git add -A\`.
-- Push (\`git push -u origin $BR\`), then open a PR against main: title "<type>(<scope>): <subject> (#$N)". The body MUST contain "Closes #$N". ⛔ Do NOT reach for "Refs #$N" on work you have finished: GitHub never closes an issue from a \`Refs\`, and NOTHING in this fleet re-reads an open issue whose PR merged — measured 2026-10-13, 25 of 36 open P0-blockers already had MERGED PRs on main while 48 PRs merged in one day and 0 blockers closed (#8468). Use "Refs #$N" ONLY when a specific acceptance indicator is genuinely unmet, and then name it on its own line as \`Still open: <indicator>\` — a bare \`Refs\` is a lane failing to take a position, not a partial delivery. Include what changed and exact test evidence. Do NOT merge.
+- Push (\`git push -u origin $BR\`), then open a PR against main: title "<type>(<scope>): <subject> (#$N)". The body MUST carry "Closes #$N" ON ITS OWN LINE — check [a] reads the LINE position, so a mid-sentence "(fixes #$N)" does not count. ⛔ Do NOT reach for "Refs #$N" on work you have finished: GitHub never closes an issue from a \`Refs\`, and NOTHING in this fleet re-reads an open issue whose PR merged — measured 2026-10-13, 25 of 36 open P0-blockers already had MERGED PRs on main while 48 PRs merged in one day and 0 blockers closed (#8468). Use "Refs #$N" ONLY when a specific acceptance indicator is genuinely unmet, and then name it on its own line as \`Still open: <indicator>\` — a bare \`Refs\` is a lane failing to take a position, not a partial delivery. Include what changed and exact test evidence. Do NOT merge.
 - Do NOT change the MCP tool registry or the public TortoiseSDK surface (needs owner approval — STOP and report instead).
 - Read skills/issue-workflow/SKILL.md and skills/issue-scoping/SKILL.md first.
 - If the defect is already fixed (in-repo or elsewhere) report ALREADY_FIXED / OUT-OF-REPO with file/line/commit evidence instead of forcing a PR. A no-change verdict with evidence is a good outcome.
 - **If you add a test file, you MUST register it in \`config/ci-surfaces.yml\`** — an unregistered file is never selected on the relevant source diff and the unconditional \`manifest-integrity\` leg fails. Verify with \`python tools/ci_selection.py --integrity\`.
 - Use the research skill for non-trivial research; never call web_search directly. Auto-file any pre-existing bug with no open issue. Never ask the human anything.
 - Collision pre-flight is CLEAN for this issue.
+
+$LANDING_BRIEF
 
 $REVIEWER_BRIEF
 
