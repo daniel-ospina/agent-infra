@@ -101,9 +101,6 @@ SWAP_SWAPPINESS="${SWAP_SWAPPINESS:-30}"
 # The privilege seam. Word-split ON PURPOSE: `sudo -n` is TWO argv entries. Empty = run as we are
 # (the suite's seam); `false` is how a case reproduces a cell that cannot escalate.
 SWAP_SUDO="${SWAP_SUDO-sudo -n}"
-# The checkout the operational + scheduled layers are installed from. Resolved by
-# check_operational_layer (under set -u, so it is declared here rather than implied).
-CELL_INFRA_ROOT=""
 
 say()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die()  { say "FATAL: $*" >&2; exit 1; }
@@ -1490,7 +1487,24 @@ check_schedule() {
   fi
   # The job declarations are the checkout's (one source of truth, like $AGENT_INFRA_PATH on the
   # Mac). INFRA_ROOT is passed explicitly so the farmed script does not have to guess.
-  out="$(HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" python3 "$sched" --install 2>&1)" || rc=$?
+  #
+  # ⛔ `TEMPLATES_DIR` IS NOT PINNED HERE, AND THAT IS DELIBERATE. fleet-schedule.py resolves it as
+  # `TEMPLATES_DIR or <INFRA_ROOT>/templates/launchd`, so an ambient value outranks the checkout we
+  # just pinned. Pinning it unconditionally is NOT available: it is the ONLY seam the hermetic
+  # suites have (they point it at fixture plists precisely so the shipped templates — armed
+  # reapers — never run against the host that runs the tests), and hard-coding the checkout here
+  # would make `scripts/cloud-cell-bringup.test.sh` execute the REAL reapers on the test box.
+  # So the override stays and the DIVERGENCE IS NAMED instead of silent: an operator reading the
+  # cell's log sees which declaration set was installed. A cell that is armed from a foreign dir
+  # by accident is then one grep away, not invisible.
+  if [ -n "${TEMPLATES_DIR:-}" ] && [ "${TEMPLATES_DIR%/}" != "$root/templates/launchd" ]; then
+    warn "the scheduled job declarations come from $TEMPLATES_DIR, NOT from this cell's checkout ($root/templates/launchd) — TEMPLATES_DIR is set in this environment"
+  fi
+  # FLEET_SCHEDULE_STATE IS pinned: the loop started here must be the one the cell's later --start
+  # supervises, and a foreign state dir would put two loops over one job set.
+  out="$(HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" \
+         FLEET_SCHEDULE_STATE="$CELL_HOME/.pi/agent/state/fleet-schedule" \
+         python3 "$sched" --install 2>&1)" || rc=$?
   printf '%s\n' "$out" | sed 's/^/    /'
   if [ "$rc" -ne 0 ]; then
     die "the scheduled layer FAILED to install or verify (rc=$rc) — this cell would run with no reaping, no liveness detection and no canary, and NOTHING else installs them (#1864). Fix the failure above."
