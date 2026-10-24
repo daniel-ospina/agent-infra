@@ -701,6 +701,25 @@ do_install() {
         case "$(sc_run is-active "$UNIT_NAME" 2>/dev/null)" in failed) break ;; esac
         sleep 2; waited=$((waited + 2))
     done
+    # ⛔ A PROOF IS ONLY GOOD IF ITS AUTHOR IS STILL THERE (review P1, #2402). The heartbeat leg accepts a
+    # plausible heartbeat without asking whether the process that wrote it is alive, and a loop that ticked
+    # once and exited leaves a FRESH heartbeat behind — so the poll could pass on a dead incarnation's last
+    # tick while the unit had already converged to `failed`, and the verdict then printed a green "installed"
+    # with a pid that was gone. Re-read the facts the manager holds AFTER the poll, in the same pass as the
+    # proof: a `failed`/`inactive` unit, or a MainPID that is not live, is a start that produced no
+    # controller, whatever the heartbeat says.
+    if controller_proof "$proof_since" "$proof_o"; then
+        local _post_state
+        _post_state="$(sc_run is-active "$UNIT_NAME" 2>/dev/null || true)"
+        case "$_post_state" in
+            failed|inactive)
+                err "$UNIT_NAME reported '$_post_state' at the end of the proof wait — the unit has already given up:"
+                err "  a heartbeat is not a controller, and this one's author is gone (no live loop holds the lock)."
+                sc_run status "$UNIT_NAME" --no-pager 2>&1 | sed 's/^/  /' | head -20 >&2 || true
+                err "  journalctl -u $UNIT_NAME -n 40"
+                return 1 ;;
+        esac
+    fi
     controller_proof "$proof_since" "$proof_o" || {
         err "$UNIT_NAME is active with MainPID $pid, but NO CONTROLLER PROVED ITSELF in ${waited}s:"
         err "  expected the harness's lock ($O/.orch.lock$([ -n "$proof_o" ] && [ "${proof_o%/}" != "${O%/}" ] && printf ' or %s/.orch.lock' "${proof_o%/}")) held by a live orch-loop.sh, or a heartbeat in the same state dir."
