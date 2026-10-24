@@ -175,22 +175,11 @@ tmpd="$(mktemp -d)" || { err "mktemp failed"; exit 1; }
 render "$TEMPLATES_DIR/$UNIT_SRC_SERVICE" "$tmpd/$UNIT_SRC_SERVICE" || exit 1
 render "$TEMPLATES_DIR/$UNIT_SRC_TIMER" "$tmpd/$UNIT_SRC_TIMER" || exit 1
 
-if [ "$MODE" = "--dry-run" ]; then
-    [ -w "$DRAINER_STATE" ] || printf 'would create %s/logs (it does not exist yet)\n' "$DRAINER_STATE"
-    printf 'would install to %s (target %s):\n\n' "$UNIT_DIR" "$TARGET"
-    sed 's/^/  /' "$tmpd/$UNIT_SRC_SERVICE" "$tmpd/$UNIT_SRC_TIMER"
+if [ "$TARGET" = "user" ] && ! command -v loginctl >/dev/null 2>&1; then
     rm -rf "$tmpd"
-    exit 0
+    err "this box needs a USER unit, but there is no loginctl here to prove the manager LINGERS — a user timer that stops with your last session fires once and never again. Grant passwordless sudo for a system target, then re-run."
+    exit 1
 fi
-
-# The state dir must exist and be writable by THIS user: the unit runs as this user and every pass
-# would fail closed on an unwritable log dir.
-mkdir -p "$DRAINER_STATE/logs" 2>/dev/null || { rm -rf "$tmpd"; err "cannot create $DRAINER_STATE/logs"; exit 1; }
-[ -w "$DRAINER_STATE" ] || { rm -rf "$tmpd"; err "state dir $DRAINER_STATE is not writable by $(id -un)"; exit 1; }
-# ⛔ A USER UNIT WITH A `User=` LINE IS REJECTED BY systemd, and a user unit whose manager STOPS when
-# the last session ends fires only while an ssh session is open — an installed timer that schedules
-# nothing, the false PASS this installer refuses for the system target. The sibling installer carries
-# the same guard for the same reason; both must refuse rather than report green.
 if [ "$TARGET" = "user" ]; then
     if grep -q '^User=' "$tmpd/$UNIT_SRC_SERVICE"; then
         # grep -v, not `sed -i`: this file's editing rules forbid sed for line surgery, and a
@@ -209,6 +198,26 @@ if [ "$TARGET" = "user" ]; then
         exit 1
     fi
 fi
+if [ "$MODE" = "--dry-run" ]; then
+    if [ -d "$DRAINER_STATE" ]; then
+        [ -w "$DRAINER_STATE" ] || printf 'WARNING: state dir %s exists and is NOT writable by %s\n' "$DRAINER_STATE" "$(id -un)"
+    else
+        printf 'would create %s/logs\n' "$DRAINER_STATE"
+    fi
+    printf 'would install to %s (target %s):\n\n' "$UNIT_DIR" "$TARGET"
+    sed 's/^/  /' "$tmpd/$UNIT_SRC_SERVICE" "$tmpd/$UNIT_SRC_TIMER"
+    rm -rf "$tmpd"
+    exit 0
+fi
+
+# The state dir must exist and be writable by THIS user: the unit runs as this user and every pass
+# would fail closed on an unwritable log dir.
+mkdir -p "$DRAINER_STATE/logs" 2>/dev/null || { rm -rf "$tmpd"; err "cannot create $DRAINER_STATE/logs"; exit 1; }
+[ -w "$DRAINER_STATE" ] || { rm -rf "$tmpd"; err "state dir $DRAINER_STATE is not writable by $(id -un)"; exit 1; }
+# ⛔ A USER UNIT WITH A `User=` LINE IS REJECTED BY systemd, and a user unit whose manager STOPS when
+# the last session ends fires only while an ssh session is open — an installed timer that schedules
+# nothing, the false PASS this installer refuses for the system target. The sibling installer carries
+# the same guard for the same reason; both must refuse rather than report green.
 mkdir -p "$UNIT_DIR" 2>/dev/null || { rm -rf "$tmpd"; err "cannot create $UNIT_DIR (a system target needs sudo; a user target needs a home dir)"; exit 1; }
 for u in "$UNIT_SRC_SERVICE" "$UNIT_SRC_TIMER"; do
     if [ -f "$UNIT_DIR/$u" ] && cmp -s "$UNIT_DIR/$u" "$tmpd/$u"; then
