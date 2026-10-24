@@ -455,6 +455,34 @@ find_tortoise() {   # print a tortoise checkout carrying the tool, or return 1
   return 1
 }
 
+# ⛔ A REFUSAL THAT DOES NOT SAY WHERE IT LOOKED SENDS THE OPERATOR TO GUESS (brief 2026-10-24).
+# "no pre-flight could be resolved" is true of EVERY possible cause — a repo that carries none, a
+# `TORTOISE_REPO` naming the wrong checkout, a "tortoise" directory that exists without the tool in
+# it, a HOME the daemon does not have. The fix each needs is a DIFFERENT PATH, so the refusal names
+# all of them, in the order they were tried, and `: '...'` quotes the empty ones instead of printing
+# `//tools/collision_preflight.py`. It never invents a candidate it did not search.
+preflight_search_paths() {   # one candidate TOOL path per line, in resolution order
+  local common configured toplevel
+  configured="$(tortoise_var)"
+  common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  toplevel="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null)"
+  {
+    # 1. the serviced repo's own copy — the scout worktree when it exists, else the main checkout
+    [ -d "$SC" ] && printf '%s\n' "$SC/tools/collision_preflight.py"
+    printf '%s\n' "$REPO/tools/collision_preflight.py"
+    # 2. a configured tortoise checkout, then the conventionally-located ones
+    [ -n "$configured" ] && printf '%s\n' "$configured/tools/collision_preflight.py"
+    [ -n "$toplevel" ] && printf '%s\n' "$toplevel/tools/collision_preflight.py"
+    [ -n "$common" ] && printf '%s\n' "$(dirname "${common%/.git}")/tortoise/tools/collision_preflight.py"
+    printf '%s\n' \
+      "${HOME:-\$HOME}/Documents/GitHub/tortoise/tools/collision_preflight.py" \
+      "${HOME:-\$HOME}/eldato/tortoise/tools/collision_preflight.py"
+  } | awk 'NF && !seen[$0]++'
+}
+preflight_search_paths_one_line() {   # the same list, for a single log line
+  preflight_search_paths | paste -sd ' ' - | sed 's/ /, /g'
+}
+
 resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if none
   local repo_dir t
   # The TARGET repo's own copy — the scout worktree when it exists, else the main checkout.
@@ -887,6 +915,7 @@ cmd_check() {
   if ! resolve_preflight; then
     echo "[refresh] check: no tools/collision_preflight.py in $tool_dir and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
     echo "[refresh] NOT PROVISIONABLE: this repo cannot be pre-flighted for dispatch, so a cell on it would MERGE ONLY (#1736)"
+    echo "[refresh]   looked for (in this order): $(preflight_search_paths_one_line)"
     echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env), or vendor tools/collision_preflight.py into the repo"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
@@ -1474,7 +1503,7 @@ scout_sync || provision_fail "$SCOUT_REFUSE_RC" "sub-step=scout-sync: ${SCOUT_RE
 # Resolve the tool BEFORE spending time on a venv: a repo with no tool can never dispatch, whatever
 # its environment, and the reason must be the one an operator sees.
 if ! resolve_preflight; then
-  provision_fail "$EXIT_NOT_PROVISIONABLE" "sub-step=preflight-tool: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}') — this repo cannot be pre-flighted for dispatch, so the cell would merge only (#1736). Fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env) or vendor tools/collision_preflight.py into the repo"
+  provision_fail "$EXIT_NOT_PROVISIONABLE" "sub-step=preflight-tool: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}') — looked for (in this order): $(preflight_search_paths_one_line) — this repo cannot be pre-flighted for dispatch, so the cell would merge only (#1736). Fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env) or vendor tools/collision_preflight.py into the repo"
 fi
 # The identity of the bytes that will judge this pass — ONE line per pass, so "which gate decided
 # this?" is answerable from the log instead of inferred from the branch (#2174).

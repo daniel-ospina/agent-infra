@@ -111,6 +111,15 @@
 #                             bogus zero — use only when the test lane is the
 #                             repo's only failing surface)
 #   --provenance <file>       write the examined failing runs as `<sha>:<run-id>`
+#   --unattributed <file>     (#2610, --commit-rows) write ONLY the examined failing
+#                             runs that yielded NO identity, in the same
+#                             `<sha>:<run-id>` form. `--provenance` is every run the
+#                             collector LOOKED AT; this is the subset it could not
+#                             attribute — and it is written HERE because this is the
+#                             function that decides `extracted`. A caller deriving that
+#                             subset from `--provenance` would be re-running the parse,
+#                             and would label every run that DID yield ids as
+#                             unattributable.
 #   --runs-report <file>      write `examined=` / `extracted=` / `completed=` /
 #                             `tested=` / `pending=` counts for the lane runs.
 #                             ⛔ WRITTEN ON BOTH EXITS (#2569): a capture that
@@ -1249,14 +1258,28 @@ collect_union_signatures() {
 # emitted, with a BLANK signature when the extractor produced none: an id that
 # vanished here would be an id the decision never sees, which is fail-OPEN.
 # `--per-run` writes the per-run id sets detect_rotating_identity() consumes.
+# `--unattributed` (#2610) writes the examined failing runs that yielded NO identity —
+# from THIS function, because it is the one that decides `extracted`. The arms below that
+# leave a run unextracted AND let the capture continue write the runref there: the
+# zero-job arm (#1482) and the ordinary empty-ids arm. `--provenance` cannot stand in: it
+# holds every examined run, including the ones that DID contribute.
+#
+# ⛔ THE PRUNED-LOG ARM (#7131) IS NOT ONE OF THEM, and the comment on it says so rather
+# than implying coverage: `run_failed_job_ids` returns 1 both for "the job list could not
+# be read" and for "read fine, no failed job", and this function treats 1 as fatal — so a
+# pruned log naming no failed job REFUSES THE WHOLE CAPTURE (the caller's extract gate),
+# and no named 1c refusal is reached for it. Making that arm live needs a distinguishable
+# status from `run_failed_job_ids` (2 = read, nothing failed), which is a behaviour change
+# in the capture with its own test; it is deliberately NOT bundled here.
 collect_union_rows() {
-  local lane_file="$1" provenance="$2" report="$3" per_run="$4"
+  local lane_file="$1" provenance="$2" report="$3" per_run="$4" unattr="${5:-}"
   local tmp_ids="" tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
   tmp_ids="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   tmp_sigs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_ids"; : > "$tmp_sigs"
   [ -n "$provenance" ] && : > "$provenance"
   [ -n "$per_run" ] && : > "$per_run"
+  [ -n "$unattr" ] && : > "$unattr"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     local status rest conclusion runref log_file ids one
@@ -1289,6 +1312,7 @@ collect_union_rows() {
       # extracted` gate in admin-merge.sh still refuses this run — the PR side
       # stays fail-closed by construction, which is deliberate.
       [ "$credited" = "1" ] && tested=$((tested - 1))
+      [ -n "$unattr" ] && printf '%s\n' "$runref" >> "$unattr"
       rm -f "$log_file"
       continue
     fi
@@ -1311,6 +1335,11 @@ collect_union_rows() {
           printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' ' ')" | sed 's/ *$//' >> "$per_run"
         fi
       fi
+      # ⛔ NOTHING TO DO IN AN `else`, and the absent branch is stated rather than assumed:
+      # `run_failed_job_ids` cannot return 0 with empty output (both its paths end
+      # `[ -n … ] || return 1`), so a pruned log naming no failed job takes the `return 1`
+      # above and FAILS THE CAPTURE CLOSED. It therefore never reaches `--unattributed` —
+      # see the ⛔ block in this function's docblock.
       continue
     fi
     if [ "$frc" -ne 0 ]; then
@@ -1346,6 +1375,9 @@ collect_union_rows() {
         return 1
       }
       [ -n "$one" ] && printf '%s\n' "$one" >> "$tmp_sigs"
+    else
+      # No ids from a readable log: THIS is the unattributable run (#2610).
+      [ -n "$unattr" ] && printf '%s\n' "$runref" >> "$unattr"
     fi
     rm -f "$log_file"
   done < "$lane_file"
@@ -1374,7 +1406,7 @@ collect_union_rows() {
 
 main() {
   local mode="" pr="" commit="" main_runs="$DEFAULT_MAIN_RUNS"
-  local exclude="" repo="" provenance="" report="" diff_a="" diff_b="" per_run=""
+  local exclude="" repo="" provenance="" report="" diff_a="" diff_b="" per_run="" unattr=""
   local workflow="${CI_FAILURE_SET_WORKFLOW:-$DEFAULT_WORKFLOW}" any_workflow=0
 
   while [ $# -gt 0 ]; do
@@ -1404,6 +1436,7 @@ main() {
         fi ;;
       --commit-rows) mode="commit-rows"; commit="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --per-run) per_run="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
+      --unattributed) unattr="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --diff) mode="diff"; diff_a="${2:-}"; diff_b="${3:-}"; shift 3 2>/dev/null || shift $# ;;
       --exclude) exclude="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
       --repo) repo="${2:-}"; shift 2 2>/dev/null || shift 1 ;;
@@ -1481,7 +1514,7 @@ main() {
       local runs
       runs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
       list_lane_runs --commit "$commit" 100 > "$runs" || { rm -f "$runs"; say_err "ci-failure-set: ✗ could not list runs for $commit"; exit 1; }
-      collect_union_rows "$runs" "$provenance" "$report" "$per_run" || { rm -f "$runs"; exit 1; }
+      collect_union_rows "$runs" "$provenance" "$report" "$per_run" "$unattr" || { rm -f "$runs"; exit 1; }
       rm -f "$runs"
       ;;
     main-union-signatures)
