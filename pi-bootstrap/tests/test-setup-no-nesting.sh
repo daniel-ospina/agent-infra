@@ -516,7 +516,7 @@ script:publish-live-workspaces.py
 script:session-postmortem.sh
 script:record-review.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
-lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
+lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py"
 # `script:disk-reaper-run.sh` joined on 2026-10-24 (#2354, PR #2361): the scheduled wrapper the
