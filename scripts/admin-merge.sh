@@ -93,18 +93,21 @@
 # region and moved the job from :896 to :945, which left an earlier version of this very
 # block citing an unrelated `http-pool-hygiene` step — the declaration then looked
 # unsubstantiated, i.e. the false absence came back through the citation instead of the
-# logic). Re-locate by the quote, and fix the number when you move it.
-#   * ci.yml:945 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
-#     `shard: [1, 2, …]` at :1035, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
+# logic. A later merge onto main moved it AGAIN, :945 -> :970, and the rebase of this
+# branch re-created the same rot: the numbers below were re-located by their quotes and
+# corrected — which is the rule working, not an exception to it). Re-locate by the quote,
+# and fix the number when you move it.
+#   * ci.yml:970 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
+#     `shard: [1, 2, …]` at :1060, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
 #     one check per slice, and each slice's step is `bash scripts/run-bash-shards.sh`
-#     (ci.yml:1073, `run: bash scripts/run-bash-shards.sh`);
+#     (ci.yml:1098, `run: bash scripts/run-bash-shards.sh`);
 #   * ci-main.yml:378 — "the main lane runs the SAME sweep as ci.yml's `bash-suites`
 #     — this job calls the one runner below, UNSHARDED", and ci-main.yml:455 is that
 #     call: `bash scripts/run-bash-shards.sh`; main publishes ONE check named
 #     `script-validate` (ci-main.yml:376);
-#   * ci.yml:1047 — "ci-main.yml's `script-validate`: one runtime for the list, in
+#   * ci.yml:1072 — "ci-main.yml's `script-validate`: one runtime for the list, in
 #     both lanes" (also ci.yml:372, "today — ci-main.yml's script-validate job runs bash
-#     shards only"). ⛔ NOT ci.yml:948: that line is the HISTORY of the pre-#1369 split
+#     shards only"). ⛔ NOT ci.yml:973: that line is the HISTORY of the pre-#1369 split
 #     ("while main's `script-validate` ran the bash sweeps + the hermetic suites") and
 #     describes a body WIDER than the list, so citing it here would argue AGAINST the
 #     containment this pair rests on (review cycle 3).
@@ -1518,8 +1521,8 @@ named_unattributable_runs() {
               say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
               say_err "       scripts/run-bash-shards.sh UNSHARDED as ONE of its steps"
               say_err "       (.github/workflows/ci-main.yml:455), and '${name}' is one shard of that same"
-              say_err "       list on a PR (.github/workflows/ci.yml:945/1073), one runtime in both lanes"
-              say_err "       (ci.yml:1047). The base therefore carries a red under a name that RUNS this"
+              say_err "       list on a PR (.github/workflows/ci.yml:970/1098), one runtime in both lanes"
+              say_err "       (ci.yml:1072). The base therefore carries a red under a name that RUNS this"
               say_err "       list — but that job has FIVE other steps (node --check :422, the lane-parity"
               say_err "       guard :440, its self-test :444, plus checkout :413 and setup-node :418), so the"
               say_err "       base's red may be this suite's or any of theirs. A CANDIDATE counterpart, not"

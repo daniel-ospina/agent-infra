@@ -14458,6 +14458,52 @@ grep -q 'INCOMPLETE' "$SCEN/err" \
   && fail "(j) the completeness cross-check ran against an UNKNOWN count" \
   || pass "(j) …and no completeness verdict is claimed from an unknown count"
 
+# ── (k) THE COMPLETENESS CROSS-CHECK IS NOT ANSWERED WITH SILENCE (#2610 review, cycle 6,
+# P3). The function is only reachable when `pr_extracted < pr_examined`, so `expected >= 1`
+# on every call — an absent or EMPTY named subset therefore means the named list is MISSING
+# ENTIRELY, which is exactly the anomaly the cross-check exists to report. It used to sit
+# behind `[ -s "$unattributed" ] || return 0`, so that case printed NOTHING AT ALL: the one
+# anomaly the check was written for was the one it could not report. The early return is
+# gone and the cross-check now fires first.
+#
+# ⛔ THIS ARM IS DISCRIMINATING WITHOUT A MUTATION, and that is why it is written as a
+# POSITIVE assertion: reinstating the `-s` return makes an EMPTY file take that return, so
+# the cross-check line disappears and this arm goes red. (An `rc != 0` assertion alone could
+# not: step 1c's `exit 1` fires whether or not the naming arm ran — the same reasoning that
+# forced both halves in (j).) The subset is emptied by a collector wrapper rather than by a
+# `grep` shim, because the emptiness is a property of the COLLECTOR's output, not of a read.
+new_scen named-refusal-empty-subset
+HEAD_NK="f9f9000000000000000000000000000000000057"
+printf '%s\n' "$HEAD_NK" > "$SCEN/head"
+lane_fail "$HEAD_NK" 9971 > "$SCEN/runs-$HEAD_NK"
+: > "$SCEN/log-9971"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9971"
+write_pr_checks "$(check_run 5071 'bash-suites (5)' completed failure 9971)"
+main_green_surface
+EMPTY_DIR="$TMP/cfs-empty-subset"
+mkdir -p "$EMPTY_DIR"
+printf '%s\n' '#!/bin/bash' \
+  'out=""; prev=""' \
+  'for a in "$@"; do [ "$prev" = "--unattributed" ] && out="$a"; prev="$a"; done' \
+  "bash '$CFS' \"\$@\"; rc=\$?" \
+  '[ -n "$out" ] && : > "$out"' \
+  'exit $rc' > "$EMPTY_DIR/ci-failure-set.sh"
+chmod +x "$EMPTY_DIR/ci-failure-set.sh"
+ADMIN_MERGE_FAILURE_SET_SH="$EMPTY_DIR/ci-failure-set.sh" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && grep -q 'failing PR run(s)' "$SCEN/err" \
+  && pass "(k) an EMPTY named subset still BLOCKS (exit $rc)" \
+  || fail "(k) the refusal is missing (exit $rc)"
+grep -q 'the collector published 0 unattributable run(s) where the refusal' "$SCEN/err" \
+  && pass "(k) …and the completeness cross-check FIRES instead of answering with silence" \
+  || fail "(k) the missing named list was answered with silence: $(sed -n '/published/p' "$SCEN/err" 2>/dev/null | head -2)"
+grep -q 'this list is INCOMPLETE' "$SCEN/err" \
+  && pass "(k) …saying the list is INCOMPLETE — a sample, not the set" \
+  || fail "(k) it did not say the list is incomplete"
+grep -q 'The failing run(s), NAMED' "$SCEN/err" \
+  && fail "(k) it printed a NAMED header over a list with nothing in it" \
+  || pass "(k) …and prints NO named header for an empty list"
+
 # ── (g) THE SAME-NAME ARM. An arm that always answers "no counterpart" would pass (c) and
 # lie about this surface, so a blocking base red with the same NAME is its own case.
 new_scen named-refusal-shared
