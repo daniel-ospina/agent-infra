@@ -109,10 +109,12 @@ jobs:
     #
     # RESERVATION  (the value the operator sets; `required-check` is the reserved label):
     #   ["self-hosted","Linux","X64","required-check"]
-    # ENGAGE + RELEASE are in docs/ops/fleet-capacity.md §9.2/§9.3 — the exact `PUT /actions/runners/
-    # {id}/labels` call and the `gh variable` call, so the reservation is reproducible rather
-    # than folklore. The reserved runners must NOT also carry `ubuntu-latest`, or advisory jobs
-    # take the reserved slots and the reservation is only advisory.
+    # ENGAGE + RELEASE are in docs/ops/fleet-capacity.md §9.2/§9.3 — the exact label call and the
+    # `gh variable` call, so the reservation is reproducible rather than folklore. §9.2 uses the
+    # NON-DESTRUCTIVE pair (`POST …/labels` to add, `DELETE …/labels/<name>` to remove) because
+    # `PUT …/labels` REPLACES every custom label on the runner. The reserved runners must NOT also
+    # carry `ubuntu-latest`, or advisory jobs take the reserved slots and the reservation is only
+    # advisory.
     #
     # ⚠️ RECORDED DECISION THIS TOUCHES. #2682 recorded "keep the required check off self-hosted
     #   capacity until 1 and 2 are true" (a dedicated ephemeral, credential-free runner; a fixed

@@ -113,16 +113,29 @@ function parseJobs(file) {
     if (/^    runs-on:\s*$/.test(line)) {
       current.runsOn = "";
       current.runsOnSeq = [];
+      current.runsOnOpaque = false;
       continue;
     }
     if (current.runsOnSeq) {
+      // ⛔ BLANK AND COMMENT-ONLY LINES ARE VALID *INSIDE* a YAML block sequence, so they do NOT
+      // end it. Ending on them truncated the label list: `- ubuntu-latest` / `# reserved` /
+      // `- required-check` then parsed as just `ubuntu-latest`, and T2 saw a job that had NOT
+      // changed while YAML said it was on the reservation (reproduced in review round 2).
+      if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
       const item = /^\s+- +(.+?)\s*$/.exec(line);
       if (item) {
         current.runsOnSeq.push(item[1]);
         current.runsOn = current.runsOnSeq.join(",");
         continue;
       }
-      current.runsOnSeq = null; // the sequence ended; fall through to the other keys
+      // A bare `-` (value on its own following lines) or an indented continuation of one: this
+      // reader cannot say what the label set IS, so the job is marked OPAQUE and fails closed
+      // rather than being read as "whatever prefix I managed to parse".
+      if (/^\s*-\s*$/.test(line) || /^\s{5,}\S/.test(line)) {
+        current.runsOnOpaque = true;
+        continue;
+      }
+      current.runsOnSeq = null; // a real sibling key ends the sequence; fall through to the keys
     }
     if (/^    uses:/.test(line)) current.uses = true;
     const to = /^    timeout-minutes:\s*(.+?)\s*$/.exec(line);
@@ -146,7 +159,9 @@ if (!job.runsOn) fail(`T1 ${JOB_ID} has no parsed 'runs-on' — the routing cann
 
 const runsOn = job.runsOn || "";
 // The routing must be variable-driven (so an operator can release it) and must NOT be a bare
-// self-hosted label list (which has no fallback and would queue forever when unlabelled).
+// self-hosted label list: with no fallback arm the job is matched by nothing until GitHub cancels it
+// at the 24 h queue limit, and a `cancelled` check is non-red in admin-merge.sh's NON_RED_CONC —
+// i.e. the repo's only required context would read non-red with no verdict (#2474).
 if (!runsOn.includes(VAR_NAME)) {
   fail(
     `T1 ${JOB_ID}'s runs-on does not consume '${VAR_NAME}' — the reservation must be engageable ` +
@@ -156,7 +171,10 @@ if (!runsOn.includes(VAR_NAME)) {
 if (!/fromJSON\(/.test(runsOn)) {
   fail(`T1 ${JOB_ID}'s runs-on is not array-valued via fromJSON(…); got: ${runsOn}`);
 }
-// A bare label list (or a bare `self-hosted`) has no fallback arm at all — refuse the shape.
+// A bare label list (or a bare `self-hosted`) has no fallback arm at all — refuse the shape. There
+// is no "queue forever" here: GitHub cancels a self-hosted job at the 24 h queue limit, and a
+// `cancelled` check is in admin-merge.sh's NON_RED_CONC, so the required context would read
+// non-red with no verdict (#2474) — which is why the fallback arm below is mandatory, not nice.
 if (/^\s*(\[|self-hosted)/.test(runsOn)) {
   fail(`T1 ${JOB_ID}'s runs-on may not be an unconditional self-hosted label list; got: ${runsOn}`);
 }
@@ -170,9 +188,10 @@ if (!runsOn.includes(FALLBACK)) {
   );
 }
 
-// T1b — the reservation value the expression's variable engages is DECLARED in the job's block,
-// and it PARSES to a label list that names the reserved label. Asserting against the bare constant
-// would be true by construction; this reads the declaration back out of the file.
+// T1b — the reservation value the expression's variable engages is DECLARED in the job's block.
+// The declared literal is extracted FROM THE FILE and parsed, so this asserts what the workflow
+// says rather than comparing the module constant to itself (the round-2 review caught exactly that
+// tautology — both branches were unreachable while the comment claimed otherwise).
 const blockText = job.block.join("\n");
 if (!blockText.includes(RESERVATION)) {
   fail(
@@ -180,14 +199,19 @@ if (!blockText.includes(RESERVATION)) {
       `operator's engage command must be reproducible from the workflow that consumes it`
   );
 } else {
-  let declared;
-  try {
-    declared = JSON.parse(RESERVATION);
-  } catch {
-    cannot(`the declared reservation value is not JSON: ${RESERVATION}`);
-  }
-  if (!Array.isArray(declared) || !declared.includes(RESERVED_LABEL)) {
-    fail(`T1 the declared reservation value does not name '${RESERVED_LABEL}': ${RESERVATION}`);
+  const declMatch = /(\[[^\]\n]*"required-check"[^\]\n]*\])/.exec(blockText);
+  if (!declMatch) {
+    fail(`T1 the declaration in ${JOB_ID}'s block does not read as a JSON label list`);
+  } else {
+    let declared;
+    try {
+      declared = JSON.parse(declMatch[1]);
+    } catch {
+      cannot(`the declared reservation value is not JSON: ${declMatch[1]}`);
+    }
+    if (!Array.isArray(declared) || !declared.includes(RESERVED_LABEL)) {
+      fail(`T1 the declared reservation value does not name '${RESERVED_LABEL}': ${declMatch[1]}`);
+    }
   }
 }
 
@@ -225,6 +249,14 @@ for (const abs of [...workflowFiles.map((f) => path.join(WORKFLOWS_DIR, f)), wfA
   const parsed = parseJobs(abs);
   for (const [id, j] of parsed.jobs) {
     const r = j.runsOn;
+    // An unreadable label set is `cannot-measure`, never an exemption.
+    if (j.runsOnOpaque) {
+      cannot(
+        `${path.basename(abs)} job '${id}' has a 'runs-on:' block sequence this reader cannot ` +
+          `resolve (a bare '-' item or an indented continuation) — refusing to grade a routing it ` +
+          `cannot read`
+      );
+    }
     // A reusable-workflow job (`uses:` and no `runs-on:`) owns no routing here. Anything ELSE with
     // no readable routing is `cannot-measure`, never a skip: an unparsed `runs-on` is precisely how
     // a second job would hide from this sweep.
@@ -275,18 +307,27 @@ const doc = readOrDie(DOC_FILE, "docs file");
 // label; `PUT` replaces the whole custom set). Either is acceptable, but the call must be there and
 // it must name the reserved label on the same invocation site — a doc that merely mentions runner
 // labels is folklore.
-const LABELS_CALL = /(?:POST|PUT)\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels/;
-if (!LABELS_CALL.test(doc)) {
+const POST_CALL = /POST\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels/;
+const DELETE_CALL = /DELETE\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels\/ubuntu-latest/;
+// The ADD must be a `POST`: `PUT …/labels` REPLACES every custom label on the runner, so a doc whose
+// only documented call is a PUT tells an operator to silently delete whatever else the cell carries.
+if (!POST_CALL.test(doc)) {
   fail(
-    `T5 ${DOC_FILE} carries no 'POST|PUT …/actions/runners/<id>/labels' call — the reservation must ` +
-      `be reproducible, not folklore`
+    `T5 ${DOC_FILE} carries no additive 'POST …/actions/runners/<id>/labels' call — the reservation ` +
+      `must be reproducible with the NON-DESTRUCTIVE call, not folklore`
   );
 }
-const labelsMatch = /(?:POST|PUT)\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels([\s\S]{0,400})/.exec(
-  doc
-);
+const labelsMatch = /POST\s+repos\/[^ \n]+\/actions\/runners\/[^ \n]*\/labels([\s\S]{0,400})/.exec(doc);
 if (labelsMatch && !labelsMatch[1].includes(`labels[]=${RESERVED_LABEL}`)) {
-  fail(`T5 the documented runner-labels call does not set 'labels[]=${RESERVED_LABEL}' near it`);
+  fail(`T5 the documented POST /labels call does not set 'labels[]=${RESERVED_LABEL}' near it`);
+}
+// ...and the leak must be documented as a targeted removal, not implied.
+if (!DELETE_CALL.test(doc)) {
+  fail(
+    `T5 ${DOC_FILE} does not document removing 'ubuntu-latest' from the reserved runner with ` +
+      `'DELETE …/actions/runners/<id>/labels/ubuntu-latest' — a reserved runner that keeps it is ` +
+      `still taking advisory jobs`
+  );
 }
 if (!doc.includes(RESERVATION)) {
   fail(

@@ -20,7 +20,11 @@
 #      A multi-line `runs-on:` parses to null in a naive reader, and a null routing looks exactly
 #      like a reusable-workflow (`uses:`) job unless it is handled — so this arm exists because its
 #      absence was how a second reservation could hide from T2 (found in review, reproduced).
-#   8. UNREADABLE workflow                                                → rc 2, never a pass.
+#   8. MUTANT: a COMMENT-INTERRUPTED block sequence of `runs-on:`       → must FAIL (T2).
+#      Blank/comment lines are valid INSIDE a YAML block sequence; a reader that ends the
+#      sequence there sees only `ubuntu-latest` while YAML puts the job on the reservation.
+#      This is the regression found in review round 2 (a false PASS).
+#   9. UNREADABLE workflow                                                → rc 2, never a pass.
 #
 # ON T2's STRICTNESS (deliberate): T2 pins EVERY other job in the tree to exactly `ubuntu-latest`,
 # not merely "must not join the reservation". That is intentional — the reservation's value is that
@@ -118,7 +122,7 @@ fi
 
 # ── 5. the documented PUT /labels call broken ─────────────────────────────────────────────────
 if mutate "$DOC" "$TMP/doc-bad-put.md" "/actions/runners/ID/labels" "/actions/runners/ID/nope"; then
-  run_expect 1 "5 MUTANT a broken PUT /labels call is REFUSED" "$WF" "$TMP/doc-bad-put.md"
+  run_expect 1 "5 MUTANT a broken documented label call is REFUSED" "$WF" "$TMP/doc-bad-put.md"
 else
   fail "5 MUTATION-NOT-APPLIED (the documented PUT /labels path was not found)"
 fi
@@ -152,7 +156,26 @@ node -e '
 # 7 — a second job whose `runs-on:` is a BLOCK SEQUENCE (not a single line).
 run_expect 1 "7 MUTANT a block-sequence second reservation job is REFUSED" "$TMP/wf-blockseq.yml" "$DOC"
 
-run_expect 2 "8 UNREADABLE workflow exits 2 (never a vacuous pass)" "$TMP/absent.yml" "$DOC"
+# 8 — a COMMENT-INTERRUPTED block sequence. Blank and comment-only lines are valid INSIDE a YAML
+# block sequence; a reader that ends the sequence there sees only the prefix (`ubuntu-latest`) while
+# YAML puts the job on the reservation. This arm is the regression from review round 2.
+node -e '
+  const fs = require("fs");
+  const src = fs.readFileSync(process.argv[1], "utf8");
+  const from = "    runs-on: ubuntu-latest\n";
+  if (!src.includes(from)) { console.error("MUTATION-NOT-APPLIED"); process.exit(3); }
+  const to = [
+    "    runs-on:",
+    "      - ubuntu-latest",
+    "      # reserved",
+    "      - required-check",
+    "",
+  ].join("\n");
+  fs.writeFileSync(process.argv[2], src.replace(from, to));
+' "$WF" "$TMP/wf-commentseq.yml"
+run_expect 1 "8 MUTANT a comment-interrupted block sequence is REFUSED" "$TMP/wf-commentseq.yml" "$DOC"
+
+run_expect 2 "9 UNREADABLE workflow exits 2 (never a vacuous pass)" "$TMP/absent.yml" "$DOC"
 
 echo
 if [ "$fails" -ne 0 ]; then
