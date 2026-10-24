@@ -2647,8 +2647,9 @@ def harness_repo_of(o: Path) -> Path | None:
 
     Resolution: `HARNESS_REPO` first (the variable the fleet's supervisor already exports), then the
     checkout containing `$O`, then the checkout containing THIS script, then the conventional
-    `$HOME/orchestrator` — and each candidate must carry the harness (`box-status.sh` at its root or
-    under `scripts/orchestrator-harness/`), so a candidate that is merely SOME checkout is skipped.
+    `$HOME/orchestrator` — and each candidate must CARRY THE HARNESS, meaning
+    `scripts/orchestrator-harness/box-status.sh` is TRACKED by that candidate's own repo (see the
+    round-3 note on the tracked check below), so a candidate that is merely some checkout is skipped.
     """
     # ⛔ FOUR CANDIDATES, BECAUSE THE TIMER EXPORTS NONE OF THE FIRST TWO. Measured (round-1 review of
     # PR #2683): the timer this file installs exports only `O`/`HOME`/`PATH` (see the timer installer),
@@ -2668,10 +2669,18 @@ def harness_repo_of(o: Path) -> Path | None:
     # Accepting either on a checkout test alone brought #2679 back in full — and SILENTLY, because when
     # that wrong repo happens to be the SWEPT repo the caller sees "same repo" and reuses the swept
     # main, which is precisely the foreign-sha comparison the goal must never make. So a candidate
-    # qualifies only if it CARRIES THE HARNESS: `scripts/orchestrator-harness/box-status.sh` in a repo
-    # checkout, or `box-status.sh` at the root of a flat payload. That is an offline, local fact about
-    # the tree — never a remote URL, which forks legitimately change — and a non-harness checkout has
-    # neither.
+    # qualifies only if it CARRIES THE HARNESS. That is an offline, local fact about the tree — never a
+    # remote URL, which forks legitimately change.
+    #
+    # ⛔ THE MARKER MUST BE **TRACKED**, NOT MERELY PRESENT (round-3 review of PR #2683, BLOCKING). A
+    # PATH-existence test re-admitted the tortoise repo for the shape this fleet actually runs: the
+    # canonical tortoise/eldato checkout carries a GITIGNORED `scripts -> $AGENT_INFRA_PATH/scripts`
+    # pointer (this repo's AGENTS.md, #9475), so `scripts/orchestrator-harness/box-status.sh` EXISTS in
+    # every such checkout through it. Measured on `/tmp/cell-wt-greenmain` (origin = tortoise.git):
+    # `is_file()` true, and the resolution returned that repo with a TORTOISE `origin/main`
+    # (`49dca29bb124…`) — #2679 in full, for the shape two of the fleet's cells run. `git ls-files
+    # --error-unmatch` is the right question: it asks the candidate's OWN repo whether it owns the
+    # harness file, and it follows no pointer.
     here = script_checkout()
     cands = [os.environ.get("HARNESS_REPO") or "", str(o), str(here or ""),
              str(Path.home() / "orchestrator")]
@@ -2682,10 +2691,10 @@ def harness_repo_of(o: Path) -> Path | None:
         top = (out or "").strip()
         if rc != 0 or not top:
             continue
-        root = Path(top)
-        if (root / "scripts" / "orchestrator-harness" / "box-status.sh").is_file() \
-                or (root / "box-status.sh").is_file():
-            return root
+        rc2, _, _ = run(["git", "-C", top, "ls-files", "--error-unmatch",
+                         "scripts/orchestrator-harness/box-status.sh"], timeout=15)
+        if rc2 == 0:
+            return Path(top)
     return None
 
 

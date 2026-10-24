@@ -2554,8 +2554,8 @@ ck "§27b ...and the header says UNRESOLVED instead of printing a foreign sha" \
    "$([ "$(sed -n 's/.*harness main:\*\*[[:space:]]*`\([^`]*\)`.*/\1/p' "$O/MERGE-REMINDER.md" | head -1)" = "UNRESOLVED" ] && echo 0 || echo 1)"
 ck "§27b ...and goal 2 is NOT-MEASURED for that reason, never compared against the swept repo" \
    "$(qF 'the harness repo could not be resolved' "$MDF" && nq 'a different commit from this cycle' "$MDF" && echo 0 || echo 1)"
-# ...and the SAME copy DOES resolve when it sits inside a checkout (the case the fix exists for).
-cp "$SUT" "$TMP/nowhere/mr-in-repo.py"
+# ...and the SUT DOES resolve its own checkout (the case the fix exists for): no copy is made, because
+# the script under test is ALREADY inside a checkout and running the copy would test the copy's location.
 out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
    HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
    python3 - "$SUT" <<'PYMOD'
@@ -2765,7 +2765,10 @@ git -C "$SPACED" commit --quiet -m "spaced"
 SPACED_SHA="$(git -C "$SPACED" rev-parse HEAD | cut -c1-12)"
 bash "$SPACED/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 &
 SPACED_PID=$!
-trap 'kill "$SPACED_PID" 2>/dev/null' EXIT
+# ⛔ NO `trap … EXIT` HERE. The suite already owns the only cleanup trap (`rm -rf "$TMP"`); a second one
+# REPLACES it, so every run leaked its whole fixture tree (round-3 review). The controller is killed
+# explicitly below, and it is a bounded `sleep`, so an interrupted run leaves a short-lived process at
+# worst — never a fixture directory.
 ck "§27b the spaced-path controller really is running with a SPACE in its argv" \
    "$([ -d "/proc/$SPACED_PID" ] && grep -q "rt a" "/proc/$SPACED_PID/cmdline" 2>/dev/null && echo 0 || echo 1)"
 out="$(run_box "$SPACED_PID bash $SPACED/scripts/orchestrator-harness/orch-loop.sh")"
@@ -2786,14 +2789,25 @@ ck "§27b ...and no whitespace split of a flattened cmdline remains in the reade
 out="$(env FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" PATH="$TMP:/usr/bin:/bin:/usr/local/bin" \
   bash "$BOX" --o "$O" --repo "$PLAIN" 2>&1)"
 ck "§27b box-status REFUSES an explicit --repo that does not carry the harness" \
-   "$(grep -q '^ref: UNRESOLVED (--repo ' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'not TRACKED there' <<<"$out" && echo 0 || echo 1)"
 ck "§27b ...and it says so instead of omitting the ref line (an absent line is not an opinion)" \
    "$(grep -q "does not carry the harness" <<<"$out" && echo 0 || echo 1)"
 # ⛔ EVERY CANDIDATE AT ONCE, including this script's own checkout — which is why the probe runs from a
 # FLAT COPY outside any checkout. Run from `$BOX` itself, candidate 3 would be this very worktree (a real
 # harness repo) and the case would pass for the wrong reason: it would prove the fallback works, not that
 # a non-harness checkout is skipped.
-mkdir -p "$TMP/flat" "$TMP/homeplain/orchestrator"
+mkdir -p "$TMP/flat" "$TMP/homeplain"
+# ⛔ `$HOME/orchestrator` IS A REAL CHECKOUT that is not the harness — otherwise this case would pass
+# because `rev-parse` skipped an empty directory, and would prove nothing about the marker.
+rm -rf "$TMP/homeplain/orchestrator"
+git init --quiet -b main "$TMP/homeplain/orchestrator" 2>/dev/null
+git -C "$TMP/homeplain/orchestrator" config user.email t@example.invalid
+git -C "$TMP/homeplain/orchestrator" config user.name t
+: > "$TMP/homeplain/orchestrator/README"
+git -C "$TMP/homeplain/orchestrator" add README
+git -C "$TMP/homeplain/orchestrator" commit --quiet -m "a checkout that is not the harness"
+ck "§27b the \$HOME/orchestrator fixture really is a checkout (so the MARKER must be what skips it)" \
+   "$(git -C "$TMP/homeplain/orchestrator" rev-parse --git-dir >/dev/null 2>&1 && echo 0 || echo 1)"
 cp "$BOX" "$TMP/flat/box-status.sh"
 # ⛔ `REPO=` IS CLEARED ON PURPOSE. `box-status.sh` honours an ambient `REPO` (the deploy arm exports
 # `REPO=<harness repo>` into every probe, #2680), and this shell's ambient value is the SWEPT repo — so
@@ -2802,10 +2816,59 @@ out="$(env REPO= HARNESS_REPO="$PLAIN" HOME="$TMP/homeplain" FIXTURE="$FX" HARNE
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
 ck "§27b the flat-copy probe really is outside every checkout (its own checkout candidate is unusable)" \
    "$(! git -C "$TMP/flat" rev-parse --git-dir >/dev/null 2>&1 && echo 0 || echo 1)"
-# ...`$HARNESS_REPO`, `$O` and `$HOME/orchestrator` are all the SAME non-harness checkout here, and none of
-# them may be adopted: the answer is UNRESOLVED with the reason, never a foreign `origin/main`.
+# ...`$HARNESS_REPO` and `$O` are the same non-harness checkout and `$HOME/orchestrator` is a DIFFERENT
+# one; none of the three may be adopted, and the flat copy's own directory is not a checkout at all. The
+# answer is UNRESOLVED with the reason, never a foreign `origin/main`.
 ck "§27b box-status skips EVERY non-harness candidate (env, \$O, \$HOME/orchestrator) and says why" \
-   "$(grep -q '^ref: UNRESOLVED (no harness repo' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ THE CANONICAL CHECKOUT SHAPE, WHICH A PATH-EXISTENCE TEST RE-ADMITTED (round-3 review, BLOCKING).
+# Every tortoise/eldato checkout carries a GITIGNORED `scripts -> $AGENT_INFRA_PATH/scripts` pointer
+# (#9475), so `scripts/orchestrator-harness/box-status.sh` EXISTS in it and a marker test written as
+# `[ -f … ]` certified a TORTOISE checkout as the harness repo — #2679 back, for the shape two of the
+# fleet's cells run. The marker must be TRACKED by the candidate's own repo.
+HERE_TOP="$(cd "$(dirname "$0")/../.." && pwd)"
+SHAPED="$FX/tortoise-shape"
+rm -rf "$SHAPED"
+git init --quiet -b main "$SHAPED" 2>/dev/null
+git -C "$SHAPED" config user.email t@example.invalid
+git -C "$SHAPED" config user.name t
+: > "$SHAPED/README"
+ln -s "$HERE_TOP/scripts" "$SHAPED/scripts"
+git -C "$SHAPED" add README
+git -C "$SHAPED" commit --quiet -m "a checkout with the gitignored scripts pointer"
+ck "§27b the shaped fixture really has \$AGENT_INFRA_PATH's scripts through a symlink, untracked" \
+   "$([ -f "$SHAPED/scripts/orchestrator-harness/box-status.sh" ] && ! git -C "$SHAPED" ls-files --error-unmatch scripts/orchestrator-harness/box-status.sh >/dev/null 2>&1 && echo 0 || echo 1)"
+# The reminder's resolver: it must NOT return the shaped repo (it may fall through to this script's own
+# checkout, which IS the harness — what it must never do is hand a tortoise repo back as the harness).
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$SHAPED" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+shaped = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(shaped)
+ok = got is not None and Path(got).resolve() != shaped
+print(0 if ok else 1)
+PYMOD
+)"
+ck "§27b harness_repo_of REFUSES a checkout whose harness path is only the gitignored scripts pointer" \
+   "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+# ...and the box probe, which names WHY (the pointer is the whole trap, so it has to be in the message).
+out="$(env REPO= HARNESS_REPO="$SHAPED" HOME="$TMP/home" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$BOX" --o "$SHAPED" --repo "$SHAPED" 2>&1)"
+ck "§27b box-status REFUSES the same shape and names the pointer as the reason" \
+   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'not TRACKED there' <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ A SUBDIRECTORY CANDIDATE. `harness-refresh.sh` and `check-deployed-drift.sh` accept a subdir for
+# `HARNESS_REPO`, so both readers normalise to `--show-toplevel`; a reader that tested the literal path
+# would refuse what the other accepts and the deploy probe would read CANNOT VERIFY forever.
+out="$(env REPO= HARNESS_REPO="$HERE_TOP/scripts" HOME="$TMP/home" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$BOX" --o "$TMP/o" 2>&1)"
+ck "§27b box-status normalises a SUBDIRECTORY candidate to its toplevel (accepted, not refused)" \
+   "$(! grep -q '^ref: UNRESOLVED' <<<"$out" && echo 0 || echo 1)"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
 echo "-- §28 the arm the list endpoint had made inert"

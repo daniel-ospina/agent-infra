@@ -98,25 +98,53 @@ elif [ -n "$stamp_commit" ]; then src="stamp"; id="$stamp_commit"; fi
 # human or a deploy script chose: `$O` (a flat payload can land anywhere) and `$HOME/orchestrator`
 # (measured on this fleet as a TORTOISE checkout, `origin/main=5f40d832c254`). Accepting either on a
 # checkout test alone compared a harness sha against tortoise's main — the wrong-repo reading this
-# script exists to remove, and it was SILENT because the answer still looked like a sha. A candidate
-# qualifies only if it CARRIES THE HARNESS: `scripts/orchestrator-harness/box-status.sh` in a repo
-# checkout, or `box-status.sh` at the root of a flat payload. Same rule as `harness_repo_of()` in
-# merge-reminder.py, so the two readers cannot disagree inside one report (#2680's lesson).
-carries_harness() {
-  [ -n "${1:-}" ] || return 1
-  [ -f "$1/scripts/orchestrator-harness/box-status.sh" ] || [ -f "$1/box-status.sh" ]
+# script exists to remove, and it was SILENT because the answer still looked like a sha.
+#
+# ⛔ AND A FILE **PATH** EXISTING IS NOT THE HARNESS EITHER (round-3 review of PR #2683, BLOCKING). The
+# canonical tortoise/eldato checkout carries a GITIGNORED `scripts -> $AGENT_INFRA_PATH/scripts` pointer
+# (see this repo's AGENTS.md, #9475), so `scripts/orchestrator-harness/box-status.sh` EXISTS in every such
+# checkout — a mere existence test re-admitted the tortoise repo and #2679 came back for the shape the
+# fleet actually runs. The harness file must therefore be TRACKED by the candidate's own repo:
+# `git ls-files --error-unmatch` follows no pointer and is an offline fact about the tree.
+#
+# Same rule as `harness_repo_of()` in merge-reminder.py, so the two readers cannot disagree inside one
+# report (#2680's lesson): a candidate that names a SUBDIRECTORY of a harness checkout is ACCEPTED (the
+# marker is looked for at the toplevel, and `$REPO` resolves the same ref from inside the subdir), where a
+# literal-path test refused what `harness-refresh.sh`/`check-deployed-drift.sh` accept.
+harness_missing_reason() { # <path> -> why it is not the harness repo (empty = it is)
+  local c="$1" top
+  [ -n "$c" ] || { printf 'empty path'; return; }
+  if ! git -C "$c" rev-parse --git-dir >/dev/null 2>&1; then
+    printf '%s is not a git checkout' "$c"; return
+  fi
+  top="$(git -C "$c" rev-parse --show-toplevel 2>/dev/null)"
+  [ -n "$top" ] || { printf '%s has no work tree toplevel' "$c"; return; }
+  if git -C "$top" ls-files --error-unmatch scripts/orchestrator-harness/box-status.sh >/dev/null 2>&1; then
+    return                                     # it IS the harness repo
+  fi
+  printf '%s does not carry the harness: scripts/orchestrator-harness/box-status.sh is not TRACKED there (a scripts -> $AGENT_INFRA_PATH/scripts pointer makes the PATH exist in any checkout)' "$top"
 }
 REF_WHY=""
+refused=""
 if [ -n "$REPO" ]; then
   # An explicit `--repo` is an operator's assertion, but it is the SAME question, so it gets the same
   # test — and a rejected one is named on `ref:` rather than silently accepted.
-  carries_harness "$REPO" || { REF_WHY="--repo '$REPO' does not carry the harness"; REPO=""; }
+  why="$(harness_missing_reason "$REPO")"
+  if [ -n "$why" ]; then REF_WHY="--repo: $why"; REPO=""
+  else REPO="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null)"; fi
 else
   for c in "${HARNESS_REPO:-}" "$O" "$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)" "$HOME/orchestrator"; do
     [ -n "$c" ] || continue
-    git -C "$c" rev-parse --git-dir >/dev/null 2>&1 || continue
-    carries_harness "$c" || continue
-    REPO="$c"; break
+    why="$(harness_missing_reason "$c")"
+    if [ -n "$why" ]; then
+      # ⛔ THE FIRST REFUSAL IS THE REASON, NAMED. `HARNESS_REPO`/`$O` set but disqualified used to fall
+      # through to a generic "no $HARNESS_REPO, no checkout beside $O" — a reason that is FALSE in that
+      # case and sends the operator looking for a variable that is already set.
+      [ -n "$refused" ] || refused="$c: $why"
+      continue
+    fi
+    REPO="$(git -C "$c" rev-parse --show-toplevel 2>/dev/null)"
+    break
   done
 fi
 ref_sha=""
@@ -125,7 +153,10 @@ if [ -n "$REPO" ] && [ -d "$REPO" ]; then
 fi
 is_sha "${ref_sha:-}" || ref_sha=""
 if [ -z "$REPO" ] && [ -z "${REF_WHY:-}" ]; then
-  REF_WHY="no harness repo: no \$HARNESS_REPO, no checkout beside \$O, and none containing this script"
+  # Name the FIRST candidate that was refused, because that is the one the operator can act on; the
+  # generic sentence is only for "nothing was even a checkout".
+  if [ -n "$refused" ]; then REF_WHY="$refused"
+  else REF_WHY="no harness repo: no \$HARNESS_REPO, no checkout beside \$O, and none containing this script"; fi
 fi
 
 relation="unknown"
