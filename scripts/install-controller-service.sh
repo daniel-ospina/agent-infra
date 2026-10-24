@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+# ⛔ SOURCING THIS FILE IS INERT (re-review, #2666). It is a SCRIPT with a top-level argument loop and an
+# action dispatch, so `source scripts/install-controller-service.sh` used to fall through to
+# `ACTION=--install` and INSTALL A REAL, ENABLED UNIT on whatever box ran it — measured in this lane's own
+# verification round, where a reviewer that wanted the helper functions wrote `/etc/systemd/system/
+# eldato-orchestrator.service` plus its `multi-user.target.wants` link and had to revert them by hand.
+# An enabled unit is a second supervisor the moment anything starts it, which is the #1761 duplicate this
+# whole file exists to prevent; a *reading* action must therefore never reach the dispatch. Nothing in this
+# repo sources it (checked), so this guard costs no caller anything.
+if [ "${BASH_SOURCE[0]:-$0}" != "$0" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 # install-controller-service.sh — put the cell's ORCHESTRATOR CONTROLLER under a service manager
 # (agent-infra#2402).
 #
@@ -137,17 +148,6 @@ TARGET=""; UNIT_DIR=""; SC=""; WANTED_BY="multi-user.target"
 # does not exist in a per-user manager, so a user unit enabled against it would never be brought back —
 # the defect this installer removes, one layer down. Resolved here beside the scope so the two cannot
 # disagree, and the rendered line is asserted below.
-# ⛔ SOURCING THIS FILE IS INERT (re-review, #2666). It is a SCRIPT with a top-level argument loop and an
-# action dispatch, so `source scripts/install-controller-service.sh` used to fall through to
-# `ACTION=--install` and INSTALL A REAL, ENABLED UNIT on whatever box ran it — measured in this lane's own
-# verification round, where a reviewer that wanted the helper functions wrote `/etc/systemd/system/
-# eldato-orchestrator.service` plus its `multi-user.target.wants` link and had to revert them by hand.
-# An enabled unit is a second supervisor the moment anything starts it, which is the #1761 duplicate this
-# whole file exists to prevent; a *reading* action must therefore never reach the dispatch. Nothing in this
-# repo sources it (checked), so this guard costs no caller anything.
-if [ "${BASH_SOURCE[0]:-$0}" != "$0" ]; then
-    return 0 2>/dev/null || exit 0
-fi
 # ⛔ A UNIT DIRECTORY SYSTEMD READS AND THIS FLEET'S READERS DO NOT IS A SECOND DISPATCHER (review P1,
 # #2402; re-review P1). `SYSTEMD_UNIT_DIR` is the installer's WRITE override, but the supervisor discovers a
 # unit only under the system dir (`CONTROLLER_SYSTEM_UNIT_DIR`, default `/etc/systemd/system`) and the user
