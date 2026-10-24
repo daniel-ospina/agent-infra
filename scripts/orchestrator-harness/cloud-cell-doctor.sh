@@ -1151,14 +1151,14 @@ run_merge() {
   prs="$(bounded "$MERGE_READ_TIMEOUT" "$GH_BIN" api "repos/$OR/pulls?state=open&per_page=$MERGE_MAX_PRS" 2>"$err")"
   rc=$?
   # ⛔ NEVER `[ -z "${prs//[[:space:]]/}" ]` HERE (the same hole `cleanup-stale-branches.sh:694`
-  # documents). The pattern substitution is SUPERLINEAR, and a real open-PR answer is large: measured
-  # on this cell's bash 5.2.21, THIS repo's real `pulls?state=open` answer (349 KB) took 84 s of PURE
-  # CPU (no syscalls at all), with the merge lock held the whole time — and the suite's synthetic
-  # 843 KiB fixture (862,802 bytes) takes 104 s in the same builtin. `MERGE_BUDGET_S`
-  # cannot bound it: the cost sits inside one builtin, so the whole sequential loop (doctor, then
-  # reap, then hygiene) stalls behind it on the first tick of every cell. The `case` glob answers "empty
-  # or whitespace-only" in O(n) and matches exactly the same set (POSIX `[:space:]`); a NUL cannot
-  # reach here (command substitution strips it), so the question is complete.
+  # documents). The pattern substitution is SUPERLINEAR, and a real open-PR answer is large. Measured
+  # on THIS box, bash 5.2.21, one-builtin cost with nothing else running: 322 KiB (330,246 B) took
+  # 14.5 s, 843 KiB (862,802 B — the suite's fixture) took 99.8 s — 2.6x the bytes for 6.9x the time,
+  # i.e. quadratic, not linear. Both with the merge lock held and no syscalls, so `MERGE_BUDGET_S`
+  # cannot bound it: a `timeout` cannot interrupt a builtin, so the whole sequential loop (doctor,
+  # then reap, then hygiene) stalls behind it on the first tick of every cell. The `case` glob answers
+  # "empty or whitespace-only" in 9 ms (322 KiB) / 26 ms (843 KiB) and matches exactly the same set
+  # (POSIX `[:space:]`); a NUL cannot reach here (command substitution strips it).
   ws_only=0
   case "$prs" in *[![:space:]]*) ;; *) ws_only=1 ;; esac
   if [ "$rc" -ne 0 ] || [ "$ws_only" = 1 ]; then
@@ -2543,8 +2543,9 @@ run_status() {
 #
 # The default therefore lives in EACH ROLE (`local dry="${1:-}"`), not only in this dispatcher: the
 # invariant is "no mode means a live pass", not "this caller happens to pass one". That redundancy is
-# deliberate — #2424 shipped twice (#2555 also made the loop bind it explicitly, `run_role_pass doctor
-# ""`, which this merge brought in) — so a FUTURE bare dispatch cannot reintroduce the crash, and the
+# deliberate — #2424 shipped twice (#2555 had ALREADY made the loop bind it explicitly,
+# `run_role_pass doctor ""`, before this branch was rebased onto it) — so a FUTURE bare dispatch
+# cannot reintroduce the crash, and the
 # invariant is testable at the role boundary rather than through the loop's timing. `reap` is not
 # bare-dispatched today (`run_doctor`'s nested `run_role_pass reap "$dry"` and the CLI's `${dry}` both
 # bind it) and gets the same default anyway, for that same future-proofing.
@@ -2598,13 +2599,17 @@ run_status() {
 #   #2424 death — while printing a ✅ "reported, not graded". A bucket that reports instead of grading
 #   is how a fail-open classifier looks.
 # ⛔ SCOPE — WHAT THIS AUDIT DOES NOT COVER (review P2). It walks `local` BINDINGS, i.e. lines matching
-#   `^[[:space:]]*local `. A positional read that is not bound by `local` — `state_get`'s direct `$1`/
-#   `$2` in `"$ROLES_DIR/$1.state"`, `row_rc_merge`'s `case "${1:-0}"`, the `attempt_*` helpers — is
-#   NOT graded by it, and `${1:-0}` there is the non-empty-default shape the audit rejects for a
-#   binding. Named here rather than silently implied: every such read today is on a function whose
-#   every caller binds, so none is live, but a NEW one would be graded by neither this block nor the
-#   suite's walk. Extending the walk to function bodies is the fix if one appears; until then, read
-#   this list as "every `local` binding of a positional", not "every positional read in the file".
+#   `^[[:space:]]*local `. A positional read that is not bound by `local` is NOT graded by it. The
+#   instances today, all in functions whose every caller binds: `free_mb` (`${1:-.}`), `hyg_df_mb`
+#   (`${1:-$CELL_HOME}`), `hyg_df_delta` (`${1:-?}`, `${2:-?}`), `num_ok` (`${1:-}`), `row_rc_merge`
+#   (`${1:-0}`), `state_get` (`$1`, `$2`), `mtime_epoch`, `pane_pid`, `session_present`,
+#   `attached_clients`, `subtree_cpu_secs`, `attempt_epoch`, `attempt_record`, and the CLI dispatch's
+#   own `case "${1:-status}"`. Two of those — `free_mb` and `hyg_df_mb` — are the NON-EMPTY-DEFAULT
+#   shape this audit rejects for a binding, so the exemption is deliberate here and would not be
+#   there: they are pure helpers whose default is the harmless current directory / cell home. Named
+#   so the omission is a recorded decision, not an implication of coverage: extending the walk to
+#   function bodies is the fix if a positional read outside a `local` ever carries a real hazard.
+#   Read this as "every `local` binding of a positional", never "every positional read in the file".
 # ⛔ The suite (final pass 3) walks this MECHANICALLY, by VALUE, keyed by (FUNCTION, NAME) and over a
 #   DERIVED role list: `"${N:-}"` passes at any index, `"${N:-<anything>}"` FAILS (a non-empty default
 #   would let an absent argument arm a mode by itself), a bare `$N` must be a `function:name` pair on
