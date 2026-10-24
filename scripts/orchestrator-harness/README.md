@@ -1143,6 +1143,17 @@ unreadable domain (or an unreadable account record) makes the run refuse instead
 only automated gate runs on Linux, and `--start`/`--uninstall` are the incident's own path). It is the
 same discipline as `ELDATO_ALLOW_TEST_HOME=1` and never applies to a normal run.
 
+⛔ **AND THE LABEL ITSELF IS PART OF THAT CONTAINMENT (agent-infra#1996).** launchd resolves a label in
+the USER domain and IGNORES `$HOME`, so a plist rendered under a throwaway home still addresses the
+live job by name — "the sandbox has its own `$HOME`" protects nothing. `install.sh` therefore treats a
+non-default `LABEL` as a sandbox seam and nothing else: `label_guard` refuses a **non-default** label on
+the invoking user's real `$HOME`, and refuses a **production** label (`com.eldato.orchestrator-loop`,
+`com.eldato.orchestrator-watchdog`) anywhere but the real `$HOME`. `selftest.sh` installs
+`LABEL_OVERRIDE=…-loop-test`, addresses every sandbox plist by that name, and puts a `launchctl` stub on
+`PATH` that **exits 97** on either production label — so "no test addressed production" is measured over
+the whole run, not assumed.
+
+
 Run the offline self-test first — it needs no network, tmux server or git writes. **Every check
 exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
 reaper, or runs `install.sh` for real) rather than re-implementing the logic — a test that
@@ -2147,6 +2158,11 @@ unnamed (a pinned-build escape hatch, not a way to avoid a red line).
 running — `$O` and the controller both move at the next `start` (which re-seeds `$O` from the pin),
 and until then every spawn line says `restart-pending`. The controller does not restart *itself*
 onto the new pin, deliberately: a self-restart mid-cycle is a liveness risk this PR does not take.
+⛔ **The DETECTION half named above is not in this PR** — the agent that repairs a removed or disabled
+job (`enable` + `bootstrap`, and `kickstart` for a loaded-but-dead one) is PR **#1986**, which owns it
+along with its plist, its disarm sentinel and its suite. It is referenced here and not restated:
+one description of one agent, and a second copy is how a fleet ends up with two sentinels.
+
 
 ### 6.5.9 The reminder's actuator arm: a GO is a claim about evidence
 
