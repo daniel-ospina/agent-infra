@@ -2523,7 +2523,19 @@ for _cl in \
   '**Verdict:** CLEAN — addressed the issue which leaves 2 blocking defects open.' \
   '**Verdict:** CLEAN — Fixes to the retry path leave 2 blocking defects unresolved.' \
   '**Verdict:** CLEAN — Removed the old guard so 2 blocking defects remain.' \
-  '**Verdict:** CLEAN — blocking defects that remain unresolved: 2'
+  '**Verdict:** CLEAN — blocking defects that remain unresolved: 2' \
+  '**Verdict:** CLEAN — the guard that we fixed leaves 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — the check which the PR fixed still reports 2 blocking defects.' \
+  '**Verdict:** CLEAN — Fix gaps leave 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — Removed code still leaves 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — Addressed items still expose 2 blocking defects.' \
+  '**Verdict:** CLEAN — Closed PRs still show 2 blocking defects.' \
+  '**Verdict:** CLEAN — Fixed-size buffer still yields 2 blocking defects.' \
+  '**Verdict:** CLEAN — Closed-loop retry leaves 2 blocking defects unresolved.' \
+  '**Verdict:** CLEAN — 2 (P1) blocking defects remain.' \
+  '**Verdict:** CLEAN — 2 [P1] open blocking defects remain.' \
+  '**Verdict:** CLEAN — (2) (P1) blocking defects remain.' \
+  '**Verdict:** CLEAN — 2 blocking P1 defects remain.'
 do
   reset; printf '%s\n' "$_cl" > "$TMP/reviewer-out"
   run "$SRC" 2284
@@ -2796,6 +2808,6 @@ no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
 
-[ "$PASS" -ge 825 ]; ck $? "assertion-count pin: >= 825 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 849 ]; ck $? "assertion-count pin: >= 849 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

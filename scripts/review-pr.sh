@@ -1787,23 +1787,20 @@ function repair_led(cl,   n, w, i, low) {
   }
   # ⛔ `fixes to …` IS A NOUN PHRASE, NOT A VERB (P0, adversarial review of #2288 — MEASURED:
   # `Fixes to the retry path leave 2 blocking defects unresolved.` opened with a repair word, so the
-  # determiner-free noun escaped the closed subject list and recorded a signed clean record. A repair verb
-  # is not followed by a preposition; a repair noun is.)
+  # determiner-free noun escaped the closed subject list and recorded a signed clean record.)
   if (low ~ ("^(" repair ")[[:space:]]+(to|of|for|in|on|at|by|with)([^[:alnum:]]|$)")) return 0
-  # ⛔ …AND A CLAUSE-INITIAL NOUN IS NOT A VERB WHEN THE NEXT WORD IS A COUNT PREDICATE (P0, adversarial
-  # review of #2288 — MEASURED: making `that` a clause boundary made `that fix leaves 2 blocking defects`
-  # clause-initial `fix`, which arm 1 then read as a repair verb. `Fixed the 3 issues` keeps its object
-  # determiner; a NOUN is followed by the predicate that reports the blockers.)
-  if (low ~ ("^(" repair ")[[:space:]]+(leaves?|remains?|stays?|stall|stalls|blocks?|is|are|was|were|has|have)([^[:alnum:]]|$)")) return 0
-  if (low ~ ("^(" repair ")([^[:alnum:]]|$)")) return 1
-  # ⛔ THE BRIDGE IS A CLOSED AUXILIARY VOCABULARY, AND `that|both|all` ARE NOT SUBJECTS (P0, eleventh
-  # fresh review of #2288 — MEASURED: they are DETERMINERS, so `that fix leaves 2 blocking defects` and
-  # `both fixes leave …` matched with the bridge empty, and three free `[[:alpha:]-]+` bridge words let
-  # `I confirm the fix leaves …` and `we note the removed guard leaves …` through — five more signed
-  # clean records over stated blockers. Only a genuine subject plus auxiliaries may precede the verb.)
-  # ⛔ AND OPTIONAL GROUPS, NEVER `{0,3}` (mawk has no interval expressions: the first version of this
-  # line compiled, matched nothing, and every legitimate repair went back to refusing under mawk only)
-  if (low ~ ("^(the pr|this pr|the branch|this branch|we|i|it)[[:space:]]+(" AUX ")*(" repair ")([^[:alnum:]]|$)")) return 1
+  # ⛔ …AND THE REPAIR MUST OBJECT THE COUNT (P0, second adversarial pass of #2288 — MEASURED: every
+  # paraphrase that put a count predicate between a repair lexeme and the counted NP recorded a signed
+  # clean record — `the guard that we fixed leaves 2 blocking defects unresolved`, `the check which the PR
+  # fixed still reports 2 …`, `Fix gaps leave 2 …`, `Removed code still leaves 2 …`, `Addressed items still
+  # expose 2 …`, `Closed PRs still show 2 …`, `Fixed-size buffer still yields 2 …`. Enumerating more noun
+  # shapes re-opens with the next paraphrase; the predicate between the verb and the count is the
+  # discriminator, and it is checked for BOTH grants — the bare one and the subject one — because the
+  # subject grant was the loophole the first attempt missed.)
+  if (match(low, ("^(" repair ")")) || match(low, ("^(the pr|this pr|the branch|this branch|we|i|it)[[:space:]]+(" AUX ")*(" repair ")"))) {
+    if (substr(low, RSTART + RLENGTH) ~ /(leaves?|remains?|stays?|reports?|yields?|exposes?|shows?|blocks?|stalls?)([^[:alnum:]]|$)/) return 0
+    return 1
+  }
   return 0
 }
 BEGIN {
@@ -1827,7 +1824,12 @@ BEGIN {
   AUX = "(have|has|had|also|now|already|just|finally|then|both)[[:space:]]+"
   pnum = "([(][[:space:]]*(" num ")[[:space:]]*[)])|(" num ")"
   PN = "(" pnum ")"
-  fwd = "(^|[^[:alnum:]])(" pnum ")([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]-]+[[:alpha:]][[:alpha:]-]*)?([[:space:]]*[(][[:space:]]*p[0-3][[:space:]]*[)])?[[:space:]-]+(" noun ")([[:space:]-]+((was|is|are|were|has|have)[[:space:]-]+)?(" repair "))?"
+  # ⛔ A SEVERITY TOKEN IS BRIDGE-FILLER, NOT A SUFFIX (P1, second adversarial pass of #2288 — MEASURED:
+  # the `(P1)` slot sat ONLY immediately before the noun, so `2 (P1) blocking defects remain` and
+  # `2 [P1] open blocking defects remain` were invisible to the classifier while `2 (P1) defects remain`
+  # refused. The bridge word may BE a severity token in any of its three slots.)
+  BW = "([[:space:]-]+([[:alpha:]][[:alpha:]-]*|[([]?[[:space:]]*p[0-3]s?[[:space:]]*[])]?))?"
+  fwd = "(^|[^[:alnum:]])(" pnum ")" BW BW BW "([[:space:]]*[(][[:space:]]*p[0-3][[:space:]]*[)])?[[:space:]-]+(" noun ")([[:space:]-]+((was|is|are|were|has|have)[[:space:]-]+)?(" repair "))?"
   # ⛔ THE MIRROR ARM GETS THE SAME BRIDGE WIDTH AS THE FORWARD ARM (P1, adversarial review of #2288 —
   # MEASURED: it capped the noun→numeral bridge at TWO words while the forward arm allowed THREE, so
   # `blocking defects that remain unresolved: 2` was a count to one arm and not the other, and recorded a
