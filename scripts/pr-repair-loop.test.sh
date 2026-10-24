@@ -227,6 +227,13 @@ PY
 check "unset seams keep the previous defaults" "daniel-ospina/tortoise True" "$default_out"
 
 
+# ⛔ A NON-ZERO EXIT MUST BE *THIS* REFUSAL (review round 7): the artifact-missing arms assert rc≠0, so a
+# `foreign_loop_census` refusal from a peer lane's live `--loop` satisfies them without the check they
+# exist for. The census reads the BOX; the fixture must own that read too.
+mkdir -p "$TMP/stubbin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/stubbin/pgrep"
+chmod +x "$TMP/stubbin/pgrep"
+export PATH="$TMP/stubbin:$PATH"
 stub_scope=(UNIT_DIR="$TMP/unit" SYSTEMCTL=/bin/true)
 env "${stub_scope[@]}" PR_REPAIR_SCRIPTS="$TMP/farm" TEMPLATES_DIR="$ROOT/templates/systemd" \
     "$INSTALLER" --dry-run >"$TMP/render.out" 2>&1
@@ -435,6 +442,12 @@ for f in pr-repair-loop.sh pi-reap-worktrees.sh; do
 done
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' >"$TMP/farmfull/pr-doctor.py"
 printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/userbin/sudo"
+# ⛔ AND pgrep (review round 7): `foreign_loop_census` shells out to `pgrep -f`, which sees the BOX, not
+# the fixture — so a peer lane running THIS VERY SUITE (its own --loop arm spawns a real
+# pr-repair-loop.sh) made the negative arm green for the wrong reason (the census refusal, not the linger
+# guard) and the positive control red. Reproduced with one live foreign `--loop`. Stub it: "no foreign
+# loop" is part of the fixture, exactly like sytemd and sudo.
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/userbin/pgrep"
 cat >"$TMP/userbin/loginctl" <<'STUB'
 #!/usr/bin/env bash
 echo "Linger=${STUB_LINGER:-no}"
@@ -450,7 +463,7 @@ case "$*" in
 esac
 exit 0
 STUB
-chmod +x "$TMP/userbin/sudo" "$TMP/userbin/loginctl" "$TMP/userbin/systemctl"
+chmod +x "$TMP/userbin/sudo" "$TMP/userbin/pgrep" "$TMP/userbin/loginctl" "$TMP/userbin/systemctl"
 
 env PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" STUB_LINGER=no \
