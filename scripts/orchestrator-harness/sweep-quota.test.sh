@@ -213,21 +213,87 @@ if need "$T/block.sh" "the sweep-listing block" && need "$T/deps.sh" "the shippe
     && ok "200: the age stamp is written (the anti-starvation floor needs it)" \
     || bad "200: state/sweep-stamp was not written"
 
-  # ── 4) 304 with a fresh stamp: reuse the listing, skip the per-PR reads ──────
+  # ── 4) 304 with a fresh stamp: the cache IS the listing, and it is reused ────
+  # ⛔ THIS CHECK USED TO ASSERT THE OPPOSITE (`SWEEP_LIST` is EMPTY on a 304) and that assertion was
+  # the defect codified: with no actable rows, every counted PR got `wait "no per-PR read"` and the
+  # arms — which sit at the end of the sweep loop — could never run. Measured on the agent-infra
+  # controller 2026-10-23: 152 of 221 `[select]` lines were such cycles and the PR path acted ZERO
+  # times in 555 cycles with 70 PRs open. A 304 is GitHub asserting "identical to what you cached", so
+  # the cached rows are this cycle's read. The per-PR CHECKS are still read (that is the cost a 304
+  # cannot remove); what a 304 saves is the listing request.
   reset_mode; GHMODE=304
   drive "$D"
   grep -q 'If-None-Match: W/"t1"' "$D/calls" \
     && ok "304: the stored ETag IS sent as If-None-Match (the conditional request happens)" \
     || bad "304: no If-None-Match was sent — calls: $(cat "$D/calls")"
-  grep -q 'listing unchanged (304' "$D/log" \
-    && ok "304: logged as 'unchanged', not as a failure" \
-    || bad "304: log is '$(cat "$D/log" 2>/dev/null)'"
   grep -q 'PR listing FAILED' "$D/log" && bad "304: a 304 is reported as a PR-listing FAILURE" \
                                        || ok "304: a 304 is not an error"
-  [ -z "$LIST" ] && ok "304: SWEEP_LIST is EMPTY, so the sweep loop reads zero PRs (per-PR reads skipped)" \
-                 || bad "304 still yielded a listing ('$LIST') — the per-PR reads would run"
+  # The 200 in section 3 wrote the cache; this 304 must now serve it.
+  [ "$(cat "$D/o/state/sweep-rows.tsv" 2>/dev/null)" = "$(printf '1763\tfix/x\tfalse\n1753\tdocs/y\tfalse')" ] \
+    && ok "200: the actable rows are PERSISTED to state/sweep-rows.tsv (the cache a 304 restores)" \
+    || bad "200: state/sweep-rows.tsv is '$(cat "$D/o/state/sweep-rows.tsv" 2>/dev/null)'"
+  [ "$LIST" = "$(printf '1763\tfix/x\tfalse\n1753\tdocs/y\tfalse')" ] \
+    && ok "304: SWEEP_LIST is RESTORED from the cache — the sweep loop has rows to act on" \
+    || bad "304 yielded LIST='$LIST' (want the cached rows; an empty list means the PR path is blind)"
+  grep -q 'restored' "$D/log" \
+    && ok "304: the restore says so on its own line, with the cache age against SWEEP_MAX_AGE" \
+    || bad "304: no restore line — log is '$(cat "$D/log" 2>/dev/null)'"
+  grep -q 'next unconditional sweep in' "$D/log" \
+    && ok "304: the anti-starvation deadline is still stated (the cache is bounded, not permanent)" \
+    || bad "304: the boundedness of the restore is not stated"
   [ ! -s "$D/o/state/sweep-defer-until" ] && ok "304: does not defer the next sweep" \
                                           || bad "304 wrongly deferred the sweep"
+
+  # ── 3b) a 304 with NO CACHE is a LOUD, NAMED refusal — never a silent "nothing to do" ──
+  # A fresh state dir (this change's first cycle, or a wiped box) can answer a 304 with nothing cached.
+  # That is a real state and it must say which artefact is missing: the generic "unchanged — 304 — or
+  # unreadable" string cannot be acted on by an operator.
+  reset_mode; GHMODE=304
+  rm -f "$D/o/state/sweep-rows.tsv"
+  drive "$D"
+  [ -z "$LIST" ] && ok "304 without a cache: SWEEP_LIST stays empty (nothing is invented)" \
+                 || bad "304 without a cache produced rows anyway ('$LIST')"
+  grep -q '304 with NO CACHE' "$D/log" \
+    && ok "304 without a cache: logged ⛔ with the artefact named" \
+    || bad "304 without a cache: log is '$(cat "$D/log" 2>/dev/null)'"
+  grep -q 'sweep-rows.tsv' "$D/log" \
+    && ok "304 without a cache: the log NAMES state/sweep-rows.tsv (the missing artefact)" \
+    || bad "304 without a cache: the missing artefact is not named"
+  # ⛔ AND IT MUST DROP THE VALIDATOR (#2640 review, P2). Left in place, every following cycle kept
+  # sending If-None-Match, kept getting 304, and kept having no cache — blind for up to SWEEP_MAX_AGE
+  # (~10 min, tens of cycles) while the log said "once". Reachable on every cell after an upgrade.
+  [ -f "$D/o/state/sweep-etag" ] \
+    && bad "304 without a cache: the ETag survived — the box stays blind until SWEEP_MAX_AGE expires" \
+    || ok "304 without a cache: the ETag is DROPPED, so the next cycle fetches unconditionally"
+
+  # ── 3d) an EMPTY actable set is NOT a corrupt file ──────────────────────────
+  # `printf` writes a 1-byte file when a 200 listed zero in-scope PRs, so `-s` passes and the parse
+  # yields zero rows — on the HEALTHIEST state (backlog drained, or nothing matching SCOPE/SEL).
+  # Naming corruption there would cry "CANNOT MERGE" every 304 cycle for the life of the box.
+  reset_mode; GHMODE=304
+  printf '\n' > "$D/o/state/sweep-rows.tsv"     # present, but holds zero rows
+  drive "$D"
+  grep -q 'ZERO actable rows' "$D/log" \
+    && ok "304 with an EMPTY cache: the drained/scope-filtered state is named" \
+    || bad "304 with an empty cache: log is '$(cat "$D/log" 2>/dev/null)'"
+  grep -q 'CANNOT MERGE' "$D/log" \
+    && bad "304 with an EMPTY cache: cries CANNOT MERGE on the drained state" \
+    || ok "304 with an empty cache: does NOT claim the cell cannot merge"
+  grep -q 'corrupt' "$D/log" \
+    && bad "304 with an EMPTY cache: asserts corruption from an empty file" \
+    || ok "304 with an empty cache: does not assert corruption it cannot know"
+
+  # ── 3c) a FAILED listing must NOT be papered over with the cache ─────────────
+  # A 304 says "unchanged"; a failure says nothing. Serving the cache on a failure would act on a
+  # read the server never confirmed this cycle — the opposite of the gate's own rule.
+  reset_mode; GHMODE=netfail
+  printf '1763\tfix/x\tfalse\n' > "$D/o/state/sweep-rows.tsv"
+  drive "$D"
+  [ -z "$LIST" ] && ok "listing FAILED: the cache is NOT served (no act on an unconfirmed read)" \
+                 || bad "listing FAILED: rows were served from the cache ('$LIST')"
+  grep -q 'PR listing FAILED' "$D/log" \
+    && ok "listing FAILED: still logged loudly (not 'nothing to do')" \
+    || bad "listing FAILED: log is '$(cat "$D/log" 2>/dev/null)'"
 
   # ── 5) the floor: a STALE stamp forces a full (unconditional) fetch ──────────
   # A completed check run does NOT reliably bump the listing ETag, so a 304 must never be allowed to
