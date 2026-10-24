@@ -33,6 +33,10 @@ import urllib.request
 REPO = "daniel-ospina/tortoise"
 CACHE = os.path.expanduser("~/.pi/agent/state/beta-progress.json")
 TTL = 1800  # was 3600; halved so the worst-case lag is 30m, at ~2x the API cost (still cheap)
+# ⛔ A CACHE `ts` MAY NOT BE IN THE FUTURE. Clock skew between the writer and the reader is real,
+# so a little is allowed and no more; see the validator in `main()` for why the bound is not
+# optional. `compute()` writes `int(time.time())`.
+CACHE_TS_SKEW_S = 300
 
 
 # ── gh RESOLUTION AND FAILURE CONTRACT (fixed 2026-10-01) ────────────────────
@@ -443,6 +447,15 @@ def main():
                 "ts", "p0", "p1", "open_prs", "merged_today"} <= set(cached):
             cached = None
         elif not (isinstance(cached.get("ts"), (int, float))
+                  # ⛔ A NUMBER IS NOT A TIMESTAMP. `time.localtime()` raises OverflowError on a
+                  # numeric-but-unrenderable `ts` (measured: `1e30`), and a FUTURE `ts` renders as
+                  # `-Nm ago`; both passed a bare isinstance test, so the cache was accepted as
+                  # FRESH, the render guard printed `unavailable`, and because `main()` returns
+                  # before `compute()` the bad file was NEVER replaced -- the whole-TTL wrong line
+                  # this nested check exists to close, reached through the one field it never
+                  # bounded (measured: 3 consecutive beats, `compute()` never called). Bounding it
+                  # makes such a cache a MISS, so one refresh overwrites it.
+                  and 0 < cached["ts"] <= time.time() + CACHE_TS_SKEW_S
                   and isinstance(cached.get("open_prs"), int)
                   and isinstance(cached.get("merged_today"), int)
                   and all(isinstance(cached.get(tier), dict)

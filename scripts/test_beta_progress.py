@@ -213,6 +213,17 @@ def test_a_cache_this_version_cannot_render_falls_through_to_a_real_line(monkeyp
         {"ts": int(_time.time()), "open_prs": "many", "merged_today": "many",
          "p0": {"open": 1, "with_pr": 0, "without": 1},
          "p1": {"open": 0, "with_pr": 0, "without": 0}},              # `%d` on a str
+        # ⛔ A NUMBER IS NOT A TIMESTAMP. `1e30` passes `isinstance(ts, (int, float))` and makes
+        # `time.localtime()` raise OverflowError, and a FUTURE ts makes the age render as
+        # `-Nm ago`; both were accepted as FRESH, so the render guard printed `unavailable` and
+        # the file was never replaced (measured: 3 beats, `compute()` never called). The render
+        # guard keeps a line here, but the RIGHT outcome is a refresh.
+        {"ts": 1e30, "open_prs": 99, "merged_today": 99,
+         "p0": {"open": 1, "with_pr": 0, "without": 1},
+         "p1": {"open": 0, "with_pr": 0, "without": 0}},              # unrenderable ts
+        {"ts": int(_time.time()) + 86400, "open_prs": 99, "merged_today": 99,
+         "p0": {"open": 1, "with_pr": 0, "without": 1},
+         "p1": {"open": 0, "with_pr": 0, "without": 0}},              # ts from the future
     ]
     for cached in unrenderable:
         no_cache.write_text(_json.dumps(cached))
@@ -223,6 +234,32 @@ def test_a_cache_this_version_cannot_render_falls_through_to_a_real_line(monkeyp
         assert "2 open PRs, 1 merged today" in out, (cached, out)
         assert _json.loads(no_cache.read_text())["open_prs"] == 2, (
             "the bad cache must be REPLACED by the fresh read, or it poisons the next beat")
+
+
+# ── the RENDER guard itself: a cache that PASSES the validator but cannot be formatted ──
+# ⛔ THE CACHE TEST ABOVE CANNOT PIN THIS. Every case in its first loop produces `unavailable`
+# from the COMPUTE guard (it stubs `compute()` to `None`), and every case in its second loop is
+# rejected by the validator before the render -- so DELETING the render guard leaves all 14 tests
+# green (measured, at two spellings of the removal). The gap is not academic: an accepted cache
+# with an unrenderable `ts` raised `OverflowError` out of `sys.exit(main())` and printed NO line,
+# which is the failure the guard exists to prevent. This test feeds the render a shape the
+# validator never sees (`compute()`'s return, not the file) so the guard is the only thing
+# between it and a traceback.
+def test_the_render_guard_holds_when_compute_returns_an_unformattable_shape(
+        monkeypatch, no_cache, capsys):
+    """`compute()` is a pile of dereferences over API data; the render is the last place an
+    unexpected shape can reach the operator as a traceback instead of the honest line. The
+    heartbeat pipes stderr away (`orchestrator-heartbeat.sh`), so a raise here is silence."""
+    for unformattable in ({"ts": int(bp.time.time())},                       # no p0/p1
+                          {"ts": int(bp.time.time()), "p0": {"open": 1},  # half a tier
+                           "p1": {"open": 0, "with_pr": 0, "without": 0},
+                           "open_prs": 1, "merged_today": 1},
+                          {"ts": int(bp.time.time()), "p0": "not a dict"}):
+        monkeypatch.setattr(bp, "compute", lambda u=unformattable: dict(u))
+        assert bp.main() == 0, unformattable
+        assert "DELIVERY: unavailable (metrics read failed)" in capsys.readouterr().out, (
+            "an unformattable shape must still produce a line — exit 0 with silence is the "
+            "failure this guard exists for", unformattable)
 
 
 # ── (c) REST `closed` also carries unmerged PRs -> excluded ──────────────────
