@@ -233,6 +233,12 @@ SH
 # These arms grade the failure path, so the fixture must fail for a reason the harness cannot
 # re-route: with a second unreadable surface the re-route is correctly refused (only the holder-SOLE
 # case is substituted). #1935's own selftest arms cover the re-route.
+# ⛔ …AND EVERY FIXTURE BELOW THAT MUST REACH THE FAILURE PATH CARRIES THE SAME TWO-SURFACE SHAPE (see
+# `mk_tool_mixed`, `mk_tool_stderr_report`, `mk_tool_stderr_chatty`, `mk_tool_silent_then_surface`,
+# `mk_tool_degraded_then_hard`). Holding this shape in ONE fixture was not enough: the others stayed
+# holder-SOLE and every arm that grades `the failed refresh is NAMED` went red on a pass that had
+# become CLEAN — which is the re-route WORKING, caught only because those arms assert the failure
+# datum rather than the verdict. A new failure-path fixture needs the second surface too.
 # mk_tool_incomplete <dir> [block|table] — the pre-flight answer that broke the fleet: a bare
 # INCOMPLETE whose failing surface is the fleet board's lane registry. `block` (default) prints the
 # canonical INCOMPLETE SURFACES block; `table` prints ONLY the SURFACE table (the shapes the producer
@@ -301,7 +307,8 @@ if n == $fail_n:
     print("issue assignee/holder           INCOMPLETE  0     " + why)
     print("INCOMPLETE SURFACES")
     print("  [issue assignee/holder] " + why)
-    print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+    print("  [open PRs] gh: could not reach api.github.com")
+    print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
     sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\\n")
     sys.exit(2)
 # THE SECOND CANDIDATE ALSO RECORDS UNUSABLE, AND WITH A DIFFERENT DATUM ON PURPOSE (review of
@@ -335,7 +342,8 @@ out.write("FLEET BOARD: probing the live-session store\n")
 out.write("issue assignee/holder           INCOMPLETE  0     " + why + "\n")
 out.write("INCOMPLETE SURFACES\n")
 out.write("  [issue assignee/holder] " + why + "\n")
-out.write("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)\n")
+out.write("  [open PRs] gh: could not reach api.github.com\n")
+out.write("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)\n")
 sys.exit(2)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
@@ -355,7 +363,8 @@ out = sys.stderr
 out.write("issue assignee/holder           INCOMPLETE  0     " + why + "\n")
 out.write("INCOMPLETE SURFACES\n")
 out.write("  [issue assignee/holder] " + why + "\n")
-out.write("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)\n")
+out.write("  [open PRs] gh: could not reach api.github.com\n")
+out.write("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)\n")
 for i in range(60):
     out.write("noise line %d\n" % i)
 sys.exit(2)
@@ -378,7 +387,8 @@ why = ("claim gate: the FLEET BOARD could not answer — the board's lane regist
 print("issue assignee/holder           INCOMPLETE  0     " + why)
 print("INCOMPLETE SURFACES")
 print("  [issue assignee/holder] " + why)
-print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+print("  [open PRs] gh: could not reach api.github.com")
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
 sys.exit(2)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
@@ -423,7 +433,8 @@ if n == $deg_n:
 print("issue assignee/holder           INCOMPLETE  0     " + why)
 print("INCOMPLETE SURFACES")
 print("  [issue assignee/holder] " + why)
-print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+print("  [open PRs] gh: could not reach api.github.com")
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
 sys.stderr.write("FLEET BOARD: cannot answer — no live-session store on this box\n")
 sys.exit(2)
 PY
