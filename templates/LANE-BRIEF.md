@@ -39,8 +39,9 @@ switch, or remove worktrees, and never touch the repo's main checkout.
 - Commit with `git commit -F <message-file>` (repo-unique temp path per AGENTS.md "Editing Rules").
   Stage specific files; never `git add -A`.
 - Push (`git push -u origin <BRANCH>`), then open a PR against main: title
-  `<type>(<scope>): <subject> (#<ISSUE>)`; body must contain `Closes #<ISSUE>` (or `Refs #<ISSUE>`
-  if partial), what changed, and exact test evidence.
+  `<type>(<scope>): <subject> (#<ISSUE>)`; the body must carry `Closes #<ISSUE>` ON ITS OWN LINE (a
+  mid-sentence mention does not count — check [a]) — or `Refs #<ISSUE>` if partial — plus what
+  changed and exact test evidence.
 - Use the research skill for non-trivial research; never call `web_search` directly.
 - Never ask the human anything. File a pre-existing bug with an issue instead of fixing it silently.
 
@@ -61,10 +62,11 @@ it). Four of them are only producible while you work, so produce them as you go.
   (the producer, `skills/issue-scoping`, writes `<!-- issue-scoping: v5.1 double diamond + verify -->`;
   only the `<!-- issue-scoping:` prefix is examined). Then the scoping content: boundaries,
   alternatives considered, the wiring table. POSITION is the contract — no leading whitespace on that
-  first line, because a line indented by four columns renders as a CODE BLOCK (a mention) — or, the
-  ONLY alternative the check accepts, the same marker as the LAST line with content, set off by a
-  blank line as a footer block. A marker quoted in a table, fence or discussion counts nowhere:
-  those are mentions, not artifacts. READ THE THREAD FIRST: if the issue already carries a scoping comment,
+  first line, because a line indented by four columns renders as a CODE BLOCK (a mention). Two other
+  documented shapes are ALSO accepted: a leading ATX heading (`## Scope — …`) with the marker on the
+  first content line after it, and the marker as the LAST line with content, set off by a blank line
+  as a footer block. A marker quoted in a table, fence or discussion counts nowhere: those are
+  mentions, not artifacts. READ THE THREAD FIRST: if the issue already carries a scoping comment,
   extend it — do not post a second one, the check needs ONE comment carrying the marker. Otherwise
   post it with `gh issue comment <ISSUE> --repo <OWNER/REPO> --body-file <file>`.
 - **[c] the code-review record, bound to the PR's CURRENT head** — a line of exactly this shape, in
@@ -72,7 +74,9 @@ it). Four of them are only producible while you work, so produce them as you go.
   `review recorded: reviews/<PR>.json verdict=<clean|clean-micro|clean-low> @ <40-hex head sha> (<owner/repo>)`.
   Record the verdict the work EARNS: `clean-micro` is refused on a non-micro issue (#513) and `clean-low`
   only on a diff whose every changed path is in the Low content-shape class (#1356), so in doubt the
-  recorder is run with `clean`.
+  recorder is run with `clean`. And if the PR body already carries an older verdict line, DELETE it:
+  the recorder APPENDS, it never removes, so a stale `verdict=clean-micro` keeps the check failing
+  even after a fresh `clean` record at the current head.
   **Record AFTER your last push, then RE-RECORD if the head moves** — a record bound to an older head is STALE, so a moved head must be RE-RECORDED at the new head: an
   older-head record certifies a revision that is no longer the PR, and the check refuses it. The
   recorder appends that line; its `--evidence` artifact is the PR comment carrying the reviewer's

@@ -340,6 +340,13 @@ case "$LANDING_HARNESS" in *"do NOT amend, rebase or push again"*) rc=0;; *) rc=
 ck $rc "…its duty is the head: no amend/rebase/push once the record exists"
 for L in "$LANDING_SELF" "$LANDING_HARNESS"; do has_honesty "$L"; ck $? "each role carries the no-fabrication paragraph (neither can be the honest one by accident)"; done
 has_mech_1 "$LANDING_HARNESS" && has_mech_2 "$LANDING_HARNESS"; ck $? "both commit mechanics are in the harness section lane.sh splices"
+# ⛔ ALL FIVE, IN BOTH ROLES (cycle-2 review, P2). §F.1 reads the composed HARNESS brief; §F.3 pins the
+# template to the SELF render — so without this loop a self-branch regression (e.g. losing the recorder
+# invocation) plus a regenerated template block was invisible to the whole suite.
+for L in "$LANDING_SELF" "$LANDING_HARNESS"; do
+  has_req_a "$L" && has_req_b "$L" && has_req_c "$L" && has_req_d "$L" && has_req_e "$L"
+  ck $? "every role carries [a]-[e] (the self render is what templates/LANE-BRIEF.md pins)"
+done
 
 echo
 echo "§F.3 the controller brief template mirrors the section BYTE FOR BYTE (drift-pinned block)"
@@ -380,7 +387,7 @@ eval "$(gate_const REFCTX)" 2>/dev/null
 eval "$(gate_const CLOSING_KW)" 2>/dev/null
 eval "$(gate_const TRACE_KW)" 2>/dev/null
 GH_REPO='daniel-ospina/agent-infra'
-if declare -f has_scoping_marker >/dev/null && declare -f has_review_record >/dev/null && declare -f parse_issue_ref >/dev/null && declare -f parse_trace_ref >/dev/null && declare -f has_test_evidence >/dev/null && [ -n "${REVIEW_RECORD_MARKER_RE:-}" ]; then rc=0; else rc=1; fi
+if declare -f has_scoping_marker >/dev/null && declare -f has_review_record >/dev/null && declare -f parse_issue_ref >/dev/null && declare -f parse_trace_ref >/dev/null && declare -f has_test_evidence >/dev/null && [ -n "${REVIEW_RECORD_MARKER_RE:-}" ] && [ -n "${TEST_EVIDENCE_RE:-}" ]; then rc=0; else rc=1; fi
 ck $rc "the gate's own parsers + patterns were EXTRACTED (a rename would make this section vacuous)"
 
 # [a] — the shape the brief prescribes passes; the shape it warns about does not.
@@ -428,13 +435,26 @@ if [ -n "$WIRING_LINE" ]; then
   rc=0
 else rc=1; fi
 ck $rc "the gate's [d] wiring predicate was EXTRACTED (a reword goes red, never silently vacuous)"
-[ "$(gate_wiring_found "$SC_BRIEF")" = "yes" ]; ck $? "[d] the brief's shape (a \`## Wiring\` section) satisfies the gate's wiring branch"
+WIRING_SAMPLE='<!-- issue-scoping: v5.1 double diamond + verify -->
+## Scope
+body.
+
+## Wiring
+| surface | change |
+|---|---|
+| lane.sh | splice |'
+[ "$(gate_wiring_found "$WIRING_SAMPLE")" = "yes" ]; ck $? "[d] the brief's shape (a \`## Wiring\` section) satisfies the gate's wiring branch"
 [ "$(gate_wiring_found '## Scope
 no plan evidence here')" = "no" ]; ck $? "…and a scoping comment without one does not"
 
 # [e] — the evidence markers the brief tells a lane to report, through the GATE's matcher.
 has_test_evidence 'pytest: 412 passed, 0 failed'; ck $? "[e] 'pytest … N passed' is accepted as test evidence"
 has_test_evidence 'VGATE PASS'; ck $? "…and 'VGATE PASS'"
+# ⛔ AND THE DIRECTION THAT MATTERS AS MUCH (cycle-2 review, P2): a matcher that accepts EVERYTHING
+# (`TEST_EVIDENCE_RE='.*'`) passed every positive above. A negative vector is what makes the parity
+# two-directional.
+has_test_evidence 'no evidence was produced'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …while prose with NO evidence is REFUSED (an accept-everything matcher cannot pass this)"
 
 echo
 echo "§F.5 NON-VACUITY — composer-level: drop ONE requirement and the assertions fire"
