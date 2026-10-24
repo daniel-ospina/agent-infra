@@ -75,6 +75,8 @@
 # Exit codes (the `pr-doctor`/`disk-reaper` vocabulary, kept identical on purpose):
 #   0  a pass completed — it dispatched, or there was genuinely nothing to do
 #   2  REFUSING — a read a pass needs could not be taken (a miss is never "nothing to do")
+#   3  UNDELIVERED — the work was placed and no worker took it (pr-doctor's own 3, kept verbatim: a
+#      monitor keyed on this pass must not read green over work nobody accepted)
 #   6  DEFERRED — the machine said not now; the status row carries which measurement said so
 set -uo pipefail
 
@@ -99,6 +101,7 @@ STATUS="$STATE_DIR/pr-repair.status.json"
 
 EXIT_OK=0
 EXIT_REFUSING=2
+EXIT_UNDELIVERED=3   # placed, and no worker took it -- pr-doctor's own 3, kept verbatim
 EXIT_DEFERRED=6
 
 say() { printf '[%s] pr-repair: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -350,7 +353,7 @@ one_pass() { # <dry-run:0|1>
     # queue nobody could read. The exit code carries the same verdict the row does.
     case "$rc_dispatch" in
         0) write_status dispatched "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "pass-complete"; return "$EXIT_OK" ;;
-        3) write_status placed-undelivered "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "no-worker-took-it"; return "$EXIT_OK" ;;
+        3) write_status placed-undelivered "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "no-worker-took-it"; return "$EXIT_UNDELIVERED" ;;
         *) write_status refusing "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-refused"; return "$EXIT_REFUSING" ;;
     esac
 }

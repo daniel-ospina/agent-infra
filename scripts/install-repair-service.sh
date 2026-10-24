@@ -33,6 +33,11 @@
 #   TEMPLATES_DIR          default <repo>/templates/systemd
 #   UNIT_DIR               default /etc/systemd/system (system scope) or ~/.config/systemd/user
 #   SYSTEMCTL              default `sudo -n systemctl` (system scope) or `systemctl --user`
+#   PR_REPAIR_SCRIPTS      the FARMED scripts dir the unit will exec, default
+#                          $CELL_HOME/.pi/agent/scripts. ⛔ An override is accepted only outside a lane
+#                          scratch checkout: a unit exec'd from `.worktrees/…` or `/tmp/wt-*` dies when
+#                          that worktree is reaped (#2697), and no read-back can see it because the
+#                          comparison is against this same variable.
 #
 # Exit codes: 0 installed/healthy · 1 REFUSED or a read-back did not match · 2 usage/unreadable
 set -uo pipefail
@@ -142,6 +147,15 @@ render() { # <template> <dest>
     local tpl="$1" dest="$2"
     [ -f "$tpl" ] || die "REFUSING: template missing: $tpl (set TEMPLATES_DIR)"
     local exec_start="$SCRIPTS_DIR/pr-repair-loop.sh --loop"
+    # ⛔ THE #2697 SHAPE, REFUSED BY SHAPE RATHER THAN BY MEMORY (review of this PR): an ExecStart under
+    # a LANE SCRATCH checkout is erased the moment that lane's worktree is reaped or the box reboots, and
+    # the unit then cannot start at all — measured one repo over as `/tmp/wt-2433-fu`. `readback` cannot
+    # catch this: it compares the unit against `$SCRIPTS_DIR`, the same variable that rendered it, so it
+    # only ever confirms the installer's own arithmetic. The check has to be on the PATH ITSELF.
+    case "$SCRIPTS_DIR" in
+        */.worktrees/*|/tmp/wt-*|/tmp/cell-wt-*|/tmp/base-*)
+            die "REFUSING: $SCRIPTS_DIR is a LANE SCRATCH checkout — a unit exec'd from it dies when that lane's worktree is reaped (#2697). Use the farmed layer ($CELL_HOME/.pi/agent/scripts) or set PR_REPAIR_SCRIPTS deliberately." ;;
+    esac
     local path_list; path_list="$(render_path)"
     sed \
         -e "s|{{USER}}|$(id -un)|g" \
@@ -199,13 +213,36 @@ readback() {
 # pid that this unit did not put there is another actor, and starting a second loop beside it is the
 # #1761 shape one capability over. `pgrep -f` is bracketed so it never matches this shell's own argv.
 foreign_loop_census() {
-    local pid cg found=""
+    local pid cg argc a0 a1 a2 found=""
     while read -r pid; do
         [ -n "$pid" ] || continue
         cg="$(cat "/proc/$pid/cgroup" 2>/dev/null)" || continue
         case "$cg" in
             *"$UNIT_NAME"*) continue ;;
         esac
+        # ⛔ "MENTIONS THE SCRIPT" IS NOT "IS THE LOOP" (review of this PR). `pgrep -f` matches a wrapper
+        # shell, an editor, a `cat`, or this installer's own `bash -c` whose argv contains the path —
+        # measured twice during review as a FALSE BLOCK with a false diagnosis ("is already live"). The
+        # argv must BE a loop invocation: argv[0] (or argv[1] after a shell) is the script, and one of
+        # its arguments is a mode word. `--status`/`--dry-run`/`--print-capacity` attempt no work.
+        mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || continue
+        [ "${#argv[@]}" -gt 0 ] || continue
+        a0="$(basename -- "${argv[0]}")"
+        a1=""; a2=""
+        [ "${#argv[@]}" -gt 1 ] && a1="$(basename -- "${argv[1]}")"
+        [ "${#argv[@]}" -gt 2 ] && a2="${argv[2]}"
+        if [ "$a0" = "pr-repair-loop.sh" ]; then
+            set -- "${argv[@]:1}"
+        elif [ "$a1" = "pr-repair-loop.sh" ]; then
+            set -- "${argv[@]:2}"
+        else
+            continue
+        fi
+        case " $* " in
+            *" --status "*|*" --dry-run "*|*" --print-capacity "*) continue ;;
+        esac
+        # Any remaining invocation DOES work: the default mode is `--once`, so only the read-only
+        # modes above are excluded.
         found="$found $pid"
     done <<EOF
 $(pgrep -f '[p]r-repair-loop\.sh' 2>/dev/null || true)
@@ -271,8 +308,13 @@ cmd_install() {
     render "$tpl" "$tmp"
 
     if [ "$SCOPE" = "user" ]; then
-        loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q 'Linger=yes' \
-            || warn "user scope without linger: this unit dies with the last login. Enable with: loginctl enable-linger $(id -un)"
+        # ⛔ A REFUSAL, NOT A WARNING (review of this PR). Without linger the unit dies with the last
+        # login — the #2402 lifetime defect this whole capability removes — and the installer would
+        # otherwise print is-active/is-enabled green over a supervisor that cannot survive a session
+        # teardown. A warning that does not stop the install is a false PASS with a footnote.
+        if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+            die "REFUSING: user scope without linger — this unit dies with the last login, so it is not activation. Run: loginctl enable-linger $(id -un)   (or install a system unit)"
+        fi
     fi
 
     # Install atomically at the platform's OWN install path, then reload/arm. `install` (not `cp`)
