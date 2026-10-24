@@ -365,16 +365,22 @@ gate_const() { grep -E "^$1=" "$GATE" | head -1; }
 eval "$(extract_fn has_scoping_marker)" 2>/dev/null
 eval "$(extract_fn has_review_record)" 2>/dev/null
 eval "$(extract_fn parse_issue_ref)" 2>/dev/null
-# parse_trace_ref is a ONE-LINER in the gate (`parse_trace_ref() { parse_issue_ref …; }`), so the
-# brace-terminated extractor above cannot lift it; lift the line itself, verbatim (a reword goes red
-# in the `declare -f` guard below rather than silently degrading to a prose check).
+# parse_trace_ref and has_test_evidence are ONE-LINERS in the gate (`name() { …; }`), so the
+# brace-terminated extractor above cannot lift them; lift the LINES themselves, verbatim. A reword
+# goes red in the `declare -f` guard below — it must never degrade into a local re-implementation,
+# which is a copy of the gate that can agree with itself while the gate disagrees (caught in review:
+# the first version declared its own `has_test_evidence` fallback and stayed green against a gate
+# whose [e] matcher had been inverted).
 eval "$(grep -E '^parse_trace_ref\(\) \{' "$GATE" | head -1)" 2>/dev/null
+eval "$(grep -E '^has_test_evidence\(\) \{' "$GATE" | head -1)" 2>/dev/null
+# …and the pattern it reads, so the extracted matcher is the gate's mechanism, not an empty variable.
+eval "$(gate_const TEST_EVIDENCE_RE)" 2>/dev/null
 eval "$(gate_const REVIEW_RECORD_MARKER_RE)" 2>/dev/null
 eval "$(gate_const REFCTX)" 2>/dev/null
 eval "$(gate_const CLOSING_KW)" 2>/dev/null
 eval "$(gate_const TRACE_KW)" 2>/dev/null
 GH_REPO='daniel-ospina/agent-infra'
-if declare -f has_scoping_marker >/dev/null && declare -f has_review_record >/dev/null && declare -f parse_issue_ref >/dev/null && declare -f parse_trace_ref >/dev/null && [ -n "${REVIEW_RECORD_MARKER_RE:-}" ]; then rc=0; else rc=1; fi
+if declare -f has_scoping_marker >/dev/null && declare -f has_review_record >/dev/null && declare -f parse_issue_ref >/dev/null && declare -f parse_trace_ref >/dev/null && declare -f has_test_evidence >/dev/null && [ -n "${REVIEW_RECORD_MARKER_RE:-}" ]; then rc=0; else rc=1; fi
 ck $rc "the gate's own parsers + patterns were EXTRACTED (a rename would make this section vacuous)"
 
 # [a] — the shape the brief prescribes passes; the shape it warns about does not.
@@ -412,11 +418,21 @@ has_review_record "$MARK" 2325 daniel-ospina/agent-infra "$O40"; rc=$?
 has_review_record 'code-review done, reviewer approved' 2325 daniel-ospina/agent-infra "$H40"; rc=$?
 [ "$rc" -ne 0 ]; ck $? "⛔ …and no phrase satisfies [c] (only the recorder's line does)"
 
-# [e] — the evidence markers the brief tells a lane to report.
-eval "$(gate_const TEST_EVIDENCE_RE)" 2>/dev/null
-if declare -f has_test_evidence >/dev/null; then :; else
-  has_test_evidence() { grep -qiE "$TEST_EVIDENCE_RE" <<<"$1"; }
-fi
+# [d] — the gate's OWN wiring predicate, lifted from the line that computes it (:1368). Driven as
+# source, so "the brief says ## Wiring and the gate accepts it" is proved, not asserted. The brief is
+# STRICTER than the gate here (the gate accepts any occurrence of the word), which is the safe
+# direction and is stated in the brief itself.
+WIRING_LINE="$(grep -E "^ *if grep -qi 'wiring' <<<\"\\\$SCOPING_COMMENT\"; then wiring_found=\"yes\"; fi$" "$GATE" | head -1)"
+if [ -n "$WIRING_LINE" ]; then
+  eval "gate_wiring_found() { local SCOPING_COMMENT=\"\$1\" wiring_found=no; ${WIRING_LINE#"${WIRING_LINE%%[![:space:]]*}"}; printf '%s' \"\$wiring_found\"; }"
+  rc=0
+else rc=1; fi
+ck $rc "the gate's [d] wiring predicate was EXTRACTED (a reword goes red, never silently vacuous)"
+[ "$(gate_wiring_found "$SC_BRIEF")" = "yes" ]; ck $? "[d] the brief's shape (a \`## Wiring\` section) satisfies the gate's wiring branch"
+[ "$(gate_wiring_found '## Scope
+no plan evidence here')" = "no" ]; ck $? "…and a scoping comment without one does not"
+
+# [e] — the evidence markers the brief tells a lane to report, through the GATE's matcher.
 has_test_evidence 'pytest: 412 passed, 0 failed'; ck $? "[e] 'pytest … N passed' is accepted as test evidence"
 has_test_evidence 'VGATE PASS'; ck $? "…and 'VGATE PASS'"
 
@@ -444,12 +460,17 @@ has_req_a "$STRIPPED" && has_req_e "$STRIPPED"; ck $? "…and the untouched requ
 STRIP2="$TMP/strip2"; mkdir -p "$STRIP2"
 cp "$HERE/spawn-gate.sh" "$STRIP2/spawn-gate.sh"; cp "$LANE" "$STRIP2/lane.sh"
 sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
+[ -s "$STRIP2/reviewer-preflight.sh" ]; ck $? "the head-binding-stripped helper copy was produced"
 (
   cd "$TMP" || exit 1
   O="$TMP/o4" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     bash "$STRIP2/lane.sh" 2325 fix/strip2 acme/widget
 ) >/dev/null 2>&1
 STRIPPED2="$(cat "$TMP/o4/logs/prompt-2325.txt" 2>/dev/null || true)"
+# ⛔ THE FIXTURE MUST HAVE COMPOSED (review, P2): an absent/empty artifact is indistinguishable from a
+# successful strip, so this control asserts the ONE-THING-CHANGED shape: the other requirements are
+# still on the brief, and only the stripped sentence is gone.
+has_req_a "$STRIPPED2" && has_req_e "$STRIPPED2"; ck $? "the head-binding fixture still composed a brief with [a] and [e] (not an empty file)"
 case "$STRIPPED2" in *"a moved head must be RE-RECORDED at the new head"*) rc=0;; *) rc=1;; esac
 [ "$rc" -ne 0 ]; ck $? "⛔ removing the HEAD-BINDING sentence MAKES the §F.1 head-binding assertion FAIL"
 

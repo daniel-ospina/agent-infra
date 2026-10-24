@@ -187,9 +187,11 @@ BRIEF
 #
 # ⛔ ONE HOME, AND IT IS NOT THIS FILE'S OPINION. The letters [a]-[e] are
 # `scripts/check-pipeline-compliance.sh`'s OWN, and the shapes below are the shapes ITS parsers
-# accept — the suite (`reviewer-preflight.test.sh` §F) extracts those parsers and drives them over
-# this text's samples, so a shape that stops being accepted there goes red here. Do not restate the
-# gate's rules; name them and give the shape.
+# accept. The suite (`reviewer-preflight.test.sh` §F.4) EXTRACTS those parsers and drives them over
+# this text's samples for [a], [b], [c], [d] and [e], so a shape that stops being accepted there goes
+# red here. Do not restate the gate's rules; name them and give the shape. Where this text is
+# STRICTER than the gate it says so ([d]'s `Wiring` heading: the gate accepts any occurrence of the
+# word), because a stricter instruction can only make a PR more compliant, never less.
 #
 # ⛔ EVIDENCE, NOT PAPERWORK (this is the whole guard against the obvious shortcut). A brief that
 # asks for these artifacts and stays silent about honesty teaches lanes to fabricate: a lane that
@@ -242,20 +244,22 @@ it). Four of them are only producible while you work, so produce them as you go.
   ordered-list marker, \`>\`, a heading or a \`- [ ]\` checkbox — write \`Closes #<ISSUE>\` (or
   \`Refs #<ISSUE>\` when something genuinely stays open). A mid-sentence \`(fixes #N)\` does NOT
   count, and an unintended closing keyword can auto-close an issue on merge.
-- **[b] the scoping comment, whose FIRST CONTENT LINE is the marker at column 0:**
-
-      <!-- issue-scoping: <YYYY-MM-DD> (<tier>) -->
-
-  …then the scoping content (boundaries, alternatives considered, the wiring table). POSITION is the
-  contract: column 0 on the first line with content, or — the ONLY alternative the check accepts —
-  the last line with content, set off by a blank line as a footer block. An indented marker renders
-  as a code block, and a marker quoted in a table, fence or discussion counts nowhere: those are
-  mentions, not artifacts. READ THE THREAD FIRST: if the issue already carries a scoping comment,
+- **[b] the scoping comment, whose FIRST CONTENT LINE is the marker — \`<!-- issue-scoping: … -->\`
+  (the producer, \`skills/issue-scoping\`, writes \`<!-- issue-scoping: v5.1 double diamond + verify -->\`;
+  only the \`<!-- issue-scoping:\` prefix is examined). Then the scoping content: boundaries,
+  alternatives considered, the wiring table. POSITION is the contract — no leading whitespace on that
+  first line, because a line indented by four columns renders as a CODE BLOCK (a mention) — or, the
+  ONLY alternative the check accepts, the same marker as the LAST line with content, set off by a
+  blank line as a footer block. A marker quoted in a table, fence or discussion counts nowhere:
+  those are mentions, not artifacts. READ THE THREAD FIRST: if the issue already carries a scoping comment,
   extend it — do not post a second one, the check needs ONE comment carrying the marker. Otherwise
   post it with \`gh issue comment <ISSUE> --repo <OWNER/REPO> --body-file <file>\`.
 - **[c] the code-review record, bound to the PR's CURRENT head** — a line of exactly this shape, in
   the PR body or a commit message, naming THIS PR, THIS repo and THIS head:
   \`review recorded: reviews/<PR>.json verdict=<clean|clean-micro|clean-low> @ <40-hex head sha> (<owner/repo>)\`.
+  Record the verdict the work EARNS: \`clean-micro\` is refused on a non-micro issue (#513) and \`clean-low\`
+  only on a diff whose every changed path is in the Low content-shape class (#1356), so in doubt the
+  recorder is run with \`clean\`.
   ${record}
 - **[d] plan evidence** (\`complexity:standard\` / \`complexity:complex\` only): the PR changes a file
   under \`docs/plans/*.md\`, OR the scoping comment carries a \`## Wiring\` section (the wiring-check
