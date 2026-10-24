@@ -563,8 +563,9 @@ printf 'abc1234 3\n' > "$TMP/O/state/reviewathead-4242"
 drive 'FAILED:ai-review-gate' rail 0 1
 if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-AT-HEAD-STUCK 4/3' "$TMP/d.log" \
    && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
-   && grep -q 'record-review.sh 4242 abc1234 clean daniel-ospina/agent-infra' "$TMP/d.log"; then
-  ok "(b5) AT-HEAD at the bound PARKS (parked-<PR> written) with REVIEW-AT-HEAD-STUCK and the exact re-record command"
+   && grep -q 'record-review.sh 4242 abc1234 clean daniel-ospina/agent-infra' "$TMP/d.log" \
+   && grep -q 'LIFT THIS PARK' "$TMP/d.log"; then
+  ok "(b5) AT-HEAD at the bound PARKS with REVIEW-AT-HEAD-STUCK, the exact re-record command, AND the park-lift (a re-record alone is provably inert)"
 else
   bad "(b5) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the recorded-review/red-gate state never escalates, or its command was eaten by a backtick substitution"
 fi
@@ -580,6 +581,47 @@ if [ "$(spawns)" = "0" ] && [ ! -f "$REV_DISP" ] && grep -q 'HEAD is UNREADABLE'
 else
   bad "(f) spawns=$(spawns) key=[$(cat "$REV_DISP" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
 fi
+
+# (g) `MAX_REVIEW_TRIES=0` is REPORT-ONLY — no dispatch, and NOTHING parked (review round 3, P2:
+# parking every NEEDS-REVIEW head on its first cycle would remove PRs from the sweep with a reason
+# claiming a reviewer failure that never happened, and disagree with merge-one.sh's `0`).
+clear_store; clear_revdisp; clear_parked
+drive 'FAILED:ai-review-gate' rail 0 1 0 CLEAN 0
+if [ "$(spawns)" = "0" ] && [ ! -e "$TMP/O/state/parked-4242" ] && grep -q 'MAX_REVIEW_TRIES=0 on this box (REPORT-ONLY' "$TMP/d.log"; then
+  ok "(g) MAX_REVIEW_TRIES=0 is REPORT-ONLY: nothing dispatched, NOTHING parked, and the line says so"
+else
+  bad "(g) spawns=$(spawns) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+
+# (h) an UNWRITABLE review budget is named and STOPS the loop (review round 3, P2). A swallowed write
+# made the bound itself best-effort: the count read back as 0 for ever and the arm re-bought a paid
+# review EVERY cycle with no REVIEW-CAP ever reached.
+clear_store; clear_revdisp; clear_parked
+mkdir -p "$TMP/O/state/reviewdisp-4242"      # a DIRECTORY of that name: the write cannot land
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "1" ] && grep -q 'CANNOT BE WRITTEN' "$TMP/d.log" \
+   && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ]; then
+  ok "(h) an unwritable budget record is NAMED and the head parks — the cap cannot be outrun silently"
+else
+  bad "(h) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+mv "$TMP/O/state/reviewdisp-4242" "$TMP/revdisp.dir.$RANDOM" 2>/dev/null || true
+clear_parked
+
+# (i) an UNWRITABLE escalation counter must be NAMED, not silently coerced (review round 3, P2). A
+# swallowed write restarts the count at 1 every cycle, so AT-HEAD could never escalate — the endless
+# wait it exists to end, wearing a bounded-looking face.
+clear_store; clear_parked
+printf '%s\n' '{"pr":4242,"head_sha":"abc1234","verdict":"clean","repo":"daniel-ospina/agent-infra"}' > "$STORE"
+mkdir -p "$TMP/O/state/reviewathead-4242"
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-AT-HEAD-UNBOUNDED' "$TMP/d.log"; then
+  ok "(i) an unwritable escalation counter says REVIEW-AT-HEAD-UNBOUNDED (an inert bound is never silent)"
+else
+  bad "(i) log=$(tr '\n' ';' < "$TMP/d.log") — the escalation silently restarted instead of naming itself"
+fi
+mv "$TMP/O/state/reviewathead-4242" "$TMP/athead.dir.$RANDOM" 2>/dev/null || true
+clear_store; clear_parked
 
 # (d) the review-LANE cap still binds, and the refusal NAMES its holders and their age
 clear_store; clear_revdisp

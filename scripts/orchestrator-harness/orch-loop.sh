@@ -862,6 +862,9 @@ review_gate_state() {
 #   CAP <n> <max>  the head has spent MAX_REVIEW_TRIES re-records with no verdict: REPORTED as
 #                  REVIEW-CAP and PARKED, because an unfixable head must not loop (the same bound, on
 #                  the same counter, merge-one.sh applies — and the same reason it applies it).
+#   REPORT-ONLY 0  `MAX_REVIEW_TRIES=0`: this box never dispatches a review re-record. Nothing is
+#                  parked (a deliberate report-only box still owns its queue) and nothing is spent;
+#                  the line says so, mirroring `MAX_RED_FIX_TRIES=0`.
 # ⛔ THE STORE IS READ, NOT A SECOND DEFINITION OF "REVIEWED" (agent-infra#2517). `review_store_file`
 # is the path `record-review.sh` writes (`FILE="$DIR/${REPO%/*}-${REPO#*/}-$PR.json"`); a reader that
 # invents its own layout finds nothing and reports "never reviewed" for every PR. Two fields are read,
@@ -897,13 +900,27 @@ review_disp_decide() { # <pr> <head> -> "ALLOW <n>" | "AT-HEAD <n>" | "CAP <n> <
   done <<EOF
 $(review_store_candidates "$pr")
 EOF
+  # ⛔ `MAX_REVIEW_TRIES=0` IS REPORT-ONLY, THE SAME IDIOM AS `MAX_RED_FIX_TRIES=0` (review round 3 of
+  # #2653, P2). It is a valid value meaning "this box never dispatches a review re-record", and the
+  # caller must say so and touch NOTHING — parking every NEEDS-REVIEW head on its first cycle would
+  # remove PRs from the sweep with a reason claiming a reviewer failure that never happened, and it
+  # would disagree with merge-one.sh, which still runs one review at `0` (it increments before it
+  # compares). REPORT-ONLY is the reading that is both honest and non-destructive.
+  if [ "${MAX_REVIEW_TRIES:-3}" -eq 0 ]; then printf 'REPORT-ONLY 0\n'; return 0; fi
   if [ "$n" -ge "${MAX_REVIEW_TRIES:-3}" ]; then
     printf 'CAP %s %s\n' "$n" "${MAX_REVIEW_TRIES:-3}"; return 0
   fi
   printf 'ALLOW %s\n' "$n"
 }
+# ⛔ THE WRITE MUST BE ABLE TO FAIL LOUDLY (review round 3 of #2653, P2). `… 2>/dev/null || true` made
+# the bound itself best-effort: an unwritable `state/` (a stray directory of that name, a read-only
+# file, a full disk — the hazard this file names at its own `state/` note) left `review_disp_read` at
+# `0` for ever, so `review_disp_decide` returned ALLOW 0 every cycle and the arm bought a fresh PAID
+# review again and again, with no REVIEW-CAP ever reached and no line saying the record failed. The
+# SAME class the red-fixer counter already fixed ("the per-head cap CANNOT be kept — refusing"). The
+# return status is the caller's signal; it is never swallowed.
 review_disp_record() { # <pr> <head> <n> — written only AFTER a spawn succeeded (bookkeep on success)
-  printf '%s %s\n' "$2" "$3" > "$O/state/reviewdisp-$1" 2>/dev/null || true
+  printf '%s %s\n' "$2" "$3" > "$O/state/reviewdisp-$1"
 }
 # review_athead_next <pr> <head> -> the number of AT-HEAD refusals now standing for this head.
 # ⛔ AT-HEAD IS THE ONE STATE THAT NEITHER DISPATCHES NOR PARKS, SO IT MUST EVENTUALLY ESCALATE
@@ -922,7 +939,9 @@ review_athead_bump() { # <pr> <head> -> prints the new count
   rec="$(review_athead_read "$1")"; n="${rec##* }"; h="${rec% *}"
   [ "${h:-}" = "${2:-}" ] || n=0
   n=$(( n + 1 ))
-  printf '%s %s\n' "$2" "$n" > "$O/state/reviewathead-$1" 2>/dev/null || true
+  # Best-effort would make the escalation inert: a failed write never advances, so AT-HEAD would log
+  # a wait row every cycle for ever — the state this counter exists to bound (review round 3, P2).
+  printf '%s %s\n' "$2" "$n" > "$O/state/reviewathead-$1" || { printf '%s\n' "$n"; return 1; }
   printf '%s\n' "$n"
 }
 # review_lane_holders — the lanes the review ceiling is counting, WITH their log age.
@@ -3874,15 +3893,23 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               # Its remedy is a RE-RECORD, which only merge-one.sh's CLEAN path mints, and this branch
               # is what withholds the spawn that would run it. Bounded here, so the state reaches a
               # HUMAN as an action item instead of logging a wait row every cycle for ever.
-              _ahn="$(review_athead_bump "$PR" "${HEAD_N:-}")"
-              if [ "$_ahn" -ge "${MAX_REVIEW_TRIES:-3}" ]; then
-                echo "#$PR REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — a CLEAN review is recorded here but the gate never went green, and the controller has no actuator for that: PARKED for a human. The remedy is a RE-RECORD, not a review, and it is one command: record-review.sh $PR ${HEAD_N:-?} clean $OR --evidence comment:<the id of that review comment> — the gate re-triggers on 'edited'. ⛔ NO BACKTICKS AND NO APOSTROPHES IN THIS LINE: it is a double-quoted string, so a backticked command is SUBSTITUTED (the command the operator is told to run would be deleted from the log and its output spliced in) — measured on PR #2664 review round 2." >>"$LOG"
+              # ⛔ A FAILED BUMP IS NAMED, NOT SILENTLY COERCED (review round 3 of #2653, P2): with the
+              # counter unwritable the count would restart at 1 every cycle and this state could never
+              # escalate — the endless wait it exists to end, wearing a bounded-looking face.
+              if ! _ahn="$(review_athead_bump "$PR" "${HEAD_N:-}")"; then
+                echo "#$PR REVIEW-AT-HEAD-UNBOUNDED at head=${HEAD_N:-?} — a CLEAN review is recorded here and the gate never went green, and state/reviewathead-$PR CANNOT BE WRITTEN, so this state can no longer escalate to a human (it would log a wait row every cycle for ever). REFUSAL: nothing dispatched; REPAIR: make $O/state writable (rm -rf a stray directory named reviewathead-$PR) and the bound resumes next cycle" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-AT-HEAD-UNBOUNDED: the escalation counter is unwritable — a human must look at this head"
+              elif [ "$_ahn" -ge "${MAX_REVIEW_TRIES:-3}" ]; then
+                echo "#$PR REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — a CLEAN review is recorded here but the gate never went green, and the controller has no actuator for that: PARKED for a human. The remedy is a RE-RECORD, not a review, and it is one command: record-review.sh $PR ${HEAD_N:-?} clean $OR --evidence comment:<the id of that review comment> — the gate re-triggers on 'edited'. ⛔ AND THEN LIFT THIS PARK: the park is honoured BEFORE the acting case and the automatic lift only matches RED TREE / rail refusals, so a re-record on its own changes nothing — rm -f $O/state/parked-$PR $O/state/parkreason-$PR $O/state/reviewathead-$PR. ⛔ NO BACKTICKS AND NO APOSTROPHES IN THIS LINE: it is a double-quoted string, so a backticked command is SUBSTITUTED (the command the operator is told to run would be deleted from the log and its output spliced in) — measured on PR #2664 review round 2." >>"$LOG"
                 park_ctrl "$PR" "${HEAD_N:-}" "REVIEW-AT-HEAD-STUCK: a CLEAN review is already recorded at head=${HEAD_N:-?} and the ai-review-gate never went green over it after ${_ahn} cycle(s). No review is dispatched (a second review of an unchanged head is waste) and the controller has no re-record actuator — a human must re-record the existing evidence or re-run the gate. A push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewathead-$PR'"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "parked: REVIEW-AT-HEAD-STUCK ${_ahn}/${MAX_REVIEW_TRIES} — recorded review, red gate, needs a human"
               else
                 echo "#$PR REVIEW-AT-HEAD at head=${HEAD_N:-?} (refusal ${_ahn}/${MAX_REVIEW_TRIES}) — a CLEAN review is already recorded at this exact head, so NO review is dispatched (a second review of an unchanged head is waste; the gate re-triggers on 'edited', so a RE-RECORD — merge-one.sh's CLEAN path — is the remedy for a red gate over a valid record, never a new review)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-AT-HEAD: a CLEAN review is recorded at this head — no re-review dispatched (the record, not a reviewer, is the missing step)"
               fi
+            elif [ "${_rvd%% *}" = "REPORT-ONLY" ]; then
+              echo "#$PR $V — NO review re-record dispatched: MAX_REVIEW_TRIES=0 on this box (REPORT-ONLY, the same idiom as MAX_RED_FIX_TRIES=0). Nothing is parked and nothing is spent; this PR keeps its next cycle" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "report-only box (MAX_REVIEW_TRIES=0) — no review lane dispatched"
             elif [ "${_rvd%% *}" = "CAP" ]; then
               # ⛔ THE MIDDLE FIELD IS THE COUNT (review of #2653, P2): `CAP <n> <max>` — `${_rvd##* }`
               # is the LAST field, i.e. `max`, which only differs from `n` when an operator LOWERS
@@ -3909,9 +3936,18 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
                 # follows one arm above: bookkeeping before the spawn makes a killed/failed spawn cost
                 # a real attempt, and this counter is the only thing standing between a wedged reviewer
                 # and an unbounded run of paid reviews.
-                review_disp_record "$PR" "${HEAD_N:-}" "$(( ${_rvn:-0} + 1 ))"
-                echo "#$PR re-record" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker merge-$PR spawned (fresh review, attempt $(( ${_rvn:-0} + 1 ))/${MAX_REVIEW_TRIES:-3})"
+                # ⛔ A RECORD THAT DID NOT LAND MUST NOT LOOK LIKE A SPENT ATTEMPT (review round 3 of
+                # #2653, P2): the counter IS the bound, so an unwritable one would re-buy a paid review
+                # every cycle. Named, and the head is parked so the loop stops rather than spending again.
+                if ! review_disp_record "$PR" "${HEAD_N:-}" "$(( ${_rvn:-0} + 1 ))"; then
+                  echo "#$PR review lane merge-$PR spawned, but state/reviewdisp-$PR CANNOT BE WRITTEN — the per-head review cap cannot be kept, so NO further review is dispatched for this head (PARKED). REFUSAL: this cycle's review was spent. REPAIR: make $O/state writable (rm -rf a stray directory named reviewdisp-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >>"$LOG"
+                  park_ctrl "$PR" "${HEAD_N:-}" "the review budget record state/reviewdisp-$PR cannot be written, so MAX_REVIEW_TRIES cannot bound this head — refusing further dispatch (a review was spent this cycle). Make $O/state writable, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+                  # ONE row, and it is a WAIT: a second `disp` for the same PR would count one PR twice.
+                  disp "$PR" "${HEAD_N:-}" "$V" wait "review budget UNWRITABLE — parked so the cap cannot be outrun"
+                else
+                  echo "#$PR re-record" >>"$LOG"
+                  disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker merge-$PR spawned (fresh review, attempt $(( ${_rvn:-0} + 1 ))/${MAX_REVIEW_TRIES:-3})"
+                fi
               else
                 echo "#$PR re-record spawn FAILED (no review worker started this cycle)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "re-record spawn FAILED"
