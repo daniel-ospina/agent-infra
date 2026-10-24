@@ -25,7 +25,8 @@ fleet's ONE classifier -- what the PR needs, and DISPATCHES that work:
                      run carries the check, its state and its age (`python-ci-gate queued
                      150m`), and the brief says WEDGED; a head whose checks never got created
                      carries `why is None` and the brief says NEVER RAN.
-    resolve-conflict GitHub says DIRTY -> dispatch: rebase on main, then record + rail
+    resolve-conflict GitHub answers a POSITIVE conflict (`mergeStateStatus=DIRTY`, or
+                     `mergeable=CONFLICTING`) -> dispatch: rebase on main, then record + rail
     record-review    the six gated checks green, no clean attestation at this head
                      -> dispatch: review, record, rail -- in ONE run
     fix-ci           a required check is RED -> dispatch: FIX it, then re-review, then rail
@@ -996,10 +997,20 @@ def _open_prs_rest():
     discriminator -- see `_rest_is_cross_repository()`): it is derived from the element's
     `head.repo`/`base.repo` objects, not faked, and an unreadable identity defaults to fork.
 
+    `mergeable` IS MAPPED TOO (#1936), and its absence from the LIST payload is handled as the
+    VALUE `UNKNOWN` rather than as a missing key: an absent key would fail the parity guard that
+    compares this mapper's shape against the `--json` argument, and a `False`-as-CONFLICTING guess
+    would report a conflict that was never measured.
+
     ⚠️ ONE FIELD IS GENUINELY NOT SERVED BY THIS ENDPOINT, AND IT IS DOCUMENTED RATHER THAN
     FAKED: the LIST payload's `mergeable_state` is null (GitHub computes mergeability per PR,
     lazily -- measured: 18/18 and 19/19 open PRs), so `mergeStateStatus` is "" on a REST pass and
-    `resolve-conflict` (arm 3) can never match. Where such a PR lands is the ARM ORDER's answer,
+    `resolve-conflict` (the conflict arm) cannot match on the fields THIS payload returns today -- `mergeable`
+    is ABSENT on that payload too (0/3 rows carried either key, `objective._rest_pr()`'s
+    measurement), which maps to `UNKNOWN`, and `UNKNOWN` is not an answer. The mapper's
+    `CONFLICTING` branch is therefore reachable only from a payload that DOES carry the field
+    (`/pulls/<n>`, not the LIST), which is why it is mapped rather than omitted. Where such a PR
+    lands is the ARM ORDER's answer,
     not this file's: `record-review`/`fix-ci` (that lane calls the rail, which refuses a DIRTY
     head), or -- when a required check is merely in flight, the dominant live shape -- `running`,
     i.e. SKIPPED WITH NOTHING DISPATCHED until the primary read recovers (agent-infra #2136
@@ -1024,7 +1035,8 @@ def _open_prs_rest():
                 "isDraft": bool(p.get("draft")),
                 # ⛔ `.upper()` IS DEFENSIVE VOCABULARY NORMALISATION, AND THAT IS ALL IT IS. REST
                 # spells this `dirty`/`clean`; `gh --json` and `objective.classify_pr()` spell it
-                # `DIRTY`/`CLEAN` (two `== "DIRTY"` comparisons), so a passthrough is a silent
+                # `DIRTY`/`CLEAN` (the `== "DIRTY"` comparison in that module's conflict arm), so a
+                # passthrough is a silent
                 # logic error whenever the field is populated -- the fleet's own REST adapter
                 # (`orchestrator-harness/gh-rest/gh`) maps it the same way, for the same reason.
                 # ⚠️ BUT IT DOES NOT MAKE `resolve-conflict` REACHABLE TODAY: this endpoint returns
@@ -1033,6 +1045,19 @@ def _open_prs_rest():
                 # is recorded in this function's docstring above -- do not let this line read as
                 # "the conflict arm is fixed".
                 "mergeStateStatus": (p.get("mergeable_state") or "").upper(),
+                # ⛔ `mergeable` IS MAPPED FROM THE ELEMENT, NOT INVENTED (#1936). REST spells it a
+                # boolean; `gh --json` spells it MERGEABLE/CONFLICTING/UNKNOWN, and
+                # `objective.classify_pr()` compares against the STRING `"CONFLICTING"` -- so a
+                # passthrough here would be a silent logic error, exactly like the line above.
+                # The three words are `objective._rest_pr()`'s spelling on purpose: ONE
+                # definition of the vocabulary shared by both readers, not a second one.
+                # ⚠️ `null` on this endpoint is COMMON (the same lazy computation that leaves
+                # `mergeable_state` empty), so the live value is usually UNKNOWN -- which is NOT a
+                # pass and does not make the conflict arm reachable over REST. It keeps the
+                # mapper's SHAPE at parity with the primary read, which is what the parity guard
+                # asserts; the residual is the same one recorded on the line above.
+                "mergeable": ("MERGEABLE" if p.get("mergeable") is True else
+                              "CONFLICTING" if p.get("mergeable") is False else "UNKNOWN"),
                 "headRefOid": head.get("sha") or "",
                 "headRefName": head.get("ref") or "",
                 # ⛔ MAPPED, NOT OMITTED -- and it is not recoverable at the call sites, because
@@ -1171,7 +1196,11 @@ def open_prs() -> list[dict]:
     REST_RECOVERED = False         # per pass: a stale True would mislabel a healthy pass
     _GH_TOKEN_CACHE = None         # per pass: one credential resolution, not one per request
     out, err, rc = sh_err([GH, "pr", "list", "--repo", REPO, "--state", "open", "--limit", "60",
-                           "--json", "number,title,isDraft,mergeStateStatus,headRefOid,headRefName,isCrossRepository,files"])
+                           # BOTH fields are load-bearing: `mergeable` is this PR's (#1936 -- a
+                           # positive CONFLICTING answer is the trigger even when the state word is
+                           # not DIRTY), `isCrossRepository` is main's. Neither may be dropped.
+                           "--json", "number,title,isDraft,mergeStateStatus,mergeable,headRefOid,"
+                           "headRefName,isCrossRepository,files"])
     parsed = True
     why = ""
     try:
@@ -2424,7 +2453,10 @@ pending: {absent}
         return """# #{n} — CONFLICTED WITH MAIN. Rebase, then merge it.
 
 **#{n}** {title}
-Head `{head}`. GitHub reports this PR **DIRTY** (a real conflict, not a failing gate).
+Head `{head}`. GitHub reports a POSITIVE conflict — `mergeable: CONFLICTING`, or
+`mergeStateStatus: DIRTY` — a real conflict: the rail refuses a conflicted head whatever the
+checks say, so neither waiting nor repairing a gate can land it. (A rail gate that is ALSO red is
+re-run by the rebase, and this brief is re-derived from the post-rebase head.)
 **A rebase CHANGES THE HEAD, so any attestation recorded before it is worth nothing -- record
 again at the new head.**
 

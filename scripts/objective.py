@@ -776,6 +776,19 @@ SURFACE_PATHS = _surface_from_env()
 # is never a check this predicate waits on.
 # `rerun-checks` and `resolve-conflict` sit ABOVE `record-review` because a missing check
 # tells you NOTHING and a rebase CHANGES THE HEAD, staling any attestation.
+# ⛔ AND `resolve-conflict` SITS ABOVE EVERY **EVIDENCE** ARM IN `classify_pr` -- `call-rail`
+# included -- which is why that one arm order is a refinement of this tuple rather than a
+# transcription of it. A `DIRTY` head is not landable at ANY evidence quality, and a rebase
+# stales the attestation, so the class must name the REBASE (see the arm-1 note). This tuple
+# orders the REPORTING/dispatch priority; it is not a licence for `call-rail` to claim a PR the
+# rail refuses.
+# ⛔ THE REFINEMENT STOPS THERE, AND IT HAS TO: the ONE arm that still outranks `resolve-conflict`
+# is the WEDGED re-trigger (arm 0), which is exactly what this tuple records (`rerun-checks`
+# before `resolve-conflict`). Those two requirements together -- the tuple's ladder for the
+# wedged arm, and #1936's refinement for `call-rail` -- are only jointly satisfiable because the
+# wedged arm and `call-rail` are disjoint, so no ordering among the three can change an answer.
+# See the arm-0 note; a future edit that makes them overlap must revisit this tuple, not quietly
+# pick a side.
 CLASS_ORDER = ("call-rail", "blocked-by-rail", "rerun-checks", "resolve-conflict",
                "record-review", "running", "fix-ci")
 # ⛔ `running` IS A CLASS, NOT A GAP (#1872). A required check that is still IN FLIGHT is not
@@ -967,12 +980,13 @@ def rollup_checks(cr):
 # `fix-ci`, i.e. the beat told the fleet to go REPAIR CODE for a job that never ran (measured on
 # this branch's base at main=57edbd7a0: `{'fix-ci': 1}`). With #1872 landed (#1930) the same shape
 # is worse in the way that matters: `rollup_checks` puts ANY non-`completed` status in `flight`,
-# so arm 5 answers `running` -- "the head is still executing" -- and both readers SKIP the PR and
-# wait for a completion that will never arrive. #1930 said so as it landed: "#1926 (`running` has
-# no age bound, so a wedged check-run parks a PR forever)". The re-trigger arms cannot reach it
-# either: a wedged run IS a required context that REPORTED (so `req_seen` is non-empty, and the
-# `gated_absent` arm 7 sees it as present) while never reaching `completed` -- so every
-# absence-based arm is structurally blind to it, and only an AGE can tell it from a healthy run.
+# so the `running` arm (arm 4) answers -- "the head is still executing" -- and both readers SKIP
+# the PR and wait for a completion that will never arrive. #1930 said so as it landed: "#1926
+# (`running` has no age bound, so a wedged check-run parks a PR forever)". The re-trigger arms
+# cannot reach it either: a wedged run IS a required context that REPORTED (so `req_seen` is
+# non-empty, and the partial-absence `rerun-checks` arm (arm 6) sees it as present) while never
+# reaching `completed` -- so every absence-based arm is structurally blind to it, and only an AGE
+# can tell it from a healthy run.
 #
 # THE BOUND, and what it is derived from. Two clocks have to be covered, because the age of a
 # non-completed check is measured from whichever applies (see `flight_age_min`): a STARTED run's
@@ -1003,15 +1017,16 @@ def rollup_checks(cr):
 # ⛔ SCOPE, STATED -- AND THE TWO SHAPES ARE NOT THE SAME SHAPE (#1948 review cycle 4, P3).
 # The aged set is the REQUIRED contexts (`GATED_CHECKS`). A wedged RAIL gate
 # (`drift-guard`/`flip-gate`/`provenance`) is not in it, and it is never a `blocked-by-rail`
-# REPAIR: `rail_block_reason` ACCEPTS an in-flight gate, but arm 1 returns `blocked-by-rail` only
-# when that gate is in `red` (`if _rail in red`), so a wedged rail gate is non-`completed`, never
-# `red`. That is DELIBERATE, one block above (#1872 review round 7: "an in-flight rail gate reads
-# `running` and a RED one still reads `blocked-by-rail`") -- an in-flight gate is not work to
-# repair. WHAT THEN HAPPENS DEPENDS ON WHETHER A REQUIRED GATE IS PRESENT:
-#   * EVERY gated context present: `rail_block_reason` names the wedged gate, arm 1 falls through
-#     to `running`, and the head WAITS -- unbounded, which is the one wait this change does not
-#     bound. Ageing it there would change the ladder for a non-required surface, and that is a
-#     separate call, deliberately not made here.
+# REPAIR: `rail_block_reason` ACCEPTS an in-flight gate, but `call-rail` (arm 2) returns
+# `blocked-by-rail` only when that gate is in `red` (`if _rail in red`), so a wedged rail gate is
+# non-`completed`, never `red`. That is DELIBERATE, one block above (#1872 review round 7: "an
+# in-flight rail gate reads `running` and a RED one still reads `blocked-by-rail`") -- an in-flight
+# gate is not work to repair. WHAT THEN HAPPENS DEPENDS ON WHETHER A REQUIRED GATE IS PRESENT:
+#   * EVERY gated context present: `rail_block_reason` names the wedged gate, `call-rail` falls
+#     through to `running`, and the head WAITS -- unbounded, which is the one wait this change does
+#     not bound. Ageing it there would change the ladder for a non-required surface, and that is a
+#     separate call, deliberately not made here. (A CONFLICTED head no longer reaches that wait at
+#     all: arm 1 answers it with the REBASE, which is the #1936 change.)
 #   * a REQUIRED gate ABSENT: `wedge_evidence`'s all-contexts read (below) ages EVERY context, so
 #     the rail gate can be the ONLY name in the reason -- `«drift-guard» queued <age>m` -- and the
 #     head reads `rerun-checks` even when it is DIRTY. Measured through `classify_one` with the
@@ -1028,8 +1043,9 @@ def rollup_checks(cr):
 # children finish, so when a required gate is absent AND every check in flight is past the bound,
 # nothing can create it and the `gated_absent and flight` term of `running` would wait for ever.
 # A rail gate appears in THAT read only as one of the stuck jobs to START -- it is named as work to
-# do, never as a `blocked-by-rail` repair -- and arm 1 still answers first on a fully-green gated
-# set, where nothing is named as an order at all.
+# do, never as a `blocked-by-rail` repair -- and `call-rail` (arm 2) still decides a fully-green
+# gated set, where nothing is named as an order at all, except for a CONFLICTED head, which arm 1
+# takes as the REBASE.
 FLIGHT_BOUND_MIN = 90.0
 
 # The contexts a landing actually waits on. `ai-review-gate` is EXCLUDED for the same reason
@@ -1395,7 +1411,14 @@ def touches_surface(p):
 
 
 def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
-    """The ONE action class for a non-draft PR, FIRST MATCH in CLASS_ORDER, or None if unread.
+    """The ONE action class for a non-draft PR, FIRST MATCH in a stated order, or None if unread.
+
+    The order below is CLASS_ORDER with ONE refinement: `resolve-conflict` is checked ahead of
+    `call-rail`, because a head GitHub reports as conflicted cannot be landed at ANY evidence
+    quality -- see arm 1. That refinement does NOT disturb the recorded precedence of
+    `rerun-checks` over `resolve-conflict`: the re-trigger arm that can outrank a conflict is the
+    WEDGED one (arm 0), and hoisting it is behaviour-preserving because it and `call-rail` are
+    provably disjoint (see arm 0).
 
     Pure on purpose: `cr` is a check-run list ALREADY READ, `att_clean` the attestation
     verdict, `stalled` the aged-out GATED flight list and `flight_stalled` the same list over
@@ -1410,7 +1433,7 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     red, flight = rollup_checks(cr)
     seen = {c.get("name") for c in cr if c.get("name")}
     req_seen = [n for n in REQUIRED if n in seen]
-    # `ai-review-gate` is DIFF-BOUND (arm 1), so it is not a gate this predicate WAITS on: its
+    # `ai-review-gate` is DIFF-BOUND (arm 2), so it is not a gate this predicate WAITS on: its
     # truth is the head-bound attestation file, never its check-run. Everything below is about
     # the other six.
     # ⛔ THE GATED SET HAS ONE OWNER (#1926 review): `GATED_CHECKS`, above. An inline copy here
@@ -1431,65 +1454,32 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     # attestation). The gate's real condition is SEMANTIC -- "a clean review is recorded at this
     # head" -- and the head-bound attestation FILE states that authoritatively, so the check-run
     # is only a stale PROXY for `ai-review-gate` and never for the other six.
-    # 1. call-rail -- every required check EXCEPT `ai-review-gate` is green AND a clean
-    #    attestation exists at the CURRENT head AND the RAIL ITSELF would take it. The last
-    #    clause was missing: an attested PR the rail refuses is a NAMED defect, not "not ready".
-    #    ⛔ THIS ARM STAYS FIRST, so a LANDABLE PR is never delayed by a running check elsewhere
-    #    (see arm 5): the cheapest landing on the board must not queue behind a non-gating job.
-    #    ⛔ A RAIL GATE *IN FLIGHT* IS NOT A DEFECT TO REPAIR (#1872 review round 7).
-    #    `rail_block_reason` deliberately accepts a gate that is in flight as well as one that is
-    #    red -- but the two are opposite instructions. `blocked-by-rail` becomes the brief "THE RAIL
-    #    REFUSES IT ON <gate>. REPAIR THAT, THEN MERGE." MEASURED: all six required contexts green,
-    #    attestation clean, `drift-guard` merely `in_progress` -> `blocked-by-rail(drift-guard)`, so
-    #    a lane was dispatched to repair a gate that had not concluded. That is the same harm arm 5
-    #    exists to remove ("a check in flight is not work", 3h burned on #7924), so an
-    #    in-flight rail gate reads `running` and a RED one still reads `blocked-by-rail`.
-    #    ⛔ AND A DIRTY HEAD IS STILL THE ONE THING A LANE CAN FIX (#1872 review round 12). This
-    #    arm already returns LAST-BUT-ONE in `CLASS_ORDER`, so returning `running` from here put it
-    #    ABOVE `resolve-conflict` -- the single exception to the arm order, and the one arm the suite
-    #    did not pin. MEASURED: six required contexts green + attestation + DIRTY + `drift-guard`
-    #    `in_progress` -> `running`, i.e. "wait", while the only available fix is a REBASE that no
-    #    check will ever do. Both consumers skip `running` and its only escalation is `STUCK`, which
-    #    is emitted for `call-rail` alone, so such a PR could wait forever.
-    if not nongreen and att_clean:
-        _rail = rail_block_reason(red, flight, seen)
-        if _rail:
-            if _rail in red:
-                return "blocked-by-rail"
-            if (pr.get("mergeStateStatus") or "") == "DIRTY":
-                return "resolve-conflict"
-            return "running"
-        return "call-rail"
-    # 2. rerun-checks -- NO required check has REPORTED at this head, and nothing is executing.
-    #    ⛔ `and not flight` IS LOAD-BEARING (#1872 review). Without it this arm SHADOWED arm 5
-    #    for the exact shape arm 5 was written for: a fresh head where no required context has
-    #    reported yet while other checks are already running -- which is the NORMAL first state
-    #    of a push, because `python-ci-gate` (and `docs`, `legal-e2e`) are created seconds after
-    #    the children. `req_seen` empty means "not reported yet" as often as "never ran", and
-    #    the two need OPPOSITE actions: wait, versus START the workflow. Worse, the dispatcher's
-    #    `rerun-checks` brief asserts "(Nothing is in flight ...)" and tells the lane to push an
-    #    empty commit -- so the shadowed arm sent it to churn a 20-second-old head, wasting
-    #    runner capacity and staling the attestation. `drive`/`drift-guard`/`sigpipe-guard`
-    #    being red cannot reach here: they are not in REQUIRED.
-    if not req_seen and not flight:
-        return "rerun-checks"
-    # 3. rerun-checks (WEDGED) -- a required check is still non-completed PAST the flight bound.
+    # 0. rerun-checks (WEDGED) -- a required check is still non-completed PAST the flight bound.
     #    This is NOT a wait: nothing will ever complete it (GitHub does not reconcile a run that
     #    was never picked up), so the work is to START it, which is what `rerun-checks` means to a
     #    lane, and the reason names the check, its state and its age.
-    #    ⛔ IT SITS ABOVE `running` (arm 5) BECAUSE A WEDGED RUN *IS* IN FLIGHT. That is the whole
-    #    trap: `rollup_checks` puts any non-`completed` status in `flight`, so arm 5 matches this
+    #    ⛔ IT SITS ABOVE `running` (arm 4) BECAUSE A WEDGED RUN *IS* IN FLIGHT. That is the whole
+    #    trap: `rollup_checks` puts any non-`completed` status in `flight`, so arm 4 matches this
     #    shape and answers "the head is still executing" -- forever, because nothing will ever
     #    complete it. Sibling #1872 said so when it landed: "#1926 (`running` has no age bound, so
     #    a wedged check-run parks a PR forever)". The age bound is the missing dimension, and
     #    without this arm the class is a WAIT that never ends (pre-merge on this branch's base it
     #    was `fix-ci`, i.e. a lane sent to REPAIR CODE FOR A JOB THAT NEVER RAN -- measured
     #    `{'fix-ci': 1}`; on the merged tree it is `running`).
-    #    ⛔ AND IT SITS ABOVE `resolve-conflict` (arm 4), where `CLASS_ORDER` records it. That is the
+    #    ⛔ AND IT SITS ABOVE `resolve-conflict` (arm 1), where `CLASS_ORDER` records it. That is the
     #    recorded ladder, not a preference: a rebase CHANGES THE HEAD, so a re-trigger before it is
     #    at worst one redundant API call, while the reverse order lets a DIRTY PR with a wedged
     #    suite sit in `resolve-conflict` while the wedge is never named. Pinned by test.
-    #    ⛔ AND IT BOUNDS THE OTHER HALF OF `running` TOO (#1926 review, P1). Arm 5's
+    #    ⛔ HOISTING IT HERE IS BEHAVIOUR-PRESERVING, and that is why the ladder above and #1936's
+    #    refinement can both hold: this arm and `call-rail` (arm 2) are PROVABLY DISJOINT.
+    #    `wedge_evidence` is non-empty only when a GATED check is stalled, or when a required gate
+    #    is ABSENT while every attempt in flight is stalled -- both need a non-green gated check
+    #    (`gated_red`/`gated_flight`/`gated_absent`), and `call-rail` requires `not nongreen`. So
+    #    neither order can change an answer, and `call-rail`'s promise -- a LANDABLE PR is never
+    #    delayed by a check elsewhere -- survives intact. What it does buy is the only ordering
+    #    that satisfies BOTH recorded decisions at once: `rerun-checks` above `resolve-conflict`
+    #    (#1926's pinned ladder) and `resolve-conflict` above `call-rail` (#1936).
+    #    ⛔ AND IT BOUNDS THE OTHER HALF OF `running` TOO (#1926 review, P1). Arm 4's
     #    `gated_absent and flight` term had NO age term, so a required gate that is absent while a
     #    NON-required child job is wedged satisfied it forever: `gated_flight == []`,
     #    `gated_absent == [6 names]`, `flight == {"test (a)"}` -> `running`, indefinitely, while
@@ -1503,20 +1493,85 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     if not gated_red and wedge_evidence(stalled, gated_absent,
                                         inflight_attempts(cr), flight_stalled):
         return "rerun-checks"
-    # 4. resolve-conflict -- GitHub says DIRTY. A rebase CHANGES THE HEAD, so it is right even
-    #    while checks are still running (they all re-run anyway) -- which is why it sits ABOVE
-    #    the `running` arm below.
-    #    ⛔ AND IT CANNOT FIRE FOR AN ATTESTED PR: arm 1 returns first, so a green+attested head
-    #    that has since gone DIRTY reads `call-rail`, whose brief says the rail would take it --
-    #    while the rail refuses a conflicted PR. Pre-existing, and DELIBERATELY left alone here
-    #    (the edge is pinned by `test_knows_the_one_edge_the_strict_order_creates` as "PINNED, NOT
-    #    ENDORSED", so fixing it changes the arm spec). Tracked in agent-infra #1936 (QUALIFIED, not
-    #    a bare `#1936`: these files live in agent-infra but a bare number reads as the repo under
-    #    test, tortoise, where #1936 is an unrelated packs feature); two reviewers rated it
-    #    P1, so it should land before this ordering is trusted.
-    if (pr.get("mergeStateStatus") or "") == "DIRTY":
+    # 1. resolve-conflict -- a POSITIVE conflict answer (`mergeStateStatus=DIRTY` or
+    #    `mergeable=CONFLICTING`), so THE RAIL WILL REFUSE THIS HEAD whatever the checks say, and
+    #    the work is a REBASE.
+    # ⛔ THIS ARM MUST PRECEDE `call-rail`. It did not, and the resulting class was a lie the
+    #    dispatcher then repeated to a lane: a fully green, CURRENTLY ATTESTED PR whose base had
+    #    moved (head untouched, so nothing stale) read `call-rail`, and the brief for that class
+    #    tells a lane "MERGE #N -- nothing else is needed ... Everything is done except the last
+    #    step" -- while `scripts/admin-merge.sh` refuses exactly that PR (`CONFLICTED`).
+    #    MEASURED 2026-10-16 against this predicate: `DIRTY + 7 green + attested -> call-rail`
+    #    with `rail_block_reason -> None`, because `rail_block_reason` reads CHECKS ONLY and
+    #    cannot see mergeability. It is a NORMAL live shape, not a corner: an attested green PR
+    #    goes DIRTY when its base advances without touching its head -- so no lane was ever told
+    #    to rebase, and the PR sat until something else noticed.
+    #    A rebase CHANGES THE HEAD and stales the attestation, which is the same reason
+    #    `resolve-conflict` already sat above `record-review`.
+    #    ⛔ IT IS THEREFORE ALSO RIGHT WHILE CHECKS ARE STILL RUNNING (they all re-run anyway),
+    #    which is why it sits above the `running` arm (arm 4).
+    #    Only a POSITIVE conflict answer counts -- a literal `DIRTY` state, or
+    #    `mergeable=CONFLICTING`. `mergeStateStatus` is computed LAZILY and reads UNKNOWN
+    #    fleet-wide while it recomputes, and treating an UNREAD state as a conflict would send
+    #    every PR to a needless rebase -- absence is not evidence (see `rail_block_reason`).
+    #    ⛔ `mergeable=CONFLICTING` IS AN ANSWER, NOT AN ABSENCE, AND THIS PREDICATE NOW HAS IT.
+    #    The queue read requests both fields (`queue()`'s `--json` list) and the classifier read
+    #    only the state word, so the ONE disagreement window GitHub actually produces --
+    #    `mergeable` settled at CONFLICTING while `mergeStateStatus` is still recomputing as
+    #    UNKNOWN -- read `call-rail` on a head GitHub says it cannot merge. `mergeable=UNKNOWN`
+    #    (the field's own unread value) stays not-evidence, on the same rule.
+    #    ⛔ THIS ARM IS NOW THE ONLY PLACE A CONFLICT IS DECIDED. `call-rail` used to carry a
+    #    second `DIRTY` check inside its `_rail` branch (#1872 round 12); with this arm above it
+    #    that check could never fire, and a duplicate that cannot fire is a second definition
+    #    waiting to diverge.
+    if (pr.get("mergeStateStatus") or "") == "DIRTY" \
+            or (pr.get("mergeable") or "") == "CONFLICTING":
         return "resolve-conflict"
-    # 5. running -- THE HEAD IS STILL EXECUTING, and nothing can be decided about it yet.
+    # 2. call-rail -- every required check EXCEPT `ai-review-gate` is green AND a clean
+    #    attestation exists at the CURRENT head AND the RAIL ITSELF would take it. The last
+    #    clause was missing: an attested PR the rail refuses is a NAMED defect, not "not ready".
+    #    ⛔ NO ARM ABOVE THIS ONE CAN DELAY A LANDABLE PR, which is the property this arm used to
+    #    state as "STAYS FIRST": arm 0 is disjoint from it (see there), and arm 1 fires only on a
+    #    head the rail REFUSES -- i.e. not landable. So the cheapest landing on the board still
+    #    never queues behind a check elsewhere (see arm 4).
+    #    ⛔ A RAIL GATE *IN FLIGHT* IS NOT A DEFECT TO REPAIR (#1872 review round 7).
+    #    `rail_block_reason` deliberately accepts a gate that is in flight as well as one that is
+    #    red -- but the two are opposite instructions. `blocked-by-rail` becomes the brief "THE RAIL
+    #    REFUSES IT ON <gate>. REPAIR THAT, THEN MERGE." MEASURED: all six required contexts green,
+    #    attestation clean, `drift-guard` merely `in_progress` -> `blocked-by-rail(drift-guard)`, so
+    #    a lane was dispatched to repair a gate that had not concluded. That is the same harm arm 4
+    #    exists to remove ("a check in flight is not work", 3h burned on #7924), so an
+    #    in-flight rail gate reads `running` and a RED one still reads `blocked-by-rail`.
+    #    ⛔ AND A DIRTY HEAD IS STILL THE ONE THING A LANE CAN FIX (#1872 review round 12). This
+    #    arm returning `running` from here once put it ABOVE `resolve-conflict` -- the single
+    #    exception to the arm order, and the one arm the suite did not pin. MEASURED: six required
+    #    contexts green + attestation + DIRTY + `drift-guard` `in_progress` -> `running`, i.e.
+    #    "wait", while the only available fix is a REBASE that no check will ever do. Both
+    #    consumers skip `running` and its only escalation is `STUCK`, which is emitted for
+    #    `call-rail` alone, so such a PR could wait forever. ARM 1 now answers every conflicted
+    #    head before this arm is reached, so there is no DIRTY check left in here: a second one
+    #    could never fire.
+    if not nongreen and att_clean:
+        _rail = rail_block_reason(red, flight, seen)
+        if _rail:
+            if _rail in red:
+                return "blocked-by-rail"
+            return "running"
+        return "call-rail"
+    # 3. rerun-checks -- NO required check has REPORTED at this head, and nothing is executing.
+    #    ⛔ `and not flight` IS LOAD-BEARING (#1872 review). Without it this arm SHADOWED arm 4
+    #    for the exact shape arm 4 was written for: a fresh head where no required context has
+    #    reported yet while other checks are already running -- which is the NORMAL first state
+    #    of a push, because `python-ci-gate` (and `docs`, `legal-e2e`) are created seconds after
+    #    the children. `req_seen` empty means "not reported yet" as often as "never ran", and
+    #    the two need OPPOSITE actions: wait, versus START the workflow. Worse, the dispatcher's
+    #    `rerun-checks` brief asserts "(Nothing is in flight ...)" and tells the lane to push an
+    #    empty commit -- so the shadowed arm sent it to churn a 20-second-old head, wasting
+    #    runner capacity and staling the attestation. `drive`/`drift-guard`/`sigpipe-guard`
+    #    being red cannot reach here: they are not in REQUIRED.
+    if not req_seen and not flight:
+        return "rerun-checks"
+    # 4. running -- THE HEAD IS STILL EXECUTING, and nothing can be decided about it yet.
     #    ⛔ THE SIGNAL IS NOT ONLY "a REQUIRED check is in flight". MEASURED 2026-10-16:
     #    `python-ci-gate` is ABSENT while its child jobs run (`test (a)`, `test-slow (a)`, ...) --
     #    the gate job is created only AFTER the matrix finishes. So the absence of a required
@@ -1526,7 +1581,7 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     #    `unreviewed` (go review it) -- so on #8825 the two readers disagreed about whether to
     #    work at all. The series is enumerated once, in the file header (4 of 11: #8825 plus
     #    #8806/#8822/#8824); these three are the ones this arm answers, and #8822 is the
-    #    nothing-in-flight shape arm 7 answers instead.
+    #    nothing-in-flight shape arm 6 answers instead.
     #    ⛔ BUT A RED REQUIRED CHECK IS STILL WORK, even beside a running unrelated job: waiting
     #    on a lint/typecheck job to finish before repairing a genuinely failing gate would only
     #    delay the fix (#8708). So the arm covers flight-or-not-yet-reported, NEVER red -- the
@@ -1536,16 +1591,16 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     #    was reported `running` for the rest of the suite and no lane ever repaired it.
     if (gated_flight or (gated_absent and flight)) and not gated_red:
         return "running"
-    # 6. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
+    # 5. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
     #    current clean attestation at this head. This is the LEGITIMATE case, and it is the exact
-    #    complement of arm 1: the ONLY difference between landing a PR and re-recording it is
+    #    complement of arm 2: the ONLY difference between landing a PR and re-recording it is
     #    whether the attestation at THIS head exists, which is why the file -- not the check-run
     #    -- decides. (An all-green `ai-review-gate` with a SUPERSEDED record lands here too: a
     #    green gate at an old head is evidence about that head, not this one.)
     if not nongreen and not att_clean:
         return "record-review"
-    # 7. rerun-checks -- SOME required check never ran at this head while others COMPLETED, and
-    #    the head is not executing (arm 5). Absence is not green, and it is not a failure to FIX:
+    # 6. rerun-checks -- SOME required check never ran at this head while others COMPLETED, and
+    #    the head is not executing (arm 4). Absence is not green, and it is not a failure to FIX:
     #    the job that was never created has to be STARTED. MEASURED #8822: `python-ci-gate`
     #    absent (its job never got created), `drift-guard` red, `ai-review-gate` red and NOTHING
     #    in flight -- the arms above made that `fix-ci` (send a lane to repair code), and the
@@ -1554,9 +1609,8 @@ def classify_pr(pr, cr, att_clean, stalled=(), flight_stalled=()):
     #    re-trigger the check first.
     if gated_absent and not gated_red:
         return "rerun-checks"
-    # 8. fix-ci -- a required check is RED: real code work.
+    # 7. fix-ci -- a required check is RED: real code work.
     return "fix-ci"
-
 
 def fix_ci_reasons(cr):
     """The REQUIRED check names that are RED, sorted -- the IN-PROGRESS work list.
