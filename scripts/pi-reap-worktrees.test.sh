@@ -427,7 +427,7 @@ run_reaper() {
     REAP_WT_MAX_DAYS=1000000 \
     REAP_WT_MAIN_REF="" \
     REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}" \
-    REAP_WT_PR_LIMIT=1000 \
+    REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT_OVERRIDE:-1000}" \
     REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}" \
     REAP_WT_STATUS_TIMEOUT="${REAP_WT_STATUS_TIMEOUT:-20}" \
     REAP_WT_PS_TIMEOUT="${REAP_WT_PS_TIMEOUT:-20}" \
@@ -838,6 +838,71 @@ assert_contains "$(row_for "$OUT" "$WT_NOPR")" "no PR — cannot prove it is lan
     "G14d the row says WHY it cannot be proven"
 assert_contains "$(row_for "$OUT" "$WT_NOPR")" "rule=6" "G14d the row names rule 6"
 assert_dir "$WT_NOPR" "G14d --apply kept it"
+
+# G14f — the P0 the review caught: a branch NAME is reused. After `feat/x` lands
+# someone checks `feat/x` out again and commits NEW work, with no PR yet. A
+# name-only match finds the OLD merged PR and "proves" the new work disposable.
+# The rule is `headRefOid == this HEAD`, so this fixture must be KEPT.
+WT_REUSE="$(add_named_wt "$REPO" "$ENV-reuse" feat/g14-reuse)"
+commit_in_wt "$WT_REUSE" "$RECENT_DATE" reuse            # 2d old: inside the 7d floor
+REUSE_SHA="$("$REAL_GIT" -C "$WT_REUSE" rev-parse HEAD)"
+OUT="$(FAKE_GH_PRS="$(printf 'feat/g14-reuse\t%s\tMERGED\t4246' "$SQ_SHA")" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_absent "$(row_for "$OUT" "$WT_REUSE")" "reason=reclaimable" \
+    "G14f a MERGED PR on a REUSED branch name does not prove THIS head landed"
+assert_absent "$(row_for "$OUT" "$WT_REUSE")" "rule=4" \
+    "G14f rule 4 requires headRefOid == HEAD, not just the branch name"
+assert_contains "$(row_for "$OUT" "$WT_REUSE")" "reason=no-pr" \
+    "G14f the row falls through to no-pr (the PR it found is other work)"
+run_reaper $ENV --dry-run --repo "$REPO" >/dev/null
+OUT="$(FAKE_GH_PRS="$(printf 'feat/g14-reuse\t%s\tMERGED\t4246' "$SQ_SHA")" \
+    run_reaper $ENV --apply --repo "$REPO")"
+assert_dir "$WT_REUSE" "G14f --apply kept the checkout holding the unlanded commit"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --short HEAD 2>/dev/null | wc -l | tr -d ' ')" "1" \
+    "G14f (control: the fixture repo is intact)"
+# and the SAME row IS removable when the oid matches (otherwise G14f is vacuous)
+OUT="$(FAKE_GH_PRS="$(printf 'feat/g14-reuse\t%s\tMERGED\t4247' "$REUSE_SHA")" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_REUSE")" "rule=4" \
+    "G14f control: the same fixture IS rule-4 reclaimable when the PR head IS this commit"
+assert_contains "$(row_for "$OUT" "$WT_REUSE")" "head=${REUSE_SHA:0:12}" \
+    "G14f the row prints the head sha it matched on"
+
+# G14g — TRUNCATION IS A REFUSAL. `--state all` spends one limit on every state,
+# so a repo with a long merged history can exhaust it; gh then returns the newest
+# rows and silently drops the rest. An absent row is not "no PR" (inside the floor
+# it is rule 6, past it the aged rule), so a FULL page fails the gate closed.
+FAKE_GH_PRS_3="$(printf 'a1\t\tMERGED\t1\na2\t\tMERGED\t2\na3\t\tMERGED\t3')"
+OUT="$(FAKE_GH_PRS="$FAKE_GH_PRS_3" REAP_WT_PR_LIMIT_OVERRIDE=3 \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "G14g a FULL PR page => exit 3 (a truncated list is not evidence)"
+assert_contains "$OUT" "gh-pr-list-truncated(limit=3)" "G14g the refusal names the bound"
+assert_contains "$(cat "$T/$ENV/reap.log")" "GH pr-list TRUNCATED" "G14g and it is logged"
+assert_dir "$WT_REUSE" "G14g armed truncation refusal removed nothing"
+OUT="$(FAKE_GH_PRS="$FAKE_GH_PRS_3" REAP_WT_PR_LIMIT_OVERRIDE=4 \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "G14g control: the same rows under a larger limit are a readable gate"
+
+# G14h — rule 4 honours the operator's MERGED cooldown (REAP_WT_MERGED_AGE_DAYS),
+# exactly like the ancestry proof: a 2d-old PR-merged head with the floor at 7d is kept.
+OUT="$(FAKE_GH_PRS="$(printf 'feat/g14-reuse\t%s\tMERGED\t4248' "$REUSE_SHA")" \
+    REAP_WT_MERGED_AGE_DAYS_OVERRIDE=7 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_REUSE")" "reason=too-recent" \
+    "G14h with the merged floor at 7d a 2d-old PR-merged head is KEPT"
+assert_absent "$(row_for "$OUT" "$WT_REUSE")" "reason=reclaimable" \
+    "G14h ... and it is not removed"
+# ... and the aged rule's REMOVAL row never claims the KEEP rule (rule=6) as its decider.
+ENV=G14i; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+WT_AGED="$(add_named_wt "$REPO" "$ENV-aged" feat/g14i-aged)"
+commit_in_wt "$WT_AGED" "$OLD_DATE" aged                  # 76d old, no PR
+OUT="$(FAKE_GH_PRS="" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_AGED")" "reason=reclaimable" \
+    "G14i an aged no-PR checkout is still reclaimed by the #1095 aged rule"
+assert_contains "$(row_for "$OUT" "$WT_AGED")" "rule=P" "G14i the REMOVAL row is attributed to rule=P"
+assert_contains "$(row_for "$OUT" "$WT_AGED")" "no-pr=gh-state" "G14i the no-PR evidence travels with it"
+assert_absent "$(row_for "$OUT" "$WT_AGED")" "rule=6" \
+    "G14i a removal is never attributed to rule 6 (a KEEP rule in the table)"
 
 # G14e — the gate must now be consulted for a repo of DETACHED records too. It
 # used to be loaded only when some record had a branch, so a repo whose only

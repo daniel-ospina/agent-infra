@@ -194,11 +194,11 @@ cannot name its evidence is visibly a bug rather than a verdict:
 | 1 | a process has the tree, or **any path inside it**, as cwd, or names it in argv | KEEP |
 | 2 | dirty, or a clean gate that cannot be evaluated | KEEP |
 | 3 | clean + HEAD is an ancestor of `origin/main` | REMOVE |
-| 4 | clean + a PR for this head is `MERGED` (merge, squash or rebase) | REMOVE |
+| 4 | clean + the PR **whose `headRefOid` IS this commit** is `MERGED` (merge, squash or rebase) | REMOVE |
 | 5 | clean + PR `CLOSED` unmerged + head not an ancestor | KEEP, and **name the PR** |
-| 6 | clean + no PR matches this head | KEEP (`no PR — cannot prove it is landed`) |
+| 6 | clean + no PR matches this head, still inside the floor in force | KEEP (`no PR — cannot prove it is landed`) |
 | 7 | younger than `REAP_WT_MIN_AGE_MINUTES` (45) | KEEP |
-| P | pre-existing gates: main/self checkout, `worktree lock`, unreadable path, bare repo, OPEN PR head, commit held only by a revocable ref, detached on no ref | KEEP |
+| P | pre-existing gates: main/self checkout, `worktree lock`, unreadable path, bare repo, OPEN PR head, commit held only by a revocable ref, detached on no ref. Past the floor in force, a clean no-PR checkout whose commits survive on a branch is REMOVED by the pre-existing #1095 aged rule (`rule=P … no-pr=`) — rule 6 is the KEEP row and never labels a removal | KEEP |
 
 **Rule 4 is why this exists.** `git merge-base --is-ancestor` cannot see a squash
 merge: the branch head is not an ancestor of `main` even though the work landed. So a
@@ -208,8 +208,19 @@ was clean, its PR **#9862 was MERGED**, and removing it freed **6004 MB**. The r
 ONE batched `gh pr list --state all --json headRefName,state,number,headRefOid` per
 pass — never one call per worktree (the fleet's `gh` budget is real) — and it now runs
 for **detached** records too, matched by `headRefOid`, because a detached head has no
-branch name to match and is exactly the class that sat unprovable. A PR beyond the
-limit is simply not found, which is rule 6: truncation errs toward KEEP.
+branch name to match and is exactly the class that sat unprovable.
+
+⛔ **A branch NAME is not identity, and the limit is not a licence.** A merged PR is
+matched to this checkout by its `headRefOid`, which must equal this HEAD: after a
+branch lands, the next lane can check the same name out again and commit new work, and
+a name-only match would "prove" that unlanded work disposable (the revocable-ref waiver
+at rule P rests on the same equality — GitHub holds the **PR's** sha, not necessarily
+this one). And because `--state all` spends ONE limit on every state, a repo with a long
+merged history can exhaust it; gh then returns the newest N rows and silently drops the
+rest. An absent row is NOT "no PR" — inside the floor it is rule 6, past the floor the
+aged rule — so a row count AT `REAP_WT_PR_LIMIT` is a **refusal** (exit 3, nothing
+removed), never a KEEP: a live branch must not be reaped on a list that never
+contained it.
 
 **Rule 7 is the freshness floor, and its witness is two-sided.** A lane dispatched
 minutes ago is detached at `main`, clean and holder-free for exactly the same reason an
@@ -222,8 +233,13 @@ records `MIN_AGE_MINUTES=` so the floor in force is auditable.
 
 ⛔ Rules 3–4 still require the commit to be *survivable*: a checkout whose commits are
 held only by `refs/remotes/*`, a tag, stash or a bisect ref is preserved with that ref
-named, **except** when a PR is `MERGED` — GitHub durably holds that head sha, so the
-merged PR is the stronger proof and rule 4 applies.
+named, **except** when the PR is `MERGED` **and its head is this commit** — GitHub then
+durably holds that sha, so the merged PR is the stronger proof and rule 4 applies.
+
+Rule 4 also honours the merged cooldown: a PR-merged head takes
+`REAP_WT_MERGED_AGE_DAYS` (and a scratch cap may only lower it), exactly like the
+ancestry proof — and unlike patch-equivalence, it does not need `git cherry` to have
+seen the squash (a multi-commit branch squashed into one commit has no per-commit twin).
 
 **Patch equivalence (a squash the ancestry test cannot see) lifts the floor too (#2354).**
 A **squash-merged** head is never an ancestor of `MAIN_REF`, so the ancestry test

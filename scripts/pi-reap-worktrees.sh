@@ -893,8 +893,12 @@ clean_gate() {
 # and 6 (no PR => KEEP + name), so it must carry `state`. `headRefOid` is what
 # lets a DETACHED head — which has no branch name to match — be matched to the
 # PR that carried its commit.
-# Truncation errs toward KEEP, never toward removal: a PR beyond the limit
-# simply is not found, and "not found" is rule 6.
+# TRUNCATION IS A REFUSAL (#2756 review). `--state all` spends one limit on
+# every state, so a repo with a long merged history can exhaust it; gh then
+# returns the newest N rows and silently drops the rest, and an absent row is NOT
+# "no PR": inside the floor that is rule 6 (KEEP), past it the aged rule
+# (REMOVE). A live branch's checkout would be reaped on a list that never
+# contained it, so a row count AT the limit fails the gate closed (exit 3).
 GH_OK=0
 PR_APPLICABLE=0
 # PR_ROWS — "headRefName\theadRefOid\tSTATE\tnumber", one row per PR, from ONE
@@ -1002,6 +1006,26 @@ pr_state_load() {
     # disable the open-PR veto for anyone still driving this seam, which is
     # fail-OPEN. Anything else that is not four fields is dropped (it cannot be
     # resolved to a state, and rule 6 keeps the checkout) — never guessed.
+    # ── TRUNCATION IS A REFUSAL, NOT A KEEP (#2756 review, P1) ────────────
+    # `--state all` spends ONE limit on every state, so the cheapest way to
+    # exhaust it is a repo with a long history of merged PRs. When that happens
+    # gh returns the NEWEST N rows and silently drops the rest — and the row it
+    # drops can be an OPEN PR, which is the veto this read exists for. A row that
+    # is merely ABSENT is not evidence of "no PR": rule 6 would keep it inside the
+    # floor and the aged tail would REMOVE it past the floor, i.e. a live branch's
+    # checkout reaped on a truncated list. So a row count at the bound means the
+    # gate could not be evaluated — the same fail-closed verdict as an unreadable
+    # `gh` (exit 3, nothing removed), never a pass.
+    local nrows
+    nrows="$(grep -c . "$out" 2>/dev/null || true)"
+    case "$nrows" in ''|*[!0-9]*) nrows=0 ;; esac
+    if [ "$nrows" -ge "$REAP_WT_PR_LIMIT" ]; then
+        rm -f "$out"; GH_OK=0; GH_STATE="truncated"; PR_ROWS=""
+        PR_SKIP_REASON="gh-pr-list-truncated(limit=$REAP_WT_PR_LIMIT)"
+        PR_SKIP_REMEDY="this repo has at least ${REAP_WT_PR_LIMIT} PRs across ALL states, so gh returned only the newest and an absence is no longer evidence. Raise REAP_WT_PR_LIMIT above the repo's total PR count (daniel-ospina/tortoise measured 913 on 2026-10-24), or reap the repo by hand"
+        log "GH pr-list TRUNCATED at limit=$REAP_WT_PR_LIMIT for $slug (rows=$nrows) — fail-closed: an absent PR is not evidence"
+        return 1
+    fi
     PR_ROWS="$(awk -F'\t' '
         NF >= 4 && $1 != "" { print; next }
         NF == 1 && $1 != ""  { printf "%s\t\tOPEN\t\n", $1 }
@@ -1011,19 +1035,27 @@ pr_state_load() {
     return 0
 }
 
-# pr_row_best <column> <value> -> "STATE\tNUMBER" of the most DECISIVE PR that
-# matches, or "" when none does. Decision order is OPEN > MERGED > CLOSED:
+# pr_row_best <column> <value> -> "STATE\tNUMBER\tOID" of the most DECISIVE PR
+# that matches, or "" when none does. Decision order is OPEN > MERGED > CLOSED:
 # an OPEN PR must veto a removal, and a branch that was closed unmerged and
 # later merged must read as landed. Two PRs on one head ref are normal (a
 # reopened or re-landed change), so the row order decides nothing.
+#
+# ⛔ THE OID IS RETURNED, AND IT IS NOT DECORATION (#2756 review, P0). A branch
+# NAME is reused: after `feat/x` lands, the next lane may check `feat/x` out
+# again and commit new work, with no PR yet. Matching on the name alone then
+# finds the OLD MERGED PR and "proves" UNLANDED work disposable. The caller must
+# require `headRefOid == this HEAD` before a MERGED row may remove anything —
+# GitHub durably holds the PR's head sha, so that equality is what makes both
+# the removal and the revocable-ref waiver sound.
 pr_row_best() {
     [ -n "$PR_ROWS" ] || return 0
     awk -F'\t' -v c="$1" -v v="$2" '
         $c == v {
             rank = ($3 == "OPEN") ? 3 : ($3 == "MERGED" ? 2 : ($3 == "CLOSED" ? 1 : 0))
-            if (rank > best) { best = rank; st = $3; num = $4 }
+            if (rank > best) { best = rank; st = $3; num = $4; oid = $2 }
         }
-        END { if (best > 0) printf "%s\t%s\n", st, num }' <<<"$PR_ROWS"
+        END { if (best > 0) printf "%s\t%s\t%s\n", st, num, oid }' <<<"$PR_ROWS"
 }
 pr_state_for_ref() { pr_row_best 1 "$1"; }
 pr_state_for_sha() { pr_row_best 2 "$1"; }
@@ -1167,8 +1199,8 @@ patch_equivalent() { # <sha> -> 0 when every commit it adds has a patch-id twin 
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
     local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf
-    local head_ts tree_ts witness wname age_s young age_floor aged_rule
-    local pr pr_state pr_num pr_key subj prnum_note
+    local head_ts tree_ts witness wname age_s young age_floor aged_note
+    local pr pr_state pr_num pr_oid pr_key pr_other subj prnum_note pr_floor
     case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trule=P proof=worktree-list --porcelain record had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
     if [ "$branch" = "BARE" ]; then printf 'preserve\tbare\t\trule=P proof=worktree-list bare repository\n'; return 0; fi
     { [ -e "$path" ] || [ -L "$path" ]; } && exists=1
@@ -1277,17 +1309,31 @@ classify_one() {
     # that the work landed. `PR_APPLICABLE=0` (no GitHub origin) means these
     # rules cannot be evaluated and the pre-existing aged policy decides —
     # never rule 6, which would be a claim about a state nobody read.
-    pr=""; pr_state=""; pr_num=""; pr_key=""
+    local pr_rest=""
+    pr=""; pr_state=""; pr_num=""; pr_oid=""; pr_key=""; pr_other=""
     if [ "$PR_APPLICABLE" = 1 ]; then
         if [ "$branch" != "-" ]; then
             pr="$(pr_state_for_ref "${branch#refs/heads/}")"
             pr_key="head-ref ${branch#refs/heads/}"
+            if [ -n "$pr" ]; then
+                pr_state="${pr%%$'\t'*}"; pr_rest="${pr#*$'\t'}"
+                pr_num="${pr_rest%%$'\t'*}"; pr_oid="${pr_rest#*$'\t'}"
+                # A MERGED row whose head is NOT this commit names OTHER work on a
+                # reused branch name. It is not evidence about this head: forget it
+                # (keeping the name for the row's note) and let the sha lookup answer.
+                if [ "$pr_state" = "MERGED" ] && [ "$pr_oid" != "$sha" ]; then
+                    pr_other="$pr_key"; pr=""; pr_state=""; pr_num=""; pr_oid=""
+                fi
+            fi
         fi
         if [ -z "$pr" ] && [ -n "$sha" ]; then
             pr="$(pr_state_for_sha "$sha")"
             pr_key="head-sha ${sha:0:12}"
         fi
-        if [ -n "$pr" ]; then pr_state="${pr%%$'\t'*}"; pr_num="${pr#*$'\t'}"; fi
+        if [ -n "$pr" ]; then
+            pr_state="${pr%%$'\t'*}"; pr_rest="${pr#*$'\t'}"
+            pr_num="${pr_rest%%$'\t'*}"; pr_oid="${pr_rest#*$'\t'}"
+        fi
     fi
     subj="head ${sha:0:12}"
     [ "$branch" != "-" ] && subj="branch ${branch#refs/heads/}"
@@ -1327,10 +1373,11 @@ classify_one() {
     case "$refs" in
         remote-only-ref:*|revocable-ref:*)
             # A revocable ref is not a survival mechanism (F3/#1104). A MERGED PR
-            # IS one — GitHub durably holds the commit's head sha — so rule 4
-            # still applies to it; only otherwise is this a preserve, with the
-            # ref NAMED so the operator can judge it.
-            if [ "$pr_state" != "MERGED" ]; then
+            # IS one — GitHub durably holds the commit's head sha — but ONLY when
+            # that PR's head IS this commit: a reused branch name can match a PR
+            # for older work whose sha GitHub holds and THIS checkout's does not
+            # (#2756 review, P0). The oid equality is the whole warrant.
+            if [ "$pr_state" != "MERGED" ] || [ "$pr_oid" != "$sha" ]; then
                 printf 'preserve\t%s\t\trule=P proof=for-each-ref --contains %s sha %s is held only by %s — that ref is revocable (`fetch --prune[--prune-tags]`, `stash drop`, `bisect reset`); removing the checkout would then ORPHAN it\n' "${refs%%:*}" "${sha:-?}" "${sha:-?}" "${refs#*:}"
                 return 0
             fi ;;
@@ -1363,13 +1410,27 @@ classify_one() {
     # Squash merges are the reason this rule exists: the branch head is a
     # non-ancestor of main even though the work is fully landed, so rule 3 can
     # never fire for that class and PR state is the only proof available.
-    if [ "$pr_state" = "MERGED" ]; then
-        if [ "$young" = 1 ]; then
-            printf 'preserve\ttoo-young\t\trule=7 age=%sm < %sm (witness=%s) proof=pr-merged %s state=MERGED%s\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname" "$pr_key" "$prnum_note"
+    if [ "$pr_state" = "MERGED" ] && [ "$pr_oid" = "$sha" ]; then
+        # The operator's merged cooldown governs here too (#2756 review, P1):
+        # REAP_WT_MERGED_AGE_DAYS is the floor for BOTH landed classes, and the
+        # scratch cap may only lower it. A PR-merged head is a STRONGER proof than
+        # patch-equivalence, so it takes this floor even when `git cherry` could
+        # not see the squash (multi-commit branches).
+        pr_floor="$REAP_WT_MERGED_AGE_DAYS"
+        if [ "$REAP_WT_SCRATCH_AGE_DAYS" -lt "$pr_floor" ] && is_scratch_path "$path"; then
+            pr_floor="$REAP_WT_SCRATCH_AGE_DAYS"
+        fi
+        if [ "$pr_floor" -gt 0 ] && [ "$age_s" -le "$((pr_floor * 86400))" ]; then
+            printf 'preserve\ttoo-recent\t\trule=P proof=age:%sd≤%sd(merged floor) pr-merged %s state=MERGED%s head=%s\n' \
+                "$((age_s / 86400))" "$pr_floor" "$pr_key" "$prnum_note" "${pr_oid:0:12}"
             return 0
         fi
-        printf 'remove\treclaimable\t%s\trule=4 refs=%s proof=pr-merged %s state=MERGED%s age=%sm clean=disposable-only unref=no-proc,no-open-pr\n' \
-            "$eph" "$refs" "$pr_key" "$prnum_note" "$((age_s / 60))"
+        if [ "$young" = 1 ]; then
+            printf 'preserve\ttoo-young\t\trule=7 proof=age:%sm<%sm(witness=%s) pr-merged %s state=MERGED%s head=%s\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname" "$pr_key" "$prnum_note" "${pr_oid:0:12}"
+            return 0
+        fi
+        printf 'remove\treclaimable\t%s\trule=4 refs=%s proof=pr-merged %s state=MERGED%s head=%s age=%sm clean=disposable-only unref=no-proc,no-open-pr\n' \
+            "$eph" "$refs" "$pr_key" "$prnum_note" "${pr_oid:0:12}" "$((age_s / 60))"
         return 0
     fi
 
@@ -1388,9 +1449,12 @@ classify_one() {
     # survive on a branch (`git worktree remove` takes the checkout, never the
     # branch). That is a recorded decision and this rule does not reverse it; it
     # makes the window in between legible, which is what was missing.
-    aged_rule="P"
+    # `rule=6` is a KEEP in the table, so it is printed on the PRESERVE row only.
+    # A removal past the floor is the PRE-EXISTING aged rule (rule=P) with the
+    # no-PR evidence carried as a marker — attributing a removal to a keep-rule
+    # made `grep 'rule=6'` report removals (#2756 review, P2).
+    aged_note=""
     if [ "$PR_APPLICABLE" = 1 ] && [ -z "$pr_state" ]; then
-        aged_rule="6"
         # The window is the FLOOR IN FORCE, not always 7d: a lane scratch dir past
         # its 1-day cap, or a patch-equivalent head past the merged floor, is out of
         # the window and falls through to the aged removal below.
@@ -1398,6 +1462,12 @@ classify_one() {
             printf 'preserve\tno-pr\t\trule=6 proof=gh-state:no-PR-for %s (no PR — cannot prove it is landed) refs=%s age=%sm\n' "$subj" "$refs" "$((age_s / 60))"
             return 0
         fi
+        aged_note=" no-pr=gh-state(no PR for $subj)"
+    elif [ -n "$pr_other" ]; then
+        # A merged PR exists but names DIFFERENT work (a reused branch name). Say so:
+        # the row is decided by the rule above, and the operator must not read
+        # "a merged PR exists" as "this head landed".
+        aged_note=" pr-merged-other-head=$pr_other"
     fi
 
     # ── rule=P: the commit is on no ref at all ─────────────────────────────
@@ -1419,8 +1489,8 @@ classify_one() {
         return 0
     fi
 
-    printf 'remove\treclaimable\t%s\trule=%s proof=aged-floor(clean,holder-free,no-open-pr) refs=%s age=%sm clean=disposable-only unref=no-proc,no-open-pr\n' \
-        "$eph" "$aged_rule" "$refs" "$((age_s / 60))"
+    printf 'remove\treclaimable\t%s\trule=P proof=aged-floor(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=no-proc,no-open-pr\n' \
+        "$eph" "$aged_note" "$refs" "$((age_s / 60))"
     return 0
 }
 
