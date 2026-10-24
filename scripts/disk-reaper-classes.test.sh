@@ -240,7 +240,7 @@ case_b() { # <owner-script> <entry-point>
 
 # ── C: an unreadable process list SKIPS the sweep and says so ───────────────────────────────────
 case_c() { # <owner-script>
-    local owner="$1" base root repo wt out base2 root2 repo2 wt2 intrus out2 err rc out_seam
+    local owner="$1" base root repo wt out base2 root2 repo2 wt2 intrus out2 err base3 root3 repo3 wt3 out3 rc out_seam
     base="$(newbase c)"; root="$base/scratch"; mkdir -p "$base/empty-proc"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" old-idle feat/c-idle)"
@@ -513,7 +513,7 @@ case_k() { # <entry-point>
 # controller pointed at a tree through a symlink named `/tmp/link/wt/f` while the candidate's canonical
 # path was `/tmp/real/wt` — no prefix matched and the tree the live controller was working in was reaped.
 case_l() { # <owner-script>
-    local owner="$1" base root repo wt wt2 wt3 out pid pid2 pid3
+    local owner="$1" base root repo wt wt2 wt3 wt4 out pid pid2 pid3 pid4
     base="$(newbase l)"; root="$base/scratch"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" wt1 feat/l-argv)"
@@ -550,7 +550,19 @@ case_l() { # <owner-script>
                "a token that IS a SYMLINK to the tree protects it too (no sub-path to match on)"
     case_check "$([ -d "$wt3" ] && echo 0 || echo 1)" \
                "and so does the ATTACHED spelling (--repo=<abs>)"
-    kill "$pid" "$pid2" "$pid3" 2>/dev/null
+    # ⛔ AND A `../`-RELATIVE SPELLING FROM A SIBLING. The join was TEXTUAL (`cwd + "/" + token`), so
+    # `../wt4/f.txt` matched nothing — and the holder's cwd is OUTSIDE the tree, so no other arm could
+    # see it either. `.`/`..` are collapsed before the boundary test now.
+    wt4="$(mk_linked_wt "$repo" "$root" wt4 feat/l-dotdot)"
+    age_path "$wt4" 400
+    mkdir -p "$root/sibling"
+    ( cd "$root/sibling" && exec bash -c 'sleep 300; :' ../wt4/f.txt ) &
+    pid4=$!; SLEEPERS="$SLEEPERS $pid4"
+    sleep 0.6
+    out="$(REAP_AW_STATE_DIR="$base/state2" REAP_AW_ROOTS="$root" bash "$owner" --apply 2>&1 | tail -200)"
+    case_check "$([ -d "$wt4" ] && echo 0 || echo 1)" \
+               "a holder naming it as ../wt4/f.txt from a SIBLING still protects it"
+    kill "$pid" "$pid2" "$pid3" "$pid4" 2>/dev/null
     return $((CASE_FAIL > 0))
 }
 
@@ -561,7 +573,7 @@ case_l() { # <owner-script>
 # live", and reaped against it. Measured: a linked worktree with a live process cwd'd inside it was
 # reaped on that host shape.
 case_m() { # <owner-script>
-    local owner="$1" base root repo wt out base2 root2 repo2 wt2 intrus out2 err rc
+    local owner="$1" base root repo wt out base2 root2 repo2 wt2 intrus out2 err base3 root3 repo3 wt3 out3 rc
     base="$(newbase m)"; root="$base/scratch"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" live-wt feat/m-live)"
@@ -588,7 +600,7 @@ case_m() { # <owner-script>
 # then read `<path> (deleted)`). The witness here is the tree BECOMING dirty between classification and
 # removal: a `git` stand-in answers CLEAN on the first `status` call and DIRTY on the next.
 case_n() { # <owner-script>
-    local owner="$1" base root repo wt out base2 root2 repo2 wt2 intrus out2 err
+    local owner="$1" base root repo wt out base2 root2 repo2 wt2 intrus out2 err base3 root3 repo3 wt3 out3
     base="$(newbase n)"; root="$base/scratch"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" wt1 feat/n-toctou)"
@@ -639,6 +651,30 @@ SLOW
     case_check "$(grep -qF 'Is a directory' <<<"$err" && echo 1 || echo 0)" \
                "and the witnesses were handed the census FILE, not its directory (no read error)"
     kill "$intrus" 2>/dev/null
+    # ⛔ AND A TREE GIT CANNOT REPORT AT RE-PROBE TIME. `dirty=''` used to be read as CLEAN here while
+    # the classifier treats the same datum as `clean-unknown` (KEEP) — so a git that answers the first
+    # `status` and afterwards fails removed a tree whose state could not be read. Reachable only with a
+    # stub that succeeds once, which is why no other case caught it.
+    base3="$(newbase n3)"; root3="$base3/scratch"
+    repo3="$(mk_repo "$base3")"
+    wt3="$(mk_linked_wt "$repo3" "$root3" wt-unreadable feat/n-unreadable)"
+    age_path "$wt3" 400
+    mkdir -p "$base3/bin"
+    cat >"$base3/bin/git" <<FAILSTUB
+#!/usr/bin/env bash
+[ "\$1" = "-C" ] || exec "$REAL_GIT" "\$@"
+[ "\$3" = "status" ] || exec "$REAL_GIT" "\$@"
+n=\$(cat "$base3/count" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" >"$base3/count"
+[ "\$n" -ge 2 ] && exit 128
+exec "$REAL_GIT" "\$@"
+FAILSTUB
+    chmod +x "$base3/bin/git"
+    out3="$(PATH="$base3/bin:$PATH" REAL_GIT="$REAL_GIT" REAP_AW_STATE_DIR="$base3/state" \
+            REAP_AW_ROOTS="$root3" bash "$owner" --apply 2>&1)"
+    case_check "$([ -d "$wt3" ] && echo 0 || echo 1)" \
+               "a tree whose state git cannot report AT RE-PROBE TIME is PRESERVED"
+    case_check "$(grep -qF 'reason=toctou' <<<"$out3" && grep -qF 're-probe-state-unreadable' <<<"$out3" && echo 0 || echo 1)" \
+               "and it is KEPT BY NAME as reason=toctou (re-probe-state-unreadable)"
     return $((CASE_FAIL > 0))
 }
 
