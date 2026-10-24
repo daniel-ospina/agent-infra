@@ -297,7 +297,13 @@ idle30h_fixture() { # <env-name> <pid> <tty> <sid> <cwd> [extra-ps-rows...]
         for r in "$@"; do printf '%s\n' "$r"; done
     } > "$T/$envname/ps-source"
     printf '{"%s":{"pid":%s,"pidStartSeconds":%s,"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"%s"}}' "$sid" "$pid" "$E_SEP3_2000" "$cwd" | cmux_store "$envname"
-    session_jsonl "$envname" "$cwd" "$sid" "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+    # ⛔ `</dev/null` IS LOAD-BEARING. `session_jsonl` ends in a bare `cat` (it is also called with a
+    # piped body elsewhere), so THIS call site used to read the CALLER's stdin — and under
+    # `scripts/run-bash-shards.sh` the caller's stdin is the derived shard list. Measured
+    # 2026-10-24: it consumed the rest of the list, so shard 3 ran 8 of its 11 shards and 22 suites
+    # silently did not run. The driver now closes that off (`</dev/null` on every shard), and this
+    # line says what it wants instead of inheriting it.
+    session_jsonl "$envname" "$cwd" "$sid" "$E_SEP3_2000" "2026-09-03T20:00:00.000Z" </dev/null
 }
 
 echo "── pi-reap-idle.test.sh ─────────────────────────────────────────"

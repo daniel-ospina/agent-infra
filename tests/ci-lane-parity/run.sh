@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off pinned by its own step in BOTH lanes (ci.yml `bash-suites-gate`, ci-main `script-validate`) and it drives THIS runner's fast copy - as a shard it would re-enter itself
 # tests/ci-lane-parity/run.sh — #1369 regression suite for scripts/check-ci-lane-parity.sh
 # and the one-runner design it asserts.
 #
@@ -79,7 +80,7 @@ trap 'rm -rf "$TMP"' EXIT
 # Those pins assert properties of the RUNNER's own code — the `listed == executed` arithmetic, the
 # failure-recording sentinel, the sweep counter, the refusal of a symlinked/out-of-repo target.
 # Every one of them is a function of the runner's LOGIC, not of which suites its list happens to
-# name. So the fixture rewrites every `run_shard <path>` line to ONE committed, hermetic stand-in
+# name. So the fixture narrows the runner's DISCOVERY to ONE committed, hermetic stand-in
 # (`tests/ci-lane-parity/stand-in-shard.sh` — a single `exit 0`) and keeps the rest byte-identical.
 #
 # ⛔ WHY THE REAL LIST IS NOT RUN HERE (this is the whole cost of this suite, measured 2026-10-23).
@@ -99,13 +100,32 @@ trap 'rm -rf "$TMP"' EXIT
 #
 # Keep `CHEAP` pointed at something hermetic: its rc must depend on nothing but itself.
 CHEAP="tests/ci-lane-parity/stand-in-shard.sh"
-awk -v cheap="$CHEAP" '
-  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
-  { print }
-' "$RUNNER" >"$TMP/runner-cheap.sh"
+# cheap_runner <out-file> <one-shard-target> — a copy of the REAL runner whose DISCOVERY points at
+# exactly one cheap target. ⛔ Since agent-infra#2609 the list is DERIVED (`SUITE_GLOBS` + each
+# suite's own `# shard:` marker), so this fixture replaces that ONE data list instead of rewriting
+# 79 `run_shard` lines: the shipped discovery, marker parse, sort and arithmetic are all still the
+# ones under test, and a fixture execution now runs the stand-in ONCE instead of 79 times.
+cheap_runner() {
+  awk -v cheap="$2" '
+    /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"" cheap "\" )"; skip = 1; next }
+    skip && /^\)$/ { skip = 0; next }
+    skip { next }
+    { print }
+  ' "$RUNNER" >"$1"
+}
+# The fixture ROOT. The runner anchors discovery to the tree it LIVES in (agent-infra#2609 review:
+# `--list` used to read the script's own text and worked from any cwd, while the run path was
+# cwd-relative — one driver, two contracts). A copy therefore sits at <root>/scripts/<name> and
+# finds its target relative to <root>, so this fixture mirrors the layout instead of leaning on the
+# caller's cwd. `scripts/sweepable.sh` keeps the syntax sweep non-empty (the `swept` sentinel).
+FIX="$TMP/fixture"
+mkdir -p "$FIX/scripts" "$FIX/tests/ci-lane-parity"
+cp "$ROOT/$CHEAP" "$FIX/$CHEAP"
+printf '#!/bin/bash\n:\n' >"$FIX/scripts/sweepable.sh"
+cheap_runner "$FIX/scripts/runner-cheap.sh" "$CHEAP"
 
 # Every fixture execution that walks the WHOLE list goes through this bound: 8d, 8e, 8h, and 8n's
-# pair. Arms 8q and 8r rebuild the runner with every run_shard line already rewritten to CHEAP, and
+# pair. Arms 8q and 8r rebuild the runner with discovery already narrowed to CHEAP, and
 # the two symlink arms run a three-line stub — those four are inert by construction and carry no
 # bound. The split is stated rather than implied so that a fixture added here knows which it is
 # (review finding, cycle 1: the comment used to claim that EVERY fixture was bounded). A bound can
@@ -161,7 +181,7 @@ for pair in "PR:$PR" "main:$MAIN"; do
     fail "the $lane lane does NOT call the shared runner"
   fi
 done
-if grep -qE '^run_shard scripts/record-review\.test\.sh' "$RUNNER"; then
+if grep -qx 'scripts/record-review.test.sh' <<<"$(bash "$RUNNER" --list 2>/dev/null)"; then
   pass "the shared runner runs scripts/record-review.test.sh (the #1348 incident suite)"
 else
   fail "the shared runner does NOT run scripts/record-review.test.sh — the incident class is open"
@@ -234,30 +254,73 @@ else
 fi
 
 echo ""
-echo "5. A GUTTED RUNNER (0 shard lines) → rc 2, never a vacuous 'both lanes agree'"
-grep -v '^run_shard ' "$RUNNER" >"$TMP/runner-gutted.sh"
-if cmp -s "$RUNNER" "$TMP/runner-gutted.sh"; then
+echo "5. A GUTTED RUNNER (no discovery) → rc 2, never a vacuous 'both lanes agree'"
+# #2609: the list is DERIVED, so "gutted" now means the DISCOVERY LIST is gone (the `SUITE_GLOBS`
+# array). Deleting the execution loop instead leaves a list that advertises 79 suites and runs
+# none — that is the runner's own runtime counter's job (`executed 0 of 79`), pinned by 8d.
+awk '
+  /^SUITE_GLOBS=\($/ { skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$RUNNER" >"$FIX/scripts/runner-gutted.sh"
+if cmp -s "$RUNNER" "$FIX/scripts/runner-gutted.sh"; then
   fail "the gutted-runner mutation did not change the file"
 else
-  guard_rc "$MAIN" "$PR" "$TMP/runner-gutted.sh"
-  if [ "$RC" -eq 2 ] && grep -q 'shard(s) (floor' <<<"$OUT"; then
-    pass "a gutted runner exits 2 and names the floor (rc 2)"
+  # The runner refuses FIRST, by itself: an empty derivation is never printed as "the list".
+  GUT_LIST="$( cd "$FIX" && bash scripts/runner-gutted.sh --list 2>&1 )"
+  GUT_RC=$?
+  guard_rc "$MAIN" "$PR" "$FIX/scripts/runner-gutted.sh"
+  if [ "$GUT_RC" -eq 2 ] && grep -q 'EMPTY' <<<"$GUT_LIST" \
+     && [ "$RC" -eq 2 ] && grep -q 'shard list is unreadable\|EMPTY' <<<"$OUT"; then
+    pass "a gutted runner refuses its own --list (rc 2, naming the emptiness) and the guard refuses it too"
   else
-    fail "a gutted runner returned rc $RC (want 2, naming the floor): $OUT"
+    fail "a gutted runner: --list rc $GUT_RC [$GUT_LIST] guard rc $RC (want 2/2): $OUT"
   fi
+fi
+
+echo ""
+echo "5b. A RUNNER THAT PRINTS TOO FEW SHARDS → rc 2, naming the floor"
+# The floor is the guard's coverage FLOOR (14 suites) — independent of how the list is produced, so
+# it needs its own stub now that the real runner can no longer be mutated into "prints 3 and exits
+# 0": its discovery either works (79) or refuses (arm 5). Without this arm the floor would be
+# unexercised, i.e. the assertion in arm 5 above would be measuring a branch nothing reached.
+{
+  echo '#!/usr/bin/env bash'
+  echo 'case "${1:-}" in'
+  echo '  --list) printf "%s\n" scripts/a.test.sh scripts/b.test.sh scripts/c.test.sh; exit 0 ;;'
+  echo '  --list-sweeps) printf "%s\n" "scripts/*.sh"; exit 0 ;;'
+  echo 'esac'
+  echo 'exit 0'
+} >"$TMP/runner-thin.sh"
+guard_rc "$MAIN" "$PR" "$TMP/runner-thin.sh"
+if [ "$RC" -eq 2 ] && grep -q 'shard(s) (floor' <<<"$OUT"; then
+  pass "a runner listing 3 shards exits 2 and names the floor (rc 2)"
+else
+  fail "a thin runner returned rc $RC (want 2, naming the floor): $OUT"
 fi
 
 echo ""
 echo "6. A RUNNER WITH NO SWEEPS (0 syntax targets) → rc 2"
 # The sweep half is DATA now (SWEEP_GLOBS) plus the loops that iterate it, and the guard reads the
-# list from the runner's own `--list-sweeps`. So the mutation must remove the LIST; deleting only
-# the loops leaves the list advertising globs nothing iterates, which the guard cannot see and the
-# RUNNER's `swept` sentinel catches at runtime (pinned by 8q below).
-grep -v -e 'for f in' -e 'SWEEP_GLOBS' "$RUNNER" >"$TMP/runner-nosweep.sh"
-if cmp -s "$RUNNER" "$TMP/runner-nosweep.sh"; then
+# list from the runner's own `--list-sweeps`. So the mutation EMPTIES that data list: deleting the
+# loops alone would leave the list advertising globs nothing iterates, which the guard cannot see
+# and the RUNNER's `swept` sentinel catches at runtime (pinned by 8q below). (#2609: the mutation
+# used to also delete `for f in …` lines, which now includes the DISCOVERY loop — that made the
+# mutated runner a syntax error, and the arm measured the unreadable-list refusal instead.)
+# Discovery stays INTACT and cheap (one hermetic target): since #2609 an emptied discovery refuses
+# its own `--list`, so mutating both halves at once would measure that refusal instead of the floor.
+for _n in 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
+  mkdir -p "$FIX/tests/t$_n"
+  printf '#!/bin/bash\nexit 0\n' >"$FIX/tests/t$_n/run.sh"
+done
+cheap_runner "$FIX/scripts/runner-nosweep.sh" "tests/t*/run.sh"
+awk '{ if ($0 ~ /^SWEEP_GLOBS=\(/) { print "SWEEP_GLOBS=()"; next } print }' \
+  "$FIX/scripts/runner-nosweep.sh" >"$TMP/runner-nosweep.tmp" && mv "$TMP/runner-nosweep.tmp" "$FIX/scripts/runner-nosweep.sh"
+if cmp -s "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-nosweep.sh"; then
   fail "the no-sweep mutation did not change the file"
 else
-  guard_rc "$MAIN" "$PR" "$TMP/runner-nosweep.sh"
+  guard_rc "$MAIN" "$PR" "$FIX/scripts/runner-nosweep.sh"
   if [ "$RC" -eq 2 ] && grep -q 'syntax target' <<<"$OUT"; then
     pass "a runner with no sweeps exits 2 — the syntax half cannot go uncovered in silence"
   else
@@ -268,9 +331,14 @@ fi
 # A runner that keeps its sweeps but loses every suite must ALSO exit 2 — the two floors are
 # independent, so a mutation that satisfies one must not carry the other.
 echo ""
-echo "6b. FLOOR INDEPENDENCE — sweeps intact but no shards still exits 2"
-grep -v '^run_shard ' "$RUNNER" >"$TMP/runner-noshards-but-sweeps.sh"
-guard_rc "$MAIN" "$PR" "$TMP/runner-noshards-but-sweeps.sh"
+echo "6b. FLOOR INDEPENDENCE — sweeps intact but no discovery still exits 2"
+awk '
+  /^SUITE_GLOBS=\($/ { skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$RUNNER" >"$FIX/scripts/runner-noshards-but-sweeps.sh"
+guard_rc "$MAIN" "$PR" "$FIX/scripts/runner-noshards-but-sweeps.sh"
 if [ "$RC" -eq 2 ]; then
   pass "the shard floor fires even while the sweep floor is satisfied (rc 2)"
 else
@@ -343,11 +411,11 @@ fi
 
 echo ""
 echo "8h. FAILURE-RECORDING ARM — dropping it must make the RUNNER fail at runtime"
-sed 's/ || shard_errors=$((shard_errors + 1))//' "$TMP/runner-cheap.sh" >"$TMP/runner-norecord.sh"
-if cmp -s "$TMP/runner-cheap.sh" "$TMP/runner-norecord.sh"; then
+sed 's/ || shard_errors=$((shard_errors + 1))//' "$FIX/scripts/runner-cheap.sh" >"$FIX/scripts/runner-norecord.sh"
+if cmp -s "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-norecord.sh"; then
   fail "the no-record mutation did not change the file"
 else
-  $FIXTURE_BOUND bash "$TMP/runner-norecord.sh" >"$TMP/runner-norecord.out" 2>&1
+  $FIXTURE_BOUND bash "$FIX/scripts/runner-norecord.sh" >"$TMP/runner-norecord.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-norecord.out")"
   if [ "$RC" -eq 1 ] && grep -qE '(failure-recording|sweep) arm is broken' <<<"$OUT"; then
@@ -416,11 +484,11 @@ echo "8d. RUNTIME SELF-CHECK — a neutered runner helper must fail, not report 
 # Neutering means replacing the WHOLE helper (the verifier's repro): the counter goes with the
 # execution, so the runner can no longer claim it ran anything.
 awk '{ if ($0 ~ /^run_shard\(\) \{/) { print "run_shard() { :; }"; next } print }' \
-  "$TMP/runner-cheap.sh" >"$TMP/runner-neutered.sh"
-if cmp -s "$TMP/runner-cheap.sh" "$TMP/runner-neutered.sh"; then
+  "$FIX/scripts/runner-cheap.sh" >"$FIX/scripts/runner-neutered.sh"
+if cmp -s "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-neutered.sh"; then
   fail "the neutered-helper mutation did not change the file"
 else
-  $FIXTURE_BOUND bash "$TMP/runner-neutered.sh" >"$TMP/runner-neutered.out" 2>&1
+  $FIXTURE_BOUND bash "$FIX/scripts/runner-neutered.sh" >"$TMP/runner-neutered.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-neutered.out")"
   if [ "$RC" -eq 1 ] && grep -q 'executed 0 of' <<<"$OUT"; then
@@ -442,14 +510,46 @@ echo "8e. COUNTER-PRESERVING SABOTAGE is now CAUGHT by the failure-recording sen
 # Earlier revisions could not catch this (the count stayed correct while failures stopped being
 # recorded); the sentinel self-check in the runner closes it, so it is no longer a residual.
 awk '{ if ($0 ~ /^run_shard\(\) \{/) { print "run_shard() { shard_ran=$((shard_ran + 1)); }"; next } print }' \
-  "$TMP/runner-cheap.sh" >"$TMP/runner-counter-only.sh"
-$FIXTURE_BOUND bash "$TMP/runner-counter-only.sh" >"$TMP/runner-counter-only.out" 2>&1
+  "$FIX/scripts/runner-cheap.sh" >"$FIX/scripts/runner-counter-only.sh"
+$FIXTURE_BOUND bash "$FIX/scripts/runner-counter-only.sh" >"$TMP/runner-counter-only.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-counter-only.out")"
 if [ "$RC" -eq 1 ]; then
   pass "dropping the failure-recording arm without touching the counter FAILS (rc 1)"
 else
   fail "the counter-preserving sabotage returned rc $RC (want 1): $OUT"
+fi
+
+echo ""
+echo "8e2. A SHARD THAT READS STDIN MUST NOT TRUNCATE THE LIST (measured: 22 suites silently skipped)"
+# The run loop feeds the DERIVED LIST to `read` on the runner's own standard input, so every shard
+# inherits it as its stdin. Measured on PR #2614's head, 2026-10-24: `scripts/pi-reap-idle.test.sh`
+# ends a fixture helper in a bare `cat`, consumed the rest of the list, and shard 3 executed 8 of
+# its 11 shards — 22 suites in that slice never ran at all. The coverage arithmetic caught it, and
+# that is exactly why this arm pins the CAUSE rather than the symptom: the count assertion only
+# fires while the arithmetic happens to disagree, and a slice whose shard count divides evenly would
+# report ✅ over suites it never executed (#2482's own decay argument).
+STDIN_FIX="$TMP/stdin-fixture"
+mkdir -p "$STDIN_FIX/scripts" "$STDIN_FIX/tests/ci-lane-parity"
+# The fixture root needs a non-empty syntax sweep (the `swept` sentinel) and three discovered
+# shards: an inert one, one that CONSUMES stdin, and one AFTER it that must still execute.
+printf '#!/bin/bash\n:\n' >"$STDIN_FIX/scripts/sweepable.sh"
+printf '#!/bin/bash\nexit 0\n' >"$STDIN_FIX/tests/ci-lane-parity/stdin-a.sh"
+printf '#!/bin/bash\ncat >/dev/null\nexit 0\n' >"$STDIN_FIX/tests/ci-lane-parity/stdin-b.sh"
+printf '#!/bin/bash\nexit 0\n' >"$STDIN_FIX/tests/ci-lane-parity/stdin-c.sh"
+awk -v g="tests/ci-lane-parity/stdin-*.sh" '
+  /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"" g "\" )"; skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$RUNNER" >"$STDIN_FIX/scripts/runner-stdin.sh"
+$FIXTURE_BOUND bash "$STDIN_FIX/scripts/runner-stdin.sh" >"$TMP/runner-stdin.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-stdin.out")"
+if [ "$RC" -eq 0 ] && grep -q 'all 3 bash shards passed' <<<"$OUT"; then
+  pass "a shard that reads stdin does not truncate the list: all 3 stand-ins executed (rc 0)"
+else
+  fail "a stdin-reading shard truncated the list (rc $RC, want 0 with all 3 executed): $OUT"
 fi
 
 echo ""
@@ -528,11 +628,11 @@ echo "8n. SWEEP BODY NEUTERED → the RUNNER must fail at runtime (and pass unne
 awk '
   /^sweep_file\(\) \{/ { print "sweep_file() { :; }"; next }
   { print }
-' "$TMP/runner-cheap.sh" >"$TMP/runner-nosweepbody.sh"
-if cmp -s "$TMP/runner-cheap.sh" "$TMP/runner-nosweepbody.sh"; then
+' "$FIX/scripts/runner-cheap.sh" >"$FIX/scripts/runner-nosweepbody.sh"
+if cmp -s "$FIX/scripts/runner-cheap.sh" "$FIX/scripts/runner-nosweepbody.sh"; then
   fail "the sweep-body mutation did not change the fixture"
 else
-  $FIXTURE_BOUND bash "$TMP/runner-cheap.sh" >"$TMP/runner-cheap.out" 2>&1
+  $FIXTURE_BOUND bash "$FIX/scripts/runner-cheap.sh" >"$TMP/runner-cheap.out" 2>&1
   RCC=$?
   OUTC="$(cat "$TMP/runner-cheap.out")"
   if [ "$RCC" -eq 0 ] && grep -q 'file(s) syntax-checked' <<<"$OUTC"; then
@@ -540,7 +640,7 @@ else
   else
     fail "the control fixture returned rc $RCC (want 0): $(printf '%s' "$OUTC" | tail -1)"
   fi
-  $FIXTURE_BOUND bash "$TMP/runner-nosweepbody.sh" >"$TMP/runner-nosweepbody.out" 2>&1
+  $FIXTURE_BOUND bash "$FIX/scripts/runner-nosweepbody.sh" >"$TMP/runner-nosweepbody.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-nosweepbody.out")"
   if [ "$RC" -eq 1 ] && grep -q 'syntax sweep executed no file' <<<"$OUT"; then
@@ -588,12 +688,10 @@ fi
 
 echo ""
 echo "8q. COUNTER-PRESERVING SWEEP NEUTER → the RUNNER must fail at runtime"
-awk -v cheap="$CHEAP" '
-  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
-  /^sweep_file\(\) \{/ { print "sweep_file() { swept=$((swept + 1)); }"; next }
-  { print }
-' "$RUNNER" >"$TMP/runner-sweepcounter.sh"
-bash "$TMP/runner-sweepcounter.sh" >"$TMP/runner-sweepcounter.out" 2>&1
+cheap_runner "$FIX/scripts/runner-cheap-sweep.sh" "$CHEAP"
+awk '{ if ($0 ~ /^sweep_file\(\) \{/) { print "sweep_file() { swept=$((swept + 1)); }"; next } print }' \
+  "$FIX/scripts/runner-cheap-sweep.sh" >"$FIX/scripts/runner-sweepcounter.sh"
+bash "$FIX/scripts/runner-sweepcounter.sh" >"$TMP/runner-sweepcounter.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-sweepcounter.out")"
 if [ "$RC" -eq 1 ] && grep -q 'sweep arm is broken' <<<"$OUT"; then
@@ -604,8 +702,10 @@ fi
 
 echo ""
 echo "8r. A SUBSTITUTED-OUT-OF-REPO TARGET → the RUNNER must refuse it"
-awk '{ if ($0 ~ /^run_shard [a-z]/) { print "run_shard /tmp/not-in-the-repo.sh"; next } print }' \
-  "$RUNNER" >"$TMP/runner-subst.sh"
+# The discovery must FIND the target (a glob only yields real files), and it must be a REAL file
+# OUTSIDE the checkout, so the refusal under test is the containment check and not an empty list.
+printf 'exit 0\n' >"$TMP/not-in-the-repo.sh"
+cheap_runner "$TMP/runner-subst.sh" "$TMP/not-in-the-repo.sh"
 if cmp -s "$RUNNER" "$TMP/runner-subst.sh"; then
   fail "the substitution mutation did not change the file"
 else
@@ -690,10 +790,7 @@ SYMDIR="$TMP/symrepo"
 mkdir -p "$SYMDIR/scripts"
 printf 'exit 0\n' >"$TMP/outside-target.sh"
 ln -sf "$TMP/outside-target.sh" "$SYMDIR/scripts/linked.sh"
-awk -v cheap="scripts/linked.sh" '
-  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
-  { print }
-' "$RUNNER" >"$SYMDIR/runner.sh"
+cheap_runner "$SYMDIR/runner.sh" "scripts/linked.sh"
 ( cd "$SYMDIR" && bash runner.sh ) >"$TMP/runner-symlink.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-symlink.out")"
@@ -766,13 +863,29 @@ echo "8am. THE FAILING SHARD IS NAMED — deleting the naming must turn this arm
 # sentinels CANNOT pin it (the sentinel is deliberately not a listed shard, so a name would be a
 # false report on a green run). Non-vacuity is built in: the same fixture with `shard_fail` deleted
 # must print NO name, and still exit 1.
+#
+# ⛔ THE FIXTURE IS A TREE, NOT A REWRITTEN LIST (agent-infra#2609 + #2643 interaction, found by
+# THIS arm). #2643 landed on main while the list was still ENUMERATED there, so its fixture rewrote
+# `run_shard <path>` lines in a copy of the runner left in `$TMP`. Under DERIVATION there is no such
+# line to rewrite, and `-` this is the part that fails silently `-` a copy sitting outside a tree
+# anchors its own discovery to the wrong root and refuses (rc 2, list EMPTY), so the arm measured
+# the refusal instead of the naming. The layout below mirrors §12's PROBE: a real fixture root the
+# copy LIVES in, with discovery narrowed to the two committed stand-ins, one passing and one failing.
 NAMED_FAIL="tests/ci-lane-parity/stand-in-fail.sh"
-awk -v cheap="$CHEAP" -v failing="$NAMED_FAIL" '
-  /^run_shard / && $2 !~ /^\"/ { n++; if (n == 1) { print "run_shard " failing; next } }
-  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
+NAMED_FIX="$TMP/named-fixture"
+mkdir -p "$NAMED_FIX/scripts" "$NAMED_FIX/tests/ci-lane-parity"
+# Non-empty sweep: the fixture runner refuses to report success over a sweep that parsed nothing.
+printf '#!/bin/bash\n:\n' >"$NAMED_FIX/scripts/sweepable.sh"
+cp "$ROOT/$CHEAP" "$NAMED_FIX/$CHEAP"
+cp "$ROOT/$NAMED_FAIL" "$NAMED_FIX/$NAMED_FAIL"
+# `stand-in-*.sh` matches BOTH, so the passing shard proves the run is not only its failure.
+awk -v g="tests/ci-lane-parity/stand-in-*.sh" '
+  /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"" g "\" )"; skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
   { print }
-' "$RUNNER" >"$TMP/runner-onefail.sh"
-env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$TMP/runner-onefail.sh" >"$TMP/runner-onefail.out" 2>&1
+' "$RUNNER" >"$NAMED_FIX/scripts/runner-named.sh"
+env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-onefail.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-onefail.out")"
 if [ "$RC" -eq 1 ] && grep -qF "❌ FAILED SHARD: $NAMED_FAIL" <<<"$OUT"; then
@@ -787,11 +900,11 @@ else
 fi
 # NON-VACUITY: same fixture, the naming call deleted. The run must STILL fail (the counter is
 # untouched) and must print NO name — so an arm that passed on any failing run would be caught.
-sed 's/\[ "$shard_errors" -ne "$shard_err0" \] && shard_fail "$1"; //' "$TMP/runner-onefail.sh" >"$TMP/runner-onefail-noname.sh"
-if cmp -s "$TMP/runner-onefail.sh" "$TMP/runner-onefail-noname.sh"; then
+sed 's/\[ "$shard_errors" -ne "$shard_err0" \] && shard_fail "$1"; //' "$NAMED_FIX/scripts/runner-named.sh" >"$NAMED_FIX/scripts/runner-noname.sh"
+if cmp -s "$NAMED_FIX/scripts/runner-named.sh" "$NAMED_FIX/scripts/runner-noname.sh"; then
   fail "the no-name mutation did not change the fixture (the naming call moved — update this arm's sed)"
 else
-  env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$TMP/runner-onefail-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
+  env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-onefail-noname.out")"
   if [ "$RC" -eq 1 ] && ! grep -qF 'FAILED SHARD' <<<"$OUT"; then
@@ -807,10 +920,7 @@ PARENTDIR="$TMP/parentrepo"
 mkdir -p "$PARENTDIR" "$TMP/outside-dir"
 printf 'exit 0\n' >"$TMP/outside-dir/stub.sh"
 ln -sfn "$TMP/outside-dir" "$PARENTDIR/scripts"
-awk -v cheap="scripts/stub.sh" '
-  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
-  { print }
-' "$RUNNER" >"$PARENTDIR/runner.sh"
+cheap_runner "$PARENTDIR/runner.sh" "scripts/stub.sh"
 ( cd "$PARENTDIR" && bash runner.sh ) >"$TMP/runner-parentsym.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-parentsym.out")"
@@ -1033,15 +1143,22 @@ done
 
 echo ''
 echo '8ac7. A DUPLICATED SHARD LIST -> rc 2 (a repeated target is not extra coverage)'
-# 13 of the 14 lines pointed at one cheap script: any length floor is satisfied while 13 suites
-# never run (ledger-sourced, cycle 2 — the substitution variant of the runner-body residual).
-awk -v cheap="$CHEAP" '
-  /^run_shard [a-z]/ && n < 13 { print "run_shard " cheap; n++; next }
-  { print }
-' "$RUNNER" >"$TMP/runner-dupes.sh"
+# ⛔ THE CONSTRUCTION MOVED WITH THE DESIGN (#2609). A DERIVED list cannot contain a duplicate —
+# `LC_ALL=C sort -u` collapses one and the globs are disjoint — so a mutated runner can no longer
+# produce this shape. The floor is still worth having: it is the guard's assertion about WHATEVER
+# runner it is pointed at (a list is an artifact, not a proof), so it is driven with a stub runner
+# that answers `--list` with 13 copies of one path and a valid sweep list.
+{
+  echo '#!/usr/bin/env bash'
+  echo 'case "${1:-}" in'
+  echo '  --list) n=0; while [ "$n" -lt 14 ]; do printf "%s\n" "scripts/cheap.sh"; n=$((n + 1)); done; exit 0 ;;'
+  echo '  --list-sweeps) printf "%s\n" "scripts/*.sh"; exit 0 ;;'
+  echo 'esac'
+  echo 'exit 0'
+} >"$TMP/runner-dupes.sh"
 guard_rc "$MAIN" "$PR" "$TMP/runner-dupes.sh"
 if [ "$RC" -eq 2 ] && grep -q 'duplicate' <<<"$OUT"; then
-  pass "a runner listing the same script 13 times exits 2 and says why"
+  pass "a runner listing the same script 14 times exits 2 and says why"
 else
   fail "a duplicated shard list returned rc $RC (want 2, naming duplicates): $OUT"
 fi
@@ -1276,6 +1393,187 @@ if grep -q 'scripts/record-review.test.sh' "$TMP/runner-list.txt"; then
   pass "--list names the incident suite (the list is the one that actually runs)"
 else
   fail "--list does not name scripts/record-review.test.sh: $(cat "$TMP/runner-list.txt")"
+fi
+
+# ⛔ A SECOND PARSER OF THE OLD SHAPE IS HOW THIS CHANGE WENT RED TWICE IN REVIEW (#2609): two
+# suites asserted their own membership by grepping the driver's TEXT for their own filename. That
+# only ever worked because the list was enumerated — and it went red the moment it was derived,
+# while telling the next lane to hand-edit the driver. Pinning "the driver names no suite" means
+# that shape can never come back: a text-grep membership check can no longer pass, so it fails
+# loudly at the suite instead of silently asserting a list that is not there.
+if grep -qE '^[[:space:]]*run_shard[[:space:]]+[^"$]' "$RUNNER"; then
+  fail "the runner still carries an ENUMERATED 'run_shard <path>' line — the list is supposed to be derived"
+else
+  pass "the runner carries no enumerated 'run_shard <path>' line (a text-grep membership check cannot pass)"
+fi
+
+echo ""
+echo "12. DERIVATION — the list is DISCOVERED from the tree, not enumerated (#2609)"
+# ⛔ THE GATE THIS SECTION EXISTS FOR: no suite may silently disappear from CI. Two halves:
+#   (a) at REPO level, every discovered suite is either in `--list` or declares `# shard: off
+#       <reason>` in its own header — so a glob that stopped matching, or a suite that arrived
+#       without a marker, is caught HERE rather than by the suite quietly never running;
+#   (b) in a FIXTURE repo, a new suite is picked up with NO edit to the runner at all.
+# The enumeration below is deliberately an INDEPENDENT re-statement of the discovery conventions:
+# a check that asked the runner what it discovered could not see a convention that narrowed.
+LIST_ALL="$(bash "$RUNNER" --list 2>/dev/null)"
+unlisted() {
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    grep -qxF "$f" <<<"$LIST_ALL" && continue
+    # A reason is REQUIRED and it must be more than whitespace: `# shard: off` followed by spaces
+    # used to read as a declared opt-out while the runner refused it (#2609 review) — the two
+    # parsers disagreed, which is how a suite gets dropped by a trailing space.
+    grep -qE '^# shard: off[[:space:]]+[^[:space:]]' <<<"$(sed -n '1,20p' "$f" 2>/dev/null)" && continue
+    printf '%s\n' "$f"
+  done
+}
+DISCOVERED="$( { for g in "scripts/*.test.sh" "scripts/*/*.test.sh" \
+      "scripts/orchestrator-harness/test-*.sh" "scripts/orchestrator-harness/selftest.sh" \
+      "tests/*/run.sh" "pi-bootstrap/tests/*.sh"; do
+    for f in $g; do [ -f "$f" ] || continue; printf '%s\n' "$f"; done
+  done; } | LC_ALL=C sort -u )"
+OFFENDERS="$(unlisted <<<"$DISCOVERED")"
+if [ -z "$OFFENDERS" ]; then
+  pass "every discovered suite is in --list or declares '# shard: off <reason>' ($(grep -c . <<<"$DISCOVERED") discovered)"
+else
+  fail "suite(s) discovered but NEITHER listed NOR opted out with a reason: $(tr '\n' ' ' <<<"$OFFENDERS")"
+fi
+# NON-VACUITY: the check must be able to report an offender, or the pass above means nothing.
+GHOST_OFFENDERS="$(unlisted <<<"$DISCOVERED
+scripts/zzz-ghost-suite.test.sh")"
+if grep -qxF 'scripts/zzz-ghost-suite.test.sh' <<<"$GHOST_OFFENDERS"; then
+  pass "control: an unlisted, unmarked suite IS reported (the check is not vacuous)"
+else
+  fail "control: an unlisted, unmarked suite was NOT reported — the assertion above is vacuous"
+fi
+
+# ── (b) the fixture repo: discovery, opt-out, order, and a NAMED failure ─────────────────────
+PROBE="$TMP/probe-repo"
+mkdir -p "$PROBE/tests/zzz-probe" "$PROBE/tests/zzz-off" "$PROBE/tests/aaa" "$PROBE/scripts"
+cp "$RUNNER" "$PROBE/scripts/runner.sh"
+# A sweepable file, so the fixture runner's own sweep self-check has work to do (it refuses to
+# report success over a sweep that parsed nothing).
+printf '#!/bin/bash\n:\n' >"$PROBE/scripts/sweepable.sh"
+printf '#!/bin/bash\nprintf "%%s\\n" "ZZZ-PROBE-RAN"\n' >"$PROBE/tests/zzz-probe/run.sh"
+printf '#!/bin/bash\nprintf "%%s\\n" "ZZZ-AAA-RAN"\n' >"$PROBE/tests/aaa/run.sh"
+printf '#!/bin/bash\n# shard: off fixture: exists only to prove a DECLARED opt-out is not run\nprintf "%%s\\n" "ZZZ-OFF-RAN"\n' \
+  >"$PROBE/tests/zzz-off/run.sh"
+PROBE_LIST="$( cd "$PROBE" && bash scripts/runner.sh --list 2>&1 )"
+RCL=$?
+if [ "$RCL" -eq 0 ] && grep -qx 'tests/zzz-probe/run.sh' <<<"$PROBE_LIST"; then
+  pass "a suite that matches a discovery glob is LISTED with no edit to the runner (the #2609 defect)"
+else
+  fail "a newly added suite was not discovered (rc $RCL): $(tr '\n' ' ' <<<"$PROBE_LIST")"
+fi
+if grep -qx 'tests/zzz-off/run.sh' <<<"$PROBE_LIST"; then
+  fail "a suite carrying '# shard: off <reason>' was still LISTED"
+else
+  pass "a suite carrying '# shard: off <reason>' is NOT listed (and the reason is required, below)"
+fi
+# ⛔ Determinism: `tests/zzz-*` was created BEFORE `tests/aaa`, so a filesystem-order list would
+# put zzz first. The list must be `LC_ALL=C sort -u` — the same on every machine, and stable.
+PROBE_LIST2="$( cd "$PROBE" && bash scripts/runner.sh --list 2>&1 )"
+if [ "$PROBE_LIST" = "$PROBE_LIST2" ] && [ "$PROBE_LIST" = "$(LC_ALL=C sort <<<"$PROBE_LIST")" ]; then
+  pass "the list is LC_ALL=C sorted and identical across runs (creation order cannot leak in)"
+else
+  fail "the list is not deterministically sorted: [$(tr '\n' '|' <<<"$PROBE_LIST")]"
+fi
+# The opt-out is a SKIP, not merely an omission: the suite's body must not execute.
+PROBE_RUN="$( cd "$PROBE" && bash scripts/runner.sh 2>&1 )"
+PROBE_RC=$?
+if [ "$PROBE_RC" -eq 0 ] && grep -q 'ZZZ-PROBE-RAN' <<<"$PROBE_RUN" && ! grep -q 'ZZZ-OFF-RAN' <<<"$PROBE_RUN"; then
+  pass "the discovered suite RUNS and the opted-out suite does NOT execute"
+else
+  fail "discovery and opt-out disagree (rc $PROBE_RC): $(tr '\n' '|' <<<"$PROBE_RUN")"
+fi
+# ⛔ The fail-closed direction: a marker with NO reason must REFUSE, never degrade to skip or run.
+mkdir -p "$PROBE/tests/zzz-noreason"
+printf '#!/bin/bash\n# shard: off\nexit 0\n' >"$PROBE/tests/zzz-noreason/run.sh"
+NOREASON="$( cd "$PROBE" && bash scripts/runner.sh --list 2>&1 )"
+RC="$?"
+if [ "$RC" -eq 2 ] && grep -q 'zzz-noreason' <<<"$NOREASON" && grep -q 'NO reason' <<<"$NOREASON"; then
+  pass "'# shard: off' with NO reason REFUSES the run (rc 2) and names the suite"
+else
+  fail "a reasonless opt-out returned rc $RC (want 2, naming the suite): $(tr '\n' '|' <<<"$NOREASON")"
+fi
+printf '#!/bin/bash\n# shard: maybe later\nexit 0\n' >"$PROBE/tests/zzz-noreason/run.sh"
+BOGUS="$( cd "$PROBE" && bash scripts/runner.sh --list 2>&1 )"
+RC="$?"
+if [ "$RC" -eq 2 ] && grep -q 'unrecognised shard marker' <<<"$BOGUS"; then
+  pass "an unrecognised '# shard:' marker REFUSES the run (rc 2) rather than guessing"
+else
+  fail "an unrecognised marker returned rc $RC (want 2): $(tr '\n' '|' <<<"$BOGUS")"
+fi
+rm -rf "$PROBE/tests/zzz-noreason"
+mkdir -p "$PROBE/tests/zzz-blankreason"
+printf '#!/bin/bash\n# shard: off   \nexit 0\n' >"$PROBE/tests/zzz-blankreason/run.sh"
+BLANK="$( cd "$PROBE" && bash scripts/runner.sh --list 2>&1 )"
+RC="$?"
+if [ "$RC" -eq 2 ] && grep -q 'zzz-blankreason' <<<"$BLANK" && grep -q 'NO reason' <<<"$BLANK"; then
+  pass "a marker with only WHITESPACE after it REFUSES the run (rc 2) — a trailing space is not a reason"
+else
+  fail "a whitespace-only reason returned rc $RC (want 2, naming the suite): $(tr '\n' '|' <<<"$BLANK")"
+fi
+rm -rf "$PROBE/tests/zzz-blankreason"
+# ⛔ The attribution half of #2609: a failing shard must be NAMED, not counted anonymously.
+# The vocabulary asserted here is #2643's (`❌ FAILED SHARD:` + the `❌ failing shard(s):` recap),
+# which landed on main with a second, independent naming implementation; this branch's earlier
+# `❌ SHARD FAILED (rc N):` spelling lost the merge to it, and ONE vocabulary is the point — a
+# reader who greps the log should not have to know which change named the shard.
+mkdir -p "$PROBE/tests/zzz-fail"
+printf '#!/bin/bash\nexit 3\n' >"$PROBE/tests/zzz-fail/run.sh"
+FAILRUN="$( cd "$PROBE" && bash scripts/runner.sh 2>&1 )"
+RC="$?"
+if [ "$RC" -eq 1 ] && grep -q '❌ FAILED SHARD: tests/zzz-fail/run.sh' <<<"$FAILRUN" \
+   && grep -qE '^❌ failing shard\(s\): .*tests/zzz-fail/run\.sh' <<<"$FAILRUN"; then
+  pass "a failing shard is NAMED inline and in the summary (rc 1, not an anonymous count)"
+else
+  fail "a failing shard was not named (rc $RC): $(tr '\n' '|' <<<"$FAILRUN")"
+fi
+rm -rf "$PROBE/tests/zzz-fail"
+
+# ── the SLICE arithmetic over a DERIVED list (#2609 rewired its input) ─────────────────────────
+# The slice code reads the same derived variable as the execution loop, so this pins that the
+# round-robin still deals every suite EXACTLY once across the slices — and, because a count-only
+# assertion is blind to "the right number of the WRONG shards", that the identity check fires on a
+# broken modulus at a width that divides the list evenly (9 shards / 3 slices).
+PROBE2="$TMP/slice-repo"
+mkdir -p "$PROBE2/scripts"
+cp "$RUNNER" "$PROBE2/scripts/runner.sh"
+printf '#!/bin/bash\n:\n' >"$PROBE2/scripts/sweepable.sh"
+for i in 1 2 3 4 5 6 7 8 9; do
+  mkdir -p "$PROBE2/tests/s$i"
+  printf '#!/bin/bash\nexit 0\n' >"$PROBE2/tests/s$i/run.sh"
+done
+SLICE_OK=1
+SLICE_SEEN=""
+for i in 1 2 3; do
+  SLICE_OUT="$( cd "$PROBE2" && BASH_SHARD_SLICE=$i/3 bash scripts/runner.sh 2>&1 )"
+  SLICE_RC=$?
+  SLICE_N="$(grep -c '  ▸' <<<"$SLICE_OUT")"
+  [ "$SLICE_RC" -eq 0 ] || SLICE_OK=0
+  [ "$SLICE_N" = 3 ] || SLICE_OK=0
+  SLICE_SEEN="$SLICE_SEEN$(grep '  ▸' <<<"$SLICE_OUT" | sed 's/.*tests/tests/' | tr '\n' ' ')"
+done
+if [ "$SLICE_OK" -eq 1 ] && [ "$(grep -o 'tests/s[0-9]' <<<"$SLICE_SEEN" | LC_ALL=C sort -u | grep -c .)" = 9 ]; then
+  pass "three slices of a 9-shard derived list run 3 each and cover all 9 (rc 0, no double-run)"
+else
+  fail "slice coverage is wrong (ok=$SLICE_OK, seen: $SLICE_SEEN)"
+fi
+# NON-VACUITY: every slice running slice-1's set keeps the COUNT right (9 % 3 == 0 ⇒ 3 each) and
+# must still fail — on the SET, not on the number.
+awk '{ if ($0 ~ /-eq "\$slice_index" \] && return 1/) { sub(/-eq "\$slice_index"/, "-eq 0"); print; next } print }' \
+  "$RUNNER" >"$PROBE2/scripts/runner-badmod.sh"
+if cmp -s "$RUNNER" "$PROBE2/scripts/runner-badmod.sh"; then
+  fail "the broken-modulus mutation did not change the runner"
+fi
+BADMOD_OUT="$( cd "$PROBE2" && BASH_SHARD_SLICE=2/3 bash scripts/runner-badmod.sh 2>&1 )"
+BADMOD_RC=$?
+if [ "$BADMOD_RC" -eq 1 ] && grep -q 'executed a DIFFERENT SET' <<<"$BADMOD_OUT"; then
+  pass "control: a broken modulus that keeps the COUNT right is caught by the SET assertion"
+else
+  fail "a broken modulus was not caught on the set (rc $BADMOD_RC): $(printf '%s' "$BADMOD_OUT" | tail -2 | tr '\n' '|')"
 fi
 
 echo ""

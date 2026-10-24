@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off runs in ci.yml's dedicated `actionlint` job (PR lane only - no post-merge site, agent-infra#2610); a shard here would be a second run site (#2439)
 # #398 — actionlint gate tests.
 #
 # Verifies scripts/check-workflow-actionlint.sh semantics:
