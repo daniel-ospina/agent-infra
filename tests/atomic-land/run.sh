@@ -2786,7 +2786,9 @@ if true; then
     fi
     # The diagnostic NEAREST the death, not the first: a scenario legitimately kills a rail (7d) and
     # bash prints `Killed` for it, so "the first diagnostic in the log" would point at a fixture doing
-    # its job. awk keeps the LAST match and needs no pipe (a `grep | tail -1` would SIGPIPE).
+    # its job. awk keeps the LAST match in ONE pass, with no pipe and no second read of a file that may
+    # be large. (⛔ Not for SIGPIPE — `tail` reads to EOF and would be safe; the SIGPIPE shape is
+    # `grep -q` closing the pipe early. The reason is one pass, not safety from a signal.)
     diag="$(awk '/syntax error|unbound variable|command not found|Terminated|Killed/{d=$0} END{if (d != "") print d}' "$MUT/$name.log" 2>/dev/null)"
     # ⛔ …AND A LOG WITH NONE OF THOSE PATTERNS IS STILL EVIDENCE. The code this replaced always
     # appended `tail -1`; keeping only the pattern match narrowed the abort path, so `No space left on
@@ -2846,6 +2848,16 @@ if true; then
     case "$_o" in
       *"last diagnostic: "*"No space left on device"*) pass "verdict arm: a log with no known pattern still yields the last diagnostic (the abort is attributable)" ;;
       *) fail "verdict arm: an abort with an unfamiliar log dropped its only evidence (got: $_o)" ;;
+    esac
+    # ⛔ TWO MATCHES, IN THE ORDER A REAL SCENARIO PRODUCES THEM (final review, #2623): every arm above
+    # carries exactly ONE match, so an awk rewritten to keep the FIRST (`if (d=="") d=$0`) would keep
+    # them all green while an abort reverted to the benign `Killed` line a fixture prints legitimately —
+    # misattribution on the one path whose whole job is attribution (#1185).
+    printf 'Killed\nscenario 7d done\nbash: line 7: FOO: unbound variable\n' >"$_sv/twomatch.log"
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=1 mutation_verdict twomatch 1 2>&1)"
+    case "$_o" in
+      *"last diagnostic: "*"unbound variable"*) pass "verdict arm: with TWO matches the report keeps the NEAREST THE DEATH, not the first" ;;
+      *) fail "verdict arm: a two-match log reported the wrong diagnostic (got: $_o)" ;;
     esac
     printf 'Terminated\n' >"$_sv/killed.log"
     _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=2 mutation_verdict killed 137 2>&1)"
