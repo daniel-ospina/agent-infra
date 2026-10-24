@@ -2908,6 +2908,34 @@ grep -q "no failure in test-d" "$TMP/err" && pass "(g) …the JOB SLUG is named 
 grep -q "pr merge" "$SCEN/calls" && fail "(g) a merge was attempted on a PR-unique job-unreadable" \
   || pass "(g) no merge attempted"
 
+# ── the SAME rule for the file-coarse aggregates (#2643), raised in #2648 review ─
+# `failure_file_key` and `main_baseline_units` had no arm for `bash-shard::`/`runner::`,
+# so BOTH fell through to the generic `${1%%::*}` / `s/::.*//` and returned the bare
+# literal `bash-shard` for EVERY shard. Every failing shard then collapsed onto ONE unit:
+# a main baseline red in one shard matched the PR's failure in a DIFFERENT shard and the
+# operator was told the lane was re-measuring main's failure when it was not — the same
+# false conclusion #7131 exists to prevent, one family over. Main is red on
+# `scripts/aa-main.test.sh`; the PR's shard is `scripts/zz-pr.test.sh`, so the PR's unit
+# is NOT on main and must be named as a PATH.
+new_scen bashshard-resid
+sha_bs='aa26430000000000000000000000000000000088'
+printf '%s\n' "$sha_bs" > "$SCEN/head"
+lane_fail "$sha_bs" 7152 > "$SCEN/runs-$sha_bs"
+printf 'bash-suites (1)\tBash shards\t2026-10-24T03:57:16Z ❌ failed shard: scripts/zz-pr.test.sh\n' > "$SCEN/log-7152"
+printf '3\n' > "$SCEN/jobs-count-7152"
+lane_fail mainbs 7153 > "$SCEN/runs-main"
+printf 'bash-suites (1)\tBash shards\t2026-10-24T03:57:16Z ❌ failed shard: scripts/aa-main.test.sh\n' > "$SCEN/log-7153"
+printf '3\n' > "$SCEN/jobs-count-7153"
+run_admin 45 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(h) a PR-unique bash shard BLOCKS (exit $rc)" \
+  || fail "(h) a PR-unique bash shard was certified (exit $rc)"
+grep -q "no failure in bash-shard" "$TMP/err" && fail "(h) the bare 'bash-shard' literal was reported as the unit" \
+  || pass "(h) …never the bare 'bash-shard' literal as a unit"
+grep -q "no failure in scripts/zz-pr.test.sh" "$TMP/err" && pass "(h) …the SHARD PATH is named as the unit" \
+  || fail "(h) a different-shard main baseline was mis-reported: $(grep 'no failure in\|measured on this lane' "$TMP/err" | head -1)"
+grep -q "pr merge" "$SCEN/calls" && fail "(h) a merge was attempted on a PR-unique bash shard" \
+  || pass "(h) no merge attempted"
+
 # And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
 # (This is the case that made the refusals look redundant in review cycle 7.)
 new_scen frc-pin-empty

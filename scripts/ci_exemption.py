@@ -1440,7 +1440,7 @@ _GUARD_INT_RE = re.compile(r"\b\d+\b")
 #: enumerates ALL of them, so the next producer reddens instead of vanishing.
 _NON_NODEID_KEY_RE = re.compile(
     r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py"
-    r"|job-unreadable::[A-Za-z0-9_.\-]+|bash-shard::[A-Za-z0-9_.\-]+"
+    r"|job-unreadable::[A-Za-z0-9_.\-]+|bash-shard::[A-Za-z0-9_./\-]+"
     r"|runner::[A-Za-z0-9_.\-]+)$"
 )
 
@@ -1667,11 +1667,42 @@ _RUNNER_AGG_SIG = "runner-aggregate"
 #: shards too (so keying there would make every green shard a "failure identity" and inflate the
 #: PR's failing set until nothing could ever certify). File-coarse for the same reason the runner
 #: aggregate above is: the shard's internal case names are not stable.
+#:
+#: ⛔ THE TOKEN IS THE PATH, NOT A SLUG OF IT, and that is a CORRECTNESS property, not
+#: cosmetics. `_slug` maps `/` and `-` onto the SAME character, so slugging a path is not
+#: injective: `scripts/a-b.test.sh` and `scripts/a/b.test.sh` both became
+#: `bash-shard::scripts-a-b.test.sh` — two DIFFERENT shards sharing ONE identity. An identity
+#: is what the rail compares against main's baseline, so a shard nobody had ever run could be
+#: exempted on the strength of an unrelated shard's history (measured in #2648 review:
+#: `decide` returned ``exempt`` for the colliding key, and the constant signature cannot save
+#: it because every shard carries the same one). A path is already whitespace-free, so the
+#: slug bought nothing here. `test_bash_shard_identity_is_injective_over_the_listed_shards`
+#: pins it against the runner's real 80-shard list.
 _BASH_SHARD_RE = re.compile(r"^(?:❌|✗)\s*\*{0,2}\s*failed shard:\s*(?P<label>\S.*?)\s*$")
 #: Matched against ``line.replace("**", "")`` for the same reason `_RUNNER_AGG_RE` is
 #: (see :func:`bash_shard_failures`): ONE rendering rule for both `❌`-keyed parsers.
 _BASH_SHARD_KEY_PREFIX = "bash-shard::"
 _BASH_SHARD_SIG = "bash-shard"
+
+#: The charset :data:`_NON_NODEID_KEY_RE` admits for a shard key — a PATH, plus `.`/`-`/`_`.
+#: `/` is admissible because the rate table's constraint is WHITESPACE-FREE (`uniq -c | awk`),
+#: not slash-free.
+_SHARD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./\-]+$")
+
+
+def _shard_token(label: str) -> str:
+    """A whitespace-free, INJECTIVE token for a shard path.
+
+    The path is kept verbatim (see `_BASH_SHARD_RE` for why a slug is not injective). Only
+    whitespace is folded — every one of the runner's 80 listed shards is already
+    `[A-Za-z0-9_./-]+`, so this is a guard rather than a transformation. If a path ever
+    carries a character outside that set, `_slug` is the DECLARED coarsening fallback: it
+    keeps an identity instead of dropping the attribution, and the injectivity assertion in
+    `tests/test_ci_exemption.py` fails for that path, so the coarsening cannot arrive
+    silently.
+    """
+    token = re.sub(r"\s+", "_", label.strip())
+    return token if _SHARD_TOKEN_RE.match(token) else _slug(token)
 
 
 def bash_shard_failures(
@@ -1697,7 +1728,7 @@ def bash_shard_failures(
         m = _BASH_SHARD_RE.match(line.replace("**", ""))
         if m is None:
             continue
-        key = f"{_BASH_SHARD_KEY_PREFIX}{_slug(m.group('label'))}"
+        key = f"{_BASH_SHARD_KEY_PREFIX}{_shard_token(m.group('label'))}"
         ids.append(key)
         signatures[key] = frozenset({_BASH_SHARD_SIG})
     return sorted(set(ids)), signatures

@@ -26,6 +26,7 @@ import pytest
 
 import importlib.util
 import itertools
+import re
 import sys
 from pathlib import Path
 
@@ -2472,13 +2473,13 @@ def test_6798_main_rates_admit_the_non_nodeid_families():
     parsed = parse_rates(
         "watchdog-kill::pytest\t1\t3\n"
         "runner::python-ci\t3\t8\n"
-        "bash-shard::scripts-a.test.sh\t2\t8\n"
+        "bash-shard::scripts/a.test.sh\t2\t8\n"
     )
 
     for key in (
         "watchdog-kill::pytest",
         "runner::python-ci",
-        "bash-shard::scripts-a.test.sh",
+        "bash-shard::scripts/a.test.sh",
     ):
         assert key in parsed.rates, (
             f"main's rate row was dropped for {key!r} (rejected={parsed.rejected}) — with "
@@ -2500,14 +2501,14 @@ def test_6798_main_signature_rows_admit_the_non_nodeid_families():
     sigs = parse_signature_rows(
         "watchdog-kill::pytest\twatchdog-kill\n"
         "runner::python-ci\trunner-aggregate\n"
-        "bash-shard::scripts-a.test.sh\tbash-shard\n"
+        "bash-shard::scripts/a.test.sh\tbash-shard\n"
     )
 
     assert sigs.get("watchdog-kill::pytest") == frozenset({"watchdog-kill"}), (
         "a dropped main signature fails `_signatures_overlap` closed"
     )
     assert sigs.get("runner::python-ci") == frozenset({"runner-aggregate"}), sigs
-    assert sigs.get("bash-shard::scripts-a.test.sh") == frozenset({"bash-shard"}), sigs
+    assert sigs.get("bash-shard::scripts/a.test.sh") == frozenset({"bash-shard"}), sigs
 
 
 # ==========================================================================
@@ -2616,7 +2617,7 @@ _BASH_SHARD_FAIL = "❌ failed shard: scripts/orchestrator-harness/worker-termin
 
 def test_bash_shard_line_yields_an_identity():
     ids, sigs = ci_exemption.bash_shard_failures(_BASH_SHARD_FAIL)
-    assert ids == ["bash-shard::scripts-orchestrator-harness-worker-terminal.test.sh"]
+    assert ids == ["bash-shard::scripts/orchestrator-harness/worker-terminal.test.sh"]
     assert sigs[ids[0]] == frozenset({ci_exemption._BASH_SHARD_SIG})
 
 
@@ -2626,7 +2627,7 @@ def test_bash_shard_ids_door_and_signatures_door_agree():
     parsed_ids = ci_exemption.parse_failed_ids(log, raw_log=True)
     parsed_sigs = ci_exemption.parse_pr_failure_text(log)
     assert parsed_ids.bash_shard == parsed_ids.ids == [
-        "bash-shard::scripts-orchestrator-harness-worker-terminal.test.sh"
+        "bash-shard::scripts/orchestrator-harness/worker-terminal.test.sh"
     ]
     assert parsed_sigs.bash_shard == parsed_sigs.ids == parsed_ids.ids
     assert parsed_sigs.signatures[parsed_ids.ids[0]] == frozenset(
@@ -2715,23 +2716,30 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
 def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
     """Every family this module PRODUCES must be a key the row/rate doors ACCEPT.
 
-    Derived from the module's own `*_KEY_PREFIX` constants, so adding a parser without
-    admitting its key reddens HERE rather than silently converting a red PR into
-    `VERDICT CLEAN blocked=0` (measured in #2648 review for `bash-shard::`, and live for
-    `runner::` before it).
+    Derived from the module's own constants, so adding a parser without admitting its key
+    reddens HERE rather than silently converting a red PR into `VERDICT CLEAN blocked=0`
+    (measured in #2648 review for `bash-shard::`, and live for `runner::` before it).
 
-    Each prefix's KEY SHAPE is declared, not guessed: `guard-step::` carries TWO parts and a
-    one-part key is correctly rejected, so the map is asserted to cover the producer set
+    ⛔ THE DERIVATION IS "any module constant whose value ENDS IN `::`", not "any constant
+    named `*_KEY_PREFIX`". The first version of this vector filtered on the suffix and was
+    40% blind, exactly as #2648's second review measured: this module's own producers are
+    NOT uniformly named that way — `_COLLECT_ERROR_PREFIX` (`:1006`) is a producer with the
+    other naming style, and `watchdog-kill::pytest` is a bare literal. A guard that only
+    sees the suffix cannot see the style the module itself used once already.
+
+    Each family's KEY SHAPE is declared, not guessed: `guard-step::` carries TWO parts and a
+    one-part key is correctly rejected, so the map is asserted to cover the derived set
     EXACTLY — a new family must state its shape here, which is the point.
     """
     shapes = {
         "guard-step::": "guard-step::tests-a.py::test-x",
+        "collect-error::": "collect-error::tests/test_a.py",
         "runner::": "runner::tests-a.test.sh",
-        "bash-shard::": "bash-shard::tests-a.test.sh",
+        "bash-shard::": "bash-shard::tests/a.test.sh",
     }
     producers = {
         v for k, v in vars(ci_exemption).items()
-        if k.endswith("_KEY_PREFIX") and isinstance(v, str) and v
+        if isinstance(v, str) and re.fullmatch(r"[a-z][a-z0-9-]*::", v)
     }
     assert producers == set(shapes), (
         "the producer set and this vector disagree — a family was added or renamed without "
@@ -2748,13 +2756,61 @@ def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
             "then sees an EMPTY PR set and emits `CLEAN blocked=0` for a RED PR — the #6798 "
             "false PASS"
         )
-    # The enumerated families that are not `*_KEY_PREFIX` constants, kept explicit.
-    for key in (
-        "watchdog-kill::pytest",
-        "collect-error::tests/test_a.py",
-        "job-unreadable::bash-suites-1",
-    ):
-        assert is_failure_key(key) and is_failure_key_loose(key), key
+    # The one family with NO prefix constant at all (a bare literal id), kept explicit and
+    # called out so a reader knows it is the residual of the derivation, not an oversight.
+    assert is_failure_key("watchdog-kill::pytest"), "watchdog-kill:: is emitted as a literal"
+    assert is_failure_key_loose("watchdog-kill::pytest"), "watchdog-kill:: is emitted as a literal"
+
+
+def test_bash_shard_identity_is_injective_over_the_listed_shards():
+    """⛔ TWO DIFFERENT SHARDS MUST NOT SHARE ONE IDENTITY (#2648 second review).
+
+    An identity is what the rail compares against main's baseline, so a collision lets a shard
+    nobody has ever run be exempted on the strength of an unrelated shard's history — measured:
+    with the identity slugged, `scripts/a-b.test.sh` and `scripts/a/b.test.sh` both produced
+    `bash-shard::scripts-a-b.test.sh`, and `decide` returned `exempt` for the colliding key.
+    The constant `bash-shard` signature cannot save it, because EVERY shard carries it.
+
+    Read the real list rather than a fixture: this must hold for the shards that actually run,
+    and it is the assertion that fails when a directory is reorganised into a sibling whose
+    slug collides.
+    """
+    src = (Path(__file__).resolve().parent.parent / "scripts/run-bash-shards.sh").read_text()
+    listed = []
+    for line in src.splitlines():
+        line = line.strip()
+        if not line.startswith("run_shard "):
+            continue
+        arg = line.split(None, 1)[1].strip().strip('"').strip("'")
+        if arg.startswith("$") or not arg:
+            continue  # an interpolated or sentinel call, not a listed path
+        listed.append(arg)
+    assert len(listed) >= 60, (
+        f"parsed only {len(listed)} listed shards — the list format changed, so this vector "
+        "would pass vacuously"
+    )
+    ids = {}
+    for path in listed:
+        got, _sigs = ci_exemption.bash_shard_failures(f"❌ failed shard: {path}")
+        assert len(got) == 1, f"{path!r} produced {got!r}"
+        ids.setdefault(got[0], []).append(path)
+        # …and the key must carry no whitespace (the rate table is `uniq -c | awk`).
+        assert re.search(r"\s", got[0]) is None, got[0]
+    collisions = {k: v for k, v in ids.items() if len(v) > 1}
+    assert not collisions, f"distinct shards share one identity: {collisions}"
+    assert len(ids) == len(set(listed)), "the count drifted from the list"
+
+    # ⛔ AND THE HARD PART: the pair that DOES collide under a slug. The scan above is
+    # future-proofing — today's 80 paths happen to slug injectively — so on its own it
+    # passes with the pre-fix code. This pair is one directory move apart (`scripts/a-b`
+    # vs `scripts/a/b`) and is what a re-introduced `_slug` breaks.
+    dash, _ = ci_exemption.bash_shard_failures("❌ failed shard: scripts/a-b.test.sh")
+    slash, _ = ci_exemption.bash_shard_failures("❌ failed shard: scripts/a/b.test.sh")
+    assert dash != slash, (
+        f"two different shards collapsed onto one identity ({dash!r}): the path was slugged, "
+        "so a shard main never ran can be exempted on an unrelated shard's baseline"
+    )
+    assert dash == ["bash-shard::scripts/a-b.test.sh"], dash
 
 
 def test_6798_the_row_door_still_rejects_junk():

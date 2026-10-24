@@ -5049,8 +5049,9 @@ build_evidence() {
 #     "cannot be attributed to this PR", and therefore never a merge), a
 #     guard-step identity (no local runner), and the other non-nodeid families a
 #     local pytest cannot execute (`collect-error::<file>` #6798,
-#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131 — passed as argv
-#     they make pytest exit 4 having run NOTHING). `repro_scope` then
+#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
+#     `bash-shard::<path>` #2643, `runner::<job>` — passed as argv they make
+#     pytest exit 4 having run NOTHING). `repro_scope` then
 #     `repro_candidates` are the one place that decision is made, and the cleared
 #     set is its intersection with the base's own failures (`intersect_sets`,
 #     below);
@@ -5294,12 +5295,22 @@ reproduce_residual_on_base() {
 # Conflating the two makes the base reproduction refuse an id the base itself
 # reproduces as FAILED — the false block #3715 exists to remove (a real
 # regression when this set was widened; caught in review).
+#
+# `bash-shard::<path>` IS here, and is the one aggregate that belongs: the shard IS
+# a file, so main having failed it is a measurement OF that file — the opposite of
+# the `collect-error::` case, where nothing in it ran. `runner::<job>` and
+# `job-unreadable::<slug>` are NOT: an aggregate failure names no file inside the
+# job, so claiming one would be inventing a measurement. Their rows therefore fall
+# through to the generic `s/::.*//` and stay a non-file unit, which can never equal
+# a nodeid's file — fail-closed for clearance, which is why nothing else is needed.
 main_measured_files() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
     sed '/^guard-step::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+    # #2643: the shard path IS the measured file (see the note above).
+    sed -n 's/^bash-shard::\(.*\)$/\1/p' "$mainfails"
   } | sort -u
 }
 
