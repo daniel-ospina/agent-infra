@@ -1601,6 +1601,7 @@ def test_a_brief_gate_refusal_is_a_REFUSAL_not_an_ambiguous_send():
         assert m._send_rc_is_ambiguous(m.SAFE_SEND_RC[rc]) is False, rc
 
 
+@test
 def test_an_ambiguous_send_is_not_blind_retried_but_a_refusal_is():
     """safe-send.sh: rc 3 (REFUSED) means nothing was consumed, so a retry is free; rc 1/4 mean the
     bytes may already be in the composer, and its own comment says "Do NOT blind-retry (that stacks
@@ -5281,8 +5282,11 @@ MUTATIONS = [
      "test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch"),
     # ── cycle-4 defects ──────────────────────────────────────────────────────────────
     ("the refusal decision ignores the exit code, so a lane-busy refusal goes silent",
-     '    if rc in (2, 3):\n        return "refused"', "    if False:\n        return \"refused\"",
+     '    if rc in (2, 3, 78, 80):', "    if False:\n        return \"refused\"",
      "test_a_lane_busy_REFUSAL_is_retried_not_suppressed"),
+    ("the brief gate's own refusal codes fall through to AMBIGUOUS, so one refusal silences an alert forever",
+     '    if rc in (2, 3, 78, 80):', '    if rc in (2, 3):',
+     "test_a_brief_gate_refusal_is_a_REFUSAL_not_an_ambiguous_send"),
     ("a started controller is proved only by the log, never by the heartbeat",
      "        advanced = log_advanced or hb_advanced", "        advanced = log_advanced",
      "test_a_respawn_is_proved_by_the_HEARTBEAT_when_the_log_is_slow"),
