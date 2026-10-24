@@ -28,6 +28,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -272,7 +273,7 @@ def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
         return "", "", 0
 
     monkeypatch.setattr(pr, "sh_err", fake_sh_err)
-    ok, _, record = pr.dispatch(_pr(9), "failing", "brief text", dry=False)
+    ok, _, record = pr.dispatch(_pr(9), "fix-ci", _OK_BRIEF, dry=False)
     assert ok is True and record is True
     assert calls, "dispatch did not invoke the spawn command"
     argv, capture = calls[-1]
@@ -299,6 +300,9 @@ def test_dispatch_does_not_record_a_gate_refusal(tmp_path, monkeypatch):
     # 75 is not a gate refusal. (`test_the_refusal_markers_are_the_gates_own_lines` pins the text.)
     (d / "spawn-gate.sh").write_text(
         'run_agent() { echo "[load-gate] REFUSED bg: load=99 >= max_load=40" >> "$2"; return 75; }\n')
+    # …and the real brief validator, for `_orch`'s reason (#2258): the dispatcher refuses an
+    # unvalidated brief in the foreground, before `run_agent` is ever reached.
+    shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
     wt = tmp_path / "wt"
     wt.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
@@ -309,7 +313,10 @@ def test_dispatch_does_not_record_a_gate_refusal(tmp_path, monkeypatch):
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setenv("O", str(d))
-    ok, detail, record = pr.dispatch(_pr(11), "failing", "brief", dry=False)
+    # ⛔ `fix-ci`, not a placeholder label: `brief()` returns "" for an unknown action, and an EMPTY
+    # brief is refused by the research gate (80) before the stub `run_agent` below is ever reached —
+    # so the 75 this test is about would never be produced (#2258).
+    ok, detail, record = pr.dispatch(_pr(11), "fix-ci", _OK_BRIEF, dry=False)
     assert ok is False and record is False
     assert "refused" in detail.lower() and "75" in detail
 
@@ -328,7 +335,7 @@ def test_dispatch_records_an_unmaterialisable_worktree(tmp_path, monkeypatch):
                             "worktree prd-3/fix/x is dirty -- refusing to reset it", persistent=True)))
     called = []
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: called.append(a) or ("", "", 0))
-    ok, detail, record = pr.dispatch(_pr(3), "failing", "x", dry=False)
+    ok, detail, record = pr.dispatch(_pr(3), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, True)
     assert "dirty" in detail
     assert not called, "nothing must be spawned when the worktree could not be materialised"
@@ -347,7 +354,7 @@ def test_a_TRANSIENT_worktree_failure_is_not_recorded(monkeypatch, tmp_path):
                         lambda p: ("", "cannot materialise fix/x: origin/fix/x could not be "
                                         "fetched (boom)"))
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: ("", "", 0))
-    ok, detail, record = pr.dispatch(_pr(3), "failing", "x", dry=False)
+    ok, detail, record = pr.dispatch(_pr(3), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, False), (ok, detail, record)
 
 
@@ -356,7 +363,7 @@ def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
     monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
-    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "b")
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "failed")
     monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: (False, "gate refused rc=75", False))
@@ -379,7 +386,7 @@ def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
     monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
-    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "b")
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
     logs = []
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
@@ -409,7 +416,7 @@ def test_dispatch_reports_a_failed_worktree_instead_of_spawning(monkeypatch, tmp
                         lambda p: ("", "worktree add failed rc=1: boom"))
     called = []
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: called.append(a) or ("", "", 0))
-    ok, detail, _ = pr.dispatch(_pr(3), "failing", "x", dry=False)
+    ok, detail, _ = pr.dispatch(_pr(3), "fix-ci", _OK_BRIEF, dry=False)
     assert ok is False
     assert "worktree add failed" in detail
     assert not called, "nothing must be spawned when the worktree could not be materialised"
@@ -433,12 +440,18 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     marker = tmp_path / "marker.txt"
     (d / "spawn-gate.sh").write_text(
         'run_agent() { echo "GATED $*" > "$MARK"; sleep 3; echo ran; return 0; }\n')
+    # …and the REAL brief validator, because `nonblocking-dispatch.sh` refuses an unvalidated brief
+    # in the FOREGROUND, before `run_agent` — which is the call this test asserts arrives (#2258).
+    shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
     wt = tmp_path / "wt"
     wt.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     prompt = tmp_path / "brief.txt"
-    prompt.write_text("do the thing\n")
+    # ⛔ A REAL BRIEF, NOT A PLACEHOLDER. `do the thing` is refused by the brief gate (80) before the
+    # dispatcher backgrounds anything, so the routing this test proves would never be exercised.
+    prompt.write_text(subprocess.run(["bash", str(_HARNESS / "brief-gate.sh"), "--section", "worker"],
+                                     capture_output=True, text=True, check=True).stdout)
     env = dict(os.environ, O=str(d), MARK=str(marker))
     nb = _HARNESS / "nonblocking-dispatch.sh"
     t0 = time.monotonic()
@@ -1293,11 +1306,33 @@ _WORKERS = {
 }
 
 
+# ⛔ A BRIEF THE RESEARCH GATE ADMITS (agent-infra#2258). `nonblocking-dispatch.sh` refuses a brief
+# with no research contract in the FOREGROUND (80), so a one-character stub like "b" never reaches
+# the `run_agent` stub these tests install — every one of them would fail on the gate instead of on
+# the behaviour it is about. Rendered from the shipped validator, because it is the same text a real
+# dispatch carries and it cannot drift from the rules that judge it.
+# ⛔ `dispatch(pr, action, TEXT, dry)` TAKES THE ORDER TEXT AS ITS THIRD ARGUMENT — it does not call
+# `brief()`. So a fixture that passed the literal "brief" was dispatching an order of one word, which
+# the research gate now refuses (80) before any worker exists. The literal is replaced with this
+# rendered section at every such call site: the tests are about dispatch/routing/state, and they are
+# only about those if the order is one a real pass would send.
+_OK_BRIEF = subprocess.run(
+    ["bash", str(_HARNESS / "brief-gate.sh"), "--section", "worker"],
+    capture_output=True, text=True, check=True).stdout
+
+
 def _orch(tmp_path, run_agent_body):
     """A private `$O` with a stub `spawn-gate.sh`, and a real git worktree to run in."""
     d = tmp_path / "orch"
     d.mkdir(parents=True, exist_ok=True)
     (d / "spawn-gate.sh").write_text(run_agent_body)
+    # ⛔ AND THE REAL BRIEF VALIDATOR (agent-infra#2258). `nonblocking-dispatch.sh` gates the brief in
+    # the FOREGROUND before it backgrounds anything, and it resolves the validator from `$O` first —
+    # so a private `$O` without it makes the dispatcher exit 78 (cannot verify) and every test below
+    # fails for a reason that has nothing to do with the routing or the promptness they are about.
+    # This is the REAL validator, not a stub: the brief pr-doctor composes must genuinely pass it.
+    (_HARNESS / "brief-gate.sh").is_file(), "the shipped brief validator is missing"
+    shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
     wt = tmp_path / "wt"
     wt.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
@@ -1349,7 +1384,7 @@ def test_dispatch_returns_promptly_whatever_the_worker_does(monkeypatch, tmp_pat
     d, wt = _orch(tmp_path, _WORKERS[label])
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
     t0 = time.monotonic()
-    ok, detail, record = pr.dispatch(_pr(5), "failing", "brief", dry=False)
+    ok, detail, record = pr.dispatch(_pr(5), "fix-ci", _OK_BRIEF, dry=False)
     elapsed = time.monotonic() - t0
     assert ok is True and record is True, (ok, detail)
     assert elapsed < 3.0, "dispatch took %.2fs -- it waited for the worker" % elapsed
@@ -1368,7 +1403,7 @@ def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, t
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(5)])
     monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
-    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "b")
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -1397,11 +1432,11 @@ def test_a_live_worker_is_never_spawned_over(monkeypatch, tmp_path):
     # alive however slow the runner is (nothing waits on it -- it is disowned by the harness).
     d, wt = _orch(tmp_path, "run_agent() { sleep 30; return 0; }\n")
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
-    ok1, detail1, record1 = pr.dispatch(_pr(7), "failing", "brief", dry=False)
+    ok1, detail1, record1 = pr.dispatch(_pr(7), "fix-ci", _OK_BRIEF, dry=False)
     assert ok1 is True and record1 is True, detail1
     before = _artifacts(d)
     assert "pid" in before and "log" in before, before
-    ok2, detail2, record2 = pr.dispatch(_pr(7), "failing", "other brief", dry=False)
+    ok2, detail2, record2 = pr.dispatch(_pr(7), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok2, record2) == (False, False), "a live worker must not be spawned over"
     assert "still running" in detail2
     assert _artifacts(d) == before, "the live worker's pid/log/rc must be untouched"
@@ -1420,7 +1455,7 @@ def test_a_head_change_does_not_bypass_the_live_worker_guard(monkeypatch):
     monkeypatch.setattr(pr, "load_state", lambda: dict(st))
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(7)])
     monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
-    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "b")
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "running")   # prd-7 is alive
     monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: calls.append(p["number"]) or (True, "", True))
@@ -1474,7 +1509,7 @@ def test_adopting_an_unsafe_lane_worktree_refuses_AND_records_a_row(monkeypatch,
     monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     _stub_the_spawn(monkeypatch)
-    ok, detail, record = pr.dispatch(_prb(42, c2, "fix/abc"), "failing", "brief", dry=False)
+    ok, detail, record = pr.dispatch(_prb(42, c2, "fix/abc"), "fix-ci", "brief", dry=False)
     assert (ok, record) == (False, True), (ok, detail, record)
     assert "uncommitted" in detail and str(lane) in detail, detail
     assert (lane / "f.txt").read_text() == "a lane's uncommitted work\n", \
@@ -1493,7 +1528,7 @@ def test_an_adopted_lane_worktree_at_the_pr_head_is_dispatched(monkeypatch, tmp_
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.5)
     seen = _stub_the_spawn(monkeypatch, rc_ok=True)
-    ok, detail, record = pr.dispatch(_prb(42, head, "fix/abc"), "failing", "brief", dry=False)
+    ok, detail, record = pr.dispatch(_prb(42, head, "fix/abc"), "fix-ci", "brief", dry=False)
     assert ok is True and record is True, detail
     assert seen and os.path.realpath(seen[-1][3]) == os.path.realpath(str(lane)), seen
 
@@ -1538,7 +1573,7 @@ def test_a_refusal_split_across_two_writes_is_finally_read(monkeypatch, tmp_path
 
     monkeypatch.setattr(pr, "sh_err", fake_sh_err)
     monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 2.0)
-    ok, detail, record = pr.dispatch(_pr(8), "failing", "brief", dry=False)
+    ok, detail, record = pr.dispatch(_pr(8), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, False), (ok, detail, record)
     assert "75" in detail
 
@@ -1688,7 +1723,7 @@ def test_an_unreadable_worker_status_REFUSES_to_spawn(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "worker_status", lambda name: None)      # --status unanswerable
     spawned = []
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: spawned.append(a) or ("", "", 0))
-    ok, detail, record = pr.dispatch(_pr(12), "failing", "x", dry=False)
+    ok, detail, record = pr.dispatch(_pr(12), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, False)
     assert "liveness" in detail
     assert not spawned, "nothing may be spawned when liveness cannot be read"
@@ -1731,7 +1766,7 @@ def test_a_dispatcher_failure_reports_the_dispatchers_own_stderr(monkeypatch, tm
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "log", lambda m: None)
-    ok, detail, record = pr.dispatch(_pr(13), "failing", "brief", dry=False)
+    ok, detail, record = pr.dispatch(_pr(13), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, False)
     assert "78" in detail and "spawn-gate.sh" in detail, detail
 
@@ -1998,7 +2033,7 @@ def test_dry_run_reports_the_worktree_refusal(monkeypatch, tmp_path):
     for name in ("prd-5", "prd-5-d"):          # both candidates occupied, neither disposable
         (repo / ".worktrees" / name).mkdir(parents=True)
         (repo / ".worktrees" / name / "precious.txt").write_text("work\n")
-    ok, detail, record = pr.dispatch(_prb(5, head, "feat/x"), "failing", "brief", dry=True)
+    ok, detail, record = pr.dispatch(_prb(5, head, "feat/x"), "fix-ci", "brief", dry=True)
     assert ok is False, "a dry run claimed it would spawn although both candidate paths are blocked"
     assert "unusable" in detail
     assert record is False

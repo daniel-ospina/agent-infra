@@ -1630,7 +1630,14 @@ if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped merge-one.
   cat > "$TMP/ra.sh" <<SH
 pi() { sleep 60; }
 . "$TMP/runagent.sh"
-start=\$(date +%s); run_agent 2 "$TMP/ra.log" /dev/null; rc=\$?; end=\$(date +%s)
+# ⛔ THE PROMPT IS A REAL BRIEF, NOT /dev/null (agent-infra#2258). run_agent now refuses a brief with
+# no research contract (80) BEFORE it spawns, so this arm's `/dev/null` would make the shipped
+# run_agent return 80 without ever launching `pi` — and the assertion below ("it ran, and was cut off
+# at the wall limit") would fail for a reason that has nothing to do with the timeout it exists to
+# test. Rendering the canonical block keeps the fixture HONEST: the function under test still gets a
+# brief of the shape a real dispatch carries.
+brief_gate_sh="$HERE/brief-gate.sh"; bash "\$brief_gate_sh" --section reviewer > "$TMP/ra-brief.txt"
+start=\$(date +%s); run_agent 2 "$TMP/ra.log" "$TMP/ra-brief.txt"; rc=\$?; end=\$(date +%s)
 echo "\$((end-start)) \$rc"
 SH
   ra="$(bash "$TMP/ra.sh" 2>/dev/null | tail -1)"

@@ -24,7 +24,18 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 GATE="$HERE/spawn-gate.sh"
 mkdir -p "$TMP/bin" "$TMP/O/state"
 LOG="$TMP/log"; PROMPT="$TMP/prompt"; PI_LOG="$TMP/pi.log"; MERGE_LOG="$TMP/merge.log"
-printf 'a prompt\n' > "$PROMPT"
+# ⛔ THE FIXTURE IS A REAL BRIEF NOW (agent-infra#2258). `run_agent` refuses a brief that carries no
+# research contract (AGENT_BRIEF_REFUSED, 80) BEFORE it reads load or disk, so a fixture of
+# `printf 'a prompt\n'` would turn every control below into a brief refusal and the load/disk
+# assertions would pass while testing nothing. Rendering the canonical block from the shipped helper
+# keeps this suite's fixture HONEST (it is the same text a real dispatch carries) and pins the gate's
+# own advice as admissible — if the canonical block ever stopped satisfying the validator, this line
+# fails here rather than in production.
+PROMPT_SECTION="$(bash "$HERE/brief-gate.sh" --section lane 2>/dev/null)"
+[ -n "$PROMPT_SECTION" ] || { echo "  ❌ brief-gate.sh --section produced nothing — cannot build a valid fixture" >&2; exit 1; }
+{ printf 'a prompt for a lane\n\n'; printf '%s\n' "$PROMPT_SECTION"; } > "$PROMPT"
+bash "$HERE/brief-gate.sh" --check "$PROMPT" lane 2>/dev/null \
+  || { echo "  ❌ the suite's own fixture brief is REFUSED by the gate — the fixture is not a brief" >&2; exit 1; }
 
 echo "==> spawn-gate self-test ($HERE)"
 
@@ -526,6 +537,12 @@ ck "fix-one.sh NAMES the load gate on a load refusal — the disk wording is not
 # tracks the file under test instead of re-implementing a pre-fix helper by hand.
 mkdir -p "$RIG/stale"
 cp "$HERE/fix-one.sh" "$RIG/stale/"
+# ⛔ THE VALIDATOR TRAVELS WITH THE STALE HELPER, AND THAT IS NOT A WEAKENING (#2258). What is stale
+# here is `spawn-gate.sh`'s refusal CONSTANTS, not the brief rules: a fixture that omitted
+# `brief-gate.sh` would make fix-one.sh exit 78 (cannot verify) and this arm would read "78" as the
+# stale-helper behaviour it is meant to test — passing for the wrong reason. The fixer's dependency on
+# the validator is the same class as its dependency on spawn-gate.sh.
+cp "$HERE/brief-gate.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
     "$HERE/spawn-gate.sh" > "$RIG/stale/spawn-gate.sh"
@@ -612,6 +629,10 @@ ck "the fixer's disk reading is the WORKTREE volume, not the main checkout (path
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
+# …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
+# `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
+# of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
+cp "$HERE/brief-gate.sh" "$RO/"
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
@@ -1598,7 +1619,16 @@ ck "…and its replay line contains no git-apply invocation at all" $rc
 # a real dispatch, a worker killed at a 1 s cap, and the status line read back.
 BG="$CAPRIG/bg"; mkdir -p "$BG/logs" "$BG/state"
 cap_clean; cap_dirty
-printf 'a prompt\n' > "$BG/prompt"
+# ⛔ THIS FIXTURE IS GATED TOO (review cycle 4, P1). `nonblocking-dispatch.sh` runs the research-first
+# gate in the FOREGROUND, so a bare `a prompt` brief is refused with 80 and NO worker is ever started —
+# the three cap-kill arms below then read "lost (no exit status recorded)" and assert a cap kill on a
+# dispatch that never happened. MEASURED: 165 passed / 3 failed, and the same rc/status string reproduced
+# standalone. Rendered from the validator with the role the dispatcher gates on (`worker`, i.e. KIND=bg),
+# and asserted at BUILD time: a fixture that drifts must fail here, by name, not three arms later as a
+# mysterious "lost" lane.
+{ printf 'a prompt for a background worker\n\n'; bash "$HERE/brief-gate.sh" --section worker; } > "$BG/prompt"
+bash "$HERE/brief-gate.sh" --check "$BG/prompt" worker 2>/dev/null \
+  || { echo "  ❌ the cap-kill fixture brief is REFUSED by the research-first gate" >&2; exit 1; }
 pi() { sleep 30; }            # exported: a FUNCTION beats the launcher's own PATH prepend (#1828)
 export -f pi
 ( cd "$CWT" && O="$BG" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 \
