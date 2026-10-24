@@ -2176,8 +2176,9 @@ is met.
   live there). The harness repo is resolved in four steps, because the FIRST TWO are absent in the
   configuration this file installs: `HARNESS_REPO`, then the checkout containing `$O`, then **the
   checkout containing this script** (in a repo checkout that is the repo root; a FLAT deploy —
-  `install.sh` puts `merge-reminder.py` straight into `$O` — makes `parents[2]` the payload's
-  grandparent, which is NOT the payload, so a flat deploy depends on `HARNESS_REPO`/`$O`), then
+  `deploy-harness.sh`/an operator's `cp`, not `install.sh`, puts `merge-reminder.py` straight into `$O`
+  — makes `parents[2]` the payload's grandparent, which is NOT the payload, so a flat deploy depends on
+  `HARNESS_REPO`/`$O`), then
   `$HOME/orchestrator`. Every candidate must CARRY the
   harness — `scripts/orchestrator-harness/box-status.sh` **tracked by that candidate's own repo** — so
   neither a checkout that is merely *some* repo nor a checkout that only *reaches* the harness through

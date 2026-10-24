@@ -11,7 +11,8 @@
 #   harness: <sha12> [current|behind|ahead|diverged|unknown] source=<pin|stamp|none>
 #   stamp: <sha12|UNRECORDED>    pin: <sha12|EMPTY>
 #   controller: RUNNING(pid <p>) | STOPPED | UNKNOWN
-#   running: <sha12> | NONE | UNREADABLE | MIXED
+#   running: <sha12> | NONE | UNREADABLE | MIXED          (a relative controller path is resolved
+#                                                        against the CONTROLLER's cwd, or UNREADABLE)
 #   roles: idle | busy:<role>(pid=<p>,age=<s>) …
 #
 # Exit: 0 = read; 2 = CANNOT VERIFY (a harness identity or the process table could not be read).
@@ -220,7 +221,23 @@ if [ -n "$ctrl" ]; then
       # (below), never a silently wrong tree. macOS lands here: `/proc` does not exist.
       cmd="$(ps -p "$pid" -o command= 2>/dev/null)"
       for w in $cmd; do case "$w" in */orch-loop.sh) script="$w" ;; esac; done
+      # The flattened fallback cannot tell a relative element from a fragment, and resolving it against
+      # OUR cwd is exactly the wrong-tree defect above: an unresolved relative path is UNREADABLE.
+      case "$script" in /*) : ;; *) [ -n "$script" ] && script="" ;; esac
     fi
+    [ -n "$script" ] || continue
+    # ⛔ A RELATIVE SCRIPT PATH RESOLVES AGAINST THE **CONTROLLER's** CWD, NOT OURS (round-3 review
+    # follow-up, measured: a controller started as `bash ./orch-loop.sh` in tree A, with this probe run
+    # from tree B, printed `running: <B's HEAD>` — a wrong tree, which is the one thing this reader must
+    # never do while the README claims it cannot). `/proc/<pid>/cwd` is the process's own working
+    # directory; if it cannot be read the answer is UNREADABLE (below), never a guess.
+    case "$script" in
+      /*) : ;;
+      *)  pcwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+          if [ -n "$pcwd" ]; then script="$pcwd/${script#./}"
+          else script=""   # unresolvable: falls through to UNREADABLE, never to our own cwd
+          fi ;;
+    esac
     [ -n "$script" ] || continue
     s="$(git -C "$(dirname "$script")" rev-parse HEAD 2>/dev/null | head -1)"
     is_sha "${s:-}" && running_ids="$running_ids $s"

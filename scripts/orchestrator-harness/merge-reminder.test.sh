@@ -2707,7 +2707,8 @@ for t in rt-a rt-b; do
   git -C "$FX/$t" config user.name t
   mkdir -p "$FX/$t/scripts/orchestrator-harness"
   : > "$FX/$t/scripts/orchestrator-harness/box-status.sh"
-  printf '#!/usr/bin/env bash\n' > "$FX/$t/scripts/orchestrator-harness/orch-loop.sh"
+  # `sleep` is the controller body: a real process is what the relative-argv case below needs.
+  printf '#!/usr/bin/env bash\nsleep 120\n' > "$FX/$t/scripts/orchestrator-harness/orch-loop.sh"
   git -C "$FX/$t" add -A
   git -C "$FX/$t" commit --quiet -m "$t"
 done
@@ -2769,8 +2770,16 @@ SPACED_PID=$!
 # REPLACES it, so every run leaked its whole fixture tree (round-3 review). The controller is killed
 # explicitly below, and it is a bounded `sleep`, so an interrupted run leaves a short-lived process at
 # worst — never a fixture directory.
-ck "§27b the spaced-path controller really is running with a SPACE in its argv" \
-   "$([ -d "/proc/$SPACED_PID" ] && grep -q "rt a" "/proc/$SPACED_PID/cmdline" 2>/dev/null && echo 0 || echo 1)"
+# ⛔ POLL, DO NOT RACE THE `fork`/`exec` WINDOW. Immediately after `&` the child's `/proc/<pid>/cmdline`
+# can still be the bare `bash` — the exec has not happened yet — and under load (a parallel selftest run
+# on this box) that window is wide enough to read the fixture as a FAILURE that is really a timing
+# artifact. 2 s in 50 ms steps: the argv is stable once exec lands.
+spaced_ready=1
+for _ in $(seq 1 40); do
+  if grep -q "rt a" "/proc/$SPACED_PID/cmdline" 2>/dev/null; then spaced_ready=0; break; fi
+  sleep 0.05
+done
+ck "§27b the spaced-path controller really is running with a SPACE in its argv" "$spaced_ready"
 out="$(run_box "$SPACED_PID bash $SPACED/scripts/orchestrator-harness/orch-loop.sh")"
 ck "§27b box-status: an argv element with a SPACE resolves to its commit, not UNREADABLE" \
    "$(grep -qx "running: $SPACED_SHA" <<<"$out" && echo 0 || echo 1)"
@@ -2820,7 +2829,32 @@ ck "§27b the flat-copy probe really is outside every checkout (its own checkout
 # one; none of the three may be adopted, and the flat copy's own directory is not a checkout at all. The
 # answer is UNRESOLVED with the reason, never a foreign `origin/main`.
 ck "§27b box-status skips EVERY non-harness candidate (env, \$O, \$HOME/orchestrator) and says why" \
-   "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+   "$(! grep -q '^ref: origin/main=' <<<"$out" && grep -q '^ref: UNRESOLVED (' <<<"$out" && grep -q 'not TRACKED there' <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ A RELATIVE CONTROLLER PATH RESOLVES AGAINST THE **CONTROLLER's** CWD, NOT THE READER's (round-3
+# review follow-up, measured on the real fleet shape: a controller started as `bash ./orch-loop.sh` in
+# tree A, with the probe run from tree B, printed `running: <B's HEAD>` — a WRONG tree, which is the one
+# thing this reader must never produce while the README promises it cannot). Driven with a REAL process
+# started by relative path from tree A, while the probe runs from tree B.
+( cd "$FX/rt-a" && exec bash ./scripts/orchestrator-harness/orch-loop.sh ) >/dev/null 2>&1 &
+REL_PID=$!
+# `cmdline` is NUL-SEPARATED, so the field is compared whole (a pattern spanning "bash" and the path can
+# never match the raw file — the very mistake this reader's `/proc` fix is about).
+rel_ready=1
+for _ in $(seq 1 40); do
+  if tr '\0' '\n' < "/proc/$REL_PID/cmdline" 2>/dev/null | grep -qx './scripts/orchestrator-harness/orch-loop.sh'; then
+    rel_ready=0; break
+  fi
+  sleep 0.05
+done
+ck "§27b the relative-argv controller really runs with a RELATIVE argv" "$rel_ready"
+printf '%s bash ./scripts/orchestrator-harness/orch-loop.sh\n' "$REL_PID" > "$FX/ps-rt.txt"
+out="$( cd "$FX/rt-b" && env FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" PATH="$TMP:/usr/bin:/bin:/usr/local/bin" \
+  bash "$BOX" --o "$O" --repo "$FX/rt-b" 2>&1)"
+ck "§27b ...and \`running:\` names the CONTROLLER's tree ($RTA), not the reader's cwd ($RTB)" \
+   "$(grep -qx "running: $RTA" <<<"$out" && ! grep -qx "running: $RTB" <<<"$out" && echo 0 || echo 1)"
+kill "$REL_PID" 2>/dev/null
+wait "$REL_PID" 2>/dev/null
 
 # ⛔ THE CANONICAL CHECKOUT SHAPE, WHICH A PATH-EXISTENCE TEST RE-ADMITTED (round-3 review, BLOCKING).
 # Every tortoise/eldato checkout carries a GITIGNORED `scripts -> $AGENT_INFRA_PATH/scripts` pointer
@@ -2862,13 +2896,22 @@ out="$(env REPO= HARNESS_REPO="$SHAPED" HOME="$TMP/home" FIXTURE="$FX" HARNESS_P
 ck "§27b box-status REFUSES the same shape and names the pointer as the reason" \
    "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'not TRACKED there' <<<"$out" && echo 0 || echo 1)"
 
-# ⛔ A SUBDIRECTORY CANDIDATE. `harness-refresh.sh` and `check-deployed-drift.sh` accept a subdir for
-# `HARNESS_REPO`, so both readers normalise to `--show-toplevel`; a reader that tested the literal path
-# would refuse what the other accepts and the deploy probe would read CANNOT VERIFY forever.
-out="$(env REPO= HARNESS_REPO="$HERE_TOP/scripts" HOME="$TMP/home" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
-  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$BOX" --o "$TMP/o" 2>&1)"
-ck "§27b box-status normalises a SUBDIRECTORY candidate to its toplevel (accepted, not refused)" \
-   "$(! grep -q '^ref: UNRESOLVED' <<<"$out" && echo 0 || echo 1)"
+# ⛔ A SUBDIRECTORY CANDIDATE — DRIVEN FROM THE FLAT COPY, BECAUSE THAT IS THE ONLY PLACE THE QUESTION IS
+# VISIBLE (round-3 review, BLOCKING: the first version of this case ran `$BOX`, whose own checkout IS the
+# harness, so candidate 3 printed a `ref:` line and the case passed whether the subdir was accepted or
+# refused — i.e. a regression to a literal-path marker shipped green).
+# `harness-refresh.sh` and `check-deployed-drift.sh` accept a subdir for `HARNESS_REPO`; a reader that
+# tested the literal path would refuse it and the deploy probe would read CANNOT VERIFY forever.
+out="$(env REPO= HARNESS_REPO="$HERE_TOP/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b box-status ACCEPTS a SUBDIRECTORY candidate of the harness repo" \
+   "$(grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+# ...and the negative control: a path that IS a subdirectory shape but is not a harness path at all is
+# refused, so "accepted" is about the marker and not about stripping path components.
+out="$(env REPO= HARNESS_REPO="$HERE_TOP/scripts/nope" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b ...and refuses a path that only LOOKS like one, so acceptance is about the marker" \
+   "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
 echo "-- §28 the arm the list endpoint had made inert"
