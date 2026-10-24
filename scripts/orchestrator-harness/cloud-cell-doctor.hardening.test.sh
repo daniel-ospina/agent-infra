@@ -301,7 +301,7 @@ cat > "$T/bin/lane-reap" <<'SH'
 printf '%s\n' "$*" >> "${DOCTOR_TEST_LANE_REAP:?}/calls"
 case "${1:-}" in
   count) printf 'lanes=1/1 zombie=0\n' ;;
-  reap)  printf 'lane-reap: trees=1/1 zombie=0 candidates=0 reaped=0 refused=0 inert=0 unidentifiable=0 abstained=0 mode=%s\n' "${2:-dry-run}" ;;
+  reap)  printf 'lane-reap: trees=1/1 zombie=0 candidates=0 reaped=0 refused=0 inert=0 unidentifiable=0 abstained=0 mode=%s\n' "$([ "${2:-}" = "--apply" ] && echo apply || echo dry-run)" ;;
 esac
 exit 0
 SH
@@ -351,7 +351,7 @@ doc() { # <role> [extra env assignments via env]
 }
 reset_tmux() { rm -f "$T/tmux/sessions" "$T/tmux/killed" "$T/tmux/new-session" "$T/tmux/refuse-kill" "$T/tmux/fail-ls" "$T/tmux/fail-ls-after-kill" "$T/tmux/no-server" "$T/tmux/no-server-after-kill" "$T/tmux/no-socket" "$T/tmux/fail-clients" "$T/tmux/slow-ls" "$T/tmux/fail-panes" "$T/tmux/end-after-list" "$T/tmux/end-after-clients" "$T/tmux/stop-midpass" "$T/tmux/ls-calls"; touch "$T/tmux/sessions"; }
 reset_ps()   { rm -f "$T/ps/calls" "$T/ps/mode" "$T/ps/pfail" "$T/ps/pfail-ppid" "$T/ps/args."* "$T/ps/lstart."*; rm -f "$T/stat/fail" "$T/gh/slow"; }
-reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; }
+reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; rm -f "$T/lane-reap/calls"; }
 # ⛔ The pane pid is a process THIS SUITE owns, never a literal. After the lstart fence the reaper
 # signals the pane pid it measured, and the `ps` double returns a constant `lstart` for any pid with
 # no file — so the fence always passes and a literal fixture pid (4242, 4747, 4848 …) is a request to
@@ -664,6 +664,16 @@ say_case "a fresh box (no server ever started) is an EMPTY list, not cannot-veri
 reset_tmux; reset_ps; reset_state
 : > "$T/tmux/no-socket"
 doc reap
+# ⛔ THE DELEGATION IS THE CONTRACT THIS SUITE PINS (#2163 review, cycle 6): with the census doubled
+# above, nothing here would go red if the doctor stopped calling `lane-reap.sh` at all — i.e. if the
+# population the session pass cannot see went unjudged again, which is the class #2163 exists for.
+# These two legs are the sibling suite's (`cloud-cell-doctor.test.sh`), copied because the seam moved.
+grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null \
+  && ok "reap: read the evidence census (count)" \
+  || bad "reap: the census was NOT read — $(cat "$T/lane-reap/calls" 2>/dev/null | tr '\n' ' ')"
+grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null \
+  && ok "reap: delegated the process pass ARMED (reap --apply)" \
+  || bad "reap: the process pass was not delegated armed — $(cat "$T/lane-reap/calls" 2>/dev/null | tr '\n' ' ')"
 [ "$RC" -eq 0 ] && ok "reap: rc=0 on a box with no tmux server yet" || bad "reap: rc=$RC on a fresh box (want 0) — $OUT"
 result_has "seen=0" && ok "reap: reports an empty namespace (seen=0, rc=0)" || bad "reap: the empty namespace is not reported — $OUT"
 case "$OUT" in *"cannot-verify"*|*"CANNOT-VERIFY"*) bad "reap: a fresh box is reported as cannot-verify — $OUT" ;; *) ok "reap: a fresh box is not cannot-verify (that row would never clear)" ;; esac

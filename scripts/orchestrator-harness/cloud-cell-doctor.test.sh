@@ -227,7 +227,12 @@ case "${1:-}" in
   # ⛔ The two answers carry DIFFERENT tokens (#2163 review, P2). When both printed
   # `lanes=1/2 zombie=0`, deleting the `count` call would still leave the census assertion green —
   # a check that could not go red. `count` is the only producer of `lanes=`; `reap` says `trees=`.
-  count) printf 'lanes=3/7 zombie=2\n' ;;
+  # DOCTOR_TEST_REAP_CENSUS=unreadable models the abstention the DOCTOR must escalate on: the reaper
+  # could not take the read, so it prints `?` and exits 3. Without this seam the doctor's own
+  # `lanes=?/?` → rc=3 arms (cloud-cell-doctor.sh:926-933) were untested — delete either and an
+  # unreadable census rendered as a clean pass (#2163 review P2, cycle 6).
+  count) if [ "${DOCTOR_TEST_REAP_CENSUS:-}" = "unreadable" ]; then printf 'lanes=?/? zombie=?\n'; exit 3; fi
+         printf 'lanes=3/7 zombie=2\n' ;;
   # DOCTOR_TEST_REAP_ABSTAIN models a pass that could not JUDGE every tree: the reaper's own
   # `abstained=` counter is the only token that distinguishes it from an idle one.
   # DOCTOR_TEST_REAP_INERT models the CELL shape: a pass that judged NO tree while refusing every
@@ -239,7 +244,7 @@ case "${1:-}" in
   # DOCTOR_TEST_REAP_REFUSAL adds the per-tree refusal LINE, which `tail -1` used to discard.
   reap)  [ -n "${DOCTOR_TEST_REAP_REFUSAL:-}" ] && printf '  REFUSE root=99 log=/x/L-a.log — %s\n' "$DOCTOR_TEST_REAP_REFUSAL"
          printf 'lane-reap: trees=%s zombie=0 candidates=0 reaped=0 refused=1 inert=%s unidentifiable=%s abstained=%s mode=%s\n' \
-           "${DOCTOR_TEST_REAP_TREES:-1/2}" "${DOCTOR_TEST_REAP_INERT:-0}" "${DOCTOR_TEST_REAP_UNIDENT:-0}" "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "${2:-dry-run}" ;;
+           "${DOCTOR_TEST_REAP_TREES:-1/2}" "${DOCTOR_TEST_REAP_INERT:-0}" "${DOCTOR_TEST_REAP_UNIDENT:-0}" "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "$([ "${2:-}" = "--apply" ] && echo apply || echo dry-run)" ;;
 esac
 exit 0
 SH
@@ -320,6 +325,19 @@ DOCTOR_TEST_REAP_ABSTAIN=2 doc reap
 grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null && ok "reap-abstain: the pass was still delegated" || bad "reap-abstain: the process pass was not delegated — $(cat "$T/lane-reap/calls" 2>/dev/null)"
 [ "$RC" -eq 3 ] && ok "reap-abstain: rc=3 (a safety read failed)" || bad "reap-abstain: rc=$RC — an abstaining pass read as clean — $OUT"
 result_has "abstained=2" && ok "reap-abstain: the abstention count is in the pass line" || bad "reap-abstain: the abstention count is missing — $OUT"
+
+# ── 1a2b) an UNREADABLE census is unverifiable, not a clean pass ────────────────────────────────
+# ⛔ THE DOCTOR'S OWN ARM (#2163 review, cycle 6). `DOCTOR_TEST_REAP_ABSTAIN`/`INERT`/`TREES` drive the
+# REAP PASS line's fields; nothing drove the `count` read, so deleting either `pass_rc=3` in the doctor's
+# census classifier (cloud-cell-doctor.sh:926-933) left this suite green and an unreadable census
+# rendered as `lanes=?/? zombie=?` at rc=0 — the exact false PASS the arm's own comment names.
+say_case "an UNREADABLE lane census is cannot-verify (rc=3), never a clean pass"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_CENSUS=unreadable doc reap
+[ "$RC" -eq 3 ] && ok "census-abstain: rc=3 (the census could not be read)" || bad "census-abstain: rc=$RC — an unreadable census read as a clean pass — $OUT"
+result_has "lanes=?/?" && ok "census-abstain: the pass line says ?/? rather than a fabricated 0" || bad "census-abstain: the census is not reported as unknown — $OUT"
+grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null && ok "census-abstain: the census was actually READ (the leg is not vacuous)" || bad "census-abstain: no count call — this arm cannot have fired"
 
 # ── 1a3) a process pass that judged NOTHING is unverifiable, not a health record ──────────────
 # ⛔ THE CELL SHAPE (#2163 review r3, P2). On a cell every lane is `ancestry-unknown`, so the armed
