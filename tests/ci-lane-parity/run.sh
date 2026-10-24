@@ -43,6 +43,17 @@
 # never `OUT="$(… bash …)"` — the main-worktree-guard content walker (#1484) refuses to execute
 # a script that wraps a shell invocation in a command substitution, reporting it as an
 # unsanctioned git operation even with zero git in the file. Evidence: issue #1122.
+#
+# NOTE ON STYLE (2): every "does this output contain X" test here is `grep -q 'X' <<<"$OUT"`,
+# NEVER a `printf`-piped-into-`grep -q` pipeline. This script runs under `set -o pipefail`, so when
+# `grep -q` exits at its first match while the writer is still pushing bytes, the writer takes
+# SIGPIPE and the PIPELINE status becomes non-zero — the `if` then takes its else branch and
+# reports a FALSE FAILURE on a payload that was there all along. `scripts/check-no-sigpipe-grep.sh`
+# records the class (#841) and its sanctioned fix (a here-string, which bash backs with a temp file
+# so no writer is left to kill). That guard's default scan set is `scripts .husky pi-bootstrap`, so
+# it cannot see this file — measured 2026-10-23: arm 2's piped form false-failed 13 times in 200
+# iterations on an untouched `origin/main` tree, and 0 times in 200 with the here-string. A spurious
+# red in the suite that gates the guard is a merge stall, not a nit.
 
 set -uo pipefail
 
@@ -63,15 +74,59 @@ fail() { checks=$((checks + 1)); echo "   ❌ $1"; failures=$((failures + 1)); }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# A FAST copy of the runner (long shards dropped) for the runtime-mutation pins: they must
-# exercise the runner's own self-checks, not spend ten minutes running the real suites.
-# `scripts/heartbeat-loop.test.sh` is on the list because this script RUNS the fast copy four times
-# (below) and that shard is ~29 real one-pass loop launches (~10 s measured): it would otherwise
-# cost ~40 s of pure duplication per lane, and a sabotage pin learns nothing from it (review
-# advisory, #1954).
-grep -v -e 'pi-reap-idle' -e 'pi-task-session-prune' -e 'pi-reap-worktrees' -e 'install-launchd' \
-  -e 'test-setup-no-nesting' -e 'scratch-worktree' -e 'tests/admin-merge' -e 'tests/atomic-land' \
-  -e 'tests/gh-shim' -e 'tests/search-cost' -e 'heartbeat-loop' "$RUNNER" >"$TMP/runner-fast.sh"
+# ── THE FIXTURE the runtime-mutation pins (8d, 8e, 8h, 8n, 8q) execute ────────────────────────
+#
+# Those pins assert properties of the RUNNER's own code — the `listed == executed` arithmetic, the
+# failure-recording sentinel, the sweep counter, the refusal of a symlinked/out-of-repo target.
+# Every one of them is a function of the runner's LOGIC, not of which suites its list happens to
+# name. So the fixture rewrites every `run_shard <path>` line to ONE committed, hermetic stand-in
+# (`tests/ci-lane-parity/stand-in-shard.sh` — a single `exit 0`) and keeps the rest byte-identical.
+#
+# ⛔ WHY THE REAL LIST IS NOT RUN HERE (this is the whole cost of this suite, measured 2026-10-23).
+# Until this line changed, the fixture was the runner's own list with a few slow shards grepped
+# out (`runner-fast.sh`), and the pins executed it THREE times (8h, 8d, 8e) — after #2414 had
+# already stopped 8n/8q pointing at a repo-wide guard whose verdict cost ~9.6 s per invocation.
+# On `origin/main` (`6ae9d509`) that made this suite take 23m37s while its ~180 static arms ran in
+# under 40 s; the three fixture executions were the other 23 minutes, all of it RE-RUNNING suites
+# that the lane's own `Bash shards` step already runs on the same commit (#2439 recorded the same
+# duplicate-work class for other folded jobs).
+#
+# ⛔ AND IT WAS NOT ONLY SLOW, IT WAS NOISY. A fixture built from the real list inherits every real
+# shard's verdict on the RUNNER'S machine, so an unrelated red (measured here: `reap-lane-venvs`
+# `❌ O3 the summary reports reaped=1`) reds a fixture whose pins expect rc 0 — `#2414` is the same
+# failure one layer out (`sigpipe-grep-guard`'s verdict reddened 8n's CONTROL arm and the message
+# blamed the fixture). An inert stand-in cannot move for a reason this file does not name.
+#
+# Keep `CHEAP` pointed at something hermetic: its rc must depend on nothing but itself.
+CHEAP="tests/ci-lane-parity/stand-in-shard.sh"
+awk -v cheap="$CHEAP" '
+  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-cheap.sh"
+
+# Every fixture execution that walks the WHOLE list goes through this bound: 8d, 8e, 8h, and 8n's
+# pair. Arms 8q and 8r rebuild the runner with every run_shard line already rewritten to CHEAP, and
+# the two symlink arms run a three-line stub — those four are inert by construction and carry no
+# bound. The split is stated rather than implied so that a fixture added here knows which it is
+# (review finding, cycle 1: the comment used to claim that EVERY fixture was bounded). A bound can
+# only ever fire on a genuine hang, and then it is a NAMED red (rc 124), never silence.
+# That is #2299's ask: `bash-suites` was measured stuck inside this suite for 90+ minutes with no
+# step progress, and a 600 s local run terminated at the same arm, reported as an unrelated red.
+# `timeout` is GNU; macOS has `gtimeout` (coreutils) or neither — with neither, the bound is absent
+# and this suite still fails closed on every assertion below (the fixture itself can no longer hang).
+if command -v timeout >/dev/null 2>&1; then
+  FIXTURE_BOUND="timeout 120"
+elif command -v gtimeout >/dev/null 2>&1; then
+  FIXTURE_BOUND="gtimeout 120"
+else
+  FIXTURE_BOUND=""
+fi
+# ⛔ The bound is applied INLINE at each call site (`$FIXTURE_BOUND bash "$TMP/…"`), never through
+# a helper taking the script as `$1`: `extensions/main-worktree-guard` treats a script invocation
+# whose path is an UNRESOLVABLE expansion (`bash "$1"`) as "this file may discard anywhere" and
+# fails closed, so wrapping the fixtures in such a helper makes every gated lane command that runs
+# this suite refuse — a false block on the very gate this suite protects (measured while writing
+# this change, #709/#1885).
 
 OUT=""
 RC=0
@@ -119,7 +174,7 @@ if cmp -s "$PR" "$TMP/ci-pr-drop.yml"; then
   fail "the PR-drop mutation did not change the file"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-drop.yml"
-  if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'PR lane'; then
+  if [ "$RC" -eq 1 ] && grep -q 'PR lane' <<<"$OUT"; then
     pass "the guard FAILS (rc 1) and names the PR lane when its call is gone"
   else
     fail "guard returned rc $RC (want 1, naming the PR lane): $OUT"
@@ -133,7 +188,7 @@ if cmp -s "$MAIN" "$TMP/ci-main-drop.yml"; then
   fail "the main-drop mutation did not change the file"
 else
   guard_rc "$TMP/ci-main-drop.yml" "$PR"
-  if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'main lane'; then
+  if [ "$RC" -eq 1 ] && grep -q 'main lane' <<<"$OUT"; then
     pass "the guard FAILS (rc 1) and names the main lane when its call is gone"
   else
     fail "guard returned rc $RC (want 1, naming the main lane): $OUT"
@@ -185,7 +240,7 @@ if cmp -s "$RUNNER" "$TMP/runner-gutted.sh"; then
   fail "the gutted-runner mutation did not change the file"
 else
   guard_rc "$MAIN" "$PR" "$TMP/runner-gutted.sh"
-  if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q 'shard(s) (floor'; then
+  if [ "$RC" -eq 2 ] && grep -q 'shard(s) (floor' <<<"$OUT"; then
     pass "a gutted runner exits 2 and names the floor (rc 2)"
   else
     fail "a gutted runner returned rc $RC (want 2, naming the floor): $OUT"
@@ -203,7 +258,7 @@ if cmp -s "$RUNNER" "$TMP/runner-nosweep.sh"; then
   fail "the no-sweep mutation did not change the file"
 else
   guard_rc "$MAIN" "$PR" "$TMP/runner-nosweep.sh"
-  if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q 'syntax target'; then
+  if [ "$RC" -eq 2 ] && grep -q 'syntax target' <<<"$OUT"; then
     pass "a runner with no sweeps exits 2 — the syntax half cannot go uncovered in silence"
   else
     fail "a runner with no sweeps returned rc $RC (want 2, naming the sweeps): $OUT"
@@ -288,14 +343,14 @@ fi
 
 echo ""
 echo "8h. FAILURE-RECORDING ARM — dropping it must make the RUNNER fail at runtime"
-sed 's/ || shard_errors=$((shard_errors + 1))//' "$TMP/runner-fast.sh" >"$TMP/runner-norecord.sh"
-if cmp -s "$TMP/runner-fast.sh" "$TMP/runner-norecord.sh"; then
+sed 's/ || shard_errors=$((shard_errors + 1))//' "$TMP/runner-cheap.sh" >"$TMP/runner-norecord.sh"
+if cmp -s "$TMP/runner-cheap.sh" "$TMP/runner-norecord.sh"; then
   fail "the no-record mutation did not change the file"
 else
-  bash "$TMP/runner-norecord.sh" >"$TMP/runner-norecord.out" 2>&1
+  $FIXTURE_BOUND bash "$TMP/runner-norecord.sh" >"$TMP/runner-norecord.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-norecord.out")"
-  if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -qE '(failure-recording|sweep) arm is broken'; then
+  if [ "$RC" -eq 1 ] && grep -qE '(failure-recording|sweep) arm is broken' <<<"$OUT"; then
     pass "a runner that cannot record failures FAILS its own sentinel (rc 1)"
   else
     fail "a runner with no failure-recording arm returned rc $RC (want 1): $OUT"
@@ -361,14 +416,14 @@ echo "8d. RUNTIME SELF-CHECK — a neutered runner helper must fail, not report 
 # Neutering means replacing the WHOLE helper (the verifier's repro): the counter goes with the
 # execution, so the runner can no longer claim it ran anything.
 awk '{ if ($0 ~ /^run_shard\(\) \{/) { print "run_shard() { :; }"; next } print }' \
-  "$TMP/runner-fast.sh" >"$TMP/runner-neutered.sh"
-if cmp -s "$TMP/runner-fast.sh" "$TMP/runner-neutered.sh"; then
+  "$TMP/runner-cheap.sh" >"$TMP/runner-neutered.sh"
+if cmp -s "$TMP/runner-cheap.sh" "$TMP/runner-neutered.sh"; then
   fail "the neutered-helper mutation did not change the file"
 else
-  bash "$TMP/runner-neutered.sh" >"$TMP/runner-neutered.out" 2>&1
+  $FIXTURE_BOUND bash "$TMP/runner-neutered.sh" >"$TMP/runner-neutered.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-neutered.out")"
-  if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'executed 0 of'; then
+  if [ "$RC" -eq 1 ] && grep -q 'executed 0 of' <<<"$OUT"; then
     pass "a runner whose helper executes nothing FAILS at runtime (rc 1, count mismatch)"
   else
     fail "a neutered helper returned rc $RC (want 1): $OUT"
@@ -387,8 +442,8 @@ echo "8e. COUNTER-PRESERVING SABOTAGE is now CAUGHT by the failure-recording sen
 # Earlier revisions could not catch this (the count stayed correct while failures stopped being
 # recorded); the sentinel self-check in the runner closes it, so it is no longer a residual.
 awk '{ if ($0 ~ /^run_shard\(\) \{/) { print "run_shard() { shard_ran=$((shard_ran + 1)); }"; next } print }' \
-  "$TMP/runner-fast.sh" >"$TMP/runner-counter-only.sh"
-bash "$TMP/runner-counter-only.sh" >"$TMP/runner-counter-only.out" 2>&1
+  "$TMP/runner-cheap.sh" >"$TMP/runner-counter-only.sh"
+$FIXTURE_BOUND bash "$TMP/runner-counter-only.sh" >"$TMP/runner-counter-only.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-counter-only.out")"
 if [ "$RC" -eq 1 ]; then
@@ -458,33 +513,37 @@ fi
 
 echo ""
 echo "8n. SWEEP BODY NEUTERED → the RUNNER must fail at runtime (and pass unneutered)"
-# A synthetic cheap shard replaces every listed target so this pair costs ~1s instead of the
-# whole suite, while keeping the runner's own self-check arithmetic (listed == executed) intact.
-CHEAP="scripts/check-no-sigpipe-grep.sh"
-awk -v cheap="$CHEAP" '
-  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
-  { print }
-' "$TMP/runner-fast.sh" >"$TMP/runner-cheap.sh"
-awk -v cheap="$CHEAP" '
-  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
+# The same inert fixture the other runtime pins execute (built once at the top of this script):
+# every listed target is the committed stand-in, so this pair costs ~1 s while keeping the
+# runner's own self-check arithmetic (listed == executed) intact.
+#
+# The stand-in MUST be hermetic: its rc has to depend on nothing but itself. It was
+# `scripts/check-no-sigpipe-grep.sh` until 2026-10-23 — a REPO-WIDE guard, so its verdict was a
+# function of every file in the tree. Five `printf … | grep -q` idioms in
+# `scripts/orchestrator-harness/lander.test.sh` (#2301) therefore reddened THIS control fixture on
+# every PR, reported as `the control fixture returned rc 1` — a message that blames the fixture and
+# never names the cause (another job's subject, `sigpipe-grep-guard`). Never point `CHEAP` at
+# anything whose rc can move without this file changing. See its definition — and the measurement
+# of what pointing it at the real list costs — at the top of this script.
+awk '
   /^sweep_file\(\) \{/ { print "sweep_file() { :; }"; next }
   { print }
-' "$TMP/runner-fast.sh" >"$TMP/runner-nosweepbody.sh"
+' "$TMP/runner-cheap.sh" >"$TMP/runner-nosweepbody.sh"
 if cmp -s "$TMP/runner-cheap.sh" "$TMP/runner-nosweepbody.sh"; then
   fail "the sweep-body mutation did not change the fixture"
 else
-  bash "$TMP/runner-cheap.sh" >"$TMP/runner-cheap.out" 2>&1
+  $FIXTURE_BOUND bash "$TMP/runner-cheap.sh" >"$TMP/runner-cheap.out" 2>&1
   RCC=$?
   OUTC="$(cat "$TMP/runner-cheap.out")"
-  if [ "$RCC" -eq 0 ] && printf '%s' "$OUTC" | grep -q 'file(s) syntax-checked'; then
+  if [ "$RCC" -eq 0 ] && grep -q 'file(s) syntax-checked' <<<"$OUTC"; then
     pass "control: the same fixture with the sweep intact PASSES (rc 0)"
   else
     fail "the control fixture returned rc $RCC (want 0): $(printf '%s' "$OUTC" | tail -1)"
   fi
-  bash "$TMP/runner-nosweepbody.sh" >"$TMP/runner-nosweepbody.out" 2>&1
+  $FIXTURE_BOUND bash "$TMP/runner-nosweepbody.sh" >"$TMP/runner-nosweepbody.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-nosweepbody.out")"
-  if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'syntax sweep executed no file'; then
+  if [ "$RC" -eq 1 ] && grep -q 'syntax sweep executed no file' <<<"$OUT"; then
     pass "a runner whose sweep body is neutered FAILS at runtime (rc 1)"
   else
     fail "a neutered sweep body returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -1)"
@@ -537,7 +596,7 @@ awk -v cheap="$CHEAP" '
 bash "$TMP/runner-sweepcounter.sh" >"$TMP/runner-sweepcounter.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-sweepcounter.out")"
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'sweep arm is broken'; then
+if [ "$RC" -eq 1 ] && grep -q 'sweep arm is broken' <<<"$OUT"; then
   pass "a runner that keeps the sweep counter but does not parse exits 1 (the arm is proven)"
 else
   fail "a counter-preserving sweep neuter returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -1)"
@@ -553,7 +612,7 @@ else
   bash "$TMP/runner-subst.sh" >"$TMP/runner-subst.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-subst.out")"
-  if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'is not inside this checkout'; then
+  if [ "$RC" -eq 1 ] && grep -q 'is not inside this checkout' <<<"$OUT"; then
     pass "a list pointed at a path outside the checkout is refused (rc 1)"
   else
     fail "an out-of-repo target returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -1)"
@@ -638,7 +697,7 @@ awk -v cheap="scripts/linked.sh" '
 ( cd "$SYMDIR" && bash runner.sh ) >"$TMP/runner-symlink.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-symlink.out")"
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'is a symlink'; then
+if [ "$RC" -eq 1 ] && grep -q 'is a symlink' <<<"$OUT"; then
   pass "a symlinked shard target is refused (rc 1)"
 else
   fail "a symlinked target returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -1)"
@@ -676,6 +735,7 @@ fi
 
 echo ""
 echo "8z. A BACKSLASH-CONTINUED SWALLOW → rc 2 (the tail is not only the first physical line)"
+
 awk '{ if ($0 ~ /^        run: bash scripts\/run-bash-shards\.sh$/) { print "        run: |"; print "          bash scripts/run-bash-shards.sh > /dev/null \\"; print "            || true"; next } print }' \
   "$PR" >"$TMP/ci-pr-cont-swallow.yml"
 if cmp -s "$PR" "$TMP/ci-pr-cont-swallow.yml"; then
@@ -699,6 +759,49 @@ else
 fi
 
 echo ""
+echo "8am. THE FAILING SHARD IS NAMED — deleting the naming must turn this arm RED (#2643)"
+# The runner now prints `❌ FAILED SHARD: <path>` at the point of failure and a recap
+# (`❌ failing shard(s): <path,…>`). BOTH are asserted here, because a reader-facing line nobody
+# asserts is a line the next refactor deletes with every gate green — and the runner's own runtime
+# sentinels CANNOT pin it (the sentinel is deliberately not a listed shard, so a name would be a
+# false report on a green run). Non-vacuity is built in: the same fixture with `shard_fail` deleted
+# must print NO name, and still exit 1.
+NAMED_FAIL="tests/ci-lane-parity/stand-in-fail.sh"
+awk -v cheap="$CHEAP" -v failing="$NAMED_FAIL" '
+  /^run_shard / && $2 !~ /^\"/ { n++; if (n == 1) { print "run_shard " failing; next } }
+  /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-onefail.sh"
+env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$TMP/runner-onefail.sh" >"$TMP/runner-onefail.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-onefail.out")"
+if [ "$RC" -eq 1 ] && grep -qF "❌ FAILED SHARD: $NAMED_FAIL" <<<"$OUT"; then
+  pass "a failing shard is NAMED at the point of failure ($NAMED_FAIL), and the run still fails (rc 1)"
+else
+  fail "a failing shard was not named at the point of failure (rc $RC): $(grep -F 'FAILED SHARD' <<<"$OUT" | head -3)"
+fi
+if grep -qE '^❌ failing shard\(s\): .*stand-in-fail\.sh' <<<"$OUT"; then
+  pass "the RECAP names it too (so grepping the summary does not require walking the log)"
+else
+  fail "the recap did not name the failing shard: $(grep -F 'failing shard' <<<"$OUT" | head -3)"
+fi
+# NON-VACUITY: same fixture, the naming call deleted. The run must STILL fail (the counter is
+# untouched) and must print NO name — so an arm that passed on any failing run would be caught.
+sed 's/\[ "$shard_errors" -ne "$shard_err0" \] && shard_fail "$1"; //' "$TMP/runner-onefail.sh" >"$TMP/runner-onefail-noname.sh"
+if cmp -s "$TMP/runner-onefail.sh" "$TMP/runner-onefail-noname.sh"; then
+  fail "the no-name mutation did not change the fixture (the naming call moved — update this arm's sed)"
+else
+  env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$TMP/runner-onefail-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-onefail-noname.out")"
+  if [ "$RC" -eq 1 ] && ! grep -qF 'FAILED SHARD' <<<"$OUT"; then
+    pass "with the naming deleted the run still fails and prints NO name — this arm measures the naming, not the count"
+  else
+    fail "the no-name mutation returned rc $RC and printed: $(grep -F 'FAILED SHARD' <<<"$OUT" | head -3)"
+  fi
+fi
+
+echo ""
 echo "8aa. A SYMLINKED PARENT DIRECTORY → the RUNNER must refuse it"
 PARENTDIR="$TMP/parentrepo"
 mkdir -p "$PARENTDIR" "$TMP/outside-dir"
@@ -711,7 +814,7 @@ awk -v cheap="scripts/stub.sh" '
 ( cd "$PARENTDIR" && bash runner.sh ) >"$TMP/runner-parentsym.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-parentsym.out")"
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q 'resolves outside this checkout'; then
+if [ "$RC" -eq 1 ] && grep -q 'resolves outside this checkout' <<<"$OUT"; then
   pass "a symlinked PARENT directory is refused (the leaf check alone would pass it)"
 else
   fail "a symlinked parent dir returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -1)"
@@ -767,13 +870,40 @@ else
 fi
 
 # A matrix list before `steps:` must not latch the step indent.
-awk '{ print } /^  bash-suites:$/ { inb = 1; next } inb && /^    runs-on: ubuntu-latest$/ { print "    strategy:"; print "      matrix:"; print "        os:"; print "          - ubuntu-latest"; inb = 0 }' \
+# ⛔ THE INJECTION MUST LAND INSIDE THE JOB THE GUARD AUDITS (#2482 review, 2026-10-23). An earlier
+# revision of this fixture injected a second `strategy:` into `bash-suites` — which broke when that job
+# gained a REAL matrix (duplicate mapping key, guard correctly exits 2, so the fixture measured YAML
+# duplication rather than the property it names) — and the first repair injected into `drift-check`,
+# which is VACUOUS: the guard reads `jobs["bash-suites"]` only, so the injection could not affect any
+# assertion it makes. The injection below adds an `os:` LIST to `bash-suites`' EXISTING matrix: no
+# duplicate key, the job's own steps stay intact, and the list really does precede `steps:` in the
+# job under audit — so if the parser latched the step indent on a list, the call would go unseen and
+# the guard would exit 2.
+awk '{ print }
+     /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ { print "        os:"; print "          - ubuntu-latest" }' \
   "$PR" >"$TMP/ci-pr-matrix.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-matrix.yml"
 if [ "$RC" -eq 0 ]; then
   pass "a strategy/matrix list before steps: does not hide the steps"
 else
   fail "a matrix list before steps: false-blocked the call (rc $RC): $OUT"
+fi
+
+# ⛔ AND THE GUARD ITSELF CANNOT BE SWITCHED OFF (#2482 review, 2026-10-23). The steps that run this
+# guard and its mutation self-test live in a SECOND job (`bash-suites-gate`), so a conditional or a
+# non-blocking failure there used to leave this check green over a disabled self-test. Measured on the
+# pre-change layout: exit 2; on the matrix layout before this fixture: exit 0.
+awk 'BEGIN { done = 0 }
+     { print }
+     !done && /^  bash-suites-gate:$/ { done = 1; next }
+     done && /^      - / { print "        if: false"; done = 2 }
+     done == 2 { done = 3 }' \
+  "$PR" >"$TMP/ci-pr-gateif.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-gateif.yml"
+if [ "$RC" -eq 2 ]; then
+  pass "an `if:` on the guard-covering job's first step is refused (the guard cannot be switched off)"
+else
+  fail "an `if:` on bash-suites-gate's step returned rc $RC (want 2): $OUT"
 fi
 
 # A sibling `push:` block that filters paths must not be read as narrowing pull_request.
@@ -804,7 +934,7 @@ echo '8ac2. A WORKFLOW-LEVEL CI_LANE_* KEY -> rc 2, NAMING THE KEY (a doc under 
 awk 'NR == 1 { print; print "env:"; print "  CI_LANE_RUNNER: /tmp/fake.sh"; next } { print }' \
   "$PR" >"$TMP/ci-pr-wflane.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-wflane.yml"
-if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q 'CI_LANE_RUNNER'; then
+if [ "$RC" -eq 2 ] && grep -q 'CI_LANE_RUNNER' <<<"$OUT"; then
   pass "a workflow-level env: CI_LANE_* key exits 2 and names the key (the arm is load-bearing)"
 else
   fail "a workflow-level CI_LANE_* key returned rc $RC (want 2, naming the key): $OUT"
@@ -848,7 +978,7 @@ for key in BASH_ENV PROMPT_COMMAND; do
   awk -v k="$key" 'NR == 1 { print; print "env:"; print "  " k ": evil.sh"; next } { print }' \
     "$PR" >"$TMP/ci-pr-inject.yml"
   guard_rc "$MAIN" "$TMP/ci-pr-inject.yml"
-  if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q "$key"; then
+  if [ "$RC" -eq 2 ] && grep -q "$key" <<<"$OUT"; then
     pass "a workflow-level env: $key exits 2 and names the key"
   else
     fail "a workflow-level env: $key returned rc $RC (want 2, naming it): $OUT"
@@ -863,7 +993,7 @@ echo '8ac5. defaults.run.shell -> rc 2 (the SAME knob one level up: the step nev
 awk '{ print; if ($0 ~ /^  bash-suites:$/) { j = 1; next } if (j && $0 ~ /^    runs-on: ubuntu-latest$/) { print "    defaults:"; print "      run:"; print "        shell: \x27true {0}\x27"; j = 0 } }' \
   "$PR" >"$TMP/ci-pr-dshell.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-dshell.yml"
-if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q 'defaults.run.shell'; then
+if [ "$RC" -eq 2 ] && grep -q 'defaults.run.shell' <<<"$OUT"; then
   pass "a job-level defaults.run.shell exits 2 and names the key"
 else
   fail "a job-level defaults.run.shell returned rc $RC (want 2, naming it): $OUT"
@@ -905,12 +1035,12 @@ echo ''
 echo '8ac7. A DUPLICATED SHARD LIST -> rc 2 (a repeated target is not extra coverage)'
 # 13 of the 14 lines pointed at one cheap script: any length floor is satisfied while 13 suites
 # never run (ledger-sourced, cycle 2 — the substitution variant of the runner-body residual).
-awk -v cheap="scripts/check-no-sigpipe-grep.sh" '
+awk -v cheap="$CHEAP" '
   /^run_shard [a-z]/ && n < 13 { print "run_shard " cheap; n++; next }
   { print }
 ' "$RUNNER" >"$TMP/runner-dupes.sh"
 guard_rc "$MAIN" "$PR" "$TMP/runner-dupes.sh"
-if [ "$RC" -eq 2 ] && printf '%s' "$OUT" | grep -q 'duplicate'; then
+if [ "$RC" -eq 2 ] && grep -q 'duplicate' <<<"$OUT"; then
   pass "a runner listing the same script 13 times exits 2 and says why"
 else
   fail "a duplicated shard list returned rc $RC (want 2, naming duplicates): $OUT"
@@ -1120,6 +1250,127 @@ bash "$GUARD" --no-such-flag >"$TMP/badflag.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/badflag.out")"
 if [ "$RC" -eq 2 ]; then pass "an unknown argument exits 2"; else fail "an unknown argument exited $RC (want 2)"; fi
+
+echo ""
+echo "8am. ATTRIBUTION — a failed shard is NAMED in the verdict, not only counted (#2643)"
+# ⛔ WHAT THIS ARM EXISTS FOR. On 2026-10-24 four shards were red on `main` and FOUR PR slices each
+# printed `❌ 1 bash shard(s) failed`; the merge rail refused the PR with "yielded NO parseable failure
+# identity", and the only way to learn which suite was red was to download an 18,695-line job log and
+# bisect it against this runner's own `▸ <secs> <path>` rows. A count is not an identity, so the
+# verdict now names its shards. Nothing asserted that, and nothing could: every existing arm here
+# asserts COUNTS and SETS (listed==executed, the slice's exact set, the sweep counter), and a red that
+# prints nothing still satisfies all of them.
+#
+# The fixture is the runner with EVERY `run_shard` line pointed at a hermetic stand-in, exactly as
+# arms 8d/8e/8h do — with ONE of them pointed at the failing stand-in, so the run is red for a reason
+# this arm chose. Three assertions, and the second and third are what make the first mean something:
+#   (a) the failing shard's PATH appears in the verdict block;
+#   (b) the PASSING stand-in's path does NOT appear there (a block that names every shard satisfies
+#       (a) while telling a reader nothing);
+#   (c) RED CONTROL — gut the recorder and the run must STILL fail (rc 1, the counter is untouched)
+#       while naming nothing. Without (c), (a) could be satisfied by any future line that happens to
+#       print a path.
+PASS_SHARD="tests/ci-lane-parity/stand-in-shard.sh"
+FAIL_SHARD="tests/ci-lane-parity/stand-in-shard-fail.sh"
+awk -v pass="$PASS_SHARD" -v fails="$FAIL_SHARD" '
+  /^run_shard / && $2 !~ /^\"/ { n++; print "run_shard " (n == 2 ? fails : pass); next }
+  { print }
+' "$RUNNER" >"$TMP/runner-named.sh"
+if cmp -s "$RUNNER" "$TMP/runner-named.sh"; then
+  fail "the attribution fixture rewrote no run_shard line"
+else
+  $FIXTURE_BOUND bash "$TMP/runner-named.sh" >"$TMP/runner-named.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-named.out")"
+  # The verdict block is everything from the `N bash shard(s) failed` line on: the per-shard line is
+  # printed mid-run and is NOT what a parser sees at the end, so assert on the block.
+  VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-named.out")"
+  if [ "$RC" -eq 1 ] && grep -qF "$FAIL_SHARD" <<<"$VERDICT"; then
+    pass "a failed shard is NAMED in the verdict block (rc 1)"
+  else
+    fail "the verdict did not name the failed shard (rc $RC): $VERDICT"
+  fi
+  if grep -qF "$PASS_SHARD" <<<"$VERDICT"; then
+    fail "the verdict names the PASSING stand-in too — a block naming every shard attributes nothing: $VERDICT"
+  else
+    pass "…and it names only the shard that actually failed"
+  fi
+  # RED CONTROL (c): the recorder's body replaced by `: ` — the failure is still COUNTED, so the run is
+  # still rc 1; only the name is gone. That is the shape that proves (a) is pinning the recorder.
+  # ⛔ ASSERTED ON THE VERDICT SLICE, NEVER ON `$OUT` (review cycle 1). `shard_note` prints a timeline
+  # row — `▸ 0s <path>` — for every listed shard whether it passed or failed, so the WHOLE log always
+  # contains the failing path and `! grep -qF "$FAIL_SHARD" <<<"$OUT"` would fail this arm on every
+  # commit, reddening `bash-suites` for the very reason it exists to attribute.
+  awk '{ if ($0 ~ /^shard_record_failure\(\) \{/) { print "shard_record_failure() { :; }"; next } print }' \
+    "$TMP/runner-named.sh" >"$TMP/runner-noname.sh"
+  if cmp -s "$TMP/runner-named.sh" "$TMP/runner-noname.sh"; then
+    fail "the no-name mutation did not change the fixture"
+  else
+    $FIXTURE_BOUND bash "$TMP/runner-noname.sh" >"$TMP/runner-noname.out" 2>&1
+    RC=$?
+    NONAME_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-noname.out")"
+    if [ "$RC" -eq 1 ] && ! grep -qF "$FAIL_SHARD" <<<"$NONAME_VERDICT"; then
+      pass "RED CONTROL: a gutted recorder still fails the run (rc 1) and names nothing in the verdict"
+    else
+      fail "with the recorder gutted the run returned rc $RC and/or named a shard in the verdict: $NONAME_VERDICT"
+    fi
+    # …and it must SAY SO rather than end on a bare count: an unnamed failure has to read as unnamed.
+    if grep -q 'could NOT be named' <<<"$NONAME_VERDICT"; then
+      pass "…and an unnamed failure says so, instead of ending as a silent count"
+    else
+      fail "an unnamed failure did not announce that it could not be named: $NONAME_VERDICT"
+    fi
+  fi
+fi
+
+echo ""
+echo "8an. ATTRIBUTION — a SWEEP failure is named too, so a MIXED run has no un-named red (#2643)"
+# ⛔ WHAT THIS ARM EXISTS FOR (#2648 cycle-4 review): the first version named only the shard LOOP, so
+# a MIXED run — one listed shard failing PLUS a `bash -n` failure from the syntax sweep — yielded
+# exactly ONE identity. The rail's step-1c (`examined > extracted`) then PASSED, and the un-named file
+# disappeared from a certificate that named no residual: a truthful refusal turned into a FALSE PASS.
+# Nothing reddened if the sweep-naming half were reverted, which is what this arm closes.
+#
+# The fixture: every `run_shard` points at the PASSING stand-in (so the run is red ONLY because of the
+# sweep), and SWEEP_GLOBS is narrowed to a temp dir holding one file with a syntax error. Assert the
+# broken file is NAMED in the verdict block and that the run does NOT fall back to `could NOT be named`.
+BROKEN_DIR="$TMP/sweep-broken"
+mkdir -p "$BROKEN_DIR"
+printf 'if then\n' >"$BROKEN_DIR/broken.sh"
+awk -v pass="$PASS_SHARD" -v dir="$BROKEN_DIR" '
+  /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=(\"" dir "/*.sh\")"; next }
+  /^run_shard / && $2 !~ /^\"/ { print "run_shard " pass; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-sweepname.sh"
+if cmp -s "$RUNNER" "$TMP/runner-sweepname.sh"; then
+  fail "the sweep-attribution fixture rewrote neither SWEEP_GLOBS nor a run_shard line"
+else
+  $FIXTURE_BOUND bash "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepname.out" 2>&1
+  RC=$?
+  SWEEP_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepname.out")"
+  if [ "$RC" -eq 1 ] && grep -qF "broken.sh" <<<"$SWEEP_VERDICT"; then
+    pass "a bash -n failure is NAMED in the verdict block (rc 1)"
+  else
+    fail "a sweep failure was counted but not named (rc $RC): $SWEEP_VERDICT"
+  fi
+  if grep -q 'could NOT be named' <<<"$SWEEP_VERDICT"; then
+    fail "a sweep failure was left UNNAMED — the rail gets an identity for the other shard and merges: $SWEEP_VERDICT"
+  else
+    pass "…and the verdict has no un-named remainder (the rail sees every failure)"
+  fi
+  # RED CONTROL: gut the recorder that the SWEEP calls, and the same run must go back to the count-only
+  # verdict — proving this arm pins the sweep's naming rather than any other line that prints a path.
+  awk '{ if ($0 ~ /^shard_named_failure\(\) \{/) { print "shard_named_failure() { :; }"; next } print }' \
+    "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepnoname.sh"
+  $FIXTURE_BOUND bash "$TMP/runner-sweepnoname.sh" >"$TMP/runner-sweepnoname.out" 2>&1
+  RC2=$?
+  SWEEP_NONAME="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepnoname.out")"
+  if [ "$RC2" -eq 1 ] && ! grep -qF "broken.sh" <<<"$SWEEP_NONAME" && grep -q 'could NOT be named' <<<"$SWEEP_NONAME"; then
+    pass "RED CONTROL: with the naming helper gutted the sweep failure is un-named again (rc 1)"
+  else
+    fail "the no-name control did not revert to an un-named verdict (rc $RC2): $SWEEP_NONAME"
+  fi
+fi
 
 echo ""
 echo "10. WIRING — a guard (or runner) nothing invokes protects nothing"

@@ -380,6 +380,10 @@ refresh_on_exit() {
   local rc=$?
   gh_pass_cache_stop
   rm -f "${UNUSABLE_LOG:-}" 2>/dev/null
+  # ⛔ NEVER UNLINK /dev/null. The degraded redirect above can point there, and `rm -f /dev/null`
+  # succeeds as root (review of #2401, fourth round). uid-1000 controllers are unaffected either
+  # way; the guard costs one test and removes a footgun from a root-run supervisor.
+  [ "${PRE_ERR_FILE:-}" = "/dev/null" ] || rm -f "${PRE_ERR_FILE:-}" 2>/dev/null
   [ "$REFRESH_RECORDED" = "1" ] && return 0
   REFRESH_RECORDED=1
   if [ "$rc" -eq 0 ]; then
@@ -437,6 +441,34 @@ find_tortoise() {   # print a tortoise checkout carrying the tool, or return 1
     (cd "$cand" && pwd -P); return 0
   done
   return 1
+}
+
+# ⛔ A REFUSAL THAT DOES NOT SAY WHERE IT LOOKED SENDS THE OPERATOR TO GUESS (brief 2026-10-24).
+# "no pre-flight could be resolved" is true of EVERY possible cause — a repo that carries none, a
+# `TORTOISE_REPO` naming the wrong checkout, a "tortoise" directory that exists without the tool in
+# it, a HOME the daemon does not have. The fix each needs is a DIFFERENT PATH, so the refusal names
+# all of them, in the order they were tried, and `: '...'` quotes the empty ones instead of printing
+# `//tools/collision_preflight.py`. It never invents a candidate it did not search.
+preflight_search_paths() {   # one candidate TOOL path per line, in resolution order
+  local common configured toplevel
+  configured="$(tortoise_var)"
+  common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  toplevel="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null)"
+  {
+    # 1. the serviced repo's own copy — the scout worktree when it exists, else the main checkout
+    [ -d "$SC" ] && printf '%s\n' "$SC/tools/collision_preflight.py"
+    printf '%s\n' "$REPO/tools/collision_preflight.py"
+    # 2. a configured tortoise checkout, then the conventionally-located ones
+    [ -n "$configured" ] && printf '%s\n' "$configured/tools/collision_preflight.py"
+    [ -n "$toplevel" ] && printf '%s\n' "$toplevel/tools/collision_preflight.py"
+    [ -n "$common" ] && printf '%s\n' "$(dirname "${common%/.git}")/tortoise/tools/collision_preflight.py"
+    printf '%s\n' \
+      "${HOME:-\$HOME}/Documents/GitHub/tortoise/tools/collision_preflight.py" \
+      "${HOME:-\$HOME}/eldato/tortoise/tools/collision_preflight.py"
+  } | awk 'NF && !seen[$0]++'
+}
+preflight_search_paths_one_line() {   # the same list, for a single log line
+  preflight_search_paths | paste -sd ' ' - | sed 's/ /, /g'
 }
 
 resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if none
@@ -547,12 +579,104 @@ fi
 # resolve it exactly as the pre-flight's own calls do. Neither touches any OTHER host, so an unrelated
 # host's problem cannot change the answer (an UNSCOPED `gh auth status` would — it validates them all).
 
+# ── THE PROBE MUST BE ABLE TO GIVE UP (TOKEN_HANG_FIX) ──────────────────────────────────────────
+# MEASURED 2026-10-21 on these cell images: `gh auth token` does not fail, it HANGS (rc=142 under an
+# alarm, stdin closed, GH_TOKEN unset). The presence probe below captured it UNBOUNDED, so
+# `refresh-candidates.sh` stalled forever at stage=provision — every pass recorded `STALE(800m)` and
+# ORIGINATION NEVER RAN all session, silently, because the only trace of a pass that never returns is
+# the absence of the next one. A probe with no bound is not a precondition check; it is an outage.
+#
+# So the probe is bounded three ways, and NONE of them can turn a non-answer into a permanent verdict:
+#   1. A token in the ENVIRONMENT is presence, KNOWN, and is answered WITHOUT invoking gh at all
+#      (`gh` itself treats GH_TOKEN/GITHUB_TOKEN as a credential, so this is the same question asked
+#      offline — the env short-circuit is not a shortcut, it is the cheap half of the same predicate).
+#   2. Every gh probe runs under an ALARM with STDIN CLOSED. Both halves matter: the bound stops a
+#      wedged helper, and `</dev/null` stops a keyring/gpg/credential-helper prompt from parking the
+#      process forever on a read that can never be answered on a headless box.
+#   3. A probe that cannot answer within the bound is PRESENCE UNKNOWN, said out loud and returned
+#      TRANSIENT. It is never PERMANENT: a hang says nothing about whether a credential exists, and
+#      the permanent marker is human-only-clearable, so classifying a hang as "not provisionable"
+#      would latch a cell MERGE-ONLY for a fault a retry can lose.
+# The bound is the repo's established idiom (`perl -e 'alarm shift; exec @ARGV'`, admin-merge.sh:5179 —
+# macOS ships no `timeout`), with GNU `timeout` as the second choice and a LOUD un-bounded warning as
+# the last resort, because an unbounded probe that silently claims to be bounded is the defect itself.
+GH_PROBE_TIMEOUT="${GH_PROBE_TIMEOUT:-20}"
+case "$GH_PROBE_TIMEOUT" in ''|*[!0-9]*) GH_PROBE_TIMEOUT=20 ;; esac
+[ "$GH_PROBE_TIMEOUT" -ge 1 ] 2>/dev/null || GH_PROBE_TIMEOUT=20
+# ANY signal death is a NON-ANSWER, not a verdict. 142 = SIGALRM (the alarm this repo's bound uses),
+# 124 = GNU `timeout`'s spelling, and every other 128+N (130=INT, 134=ABRT, 137=KILL, 139=SEGV,
+# 143=TERM, …) is the probe being KILLED — a killed probe says nothing about whether a credential exists.
+# ⛔ THE WHOLE 128+N RANGE, NOT A LIST. The first version enumerated {142,124,137}, so a probe that died
+# of SIGTERM/SEGV/ABRT fell through to the "no credential STORED" arm and latched the human-only-clear
+# MERGE-ONLY marker — the same non-answer-read-as-absence this fix exists to close, one signal over
+# (measured by review on this PR).
+gh_probe_timed_out() { case "${1:-}" in 12[4-9]|1[3-9][0-9]) return 0 ;; *) return 1 ;; esac; }
+# ⛔ THE BOUND MUST KILL THE PROCESS GROUP, AND THE CAPTURE MUST NOT BE A PIPE (this is the difference
+# between a bound that works and one that only looks like it — measured while writing this fix).
+# `$( … )` reads until EVERY writer closes the pipe, so an alarm that kills the gh shell while its own
+# child (a credential helper's `sleep`, a hung `gpg`) still holds stdout returns rc=142 IMMEDIATELY and
+# then PARKS THE PASS for the child's whole lifetime: the first version of this fix printed the right
+# "PRESENCE UNKNOWN" line and took 5m0s to exit. So:
+#   * the child is put in its OWN process group (`setpgrp`, the idiom scratch-worktree.sh:689 already
+#     uses) and the alarm KILLs the GROUP — a helper cannot outlive its probe;
+#   * stderr goes to a FILE and stdout is discarded (gh auth token prints the TOKEN; it must never
+#     reach a log), so no pipe exists for an orphan to hold open.
+GH_PROBE_ERR=""
+# ⛔ THE ERROR FILE IS A SENTINEL THAT MAY ALIAS A REAL DEVICE. When ${TMPDIR} is unwritable the path
+# falls back to `/dev/null`, and an unguarded `rm -f "$GH_PROBE_ERR"` on an exit path then deletes THE
+# DEVICE NODE (silently refused for an unprivileged user, destructive for root). One cleanup point, with
+# the guard in it, instead of six call sites that each have to remember.
+gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; esac; rm -f "$GH_PROBE_ERR" 2>/dev/null || true; }
+gh_probe_bounded() { # gh_probe_bounded <secs> <cmd…>; sets GH_PROBE_ERR (stderr of the probe)
+  local _s="$1"; shift
+  # ⛔ RELEASE THIS FUNCTION'S OWN PREVIOUS PROBE FILE FIRST. Every call mints a NEW `mktemp` path and
+  # reassigns GH_PROBE_ERR, so without this the prior call's file is orphaned — and the harness makes
+  # TWO calls (the credential probe, then the rate-limit probe), so the common path leaked one 0-byte
+  # file per refresh pass. The cleanup helper is the single guarded `rm` site, so calling it here adds
+  # no second `rm -f "$GH_PROBE_ERR"` and the funnel's "exactly ONE code-level rm" assertion holds.
+  gh_probe_err_cleanup
+  # ⛔ AN UNPREDICTABLE NAME WITH O_EXCL, never `$$` in a world-writable dir. A pid-derived name is
+  # guessable by any other local user, and `: >` follows a symlink — so a peer on a shared cell
+  # could pre-create that path as a symlink and have this harness truncate an arbitrary file. The
+  # stderr this captures holds `gh`'s output (never logged, per the note above), so it must not be
+  # readable either: mktemp gives an unpredictable name and mode 0600.
+  GH_PROBE_ERR="$(mktemp "${TMPDIR:-/tmp}/.refresh-gh-probe.XXXXXX" 2>/dev/null)" || GH_PROBE_ERR=/dev/null
+  [ -n "$GH_PROBE_ERR" ] || GH_PROBE_ERR=/dev/null
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'my $t=shift; my $pid=fork(); if(!defined $pid){ exit 125 }
+             if($pid==0){ setpgrp(0,0); exec @ARGV; exit 127 }
+             $SIG{ALRM}=sub{ kill("KILL", -$pid); exit 142 };
+             alarm $t; waitpid($pid,0); alarm 0;
+             # ⛔ A SIGNAL DEATH IS NOT A SUCCESS. Perl puts a signal death in the LOW byte of $?, so a
+             # bare `exit($? >> 8)` reports 0 for a child killed by SIGKILL/SIGSEGV — an OOM-killed `gh`
+             # would read as "credential present, API answered" and the whole pre-flight would be blessed
+             # off a probe that never answered. Re-spell it as 128+N (the shell convention, and the same
+             # thing `exec`ed perl reports), so a killed probe is a non-answer here too.
+             exit(($? & 127) ? 128 + ($? & 127) : ($? >> 8))' \
+      "$_s" "$@" </dev/null >/dev/null 2>"$GH_PROBE_ERR"
+  elif command -v timeout >/dev/null 2>&1; then
+    # GNU `timeout` runs the child in its own process group and signals that GROUP (no --foreground),
+    # so this arm has the same property; `--kill-after` covers a helper that ignores SIGTERM.
+    timeout --kill-after=2 "$_s" "$@" </dev/null >/dev/null 2>"$GH_PROBE_ERR"
+  else
+    echo "[refresh] WARN: neither perl nor timeout is on PATH, so the gh probe CANNOT be bounded — a hanging gh will stall this pass (install perl or coreutils)" >&2
+    "$@" </dev/null >/dev/null 2>"$GH_PROBE_ERR"
+  fi
+}
+
 # 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
 gh_probe_env() {
-  local terr err
+  local terr err prc presence=""
   if ! command -v gh >/dev/null 2>&1; then
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  # ⛔ THE ENV TOKEN IS PRESENCE, AND IT COSTS NO gh CALL. `gh` documents GH_TOKEN/GITHUB_TOKEN as its
+  # own credential sources, so an env token is the credential the pre-flight's calls will use — asking
+  # `gh auth token` about it asks a question whose answer is already in hand, and on the measured
+  # images that question is exactly the one that hangs.
+  if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
+    presence=env
   fi
   # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. Presence and validation have to
   # be TWO questions, because no single hosted call answers both without naming a host. `gh auth
@@ -563,15 +687,42 @@ gh_probe_env() {
   # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring),
   # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
   # captured stream is STDERR ONLY (`2>&1 >/dev/null`), so no token can reach the log.
-  if ! terr="$(gh auth token 2>&1 >/dev/null)"; then
-    echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
-    printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
-    echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
-    return "$EXIT_NOT_PROVISIONABLE"
+  # ⛔ BOUNDED, STDIN CLOSED, AND A NON-ANSWER IS NOT AN ABSENCE (TOKEN_HANG_FIX). See the block above
+  # `gh_probe_bounded`. MEASURED rc=142: an unbounded capture here is what stalled the funnel forever.
+  if [ -z "$presence" ]; then
+    gh_probe_bounded "$GH_PROBE_TIMEOUT" gh auth token; prc=$?
+    terr="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
+    if gh_probe_timed_out "$prc"; then
+      echo "[refresh] TRANSIENT: gh credential PRESENCE UNKNOWN — 'gh auth token' did not answer within ${GH_PROBE_TIMEOUT}s in the environment the pre-flight runs in (HOME=$HOME), so whether a credential is stored here CANNOT BE VERIFIED from this box (rc=$prc). This is NOT 'no credential': a probe that cannot answer is a fact about the probe, not about the credential, and it is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
+      printf '%s\n' "$terr" | sed -n '1,2p' | sed 's/^/[refresh]   /'
+      echo "[refresh]   fix: put the token in the cell's environment (GH_TOKEN/GITHUB_TOKEN) so presence needs no gh call at all, or raise GH_PROBE_TIMEOUT (now ${GH_PROBE_TIMEOUT}s) if this box's credential store is merely slow; a hung credential helper (gpg/keyring with no tty) is the usual cause"
+      gh_probe_err_cleanup
+      return "$EXIT_TRANSIENT"
+    fi
+    if [ "$prc" -ne 0 ]; then
+      echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+      printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+      echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
+      gh_probe_err_cleanup
+      return "$EXIT_NOT_PROVISIONABLE"
+    fi
+    presence=stored
   fi
   # VALIDATION is the same call the pre-flight's gh-backed surfaces make, with no host named. A
   # credential that is STORED and DOES answer is usable, so this is also where the probe can SUCCEED.
-  err="$(gh api rate_limit 2>&1)" && return 0
+  # ⛔ BOUNDED TOO, for the same measured reason: this is the arm that reaches the NETWORK, and a dead
+  # proxy or a wedged tunnel parks it exactly like the credential lookup did. A bound here is already
+  # TRANSIENT-shaped (the fall-through below is TRANSIENT unless the API answers 401), so it cannot
+  # latch anything.
+  gh_probe_bounded "$GH_PROBE_TIMEOUT" gh api rate_limit; prc=$?
+  [ "$prc" -eq 0 ] && { gh_probe_err_cleanup; return 0; }
+  err="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
+  if gh_probe_timed_out "$prc"; then
+    echo "[refresh] TRANSIENT: the gh credential is present (source=$presence) but 'gh api rate_limit' did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc) in the environment the pre-flight runs in (HOME=$HOME) — a probe that cannot answer is an OUTAGE, not a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
+    printf '%s\n' "$err" | sed -n '1,2p' | sed 's/^/[refresh]   /'
+    gh_probe_err_cleanup
+    return "$EXIT_TRANSIENT"
+  fi
   # A credential IS stored, but the call did not answer. Is it REJECTED, or merely UNREACHABLE? Only
   # the API can say, and only a 401 is unambiguous. A 403 is deliberately NOT used: `/rate_limit` is
   # exempt from the PRIMARY rate limit, but a 403 still has several meanings — an SSO/SAML
@@ -585,13 +736,15 @@ gh_probe_env() {
   # ⚠️ DECLARED RESIDUAL: a credential that GitHub rejects with a 403 is therefore retried
   # indefinitely (loudly, via `FAILED rc=1`) and never writes the permanent marker.
   if grep -q 'HTTP 401' <<<"$err"; then
-    echo "[refresh] NOT PROVISIONABLE: the gh credential STORED for the host gh is configured for is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
+    echo "[refresh] NOT PROVISIONABLE: the gh credential PRESENT for the host gh is configured for (source=$presence) is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
     printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: re-authenticate gh in THIS home (gh auth login --with-token <token>), then re-run"
+    gh_probe_err_cleanup
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  echo "[refresh] TRANSIENT: a gh credential is stored for the host gh is configured for but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
+  echo "[refresh] TRANSIENT: a gh credential is PRESENT for the host gh is configured for (source=$presence) but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
   printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+  gh_probe_err_cleanup
   return "$EXIT_TRANSIENT"
 }
 
@@ -750,6 +903,7 @@ cmd_check() {
   if ! resolve_preflight; then
     echo "[refresh] check: no tools/collision_preflight.py in $tool_dir and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
     echo "[refresh] NOT PROVISIONABLE: this repo cannot be pre-flighted for dispatch, so a cell on it would MERGE ONLY (#1736)"
+    echo "[refresh]   looked for (in this order): $(preflight_search_paths_one_line)"
     echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env), or vendor tools/collision_preflight.py into the repo"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
@@ -1108,6 +1262,43 @@ refresh_stage provision "provisioning (state dir, gh environment, scout worktree
 # persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits RUNNING with `lanes: 0`
 # — the merge-only shape this change exists to remove (#1853 review).
 mkdir -p "$O" || refresh_fail provision "$EXIT_TRANSIENT" "cannot create the state directory $O — nothing can be persisted, so an empty backlog would be a false report"
+# ⛔ FAIL-CLOSED, unlike the cache's own `mkdir -p … 2>/dev/null` further up: the reap pass records
+# its classification here and its writes abort the pass on failure, so an absent state subdirectory
+# would abort EVERY pass — a permanent no-dispatch loop whose cause was never printed (#2183).
+mkdir -p "$O/state" || refresh_fail provision "$EXIT_TRANSIENT" "cannot create $O/state — the reap pass records what it kept and released there, and cannot run without it (#2183)"
+# ⛔ AND WRITABLE, NOT MERELY PRESENT — the rule the `$O` probe below already states for `$O` (review
+# P3, #2183). `mkdir -p` SUCCEEDS on an existing read-only or root-owned directory, and the reap's
+# first write there then raises a Python traceback that reads to an operator as "the blacklist is
+# half-rewritten" — the wrong place entirely. One probe makes it the ONE named refusal.
+# ⛔ REMOVED BEFORE THE PROBE AS WELL (review A-P4, cycle 5): `: > existing-file` needs no write
+# permission on the directory, so a probe file left by a pass killed between the write and the `rm`
+# makes the probe SUCCEED on a later read-only dir and the guard silently passes.
+rm -f "$O/state/.write-probe" 2>/dev/null
+if ! ( : > "$O/state/.write-probe" ) 2>/dev/null; then
+  # …but ONLY when the failure is specific to `state/`. A read-only `$O` makes BOTH probes fail, and
+  # that case belongs to the `$O` probe below (its own message, and its own established rc) — not to
+  # this one, which exists to name a healthy `$O` with an unwritable `state/`.
+  if ! ( : > "$O/.write-probe-pre" ) 2>/dev/null; then
+    rm -f "$O/.write-probe-pre" 2>/dev/null
+  else
+  # ⛔ NOT TRANSIENT: this is the PERMANENT local condition the probe exists to name (a root-owned or
+  # read-only state dir). `orch-loop.sh` reads rc!=0 as "retry next cycle", so the transient code would
+  # mean a pass every cycle for ever, no `.refresh-blocked`, and a funnel that only says STALE — the
+  # "cell reports RUNNING and dispatches nothing" shape with its cause buried in the log. rc=3 is the
+  # provisioning channel that stops the retry and names the reason in `status`.
+  # ⛔ AND IT MUST CARRY THE `NOT PROVISIONABLE` MARKER (review cycle 4, B-P2): rc=3 only populates
+  # `.refresh-blocked` through `grep 'NOT PROVISIONABLE'` over the log tail. Without the marker the
+  # operator's durable record is a merge-only block with an EMPTY "Reason and evidence" section and a
+  # remedy list naming TORTOISE_REPO/SCOUT_PY/HOME, none of which can fix a root-owned state dir.
+  # ⛔ AND THE PROBE FILE IS ALWAYS REMOVED (review cycle 4, B-P2): `: > existing-file` needs no WRITE
+  # permission on the directory, so a leftover `.write-probe-pre` makes this probe SUCCEED on a
+  # read-only `$O` next pass — latching a transient permission fault into the permanent rc=3 branch
+  # (and into `.refresh-blocked`, after which the refresh is never re-spawned).
+  rm -f "$O/.write-probe-pre" 2>/dev/null
+  refresh_fail provision "${EXIT_NOT_PROVISIONABLE:-3}" "NOT PROVISIONABLE: $O/state is not WRITABLE — the reap pass records what it kept and released there, so no pass could classify checked.txt (#2183). fix: chown/chmod $O/state so the orchestrating user can write it (then re-run)"
+  fi
+fi
+rm -f "$O/state/.write-probe"
 # ⛔ WRITABLE, NOT MERELY PRESENT — `mkdir -p` SUCCEEDS on an existing read-only or root-owned
 # directory, where every write below fails. Those failures are invisible in exactly the way that
 # matters: a STALE `.pool` left by an earlier run satisfies a test on the FILE, the loop reads that
@@ -1117,6 +1308,7 @@ mkdir -p "$O" || refresh_fail provision "$EXIT_TRANSIENT" "cannot create the sta
 # write failure that only BEGINS mid-run (a disk that fills afterwards) is refused at THAT write
 # rather than absorbed. What remains unhandled is narrower: a line left PARTIALLY written by an
 # interrupted write is not rolled back.
+rm -f "$O/.write-probe" 2>/dev/null
 if ! ( : > "$O/.write-probe" ) 2>/dev/null; then
   echo "[refresh] ABORT: $O is not WRITABLE — the pass could not persist its backlog (#1736)"
   refresh_fail provision "$EXIT_TRANSIENT" "$O is not WRITABLE — the pass could not persist its backlog (agent-infra#1736)"
@@ -1269,6 +1461,7 @@ scout_sync || exit "$SCOUT_REFUSE_RC"
 # its environment, and the reason must be the one an operator sees.
 if ! resolve_preflight; then
   echo "[refresh] NOT PROVISIONABLE: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
+  echo "[refresh]   looked for (in this order): $(preflight_search_paths_one_line)"
   echo "[refresh]   this repo cannot be pre-flighted for dispatch — the cell would merge only (#1736)"
   echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env) or vendor tools/collision_preflight.py into the repo"
   exit "$EXIT_NOT_PROVISIONABLE"
@@ -1649,6 +1842,16 @@ if ! rest_list pulls --repo "$OR" --state all --limit 500 --jq '.[]|.head.ref' >
   [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
 fi
 rm -f "$O/.list-err"
+# ── NOTHING THIS PASS DID NOT CLASSIFY MAY BE READ AS THIS PASS'S CLASSIFICATION (agent-infra#2183)
+# ⛔ TRUNCATED AT PASS START, AS AN EXPLICIT LIST — never a `checked-*` glob, which would also delete
+# `state/checked-release-cursor` on every pass and silently reduce the release rotation to "always
+# restart at the head of checked.txt" — exactly the permanent head-of-file starvation the cursor
+# exists to prevent, and a change no test would notice. Absence is then the ONLY reading a later step
+# can make of "this pass did not classify": a record from an earlier pass can never speak for this
+# one, and that guarantee needs no epoch comparison (a comparison against a pass clock this script
+# does not keep would either never fire or always fire).
+rm -f "$O/state/checked-kept" "$O/state/checked-reap" \
+      "$O/state/checked-release-candidates" "$O/state/checked-release" 2>/dev/null
 # ⛔ The reap pass REWRITES state (`dispatched.txt`, `checked.txt`) and its status used to be
 # discarded, so a failure there left a half-written blacklist or a stale suppression and the pass
 # carried on reporting success. Its status is read IMMEDIATELY below — and the invocation line is
@@ -1656,14 +1859,79 @@ rm -f "$O/.list-err"
 # `python3 - "$O" "$PRUNE_OR" <<'PY'` carries the EXPLICIT-OR-DERIVED repo slug the landed prune needs
 # for `gh issue view <N> --repo <slug>` — never the listings' fallback literal (review P1, cycle 4).
 python3 - "$O" "$PRUNE_OR" <<'PY'
-import json, os, re, subprocess, sys
+import json, os, re, shutil, subprocess, sys, time
 O = sys.argv[1]
 # The landed prune's repo slug. ABSENT means it cannot ask the authoritative question, and the
 # prune then keeps every entry (fail closed per entry) — never assumes closed.
 OR = sys.argv[2] if len(sys.argv) > 2 else ""
+ST = os.path.join(O, "state")
 def lines(name):
+    """Read one listing as text lines. ABSENT ⇒ `[]` (the guards below already refuse on absence).
+    UNREADABLE ⇒ `None`, and EVERY caller must treat that as the ABSENT case for ITS half — never as
+    an empty answer (review B-P2, cycle 2). `open()` here was unguarded, so a single non-UTF-8 byte in
+    `.pr_brs`/`dispatched.txt`/`.open_iss`/`checked.txt`, or one of them being a directory, raised out
+    of the heredoc: `reap_rc` non-zero aborts the pass with EXIT_TRANSIENT, and it does so on EVERY
+    subsequent pass — a permanent no-dispatch loop that presents as a RUNNING cell, which is the exact
+    class this change exists to remove. The trigger is ordinary data: a git ref name may legally carry
+    bytes >= 0x80 and `.pr_brs` is built from `gh`'s `.[]|.head.ref`."""
     p = os.path.join(O, name)
-    return [l.strip() for l in open(p)] if os.path.exists(p) else []
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p, encoding="utf-8", errors="strict") as fh:
+            return [l.strip() for l in fh]
+    except (OSError, UnicodeDecodeError):
+        return None
+def read_soft(name):
+    """Read one state file, distinguishing ABSENT/EMPTY ([]) from UNREADABLE (None).
+    ⛔ The distinction is load-bearing: `candidates.txt` is a DIRECTORY on a box whose queue write is
+    broken, and treating that as "nothing is queued" would be an inference from a failed read. The
+    caller decides — the checked classification refuses on an unreadable `dispatched.txt` (releasing a
+    dispatched-but-undelivered entry would re-dispatch it) and proceeds on an absent one."""
+    p = os.path.join(O, name)
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p) as fh:
+            return [l.strip() for l in fh]
+    # ⛔ `UnicodeDecodeError` IS NOT AN `OSError` (review P3, #2183). One stray byte in a listing would
+    # escape this helper, abort the reap and take EVERY pass down with it — a permanent no-dispatch
+    # loop, the exact class this change exists to remove. A corrupt byte is the documented UNREADABLE,
+    # so the caller refuses the classification by name instead.
+    except (OSError, UnicodeDecodeError):
+        return None
+def publish(name, text):
+    """Write one state record atomically (write + rename), so a reader never sees a torn file.
+    ⛔ CHECKED, like every sibling write in this block (review). `open()`/`os.replace()` were unguarded,
+    so ENOSPC mid-pass, EACCES, or a DIRECTORY where `state/checked-kept` /
+    `state/checked-release-candidates` should be raised out of this heredoc: `reap_rc` non-zero aborts the
+    pass with EXIT_TRANSIENT, on EVERY subsequent pass — the permanent no-dispatch loop that presents as
+    RUNNING, which is the exact class this change removes for `candidates.txt`/`checked.txt`. A publish
+    that cannot land now prints the NAMED refusal and takes the SAME rc it took before (a traceback became
+    an abort); what it no longer does is blame the blacklist rewrite for a state-file write."""
+    tmp = os.path.join(ST, ".%s.%d" % (name, os.getpid()))
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, os.path.join(ST, name))
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        print("[reap] ABORT: cannot publish %s under %s (%s) — the classification is recorded there, so "
+              "this pass cannot report what it kept or released" % (name, ST, exc))
+        raise SystemExit(1)
+# ⛔ THE REAPER IS THE FIRST THING IN THIS SCRIPT THAT WRITES UNDER $O/state, AND ITS WRITES ARE
+# FAIL-CLOSED (a failure aborts the pass below). The directory is created earlier by
+# `gh_pass_cache_start`, but that mkdir is deliberately FAIL-OPEN (`if mkdir -p … 2>/dev/null`), so a
+# box where it failed would abort every pass HERE — a permanent no-dispatch loop with no cause
+# printed. Creating it again, fail-closed, makes that failure one named refusal instead.
+try:
+    os.makedirs(ST, exist_ok=True)
+except OSError as exc:
+    print("[reap] ABORT: cannot create %s (%s) — the reap pass records its classification there (#2183)" % (ST, exc))
+    raise SystemExit(1)
 # ⛔ FAIL CLOSED. An ABSENT list means the read FAILED, which is not the same as "the answer is
 # none". The capture above deletes the file when `gh` fails, so absence is the failure signal — and
 # without this guard `brs == []` makes `has_pr` false for EVERY issue, un-blacklisting open issues
@@ -1671,39 +1939,183 @@ def lines(name):
 # for them. Refuse the whole pass and leave the blacklist untouched, so the next cycle retries with a
 # live listing. A PRESENT but EMPTY file is a real answer ("no PRs") and is still reaped.
 # (agent-infra#1705)
-missing = [f for f in (".open_iss", ".pr_brs") if not os.path.exists(os.path.join(O, f))]
-if missing:
-    print("[reap] SKIPPED: %s not readable — an unreadable listing is not an empty one; blacklist untouched"
-          % " ".join(missing))
+# ── THE TWO LISTINGS ARE READ BY DIFFERENT HALVES OF THIS PASS ─────────────────────────────────
+# `.open_iss` is consumed ONLY by the dispatched reap below; the checked classification reads
+# `candidates.txt`, `dispatched.txt`, `.pr_brs`, `tmux` and the claim registry. Under the old single
+# guard an issues-listing failure ALSO skipped the checked classification, so `checked.txt` kept
+# suppressing for ever on a failure that had nothing to do with it — the suppression-with-no-
+# justification this change exists to remove. The guard is therefore SPLIT by what each half reads.
+have_open = os.path.exists(os.path.join(O, ".open_iss"))
+have_pr = os.path.exists(os.path.join(O, ".pr_brs"))
+# PRESENT BUT UNDECODABLE IS THE ABSENT CASE (see `lines()`): existence is not readability, and the
+# guard below is the one place that turns "I could not read this listing" into "do not decide on it".
+_open_rows = lines(".open_iss") if have_open else []
+_pr_rows = lines(".pr_brs") if have_pr else []
+if _open_rows is None:
+    have_open = False; _open_rows = []
+if _pr_rows is None:
+    have_pr = False; _pr_rows = []
+if not have_open or not have_pr:
+    print("[reap] SKIPPED: %s not readable — an unreadable listing is not an empty one; the "
+          "dispatched blacklist is untouched%s"
+          % (" ".join(f for f, ok in ((".open_iss", have_open), (".pr_brs", have_pr)) if not ok),
+             "; the checked classification still runs" if (not have_open and have_pr) else ""))
+# ⛔ THE CHECKED CLASSIFICATION CANNOT RULE OUT A PR WITHOUT `.pr_brs`, so it refuses the WHOLE
+# classification rather than releasing on the facts it happens to have. Same polarity as #1705,
+# applied to the other reader of the same listing: an unreadable listing is not an empty one.
+if not have_pr:
+    _REFUSED = "pr-brs-unreadable"
+    print("[reap] SKIPPED (checked: .pr_brs unreadable) — a suppression is released only when a "
+          "re-checkable fact holds, and without the PR listing one of those facts cannot be read")
+    publish("checked-reap", "released=0 deferred=0 unjustified=- refused=%s at=%d\n" % (_REFUSED, int(time.time())))
     raise SystemExit(0)
-open_iss = {l for l in lines(".open_iss") if l}
-brs = [l for l in lines(".pr_brs") if l]
+open_iss = {l for l in _open_rows if l}
+brs = [l for l in _pr_rows if l]
+# ⛔ AN UNREADABLE SESSION LIST IS NOT "NO LANES" (review E-P3, cycle 2). `tmux ls`'s exit status was
+# discarded and every failure collapsed into `out = ""`, so a tmux that could not answer silently
+# REMOVED the `lane` keep fact — moving live lanes toward release, which is the duplicate-dispatch
+# direction. `lane` is one of the facts this pass converts into a release decision, so it gets the
+# same rule as the two listings. The two benign readings are named explicitly rather than inferred:
+# no tmux binary (a box without tmux runs no lanes), and tmux's own "no server running".
+_live_unreadable = False
+live = set()
 try:
-    out = subprocess.run(["tmux", "ls", "-F", "#{session_name}"], capture_output=True, text=True).stdout
+    _tm = subprocess.run(["tmux", "ls", "-F", "#{session_name}"], capture_output=True, text=True)
+    if _tm.returncode == 0:
+        live = {m.group(1) for m in re.finditer(r"^lane-(\d+)$", _tm.stdout or "", re.M)}
+    elif "no server running" in (_tm.stdout or "") + (_tm.stderr or ""):
+        live = set()
+    elif shutil.which("tmux") is None:
+        live = set()
+    else:
+        _live_unreadable = True
+except FileNotFoundError:
+    live = set()
 except Exception:
-    out = ""
-live = {m.group(1) for m in re.finditer(r"^lane-(\d+)$", out, re.M)}
-keep, reaped = [], []
-for n in lines("dispatched.txt"):
+    _live_unreadable = True
+if _live_unreadable:
+    _REFUSED = "live-sessions-unreadable"
+    print("[reap] SKIPPED (checked: the live-session list could not be read) — `lane` is one of the "
+          "facts this pass releases on, so an unanswerable `tmux ls` must not free anything")
+    publish("checked-reap", "released=0 deferred=0 unjustified=- refused=%s at=%d\n" % (_REFUSED, int(time.time())))
+    raise SystemExit(0)
+_disp_rows = lines("dispatched.txt") if have_open else []
+# ⛔ NOT "NOTHING IS DISPATCHED": an empty read would make every entry look un-dispatched, and the
+# reap would then WRITE that emptiness back — the duplicate-lane direction (a blacklist silently
+# destroyed). So the unreadable case publishes the refusal AND disables the reap entirely; substituting
+# `[]` here and letting the block below run would rewrite `dispatched.txt` as empty, which is the very
+# destruction the guard exists to prevent (measured on this fixture: the first cut of this fix emptied
+# the file and the classification then read a healthy empty blacklist).
+_disp_ok = _disp_rows is not None
+if not _disp_ok:
+    print("[reap] SKIPPED (dispatched.txt unreadable) — an unreadable blacklist is not an empty one; "
+          "nothing is reaped and the file is left exactly as it was")
+    _disp_rows = []
+if have_open and _disp_ok:
+    keep, reaped = [], []
+    for n in _disp_rows:
+        if not n:
+            continue
+        if n in live:
+            keep.append(n); continue
+        has_pr = any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
+        if n in open_iss and not has_pr:
+            reaped.append(n)
+        else:
+            keep.append(n)
+    with open(os.path.join(O, "dispatched.txt"), "w") as fh:
+        fh.write("\n".join(keep) + ("\n" if keep else ""))
+    if reaped:
+        gone = set(reaped)
+        ck = os.path.join(O, "checked.txt")
+        _ck_rows = lines("checked.txt")
+        if _ck_rows is None:
+            # ⛔ WRITING THE DROP FROM AN UNREADABLE FILE WOULD EMPTY `checked.txt` — an unreadable
+            # file is not an empty one, so the drop is skipped and the numbers stay (the checked
+            # classification releases them anyway once a fact says they are free).
+            print("[reap] SKIPPED (checked.txt unreadable for the blacklist drop) — the %d un-blacklisted "
+                  "number(s) stay in checked.txt this pass" % len(reaped))
+            kept_ck = None
+        else:
+            kept_ck = [l for l in _ck_rows if l and l not in gone]
+        if kept_ck is not None and os.path.exists(ck):
+            with open(ck, "w") as fh:
+                fh.write("\n".join(kept_ck) + ("\n" if kept_ck else ""))
+        print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
+
+# ── THE CHECKED CLASSIFICATION: A SUPPRESSION SURVIVES ONLY WHILE A RE-CHECKABLE FACT HOLDS ─────
+# `checked.txt` short-circuits the walk before any network call, so an entry in it is invisible to
+# every later pass — and until now NOTHING revalidated it. The only thing that ever removed an entry
+# was the dispatched reap above, which walks a DIFFERENT file. So a CLEAN-judged candidate that was
+# never dispatched is suppressed for ever, and the dispatch line reports it as `N blacklisted
+# (checked)` with no reason (agent-infra#2183).
+# ⛔ KEEP FACTS ARE POSITIVE EVIDENCE ONLY, and each is a fact THIS pass can re-read:
+#   dispatched  the blacklist still names it (its dispatch is not yet delivered)
+#   queued      it is still waiting in candidates.txt for the dispatcher
+#   pr          a PR head ref names it
+#   lane        a live `lane-N` session exists (the ONE `tmux ls` above, already paid for)
+# NOT keep facts, and why:
+#   absent from `.open_iss`  it is a 500-row created-DESC WINDOW: the oldest open issues fall out of
+#                            it permanently, so absence is not "closed". Its documented loss only
+#                            NARROWS this pass, so it can never be a terminal fact.
+#   a branch ref             the scout is fetched without `--prune`, so a deleted branch's ref never
+#                            goes away — unbounded evidence. The pre-flight's own branch/PR COLLISION
+#                            already refuses to queue such an issue, TTL-bounded by the collision
+#                            ledger, which is the right home for a fact that expires.
+# STATED RESIDUAL: `.pr_brs` is the same 500-row window, and a PR whose head ref does not embed the
+# issue number never matches — both make the `pr` keep fact MISSING for old or oddly-named PRs, which
+# releases the entry and buys ONE re-judge (the pre-flight then answers COLLISION for a live PR). A
+# cost, not a correctness guarantee, and it is bounded by the release cap in the bash filter.
+def pr_ref(n):
+    return any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
+_disp = read_soft("dispatched.txt")
+_queued = read_soft("candidates.txt")
+_cksrc = read_soft("checked.txt")
+if _disp is None:
+    # ⛔ FAIL CLOSED, for the ONE file whose misreading re-dispatches work: an unreadable
+    # `dispatched.txt` is not an empty one, so every entry whose only keep fact is "already
+    # dispatched" would look releasable and buy a duplicate lane.
+    _REFUSED = "dispatched-unreadable"
+    print("[reap] SKIPPED (checked: dispatched.txt unreadable) — its entries cannot be told apart from "
+          "releasable ones, so nothing is released this pass")
+    publish("checked-reap", "released=0 deferred=0 unjustified=- refused=%s at=%d\n" % (_REFUSED, int(time.time())))
+    raise SystemExit(0)
+if _cksrc is None:
+    _REFUSED = "checked-unreadable"
+    print("[reap] SKIPPED (checked: checked.txt unreadable) — there is nothing to classify")
+    publish("checked-reap", "released=0 deferred=0 unjustified=- refused=%s at=%d\n" % (_REFUSED, int(time.time())))
+    raise SystemExit(0)
+# An unreadable `candidates.txt` yields NO `queued` keep fact. That direction is safe: a released
+# entry is only RE-JUDGED (the pre-flight answers it again, and a CLEAN re-appends it), so the most
+# this costs is one wasted pre-flight per entry — never a duplicate dispatch, which needs the
+# dispatched check above.
+dispatched_set = {l for l in _disp if l}
+queued_set = {l for l in (_queued or []) if l}
+kept, releasable = [], []
+for n in _cksrc:
     if not n:
         continue
-    if n in live:
-        keep.append(n); continue
-    has_pr = any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
-    if n in open_iss and not has_pr:
-        reaped.append(n)
+    if n in dispatched_set:
+        kept.append((n, "dispatched"))
+    elif n in queued_set:
+        kept.append((n, "queued"))
+    elif pr_ref(n):
+        kept.append((n, "pr"))
+    elif n in live:
+        kept.append((n, "lane"))
     else:
-        keep.append(n)
-with open(os.path.join(O, "dispatched.txt"), "w") as fh:
-    fh.write("\n".join(keep) + ("\n" if keep else ""))
-if reaped:
-    gone = set(reaped)
-    ck = os.path.join(O, "checked.txt")
-    kept = [l for l in lines("checked.txt") if l and l not in gone]
-    if os.path.exists(ck):
-        with open(ck, "w") as fh:
-            fh.write("\n".join(kept) + ("\n" if kept else ""))
-    print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
+        releasable.append(n)
+# ⛔ THIS DOES NOT REWRITE checked.txt BEYOND THE PRE-EXISTING `dispatched.txt` DROP ABOVE. It
+# publishes what it CLASSIFIED and lets the bash claim filter perform the single release rewrite,
+# once, after the claim registry has had its say — so there is exactly one writer of a release, and
+# an entry the registry keeps never has to be put back.
+publish("checked-kept", "".join("%s\t%s\n" % (n, r) for n, r in kept))
+publish("checked-release-candidates", "".join(n + "\n" for n in dict.fromkeys(releasable)))
+print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d releasable=%d"
+      % (len(kept) + len(releasable),
+         sum(1 for _, r in kept if r == "dispatched"), sum(1 for _, r in kept if r == "queued"),
+         sum(1 for _, r in kept if r == "pr"), sum(1 for _, r in kept if r == "lane"),
+         len(releasable)))
 
 # ── landed.txt: a REPORTED decision, never a second blacklist (tortoise#8560/#8625/#8629) ─────
 # `landed.txt` is the LANDED verdicts' home. An entry whose issue is now CLOSED has had its decision
@@ -1727,7 +2139,19 @@ if reaped:
 # ⛔ FAIL CLOSED PER ENTRY: an entry whose state cannot be read is KEPT — a failed read never drops a
 # suppression that may still be owed. Named in the log, so it is never silent.
 lp = os.path.join(O, "landed.txt")
-landed_entries = [l for l in lines("landed.txt") if l]
+# ⛔ UNREADABLE IS NOT EMPTY, AND IT MUST NOT ABORT THE PASS. `lines()` returns `None` for
+# UNREADABLE (see its own contract), and this caller was the one site the merge left unguarded: a
+# single stray byte — or `landed.txt` being a directory, the shape `read_soft` documents — raised
+# `TypeError: 'NoneType' object is not iterable`, the reap exited non-zero, and the caller refused the
+# whole pass TRANSIENTLY every cycle: the permanent no-dispatch loop this change exists to remove.
+# `or []` reads as "nothing to settle this pass", which leaves landed.txt UNTOUCHED — every entry is
+# kept, i.e. fail-closed per entry, the same polarity as the per-entry `landed_issue_state` rule below.
+_landed_rows = lines("landed.txt")
+if _landed_rows is None:
+    print("[reap] SKIPPED (landed.txt unreadable) — no landed entry is settled or released this pass; "
+          "an unreadable file is not an empty one")
+    _landed_rows = []
+landed_entries = [l for l in _landed_rows if l]
 
 def landed_issue_state(n):
     """The issue's own state, straight from gh — UNCAPPED, and None on ANY failure
@@ -1779,6 +2203,316 @@ if [ "$reap_rc" -ne 0 ]; then
 fi
 for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
 
+# ── THE CLAIM FILTER: A SUPPRESSION SURVIVES ONLY WHILE A FACT THAT CAN BE RE-CHECKED HOLDS ─────
+# The reaper has classified `checked.txt` against LOCAL facts and published the residue in
+# `state/checked-release-candidates`. The one fact it cannot read locally is the cross-box ISSUE
+# CLAIM — an issue a peer started ten seconds ago has no lane, no branch and no PR, so a local-only
+# view would release it and buy a duplicate dispatch. So the residue is asked of the AUTHORITATIVE
+# reader already shipped (`issue_claim_verdict`), whose lease polarity — absent / live / unreadable /
+# stale — is reused rather than re-derived here: one authority for "is this held".
+# ⛔ THIS BLOCK SITS ABOVE THE AFFORDABILITY REFUSAL, DELIBERATELY. The file's own #1736 follow-up
+# note records why housekeeping placed BELOW an affordability gate stops happening exactly on the
+# starved box — which is the box where a stale suppression hurts most, because the pass has no other
+# work to do. What this block costs is `git ls-remote`, i.e. git transport, NOT the REST core budget
+# the starve gate protects.
+# ⛔ AND IT IS BOUNDED BY A ROTATING CURSOR, not by a head window. `CHECKED_RELEASE_MAX` asks per pass
+# against a sorted candidate list, starting after `state/checked-release-cursor` and wrapping to the
+# start, so a head of permanently-held entries can never consume the budget for ever (a plain
+# "first MAX" window would starve everything behind them, which is the very defect #1729 fixed for
+# the pre-flight walk). Candidate lists are sorted numerically first, because a rotation is only a
+# rotation over an ORDERED list — on an unsorted list a window whose last element is its numeric
+# maximum repeats forever and the tail is never asked.
+# ⛔ THE CURSOR IS THE **LAST ASKED** NUMBER, NOT THE RUNNING MAXIMUM (review P1, #2183). Storing the
+# maximum froze the ring the moment it reached the largest candidate: the cursor could then never
+# move again (every later ask is smaller), so pass 1 always asked nothing, pass 2 always asked the
+# SAME first MAX entries, and everything beyond them was never asked again — a suppression whose
+# release no pass could ever re-check, i.e. exactly the #2183 defect this block exists to end.
+# `last asked` advances on every capped pass (resuming mid-ring), and a pass that swept the whole
+# ring without hitting the cap resets it to 0 (the ring is covered; the next pass starts at the
+# head).
+# ⛔ A NON-NUMERIC (OR ZERO) CAP MUST NOT REMOVE THE BOUND (review P3, #2183). `[ 3 -ge abc ]` prints
+# "integer expression expected" and evaluates FALSE, so an unvalidated typo would make the cap NEVER
+# bind — every candidate without a local keep-fact asked in one pass, one `git ls-remote` plus a
+# `git fetch` per held claim, growing with `checked.txt`. That is the same "an errored test is FALSE,
+# and FALSE opens the gate" shape this file already records for MAX_LANES. `0` is coerced too: it
+# would ask nothing and publish every entry as `deferred` for ever — a silent disable wearing the
+# shape of a measurement.
+CHECKED_RELEASE_MAX="${CHECKED_RELEASE_MAX:-24}"
+case "$CHECKED_RELEASE_MAX" in ''|*[!0-9]*) CHECKED_RELEASE_MAX=24 ;; 0) CHECKED_RELEASE_MAX=24 ;; esac
+# ⛔ AN ALL-DIGIT VALUE IS NOT YET IN RANGE (review B-P3 / E-P3, cycle 2). `[ 3 -ge 99999999999999999999 ]`
+# prints "integer expression expected" and evaluates FALSE, so a value past intmax disarms the cap
+# exactly as a typo did — measured: 30 held candidates, all asked in one pass, `deferred=0`. Six digits
+# is four hundred times the default; anything larger is a mistake, not an intent.
+case "${#CHECKED_RELEASE_MAX}" in
+  7|8|9|10|11|12|13|14|15|16|17|18|19|20) CHECKED_RELEASE_MAX=24 ;;
+esac
+# ⛔ AND A SANE CEILING, because each ask is an UN-TIMEOUTED `git ls-remote` (+ a `git fetch` per live
+# claim; claims.sh has no per-call timeout): `100000` is a valid 6-digit value that would turn the pass
+# into something that cannot finish (review cycle 4, E-P3). ⛔ WHAT THE CEILING BOUNDS IS THE COUNT,
+# NOT THE WALL CLOCK (review E-P3, cycle 5): 96 asks against a blackholed origin is still hours of
+# kernel connect timeouts, so a pass can outlive the loop's 20-minute stale-lock bound and two passes
+# can share one `$O`. That is the RECORDED RESIDUAL — the remedy is a per-call `timeout` in
+# `claims.sh`, another owner's file. The coercion is LOUD, because the operator line tells them to
+# raise this knob.
+if ! [ "$CHECKED_RELEASE_MAX" -le 96 ] 2>/dev/null; then
+  echo "[reap] WARN: CHECKED_RELEASE_MAX=$CHECKED_RELEASE_MAX is above the supported ceiling — using 96 (each ask is an un-timeouted git call; raise it only with a per-call timeout in claims.sh)"
+  CHECKED_RELEASE_MAX=96
+fi
+_ck_released_n=0
+_ck_deferred_n=0
+_ck_unjustified_n=0
+if [ -f "$O/state/checked-release-candidates" ]; then
+  # every decision this pass makes, one `N<TAB>reason` line, written once and read three times below
+  # ⛔ `$$`, like `checked-reap.$$` below (review E-P2, cycle 2): these are FIXED paths under `$O`, and
+# this script takes no `$O/.refresh.lock` of its own — `orch-loop.sh` holds it, with a stale bound a
+# hung git call can outlive. Two writers on one truncated path leave a PARTIAL line that the `mv` then
+# installs as `checked.txt`, silently suppressing a number nobody classified.
+_ck_tmp="$O/.checked-decided.$$"
+: > "$_ck_tmp" || { echo "[refresh] ABORT: cannot write $_ck_tmp — the checked classification could not be persisted (#2183)"; exit "$EXIT_TRANSIENT"; }
+  if [ ! -s "$O/state/checked-release-candidates" ]; then
+    : # the classification ran and found EVERY entry justified: nothing to ask, nothing to release
+  elif [ ! -f "$O/claims.sh" ]; then
+    # ⛔ A BOX WITHOUT THE REGISTRY IS THE DOCUMENTED LOUD FALLTHROUGH (issue_claim_verdict's STATED
+    # LIMIT): it cannot take a claim either, so refusing to release would leave a suppression no
+    # reader on that box could ever justify. No network read happens here, so the cap does not apply.
+    echo "[reap] the claim registry ($O/claims.sh) is NOT INSTALLED — releasing on local facts only (documented fallback)"
+    # ⛔ AND THE LINE SAYS SO (review E, cycle 5): the claim read is the one fact this pass cannot
+    # answer locally, and a release made without it is indistinguishable on the operator line from a
+    # fully claim-checked one. `none` means "nothing was refused"; this uses its own value.
+    CHECKED_REFUSED="claim-registry-absent"
+    while IFS= read -r _n; do
+      case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
+      printf '%s\treleased\n' "$_n" >> "$_ck_tmp"
+    done < "$O/state/checked-release-candidates"
+  else
+    _ck_sorted="$(mktemp "${TMPDIR:-/tmp}/ck-sorted.XXXXXX")" || _ck_sorted=""
+    # ⛔ A FAILED SORT IS NOT A BINDING CAP (review cycle 3). Both failures landed every candidate in
+    # `deferred`, which the reader renders as "CHECKED_RELEASE_MAX is too small for this cell" — the
+    # wrong knob, about a release that in fact never ran. The cause is recorded separately and the
+    # reader says so; the rows are `unknown` (no later pass reached them either).
+    _ck_sort_failed=0
+    if [ -z "$_ck_sorted" ]; then
+      _ck_sort_failed=1
+      echo "[reap] WARN: could not create the release sort temp file (mktemp failed in ${TMPDIR:-/tmp}) — the checked release did NOT run this pass"
+    # ⛔ `-u`: a duplicated row in `checked.txt` is reachable (the walk appends with no duplicate
+    # guard) and, without dedupe, it is asked twice, spends two slots of the cap, and makes
+    # `checked_released=` report two releases for one entry — the number the operator reads as "how
+    # many suppressions were cleared" (review cycle 4, B-P3).
+    elif ! sort -nu "$O/state/checked-release-candidates" > "$_ck_sorted" 2>/dev/null; then
+      _ck_sort_failed=1
+      : > "$_ck_sorted"
+      echo "[reap] WARN: could not sort the release candidates (sort failed) — the checked release did NOT run this pass"
+    fi
+    _ck_cursor=0
+    if [ -r "$O/state/checked-release-cursor" ]; then
+      _ck_cursor="$(tr -dc '0-9' < "$O/state/checked-release-cursor" 2>/dev/null)"
+      [ -n "$_ck_cursor" ] || _ck_cursor=0
+      # ⛔ A CURSOR THIS READER CANNOT COMPARE IS NOT A CURSOR (review E-P2, cycle 2). `tr -dc` on a
+      # file holding TWO stamps (or on anything past intmax) yields a value for which BOTH ring
+      # comparisons error to FALSE: pass 1 skips every entry, pass 2 skips every entry, nothing is
+      # asked, and the poisoned value is re-persisted unchanged — a permanent stall that reads as
+      # `unjustified=0`. Measured with a cursor file of two concatenated stamps (20 digits): 0 asks.
+      # The safe reset is 0 (start at the head), never a guess at the intended position.
+      # ⛔ THE INVARIANT, NOT AN ENUMERATION (review B-P2, cycle 5): a list of forbidden lengths is a
+      # hole above its last value — a cursor of 30 digits (three concatenated stamps) escaped the
+      # 7..20 arm, made BOTH comparisons error to FALSE, asked nothing, and re-persisted itself: the
+      # permanent stall the cycle-2 fix exists to end, one stamp further along. An issue number this
+      # harness can compare is 1..6 digits (the same bound the ask loop and the cap use).
+      case "${#_ck_cursor}" in
+        1|2|3|4|5|6) : ;;
+        *)
+          echo "[reap] WARN: state/checked-release-cursor is not a comparable issue number ($_ck_cursor) — restarting the rotation at the head of checked.txt"
+          _ck_cursor=0 ;;
+      esac
+    fi
+    _ck_asked=0
+    _ck_last_asked=""       # the LAST number asked, in ring order — the cursor advances to it
+    _ck_next_cursor=""
+    for _ck_pass in 1 2; do
+      [ "$_ck_asked" -ge "$CHECKED_RELEASE_MAX" ] && break
+      [ -n "$_ck_sorted" ] || break
+      while IFS= read -r _n; do
+        case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
+        # ⛔ THE CURSOR AND THE CAP ARE LENGTH-CLAMPED; THE NUMBER IS COMPARED TOO (review cycle 3).
+        # A row of 30 digits passes the digit gate and then makes BOTH ring comparisons error to FALSE
+        # (`integer expression expected`), so it is never asked by any pass — and the deferred sweep
+        # called it `deferred`, which the reader renders as "raise CHECKED_RELEASE_MAX": a false
+        # instruction about a knob that cannot help. It is `unknown` (see the sweep below).
+        [ "${#_n}" -le 6 ] || continue
+        [ "$_ck_asked" -ge "$CHECKED_RELEASE_MAX" ] && break
+        # pass 1 = what lies after the cursor; pass 2 = the wrap. Nothing is ever skipped: an entry
+        # not asked this pass is `deferred`, recorded as such, and reached by a later pass.
+        if [ "$_ck_pass" -eq 1 ]; then
+          [ "$_n" -gt "$_ck_cursor" ] || continue
+        else
+          [ "$_n" -le "$_ck_cursor" ] || continue
+        fi
+        issue_claim_verdict "$_n"; _ck_rc=$?
+        _ck_asked=$(( _ck_asked + 1 ))
+        _ck_last_asked="$_n"
+        case "$_ck_rc" in
+          0) printf '%s\treleased\n' "$_n" >> "$_ck_tmp" ;;
+          1) printf '%s\tclaim\n' "$_n" >> "$_ck_tmp" ;;
+          3) # ⛔ THE PROVISIONING CHANNEL, the same one the walk uses (refresh-candidates.sh's CLEAN
+             # arm, ICR=3): local, PERMANENT, and fixable in one `cp`. Absorbing it into
+             # `claim-unknown` would keep the suppression forever on a box whose problem is that its
+             # `claims.sh` predates `claim_issue_preflight` — so orch-loop.sh records
+             # `.refresh-blocked` and `status` names the reason, instead of a cell that looks healthy.
+             echo "[reap] NOT PROVISIONABLE: ${CLAIM_RESULT:-$O/claims.sh cannot answer the issue-claim question on #$_n} — the checked classification cannot be decided on this box"
+             # ⛔ THE REMEDY NAMES THE VERIFYING SEEDER (agent-infra#2041/#2382): a bare `cp *.sh` ships the
+             # module with no verdict — the exact remedy deploy-harness.test.sh refuses to let a shipped
+             # script hand an operator, and this line was added by this branch while that gate was landing.
+             echo "[reap]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run)"
+             rm -f "$_ck_tmp" 2>/dev/null; [ -n "$_ck_sorted" ] && rm -f "$_ck_sorted" 2>/dev/null
+             exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
+          # ⛔ NEVER RELEASE ON A CODE THIS READER DOES NOT RECOGNISE (127 from a missing function, or
+          # any code a future registry invents). An unrecognised answer is not evidence of freedom —
+          # it is `claim-unknown`, kept, and COUNTED, so the line shows an unproven suppression
+          # rather than an empty one.
+          *) printf '%s\tclaim-unknown\n' "$_n" >> "$_ck_tmp" ;;
+        esac
+      done < "$_ck_sorted"
+    done
+    # everything the cap did not reach is DEFERRED — kept, and named, so a bounded pass is still an
+    # auditable one (an unasked entry must never look like an unjustified one).
+    # ⛔ AN EMPTY `.checked-decided` IS NOT A REASON TO DROP THE LIST. `NR==FNR` is true for the
+    # FIRST RECORD OF THE SECOND FILE whenever the first file is EMPTY, so the entire candidate list
+    # was consumed as if it were the decision file and nothing was written. The reachable route is a
+    # failed `mktemp`/`sort` (the release sort cannot be created, so no ask is made) — NOT
+    # `CHECKED_RELEASE_MAX=0`, which the cap coerces to 24. The pass then published `deferred=0`
+    # while N entries were never asked, and they reached the walk as `skipped_checked_unknown`:
+    # the sum still closed, so `reason_conflict` could never fire.
+    # ⛔ AND A ROW THAT IS NOT AN ISSUE NUMBER IS NOT `deferred` (review E, cycle 2). The ask loop
+    # skips non-numeric rows (`case ... *[!0-9]*) continue`), so such a row can never be asked — yet
+    # the sweep below called it `deferred`, i.e. "reached by a later pass", which is false for ever.
+    # It is `unknown`: a corrupted line in `checked.txt` that suppresses nothing and that no pass can
+    # ever justify.
+    # A row is `deferred` only if a LATER PASS COULD ACTUALLY ASK IT: a real issue number at most 6
+    # digits (the cap the ask loop compares with). Anything else is `unknown` — it can never be asked,
+    # so calling it deferred would promise a release that cannot happen.
+    if [ "$_ck_sort_failed" -eq 1 ]; then
+      awk -F'\t' 'NF && !seen[$1]++{print $1"\tunknown"}' \
+        "$O/state/checked-release-candidates" >> "$_ck_tmp"
+    elif [ -s "$_ck_tmp" ]; then
+      awk -F'\t' 'FILENAME==ARGV[1]{d[$1]=1;next} NF && !($1 in d) && !seen[$1]++{ \
+                     if ($1 ~ /^[0-9]+$/ && length($1) <= 6) print $1"\tdeferred"; else print $1"\tunknown" }' \
+        "$_ck_tmp" "$O/state/checked-release-candidates" >> "$_ck_tmp"
+    else
+      awk -F'\t' 'NF && !seen[$1]++{ \
+                     if ($1 ~ /^[0-9]+$/ && length($1) <= 6) print $1"\tdeferred"; else print $1"\tunknown" }' \
+        "$O/state/checked-release-candidates" >> "$_ck_tmp"
+    fi
+    # ── the cursor to persist: capped ⇒ resume AFTER the last asked; ring swept ⇒ restart at the
+    # head (0); nothing asked at all ⇒ leave it exactly where it was.
+    if [ "$_ck_asked" -ge "$CHECKED_RELEASE_MAX" ] && [ -n "$_ck_last_asked" ]; then
+      _ck_next_cursor="$_ck_last_asked"
+    elif [ "$_ck_asked" -gt 0 ]; then
+      _ck_next_cursor=0
+    else
+      _ck_next_cursor="$_ck_cursor"
+    fi
+    if printf '%s\n' "$_ck_next_cursor" > "$O/state/.checked-release-cursor.$$" 2>/dev/null \
+       && mv "$O/state/.checked-release-cursor.$$" "$O/state/checked-release-cursor" 2>/dev/null; then :
+    else
+      rm -f "$O/state/.checked-release-cursor.$$" 2>/dev/null
+      echo "[reap] WARN: could not persist the release cursor in $O/state/checked-release-cursor — the next pass restarts at the head of checked.txt (slower, and nothing is lost)"
+    fi
+    [ -n "$_ck_sorted" ] && rm -f "$_ck_sorted"
+  fi
+  # ── THE SINGLE RELEASE WRITER ────────────────────────────────────────────────────────────────
+  # `checked.txt` is rewritten HERE and nowhere else for a release (the heredoc's pre-existing
+  # `dispatched.txt` drop is a different decision and is untouched). Atomic via `mv`: a concurrent
+  # reader sees the old file or the new one, never a torn one.
+  # ⛔ A FAILED PUBLISH IS NOT "NOTHING WAS RELEASED" (review E-P2 / B-P4, cycle 5). Measured: with
+  # `state/checked-release` a DIRECTORY, `mv` moves the temp INSIDE it and returns 0, `wc -l < dir`
+  # yields "", `_ck_released_n` becomes 0, the `checked.txt` rewrite is skipped (it is guarded on
+  # `> 0`) and the funnel publishes `checked_released=0` — every number on the operator line reading
+  # clean while N decided releases freed nothing. The sibling arms all publish `-` for this; so does
+  # this one now, and the count is taken from the DECISION file, not from the file that just failed.
+  _ck_decided_released="$(grep -c 'released$' "$_ck_tmp" 2>/dev/null || :)"
+  case "${_ck_decided_released:-}" in ''|*[!0-9]*) _ck_decided_released=0 ;; esac
+  _ck_published=0
+  if awk -F'\t' '$2=="released"{print $1}' "$_ck_tmp" > "$O/state/.checked-release.$$" 2>/dev/null \
+     && mv "$O/state/.checked-release.$$" "$O/state/checked-release" 2>/dev/null \
+     && [ -f "$O/state/checked-release" ]; then
+    _ck_released_n="$(wc -l < "$O/state/checked-release" 2>/dev/null | tr -d ' ')"
+    case "${_ck_released_n:-}" in ''|*[!0-9]*) _ck_released_n=0 ;; esac
+    [ "$_ck_released_n" = "$_ck_decided_released" ] && _ck_published=1
+  fi
+  if [ "$_ck_published" -ne 1 ]; then
+    rm -f "$O/state/.checked-release.$$" 2>/dev/null
+    _ck_released_n="-"
+    echo "[reap] WARN: could not publish $O/state/checked-release (the release list did not land as a regular file with the expected $(printf '%s' "$_ck_decided_released") line(s)) — publishing released=- (unknown); the entries stay suppressed until a later pass re-asks them"
+  fi
+  _ck_deferred_n="$(grep -c 'deferred$' "$_ck_tmp" 2>/dev/null || :)"
+  _ck_unjustified_n="$(grep -c 'claim-unknown$' "$_ck_tmp" 2>/dev/null || :)"
+  case "${_ck_deferred_n:-}" in ''|*[!0-9]*) _ck_deferred_n=0 ;; esac
+  case "${_ck_unjustified_n:-}" in ''|*[!0-9]*) _ck_unjustified_n=0 ;; esac
+  if [ "$_ck_released_n" != "-" ] && [ "$_ck_released_n" -gt 0 ]; then
+    # ⛔ AND THE ONE TEMP THAT BECOMES `checked.txt` ITSELF (review cycle 3, three reviewers). This was
+    # the last fixed path in the block: two overlapping passes (this block now spends up to
+    # CHECKED_RELEASE_MAX un-timeouted `git ls-remote` calls above the affordability gate, so a pass can
+    # outlive `orch-loop.sh`'s 20-minute stale-lock bound) both truncate the same inode and either may
+    # `mv` a half-written or foreign snapshot into `checked.txt` — resurrecting entries that
+    # `state/checked-release` reported released, or installing a number nothing classified.
+    if awk 'NR==FNR{d[$1]=1;next} !($1 in d)' "$O/state/checked-release" "$O/checked.txt" > "$O/.checked.new.$$" 2>/dev/null \
+       && mv "$O/.checked.new.$$" "$O/checked.txt" 2>/dev/null; then
+      echo "[reap] released from checked.txt (no queued/dispatched/PR/lane/claim fact): $(tr '\n' ' ' < "$O/state/checked-release")"
+      # ⛔ THE POSTCONDITION, NOT THE INTENT (review cycle 4, E-P3). `$$` on the temp only prevents a
+      # TORN LINE; the `mv` can still install a snapshot read before another pass's write, which keeps
+      # suppressing entries this pass is about to report as released — "a count for entries the file
+      # still suppresses", the very thing the failed-rewrite arm below refuses to publish. So the
+      # claim is CHECKED: if any released number is still in the file, the count is unknown.
+      if [ -s "$O/state/checked-release" ] && grep -qFx -f "$O/state/checked-release" "$O/checked.txt" 2>/dev/null; then
+        _ck_released_n="-"
+        echo "[reap] WARN: checked.txt still lists a number this pass released (a concurrent write landed between the read and the rewrite) — publishing released=- (unknown) rather than a count the file contradicts"
+      fi
+    else
+      rm -f "$O/.checked.new.$$" 2>/dev/null
+      # ⛔ NEVER PUBLISH A COUNT FOR ENTRIES THE FILE STILL SUPPRESSES (#1853's "every state write is
+      # checked"). `-` is unknown, and the reader renders it as unknown.
+      _ck_released_n="-"
+      echo "[reap] WARN: could not rewrite $O/checked.txt after the release — publishing released=- (unknown) rather than a count for entries the file still suppresses (#2183)"
+    fi
+  fi
+  # the claim outcomes join the local ones, so the walk derives EVERY skip's reason from one file
+  # ⛔ CHECKED, because the published `skipped_checked_*` breakdown is built from this append: a lost
+  # line turns a justified keep into `unknown` — or, with the whole append lost, into `deferred`, a
+  # reason that is false. LOUD but not fatal: a missing reason makes a worse LINE, where aborting
+  # would cost a pass and a lost queue entry would not be recovered by aborting either.
+  if awk -F'\t' '$2!="released"{print}' "$_ck_tmp" >> "$O/state/checked-kept" 2>/dev/null; then :
+  else
+    # ⛔ NOT "shown as reason_conflict" (review): `CHECKED_REASONS` is built from this file, so a lost
+    # append leaves every suppressed number UNMATCHED and the walk's own `*)` arm counts it as
+    # `skipped_checked_unknown` — the eight counters still sum to `skipped_checked`, so `reason_conflict`
+    # (an invariant assert over those counters) stays 0 and cannot report this. Naming the wrong key sent
+    # an operator to a field that never moves.
+    echo "[reap] WARN: could not append the claim outcomes to $O/state/checked-kept — every entry it did not record is counted as skipped_checked_unknown (the breakdown still sums, so reason_conflict cannot show this) rather than name a reason nobody verified"
+  fi
+  # ⛔ `refused=` IS PUBLISHED HERE (review): the no-registry fallback above sets
+  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say a release was made WITHOUT the
+  # cross-box claim read — and nothing ever wrote it here, while the funnel's reader re-initialises the
+  # variable from THIS record. Measured before this line existed: `checked_refused=none` on a box with no
+  # `$O/claims.sh`, i.e. the one release that skipped the claim check was byte-identical on the operator
+  # line to a fully claim-checked one — the "a fact with no statement" defect this change exists to end.
+  if printf 'released=%s deferred=%s unjustified=%s refused=%s sort_failed=%s at=%s\n' \
+       "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "${CHECKED_REFUSED:-none}" "${_ck_sort_failed:-0}" "$(date +%s 2>/dev/null || echo 0)" \
+       > "$O/state/.checked-reap.$$" 2>/dev/null \
+     && mv "$O/state/.checked-reap.$$" "$O/state/checked-reap" 2>/dev/null; then :
+  else
+    rm -f "$O/state/.checked-reap.$$" 2>/dev/null
+    echo "[reap] WARN: could not record the checked classification in $O/state/checked-reap — the dispatch line will say checked_released=- rather than invent a count"
+  fi
+  if [ -s "$O/checked.txt" ]; then
+    echo "[reap] checked.txt: $(wc -l < "$O/checked.txt" | tr -d ' ') entr(ies), $_ck_released_n released, $_ck_deferred_n deferred, $_ck_unjustified_n without a proven fact (expected bound: 0)"
+  fi
+  # ⛔ AND THE DECISION FILE IS REMOVED WHATEVER HAPPENED (review cycle 3, P4): one
+  # `.checked-decided.<pid>` per pass accumulated in the cell home for ever, and the `exit 3` arm above
+  # left one behind on every retry. LAST, because everything above READS it — removing it earlier made
+  # every reason fall through to `unknown` (caught by this suite, not by review).
+  rm -f "$_ck_tmp" 2>/dev/null
+fi
+
 # ── NOW THAT THE BLACKLIST IS PRUNED, CAN THIS PASS AFFORD ANYTHING AT ALL? (#1736 follow-up) ────
 # ⛔ THIS GATE IS DELIBERATELY **LATE — BELOW THE REAPER — AND NOT AT THE TOP OF THE PASS.** It used
 # to sit immediately after `gh_env_verdict`, where refusing genuinely cost zero calls, and “zero
@@ -1804,9 +2538,19 @@ for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
 if [ "$CORE_PACING" -eq 1 ]; then
   if CORE_NOW="$(core_remaining)"; then
     if [ "$CORE_NOW" -lt $(( CORE_RESERVE + CORE_PER_CANDIDATE )) ]; then
-      echo "[refresh] ABORT: REST core budget remaining=$CORE_NOW cannot buy one candidate without eating the reserve=$CORE_RESERVE (~$CORE_PER_CANDIDATE per candidate) — this pass ran NOTHING of the pool and judged NOTHING, so an empty backlog would be a false report (#1736). The dispatched.txt reaper HAS run (that is why the refusal is here and not earlier); the pool is left untouched and the next cycle retries."
+      # ⛔ THE REFUSAL MUST NOT CLAIM A CLASSIFICATION THAT WAS SKIPPED (review E-P3, cycle 2). The
+      # reaper records `unjustified=-` when it refused (an unreadable listing, an unanswerable
+      # `tmux ls`), so the sentence is built from that record rather than asserted: naming as done the
+      # one piece of housekeeping that did NOT happen sends the operator to the wrong place.
+      _ck_done="the dispatched.txt reaper AND the checked.txt release HAVE run"
+      if [ -r "$O/state/checked-reap" ]; then
+        case "$(tr ' ' '\n' < "$O/state/checked-reap" 2>/dev/null | sed -n 's/^unjustified=//p')" in
+          -) _ck_done="the dispatched.txt reaper has run, but the checked.txt classification was REFUSED this pass (see [reap] SKIPPED above)" ;;
+        esac
+      fi
+      echo "[refresh] ABORT: REST core budget remaining=$CORE_NOW cannot buy one candidate without eating the reserve=$CORE_RESERVE (~$CORE_PER_CANDIDATE per candidate) — this pass ran NOTHING of the pool and judged NOTHING, so an empty backlog would be a false report (#1736). $_ck_done (that is why the refusal is here and not earlier); the pool is left untouched and the next cycle retries."
       refresh_cmd "core budget gate (core_remaining) — the reserve check that refused"
-      refresh_fail list "$EXIT_TRANSIENT" "the REST core budget (remaining=$CORE_NOW, reserve=$CORE_RESERVE) could not buy one candidate, so NOTHING of the pool ran and nothing was judged"
+      refresh_fail list "$EXIT_TRANSIENT" "the REST core budget (remaining=$CORE_NOW, reserve=$CORE_RESERVE) could not buy one candidate, so NOTHING of the pool ran and nothing was judged — an empty backlog would be a false report (#1736). $_ck_done (that is why the refusal is here and not earlier); the pool is left untouched and the next cycle retries."
     fi
     echo "[refresh] budget: REST core remaining=$CORE_NOW, reserve=$CORE_RESERVE, ~$CORE_PER_CANDIDATE per candidate — up to $(( (CORE_NOW - CORE_RESERVE) / CORE_PER_CANDIDATE )) candidate(s) affordable this pass (limit $LIMIT)"
   else
@@ -2177,8 +2921,9 @@ COLLIDED_NEW=""         # numbers THIS pass found held by a peer
 # for a missing count that this file subtracts correctly.
 # ⛔ EVERY WAY A ROW LEAVES THE FUNNEL WITHOUT BEING JUDGED HAS ITS OWN COUNTER (review finding
 # P2-1). `not_reached` is DERIVED (listed − the skip buckets − judged), so a walk-past arm with no
-# counter of its own silently lands in `not_reached` — and orch-loop.sh RENDERS that bucket as
-# `N not reached (limit)`, the one reading that tells an operator to raise `LIMIT`. On a four-box
+# counter of its own silently lands in `not_reached` — and orch-loop.sh used to RENDER that bucket as
+# `N not reached (limit)`, the one reading that told an operator to raise `LIMIT` (the bucket now
+# always carries a measured cause — `stop=`). On a four-box
 # fleet with a fresh collision ledger the ordinary case is walking past dozens of peer-held
 # candidates, so the derived number was dominated by peer-held work while `limit=` sat at its real
 # value beside it — the same class of false statement (`backlog empty queue=READ(223)`) this funnel
@@ -2201,11 +2946,51 @@ QUEUED_THIS_PASS=""    # issue numbers this pass put in candidates.txt (the hand
 # reason. An unrecognisable output yields NO row, and the abort then says `unknown` rather than naming
 # a surface it could not read.
 UNUSABLE_LOG="$O/state/.unusable.$$"
+# The pre-flight's STDERR for the candidate being judged (#2401). A FILE, not a pipe or a merged
+# stream: the reader needs the tool's diagnostic SEPARATELY from its report, and `2>&1` is exactly
+# what made them one blob. Removed by the EXIT trap with `UNUSABLE_LOG`.
+#
+# ⛔ A REDIRECTION ON THE PRE-FLIGHT IS A REDIRECTION THAT CAN STOP IT (review of #2401, third round).
+# `2>"$PRE_ERR_FILE"` is part of the COMMAND: if `$O/state` is missing or unwritable the tool never
+# runs, every candidate comes back verdict-less, the verdict-less arm increments `pretry-<N>` and at
+# RETRY_MAX the issue is appended to `checked.txt` — the silent permanent suppression #1716 removed,
+# reachable by one missing directory. Reproduced: the shipped `selftest.sh` fixtures that do not
+# create `$O/state` went red on this branch for exactly that reason (measured: 2 -> 10 failures), so
+# the hazard was reachable in the suite before it was reachable on a box. Degrading to /dev/null
+# loses the diagnostic in that state and never the verdict, and the EXIT trap's `rm -f` tolerates it.
+PRE_ERR_FILE="$O/state/.preflight-err.$$"
+mkdir -p "$O/state" 2>/dev/null || true
+: > "$PRE_ERR_FILE" 2>/dev/null || PRE_ERR_FILE=/dev/null
+# ⛔ THE DATUM BELONGS TO THE FIRST RUN THAT MADE THIS PASS UNUSABLE, NOT TO THE LAST ONE JUDGED
+# (review of #2401). `PRE_RC` / `PRE_ERR_LINE` are overwritten by EVERY candidate, so a pass whose
+# pool was `#42 INCOMPLETE (rc 2, stderr …)` then `#43 unusable, rc 0` recorded `tool_rc=0
+# stderr=none` beside `first cause: claim gate: … could not answer` — the record CONTRADICTED its own
+# first cause and asserted a healthy tool where the failing run exited 2.
+#
+# ⛔ AND EVERY ARM THAT MAKES THE PASS UNUSABLE CALLS IT, not only `record_unusable` (third round):
+# the DEGRADED verdict arms (`CLEAN`/`COLLISION` + `ALSO INCOMPLETE:`) increment `V_UNJUDGED` and
+# record no surface row — so with the helper called only from `record_unusable` they left
+# `tool_err=none` in the record for a run that HAD written a stderr diagnostic and exited 2: a
+# positive assertion of "no stderr" about a tool that wrote one. They now pass their own arm name.
+snapshot_datum() {   # <arm>
+  # A DEGRADED VERDICT IS THE WEAKEST REASON TO HOLD A DATUM (review of #2401, sixth round).
+  # The degraded arms record no surface row, so a pool of issue #42 degraded (rc 0, no stderr) then
+  # #43 the real refusal (rc 2, stderr) snapshotted #42's HEALTHY datum while unusable_cause quoted
+  # #43's words — the section 1d defect one arm over, and it lost the rc=2 and the diagnostic that
+  # matter. A later arm may therefore REPLACE a preflight-degraded snapshot; it may never replace a
+  # real one (that is the first-record rule).
+  if [ -n "${PRE_FAIL_AT:-}" ] && [ "${PRE_FAIL_ARM:-}" != "preflight-degraded" ]; then
+    return 0
+  fi
+  PRE_FAIL_AT="${N:-}"; PRE_FAIL_RC="${PRE_RC:-}"; PRE_FAIL_ERR="${PRE_ERR_LINE:-}"
+  PRE_FAIL_ARM="${1:-}"
+}
 record_unusable() {   # <slug> [<reason>]
   local slug="$1" reason="${2:-}"
   # One field, no spaces: this lands in a `key=value` record and in a greppable log line.
   slug="$(printf '%s' "$slug" | tr ' /' '--' | tr -cd 'A-Za-z0-9._:-')"
   [ -n "$slug" ] || slug="unnamed-surface"
+  snapshot_datum "$slug"
   printf '%s\t%s\n' "$slug" "$(printf '%s' "$reason" | tr '\n\t' '  ')" >> "$UNUSABLE_LOG" 2>/dev/null || true
 }
 # `slug:n …` in first-seen order — a count per surface, which is what tells an operator whether ONE
@@ -2213,12 +2998,50 @@ record_unusable() {   # <slug> [<reason>]
 unusable_summary() {
   [ -s "$UNUSABLE_LOG" ] || return 0
   awk -F'\t' '{ if (!($1 in n)) { order[++k]=$1 } n[$1]++ }
-              END { for (i=1;i<=k;i++) printf "%s%s:%d", (i>1?" ":""), order[i], n[order[i]] }' \
+              END { for (i=1;i<=k;i++) printf "%s%s:%d", (i>1?",":""), order[i], n[order[i]] }' \
     "$UNUSABLE_LOG" 2>/dev/null
 }
 unusable_cause() {    # the FIRST failure's own words, bounded so one log line stays readable
   [ -s "$UNUSABLE_LOG" ] || return 0
-  awk -F'\t' 'NF>1 && $2!="" { print $2; exit }' "$UNUSABLE_LOG" 2>/dev/null | cut -c1-320
+  # ⛔ NO `$2 != ""` FILTER (review of #2401, second round). The datum snapshot is taken on the
+  # first `record_unusable` CALL, so skipping an empty-reason row (a verdict-less run with no
+  # output; a table row whose NOTE column was omitted — a shape the parser explicitly supports)
+  # made the "first cause" a DIFFERENT record than the datum describes: measured
+  # `tool_issue=42 tool_rc=0 stderr=none` beside a #43 refusal, asserting a healthy tool where the
+  # run exited 2. Both readers must name the same first record by construction; when its reason is
+  # empty the prose cause is legitimately absent and the datum alone carries the fact.
+  awk -F'\t' 'NF>1 { print $2; exit }' "$UNUSABLE_LOG" 2>/dev/null | cut -c1-320
+}
+# ── THE DATUM: WHICH COMMAND RAN, WHAT IT RETURNED, AND ITS OWN EXIT ──────────
+# ⛔ THE CAUSE IS THE PRODUCER'S PROSE, AND PROSE IS NOT A DATUM (#2401). The refusal above names the
+# surface and quotes the tool's note, but the note is a SENTENCE: on cell-4 it read `…could not answer
+# — the board's live-session store could not be read… (tried: `cmux sessi` because the 320-char bound
+# landed mid-word, and the SPECIFIC thing that had to change (two live pids running in REAPED
+# worktrees) never appeared on the dispatch line at all. Meanwhile the tool's exit status — a
+# measurement — was captured at the call site and then used ONLY for the `-eq 3` provisioning guard,
+# so a pre-flight that answered INCOMPLETE (rc 2) and one that CRASHED produced the same sentence.
+# These two carry the measured half, and they LEAD the cause so no downstream bound can cut them
+# (`refresh_cause_brief` truncates `why=` at 400 chars, `unusable_cause` at 320).
+PRE_RC=""            # the pre-flight's OWN exit status for the candidate just judged
+PRE_ERR_LINE=""     # the first non-empty STDERR line it wrote (its diagnostic, when it has one)
+PRE_FAIL_AT=""       # the FIRST candidate that made this pass unusable, and ITS datum — see
+PRE_FAIL_RC=""       # `record_unusable`: the last candidate's rc would contradict the first cause
+PRE_FAIL_ERR=""
+PRE_FAIL_ARM=""      # …and WHICH arm produced that record. The claim-registry arms record unusable
+                     # AFTER a CLEAN pre-flight (`rc 0`), so a bare `rc=0 stderr=none` beside their
+                     # cause reads as a contradiction; naming the arm makes the datum unambiguous
+                     # without giving the pre-flight another run's numbers (review of #2401, R1).
+# TWO LENGTHS, ON PURPOSE (review of #2401, sixth round). The RECORD keeps the full 200-char stderr
+# line in tool_err=; the INLINE datum cuts it to 80 so the surface clause and the datum both survive
+# refresh_cause_brief's 400-char cut. Measured before this: a 200-char stderr pushed the BLOCKED line
+# to 566 characters and cut issue-assignee-ho mid-word — the datum destroyed the reading it exists
+# to serve.
+preflight_datum() {  # "issue=#<N> cmd=<tool> <args> rc=<N> stderr=<first 80 chars|none>"
+  [ -n "${PRE_FAIL_RC:-}" ] || return 0
+  printf 'issue=#%s cmd=%s rc=%s stderr=%s' \
+    "${PRE_FAIL_AT:-?}" \
+    "$(basename "${PREFLIGHT:-pre-flight}") --repo ." \
+    "$PRE_FAIL_RC" "$(printf '%s' "${PRE_FAIL_ERR:-none}" | cut -c1-80)"
 }
 # The two report shapes the producer uses, in preference order. The BLOCK is canonical; the TABLE is
 # the fallback for a bare INCOMPLETE (no block). They are parsed separately and the block WINS, so one
@@ -2228,7 +3051,14 @@ preflight_unusable_surfaces() {   # <preflight output> -> "<slug>\t<reason>" lin
   block="$(printf '%s\n' "$out" | awk '
     function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
     /^INCOMPLETE SURFACES/ { inblk=1; next }
-    inblk && /^[A-Z][A-Z ]+ — / { inblk=0 }
+    # ⛔ A NEW SECTION ENDS THE BLOCK. Any COLUMN-0 line is a heading — the block own rows are
+    # indented `[surface] …` — and the previous rule stopped only on a heading followed by an em
+    # dash, so an `ADVISORY SURFACES` heading was consumed as a FAILURE surface. Measured once the
+    # funnel record was comma-joined (a space-join had been discarding the second token and hiding
+    # it): `unusable=issue-assignee-holder:1,open-PRs:1`, an ADVISORY surface counted as a failing
+    # one, which is a false accusation against the producer.
+    # NOTE: no apostrophes in here — this is a SINGLE-QUOTED awk program, so one would close it.
+    inblk && /^[^[:space:]]/ { inblk=0 }
     inblk && /^ *\[/ {
       line=$0
       s=line; sub(/^ *\[/, "", s); sub(/\].*$/, "", s)
@@ -2260,6 +3090,68 @@ preflight_unusable_surfaces() {   # <preflight output> -> "<slug>\t<reason>" lin
       }
     }'
 }
+# ── WHY THE WALK STOPPED (agent-infra#2183) ─────────────────────────────────────────────────────
+# `not_reached` is DERIVED (listed - the skip buckets - judged), so until now the largest bucket on a
+# starved cell carried NO measured cause at all and orch-loop.sh rendered it as `N not reached
+# (limit)` — an instruction to raise `LIMIT` that the same record contradicted by printing `limit=`
+# at its real value beside it. Measured on cell-1, 2026-10-20:
+#   195 candidates -> 0 queued, … 12 unjudged (pre-flight), …, 183 not reached
+# where the true cause was `RUN_BUDGET` spent on twelve pre-flight runs that could not answer. Each
+# `break` below therefore NAMES itself, and `stop=none` means the walk reached the end of the pool
+# (the only state that licenses the #1984 skip).
+STOP=none
+# A cause and a residue can disagree without either number being wrong: `stop=none` says the walk
+# reached the end, which implies nothing is left. It gets its OWN key so that a disagreement can
+# never be published as a parts-sum failure — the pool's parts still sum, and saying otherwise would
+# be a false statement about the pool (orch-loop.sh renders that as UNRECONCILED).
+STOP_CONFLICT=0
+# ...and the same rule for the `skipped_checked` SUB-breakdown: a reason counter that does not add up
+# is a defect in THIS accounting, not evidence about the pool.
+REASON_CONFLICT=0
+# ── WHY A CHECKED ROW IS CHECKED (agent-infra#2183) ─────────────────────────────────────────────
+# `checked.txt` suppresses a candidate from every later pass, and until now nothing recorded WHY — so
+# a suppression whose justification was never stated could never be audited, bounded, or released.
+# The reaper/claim filter writes `N<TAB>reason` per pass into `state/checked-kept`; these counters
+# publish that breakdown on the dispatch line. They must SUM to `skipped_checked`.
+SKIP_CHECKED_QUEUED=0; SKIP_CHECKED_DISPATCHED=0; SKIP_CHECKED_PR=0
+SKIP_CHECKED_LANE=0; SKIP_CHECKED_CLAIM=0; SKIP_CHECKED_CLAIM_UNKNOWN=0
+SKIP_CHECKED_DEFERRED=0; SKIP_CHECKED_UNKNOWN=0
+# ⛔ INDENTED ON PURPOSE. selftest.sh extracts this region with
+# `awk '/^n=0$/{f=1} f{print} /^done < /{f=0}'`, which stops at the first COLUMN-0 `done < `. An
+# unindented read loop here would truncate the extracted body at that line — the positive checks
+# would redden loudly, and the NEGATIVE ones (an errored pre-flight does not blacklist) would go
+# vacuously green against a walk the extraction no longer contains.
+CHECKED_REASONS=""
+if [ -r "$O/state/checked-kept" ]; then
+  while IFS="$(printf '\t')" read -r _ck _cr; do
+    [ -n "${_ck:-}" ] || continue
+    CHECKED_REASONS="$CHECKED_REASONS $_ck:${_cr:-unknown}"
+  done < "$O/state/checked-kept"
+fi
+CHECKED_REASONS="$CHECKED_REASONS "
+# ── WHICH SURFACE COULD NOT BE READ (agent-infra#2183) ──────────────────────────────────────────
+# Five of the six unusable-verdict arms are one environment surface failing to answer, and the
+# producer already says which: it prints an `INCOMPLETE SURFACES` block of `  [<surface>] <note>`
+# lines. So the surface is PARSED, never guessed — a guess would be the same defect as the `(limit)`
+# this replaces, a cause printed for a number nobody measured. A run whose block is absent or
+# unparseable is counted as `unknown`, NEVER as "no surface", so a producer rewording cannot turn a
+# broken environment into a clean-looking line.
+# ⛔ DEFINED INSIDE THE EXTRACTED REGION (`n=0` … `done <`): selftest.sh runs this loop body
+# standalone, so a helper defined ABOVE `n=0` would be undefined there — the file records that wound
+# for `CORE_PACING` further down.
+# ⛔ ONE PARSER, NOT TWO. `preflight_unusable_surfaces` (above, agent-infra#2097/#2229) already parses
+# BOTH producer shapes — the canonical `INCOMPLETE SURFACES` block AND the `SURFACE <name> INCOMPLETE …`
+# table fallback — so it is the single source of surface names. This adapter only RECORDS the case that
+# parser cannot name: an output with no parseable surface at all. It deliberately does NOT re-record the
+# rows the main walk already fed to `record_unusable` for the SAME $PRE (recorded once above), because
+# doing so would count one failing surface twice on the `unusable=` line.
+# ⛔ AN UNPARSEABLE OUTPUT IS `unknown`, NEVER "no surface": the producer's block sitting in a shape this
+# reader cannot read would otherwise turn a broken environment into a clean-looking line.
+pre_incomplete_surfaces() { # <pre-flight output>
+  [ -n "$(preflight_unusable_surfaces "$1")" ] && return 0
+  record_unusable "unknown" "the pre-flight printed no surface this reader could parse"
+  return 0
+}
 skipped=0               # candidates walked past because a recent pass already found them held
 _now="$(date +%s 2>/dev/null || echo 0)"
 # ⛔ A RECORD MAY NOT DEFER A CANDIDATE FOR LONGER THAN A TTL. This script only ever writes
@@ -2281,7 +3173,23 @@ fi
 refresh_stage judge "$PREFLIGHT --repo . (one run per candidate)"
 while read -r N; do
   [ -z "${N:-}" ] && continue
-  if grep -qx "$N" "$O/checked.txt" 2>/dev/null; then SKIP_CHECKED=$((SKIP_CHECKED + 1)); continue; fi
+  if grep -qx "$N" "$O/checked.txt" 2>/dev/null; then
+    SKIP_CHECKED=$((SKIP_CHECKED + 1))
+    # ⛔ ONE COUNTER PER REASON, and an UNMAPPED reason lands in `unknown` rather than vanishing, so
+    # the eight always sum to SKIP_CHECKED (a future arm cannot make this line lie by not counting).
+    # The colon in the pattern is what keeps #42 from matching a `421:queued` entry.
+    case "$CHECKED_REASONS" in
+      *" $N:dispatched "*)     SKIP_CHECKED_DISPATCHED=$((SKIP_CHECKED_DISPATCHED + 1)) ;;
+      *" $N:queued "*)         SKIP_CHECKED_QUEUED=$((SKIP_CHECKED_QUEUED + 1)) ;;
+      *" $N:pr "*)             SKIP_CHECKED_PR=$((SKIP_CHECKED_PR + 1)) ;;
+      *" $N:lane "*)           SKIP_CHECKED_LANE=$((SKIP_CHECKED_LANE + 1)) ;;
+      *" $N:claim-unknown "*)  SKIP_CHECKED_CLAIM_UNKNOWN=$((SKIP_CHECKED_CLAIM_UNKNOWN + 1)) ;;
+      *" $N:claim "*)          SKIP_CHECKED_CLAIM=$((SKIP_CHECKED_CLAIM + 1)) ;;
+      *" $N:deferred "*)       SKIP_CHECKED_DEFERRED=$((SKIP_CHECKED_DEFERRED + 1)) ;;
+      *)                       SKIP_CHECKED_UNKNOWN=$((SKIP_CHECKED_UNKNOWN + 1)) ;;
+    esac
+    continue
+  fi
   if grep -qx "$N" "$O/dispatched.txt" 2>/dev/null; then SKIP_DISPATCHED=$((SKIP_DISPATCHED + 1)); continue; fi
   # ⛔ A LANDED ISSUE IS SUPPRESSED, NOT BLACKLISTED, AND THE SKIP SITS BEFORE THE SLOT COUNTER so a
   # recorded entry costs no LIMIT slot on later passes (tortoise#8560). Reported in the tail of every
@@ -2297,8 +3205,8 @@ while read -r N; do
   # `>#N SKIPPED` line until the next non-collided candidate happened to break the loop — with a
   # large ledger that is an unbounded block of log noise per pass. The skip arm is a WALK-PAST; it
   # must never outrank the stop conditions.
-  [ "$n" -ge "$LIMIT" ] && { POOL_SWEPT=0; break; }
-  [ "$judged" -ge "$RUN_BUDGET" ] && { POOL_SWEPT=0; break; }
+  [ "$n" -ge "$LIMIT" ] && { POOL_SWEPT=0; STOP=limit; break; }
+  [ "$judged" -ge "$RUN_BUDGET" ] && { POOL_SWEPT=0; STOP=run_budget; break; }
   # A candidate a recent pass already found HELD is walked past at NO network cost. It is NOT written
   # to `checked.txt`: when the record expires the normal path judges it again (ledger note above).
   # ⛔ DELIBERATELY ABOVE THE BUDGET PROBE BELOW: a skip costs no network at all, so a held candidate
@@ -2310,8 +3218,9 @@ while read -r N; do
       skipped=$((skipped + 1))
       # ⛔ AND THE FUNNEL COUNTS IT (review finding P2-1): `skipped` feeds the human summary below,
       # SKIP_COLLIDED feeds the decomposition. Without this the row lands in the DERIVED
-      # `not_reached` bucket, which the dispatch line renders as `N not reached (limit)` — a false
-      # cause for a real number, printed beside `limit=` at its true value.
+      # `not_reached` bucket, which the dispatch line rendered as `N not reached (limit)` — a false
+      # cause for a real number, printed beside `limit=` at its true value (the bucket now names its
+      # measured cause).
       SKIP_COLLIDED=$((SKIP_COLLIDED + 1))
       echo "[refresh] >#$N SKIPPED — a pass less than ${COLLISION_TTL}s ago found a peer holding it; retried when that record expires (agent-infra#1729)"
       continue ;;
@@ -2336,6 +3245,7 @@ while read -r N; do
       if [ "$CORE_NOW" -lt $(( ${CORE_RESERVE:-0} + ${CORE_EST:-0} )) ]; then
         STARVED=1
         POOL_SWEPT=0
+        STOP=spend
         # The report names BOTH budgets, each by what it actually counts: `judged` is pre-flight
         # RUNS and `n` is SLOTS filled. #2050 said "judged $judged of the $LIMIT slot(s)", which is
         # only true under the pre-#1729 meaning of `n`; keeping that sentence on the reconciled head
@@ -2369,7 +3279,46 @@ while read -r N; do
     [ -n "${GH_REPO:-}" ] && echo "[refresh] GH_REPO='$GH_REPO' (ambient) is NOT the repo this pass grades — pinning GH_REPO=$OR for the pre-flight, so no gh read can answer about another repository"
     GH_REPO="$OR"; export GH_REPO
   fi
-  PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>&1)"; PRE_RC=$?
+  # ⛔ STDERR IS CAPTURED, NOT MERGED (#2401). It used to be `2>&1`, which made the tool's DIAGNOSTIC
+  # indistinguishable from its REPORT — so the one line a failing producer writes to say what went
+  # wrong could only ever arrive as the LAST line of a blob whose head the parsers read, and a producer
+  # that prints only `FATAL: …` on stderr left `VERDICT` absent with no cause anywhere. Kept apart here,
+  # then folded back into `$PRE` below so every existing parser and the `tail -3` diagnostics still see
+  # the same text they always did.
+  PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>"$PRE_ERR_FILE")"; PRE_RC=$?
+  PRE_ERR_LINE="$(grep -m1 -v '^[[:space:]]*$' "$PRE_ERR_FILE" 2>/dev/null | cut -c1-200)"
+  # ⛔ THE WHOLE STDERR IS FOLDED BACK, NOT A BOUNDED SLICE (review of #2401, second round). The
+  # first attempt kept only the FIRST line; the second kept `tail -40`. Both are NARROWINGS relative
+  # to the `2>&1` this replaces, and `tail -40` is the dangerous one: a producer that writes its
+  # report to stderr and then >40 more lines loses its VERDICT line, falls out of the INCOMPLETE arm
+  # (which deliberately neither strikes nor clears) into the verdict-less arm — which INCREMENTS
+  # `retry-<N>` and, at RETRY_MAX, permanently appends the issue to `checked.txt`. That is the
+  # silent, invisible suppression #1716 removed, reachable by a CHATTY producer. Measured on the
+  # same fixture: `origin/main` -> `unusable=issue-assignee-holder:1`, never retired; `tail -40` ->
+  # `unusable=preflight-no-verdict:1`, `pretry=1`. A `cat` is exact parity with the old surface and
+  # adds no flood risk the old code did not already have.
+  # ⛔ THE FOLD IS TERMINATED AND LABELLED (#2401, third round). The producer's report ends with its
+  # `VERDICT:` line, and the block parser's ONLY terminator is `^[A-Z][A-Z ]+ — `. Appending stderr
+  # straight after the report therefore left `inblk` open into the stderr text, so a stderr line
+  # beginning with `[` was parsed as a SURFACE ROW — a surface the producer never reported, against
+  # the parser's stated contract, and `tool_arm` would then be that fabricated slug. Measured:
+  # report + `[preflight] live-session store probe failed` -> a phantom
+  # `preflight<TAB>live-session store probe failed` row. `STDERR —` matches the terminator and can
+  # never itself become a row. (Under the old `2>&1` this was unreachable: stderr arrived first.)
+  # ⛔ THE LABEL MUST MATCH THE TERMINATOR, INCLUDING ITS TRAILING SPACE (review of #2401, fourth
+  # round). The block parser's terminator is `^[A-Z][A-Z ]+ — ` — a SPACE after the em dash — and the
+  # first draft's label was a bare `STDERR —`, which does NOT match, so `inblk` stayed open into the
+  # folded stderr and a stderr line beginning with `[` was parsed as a SURFACE ROW. Measured with the
+  # shipped parser: report + `STDERR —` + `  [preflight] …probe failed` -> `unusable=… preflight:1`,
+  # a surface the producer never reported, and `tool_arm=preflight` — the fabricated slug this
+  # change's own comment says is impossible. The label now carries trailing text so ` — ` matches.
+  #
+  # ⛔ AND A BLANK STDERR IS NOT FOLDED AT ALL: a whitespace-only file made the label itself the
+  # verdict-less arm's `first cause` ("STDERR —") beside `tool_err=none` — a record contradicting
+  # itself. A file with no non-blank line says nothing, so nothing is folded.
+  if [ -s "$PRE_ERR_FILE" ] && grep -q '[^[:space:]]' "$PRE_ERR_FILE" 2>/dev/null; then
+    PRE="$PRE"$'\n'$'STDERR — not the pre-flight report\n'"$(cat "$PRE_ERR_FILE" 2>/dev/null)"
+  fi
   # ⛔ A tool that REFUSED TO RUN is a PROVISIONING failure, not a per-issue "no verdict". The
   # pre-flight's EXIT_USAGE (3) is how it reports an unusable environment — most importantly its
   # Python >= 3.12 guard (#5128), which prints an explanation and NO `VERDICT` line. Absorbing that
@@ -2426,7 +3375,22 @@ while read -r N; do
       # A DEGRADED pre-flight short-circuits BEFORE the claim read: the verdict is not trustworthy,
       # so the issue is left unchecked and is neither queued nor certified either way.
       if [ "$degraded" -eq 1 ]; then
+        snapshot_datum preflight-degraded
         V_UNJUDGED=$((V_UNJUDGED + 1))
+        pre_incomplete_surfaces "$PRE"
+        # ⛔ THE DATUM KEEPS ITS DEGRADED LABEL (merge review of #2391, `degraded-first`).
+        # `pre_incomplete_surfaces` records its rows through `record_unusable` → `snapshot_datum
+        # <slug>`, and `snapshot_datum` rightly lets a REAL arm replace a degraded one — so this
+        # run's rc 0 / stderr=none went into the record labelled `issue-assignee-holder`, a real
+        # surface name. A later candidate's hard failure then hit the first-record rule and could
+        # NOT replace it: a healthy datum asserting `stderr=none` beside the refusal's own words,
+        # which is the exact contradiction the degraded arm exists to avoid (main's #2659 case was
+        # green only because `pre_incomplete_surfaces` did not exist when it was written).
+        # `PRE_FAIL_AT` is this run's only when no earlier candidate held a real datum, so the
+        # restore cannot downgrade a real first-record snapshot.
+        if [ -n "${PRE_FAIL_AT:-}" ] && [ "${PRE_FAIL_AT:-}" = "${N:-}" ]; then
+          PRE_FAIL_ARM=preflight-degraded
+        fi
         echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         # ── the cross-box ISSUE claim is a BLOCKING surface (agent-infra#1850) ───────────────────
@@ -2472,14 +3436,27 @@ while read -r N; do
             # this loop body and runs it standalone, so anything it calls must live inside the
             # extraction.)
             if ! printf '%s\n' "$N" >> "$O/candidates.txt"; then
-              echo "[refresh] ABORT: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
+              # ⛔ NOT TRANSIENT (review E-P2, cycle 5): a `candidates.txt` that is a DIRECTORY
+              # (documented reachable at this file's own `read_soft` note) or root-owned 444 cannot be
+              # appended to on ANY pass, so the transient code means the full pre-flight walk every
+              # cycle for ever, no `.refresh-blocked`, and no reason in `status` — the "cell reports
+              # RUNNING and dispatches nothing" shape, on the write that is reached FIRST. rc=3 is the
+              # provisioning channel that stops the retry and names the reason; the cause carries the
+              # `NOT PROVISIONABLE` marker the loop greps for into `.refresh-blocked`, and main's
+              # `refresh_fail` (agent-infra#2229) is what makes the refusal a durable record rather
+              # than a log line.
               refresh_cmd "append #$N to $O/candidates.txt"
-              refresh_fail persist "${EXIT_TRANSIENT:-1}" "cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (agent-infra#1736)"
+              refresh_fail persist "${EXIT_NOT_PROVISIONABLE:-3}" "NOT PROVISIONABLE: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736). fix: chown/chmod $O/candidates.txt, or remove it if it is a directory (then re-run)"
             fi
             if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
-              echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt (#1736)"
+              # ⛔ NOT TRANSIENT (review cycle 4, E-P2): a `checked.txt` that is a directory or
+              # root-owned 444 cannot be appended to on ANY pass, so the transient code means a
+              # full-cost pass every cycle for ever with no `.refresh-blocked` — the "cell reports
+              # RUNNING and dispatches nothing" shape, exactly the one this patch refuses one file
+              # over. rc=3 names it (and the loop's `grep 'NOT PROVISIONABLE'` writes the reason into
+              # the block), and the retry stops.
               refresh_cmd "append #$N to $O/checked.txt"
-              refresh_fail persist "${EXIT_TRANSIENT:-1}" "cannot record #$N as checked in $O/checked.txt — the queue entry is retryable, but the certification was not persisted (agent-infra#1736)"
+              refresh_fail persist "${EXIT_NOT_PROVISIONABLE:-3}" "NOT PROVISIONABLE: cannot record #$N as checked in $O/checked.txt — the queue entry is retryable, but the certification was not persisted (#1736). fix: chown/chmod $O/checked.txt, or remove it if it is a directory (then re-run)"
             fi
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1)); V_QUEUED=$((V_QUEUED + 1))
@@ -2515,6 +3492,8 @@ while read -r N; do
              echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
              # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
+             # The unanswerable SURFACE here is the registry itself, so it is named without asking
+             # the pre-flight's transcript for a surface the pre-flight did not fail on.
              ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
              V_UNJUDGED=$((V_UNJUDGED + 1))
              record_unusable "issue-claim-registry" "${CLAIM_RESULT:-the cross-box claim registry could not answer}"
@@ -2540,7 +3519,14 @@ while read -r N; do
       # environment report a healthy `checked N; backlog now 0` — the reading this pass exists to
       # refuse (#1853 review).
       if [ "$degraded" -eq 1 ]; then
+        snapshot_datum preflight-degraded
         V_UNJUDGED=$((V_UNJUDGED + 1))
+        pre_incomplete_surfaces "$PRE"
+        # …and the same restore as the CLEAN-degraded arm above: the rows must not relabel a
+        # degraded datum as a real surface, or a later hard failure cannot replace it.
+        if [ -n "${PRE_FAIL_AT:-}" ] && [ "${PRE_FAIL_AT:-}" = "${N:-}" ]; then
+          PRE_FAIL_ARM=preflight-degraded
+        fi
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
@@ -2580,13 +3566,27 @@ while read -r N; do
       # verdict-less arm alone (see the RETRY_MAX note near the top). It stays unchecked (retried next
       # pass) and is REPORTED, which is what the arm did before the port folded it into the
       # verdict-less one.
+      # THIS ARM RECORDS NO ROW, SO IT MUST STILL TAKE THE DATUM (review of #2401, sixth round): an
+      # INCOMPLETE report with no parseable surface row (the parser's own documented "emits nothing"
+      # path) left tool_rc=unrecorded / tool_err=none while PRE_RC and the stderr line were in hand.
+      snapshot_datum preflight-incomplete
       V_UNJUDGED=$((V_UNJUDGED + 1))
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (an INCOMPLETE is box-wide: it neither strikes nor clears the $RETRY_MAX verdict-less bound)" ;;
     *)
       V_UNJUDGED=$((V_UNJUDGED + 1))
       # ⛔ A VERDICT-LESS RUN IS NAMED LIKE ANY OTHER UNUSABLE ANSWER (#2229): the last line the tool
       # printed is the only evidence of why it answered nothing, and it used to be discarded.
-      record_unusable "preflight-no-verdict" "$(printf '%s\n' "$PRE" | grep -v '^[[:space:]]*$' | tail -1)"
+      # ⛔ SPLIT, because these are two faults that a single slug would MERGE: a `VERDICT:` line this
+      # reader could not classify is a CONTRACT disagreement (the producer named a verdict we do not
+      # know) and needs the producer checked; a run with no verdict at all needs the ENVIRONMENT
+      # checked. Collapsing them sends an operator to the wrong place. Both go through the one
+      # recorder (#2097/#2229), so the log's aggregate line and the harness's `unusable=` key agree.
+      if grep -qE '^VERDICT' <<<"$PRE"; then
+        record_unusable "unrecognised-verdict" "the pre-flight printed a VERDICT line this reader does not recognise"
+        echo "[refresh] ?#$N no USABLE verdict from the pre-flight (a VERDICT line this reader does not recognise) — left unchecked for the next pass"
+      else
+        record_unusable "preflight-no-verdict" "$(printf '%s\n' "$PRE" | grep -v '^[[:space:]]*$' | tail -1)"
+      fi
       # ⛔ A VERDICT-LESS RUN IS NOT A VERDICT, BUT IT MAY NOT BE RETRIED FOREVER (tortoise#8469 review
       # P2). No `VERDICT:` line at all — the pre-flight crashed, timed out or answered an ambiguous
       # target — so the entry is BOUNDED: after RETRY_MAX verdict-less attempts it is marked checked so
@@ -2647,6 +3647,66 @@ FUNNEL_LISTED="${POOL_ROWS:-}"
 # A plain digit test, not `is_num`: this script defines no such helper and MUST NOT grow a second
 # number parser (selftest extracts it). `wc -l` output is already space-stripped at POOL_ROWS.
 case "$FUNNEL_LISTED" in ''|*[!0-9]*) FUNNEL_LISTED="-" ;; esac
+# ── THE UNUSABLE PAYLOAD: WHICH SURFACE, HOW MANY TIMES (agent-infra#2183) ──────────────────────
+# `unjudged=12` says twelve pre-flight runs produced nothing the caller could act on; it does not
+# say whether that is one broken surface or twelve unrelated faults, and those need opposite
+# responses. So the surfaces are named with their occurrence counts — `none` ONLY when nothing was
+# unusable, and `unknown:<n>` for any unusable run that named no surface, so a parse failure can
+# never be published as "no surface".
+# ⛔ BASH 3.2 HAS NO ASSOCIATIVE ARRAYS (`declare -A` is bash 4+ and this harness targets /bin/bash
+# 3.2), so distinct slugs are counted with `sort -u` + `grep -cx` — a handful of forks once per
+# pass, never per candidate.
+UNUSABLE_FIELD="none"
+if [ "${V_UNJUDGED:-0}" -gt 0 ]; then
+  # ⛔ ONE SOURCE, NOT TWO. `record_unusable` is the ONLY place a failing surface is counted (the
+  # agent-infra#2097/#2229 mechanism), so the aggregate log line, the funnel's `unusable=` key and the
+  # pass-record's `unusable=` are all reads of the same log. Building this field from a SECOND list let
+  # the two disagree — `claim-registry` in one and `issue-claim-registry` in the other for the same
+  # failure. The slug is canonical from the recorder, so no case-folding is needed here.
+  # ⛔ COMMA-JOINED, because `FUNNEL_LINE` is a SPACE-delimited `key=value` record that orch-loop.sh
+  # parses with `for kv in ${f:-}`. `unusable_summary` joins its `<slug>:<n>` pairs with a SPACE (the
+  # right framing for a log line), so using it verbatim here would split the value across tokens: the
+  # reader keeps `unusable=<first>` and silently DISCARDS every later surface. Multi-surface passes are
+  # ordinary — the walk records a producer surface and `issue-claim-registry` in the same pass — so that
+  # is exactly the "names one fact and hides the rest" reading this change exists to end.
+  UNUSABLE_FIELD="$(unusable_summary | tr ' ' ',')"
+  [ -n "$UNUSABLE_FIELD" ] || UNUSABLE_FIELD="unknown:$V_UNJUDGED"
+fi
+# ── WHAT THE REAPER/CLAIM FILTER RELEASED (agent-infra#2183) ────────────────────────────────────
+# Read from `state/checked-reap`, NOT recomputed: one writer decides what a suppression costs, and
+# `-` is published when that record is absent (a pass that reached no reaper) rather than a zero
+# that would read as "nothing was suppressed".
+# ⛔ `deferred` IS PUBLISHED HERE TOO (review E-P2, cycle 2): the reaper recorded it in
+# `state/checked-reap` and NOTHING read it, so a pass whose cap bound every cycle — the one reading
+# that tells an operator `CHECKED_RELEASE_MAX` is too small for this cell — looked exactly like a pass
+# that had nothing to release. It is a third key, not a rename: `-` still means "that record is
+# absent", and each key is validated on its own.
+CHECKED_RELEASED="-"; CHECKED_UNJUSTIFIED="-"; CHECKED_DEFERRED="-"; CHECKED_REFUSED=""; CHECKED_SORT_FAILED="-"
+if [ -r "$O/state/checked-reap" ]; then
+  for _kv in $(cat "$O/state/checked-reap" 2>/dev/null); do
+    case "${_kv%%=*}" in
+      refused)     CHECKED_REFUSED="${_kv#*=}" ;;
+      released)    CHECKED_RELEASED="${_kv#*=}" ;;
+      unjustified) CHECKED_UNJUSTIFIED="${_kv#*=}" ;;
+      deferred)    CHECKED_DEFERRED="${_kv#*=}" ;;
+      sort_failed) CHECKED_SORT_FAILED="${_kv#*=}" ;;
+    esac
+  done
+fi
+case "$CHECKED_RELEASED" in ''|*[!0-9]*) CHECKED_RELEASED="-" ;; esac
+case "$CHECKED_UNJUSTIFIED" in ''|*[!0-9]*) CHECKED_UNJUSTIFIED="-" ;; esac
+case "$CHECKED_DEFERRED" in ''|*[!0-9]*) CHECKED_DEFERRED="-" ;; esac
+# The `skipped_checked` sub-breakdown must add up, for the same reason the pool's parts must: a
+# counter that no arm feeds is a hole in the accounting, and it is the hole a future `continue`
+# without a counter would make. ⛔ It does NOT touch `reconciled` — the POOL's parts still sum, so a
+# `reconciled=0` here would make the dispatch line print `UNRECONCILED (the parts do not sum to the
+# pool)` about a pool that did sum. Two different claims, two different keys.
+if [ $(( ${SKIP_CHECKED_QUEUED:-0} + ${SKIP_CHECKED_DISPATCHED:-0} + ${SKIP_CHECKED_PR:-0} \
+        + ${SKIP_CHECKED_LANE:-0} + ${SKIP_CHECKED_CLAIM:-0} + ${SKIP_CHECKED_CLAIM_UNKNOWN:-0} \
+        + ${SKIP_CHECKED_DEFERRED:-0} + ${SKIP_CHECKED_UNKNOWN:-0} )) -ne "${SKIP_CHECKED:-0}" ]; then
+  REASON_CONFLICT=1
+  echo "[refresh] WARN the checked breakdown does not add up: skipped_checked=${SKIP_CHECKED:-0} but queued=${SKIP_CHECKED_QUEUED:-0} dispatched=${SKIP_CHECKED_DISPATCHED:-0} pr=${SKIP_CHECKED_PR:-0} lane=${SKIP_CHECKED_LANE:-0} claim=${SKIP_CHECKED_CLAIM:-0} claim_unknown=${SKIP_CHECKED_CLAIM_UNKNOWN:-0} deferred=${SKIP_CHECKED_DEFERRED:-0} unknown=${SKIP_CHECKED_UNKNOWN:-0}"
+fi
 FUNNEL_NOTREACHED="-"
 if [ "$FUNNEL_LISTED" != "-" ]; then
   FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - SKIP_LANDED - SKIP_COLLIDED - judged ))
@@ -2675,13 +3735,33 @@ if [ "$FUNNEL_LISTED" != "-" ]; then
   [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_LANDED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
     && [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -eq "$judged" ] && FUNNEL_OK=1
 fi
-FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_landed=$SKIP_LANDED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
+# ── THE CAUSE AND THE RESIDUE MUST AGREE, OR THE RECORD SAYS SO (agent-infra#2183) ──────────────
+# `stop=none` means the walk reached the end of the pool, which by construction means nothing is
+# left in it — so a non-zero `not_reached` beside it is a contradiction. The benign cause is a
+# `.pool`/listing disagreement (a row vanished, or the pool shrank between counting and walking);
+# the damaging one is an arm that stopped the walk without naming itself. Either way the record must
+# not present a cause and a residue that disagree as if they were one measurement.
+if [ "${STOP:-none}" = none ] && [ "$FUNNEL_NOTREACHED" != "-" ] && [ "$FUNNEL_NOTREACHED" -ne 0 ]; then
+  STOP_CONFLICT=1
+  echo "[refresh] WARN funnel stop says the walk reached the END of the pool, but $FUNNEL_NOTREACHED candidate(s) were not reached — the pool listing and the walk disagree (a row vanished, or an arm stopped the walk without recording why). The parts still sum; this is about the CAUSE, not the arithmetic."
+fi
+FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_landed=$SKIP_LANDED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK stop=${STOP:-none} unusable=$UNUSABLE_FIELD repo=${OR:-?} checked_released=$CHECKED_RELEASED checked_unjustified=$CHECKED_UNJUSTIFIED checked_deferred=$CHECKED_DEFERRED checked_refused=${CHECKED_REFUSED:-none} checked_sort_failed=$CHECKED_SORT_FAILED stop_conflict=${STOP_CONFLICT:-0} reason_conflict=${REASON_CONFLICT:-0} skipped_checked_queued=${SKIP_CHECKED_QUEUED:-0} skipped_checked_dispatched=${SKIP_CHECKED_DISPATCHED:-0} skipped_checked_pr=${SKIP_CHECKED_PR:-0} skipped_checked_lane=${SKIP_CHECKED_LANE:-0} skipped_checked_claim=${SKIP_CHECKED_CLAIM:-0} skipped_checked_claim_unknown=${SKIP_CHECKED_CLAIM_UNKNOWN:-0} skipped_checked_deferred=${SKIP_CHECKED_DEFERRED:-0} skipped_checked_unknown=${SKIP_CHECKED_UNKNOWN:-0} at=$(date +%s)"
 if printf '%s\n' "$FUNNEL_LINE" > "$O/state/.refresh-funnel.$$" 2>/dev/null \
    && mv "$O/state/.refresh-funnel.$$" "$O/state/refresh-funnel" 2>/dev/null; then
   echo "[refresh] funnel $FUNNEL_LINE"
 else
   rm -f "$O/state/.refresh-funnel.$$" 2>/dev/null
   echo "[refresh] WARN could not record the funnel in $O/state/refresh-funnel — the dispatch line will say UNRECORDED rather than report a decomposition it does not have"
+fi
+# ── ONE AGGREGATE LINE FOR THE UNUSABLE RUNS (agent-infra#2183) ─────────────────────────────────
+# The per-candidate `?` lines say WHAT each run could not do and then scroll away; on the measured
+# cell twelve of them scrolled past and nothing said they were the SAME surface failing twelve times.
+# This line says it once, in the log rather than only in the machine record, because the operator
+# reading a pasted log tail is the one who has to act on it. It is in ADDITION to the per-candidate
+# lines, not instead of them — those carry the specific reason for a specific issue.
+if [ "${V_UNJUDGED:-0}" -gt 0 ]; then
+  echo "[refresh] ${V_UNJUDGED} of ${judged} pre-flight run(s) unusable — surface(s): ${UNUSABLE_FIELD}"
+  _uc="$(unusable_cause)"; [ -n "$_uc" ] && echo "[refresh]   first reason: $_uc"
 fi
 # ── persist what this pass learned about HELD candidates (agent-infra#1729) ─────────────────────
 # REWRITTEN, never appended: every record that is still fresh is carried over with its ORIGINAL
@@ -2781,14 +3861,23 @@ if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
   # discarded one line before it would have been printed.
   _us_summary="$(unusable_summary)"
   _us_cause="$(unusable_cause)"
+  _us_datum="$(preflight_datum)"
   if [ -n "$_us_summary" ]; then
     echo "[refresh] unusable: $_us_summary — the failing surface(s) this pass could not query"
   fi
   echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736).${_us_summary:+ Failing surface(s): $_us_summary.} Retrying next cycle."
   [ -n "$_us_cause" ] && echo "[refresh]   cause: $_us_cause"
+  [ -n "$_us_datum" ] && echo "[refresh]   datum: pre-flight $_us_datum"
+  # ⛔ THE MEASURED HALF LEADS THE PERSISTED CAUSE (#2401). `refresh_cause_brief` renders this `why=`
+  # into the caller's `[dispatch] BLOCKED: refresh failed — stage=<st>: <why cut 400>`, so whatever sits
+  # in the first 400 characters IS what an operator sees. The prose sentence used to occupy all of it,
+  # and the datum (command, rc, the tool's own stderr line) was not in the record at all.
   refresh_fail preflight "$EXIT_TRANSIENT" \
-    "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_summary:+ — failing surface(s): $_us_summary}${_us_cause:+ — first cause: $_us_cause}" \
-    "judged=$judged" "unusable=${_us_summary:-unknown}"
+    "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_summary:+ — failing surface(s): $_us_summary}${_us_datum:+ — pre-flight $_us_datum}${_us_cause:+ — first cause: $_us_cause}" \
+    "judged=$judged" "unusable=${_us_summary:-unknown}" \
+    "tool_rc=${PRE_FAIL_RC:-unrecorded}" "tool_err=${PRE_FAIL_ERR:-none}" \
+    "tool_issue=${PRE_FAIL_AT:-unrecorded}" "tool_arm=${PRE_FAIL_ARM:-none}" \
+    "tool_cmd=$(basename "${PREFLIGHT:-pre-flight}") --repo ."
 fi
 # Dedupe WITHOUT re-sorting. orch-loop.sh consumes this file top-down and dispatches the first
 # BATCH entries, so its ORDER IS the dispatch priority. `sort -n -u` re-ordered the ENTIRE backlog

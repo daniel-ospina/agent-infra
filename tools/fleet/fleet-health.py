@@ -459,6 +459,121 @@ def reaper_section():
     return alarms
 
 
+# ── the harness-apply pass record (#2416) ────────────────────────────────────────────────────────
+# `scripts/harness-apply-pass.sh` runs on a schedule (systemd timer / launchd agent) and writes ONE
+# record per pass: the readings it decided from (head, ref, behind, ahead, dirty), the pin records,
+# and the verdict. It exists because the measured failure was SILENT: the Mac's `sync.sh` aborted on
+# a one-file dirty tree and the orchestrator aged 91 commits behind `main` while every signal said
+# "auto", and nothing anywhere reported a behind-by-N. This is the fleet's reader for that number.
+#
+# ⛔ THE SAME RULES AS THE REAPER RECORD ABOVE, deliberately, because it is the same kind of artifact:
+# a SEAM rather than a hardcoded path, an absent record is an alarm only where a schedule is supposed
+# to exist, an unreadable or future-dated record is never "fine", and the pass's own success
+# vocabulary (0 current / 10 advanced / 11 mended) is the only green set — every refusal is an alarm,
+# because a refusal means a HUMAN must resolve something (an ahead box may be a lane's only copy).
+def _harness_apply_status_path():
+    base = os.environ.get("HARNESS_APPLY_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".pi", "agent", "state")
+    return os.path.join(base, "harness-apply.status")
+
+
+def _harness_apply_is_scheduled():
+    """Is a harness-apply job installed on this box, or a state dir pinned by env?
+
+    `HARNESS_APPLY_SCHEDULE_ASSERT` is a TEST SEAM (nothing in production sets it) for the same
+    reason as `DISK_REAPER_SCHEDULE_ASSERT`: without it a suite's expectation would depend on whether
+    the runner carries the unit.
+    """
+    override = os.environ.get("HARNESS_APPLY_SCHEDULE_ASSERT")
+    if override in ("0", "1"):
+        return override == "1"
+    if os.environ.get("HARNESS_APPLY_STATE_DIR"):
+        return True
+    home = os.path.expanduser("~")
+    for p in ("/etc/systemd/system/eldato-harness-apply.timer",
+              os.path.join(home, ".config", "systemd", "user", "eldato-harness-apply.timer"),
+              os.path.join(home, "Library", "LaunchAgents", "com.eldato.harness-apply.plist")):
+        if os.path.exists(p):
+            return True
+    return False
+
+
+def harness_apply_record():
+    """Return (detail, alarm) from the harness-apply pass record.
+
+    ⛔ `behind` IS THE HEADLINE, not the exit code. The measured defect was a box 91 commits behind
+    while every verdict it could produce read "auto"; a record that says `rc=0 behind=91` must alarm
+    on the NUMBER even though the pass exited cleanly (the number is a reading, the code is about the
+    pass). Conversely `behind` is read from the record and never re-derived here — one record, one
+    measurement.
+    """
+    path = _harness_apply_status_path()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            kv = dict(ln.split("=", 1) for ln in (x.strip() for x in fh) if "=" in ln)
+    except OSError as exc:                                      # noqa: BLE001
+        import errno as _errno
+        if exc.errno == _errno.ENOENT:
+            if not _harness_apply_is_scheduled():
+                return ("no pass record yet, and no harness-apply schedule on this box", False)
+            return (f"no pass record at {path} although a harness-apply schedule IS installed — the job is not writing its record", True)
+        return (f"pass record UNREADABLE at {path} ({exc}) — this is NOT 'the harness is current'", True)
+    try:
+        stale = int(os.environ.get("HARNESS_APPLY_STALE_SECONDS", "3600") or 3600)
+    except ValueError:
+        return (f"HARNESS_APPLY_STALE_SECONDS={os.environ.get('HARNESS_APPLY_STALE_SECONDS')!r} is not a whole number — cannot judge staleness", True)
+    try:
+        epoch = int(kv.get("epoch", ""))
+        age = int(time.time()) - epoch
+    except (TypeError, ValueError):
+        return (f"record has no readable epoch (rc={kv.get('rc', '?')}) — cannot tell whether the harness is still being applied",
+                True)
+    if age < 0 or age > stale:
+        return (f"record is STALE: last pass {age}s ago (bound {stale}s) — the job is scheduled but is not running",
+                True)
+    behind = kv.get("behind", "?")
+    try:
+        behind_n = int(behind)
+    except (TypeError, ValueError):
+        behind_n = None
+    rc = kv.get("rc", "?")
+    # ⛔ `deployed` IS THE COMMIT THE BOX RUNS (the pin tree on a cell, the checkout on a Mac), and
+    # `behind` is measured from it. On a pin-per-commit cell the checkout is NEVER moved by the advance,
+    # so reporting `head` here would name a commit that legitimately stays behind while the box runs
+    # main — the alarm would be un-clearable. `head` is printed beside it as the checkout reading.
+    deployed = kv.get("deployed", kv.get("head", "?"))
+    head = kv.get("head", "?")
+    ref = kv.get("ref", "?")
+    # ⛔ A COMPARISON THAT WAS NOT FRESH IS NOT A GREEN. `--print-status` (the readiness gate) refuses a
+    # record whose `fetch=` is neither `ok` nor absent; this reader ignored the field entirely, so
+    # `rc=0 behind=0 fetch=failed` was RED at the gate and CLEAN on the fleet instrument — the same
+    # two-readers-one-record shape this PR already fixed twice, pointing the other way. Same allow-list,
+    # so neither side grows a second rule.
+    fetch_state = kv.get("fetch", "")
+    if fetch_state not in ("ok", ""):
+        return (f"record rc={rc} was written from a comparison that was NOT fresh (fetch={fetch_state}) — "
+                f"deployed={deployed} ref={ref} — cannot-verify is not current", True)
+    if rc in ("0", "10", "11") and behind_n == 0:
+        return (f"record ok rc={rc} deployed={deployed} head={head} ref={ref} behind=0 age={age}s "
+                f"action={kv.get('action', '?')}", False)
+    if behind_n is not None and behind_n > 0:
+        return (f"BEHIND origin/{ref}: {behind_n} commit(s) — deployed={deployed} (rc={rc}, "
+                f"action={kv.get('action', '?')}) — the box is not being moved", True)
+    return (f"record rc={rc} deployed={deployed} head={head} ref={ref} behind={behind} "
+            f"action={kv.get('action', '?')} detail={kv.get('detail', '?')} age={age}s — a human must look "
+            f"(an ahead box may hold work that exists nowhere else)", True)
+
+
+def harness_apply_section():
+    """Report the harness-apply PASS RECORD. A separate section, not a row in `reaper_section()`:
+    that function is the disk-maintainer table and its suite pins its rows; this is a second, distinct
+    scheduled pass and it carries its own record."""
+    print("\nharness apply (pass record)")
+    detail, alarm = harness_apply_record()
+    print(f"  {detail}")
+    return [f"harness apply: {detail}"] if alarm else []
+
+
 def main():
     now = time.time()
     prev = {}
@@ -552,10 +667,14 @@ def main():
         json.dump({str(r.get("pid")): {"cpu": cputime_secs(r.get("pid")), "at": now}
                    for r in hook.values() if r.get("pid")}, fh)
 
-    reaper_alarms = reaper_section()
-    if reaper_alarms:
-        print(f"\n⚠️  {len(reaper_alarms)} REAPER alarm(s) — a scheduled maintainer is not protecting this box:")
-        for a in reaper_alarms:
+    sched_alarms = reaper_section()
+    # ⛔ THE HARNESS APPLY RECORD JOINS THE SAME ALARM LIST, so it rides the same non-zero exit: an
+    # instrument that printed a drift warning while exiting 0 would be unreadable to a scheduler —
+    # which is exactly how the Mac sat 91 commits behind with every signal reading "auto".
+    sched_alarms += harness_apply_section()
+    if sched_alarms:
+        print(f"\n⚠️  {len(sched_alarms)} SCHEDULED-MAINTAINER alarm(s) — a job this box relies on is not doing its work:")
+        for a in sched_alarms:
             print(f"   - {a}")
 
     print()
@@ -573,7 +692,7 @@ def main():
         # from where the identity abstention was fixed.
         print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (lane identity not established)")
         return 1
-    if reaper_alarms:
+    if sched_alarms:
         # A reaper alarm does not make the LANE rows wrong, so it is reported after them — but it
         # must still be a non-zero exit, or a scheduler calling this script cannot see it either.
         return 1

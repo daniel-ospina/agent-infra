@@ -9,15 +9,25 @@
 # Checks:
 #   1. Every pi-config/extensions entry is a symlink (a real copy = drift risk).
 #   2. Every entry resolves (realpath) to extensions/<name> — clone-path agnostic.
-#   3. Set parity: every extensions/ top-level entry except *.test.ts is wired
-#      into pi-config (a new extension that isn't wired ships on NO machine).
+#   3. Set parity: every extensions/ top-level entry GIT TRACKS (except
+#      *.test.ts) is wired into pi-config (a new extension that isn't wired
+#      ships on NO machine). See "TRACKED, NOT PRESENT (#2425)" below.
 #   4. Manifest parity: manifest.json files.extensions.entries (the consumer
 #      ship-list materialized by bin/agent-infra.js into ~/.pi/agent/extensions/)
-#      and the extensions/ tree must name the SAME set (dirs normalized — the
-#      manifest records "dir/", the tree "dir" — and *.test.ts excluded from
-#      both sides). A new extension with no manifest row ships on NO consumer
-#      (#498 staleness class); a stale manifest row for a deleted extension
-#      breaks every consumer bootstrap.
+#      and the extensions/ tree must agree BOTH WAYS, each side asked the
+#      question it can answer truthfully: 4a asks every TRACKED extension for a
+#      row (a new extension with no manifest row ships on NO consumer), and 4b
+#      asks every row for an entry that EXISTS on disk (a stale row for a
+#      deleted extension breaks every consumer bootstrap). 4b is deliberately
+#      ON-DISK scoped, not tracked-scoped: its job is that every SHIPPED row has a
+#      target, and a row for a present-but-untracked path passes on the machine
+#      that has that path while 4b itself reds it on a clean checkout. Demanding
+#      trackedness here would red the developer machine for a machine-local
+#      inconsistency — the #2425 false-block family — without adding a ship
+#      guarantee, because the row itself ships and the fresh-checkout run
+#      already fails on the missing entry. Dirs normalized (the manifest
+#      records "dir/", the tree "dir"), *.test.ts excluded from both sides
+#      (#498 staleness class).
 #   5. LIVE-FARM LIVENESS (machine-local — checks 1-4 gate the repo, this one
 #      gates the materialized farm at ~/.pi/agent/extensions/). Every
 #      manifest-listed entry that IS a symlink there must RESOLVE to a path
@@ -42,6 +52,56 @@
 # Check 5 closes the machine-local half of that same row set:
 #   - a shipped link's target was removed      -> fails check 5
 #
+# TRACKED, NOT PRESENT (#2425). Checks 3 and 4a used to enumerate "$DST"/* —
+# they asked "which directories EXIST under extensions/" and then reported a
+# directory git has never heard of as "an extension that is not wired". One
+# `npm install` inside extensions/<x>/ produces exactly that shape: an untracked,
+# git-ignored node_modules tree. Measured 2026-10-23 on the Mac: `./sync.sh`
+# reported "extension vision-interceptor exists in extensions/ but is not wired"
+# for a directory whose ONLY content was node_modules — `git ls-files
+# extensions/vision-interceptor` was empty, there was no package.json — and the
+# message told the reader a fresh machine "won't get it", the opposite of the
+# truth: nothing can ship what git does not track. Deleting the ignored tree
+# turned sync green, so the gate had indicted a packaging defect that did not
+# exist while a real one (#2424, the doctor loop crashing on a bare $1) sat two
+# files over.
+#
+# The question a SHIP gate must ask is "which extensions does GIT TRACK", and it
+# is answered from the index (`git ls-files -- extensions`), not from the
+# filesystem: a directory whose entire content is ignored cannot be shipped, so
+# it cannot be "not wired". Both error directions stay intact and are pinned by
+# tests/pi-config-extensions/run.sh — a TRACKED extension with no farm link fails
+# (check 3), and a TRACKED extension with no manifest row fails (check 4a). The
+# index is read for checks 3/4a AND for the two guards that keep that reading
+# honest (the ⏭️ naming line and the vacuity floor); checks 1, 2, 4b and 5 remain
+# filesystem/live-farm checks, which is what they are for.
+#
+# DOT-NAMED FURNITURE. Switching from the shell glob to the index made
+# `extensions/.gitkeep` gated for the first time (the glob could never match a
+# leading dot), which would red a machine over repo furniture — the same
+# false-block family this issue fixes. The exemption is therefore NARROW: an
+# entry is furniture only when it is dot-named AND not extension-shaped — no
+# `.ts`/`.js` file name, and (for a directory) no `index.ts`/`index.js`/
+# `package.json`. A dot-named entry that IS extension-shaped is a LOADABLE
+# extension, not furniture: pi's loader has NO dot filter (measured —
+# `.hidden.ts`, `.backup.ts` and a normal `.ts` in one agent dir all loaded;
+# `bin/agent-infra.js` farms a manifest row verbatim, dot name included), so
+# skipping `extensions/.hidden.ts` or `extensions/.adapter/index.ts` would be a
+# false PASS in a ship gate. Those are gated and named like any other extension;
+# only furniture is skipped, and it is skipped silently on every side (it is not
+# a ship artefact, so naming it in the ⏭️ line would be noise).
+#
+# Fail-closed, and the reading travels with the verdict: when the index cannot be
+# read (no git, or $ROOT is not the work-tree toplevel) the gate FAILS rather
+# than falling back to the filesystem scan — a fallback would reinstate exactly
+# this bug, silently. A tracked path under extensions/ that CONTAINS A NEWLINE is
+# refused for the same reason: the top-level name is derived line-wise, so such a
+# path would be silently truncated (and could even collide with another name) —
+# better to refuse than to mis-name. resolve_path canonicalizes BOTH sides of the toplevel
+# comparison because git resolves symlinks and $ROOT does not (on macOS
+# /tmp -> /private/tmp). Untracked extension-shaped paths are named in a ⏭️ line
+# instead of being silently ignored, so no reader has to infer what was gated.
+#
 # Usage:  bash scripts/check-pi-config-extensions.sh
 # Exit:   0 = invariant holds, 1 = drift found (details printed to stdout).
 # ============================================================
@@ -61,6 +121,25 @@ resolve_path() {
   else
     echo ""
   fi
+}
+
+# is_furniture <path> — true (0) only for a DOT-NAMED entry that is NOT
+# extension-shaped: no .ts/.js file name, and for a directory no
+# index.ts/index.js/package.json. See "DOT-NAMED FURNITURE" in the header — a
+# dot-named extension IS loadable by pi, so it must never be exempted.
+is_furniture() {
+  case "$(basename "$1")" in
+    .*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *.ts|*.js) return 1 ;;   # extension-shaped file — gated like any other
+  esac
+  if [ -d "$1" ] \
+      && { [ -e "$1/index.ts" ] || [ -e "$1/index.js" ] || [ -e "$1/package.json" ]; }; then
+    return 1                 # extension-shaped directory — gated like any other
+  fi
+  return 0
 }
 
 if [ ! -d "$SRC" ]; then
@@ -91,18 +170,116 @@ for e in "$SRC"/*; do
   fi
 done
 
-# --- check 3: set parity — every real extension is wired into pi-config ------
-for e in "$DST"/*; do
-  [ -e "$e" ] || continue
-  base="$(basename "$e")"
-  case "$base" in
-    *.test.ts) continue ;;   # test files are not extensions; not shipped
-  esac
-  if [ ! -L "$SRC/$base" ]; then
-    echo "❌ extension $base exists in extensions/ but is not wired into pi-config/extensions (fresh machines won't get it)"
+# --- tracked set: what CAN ship (see TRACKED, NOT PRESENT in the header) ----
+# TRACKED_EXTENSIONS = top-level names under extensions/ that git tracks, one per
+# line. Empty is a valid answer for a tree with nothing tracked AND nothing
+# extension-shaped on disk; the vacuity floor below refuses the other empty case
+# (disk shows extensions, the index names none of them).
+TRACKED_EXTENSIONS=""
+index_ok=0
+if ! command -v git >/dev/null 2>&1; then
+  echo "❌ git not found — checks 3/4a ask which extensions GIT TRACKS under extensions/, and the index cannot be read without it"
+  FAILURES=$((FAILURES + 1))
+else
+  repo_top="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || echo "")"
+  root_res="$(resolve_path "$ROOT")"
+  top_res=""
+  if [ -n "$repo_top" ]; then top_res="$(resolve_path "$repo_top")"; fi
+  if [ -z "$top_res" ] || [ "$top_res" != "$root_res" ]; then
+    # Fail-closed: a filesystem fallback here would reinstate #2425 silently, and
+    # enumerating a nested dir's index would answer about the WRONG tree.
+    echo "❌ cannot read the git index for $ROOT (not a git work tree, or not its toplevel) — checks 3/4a ask which extensions GIT TRACKS, so their answer would be a guess; refusing to guess"
+    FAILURES=$((FAILURES + 1))
+  elif ! nl_bytes="$(git -C "$ROOT" ls-files -z -- extensions 2>/dev/null | tr -cd '\n' | wc -c)"; then
+    echo "❌ git ls-files failed under $ROOT — checks 3/4a cannot establish which extensions are tracked; refusing to guess"
+    FAILURES=$((FAILURES + 1))
+  elif [ "$(printf '%s' "$nl_bytes" | tr -d '[:space:]')" != "0" ]; then
+    # Newline guard: the top-level name is derived LINE-WISE below, so a tracked
+    # path containing LF would be truncated to a prefix — and because `grep -F`
+    # treats an LF-bearing pattern as several patterns, the empty/prefix name
+    # could even match another entry and hide the directory from the ⏭️ line.
+    # Refuse rather than mis-name it (measured: extensions/ext<LF>ing/index.ts,
+    # tracked, unwired and unlisted, passed the gate silently).
+    echo "❌ a tracked path under extensions/ contains a newline — checks 3/4a derive the extension name line-wise, so the tracked set cannot be represented; refusing to mis-name it"
+    FAILURES=$((FAILURES + 1))
+  elif TRACKED_EXTENSIONS="$(git -C "$ROOT" ls-files -z -- extensions 2>/dev/null \
+      | tr '\0' '\n' | sed -n 's|^extensions/\([^/]*\).*|\1|p' | sort -u)"; then
+    # "extensions/d/index.ts" -> "d"; a dir whose content is entirely ignored
+    # yields no path at all, so it never enters this list. -z + tr INSIDE the
+    # pipeline on purpose: bash's command substitution silently eats NUL bytes,
+    # so capturing `git ls-files -z` into a variable first yields ONE munged
+    # line (measured — every tracked name vanished and the gate listed the whole
+    # tree as untracked).
+    index_ok=1
+  else
+    echo "❌ git ls-files failed under $ROOT — checks 3/4a cannot establish which extensions are tracked; refusing to guess"
     FAILURES=$((FAILURES + 1))
   fi
-done
+fi
+
+# Untracked extension-shaped paths: git never ships them, so they are not drift.
+# Named rather than dropped — a silent skip is how the reader of a red (or a
+# green) has to infer the scope, which is what #2425 was about.
+if [ "$index_ok" -eq 1 ]; then
+  untracked_exts=""
+  present_exts=""
+  # Three globs, because no single shell glob covers every top-level name:
+  # `*` skips dot-named entries, `.[!.]*` skips `..`-prefixed ones (its second
+  # character is a dot), and `..?*` is what reaches those. Dropping the third
+  # arm silently omitted a `..hidden.ts` — which is_furniture() classifies as
+  # EXTENSION-shaped, i.e. gated — so an untracked one was never named.
+  for e in "$DST"/* "$DST"/.[!.]* "$DST"/..?*; do
+    # `-L` too: a DANGLING SYMLINK is a tracked entry that ships and loads
+    # nothing, so it must be examined (and named), not treated as absent — the
+    # checks 1/2 loops already make this distinction.
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    base="$(basename "$e")"
+    case "$base" in
+      *.test.ts) continue ;;
+    esac
+    if is_furniture "$e"; then continue; fi   # dot-named, not extension-shaped
+    present_exts="${present_exts:+$present_exts }$base"
+    grep -Fqx -- "$base" <<<"$TRACKED_EXTENSIONS" || untracked_exts="${untracked_exts:+$untracked_exts }$base"
+  done
+  if [ -n "$untracked_exts" ]; then
+    echo "⏭️  not gated (UNTRACKED — git does not ship these, so they cannot be 'not wired'): $untracked_exts"
+  fi
+  # Vacuity floor — the "check that cannot fail" class this repo keeps deleting.
+  # If extension-shaped paths exist on disk but the index names NONE of them, the
+  # READING is wrong (a bad pathspec, a wrong cwd), not the tree: checks 3/4a
+  # would then pass over an unwired tree forever. Refuse instead of passing.
+  if [ -z "$TRACKED_EXTENSIONS" ] && [ -n "$present_exts" ]; then
+    echo "❌ git tracks NO extension under extensions/ although these exist on disk: $present_exts — checks 3/4a would pass vacuously; the index reading is wrong (pathspec/cwd), refusing"
+    FAILURES=$((FAILURES + 1))
+  fi
+fi
+
+# --- check 3: set parity — every TRACKED extension is wired into pi-config ---
+# Iterates the tracked set, not the directory listing (#2425): an untracked
+# node_modules-only directory is not an extension that needs wiring.
+if [ "$index_ok" -eq 1 ]; then
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    case "$base" in
+      *.test.ts) continue ;;   # test files are not extensions; not shipped
+    esac
+    if is_furniture "$DST/$base"; then continue; fi   # dot-named, not extension-shaped
+    # Tracked but ABSENT from the worktree means the index and disk disagree (an
+    # unstaged `rm`): there is nothing to wire, and demanding a manifest row for a
+    # path that is not on disk would report drift that cannot ship. A DANGLING
+    # SYMLINK is NOT absent — `-L` makes it pass this guard, because a tracked link
+    # ships and loads nothing, which is exactly what this gate must report. A farm
+    # link that still points here is not this loop's business — check 2 compares
+    # the link's resolved target NAME (realpath returns a path even when only the
+    # final component is missing, so it can pass), and check 5 is the liveness arm
+    # on a machine where the farm is materialized.
+    [ -e "$DST/$base" ] || [ -L "$DST/$base" ] || continue
+    if [ ! -L "$SRC/$base" ]; then
+      echo "❌ tracked extension $base exists in extensions/ (git tracks it) but is not wired into pi-config/extensions (fresh machines won't get it)"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done <<<"$TRACKED_EXTENSIONS"
+fi
 
 # --- check 4: manifest ↔ tree set parity (issue #502) ------------------------
 # manifest.json files.extensions.entries is the consumer ship-list that
@@ -153,18 +330,29 @@ fi
 # both at once. (Guard on parse_ok, not FAILURES: prior failures must not
 # suppress the manifest report.)
 if [ "$parse_ok" -eq 1 ]; then
-  # 4a — every real extension (except *.test.ts) must have a manifest row.
-  for e in "$DST"/*; do
-    [ -e "$e" ] || continue
-    base="$(basename "$e")"
-    case "$base" in
-      *.test.ts) continue ;;   # test files are not shipped; never in manifest
-    esac
-    if ! grep -Fqx "$base" <<<"$manifest_rows"; then
-      echo "❌ extension $base exists in extensions/ but has no manifest.json files.extensions.entries row (bin/agent-infra.js consumers won't get it)"
-      FAILURES=$((FAILURES + 1))
-    fi
-  done
+  # 4a — every TRACKED extension (except *.test.ts) must have a manifest row.
+  # Same index reading as check 3 (#2425): an untracked ignored directory ships
+  # to nobody, so it needs no row.
+  # `verified` is what THIS RUN compared; the closing verdict reports it (#2121: a count of the
+  # directory's contents is state that existed before this run, so it is not evidence that this
+  # run observed anything). It is incremented where the manifest comparison actually happens —
+  # inside the INDEX walk (#2425), never by listing the directory.
+  verified=0
+  if [ "$index_ok" -eq 1 ]; then
+    while IFS= read -r base; do
+      [ -n "$base" ] || continue
+      case "$base" in
+        *.test.ts) continue ;;   # test files are not shipped; never in manifest
+      esac
+      if is_furniture "$DST/$base"; then continue; fi   # dot-named, not extension-shaped
+      [ -e "$DST/$base" ] || [ -L "$DST/$base" ] || continue   # index/disk disagreement — see check 3
+      verified=$((verified + 1))
+      if ! grep -Fqx -- "$base" <<<"$manifest_rows"; then
+        echo "❌ tracked extension $base exists in extensions/ (git tracks it) but has no manifest.json files.extensions.entries row (bin/agent-infra.js consumers won't get it)"
+        FAILURES=$((FAILURES + 1))
+      fi
+    done <<<"$TRACKED_EXTENSIONS"
+  fi
 
   # 4b — every manifest row must resolve to a real extensions/ entry.
   while IFS= read -r row; do
@@ -205,5 +393,9 @@ if [ "$FAILURES" -gt 0 ]; then
   exit 1
 fi
 
-echo "✅ pi-config/extensions = symlink farm into extensions/ (single source of truth, $(( $(ls -1 "$SRC" | wc -l | tr -d ' ') )) entries)"
-echo "✅ manifest.json files.extensions.entries ↔ extensions/ tree parity holds (check 4)"
+echo "✅ pi-config/extensions = symlink farm into extensions/ (single source of truth, $verified extension(s) compared to the manifest by THIS run)"
+# The verdict names the reading it was reached from: checks 3/4a ask "which
+# extensions does GIT TRACK under extensions/", not "which directories exist"
+# (#2425 — an untracked, git-ignored node_modules tree is not an unwired
+# extension, and the old wording sent readers hunting a packaging defect).
+echo "✅ manifest.json files.extensions.entries ↔ extensions/ parity holds (check 4 — 4a asks whether every TRACKED extension has a row; 4b whether every row has an on-disk entry; tracked = git lists it under extensions/, and an untracked/ignored path cannot ship so it is not drift)"

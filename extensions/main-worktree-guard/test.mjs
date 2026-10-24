@@ -1080,6 +1080,19 @@ expectBool("#1144: plain `pull --ff-only` → verifiable",
   seff("git pull --ff-only origin main")?.unverifiable === false, true);
 expectBool("#1144: attached short value `-Xours` consumes no next token",
   seff("git merge --ff-only -Xours origin/main")?.ffOnly === true, true);
+// ── #2277: the SOURCE ref list (positionals) — the foreign-checkout arm needs
+// the no-positional form, so a `pull --ff-only origin main` must expose its
+// refs rather than look like the bare form.
+expectBool("#2277: bare `pull --ff-only` has NO positional (targets the configured upstream)",
+  JSON.stringify(seff("git pull --ff-only")?.positionals) === "[]", true);
+expectBool("#2277: `pull --ff-only origin main` exposes both positionals",
+  JSON.stringify(seff("git pull --ff-only origin main")?.positionals) === '["origin","main"]', true);
+expectBool("#2277: an option VALUE is not a positional (`merge -m msg --ff-only`)",
+  JSON.stringify(seff("git merge -m msg --ff-only")?.positionals) === "[]", true);
+expectBool("#2277: a value attached inside a cluster is not a positional (`merge -qm msg`)",
+  JSON.stringify(seff("git merge -qm msg --ff-only origin/main")?.positionals) === '["origin/main"]', true);
+expectBool("#2277: a dashless branch name is a positional (`pull --ff-only main`)",
+  JSON.stringify(seff("git pull --ff-only main")?.positionals) === '["main"]', true);
 // ── cycle-2 reviewer: git's left-to-right short scan + fail-closed option shapes ──
 expectBool("#1144: `merge -Xours --ff-only` → ffOnly true (attached value, real flag follows)",
   seff("git merge -Xours --ff-only origin/main")?.ffOnly === true, true);
@@ -5193,8 +5206,21 @@ try {
   expectBool("#1139: the fail-closed remedy is printed only when that file exists",
     pinSrc.includes("if (existsSync(p)) sanctionedHelper = p;") &&
     !pinSrc.includes("const sanctionedHelper = _frameworkRoot"), true);
-  expectBool("#1139 T6: a null anchor / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
-    pinSrc.includes("if (!_frameworkRoot) return null;") &&
+  // #2332 reshaped this predicate: the anchor is no longer the ONLY gate, so the
+  // pin is on the three things that must all still fail CLOSED — (1) an absent
+  // module root skips arm 1 instead of taking it, (2) arm 2 requires a pin (a
+  // missing/unreadable pin JSON yields an empty map, so no relpath is exempt),
+  // and (3) a throwing probe still keeps the M5 set gated. A regression in any
+  // of them turns "cannot tell" into "allow", which is the fail-open this test
+  // exists for.
+  // ⚠️ The anchor string must be UNIQUE in index.ts. `if (_frameworkRoot) {` is
+  // not: it occurs in an unrelated function too, so mutating arm 1 to
+  // `if (true) {` left the assertion green (measured at #2332 review). The pin
+  // is on the arm-1 open + its own loop, which appears exactly once.
+  expectBool("#1139 T6: a null anchor / an absent pin / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
+    pinSrc.includes("if (_frameworkRoot) {\n    for (const rel of SANCTIONED_SCRIPT_RELPATHS) {") &&
+    (pinSrc.match(/if \(_frameworkRoot\) \{\n    for \(const rel of SANCTIONED_SCRIPT_RELPATHS\) \{/g) ?? []).length === 1 &&
+    pinSrc.includes("if (typeof want !== \"string\" || want.length !== 64) continue;") &&
     pinSrc.includes("catch { rel = null; }") &&
     pinSrc.includes("if (rel === null) return true;"), true);
   expectBool("#1139 (review cycle-1 P1): the pipe-seed walk TOKENIZES shell words (a quoted piped script was unwalked)",

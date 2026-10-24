@@ -73,6 +73,15 @@ command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority
   || { echo "[merge $PR] FATAL repo-authority.sh is stale (no resolve_required_checks/merge_authority) — refusing to run without the per-repo merge contract" >> "$L.log"; exit 1; }
 REQ_OVERRIDE="${REQ:-}"
 REQ=""
+# ── AGENT_GH_REAL: pin the ONE real gh this box resolves (agent-infra#2320) ──────────────────────
+# This worker is about to make the read the whole merge contract rests on. MEASURED 2026-10-22: the
+# wrapper chain resolved to ITSELF on the owner's Mac, every gh call returned EMPTY, protection read
+# UNREADABLE and THIS script refused every merge (exit 5) while the reported cause pointed at
+# permissions. A pin exported here — per box, DISCOVERED from PATH, never a hardcoded home — is what
+# stops the chain re-forming. Best-effort: if it cannot be pinned the read below still fails closed,
+# and `bin/harness status` names it. ⛔ Interface-guarded so a pre-#2320 `$O` copy is a no-op rather
+# than a 127 in the merge log.
+if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real || true; fi
 
 # ── the rail-refusal RECORD (the controller's red-fixer role reads it) ──────────
 # Sourced from the SAME two homes as every other shared module here (`$O` is what the daemon
@@ -93,7 +102,16 @@ command -v rail_refusal_record >/dev/null 2>&1 || echo "[merge $PR] ⚠️ rail-
 run_agent() { # run_agent <seconds> <logfile> <promptfile>
   local t="$1" log="$2" prompt="$3" pid w rc start elapsed
   start="$(date +%s)"
-  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
+  # ⛔ THE SAME RESOLVED MODEL AS spawn-gate.sh's `run_agent` (agent-infra#2208, review P1). This is a
+  # SECOND `run_agent` — the `chain-<N>` first-review spawn for every own-lane PR, i.e. the highest-
+  # volume model call the harness makes — and it carried the hardcoded `deepseek-v4-flash` the
+  # sibling was fixed for. Fixing one and not the other leaves the defect exactly where it costs
+  # most, and `spawn-gate.test.sh` already treats both files as one population
+  # (`EXPECTED_PI="merge-one.sh spawn-gate.sh"`), so the divergence was invisible to the suite.
+  # Keep the two defaults IDENTICAL: a lane must not run a different model than its reviewer.
+  local lane_provider="${PI_LANE_PROVIDER:-deepseek}" lane_model="${PI_LANE_MODEL:-deepseek-flash}"
+  echo "[agent] provider=$lane_provider model=$lane_model" >> "$log"
+  pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
@@ -539,7 +557,7 @@ rail_attempt() {
       # ⛔ A RECORD THAT CANNOT BE WRITTEN IS SAID, NOT SWALLOWED. The controller's red-fixer role
       # reads this record; without it the refusal produces no work — the exact stall this exists to
       # end — so the degraded box must say so loudly, in the log an operator reads.
-      echo "[merge $PR] ⚠️ REFUSAL NOT RECORDED — rail-refusal.sh is missing/unusable in \$O, or \$O/state is unwritable, so NO red-fixer can see this refusal (re-seed: cp scripts/orchestrator-harness/*.sh \"\$O/\"; free space). The rail's words are above." >> "$L.log"
+      echo "[merge $PR] ⚠️ REFUSAL NOT RECORDED — rail-refusal.sh is missing/unusable in \$O, or \$O/state is unwritable, so NO red-fixer can see this refusal (re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \"$O\"; free space). The rail's words are above." >> "$L.log"
     fi
     # Removed unconditionally: the `/dev/null` fallback that made this unsafe is gone, and a staged
     # temp left behind on the `tail`-failed path is one file per PR, forever (review P3, cycle 4).

@@ -49,6 +49,9 @@ case "$*" in *"--jq .head.sha"*)
   fi
   printf '%s' '75c0353907f016cf71661d8a6b11f61bf4d5092f'; exit 0 ;; esac
 case "$*" in *"--auto"*) printf 'STUB: delegated auto-merge'; exit 0 ;; esac
+# A DELEGATED `issue view` (PR-numbered target): real gh answers such a number with an OBJECT, and the
+# adapter must pass that answer through untouched. Only the REST path below starts with `repos/`.
+case "$*" in *"issue view 900 "*) printf '%s' '{"number":900,"title":"a pull request","state":"MERGED","stateReason":"","assignees":[],"url":"https://example/900"}'; exit 0 ;; esac
 # POST /comments (pr comment) and GET /comments (pr view --json comments) share a path — split on method.
 case "$*" in *"-X POST"*"/comments"*) printf '{"id":7,"html_url":"https://github.com/o/r/pull/8833#issuecomment-7"}'; exit 0 ;; esac
 path="$(printf '%s\n' "$@" | grep -m1 -E '^repos/')"
@@ -58,8 +61,8 @@ case "$path" in
   *"ready_for_review"*)   printf '{}'; exit 0 ;;
   # check-runs BEFORE status: "check-runs" does not contain "/status", but order still matters.
   *"check-runs"*)         printf '%s\n%s\n' \
-      '{"check_runs":[{"name":"ai-review-gate","status":"completed","conclusion":"success","details_url":"https://x/runs/1","app":{"slug":"github-actions"}},{"name":"changes","status":"in_progress","conclusion":null,"details_url":"https://x/runs/2","app":{"slug":"github-actions"}}]}' \
-      '{"check_runs":[{"name":"python-ci-gate","status":"completed","conclusion":"failure","details_url":"https://x/runs/12345/job/9","app":{"slug":"github-actions"}}]}'
+      '{"check_runs":[{"name":"ai-review-gate","status":"completed","conclusion":"success","started_at":"2026-10-23T01:00:00Z","completed_at":"2026-10-23T01:05:00Z","details_url":"https://x/runs/1","app":{"slug":"github-actions"}},{"name":"changes","status":"in_progress","conclusion":null,"started_at":"2026-10-23T01:06:00Z","details_url":"https://x/runs/2","app":{"slug":"github-actions"}}]}' \
+      '{"check_runs":[{"name":"python-ci-gate","status":"completed","conclusion":"failure","started_at":"2026-10-23T01:10:00Z","completed_at":"2026-10-23T01:20:00Z","details_url":"https://x/runs/12345/job/9","app":{"slug":"github-actions"}}]}'
       exit 0 ;;
   *"/status")             # legacy commit status (StatusContext) — not a check run
       printf '{"statuses":[{"context":"vercel/deploy","state":"pending","target_url":"https://vercel/1","creator":{"login":"vercel"}}]}'; exit 0 ;;
@@ -68,6 +71,7 @@ case "$path" in
   *"/pulls?state="*)      printf '%s' '[{"number":9001,"title":"unrelated newest","state":"open","merged_at":null,"mergeable":true,"mergeable_state":"clean","draft":false,"head":{"ref":"other","sha":"o1"}},{"number":3,"title":"c","state":"open","merged_at":null,"mergeable":true,"mergeable_state":"clean","draft":false,"head":{"ref":"c","sha":"c3"}},{"number":2,"title":"b","state":"open","merged_at":null,"mergeable":true,"mergeable_state":"clean","draft":false,"head":{"ref":"b","sha":"b2"}}]'; exit 0 ;;
   *"/issues?state="*)     printf '%s' '[{"number":900,"title":"a pull request","state":"open","pull_request":{"url":"x"}},{"number":8491,"title":"real issue","state":"open","labels":[{"name":"P0-blocker"}]},{"number":8492,"title":"another","state":"open","labels":[]}]'; exit 0 ;;
   *"/issues/8833/comments"*|*"/comments?per_page"*) printf '%s\n%s\n' '[{"body":"LGTM","user":{"login":"rev"},"created_at":"2026-10-17"}]' '[{"body":"second","user":{"login":"rev2"},"created_at":"2026-10-18"}]'; exit 0 ;;
+  *"/issues/900")        printf '%s' '{"number":900,"title":"a pull request","state":"open","state_reason":null,"assignees":[],"html_url":"https://example/900","pull_request":{"url":"x"}}'; exit 0 ;;
   *"/issues/9008"*)      printf '%s' '{"number":9008,"title":"dup","state":"closed","state_reason":"duplicate","assignees":[]}'; exit 0 ;;
   *"/issues/8491"*)       printf '%s' '{"number":8491,"title":"real issue","state":"open","labels":[{"name":"P0-blocker"}],"assignees":[{"login":"daniel-ospina"}]}'; exit 0 ;;
 esac
@@ -140,6 +144,19 @@ out="$(run pr checks 8833 --repo o/r --json name,state 2>&1)"
 ck "pr checks includes LEGACY commit statuses (else a protection context is never green)" \
    "$(printf '%s' "$out" | json_eq 'any(x["name"]=="vercel/deploy" for x in d)')"
 
+# ⛔ ORDERING FIELDS MUST SURVIVE THE PROJECTION, not just the allow-list. `startedAt` was in
+# CHECK_FIELDS (so `gh pr checks --json ...,startedAt` passed the field check and was NOT delegated)
+# while the projection emitted no such key — a caller ordering check runs by attempt got undefined
+# on EVERY installed box, silently. MEASURED: the lander newest-attempt dedupe was inert through
+# this adapter, so a re-run that came back green still read `1 FAILED check(s)`.
+out="$(run pr checks 8833 --repo o/r --json name,state,startedAt,workflow 2>&1)"
+ck "pr checks projects startedAt (a dedupe by newest attempt cannot work without it)" \
+   "$(printf '%s' "$out" | json_eq 'all(("startedAt" in x) for x in d) and any(x.get("startedAt") for x in d)')"
+ck "pr checks projects start times that can ORDER two attempts of one job (not all null)" \
+   "$(printf '%s' "$out" | json_eq 'len({x.get("startedAt") for x in d if x.get("startedAt")}) >= 2')"
+ck "pr checks still delegates a field it does not model (startedAt must not license a partial answer)" \
+   "$(printf '%s' "$out" | json_eq 'all(("workflow" in x) for x in d)')"
+
 # ── D2. pr checks WITHOUT --json delegates (the table is not modelled) ──────────────────────────
 : >"$TMP/log"
 out="$(run pr checks 8833 --repo o/r 2>&1)"
@@ -188,6 +205,31 @@ ck "issue view state_reason read stays on REST (no delegation for a CLOSED issue
 run pr view 8833 --repo o/r --json stateReason >/dev/null 2>&1
 ck "pr view --json stateReason still DELEGATES (gh rejects the field for PRs; REST must not invent it)" \
    "$(haslog 'pr view 8833 --repo o/r --json stateReason' && echo 0 || echo 1)"
+
+# ── D5. `issue view` of a PR-NUMBERED target must DELEGATE, never answer `[]` ────────────────
+# Issues and pull requests SHARE one number sequence, so `gh issue view <n>` on a PR number is a
+# legitimate question — and it is the exact read `collision_preflight.py` makes for `issue landed`
+# AND `issue assignee/holder` (#2645 in daniel-ospina/agent-infra is such a number). Measured
+# 2026-10-24: the adapter applied its LIST-only "drop pull_request rows" filter on the VIEW path,
+# printed `[]` with rc 0, and a fail-closed caller refused non-object JSON on BOTH surfaces. The
+# candidate became INCOMPLETE, and six INCOMPLETE candidates are `ABORT: … judged NOTHING` — an
+# empty dispatch backlog with capacity free, produced by the adapter (the class its own header calls
+# "does not degrade the fleet, it disables it").
+: >"$TMP/log"
+out="$(run issue view 900 --repo o/r --json number,title,state,stateReason,assignees,url 2>&1)"
+ck "issue view of a PR-numbered target DELEGATES (an empty [] is non-object JSON to the pre-flight)" \
+   "$(haslog 'issue view 900 --repo o/r' && echo 0 || echo 1)"
+ck "issue view of a PR-numbered target never prints the LIST shape ([])" \
+   "$([ "$out" != "[]" ] && [ -n "$out" ] && echo 0 || echo 1)"
+ck "issue view of a PR-numbered target returns a JSON OBJECT, the shape the caller was promised" \
+   "$(printf '%s' "$out" | json_eq 'isinstance(d, dict) and d.get("number")==900')"
+# NON-VACUITY for the same arm: a REAL issue number must still be served over REST, not delegated —
+# otherwise "delegate on a PR" could hide a resolver that delegates everything (a silent GraphQL draw
+# on the scarce bucket, which is the reason this arm exists at all).
+: >"$TMP/log"
+run issue view 8491 --repo o/r --json number,state >/dev/null 2>&1
+ck "an ordinary issue read still stays on REST (the PR arm did not license delegating everything)" \
+   "$(haslog 'repos/o/r/issues/8491' && ! haslog 'issue view 8491' && echo 0 || echo 1)"
 
 # ── E. pr list --head must reach the API (chain-merge.sh:44 — else the WRONG PR is merged) ───────
 : >"$TMP/log"

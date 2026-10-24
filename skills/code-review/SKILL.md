@@ -1602,6 +1602,17 @@ disposition is `follow_up` and which are filed as owned issues and named in the 
 record the verdict so the `ai-review-gate` required
 check can go green. Best-effort — NEVER fails the workflow:
 
+**Who is running the review — you, or a lander with no prompt to compose?** If the answer is "I
+need a review of PR N obtained and recorded by someone else" (a merge-duty lane, a rail operator, a
+controller with no reviewer session), do NOT hand-compose a reviewer prompt and do NOT record by
+hand: `scripts/review-pr.sh <PR>` (farmed to `~/.pi/agent/scripts/review-pr.sh` on a cell) spawns a
+genuinely fresh-context reviewer over the PR's CURRENT head, posts its findings as the PR comment
+this step names as `--evidence`, and records ONLY a clean verdict — bound to the head it actually
+reviewed — through the recorder below. Findings ⇒ exit 7, no record, findings printed; an
+unresolvable repo/auth, a reviewer with no verdict, a head that moved mid-review, and a head that
+already carries a clean record each refuse with a named cause. A session that runs THIS skill keeps
+using the block below.
+
 **Which verdict, by class.** `record-review.sh` accepts `clean`, `clean-micro` and `clean-low`:
 
 - **`clean`** — the normal verdict, and the one a **Low code-impact** change records when its
@@ -1670,8 +1681,16 @@ fi
   `ai-review-gate` workflow and turns the check green (the marker is HMAC-signed;
   see the workflow header in `.github/workflows/ai-review-gate.yml`).
 - If the PR head moves AFTER recording (fix commits, merge of main), the gate
-  turns red again: re-review the new head and re-record. NEVER re-record a moved
-  head without a fresh review — the gate binds the full head sha.
+  turns red again: re-review the new head and re-record — UNLESS a carry arm
+  proves the reviewed artifact is unchanged (the same three-dot DIGEST, or a
+  base-only move — the base advanced, YOUR OWN commits did not), AND the target
+  head is not measurably red (#1575 clause E refuses the carry; re-run the
+  failing checks and re-record instead), in which case nothing is owed: pass
+  the recorded head and the recorded verdict to `record-review.sh` and it
+  re-binds (`mint:"carried"`, no `--evidence`). See
+  `commit-workflow/workflow/04-merge-deploy.md` condition 6. NEVER re-record a
+  moved head with a CHANGED artifact without a fresh review — the gate binds the
+  full head sha.
 - A saved record with a FAILED evidence post (transient API error) leaves the
   gate red: re-run `record-review.sh` to retry the post (the script warns and
   exits 0 on transient failures).
