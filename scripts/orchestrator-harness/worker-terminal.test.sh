@@ -28,11 +28,30 @@ LOOP="$HERE/orch-loop.sh"
 DM="$HERE/dispatch-merge.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# ── HERMETIC FROM THE BOX'S gh CONFIG DIRECTION (measured on the CI runner, 2026-10-24) ──────
+# `gh` resolves its config dir as $GH_CONFIG_DIR, then $XDG_CONFIG_HOME/gh, then $HOME/.config/gh —
+# and the shipped `wt_gh_hosts` mirrors that order DELIBERATELY (a one-location probe refuses an
+# AUTHENTICATED box, forever: #2396). The consequence for THIS SUITE is not a product bug but a
+# hermeticity one: the GitHub runner exports XDG_CONFIG_HOME=/home/runner/.config, so every fixture
+# that builds `$fixture_home/.config/gh/hosts.yml` was evaluated against the RUNNER's config instead
+# of the fixture's, and 7 unrelated assertions went red (`wt_gh_hosts` answered the runner's path,
+# the credential probe refused a provisioned worker, the cleanup then had no session to name).
+# One ambient variable cascaded into seven arms, on main and on every PR, so no PR could land.
+# The arms that PIN the resolver's precedence still set these per-arm (inline assignment, `env -i`,
+# or a subshell), which is exactly why scrubbing them here cannot weaken those assertions.
+unset GH_CONFIG_DIR XDG_CONFIG_HOME
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1));
   else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL+1)); fi
 }
+# The scrub above must be ASSERTED, not assumed: a box (or a future runner image, or another lane's
+# shell) that repoints gh's config would otherwise re-break seven arms with one variable, and the
+# failure would again read as seven unrelated defects. One named assertion, at the top, so the next
+# occurrence fails ONCE and says why.
+ck "hermetic: the caller's gh config dir is not inherited (GH_CONFIG_DIR/XDG_CONFIG_HOME scrubbed)" \
+   "$([ -z "${GH_CONFIG_DIR:-}" ] && [ -z "${XDG_CONFIG_HOME:-}" ] && echo 0 || echo 1)"
 # A `hosts.yml` that ACTUALLY carries a token — the only shape `wt_gh_hosts_token` blesses. ⛔ The old
 # fixture was `printf 'github.com:\n'` (a host entry and nothing else), which the probe read as
 # PROVISIONED: a `gh auth logout`/half-write leftover starts the credential-less worker this gate
