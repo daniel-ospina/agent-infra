@@ -7,6 +7,50 @@
 # removed 163 worktrees with zero data loss — but nothing prevented
 # regeneration. This is the reclamation mechanism.
 #
+# ⛔ DURABLE RULE — WHAT MAKES A WORKTREE "FINISHED" (do not re-derive this)
+# -------------------------------------------------------------------------
+# A worktree is FINISHED — and therefore reclaimable regardless of its age —
+# only on EVIDENCE, never on a name and never on a clock:
+#
+#   1. MERGED       its HEAD is an ancestor of the base (`git merge-base
+#                   --is-ancestor <head> <main>`, the same question as
+#                   `git branch --merged origin/main`). The work it exists for
+#                   is on the base, so the checkout is the last copy of
+#                   nothing. This is what makes it reclaimable, and it EXEMPTS
+#                   it from the age floor below. Before the merged exemption,
+#                   the merge was computed and PRINTED but not binding, so the
+#                   binding test was "HEAD older than 7 days": measured
+#                   2026-10-22 over the live 550-worktree tortoise estate, 250
+#                   worktrees failed ONLY on that clock.
+#   2. CLEAN        `git -C <wt> status --porcelain -unormal` is empty — no
+#                   uncommitted and no untracked file, nothing to reason about.
+#   3. NO UNPUSHED  `git rev-list --count HEAD --not --remotes` is 0: no commit
+#                   on HEAD exists on no remote ref. This catches the one shape
+#                   merged-ness cannot: a checkout whose branch already landed
+#                   but which carries a further LOCAL commit on top.
+#   4. NO STASH     the repo-global stash register names no entry for the
+#                   branch. Read as a REGISTER (one bounded read per pass),
+#                   never with `git stash` — see the lane-stash rule below.
+# plus the two standing vetoes: no live process holds the path, and the branch is
+# not an open PR head / live claim.
+#
+# Anything ambiguous is KEPT and the reason is NAMED. An aged-but-unmerged named
+# branch stays reclaimable (its commits survive on the branch ref — `git
+# worktree remove` deletes the CHECKOUT, never a ref), which is the measured
+# #1095 class; gates 2-4 apply to that path too.
+#
+# ⛔ TWO THINGS THIS TOOL MUST NEVER DO
+#   1. NEVER touch a PRIMARY checkout — not the main worktree, not a bare repo,
+#      not the checkout the reaper is running inside. `MAIN_CANON` and
+#      `is_self_or_ancestor` are the only permitted tests for that, and they run
+#      before every other gate.
+#   2. NEVER judge "finished" from a BRANCH NAME (or a path, or a lane slug)
+#      alone. A name is not a ref: `git worktree list` keeps printing
+#      `branch refs/heads/X` after X is force-deleted, and a branch called
+#      `fix-1234` says nothing about whether its work landed. Every verdict here
+#      comes from a git object read — ancestry, a resolving ref, a status byte,
+#      a rev-list count.
+#
 # POLICY CONTRACT (per issue #1095). A worktree is removed ONLY when ALL hold:
 #   * clean        — `git status --porcelain --ignored=traditional -unormal` is
 #                    empty except declared-EPHEMERAL root entries
@@ -86,11 +130,12 @@
 # the box sat at 87% used. An unmerged head is NOT exempt: there the age floor
 # still separates "a stale scratch checkout" from "work in progress".
 #
-# `merged` is REPORTED (refs=merged|branch-retained:<b>|reachable-from:<ref>),
-# not binding: the issue's own measured sweep removed 48 "stale-unmerged, no
-# open PR" worktrees with the branch retained, and its never-auto-remove list
-# names only clean/reachable/unreferenced. See docs/scoping/
-# 2026-09-15-issue-1095-worktree-reaper.md §2 for the derivation.
+# `merged` is now BINDING in ONE direction only — as a FINISHED PROOF that
+# exempts a worktree from the age floor (see the DURABLE RULE above). It is
+# still NOT a requirement: the issue's own measured sweep removed 48
+# "stale-unmerged, no open PR" worktrees with the branch retained, and its
+# never-auto-remove list names only clean/reachable/unreferenced. See
+# docs/scoping/2026-09-15-issue-1095-worktree-reaper.md §2 for the derivation.
 #
 # EPHEMERAL ALLOWLIST — the measured sweep treated a per-worktree `.venv` as
 # disposable (14 worktrees removed on that basis). The allowlist is the ONLY
@@ -181,7 +226,8 @@
 #   unparseable-path (poisoned record) > bare > main-checkout > self-checkout >
 #   worktree-locked > unreadable-path | prunable > live-process > live-cwd >
 #   dirty | ignored-artifact | status-timeout | status-error >
-#   detached-unreachable > open-pr > too-recent > reclaimable
+#   detached-unreachable > open-pr > unpushed-unverifiable | unpushed-commits >
+#   stranded-stash > too-recent > reclaimable
 #
 # PRESERVE reasons and why each one is not a bug:
 #   main-checkout          the shared checkout
@@ -219,7 +265,13 @@
 #                          refuse to delete
 #   status-*               the clean gate could not be evaluated => fail-closed
 #   open-pr                an open PR head branch
-#   too-recent             HEAD commit not strictly older than --aged-days
+#   unpushed-commits       HEAD carries >=1 commit reachable from no remote ref
+#                          — the one shape merged-ness cannot see
+#   unpushed-unverifiable  the unpushed probe could not be read => fail-closed
+#   stranded-stash         the stash register names an entry for this branch —
+#                          the lane may still have work parked for it
+#   too-recent             HEAD commit not strictly older than --aged-days AND
+#                          the branch is NOT merged (a merged head is exempt)
 #   unreadable-head        HEAD could not be dated
 #   deferred               the pass budget ran out; the record is UNCLASSIFIED,
 #                          so it also blocks the end-of-pass prune (an
@@ -236,7 +288,7 @@
 #   REAP_WT_LIST_TIMEOUT REAP_WT_STATUS_TIMEOUT REAP_WT_PS_TIMEOUT
 #   REAP_WT_CWD_TIMEOUT REAP_WT_GH_TIMEOUT REAP_WT_REMOVE_TIMEOUT
 #   REAP_WT_GIT_TIMEOUT
-#   REAP_WT_BUDGET_SECONDS REAP_WT_STATE_DIR REAP_WT_LOCK_STALE_SECONDS
+#   REAP_WT_BUDGET_SECONDS REAP_WT_ROTATE REAP_WT_STATE_DIR REAP_WT_LOCK_STALE_SECONDS
 #   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT
 # Exit codes: 0 pass completed with nothing failed, 2 usage, 3 fail-closed
 # abort (nothing trusted), 4 pass completed but >=1 removal FAILED.
@@ -282,6 +334,10 @@ REAP_WT_REMOVE_TIMEOUT="${REAP_WT_REMOVE_TIMEOUT:-120}"
 # which on a healthy repo are milliseconds and on a hung mount are forever.
 REAP_WT_GIT_TIMEOUT="${REAP_WT_GIT_TIMEOUT:-20}"
 REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}"
+# Pass-budget rotation (see rotate_records). 1 = rotate (default); 0 disables it
+# and restores strict `git worktree list` order. A caller whose assertion depends
+# on WHICH row the budget defers (the A7/A15 budget fixtures) pins 0.
+REAP_WT_ROTATE="${REAP_WT_ROTATE:-1}"
 REAP_WT_LOCK_STALE_SECONDS="${REAP_WT_LOCK_STALE_SECONDS:-1800}"
 REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT:-1000}"
 REAP_WT_MAIN_REF="${REAP_WT_MAIN_REF:-}"
@@ -1137,6 +1193,148 @@ patch_equivalent() { # <sha> -> 0 when every commit it adds has a patch-id twin 
 }
 
 # ── classification ─────────────────────────────────────────────────────
+# ── finished-proof probes (merged ⇒ age-exempt; gates 3 and 4) ──────────
+# Both probes read REPO-GLOBAL state, so the expensive half is loaded ONCE per
+# pass and the per-worktree half is a bounded single probe (or a scan of an
+# already-read file). Neither ever shells out to `git stash`: the register is
+# read through `git log --walk-reflogs -g refs/stash`, because a bare `git
+# stash` mutates the repo-global stash stack that every lane in this repo
+# shares (the #8051 lane_stash hazard, reproduced in tools/lane_stash.py).
+STASH_OUT=""
+STASH_STATE="unknown"   # ok | empty | unreadable
+REMOTE_STATE="unknown"  # present | absent | unreadable
+
+# stash_index_load — ONE bounded read of the stash register: "<selector>\t<subject>".
+# An ABSENT refs/stash is a decided `empty`, not an error; any OTHER failure is
+# `unreadable`, and an unreadable register fails CLOSED at the gate below (a
+# register we cannot read is not a register we can say is clear).
+stash_index_load() {
+    STASH_OUT="$(mktemp "${TMPDIR:-/tmp}/pi-reap-stash.XXXXXX" 2>/dev/null)" || { STASH_OUT=""; STASH_STATE="unreadable"; return 0; }
+    # BOUNDED like every other probe: this script's contract is that NO git probe
+    # runs unwatched, and an unbounded `rev-parse` on a hung mount would hold the
+    # pass lock past its own staleness horizon. rc 1 = the ref genuinely does not
+    # exist ("no stashes"); 124 = timeout and anything else = a probe we could
+    # not evaluate. Only the FIRST is a decided empty register.
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" rev-parse --verify -q refs/stash
+    case "$?" in
+        0) ;;
+        1) STASH_STATE="empty"; return 0 ;;
+        *) STASH_STATE="unreadable"; return 0 ;;
+    esac
+    if ! run_bounded "$REAP_WT_GIT_TIMEOUT" "$STASH_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" log --walk-reflogs -g refs/stash --format='%gd%x09%gs'; then
+        STASH_STATE="unreadable"; return 0
+    fi
+    STASH_STATE="ok"
+    return 0
+}
+
+# remote_state_load — ONE probe: does this repo have any remote at all?
+# A repo with NO remote has no notion of "pushed", and treating every commit as
+# unpushed would hold the whole estate forever (a fresh `git init`, and every
+# hermetic test fixture, is exactly that). Decided once; fail-closed when the
+# probe itself cannot be evaluated.
+remote_state_load() {
+    # "Pushed" is defined by REMOTE-TRACKING REFS, not by configured remotes: a
+    # repo whose `remote.origin` was renamed/unset keeps its refs/remotes/*, and
+    # deciding `absent` from the config alone would silently switch gate 3 off
+    # for the whole pass. So `absent` requires BOTH to be empty.
+    if ! run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" remote; then
+        REMOTE_STATE="unreadable"; return 0
+    fi
+    [ -r "$GIT_OUT" ] || { REMOTE_STATE="unreadable"; return 0; }
+    if [ -n "$(tr -d '[:space:]' <"$GIT_OUT")" ]; then
+        REMOTE_STATE="present"; return 0
+    fi
+    if ! run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" for-each-ref --count=1 --format='%(refname)' refs/remotes; then
+        REMOTE_STATE="unreadable"; return 0
+    fi
+    [ -r "$GIT_OUT" ] || { REMOTE_STATE="unreadable"; return 0; }
+    if [ -n "$(tr -d '[:space:]' <"$GIT_OUT")" ]; then
+        REMOTE_STATE="present"
+    else
+        REMOTE_STATE="absent"
+    fi
+    return 0
+}
+
+# unpushed_ahead <path> -> prints the count of commits on HEAD reachable from no
+# remote ref. rc 0 = verified, rc 1 = UNVERIFIABLE (the caller must PRESERVE).
+# `--not --remotes` is the only definition that can see the dangerous shape:
+# a branch whose landed tip is on main while the checkout carries a further
+# LOCAL commit — ancestry calls that "not merged", and branch retention hides
+# the fact that the commit exists in exactly one place.
+unpushed_ahead() {
+    local path="$1" n
+    case "$REMOTE_STATE" in
+        absent) printf '0\n'; return 0 ;;
+        present) ;;
+        *) return 1 ;;
+    esac
+    if ! run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$path" rev-list --count HEAD --not --remotes; then
+        return 1
+    fi
+    n="$(head -1 "$GIT_OUT" 2>/dev/null)"
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$n"; return 0
+}
+
+# stranded_stash_for <branch-ref> -> prints the matching "<selector>\t<subject>"
+# when the stash register names an entry for exactly this branch. Matched on the
+# reflog subject's own form (`On <branch>: …` / `WIP on <branch>: …`), so a
+# PREFIX branch (`feat/x` vs `feat/x2`) cannot match.
+# A DETACHED row (`-`) never matches: its stash entry records `On (no branch):`,
+# so gate 4 cannot see it. That is not a data-loss gap — `git worktree remove`
+# never touches refs/stash — but it is why a detached row is decided by
+# `commits_survive` alone, and it is called out rather than left implicit.
+stranded_stash_for() {
+    local ref="$1" bn line subj
+    [ "$ref" = "-" ] && return 1
+    bn="${ref#refs/heads/}"
+    case "$STASH_STATE" in
+        empty) return 1 ;;
+        ok) ;;
+        *) return 1 ;;   # unreadable is handled by the caller as fail-closed
+    esac
+    [ -s "$STASH_OUT" ] || return 1
+    while IFS= read -r line; do
+        # `$'\t'` is the ONLY tab here: inside a `case` pattern a quoted "\t"
+        # is a literal backslash-t and silently matches nothing.
+        subj="${line#*$'\t'}"
+        case "$subj" in
+            "On $bn:"*|"WIP on $bn:"*) printf '%s\n' "$line"; return 0 ;;
+        esac
+    done <"$STASH_OUT"
+    return 1
+}
+
+# rotate_records <records> <offset> — rotate a newline-separated record list so
+# that record <offset> comes first, wrapping. The pass budget is only checked
+# BETWEEN records, and `git worktree list` order is stable, so a budget-limited
+# pass classified a fixed HEAD of the list and deferred the same TAIL on every
+# run: the newest worktrees — appended last, and the ones a pass exists to reap —
+# were never reached. Measured 2026-10-22 on the live estate: 12 consecutive
+# scheduled passes deferred 208-434 of ~540 worktrees, always the same tail, and
+# the count only grew.
+#
+# HONEST LIMIT: the offset advances by what the pass CONSUMED, so it reaches any
+# given tail across successive passes only while the estate stops growing faster
+# than the budget consumes. A list growing faster than ~rows-per-pass can still
+# outrun the offset. This narrows the starvation hole; it does not close it
+# against unbounded growth.
+rotate_records() {
+    local records="$1" n off
+    n="$(printf '%s\n' "$records" | sed '/^$/d' | wc -l | tr -d ' ')"
+    [ "$n" -gt 1 ] || { printf '%s\n' "$records"; return 0; }
+    off=$((${2:-0} % n))
+    [ "$off" -gt 0 ] || { printf '%s\n' "$records"; return 0; }
+    printf '%s\n' "$records" | sed '/^$/d' |
+        awk -v o="$off" 'NR>o{print} {a[NR]=$0} END{for(i=1;i<=o;i++) print a[i]}'
+}
+
 # classify_one <path> <sha> <branch> <flags> <now>
 # Emits one row: "<verdict>\t<reason>\t<ephemeral>\t<detail>" (ephemeral is
 # third so the free-text detail, which may embed a path containing a tab, is
@@ -1252,6 +1450,25 @@ classify_one() {
         if [ -n "$PR_REFS" ] && grep -qxF -- "$bn" <<<"$PR_REFS"; then
             printf 'preserve\topen-pr\t\tbranch %s is an open PR head\n' "$bn"; return 0
         fi
+    fi
+
+    # ── gates 3 and 4 of the DURABLE RULE ──────────────────────────────
+    # These sit AFTER every cheap gate (so the probes only run on rows that
+    # could actually be removed) and BEFORE the age floor (so no clock can
+    # reach a row that these two would keep).
+    local unp
+    if ! unp="$(unpushed_ahead "$path")"; then
+        printf 'preserve\tunpushed-unverifiable\t\tcannot read the unpushed-commit probe — abstaining\n'; return 0
+    fi
+    if [ "$unp" != 0 ]; then
+        printf 'preserve\tunpushed-commits\t\t%s commit(s) on HEAD exist on no remote ref\n' "$unp"; return 0
+    fi
+    case "$STASH_STATE" in
+        unreadable)
+            printf 'preserve\tstranded-stash\t\tthe stash register could not be read — abstaining (a register we cannot read is not a clear register)\n'; return 0 ;;
+    esac
+    if detail="$(stranded_stash_for "$branch")"; then
+        printf 'preserve\tstranded-stash\t\tthe stash register holds work for branch %s: %s\n' "${branch#refs/heads/}" "$detail"; return 0
     fi
 
     local head_ts
@@ -1442,7 +1659,7 @@ run() {
     # it owns the probe scratch dir, the watchdog timers, the probe output files
     # and the lock. Installing it later (as it was) leaked the scratch dir on
     # every early fail-closed exit.
-    trap 'tb_watchdogs_reap; tb_bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT"; lock_release' EXIT
+    trap 'tb_watchdogs_reap; tb_bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT" "$STASH_OUT"; lock_release' EXIT
     if [ "$MODE" = unknown ]; then
         if [ "$REAP_WT_DRY_RUN" = "0" ]; then MODE=apply; else MODE=dry-run; fi
     fi
@@ -1530,6 +1747,34 @@ run() {
     log "==== pi-reap-worktrees pass: MODE=$MODE repo=$REPO_CANON aged=${REAP_WT_AGED_DAYS}d main=${MAIN_CANON} now=$now ===="
     WT_TOTAL="$(printf '%s\n' "$WT_LIST" | sed '/^$/d' | wc -l | tr -d ' ')"
 
+    # ROTATION — see rotate_records(). The offset lives in the state dir so it
+    # survives passes; a pass that exhausts its budget advances it by what it
+    # actually consumed, so the deferred tail is reached next time instead of
+    # never. WT_LIST itself is left untouched: the pre-prune re-read appends to
+    # it and compares it as a SET.
+    OFFSET_FILE="$STATE_DIR/pi-reap-worktrees.offset"
+    WT_OFFSET="$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)"
+    case "$WT_OFFSET" in ''|*[!0-9]*) WT_OFFSET=0 ;; esac
+    WT_ORDER="$WT_LIST"
+    if [ "$REAP_WT_ROTATE" = 1 ]; then
+        WT_ORDER="$(rotate_records "$WT_LIST" "$WT_OFFSET")"
+        # A rotation that produced nothing must NEVER become a silent no-op
+        # pass: fall back to the unrotated list, which is the pre-fix behaviour.
+        #
+        # ⛔ O(1) emptiness test ONLY. Do NOT write this as a whitespace
+        # substitution `${WT_ORDER//[[:space:]]/}`: bash's pattern substitution
+        # with a POSIX character class inside a bracket expression is
+        # catastrophic on a large string and is PURE SHELL CPU with NO child
+        # process, so it looks exactly like a wedged lane. MEASURED on a 72 KB
+        # worktree list (564 rows): 772 min real / 577 min user CPU, one core,
+        # no children — it silently turned every full-size pass into a hang that
+        # classified ZERO records while reading as 79% CPU. `[ -n "$x" ]` is
+        # O(1) and is all this guard needs: the list is tab-separated records, so
+        # an all-whitespace value can only arise from an input that also has
+        # WT_TOTAL=0, and that case is already handled below.
+        [ -n "$WT_ORDER" ] || WT_ORDER="$WT_LIST"
+    fi
+
     local need_pr=0 p h b f
     while IFS=$'\t' read -r p h b f; do
         [ -n "$p" ] || continue
@@ -1564,6 +1809,8 @@ run() {
     fi
     self_pid_tree_load
     cwd_probe_load
+    stash_index_load
+    remote_state_load
 
     say "note: \`git worktree remove\` deletes the CHECKOUT only — branch refs are never deleted by this tool."
     say "note: no byte-savings figure is reported — a per-worktree .venv shares blocks with the uv"
@@ -1686,7 +1933,15 @@ run() {
                 # test above — a present-dir row of either must not block.
             esac
         fi
-    done <<<"$WT_LIST"
+    done <<<"$WT_ORDER"
+
+    # Advance the rotation by what this pass actually CONSUMED, so a
+    # budget-deferred tail is the head of the next pass rather than
+    # permanently unreachable. Best-effort: an unwritable state dir must not fail a pass
+    # that already removed correctly.
+    if [ "$WT_TOTAL" -gt 0 ] 2>/dev/null && [ "$REAP_WT_ROTATE" = 1 ]; then
+        printf '%s\n' "$(( (WT_OFFSET + WT_TOTAL - DEFERRED) % WT_TOTAL ))" >"$OFFSET_FILE" 2>/dev/null || true
+    fi
 
     if [ "$MODE" = apply ] && [ "$PRUNE_WANTED" -gt 0 ]; then
         # F17 (cycle-10, P1) — the per-record `prunable` test above read the flag
