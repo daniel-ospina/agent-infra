@@ -78,7 +78,15 @@ cat >"$TMP/bin/gh" <<'SH'
 mode="$(cat "$FAKE_GH_MODE" 2>/dev/null || echo ok)"
 case "$mode" in
   fail)    echo "HTTP 502: bad gateway" >&2; exit 1 ;;
+  # ⛔ EVERY ONE OF THESE IS RC=0 AND IS NOT A PR LIST (review cycle 1). Two of them were read as
+  # "zero open PRs" by the shipped code — the #2271 conflation — and three of them killed the
+  # trigger with a traceback. The suite drives all of them now; `garbage` existed unexercised.
   garbage) printf 'this is not json\n'; exit 0 ;;
+  empty)   printf ''; exit 0 ;;
+  object)  printf '{}\n'; exit 0 ;;
+  null)    printf 'null\n' ;;
+  wrapped) printf '{"data":[]}\n' ;;
+  scalars) printf '[1,2]\n' ;;
   *)       cat "$FAKE_GH_STATE" ;;
 esac
 SH
@@ -89,7 +97,7 @@ export FAKE_GH_STATE="$GH_STATE" FAKE_GH_MODE="$GH_MODE" FAKE_DOCTOR_LOG="$DOCTO
 surface() { # <mergeStateStatus> <updatedAt>  — one open PR; the whole observable surface
   printf '[{"number":101,"mergeStateStatus":"%s","updatedAt":"%s","isDraft":false}]\n' "$1" "$2" >"$GH_STATE"
 }
-n_doctor() { wc -l <"$DOCTOR_LOG" | tr -d ' '; }
+n_doctor() { [ -f "$DOCTOR_LOG" ] && wc -l <"$DOCTOR_LOG" | tr -d ' ' || printf '0'; }
 reset_doctor() { : >"$DOCTOR_LOG"; }
 
 start_loop() { # <state-dir> <repo> <debounce> <logfile> → pid
@@ -100,12 +108,26 @@ start_loop() { # <state-dir> <repo> <debounce> <logfile> → pid
 wait_for() { # <file> <fixed-string> <tenths>
   local i=0
   while [ "$i" -lt "$3" ]; do
-    grep -qF -- "$2" "$1" && return 0
+    # the file may not exist yet on the very first probe — a `grep` on a missing path would print a
+    # spurious error into the CI log
+    [ -f "$1" ] && grep -qF -- "$2" "$1" && return 0
     sleep 0.1; i=$((i + 1))
   done
   return 1
 }
 stop_loop() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }
+# ⛔ POLL FOR AN ARRIVAL, SLEEP ONLY FOR AN ABSENCE (review cycle 1). `wait_for PASS-BEGIN` returns
+# before the doctor is spawned (the trigger logs it first), so `sleep 1; assert count==1` asked a
+# saturated runner to fork python inside one second. Every other sleep in this file asserts that
+# something did NOT happen, which cannot flake. This helper is the arrival half.
+wait_dir() { # <want-count> <tenths>
+  local i=0
+  while [ "$i" -lt "$2" ]; do
+    [ "$(n_doctor)" -ge "$1" ] && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── A. the fingerprint is a function of the SURFACE"
@@ -131,6 +153,22 @@ out="$(python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-a --repo-dir 
 assert_eq "$rc" "2" "--dry-run-print on an unreadable surface exits 2 (never 0 with an empty value)"
 assert_not_contains "$out" "prs=0" "unreadable is not reported as zero PRs"
 assert_contains "$out" "PR-SURFACE-UNREADABLE" "it names the failure"
+
+echo "── A3. rc=0 is not the same as a READABLE surface (#2271), and [] is not the same as unusable"
+for mode in garbage empty object null wrapped scalars; do
+  echo "$mode" >"$GH_MODE"
+  out="$(python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-a --repo-dir "$APP" --dry-run-print 2>&1)"; rc=$?
+  assert_eq "$rc" "2" "gh output '$mode' (rc=0, not a PR list) is UNREADABLE, not an empty surface"
+  assert_not_contains "$out" "prs=0" "'$mode' is never reported as zero open PRs"
+done
+# ⛔ THE MODE MUST BE RESET FIRST: the loop above leaves the fake gh on its LAST mode (`scalars`),
+# and the positive control below has to run against a READABLE gh or it proves nothing.
+echo ok >"$GH_MODE"
+# the POSITIVE control: a genuinely empty surface is the JSON list `[]`, and it must NOT be refused
+printf '[]\n' >"$GH_STATE"
+out="$(python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-a --repo-dir "$APP" --dry-run-print 2>&1)"; rc=$?
+assert_eq "$rc" "0" "a genuinely empty surface ([]) is READABLE — over-refusing it would be the opposite bug"
+assert_contains "$out" "prs=0" "and it reports zero PRs"
 echo ok >"$GH_MODE"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -141,7 +179,7 @@ S="$TMP/state/b"; mkdir -p "$S"; LOG="$TMP/b.log"
 pid="$(start_loop "$S" fake-owner/suite-b 2 "$LOG")"
 if wait_for "$LOG" "PASS-BEGIN" 100; then pass "the first read of a cold trigger runs a pass"
 else fail "cold start ran no pass"; fi
-sleep 1
+wait_dir 1 100 || true
 assert_eq "$(n_doctor)" "1" "exactly one doctor invocation on the cold pass"
 reset_doctor
 sleep 4                       # ≥4 poll ticks with a byte-identical surface
@@ -173,7 +211,8 @@ reset_doctor
 S="$TMP/state/c"; mkdir -p "$S"; LOG="$TMP/c.log"
 pid="$(start_loop "$S" fake-owner/suite-c 3 "$LOG")"
 wait_for "$LOG" "PASS-BEGIN" 100 || fail "cold pass never ran (case C cannot start)"
-sleep 1; reset_doctor
+wait_dir 1 100 || true
+reset_doctor
 i=0
 while [ "$i" -lt 5 ]; do                       # five RAPID changes, well inside the 3 s debounce
   if [ $((i % 2)) -eq 0 ]; then st=BEHIND; else st=CONFLICTING; fi
@@ -208,19 +247,30 @@ reset_doctor
 S="$TMP/state/d"; mkdir -p "$S"; LOG="$TMP/d.log"
 pid="$(start_loop "$S" fake-owner/suite-d 1 "$LOG")"
 wait_for "$LOG" "PASS-BEGIN" 100 || fail "cold pass never ran (case D cannot start)"
-sleep 1; reset_doctor
-# ⛔ THE BASELINE IS TAKEN HERE, not asserted as an absence: a warm READABLE tick legitimately
-# says "no change", so the claim is that the phrase does not GROW while the surface is unreadable.
-quiet_before="$(grep -cF 'no change' "$LOG")"
-unread_before="$(grep -cF 'PR-SURFACE-UNREADABLE' "$LOG")"
+wait_dir 1 100 || true
+reset_doctor
+# ⛔ THE BASELINE IS TAKEN **AFTER** THE FLIP HAS PRODUCED ≥2 UNREADABLE TICKS, not before it.
+# Taking it before made this assertion RACY and it flaked: the trigger can be mid-tick when the mode
+# flips, so a tick that read the surface while it was still readable logs its legitimate "no change"
+# a moment later and lands in the "after" bucket. Waiting for two unreadable ticks first means every
+# tick counted below is provably a failing-read tick.
 echo fail >"$GH_MODE"
-sleep 4                                        # ≥3 poll ticks against a failing gh
+i=0
+while [ "$i" -lt 120 ]; do
+  [ "$(grep -cF 'PR-SURFACE-UNREADABLE' "$LOG")" -ge 2 ] && break
+  sleep 0.1; i=$((i + 1))
+done
+unread_before="$(grep -cF 'PR-SURFACE-UNREADABLE' "$LOG")"
+quiet_before="$(grep -cF 'no change' "$LOG")"
+assert_contains "$(cat "$LOG")" "PR-SURFACE-UNREADABLE" "a failed gh read is logged as PR-SURFACE-UNREADABLE"
+[ "$unread_before" -ge 2 ] && pass "the next tick RETRIED the read ($unread_before attempts so far)" \
+  || fail "the read was not retried (${unread_before} attempt(s))"
+sleep 3                                        # more unreadable ticks, all of them after the baseline
 quiet_after="$(grep -cF 'no change' "$LOG")"
 unread_after="$(grep -cF 'PR-SURFACE-UNREADABLE' "$LOG")"
-assert_contains "$(cat "$LOG")" "PR-SURFACE-UNREADABLE" "a failed gh read is logged as PR-SURFACE-UNREADABLE"
-[ "$unread_after" -gt "$unread_before" ] && pass "the next tick RETRIED the read ($((unread_after - unread_before)) attempt(s) in 4 s)" \
-  || fail "the read was not retried (attempts stayed at $unread_before)"
 assert_eq "$quiet_after" "$quiet_before" "no unreadable tick ever logged 'no change' (the #2271 failure)"
+[ "$unread_after" -gt "$unread_before" ] && pass "and it kept retrying ($((unread_after - unread_before)) more attempt(s))" \
+  || fail "retrying stopped after the first two attempts"
 assert_eq "$(n_doctor)" "0" "an unreadable surface invoked the doctor ZERO times"
 # the surface comes back byte-identical: still no pass (the fingerprint was KEPT, not forgotten)
 echo ok >"$GH_MODE"
@@ -229,13 +279,27 @@ assert_eq "$(n_doctor)" "0" "the surface returning UNCHANGED owes no pass"
 assert_contains "$(cat "$LOG")" "keeping the last fingerprint" "going blind was not treated as a change"
 stop_loop "$pid"
 
+echo "── D2. --once over an UNREADABLE surface exits non-zero and never says 'no change'"
+surface CONFLICTING "2026-10-24T18:00:00Z"
+reset_doctor
+S="$TMP/state/d2"; mkdir -p "$S"
+python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-d2 --repo-dir "$APP" --once \
+  --poll 1 --backstop 1000000 --state-dir "$S" >"$TMP/d2a.log" 2>&1   # seed a fingerprint
+echo fail >"$GH_MODE"
+python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-d2 --repo-dir "$APP" --once \
+  --poll 1 --backstop 1000000 --state-dir "$S" >"$TMP/d2.log" 2>&1; rc=$?
+echo ok >"$GH_MODE"
+assert_eq "$rc" "2" "--once on an unreadable surface exits 2 (a READS-I-COULD-NOT-DO verdict)"
+assert_contains "$(cat "$TMP/d2.log")" "SURFACE-DEGRADED" "it names the degraded surface"
+assert_not_contains "$(cat "$TMP/d2.log")" "no change" "and never reports the unreadable surface as quiet"
+
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── E. the LOCK: a second instance exits 0 and runs no second doctor"
 S="$TMP/state/e"; mkdir -p "$S"; LOG="$TMP/e.log"
 reset_doctor
 pid="$(start_loop "$S" fake-owner/suite-e 1 "$LOG")"
 wait_for "$LOG" "PASS-BEGIN" 100 || fail "the holding instance never started"
-sleep 1
+wait_dir 1 100 || true
 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-e --repo-dir "$APP" --once \
   --poll 1 --backstop 1000000 --state-dir "$S" >"$TMP/e2.log" 2>&1; rc=$?
 assert_eq "$rc" "0" "the second instance exits 0 (not an error, not a crash loop)"
@@ -288,6 +352,49 @@ darwin="$(ELDATO_PLATFORM=Darwin bash "$INSTALLER" --dry-run 2>&1)"; drc=$?
 [ "$drc" -ne 0 ] && pass "the installer REFUSES a non-systemd platform (rc=$drc)" \
   || fail "the installer 'succeeded' on Darwin — an artifact nothing reads"
 assert_contains "$darwin" "install-launchd.sh" "and it names the installer that owns that platform"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+echo "── H. a trigger with NO doctor is DOCTOR-MISSING, never a clean pass"
+NODOC="$TMP/nodoctor"; mkdir -p "$NODOC" "$TMP/state/h"
+cp "$SRC" "$NODOC/pr-doctor-trigger.py"          # the trigger WITHOUT its sibling pr-doctor.py
+surface CONFLICTING "2026-10-24T18:00:00Z"
+reset_doctor
+python3 "$NODOC/pr-doctor-trigger.py" --repo fake-owner/suite-h --repo-dir "$NODOC" --once \
+  --poll 1 --backstop 1000000 --state-dir "$TMP/state/h" >"$TMP/h.log" 2>&1; rc=$?
+# ⛔ CPython exits 2 for "can't open file", and 2 is the code this trigger treats as a CLEAN window —
+# so without this arm a trigger whose doctor was never farmed reported a clean pass, consumed the
+# whole backstop window and exited 0 under the unit's ExecStart. That is the exact state the farm
+# ORDER in pi-bootstrap/setup.sh exists to prevent, and the farm cannot prevent it off-farm.
+assert_eq "$rc" "1" "--once with no doctor exits non-zero (not a clean 0)"
+assert_contains "$(cat "$TMP/h.log")" "DOCTOR-MISSING" "it is named DOCTOR-MISSING"
+python3 - "$TMP/state/h/pr-doctor-trigger-suite-h.state.json" <<'PYH'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d.get("last_pass") == 0, "a missing doctor must NOT consume the backstop window: %r" % d
+PYH
+assert_eq "$?" "0" "the backstop window is NOT consumed by a missing doctor"
+
+echo "── I. a PENDING change survives a RESTART inside the debounce window"
+surface CONFLICTING "2026-10-24T18:00:00Z"
+reset_doctor
+S="$TMP/state/i"; mkdir -p "$S"; LOG="$TMP/i.log"
+pid="$(start_loop "$S" fake-owner/suite-i 20 "$LOG")"   # a long debounce: the window is wide on purpose
+wait_for "$LOG" "PASS-BEGIN" 100 || fail "cold pass never ran (case I cannot start)"
+wait_dir 1 100 || true
+reset_doctor
+surface BEHIND "2026-10-24T19:00:00Z"                    # a REAL change, then kill inside the window
+wait_for "$LOG" "CHANGE" 100 || fail "the change was never observed"
+stop_loop "$pid"                                        # killed BEFORE the 20 s debounce elapses
+assert_eq "$(n_doctor)" "0" "nothing ran yet (the change is still in its coalescing window)"
+printf '%s\n' "$(cat "$S"/pr-doctor-trigger-suite-i.state.json)" | grep -qF '"pending_since"' \
+  && pass "the pending change was PERSISTED, not just remembered" \
+  || fail "no pending_since in the state: a restart would silently drop the change"
+LOG="$TMP/i2.log"
+pid="$(start_loop "$S" fake-owner/suite-i 20 "$LOG")"
+wait_dir 1 300 || true
+assert_eq "$(n_doctor)" "1" "after the restart the change still runs exactly ONE pass (not lost, not doubled)"
+assert_contains "$(cat "$LOG")" "RESUMING a pending change" "and the restart says it is resuming one"
+stop_loop "$pid"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 # Tripwire for section loss: a whole case was once deleted from a suite of this shape and it still

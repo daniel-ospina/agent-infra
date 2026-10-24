@@ -39,8 +39,12 @@
 #   PR_DOCTOR_TRIGGER     the trigger to install (default: beside this script's repo, else
 #                         $HOME/.pi/agent/scripts/pr-doctor-trigger.py)
 #   REPAIR_REPO           the repo whose PR surface is watched (default daniel-ospina/tortoise)
-#   PR_DOCTOR_REPO_DIR    the checkout the doctor materialises worktrees from
-#                         (default $HOME/Documents/GitHub/tortoise)
+#   PR_DOCTOR_REPO_DIR    the checkout the trigger EXPORTS to the doctor as
+#                         PR_DOCTOR_REPO_DIR (default: the doctor's own constant,
+#                         $HOME/Documents/GitHub/tortoise). ⛔ INERT TODAY: `scripts/pr-doctor.py` still
+#                         hardcodes `REPO_DIR`, so this describes the value handed over, not a checkout
+#                         the doctor is known to use. The lane porting that seam owns making it real;
+#                         the installer WARNS when the path does not exist rather than implying it works
 #   REPAIR_POLL_SEC       the lead, in seconds (default 60)
 #   REPAIR_DEBOUNCE_SEC   the coalescing window (default 90)
 #   REPAIR_MAX            the doctor's --max (default 8)
@@ -154,9 +158,40 @@ TRIGGER="$(find_trigger)" || die "pr-doctor-trigger.py not found (looked beside 
    repo's scripts/, and in \$HOME/.pi/agent/scripts). Install the farm first: pi-bootstrap/setup.sh"
 [ -f "$TRIGGER" ] || die "the trigger resolves to a non-file: $TRIGGER"
 
+# ⛔ THE DRY RUN IS ANSWERED BEFORE THE SCOPE IS RESOLVED (review cycle 1). Resolving the scope
+# shells `sudo -n true` and `systemctl --user show-environment`, so a box with no passwordless sudo
+# and no user manager — a docker CI job, a dev container, a locked-down cell — could not PRINT the
+# unit it would install. A render is a pure function of the template and the env; it must never need
+# a service manager, and it must touch nothing (`--dry-run` is the debugging surface an operator uses
+# precisely when the service manager is what is broken). The scope-specific line is the only thing it
+# cannot know, so it renders the SYSTEM form — the cell's shape — and says so.
+if [ "$ACTION" = "--dry-run" ]; then
+  WANTED_BY="${REPAIR_DRYRUN_WANTED_BY:-multi-user.target}"
+  render
+  exit 0
+fi
+
 if ! resolve_scope; then
   die "no service manager answered: no passwordless sudo for a system unit and no systemd user
    manager. Nothing was installed — a trigger that is 'installed' but never fires is a false PASS."
+fi
+# ⛔ THE START LIMIT MUST BE ABLE TO FIRE (review cycle 1). `StartLimitIntervalSec=300` with
+# `StartLimitBurst=3` only converges to `failed` if three attempts FIT in the window: at one start
+# per `RestartSec`, that needs `3 x (RestartSec + 1) < 300`, i.e. RestartSec < 100. Above that the
+# burst can never fill, the unit restarts for ever, and every aggregate reads supervised — the
+# inert-enforcer shape this unit's own header rejects.
+if [ "$RESTART_SEC" -ge 100 ]; then
+  die "REPAIR_RESTART_SEC=$RESTART_SEC cannot fill StartLimitBurst=3 inside StartLimitIntervalSec=300
+   (needs RestartSec < 100). A limit that can never fire is not a limit: the unit would restart for
+   ever while every surface read supervised."
+fi
+# The checkout the doctor is *supposed* to use. It is inert until the OBJECTIVE_REPO port lands
+# (see the env-seam note above), so a missing path is a WARNING with its reason — not a refusal,
+# and never silence.
+if [ ! -d "$REPO_DIR" ]; then
+  say "⚠️  PR_DOCTOR_REPO_DIR=$REPO_DIR does not exist on this box. The trigger exports it, but"
+  say "    scripts/pr-doctor.py still hardcodes its own REPO_DIR, so this is a NAMED residual, not"
+  say "    a working redirect — see the required follow-up on the PR."
 fi
 UNIT_PATH="$UNIT_DIR/$UNIT_NAME"
 
@@ -186,10 +221,6 @@ case "$ACTION" in
     ok "$UNIT_NAME removed"
     exit 0
     ;;
-  --dry-run)
-    render
-    exit 0
-    ;;
 esac
 
 # ── install (idempotent) ─────────────────────────────────────────────────────────────────────
@@ -198,7 +229,9 @@ NEW="$(mktemp)"; trap 'rm -f "$NEW"' EXIT
 render >"$NEW" || die "render failed"
 grep -qF -- "{{" "$NEW" && die "the render left an unsubstituted placeholder — refusing to install a
    unit with a literal {{TOKEN}} in its ExecStart"
+CHANGED=1
 if [ -f "$UNIT_PATH" ] && cmp -s "$NEW" "$UNIT_PATH"; then
+  CHANGED=0
   ok "already installed and unchanged: $UNIT_PATH"
   $SYSTEMCTL daemon-reload >/dev/null 2>&1
 else
@@ -208,8 +241,14 @@ else
 fi
 $SYSTEMCTL enable "$UNIT_NAME" >/dev/null 2>&1 \
   || die "could not ENABLE $UNIT_NAME — a unit that is installed but not enabled never comes back"
-$SYSTEMCTL restart "$UNIT_NAME" >/dev/null 2>&1 \
-  || say "⚠️  restart failed; the unit is enabled and will come up at next boot (check --status)"
+# ⛔ ONLY RESTART WHEN THE BYTES CHANGED (review cycle 1). The render carries `{{PATH}}`, so a re-run
+# from a different PATH rewrote the unit and restarted the service for no reason — and with
+# `KillMode=process` a restart does not take the doctor with it, so a gratuitous restart is exactly
+# how a second doctor appears beside the first.
+if [ "$CHANGED" -eq 1 ]; then
+  $SYSTEMCTL restart "$UNIT_NAME" >/dev/null 2>&1 \
+    || say "⚠️  restart failed; the unit is enabled and will come up at next boot (check --status)"
+fi
 # ⛔ READ BACK THE ARTIFACT, not the exit status of the verbs above: "installed" is a claim about
 # what the manager will RUN, and the only evidence is the manager's own answer plus the file.
 [ -f "$UNIT_PATH" ] || die "the unit file is gone after install: $UNIT_PATH"
