@@ -76,8 +76,18 @@ def _objective():
     # gets the refusal below (fail-closed, never a guess) — so any future farm list carrying this
     # script must carry the deriver too.
     if not os.environ.get("OBJECTIVE_REPO"):
-        derived = _checkout_repo()
+        derived, why = _checkout_repo()
         if not derived:
+            # ⛔ TWO CAUSES, TWO REMEDIES, NAMED SEPARATELY. Collapsing them made the operator apply
+            # the stated remedy ("run from the checkout you mean") forever on a box that is in fact
+            # MISSING the deriver — the loop stays dead and the message points elsewhere.
+            if why == "deriver-missing":
+                raise SystemExit(
+                    "pr-loop: cannot bind this checkout's repo — the ONE slug deriver is MISSING "
+                    "next to this script (looked for orchestrator-harness/repo-slug.sh and "
+                    "repo-slug.sh). Refusing to grade ANOTHER repo (the classifier's fallback is "
+                    "daniel-ospina/tortoise). Remedy: deploy scripts/orchestrator-harness/repo-slug.sh "
+                    "with this file, or export OBJECTIVE_REPO=<owner/name>.")
             raise SystemExit(
                 "pr-loop: cannot derive this checkout's repo from its origin remote — refusing to "
                 "grade ANOTHER repo (the classifier's fallback is daniel-ospina/tortoise). Run from "
@@ -90,9 +100,10 @@ def _objective():
 
 
 def _checkout_repo(path=None):
-    """`owner/name` of the checkout this loop acts on, or None when it cannot be read.
+    """(slug, reason): `owner/name` of the checkout this loop acts on, or (None, why).
 
-    Sourced, never re-implemented — see the block above `_objective`.
+    Sourced, never re-implemented — see the block above `_objective`. The reason is "deriver-missing"
+    when the script is deployed without repo-slug.sh, else "underivable" — two different remedies.
     """
     lib = None
     for cand in (HERE / "orchestrator-harness" / "repo-slug.sh", HERE / "repo-slug.sh"):
@@ -100,17 +111,18 @@ def _checkout_repo(path=None):
             lib = cand
             break
     if lib is None:
-        return None
+        return None, "deriver-missing"
     try:
         res = subprocess.run(
             ["bash", "-c", '. "$1" >/dev/null 2>&1; derive_or "$2"', "_", str(lib),
              str(path or os.getcwd())],
             capture_output=True, text=True, timeout=30)
     except Exception:
-        return None
+        return None, "underivable"
     if res.returncode != 0:
-        return None
-    return (res.stdout or "").strip() or None
+        return None, "underivable"
+    slug = (res.stdout or "").strip()
+    return (slug, "") if slug else (None, "underivable")
 
 
 def log(msg):

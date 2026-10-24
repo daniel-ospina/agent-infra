@@ -48,11 +48,17 @@
 #
 # NON-VACUITY
 #   §2 and §3 are pairs with opposite verdicts on one-byte-different inputs (the issue's own
-#   requirement). '--mutations' additionally plants a defect into a TEMP COPY of each shipped file
-#   and requires the paired arm to go RED; a mutation that leaves the suite green is reported as a
-#   FAILURE, because it means the assertion is not load-bearing.
+#   requirement). '--mutations' additionally plants a defect into a TEMP COPY of each of the two
+#   shipped files it names below (§1's pr-loop.py and §2's repo-authority.sh) and requires the arm
+#   to go RED; a mutation that leaves the suite green is reported as a FAILURE, because it means the
+#   assertion is not load-bearing. ⚠️ §3 has NO mutation arm, and says so: its non-vacuity is the
+#   opposite-verdict pair in ONE pass (the held tree preserved, its identical twin removed), because
+#   executing a mutated copy of the reaper is refused by the harness's own script-content gate.
 #
-# HERMETIC: temp git fixtures, stub 'gh'/'lsof'/'ps' on a private PATH, no network, no real state.
+# HERMETIC: temp git fixtures, a stub 'gh' (STUB_GH_*) and a stub 'lsof' on a private PATH, no
+# network, no real state (own HOME + GIT_CONFIG_GLOBAL + GIT_CONFIG_NOSYSTEM). ⚠️ 'ps' is the REAL
+# one: the reaper's live-PROCESS arm reads the box's process table, and a stub would have to satisfy
+# the reaper's own see-self control probe. Stated, so a box-dependent red on that arm is diagnosable.
 #
 # Run: bash tests/inert-capability-effects/run.sh   (add the mutations flag for non-vacuity proof)
 
@@ -123,10 +129,11 @@ if [ "$got_a" = "REPO:daniel-ospina/agent-infra" ]; then
 else
     bad "§1 pr-loop's classifier did NOT grade the checkout it runs in — it said '$got_a', so a box grades one repo's PRs from another repo's checkout (the measured '58 PR(s) had UNREADABLE checks' shape)"
 fi
-if [ "$got_b" = "REPO:daniel-ospina/tortoise" ] && [ "$got_a" != "$got_b" ]; then
+if [ "$got_b" = "REPO:daniel-ospina/tortoise" ] && [ "$got_a" != "$got_b" ] \
+    && [ "${got_a#REPO:}" != "$got_a" ]; then
     ok "§1 …and a DIFFERENT checkout yields a DIFFERENT repo (the slug is READ, not a literal)"
 else
-    bad "§1 the classifier reported the same/incorrect repo for two different checkouts ('$got_a' vs '$got_b') — the binding does not read the remote"
+    bad "§1 the two checkouts did not yield two different repos ('$got_a' vs '$got_b') — either the binding does not read the remote, or fixture A is not a readable checkout (in which case the inequality below is vacuous)"
 fi
 
 # ── an underivable checkout must REFUSE, never fall back to a default ────────────────────────
@@ -197,8 +204,9 @@ TAB="$(printf '\t')"
 # ── ARM 1: a READABLE protection endpoint is the repo's own set ──────────────────────────────
 printf 'pipeline-compliance\n' >"$WORK/ctx-readable"
 printf '' >"$WORK/ctx-empty"
-# The stub records the argv it was asked, so this arm also pins WHICH REPO the contract came from
-# — the wrong-repo class of the incident table, here at the required-set seam.
+# The stub records the argv it was asked, so this arm pins that the protection read NAMED the repo
+# it was handed (`repos/<owner>/<name>/branches/main/protection`). ⚠️ That is the RESOLVER half, not
+# the caller half: the caller-side repo binding is §1's, and nothing here exercises a caller.
 STUB_GH_LOG="$WORK/gh.log"
 : >"$STUB_GH_LOG"
 STUB_GH_CONTEXTS="$WORK/ctx-readable"; export STUB_GH_CONTEXTS
