@@ -2813,13 +2813,19 @@ if true; then
     printf '3 290\n' >"$_sv/red.verdict"
     _o="$(MUT="$_sv" mutation_verdict red 1 2>&1)"
     case "$_o" in
-      *"class covered"*"3 of 290"*) pass "verdict arm: an artifact reporting failures is COVERAGE (a reddening child is not re-run)" ;;
+      *"✅"*"class covered"*"3 of 290"*) pass "verdict arm: an artifact reporting failures is COVERAGE (a reddening child is not re-run)" ;;
       *) fail "verdict arm: a reddening child did not read as coverage (got: $_o)" ;;
     esac
     printf '0 290\n' >"$_sv/green.verdict"
     _o="$(MUT="$_sv" mutation_verdict green 0 2>&1)"
+    # ⛔ THE SEVERITY, NOT JUST THE WORDING (review 3, P1 on #2623). This arm used to test only that
+    # the text contained "did NOT redden", which `fail`->`pass` on that branch does not change — so
+    # the whole mutation guard could go inert and SILENT: every class that stopped reddening would
+    # print `✅ … did NOT redden (class NOT covered)`, increment nothing, and the suite would report all
+    # green. That is a FALSE PASS over every unchecked bypass class, the one outcome §18 exists to
+    # prevent. The marker is part of the assertion in BOTH directions.
     case "$_o" in
-      *"did NOT redden"*) pass "verdict arm: an artifact reporting 0 failures is class NOT covered — not an abort, and not coverage" ;;
+      *"❌"*"did NOT redden"*) pass "verdict arm: an artifact reporting 0 failures is class NOT covered — not an abort, and not coverage" ;;
       *) fail "verdict arm: a kept-green child did not read as a coverage gap (got: $_o)" ;;
     esac
     printf 'mutated rail: line 9: syntax error near unexpected token\n' >"$_sv/dead.log"
@@ -2827,6 +2833,17 @@ if true; then
     case "$_o" in
       *"NO verdict artifact"*"rc=1"*"syntax error"*) pass "verdict arm: an absent artifact ABORTS with rc and the diagnostic named (the failure is attributable)" ;;
       *) fail "verdict arm: an aborted child was not attributed (got: $_o)" ;;
+    esac
+    # ⛔ …AND A DIAGNOSTIC THAT MATCHES NONE OF THOSE PATTERNS IS STILL EVIDENCE (review 3, P2 on
+    # #2623). The `dead` arm above carries `syntax error`, so it passes with or without the `tail -1`
+    # fallback. Without it, an abort whose only evidence is a full disk or a bash abort inside the rail
+    # reports the log path and NOTHING to look for — the #1185 unattributable-failure class, back
+    # again with nothing red.
+    printf 'bash: line 42: No space left on device\n' >"$_sv/enospc.log"
+    _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=1 mutation_verdict enospc 1 2>&1)"
+    case "$_o" in
+      *"last diagnostic: "*"No space left on device"*) pass "verdict arm: a log with no known pattern still yields the last diagnostic (the abort is attributable)" ;;
+      *) fail "verdict arm: an abort with an unfamiliar log dropped its only evidence (got: $_o)" ;;
     esac
     printf 'Terminated\n' >"$_sv/killed.log"
     _o="$(MUT="$_sv" MUTATION_VERDICT_WAIT=2 mutation_verdict killed 137 2>&1)"
