@@ -102,7 +102,16 @@ command -v rail_refusal_record >/dev/null 2>&1 || echo "[merge $PR] ⚠️ rail-
 run_agent() { # run_agent <seconds> <logfile> <promptfile>
   local t="$1" log="$2" prompt="$3" pid w rc start elapsed
   start="$(date +%s)"
-  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
+  # ⛔ THE SAME RESOLVED MODEL AS spawn-gate.sh's `run_agent` (agent-infra#2208, review P1). This is a
+  # SECOND `run_agent` — the `chain-<N>` first-review spawn for every own-lane PR, i.e. the highest-
+  # volume model call the harness makes — and it carried the hardcoded `deepseek-v4-flash` the
+  # sibling was fixed for. Fixing one and not the other leaves the defect exactly where it costs
+  # most, and `spawn-gate.test.sh` already treats both files as one population
+  # (`EXPECTED_PI="merge-one.sh spawn-gate.sh"`), so the divergence was invisible to the suite.
+  # Keep the two defaults IDENTICAL: a lane must not run a different model than its reviewer.
+  local lane_provider="${PI_LANE_PROVIDER:-deepseek}" lane_model="${PI_LANE_MODEL:-deepseek-flash}"
+  echo "[agent] provider=$lane_provider model=$lane_model" >> "$log"
+  pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
@@ -566,7 +575,7 @@ rail_attempt() {
       # ⛔ A RECORD THAT CANNOT BE WRITTEN IS SAID, NOT SWALLOWED. The controller's red-fixer role
       # reads this record; without it the refusal produces no work — the exact stall this exists to
       # end — so the degraded box must say so loudly, in the log an operator reads.
-      echo "[merge $PR] ⚠️ REFUSAL NOT RECORDED — rail-refusal.sh is missing/unusable in \$O, or \$O/state is unwritable, so NO red-fixer can see this refusal (re-seed: cp scripts/orchestrator-harness/*.sh \"\$O/\"; free space). The rail's words are above." >> "$L.log"
+      echo "[merge $PR] ⚠️ REFUSAL NOT RECORDED — rail-refusal.sh is missing/unusable in \$O, or \$O/state is unwritable, so NO red-fixer can see this refusal (re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \"$O\"; free space). The rail's words are above." >> "$L.log"
     fi
     # Removed unconditionally: the `/dev/null` fallback that made this unsafe is gone, and a staged
     # temp left behind on the `tail`-failed path is one file per PR, forever (review P3, cycle 4).
