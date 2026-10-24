@@ -2929,6 +2929,28 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     'for n in 1 2; do gh pr view $n; done; git ls-files -m',
     'for n in 1 2; do gh pr view $n; done; git grep -n needle -- "*.ts"',
     'for f in 1 2; do git log --oneline -1 $f; gh pr view $f; done',
+    // ⛔ #2206 REVIEW P0 — `--repo` EATS THE NEXT WORD, AND THAT WORD CAN BE `git`. The stripped
+    // form is what the VERB/FLAG reads want, and it was also what `mentionsGitWord` scanned, so a
+    // `git` sitting in the `--repo` value slot vanished and the escape certified the command. Both
+    // proven running at zero dispatches before the fix: the alias push (DESIGN-1's own class) and
+    // `update-index`, a write verb `GIT_COMMIT_PATTERN` does not know.
+    "for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo git -c alias.p=push p origin HEAD:refs/heads/x",
+    "for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo git update-index --force-remove f.txt",
+    // …and the same thing across the newline `\s*` also spans, which is how it was found.
+    "for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo\ngit -c alias.p=push p origin HEAD:refs/heads/x",
+    "for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo\ngit update-index --force-remove f.txt",
+    // ⛔ #2206 REVIEW P0 — A SUBSTITUTION THAT ASSEMBLES A `gh api` WRITE FLAG. `printf` was on
+    // `HARMLESS_SUBSTITUTION_PROGRAMS` ("its whole argument surface is data" — true of its INPUTS,
+    // false of its OUTPUT), so `$(printf -- '-%s%s' X POST)` became the single argv word `-XPOST`
+    // with no `-X` anywhere in the text for `hasApiWriteFlagAnywhere` to find. Both were measured
+    // CERTIFIED at zero dispatches: an unevidenced PR merge, and PR self-approval. The dimension is
+    // now removed — a `gh api` argument list may carry no substitution at all.
+    "for n in 1; do gh pr view $n; done; gh api $(printf -- '-%s%s' X POST) repos/o/r/pulls/1/merge",
+    "for n in 1; do gh pr view $n; done; gh api repos/o/r/pulls/1/reviews $(printf -- '-%s%s' f 'event=APPROVE')",
+    // …including inside DOUBLE quotes (the shell runs a substitution there too) and via a backtick,
+    // which assembles its words with no `-`-prefixed text to match.
+    'gh api "repos/$(printf \'%s\' x)" --jq .x',
+    "gh api `printf -- '-%s%s' X POST` repos/o/r/pulls/1/merge",
   ];
   for (const cmd of writes) {
     ok(!readsOnlyGhRead(cmd), `NOT a read (must keep the floor's decision): ${cmd}`);
@@ -7900,6 +7922,48 @@ testAsync("#spawngate 1/4 — a retry-exhausted spawn (`status: failed`) does NO
         equal(blocks[0].spawn_attempts, 1, "the row carries the attempt count");
       } finally {
         process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2206 review P2: the CAPACITY refusal is non-terminal in the text the model reads", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire, sent } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_FAILED });
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "the capacity arm still refuses");
+        // ⛔ #2204's own thesis, applied to the arm it left out: the refusal must not READ as the end
+        // of the run. `terminate: false` is a field the MODEL never sees; the measured failure was
+        // the model treating the block as terminal, so the TEXT has to say otherwise — while this
+        // arm's own `describeSpawnCapacity` asks for a RETRY, which a terminal reading contradicts.
+        const reason = blocked.reason as string;
+        ok(
+          reason.includes("THIS BLOCK IS NOT TERMINAL"),
+          "the capacity refusal states it is not terminal in the text the model reads (#2206 review P2)"
+        );
+        ok(/re-dispatch the reviewer/i.test(reason), "…and pairs it with the RETRY that arm asks for");
+        equal(blocked.terminate, false, "…and stays non-terminating");
+        // The model-visible half, which this arm did not have at all before the fix.
+        const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
+        equal(recoveries.length, 1, "the capacity refusal delivers its one recovery message");
+        equal(recoveries[0].options?.triggerTurn, true, "…triggering the turn that keeps the run alive");
+        // ONCE per session, the same bound as the floor: no unbounded retry loop.
+        await fire("tool_result", { toolName: "task", details: SPAWN_CUT });
+        await fire("tool_call", { toolName: "bash", input: { command: "git commit -m y" } });
+        equal(
+          sent.filter((s) => s.message?.customType === "reviewer-block-recovery").length,
+          1,
+          "…and does not deliver a second one"
+        );
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       }
     });
   });

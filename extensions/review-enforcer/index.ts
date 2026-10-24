@@ -790,13 +790,23 @@ interface ScanTokens {
   gaps: string[];
 }
 
-function scanTokens(command: string): ScanTokens {
+function scanTokens(command: string, opts: { stripRepo?: boolean } = {}): ScanTokens {
   // bash removes a backslash-newline outright, so `g\<newline>h` is the command
   // `gh`. Do the same before tokenizing, or the continuation splits the name.
   // #1203: the mandated rail's own filename is neutralized BEFORE tokenizing, so
   // the path cannot supply the words `admin`/`merge` the verbs and flags are read
   // from. Length-preserving, so every offset below still addresses `command`.
-  const joined = stripRepoArgs(withoutMandatedRailPath(command)).replace(/\\\r?\n/g, "");
+  //
+  // ⛔ `stripRepo: false` EXISTS BECAUSE THE STRIP DELETES AN ATTACKER-CHOSEN WORD (#2206 review,
+  // P0). `stripRepoArgs` consumes the token AFTER `--repo`, and that token can be `git`: measured,
+  // `for n in 1 2; do gh pr view $n; done; gh issue view 1 --repo git -c alias.p=push p origin
+  // HEAD:refs/heads/x` certified as a READ at zero dispatches and ran an alias push — `git` was
+  // gone from the token list `mentionsGitWord` scans, and `GIT_COMMIT_PATTERN` only knows
+  // `commit`/`push`. The strip exists to stop a repo VALUE supplying `pr`/`merge`/`admin` words to
+  // the VERB and FLAG reads; a rule that asks whether the text MENTIONS `git` must read the text as
+  // written, because under-reading there costs a write and over-reading costs a retry.
+  const pre = withoutMandatedRailPath(command);
+  const joined = (opts.stripRepo === false ? pre : stripRepoArgs(pre)).replace(/\\\r?\n/g, "");
   const mask = unquotedMask(joined);
   const tokens = joined.split(/[\s;&|(){!]+/).filter((t) => t.length > 0);
   const starts: number[] = [];
@@ -1427,7 +1437,13 @@ function normalizeProgramWord(w: string): string {
  */
 function mentionsGitWord(command: string): boolean {
   if (GIT_COMMIT_PATTERN.test(command)) return true;
-  for (const token of scanTokens(command).tokens) {
+  // ⛔ NO `stripRepoArgs` ON THIS SCAN (#2206 review, P0 — see `scanTokens`' `stripRepo` note).
+  // The stripped form is the right view for reading a VERB, and the wrong view for asking whether
+  // `git` is mentioned: the strip eats the word after `--repo`, so a `git` sitting there vanished
+  // and this predicate answered false. `GIT_COMMIT_PATTERN` caught `git commit`/`git push` on the
+  // RAW text and nothing else, so every other write verb — and an alias push, the exact DESIGN-1
+  // class — was certified. Both spellings are pinned in `index.test.ts` (negative table).
+  for (const token of scanTokens(command, { stripRepo: false }).tokens) {
     if (normalizeProgramWord(token) === "git") return true;
   }
   return false;
@@ -1442,6 +1458,16 @@ function mentionsGitWord(command: string): boolean {
  * overwrite any file the session can write. Only the substitution's FIRST WORD was ever checked, so
  * an "harmless" program's own flags were the hole. Every entry here is now a program whose whole
  * argument surface is data — and `gh` is the only other name accepted, validated by the gh loop.
+ *
+ * ⛔ THIS LIST IS NOT WHAT MAKES A `gh api` CALL READ-ONLY, AND IT MUST NOT BE ASKED TO BE (#2206
+ * review, P0). "Its whole argument surface is data" is a claim about a program's INPUTS; it says
+ * nothing about its OUTPUT, and `printf` can ASSEMBLE any word: `gh api $(printf -- '-%s%s' X POST)
+ * repos/o/r/pulls/1/merge` expands to the single argv word `-XPOST`, so the write flag never exists
+ * in the text for `hasApiWriteFlagAnywhere` to find — it certified a merge and a PR self-approval.
+ * Narrowing this list would be the DESIGN-2 loop (one layer closed per review round), so the
+ * SUBSTITUTION DIMENSION is removed for the one gh verb that writes: `readsOnlyGhRead` refuses any
+ * `gh api` whose argument list contains a substitution (`apiSegmentReads…`). `printf` stays usable
+ * where its output is a VALUE (`gh pr view $(printf '%s' 5)`), which is what it was added for.
  */
 const HARMLESS_SUBSTITUTION_PROGRAMS = new Set([
   "basename", "cut", "date", "dirname", "echo", "head", "hostname", "id", "jq", "mktemp",
@@ -1579,6 +1605,20 @@ const DATA_FILTER_SCRIPT_EXECUTES =
   // whitespace alone missed every real spelling of it (caught by re-running the probe).
   /(^|[;{}\s'"])([0-9$,/]*)\s*[ewW](\s|;|$)|s\/(?:\\.|[^\\/])*\/(?:\\.|[^\\/])*\/[a-z]*[ew]|system\s*\(|\b(?:print|printf)\b[^;{}]*[>|]|\|\s*getline/;
 
+/**
+ * Is the token at `k` part of a command substitution (`$(…)` or a backtick body)?
+ *
+ * The tokenizer splits `$(…)` on its `(` — the `$` ends one token and the program starts the next —
+ * so the opening is visible only as a `$`-terminated word whose following GAP contains `(`. `${VAR}`
+ * is a variable, not a substitution: its gap is `{`, and it is left alone (`repos/${R}/pulls` stays
+ * readable). A backtick is a substitution wherever it appears.
+ */
+function hasSubstitutionAt(scan: { tokens: string[]; gaps: string[] }, k: number): boolean {
+  const t = scan.tokens[k] ?? "";
+  if (t.includes("`")) return true;
+  return /\$$/.test(dequote(t)) && (scan.gaps[k + 1] ?? "").includes("(");
+}
+
 export function readsOnlyGhRead(command: string): boolean {
   if (mentionsGitWord(command)) return false;
   const scan = scanTokens(command);
@@ -1715,6 +1755,14 @@ export function readsOnlyGhRead(command: string): boolean {
     if (group === "api") {
       const last = endOfSegment(i);
       for (let k = i + 2; k <= last; k++) {
+        // ⛔ A COMMAND SUBSTITUTION IN THE ARGUMENT LIST MAKES THE CALL UNREADABLE (#2206 review,
+        // P0). Evaluated BEFORE the `isData` skip: bash runs a substitution inside DOUBLE quotes
+        // too, so `gh api "repos/$(printf …)"` is the same hole quoted. `$(printf -- '-%s%s' X
+        // POST)` is ONE argv word `-XPOST`; a backtick body assembles its words the same way. The
+        // rule is the DIMENSION, not the program: an api call is a read only when every word gh
+        // will receive is spelled in the text. `sha=$(gh api …)` is unaffected — there the
+        // substitution WRAPS the call instead of feeding it, and its arguments carry no `$(`.
+        if (hasSubstitutionAt(scan, k)) return false;
         if (isData(k)) continue;
         const t = tok(k);
         const flag = word(k);
@@ -4604,6 +4652,12 @@ export function unspawnableMessage(
     `⛔ Blocked — a \`task\`/\`subagent\` spawn produced NO verdict; 0 reviewer verdicts counted`,
     `   (${spawnFaultLabel(spawnFaultClass(attempts))}, not a compliance one).`,
     ...describeSpawnCapacity(attempts, readMachineCapacity(), total),
+    // #2204 (2) + #2206 review (P2): this arm IS a refusal, and the docs (and the comment beside
+    // the return) promise a refusal says it is not terminal. Only `terminate: false` was stated —
+    // a field the MODEL never sees — while this text asked for a RETRY with nothing telling the
+    // model the run continues, which is the measured failure #2204 (2) exists to fix.
+    "   → THIS BLOCK IS NOT TERMINAL: the run continues. Do not end the session on it —",
+    "     re-dispatch the reviewer (the RETRY above) and keep going.",
     "   → THE REQUIREMENT IS UNCHANGED: a reviewer verdict is still mandatory before this git op",
     `     (${SPAWN_UNSPAWNABLE_TOKEN} is what the BOX did, not a waiver). The rail will also demand`,
     `     the attestation at the FINAL head — ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
@@ -5271,6 +5325,11 @@ export default function (pi: ExtensionAPI) {
           command: auditCommand(command), // #1492: the refused command, not just the reason
         });
         // #2204 (2): non-terminating, like the floor return below — see the note on the micro arm.
+        // AND the model-visible half: `unspawnableMessage` now states it, and the recovery is
+        // delivered here too (#2206 review, P2 — the arm stated `terminate: false` and nothing the
+        // model reads, so a lane on the one arm #2204 calls "the refusal the model reads as the end
+        // of the run" still read it that way).
+        deliverBlockRecovery(tier, command);
         return {
           block: true,
           reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
