@@ -685,6 +685,33 @@ def shell_quote(s: str) -> str:
 CRON_TAG = "# tortoise-merge-reminder"
 
 
+NO_CRONTAB_RE = re.compile(r"no crontab for", re.I)
+
+
+def _systemd_escape(v: str) -> str:
+    """A literal `%` in a unit file — systemd would expand it as a specifier."""
+    return v.replace("%", "%%")
+
+
+def _crontab_read() -> tuple[bool, list[str], str]:
+    """-> (readable, lines, refusal).
+
+    ⛔ AN UNREADABLE CRONTAB IS NOT AN EMPTY ONE. `crontab -l` exits non-zero both when the user has
+    no crontab AND when the spool cannot be read; reading the second as the first made `install`
+    REWRITE the crontab from "" — deleting every operator entry — and made `--uninstall-timer` report
+    "nothing to remove" and exit 0 while the arm was still installed and firing. The only non-zero
+    answer that means "empty" is cron's own no-crontab message (stderr on Linux, stdout on some
+    BSDs); anything else is an ABSTENTION, and the caller must not rewrite the spool.
+    """
+    rc, out, err = run(["crontab", "-l"], timeout=30)
+    if rc == 0:
+        return True, (out or "").splitlines(), ""
+    if NO_CRONTAB_RE.search(out or "") or NO_CRONTAB_RE.search(err or ""):
+        return True, [], ""
+    return False, [], (f"could not READ the crontab (rc={rc}: {one_line(err) or one_line(out)}) — "
+                       f"refusing to rewrite it BLIND, which would delete every other entry")
+
+
 def _cron_line(o: Path, mins: int) -> str:
     """The crontab entry, quoted for /bin/sh AND for cron.
 
@@ -1448,11 +1475,27 @@ def landing_cycle(args, o: Path, slug: str, repo_path: Path, budget: Budget):
                             "detail": f"the top {args.candidates} candidates were read",
                             "dispatch": False, "reds": 0, "red_labels": []})
             continue
-        st, detail = (attest(o, Path(args.reviews).expanduser(), slug, p["number"], p["head"])
-                      if p["head"] else (UNREADABLE, "the head sha could not be read"))
-        claim, claim_detail = (claim_state(o, repo_path, p["number"], p["head"])
-                               if p["head"] else (UNREADABLE, "no head to key a claim on"))
-        rail, rail_detail = rail_state(o, p["number"], ps_rows)
+        try:
+            st, detail = (attest(o, Path(args.reviews).expanduser(), slug,
+                                 p["number"], p["head"])
+                          if p["head"] else (UNREADABLE, "the head sha could not be read"))
+            claim, claim_detail = (claim_state(o, repo_path, p["number"], p["head"])
+                                   if p["head"] else (UNREADABLE, "no head to key a claim on"))
+            rail, rail_detail = rail_state(o, p["number"], ps_rows)
+        except OSError as e:
+            # ⛔ ONE CANDIDATE'S read failing must not UNMAKE A DISPATCH THIS CYCLE ALREADY MADE.
+            # An OSError here (a fork/exec failure under load, a non-executable git) used to escape
+            # `main`, which reported "SKIPPED … (no dispatch)" while a rail was running — an
+            # invitation to hand-dispatch the same PR and end up with two rails on one lock.
+            results.append({"pr": p, "rank": i,
+                            "readings": (f"pr={p['state'].upper()} "
+                                         f"draft={'yes' if p['draft'] else 'no'} "
+                                         f"mergeable={p['mergeable']} reds=NOT-READ "
+                                         f"attested@head=NOT-READ claim=NOT-READ rail=NOT-READ"),
+                            "verdict": f"SKIPPED(UNREADABLE {type(e).__name__})",
+                            "detail": f"this candidate's gates could not be read: {e}",
+                            "dispatch": False, "reds": 0, "red_labels": []})
+            continue
         d = decide(p, st, detail, surface, claim, claim_detail, rail, rail_detail,
                    args.retry_s, o)
         d.update({"pr": p, "rank": i})
@@ -1479,7 +1522,10 @@ def landing_cycle(args, o: Path, slug: str, repo_path: Path, budget: Budget):
                         record_attempt(o, p["number"], p["head"], f"rail ({info})")
                     else:
                         d["verdict"] = f"REFUSE({info})"
-                        d["detail"] = "another lander won the lock at the moment of action"
+                        own = ("DISPATCH-FAILED" in info) or ("stale-lock" in info)
+                        d["detail"] = ("this cycle could not take the lock (the reading names "
+                                       "why) — not necessarily another lander" if own else
+                                       "another lander won the lock at the moment of action")
         elif d["verdict"] == GO:
             # A GO that was not the FIRST one this cycle still must not read like a dispatch.
             d["verdict"] = "GO (held: one dispatch per cycle)"
@@ -1504,7 +1550,7 @@ def compose(md: Path, slug: str, main_sha: str, budget: Budget,
 
 **Target:** `{slug}` · **origin/main:** `{main_sha[:12] or 'UNREADABLE'}` ·
 **REST:** {budget.calls}/{REST_BUDGET} metered (+1 exempt `rate_limit`) ·
-**core:** {budget.core_remaining}/{budget.core_limit}
+**core:** {(str(budget.core_remaining) + '/' + str(budget.core_limit)) if budget.core_limit else 'UNREADABLE (rate_limit was not reached)'}
 
 {f'⛔ **SKIPPED:** {skipped}' if skipped else '**cycle:** ran'}
 
@@ -1518,7 +1564,7 @@ def compose(md: Path, slug: str, main_sha: str, budget: Budget,
 
 | # | PR | verdict | measured reading | title |
 |---|---|---|---|---|
-{chr(10).join(rows) if rows else '| — | — | no open PRs | — | — |'}
+{chr(10).join(rows) if rows else ('| — | — | NOT-READ (the cycle was skipped before the listing) | — | — |' if skipped else '| — | — | no open PRs | — | — |')}
 
 Readings are the values this cycle MEASURED. `in-flight` > 0 with `reds=0` is a **WAIT**, never a
 GO (#2522/#2592); `attested@head=stale` means a record exists but was minted for an older head
@@ -1528,7 +1574,7 @@ GO (#2522/#2592); `attested@head=stale` means a record exists but was minted for
 
 | box | harness | controller | roles | verdict |
 |---|---|---|---|---|
-{chr(10).join(dep) if dep else '| — | — | — | — | no box inventory (`$O/state/boxes.tsv`) and no local probe |'}
+{chr(10).join(dep) if dep else ('| — | — | — | — | NOT-RUN (the cycle was skipped before the deploy arm) |' if skipped else '| — | — | — | — | no box inventory (`$O/state/boxes.tsv`) and no local probe |')}
 
 A merged fix that is not live on a box has fixed nothing. The arm dispatches each box's OWN
 activation verb, never a hand restart, and only after the landing decision — and VERIFIES it by
@@ -1661,7 +1707,11 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
             removed.append(f"{unit}.timer/.service")
         if shutil.which("crontab"):
             tag = CRON_TAG
-            rc, out, _ = run(["crontab", "-l"], timeout=30)
+            read_ok, current_lines, why = _crontab_read()
+            if not read_ok:
+                print(f"⛔ {why}", file=sys.stderr)
+                return 3
+            out = "\n".join(current_lines)
             if any(_is_our_cron_line(ln, tag) for ln in (out or "").splitlines()):
                 kept = [ln for ln in (out or "").splitlines() if not _is_our_cron_line(ln, tag)]
                 try:
@@ -1685,12 +1735,17 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
         udir.mkdir(parents=True, exist_ok=True)
         service.write_text(
             "[Unit]\nDescription=merge reminder (harness)\n\n[Service]\nType=oneshot\n"
-            f"WorkingDirectory={o}\nEnvironment=O={o}\nEnvironment=HOME={Path.home()}\n"
-            f"Environment=PATH={os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}\n"
+            # ⛔ `%` IS A SPECIFIER IN A UNIT FILE (`%p`, `%h`, …), so an operator path carrying
+            # one ran the timer against a DIFFERENT $O while `is-active` still said active — the
+            # silent no-op arm this loop keeps removing. Doubling is systemd's escape for a literal.
+            f"WorkingDirectory={_systemd_escape(str(o))}\n"
+            f"Environment=O={_systemd_escape(str(o))}\n"
+            f"Environment=HOME={_systemd_escape(str(Path.home()))}\n"
+            f"Environment=PATH={_systemd_escape(os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin'))}\n"
             # ⛔ `argv[0]` IS the interpreter, so prefixing `/usr/bin/env python3` made the unit run
             # the interpreter AS the script (an immediate SyntaxError) while the timer reported
             # itself active — the reminder then never ran at all, silently (#2603 review).
-            f"ExecStart={' '.join(shell_quote(a) for a in argv)}\n")
+            f"ExecStart={' '.join(_systemd_escape(shell_quote(a)) for a in argv)}\n")
         timer.write_text(
             "[Unit]\nDescription=merge reminder timer\n\n[Timer]\n"
             f"OnBootSec=60s\nOnUnitActiveSec={interval}s\nAccuracySec=10s\n\n"
@@ -1711,9 +1766,11 @@ def install_timer(o: Path, interval: int, uninstall: bool) -> int:
         # runs the line through /bin/sh — an unquoted space turns the schedule into a command that
         # cannot run, which then reads exactly like a reminder with nothing to say.
         entry = _cron_line(o, mins)
-        rc, out, _ = run(["crontab", "-l"], timeout=30)
-        current = out if rc == 0 else ""
-        kept = [ln for ln in current.splitlines() if not _is_our_cron_line(ln, tag)]
+        read_ok, current_lines, why = _crontab_read()
+        if not read_ok:
+            print(f"⛔ {why}", file=sys.stderr)
+            return 3
+        kept = [ln for ln in current_lines if not _is_our_cron_line(ln, tag)]
         kept.append(entry)
         # Feed the crontab through stdin (the `run()` helper cannot); the rc is still checked.
         try:
@@ -1837,18 +1894,27 @@ def main(argv=None) -> int:
         landing, dispatched = landing_cycle(args, o, slug, repo_path, budget)
     except Skipped as e:
         skipped = str(e)
-        landing, dispatched = [], False
+        landing = []
     except OSError as e:
         # ⛔ A READ-ONLY OR FULL $O MUST STILL PRODUCE THE REPORT (or say why it could not): an
         # uncaught OSError meant a traceback, no MERGE-REMINDER.md and no stated reason.
+        # ⛔ AND `dispatched` IS NOT RESET: a dispatch is a FACT about a child process that is
+        # already running, not a value a failed read gets to withdraw.
         skipped = f"UNREADABLE environment — {type(e).__name__}: {e}"
-        landing, dispatched = [], False
+        landing = []
     if not skipped:
         # The deploy arm runs AFTER the landing decision, and a landing dispatched this cycle
         # DEFERS it: restarting a controller under the rail we just started destroys that run.
         # `args.act` is passed because `--no-act` is the INSPECT mode and it covers both arms.
-        deploy = deploy_arm(o, main, dispatched, args.verify_deploy_s, args.dry_run, args.act,
-                            args.retry_s)
+        try:
+            deploy = deploy_arm(o, main, dispatched, args.verify_deploy_s, args.dry_run,
+                                args.act, args.retry_s)
+        except (Skipped, OSError) as e:
+            # The deploy arm can refuse a whole cycle (a malformed inventory) or hit an environment
+            # error. Neither may leave the deliverable unwritten — say it in the table instead.
+            deploy = [{"box": "(the whole arm)", "harness": "", "relation": "",
+                       "controller": "", "roles": "", "source": "",
+                       "readings": "", "verdict": f"SKIPPED({e})"}]
 
     if not main:
         main = main_sha(repo_path)

@@ -1360,6 +1360,174 @@ ck "§25k an UNWRITABLE ledger is NAMED in the verdict (the bound is declared in
 ck "§25k ...and the cycle still ran to completion (rc=$rc)" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
 rmdir "$O/state/merge-reminder.deploys"
 
+# ═══ §26 cycle-5: an unreadable crontab, a lost dispatch, a skipped file, and `%` in a unit ═══
+echo "-- §26 the reads that must abstain instead of guessing"
+# ⛔ AN UNREADABLE CRONTAB IS NOT AN EMPTY ONE. `crontab -l` fails for BOTH "no crontab for <user>" and
+# "cannot read the spool"; reading the second as the first made install REWRITE the spool from empty —
+# deleting an operator's nightly backup — and made uninstall print "nothing to remove" and exit 0 while
+# the arm was still firing. Measured end to end with a stub whose `-l` fails while the spool is intact.
+mkdir -p "$TMP/cronfail"; : > "$FX/crontab.txt"
+printf '0 3 * * * /usr/local/bin/backup.sh   # operator nightly backup\n' > "$FX/crontab.txt"
+cp "$FX/crontab.txt" "$TMP/spool.before"
+cat > "$TMP/cronfail/crontab" <<'STUB'
+#!/bin/bash
+case "${1:-}" in
+  -l) echo "crontab: cannot read /var/spool/cron/crontabs/x: Permission denied" >&2; exit 1 ;;
+  -)  /bin/cat > "$FIXTURE/crontab.txt"; exit 0 ;;
+esac
+exit 2
+STUB
+chmod +x "$TMP/cronfail/crontab"
+out3="$(env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronfail" "$PY3" "$SUT" --o "$O" \
+        --install-timer --interval 600 2>&1)"; rc3=$?
+ck "§26a an UNREADABLE crontab refuses the install (rc=$rc3, not 0)" \
+   "$([ "$rc3" -eq 3 ] && qF 'could not READ the crontab' "$out3" && echo 0 || echo 1)"
+ck "§26a ...and the operator's schedule was NOT rewritten (no entry of ours was added)" \
+   "$(cmp -s "$TMP/spool.before" "$FX/crontab.txt" && echo 0 || echo 1)"
+# ...and the same read on the uninstall path must not claim a removal it did not perform.
+printf '*/10 * * * * O=%s %s %s --o %s   # tortoise-merge-reminder\n' "'$O'" "'$PY3'" "'$SUT'" "'$O'" \
+  > "$FX/crontab.txt"
+cp "$FX/crontab.txt" "$TMP/spool.before2"
+out3="$(env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronfail" "$PY3" "$SUT" --o "$O" \
+        --uninstall-timer 2>&1)"; rc3=$?
+ck "§26b --uninstall-timer over an UNREADABLE crontab exits 3 (rc=$rc3)" \
+   "$([ "$rc3" -eq 3 ] && echo 0 || echo 1)"
+ck "§26b ...does NOT claim 'nothing to remove'" "$(nq 'nothing to remove' "$out3" && echo 0 || echo 1)"
+ck "§26b ...and leaves the live entry in place rather than reporting success over it" \
+   "$(cmp -s "$TMP/spool.before2" "$FX/crontab.txt" && echo 0 || echo 1)"
+# The documented EMPTY case still installs: cron's own no-crontab message is not an abstention.
+cat > "$TMP/cronfail/crontab" <<'STUB'
+#!/bin/bash
+case "${1:-}" in
+  -l) if [ -s "$FIXTURE/crontab.txt" ]; then /bin/cat "$FIXTURE/crontab.txt"; exit 0; fi
+      echo "no crontab for tester" >&2; exit 1 ;;
+  -)  /bin/cat > "$FIXTURE/crontab.txt"; exit 0 ;;
+esac
+exit 2
+STUB
+chmod +x "$TMP/cronfail/crontab"; : > "$FX/crontab.txt"
+out3="$(env HOME="$TMP/home3" FIXTURE="$FX" PATH="$TMP/cronfail" "$PY3" "$SUT" --o "$O" \
+        --install-timer --interval 600 2>&1)"; rc3=$?
+ck "§26c the documented NO-CRONTAB case still installs and verifies (rc=$rc3)" \
+   "$([ "$rc3" -eq 0 ] && qF 'tortoise-merge-reminder' "$(cat "$FX/crontab.txt" 2>/dev/null)" && echo 0 || echo 1)"
+: > "$FX/crontab.txt"
+
+# ⛔ `%` IS A SPECIFIER IN A SYSTEMD UNIT (`%p`, `%h`, …): an `$O` carrying one ran the timer against a
+# DIFFERENT directory while `is-active` still said active — a silent no-op arm.
+H4="$TMP/home4"; mkdir -p "$H4"
+cat > "$TMP/sysbin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in "--user is-active") echo active ;; esac
+exit 0
+STUB
+chmod +x "$TMP/sysbin/systemctl"
+out3="$(env HOME="$H4" FIXTURE="$FX" PATH="$TMP/sysbin:/usr/bin:/bin" \
+        "$PY3" "$SUT" --o "$TMP/o%pct" --install-timer --interval 600 2>&1)"; rc3=$?
+UNIT="$H4/.config/systemd/user/merge-reminder.service"
+ck "§26d a '%' in \$O is ESCAPED in the unit (rc=$rc3)" \
+   "$([ "$rc3" -eq 0 ] && qF 'o%%pct' "$(cat "$UNIT" 2>/dev/null)" && echo 0 || echo 1)"
+ck "§26d ...and no bare unescaped '%p' reaches systemd as a specifier" \
+   "$(qF 'o%%pct' "$(cat "$UNIT" 2>/dev/null)" && nq 'o%pct' "$(cat "$UNIT" 2>/dev/null)" && echo 0 || echo 1)"
+
+# ⛔ A SKIPPED CYCLE MUST NOT RENDER VALUES IT NEVER READ. With rate_limit failing, the file used to
+# say "no open PRs" and "no box inventory" — facts about reads that never happened.
+write_baseline; reset_o
+printf '{"message":"API rate limit exceeded"}\n' > "$FX/rate_limit.json"
+sed "s/^.*repos\/.*rate_limit.*$/&/" /dev/null 2>/dev/null || true
+cat > "$BIN/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FIXTURE/calls.txt"
+case "$*" in
+  *rate_limit*) echo "boom" >&2; exit 1 ;;
+esac
+echo '[]'
+STUB
+chmod +x "$BIN/gh"
+out="$(run_sut 2>&1)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§26e a SKIPPED cycle says NOT-READ, not 'no open PRs'" \
+   "$(qF 'NOT-READ (the cycle was skipped before the listing)' "$MDF" && nq 'no open PRs' "$MDF" && echo 0 || echo 1)"
+ck "§26e ...and NOT-RUN for the deploy arm, not 'no box inventory'" \
+   "$(qF 'NOT-RUN (the cycle was skipped before the deploy arm)' "$MDF" && nq 'no box inventory' "$MDF" && echo 0 || echo 1)"
+ck "§26e ...and the core pair is UNREADABLE, not None/None" \
+   "$(qF 'UNREADABLE (rate_limit was not reached)' "$MDF" && nq 'None/None' "$MDF" && echo 0 || echo 1)"
+
+# The gh stub above is LOCAL to §26e; restore the shared one so the cases after this block (they read
+# the same fixture) see the same world they did before.
+cat > "$BIN/gh" <<'STUB'
+#!/usr/bin/env bash
+echo "$2" >> "$FIXTURE/calls.txt"
+case "$2" in
+  rate_limit)                        cat "$FIXTURE/rate_limit.json" ;;
+  repos/*/pulls*)                    cat "$FIXTURE/pulls.json" ;;
+  repos/*/actions/runs*)             cat "$FIXTURE/runs.json" ;;
+  repos/*/check-runs*)               cat "$FIXTURE/checks.json" ;;
+  repos/*/status*)                   cat "$FIXTURE/status.json" ;;
+  *) echo "stub gh: unexpected path $2" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$BIN/gh"
+
+
+# ⛔ A DISPATCH IS A FACT A FAILED READ CANNOT WITHDRAW. An OSError on the SECOND candidate used to
+# escape to `main`, which then printed "SKIPPED … (no dispatch)" beside a rail that was already
+# running — an invitation to hand-dispatch the same PR onto the same lock.
+write_baseline; reset_o
+out="$(python3 - "$SUT" "$O" "$SLUG" "$REPO_SRC" <<'PYMOD'
+import importlib.util, sys
+from argparse import Namespace
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+o, slug, repo = Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
+pr = lambda n: {"number": n, "head": "a" * 40, "state": "OPEN", "draft": False,
+                "mergeable": "MERGEABLE", "title": "t%d" % n}
+m.read_prs = lambda budget, slug, n: [pr(42), pr(43)]
+m.rank = lambda prs, o, reviews, slug: prs
+m._ps_table = lambda: []
+m.check_surface = lambda budget, slug, head: {"reds": [], "in_flight": [], "groups": 3,
+                                              "unreadable": ""}
+m.attest = lambda o, reviews, slug, n, head: ("yes", "")
+seen = {"n": 0}
+def claim(o, repo, n, head):
+    seen["n"] += 1
+    if seen["n"] == 1:
+        return ("none", "")
+    raise OSError(11, "Resource temporarily unavailable")
+m.claim_state = claim
+m.rail_state = lambda o, n, rows: ("idle", "")
+m.resolve_rail = lambda rail, o: "/bin/echo"
+m.dispatch_rail = lambda *a, **k: (True, "pid=4242", "/x/rail.log")
+args = Namespace(reviews="/x", max_prs=5, candidates=2, dry_run=False, act=True,
+                 rail="/x/rail.sh", rail_wait_s=1, retry_s=900)
+results, dispatched = m.landing_cycle(args, o, slug, repo, None)
+print("dispatched=%s" % dispatched)
+print("second=%s" % results[1]["verdict"])
+print("second_readings=%s" % results[1]["readings"])
+print("line=%s" % m.one_line_of(results, [], "", dispatched))
+print("skipline=%s" % m.one_line_of(results, [], "UNREADABLE report", dispatched))
+PYMOD
+)"
+ck "§26f a dispatch already made is NOT withdrawn by a later candidate's OSError" \
+   "$(qF 'dispatched=True' "$out" && echo 0 || echo 1)"
+ck "§26f ...the failing candidate is reported as UNREADABLE, not as quiet" \
+   "$(qF 'second=SKIPPED(UNREADABLE ' "$out" && qF 'reds=NOT-READ' "$out" && echo 0 || echo 1)"
+ck "§26f ...the line still reports the dispatch that happened" \
+   "$(qF 'GO dispatched (pid=4242)' "$out" && echo 0 || echo 1)"
+ck "§26f ...and if the cycle IS skipped later (the report write), the skip keeps the fact" \
+   "$(qF 'a rail WAS dispatched this cycle' "$out" && nq 'SKIPPED — UNREADABLE report (no dispatch)' "$out" && echo 0 || echo 1)"
+
+# ⛔ END TO END: a dispatch, then a FAILED REPORT WRITE. The cycle is SKIPPED by contract, but the
+# reminder must not then say "(no dispatch)" — that invites a hand dispatch onto the same lock.
+write_baseline; reset_o
+rm -f "$O/MERGE-REMINDER.md"; mkdir -p "$O/MERGE-REMINDER.md"     # the write cannot replace a dir
+out="$(run_sut 2>&1)"; rc=$?
+rmdir "$O/MERGE-REMINDER.md"
+ck "§26g a dispatch + a failed report write is exit 3 (rc=$rc)" "$([ "$rc" -eq 3 ] && echo 0 || echo 1)"
+ck "§26g ...and the line keeps the dispatch (never '(no dispatch)' beside a live rail)" \
+   "$(qF 'a rail WAS dispatched this cycle' "$out" && nq '(no dispatch)' "$out" && echo 0 || echo 1)"
+
+
 # ⛔ THE PROCESS TABLE IS RE-READ AT THE MOMENT OF ACTION. A rail that appears only in the SECOND
 # read (after the gates and this cycle's REST calls) must still refuse the dispatch.
 write_baseline; reset_o
