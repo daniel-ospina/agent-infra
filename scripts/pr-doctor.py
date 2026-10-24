@@ -1211,7 +1211,8 @@ _RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
 # dispatch chain" for a box whose capability probe proved it cannot complete a call at all. That is
 # the same omission [#2291] recorded for `[fork-gate]` ("the FIFTH and it was missing") — the count
 # was wrong there too, at four. Five, and every one of them is a constant this table must re-read.
-GATE_REFUSAL_BOUND = {71: "capability", 73: "fork", 74: "land-backlog", 75: "load", 77: "disk"}
+GATE_REFUSAL_BOUND = {71: "capability", 73: "fork", 74: "land-backlog", 75: "load", 77: "disk",
+                      81: "memory"}
 GATE_REFUSALS = tuple(sorted(GATE_REFUSAL_BOUND))
 # The NEXT ACTION per axis -- a verdict without one is a diagnosis the reader has to re-derive (#2710).
 # The remedies genuinely differ, which is why `spawn-gate.sh` gives them a code each: only the
@@ -1226,6 +1227,12 @@ GATE_NEXT_ACTION = {
     "capability": "measure the box by hand, then restart/reprovision it -- its capability probe "
                   "could not complete a call and return, so a re-dispatch here refuses again and "
                   "waiting does NOT clear it (LANE_PREFLIGHT=0 only once an operator has measured it)",
+    # ⛔ THE MEMORY REMEDY IS NOT THE LOAD ONE (#2387): it clears when resident lanes FINISH, which is
+    # a wait for the lanes and not for the load average. Telling an operator to watch a 1-min load
+    # figure on a box the OOM killer is taking lanes from is the wrong-cause class this table exists
+    # to remove, so the axis has its own sentence and its own token.
+    "memory": "let resident lanes finish (or stop one deliberately) -- it clears when they release "
+              "their working set, and waiting for LOAD does not clear it",
 }
 # ⛔ THE TOKEN COMES FIRST, THE SENTENCE AFTER IT (review P1, #2291). `record_exit()`'s own contract
 # is that the reason is a PREFIX because both readers cut the tail -- the tightest at 110 chars
@@ -1238,6 +1245,7 @@ GATE_NEXT_ACTION = {
 # human reads when the line is not truncated.
 GATE_NEXT_TOKEN = {"load": "wait", "disk": "prune-disk",
                    "land-backlog": "land-prs", "fork": "restart-box",
+                   "memory": "finish-lanes",
                    # ⛔ NOT "wait": a capability refusal is the one class where waiting is provably
                    # useless -- the probe already failed on this box. `GATE_NEXT_TOKEN.get(ax, "wait")`
                    # at the verdict line would have defaulted it to exactly the wrong remedy.
@@ -1259,7 +1267,7 @@ VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
 # MEASURED on cell-4 at load 0.32x (#2293) -- was read as a DISPATCH: it wrote a spawn row and burnt
 # a 90-min budget slot for an agent that never existed. The marker is the gate's own line.
 REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED", "[land-backlog] REFUSED",
-                   "[fork-gate] REFUSED", "[capability-gate] REFUSED")
+                   "[fork-gate] REFUSED", "[capability-gate] REFUSED", "[mem-gate] REFUSED")
 # `run_agent` appends this line only AFTER `pi` has been waited on (spawn-gate.sh starts `pi >> $LOG`
 # and writes this line after `wait`), so its presence in a log PROVES an agent ran -- and a gate
 # refusal is written strictly BEFORE any agent starts. That makes it a one-way discriminator: agent
