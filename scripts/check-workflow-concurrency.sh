@@ -150,19 +150,34 @@ fi
 # Deduplicate. The same file named twice is ONE workflow; without this, the duplicate-group rule below
 # compares a file against itself and refuses a correct workflow as "they would cancel each other"
 # (round 4, P2 — `check-workflow-concurrency.sh f.yml f.yml` was RED).
+# The key is the RESOLVED path, not the spelling: `x.yml` and `./x.yml` are one file, and comparing
+# raw strings let the duplicate-group rule compare a file against itself (round 5, P2).
 DEDUPED=()
+DEDUPED_KEYS=()
 for f in "${FILES[@]}"; do
+  canon="$f"
+  if [ -f "$f" ]; then
+    # Resolve to an absolute path without changing directory: `x.yml` and `./x.yml` are one file.
+    canon="$(realpath -- "$f" 2>/dev/null)"
+    if [ -z "$canon" ]; then
+      canon="$(printf '%s' "$f" | sed -e 's#^\./##' -e 's#/\./#/#g' -e 's#//*#/#g')"
+    fi
+  fi
   seen=0
-  for d in "${DEDUPED[@]+"${DEDUPED[@]}"}"; do
-    [ "$d" = "$f" ] && { seen=1; break; }
+  for d in "${DEDUPED_KEYS[@]+"${DEDUPED_KEYS[@]}"}"; do
+    [ "$d" = "$canon" ] && { seen=1; break; }
   done
-  [ "$seen" -eq 0 ] && DEDUPED+=("$f")
+  [ "$seen" -eq 0 ] && { DEDUPED+=("$f"); DEDUPED_KEYS+=("$canon"); }
 done
 FILES=("${DEDUPED[@]}")
 
 TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/wf-concurrency.XXXXXX")" || exit 2
 TMP_GROUPS="$(mktemp "${TMPDIR:-/tmp}/wf-concurrency-groups.XXXXXX")" || exit 2
-trap 'rm -f "$TMP_OUT" "$TMP_GROUPS"' EXIT
+# NO cleanup trap on purpose. A module-level `rm` whose targets are variables is not statically
+# resolvable by the session checkout-hygiene guard, which then refuses to run THIS script at all
+# (fail-closed, "the whole working tree") — a verifier that cannot be executed verifies nothing.
+# The two files are mktemp-named in TMPDIR and are left for the tmp reaper, exactly as
+# tests/actionlint/run.sh does with its own scratch dir.
 
 # The reader. One TAB-separated record per file:
 #   <basename> \t <triggers> \t <hasconc> \t <group> \t <cancel> \t <joblevel> \t <on-parsed>
@@ -190,7 +205,11 @@ function unq(s)  { if (s ~ /^\".*\"$/ ) return substr(s, 2, length(s) - 2)
 function addtrigger(v,   t) {
   t = unq(trim(v))
   if (t == "") return
-  if (t ~ /^\*/ || t ~ /^![^!]/) { concbad = 1; return }   # an alias / a tag: not a trigger this reader can resolve
+  # An alias (`*x`) or ANY tag (`!x`, `!!seq`, `!!str`) is not a trigger name this reader can
+  # resolve. Recording it as one left the file neither PR nor push, so every rule went vacuous
+  # (round 4). A double-bang tag escaped that test by one character, and the test was the whole
+  # guard (round 5).
+  if (t ~ /^\*/ || t ~ /^!/) { concbad = 1; concwhy = "the `on:` value is an alias or a tagged scalar, which this reader cannot resolve into trigger names"; return }
   trig[t] = 1
 }
 # addflow() — `on: [push, pull_request]` and `on: {pull_request: {...}}`. A flow MAPPING carries its
@@ -220,19 +239,23 @@ function closes(v) { return gsub(/[\]}]/, "", v) }
 # line of the NEXT file (so a previous record never carries content from the next file) and at EOF.
 function flush(   tg, k, n) {
   if (fname == "") return
+  if (pendkey != "") {                    # a value that ran to EOF: still a value
+    if (pendkey == "group") { group = unq(trim(pendval)) } else { cancel = tolower(unq(trim(pendval))) }
+    pendkey = ""; pendval = ""; pendind = -1
+  }
   n = 0; tg = ""
   for (k in trig) { n++; tg = tg (n > 1 ? " " : "") k }
-  printf "%s\037%s\037%d\037%s\037%s\037%d\037%d\037%s\037%d\n", fname, tg, hasconc, group, cancel, joblevel, (n > 0 ? 1 : 0), wfname, concbad
+  printf "%s\037%s\037%d\037%s\037%s\037%d\037%d\037%s\037%d\037%s\n", fname, tg, hasconc, group, cancel, joblevel, (n > 0 ? 1 : 0), wfname, concbad, concwhy
   delete trig; hasconc = 0; group = ""; cancel = ""; joblevel = 0; fname = ""; onindent = -1; cur = ""
   scalarindent = -1; flowopen = 0; flowbuf = ""; flowmode = ""; wfname = ""; concbad = 0
-  pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0
+  pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0; concwhy = ""
 }
 BEGIN {
   cur = ""; SQ = sprintf("%c", 39); DQ = "\""
   QCH = "[" DQ SQ "]"
   KEYPAT = QCH "?[A-Za-z_][A-Za-z0-9_-]*" QCH "?[ \t]*:"
   hasconc = 0; joblevel = 0; onindent = -1; scalarindent = -1; flowopen = 0; flowbuf = ""; flowmode = ""
-  wfname = ""; concbad = 0; pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0
+  wfname = ""; concbad = 0; pendkey = ""; pendval = ""; pendind = -1; flowdepth = 0; concwhy = ""
 }
 {
   if (FNR == 1) {                         # a new file begins: close the previous record FIRST
@@ -242,27 +265,30 @@ BEGIN {
 
   line = $0
   sub(/\r$/, "", line)
+  lineindent = 0                          # 0 for a top-level line
+  if (match(line, /^[ \t]+/)) lineindent = RLENGTH
+
+  # BLOCK-SCALAR BODIES and PENDING VALUES are TEXT: they are read BEFORE the comment strip, because
+  # inside them a `#` is literal. Stripping first DELETED a `#` line that carried a per-commit
+  # variable out of a `group: |` body, so the inert gate read GREEN (round 5, P2). It also kept a
+  # `#` line inside a `run: |` body from being mistaken for a key.
+  if (scalarindent >= 0 && lineindent > scalarindent) next
+  if (pendkey != "" && lineindent > pendind) {
+    pendval = pendval " " trim(line)
+    if (length(pendval) > 65536) { pendkey = ""; pendval = ""; pendind = -1; concbad = 1; concwhy = "a pending `concurrency` value larger than 65536 characters is not modelled" }
+    next
+  }
+
   sub(/^[ \t]*#.*$/, "", line)            # whole-line comment
   sub(/[ \t]+#.*$/, "", line)             # trailing comment (the comment may itself contain a hash: #2474)
   if (trim(line) == "") next
 
-  # BLOCK SCALARS: `run: |` bodies are TEXT, not keys. Without this, a `concurrency:` line inside a
-  # shell script or a heredoc reads as a real key (round 2: a `run: |` fragment was refused as "a
-  # JOB-level concurrency" — a false red pointing at a change that does not exist in the file).
-  if (scalarindent >= 0) {
-    lead = 0
-    if (match(line, /^[ \t]+/)) lead = RLENGTH   # match() returns the POSITION, RLENGTH is the width
-    if (lead > scalarindent) next         # still inside the scalar body
-    scalarindent = -1
-  }
-  lineindent = 0                          # 0 for a top-level line
-  if (match(line, /^[ \t]+/)) lineindent = RLENGTH
+  if (scalarindent >= 0 && lineindent <= scalarindent) scalarindent = -1
 
-  # A pending `group:` / `cancel-in-progress:` whose value was empty on its own line: the value is the
-  # following indented line(s), joined (a plain continuation, `|`, or `>-`). Leaving it absent is the
-  # DANGEROUS direction here: R2 treats an absent cancel as the non-cancelling default.
+  # A pending value resolves at the first line that is NOT its continuation — including the end of
+  # the file, where nothing follows (round 5, P1: resolved only on a later, less-indented line, so a
+  # `cancel-in-progress:` whose value was the last line stayed ABSENT and R2 accepted it as default).
   if (pendkey != "") {
-    if (lineindent > pendind) { pendval = pendval " " trim(line); next }
     if (pendkey == "group") { group = unq(trim(pendval)) } else { cancel = tolower(unq(trim(pendval))) }
     pendkey = ""; pendval = ""; pendind = -1
   }
@@ -282,7 +308,8 @@ BEGIN {
     # accumulating it without a ceiling makes the cost grow with attacker-chosen input
     # (measured 35 s on an 838 KB crafted file before these two lines).
     if (length(flowbuf) > 65536) {
-      concbad = 1; flowopen = 0; flowbuf = ""; flowmode = ""; flowdepth = 0
+      concbad = 1; concwhy = "an unterminated flow value larger than 65536 characters is not modelled"
+      flowopen = 0; flowbuf = ""; flowmode = ""; flowdepth = 0
       next
     }
     if (flowdepth <= 0) {
@@ -311,7 +338,7 @@ BEGIN {
     }
     if (cur == "jobs") {
       rest = trim(substr(line, index(line, ":") + 1))
-      if (rest ~ /^\{/) { concbad = 1 }   # a flow-style jobs: is not modelled (a job-level block hides in it)
+      if (rest ~ /^\{/) { concbad = 1; concwhy = "a flow-style `jobs:` is not modelled here, so a job-level `concurrency:` inside it cannot be seen" }
     }
     if (cur == "concurrency") {
       hasconc = 1
@@ -322,6 +349,7 @@ BEGIN {
           else { parseconc(rest) }
         } else if (rest ~ /^\[/ || rest ~ /^\*/) {
           concbad = 1                   # a sequence or an alias: valid YAML, not modelled -> R0
+          concwhy = "the `concurrency:` value is a sequence or an alias, not a group mapping"
         } else {
           group = unq(rest)             # the scalar shorthand `concurrency: <group>`
         }
@@ -346,7 +374,11 @@ BEGIN {
     next
   }
 
-  if (line ~ /^[ \t]*\?[ \t]/) { concbad = 1; next }   # explicit-key form: not modelled
+  if (line ~ /^[ \t]*\?[ \t]/) {        # explicit-key form, at any indent: not modelled
+    concbad = 1
+    concwhy = "the file uses YAML explicit-key syntax (`? key`), which this reader does not model"
+    next
+  }
 
   # A JOB-level `concurrency:` (indented while we are NOT in the workflow-level section). GitHub
   # honours it and this check does not model it, so it is refused (R0) rather than ignored.
@@ -395,7 +427,7 @@ has_trigger() { # has_trigger <triggers> <name>
   return 1
 }
 
-while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed wfname concbad; do
+while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed wfname concbad concwhy; do
   [ -n "${fname:-}" ] || continue
   scanned=$((scanned + 1))
 
@@ -407,7 +439,9 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
 
   # ---- R0: what could not be read is not compliant ----------------------------------------
   if [ "$onparsed" -eq 0 ]; then
-    fail "$fname: this check could not read any trigger from the \`on:\` section — refusing to treat an unreadable workflow as non-PR. (A workflow is not run without \`on:\`; a shape this reader cannot resolve must be fixed or modelled.) [R0]"
+    # The specific cause when the reader has one (an alias, a tag): the generic sentence describes
+    # the SYMPTOM and would send the author looking for a missing `on:` that is in the file.
+    fail "$fname: ${concwhy:-this check could not read any trigger from the \`on:\` section} — refusing to treat an unreadable workflow as non-PR. A workflow is not run without \`on:\`; a shape this reader cannot resolve must be fixed or modelled [R0]"
     continue
   fi
   if [ "$joblevel" -eq 1 ]; then
@@ -415,7 +449,9 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
     continue
   fi
   if [ "${concbad:-0}" -eq 1 ]; then
-    fail "$fname: the \`concurrency:\` value is a sequence or an alias — valid YAML that this check does not model, and an unreadable cancellation policy must not read as compliant [R0]"
+    # ONE message per cause: three shapes shared this line and two of them were then described as
+    # "a sequence or an alias" that the file did not contain (round 5, P2).
+    fail "$fname: ${concwhy:-an unreadable shape in this file} — an unreadable cancellation policy must not read as compliant [R0]"
     continue
   fi
 
@@ -428,6 +464,14 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
   has_trigger "$triggers" push && is_push=1
   is_reusable=0
   has_trigger "$triggers" workflow_call && is_reusable=1
+  # R3's hazard is that a callee's `concurrency` groups two CALLERS together. A workflow that is both
+  # reusable AND PR-triggered must declare a cancelling block to satisfy R1, and in the callee's
+  # context that block is exactly this hazard — one block cannot serve both, so the combination is
+  # refused rather than half-satisfied in silence (round 5, P2). `pipeline-compliance.yml` carries
+  # both triggers but no block, so it keeps satisfying R3's absence rule.
+  if [ "$is_reusable" -eq 1 ] && [ "$is_pr" -eq 1 ] && [ "$hasconc" -eq 1 ]; then
+    fail "$fname: triggers BOTH \`workflow_call\` and a pull-request event — R1 requires a cancelling block, and in the callee's context that block groups two CALLERS on one ref together (R3). Split the reusable workflow out [R3]"
+  fi
 
   # ---- R2: a push-triggered workflow must never cancel a default-branch run ----------------
   if [ "$is_push" -eq 1 ]; then
@@ -468,8 +512,13 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
         # the canonical `${{ github.workflow }}-${{ github.ref }}` idiom would be false-red as
         # "they would cancel each other" (round 2 P2), when their runtime groups differ.
         identity="${wfname:-$fname}"
-        resolved="${group//'${{ github.workflow }}'/$identity}"
-        resolved="${resolved//'${{github.workflow}}'/$identity}"
+        # Canonicalise the expression before comparing: `${{github.workflow}}`,
+        # `${{  github.workflow  }}` and `${{ github.workflow }}` are ONE expression, and substituting
+        # only two literal spellings made the comparison read un-expanded templates — a correct pair
+        # was refused as "they would cancel each other", and a genuinely shared group was missed
+        # (round 5, P2). sed is anchored on `[^}]*` so two expressions on one line are two matches.
+        resolved="$(printf '%s' "$group" | sed -E 's/\$\{\{[[:space:]]*([^}]*[^}[:space:]])[[:space:]]*\}\}/${{ \1 }}/g')"
+        resolved="${resolved//'${{ github.workflow }}'/$identity}"
         printf '%s\t%s\n' "$resolved" "$fname" >>"$TMP_GROUPS"
         # A per-commit variable makes every head (and every retry) its own group, so the block cancels
         # NOTHING — the exact defect it exists to prevent. This refusal must apply on BOTH paths: it
@@ -482,16 +531,20 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
             fail "$fname: \`concurrency.group\` ('$group') carries a PER-COMMIT variable — every head/attempt becomes its own group, so the block cancels nothing at all (an inert gate). Key it on \`github.ref\` / \`github.head_ref\` alone [R1]" ;;
           *)
             if has_trigger "$triggers" pull_request_target; then
+              # On `pull_request_target`, `github.ref` is the BASE branch — but `github.head_ref` and
+              # the PR number are both the pull request, so all three are correct keys here. Accepting
+              # only the number refused a correct group and told the author it "collapses every PR
+              # into one", which is not what a head_ref group does (round 5, P2).
               case "$group" in
-                *'github.event.pull_request.number'*) : ;;
-                *) fail "$fname: \`pull_request_target\` sets \`github.ref\` to the BASE branch, so a group keyed on '$group' collapses every PR into one — key it on \`github.event.pull_request.number\` [R1]" ;;
+                *'github.head_ref'*|*'github.event.pull_request.number'*|*'github.event.number'*) : ;;
+                *) fail "$fname: \`pull_request_target\` sets \`github.ref\` to the BASE branch, so a group keyed on '$group' collapses every PR into one — key it on \`github.head_ref\` or the PR number (\`github.event.pull_request.number\`) [R1]" ;;
               esac
             else
               case "$group" in
-                # The PR number is per-PR and stable across heads, so it is a correct key for
-                # `pull_request` too — refusing it was a false red (round 4, P2).
-                *'github.ref'*|*'github.head_ref'*|*'github.event.pull_request.number'*) : ;;
-                *) fail "$fname: \`concurrency.group\` ('$group') is not keyed on the PR — expected \`github.ref\`, \`github.head_ref\` or \`github.event.pull_request.number\`. Keyed on a SHA it cancels nothing (each head is its own group) [R1]" ;;
+                # The PR number is per-PR and stable across heads and `github.event.number` is that
+                # same number — refusing either was a false red (rounds 4 and 5).
+                *'github.ref'*|*'github.head_ref'*|*'github.event.pull_request.number'*|*'github.event.number'*) : ;;
+                *) fail "$fname: \`concurrency.group\` ('$group') is not keyed on the PR — expected \`github.ref\`, \`github.head_ref\` or the PR number (\`github.event.pull_request.number\` / \`github.event.number\`) [R1]" ;;
               esac
             fi ;;
         esac

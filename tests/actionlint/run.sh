@@ -442,7 +442,9 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-github-workflow-a.yml" "$CFIX/pr-github-workflow-b.yml" \
   "$CFIX/pr-trailing-comment.yml" "$CFIX/push-heredoc.yml" \
   "$CFIX/pr-nameless-a.yml" "$CFIX/pr-nameless-b.yml" "$CFIX/pr-flow-map.yml" \
-  "$CFIX/pr-number-key.yml" "$CFIX/pr-group-folded.yml" "$CFIX/pr-cancel-capital.yml"
+  "$CFIX/pr-number-key.yml" "$CFIX/pr-group-folded.yml" "$CFIX/pr-cancel-capital.yml" \
+  "$CFIX/pr-event-number.yml" "$CFIX/pr-target-headref.yml" "$CFIX/pr-eof.yml" \
+  "$CFIX/pr-workflow-ws-a.yml" "$CFIX/pr-workflow-ws-b.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -470,6 +472,11 @@ for pair in \
   "push-cancel-folded.yml R2" \
   "push-jobs-flow.yml R0" \
   "push-on-alias.yml R0" \
+  "push-eof.yml R2" \
+  "push-on-tag.yml R0" \
+  "pr-explicit-key.yml R0" \
+  "pr-hidden-sha.yml R1" \
+  "reusable-and-pr.yml R3" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
@@ -489,6 +496,24 @@ conc_run 0 "the same file passed twice is one workflow" "$CFIX/pr-ok.yml" "$CFIX
 grep -q '1 file(s) scanned' "$OUT" \
   && pass "the duplicate path was collapsed before the group comparison" \
   || { fail "the same file was counted twice"; sed 's/^/      /' "$OUT"; }
+
+# The duplicate is the same FILE, not the same STRING: `x.yml` and `./x.yml` resolve to one path.
+conc_run 0 "one file under two spellings is one workflow" "$CFIX/pr-ok.yml" "$CFIX/./pr-ok.yml"
+grep -q '1 file(s) scanned' "$OUT" \
+  && pass "the second spelling resolved to the same file" \
+  || { fail "a second spelling was counted as a second workflow"; sed 's/^/      /' "$OUT"; }
+
+# R0 has several causes and each must be NAMED: one message for all of them described two files as
+# "a sequence or an alias" that contained neither (#2660 round 5).
+conc_run 1 "a flow-style jobs: is named as such" "$CFIX/push-jobs-flow.yml"
+grep -q 'flow-style' "$OUT" && pass "the flow-style jobs: cause is named" \
+  || { fail "the flow-style jobs: refusal did not name its cause"; sed 's/^/      /' "$OUT"; }
+conc_run 1 "an explicit key is named as such" "$CFIX/pr-explicit-key.yml"
+grep -q 'explicit-key syntax' "$OUT" && pass "the explicit-key cause is named" \
+  || { fail "the explicit-key refusal did not name its cause"; sed 's/^/      /' "$OUT"; }
+conc_run 1 "a tagged on: is named as such" "$CFIX/push-on-tag.yml"
+grep -q 'tagged scalar' "$OUT" && pass "the tagged on: cause is named" \
+  || { fail "the tagged on: refusal did not name its cause"; sed 's/^/      /' "$OUT"; }
 
 # Cross-file rule: two PR workflows that share one group would cancel each other. Neither file is
 # wrong on its own, so this can only be caught by reading the whole set.
