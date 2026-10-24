@@ -449,6 +449,24 @@ case_j() { # <owner-script> <lock-dir-name>
     return $((CASE_FAIL > 0))
 }
 
+# ── K: a class that could not be SET UP is `misconfigured`, not `fail-closed` ────────────────────
+# `fail-closed` means "the delegate RAN and could not do the work". A missing owner is the other thing,
+# and the record said `fail-closed` beside `detail=cannot run: …` — two contradictory causes on the
+# line an operator fixes from.
+case_k() { # <entry-point>
+    local pass="$1" base root out status
+    base="$(newbase k)"; root="$base/scratch"; mkdir -p "$root"
+    out="$(DISK_REAPER_STATE_DIR="$base/state" REAP_AW_ROOTS="$root" REAP_DI_ROOTS="$base/no-di" \
+           ABANDONED_WT_REAPER="$base/missing.sh" bash "$pass" --dry-run --only worktree 2>&1)"
+    [ -n "${DRC_DEBUG:-}" ] && printf 'K\n%s\n' "$out" >&2
+    status="$(cat "$base/state/disk-reaper.status" 2>/dev/null)"
+    case_check "$(grep -q '^verdict_worktree=misconfigured$' <<<"$status" && echo 0 || echo 1)" \
+               "a missing owner is recorded as MISCONFIGURED (could not be set up), not fail-closed"
+    case_check "$(grep -qF 'cannot run: abandoned-worktree-delegate-missing' <<<"$status" && echo 0 || echo 1)" \
+               "and detail= names the missing owner"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 MUT_A='s/if lp_path_held "\$CENSUS" "\$canon"; then/if false; then/'
 MUT_B='s/if remove_one "\$canon" "\$repo"; then/if false; then/'
@@ -461,6 +479,7 @@ MUT_H='s/if \[ -L "\$d" \]; then/if false; then/'
 MUT_I='s/        dirty="?"$/        dirty="0"/'
 MUT_D2='s/^        PIN_PATHS="\$_pc"$/        :/'
 MUT_J='s/kill -0/false/'
+MUT_K='s/^        AW_SETUP_FAIL=1$/        :/'
 
 echo "── disk-reaper-classes.test.sh — #2542 classes ─────────────────────────────────────────────"
 
@@ -549,6 +568,16 @@ if apply_mutation "$AW_OWNER" "$T/mut-d2/reap-abandoned-worktrees.sh" "$MUT_D2";
     expect_fail "D mutation: dropping the pin canonicalisation turns the symlinked-stamp case RED" case_d "$T/mut-d2/reap-abandoned-worktrees.sh"
 else
     bad "D canonicalisation mutation could not be applied — the aliased pin is not being checked"
+fi
+
+expect_pass "K a missing owner is misconfigured, not fail-closed" case_k "$REAPER"
+if apply_mutation "$REAPER" "$T/mut-k/disk-reaper.sh" "$MUT_K"; then
+    for d in pi-reap-worktrees.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh pi-cache-reap.sh reap-lane-venvs.sh; do
+        [ -f "$HERE/$d" ] && ln -sfn "$HERE/$d" "$T/mut-k/$d"
+    done
+    expect_fail "K mutation: not recording the setup failure turns the case RED" case_k "$T/mut-k/disk-reaper.sh"
+else
+    bad "K mutation could not be applied (the AW_SETUP_FAIL arm moved) — the case is not checking it any more"
 fi
 
 echo
