@@ -13,9 +13,13 @@
  *   reason      — short tag (escape_hatch, per_command_escape_hatch, no_review_record, no_reviewers_dispatch, ...)
  *   session_cwd — process.cwd() at emit time (the session's working directory)
  *   ...extra    — per-event fields. The ones a reader will meet today: `tier` + `tier_source`
- *                 (`read` | `undetermined`) on the review-enforcer's `gate_block` / `gate_pass` /
- *                 `reviewer_preflight` records (#2204), `phase` (`session_start` | `first_push` |
- *                 `block_recovery`) and `delivered` on `reviewer_preflight` (#2148/#2204), and
+ *                 (`read` | `undetermined`) on the review-enforcer's `gate_block`, `gate_pass` and
+ *                 `phase: "block_recovery"` records (#2204) — the other two pre-flight records
+ *                 (`session_start`, `first_push`) carry neither, because no tier was read there;
+ *                 `phase` (`session_start` | `first_push` | `block_recovery`), `role` and `send_queued`
+ *                 on `reviewer_preflight` (#2148/#2204 — `send_queued`, NOT `delivered`: the SDK's
+ *                 `sendMessage` is fire-and-forget, so "handed to the SDK" is the most an extension
+ *                 can observe and a `delivered` field would claim more than it can know); and
  *                 `command` on every record that can name the refused/allowed command (#1492).
  *                 Fields are ADDITIVE: a reader must tolerate one it does not know, and must
  *                 never infer an absent field (an old line has no `tier_source`).

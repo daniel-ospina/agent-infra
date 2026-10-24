@@ -1535,16 +1535,50 @@ function isUnreadableProgramWord(w: string): boolean {
  *      substitution. A wider exemption is a measured false PASS: `gh pr view 1; $(cat /tmp/f)`
  *      with `git push` in `/tmp/f` EXECUTES that output, and the first version allowed it
  *      (fresh review, P1);
- *   4. no program PIPED INTO a shell or an interpreter (`… | sh`, `… | python3`): that program
- *      is the previous stage's output, and nothing in this text can be read as its words. A text
- *      filter in a pipe (`| jq`, `| sed`, `| awk`, `| head`) processes the data and runs nothing,
- *      so it is allowed — refusing it would re-create #2204's false positive for the ordinary
- *      `gh pr view … --json body | jq -r .body` read.
+ *   4. every PIPELINE STAGE is a known data filter whose arguments cannot run a program or open
+ *      an output file (`READ_PIPELINE_FILTERS` + `DATA_FILTER_SCRIPT_EXECUTES`). A shell or an
+ *      interpreter reads its PROGRAM from that stream (`… | sh`, `… | python3`) and is refused, as
+ *      is a WRAPPER WORD that hides one (`… | env -i bash`, `… | xargs -n1 sh`) and a filter SCRIPT
+ *      that executes (`… | sed '1e /tmp/x.sh'`). Pure filters (`| jq`, `| head`, `| sed -n '3,12p'`)
+ *      process the data and run nothing, so they stay allowed — refusing them would re-create
+ *      #2204's false positive for the ordinary `gh pr view … --json body | jq -r .body` read.
  *
  * Any doubt answers FALSE and the floor keeps its decision. The polarity is the point:
  * an unreadable command is NOT a permission — the same rule as `readsNonMergeGhCall`,
  * applied to "is this a write" instead of "is this an admin merge".
  */
+/**
+ * Pipeline stages a zero-dispatch READ may be piped into — a POSITIVE allowlist of filters that
+ * print what they are handed and cannot start a process.
+ *
+ * ⛔ Deliberately ABSENT, each for a measured reason: every shell and interpreter (`| sh`,
+ * `| python3` — they read their PROGRAM from the stream); the wrapper words that hide one one token
+ * later (`env`, `exec`, `command`, `nohup`, `nice`, `timeout`, `setsid`, `stdbuf`, `xargs` — the
+ * first cut tested only the token immediately after the `|` and certified `| env -i bash` and
+ * `| xargs -n1 sh`); and the filters whose FLAGS or second argument open an OUTPUT file (`sort -o f`,
+ * `uniq in out`, `tee`), which is why `HARMLESS_SUBSTITUTION_PROGRAMS` excludes them too. `sed` and
+ * `awk` are here because the triage corpus reads through them, and their SCRIPT is checked instead.
+ */
+const READ_PIPELINE_FILTERS = new Set([
+  "jq", "head", "tail", "cut", "tr", "wc", "grep", "rg", "cat", "column", "nl", "rev", "fold",
+  "sed", "awk",
+]);
+
+/**
+ * The `sed`/`awk` SCRIPT constructs that EXECUTE or WRITE — the reason a data filter still needs
+ * its arguments read.
+ *
+ * Measured bypass in the first cut: `… | sed '1e /tmp/x.sh'` was certified as a read and ran the
+ * file (sed's `e` command executes the pattern space; `w`/`W` write one), and awk's `system()` /
+ * `print > "f"` / `"cmd" | getline` do the same. An ordinary print script (`3,12p`, `s/a/b/`,
+ * `NR>1`) matches none of these and stays a read.
+ */
+const DATA_FILTER_SCRIPT_EXECUTES =
+  // The sed `e`/`w`/`W` COMMAND. The preceder class includes the QUOTES: a script is normally
+  // written `sed '1e /tmp/x.sh'`, so the address is preceded by `'` and an anchor of `;{}` +
+  // whitespace alone missed every real spelling of it (caught by re-running the probe).
+  /(^|[;{}\s'"])([0-9$,/]*)\s*[ewW](\s|;|$)|s\/(?:\\.|[^\\/])*\/(?:\\.|[^\\/])*\/[a-z]*[ew]|system\s*\(|\b(?:print|printf)\b[^;{}]*[>|]|\|\s*getline/;
+
 export function readsOnlyGhRead(command: string): boolean {
   if (mentionsGitWord(command)) return false;
   const scan = scanTokens(command);
@@ -1626,21 +1660,42 @@ export function readsOnlyGhRead(command: string): boolean {
     return false;
   }
 
-  // (4) No program piped into a SHELL or an INTERPRETER. `… | jq`, `| sed`, `| awk`, `| head`
-  // process data and run nothing. A shell or an interpreter READS ITS PROGRAM from that same
-  // stream, so it keeps the refusal — and the refusal is not narrowed with a `-m <module>`
-  // exception: telling `python3 -m json.tool` from `python3 -m pip …` is the enumeration trap this
-  // file's doctrine rejects, so `| python3` costs a retry instead.
+  // (4) Every PIPELINE STAGE must be a data filter that cannot run a program or open an output
+  // file.
+  //
+  // ⛔ POSITIVE ALLOWLIST, NOT A LIST OF SHELLS. The first cut refused a shell/interpreter in the
+  // token IMMEDIATELY after the `|`, and that certified three writes at ZERO dispatches (fresh
+  // review, P1 — each reproduced through the real `tool_call` handler before it was fixed):
+  //
+  //   … | sed '1e /tmp/x.sh'   sed's `e` command RUNS /tmp/x.sh — whatever may be in it
+  //   … | env -i bash          the runner is one WRAPPER WORD past the pipe, so the shell test
+  //   … | xargs -n1 sh         never sees it; xargs builds a command from the stream
+  //
+  // A stage that is not a KNOWN filter is therefore refused: `env`, `xargs`, `sudo`, `nice`, a
+  // shell, an interpreter, and also `sort`/`uniq`/`tee`, whose flags and second argument open
+  // OUTPUT files (`sort -o f`, `uniq in out`) — the same reason `HARMLESS_SUBSTITUTION_PROGRAMS`
+  // leaves them out. `sed`/`awk` stay allowed because the corpus reads through them
+  // (`| sed -n '3,12p'`, `| awk 'NR>1'`), so their SCRIPT is inspected for the constructs that
+  // execute or write (`DATA_FILTER_SCRIPT_EXECUTES`) — refusing the filter name outright would
+  // re-create the false block that measurement cost.
+  //
+  // The polarity is this function's throughout: an unrecognised stage is NOT a read, so it costs a
+  // retry (`| head`, `| jq`) instead of certifying a program that ran with no reviewer verdict.
+  let sedOrAwkStage = false;
   for (let i = 1; i < scan.tokens.length; i++) {
     if (isData(i)) continue;
     if (!/(^|[^|])\|([^|]|$)/.test(scan.gaps[i] ?? "")) continue;
     if (isData(i - 1)) continue;
     const w = word(i);
-    if (
-      STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
-      /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh|busybox)$/.test(w)
-    ) return false;
+    if (!READ_PIPELINE_FILTERS.has(w)) return false;
+    if (w === "sed" || w === "awk") sedOrAwkStage = true;
   }
+  // ⛔ THE SCRIPT IS DATA ON THIS SCAN, SO IT IS READ FROM THE TEXT. `sed '1e /tmp/x.sh'` is ONE
+  // quoted token, and the tokenizer splits quoted regions on `(`/`{`/`;` too, so a stage-by-stage
+  // walk cannot see the script's own words. The construct test therefore runs over the command
+  // TEXT, and it is the fail-closed direction: the over-approximation can only REFUSE a command
+  // that carries an execute/write construct somewhere, never certify one that does.
+  if (sedOrAwkStage && DATA_FILTER_SCRIPT_EXECUTES.test(command)) return false;
 
   // (2) Every gh invocation is a READ, and there is at least one.
   let seen = false;
@@ -1692,7 +1747,13 @@ export function readsOnlyGhRead(command: string): boolean {
       }
       continue;
     }
-    const allowed = GH_READ_SUBCOMMANDS[group];
+    // ⛔ OWN-PROPERTY LOOKUP. `group` is attacker-chosen text, and a plain index reaches the
+    // PROTOTYPE: `gh constructor view` yielded `Object` (not `undefined`), so `.includes` threw out
+    // of the gate — a refusal with no `gate_block` row and no recovery message, which is the
+    // "refused and indistinguishable in the log" defect #2204 names (fresh review, P2).
+    const allowed = Object.prototype.hasOwnProperty.call(GH_READ_SUBCOMMANDS, group)
+      ? GH_READ_SUBCOMMANDS[group]
+      : undefined;
     if (allowed === undefined) return false;
     const subTok = tok(i + 2);
     if (subTok === "" || CONSTRUCT.test(subTok)) return false;
@@ -4508,7 +4569,10 @@ export function dispatchFloorMessage(tier: string, role: ReviewerRole = "self"):
     "     reviewer at all (#2204). Run the read as a plain standalone command on its own line —",
     "     `gh pr view <n>`, `gh api <GET path>`, `gh issue view <n>` — and it is allowed with ZERO",
     "     dispatches. A refusal means the text could not be certified as a read: a loop or a `$(…)`",
-    "     that could hide a program, a path-spelled `gh`, or a read bundled with a write.",
+    "     that could hide a program, a path-spelled `gh`, a read bundled with a write, a `git` word",
+    "     ANYWHERE in the command (put the git command on its own line — it needs no reviewer there,",
+    "     but a git mention is never certified as a read), or a pipeline stage that can run a program",
+    "     or write a file (`| bash`, `| env -i bash`, `| xargs -n1 sh`, `| sed '1e …'`, `| sort -o f`).",
   ].join("\n");
 }
 
@@ -5163,7 +5227,16 @@ export default function (pi: ExtensionAPI) {
             spawn_outcomes: spawnAttempts.map((a) => a.outcome),
             command: auditCommand(command),
           });
-          return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
+          // #2204 (2): stated EXPLICITLY on the capacity arm too. Its own text asks for a RETRY
+          // (`describeSpawnCapacity`), so a refusal the model reads as the end of the run would
+          // contradict the remedy it was just handed — the exact measured failure #2204 (2) fixes.
+          // The value is the SDK default, so nothing changes at runtime; stating it is what stops a
+          // future edit from reaching for `terminate: true` to "make the refusal stick".
+          return {
+            block: true,
+            reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
+            terminate: false,
+          };
         }
         const floor = describeDispatchFloorRead(command, "micro", dispatchCount);
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
@@ -5197,7 +5270,12 @@ export default function (pi: ExtensionAPI) {
           spawn_outcomes: spawnAttempts.map((a) => a.outcome),
           command: auditCommand(command), // #1492: the refused command, not just the reason
         });
-        return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
+        // #2204 (2): non-terminating, like the floor return below — see the note on the micro arm.
+        return {
+          block: true,
+          reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
+          terminate: false,
+        };
       }
 
       const floor = describeDispatchFloorRead(command, tier, dispatchCount);

@@ -2791,6 +2791,26 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     `gh pr view 1; node -e 'require("child_process").execSync("git push")'`,
     "gh pr view 1; sh -c 'gh pr create --fill'",
     "gh pr view 1 | sh",
+    // ⛔ THE PIPE STAGE IS A POSITIVE ALLOWLIST, and these are the shapes the first cut certified
+    // as a zero-dispatch READ (measured through the real handler, fresh review P1). Each one RUNS
+    // something the text never spelled as a command — which is the whole reason the floor exists.
+    "gh pr view 1 | env -i bash", // the runner is one WRAPPER word past the pipe
+    "gh pr view 1 | xargs -n1 sh", // xargs builds a command out of the stream
+    "gh pr view 1 | /bin/sh",
+    `gh pr view 1 | sed '1e /tmp/x.sh'`, // sed's `e` command executes the file
+    `gh pr view 1 | sed 'w /tmp/f'`, // …and `w` writes one
+    `gh pr view 1 | sed 's/a/b/e'`, // the substitution spelling of the same
+    `gh pr view 1 | awk 'BEGIN{system("/tmp/x")}'`,
+    `gh pr view 1 | awk '{print > "/tmp/f"}'`,
+    `gh pr view 1 | awk '"date" | getline x'`,
+    "gh pr view 1 | sort -o /tmp/f", // a filter whose FLAG opens an output file
+    "gh pr view 1 | uniq /tmp/out", // …or whose second argument is one
+    "gh pr view 1 | tee /tmp/f",
+    // A non-allowlisted gh GROUP must not reach the PROTOTYPE chain (#2204 cycle-3 review, P2):
+    // `GH_READ_SUBCOMMANDS[group]` yielded `Object` for `constructor`, so `.includes` threw out of
+    // the gate — a refusal with no audit row and no recovery text.
+    "gh constructor view 2",
+    "gh toString pr view 1",
     "gh pr view 1; . <(echo 'git push')",
     // a path-spelled gh is not a read this layer can certify
     "/usr/bin/gh pr view 1",
@@ -3082,6 +3102,25 @@ testAsync("#2204: a delivery that could not happen does NOT spend the session's 
         );
         equal(audit.length, 1, "the attempt is still audited (an operator must be able to see it)");
         equal(audit[0].send_queued, false, "…and says NOTHING was handed over");
+        // ⛔ THE NAME'S OTHER HALF — the recovery is NOT SPENT (fresh review, P2). Asserting only
+        // `send_queued === false` proves the attempt was recorded; it says nothing about the budget,
+        // and "the flag was set before the try" is exactly the regression that would survive it. So
+        // hand the SAME session a working `sendMessage` and block again: exactly one recovery must
+        // be delivered, which is only possible if the failed attempt did not consume it.
+        const sent: any[] = [];
+        (pi as any).sendMessage = (message: any, opts: any) => { sent.push({ message, opts }); };
+        const blockedAgain = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(blockedAgain && blockedAgain.block === true, "the second refusal still blocks");
+        equal(
+          sent.filter((s) => s.message?.customType === "reviewer-block-recovery").length,
+          1,
+          "…and the session's one recovery is STILL delivered (the failed attempt did not spend it)"
+        );
+        const auditAfter = readAuditLines(auditLogPath()).filter(
+          (l) => l.event === "reviewer_preflight" && l.phase === "block_recovery"
+        );
+        equal(auditAfter.length, 2, "…and the successful hand-off is audited on its own row");
+        equal(auditAfter[1].send_queued, true, "…which is the row that says it was handed over");
       } finally {
         if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       }
