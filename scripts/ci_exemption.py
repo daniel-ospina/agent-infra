@@ -65,6 +65,18 @@ attributed first, then a non-pytest step failing with bare prose. Closing it nee
 per-step conclusions from the run metadata. See :func:`guard_step_failures` and
 the measured capture this is grounded on.
 
+HALF 1c — PIPELINE-COMPLIANCE GATE ATTRIBUTION (#1185)
+
+`scripts/check-pipeline-compliance.sh` announces a failure in a THIRD shape —
+``❌ [<letter>] <reason> for/on <subject>`` — and neither half above could see it,
+so the DOMINANT red in the queue (measured 2026-10-24: ``pipeline-compliance (c)``
+over all 70 open agent-infra PRs) was reported as unattributable while the log
+named it in plain text. The check letter plus the message's first clause therefore
+become an identity (``pipeline-compliance::<letter>::<subject-slug>``), so the
+refusal says what the check says — ``blocked by check (c): …`` — instead of
+"we cannot say why". Attribution is still not exemption: see
+:func:`pipeline_check_failures`.
+
 HALF 2 — THE PRE-MERGE EXEMPTION DECISION (``signatures``, ``decide``)
 
 The pre-merge classifier used to decide ownership of a failure by MEMBERSHIP IN A
@@ -105,9 +117,10 @@ compared** and **visible**:
 And the parser is **fail-closed** (#3705's rule applied to the exemption parser):
 the union IS an allowlist, so junk in it is a zero-evidence pass. An unparseable or
 non-nodeid line must REFUSE the exemption and be COUNTED AND REPORTED -- never
-silently swallowed, never read as "no failures". Since #4469 the failure-key
-universe is a pytest nodeid OR an attributable guard-step annotation (HALF 1b);
-a line that is NEITHER is still refused, counted and reported.
+silently swallowed, never read as "no failures". The failure-key universe is a
+pytest nodeid, an attributable guard-step annotation (HALF 1b), OR — since #1185 —
+a `check-pipeline-compliance.sh` gate failure (HALF 1c); a line that is NONE of
+them is still refused, counted and reported.
 
 Pure functions only: no I/O, no network, no git — except :func:`_read`, the
 ``ids`` CLI and the ``signatures`` CLI, which read the caller's own capture file.
@@ -117,8 +130,10 @@ The caller supplies the observed numbers; this module decides, and explains.
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -261,6 +276,12 @@ class ParseResult:
     #: FILE-COARSE, and an operator must be able to see that the comparison happened
     #: at file granularity rather than at test-id granularity.
     runner: list[str] = field(default_factory=list)
+    #: The `pipeline-compliance` gate ids that entered ``ids`` (#1185) — reported
+    #: separately for the same reason as the families above: this identity came
+    #: from a GATE CHECK, not from a test, so the remedy is the artifact the check
+    #: names (`record-review.sh` for (c), a scoping comment for (b)) rather than a
+    #: re-run.
+    pipeline_checks: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -403,10 +424,19 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
         # family replaces the other; both are produced from the same capture.
         runner_ids, _runner_signatures = runner_aggregate_failures(lines)
         ids.extend(runner_ids)
+        # Pass 6 — PIPELINE-COMPLIANCE gate failures (#1185). Same treatment and
+        # the same reason: `check-pipeline-compliance.sh` prints `❌ [<letter>] …`
+        # and no shape-checking pass above can see it, so the dominant red in the
+        # queue was refused as unattributable. Raw-log only, and read through the
+        # SAME helper the `signatures` door uses, so the two doors cannot disagree
+        # about this universe.
+        pipeline_ids, _pipeline_signatures = pipeline_check_failures(lines)
+        ids.extend(pipeline_ids)
     return ParseResult(
         ids=sorted(set(ids)), rejected=rejected, guard_steps=guard_steps,
         non_nodeid=sorted(set(non_nodeid)),
         runner=sorted(set(runner_ids)) if raw_log else [],
+        pipeline_checks=sorted(set(pipeline_ids)) if raw_log else [],
     )
 
 
@@ -548,7 +578,14 @@ class Verdict:
     @property
     def line(self) -> str:
         mark = "BLOCK " if self.blocked else "EXEMPT"
-        return f"{mark}: {self.nodeid}  {self.reason}"
+        # #1185: a `pipeline-compliance` gate id says WHICH check blocked the PR
+        # and on what — `blocked by check (c): <subject>` — so the refusal is
+        # actionable instead of "unattributable". Presentation only: the note is
+        # derived from the id, never from a re-read of the log, and it can neither
+        # clear nor create a block (the family's own `blocked` flag is unchanged).
+        note = pipeline_check_note(self.nodeid) if self.blocked else ""
+        prefix = f"{note} — " if note else ""
+        return f"{mark}: {self.nodeid}  {prefix}{self.reason}"
 
 
 @dataclass
@@ -1033,12 +1070,180 @@ _TRAILER_RE = re.compile(
 # A section boundary that ends the current failure block.
 _BLOCK_END_RE = re.compile(r"^(?:={3,}|-{3,}|Captured\b).*$")
 
+# A MEASURED DURATION is substrate too — and it is the one substrate axis the
+# mask list was missing (tortoise #9331). An assertion message that interpolates
+# its own measurement (``elapsed < 1.2, f"local EP took {elapsed:.2f}s …"``) has
+# a DIFFERENT signature on every run, so `_signatures_overlap`'s SUBSET rule can
+# never hold for it: an id main measures red at 25% is BLOCKed forever as
+# "same id, a DIFFERENT failure" — and blocked randomly, depending on which run
+# sampled the timer. Measured on tortoise PR logs:
+#
+#   BLOCK : tests/test_ep_local_395.py::test_ac5_interactive_latency_zone
+#           signature differs from main's (1/1 (100%) vs 1/4 (25%))
+#
+# The mask is narrowed on THREE axes, and one BOUND axis is DELIBERATELY declared
+# as a residual. Each decision below is grounded in a measured phrasing, because
+# four review cycles each found a hole in the previous cut's shape:
+#
+#   1. A TIME UNIT must follow the number. A bare number stays SIGNAL —
+#      ``expected status 403, got 404``, ``orphaned servers: 16 (threshold: 12)``,
+#      ``91.2%`` and ``12/40`` are the DATA a failure is about.
+#   2. The value must be FRACTIONAL (``1.21``, ``0.12``): a perf-counter
+#      interpolation (``{elapsed:.1f}``/``:.2f``/``:.3f``) is fractional by
+#      construction, and an INTEGER bound — ``≤1s``, ``after 30s``, ``budget 300s``,
+#      the overwhelming majority of declared bounds in this repo — is untouched.
+#   3. The UNIT and the SLOT survive into the token (``<MEAS1:s>`` vs
+#      ``<MEAS1:ms>``), so a change of SCALE (``1.21ms`` vs ``1.21s``) and a
+#      message that gains or loses a duration both stay signal.
+#
+# A COMPARISON OPERATOR is the ONE bound marker honoured: ``≤1.5s``, ``<= 1.5s``,
+# ``<0.1s``, ``>= 2.5s`` is left RAW, because an operator-prefixed value is a
+# limit by construction and a PR that MOVES it is a different failure.
+#
+# WHY THERE IS NO BOUND-NOUN LIST (the four cycle-deep measurement). The tempting
+# next step — leave a duration raw when a word like bound/budget/limit/timeout is
+# nearby — was implemented, reviewed and REMOVED, because this repo uses the SAME
+# nouns for the MEASUREMENT side of the message:
+#
+#   tests/test_engine_probe.py:152      f"probe exceeded its bound: {elapsed:.2f}s"
+#   tests/test_markers.py:1370          f"probe overran its bound: {elapsed:.2f}s"
+#   tests/test_monitoring.py:1363       f"metrics() did not honour the count budget: {…}s"
+#   tests/test_bounded_raw_clients_3065 f"bound not consumed as a bound: {elapsed:.2f}s"
+#
+# A noun list therefore fails BOTH ways at once: it misses phrasings it does not
+# enumerate (``bounded at 0.05s``, ``at most 1.5s``, ``up to 1.5s``, ``worst case
+# 1.50s`` — measured in tests/test_monitoring.py:570, test_session_auth.py:1139,
+# test_ship_test_onboarding.py:5304) and it MISFIRES on the labels above, leaving
+# the #9331 signature volatile for 7 of 8 real duration messages. Every wording
+# added to the list moved the hole rather than closing it.
+#
+# DECLARED RESIDUALS (each PINNED by a test, not asserted in prose):
+#
+#   * a FRACTIONAL bound written as a noun phrase or a label — ``on a 0.1s bound``,
+#     ``budget 3.0s``, ``bounded at 0.05s`` — is masked, so a PR that moves such a
+#     bound alone compares equal. Accepted and declared rather than chased: the
+#     value IS what varies per run, so preserving values would defeat the mask
+#     entirely, and the exemption still has to clear the independent backstops
+#     (`min_runs` floor, main-present, and the rate comparison, #5250) — it is not
+#     a free pass on a PR-unique failure. Pinned by
+#     ``test_9331_a_fractional_noun_phrase_bound_is_a_declared_residual``.
+#   * pytest renders a message-less elapsed assertion as ``assert 1.47 < 1.2`` —
+#     unit-less, indistinguishable from the data a failure is about
+#     (``test_9331_the_unitless_assert_expansion_is_a_declared_residual``);
+#   * an integer-rendered measurement (``{elapsed:.0f}s``) stays volatile, by (2);
+#   * a duration used as DATA with no operator (``measured 10.36 s of the
+#     control's 10.85 s``) is masked in both slots
+#     (``test_9331_a_duration_used_as_data_is_a_declared_residual``);
+#   * units outside the list (``1.5m``, ``1.5h``, ``3 days``) and uppercase units
+#     (``1.2S``) are not masked — under-masking is the fail-CLOSED direction, so
+#     the list grows only on evidence
+#     (``test_9331_out_of_list_units_stay_volatile``).
+_MEASURED_DURATION_RE = re.compile(
+    # ``(?<![\d.])``: without a left anchor ``\d+`` is RETRIED at every offset
+    # inside a long digit run, so a 40 KB run of digits cost 3.47 s and the cost
+    # quadrupled per doubling (cycle 9). Every other number pattern in this list is
+    # left-bounded for the same reason; this one was not.
+    r"(?<![\d.])(?P<num>\d+\.\d+)\s?"
+    r"(?P<unit>ns|us|µs|μs|ms|seconds|second|secs|sec|minutes|minute|mins|min|s)"
+    # ``(?![A-Za-z_])`` rather than ``(?!\w)``: a unit followed by a DIGIT still
+    # masks, so normalisation is IDEMPOTENT for duration text (``1.5s1.7s``
+    # masked once == masked twice). The row readers re-normalise what the writer
+    # normalised, so a non-idempotent step would make writer≠reader and fail the
+    # subset rule closed.
+    #
+    # NON-IDEMPOTENT BY CONSTRUCTION, and declared rather than relied on: a mask
+    # anchored on a LEFT NON-WORD boundary becomes applicable only AFTER the
+    # duration mask replaces the unit letter with ``>`` — ``1.5s746b295c`` →
+    # ``<MEAS1:s>746b295c`` on pass 1, ``<MEAS1:s><HEX>`` on pass 2, and the same
+    # shape holds for ``1.5s0x1f`` → ``<MEAS1:s><ADDR>``. A host:port suffix is NOT
+    # in this class: its port must be NUMERIC, so ``1.5slocalhost:8080`` never masks
+    # (the unit lookahead rejects the letter that follows) while ``1.5s127.0.0.1:8080``
+    # does. This is reachable ONLY when a duration is emitted
+    # immediately before such an id, which pytest text does not do; the two-pass
+    # result is pinned by
+    # ``test_9331_a_duration_before_an_id_stays_a_declared_two_pass_residual`` so a
+    # future producer that reads a raw signature column sees the shape named instead
+    # of discovering it as a permanent block (review cycle 8).
+    r"(?![A-Za-z_])"
+)
+
+#: A comparison operator is the ONE bound marker honoured: a value prefixed by one
+#: is a LIMIT, so a PR that moves it is a different failure. A bare ``=`` is NOT
+#: one (``elapsed=1.21s`` is an interpolation), and the branch is ANCHORED to the
+#: window edge so an earlier ``<`` cannot free a later measurement.
+#: ``_BOUND_OPERATOR_RE``. The ``(?<![-=>])`` guards an ARROW: ``->`` and ``=>``
+#: end in ``>`` and ``=`` but are not comparisons, so without the guard
+#: ``phase collect -> 1.21s`` left the measurement RAW and stayed volatile — an
+#: undeclared residual that kept #9331 open for that phrasing (cycle 9).
+_BOUND_OPERATOR_RE = re.compile(r"(?<![-=>])(?:[<>≤≥]=?|==)\s*$")
+
+#: An ALREADY-MASKED token (``<ADDR>``, ``<HOSTPORT>``, ``<MEAS1:s>``, ``<N>``…).
+#: It is stripped from the left window before the operator test, because these
+#: tokens END IN ``>`` — and that ``>`` is the closing delimiter of a mask, not a
+#: comparison: without this, ``0x1f 1.21s`` read ``>`` as an operator and left the
+#: measurement RAW, re-creating the #9331 block for any message where a masked id
+#: precedes the timer (review cycle 6).
+#:
+#: EVERY token this module can emit is enumerated, because a SHAPE rule cannot
+#: tell a mask from ordinary comparison text. Cycle 8 narrowed the pattern to
+#: ``<[A-Za-z_][^<>]{0,23}>`` ("the inner text starts with a name") and cycle 9
+#: measured that still open: in ``assert a<b and p99 >= 2.5s`` the span
+#: ``<b and p99 >`` starts with a letter, so it was stripped, the operator with it,
+#: and a MOVED bound was masked into one signature — the fail-OPEN direction this
+#: strip exists to prevent. An explicit alternation of the masks actually emitted
+#: (``<ADDR>``, ``<UUID>``, ``<HEX>``, ``<HOSTPORT>``, ``<N>``, ``team_<X>``,
+#: ``<MEAS<n>:<unit>>``) is closed, so comparison text can never match it.
+_MASKED_TOKEN_RE = re.compile(
+    r"<(?:ADDR|UUID|HEX|HOSTPORT|N|X|MEAS\d+:[A-Za-zµμ]+)>"
+)
+
+
+def _mask_measured_duration(m: re.Match[str]) -> str:
+    """``<MEAS<slot>:<unit>>`` for a MEASUREMENT; an operator-prefixed bound stays RAW.
+
+    The slot is the index of the duration-SHAPED number in the message, so a
+    message that gains or loses a duration never collides with the shorter one.
+    See the ``_MEASURED_DURATION_RE`` block for the bound rule and every declared
+    residual (a noun-phrase bound is masked on purpose).
+    """
+    before = _MASKED_TOKEN_RE.sub(
+        " ", m.string[max(0, m.start() - 32):m.start()]
+    )
+    if _BOUND_OPERATOR_RE.search(before):
+        return m.group(0)
+    # The slot is the ordinal of this duration-SHAPED number in the message. It is
+    # read from ONE precomputed pass rather than recounted per match: the previous
+    # form re-scanned the whole prefix inside every match — O(n x k) — and a
+    # duration-dense line cost 4.9 s at 60 KB (review cycle 7, finding 1). The table
+    # is cached per string because the writer and the row readers normalise the SAME
+    # text, and it is keyed on that text, so no state outlives a call.
+    slot = _duration_slot_table(m.string)[m.start()]
+    return f"<MEAS{slot}:{m.group('unit')}>"
+
+
+@functools.lru_cache(maxsize=8)
+def _duration_slot_table(text: str) -> dict[int, int]:
+    """``{match start: ordinal}`` for every duration-shaped number in ``text``.
+
+    One left-to-right pass: a match's ordinal among its siblings IS its slot, which
+    is exactly what the per-match prefix recount computed, so this is a constant-
+    factor change (linear instead of quadratic), not a change of the mask's meaning.
+    ``maxsize`` is small on purpose: the only texts cached are the failure messages
+    of one decision.
+    """
+    return {
+        mm.start(): i
+        for i, mm in enumerate(_MEASURED_DURATION_RE.finditer(text), 1)
+    }
+
+
 # Volatile substrate IDENTIFIERS, each one named by measured evidence. The mask
 # list is deliberately CLOSED and documented: over-normalising is the fail-OPEN
 # direction (two different failures collapsing into one signature would make a
 # PR's signature set a subset of main's more easily), so nothing is masked that
-# the evidence does not demand. Ids/addresses/tenants only — never data values.
-_VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str], ...] = (
+# the evidence does not demand. Ids/addresses/tenants/measurements only — never
+# data values.
+_VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
     (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<ADDR>"),
     (
         re.compile(
@@ -1056,6 +1261,10 @@ _VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str], ...] = (
     # declared interpolation; the stable part is its shape.
     (re.compile(r"\bteam_[A-Za-z0-9][A-Za-z0-9_]{0,63}\b"), "team_<X>"),
     (re.compile(r"\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d{2,5}\b"), "<HOSTPORT>"),
+    # Last, and context-aware: a fractional duration that is a MEASUREMENT is the
+    # machine's, not the assertion's (#9331); an operator-prefixed bound is
+    # signal. The unit and the slot ride the token so SCALE and COUNT stay signal.
+    (_MEASURED_DURATION_RE, _mask_measured_duration),
 )
 
 
@@ -1079,6 +1288,9 @@ class SignatureParse:
     non_nodeid: list[str] = field(default_factory=list)
     #: The RUNNER-AGGREGATE ids that entered ``ids`` — same reason (file-coarse).
     runner: list[str] = field(default_factory=list)
+    #: The `pipeline-compliance` gate ids that entered ``ids`` (#1185) — same
+    #: reason: a gate check is not a test, and its remedy is named by the check.
+    pipeline_checks: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -1245,8 +1457,9 @@ _NON_NODEID_KEY_RE = re.compile(
 def is_failure_key(key: str) -> bool:
     """Is ``key`` in the universe the RATE table accepts (#4469)?
 
-    A pytest nodeid, a guard-step identity AND a non-nodeid failure identity
-    (#6798) are all failure keys; the same predicate must gate
+    A pytest nodeid, a guard-step identity, a non-nodeid failure identity
+    (#6798) AND a `pipeline-compliance` gate identity (#1185) are all failure
+    keys; the same predicate must gate
     :func:`parse_rates`, or main's rate row is dropped and every such failure
     reads as PR-unique forever.
 
@@ -1263,6 +1476,7 @@ def is_failure_key(key: str) -> bool:
         _NODEID_RE.match(key)
         or _GUARD_KEY_RE.match(key)
         or _NON_NODEID_KEY_RE.match(key)
+        or _PIPELINE_KEY_RE.match(key)
     )
 
 
@@ -1272,6 +1486,7 @@ def is_failure_key_loose(key: str) -> bool:
         _NODEID_LOOSE_RE.match(key)
         or _GUARD_KEY_RE.match(key)
         or _NON_NODEID_KEY_RE.match(key)
+        or _PIPELINE_KEY_RE.match(key)
     )
 
 
@@ -1478,6 +1693,165 @@ def runner_aggregate_failures(
         key = f"{_RUNNER_KEY_PREFIX}{_slug(m.group('label'))}"
         ids.append(key)
         signatures[key] = frozenset({_RUNNER_AGG_SIG})
+    return sorted(set(ids)), signatures
+
+
+# ==========================================================================
+# HALF 1c (#1185) — PIPELINE-COMPLIANCE GATE ATTRIBUTION
+# ==========================================================================
+#
+# THE DEFECT. `scripts/check-pipeline-compliance.sh` is the gate that BINDS the
+# review attestation to a head (check (c)), and it is the DOMINANT red in the
+# queue: `aiconsol`'s sweep of all 70 open agent-infra PRs (2026-10-24 04:42Z)
+# found `pipeline-compliance (c)` the top blocker. The gate announces a failure in
+# a THIRD shape, and the id universe knew only two — pytest's `FAILED <nodeid>`
+# and a guard step's `::error::` annotation (HALF 1b) — so a run whose ONLY
+# failing job was this gate yielded `examined=1 extracted=0` and the rail told the
+# operator, on three separate PRs (#2430, #2608, #2623):
+#
+#   yielded NO parseable failure identity … This is a refusal, not a comparison.
+#
+# …about a log that said, in plain text:
+#
+#   ❌ [c] no head-bound code-review record for daniel-ospina/agent-infra#2623 — check (c) accepts ONLY …
+#   ❌ PIPELINE COMPLIANCE: BLOCKED (1 failure(s)).
+#
+# MEASURED on agent-infra #2623, run 40066552772 (job `pipeline-compliance`, head
+# d1024c5d): `ci_exemption.py ids` on that exact capture returned `ids=0`, which
+# reproduces the refusal on real data — so a lane was told "we cannot say why"
+# when the answer was "run record-review.sh at this head".
+#
+# THE EMITTER'S SHAPE, from `fail()` in scripts/check-pipeline-compliance.sh (all
+# 13 call sites):
+#
+#   ❌ [<letter>] <short reason> — <long explanation>
+#   ❌ PIPELINE COMPLIANCE: BLOCKED (<N> failure(s)).   <- SUMMARY, never an identity
+#
+# Three facts shape this parser, and each is load-bearing:
+#
+#   * THE LETTER IS THE CHECK, and a letter names a STABLE artifact the operator
+#     acts on: (a) linked issue, (b) scoping comment, (c) head-bound review
+#     record, (d) plan evidence, (e) test coverage. The SUBJECT is what the check
+#     failed ON; every message is written `<reason> for/on <subject>`, so the
+#     FIRST CLAUSE carries it (check (c): "… for daniel-ospina/agent-infra#2623").
+#   * THE IDENTITY STOPS AT THE FIRST ` — `. Everything after it is the long
+#     explanation, and it carries VOLATILE text: check (c)'s own text embeds the
+#     head sha (`… at the CURRENT head (d1024c5def3e…)`), so an identity built
+#     from the whole line would be unique to ONE head, could never match any
+#     baseline, and would arrive as the #3756 rotating-identity class — which is
+#     never a merge, i.e. the permanent false refusal again in a new costume.
+#   * THE SUMMARY LINE IS NOT AN IDENTITY. `❌ PIPELINE COMPLIANCE: BLOCKED (N
+#     failure(s)).` carries a COUNT and no artifact, so keying on it would make
+#     the identity track the number of failures — the same volatility by another
+#     route. The pattern below requires the bracketed letter, so it cannot match;
+#     the property is pinned by a test rather than left to the reader.
+#
+# ⛔ IT CAN ONLY ADD IDENTITIES, NEVER REMOVE ONE (the fail-closed direction), and
+# it does NOT make the gate passable. The key enters the SAME comparison every
+# other family uses: main's baseline cannot carry `pipeline-compliance::c::…`
+# because the gate runs on `pull_request_target` only, so the id is ABSENT FROM
+# MAIN and the decision REFUSES it (the #7734 branch) — a genuinely failing check
+# on the PR's own tree still blocks. What changes is the REASON, not the verdict:
+# `blocked by check (c): <subject>` instead of "unattributable".
+_PIPELINE_KEY_PREFIX = "pipeline-compliance::"
+
+#: The gate's failure marker, ANCHORED at the start of the line's CONTENT — the
+#: same anchor discipline `_ANNOTATION_RE` uses, and for the same measured reason:
+#: `gh run view` echoes the workflow's own SOURCE, so a mid-line search would
+#: manufacture a phantom identity from an `echo "❌ …"` line. The emoji is pinned
+#: rather than a `[❌✗]` class: a NARROWER pattern can only MISS an identity (which
+#: blocks exactly as before), while a wider one can misattribute a line it never
+#: saw. `\s*` after the emoji absorbs the markdown-bold rendering some emitters
+#: apply; the letter is bounded because a longer token is not a check name.
+_PIPELINE_CHECK_RE = re.compile(
+    r"^❌\s*\[(?P<letter>[a-z]{1,4})\]\s+(?P<text>\S.*)$"
+)
+
+#: A commit-ish token inside a clause, masked so an identity that happens to name
+#: a sha cannot drift per head (see the section header). `\b` on both sides so a
+#: word is never eaten out of a longer token.
+_SHA_LIKE_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+#: The CLI's whitespace-free key, and the ONLY shape `is_failure_key` admits for
+#: this family. The charset is exactly `_slug`'s, so the key survives the
+#: `uniq -c | awk` rate table and the provenance files.
+_PIPELINE_KEY_RE = re.compile(
+    r"^pipeline-compliance::(?P<letter>[a-z]{1,4})::(?P<subject>[A-Za-z0-9_.\-]+)$"
+)
+
+#: A subject slug is CAPPED so one pathological message cannot mint an unbounded
+#: key. Two messages sharing an 80-char prefix collapse into ONE identity —
+#: harmless and DECLARED: both are the same check failing, which is the
+#: granularity the key asserts (`job-unreadable::` records the same trade for its
+#: job slugs).
+_PIPELINE_SUBJECT_MAX = 80
+
+
+def _pipeline_subject(text: str) -> str:
+    """The SUBJECT slug of a gate failure message — stable across runs and heads.
+
+    The FIRST CLAUSE is the subject: the emitter writes every failure as
+    ``<reason> for/on <subject>``, and everything after the first `` — `` is the
+    long explanation, which carries the head sha for check (c) (see the section
+    header). With no separator (a reworded message) the first 12 WORDS are used —
+    by words, never by characters, so the fallback cannot cut a token in half.
+    """
+    clause, sep, _rest = text.partition(" — ")
+    if not sep:
+        clause = " ".join(text.split()[:12])
+    clause = " ".join(_SHA_LIKE_RE.sub("<sha>", clause).split())
+    return _slug(clause)[:_PIPELINE_SUBJECT_MAX].strip("-") or "unknown"
+
+
+def pipeline_check_key(letter: str, subject: str) -> str:
+    """``pipeline-compliance::<letter>::<subject>`` — one whitespace-free identity."""
+    return f"{_PIPELINE_KEY_PREFIX}{_slug(letter)}::{subject}"
+
+
+def pipeline_check_note(key: str) -> str:
+    """``blocked by check (<letter>): <subject>`` for a gate id, else ``''``.
+
+    THE ONE RENDERING of this family's identity, used by :attr:`Verdict.line` and
+    by the ``ids`` door's stderr note, so the operator reads the same sentence
+    wherever the id surfaces. Returning ``''`` for every other family is what
+    keeps the note off the ~5 other id shapes the rail compares.
+    """
+    m = _PIPELINE_KEY_RE.match(key)
+    if m is None:
+        return ""
+    return f"blocked by check ({m.group('letter')}): {m.group('subject')}"
+
+
+def pipeline_check_failures(
+    text: str,
+) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(ids, {id: {signature}})`` for ``check-pipeline-compliance.sh`` failures.
+
+    ONE helper for BOTH doors, exactly as ``guard_step_failures``,
+    ``non_nodeid_failures`` and ``runner_aggregate_failures`` are: the ``ids`` CLI
+    and the ``signatures`` CLI must not disagree about this universe OR its
+    signature (an id signed by one door and not the other fails §4.6's subset
+    rule closed, so the identity would BLOCK instead of compare).
+
+    The signature is the subject slug — the same text the key's tail carries, so
+    "same id" and "same failure" coincide for this family and the subset rule
+    compares like with like.
+    """
+    ids: list[str] = []
+    signatures: dict[str, frozenset[str]] = {}
+    for line in _log_lines(text):
+        if not line:
+            continue
+        # Markdown-bold is stripped BEFORE the match, the same way the
+        # runner-aggregate pass does: an emoji+marker wrapped in `**` pairs would
+        # otherwise match NOTHING against the capture it exists for.
+        m = _PIPELINE_CHECK_RE.match(line.replace("**", ""))
+        if m is None:
+            continue
+        subject = _pipeline_subject(m.group("text"))
+        key = pipeline_check_key(m.group("letter"), subject)
+        ids.append(key)
+        signatures[key] = frozenset({subject})
     return sorted(set(ids)), signatures
 
 
@@ -1775,6 +2149,15 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
         signatures[key] = frozenset(sigs)
     id_list.extend(runner_keys)
 
+    # Pass 6 — PIPELINE-COMPLIANCE gate failures (#1185). Same helper, same
+    # reason as Pass 5: without it the `signatures` door exits 1 on a
+    # gate-only capture and ci-failure-set.sh treats that as FATAL, which would
+    # RELOCATE the refusal instead of removing it.
+    pipeline_keys, pipeline_signatures = pipeline_check_failures(text)
+    for key, sigs in pipeline_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(pipeline_keys)
+
     return SignatureParse(
         ids=sorted(set(id_list)),
         signatures=signatures,
@@ -1784,6 +2167,7 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
         guard_steps=guard_keys,
         non_nodeid=non_nodeid_keys,
         runner=runner_keys,
+        pipeline_checks=pipeline_keys,
     )
 
 
@@ -1948,7 +2332,8 @@ def _cmd_ids(args: argparse.Namespace) -> int:
         f"unattributable={len(parsed.rejected)} "
         f"guard-steps={len(parsed.guard_steps)} "
         f"non-nodeid={len(parsed.non_nodeid)} "
-        f"runner={len(parsed.runner)}",
+        f"runner={len(parsed.runner)} "
+        f"pipeline-checks={len(parsed.pipeline_checks)}",
         file=sys.stderr,
     )
     # A RUNNER-AGGREGATE identity is FILE-COARSE, and the operator must be able to see
@@ -1973,6 +2358,17 @@ def _cmd_ids(args: argparse.Namespace) -> int:
     for key in parsed.non_nodeid:
         print(
             f"ci-exemption: NON-NODEID failure ATTRIBUTED (comparison, not refusal): {key}",
+            file=sys.stderr,
+        )
+    # #1185: NAME the check, and what it is about. The rail's remedy for a gate
+    # failure is NOT a re-run — it is the artifact the check names
+    # (`record-review.sh` at this head for (c), a scoping comment for (b)) — so an
+    # id that did not say WHICH check failed left the operator to guess, which is
+    # the refusal this half removes.
+    for key in parsed.pipeline_checks:
+        print(
+            "ci-exemption: PIPELINE-COMPLIANCE gate failure ATTRIBUTED (a gate "
+            f"check, no test nodeid): {key} — {pipeline_check_note(key)}",
             file=sys.stderr,
         )
     return 0
@@ -2001,7 +2397,8 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
         f"unattributed={len(parsed.unattributed)} "
         f"guard-steps={len(parsed.guard_steps)} "
         f"non-nodeid={len(parsed.non_nodeid)} "
-        f"runner={len(parsed.runner)}",
+        f"runner={len(parsed.runner)} "
+        f"pipeline-checks={len(parsed.pipeline_checks)}",
         file=sys.stderr,
     )
     for key in parsed.runner:
@@ -2012,6 +2409,12 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
     for key in parsed.non_nodeid:
         print(
             f"ci-exemption: NON-NODEID failure ATTRIBUTED (comparison, not refusal): {key}",
+            file=sys.stderr,
+        )
+    for key in parsed.pipeline_checks:
+        print(
+            "ci-exemption: PIPELINE-COMPLIANCE gate failure ATTRIBUTED (a gate "
+            f"check, no test nodeid): {key} — {pipeline_check_note(key)}",
             file=sys.stderr,
         )
     return 0 if parsed.ok else 1

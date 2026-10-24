@@ -380,6 +380,10 @@ refresh_on_exit() {
   local rc=$?
   gh_pass_cache_stop
   rm -f "${UNUSABLE_LOG:-}" 2>/dev/null
+  # ⛔ NEVER UNLINK /dev/null. The degraded redirect above can point there, and `rm -f /dev/null`
+  # succeeds as root (review of #2401, fourth round). uid-1000 controllers are unaffected either
+  # way; the guard costs one test and removes a footgun from a root-run supervisor.
+  [ "${PRE_ERR_FILE:-}" = "/dev/null" ] || rm -f "${PRE_ERR_FILE:-}" 2>/dev/null
   [ "$REFRESH_RECORDED" = "1" ] && return 0
   REFRESH_RECORDED=1
   if [ "$rc" -eq 0 ]; then
@@ -547,12 +551,104 @@ fi
 # resolve it exactly as the pre-flight's own calls do. Neither touches any OTHER host, so an unrelated
 # host's problem cannot change the answer (an UNSCOPED `gh auth status` would — it validates them all).
 
+# ── THE PROBE MUST BE ABLE TO GIVE UP (TOKEN_HANG_FIX) ──────────────────────────────────────────
+# MEASURED 2026-10-21 on these cell images: `gh auth token` does not fail, it HANGS (rc=142 under an
+# alarm, stdin closed, GH_TOKEN unset). The presence probe below captured it UNBOUNDED, so
+# `refresh-candidates.sh` stalled forever at stage=provision — every pass recorded `STALE(800m)` and
+# ORIGINATION NEVER RAN all session, silently, because the only trace of a pass that never returns is
+# the absence of the next one. A probe with no bound is not a precondition check; it is an outage.
+#
+# So the probe is bounded three ways, and NONE of them can turn a non-answer into a permanent verdict:
+#   1. A token in the ENVIRONMENT is presence, KNOWN, and is answered WITHOUT invoking gh at all
+#      (`gh` itself treats GH_TOKEN/GITHUB_TOKEN as a credential, so this is the same question asked
+#      offline — the env short-circuit is not a shortcut, it is the cheap half of the same predicate).
+#   2. Every gh probe runs under an ALARM with STDIN CLOSED. Both halves matter: the bound stops a
+#      wedged helper, and `</dev/null` stops a keyring/gpg/credential-helper prompt from parking the
+#      process forever on a read that can never be answered on a headless box.
+#   3. A probe that cannot answer within the bound is PRESENCE UNKNOWN, said out loud and returned
+#      TRANSIENT. It is never PERMANENT: a hang says nothing about whether a credential exists, and
+#      the permanent marker is human-only-clearable, so classifying a hang as "not provisionable"
+#      would latch a cell MERGE-ONLY for a fault a retry can lose.
+# The bound is the repo's established idiom (`perl -e 'alarm shift; exec @ARGV'`, admin-merge.sh:5179 —
+# macOS ships no `timeout`), with GNU `timeout` as the second choice and a LOUD un-bounded warning as
+# the last resort, because an unbounded probe that silently claims to be bounded is the defect itself.
+GH_PROBE_TIMEOUT="${GH_PROBE_TIMEOUT:-20}"
+case "$GH_PROBE_TIMEOUT" in ''|*[!0-9]*) GH_PROBE_TIMEOUT=20 ;; esac
+[ "$GH_PROBE_TIMEOUT" -ge 1 ] 2>/dev/null || GH_PROBE_TIMEOUT=20
+# ANY signal death is a NON-ANSWER, not a verdict. 142 = SIGALRM (the alarm this repo's bound uses),
+# 124 = GNU `timeout`'s spelling, and every other 128+N (130=INT, 134=ABRT, 137=KILL, 139=SEGV,
+# 143=TERM, …) is the probe being KILLED — a killed probe says nothing about whether a credential exists.
+# ⛔ THE WHOLE 128+N RANGE, NOT A LIST. The first version enumerated {142,124,137}, so a probe that died
+# of SIGTERM/SEGV/ABRT fell through to the "no credential STORED" arm and latched the human-only-clear
+# MERGE-ONLY marker — the same non-answer-read-as-absence this fix exists to close, one signal over
+# (measured by review on this PR).
+gh_probe_timed_out() { case "${1:-}" in 12[4-9]|1[3-9][0-9]) return 0 ;; *) return 1 ;; esac; }
+# ⛔ THE BOUND MUST KILL THE PROCESS GROUP, AND THE CAPTURE MUST NOT BE A PIPE (this is the difference
+# between a bound that works and one that only looks like it — measured while writing this fix).
+# `$( … )` reads until EVERY writer closes the pipe, so an alarm that kills the gh shell while its own
+# child (a credential helper's `sleep`, a hung `gpg`) still holds stdout returns rc=142 IMMEDIATELY and
+# then PARKS THE PASS for the child's whole lifetime: the first version of this fix printed the right
+# "PRESENCE UNKNOWN" line and took 5m0s to exit. So:
+#   * the child is put in its OWN process group (`setpgrp`, the idiom scratch-worktree.sh:689 already
+#     uses) and the alarm KILLs the GROUP — a helper cannot outlive its probe;
+#   * stderr goes to a FILE and stdout is discarded (gh auth token prints the TOKEN; it must never
+#     reach a log), so no pipe exists for an orphan to hold open.
+GH_PROBE_ERR=""
+# ⛔ THE ERROR FILE IS A SENTINEL THAT MAY ALIAS A REAL DEVICE. When ${TMPDIR} is unwritable the path
+# falls back to `/dev/null`, and an unguarded `rm -f "$GH_PROBE_ERR"` on an exit path then deletes THE
+# DEVICE NODE (silently refused for an unprivileged user, destructive for root). One cleanup point, with
+# the guard in it, instead of six call sites that each have to remember.
+gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; esac; rm -f "$GH_PROBE_ERR" 2>/dev/null || true; }
+gh_probe_bounded() { # gh_probe_bounded <secs> <cmd…>; sets GH_PROBE_ERR (stderr of the probe)
+  local _s="$1"; shift
+  # ⛔ RELEASE THIS FUNCTION'S OWN PREVIOUS PROBE FILE FIRST. Every call mints a NEW `mktemp` path and
+  # reassigns GH_PROBE_ERR, so without this the prior call's file is orphaned — and the harness makes
+  # TWO calls (the credential probe, then the rate-limit probe), so the common path leaked one 0-byte
+  # file per refresh pass. The cleanup helper is the single guarded `rm` site, so calling it here adds
+  # no second `rm -f "$GH_PROBE_ERR"` and the funnel's "exactly ONE code-level rm" assertion holds.
+  gh_probe_err_cleanup
+  # ⛔ AN UNPREDICTABLE NAME WITH O_EXCL, never `$$` in a world-writable dir. A pid-derived name is
+  # guessable by any other local user, and `: >` follows a symlink — so a peer on a shared cell
+  # could pre-create that path as a symlink and have this harness truncate an arbitrary file. The
+  # stderr this captures holds `gh`'s output (never logged, per the note above), so it must not be
+  # readable either: mktemp gives an unpredictable name and mode 0600.
+  GH_PROBE_ERR="$(mktemp "${TMPDIR:-/tmp}/.refresh-gh-probe.XXXXXX" 2>/dev/null)" || GH_PROBE_ERR=/dev/null
+  [ -n "$GH_PROBE_ERR" ] || GH_PROBE_ERR=/dev/null
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'my $t=shift; my $pid=fork(); if(!defined $pid){ exit 125 }
+             if($pid==0){ setpgrp(0,0); exec @ARGV; exit 127 }
+             $SIG{ALRM}=sub{ kill("KILL", -$pid); exit 142 };
+             alarm $t; waitpid($pid,0); alarm 0;
+             # ⛔ A SIGNAL DEATH IS NOT A SUCCESS. Perl puts a signal death in the LOW byte of $?, so a
+             # bare `exit($? >> 8)` reports 0 for a child killed by SIGKILL/SIGSEGV — an OOM-killed `gh`
+             # would read as "credential present, API answered" and the whole pre-flight would be blessed
+             # off a probe that never answered. Re-spell it as 128+N (the shell convention, and the same
+             # thing `exec`ed perl reports), so a killed probe is a non-answer here too.
+             exit(($? & 127) ? 128 + ($? & 127) : ($? >> 8))' \
+      "$_s" "$@" </dev/null >/dev/null 2>"$GH_PROBE_ERR"
+  elif command -v timeout >/dev/null 2>&1; then
+    # GNU `timeout` runs the child in its own process group and signals that GROUP (no --foreground),
+    # so this arm has the same property; `--kill-after` covers a helper that ignores SIGTERM.
+    timeout --kill-after=2 "$_s" "$@" </dev/null >/dev/null 2>"$GH_PROBE_ERR"
+  else
+    echo "[refresh] WARN: neither perl nor timeout is on PATH, so the gh probe CANNOT be bounded — a hanging gh will stall this pass (install perl or coreutils)" >&2
+    "$@" </dev/null >/dev/null 2>"$GH_PROBE_ERR"
+  fi
+}
+
 # 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
 gh_probe_env() {
-  local terr err
+  local terr err prc presence=""
   if ! command -v gh >/dev/null 2>&1; then
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  # ⛔ THE ENV TOKEN IS PRESENCE, AND IT COSTS NO gh CALL. `gh` documents GH_TOKEN/GITHUB_TOKEN as its
+  # own credential sources, so an env token is the credential the pre-flight's calls will use — asking
+  # `gh auth token` about it asks a question whose answer is already in hand, and on the measured
+  # images that question is exactly the one that hangs.
+  if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
+    presence=env
   fi
   # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. Presence and validation have to
   # be TWO questions, because no single hosted call answers both without naming a host. `gh auth
@@ -563,15 +659,42 @@ gh_probe_env() {
   # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring),
   # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
   # captured stream is STDERR ONLY (`2>&1 >/dev/null`), so no token can reach the log.
-  if ! terr="$(gh auth token 2>&1 >/dev/null)"; then
-    echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
-    printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
-    echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
-    return "$EXIT_NOT_PROVISIONABLE"
+  # ⛔ BOUNDED, STDIN CLOSED, AND A NON-ANSWER IS NOT AN ABSENCE (TOKEN_HANG_FIX). See the block above
+  # `gh_probe_bounded`. MEASURED rc=142: an unbounded capture here is what stalled the funnel forever.
+  if [ -z "$presence" ]; then
+    gh_probe_bounded "$GH_PROBE_TIMEOUT" gh auth token; prc=$?
+    terr="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
+    if gh_probe_timed_out "$prc"; then
+      echo "[refresh] TRANSIENT: gh credential PRESENCE UNKNOWN — 'gh auth token' did not answer within ${GH_PROBE_TIMEOUT}s in the environment the pre-flight runs in (HOME=$HOME), so whether a credential is stored here CANNOT BE VERIFIED from this box (rc=$prc). This is NOT 'no credential': a probe that cannot answer is a fact about the probe, not about the credential, and it is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
+      printf '%s\n' "$terr" | sed -n '1,2p' | sed 's/^/[refresh]   /'
+      echo "[refresh]   fix: put the token in the cell's environment (GH_TOKEN/GITHUB_TOKEN) so presence needs no gh call at all, or raise GH_PROBE_TIMEOUT (now ${GH_PROBE_TIMEOUT}s) if this box's credential store is merely slow; a hung credential helper (gpg/keyring with no tty) is the usual cause"
+      gh_probe_err_cleanup
+      return "$EXIT_TRANSIENT"
+    fi
+    if [ "$prc" -ne 0 ]; then
+      echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+      printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+      echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
+      gh_probe_err_cleanup
+      return "$EXIT_NOT_PROVISIONABLE"
+    fi
+    presence=stored
   fi
   # VALIDATION is the same call the pre-flight's gh-backed surfaces make, with no host named. A
   # credential that is STORED and DOES answer is usable, so this is also where the probe can SUCCEED.
-  err="$(gh api rate_limit 2>&1)" && return 0
+  # ⛔ BOUNDED TOO, for the same measured reason: this is the arm that reaches the NETWORK, and a dead
+  # proxy or a wedged tunnel parks it exactly like the credential lookup did. A bound here is already
+  # TRANSIENT-shaped (the fall-through below is TRANSIENT unless the API answers 401), so it cannot
+  # latch anything.
+  gh_probe_bounded "$GH_PROBE_TIMEOUT" gh api rate_limit; prc=$?
+  [ "$prc" -eq 0 ] && { gh_probe_err_cleanup; return 0; }
+  err="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
+  if gh_probe_timed_out "$prc"; then
+    echo "[refresh] TRANSIENT: the gh credential is present (source=$presence) but 'gh api rate_limit' did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc) in the environment the pre-flight runs in (HOME=$HOME) — a probe that cannot answer is an OUTAGE, not a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
+    printf '%s\n' "$err" | sed -n '1,2p' | sed 's/^/[refresh]   /'
+    gh_probe_err_cleanup
+    return "$EXIT_TRANSIENT"
+  fi
   # A credential IS stored, but the call did not answer. Is it REJECTED, or merely UNREACHABLE? Only
   # the API can say, and only a 401 is unambiguous. A 403 is deliberately NOT used: `/rate_limit` is
   # exempt from the PRIMARY rate limit, but a 403 still has several meanings — an SSO/SAML
@@ -585,13 +708,15 @@ gh_probe_env() {
   # ⚠️ DECLARED RESIDUAL: a credential that GitHub rejects with a 403 is therefore retried
   # indefinitely (loudly, via `FAILED rc=1`) and never writes the permanent marker.
   if grep -q 'HTTP 401' <<<"$err"; then
-    echo "[refresh] NOT PROVISIONABLE: the gh credential STORED for the host gh is configured for is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
+    echo "[refresh] NOT PROVISIONABLE: the gh credential PRESENT for the host gh is configured for (source=$presence) is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
     printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: re-authenticate gh in THIS home (gh auth login --with-token <token>), then re-run"
+    gh_probe_err_cleanup
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  echo "[refresh] TRANSIENT: a gh credential is stored for the host gh is configured for but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
+  echo "[refresh] TRANSIENT: a gh credential is PRESENT for the host gh is configured for (source=$presence) but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
   printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+  gh_probe_err_cleanup
   return "$EXIT_TRANSIENT"
 }
 
@@ -2201,11 +2326,51 @@ QUEUED_THIS_PASS=""    # issue numbers this pass put in candidates.txt (the hand
 # reason. An unrecognisable output yields NO row, and the abort then says `unknown` rather than naming
 # a surface it could not read.
 UNUSABLE_LOG="$O/state/.unusable.$$"
+# The pre-flight's STDERR for the candidate being judged (#2401). A FILE, not a pipe or a merged
+# stream: the reader needs the tool's diagnostic SEPARATELY from its report, and `2>&1` is exactly
+# what made them one blob. Removed by the EXIT trap with `UNUSABLE_LOG`.
+#
+# ⛔ A REDIRECTION ON THE PRE-FLIGHT IS A REDIRECTION THAT CAN STOP IT (review of #2401, third round).
+# `2>"$PRE_ERR_FILE"` is part of the COMMAND: if `$O/state` is missing or unwritable the tool never
+# runs, every candidate comes back verdict-less, the verdict-less arm increments `pretry-<N>` and at
+# RETRY_MAX the issue is appended to `checked.txt` — the silent permanent suppression #1716 removed,
+# reachable by one missing directory. Reproduced: the shipped `selftest.sh` fixtures that do not
+# create `$O/state` went red on this branch for exactly that reason (measured: 2 -> 10 failures), so
+# the hazard was reachable in the suite before it was reachable on a box. Degrading to /dev/null
+# loses the diagnostic in that state and never the verdict, and the EXIT trap's `rm -f` tolerates it.
+PRE_ERR_FILE="$O/state/.preflight-err.$$"
+mkdir -p "$O/state" 2>/dev/null || true
+: > "$PRE_ERR_FILE" 2>/dev/null || PRE_ERR_FILE=/dev/null
+# ⛔ THE DATUM BELONGS TO THE FIRST RUN THAT MADE THIS PASS UNUSABLE, NOT TO THE LAST ONE JUDGED
+# (review of #2401). `PRE_RC` / `PRE_ERR_LINE` are overwritten by EVERY candidate, so a pass whose
+# pool was `#42 INCOMPLETE (rc 2, stderr …)` then `#43 unusable, rc 0` recorded `tool_rc=0
+# stderr=none` beside `first cause: claim gate: … could not answer` — the record CONTRADICTED its own
+# first cause and asserted a healthy tool where the failing run exited 2.
+#
+# ⛔ AND EVERY ARM THAT MAKES THE PASS UNUSABLE CALLS IT, not only `record_unusable` (third round):
+# the DEGRADED verdict arms (`CLEAN`/`COLLISION` + `ALSO INCOMPLETE:`) increment `V_UNJUDGED` and
+# record no surface row — so with the helper called only from `record_unusable` they left
+# `tool_err=none` in the record for a run that HAD written a stderr diagnostic and exited 2: a
+# positive assertion of "no stderr" about a tool that wrote one. They now pass their own arm name.
+snapshot_datum() {   # <arm>
+  # A DEGRADED VERDICT IS THE WEAKEST REASON TO HOLD A DATUM (review of #2401, sixth round).
+  # The degraded arms record no surface row, so a pool of issue #42 degraded (rc 0, no stderr) then
+  # #43 the real refusal (rc 2, stderr) snapshotted #42's HEALTHY datum while unusable_cause quoted
+  # #43's words — the section 1d defect one arm over, and it lost the rc=2 and the diagnostic that
+  # matter. A later arm may therefore REPLACE a preflight-degraded snapshot; it may never replace a
+  # real one (that is the first-record rule).
+  if [ -n "${PRE_FAIL_AT:-}" ] && [ "${PRE_FAIL_ARM:-}" != "preflight-degraded" ]; then
+    return 0
+  fi
+  PRE_FAIL_AT="${N:-}"; PRE_FAIL_RC="${PRE_RC:-}"; PRE_FAIL_ERR="${PRE_ERR_LINE:-}"
+  PRE_FAIL_ARM="${1:-}"
+}
 record_unusable() {   # <slug> [<reason>]
   local slug="$1" reason="${2:-}"
   # One field, no spaces: this lands in a `key=value` record and in a greppable log line.
   slug="$(printf '%s' "$slug" | tr ' /' '--' | tr -cd 'A-Za-z0-9._:-')"
   [ -n "$slug" ] || slug="unnamed-surface"
+  snapshot_datum "$slug"
   printf '%s\t%s\n' "$slug" "$(printf '%s' "$reason" | tr '\n\t' '  ')" >> "$UNUSABLE_LOG" 2>/dev/null || true
 }
 # `slug:n …` in first-seen order — a count per surface, which is what tells an operator whether ONE
@@ -2218,7 +2383,45 @@ unusable_summary() {
 }
 unusable_cause() {    # the FIRST failure's own words, bounded so one log line stays readable
   [ -s "$UNUSABLE_LOG" ] || return 0
-  awk -F'\t' 'NF>1 && $2!="" { print $2; exit }' "$UNUSABLE_LOG" 2>/dev/null | cut -c1-320
+  # ⛔ NO `$2 != ""` FILTER (review of #2401, second round). The datum snapshot is taken on the
+  # first `record_unusable` CALL, so skipping an empty-reason row (a verdict-less run with no
+  # output; a table row whose NOTE column was omitted — a shape the parser explicitly supports)
+  # made the "first cause" a DIFFERENT record than the datum describes: measured
+  # `tool_issue=42 tool_rc=0 stderr=none` beside a #43 refusal, asserting a healthy tool where the
+  # run exited 2. Both readers must name the same first record by construction; when its reason is
+  # empty the prose cause is legitimately absent and the datum alone carries the fact.
+  awk -F'\t' 'NF>1 { print $2; exit }' "$UNUSABLE_LOG" 2>/dev/null | cut -c1-320
+}
+# ── THE DATUM: WHICH COMMAND RAN, WHAT IT RETURNED, AND ITS OWN EXIT ──────────
+# ⛔ THE CAUSE IS THE PRODUCER'S PROSE, AND PROSE IS NOT A DATUM (#2401). The refusal above names the
+# surface and quotes the tool's note, but the note is a SENTENCE: on cell-4 it read `…could not answer
+# — the board's live-session store could not be read… (tried: `cmux sessi` because the 320-char bound
+# landed mid-word, and the SPECIFIC thing that had to change (two live pids running in REAPED
+# worktrees) never appeared on the dispatch line at all. Meanwhile the tool's exit status — a
+# measurement — was captured at the call site and then used ONLY for the `-eq 3` provisioning guard,
+# so a pre-flight that answered INCOMPLETE (rc 2) and one that CRASHED produced the same sentence.
+# These two carry the measured half, and they LEAD the cause so no downstream bound can cut them
+# (`refresh_cause_brief` truncates `why=` at 400 chars, `unusable_cause` at 320).
+PRE_RC=""            # the pre-flight's OWN exit status for the candidate just judged
+PRE_ERR_LINE=""     # the first non-empty STDERR line it wrote (its diagnostic, when it has one)
+PRE_FAIL_AT=""       # the FIRST candidate that made this pass unusable, and ITS datum — see
+PRE_FAIL_RC=""       # `record_unusable`: the last candidate's rc would contradict the first cause
+PRE_FAIL_ERR=""
+PRE_FAIL_ARM=""      # …and WHICH arm produced that record. The claim-registry arms record unusable
+                     # AFTER a CLEAN pre-flight (`rc 0`), so a bare `rc=0 stderr=none` beside their
+                     # cause reads as a contradiction; naming the arm makes the datum unambiguous
+                     # without giving the pre-flight another run's numbers (review of #2401, R1).
+# TWO LENGTHS, ON PURPOSE (review of #2401, sixth round). The RECORD keeps the full 200-char stderr
+# line in tool_err=; the INLINE datum cuts it to 80 so the surface clause and the datum both survive
+# refresh_cause_brief's 400-char cut. Measured before this: a 200-char stderr pushed the BLOCKED line
+# to 566 characters and cut issue-assignee-ho mid-word — the datum destroyed the reading it exists
+# to serve.
+preflight_datum() {  # "issue=#<N> cmd=<tool> <args> rc=<N> stderr=<first 80 chars|none>"
+  [ -n "${PRE_FAIL_RC:-}" ] || return 0
+  printf 'issue=#%s cmd=%s rc=%s stderr=%s' \
+    "${PRE_FAIL_AT:-?}" \
+    "$(basename "${PREFLIGHT:-pre-flight}") --repo ." \
+    "$PRE_FAIL_RC" "$(printf '%s' "${PRE_FAIL_ERR:-none}" | cut -c1-80)"
 }
 # The two report shapes the producer uses, in preference order. The BLOCK is canonical; the TABLE is
 # the fallback for a bare INCOMPLETE (no block). They are parsed separately and the block WINS, so one
@@ -2369,7 +2572,46 @@ while read -r N; do
     [ -n "${GH_REPO:-}" ] && echo "[refresh] GH_REPO='$GH_REPO' (ambient) is NOT the repo this pass grades — pinning GH_REPO=$OR for the pre-flight, so no gh read can answer about another repository"
     GH_REPO="$OR"; export GH_REPO
   fi
-  PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>&1)"; PRE_RC=$?
+  # ⛔ STDERR IS CAPTURED, NOT MERGED (#2401). It used to be `2>&1`, which made the tool's DIAGNOSTIC
+  # indistinguishable from its REPORT — so the one line a failing producer writes to say what went
+  # wrong could only ever arrive as the LAST line of a blob whose head the parsers read, and a producer
+  # that prints only `FATAL: …` on stderr left `VERDICT` absent with no cause anywhere. Kept apart here,
+  # then folded back into `$PRE` below so every existing parser and the `tail -3` diagnostics still see
+  # the same text they always did.
+  PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>"$PRE_ERR_FILE")"; PRE_RC=$?
+  PRE_ERR_LINE="$(grep -m1 -v '^[[:space:]]*$' "$PRE_ERR_FILE" 2>/dev/null | cut -c1-200)"
+  # ⛔ THE WHOLE STDERR IS FOLDED BACK, NOT A BOUNDED SLICE (review of #2401, second round). The
+  # first attempt kept only the FIRST line; the second kept `tail -40`. Both are NARROWINGS relative
+  # to the `2>&1` this replaces, and `tail -40` is the dangerous one: a producer that writes its
+  # report to stderr and then >40 more lines loses its VERDICT line, falls out of the INCOMPLETE arm
+  # (which deliberately neither strikes nor clears) into the verdict-less arm — which INCREMENTS
+  # `retry-<N>` and, at RETRY_MAX, permanently appends the issue to `checked.txt`. That is the
+  # silent, invisible suppression #1716 removed, reachable by a CHATTY producer. Measured on the
+  # same fixture: `origin/main` -> `unusable=issue-assignee-holder:1`, never retired; `tail -40` ->
+  # `unusable=preflight-no-verdict:1`, `pretry=1`. A `cat` is exact parity with the old surface and
+  # adds no flood risk the old code did not already have.
+  # ⛔ THE FOLD IS TERMINATED AND LABELLED (#2401, third round). The producer's report ends with its
+  # `VERDICT:` line, and the block parser's ONLY terminator is `^[A-Z][A-Z ]+ — `. Appending stderr
+  # straight after the report therefore left `inblk` open into the stderr text, so a stderr line
+  # beginning with `[` was parsed as a SURFACE ROW — a surface the producer never reported, against
+  # the parser's stated contract, and `tool_arm` would then be that fabricated slug. Measured:
+  # report + `[preflight] live-session store probe failed` -> a phantom
+  # `preflight<TAB>live-session store probe failed` row. `STDERR —` matches the terminator and can
+  # never itself become a row. (Under the old `2>&1` this was unreachable: stderr arrived first.)
+  # ⛔ THE LABEL MUST MATCH THE TERMINATOR, INCLUDING ITS TRAILING SPACE (review of #2401, fourth
+  # round). The block parser's terminator is `^[A-Z][A-Z ]+ — ` — a SPACE after the em dash — and the
+  # first draft's label was a bare `STDERR —`, which does NOT match, so `inblk` stayed open into the
+  # folded stderr and a stderr line beginning with `[` was parsed as a SURFACE ROW. Measured with the
+  # shipped parser: report + `STDERR —` + `  [preflight] …probe failed` -> `unusable=… preflight:1`,
+  # a surface the producer never reported, and `tool_arm=preflight` — the fabricated slug this
+  # change's own comment says is impossible. The label now carries trailing text so ` — ` matches.
+  #
+  # ⛔ AND A BLANK STDERR IS NOT FOLDED AT ALL: a whitespace-only file made the label itself the
+  # verdict-less arm's `first cause` ("STDERR —") beside `tool_err=none` — a record contradicting
+  # itself. A file with no non-blank line says nothing, so nothing is folded.
+  if [ -s "$PRE_ERR_FILE" ] && grep -q '[^[:space:]]' "$PRE_ERR_FILE" 2>/dev/null; then
+    PRE="$PRE"$'\n'$'STDERR — not the pre-flight report\n'"$(cat "$PRE_ERR_FILE" 2>/dev/null)"
+  fi
   # ⛔ A tool that REFUSED TO RUN is a PROVISIONING failure, not a per-issue "no verdict". The
   # pre-flight's EXIT_USAGE (3) is how it reports an unusable environment — most importantly its
   # Python >= 3.12 guard (#5128), which prints an explanation and NO `VERDICT` line. Absorbing that
@@ -2426,6 +2668,7 @@ while read -r N; do
       # A DEGRADED pre-flight short-circuits BEFORE the claim read: the verdict is not trustworthy,
       # so the issue is left unchecked and is neither queued nor certified either way.
       if [ "$degraded" -eq 1 ]; then
+        snapshot_datum preflight-degraded
         V_UNJUDGED=$((V_UNJUDGED + 1))
         echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
@@ -2540,6 +2783,7 @@ while read -r N; do
       # environment report a healthy `checked N; backlog now 0` — the reading this pass exists to
       # refuse (#1853 review).
       if [ "$degraded" -eq 1 ]; then
+        snapshot_datum preflight-degraded
         V_UNJUDGED=$((V_UNJUDGED + 1))
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
@@ -2580,6 +2824,10 @@ while read -r N; do
       # verdict-less arm alone (see the RETRY_MAX note near the top). It stays unchecked (retried next
       # pass) and is REPORTED, which is what the arm did before the port folded it into the
       # verdict-less one.
+      # THIS ARM RECORDS NO ROW, SO IT MUST STILL TAKE THE DATUM (review of #2401, sixth round): an
+      # INCOMPLETE report with no parseable surface row (the parser's own documented "emits nothing"
+      # path) left tool_rc=unrecorded / tool_err=none while PRE_RC and the stderr line were in hand.
+      snapshot_datum preflight-incomplete
       V_UNJUDGED=$((V_UNJUDGED + 1))
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (an INCOMPLETE is box-wide: it neither strikes nor clears the $RETRY_MAX verdict-less bound)" ;;
     *)
@@ -2781,14 +3029,23 @@ if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
   # discarded one line before it would have been printed.
   _us_summary="$(unusable_summary)"
   _us_cause="$(unusable_cause)"
+  _us_datum="$(preflight_datum)"
   if [ -n "$_us_summary" ]; then
     echo "[refresh] unusable: $_us_summary — the failing surface(s) this pass could not query"
   fi
   echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736).${_us_summary:+ Failing surface(s): $_us_summary.} Retrying next cycle."
   [ -n "$_us_cause" ] && echo "[refresh]   cause: $_us_cause"
+  [ -n "$_us_datum" ] && echo "[refresh]   datum: pre-flight $_us_datum"
+  # ⛔ THE MEASURED HALF LEADS THE PERSISTED CAUSE (#2401). `refresh_cause_brief` renders this `why=`
+  # into the caller's `[dispatch] BLOCKED: refresh failed — stage=<st>: <why cut 400>`, so whatever sits
+  # in the first 400 characters IS what an operator sees. The prose sentence used to occupy all of it,
+  # and the datum (command, rc, the tool's own stderr line) was not in the record at all.
   refresh_fail preflight "$EXIT_TRANSIENT" \
-    "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_summary:+ — failing surface(s): $_us_summary}${_us_cause:+ — first cause: $_us_cause}" \
-    "judged=$judged" "unusable=${_us_summary:-unknown}"
+    "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_summary:+ — failing surface(s): $_us_summary}${_us_datum:+ — pre-flight $_us_datum}${_us_cause:+ — first cause: $_us_cause}" \
+    "judged=$judged" "unusable=${_us_summary:-unknown}" \
+    "tool_rc=${PRE_FAIL_RC:-unrecorded}" "tool_err=${PRE_FAIL_ERR:-none}" \
+    "tool_issue=${PRE_FAIL_AT:-unrecorded}" "tool_arm=${PRE_FAIL_ARM:-none}" \
+    "tool_cmd=$(basename "${PREFLIGHT:-pre-flight}") --repo ."
 fi
 # Dedupe WITHOUT re-sorting. orch-loop.sh consumes this file top-down and dispatches the first
 # BATCH entries, so its ORDER IS the dispatch priority. `sort -n -u` re-ordered the ENTIRE backlog

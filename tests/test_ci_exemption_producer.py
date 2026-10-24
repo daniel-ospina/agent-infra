@@ -848,3 +848,180 @@ def test_a_test_nodeid_still_flows_through_unchanged():
     assert list(rows.failures) == [DR]
     assert rows.rejected == []
     assert list(parse_signature_rows(f"{DR}\tAssertionError: assert 3 == 2\n")) == [DR]
+
+
+# ==========================================================================
+# #1185 — PIPELINE-COMPLIANCE GATE ATTRIBUTION THROUGH THE PRODUCER AND THE WIRE
+# ==========================================================================
+#
+# The measured capture (agent-infra #2623, run 40066552772, head d1024c5d): the
+# ONLY failing job was `pipeline-compliance`, and its log named the failure in
+# plain text — `❌ [c] no head-bound code-review record for <repo>#<PR>`. The
+# producer knew two shapes, so it emitted NOTHING, `examined > extracted` tripped
+# the rail's refusal, and the dominant red in the queue was reported as
+# unattributable. The fixture below is that capture, including the parts that must
+# NOT become identities: the echoed script SOURCE (a line containing `❌`), the
+# `✅`/`⏭` pass lines, and the terminal summary.
+_PC_JOB = "pipeline-compliance"
+_PC_STEP = "Check pipeline compliance"
+_PC_SUBJECT = "no-head-bound-code-review-record-for-daniel-ospina-agent-infra-2623"
+_PC_KEY = f"pipeline-compliance::c::{_PC_SUBJECT}"
+_PC_HEAD = "d1024c5def3eb0c43dac4bd7ca26b35bf4d458d9"
+
+
+def _pipeline_capture(head: str = _PC_HEAD, letter: str = "c") -> str:
+    """The real `--log-failed` shape, wrapped like the measured capture."""
+    prefix = f"{_PC_JOB}\t{_PC_STEP}\t"
+    lines = [
+        '2026-10-24T05:35:03.6481374Z \x1b[36;1m    echo "❌ scripts/'
+        'check-pipeline-compliance.sh missing from checkout" >&2\x1b[0m',
+        "2026-10-24T05:35:05.6316993Z === Pipeline Compliance Gate ===",
+        "2026-10-24T05:35:08.6994729Z ✅ [a] linked issue #2622 (closing keyword in PR body)",
+        "2026-10-24T05:35:08.7057090Z ✅ [b] scoping comment present on issue #2622",
+        f"2026-10-24T05:35:08.8116270Z ❌ [{letter}] no head-bound code-review record for "
+        f"daniel-ospina/agent-infra#2623 — check ({letter}) accepts ONLY the "
+        "record-review.sh marker for THIS PR at the CURRENT head "
+        f"({head[:12]}…): a line of exactly the form review recorded: "
+        f"reviews/2623.json verdict=<clean> @ {head} (daniel-ospina/agent-infra)",
+        "2026-10-24T05:35:08.8121031Z       Missing: the code-review record marker "
+        "for this PR at this head.",
+        "2026-10-24T05:35:08.8124200Z ⏭  [d] Skipped: issue #2622 has no "
+        "complexity:standard/complex label",
+        "2026-10-24T05:35:08.8151938Z ❌ PIPELINE COMPLIANCE: BLOCKED (1 failure(s)).",
+        "2026-10-24T05:35:08.8173424Z ##[error]Process completed with exit code 1.",
+    ]
+    return "\n".join(prefix + line for line in lines) + "\n"
+
+
+def test_a_pipeline_check_failure_becomes_an_identity():
+    """The gate's `❌ [<letter>] …` line is the THIRD identity shape (#1185).
+
+    MUTATION: skip the gate pass in ``parse_pr_failure_text`` → ``ids == []``, the
+    producer exits 1, and the rail refuses the run as unattributable → RED.
+    MUTATION: key on the whole line instead of its first clause → the head sha
+    enters the id and the exact-string assertion REDs (the #3756
+    rotating-identity class: an id that changes per head can never be compared).
+    """
+    parsed = parse_pr_failure_text(_pipeline_capture())
+
+    assert parsed.ids == [_PC_KEY]
+    assert parsed.pipeline_checks == [_PC_KEY]
+    assert parsed.signatures[_PC_KEY] == frozenset({_PC_SUBJECT})
+    assert parsed.unsigned == [], "a signed gate failure is not unsigned"
+    assert parsed.ok is True
+
+
+def test_the_summary_and_the_echoed_source_are_not_identities():
+    """Only the `❌ [<letter>]` line is an identity — the count and the echo are not.
+
+    The terminal `❌ PIPELINE COMPLIANCE: BLOCKED (N failure(s)).` names a COUNT
+    and no artifact, so keying on it would make the identity track the number of
+    failures; the echoed `echo "❌ …"` source line is a MID-LINE mention. Either
+    one becoming an id would also make the count 2 or 3 instead of 1.
+
+    MUTATION: relax the pattern to a bare `❌` prefix → both lines become ids and
+    the exact-length assertion REDs.
+    """
+    parsed = parse_pr_failure_text(_pipeline_capture())
+
+    assert len(parsed.ids) == 1
+    assert all("BLOCKED" not in i for i in parsed.ids)
+    assert all("echo" not in i for i in parsed.ids)
+
+
+def test_the_head_sha_cannot_enter_the_identity():
+    """The SAME failure at a DIFFERENT head must produce the SAME identity.
+
+    Check (c)'s message embeds the head sha (`… at the CURRENT head (d1024c5def3e…)`)
+    and the record path's shell form. An identity built from the whole line would
+    differ at every head, so it could never match a baseline and every rerun would
+    arrive as a NEW rotating identity — a permanent false refusal in a new costume.
+
+    MUTATION: key on the full message text → the two ids differ and the equality
+    assertion REDs.
+    """
+    a = parse_pr_failure_text(_pipeline_capture(head="a" * 40)).ids
+    b = parse_pr_failure_text(_pipeline_capture(head="b" * 40)).ids
+
+    assert a == b == [_PC_KEY]
+
+
+def test_a_gate_identity_is_admitted_by_the_key_predicates():
+    """The key MUST pass ``is_failure_key`` — or the row is rejected, not blocked.
+
+    ⛔ THE ASYMMETRY IS LOAD-BEARING (the #6798 measurement): a key rejected by
+    this pair of predicates is dropped from the PR's rows, so ``decide`` sees an
+    EMPTY failure set and emits CLEAN for a red PR — a silent false PASS, strictly
+    worse than the refusal it replaced.
+
+    MUTATION: drop ``_PIPELINE_KEY_RE`` from ``is_failure_key`` /
+    ``is_failure_key_loose`` → ``rows.rejected`` is non-empty and
+    ``rows.failures`` is empty → RED.
+    """
+    rows = parse_failure_rows(f"{_PC_KEY}\t1\t1\t{_PC_SUBJECT}\n")
+
+    assert rows.rejected == []
+    assert list(rows.failures) == [_PC_KEY]
+    assert ci_exemption.is_failure_key(_PC_KEY) is True
+    assert ci_exemption.is_failure_key_loose(_PC_KEY) is True
+
+
+def test_a_gate_failure_still_BLOCKS_and_says_which_check():
+    """Attribution is not exemption: the gate failure blocks, and NAMES itself.
+
+    Main's baseline cannot carry a `pipeline-compliance` row (the gate runs on
+    `pull_request_target` only), so the id is ABSENT FROM MAIN and the decision
+    refuses it. The refusal line must carry the check and its subject —
+    `blocked by check (c): …` — instead of the generic reason alone.
+
+    MUTATION: drop the note from `Verdict.line` → the `blocked by check (c)`
+    assertion REDs and the operator is back to "we cannot say why".
+    MUTATION: exempt this family unconditionally → the `any_blocked` assertion
+    REDs (a false certificate: a merge without a review attestation).
+    """
+    rows = parse_failure_rows(f"{_PC_KEY}\t1\t1\t{_PC_SUBJECT}\n")
+
+    d = decide(rows.failures, {}, main_signatures={}, k_pr=1)
+
+    assert d.any_blocked, d.report()
+    assert not d.exempt
+    block = d.blocked[0].line
+    assert block.startswith(f"BLOCK : {_PC_KEY}  "), block
+    assert "blocked by check (c):" in block, block
+    assert _PC_SUBJECT in block, block
+
+
+def test_cli_ids_reports_the_gate_attribution(tmp_path, capsys):
+    """The shell's door: `ids` emits the gate key and REPORTS which check it was.
+
+    MUTATION: drop the `pipeline-checks` counter → the `pipeline-checks=1`
+    assertion REDs, and the attribution becomes invisible in the rail's evidence.
+    MUTATION: emit no stderr note → the operator loses the sentence that names the
+    check and the artifact the remedy must produce.
+    """
+    log = _write(tmp_path, "pipeline.log", _pipeline_capture())
+
+    rc = main(["ids", "--log", log])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out == f"{_PC_KEY}\n"
+    assert "pipeline-checks=1" in captured.err
+    assert "blocked by check (c):" in captured.err
+
+
+def test_cli_signatures_emits_the_gate_row(tmp_path, capsys):
+    """The producer's stdout is the shell-joinable gate row.
+
+    MUTATION: emit no signature for the gate id → the empty-stdout / rc-1
+    assertions RED, and `ci-failure-set.sh` treats a signature-door failure as
+    FATAL — so the refusal would be RELOCATED here instead of removed.
+    """
+    log = _write(tmp_path, "pipeline.log", _pipeline_capture())
+
+    rc = main(["signatures", "--log", log])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out == f"{_PC_KEY}\t{_PC_SUBJECT}\n"
+    assert "pipeline-checks=1" in captured.err

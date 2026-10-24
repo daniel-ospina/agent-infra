@@ -5094,7 +5094,8 @@ reproduce_residual_on_base() {
   [ -s "$residual" ] || return 1
   # ⛔ EVERY NON-NODEID FAMILY IS EXCLUDED, not just the guard step (#3715 review,
   # P2). The parser's other non-nodeid identities — `collect-error::<file>`
-  # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131) — are
+  # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131) and
+  # `pipeline-compliance::<letter>::<subject>` (#1185) — are
   # real residual rows but they name no pytest nodeid. Handed to the runner as
   # ARGV, ONE of them makes pytest EXIT 4 having run NOTHING (`ERROR: file or
   # directory not found`), so a residual that mixes a collection error with real
@@ -5103,7 +5104,7 @@ reproduce_residual_on_base() {
   # already filters them from the candidate set; this is the function's own
   # guard, so the contract holds for any caller.)
   local nodeids
-  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' "$residual" 2>/dev/null || true)"
+  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' -e '^pipeline-compliance::' "$residual" 2>/dev/null || true)"
   [ -n "$nodeids" ] || return 1
 
   # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
@@ -5297,8 +5298,14 @@ main_measured_files() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
-    sed '/^guard-step::/d; s/::.*//' "$mainfails"
+    sed '/^guard-step::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+    # #1185: a gate identity is keyed by its CHECK, not by a file — the same
+    # per-entry identity `job-unreadable::` uses, and for the same reason: a main
+    # baseline red on a DIFFERENT check must not read as a pre-existing failure in
+    # this one. The generic `s/::.*//` above is suppressed for the family so it
+    # cannot also claim a "file" called `pipeline-compliance`.
+    sed -n 's/^\(pipeline-compliance::[^:]*\)::.*/\1/p' "$mainfails"
   } | sort -u
 }
 
@@ -5315,7 +5322,7 @@ main_baseline_units() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
-    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; s/::.*//' "$mainfails"
+    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
     sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
     sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
@@ -5323,6 +5330,11 @@ main_baseline_units() {
     # above is suppressed for the family and a main baseline red on a DIFFERENT
     # job would read as pre-existing in this one.
     sed -n 's/^job-unreadable::\(.*\)$/\1/p' "$mainfails"
+    # #1185: the unit is the CHECK (`pipeline-compliance::<letter>`), for exactly
+    # the #7131 reason — main red on check (a) must not read as a pre-existing
+    # failure in this PR's check (c). The letter stays ON the unit, so it can
+    # never collide with a test file of the same name.
+    sed -n 's/^\(pipeline-compliance::[^:]*\)::.*/\1/p' "$mainfails"
   } | sort -u
 }
 
@@ -5344,6 +5356,11 @@ failure_file_key() {
     # pre-existing failure in this one. Without this arm the generic default
     # would collapse every job onto the literal `job-unreadable`.
     job-unreadable::*) printf '%s\n' "${1#job-unreadable::}" ;;
+    # #1185: the unit is the CHECK, `pipeline-compliance::<letter>` — main red on
+    # check (a) must not read as a pre-existing failure in this PR's check (c),
+    # and the generic default would collapse the whole family onto the literal
+    # `pipeline-compliance`.
+    pipeline-compliance::*) local p="${1#pipeline-compliance::}"; printf '%s\n' "pipeline-compliance::${p%%::*}" ;;
     *) printf '%s\n' "${1%%::*}" ;;
   esac
 }
@@ -5370,7 +5387,8 @@ intersect_sets() {
 #   * a guard-step identity has no local pytest runner, so it cannot be
 #     reproduced and must always remain in the residual.
 #   * the other non-nodeid identities (`collect-error::<file>` #6798,
-#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131) also name no
+#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
+#     `pipeline-compliance::<letter>::<subject>` #1185) also name no
 #     pytest nodeid. Handed to the runner as argv they make it EXIT 4 having run
 #     NOTHING, so they are not candidates either — they are units the rail can
 #     NAME, never measurements a local run can clear (#3715 review, P2).
@@ -5387,6 +5405,7 @@ repro_scope() {
     [ -n "$nid" ] || continue
     case "$nid" in
       guard-step::*|collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
+      pipeline-compliance::*) continue ;;
     esac
     printf '%s\n' "$nid" >> "$out"
   done < "$scratch"
@@ -6191,8 +6210,9 @@ main() {
   fi
   if [ "$pr_extracted" -lt "$pr_examined" ]; then
     say_err "⛔ admin-merge: BLOCKED — $((pr_examined - pr_extracted)) of $pr_examined failing PR run(s)"
-    say_err "   yielded NO parseable failure identity (neither a 'FAILED <nodeid>' line nor an"
-    say_err "   attributable guard-step '::error::' annotation), so their failures are NOT in the"
+    say_err "   yielded NO parseable failure identity (none of: a 'FAILED <nodeid>' line, an"
+    say_err "   attributable guard-step '::error::' annotation, or a 'check-pipeline-compliance.sh'"
+    say_err "   '❌ [<letter>] …' line), so their failures are NOT in the"
     say_err "   set and 'blocked by the decision: 0' would be a false certificate (lane: $lane)."
     say_err "   Either the run failed outside the test step (fix it), or the log format moved"
     say_err "   and the parser needs updating. This is a refusal, not a comparison."
@@ -6223,7 +6243,46 @@ main() {
     > "$TMP/main-rates.txt" 2> "$TMP/main-drops.err" || main_status=$?
   [ -s "$TMP/main-drops.err" ] && cat "$TMP/main-drops.err" >&2
   if [ "$main_status" -ne 0 ]; then
+    # ── #2569: TWO OPPOSITE STATES, ONE MESSAGE ────────────────────────────────
+    # "main is GREEN, so the table is empty" and "main could not be READ" both used
+    # to reach an operator as this one line plus `parser exit 1`. They are opposite
+    # claims — the first is a real measurement, the second is no measurement at all —
+    # and the difference is in data the capture already holds (#2569, measured on
+    # the fleet's own refusals 2026-10-23). The REFUSAL is unchanged; what changes is
+    # that it now SAYS which case it is in and names the window it measured.
+    #
+    # `unreadable=` names WHICH read died, so the remedy named is one that can work.
+    # On THIS mode the label is `parse:<id>` (see the arm below); an ABSENT report
+    # means no read window reached the collector at all — the LISTING failed, or the
+    # capture was killed/refused before publishing, or the report could not be
+    # written (which `write_runs_report` now says out loud).
+    local main_unreadable main_tested_bad main_completed_bad
+    main_unreadable="$(report_value "$TMP/main-report.txt" unreadable)"
+    main_tested_bad="$(report_value "$TMP/main-report.txt" tested)"
+    main_completed_bad="$(report_value "$TMP/main-report.txt" completed)"
     say_err "admin-merge: ✗ BLOCK — could not extract main's rate table (parser exit $main_status)."
+    # ⛔ `log:` IS NOT A RATE-PATH LABEL (review, cycle 3). This capture extracts
+    # through the COMPOSITE `extract_failed_tests` (fetch → ids → job-level fallback
+    # for a pruned log), so its reason is `parse:<id>`: naming a FETCH here would
+    # claim a precision the collector does not have — and a dead `log:` arm in a
+    # gate is worse than no arm, because a test that drives it proves nothing. The
+    # signature block below DOES establish the fetch (it calls `fetch_failed_log`
+    # directly), so `log:` lives there and only there.
+    case "$main_unreadable" in
+      parse:*)
+        say_err "   This is a FAILED READ, not an empty baseline: the window WAS listed and"
+        say_err "   partially measured — main: completed=${main_completed_bad:-0} run(s), of which"
+        say_err "   tested=${main_tested_bad:-0} — and run ${main_unreadable#parse:} was read but"
+        say_err "   yielded NO failure identity (its log could not be fetched, or the id parser"
+        say_err "   could not read it — a missing/updated parser, or a moved log format)."
+        say_err "   Re-running fixes the first; the second needs the parser updated." ;;
+      *)
+        say_err "   This is an UNREADABLE window, not an empty baseline: main's run LISTING"
+        say_err "   could not be read (or the capture refused before publishing any counters),"
+        say_err "   so nothing was measured that could be read. An empty table is authoritative"
+        say_err "   only when the read SUCCEEDED — a green main that was read names its measured"
+        say_err "   run count instead." ;;
+    esac
     say_err "   Refusing to certify a comparison computed over an unreadable baseline."
     exit 1
   fi
@@ -6233,11 +6292,29 @@ main() {
   # into the rate file would DOUBLE the count in the evidence. They are re-emitted
   # for visibility and deliberately NOT counted.
   run_failure_set --main-union-signatures "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
-    --exclude "$head" \
+    --exclude "$head" --runs-report "$TMP/main-sig-report.txt" \
     > "$TMP/main-signatures.txt" 2> "$TMP/main-sig-drops.err" || main_sig_status=$?
   [ -s "$TMP/main-sig-drops.err" ] && cat "$TMP/main-sig-drops.err" >&2
   if [ "$main_sig_status" -ne 0 ]; then
+    # #2569: same two-state disclosure as the rate table above, read from this
+    # pass's OWN report (the signature capture used to write none at all, so its
+    # counters and its reason were discarded on every run).
+    local main_sig_unreadable
+    main_sig_unreadable="$(report_value "$TMP/main-sig-report.txt" unreadable)"
     say_err "admin-merge: ✗ BLOCK — could not extract main's signature table (parser exit $main_sig_status)."
+    case "$main_sig_unreadable" in
+      log:*)
+        say_err "   A FAILED READ over a window that WAS listed: main's rate table measured"
+        say_err "   $(report_value "$TMP/main-report.txt" tested) tested run(s), and the failed-step"
+        say_err "   log of run ${main_sig_unreadable#log:} could not be fetched for the signature pass." ;;
+      parse:*)
+        say_err "   A FAILED READ over a window that WAS listed: main's rate table measured"
+        say_err "   $(report_value "$TMP/main-report.txt" tested) tested run(s), and run ${main_sig_unreadable#parse:}"
+        say_err "   yielded no failure identity for the signature pass (fetch or parser)." ;;
+      *)
+        say_err "   No signature pass ran over a read window: main's run LISTING could not be"
+        say_err "   read (or the capture refused before it), so nothing was measured here." ;;
+    esac
     say_err "   Without it every signature check fails closed; that is a refusal, not a green."
     exit 1
   fi
@@ -6271,6 +6348,10 @@ main() {
   # lane — this one does) have no single --workflow spanning both sides, which is
   # what --any-workflow is for (#1003).
   local main_tested main_completed
+  # The EMPTY-baseline reason, computed ONCE at step 2b-bis and reused verbatim in the
+  # posted evidence's `main side:` line, so stdout and the durable artifact cannot
+  # disagree about whether the zero means "green" or "clipped" (#2569 review).
+  local main_side_reason=""
   main_tested="$(report_value "$TMP/main-report.txt" tested)"
   main_completed="$(report_value "$TMP/main-report.txt" completed)"
   if ! counter_is_positive "$main_tested"; then
@@ -6284,6 +6365,45 @@ main() {
     say_err "   then no single --workflow spans both sides. Compare against every lane on main"
     say_err "   instead: add --any-workflow BEFORE the -- separator."
     exit 1
+  fi
+
+  # ── 2b-bis. NAME THE MEASUREMENT BEHIND AN EMPTY TABLE (#2569) ─────────────
+  # An empty rate table over a POSITIVE `tested` count means the read SUCCEEDED and
+  # produced no failing id. That is the OPPOSITE claim from the refusal above, which
+  # fires when nothing could be read — and a bare "empty" cannot tell them apart.
+  # The capture that produced this table exits 0 (a failed read exits 1), so the
+  # states are already separated in CODE; this block separates them in the EVIDENCE,
+  # at the point of the read rather than only in the closing summary.
+  #
+  # ⛔ IT DOES NOT CLAIM GREEN UNCONDITIONALLY (#2569 review). An empty table is also
+  # what a CLIPPED baseline looks like: a failing main run that yielded no failure
+  # identity (a collection error, a job that died before pytest) is invisible to a
+  # FAILURE-ONLY projection, so `examined > extracted` with zero rows is main RED and
+  # UNMEASURED — not main green. The main side deliberately does not BLOCK on that
+  # (an under-reported baseline can only cause a false block, whose remedy is the
+  # re-run), but it must not be reported as a certificate either.
+  if [ ! -s "$TMP/main-rates.txt" ]; then
+    local main_examined main_extracted
+    main_examined="$(report_value "$TMP/main-report.txt" examined)"
+    main_extracted="$(report_value "$TMP/main-report.txt" extracted)"
+    info "admin-merge: main's baseline is EMPTY BY MEASUREMENT — 0 failing id(s) over ${main_tested} tested run(s) of ${main_completed} completed (lane: $lane)."
+    # ONE predicate, and the reason it produces is used BOTH here and in the POSTED
+    # EVIDENCE below (`main side:`), because the evidence body is the durable artifact
+    # a human and the verifier read: `verify-admin-merge-evidence.sh` names that very
+    # line as reading the zero as "EMPTY because the lane is GREEN", and a CLIPPED
+    # baseline producing that zero would make the certificate contradict the run
+    # (#2569 review, cycle 3). `main_side_reason` is that shared sentence.
+    if counter_is_zero "$main_examined"; then
+      main_side_reason="EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b)."
+      info "admin-merge:    examined=0, so no run in that window failed: this is a READ that measured no failure, i.e. main is GREEN here — not a failed read."
+    elif counter_is_number "$main_examined" && counter_is_number "$main_extracted"; then
+      main_side_reason="EMPTY of ATTRIBUTABLE ids, but CLIPPED, not green: ${main_examined} failing run(s) yielded only ${main_extracted} identity(ies), so a main-side failure with NO failure identity is invisible to this comparison."
+      info "admin-merge:    BUT examined=${main_examined} with only ${main_extracted} yielding an identity: the baseline is CLIPPED, not green —"
+      info "admin-merge:    a main-side failure with NO failure identity is invisible to this comparison (it can only make a residual look larger)."
+    else
+      main_side_reason="EMPTY, but the window published no examined/extracted counters, so its completeness is UNKNOWN."
+      info "admin-merge:    The window's examined/extracted counters were not published, so this table's completeness is UNKNOWN."
+    fi
   fi
 
   # ── 2c. THE PR'S EVALUATED TREE — RESOLVED HERE; THE BASE IS CONTEXT (#1261) ───────────────────
@@ -6540,6 +6660,15 @@ main() {
         say_err "   the E5 second sample the re-run would take. No merge."
       fi
       say_err "   $repro_line"
+      # §33 (#1147): the REASON, not just the node id — the SAME lines the
+      # post-rerun refusal prints below. This path used to drop them, so an
+      # operator who blocked with `--no-rerun` got only the FILE-level diagnosis
+      # below and never the decision's own per-id reason. That gap is what made a
+      # `pipeline-compliance` check (#1185) read as "main carries no failure in
+      # pipeline-compliance::c" instead of "blocked by check (c): <subject>" — and
+      # for a GATE failure this is the path a lane should take, because a re-run
+      # cannot mint the artifact the check is asking for.
+      grep -v '^EXEMPT' "$TMP/unique.lines" 2>/dev/null | sed 's/^/   /' >&2 || true
       # §37 (main): WHY each residual could not be attributed to this PR — the
       # FILE-level diagnosis. Complementary to the decision's id-level reason
       # lines below, not a replacement: the decision says WHAT it decided and on
@@ -7194,7 +7323,7 @@ $attribution_line"
    measured sets: PR failing runs=0 | main failing runs=0 (lane: $lane)
    lane parity: $parity_evidence
    PR side: ${pr_examined:-0} failing run(s) of ${pr_completed:-0} completed / ${pr_tested:-0} tested for head $head (${pr_pending:-0} pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
-   main side: $(report_value "$TMP/main-report.txt" examined) failing run(s) of ${main_completed:-0} completed / ${main_tested:-0} tested over the window ($MAIN_RUNS run(s) requested). EMPTY because the lane is GREEN over that window — NOT because main has no run (a lane that never tested main BLOCKS at step 2b).
+   main side: $(report_value "$TMP/main-report.txt" examined) failing run(s) of ${main_completed:-0} completed / ${main_tested:-0} tested over the window ($MAIN_RUNS run(s) requested). ${main_side_reason:-EMPTY, but the window published no examined/extracted counters, so its completeness is UNKNOWN.}
    main check surface: $BASE_STATUS — $BASE_RED failing of $BASE_TOTAL measured, $BASE_PENDING pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: $TREE_STATUS — $TREE_RED failing of $TREE_TOTAL measured, $TREE_PENDING pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
    Correct when the lane is green on both sides — but ONLY when both sides ran the SAME lane. The per-side counters tell 'green' from 'never run'; the parity line tells 'the same lane' from 'two different lanes'. A wrong lane selector certifies neither."

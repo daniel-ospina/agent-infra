@@ -84,7 +84,37 @@ A live holder is **never** selected. The witnesses are mechanical and fail close
 A probe that cannot be evaluated is a refusal (`exit 3` **from the owner**), not a pass. Through the
 entry point that refusal arrives as exit **6** with `ok=0` in the pass record and
 `verdict=<class>=refused` — the unit stays green because the box is busy, and the RECORD is what
-alarms (see **Exit codes** below). The worktree owner additionally requires the checkout to be
+alarms (see **Exit codes** below).
+
+**The open-PR probe is the one refusal that is PER REPO** (#2443). It needs a credential store, and
+that store is per-`HOME` (`$HOME/.config/gh`, or `GH_TOKEN`); the installed unit renders
+`Environment=HOME={{HOME}}`, so the unit's own `HOME` decides whether the class can run at all. When
+the probe cannot answer, only the repo it could not answer FOR is skipped: its checkouts are left
+untouched (a checkout whose PR state is unknown is never removed) while the other repos in the same
+pass are still reclaimed. The skip is named twice — `skipped=<repo> reason=<why>` on the class output
+and `skipped_worktree=` in the pass record — and the class verdict stays **fail-closed (3)**: skipping
+a repo is not a pass. `reason=` says which thing failed, because the remedies differ:
+
+| `reason=` | what it means |
+|---|---|
+| `gh-not-authenticated(rc=4)` | `gh` is installed and working but has no credentials for this pass's `HOME`. The remedy is the unit's `HOME` (or `GH_TOKEN`), **not** an install |
+| `gh-missing(rc=127)` | `gh` is not executable for the pass (`GH_BIN`) |
+| `gh-timeout(rc=124)` | `gh` did not answer within `REAP_WT_GH_TIMEOUT` |
+| `gh-error(rc=N)` | the query failed for another reason; the pass log carries `gh`'s own message |
+| `origin-probe-failed(rc=N)` | the repo's `origin` remote could not be read — a git problem, never an auth one |
+| `origin-probe-timeout(rc=124)` | the bounded `git remote get-url origin` did not answer in `REAP_WT_GIT_TIMEOUT` |
+| `git-missing(rc=127)` | `git` is not executable for the pass (`GIT_BIN`) |
+| `scratch-unwritable` | the probe could not create its one scratch file (the path is named in the line above it) |
+
+A token never contains a space, so a repo path or a `TMPDIR` with a space in it cannot split the line
+and turn a named skip back into an anonymous class-wide verdict.
+
+`install-disk-reaper-timer.sh` names this prerequisite **at install time** (a warning, not a refusal:
+a box without working `gh` still wants its `uv` and `venv` classes). A unit installed with a `HOME`
+that cannot authenticate `gh` otherwise goes red every hour while nothing is reclaimed, and the red
+names a cause nobody can act on.
+
+The worktree owner additionally requires the checkout to be
 **clean** (uncommitted work is never destroyed), **reachable** (its commits survive the checkout's
 deletion), and not an open-PR head.
 
@@ -212,13 +242,79 @@ numbers and the dispatch floor are tracked in #2159 / #1852.
 Every pass writes `$DISK_REAPER_STATE_DIR/disk-reaper.status` (default
 `$HOME/.pi/agent/state`), atomically, as `key=value`:
 
+The **state dir is resolved, not assumed** (#2443). The configured dir is used whenever a byte can be
+written to it; when it cannot (a full disk — the exact condition the pass exists for), the lock, log,
+scratch and record move to the first writable tmpfs candidate in
+`DISK_REAPER_STATE_DIR_FALLBACKS` (default `$XDG_RUNTIME_DIR/pi-disk-reaper` then
+`/dev/shm/pi-disk-reaper-<uid>`), and the pass says so on its own output. `DISK_REAPER_TMPFS_ROOT`
+relocates where the default fallback lives (default `/dev/shm`), and an **EMPTY**
+`DISK_REAPER_STATE_DIR_FALLBACKS` disables the fallback entirely, restoring the pre-#2443 hard refusal
+for a box whose configured state dir must be the only one (T46 pins that arm). **The three delegates are
+given that dir too** (`CACHE_REAP_LOCK`/`CACHE_REAP_LOG`, `REAP_WT_STATE_DIR`/`REAP_WT_LOG`,
+`REAP_VENV_LOG`, and `TMPDIR` for scratch) — on a full disk each of them would otherwise fail closed at
+its OWN lock and log in the same unwritable directory, so the pass would "run" and free nothing. The
+record then carries
+`state_dir=` (where the pass ran) and `state_dir_primary=` (the configured dir it could not use), plus
+a `detail=` naming the reason. A writable configured dir produces the unchanged record — no extra
+field, no fallback. The record itself is written to the **configured** path whenever that path is
+writable at the END of the pass (a pass that freed the space may have just unblocked it), so the
+supervisor's read path is preferred and the fallback path is the last resort. With no writable
+candidate anywhere the pass REFUSES (exit 3) and names every candidate it tried — a pass with no
+lock and no readable record is not a pass (T46, T55).
+
+A fallback pass also refuses to run beside a **live pass** (T55f/T55b): the fallback only proves the
+configured dir is unwritable *now*, and a pass that started while it was writable can still be running
+and holding that lock. Because a fallback pass hands the delegates its own state dir, their locks move
+too, so nothing else would keep two `uv cache prune` / `git worktree remove` runs off the same tree.
+**The lock is ONE canonical path**, `${DISK_REAPER_TMPFS_ROOT}/pi-disk-reaper/disk-reaper.lock` —
+deliberately not keyed on the uid, on `$XDG_RUNTIME_DIR`, or on which fallback candidate was resolved,
+because those are exactly the inputs that differ between a **system unit**, an interactive shell and a
+pass run by hand as another account. A lock whose *name* depends on them is a lock those passes do not
+share. Every pass checks the canonical path **and its own configured dir's**, so the ordering this
+paragraph is about — a healthy pass starting while a fallback pass still runs, the fallback having just
+freed the space — is closed (T55f4b), not traded, because one fixed path costs a single stat. (Two
+passes under **different accounts** each check their own configured dir, so the older pass's
+`$HOME` lock is still not visible to the other; that is unchanged from before the fallback and is why
+every pass on a box should share one `DISK_REAPER_STATE_DIR`.) Enumerating "my candidates" / "my uid's tmpfs dir" was tried and abandoned: each variant
+made the set a function of the checker's environment, and each left a reachable ordering where two
+passes reaped concurrently. Two further properties are load-bearing: a lock dir with **no readable
+token** counts as live while it is younger than the stale bound, because the token write can fail on a
+full disk where `mkdir` still succeeded (reading that as "free" was fail-open — T55f2); and liveness does **not** use `kill -0`, which
+returns EPERM for a **live** process owned by another uid and so read a live holder as dead. It uses
+`ps -o lstart=` plus a decision on the **exit status**: `ps -p PID` exits 1 BOTH for "no such process"
+and for "I could not look" (a hardened `/proc` with hidepid, a sandboxed cell, a `PS_BIN` shim), and
+folding the second into the first is fail-OPEN. A control probe (`ps -p $$`) decides which reading
+applies — rc 1 means *absent* only when `ps` can report the pass's own start time, otherwise the
+holder is treated as live for the stale window (T55f4e). The full-disk probe likewise never writes
+through a pre-planted name: a `.disk-reaper-probe.<pid>` that already exists (file, symlink or FIFO)
+refuses the candidate rather than truncating its target or **hanging** the pass on a FIFO — the
+oneshot unit has no timeout, so a hang there is a silently disarmed reaper. Matching is by file identity, not
+string: a trailing slash or a symlink alias must not make a pass refuse against its own lock, which
+would be this feature's own failure — a green unit over a reaper that never reaps (T55f5). If the
+canonical tmpfs dir is itself unusable the pass falls back to a lock inside its state dir and **says
+so**: exclusion then holds only against passes that resolved the same state dir. **The canonical lock is obeyed only when this user owns its directory**, and it is only *used* then
+too: `/dev/shm` is world-writable, so a token planted by another local user could otherwise hold every
+pass — root's included — at exit 6, the one non-zero code the unit accepts, with no record written. A
+foreign directory instead degrades the pass to state-dir locking, which the pass prints. For the same
+reason a **fallback candidate** directory is adopted only when this user owns it; the configured state
+dir is exempt, since a shared or root-run state dir is legitimate. **Residuals:** a peer using a
+*different* `DISK_REAPER_TMPFS_ROOT` is outside the set (pin it identically on every pass); and while
+degraded, exclusion holds only against passes that resolved the same state dir.
+
 ```
 mode=apply ok=0 rc=6 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
 verdict_uv=deferred verdict_venv=ok verdict_worktree=ok
 would_free_mb_* candidates_* repos=/tmp/cell-ai detail=pi-cache-reap.sh exited 7
+skipped_worktree=/tmp/cell-ai[gh-not-authenticated(rc=4)]
 freed_mb_unmeasured=
 ```
+
+`skipped_worktree=` is empty on a pass where every repo could be verified; otherwise it lists
+`<repo>[<reason>], …` — the subject the class verdict never had, so "the worktree class is red" is
+answerable as "one repo, because `gh` has no credentials here" (#2443). It is also printed by
+`disk-reaper.sh --print-status`, which is the surface `cloud-cell-supervisor.sh` reads: a field the
+reader does not print does not exist.
 
 `rc=6` with `detail=… exited 7` is a **deferral**: `pi-cache-reap.sh` ran, found a live `uv` holding
 the cache, declined to act and claimed nothing. The condition is recorded (`ok=0`,
@@ -270,8 +366,8 @@ vocabulary, so on macOS the artifact's **last exit status** is the thing read ag
 |---|---|---|
 | 0 | pass completed, every selected class ok | accepted |
 | 2 | usage — an unknown flag, an unknown `--only` class (including an EMPTY one), a non-numeric number, or a non-boolean `DISK_REAPER_DRY_RUN` | red |
-| 3 | **fail-closed**: a delegate returned its own `3` (it could not measure, verify or reach a probe), a delegate is missing or a class had no repo to scan (per-class `verdict=misconfigured`, record `freed_mb_<class>=not-run`), the pass record could not be written, or a delegate could not run as asked (its `2` = bad arguments, `124` = timeout, `126`/`127` = no such binary). **Also a refusal at startup** when `scripts/lib/bounded.sh` is missing, `TB_TIMEOUT_BIN` is unusable, or a numeric seam (`DISK_REAPER_STALE_SECONDS`, `DISK_REAPER_LOCK_STALE_SECONDS`, the timeouts, the `du` budget) is not a number — or is a digit string too large for the shell to compare (`[ ... ]` parses with `strtoimax`, and an out-of-range value makes the COMPARISON error and take the `else` arm, so such a bound is refused rather than silently ignored: at most 9 digits, ~31 years) — no per-class line is printed there | red |
-| 4 | a class completed but at least one removal FAILED; a lock directory that cannot be created at all; or the **pass record cannot be written** while the verdict was a green one (with no record there is no alarm channel, so 5/6 escalates to 4) | red |
+| 3 | **fail-closed**: a delegate returned its own `3` (it could not measure, verify or reach a probe), a delegate is missing or a class had no repo to scan (per-class `verdict=misconfigured`, record `freed_mb_<class>=not-run`), the pass record could not be written, or a delegate could not run as asked (its `2` = bad arguments, `124` = timeout, `126`/`127` = no such binary). **Also a refusal at startup** when `scripts/lib/bounded.sh` is missing, `TB_TIMEOUT_BIN` is unusable, **neither the state dir nor any `DISK_REAPER_STATE_DIR_FALLBACKS` candidate can be written** (#2443 — a pass with no lock and no readable record is not a pass; the refusal names every candidate), or a numeric seam (`DISK_REAPER_STALE_SECONDS`, `DISK_REAPER_LOCK_STALE_SECONDS`, the timeouts, the `du` budget) is not a number — or is a digit string too large for the shell to compare (`[ ... ]` parses with `strtoimax`, and an out-of-range value makes the COMPARISON error and take the `else` arm, so such a bound is refused rather than silently ignored: at most 9 digits, ~31 years) — no per-class line is printed there | red |
+| 4 | a class completed but at least one removal FAILED; a lock directory that cannot be created at all (a filesystem problem NOTHING could work around — the state dir was writable when it was resolved, so this is the mid-pass case); or the **pass record cannot be written** while the verdict was a green one (with no record there is no alarm channel, so 5/6 escalates to 4) | red |
 | 5 | a class reported **work it would do but did not act on it** (over bound). In an APPLY pass it is ranked with a fail-closed class, because nothing was reclaimed for a real condition | red in apply (`0 5 6` is not the armed set), accepted in a `--report-only` render, where 5 IS the dry run's job |
 | 6 | a **delegate DEFERRED** the pass: it ran, declined to act, and claimed nothing — a live tool holds the cache (`pi-cache-reap.sh` `7`), another cache pass holds its lock (`pi-cache-reap.sh` `4`) — or **this pass did not run because another disk-reaper holds the lock** (benign; no record is written and the previous one stands) | accepted |
 
@@ -406,7 +502,7 @@ when the last run has never happened, and when the pass record's own `rc` is one
 | T43 | a checkout under a path containing a space is measured at its real path, not truncated at the space |
 | T44 | `--status` fails when the pass record **cannot be judged at all** (`--print-status` produced no status line), on both platforms |
 | T45 | fleet-health reads the record at **`DISK_REAPER_STATE_DIR`**, not a hardcoded HOME path — one record, one verdict |
-| T46 | a lock directory that **cannot be created at all** (full/read-only state dir) is a failure (4), never "another pass holds the lock" (6) |
+| T46 | an unwritable state dir with **no fallback** is a REFUSAL (3, RED), never "another pass holds the lock" (6) and never a benign skip (#2443) |
 | T47 | a class that could not be **set up** records `verdict=misconfigured` + `freed_mb=not-run`, never a measured 0 |
 | T48 | a non-numeric `DISK_REAPER_WT_AGED_DAYS` is refused on the **Darwin** install path too |
 | T49 | the pass leaves **no probe scratch** behind — neither on a completed pass nor on a startup refusal |
@@ -415,6 +511,7 @@ when the last run has never happened, and when the pass record's own `rc` is one
 | T52 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder (#2159) |
 | T53 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is RED in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; a uv deferral cannot mask a venv removal failure across classes; and the `7` row is asserted on BOTH sides — uv `7` defers, a venv delegate's out-of-vocabulary `7` is RED (#2156, #2036) |
 | T54 | the stale threshold and the help text: a non-numeric `DISK_REAPER_STALE_SECONDS` is refused on read (never a green `status=ok`), and `--help` still reaches the end of the header — it carries the DEFERRED exit-code bullet and the watchdog pin, so the derived range is what is printing |
+| T55 | **a full disk does not stop the pass** (#2443): an uncreatable state dir falls back to a tmpfs candidate — the classes RUN, the record is written with `state_dir=`/`state_dir_primary=` and says why, and the pass discloses it; the fallback lock is a REAL lock (a live holder still defers, 6); nothing writable anywhere is still a refusal naming every candidate; a writable configured dir produces the unchanged record; and the record returns to the configured path on the next pass once it can be written |
 
 ⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is
 flaky (~4%: one invocation fail-closes with `tmux probe FAILED` and empty probe output, so every §B1

@@ -103,6 +103,32 @@ BEAT_PATH = os.path.join(STATE, "NEEDS-ACTION.beat")
 # ~10 minutes on one machine -- it is not a security boundary.
 MD_SHA_LEN = 12
 
+# ⛔ TWO FACTS A REFUSAL MUST CARRY, AND NEITHER COULD BE DERIVED FROM `rows` (#2227).
+# `_SAMPLED_NOTE` is `lane-status.py`'s own "what I sampled" line, lifted off its stderr: it caps
+# its walks (task dirs, session files, pids, activity files) rather than relying on a timeout, and a
+# capped read that names its cap is usable evidence while a silent one is a lower bound published as
+# the fleet. `_last_good_sentence()` answers "but when did we last actually READ this?" -- with the
+# AGE of the published snapshot, never a value from it (a stale verdict is not a current one).
+_SAMPLED_NOTE = ""
+
+
+def _last_good_sentence():
+    """The last good snapshot is Ns old -- an AGE, never a value, or `none` if there is none.
+
+    A refusal that does not say this cannot be told apart from one that arrived after a blackout: a
+    `TimeoutExpired` minutes after a good read is a busy box, and the same exception after six hours
+    is a dead monitor. Neither may be reported by printing the old verdicts -- the age is the whole
+    of what a refusal is entitled to borrow from the cache.
+    """
+    for p in (os.path.join(STATE, "lane-status.last.json"),
+              os.path.join(STATE, "lane-status.cache")):
+        try:
+            return "the last good snapshot is %ds old (%s)" % (
+                max(0, int(time.time() - os.path.getmtime(p))), display_path(p))
+        except OSError:
+            continue
+    return "there is NO previous snapshot on this box -- nothing has ever been read here"
+
 
 def display_path(p):
     """A path a reader can act on. The beat is read in a terminal whose cwd is the agent home, so
@@ -122,6 +148,40 @@ COLD_MIN = 2 * 60              # decision tree Step 4: "< 2 min -> TOOL-IN-FLIGH
 WARM_MIN = 10 * 60             # decision tree Step 4: "> 10 min -> STEP 5"
 NUDGE_SUPPRESS_S = 3600        # orchestrator-heartbeat.sh NUDGE_SUPPRESS_S
 REGISTRY_GRACE = 6             # a snapshot with fewer lanes than registry-grace is PARTIAL
+# PROTECTED BY A DECLARED LIST, NOT NAMES BURIED IN CODE (owner report 2026-10-20, twice).
+# A workspace the owner created or renamed -- "Personal website" -- was classified as an idle
+# FLEET LANE and received a lane brief for tortoise PR #9150. Protection that depends on
+# remembering which strings are the owner's is the "passes only by remembering" failure the fleet
+# forbids -- so the owner declares them in a file instead of in this source.
+#
+# ⛔ THIS IS A UNION MEMBER ONLY, and Step 0 (below) is the mechanism: a workspace is a fleet lane
+# only when that is DEMONSTRABLE, and a declared entry can ADD protection but never make a lane
+# FLEET. Both arrivals are kept -- the evidence predicate from this branch and the declared list
+# from `main` -- because each protects a case the other does not.
+_OWNER_WS_FILE = os.path.join(os.path.expanduser("~"), ".pi", "agent", "state",
+                              "owner-workspaces.txt")
+
+
+def _owner_workspaces() -> tuple:
+    # ⛔ A MALFORMED FILE MUST NOT TAKE THE TOOL DOWN. This is read at IMPORT time, so an exception
+    # here kills every lane-actions.py invocation -- roster, doctor triage, every classify_row
+    # consumer -- instead of degrading to the historical tuple. Two measured shapes (review, P1):
+    #   * a non-UTF-8 byte, or the UTF-16LE that a PowerShell `>` redirect produces, raises
+    #     UnicodeDecodeError -- whose MRO parent is ValueError, NOT OSError -- so `except OSError`
+    #     missed it and the whole triage tool died at import;
+    #   * a UTF-8 BOM is not whitespace to str.strip(), so a plain `open()` left the FIRST declared
+    #     name as "\ufeffPersonal website", which can never match a lane -- the owner first entry
+    #     would stay unprotected while the roster printed it as PROTECTED.
+    # `utf-8-sig` strips the BOM, `errors="replace"` turns any remaining bad byte into U+FFFD rather
+    # than raising, and ValueError stays caught as the belt to that brace.
+    try:
+        with open(_OWNER_WS_FILE, encoding="utf-8-sig", errors="replace") as f:
+            return tuple(x.strip() for x in f
+                         if x.strip() and not x.lstrip().startswith("#"))
+    except (OSError, ValueError):
+        return ()
+
+
 MAX_NAMES = 4                  # names inline in the beat clause; the rest live in the file
 SUMMARY_MAX = 300
 LAST_MSG_CHARS = 200
@@ -293,6 +353,20 @@ def _busy_sids():
 # reason a lane is FLEET. Leaving them in keeps a DMeer lane protected even if someone later gives it
 # a worktree-shaped cwd, which is exactly what a union member is for.
 PROTECTED_LEGACY_NAMES = ("DMeer", "DMer", "HANG")
+
+
+def _declared_owner_hit(lane):
+    """True when the lane title matches an entry DECLARED in `state/owner-workspaces.txt`.
+
+    The owner-declared list, not a tuple in this source: the failure it answers is precisely
+    "a name nobody remembered", and a file the owner can edit is the only form that does not
+    require a code change to protect their own workspace. A read failure yields `()` (see
+    `_owner_workspaces`), which means NO declared protection -- and Step 0 still protects every
+    cwd that is not demonstrably a fleet worktree, so a lost list cannot make the fleet unsafe;
+    it only loses the belt over that brace.
+    """
+    name = (lane or "").lower()
+    return any(w in name for w in (n.lower() for n in _owner_workspaces()) if w)
 
 
 def _legacy_name_hit(lane):
@@ -1514,11 +1588,18 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None, spawn_markers=None):
         ident, ident_why = lane_identity(r, markers)
         c["identity"], c["identity_why"], c["cwd"] = ident, ident_why, lane_cwd(r)
         legacy = _legacy_name_hit(c["lane"])
-        c["protected"] = (ident != "FLEET") or legacy
+        # The DECLARED list (`state/owner-workspaces.txt`, from `main`) is the second union member.
+        # Matched by SUBSTRING on the title, deliberately: the owner writes whole titles there
+        # ("Personal website"), and for "may I type into this?" a wider match is the safe direction.
+        declared = _declared_owner_hit(c["lane"])
+        c["protected"] = (ident != "FLEET") or legacy or declared
         if legacy and ident == "FLEET":
             c["identity_why"] = ("%s; also matched a historical owner lane name (%s) -- the name "
                                  "list is an ADDITIONAL union, not the mechanism"
                                  % (ident_why, "/".join(PROTECTED_LEGACY_NAMES)))
+        elif declared and ident == "FLEET":
+            c["identity_why"] = ("%s; also DECLARED as the owner's in %s -- a union member, never "
+                                 "the mechanism" % (ident_why, display_path(_OWNER_WS_FILE)))
         c["busy"] = bool(r.get("sid") and r["sid"] in busy)
         # Messages are read ONLY where they can change an outcome: a lane proven WORKING by CPU
         # time, or waiting on a live child, or inside a declarable tool budget needs no report at
@@ -1748,6 +1829,9 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None, spawn_markers=None):
             "dispatch_targets": [c["lane"] for c in idle],
             "meta": meta, "jev_down": jev_down, "words_read": bool(words_read),
             "procmap": procmap_note,
+            # `lane-status`'s SAMPLED note, when its bounded walk truncated (#2227). Carried here
+            # so `render_md` can say it in the artifact a human reads, not only on stderr.
+            "sampled": _SAMPLED_NOTE,
             "n_lanes": len(rows), "n_registry": len(labels), "files": files,
             "n_protected": n_protected, "n_identity_unread": n_identity_unread,
             # the rows that actually reached a bucket: `n_lanes` is the PRE-filter count, so a lane
@@ -1772,6 +1856,15 @@ def render_md(res, snapshot_age, source):
              "(snapshot %ss old, %d lanes). Tree: `state/LANE-STATE-DECISION-TREE.md`._"
              % (ts, snapshot_age, res["n_lanes"]))
     L.append("")
+    # ⛔ A CAPPED SCAN SAYS SO IN THE ARTIFACT, NOT ONLY ON STDERR (#2227). `lane-status` bounds its
+    # walks and reports what it sampled; a reader of this file is deciding whether to dispatch, so
+    # "the roster was truncated" belongs where the verdicts are, not in a log the reader does not
+    # see. `res["sampled"]` is empty on an uncapped scan, so the ordinary document is unchanged.
+    if res.get("sampled"):
+        L.append("> **PARTIAL SCAN.** `%s` -- lanes beyond the cap were NOT read, so a lane"
+                 " missing from these lists is not proof that nothing is wrong with it."
+                 % res["sampled"])
+        L.append("")
     # A SNAPSHOT OLDER THAN THE TICK'S OWN BOUND IS NORMAL, NOT AN ERROR -- but every age below is
     # measured against the SNAPSHOT, so a reader who does not know its age will read a 12-minute-old
     # verdict as a live one. The tick is bounded at 390s and its scan is the LAST thing it does, so
@@ -1791,8 +1884,9 @@ def render_md(res, snapshot_age, source):
                                               for c in res["quiet"]) or "none"))
     L.append("- PROTECTED lanes (not demonstrably the fleet's -- the owner's own workspaces, and any "
              "lane whose cwd is UNREADABLE) and auto-nudged (BUSY) lanes are never offered as work. "
-             "The historical names (%s) are an ADDITIONAL union only, never the mechanism."
-             % "/".join(PROTECTED_LEGACY_NAMES))
+             "Protection is the EVIDENCE predicate; the historical names (%s) and any entry in %s "
+             "are ADDITIONAL union members only, never the mechanism."
+             % ("/".join(PROTECTED_LEGACY_NAMES), display_path(_OWNER_WS_FILE)))
     L.append("- Entry format: `- <lane> [<verdict> <confidence>] (<how long since its last output>) "
              "[<cmux-workspace-uuid>] \u2014 <last message>` -- the WHY line below carries every other "
              "age (the words, the child, the tool) so no number here has to be guessed at.")
@@ -1987,6 +2081,8 @@ def load_snapshot(args, LS=None):
     # COMPOSE: the attempts share one budget, so this tool can never outlive its caller.
     budget = max(1.0, float(args.budget))
     deadline = time.monotonic() + budget
+    _read_t0 = time.monotonic()      # for the refusal's "how long it waited" (#2227)
+    _sampled = ""                    # lane-status's SAMPLED note, carried into the header
     # ⛔ THE RETRY MUST NOT BE STARVED BY THE ATTEMPT IT IS FIXING (#1788, #1774). A shared
     # deadline alone subtracts attempt 0's cost from the retry's allowance, so on a loaded box
     # (measured: 250-300s per scan) a 200s first attempt left the `--no-cache` scan ~220s -- the
@@ -2008,8 +2104,18 @@ def load_snapshot(args, LS=None):
         cmd = ["/usr/bin/python3", LS_PATH, "--json", "--sample", str(args.sample)]
         if attempt:
             cmd.append("--no-cache")
+        # ⛔ THE SCAN'S OWN SAMPLING NOTE COMES BACK ON STDERR, AND IT MUST NOT BE DROPPED (#2227).
+        # lane-status caps its walks and says what it sampled; a consumer that reads only stdout
+        # would republish a truncated roster as the fleet -- the exact silent lower bound the cap
+        # exists to avoid. Captured here and carried into the generated header below.
+        _sampled = ""
+        _attempt_t0 = time.monotonic()
         try:
-            raw = subprocess.run(cmd, capture_output=True, text=True, timeout=allowance).stdout
+            _r = subprocess.run(cmd, capture_output=True, text=True, timeout=allowance)
+            raw = _r.stdout
+            _sampled = next((ln.strip() for ln in (_r.stderr or "").splitlines()
+                             if ln.startswith("lane-status: SAMPLED")), "")
+            globals()["_SAMPLED_NOTE"] = _sampled
             rows = json.loads(raw)
             # ⛔ `_refuse_if_degraded` RAISES `SystemExit`, WHICH IS A `BaseException` (2026-10-18,
             # review). `except Exception` therefore did NOT catch it, so a DEGRADED re-scan escaped
@@ -2033,7 +2139,18 @@ def load_snapshot(args, LS=None):
                        "the fleet size is unknown" if want is None
                        else "wanted >= %d" % max(0, want - REGISTRY_GRACE)))
                 return first[:3]
-            raise SystemExit("lane-actions: lane-status.py failed: %r" % (e,))
+            # ⛔ A REFUSAL NAMES ITSELF (#2227): WHAT IT TRIED, HOW LONG IT WAITED, AND THE AGE OF
+            # THE LAST GOOD SAMPLE. `lane-status.py failed: TimeoutExpired` was the whole message
+            # pr-doctor surfaced for a fleet read that had actually happened minutes earlier --
+            # the reader could not tell a hung tool from a busy box, and the age of the last real
+            # snapshot (the thing that decides whether to act) was not printed at all.
+            # `last_good` is an AGE from the published snapshot's mtime, never a value from it.
+            raise SystemExit(
+                "lane-actions: lane-status.py failed after %.1fs of a %ss budget "
+                "(tried: lane-status.py --json --sample %s%s; %s: %s); %s"
+                % (time.monotonic() - _attempt_t0, args.budget, args.sample,
+                   "" if attempt else ", then --no-cache", type(e).__name__, str(e)[:120],
+                   _last_good_sentence()))
         try:
             age = int(time.time() - os.path.getmtime(
                 os.path.join(STATE, "lane-status.cache")))
@@ -2055,7 +2172,9 @@ def load_snapshot(args, LS=None):
                             len(rows), want if want is not None else "an unknown fleet size"))
     if best is None:
         raise SystemExit("lane-actions: no snapshot could be read within the %ss budget "
-                         "(the first scan never finished)" % (args.budget,))
+                         "(waited %.1fs across both attempts); %s"
+                         % (args.budget, time.monotonic() - _read_t0,
+                            _last_good_sentence()))
     # ⛔ WHAT IS RETURNED HERE IS THE NEWEST READ, NOT THE FIRST ONE -- AND IT IS NOT COMPLETE.
     # The recorded rule ("None means UNKNOWN, so take the strongest read available") still holds:
     # this returns the strongest read that could be OBTAINED, and says on stderr that its
