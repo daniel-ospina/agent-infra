@@ -2012,7 +2012,10 @@ whose pin agrees but whose controller is not RUNNING is `deployed-but-NOT-activa
 at this pin VERIFIED and the controller has been stopped since (an operator's stop)` when that
 row says VERIFIED, `OUR last activation of this box did not verify (N unverified attempt(s);
 last verdict: …)` otherwise, and `no activation of this box is recorded at this pin` when the
-ledger is empty. A status command that never answered the controller question is
+ledger is empty. The drifted `controller=STOPPED` branch makes the same three-way reading. ⛔ The
+deploy BOUND is the CURRENT streak — unverified attempts since the box last provably reached
+this pin — so an arrival clears it; a lifetime total refused every later, legitimate attempt
+while quoting a count the ledger's own last row denied. A status command that never answered the controller question is
 `UNPROVEN controller=UNREADABLE`, never `deployed-but-NOT-activated`. Calling that row `current` made the table contradict the goals
 block one section above it, which reads the same box as `MARKERS-BROKEN — controller=STOPPED`. The boxes are an
 inventory (`$O/state/boxes.tsv`: `name<TAB>status-cmd<TAB>activate-cmd`), so a cell is driven through
@@ -2082,7 +2085,7 @@ is still matched by its script path, and that legacy fallback is the only place 
 abstention (exit 3) that rewrites nothing, rather than an empty crontab it would overwrite.
 
 **Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§28,
-274 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+277 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
 unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
 how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
 -l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the

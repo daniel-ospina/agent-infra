@@ -1919,14 +1919,14 @@ ck "§28 a drifted cell BREAKS goal 2's marker" \
 ck "§28 ...and the drifted box is NAMED with its reading" \
    "$(qF "cell-2=${OTHER:0:12} [behind]" "$MDF" && echo 0 || echo 1)"
 ck "§28 ...and the count says 1/2 on main, not 'autonomous'" \
-   "$(qF '1/2 on this cycle' "$MDF" && nq 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
+   "$(qF '1/2 box(es) on this cycle' "$MDF" && nq 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
 # All boxes current: the marker HOLDS, and the report says what that is worth (not proof).
 write_no_landing; reset_o
 printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-cur.sh" "$TMP/box-cur.sh" > "$O/state/boxes.tsv"
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 every box on the pin ⇒ MARKERS-HOLD" \
-   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF '2/2 on this cycle' "$MDF" && echo 0 || echo 1)"
+   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF '2/2 box(es) on this cycle' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and it says the marker is not proof of autonomy" \
    "$(qF 'That is the marker, not proof' "$MDF" && echo 0 || echo 1)"
 
@@ -1952,7 +1952,7 @@ ck "§27 a box answering [current] at ANOTHER commit BREAKS the marker" \
 ck "§27 ...and the line says it is a different commit from this cycle's main" \
    "$(qF 'a different commit from this cycle' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and only 1 of 2 counts as on main" \
-   "$(qF '1/2 on this cycle' "$MDF" && nq 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
+   "$(qF '1/2 box(es) on this cycle' "$MDF" && nq 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
 # A stamp identity is a SEED RECORD, not a running process: it cannot hold the marker either.
 write_no_landing; reset_o
 printf 'harness: %s [current] source=stamp\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
@@ -2162,6 +2162,61 @@ MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a box that never answered the controller is UNPROVEN, not 'not activated'" \
    "$(qF 'UNPROVEN controller=UNREADABLE' "$MDF" && nq 'deployed-but-NOT-activated' "$MDF" \
       && echo 0 || echo 1)"
+# ⛔ THE LEDGER'S *LAST* VERDICT, IN BOTH FILE ORDERS. Every row is an attempt; the answer is the
+# newest EPOCH, not the last line on disk. Neither `deploy_attempts` branch had discriminating coverage
+# (three mutants - count every row, first row wins, last line wins - all stayed green, because the only
+# multi-row case wrote identical verdicts at identical epochs).
+write_no_landing; reset_o
+now_epoch="$(date +%s)"
+printf 'cell-1\t%s\t%s\t%s\tVERIFIED harness=%s [current] controller=RUNNING\n' \
+  "${OTHER:0:12}" "${MAIN12}" "$now_epoch" "$MAIN12" > "$O/state/merge-reminder.deploys"
+printf 'cell-1\t%s\t%s\t%s\tUNVERIFIED harness=%s [current] controller=STOPPED\n' \
+  "${OTHER:0:12}" "${MAIN12}" "$((now_epoch - 500))" "$MAIN12" >> "$O/state/merge-reminder.deploys"
+printf 'harness: %s [behind] source=pin\ncontroller: STOPPED\nroles: idle\n' \
+  "$MAIN12" > "$FX/box.drift-stop.txt"
+cat > "$TMP/box-drift-stop.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.drift-stop.txt"
+STUB
+chmod +x "$TMP/box-drift-stop.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-drift-stop.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a drifted STOPPED box whose last row VERIFIED reads as an operator's stop (file order A)" \
+   "$(qF 'our activation at this pin VERIFIED' "$MDF" && nq 'did not verify' "$MDF" && echo 0 || echo 1)"
+# ...and the SAME ledger with its lines swapped must read the same way (the epoch decides, not the file).
+printf 'cell-1\t%s\t%s\t%s\tUNVERIFIED harness=%s [current] controller=STOPPED\n' \
+  "${OTHER:0:12}" "${MAIN12}" "$((now_epoch - 500))" "$MAIN12" > "$O/state/merge-reminder.deploys"
+printf 'cell-1\t%s\t%s\t%s\tVERIFIED harness=%s [current] controller=RUNNING\n' \
+  "${OTHER:0:12}" "${MAIN12}" "$now_epoch" "$MAIN12" >> "$O/state/merge-reminder.deploys"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 ...and reads the same way when the file's ORDER is reversed" \
+   "$(qF 'our activation at this pin VERIFIED' "$MDF" && nq 'did not verify' "$MDF" && echo 0 || echo 1)"
+
+# ⛔ AND THE BOUND IS THE CURRENT STREAK, NOT A LIFETIME TOTAL: three failures followed by a VERIFIED
+# arrival must not keep refusing every later attempt with a count the ledger's own last row denies.
+printf 'cell-1\t%s\t%s\t%s\tUNVERIFIED\n' "${OTHER:0:12}" "${MAIN12}" "$((now_epoch - 3000))" \
+  > "$O/state/merge-reminder.deploys"
+printf 'cell-1\t%s\t%s\t%s\tUNVERIFIED\n' "${OTHER:0:12}" "${MAIN12}" "$((now_epoch - 2400))" \
+  >> "$O/state/merge-reminder.deploys"
+printf 'cell-1\t%s\t%s\t%s\tUNVERIFIED\n' "${OTHER:0:12}" "${MAIN12}" "$((now_epoch - 1800))" \
+  >> "$O/state/merge-reminder.deploys"
+printf 'cell-1\t%s\t%s\t%s\tVERIFIED harness=%s [current] controller=RUNNING\n' \
+  "${OTHER:0:12}" "${MAIN12}" "$((now_epoch - 1200))" "$MAIN12" >> "$O/state/merge-reminder.deploys"
+printf 'harness: %s [behind] source=pin\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
+  "$MAIN12" > "$FX/box.drift-run.txt"
+cat > "$TMP/box-drift-run.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.drift-run.txt"
+STUB
+chmod +x "$TMP/box-drift-run.sh"
+printf 'cell-1\tbash %s\tbash true\n' "$TMP/box-drift-run.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 3 failures then a VERIFIED arrival do NOT count toward the deploy bound" \
+   "$(nq 'REFUSE(deploy-attempts=3' "$MDF" && nq 'has not reached' "$MDF" && echo 0 || echo 1)"
+
 # ⛔ AND A **VERIFIED** ATTEMPT IS NOT OUR DAMAGE. The ledger records every dispatch, including the
 # ones that ended `VERIFIED … controller=RUNNING`; counting those as failures inverted the sentence
 # a second time (a successful activation followed by an operator's stop read as the arm's own damage).
@@ -2272,7 +2327,7 @@ b = m.Budget("gh")
 b.search_calls = m.GOAL_SEARCH_BUDGET
 lines, actions = m.goal_progress([row], b, "o/r", main_sha="a" * 12)
 txt = "\n".join(lines + actions)
-ok = ("STANDING=MARKERS-HOLD" in txt and "(1/1 on this cycle's main)" in txt
+ok = ("STANDING=MARKERS-HOLD" in txt and "(1/1 box(es) on this cycle's main, deployed AND activated)" in txt
       and "LOCAL ONLY" in txt and "not compared" not in txt)
 print(0 if ok else 1)
 PY2

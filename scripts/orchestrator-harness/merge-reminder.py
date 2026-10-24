@@ -972,7 +972,7 @@ DEPLOY_MAX_ATTEMPTS = 3
 
 
 def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int, str]:
-    """-> (attempts recorded for this box TOWARDS `to`, epoch of the LAST one, that row's VERDICT).
+    """-> (UNVERIFIED attempts since it last reached `to`, epoch of the newest row, that row's VERDICT).
 
     ⛔ THE VERDICT IS PART OF THE ANSWER. Every dispatched attempt is recorded, including ones that
     ended `VERIFIED … controller=RUNNING`, so "an attempt exists at this pin" is NOT "our last
@@ -998,7 +998,7 @@ def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int, str
         text = read_artifact(p)
     except (OSError, ValueError):
         return 0, 0, ""
-    n, last, last_verdict = 0, 0, ""
+    rows: list[tuple[int, str]] = []
     to12 = to[:12]
     for line in text.splitlines():
         # ⛔ TAB, NOT SPACE: a box name is human-authored (`name<TAB>status<TAB>activate`) and may
@@ -1008,13 +1008,21 @@ def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int, str
         if len(parts) >= 4 and parts[0] == box and parts[2] == to12:
             verdict = (parts[4] if len(parts) > 4 else "").strip()
             try:
-                epoch = int(parts[3])
+                rows.append((int(parts[3]), verdict))
             except ValueError:
                 continue
-            if epoch >= last:
-                last, last_verdict = epoch, verdict
-            if not verdict.startswith("VERIFIED"):
-                n += 1
+    if not rows:
+        return 0, 0, ""
+    # ⛔ ORDERED BY EPOCH, NOT BY LINE: an out-of-order (or hand-edited) ledger must not let an old
+    # row be read as "the last thing that happened".
+    rows.sort()
+    last, last_verdict = rows[-1]
+    # ⛔ THE BOUND IS THE CURRENT STREAK, NOT A LIFETIME TOTAL. `n` means "unverified attempts SINCE
+    # the box last provably reached this pin": a box that failed three times and then VERIFIED has
+    # arrived, and carrying those three forever refused every later, legitimate attempt while the
+    # refusal quoted a count the ledger's own last row denied.
+    reached = max((e for e, v in rows if v.startswith("VERIFIED")), default=-1)
+    n = sum(1 for e, v in rows if e > reached and not v.startswith("VERIFIED"))
     return n, last, last_verdict
 
 
@@ -1180,7 +1188,10 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                 # apply -> start` chain whose `apply` failed leaves the cell DOWN; reporting that as
                 # "the operator stopped it" would bury the arm's own damage.)
                 n, _last, last_verdict = deploy_attempts(o, name, d["harness"], main_sha)
-                why = (f" — our last activation of this box did not verify ({n} unverified "
+                why = (" — our activation at this pin VERIFIED and the controller has been stopped "
+                       "since (an operator's stop; this arm does not restart it)"
+                       if last_verdict.startswith("VERIFIED") else
+                       f" — our last activation of this box did not verify ({n} unverified "
                        f"attempt(s); last verdict: {last_verdict or '<none>'}); a human must confirm the "
                        f"box state before this arm touches it again"
                        if n else
@@ -2029,7 +2040,11 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         # reason then printed twice. The mixed case states the PARTIAL count instead.
         "  harness: " + _drift_text(drift) +
         ("" if not drift else
-         f" ({len(currents)}/{len(drift)} on this cycle's main)" if compared else
+         # ⛔ THE LABEL NAMES THE PREDICATE IT COUNTS. `on_pin` requires main AND activation, so
+         # "on this cycle's main" let a row say `[current]` beside a fraction that excluded it — the
+         # two-readers defect inside one line.
+         f" ({len(currents)}/{len(drift)} box(es) on this cycle's main, deployed AND activated)"
+         if compared else
          f" ({len(drift) - len(measured)} of {len(drift)} box(es) gave no answer)"
          if (main_sha and measured) else
          f" (not compared — {why_not_compared})"),
