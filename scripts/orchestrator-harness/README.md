@@ -586,13 +586,15 @@ Two ordering rules in that contract are load-bearing, both measured (2026-10-22)
   not in tmux's `update-environment` list. So with a server in place, the credential must be in the
   worker's HOME/`keys.env` or in the server's own environment — either name, non-empty; else refused.
 
+A `none` verdict is **not** allowed to be mute: `wt_launcher_why` carries the probe's own answer (one call, stderr only) into the controller's `[startup]` line — `[startup] worker launcher=none (cmux=yes, uname=Linux) — cmux tree --json failed (rc=1): cmux: cmux-tui daemon binary not found at …` — and into `wt_spawn`'s `none` refusal (`REFUSED … — why: …`; the other thirteen `REFUSED` lines report their own failure directly and do not repeat it — fourteen in total, re-counted after the rebase onto main, which added four). Measured on cell-1, 2026-10-22 (agent-infra#2366): without it, `launcher=none` was indistinguishable from a tty gate, a `TERM` gate, a drifted probe shape or an absent daemon, and the diagnosis it was already holding took an investigation to re-derive. The suffix appears **only** for `none`; `tmux` on launchd and `terminal` on a cell are healthy states and are not stamped `failed:`. A `none` startup line costs **two** `cmux tree` calls (the verdict's and the reason's) — a pinned count, not a guess.
+
 There is **no env override** for the launcher: a gate an agent can defeat with an export is not a gate.
 (`WT_WORKER_HOME` is not a launcher override — it names the HOME that holds a worker's credentials, an
 input to the environment contract.)
 Around the spawn, three properties hold:
 
 - **the concurrency caps still bind** — `wt_count` reads ONE census (`cmux tree --json` plus the tmux
-  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s, because every caller reads it
+  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s (the absent-owner confirmation window is `WT_ABSENT_CONFIRM=60`s — overridable, but `0` is NOT "off": it is coerced to 60, because zero would confirm on ONE sample), because every caller reads it
   through a command substitution), and a worker is identified the way its launcher named it: by the
   `wt-<worker>` workspace for the layout grammar, and by its **terminal id** (recorded at spawn) for
   `surface new-terminal`, which takes no name. Its polarity is fail-CLOSED in BOTH halves: a `cmux
@@ -602,8 +604,12 @@ Around the spawn, three properties hold:
   ⛔ **but "cannot be read" is not "is not there", and the difference is the whole census.** An
   ABSENT session owner is a *reading*, not an unreadable one: a terminal lives inside the session
   owner, so `cmux tree` answering `cannot connect to session socket …: Connection refused` (empty
-  stdout, nothing listening) means no durable terminal exists, and its records are **dead** — the same
-  polarity the tmux half already applies to `no server running`. A daemon that ANSWERS with something
+  stdout, nothing listening) means no durable terminal exists, and once that answer is **CONFIRMED —
+  two samples at least `WT_ABSENT_CONFIRM` (default 60 s) apart** — its records are **dead**; a single
+  refusal only opens the window and keeps the caps binding (a hard-killed owner leaves pty children
+  behind, and a restart window is seconds), while a readable census — or a successful terminal spawn,
+  which proves the owner answered — or ANY answer that is neither readable nor absent (a banner, the `cannot connect …: No such file or directory` wrapper) closes it again, and a stamp older than `WT_ABSENT_STALE_MIN` = **max(4×`CYC`, 2×`WT_ABSENT_CONFIRM`)** (never narrower than the window) — or one dated in the future — is treated as a first sample rather than a confirmed one. This is the same polarity the tmux half already
+  applies to `no server running`. A daemon that ANSWERS with something
   undecodable (a banner, a drifted shape, `cmux: cannot read`) is still UNKNOWN and still pins every
   cap. Without that distinction there is no bound anywhere between "unreadable" and "slot held":
   measured 2026-10-24, a dead daemon left 18 stale worker records counted as 18 live workers for 26h,

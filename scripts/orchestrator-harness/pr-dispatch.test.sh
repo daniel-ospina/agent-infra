@@ -29,8 +29,25 @@ trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 ok()  { echo "  ✅ $1"; PASS=$((PASS+1)); }
 bad() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+clear_workers() {
+  local f
+  for f in "$TMP/O/state"/worker-* "$TMP/O/state/.wt-census"; do
+    [ -e "$f" ] && mv "$f" "$TMP/worker.spent.$RANDOM" 2>/dev/null
+  done
+  return 0
+}
+
 
 [ -f "$ORCH" ] || { echo "FATAL: $ORCH not found"; exit 1; }
+# ⛔ THE HOST'S OWN TMUX MUST NOT LEAK INTO THIS SUITE'S CENSUS (agent-infra#2653 review round 12).
+# `wt_table` counts worker-named tmux sessions with no record of their own; on a box where the
+# controller is RUNNING those are real, so the lane-count assertions read `10/9` or `12/9` depending on
+# what the machine was doing. ⛔ A SHELL FUNCTION IS NOT ENOUGH — the census invokes tmux through
+# `wt_bounded` (`perl -e 'alarm shift; exec @ARGV'`), i.e. `exec`, which can only find a FILE. So this
+# is a file stub answering the EMPTY polarity (`no server running` => no tmux session can exist).
+mkdir -p "$TMP/bin-tmuxnone"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "no server running on /tmp/fixture"\nexit 1\n' > "$TMP/bin-tmuxnone/tmux"
+chmod +x "$TMP/bin-tmuxnone/tmux"
 
 # ── the shipped quoter (the spawn lines call `shq`) ───────────────────────────────────────────────
 grep -E '^shq\(\) \{' "$ORCH" > "$TMP/shq.sh"
@@ -224,6 +241,12 @@ PY
         *) return 0 ;;
       esac
     }
+    # ⛔ NEUTRALISE THE HOST'S OWN TMUX (measured, agent-infra#2653 round 11): `wt_table` counts
+    # worker-named tmux sessions that have no record of their own, so on a box where the controller is
+    # RUNNING this suite's census was `9 fixture lanes + the box's live merge-*/fix-* sessions` — the
+    # lane-count assertions then read 12/9 and depended on what the machine happened to be doing. A
+    # stub that answers nothing makes the tmux arm UNKNOWN, which invents no rows.
+    PATH="$TMP/bin-tmuxnone:$PATH"
     sess() { return 1; }
     claim_live() { return 1; }
     can_spawn() { return 0; }
@@ -304,6 +327,7 @@ PY
     # the mergeability probe IS the routing decision, so the stub must answer it (a stub that prints
     # nothing makes the arm read MSTAT="" and fall through — silently grading the wrong path).
     gh() { echo "GH $*" >> "$TMP/gspy"; case "$*" in *mergeable*) echo CONFLICTING ;; esac; return 0; }
+    PATH="$TMP/bin-tmuxnone:$PATH"   # see the file stub at the top: the host's live sessions must not leak
     sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
     # …and the CI-queue predicate for the same reason as `drive()` above: the CONFLICTING arm now
@@ -351,7 +375,7 @@ drive "" rail 0
 
 echo
 echo "=== T1: a claim has a spawn behind it, and a failed spawn is never silent ==="
-drive GREEN rail 0 1
+clear_workers; drive GREEN rail 0 1
 _g=$(spawns); _a="$(acts)"
 [ "$_g" -ge 1 ] && [ "$_a" = "1" ] && [ "$_g" = "$_a" ] \
   && ok "GREEN+rail: 1 spawn and exactly 1 \`act\` row (the ledger's act count IS the spawn count)" \
@@ -459,6 +483,11 @@ seed_revdisp()  { printf '%s %s\n' "$1" "$2" > "$REV_DISP"; }
 # here shares ONE `$O/state`. Leaving it in place routes these drives into the FIXER arm and the whole
 # section would then grade a path it never reached — measured: (a) reported "spawns=1" for a fixer.
 clear_needsfix() { mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.spent.$RANDOM" 2>/dev/null || true; }
+# ⛔ A DRIVE THAT SPAWNS LEAVES A WORKER RECORD, WHICH INFLATES THE NEXT DRIVE'S CENSUS (measured):
+# the `lanes-in-use` fixture says 9, and a leftover `worker-merge-4242` made the same assertion read
+# `review lanes=10/9`. Records are files, so move the ones this fixture's PR could own out of the way —
+# `mv`, never `rm` on a `$TMP/…` path (#709).
+clear_workers
 # The shipped park_ctrl WRITES parked/parkreason into the shared `$TMP/O/state`, so each park assertion
 # starts from a clean slate: a leftover `parked-4242` from an earlier drive would make the next
 # assertion pass for the wrong reason (and the negative one — a failed spawn parks nothing — impossible).
@@ -689,12 +718,19 @@ mv "$TMP/O/state/parked-4242" "$TMP/parked.m.dir.$RANDOM" 2>/dev/null || true
 
 # (d) the review-LANE cap still binds, and the refusal NAMES its holders and their age
 clear_store; clear_revdisp
-drive 'FAILED:ai-review-gate' rail 9 1
-if [ "$(spawns)" = "0" ] && grep -q 'NO re-record slot (review lanes=9/9' "$TMP/d.log" \
+clear_workers; drive 'FAILED:ai-review-gate' rail 9 1
+# ⛔ THE NUMERATOR IS PINNED AT 9 (review round 12 of #2653): `wt_table` also counts worker-named TMUX
+# sessions that have no record of their own, and on a box where the controller is RUNNING those are
+# real — which is why this assertion was briefly widened to `[0-9]+`. The cause is fixed in the fixture
+# now (the host's tmux is stubbed out in `drive`, and `clear_workers` removes the records a previous
+# drive's spawn left), so the count IS the 9 merge lanes the `lanes-in-use` knob writes, and pinning it
+# also keeps the census's OVER-count regression class (a worker counted more than once — this file's own
+# `w:`/`t:`/name triple) from passing as "the ceiling was reached anyway".
+if [ "$(spawns)" = "0" ] && grep -Eq 'NO re-record slot \(review lanes=9/9' "$TMP/d.log" \
    && grep -q 'holding: merge-0(120m)' "$TMP/d.log"; then
   ok "(d) review-lane ceiling reached => refused, and the line names the lanes holding it WITH their age"
 else
-  bad "(d) spawns=$(spawns) log=$(head -2 "$TMP/d.log" | tr '\n' ';') — a count with no owner is the state that hid the stall"
+  bad "(d) spawns=$(spawns) state=[$(ls "$TMP/O/state" | grep -c '^worker-' )] files=[$(ls "$TMP/O/state" | grep '^worker-' | tr '\n' ',')] log=$(tr '\n' ';' < "$TMP/d.log") — a count with no owner is the state that hid the stall"
 fi
 
 # (e) once the review is recorded the MERGE path is reached, and the issue path's own rule opens
