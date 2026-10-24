@@ -199,6 +199,12 @@ STUB
 # suite went red on its own deployment target, and the `--uninstall` arm resolved the MACHINE-SCOPE
 # copy and issued `disable --now` plus `rm -f` against it. A fixture that can reach the host is not a
 # hermetic suite, and this one would have been red on every cell it is meant to protect.
+# ⛔ THE USER-SCOPE READ SEAM IS PINNED TOO (re-review P2, #2666). `installed_user_unit_dirs` now feeds the
+# `--install` second-supervisor guard, so an ambient `CONTROLLER_USER_UNIT_DIR` (a documented supervisor
+# seam) pointing at a directory holding the PRODUCTION unit would make every `--install` arm refuse
+# "a unit is already installed at …" — the same false red this fixture already prevents for the system
+# seam. `sup` pins it for the same reason; `inst` must now agree. Arms that need it set pass it through
+# `EXTRA_ENV`, which comes after this line and therefore wins.
 inst() {
   local r="$T/$1"; shift
   # ⛔ THE FIXTURE ASKS FOR A ROOT INSTALL EXPLICITLY (review P2 round 16, #2402). The installer now refuses
@@ -207,7 +213,7 @@ inst() {
   # fixture carries the same explicit opt-in an operator would; the one arm that must SEE the refusal
   # (`§G`, root is refused) runs `inst` with `EXTRA_ENV` unsetting it, so the rule is exercised, not bypassed.
   bnd env ORCH_SUPERVISOR="$SUP" SYSTEMCTL="$r/bin/systemctl" SYSTEMD_UNIT_DIR="$r/units" \
-      CONTROLLER_SYSTEM_UNIT_DIR="$r/units" CONTROLLER_ALLOW_ROOT=1 \
+      CONTROLLER_SYSTEM_UNIT_DIR="$r/units" CONTROLLER_USER_UNIT_DIR="$r/nouser" CONTROLLER_ALLOW_ROOT=1 \
       TEMPLATES_DIR="${TPL_DIR:-$(dirname "$TPL")}" HOME="$r/home" CELL_HOME="$r/home" \
       ENV_FILE="$r/home/keys.env" O="$r/o" PATH="$r/bin:$PATH" ELDATO_PLATFORM="${PLATFORM:-Linux}" \
       ${EXTRA_ENV:-} bash "$INST" "$@"
@@ -1122,6 +1128,255 @@ HS_RC=0; HS_OUT="$(SC_PROOF=stale CONTROLLER_PROOF_TIMEOUT=4 inst hs --install 2
 [ "$HS_RC" -ne 0 ] && ok 'install: a PRE-START heartbeat does not certify the install' \
                    || bad "install: certified a unit from a heartbeat that predates its start — $HS_OUT"
 
+# ⛔ THE PROOF POLL MUST OUTWAIT THE PHASE IT WATCHES (review P1, #2402). `systemctl start` forks
+# (`Type=simple`), so the poll begins BEFORE `ExecStart`'s `start` has run `harness_apply` + `cmd_check` and
+# `exec`ed the loop — the phase the supervisor budgets 600 s for. The poll defaulted to 240 s while its own
+# predicate accepts a heartbeat up to `2 × CYC` (480 s): a controller whose first witness landed between
+# 240 s and 480 s was ACCEPTED by the predicate and never observed, so `--install` printed "NO CONTROLLER
+# PROVED ITSELF in 240s", `cloud-cell-bringup.sh` died on that rc, and CELL READY was refused on a healthy
+# cell. Pinned two ways: the default is asserted from the shipping source (an arm cannot wait 600 s), and
+# the refusal names the RESOLVED budget, so the message can never again contradict the wait.
+say_case 'the controller-proof poll budgets at least the start phase it observes'
+case "$(grep -c 'CONTROLLER_PROOF_TIMEOUT:-600' "$INST" 2>/dev/null || true)" in
+  0) bad 'the proof poll default is not 600 s — it cannot observe the 600 s start phase the supervisor budgets' ;;
+  *) ok 'the proof poll default is the start budget (600 s), not 240 s' ;;
+esac
+grep -q 'CONTROLLER_PROOF_TIMEOUT:-240' "$INST" 2>/dev/null \
+  && bad 'the 240 s default is still in the source — the poll would abandon the phase it observes' \
+  || ok 'the 240 s default is gone'
+HPT="$(arm_root hpt)"; mk_systemctl "$HPT/bin" "$HPT/state" "$HPT/sc.log"
+HPT_RC=0; HPT_OUT="$(SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst hpt --install 2>&1)" || HPT_RC=$?
+[ "$HPT_RC" -ne 0 ] && ok 'proof budget: the no-proof refusal still fires under the override' \
+                    || bad "proof budget: certified an install with no proof under a 4 s budget — $HPT_OUT"
+case "$HPT_OUT" in
+  *'in 4s of 4s (CONTROLLER_PROOF_TIMEOUT)'*) ok 'proof budget: the refusal names the RESOLVED budget AND the elapsed wait, not a stale constant' ;;
+  *) bad "proof budget: the refusal does not name the budget it waited — $HPT_OUT" ;;
+esac
+
+# ⛔ A WRITE TARGET systemd LOADS AND THIS FLEET'S READERS DO NOT IS A SECOND DISPATCHER (review P1, #2402).
+# `SYSTEMD_UNIT_DIR=/etc/systemd/system.control` installed an ENABLED, BOOT-ARMED unit that `start`/`stop`/
+# `status` cannot discover: when it died the doctor launched a tmux controller while `Restart=always` revived
+# the unit (#1761). A hermetic temp dir must stay allowed (every other arm above installs into one), so the
+# rule refuses only the directories systemd reads and these readers do not search.
+# ⛔ THE PROBE IS A DRY RUN, AND THAT IS THE HERMETIC CHOICE (review P2, #2402). The guard lives in
+# `choose_target`, which `--dry-run` reaches before any file operation, so this arm exercises the PRODUCTION
+# decision with nothing written. A real `--install` into these paths would have been a fixture that can
+# reach the host — under a regressed guard the arm itself would have written an enabled unit into
+# `/usr/lib/systemd/system`. (Verified by mutation: with the guard deleted, a dry run prints
+# `dry-run: would install … and enable it` and exits 0, so every assertion below goes red.)
+say_case 'SYSTEMD_UNIT_DIR refuses a directory systemd loads but the cooperating verbs cannot see'
+for _bad_dir in /etc/systemd/system.control /etc/systemd/system.attached /usr/lib/systemd/system /etc/systemd/user /etc/xdg/systemd/user; do
+  _bd="$(arm_root "bd-$(printf '%s' "$_bad_dir" | tr '/' '_')")"; mk_systemctl "$_bd/bin" "$_bd/state" "$_bd/sc.log"
+  _BD_RC=0; _BD_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_bad_dir" inst "$(basename "$_bd")" --dry-run 2>&1)" || _BD_RC=$?
+  [ "$_BD_RC" -ne 0 ] && ok "SYSTEMD_UNIT_DIR=$_bad_dir is REFUSED" \
+                      || bad "SYSTEMD_UNIT_DIR=$_bad_dir would install an enabled, boot-armed unit nothing here can see — $_BD_OUT"
+  case "$_BD_OUT" in
+    *'dry-run: would install'*) bad "SYSTEMD_UNIT_DIR=$_bad_dir: the dry run planned the install (the guard did not fire)" ;;
+    *) ok "SYSTEMD_UNIT_DIR=$_bad_dir: no install was planned" ;;
+  esac
+done
+BDR="$(arm_root 'bd-reason')"; mk_systemctl "$BDR/bin" "$BDR/state" "$BDR/sc.log"
+BDR_RC=0; BDR_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/etc/systemd/system.control" inst 'bd-reason' --dry-run 2>&1)" || BDR_RC=$?
+[ "$BDR_RC" -ne 0 ] && ok 'a dry run into /etc/systemd/system.control is REFUSED' \
+                    || bad "the dry run planned an install into /etc/systemd/system.control — $BDR_OUT"
+case "$BDR_OUT" in
+  *'REFUSING SYSTEMD_UNIT_DIR'*) ok 'the refusal names the offending override' ;;
+  *) bad "the refusal does not name SYSTEMD_UNIT_DIR — $BDR_OUT" ;;
+esac
+case "$BDR_OUT" in
+  *'#1761'*) ok 'the refusal names the consequence (two dispatchers on one queue)' ;;
+  *) bad "the refusal does not name the #1761 consequence — $BDR_OUT" ;;
+esac
+# ⛔ AND THE READ SEAM CANNOT DEFEAT IT: re-pointing `CONTROLLER_SYSTEM_UNIT_DIR` at the same directory used
+# to make the guard agree with itself. The allowed set is the literal default, not the seam.
+_bd="$(arm_root 'bd-seam')"; mk_systemctl "$_bd/bin" "$_bd/state" "$_bd/sc.log"
+BDS_RC=0; BDS_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/etc/systemd/system.control CONTROLLER_SYSTEM_UNIT_DIR=/etc/systemd/system.control" inst 'bd-seam' --dry-run 2>&1)" || BDS_RC=$?
+[ "$BDS_RC" -ne 0 ] && ok 're-pointing CONTROLLER_SYSTEM_UNIT_DIR at the same directory does NOT defeat the guard' \
+                    || bad "re-pointing the read seam defeated the SYSTEMD_UNIT_DIR guard — $BDS_OUT"
+# …and the ALLOWED side of the same rule, so the guard is a boundary and not a blanket refusal: the two
+# directories the readers DO search stay installable, and so does a hermetic temp dir (every other arm).
+_gd="$(arm_root 'gd-ok')"; mk_systemctl "$_gd/bin" "$_gd/state" "$_gd/sc.log"
+GDO_RC=0; GDO_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=/etc/systemd/system" inst 'gd-ok' --dry-run 2>&1)" || GDO_RC=$?
+[ "$GDO_RC" -eq 0 ] && ok 'SYSTEMD_UNIT_DIR=/etc/systemd/system (a directory the readers search) is ALLOWED' \
+                    || bad "the guard refused the canonical system unit dir — $GDO_OUT"
+# ⛔ THE LIST IS NOT HAND-MAINTAINED, AND AN ALIAS IS NOT A DIFFERENT DIRECTORY (re-review P1, #2666). Two
+# escapes of the first form, both measured: `/run/systemd/system.control` — which `systemd-analyze unit-paths`
+# prints — was ADMITTED (`would install …`, rc 0), and `ln -s /usr/lib/systemd/system <tmp>/alias` was
+# admitted too, because a literal match cannot see through an alias. The decision is taken on the RESOLVED
+# path and against the systemd TREE, so a new subtree cannot be forgotten and a symlink cannot dodge it.
+for _run_dir in /run/systemd/system.control /run/systemd/system.attached /run/systemd/generator /run/systemd/generator.late; do
+  _rd="$(arm_root "rd-$(printf '%s' "$_run_dir" | tr '/' '_')")"; mk_systemctl "$_rd/bin" "$_rd/state" "$_rd/sc.log"
+  _RD_RC=0; _RD_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_run_dir" inst "$(basename "$_rd")" --dry-run 2>&1)" || _RD_RC=$?
+  [ "$_RD_RC" -ne 0 ] && ok "SYSTEMD_UNIT_DIR=$_run_dir is REFUSED (a systemd tree the readers do not search)" \
+                      || bad "SYSTEMD_UNIT_DIR=$_run_dir was ADMITTED — systemd loads it and nothing here can see it — $_RD_OUT"
+done
+_rl="$(arm_root 'rd-alias')"; mk_systemctl "$_rl/bin" "$_rl/state" "$_rl/sc.log"
+mkdir -p "$_rl/tree"; ln -sfn /usr/lib/systemd/system "$_rl/tree/alias"
+RL_RC=0; RL_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_rl/tree/alias" inst 'rd-alias' --dry-run 2>&1)" || RL_RC=$?
+[ "$RL_RC" -ne 0 ] && ok 'a SYMLINK to a systemd unit directory is REFUSED too (the decision is on the resolved path)' \
+                   || bad "a symlink to /usr/lib/systemd/system was admitted — $RL_OUT"
+case "$RL_OUT" in
+  *'resolves to /usr/lib/systemd/system'*) ok 'and the refusal names what the alias resolved to' ;;
+  *) bad "the alias refusal does not name the resolved path — $RL_OUT" ;;
+esac
+# …and an alias to an ALLOWED directory stays allowed: the rule is the resolved directory, not the presence
+# of a symlink (a cell that symlinks its state dir must not be refused for it).
+_ra="$(arm_root 'rd-alias-ok')"; mk_systemctl "$_ra/bin" "$_ra/state" "$_ra/sc.log"
+mkdir -p "$_ra/tree"; ln -sfn /etc/systemd/system "$_ra/tree/ok"
+RA_RC=0; RA_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_ra/tree/ok" inst 'rd-alias-ok' --dry-run 2>&1)" || RA_RC=$?
+[ "$RA_RC" -eq 0 ] && ok 'a symlink to the canonical system unit dir is ALLOWED (resolved, then graded)' \
+                   || bad "a symlink to /etc/systemd/system was refused — $RA_OUT"
+# ⛔ ONE DIRECTORY, ONE COPY, HOWEVER IT IS SPELLED (re-review P2, #2666). The same directory reached as
+# `CONTROLLER_USER_UNIT_DIR` WITH A TRAILING SLASH and as the target itself was counted twice, so the
+# "already installed" guard printed one file as two copies and refused a healthy idempotent re-install with
+# `--uninstall` as the remedy — and `cloud-cell-bringup.sh --check` re-runs `--install` every time. This is a
+# regression pin: it is green on the pre-fix code (which saw one copy) and red on the intermediate revision
+# that widened the enumeration without resolving each candidate.
+say_case 'a re-install is idempotent when the same unit dir is spelled two ways'
+RI="$(arm_root ri)"; mk_systemctl "$RI/bin" "$RI/state" "$RI/sc.log"
+RI_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$RI/home/.config/systemd/user CONTROLLER_USER_UNIT_DIR=$RI/home/.config/systemd/user/" inst ri --install 2>&1)"; RI_RC=$?
+[ "$RI_RC" -eq 0 ] && ok 'install: first run into the user dir (two spellings of it in the env) succeeds' \
+                   || bad "install: refused the first run over a spelling difference — $RI_OUT"
+RI2_RC=0; RI2_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$RI/home/.config/systemd/user CONTROLLER_USER_UNIT_DIR=$RI/home/.config/systemd/user/" inst ri --install 2>&1)" || RI2_RC=$?
+[ "$RI2_RC" -eq 0 ] && ok 'install: the RE-RUN is idempotent (one directory is one copy, however spelled)' \
+                    || bad "install: refused a healthy idempotent re-install with 'already installed' — $RI2_OUT"
+case "$RI2_OUT" in
+  *'already installed at'*) bad 'install: the re-run reported the SAME copy as a second one' ;;
+  *) ok 'install: the re-run does not report one file as two copies' ;;
+esac
+# ⛔ THE HOME ROOTS MUST BE RESOLVED BEFORE THEY ARE COMPARED (re-review P1, #2666). The candidate is
+# resolved; comparing it against an UNRESOLVED `$HOME` re-opened the hole: with `$HOME` a symlink the
+# candidate resolved to its physical spelling and matched no pattern, so `$HOME/.local/share/systemd/user` —
+# a real user-manager unit root — was ADMITTED. This arm makes `$HOME` a symlink on purpose.
+say_case 'a symlinked $HOME does not hide the user manager unit roots'
+SH="$(arm_root sh)"; mk_systemctl "$SH/bin" "$SH/state" "$SH/sc.log"
+mkdir -p "$SH/realhome/.local/share/systemd/user" "$SH/realhome/.config/systemd/user"
+ln -sfn "$SH/realhome" "$SH/home-link"
+SH_RC=0; SH_OUT="$(EXTRA_ENV="HOME=$SH/home-link SYSTEMD_UNIT_DIR=$SH/home-link/.local/share/systemd/user" inst sh --dry-run 2>&1)" || SH_RC=$?
+[ "$SH_RC" -ne 0 ] && ok 'a symlinked $HOME does not hide ~/.local/share/systemd/user (still REFUSED)' \
+                   || bad "a symlinked \$HOME admitted a real user-manager unit root — $SH_OUT"
+# ⛔ AND THE XDG ROOTS ARE USER-MANAGER UNIT ROOTS TOO (re-review P2, #2666): `systemd.unit(5)` lists
+# `$XDG_CONFIG_HOME/systemd/user` and `$XDG_DATA_HOME/systemd/user`, and neither was covered.
+for _xdg in XDG_CONFIG_HOME XDG_DATA_HOME; do
+  _ax="$(arm_root "xdg-$(printf '%s' "$_xdg" | tr 'A-Z' 'a-z')")"; mk_systemctl "$_ax/bin" "$_ax/state" "$_ax/sc.log"
+  mkdir -p "$_ax/xdg/systemd/user"
+  _AX_RC=0; _AX_OUT="$(EXTRA_ENV="$_xdg=$_ax/xdg SYSTEMD_UNIT_DIR=$_ax/xdg/systemd/user" inst "$(basename "$_ax")" --dry-run 2>&1)" || _AX_RC=$?
+  [ "$_AX_RC" -ne 0 ] && ok "$_xdg/systemd/user is REFUSED (a user-manager unit root nothing here reads)" \
+                      || bad "$_xdg/systemd/user was ADMITTED — $_AX_OUT"
+done
+# ⛔ A LEAF THAT DOES NOT EXIST YET STILL RESOLVES THROUGH A SYMLINKED PARENT (re-review P2, #2666). The
+# fallback used to keep the literal when `readlink -f` was unavailable, while `mkdir -p` followed the
+# symlinked parent — so the guard graded one path and the write landed in another (inside /etc/systemd).
+say_case 'a leaf that does not exist yet is graded by where the write would land'
+SL="$(arm_root sl)"; mk_systemctl "$SL/bin" "$SL/state" "$SL/sc.log"
+mkdir -p "$SL/tree"; ln -sfn /etc/systemd "$SL/tree/alias"
+# ⛔ THE ARM IS ONLY DISCRIMINATING WHERE `readlink -f` CANNOT ANSWER (re-review P2, #2666): GNU readlink -f
+# resolves a missing LEAF under an existing parent, so with it present the hole never opens. The measured
+# shape is the one where it cannot answer — a minimal box, busybox, or a PATH without it — so the stub below
+# makes `readlink` fail, which is exactly the branch the fallback exists for. Without the parent-resolution
+# in `canon_dir` this arm returns 0 and dry-runs an install into /etc/systemd; with it, REFUSED.
+printf '#!/bin/bash\nexit 1\n' > "$SL/bin/readlink"; chmod +x "$SL/bin/readlink"
+SL_RC=0; SL_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$SL/tree/alias/system.control" inst sl --dry-run 2>&1)" || SL_RC=$?
+case "$SL_OUT" in
+  *'cannot create'*|*'Permission denied'*) bad "the probe tried to WRITE instead of refusing (guard bypassed) — $SL_OUT" ;;
+esac
+[ "$SL_RC" -ne 0 ] && ok 'a not-yet-created leaf UNDER a symlinked parent is REFUSED (resolved through the link)' \
+                   || bad "a leaf under a symlink to /etc/systemd was admitted — the write would land there — $SL_OUT"
+[ -d /etc/systemd/system.control ] && bad 'the probe CREATED /etc/systemd/system.control on this box' || true
+# ⛔ SOURCING THE INSTALLER MUST BE INERT (re-review incident, #2666). It is a script with a top-level
+# dispatch, so `source …` fell through to `ACTION=--install` and installed a REAL, ENABLED unit on the box
+# that ran it (measured in this lane's verification round: /etc/systemd/system/eldato-orchestrator.service
+# plus its multi-user.target.wants link, reverted by hand). An enabled unit is a second supervisor the
+# moment anything starts it — the #1761 duplicate this file exists to prevent.
+say_case 'sourcing the installer performs no action'
+SO="$(arm_root so)"; mk_systemctl "$SO/bin" "$SO/state" "$SO/sc.log"
+SO_RC=0; SO_OUT="$(bnd env SYSTEMCTL="$SO/bin/systemctl" SYSTEMD_UNIT_DIR="$SO/units" CONTROLLER_SYSTEM_UNIT_DIR="$SO/units" \
+    CONTROLLER_USER_UNIT_DIR="$SO/nouser" CONTROLLER_ALLOW_ROOT=1 HOME="$SO/home" CELL_HOME="$SO/home" \
+    TEMPLATES_DIR="$(dirname "$TPL")" ENV_FILE="$SO/home/keys.env" O="$SO/o" PATH="$SO/bin:$PATH" \
+    bash -c 'source "$1" --install; echo SOURCED_OK' _ "$INST" 2>&1)" || SO_RC=$?
+case "$SO_OUT" in
+  *SOURCED_OK*) ok 'sourcing exits cleanly (the source guard returns before the dispatch)' ;;
+  *) bad "sourcing did not return cleanly — $SO_OUT" ;;
+esac
+[ -f "$SO/units/eldato-orchestrator.service" ] && bad 'sourcing the installer WROTE a unit (a sourced script must never install)' \
+                                              || ok 'sourcing the installer wrote nothing'
+# ⛔ A LEADING `//` IS THE SAME DIRECTORY (re-review P1, #2666). bash's `pwd -P` PRESERVES exactly two leading
+# slashes (`cd //etc/systemd/user && pwd -P` → `//etc/systemd/user`), so a doubled-slash spelling missed every
+# tree pattern — `//etc/systemd/system.control` dry-ran an install while `/etc/systemd/system.control` was
+# refused — and was counted as a SECOND copy by the resolved dedupe, refusing an idempotent re-install of one
+# file as two. `canon_dir` normalises it on the way out.
+say_case 'a doubled leading slash is the same directory, not a different one'
+DS="$(arm_root ds)"; mk_systemctl "$DS/bin" "$DS/state" "$DS/sc.log"
+# ⛔ AND THE NORMALISATION MUST NOT DEPEND ON `readlink` (re-review P1, #2666): with `readlink -f` present it
+# already collapses `//`, so the branch that needs the explicit normalisation is the one where it cannot
+# answer — and that is the branch a minimal box runs. The stub makes `readlink` fail so the `pwd -P` branch
+# (which PRESERVES the doubled slash) is the one exercised; removing the normalisation then admits a real
+# systemd directory.
+printf '#!/bin/bash\nexit 1\n' > "$DS/bin/readlink"; chmod +x "$DS/bin/readlink"
+for _ds in '//etc/systemd/user' '///etc/systemd/system.control' '//etc/xdg/systemd/user'; do
+  _DS_RC=0; _DS_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_ds" inst ds --dry-run 2>&1)" || _DS_RC=$?
+  [ "$_DS_RC" -ne 0 ] && ok "SYSTEMD_UNIT_DIR=$_ds is REFUSED without readlink too (the slash run is normalised)" \
+                      || bad "SYSTEMD_UNIT_DIR=$_ds was ADMITTED — a spelling that collides with a refused dir — $_DS_OUT"
+done
+# …and with `readlink` PRESENT the same spellings must land identically (the normalisation is belt-and-braces).
+DS0="$(arm_root ds0)"; mk_systemctl "$DS0/bin" "$DS0/state" "$DS0/sc.log"
+for _ds in '//etc/systemd/system.control' '///etc/systemd/user'; do
+  _DS0_RC=0; _DS0_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_ds" inst ds0 --dry-run 2>&1)" || _DS0_RC=$?
+  [ "$_DS0_RC" -ne 0 ] && ok "SYSTEMD_UNIT_DIR=$_ds is REFUSED with readlink present" \
+                       || bad "SYSTEMD_UNIT_DIR=$_ds was ADMITTED with readlink present — $_DS0_OUT"
+done
+DS2="$(arm_root ds2)"; mk_systemctl "$DS2/bin" "$DS2/state" "$DS2/sc.log"
+mkdir -p "$DS2/home/.config/systemd/user"
+DS2_RC=0; DS2_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=//$DS2/home/.config/systemd/user" inst ds2 --install 2>&1)" || DS2_RC=$?
+[ "$DS2_RC" -eq 0 ] && ok 'install: a doubled-slash target installs' || bad "install: refused a doubled-slash target — $DS2_OUT"
+DS3_RC=0; DS3_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$DS2/home/.config/systemd/user" inst ds2 --install 2>&1)" || DS3_RC=$?
+[ "$DS3_RC" -eq 0 ] && ok 'install: the SAME directory under the other spelling re-installs idempotently' \
+                   || bad "install: the two spellings were counted as two copies — $DS3_OUT"
+# ⛔ THE GRADED PATH IS THE PATH THE WRITE LANDS ON (re-review P2, #2666). Resolving only the immediate parent
+# left the literal when more than the leaf was missing, so a `..` segment could stand in front of a real
+# systemd dir. The resolver now walks up to the deepest EXISTING ancestor and appends the remainder.
+say_case 'a path with a .. segment is graded after the .. is collapsed'
+DD="$(arm_root dd)"; mk_systemctl "$DD/bin" "$DD/state" "$DD/sc.log"
+for _dd in '/tmp/../etc/systemd/system.control' "$DD/missing/../usr/lib/systemd/system"; do
+  _DD_RC=0; _DD_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_dd" inst dd --dry-run 2>&1)" || _DD_RC=$?
+  case "$_dd" in
+    *usr/lib*) [ "$_DD_RC" -eq 0 ] && ok "$_dd is ALLOWED (it collapses to a fixture dir, not /usr/lib)" \
+                                     || bad "$_dd was refused although it collapses away from /usr/lib — $_DD_OUT" ;;
+    *)         [ "$_DD_RC" -ne 0 ] && ok "$_dd is REFUSED (the .. collapses onto a real systemd dir)" \
+                                     || bad "$_dd was admitted — the graded path is not the write path — $_DD_OUT" ;;
+  esac
+done
+# ⛔ A `..` CHAIN THAT CLIMBS PAST THE RESOLVED ANCESTOR (re-review P1, #2666). The missing-ancestor branch
+# duplicated the remainder VERBATIM, so its `..`s survived into the graded path where no tree pattern can see
+# them: `<tmp>/x/../../../../etc/systemd/system.control` graded as a fixture path while `mkdir -p` created
+# the directory INSIDE /etc/systemd. The remainder is now normalised lexically against the resolved ancestor.
+DD2="$(arm_root dd2)"; mk_systemctl "$DD2/bin" "$DD2/state" "$DD2/sc.log"
+_UP="$DD2/x/$(printf '../%.0s' $(seq 1 8))etc/systemd/system.control"
+UP_RC=0; UP_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_UP" inst dd2 --dry-run 2>&1)" || UP_RC=$?
+[ "$UP_RC" -ne 0 ] && ok 'a .. chain that climbs PAST the resolved ancestor is REFUSED (remainder normalised)' \
+                   || bad "a .. chain climbed to /etc/systemd and was still admitted — the write would land there — $UP_OUT"
+case "$UP_OUT" in
+  *'resolves to /etc/systemd/system.control'*) ok 'and the refusal names the path it climbed to' ;;
+  *) bad "the climbing-.. refusal does not name the resolved path — $UP_OUT" ;;
+esac
+# …and the lexically-normalised remainder must not REFUSE a path that merely climbs inside the fixture.
+_UPOK="$DD2/missing/x/../../units"
+UPO_RC=0; UPO_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_UPOK" inst dd2 --dry-run 2>&1)" || UPO_RC=$?
+[ "$UPO_RC" -eq 0 ] && ok 'a .. chain that stays inside the fixture is still ALLOWED (the rule is the resolved path)' \
+                    || bad "a fixture path with interior .. was refused — $UPO_OUT"
+# ⛔ AND THE PHYSICAL SPELLING OF A NOT-YET-EXISTING USER ROOT (re-review P2, #2666): with `$HOME` a symlink and
+# `~/.local/share/systemd` absent, the `$HOME` spelling was refused while its PHYSICAL spelling was admitted —
+# same directory, two verdicts. Both must resolve to the same root now.
+say_case 'a symlinked $HOME does not change the verdict for a not-yet-created user root'
+PH="$(arm_root ph)"; mk_systemctl "$PH/bin" "$PH/state" "$PH/sc.log"
+mkdir -p "$PH/realhome/.config"
+ln -sfn "$PH/realhome" "$PH/home-link"
+for _ph in "$PH/home-link/.local/share/systemd/user" "$PH/realhome/.local/share/systemd/user"; do
+  _PH_RC=0; _PH_OUT="$(EXTRA_ENV="HOME=$PH/home-link SYSTEMD_UNIT_DIR=$_ph" inst ph --dry-run 2>&1)" || _PH_RC=$?
+  [ "$_PH_RC" -ne 0 ] && ok "a not-yet-created user root is REFUSED via $(printf '%s' "$_ph" | sed "s:$PH/::") (same verdict as its physical spelling)" \
+                      || bad "a not-yet-created real user root was admitted via a spelling alias — $_PH_OUT"
+done
+
 # ⛔ MainPID 0 WITH A *FRESH* HEARTBEAT IS STILL NOT A CONTROLLER (review P1, #2402). `is-active` reports
 # `activating` during a RestartSec wait, and a loop that ticked 10 s ago then died leaves a readable fresh
 # heartbeat; `--status` returned 0 and printed main_pid=0 — the state the doc says it refuses.
@@ -1152,6 +1407,24 @@ case "$HO_OUT" in
 esac
 [ -f "$HO/units/eldato-orchestrator.service" ] && bad 'install: wrote the second unit anyway' \
                                                || ok 'install: wrote nothing beside the existing unit'
+# ⛔ AND THE GUARD MUST SEE EVERY COPY THE READ-BACK VERBS CAN FIND (review P2, #2402). The guard read a
+# NARROWER list than `find_installed_unit`: only `$HOME/.config/systemd/user`, never the passwd homes or
+# `CONTROLLER_USER_UNIT_DIR`. `cloud-cell-bringup.sh` forces HOME=$CELL_HOME before running the installer,
+# so an OPERATOR-installed user unit was invisible: `--install` printed `changed=1` and left TWO copies for
+# one state dir — two enabled units, `stop` addresses one, the other revives the controller (#1761). This
+# arm puts our copy in a user-unit dir that is not $HOME, the shape the bring-up actually produces.
+HO2="$(arm_root ho2)"; mk_systemctl "$HO2/bin" "$HO2/state" "$HO2/sc.log"
+mkdir -p "$HO2/op/.config/systemd/user"
+: > "$HO2/op/.config/systemd/user/eldato-orchestrator.service"
+HO2_RC=0; HO2_OUT="$(EXTRA_ENV="HOME=$HO2/home CONTROLLER_USER_UNIT_DIR=$HO2/op/.config/systemd/user" inst ho2 --install 2>&1)" || HO2_RC=$?
+[ "$HO2_RC" -ne 0 ] && ok 'install: a copy in the OPERATOR home (not $HOME) is REFUSED too (the bring-up shape)' \
+                    || bad "install: armed a second unit because the guard could not see the operator-home copy — $HO2_OUT"
+case "$HO2_OUT" in
+  *'already installed at'*) ok 'install: and that refusal names the copy it found' ;;
+  *) bad "install: the operator-home refusal is unnamed — $HO2_OUT" ;;
+esac
+[ -f "$HO2/units/eldato-orchestrator.service" ] && bad 'install: wrote a second unit beside the operator-home copy' \
+                                                 || ok 'install: wrote nothing beside the operator-home copy'
 
 # ── an ELEVATED uninstall is refused (review P2, #2402) ──────────────────────────────────────────
 # HOME=/root hides the operator's user unit, so `--uninstall` under sudo printed "not installed" (rc 0)
@@ -1160,13 +1433,45 @@ say_case 'uninstall refuses an elevated (sudo) invocation'
 HU2="$(arm_root hu2)"; mk_systemctl "$HU2/bin" "$HU2/state" "$HU2/sc.log"
 printf '#!/bin/bash\ncase "$1" in\n  -u) echo 0 ;;\n  -un) exec /usr/bin/id -un ;;\n  *) exec /usr/bin/id "$@" ;;\nesac\n' > "$HU2/bin/id"
 chmod +x "$HU2/bin/id"
-HU2_RC=0; HU2_OUT="$(EXTRA_ENV=SUDO_USER=operator inst hu2 --uninstall 2>&1)" || HU2_RC=$?
+HU2_RC=0; HU2_OUT="$(EXTRA_ENV="SUDO_USER=operator CONTROLLER_ALLOW_ROOT=0" inst hu2 --uninstall 2>&1)" || HU2_RC=$?
 [ "$HU2_RC" -ne 0 ] && ok 'uninstall: an ELEVATED invocation is REFUSED' \
                    || bad "uninstall: reported success under sudo, where HOME hides the operator's unit — $HU2_OUT"
 case "$HU2_OUT" in
   *'REFUSING to uninstall as root'*) ok 'uninstall: the refusal names the reason and the operator re-run' ;;
   *) bad "uninstall: refused without naming the root cause — $HU2_OUT" ;;
 esac
+# ⛔ AND THE OTHER SPELLINGS OF "root" (review P1, #2402). The guard used to need `SUDO_USER`, so `su -`, a
+# direct root login or any root-run provision fell THROUGH it: HOME=/root hid the operator's user unit, the
+# verb printed "not installed" and returned 0 over a unit that was still enabled and restarting the
+# controller — the false pass this verb exists to refuse, still live on the spelling the install guard had
+# already been fixed for. Since the guard is now the uid, this arm carries no `SUDO_USER` at all: on the
+# pre-fix code it returns 0, on the fixed code it refuses.
+HU3="$(arm_root hu3)"; mk_systemctl "$HU3/bin" "$HU3/state" "$HU3/sc.log"
+printf '#!/bin/bash\ncase "$1" in\n  -u) echo 0 ;;\n  -un) exec /usr/bin/id -un ;;\n  *) exec /usr/bin/id "$@" ;;\nesac\n' > "$HU3/bin/id"
+chmod +x "$HU3/bin/id"
+mkdir -p "$HU3/home/.config/systemd/user"
+: > "$HU3/home/.config/systemd/user/eldato-orchestrator.service"
+HU3_RC=0; HU3_OUT="$(EXTRA_ENV="CONTROLLER_ALLOW_ROOT=0" inst hu3 --uninstall 2>&1)" || HU3_RC=$?
+[ "$HU3_RC" -ne 0 ] && ok 'uninstall: a root run with NO SUDO_USER (su -, root login) is REFUSED too' \
+                   || bad "uninstall: a uid-0 run with no SUDO_USER reported 'not installed' over a still-enabled unit — $HU3_OUT"
+case "$HU3_OUT" in
+  *'REFUSING to uninstall as root'*) ok 'uninstall: and that refusal names the reason' ;;
+  *) bad "uninstall: the no-SUDO_USER refusal is unnamed — $HU3_OUT" ;;
+esac
+# ⛔ THE SAME OPT-IN AS `--install`, AND IT IS PROVEN TO RUN PAST THE GUARD (re-review P2, #2666). The
+# previous arm was a tautology: `inst` already exports `CONTROLLER_ALLOW_ROOT=1` (so it was byte-identical to
+# every other call) and no `id` stub meant the guard never fired on a non-root runner — it passed through the
+# "not installed" early return instead of through the opt-in. Now `id` reports uid 0, a unit IS installed in
+# the fixture's unit dir, and the arm requires the verb to both exit 0 and REMOVE it.
+HU4="$(arm_root hu4)"; mk_systemctl "$HU4/bin" "$HU4/state" "$HU4/sc.log"
+printf '#!/bin/bash\ncase "$1" in\n  -u) echo 0 ;;\n  -un) exec /usr/bin/id -un ;;\n  *) exec /usr/bin/id "$@" ;;\nesac\n' > "$HU4/bin/id"
+chmod +x "$HU4/bin/id"
+: > "$HU4/units/eldato-orchestrator.service"
+HU4_RC=0; HU4_OUT="$(EXTRA_ENV="CONTROLLER_ALLOW_ROOT=1" inst hu4 --uninstall 2>&1)" || HU4_RC=$?
+[ "$HU4_RC" -eq 0 ] && ok 'uninstall: CONTROLLER_ALLOW_ROOT=1 is the documented escape at uid 0 and it proceeds' \
+                    || bad "uninstall: the documented CONTROLLER_ALLOW_ROOT=1 was refused at uid 0 — $HU4_OUT"
+[ -f "$HU4/units/eldato-orchestrator.service" ] && bad 'uninstall: the opt-in arm passed without removing the unit (it never reached the verb)' \
+                                                 || ok 'uninstall: the opt-in arm PROVES it ran past the guard (the fixture unit is gone)'
 
 # ── a service-mode start does not wait forever on a session that is not ours (review P2, #2402) ──
 # `$SESSION` is machine-scoped, so a peer repo's controller holds the same name. An unbounded wait parks
