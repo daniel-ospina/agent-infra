@@ -1325,14 +1325,18 @@ claim_snapshot_verdict() { # <snapshot-file> <ref> -> verdict word on stdout
 # controller would pay two network round trips per PR per cycle (24 PRs x 2 = 48 calls).
 # ⛔ `CLAIM_SNAPSHOT_FETCH` / `CLAIM_SNAPSHOT_REFS` are set for the CALLER (the controller prints
 # them on its cycle line): globals because `$(claim_snapshot …)` would run it in a subshell.
-CLAIM_SNAPSHOT_FETCH=""; CLAIM_SNAPSHOT_REFS=""
+# `CLAIM_SNAPSHOT_WRITE` is a THIRD, separate answer: whether the snapshot could be PUBLISHED. A failed
+# FETCH and a failed PUBLISH have different consequences (the first publishes a header that says so;
+# the second publishes nothing, leaving the previous still-believed read in place), so a caller that
+# collapses them logs the wrong cause AND the wrong consequence (review, P2).
+CLAIM_SNAPSHOT_FETCH=""; CLAIM_SNAPSHOT_REFS=""; CLAIM_SNAPSHOT_WRITE=""
 claim_snapshot() {
   # `$1` is OPTIONAL and `set -u` is on, so the temp name must NOT be built from it directly:
   # `local out="${1:-…}" tmp="$1.$$"` dereferences the unset `$1` and aborts the whole fetch with
   # "unbound variable" (exit 127) instead of falling back to the default (P2, 2026-10-14 export
   # review). Derive the temp name from the RESOLVED output path.
   local out="${1:-$HOME/orchestrator/state/claims-snapshot}"
-  local tmp="$out.$$" body="$out.body.$$" fetch now n
+  local tmp="$out.$$" body="$out.body.$$" fetch now n write
   : > "$body"
   # --prune so a claim DELETED on another box (released, or pruned) does not linger here.
   # ⛔ It prunes by DESTINATION pattern, so worker-side temp refs must live in CLAIM_TMP_NS, never
@@ -1362,12 +1366,19 @@ claim_snapshot() {
   # keep the previous (age-guarded) snapshot, and report the fetch as failed.
   if { printf '#claim-snapshot\t%s\t%s\t%s\n' "$now" "$fetch" "$n"; cat "$body"; } > "$tmp" 2>/dev/null \
      && mv -f "$tmp" "$out" 2>/dev/null; then
+    write=ok
     rm -f "$body" 2>/dev/null || true
   else
-    fetch=failed; n=0
+    # ⛔ A FAILED PUBLISH IS NOT A FAILED FETCH (review, P2). `fetch` keeps the FETCH's own answer;
+    # `write` records this failure. On a failed FETCH the published header itself says `failed`, so
+    # the reader refuses it; on a failed PUBLISH nothing is published, the PREVIOUS snapshot survives
+    # with its own `ok` header, and it is still believed until it ages out at
+    # CLAIM_SNAPSHOT_MAX_AGE. Collapsing the two made the cycle log assert a stand-down that did not
+    # happen, and pointed an auditor at the network when the cause was the disk.
+    write=failed; n=0
     rm -f "$tmp" "$body" 2>/dev/null || true
   fi
-  CLAIM_SNAPSHOT_FETCH="$fetch"; CLAIM_SNAPSHOT_REFS="$n"
+  CLAIM_SNAPSHOT_FETCH="$fetch"; CLAIM_SNAPSHOT_REFS="$n"; CLAIM_SNAPSHOT_WRITE="$write"
   return 0
 }
 
