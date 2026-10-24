@@ -3345,6 +3345,19 @@ while read -r N; do
         snapshot_datum preflight-degraded
         V_UNJUDGED=$((V_UNJUDGED + 1))
         pre_incomplete_surfaces "$PRE"
+        # ⛔ THE DATUM KEEPS ITS DEGRADED LABEL (merge review of #2391, `degraded-first`).
+        # `pre_incomplete_surfaces` records its rows through `record_unusable` → `snapshot_datum
+        # <slug>`, and `snapshot_datum` rightly lets a REAL arm replace a degraded one — so this
+        # run's rc 0 / stderr=none went into the record labelled `issue-assignee-holder`, a real
+        # surface name. A later candidate's hard failure then hit the first-record rule and could
+        # NOT replace it: a healthy datum asserting `stderr=none` beside the refusal's own words,
+        # which is the exact contradiction the degraded arm exists to avoid (main's #2659 case was
+        # green only because `pre_incomplete_surfaces` did not exist when it was written).
+        # `PRE_FAIL_AT` is this run's only when no earlier candidate held a real datum, so the
+        # restore cannot downgrade a real first-record snapshot.
+        if [ -n "${PRE_FAIL_AT:-}" ] && [ "${PRE_FAIL_AT:-}" = "${N:-}" ]; then
+          PRE_FAIL_ARM=preflight-degraded
+        fi
         echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         # ── the cross-box ISSUE claim is a BLOCKING surface (agent-infra#1850) ───────────────────
@@ -3476,6 +3489,11 @@ while read -r N; do
         snapshot_datum preflight-degraded
         V_UNJUDGED=$((V_UNJUDGED + 1))
         pre_incomplete_surfaces "$PRE"
+        # …and the same restore as the CLEAN-degraded arm above: the rows must not relabel a
+        # degraded datum as a real surface, or a later hard failure cannot replace it.
+        if [ -n "${PRE_FAIL_AT:-}" ] && [ "${PRE_FAIL_AT:-}" = "${N:-}" ]; then
+          PRE_FAIL_ARM=preflight-degraded
+        fi
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
