@@ -264,6 +264,31 @@ PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" SAFE_SEND_DI
   bash "$ROOT/scripts/safe-send.sh" 00000000-0000-0000-0000-000000000000 test "$TMP/no-research.txt" --force >/dev/null 2>&1
 [ -s "$CMUX_LOG" ]; ck $? "…but --force (the documented STOP route) bypasses the brief gate — the exemption is pinned, not implied"
 
+# ── safe-send.sh `--notice`: the ALERT route (review cycle 5, P1). The fleet's only controller alert
+# (tools/fleet/outcome_canary.py) sends a MACHINE-COMPOSED message through safe-send.sh, and that
+# message has no brief and no research question. With the gate unconditional every alert was refused
+# 80 and then classified AMBIGUOUS by the canary — which SUPPRESSES — so the controller was never
+# told. Two assertions, both driven, and they must move in opposite directions: the alert refuses
+# WITHOUT the mode (so the exemption is a real mode and not a hole in the gate) and is admitted WITH
+# it; and the no-pi guard still fires under --notice, because typing an alert into a bare shell
+# EXECUTES. (A `--notice` that also skipped that guard would be the bug this file exists to prevent.)
+ALERT="$TMP/alert.txt"; printf 'STALE PR: 999 has not moved in 3h\n' > "$ALERT"
+: > "$CMUX_LOG"
+PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
+  bash "$ROOT/scripts/safe-send.sh" 00000000-0000-0000-0000-000000000000 outcome-canary "$ALERT" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "an ALERT with no research contract is still REFUSED without --notice (rc=$rc)"
+[ -s "$CMUX_LOG" ]; rc=$?
+[ "$rc" -ne 0 ]; ck $? "…and the pane was not even read (no exemption by accident)"
+: > "$CMUX_LOG"
+PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" SAFE_SEND_DISPATCH=/bin/true \
+  bash "$ROOT/scripts/safe-send.sh" 00000000-0000-0000-0000-000000000000 outcome-canary "$ALERT" --notice >"$TMP/notice.out" 2>&1; rc=$?
+{ [ "$rc" -ne 80 ] && [ "$rc" -ne 78 ]; }; ck $? "POSITIVE CONTROL: --notice passes the BRIEF gate for a machine-composed alert (rc=$rc)"
+grep -q 'NO pi IN THIS PANE' "$TMP/notice.out"; ck $? "…and the no-pi guard is STILL in force under --notice (an alert typed into a bare shell would be EXECUTED)"
+# ⛔ A BYPASS NOBODY CAN TYPO. An unknown mode must be a usage error, not a silent exemption: the next
+# person who reaches for "--no-gate" would otherwise get a gate-free send and never learn it.
+bash "$ROOT/scripts/safe-send.sh" ws label "$ALERT" --bogus >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ]; ck $? "an UNKNOWN mode is a usage error (2), never a silent exemption (rc=$rc)"
+
 # ── pr-doctor.py: the fleet's own generated worker brief must carry the contract, or every worker the
 # beat spawns is refused. Driven through the module, not grepped from the source.
 out="$("$ROOT/../venv-brief-probe" 2>/dev/null; python3 - "$ROOT" <<'PY' 2>/dev/null

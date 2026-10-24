@@ -48,6 +48,11 @@ if [ ! -f "$_bg_lib" ]; then
 fi
 if ! bash "$_bg_lib" --check - lane <<<"$MSG"; then
   echo "$LABEL: REFUSED — the order did not pass the research-first gate. NOT dispatched: the target was not even resolved."
+  # ⛔ A STOP IS NOT A WORK ORDER, AND THIS SCRIPT HAS NO EXEMPTION ON PURPOSE (review cycle 5, P2).
+  # The advice "re-author the research section" is wrong for a STOP: there is no brief to re-author and
+  # no research question to answer. Rather than add a second bypass here (safe-send.sh already owns the
+  # documented STOP route, and a second one is a second thing to keep honest), name the route.
+  echo "$LABEL: …if this is a STOP or a fleet ALERT rather than a work order, use safe-send.sh: it owns that route (--force for a STOP, --notice for a machine-composed alert)."
   exit 80
 fi
 

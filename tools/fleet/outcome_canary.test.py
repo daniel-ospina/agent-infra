@@ -1588,6 +1588,19 @@ def test_capture_never_writes_the_default_state_path():
 
 
 @test
+def test_a_brief_gate_refusal_is_a_REFUSAL_not_an_ambiguous_send():
+    """#2258 review cycle 5, P1: safe-send.sh exits 78 (validator missing) / 80 (brief refused) BEFORE it
+    probes the pane, so nothing was consumed and a retry is free — the same fact rc 3 carries. Neither was
+    in SAFE_SEND_RC, so both fell through to the AMBIGUOUS default, which SUPPRESSES: one gate refusal
+    silenced the fleet's alert path permanently, and the report claimed "bytes may have landed" about a
+    message that was provably never sent."""
+    m = load()
+    for rc in (78, 80):
+        assert m.classify_send(rc, "") == "refused", (rc, m.classify_send(rc, ""))
+        assert m.classify_send(rc, "REFUSED [x] y — did not pass the research-first gate") == "refused"
+        assert m._send_rc_is_ambiguous(m.SAFE_SEND_RC[rc]) is False, rc
+
+
 def test_an_ambiguous_send_is_not_blind_retried_but_a_refusal_is():
     """safe-send.sh: rc 3 (REFUSED) means nothing was consumed, so a retry is free; rc 1/4 mean the
     bytes may already be in the composer, and its own comment says "Do NOT blind-retry (that stacks
