@@ -13619,6 +13619,93 @@ grep -qx 'unreadable=parse:9831' "$TMP/sg-psig-rep.txt" 2>/dev/null \
   || fail "(g3) the parse label is missing: $(tr '\n' ' ' < "$TMP/sg-psig-rep.txt" 2>/dev/null)"
 
 
+# ── 79. THE REFUSAL NAMES ITS SUBJECT — THE RUN, THE CHECK, AND THE BASE ANSWER (#2610) ─
+# A count is not a subject. Measured on agent-infra 2026-10-24: three rails (#2430, #2608,
+# #2623) refused with "N of M failing PR run(s) yielded NO parseable failure identity" for
+# heads whose surface was red on `bash-suites (1)/(5)/(7)`, and the refusal named NOTHING —
+# not the run, not the check, not what the base carries under that name. Reconstructing the
+# subject took a `gh api` survey by hand, and in the meantime the refusal read as
+# "unattributable", which is a conclusion this rail must never deliver without evidence.
+#
+# ⛔ WHAT THIS DOES **NOT** PIN. The base comparison in this rail is by FAILURE IDENTITY (the
+# exemption decision), not by check name, so a name answer is CONTEXT — it never exempts. The
+# fixture deliberately carries the real agent-infra split (the PR lane's `bash-suites (5)` vs
+# main's `script-validate`), and the assertions pin that the rail STATES the split rather than
+# resolving it into an exemption.
+echo "== 79. an unattributable failing run is refused BY NAME, with its base counterpart (#2610) =="
+new_scen named-refusal
+HEAD_NR="f9f90000000000000000000000000000000000ab"
+printf '%s\n' "$HEAD_NR" > "$SCEN/head"
+lane_fail "$HEAD_NR" 9901 > "$SCEN/runs-$HEAD_NR"
+: > "$SCEN/log-9901"                       # the failed-step log carries NO identity
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9901"
+write_pr_checks "$(check_run 5001 'bash-suites (5)' completed failure 9901)"
+# The base's OWN surface: the same suite under a DIFFERENT name — the split this repo has.
+write_main_checks "$(check_run 4001 'script-validate' completed failure 6101)"
+main_run_map 6101 push 'CI on main'
+{ main_red_n mainnr01 9902 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a) the unattributable failing run still BLOCKS (exit $rc)" \
+  || fail "(a) the rail merged over a run whose failures entered neither side of the comparison"
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN/err" \
+  && pass "(a) …at step 1c, the arm this issue is about" \
+  || fail "(a) the refusal did not fire at step 1c: $(head -4 "$SCEN/err" 2>/dev/null)"
+grep -q "check 'bash-suites (5)'" "$SCEN/err" \
+  && pass "(b) the refusal NAMES the check that yielded nothing — not just a count" \
+  || fail "(b) the refusal names no check: $(grep -n 'run 9901' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "run 9901" "$SCEN/err" \
+  && pass "(b) …and the RUN it failed in" \
+  || fail "(b) the refusal names no run"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(c) …and answers the base question BY NAME: no base counterpart for 'bash-suites (5)'" \
+  || fail "(c) the base-counterpart answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q ": script-validate" "$SCEN/err" \
+  && pass "(c) …naming what the base DID carry, so the other name for the same suite is visible" \
+  || fail "(c) the base's own red names are not stated: $(grep -n 'measured on' "$SCEN/err" 2>/dev/null | head -2)"
+grep -q "by FAILURE IDENTITY (the exemption decision), not by" "$SCEN/err" \
+  && pass "(d) …and says a NAME answer is not an exemption (the identity is what decides)" \
+  || fail "(d) the message could be read as an exemption — the two questions are not separated"
+# A base whose surface carries the SAME red name is reported as that, not as an absence: an
+# arm that answered "no counterpart" unconditionally would pass (c) and lie on this fixture.
+new_scen named-refusal-shared
+HEAD_NS="f9f90000000000000000000000000000000000cd"
+printf '%s\n' "$HEAD_NS" > "$SCEN/head"
+lane_fail "$HEAD_NS" 9911 > "$SCEN/runs-$HEAD_NS"
+: > "$SCEN/log-9911"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9911"
+write_pr_checks "$(check_run 5011 'bash-suites (5)' completed failure 9911)"
+write_main_checks "$(check_run 4011 'bash-suites (5)' completed failure 6102)"
+main_run_map 6102 push 'CI on main'
+{ main_red_n mainns01 9912 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e) a shared red NAME still REFUSES (a name match is not an exemption)" \
+  || fail "(e) a same-named base red exempted the PR by NAME — the decision is by identity"
+grep -q "'bash-suites (5)' IS red on 'main'" "$SCEN/err" \
+  && pass "(e) …and reports the base as carrying the same name RED (not as an absence)" \
+  || fail "(e) the same-name arm is wrong: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "NO BASE COUNTERPART" "$SCEN/err" \
+  && fail "(e) it ALSO claimed no counterpart — the arms are not exclusive" \
+  || pass "(e) …and does NOT claim an absent counterpart on the same surface"
+# ── MUTATION: the assertions above must rest on the naming arm, not on other text ──
+MUTD="$TMP/mut-named"; rm -rf "$MUTD"; mkdir -p "$MUTD"
+grep -v 'named_unattributable_runs "$TMP/pr-runs.txt"' "$ADM" > "$MUTD/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD/"
+bash -n "$MUTD/admin-merge.sh" \
+  && pass "(m) the mutant (naming arm deleted) is still valid bash" \
+  || fail "(m) the mutant does not parse — the mutation is not a clean arm deletion"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  bash "$MUTD/admin-merge.sh" 42 --main-runs 1 >"$SCEN/mut-out" 2>"$SCEN/mut-err"
+mrc=$?
+[ "$mrc" -ne 0 ] \
+  && pass "(m) the mutant still refuses at step 1c — the refusal is not what this arm adds" \
+  || fail "(m) the mutant merged: this fixture does not reach the naming path at all"
+grep -q "check 'bash-suites (5)'" "$SCEN/mut-err" 2>/dev/null \
+  && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
+  || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
