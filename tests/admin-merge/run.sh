@@ -13857,6 +13857,46 @@ grep -q "the base ref could NOT be resolved" "$SCEN/err" \
 grep -q "IS red on 'main'" "$SCEN/err" \
   && fail "(i) it asserted a red is 'on main' about a base it never resolved" \
   || pass "(i) …and asserts nothing about 'main'"
+# ── (j) A COUNT THAT COULD NOT BE MADE IS NOT A ZERO COUNT. The header's count comes from
+# `grep -c`; when grep cannot read the file at all (exit 2/127) the function must say the count
+# is UNKNOWN and print NO number — a header asserting `NAMED (0)` over a list that then prints
+# runs is a measured-looking claim about something never measured (#2610 review, round 5). The
+# status is forced here with a PATH shim that behaves as the real grep EXCEPT for the
+# unattributed list, so nothing else in the rail is affected.
+new_scen named-refusal-uncountable
+HEAD_NU="f9f9000000000000000000000000000000000056"
+printf '%s\n' "$HEAD_NU" > "$SCEN/head"
+lane_fail "$HEAD_NU" 9961 > "$SCEN/runs-$HEAD_NU"
+: > "$SCEN/log-9961"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9961"
+write_pr_checks "$(check_run 5061 'bash-suites (5)' completed failure 9961)"
+main_green_surface
+UNC_BIN="$TMP/grep-uncountable"
+mkdir -p "$UNC_BIN"
+printf '%s\n' '#!/bin/sh' \
+  'case "$*" in *pr-unattributed*) echo "grep: cannot read the unattributable list" >&2; exit 2 ;; esac' \
+  'exec /usr/bin/grep "$@"' > "$UNC_BIN/grep"
+chmod +x "$UNC_BIN/grep"
+PATH="$UNC_BIN:$PATH" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(j) an uncountable list still BLOCKS (exit $rc)" \
+  || fail "(j) the rail proceeded with an uncountable list"
+grep -q "could not be COUNTED" "$SCEN/err" \
+  && pass "(j) …and says the count could not be made" \
+  || fail "(j) the uncountable arm is silent: $(sed -n '/NAMED/,$p' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "UNKNOWN, not zero" "$SCEN/err" \
+  && pass "(j) …naming it UNKNOWN rather than zero" \
+  || fail "(j) the message does not distinguish unknown from zero"
+grep -q 'NAMED (0)' "$SCEN/err" \
+  && fail "(j) it asserted a count of 0 for a list it could not count" \
+  || pass "(j) …and prints NO number it did not measure"
+grep -q 'run 9961' "$SCEN/err" \
+  && pass "(j) …while the runs themselves are still named (the lines are real)" \
+  || fail "(j) the runs were dropped along with the count"
+grep -q 'INCOMPLETE' "$SCEN/err" \
+  && fail "(j) the completeness cross-check ran against an UNKNOWN count" \
+  || pass "(j) …and no completeness verdict is claimed from an unknown count"
+
 # ── (g) THE SAME-NAME ARM. An arm that always answers "no counterpart" would pass (c) and
 # lie about this surface, so a blocking base red with the same NAME is its own case.
 new_scen named-refusal-shared
