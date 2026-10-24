@@ -456,11 +456,35 @@ do_install() {
     # ONCE so the refusal can only quote the number the test enforced. (It used to print `300/3-15` = 85 s
     # while the test required at most 84: a remedy the guard then refused.)
     sl_maxtime=$(( (sl_iv - 1) / sl_burst - RESTART_SEC ))
-    # ⛔ A NEGATIVE BOUND IS NOT A REMEDY (review P2 round 9, #2402): when the template's own RestartSec
-    # alone exceeds the window there is no value to recommend, and the old sentence still printed one
-    # ("Use ORCH_START_TIMEOUT_SEC <= -401s."). Name the real cause instead.
+    # ⛔ A NEGATIVE BOUND IS NOT A REMEDY, AND THE CAUSE MUST BE NAMED CORRECTLY (review P2 rounds 9 and 10,
+    # #2402). Two defects lived here: the sentence printed the negative bound as advice
+    # ("Use ORCH_START_TIMEOUT_SEC <= -401s."), and it blamed the TEMPLATE even when the operator's own
+    # `ORCH_RESTART_SEC` was what pushed the window out of reach — an operator who followed it (raising
+    # StartLimitIntervalSec above `RestartSec × burst`) was then refused by `verify_unit`, which pins the
+    # rendered window. The true minimum is `burst × (RestartSec + 1) + 1` (one whole second of orphan ceiling
+    # for the LAST attempt, plus one so the burst can be EXCEEDED inside the window), and it is computed ONCE
+    # so the message can only quote what the guard enforces.
+    sl_min_iv=$(( sl_burst * (RESTART_SEC + 1) + 1 ))
+    sl_max_rs=$(( (sl_iv - 1) / sl_burst - 1 ))
+    # ⛔ A REMEDY MUST BE FOLLOWABLE WITHOUT A SECOND, UNDOCUMENTED KNOB (review P2 round 10, #2402). The
+    # refusal used to offer `ORCH_RESTART_SEC <= 98` — the bound that fits a 1 s orphan ceiling — while the
+    # ceiling still defaulted to 60 s, so an operator who followed it met a SECOND refusal naming a variable
+    # the message never mentioned (`ORCH_START_TIMEOUT_SEC <= 1s`). The bound is now derived from the ceiling
+    # ACTUALLY IN FORCE, so one edit satisfies both guards; the 1 s-ceiling shape is still named, as an
+    # explicit second knob.
+    # ⛔ AND IT NO LONGER ADVISES RAISING StartLimitIntervalSec (review P2 round 10, #2402): `verify_unit`
+    # PINS the rendered window, so that advice was refused by this same installer's own artifact check. A
+    # remedy that cannot be followed is the defect class this PR exists to remove, not a nicety.
+    sl_max_rs_at_ceiling=$(( (sl_iv - 1) / sl_burst - START_TIMEOUT_SEC ))
     if [ "$sl_maxtime" -lt 1 ]; then
-        err "REFUSING: the template cannot satisfy its own start limit — StartLimitBurst=$sl_burst attempts inside StartLimitIntervalSec=${sl_iv}s leave no room for RestartSec=${RESTART_SEC}s, so even a 1 s orphan ceiling never fits and NO configuration converges to failed. Fix the template (StartLimitIntervalSec= needs to exceed ${RESTART_SEC}×${sl_burst}s) rather than ORCH_START_TIMEOUT_SEC."
+        err "REFUSING: no orphan ceiling fits this start limit — StartLimitBurst=$sl_burst attempts inside StartLimitIntervalSec=${sl_iv}s leave nothing for RestartSec=${RESTART_SEC}s plus a >= 1s ceiling (the minimum window is ${sl_min_iv}s), so NO configuration would converge to failed."
+        if [ "$sl_max_rs_at_ceiling" -ge 1 ]; then
+            err "  ORCH_RESTART_SEC=${RESTART_SEC} is what made the window too small: use ORCH_RESTART_SEC <= ${sl_max_rs_at_ceiling} with the current ORCH_START_TIMEOUT_SEC=${START_TIMEOUT_SEC} — the two must sum to at most $(( (sl_iv - 1) / sl_burst ))s inside ${sl_iv}s."
+        elif [ "$sl_max_rs" -ge 1 ]; then
+            err "  ORCH_RESTART_SEC=${RESTART_SEC} plus ORCH_START_TIMEOUT_SEC=${START_TIMEOUT_SEC} overrun the window together: lower BOTH — e.g. ORCH_RESTART_SEC <= ${sl_max_rs} with ORCH_START_TIMEOUT_SEC=1 — so the ceiling plus RestartSec fits ${sl_burst} attempts inside ${sl_iv}s."
+        else
+            err "  The TEMPLATE is too small for ANY value: StartLimitIntervalSec=${sl_iv}s cannot fit StartLimitBurst=${sl_burst} attempts at any RestartSec >= 1 (it needs >= ${sl_burst}×2+1 = $(( sl_burst * 2 + 1 ))s). Raise it in the template."
+        fi
         return 1
     fi
     [ "$START_TIMEOUT_SEC" -le "$sl_maxtime" ] \

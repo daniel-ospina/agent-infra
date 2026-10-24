@@ -1363,6 +1363,37 @@ esac
 # `reset-failed`, which also ZEROES the start rate limit — and the doctor does this every 120 s inside a
 # 300 s window, so convergence to `failed` became probabilistic. RED on revert: drop the word check and the
 # stub's `reset-failed` call appears.
+# ⛔ AN OPERATOR'S OWN RestartSec IS NAMED AS THE CAUSE, WITH A VALUE THAT WORKS (review P2 round 10, #2402).
+# With `ORCH_RESTART_SEC=200` the window cannot fit ANY ceiling, and the refusal used to blame the template.
+# RED on revert: the message names StartLimitIntervalSec only, and no `ORCH_RESTART_SEC <=` remedy appears.
+say_case 'a RestartSec that cannot fit the window is named as the cause, with an actionable bound'
+JR5="$(arm_root j5)"; mk_systemctl "$JR5/bin" "$JR5/state" "$JR5/sc.log"
+JR5_RC=0; JR5_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=200 inst j5 --install 2>&1)" || JR5_RC=$?
+[ "$JR5_RC" -ne 0 ] \
+  && ok 'install: REFUSES when RestartSec alone leaves no room for a 1 s orphan ceiling' \
+  || bad "install: accepted ORCH_RESTART_SEC=200 inside a 300 s window — no configuration can converge to failed — $JR5_OUT"
+case "$JR5_OUT" in
+  *'ORCH_RESTART_SEC <= 39'*) ok 'install: the refusal quotes the bound that fits WITH THE CEILING IN FORCE (<= 39 at the 60 s default), not the 98 s one that needs a second knob' ;;
+  *) bad "install: the refusal did not name ORCH_RESTART_SEC with a bound the NEXT guard also accepts ('<= 39' at the default ceiling) — $JR5_OUT" ;;
+esac
+# ⛔ THE REMEDY MUST BE ACCEPTED ON ITS OWN, WITH NOTHING ELSE CHANGED (review P2 round 10, #2402). The
+# previous message named 98 s, which guard B then refused unless ORCH_START_TIMEOUT_SEC was ALSO lowered to
+# 1 — a second knob the message never mentioned, so the printed contract was never exercised (the old arm
+# supplied the missing knob silently). This arm applies ONLY the quoted number, at the default ceiling.
+# RED on revert: quote `sl_max_rs` again and this install is refused with `ORCH_START_TIMEOUT_SEC <= 1s`.
+JR6B="$(arm_root j6b)"; mk_systemctl "$JR6B/bin" "$JR6B/state" "$JR6B/sc.log"
+JR6B_RC=0; JR6B_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=39 inst j6b --install 2>&1)" || JR6B_RC=$?
+[ "$JR6B_RC" -eq 0 ] \
+  && ok 'install: ACCEPTS the quoted bound (39 s) with NOTHING ELSE changed — one knob, no second undocumented one' \
+  || bad "install: refused the value its own refusal recommends (39 s at the default 60 s ceiling) — the remedy still needs a second knob: $JR6B_OUT"
+# ...and the explicit TWO-KNOB shape (the largest RestartSec, with the 1 s ceiling it leaves room for) is
+# still accepted, so naming it in the else-branch is a real alternative rather than prose.
+JR6="$(arm_root j6)"; mk_systemctl "$JR6/bin" "$JR6/state" "$JR6/sc.log"
+JR6_RC=0; JR6_OUT="$(EXTRA_ENV=ORCH_RESTART_SEC=98 ORCH_START_TIMEOUT_SEC=1 inst j6 --install 2>&1)" || JR6_RC=$?
+[ "$JR6_RC" -eq 0 ] \
+  && ok 'install: ACCEPTS the two-knob shape (98 s RestartSec with the 1 s ceiling it leaves room for)' \
+  || bad "install: refused the two-knob shape its own else-branch names (98 s, with a 1 s ceiling) — bound and message disagree — $JR6_OUT"
+
 say_case 'an automated restart does NOT clear the start limit while the unit is activating'
 PR3="$(arm_root pr3)"; mk_systemctl "$PR3/bin" "$PR3/state" "$PR3/sc.log"; mk_tmux "$PR3/bin" "$PR3/tmux.log"
 : > "$PR3/units/eldato-orchestrator.service"; : > "$PR3/state/enabled"; printf 'activating\n' > "$PR3/state/isactive_word"

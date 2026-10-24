@@ -2197,6 +2197,12 @@ cmd_start() {
   own="$(owned_controller_pids)" \
     || die "cannot read the process table (ps) — refusing to start on an unreadable read"
   if [ -n "$own" ]; then
+    # ⛔ THE THIRD "already running" EXIT HANDS OVER TOO (review P2 round 10, #2402). Its two siblings have
+    # this guard; without it, a controller that appears between the handover at the top of this function and
+    # this read (the window spans `assert_queue_target`'s git/network reads) reaches this branch, returns 0
+    # — and under `Restart=always` three orderly exits inside the start window leave the unit `failed`,
+    # which is the loop the handover exists to remove, on the one path the PR's own comment claims is closed.
+    if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then foreground_handover || return 1; fi
     say "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
     # agent-infra#1989: heal the doctor half on THIS path too — it returns "already running" about a
     # live controller exactly like the session branch above, and a cell with a controller but no
@@ -2230,6 +2236,14 @@ cmd_start() {
     [ "$ust" -eq 3 ] && die "cannot read whether $CONTROLLER_UNIT is enabled — refusing to start a tmux controller beside a unit that may be enabled and start at boot (two dispatchers on one queue, #1761). Read it yourself: systemctl is-enabled $CONTROLLER_UNIT"
     # rc 1 is a real DISABLED answer: the operator said this box's controller is not service-managed, so
     # fall through to the tmux path below.
+    # ⛔ AND A DISABLED-BUT-STILL-RUNNING UNIT IS THE DECISION, NOT AN OVERSIGHT (review P2 round 10, #2402,
+    # NOT adopted). `systemctl disable` without `--now` keeps the loaded unit and its `Restart=always`, so a
+    # `start` landing inside that RestartSec window can put a tmux controller beside a unit the manager is
+    # about to bring back. A round-10 reviewer proposed deciding from the ACTIVE read instead. That reverses
+    # the rule this PR states twice and pins with arms — "disabled is an OPERATOR saying this box is not
+    # service-managed", so `start` uses tmux and never starts the unit — and a review round is not the place
+    # to reverse it: the reopen argument lives in #2607, with the measured window and the cost of both
+    # directions.
     if [ "$ust" -eq 0 ]; then
       # ⛔ A UNIT THAT HIT ITS START LIMIT IS FAILED BY DESIGN, AND `start` REFUSES IT (review P1, #2402).
       # StartLimitBurst=3 is what turns a configuration fault into an operator-visible `failed`; systemd then

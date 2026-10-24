@@ -162,10 +162,13 @@ danger is a tmux controller launched beside a unit that may be enabled.
 
 **Those verbs never execute `keys.env` with root's authority.** Resolving the owner means *sourcing* that
 file, and the file belongs to the operator, while `sudo bash … --status` is a documented invocation — so
-when the installer runs as root it evaluates the file as the account that **owns** it (`runuser -u <owner>`),
-and when that cannot be arranged (no `runuser`, an owner it cannot read) it does not evaluate the file at
-all and falls back to the rendered `O=`, which is cleartext in the unit. The fallback costs nothing for
-ownership, because ownership is the union above.
+when the installer runs as root it evaluates the file as the **invoking operator** (`SUDO_USER`) whenever
+sudo can name one, and otherwise as the account that **owns** it (`runuser -u <owner>`). It refuses to
+evaluate the file at all — falling back to the rendered `O=`, which is cleartext in the unit — in three
+cases: no `runuser`; a file it cannot read, or whose owner it cannot name; and a file **any account but its
+owner can write** (the shape `sudo tee` leaves behind with a shared group, where "the owner" is the wrong
+question — the test is who can *write* it, not who owns it, because an account that can write it can run
+code as root). The fallback costs nothing for ownership, because ownership is the union above.
 
 ## Tests
 
