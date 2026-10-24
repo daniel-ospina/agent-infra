@@ -13804,6 +13804,223 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
   && fail "(#1185 c) …but the SUPERSEDED run's log was fetched — the identity resurrected a replaced red" \
   || pass "(#1185 c) …and the superseded run's log was never read"
 
+# ── 79. THE REFUSAL NAMES ITS SUBJECT — THE RUN, THE CHECK, AND THE BASE ANSWER (#2610) ─
+# A count is not a subject. Measured on agent-infra 2026-10-24: three rails (#2430, #2608,
+# #2623) refused with "N of M failing PR run(s) yielded NO parseable failure identity" for
+# heads whose surface was red on `bash-suites (1)/(5)/(7)`, and the refusal named NOTHING —
+# not the run, not the check, not what the base carries under that name. Reconstructing the
+# subject took a `gh api` survey by hand, and in the meantime the refusal read as
+# "unattributable", which is a conclusion this rail must never deliver without evidence.
+#
+# ⛔ WHAT THIS DOES **NOT** PIN. The EXEMPTION DECISION compares failures by IDENTITY, not by
+# check name, so a name answer is CONTEXT — it never exempts. The fixture carries the real
+# agent-infra split (the PR lane's `bash-suites (5)` vs main's `script-validate`) in its REAL
+# shape: main's red sits on a `push` run of a workflow that declares no `pull_request`
+# trigger, so the base probe measures it and then EXEMPTS it as not-PR-evaluable. A reader
+# built on the blocking-red set alone would answer "no such red" about the one red that
+# exists — that is the shape pinned here, not the `unknown`-evaluability arm.
+echo "== 79. an unattributable failing run is refused BY NAME, with its base counterpart (#2610) =="
+new_scen named-refusal
+HEAD_NR="f9f90000000000000000000000000000000000ab"
+printf '%s\n' "$HEAD_NR" > "$SCEN/head"
+lane_fail "$HEAD_NR" 9901 > "$SCEN/runs-$HEAD_NR"
+: > "$SCEN/log-9901"                       # the failed-step log carries NO identity
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9901"
+write_pr_checks "$(check_run 5001 'bash-suites (5)' completed failure 9901)"
+# The base's OWN surface: the same suite under a DIFFERENT name — the split this repo has.
+write_main_checks "$(check_run 4001 'script-validate' completed failure 6101)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6101"
+wf_declares .github/workflows/ci-main.yml push          # …declaring NO pull_request trigger
+main_run_map 6101 push 'CI on main'
+{ main_red_n mainnr01 9902 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a) the unattributable failing run still BLOCKS (exit $rc)" \
+  || fail "(a) the rail merged over a run whose failures entered neither side of the comparison"
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN/err" \
+  && pass "(a) …at step 1c, the arm this issue is about" \
+  || fail "(a) the refusal did not fire at step 1c: $(head -4 "$SCEN/err" 2>/dev/null)"
+grep -q "check 'bash-suites (5)'" "$SCEN/err" \
+  && pass "(b) the refusal NAMES the check that yielded nothing — not just a count" \
+  || fail "(b) the refusal names no check: $(grep -n 'run 9901' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "run 9901" "$SCEN/err" \
+  && pass "(b) …and the RUN it failed in" \
+  || fail "(b) the refusal names no run"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(c) …and answers the base question BY NAME: no base counterpart for 'bash-suites (5)'" \
+  || fail "(c) the base-counterpart answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+# ⛔ THE EXEMPTED-BASE-RED ARM. main's `script-validate` is measured by the probe and then
+# EXEMPTED (its workflow declares no pull_request trigger), so it is NOT in the blocking set.
+# An arm reading only the blocking reds prints an EMPTY list here — the false absence this
+# fixture exists to catch, and the exact shape of the real repo tonight.
+grep -q "red: script-validate" "$SCEN/err" \
+  && pass "(c) …naming the base's own red even though the probe EXEMPTED it as not-PR-evaluable" \
+  || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader answers 'none'): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
+grep -q "The EXEMPTION DECISION compares failures by FAILURE IDENTITY" "$SCEN/err" \
+  && pass "(d) …and says a NAME answer is not an exemption (the identity is what decides)" \
+  || fail "(d) the message could be read as an exemption — the two questions are not separated"
+# ── (e)/(f) THE RUN'S OWN ATTRIBUTION, NOT THE RUN'S MERE PRESENCE (#2610 review, P1-2) ────
+# `--provenance` holds EVERY examined failing run, so a refusal derived from it names runs
+# that DID yield ids. The subset comes from the collector's `--unattributed`, and this
+# fixture proves the two are told apart: run A yields an id (exempt on main, so it does not
+# change the verdict), run B yields nothing. Only B may be named.
+new_scen named-refusal-partial
+HEAD_NP="f9f90000000000000000000000000000000000ef"
+printf '%s\n' "$HEAD_NP" > "$SCEN/head"
+{ lane_fail "$HEAD_NP" 9921; lane_fail "$HEAD_NP" 9922; } > "$SCEN/runs-$HEAD_NP"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9921"
+: > "$SCEN/log-9922"
+echo 'test (z)' > "$SCEN/jobs-failed-9922"
+write_pr_checks "$(check_run 5021 'test (z)' completed failure 9922)"
+write_main_checks "$(check_run 4021 'script-validate' completed failure 6103)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6103"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6103 push 'CI on main'
+{ main_red_n mainnp01 9923 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e) a partially attributing head still BLOCKS (exit $rc)" \
+  || fail "(e) the rail merged with one failing run unattributable"
+grep -q "BLOCKED — 1 of 2 failing PR run(s)" "$SCEN/err" \
+  && pass "(e) …reporting 1 of 2 unattributable" \
+  || fail "(e) the 1c refusal did not fire as expected: $(head -3 "$SCEN/err" 2>/dev/null)"
+grep -q "run 9922" "$SCEN/err" \
+  && pass "(f) the refusal NAMES the run that yielded nothing (9922)" \
+  || fail "(f) the unattributable run is not named: $(grep -n 'run 99' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "run 9921" "$SCEN/err" \
+  && fail "(f) it ALSO named run 9921, which DID yield an id — provenance was used as the subset" \
+  || pass "(f) …and does NOT name run 9921, which contributed an id"
+# ── (h) A GREEN BASE — the COMMON case, and the one a `paste`-then-`sed` default misses.
+# `paste -sd, -` emits no line at all for zero input lines, so a `sed 's/^$/none/'` placed
+# AFTER it is dead code and the answer ends at `red: ` (#2610 review, P2-1). This arm is
+# the one that fails if that default regresses.
+new_scen named-refusal-greenbase
+HEAD_NG="f9f9000000000000000000000000000000000012"
+printf '%s\n' "$HEAD_NG" > "$SCEN/head"
+lane_fail "$HEAD_NG" 9931 > "$SCEN/runs-$HEAD_NG"
+: > "$SCEN/log-9931"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9931"
+write_pr_checks "$(check_run 5031 'bash-suites (5)' completed failure 9931)"
+main_green_surface
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) a green base with an unattributable PR run still BLOCKS (exit $rc)" \
+  || fail "(h) the refusal did not fire against a green base"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(h) …and still answers the base question BY NAME" \
+  || fail "(h) no counterpart answer against a green base: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -qE "^       red: none$" "$SCEN/err" \
+  && pass "(h) …printing 'red: none' for a base with no reds (not an empty 'red: ')" \
+  || fail "(h) the empty red list renders as nothing at all: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
+# ── (i) AN UNRESOLVED BASE REF IS NOT 'main'. A failed `pr view --json baseRefName` must
+# not be narrated as a claim about a branch nobody resolved.
+new_scen named-refusal-nobase
+HEAD_NB="f9f9000000000000000000000000000000000034"
+printf '%s\n' "$HEAD_NB" > "$SCEN/head"
+printf '\n' > "$SCEN/base-ref"                      # the resolution answers EMPTY
+lane_fail "$HEAD_NB" 9941 > "$SCEN/runs-$HEAD_NB"
+: > "$SCEN/log-9941"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9941"
+write_pr_checks "$(check_run 5041 'bash-suites (5)' completed failure 9941)"
+main_green_surface
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(i) an unresolvable base ref still refuses (exit $rc)" \
+  || fail "(i) the rail proceeded with no base ref"
+grep -q "the base ref could NOT be resolved" "$SCEN/err" \
+  && pass "(i) …saying the counterpart question is UNANSWERED" \
+  || fail "(i) an unresolved base ref was narrated as a claim about a branch: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "IS red on 'main'" "$SCEN/err" \
+  && fail "(i) it asserted a red is 'on main' about a base it never resolved" \
+  || pass "(i) …and asserts nothing about 'main'"
+# ── (j) A COUNT THAT COULD NOT BE MADE IS NOT A ZERO COUNT. The header's count comes from
+# `grep -c`; when grep cannot read the file at all (exit 2/127) the function must say the count
+# is UNKNOWN and print NO number — a header asserting `NAMED (0)` over a list that then prints
+# runs is a measured-looking claim about something never measured (#2610 review, round 5). The
+# status is forced here with a PATH shim that behaves as the real grep EXCEPT for the
+# unattributed list, so nothing else in the rail is affected.
+new_scen named-refusal-uncountable
+HEAD_NU="f9f9000000000000000000000000000000000056"
+printf '%s\n' "$HEAD_NU" > "$SCEN/head"
+lane_fail "$HEAD_NU" 9961 > "$SCEN/runs-$HEAD_NU"
+: > "$SCEN/log-9961"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9961"
+write_pr_checks "$(check_run 5061 'bash-suites (5)' completed failure 9961)"
+main_green_surface
+UNC_BIN="$TMP/grep-uncountable"
+mkdir -p "$UNC_BIN"
+printf '%s\n' '#!/bin/sh' \
+  'case "$*" in *pr-unattributed*) echo "grep: cannot read the unattributable list" >&2; exit 2 ;; esac' \
+  'exec /usr/bin/grep "$@"' > "$UNC_BIN/grep"
+chmod +x "$UNC_BIN/grep"
+PATH="$UNC_BIN:$PATH" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+# ⛔ ANCHORED TO THE ARM, NOT TO THE EXIT (#2610 review, round 6): step 1c's `exit 1` fires on
+# `pr_extracted < pr_examined` whether or not the naming arm ran, so an `rc != 0` assertion alone
+# could not redden if the arm regressed. Both halves are required: the refusal AND the unknown
+# header, on the same run.
+[ "$rc" -ne 0 ] && grep -q 'failing PR run(s)' "$SCEN/err" \
+  && grep -q 'The failing run(s), NAMED —' "$SCEN/err" \
+  && pass "(j) an uncountable list still BLOCKS (exit $rc) and still names the runs" \
+  || fail "(j) the refusal or the named header is missing (exit $rc)"
+grep -q "could not be COUNTED" "$SCEN/err" \
+  && pass "(j) …and says the count could not be made" \
+  || fail "(j) the uncountable arm is silent: $(sed -n '/NAMED/,$p' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "UNKNOWN, not zero" "$SCEN/err" \
+  && pass "(j) …naming it UNKNOWN rather than zero" \
+  || fail "(j) the message does not distinguish unknown from zero"
+grep -q 'NAMED (0)' "$SCEN/err" \
+  && fail "(j) it asserted a count of 0 for a list it could not count" \
+  || pass "(j) …and prints NO number it did not measure"
+grep -q "run 9961 — check 'bash-suites (5)'" "$SCEN/err" \
+  && pass "(j) …while the runs themselves are still named (the lines are real)" \
+  || fail "(j) the runs were dropped along with the count: $(grep -n '9961' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q 'INCOMPLETE' "$SCEN/err" \
+  && fail "(j) the completeness cross-check ran against an UNKNOWN count" \
+  || pass "(j) …and no completeness verdict is claimed from an unknown count"
+
+# ── (g) THE SAME-NAME ARM. An arm that always answers "no counterpart" would pass (c) and
+# lie about this surface, so a blocking base red with the same NAME is its own case.
+new_scen named-refusal-shared
+HEAD_NS="f9f90000000000000000000000000000000000cd"
+printf '%s\n' "$HEAD_NS" > "$SCEN/head"
+lane_fail "$HEAD_NS" 9911 > "$SCEN/runs-$HEAD_NS"
+: > "$SCEN/log-9911"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9911"
+write_pr_checks "$(check_run 5011 'bash-suites (5)' completed failure 9911)"
+write_main_checks "$(check_run 4011 'bash-suites (5)' completed failure 6102)"
+main_run_map 6102 push 'CI on main'
+{ main_red_n mainns01 9912 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(g) a shared red NAME still REFUSES (a name match is not an exemption)" \
+  || fail "(g) a same-named base red exempted the PR by NAME — the decision is by identity"
+grep -q "'bash-suites (5)' IS red on 'main'" "$SCEN/err" \
+  && pass "(g) …and reports the base as carrying the same name RED (not as an absence)" \
+  || fail "(g) the same-name arm is wrong: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "NO BASE COUNTERPART" "$SCEN/err" \
+  && fail "(g) it ALSO claimed no counterpart — the arms are not exclusive" \
+  || pass "(g) …and does NOT claim an absent counterpart on the same surface"
+# ── MUTATION: the assertions above must rest on the naming arm, not on other text ──
+MUTD="$TMP/mut-named"; rm -rf "$MUTD"; mkdir -p "$MUTD"
+grep -v 'named_unattributable_runs "$TMP/pr-unattributed.txt"' "$ADM" > "$MUTD/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD/"
+bash -n "$MUTD/admin-merge.sh" \
+  && pass "(m) the mutant (naming arm deleted) is still valid bash" \
+  || fail "(m) the mutant does not parse — the mutation is not a clean arm deletion"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  bash "$MUTD/admin-merge.sh" 42 --main-runs 1 >"$SCEN/mut-out" 2>"$SCEN/mut-err"
+mrc=$?
+# The SAME refusal must still fire — a mutant that died earlier would make the absence arm
+# vacuously true, so the arm below is only meaningful once THIS one holds.
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN/mut-err" 2>/dev/null \
+  && pass "(m) the mutant still refuses at step 1c — the refusal is not what this arm adds" \
+  || fail "(m) the mutant did not reach step 1c (exit $mrc): $(head -3 "$SCEN/mut-err" 2>/dev/null)"
+grep -q "check 'bash-suites (5)'" "$SCEN/mut-err" 2>/dev/null \
+  && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
+  || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
