@@ -1715,6 +1715,22 @@ out="$(bash "$TMP/q20.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O37" 2>&1)"
 case "$out" in *"count=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "WT_ABSENT_CONFIRM=0 + CYC=5 together still confirm (the bound is never narrower than the window)" $rc
 
+# ⛔ A LEADING-ZERO `CYC` MUST NOT KILL THE *SOURCE* (review round 13 of #2653, P1). `case ''|*[!0-9]*)`
+# accepts `08` and `[ 08 -ge 1 ]` is true, so `$(( 4 * 08 ))` read it as OCTAL, errored, and left
+# `WT_ABSENT_STALE_MIN` UNBOUND — fatal at source time under `set -u` in ALL THREE consumers
+# (orch-loop.sh, dispatch-merge.sh, report.sh): the controller exits before a cycle runs and KeepAlive
+# relaunches a process that dies in the same place. Measured on the previous head, green on main.
+cat > "$TMP/q21.sh" <<'SH'
+set -u
+O="$2"; mkdir -p "$O"
+CYC=08
+. "$1"
+echo "loaded=yes stale=$WT_ABSENT_STALE_MIN"
+SH
+out="$(CYC=08 bash "$TMP/q21.sh" "$LIB" "$TMP/O38" 2>&1)"
+case "$out" in *"loaded=yes stale=960"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "CYC=08 cannot kill the source (the octal expansion is normalised, not class-checked)" $rc
+
 # ⛔ A BAD `CYC` MUST NOT EMPTY THE CENSUS (review round 10 of #2653, P1). The staleness rule does
 # arithmetic on CYC, which this module inherits from the environment (its consumers, `dispatch-merge.sh`
 # and `report.sh`, do not coerce it) — and an arithmetic-expansion error TERMINATES wt_table before it
@@ -1761,9 +1777,14 @@ export CMUX_TREE_ABSENT=1
 . "$1"
 echo "count=$(wt_count merge-)"
 echo "window=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo none)"
+echo "delta=$(($(cat "$WT_DIR/.wt-absent-since" 2>/dev/null || echo 0) - $(date +%s)))"
 SH
 out="$(bash "$TMP/q17.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O34" 2>&1)"
-case "$out" in *"count=1"*"window=open"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+# ⛔ AND THE STAMP MUST HAVE BEEN REWRITTEN, not merely kept (review round 13): with the stamp KEPT the
+# elapsed value is negative, so neither rule fires and `count=1`/`window=open` are equally true — the
+# old assertion was green on the pre-round-10 code. A rewritten stamp is within the window of NOW; the
+# seeded one was +7200.
+case "$out" in *"count=1"*"window=open"*"delta="+"7200"*) rc=1; echo "      stamp NOT rewritten: $out";; *"count=1"*"window=open"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "a FUTURE stamp (a clock step) is discarded instead of pinning the release" $rc
 
 # ⛔ A STALE STAMP CONFIRMS NOTHING (review round 9 of #2653, P1): the stamp records when an absent

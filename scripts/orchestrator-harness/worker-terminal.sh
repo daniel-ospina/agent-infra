@@ -728,7 +728,7 @@ wt_tmux_names() {
 # WT_ABSENT_CONFIRM — how long an absent session owner must persist before its records are concluded
 # dead (agent-infra#2653, review round 5). Two samples, never one: see the arm in wt_table.
 WT_ABSENT_CONFIRM="${WT_ABSENT_CONFIRM:-60}"
-case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
+case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*|0*) WT_ABSENT_CONFIRM=60 ;; *) WT_ABSENT_CONFIRM=$(( 10#$WT_ABSENT_CONFIRM )) ;; esac
 # ⛔ ZERO IS NOT "OFF", IT IS "CONFIRM ON ONE SAMPLE" (review round 7 of #2653, P2): any `export` could
 # set it, and a gate an export can defeat is not a gate (the same reasoning `wt_bounded` records for its
 # own `0`). An ALREADY-ELAPSED window is a different input and still confirms on this sample.
@@ -736,7 +736,7 @@ case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
 # other way round, `0` made the `2*window` floor 0, leaving `4*CYC` = 20s at the sanctioned `CYC=5` —
 # NARROWER than the 60s window it must be wider than, so every stamp was discarded as stale before it
 # could confirm and the release could never fire, silently.
-[ "$WT_ABSENT_CONFIRM" -gt 0 ] 2>/dev/null || WT_ABSENT_CONFIRM=60
+[ "$WT_ABSENT_CONFIRM" -ge 1 ] 2>/dev/null || WT_ABSENT_CONFIRM=60
 # ⛔ CYC IS READ BY THE STALENESS RULE BELOW, SO IT IS COERCED HERE, NOT ASSUMED (review round 10 of
 # #2653). This module is sourced by `dispatch-merge.sh` and `report.sh`, which do NOT coerce CYC for
 # it (`orch-loop.sh` repairs only its own shell), so a non-numeric value from the environment reaches
@@ -744,19 +744,36 @@ case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
 # An empty table is read as "this box has no workers": the caps stop binding and `wt_close` deletes a
 # record it never looked at. `CYC` also floors at 5 (install.sh, orch-loop), so a legitimate small
 # cycle is preserved.
-CYC="${CYC:-240}"
-case "$CYC" in ''|*[!0-9]*) CYC=240 ;; esac
-[ "$CYC" -ge 1 ] 2>/dev/null || CYC=240
+# ⛔ NORMALISE INTO A LOCAL, DO NOT CLASS-CHECK AND DO NOT TOUCH THE CALLER'S `CYC` (review round 13 of
+# #2653, P1). `case ''|*[!0-9]*)` ACCEPTS `08`, `[ 08 -ge 1 ]` is true (test parses decimal), and then
+# `$(( 4 * CYC ))` reads `08` as OCTAL and ERRORS — the assignment fails, and with `set -u` (every
+# consumer: orch-loop.sh, dispatch-merge.sh, report.sh) `WT_ABSENT_STALE_MIN` is UNBOUND, which is fatal
+# at SOURCE time: the controller and the merge dispatcher exit before a cycle runs, and KeepAlive
+# relaunches a process that dies in the same place — the `CYC=08` relaunch-loop the `is_num` doctrine
+# records. `0*` is therefore rejected as well, and `10#` makes the rest decimal.
+CYCN=240
+case "${CYC:-}" in
+  ''|*[!0-9]*|0*) : ;;
+  *) [ "${#CYC}" -le 9 ] && CYCN=$(( 10#$CYC )) ;;
+esac
+[ "$CYCN" -ge 1 ] 2>/dev/null || CYCN=240
 # A stamp older than this is not continuity for the CURRENT outage: it is re-stamped, never confirmed.
 # ⛔ AND IT MUST BE WIDER THAN THE CONFIRMATION WINDOW (review round 10 of #2653), or a sanctioned
 # small cycle (`CYC` floors at 5) would discard every stamp before it could ever confirm — the release
 # #2653 provides would silently never happen. Whichever is larger: 4 cycles, or twice the window.
-WT_ABSENT_STALE_MIN=$(( 4 * CYC ))
+WT_ABSENT_STALE_MIN=$(( 4 * CYCN ))
 [ "$WT_ABSENT_STALE_MIN" -ge $(( 2 * WT_ABSENT_CONFIRM )) ] || WT_ABSENT_STALE_MIN=$(( 2 * WT_ABSENT_CONFIRM ))
 WT_CENSUS=""
 wt_table() {
   local now ttl dir cache hdr tree tree_err tfile absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
-  now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
+  # ⛔ A FAILED OR BACKWARDS CLOCK MUST NOT FREEZE THE MEMO (review round 13 of #2653, P2). `|| echo 0`
+  # is the idiom round 12 removed from the absent arm: with `now=0` (or after a backwards clock step)
+  # `now - at` is NEGATIVE, which is `< ttl`, so a memo is served FOREVER instead of for 10 s — the
+  # census freezes at the pre-step verdict, and a frozen `dead` row is the under-count direction (the
+  # caps stop binding). The age must be non-negative AND under the TTL.
+  now="$(date +%s 2>/dev/null)" || now=""
+  case "$now" in ''|*[!0-9]*) now="" ;; esac
+  ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
     hdr="$(head -1 "$cache" 2>/dev/null)"
@@ -764,7 +781,10 @@ wt_table() {
       '# at='*)
         case "${hdr#\# at=}" in
           ''|*[!0-9]*) : ;;
-          *) [ $(( now - ${hdr#\# at=} )) -lt "$ttl" ] && { sed '1d' "$cache"; return 0; } ;;
+          *) if [ -n "$now" ]; then
+               _mage=$(( now - ${hdr#\# at=} ))
+               [ "$_mage" -ge 0 ] && [ "$_mage" -lt "$ttl" ] && { sed '1d' "$cache"; return 0; }
+             fi ;;
         esac ;;
     esac
   fi
@@ -925,8 +945,12 @@ wt_table() {
                  [ -e "$_wl" ] || { : >"$_wl" 2>/dev/null || true; wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED); logged once per process"; }; }
           absent_since="$absent_now"
         fi
-        # ONE comparison, always: a zero (or already-elapsed) window confirms on THIS sample, which is
-        # what the suites and an operator debugging a box use; the default window needs a second sample.
+        # ONE comparison, always: an ALREADY-ELAPSED stamp confirms on THIS sample — that is how an
+        # operator declares "this outage has lasted", and how the fixtures say it. ⛔ THE KNOB'S `0` DOES
+        # NOT: it is coerced to 60 above (review round 7), because zero would confirm on one sample.
+        # This comment claimed the suites set the knob to 0 — they did exactly the opposite, BECAUSE of
+        # round 7, and a reader looking for that debugging switch would think the knob was broken
+        # (review round 13).
         [ $(( absent_now - absent_since )) -ge "$WT_ABSENT_CONFIRM" ] && probe_ok=1
         fi ;;
       # ⛔ ANY OTHER ANSWER CLOSES THE WINDOW TOO (review round 8 of #2653, P2). It used to close only
