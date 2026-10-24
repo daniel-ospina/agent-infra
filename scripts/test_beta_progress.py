@@ -848,7 +848,7 @@ def test_the_real_request_path_sends_the_token_in_a_header_and_never_prints_it(m
         seen["timeout"] = timeout
         return _Resp(b'[{"number": 1, "head": {"ref": "x"}, "merged_at": null}]')
 
-    monkeypatch.setattr(bp.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bp, "_rest_open", fake_urlopen)
     out = bp._rest_get_json("https://api.github.com/repos/o/r/pulls?state=open",
                             "gho_real_path_token")
     assert out == [{"number": 1, "head": {"ref": "x"}, "merged_at": None}]
@@ -860,12 +860,79 @@ def test_the_real_request_path_sends_the_token_in_a_header_and_never_prints_it(m
     def boom(req, timeout=None):
         raise OSError("connection refused")
 
-    monkeypatch.setattr(bp.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(bp, "_rest_open", boom)
     assert bp._rest_get_json("https://api.github.com/x", "gho_real_path_token") is None
 
     captured = capsys.readouterr()
     assert "gho_real_path_token" not in (captured.out + captured.err), (
         "the transport must not print the credential on either path")
+
+
+# ── the PAT never leaves the origin it was sent to ──────────────────────
+def test_a_cross_origin_redirect_never_carries_the_token_to_the_new_host():
+    """`_rest_get_json` is the ONE function holding the credential, and urllib's default
+    redirect handler re-sends every header except content-length/content-type. Without the
+    same-origin rule a 30x naming another host would hand `Authorization: bearer <tok>` to
+    that host. Two loopback ports are two origins, so this needs no network. The positive
+    control pins the other half -- a redirect that stays put is still followed, so the rule
+    did not silence legitimate redirects."""
+    import http.server
+    import threading
+
+    received = []
+
+    class _Sink(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append((self.path, self.headers.get("Authorization")))
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    class _Redirector(http.server.BaseHTTPRequestHandler):
+        away = ""
+
+        def do_GET(self):
+            if self.path in ("/away", "/stay"):
+                self.send_response(302)
+                self.send_header("Location", self.away if self.path == "/away" else "/ok")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = b'{"same": "origin"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    sink = http.server.HTTPServer(("127.0.0.1", 0), _Sink)
+    redir = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
+    _Redirector.away = "http://127.0.0.1:%d/x" % sink.server_address[1]
+    redir_url = "http://127.0.0.1:%d" % redir.server_address[1]
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (sink, redir)]
+    for t in threads:
+        t.start()
+    try:
+        assert bp._rest_get_json(redir_url + "/away", "gho_redirect_token") is None, (
+            "a cross-origin redirect must be refused, not followed")
+        assert received == [], (
+            "nothing may reach the other origin -- the header carrying the PAT was re-sent "
+            "by urllib's default redirect handler (got %r)" % (received,))
+        assert bp._rest_get_json(redir_url + "/stay", "gho_redirect_token") == {
+            "same": "origin"}, "a same-origin redirect must still be followed"
+    finally:
+        for s in (sink, redir):
+            s.shutdown()
+            s.server_close()
 
 
 # ── the fallback is a FALLBACK: a healthy GraphQL read pays for no REST ─────

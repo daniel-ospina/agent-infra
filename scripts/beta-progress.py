@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 import urllib.request
 
 REPO = "daniel-ospina/tortoise"
@@ -239,6 +240,33 @@ def _token():
     return ""
 
 
+class _SameOriginOnly(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only while it stays on the origin we asked.
+
+    ⛔ THE REQUEST CARRIES THE PAT. urllib's default redirect handler re-sends every header
+    except `content-length`/`content-type` to the redirect target, so a 30x naming another
+    host would hand `Authorization: bearer <tok>` to that host. GitHub's API does not redirect
+    `/pulls` cross-origin today, so this is defence in depth rather than a live leak: the
+    property bought is that the token cannot leave the origin that was asked. Returning None
+    makes urllib raise HTTPError, which the caller already turns into None (UNKNOWN, never
+    empty). Same-origin redirects are untouched.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_REST_OPENER = urllib.request.build_opener(_SameOriginOnly)
+
+
+def _rest_open(req, timeout):
+    """The single seam every REST read goes through -- ONE opener, so the same-origin
+    redirect policy cannot be bypassed by a second call site appearing later."""
+    return _REST_OPENER.open(req, timeout=timeout)
+
+
 def _rest_get_json(url, tok, timeout=REST_TIMEOUT_S):
     """One REST GET. Parsed JSON, or None on ANY failure -- None means UNKNOWN, never empty."""
     req = urllib.request.Request(url, headers={
@@ -247,7 +275,7 @@ def _rest_get_json(url, tok, timeout=REST_TIMEOUT_S):
         "User-Agent": "beta-progress",
     })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _rest_open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
     except Exception as exc:
         # ⛔ A REASON, NOT SILENCE (#2142 review). Still returns None (UNKNOWN, never empty), but a
@@ -441,9 +469,13 @@ def compute():
     merged = gh("pr", "list", "--repo", REPO, "--state", "merged", "--limit", "400",
                 "--json", "number,title,headRefName,mergedAt")
     # GRAPHQL REFUSED -> TRY REST BEFORE DECLARING THE METRICS UNAVAILABLE. If EITHER read
-    # failed, BOTH lists are re-read over REST: a REST open-count beside a GraphQL
-    # merged-count would compare two DIFFERENTLY-WRONG reads, and `merged_today` is a
-    # comparison against the open window. Same source or no metric.
+    # failed, BOTH lists are re-read over REST: once one read has failed the survivor may
+    # itself be a degraded read, so pairing a REST count with it would compare two
+    # DIFFERENTLY-WRONG reads of one metric. The cross-list consumer that makes that unsafe is
+    # `covered()`, which walks `openpr + merged` together (`merged_today` reads `merged` alone).
+    # Same source or no metric -- scoped to THIS re-read: where the workspace has the gh layer's
+    # REST adapter the OPEN read is already REST while MERGED is GraphQL (see the block above),
+    # so this arm claims no more than that a FAILURE never leaves a half-re-read pair.
     if openpr is None or merged is None:
         deadline = time.time() + REST_BUDGET_S      # ONE budget for the pair (see above)
         ro = _rest_prs("open", limit=500, deadline=deadline)
