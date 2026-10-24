@@ -205,7 +205,7 @@ lp_path_held() { # <census> <canonical-path>
 # was pointed at, so argv is a different witness from cwd.
 LP_NAME_WHY=""
 lp_path_named() { # <census> <canonical-path>
-    local f="$1" path="$2" kind pid p _pp base _cand
+    local f="$1" path="$2" kind pid p _pp base _cand _pcwd
     base="${path##*/}"
     LP_NAME_WHY=""
     [ -n "$path" ] && [ -r "$f" ] || return 1
@@ -252,6 +252,24 @@ lp_path_named() { # <census> <canonical-path>
                     LP_NAME_WHY="argv pid $pid (canonicalised)"; return 0
                 fi ;;
         esac
+    done <"$f"
+    # ⛔ AND A TOKEN THAT IS RELATIVE TO THE HOLDER'S OWN CWD. "Absolute only" exists because resolving a
+    # token against OUR cwd would be a lie — but the holder's cwd is in the SAME table, so resolving
+    # against THAT is the truth, and a holder naming the tree as `rel-argv/f.txt` from its parent used to
+    # name nothing at all (measured: the tree was reaped under a live holder whose cwd was its parent).
+    # Only tokens that are neither absolute nor `KEY=/abs` reach here; the holder's cwd comes from the
+    # /proc (already physical) or the `lsof` row, and `..` components are not normalised — such a token
+    # simply does not match, which fails closed (the tree is KEPT by the age/other arms, never reaped
+    # because of it).
+    while IFS="$(printf '\t')" read -r kind pid p; do
+        [ "$kind" = arg ] || continue
+        case "$p" in /*) continue ;; *=*) continue ;; esac
+        _pcwd="$(awk -F'\t' -v p="$pid" '$1=="cwd" && $2==p {print $3; exit}' "$f" 2>/dev/null)"
+        [ -n "$_pcwd" ] || continue
+        case "$p" in *..*) continue ;; esac
+        if _lp_rel "${_pcwd%/}/$p" "$path"; then
+            LP_NAME_WHY="argv pid $pid (relative to its cwd ${_pcwd})"; return 0
+        fi
     done <"$f"
     return 1
 }

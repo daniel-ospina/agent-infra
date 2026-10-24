@@ -354,6 +354,37 @@ head_state() {
     printf ' head=%s dirty=%s' "${sha:-?}" "$dirty"
 }
 
+# TOCTOU_REPROBE <worktree> — a FRESH census + a fresh dirty check, immediately before removal.
+#   The classification above ran against ONE snapshot taken at pass start; the removal can be up to
+#   BUDGET (300s/root) later, and a lane that enters an old, clean worktree during that window used to
+#   lose it with a live cwd inside (measured: the witness's cwd read `<path> (deleted)`). The sibling
+#   owner re-checks exactly here for the same reason (`pi-reap-worktrees.sh`'s F4/#1105). Any new
+#   witness — a live cwd/exe/argv, an unreadable fresh census, or a tree that is no longer clean — is a
+#   PRESERVE.
+TOCTOU_WHY=""
+toctou_preserve() { # <worktree> -> 0 = still removable, 1 = PRESERVE (TOCTOU_WHY names it)
+    local wt="$1" fresh rc out dirty_n
+    TOCTOU_WHY=""
+    fresh="$(mktemp -d "${TMPDIR:-/tmp}/reap-aw-reprobe.XXXXXX" 2>/dev/null)" || { TOCTOU_WHY="re-probe-unavailable"; return 1; }
+    if ! lp_census "$fresh" >/dev/null 2>&1; then
+        rm -rf "$fresh" 2>/dev/null
+        TOCTOU_WHY="re-probe-census-unreadable"
+        return 1
+    fi
+    if lp_path_held "$fresh" "$wt"; then TOCTOU_WHY="entered-during-pass ($LP_HOLD_WHY)"; rm -rf "$fresh"; return 1; fi
+    if lp_path_named "$fresh" "$wt"; then TOCTOU_WHY="argv-named-during-pass ($LP_NAME_WHY)"; rm -rf "$fresh"; return 1; fi
+    if [ "$DIRTY_MODE" = keep ]; then
+        out="$(head_state "$wt")"
+        dirty_n="$(printf '%s' "$out" | sed -n 's/.*dirty=\([0-9][0-9]*\).*/\1/p')"
+        case "$dirty_n" in
+            0|'') : ;;   # '' = git could not answer; the dial already kept those at classification
+            *) TOCTOU_WHY="became-dirty(dirty_n=$dirty_n)"; rm -rf "$fresh"; return 1 ;;
+        esac
+    fi
+    rm -rf "$fresh" 2>/dev/null
+    return 0
+}
+
 remove_one() { # <worktree-canonical-path> <repo> — 0 removed, 1 not removed (named by the caller)
     # ⛔ HOW it was removed is REPORTED, never inferred from a variable that only means "a repo was
     # found": an unregistered (moved) worktree is removed with `rm`, and a report that called that
@@ -498,6 +529,13 @@ sweep_root() { # <root>
         if [ "$(now)" -ge "$deadline" ]; then
             say "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
             KEPT=$((KEPT + 1)); continue
+        fi
+        # ⛔ RE-PROVE IMMEDIATELY BEFORE THE DESTRUCTIVE CALL. Everything above ran against ONE snapshot.
+        if ! toctou_preserve "$canon"; then
+            KEPT=$((KEPT + 1))
+            say "KEPT   $canon reason=toctou ($TOCTOU_WHY; the pass-start snapshot was up to ${BUDGET}s stale, and a live holder is never a guess; age=${age}m)"
+            log "PRESERVE-TOCTOU $canon $TOCTOU_WHY"
+            continue
         fi
         if remove_one "$canon" "$repo"; then
             # `how=` comes from the ARM THAT RAN, never from "a repo was found": an unregistered
