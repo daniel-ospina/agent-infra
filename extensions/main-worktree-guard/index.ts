@@ -2809,6 +2809,17 @@ function _worktreeDiscardBlock(command: string): string | null {
       hit.kind === "producer" ? _wtExpandedProducerReason(hit.token) : _WT_EXPANDED_SCRIPT_REASON,
     );
   };
+  // ⛔ ONE predicate for every place a script FILE's own body is read — the two
+  // command-position walks AND the `eval` / `-c` / `$(cat)` / assignment-value readers.
+  // A SANCTIONED, PINNED script's body is audited bytes, so the arm does not apply to it
+  // (`_isAuditedSanctionedScript` = sanctioned anchor + the pin's digest, never the path
+  // alone); for anything else the refusal fires exactly as before. Patching only some of
+  // these sites makes the verdict depend on WHERE the same body was reached — which is the
+  // invariant `_expRefusal` itself states two lines above — and leaves the reported defect
+  // (a framework script, including the mandated rail, unrunnable by a false block) alive on
+  // the spellings that go through the other readers.
+  const _expRefusalForBody = (scriptPath: string, body: string): string | null =>
+    _isAuditedSanctionedScript(resolve(execCwd, scriptPath)) ? null : _expRefusal(body);
 
   // Executable-shebang script (`./undo.sh`, `/tmp/undo.sh`): extractScriptPath
   // only recognises interpreter WORDS (`bash x.sh`), so a directly-executed
@@ -3218,12 +3229,39 @@ function _worktreeDiscardBlock(command: string): string | null {
       if (disc.length) {
         sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: p });
       }
-      // #1228: a script we DID read runs an EXPANDED path — same unreadable-
-      // script hole one level down, as a direct operand (`bash ./undo*.sh`) OR
-      // as a piped producer (`bash -c 'cat ./undo*.sh | bash'`); fail closed
-      // before the walk silently skips it.
-      const expNested = _expRefusal(content);
-      if (expNested) return expNested;
+      // ⛔ A SANCTIONED script's BODY is AUDITED BYTES, so the #1228 body arm does not
+      // apply to it. That is the exemption's own stated contract ("the exemption skips the
+      // content walk for the WHOLE invocation") and it was honoured for the DISCARD verdict
+      // but NOT for this refusal, which is how the framework's own `gh` shim became
+      // unrunnable: its body carries
+      //     LC_ALL=C grep -qa '<marker>' <(head -c 8192 2>/dev/null < "$1")
+      // and `_wtProcessSubExpansion` matches ANY `<(head|tail|cat|…)` whose inner text
+      // needs a runtime expansion, so a PROCESS-SUBSTITUTION ARGUMENT to `grep` — not a
+      // script source at all — was read as an expanded script path and every path-spelled
+      // invocation of the shim was refused as "the script path contains a shell-expansion
+      // form" (measured 2026-10-24; reds `test-script-backdoor.mjs` B5c on any box where
+      // `gh` on PATH IS that shim).
+      //
+      // ⛔ THE PREDICATE IS THE DIGEST, NOT THE PATH. `_sanctionedScriptExemption` has two
+      // arms and only arm 2 checks bytes; arm 1 is PATH ONLY by spec (the pre-existing
+      // `~/.pi/agent` anchor, unchanged by #2332). Keying this stand-down on
+      // `exemption !== null` therefore exempts ARBITRARY bytes at a sanctioned relpath
+      // under the module's root — measured at review AND by the verifier: an unaudited
+      // body planted at a sanctioned relpath was ALLOWED with the path-keyed version and
+      // BLOCKED without it. That is the #1228 fail-open (silent destruction of other
+      // sessions' uncommitted work, which an expanded operand resolves at runtime).
+      // `_isAuditedSanctionedScript` adds the pin's sha256 for BOTH arms, so only the
+      // shipped bytes can take it. Note the body's own discards are still PARSED above (the
+      // set filter is what drops them), and the nested-script descent below is NOT skipped
+      // — the audited-bytes claim is about THIS file only, so whatever its body names is
+      // still walked.
+      if (!_isAuditedSanctionedScript(real)) {
+        // #1228: a script we DID read runs an EXPANDED path — same unreadable-script hole
+        // one level down, as a direct operand or as a piped producer; fail closed before the
+        // walk silently skips it.
+        const expNested = _expRefusal(content);
+        if (expNested) return expNested;
+      }
       p = extractScriptPath(content) ?? seeds.shift() ?? null;
     }
     // #1885 — the SECOND, independently bounded walk: every command-position script the
@@ -3252,8 +3290,14 @@ function _worktreeDiscardBlock(command: string): string | null {
         if (disc.length) {
           sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: seed });
         }
-        const expNested = _expRefusal(content);
-        if (expNested) return expNested;
+        // Same digest-keyed stand-down as the walk above — ONE predicate, both walks (a
+        // sanctioned script reached through the command-position queue must not be gated by
+        // a rule its sibling walk already exempts it from). The nested-script push below is
+        // NOT skipped, for the same reason.
+        if (!_isAuditedSanctionedScript(real)) {
+          const expNested = _expRefusal(content);
+          if (expNested) return expNested;
+        }
         const nested = extractScriptPath(content);
         if (nested && !seen.has(String(nested)) && !cpQueue.includes(nested)) cpQueue.push(nested);
       }
@@ -3324,7 +3368,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           const real = realpathSync(resolve(execCwd, val));
           if (statSync(real).isFile() && statSync(real).size <= 64 * 1024) {
             const vContent = readFileSync(real, "utf8");
-            const expFile = _expRefusal(vContent);
+            const expFile = _expRefusalForBody(real, vContent);
             if (expFile) return expFile;
             sets.push({ discs: extractWorkingTreeDiscards(vContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: val });
           }
@@ -3353,7 +3397,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           const sp = extractScriptPath(sub);
           if (sp && !/[$`]/.test(sp)) {
             const scContent = readFileSync(resolve(execCwd, sp), "utf8");
-            const expSc = _expRefusal(scContent);
+            const expSc = _expRefusalForBody(sp, scContent);
             if (expSc) return expSc;
             sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
           }
@@ -3378,7 +3422,7 @@ function _worktreeDiscardBlock(command: string): string | null {
       const sp = extractScriptPath(payload);
       if (sp && !/[$`]/.test(sp)) {
         const eContent = readFileSync(resolve(execCwd, sp), "utf8");
-        const expFile = _expRefusal(eContent);
+        const expFile = _expRefusalForBody(sp, eContent);
         if (expFile) return expFile;
         sets.push({ discs: extractWorkingTreeDiscards(eContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
       }
@@ -3467,7 +3511,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           // where outer-glob.sh is `bash ./undo*.sh`) — the payload-text check
           // above cannot see it, and the static-discard probe below cannot read
           // the inner script. Same rule as the nested-script walk.
-          const expFile = _expRefusal(cContent);
+          const expFile = _expRefusalForBody(sp, cContent);
           if (expFile) return expFile;
           sets.push({ discs: extractWorkingTreeDiscards(cContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
         }
@@ -3491,7 +3535,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           // carry an expanded script shape (`bash -c "$(cat /tmp/x.sh)"` where
           // x.sh pipes `./undo*.sh` into bash) — the static-discard probe below
           // cannot read it, so the nested-script rule applies here too.
-          const expCat = _expRefusal(catContent);
+          const expCat = _expRefusalForBody(real, catContent);
           if (expCat) return expCat;
           sets.push({ discs: extractWorkingTreeDiscards(catContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: catPath });
           continue;
@@ -3544,7 +3588,7 @@ function _worktreeDiscardBlock(command: string): string | null {
               const st = statSync(real);
               if (st.isFile() && (st.mode & 0o111) !== 0 && st.size <= 64 * 1024) {
                 const pContent = readFileSync(real, "utf8");
-                const expP = _expRefusal(pContent);
+                const expP = _expRefusalForBody(first, pContent);
                 if (expP) return expP;
                 sets.push({ discs: extractWorkingTreeDiscards(pContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: first });
               }
@@ -3572,7 +3616,7 @@ function _worktreeDiscardBlock(command: string): string | null {
           const sp = extractScriptPath(sub);
           if (sp && !/[$`]/.test(sp)) {
             const scContent = readFileSync(resolve(execCwd, sp), "utf8");
-            const expSc = _expRefusal(scContent);
+            const expSc = _expRefusalForBody(sp, scContent);
             if (expSc) return expSc;
             sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
           }
@@ -3997,6 +4041,32 @@ const _frameworkRoot: string | null = (() => {
  *  is intentional: once the closure is pinned, WHERE the audited program runs
  *  from does not change what it does, and pretending the anchor is narrower than
  *  it is would be the more dangerous error. */
+/** #2332 / #1485 — TRUE only when `resolved` is a sanctioned script whose bytes ARE the
+ *  pinned, audited ones: arm 1 or arm 2 of `_sanctionedScriptExemption`, PLUS the digest.
+ *
+ *  ⛔ The digest is not belt-and-braces. `_sanctionedScriptExemption`'s arm 1 is PATH ONLY,
+ *  deliberately (it is the pre-existing `~/.pi/agent` anchor, kept unchanged by #2332), so
+ *  "the exemption applied" is ALSO true for arbitrary bytes written to a sanctioned relpath
+ *  under the module's own root — which on a copy-deployed box (a real `scripts/` copy inside
+ *  `~/.pi/agent`, which is not a git checkout and so is outside the write gate) an agent can
+ *  mint. A caller that stands down a CONTENT-derived refusal is making a claim about the
+ *  BYTES, so it must ask THIS question and never `_sanctionedScriptExemption(...) !== null`.
+ *  The difference is measurable: at review, an unaudited `#!/bin/bash` + `bash ./undo*.sh`
+ *  minted at a farm relpath was BLOCKED before such a stand-down and ALLOWED after it — the
+ *  #1228 fail-open (silent destruction of other sessions' uncommitted work) that this
+ *  helper's digest check keeps shut.
+ *
+ *  Both arms are considered, because both anchors were already trusted to skip the whole
+ *  content walk for a sanctioned leaf; the digest then narrows BOTH to the shipped bytes. */
+function _isAuditedSanctionedScript(resolved: string): boolean {
+  let real: string;
+  try { real = realpathSync(resolved); } catch { return false; }
+  const sa = _sanctionedScriptExemption(real);
+  if (sa === null) return false;
+  const want = _sanctionedScriptPin().sha256[sa.rel];
+  return typeof want === "string" && want.length === 64 && _sha256Of(real) === want;
+}
+
 function _sanctionedScriptExemption(resolvedScript: string): { rel: string; via: "module-root" | "identity" } | null {
   let real: string;
   try {

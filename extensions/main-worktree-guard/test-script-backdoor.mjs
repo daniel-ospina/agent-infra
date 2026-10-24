@@ -352,19 +352,46 @@ async function partB() {
     expectTrue("B5b (b): the SAME content at another path → BLOCKED (the exemption is path-keyed, never content-keyed)",
       blocked(await bash("bash scripts/rail.sh", hub)), "was allowed");
     // The gh shim is a listed entry, so the check is the SAME one as the rail's:
-    // the checkout's own copy runs. The copy PATH resolves to belongs to the HUB,
-    // which in a worktree-rooted test says nothing about the list — and a hub copy
-    // that is out of sync with this checkout must stay refused (fail closed), so
-    // it is only asserted when the two are byte-identical.
+    // the CHECKOUT's own copy runs, addressed by its own absolute path.
+    //
+    // ⛔ `command -v gh` IS NOT PART OF THIS ASSERTION (2026-10-24). It used to be: the
+    // arm ran only when the `gh` on PATH was BYTE-IDENTICAL to this checkout's shim, and
+    // silently SKIPPED otherwise. That made the verdict a property of the BOX rather than
+    // of the code — green wherever `gh` resolves elsewhere (a deployment shim, a real
+    // `gh` binary), red on CI where it resolves to this file — which is how a REAL false
+    // block (the shim's own `head -c 8192 … < "$1"` line read as a runtime-expanded
+    // script path, so every path-spelled invocation was refused) survived on main: the
+    // arm that pins it was skipped on most boxes and red only on the runner. The command
+    // below spells `${shim}` explicitly, so what PATH holds cannot change what is
+    // asserted, and a hub-side copy that is out of sync is the NEXT arm's job (B5c2).
     const shim = join(REPO, "scripts", "gh-shim", "gh");
-    if (ghOnPath && readFileSync(ghOnPath, "utf-8") === readFileSync(shim, "utf-8")) {
-      expectTrue("B5c (b): the gh shim (named entry `scripts/gh-shim/gh`) is runnable",
-        allowed(await bash(`${shim} issue list --repo o/r --limit 1`, hub)), "was blocked");
-    } else {
-      skipped("B5c (b): the gh shim", ghOnPath
-        ? "the shim on PATH is a different (out-of-sync) copy from this checkout"
-        : "no gh on PATH");
-    }
+    expectTrue("B5c (b): the gh shim (named entry `scripts/gh-shim/gh`) is runnable",
+      allowed(await bash(`${shim} issue list --repo o/r --limit 1`, hub)), "was blocked");
+    // …and the SAME BYTES at a non-sanctioned path stay refused, so the fix above cannot
+    // be a content relaxation: the exemption is the PINNED IDENTITY, never the bytes.
+    // ⛔ This arm pins "the same program elsewhere is not exempt". It does NOT pin the
+    // #1228 arm the fix relaxed — measured at review: this copy is refused by the #1484
+    // content walk (it runs `git`-bearing code), so it would block with or without the
+    // stand-down. The fail-closed control for the CHANGED arm is B5c3 below, which a
+    // reason assertion makes checkable (#709 + the expansion wording), the same way B3b
+    // and B5e identify their refuser.
+    const copiedShim = join(hub, "scripts", "shim-copy");
+    mkdirSync(join(hub, "scripts"), { recursive: true });
+    writeFileSync(copiedShim, readFileSync(shim));
+    expectTrue("B5c2 (b): the SAME shim bytes at a non-sanctioned path → BLOCKED (identity-keyed, not content-keyed)",
+      blocked(await bash(`bash scripts/shim-copy issue list --repo o/r --limit 1`, hub)), "was allowed");
+    // ⛔ B5c3 — the CONTROL for the one arm the sanctioned stand-down relaxes. This body
+    // is the shape the stand-down exists for (a readable script whose content carries a
+    // runtime-expanded operand, one level in) at a NON-sanctioned path, so it must still be
+    // refused BY THAT ARM: if the stand-down were keyed on anything an agent controls (the
+    // path, the relpath, the filename), this script would run and the discard it names would
+    // be unread, which is the #1228 fail-open. Measured reason: #709 script-indirection.
+    const shapeCopy = join(hub, "scripts", "shim-shape");
+    writeFileSync(shapeCopy, '#!/bin/bash\ngrep -qa m <(head -c 10 "$HOME/x")\n');
+    const shapeRes = await bash("bash scripts/shim-shape", hub);
+    expectTrue("B5c3 (b): a NON-sanctioned body with the same expanded-operand shape → BLOCKED (#709), so the stand-down is not content-keyed",
+      blocked(shapeRes) && /#709/.test(shapeRes.reason) && /shell-expansion form/.test(shapeRes.reason),
+      `reason=${String(shapeRes && shapeRes.reason).split("\n")[0]}`);
     // The #1129 adversarial-review P0 boundary: a committed git-DESTRUCTIVE
     // framework helper is NOT on the list and must stay refused.
     expectTrue("B5d (b): `scripts/cleanup-worktree.sh` (committed, destructive) is still refused",

@@ -102,6 +102,15 @@ SHELL expands at runtime — `$`/backtick, glob (`*`, `?`, `[...]`), brace
 command word (`~/undo.sh`, `sub/undo.sh` is READ instead), inside an
 interpreter `-c` payload / `eval` payload / a nested script, or as a piped
 producer (`cat ./undo*.sh | bash`, `F=./undo.sh; cat $F | bash`; #1228),
+**except in a SANCTIONED script's own body** — the entries in
+`SANCTIONED_SCRIPT_RELPATHS` are exempted from the whole content walk when their
+bytes ARE the pinned audited ones (`sanctioned-scripts.pin.json`), and that now
+includes this arm: `scripts/gh-shim/gh` carries
+`grep -qa '<marker>' <(head -c 8192 2>/dev/null < "$1")`, whose process substitution
+matches the expansion predicate, so path-spelled invocations of the shim were
+refused as an unreadable script (measured 2026-10-24). The exemption is
+DIGEST-KEYED, so arbitrary bytes at a sanctioned relpath are not exempt — the
+`#1228` arm still fires for every unaudited script,
 a command-position `$NAME` whose assignment in effect at that point is
 path-shaped but not statically readable (`S=$(pwd)/undo.sh; $S`, `+=` onto a base
 it cannot read), or whose parameter expansion uses a SUBSTRING operator
