@@ -43,7 +43,43 @@ trap cleanup EXIT
 [ -f "$DOCTOR" ] && ok "shipped doctor present: $(basename "$DOCTOR")" || { bad "missing $DOCTOR"; exit 1; }
 [ -f "$SUP" ]    && ok "shipped supervisor present" || { bad "missing $SUP"; exit 1; }
 
-mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clients" "$T/ps"
+mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clients" "$T/ps" "$T/tmp"
+# ⛔ $T/repo MUST BE A REAL CHECKOUT (agent-infra#2573). The cache sweep enumerates worktree roots with
+# `git worktree list`, and an EMPTY-enumeration read is cannot-verify (rc=3) by design — so on a plain
+# directory every hygiene arm here would assert against a pass that abstained instead of deciding.
+git init -q "$T/repo" 2>/dev/null || true
+
+# ⛔ THE HYGIENE ROLE'S NEW SINKS ARE STUBBED IN THIS FIXTURE (agent-infra#2573). The doctor now reaps
+# stale `cloud-cell-*` dirs under $TMPDIR and prunes IDLE docker images/volumes, and a suite that left
+# those seams pointed at the HOST would delete a fixture of the operator's and run a real
+# `docker image prune -af` on every green run. Both decisions are driven, on real fixtures, by
+# `cloud-cell-doctor.hygiene.test.sh`; here they point at throwaway paths so no arm can reach the box.
+export HYGIENE_TMP_DIR="$T/tmp"
+# ⛔ …AND THE CWD CENSUS IS A SINK TOO (review round 7, P2). `live-ownership.sh` reads the RUNNER's real
+# process table, so a fixture that left `LO_CWD_PROBE` pointing at the host would make the hygiene pass
+# cannot-verify (rc=3) on any runner whose process table it cannot read — a false red about the platform
+# that says nothing about the code. The sibling hardening fixture pins it for the same reason; this one
+# previously pinned only the temp root and docker, so it was the one seam left on the host.
+cat > "$T/bin/cwdprobe" <<'SH'
+#!/bin/bash
+emit() { [ -n "$1" ] || return 0; printf '/proc/4242/cwd -> %s\n' "$1"; printf 'p4242\nn%s\n' "$1"; }
+emit "$FAKE_CWD"
+exit 0
+SH
+chmod +x "$T/bin/cwdprobe"
+export LO_CWD_PROBE="$T/bin/cwdprobe" FAKE_CWD="$T/nowhere-unheld"
+cat > "$T/bin/docker-stub" <<'SH'
+#!/bin/bash
+# `info` MUST succeed, or the sweep correctly reports "no daemon" and the arms around it stop being
+# about what they claim. The two prunes are no-ops: nothing here may touch a real daemon.
+case "${1:-}" in
+  info)    printf 'Server Version: stub\n'; exit 0 ;;
+  version) printf '29.1.3\n'; exit 0 ;;   # the volume verb is version-gated; a stub must answer it
+esac
+exit 0
+SH
+chmod +x "$T/bin/docker-stub"
+export DOCTOR_DOCKER_BIN="$T/bin/docker-stub"
 
 # ── stubs ────────────────────────────────────────────────────────────────────────────────────────
 # tmux: sessions list, pane pid per session, attached clients per session, and a kill LOG so the
@@ -115,10 +151,16 @@ if [ "${1:-}" = "-p" ]; then
     if [ -f "$S/lstart.$pid" ]; then cat "$S/lstart.$pid"; else printf 'Mon Jan  1 00:00:00 2020'; fi
     exit 0
   fi
+  # `etime=` — the lock-owner AGE read `service_controller_present` now performs (review P2, #2402).
+  # Default is 100 days, i.e. "this process began long before any lock" — the pre-fix reading, so an
+  # arm that wants a RECYCLED pid must say so explicitly with `$S/etime.<pid>`.
+  if [ "$fmt" = "etime=" ]; then
+    if [ -f "$S/etime.$pid" ]; then cat "$S/etime.$pid"; else printf '100-00:00:00\n'; fi
+    exit 0
+  fi
   if [ -f "$S/args.$pid" ]; then cat "$S/args.$pid"; else printf '1 (init)\n'; fi
   exit 0
 fi
-exit 0
 SH
 
 # sleep: appends to the lane log between the two observations when the suite asks for "still
@@ -200,8 +242,8 @@ doc() { # <role> [extra env assignments via env]
   OUT="$(bash "$DOCTOR" "$@" 2>&1)"; RC=$?
 }
 reset_tmux() { rm -f "$T/tmux/sessions" "$T/tmux/killed" "$T/tmux/new-session"; touch "$T/tmux/sessions"; }
-reset_ps()   { rm -f "$T/ps/calls" "$T/ps/mode" "$T/ps/args."* "$T/ps/lstart."*; }
-reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; }
+reset_state() { rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; }
+reset_ps()   { rm -f "$T/ps/calls" "$T/ps/mode" "$T/ps/args."* "$T/ps/lstart."* "$T/ps/etime."*; }
 mk_lane() { # <name> <pid> [<log mtime, `touch -t` form; default ancient>]
   printf '%s\n' "$1" >> "$T/tmux/sessions"
   printf '%s\n' "$2" > "$T/tmux/panes/$1"
@@ -404,6 +446,108 @@ mkdir -p "$T/o/state/roles"; : > "$T/o/state/roles/.desired"
 doc doctor
 grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: a started cell with no controller session restarts it" \
   || bad "doctor: did NOT restart the missing controller — $OUT"
+
+# ⛔ THE SERVICE MANAGER OWNS A CONTROLLER IT HAS STOPPED (review P1, #2402). A deliberate
+# `systemctl stop` leaves `.desired` in place, so this pass still reaches the ABSENT→restart arm; the
+# supervisor answers rc 4 instead of re-arming the unit. Folding that into the FAILED arm would redden the
+# pass over the operator's own decision (and log "restart FAILED" every 120 s on a cell that is correctly
+# stopped), while folding it into the success arm would claim a restart that never happened.
+reset_tmux; reset_ps; reset_state; rm -f "$T/sup/calls"
+: > "$T/o/state/roles/.desired"; rm -f "$T/o/.orch.lock" "$T/o/heartbeat"
+printf '4\n' > "$T/sup/rc"
+doc doctor; RC4="$RC"
+rm -f "$T/sup/rc"
+grep -q 'start' "$T/sup/calls" 2>/dev/null && ok 'doctor: the restart was attempted through the supervisor' \
+  || bad "doctor: never called the supervisor — the rc=4 arm cannot be reached: $OUT"
+case "$OUT" in
+  *'controller restart not launched'*) ok 'doctor: rc=4 is recorded as NOT LAUNCHED (service-managed), not as a failure' ;;
+  *) bad "doctor: rc=4 was not reported as a service-managed non-restart: $OUT" ;;
+esac
+case "$OUT" in
+  *'restart FAILED'*) bad 'doctor: reported a FAILED restart for a unit the manager deliberately stopped' ;;
+  *) ok 'doctor: a deliberate unit stop is not counted against the pass' ;;
+esac
+[ "$RC4" -eq 0 ] \
+  && ok 'doctor: the pass stays clean when the manager owns a stopped controller (rrc unchanged)' \
+  || bad "doctor: a service-managed non-restart reddened the pass (rc=$RC4) — the operator's stop would read as a doctor failure"
+
+# ⛔ A UNIT THAT CONVERGED TO `failed` IS NOT A CLEAN PASS (review P1 round 11, #2402). The supervisor used to
+# answer the SAME rc 4 for a deliberate `systemctl stop` and for a start limit that converged to `failed`, and
+# this pass recorded both as clean — so a STARTED cell whose unit had given up (no dispatcher, `.desired`
+# present) exited 0 and read healthy, which is the false green #2402 removes, one layer in. rc 5 now carries
+# that state and must redden the pass. RED on revert: fold rc 5 into the rc-4 arm and RC5 drops back to 0.
+reset_tmux; reset_ps; reset_state; rm -f "$T/sup/calls"
+: > "$T/o/state/roles/.desired"; rm -f "$T/o/.orch.lock" "$T/o/heartbeat"
+printf '5\n' > "$T/sup/rc"
+doc doctor; RC5="$RC"
+rm -f "$T/sup/rc"
+case "$OUT" in
+  *'CONVERGED TO FAILED'*) ok 'doctor: rc=5 is reported as a unit that converged to FAILED (no dispatcher), not as a clean non-restart' ;;
+  *) bad "doctor: rc=5 was not reported as the failed-unit state: $OUT" ;;
+esac
+[ "$RC5" -ne 0 ] \
+  && ok 'doctor: a started cell whose dispatcher is gone because the unit FAILED is NOT a clean pass (rc is non-zero)' \
+  || bad 'doctor: recorded a CLEAN pass over a started cell with NO dispatcher (the unit FAILED) — exactly the false green this change removes'
+case "$OUT" in
+  *'restart FAILED'*) bad 'doctor: borrowed the generic restart-FAILED wording for a unit that never accepted a start' ;;
+  *) ok 'doctor: the failed-unit outcome has its own wording (an operator can tell it from a transient)' ;;
+esac
+
+# ⛔ A LIVE LOOP RECORD IS NOT A LIVE CONTROLLER (review P0, #2402). The pre-fix
+# `service_controller_present` fell back to `loop_alive`, which reads the DOCTOR's own loop.pid — a
+# tautology in `loop` mode (the only mode a cell runs), so a cell whose controller had DIED read
+# `controller RUNNING (no heartbeat recorded yet)`, the ABSENT→restart arm below was unreachable, and the
+# doctor never restarted it. This arm fakes exactly that state: a live, identity-matched loop record and
+# NO controller (no session, no lock owner, no heartbeat). The restart MUST still be launched.
+reset_tmux; reset_ps; reset_state
+rm -f "$T/sup/calls"; : > "$T/o/state/roles/.desired"; rm -f "$T/o/.orch.lock" "$T/o/heartbeat"
+loop_up "$$"
+doc doctor
+grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: the doctor's own loop record does not witness a controller — a missing one is still restarted" \
+  || bad "doctor: reported a controller RUNNING from its OWN loop pid and did NOT restart it — $OUT"
+rm -f "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"
+
+# ⛔ THE LOCK OWNER IS THE AUTHORITY, AND ITS **AGE** IS PART OF THE CLAIM (review P2, #2402).
+# `lock_controller_pid` carries the shape AND the age for a written reason: `$O/.orch.lock` is data on
+# disk that outlives a `kill -9`, so the OS can RECYCLE that pid onto a peer repo's controller — and on
+# this box a peer repo's controller has the SAME basename from the SAME shared harness path, so the
+# shape alone matches. These two arms drive the age half through the ps stub: the pid here is the
+# test shell's own (so `kill -0` succeeds and the shape matches), and only `etime` differs.
+say_case "doctor: the lock owner's AGE decides — a recycled pid is not this cell's controller"
+reset_tmux; reset_ps; reset_state
+rm -f "$T/sup/calls" "$T/o/heartbeat"; : > "$T/o/state/roles/.desired"
+printf '%s\n' "$$" > "$T/o/.orch.lock"
+printf 'bash /x/harness/orch-loop.sh\n' > "$T/ps/args.$$"
+# (a) it began 30s ago and the lock was written just now → it IS the lock's owner → no restart.
+printf '00:00:30\n' > "$T/ps/etime.$$"
+doc doctor
+[ -s "$T/sup/calls" ] && bad "doctor: restarted over a lock owner that provably began BEFORE the lock — $OUT" \
+  || ok "doctor: a live lock owner that began before the lock is the controller (no restart)"
+result_has "RUNNING" && ok "doctor: reports the service-managed controller as RUNNING" \
+  || bad "doctor: did not report the service-managed controller — $OUT"
+# (b) SAME pid, SAME argv, a lock written in 2020 and a process that began 10s ago → the pid was
+#     RECYCLED onto a peer repo's controller. Reporting RUNNING here is the "witness that cannot say no"
+#     (the arm above this one), and it makes the ABSENT→restart arm unreachable on a dead controller.
+#     Without the age rule this arm FAILS: the shape matches, so the pre-fix read returned 0.
+touch -t 202001010000 "$T/o/.orch.lock"
+printf '00:00:10\n' > "$T/ps/etime.$$"
+rm -f "$T/sup/calls"
+doc doctor
+grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: a RECYCLED pid (began after the lock was written) does not witness a controller — it is restarted" \
+  || bad "doctor: a recycled pid that began AFTER the lock was written was accepted as this cell's controller and the dead one was NOT restarted — $OUT"
+# (c) an UNREADABLE age (the ps seam cannot answer) is not ownership either: same safe direction. The
+#     stub answers `etime=` with an EMPTY body, which is what a ps that cannot compute the age returns.
+#     The argv stub is re-created FIRST: `reset_ps` clears it too, and without it this arm passes on the
+#     shape mismatch instead — which is already covered, so it would prove nothing about the age.
+reset_ps
+printf 'bash /x/harness/orch-loop.sh\n' > "$T/ps/args.$$"
+: > "$T/ps/etime.$$"
+rm -f "$T/sup/calls"
+touch "$T/o/.orch.lock"
+doc doctor
+grep -q 'start' "$T/sup/calls" 2>/dev/null && ok "doctor: an UNREADABLE lock-owner age is NOT treated as ownership — it is restarted, not reported RUNNING" \
+  || bad "doctor: an unreadable age was read as ownership and a dead controller was left alone — $OUT"
+rm -f "$T/o/.orch.lock" "$T/ps/args.$$" "$T/ps/etime.$$"
 
 # Present but stale: report, do not start (a live-but-slow controller is a P0 kill decision).
 printf 'orch\n' >> "$T/tmux/sessions"
@@ -1084,6 +1228,113 @@ rm -f "$T/tmux/ls_rc" "$T/tmux/ls_msg"
 [ "$RC" -eq 3 ] && [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = "3" ] \
   && ok "hygiene: an unreadable session list is rc=3 (the sweep was never evaluated)" \
   || bad "hygiene: an unreadable session list produced rc=$RC (a clean pass over an unrun sweep)"
+
+# ── 18) A DEAD LOOP IS NEVER 'WAITING' (agent-infra#2306) ────────────────────────────────────────
+# The measured pi-cell-4 output, in full: `loop: NOT RUNNING` printed BESIDE four `WAITING … 274s
+# ago` rows that quoted the dead loop's start time as if it were progressing. The only row that knew
+# the truth did not suppress or downgrade the others, so a reader concluded "the first pass is slow"
+# while nothing would ever complete — and reap/merge/hygiene never ran at all (a cell that produces
+# PRs and can never land them).
+say_case "status: a DEAD loop reports DEAD in every row, never WAITING (#2306)"
+reset_state; reset_tmux; reset_ps; : > "$T/o/state/roles/.desired"
+: > "$T/o/logs/doctor.log"
+# A pid that is provably gone: start one and reap it, so `kill -0` fails for the right reason.
+"$REAL_SLEEP" 0.05 & GONE_PID=$!; wait "$GONE_PID" 2>/dev/null || true
+printf '%s\n' "$GONE_PID" > "$T/o/state/roles/loop.pid"
+printf '%s|proc:12345\n' "$GONE_PID" > "$T/o/state/roles/loop.ident"
+printf '%s\n' "$(( $(date +%s) - 274 ))" > "$T/o/state/roles/loop.started"
+# …and the SIGKILL's leftovers: the in-progress marker a killed loop cannot remove.
+: > "$T/o/state/roles/.doctor.running"
+# ⛔ THE EXACT MEASURED SHAPE FIRST: no role record yet (so the old code took the grace branch) plus
+# the marker a SIGKILL left behind. That is the combination that printed `WAITING … 274s ago` beside
+# `loop: NOT RUNNING`, and it is the one a role-record-only fixture cannot reach.
+doc status
+case "$OUT" in *WAITING*) bad "status: printed WAITING for a role with no pass under a DEAD loop — $OUT" ;;
+              *) ok "status: the measured shape (no pass + stale .running marker) is not WAITING" ;; esac
+case "$OUT" in *"still running"*) bad "status: read the killed loop's .running marker as a live pass — $OUT" ;;
+              *) ok "status: a killed loop's in-progress marker is not read as a live pass" ;; esac
+NOW="$(date +%s)"
+for r in reap doctor merge hygiene; do
+  printf 'role=%s\nlast_pass_at=x\nlast_pass_epoch=%s\npasses=1\nlast_rc=0\nlast_result=ok\n' "$r" "$NOW" \
+    > "$T/o/state/roles/$r.state"
+done
+doc status
+case "$OUT" in *WAITING*) bad "status: printed WAITING under a DEAD loop (the #2306 lie) — $OUT" ;;
+              *) ok "status: no row promises WAITING when the loop is gone" ;; esac
+case "$OUT" in *"DEAD"*) ok "status: names the rows DEAD" ;; *) bad "status: no DEAD row — $OUT" ;; esac
+result_has "pid-gone" && ok "status: names the evidence (pid-gone), not just the verdict" || bad "status: the reason is not named — $OUT"
+result_has "last pass" && ok "status: still reports the last pass each role recorded" || bad "status: the last-pass record was lost — $OUT"
+[ "$RC" -ne 0 ] && ok "status: a dead loop under a started cell fails the verb (rc=$RC)" || bad "status: rc=0 beside a dead loop"
+# ⛔ THE SAME FIXTURE WITH A LIVE LOOP MUST NOT READ DEAD — otherwise the arm above is satisfied by
+# "rows are always red" rather than by the liveness check it claims to test.
+"$REAL_SLEEP" 30 & LIVE_PID=$!
+loop_up "$LIVE_PID"
+printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+doc status
+kill "$LIVE_PID" 2>/dev/null || true
+case "$OUT" in *"DEAD"*) bad "status: called a LIVE loop's roles DEAD (the control arm) — $OUT" ;;
+              *) ok "status: a live loop's rows are not DEAD (non-vacuity of the arm above)" ;; esac
+[ "$RC" -eq 0 ] && ok "status: the live-loop control is clean, so the dead arm is decided by liveness" \
+                 || bad "status: the live-loop control failed (rc=$RC) — $OUT"
+
+# ⛔ AN UNREADABLE READ IS NOT A DEATH WITNESS. Each shape below cannot distinguish "gone" from "could
+# not tell", so it must abstain: UNKNOWN + rc 3, never WAITING (a promise) and never DEAD (a claim).
+say_case "status: unverifiable loop records abstain with a named reason (#2306)"
+for shape in unparseable-pid no-identity-record; do
+  reset_state; : > "$T/o/state/roles/.desired"; : > "$T/o/logs/doctor.log"
+  "$REAL_SLEEP" 30 & LIVE_PID=$!
+  case "$shape" in
+    unparseable-pid)      printf 'not-a-pid\n' > "$T/o/state/roles/loop.pid" ;;
+    no-identity-record)   printf '%s\n' "$LIVE_PID" > "$T/o/state/roles/loop.pid"
+                          rm -f "$T/o/state/roles/loop.ident" ;;
+  esac
+  printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+  doc status
+  kill "$LIVE_PID" 2>/dev/null || true
+  case "$OUT" in *WAITING*) bad "status[$shape]: abstained as WAITING (a promise it cannot make) — $OUT" ;;
+                *) ok "status[$shape]: no WAITING row" ;; esac
+  case "$OUT" in *DEAD*) bad "status[$shape]: manufactured a death witness from an unreadable read — $OUT" ;;
+                *) ok "status[$shape]: does not claim DEAD from an unreadable read" ;; esac
+  [ "$RC" -eq 3 ] && ok "status[$shape]: rc=3 (the abstention code, not a pass)" \
+                  || bad "status[$shape]: rc=$RC (want 3) — $OUT"
+  result_has "UNKNOWN" && ok "status[$shape]: named UNKNOWN" || bad "status[$shape]: no UNKNOWN row — $OUT"
+done
+reset_state; rm -f "$T/o/state/roles/"*; : > "$T/o/state/roles/.desired"
+
+# ── 19) THE LOOP SURVIVES ITS FIRST TICK, AND AN ABSENT MODE IS A LIVE PASS (agent-infra#2424) ────
+# ⛔ THE BUG THIS CASE EXISTS FOR: `run_loop` dispatches `run_role_pass doctor` with NO mode
+# argument, so `"$@"` expanded to nothing and every role's `local dry="$1"` read an UNBOUND `$1`
+# under `set -u` — the loop DIED on its first tick, every tick, on every cell, and nothing recorded
+# it (`doctor` is first in the tick, so it crashed; `reap`/`merge`/`hygiene` carried the same latent
+# bug). The `.desired`-absent fixture above could NOT see it: that loop exits BEFORE its first
+# dispatch, which is exactly why the crash survived three recorded instances on cell-4.
+# ⛔ A SUBCOMMAND-DRIVING test is VACUOUS here: the CLI always binds `$1` (to ""), so only driving
+# `loop` exercises the ABSENT-argument shape. And "it did not crash" is not the criterion either —
+# a loop that runs and schedules nothing has fixed nothing, so each role must record a LIVE pass.
+say_case "loop: the first tick dispatches, and an absent mode is a LIVE pass (#2424)"
+reset_state; reset_tmux; reset_ps; rm -f "$T/writing"
+: > "$T/o/state/roles/.desired"          # a STARTED cell: this loop must DISPATCH, not exit
+: > "$T/tmux/sessions"
+OUT="$(LOOP_TICK=10 DOCTOR_INTERVAL=0 MERGE_INTERVAL=0 HYGIENE_INTERVAL=0 \
+       timeout 6 bash "$DOCTOR" loop 2>&1)"; RC=$?
+case "$OUT" in
+  *"unbound variable"*) bad "loop: DIED on its first tick (the #2424 abort) — $OUT" ;;
+  *)                    ok "loop: the first tick dispatches with no unbound-variable abort" ;;
+esac
+for r in reap doctor merge hygiene; do
+  st="$T/o/state/roles/$r.state"
+  if [ ! -f "$st" ]; then bad "loop: role '$r' recorded NO pass (its state file is missing)"; continue; fi
+  p="$(sed -n 's/^passes=//p' "$st")"
+  res="$(sed -n 's/^last_result=//p' "$st")"
+  { [ -n "$p" ] && [ "$p" -ge 1 ]; } \
+    && ok "loop: role '$r' recorded a pass (passes=$p)" \
+    || bad "loop: role '$r' recorded passes='${p}' — it never completed a pass"
+  case "$res" in
+    *"a rehearsal"*) bad "loop: role '$r' ran as a REHEARSAL (dry-run branch) with no flag — $res" ;;
+    *)               ok "loop: role '$r' ran LIVE (absent mode ≠ --dry-run)" ;;
+  esac
+done
+reset_state; rm -f "$T/o/state/roles/.desired"
 
 # ── summary ─────────────────────────────────────────────────────────────────────────────────────
 echo

@@ -76,6 +76,14 @@
 #
 # Env seams:
 #   DISK_REAPER_STATE_DIR      status/log dir            (default $HOME/.pi/agent/state)
+#   DISK_REAPER_STATE_DIR_FALLBACKS  colon-separated dirs used IN ORDER when the state dir above
+#                              cannot be written (a full disk). Default: $XDG_RUNTIME_DIR/pi-disk-reaper
+#                              (when set) then <DISK_REAPER_TMPFS_ROOT>/pi-disk-reaper-<uid>. An EMPTY
+#                              value disables the fallback and restores the hard refusal (#2443)
+#   DISK_REAPER_TMPFS_ROOT     where the default fallback lives, AND the root of the ONE canonical
+#                              pass lock (<root>/pi-disk-reaper/disk-reaper.lock) every pass derives
+#                              (default /dev/shm). Pin it identically on every pass on a box — a pass
+#                              with a different value cannot see the others' canonical lock (#2443)
 #   DISK_REAPER_LOG            pass log                  (default $STATE_DIR/disk-reaper.log)
 #   DISK_REAPER_REPOS          colon-separated repos when no --repo is given
 #   DISK_REAPER_ONLY           classes (same as --only)
@@ -186,6 +194,11 @@ WT_TALLY_COVER=0/0
 RC_UV=0; RC_VENV=0; RC_WT=0
 VERDICT_UV="not-run"; VERDICT_VENV="not-run"; VERDICT_WT="not-run"
 NOTE_UV=""; NOTE_VENV=""; NOTE_WT=""
+# Repos whose open-PR gate could not be verified, and the reason, as `<repo>[<reason>]` — one entry
+# each. A SKIPPED repo is not a failed CLASS: its own checkouts are untouched (fail closed) while the
+# other repos in the same class are still reclaimed. Reported per repo so a single unverifiable repo
+# cannot hide what the pass did do, and cannot disable the repos it could not reach (#2443).
+SKIPPED_WT=""; SKIPPED_WT_N=0
 # Set when a class could not be set up AT ALL (delegate absent, no repo to scan). That is one of the
 # things exit 3 means; a delegate that RAN and DEFERRED is 6, and one that ran and failed closed is
 # also 3 but with a per-class verdict, not `misconfigured`. Keeping the two apart is the whole point
@@ -355,6 +368,10 @@ print_status() {
     say "verdict_uv=$(status_field verdict_uv)"
     say "verdict_venv=$(status_field verdict_venv)"
     say "verdict_worktree=$(status_field verdict_worktree)"
+    # ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST. `skipped_worktree=` is the whole point of
+    # #2443 (WHICH repo was skipped and WHY); leaving it out of `--print-status` would repeat the
+    # `classes=`/`repos=` defect this block already documents — written every pass, read by nobody.
+    say "skipped_worktree=$(status_field skipped_worktree)"
     # `classes=` and `repos=` were WRITTEN every pass and read by nobody, so "which sinks and which
     # checkouts did the last pass actually cover" — the first question after a bring-up changes
     # DISK_REAPER_REPOS — had no answer on any surface. The record is this feature's verdict channel,
@@ -597,7 +614,165 @@ run_class() {
 }
 
 # ── one pass ────────────────────────────────────────────────────────────────────────────────────
-mkdir -p "$STATE_DIR" 2>/dev/null || { printf '%s: cannot create state dir %s\n' "$SCRIPT_NAME" "$STATE_DIR" >&2; exit 3; }
+# ── the state dir: a FULL DISK MUST NOT STOP THE PASS (#2443) ───────────────────────────────────
+# MEASURED (2026-10-23 06:53Z, cell-1): `df /` = 100%, 0 bytes available, and the hourly pass printed
+#   disk-reaper.sh: cannot create state dir /home/cmux/.pi/agent/state
+# having run NO class — on the box, at the moment, whose disk it exists to free. The state dir is not
+# "just a log location": the lock and the pass record live there, so without a writable one the reaper
+# cannot run at all, which is the exact inert-enforcer shape this feature exists to remove. Its state
+# therefore has to live somewhere the exhausted filesystem cannot reach.
+#
+# ⛔ THE CONFIGURED DIR IS STILL THE PRIMARY. It is used whenever it can be written; the fallback
+# exists ONLY for the case where it cannot, and it is tmpfs — a DIFFERENT filesystem, so "full" is a
+# property of the primary and never of the fallback. Every fallback is DISCLOSED: loudly on the pass's
+# stdout (journald keeps it) and in the record (`state_dir_primary=`), never silently.
+# ⛔ MUTUAL EXCLUSION IS NOT WEAKENED. A fallback pass takes a lock — that is why a pass with no
+# writable candidate REFUSES below rather than running unlocked — and it is the CANONICAL lock, the one
+# path every pass on the box derives from the tmpfs root alone (see CANONICAL_LOCK_DIR). So a pass that
+# took the configured dir's lock before the disk filled is still excluded, in both orderings, and the
+# concurrent-deletion hazard those two locks used to create is closed by construction rather than by
+# enumerating environments the checker does not control.
+state_dir_writable() { # <dir> — create it and PROVE a byte can be written
+    local d="$1" p
+    [ -n "$d" ] || return 1
+    mkdir -p "$d" 2>/dev/null || return 1
+    p="$d/.disk-reaper-probe.$$"
+    # ⛔ NEVER WRITE THROUGH A PRE-PLANTED NAME. `-e` follows a symlink, so a DANGLING one would create
+    # its target; `-L` catches that, and it is what makes a planted FIFO a refusal rather than a hang
+    # (opening a FIFO for write blocks until a reader appears — measured: the pass sat in
+    # wait_for_partner with no output, and the oneshot unit has no timeout).
+    [ -e "$p" ] || [ -L "$p" ] && return 1
+    # ⛔ A ZERO-BYTE CREATE IS NOT A FREE-SPACE PROBE. On a full filesystem an entry can be creatable
+    # while a data block is not, so "the pass can write its record here" is measured with a real byte.
+    # `set -C` (noclobber) makes the write itself refuse to follow an existing name, belt to the braces.
+    # ⛔ THE `set -C` MUST LIVE IN A SUBSHELL. A brace group is not a subshell, so `set -C` there leaked
+    # noclobber into the whole pass and every later `>` write — including the per-pass `: >"$LOG"`
+    # truncation — started failing (measured: the log grew 5 -> 10 -> 15 lines across passes with one
+    # error per pass). Parentheses scope it to the probe.
+    ( set -C; printf 'x' >"$p" ) 2>/dev/null || { rm -f "$p" 2>/dev/null; return 1; }
+    rm -f "$p" 2>/dev/null
+    return 0
+}
+# tmpfs candidates: XDG_RUNTIME_DIR when the box has one, then /dev/shm. macOS has neither (its temp
+# roots are on the data volume), so there the refusal below is the honest answer — unchanged behaviour.
+# `-` (not `:-`): an EMPTY value disables the fallback, which is both a test seam and the operator's
+# way to restore the old hard refusal on a box where a record off the primary path would be worse.
+STATE_DIR_PRIMARY="$STATE_DIR"
+STATE_DIR_PRIMARY_NOTE=""
+# ⛔ ONE CANONICAL LOCK PATH, DERIVED FROM THE TMPFS ROOT ALONE (#2443). It is deliberately NOT
+# keyed on the uid, on $XDG_RUNTIME_DIR, or on which fallback candidate this pass resolved: those are
+# exactly the inputs that differ between a system unit, an interactive shell and a root repair pass,
+# and a lock whose NAME depends on them is a lock those three do not share. tmpfs is writable when the
+# disk is full, which is the only property the fallback needs from it.
+CANONICAL_LOCK_DIR="${DISK_REAPER_TMPFS_ROOT:-/dev/shm}/pi-disk-reaper"
+# The CONFIGURED dir's lock, set below ONLY when this pass fell back (a healthy pass's own lock IS
+# that path, and `same_file` skips it). ⛔ DECLARED HERE, NOT NEAR ITS READER — initialising it after
+# `resolve_state_dir` runs wipes the value that function sets (measured: the fallback then ran beside
+# the live primary pass, the exact hazard the check exists for).
+PRIMARY_LOCK_DIR=""
+# An operator's own `DISK_REAPER_LOG` pin wins over the fallback's log path (resolve_state_dir below).
+LOG_PINNED="${DISK_REAPER_LOG:-}"
+STATE_DIR_FALLBACKS="${DISK_REAPER_STATE_DIR_FALLBACKS-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/pi-disk-reaper}:${DISK_REAPER_TMPFS_ROOT:-/dev/shm}/pi-disk-reaper-$(id -u 2>/dev/null || printf 0)}"
+
+resolve_state_dir() { # sets STATE_DIR/LOCK_DIR/STATUS/LOG, or refuses (exit 3)
+    local cand seen=" "
+    state_dir_writable "$STATE_DIR" && return 0
+    while IFS= read -r cand; do
+        [ -n "$cand" ] || continue
+        case "$seen" in *" $cand "*) continue ;; esac
+        seen="$seen$cand "
+        [ "$cand" = "$STATE_DIR" ] && continue
+        # ⛔ OWNERSHIP IS CHECKED BEFORE THE PROBE, NOT AFTER IT. A fallback candidate is only adopted
+        # when this user owns it: /dev/shm is 1777 and the name is guessable, so a pre-existing foreign
+        # dir carrying a planted lock would become this pass's lock/log/record dir and then defer for
+        # ever (exit 6, unit GREEN, no record). Checking it AFTER `state_dir_writable` was the bug: that
+        # function WRITES into the directory (at a predictable `.disk-reaper-probe.$$` name) before the
+        # guard ran, so in a foreign dir it truncated whatever that name resolved to — a planted symlink
+        # to a victim file was truncated to one byte, and a planted FIFO HUNG the pass (openat in
+        # wait_for_partner) with the unit being Type=oneshot and unbounded, i.e. the reaper silently
+        # disarmed. The canonical branch below already had this order; the two must not disagree.
+        # The CONFIGURED dir is exempt from ownership (a shared or root-run state dir is legitimate).
+        # An ABSENT candidate is fine — this pass will create it, and then owns what it created. Only a
+        # PRE-EXISTING directory can be foreign, so only that case is refused.
+        if [ -e "$cand" ] || [ -L "$cand" ]; then
+            [ -O "$cand" ] || continue
+        fi
+        state_dir_writable "$cand" || continue
+        STATE_DIR_PRIMARY_NOTE="unwritable"
+        STATE_DIR="$cand"
+        # ⛔ THE LOCK DOES NOT MOVE WITH THE STATE DIR. It moves to ONE canonical path every pass on
+        # this box derives identically — `${DISK_REAPER_TMPFS_ROOT}/pi-disk-reaper/disk-reaper.lock`,
+        # no uid, no candidate choice — so a fallback pass and a healthy pass contend on the SAME lock
+        # whichever ordering they start in. Enumerating "candidate" or "per-uid" locks was tried and
+        # abandoned: it needed every checker to reconcile environments it does not control (a system
+        # unit has no $XDG_RUNTIME_DIR, a root repair pass has a different uid), and each enumeration
+        # gap was another way for two passes to delete concurrently. One name cannot drift.
+        # The log, record and scratch DO follow the state dir (they are data, not identity).
+        if mkdir -p "$CANONICAL_LOCK_DIR" 2>/dev/null && [ -O "$CANONICAL_LOCK_DIR" ] && state_dir_writable "$CANONICAL_LOCK_DIR"; then
+            LOCK_DIR="$CANONICAL_LOCK_DIR/disk-reaper.lock"
+        else
+            # Degraded, and DISCLOSED: no tmpfs at all means we can only exclude within this state dir.
+            LOCK_DIR="$STATE_DIR/disk-reaper.lock"
+            printf '%s: ⚠ the canonical lock dir %s is unusable too — this pass can only exclude against passes that resolved the same state dir\n' \
+                "$SCRIPT_NAME" "$CANONICAL_LOCK_DIR" >&2
+        fi
+        STATUS="$STATE_DIR/disk-reaper.status"
+        [ -n "$LOG_PINNED" ] || LOG="$STATE_DIR/disk-reaper.log"
+        return 0
+    done <<<"$(printf '%s\n' "$STATE_DIR_FALLBACKS" | tr ':' '\n')"
+    # ⛔ NO WRITABLE STATE DIR ANYWHERE IS STILL A REFUSAL, and now it is a *stated* one: every
+    # candidate tried is named. A pass that cannot record is a pass no reader can see, and a pass
+    # without a lock is not a pass at all (#2036/T46).
+    # ⛔ NAME WHAT WAS TRIED. With the fallback seam emptied there is no candidate list, and printing
+    # `(tried: )` would be a refusal whose reason is invisible — the operator cannot tell "every
+    # candidate was unwritable" from "no candidate exists", which are different remediations.
+    if [ -n "${STATE_DIR_FALLBACKS//:/}" ]; then
+        # ⛔ RENDER ONLY THE CANDIDATES THAT EXIST. With $XDG_RUNTIME_DIR unset the default list's `:`
+        # join leaves an EMPTY first entry, and the old `${VAR//:/, }` printed it verbatim — "(tried: ,
+        # /dev/shm/…)" names a candidate with no name, so the message was not "every candidate it tried".
+        tried8="$(printf '%s\n' "$STATE_DIR_FALLBACKS" | tr ':' '\n' | sed '/^$/d' | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+        printf '%s: cannot create state dir %s — and no fallback was writable (tried: %s)\n' \
+            "$SCRIPT_NAME" "$STATE_DIR_PRIMARY" "$tried8" >&2
+    else
+        printf '%s: cannot create state dir %s — and no fallback is configured (DISK_REAPER_STATE_DIR_FALLBACKS is empty)\n' \
+            "$SCRIPT_NAME" "$STATE_DIR_PRIMARY" >&2
+    fi
+    printf '%s: refusing to start — this pass would run with no lock and no readable record (exit 3).\n' "$SCRIPT_NAME" >&2
+    printf '%s: free space by hand, or point DISK_REAPER_STATE_DIR at a writable filesystem.\n' "$SCRIPT_NAME" >&2
+    exit 3
+}
+
+resolve_state_dir
+if [ -n "$STATE_DIR_PRIMARY_NOTE" ]; then
+    # ⛔ THE DELEGATES GET THE SAME DIR, AND THAT IS THE POINT OF THE FALLBACK. Each of the three
+    # owners keeps its own lock and log under `$HOME/.pi/agent/state`; left alone on a full disk they
+    # fail closed in THAT directory (pi-cache-reap.sh: "cannot create the lock directory … exit 3";
+    # pi-reap-worktrees.sh: "FAIL-CLOSED abort: lock held"), so the pass would "run", free nothing and
+    # report fail-closed — the same inert outcome through a longer path. Only seams the operator has
+    # not pinned are set, so an explicit CACHE_REAP_LOCK/REAP_WT_STATE_DIR/… still wins.
+    export CACHE_REAP_LOCK="${CACHE_REAP_LOCK:-$STATE_DIR/pi-cache-reap.lock}"
+    export CACHE_REAP_LOG="${CACHE_REAP_LOG:-$STATE_DIR/pi-cache-reap.log}"
+    export REAP_WT_STATE_DIR="${REAP_WT_STATE_DIR:-$STATE_DIR}"
+    export REAP_WT_LOG="${REAP_WT_LOG:-$STATE_DIR/pi-reap-worktrees.log}"
+    export REAP_VENV_LOG="${REAP_VENV_LOG:-$STATE_DIR/reap-lane-venvs.log}"
+    # Scratch too: the bounded probes and the venv owner's `mktemp` would otherwise still target the
+    # exhausted filesystem. `tb_bound_tmp` is lazy and idempotent, so the retry below only creates the
+    # scratch that the earlier attempt could not.
+    mkdir -p "$STATE_DIR/tmp" 2>/dev/null && export TMPDIR="$STATE_DIR/tmp"
+    tb_bound_tmp 2>/dev/null || true
+    printf '%s: ⚠ state dir %s is unusable (%s) — running this pass on %s (lock, log, scratch, record; the delegates get it too)\n' \
+        "$SCRIPT_NAME" "$STATE_DIR_PRIMARY" "$STATE_DIR_PRIMARY_NOTE" "$STATE_DIR" >&2
+    # ⛔ THE LOCK THE OTHER PASS HOLDS IS THE PRIMARY ONE, AND IT IS STILL READABLE ON A FULL DISK.
+    # `state_dir_writable` can only fail here, so this pass takes its lock on tmpfs — a DIFFERENT lock
+    # from a pass that started while the configured dir was still writable and is STILL RUNNING. Left
+    # unchecked the two would run the same three delegates over the same caches, and because this pass
+    # hands the delegates ITS state dir (CACHE_REAP_LOCK, REAP_WT_STATE_DIR — see above) their own locks
+    # would not exclude each other either: two `uv cache prune`s, or two `git worktree remove`/`prune`s,
+    # over one tree. The disclosure is NOT enough — that is concurrent deletion, not an accounting
+    # artefact. So a fallback pass refuses to run beside a LIVE primary holder (checked after it takes
+    # its own lock, below).
+    PRIMARY_LOCK_DIR="$STATE_DIR_PRIMARY/disk-reaper.lock"
+fi
 
 # proc_lstart <pid> — the process's start time as `ps` prints it, pinned to C so BOTH sides of the
 # comparison are spelled the same way (en_GB prints `Sun 18 Oct …`, C prints `Sun Oct 18 …` — the same
@@ -693,6 +868,132 @@ release_lock() {
 }
 # A long but PROGRESSING pass must not age out of its own lock (a stale lock is taken by a contender).
 heartbeat_lock() { [ "${LOCK_HELD:-0}" = 1 ] && touch "$LOCK_DIR" 2>/dev/null; return 0; }
+
+# ps_can_see_self — can this `ps` report a process at all? A control probe, because `ps -p PID` exits 1
+# BOTH for "no such process" and for "could not see it", and the two mean opposite things here. Cheap,
+# and only consulted on the rc-1 arm.
+ps_can_see_self() {
+    local out
+    out="$(tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" env LC_ALL=C "$PS_BIN" -o lstart= -p "$$" 2>/dev/null)" || return 1
+    [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ]
+}
+
+# peer_lock_live <lock-dir> — is another live pass holding THAT lock? The SAME identity rule this
+# script's own lock uses (pid AND its start time): a live pid alone is not a holder, because pids are
+# recycled and a recycled one would block every future pass for ever; a token without `lstart=` is
+# treated as LIVE, matching acquire_lock's deliberate fail-closed choice for old-release tokens.
+peer_lock_live() {
+    local d="$1" owner owner_lstart now_lstart age lm ps_out ps_rc
+    [ -n "$d" ] && [ -d "$d" ] || return 1
+    owner="$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$d/token" 2>/dev/null | head -1)"
+    owner_lstart="$(sed -n 's/.*lstart=//p' "$d/token" 2>/dev/null | head -1)"
+    if [ -z "$owner" ]; then
+        # ⛔ A LOCK DIR WITH NO READABLE TOKEN IS STILL A LOCK, MIRRORING `acquire_lock`. The token write
+        # there is `|| true`, and this function exists for the state `state_dir_writable` documents — an
+        # entry can be creatable while a data block is not — so on a full disk `mkdir` can succeed and
+        # the token's write fail. Reading that as "free" let a fallback pass run beside that live
+        # holder: the exact concurrent-reap hazard this gate closes. A tokenless lock younger than the
+        # stale bound is therefore LIVE; past it, it is debris and the pass proceeds (self-healing).
+        lm="$(file_mtime "$d")"
+        case "$lm" in ''|*[!0-9]*) age=0 ;; *) age=$(( $(now) - lm )) ;; esac
+        [ "$age" -le "$LOCK_STALE_SECONDS" ]
+        return $?
+    fi
+    # ⛔ NOT `kill -0`. It returns EPERM — indistinguishable from "no such process" through `|| return
+    # 1` — for a LIVE process owned by another uid, so a root repair pass's lock read as dead and the
+    # two passes reaped concurrently (measured: rc=0 beside a live root holder). `ps -o lstart=` IS
+    # world-readable, so readability is the existence test: if the start time can be read the process
+    # exists, and the token's own `lstart` then decides identity (recycled pid => not a holder).
+    # ⛔ THE EXIT STATUS IS WHAT SEPARATES "GONE" FROM "COULD NOT LOOK", and `proc_lstart` throws it away.
+    # `ps -p PID` exits 1 when there is no such process, and 0 when there is — including a process owned
+    # by ANOTHER uid, which is why `kill -0` cannot be used (it returns EPERM for exactly that case and
+    # read a live root holder as dead: measured, a fallback pass ran beside it). A non-1 failure (a
+    # broken PS_BIN, a `ps` that timed out on a hung /proc, hidepid) means we cannot tell, and THAT must
+    # fail closed — reading it as "no holder" ran a pass beside a live one (measured with
+    # PS_BIN=/nonexistent: rc=0, class ran). The stale window bounds both arms, so a genuinely dead
+    # holder cannot hold the pass for ever (a permanent exit 6 is the inert reaper this feature removes).
+    ps_out="$(tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" env LC_ALL=C "$PS_BIN" -o lstart= -p "$owner" 2>/dev/null)"; ps_rc=$?
+    now_lstart="$(printf '%s' "$ps_out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    # ⛔ rc 1 IS NOT ONLY "ABSENT". It is also "could not look" — a hardened /proc (hidepid), a sandboxed
+    # cell, or a PS_BIN shim that exits 1 on error — and folding the third outcome into "absent" is
+    # fail-OPEN: the live holder becomes invisible and the pass runs beside it (measured with a
+    # PS_BIN that exits 1: rc=0, class ran, while a working ps gives rc=6 on the same fixture). The
+    # control probe decides which reading applies, exactly as scripts/orchestrator-harness/claims.sh
+    # does: if ps cannot report OUR OWN pid's start time, rc 1 carries no information.
+    if [ "$ps_rc" -eq 1 ] && ps_can_see_self; then
+        return 1                            # ps works and does not know this pid: definitely not a holder
+    fi
+    if [ -z "$now_lstart" ]; then
+        lm="$(file_mtime "$d")"
+        case "$lm" in ''|*[!0-9]*) age=0 ;; *) age=$(( $(now) - lm )) ;; esac
+        [ "$age" -le "$LOCK_STALE_SECONDS" ]
+        return $?
+    fi
+    [ -z "$owner_lstart" ] || [ "$owner_lstart" = "$now_lstart" ]
+}
+
+# same_file <a> <b> — are these two spellings the SAME lock? A trailing slash, or a symlink/–ef alias,
+# otherwise makes a pass compare its own lock with itself, fail to recognise it, and REFUSE (exit 6) —
+# which the unit treats as GREEN, so the reaper would silently never reap: this feature's own named
+# failure, produced by a comparison. Measured with `...FALLBACKS=/tmp/x/fb-slash/`: rc=6, and the pid
+# it named as the holder was the pass itself.
+same_file() {
+    local a b
+    a="$(printf '%s' "$1" | sed 's#/*$##')"
+    b="$(printf '%s' "$2" | sed 's#/*$##')"
+    [ -n "$a" ] && [ "$a" = "$b" ] && return 0
+    [ -e "$1" ] && [ -e "$2" ] && [ "$1" -ef "$2" ]
+}
+
+# peer_lock_dirs — the locks that mean "a pass is already working this box". Exactly TWO, and neither
+# depends on the checker's uid, $XDG_RUNTIME_DIR, or which fallback candidate it resolved: the
+# configured dir's lock and the ONE canonical tmpfs lock. ⛔ EVERY ENUMERATION VARIANT WAS TRIED AND
+# ABANDONED (#2443 review cycles 3-5): "my configured candidates", "my uid's tmpfs dir", "every
+# pi-disk-reaper-* uid dir" each left a reachable ordering where two passes reaped concurrently,
+# because each made the SET a function of the checker's environment — the one thing a system unit, an
+# interactive shell and a root repair pass do NOT share. A single fixed name cannot drift, and it is
+# why a healthy pass can check it too (below) without any hermeticity problem: one path, one stat.
+peer_lock_dirs() {
+    printf '%s\n' "$PRIMARY_LOCK_DIR"
+    # ⛔ OBEY ONLY A LOCK WE COULD HAVE TAKEN OURSELVES. /dev/shm is 1777, so on a shared host any local
+    # user can create this directory first and plant a token naming a long-lived pid: obeying it holds
+    # every pass — root's included — at exit 6, the one non-zero code the unit accepts, with no record
+    # written (measured). Obeying only an owned dir turns that permanent disarm into a disclosed
+    # degradation to state-dir locking, which the pass already reports.
+    [ -O "$CANONICAL_LOCK_DIR" ] || return 0
+    printf '%s\n' "$CANONICAL_LOCK_DIR/disk-reaper.lock"
+}
+
+# check_peer_locks — no pass may run beside a live pass holding either of the TWO locks that exist: the
+# canonical one and this pass's configured one. It runs for EVERY pass, not only a fallback one: a
+# healthy pass takes the configured lock while a fallback pass takes the canonical one, so leaving the
+# healthy side unchecked was the mirror ordering (healthier pass starts after the fallback freed the
+# space). With ONE fixed canonical path that check is a single stat, so it is closed rather than traded.
+# Only refusal is safe here: deferring (6) is the routine "another pass is doing this hour's work" code
+# the unit treats as green, and unlike crediting each other's `df` deltas, it cannot delete twice.
+# ⛔ THE CANONICAL LOCK IS OBEYED ONLY WHEN THIS USER OWNS ITS DIR (peer_lock_dirs): /dev/shm is 1777,
+# so on a shared host a foreign token could otherwise hold every pass at 6 for ever.
+check_peer_locks() {
+    # ⛔ EVERY PASS, NOT ONLY A FALLBACK ONE. A healthy pass takes the configured lock and a fallback
+    # pass takes the canonical one, so a healthy pass starting while a fallback pass still runs (the
+    # fallback may have just freed the space that made the configured dir writable) is the mirror
+    # ordering — and with ONE fixed canonical path, checking it costs a single stat, so there is no
+    # reason to leave it open. The old residual (i) was priced on enumerating tmpfs dirs; one name is
+    # free, which is what makes it closable rather than a trade.
+    local cand owner
+    while IFS= read -r cand; do
+        [ -n "$cand" ] || continue
+        # ⛔ NOT A STRING COMPARE: this pass's own lock can be spelled with a trailing slash or reached
+        # through a symlink, and failing to recognise it makes the pass refuse against itself (exit 6,
+        # unit GREEN) — the inert reaper this feature exists to remove.
+        same_file "$cand" "$LOCK_DIR" && continue
+        peer_lock_live "$cand" || continue
+        owner="$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$cand/token" 2>/dev/null | head -1)"
+        say "disk-reaper: another pass holds a lock this pass must not run beside ($cand, pid ${owner:-?}) — refusing to run on $LOCK_DIR: a fallback pass hands the delegates this state dir, so their locks would not exclude two concurrent reaps of the same caches"
+        release_lock
+        exit 6
+    done <<<"$(peer_lock_dirs)"
+}
 # ⛔ THE BOUNDED-EXECUTION LIBRARY OWNS SCRATCH AND TIMER PROCESSES. scripts/lib/bounded.sh documents
 # `tb_bound_cleanup` and `tb_watchdogs_reap` as the CALLERS' EXIT-trap obligations; without them every
 # pass on a host with no GNU `timeout` (macOS — the platform this PR adds) leaks its probe scratch dirs.
@@ -1064,7 +1365,7 @@ reap_venv() {
     # Same rule as the worktree arm: in a DRY pass the candidate count is OUR scan of the delegate
     # REAP rows, so classification output makes it answerable even without a tally; a refusal does not.
     HAVE_VENV_CAND="$have_venv_tally"
-    if is_dry && printf '%s\n' "$rows" | grep -qE '^(REAP|KEEP|SUMMARY) '; then HAVE_VENV_CAND=1; fi
+    if is_dry && grep -qE '^(REAP|KEEP|SUMMARY) ' <<<"$rows"; then HAVE_VENV_CAND=1; fi
     # Candidate rows are the owner's `REAP <reason> <N>MB <path>` lines; they carry the SIZE, which the
     # tally does not, so the row scan still runs in a dry pass for the byte estimate and the detail list.
     if is_dry; then
@@ -1117,7 +1418,7 @@ reap_venv() {
 
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1
+    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1 _skip="" SKIP_NOTE=""
     # The delegate's own tally, summed across repos. `reasons` is joined; a proof value that DIFFERS
     # between repos is reported as `mixed` rather than letting the last repo answer for all of them.
     local sum_classified=0 sum_preserved=0 sum_remove=0 sum_reasons="" sum_removed=0 sum_failed=0
@@ -1207,6 +1508,23 @@ reap_worktree() {
         fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
+        # ⛔ A REPO THE OPEN-PR GATE CANNOT VERIFY IS SKIPPED BY NAME — never the whole class, and never
+        # a silent absence. The delegate fails closed for ONE repo (its checkouts untouched, which is
+        # the safety property and it is NOT weakened here); this ledger says WHICH repo and WHY, so the
+        # operator can fix the cause instead of reading `verdict=fail-closed` with no subject. Measured
+        # 2026-10-23 on a cell at 95% used: gh present and working but not authenticated under the
+        # pass's HOME -> both repos aborted -> `freed_df=0MB`, reported as "gh unavailable" (#2443).
+        # ⛔ THE REASON IS EVERYTHING AFTER `reason=`, not the token after `skipped=`: a repo path may
+        # contain a space (a checkout under `~/My Projects/…`), and anchoring on the path would then
+        # match nothing — silently turning a named skip back into an anonymous fail-closed class.
+        # `tr -d '[:space:]'` keeps a malformed/split token from becoming half a reason; the delegate
+        # emits space-free tokens, so this only ever removes trailing whitespace in practice (#2443 P1).
+        _skip="$(printf '%s\n' "$out" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1 | tr -d '[:space:]')"
+        if [ -n "$_skip" ]; then
+            SKIPPED_WT_N=$((SKIPPED_WT_N + 1))
+            SKIPPED_WT="${SKIPPED_WT}${SKIPPED_WT:+, }${repo}[${_skip}]"
+            say "disk-reaper: class=worktree skipped=$repo reason=$_skip — this repo's checkouts are UNTOUCHED (fail closed); the class kept going for the other repos"
+        fi
         RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
         # Same rule as the venv class: one entry per DISTINCT code, appended, delegate code first.
         if [ "$rc" -gt 0 ]; then
@@ -1228,6 +1546,22 @@ reap_worktree() {
     # (a review cycle found the two surfaces disagreeing).
     [ "$have_tally" = 1 ] && [ -z "$sum_reasons" ] && sum_reasons="none"
 
+    # The skip ledger rides on the class line AND the pass record: a class that skipped a repo did LESS
+    # than a clean class, so its verdict stays fail-closed (3) — skipping is not a pass — but the line
+    # names how much of the class DID run, which is what makes the difference actionable.
+    SKIP_NOTE=""
+    [ "$SKIPPED_WT_N" -gt 0 ] && SKIP_NOTE=" skipped=$SKIPPED_WT_N ($SKIPPED_WT)"
+    # ⛔ NOT MISCONFIG. That field is "a class that could not be SET UP at all" and is rendered as
+    # `cannot run: …` — the opposite of what happened here: the class RAN and reclaimed the repos it
+    # could verify. Adding it made `detail=` carry two contradictory causes, one of them false, on a
+    # record an operator reads to decide what to fix. `NOTE_WT` names the cause; the exit code and
+    # `verdict_worktree=fail-closed` already carry the red (#2443 review P2).
+    if [ "$SKIPPED_WT_N" -gt 0 ]; then
+        case "; $NOTE_WT;" in
+            *"; open-PR gate unverifiable;"*) : ;;
+            *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }open-PR gate unverifiable" ;;
+        esac
+    fi
     if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi
     # (the delegate's tally is lifted out of $out inside the repo loop above)
     # The owner deliberately reports NO byte figure: whether its `.venv`s share cache blocks is a
@@ -1269,16 +1603,16 @@ reap_worktree() {
         done <<<"$rows"
         CAND_WT="$all_c"
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}"
+        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
     else
         # `candidates_worktree` used to be structurally 0 on an ARMED pass (it was only accumulated in
         # the dry-run branch), so the record answered "no candidates" for a pass that classified fifty.
         # Lift the delegate's `remove=` instead of re-deriving it.
         CAND_WT="$sum_remove"
         if [ "${DF_WT_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
         else
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
         fi
     fi
     # An ANSWERED `reasons=none` is normalised ABOVE, before the class line prints it (a fix applied
@@ -1295,7 +1629,7 @@ reap_worktree() {
     # only `class=worktree FAIL-CLOSED gh unavailable` and exited 3, so the record claimed
     # `candidates_worktree=0` (a measured zero) beside `classified_worktree=?`. Count it only when the
     # output actually contains CLASSIFICATION rows — that is what the `du` sweep measured.
-    if is_dry && printf '%s\n' "$rows" | grep -qE '^(remove|preserve|SUMMARY) '; then HAVE_WT_CAND=1; fi
+    if is_dry && grep -qE '^(remove|preserve|SUMMARY) ' <<<"$rows"; then HAVE_WT_CAND=1; fi
     return 0
 }
 
@@ -1303,6 +1637,12 @@ reap_worktree() {
 MODE_TEXT=dry-run; is_dry || MODE_TEXT=apply
 acquire_lock
 : >"$LOG" 2>/dev/null || true
+# ⛔ THE FALLBACK'S OWN LOCK IS NOT THE ONLY ONE THAT MATTERS (#2443 review): a pass that started
+# while the configured dir was writable may still be running and holding THAT lock. Runs for EVERY pass
+# (see check_peer_locks' own docblock — a healthy pass takes the configured lock and a fallback pass the
+# canonical one, so the healthy side must check too); with one fixed canonical path that is a single
+# stat, not an enumeration, so no hermeticity cost.
+check_peer_locks
 {
     say "disk-reaper: pass start mode=$MODE_TEXT only=$ONLY aged=${WT_AGED_DAYS}d venv_min_age=${VENV_MIN_AGE}s pid=$$"
     # The bounding MECHANISM is disclosed only when it is not GNU `timeout`: on a host that has it,
@@ -1314,6 +1654,10 @@ acquire_lock
     fi
     log "==== pass start mode=$MODE_TEXT only=$ONLY repos=${REPOS:-<resolved per class>} ===="
     log "watchdog: ${TB_TIMEOUT_KIND:-unknown} ($(tb_watchdog_description))"
+    # The fallback is said in the PASS LOG too, not only on stderr before it: the log is the artifact an
+    # operator reads after the fact, and "which filesystem held this pass's lock" decides whether its
+    # `df` deltas can be credited to it (agent-infra#2443).
+    [ -n "$STATE_DIR_PRIMARY_NOTE" ] && say "disk-reaper: ⚠ state dir fallback — configured $STATE_DIR_PRIMARY is unusable ($STATE_DIR_PRIMARY_NOTE); lock/log/scratch/record on $STATE_DIR, and the three delegates were given it too"
     log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING}"
 } | tee -a "$LOG"
 
@@ -1375,9 +1719,17 @@ DETAIL=""
 [ -n "$NOTE_WT" ] && DETAIL="${DETAIL}${DETAIL:+; }$NOTE_WT"
 [ -n "$MISCONFIG" ] && DETAIL="${DETAIL}${DETAIL:+; }cannot run: ${MISCONFIG}"
 [ -n "$UNMEASURED" ] && DETAIL="${DETAIL}${DETAIL:+; }df could not measure the reclaim for: ${UNMEASURED} (not a measured zero)"
+# The fallback is part of the VERDICT, not a footnote beside it: a reader who sees a record must be
+# able to tell that it came from a pass whose configured state dir was unusable (agent-infra#2443).
+[ -n "$STATE_DIR_PRIMARY_NOTE" ] && DETAIL="${DETAIL}${DETAIL:+; }state dir $STATE_DIR_PRIMARY was unusable (${STATE_DIR_PRIMARY_NOTE}) — this pass ran on $STATE_DIR, and so did its delegates"
 [ -n "$DETAIL" ] || DETAIL="ok"
-UTMP="$STATUS.tmp.$$"
-{
+
+# ⛔ THE RECORD GOES TO THE CONFIGURED PATH WHENEVER IT CAN (#2443). A fallback pass may have just FREED
+# the space that made the configured dir unwritable, and the supervisor reads
+# $DISK_REAPER_STATE_DIR/disk-reaper.status — a record only the fallback can see is a record the alarm
+# channel cannot read. One record, one verdict (T45): the canonical dir is preferred, the dir this pass
+# ran on is the fallback, and BOTH ARE NEVER WRITTEN.
+record_body() {
     printf 'epoch=%s\n' "$(now)"
     printf 'iso=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'mode=%s\n' "$MODE_TEXT"
@@ -1416,15 +1768,49 @@ UTMP="$STATUS.tmp.$$"
     printf 'verdict_uv=%s\n' "$VERDICT_UV"
     printf 'verdict_venv=%s\n' "$VERDICT_VENV"
     printf 'verdict_worktree=%s\n' "$VERDICT_WT"
+    # empty=no repo was skipped; otherwise `<repo>[<reason>], ...` — the subject the class verdict
+    # never had (#2443).
+    printf 'skipped_worktree=%s\n' "$SKIPPED_WT"
     printf 'repos=%s\n' "$(printf '%s' "$REPOS" | tr '\n' ',')"
+    # ⛔ THE NORMAL RECORD IS UNCHANGED (#2443): BOTH fields appear only when this pass actually fell
+    # back, so a healthy box's artifact stays byte-for-byte what every existing reader already parses.
+    # An UNCONDITIONAL `state_dir=` was the first draft and it is wrong: it adds a line to the record of
+    # every healthy pass on every box, to say where a pass ran when the answer is the configured path
+    # the reader already holds. `state_dir` is where THIS pass's lock/log/scratch/record lived;
+    # `state_dir_primary` is the configured dir it could not use.
+    if [ -n "$STATE_DIR_PRIMARY_NOTE" ]; then
+        printf 'state_dir=%s\n' "$STATE_DIR"
+        printf 'state_dir_primary=%s\n' "$STATE_DIR_PRIMARY"
+    fi
     printf 'detail=%s\n' "$DETAIL"
-} >"$UTMP" 2>/dev/null && mv -f "$UTMP" "$STATUS" 2>/dev/null \
-    || { say "disk-reaper: ⛔ cannot write the pass record $STATUS — the PREVIOUS record still stands (readers will keep seeing it until it goes stale); this pass's exit code is the only witness to this run"
-         rm -f "$UTMP" 2>/dev/null
-         # ⛔ 5 AND 6 ARE GREEN BECAUSE THE RECORD CARRIES THE ALARM. With no record there is no alarm
-         # channel left, so any non-3 verdict becomes 4 (a filesystem problem) instead of exiting green
-         # over an un-writable state dir.
-         [ "$verdict" = 3 ] || verdict=4; }
+    return 0
+}
+
+write_record() { # <dir> — 0 when the record was written and renamed into place
+    local d="$1" tmp
+    tmp="$d/disk-reaper.status.tmp.$$"
+    record_body >"$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    mv -f "$tmp" "$d/disk-reaper.status" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    return 0
+}
+
+RECORD_DIR=""
+if [ "$STATE_DIR_PRIMARY" != "$STATE_DIR" ] && state_dir_writable "$STATE_DIR_PRIMARY"; then
+    RECORD_DIR="$STATE_DIR_PRIMARY"
+else
+    RECORD_DIR="$STATE_DIR"
+fi
+write_record "$RECORD_DIR" 2>/dev/null \
+    || { if [ "$RECORD_DIR" != "$STATE_DIR" ] && write_record "$STATE_DIR"; then
+             say "disk-reaper: ⚠ cannot write the pass record to $RECORD_DIR — it is at $STATE_DIR/disk-reaper.status instead"
+         else
+             RECORD_DIR=""
+         fi; }
+[ -z "$RECORD_DIR" ] && { say "disk-reaper: ⛔ cannot write the pass record $STATUS — the PREVIOUS record still stands (readers will keep seeing it until it goes stale); this pass's exit code is the only witness to this run"
+             # ⛔ 5 AND 6 ARE GREEN BECAUSE THE RECORD CARRIES THE ALARM. With no record there is no alarm
+             # channel left, so any non-3 verdict becomes 4 (a filesystem problem) instead of exiting green
+             # over an un-writable state dir.
+             [ "$verdict" = 3 ] || verdict=4; }
 log "==== pass end mode=$MODE_TEXT verdict=$verdict freed_mb=$TOTAL uv=$FREED_UV venv=$FREED_VENV worktree=$FREED_WT candidates=$(( CAND_UV + CAND_VENV + CAND_WT )) ===="
 
 exit "$verdict"

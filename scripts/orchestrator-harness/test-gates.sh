@@ -576,10 +576,11 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
       LOG="$TMP/g.log"; O="$TMP/gO"; mkdir -p "$O/state"
       sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
       gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
-      # ⛔ THE SPAWN IS A DURABLE TERMINAL NOW (worker-terminal.sh): a tmux window is the measured
-      # 21-line death on a cell. The spy records the SPAWN ARGV, so every assertion below still reads
-      # "what actually ran" — and the carried REQ/REVIEW_GATE land in it unchanged, because they are
-      # part of the command the worker is started with.
+      # ⛔ THE SPAWN IS A DURABLE TERMINAL WHERE THE DAEMON ANSWERS (worker-terminal.sh); on a box
+      # without one it is tmux with an explicit HOME+keys.env contract — the `~21 log lines` death was
+      # the missing environment, not tmux (agent-infra#2210, reopened). The spy records the SPAWN ARGV,
+      # so every assertion below still reads "what actually ran" — and the carried REQ/REVIEW_GATE land
+      # in it unchanged, because they are part of the command the worker is started with.
       WT_DIR="$O/state"; WT_TABLE_TTL=0
       . "$HERE/worker-terminal.sh"
       cmux() {
@@ -2810,12 +2811,18 @@ GHFAIL2
     # (12h) ⛔ A NAME OUTSIDE THE FAMILIES IS SPARED (review round 10 final pass): `sed` without `-n`
     # echoed every non-matching basename as if it were a PR id, so such a file was DELETED as an
     # orphan — a delete-direction bug in the one function that is supposed to fail closed.
-    rm -f "$PO/state/"*; : > "$PO/state/needsfix-note.txt"; : > "$PO/state/reviewcount-6999"; sleep 1; : > "$PO/state/last-open-prs"
+    # ⛔ AND THE FAMILIES MUST BE ONE EDIT IN TWO PLACES (review of #2664, P3): the `for mf in …` glob and
+    # the `sed -En` alternation are TWO halves of one predicate. Adding only the glob yields `mp=""` →
+    # `continue` → the file is never removed, and one stale file per abandoned PR accumulates silently
+    # for ever — the exact leak the reviewcount pin was added for. So every family is seeded here.
+    rm -f "$PO/state/"*; : > "$PO/state/needsfix-note.txt"; : > "$PO/state/reviewcount-6999"
+    : > "$PO/state/reviewdisp-6999"; : > "$PO/state/reviewathead-6999"; sleep 1; : > "$PO/state/last-open-prs"
     ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
-    if [ -e "$PO/state/needsfix-note.txt" ] && [ ! -e "$PO/state/reviewcount-6999" ]; then
-      echo "  ✅ a name outside the marker families is SPARED, while a departed PR's reviewcount IS pruned"; PASS=$((PASS+1))
+    if [ -e "$PO/state/needsfix-note.txt" ] && [ ! -e "$PO/state/reviewcount-6999" ] \
+       && [ ! -e "$PO/state/reviewdisp-6999" ] && [ ! -e "$PO/state/reviewathead-6999" ]; then
+      echo "  ✅ a name outside the marker families is SPARED, while a departed PR's reviewcount AND the review budgets (reviewdisp/reviewathead) are pruned"; PASS=$((PASS+1))
     else
-      echo "  ❌ the prune mis-handled names outside the families (note=$( [ -e "$PO/state/needsfix-note.txt" ] && echo kept || echo DELETED) reviewcount=$( [ -e "$PO/state/reviewcount-6999" ] && echo kept || echo deleted))"; FAIL=$((FAIL+1))
+      echo "  ❌ the prune mis-handled names outside the families (note=$( [ -e "$PO/state/needsfix-note.txt" ] && echo kept || echo DELETED) reviewcount=$( [ -e "$PO/state/reviewcount-6999" ] && echo kept || echo deleted) reviewdisp=$( [ -e "$PO/state/reviewdisp-6999" ] && echo kept || echo deleted) reviewathead=$( [ -e "$PO/state/reviewathead-6999" ] && echo kept || echo deleted))"; FAIL=$((FAIL+1))
     fi
     # (12d) ⛔ AN EMPTY BUT SUCCESSFUL LISTING PRUNES (review round 7, P3): n=0 with `last-open-prs`
     # present means "this repo has no open PRs", where every marker is orphaned — the drained state.

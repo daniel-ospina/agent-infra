@@ -480,7 +480,11 @@ fi
 # dispatcher at `scripts/orchestrator-harness/retired/queue_verdicts.py` (still importable from
 # there, which is what keeps the retired copy runnable as a record). A farmed file that no live step
 # execs is a dependency the farm delivers to nobody.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh)
+# agent-infra#2374 adds registry-sync.sh: `cloud-cell-bringup.sh` runs it (the farmed copy is the
+# one a cell finds) to converge the per-box review-record registry with the fleet's before lanes
+# are dispatched, and `atomic-land.sh` runs it beside itself. A cell without it boots BLIND —
+# every PR another box reviewed reads as unreviewed — which is the state #2374 measures.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -695,7 +699,14 @@ fi
 # joined the #427/#373 farms and drifted: the repo copy is CI-tested while
 # production mints execute the ~/.pi copy. Same idempotent real-copy refresh
 # model as the farms above.
-merge_gate_srcs=(record-review.sh)
+# review-pr.sh rides the SAME farm for the same reason, plus one of its own: it is
+# the seam a LANDER types (`scripts/review-pr.sh <PR>`), and on a cell the
+# `scripts/` checkout is not where an agent works — `~/.pi/agent/scripts/` is, which
+# is where the code-review skill and the lane briefs already point. Farmed WITHOUT
+# its recorder is still correct (the script falls back to the sibling, then to
+# $DEST/scripts/record-review.sh, and REFUSES loudly when neither is executable),
+# but the two are one workflow and belong in one farm.
+merge_gate_srcs=(record-review.sh review-pr.sh)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0
 for base in "${merge_gate_srcs[@]}"; do
@@ -711,10 +722,18 @@ for base in "${merge_gate_srcs[@]}"; do
     rm -f "$dest"
   fi
   cp -f "$f" "$dest"
-  chmod +x "$dest" 2>/dev/null || true
+  # ⛔ A SWALLOWED `chmod` FAILURE IS A SILENTLY NON-EXECUTABLE LANDER SEAM (P3, fresh review of
+  # #2288). The lane brief and the code-review skill tell a lander to TYPE this path
+  # (`~/.pi/agent/scripts/review-pr.sh <PR>`, no `bash`), so a `cp -f` that inherits a restrictive
+  # umask without `x` — with the failure discarded by `|| true` — ships a seam nobody can invoke,
+  # and the farm test (existence + byte-equality only) stays green. Assert it instead.
+  if ! chmod +x "$dest" 2>/dev/null; then
+    echo "    ⚠️  could not chmod +x $dest — the lander seam would not be executable" >&2
+    farm_missing+="scripts/$base (chmod +x failed)"$'\n'
+  fi
   merge_gate_copied=$((merge_gate_copied+1))
 done
-echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, #562)"
+echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh + review-pr.sh, #562)"
 
 # ── the pi spawn-point gate (#1884) ──────────────────────────────────────────
 # Installed as `pi` — not as a farmed script — because that is the whole point: `spawn-gate.sh` is
