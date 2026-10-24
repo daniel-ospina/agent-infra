@@ -275,7 +275,7 @@ unit_main_pid() {
 #   * a very long run overflows `$(( ))`.
 # So: force decimal, bound the length, require a plausible epoch instant, tolerate <=60s of skew, and clamp
 # the age at 0 (an age is seconds SINCE the write; it can never be negative).
-heartbeat_age() {    local hb="$O/heartbeat" t now age
+heartbeat_age() {    local dir="${1:-$O}" hb="${1:-$O}/heartbeat" t now age
     [ -f "$hb" ] || return 1
     t="$(tr -dc '0-9' <"$hb" 2>/dev/null)" || return 1
     case "${t:-}" in ''|*[!0-9]*) return 1 ;; esac
@@ -594,13 +594,29 @@ do_install() {
     # the process table settles it: a launcher that BEGAN AFTER the heartbeat cannot be its author. Same
     # shape+age rule the lock leg uses, so an unprovable age fails CLOSED (and says so) rather than
     # certifying - a false red here is an install that refuses, a false green is the #2402 defect.
+    # ⛔ THE HEARTBEAT THAT COUNTS IS THE ONE THE PROOF WILL READ (review P1, #2402). The proof below trusts
+    # the unit's RESOLVED state dir (`proof_o`), because a `keys.env` `O=` line moves where the controller
+    # writes; a gate that read only this installer's `$O/heartbeat` found NOTHING there, escaped to
+    # `pre_active=1`, and then the dead incarnation's heartbeat in the RESOLVED dir satisfied the <=2xCYC leg
+    # — the same false PASS, one state wider, and byte-for-byte what this gate claims to close. Resolve the
+    # proof dir BEFORE the gate: if a heartbeat exists in the dir the proof will consult (falling back to
+    # `$O`), the MainPID-began-at/before test applies to THAT file; only when neither dir has one is there
+    # nothing to bind.
+    local proof_o=""
+    proof_o="$(unit_owner_dir "$UNIT_DIR/$UNIT_NAME" 2>/dev/null || true)"
     if [ "$(sc_run is-active "$UNIT_NAME" 2>/dev/null)" = active ]; then
-        local _pre_pid _pre_hb _pre_rc
+        local _pre_pid _pre_hb _pre_rc _pre_d
         _pre_pid="$(unit_main_pid 2>/dev/null || true)"
         _pre_hb=""
-        if [ -f "$O/heartbeat" ]; then _pre_hb="$(tr -dc '0-9' < "$O/heartbeat" 2>/dev/null || true)"; fi
+        for _pre_d in "${proof_o:-}" "$O"; do
+            [ -n "${_pre_d:-}" ] || continue
+            [ -f "${_pre_d%/}/heartbeat" ] || continue
+            _pre_hb="$(tr -dc '0-9' < "${_pre_d%/}/heartbeat" 2>/dev/null || true)"
+            [ -n "${_pre_hb:-}" ] && break
+        done
         if [ -z "${_pre_hb:-}" ]; then
-            # No heartbeat to bind: nothing can be certified from it, and the lock leg still decides.
+            # No heartbeat in ANY dir the proof reads: nothing can be certified from one, and the lock leg
+            # still decides.
             pre_active=1
         elif [ "${_pre_pid:-0}" = "0" ]; then
             : # an active unit with no MainPID proves nothing about a heartbeat
@@ -652,8 +668,6 @@ do_install() {
     # round 9, #2402): the supervisor sources `$ENV_FILE` (`set -a`), so a `keys.env` `O=` line moves the
     # controller's lock and heartbeat there while this installer never sources the file. Resolved from the
     # INSTALLED copy, so the proof asks about the same unit the manager is running.
-    local proof_o=""
-    proof_o="$(unit_owner_dir "$UNIT_DIR/$UNIT_NAME" 2>/dev/null || true)"
     while [ "$waited" -lt "${CONTROLLER_PROOF_TIMEOUT:-240}" ]; do
         controller_proof "$proof_since" "$proof_o" && break
         # a unit that has already converged to `failed` will not produce a controller — stop waiting
@@ -769,7 +783,13 @@ do_status() {
     # bound; or a plausible heartbeat). Reported here, never used to decide rc: a start that is still
     # inside its first CYC legitimately has neither witness, and turning that into a refusal would be a
     # false red on every healthy start. The stale-heartbeat refusal above is what bounds the ambiguity.
-    if controller_proof; then
+    # ⛔ AND IT READS THE UNIT'S RESOLVED DIR TOO (review P2, #2402). `--status` is what the bring-up gates
+    # `CELL READY` on, and on a `keys.env`-repointed cell it read only this installer's `$O`: the heartbeat
+    # witness was UNREADABLE and `controller=` reported none-proved while it returned 0 — a dispatcher that
+    # is gone, certified. Same resolved dir the proof in `--install` uses.
+    local _st_o=""
+    _st_o="$(unit_owner_dir "$UNIT_DIR/$UNIT_NAME" 2>/dev/null || true)"
+    if controller_proof 0 "$_st_o"; then
         say "controller=proved (an owned lock holder, or a heartbeat newer than 2*CYC)"
     else
         say "controller=none-proved yet (no owned lock holder and no plausible heartbeat — expected during the first CYC after a start; the heartbeat bound above is what refuses a dead one)"
@@ -777,7 +797,7 @@ do_status() {
     # NRestarts is the direct evidence for the issue's bullet 3/5 ("it comes back on its own"): a unit
     # that has restarted had a controller that died and was brought back without a human.
     local nr; nr="$(sc_run show -p NRestarts "$UNIT_NAME" 2>/dev/null)"; case "$nr" in NRestarts=*) say "restarts=${nr#NRestarts=}" ;; *) say "restarts=unreadable" ;; esac
-    if age="$(heartbeat_age)"; then
+    if age="$(heartbeat_age "${_st_o:-$O}")"; then
         say "heartbeat_age_s=$age"
         # Two cycles + 300s is the same staleness bound install.sh uses for launchd: a quiet cell is not a
         # wedged one, and a wedged one must not read as fresh.

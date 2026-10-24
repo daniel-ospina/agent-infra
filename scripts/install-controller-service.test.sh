@@ -1804,13 +1804,55 @@ DL_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst dl --install > "$T/dl.out
 kill "$DL_LATE" 2>/dev/null || true
 [ "$DL_RC" -ne 0 ] && ok 'install: a launcher that began AFTER the heartbeat does NOT certify it (the dead incarnation wins nothing)' \
                    || bad "install: certified an ACTIVE unit from a heartbeat older than its own MainPID — this is the #2402 false pass: $(cat "$T/dl.out")"
-# …and the same shape with the heartbeat ABSENT still installs: there is nothing to bind, and the lock leg decides.
+# ...and the same shape with the heartbeat ABSENT still installs: there is nothing to bind at the gate. (What
+# lets THIS fixture through is the stub `start` writing a FRESH heartbeat under the default SC_PROOF — with
+# SC_PROOF=none the proof refuses it, which is an arm below.)
 DN="$(arm_root dn)"; mk_systemctl "$DN/bin" "$DN/state" "$DN/sc.log"
 printf 'active\n' > "$DN/state/isactive_word"; : > "$DN/state/active"; printf '4242\n' > "$DN/state/mainpid"
 rm -f "$DN/o/heartbeat"
 DN_RC=0; CONTROLLER_PROOF_TIMEOUT=4 inst dn --install > "$T/dn.out" 2>&1 || DN_RC=$?
 [ "$DN_RC" -eq 0 ] && ok 'install: an ACTIVE unit with NO heartbeat is not refused (the binding has nothing to bind)' \
                    || bad "install: refused an active unit with no heartbeat — the MainPID gate over-reaches: $(cat "$T/dn.out")"
+
+# ---- the heartbeat that counts is the one the PROOF reads (review P1, #2402) ----
+# A `keys.env` `O=` line moves the controller's state dir, and the proof follows the unit's RESOLVED dir. A
+# gate that read only the installer's `$O/heartbeat` found NOTHING there, escaped to `pre_active=1`, and then
+# the dead incarnation's heartbeat in the RESOLVED dir satisfied the <=2xCYC leg -- the false PASS this gate
+# exists to close, one state wider.
+say_case "a heartbeat in the RESOLVED state dir is bound too (it is the one the proof reads)"
+RB="$(arm_root rb)"; mk_systemctl "$RB/bin" "$RB/state" "$RB/sc.log"
+printf 'active\n' > "$RB/state/isactive_word"; : > "$RB/state/active"
+mkdir -p "$RB/o2"; printf '%s\n' "$(( $(date +%s) - 100 ))" > "$RB/o2/heartbeat"   # ONLY in the resolved dir
+rm -f "$RB/o/heartbeat"
+{
+  printf 'Environment=O=%s\n' "$RB/o"
+  printf 'Environment=ENV_FILE=%s\n' "$RB/home/keys.env"
+  printf 'Environment=CELL_HOME=%s\n' "$RB/home"
+} > "$RB/units/eldato-orchestrator.service"
+printf 'O=%s\n' "$RB/o2" > "$RB/home/keys.env"
+sleep 60 & RB_LATE=$!; printf '%s\n' "$RB_LATE" > "$RB/state/mainpid"
+RB_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst rb --install > "$T/rb.out" 2>&1 || RB_RC=$?
+[ "$RB_RC" -ne 0 ] && ok 'install: a heartbeat in the RESOLVED dir (not $O) does NOT certify a dead incarnation' \
+                   || bad "install: certified from the resolved dir's stale heartbeat -- the gate only looked at \$O: $(cat "$T/rb.out")"
+kill "$RB_LATE" 2>/dev/null || true
+# ...and a FRESH heartbeat there is READ as such: `--status` reports an age instead of UNREADABLE.
+printf '%s\n' "$(date +%s)" > "$RB/o2/heartbeat"
+inst rb --status > "$T/rb-status.out" 2>&1 || true
+grep -qE '^heartbeat_age_s=[0-9]+' "$T/rb-status.out" \
+  && ok 'status: reads the RESOLVED dir heartbeat (not UNREADABLE on a keys.env-repointed cell)' \
+  || bad "status: could not read the resolved dir heartbeat -- the bring-up gates CELL READY on this: $(grep -E 'heartbeat|controller=' "$T/rb-status.out" | head -3)"
+
+# An UNDATABLE MainPID fails CLOSED: the gate cannot prove the heartbeat's author, so it must not certify it.
+FC="$(arm_root fc)"; mk_systemctl "$FC/bin" "$FC/state" "$FC/sc.log"
+printf 'active\n' > "$FC/state/isactive_word"; : > "$FC/state/active"
+printf '4242\n' > "$FC/state/mainpid"                       # not a process on this box
+printf '%s\n' "$(( $(date +%s) - 100 ))" > "$FC/o/heartbeat"
+FC_RC=0; SC_PROOF=none CONTROLLER_PROOF_TIMEOUT=4 inst fc --install > "$T/fc.out" 2>&1 || FC_RC=$?
+[ "$FC_RC" -ne 0 ] && ok 'install: an UNDATABLE MainPID fails CLOSED (an unprovable age never certifies)' \
+                   || bad "install: an undatable MainPID certified the install -- the gate fails OPEN: $(cat "$T/fc.out")"
+grep -q 'cannot date MainPID' "$T/fc.out" \
+  && ok 'install: and it SAYS why it refused to treat the unit as pre-active' \
+  || bad "install: refused without naming the undatable MainPID: $(cat "$T/fc.out")"
 
 # ── a copy that supervises ANOTHER state dir is not ours to replace (review P2, #2402) ──────────────
 # `installed_units` lists only OURS, so a foreign unit at the target path was invisible to the write
