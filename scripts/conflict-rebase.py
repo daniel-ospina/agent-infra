@@ -533,34 +533,52 @@ def required_contexts(repo: str) -> list[str]:
 
 
 def checks_green(pr: dict, required: list[str]) -> bool:
-    """Every REQUIRED context reported at this head, and NONE of its attempts red.
+    """Every REQUIRED context reported at this head, and its NEWEST attempt is green.
 
-    ⛔ ALL ATTEMPTS, NOT THE LAST ONE. A re-run ADDS a check-run; the same context can
-    hold both `failure` and `success` on one head, and a last-wins dict makes the
-    verdict a function of rollup order — the fleet's known re-run/rollup class. This is
-    a required-context GREEN, so a false PASS here force-pushes under a red gate.
+    ⛔ THE NEWEST ATTEMPT DECIDES — BUT ONLY WHEN "NEWEST" IS KNOWABLE (#2698 review,
+    cycle 2, P2). Requiring EVERY attempt to be green made a PR retried once ineligible
+    forever (a re-run ADDS a check-run and does not clear the red one), so the BEHIND arm
+    was inert for exactly the population it serves. But a last-wins dict is only correct
+    if the ordering is TOTAL: `statusCheckRollup` carries `startedAt`/`completedAt` on
+    `CheckRun` and NOT on legacy `StatusContext` entries, so an ordinal of
+    `startedAt or ""` makes the verdict a function of rollup ORDER for the legacy path —
+    a newer red masked by an older green, i.e. a false green that force-pushes a rebase
+    under a red required gate. The fleet has already paid for this once (objective.py
+    records that with no database id "every check-run compared equal at 0 … the
+    newest-attempt rule was silently defeated").
+
+    So: order by timestamp where a timestamp exists; where it does not (a context whose
+    attempts carry no ordering at all, or a tie on the newest timestamp with disagreeing
+    conclusions) the answer is AMBIGUOUS and this FAILS CLOSED — every attempt at that
+    context must be green. `statusCheckRollup` also carries no app slug, so two workflows
+    publishing one job name are conflated — the rail's own stated residual, named here.
     """
     if not required:
         return False
-    # ⛔ THE NEWEST ATTEMPT DECIDES, NOT EVERY ATTEMPT (#2698 review, P1). A re-run ADDS
-    # a check-run; it does not clear the red one. Requiring EVERY attempt at a context
-    # to be green makes a PR that was retried once permanently ineligible — which is
-    # precisely the population this arm exists to serve, because a red required context
-    # is WHY a fixer retried it. Measured live on daniel-ospina/agent-infra: three
-    # MERGEABLE+BEHIND PRs carried `pipeline-compliance: CANCELLED, SUCCESS` and were
-    # skipped as "behind but not green", with the census blaming a fixer.
-    # This is the same read the rail makes and AGENTS.md prescribes: newest attempt per
-    # (workflow, job), decided by POLARITY. `statusCheckRollup` carries no app slug, so
-    # two workflows publishing one job name are still conflated — the rail's own stated
-    # residual, named here rather than silently shared.
-    newest: dict[str, tuple[str, str]] = {}
+    attempts: dict[str, list[tuple[str, str]]] = {}
     for c in pr.get("statusCheckRollup") or []:
         name = str(c.get("name") or c.get("context") or "")
         conclusion = str(c.get("conclusion") or c.get("state") or "").upper()
         when = str(c.get("startedAt") or c.get("completedAt") or "")
-        if name not in newest or when >= newest[name][0]:
-            newest[name] = (when, conclusion)
-    return all(newest.get(ctx) and newest[ctx][1] in GREEN_CONCLUSIONS for ctx in required)
+        attempts.setdefault(name, []).append((when, conclusion))
+    for ctx in required:
+        rows = attempts.get(ctx)
+        if not rows:
+            return False
+        stamped = [(w, k) for w, k in rows if w]
+        if len(stamped) == len(rows):
+            newest = max(w for w, _ in stamped)
+            top = {k for w, k in stamped if w == newest}
+            if len(top) > 1:
+                return False          # a tie on the newest attempt, disagreeing: ambiguous
+            if not GREEN_CONCLUSIONS >= top:
+                return False
+            continue
+        # At least one attempt cannot be ordered at all — the legacy-status shape.
+        # Do not let list position decide; require agreement, which is fail-closed.
+        if len({k for _, k in rows}) != 1 or not GREEN_CONCLUSIONS >= {k for _, k in rows}:
+            return False
+    return True
 
 
 def clean_record_at_head(pr: int, repo: str, head: str) -> bool:

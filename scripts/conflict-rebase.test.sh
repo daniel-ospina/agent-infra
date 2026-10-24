@@ -233,6 +233,28 @@ ck "$([ -f "$TMP/reviews/acme-widgets-201.json" ] && echo present || echo absent
 ck "$(ls "$TMP/reviews" | grep -c 'superseded')" "1" "§3b …and kept for audit as .superseded-<head>"
 has "$(cat "$TMP/fake/comment-201.md" 2>/dev/null || echo)" "Re-review is required" "§3b the comment demands the re-review it now needs"
 
+# §3c the diff could not be READ at all => "relation UNKNOWN", never "a DIFFERENT diff"
+# (#2698 review, cycle 2, P2). The arm is correct today, but what it guards is a one-line
+# `elif` ORDER: `superseded-unverified` starts with `superseded`, so a tidy that moves the
+# generic arm up silently restores a comment claiming the diff CHANGED when it was never
+# read — a false claim in the one artifact the PR's owner reads. This test pins the order.
+seed_fixture
+CLEAN_SHA="$(head_of feat/clean)"
+write_prs "[$(pr_json 301 feat/clean "$CLEAN_SHA" CONFLICTING CLEAN)]"
+printf '{"head_sha":"%s","verdict":"clean","diff_sha256":"eeee5555"}\n' "$CLEAN_SHA" >"$TMP/reviews/acme-widgets-301.json"
+# a --print-diff-hash stub that FAILS: diff_hash -> ("unavailable", "")
+cat >"$CONFLICT_REBASE_RECORD_SH" <<EOS
+#!/usr/bin/env bash
+exit 1
+EOS
+chmod +x "$CONFLICT_REBASE_RECORD_SH"
+run_bot --max 1 --interval-s 0 >/dev/null
+BODY="$(cat "$TMP/fake/comment-301.md" 2>/dev/null || echo)"
+has "$BODY" "could not be read" "§3c an unreadable diff is reported as unreadable"
+has "$BODY" "UNKNOWN" "§3c …and its relation to the record as UNKNOWN"
+ck "$(case "$BODY" in *"DIFFERENT diff"*) echo claimed-changed ;; *) echo honest ;; esac)" "honest" "§3c …and NEVER as a changed diff (the arm-order trap)"
+ck "$(ls "$TMP/reviews" | grep -c 'superseded')" "1" "§3c …and the record was still moved aside (no attestation over an unverified head)"
+
 # ═══════════════════════ §4: peer-pushing ═════════════════════════════════════
 echo "§4 a head that is not the PR's own head is refused"
 seed_fixture
@@ -480,6 +502,58 @@ PY
 write_prs "$(cat "$TMP/prs-mixed.json")"
 OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
 has "$OUT" 'behind but not green' "§18c a PR whose NEWEST attempt is red is still skipped (the pair is discriminating)"
+# ⛔ THE LEGACY-STATUS ARM (#2698 review, cycle 2, P2). `statusCheckRollup` carries
+# `startedAt` on CheckRun and NOT on StatusContext, so an ordinal of `startedAt or ""`
+# makes the verdict a function of ROLLUP ORDER for that shape — a newer red masked by an
+# older green, i.e. a false green that force-pushes a rebase under a red required gate.
+# Ambiguity must fail CLOSED: no ordering -> every attempt green, else not green.
+python3 - "$H_SHA" >"$TMP/prs-mixed.json" <<'PY'
+import json, sys
+sha = sys.argv[1]
+# Order A: green first, red second, NEITHER timestamped.
+roll = [{"context": "pipeline-compliance", "state": "SUCCESS", "targetUrl": "u"},
+        {"context": "pipeline-compliance", "state": "FAILURE", "targetUrl": "u"}]
+print(json.dumps([{"number": 1301, "headRefName": "feat/clean", "headRefOid": sha,
+                   "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND", "isDraft": False,
+                   "updatedAt": "2020-01-01T00:00:00Z", "isCrossRepository": False,
+                   "headRepository": {"nameWithOwner": "acme/widgets"}, "labels": [],
+                   "title": "feat/clean", "baseRefName": "main", "statusCheckRollup": roll}]))
+PY
+write_prs "$(cat "$TMP/prs-mixed.json")"
+OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
+has "$OUT" 'behind but not green' "§18d an UNORDERABLE context with any red attempt is not green (§18d+§18e are order-swapped)"
+# Order B: the SAME two attempts, reversed. If the verdict is a function of list position
+# these two disagree, and one of them is a false green. Both must be red.
+python3 - "$H_SHA" >"$TMP/prs-mixed.json" <<'PY'
+import json, sys
+sha = sys.argv[1]
+roll = [{"context": "pipeline-compliance", "state": "FAILURE", "targetUrl": "u"},
+        {"context": "pipeline-compliance", "state": "SUCCESS", "targetUrl": "u"}]
+print(json.dumps([{"number": 1301, "headRefName": "feat/clean", "headRefOid": sha,
+                   "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND", "isDraft": False,
+                   "updatedAt": "2020-01-01T00:00:00Z", "isCrossRepository": False,
+                   "headRepository": {"nameWithOwner": "acme/widgets"}, "labels": [],
+                   "title": "feat/clean", "baseRefName": "main", "statusCheckRollup": roll}]))
+PY
+write_prs "$(cat "$TMP/prs-mixed.json")"
+OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
+has "$OUT" 'behind but not green' "§18e …and the order-reversed twin is red too (order cannot decide)"
+# Order C: both attempts green and untimestamped -> green, so the pair above is not
+# just "legacy shape is always red".
+python3 - "$H_SHA" >"$TMP/prs-mixed.json" <<'PY'
+import json, sys
+sha = sys.argv[1]
+roll = [{"context": "pipeline-compliance", "state": "SUCCESS", "targetUrl": "u"},
+        {"context": "pipeline-compliance", "state": "SUCCESS", "targetUrl": "u"}]
+print(json.dumps([{"number": 1301, "headRefName": "feat/clean", "headRefOid": sha,
+                   "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND", "isDraft": False,
+                   "updatedAt": "2020-01-01T00:00:00Z", "isCrossRepository": False,
+                   "headRepository": {"nameWithOwner": "acme/widgets"}, "labels": [],
+                   "title": "feat/clean", "baseRefName": "main", "statusCheckRollup": roll}]))
+PY
+write_prs "$(cat "$TMP/prs-mixed.json")"
+OUT="$(run_bot --dry-run --max 2 --interval-s 0 --include-behind --json)"
+has "$OUT" '"action": "would-rebase"' "§18f an untimestamped context whose attempts ALL agree green is green"
 
 # ═══════════════════════ §19: the schedule can actually run (#2698 review P1) ═══
 # `timeout` is GNU coreutils; a Mac has none. A bare `timeout 1800 python3 …` exited 127
