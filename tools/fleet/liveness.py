@@ -70,6 +70,57 @@ working" signal is a VETO against ``wedged``, never a reason to escalate. This
 is the direction ``docs/ops/pi-idle-repl-reaper-policy.md`` already mandates
 ("no proof ⇒ not idle ⇒ never kill") applied to the diagnostic.
 
+THE REF-CLAIM REGISTRY (#1777) — WHY A LANE CAN BE LIVE AND INVISIBLE
+--------------------------------------------------------------------
+The fleet's lanes are enumerated from surfaces that all require a **transcript**:
+the cmux hook store and the session JSONL. An orchestrator lane runs
+``pi -p --no-session`` (``lane.sh`` / ``fix-one.sh`` / ``merge-one.sh``), so it
+writes **no transcript** and has **no store record** — it is in NO population
+this module can build. Measured (2026-10-15): ``lane_liveness.py`` reported
+``lanes=22`` and the live ``fix-8721`` lane was absent, while a controller
+running ``grep -l <branch> ~/.pi/agent/sessions/*/*.jsonl`` read the emptiness as
+"nobody is on it" and stated a CLEAN verdict with a live writer committing to
+the branch. That is the defect class: **an undeclared-coverage inference** — a
+surface declares the read set it consulted, never the gaps it cannot see.
+
+The durable, holder-authored record that DOES name such a lane is the
+**ref-claim**: ``refs/claims/<pr>-<sha12>``, written by
+``scripts/orchestrator-harness/claims.sh``, whose root commit's message carries
+``owner=<host>:<pid>`` and ``lease_until=<digits>``. Nothing in ``tools/fleet/``
+read it. This module now accepts it as ONE MORE EVIDENCE AXIS
+(``Evidence.claim_read``), decided inside the existing empty-candidate branch:
+
+* **a durable store answers *which* lanes exist; a process probe answers
+  *whether that incarnation is alive*** — the split #1178 mandates. The process
+table is NOT a lane population here, and a claim is never probed at all: a claim
+records no process start to fence against (``probe <pid> ""`` → rc 2
+``unusable-start-seconds``) and ``probe-argv`` returns ``holder`` for any live
+pid, so a presence-only probe would be a SECOND identity rule.
+* **every claim verdict is ``unknown``, with one of the six named reasons in
+  ``CLAIM_REASONS``** — ``claims-unreadable`` / ``no-claim-visible`` /
+  ``claim-owner-unparseable`` / ``claim-held`` / ``holder-on-foreign-box`` /
+  ``claim-holder-unverifiable``. ``claim-held`` asserts **ownership** liveness
+  only (the declared lease window, read exactly as ``claims.sh``'s
+  ``claim_acquire`` and ``orch-loop.sh``'s ``claim_live`` read it) and never
+  incarnation liveness. Adopting lease *renewal* would make the lease a process
+  signal and would contradict the recorded decision #1709 rec 3
+  (``claims.sh``: "LEASE = DATA, NOT LIVENESS") — that is a reopen, not a change
+  to make here.
+* **fail-closed, structurally:** an unreadable read cannot be read as an
+  absence (different reason), an absence cannot be read as "free" (it abstains
+  and the detail declares the gap), a FOREIGN owner's pid is never probed, and
+  ``dead`` stays unreachable for a claim because ``is_dead_evidence`` requires a
+  NON-EMPTY candidate set that a claim-shaped ``Evidence`` does not have.
+* **the existing ladder is untouched.** The claim branch is inside
+  ``if not cands:`` — it refines the ``no-holder-record`` abstention and cannot
+  override session evidence, so the ordering above still holds and a
+  growing-transcript lane still reads ``running-quiet/jsonl-grew``. A pinned
+  test asserts the claim logic is INERT when ``claim_read is None``.
+
+Acquisition lives in the sibling ``claim_lanes.py`` (a driver, never a second
+opinion); why a lane can be live and invisible, and the recovery procedure, are
+documented in ``docs/ops/fleet-liveness.md``.
+
 THE CONTRACT, AS FORMAL CONDITIONS (each re-derived, not paraphrased)
 ---------------------------------------------------------------------
 * **``wedged`` requires a POSITIVELY OPEN turn** (#1254): frozen past the
@@ -141,6 +192,10 @@ __all__ = [
     "Tool",
     "Record",
     "Turn",
+    "Claim",
+    "ClaimRead",
+    "CLAIM_REASONS",
+    "claim_verdict",
     "Evidence",
     "Verdict",
     "CALL_DISCARDING_STOP_REASONS",
@@ -386,6 +441,82 @@ class Turn:
     abstain: bool = False
 
 
+@dataclass(frozen=True)
+class Claim:
+    """ONE row of the fleet's ref-claim registry (#1777).
+
+    A **ref-claim** is ``refs/claims/<pr>-<sha12>`` — a git ref whose root commit's
+    message carries ``owner=<host>:<pid>`` and ``lease_until=<digits>``. That
+    namespace carries TWO more key shapes as well — ``refs/claims/issue-<N>``
+    (``claim_issue_key``) and the landing key ``refs/claims/pr-<N>``
+    (``claim_pr_key``); ``kind`` names which shape a row is (``issue`` / ``foreign``
+    for those two), because neither is HEAD-scoped and neither may answer for a
+    head. This is
+    the *durable, holder-authored* record of who holds a PR head, and it is the
+    ONLY record that can name an orchestrator lane: ``fix-one.sh`` / ``merge-one.sh``
+    spawn ``pi -p --no-session``, so those lanes write **no transcript** and have
+    **no cmux hook record**. Do not confuse it with the other shipped sense of
+    "claim" — the *comment-claim* (a GitHub issue comment a lane takes ownership
+    with, read by the product repo's pre-flight) — nor with the product repo's
+    own registry vocabulary.
+
+    Fields are DATA, never a verdict: this dataclass asserts nothing about a
+    process. ``lease_state`` is ``live``/``expired``/``unknown`` where
+    ``unknown`` (an absent, ``0``, non-digit, or >18-digit value) is deliberately
+    **NOT expired** — the fleet's own conservative polarity (``claims.sh``'s
+    ``claim_acquire``/``claim_prune`` and ``orch-loop.sh``'s ``claim_live`` all
+    treat an unparseable lease as live, and a *tighter* reading here would
+    re-create the two-readers-disagree defect those sites document).
+    """
+
+    ref: str = ""
+    key: str = ""            # "<pr>-<sha12>" — the content address (HEAD-scoped)
+    pr: str = ""
+    sha12: str = ""
+    # ⛔ THREE KEY SHAPES SHARE ``refs/claims/`` (see ``claim_lanes.parse_key``): the
+    # HEAD key ``<pr>-<sha12>`` (``claim_key``), the ISSUE key ``issue-<N>``
+    # (``claim_issue_key``) and the LANDING key ``pr-<N>`` (``claim_pr_key``, #1952).
+    # ``kind`` is ``head`` | ``issue`` | ``foreign``; ONLY a ``head`` key is
+    # HEAD-scoped, so only it may answer a ``--sha`` query. Without this field
+    # ``issue-1850`` parses as ``pr="issue", sha12="1850"`` and a short
+    # ``--sha 1850`` reads a held head nobody holds.
+    kind: str = "head"
+    issue: str = ""         # the issue number, for ``kind == "issue"``
+    owner: str = "?"         # as written; "<host>:<pid>"; "?" when unreadable
+    owner_host: str = ""
+    owner_pid: Optional[int] = None
+    lease_until: Optional[int] = None
+    lease_state: str = "unknown"   # live | expired | unknown
+    scope: str = "unknown"         # local | foreign | unknown
+    commit: str = ""               # the claim commit sha (the fence value)
+    age_s: Optional[int] = None    # claim age, from the (pusher-minted) committer date
+
+
+@dataclass(frozen=True)
+class ClaimRead:
+    """The result of reading the ref-claim registry — an ABSENCE-AWARE read.
+
+    ``readable`` is the load-bearing field: ``False`` means the namespace could
+    not be consulted at all (git failed / authenticated off / timed out / missing;
+    or a snapshot that is missing, stale, or shape-drifted). An unreadable read
+    must NEVER be collapsed into "no claims" — that collapse is the false-free
+    this evidence exists to remove.
+
+    ``present`` is False only for a SUCCESSFUL read that returned zero refs.
+    ``claims`` therefore being empty is meaningful only when ``readable`` is True.
+    ``siblings`` names the other HEAD keys seen for a queried PR: the key is
+    HEAD-scoped, so an absent key is not the same as a free PR, and naming the
+    siblings is how the read declares that gap.
+    """
+
+    readable: bool = False
+    present: bool = False
+    claims: Tuple[Claim, ...] = ()
+    siblings: Tuple[str, ...] = ()
+    source: str = ""
+    detail: str = ""
+
+
 @dataclass
 class Evidence:
     """Everything a verdict may rest on. Absent fields are ``None``/defaults."""
@@ -402,6 +533,10 @@ class Evidence:
     jsonl_turn: Optional[Turn] = None
     tool: Optional[Tool] = None
     record: Optional[Record] = None
+    # The ref-claim registry read (#1777). None for every session-lane caller:
+    # the claim logic is reachable ONLY when a caller explicitly supplies it, so
+    # the existing verdict ladder is unchanged (pinned by a test + mutation).
+    claim_read: Optional[ClaimRead] = None
     now_ms: int = 0
     idle_ms: int = IDLE_MS
     record_veto_ms: int = RECORD_VETO_MS
@@ -630,8 +765,122 @@ def observed_from_probe(rc: int, status: str) -> str:
     return "unreadable"
 
 
+# ── the ref-claim registry (#1777) ───────────────────────────────────────
+# The six reasons a claim-shaped query may return. ALL of them are `unknown`:
+# true — and that is the design, not a shortfall. The five-state vocabulary has
+# no state meaning "a declared owner exists but I cannot see the process", and
+# `running-quiet` would make `liveness.py`'s CLI exit **0** for a claim query
+# (`return 0 if verdict.state != "unknown" else 3`) — the one mapping a future
+# exit-code consumer could read as a green light. `unknown` cannot be read that
+# way, and the reason carries the meaning.
+#
+# WHY A CLAIM IS NEVER PROBED (measured, not assumed):
+#   `bash scripts/lib/pid-identity.sh probe <live pid> ""` -> rc 2
+#   `unusable-start-seconds` (a claim records no process start to fence against),
+#   and `probe-argv <pid>` returns `holder` for ANY live pid (pure presence, no
+#   identity claim). A presence-only probe mode would therefore be a SECOND
+#   identity rule — the "two contracts for one safety rule" defect #1178 exists
+#   to remove. So a claim asserts OWNERSHIP liveness and never incarnation
+#   liveness, and `Verdict.holder_pid` is never set on a claim verdict.
+CLAIM_REASONS = (
+    "claims-unreadable",
+    "no-claim-visible",
+    "claim-owner-unparseable",
+    "claim-held",
+    "holder-on-foreign-box",
+    "claim-holder-unverifiable",
+)
+
+# Fixed disclosure appended to the absence reason. The incident's live lane
+# (a fixer committing to `fix/7951-atomic-write-outbox`) was read as "free" from
+# an absence inference; this sentence is the reason the read can no longer be
+# read that way.
+NO_CLAIM_DISCLOSURE = (
+    "key is HEAD-scoped and the registry is transient: refs are DELETED on release "
+    "and PRUNED on expiry, and fix-one.sh releases its claim before merge-one.sh "
+    "re-claims the new head (a designed no-claim window inside a live lane) — "
+    "absence of a claim is NOT freedom"
+)
+
+
+def _claim_detail(claim: Optional[Claim]) -> str:
+    """Owner identity, lease and age as NON-liveness detail.
+
+    The issue's ask is that a holder be *reported* with its owner pid and age;
+    the owner identity therefore rides here rather than in ``holder_pid``, so
+    "who holds this?" is answered without any consumer reading the field as a
+    verified incarnation. The age comes from the claim commit's committer date,
+    which is pusher-minted, so it is shown as non-liveness detail only — and it is
+    omitted (never invented) when the read had no commit to date (a snapshot).
+    """
+    if claim is None:
+        return ""
+    parts = ["owner=%s" % (claim.owner or "?")]
+    if claim.lease_until is not None:
+        parts.append("lease_until=%d" % claim.lease_until)
+    parts.append("lease=%s" % claim.lease_state)
+    if claim.age_s is not None:
+        parts.append("age_s=%d" % claim.age_s)
+    parts.append("scope=%s" % claim.scope)
+    if claim.ref:
+        parts.append("ref=%s" % claim.ref)
+    return " ".join(parts)
+
+
+def claim_verdict(cr: ClaimRead) -> Verdict:
+    """The claim half of the abstention. Pure, total, and mutually exclusive.
+
+    A DECLARED ordered cascade — the first matching rung wins, and the last is a
+    catch-all, so the six reasons partition every readable/unreadable input. The
+    order is the safety property: an unreadable read can never be read as an
+    absence, and an absence can never be read as "free".
+
+    Called ONLY from ``evaluate``'s existing empty-candidate-set branch, so a
+    claim can never override a session verdict and can never reach ``dead``:
+    ``is_dead_evidence`` requires a NON-EMPTY candidate set, and a claim-shaped
+    ``Evidence`` carries none (C4's vacuity guard, #1178).
+    """
+    if not cr.readable:
+        return Verdict("unknown", "claims-unreadable",
+                       detail=cr.detail or ("source=%s" % (cr.source or "unknown")))
+    if not cr.claims:
+        detail = NO_CLAIM_DISCLOSURE
+        if cr.siblings:
+            detail += "; claims exist for other heads of this PR: %s" % ", ".join(cr.siblings)
+        return Verdict("unknown", "no-claim-visible", detail=detail)
+    if any(c.scope == "unknown" for c in cr.claims):
+        bad = next(c for c in cr.claims if c.scope == "unknown")
+        return Verdict("unknown", "claim-owner-unparseable",
+                       detail="%s (owner string unusable)" % _claim_detail(bad))
+    held = [c for c in cr.claims if c.lease_state in ("live", "unknown")]
+    if held:
+        # OWNERSHIP liveness only — the declared lease window is open. This
+        # asserts nothing about the holder's process (see the header note).
+        return Verdict("unknown", "claim-held",
+                       detail="%s (declared ownership window; process liveness not asserted)"
+                              % _claim_detail(held[0]))
+    foreign = [c for c in cr.claims if c.scope == "foreign"]
+    if foreign:
+        # A foreign owner's pid is NOT probeable here (measured: agent-infra's
+        # live refs are `owner=cmux:<pid>` while this host is
+        # `Daniels-MacBook-Air-new`), and probing one is actively wrong: a local
+        # pid collision can read `absent`, and `absent` is a death witness.
+        return Verdict("unknown", "holder-on-foreign-box",
+                       detail="%s (foreign owner is never probed locally)" % _claim_detail(foreign[0]))
+    return Verdict("unknown", "claim-holder-unverifiable",
+                   detail="%s (no open lease; no probeable incarnation)" % _claim_detail(cr.claims[0]))
+
+
 def evaluate(ev: Evidence) -> Verdict:
-    """The verdict function. Pure: no I/O, no clock, no signals."""
+    """The verdict function. Pure: no I/O, no clock, no signals.
+
+    ORDERING IS THE SAFETY PROPERTY, and this function's ordering is unchanged by
+    the claim evidence: a claim is decided ONLY inside the existing empty-candidate
+    branch (step 2's ``if not cands``), i.e. where the ladder had nothing to go on.
+    A claim-bearing query that also carries a growing transcript still reads
+    ``running-quiet/jsonl-grew``; a claim can never override session evidence and
+    can never reach ``dead`` (see ``claim_verdict``).
+    """
     # (0) Evidence availability. A failed read abstains with a NAMED reason —
     #     never a guessed verdict, and never `dead` (C3, T12).
     if not ev.ps_ok:
@@ -665,6 +914,10 @@ def evaluate(ev: Evidence) -> Verdict:
         if not cands:
             # C4 — an empty candidate set is an abstention, exactly where the
             # reviewed kill path abstains (`SKIP incarnation-unmatched`).
+            # #1777: a ref-claim read REFINES this abstention — it never precedes
+            # the ladder, so no session verdict can be overridden by a claim.
+            if ev.claim_read is not None:
+                return claim_verdict(ev.claim_read)
             return Verdict("unknown", "no-holder-record")
         # At least one candidate ABSTAINED (off-fence / unreadable) and there is
         # no fenced holder. C1: that is an uncertainty, never a death witness.
