@@ -286,6 +286,12 @@ export HARNESS_REPO="$INFRA" GIT_STUB_REAL=1
 # in BR_RC and combined output in BR_OUT, exactly as cloud-cell-supervisor.test.sh does.
 BR_RC=0; BR_OUT=''
 br() {
+  # ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} is expanded UNQUOTED on purpose (it carries `NAME=value` pairs), so a
+  # value with whitespace would make `env` treat the remaining words as the command: the bring-up never
+  # runs, `env` exits 127, and an arm asserting only a non-zero rc passes VACUOUSLY. Refuse it here.
+  case "${BR_EXTRA_ENV:-}" in
+    *[[:space:]]*) echo "fixture: BR_EXTRA_ENV must not contain whitespace (got '$BR_EXTRA_ENV')" >&2; exit 1 ;;
+  esac
   # ⛔ HERMETIC FROM THE BOX (measured on a fresh CI runner, 2026-10-24). Every ambient repo variable is
   # CLEARED here, because the disk-reaper installer falls back to them when nothing tells it which repo
   # to scan: with $AGENT_INFRA_PATH exported by a developer's shell the install succeeded locally while
@@ -297,7 +303,11 @@ br() {
   # dies there - measured 2026-10-24, where the GH_REPO-ordering arm asserted an `ok: gh login` line the
   # CI run never reached (the key it needed came from the author's shell, not from the fixture). An arm
   # that needs a key must pass one explicitly (`BR_EXTRA_ENV=...`), so no arm silently inherits one.
-  BR_OUT="$(env -u AGENT_INFRA_PATH -u TORTOISE_REPO -u DISK_REAPER_REPOS -u DEEPSEEK_API_KEY \
+  # BOTH provider keys the bring-up accepts (`cloud-cell-bringup.sh`: it refuses only when NEITHER is
+  # set), so an ambient `ANTHROPIC_API_KEY` cannot stand in for the fixture's either — measured: with
+  # only that key ambient, the pre-fix ordering arm PASSED locally for the wrong reason.
+  BR_OUT="$(env -u AGENT_INFRA_PATH -u TORTOISE_REPO -u DISK_REAPER_REPOS \
+            -u DEEPSEEK_API_KEY -u ANTHROPIC_API_KEY \
             PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
             CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
             GH_TOKEN_FILE="$TOK" GH_STUB_MODE="$1" CURL_STUB_MODE="$2" \
@@ -933,8 +943,9 @@ say_case "an OPERATOR-SHELL GH_REPO is DROPPED even when keys.env is ABSENT"
 # first cut only ran it AFTER sourcing, and a missing keys.env is a supported non-fatal path — so on
 # exactly the arm with no file to blame, an operator shell's sticky `GH_REPO` survived and every
 # check below graded another repo. Nothing in the suite covered it: every `br …` case writes
-# $T/keys.env first. Assert the DROP line on the no-file arm (the run still refuses later for the
-# missing provider key — the ORDERING is what proves the drop happened before any check ran).
+# $T/keys.env first. Assert the DROP line on the no-file arm (the run still refuses later, at
+# check_operational_layer in this fixture — the ORDERING is what proves the drop happened before any
+# check ran). The provider key comes from the operator shell this arm models, via BR_EXTRA_ENV.
 rm -f "$T/absent.env"
 # A PROVIDER KEY FROM THE OPERATOR SHELL, WHICH IS THIS ARM'S WHOLE PREMISE (no keys.env at all):
 # without one the run stops at `check_provider` and never reaches a repo-reading check, so the ordering
