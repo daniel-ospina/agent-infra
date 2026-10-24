@@ -2142,11 +2142,44 @@ printf 'cell-1\tbash %s\t\ncell-2\tbash %s\t\n' "$TMP/box-cur.sh" "$TMP/box-dead
   > "$O/state/boxes.tsv"
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
-ck "§27 a mixed fleet with every PROBED box on the pin says so, not 'NOT all: <none>'" \
-   "$(qF 'every PROBED box is on the pin' "$MDF" && nq 'NOT all: <none>' "$MDF" \
+ck "§27 a mixed fleet with every PROBED box on the pin states NO 'NOT all' clause" \
+   "$(nq 'NOT all' "$MDF" && qF '1/1 PROBED box(es) run this cycle' "$MDF" \
       && qF '1 box(es) gave no answer' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and the READINGS state the partial count, not 'not compared'" \
    "$(qF '(1 of 2 box(es) gave no answer)' "$MDF" && nq 'not compared' "$MDF" && echo 0 || echo 1)"
+# ⛔ ...and an EMPTY controller is an UNREAD answer, not a stopped box: `readable` comes from the
+# `harness:` line alone, so a status command that never answers the controller question used to get a
+# `deployed-but-NOT-activated — controller=<unread>` verdict the read did not support.
+printf 'harness: %s [current] source=pin\nroles: idle\n' "$MAIN12" > "$FX/box.noctrl.txt"
+cat > "$TMP/box-noctrl.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.noctrl.txt"
+STUB
+chmod +x "$TMP/box-noctrl.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-noctrl.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a box that never answered the controller is UNPROVEN, not 'not activated'" \
+   "$(qF 'UNPROVEN controller=UNREADABLE' "$MDF" && nq 'deployed-but-NOT-activated' "$MDF" \
+      && echo 0 || echo 1)"
+# ⛔ AND A **VERIFIED** ATTEMPT IS NOT OUR DAMAGE. The ledger records every dispatch, including the
+# ones that ended `VERIFIED … controller=RUNNING`; counting those as failures inverted the sentence
+# a second time (a successful activation followed by an operator's stop read as the arm's own damage).
+printf 'cell-1\t%s\t%s\t%s\tVERIFIED harness=%s [current] controller=RUNNING\n' \
+  "${OTHER:0:12}" "${MAIN12}" "$(date +%s)" "$MAIN12" > "$O/state/merge-reminder.deploys"
+printf 'harness: %s [current] source=pin\ncontroller: STOPPED\nroles: idle\n' \
+  "$MAIN12" > "$FX/box.stopped3.txt"
+cat > "$TMP/box-stopped3.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.stopped3.txt"
+STUB
+chmod +x "$TMP/box-stopped3.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-stopped3.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a VERIFIED activation followed by a stop reads as an operator's stop" \
+   "$(qF 'VERIFIED and the controller has been stopped since (an operator' "$MDF" \
+      && nq 'did not verify' "$MDF" && echo 0 || echo 1)"
 
 # ⛔ AND THE ARM'S OWN FAILED ACTIVATION IS NAMED, not excused as an operator's stop: the ledger
 # holds the attempt at this pin, so "it cannot tell" was a false limitation.

@@ -2008,10 +2008,12 @@ by `apply` BEFORE `start`. When the BEFORE read carries no pid at all (a box one
 older status command), a restart cannot be proven and the deploy is `UNVERIFIED` — never a fallback
 to "any pid", which would accept exactly the pre-existing controller the rule excludes. ⛔ A box
 whose pin agrees but whose controller is not RUNNING is `deployed-but-NOT-activated`, never
-`current`: the arm does not start it, and it says WHICH state it found — `OUR last activation
-of this box did not verify` when the ledger holds an attempt at this pin (the arm's own damage,
-from a `stop → apply → start` whose `start` failed), `no activation is recorded at this pin`
-otherwise (an operator's stop). Calling that row `current` made the table contradict the goals
+`current`: the arm does not start it, and it reads the LEDGER's last verdict — `our activation
+at this pin VERIFIED and the controller has been stopped since (an operator's stop)` when that
+row says VERIFIED, `OUR last activation of this box did not verify (N unverified attempt(s);
+last verdict: …)` otherwise, and `no activation of this box is recorded at this pin` when the
+ledger is empty. A status command that never answered the controller question is
+`UNPROVEN controller=UNREADABLE`, never `deployed-but-NOT-activated`. Calling that row `current` made the table contradict the goals
 block one section above it, which reads the same box as `MARKERS-BROKEN — controller=STOPPED`. The boxes are an
 inventory (`$O/state/boxes.tsv`: `name<TAB>status-cmd<TAB>activate-cmd`), so a cell is driven through
 whatever remote path that box already uses — no new control surface is invented here.
@@ -2080,7 +2082,7 @@ is still matched by its script path, and that legacy fallback is the only place 
 abstention (exit 3) that rewrites nothing, rather than an empty crontab it would overwrite.
 
 **Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§28,
-272 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+274 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
 unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
 how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
 -l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the

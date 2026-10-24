@@ -971,8 +971,14 @@ REAP_STALE_S = 300
 DEPLOY_MAX_ATTEMPTS = 3
 
 
-def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int]:
-    """-> (attempts recorded for this box TOWARDS `to`, epoch of the LAST one).
+def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int, str]:
+    """-> (attempts recorded for this box TOWARDS `to`, epoch of the LAST one, that row's VERDICT).
+
+    ⛔ THE VERDICT IS PART OF THE ANSWER. Every dispatched attempt is recorded, including ones that
+    ended `VERIFIED … controller=RUNNING`, so "an attempt exists at this pin" is NOT "our last
+    activation failed": a successful activation followed by an OPERATOR's stop is a different history,
+    and reporting it as the arm's own damage is the same inversion (in the other direction) that this
+    reading exists to prevent. Rows whose verdict is `VERIFIED` are not counted as failures.
 
     ⛔ A DEPLOY NEEDS A BOUND AS MUCH AS A MERGE DOES. Without one, a box that cannot reach
     `origin/main` — pinned `ahead` of it, `diverged` from it, or with an `apply` that never advances
@@ -991,8 +997,8 @@ def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int]:
     try:
         text = read_artifact(p)
     except (OSError, ValueError):
-        return 0, 0
-    n, last = 0, 0
+        return 0, 0, ""
+    n, last, last_verdict = 0, 0, ""
     to12 = to[:12]
     for line in text.splitlines():
         # ⛔ TAB, NOT SPACE: a box name is human-authored (`name<TAB>status<TAB>activate`) and may
@@ -1000,12 +1006,16 @@ def deploy_attempts(o: Path, box: str, frm: str, to: str) -> tuple[int, int]:
         # never bind for that box and it would be restarted every cycle.
         parts = line.split("\t")
         if len(parts) >= 4 and parts[0] == box and parts[2] == to12:
-            n += 1
+            verdict = (parts[4] if len(parts) > 4 else "").strip()
             try:
-                last = max(last, int(parts[3]))
+                epoch = int(parts[3])
             except ValueError:
                 continue
-    return n, last
+            if epoch >= last:
+                last, last_verdict = epoch, verdict
+            if not verdict.startswith("VERIFIED"):
+                n += 1
+    return n, last, last_verdict
 
 
 def record_deploy(o: Path, box: str, frm: str, to: str, verdict: str) -> bool:
@@ -1107,13 +1117,28 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                     # limitation — it kept the arm's OWN damage (a `stop -> apply -> start` whose apply
                     # advanced the pin and whose start failed) reading as an operator's intent, which is
                     # the one case a human most needs named.
-                    n_dep, _last_dep = deploy_attempts(o, name, d["harness"], main_sha)
+                    if not d["controller"]:
+                        # ⛔ AN EMPTY CONTROLLER IS AN UNREAD ANSWER, NOT A STOPPED ONE. `readable` is
+                        # set by the `harness:` line alone, so a status command that never answers the
+                        # controller question used to produce `deployed-but-NOT-activated —
+                        # controller=<unread> is not RUNNING`, a verdict the read did not support — while
+                        # the sibling rule for roles is REFUSE(roles=UNREADABLE).
+                        entry["verdict"] = ("UNPROVEN controller=UNREADABLE — the status command did "
+                                            "not answer whether the box is running, so this arm cannot "
+                                            "say it is deployed-and-activated")
+                        results.append(entry)
+                        continue
+                    n_dep, _last_dep, last_verdict = deploy_attempts(o, name, d["harness"], main_sha)
                     entry["verdict"] = (
                         f"deployed-but-NOT-activated — harness {d['harness'][:12]} [current] is the "
-                        f"pin; controller={d['controller'] or '<unread>'} is not RUNNING. "
-                        + (f"OUR last activation of this box did not verify ({n_dep} attempt(s) "
-                           f"recorded); a human must confirm the box state before this arm touches it "
-                           f"again"
+                        f"pin; controller={d['controller']} is not RUNNING. "
+                        + ("our activation at this pin VERIFIED and the controller has been stopped "
+                           "since (an operator's stop — this arm does not restart it)"
+                           if last_verdict.startswith("VERIFIED") else
+                           f"OUR last activation of this box did not verify "
+                           f"({n_dep} unverified attempt(s); last verdict: "
+                           f"{last_verdict or '<none>'}) — a human must confirm the box state before "
+                           f"this arm touches it again"
                            if n_dep else
                            "no activation of this box is recorded at this pin, so this arm cannot tell "
                            "an operator's stop from its own failed activation and does not start it"))
@@ -1154,9 +1179,10 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                 # does not start the box — and it says WHICH one the ledger suggests. (A `stop ->
                 # apply -> start` chain whose `apply` failed leaves the cell DOWN; reporting that as
                 # "the operator stopped it" would bury the arm's own damage.)
-                n, _last = deploy_attempts(o, name, d["harness"], main_sha)
-                why = (f" — our last activation of this box did not verify ({n} attempt(s) recorded); "
-                       f"a human must confirm the box state before this arm touches it again"
+                n, _last, last_verdict = deploy_attempts(o, name, d["harness"], main_sha)
+                why = (f" — our last activation of this box did not verify ({n} unverified "
+                       f"attempt(s); last verdict: {last_verdict or '<none>'}); a human must confirm the "
+                       f"box state before this arm touches it again"
                        if n else
                        " — this arm cannot tell an operator's stop from its own failed activation, "
                        "so it does not start it")
@@ -1176,7 +1202,7 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                                     "covers BOTH arms)")
                 results.append(entry)
                 continue
-            attempts, last_try = deploy_attempts(o, name, d["harness"], main_sha)
+            attempts, last_try, _lv = deploy_attempts(o, name, d["harness"], main_sha)
             if attempts >= DEPLOY_MAX_ATTEMPTS:
                 entry["verdict"] = (f"REFUSE(deploy-attempts={attempts} at harness="
                                     f"{d['harness'][:12] or '<none>'}) — this box has not reached "
@@ -2077,11 +2103,11 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         # ⛔ "NOT all: <none>" IS A VERDICT WITH NO DATUM, contradicted by its own complete fraction —
         # and one unreachable cell with the rest on the pin is the COMMON degradation, so that clause is
         # the one the owner reads most often.
-        bad_clause = (f" — NOT all: {bad_names}. " if measured_bad
-                      else " — every PROBED box is on the pin. ")
+        # ⛔ "every PROBED box is on the pin" RESTATED the fraction one clause earlier (N/N), and put a
+        # period before an em-dash clause. When every probed box is on the pin there is nothing to add.
+        bad_clause = f" — NOT all: {bad_names}" if measured_bad else ""
         head = (f"**Goal 2 (harness autonomy):** {len(currents)}/{len(measured)} PROBED box(es) run "
-                f"this cycle's main, deployed and activated."
-                f"{bad_clause}"
+                f"this cycle's main, deployed and activated{bad_clause}. "
                 # \u26d4 THE COUNT IS IN THE SENTENCE, SO THE REASON IS THE FACT AND NOT A SECOND COUNT.
                 # "1 box(es) did not answer (1 box(es) did not answer)" was the duplication this
                 # sentence shipped with for one round.
