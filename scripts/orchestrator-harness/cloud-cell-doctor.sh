@@ -1953,8 +1953,15 @@ run_doctor() {
     # "controller restarted" from a start that answered "already running", and a WEDGED controller —
     # alive, heartbeat stale — was never reported: the one signal that tells "dispatches nothing" from
     # "idle" was dead on exactly the box shape this PR creates.
-    log "[doctor] controller is up WITHOUT a tmux session (service-managed) — evaluating its heartbeat instead of restarting it"
-    controller_heartbeat_verdict "the controller (service-managed)"
+    # ⛔ THE LABEL MUST NOT CLAIM MORE THAN THE READ (review P2 round 19, #2402 / C). `service_controller_present`
+    # proves a LIVE, lock-owning controller with no session — not that a unit supervises it. This file reads no
+    # unit here, so an orphaned controller that outlived its session (the shape `cmd_stop` documents), or a box
+    # after `--uninstall`, was logged as "service-managed": supervision asserted from a lock, the
+    # "claim nobody measured" shape this PR removes elsewhere. The substance (evaluate the heartbeat, do not
+    # restart a live controller) is unchanged; the authoritative supervision read is `cmd_status`'s
+    # `supervision:` row, which is not consulted on this path.
+    log "[doctor] controller is up WITHOUT a tmux session — evaluating its heartbeat instead of restarting it (this read proves the CONTROLLER; whether a unit supervises it is decided by the rc-4/rc-5 arms, not here)"
+    controller_heartbeat_verdict "the controller (no session)"
   elif [ "$dry" = "--dry-run" ]; then
     log "[doctor] WOULD restart the controller (tmux '$SESSION' absent, cell is started)"
     result="$result; would restart controller"
@@ -2005,7 +2012,7 @@ run_doctor() {
         # is what made a keyless cell retry forever with every surface reading supervised). Honouring it is
         # NOT a failed pass: the stop is the decision, and a failed unit is handled by the rc-5 arm above —
         # which is why this message no longer claims "a start limit that converged to failed" as well.
-        log "[doctor] controller restart NOT launched — the service manager owns ${CONTROLLER_UNIT:-the controller unit} and reports it not active (a deliberate stop, or a start limit that converged to failed); a human 'cloud-cell-supervisor.sh start' re-arms it"
+        log "[doctor] controller restart NOT launched — the service manager owns ${CONTROLLER_UNIT:-the controller unit} and reports it not active (a deliberate stop); a human 'cloud-cell-supervisor.sh start' re-arms it"
         result="$result; controller restart not launched (service-managed, unit not active)"
       else
         log "[doctor] controller restart FAILED (supervisor start rc=$rc) — see $O/logs/doctor.log"
