@@ -434,6 +434,12 @@ CONTROLLER_UNIT_IN="${CONTROLLER_UNIT:-}"
 SYSTEMCTL_IN="${SYSTEMCTL:-}"
 CONTROLLER_SYSTEM_UNIT_DIR_IN="${CONTROLLER_SYSTEM_UNIT_DIR:-}"
 CONTROLLER_USER_UNIT_DIR_IN="${CONTROLLER_USER_UNIT_DIR:-}"
+# ⛔ AND `PS_BIN` BELONGS TO THE FAMILY TOO (review P1 round 19, #2402 / B). It is read at CALL time by
+# `_proc_start_epoch`, and its answer (`_proc_began_after`) is what decides which pids `stop` may signal.
+# A pushed `PS_BIN` stub forges the age rule: a recycled pid that merely LOOKS like `<shell> <…/orch-loop.sh>`
+# is then classified as the lock owner and gets TERM/KILL — the peer-repo controller that rule exists to
+# protect. Absent a caller value the restored state is "unset" = the real `/bin/ps` default.
+PS_BIN_IN="${PS_BIN:-}"
 source_env_file
 ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
 ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
@@ -446,8 +452,17 @@ ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
 # exists to prevent, now reachable from keys.env instead of from the caller's shell.
 [ -z "$CONTROLLER_INVOKER_HOME_IN" ]     || CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"
 SYSTEMCTL="$SYSTEMCTL_IN"
-[ -z "$CONTROLLER_SYSTEM_UNIT_DIR_IN" ]  || CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
-[ -z "$CONTROLLER_USER_UNIT_DIR_IN" ]    || CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+# ⛔ THESE TWO ARE RE-ASSERTED UNCONDITIONALLY, WHICH IS THE WHOLE POINT (review P1 round 19, #2402 / B).
+# The timeout siblings above use `[ -z "$_IN" ] ||` because an UNSET one legitimately comes from the env
+# file (tmux mode has no unit to provide it). A unit DIRECTORY has no such reading: its default is computed
+# downstream (`${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}`), so "unset" is the CORRECT restored
+# state, and the conditional form left the keys.env value in force — the fence was inert in production,
+# where the unit renders no such variable and every caller supplies nothing. Reproduced: a keys.env line
+# `CONTROLLER_SYSTEM_UNIT_DIR=/tmp/nowhere` hid the installed unit with 0 systemctl calls and `stop`
+# printing "not running", which is the exact false pass the fence was added to close.
+CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
+CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+PS_BIN="$PS_BIN_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -675,6 +690,12 @@ controller_user_unit_dirs() {
   local h
   [ -n "${CONTROLLER_USER_UNIT_DIR:-}" ] && printf '%s\n' "$CONTROLLER_USER_UNIT_DIR"
   h="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  # ⛔ A MISSING `getent` MUST NOT FAIL SILENTLY (review P2 round 19, #2402 / B). The passwd home is the
+  # candidate the doctor's `HOME=$CELL_HOME` session depends on; without `getent` it would simply disappear
+  # from the list and re-open the duplicate-dispatcher defect with no diagnostic anywhere. stderr only —
+  # stdout is a list.
+  command -v getent >/dev/null 2>&1 \
+    || printf '%s\n' "cloud-cell-supervisor: getent not found — the passwd-home unit lookup is unavailable on this box, so a reader whose HOME is not the installer's may miss the unit" >&2
   h="$(passwd_home "$(id -u)")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   h="$(passwd_home "${SUDO_USER:-}")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   return 0
