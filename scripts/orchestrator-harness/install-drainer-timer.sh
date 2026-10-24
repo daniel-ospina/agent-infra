@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# install-drainer-timer.sh — put the ai-drainer on a CELL's clock (systemd).
+#
+# ── THE LINUX CHOICE, STATED ONCE ─────────────────────────────────────────────────────────────────
+# A cell has no launchd. It has exactly two scheduling mechanisms today, and this installer uses one
+# of them rather than inventing a third:
+#   1. `cloud-cell-doctor.sh loop` — the supervisor's ROLE loop (doctor/reap/merge/hygiene), started
+#      by `cloud-cell-supervisor.sh start`;
+#   2. systemd timers — `install-disk-reaper-timer.sh` renders templates/systemd/* and
+#      `systemctl enable --now`s them (with a passwordless-sudo system unit, else a user unit).
+#
+# The drainer is scheduled by (2), NOT added as a fifth role. IN ONE SENTENCE WHY: the drainer's lock
+# must OUTLIVE its own pass — it waits for the LANE it dispatched (up to LANE_TIMEOUT=3000s) — so as a
+# role it would block the loop that also runs merge and doctor, and the loop's own stall bound would
+# fire on a HEALTHY drainer; and the backlog it drains may belong to a repo the cell's controller is
+# not bound to at all. See templates/systemd/eldato-ai-drainer.service for the full reasoning (and
+# for why the bring-up does not install it: a lane dispatcher is per-repo and costs model spend, so
+# it is an explicit, per-cell operator step, exactly like the disk reaper's arming).
+#
+# ⛔ IT IS AN INSTALLER AND NOT A LINE IN THE BRING-UP, for the same reason
+# install-disk-reaper-timer.sh is: the artifact must be rendered from machine state (HOME, PATH, the
+# state dir, the checkout the script runs from) and installed idempotently. One place renders and
+# converges; everything else calls it.
+#
+# Usage:
+#   install-drainer-timer.sh [--install] [--dry-run] [--status] [--uninstall] [--help]
+#
+# Env seams (tests + unusual cells):
+#   DRAINER            the entry point the unit runs   default: this checkout's
+#                      scripts/orchestrator-harness/ai-drainer.sh, else the farmed copy in
+#                      $HOME/.pi/agent/scripts/ (a cell has no ~/Documents checkout, TCC aside)
+#   DRAINER_O          controller runtime dir the pass reads ($O)      default: $HOME/orchestrator
+#   DRAINER_STATE      the drainer's state dir ($AI)                   default: $HOME/orchestrator-ai
+#   DRAINER_REPO_SLUG  owner/name the brief names                      default: daniel-ospina/agent-infra
+#   DRAINER_SEED_REPO  checkout the lane's worktree is branched from    default: $HOME/agent-infra-main
+#   TEMPLATES_DIR      template dir (default: this repo's templates/systemd)
+#   SYSTEMD_UNIT_DIR   install dir OVERRIDE (tests: a temp dir with SYSTEMCTL a fake)
+#   SYSTEMCTL          `systemctl` to call  default: user manager if it answers, else `sudo -n systemctl`
+#   SUDO               sudo probe           default: `sudo -n`
+#
+# Exit codes: 0 ok · 1 failure (named) · 2 usage.
+set -uo pipefail
+
+INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/systemd}"
+UNIT_SRC_SERVICE="eldato-ai-drainer.service"
+UNIT_SRC_TIMER="eldato-ai-drainer.timer"
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+err() { printf 'install-drainer-timer: ERROR — %s\n' "$*" >&2; return 1; }
+
+MODE=--install
+case "${1:-}" in
+    -h | --help) usage ;;
+    --install | --dry-run | --status | --uninstall) MODE="$1" ;;
+    '') ;;
+    *) usage ;;
+esac
+
+HOME_DIR="${HOME:?HOME is required}"
+DRAINER_O="${DRAINER_O:-$HOME_DIR/orchestrator}"
+DRAINER_STATE="${DRAINER_STATE:-$HOME_DIR/orchestrator-ai}"
+DRAINER_REPO_SLUG="${DRAINER_REPO_SLUG:-daniel-ospina/agent-infra}"
+DRAINER_SEED_REPO="${DRAINER_SEED_REPO:-$HOME_DIR/agent-infra-main}"
+SYSTEMCTL="${SYSTEMCTL:-}"
+SUDO="${SUDO:-sudo -n}"
+
+# The script the unit execs. The repo copy is authoritative when it exists (this installer is run
+# from a checkout); a cell usually has only the farmed copy, which is what pi-bootstrap ships.
+if [ -z "${DRAINER:-}" ]; then
+    for _c in "$INFRA_ROOT/scripts/orchestrator-harness/ai-drainer.sh" \
+              "$HOME_DIR/.pi/agent/scripts/ai-drainer.sh"; do
+        [ -f "$_c" ] && { DRAINER="$_c"; break; }
+    done
+fi
+[ -n "${DRAINER:-}" ] || err "ai-drainer.sh not found (looked in this checkout and $HOME/.pi/agent/scripts) — nothing to schedule"
+[ -f "$DRAINER" ] || err "DRAINER=$DRAINER does not exist"
+[ -f "$TEMPLATES_DIR/$UNIT_SRC_SERVICE" ] || err "template not found: $TEMPLATES_DIR/$UNIT_SRC_SERVICE"
+[ -f "$TEMPLATES_DIR/$UNIT_SRC_TIMER" ] || err "template not found: $TEMPLATES_DIR/$UNIT_SRC_TIMER"
+
+# ── which systemctl, and therefore which unit dir ─────────────────────────────────────────────
+# System unit first (the cell's normal shape), user unit when systemd's user manager answers but
+# there is no passwordless sudo. Anything else is a LOUD failure: a timer that was "installed" and
+# never fires is the false PASS this fleet keeps removing.
+resolve_target() {
+    if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then TARGET=override; UNIT_DIR="$SYSTEMD_UNIT_DIR"; SYSTEMCTL="${SYSTEMCTL:-systemctl}"; return 0; fi
+    if command -v systemctl >/dev/null 2>&1; then
+        if $SUDO systemctl show-environment >/dev/null 2>&1; then
+            TARGET=system; UNIT_DIR=/etc/systemd/system; SYSTEMCTL="${SYSTEMCTL:-$SUDO systemctl}"; return 0
+        fi
+        if [ -n "$(systemctl --user show-environment 2>/dev/null)" ]; then
+            TARGET=user; UNIT_DIR="$HOME_DIR/.config/systemd/user"; SYSTEMCTL="${SYSTEMCTL:-systemctl --user}"; return 0
+        fi
+    fi
+    return 1
+}
+resolve_target || {
+    err "no usable scheduler: neither a passwordless-sudo system systemd nor a working user manager answered. The drainer will NOT run unattended — fix systemd (or grant passwordless sudo for systemctl) and re-run."
+    exit 1
+}
+[ -n "${SYSTEMCTL:-}" ] || SYSTEMCTL="$([ "$TARGET" = system ] && printf 'sudo -n systemctl' || printf 'systemctl --user')"
+
+render() { # <template> <dest>
+    local v
+    sed -e "s|{{USER}}|$(id -un)|g" \
+        -e "s|{{HOME}}|$HOME_DIR|g" \
+        -e "s|{{PATH}}|${PATH:-/usr/local/bin:/usr/bin:/bin}|g" \
+        -e "s|{{O}}|$DRAINER_O|g" \
+        -e "s|{{AI}}|$DRAINER_STATE|g" \
+        -e "s|{{REPO_SLUG}}|$DRAINER_REPO_SLUG|g" \
+        -e "s|{{SEED_REPO}}|$DRAINER_SEED_REPO|g" \
+        -e "s|{{MAX_LANES}}|${MAX_LANES:-4}|g" \
+        -e "s|{{MIN_SWAP_MB}}|${MIN_SWAP_MB:-700}|g" \
+        -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-3000}|g" \
+        -e "s|{{DRAINER}}|$DRAINER|g" \
+        "$1" >"$2"
+    # ⛔ A value carrying `|` or `&` would silently corrupt the rendered unit (sed replacement), and a
+    # leftover `{{…}}` means a placeholder nothing substituted — a unit that starts with a literal
+    # `{{HOME}}` in it. Both are refusals, never a warning.
+    if grep -q '{{' "$2"; then rm -f "$2"; err "unsubstituted placeholder remains in the rendered unit"; return 1; fi
+}
+
+say_status() {
+    local svc="$1" tmr="$2"
+    printf 'installer target: %s (%s)\n' "$TARGET" "$UNIT_DIR"
+    for u in "$svc" "$tmr"; do
+        if [ -f "$UNIT_DIR/$u" ]; then printf '  %-34s installed\n' "$u"; else printf '  %-34s MISSING\n' "$u"; fi
+    done
+    if [ -f "$UNIT_DIR/$tmr" ]; then
+        printf '  timer state: %s\n' "$($SYSTEMCTL is-active "$tmr" 2>/dev/null || true)"
+        printf '  next run:    %s\n' "$($SYSTEMCTL list-timers --all "$tmr" 2>/dev/null | sed -n '2p' | sed 's/  */ /g' || true)"
+    fi
+}
+
+case "$MODE" in
+    --status) say_status "$UNIT_SRC_SERVICE" "$UNIT_SRC_TIMER"; exit 0 ;;
+    --uninstall)
+        $SYSTEMCTL disable --now "$UNIT_SRC_TIMER" >/dev/null 2>&1 || true
+        rm -f "$UNIT_DIR/$UNIT_SRC_TIMER" "$UNIT_DIR/$UNIT_SRC_SERVICE" || err "cannot remove the units from $UNIT_DIR"
+        $SYSTEMCTL daemon-reload >/dev/null 2>&1 || true
+        printf 'drainer timer removed — nothing dispatches from this cell any more\n'
+        exit 0 ;;
+esac
+
+# The state dir must exist and be writable by THIS user: the unit runs as this user and every pass
+# would fail closed on an unwritable log dir.
+mkdir -p "$DRAINER_STATE/logs" 2>/dev/null || { err "cannot create $DRAINER_STATE/logs"; exit 1; }
+[ -w "$DRAINER_STATE" ] || { err "state dir $DRAINER_STATE is not writable by $(id -un)"; exit 1; }
+[ -z "$DRAINER_O" ] || [ -d "$DRAINER_O" ] || { err "DRAINER_O=$DRAINER_O does not exist — the pass would count zero lanes and dispatch as if the box were idle"; exit 1; }
+
+tmpd="$(mktemp -d)" || { err "mktemp failed"; exit 1; }
+render "$TEMPLATES_DIR/$UNIT_SRC_SERVICE" "$tmpd/$UNIT_SRC_SERVICE" || exit 1
+render "$TEMPLATES_DIR/$UNIT_SRC_TIMER" "$tmpd/$UNIT_SRC_TIMER" || exit 1
+
+if [ "$MODE" = "--dry-run" ]; then
+    printf 'would install to %s (target %s):\n\n' "$UNIT_DIR" "$TARGET"
+    sed 's/^/  /' "$tmpd/$UNIT_SRC_SERVICE" "$tmpd/$UNIT_SRC_TIMER"
+    rm -rf "$tmpd"
+    exit 0
+fi
+
+mkdir -p "$UNIT_DIR" 2>/dev/null || { rm -rf "$tmpd"; err "cannot create $UNIT_DIR (a system target needs sudo; a user target needs a home dir)"; exit 1; }
+for u in "$UNIT_SRC_SERVICE" "$UNIT_SRC_TIMER"; do
+    if [ -f "$UNIT_DIR/$u" ] && cmp -s "$UNIT_DIR/$u" "$tmpd/$u"; then
+        printf '  %s: unchanged\n' "$u"
+    else
+        cp "$tmpd/$u" "$UNIT_DIR/$u" || { rm -rf "$tmpd"; err "cannot write $UNIT_DIR/$u"; exit 1; }
+        printf '  %s: written\n' "$u"
+    fi
+done
+rm -rf "$tmpd"
+$SYSTEMCTL daemon-reload >/dev/null 2>&1 || { err "systemctl daemon-reload failed — the units on disk are not the units systemd knows"; exit 1; }
+$SYSTEMCTL enable --now "$UNIT_SRC_TIMER" >/dev/null 2>&1 || { err "systemctl enable --now $UNIT_SRC_TIMER failed — an installed timer that is not enabled never fires"; exit 1; }
+
+# ⛔ READ IT BACK. A unit on disk and an enabled timer is not the same statement as "the timer is
+# active"; the answer is the read after, never the command's status.
+state="$($SYSTEMCTL is-active "$UNIT_SRC_TIMER" 2>/dev/null || true)"
+[ "$state" = "active" ] || { err "the timer is installed but NOT active (state: ${state:-unknown})"; exit 1; }
+printf 'ai-drainer scheduled: %s active in %s (state dir %s, log %s/logs/ai-drainer.log)\n' \
+    "$UNIT_SRC_TIMER" "$UNIT_DIR" "$DRAINER_STATE" "$DRAINER_STATE"
