@@ -878,7 +878,15 @@ ORUN() { # <extra args…>
   # ⛔ ELDATO_ALLOW_TEST_HOME=1 is the #446 guard's documented opt-in: this HOME is a sandbox, so the
   # run WOULD otherwise (correctly) refuse to touch launchd. With it, the `launchctl` stub on PATH is
   # what stands in for the real domain — no real job is registered or removed by this suite.
+  # ⛔ HARNESS=NOW REQUIRED, AND IT IS THE CHECKOUT ITSELF (agent-infra#2231). The installer no longer
+  # renders `$O/orch-loop.sh`; it renders the PINNED tree's program, so it must resolve a git worktree
+  # or REFUSE. Naming this checkout explicitly is the documented "pin a deliberate checkout" route: it
+  # is a real worktree with a HEAD, so the installer MENDs the two pin records under the sandbox HOME
+  # ($SHOME/.harness-path, $SHOME/.pi/agent/state/HARNESS-PIN) — read-only git, no worktree created,
+  # nothing outside $T is touched. Without it the materialiser would run `git worktree add` against
+  # THIS repository, which a test must never do.
   env HOME="$SHOME" O="$T/o" REPO="$(cd "$HARNESS/../.." && pwd)" OR="acme/widget" \
+    HARNESS="$HARNESS" \
     ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLIST" \
     AI_REVIEW_GATE_KEY= \
     PATH="$SHOME/.local/share/pi-node/current/bin:$T/bin:$PATH" \
