@@ -367,6 +367,26 @@ PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 }
 
+# mk_tool_stderr_bracket <dir> — a normal report on stdout, plus a stderr line that BEGINS WITH `[`.
+# This is the phantom-surface-row shape (review of #2401, fourth round): the block parser's only
+# terminator is a line matching `^[A-Z][A-Z ]+ — `, so folding stderr straight after the report left
+# the block OPEN and parsed this line as a surface the producer never reported.
+mk_tool_stderr_bracket() {
+  local d="$1"
+  mk_tool_incomplete "$1"
+  python3 - "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+src = src.replace(
+    'sys.exit(2)',
+    'sys.stderr.write("[preflight] live-session store probe failed\\n")\nsys.exit(2)',
+)
+open(path, "w").write(src)
+PY
+  chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+
 # mk_tool_clean <dir> — a CLEAN verdict that also RECORDS the GH_REPO it ran under ($GHRELOG), the
 # only way to prove the pin reached the child — and, when `$TOMBREC`/`$TOMBLOG` are set, the state of the
 # outcome record AT THE MOMENT IT RUNS. That snapshot is how the tombstone is proved to be written
@@ -554,6 +574,50 @@ rf "$D"
 case "$(rec "$D" why)" in
   *"claim gate"*) bad "same-record: the first cause is #43's prose while the datum is #42's — the record contradicts itself" ;;
   *) ok "same-record: and the first cause does not quote a LATER record" ;;
+esac
+
+# ── 1i) A `[`-LEADING STDERR LINE IS NOT A SURFACE ROW ─────────────────────────
+# The fold puts stderr AFTER the report (the old merged stream put it first), so the block parser's
+# terminator is what keeps a diagnostic from being read as a surface the producer never reported.
+mk_case fail-stderr-bracket 42
+mk_tool_stderr_bracket "$D"
+rf "$D"
+case "$(rec "$D" unusable)" in
+  *"preflight:"*) bad "bracket: a stderr line beginning with '[' was parsed as a SURFACE ROW — unusable='$(rec "$D" unusable)'" ;;
+  *) ok "bracket: a '['-leading stderr line is not a surface row" ;;
+esac
+case "$(rec "$D" unusable)" in
+  *"issue-assignee-holder"*) ok "bracket: and the REAL surface is still named" ;;
+  *) bad "bracket: the real surface was lost — '$(rec "$D" unusable)'" ;;
+esac
+[ "$(rec "$D" tool_arm)" = "issue-assignee-holder" ] \
+  && ok "bracket: the datum's arm is the real surface, never a fabricated one" \
+  || bad "bracket: tool_arm='$(rec "$D" tool_arm)' (want issue-assignee-holder)"
+
+# ── 1j) A BLANK STDERR IS NOT FOLDED (the label must never become a cause) ──────
+# ⛔ THE FIXTURE MUST BE VERDICT-LESS (review of #2401, fifth round). The first version used the
+# INCOMPLETE fixture, whose parseable surface row makes `record_unusable` fire from the SURFACE, so
+# `why` was the claim-gate prose whether or not the label was folded — deleting the whitespace gate
+# left the suite GREEN. The label can only become a cause through the VERDICT-LESS arm's
+# `tail -1`, so this fixture produces no stdout at all and whitespace-only stderr: with the gate the
+# pass folds nothing and records an empty reason; without it, the label IS the last non-blank line
+# and becomes the cause. Both halves are asserted, so a do-nothing fixture cannot pass.
+mk_case fail-stderr-blank 42
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+sys.stderr.write("   \n\n")   # whitespace only: says nothing, so nothing may be folded
+sys.exit(0)                    # …and NO verdict line, so the record's reason comes from tail -1
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D"
+case "$(rec "$D" why)" in
+  *"STDERR —"*) bad "blank-stderr: the label itself became the first cause — '$(rec "$D" why)'" ;;
+  *) ok "blank-stderr: a whitespace-only stderr contributes no cause" ;;
+esac
+case "$(rec "$D" unusable)" in
+  *"preflight-no-verdict"*) ok "blank-stderr: and the verdict-less arm still names the record (the fixture is not vacuous)" ;;
+  *) bad "blank-stderr: unusable='$(rec "$D" unusable)' — the fixture did not reach the arm under test" ;;
 esac
 
 # ── 1f) AND THE DATUM DOES NOT DISPLACE ITS PRE-EXISTING VOCABULARY ─────────────
