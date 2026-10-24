@@ -2387,8 +2387,8 @@ run_status() {
 #     * who (controller_heartbeat_verdict) — it NAMES what is up (`tmux '<session>'`, `the
 #       controller (service-managed)`) in the line the operator reads. An empty default would print a
 #       diagnosis that names nobody — `⛔ CONTROLLER STALE:  is up but …` — so the read stays fatal
-#       and the caller that omitted it is the bug. Added by the #2402 merge: `${1:-}` arrived after
-#       this audit was written, and the suite's exhaustive walk is what caught it — the audit working.
+#       and the caller that omitted it is the bug. The BARE read arrived with #2402, after this audit
+#       was written, and the suite's exhaustive walk is what caught it — the audit working.
 #     * role/rc/own/bound — an empty ROLE records a pass nowhere, and an empty BOUND makes
 #       `[ "" -ge N ]` an arithmetic error: the caller is wrong and saying so beats a silent write
 #       to nowhere.
@@ -2414,13 +2414,19 @@ run_status() {
 #   instances today, all in functions whose every caller binds: `free_mb` (`${1:-.}`), `hyg_df_mb`
 #   (`${1:-$CELL_HOME}`), `hyg_df_delta` (`${1:-?}`, `${2:-?}`), `num_ok` (`${1:-}`), `row_rc_merge`
 #   (`${1:-0}`), `state_get` (`$1`, `$2`), `mtime_epoch`, `pane_pid`, `session_present`,
-#   `attached_clients`, `subtree_cpu_secs`, `attempt_epoch`, `attempt_record`, and the CLI dispatch's
-#   own `case "${1:-status}"`. Two of those — `free_mb` and `hyg_df_mb` — are the NON-EMPTY-DEFAULT
+#   `attached_clients`, `subtree_cpu_secs`, `attempt_epoch`, `attempt_record`,
+#   `service_controller_present` (`${1##*/}`, `${2##*/}` — self-bound via `set -- $c`, so the
+#   caller's argv never reaches them), and the CLI dispatch's own `case "${1:-status}"`,
+#   `role="$1"` and `$1`. Two of those — `free_mb` and `hyg_df_mb` — are the NON-EMPTY-DEFAULT
 #   shape this audit rejects for a binding, so the exemption is deliberate here and would not be
 #   there: they are pure helpers whose default is the harmless current directory / cell home. Named
 #   so the omission is a recorded decision, not an implication of coverage: extending the walk to
 #   function bodies is the fix if a positional read outside a `local` ever carries a real hazard.
 #   Read this as "every `local` binding of a positional", never "every positional read in the file".
+# ⛔ AND `local` MUST BE THE LINE'S FIRST TOKEN. The walk greps `^[[:space:]]*local `, so a binding
+#   written inside a ONE-LINE function body (`f() { local x="$1"; }`) is not scanned either. None
+#   exists in this file today (`grep -nE '\{ *local '` is empty), and the style here is one binding
+#   per line — stated because a future one-liner would be invisible rather than graded.
 # ⛔ The suite (final pass 3) walks this MECHANICALLY, by VALUE, keyed by (FUNCTION, NAME) and over a
 #   DERIVED role list: `"${N:-}"` passes at any index, `"${N:-<anything>}"` FAILS (a non-empty default
 #   would let an absent argument arm a mode by itself), a bare `$N` must be a `function:name` pair on
