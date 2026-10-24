@@ -259,9 +259,10 @@ it). Four of them are only producible while you work, so produce them as you go.
   first content line after it, and the marker as the LAST line with content, set off by a blank line
   as a footer block. A marker quoted in a table, fence or discussion counts nowhere: those are
   mentions, not artifacts. READ THE THREAD FIRST: if a scoping comment already exists, ADD to it
-  rather than starting over — and if its marker sits as a footer, insert ABOVE the marker, because a
-  marker that is no longer first-or-footer stops being an artifact. To post one (posting a SECOND
-  comment also satisfies the check; it scans every comment):
+  rather than starting over — and if its marker sits as a footer, insert ABOVE the footer BLOCK while
+  KEEPING the blank line that immediately precedes the marker, because a marker with text directly
+  above it is neither first-or-footer and stops being an artifact (posting a SECOND comment also
+  satisfies the check; it scans every comment):
   \`gh issue comment <ISSUE> --repo <OWNER/REPO> --body-file <file>\`.
 - **[c] the code-review record, bound to the PR's CURRENT head** — a line of exactly this shape, in
   the PR body or a commit message, naming THIS PR, THIS repo and THIS head:
@@ -269,7 +270,8 @@ it). Four of them are only producible while you work, so produce them as you go.
   ${record}
 - **[d] plan evidence** (\`complexity:standard\` / \`complexity:complex\` only): the PR changes a file
   under \`docs/plans/*.md\`, OR the scoping comment carries a \`## Wiring\` section (the wiring-check
-  table). A \`complexity:micro\` issue is exempt from [b]-[e].
+  table). This is deliberately STRICTER than the check, which accepts any use of the word "wiring" —
+  the safe direction. A \`complexity:micro\` issue is exempt from [b]-[e].
 - **[e] test evidence** when the PR touches runtime code (\`extensions/**\`, \`bin/*.js\`): new or
   updated \`*.test.ts\` / \`*.test.js\` files in the diff, OR the run reported in the PR body — the
   exact command and its counts (\`<N> passed\`, \`pytest …\`, \`npm test\`, \`VGATE PASS\`, \`<N>/<N>\`).

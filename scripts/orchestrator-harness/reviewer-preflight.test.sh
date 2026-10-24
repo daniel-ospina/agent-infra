@@ -330,7 +330,7 @@ echo
 echo "§F.2 role-correct on [c] only — who mints the record differs, what is owed does not"
 case "$LANDING_SELF" in *"Record AFTER your last push, then RE-RECORD if the head moves"*) rc=0;; *) rc=1;; esac
 ck $rc "self: the LANE records (after the last push) and re-records when the head moves"
-case "$LANDING_SELF" in *"insert ABOVE the marker"*) rc=0;; *) rc=1;; esac
+case "$LANDING_SELF" in *"insert ABOVE the footer BLOCK"*"KEEPING the blank line"*) rc=0;; *) rc=1;; esac
 ck $rc "…and says how to extend a FOOTER-shaped scoping comment without destroying its position"
 case "$LANDING_SELF" in *"posting a SECOND"*"satisfies the check"*) rc=0;; *) rc=1;; esac
 ck $rc "…and that a second comment is accepted (the check scans every comment)"
@@ -345,10 +345,12 @@ ck $rc "…its duty is the head: no amend/rebase/push once the record exists"
 # ⛔ NOT JUST THE SENTENCE, THE ADVICE (cycle-3 review, P2): "in doubt use `clean`" and the stale-line
 # deletion are the RECORDER's business, so a harness lane must not be handed them four lines before
 # being told merge-one.sh mints the record.
-case "$LANDING_HARNESS" in *"in doubt use"*) rc=1;; *) rc=0;; esac
+case "$LANDING_HARNESS" in *"in doubt use"*|*"DELETE it"*) rc=1;; *) rc=0;; esac
 ck $rc "⛔ …and is NOT given the recorder's verdict/stale-line advice (it does not run the recorder)"
 case "$LANDING_SELF" in *"in doubt use"*) rc=0;; *) rc=1;; esac
-ck $rc "the SELF role does carry that advice (it is the one that runs the recorder)"
+ck $rc "the SELF role does carry the verdict advice (it is the one that runs the recorder)"
+case "$LANDING_SELF" in *"DELETE it"*) rc=0;; *) rc=1;; esac
+ck $rc "…and the stale-line deletion (the remedy for a body carrying an older verdict)"
 # …and the post-record body-edit ban must carry its ONE exception, or the [c] remedy contradicts it.
 # It lives in the REVIEWER brief section (where the ban is stated), not in the landing section.
 case "$SELF_BRIEF" in *"ONE exception is the [c] remedy"*) rc=0;; *) rc=1;; esac
@@ -429,6 +431,14 @@ has_scoping_marker $'## Scope — #2325\n<!-- issue-scoping: v5.1 double diamond
 has_scoping_marker 'Discussed first.
 <!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
 [ "$rc" -ne 0 ]; ck $? "⛔ …while a marker CROWDED under a preamble (no blank line) FAILS (that is the mention shape)"
+# …and the FOOTER remedy has the same trap: text inserted directly above the marker (no blank line) is
+# the shape the [b] remedy must not produce — measured, not assumed.
+has_scoping_marker '## Scope
+preamble.
+
+NEW CONTENT
+<!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and inserting text directly ABOVE a footer marker (no blank line) FAILS — the blank line is part of the shape"
 has_scoping_marker '    <!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
 [ "$rc" -ne 0 ]; ck $? "⛔ …an INDENTED marker FAILS (a code block is a mention — column 0 is the contract)"
 has_scoping_marker 'The artifact looks like `<!-- issue-scoping: 2026-10-25 (standard) -->` in a table.'; rc=$?
