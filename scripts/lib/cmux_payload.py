@@ -128,32 +128,38 @@ def tail_marker(text: str, tail_chars: int = DEFAULT_TAIL_CHARS) -> str:
     return compacted[-tail_chars:]
 
 
-# ⛔ A SHORT MARKER IS NOT A SUBSTRING (#1881 review, round 4 P1). `tail_marker` returns the WHOLE
-# compacted payload when it is shorter than `tail_chars`, and the comparison used to be a bare
-# `marker in compact(...)`. So a payload of `ok` was certified by any appended text that happened to
-# contain it — the lane writing "checking the token now" made "token" certify it, and a truncated
-# `Retry` was certified by `Retrying…`. The docstring's own defect class includes an 8-byte payload
-# that vanished entirely, so short payloads are in scope. Below this length the marker must match as a
-# TOKEN (no alphanumeric character on either side), never as a fragment of a longer word.
-MIN_SUBSTRING_MARKER = 16
+# ⛔ A SHORT MARKER IS A WHOLE VALUE, NOT A SUBSTRING (#1881 review, rounds 4 and 5). `tail_marker`
+# returns the WHOLE compacted payload when it is shorter than `tail_chars`, and the comparison used to
+# be a bare `marker in compact(...)`. So a payload of `ok` was certified by any appended text that
+# contained it — the lane writing "checking the token now" made "token" certify it, a truncated
+# `Retry` was certified by `Retrying…`, and a boundary-only rule was still fooled by the lane's own
+# prose (`ok` by "ok, moving on to the tests"; `continue` by "I will continue with the next item").
+# The docstring's own defect class includes an 8-byte payload that vanished entirely, so short
+# payloads are in scope. Below this length the marker must EQUAL a whole candidate value — the message
+# IS the value — never sit inside a longer text.
+#
+# ⛔ AND IT MUST NOT GO THE OTHER WAY EITHER (#1881 review, round 5 P1). A boundary test run against
+# WHITESPACE-PRESERVING text could never match a whitespace-STRIPPED marker with an internal space,
+# so `resume it` / `do it now` / `check pane` became permanently unverifiable: every short multi-word
+# order would be reported not-confirmed, with a remedy that invites a re-send of an order that
+# arrived. Equality in the COMPACTED domain fixes both directions at once — the whitespace is gone
+# from both sides, so the same rule cannot manufacture a false PASS or a false FAIL.
+MIN_WHOLE_VALUE_MARKER = 16
 
 
 def _marker_matches(text: str | None, marker: str) -> bool:
-    """Whether `marker` occurs in `text` — as a TOKEN when it is short, as a run when it is long.
+    """Whether `marker` identifies a WHOLE value in `text` (short) or a run inside it (long).
 
-    Whitespace is removed for the long form (a TUI wrap must not manufacture a false negative), and
-    kept-but-flattened for the short form (removing it would fuse words and defeat the boundary).
+    Long markers (>= MIN_WHOLE_VALUE_MARKER) are a whitespace-insensitive substring: a TUI wrap must
+    not manufacture a false negative, and 16+ characters of a payload are not something a lane's
+    unrelated output contains by accident. Short markers must equal the whole candidate, because a
+    shorter string is a common word and any `in` / boundary test over prose certifies it.
     """
     if not marker or not text:
         return False
-    if len(marker) >= MIN_SUBSTRING_MARKER:
+    if len(marker) >= MIN_WHOLE_VALUE_MARKER:
         return marker in compact(text)
-    flat = flatten(text)
-    # A short payload IS the whole message, so an exact match against a flattened candidate is the
-    # strongest form; the boundary regex covers the rest without letting a fragment certify anything.
-    if compact(flat) == marker:
-        return True
-    return re.search(rf"(?<![A-Za-z0-9]){re.escape(marker)}(?![A-Za-z0-9])", flat) is not None
+    return compact(text) == marker
 
 
 def screen_has_payload(screen: str | None, sent_text: str,
@@ -200,8 +206,11 @@ def session_file_hits(session_id: str | None) -> list[str]:
     `session_file_for` answers None for both, and the send loop used that None as proof that the
     transcript did not exist before the send — so one transient `getmtime` error on a pre-existing
     18 MB transcript reopened the search at offset 0 and let a days-old identical message certify a
-    send that appended nothing. The glob is the only read that answers existence without touching a
-    stat, so it is the only read that may license offset 0.
+    send that appended nothing.
+
+    ⛔ AND NEITHER IS "I COULD NOT LOOK" (#1881 review, round 5 P2). `glob.glob` swallows OSError
+    and returns [], so an unreadable directory read exactly like an empty one; `session_files_state`
+    is the read that answers existence, and it reports unreadability instead of a convenient [].
     """
     if not session_id:
         return []
@@ -209,11 +218,40 @@ def session_file_hits(session_id: str | None) -> list[str]:
     return glob.glob(f"{home}/.pi/agent/sessions/*/*{session_id}*.jsonl")
 
 
+def session_files_state(session_id: str | None) -> bool | None:
+    """Whether any transcript EXISTS for a known session id: True / False / None (unreadable).
+
+    ⛔ THIS IS THE ONLY READ THAT MAY LICENSE OFFSET 0, SO IT MUST NOT FAIL OPEN (#1881 review,
+    round 5 P2). A glob cannot tell "no match" from "the directory could not be read", and the two
+    baseline reads used to be the same glob back-to-back — so one short filesystem stall covered
+    both, "no file" was inferred, and the search reopened at offset 0 over a pre-existing transcript.
+    An existence read that ERRORED is `None` here, and `None` never licenses the 2 MB window.
+    """
+    if not session_id:
+        return False
+    root = os.path.join(os.path.expanduser("~"), ".pi", "agent", "sessions")
+    try:
+        with os.scandir(root) as it:
+            project_dirs = [entry.path for entry in it if entry.is_dir()]
+    except OSError:
+        return None
+    unknown = False
+    for directory in project_dirs:
+        try:
+            with os.scandir(directory) as it:
+                for entry in it:
+                    if session_id in entry.name and entry.name.endswith(".jsonl"):
+                        return True
+        except OSError:
+            unknown = True                     # a directory we cannot read could hold it
+    return None if unknown else False
+
+
 def session_file_for(session_id: str | None) -> str | None:
     """The newest transcript for a KNOWN session id, or None when none can be NAMED.
 
-    None means "no path I can vouch for" — no file exists, or the stat failed. Callers that need to
-    distinguish those must ask `session_file_hits`.
+    None means "no path I can vouch for" — no file exists, or the stat failed, or the glob failed.
+    Callers that need to distinguish existence must ask `session_files_state`.
 
     Takes the id rather than the workspace on purpose: the caller resolves the id ONCE, before the
     send, so a later lookup can only answer "does the file exist now", never "is this a different
@@ -244,22 +282,6 @@ def resolve_session_file(workspace: str, run) -> str | None:
     return session_file_for(resolve_session_id(workspace, run))
 
 
-def _decode_escaped(text: str) -> str:
-    """A JSON/JSONL payload's DECODED text, or "" if it is not one.
-
-    A line of the transcript is a JSON object (`lane-read.py` does `json.loads(line)` and pulls
-    `content` out of it), so the message text lives inside a JSON string — where `"` is written
-    `\\"` and `\\` as `\\\\`. Comparing a marker built from the SENT text against those raw bytes
-    can therefore never match (#1881 review P1).
-    """
-    s = (text or "").strip()
-    if not s or s[0] not in "{[\"":
-        return ""
-    try:
-        return "\n".join(_json_strings(json.loads(s)))
-    except Exception:                                          # noqa: BLE001
-        return ""
-
 
 def _json_strings(node) -> list[str]:
     """Every string value inside a decoded JSON value, at any depth."""
@@ -276,6 +298,17 @@ def _json_strings(node) -> list[str]:
             out.extend(_json_strings(value))
         return out
     return []
+
+
+def _json_strings_of(line: str) -> list[str]:
+    """Every string value in one JSONL record, or [] when the line is not JSON."""
+    s = (line or "").strip()
+    if not s or s[0] not in "{[\"":
+        return []
+    try:
+        return _json_strings(json.loads(s))
+    except Exception:                                          # noqa: BLE001
+        return []
 
 
 def transcript_has_payload(path: str, sent_text: str,
@@ -321,11 +354,15 @@ def transcript_has_payload(path: str, sent_text: str,
         return True
     # Decode the JSONL records the send appended. A fragment at either edge of the window may not
     # parse; that is fine, a partial line can only ever ADD candidates, never remove one.
-    candidates = [chunk]
+    # ⛔ EACH STRING VALUE IS ITS OWN CANDIDATE — NEVER A JOINED ONE (#1881 review, round 5 P1). The
+    # joined form (`"\n".join(...)`) is a SUPERSET of the record's fields, so a substring rule on it
+    # matched ACROSS two unrelated fields: `{"content":"so we should check","note":"the pane first"}`
+    # certified the payload `check the pane first`, which the lane never sent. A whole-value rule on
+    # the join can never match at all, so the join was wrong in both directions and is gone. Each
+    # string value is offered separately, which is what a message actually is.
+    candidates = [chunk, *chunk.splitlines()]
     for line in chunk.splitlines():
-        decoded = _decode_escaped(line)
-        if decoded:
-            candidates.append(decoded)
+        candidates.extend(_json_strings_of(line))
     return any(_marker_matches(candidate, marker) for candidate in candidates)
 
 
@@ -381,12 +418,14 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     # could not obtain says nothing about whether a transcript existed, so it must never license the
     # 2 MB window: without a baseline the verdict stays below VERIFIED (PANE_ONLY at best).
     session_id = resolve_session_id(workspace, run)
-    # ⛔ EXISTENCE IS ANSWERED BY THE GLOB, NOT BY THE NAME (#1881 review, round 4 P1): a file whose
-    # stat failed is unnamed but NOT absent, and treating it as absent reopened the 2 MB window.
-    session_had_file = bool(session_file_hits(session_id))
+    # ⛔ EXISTENCE IS A READ, NOT AN INFERENCE (#1881 review, rounds 4 and 5): `session_file_for`
+    # answers None for "no file", "stat failed" AND "could not look", and only the FIRST of those may
+    # reopen the search at offset 0. `session_files_state` reports unreadability as None, which never
+    # licenses the 2 MB window.
+    session_had_file = session_files_state(session_id)
     session_file = session_file_for(session_id)
     session_base = transcript_offset(session_file)
-    may_await_new_file = bool(session_id) and not session_had_file
+    may_await_new_file = bool(session_id) and session_had_file is False
 
     try:
         sent = cmux("send", "--workspace", workspace, text)

@@ -437,6 +437,96 @@ def test_an_unnameable_existing_transcript_never_licenses_the_two_mb_window(P, t
     assert verdict != P.VERIFIED, "an unnameable pre-existing transcript certified the send"
 
 
+def test_a_short_multi_word_payload_still_verifies(P, tmp_path):
+    """⛔ THE FALSE NEGATIVE THE BOUNDARY RULE CREATED (#1881 review, round 5 P1). `tail_marker` is
+    WHITESPACE-STRIPPED, so a boundary test run against whitespace-preserving text could never match a
+    marker with an internal space: `resume it`, `do it now`, `check pane` all became permanently
+    unverifiable, and the operator's remedy invites a re-send of an order that arrived. Whole-value
+    equality in the COMPACTED domain fixes both directions: the whitespace is gone from both sides.
+
+    Fails on the round-4 bytes: they return False for every payload here."""
+    for payload in ("resume it", "do it now", "check pane", "go on", "retry it"):
+        f = tmp_path / "session.jsonl"
+        f.write_text(json.dumps({"type": "message", "message": {"role": "user", "content": [
+            {"type": "text", "text": payload}]}}) + "\n", encoding="utf-8")
+        assert P.transcript_has_payload(str(f), payload) is True, payload
+
+
+def test_a_short_payload_is_not_certified_by_the_lanes_own_prose(P, tmp_path):
+    """⛔ A TOKEN BOUNDARY WAS NOT ENOUGH (#1881 review, round 5 P1). The lane's own output is prose
+    the check runs over, so `continue` was certified by "I will continue with the next item" and `ok`
+    by "ok, moving on to the tests" — both a false VERIFIED for an order that was never submitted. A
+    short marker must EQUAL a whole value, and splitting a message across two fields must not
+    reassemble it into a match.
+
+    Fails on the round-4 bytes: all three return True there."""
+    prose = tmp_path / "prose.jsonl"
+    prose.write_text(
+        json.dumps({"type": "assistant", "content": "I will continue with the next item"}) + "\n"
+        + json.dumps({"type": "assistant", "content": "ok, moving on to the tests"}) + "\n",
+        encoding="utf-8")
+    assert P.transcript_has_payload(str(prose), "continue") is False
+    assert P.transcript_has_payload(str(prose), "ok") is False
+    # Two unrelated fields must not be CONCATENATED into a match (the round-4 boundary rule did: the
+    # joined candidate "soweshouldcheckthepanefirst" contains "thepanefirst"). Accepted residual: a
+    # short payload that exactly EQUALS some field's value still matches (here "the pane first" equals
+    # the record's `note`). That requires an exact coincidence with the lane's own field text, and
+    # closing it fully would mean trusting only a named content field — a schema coupling this helper
+    # deliberately does not take. Stated, not hidden.
+    split = tmp_path / "split.jsonl"
+    split.write_text(json.dumps({"content": "so we should check", "note": "the pane first"}) + "\n",
+                     encoding="utf-8")
+    assert P.transcript_has_payload(str(split), "the pane first SO the check ran") is False
+    assert P.transcript_has_payload(str(split), "check the pane first") is False
+
+
+def test_an_unreadable_existence_read_never_licenses_the_two_mb_window(P, tmp_path, monkeypatch):
+    """⛔ "I COULD NOT LOOK" IS NOT "THERE IS NO FILE" (#1881 review, round 5 P2). `glob.glob`
+    swallows OSError and returns [], so an unreadable directory read exactly like an empty one; the
+    two baseline reads were the same glob back-to-back, so one short filesystem stall covered both,
+    "no file" was inferred, and the search reopened at offset 0 over a pre-existing transcript. An
+    existence read that errored is None here, and None never licenses the 2 MB window."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    sess = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    sess.write_text('{"type":"user","text":"' + LONG + '"}\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    def unreadable(path):
+        raise OSError("filesystem stalled")
+
+    monkeypatch.setattr(P.os, "scandir", unreadable)
+
+    def run(argv, timeout=None):
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            return _Proc(f"{sid}\n")
+        if argv[:2] == ["cmux", "send"]:
+            return _Proc("OK")                    # sent, but nothing appended
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc("working...\n")
+        return _Proc("")
+
+    assert P.session_files_state(sid) is None
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict != P.VERIFIED
+
+
+def test_the_catch_all_verdict_text_does_not_assert_a_send_it_did_not_witness():
+    """The catch-all arm also receives the case where `cmux send` ITSELF exited non-zero: nothing was
+    typed, no pane or transcript was read, so "SENT" and "the TAIL is not on the pane" were claims
+    about evidence never gathered, with a remedy (re-send) that fails identically. The text must name
+    both branches so a later edit cannot silently restore the assertion."""
+    with open(_ORCH_SEND, encoding="utf8") as fh:
+        shell = fh.read()
+    catch_all = shell.split("\n  *)", 1)[1]
+    flat = " ".join(catch_all.split())
+    assert "NOT VERIFIED AS DELIVERED" in flat
+    assert "Either cmux refused the send" in flat
+    assert "not on the pane and not in the transcript" not in flat
+
+
 def test_a_transcript_created_by_this_send_can_still_verify(P, tmp_path, monkeypatch):
     """⛔ ONE RESOLUTION IS NOT ENOUGH (#1881 review P2). pi creates the session file on the first
     user message, so resolving the path only BEFORE the send made VERIFIED unreachable for a lane
