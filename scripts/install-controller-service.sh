@@ -171,27 +171,36 @@ TARGET=""; UNIT_DIR=""; SC=""; WANTED_BY="multi-user.target"
 # so re-pointing `CONTROLLER_SYSTEM_UNIT_DIR` at a refused directory cannot make the guard agree with
 # itself. A directory OUTSIDE every systemd tree (a hermetic test fixture under `$TMPDIR`) is always
 # allowed: nothing boots it.
-canon_dir() { # <dir> — the resolved spelling (symlinks, `//`, and trailing slashes collapsed)
-    local d="${1:-}" par base
+canon_dir() { # <dir> — the path `mkdir -p` WOULD land on, physically
+    local d="${1:-}" par base rest="" out=""
     [ -n "$d" ] || return 0
-    # 1. An EXISTING directory answers physically.
-    if [ -d "$d" ]; then ( cd "$d" 2>/dev/null && pwd -P ) && return 0; fi
-    # 2. A leaf that does not exist yet: resolve its PARENT physically and keep the leaf (re-review P2,
-    # #2666). The first form of this function fell back to the literal when `readlink -f` was unavailable —
-    # and the guard then graded an UNRESOLVED literal while `mkdir -p` followed the symlinked parent, so
-    # `/tmp/alias/system.control` with `/tmp/alias -> /etc/systemd` was admitted and created the directory
-    # INSIDE /etc/systemd. That is the one direction this guard cannot have, so the parent is resolved here
-    # rather than left to `readlink`'s presence.
-    par="$(dirname "$d")"; base="$(basename "$d")"
-    if [ -d "$par" ]; then
-        ( cd "$par" 2>/dev/null && printf '%s/%s\n' "$(pwd -P | sed 's:/*$::')" "$base" ) && return 0
-    fi
-    # 3. `readlink -f` where it exists (resolves a chain whose parent is present).
+    # ⛔ `readlink -f` FIRST, WHEN IT CAN ANSWER (re-review P1, #2666): it collapses `//` and resolves the
+    # whole chain. It cannot answer while ANY ancestor is missing, which is what the branches below cover —
+    # and the bash `pwd -P` they use preserves exactly TWO leading slashes (`cd //etc/systemd/user && pwd -P`
+    # → `//etc/systemd/user`), so a doubled-slash spelling used to miss every tree pattern AND be counted as
+    # a second copy by the resolved dedupe. Every branch therefore normalises a leading `//` on the way out.
     if command -v readlink >/dev/null 2>&1 && readlink -f -- "$d" >/dev/null 2>&1; then
-        readlink -f -- "$d"; return 0
+        out="$(readlink -f -- "$d")"
+    elif [ -d "$d" ]; then
+        out="$( cd "$d" 2>/dev/null && pwd -P )"
+    else
+        # ⛔ RESOLVE THE DEEPEST ANCESTOR THAT EXISTS AND APPEND THE REST (re-review P2, #2666). Resolving
+        # only the immediate parent left the LITERAL when more than the leaf was missing, so the graded path
+        # was not the path the write landed on: `<tmp>/noexist/../etc/systemd/system.control` was admitted
+        # (the `..` never collapsed, no pattern matched) while `mkdir -p` created `<tmp>/etc/systemd/…`.
+        par="$d"
+        while [ -n "$par" ] && [ "$par" != "/" ] && [ "$par" != "." ] && [ ! -d "$par" ]; do
+            base="$(basename "$par")"
+            rest="${base}${rest:+/$rest}"
+            par="$(dirname "$par")"
+        done
+        if [ -d "${par:-/}" ]; then
+            out="$( cd "${par:-/}" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$rest" )"
+        fi
     fi
-    # 4. Last resort: the slash-stripped literal.
-    printf '%s\n' "${d%/}"
+    [ -n "$out" ] || out="${d%/}"
+    case "$out" in //*) out="/${out#//}" ;; esac   # POSIX: a leading `//` is implementation-defined
+    printf '%s\n' "$out"
 }
 unit_dir_under() { # <resolved dir> <root> — true when <dir> IS <root> or inside it (both resolved)
     local d="${1%/}" r

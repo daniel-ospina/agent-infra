@@ -1300,6 +1300,64 @@ case "$SO_OUT" in
 esac
 [ -f "$SO/units/eldato-orchestrator.service" ] && bad 'sourcing the installer WROTE a unit (a sourced script must never install)' \
                                               || ok 'sourcing the installer wrote nothing'
+# ⛔ A LEADING `//` IS THE SAME DIRECTORY (re-review P1, #2666). bash's `pwd -P` PRESERVES exactly two leading
+# slashes (`cd //etc/systemd/user && pwd -P` → `//etc/systemd/user`), so a doubled-slash spelling missed every
+# tree pattern — `//etc/systemd/system.control` dry-ran an install while `/etc/systemd/system.control` was
+# refused — and was counted as a SECOND copy by the resolved dedupe, refusing an idempotent re-install of one
+# file as two. `canon_dir` normalises it on the way out.
+say_case 'a doubled leading slash is the same directory, not a different one'
+DS="$(arm_root ds)"; mk_systemctl "$DS/bin" "$DS/state" "$DS/sc.log"
+# ⛔ AND THE NORMALISATION MUST NOT DEPEND ON `readlink` (re-review P1, #2666): with `readlink -f` present it
+# already collapses `//`, so the branch that needs the explicit normalisation is the one where it cannot
+# answer — and that is the branch a minimal box runs. The stub makes `readlink` fail so the `pwd -P` branch
+# (which PRESERVES the doubled slash) is the one exercised; removing the normalisation then admits a real
+# systemd directory.
+printf '#!/bin/bash\nexit 1\n' > "$DS/bin/readlink"; chmod +x "$DS/bin/readlink"
+for _ds in '//etc/systemd/user' '///etc/systemd/system.control' '//etc/xdg/systemd/user'; do
+  _DS_RC=0; _DS_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_ds" inst ds --dry-run 2>&1)" || _DS_RC=$?
+  [ "$_DS_RC" -ne 0 ] && ok "SYSTEMD_UNIT_DIR=$_ds is REFUSED without readlink too (the slash run is normalised)" \
+                      || bad "SYSTEMD_UNIT_DIR=$_ds was ADMITTED — a spelling that collides with a refused dir — $_DS_OUT"
+done
+# …and with `readlink` PRESENT the same spellings must land identically (the normalisation is belt-and-braces).
+DS0="$(arm_root ds0)"; mk_systemctl "$DS0/bin" "$DS0/state" "$DS0/sc.log"
+for _ds in '//etc/systemd/system.control' '///etc/systemd/user'; do
+  _DS0_RC=0; _DS0_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_ds" inst ds0 --dry-run 2>&1)" || _DS0_RC=$?
+  [ "$_DS0_RC" -ne 0 ] && ok "SYSTEMD_UNIT_DIR=$_ds is REFUSED with readlink present" \
+                       || bad "SYSTEMD_UNIT_DIR=$_ds was ADMITTED with readlink present — $_DS0_OUT"
+done
+DS2="$(arm_root ds2)"; mk_systemctl "$DS2/bin" "$DS2/state" "$DS2/sc.log"
+mkdir -p "$DS2/home/.config/systemd/user"
+DS2_RC=0; DS2_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=//$DS2/home/.config/systemd/user" inst ds2 --install 2>&1)" || DS2_RC=$?
+[ "$DS2_RC" -eq 0 ] && ok 'install: a doubled-slash target installs' || bad "install: refused a doubled-slash target — $DS2_OUT"
+DS3_RC=0; DS3_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$DS2/home/.config/systemd/user" inst ds2 --install 2>&1)" || DS3_RC=$?
+[ "$DS3_RC" -eq 0 ] && ok 'install: the SAME directory under the other spelling re-installs idempotently' \
+                   || bad "install: the two spellings were counted as two copies — $DS3_OUT"
+# ⛔ THE GRADED PATH IS THE PATH THE WRITE LANDS ON (re-review P2, #2666). Resolving only the immediate parent
+# left the literal when more than the leaf was missing, so a `..` segment could stand in front of a real
+# systemd dir. The resolver now walks up to the deepest EXISTING ancestor and appends the remainder.
+say_case 'a path with a .. segment is graded after the .. is collapsed'
+DD="$(arm_root dd)"; mk_systemctl "$DD/bin" "$DD/state" "$DD/sc.log"
+for _dd in '/tmp/../etc/systemd/system.control' "$DD/missing/../usr/lib/systemd/system"; do
+  _DD_RC=0; _DD_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$_dd" inst dd --dry-run 2>&1)" || _DD_RC=$?
+  case "$_dd" in
+    *usr/lib*) [ "$_DD_RC" -eq 0 ] && ok "$_dd is ALLOWED (it collapses to a fixture dir, not /usr/lib)" \
+                                     || bad "$_dd was refused although it collapses away from /usr/lib — $_DD_OUT" ;;
+    *)         [ "$_DD_RC" -ne 0 ] && ok "$_dd is REFUSED (the .. collapses onto a real systemd dir)" \
+                                     || bad "$_dd was admitted — the graded path is not the write path — $_DD_OUT" ;;
+  esac
+done
+# ⛔ AND THE PHYSICAL SPELLING OF A NOT-YET-EXISTING USER ROOT (re-review P2, #2666): with `$HOME` a symlink and
+# `~/.local/share/systemd` absent, the `$HOME` spelling was refused while its PHYSICAL spelling was admitted —
+# same directory, two verdicts. Both must resolve to the same root now.
+say_case 'a symlinked $HOME does not change the verdict for a not-yet-created user root'
+PH="$(arm_root ph)"; mk_systemctl "$PH/bin" "$PH/state" "$PH/sc.log"
+mkdir -p "$PH/realhome/.config"
+ln -sfn "$PH/realhome" "$PH/home-link"
+for _ph in "$PH/home-link/.local/share/systemd/user" "$PH/realhome/.local/share/systemd/user"; do
+  _PH_RC=0; _PH_OUT="$(EXTRA_ENV="HOME=$PH/home-link SYSTEMD_UNIT_DIR=$_ph" inst ph --dry-run 2>&1)" || _PH_RC=$?
+  [ "$_PH_RC" -ne 0 ] && ok "a not-yet-created user root is REFUSED via $(printf '%s' "$_ph" | sed "s:$PH/::") (same verdict as its physical spelling)" \
+                      || bad "a not-yet-created real user root was admitted via a spelling alias — $_PH_OUT"
+done
 
 # ⛔ MainPID 0 WITH A *FRESH* HEARTBEAT IS STILL NOT A CONTROLLER (review P1, #2402). `is-active` reports
 # `activating` during a RestartSec wait, and a loop that ticked 10 s ago then died leaves a readable fresh
