@@ -1028,22 +1028,58 @@ fi
 # must stay USABLE (refusing it would wedge a legitimate record for ever); a COMPARED value holding a
 # non-ASCII character must be REFUSED (a real U+2028 made the shell sed truncate where the python
 # replica did not, so the slow path would decide on a truncated value the gate had just vouched for).
-echo "── §30g the reader's edge shapes: null is usable, non-ASCII compared values are not"
-K_NULL="daniel-ospina-agent-infra-2202"
-seed_payload "$STORE10" "$K_NULL" "{\"pr\":2202,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\",\"supersedes\":null}"
-RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
-assert_contains "$RS_LAST" "pulled daniel-ospina-agent-infra-2202" "§30g a record whose compared key is null still materialises"
-K_UNI="daniel-ospina-agent-infra-2203"
-seed_payload "$STORE10" "$K_UNI" "{\"pr\":2203,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\u2028x\",\"reviewed_at\":\"2026-11-13T10:00:00Z\"}"
-RS_LAST="$(rsx "$STORE10" "$BOX13" pull 2>&1)"; RS_RC=$?
-assert_contains "$RS_LAST" "unreadable=" "§30g a non-ASCII COMPARED value is refused (the two readers cannot be shown to agree)"
-if grep -q 'pulled daniel-ospina-agent-infra-2203' <<<"$RS_LAST"; then bad "§30g the non-ASCII record was installed"; else ok "§30g ...and it is not installed"; fi
+# ⛔ THE FIXTURE MUST CARRY A **RAW** U+2028 IN A COMPARED VALUE THE KEY CHECK DOES NOT READ. A first
+# draft used the JSON ESCAPE `\u2028` inside `repo`, and deleting the `isascii` arm entirely still left
+# the suite green (measured: mutant PASS=199 FAIL=0): the escape makes json decode U+2028 while the
+# text reader keeps the six literal characters, so the VALUE comparison refused it, and `repo` is
+# consumed by the key check anyway. This fixture writes the raw character (ANSI-C quoting) into
+# `verdict`, with a fresh store and box, so only the ascii arm can refuse it (verified: the mutant
+# installs it, `wrote=1`).
+echo "── §30g the reader's edge shapes: null is usable, a RAW non-ASCII compared value is not"
+ORIGIN11="$T/origin11.git"; STORE11="$T/store11"; BOX14="$T/box14"
+git init -q --bare "$ORIGIN11"; mkdir -p "$STORE11" "$BOX14"
+git -C "$STORE11" init -q; git -C "$STORE11" remote add origin "$ORIGIN11"
+git -C "$STORE11" config user.email sync@test.invalid; git -C "$STORE11" config user.name sync-test
+git -C "$STORE11" commit -q --allow-empty -m seed; git -C "$STORE11" push -q origin HEAD:refs/heads/main
+K_NULL="daniel-ospina-agent-infra-2302"
+seed_payload "$STORE11" "$K_NULL" "{\"pr\":2302,\"head_sha\":\"$HEAD_A\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-11-13T10:00:00Z\",\"supersedes\":null}"
+RS_LAST="$(rsx "$STORE11" "$BOX14" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "0" "§30g a record whose compared key is null is usable (exit 0)"
+assert_contains "$RS_LAST" "pulled daniel-ospina-agent-infra-2302" "§30g ...and it materialises"
+K_UNI="daniel-ospina-agent-infra-2303"
+# RAW U+2028 (e2 80 a8) inside `verdict`, which nothing but the compared-value arm reads.
+printf '{"pr":2303,"head_sha":"%s","verdict":"cl\342\200\250ean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-13T10:00:00Z"}' "$HEAD_A" > "$T/uni.json"
+seed_payload "$STORE11" "$K_UNI" "$(command cat "$T/uni.json")"
+RS_LAST="$(rsx "$STORE11" "$BOX14" pull 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30g a RAW non-ASCII COMPARED value is refused (exit 4)"
+assert_contains "$RS_LAST" "unreadable=1" "§30g ...counted exactly once"
+assert_contains "$RS_LAST" "json vs field" "§30g ...naming the two-reader cause"
+if [ -e "$BOX14/$K_UNI.json" ]; then bad "§30g the non-ASCII record was INSTALLED"; else ok "§30g ...and it is not installed"; fi
 
-if git -C "$STORE10" rev-parse --verify --quiet "refs/reviews/$K_AMBIG_LOCAL" >/dev/null; then
-  bad "§30e the ambiguous record was PUBLISHED anyway"
-else
-  ok "§30e ...and nothing reached the store"
-fi
+# ── §30h: the counters count RECORDS, not events. `union` runs pull AND push, so one defective key is
+# seen twice: measured before the fix, ONE ambiguous local record reported `unreadable=2` /
+# `skipped=2` / "2 record(s) were SKIPPED" — the same "look for a second record that does not exist,
+# and double the number a scheduler trends" defect cycle 4 fixed for `conflicts=`.
+echo "── §30h union counts a defective record ONCE (skipped=/unreadable=, like conflicts=)"
+ORIGIN12="$T/origin12.git"; STORE12="$T/store12"; BOX15="$T/box15"
+git init -q --bare "$ORIGIN12"; mkdir -p "$STORE12" "$BOX15"
+git -C "$STORE12" init -q; git -C "$STORE12" remote add origin "$ORIGIN12"
+git -C "$STORE12" config user.email sync@test.invalid; git -C "$STORE12" config user.name sync-test
+git -C "$STORE12" commit -q --allow-empty -m seed; git -C "$STORE12" push -q origin HEAD:refs/heads/main
+K_CNT="daniel-ospina-agent-infra-2304"
+printf '{\n  "pr": 2304,\n  "evidence": {"reviewed_at": "2020-01-01T00:00:00Z"},\n  "head_sha": "%s",\n  "verdict": "clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-11-13T10:00:00Z"\n}\n' "$HEAD_A" > "$BOX15/$K_CNT.json"
+RS_LAST="$(rsx "$STORE12" "$BOX15" union 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30h a defective record makes the union NOT converged (exit 4)"
+assert_contains "$RS_LAST" "unreadable=1 " "§30h ...and it is counted ONCE (unreadable=1, not 2 for two directions)"
+assert_contains "$RS_LAST" "skipped=1" "§30h ...and the convergence line's skipped= agrees"
+assert_contains "$RS_LAST" "1 record(s) were SKIPPED" "§30h ...and the message names one record, not two"
+# and TWO defective records are still TWO: a dedupe that also collapsed distinct keys would be worse
+K_CNT2="daniel-ospina-agent-infra-2305"
+printf '{\n  "pr": 2305,\n  "evidence": {"reviewed_at": "2020-01-01T00:00:00Z"},\n  "head_sha": "%s",\n  "verdict": "clean",\n  "repo": "daniel-ospina/agent-infra",\n  "reviewed_at": "2026-11-13T10:00:00Z"\n}\n' "$HEAD_A" > "$BOX15/$K_CNT2.json"
+RS_LAST="$(rsx "$STORE12" "$BOX15" union 2>&1)"; RS_RC=$?
+assert_eq "$RS_RC" "4" "§30h two defective records still exit 4"
+assert_contains "$RS_LAST" "unreadable=2 " "§30h ...and are counted as TWO distinct records (not 4 events)"
+assert_contains "$RS_LAST" "2 record(s) were SKIPPED" "§30h ...and the message says two"
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
