@@ -781,7 +781,12 @@ async function partB() {
     // allowance required baseline.repoKey === the sync op's repoKey, which such
     // a lane can never satisfy; the arm now decides on a live measurement.
     const ffOrigin = join(tmp, "ff-origin.git");
-    execSync(`git init -q --bare "${ffOrigin}"`, { stdio: "ignore" });
+    // #2581 — the bare repo is EMPTY, so the branch the clones below check out is named by
+    // `init.defaultBranch` from the box's EFFECTIVE config (this suite replaces HOME before it
+    // loads, so only the system/ambient channel reaches it). Where it is unset (a CI runner, a
+    // fresh cell) git names it `master`, `git push -q origin main` below fails on the refspec, and
+    // the suite reads as a regression. Name the branch in the FIXTURE (`-b main`), not on the box.
+    execSync(`git init -q --bare -b main "${ffOrigin}"`, { stdio: "ignore" });
     const ffSeed = join(tmp, "ff-seed");
     execSync(`git clone -q "${ffOrigin}" "${ffSeed}"`, { stdio: "ignore" });
     execSync("git config user.email t@t && git config user.name t", { cwd: ffSeed, stdio: "ignore" });
