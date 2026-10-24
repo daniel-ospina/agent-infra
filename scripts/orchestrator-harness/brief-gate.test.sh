@@ -328,10 +328,22 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # The CALLERS are the eight below; the rest NAME the gate on purpose and are declared rather than
 # filtered out by a pattern — a filter would silently absorb the next caller that happens to be a
 # `.md` file, which is the "gate that cannot see the thing it exists for" shape.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+#
+# ⛔ AND A SUITE THAT DRIVES `run_agent` IS A MEMBER TOO (review cycle 3, P1). `capacity-transfer.test.sh`
+# renders its brief fixture FROM this validator, so it references the gate; but the class it belongs to
+# is broader than "references": ANY suite that drives a dispatch path needs a COMPLIANT fixture, and
+# this census cannot see one that merely *drives* the path. That gap let two registered shards go red
+# in one commit (capacity-transfer and tests/pi-shim — the latter with a brief that was never created
+# at all). Declared here so the reference is accounted for; the broader class is named in the STATED
+# LIMIT below rather than silently believed to be covered.
+EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"
+# STATED LIMIT, so the next lane does not read this census as covering a class it cannot see: it counts
+# REFERENCERS under scripts/ + templates/ + AGENTS.md. A suite that drives `run_agent` (or a dispatcher)
+# through a fixture WITHOUT naming the gate is invisible here — `tests/pi-shim/run.sh` was exactly that,
+# and it was red for a missing brief fixture no census could have caught.
 [ -n "$found" ]; ck $? "…and the census found something (an empty scan is never a clean scan)"
 # …and each DISPATCH path is listed with a call, not merely a mention. This is the half that catches a
 # caller whose gate line was deleted while its comment stayed.
