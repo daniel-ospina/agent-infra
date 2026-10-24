@@ -729,9 +729,14 @@ wt_tmux_names() {
 # dead (agent-infra#2653, review round 5). Two samples, never one: see the arm in wt_table.
 WT_ABSENT_CONFIRM="${WT_ABSENT_CONFIRM:-60}"
 case "$WT_ABSENT_CONFIRM" in ''|*[!0-9]*) WT_ABSENT_CONFIRM=60 ;; esac
+# ⛔ ZERO IS NOT "OFF", IT IS "CONFIRM ON ONE SAMPLE" — the single-sample conclusion the whole rule
+# forbids, reachable by any `export` in the controller's environment (review round 7 of #2653, P2). A
+# gate that an export can defeat is not a gate; the same reasoning `wt_bounded` records for its own
+# `0`. An ALREADY-ELAPSED window is a different input and still confirms on this sample.
+[ "$WT_ABSENT_CONFIRM" -gt 0 ] 2>/dev/null || WT_ABSENT_CONFIRM=60
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree tree_err absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
+  local now ttl dir cache hdr tree tree_err tfile trc absent_now absent_since nrc names probe_ok raw="" tbl="" f name kind id st
   now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
@@ -767,24 +772,39 @@ wt_table() {
   # every row it derives FROM THE DAEMON — the record-less workers the census exists to keep. That is
   # the under-count direction (caps stop binding). So the capture is optional: if the file cannot be
   # created, the probe still runs and its stderr is discarded exactly as before.
-  tree_err="$dir/.wt-tree-err.$$"
-  if : >"$tree_err" 2>/dev/null; then
-    tree="$(cmux tree --json 2>"$tree_err")" || tree=""
-    tree_err="$(cat "$tree_err" 2>/dev/null || true)"
-    rm -f "$tree_err" 2>/dev/null || true
+  # ⛔ THREE SEPARATE NAMES, BECAUSE ONE WAS DOING TWO JOBS (review round 7 of #2653): `tree_err` held
+  # the FILE PATH and then the file's CONTENT, so `rm -f "$tree_err"` removed nothing and one capture
+  # file accumulated per controller process (carrying the daemon's stale stderr, and colliding with the
+  # next run's `mkdir`). And a failing `>` redirect prints its own diagnostic on the PRE-COMMAND stderr,
+  # which `2>/dev/null` on that simple command does not silence — the `{ …; } 2>/dev/null` group does,
+  # which matters because on an unwritable `$dir` this runs on EVERY census read and the controller's
+  # log is append-only and never rotated.
+  tfile="$dir/.wt-tree-err.$$"
+  if { : >"$tfile"; } 2>/dev/null; then
+    tree="$(cmux tree --json 2>"$tfile")" || tree=""
+    tree_err="$(cat "$tfile" 2>/dev/null || true)"
+    rm -f "$tfile" 2>/dev/null || true
   else
-    # No capture file: merge the streams, then SPLIT them on "is there JSON in here at all". The
-    # absent-owner signature lives on stderr, so simply discarding it (the pre-change behaviour) would
-    # make an unwritable `$dir` un-fixable: the census could never conclude an absent owner and the
-    # caps would pin for ever — the 26h stall again, from the other side.
-    # ⛔ DO NOT CLEAR ON A NON-ZERO EXIT HERE: the merged text IS the diagnostic (the absent-owner
-    # sentence arrives on stderr with rc=3), so `|| tree=""` would throw it away and re-hide the exact
-    # state this fallback exists to preserve. The `case` below is what decides.
-    tree="$(cmux tree --json 2>&1)" || true
-    case "$tree" in
-      *'{'*) tree_err="" ;;            # something JSON-shaped: let the parser judge it (a banner → UNKNOWN)
-      *)     tree_err="$tree"; tree="" ;;  # nothing JSON-shaped: the text IS the diagnostic
-    esac
+    # No capture file: merge the streams, then SPLIT them on RC FIRST and shape second.
+    # ⛔ RC FIRST IS THE FAIL-OPEN FIX (review round 7 of #2653, P1). The writable branch DISCARDS the
+    # reply when the read exits non-zero (`|| tree=""`), so accepting a parseable answer with a
+    # non-zero exit HERE made the two branches disagree about the same bytes: measured, one terminal
+    # record read `unknown`/count=1 with the capture writable and `dead`/count=0 with it unopenable —
+    # i.e. ONE sample emptied the census on exactly the degraded box this fallback exists for (caps
+    # stop binding, `wt_alive` says DEAD so the controller re-spawns, `wt_close` deletes a live
+    # worker's record). A non-zero exit is never a reading, in either branch.
+    # ⛔ AND THE TEXT MUST SURVIVE THAT EXIT: the absent-owner sentence arrives on stderr WITH rc=3, so
+    # clearing it would re-hide the one state this fallback preserves. It becomes the DIAGNOSTIC
+    # (`tree_err`), never the census.
+    tree="$(cmux tree --json 2>&1)"; trc=$?
+    if [ "$trc" -eq 0 ]; then
+      case "$tree" in
+        *'{'*) tree_err="" ;;              # JSON-shaped: let the parser judge it (a banner → UNKNOWN)
+        *)     tree_err="$tree"; tree="" ;; # nothing JSON-shaped: the text IS the diagnostic
+      esac
+    else
+      tree_err="$tree"; tree=""
+    fi
   fi
   # ⛔ READABILITY IS THE PROBE'S ANSWER, NOT "the daemon printed something". A reply the parser
   # cannot decode (a banner line before the JSON, a shape that drifted between cmux builds — the
@@ -827,7 +847,7 @@ wt_table() {
           # every sample restarts it, the comparison never elapses, and the census stays UNKNOWN for
           # ever — exactly the 26h stall this change exists to end, with nothing saying so. `wt_warn`
           # writes to stderr AND `$LOG`, which is where that stall would have been visible.
-          printf '%s\n' "$absent_now" > "$dir/.wt-absent-since" 2>/dev/null \
+          { printf '%s\n' "$absent_now" > "$dir/.wt-absent-since"; } 2>/dev/null \
             || wt_warn "census absent-window UNWRITABLE at $dir/.wt-absent-since — the review/fix caps cannot free until $dir is writable (the absent owner is real but cannot be CONFIRMED)"
           absent_since="$absent_now"
         fi

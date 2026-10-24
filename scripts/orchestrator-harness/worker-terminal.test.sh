@@ -95,6 +95,9 @@ case "${1:-}" in
     # "the census saw nothing", i.e. every worker dead. Measured here before it was fixed.
     if [ -n "${CMUX_TREE_JSON:-}" ]; then printf '%s\n' "$CMUX_TREE_JSON"
     else printf '%s\n' '{"workspaces":[],"screens":[],"tabs":[],"terminals":[]}'; fi
+    # ⛔ A REPLY THAT IS JSON **AND** EXITS NON-ZERO: not a reading (the writable capture branch
+    # discards it with `|| tree=""`), so the fallback must not trust it either (review round 7).
+    [ -n "${CMUX_TREE_JSON_RC:-}" ] && exit "$CMUX_TREE_JSON_RC"
     ;;
   surface)
     [ "${CMUX_HOST:-0}" = "1" ] || { echo 'cmux: unknown resource scope "surface"' >&2; exit 1; }
@@ -1487,7 +1490,11 @@ echo "── Q) an ABSENT session owner is a READING: nothing is listening, so n
 cat > "$TMP/q1.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
-export CMUX_TREE_ABSENT=1 WT_ABSENT_CONFIRM=0
+export CMUX_TREE_ABSENT=1
+# ⛔ AN ALREADY-ELAPSED WINDOW, NOT `WT_ABSENT_CONFIRM=0` (review round 7 of #2653): a zero knob would
+# confirm on ONE sample — the conclusion the rule forbids — and the module now coerces it to 60. The
+# switch that says "this outage has lasted" is this stamp, never the knob.
+printf '%s\n' "$(( $(date +%s) - 600 ))" > "$WT_DIR/.wt-absent-since"
 printf 'kind=terminal\nid=term_stale1\nworkspace=ws_stale1\n' > "$WT_DIR/worker-merge-91"
 printf 'kind=terminal\nid=term_stale2\nworkspace=ws_stale2\n' > "$WT_DIR/worker-fix-92"
 . "$1"
@@ -1537,7 +1544,8 @@ for _msg in 'cannot connect to session socket /tmp/x.sock: No such file or direc
   cat > "$TMP/q3.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
-export CMUX_TREE_ABSENT=1 CMUX_TREE_ABSENT_MSG="$4" WT_ABSENT_CONFIRM=0
+export CMUX_TREE_ABSENT=1 CMUX_TREE_ABSENT_MSG="$4"
+printf '%s\n' "$(( $(date +%s) - 600 ))" > "$WT_DIR/.wt-absent-since"   # an ELAPSED window
 printf 'kind=terminal
 id=term_live5
 workspace=ws_live5
@@ -1616,7 +1624,7 @@ id=term_w1
 workspace=ws_w1
 ' > "$O/state/worker-merge-99"
 chmod 500 "$O/state"
-WT_DIR="$O/state"; WT_TABLE_TTL=0; export CMUX_TREE_ABSENT=1 WT_ABSENT_CONFIRM=0
+WT_DIR="$O/state"; WT_TABLE_TTL=0; export CMUX_TREE_ABSENT=1
 . "$1"
 wt_table >/dev/null 2>"$O/err.txt" || true
 chmod 700 "$O/state"
@@ -1625,6 +1633,76 @@ SH
 out="$(bash "$TMP/q7.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O24" 2>&1)"
 case "$out" in *"UNWRITABLE"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "an unwritable absent-window is NAMED (an inert release cannot pass as a bounded one)" $rc
+
+# ⛔ AN RC!=0 REPLY IS NEVER THE CENSUS — IN EITHER BRANCH (review round 7 of #2653, P1). The writable
+# capture path discards it (`|| tree=""`); the merged fallback used to trust a JSON-shaped answer
+# regardless of rc, so the SAME bytes read `unknown`/count=1 with a writable dir and `dead`/count=0
+# without one — one sample emptying the census on exactly the degraded box the fallback exists for.
+cat > "$TMP/q10.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; mkdir -p "$O/state"
+printf 'kind=terminal\nid=term_rc1\nworkspace=ws_rc1\n' > "$O/state/worker-merge-96"
+export CMUX_TREE_JSON='{"workspaces":[],"screens":[],"tabs":[],"terminals":[]}' CMUX_TREE_JSON_RC=3
+chmod 500 "$O/state"                       # the capture CANNOT be written → the merged fallback runs
+WT_DIR="$O/state"; WT_TABLE_TTL=0
+. "$1"
+echo "alive=$(wt_alive merge-96 && echo yes || echo no)"
+echo "count=$(wt_count merge-)"
+SH
+out="$(bash "$TMP/q10.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O27" 2>&1)"
+case "$out" in *"alive=yes"*"count=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a JSON reply with rc!=0 is UNKNOWN in the merged fallback too (no single-sample emptying)" $rc
+
+# ⛔ AND THE KNOB IS NOT AN OFF-SWITCH (review round 7 of #2653, P2): `WT_ABSENT_CONFIRM=0` would
+# confirm on ONE sample — the conclusion the rule forbids — and any `export` could set it. It is
+# coerced, so the first sample still keeps the caps binding.
+cat > "$TMP/q11.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+printf 'kind=terminal\nid=term_k0\nworkspace=ws_k0\n' > "$WT_DIR/worker-merge-95b"
+export CMUX_TREE_ABSENT=1 WT_ABSENT_CONFIRM=0
+. "$1"
+echo "count=$(wt_count merge-)"
+SH
+out="$(bash "$TMP/q11.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O28" 2>&1)"
+case "$out" in *"count=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "WT_ABSENT_CONFIRM=0 cannot disable the two-sample rule (an export is not a gate)" $rc
+
+# ⛔ THE SPAWN-CLEAR NEEDS A PIN, OR A REFACTOR THAT FOLDS IT INTO wt_forget STAYS GREEN (review
+# round 7 of #2653). A terminal spawn PROVES the cmux owner answered, so it must close the absent
+# window; a TMUX spawn proves nothing about that owner (and is exactly what the controller keeps doing
+# during an outage), so it must NOT — otherwise the 60s timer restarts on every outage spawn and the
+# 26h stall returns.
+mkdir -p "$TMP/home-q8" "$TMP/home-q9"
+gh_hosts_fixture "$TMP/home-q8"; gh_hosts_fixture "$TMP/home-q9"
+cat > "$TMP/q8.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_LOG="$4"; : > "$CMUX_LOG"
+WT_WORKER_HOME="$5"
+printf '%s\n' "$(( $(date +%s) - 600 ))" > "$WT_DIR/.wt-absent-since"
+. "$1"
+echo "window-before=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+wt_spawn "merge-77" "/tmp" 'bash /tmp/w.sh 77 b o/r'; echo "spawn_rc=$?"
+echo "window-after=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+SH
+out="$(bash "$TMP/q8.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O25" "$TMP/cmux25.log" "$TMP/home-q8" 2>&1)"
+case "$out" in *"window-before=open"*"spawn_rc=0"*"window-after=closed"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a successful TERMINAL spawn closes the absent window (the owner answered)" $rc
+
+cat > "$TMP/q9.sh" <<'SH'
+set -u
+PATH="$2:$3:$PATH"; O="$4"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_ABSENT=1 TMUX_LOG="$5"; : > "$TMUX_LOG"
+WT_WORKER_HOME="$6"
+printf '%s\n' "$(( $(date +%s) - 600 ))" > "$WT_DIR/.wt-absent-since"
+. "$1"
+wt_spawn "lane-78" "/tmp" 'bash /tmp/w.sh 78 b o/r'; echo "spawn_rc=$?"
+echo "window-after=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+SH
+out="$(bash "$TMP/q9.sh" "$LIB" "$TMP/bin-cmux" "$TMP/stub" "$TMP/O26" "$TMP/tmux26.log" "$TMP/home-q9" 2>&1)"
+case "$out" in *"spawn_rc=0"*"window-after=open"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a TMUX spawn does NOT close the absent window (it proves nothing about the cmux owner)" $rc
 
 echo
 echo "── H) the controller's capacity probes answer on BOTH platforms (agent-infra#1702) ──"
