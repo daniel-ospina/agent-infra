@@ -149,8 +149,10 @@ reviewer_brief_section() {
 ⛔ ${REVIEWER_HEAD_BINDING}. If you push again after recording the record is void UNLESS the CARRY
 below applies — re-record, or re-run the recorder naming the RECORDED head so it carries.
 ⛔ A CARRY IS NOT A RE-REVIEW (#2343). ${REVIEWER_PREFLIGHT_CARRY_CLAUSE}.
-⛔ NEVER edit the PR body after recording: \`record-review.sh --evidence\` verifies the artifact, and
-an edited body is a changed artifact the next reader cannot trust.
+⛔ NEVER edit the PR body after recording to ADD or REWORD prose: \`record-review.sh --evidence\`
+verifies the artifact, and an edited body is a changed artifact the next reader cannot trust. The
+ONE exception is the [c] remedy — deleting a stale \`review recorded:\` line, which the recorder
+appends and never removes.
 ⛔ If the rail refuses, read its reason — it names the command to run. Do not retry at the same head.
 BRIEF
       ;;
@@ -215,9 +217,13 @@ landing_artifacts_brief_section() {
   case "$role" in
     self)
       record="**Record AFTER your last push, then RE-RECORD if the head moves** — ${LANDING_HEAD_BINDING}: an
-  older-head record certifies a revision that is no longer the PR, and the check refuses it. The
-  recorder appends that line; its \`--evidence\` artifact is the PR comment carrying the reviewer's
-  verdict (see the reviewer step below):
+  older-head record certifies a revision that is no longer the PR, and the check refuses it. Record
+  the verdict the work EARNS: \`clean-micro\` is refused on a non-micro issue (#513) and \`clean-low\` only
+  on a diff whose every changed path is in the Low content-shape class (#1356), so in doubt use
+  \`clean\`. And if the PR body already carries an older verdict line, DELETE it — the recorder
+  APPENDS, it never removes, so a stale \`verdict=clean-micro\` keeps the check failing even after a
+  fresh \`clean\` record at the current head. The recorder's \`--evidence\` artifact is the PR comment
+  carrying the reviewer's verdict (see the reviewer step below):
   \`~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>\`"
       ;;
     harness)
@@ -252,17 +258,14 @@ it). Four of them are only producible while you work, so produce them as you go.
   documented shapes are ALSO accepted: a leading ATX heading (\`## Scope — …\`) with the marker on the
   first content line after it, and the marker as the LAST line with content, set off by a blank line
   as a footer block. A marker quoted in a table, fence or discussion counts nowhere: those are
-  mentions, not artifacts. READ THE THREAD FIRST: if the issue already carries a scoping comment,
-  extend it — do not post a second one, the check needs ONE comment carrying the marker. Otherwise
-  post it with \`gh issue comment <ISSUE> --repo <OWNER/REPO> --body-file <file>\`.
+  mentions, not artifacts. READ THE THREAD FIRST: if a scoping comment already exists, ADD to it
+  rather than starting over — and if its marker sits as a footer, insert ABOVE the marker, because a
+  marker that is no longer first-or-footer stops being an artifact. To post one (posting a SECOND
+  comment also satisfies the check; it scans every comment):
+  \`gh issue comment <ISSUE> --repo <OWNER/REPO> --body-file <file>\`.
 - **[c] the code-review record, bound to the PR's CURRENT head** — a line of exactly this shape, in
   the PR body or a commit message, naming THIS PR, THIS repo and THIS head:
   \`review recorded: reviews/<PR>.json verdict=<clean|clean-micro|clean-low> @ <40-hex head sha> (<owner/repo>)\`.
-  Record the verdict the work EARNS: \`clean-micro\` is refused on a non-micro issue (#513) and \`clean-low\`
-  only on a diff whose every changed path is in the Low content-shape class (#1356), so in doubt the
-  recorder is run with \`clean\`. And if the PR body already carries an older verdict line, DELETE it:
-  the recorder APPENDS, it never removes, so a stale \`verdict=clean-micro\` keeps the check failing
-  even after a fresh \`clean\` record at the current head.
   ${record}
 - **[d] plan evidence** (\`complexity:standard\` / \`complexity:complex\` only): the PR changes a file
   under \`docs/plans/*.md\`, OR the scoping comment carries a \`## Wiring\` section (the wiring-check

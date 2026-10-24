@@ -66,21 +66,22 @@ it). Four of them are only producible while you work, so produce them as you go.
   documented shapes are ALSO accepted: a leading ATX heading (`## Scope — …`) with the marker on the
   first content line after it, and the marker as the LAST line with content, set off by a blank line
   as a footer block. A marker quoted in a table, fence or discussion counts nowhere: those are
-  mentions, not artifacts. READ THE THREAD FIRST: if the issue already carries a scoping comment,
-  extend it — do not post a second one, the check needs ONE comment carrying the marker. Otherwise
-  post it with `gh issue comment <ISSUE> --repo <OWNER/REPO> --body-file <file>`.
+  mentions, not artifacts. READ THE THREAD FIRST: if a scoping comment already exists, ADD to it
+  rather than starting over — and if its marker sits as a footer, insert ABOVE the marker, because a
+  marker that is no longer first-or-footer stops being an artifact. To post one (posting a SECOND
+  comment also satisfies the check; it scans every comment):
+  `gh issue comment <ISSUE> --repo <OWNER/REPO> --body-file <file>`.
 - **[c] the code-review record, bound to the PR's CURRENT head** — a line of exactly this shape, in
   the PR body or a commit message, naming THIS PR, THIS repo and THIS head:
   `review recorded: reviews/<PR>.json verdict=<clean|clean-micro|clean-low> @ <40-hex head sha> (<owner/repo>)`.
-  Record the verdict the work EARNS: `clean-micro` is refused on a non-micro issue (#513) and `clean-low`
-  only on a diff whose every changed path is in the Low content-shape class (#1356), so in doubt the
-  recorder is run with `clean`. And if the PR body already carries an older verdict line, DELETE it:
-  the recorder APPENDS, it never removes, so a stale `verdict=clean-micro` keeps the check failing
-  even after a fresh `clean` record at the current head.
   **Record AFTER your last push, then RE-RECORD if the head moves** — a record bound to an older head is STALE, so a moved head must be RE-RECORDED at the new head: an
-  older-head record certifies a revision that is no longer the PR, and the check refuses it. The
-  recorder appends that line; its `--evidence` artifact is the PR comment carrying the reviewer's
-  verdict (see the reviewer step below):
+  older-head record certifies a revision that is no longer the PR, and the check refuses it. Record
+  the verdict the work EARNS: `clean-micro` is refused on a non-micro issue (#513) and `clean-low` only
+  on a diff whose every changed path is in the Low content-shape class (#1356), so in doubt use
+  `clean`. And if the PR body already carries an older verdict line, DELETE it — the recorder
+  APPENDS, it never removes, so a stale `verdict=clean-micro` keeps the check failing even after a
+  fresh `clean` record at the current head. The recorder's `--evidence` artifact is the PR comment
+  carrying the reviewer's verdict (see the reviewer step below):
   `~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>`
 - **[d] plan evidence** (`complexity:standard` / `complexity:complex` only): the PR changes a file
   under `docs/plans/*.md`, OR the scoping comment carries a `## Wiring` section (the wiring-check
@@ -145,8 +146,10 @@ flag does either.
    RAIL="scripts/$(printf 'a%s' 'dmin')-$(printf 'mer%s' 'ge').sh"
    ```
 
-⛔ **Never edit the PR body after recording.** `record-review.sh --evidence` verifies the review
-artifact; an edited body is a changed artifact the next reader cannot trust.
+⛔ **Never edit the PR body after recording to add or reword prose.** `record-review.sh --evidence`
+verifies the review artifact; an edited body is a changed artifact the next reader cannot trust. The
+one exception is deleting a stale `review recorded:` line (the [c] remedy — the recorder appends and
+never removes).
 ⛔ **A CARRY IS NOT A RE-REVIEW (#2343).** You do not pay for a second review when a **valid** record
    already exists. Pass the head **and the verdict** that record already names — the REVIEWED head, not the live one;
    a `clean-micro` record stays `clean-micro`, because the lane arm does not compare verdicts — and

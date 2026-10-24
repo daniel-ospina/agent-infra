@@ -330,6 +330,10 @@ echo
 echo "§F.2 role-correct on [c] only — who mints the record differs, what is owed does not"
 case "$LANDING_SELF" in *"Record AFTER your last push, then RE-RECORD if the head moves"*) rc=0;; *) rc=1;; esac
 ck $rc "self: the LANE records (after the last push) and re-records when the head moves"
+case "$LANDING_SELF" in *"insert ABOVE the marker"*) rc=0;; *) rc=1;; esac
+ck $rc "…and says how to extend a FOOTER-shaped scoping comment without destroying its position"
+case "$LANDING_SELF" in *"posting a SECOND"*"satisfies the check"*) rc=0;; *) rc=1;; esac
+ck $rc "…and that a second comment is accepted (the check scans every comment)"
 case "$LANDING_SELF" in *'`merge-one.sh` mints'*) rc=1;; *) rc=0;; esac
 ck $rc "…and is not told merge-one.sh mints it (the two roles cannot collapse)"
 case "$LANDING_HARNESS" in *'`merge-one.sh` mints'*) rc=0;; *) rc=1;; esac
@@ -338,6 +342,17 @@ case "$LANDING_HARNESS" in *"Record AFTER your last push"*) rc=1;; *) rc=0;; esa
 ck $rc "⛔ …and is NOT told to record it (this lane has no reviewer to point --evidence at)"
 case "$LANDING_HARNESS" in *"do NOT amend, rebase or push again"*) rc=0;; *) rc=1;; esac
 ck $rc "…its duty is the head: no amend/rebase/push once the record exists"
+# ⛔ NOT JUST THE SENTENCE, THE ADVICE (cycle-3 review, P2): "in doubt use `clean`" and the stale-line
+# deletion are the RECORDER's business, so a harness lane must not be handed them four lines before
+# being told merge-one.sh mints the record.
+case "$LANDING_HARNESS" in *"in doubt use"*) rc=1;; *) rc=0;; esac
+ck $rc "⛔ …and is NOT given the recorder's verdict/stale-line advice (it does not run the recorder)"
+case "$LANDING_SELF" in *"in doubt use"*) rc=0;; *) rc=1;; esac
+ck $rc "the SELF role does carry that advice (it is the one that runs the recorder)"
+# …and the post-record body-edit ban must carry its ONE exception, or the [c] remedy contradicts it.
+# It lives in the REVIEWER brief section (where the ban is stated), not in the landing section.
+case "$SELF_BRIEF" in *"ONE exception is the [c] remedy"*) rc=0;; *) rc=1;; esac
+ck $rc "the body-edit ban names its one exception (deleting a stale record line — the [c] remedy)"
 for L in "$LANDING_SELF" "$LANDING_HARNESS"; do has_honesty "$L"; ck $? "each role carries the no-fabrication paragraph (neither can be the honest one by accident)"; done
 has_mech_1 "$LANDING_HARNESS" && has_mech_2 "$LANDING_HARNESS"; ck $? "both commit mechanics are in the harness section lane.sh splices"
 # ⛔ ALL FIVE, IN BOTH ROLES (cycle-2 review, P2). §F.1 reads the composed HARNESS brief; §F.3 pins the
@@ -406,7 +421,11 @@ has_scoping_marker "$SC_BRIEF"; ck $? "[b] the brief's shape (marker = FIRST con
 has_scoping_marker 'Discussed first.
 
 <!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
-[ "$rc" -eq 0 ]; ck $? "…and a BLANK-LINE-SEPARATED FOOTER is ACCEPTED too (the check's ONE alternative — an earlier draft of this test claimed the marker must be first, and THIS gate falsified the claim)"
+[ "$rc" -eq 0 ]; ck $? "…and a BLANK-LINE-SEPARATED FOOTER is ACCEPTED (one of the two documented alternatives — an earlier draft claimed the marker must be first, and THIS gate falsified it)"
+# ⛔ THE HEADING SHAPE IS THE THIRD (cycle-3 review, P2): the brief names it, so it must be driven, or a
+# gate that stopped skipping headings would leave a lane following the brief rejected with §F all green.
+has_scoping_marker $'## Scope — #2325\n<!-- issue-scoping: v5.1 double diamond + verify -->\n\nboundaries.'; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a leading ATX heading with the marker on the next content line is ACCEPTED (the #729/#843 shape the brief names)"
 has_scoping_marker 'Discussed first.
 <!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
 [ "$rc" -ne 0 ]; ck $? "⛔ …while a marker CROWDED under a preamble (no blank line) FAILS (that is the mention shape)"
