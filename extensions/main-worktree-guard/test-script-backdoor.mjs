@@ -371,26 +371,28 @@ async function partB() {
     // be a content relaxation: the exemption is the PINNED IDENTITY, never the bytes.
     // ⛔ This arm pins "the same program elsewhere is not exempt". It does NOT pin the
     // #1228 arm the fix relaxed — measured at review: this copy is refused by the #1484
-    // content walk (it runs `git`-bearing code), so it would block with or without the
-    // stand-down. The fail-closed control for the CHANGED arm is B5c3 below, which a
-    // reason assertion makes checkable (#709 + the expansion wording), the same way B3b
-    // and B5e identify their refuser.
+    // unresolvable-delegation TEXT arm (the shim has no `git` invocation at all;
+    // `allGitInvocations(shim)` is empty), so it blocks with or without the stand-down.
+    // The fail-closed control for the CHANGED arm's KEY is in test-sanctioned-identity.mjs
+    // `(b3)` + mutation `M6` (a planted body at a sanctioned relpath under the module root
+    // must stay blocked, and must be admitted when the digest is dropped); B5c3 below keeps
+    // the arm itself alive for non-sanctioned bodies.
     const copiedShim = join(hub, "scripts", "shim-copy");
     mkdirSync(join(hub, "scripts"), { recursive: true });
     writeFileSync(copiedShim, readFileSync(shim));
     expectTrue("B5c2 (b): the SAME shim bytes at a non-sanctioned path → BLOCKED (identity-keyed, not content-keyed)",
       blocked(await bash(`bash scripts/shim-copy issue list --repo o/r --limit 1`, hub)), "was allowed");
-    // ⛔ B5c3 — the CONTROL for the one arm the sanctioned stand-down relaxes. This body
-    // is the shape the stand-down exists for (a readable script whose content carries a
-    // runtime-expanded operand, one level in) at a NON-sanctioned path, so it must still be
-    // refused BY THAT ARM: if the stand-down were keyed on anything an agent controls (the
-    // path, the relpath, the filename), this script would run and the discard it names would
-    // be unread, which is the #1228 fail-open. Measured reason: #709 script-indirection.
+    // ⛔ B5c3 — the #1228 arm still exists for NON-sanctioned bodies: a readable script whose
+    // content carries a runtime-expanded operand, at a path that is not on the sanctioned
+    // list, must still be refused BY THAT ARM (asserted on `#709` + the expansion wording,
+    // so it cannot pass for the wrong reason). It does NOT pin the DIGEST key of the
+    // sanctioned stand-down — a non-sanctioned path is never exempt — that is (b3)/M6 in
+    // test-sanctioned-identity.mjs. Measured reason: #709 script-indirection.
     const shapeCopy = join(hub, "scripts", "shim-shape");
     writeFileSync(shapeCopy, '#!/bin/bash\ngrep -qa m <(head -c 10 "$HOME/x")\n');
     const shapeRes = await bash("bash scripts/shim-shape", hub);
-    expectTrue("B5c3 (b): a NON-sanctioned body with the same expanded-operand shape → BLOCKED (#709), so the stand-down is not content-keyed",
-      blocked(shapeRes) && /#709/.test(shapeRes.reason) && /shell-expansion form/.test(shapeRes.reason),
+    expectTrue("B5c3 (b): a NON-sanctioned body with the same expanded-operand shape → BLOCKED (#709), so the arm is still live",
+      blocked(shapeRes) && /#709/.test(String(shapeRes.reason)) && /shell-expansion form/.test(String(shapeRes.reason)),
       `reason=${String(shapeRes && shapeRes.reason).split("\n")[0]}`);
     // The #1129 adversarial-review P0 boundary: a committed git-DESTRUCTIVE
     // framework helper is NOT on the list and must stay refused.
