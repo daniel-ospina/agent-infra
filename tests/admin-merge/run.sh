@@ -14534,6 +14534,16 @@ cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD2/"
 bash -n "$MUTD2/admin-merge.sh" \
   && pass "(n2) the mutant (equivalence deleted) is still valid bash" \
   || fail "(n2) the mutant does not parse — the mutation is not a clean arm deletion"
+# ⛔ THE ARM MUST BE ABLE TO FAIL, AND THAT IS ASSERTED, NOT ASSUMED (#2610 review). An absence
+# assertion is only as strong as the presence it depends on: without this precondition the arm
+# below reads "the mapped line is gone" about a scenario that never printed it. Measured with the
+# equivalence neutered BEFORE this arm existed: the suite reported
+#   ✅ (n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm
+# while the mapping was absent — a green arm asserted rather than verified. Same shape as (m)'s
+# own precondition: the SAME scenario through the UNMUTATED rail must carry the line first.
+grep -q "base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/err" 2>/dev/null \
+  && pass "(n2) precondition: the UNMUTATED rail on this scenario prints the mapped answer" \
+  || fail "(n2) precondition FAILED — the unmutated rail never printed the mapped answer, so the absence arm below would pass vacuously: $(grep -c 'base:' "$SCEN_EQ/err" 2>/dev/null || printf 'unreadable')"
 SCEN="$SCEN_EQ" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
   ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
   ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
@@ -14568,6 +14578,13 @@ bash -n "$MUTD3/admin-merge.sh" \
 grep -q 'bash-suites\*)' "$MUTD3/admin-merge.sh" \
   && pass "(n3) …and it really carries the widened pattern (not the shipped one)" \
   || fail "(n3) the widening did not apply — the arm would be vacuous"
+# ⛔ SAME PRECONDITION DISCIPLINE AS (n2)/(m): the absence arms below are about a line the
+# UNMUTATED rail must NOT print on this scenario, so assert the answer it DOES print first. A
+# scenario that had drifted to a different check name would otherwise satisfy every absence arm
+# at once and prove nothing about the digits guard.
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_UNMAPPED/err" 2>/dev/null \
+  && pass "(n3) precondition: the UNMUTATED rail on this scenario prints today's absence answer" \
+  || fail "(n3) precondition FAILED — the unmutated rail did not print the absence answer, so the absence arms below would pass vacuously: $(grep -c 'base:' "$SCEN_UNMAPPED/err" 2>/dev/null || printf 'unreadable')"
 SCEN="$SCEN_UNMAPPED" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
   ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
   ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
