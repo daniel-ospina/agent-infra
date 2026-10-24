@@ -408,6 +408,11 @@ fi
 # or AGENT_DISK_REFUSED (77);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
+# A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
+# AGENT_MEM_REFUSED (81), AGENT_BRIEF_REFUSED (80) or AGENT_DISK_REFUSED (77);
+# AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
+# namespace and could exit any of those itself (#1720).
+
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
   # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns
