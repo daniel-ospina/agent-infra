@@ -70,8 +70,14 @@ release_issue_claim_unspawned() { # <issue>
 # The controller appends each id to `$O/dispatched.txt` and `.batch` BEFORE calling this script, so a
 # refusal that only releases the claim leaves a row that makes this box skip a FREE issue until the
 # reaper prunes it. The CI-queue deferral already did this correctly (and exits 3 so the cycle record
-# says `dispatched=0`); the repo-target refusals must do the same, or the funnel reports work that
-# never started. One helper, used by every refusal path.
+# says `dispatched=0`); the BATCH-level repo-target refusals must do the same, and do — every one of
+# them exits 72, which orch-loop.sh's `_dmrc` arm turns into `K=0` for the batch. One helper, used by
+# every refusal path, so no path can drop a claim and keep the row.
+#   ⚠️ SCOPE: a PER-ISSUE refusal (`continue`, below) still drops its row and releases its claim, but
+#   leaves this script's exit status 0 — the controller still counts that batch as dispatched. It is
+#   latent, not measured: after the batch-level assertion the worktree is created inside the asserted
+#   checkout, so the per-issue slug/dir half cannot fire today. Recorded here so the next refusal path
+#   added below reads the real invariant instead of "the funnel is fixed" (follow-up issue).
 drop_dispatched_rows() {
   local ids="" n tmp
   for n in "$@"; do case "${n:-}" in ''|*[!0-9]*) continue ;; esac; ids="$ids $n"; done

@@ -26,9 +26,10 @@
 # the same resolver `orch-loop.sh` and `refresh-candidates.sh` read (#2040). This file adds only the
 # IDENTITY COMPARISON, which no existing module owned.
 #
-# SOURCED by lane.sh (the start gate inside the worktree), dispatch-merge.sh (the issue-lane builder)
-# and fix-one.sh (the PR-lane builder). ⛔ Present on a deployed box or those three refuse to start
-# (exit 78): a gate that silently degrades to no gate is the defect this file exists to remove.
+# SOURCED by lane.sh (the start gate inside the worktree), dispatch-merge.sh (the issue-lane builder),
+# fix-one.sh (the PR-lane builder) and adopt-fix.sh (the PR-repair lane). ⛔ Present on a deployed box
+# or ALL FOUR refuse to start (exit 78): a gate that silently degrades to no gate is the defect this
+# file exists to remove.
 set -u
 
 # The exit code callers use for this refusal. 72 is free in scripts/ and distinct from the capacity
@@ -62,7 +63,14 @@ repo_target_slug() {
   local p="${1:-}" url
   [ -n "$p" ] && [ -d "$p" ] || return 1
   command -v repo_slug_from_remote >/dev/null 2>&1 || return 1
-  url="$(_repo_target_git -C "$p" remote get-url origin 2>/dev/null)" || return 1
+  # ⛔ READ THE CONFIGURED VALUE, NOT `remote get-url` (#2762 review, P1). `get-url` APPLIES
+  # `url.<base>.insteadOf` rewrites, and an ambient `GIT_CONFIG_GLOBAL` carrying a cross-repo rewrite
+  # made a tortoise worktree answer the agent-infra slug — through the scrub, `result=OK`, lane and
+  # chain spawned in the wrong repo (measured). `config --get remote.origin.url` returns what the repo
+  # was cloned from and is immune to that rewrite; a legitimate MIRROR rewrite (which `get-url` would
+  # turn into a local path, refusing every correct dispatch as `worktree-origin-unreadable`) also
+  # keeps its GitHub slug here.
+  url="$(_repo_target_git -C "$p" config --get remote.origin.url 2>/dev/null)" || return 1
   [ -n "$url" ] || return 1
   repo_slug_from_remote "$url" 2>/dev/null
 }
@@ -109,6 +117,12 @@ repo_target_valid_slug() {
 #   rc 0 = the worktree IS the target; REPO_TARGET_REFUSED (72) = refuse to start anything.
 # Either <target-slug> or <target-dir> (or both) must be named. <target-slug> wins when both are
 # given; <target-dir> then supplies the identity comparison as well.
+#   `reason=` tokens: no-target, target-invalid, target-unreadable, target-dir-unreadable, target-self,
+#   worktree-missing, worktree-not-a-repo, worktree-origin-unreadable, slug-mismatch, dir-mismatch.
+#   A lane can emit the identity line `result=OK` and then a `result=REFUSED reason=target-underivable`
+#   line (the `--repo-dir`-only path had no slug to record yet): operators read the LAST `result=`
+#   line for a dispatch, never `head -1` — see `repo_target_refuse` below, the one producer of that
+#   second line.
 repo_target_assert() {
   local label="${1:-dispatch}" wt="${2:-}" want="${3:-}" wantdir="${4:-}"
   local slug="" wdir="" cw="" cwant="" wreal="" wantreal="" want_derived=0 reason="" human="" result="REFUSED"
@@ -195,6 +209,17 @@ repo_target_assert() {
   fi
   printf '[repo-target] %s result=REFUSED repo=%s worktree=%s target=%s target_dir=%s reason=%s — REFUSED: %s\n' \
     "$label" "${slug:-UNREADABLE}" "${wdir:-${wt:-<none>}}" "${want:-<none>}" "${wantdir:-<none>}" "$reason" "$human"
+  return "$REPO_TARGET_REFUSED"
+}
+
+# repo_target_refuse <label> <reason> <human> — the ONE producer of a refusal emitted OUTSIDE an
+# assertion (lane.sh's `--repo-dir`-only path, where the identity assertion already passed and the
+# refusal is that no slug could be derived for the brief). Same format, same reason vocabulary, so an
+# operator greps one shape and a format change cannot drift between two hand-written printfs.
+repo_target_refuse() {
+  local label="${1:-dispatch}" reason="${2:-refused}" human="${3:-refusing}"
+  printf '[repo-target] %s result=REFUSED repo=UNREADABLE worktree=%s target=<none> target_dir=<none> reason=%s — REFUSED: %s\n' \
+    "$label" "${PWD:-<none>}" "$reason" "$human"
   return "$REPO_TARGET_REFUSED"
 }
 

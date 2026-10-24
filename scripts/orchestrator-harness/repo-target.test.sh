@@ -13,8 +13,9 @@
 #   A  the shared identity assertion: target+worktree agree; mismatch refuses naming BOTH slugs; no
 #      target refuses with a named reason; two checkouts of the SAME slug are distinguished by
 #      directory; an unreadable origin is a refusal, never a pass; the branch-level assertion; ambient
-#      GIT_DIR cannot forge it; case-insensitive slugs pass; a self-referential target dir refuses; a
-#      malformed target refuses.
+#      GIT_DIR cannot forge it; a `url.*.insteadOf` rewrite cannot forge it EITHER (raw config read),
+#      and a legitimate MIRROR rewrite does not refuse a correct pair; case-insensitive slugs pass; a
+#      self-referential target dir refuses; a malformed target refuses; the three shape rules agree.
 #   B  lane.sh (the start gate inside the worktree): matching target starts; tortoise worktree with an
 #      agent-infra target REFUSES (72) with both slugs in the message and writes NO brief; no target
 #      refuses; a flag/positional contradiction refuses; a worktree checked out on another branch
@@ -25,12 +26,15 @@
 #      target materialises and passes both assertions.
 #   D  dispatch-merge.sh (the issue-lane builder): a checkout that is not the target refuses the whole
 #      batch (both slugs named); no target refuses.
-#   F  the module is REQUIRED: absent or stale -> exit 78 in EVERY caller (lane, fix-one, dispatch-merge).
+#   F  the module is REQUIRED: absent or stale -> exit 78 in EVERY caller (lane, fix-one,
+#      dispatch-merge, adopt-fix).
+#   E  the non-vacuity proof (optional): the PRE-FIX lane starts the wrong-repo lane.
 #
 # HERMETIC: every repo is a throwaway `git init` under a temp dir, and `http.proxy` points at a closed
-# local port so the one fetch under test fails instantly without network while `git remote get-url`
-# keeps answering the GitHub slug (do NOT rewire origin with `url.<path>.insteadOf`: it rewrites
-# `get-url` too and makes every fixture unreadable).
+# local port so the one fetch under test fails instantly without network. Fixture repos keep their
+# GitHub origin URL (never rewire it: `url.<path>.insteadOf` rewrites `get-url` and makes the fixture
+# unreadable). A11/A12 add a rewrite deliberately, through `GIT_CONFIG_GLOBAL`, to prove the identity
+# read is the RAW configured value; they are the only places a rewrite is used.
 # Run: bash repo-target.test.sh            (and `--nonvacuity <rev>` to re-measure the pre-fix tree)
 set -u
 
@@ -148,6 +152,37 @@ A10="$(repo_target_assert "unit" "$TWT" "tortoise" "")"; a10=$?
 A10b="$(repo_target_assert "unit" "$TWT" "/tmp/not-a-slug" "")"; a10b=$?
 { [ "$a10" -eq 72 ] && grep -q 'reason=target-invalid' <<<"$A10" \
     && [ "$a10b" -eq 72 ] && grep -q 'reason=target-invalid' <<<"$A10b"; }; ck "A10 malformed target ('tortoise', a path) -> REFUSED reason=target-invalid, not a wrong-repo claim" $?
+
+# ⛔ A `url.<base>.insteadOf` REWRITE MUST NOT FORGE THE SLUG (#2762 review, P1). `git remote get-url`
+# APPLIES url rewrites, so an ambient `GIT_CONFIG_GLOBAL` mapping the tortoise URL onto agent-infra's
+# made a tortoise worktree answer `agent-infra` — through the GIT_DIR scrub — and the gate printed
+# `result=OK`: the measured #2724 defect, certified by the gate built to stop it. Identity is read
+# from `config --get remote.origin.url` (raw), which no rewrite touches.
+FORGE_CFG="$T/gc-forge"
+printf '[url "https://github.com/daniel-ospina/agent-infra.git"]\n\tinsteadOf = https://github.com/daniel-ospina/tortoise.git\n' > "$FORGE_CFG"
+FORGED="$(GIT_CONFIG_GLOBAL="$FORGE_CFG" "$REAL_GIT" -C "$TWT" remote get-url origin 2>/dev/null || true)"
+A11="$(GIT_CONFIG_GLOBAL="$FORGE_CFG" repo_target_assert "unit" "$TWT" "daniel-ospina/agent-infra" "")"; a11=$?
+{ [ "$a11" -eq 72 ] && grep -q 'repo=daniel-ospina/tortoise' <<<"$A11" \
+    && grep -q 'reason=slug-mismatch' <<<"$A11" && grep -q 'agent-infra' <<<"$FORGED"; }; ck "A11 a url.insteadOf rewrite that DOES re-point get-url ('$FORGED') does not forge the identity (72)" $?
+# ...and the other direction: a LEGITIMATE mirror rewrite must not make a correct pair unreadable.
+# (`remote get-url` answers the local mirror path, so the old read refused every correct dispatch.)
+MIRROR_CFG="$T/gc-mirror"
+printf '[url "/srv/mirror/tortoise.git"]\n\tinsteadOf = https://github.com/daniel-ospina/tortoise.git\n' > "$MIRROR_CFG"
+A12="$(GIT_CONFIG_GLOBAL="$MIRROR_CFG" repo_target_assert "unit" "$TWT" "daniel-ospina/tortoise" "")"; a12=$?
+{ [ "$a12" -eq 0 ] && grep -q 'result=OK' <<<"$A12"; }; ck "A12 a benign MIRROR rewrite does not refuse a correct pair (raw config, not the rewritten URL)" $?
+
+# ONE OWNER FOR THE SHAPE RULE, MEASURED (#2762 review, P2): a hand-copy that agrees on the two shapes
+# A10 pins and diverges elsewhere would pass A10. Drive all three through one table.
+shape_bad=0
+for s in 'a/b' 'A/B' 'acme/widget.js' 'tortoise' '/tmp/x' 'a/b/c' 'a:b/c' 'a b/c' 'a//'; do
+  if repo_slug_valid "$s"; then vs=0; else vs=1; fi
+  if repo_target_valid_slug "$s"; then vt=0; else vt=1; fi
+  if derive_or "$TT" "$s" >/dev/null 2>&1; then vd=0; else vd=2; fi
+  case "$s" in 'a/b'|'A/B'|'acme/widget.js') want=0 ;; *) want=1 ;; esac
+  { [ "$vs" = "$want" ] && [ "$vt" = "$vs" ] && { { [ "$want" = 0 ] && [ "$vd" = 0 ]; } || { [ "$want" = 1 ] && [ "$vd" = 2 ]; }; }; } \
+    || { echo "     shape '$s': repo_slug_valid=$vs repo_target_valid_slug=$vt derive_or=$vd want=$want"; shape_bad=$((shape_bad+1)); }
+done
+ck "A13 repo_slug_valid / repo_target_valid_slug / derive_or agree on 9 shapes (one owner, not a copy)" "$shape_bad"
 
 # ═══ B. lane.sh — the start gate ══════════════════════════════════════════════════════════════
 echo
@@ -280,6 +315,29 @@ f5=$?
 ( cd "$TT" && O="$RIG_STALE/o-dm" bash "$RIG_STALE/dispatch-merge.sh" "$TT" daniel-ospina/tortoise 5006 ) > "$T/f-dm2.out" 2>&1
 f6=$?
 { [ "$f6" -eq 78 ] && grep -q 'is stale' "$T/f-dm2.out"; }; ck "F6 dispatch-merge.sh with a STALE module -> FATAL 78 (rc=$f6)" $?
+# adopt-fix.sh is the FOURTH caller (#2762 review, P2): T9 says EVERY caller, so it is measured, not
+# inspected. It builds a worktree before the fixer runs, so a stale/missing module here is wrong-repo
+# work one layer above the assertion.
+( cd "$TT" && O="$RIG_MISS/o-adopt" bash "$RIG_MISS/adopt-fix.sh" "$TT" daniel-ospina/tortoise 5010 feat/5010 ) > "$T/f-adopt.out" 2>&1
+f7=$?
+{ [ "$f7" -eq 78 ] && grep -qi 'missing' "$T/f-adopt.out"; }; ck "F7 adopt-fix.sh without the module -> FATAL 78 (rc=$f7)" $?
+( cd "$TT" && O="$RIG_STALE/o-adopt" bash "$RIG_STALE/adopt-fix.sh" "$TT" daniel-ospina/tortoise 5011 feat/5011 ) > "$T/f-adopt2.out" 2>&1
+f8=$?
+{ [ "$f8" -eq 78 ] && grep -q 'is stale' "$T/f-adopt2.out"; }; ck "F8 adopt-fix.sh with a STALE module -> FATAL 78 (rc=$f8)" $?
+# ...and the wrong-CHECKOUT half: refuse 72 BEFORE a fetch or a worktree exists in the wrong repo.
+ADOPT_O="$T/o-adopt3"; mkdir -p "$ADOPT_O/logs"
+( cd "$TWT" && O="$ADOPT_O" bash "$HERE/adopt-fix.sh" "$TWT" daniel-ospina/agent-infra 5012 feat/5012 ) > "$T/f-adopt3.out" 2>&1
+f9=$?
+{ [ "$f9" -eq 72 ] && grep -q 'reason=slug-mismatch' "$ADOPT_O/logs/adopt-5012.log" 2>/dev/null \
+    && [ ! -d "$TWT/.worktrees/adopt-5012" ]; }; ck "F9 adopt-fix.sh on the wrong checkout -> REFUSED 72, NO worktree built (rc=$f9)" $?
+# THE HALF-DEPLOY PAIR (#2762 review, P2): a SHIPPED repo-target.sh beside an OLD repo-slug.sh (one
+# with the parser but no `repo_slug_valid`) must be FATAL, not refuse every explicit target as
+# `target-invalid`. Nothing else in this suite reaches the `repo_slug_valid` half of the FATAL guard.
+RIG_HALF="$T/rig-half"; mkdir -p "$RIG_HALF"; cp "$HERE"/*.sh "$RIG_HALF/"
+printf '#!/usr/bin/env bash\nrepo_slug_from_remote() { printf "%%s\\n" "$1"; }\n' > "$RIG_HALF/repo-slug.sh"
+( cd "$TWT" && O="$RIG_HALF/o-lane" LANE_DRY_RUN=1 bash "$RIG_HALF/lane.sh" --repo daniel-ospina/tortoise 5013 feat/5013 ) > "$T/f-half.out" 2>&1
+f10=$?
+{ [ "$f10" -eq 78 ] && grep -q 'missing or stale' "$T/f-half.out"; }; ck "F10 shipped module + OLD repo-slug.sh (no repo_slug_valid) -> FATAL 78, not target-invalid (rc=$f10)" $?
 
 # ═══ E. the pre-fix tree does NOT refuse (the non-vacuity proof) ══════════════════════════════
 # Optional because the baseline must be a commit BEFORE this change: run it manually with

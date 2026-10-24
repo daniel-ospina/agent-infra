@@ -142,7 +142,7 @@ fi
 if [ -z "$OR" ]; then
   OR="$(repo_target_slug "$PWD" 2>/dev/null || true)"
   if [ -z "$OR" ]; then
-    echo "[repo-target] lane $N result=REFUSED repo=UNREADABLE worktree=$PWD target=<none> target_dir=${LANE_REPO_DIR:-} reason=target-underivable — REFUSED: the target directory passed the assertion but its origin slug cannot be read, so the lane has no repo to name in its brief or its gh calls" | tee -a "$O/logs/lane-$N.log"
+    echo "$(repo_target_refuse "lane $N" target-underivable "the target directory passed the assertion but its origin slug cannot be read, so the lane has no repo to name in its brief or its gh calls")" | tee -a "$O/logs/lane-$N.log"
     echo "[lane $N] NOT started: no target slug could be derived from the asserted worktree" >> "$O/logs/lane-$N.log"
     exit "$REPO_TARGET_REFUSED"
   fi
