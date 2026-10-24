@@ -28,11 +28,30 @@ LOOP="$HERE/orch-loop.sh"
 DM="$HERE/dispatch-merge.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# ── HERMETIC FROM THE BOX'S gh CONFIG DIRECTION (measured on the CI runner, 2026-10-24) ──────
+# `gh` resolves its config dir as $GH_CONFIG_DIR, then $XDG_CONFIG_HOME/gh, then $HOME/.config/gh —
+# and the shipped `wt_gh_hosts` mirrors that order DELIBERATELY (a one-location probe refuses an
+# AUTHENTICATED box, forever: #2396). The consequence for THIS SUITE is not a product bug but a
+# hermeticity one: the GitHub runner exports XDG_CONFIG_HOME=/home/runner/.config, so every fixture
+# that builds `$fixture_home/.config/gh/hosts.yml` was evaluated against the RUNNER's config instead
+# of the fixture's, and 7 unrelated assertions went red (`wt_gh_hosts` answered the runner's path,
+# the credential probe refused a provisioned worker, the cleanup then had no session to name).
+# One ambient variable cascaded into seven arms, on main and on every PR, so no PR could land.
+# The arms that PIN the resolver's precedence still set these per-arm (inline assignment, `env -i`,
+# or a subshell), which is exactly why scrubbing them here cannot weaken those assertions.
+unset GH_CONFIG_DIR XDG_CONFIG_HOME
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1));
   else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL+1)); fi
 }
+# The scrub above must be ASSERTED, not assumed: a box (or a future runner image, or another lane's
+# shell) that repoints gh's config would otherwise re-break seven arms with one variable, and the
+# failure would again read as seven unrelated defects. One named assertion, at the top, so the next
+# occurrence fails ONCE and says why.
+ck "hermetic: the caller's gh config dir is not inherited (GH_CONFIG_DIR/XDG_CONFIG_HOME scrubbed)" \
+   "$([ -z "${GH_CONFIG_DIR:-}" ] && [ -z "${XDG_CONFIG_HOME:-}" ] && echo 0 || echo 1)"
 # A `hosts.yml` that ACTUALLY carries a token — the only shape `wt_gh_hosts_token` blesses. ⛔ The old
 # fixture was `printf 'github.com:\n'` (a host entry and nothing else), which the probe read as
 # PROVISIONED: a `gh auth logout`/half-write leftover starts the credential-less worker this gate
@@ -55,6 +74,10 @@ printf '%s\n' "CMUX $*" >> "${CMUX_LOG:-/dev/null}"
 if [ "${CMUX_ABSENT:-0}" = "1" ]; then echo "cmux: no daemon" >&2; exit 1; fi
 case "${1:-}" in
   tree)
+    # ⛔ AN ABSENT SESSION OWNER: no stdout, a transport error ON STDERR, non-zero rc. This is the
+    # measured shape of the live cell on 2026-10-24 (`cannot connect to session socket …: Connection
+    # refused (os error 111)`) and it is a READING, not an unreadable census (agent-infra#2653).
+    [ "${CMUX_TREE_ABSENT:-0}" = "1" ] && { printf '%s\n' "${CMUX_TREE_ABSENT_MSG:-cannot connect to session socket /tmp/cmux-tui-1000/cloud.sock: Connection refused (os error 111)}" >&2; exit 3; }
     [ "${CMUX_TREE_FAIL:-0}" = "1" ] && { echo "cmux: cannot read" >&2; exit 1; }
     # A SEQUENCED tree: the daemon answers differently on the nth call (a close is verified against a
     # SECOND read). `$CMUX_TREE_SEQ.1`, `.2`, … with `.last` as the fallback.
@@ -1449,6 +1472,124 @@ grep -qE '^[wt]:' <<<"$rows" && rc=1 || rc=0
 ck "…and no internal \`w:\`/\`t:\` key row leaks into the printed table" $rc
 printf '%s\n' "$rows" | awk -F'\t' '$1=="lane-1" && $2=="alive"{f=1} END{exit f?0:1}' && rc=0 || rc=1
 ck "…the rows are the worker names with their verdict" $rc
+
+echo
+echo "── Q) an ABSENT session owner is a READING: nothing is listening, so nothing is running ──"
+# ⛔ MEASURED 2026-10-24 (agent-infra#2653). The cmux daemon was not running and `cmux tree --json`
+# answered `cannot connect to session socket …: Connection refused` with EMPTY stdout. The probe read
+# that as UNREADABLE, every terminal record read UNKNOWN, and UNKNOWN counts as LIVE (the fail-closed
+# rule below, which is right for a transient blip). The harness therefore counted 18 worker records
+# whose logs had been silent for 26-30 HOURS as 18 live workers, `wt_close` could never PROVE a close,
+# the review-lane ceiling stayed at 11/6 for 26 hours, no review was dispatched for the 8 NEEDS-REVIEW
+# PRs, the PR queue could not drain, and the issue path stayed shut with 175 candidates waiting.
+# A terminal lives INSIDE the session owner: if the owner is not running, the terminal is gone. That is
+# a measurement — the same polarity the tmux half already implements.
+cat > "$TMP/q1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_ABSENT=1 WT_ABSENT_CONFIRM=0
+printf 'kind=terminal\nid=term_stale1\nworkspace=ws_stale1\n' > "$WT_DIR/worker-merge-91"
+printf 'kind=terminal\nid=term_stale2\nworkspace=ws_stale2\n' > "$WT_DIR/worker-fix-92"
+. "$1"
+echo "alive=$(wt_alive merge-91 && echo yes || echo no)"
+echo "merge=$(wt_count merge-)"
+echo "fix=$(wt_count fix-)"
+wt_close merge-91; echo "close_rc=$?"
+echo "record=$([ -f "$WT_DIR/worker-merge-91" ] && echo kept || echo gone)"
+SH
+out="$(bash "$TMP/q1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O18" 2>&1)"
+case "$out" in *"alive=no"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an absent daemon reads its terminal records DEAD (nothing is listening)" $rc
+case "$out" in *"merge=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…so the REVIEW-lane census is 0, not 11 ghosts — the ceiling can free" $rc
+case "$out" in *"fix=0"*) rc=0 ;; *) rc=1;; esac
+ck "…and the fixer census with it (one polarity, every cap)" $rc
+case "$out" in *"close_rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…a close is now PROVEN (the verification read can finally answer)" $rc
+case "$out" in *"record=gone"*) rc=0 ;; *) rc=1;; esac
+ck "…and the stale record is released instead of pinning a slot forever" $rc
+# ⛔ THE OTHER DIRECTION, ON THE SAME FIXTURE: a daemon that ANSWERS but cannot be READ is a different
+# state and must stay UNKNOWN. Without this half the change is a licence to declare every worker dead
+# whenever the census is awkward, which is the false-PASS direction the polarity rule forbids.
+cat > "$TMP/q2.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_FAIL=1
+printf 'kind=terminal\nid=term_live1\nworkspace=ws_live1\n' > "$WT_DIR/worker-merge-93"
+. "$1"
+echo "alive=$(wt_alive merge-93 && echo yes || echo no)"
+echo "merge=$(wt_count merge-)"
+wt_close merge-93; echo "close_rc=$?"
+echo "record=$([ -f "$WT_DIR/worker-merge-93" ] && echo kept || echo gone)"
+SH
+out="$(bash "$TMP/q2.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O19" 2>&1)"
+case "$out" in *"alive=yes"*"merge=1"*"close_rc=1"*"record=kept"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a FAILED (not absent) census read is still UNKNOWN: alive, counted, unprovable, record KEPT" $rc
+# ⛔ AND THE WRAPPER IS NOT THE SIGNAL — THE ERRNO IS (review of #2653, P1). `cannot connect to session
+# socket <path>: <reason>` is errno-agnostic, so it also carries `No such file or directory` (a
+# repointed HOME / a wrong socket path) and `Permission denied` — BOTH reachable with the daemon and
+# its terminals ALIVE. Matching the wrapper would empty the census and DELETE a lived worker's
+# record, the P1 the tmux half's header records. Only an absent LISTENER (`Connection refused`) or the
+# CLI's own `no server running` may empty it.
+for _msg in 'cannot connect to session socket /tmp/x.sock: No such file or directory (os error 2)' \
+            'cannot connect to session socket /tmp/x.sock: Permission denied (os error 13)' \
+            'cannot connect to session socket /tmp/x.sock: Resource temporarily unavailable (os error 11)'; do
+  cat > "$TMP/q3.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_ABSENT=1 CMUX_TREE_ABSENT_MSG="$4" WT_ABSENT_CONFIRM=0
+printf 'kind=terminal
+id=term_live5
+workspace=ws_live5
+' > "$WT_DIR/worker-merge-95"
+. "$1"
+echo "alive=$(wt_alive merge-95 && echo yes || echo no)"
+echo "count=$(wt_count merge-)"
+SH
+  out="$(bash "$TMP/q3.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O20" "$_msg" 2>&1)"
+  case "$out" in *"alive=yes"*"count=1"*) rc=0 ;; *) rc=1 ;; esac
+  ck "the WRAPPER with a different errno is still UNKNOWN: ${_msg##*: }" $rc
+done
+
+# ⛔ ONE SAMPLE IS NOT A STATE (review round 5 of #2653). A terminal record carries no pid, so the
+# absent-owner read is the ONLY thing that would justify deleting it — and a HARD-KILLED daemon never
+# closes its ptys or signals its children, so an orphaned worker can outlive the owner. A restart
+# window is seconds; the confirmation window is what keeps the 26h stall fixed without letting a single
+# refusal sample empty the census.
+cat > "$TMP/q4.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_ABSENT=1
+printf 'kind=terminal\nid=term_open1\nworkspace=ws_open1\n' > "$WT_DIR/worker-merge-97"
+. "$1"
+echo "first=$(wt_alive merge-97 && echo yes || echo no)/$(wt_count merge-)"
+echo "window=$([ -f "$WT_DIR/.wt-absent-since" ] && echo opened || echo none)"
+# a SECOND sample, still inside the window -> still UNKNOWN
+echo "second=$(wt_alive merge-97 && echo yes || echo no)/$(wt_count merge-)"
+# an old window -> CONFIRMED
+printf '%s\n' "$(( $(date +%s) - 600 ))" > "$WT_DIR/.wt-absent-since"
+echo "confirmed=$(wt_alive merge-97 && echo yes || echo no)/$(wt_count merge-)"
+SH
+out="$(bash "$TMP/q4.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O21" 2>&1)"
+case "$out" in *"first=yes/1"*"window=opened"*"second=yes/1"*"confirmed=no/0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "the absent owner is CONFIRMED by two samples: one refusal keeps the caps binding, an elapsed window frees them" $rc
+# …and a READABLE answer closes the window again (a restart must not inherit a stale verdict)
+cat > "$TMP/q5.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_ABSENT=1
+printf 'kind=terminal\nid=term_back1\nworkspace=ws_back1\n' > "$WT_DIR/worker-merge-98"
+. "$1"
+wt_table >/dev/null 2>&1 || true          # opens the window
+echo "window=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+unset CMUX_TREE_ABSENT; export CMUX_TREE_JSON='{"workspaces":[{"id":"ws_back1","name":"wt-merge-98"}],"screens":[{"id":"s1","workspace_id":"ws_back1","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_back1"}],"terminals":[{"id":"term_back1","running":true}]}'
+wt_table >/dev/null 2>&1 || true          # the FIRST read after the daemon answers again
+echo "after-read=$([ -f "$WT_DIR/.wt-absent-since" ] && echo open || echo closed)"
+echo "alive=$(wt_alive merge-98 && echo yes || echo no)"
+SH
+out="$(bash "$TMP/q5.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O22" 2>&1)"
+case "$out" in *"window=open"*"after-read=closed"*"alive=yes"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a READABLE census closes the absent window (a returning daemon is not judged by a stale one)" $rc
 
 echo
 echo "── H) the controller's capacity probes answer on BOTH platforms (agent-infra#1702) ──"

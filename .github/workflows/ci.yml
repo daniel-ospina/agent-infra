@@ -230,7 +230,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -447,6 +447,13 @@ jobs:
         run: python3.12 tools/fleet/outcome_canary.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
+      - name: Spawn-capacity suite (#2665, zero-dep)
+        # The ≥1-dispatch floor's classifier: a `task`/`subagent` result that produced NO verdict
+        # must not count as a review. Zero-dependency (node stdlib + tsx), so it runs in THIS job,
+        # which performs no `npm ci` — and its consumer's suite lives in
+        # extensions/review-enforcer/index.test.ts (the `npm ci` job), so the classifier's own pins
+        # ran nowhere until this step existed.
+        run: npx tsx extensions/shared/spawn-capacity.test.ts
       - name: Kill-switch / session-escape suite (#1419)
         # #1419 — the deadlock escape. Zero-dependency (node stdlib + tsx), so it
         # MUST run in THIS job, which performs no `npm ci`; it is also invoked
