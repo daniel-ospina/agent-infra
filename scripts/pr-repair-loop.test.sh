@@ -512,7 +512,11 @@ else
     bad "the census refusal is not discriminating (out: $(tr -d '\n' <"$TMP/census.out" | cut -c1-220))"
 fi
 # ...and the SAME box installs once that loop is gone: the refusal is the loop, not the arm.
-kill -TERM "$FOREIGN_PID" 2>/dev/null || true
+# ⛔ KILL THE GROUP, NOT THE PID (review round 9): the spawn is `setsid bash <script> --loop`, so the
+# bash pid is the group leader and the script's own `sleep` is a CHILD of it — TERM to the pid alone
+# orphans a `sleep 120` on every suite run (the same leak the --loop arm above already fixed).
+kill -TERM -- -"$FOREIGN_PID" 2>/dev/null || kill -TERM "$FOREIGN_PID" 2>/dev/null || true
+wait "$FOREIGN_PID" 2>/dev/null || true
 sleep 0.3
 cp "$TMP/stubbin/pgrep" "$TMP/claimbin/pgrep"
 env PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin/systemctl" \
