@@ -35,6 +35,10 @@ Environment=BOUNDED_LIB={{BOUNDED_LIB}}
 Environment=CACHE_REAPER={{REAPER_DIR}}/pi-cache-reap.sh
 Environment=VENV_REAPER={{REAPER_DIR}}/reap-lane-venvs.sh
 Environment=WORKTREE_REAPER={{REAPER_DIR}}/pi-reap-worktrees.sh
+# #2542: the two owners of the classes that actually filled the cells (abandoned /tmp worktrees, and
+# surplus copies of the same runner install). Pinned for the same reason as the three above.
+Environment=ABANDONED_WT_REAPER={{REAPER_DIR}}/reap-abandoned-worktrees.sh
+Environment=DUP_INSTALL_REAPER={{REAPER_DIR}}/reap-duplicate-installs.sh
 # The worktree owner must ask GitHub which PRs are open before it may delete anything. A busy cell
 # shares one account with every other box, so the harness gh shim backs off; this timeout is above
 # that backoff window. If it still cannot answer, the class FAILS CLOSED (a checkout with an open PR
