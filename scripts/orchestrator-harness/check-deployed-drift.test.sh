@@ -40,10 +40,13 @@ for f in "$DRIFT" "$SHARDS"; do
   [ -s "$f" ] || { echo "❌ missing $f — this suite grades the shipped file, so it cannot run"; exit 2; }
 done
 command -v git >/dev/null 2>&1 || { echo "❌ git not found — cannot build the fixture repo"; exit 2; }
-# ⛔ THE FIXTURE MUST HASH THE WAY THE GRADED SCRIPT DOES, or it stamps a FALSE record on a box without
-# `sha256sum`: the pipeline would emit nothing, `awk` would still exit 0, and the stamp would carry the
-# EMPTY-INPUT digest — so a missing tool would surface as "a post-install hand edit" instead of as a tool
-# error. `check-deployed-drift.sh` resolves `sha256sum`, else `shasum -a 256`; do the same and refuse.
+# ⛔ THE FIXTURE MUST HASH THE WAY THE GRADED SCRIPT DOES. Measured on the pre-change fixture with
+# `sha256sum` absent from PATH: the payload came out EMPTY (both the inner and the outer hash use the same
+# missing binary, so nothing is emitted and `awk` still exits 0), and the grade after it was **UNKNOWN,
+# rc 2 — "carries no payload hash"**, i.e. a failing §1. So the real failure mode is a confusing tool
+# error, not a stampable false record (an earlier draft of this comment claimed the empty-input digest
+# reached the stamp and surfaced as a hand edit — wrong, and corrected in review round 12). Resolving the
+# command here, as `check-deployed-drift.sh` does, turns that confusion into one named line.
 SHA_CMD="sha256sum"
 command -v sha256sum >/dev/null 2>&1 || SHA_CMD="shasum -a 256"
 command -v ${SHA_CMD%% *} >/dev/null 2>&1 || { echo "❌ neither sha256sum nor shasum is available — the fixture cannot write a truthful stamp"; exit 2; }

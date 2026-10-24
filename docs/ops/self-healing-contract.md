@@ -386,10 +386,14 @@ freshness; refuse rather than place blind.
 
 **ALIVE vs REFUSING vs IDLE.** ALIVE = `place=<host> lpc=… evaluated=N eligible=M`; **REFUSING =
 `refuse bound=<the dominant bound> detail=… evaluated=N eligible=0`** with the bound named
-(`fork_headroom`/`fork_probe`/`disk`/`load_per_cpu`/`memory`/`probe_stale`/`probe_unreadable`/
-`no_probe`), exit **1** (*"a REFUSAL IS NOT A FAILURE, it is the answer"*); IDLE does not apply.
-Exit 2 = the channel is unreadable ⇒ **the caller must refuse to place**; exit 254 = the probe itself
-could not fork (a *reading*, not a crash).
+(`fork_headroom`/`fork_probe`/**`fork_unknown`**/`disk`/`load_per_cpu`/`memory`/`probe_stale`/
+`probe_unreadable`/`no_probe`, plus `usage` on the exit-2 arms), exit **1** (*"a REFUSAL IS NOT A FAILURE, it is the answer"*); IDLE does not apply.
+Exit **2 = "cannot answer"** — and that is MORE than the transport: the sub-cases are an unreadable fleet
+channel (`cap_read_fleet`), `refuse bound=usage detail=no-self-host|clock-unreadable` on a `place` call,
+`probe=unreadable` on a `probe`, and an unknown verb. ⛔ Read the reason line before deciding which: a
+`bound=usage` on `place` is a caller defect, not a git fault — the same "shared code, read the reason"
+rule as `harness-refresh.sh`'s 23 (§3.12). Exit 254 = the probe itself could not fork (a *reading*, not a
+crash).
 The fleet channel is `refs/boxes/<host>/<at>-<ncpu>-<load1>-<lanes>-<disk>-<mem>-<procs>-<max>-<fork>`
 on the queue repo's origin, read with one `git ls-remote --refs`.
 
