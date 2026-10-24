@@ -5369,3 +5369,77 @@ def test_a_set_whose_repos_share_a_TAG_is_REFUSED_before_anything_is_read(tmp_pa
     # And the ordinary, unambiguous set is NOT refused by this guard.
     assert pr.set_tag_collisions(["daniel-ospina/agent-infra", "daniel-ospina/tortoise"]) == ""
     assert pr.repo_tag("daniel-ospina/tortoise") == "daniel-ospina-tortoise"
+
+
+def test_the_POST_MATERIALISE_recheck_asks_BOTH_worker_names(monkeypatch):
+    """The third liveness read is the one the window is for; probing one name there reopens it.
+
+    `worker_live_for()` exists because the WORKTREE is `prd-<n>` in every mode while
+    `worker_name()` is mode-qualified. Applying the union at the two PRE-checks only leaves the
+    post-materialise re-check — the read whose whole justification is "`materialise_worktree` can
+    fetch for 300 s, and another invocation can pass the same guard inside that window" — asking
+    this mode's name alone, so the second agent still lands in the live worker's tree (and
+    `materialise_worktree` has ALREADY `reset --hard` that tree by then).
+    """
+    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-tortoise-")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "STATE_DIR", "/tmp")
+    went_live = []
+
+    def _materialise(p, dry=False, **_kw):
+        went_live.append(p["number"])          # the window OPENS here
+        return "/wt/prd-3", ""
+
+    def _worker_live(name):
+        # The other mode's worker appears while the worktree is being prepared.
+        return bool(went_live) and name == "prd-3"
+
+    spawned = []
+    monkeypatch.setattr(pr, "materialise_worktree", _materialise)
+    monkeypatch.setattr(pr, "worker_live", _worker_live)
+    monkeypatch.setattr(pr, "sh_err", lambda *a, **k: spawned.append(a) or ("", "", 0))
+    ok, detail, record = pr.dispatch(_pr(3), "fix", "x", dry=False)
+    assert ok is False, "a live worker's worktree was adopted for a SECOND agent"
+    assert "appeared" in detail, detail
+    assert record is False, "a liveness probe is not a verdict about the PR; nothing is recorded"
+    assert not spawned, "nothing may be spawned once the re-check sees the live worker"
+
+
+def test_HALF_a_rubric_seam_is_a_hybrid_rubric_and_refuses_even_the_built_in_repo(monkeypatch):
+    """⛔ ONE SEAM IS NOT "NO DECLARATION, SO THE BUILT-INS" — `objective.py` binds them SEPARATELY.
+
+    `REQUIRED = _required_from_env()` and `SURFACE_PATHS = _surface_from_env()` each read their own
+    variable and fall back to their own built-in, so with exactly one seam set the rubric in force is
+    one half the operator's and one half the built-ins'. `_rubric_supplied()` (both-or-neither) then
+    falls through to the `_RUBRIC_REPO` arm, whose premise is that BOTH halves are the built-ins —
+    and dispatch was ALLOWED for the built-ins' own repo while every PR was classified against a
+    foreign required-check set (`rerun-checks` at green PRs; `call-rail` gated on contexts the repo
+    never runs). Measured before the guard, with OBJECTIVE_REQUIRED=python-ci-gate:
+
+        rubric: required=python-ci-gate surface=tortoise/sdk.py,… (from objective.py built-ins)
+
+    — a line that names the operator's contexts and attributes them to the built-ins. The audit line
+    this change added is worth nothing if it can lie in exactly the case that needs auditing.
+    """
+    monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
+    monkeypatch.delenv("OBJECTIVE_SURFACE", raising=False)
+    try:
+        pr.canonical_paths()
+        assert pr._rubric_seams() == (False, False)
+        assert pr.contract_note(_REPO_B) == "", "no seam at all: the built-ins ARE that repo's"
+        for req, surf, named in (("python-ci-gate", None, "OBJECTIVE_SURFACE"),
+                                 (None, "config/surface-manifest.yml", "OBJECTIVE_REQUIRED")):
+            for k, v in (("OBJECTIVE_REQUIRED", req), ("OBJECTIVE_SURFACE", surf)):
+                if v is None:
+                    monkeypatch.delenv(k, raising=False)
+                else:
+                    monkeypatch.setenv(k, v)
+            pr.canonical_paths()
+            note = pr.contract_note(_REPO_B)
+            assert note, "half a declaration cleared the refusal for the BUILT-INS' repo"
+            assert "HYBRID" in note and named in note, note
+            # …and the refusal reaches the only path that spawns, for that repo too.
+            pr.apply_repo(_REPO_B, "")
+            assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False)
+    finally:
+        pr.canonical_paths()

@@ -703,6 +703,20 @@ GH_LAYER_ENV = dict(getattr(CLASSIFIER, "GH_LAYER_ENV", {}) or {})
 _RUBRIC_REPO = "daniel-ospina/tortoise"      # the repo `REQUIRED_DEFAULT` describes, NOT a target
 
 
+def _rubric_seams() -> tuple[bool, bool]:
+    """`(required declared, surface declared)` -- the two seams are INDEPENDENT everywhere else.
+
+    ⛔ NOT ONE FLAG, BECAUSE `objective.py` DOES NOT BIND THEM AS ONE: `REQUIRED =
+    _required_from_env()` and `SURFACE_PATHS = _surface_from_env()` each take their own env var and
+    fall back to their own built-in, so a half-declared pair produces a HYBRID rubric (the
+    operator's contexts judged against the built-ins' surface paths). Asking "were both supplied?"
+    is therefore not the same question as "did the operator declare a rubric?" (#2280 review
+    cycle 4, P2).
+    """
+    return (bool((os.environ.get("OBJECTIVE_REQUIRED") or "").strip()),
+            bool((os.environ.get("OBJECTIVE_SURFACE") or "").strip()))
+
+
 def _rubric_supplied() -> bool:
     """True when the operator supplied a rubric through `objective.py`'s own seams.
 
@@ -710,8 +724,8 @@ def _rubric_supplied() -> bool:
     supplied", never "this repo requires nothing" -- the latter would make every PR
     `call-rail`-eligible.
     """
-    return bool((os.environ.get("OBJECTIVE_REQUIRED") or "").strip()) and bool(
-        (os.environ.get("OBJECTIVE_SURFACE") or "").strip())
+    required, surface = _rubric_seams()
+    return required and surface
 
 
 def contract_note(slug: str) -> str:
@@ -729,6 +743,24 @@ def contract_note(slug: str) -> str:
     """
     if not slug:
         return ""                       # nothing is being graded: no rubric to be wrong about
+    required_seam, surface_seam = _rubric_seams()
+    if required_seam != surface_seam:
+        # ⛔ HALF A DECLARATION IS NOT A DECLARATION, AND IT IS NOT THE BUILT-INS EITHER. With one
+        # seam set, `objective.py` holds the operator's value for that half and its own built-in
+        # for the other, so the rubric in force describes NO repo -- not even `_RUBRIC_REPO`, whose
+        # premise below is that BOTH halves are the built-ins. Measured before this guard: with
+        # `OBJECTIVE_REQUIRED=python-ci-gate` and no surface seam, a tortoise pass reported
+        # `required=python-ci-gate surface=tortoise/sdk.py,... (from objective.py built-ins)` and
+        # DISPATCHED -- orders derived from a declaration nobody read, and an audit line that
+        # attributes the operator's contexts to the built-ins.
+        return ("only %s is set (OBJECTIVE_REQUIRED=%s, OBJECTIVE_SURFACE=%s), and `objective.py` "
+                "binds the two seams INDEPENDENTLY -- so this pass holds a HYBRID rubric: half the "
+                "operator's, half the built-ins', describing NO repo. Nothing is dispatched; the "
+                "queue is still graded. Fix: supply BOTH seams for the repo being graded, or "
+                "neither. Tracked: agent-infra#2518"
+                % ("OBJECTIVE_REQUIRED" if required_seam else "OBJECTIVE_SURFACE",
+                   "set" if required_seam else "unset",
+                   "set" if surface_seam else "unset"))
     if _rubric_supplied():
         # ⛔ "THE OPERATOR DECLARED IT" IS ONLY AN ANSWER FOR A REPO THE DECLARATION CAN NAME.
         # The seams are MACHINE-wide (`OBJECTIVE_REQUIRED`/`OBJECTIVE_SURFACE` carry values, not a
@@ -2962,7 +2994,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # (300 s timeouts) and add a worktree; another pr-doctor invocation (a manual `--only`, which
     # the heartbeat lock does not cover) can pass the same guard inside that window. Re-asking here
     # costs one `--status` on the only path that spawns anything.
-    again = worker_live(name)
+    again = worker_live_for(n)            # BOTH names: the worktree is `prd-<n>` in every mode
     if again is not False:
         return (False, "worker %s appeared (or its liveness became unreadable) while the worktree "
                        "was being prepared -- refusing to spawn a second one" % name, False)
