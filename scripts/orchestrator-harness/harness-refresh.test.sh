@@ -736,7 +736,55 @@ case "$_row43" in *harness=*) bad "a current box's row carries a token anyway: '
 
 _CASE=$((_CASE+1)); echo "=== C2: the issue-lane spawn line carries it too (dispatch-merge.sh, driven with stubs) ==="
 D="$T/c2"; mkdir -p "$D/bin" "$D/O" "$D/repo/.worktrees"
-printf '#!/bin/bash\nexit 0\n'       > "$D/bin/git";    chmod +x "$D/bin/git"
+# ⛔ THE GIT STUB MUST MATERIALISE A **USABLE** WORKTREE (#2033, measured 2026-10-24): it used to be a
+# blind `exit 0`, which was indistinguishable from production only while nothing verified the add.
+# `dispatch-merge.sh` now provisions through `wt_provision`, whose step 4 asks the checkout itself
+# (`symbolic-ref --short HEAD` == the branch, `rev-parse --verify HEAD` resolves) — so a blind stub
+# reported "add succeeded" over a checkout that DOES NOT EXIST, the rollback ran, and every issue was
+# skipped: `#7: worktree add reported success but the checkout is not usable — skipping (no lane, no
+# chain)`. All three C2 assertions then failed on an empty `grep 'lane-7'`, for a reason they do not
+# test (measured: 195 passed, 3 failed). So the stub emulates the PRODUCTION PRECONDITION — an add
+# that creates the ref and materialises the directory, which is what makes the post-check pass for
+# the right reason — instead of turning the verification off (a verification an env var can open is
+# not a verification; same rule as the CIQ_GH seam below).
+cat > "$D/bin/git" <<'GIT'
+#!/bin/bash
+# A git that behaves like a REAL successful `worktree add`: the directory exists afterwards, the
+# record is LISTED by `worktree list`, and the checkout answers the branch/HEAD queries `wt_provision`
+# verifies — including on a SECOND dispatch of the same issue, where a real git reports the existing
+# worktree and the lifecycle REUSES it. Everything else exits 0 quietly (this rig drives the
+# DISCLOSURE on the spawn line, not git).
+d="$PWD"
+if [ "${1:-}" = "-C" ]; then d="${2:-}"; shift 2 || true; fi
+case "${1:-}" in
+  worktree)
+    case "${2:-}" in
+      add)
+        shift 2
+        br=""
+        if [ "${1:-}" = "-b" ]; then br="${2:-}"; shift 2 || true; fi
+        p="${1:-}"
+        if [ -n "$p" ]; then
+          mkdir -p "$p" && printf '%s\n' "$br" > "$p/.emulated-branch"
+          printf '%s %s\n' "$p" "$br" >> "$d/.emulated-worktrees"
+        fi
+        ;;
+      list)
+        [ -f "$d/.emulated-worktrees" ] || exit 0
+        while read -r p br; do
+          [ -n "$p" ] || continue
+          printf 'worktree %s\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/%s\n\n' "$p" "$br"
+        done < "$d/.emulated-worktrees"
+        ;;
+    esac
+    exit 0 ;;
+  symbolic-ref)
+    [ -f "$d/.emulated-branch" ] || exit 1
+    cat "$d/.emulated-branch" ;;
+  *) exit 0 ;;
+esac
+GIT
+chmod +x "$D/bin/git"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/tmux";   chmod +x "$D/bin/tmux"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/sleep";  chmod +x "$D/bin/sleep"
 printf '#!/bin/bash\necho load\n'    > "$D/bin/uptime"; chmod +x "$D/bin/uptime"
