@@ -2778,6 +2778,16 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     `for n in 1 2; do gh pr view $n; done > /tmp/out.txt`, // a redirect TARGET is not a program
     `for n in 1 2; do gh pr view $n; done 2>/dev/null`, // …nor is `2>/dev/null`
     `for pr in 1; do sha=$(gh api repos/o/r/pulls/$pr --jq .head.sha); echo "$sha"; done`,
+    // ⛔ A REDIRECT TARGET FOLLOWED BY ANOTHER REDIRECTION (#2206 cycle-2 review, P1 over-block).
+    // The first cut of `isTrailingRedirectTarget` demanded the target END its segment, which refused
+    // the canonical `> out 2>&1` loop — the exact shape the exemption exists for — and made the
+    // verdict depend on the ORDER of the two redirections. All three orderings are pinned.
+    `for n in 1 2; do gh pr view $n; done > /tmp/out.txt 2>&1`,
+    `for n in 1 2; do gh pr view $n; done 2>&1 > /tmp/out.txt`,
+    `for n in 1 2; do gh pr view $n; done > /tmp/out.txt 2>/tmp/e.txt`,
+    // …and a path fragment attached to a substitution CLOSER is not an absolute-path program when
+    // the substitution itself is an ARGUMENT (the assembled word is `…/.a/x`, not `/x`).
+    `gh pr view $(gh api repos/x --jq .a)/x`,
   ];
   for (const cmd of reads) {
     ok(readsOnlyGhRead(cmd), `POSITIVE READ expected (would be refused at 0 dispatches): ${cmd}`);
@@ -3000,6 +3010,37 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     `for n in 1; do gh pr view $n; done; curl -s -X PUT -H "Authorization: token $T" --data '{"content":"eA=="}' https://api.github.com/repos/o/r/contents/x`,
     "for n in 1; do gh pr view $n; done; npm publish --access public",
     "for n in 1; do gh pr view $n; done; rsync -a ./ host:/srv/app/",
+    // ─── RE-REVIEW (cycle 2): SIX MORE, EACH REPRODUCED THE SAME WAY. Four were the SAME CLASS as
+    // the block above — a lexical test where the question is semantic — which is why they are
+    // pinned here rather than trusted to the fix's prose.
+    //
+    // (6) P0 — `attachedToClose` asked whether the previous TOKEN ended with `/`, so
+    // `$(echo)/bin/bash` (previous token `/bin`) was exempted and bash assembled `/bin/bash`.
+    "gh pr view 1; $(echo)/bin/bash /tmp/x.sh",
+    "gh pr view 1; $(echo)/tmp/x.sh",
+    // (7) P0 — `isData(i)` skipped a QUOTED word in COMMAND position, because `isCommandName` only
+    // calls a quoted region a command name when it is the FIRST token of the simple command. An
+    // assignment or redirection prefix demoted it to DATA, and every one of these RAN the script.
+    `gh pr view 1; X=1 "/tmp/x.sh"`,
+    `gh pr view 1; >/tmp/o "/tmp/x.sh"`,
+    `gh pr view 1; 2>/dev/null "/tmp/x.sh"`,
+    // …and the same hole on the PIPELINE side: a quoted STAGE is still executed.
+    `gh pr view 1 | "sort" -o /tmp/f`,
+    // (8) P1 — the in-place flag was matched only as an ALL-LETTERS bundle, so the ordinary
+    // `-i.bak` / `-ni.bak` spelling WROTE the named file under a read certification.
+    `gh pr view 1 | sed -i.bak 's/a/b/' /tmp/f`,
+    `gh pr view 1 | sed -ni.bak 's/a/b/' /tmp/f`,
+    // (9) P1 — the sed address group could not match a REGEX address, so `sed '/re/e'` executed on
+    // GNU sed (the fleet's cells).
+    `gh pr view 1 | sed '/touch/e'`,
+    `gh pr view 1 | sed '/x/W'`,
+    // (10) P2 — `gh run download` WRITES artifact files into the working tree, so it is not a read.
+    "for n in 1 2; do gh run download $n; done",
+    // (11) P2 — `${VAR}` is NOT a readable substitution. The doc claimed it was "left alone"; an
+    // UNQUOTED expansion also word-splits, so it can yield `git push`. Refused, and pinned so the
+    // doc and the code cannot drift apart again in the permissive direction.
+    "gh pr view ${R}/1",
+    "gh api repos/o/r/commits/${SHA}/check-runs",
   ];
   for (const cmd of writes) {
     ok(!readsOnlyGhRead(cmd), `NOT a read (must keep the floor's decision): ${cmd}`);

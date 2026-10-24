@@ -2323,7 +2323,7 @@ export const GH_READ_SUBCOMMANDS: Record<string, string[]> = {
   pr: ["view", "list", "diff", "checks", "status"],
   issue: ["view", "list", "status"],
   repo: ["view", "list"],
-  run: ["view", "list", "download"],
+  run: ["view", "list"], // NOT `download`: it WRITES artifact files into the working tree (#2206 review, P2)
   workflow: ["view", "list"],
   release: ["view", "list"],
   ruleset: ["view", "list"],
@@ -2523,8 +2523,19 @@ function isTrailingRedirectTarget(scan: ScanTokens, i: number): boolean {
   // A separator between the operator and this word starts a NEW command, so this word is not a
   // target — it is whatever that new command runs.
   if (/[;&|(){!\n\r]/.test(scan.gaps[i] ?? "")) return false;
-  // A target ENDS its segment; a word followed by more command words is not one.
-  if (i + 1 < scan.tokens.length && !/[;&|\n\r]/.test(scan.gaps[i + 1] ?? "")) return false;
+  // A target may be followed by MORE REDIRECTIONS of the same command (`> out 2>&1`, `> out 2>err`,
+  // `> out <in`) but not by another command WORD. ⛔ The first version demanded this word END its
+  // segment, which refused the canonical `> out 2>&1` — the exact loop shape this exemption exists
+  // to protect (`for n in …; do gh pr view $n; done > /tmp/out 2>&1`) — and made the verdict depend
+  // on the ORDER of the two redirections (#2206 review, P1 over-block).
+  let segEnd = i;
+  while (segEnd + 1 < scan.tokens.length && !/[;&|(){!\n\r]/.test(scan.gaps[segEnd + 1] ?? "")) segEnd++;
+  for (let k = i + 1; k <= segEnd; k++) {
+    if (
+      !REDIRECTION_TOKEN.test(scan.tokens[k] ?? "") &&
+      !REDIRECTION_TOKEN.test(scan.tokens[k - 1] ?? "")
+    ) return false;
+  }
   // `> /dev/null /bin/bash`: the operator has no command to attach to, so the word after it is the
   // command, not a target (the shell runs `/bin/bash` there).
   if (i < 2) return false;
@@ -2620,19 +2631,25 @@ const DATA_FILTER_SCRIPT_EXECUTES =
   // The sed `e`/`w`/`W` COMMAND. The preceder class includes the QUOTES: a script is normally
   // written `sed '1e /tmp/x.sh'`, so the address is preceded by `'` and an anchor of `;{}` +
   // whitespace alone missed every real spelling of it (caught by re-running the probe).
-  // ⛔ THE TRAILING CLASS IS NOT `(\s|;|$)` ANY MORE (#2206 review, P1). That anchor certified
-  // three executing spellings as reads at zero dispatches — `sed '1{p;e}'` (`e` before `}`),
-  // `sed -n 'e'` (`e` before the closing quote) and `sed 'w/tmp/f'` (`w` before `/`) — because the
-  // character AFTER the command letter was a quote, a brace or a slash and none of them matched.
-  // A sed/awk script command letter terminates at whitespace, `;`, `}`, a quote, `/`, `\\` or EOL.
-  /(^|[;{}\s'"])([0-9$,/]*)\s*[ewW]([\s;}$'"\/\\]|$)|s\/(?:\\.|[^\\/])*\/(?:\\.|[^\\/])*\/[a-z]*[ew]|system\s*\(|\b(?:print|printf)\b[^;{}]*[>|]|\|\s*getline/;
+  // ⛔ THE SCRIPT'S ADDRESS CAN BE A REGEX, SO THE PRECEDER CLASS MUST INCLUDE `/` AND `\`
+  // (#2206 review, P1). The address group `([0-9$,/]*)` cannot match `/touch/`, so `sed '/touch/e'`
+  // was certified a read and GNU sed RAN the pattern space. The trail is now a negative lookahead
+  // instead of a terminator class: a bare `e`/`w`/`W` not inside a longer word is a sed command
+  // letter wherever it sits. Appending `'`/`}`/`"`/`/`/`\` covers the spellings measured escaping.
+  // A script whose `e`/`w` is part of a word (`/end/`, `NR>1`, `print`) still reads, because the
+  // lookahead refuses only a STANDALONE letter.
+  /(^|[;{}\s'"\/\\])(?:[0-9$,/]*|\/(?:\\.|[^\\/])*\/)\s*[ewW](?![A-Za-z])|s\/(?:\\.|[^\\/])*\/(?:\\.|[^\\/])*\/[a-z]*[ew]|system\s*\(|\b(?:print|printf)\b[^;{}]*[>|]|\|\s*getline/;
 
 /**
  * Is the token at `k` part of a command substitution (`$(…)` or a backtick body)?
  *
  * The tokenizer splits `$(…)` on its `(` — the `$` ends one token and the program starts the next —
- * so the opening is visible only as a `$`-terminated word whose following GAP contains `(`. `${VAR}`
- * is a variable, not a substitution: its gap is `{`, and it is left alone (`repos/${R}/pulls` stays
+ * so the opening is visible only as a `$`-terminated word whose following GAP contains `(`.
+ * ⛔ `${VAR}` IS **NOT** EXEMPT, AND THAT IS THE FAIL-CLOSED ANSWER (#2206 review, P2 — the
+ * previous text here claimed the opposite). Its gap is `{`, not `(`, so it is not a substitution
+ * this layer can read, and it is refused. An UNQUOTED `${VAR}` also undergoes word splitting: it
+ * can expand to `git push`, so a doc that called `repos/${R}/pulls` readable was describing
+ * behaviour the code never had, in the direction that costs a merge. Refusing it costs a retry.
  * readable). A backtick is a substitution wherever it appears.
  */
 function hasSubstitutionAt(scan: { tokens: string[]; gaps: string[] }, k: number): boolean {
@@ -2667,8 +2684,19 @@ export function readsOnlyGhRead(command: string): boolean {
   if (apiPresent && hasApiWriteFlagAnywhere(scan)) return false;
 
   // (3) No opaque executable word, and no unreadable PROGRAM.
+  //
+  // ⛔ THIS LOOP DOES NOT SKIP DATA TOKENS BEFORE THE PROGRAM TEST (#2206 review, P0). `isData(i)`
+  // used to be the first statement, and `isCommandName` only calls a quoted region a command name
+  // when it is the FIRST token of the simple command — so an assignment or redirection prefix
+  // demoted it to plain DATA and the program test never ran. Each of these RAN the script:
+  //   gh pr view 1; X=1 "/tmp/x.sh"
+  //   gh pr view 1; >/tmp/o "/tmp/x.sh"
+  //   gh pr view 1; 2>/dev/null "/tmp/x.sh"
+  // Quoting never prevents execution, so DATA status cannot excuse a token the shell runs. The
+  // predicate below therefore applies to EVERY token; only the checks AFTER it (which read the raw
+  // token for constructs and substitutions) stay data-exempt, because a quoted region is data to
+  // those questions and owes them nothing.
   for (let i = 0; i < scan.tokens.length; i++) {
-    if (isData(i)) continue;
     const t = tok(i);
     // A shell/interpreter/script in a COMMAND position runs words this text does not contain.
     // Redirections are exempt, and so is their TARGET: `done > /tmp/out.txt` is not a program
@@ -2679,22 +2707,42 @@ export function readsOnlyGhRead(command: string): boolean {
     // review, P2). The pipeline case is judged by the shell/interpreter test in (4), not here.
     const gapBefore = scan.gaps[i] ?? "";
     const pipedIn = /(^|[^|])\|([^|]|$)/.test(gapBefore);
-    // A WORD FRAGMENT directly attached to a substitution/brace close is not a program: in
-    // `gh api repos/o/r/commits/$(cat sha)/check-runs` the `/check-runs` token is the tail of the
-    // endpoint, and reading its leading `/` as an absolute path refused a plain read (measured on
-    // the real blocked-command corpus).
+    // A WORD FRAGMENT directly attached to a substitution close is not necessarily a program: in
+    // `gh api repos/o/r/commits/$(gh api repos/x --jq .sha)/check-runs` the `/check-runs` token is
+    // the tail of the endpoint ARGUMENT.
     //
-    // ⛔ BUT BOTH CLAUSES HERE WERE BYPASSES (#2206 review, P0), because they only asked whether
-    // the fragment LOOKED attached:
-    //   • `.trimEnd()` made `$(…) /bin/bash` (a SPACE after the closer) count as attached, so a
-    //     whitespace-separated program after any substitution was exempted;
-    //   • nothing required the fragment to be a path CONTINUATION, so `$(echo /bin/)sh` was
-    //     exempted too — and that token is not a fragment, it completes `/bin/sh` across the
-    //     closer. It ran (reproduced through the real handler).
-    // The exemption is now: DIRECTLY attached, a path continuation, and not completing an absolute
-    // path that was split before the closer.
+    // ⛔ EVERY LEXICAL VERSION OF THIS TEST WAS A P0 BYPASS (#2206 review, two rounds). Round 1
+    // exempted anything whose gap merely ENDED in `)` (`.trimEnd()`), so `$(…) /bin/bash` with a
+    // SPACE counted. Round 2 required direct attachment and `!tok(i-1).endsWith("/")`, which still
+    // certified `$(echo)/bin/bash` — the previous token is `/bin`, which does not end with a slash,
+    // and bash assembles `/bin/bash` across the closer. Both RAN.
+    //
+    // The question is not how the fragment is SPELLED but whether the ASSEMBLED word is in command
+    // position — and `isCommandPositionAt(scan, i)` cannot answer it, because `)` is itself in its
+    // separator class, so it says "command position" for `repos/…/sha/check-runs` too. The opener
+    // can answer it: the assembled word starts where the substitution opened, so it is a command
+    // exactly when that opener is.
+    const closerOpener = ((): number | null => {
+      if (!/[)}\]]$/.test(gapBefore)) return null;
+      for (let k = i - 1; k >= 0; k--) {
+        if (/\$$/.test(tok(k)) && /^\s*\(/.test(scan.gaps[k + 1] ?? "")) return k;
+      }
+      return null;
+    })();
     const attachedToClose =
-      /[)}\]]$/.test(gapBefore) && /^\//.test(t) && !/\/$/.test(tok(i - 1));
+      closerOpener !== null && /^\//.test(t) && !isCommandPositionAt(scan, closerOpener);
+    // ⛔ A QUOTED WORD IN COMMAND POSITION IS STILL THE COMMAND (#2206 review, P0) — see the loop
+    // header. This is the ONLY question a data token owes; below here the raw token is read for
+    // constructs and substitutions, which a quoted region is data to.
+    if (
+      !pipedIn &&
+      !attachedToClose &&
+      !isTrailingRedirectTarget(scan, i) &&
+      isCommandPositionAt(scan, i) &&
+      !REDIRECTION_TOKEN.test(t) &&
+      isUnreadableProgramWord(word(i))
+    ) return false;
+    if (isData(i)) continue;
     if (
       !pipedIn &&
       !attachedToClose &&
@@ -2756,7 +2804,10 @@ export function readsOnlyGhRead(command: string): boolean {
   // retry (`| head`, `| jq`) instead of certifying a program that ran with no reviewer verdict.
   let sedOrAwkStage = false;
   for (let i = 1; i < scan.tokens.length; i++) {
-    if (isData(i)) continue;
+    // ⛔ NO DATA SKIP BEFORE THE STAGE TEST (#2206 review, P0). `isData(i)` here skipped a QUOTED
+    // stage word, and a quoted stage is still executed: `gh pr view 1 | "sort" -o /tmp/f` was
+    // certified a read. The pipe test below is what identifies a stage; whether the word was written
+    // with quotes is irrelevant to what the shell runs.
     if (!/(^|[^|])\|([^|]|$)/.test(scan.gaps[i] ?? "")) continue;
     // ⛔ NO `isData(i - 1)` SKIP (#2206 review, P1). It was meant to stop a QUOTED argument that
     // precedes the pipe from looking like a stage, but it skipped the STAGE CHECK ITSELF: one data
@@ -2790,10 +2841,17 @@ export function readsOnlyGhRead(command: string): boolean {
       // Quoted or not, the shell passes a flag through verbatim, so this loop does NOT skip data.
       const ft = word(k);
       if (badLong !== undefined && badLong.test(ft)) return false;
+      // ⛔ THE LEADING LETTERS OF THE BUNDLE, NOT THE WHOLE TOKEN (#2206 review, P1).
+      // `/^-[A-Za-z]+$/` never matched a flag with a SUFFIX, and `sed -i.bak` / `-ni.bak` is the
+      // ordinary in-place spelling on BSD and GNU sed: it WROTE the named file under a read
+      // certification. Reading the letters before the first non-letter also closes `-f<file>`-
+      // style attached spellings, while `-F,` (awk's field separator) stays a read because `F` is
+      // not in awk's set.
+      const letters = ft.startsWith("-") ? ft.slice(1).split(/[^A-Za-z]/, 1)[0] : "";
       if (
         badLetters !== "" &&
-        /^-[A-Za-z]+$/.test(ft) &&
-        [...ft.slice(1)].some((ch) => badLetters.includes(ch))
+        letters !== "" &&
+        [...letters].some((ch) => badLetters.includes(ch))
       ) return false;
     }
   }
