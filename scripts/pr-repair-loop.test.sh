@@ -473,7 +473,7 @@ env PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
     "$INSTALLER" --install >"$TMP/linger-no.out" 2>&1
 check "a user-scope install without linger is REFUSED (rc≠0)" 1 "$?"
 if grep -q 'loginctl enable-linger' "$TMP/linger-no.out" \
-    && ! find "$TMP/fakehome" -name '*.service' 2>/dev/null | grep -q .; then
+    && [ -z "$(find "$TMP/fakehome" -name '*.service' 2>/dev/null)" ]; then
     ok "the linger refusal names the remedy and installs NOTHING"
 else
     bad "the linger refusal is not discriminating (out: $(tr -d '\n' <"$TMP/linger-no.out" | cut -c1-220))"
@@ -482,7 +482,7 @@ env PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" STUB_LINGER=yes \
     "$INSTALLER" --install >"$TMP/linger-yes.out" 2>&1
 check "the same install with linger=yes succeeds (rc=0)" 0 "$?"
-find "$TMP/fakehome" -name 'eldato-pr-repair.service' 2>/dev/null | grep -q . \
+[ -n "$(find "$TMP/fakehome" -name 'eldato-pr-repair.service' 2>/dev/null)" ] \
     && ok "the unit was written into the user scope" \
     || bad "the unit was not written into the user scope"
 
@@ -506,7 +506,7 @@ env PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" \
     "$INSTALLER" --install >"$TMP/census.out" 2>&1
 check "a live foreign --loop REFUSES the install (rc≠0)" 1 "$?"
-if grep -qi 'already live' "$TMP/census.out" && ! find "$TMP/claimunit" -name '*.service' 2>/dev/null | grep -q .; then
+if grep -qi 'already live' "$TMP/census.out" && [ -z "$(find "$TMP/claimunit" -name '*.service' 2>/dev/null)" ]; then
     ok "the census refusal names the duplicate claim and installs NOTHING"
 else
     bad "the census refusal is not discriminating (out: $(tr -d '\n' <"$TMP/census.out" | cut -c1-220))"
@@ -523,18 +523,20 @@ env PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" \
     "$INSTALLER" --install >"$TMP/census-gone.out" 2>&1
 check "the same install succeeds with no foreign loop (rc=0)" 0 "$?"
-find "$TMP/claimunit" -name 'eldato-pr-repair.service' 2>/dev/null | grep -q . \
+[ -n "$(find "$TMP/claimunit" -name 'eldato-pr-repair.service' 2>/dev/null)" ] \
     && ok "the control arm installed into the FIXTURE unit dir" \
     || bad "the control arm did not install into the fixture (out: $(tr -d '\n' <"$TMP/census-gone.out" | cut -c1-220))"
 
 echo "── the farm declares what the unit execs ──"
 for f in pr-repair-loop.sh install-repair-service.sh; do
-    if grep -qE "^fleet_srcs=\(.*[[:space:](]$f[[:space:])]" "$ROOT/pi-bootstrap/setup.sh" 2>/dev/null \
-        || grep -oE 'fleet_srcs=\([^)]*\)' "$ROOT/pi-bootstrap/setup.sh" 2>/dev/null | grep -qE "[[:space:](]$f([[:space:])]|$)"; then
-        ok "setup.sh's farm set declares $f"
-    else
-        bad "setup.sh's farm set does NOT declare $f — the unit would exec a file no cell installs"
-    fi
+    # ⛔ NO PIPE INTO `grep -q` (scripts/check-no-sigpipe-grep.sh): a quiet grep exits on the first match
+    # and the producer takes SIGPIPE, so under `set -o pipefail` a MATCH can read as a failure. Capture and
+    # test in the shell.
+    farm_line="$(grep -oE 'fleet_srcs=\([^)]*\)' "$ROOT/pi-bootstrap/setup.sh" 2>/dev/null || true)"
+    case "$farm_line" in
+        *" $f "*|*" $f)"*) ok "setup.sh's farm set declares $f" ;;
+        *) bad "setup.sh's farm set does NOT declare $f — the unit would exec a file no cell installs" ;;
+    esac
 done
 
 echo
