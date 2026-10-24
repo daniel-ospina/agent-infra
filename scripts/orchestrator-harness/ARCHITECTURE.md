@@ -147,6 +147,9 @@ adds the **reads**, the **writes / emits** and the failure surface.
 | `selftest.sh` | a human / CI | the shipped scripts | pass/fail | offline; drives the shipped code rather than grepping it |
 | `check-port-drift.sh` | a human | `port-provenance.txt`, tortoise ref | pass/fail | gates the tortoise-side removal. **Compares against a PIN, so a stale pin reports work that has moved (see §6.4)** |
 | `test-claims.sh` / `test-crossbox.sh` / `test-gates.sh` / `spawn-gate.test.sh` / `refresh-scout.test.sh` / `sweep-quota.test.sh` / `claim-exclusion.test.sh` / `install-launchd-durability.test.sh` / `capacity-transfer.test.sh` | a human / CI | — | pass/fail | each pins one regression contract. `test-claims.sh` cannot prove cross-box atomicity on one machine; `claim-exclusion.test.sh` is the closest available — N processes raced at a barrier against a real `receive-pack` — and prints the per-operation exclusion table README §7.2d records. `install-launchd-durability.test.sh` is HERMETIC (a `launchctl` stub first on `PATH`, a throwaway `$HOME`/$O) and is a CI shard: it asserts the forbidden end state directly — "not running AND (a persistent disable written OR exit 0)" is a failure. `capacity-transfer.test.sh` drives the shipped `lane.sh`/`chain-merge.sh` and releases a REAL claim against a LOCAL bare repo |
+| `merge-reminder.test.sh` | a human / CI | — | pass/fail | #2603: drives the shipped reminder's ACTUATOR ARM through every gate — attested+quiet dispatches; `attested=stale`, `in-flight=3`, `reds=1`, a held claim, a live rail and `mergeable=null` each refuse BY NAME and dispatch nothing — plus the grouping rule both ways (a re-run to success is not red; a same-named job in ANOTHER workflow cannot mask a red), the deploy arm's artifact-verified restart, `rate_limit` FIRST with a thin budget spending nothing else, and two MUTANTS proving the gates live — plus §27, the goals: the counts are server-side label answers (a local slice undercounts), an unread count is `NOT-MEASURED` and never `0`, a drifted cell breaks goal 2 by name, and the goal reads are pinned BEFORE the PR reads on the wire AND in the report; and §28, the four defects a review found (a `mergeable: null` listing that made the arm inert, a full PR page read as a queue, a deploy bound keyed on a value the action changes, evidence read from a neighbouring checkout). Hermetic (stub `gh`/`ps`/rail, a REAL `refs/claims/*` ref). A CI shard in both lanes |
+| `merge-reminder.py` | a timer (launchd / systemd-user / cron — `--install-timer`), or by hand | the open-PR listing, the local review store (`~/.pi/agent/reviews`), `rate_limit`, `refs/claims/*` (an EXPIRED lease is free, per `claims.sh`), the process table, `$O/state/boxes.tsv` | `$O/MERGE-REMINDER.md`, ONE line on stdout, `state/merge-reminder.attempts`, `state/mergeclaim-<PR>.lock` (taken for the dispatch under a `<lock>.reap` mutex; LEFT in place when the bounded wait expires, then reaped only when no landing attempt is live — and ⛔ only when the owner is IDENTIFIED: a lock whose pid is empty or garbled is a creator between `O_EXCL`-open and its pid write, so it is not reaped until it is older than `REAP_STALE_S`. The mutex itself carries `<pid> <epoch>`; a live pid is believed when its epoch is absent (the pre-upgrade sidecar), and an aged one is reclaimed), `state/merge-reminder-deploy.lock`, `logs/merge-reminder-*.log`, and a backgrounded rail run on a complete-evidence GO | **the goals come FIRST**: `## GOALS` states the owner's two goals, `## Where the goals stand this run` MEASURES them (goal 1 = tortoise P0/P1 open + closed today + PRs merged today; goal 2 = EVERY box on this cycle's `origin/main` — harness sha equal, its own `relation=current`, `source` not `stamp`, `controller=RUNNING` (deployed AND activated; the queue is a SEPARATE reading and never moves the standing word)), and `## What to do (in GOAL order)` derives the next action — with `main()` measuring drift → goals → PR reads, in that order, because the PR reads first spent the whole core budget and left the goals unmeasured (2026-10-24). ⛔ The cycle's main is read ONCE with a real backoff retry, and that single value is what the goals, the deploy table, the header and `--json` all use (a later re-read let the header print a sha the goals had called unreadable); a missing `state/boxes.tsv` is announced as LOCAL ONLY. ⛔ Goal counts are SERVER-SIDE (`search/issues` `total_count`; a local `--json` slice counted the PAGE — `P0=4 · P1=5` vs 7 and 20), and an unread count is `NOT-MEASURED`, never `0`. Search calls are a SEPARATE quota (`GOAL_SEARCH_BUDGET`, `budget.search_calls`), so the goals cannot starve `REST_BUDGET`. **the rail is the authority**: this file never merges and never overrides. Its gates are a COST pre-filter (open/not-draft/mergeable — the mergeability value is re-read on the SINGLE-PR endpoint, because the LIST endpoint answers `null` for every PR and reading that `null` as a refusal made the arm inert — head-bound record, `reds=0 in-flight=0`, no claim, no running rail) and every one refuses BY NAME. ⛔ A FULL page of the open-PR listing is UNREADABLE by name (it carries no `total_count`; 70 open PRs against a 30-row page hid 40), and `--repo` naming a repo this checkout is not ABSTAINS rather than reading a neighbouring repo's `refs/claims/*`. Exit 3 = SKIPPED (rate-limited / unreadable), never an empty queue. ⛔ A dispatch is a FACT: once a candidate's rail is spawned, no later candidate's failed read and no failed report write may render the cycle as "(no dispatch)". ⛔ An unreadable CRONTAB is not an empty one (the only non-zero answer that means empty is cron's own `no crontab for`): rewriting the spool from "" deleted operator entries and made `--uninstall-timer` report success over a live arm. ⛔ `%` is a systemd SPECIFIER, so it is doubled in the unit or an `$O` carrying one runs against the wrong directory. README §6.5.9 |
+| `box-status.sh` | `merge-reminder.py`'s deploy arm, or by hand | `$O/.agent-infra-stamp.json`, `HARNESS-PIN`, the doctor's `state/roles/.*.lock`, the process table | three parsable lines (`harness:` / `controller:` / `roles:`) + the stamp/pin detail line | exit 2 = CANNOT VERIFY (no identity, or no ref to compare) — an unread process table or an unresolvable pin is never `current` |
 
 **Manual utility:** `adopt-fix.sh` — materialises a worktree for a foreign branch and runs
 `fix-one.sh` against a specific PR by hand; exits with the fixer's status.
@@ -178,6 +181,8 @@ applying and the PR becomes eligible again.
 | `state/fixspend-<PR>-<head>` | `orch-loop.sh`, written BEFORE the spawn at the one site that consumes a findings marker | consumed by `refund_bailed_fixer`; consumed by `review_state_clear` when a verified CLEAN lands at that head (the findings state it stood for is superseded); deleted by `prune_orphan_markers` for PRs that left the open listing, on the GREEN arm (any authority — a local dispatch record, not evidence), and on MERGED/CLOSED; removed if the spawn fails | proof that a findings marker was actually spent, so a bail written by a different arm (CI-red, CONFLICTING) cannot MANUFACTURE a findings record for a head no reviewer reported on (review rounds 4-10, agent-infra#2132) |
 | `state/needsreview-<PR>-<head>` | `merge-one.sh` ONLY — a reviewer run at that head produced no usable verdict (agent-infra#2132). The controller never writes it: it cannot see whether head-bound evidence exists, so a marker it wrote would assert a property it cannot measure | cleared by `review_state_clear` once the signed marker VERIFIED, deleted by `orch-loop.sh` when a GATE-authority PR is GREEN, on MERGED / CLOSED, and replaced (pruned per PR) when a newer verdict is recorded | "a reviewer run at this head produced no verdict — re-run the REVIEW". Bounded by `state/reviewcount-<PR>`; one marker per PR. ⚠ A marker can describe a SUPERSEDED head until `merge-one.sh` next runs for that PR (the rail fast path exits before the clear) — the count does not prove head currency, and says so |
 | `state/reviewcount-<PR>` | `merge-one.sh` | reset when the stored head ≠ the current head, and by any run that DID produce a usable verdict (`review_state_clear` on a verified CLEAN, `review_state_record` on `ISSUES`) — it counts CONSECUTIVE verdict-less runs | `"<head> <n>"` — verdict-less reviewer runs at this head, capped by `MAX_REVIEW_TRIES` (3), then park |
+| `state/reviewdisp-<PR>` | `orch-loop.sh` (written only after the `merge-<PR>` review lane actually spawned) | a push (stored head ≠ current head) re-arms it; deleted on MERGED/CLOSED and by `prune_orphan_markers` | `"<head> <n>"` — review lanes the CONTROLLER has dispatched at this head, capped by the SAME `MAX_REVIEW_TRIES` merge-one uses. Read by `review_disp_decide` BEFORE capacity: `REVIEW-AT-HEAD` (either store name — repo-qualified or legacy `<pr>.json` — holds a CLEAN record at exactly this head → no re-review), `REVIEW-CAP n/max` (budget spent → park), an unreadable head dispatches nothing, and `MAX_REVIEW_TRIES=0` is REPORT-ONLY (nothing dispatched, nothing parked). A write that FAILS is named, never swallowed: `reviewdisp` ⇒ park (the cap cannot be outrun), `reviewathead` ⇒ `REVIEW-AT-HEAD-UNBOUNDED`, and an unwritable `parked-<PR>` ⇒ `PARK DID NOT LAND` (the park IS the terminator). `park_ctrl` now returns its write status for the two escalating branches. Every one is a named line, never a silent skip (agent-infra#2653) |
+| `state/reviewathead-<PR>` | `orch-loop.sh` (one bump per cycle the review arm refuses as AT-HEAD) | same head-change reset; deleted on MERGED/CLOSED and by `prune_orphan_markers` | `"<head> <n>"` — at `MAX_REVIEW_TRIES` the PR parks as `REVIEW-AT-HEAD-STUCK`: the state neither dispatches nor parks, so it must escalate to a human rather than wait for ever (agent-infra#2653) |
 | `state/fixbail-<PR>-<head>` | `fix-one.sh` (cross-box CAS refusal) | consumed by `refund_bailed_fixer` (rm) | "a fixer was refused this head by another box" — proof no work happened, so the attempt is refunded |
 | `state/fixcount-<PR>` | `orch-loop.sh` (booked at spawn) | decremented by `fix-one.sh` (load refusal) and `refund_bailed_fixer`. **Not head-keyed** (⚠ see §6.2) | fixer attempts consumed for this PR |
 | `state/railcount-<PR>` | `merge-one.sh` (rail mode) | reset when the stored head ≠ the current head | `"<head> <n>"` — rail refusals at this head, capped by `RAIL_TRIES` (3) |
@@ -186,6 +191,12 @@ applying and the PR becomes eligible again.
 | `state/redfix-<PR>` | `orch-loop.sh` (red-fixer role) | reset when the stored head ≠ the current head; removed with the refusal | `"<head> <n>"` — red-fixer attempts at THIS head, capped by `MAX_RED_FIX_TRIES` (2). Head-keyed by construction, so a fixer's push buys a fresh budget (the `fixcount-<PR>` residual in §6.2 is deliberately not inherited) |
 | `state/parked-<PR>` | `orch-loop.sh`, `merge-one.sh` | a later push re-arms it (the stored head stops matching) | needs a human; the loop skips the PR while parked at this head |
 | `state/merged-<PR>.done` | `merge-one.sh` | never | merge completed |
+| `MERGE-REMINDER.md` (`$O/`, not `state/`) | `merge-reminder.py`, atomically (temp-then-`os.replace`) | OVERWRITTEN each cycle | the cycle's written answer: **the two goals and where they stand** (`## GOALS`, `## Where the goals stand this run`, `## What to do (in GOAL order)` — first, because they are what the queue is for), then the one line, the landing candidates with their MEASURED readings (`reds=`, `in-flight=`, `attested@head=`, `claim=`, `rail=`), the deploy table, and the shared-red view. A skipped cycle says `**SKIPPED:** <reason>` here — never `nothing to do` — and its goal block says `NOT-MEASURED` rather than showing counts it never read (agent-infra#2603) |
+| `state/merge-reminder.attempts` | `merge-reminder.py`, on every DISPATCH (with the rail's own rc) | bounded to the last 400 lines | `<pr> <head> <epoch> <verdict>`. It is why a refusal at one head is not retried blind: the same head inside `--retry-s` is a `WAIT(retry-after=…)`, and a push moves the head and re-arms the candidate |
+| `state/merge-reminder.deploys` | `merge-reminder.py`, on every deploy ACTIVATION (with its verdict); an UNWRITABLE ledger is reported in the verdict (`the deploy ledger could NOT be written — the attempt bound is inert until $O/state is writable`), never silently inert | bounded to the last 400 lines | `<box>\t<from-sha12>\t<to-sha12>\t<epoch>\t<verdict>` (TAB-separated: a box name may contain a space). The DEPLOY arm's bound is keyed on **box + target sha** (⛔ not on the `from`→`to` pair: `from` is a value the activation ITSELF changes, so a box that crept forward without arriving — `diverged` → `behind`, a partial `apply` — missed its own row and was restarted every 600 s): a repeat inside `--retry-s` is a `WAIT`, and `DEPLOY_MAX_ATTEMPTS` (3) unverified attempts is a `REFUSE` naming a human — otherwise a box that cannot reach `origin/main` is restarted every cycle (agent-infra#2603 review) |
+| `state/merge-reminder-deploy.lock` | `merge-reminder.py`, around a deploy activation (`O_EXCL`, holds a pid) | removed in a `finally`; a dead pid is reaped by the next cycle | **local, one-box** single-owner lock for the DEPLOY arm: `--interval` (600 s) is shorter than `--rail-wait-s` (900 s), so overlapping timer cycles are reachable by construction and two of them must not run `stop → apply → start` at once (agent-infra#2603 review) |
+| `state/boxes.tsv` | a human | — | the DEPLOY arm's inventory: `name<TAB>status-cmd<TAB>activate-cmd`, `#` comments. Absent → the arm acts on THIS box only (`box-status.sh`). A status command must answer `harness:` / `controller:` / `roles:`; a blank or unreadable answer is `roles=UNREADABLE` and refuses the restart rather than assuming idle |
+| `logs/merge-reminder-*.log` | `merge-reminder.py` (`logs/merge-reminder-rail-<PR>-<epoch>.log`, `…-deploy-<box>-<epoch>.log`) | never | the dispatched rail's and activation's OWN output. The reminder reports the rail's rc from waiting on that child (bounded by `--rail-wait-s`), never from assuming the spawn succeeded |
 | `state/rerun-<PR>-<runid>` | `orch-loop.sh` | never | a failed CI run was already re-triggered; stops a rerun storm |
 | `candidates.txt` (`$O/`, not `state/`) | `refresh-candidates.sh` (append + dedupe) | consumed by dispatch; pruned by `orch-loop.sh` (drops ids already in `dispatched.txt`); rewritten atomically (`mv`) | the dispatch backlog. **FIFO — order IS priority**, qualified by the product floor below: up to `PRODUCT_FLOOR` slots of a batch are filled from `candidates.product.txt` first, so the head of a batch can be a LOWER-tier product issue while the backlog order still governs everything else (agent-infra#2054) |
 | `candidates.product.txt` / `candidates.harness.txt` (`$O/`) | `refresh-candidates.sh` (`write_product_queues`, ONCE per pass) | `orch-loop.sh` reads the product queue for the floor, and only ever reads numbers that are ALSO in `candidates.txt` | the product-floor split. `product` = a `PRODUCT_REPOS` issue (default `daniel-ospina/tortoise`) WITHOUT the `harness` label; `harness` = everything else, including every agent-infra issue. ⛔ A FAILED `--label harness` listing classifies EVERY candidate as harness, so the product queue is empty and the floor reports itself unmet — never a product candidate invented from a read that did not answer. Both files are DERIVED from `candidates.txt` at the end of the pass, so a stale entry cannot resurrect work |
@@ -231,7 +242,7 @@ default**, so a job already loaded keeps the old value until it is reloaded (or 
 | (reviewer budget, not a `[dispatch]` string) | `MAX_REVIEW` | 4 | `review_slots()` returns `MAX_REVIEW` normally and `10#MAX_REVIEW + 2` while `open > MERGE_PRIORITY_AT` — the `+2` headroom is real and read base-10 deliberately (a leading-zero value would otherwise be octal) |
 | (fixer concurrency, not a `[dispatch]` string) | `MAX_FIX` | 3 | caps concurrent `fix-<PR>` sessions |
 | fixer attempts | `MAX_FIX_TRIES` | 3 | at the cap → park at this head |
-| reviewer runs without a verdict at one head (`reviewcount-<PR>`) | `MAX_REVIEW_TRIES` | 3 | at the cap → park (nothing was reviewed, so no marker can be minted and a fixer has no findings); a new push re-arms it (agent-infra#2132). ⛔ It bounds the VERDICT-LESS loop only: a head whose signed marker verified but whose gate never reaches SUCCESS deliberately does not park (the gate may still go green next cycle), so that path is bounded by `RAIL_TRIES`/a human, not by this counter — the same unbounded-re-record class as agent-infra#1756 |
+| reviewer runs without a verdict at one head (`reviewcount-<PR>`) | `MAX_REVIEW_TRIES` | 3 | at the cap → park (nothing was reviewed, so no marker can be minted and a fixer has no findings); a new push re-arms it (agent-infra#2132). ⛔ It bounds the VERDICT-LESS loop only: a head whose signed marker verified but whose gate never reaches SUCCESS deliberately does not park (the gate may still go green next cycle), so that path is bounded by `RAIL_TRIES`/a human, not by this counter — the same unbounded-re-record class as agent-infra#1756. ⛔ **AND THE CONTROLLER READS THE SAME LIMIT** (`state/reviewdisp-<PR>`, agent-infra#2653): the review lane is dispatched by `orch-loop.sh`, so the budget that bounds it must be visible there too — two readers, one number, pinned by `selftest.sh`'s coercion count |
 | dispatch batch | `BATCH` | 2 | issues per cycle |
 | cycle | `CYC` | 240s | floored at 5; jittered ±20% so several boxes stop waking together |
 
@@ -318,3 +329,110 @@ are indistinguishable in the log. `mp_reason`'s own comment records the measured
 5. **Do not `pkill -f` with a pattern that could appear in a prompt.** Prompts are passed as argv
    elements (`"$(cat "$prompt")"`), so a pattern matching prompt *text* kills the worker. Kill by
    recorded pid.
+
+---
+
+## 9. The fleet partition — one cell per repo, one BROAD cell per queue
+
+A controller's work queue is **one repo**: `$OR`. The supervisor **derives** it from `$REPO`'s
+`origin` remote (`resolve_queue_target`), and an explicit `OR` that disagrees with that checkout
+**refuses the start** rather than dispatching repo B's PRs out of repo A's tree (agent-infra#1901).
+So the fleet is partitioned by **(cell → checkout)** first, and `SCOPE` decides how much of *that
+repo's* queue a cell touches:
+
+| `SCOPE` at process start | swept set (`headRefName` filter, `BEGIN scope-select`) | when |
+|---|---|---|
+| `auto` (**default**: unset) | BROAD when open PRs `> 10`, else OWN | a one-cell repo, or a cell nobody has decided about |
+| `broad` | every **non-draft** PR except `^design/`, `^scope/`, `^dependabot/` | **the one cell that owns draining this repo's queue** |
+| `own` | only `-tm$` (lane), `-cap$` (capacity), `^fix/` | every *other* cell on the same repo |
+
+⛔ **Drafts are swept only on own-pattern branches.** The listing ANDs `$SEL` to
+`select((.isDraft|not) or (.headRefName|test("-tm$|-cap$|^fix/")))` (`orch-loop.sh`), so a **draft**
+`feat/`, `chore/`, `test/` or `epic/` branch is swept by **neither** mode — `broad` does not reach it.
+That is deliberate for own-pattern drafts (nothing else would ever ready them, #8219/#8085) and it
+means "pin this cell `broad`" is not a way to get a non-lane draft swept or readied.
+
+`SCOPE` is read from the process **environment**, which is fixed when the process starts (the
+`BEGIN scope-select` block re-evaluates every cycle, but it reads that same fixed value). So a
+change takes effect by restarting the cell — never by exporting into a live controller. A
+set-but-empty or unrecognised value is **FATAL** in both `orch-loop.sh` (the `BEGIN scope-select`
+block) and the supervisor (`validate_scope`): a blank entry that silently fell back to `auto` is
+exactly a cell that drains the shared queue.
+
+### 9.1 `own` is a branch-pattern filter — NOT an ownership filter
+
+`own` selects `-tm$|-cap$|^fix/`, which is **the same set on every cell of the same repo**. It
+separates a cell from **non-lane** branches (`feat/`, `chore/`, `test/`, `epic/`); it does **not**
+separate two cells from each other. Two `own`-pinned cells on one repo sweep the same PRs and can
+still both re-record and both auto-arm the same head.
+
+Ownership is also still **inferred from LOCAL branches and worktrees**
+(`tools/collision_preflight.py`), which are invisible across machines — agent-infra#4256.
+**The pin is a MITIGATION, never the fix**; the root is #5052 (an authoritative expiring claim
+registry). Both files carry that caveat in their own comments; this section exists so a future
+reader does not read the partition as a guarantee of non-duplication.
+
+Two operational consequences that are easy to get backwards:
+
+- **Partitioning cells apart is done by repo, not by `own`.** Two cells are separated when they
+  have different checkouts (different `OR`). Two `own` cells on one repo are separated by nothing.
+- **`own` on the only cell of a repo strands that repo's non-lane PRs.** Measured on tortoise
+  2026-10-24T05:07Z: 12 open PRs, of which the `own` filter matched **6**. The other five live
+  branches — `feat/runner-autoscale`, `feat/9675-step1-write-eval`, `feat/3515-store-sync-backstop`,
+  `chore/batch-review-measurement`, `test/9664-capstone-connector-record` — are in the swept set
+  only because that cell is BROAD, and the sixth non-match is a draft `epic/` branch that neither
+  mode sweeps (see the draft rule above). The count
+  moves minute to minute — the controller's 05:00Z cycle printed `open=14` from its sticky
+  last-known after a transient listing failure, the 05:07Z listing was 12 — so re-measure, never
+  quote this one.
+
+### 9.2 The measured partition (2026-10-24T05:00Z)
+
+| cell (`cmux vm ls`) | host name | `REPO` (checkout) | `OR` (queue) | `SCOPE` | what proves it |
+|---|---|---|---|---|---|
+| `pi-cell-3` | `cmux` | `/tmp/cell-t3` | `daniel-ospina/tortoise` | **`broad`** (pinned 05:00:00Z) | `/proc/<pid>/environ`; `[scope] open=14 -> BROAD (pinned SCOPE=broad)`; `[cap] … open=14@daniel-ospina/tortoise`; fresh `refs/boxes/cmux/*` in tortoise |
+| `Daniels-MacBook-Air` (the Mac orchestrator) | `Daniels-MacBook-Air` | an **agent-infra** checkout | `daniel-ospina/agent-infra` | **unverified** — not readable from `pi-cell-3` | fresh `refs/boxes/Daniels-MacBook-Air/*` in agent-infra (newest 04:55:42Z). `cap_publish "$REPO"` pushes to the *checkout's* origin, so those refs prove an agent-infra checkout, not merely an agent-infra queue |
+| `pi-cell-4` | — | — | — | **UNKNOWN** | no `refs/boxes` record in either repo **and** the cmux peer link is down from `pi-cell-3` (`cmux vm exec pi-cell-4` → `no known daemon matches this route; connect with an invitation`). No record is not a measurement of absence |
+| `pi-lane-1` | — | — | — | **UNKNOWN** | same: no capacity ref, same link failure |
+
+⛔ **Do not read the UNKNOWN rows as "no controller".** The cell that cannot be reached is the cell
+that cannot be re-pinned from here, and it must not be written into this table as if it had been.
+
+### 9.3 Applying a partition change
+
+One cell at a time, through the supervisor — never two controllers on one cell (the ownership read in
+`cloud-cell-supervisor.sh`, agent-infra#1761: `$O/.orch.lock` plus a scoped process read, because
+`tmux has-session` cannot see a controller launched outside the `orch` session), and never by editing
+a live controller's environment:
+
+```bash
+CELL_HOME=/tmp/cell-home REPO=<checkout> O=$CELL_HOME/orchestrator \
+OR=<owner/repo> SCOPE=<role> \
+HARNESS_REPO=<agent-infra checkout> HARNESS_REF=origin/main \
+HARNESS_PIN_DIR=$CELL_HOME/harness HARNESS_PIN_FILE=$CELL_HOME/.harness-path \
+bash scripts/cloud-cell-supervisor.sh stop      # then: start, with the same environment
+```
+
+Prove it after the start, in this order:
+
+1. the **new** pid's environment carries the intended pair — `tr '\0' '\n' < /proc/<pid>/environ |
+   grep -E '^(OR|REPO|SCOPE)='`;
+2. `status` prints `controller: RUNNING (pid …) — scope=<SCOPE> repo=<OR>` — it echoes the
+   **configured** value (`scope=auto` on a cell that was never pinned; the *resolved* mode is not in
+   `status`) — and the queue line `[ok — derived from the checkout]` when `OR` was left to derive,
+   or `[ok — OR matches the checkout]` when it was declared;
+3. the pin equals the remote tip — `cat $CELL_HOME/.pi/agent/state/HARNESS-PIN` vs
+   `git ls-remote origin refs/heads/main`;
+4. the controller's own log names the repo and the mode it actually took —
+   `[cap] … open=<n>@<OR>` and `[scope] open=<n> -> <MODE> (<why>)` (this `[scope]` line, not
+   `status`, is where the RESOLVED mode is readable).
+
+If the new configuration refuses to start, restart the **previous** environment and report the cell
+as unchanged — an unattended cell with no controller is worse than an unpinned one.
+
+⚠️ `cloud-cell-supervisor.sh check` prints the `⛔ COLLISION: … an UNPINNED cell drains the SHARED
+queue` advisory **unconditionally** — it is not a verdict about the cell being checked, and it fires
+on a correctly pinned `SCOPE=broad` cell too. Read the role from the controller's `[scope]` line and
+the configured value from `status`'s `scope=`, not from that block, or the advisory becomes
+background noise that the real collision (two BROAD cells, or an unpinned one) no longer cuts
+through.

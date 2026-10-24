@@ -521,6 +521,38 @@ else
 fi
 
 echo ""
+echo "8e2. A SHARD THAT READS STDIN MUST NOT TRUNCATE THE LIST (measured: 22 suites silently skipped)"
+# The run loop feeds the DERIVED LIST to `read` on the runner's own standard input, so every shard
+# inherits it as its stdin. Measured on PR #2614's head, 2026-10-24: `scripts/pi-reap-idle.test.sh`
+# ends a fixture helper in a bare `cat`, consumed the rest of the list, and shard 3 executed 8 of
+# its 11 shards — 22 suites in that slice never ran at all. The coverage arithmetic caught it, and
+# that is exactly why this arm pins the CAUSE rather than the symptom: the count assertion only
+# fires while the arithmetic happens to disagree, and a slice whose shard count divides evenly would
+# report ✅ over suites it never executed (#2482's own decay argument).
+STDIN_FIX="$TMP/stdin-fixture"
+mkdir -p "$STDIN_FIX/scripts" "$STDIN_FIX/tests/ci-lane-parity"
+# The fixture root needs a non-empty syntax sweep (the `swept` sentinel) and three discovered
+# shards: an inert one, one that CONSUMES stdin, and one AFTER it that must still execute.
+printf '#!/bin/bash\n:\n' >"$STDIN_FIX/scripts/sweepable.sh"
+printf '#!/bin/bash\nexit 0\n' >"$STDIN_FIX/tests/ci-lane-parity/stdin-a.sh"
+printf '#!/bin/bash\ncat >/dev/null\nexit 0\n' >"$STDIN_FIX/tests/ci-lane-parity/stdin-b.sh"
+printf '#!/bin/bash\nexit 0\n' >"$STDIN_FIX/tests/ci-lane-parity/stdin-c.sh"
+awk -v g="tests/ci-lane-parity/stdin-*.sh" '
+  /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"" g "\" )"; skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$RUNNER" >"$STDIN_FIX/scripts/runner-stdin.sh"
+$FIXTURE_BOUND bash "$STDIN_FIX/scripts/runner-stdin.sh" >"$TMP/runner-stdin.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-stdin.out")"
+if [ "$RC" -eq 0 ] && grep -q 'all 3 bash shards passed' <<<"$OUT"; then
+  pass "a shard that reads stdin does not truncate the list: all 3 stand-ins executed (rc 0)"
+else
+  fail "a stdin-reading shard truncated the list (rc $RC, want 0 with all 3 executed): $OUT"
+fi
+
+echo ""
 echo "8j. A FLAG AT THE CALL SITE → rc 2 (--list runs no shard)"
 awk '{ if ($0 ~ /^        run: bash scripts\/run-bash-shards\.sh$/) { print "        run: bash scripts/run-bash-shards.sh --list"; next } print }' \
   "$PR" >"$TMP/ci-pr-flag.yml"
@@ -800,6 +832,7 @@ fi
 
 echo ""
 echo "8z. A BACKSLASH-CONTINUED SWALLOW → rc 2 (the tail is not only the first physical line)"
+
 awk '{ if ($0 ~ /^        run: bash scripts\/run-bash-shards\.sh$/) { print "        run: |"; print "          bash scripts/run-bash-shards.sh > /dev/null \\"; print "            || true"; next } print }' \
   "$PR" >"$TMP/ci-pr-cont-swallow.yml"
 if cmp -s "$PR" "$TMP/ci-pr-cont-swallow.yml"; then
@@ -820,6 +853,65 @@ if [ "$RC" -eq 2 ]; then
   pass "a continued pipe exits 2 (no pipefail in the default shell)"
 else
   fail "a continued pipe returned rc $RC (want 2): $OUT"
+fi
+
+echo ""
+echo "8am. THE FAILING SHARD IS NAMED — deleting the naming must turn this arm RED (#2643)"
+# The runner now prints `❌ FAILED SHARD: <path>` at the point of failure and a recap
+# (`❌ failing shard(s): <path,…>`). BOTH are asserted here, because a reader-facing line nobody
+# asserts is a line the next refactor deletes with every gate green — and the runner's own runtime
+# sentinels CANNOT pin it (the sentinel is deliberately not a listed shard, so a name would be a
+# false report on a green run). Non-vacuity is built in: the same fixture with `shard_fail` deleted
+# must print NO name, and still exit 1.
+#
+# ⛔ THE FIXTURE IS A TREE, NOT A REWRITTEN LIST (agent-infra#2609 + #2643 interaction, found by
+# THIS arm). #2643 landed on main while the list was still ENUMERATED there, so its fixture rewrote
+# `run_shard <path>` lines in a copy of the runner left in `$TMP`. Under DERIVATION there is no such
+# line to rewrite, and `-` this is the part that fails silently `-` a copy sitting outside a tree
+# anchors its own discovery to the wrong root and refuses (rc 2, list EMPTY), so the arm measured
+# the refusal instead of the naming. The layout below mirrors §12's PROBE: a real fixture root the
+# copy LIVES in, with discovery narrowed to the two committed stand-ins, one passing and one failing.
+NAMED_FAIL="tests/ci-lane-parity/stand-in-fail.sh"
+NAMED_FIX="$TMP/named-fixture"
+mkdir -p "$NAMED_FIX/scripts" "$NAMED_FIX/tests/ci-lane-parity"
+# Non-empty sweep: the fixture runner refuses to report success over a sweep that parsed nothing.
+printf '#!/bin/bash\n:\n' >"$NAMED_FIX/scripts/sweepable.sh"
+cp "$ROOT/$CHEAP" "$NAMED_FIX/$CHEAP"
+cp "$ROOT/$NAMED_FAIL" "$NAMED_FIX/$NAMED_FAIL"
+# `stand-in-*.sh` matches BOTH, so the passing shard proves the run is not only its failure.
+awk -v g="tests/ci-lane-parity/stand-in-*.sh" '
+  /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"" g "\" )"; skip = 1; next }
+  skip && /^\)$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$RUNNER" >"$NAMED_FIX/scripts/runner-named.sh"
+env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-onefail.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-onefail.out")"
+if [ "$RC" -eq 1 ] && grep -qF "❌ FAILED SHARD: $NAMED_FAIL" <<<"$OUT"; then
+  pass "a failing shard is NAMED at the point of failure ($NAMED_FAIL), and the run still fails (rc 1)"
+else
+  fail "a failing shard was not named at the point of failure (rc $RC): $(grep -F 'FAILED SHARD' <<<"$OUT" | head -3)"
+fi
+if grep -qE '^❌ failing shard\(s\): .*stand-in-fail\.sh' <<<"$OUT"; then
+  pass "the RECAP names it too (so grepping the summary does not require walking the log)"
+else
+  fail "the recap did not name the failing shard: $(grep -F 'failing shard' <<<"$OUT" | head -3)"
+fi
+# NON-VACUITY: same fixture, the naming call deleted. The run must STILL fail (the counter is
+# untouched) and must print NO name — so an arm that passed on any failing run would be caught.
+sed 's/\[ "$shard_errors" -ne "$shard_err0" \] && shard_fail "$1"; //' "$NAMED_FIX/scripts/runner-named.sh" >"$NAMED_FIX/scripts/runner-noname.sh"
+if cmp -s "$NAMED_FIX/scripts/runner-named.sh" "$NAMED_FIX/scripts/runner-noname.sh"; then
+  fail "the no-name mutation did not change the fixture (the naming call moved — update this arm's sed)"
+else
+  env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-onefail-noname.out")"
+  if [ "$RC" -eq 1 ] && ! grep -qF 'FAILED SHARD' <<<"$OUT"; then
+    pass "with the naming deleted the run still fails and prints NO name — this arm measures the naming, not the count"
+  else
+    fail "the no-name mutation returned rc $RC and printed: $(grep -F 'FAILED SHARD' <<<"$OUT" | head -3)"
+  fi
 fi
 
 echo ""
@@ -1425,12 +1517,16 @@ else
 fi
 rm -rf "$PROBE/tests/zzz-blankreason"
 # ⛔ The attribution half of #2609: a failing shard must be NAMED, not counted anonymously.
+# The vocabulary asserted here is #2643's (`❌ FAILED SHARD:` + the `❌ failing shard(s):` recap),
+# which landed on main with a second, independent naming implementation; this branch's earlier
+# `❌ SHARD FAILED (rc N):` spelling lost the merge to it, and ONE vocabulary is the point — a
+# reader who greps the log should not have to know which change named the shard.
 mkdir -p "$PROBE/tests/zzz-fail"
 printf '#!/bin/bash\nexit 3\n' >"$PROBE/tests/zzz-fail/run.sh"
 FAILRUN="$( cd "$PROBE" && bash scripts/runner.sh 2>&1 )"
 RC="$?"
-if [ "$RC" -eq 1 ] && grep -q 'SHARD FAILED (rc 3): tests/zzz-fail/run.sh' <<<"$FAILRUN" \
-   && grep -q '^   - tests/zzz-fail/run.sh$' <<<"$FAILRUN"; then
+if [ "$RC" -eq 1 ] && grep -q '❌ FAILED SHARD: tests/zzz-fail/run.sh' <<<"$FAILRUN" \
+   && grep -qE '^❌ failing shard\(s\): .*tests/zzz-fail/run\.sh' <<<"$FAILRUN"; then
   pass "a failing shard is NAMED inline and in the summary (rc 1, not an anonymous count)"
 else
   fail "a failing shard was not named (rc $RC): $(tr '\n' '|' <<<"$FAILRUN")"

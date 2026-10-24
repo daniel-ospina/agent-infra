@@ -193,7 +193,11 @@ if [ "${1:-}" = "--list" ]; then
 fi
 
 if [ "${1:-}" = "--list-sweeps" ]; then
-  printf '%s\n' "${SWEEP_GLOBS[@]}"
+  # `${SWEEP_GLOBS[@]+…}` and not a bare expansion: bash 3.2 (macOS) treats `"${A[@]}"` on an
+  # EMPTY array under `set -u` as an unbound variable, so this line exited 1 for an emptied list and
+  # `check-ci-lane-parity`'s §6 fixture reported "the lane's own sweep list is unreadable" instead of
+  # the no-sweeps floor it was measuring. The same idiom guards SUITE_GLOBS above.
+  printf '%s\n' ${SWEEP_GLOBS[@]+"${SWEEP_GLOBS[@]}"}
   exit 0
 fi
 
@@ -202,7 +206,6 @@ fi
 # nothing while the list still reads its full count) fails loudly instead of reporting "all bash
 # shards passed". A static check over this file's text could never catch that; running it can.
 shard_errors=0
-shard_failed=()
 shard_ran=0
 shard_skipped=0
 shard_listed=0
@@ -268,6 +271,35 @@ shard_ran_log="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-ran.$$")"
 : > "$shard_ran_log" 2>/dev/null || true
 trap 'rm -f "$shard_ran_log"' EXIT
 
+# ── NAMING THE FAILING SHARD (#2643) ──────────────────────────────────────────────────────────
+# The count alone is UNATTRIBUTABLE. `❌ 4 bash shard(s) failed` names no suite, so nobody reading
+# the job — human or agent — can tell WHICH body of work is red without walking tens of thousands of
+# lines up the log. Measured cost (2026-10-24): main and every PR carried the same four red shards
+# for hours, `bash-suites` red on every PR head, and every lane re-derived those four from CI logs by
+# hand, over a 5-minute fix. The names were in the log all along; they were just not in the answer.
+#
+# ⛔ TWO READERS, TWO MECHANISMS — and the rail is served by the OTHER one. `run_shard` emits
+# `::error::bash shard failed: <path>`, a GitHub annotation, and `scripts/ci_exemption.py ids`
+# recognises it as a guard-step identity that CARRIES the shard path — measured on a log with two of
+# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. That is what
+# makes a red `bash-suites` step comparable to main's baseline PER SHARD, and it is NOT this block:
+# measured against the prose lines printed here, the same parser returns `ids=0` — they neither help
+# nor hurt it. Do not "fix" the rail here, and never delete the annotation while keeping these lines:
+# that would leave every lane unattributable again.
+#
+# Two prints, on purpose — and the REASON is the early exits: the recap below is reached only at the
+# END of a run, while this file has several `exit 1` paths ABOVE it (`shard target resolves outside
+# this checkout`, `slice executed a DIFFERENT SET of shards`, and the two sentinels). On any of those
+# the per-failure line is the only name the log will ever carry.
+# LISTED shards only: the runtime sentinel at the end of this file deliberately runs a failing stub,
+# and a green run must never print a FAILED SHARD line for it (`shard_is_listed` is 0 there).
+shard_failed_list=""
+shard_fail() {
+  [ "$shard_is_listed" = 1 ] || return 0
+  shard_failed_list="${shard_failed_list}${shard_failed_list:+, }$1"
+  echo "❌ FAILED SHARD: $1"
+}
+
 slice_skips() {
   slice_pos=$shard_listed
   shard_listed=$((shard_listed + 1))
@@ -308,13 +340,34 @@ shard_note() {
 # parser's own rules and names the suite — the rail can rate-compare it against main's baseline instead
 # of refusing. It does NOT weaken the comparison: a suite that fails here and is green on main is still
 # a PR-unique failure and still blocks.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; bash "$1" || { shard_rc=$?; shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && { shard_failed+=("$1"); printf '❌ SHARD FAILED (rc %s): %s\n' "$shard_rc" "$1"; }; [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
+# ⛔ A SUITE MUST NOT BE ABLE TO READ THE DRIVER'S STDIN (measured 2026-10-24, this PR's own CI).
+# The run loop below feeds the derived list to `read` on this script's standard input, so until the
+# `</dev/null` on the `bash` call EVERY suite inherited that list as its own stdin.
+# `scripts/pi-reap-idle.test.sh` carries a bare `cat` in a fixture helper (`session_jsonl`) and
+# consumed the remaining entries: shard 3 executed 8 of its 11 shards and 22 suites in that slice
+# never ran at all. Only the coverage self-check below (#2482) turned that into a red job — without
+# it, the slice would have reported success over 22 suites it never executed. A suite is hermetic
+# by CONTRACT; the driver now guarantees the INPUT half of that rather than trusting it.
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" </dev/null || { shard_errors=$((shard_errors + 1)); [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
 # checking no syntax at all. `swept` is asserted below, so the sweep loops must have done work.
 swept=0
-sweep_file() { swept=$((swept + 1)); bash -n "$1" || shard_errors=$((shard_errors + 1)); }
+# ⛔ SWEEP FAILURES ARE COUNTED SEPARATELY (#2643 review, 2026-10-24). `shard_errors` is the verdict
+# and covers BOTH classes, so a recap that DERIVES "the sweep half" by subtracting the named shards
+# is guessing: when the naming arm itself is broken, a failing SHARD opens the "all sweeps" branch and
+# points the reader at the wrong subsystem. One counter, incremented where the failure happens.
+# ⛔ THE ` || shard_errors=$((shard_errors + 1))` LITERAL SURVIVES IN `sweep_file` because
+# `tests/ci-lane-parity/run.sh` §8h pins it by `sed` — and MEASURED, that `sed` changes ONLY
+# `sweep_file` (plus a comment). `run_shard`'s recorder is the grouped form main added on 2026-10-24
+# (`bash "$1" || { shard_errors=…; … echo "::error::…"; }`), so the sed never matched it, before or
+# after this branch; `run_shard`'s recorder is pinned by the runtime failure-recording sentinel
+# instead. The second counter below is therefore charged from the same DELTA idiom rather than by
+# rewriting the recorder into another group, so a reader who trusts §8h keeps seeing exactly what
+# §8h covers.
+sweep_errors=0
+sweep_file() { swept=$((swept + 1)); shard_err0=$shard_errors; bash -n "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_errors" -ne "$shard_err0" ] && sweep_errors=$((sweep_errors + 1)); }
 
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
 # keeps the line count but points the list at a /tmp stub would report every shard as passed having
@@ -443,13 +496,18 @@ fi
 sentinel_sweep="$(mktemp)"
 printf 'if then\n' >"$sentinel_sweep"
 before_sweep_err=$shard_errors
+before_sweep_errors=$sweep_errors
 sweep_file "$sentinel_sweep"
 rm -f "$sentinel_sweep"
 if [ "$shard_errors" -ne $((before_sweep_err + 1)) ]; then
   echo "❌ the sweep arm is broken — a file with a syntax error would not fail this run"
   exit 1
 fi
+# Both counters are restored to their PRE-sentinel values (not decremented): a decrement silently
+# assumes the sentinel incremented, and this file's whole discipline is that an assumption about a
+# counter is what a refactor invalidates.
 shard_errors=$before_sweep_err
+sweep_errors=$before_sweep_errors
 swept=$((swept - 1))
 
 # Runtime self-check 3: the FAILURE-RECORDING arm must still be wired. Without this, a rewrite
@@ -475,13 +533,25 @@ shard_listed=$before_listed
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
-  # ⛔ NAMED, not just counted. "N bash shard(s) failed" was unattributable: a shard that dies on
-  # its own generated fixture (`/tmp/tmp.XXXX: line 1: syntax error near unexpected token 'then'`)
-  # read as a whole-list failure with no suite to look at. The names are printed here and again
-  # inline at the moment each shard failed, so the CI log line that carries the red carries it too.
-  if [ "${#shard_failed[@]}" -gt 0 ]; then
-    printf '   failing shard(s):\n'
-    printf '   - %s\n' ${shard_failed[@]+"${shard_failed[@]}"}
+  # The recap (#2643). Three shapes, each REPORTED from what was counted — never inferred from what is
+  # absent: a failing shard is named; a failing syntax sweep named its own file at the `bash -n` line;
+  # and a failure with NEITHER means the naming arm is broken, which is a defect in this runner and must
+  # say so rather than blame a subsystem it never looked at.
+  if [ -n "$shard_failed_list" ]; then
+    echo "❌ failing shard(s): $shard_failed_list"
+    # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT. `shard_errors` counts BOTH failing shards and failing
+    # syntax sweeps; the list above names only the former. Printing "2 failed" beside one name reads as
+    # a missing name — and the missing half is exactly what the recap exists to stop hunting for.
+    if [ "$sweep_errors" -gt 0 ]; then
+      echo "❌ …and $sweep_errors of them are SYNTAX-SWEEP failures, not shards — each named at its own 'bash -n' line"
+    fi
+  elif [ "$sweep_errors" -eq "$shard_errors" ] && [ "$sweep_errors" -gt 0 ]; then
+    echo "❌ every failure above is a syntax-sweep failure, named at its own 'bash -n' line"
+  else
+    # Mixed AND unnamed: a broken naming arm alongside a failing sweep. Do NOT claim the sweep caused
+    # everything — measure it. (Final review: this branch used to say "every failure above is a
+    # syntax-sweep failure", which sent triage to fix the sweep and lose the unnamed shard with it.)
+    echo "❌ no shard is named, and $((shard_errors - sweep_errors)) of the $shard_errors failure(s) is/are NOT a syntax sweep — the naming arm is not wired for them. This is a defect in scripts/run-bash-shards.sh, not in the shard: read the per-shard output above for the path."
   fi
   exit 1
 fi
