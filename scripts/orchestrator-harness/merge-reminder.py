@@ -425,6 +425,12 @@ def check_surface(budget: Budget, slug: str, head: str) -> dict:
         offer(key, stamp, verdict, f"status / {ctx or '<unnamed>'}")
 
     status_groups = [v for k, v in groups.items() if k and k[0] == "status"]
+    # ⛔ EVERY OTHER COMBINED TOKEN IS RED (the same allow-list polarity as a check conclusion):
+    # `error` is a red-class value in GitHub's enum (admin-merge.sh's MEASURING_STATE includes it), and
+    # an unnamed future token must never fall through the gap between `failure` and `pending`.
+    if not problem and combined and combined not in ("success", "pending", "failure"):
+        problem = (f"the combined commit-status state is `{combined}`, which this reader does not "
+                   f"classify — an unrecognised conclusion is never green")
     if not problem and combined == "failure" and not any(
             v["verdict"] == "red" for v in status_groups):
         problem = ("the combined commit-status state is `failure` but no failing status was read "
@@ -954,9 +960,9 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                     continue
                 held_deploy_lock = True
             logdir = o / "logs"
-            logdir.mkdir(parents=True, exist_ok=True)
             log = logdir / f"merge-reminder-deploy-{name}-{int(time.time())}.log"
             try:
+                logdir.mkdir(parents=True, exist_ok=True)
                 with log.open("w") as fh:
                     fh.write(f"[{now_iso()}] deploy {name}: {activate_cmd}\n")
                     fh.flush()
@@ -1145,21 +1151,47 @@ def _take_pid_lock(path: Path) -> tuple[bool, str]:
             return os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
             return None
+        except OSError as e:
+            # A read-only/full `$O` must be a REPORTED refusal, not an exception out of the cycle:
+            # `main` catches Skipped, and an uncaught OSError here wrote no MERGE-REMINDER.md at all.
+            raise Skipped(f"DISPATCH-FAILED lock={type(e).__name__}: {e}")
 
     def _take(fd) -> tuple[bool, str]:
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
         return True, "taken"
 
-    fd = _create()
+    try:
+        fd = _create()
+    except Skipped as e:
+        return False, str(e)
     if fd is not None:
         return _take(fd)
+    def _reapable(pid: str) -> tuple[bool, str]:
+        """-> (may we reap it, the refusal when we may not). ONE rule for BOTH reads."""
+        if pid.isdigit():
+            return (False, f"running pid={pid}") if _pid_alive(pid) else (True, "")
+        # ⛔ A LOCK WITH NO (OR GARBLED) PID IS A CREATOR MID-WRITE, NOT A DEAD OWNER. `_create()`
+        # opens with O_EXCL and `_take()` writes the pid a moment later; a racer reading in that
+        # window sees an EMPTY file, which `_pid_alive("")` calls dead — and it would then reap a
+        # LIVE creator's lock, giving two winners and two rails for one PR (measured 2 in 40
+        # trials). Garbage is only assumed stale once the file is older than the window in which a
+        # writer could still be about to write it.
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError:
+            age = REAP_STALE_S
+        if age < REAP_STALE_S:
+            return False, f"running (the lock carries no usable pid yet: {age:.0f}s old)"
+        return True, f"reaping (no usable pid, {age:.0f}s old)"
+
     try:
         pid = path.read_text().strip()
     except OSError:
         pid = "?"
-    if _pid_alive(pid):
-        return False, f"running pid={pid}"
+    ok, why = _reapable(pid)
+    if not ok:
+        return False, why
 
     reap = path.with_name(path.name + ".reap")
     rfd = None
@@ -1177,7 +1209,23 @@ def _take_pid_lock(path: Path) -> tuple[bool, str]:
                 rage = int(fields[1]) if len(fields) > 1 else 0
             except (OSError, ValueError):
                 rpid, rage = "?", 0
-            if _pid_alive(rpid) and rage and (time.time() - rage) < REAP_STALE_S:
+            # ⛔ THE MUTEX HAS THE SAME CREATOR-MID-WRITE WINDOW AS THE LOCK. It is `O_EXCL`-created
+            # and only THEN written, so a racer that reads in between sees an EMPTY sidecar; "no
+            # usable pid" must not be read as "no owner", or it unlinks the LIVE mutex its peer is
+            # about to occupy and BOTH reapers enter the critical section — measured, and the same
+            # rule the lock itself already applies (§25d).
+            if not rpid.isdigit():
+                try:
+                    mage = time.time() - reap.stat().st_mtime
+                except OSError:
+                    mage = REAP_STALE_S
+                if mage < REAP_STALE_S:
+                    return False, ("running (a reap is starting: its mutex carries no usable pid "
+                                   f"yet, {mage:.0f}s old)")
+            # An ABSENT epoch (the pre-upgrade sidecar, or an unreadable one) cannot be aged, so a
+            # LIVE pid is believed: unlink it and two reapers enter the critical section together.
+            aged = bool(rage) and (time.time() - rage) >= REAP_STALE_S
+            if _pid_alive(rpid) and not aged:
                 return False, f"running (a reap is in progress pid={rpid})"
             try:
                 reap.unlink()          # a dead OR aged reaper is the same stale flag, one level down
@@ -1194,8 +1242,11 @@ def _take_pid_lock(path: Path) -> tuple[bool, str]:
             pid2 = path.read_text().strip()
         except OSError:
             pid2 = pid
-        if _pid_alive(pid2):
-            return False, f"running pid={pid2}"
+        # The SAME window can open again between our first read and this one: the pid is re-read UNDER
+        # the mutex precisely because a creator may have replaced the file — so the SAME rule decides.
+        ok2, why2 = _reapable(pid2)
+        if not ok2:
+            return False, why2
         try:
             path.unlink()
         except OSError:
@@ -1786,6 +1837,11 @@ def main(argv=None) -> int:
         landing, dispatched = landing_cycle(args, o, slug, repo_path, budget)
     except Skipped as e:
         skipped = str(e)
+        landing, dispatched = [], False
+    except OSError as e:
+        # ⛔ A READ-ONLY OR FULL $O MUST STILL PRODUCE THE REPORT (or say why it could not): an
+        # uncaught OSError meant a traceback, no MERGE-REMINDER.md and no stated reason.
+        skipped = f"UNREADABLE environment — {type(e).__name__}: {e}"
         landing, dispatched = [], False
     if not skipped:
         # The deploy arm runs AFTER the landing decision, and a landing dispatched this cycle

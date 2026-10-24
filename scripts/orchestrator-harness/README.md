@@ -1937,10 +1937,10 @@ these were read at the moment of action:
 |---|---|---|
 | open, not draft, MERGEABLE | `pr=OPEN draft=no mergeable=MERGEABLE` | `mergeable: null` is GitHub saying "not computed yet" — `REFUSE(mergeable=unknown)` |
 | a record at the LIVE head | `attested@head=yes` | a record bound to an older head is `REFUSE(attested=stale)`; six PRs were caught in exactly that state |
-| quiet surface | `reds=0 in-flight=0` | `reds=0` with 21 in flight is a **WAIT** (`REFUSE(in-flight=21)` — #2522/#2592). The combined commit-status `state` is cross-checked against the entries READ — but `pending` with **zero** statuses is GitHub's EMPTY state for a check-run-only head, not truncation, and treating it as truncation made every real head UNREADABLE |
+| quiet surface | `reds=0 in-flight=0` | `reds=0` with 21 in flight is a **WAIT** (`REFUSE(in-flight=21)` — #2522/#2592). The combined commit-status `state` is cross-checked against the entries READ — but `pending` with **zero** statuses is GitHub's EMPTY state for a check-run-only head, not truncation, and treating it as truncation made every real head UNREADABLE. The combined token is read with an ALLOW-LIST (`success` / `pending` / `failure`): `error` is a red-class value and an unnamed future token is never green, because a value this reader cannot classify must abstain rather than pass |
 | no live claim | `claim=none` | `refs/claims/pr-<N>`, `refs/claims/<N>-<head12>`; an unreadable claim store is an ABSTENTION |
 | a surface that was actually READ | `reds=0 in-flight=0` | a surface of ZERO groups is `REFUSE(surface=empty)`: a head pushed moments ago has no check runs and no commit statuses, and a review record can precede CI — **absence of evidence is not evidence of green** |
-| no rail running | `rail=idle` | the local landing lock with a LIVE pid, or ANY live `admin-merge.sh` naming the PR — re-read AT THE MOMENT OF ACTION, not only from the pre-REST snapshot |
+| no rail running | `rail=idle` | the local landing lock with a LIVE pid, or ANY live `admin-merge.sh` / `merge-one.sh` naming the PR — re-read AT THE MOMENT OF ACTION, not only from the pre-REST snapshot. ⛔ Our OWN process is never that rail: `--rail <path>/admin-merge.sh` puts the rail's name in this timer's own argv, so a process whose pid is this process (or its parent) is skipped, as is any row running `merge-reminder.py` — counting them made the arm refuse itself every cycle, blaming a rail that did not exist |
 
 ⛔ **The rail is the authority and this file never merges.** `admin-merge.sh` re-reads the surface
 with its own allow-list polarity, binds its evidence to one SHA, refuses a moved head and classifies
@@ -1990,12 +1990,16 @@ to "any pid", which would accept exactly the pre-existing controller the rule ex
 inventory (`$O/state/boxes.tsv`: `name<TAB>status-cmd<TAB>activate-cmd`), so a cell is driven through
 whatever remote path that box already uses — no new control surface is invented here.
 
-It is also **bounded**: every activation is recorded (`state/merge-reminder.deploys`), a repeat of
+It is also **bounded**: every activation is recorded (`state/merge-reminder.deploys`,
+TAB-separated — a box name may contain a space, and a whitespace split would key on the first word and
+never bind), a repeat of
 the same box/from/to pair inside `--retry-s` is a `WAIT(deploy-retry-after=…)`, and a third
 unverified attempt refuses by count (`REFUSE(deploy-attempts=3 …)`) naming a human. Without that
 bound a box that cannot reach `origin/main` — pinned `ahead`, `diverged`, or an `apply` that never
 advances the pin — would be stopped and started every cycle forever, because every gate that could
-stop it re-opens 600 s later.
+stop it re-opens 600 s later. If the ledger cannot be WRITTEN the verdict says so
+(`⚠️ the deploy ledger could NOT be written — the attempt is not bounded`): an unrecorded attempt is
+still an attempt, so the bound must not report itself satisfied while bounding nothing.
 
 It refuses six things, each one a way an actuator becomes an incident:
 
@@ -2030,8 +2034,8 @@ write is not a timer. `--uninstall-timer` removes **every** arm install can crea
 the crontab entry on a box with no systemd) and verifies the removal, so uninstall cannot leave an
 arm firing behind a "nothing to remove".
 
-**Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§24,
-122 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+**Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§25,
+159 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
 unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
 how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
 -l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the

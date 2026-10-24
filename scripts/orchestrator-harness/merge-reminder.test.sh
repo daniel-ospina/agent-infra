@@ -1157,6 +1157,209 @@ ck "§25a exactly ONE of six concurrent reapers wins the lock" \
    "$(grep -qx 'winners=1' <<<"$rout" && echo 0 || echo 1)"
 ck "§25a (the sidecar mutex was cleaned up)"    "$([ ! -e "$RPD/state/mergeclaim-42.lock.reap" ] && echo 0 || echo 1)"
 
+# ⛔ AND THE RACE IS NOT THE CONTROL — the READ is. `_create()` opens with O_EXCL and writes the pid a
+# moment later, so a racer that reads in between sees an EMPTY file; "no pid" used to read as "dead",
+# which reaped a LIVE creator's lock and gave two winners (measured 2 in 40 trials on the pre-fix
+# file). A probabilistic six-way race cannot pin that (a defeated mutex passed 4 runs in 6), so the
+# window is driven DIRECTLY: an empty lock is a creator mid-write and must be left alone.
+RD2="$TMP/reap2"; mkdir -p "$RD2/state"
+LOCK2="$RD2/state/mergeclaim-42.lock"
+: > "$LOCK2"
+rout="$(python3 - "$SUT" "$LOCK2" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+got, detail = m._take_pid_lock(Path(sys.argv[2]))
+print("got=%s|%s" % (got, detail))
+PYMOD
+)"
+ck "§25d an EMPTY lock (a creator mid-write) is NOT reaped" \
+   "$(qF 'got=False|running (the lock carries no usable pid yet' "$rout" && echo 0 || echo 1)"
+ck "§25d ...and its file was left in place"          "$([ -s "$LOCK2" ] || [ -e "$LOCK2" ] && echo 0 || echo 1)"
+
+# ...while the SAME empty file, older than the bound, is genuine garbage and is reaped.
+python3 - "$LOCK2" <<'PYMOD'
+import os, sys, time
+t = time.time() - 3600
+os.utime(sys.argv[1], (t, t))
+PYMOD
+rout="$(python3 - "$SUT" "$LOCK2" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+got, detail = m._take_pid_lock(Path(sys.argv[2]))
+print("got=%s|%s" % (got, detail))
+PYMOD
+)"
+ck "§25e an EMPTY lock OLDER than REAP_STALE_S IS reaped (garbage, not a writer)" \
+   "$(qF 'got=True|taken' "$rout" && echo 0 || echo 1)"
+
+# ⛔ A LIVE REAPER IS BELIEVED EVEN WHEN ITS SIDECAR CANNOT BE AGED. The pre-upgrade sidecar carries a
+# pid and NO epoch; treating an absent epoch as "stale" unlinked a live reaper's mutex and let two
+# reapers into the critical section during a mixed-version window.
+RD3="$TMP/reap3"; mkdir -p "$RD3/state"
+LOCK3="$RD3/state/mergeclaim-42.lock"
+printf '99999999\n' > "$LOCK3"                 # dead owner: the reap is legitimate
+printf '%s\n' "$$" > "$LOCK3.reap"             # ...but a LIVE reaper holds the mutex, with no epoch
+rout="$(python3 - "$SUT" "$LOCK3" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+got, detail = m._take_pid_lock(Path(sys.argv[2]))
+print("got=%s|%s" % (got, detail))
+PYMOD
+)"
+ck "§25f a LIVE reaper with NO epoch is believed, not aged out" \
+   "$(qF 'got=False|running (a reap is in progress pid=' "$rout" && echo 0 || echo 1)"
+ck "§25f ...and its mutex was not deleted"           "$([ -e "$LOCK3.reap" ] && echo 0 || echo 1)"
+
+printf '%s %s\n' "$$" "$(date +%s)" > "$LOCK3.reap"   # a live reaper WITH a fresh epoch
+rout="$(python3 - "$SUT" "$LOCK3" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+got, detail = m._take_pid_lock(Path(sys.argv[2]))
+print("got=%s|%s" % (got, detail))
+PYMOD
+)"
+ck "§25f ...and a fresh epoch refuses the same way" \
+   "$(qF 'got=False|running (a reap is in progress pid=' "$rout" && echo 0 || echo 1)"
+
+printf '99999999 %s\n' 1600000000 > "$LOCK3.reap"     # a DEAD reaper's mutex is the stale flag one
+rout="$(python3 - "$SUT" "$LOCK3" <<'PYMOD'           # level down: the reap must still happen
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+got, detail = m._take_pid_lock(Path(sys.argv[2]))
+print("got=%s|%s" % (got, detail))
+PYMOD
+)"
+ck "§25f a DEAD reap mutex is itself reaped, so a crashed reaper cannot fence the PR forever" \
+   "$(qF 'got=True|taken' "$rout" && echo 0 || echo 1)"
+
+# ⛔ AND THE MUTEX HAS THE SAME MID-WRITE WINDOW: `O_EXCL`-create, then the pid. A racer that reads an
+# EMPTY sidecar must not conclude "no owner" — it would unlink the LIVE mutex its peer is about to
+# occupy, and both reapers enter the critical section (measured: 2 winners).
+RD4="$TMP/reap4"; mkdir -p "$RD4/state"
+LOCK4="$RD4/state/mergeclaim-42.lock"
+printf '99999999\n' > "$LOCK4"                  # dead owner: a reap IS legitimate
+: > "$LOCK4.reap"                               # ...but a peer's reap mutex was just created
+rout="$(python3 - "$SUT" "$LOCK4" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+got, detail = m._take_pid_lock(Path(sys.argv[2]))
+print("got=%s|%s" % (got, detail))
+PYMOD
+)"
+ck "§25f an EMPTY reap mutex (a peer mid-write) is not unlinked" \
+   "$(qF 'got=False|running (a reap is starting: its mutex carries no usable pid yet' "$rout" && echo 0 || echo 1)"
+ck "§25f ...and the peer's mutex file is still there"            "$([ -e "$LOCK4.reap" ] && echo 0 || echo 1)"
+
+# ...while an EMPTY sidecar older than the bound is garbage, and the reap proceeds.
+python3 - "$LOCK4.reap" <<'PYMOD'
+import os, sys, time
+t = time.time() - 3600
+os.utime(sys.argv[1], (t, t))
+PYMOD
+rout="$(python3 - "$SUT" "$LOCK4" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+got, detail = m._take_pid_lock(Path(sys.argv[2]))
+print("got=%s|%s" % (got, detail))
+PYMOD
+)"
+ck "§25f an EMPTY reap mutex OLDER than the bound IS cleared (a crashed peer, not a writer)" \
+   "$(qF 'got=True|taken' "$rout" && echo 0 || echo 1)"
+
+# ⛔ OUR OWN INVOCATION IS NEVER A RAIL, however its argv reads: `--rail <path>/admin-merge.sh` puts
+# the rail's NAME in this process's own command line. Deleting the `pid in me` arm left the whole
+# suite green (only the PEER case was pinned), so the self-refusal could return unnoticed.
+RS="$TMP/railscan"; mkdir -p "$RS/state"
+rkout="$(python3 - "$SUT" "$RS" <<'PYMOD'
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+o = Path(sys.argv[2])
+print("self=%r" % m.any_rail_live(
+    o, [(str(os.getpid()), "python3 /x/merge-reminder.py --rail /x/admin-merge.sh 42")]))
+# the pid arm ALONE: an argv that never names this script must still not be a rail when it is US
+print("selfpid=%r" % m.any_rail_live(o, [(str(os.getpid()), "bash /x/admin-merge.sh 42")]))
+print("real=%r" % m.any_rail_live(o, [("888", "bash /x/admin-merge.sh 42 --repo s")]))
+print("none=%r" % m.any_rail_live(o, [("999", "bash /x/unrelated.sh")]))
+PYMOD
+)"
+ck "§25g OUR OWN pid is never a rail, whatever its argv names" \
+   "$(qF "self=''" "$rkout" && echo 0 || echo 1)"
+ck "§25g ...and the pid arm holds on its own (an argv that does not name this script)" \
+   "$(qF "selfpid=''" "$rkout" && echo 0 || echo 1)"
+ck "§25g ...while a real rail row still refuses"                 "$(qF "real='admin-merge.sh pid=888'" "$rkout" && echo 0 || echo 1)"
+ck "§25g ...and an unrelated row is none"                        "$(qF "none=''" "$rkout" && echo 0 || echo 1)"
+
+# ⛔ AN UNRECOGNISED COMBINED TOKEN IS RED, NOT GREEN. `error` is a red-class value in GitHub's enum
+# (the same allow-list the rail uses); a reader that knew only `failure`/`pending` returned reds=0 with
+# an `error` state — a GO from a page it could not classify.
+write_baseline; reset_o
+printf '{"state":"error","statuses":[],"total_count":0}\n' > "$FX/status.json"
+out="$(run_sut --json)"; rc=$?
+ck "§25h a combined state=error with nothing read is UNREADABLE" \
+   "$(qF 'combined commit-status state is' "$out" && qF 'REFUSE(UNREADABLE)' "$out" && echo 0 || echo 1)"
+ck "§25h ...and nothing was dispatched"                          "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+# ⛔ AN UNWRITABLE LEDGER IS SAID, NOT SILENTLY INERT — and the TAB format is pinned by a box name
+# that CONTAINS A SPACE (a whitespace split keys on the first word, so the bound never binds and the
+# box is restarted every cycle).
+LD="$TMP/ledger"; mkdir -p "$LD/state"
+lout="$(python3 - "$SUT" "$LD" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+o = Path(sys.argv[2])
+print("space=%r %r" % (m.record_deploy(o, "cell one", "a" * 12, "b" * 12, "ok"),
+                       m.deploy_attempts(o, "cell one", "a" * 12, "b" * 12)))
+(o / "state" / m.DEPLOYS).unlink()
+(o / "state" / m.DEPLOYS).mkdir()                  # a DIRECTORY: every append now fails
+print("unwritable=%r" % (m.record_deploy(o, "cell one", "c" * 12, "d" * 12, "ok"),))
+PYMOD
+)"
+ck "§25i a box name with a SPACE round-trips through the TAB ledger and is COUNTED" \
+   "$(qF "space=True (1," "$lout" && echo 0 || echo 1)"
+ck "§25i an UNWRITABLE ledger reports False (the bound is not silently inert)" \
+   "$(qF 'unwritable=False' "$lout" && echo 0 || echo 1)"
+
+# ⛔ A READ-ONLY `$O` MUST STILL PRODUCE A CYCLE, NOT A TRACEBACK. An OSError from the lock create
+# escaped every handler, so the run died with no MERGE-REMINDER.md and no stated reason.
+write_baseline; reset_o
+chmod 555 "$O/state"
+out="$(run_sut 2>&1)"; rc=$?
+chmod 755 "$O/state"
+ck "§25j a read-only state dir yields a REPORTED cycle (rc=$rc), not a traceback" \
+   "$(qF 'DISPATCH-FAILED lock=' "$out" && nq 'Traceback' "$out" && echo 0 || echo 1)"
+ck "§25j ...and nothing was dispatched"              "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+# ⛔ AND THE VERDICT SAYS SO, not just the return value: with the ledger un-writable the bound is
+# inert, and a silent True would make "no attempts recorded" mean two different things.
+write_no_landing; reset_o
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING(pid 1)\nroles: idle\n' > "$FX/box.txt"
+printf 'local\tbash %s --o %s\tbash %s\n' "$TMP/box-status-stub.sh" "$O" "$TMP/box-noop.sh" > "$O/state/boxes.tsv"
+rm -f "$O/state/merge-reminder.deploys"
+mkdir -p "$O/state/merge-reminder.deploys"          # a DIRECTORY: every append fails
+out="$(run_sut --verify-deploy-s 1)"; rc=$?
+ck "§25k an UNWRITABLE ledger is NAMED in the verdict (the bound is declared inert)" \
+   "$(qF 'the deploy ledger could NOT be written' "$out" && echo 0 || echo 1)"
+ck "§25k ...and the cycle still ran to completion (rc=$rc)" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+rmdir "$O/state/merge-reminder.deploys"
+
 # ⛔ THE PROCESS TABLE IS RE-READ AT THE MOMENT OF ACTION. A rail that appears only in the SECOND
 # read (after the gates and this cycle's REST calls) must still refuse the dispatch.
 write_baseline; reset_o
