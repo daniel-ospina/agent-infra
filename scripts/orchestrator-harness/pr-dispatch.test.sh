@@ -79,6 +79,14 @@ grep -E '^is_limit\(\) \{' "$ORCH" > "$TMP/islimit.sh"
 # The drain rule the review budget feeds: `mp_reason <unowned> <lanes> <workers> [<open>]` prints the
 # hold-down reason, or NOTHING when no PR is un-owned (the only state that opens the issue path).
 sed -n '/^mp_reason() {/,/^}/p' "$ORCH" > "$TMP/mpreason.sh"
+# ⛔ THE SHIPPED `park_ctrl`, NOT A STUB (review of #2664, P2). A `park_ctrl() { return 0; }` stub made
+# every "…PARKED" claim in T7 unverified: the log line is emitted BEFORE the park, so dropping the park
+# from either branch left the arm green while the PR re-entered it every cycle for ever — the exact
+# endless-wait shape the reviewathead bound exists to end, and the one thing that stops re-entry is the
+# `parked-<PR>` file this function writes.
+sed -n '/^park_ctrl() {/,/^}/p' "$ORCH" > "$TMP/parkctrl.sh"
+[ -s "$TMP/parkctrl.sh" ] && grep -q 'parkreason-' "$TMP/parkctrl.sh" \
+  || { echo "FATAL: park_ctrl() not found in orch-loop.sh"; exit 1; }
 [ -s "$TMP/mpreason.sh" ] && grep -q 'merge-priority' "$TMP/mpreason.sh" \
   || { echo "FATAL: mp_reason() not found in orch-loop.sh"; exit 1; }
 
@@ -220,7 +228,10 @@ PY
     claim_live() { return 1; }
     can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }
-    park_ctrl() { return 0; }
+    # ⛔ THE SHIPPED park_ctrl (review of #2664, P2) — a stub makes every "PARKED" assertion a claim
+    # about a log line that is written BEFORE the park.
+    # shellcheck disable=SC1090
+    . "$TMP/parkctrl.sh"
     # ⛔ THE CI-QUEUE PREDICATE IS STUBBED LIKE EVERY OTHER NEIGHBOUR (#2333 review cycle 2, P1).
     # It is not decoration: `orch-loop.sh` now calls `ciq_push_ok` in both fixer arms, and an
     # UNDEFINED command returns 127 — `! 127` is TRUE, so every arm here would take the DEFERRAL path
@@ -443,7 +454,12 @@ seed_revdisp()  { printf '%s %s\n' "$1" "$2" > "$REV_DISP"; }
 # here shares ONE `$O/state`. Leaving it in place routes these drives into the FIXER arm and the whole
 # section would then grade a path it never reached — measured: (a) reported "spawns=1" for a fixer.
 clear_needsfix() { mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.spent.$RANDOM" 2>/dev/null || true; }
-clear_needsfix
+# The shipped park_ctrl WRITES parked/parkreason into the shared `$TMP/O/state`, so each park assertion
+# starts from a clean slate: a leftover `parked-4242` from an earlier drive would make the next
+# assertion pass for the wrong reason (and the negative one — a failed spawn parks nothing — impossible).
+clear_parked() { mv "$TMP/O/state/parked-4242" "$TMP/parked.spent.$RANDOM" 2>/dev/null || true
+                 mv "$TMP/O/state/parkreason-4242" "$TMP/parkreason.spent.$RANDOM" 2>/dev/null || true; }
+clear_needsfix; clear_parked
 # The holders line reads a worker's log age: give it a real log file so the age is an age, not `?m`.
 mkdir -p "$TMP/O/logs"; : > "$TMP/O/logs/merge-0.log"
 
@@ -474,12 +490,13 @@ grep -q 'holding:' "$TMP/d.log" && bad "(b1) the AT-HEAD refusal was reported as
 clear_store
 
 # (b2) the BOUND holds at the cap, and it says REVIEW-CAP with the count — never a silent stop
-clear_store; seed_revdisp abc1234 3
+clear_parked; clear_store; seed_revdisp abc1234 3
 drive 'FAILED:ai-review-gate' rail 0 1
-if [ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && grep -q 'REVIEW-CAP 3/3' "$TMP/d.log"; then
-  ok "(b2) MAX_REVIEW_TRIES spent at this head => no dispatch, and the line names REVIEW-CAP with the count"
+if [ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && grep -q 'REVIEW-CAP 3/3' "$TMP/d.log" \
+   && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ]; then
+  ok "(b2) MAX_REVIEW_TRIES spent at this head => no dispatch, REVIEW-CAP with the count, and the head is PARKED"
 else
-  bad "(b2) spawns=$(spawns) acts=$(acts) key=[$(cat "$REV_DISP" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the review budget is unbounded at a fixed head"
+  bad "(b2) spawns=$(spawns) acts=$(acts) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the review budget is unbounded at a fixed head"
 fi
 
 # (c) a PUSH re-arms it: the same PR at a NEW head is dispatchable again, and the budget restarts
@@ -503,13 +520,14 @@ else
 fi
 
 # (c3) a FAILED spawn spends NOTHING — the `fixcount` rule, applied to the review budget
-clear_store; clear_revdisp
+clear_parked; clear_store; clear_revdisp
 drive 'FAILED:ai-review-gate' rail 0 0
 # ⛔ `acts`/`waits`, NOT `spawns`: the stub records the ATTEMPT in `$TMP/spy` before it refuses, so a
 # failed spawn still has a spy line (the suite's own existing rule: a failed spawn is a WAIT, never an
 # act). The artifact under test here is the (PR, head) KEY, which must not exist at all.
-if [ "$(acts)" = "0" ] && [ ! -e "$REV_DISP" ] && grep -q 're-record spawn FAILED' "$TMP/d.log"; then
-  ok "(c3) a FAILED review spawn records NO attempt (bookkeep only on success)"
+if [ "$(acts)" = "0" ] && [ ! -e "$REV_DISP" ] && [ ! -e "$TMP/O/state/parked-4242" ] \
+   && grep -q 're-record spawn FAILED' "$TMP/d.log"; then
+  ok "(c3) a FAILED review spawn records NO attempt and parks NOTHING (bookkeep only on success)"
 else
   bad "(c3) acts=$(acts) key-exists=$([ -e "$REV_DISP" ] && echo yes || echo no) log=$(tr '\n' ';' < "$TMP/d.log")"
 fi
@@ -539,13 +557,16 @@ mv "$TMP/home/.pi/agent/reviews/4242.json" "$TMP/legacy.spent.$RANDOM" 2>/dev/nu
 
 # (b5) AT-HEAD is bounded: the one state that neither dispatches nor parks must ESCALATE
 # (review of #2653, P2 — otherwise it logs a wait row every cycle for ever).
+clear_parked
 printf '%s\n' '{"pr":4242,"head_sha":"abc1234","verdict":"clean","repo":"daniel-ospina/agent-infra"}' > "$STORE"
 printf 'abc1234 3\n' > "$TMP/O/state/reviewathead-4242"
 drive 'FAILED:ai-review-gate' rail 0 1
-if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-AT-HEAD-STUCK 4/3' "$TMP/d.log"; then
-  ok "(b5) AT-HEAD at the bound PARKS with REVIEW-AT-HEAD-STUCK (an operator action, not an endless wait)"
+if [ "$(spawns)" = "0" ] && grep -q 'REVIEW-AT-HEAD-STUCK 4/3' "$TMP/d.log" \
+   && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+   && grep -q 'record-review.sh 4242 abc1234 clean daniel-ospina/agent-infra' "$TMP/d.log"; then
+  ok "(b5) AT-HEAD at the bound PARKS (parked-<PR> written) with REVIEW-AT-HEAD-STUCK and the exact re-record command"
 else
-  bad "(b5) log=$(tr '\n' ';' < "$TMP/d.log") — the recorded-review/red-gate state never escalates"
+  bad "(b5) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") — the recorded-review/red-gate state never escalates, or its command was eaten by a backtick substitution"
 fi
 clear_store; mv "$TMP/O/state/reviewathead-4242" "$TMP/athead.spent.$RANDOM" 2>/dev/null || true
 
