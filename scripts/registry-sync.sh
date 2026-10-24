@@ -5,13 +5,26 @@
 #   registry-sync.sh push    …
 #   registry-sync.sh union   …   # pull, then push — the converging verb
 #   registry-sync.sh status  …   # counts, plus the records another box has and this one does not
+#   registry-sync.sh surface-check [--repo <path>]
+#                                # 0 when the checkout-guard can CLASSIFY this script's git
+#                                # surface, 5 when it would refuse it, 3 when that cannot be
+#                                # checked here. Run it after editing this file (see below).
 #
 # Exit: 0 converged (nothing left to do), 2 usage, 1 cannot run (no store / no remote /
 # unwritable registry / a record that could not be moved), 3 CONVERGED WITH DIVERGENCE — at
 # least one pair of records shares a `reviewed_at` but disagrees on content, so neither side was
 # overwritten (rule 4 below), 4 records were SKIPPED because they could not be read or ordered
 # (an unreadable peer ref or stamp, a mis-keyed record) — an unreadable store is not a converged
-# one, and 0 must never be reported over records this box could not use.
+# one, and 0 must never be reported over records this box could not use, 5 REFUSED — the
+# invocation never ran at all because the checkout-guard withheld it (see "THE GIT SURFACE IS
+# LITERAL" below).
+#
+# ⛔ 5 CANNOT BE EMITTED BY A RUN OF THIS SCRIPT. A guard refusal happens BEFORE the first line
+# of this file executes, so the caller sees NO exit status at all — and "no exit status" has been
+# read as success, which is the whole of #2520. `surface-check` is the verb that turns that silence
+# into a value (0 = the guard will let this run, 5 = it would refuse it, 3 = the check could not
+# read its own source, which is NOT a pass). Any wrapper that sees the invocation withheld must map
+# it onto 5 rather than onto 0.
 #
 # ── WHY THIS EXISTS ───────────────────────────────────────────────────────────────────────
 # `record-review.sh` writes ~/.pi/agent/reviews/<owner>-<repo>-<pr>.json and NOTHING replicated
@@ -78,6 +91,55 @@
 # A second run writes nothing, pushes nothing and reports zero work: identical content is compared
 # byte-for-byte and skipped BEFORE any write. `status` prints `hash=`, a digest over (name,
 # content) pairs, so "running it twice changed nothing" is an assertion rather than a claim.
+# ⛔ ONE DOCUMENTED EXCEPTION: a local record that is byte-different from the published one but
+# equal once TRAILING NEWLINES are stripped is REWRITTEN to the published bytes (`· canon <key>`,
+# counted in `wrote=`). That is not a re-write of a decision — the stamp, verdict and head are
+# already equal, rule 4 protects records that DISAGREE — it is the repair of a formatting artefact
+# from an older pull that left 3,261 of 3,462 records one newline away from their own ref. Keeping
+# it would mean every pass re-reads the whole registry (`same_bytes` is exact), which is what made
+# an hourly pass impossible to bound; after it, the local registry is byte-identical to the fleet's
+# record, which is the property `hash=` and the equality fast path both rest on.
+#
+# ── COST, MEASURED, AND WHY IT IS SHAPED THIS WAY (#2577) ─────────────────────────────────
+# Both directions compare EVERY key against the store, so a naive per-key read costs two git
+# processes per key per direction. On the reference box (3,462 refs) that was **~15 minutes** for
+# one `union` — a scheduled step killed by its own bound on every pass, i.e. an inert enforcer.
+# Two BATCHED calls now answer the same question (`cat-file --batch-check` for the store's blob id
+# per ref, `hash-object --stdin-paths` for this box's per file; equal ids are equal bytes), so the
+# steady state is ~29 s `pull` / ~75 s `push` on that box and the slow path runs only on records
+# that actually differ. The first pass over a BLIND box is still the expensive one, and it makes
+# CUMULATIVE progress: each record it finishes is canonical and thereafter takes the fast path.
+#
+# ── THE CONVERGENCE LINE (#2577) ───────────────────────────────────────────────────────────
+# Every writing verb prints, after the detailed summary,
+#     <verb>: refs=N files=N added=N updated=N skipped=N
+#   refs     the refs the STORE lists for this run — the fleet's side
+#   files    the .json records this box's registry holds AFTER the run — this side
+#   added    records materialised where this box had none (the #2374 failure, counted)
+#   updated  records materialised OVER a local record that lost the `reviewed_at` ordering (rule 1)
+#   skipped  records the run could not READ or could not USE, so it never wrote them — the same
+#            counter the detailed line reports as `unreadable`, which is the exit-4 class
+# The two numbers are the point: `refs` and `files` drifting apart IS a stalled sync, and it is
+# visible from one log line instead of inferred from a merge role's NO-RECORD refusals. The
+# detailed line (`wrote= pushed= same= older_refused= conflicts= unkeyed= …`) is unchanged and
+# still carries the per-rule breakdown; this line is the convergence surface a scheduler logs.
+#
+# ── THE GIT SURFACE IS LITERAL (#2520) ────────────────────────────────────────────────────
+# ⛔ THIS FILE'S git INVOCATIONS ARE ALL STATICALLY VISIBLE, ONE LITERAL VERB PER LINE, AND NONE
+# OF THEM CAN REWRITE A CHECKOUT. That is not style: the checkout-guard (`#709`) reads a script
+# an agent asks it to run and fails CLOSED on any git invocation whose verb it cannot bound, so a
+# single dynamic-argv wrapper (`git "$@"`) made every verb of this script — status, pull, union —
+# un-runnable from an agent's shell, which is exactly the remedy the rail's "no review record"
+# refusal names (#2520). A registry sync moves BLOBS and REFS; it never needs a working tree, so
+# the fix is not a guard exemption (that would be weakening a gate that protects real work) and
+# not a roster of allowed verbs: it is that the script has no such verb to classify.
+# The surface, verb by verb, is `g_ls_remote`, `g_fetch`, `g_remote_get_url`, `g_rev_parse`,
+# `g_cat_blob`, `g_cat_batch_check`, `g_hash_object`, `g_hash_paths`, `g_mktree`, `g_commit_tree`,
+# `g_push`/`g_push_create` and `g_update_ref` below — network reads, object/blob reads, object/blob
+# writes, one ref update, and one push. `is_repo`'s own check is literal for the same reason. If
+# this file is edited, run `registry-sync.sh surface-check` (exit 0 = the guard classifies it, 5 = the guard would refuse
+# it) — the shipped test suite runs the same check, and pins it against a fixture that
+# reintroduces the wrapper.
 #
 # ── WHAT THIS DOES NOT DO ────────────────────────────────────────────────────────────────
 # * It decides nothing about a review. It moves bytes between registries; the gate's
@@ -95,18 +157,22 @@
 #
 # ── WHERE IT RUNS ───────────────────────────────────────────────────────────────────────
 # `atomic-land.sh` runs `union` before it reads the review record (both directions, at the one
-# point every landing passes through), and `cloud-cell-bringup.sh` runs it so a freshly booted
-# cell starts with the records that already exist instead of with none. `push` and `pull` are
-# also operators' verbs: `status` first to see what is missing here, then `pull`.
+# point every landing passes through), `cloud-cell-bringup.sh` runs it so a freshly booted cell
+# starts with the records that already exist instead of with none, and `cloud-cell-doctor.sh`'s
+# hourly `hygiene` role runs it as its fourth sub-step (#2577) — the rail heals the registry one
+# PR at a time, and only for a PR already offered to the rail, so without a scheduled pass a box
+# whose merge role reads its own small registry never offers the PR at all. That is the fixed
+# point the hygiene step leaves. `push` and `pull` are also operators' verbs: `status` first to
+# see what is missing here, then `pull`.
 set -uo pipefail
 
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 VERB="${1:-}"
 case "$VERB" in
-  pull|push|union|status) shift ;;
+  pull|push|union|status|surface-check) shift ;;
   -h|--help|"") sed -n '2,/^set -uo/{/^set -uo/d;s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]}"; exit 2 ;;
-  *) printf "registry-sync.sh: unknown verb '%s' — usage: registry-sync.sh <pull|push|union|status> [--repo <path>] [--dir <path>] [--remote <name>] [--timeout <n>] [--quiet]\n" "$VERB" >&2; exit 2 ;;
+  *) printf "registry-sync.sh: unknown verb '%s' — usage: registry-sync.sh <pull|push|union|status|surface-check> [--repo <path>] [--dir <path>] [--remote <name>] [--timeout <n>] [--quiet]\n" "$VERB" >&2; exit 2 ;;
 esac
 
 STORE_ARG=""
@@ -134,31 +200,55 @@ done
 say()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
-# ── bounded git ───────────────────────────────────────────────────────────────────────────
+# ── bounded git, ONE LITERAL VERB PER LINE (#2520) ───────────────────────────────────────
 # Every network op is bounded, and GIT_TERMINAL_PROMPT=0 is the one that matters most: without it
 # a box with no credential helper BLOCKS on an invisible username prompt until the calling tool is
 # killed, which reads as "the rail hung" rather than "this box cannot authenticate".
+#
+# ⛔ THE VERB IS LITERAL AT THE CALL SITE. The previous shape was ONE wrapper taking `<git args…>`
+# and running `git -C "$STORE" -c gc.auto=0 "$@"`. The bound and the env were right; what was
+# wrong is that the checkout-guard cannot bound a verb that arrives as `"$@"`, so it withheld the
+# WHOLE invocation — `status`, `pull` and `union` alike — with `Form: unverifiable-verb` (#2520,
+# reproduced 2026-10-23 from the hub AND from a linked worktree). Each verb therefore gets its own
+# one-line wrapper below, naming the verb in the source where the guard (and a human) can read it.
+# `run_bounded` only supplies the bound + the prompt-safe environment; it never decides what runs.
 TIMEOUT_BIN=""
 for c in timeout gtimeout; do command -v "$c" >/dev/null 2>&1 && { TIMEOUT_BIN="$c"; break; }; done
-git_b() { # <git args…>
-  local rc pid w
+run_bounded() { # <seconds> <command…>
+  local secs="$1" pid w rc; shift
   if [ -n "$TIMEOUT_BIN" ]; then
     GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true GIT_PAGER=cat GIT_OPTIONAL_LOCKS=0 \
-      "$TIMEOUT_BIN" "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 "$@"
+      "$TIMEOUT_BIN" "$secs" "$@"
     return
   fi
   # No `timeout` on this box (stock macOS). A WATCHDOG, not a fallback to unbounded: the caller is
   # the landing rail, and an unbounded network read there is a hang, not a slow success.
-  GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true GIT_PAGER=cat GIT_OPTIONAL_LOCKS=0 \
-    git -C "$STORE" -c gc.auto=0 "$@" &
+  GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true GIT_PAGER=cat GIT_OPTIONAL_LOCKS=0 "$@" &
   pid=$!
-  ( sleep "$MAX_WAIT"; kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$pid"; rc=$?
   kill -TERM "$w" 2>/dev/null
   wait "$w" 2>/dev/null
   return "$rc"
 }
+# The verbs. Each is ONE literal git invocation inside ONE bound; `-C "$STORE"` pins the repo and
+# `-c gc.auto=0` keeps a background gc out of a registry read. Nothing here writes a working tree.
+g_remote_get_url() { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 remote get-url "$REMOTE"; }
+g_ls_remote()      { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 ls-remote --quiet --refs "$REMOTE" 'refs/reviews/*'; }
+g_fetch()          { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 fetch --no-tags --quiet "$REMOTE" '+refs/reviews/*:refs/reviews/*'; }
+g_rev_parse()      { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 rev-parse --verify --quiet "$1"; }
+g_cat_blob()       { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 cat-file blob "$1"; }
+g_hash_object()    { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 hash-object -w "$1"; }
+g_mktree()         { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 mktree; }
+g_commit_tree()    { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 -c user.name=registry-sync -c user.email=registry-sync@localhost commit-tree "$1" -m "$2"; }
+g_push()           { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 push --quiet --force-with-lease="$1" "$REMOTE" "$2"; }
+g_push_create()    { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 push --quiet "$REMOTE" "$1"; }
+g_update_ref()     { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 update-ref "$1" "$2"; }
+# The two BATCHED reads the equality fast path needs (see "THE EQUALITY FAST PATH" below): one
+# process for every store record's blob id, one for every local record's. Neither prints content.
+g_cat_batch_check() { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 cat-file --batch-check; }
+g_hash_paths()    { run_bounded "$MAX_WAIT" git -C "$STORE" -c gc.auto=0 hash-object --no-filters --stdin-paths; }
 
 # ── fields ───────────────────────────────────────────────────────────────────────────────
 # sed, not jq: record-review.sh WRITES a record with one printf in a fixed field order and reads
@@ -177,34 +267,78 @@ field() { # <file> <name>
 # the rail then refused with "carries no usable head_sha"; a record with no head_sha did the same
 # and the run reported `wrote=1 … unreadable=0`, exit 0). So usability is checked BEFORE a peer
 # record may win or be installed, and an unusable one is counted `unreadable` (exit 4).
-record_usable() { # <file> → 0 when this box's reader can use it
+record_usable() { # <file> → 0 when the reader this box ships can use it
   local f="$1"
-  # ⛔ THE CHECK IS THE READER'S OWN, at the TOP LEVEL of the JSON — not `field` (a greedy sed that
+  # ⛔ THE CHECK IS THE ONE THE READER MAKES, at the TOP LEVEL of the JSON — not `field` (a greedy sed that
   # takes the LAST match on the line). A record whose top-level `head_sha` is empty but which
   # carries a nested 40-hex one inside, say, an `evidence` object PASSED the old sed-based gate and
   # was installed over a usable local record; `read_record` then read `head_sha=''` and refused
   # ("carries no usable head_sha") — the exact regression this gate exists to prevent, reached
   # through the value parse instead of the syntax parse.
+  # ⛔ ONE BODY, TWO CALLERS. `build_local_blobs` asks this same program about the WHOLE registry in
+  # ONE process (`--list`), because the equality fast path must not skip a record the gate would
+  # refuse: a store record that is unusable AND already mirrored here would otherwise be reported
+  # `same` instead of `unreadable`, and `union` would return 0 over a record this box cannot use —
+  # the false convergence the header forbids. Restating the rules there instead of sharing them is
+  # exactly how a fast path drifts from the gate it stands in for.
   command -v python3 >/dev/null 2>&1 || {
     warn "  ⚠️ python3 is not available, so a record cannot be checked against this box's reader — refusing to install one."
     return 1
   }
-  python3 - "$f" <<'PY' >/dev/null 2>&1 || return 1
-import json, re, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(1)
-if not isinstance(d, dict):
-    sys.exit(1)
-h, v = d.get("head_sha", ""), d.get("verdict", "")
-if not (isinstance(h, str) and re.fullmatch(r"[0-9a-fA-F]{40}", h)):
-    sys.exit(1)
-if not (isinstance(v, str) and v.strip()):
-    sys.exit(1)
-PY
-  return 0
+  python3 -c "$RECORD_READER_PY" --one "$f" >/dev/null 2>&1
 }
+
+# The reader's usability rules, in ONE place. `--one <file>` exits 0 when the box's rail can use it;
+# `--list` reads paths from stdin and prints the usable ones (the batched caller).
+RECORD_READER_PY='
+import json, re, sys
+RE = re.compile(r"[0-9a-fA-F]{40}")
+def rec(p):
+    try:
+        d = json.load(open(p))
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
+def usable(p):
+    d = rec(p)
+    if d is None:
+        return False
+    h, v = d.get("head_sha", ""), d.get("verdict", "")
+    if not (isinstance(h, str) and RE.fullmatch(h)):
+        return False
+    if not (isinstance(v, str) and v.strip()):
+        return False
+    return True
+def fast_ok(p):
+    # ⛔ THE FAST PATH ASKS A STRICTER QUESTION THAN THE INSTALL GATE, because it answers
+    # "is this record already what the full comparison would call SAME?" — and the full
+    # comparison counts a record UNREADABLE (exit 4) unless it ALSO has a readable
+    # reviewed_at, a numeric pr and a repo, and a key its own fields agree with. Testing
+    # only head_sha/verdict there let an already-mirrored store defect read as `same`, so
+    # `union` returned 0 over a record this box cannot use — the false convergence the
+    # file header forbids. Same rule, one body: nothing here may drift from pull_one.
+    if not usable(p):
+        return False
+    d = rec(p)
+    if not isinstance(d.get("reviewed_at"), str) or not d.get("reviewed_at").strip():
+        return False
+    pr, repo = d.get("pr"), d.get("repo", "")
+    if not isinstance(pr, int) or isinstance(pr, bool):
+        return False
+    if not (isinstance(repo, str) and "/" in repo):
+        return False
+    stem = p.rsplit("/", 1)[-1][:-5] if p.endswith(".json") else ""
+    if re.fullmatch(r"[A-Za-z0-9_.-]+-[A-Za-z0-9_.-]+-[0-9]+", stem):
+        owner, _, name = repo.partition("/")
+        if "%s-%s-%d" % (owner, name, pr) != stem:
+            return False
+    return True
+if sys.argv[1] == "--one":
+    sys.exit(0 if usable(sys.argv[2]) else 1)
+for p in sys.stdin.read().splitlines():
+    if p and fast_ok(p):
+        print(p)
+'
 
 # ── equal `reviewed_at`, different bytes: WHICH KIND of difference is it? ─────────────────
 # Rule 4 reports a DISAGREEMENT. Two records that agree on the verdict and on the HEAD are not
@@ -212,7 +346,7 @@ PY
 # verdict unpublishable for ever: two boxes each carrying their own local record onto the same head
 # produce the same head and verdict with different `carried_from`, and every union then exited 3
 # with a "reconcile by hand" the operator cannot act on. (A carry of a carry, whose `carried_from`
-# names an intermediate head rather than the peer's, is still reported as a conflict — that is
+# names an intermediate head rather than the head of the peer, is still reported as a conflict — that is
 # genuinely ambiguous ordering, and rule 4 says report rather than guess.)
 same_stamp_relation() { # <a> <b> → a | b | same | conflict
   local a="$1" b="$2" av bv ah bh am bm amb bmb
@@ -232,7 +366,7 @@ same_stamp_relation() { # <a> <b> → a | b | same | conflict
     if [ "$bm" = "carried" ] && [ "$am" != "carried" ]; then printf 'b'; return 0; fi
     printf 'same'; return 0
   fi
-  # Different heads: the only thing that can certify which one supersedes is the record's own
+  # Different heads: the only thing that can certify which one supersedes is the record lineage
   # lineage (`supersedes`), which the callers test first. Anything else is a conflict.
   printf 'conflict'
 }
@@ -254,7 +388,7 @@ resolve_store() {
     # --repo naming a checkout whose remote is spelled differently would otherwise disable sync
     # even though $AGENT_INFRA_PATH can reach the namespace.
     STORE="$(cd "$cand" && pwd)"
-    if git_b remote get-url "$REMOTE" >/dev/null 2>&1; then return 0; fi
+    if g_remote_get_url >/dev/null 2>&1; then return 0; fi
     warn "registry-sync.sh: '$STORE' is a checkout but has no remote '$REMOTE' — trying the next candidate."
     STORE=""
   done
@@ -278,16 +412,22 @@ resolve_store() {
 # name into this checkout. An object we cannot read is reported per record as UNREADABLE (exit 4),
 # never answered from a stale local ref.
 STORE_REFS=""
+STORE_REF_COUNT=0
 fetch_refs() {
   local listing=""
-  if ! listing="$(git_b ls-remote --quiet --refs "$REMOTE" 'refs/reviews/*' 2>/dev/null)"; then
+  if ! listing="$(g_ls_remote 2>/dev/null)"; then
     warn "registry-sync.sh: cannot READ the '$REMOTE' registry from '$STORE' — it is UNKNOWN, not empty. Not syncing."
     return 1
   fi
   STORE_REFS="$listing"
+  reset_store_blobs            # the listing just changed; the batched map describes the old one
+  # `refs=` in the convergence line is the STORE's own count, taken from the one read that is the
+  # truth about the store (`ls-remote`), so a listing that returns nothing answers refs=0 —
+  # "the store is empty", which is a different state from "the store could not be read" (return 1).
+  STORE_REF_COUNT="$(printf '%s\n' "$listing" | awk 'NF >= 2' | wc -l | tr -d ' ')"
   [ -z "$listing" ] && return 0
   # NOT `--prune` (rule 2), and no longer load-bearing for the key list: it only carries objects.
-  if ! git_b fetch --no-tags --quiet "$REMOTE" '+refs/reviews/*:refs/reviews/*' >/dev/null 2>&1; then
+  if ! g_fetch >/dev/null 2>&1; then
     warn "registry-sync.sh: ⚠️ the FETCH from '$REMOTE' failed while the store still lists refs — this run"
     warn "  continues from the store's own listing, and every record whose objects are not already here"
     warn "  is reported UNREADABLE (exit 4) rather than answered from a stale local ref."
@@ -298,14 +438,131 @@ fetch_refs() {
 remote_refs() {
   printf '%s\n' "$STORE_REFS" | awk 'NF >= 2 { sub(/^refs\/reviews\//, "", $2); print $2 }' | LC_ALL=C sort
 }
+
+# ── THE EQUALITY FAST PATH (#2577's cost, measured) ───────────────────────────────────────
+# A registry is ~3,500 records and BOTH directions compare every key against the store, so the
+# steady state used to cost two git processes PER KEY PER DIRECTION — ~14,000 spawns, measured at
+# **15 minutes** for one `union` on a box with 3,460 refs. A step the hourly hygiene role has to
+# finish inside its own bound cannot afford that: it would be killed mid-run every pass, leaving
+# a permanently half-converged registry and a log line that says TIMED OUT for ever — the inert
+# enforcer this step exists to remove.
+#
+# The comparison the merge rules actually make is BYTES (`same_bytes`), and git already answers
+# that without reading content: `cat-file --batch-check` gives the store's blob id for every
+# `<commit>:record.json` in ONE process, and `hash-object --stdin-paths` gives the blob id of every
+# local record in ONE process. Equal blob ids ARE equal bytes, so the fast path is not a heuristic
+# — it is the same predicate, computed by the same tool. Anything that is NOT provably identical
+# falls through to the full read below, so every rule (1 older, 3 unkeyed, 4 conflict, usability)
+# still runs on exactly the records that could possibly violate it.
+# ⛔ IT IS NOT A CACHE AND IT KEEPS NO STATE BETWEEN RUNS: both sides are recomputed from the
+# store's own listing and this box's own files on every run, so a stale index cannot make a
+# record look converged. If the batched call fails (a timeout, a repo that cannot answer), the
+# maps are empty, every lookup misses, and the run takes the slow path — never the optimistic one.
+STORE_BLOB=""   # "<key>\t<blob-oid|->"   (- = the store lists the ref but carries no record.json)
+LOCAL_BLOB=""   # "<path>\t<blob-oid>"
+BLOB_DIR=""
+cleanup_blobs() { if [ -n "$BLOB_DIR" ] && [ -d "$BLOB_DIR" ]; then rm -rf "$BLOB_DIR"; fi; return 0; }
+trap cleanup_blobs EXIT
+
+blob_workdir() {
+  if [ -z "$BLOB_DIR" ]; then
+    BLOB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/registry-sync-blobs.XXXXXX")" || { BLOB_DIR=""; return 1; }
+  fi
+  return 0
+}
+
+build_store_blobs() { # ONE process over EVERY ref the store lists
+  [ -n "$STORE_BLOB" ] && return 0
+  [ -n "$STORE_REFS" ] || return 0
+  blob_workdir || return 1
+  local key oid req keys
+  req="$BLOB_DIR/store.req"; keys="$BLOB_DIR/store.keys"; STORE_BLOB="$BLOB_DIR/store.map"
+  # ⛔ THE KEY→COMMIT PAIRING IS ONE awk PASS, not `store_oid` per key: that helper printf's the
+  # whole listing and awk-parses it per call (measured 17.6 ms × 3,462 refs = 61 s of pure
+  # process churn before a single record was compared).
+  printf '%s\n' "$STORE_REFS" \
+    | awk 'NF >= 2 { sub(/^refs\/reviews\//, "", $2); print $2 "\t" $1 }' | LC_ALL=C sort > "$keys"
+  awk -F'\t' '{ printf "%s:record.json\n", $2 }' "$keys" > "$req"
+  # `--batch-check` answers exactly one line per request, in request order, and answers a MISSING
+  # object with `<expr> missing` — only the object present on the line is the oid, so the oid is
+  # field 1 on a hit (`<oid> <type> <size>`) and there is no echoed expression to parse. Reading
+  # the key list back in the same order re-attributes each answer; a truncated answer leaves the
+  # remaining keys absent from the map, so they take the slow path rather than being guessed.
+  g_cat_batch_check < "$req" 2>/dev/null | awk -v kf="$keys" '
+    BEGIN { while ((getline k < kf) > 0) { split(k, a, "\t"); keys[++n] = a[1] } }
+    { if (NR > n) exit
+      if (NF >= 2 && $2 != "missing") print keys[NR] "\t" $1; else print keys[NR] "\t-" }' > "$STORE_BLOB"
+  return 0
+}
+
+build_local_blobs() { # ONE process over EVERY record this box holds
+  [ -n "$LOCAL_BLOB" ] && return 0
+  [ -d "$REG_DIR" ] || return 0
+  blob_workdir || return 1
+  local f paths all usable
+  paths="$BLOB_DIR/local.paths"; LOCAL_BLOB="$BLOB_DIR/local.map"
+  all="$BLOB_DIR/local.all"; usable="$BLOB_DIR/local.usable"
+  : > "$paths"
+  for f in "$REG_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    [ -L "$f" ] && continue           # write_local refuses to write through a symlink; never hash one
+    # ABSOLUTE on purpose: `hash-object --stdin-paths` runs with `-C "$STORE"`, so a relative
+    # `--dir` would resolve every path against the STORE checkout — git aborts at the first
+    # unopenable path, the map comes out empty, and the fast path silently disappears.
+    case "$f" in /*) ;; *) f="$PWD/$f" ;; esac
+    printf '%s\n' "$f" >> "$paths"
+  done
+  [ -s "$paths" ] || return 0
+  g_hash_paths < "$paths" 2>/dev/null | awk -v pf="$paths" '
+    BEGIN { while ((getline p < pf) > 0) paths[++n] = p }
+    { if (NR > n) exit; if (NF >= 1) print paths[NR] "\t" $1 }' > "$all"
+  # ⛔ ONLY A RECORD THE FAST PATH CAN ANSWER FOR IS IN THE MAP — usable AND stamped AND
+  # key-consistent (see RECORD_READER_PY `fast_ok`): an unusable, unstamped or mis-keyed record
+  # that is already mirrored here must still be counted `unreadable` (exit 4), never `same`.
+  # No python3 → the map is empty and every key takes the full read: correct, just slower.
+  if command -v python3 >/dev/null 2>&1 && python3 -c "$RECORD_READER_PY" --list < "$paths" > "$usable" 2>/dev/null && [ -s "$usable" ]; then
+    # ⛔ `[ -s "$usable" ]` IS LOAD-BEARING: the `NR == FNR` split below is wrong when the FIRST
+    # file is EMPTY (NR and FNR are both 1 on the second file's first line, so it is eaten as if it
+    # were file one). Direction here is safe — a dropped entry only forces the slow path — but the
+    # guard keeps the map from being silently one record short for a reason nobody reading the awk
+    # would guess.
+    awk -F'\t' 'NR == FNR { ok[$1] = 1; next } ($1 in ok)' "$usable" "$all" > "$LOCAL_BLOB"
+  fi
+  return 0
+}
+
+store_blob_of() { # <key> → the store's record-blob id (empty when unknown, "-" when it carries none)
+  [ -n "$STORE_BLOB" ] && [ -s "$STORE_BLOB" ] || return 0
+  awk -F'\t' -v k="$1" '$1 == k { print $2; exit }' "$STORE_BLOB"
+}
+local_blob_of() { # <path> → this box's record-blob id for that file (empty when not hashed)
+  [ -n "$LOCAL_BLOB" ] && [ -s "$LOCAL_BLOB" ] || return 0
+  # The map is keyed by ABSOLUTE path (see build_local_blobs); a relative `--dir` must not make the
+  # lookup miss for every record, which would leave the fast path permanently inert.
+  local p="$1"
+  case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+  awk -F'\t' -v p="$p" '$1 == p { print $2; exit }' "$LOCAL_BLOB"
+}
+# A fetch can move the store's refs under the maps, and a pull writes local files; both sides are
+# therefore invalidated by the caller rather than trusted past the event that changes them.
+reset_store_blobs() { STORE_BLOB=""; }
+reset_local_blobs() { LOCAL_BLOB=""; }
 store_oid() { # <key> → the commit the STORE names for that ref (empty: the store has no such ref)
   printf '%s\n' "$STORE_REFS" | awk -v want="refs/reviews/$1" '$2 == want { print $1; exit }'
 }
+# The record bytes the STORE's own object carries, resolved in TWO steps on purpose: `rev-parse`
+# turns `<commit>:record.json` into a blob id, and `g_cat_blob` prints that blob.
+# ⛔ NOT one hop with a `<rev>:<path>` operand on the printing verb: the checkout-guard classifies
+# that shape as a possible REVERT SOURCE (`cat-file-revert`, #1060/#1125) and then runs its STATE
+# predicate over this checkout, so a registry read would depend on the store checkout's WIP. The
+# split calls keep this path exactly what it is — two reads — and the guard sees two plain verbs.
 remote_record() { # <key> → the record bytes carried by the STORE's own object
-  local oid
+  local oid blob
   oid="$(store_oid "$1")"
   [ -n "$oid" ] || return 1
-  git_b show "$oid:record.json" 2>/dev/null
+  blob="$(g_rev_parse "$oid:record.json" 2>/dev/null)" || return 1
+  [ -n "$blob" ] || return 1
+  g_cat_blob "$blob" 2>/dev/null
 }
 
 # ── the registry ─────────────────────────────────────────────────────────────────────────
@@ -316,6 +573,16 @@ registry_names() { # one filename per line (absent dir → nothing)
     [ -e "$f" ] || continue            # unmatched glob
     printf '%s\n' "${f##*/}"
   done | LC_ALL=C sort
+}
+
+registry_file_count() { # how many .json records this box holds AFTER a run (#2577's `files=`)
+  local f n=0
+  [ -d "$REG_DIR" ] || { printf '0'; return 0; }
+  for f in "$REG_DIR"/*.json; do
+    [ -e "$f" ] || continue            # unmatched glob
+    n=$((n + 1))
+  done
+  printf '%s' "$n"
 }
 
 write_local() { # <key> <content-file>
@@ -334,6 +601,9 @@ write_local() { # <key> <content-file>
 same_bytes() { [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; }
 
 PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0
+# The convergence counters (#2577). `ADDED`/`UPDATED` are PULL-side only — they describe what this
+# box's registry RECEIVED — while `WROTE` counts both directions. `files=` is read after the run.
+ADDED=0 UPDATED=0
 CONFLICT_KEYS=""
 
 conflict() { # <key> <local-at> <remote-at> <local-file>
@@ -434,6 +704,14 @@ push_one() { # <key> <source-file>
     UNREADABLE=$((UNREADABLE + 1)); return 0
   fi
   cs="$(field "$f" reviewed_at)"
+  # ⛔ THE FAST PATH (both directions share it): identical blob ids are identical bytes, so this
+  # key is already published exactly as it sits here — no ordering rule and no conflict rule has
+  # anything to decide. Counted `SAME`, exactly as the full comparison would.
+  local sb
+  sb="$(store_blob_of "$key")"
+  if [ -n "$sb" ] && [ "$sb" != "-" ] && [ "$(local_blob_of "$f")" = "$sb" ]; then
+    SAME=$((SAME + 1)); return 0
+  fi
   attempt=0
   while :; do
     attempt=$((attempt + 1))
@@ -452,18 +730,17 @@ push_one() { # <key> <source-file>
     # an unconditional force — which is how a newer peer record was silently replaced by an older
     # one. A refusal means the state moved, and the loop below re-decides against the new state.
     exp="$DEC_EXP"
-    blob="$(git_b hash-object -w "$f" 2>/dev/null)" || break
-    tree="$(printf '100644 blob %s\trecord.json\n' "$blob" | git_b mktree 2>/dev/null)" || break
-    commit="$(git_b -c user.name=registry-sync -c user.email=registry-sync@localhost \
-      commit-tree "$tree" -m "review record $key reviewed_at=$cs" 2>/dev/null)" || break
+    blob="$(g_hash_object "$f" 2>/dev/null)" || break
+    tree="$(printf '100644 blob %s\trecord.json\n' "$blob" | g_mktree 2>/dev/null)" || break
+    commit="$(g_commit_tree "$tree" "review record $key reviewed_at=$cs" 2>/dev/null)" || break
     if [ -n "$exp" ]; then
-      git_b push --quiet --force-with-lease="refs/reviews/$key:$exp" "$REMOTE" "$commit:refs/reviews/$key" >/dev/null 2>&1
+      g_push "refs/reviews/$key:$exp" "$commit:refs/reviews/$key" >/dev/null 2>&1
     else
-      git_b push --quiet "$REMOTE" "$commit:refs/reviews/$key" >/dev/null 2>&1
+      g_push_create "$commit:refs/reviews/$key" >/dev/null 2>&1
     fi
     rc=$?
     if [ "$rc" -eq 0 ]; then
-      git_b update-ref "refs/reviews/$key" "$commit" >/dev/null 2>&1
+      g_update_ref "refs/reviews/$key" "$commit" >/dev/null 2>&1
       say "  ↑ pushed $key (reviewed_at=$cs)"
       PUSHED=$((PUSHED + 1)); WROTE=$((WROTE + 1)); return 0
     fi
@@ -478,6 +755,18 @@ push_one() { # <key> <source-file>
 
 pull_one() { # <key>
   local key="$1" tmp lf rat lat pull_reason=""
+  # ⛔ THE FAST PATH: the store's blob id and this box's agree, so the bytes are identical and
+  # there is nothing for rules 1/4 to decide. Same counter as the full comparison (`SAME`), so the
+  # summary cannot tell the two paths apart — and must not.
+  local sb
+  sb="$(store_blob_of "$key")"
+  if [ -n "$sb" ] && [ "$sb" != "-" ]; then
+    lf="$(local_record_for_key "$key" 2>/dev/null)" || lf=""
+    if [ -n "$lf" ] && [ "$(local_blob_of "$lf")" = "$sb" ]; then
+      SAME=$((SAME + 1)); return 0
+    fi
+  fi
+  lf=""
   tmp="$(mktemp "${TMPDIR:-/tmp}/registry-sync-pull.XXXXXX")" || { FAILED=$((FAILED + 1)); return 0; }
   if ! remote_record "$key" >"$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
     # The ref exists (it came from remote_refs) but carries no readable record.json: that is a
@@ -559,7 +848,20 @@ pull_one() { # <key>
           a) pull_reason="same mint time, same head, and the peer's record is the carried one; taking it as a supersession" ;;
           b) say "  · keep $key — same mint time and THIS box's record is the carried one (same head, same verdict)"
              SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0 ;;
-          same) say "  · keep $key — same mint time, verdict, head and merge base; the records differ only in carry provenance"
+          same) # ⛔ A FORMATTING-ONLY DIFFERENCE IS RESOLVED, NOT KEPT (#2577, measured). 3,261 of
+             # 3,462 records on the reference box differed from their published blob by exactly one
+             # TRAILING NEWLINE — an artefact of an older pull, not a disagreement — so every pass
+             # re-read them (`same_bytes` is exact) and a scheduled run could never become cheap.
+             # Equal after trailing newlines are stripped is not a verdict difference: the stamp,
+             # verdict and head are already equal here, and rule 4 only protects records that
+             # DISAGREE. Rewriting the local file to the PUBLISHED bytes makes this box's registry
+             # byte-identical to the fleet's record — the property `hash=` and the equality fast path
+             # both rest on — and it is counted as a write, because it is one.
+             if [ "$lf" = "$REG_DIR/$key.json" ] && [ "$(command cat "$lf")" = "$(command cat "$tmp")" ] && write_local "$key" "$tmp"; then
+               say "  · canon $key — the only difference was trailing newlines; rewrote it to the published bytes"
+               WROTE=$((WROTE + 1)); SAME=$((SAME + 1)); rm -f "$tmp"; return 0
+             fi
+             say "  · keep $key — same mint time, verdict, head and merge base; the records differ only in carry provenance"
              SAME=$((SAME + 1)); rm -f "$tmp"; return 0 ;;
           *) conflict "$key" "$lat" "$rat" "$lf"; rm -f "$tmp"; return 0 ;;
         esac
@@ -569,6 +871,10 @@ pull_one() { # <key>
   if write_local "$key" "$tmp"; then
     say "  ↓ pulled $key (reviewed_at=$rat)${pull_reason:+ — $pull_reason}"
     WROTE=$((WROTE + 1))
+    # `lf` is non-empty exactly when `local_record_for_key` found a record the READER would act on
+    # (the qualified file, or the legacy `<pr>.json` it falls back to) — so it is the right test for
+    # "this box had none" and not a guess from the qualified path alone.
+    if [ -n "$lf" ]; then UPDATED=$((UPDATED + 1)); else ADDED=$((ADDED + 1)); fi
   else
     warn "  ⚠️ FAILED $key — could not write $REG_DIR/$key.json"
     FAILED=$((FAILED + 1))
@@ -650,6 +956,9 @@ local_record_for_key() { # <key>
 
 do_pull() {
   fetch_refs || return 1
+  reset_local_blobs
+  build_store_blobs || :
+  build_local_blobs || :
   local key
   while IFS= read -r key; do
     [ -n "$key" ] || continue
@@ -659,6 +968,11 @@ do_pull() {
 
 do_push() {
   fetch_refs || return 1
+  # A pull may have materialised records since the maps were built; the local side is rebuilt so a
+  # freshly written record is compared by id rather than re-read.
+  reset_local_blobs
+  build_store_blobs || :
+  build_local_blobs || :
   local key name list
   list="$(mktemp "${TMPDIR:-/tmp}/registry-sync-keys.XXXXXX")" || return 1
   local_keyed "$list" <<<"$(registry_names)"
@@ -718,10 +1032,15 @@ do_status() {
 summary() { # <verb>
   printf '%s: wrote=%s pushed=%s same=%s older_refused=%s conflicts=%s unkeyed=%s unreadable=%s failed=%s\n' \
     "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$CONFLICT" "$UNKEYED" "$UNREADABLE" "$FAILED"
+  # THE CONVERGENCE LINE (#2577). Printed LAST so a caller that greps `^<verb>:` for the tail (the
+  # rail and the cell bring-up both do) reports the numbers a stalled sync makes visible, instead of
+  # a breakdown that reads identical whether the 3,000 fleet records arrived or none did.
+  printf '%s: refs=%s files=%s added=%s updated=%s skipped=%s\n' \
+    "$1" "$STORE_REF_COUNT" "$(registry_file_count)" "$ADDED" "$UPDATED" "$UNREADABLE"
   if [ "$FAILED" -gt 0 ]; then
     # WHICH SIDE failed matters at the caller: a failed PULL means the fleet is UNKNOWN here, while a
-    # failed PUSH means the records WERE read and this box could not publish. Naming both as "the
-    # fleet's records are UNKNOWN" sent an operator to re-run a path that fails identically.
+    # failed PUSH means the records WERE read and this box could not publish. Naming both as a single
+    # records-are-UNKNOWN state sent an operator to re-run a path that fails identically.
     if [ "$PUSH_FAILED" -gt 0 ] && [ "$FAILED" -eq "$PUSH_FAILED" ]; then
       warn "registry-sync.sh: $FAILED record(s) could not be PUBLISHED — the pull side succeeded, so this box"
       warn "  HOLDs the fleet's records but its own are still LOCAL. Re-run to retry (nothing was deleted)."
@@ -741,6 +1060,64 @@ summary() { # <verb>
   fi
   return 0
 }
+
+# ── surface-check: would the checkout-guard CLASSIFY this script? (#2520) ──────────────────
+# The one question a refused lane could not answer: is the sync command the rail told it to run
+# actually runnable here? A guard refusal happens before this file first line, so the caller gets
+# NO exit status — and silence has been read as success, which is the whole of #2520. This verb
+# turns that silence into a value: 0 = every git invocation here is one the guard can classify,
+# 5 = it would withhold the run, 3 = the check could not read its own source.
+#
+# ⛔ IT IS A DELIBERATELY CONSERVATIVE RESTATEMENT OF TWO GUARD RULES, NOT A SECOND OPINION. The
+# rules are (a) a git invocation whose VERB arrives as a variable cannot be bounded, so the guard
+# fails closed on it, and (b) a verb that rewrites a working tree has no business in a registry
+# sync at all. Restating them can only OVER-refuse (a false 5 costs one grep), never under-refuse,
+# which is the safe direction for a check whose whole purpose is to catch a regression. The shipped
+# suite (§28) pins this against the guard OWN classifier on the real file and on two fixtures, so a
+# restatement that drifts reads as a red suite rather than as a quiet false OK.
+surface_check() {
+  local hits rc
+  hits="$(awk '
+    # Every token after a `git` command word, minus the options that consume an argument, is the
+    # VERB. `-C`/`-c` and friends take a value, so their value must not be mistaken for a verb.
+    {
+      n = split($0, t, /[ \t]+/)
+      for (i = 1; i <= n; i++) {
+        if (t[i] != "git") continue
+        j = i + 1
+        while (j <= n && t[j] ~ /^-/) {
+          if (t[j] == "-C" || t[j] == "-c" || t[j] == "--git-dir" || t[j] == "--work-tree" ||
+              t[j] == "--namespace" || t[j] == "--config-env" || t[j] == "--super-prefix" ||
+              t[j] == "--exec-path") j++
+          j++
+        }
+        if (j > n) continue                      # a bare `git` runs nothing
+        v = t[j]
+        if (v ~ /[$`]/) { printf "%d: dynamic verb %s\n", NR, v; continue }
+        fam = " checkout checkout-index restore switch reset clean read-tree apply rm "
+        if (index(fam, " " v " ") > 0) printf "%d: working-tree verb %s\n", NR, v
+      }
+    }' "${BASH_SOURCE[0]}" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "surface-check: ⛔ could not read ${BASH_SOURCE[0]} (awk rc=$rc) — exit 3 = NOT VERIFIED, never a pass."
+    return 3
+  fi
+  if [ -z "$hits" ]; then
+    say "surface-check: OK — every git invocation in ${BASH_SOURCE[0]##*/} has a LITERAL verb the checkout-guard can classify, and none rewrites a working tree."
+    return 0
+  fi
+  warn "surface-check: ⛔ the CHECKOUT-GUARD would withhold this script (#709): a git invocation whose"
+  warn "  verb it cannot bound makes EVERY verb here un-runnable, and the withheld run prints no exit"
+  warn "  status at all — which is exactly the state issue 2520 records. The offending line(s):"
+  printf '%s\n' "$hits" | sed 's/^/  /' >&2
+  warn "  Fix the script git surface (one literal verb per line); never weaken the guard. Exit 5 = REFUSED."
+  return 5
+}
+
+case "$VERB" in
+  surface-check) surface_check; exit $? ;;
+esac
 
 resolve_store || exit 1
 case "$VERB" in
