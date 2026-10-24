@@ -221,8 +221,8 @@ case_b() { # <owner-script> <entry-point>
 
 # ── C: an unreadable process list SKIPS the sweep and says so ───────────────────────────────────
 case_c() { # <owner-script>
-    local owner="$1" base root repo wt out rc
-    base="$(newbase c)"; root="$base/scratch"
+    local owner="$1" base root repo wt out rc out_seam
+    base="$(newbase c)"; root="$base/scratch"; mkdir -p "$base/empty-proc"
     repo="$(mk_repo "$base")"
     wt="$(mk_linked_wt "$repo" "$root" old-idle feat/c-idle)"
     age_path "$wt" 400
@@ -235,6 +235,18 @@ case_c() { # <owner-script>
                "and it REPORTS the skip (SKIP reason=census-unreadable)"
     case_check "$(grep -qF 'nothing was reaped' <<<"$out" && echo 0 || echo 1)" \
                "the skip says in words that nothing was reaped"
+    # ⛔ AND THE DOCUMENTED SEAM MUST REACH THAT ARM — both spellings of a bad seam: a MISSING path and an
+    # EMPTY directory (the natural `mktemp -d` shape). An existence-only check let the empty-dir spelling
+    # fall through to `lsof`, read a DIFFERENT table and report green, so the documented way to exercise
+    # the refusal could not reach it.
+    out_seam="$(REAP_AW_PROC_ROOT="$base/no-such-proc" REAP_AW_ROOTS="$base/scratch-x" \
+                bash "$owner" --dry-run 2>&1)"
+    case_check "$(grep -qF 'census=unreadable' <<<"$out_seam" && echo 0 || echo 1)" \
+               "an explicit REAP_AW_PROC_ROOT naming a MISSING table forces the fail-closed arm"
+    out_seam="$(REAP_AW_PROC_ROOT="$base/empty-proc" REAP_AW_ROOTS="$base/scratch-x" \
+                bash "$owner" --dry-run 2>&1)"
+    case_check "$(grep -qF 'census=unreadable' <<<"$out_seam" && echo 0 || echo 1)" \
+               "and so does an EMPTY directory (it names no process table either)"
     return $((CASE_FAIL > 0))
 }
 
@@ -454,9 +466,14 @@ case_j() { # <owner-script> <lock-dir-name>
 # and the record said `fail-closed` beside `detail=cannot run: …` — two contradictory causes on the
 # line an operator fixes from.
 case_k() { # <entry-point>
-    local pass="$1" base root out status
+    local pass="$1" base root out status repo
     base="$(newbase k)"; root="$base/scratch"; mkdir -p "$root"
-    out="$(DISK_REAPER_STATE_DIR="$base/state" REAP_AW_ROOTS="$root" REAP_DI_ROOTS="$base/no-di" \
+    # ⛔ A FIXTURE REPO, or the case proves nothing: with no resolvable repo the pass records
+    # `misconfigured` for the OTHER reason (`worktree-no-repo`) and the mutant survives — which is also
+    # what made this case red in CI (whose only env is BASH_SHARD_SLICE) while it passed on a fleet box
+    # only because ambient REPO/AGENT_INFRA_PATH leaked in (and then it ran the real reaper over real roots).
+    repo="$(mk_repo "$base")"
+    out="$(DISK_REAPER_STATE_DIR="$base/state" DISK_REAPER_REPOS="$repo" REAP_AW_ROOTS="$root" REAP_DI_ROOTS="$base/no-di" \
            ABANDONED_WT_REAPER="$base/missing.sh" bash "$pass" --dry-run --only worktree 2>&1)"
     [ -n "${DRC_DEBUG:-}" ] && printf 'K\n%s\n' "$out" >&2
     status="$(cat "$base/state/disk-reaper.status" 2>/dev/null)"
@@ -464,6 +481,33 @@ case_k() { # <entry-point>
                "a missing owner is recorded as MISCONFIGURED (could not be set up), not fail-closed"
     case_check "$(grep -qF 'cannot run: abandoned-worktree-delegate-missing' <<<"$status" && echo 0 || echo 1)" \
                "and detail= names the missing owner"
+    return $((CASE_FAIL > 0))
+}
+
+# ── L: argv-named via a SYMLINKED spelling still protects the tree ───────────────────────────────
+# The census stores argv tokens as the process WROTE them; candidates are compared by physical path. A
+# controller pointed at a tree through a symlink named `/tmp/link/wt/f` while the candidate's canonical
+# path was `/tmp/real/wt` — no prefix matched and the tree the live controller was working in was reaped.
+case_l() { # <owner-script>
+    local owner="$1" base root repo wt out pid
+    base="$(newbase l)"; root="$base/scratch"
+    repo="$(mk_repo "$base")"
+    wt="$(mk_linked_wt "$repo" "$root" wt1 feat/l-argv)"
+    age_path "$wt" 400
+    ln -s "$root" "$base/link"
+    # ⛔ `sleep 300; :` and not `sleep 300`: bash REPLACES itself with a lone simple command (exec
+    # optimisation), so the argv token this case needs was gone from /proc/<pid>/cmdline by the time the
+    # census read it — the case measured nothing and the tree was reaped in the fixture too.
+    bash -c 'sleep 300; :' "$base/link/wt1/some-file.txt" &
+    pid=$!; SLEEPERS="$SLEEPERS $pid"
+    sleep 0.5
+    out="$(REAP_AW_STATE_DIR="$base/state" REAP_AW_ROOTS="$root" REAP_AW_PROC_ROOT=/proc bash "$owner" --apply 2>&1)"
+    [ -n "${DRC_DEBUG:-}" ] && printf 'L\n%s\n' "$out" >&2
+    case_check "$([ -d "$wt" ] && echo 0 || echo 1)" \
+               "a tree a live process names through a SYMLINK is KEPT (argv spellings are canonicalised)"
+    case_check "$(grep -qF 'reason=argv-named' <<<"$out" && echo 0 || echo 1)" \
+               "and it is KEPT BY NAME with reason=argv-named"
+    kill "$pid" 2>/dev/null
     return $((CASE_FAIL > 0))
 }
 
@@ -480,6 +524,8 @@ MUT_I='s/        dirty="?"$/        dirty="0"/'
 MUT_D2='s/^        PIN_PATHS="\$_pc"$/        :/'
 MUT_J='s/kill -0/false/'
 MUT_K='s/^        AW_SETUP_FAIL=1$/        :/'
+MUT_L='s/_lp_rel "\$_cand" "\$path"/_lp_rel "" "$path"/'
+MUT_C='s/^    LP_CENSUS_UNAVAILABLE=1$/    :/'
 
 echo "── disk-reaper-classes.test.sh — #2542 classes ─────────────────────────────────────────────"
 
@@ -578,6 +624,26 @@ if apply_mutation "$REAPER" "$T/mut-k/disk-reaper.sh" "$MUT_K"; then
     expect_fail "K mutation: not recording the setup failure turns the case RED" case_k "$T/mut-k/disk-reaper.sh"
 else
     bad "K mutation could not be applied (the AW_SETUP_FAIL arm moved) — the case is not checking it any more"
+fi
+
+expect_pass "L a live holder naming the tree through a SYMLINK still protects it" case_l "$AW_OWNER"
+# ⚠️ THE ARM LIVES IN THE SHARED LIBRARY, so the mutant is a mutant LIBRARY with a COPY of the owner
+# beside it (a symlinked owner resolves `pwd -P` back to the real directory and would source the real
+# library — the mutant would then be the real thing and the case would "pass" its own mutation).
+mkdir -p "$T/mut-l/lib"
+cp "$HERE/reap-abandoned-worktrees.sh" "$T/mut-l/reap-abandoned-worktrees.sh"
+sed "$MUT_L" "$HERE/lib/live-paths.sh" >"$T/mut-l/lib/live-paths.sh" 2>/dev/null
+if cmp -s "$HERE/lib/live-paths.sh" "$T/mut-l/lib/live-paths.sh" || ! bash -n "$T/mut-l/lib/live-paths.sh" 2>/dev/null; then
+    bad "L mutation could not be applied to lib/live-paths.sh (the argv canonicalisation moved) — the case is not checking it any more"
+else
+    chmod +x "$T/mut-l/reap-abandoned-worktrees.sh"
+    expect_fail "L mutation: dropping the argv canonicalisation turns the case RED" case_l "$T/mut-l/reap-abandoned-worktrees.sh"
+fi
+if apply_mutation "$AW_OWNER" "$T/mut-c2/reap-abandoned-worktrees.sh" "$MUT_C"; then
+    ln -sfn "$HERE/lib" "$T/mut-c2/lib"
+    expect_fail "C mutation: dropping the seam refusal turns the seam assertions RED" case_c "$T/mut-c2/reap-abandoned-worktrees.sh"
+else
+    bad "C seam mutation could not be applied — the seam assertions are not checking it"
 fi
 
 echo

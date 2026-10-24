@@ -667,6 +667,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | I | a tree **git cannot read** is not a clean tree: `dirty=?` KEEPS it (`reason=clean-unknown`), so uncommitted work survives a dangling `.git` | `dirty="?"` → `dirty="0"` |
 | J | a lock whose owner is **live** is honoured by both owners (`SKIP reason=lock-held`, rc 3, lock left in place) | `kill -0 "$owner"` → `false` |
 | K | a class that could not be **set up** is `misconfigured` (not `fail-closed`, which means the delegate ran) | `AW_SETUP_FAIL=1` → `:` |
+| L | a live process that names the tree through a **symlinked** spelling still protects it (argv tokens are canonicalised) | `_lp_rel "$_cand" "$path"` → `_lp_rel "" "$path"` |
 
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`

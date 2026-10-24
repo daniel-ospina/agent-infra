@@ -239,8 +239,8 @@ acquire_lock() {
     if ! num "$owner"; then
         if [ -f "$LOCK_DIR/token" ]; then _lmt="$(file_mtime "$LOCK_DIR/token")"; else _lmt="$(file_mtime "$LOCK_DIR")"; fi
         if num "$_lmt"; then
-            _lage=$(( $(now) - _lmt )); [ "$_lage" -lt 0 ] && _lage=0
-            if [ "$_lage" -le "$LOCK_STALE_SECONDS" ]; then
+            _lage=$(( $(now) - _lmt ))
+            if [ "$_lage" -ge 0 ] && [ "$_lage" -le "$LOCK_STALE_SECONDS" ]; then
                 say "SKIP reason=lock-tokenless age=${_lage}s"
                 return 3
             fi
@@ -530,7 +530,10 @@ say "reap-abandoned-worktrees: pass start mode=$MODE_TEXT roots=$(printf '%s' "$
 # An EXPLICIT seam that does not name a readable process table forces the fail-closed arm: the seam
 # says WHICH table to read, so falling through to `lsof` would silently read a different one and
 # report green — the exact "the documented way to test the refusal cannot reach it" defect.
-if [ -n "${REAP_AW_PROC_ROOT:-}" ] && [ ! -d "${REAP_AW_PROC_ROOT}" ]; then
+# "Readable" means it LOOKS like a process table (`self/cwd`, or a numbered pid with a `cwd`): an
+# EMPTY directory — the natural spelling of a test seam (`mktemp -d`) — passed an existence check and
+# fell through to `lsof`, reading a different table and reporting green.
+if [ -n "${REAP_AW_PROC_ROOT:-}" ] && [ ! -e "${REAP_AW_PROC_ROOT}/self/cwd" ] && ! ls "${REAP_AW_PROC_ROOT}"/[0-9]*/cwd >/dev/null 2>&1; then
     say "note: REAP_AW_PROC_ROOT=$REAP_AW_PROC_ROOT is not a process table — forcing the fail-closed arm rather than reading a different one"
     LP_CENSUS_UNAVAILABLE=1
 fi
