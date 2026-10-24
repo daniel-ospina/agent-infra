@@ -261,7 +261,7 @@ function stripcomment(s,   out, i, n, c, q, nx) {
       }
       continue
     }
-    if (c == DQ || c == SQ) { q = c; out = out c; continue }
+    if ((c == DQ || c == SQ) && at_val_start(s, i)) { q = c; out = out c; continue }
     if (c == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[ \t]/)) {
       sub(/[ \t]+$/, "", out)
       return out
@@ -273,6 +273,28 @@ function stripcomment(s,   out, i, n, c, q, nx) {
   # otherwise a real comment is kept as part of the value (round 9).
   if (q != "") return stripcomment_simple(s)
   return out
+}
+# has_closing(s, i, q) — TRUE when a quote of the same kind as s[i] closes later on the line, which
+# is what distinguishes a quoted VALUE (a shell-quoted JSON blob in a `run:` scalar) from a stray
+# apostrophe inside a plain scalar.
+function has_closing(s, i, q,   j, n, c) {
+  n = length(s)
+  for (j = i + 1; j <= n; j++) {
+    c = substr(s, j, 1)
+    if (q == DQ && c == "\\") { j++; continue }
+    if (c == q) return 1
+  }
+  return 0
+}
+# at_val_start(s, i) — TRUE when the quote at position i OPENS a quoted scalar: YAML only quotes at a
+# value position, so an apostrophe inside a plain scalar (or inside a comment) is just a character.
+function at_val_start(s, i,   j, c) {
+  if (i == 1) return 1
+  j = i - 1
+  while (j > 0 && substr(s, j, 1) ~ /[ \t]/) j--
+  if (j == 0) return 1
+  c = substr(s, j, 1)
+  return (c == ":" || c == "-" || c == "[" || c == "{" || c == ",")
 }
 # stripcomment_simple(s) — the pre-quote-aware rule, used only when a quote never closes.
 function stripcomment_simple(s,   i, n) {
@@ -305,7 +327,7 @@ function mask_quoted(s,   out, i, n, c, q, nx, start, seg, j) {
       }
       continue
     }
-    if (c == DQ || c == SQ) { q = c; start = i; continue }
+    if ((c == DQ || c == SQ) && (at_val_start(s, i) || has_closing(s, i, c))) { q = c; start = i; continue }
     out = out c
   }
   # UNCLOSED quote: a plain scalar with an apostrophe, not a string. Returning the raw line keeps the
@@ -529,11 +551,13 @@ BEGIN {
     }
     if (match(t, "^" QCH "?group" QCH "?[ \t]*:")) {
       v = unq(trim(substr(t, index(t, ":") + 1)))
-      if (v == "" || v ~ /^[|>]/) { pendkey = "group"; pendval = ""; pendind = lineindent; pendblock = (v ~ /^[|>]/ ? 1 : 0) } else { group = v }
+      if (v ~ /^[|>]/) { pendkey = "group"; pendval = ""; pendind = lineindent; pendblock = 1 }
+      else { group = v; pendkey = "group"; pendval = v; pendind = lineindent; pendblock = 0 }
     }
     else if (match(t, "^" QCH "?cancel-in-progress" QCH "?[ \t]*:")) {
       v = unq(trim(substr(t, index(t, ":") + 1)))
-      if (v == "" || v ~ /^[|>]/) { pendkey = "cancel"; pendval = ""; pendind = lineindent; pendblock = (v ~ /^[|>]/ ? 1 : 0) } else { cancel = tolower(v) }
+      if (v ~ /^[|>]/) { pendkey = "cancel"; pendval = ""; pendind = lineindent; pendblock = 1 }
+      else { cancel = tolower(v); pendkey = "cancel"; pendval = v; pendind = lineindent; pendblock = 0 }
     }
   }
 }
@@ -545,7 +569,7 @@ if [ "$awk_rc" -ne 0 ]; then
 fi
 
 errors=0
-scanned=0
+scanned=0; r0_refusals=0
 pr_seen=0
 applied_exemptions=" "
 
@@ -588,16 +612,19 @@ while IFS=$'\037' read -r fname triggers hasconc group cancel joblevel onparsed 
 
   # ---- R0: what could not be read is not compliant ----------------------------------------
   if [ "$onparsed" -eq 0 ]; then
+    r0_refusals=$((r0_refusals + 1))
     # The specific cause when the reader has one (an alias, a tag): the generic sentence describes
     # the SYMPTOM and would send the author looking for a missing `on:` that is in the file.
     fail "$fname: ${concwhy:-this check could not read any trigger from the \`on:\` section} — refusing to treat an unreadable workflow as non-PR. A workflow is not run without \`on:\`; a shape this reader cannot resolve must be fixed or modelled [R0]"
     continue
   fi
   if [ "$joblevel" -eq 1 ]; then
+    r0_refusals=$((r0_refusals + 1))
     fail "$fname: declares a JOB-level \`concurrency:\`, which GitHub honours and this check does not model — hoist it to a workflow-level \`concurrency:\` (see --help) [R0]"
     continue
   fi
   if [ "${concbad:-0}" -eq 1 ]; then
+    r0_refusals=$((r0_refusals + 1))
     # ONE message per cause: three shapes shared this line and two of them were then described as
     # "a sequence or an alias" that the file did not contain (round 5, P2).
     fail "$fname: ${concwhy:-an unreadable shape in this file} — an unreadable cancellation policy must not read as compliant [R0]"
@@ -733,8 +760,14 @@ if [ "$scanned" -eq 0 ]; then
   echo "❌ no workflow files were scanned — refusing to report PASS over an empty scan set (<$MODE>)" >&2
   exit 2
 fi
-if [ "$MODE" = "repo" ] && [ "$pr_seen" -eq 0 ]; then
+if [ "$MODE" = "repo" ] && [ "$pr_seen" -eq 0 ] && [ "$r0_refusals" -eq 0 ]; then
   echo "❌ no pull_request-triggered workflow was found in $ROOT/.github/workflows — R1 verified NOTHING (a broken glob or a renamed trigger must not read green)" >&2
+  exit 2
+fi
+if [ "$MODE" = "repo" ] && [ "$r0_refusals" -gt 0 ]; then
+  # A refused file already says why it could not be read; adding "no PR workflow was found" names a
+  # SECOND cause (a rename or a glob hole) that does not exist, and sends the author after it
+  # (round 10, P2 — the same class the exemption bookkeeping had in round 8).
   exit 2
 fi
 if [ "$MODE" = "repo" ]; then

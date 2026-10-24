@@ -450,7 +450,8 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-flow-format.yml" "$CFIX/pr-flow-capital.yml" "$CFIX/push-flow-false-capital.yml" \
   "$CFIX/push-group-continuation-eof.yml" "$CFIX/pr-run-json.yml" "$CFIX/pr-group-hash-quoted.yml" "$CFIX/push-on-sequence-ok.yml" \
   "$CFIX/pr-group-apostrophe-comment.yml" "$CFIX/pr-on-column0-sequence.yml" \
-  "$CFIX/pr-on-sequence-mapping.yml"
+  "$CFIX/pr-on-sequence-mapping.yml" \
+  "$CFIX/pr-group-apostrophe-pair-ok.yml" "$CFIX/pr-multiline-value-ok.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -494,6 +495,8 @@ for pair in \
   "pr-flow-group-comma-sha.yml R1" \
   "push-on-sequence.yml R2" \
   "push-job-apostrophe-name.yml R0" \
+  "pr-group-apostrophe-pair-comment.yml R1" \
+  "pr-multiline-value-sha.yml R1" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
@@ -570,6 +573,37 @@ grep -q '1 PR entry point(s)' "$OUT" \
   && pass "the sequence entry counts as one PR entry point" \
   || { fail "the sequence entry was not counted as a PR entry point"; sed 's/^/      /' "$OUT"; }
 
+# A workflow refused by R0 must NOT also be reported as "no pull_request-triggered workflow was
+# found": that names a second cause (a rename, a glob hole) that does not exist and sends the author
+# after it (#2660 round 10).
+NOR0_TREE="$(mktemp -d "${TMPDIR:-/tmp}/wfconc-nor0.XXXXXX")"
+mkdir -p "$NOR0_TREE/.github/workflows"
+cat >"$NOR0_TREE/.github/workflows/pr-bad.yml" <<'YAML'
+name: bad
+on: !!seq [pull_request]
+concurrency:
+  group: pr-bad-${{ github.ref }}
+  cancel-in-progress: true
+YAML
+cat >"$NOR0_TREE/.github/workflows/ci-main.yml" <<'YAML'
+name: main
+on:
+  push:
+    branches: [main]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+YAML
+conc_run 2 "a tree whose only PR workflow is unreadable is RED" --root "$NOR0_TREE"
+if grep -q 'no pull_request-triggered workflow was found' "$OUT"; then
+  fail "the unreadable PR workflow was ALSO reported as none found (two causes, one file)"
+  sed 's/^/      /' "$OUT"
+else
+  pass "the unreadable workflow is not also reported as no PR workflow found"
+fi
+
 # An exempt guard that DROPS its PR trigger and gains a `concurrency:` block must still be refused.
 # Gating the stale-exemption arm on "is this still PR-triggered" made both R4 arms unreachable at
 # once: the bookkeeping arm was satisfied by the scan and this one by the missing trigger
@@ -615,7 +649,8 @@ jobs:
     steps:
       - run: echo ok
 YAML
-conc_run 1 "an exempt guard refused by R0 is RED" --root "$EXEMPT_TREE"
+# Repo mode answers an unreadable workflow with exit 2 (not 1): the scan could not verify the tree.
+conc_run 2 "an exempt guard refused by R0 is RED" --root "$EXEMPT_TREE"
 if grep -q 'no such PR-triggered workflow was scanned' "$OUT"; then
   fail "an R0-refused guard was ALSO reported as never scanned (two causes, one file)"
   sed 's/^/      /' "$OUT"
