@@ -1244,6 +1244,62 @@ case "$RI2_OUT" in
   *'already installed at'*) bad 'install: the re-run reported the SAME copy as a second one' ;;
   *) ok 'install: the re-run does not report one file as two copies' ;;
 esac
+# ⛔ THE HOME ROOTS MUST BE RESOLVED BEFORE THEY ARE COMPARED (re-review P1, #2666). The candidate is
+# resolved; comparing it against an UNRESOLVED `$HOME` re-opened the hole: with `$HOME` a symlink the
+# candidate resolved to its physical spelling and matched no pattern, so `$HOME/.local/share/systemd/user` —
+# a real user-manager unit root — was ADMITTED. This arm makes `$HOME` a symlink on purpose.
+say_case 'a symlinked $HOME does not hide the user manager unit roots'
+SH="$(arm_root sh)"; mk_systemctl "$SH/bin" "$SH/state" "$SH/sc.log"
+mkdir -p "$SH/realhome/.local/share/systemd/user" "$SH/realhome/.config/systemd/user"
+ln -sfn "$SH/realhome" "$SH/home-link"
+SH_RC=0; SH_OUT="$(EXTRA_ENV="HOME=$SH/home-link SYSTEMD_UNIT_DIR=$SH/home-link/.local/share/systemd/user" inst sh --dry-run 2>&1)" || SH_RC=$?
+[ "$SH_RC" -ne 0 ] && ok 'a symlinked $HOME does not hide ~/.local/share/systemd/user (still REFUSED)' \
+                   || bad "a symlinked \$HOME admitted a real user-manager unit root — $SH_OUT"
+# ⛔ AND THE XDG ROOTS ARE USER-MANAGER UNIT ROOTS TOO (re-review P2, #2666): `systemd.unit(5)` lists
+# `$XDG_CONFIG_HOME/systemd/user` and `$XDG_DATA_HOME/systemd/user`, and neither was covered.
+for _xdg in XDG_CONFIG_HOME XDG_DATA_HOME; do
+  _ax="$(arm_root "xdg-$(printf '%s' "$_xdg" | tr 'A-Z' 'a-z')")"; mk_systemctl "$_ax/bin" "$_ax/state" "$_ax/sc.log"
+  mkdir -p "$_ax/xdg/systemd/user"
+  _AX_RC=0; _AX_OUT="$(EXTRA_ENV="$_xdg=$_ax/xdg SYSTEMD_UNIT_DIR=$_ax/xdg/systemd/user" inst "$(basename "$_ax")" --dry-run 2>&1)" || _AX_RC=$?
+  [ "$_AX_RC" -ne 0 ] && ok "$_xdg/systemd/user is REFUSED (a user-manager unit root nothing here reads)" \
+                      || bad "$_xdg/systemd/user was ADMITTED — $_AX_OUT"
+done
+# ⛔ A LEAF THAT DOES NOT EXIST YET STILL RESOLVES THROUGH A SYMLINKED PARENT (re-review P2, #2666). The
+# fallback used to keep the literal when `readlink -f` was unavailable, while `mkdir -p` followed the
+# symlinked parent — so the guard graded one path and the write landed in another (inside /etc/systemd).
+say_case 'a leaf that does not exist yet is graded by where the write would land'
+SL="$(arm_root sl)"; mk_systemctl "$SL/bin" "$SL/state" "$SL/sc.log"
+mkdir -p "$SL/tree"; ln -sfn /etc/systemd "$SL/tree/alias"
+# ⛔ THE ARM IS ONLY DISCRIMINATING WHERE `readlink -f` CANNOT ANSWER (re-review P2, #2666): GNU readlink -f
+# resolves a missing LEAF under an existing parent, so with it present the hole never opens. The measured
+# shape is the one where it cannot answer — a minimal box, busybox, or a PATH without it — so the stub below
+# makes `readlink` fail, which is exactly the branch the fallback exists for. Without the parent-resolution
+# in `canon_dir` this arm returns 0 and dry-runs an install into /etc/systemd; with it, REFUSED.
+printf '#!/bin/bash\nexit 1\n' > "$SL/bin/readlink"; chmod +x "$SL/bin/readlink"
+SL_RC=0; SL_OUT="$(EXTRA_ENV="SYSTEMD_UNIT_DIR=$SL/tree/alias/system.control" inst sl --dry-run 2>&1)" || SL_RC=$?
+case "$SL_OUT" in
+  *'cannot create'*|*'Permission denied'*) bad "the probe tried to WRITE instead of refusing (guard bypassed) — $SL_OUT" ;;
+esac
+[ "$SL_RC" -ne 0 ] && ok 'a not-yet-created leaf UNDER a symlinked parent is REFUSED (resolved through the link)' \
+                   || bad "a leaf under a symlink to /etc/systemd was admitted — the write would land there — $SL_OUT"
+[ -d /etc/systemd/system.control ] && bad 'the probe CREATED /etc/systemd/system.control on this box' || true
+# ⛔ SOURCING THE INSTALLER MUST BE INERT (re-review incident, #2666). It is a script with a top-level
+# dispatch, so `source …` fell through to `ACTION=--install` and installed a REAL, ENABLED unit on the box
+# that ran it (measured in this lane's verification round: /etc/systemd/system/eldato-orchestrator.service
+# plus its multi-user.target.wants link, reverted by hand). An enabled unit is a second supervisor the
+# moment anything starts it — the #1761 duplicate this file exists to prevent.
+say_case 'sourcing the installer performs no action'
+SO="$(arm_root so)"; mk_systemctl "$SO/bin" "$SO/state" "$SO/sc.log"
+SO_RC=0; SO_OUT="$(bnd env SYSTEMCTL="$SO/bin/systemctl" SYSTEMD_UNIT_DIR="$SO/units" CONTROLLER_SYSTEM_UNIT_DIR="$SO/units" \
+    CONTROLLER_USER_UNIT_DIR="$SO/nouser" CONTROLLER_ALLOW_ROOT=1 HOME="$SO/home" CELL_HOME="$SO/home" \
+    TEMPLATES_DIR="$(dirname "$TPL")" ENV_FILE="$SO/home/keys.env" O="$SO/o" PATH="$SO/bin:$PATH" \
+    bash -c 'source "$1" --install; echo SOURCED_OK' _ "$INST" 2>&1)" || SO_RC=$?
+case "$SO_OUT" in
+  *SOURCED_OK*) ok 'sourcing exits cleanly (the source guard returns before the dispatch)' ;;
+  *) bad "sourcing did not return cleanly — $SO_OUT" ;;
+esac
+[ -f "$SO/units/eldato-orchestrator.service" ] && bad 'sourcing the installer WROTE a unit (a sourced script must never install)' \
+                                              || ok 'sourcing the installer wrote nothing'
 
 # ⛔ MainPID 0 WITH A *FRESH* HEARTBEAT IS STILL NOT A CONTROLLER (review P1, #2402). `is-active` reports
 # `activating` during a RestartSec wait, and a loop that ticked 10 s ago then died leaves a readable fresh

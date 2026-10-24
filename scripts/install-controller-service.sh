@@ -137,6 +137,17 @@ TARGET=""; UNIT_DIR=""; SC=""; WANTED_BY="multi-user.target"
 # does not exist in a per-user manager, so a user unit enabled against it would never be brought back —
 # the defect this installer removes, one layer down. Resolved here beside the scope so the two cannot
 # disagree, and the rendered line is asserted below.
+# ⛔ SOURCING THIS FILE IS INERT (re-review, #2666). It is a SCRIPT with a top-level argument loop and an
+# action dispatch, so `source scripts/install-controller-service.sh` used to fall through to
+# `ACTION=--install` and INSTALL A REAL, ENABLED UNIT on whatever box ran it — measured in this lane's own
+# verification round, where a reviewer that wanted the helper functions wrote `/etc/systemd/system/
+# eldato-orchestrator.service` plus its `multi-user.target.wants` link and had to revert them by hand.
+# An enabled unit is a second supervisor the moment anything starts it, which is the #1761 duplicate this
+# whole file exists to prevent; a *reading* action must therefore never reach the dispatch. Nothing in this
+# repo sources it (checked), so this guard costs no caller anything.
+if [ "${BASH_SOURCE[0]:-$0}" != "$0" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 # ⛔ A UNIT DIRECTORY SYSTEMD READS AND THIS FLEET'S READERS DO NOT IS A SECOND DISPATCHER (review P1,
 # #2402; re-review P1). `SYSTEMD_UNIT_DIR` is the installer's WRITE override, but the supervisor discovers a
 # unit only under the system dir (`CONTROLLER_SYSTEM_UNIT_DIR`, default `/etc/systemd/system`) and the user
@@ -161,18 +172,36 @@ TARGET=""; UNIT_DIR=""; SC=""; WANTED_BY="multi-user.target"
 # itself. A directory OUTSIDE every systemd tree (a hermetic test fixture under `$TMPDIR`) is always
 # allowed: nothing boots it.
 canon_dir() { # <dir> — the resolved spelling (symlinks, `//`, and trailing slashes collapsed)
-    local d="${1:-}"
+    local d="${1:-}" par base
     [ -n "$d" ] || return 0
-    # `readlink -f` is GNU/busybox: it resolves every component that exists and returns the canonical path
-    # with a not-yet-created leaf kept as-is. Where it is absent, `pwd -P` answers the same question for a
-    # directory that exists; a path that does not exist at all degrades to its slash-stripped spelling.
+    # 1. An EXISTING directory answers physically.
+    if [ -d "$d" ]; then ( cd "$d" 2>/dev/null && pwd -P ) && return 0; fi
+    # 2. A leaf that does not exist yet: resolve its PARENT physically and keep the leaf (re-review P2,
+    # #2666). The first form of this function fell back to the literal when `readlink -f` was unavailable —
+    # and the guard then graded an UNRESOLVED literal while `mkdir -p` followed the symlinked parent, so
+    # `/tmp/alias/system.control` with `/tmp/alias -> /etc/systemd` was admitted and created the directory
+    # INSIDE /etc/systemd. That is the one direction this guard cannot have, so the parent is resolved here
+    # rather than left to `readlink`'s presence.
+    par="$(dirname "$d")"; base="$(basename "$d")"
+    if [ -d "$par" ]; then
+        ( cd "$par" 2>/dev/null && printf '%s/%s\n' "$(pwd -P | sed 's:/*$::')" "$base" ) && return 0
+    fi
+    # 3. `readlink -f` where it exists (resolves a chain whose parent is present).
     if command -v readlink >/dev/null 2>&1 && readlink -f -- "$d" >/dev/null 2>&1; then
         readlink -f -- "$d"; return 0
     fi
-    ( cd "$d" 2>/dev/null && pwd -P ) || printf '%s\n' "${d%/}"
+    # 4. Last resort: the slash-stripped literal.
+    printf '%s\n' "${d%/}"
+}
+unit_dir_under() { # <resolved dir> <root> — true when <dir> IS <root> or inside it (both resolved)
+    local d="${1%/}" r
+    r="$(canon_dir "${2:-}")"
+    [ -n "$r" ] && [ "$r" != "/" ] || return 1
+    case "$d" in "$r"|"$r"/*) return 0 ;; esac
+    return 1
 }
 unit_dir_in_systemd_tree() { # <resolved dir> — a tree one of systemd's managers loads units from
-    local d="${1%/}" h
+    local d="${1%/}" r
     case "$d" in
         /etc/systemd|/etc/systemd/*) return 0 ;;
         /run/systemd|/run/systemd/*) return 0 ;;
@@ -182,9 +211,19 @@ unit_dir_in_systemd_tree() { # <resolved dir> — a tree one of systemd's manage
         /lib/systemd|/lib/systemd/*) return 0 ;;
         /etc/xdg/systemd|/etc/xdg/systemd/*) return 0 ;;
     esac
-    for h in "${HOME:-}" "$(passwd_home "$(id -u)" 2>/dev/null || true)" "$(passwd_home "${SUDO_USER:-}" 2>/dev/null || true)"; do
-        [ -n "$h" ] || continue
-        case "$d" in "${h%/}"/.local/share/systemd|"${h%/}"/.local/share/systemd/*) return 0 ;; esac
+    # ⛔ THE HOME AND XDG ROOTS ARE RESOLVED BEFORE THEY ARE COMPARED (re-review P1, #2666). The candidate is
+    # resolved; comparing it against an UNRESOLVED `${HOME}` re-opened the very hole this fix closes — with
+    # `$HOME` a symlink (`/home/op -> /mnt/data/op`), `$HOME/.local/share/systemd/user` resolved to
+    # `/mnt/data/op/...` and matched no pattern, so a real systemd user unit dir was ADMITTED while the
+    # previous revision refused it. `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME`/`$XDG_RUNTIME_DIR` are real user
+    # manager unit roots too (systemd.unit(5)) and were missing entirely.
+    for r in "${XDG_CONFIG_HOME:-}" "${XDG_DATA_HOME:-}" "${XDG_RUNTIME_DIR:-}"; do
+        [ -n "$r" ] && unit_dir_under "$d" "$r/systemd" && return 0
+    done
+    for r in "${HOME:-}" "$(passwd_home "$(id -u)" 2>/dev/null || true)" "$(passwd_home "${SUDO_USER:-}" 2>/dev/null || true)"; do
+        [ -n "$r" ] || continue
+        unit_dir_under "$d" "$r/.config/systemd" && return 0
+        unit_dir_under "$d" "$r/.local/share/systemd" && return 0
     done
     return 1
 }
