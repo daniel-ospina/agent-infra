@@ -2819,7 +2819,9 @@ function _worktreeDiscardBlock(command: string): string | null {
   // (a framework script, including the mandated rail, unrunnable by a false block) alive on
   // the spellings that go through the other readers.
   const _expRefusalForBody = (scriptPath: string, body: string): string | null =>
-    _isAuditedSanctionedScript(resolve(execCwd, scriptPath)) ? null : _expRefusal(body);
+    _isAuditedSanctionedScript(resolve(execCwd, scriptPath), _sha256OfBody(body))
+      ? null
+      : _expRefusal(body);
 
   // Executable-shebang script (`./undo.sh`, `/tmp/undo.sh`): extractScriptPath
   // only recognises interpreter WORDS (`bash x.sh`), so a directly-executed
@@ -3230,10 +3232,14 @@ function _worktreeDiscardBlock(command: string): string | null {
         sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: p });
       }
       // ⛔ A SANCTIONED script's BODY is AUDITED BYTES, so the #1228 body arm does not
-      // apply to it. That is the exemption's own stated contract ("the exemption skips the
-      // content walk for the WHOLE invocation") and it was honoured for the DISCARD verdict
-      // but NOT for this refusal, which is how the framework's own `gh` shim became
-      // unrunnable: its body carries
+      // apply to it. WHY THE TWO EXEMPTIONS ARE NOT ONE: M4's #1129 arm skips its whole walk
+      // for an audited leaf ("the walk is skipped for the whole invocation"), while M5's
+      // #1139 arm is deliberately SET-scoped ("the SET is dropped, never the command", see
+      // the SCOPE paragraph below) — so M5's exemption was honoured for the DISCARD verdict
+      // and this refusal, re-derived from the SAME audited file inside the same walk,
+      // escaped it. The digest makes the same audited-bytes claim M4 already makes, which is
+      // why it is the key here. How the framework's own `gh` shim became unrunnable: its
+      // body carries
       //     LC_ALL=C grep -qa '<marker>' <(head -c 8192 2>/dev/null < "$1")
       // and `_wtProcessSubExpansion` matches ANY `<(head|tail|cat|…)` whose inner text
       // needs a runtime expansion, so a PROCESS-SUBSTITUTION ARGUMENT to `grep` — not a
@@ -3255,7 +3261,7 @@ function _worktreeDiscardBlock(command: string): string | null {
       // set filter is what drops them), and the nested-script descent below is NOT skipped
       // — the audited-bytes claim is about THIS file only, so whatever its body names is
       // still walked.
-      if (!_isAuditedSanctionedScript(real)) {
+      if (!_isAuditedSanctionedScript(real, _sha256OfBody(content))) {
         // #1228: a script we DID read runs an EXPANDED path — same unreadable-script hole
         // one level down, as a direct operand or as a piped producer; fail closed before the
         // walk silently skips it.
@@ -3294,7 +3300,7 @@ function _worktreeDiscardBlock(command: string): string | null {
         // sanctioned script reached through the command-position queue must not be gated by
         // a rule its sibling walk already exempts it from). The nested-script push below is
         // NOT skipped, for the same reason.
-        if (!_isAuditedSanctionedScript(real)) {
+        if (!_isAuditedSanctionedScript(real, _sha256OfBody(content))) {
           const expNested = _expRefusal(content);
           if (expNested) return expNested;
         }
@@ -4056,15 +4062,26 @@ const _frameworkRoot: string | null = (() => {
  *  #1228 fail-open (silent destruction of other sessions' uncommitted work) that this
  *  helper's digest check keeps shut.
  *
- *  Both arms are considered, because both anchors were already trusted to skip the whole
- *  content walk for a sanctioned leaf; the digest then narrows BOTH to the shipped bytes. */
-function _isAuditedSanctionedScript(resolved: string): boolean {
+ *  Both arms are considered, because both anchors were already trusted by their own
+ *  callers; the digest then narrows BOTH to the shipped bytes.
+ *
+ *  ⛔ `bodyDigest` EXISTS BECAUSE OF A TOCTOU, not for tidiness: the callers below hold a
+ *  body they ALREADY READ (`readFileSync(real, "utf8")`), and comparing a digest re-read
+ *  from the same path pairs "the body I judged" with "the bytes I hashed" only if nothing
+ *  writes the file in between — and an agent may run a writer concurrently. Hashing the
+ *  bytes in hand makes the pairing true by construction. This mirrors the pin's own reason
+ *  for being read at load (`_sanctionedScriptPin`): any read that happens AFTER the process
+ *  started is a read an agent can influence. Callers that hold no body (the two walks pass
+ *  the text they just read, so they pass it too) fall back to the disk read. */
+function _isAuditedSanctionedScript(resolved: string, bodyDigest?: string | null): boolean {
   let real: string;
   try { real = realpathSync(resolved); } catch { return false; }
   const sa = _sanctionedScriptExemption(real);
   if (sa === null) return false;
   const want = _sanctionedScriptPin().sha256[sa.rel];
-  return typeof want === "string" && want.length === 64 && _sha256Of(real) === want;
+  if (typeof want !== "string" || want.length !== 64) return false;
+  const got = bodyDigest === undefined ? _sha256Of(real) : bodyDigest;
+  return got !== null && got === want;
 }
 
 function _sanctionedScriptExemption(resolvedScript: string): { rel: string; via: "module-root" | "identity" } | null {
@@ -4135,6 +4152,12 @@ function _delegationClosurePinned(root: string, delegates: Record<string, string
 
 /** sha256 of a file, or null when it cannot be read (callers compare against a
  *  digest, so null never equals one — the fail-closed direction). */
+/** sha256 of the IN-MEMORY body a caller already holds — the TOCTOU-free form for a
+ *  decision about specific bytes (see `_isAuditedSanctionedScript`'s `bodyDigest`). */
+function _sha256OfBody(body: string): string {
+  return createHash("sha256").update(body, "utf8").digest("hex");
+}
+
 function _sha256Of(path: string): string | null {
   try {
     return createHash("sha256").update(readFileSync(path)).digest("hex");

@@ -425,8 +425,8 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     // stand-down rests on a path an agent can reproduce — which is the fail-open it replaced.
     const M6 = {
       name: "M6 body-arm-digest-dropped",
-      from: 'return typeof want === "string" && want.length === 64 && _sha256Of(real) === want;',
-      to: 'return typeof want === "string" && want.length === 64; // MUTATION M6: the body-arm digest dropped',
+      from: 'return got !== null && got === want;',
+      to: 'return true; // MUTATION M6: the body-arm digest dropped — the anchor alone grants',
     };
     const m6 = await loadGuard(join(work, "mut-m6"), M6);
     if (m6) {
