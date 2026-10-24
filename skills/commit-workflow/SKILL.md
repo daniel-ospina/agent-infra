@@ -96,10 +96,11 @@ escalation is exhausted (per the `code-review` skill, Step 6.5 Orchestrator Esca
 Two Pi extensions enforce the quality gates below. Neither is a blanket tier rule — each has its own scoping mechanism, and neither is bypassed for code-bearing sets:
 
 ### Review Enforcer (`review-enforcer`)
-Blocks `git commit/push` and `gh pr create/merge` unless ≥1 sub-agent was dispatched this session (the `task` tool or the specialized-agent `subagent` tool — any dispatch counts).
+Blocks `git commit/push` and `gh pr create/merge` unless ONE of two signals is positively read: ≥1 sub-agent dispatched this session (the `task` tool or the specialized-agent `subagent` tool — any dispatch counts), **or** a review record bound to the EXACT head the op would publish (`~/.pi/agent/reviews/<owner>-<repo>-<PR>.json`, `head_sha` == the pushed commit, verdict accepted — #2471).
 
-- **Scope:** **uniform ≥1-dispatch block — every tier (micro, standard, complex, unknown/unlabeled) blocks at 0 dispatches (#485)** — see the REVIEW-ENFORCER-TIER-RULE fence in `workflow/01-preflight.md` (machine-read; drift-pinned to `TIER_RULE` in `extensions/review-enforcer/index.ts`)
-- **What it wants:** ≥1 sub-agent dispatch before any git op
+- **Scope:** **uniform block — every tier (micro, standard, complex, unknown/unlabeled) blocks when neither signal is present (#485)** — see the REVIEW-ENFORCER-TIER-RULE fence in `workflow/01-preflight.md` (machine-read; drift-pinned to `TIER_RULE` in `extensions/review-enforcer/index.ts`)
+- **The record arm cannot weaken it:** it allows only when the record binds the exact commit and its verdict passes the same binding as `check-pipeline-compliance.sh` check (c) (`clean-micro` needs a `complexity:micro` issue; `clean-low` needs the producer's merge-base + diff-digest bindings). A different head, a different repo, a corrupt file, or an op that cannot be attributed to ONE commit (`--all`/glob/delete push, unattributable `cd`) blocks exactly as before — and a record bound to this head with a verdict the gate does NOT accept blocks even when the session dispatched (strictest wins).
+- **What it wants:** ≥1 sub-agent dispatch before any git op, OR a push of a head whose review is already recorded at that sha
 - **What to do:** Dispatch a reviewer sub-agent that returns a verdict on the diff — even a one-line reviewer must state whether the diff is sound ("NO ISSUES FOUND" or a list of issues), however small the diff. The ≥1-dispatch floor is content-free by design (#485 F2) — it counts the dispatch, not the verdict — but the reviewer you dispatch is expected to review, not to rubber-stamp. Code-bearing sets satisfy the floor via VGATE's own [VGATE] verification dispatch, whose PASS is the code-set equivalent of a returned verdict; docs-only sets dispatch a lightweight reviewer naming the diff and returning its verdict.
 - **Bypass:** `AGENT_SKIP_REVIEW_GATE=1` (emergency only)
 
