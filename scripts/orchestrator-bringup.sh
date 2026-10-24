@@ -932,7 +932,12 @@ start_cell() {
     # and the real cause (apply failed) is never stated. Measured by review of #1856.
     refuse "the harness could not be pinned to ${HARNESS_REF:-the configured ref} in ${HARNESS_REPO:-this checkout} (see the apply output above) — no controller was started"
   fi
-  if ! bash "$SUPERVISOR" start; then
+  # ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THIS CALLER IS NOT THE SERVICE MANAGER (review P1 round 18,
+  # #2402). The unit exports `ORCH_FOREGROUND=1`, and a bring-up run from a lane shell inherits it through the
+  # tmux server the controller created; without this pin the exec branch fires and `exec`s the loop INSIDE
+  # this process — outside the unit's cgroup, so `systemctl stop` cannot end it, and the registry entry below
+  # is never recorded because the process was replaced. `harness-up` carries the same fence.
+  if ! env ORCH_FOREGROUND=0 bash "$SUPERVISOR" start; then
     refuse "cloud-cell-supervisor.sh start failed (see its output above) — no registry entry was recorded"
   fi
   STARTED_PID="$(await_pid roster_pid_from_status)"

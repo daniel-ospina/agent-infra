@@ -11,14 +11,18 @@
 #   1. lists the FAILING check runs for a selector (a PR head, a commit, or the
 #      last N runs on main);
 #   2. fetches each failing run's failed-step log (`gh run view --log-failed`);
-#   3. extracts `FAILED <nodeid>` lines AND attributable GUARD-STEP failures
+#   3. extracts `FAILED <nodeid>` lines, attributable GUARD-STEP failures
 #      (#4469 — a substantive GitHub Actions error annotation in a step the
 #      RUNNER marked failed, when the run's ROOT failing step also yields an
-#      identity and no step showed an UNCLASSIFIED pytest failure), and emits a
-#      sorted, unique, one-identity-per-line set.
+#      identity and no step showed an UNCLASSIFIED pytest failure), the other
+#      NON-NODEID families (#6798/#7131), JS/TS RUNNER aggregates, and
+#      `check-pipeline-compliance.sh` gate failures (#1185 — `❌ [<letter>] …`,
+#      keyed on the check letter plus the subject its first clause names), and
+#      emits a sorted, unique, one-identity-per-line set.
 #
-# Guard-step attribution exists so a guard failure is COMPARED against main like a
-# test nodeid instead of tripping the caller's fail-closed refusal. The refusal is
+# Guard-step and gate attribution exist so a non-pytest failure is COMPARED
+# against main like a test nodeid instead of tripping the caller's fail-closed
+# refusal. The refusal is
 # NOT weakened: the runner's own `Process completed with exit code <N>.` is never
 # an identity, an annotation from a step that did not fail the run is never one, a
 # sibling annotation may not stand in for an unparseable ROOT failure, and a step
@@ -129,8 +133,9 @@
 #
 # Exit codes:
 #   0  extracted (the set may legitimately be EMPTY — no failing runs, or
-#      failing runs whose failures carry no parseable identity: neither a
-#      `FAILED <nodeid>` line nor an attributable guard-step annotation)
+#      failing runs whose failures carry no parseable identity: none of a
+#      `FAILED <nodeid>` line, an attributable guard-step annotation, or a
+#      `❌ [<letter>]` gate line)
 #   1  the extraction itself failed (gh error, unreadable log) — the caller MUST
 #      treat this as "cannot certify", never as "no unique failures". A rail
 #      that reads an extraction error as an empty set is vacuously green.
@@ -165,7 +170,8 @@
 #              below — the SELECTION is corrected, so every counter reads it)
 #   extracted  failing runs that yielded at least one failure identity — a
 #              `FAILED <nodeid>` line OR (since #4469) an attributable guard-step
-#              error annotation from the run's ROOT failing step
+#              error annotation from the run's ROOT failing step, OR (since #1185)
+#              a `check-pipeline-compliance.sh` `❌ [<letter>] …` gate line
 #   completed  lane runs that FINISHED (any conclusion)
 #   tested     of `completed`, the runs that actually EXERCISED the code:
 #              `success`, `failure`, `timed_out`. NOT `cancelled`/`skipped`

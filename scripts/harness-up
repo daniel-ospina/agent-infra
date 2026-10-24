@@ -1639,7 +1639,13 @@ hu_start_loop() {
     *) warn "gh: could not be verified ($(hu_bound_explain "$gh_rc" "${HU_GH_TIMEOUT:-20}")) — not treated as authenticated, and not as absent" ;;
   esac
   [ -f "$SELF_PATH/orchestrator-bringup.sh" ] || { warn "loop: no orchestrator-bringup.sh beside $SELF — cannot start the controller this way"; return 1; }
-  hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" start >"$HU_TMP/loop.log" 2>&1; rc=$?
+  # ⛔ `ORCH_FOREGROUND=0` IS PINNED, NOT INHERITED (review P2 round 17, #2402). A service-managed
+  # controller exports `ORCH_FOREGROUND=1` into its WHOLE process tree, and a tmux server that controller
+  # started carries it into every lane shell — so this delegation, run from such a shell, would take
+  # `start`'s FOREGROUND branch, `exec` the loop inside the CALLER and leave the enabled unit unsupervised
+  # (the surface reads supervised while the controller dies with the shell). The value describes the
+  # CALLER, so the caller pins it.
+  ORCH_FOREGROUND=0 hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" start >"$HU_TMP/loop.log" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/loop.log" | tail -n 40
   if [ "$rc" -eq 0 ]; then say "loop: ok"; return 0; fi
   warn "loop: start failed ($(hu_bound_explain "$rc" "$BOUND")) — see the output above"
@@ -1653,7 +1659,9 @@ hu_start_supervisor() {
   if [ "$PLATFORM" != "cell" ]; then say "supervisor: SKIPPED (no cell supervisor on macOS; launchd owns the controller)"; return 0; fi
   if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$sess" 2>/dev/null; then say "supervisor: ok (session '$sess' is up)"; return 0; fi
   [ -f "$SELF_PATH/cloud-cell-supervisor.sh" ] || { warn "supervisor: no cloud-cell-supervisor.sh beside $SELF, and no session '$sess'"; return 1; }
-  hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" start >"$HU_TMP/sup.log" 2>&1; rc=$?
+  # ⛔ same inheritance fence as the loop arm above (review P2 round 17, #2402): inside a service-managed
+  # controller's tree, an inherited `ORCH_FOREGROUND=1` would re-parent the controller into THIS shell.
+  ORCH_FOREGROUND=0 hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" start >"$HU_TMP/sup.log" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/sup.log" | tail -n 30
   [ "$rc" -eq 0 ] || { warn "supervisor: start failed ($(hu_bound_explain "$rc" "$BOUND"))"; return 1; }
   say "supervisor: ok"; return 0
