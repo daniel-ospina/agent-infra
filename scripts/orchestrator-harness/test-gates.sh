@@ -1447,6 +1447,11 @@ FAKE
     grep -E '^is_num\(\) \{' "$ORCH"
     sed -n '/^file_mtime_epoch() {/,/^}/p' "$ORCH"
     sed -n '/^mp_recent_land() {/,/^}/p' "$ORCH"
+    # ⛔ THE LABEL HELPER BELONGS HERE TOO (review 3-P2): the shipped stall arm derives its
+    # `drain=<label>` from `drain_stall_label`. A harness that extracted the block without it got a
+    # 127 inside the substitution and an empty label, so every driven arm read UNMEASURED while the
+    # shipped code was correct — the unextracted-helper trap, in the other direction.
+    sed -n '/^drain_stall_label() {/,/^}/p' "$ORCH"
   } > "$TMP/drain_helpers.sh"
   DO="$TMP/drainO"; mkdir -p "$DO/state"
   _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN] [PRDISP_SPAWNS] [PRDISP_TOP]
@@ -1626,6 +1631,68 @@ PYEOF
   else
     echo "  ❌ drain_stall_token() is missing — the escalation can be silent again"; FAIL=$((FAIL+1))
   fi
+  # ── THE TOKEN DERIVES ITS LABEL, SO THE LOG AND THE ARTIFACT AGREE (review 3-P2) ─────────────
+  # `_esc` hard-coded "carries drain=DEADLOCK" in BOTH stall arms, so a STALLED pass (spawns=4)
+  # promised a DEADLOCK token that `drain_stall_label` would never print. Pin the derivation, not a
+  # hard-coded token: the log line must interpolate the label the status token reads.
+  wpin "the escalation names the label its own marker yields (never a hard-coded DEADLOCK)" "$ORCH" \
+       '_escl="$(drain_stall_label)"'
+  if grep -qF 'carries drain=DEADLOCK until a PR lands' "$ORCH"; then
+    echo "  ❌ a hard-coded drain=DEADLOCK survives in the escalation — the STALLED arm would name a token that is not there"; FAIL=$((FAIL+1))
+  else
+    echo "  ok the escalation interpolates the derived label (no hard-coded DEADLOCK)"; PASS=$((PASS+1))
+  fi
+  # ── AN UNMEASURED SPAWN COUNT CARRIES NO POSITIVE DIAGNOSIS (review 2-P2) ──────────────────
+  # "the workers run and nothing lands" is a claim ABOUT SPAWNS. On an UNMEASURED count the STALLED
+  # arm must not print it — that is the claim-without-a-measurement defect sign-reversed.
+  _u="$(_drain 200 180 '')"   # PRDISP_SPAWNS set-but-empty => UNMEASURED
+  case "$_u" in
+    *"the workers run"*) echo "  ❌ an UNMEASURED spawn count still asserted 'the workers run': $_u"; FAIL=$((FAIL+1)) ;;
+    *"cannot say whether any worker was started"*) echo "  ok an UNMEASURED count says so instead of asserting the workers run"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the UNMEASURED stall arm produced no honest tail: $_u"; FAIL=$((FAIL+1)) ;;
+  esac
+  # …while a MEASURED positive still gets the land-problem diagnosis.
+  _p="$(_drain 200 180 4)"
+  case "$_p" in
+    *"the workers run and nothing lands"*) echo "  ok a MEASURED positive count keeps the land-problem diagnosis"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a measured positive count lost its land-problem diagnosis: $_p"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ── THE MARKER CANNOT OUTLIVE THE DRAIN (review 1-P1, the stale-flag class) ────────────────
+  # The whole drain-health block is gated on `LO_CHOICE=pr`, so its "drain alive" clear never runs
+  # once the last un-owned PR is merged by a PEER box: `drain_stall_token` kept printing
+  # `drain=DEADLOCK(passes=7,unowned=9,…)` forever — a false deadlock, and a false deadlock is how an
+  # operator learns to ignore a real one. DRIVEN, not pinned: the block is extracted by its markers.
+  _CLEAR_BLOCK="$(sed -n '/^ *# \[drain-clear:begin\]/,/^ *# \[drain-clear:end\]/p' "$ORCH")"
+  if grep -q 'drain-stall' <<<"$_CLEAR_BLOCK"; then
+    echo "  ok the drain-clear block was extracted from the controller"; PASS=$((PASS+1))
+  else
+    echo "  ❌ could not extract the drain-clear block (markers moved?) — the marker can go stale again"; FAIL=$((FAIL+1))
+  fi
+  _clearcase() { # _clearcase <UPN_WORK>  -> 'gone' | 'present'
+    ( set -u
+      O="$DO"; mkdir -p "$DO/state"
+      printf 'at=%s\npasses=7\nage=240\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+      UPN_WORK="$1"
+      eval "$_CLEAR_BLOCK"
+      [ -e "$DO/state/drain-stall" ] && echo present || echo gone )
+  }
+  _c="$(_clearcase 0)";  [ "$_c" = "gone" ] \
+    && { echo "  ok a measured ZERO un-owned PRs clears the escalation marker (no false DEADLOCK survives the drain)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a measured zero un-owned PR left the marker behind — the status line keeps lying: $_c"; FAIL=$((FAIL+1)); }
+  _c="$(_clearcase 9)";  [ "$_c" = "present" ] \
+    && { echo "  ok un-owned PRs REMAIN => the marker is kept (the drain is still stalled)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a still-stalled drain lost its marker: $_c"; FAIL=$((FAIL+1)); }
+  # ⛔ FAIL-CLOSED: an UNREADABLE count is not "no un-owned PRs" and must never clear the escalation.
+  _c="$(_clearcase '?')"; [ "$_c" = "present" ] \
+    && { echo "  ok an UNREADABLE un-owned count does NOT clear the marker (fail-closed, not fail-open)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ an unreadable un-owned count cleared the escalation — a fail-open clear: $_c"; FAIL=$((FAIL+1)); }
+  rm -f "$DO/state/drain-stall"
+  # ── THE FUNNEL IS ACTUALLY HANDED THE SPAWN COUNT (review 7-P2) ─────────────────────────────
+  # `lo_select` and `spawns_since` are each driven in isolation, so deleting the 11th argument at the
+  # SHIPPED call site would keep every suite green while the funnel silently reverted to the
+  # pre-#2590 acted-based wording — the exact regression this change removes.
+  wpin "the funnel is handed the PR sweep's spawn count (the 11th argument is wired)" "$ORCH" \
+       '"${PRDISP_REC:-unknown}" "${PRDISP_SPAWNS:-}"'
   # ⛔ A FUTURE LAND STAMP IS UNMEASURABLE, NOT A FRESH LAND (review cycle 3, P2). `find -mmin -N`
   # passes a future-stamped file, so clamping the negative age to 0 rendered a clock step-back as
   # "drain alive" — and after the release valve was removed this line is a stall's only signal.
@@ -1708,6 +1775,8 @@ PYEOF
   # landing* into *dispatch more issues*, which hides the stall behind fresh activity. The PR queue IS
   # the work, so the correct response to "nothing has landed in 4h" is to say so beside the gate.
   wpin "a long stall is NAMED beside the gate it explains" "$ORCH" '[dispatch] DRAIN STALLED — no PR merged in ${_lage}m'
+  wpin "the PR sweep's terminal line is SCOPED to the PR sweep (issue lanes are spawned later)" "$ORCH" \
+       'the PR sweep started no worker this pass'
   # ⛔ ABSENCE PIN against the release arm returning: no function here may take an AGE and return
   # "not held". `mp_reason`'s arguments are inputs to a HOLD; nothing in the selection path may read a
   # land age to decide that the gate should stop holding.

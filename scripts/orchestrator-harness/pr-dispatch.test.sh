@@ -886,14 +886,14 @@ if [ -s "$TMP/sum.sh" ] && [ -s "$TMP/spawns.sh" ]; then
   }
   _got="$(_sp "$BASE")"; _c="$(cat "$TMP/sp.out" 2>/dev/null)"
   case "$_got" in
-    "[spawn] SPAWNED 2 worker(s) this pass: fix-12,merge-11"*) ok "a pass that started workers SAYS so, and names them" ;;
+    "[spawn] SPAWNED 2 worker(s) in this pass's PR sweep: fix-12,merge-11"*) ok "a pass that started workers SAYS so, and names them" ;;
     *) bad "the [spawn] line did not name the workers this pass started: '$_got'" ;;
   esac
   if [ "$_c" = "2" ]; then ok "…and the count the funnel and the drain guard read is set to it"
   else bad "PRDISP_SPAWNS was '$_c' after a 2-spawn pass"; fi
   _got="$(_sp "$((BASE + 100))")"; _c="$(cat "$TMP/sp.out" 2>/dev/null)"
   case "$_got" in
-    "[spawn] NONE"*"no worker was started by this pass"*) ok "a pass that started NOTHING says NONE — and says acts may still exist" ;;
+    "[spawn] NONE"*"the PR sweep started no worker this pass"*) ok "a pass that started NOTHING says NONE — and says acts may still exist" ;;
     *) bad "a zero-spawn pass did not say NONE: '$_got'" ;;
   esac
   if [ "$_c" = "0" ]; then ok "…and the count is a MEASURED 0, so the funnel cannot borrow the word 'dispatch'"

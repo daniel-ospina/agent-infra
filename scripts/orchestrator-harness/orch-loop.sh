@@ -4427,13 +4427,19 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
   _spn="${_spl%%	*}"; _spt="${_spl#*	}"
   [ "$_spt" = "$_spl" ] && _spt=""
   if ! is_num "${_spn:-}"; then
-    echo "[spawn] UNMEASURED — this pass cannot say what it started (state/ cannot be enumerated or the cycle clock is unreadable), so the ${PRDISP_ACTS:-?} act row(s) below are actions, NOT spawns; do not read them as work in flight" >>"$LOG"
+    # ⛔ THIS MEASUREMENT IS SCOPED TO THE PR SWEEP, AND THE LINE SAYS SO (review 4-P2). The sample is
+    # taken in the [prsum] block, but the ISSUE lanes are spawned later (dispatch-merge.sh -> wt_spawn).
+    # An unscoped "no worker was started by this pass" was therefore FALSE on every issue-dispatching
+    # pass — it printed NONE and then the lanes landed — which is the same acted-vs-spawned lie this
+    # change exists to delete, on the one question the issue asks.
+    echo "[spawn] UNMEASURED — this pass cannot say what its PR sweep started (state/ cannot be enumerated or the cycle clock is unreadable), so the ${PRDISP_ACTS:-?} act row(s) below are actions, NOT spawns; do not read them as work in flight" >>"$LOG"
   elif [ "$_spn" -gt 0 ]; then
     PRDISP_SPAWNS="$_spn"; PRDISP_SPAWN_TAGS="$_spt"
-    echo "[spawn] SPAWNED $_spn worker(s) this pass: ${_spt:--} (each is a state/worker-<tag> record wt_spawn wrote at created>=${CYCLE_T0:-0}; the tag is the handle the census, the caps and the reaper use)" >>"$LOG"
+    echo "[spawn] SPAWNED $_spn worker(s) in this pass's PR sweep: ${_spt:--} (each is a state/worker-<tag> record wt_spawn wrote at created>=${CYCLE_T0:-0}; the tag is the handle the census, the caps and the reaper use)" >>"$LOG"
   else
-    PRDISP_SPAWNS=0
-    echo "[spawn] NONE — no worker was started by this pass (0 state/worker-* records with created>=${CYCLE_T0:-0}); ${PRDISP_ACTS:-0} act row(s) may still exist — an arm, a rerun or a draft-ready — and those start nothing" >>"$LOG"
+    # A measured 0 owns `none`; UNMEASURED must not also claim it (review 6-P2).
+    PRDISP_SPAWNS=0; PRDISP_SPAWN_TAGS="none"
+    echo "[spawn] NONE — the PR sweep started no worker this pass (0 state/worker-* records with created>=${CYCLE_T0:-0}); ${PRDISP_ACTS:-0} act row(s) may still exist — an arm, a rerun or a draft-ready — and those start nothing. Issue lanes, if any are dispatched below, are NOT counted here" >>"$LOG"
   fi
   # ⛔ THE POPULATION CAVEAT IS NOT OPTIONAL. `OPEN_ROWS` is the only enumerable list of the COUNTED
   # set; without it (GraphQL failed and `open_pr_count` deleted its rows, or the fallback fired) the
@@ -4773,7 +4779,13 @@ PY
         if printf 'at=%s\npasses=%s\nage=%s\nunowned=%s\nspawns=%s\nacts=%s\n' \
              "$(date +%s)" "$_dpass" "$_lage" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
              > "$O/state/drain-stall" 2>/dev/null; then
-          _esc="ESCALATED -> state/drain-stall (pass ${_dpass}); the cycle status line now carries drain=DEADLOCK until a PR lands"
+          # ⛔ THE LABEL IS DERIVED, NOT HARD-CODED (review 3-P2). A STALLED pass records `spawns=4`
+          # and `drain_stall_label` then prints STALLED, so promising "drain=DEADLOCK" here told the
+          # operator to expect a token that is not there — the label drift the "one definition, two
+          # readers" contract at drain_stall_label() exists to prevent. Computed on the SUCCESS path
+          # only: a failed write must keep the COULD-NOT-RECORD message, not an ESCALATED one.
+          _escl="$(drain_stall_label)"; [ -n "${_escl:-}" ] || _escl="UNMEASURED"
+          _esc="ESCALATED -> state/drain-stall (pass ${_dpass}); the cycle status line now carries drain=${_escl} until a PR lands"
         else
           _esc="ESCALATION COULD NOT BE RECORDED (state/ is unwritable) — this line is the only trace"
         fi
@@ -4794,7 +4806,15 @@ PY
         if [ "${_spk:-}" = "0" ]; then
           echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}." >> "$LOG"
         else
-          echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain, and this pass ${_spn_txt}${_whysrc} — the workers run and nothing lands, which is a LAND problem, not an idle one. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work. ${_esc}." >> "$LOG"
+          # ⛔ AN UNMEASURED COUNT MUST NOT CARRY A POSITIVE DIAGNOSIS (review 2-P2). "the workers run
+          # and nothing lands" is a claim ABOUT SPAWNS, and the UNMEASURED arm did not measure them —
+          # the same claim-without-a-measurement defect this change deletes, sign-reversed.
+          if is_num "${_spk:-}"; then
+            _spn_tail="the workers run and nothing lands, which is a LAND problem, not an idle one"
+          else
+            _spn_tail="this pass cannot say whether any worker was started — the LAND problem is measured, the spawn reading is not"
+          fi
+          echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain, and this pass ${_spn_txt}${_whysrc} — ${_spn_tail}. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work. ${_esc}." >> "$LOG"
         fi
       else
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
@@ -4805,6 +4825,21 @@ PY
       echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work." >> "$LOG"
     fi
     # [drain-health:end]
+  else
+    # [drain-clear:begin] (extracted and DRIVEN by test-gates.sh — keep the marker)
+    # ⛔ THE MARKER MUST NOT OUTLIVE ITS CONDITION WHEN THE DRAIN ENDS (review 1-P1). This whole
+    # block runs ONLY while `LO_CHOICE=pr`, and it holds the only unlock-keyed clear — so a box that
+    # stalled (marker written, `unowned=9`) and then saw those rows merged by a PEER box fell to
+    # `LO_CHOICE=issue` with nothing to delete the marker: `drain_stall_token` runs on EVERY cycle and
+    # keeps printing `drain=DEADLOCK(passes=7,unowned=9,…)` on the status line forever, with a count
+    # that is no longer true and an age that only grows. That is exactly the stale-flag class this
+    # escalation's own comment claims to eliminate, and a false DEADLOCK is how an operator learns to
+    # ignore a real one. Clear it on a MEASURED zero, and only then: an unreadable UPN_WORK is not
+    # "no un-owned PRs" and must leave the marker alone (fail-closed).
+    if is_num "${UPN_WORK:-}" && [ "$UPN_WORK" -eq 0 ]; then
+      rm -f "$O/state/drain-stall" 2>/dev/null || true
+    fi
+    # [drain-clear:end]
   fi
   # The printed decision is AUTHORITATIVE over the issue path: if the funnel did not choose issue
   # work, nothing opens a lane for an issue, even if every capacity gate below happens to pass.
@@ -5212,13 +5247,19 @@ PY
     _cr_drain="${LO_CHOICE:-none}"
     if [ "${LO_CHOICE:-none}" = "pr" ]; then
       _cr_drain="$(drain_stall_label)"; [ -n "$_cr_drain" ] || _cr_drain="draining"
+      # ⛔ ONE FIELD SAYING "NOT MEASURED" AND THE NEXT SAYING "NONE EXISTED" IS A LIE IN A RECORD
+      # (review 6-P2). On an UNMEASURED pass `PRDISP_SPAWN_TAGS` is empty, and the old
+      # `${PRDISP_SPAWN_TAGS:-none}` wrote `spawned_pr=UNMEASURED spawn_tags=none` — the second field
+      # asserting an absence nobody measured. Only a MEASURED zero owns `none`.
+      _cr_tags="${PRDISP_SPAWN_TAGS:-}"
+      [ -n "$_cr_tags" ] || { [ -n "${PRDISP_SPAWNS:-}" ] && _cr_tags="none" || _cr_tags="UNMEASURED"; }
     fi
     cycle_record_write "$O" \
       start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
       selected="$_cr_sel" selected_n="${SEL_TOTAL:-0}" dispatched="${K:-0}" ids="${_cr_ids:--}" \
       nothing="$_cr_nothing" placement="${CAP_STATE:-unavailable}" placed_on="${CAP_PLACE:-none}" \
       bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
-      spawned_pr="${PRDISP_SPAWNS:-UNMEASURED}" spawn_tags="${PRDISP_SPAWN_TAGS:-none}" \
+      spawned_pr="${PRDISP_SPAWNS:-UNMEASURED}" spawn_tags="$_cr_tags" \
       drain="$_cr_drain" \
       || echo "[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable or the module is absent) — an absent record is NOT a healthy box: harness status reads it ABSENT/DEGRADED" >> "$LOG"
   else
