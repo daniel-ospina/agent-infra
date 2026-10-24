@@ -163,24 +163,77 @@ The mirror failure is real too: a working child was once declared `wedged` with
 > classifier forks it. Adding a second identity probe anywhere is the "two contracts for one
 > safety rule" defect #1178 exists to remove.
 
-**Three consumers, still one rule.** `scripts/lane-watchdog.py` (the wedge reaper) forks the same
+**Four consumers, still one rule.** `scripts/lane-watchdog.py` (the wedge reaper) forks the same
 CLI **at signal time**, immediately before each `os.kill`: it supplies the incarnation it recorded
 when it measured the subtree, and signals only on `holder`. It derives no identity of its own — an
 earlier version signalled by pid alone, which is the superseded form recorded in §6.
+
+**A fourth consumer: the `pi` POOL's owner** (`scripts/orphan-reap.py --pool pi`, 2026-10-22). The
+`ppid=1` orphan class above could not see a lane's `pi` at all — bare argv, reparented to launchd
+or sitting under tmux — so the session pool had no owner and grew without bound. That reaper
+derives the session **from the pid** (the JSONL whose name-stamp is within the canon's
+`FENCE_TOLERANCE_SECONDS` of `now - etime`; an argv `--session` form is left to
+`scripts/lib/pid-identity.sh`, never re-parsed), then calls **`liveness.gather`** — so the store is
+read and its vetoes apply — appends the live pid it is holding as a `HOLDER` candidate (the C2
+direction), and acts **only** when `evaluate` returns `idle`. ⛔ **And in the shipped default it
+does not act AT ALL**: the canon verdict is necessary, not sufficient. The chain must also pass the
+recorded HOST DECISION (§`#1207`, owner-approved as option A on `#1297`): a human terminal or
+login shell is `KEEP-HUMAN`, and a chain that is **unparseable OR carries no host app at all** is
+`unknown` — *report only, never reap*. A `pi` reparented to launchd has no ancestry left to show a
+host, which is exactly this pool's target population, so its reapable set is **empty by decision**:
+the census ships, arming it is a reopen (one named constant), never a flag flip. Three process
+gates sit in front of
+that verdict — CPU delta < 0.10 s over the printed window, ancestry walked to the top (a
+Terminal/iTerm/login-shell/tmux ancestor is `KEEP-HUMAN`), and progress judged against the
+process's **own** median inter-entry gap (age ≥ max(`IDLE_MS`, 100× the gap)) — and the four
+reported states are `LIVE`, `PARKED-REAPABLE`, `KEEP-HUMAN`, `UNVERIFIABLE`. Its declared blind
+spots are the ones §1 leaves it: a `pi` that leaves no bindable session file (a print-mode / `task`
+child, or a resumed session keeping its original name-stamp) has **no progress channel**, so one
+of the three gates cannot be evaluated on it — a PARKED one abstains as `UNVERIFIABLE`
+(`no-progress-channel:<binding>`), never as "nothing to reap", while a BUSY one still reads `LIVE`
+off gate 1 (the CPU delta). That asymmetry is deliberate, not a gap: `PARKED-REAPABLE` is only
+reachable by a row that HAS a transcript (the abstention on a missing one sits on the same path),
+so nothing is reaped either way, and collapsing a busy unbound lane into an abstention would
+destroy the census's one diagnostic job — telling progress from parked. The guarantee is the
+abstention on the PARKED row, not a promise that an unbound row can never read `LIVE`. A **second**
+declared blind spot is the SWITCHED session (`/new`, `/fork`, `/clone`): pi writes a fresh stamped
+file and leaves the abandoned one behind, so the fence binds the dead transcript and the row can
+read `PARKED-REAPABLE` for a lane that was writing seconds ago — masked to `UNVERIFIABLE` under the
+shipped host decision, and a wrong kill only where that decision is reopened (#2475). A **third** is
+the HOST ALLOWLIST: an interactive host that is not listed in `HUMAN` is invisible to gate 2
+(WezTerm/Ghostty/Zed are covered; a VS Code `Code Helper` cannot be matched at all, because
+`ps -Ao comm=` is space-split, so such a session is caught only through a shell/terminal ancestor,
+or not at all). That list is an allowlist of owners, so a NEW host is a real gap rather than a bug.
+On a box where the hook store is unreadable every
+row that **reaches** the canon abstains as `store-unreadable`, because that is what §1 requires of
+the verdict it consumes — a row under a terminal/login-shell/tmux ancestor is `KEEP-HUMAN` from
+gate 2 **before** the canon verdict is consulted and so does not abstain (the canon is still read;
+gate 2 supersedes its answer). The safe property holds either way — nothing is reaped — but
+`counts.UNVERIFIABLE == pool size` is **not** a store-health probe, and 0 UNVERIFIABLE does not
+mean the store was readable. Beyond those three, the pool inherits §1's remaining blind spots
+verbatim: a same-fence start in the same cwd (`ambiguous-binding`), another uid's processes (the
+pid-side cwd filter is skipped and `binding_detail` shows it), memory/fd pressure, and a live child
+of a parked parent it does not enumerate — the runtime `declared blind spots:` line prints the same
+list, so the header, the report and this section name one set.
 
 The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
 `scripts/pi-reap-idle.sh`):
 
 1. **Candidates are a UNION.** The candidate set for a session id is the current store record,
-   **every** `priorProcessGenerations` entry, and every pid whose **argv names the session** in a
-   resume form (`pi --session <id>`, `-r <id>`, `--resume <id>`, or `--session=<id>`). The union —
+   **every** `priorProcessGenerations` entry, every pid whose **argv names the session** in a
+   resume form (`pi --session <id>`, `-r <id>`, `--resume <id>`, or `--session=<id>`), and — for
+   the `pi` pool below — the pid that pool's reaper is itself holding (a *positive* observation
+   from a fresh `ps` read; a bare-argv `pi` is invisible to the argv source). The union —
    not the newest, not the first — is what stops a resumed session's stale tag from calling a live
    lane dead. Without the argv source, "the record's incarnation is gone" would be silently
    equated with "the lane is dead".
 
 2. **A pid holds the session its store record names only if the fence matches.** A fresh `ps`
    read must show it present, **not a zombie**, and its `lstart` must be within
-   **±`FENCE_TOLERANCE_SECONDS`** (default 3 s) of the recorded `pidStartSeconds`. The fence
+   **±`FENCE_TOLERANCE_SECONDS`** (default 3 s) of the recorded `pidStartSeconds`. ⚠️ The `pi`
+   pool below fences against a DIFFERENT datum on the SAME bound: the session JSONL's
+   **name-stamp** (UTC, ms) against `now - etime`. Same tolerance, different evidence — stated
+   here so the two are not read as one reading. The fence
    exists because second-granularity rounding differs by up to ~1 s; its whole purpose is to make
    an identity *uncertainty* fail safe. An unrelated process that inherits a dead session's pid
    fails the fence and is **not** its holder. A pid whose **argv** names the session is a *direct*
@@ -409,7 +462,12 @@ fails without its fix):
 python3 tools/fleet/liveness.test.py               # 24 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
+python3 scripts/orphan-reap.test.py --mutations    # the `pi` pool's gates + the fence-default pin
 ```
+
+The last suite is also the only place the fence default is pinned against
+`scripts/lib/pid-identity.sh` (`fence_matches_canon`), so a change to the identity rule that skips
+it leaves that divergence unpinned.
 
 ---
 
@@ -716,6 +774,21 @@ boundary below is stated rather than implied. It lives in **`scripts/lib/fleet-i
 point — `scripts/orchestrator-bringup.sh` (`check | start | stop | restart | status`), the same script
 that owns the per-`(machine, repo)` redundancy guard. No fourth launcher.
 
+### The same doctrine on the CELL DOCTOR loop (#2306)
+
+`scripts/orchestrator-harness/cloud-cell-doctor.sh status` derives every role row from ONE three-valued
+read of the loop's record — `alive` / `dead:<reason>` / `unknown:<reason>` / `absent:<reason>` — because
+its predecessor answered yes/no, so `return 1` folded "the recorded incarnation is GONE" and "I could
+not read the record" into one no, and the rows ignored it entirely: `loop: NOT RUNNING` printed *beside*
+four `WAITING … 274s ago` rows that quoted the dead loop's start time as if it were progressing. The
+states are this document's, not a new vocabulary — identity decides first and is the only source of
+`dead`; an unreadable read is a NAMED abstention (`UNKNOWN`, exit 3), never a death witness; `absent`
+(no record at all) is neither, because nothing was unreadable *and* there is no incarnation whose death
+could be witnessed. `WAITING` — a promise that something is in progress — is only printed under an
+`alive` loop with a transcript that moved inside the worst-case pass window: a live pid is a process,
+not a scheduler. `DEAD` never falls through to a clean last pass: a dead scheduler means no further
+pass, whatever the last one said.
+
 **`status` prints one table and its exit code is the worst row:**
 
 ```
@@ -741,7 +814,7 @@ the abstention doctrine of §4 applied to this surface: an unreadable read is ne
 | component | predicate |
 |---|---|
 | `controller` | lock owner cross-checked against an `orch-loop.sh` invocation, plus `$O/heartbeat` age (a live pid with a frozen heartbeat is *wedged*, not healthy) |
-| `controller-watchdog` | at least one of the launchd watchdog job / `watchdog-loop.sh` is live, and if the JOB is present its last exit is still read: a failing job is `FAILING` ("the plain loop is still covering, which is why this is not fatal") even though the pair is fine. **The pair is NOT a duplicate**: both invoke the same idempotent `watchdog.sh` (check → load → log → exit), so they cannot disagree about the desired state, and the plain loop is the deliberate stopgap that survives the launchctl being defeated (`watchdog-loop.sh`'s own header; #1976). The row says so in its ACTUAL column ("redundant by design"). `DUPLICATE` is reserved for the same mechanism twice — two `watchdog-loop.sh` processes, which really do run every action twice |
+| `controller-watchdog` | at least one of the launchd watchdog job / `watchdog-loop.sh` is live, and if the JOB is present its last exit is still read: a failing job is `FAILING` ("the plain loop is still covering, which is why this is not fatal") even though the pair is fine. **The pair is NOT a duplicate**, and the reason is not the one this line used to give. Before #2303 BOTH mechanisms ran the same idempotent `watchdog.sh` (check → load → log → exit) and could not disagree about the desired state; the TRACKED launchd job (`com.eldato.controller-watchdog`) now runs `watchdog-loop.sh`, whose restart is a NON-idempotent `launchctl kickstart -k`. What bounds the pair is therefore the SHARED ON-DISK RESTART BUDGET (`$HOME/.pi/agent/state/controller-watchdog.streak`): both runners spend the same cap, so the restarts per episode stay within `MAX_CONSEC` — never a tight loop. ⛔ The one job that COULD disagree — the hand-provisioned `com.eldato.orchestrator-watchdog`, a *different* script (`~/orchestrator/watchdog.sh`) on its own 20 s timer — is listed in `templates/launchd/RETIRED`, so the installer unloads it and **this watchdog's restarts disabled**: the pair is never two mutating watchdogs (see `docs/ops/ACTIVATION-MATRIX.md` row 8). The row says so in its ACTUAL column ("redundant by design"). `DUPLICATE` is reserved for the same mechanism twice — two `watchdog-loop.sh` processes, which really do run every action twice |
 | `heartbeat-loop`, `cadence-timer` | the pid its OWN pidfile names, cross-checked against a process whose argv is that script (a recycled pid is `FAILING`, not alive), plus that loop's **own** freshness signal — and "own" is load-bearing: the cadence timer used to be judged by `orchestrator-heartbeat.log`, which the *heartbeat loop* appends to every pass, so its `LATE` branch could only fire if BOTH loops stopped. It now writes `cadence-timer.beat` per tick, and that beacon is what the row reads. A copy of the script installed **before** the beacon (farmed copies lag the repo) logs `CADENCE-TIMER started pid=…` and no beacon, and the row says so — `LATE`, with the stale copy named and the re-sync named, rather than a permanent red whose reason blames a healthy loop |
 | `pr-doctor`, the reapers | **loaded** in the domain + **last exit 0** + a freshness file within 2× their OWN `StartInterval` (a 6 h reaper is not judged by a 20-min reaper's clock). Between runs `pid` is legitimately `-`, so "pid exists" is the wrong predicate — and "last exit status" is the readable datum nobody was reading. The freshness file is the job's declared `StandardOutPath`/`StandardErrorPath` when it declares one, otherwise **the log the component's own script writes** (the four reaper templates deliberately declare no output path, so for them it is always the own-log) (`pi-reap-worktrees.sh:190`, `cleanup-stale-branches.sh:2411`, and the session reaper's/lane-liveness's own logs). A job with NEITHER is `UNKNOWN`, never `OK` — a job launchd stops scheduling is otherwise indistinguishable from a healthy one |
 | `cell-supervisor` | applicable on a cell ONLY (`SKIPPED` on a Mac with the reason; `UNKNOWN` when the platform is *unset*, because "cannot answer" is not a pass); the process plus its tmux session, because an OOM-killed `cmux-tui` leaves a live supervisor with a gone session. A **cell** is a box that carries a cell's identity that was **provisioned**, not defaulted: an explicit `$STATE/.cell` marker, or a cell home that actually holds one (`keys.env`, `.harness-path`). `bringup` defaults `CELL_HOME=/tmp/cell-home`, so "the variable is set" is not evidence — and the kernel alone certainly is not, since `uname -s = Linux` is what `bringup` maps to `PLATFORM=cell`; keying on either would make every Linux dev box and CI runner permanently red for a supervisor it does not have |
@@ -750,9 +823,13 @@ the abstention doctrine of §4 applied to this surface: an unreadable read is ne
 **Three states, and "not installed" is not one of them when the code is here.** A component whose
 **job definition is absent** has two very different causes, and rendering both as `SKIPPED` (a pass) is
 how the component that motivated this file stayed green by absence: `com.tortoise.pr-doctor` and
-`com.eldato.orchestrator-watchdog` are installed by **no surface in this repo** (they are
+`com.eldato.orchestrator-watchdog` were installed by **no surface in this repo** (they were
 hand-provisioned), so on a box built by the repo's own installers both rows hit `SKIPPED` *and* `start`
-could not act on them (`fleet_component_has_start` needs the plist). The rule is now: **if the
+could not act on them (`fleet_component_has_start` needs the plist). That measurement is now history and
+is what forced the fix: both ship a template (`templates/launchd/com.tortoise.pr-doctor.plist`; and
+`com.eldato.controller-watchdog.plist` as the TRACKED replacement for the hand-provisioned
+`com.eldato.orchestrator-watchdog`, which moved to `templates/launchd/RETIRED`). The rule it produced
+stands: **if the
 component's own code exists on the box, something is expected to run it**, and a missing job is
 `MISSING` (actionable, and it fails the table). `SKIPPED` is reserved for a component whose code is
 absent too — it genuinely does not exist here — and it always carries its reason.

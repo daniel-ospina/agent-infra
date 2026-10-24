@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, gh-rate-limits, gh-limit
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2227, gh-rate-limits, gh-limit
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -30,6 +30,44 @@ which resolves the next `gh` on PATH — including `gh-shim`, so the argv gate s
 Where both pace, the cost of a mutating call is one extra `>= 1 s` gap. Neither layer supersedes
 the other; changing one does not change the other's guarantee.
 
+## A serialised call is SLOW, not ABSENT — the readers must say which (#2227)
+
+Serialising per box is the correct remedy for the secondary limit, and it has a cost that is easy to
+misread: **latency becomes a function of how many lanes the box is running.** Measured 2026-10-20 on
+three cloud cells:
+
+| lanes on box | `gh pr view` |
+|---|---|
+| 13 | **63.0 s** |
+| 3 | 0.676 s |
+| — | 0.091 s (raw `curl` to `api.github.com` — network and account fine) |
+
+A reader whose timeout sits under that number does not bound the read, it **manufactures a false
+absence** — the beat printed `queue_read=BLIND(14/14 unread)`, `merged_24h=?` and
+`VERDICT=UNKNOWN (merge-rate read failed)` roughly hourly for data that was merely not served yet.
+
+The rules that follow from it, and where they live:
+
+- **The read budgets are derived from the measurement, never picked.** `objective.py`'s
+  `QUEUE_READ_MAX_S` (100 s) is 1.6x the measured worst case; `merge-queue.py`'s
+  `MERGE_RATE_TIMEOUT_S` (100 s) is the same. Changing either without the measurement is the same
+  mistake in the other direction.
+- **The reader CLIPS its cap to the caller's declared bound** (`OBJECTIVE_CALLER_BOUND_S`, set by
+  `heartbeat-loop.sh` and `lane-scan-fallback.sh` as `run_bounded`/`bounded` arguments). The reader
+  and the loop deploy separately (`heartbeat-loop.sh` is a declared, withheld farm entry, #1553), so
+  a new reader under an old 90 s loop reads for 66 s and still PRINTS. A budget above the caller's
+  kill is an inert bound: the process dies and writes no line at all.
+- **A slow read is DATA and says so; a failed read says why.** `queue_read=SLOW(waited=63.1s)`
+  carries real counts and no caveat; `queue_read=UNREADABLE(waited=100.4s, last_good=812s)` carries
+  `what it tried`, the wait, and the AGE of the last good sample, and **no counts at all** (#1869
+  still governs: a stale number never stands in for an unread one, and a stale value may be shown
+  only labelled with its age — `merge-queue.py` prints `last_good_rate=` and still refuses a
+  verdict).
+- **`BLIND` keeps its narrow meaning** (the merge state never came back readable), so a word that
+  covers "we waited 63 s and got an answer" cannot also cover "we never got an answer".
+- Bounds that a busy box can exceed are not bounds: `lane-status.py` caps the WORK it walks
+  (session files, pids, activity files) and reports `lane-status: SAMPLED …` when a cap bites.
+
 ## The layer that owns this now (#1988)
 
 Every harness `gh` call goes through **one** helper, `scripts/orchestrator-harness/gh-limit.py`,
@@ -40,7 +78,13 @@ documented policy, so this file does not restate the numbers — it names where 
 | Behaviour | Where |
 |---|---|
 | ONE `gh` call in flight per box (`flock` on `$GH_LIMIT_DIR/gh.lock`) — including the `/rate_limit` probe, which runs while the caller is in backoff | `acquire_lock` |
-| `retry-after`, then the bucket's `x-ratelimit-reset` when remaining is 0, then **≥ 60 s doubling** with upward jitter; **4 attempts**, then fail loudly | `plan_wait` / `dispatch` |
+| **Identical concurrent READS share ONE load** (`#2243`): the key is the normalised request (host + credential digest + cwd repo pin + endpoint + argv), a waiter shares the leader's result **or its failure** under a **bounded** wait, and a waiter past the bound gets a distinct `busy` (exit **75**, holder's age on stderr) instead of an unbounded queue. A leader that died or overran is taken over, so no orphan claim survives | `single_flight` / `flight_key` / `flight_eligible` / `prune_flights` |
+| **Never coalesced**: mutations (two merges are two merges), `auth` (its stdout is the credential) and `/rate_limit` (the pass's own meter) | `flight_eligible` |
+| A previous answer may be served **while a refresh is in flight** — opt-in only (`GH_LIMIT_FLIGHT_STALE_SERVE=1`, off by default) and then the age goes on stderr; stale is never presented as current | `single_flight` (stale branch) |
+| `retry-after`, then the bucket's `x-ratelimit-reset` when remaining is 0 **and the refusal is PRIMARY**, then **≥ 60 s doubling** with upward jitter; **4 attempts**, then fail loudly. A **secondary/unclassified** refusal never adopts a reset as its wait — the primary counter does not predict a secondary limit | `plan_wait` / `limit_kind` / `dispatch` |
+| **The ACCOUNT's budget is partitioned, not the box's** (`#2137`): `5000 × safety ÷ declared fleet ÷ 60` per bucket per window, floored at 1 call/window, taken immediately before each send | `account_share` / `budget_gate` |
+| **An UNCLASSIFIED refusal (`status=?`) is its own class** — treated like a secondary one (≥ 1 min, jittered, doubling) and recorded as `kind=unclassified`, because the bucket reset that used to be its only number is not a recovery time | `limit_kind` |
+| **The block window is the classification's, not the reset's**, and it is revalidated before it is paid: one exempt `GET /rate_limit` above `GH_LIMIT_GATE_REVALIDATE_S`, `remaining > 0` ⇒ the marker is stale (annotated, age kept) ⇒ the call proceeds. A marker older than the window it recorded, or than `GH_LIMIT_MARKER_MAX_AGE`, blocks nothing | `marker_gate` / `marker_window` / `mark_marker_stale` |
 | The failing **bucket** is named (`core` vs `graphql`) with its reset — never inferred from whichever counter looks healthy | `bucket_for` / `fail_loudly` |
 | **≥ 1 s between mutative calls** (POST/PATCH/PUT/DELETE) | `pace_mutation` |
 | Conditional REST for polling: ETag stored per URL (host + path + credential digest), `if-none-match` sent, a **304 replayed from cache** and charged nothing. The cached body is base64 (a 304 replay is byte-exact, binary included) and the cache is bounded in ENTRIES and BYTES (`GH_LIMIT_CACHE_MAX_ENTRIES` 500, `GH_LIMIT_CACHE_MAX_BYTES` 64 MiB) | `conditional_fetch` / `cache_put` / `prune_cache` |
@@ -58,9 +102,14 @@ Two properties worth knowing before you debug it:
   such as `gh-rest/gh` merge stderr into stdout and then parse it.
 * **A refused call is never reported as empty data.** The failure names the bucket and the reset,
   and it records itself in `$GH_LIMIT_DIR/last-limit`, which `orch-loop.sh` prints on its cycle line
-  as `gh=rate_limited(bucket=graphql reset=<epoch> <age>)` for 15 minutes — or as
+  as `gh=rate_limited(bucket=graphql reset=<epoch> until=<epoch> <age>)` for 15 minutes — or as
   `gh=recovered(bucket=… <age>)` once a later call succeeded, so a limit that has been read past is
-  not asserted as a current one. The failure text says `rate limit`, because that is the phrase
+  not asserted as a current one. `until=` is the window this box actually honours (the classification's
+  window); `reset=` is the bucket's own reset and stays on the line because readers exist, but a
+  secondary/unclassified refusal retries in ~60 s while its reset sits far outside that window — the
+  derived figure lives in `docs/ops/cost-config-policy.md` §2, and is not restated here — so only
+  `until=` answers "how long is this box blocked". The failure text says `rate limit`, because that is
+  the phrase
   `objective.py`'s transport markers turn into `VERDICT=GH-RATE-LIMITED`.
 * **A shim's identity is its own sentinel line, not its helper's presence.** Both seed dirs can be
   on one PATH (`install.sh` + the cell supervisor), and a HALF-INSTALLED box (adapter seeded, helper
@@ -88,6 +137,62 @@ Two properties worth knowing before you debug it:
 
 - **Cross-box concurrency is not serialised.** Boxes cannot see each other; the invariant is one
   call in flight *per box*.
+- **Coalescing is per box, and only for requests that are identical RIGHT NOW** (`#2243`). Two lanes
+  reading the same PR 10 s apart are two loads (the answer is not cached as current — only a flight
+  still in progress is shared), and two boxes reading it are still two loads. What the layer removes
+  is the *queued duplicate*: the measured 63 s `gh pr view` at 13 lane processes was ours, not
+  GitHub's. `GH_LIMIT_FLIGHT=0` turns it off; `GH_LIMIT_FLIGHT_WAIT` (5 s, Nginx's
+  `proxy_cache_lock_timeout` default) is the bound, `GH_LIMIT_FLIGHT_LEADER_MAX_AGE` (120 s,
+  `proxy_cache_lock_age`) is when a stalled holder is taken over.
+- **A `busy` outcome is a NOT-AN-ANSWER.** Exit **75** with `BUSY single-flight …` on stderr, naming
+  the holder's pid and age. It is deliberately not a rate limit and carries no bucket, so a caller
+  that classifies failures must retry it rather than record it as quota — and it never inherits the
+  wait: the bound is the whole wait.
+- **Cross-box BURST is not serialised — it is PARTITIONED (#2137).** Boxes cannot see each other, so
+  the invariant is still one call in flight *per box*; what bounds the ACCOUNT is a declared share:
+  GitHub's primary limit is **per account** (a PAT, an OAuth app and a GitHub App acting for one user
+  all draw on the same 5,000/hr bucket), so a per-box budget is ~N times the account's. The layer
+  divides that budget by a **declared fleet size** (`GH_LIMIT_ACCOUNT_FLEET_SIZE`, default 4) with a
+  safety fraction (`GH_LIMIT_ACCOUNT_SAFETY`, 0.8) and paces this box at that share per window
+  (`GH_LIMIT_ACCOUNT_WINDOW_S`, 60 s) — 5000 × 0.8 / 4 / 60 ≈ **16 graphql calls/min** at the
+  defaults, whose share is floored at 1 so a conservative setting cannot brick a box. No cross-box
+  messaging is needed, which is the point: a partition is testable and does not depend on an
+  unreachable peer. What is *still* not bounded: a box whose declaration is wrong (too small a fleet
+  ⇒ too generous a share), and **`core`/REST is not paced by default** — the hot reads were
+  deliberately moved onto REST (#1962/#2137), so pacing it here would push the fleet back onto the
+  bucket that is refusing; opt in with `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql,core`.
+- **A bounded caller proceeds OVER the partition.** `GH_LIMIT_NO_WAIT` callers (the heartbeat's eight
+  telemetry tools) cannot be paced without outliving their own subprocess bound, so they take the
+  slot check and proceed when it is exhausted, recording the overdraw in `events.log`. Pacing them
+  would turn a rate-limit verdict into the timeout that NO_WAIT exists to prevent. The same applies
+  to a caller that waited one window and lost the retake to a peer: it sends and records the
+  overdraw rather than waiting a second window (which would multiply the in-call bound by the
+  attempt count) or falling through silently.
+  A caller that *can* wait, and whose next slot is further away than `GH_LIMIT_MAX_WAIT`, is refused
+  **locally** instead: the layer prints the share it enforced on stderr, records `last-budget`, sends
+  nothing, and exits **75** (`EX_TEMPFAIL`) — the same "retry later" code the give-up path uses, so a
+  caller reading only the exit code cannot mistake a partition refusal for a success.
+- **A marker blocks only within the window its CLASSIFICATION justifies, and only after
+  revalidation (#2137).** `last-limit` now carries `kind=`, `until=` and `remaining=` beside the
+  fields it always had. The layer's own gate waits at most `until` — never the bucket `reset=` for an
+  `unclassified`/`secondary` refusal, because GitHub documents (and the fleet measured) that the
+  primary counter does not predict a secondary limit — never when the marker is older than the window
+  it recorded or older than `GH_LIMIT_MARKER_MAX_AGE` (900 s), and never for a `NO_WAIT` caller or a
+  request-free command. Before a wait longer than `GH_LIMIT_GATE_REVALIDATE_S` (30 s) it spends one
+  exempt `GET /rate_limit`: a bucket reporting headroom marks the marker stale (`stale=`,
+  `reval_remaining=`) and the call proceeds — deliberately **not** `recovered=`, because the cycle
+  token prints that field as `gh=recovered(…)` and the only honest source of it is a real request that
+  succeeded; the exempt endpoint is measured to report 4999/5000 while every call is refused. A marker
+  whose window is further away than `GH_LIMIT_MAX_WAIT` is not slept-then-ignored either: the gate
+  declines, and the refusal itself (which fails fast) is the cheaper evidence. The annotation is
+  written **only onto the record the gate actually read** — identity is `at=`+`bucket=`+`kind=` —
+  because `record_limit` writes `last-limit` outside the box lock (a refusal must not queue behind a
+  sleeping gate), so a concurrent client can replace the file in between; a blind `stale=` would then
+  clear a fresh genuine refusal's window, and since the gate suppresses on `stale=` permanently the
+  drop would be silent (fail-open). A replaced record is left alone and the event log says so.
+  Residual: a reader
+  OUTSIDE this helper that still blocks on `reset=` will over-block — `until=` is the field to read,
+  and `reset=` is the bucket's own reset, not a block window.
 - **A degraded state dir**: if `$GH_LIMIT_DIR`/`$XDG_CACHE_HOME` cannot be created, the fallback is
   a per-user temp dir (`${TMPDIR}/gh-limit-<uid>`), which still shares one lock between that user's
   processes and records the degradation in its own `events.log` — but the controller's heartbeat
@@ -103,7 +208,7 @@ Two properties worth knowing before you debug it:
   `GH_LIMIT_NO_WAIT=1` makes the layer record the limit and return at once; EIGHT heartbeat tools set
   it (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`,
   `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`), because each one's own
-  bound is a per-CALL timeout in the 60-420 s range (or a `run_bounded` step of 20-90 s) that is
+  bound is a per-CALL timeout in the 60-420 s range (or a `run_bounded` step of 20-180 s) that is
   consumed by the layer's first documented wait of 60 s, or shared with every other call the step
   makes — the outcome is a timeout, and the box then reports `UNKNOWN`/`STALL` instead of the
   `RATE-LIMITED` verdict it can prove. (One of the eight — `pr-doctor.py` — is
@@ -169,7 +274,17 @@ Two properties worth knowing before you debug it:
   `gh=recovered(bucket=… <age>)`; the 15-minute age bound still applies to both forms.
 
 `$GH_LIMIT_DIR` defaults to `${XDG_CACHE_HOME:-~/.cache}/gh-limit`. Files you will find there:
-`gh.lock`, `etag/`, `last-mutation`, `last-limit`, `events.log`.
+`gh.lock`, `etag/`, `flights/` (one `<key>.leader` claim and one `<key>.json` last outcome per
+in-flight request — `#2243`), `last-mutation`, `last-limit`, `last-budget`, `events.log`, and one
+`budget-<bucket>` sliding window per partitioned bucket (newline-separated send timestamps, bounded
+by the share; a stamp from the FUTURE is dropped, because a clock that stepped back is not permission
+to refuse every call) plus `budget-<bucket>.over`, the window in which the over-share line was last
+written — the overdraw is recorded ONCE per window per bucket rather than once per call, because a
+~500-call NO_WAIT refresh against a 16-call share would otherwise fill `events.log` with its own
+overdraw and evict every refusal and probe decision (that flood is a record-eating defect, not noise).
+`last-budget` is written **only** by a LOCAL partition refusal and never into
+`last-limit`: the heartbeat prints `last-limit` as `gh=rate_limited(…)`, and publishing our own
+budget decision as GitHub's limit is the false attribution the local-refusal rule forbids.
 
 Operator knobs (all optional): `GH_LIMIT_MAX_ATTEMPTS` (4 attempts in total), `GH_LIMIT_BASE_WAIT` (60 s),
 `GH_LIMIT_MAX_WAIT` (300 s — a reset beyond this fails FAST so the caller's own deferral takes
@@ -177,11 +292,32 @@ over), `GH_LIMIT_LOCK_TIMEOUT` (600 s), `GH_LIMIT_MUTATION_GAP` (1 s),
 `GH_LIMIT_CACHE_MAX_ENTRIES` (500), `GH_LIMIT_CACHE_MAX_BYTES` (67108864 — 64 MiB; the cache is
 bounded in entries AND bytes, whichever binds first), `GH_LIMIT_CONDITIONAL=0` (disable the ETag
 path), `GH_LIMIT_NO_WAIT=1` (never sleep in-process — set by callers that have their own bound) with
-`GH_LIMIT_NO_WAIT_LOCK_S` (5 s — the lock budget under `NO_WAIT`). Every knob
+`GH_LIMIT_NO_WAIT_LOCK_S` (5 s — the lock budget under `NO_WAIT`, and the flight budget with it).
+Coalescing (`#2243`): `GH_LIMIT_FLIGHT=0` (disable it), `GH_LIMIT_FLIGHT_WAIT` (5 s — Nginx's
+`proxy_cache_lock_timeout` default; past it a waiter returns `busy` at exit 75),
+`GH_LIMIT_FLIGHT_LEADER_MAX_AGE` (120 s — `proxy_cache_lock_age`; a holder older than this, or one
+whose pid is gone, is taken over), `GH_LIMIT_FLIGHT_KEEP_S` (30 s — how long a finished outcome stays
+on record), `GH_LIMIT_FLIGHT_STALE_SERVE=1` (serve a previous answer while a refresh is in flight,
+WITH its age on stderr; off by default), `GH_LIMIT_FLIGHT_STALE_MAX_AGE` (30 s), and
+`GH_LIMIT_FLIGHT_MAX_ENTRY` (4 MiB — a larger outcome is not shared; waiters take the key over).
+`GH_LIMIT_ACCOUNT_FLEET_SIZE` (4 — the DECLARED number of boxes spending one account budget),
+`GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR` (5000 — GitHub's per-account, per-bucket primary limit),
+`GH_LIMIT_ACCOUNT_SAFETY` (0.8 — headroom kept inside the share),
+`GH_LIMIT_ACCOUNT_WINDOW_S` (60 s — the window the share is spent over),
+`GH_LIMIT_ACCOUNT_PARTITION_BUCKETS` (`graphql` — which buckets are paced; `graphql,core` opts REST in),
+`GH_LIMIT_MARKER_MAX_AGE` (900 s — a marker older than this is not evidence about now) and
+`GH_LIMIT_GATE_REVALIDATE_S` (30 s — the wait above which a marker is revalidated before it is paid).
+The conditional-GET PASS CACHE has its own three: `GH_LIMIT_PASS_CACHE` (unset/`0` disables it; any
+other value enables it — `refresh-candidates.sh` sets it for the sweep), `GH_LIMIT_PASS_CACHE_MAX_ENTRY`
+(4 MiB — the largest single `--include` response it will keep) and `GH_LIMIT_PASS_CACHE_MAX_BYTES`
+(64 MiB — the whole cache's budget); an entry over either bound is simply not cached.
+Every knob
 is range-clamped, and `nan`/`inf` fall back to the documented default rather than disabling a bound
 (an `inf` lock timeout would be a hang, a `nan` wait a traceback).
 `GH_LIMIT_NOW_CMD`/`GH_LIMIT_SLEEP_CMD` are the TEST seams for the fake clock — do not set them
-in production.
+in production. ⛔ The flight ledger deliberately does NOT use them: it measures a LIVE process's age
+and an answer's age, and both are safety labels (a stale answer must never read as current), so a
+knob must not be able to make one look like the other.
 
 ⛔ **Also corrected 2026-10-17 (agent-infra#1910): the section below that told you to read
 `rate_limit` for the secondary limit was WRONG, and it is the mistake that reopened this

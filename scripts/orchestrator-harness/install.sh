@@ -108,9 +108,18 @@ MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
 FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
+# The red-fixer role's two caps (agent-infra#2223): red-fixer lanes per box, and attempts per head sha.
+# Rendered like every other limit so an operator can pin them and the `limits` line can show them; a
+# limit that only exists as an env var is one nobody can find when the role misbehaves.
+MAX_RED_FIX="${MAX_RED_FIX:-4}"
+MAX_RED_FIX_TRIES="${MAX_RED_FIX_TRIES:-2}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
+# The product work floor (agent-infra#2054): how many slots of each batch are filled from
+# `candidates.product.txt` first. 0 disables it — a legitimate setting, so it must be settable through
+# the shipped (launchd) path like every other limit, and it is validated below with them.
+PRODUCT_FLOOR="${PRODUCT_FLOOR:-1}"
 CYC="${CYC:-240}"
 # Drain scope (README §5): auto (count rule) | own (pin own-only) | broad (pin broad).
 # A fleet runs exactly ONE broad box; the rest pin own. Validated below, AFTER the action parse
@@ -175,6 +184,18 @@ if [ "$ACTION" = uninstall ]; then
   # dispatching — README §6 step 2's `pkill` is undone by launchd a second later. So: remove, then READ
   # the domain until the label is no longer LOADED, and fail loudly if it still is.
   lc_bootout "$LABEL" "$PLIST" || exit 1
+  # ⛔ BOOTOUT NO LONGER STOPS THE CONTROLLER, SO UNINSTALL MUST (2026-10-18, review round 1, measured).
+  # The job used to BE orch-loop.sh, so removing it stopped the fleet. It now runs launchd-controller.sh,
+  # which keeps the controller in a tmux session that is NOT in the job's process group (the pane's
+  # parent is the tmux server, ppid-1 lineage), so `launchctl bootout` kills only the supervisor and
+  # leaves a full controller dispatching, merging and unsupervised — with a ✅ printed over it. That is
+  # the exact inversion of the guard below: it used to be launchd resurrecting the controller; now it
+  # is tmux preserving it. The session name is the job's own (`CONTROLLER_SESSION`, default
+  # `orch-controller`), so this can only ever stop the controller this job started.
+  CTRL_SESS="${CONTROLLER_SESSION:-orch-controller}"
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$CTRL_SESS" 2>/dev/null; then
+    tmux kill-session -t "=$CTRL_SESS" 2>/dev/null || true
+  fi
   # ⛔ "IS IT STILL LOADED" — not "does it have a pid". A KeepAlive job that has just exited sits LOADED
   # with no pid for up to its respawn throttle (`minimum runtime`, 10s by default), so a pid-only read
   # declared a job removed that launchd still holds and will relaunch (review finding). `lc_probe` is
@@ -212,6 +233,34 @@ if [ "$ACTION" = uninstall ]; then
     # The plist is KEPT: it is the only handle a verified removal has (and the only thing a human can
     # inspect), so destroying it here would leave the job loaded with nothing to retry against.
     die "$LABEL is STILL loaded${pid:+ (pid $pid)} after 'launchctl bootout' — NOT removed, and the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20"
+  fi
+  # ⛔ AND THE CONTROLLER MUST BE GONE BEFORE ✅ (review round 1). `kill-session` is a SIGNAL, not a
+  # proof — a pane that refuses to die, or a controller started by some other path, leaves a box that
+  # still dispatches while this command says Removed. The controller records its own pid in
+  # $O/.orch.lock, so that is the read that answers the question; give the SIGHUP a moment first, and
+  # keep the plist on failure so the retry has something to act on.
+  _cp=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    # ⛔ THE READ MUST BE GUARDED — a non-regular lock (a FIFO, a wedged network mount) makes `cat`
+    # BLOCK ON OPEN, and this runs AFTER the bootout, so the wait would hang for ever with the fleet
+    # already stopped, the plist never removed and no message (review round 2, measured: a FIFO lock
+    # still blocked the exact expression after 2s). `lc_foreign_controller` already documents and
+    # guards this same read; do not re-do it unguarded.
+    # ⛔ AND "CANNOT READ IT" IS NOT "NO CONTROLLER" (review round 3, measured: a FIFO lock was
+    # byte-identical to an ABSENT lock and printed ✅). An absent lock means no controller holds it; a
+    # PRESENT but non-regular one means the controller's state CANNOT BE VERIFIED, and this block's
+    # whole job is to refuse that — the shape `lc_probe`'s `unread=2` already models ten lines above.
+    if [ ! -e "$O/.orch.lock" ]; then _cp=0; break; fi
+    if [ ! -f "$O/.orch.lock" ]; then
+      die "$O/.orch.lock is not a regular file (a FIFO, or a wedged mount), so whether the controller is still running cannot be VERIFIED — NOT removed, and the plist is kept at $PLIST. Next: ls -l '$O/.orch.lock'; if no controller is running, rm -f it, then re-run --uninstall"
+    fi
+    _cp="$(cat "$O/.orch.lock" 2>/dev/null || echo 0)"
+    case "$_cp" in ''|*[!0-9]*) _cp=0 ;; esac
+    [ "$_cp" -gt 0 ] && kill -0 "$_cp" 2>/dev/null || break
+    sleep 0.5
+  done
+  if [ "$_cp" -gt 0 ] && kill -0 "$_cp" 2>/dev/null; then
+    die "the controller is STILL running (pid $_cp, recorded in $O/.orch.lock) after removing $LABEL — NOT removed, and the plist is kept at $PLIST. Next: tmux kill-session -t =${CONTROLLER_SESSION:-orch-controller} (or kill $_cp), then re-run --uninstall"
   fi
   rm -f "$PLIST"
   rm -f "$O/state/launchd-loaded.sha256"
@@ -503,6 +552,15 @@ done
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-limit.py" 2>/dev/null \
     || die "gh-limit.py does not parse"
 }
+# The merge reminder (#2603) is a TIMER'S ENTRY POINT, and a syntax error in it is a cycle that dies
+# with a traceback in a log nobody reads — the same class as a broken gh-limit.py, so it takes the
+# same parse gate. `box-status.sh` is a `*.sh` and is already covered by the sweep above.
+# ⛔ UNGUARDED, like its neighbour: a `[ -f ]` guard made a MISSING file pass this gate, so a
+# checkout without merge-reminder.py was reported as parsing fine while the timer had no script.
+command -v python3 >/dev/null 2>&1 \
+  || die "python3 is not on PATH — the merge reminder (merge-reminder.py) cannot run without it"
+python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/merge-reminder.py" 2>/dev/null \
+  || die "merge-reminder.py is missing or does not parse"
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
@@ -597,7 +655,7 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # different ways: '4x' renders a plist that LIES about the ceiling and still exits 0 (only the loop's
 # own coercion saves the run), while '4&5' renders the literal `4__MAX_LANES__5` -- a syntactically
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
-for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC; do
+for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC; do
   _v="${!_n}"
   case "${_v:-}" in
     ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
@@ -615,7 +673,60 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
     # disabled the claim / discarded the controller loop. The loop now coerces such a value to the
     # DEFAULT, so accepting it here would render a plist that LIES about the ceiling while exiting 0.
     # Refuse it loudly instead: a value this installer accepts must be the value the loop uses.
-    0*) die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
+    # ⛔ AND `PRODUCT_FLOOR` IS NOT ONE OF "THESE" (review cycle 17, P2). The shared sentence below says a
+    # leading-zero value "would silently coerce it to the default" — true for the twelve `is_limit` consumers,
+    # FALSE for the floor: `floor_norm` parses with `10#`, so `00` is 0, and 0 is the value that DISABLES the
+    # floor. Refusing `00` is still right (a value this installer accepts must be the value the loop uses, and
+    # `00` reads as "default" to a human), but the reason must be the one that actually applies — otherwise
+    # an operator is told to expect the default 1 and would get a disabled floor.
+    # ⛔ AND IT MUST NAME *THIS* VALUE, NOT ONE EXAMPLE (review cycle 24, P2). The sentence hardcoded `'00'`, so
+    # every other leading-zero input was refused with a consequence that does not apply to it: `floor_norm`
+    # reads `08` in base 10 as 8 (then clamps it to BATCH), which is neither 0 nor "the default 1". The
+    # computed value is interpolated, and the two consequences get their own sentences — the discipline this
+    # arm was added for, applied to all ten inputs it fires on instead of one.
+    0*)
+       case "$_n" in PRODUCT_FLOOR)
+         _dec=$(( 10#$_v ))
+         if [ "$_dec" = "0" ]; then
+           die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is 0, which DISABLES the floor rather than taking the default 1; write '0' to disable it deliberately, or a value in 1..BATCH"
+         fi
+         # ⛔ AND `CLAMPED` ONLY WHEN IT WOULD BE (review cycle 25, P2): `floor_norm` clamps only a value ABOVE
+         # the batch, so for `08` with `BATCH=20` nothing is clamped and the loop uses exactly 8 — the previous
+         # sentence asserted the clamp for the whole class, which is the same "the reason must be the one that
+         # applies" defect cycle 24 removed from the `'00'` example, one input class over.
+         _zb="${BATCH:-0}"
+         case "$_zb" in ''|*[!0-9]*|0*) _zb=1 ;; *) _zb=$(( 10#$_zb )) ;; esac
+         if [ "$_dec" -gt "$_zb" ]; then
+           die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec and is then CLAMPED to BATCH ($_zb), which is not the value the plist would state; write '$_dec'"
+         fi
+         die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec, inside BATCH ($_zb), so the loop would use $_dec; write '$_dec' without the padding rather than a spelling that reads as 'the default' to a human" ;;
+       esac
+       die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
+    # ⛔ AND A FLOOR ABOVE THE BATCH IS ALSO A PLIST THAT LIES (review cycle 12, P2). `floor_norm` clamps
+    # `PRODUCT_FLOOR` to `[0, BATCH]` at runtime, so `BATCH=2 PRODUCT_FLOOR=9` was accepted here, rendered
+    # into the plist, and then silently used as 2 — the same "a value this installer accepts must be the
+    # value the loop uses" contract the `0`-window arm above exists for. `0` is legitimate (it disables the
+    # floor) and is NOT caught here; only an unreachable floor is.
+    # ⚠️ IT MUST COME AFTER `0*`: a `*)` arm placed above it shadows every leading-zero value, which broke
+    # the leading-zero refusal in this very suite (measured: one FAIL). Case arms are first-match.
+    # ⛔ AND THE BATCH IS NORMALISED TOO (review cycle 23, P2). `floor_norm` reads a batch of `0` as 1 (its
+    # `0*` arm), so an EXPLICIT `BATCH=0 PRODUCT_FLOOR=1` — a value the installer accepts and the loop honours —
+    # was refused by a comparison against the RAW `0`; following that refusal would have meant setting
+    # `PRODUCT_FLOOR=0`, which DISABLES the floor. Normalise both sides the way the loop does, then compare.
+    # ⛔ AND SAY THE NORMALISATION ONLY WHEN IT HAPPENED (review cycle 24, P2): the previous sentence printed
+    # "(BATCH=0 is read as 1)" for every over-shoot, including `BATCH=2 PRODUCT_FLOOR=9`, describing an
+    # adjustment that never took place. The shipped default is `BATCH=2` (install.sh:113, README, ARCHITECTURE
+    # and the live plist agree) — not 0 — so that clause was wrong in the common case and in the defaults.
+    *) case "$_n" in PRODUCT_FLOOR)
+         _eff_batch="${BATCH:-0}"
+         _norm_note=""
+         case "$_eff_batch" in
+           ''|*[!0-9]*) _eff_batch=1; _norm_note=" (BATCH='${BATCH:-}' is read as 1)" ;;
+           0*) _eff_batch=1; _norm_note=" (BATCH='${BATCH:-}' is read as 1)" ;;
+           *) _eff_batch=$(( 10#$_eff_batch )) ;;
+         esac
+         [ "${_v:-0}" -le "$_eff_batch" ] 2>/dev/null || die "$_n='${_v}' is above BATCH='${BATCH:-}'${_norm_note} — the loop clamps the floor to the batch, so the plist would state a floor the controller never uses" ;;
+       esac ;;
   esac
   # A digit string is not enough: `[` ERRORS at or above 2**63, and an errored test is FALSE, which
   # OPENS the gate the value configures. `MAX_LANES=99999999999999999999` passed the class test, and
@@ -666,9 +777,12 @@ sed \
   -e "s|__FUNNEL_MAX_AGE_MIN__|$FUNNEL_MAX_AGE_MIN|g" \
   -e "s|__MAX_FIX__|$MAX_FIX|g" \
   -e "s|__MAX_FIX_TRIES__|$MAX_FIX_TRIES|g" \
+  -e "s|__MAX_RED_FIX__|$MAX_RED_FIX|g" \
+  -e "s|__MAX_RED_FIX_TRIES__|$MAX_RED_FIX_TRIES|g" \
   -e "s|__MIN_SWAP_FREE__|$MIN_SWAP_FREE|g" \
   -e "s|__MIN_MEM_FREE_MB__|$MIN_MEM_FREE_MB|g" \
   -e "s|__BATCH__|$BATCH|g" \
+  -e "s|__PRODUCT_FLOOR__|$PRODUCT_FLOOR|g" \
   -e "s|__CYC__|$CYC|g" \
   "$TEMPLATE" > "$RENDER"
 plutil -lint "$RENDER" >/dev/null || { rm -f "$RENDER"; die "rendered plist is invalid"; }
@@ -736,17 +850,30 @@ DRIFTED=""
 # `reviewer-preflight.sh` (the #2148 disclosure helper lane.sh calls as `$O/reviewer-preflight.sh`),
 # while origin/main added `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the
 # derived repo surface, #2040).
+# worker-terminal.sh (#2210) is SOURCED by both controllers: their own guard only checks that the
+# verbs EXIST, so a partial older copy at $O passes it and the box silently executes a stale launcher
+# (a census that reads 0 workers, a reap that cannot prove a kill).
+# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by THREE
+# daemons (`orch-loop.sh`, `fix-one.sh`, `dispatch-merge.sh`), each of which only checks that the
+# verbs exist — so a stale `$O/ci-queue.sh` passes every interface guard and the box keeps deriving
+# its ceiling with the pre-review runner-count read (the 3x over-permissive one). A sourced module
+# that is not in this list is the drift the list exists to catch.
 # reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
 # #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
 # render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
-for f in orch-loop.sh harness-refresh.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
 if [ -n "$DRIFTED" ]; then
   warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
   warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
-  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/' && cp '$HERE'/gh-limit.py '$O/'";
+  # ⛔ NOT A BARE `cp '$HERE'/*.sh '$O'/` ANY MORE (review P2). That line is the depth-1, unverified copy
+  # #2041 measured as a false PASS — and it was the MOST operator-visible remedy in the harness, the one
+  # README §4.1 tells the operator to run right after a verified redeploy. The helper copies every
+  # shipped file (subdirectories and `gh-limit.py` included) and byte-verifies each one; it refuses
+  # rather than half-applies.
+  warn "  bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'   # every shipped file, byte-verified (#2041)";
 fi
 
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────
@@ -843,7 +970,8 @@ prov_dirty() {
 write_provenance() {
   local commit rel dirty_word payload tmp drc _depf _depb dep_why
   # ⛔ `relation`/`commit` describe the SOURCE checkout, and `payloadSha256` describes the DEPLOYED
-  # `$O/*.sh` — this installer never copies (`$O` is synced by the operator, see the DRIFTED warning
+  # `$O/*.sh` — this installer seeds only `$O/gh-rest/gh` and `$O/gh-limit.py` (the `*.sh` payload is
+  # the operator's copy, and the verified path for it is `deploy-harness.sh` — see the DRIFTED warning
   # above), so the two can genuinely disagree: an install run from a newer checkout while `$O` still
   # holds older bytes records `commit: <new tip>, relation: "current"` over a payload from a different
   # commit. Measured: `$O` at C1 bytes + writer at C2 → stamp `commit C2 / relation current /
@@ -926,7 +1054,7 @@ STAMPEOF
   fi
   if [ "$dep_match" = false ]; then
     warn "the DEPLOYED copy at \$O does NOT match the source at $HERE:$dep_why"
-    warn "  the record names $commit, but the box is not running those bytes — cp '$HERE'/*.sh '$O'/"
+    warn "  the record names $commit, but the box is not running those bytes — bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'"
   fi
   return 0
 }
@@ -955,6 +1083,16 @@ SELF="bash $(shq "$HERE/install.sh")"
 # cycle, so a quiet cell (CYC=900) is not declared wedged on a healthy controller. Passed down rather
 # than read from a global: the library must not depend on an unstated variable.
 LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
+# ⛔ THE PLIST NOW EXECUTES A SCRIPT THE INSTALLER NEVER COPIES, SO ITS ABSENCE IS FATAL, NOT DRIFT.
+# This installer deliberately copies nothing ($O is operator-synced) and the DRIFT block above WARNS —
+# correctly for the general list. But the entrypoint is different in kind: on an un-synced box
+# `/bin/bash $O/launchd-controller.sh` exits 127 on every run, so a `--start` would bootstrap a job
+# that crash-loops under KeepAlive, grows launchd.err, and leaves the fleet with NO controller while
+# the command reports success. It is one `-f` test away from being knowable, so it is refused here.
+case "$ACTION" in
+  start|restart)
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: cp '$HERE'/*.sh '$O'/"; ;;
+esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
   restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                              || exit 1 ;;
@@ -1005,7 +1143,7 @@ cat <<EOF
   harness   $O
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
   repo      $REPO   ($OR_SHOW)
-  limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
+  limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES red_fix=$MAX_RED_FIX red_fix_tries=$MAX_RED_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
 EOF

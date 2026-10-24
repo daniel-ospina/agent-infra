@@ -37,7 +37,7 @@ release_issue_claim_unspawned() { # <issue>
     return 0
   fi
   if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
-    echo "#$n: ⚠️ $csh predates the issue-claim release (no claim_issue_release_record) — the claim is NOT released; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/"
+    echo "#$n: ⚠️ $csh predates the issue-claim release (no claim_issue_release_record) — the claim is NOT released; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator"
     return 0
   fi
   # ⚠️ The generation guard is deliberately INERT on this path, and that is correct rather than an
@@ -56,10 +56,118 @@ release_issue_claim_unspawned() { # <issue>
   return 0
 }
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THIS IS NOW A `gh` CONSUMER, SO IT RE-ASSERTS THE SHIMS (#2333 review P2). The `export PATH`
+# above puts the real `/opt/homebrew/bin/gh` FIRST, ahead of the controller's exported shim dirs, and
+# the CI-queue read below is this script's FIRST `gh` call — so without this it would run outside the
+# cell's rate-limit serialiser and the Mac REST adapter, while `README` §7.2h says every read goes
+# through them. `fix-one.sh` carries the identical pair for the same reason; adapter last so
+# `$O/gh-rest` (which itself calls the same helper) wins where it exists. `-d`-guarded, so a box
+# shipping neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# ── the worker launcher (worker-terminal.sh) ─────────────────────────────────────────────────────
+# Lanes and chains are WORKERS, so they are started by the same module orch-loop.sh uses — a durable
+# terminal where the cmux daemon answers, tmux (with an explicit HOME + keys.env contract) where it does
+# not. ⛔ The `~21 log lines` death that agent-infra#2210 first attributed to tmux is an ENVIRONMENT
+# failure (agent-infra#2210, reopened 2026-10-22): `gh`'s credential is HOME-bound, and the pre-fix tmux
+# arm passed no HOME, so a lane stopped at its first `gh` call. Leaving this path on `none` on a Linux
+# cell is what made the controller refuse every spawn, every cycle.
+for _wt_cand in "$O/worker-terminal.sh" "$(dirname "${BASH_SOURCE[0]:-$0}")/worker-terminal.sh"; do
+  [ -f "$_wt_cand" ] && { WT_MOD="$_wt_cand"; break; }
+done
+[ -n "${WT_MOD:-}" ] && . "$WT_MOD"
+# ⛔ The guard covers EVERY verb this script calls — `wt_launcher` (the startup/refusal line) and
+# `wt_count` (the final worker count) included, not only the three that look load-bearing: a module
+# that satisfies a narrower guard still leaves the controller printing `launcher=` and a false `0`.
+for _wt_v in wt_spawn wt_alive wt_close wt_launcher wt_count; do
+  command -v "$_wt_v" >/dev/null 2>&1 || { echo "dispatch-merge: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_close/wt_launcher/wt_count) — refusing to dispatch lanes that cannot be started or stopped; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"; exit 78; }
+done
 cd "$REPO" || { echo "dispatch-merge: cannot cd into $REPO — releasing every claim in this batch (no lane and no chain can start here)"
   for N in "$@"; do release_issue_claim_unspawned "$N"; done
   exit 1; }
 git fetch origin main --quiet 2>/dev/null
+
+# ── CI BACK-PRESSURE, READ ONCE FOR THE WHOLE BATCH ─────────────────────────────────────────────
+# This is the tool that STAMPEDES: it takes every issue it is handed and starts a lane for each, and
+# every lane ends in a PR that needs a full CI pass. Measured 2026-10-22 13:40 the queue was
+# queued=92/in_progress=6 on 5 runners (tortoise) and queued=97/in_progress=7 (agent-infra) — a batch
+# dispatched into that finishes nothing and makes the backlog worse. The read is the SAME module the
+# controller and fix-one.sh read (`ci-queue.sh`), so the three surfaces cannot disagree about the
+# queue. ⛔ BUT A DEFERRAL HERE IS NOT FREE (#2296 review cycle 4, P1): the controller takes the
+# claim (`claim_issue_acquire "" "$ISS"` in orch-loop.sh's dispatch block) and appends N to `.batch`
+# AND `dispatched.txt` BEFORE it hands the batch to this script, so "deferring claims nothing" was
+# FALSE. Without the release below, every issue in a deferred batch would sit on a 3 h cross-box
+# lease held by a box that started no work — refused by every peer — and be skipped by this box
+# until the row was reaped. The release and the row drop are what make "the issues stay in the pool,
+# re-decided on the next invocation" true. ⛔ SYMBOLS, NOT LINE NUMBERS (#2333 review, P2): this note
+# used to cite a line number in that block, and it drifted on the very next edit to orch-loop.sh.
+CIQ_MOD="$O/ci-queue.sh"
+[ -f "$CIQ_MOD" ] || CIQ_MOD="$(dirname "${BASH_SOURCE[0]:-$0}")/ci-queue.sh"
+if [ -f "$CIQ_MOD" ]; then
+  # shellcheck source=/dev/null
+  . "$CIQ_MOD"
+  # ⛔ AN INCOMPLETE MODULE IS SAID OUT LOUD, NOT SWALLOWED (#2333 review cycle 2, P2). With the
+  # interface guard missing one of the functions it then calls, `! ciq_ci_allowed` against an
+  # UNSOURCED function is `! 127` = TRUE — this dispatcher would print "nothing dispatched this run"
+  # and exit 0 for EVER, with nothing naming the broken gate (the same polarity trap `orch-loop.sh`
+  # names). So the absence is announced and the batch proceeds — the controller's own arm already
+  # made the fail-closed decision about this cycle.
+  # ⛔ THE GUARD NAMES EVERY FUNCTION THE CALLS ACTUALLY REACH, TRANSITIVELY (#2333 cycle 7, P2).
+  # `ciq_ci_allowed` calls `ciq_verdict`, and `ciq_eval` calls `ciq_is_count`; with `ciq_verdict`
+  # absent the predicate ran `ciq_verdict … >/dev/null 2>&1` -> rc 127 -> `case $? in 1) return 0
+  # ;; *) return 1` -> 1 = DEFER, SILENTLY, ON EVERY CALL, while this guard reported the module
+  # COMPLETE and printed no INCOMPLETE line — every fixer, rerun and batch stopped for ever by a
+  # half-stale copy. A guard that under-specifies its module is the same permanent-stop class as an
+  # unguarded call, reached through the guard instead.
+  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min >/dev/null 2>&1; then
+    if ! ciq_ci_allowed "$OR"; then
+      echo "dispatch-merge: nothing dispatched this run"
+      ciq_defer_note_here "the whole batch ($* — $# issue(s); each lane ends in a PR needing a full CI pass)"
+      # ⛔ UNDO WHAT THE CONTROLLER ALREADY DID (#2296 cycle 4, P1). Each issue here is CLAIMED
+      # (`refs/claims/issue-<N>`, 3 h lease) and recorded in `dispatched.txt` before this script was
+      # called. No lane and no chain will start, so nothing would ever reach the release in
+      # `chain-merge.sh`'s EXIT trap — the same failure `release_issue_claim_unspawned` exists for on
+      # the `cd` failure above. Release the claims AND drop the rows: a row with no dispatch makes
+      # this box skip a FREE issue until the reaper prunes it, which is a turn consumed for work that
+      # never started.
+      _deferred_ids=""
+      for N in "$@"; do
+        case "${N:-}" in ''|*[!0-9]*) continue ;; esac
+        release_issue_claim_unspawned "$N"
+        _deferred_ids="$_deferred_ids $N"
+      done
+      if [ -n "$_deferred_ids" ] && [ -f "$O/dispatched.txt" ]; then
+        _dtmp="$(mktemp "${TMPDIR:-/tmp}/dispatchmerge.XXXXXX" 2>/dev/null)" || _dtmp=""
+        if [ -n "$_dtmp" ] && awk -v ids="$_deferred_ids" \
+             'BEGIN{n=split(ids,a," "); for(i=1;i<=n;i++) if(a[i]!="") drop[a[i]]=1} !($0 in drop)' \
+             "$O/dispatched.txt" > "$_dtmp" 2>/dev/null; then
+          mv -f "$_dtmp" "$O/dispatched.txt" 2>/dev/null || rm -f "$_dtmp"
+        else
+          [ -n "$_dtmp" ] && rm -f "$_dtmp"
+        fi
+      fi
+      echo "dispatch-merge: re-run when the queue has drained; a lane started now would queue behind it and its PR would invalidate any head-bound review record it produces"
+      # ⛔ EXIT 3, NOT 0 (#2296 cycle 6, P2): the controller counted each of these issues as
+      # DISPATCHED (`K`) before calling this script, so a plain `exit 0` left the funnel printing
+      # `… -> N dispatched` and the cycle record `dispatched=N ids=… nothing=none` on the one
+      # cycle the gate deferred everything. 3 is the code the controller reads to record
+      # `dispatched=0` with a named reason — the same row says the truth as the claims it just
+      # released.
+      exit 3
+    fi
+  else
+    # Keep the name list byte-identical to the `declare -f` guard above (#2333 review cycle 12, P2):
+    # a stale `$O` copy is the case this message reports, so the list is LITERAL — it cannot be
+    # rendered from a variable the module would define.
+    echo "dispatch-merge: WARNING — $CIQ_MOD is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count/ciq_ceiling/ciq_defer_line/ciq_horizon_min/ciq_job_p90_min); the CI-queue gate is INERT for this batch" >&2
+  fi
+else
+  # ⛔ AN ABSENT MODULE IS ANNOUNCED TOO (#2333 cycle 3, P2). This is the stale-`$O` shape that
+  # `install.sh` and `check-single-source.sh` now detect — and a silent skip here means the batch
+  # stampedes exactly as before while every OTHER surface (the controller, `fix-one.sh`) says
+  # UNMEASURED out loud. Silence in one of three callers is how a gate rots into a decoration.
+  echo "dispatch-merge: WARNING — no ci-queue.sh at $CIQ_MOD; the CI-queue gate is UNMEASURED for this batch (the batch proceeds, and the controller's own arm already decided this cycle)" >&2
+fi
 
 for N in "$@"; do
   # Issue numbers come from the GitHub API via candidates.txt; never let one reach a shell string.
@@ -74,8 +182,24 @@ for N in "$@"; do
     git worktree add ".worktrees/$WT" -b "$BR" origin/main >/dev/null 2>&1 \
       || { echo "#$N: worktree add failed (branch exists?) — skipping"; release_issue_claim_unspawned "$N"; continue; }
   fi
-  tmux new-session -d -s "lane-$N" "cd '$REPO/.worktrees/$WT' && bash '$O/lane.sh' $N '$BR' '$OR'" 2>/dev/null \
-    && echo "#$N: lane-$N (implement+PR)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
+  # #2216 brought a second disclosure into this line: WHICH harness the spawn was computed from, so a
+  # lane that behaves unlike a peer is traceable to a stale checkout. Both disclosures belong on the
+  # same line — the launcher names HOW it was spawned (durable terminal vs tmux), the token names
+  # WHAT it was spawned from.
+  # ⛔ THE DISCLOSURE IS NOT CONDITIONAL ON THE SPAWN SUCCEEDING (agent-infra#2215's C2 arm drives a
+  # box where the launcher REFUSES — no surface at all (no cmux answer AND no tmux), or a spawn the
+  # credential contract refuses — and a refusal that says nothing
+  # about the harness is the case where the operator most needs it: "why did this box not start a
+  # lane?" and "which tree is it running?" are one question. So BOTH outcomes carry the token, and
+  # the success line still only appears when the lane really started.
+  # An EMPTY token (the box is current) appends nothing at all — `${T:+ …}`, never `${T:-…}`.
+  _lan="$(wt_launcher)"
+  _hd="${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
+  if wt_spawn "lane-$N" "$REPO/.worktrees/$WT" "bash '$O/lane.sh' $N '$BR' '$OR'"; then
+    echo "#$N: lane-$N (implement+PR, launcher=$_lan)$_hd"
+  else
+    echo "#$N: lane-$N NOT spawned (launcher=$_lan)$_hd"
+  fi
   # ⛔ IF THE CHAIN CANNOT BE STARTED, NO TRAP WILL EVER RELEASE THE CLAIM (2026-10-16 review): this
   # was the second no-chain path, and it was covered by nothing. A stale `chain-$N` session name, a
   # dead tmux server or tmux missing all land here, and the issue then stays claimed on every box for
@@ -90,9 +214,16 @@ for N in "$@"; do
   # RELEASED or to reach its CLAIM_ISSUE_TTL (3h) first — not because the gap is small. Do not shorten
   # the TTL without revisiting this line.
   chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
-  if tmux new-session -d -s "chain-$N" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'" 2>/dev/null; then
+  if wt_spawn "chain-$N" "$REPO" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'"; then
     echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else
+    # The same disclosure on the refusal path (see the lane spawn above): a chain that never started
+    # is the other half of "what did this box do, and from which tree".
+    # ⛔ `${_lan-}` AND NOT `$_lan`: this branch is EXTRACTED AND DRIVEN STANDALONE by
+    # refresh-scout.test.sh (which anchors on the `if wt_spawn "chain-` line and runs the fragment
+    # with stubbed launcher verbs), so every variable it reads must be safe when unset — the suite
+    # runs under `set -u` and a bare `$_lan` aborted the fragment into a false "released 0 times".
+    echo "        chain-$N NOT spawned (launcher=${_lan-})${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
     # ⛔ THE LANE IS ALREADY RUNNING (the spawn two lines up) — so "no chain will ever run" is true
     # while "nothing is running" is NOT, and releasing here would declare an issue this box is
     # ACTIVELY IMPLEMENTING free: a peer claims it, duplicates the work, and this box still opens a PR
@@ -101,10 +232,10 @@ for N in "$@"; do
     # pool on its lease. So STOP THE LANE FIRST and release only once it is confirmed gone; if it
     # cannot be stopped, KEEP the claim: the lease expiring it is the safe direction.
     echo "#$N: chain-$N could NOT be started — stopping lane-$N (its PR would never be merged)"
-    if tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "lane-$N"; then
-      tmux kill-session -t "lane-$N" 2>/dev/null || true
+    if wt_alive "lane-$N"; then
+      wt_close "lane-$N" || true
     fi
-    if tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "lane-$N"; then
+    if wt_alive "lane-$N"; then
       echo "#$N: ⚠️ lane-$N is still alive — KEEPING the issue claim (releasing it would let a peer duplicate this work); it expires with the lease"
     else
       echo "#$N: lane-$N stopped — releasing the issue claim"
@@ -113,5 +244,5 @@ for N in "$@"; do
   fi
   sleep 30   # stagger uv sync
 done
-echo "--- tmux: $(tmux ls 2>/dev/null | wc -l | tr -d ' ') sessions ---"
+echo "--- workers (launcher=$(wt_launcher)): $(wt_count lane- chain-) ---"
 uptime | sed 's/.*load/load/'

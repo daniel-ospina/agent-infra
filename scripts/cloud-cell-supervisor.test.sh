@@ -76,6 +76,15 @@ trap 'ai1711_cleanup; tmux kill-session -t "=${DOCTOR_SESSION:-cell-doctor}" 2>/
 # exercised deliberately, not by accident).
 export DOCTOR_SESSION="cell-doctor-test-$$"
 tmux kill-session -t "=cell-doctor" 2>/dev/null || true
+# ⛔ THE SERVICE SEAM IS PINNED AWAY FROM THIS BOX (#2402). `cloud-cell-supervisor.sh` now asks whether a
+# controller SERVICE is installed and enabled, and delegates `start`/`stop` to the service manager when it
+# is. That answer is MACHINE state (`/etc/systemd/system`, `$HOME/.config/systemd/user`), so on a cell
+# where the controller is service-managed — the state #2402 exists to create — this suite would drive the
+# REAL unit: `start` would start the production dispatcher and `stop` would stop it, from a test.
+# Every invocation below inherits these exports (no `env -i` wraps the supervisor), so one pin covers all
+# of them; the arms that exercise service mode live in `install-controller-service.test.sh`, which points
+# both dirs at its own fixtures.
+export CONTROLLER_SYSTEM_UNIT_DIR="$T/no-system-units" CONTROLLER_USER_UNIT_DIR="$T/no-user-units"
 
 for f in "$SUP" "$BRINGUP"; do
   [ -f "$f" ] && ok "shipped script present: $(basename "$f")" || { bad "missing $f"; exit 1; }
@@ -121,6 +130,10 @@ make_ai_repo() {
   for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
+  # ⛔ the REAL launcher module (agent-infra#2210), not an empty placeholder: `start`'s unattended
+  # prune asks it for the worker census, and an empty copy can only answer "unknown" — which makes
+  # that arm skip the prune in BOTH cases and tests nothing.
+  cp "$(dirname "$SUP")/orchestrator-harness/worker-terminal.sh" "$AI/scripts/orchestrator-harness/worker-terminal.sh"
   write_doctor_stub "$AI/scripts/orchestrator-harness"
   # #1717: `start` PROVISIONS the record step from the harness checkout — `recorder_src()` resolves
   # `$HARNESS/../record-review.sh` plus its declared sibling `lib/diff-normalize.py` — so a fixture
@@ -764,14 +777,44 @@ stub_missing "$P/bin" pi
 cat > "$P/bin/tmux" <<'SH'
 #!/bin/bash
 case "${1:-}" in
-  has-session) [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
-  new-session) : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
-  ls) if [ -n "${PROV_TMUX_STREAM:-}" ]; then printf 'merge-1: x\n'; i=0; while [ "$i" -lt 60000 ]; do printf 'other-%s: y\n' "$i"; i=$((i+1)); done; exit 0; fi
-      [ -n "${PROV_TMUX_SESSIONS:-}" ] && printf '%s\n' "$PROV_TMUX_SESSIONS"; exit 0 ;;
+  has-session)
+    # #2306: the doctor session is made to FAIL its launch while the controller's still succeeds, so
+    # the two new-session calls are told apart by NAME (the doctor session is `cell-doctor`).
+    case " $* " in *"=cell-doctor"*) [ -n "${PROV_TMUX_FAIL:-}" ] && exit 1 ;; esac
+    [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
+  new-session)
+    case " $* " in
+      *"-s cell-doctor"*) [ -n "${PROV_TMUX_FAIL:-}" ] && { printf 'server exited unexpectedly\n' >&2; exit 1; } ;;
+    esac
+    : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
+  ls) if [ -n "${PROV_TMUX_STREAM:-}" ]; then
+        # BARE names, like `tmux ls -F '#{session_name}'`: the census reads the field, not the
+        # human description, so a stream of "merge-1: x" lines names no worker at all.
+        printf 'merge-1\n'; i=0; while [ "$i" -lt 60000 ]; do printf 'other-%s\n' "$i"; i=$((i+1)); done; exit 0
+      fi
+      if [ -n "${PROV_TMUX_SESSIONS:-}" ]; then
+        case " $* " in
+          *" -F "*) printf '%s\n' "$PROV_TMUX_SESSIONS" | sed 's/:.*//' ;;
+          *)       printf '%s\n' "$PROV_TMUX_SESSIONS" ;;
+        esac
+        exit 0
+      fi ;;
   *) exit 0 ;;
 esac
 SH
 chmod +x "$P/bin/tmux"
+# A cmux double for the DURABLE-TERMINAL census (agent-infra#2210). The supervisor's worker count no
+# longer reads tmux, so an arm that wants "a worker exists" must present it the way a cell does.
+# Silent unless PROV_CMUX_TREE is set, so every other arm sees exactly what it saw before.
+cat > "$P/bin/cmux" <<'SH'
+#!/bin/bash
+case "${1:-}" in
+  tree)    [ -n "${PROV_CMUX_TREE:-}" ] && { printf '%s\n' "$PROV_CMUX_TREE"; exit 0; }; exit 1 ;;
+  surface) echo 'cmux: unknown resource scope "surface"' >&2; exit 1 ;;
+esac
+exit 0
+SH
+chmod +x "$P/bin/cmux"
 # A `df` stub emitting a realistic `df -Pk` line whose 4th column is 1KiB blocks. Parameterized so
 # the free-space-floor arms can straddle the REAL floor: a single "nearly full" stub cannot see the
 # KiB/MiB unit error, because 1 KiB is below any plausible threshold under either reading.
@@ -888,6 +931,28 @@ case "$PROV_OUT" in
   *"$(printf '%s' "$WANT" | cut -c1-12)"*) ok "status prints the recorded harness commit" ;;
   *) bad "status does not print the recorded commit — $PROV_OUT" ;;
 esac
+# ⛔ `lanes:` is the launcher's census, not `tmux ls` (agent-infra#2210): on a cell the lanes are cmux
+# durable terminals, so a tmux-only count printed 0 for a busy box — and a revert must red these two.
+PROV_CMUX_TREE='{"workspaces":[{"id":"ws_l9","name":"wt-lane-9"}],"screens":[{"id":"s9","workspace_id":"ws_l9","layout":{"root":{"tab_ids":["t9"]}}}],"tabs":[{"id":"t9","content_id":"term_l9"}],"terminals":[{"id":"term_l9","running":true}]}' prov status
+case "$PROV_OUT" in
+  *"lanes: 1"*) ok "status counts a durable-terminal lane (a cmux-only worker reads as 1)" ;;
+  *) bad "status does not count a durable-terminal lane — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
+esac
+prov status
+case "$PROV_OUT" in
+  *"lanes: 0"*) ok "…and reports an idle cell as 0 (an honest zero, not UNKNOWN, when the census answers)" ;;
+  *) bad "status does not report 0 for an idle census — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
+esac
+# ⛔ A `chain-*` WORKER IS A WORKER FOR THIS DECISION TOO (review finding on #2210's fix). The census
+# filter in worker-terminal.sh counts `chain-<N>` (dispatch-merge.sh spawns them; they live ~90 min),
+# but this count listed only lane-/fix-/merge-, so a chain-only box read "no workers" — and
+# `workers_maybe_live()` is what authorises the DESTRUCTIVE cache/disk sweep to run. A census that
+# reports a worker the decision cannot see is a census the decision does not have.
+PROV_TMUX_SESSIONS='chain-9' prov status
+case "$PROV_OUT" in
+  *"lanes: 1"*) ok "status counts a chain-only worker (the census and the destructive gate are one population)" ;;
+  *) bad "status reports 0 for a chain-only census — the sweep would run under a live chain worker — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
+esac
 
 # (e2) APPLY --pin-only — the ADVANCE path a RUNNING cell uses (agent-infra#2215).
 # The per-cycle self-refresh must move the pin WITHOUT re-seeding $O: seeding underneath a live controller
@@ -966,6 +1031,32 @@ prov start
 GOT="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
 [ "$GOT" = "$WANT" ] && ok "start recorded origin/main's commit, not the stale tree it was pointed at" \
                      || bad "start recorded '$GOT', want '$WANT'"
+
+# (g2) A PRESENT DOCTOR THAT FAILS TO LAUNCH IS NOT A RETIRED ARTIFACT (agent-infra#2306).
+# The measured cell had the doctor at $O/cloud-cell-doctor.sh — `doctor_path` had already succeeded, or
+# it would have warned the other way — while `tmux new-session` printed "server exited unexpectedly"
+# into a DISCARDED stderr. `start` then reported "cloud-cell-doctor.sh not shipped" (a false CAUSE:
+# #2160's retirement message, for a file that was right there) and returned 0 (a false SUCCESS).
+PROV_TMUX_FAIL=1 prov start
+case "$PROV_OUT" in
+  *"not shipped"*) bad "start: blamed a retired artifact for a LAUNCH failure (the doctor is IN \$O)" ;;
+  *) ok "start: does not report a doctor that is present as 'not shipped'" ;;
+esac
+case "$PROV_OUT" in
+  *"LAUNCH failure"*) ok "start: names the launch failure for what it is" ;;
+  *) bad "start: the launch failure is not named — $(printf '%s' "$PROV_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+case "$PROV_OUT" in
+  *"server exited unexpectedly"*) ok "start: carries tmux's own stderr into the report (it was discarded)" ;;
+  *) bad "start: tmux's stderr was dropped — $(printf '%s' "$PROV_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+[ "$PROV_RC" -ne 0 ] && ok "start: a present-but-unlaunchable doctor is NOT a successful start" \
+                     || bad "start: returned 0 with no doctor loop running (a false success)"
+# …and the POSITIVE control: the same fixture WITHOUT the launch failure starts the doctor loop and
+# returns 0, so the arm above is decided by the failure and not by a fixture that always fails.
+prov start
+[ "$PROV_RC" -eq 0 ] && case "$PROV_OUT" in *"doctor loop started"*) ok "start: the same fixture with a working tmux starts the doctor loop (non-vacuity)" ;; *) bad "start: no doctor-loop start reported — $(printf '%s' "$PROV_OUT" | tail -2 | tr '\n' ' ')" ;; esac \
+                     || bad "start: the control arm failed — $(printf '%s' "$PROV_OUT" | tail -2 | tr '\n' ' ')"
 
 # (h) THE FREE-SPACE FLOOR — a full disk is what breaks a cell FIRST, and it used to read healthy.
 # ⛔ PH is re-read from the record FIRST: (g) left it pointing at the diverged tree, so without this
@@ -1153,7 +1244,7 @@ fetch_prov apply
 # The guard only checked the CONTROLLER session, while orch-loop.sh spawns workers into their own
 # detached sessions and `stop` kills only the controller — so a `merge-*` worker can still be running
 # when `start` runs, and `cmd_prune --caches` would delete the `.venv` under it.
-say_case "start does not auto-prune caches while worker sessions run (#1745)"
+say_case "start does not auto-prune caches while workers may be live (#1745, #2210)"
 # ⛔ THE MARKER MOVED OFF `.venv` (agent-infra#1932). A per-worktree `.venv` is no longer swept blindly
 # by this path at all — its only deleter is reap-lane-venvs.sh, which needs proof that no lane is alive
 # — so "the venv survived" can no longer distinguish "the guard held" from "the sweep never ran".
@@ -1169,7 +1260,7 @@ PROV_TMUX_SESSIONS='merge-42: 1 windows (created Thu Oct 15 21:00:00 2026) (grou
 [ -d "$P/repo/.venv" ] && ok "the lane's .venv survived (it is not this sweep's to delete, #1932)" \
                        || bad "start deleted a .venv — the blind sweep is back"
 case "$PROV_OUT" in
-  *"worker sessions are still running"*) ok "the unattended path said WHY it stood down" ;;
+  *"workers may still be running"*) ok "the unattended path said WHY it stood down" ;;
   *) bad "the stand-down is unexplained — $PROV_OUT" ;;
 esac
 unset PROV_TMUX_SESSIONS
@@ -1194,6 +1285,21 @@ PROV_TMUX_STREAM=1 PPATH="$P/prunebin" prov start
 [ -d "$P/repo/node_modules" ] && ok "start does NOT auto-prune when the worker listing STREAMS (no '| grep -q' SIGPIPE fail-open)" \
                              || bad "start pruned a LIVE worker's cache — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
 unset PROV_TMUX_STREAM
+# ⛔ THE ARM THAT DISCRIMINATES CENSUS FROM TMUX (review cycle 2, agent-infra#2210): a worker that
+# exists ONLY as a durable terminal, with the tmux listing EMPTY — the shape every cmux-ANSWERING
+# cell is in (a cell whose guest cmux cannot answer runs tmux sessions instead, #2210, which the two
+# PROV_TMUX_ arms above cover). The
+# pre-fix guard (`tmux ls | grep -cE '^(lane|fix|merge)-'`) sees nothing here and prunes a live
+# lane's caches; reverting the fix must red THIS arm, which is why it is separate from the tmux one.
+rm -rf "$P/repo/node_modules"; mkdir -p "$P/repo/node_modules"
+PROV_CMUX_TREE='{"workspaces":[{"id":"ws_l9","name":"wt-lane-9"}],"screens":[{"id":"s9","workspace_id":"ws_l9","layout":{"root":{"tab_ids":["t9"]}}}],"tabs":[{"id":"t9","content_id":"term_l9"}],"terminals":[{"id":"term_l9","running":true}]}' \
+  PPATH="$P/prunebin" prov start
+[ -d "$P/repo/node_modules" ] && ok "start does NOT prune while a worker exists only as a DURABLE TERMINAL (a cell's shape)" \
+                             || bad "start pruned caches under a live durable-terminal lane — the census still reads tmux"
+case "$PROV_OUT" in
+  *"workers may still be running"*) ok "…and says so (the stand-down is not silent)" ;;
+  *) bad "the durable-terminal stand-down is unexplained — $PROV_OUT" ;;
+esac
 PPATH=""
 
 # ── 10) PRUNE: the destructive verb (agent-infra#1745) ─────────────────────────────────────────────
@@ -1243,6 +1349,75 @@ rm -rf "$R/repo-wt/.venv"; mkdir -p "$R/repo-wt/.venv"; printf 'x\n' > "$R/repo-
 PRUNE_VENV_MIN_AGE=0 prunesup --caches
 [ -e "$R/repo-wt/.venv" ] && bad "prune --caches did not reclaim a provably-dead lane's .venv (the delegation is dead)" \
                           || ok "prune --caches reclaims a lane .venv once the reaper can prove it is dead"
+
+# ⛔ THE CALLER'S PER-ROOT EXCLUSION (agent-infra#2573). The doctor's hygiene role proves, per worktree
+# root, whether a LIVE process has a cwd inside it, and excludes exactly those so the rest can still be
+# swept on the busiest box. The verb must therefore honour the exclusion — and it must stay an
+# EXCLUSION: every root the caller does NOT name (here the main checkout; in production $HARNESS_REPO's
+# worktrees, which the doctor cannot even enumerate) keeps its coverage. Both directions, one arm.
+mkdir -p "$R/repo-wt/node_modules" "$R/repo/.pytest_cache"
+printf 'x\n' > "$R/repo-wt/node_modules/marker"; printf 'x\n' > "$R/repo/.pytest_cache/marker"
+prunesup --caches --exclude-root="$R/repo-wt"
+[ -e "$R/repo-wt/node_modules" ] && ok "prune --exclude-root: the EXCLUDED root keeps its caches (a live process holds it)" \
+                                 || bad "prune --exclude-root swept a root it was told to spare"
+[ -e "$R/repo/.pytest_cache" ] && bad "prune --exclude-root: a root the caller did NOT exclude was left unswept (an exclusion list must not narrow coverage)" \
+                               || ok "prune --exclude-root: a root the caller did NOT name is still swept (exclusion, never inclusion)"
+case "$PR_OUT" in
+  *"NOT swept at $R/repo-wt"*) ok "prune --exclude-root: the skip is REPORTED by path, never silent" ;;
+  *) bad "prune --exclude-root: the excluded root was skipped without saying so — $PR_OUT" ;;
+esac
+# A ROOT CAN BE THE MAIN CHECKOUT, and the cache loop reaches it through a SECOND call site (the
+# `sweep_root_caches "$r"` line). Excluding only the linked-worktree loop would leave that one armed.
+mkdir -p "$R/repo/node_modules"; printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/repo"
+[ -e "$R/repo/node_modules" ] && ok "prune --exclude-root: the MAIN checkout root is spared when it is the excluded one" \
+                             || bad "prune --exclude-root: the main checkout's own root was swept despite the exclusion"
+# A path that no longer exists cannot be held by a live process (and `sweep_root_caches` skips a missing
+# root anyway), so a stale exclusion must not silently disable the sweep.
+mkdir -p "$R/repo/node_modules"; printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/gone-root"
+[ -e "$R/repo/node_modules" ] && bad "prune --exclude-root: a vanished exclusion path disabled the sweep (it spared a root nothing holds)" \
+                             || ok "prune --exclude-root: an exclusion path that no longer exists does not stop the sweep"
+# ⛔ THE DECISIVE CASE (agent-infra#2573 review, P1): the caller excludes the PARENT root, which is
+# exactly what the doctor does when the cwd census finds a live process anywhere under the repo (the
+# fleet layout: every lane worktree is `<repo>/.worktrees/<lane>`). A prefix match on the DESCENDANT
+# side then skips every worktree under it — all lanes spared, while the caller reports "swept N idle
+# root(s)". Restoring `case "$root" in "$cand"/*` reddens this arm.
+git -C "$R/repo" worktree add -q --detach "$R/repo/.worktrees/laneC" HEAD 2>/dev/null || true
+mkdir -p "$R/repo/.worktrees/laneC/node_modules" "$R/repo/node_modules"
+printf 'x\n' > "$R/repo/.worktrees/laneC/node_modules/marker"
+printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/repo"
+[ -e "$R/repo/.worktrees/laneC/node_modules" ] && bad "prune --exclude-root: an excluded PARENT spared every worktree UNDER it — one live lane disables the sweep (the #2573 clamp, one level down)" \
+                                              || ok "prune --exclude-root: a worktree UNDER an excluded parent is still swept"
+[ -e "$R/repo/node_modules" ] && ok "prune --exclude-root: the excluded parent's OWN root is still spared" \
+                             || bad "prune --exclude-root: the excluded parent's own caches were swept"
+
+# ⛔ ONE HELD ROOT MUST NOT SPARE ITS SIBLINGS (agent-infra#2573 review, P1). The fleet puts every lane
+# worktree under `<repo>/.worktrees/<lane>`, so a prefix match in the WRONG direction — `case "$root" in
+# "$cand"/*` — made ONE live lane exclude every sibling root, while the caller still reported "swept N
+# idle root(s)": the same self-disable #2573 exists to remove, one level down. Two NESTED registered
+# worktrees are the reproduction; restoring that arm reddens the two `ok`s below.
+git -C "$R/repo" worktree add -q --detach "$R/repo/.worktrees/laneA" HEAD
+git -C "$R/repo" worktree add -q --detach "$R/repo/.worktrees/laneB" HEAD
+mkdir -p "$R/repo/.worktrees/laneA/node_modules" "$R/repo/.worktrees/laneB/node_modules" "$R/repo/node_modules"
+printf 'x\n' > "$R/repo/.worktrees/laneA/node_modules/marker"
+printf 'x\n' > "$R/repo/.worktrees/laneB/node_modules/marker"
+printf 'x\n' > "$R/repo/node_modules/marker"
+prunesup --caches --exclude-root="$R/repo/.worktrees/laneA"
+[ -e "$R/repo/.worktrees/laneA/node_modules" ] && ok "prune --exclude-root: a NESTED held worktree keeps its caches" \
+                                              || bad "prune --exclude-root: the nested excluded worktree was swept"
+[ -e "$R/repo/.worktrees/laneB/node_modules" ] && bad "prune --exclude-root: one held worktree spared its SIBLING (the clamp is back, one level down)" \
+                                              || ok "prune --exclude-root: a SIBLING of a held worktree is still swept (exclusion is per-root, not per-repo)"
+[ -e "$R/repo/node_modules" ] && ok "prune --exclude-root: an ANCESTOR of a held root is spared too (its own find -maxdepth 5 recurses INTO it)" \
+                             || bad "prune --exclude-root: the parent checkout was swept while a held worktree sat inside it"
+# A RELATIVE exclusion would be resolved against whatever directory the caller happened to be in, so it
+# is refused — a silent misresolution is a held root that gets swept.
+prunesup --caches --exclude-root=relative/path
+[ "$PR_RC" -ne 0 ] && case "$PR_OUT" in
+  *"--exclude-root needs an ABSOLUTE path"*) ok "prune --exclude-root: a relative path is REFUSED (it would resolve against the caller's cwd)" ;;
+  *) bad "prune --exclude-root: rc=$PR_RC but the refusal is not explained — $PR_OUT" ;;
+esac || bad "prune --exclude-root: a relative exclusion path was accepted (rc=$PR_RC)"
 # (ii) --scratch: a registered worktree is unmerged work and must survive; an unregistered old
 # checkout is what the flag exists to reclaim.
 git -C "$R/repo" worktree add -q --detach "$R/scratch/registered" HEAD
@@ -1844,6 +2019,76 @@ case "$Q_OUT" in
   *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
 esac
+# ── (l) THE SESSION'S ENV IS CARRIED INSIDE THE COMMAND STRING — AND GH_REPO IS NOT ──────────────
+# MEASURED 2026-10-21, two failures with one root: a tmux session is served the TMUX SERVER's
+# environment, not the caller's, so an ambient export silently vanishes when a server already exists —
+# the loop on one cell died `FATAL REPO is not set`. And a cell's pushed `keys.env` carried
+# `export GH_REPO=daniel-ospina/tortoise`, which gh honours as the DEFAULT repo for every command, so
+# agent-infra rails on that box graded a tortoise PR and printed `ALREADY MERGED` over zero work.
+# Both halves are asserted on the SHIPPED string, executed the way tmux executes it: the recorded
+# command is run under `env -i` (no caller environment at all — the worst-case server) with ONLY the
+# final controller exec replaced by a probe. Nothing else is rewritten, so an `export` moved back out
+# of the string fails here even though the string still mentions the name.
+say_case "the session env lives INSIDE the command string, and GH_REPO is neutralised (#2216 class)"
+printf 'export GH_REPO=daniel-ospina/tortoise\n' > "$Q/keys.env"
+qsup start "$Q/agent-repo" "$Q/st-env"
+[ "$Q_RC" -eq 0 ] && ok "start proceeds with a keys.env that exports a GLOBAL GH_REPO (it is neutralised, not refused)" \
+                  || bad "start refused a cell merely because its keys.env carries GH_REPO: $Q_OUT"
+# ⛔ THE COMMAND UNDER TEST IS THE CONTROLLER'S, NOT THE DOCTOR'S. The stub records a single `cmd`
+# file and the LAST session launched is the doctor (`bash cell-doctor.sh loop`), so reading that file
+# graded the WRONG command string — this check then reported "unproven" rather than red, which is the
+# false-negative shape it exists to avoid. The controller's own argv line is the one naming orch-loop.sh.
+_CTRL_ARGV="$(grep -F 'orch-loop.sh' "$Q/st-env/argv" 2>/dev/null | tail -1)"
+_COMMAND=""
+if [ -n "$_CTRL_ARGV" ]; then
+  _COMMAND="${_CTRL_ARGV#*-c }"   # drop `new-session -d -s <sess> -c `
+  _COMMAND="${_COMMAND#* }"       # drop the -c DIRECTORY (the harness path; it carries no spaces)
+fi
+[ -n "$_COMMAND" ] || bad "could not recover the controller's command string from the stub argv — the env-in-session assertions would grade nothing"
+# (1) STATIC: the unset is inside the string, AFTER the keys.env source (otherwise the source puts it
+# back — the file is re-sourced by the session itself) and BEFORE the controller exec.
+_ranks="$(printf '%s\n' "$_COMMAND" | awk '{ i=index($0,"keys.env"); j=index($0,"unset GH_REPO"); k=index($0,"orch-loop.sh");
+    print (i>0 && j>i && k>0 && j<k) ? "ordered" : "out-of-order" }')"
+case "$_ranks" in
+  ordered) ok "the unset GH_REPO is inside the command string, after the keys.env source and before the controller exec" ;;
+  *) bad "the unset GH_REPO is missing or misplaced in the command string — a session that re-sources keys.env would carry the global repo: $_COMMAND" ;;
+esac
+# (2) RUNTIME: run the SHIPPED string the way tmux does (env -i + the server's environment) with only
+# the controller exec swapped for a probe. This is what proves the values SURVIVE into the session.
+# The prefix is taken by PARAMETER EXPANSION (strip from the single `bash '<harness>/orch-loop.sh'`
+# tail), not by a regex: the string is full of shell metacharacters and a pattern that half-matched
+# would silently build a probe that proves nothing.
+_PROBE="$Q/st-env/probe.sh"
+# ⛔ NO QUOTED GLOB IN THE STRIP: in `${var%pattern}` a quoted `'*'` is a LITERAL asterisk, so
+# `${_COMMAND%bash '*'}` matches nothing and the probe silently fell back to the whole string (measured
+# here — the failed match is why the honest branch below is "could not build" rather than a false pass).
+_PROBE_CMD="$(printf '%s' "$_COMMAND" | sed "s#bash '[^']*/orch-loop[.]sh'.*##")"
+if [ -n "$_PROBE_CMD" ] && [ "$_PROBE_CMD" != "$_COMMAND" ]; then
+  printf '%s\n' "$_PROBE_CMD" > "$_PROBE"
+  printf 'printf "REPO=%%s GH_REPO=%%s OR=%%s\\n" "$REPO" "${GH_REPO:-<unset>}" "$OR" > "%s"\n' \
+    "$Q/st-env/inside" >> "$_PROBE"
+  ( cd / && env -i PATH=/usr/bin:/bin HOME="$Q/home" bash "$_PROBE" >/dev/null 2>&1 )
+  _INSIDE="$(cat "$Q/st-env/inside" 2>/dev/null)"
+  case "$_INSIDE" in
+    *"REPO=$Q/agent-repo"*) ok "the launcher's REPO SURVIVES into the session under env -i (\"$_INSIDE\")" ;;
+    *) bad "REPO did not survive into the session (got '$_INSIDE') — the loop would die FATAL REPO is not set" ;;
+  esac
+  case "$_INSIDE" in
+    *"GH_REPO=<unset>"*) ok "GH_REPO is EMPTY inside the session even though keys.env exported it globally" ;;
+    *GH_REPO=?*) bad "the session inherited a GLOBAL GH_REPO ('$_INSIDE') — every gh call on this box would default to that repo" ;;
+    *) bad "the probe did not report GH_REPO at all ('$_INSIDE') — cannot-verify is not a pass here" ;;
+  esac
+else
+  bad "could not build the runtime probe from the recorded command string — the env-in-session claim is unproven (tail: '${_COMMAND: -160}')"
+fi
+# (3) The bring-up half: it must not WRITE a global GH_REPO, and it must drop one that is pushed.
+grep -nE '^[[:space:]]*(export[[:space:]]+)?GH_REPO=' "$BRINGUP" >/dev/null 2>&1 \
+  && bad "cloud-cell-bringup.sh WRITES/EXPORTS a global GH_REPO — the repo must be per-invocation state" \
+  || ok "cloud-cell-bringup.sh writes no global GH_REPO"
+grep -qF 'unset GH_REPO' "$BRINGUP" \
+  && ok "cloud-cell-bringup.sh DROPS a GH_REPO pushed through keys.env (the measured wrong-repo defect)" \
+  || bad "cloud-cell-bringup.sh does not neutralise a pushed GH_REPO"
+
 # ── (l) one owner per controller (agent-infra#1761) ───────────────────────────────────────────────
 # The cell's controller answer must come from the harness's own AUTHORITY (the pid $O/.orch.lock
 # names) and this cell's own orch-loop.sh processes — never from `tmux has-session` alone. Measured
@@ -1993,6 +2238,246 @@ case "$OUT" in
   *"controller: STOPPED"*) ok "status: STOPPED once the owner is genuinely gone" ;;
   *) bad "status: still reports a controller after stop — $OUT" ;;
 esac
+
+# ── #2402 cycle-2: a unit stop's EFFECT is read AFTER the teardown ─────────────────────────────────
+# The effect check used to run AT the `systemctl stop` call, where the two states are indistinguishable:
+#   (a) unit installed but DISABLED (the migration state) — the unit stop is a deliberate NO-OP and the
+#       pid teardown stops the controller. Reading early failed a stop that then succeeded, and
+#       `harness-down` turned that into a refusal over a quiet box;
+#   (b) the OTHER scope's unit under `Restart=always` — the stop lands on the wrong manager and a
+#       controller comes back AFTER the teardown. Only a post-teardown observation can see it, and
+#       skipping the check whenever the addressed unit is disabled hides exactly this case.
+say_case "stop on a service-managed box: the unit's effect is read AFTER the teardown"
+S2="$T/svc2"; rm -rf "$S2"; mkdir -p "$S2/units" "$S2/o" "$S2/home" "$S2/repo" "$S2/bin"
+: > "$S2/units/eldato-orchestrator.service"
+cat > "$S2/bin/systemctl" <<'SH'
+#!/bin/bash
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  is-enabled) printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  stop)       [ -n "${SVC_HOOK:-}" ] && [ -x "${SVC_HOOK:-}" ] && "$SVC_HOOK"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S2/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S2/o/orch-loop.sh"
+svc_sup() { # <verb>
+  PATH="$S2/bin:$PATH" SYSTEMCTL="$S2/bin/systemctl" SVC_HOOK="${SVC_HOOK:-}" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$S2/units" CONTROLLER_USER_UNIT_DIR="$T/no-user-units" \
+    CELL_HOME="$S2/home" ENV_FILE="$S2/keys.env" SESSION="svc2402-$$" O="$S2/o" REPO="$S2/repo" \
+    OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" CONTROLLER_STOP_TIMEOUT=3 \
+    bash "$SUP" "$1" 2>&1
+}
+# (a) BENIGN migration state: the teardown stops it, and the verdict must be a clean stop.
+rm -f "$S2/o/.orch.lock"; bash "$S2/o/orch-loop.sh" & S2P=$!
+printf '%s\n' "$S2P" > "$S2/o/.orch.lock"; sleep 0.3
+unset SVC_HOOK
+S2_OUT="$(svc_sup stop)"; S2_RC=$?
+[ "$S2_RC" -eq 0 ] && ok "stop: installed-but-DISABLED → rc=0 (the teardown's stop is not a false failure)" \
+                   || bad "stop: rc=$S2_RC over a stop that succeeded — $S2_OUT"
+case "$S2_OUT" in
+  *'not reporting a stop'*) bad "stop: warned 'not reporting a stop' over a quiet box — $S2_OUT" ;;
+  *) ok "stop: no false 'not reporting a stop' in the migration state" ;;
+esac
+kill -0 "$S2P" 2>/dev/null && kill -9 "$S2P" 2>/dev/null
+# (b) a controller comes BACK after the teardown (the other scope's Restart=always): the verb must FAIL.
+cat > "$S2/hook" <<SH
+#!/bin/bash
+( sleep 1; bash "$S2/o/orch-loop.sh" >/dev/null 2>&1 & printf '%s\n' "\$!" > "$S2/o/.orch.lock" ) >/dev/null 2>&1 &
+SH
+chmod +x "$S2/hook"; rm -f "$S2/o/.orch.lock"
+SVC_HOOK="$S2/hook" S2B_OUT="$(SVC_HOOK="$S2/hook" svc_sup stop)"; S2B_RC=$?
+[ "$S2B_RC" -ne 0 ] && ok "stop: a controller that returns AFTER the teardown FAILS the verb (restart=always, wrong scope)" \
+                    || bad "stop: reported success over a controller that came back — $S2B_OUT"
+case "$S2B_OUT" in
+  *'AFTER the teardown'*) ok "stop: the warning says the controller returned after the teardown" ;;
+  *) bad "stop: failed without naming what it saw — $S2B_OUT" ;;
+esac
+[ -f "$S2/o/.orch.lock" ] && ok "stop: left the lock in place (its owner was alive — #1761's duplicate)" \
+                          || bad "stop: released a lock whose owner was alive"
+S2C="$(cat "$S2/o/.orch.lock" 2>/dev/null)"; { [ -n "$S2C" ] && kill -9 "$S2C"; } 2>/dev/null || true
+
+# ── #2402 review round 6 P1: a unit is OURS when its keys.env repoints $O ─────────────────────────
+# The unit renders the INSTALLER's $O, and the controller re-sources $ENV_FILE, which may repoint $O —
+# both files say so in their own words ("this installer's $O and the controller's can legitimately
+# differ"). Ownership read as a bare string comparison against the rendered value therefore called this
+# cell's OWN installed, enabled unit ANOTHER state dir's the moment keys.env carried an `O=` line: `stop`
+# skipped `systemctl stop`, killed the pid, printed "released lock", and `Restart=always` re-created the
+# controller within RestartSec — the "reported stopped, still running" false pass this PR exists to
+# remove — while `status` printed "nothing will restart it" over a supervised cell.
+say_case "unit ownership survives a keys.env that repoints \$O, and a genuinely foreign unit is still foreign"
+S3="$T/svc3"; rm -rf "$S3"; mkdir -p "$S3/units" "$S3/o" "$S3/home" "$S3/repo" "$S3/bin" "$T/no-user-units"
+printf 'O=%s/o\n' "$S3" > "$S3/home/keys.env"
+# the installer rendered ITS OWN $O — a different path from the one keys.env resolves the controller to
+cat > "$S3/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$S3/home
+Environment=ENV_FILE=$S3/home/keys.env
+Environment=O=$S3/installer-orchestrator
+Restart=always
+SH
+cat > "$S3/bin/systemctl" <<SH
+#!/bin/bash
+[ "\${1:-}" = "--user" ] && shift
+printf '%s\n' "\$*" >> "$S3/sc.log"
+case "\${1:-}" in
+  is-enabled) printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S3/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S3/o/orch-loop.sh"
+svc3_sup() { # <verb>
+  PATH="$S3/bin:$PATH" SYSTEMCTL="$S3/bin/systemctl" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$S3/units" CONTROLLER_USER_UNIT_DIR="$T/no-user-units" \
+    CELL_HOME="$S3/home" ENV_FILE="$S3/home/keys.env" SESSION="svc2402b-$$" O="$S3/o" REPO="$S3/repo" \
+    OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" CONTROLLER_STOP_TIMEOUT=3 \
+    bash "$SUP" "$1" 2>&1
+}
+rm -f "$S3/o/.orch.lock"; bash "$S3/o/orch-loop.sh" & S3P=$!
+printf '%s\n' "$S3P" > "$S3/o/.orch.lock"; sleep 0.3
+: > "$S3/sc.log"
+S3_OUT="$(svc3_sup stop)"
+# ⛔ THE DISCRIMINATOR IS `systemctl stop`, NOT rc: a kill alone returns 0 over a controller that returns.
+grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
+  && ok 'stop: addressed the UNIT of a cell whose keys.env repoints $O (the rendered O is not the owner — the resolution is)' \
+  || bad "stop: never called 'systemctl stop' — this cell's own unit was read as another state dir's, so Restart=always re-creates the controller this verb just killed (calls: $(tr '\n' '|' < "$S3/sc.log" 2>/dev/null)) — $S3_OUT"
+kill -9 "$S3P" 2>/dev/null || true
+S3C="$(cat "$S3/o/.orch.lock" 2>/dev/null)"; { [ -n "$S3C" ] && kill -9 "$S3C"; } 2>/dev/null || true
+# NEGATIVE CONTROL: the SAME rendered shape, but its env file does NOT resolve to this cell's $O. Ownership
+# must stay PROVEN-foreign (the resolution must not become "any unit on the box is ours", which would stop
+# another cell's dispatcher).
+printf 'OTHER=1\n' > "$S3/home/other-keys.env"
+cat > "$S3/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$S3/home
+Environment=ENV_FILE=$S3/home/other-keys.env
+Environment=O=$S3/installer-orchestrator
+Restart=always
+SH
+rm -f "$S3/o/.orch.lock"; : > "$S3/sc.log"
+S3N_OUT="$(svc3_sup stop)"; S3N_RC=$?
+grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
+  && bad "stop: stopped a unit whose env file resolves a DIFFERENT state dir — the widened ownership would stop another cell's controller — $S3N_OUT" \
+  || ok 'stop: a unit whose env file resolves another state dir stays FOREIGN and is left alone (the negative control)'
+case "$S3N_OUT" in
+  *"NOT this one"*) ok 'stop: the foreign unit is NAMED, not silently skipped' ;;
+  *) bad "stop: left the foreign unit alone without naming it — $S3N_OUT" ;;
+esac
+rm -f "$S3/units/eldato-orchestrator.service"
+# ── #2402 review round 9 P1: the MIRROR direction — rendered `O` is ours, keys.env says elsewhere ────────
+# The arm above pins "rendered ≠ $O, resolves $O". The mirror is just as real and just as damaging:
+# `verify_unit` REQUIRES `Environment=O=$O`, so every copy the INSTALLER renders carries the installer's own
+# $O while the controller it starts may run in the dir `keys.env` resolves. A supervisor whose $O was pinned
+# before an operator repointed keys.env (or whose env file was edited since it started) then read its OWN
+# unit as another state dir's: `stop` skipped `systemctl stop`, killed the pid, printed "released lock", and
+# `Restart=always` re-created the controller within RestartSec — the same false pass, from the opposite read.
+# So ownership is the UNION of the two answers the unit carries about itself, and only a copy that provably
+# matches NEITHER stays foreign (the negative control above).
+cat > "$S3/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=CELL_HOME=$S3/home
+Environment=ENV_FILE=$S3/home/other-keys.env
+Environment=O=$S3/o
+Restart=always
+SH
+rm -f "$S3/o/.orch.lock"; bash "$S3/o/orch-loop.sh" & S3MP=$!
+printf '%s\n' "$S3MP" > "$S3/o/.orch.lock"; sleep 0.3
+: > "$S3/sc.log"
+S3M_OUT="$(svc3_sup stop)"
+grep -qx 'stop eldato-orchestrator.service' "$S3/sc.log" \
+  && ok 'stop: a unit that RENDERS this state dir’s O is addressed even when keys.env repoints the controller elsewhere (the union, not the resolution alone)' \
+  || bad "stop: called a unit that renders THIS state dir's O foreign — the installer's own copies always render it, so Restart=always re-creates the controller this verb just killed (calls: $(tr '\n' '|' < "$S3/sc.log" 2>/dev/null)) — $S3M_OUT"
+kill -9 "$S3MP" 2>/dev/null || true
+S3MC="$(cat "$S3/o/.orch.lock" 2>/dev/null)"; { [ -n "$S3MC" ] && kill -9 "$S3MC"; } 2>/dev/null || true
+rm -f "$S3/units/eldato-orchestrator.service"
+# ── §(l-n) THE UNIT'S OWN `HOME`, AND THE INVOKER'S HOME, DECIDE WHICH UNIT A VERB ADDRESSES ──
+# ⛔ TWO DEFECTS MEASURED ON THE ROUND-16 HEAD (review P2 round 17, #2402), both of which this suite was
+# BLIND to (mutations that reverted either fix left it at 455/0), and both of which present as the
+# "reported stopped, still running" false pass:
+#  (1) `env_file_owner_o` evaluated `keys.env` with the CALLER's HOME, so `O=$HOME/o` named the caller's home
+#      and a foreign cell's unit read as this cell's own (or this cell's as foreign);
+#  (2) the USER unit directory was derived from the RE-POINTED `HOME` (= $CELL_HOME), while the installer
+#      writes to the INVOKER's `$HOME/.config/systemd/user` — so with CELL_HOME != HOME every verb looked in a
+#      directory no installer writes and reported `supervision: NONE` over an ENABLED unit.
+say_case "a unit's keys.env resolving \$HOME uses the UNIT's home, and the user unit dir is the INVOKER's"
+S5="$T/svc5"; rm -rf "$S5"; mkdir -p "$S5/units" "$S5/o" "$S5/home" "$S5/uh" "$S5/repo" "$S5/bin" "$S5/invokerhome/.config/systemd/user"
+printf 'O=$HOME/o\n' > "$S5/uh/keys.env"
+cat > "$S5/units/eldato-orchestrator.service" <<SH
+[Service]
+Environment=HOME=$S5/uh
+Environment=CELL_HOME=$S5/home
+Environment=ENV_FILE=$S5/uh/keys.env
+Environment=O=$S5/installer-orchestrator
+Restart=always
+SH
+cat > "$S5/bin/systemctl" <<SH
+#!/bin/bash
+[ "\${1:-}" = "--user" ] && shift
+printf '%s\n' "\$*" >> "$S5/sc.log"
+case "\${1:-}" in
+  is-enabled) printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S5/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S5/o/orch-loop.sh"
+svc5_sup() { # <verb> [extra env…]
+  PATH="$S5/bin:$PATH" SYSTEMCTL="$S5/bin/systemctl" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$S5/units" \
+    HOME="$S5/invokerhome" CELL_HOME="$S5/home" ENV_FILE="$S5/home/keys.env" \
+    SESSION="svc2402c-$$" O="$S5/o" REPO="$S5/repo" OR="daniel-ospina/agent-infra" \
+    SCOPE=own HARNESS="" CONTROLLER_STOP_TIMEOUT=3 "$@" 2>&1
+}
+# (1) the resolution must follow the UNIT's HOME. `status` names the dir a foreign unit supervises.
+S5_OUT="$(svc5_sup bash "$SUP" status)"
+case "$S5_OUT" in
+  *"$S5/uh/o"*) ok "unit HOME: a keys.env spelling O=\$HOME/o resolves against the UNIT's Environment=HOME=" ;;
+  *) bad "unit HOME: the resolution did not use the unit's HOME — a foreign cell's unit reads as this cell's (or this cell's as foreign): $S5_OUT" ;;
+esac
+case "$S5_OUT" in
+  *"$S5/invokerhome/o"*) bad "unit HOME: the resolution used the CALLER's HOME — ONE unit file, two owners depending on who runs the verb: $S5_OUT" ;;
+  *) ok "unit HOME: and it does NOT use the caller's HOME" ;;
+esac
+# (2) with CELL_HOME != HOME and NO CONTROLLER_USER_UNIT_DIR, the USER copy must still be FOUND — the installer
+# writes it under the INVOKER's home, so a reader deriving it from $CELL_HOME is reading a directory that never
+# exists. The unit there is OURS (it renders this state dir), so `status` must not answer `supervision: NONE`.
+# ⛔ ITS OWN FIXTURE: arm (1) deliberately leaves a FOREIGN copy in the SYSTEM dir above, and that copy is the
+# resolved one — reusing this root would test the system-dir walk, not the invoker-home reader.
+S6="$T/svc6"; rm -rf "$S6"; mkdir -p "$S6/system" "$S6/o" "$S6/home" "$S6/repo" "$S6/bin" "$S6/invokerhome/.config/systemd/user"
+cat > "$S6/bin/systemctl" <<SH
+#!/bin/bash
+[ "\${1:-}" = "--user" ] && shift
+printf '%s\n' "\$*" >> "$S6/sc.log"
+case "\${1:-}" in
+  is-enabled) [ -f "$S6/user-enabled" ] && { printf 'enabled\n'; exit 0; }; printf 'disabled\n'; exit 1 ;;
+  is-active)  printf 'inactive\n'; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$S6/bin/systemctl"; cp "$L/o/orch-loop.sh" "$S6/o/orch-loop.sh"; touch "$S6/user-enabled"
+cat > "$S6/invokerhome/.config/systemd/user/eldato-orchestrator.service" <<SH
+[Service]
+Environment=HOME=$S6/invokerhome
+Environment=CELL_HOME=$S6/home
+Environment=ENV_FILE=$S6/home/keys.env
+Environment=O=$S6/o
+Restart=always
+SH
+S6_OUT="$(env -u CONTROLLER_USER_UNIT_DIR PATH="$S6/bin:$PATH" SYSTEMCTL="$S6/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$S6/system" \
+          HOME="$S6/invokerhome" CELL_HOME="$S6/home" ENV_FILE="$S6/home/keys.env" \
+          SESSION="svc2402d-$$" O="$S6/o" REPO="$S6/repo" OR="daniel-ospina/agent-infra" \
+          SCOPE=own HARNESS="" bash "$SUP" status 2>&1)"
+# ⛔ MATCH THE SUPERVISION ROW, NOT A SUBSTRING OF THE WHOLE REPORT: `status` also prints "gh: not installed"
+# and "NO RECORD" lines, and a loose match graded an unrelated answer as this arm's verdict.
+if grep -q 'supervision:.*NONE' <<<"$S6_OUT"; then
+  bad "invoker HOME: the USER unit at the INVOKER's \$HOME/.config/systemd/user was not found (CELL_HOME != HOME) — status claims nothing supervises an ENABLED unit: $S6_OUT"
+elif grep -q 'supervision:.*ACTIVE' <<<"$S6_OUT"; then
+  ok "invoker HOME: the USER unit is found through the INVOKER's HOME, not the re-pointed \$CELL_HOME"
+else
+  bad "invoker HOME: status gave no supervision verdict at all for an enabled USER unit: $S6_OUT"
+fi
+
 # ── §(m) A STALE LOCK NAMING A PEER CONTROLLER MUST NEVER BE SIGNALLED ─────────────────────────
 # $LOCK is data on disk and outlives a `kill -9`, an OOM or a reboot. If the OS RECYCLES that pid to
 # a peer lane's controller — the exact argv shape every controller on this box has — then the pid is
@@ -3080,7 +3565,13 @@ while [ $# -gt 0 ]; do case "$1" in -s|-t) n="$2"; shift 2 ;; *) shift ;; esac; 
 n="${n#=}"
 case "$sub" in
   has-session) [ -n "$n" ] && [ -f "$S/up.$n" ] && exit 0; exit 1 ;;
-  new-session) [ -n "$n" ] && : > "$S/up.$n"; exit 0 ;;
+  new-session) [ -n "$n" ] && : > "$S/up.$n"
+               # ⛔ #2306: the supersede fence used to be reached only because a flat `sleep 2` gave a
+               # racing `stop` its window. The launch now returns as soon as the session appears, so
+               # the arm triggers the stop INSIDE the launch — deterministic, and still exactly the
+               # "a stop landed while start was running" shape it has to cover.
+               [ -n "${AI1989_BUMP_GEN:-}" ] && printf '9\n' > "$AI1989_BUMP_GEN"
+               exit 0 ;;
   kill-session) [ -n "$n" ] && rm -f "$S/up.$n"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -3115,14 +3606,17 @@ rm -f "$W2/o/state/roles/.stop-generation"
 SG2="$W2/state.supersede2"; rm -rf "$SG2"; mkdir -p "$SG2"
 : > "$W2/o/state/roles/.stop-generation"
 : > "$SG2/up.ai1989-busy-$$"        # the controller session already exists
-( sleep 1; printf '9\n' > "$W2/o/state/roles/.stop-generation" ) & SUP_BG2=$!
 SUP_SRC2=0
+# ⛔ The stop is triggered from INSIDE the launch (#2306). A flat `sleep 2` in the doctor launch used
+# to supply this window, and it was the only reason this arm could pass: with the launch returning as
+# soon as tmux reports the session, a `( sleep 1; bump )` race would land AFTER the fence had already
+# been checked — green on the clock, not on the fence.
 env PATH="$W2/bin:$W2/stub:$PATH" AI1989_STATE="$SG2" AI1711_SOCK="" \
+    AI1989_BUMP_GEN="$W2/o/state/roles/.stop-generation" \
     CELL_HOME="$W2/home" HOME="$W2/home" ENV_FILE="$W2/keys-env.env" \
     SESSION="ai1989-busy-$$" O="$W2/o" REPO="$W2/repo" HARNESS="$W2/harness" HARNESS_REPO="$AI" \
     HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 HARNESS_REF="$W2_REF" \
     bash "$SUP" start >"$W2/start.supersede2.out" 2>&1 || SUP_SRC2=$?
-wait "$SUP_BG2" 2>/dev/null || true
 [ "$SUP_SRC2" -ne 0 ] && grep -q 'a STOP arrived while this start was running' "$W2/start.supersede2.out" \
   && ok "start: the 'already running' heal is fenced too (rc=$SUP_SRC2, not a silent re-arm)" \
   || bad "start: the already-running heal ignored a concurrent stop (rc=$SUP_SRC2) — $(tail -2 "$W2/start.supersede2.out" | tr '\n' ' ')"
@@ -3225,6 +3719,105 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
 [ "$LARC" -eq 0 ] && [ "$newdoc" = 0 ] \
   && ok "start: a live loop record with no session is treated as RUNNING (no second doctor session)" \
   || bad "start: a surviving loop was ignored (rc=$LARC, new doctor session=$newdoc) — $(tail -2 "$LA/out" | tr '\n' ' ') // live matches: $(ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$LA/o/orch-loop.sh" -v h="$LA/h/orch-loop.sh" '{ c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c); n=split(c,t," "); if (n>=2 && (t[2]==a || t[2]==h)) print $1" "t[2] }' | tr '\n' ' ')"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# keys.env cannot override a bound the INSTALLER validated (review P1, #2402)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# The unit renders `CONTROLLER_ORPHAN_TIMEOUT` / `CONTROLLER_HANDOVER_TIMEOUT` into its ENVIRONMENT so the
+# supervisor reads the values the installer proved fit StartLimitBurst inside StartLimitIntervalSec. But
+# `source_env_file` runs with `set -a`, so a `CONTROLLER_ORPHAN_TIMEOUT=3600` line in keys.env replaced the
+# validated 60 — and at 3600 the burst can never fill (3 x (3600+15) >> 300 s), so the unit restarted
+# forever while the template, the installer, the doc and `--status` all printed 60: exactly the pre-fix
+# state the arithmetic exists to remove. The re-assert is the same caller-describes-the-caller shape
+# ORCH_FOREGROUND already had; it is pinned structurally because a behavioural arm would have to park on
+# the very wait it bounds.
+say_case "keys.env cannot override the validated controller bounds (the caller's values survive the source)"
+_src_block="$(awk '/^ORCH_FOREGROUND_IN=/,/^export HOME=/' "$SUP" 2>/dev/null)"
+grep -q '^source_env_file' <<<"$_src_block" \
+  && ok 'env-file override: the snapshot/restore block straddles the source (non-vacuous)' \
+  || bad 'env-file override: the re-assert block does not surround source_env_file'
+# CONTROLLER_UNIT is the fourth member: the template renders the name, so a keys.env line must not re-point it
+# (review P1 round 14, #2402 — `stop` printed success with no systemctl call while the enabled unit kept the
+# controller alive, and `start` launched a tmux controller beside it).
+for _v in ORCH_FOREGROUND ORCH_AUTOMATED_RESTART CONTROLLER_ORPHAN_TIMEOUT CONTROLLER_HANDOVER_TIMEOUT CONTROLLER_UNIT \
+          SYSTEMCTL CONTROLLER_SYSTEM_UNIT_DIR CONTROLLER_USER_UNIT_DIR; do
+  grep -q "^${_v}_IN=" <<<"$_src_block" \
+    && ok "env-file override: $_v is SNAPSHOTTED before the source" \
+    || bad "env-file override: $_v is not snapshotted — a keys.env line would silently replace the value the installer validated"
+  grep -q "${_v}=\"\$${_v}_IN\"" <<<"$_src_block" \
+    && ok "env-file override: $_v is re-asserted AFTER the source" \
+    || bad "env-file override: $_v is not restored after source_env_file — keys.env can still win"
+done
+# ⛔ CONTROLLER_INVOKER_HOME IS THE FOURTH OF THAT FAMILY BUT SITS OUTSIDE THE BLOCK ABOVE (it is captured
+# at :315, before ORCH_FOREGROUND_IN, so the awk range cannot see it). Pinned directly, or its fence can be
+# deleted with every arm above still green. RED on revert: the `$CONTROLLER_INVOKER_HOME_IN` assignment goes.
+grep -q 'CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"' "$SUP" \
+  && ok 'env-file override: CONTROLLER_INVOKER_HOME is re-asserted after the source' \
+  || bad 'env-file override: CONTROLLER_INVOKER_HOME is not restored after source_env_file — keys.env can re-point the directory every unit reader uses'
+
+# ⛔ THE UNIT'S DIRECTORY IS SEARCHED, NOT GUESSED FROM THE CALLER'S HOME (review P1 round 18, #2402).
+# `$HOME` at read time is the INVOKER's; the doctor's session forces `HOME=$CELL_HOME`, while an operator's
+# standalone install wrote the unit under the OPERATOR's home. With `CELL_HOME != $HOME` the doctor found
+# nothing, skipped the service branch and launched a tmux controller BESIDE the enabled unit (#1761).
+grep -q 'controller_user_unit_dirs' "$SUP" && grep -q '^passwd_home()' "$SUP" \
+  && ok 'unit lookup: the user-scope search carries the passwd-home candidates, not only the invoker HOME' \
+  || bad 'unit lookup: the user-scope unit is resolved from a single HOME guess again — a CELL_HOME != HOME cell loses its unit (and its NOT-ACTIVE fence)'
+grep -q 'getent passwd "\$1"' "$SUP" \
+  && ok 'unit lookup: passwd_home reads the database, so neither `export HOME=$CELL_HOME` nor sudo can re-point it' \
+  || bad 'unit lookup: passwd_home does not read the passwd database — the caller environment decides again'
+grep -q 'dirname "\$_UNIT_PATH")" != ' "$SUP" \
+  && ok 'unit lookup: the manager scope is taken from the resolved copy (any user dir), not one guessed path' \
+  || bad 'unit lookup: the scope is decided by comparing against one guessed user directory — a unit found in another candidate would be addressed on the SYSTEM manager'
+# ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THESE CALLERS ARE NOT THE SERVICE MANAGER (review P1 round 18,
+# #2402). The unit exports =1 and every lane shell inherits it through the tmux server it created, so an
+# unpinned `start` either parks against the handover bound and reports a false failure (`harness up`) or
+# `exec`s the loop outside the unit's cgroup (`orchestrator-bringup.sh`).
+grep -q 'ORCH_FOREGROUND=0 hu_run' "$HERE/harness-up" \
+  && ok 'caller pin: harness-up starts the supervisor with ORCH_FOREGROUND=0, so an inherited =1 cannot ride in' \
+  || bad 'caller pin: harness-up starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin'
+grep -q 'env ORCH_FOREGROUND=0 bash "\$SUPERVISOR" start' "$HERE/orchestrator-bringup.sh" \
+  && ok 'caller pin: orchestrator-bringup.sh starts the supervisor with ORCH_FOREGROUND=0, so an inherited =1 cannot ride in' \
+  || bad 'caller pin: orchestrator-bringup.sh starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin — an inherited =1 execs the loop outside the unit cgroup'
+# ⏱ THE ANTI-ROT PIN FOR THE SERVICE-MANAGED AUTOMATED RESTART (review P1, #2402). The doctor's restart arm
+# sets ORCH_AUTOMATED_RESTART=1; `cmd_start` refuses to re-arm a unit the manager reports not active under
+# it and answers rc 4 — its own outcome, which the doctor records as NOT LAUNCHED rather than as a failure.
+# Both halves are behavioural arms in install-controller-service.test.sh §C and cloud-cell-doctor.test.sh;
+# this pin fails if either end of the contract is deleted here.
+grep -q 'ORCH_AUTOMATED_RESTART' "$SUP" && grep -q '          return 4' "$SUP" \
+  && ok 'automated restart: the supervisor carries the fence and its rc=4 outcome' \
+  || bad 'automated restart: the ORCH_AUTOMATED_RESTART fence (or its rc=4 outcome) is gone from the supervisor'
+# ⏱ THE DOCTOR'S `ORCH_FOREGROUND=0` PIN MUST BE EXPORTED (review P2 round 9, #2402). A bare assignment
+# holds only by two accidents — an inherited export attribute (the case the pin exists to defeat) or the
+# child's own `:-0` default — so neither is the guarantee. RED on revert: `export` removed → the grep misses.
+grep -q 'set +a; export ORCH_FOREGROUND=0;' "$SUP" \
+  && ok 'doctor: the ORCH_FOREGROUND=0 pin is EXPORTED, so an inherited =1 cannot ride into the doctor session' \
+  || bad 'doctor: ORCH_FOREGROUND=0 is a bare assignment — it holds only by an inherited export attribute or the child default, neither of which is the pin'
+# ⛔ NO "already running" ANSWER IN SERVICE MODE (review P2 round 11, #2402). `foreground_handover` returns 0
+# when the controller it waited for is GONE, so a `say "already running …"` placed AFTER it announced a pid
+# that no longer exists and returned 0 without launching anything — a clean pass over a cell with no
+# dispatcher. Every such answer must therefore sit in the NON-foreground arm of its branch (an `else`),
+# never on the path the handover returns to. RED on revert: putting the `say` back after the handover leaves
+# it outside an `else` and this pin reports the line.
+say_case 'every "already running" answer sits in the NON-foreground arm (service mode falls through to launch)'
+_ar_bad="$(awk '
+  { line[NR] = $0 }
+  END {
+    for (i = 1; i <= NR; i++) {
+      if (line[i] !~ /say "already running/) continue
+      found = 0
+      for (j = i - 1; j >= 1 && j >= i - 9; j--) {
+        # The answer is correct if it sits in the NON-foreground arm, which this file spells two ways: an
+        # `else` after a foreground test, or a branch whose own condition requires `ORCH_FOREGROUND != 1`.
+        if (line[j] ~ /^[[:space:]]*else[[:space:]]*$/) { found = 1; break }
+        if (line[j] ~ /ORCH_FOREGROUND/ && line[j] ~ /!= 1/) { found = 1; break }
+      }
+      if (!found) printf "%d ", i
+    }
+  }
+' "$SUP")"
+[ -z "$_ar_bad" ] \
+  && ok 'service mode: no "already running" answer is reachable after a completed handover' \
+  || bad "service mode: an \"already running\" answer sits on the handover path (lines: $_ar_bad) — after the handover the controller is GONE, so this reports a dead pid and exits 0 without launching"
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

@@ -1217,6 +1217,14 @@ const MIRROR_FILES = [
   "extensions/custom-provider-qwen/index.ts",
   "scripts/frontmatter-validate.mjs",
   ".github/workflows/ci-main.yml",
+  // #1330 — the repo's ONE copy of pi's `isToolCallEventType` carries the
+  // provenance stamp (`@earendil-works/pi-coding-agent <version>` + the
+  // `dist/core/extensions/types.js` line range it was hand-derived from). The
+  // stamp is only re-verified by hand, so a `PI_VERSION_PIN` bump must RED here
+  // until someone re-derives it — otherwise the header keeps asserting a release
+  // and a line range that nothing reads while gate (i) reports green, which is
+  // the 2026-08-10 hand-synced-stamp escape this gate exists for.
+  "extensions/shared/tool-call-event.ts",
 ];
 // Non-pi dependency versions legitimately quoted in a surface (so they are not
 // mistaken for stamps). Adding an entry here is a deliberate, reviewed act.
@@ -1232,7 +1240,7 @@ const ALLOWED_NON_PI = {
 // "A probe of the 3.11.4 runtime is pending.", or "// Runner image parity: 22.11.0" all reddened the
 // suite — the same incident class as #485 T2 (issue #779, which reddened main twice on 2026-09-10).
 // Moving the stamp marker to the pi token itself is the fix: none of those prose lines names pi, while
-// every real stamp line on all four surfaces does (the ci-main.yml stamp comments were reworded to
+// every real stamp line on all five surfaces does (the ci-main.yml stamp comments were reworded to
 // name pi, which is what they are stamping). A stamp line reworded to drop the pi token falls out of
 // coverage and trips the per-surface floor below, loudly, instead of silently weakening the guard.
 const PI_STAMP_MARKER_RE = /\bpi\b/i;
@@ -1247,6 +1255,11 @@ const STAMP_FLOORS = {
   "extensions/custom-provider-qwen/index.ts": 1,
   "scripts/frontmatter-validate.mjs": 3,
   ".github/workflows/ci-main.yml": 2,
+  // #1330 — exactly one stamp line (`@earendil-works/pi-coding-agent <pin>`);
+  // the `dist/…:45-47` line range beside it is deliberately NOT asserted (it
+  // moves within a version, see #651) but it sits on a non-pi-naming line, so it
+  // cannot pad this floor.
+  "extensions/shared/tool-call-event.ts": 1,
 };
 
 /** Version literals in stamp context on one surface, minus its allowlisted non-pi versions. */
@@ -1306,6 +1319,55 @@ test("every version literal in the mirror surfaces is the pin or a listed dep ve
     [],
     "a mirror surface lost stamp coverage — counts may GROW, never shrink below the floor " +
       `(a stamp was silently dropped or its keyword line was reworded):\n  ${thin.join("\n  ")}`
+  );
+});
+
+// #1330 — guard (i) covers the shared SDK-predicate copy, and says so in a way
+// that REDs if the surface is dropped from the list. The list is a closed,
+// hardcoded set (there is no discovery mechanism), so an entry that is never
+// added leaves the file's provenance stamp asserting a release and a `dist`
+// line range that no gate reads — the hand-synced-stamp escape guard (i) exists
+// for. This test is the KEEP-IT-COVERED assertion; the mutation half below is
+// what proves the entry actually bites (a floor alone can be satisfied by a
+// stamp nobody compares).
+test("guard (i) covers the shared tool-call predicate copy (#1330)", () => {
+  const file = "extensions/shared/tool-call-event.ts";
+  assert.ok(
+    MIRROR_FILES.includes(file),
+    `${file} must be in MIRROR_FILES — it carries the provenance stamp for the ONE hand-synced ` +
+      "copy of pi's isToolCallEventType, and guard (i) has no discovery mechanism, so an unlisted " +
+      "surface is an unread stamp (the #1330 record then claims a guard that does not exist)"
+  );
+  assert.ok(
+    Object.hasOwn(STAMP_FLOORS, file),
+    `${file} must have an explicit STAMP_FLOORS entry — the implicit floor of 1 would still pass ` +
+      "after the stamp line was reworded to drop the pi token"
+  );
+  const src = fs.readFileSync(path.join(REPO_ROOT, file), "utf8");
+  const stamps = collectStampLiterals(file, src);
+  assert.ok(
+    stamps.length >= 1,
+    `${file} must carry a pi stamp in stamp context — none was read, so the provenance header ` +
+      "is no longer a stamp and the surface is covered in name only"
+  );
+  for (const s of stamps) {
+    assert.equal(
+      s.value,
+      PI_VERSION_PIN,
+      `${file}:${s.line} pins ${s.value} but PI_VERSION_PIN=${PI_VERSION_PIN} — re-derive the ` +
+        "predicate against the new release (and its dist line range) before moving the pin"
+    );
+  }
+  // Mutation control: the LIVE bytes of this surface, with the pinned release
+  // rewritten, must be reported. Without this, a surface can be listed and
+  // counted while every comparison over it is skipped.
+  const drifted = src.replace(new RegExp(PI_VERSION_PIN.replace(/\./g, "\\."), "g"), "0.0.1");
+  assert.ok(drifted !== src, `the mutation control did not change ${file} — the pin literal was not found`);
+  assert.equal(
+    stampFindings([{ file, src: drifted }], PI_VERSION_PIN).length,
+    1,
+    `a stale stamp in ${file} must be reported as an offender — otherwise the surface is listed but ` +
+      "never compared, which is the false PASS this guard exists to prevent"
   );
 });
 

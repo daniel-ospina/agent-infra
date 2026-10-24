@@ -6,8 +6,9 @@
  * Run: npx tsx extensions/skill-enforcer.test.ts   (from any agent-infra checkout)
  *
  * Zero-dep by construction: `skill-enforcer.ts` has no runtime import outside
- * `node:*` and `./shared/*` (the pi SDK value import is inlined — see the file
- * header), so this suite runs on a bare checkout with no `npm ci`.
+ * `node:*` and `./shared/*` (pi's SDK predicate now comes from
+ * `./shared/tool-call-event.ts` — imported, not inlined), so this suite runs on
+ * a bare checkout with no `npm ci`.
  *
  * ── Fixture honesty (read before trusting a green run) ───────────────────────
  * pi loads extensions with **jiti**, which keeps the SYMLINK path in
@@ -41,6 +42,7 @@ import hook, {
   canonicalSkillFile,
   canonicalSkillsRoot,
   CANONICAL_FARM_ERROR,
+  commandMatches,
   skillRoots,
   skillDisplayPath,
   skillFileFor,
@@ -48,6 +50,9 @@ import hook, {
   _setSkillReadsFileForTest,
   _setManifestForTest,
 } from "./skill-enforcer.js";
+// The derivation itself is asserted in its own suite (extensions/shared/
+// git-command-parse.test.ts); this file only needs it for the OR property below.
+import { commandSpellings } from "./shared/git-command-parse.js";
 
 const REPO_ROOT = resolve(__dirname, "..");
 const REAL_MANIFEST = join(REPO_ROOT, "enforcement", "dangerous-ops.txt");
@@ -798,6 +803,126 @@ async function main() {
     equal((await pi.fire("tool_call", TORTOISE_WRITE))?.block, true, "the hard verb list must still block a genuine write");
   });
 
+  // ── #1329 — the command gate matched ONE spelling (the raw string) ────────
+  // MEASURED against the armed manifest before this change: the first list below
+  // ran ALLOWED because the pattern `git commit` is split by git's own global
+  // options — and `git -C <dir>` is how this fleet commits in a linked worktree,
+  // so a cooperating agent produces it without intending anything. The second
+  // list is the boundary the manifest header declares: shell state a static text
+  // gate cannot read. Both directions are pinned, so neither can be widened or
+  // silently narrowed without editing the declared boundary.
+  section("H. #1329 — command spelling: git/gh GLOBAL options closed, shell indirection DECLARED open");
+
+  // Every spelling in the closed list must fire the rule whose literal pattern it
+  // splits, and clearing the gate must stay POSSIBLE for each (the #1321 lesson:
+  // a remedy that does not exist is a permanent confusing block).
+  const GLOBAL_OPTION_SPELLINGS: Array<[string, string]> = [
+    ["git -C /tmp/wt commit -m x", "commit-workflow"],
+    ["git --no-pager commit -m x", "commit-workflow"],
+    ["git -c user.name=a commit -m x", "commit-workflow"],
+    ["git --git-dir=/x/.git commit -m x", "commit-workflow"],
+    ["git -C /x stash pop", "commit-workflow"],
+    ["git --work-tree /x add .", "commit-workflow"],
+    ["gh -R owner/name pr create --fill", "commit-workflow"],
+    ["gh --repo=owner/name pr merge 42", "commit-workflow"],
+    ["git -C /x worktree add /tmp/w", "using-git-worktrees"],
+    // ⛔ THE SEPARATOR IS NOT A TOKEN BOUNDARY (#1329 review, P2). These were ALLOWED at
+    // the head that DECLARED the class closed — measured — because the rule is the literal
+    // `git commit` with ONE space and the derivation left the original separator in place.
+    // A header that declares a class closed must be true of the class, not of one spelling
+    // of it; the tab form is the one a fleet lane produces from a table-driven command.
+    ["git -C /x\tcommit -m x", "commit-workflow"],
+    ["git\tcommit -m x", "commit-workflow"],
+    ["git  commit -m x", "commit-workflow"],
+    ["git -C /x  \t stash pop", "commit-workflow"],
+    // ⛔ AND THE CASE DIMENSION (#1329 review cycle 2, P2). The rule is compiled with the `i`
+    // flag and the header says "case-insensitive regex", but the derivation's command-word
+    // comparison was an exact lowercase match — so `GIT commit` was blocked by the raw rule while
+    // `GIT -C /x commit` was ALLOWED: the same "one spelling" asymmetry, surviving in the case
+    // dimension. On a case-insensitive filesystem (macOS APFS, a fleet platform) `GIT` resolves
+    // to /usr/bin/git, i.e. a LIVE ungated commit; on Linux it is at least a false declaration.
+    ["GIT -C /x commit -m x", "commit-workflow"],
+    ["Git -C /x commit -m x", "commit-workflow"],
+    ["gIT --no-pager commit -m x", "commit-workflow"],
+    ["GIT -C /x stash pop", "commit-workflow"],
+    ["GH -R owner/name pr create --fill", "commit-workflow"],
+    ["GIT -C /x worktree add /tmp/w", "using-git-worktrees"],
+  ];
+
+  await test("#1329 — git/gh GLOBAL options between the command word and the verb are CLOSED", async () => {
+    const { pi } = await newSession();
+    for (const [command, skill] of GLOBAL_OPTION_SPELLINGS) {
+      const res = await pi.fire("tool_call", { toolName: "bash", input: { command } });
+      ok(res && res.block === true, `${JSON.stringify(command)} must be blocked — it ran UNGATED before #1329`);
+      ok(String(res.reason).includes(skill), `${JSON.stringify(command)} must be attributed to ${skill}, got: ${String(res.reason).split("\n")[0]}`);
+    }
+  });
+
+  await test("#1329 — the newly-closed spellings remain SATISFIABLE (the governing read clears them)", async () => {
+    const { pi } = await newSession();
+    for (const skill of ["commit-workflow", "using-git-worktrees"]) {
+      await pi.fire("tool_call", { toolName: "read", input: { path: join(homedir(), ".pi", "agent", "skills", skill, "SKILL.md") } });
+    }
+    for (const [command] of GLOBAL_OPTION_SPELLINGS) {
+      equal((await pi.fire("tool_call", { toolName: "bash", input: { command } }))?.block, undefined,
+        `${JSON.stringify(command)} must clear after the governing skill is read — a spelling-only block must have a remedy`);
+    }
+  });
+
+  await test("#1329 — DECLARED OPEN: shell indirection bypasses the gate, and this is the boundary", async () => {
+    // NOT a desired behaviour — the manifest header states it, so it is asserted
+    // here. If a later change closes one of these, this test FAILS and the author
+    // must update the CLOSED/NOT CLOSED lists in enforcement/dangerous-ops.txt too.
+    const { pi } = await newSession();
+    const open = [
+      "g=commit; git $g -m x",          // variable indirection
+      'eval "$CMD"',                   // eval of a variable
+      "gc -m x",                        // an alias invocation (the definition is below)
+      'git com"mit" -m x',              // quote-splicing inside the verb
+      "git comm\\it -m x",              // backslash-splicing inside the verb
+      "git \\\ncommit -m x",            // a `\\` line continuation
+      'sh -c "git -C /x commit"',       // nesting: the quoted text is data, not a command word
+      "rg -n 'git -C x commit' skills/", // a quoted mention the raw pattern is split across
+    ];
+    for (const command of open) {
+      equal((await pi.fire("tool_call", { toolName: "bash", input: { command } }))?.block, undefined,
+        `${JSON.stringify(command)} is DECLARED OPEN in the manifest header — closing it means updating that declaration too`);
+    }
+    // The alias DEFINITION contains the literal pattern, so it IS caught — the
+    // asymmetry is deliberate and must stay visible.
+    ok((await pi.fire("tool_call", { toolName: "bash", input: { command: "alias gc='git commit'" } }))?.block,
+      "the alias DEFINITION is raw-matched; only its later use is not");
+    // Path-qualified / wrapper-prefixed commands contain the literal pattern, so the
+    // raw match already closed them. The issue body listed these as bypasses; they
+    // never were one (measured).
+    for (const command of ["/usr/bin/git commit -m x", "command git commit -m x", "env FOO=1 git commit -m x", "sudo git commit -m x", "bash -c 'git commit -m x'", "eval 'git commit -m x'", "echo 'git commit -m x'"]) {
+      ok((await pi.fire("tool_call", { toolName: "bash", input: { command } }))?.block, `${JSON.stringify(command)} contains the pattern and must be blocked`);
+    }
+  });
+
+  await test("#1329 — a QUOTED mention is match-by-text: the derivation does not reinterpret quotes", async () => {
+    const { pi } = await newSession();
+    // Pre-existing, unchanged bluntness: the gate matches command TEXT, so the
+    // literal pattern blocks wherever it appears.
+    ok((await pi.fire("tool_call", { toolName: "bash", input: { command: "rg -n 'git commit' skills/" } }))?.block,
+      "the literal pattern is matched inside quotes too — that is the raw match, unchanged");
+    // ... and the derivation must NOT reach INTO a quoted region to find a command
+    // word: this mention is split by the very options #1329 normalises, and it stays
+    // allowed. Closing it would mean reinterpreting quoted data as commands (and
+    // would block far more searches than it caught).
+    equal((await pi.fire("tool_call", { toolName: "bash", input: { command: "rg -n 'git -C x com' skills/" } }))?.block, undefined);
+  });
+
+  await test("#1329 — commandMatches ORs across spellings and always tries the raw command FIRST", async () => {
+    // The property that makes the hardening safe: a rule that matched the raw
+    // command cannot stop matching because a spelling was derived.
+    const raw = /git commit/i;
+    equal(commandMatches(raw, ["git commit -m x"]), true, "the raw command must always be tried");
+    equal(commandMatches(raw, ["echo hi", "git commit -m x"]), true, "the derived spelling must be tried too");
+    equal(commandMatches(raw, ["git -C /x commit -m x"]), false, "the RAW string alone does not match — the derivation is what closes it");
+    equal(commandMatches(raw, commandSpellings("git -C /x commit -m x")), true);
+  });
+
   await test("prerequisite chain: writing-plans alone blocks write; with issue-scoping it does not", async () => {
     const { pi } = await newSession();
     await pi.fire("tool_call", { toolName: "read", input: { path: join(REPO_ROOT, "skills", "writing-plans", "SKILL.md") } });
@@ -877,6 +1002,79 @@ async function main() {
     try { await pi.fire("session_start", {}); } finally { console.error = orig; }
     ok(/corrupt|unreadable/.test(errs.join("\n")), `expected a corruption diagnostic, got: ${errs.join("|")}`);
     equal((await pi.fire("tool_call", COMMIT))?.block, true);
+  });
+
+  // #1331: the persisted window is a bound on IDLENESS, not on the age of the
+  // read. This pins the mechanism the documentation now commits to
+  // (enforcement/dangerous-ops.txt header, AGENTS.md §Skill Reading Protocol):
+  // persistReadFiles() writes `readAt: now` for EVERY in-memory read — a
+  // restored one included — and runs at session_shutdown, so each session that
+  // restores an entry re-stamps it. Remove the re-stamp (drop the `now` write
+  // in favour of the persisted value) and this test fails: a read would then
+  // expire 24 h after it was taken, which is precisely the mis-statement the
+  // issue corrected.
+  // ⛔ ID is T13a, not T13: a PRE-EXISTING leg above already owns "T13" (the path-shaped
+  // residual), and two rows of the design record cited the same ambiguous id.
+  await test("T13a — the 24 h window bounds IDLENESS: a restored read is re-stamped at session_shutdown (#1331)", async () => {
+    const { pi, reads } = await newSession();
+    const seeded = Date.now() - 23 * 60 * 60 * 1000; // inside the TTL → restores
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: seeded }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, undefined, "a 23 h-old persisted read must clear the gate (it is restored)");
+    const before = Date.now();
+    await pi.fire("session_shutdown", {});
+    const after = Date.now();
+    const [entry] = JSON.parse(readFileSync(reads, "utf-8")) as Array<{ file: string; readAt: number }>;
+    equal(entry.file, "commit-workflow");
+    ok(entry.readAt >= before && entry.readAt <= after, `session_shutdown must re-stamp the restored entry to now (seeded=${seeded}, persisted=${entry.readAt}, window=[${before},${after}])`);
+    ok(entry.readAt > seeded + 1000, "the persisted readAt must be strictly newer than the 23 h-old seed — the TTL must not measure the read's age");
+  });
+
+  // ⛔ The window is pinned from BELOW by T13a (23 h restores). Without a leg from ABOVE,
+  // `READ_PERSIST_TTL_MS` could be raised to a year — or to `Infinity` — and this suite
+  // stayed green while AGENTS.md, templates/AGENTS.base.md and the dangerous-ops manifest
+  // all kept asserting "24 h": the exact doc/code divergence #1331 exists to close, one
+  // constant edit away. This is the other side.
+  await test("T13b — a persisted read OLDER than 24 h is NOT restored (the window is two-sided)", async () => {
+    const { pi, reads } = await newSession();
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: Date.now() - 25 * 60 * 60 * 1000 }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, true, "a 25 h-old persisted read must NOT clear the gate");
+  });
+
+  // ⛔ A stamp from the future used to restore on EVERY session and could never be pruned
+  // (the age test is one-sided and Math.max kept the future value), so one hand-written line
+  // cleared this gate permanently. Fail closed: the gate must ask again.
+  await test("T13c — a FUTURE-dated persisted read does not clear the gate (skew guard)", async () => {
+    const { pi, reads } = await newSession();
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: Date.now() + 365 * 24 * 60 * 60 * 1000 }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, true, "a future stamp is not evidence of a read");
+  });
+
+  // ⛔ T13c proves only that a future stamp does not RESTORE. The claim the design record
+  // makes — "dropped at restore, and not carried into the persisted file by the merge path"
+  // — has a SECOND branch (persistReadFiles()'s `existing` loop). Deleting that branch left
+  // this suite fully green: the file kept the future stamp, so a single hand-written line
+  // could be re-laundered on every persist. This leg fires a real persist and asserts the
+  // written file no longer carries it.
+  await test("T13e — a FUTURE-dated stamp is not carried into the persisted file by the merge path", async () => {
+    const { pi, reads } = await newSession();
+    const future = Date.now() + 365 * 24 * 60 * 60 * 1000;
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: future }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, true, "precondition: the future stamp does not restore");
+    await pi.fire("session_shutdown", {}); // calls persistReadFiles() -> the merge path
+    const written = JSON.parse(readFileSync(reads, "utf-8")) as Array<{ file: string; readAt: number }>;
+    ok(!written.some((e) => e.readAt > Date.now() + 60 * 1000),
+      `the merge path must drop a future-dated entry (written=${JSON.stringify(written)})`);
+  });
+
+  await test("T13d — a stamp inside the 60 s skew allowance still restores", async () => {
+    const { pi, reads } = await newSession();
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: Date.now() + 30 * 1000 }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, undefined, "30 s of clock skew must not invalidate a read");
   });
 
   section("F. #1328 — a `hard` rule fires on EVERY tool, not only bash / `mcp__*`");
@@ -965,7 +1163,14 @@ async function main() {
   await test("the SDK is imported for TYPES only — the module loads with zero node_modules", () => {
     ok(!/^\s*import\s+(?!type\b)[^;\n]*@earendil-works/m.test(SOURCE), "a runtime SDK import would break the bare-checkout suite");
     ok(SOURCE.includes('import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-coding-agent"'));
-    ok(/function isToolCallEventType\(/.test(SOURCE), "the inlined predicate is load-bearing");
+    // #1330 — the predicate is no longer inlined HERE. It has one home
+    // (shared/tool-call-event.ts) and is pinned against the real export by
+    // extensions/verification-gate/tool-call-event-parity.test.ts; a private copy
+    // in this file would drift under a pi upgrade with every gate still reporting
+    // `✅ Loaded`. shared/tool-call-event.test.ts asserts this import repo-wide.
+    ok(SOURCE.includes('import { isToolCallEventType } from "./shared/tool-call-event.js"'),
+      "the shared predicate import must be present (it replaces the #1321 inline)");
+    ok(!/function isToolCallEventType\(/.test(SOURCE), "the predicate must not be re-inlined here (#1330)");
   });
   await test("no gate key is built from SKILLS_PREFIX any more (only the display fallback)", () => {
     const hits = SOURCE.match(/SKILLS_PREFIX\}\$\{/g) ?? [];

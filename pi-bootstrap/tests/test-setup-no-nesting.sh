@@ -137,19 +137,43 @@ check_fix_markers() {
     || fail "$label: installed builtin-tools missing #36 PATH augmentation"
 }
 
-# #562 — merge-gate scripts farm parity: record-review.sh must be farmed to
+# #562 — merge-gate scripts farm parity: EVERY entry of `merge_gate_srcs` must be farmed to
 # $DEST/scripts/ and byte-match the repo copy (the repo copy is CI-tested;
 # production mints execute the ~/.pi copy — drift is a silent partial
 # deployment of an enforcement-critical script).
+# ⛔ THE ARRAY IS THE LIST, NOT THIS FUNCTION (P3, fresh review of #2288): this used to hard-code
+# `record-review.sh`, so the SECOND member of the farm it was extended for (`review-pr.sh`, the seam
+# that mints every `clean` record) drifted undetected by the very suite that exists to catch it.
+# `farm_array_entries` is the one reader of a declared array (#1872), so a third member is covered
+# the day it is declared.
 check_record_review_farmed() {
   local label="$1"
-  local dest="$DEST/scripts/record-review.sh"
-  [ -f "$dest" ] \
-    || { fail "$label: record-review.sh not farmed into scripts/ (merge-gate farm missing)"; return; }
-  if diff -q "$ROOT/scripts/record-review.sh" "$dest" >/dev/null 2>&1; then
-    echo "ok: $label farmed record-review.sh == repo copy (#562)"
-  else
-    fail "$label: farmed record-review.sh differs from scripts/record-review.sh (stale copy!)"
+  local entry dest declared=0 checked=0
+  local line
+  line="$(farm_array_entries merge_gate_srcs)"
+  [ -n "$line" ] \
+    || { fail "$label: could not read the merge_gate_srcs array from setup.sh (wrapped across lines?) — 0 declared entries must never read as clean"; return; }
+  for entry in $line; do
+    declared=$((declared+1))
+    dest="$DEST/scripts/$entry"
+    [ -f "$ROOT/scripts/$entry" ] \
+      || { fail "$label: merge_gate_srcs declares '$entry' but scripts/$entry does not exist"; continue; }
+    [ -f "$dest" ] \
+      || { fail "$label: $entry not farmed into scripts/ (merge-gate farm missing or silently skipped)"; continue; }
+    # ⛔ THE BIT IS PART OF THE CONTRACT (P3, fresh review of #2288): the lane brief and the
+    # code-review skill tell a lander to TYPE this path, so a farmed-but-not-executable copy is a
+    # seam nobody can invoke — and existence + byte-equality alone reported it clean, while
+    # setup.sh discarded a failing `chmod +x` with `|| true`.
+    [ -x "$dest" ] \
+      || fail "$label: $entry is farmed but NOT EXECUTABLE ($dest) — a lander cannot type it"
+    if diff -q "$ROOT/scripts/$entry" "$dest" >/dev/null 2>&1; then
+      checked=$((checked+1))
+    else
+      fail "$label: farmed $entry differs from scripts/$entry (stale copy!)"
+    fi
+  done
+  if [ "$checked" -eq "$declared" ] && [ "$checked" -gt 0 ]; then
+    echo "ok: $label merge_gate_srcs farm byte-identical for $checked/$declared declared entries (#562)"
   fi
   # #1362 D1 — record-review.sh resolves its diff normalizer from a SIBLING
   # directory (`<script dir>/lib/diff-normalize.py`). Farming the producer
@@ -490,10 +514,18 @@ script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees-la
 script:pi-reap-worktrees.sh script:pr-doctor.py
 script:publish-live-workspaces.py
 script:session-postmortem.sh
+script:record-review.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
 lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py"
+# `script:record-review.sh` joined on 2026-10-21 (PR #2288, #2287): `review-pr.sh` is now farmed by
+# the SAME `merge_gate_srcs` array and EXECS it, so the derivation sees the recorder as a producer
+# for the first time. It is DELIVERED — that array is what puts it at $DEST/scripts/record-review.sh
+# (and that is why `review-pr.sh` could ever find its recorder) — so this is a re-pin of the derived
+# population, NOT a `LANE_PRODUCERS_EXEMPT` entry: an exemption would claim a deliverable producer is
+# withheld, which is the opposite of what the farm does.
+#
 # `script:pi-reap-worktrees-launchd.py` joined on 2026-10-20 (PR #2173): the consolidated disk
 # reaper's macOS LaunchAgent execs it (a launchd-spawned `bash` cannot read a repo under ~/Documents,
 # so the checkout's interpreter reads the script and hands it to bash on stdin). It is DELIVERED —
@@ -529,8 +561,20 @@ farm_array_entries() { # <array-name> [repo-root]
 # Whole-word membership, the `ci_runner_gate.test.sh` idiom: a plain `grep -F` for the basename is
 # also satisfied by `lane-actions.py.old`, i.e. by the exact rename that leaves the producer
 # undelivered. `tr` splits the array on whitespace, `grep -Fxq` requires the whole entry.
-farm_declares() { # <array-name> <entry> [repo-root] -> 0 when the array carries the entry as a word
-  farm_array_entries "$1" "$3" | grep -Fxq -- "$2"
+farm_declares() { # <array-name> <entry> [<repo-root>|<setup.sh>] -> 0 when the array carries the entry as a word
+  # The third argument arrives in TWO shapes and BOTH are in use: a REPO ROOT (the population floor
+  # and the closure probes pass "$ROOT"/"$root") and an explicit setup.sh FILE (check_orphan_reaper_farmed
+  # and its non-vacuity probe pass a throwaway COPY, so the real file is never perturbed). Handling only
+  # one of them reads an empty array for the other — which reports "not declared" for an entry that IS
+  # declared, i.e. a false FAIL, and in the probe direction a false "the check did not fire".
+  local arr="$1" entry="$2" where="${3:-$ROOT}" line
+  if [ -f "$where" ]; then
+    line="$(sed -n "s/^${arr}=(\(.*\))$/\1/p" "$where")"
+  else
+    line="$(farm_array_entries "$arr" "$where")"
+  fi
+  [ -n "$line" ] || return 1
+  printf '%s\n' "$line" | tr -s ' ' '\n' | sed '/^$/d' | grep -Fxq -- "$entry"
 }
 # A repo-relative path as a population entry.
 producer_kind_of() { # <scripts/... path>
@@ -916,6 +960,42 @@ producer_probe() { # <check-fn> <label> <population> -> the FAILURES delta, on s
   FAILURES="$saved"
   printf '%s' "$delta"
 }
+
+check_orphan_reaper_farmed() { # [<label>] [<setup.sh>]
+  local label="${1:-run1}" setup_file="${2:-$ROOT/pi-bootstrap/setup.sh}" entry="pi-reap-orphans.sh"
+  if ! farm_declares fleet_srcs "$entry" "$setup_file"; then
+    fail "$label: '$entry' is declared by NO farm array — the com.eldato.pi-reap-orphans job execs \$DEST/scripts/$entry, so the farm would schedule a job whose script is missing (#1862/#1863)"
+    return
+  fi
+  [ -f "$ROOT/scripts/$entry" ] \
+    || { fail "$label: fleet_srcs declares '$entry' but scripts/$entry does not exist — the farm skips it SILENTLY"; return; }
+  [ -f "$DEST/scripts/$entry" ] \
+    || { fail "$label: '$entry' is declared but was NOT farmed into \$DEST/scripts (silent skip) — the scheduled job would find no script"; return; }
+  echo "ok: $label the orphan reaper is DECLARED in fleet_srcs and farmed (#1862/#1863)"
+}
+
+# NON-VACUITY PROBE for the check above: it must FIRE on an array that lacks the reaper. Runs against
+# a THROWAWAY copy of setup.sh with `pi-reap-orphans.sh` removed, so the real file is never
+# perturbed; FAILURES is restored exactly as in `producer_probe`.
+orphan_probe() { # <probe-label> <setup-copy> -> prints the FAILURES delta
+  local saved_failures="$FAILURES" delta
+  check_orphan_reaper_farmed "$1" "$2" >/dev/null 2>&1
+  delta=$((FAILURES - saved_failures))
+  FAILURES="$saved_failures"
+  printf '%s' "$delta"
+}
+PROBE_SETUP_NO_REAPER="$TMP/setup-no-reaper.sh"
+sed 's/ pi-reap-orphans\.sh//' "$ROOT/pi-bootstrap/setup.sh" > "$PROBE_SETUP_NO_REAPER"
+# Test the ARRAY, not the whole file: `pi-reap-orphans.sh` also appears in setup.sh's comments, so a
+# whole-file grep would refuse a correctly-built fixture.
+if sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$PROBE_SETUP_NO_REAPER" | tr -s ' ' '\n' | grep -Fxq -- 'pi-reap-orphans.sh'; then
+  fail "probe fixture's fleet_srcs still carries pi-reap-orphans.sh — the reaper-membership non-vacuity probe cannot run"
+elif [ "$(orphan_probe "reaper-probe-absent" "$PROBE_SETUP_NO_REAPER")" -gt 0 ]; then
+  echo "ok: the reaper-membership guard FIRES when pi-reap-orphans.sh is absent from fleet_srcs (non-vacuous)"
+else
+  fail "the reaper-membership guard did NOT fire on an array without pi-reap-orphans.sh — it reads absent as clean"
+fi
+
 # FORMS — every extraction form the header declares, on one synthetic consumer pair (hermetic: no
 # repo file is touched). A form dropped from `_producer_scan` without being dropped from the header
 # fails HERE, which is what keeps the declared surface and the implemented one the same surface. One
@@ -1793,11 +1873,36 @@ check_producer_farm_declared "run1" "$LANE_PRODUCERS_DERIVED"
   || fail "run1: the population pin NEVER RAN on the real tree — its invocation is missing or was skipped, so a silently SHRUNK population would read as clean (#1899)"
 [ "${_DISPO_RAN:-0}" = 1 ] \
   || fail "run1: the DISPOSITION gate NEVER RAN on the real tree — its invocation is missing or was skipped, which is the #1899 defect itself (a green run over an unjudged population)"
+check_orphan_reaper_farmed "run1"
 check_identity_lib_farmed "run1"
 check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"
-grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
-  || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
+# ⛔ DERIVED FROM `merge_gate_srcs`, for the same reason as the lib-farm pin below (#1897):
+# this assertion used to pin the literal `1 copied (record-review.sh, #562)`, so farming a
+# legitimate SECOND merge-gate script (review-pr.sh, #2287) turned a correct farm into a CI
+# red — caught by the seam's own fresh-context review of PR #2288, not by CI. Read the count
+# and names FROM the array, so a red here means what it exists to mean: a sibling that landed
+# undeclared, or a summary that lies about what it farmed.
+merge_decl="$(farm_array_entries merge_gate_srcs | tr '\n' ' ')"
+merge_n="$(printf '%s\n' "$merge_decl" | wc -w | tr -d ' ')"
+if [ -z "${merge_n:-}" ] || [ "$merge_n" -eq 0 ]; then
+  fail "run 1: could not read the merge_gate_srcs array from setup.sh — the merge-gate farm assertion cannot be derived (#562)"
+else
+  # `|| true`: under `set -euo pipefail` a bare assignment from a failing `grep -m1` would
+  # abort the whole suite and skip every later section, making the diagnostic below
+  # unreachable (P3, sixth fresh review of PR #2288).
+  merge_line="$(grep -m1 'scripts merge-gate farm: [0-9][0-9]* copied' "$RUNS_LOG" || true)"
+  case "$merge_line" in
+    *"scripts merge-gate farm: $merge_n copied"*) ;;
+    *) fail "run 1 did not report the merge-gate scripts farm copies (expected $merge_n copied, #562): ${merge_line:-<no merge-gate-farm line at all>}" ;;
+  esac
+  for merge_base in $merge_decl; do
+    case "$merge_line" in
+      *"$merge_base"*) ;;
+      *) fail "run 1: the merge-gate farm summary does not NAME the declared script '$merge_base' — a summary that omits a script it farmed misreports the farm (#1897/#562)" ;;
+    esac
+  done
+fi
 # ⛔ DERIVED FROM `lib_srcs`, NOT HARD-CODED (#1897). This used to pin the literal string `2 copied
 # (pid-identity.sh + diff-normalize.py)` — so adding a legitimate THIRD lib (beat-pair.sh, the
 # recap/beat rule both readers share) turned a correct farm into a CI red. Read the expected count and
@@ -1892,6 +1997,7 @@ rm -rf "$DEST/tools"
 echo "== run 2: re-run refresh"
 echo "# machine-local mutation" >> "$DEST/agents/verifier.md"
 echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm refresh
+echo "# stale farm mutation" >> "$DEST/scripts/review-pr.sh"       # #562 farm refresh (the seam, P3 #2288)
 if [ -f "$DEST/scripts/ci_runner_gate.sh" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/ci_runner_gate.sh"  # #1719 farm refresh
 fi
@@ -1981,6 +2087,11 @@ if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
   fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
 else
   echo "ok: farmed record-review.sh refreshed on re-run (#562)"
+fi
+if grep -q "stale farm mutation" "$DEST/scripts/review-pr.sh"; then
+  fail "stale farm mutation survived re-run (farmed review-pr.sh was not refreshed)"
+else
+  echo "ok: farmed review-pr.sh refreshed on re-run (#562, #2288)"
 fi
 if [ ! -f "$DEST/scripts/lib/pid-identity.sh" ]; then
   : # already reported by check_identity_lib_farmed "run2" (missing file is not "refreshed")

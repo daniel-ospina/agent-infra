@@ -53,6 +53,7 @@ reset_env() {  # fresh state dir, clock, counters — one scenario per box
   rm -rf "$GH_LIMIT_DIR"; mkdir -p "$GH_LIMIT_DIR"
   printf '1700000000\n' > "$CLOCK"
   : > "$SLEEPS"; : > "$STUB_LOG"; printf '0\n' > "$COUNT"
+  rm -f "$TMP/release"
   export GH_LIMIT_SCENARIO="$1"
 }
 
@@ -69,22 +70,62 @@ n=$(( n + 1 )); printf '%s\n' "$n" >"$GH_LIMIT_TEST_COUNT"
 # early — a test that counts requests must see all of them (the probe used to be invisible here).
 printf 'call|%s\n' "$*" >>"$GH_LIMIT_TEST_STUBLOG"
 case "$GH_LIMIT_SCENARIO" in
-  converge|limited)
-    # The markers go to the log; STDOUT must be a well-formed `--include` response or the
-    # conditional layer's fallback would re-run the call and the count would read double. `limited`
-    # ALSO instruments the `api rate_limit` probe below, so an unserialised probe shows up as
-    # overlap in the same measurement as an unserialised call.
+  converge|limited|coalesce|leaderfail|slow)
     printf 'start|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
-    sleep 0.1
+    case "$GH_LIMIT_SCENARIO" in
+      converge|limited) sleep 0.1 ;;
+      leaderfail) sleep 0.4 ;;
+      coalesce) sleep 0.6 ;;
+      slow)
+        # PARKED until the test releases it (bounded, so a broken fixture cannot hang the suite).
+        _pi=0
+        while [ "$_pi" -lt 100 ] && [ ! -e "$GH_LIMIT_TEST_RELEASE" ]; do sleep 0.1; _pi=$(( _pi + 1 )); done ;;
+    esac
     printf 'end|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG" ;;
 esac
 case "$*" in
   *"api rate_limit"*)
-    # The exempt endpoint, measured to report healthy headroom while another bucket is empty.
-    printf '{"resources":{"core":{"remaining":4999,"reset":1700003600},"graphql":{"remaining":4999,"reset":1700003600}}}'
+    # The exempt endpoint, measured to report healthy headroom while another bucket is empty. Two
+    # scenarios make it report something ELSE, which is what the account-scope tests revalidate
+    # against: `probeempty` = the bucket really is out (a reset ~43 min away), `probehead` = the
+    # bucket has headroom, so any marker claiming otherwise is stale.
+    case "${GH_LIMIT_SCENARIO:-}" in
+      probeempty) _rem=0; _reset=1700002580 ;;
+      probehead)  _rem=4573; _reset=1700003600 ;;
+      # ⛔ A CONCURRENT WRITER, INSTRUMENTED. `record_limit` writes `last-limit` OUTSIDE the box lock,
+      # so between the gate's read and its annotation another client can replace the record with a
+      # FRESH genuine refusal. This arm does exactly that while the probe is in flight, which is the
+      # only way to exercise the identity guard through the gate instead of at the function level.
+      probereplace)
+        _rem=4573; _reset=1700003600
+        printf 'at=1700000500 bucket=graphql reset=1700002580 attempts=1 waited=0 status=403 kind=primary until=1700002580 remaining=0\n' \
+          > "$GH_LIMIT_DIR/last-limit" ;;
+      *)          _rem=4999; _reset=1700003600 ;;
+    esac
+    printf '{"resources":{"core":{"remaining":%d,"reset":%d},"graphql":{"remaining":%d,"reset":%d}}}' \
+      "$_rem" "$_reset" "$_rem" "$_reset"
     exit 0 ;;
 esac
 case "$GH_LIMIT_SCENARIO" in
+  coalesce)
+    # ONE answer per INVOCATION, carrying the invocation count: five callers that each ran their own
+    # request would produce five DIFFERENT bodies (n=1..5), so byte-identical output is proof that
+    # they received one load, not that the assertion happened to look at the right line.
+    printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true,"n":%s}' "$n"
+    exit 0 ;;
+  leaderfail)
+    # The FIRST call fails with a distinctive error and every later one SUCCEEDS — so a follower that
+    # did not learn the leader's failure reports a success, which the test must catch.
+    if [ "$n" -le 1 ]; then
+      printf '{"message":"leader failed"}'
+      printf 'gh: LEADER-ERROR: the first read failed (HTTP 502)\n' >&2
+      exit 1
+    fi
+    printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true,"n":%s}' "$n"
+    exit 0 ;;
+  slow)
+    printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true,"fresh":1}'
+    exit 0 ;;
   converge)
     printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true}'
     exit 0 ;;
@@ -116,6 +157,23 @@ case "$GH_LIMIT_SCENARIO" in
     fi
     printf 'HTTP/2.0 200 OK\r\nEtag: "e1"\r\n\r\n{"state":"OPEN","number":1}'
     exit 0 ;;
+  retryafterlong)
+    # The server names a delay BEYOND the one-minute floor: the record must carry it, or this box's
+    # peers resume 240 s inside a cool-down this process is still honouring. Refuses ONCE so the
+    # normal retry path writes the record (not the give-up path).
+    if [ "$n" -le 1 ]; then
+      printf 'HTTP/2.0 403 Forbidden\r\nRetry-After: 300\r\nX-RateLimit-Remaining: 45\r\nX-RateLimit-Reset: 1700003600\r\n\r\n{"message":"API rate limit exceeded"}\r\n'
+      printf 'gh: API rate limit exceeded (HTTP 403)\n' >&2
+      exit 1
+    fi
+    printf 'HTTP/2.0 200 OK\r\nEtag: "e2"\r\n\r\n{"state":"OPEN","number":1}'
+    exit 0 ;;
+  retryafterlongalways)
+    # The same server delay, but it NEVER clears: exercises the give-up / NO_WAIT record, which reach
+    # `record_window` with no `plan_wait` result to carry the header.
+    printf 'HTTP/2.0 403 Forbidden\r\nRetry-After: 300\r\nX-RateLimit-Remaining: 45\r\nX-RateLimit-Reset: 1700003600\r\n\r\n{"message":"API rate limit exceeded"}\r\n'
+    printf 'gh: API rate limit exceeded (HTTP 403)\n' >&2
+    exit 1 ;;
   retryzero)
     # `retry-after: 0` — a degenerate value that must not become a zero-wait burst.
     printf 'HTTP/2.0 403 Forbidden\r\nRetry-After: 0\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700003600\r\n\r\n{"message":"API rate limit exceeded"}\r\n'
@@ -130,6 +188,22 @@ case "$GH_LIMIT_SCENARIO" in
     fi
     printf '%s\n' "$err" >&2
     exit 1 ;;
+  unclassified)
+    # ⛔ THE MEASURED `status=?` SHAPE. A refusal gh reports in PROSE alone: no HTTP status, no
+    # headers, and none of the secondary vocabulary — so neither the bucket nor the status can be
+    # classified. This is the class that used to adopt a bucket reset (~43 min) as its wait.
+    printf 'gh: API rate limit exceeded.\n' >&2
+    exit 1 ;;
+  nearreset)
+    # A genuinely EXHAUSTED bucket whose reset is INSIDE the in-call bound: the documented
+    # `x-ratelimit-reset` rule must still be honoured for a primary refusal.
+    if [ "$n" -le 1 ]; then
+      printf 'HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000120\r\n\r\n{"message":"API rate limit exceeded"}\r\n'
+      printf 'gh: API rate limit exceeded (HTTP 403)\n' >&2
+      exit 1
+    fi
+    printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true}'
+    exit 0 ;;
   checksfail)
     # `gh pr checks` prints EVERY check on stdout and signals the verdict with the exit code
     # (0 pass / 1 fail / 8 pending). Nothing here is a rate limit.
@@ -191,6 +265,11 @@ esac
 STUB
 chmod +x "$TMP/stub-gh"
 export GH_LIMIT_TEST_STUBLOG="$STUB_LOG" GH_LIMIT_TEST_COUNT="$COUNT" GH_LIMIT_REAL_GH="$TMP/stub-gh"
+# The `slow`/coalescing fixtures PARK a request until the test releases it, so a "leader that is
+# still in flight" can be held for as long as the assertion needs without killing anything (a killed
+# leader's stub child would keep writing into the NEXT scenario's log). Created by the test to
+# release; removed by `reset_env`.
+export GH_LIMIT_TEST_RELEASE="$TMP/release"
 
 # ── helpers ─────────────────────────────────────────────────────────────────────────────────────
 run_helper() { python3 "$HELPER" --real-gh "$TMP/stub-gh" -- "$@"; }
@@ -231,6 +310,46 @@ ck "retry-after: the caller gets the SUCCESS body, not the rate-limit body" "$(h
 ck "retry-after: exactly two attempts" "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
 ck "retry-after: the streams stay clean on a call that eventually succeeded" \
    "$([ ! -s "$TMP/err-A" ] && echo 0 || echo 1)"
+# ⛔ AND THE WINDOW IT RECORDS IS THE SERVER'S, NOT THE FLOOR. `plan_wait` honours `retry-after`
+# exactly (bounded by MAX_WAIT); `marker_until` capped EVERY non-primary window at the 60 s floor, so
+# a `Retry-After: 300` had this process sleeping 300 s while its own record told peers the box was
+# free in 60 — 240 s of peer traffic inside a cool-down the layer itself was obeying. Sleeps are
+# stubbed here; the assertion is on the durable record.
+reset_env retryafter-window
+GH_LIMIT_SLEEP_CMD=true GH_LIMIT_SCENARIO=retryafterlong \
+  run_helper api repos/o/r >/dev/null 2>&1 || true
+_win="$(python3 -c 'import re, sys
+t = open(sys.argv[1]).read()
+print(int(re.search(r"\buntil=(\d+)", t).group(1)) - int(re.search(r"\bat=(\d+)", t).group(1)))' \
+        "$GH_LIMIT_DIR/last-limit")"
+ck "retry-after: the recorded window is the server's 300s delay, not the 60s floor (got ${_win}s)" \
+   "$([ "$_win" -gt 250 ] && echo 0 || echo 1)"
+# ⛔ AND THE SAME MUST HOLD ON THE PATHS THAT NEVER CALL `plan_wait`. The give-up and NO_WAIT records
+# reach `record_window` with `wait=None`, so the `limit.retry_after` fallback is what carries the
+# header there — without it, the two paths that write the LAST record of a run would fall back to the
+# 60 s floor (unpinned by the run above, which refuses only once and ends on the retry path).
+reset_env retryafter-window-nowait
+GH_LIMIT_NO_WAIT=1 GH_LIMIT_SCENARIO=retryafterlongalways \
+  run_helper api repos/o/r >/dev/null 2>&1 || true
+_win2="$(python3 -c 'import re, sys
+t = open(sys.argv[1]).read()
+print(int(re.search(r"\buntil=(\d+)", t).group(1)) - int(re.search(r"\bat=(\d+)", t).group(1)))' \
+        "$GH_LIMIT_DIR/last-limit")"
+ck "retry-after: the NO_WAIT/give-up record ALSO carries the server's 300s window (got ${_win2}s)" \
+   "$([ "$_win2" -gt 250 ] && echo 0 || echo 1)"
+# ⛔ AND THE TWO RECORDS OF ONE REFUSAL MUST AGREE ABOUT ITS AGE. `events.log` said `evidence_age=0s`
+# while the same event's stderr said `marker_age=120s` (the borrowed reset's age), so an operator had
+# two answers to "how old is what this decision rested on". A refusal with no reset header borrows the
+# last record's, and that record's age IS the evidence age — in both places.
+reset_env evidence-age-agreement
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=?\n' > "$GH_LIMIT_DIR/last-limit"
+printf '1700000120\n' > "$CLOCK"
+GH_LIMIT_NO_WAIT=1 GH_LIMIT_SCENARIO=unclassified run_helper api graphql -f query='{viewer{login}}' \
+  >/dev/null 2>"$TMP/err-age" || true
+_log_age="$(grep -oE 'evidence_age=[0-9]+s' "$GH_LIMIT_DIR/events.log" | tail -1 | grep -oE '[0-9]+')"
+_err_age="$(grep -oE 'marker_age=[0-9]+s' "$TMP/err-age" | tail -1 | grep -oE '[0-9]+')"
+ck "NO_WAIT: the log and the stderr agree on the borrowed record's AGE (log=${_log_age}s err=${_err_age}s)" \
+   "$([ -n "$_log_age" ] && [ "$_log_age" -gt 0 ] && [ "$_log_age" = "$_err_age" ] && echo 0 || echo 1)"
 
 # ── B. A secondary limit with NO headers: >=60s, doubling, bounded, then FAIL LOUDLY ──────────
 reset_env secondary
@@ -241,7 +360,7 @@ ck "secondary: the failure is LOUD on stderr (never a silent success)" "$([ "$rc
 ck "secondary: the message NAMES the bucket (graphql, not the REST counter that looks healthy)" \
    "$(has 'bucket=graphql' "$(cat "$TMP/err-B")" && echo 0 || echo 1)"
 ck "secondary: the message names the reset it observed" \
-   "$(grep -qE 'rate limit \(bucket=graphql reset=[0-9]+\)' "$TMP/err-B" && echo 0 || echo 1)"
+   "$(grep -qE 'rate limit \(bucket=graphql reset=[0-9]+ kind=secondary\)' "$TMP/err-B" && echo 0 || echo 1)"
 ck "secondary: wait 1 is >= 60s"   "$(sleep_at_least 0 60 && echo 0 || echo 1)"
 ck "secondary: wait 2 is >= 120s (doubling)" "$(sleep_at_least 1 120 && echo 0 || echo 1)"
 ck "secondary: wait 3 is >= 240s (doubling)" "$(sleep_at_least 2 240 && echo 0 || echo 1)"
@@ -260,6 +379,9 @@ ck "a reset an hour away does NOT park the call for an hour (1 attempt, no wait)
    "$([ "$(calls)" -eq 1 ] && [ -z "$(sleeps)" ] && echo 0 || echo 1)"
 ck "and it says why, naming the in-call bound" \
    "$(has 'in-call bound' "$(cat "$TMP/err-C")" && echo 0 || echo 1)"
+ck "the fail-fast BACKOFF line carries its own evidence: kind, attempt, remaining, age" \
+   "$(grep -qE 'reset beyond the in-call bound.*kind=[a-z]+ attempt=[0-9]+ remaining=[0-9?]+ evidence_age=0s' \
+        "$GH_LIMIT_DIR/events.log" && echo 0 || echo 1)"
 
 # ── D. Not every failure is a rate limit ───────────────────────────────────────────────────────
 reset_env notfound
@@ -386,12 +508,24 @@ wait
 ck "CONTROL: 8 unserialised callers DO overlap (the probe can fail)" "$([ "$(max_inflight)" -gt 1 ] && echo 0 || echo 1)"
 : >"$STUB_LOG"
 for i in 1 2 3 4 5 6 7 8; do
-  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r >/dev/null 2>&1 ) &
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r >"$TMP/g1-$i" 2>&1 ) &
 done
 wait
 ck "single flight: 8 concurrent callers never exceed 1 in flight" "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
-ck "single flight: all 8 still ran (serialised, not dropped)" \
-   "$([ "$(grep -c '^start|' "$STUB_LOG")" -eq 8 ] && echo 0 || echo 1)"
+# ⛔ THIS ASSERTION USED TO READ "all 8 still ran" AND COUNTED 8 INVOCATIONS. That was protecting
+# "nothing is dropped", not "the same read runs eight times" — and #2243 makes the eight identical
+# reads ONE load (the queued-duplicate cost: 0.676 s at 3 lane processes, 63 s at 13). The property is
+# kept, in the form that matters: every caller still gets the ANSWER. The companion below pins the
+# serialisation itself for requests that are NOT identical.
+ck "single flight: all 8 callers still GOT the answer (coalesced into one load) [$(calls) load(s)]" \
+   "$([ "$(calls)" -eq 1 ] && [ "$(cat "$TMP"/g1-* | grep -o '"ok":true' | wc -l | tr -d ' ')" -eq 8 ] && echo 0 || echo 1)"
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6 7 8; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api "repos/o/r/pulls/94$i" >/dev/null 2>&1 ) &
+done
+wait
+ck "single flight: DIFFERENT reads are NOT collapsed — 8 requests, and never 2 in flight [#$(calls)/peak $(max_inflight)]" \
+   "$([ "$(calls)" -eq 8 ] && [ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
 
 # The PROBE is the one gh request this layer issues outside an attempt (it runs while the caller is
 # in backoff, when the rest of the box is busiest). It must be serialised too.
@@ -403,8 +537,441 @@ done
 wait
 ck "single flight: the /rate_limit PROBE is serialised too (it runs outside the attempt lock)" \
    "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
-ck "single flight: … and that measurement really saw the probe (each caller's retries ran)" \
+ck "single flight: … and that measurement really saw the probe (the leader's 4 attempts + 3 probes)" \
    "$([ "$(grep -c '^start|' "$STUB_LOG")" -gt 4 ] && echo 0 || echo 1)"
+
+# ── G2. COALESCING: identical concurrent READS share ONE load (agent-infra#2243) ────────────────
+# ⛔ WHAT THIS SECTION IS FOR. Serialisation (#1988/#2005) decides WHO GOES NEXT; it does not decide
+# whether the work is worth doing twice. Thirteen lanes asking for the SAME read queued thirteen
+# times for one answer already known after the first (measured: `gh pr view` 0.676 s at 3 lane
+# processes, 63 s at 13, while `curl /rate_limit` was 0.091 s on 4658/5000 quota — the cost was
+# OURS). Each assertion below fails when its mechanism is disabled:
+#   (a) drop the coalescing                => 5 loads, and the bodies differ (n=1..5)
+#   (b) make the key ignore the request    => 1 load for 5 DIFFERENT reads
+#   (c) do not publish a failure           => followers report the SECOND call's success
+#   (d) allow mutating argv to be shared   => 1 load for 2 merges (a lost merge)
+#   (e) remove the bound                   => a hang instead of BUSY (75) with the age
+#   (f) remove the age label / serve stale by default => stale presented as current
+#   (6) remove the takeover                 => a dead leader's key is never released
+
+# (a) five concurrent IDENTICAL reads make exactly ONE underlying call.
+reset_env g2a
+for _i in 1 2 3 4 5; do
+  ( GH_LIMIT_SCENARIO=coalesce python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+      >"$TMP/g2a-$_i" 2>/dev/null ) &
+done
+wait
+ck "(a) 5 concurrent IDENTICAL reads make exactly ONE underlying gh call [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+# Byte-identical bodies carrying `n:1` (the FIRST invocation's answer): a follower that re-ran the
+# request would have produced n=2..5, so this proves SHARING rather than a lucky line count.
+ck "(a) … and all 5 received THAT one answer, byte-identical [$(sort -u "$TMP"/g2a-* | tr '\n' ' ')]" \
+   "$([ "$(sort -u "$TMP"/g2a-* | grep -c .)" -eq 1 ] && grep -q '"n":1' "$TMP/g2a-1" && echo 0 || echo 1)"
+
+# (b) five concurrent DIFFERENT reads are five requests — nothing is over-collapsed.
+reset_env g2b
+for _i in 1 2 3 4 5; do
+  ( GH_LIMIT_SCENARIO=converge python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api "repos/o/r/pulls/94$_i" \
+      >/dev/null 2>&1 ) &
+done
+wait
+ck "(b) 5 concurrent DIFFERENT reads make 5 calls (no over-collapsing) [$(calls)]" \
+   "$([ "$(calls)" -eq 5 ] && echo 0 || echo 1)"
+ck "(b) … and they are still SERIALISED, never 2 in flight (#2005 stands) [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+
+# (c) a FAILING leader: every follower learns the failure, with the leader's error, and none reports
+# the success a later call would have produced.
+reset_env g2c
+for _i in 1 2 3 4 5; do
+  ( GH_LIMIT_SCENARIO=leaderfail python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+      >"$TMP/g2c-out-$_i" 2>"$TMP/g2c-err-$_i"; printf '%s' "$?" >"$TMP/g2c-rc-$_i" ) &
+done
+wait
+ck "(c) a failing leader is shared: exactly ONE call [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+_bad=""
+for _i in 1 2 3 4 5; do
+  [ "$(cat "$TMP/g2c-rc-$_i")" -ne 0 ] || _bad="$_bad rc$_i"
+  grep -q 'LEADER-ERROR' "$TMP/g2c-err-$_i" || _bad="$_bad err$_i"
+  grep -q '"ok":true' "$TMP/g2c-out-$_i" && _bad="$_bad fake-success$_i"
+done
+ck "(c) … every follower exits non-zero WITH the leader's own error, none reports success [${_bad# }]" \
+   "$([ -z "$_bad" ] && echo 0 || echo 1)"
+
+# (d) two concurrent MUTATIONS are two requests. 
+# ⛔ THE SAME ARGV ON PURPOSE: `body=a` vs `body=b` would differ in the KEY and the test would pass
+# with the mechanism disabled. Two callers asking for the same merge (or the same comment) are two
+# requests, and coalescing one would DROP it.
+reset_env g2d
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api -X POST repos/o/r/issues/1/comments -f body=x \
+      >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) two concurrent MUTATIONS are two calls, never one [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+# ⛔ AND THE PREDICATE THAT GATES COALESCING MUST NOT BE `is_mutating`'s. That one is `MUTATING_PAIRS`
+# plus "`api graphql` is a read", and it says of itself that it "errs wide rather than narrow" — a
+# false MUTATION there costs one wasted 1 s pace. Reused here, an unlisted mutation (or a GraphQL
+# MUTATION, which `api_is_mutating` calls a read outright) reads as a read and two concurrent identical
+# calls collapse into ONE: the second is never executed and its caller gets the first one's rc 0.
+# So the gate is a READ allowlist. Both directions are pinned here (review round 2).
+reset_env g2d2
+for _i in 1 2; do
+  ( GH_LIMIT_SCENARIO=plain python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api graphql -f 'query=mutation { addComment(input:{body:"x"}) { id } }' >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) two concurrent GRAPHQL MUTATIONS are two calls (a payload starting with 'mutation' is not a read) [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d3
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- run delete 12345 >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) an UNLISTED mutating subcommand is never coalesced (fail closed) [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d4
+for _i in 1 2 3; do
+  ( GH_LIMIT_SCENARIO=coalesce python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- pr view 9 --repo o/r >"$TMP/g2d4-$_i" 2>/dev/null ) &
+done
+wait
+ck "(d) … while an ALLOWLISTED subcommand READ still coalesces (3 callers, one load) [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && cmp -s "$TMP/g2d4-1" "$TMP/g2d4-2" && cmp -s "$TMP/g2d4-1" "$TMP/g2d4-3" && [ -s "$TMP/g2d4-1" ] && echo 0 || echo 1)"
+# ⛔ THE ENDPOINT CANNOT BE "THE FIRST TOKEN THAT DOES NOT START WITH `-`". With a value-taking flag
+# before it, that token is the FLAG'S VALUE — so `gh api -H 'Accept: x' graphql -f 'query=mutation…'`
+# skipped the GraphQL inspection and a MUTATION was coalesced (review round 3), `-H`-prefixed GraphQL
+# refusals were pinned on the `core` bucket, and a `-H`-prefixed `/rate_limit` counted as recovery
+# evidence. All four call sites now share `api_endpoint`; these are the argv shapes that broke it.
+reset_env g2d5
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api -H 'Accept: application/json' graphql -f 'query=mutation { addComment(input:{body:"x"}) { id } }' \
+      >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) a GraphQL MUTATION behind a value-taking flag is STILL not coalesced [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d6
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api -H 'Accept: application/json' rate_limit >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) … and the exempt /rate_limit meter behind a flag is not coalesced either [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d7
+for _i in 1 2 3; do
+  ( GH_LIMIT_SCENARIO=converge python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api -H 'Accept: application/json' repos/o/r/pulls/12678 >"$TMP/g2d7-$_i" 2>/dev/null ) &
+done
+wait
+ck "(d) … while a flagged READ endpoint still coalesces (the fix narrowed nothing) [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && cmp -s "$TMP/g2d7-1" "$TMP/g2d7-2" && cmp -s "$TMP/g2d7-1" "$TMP/g2d7-3" && [ -s "$TMP/g2d7-1" ] && echo 0 || echo 1)"
+_ep="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+H = ["-H", "Accept: application/json"]
+bad = []
+if m.api_endpoint(["api"] + H + ["graphql", "-f", "query={x}"]) != "graphql": bad.append("endpoint")
+if m.bucket_for(["api"] + H + ["graphql"]) != "graphql": bad.append("bucket")
+if m.makes_request(["api"] + H + ["rate_limit"]): bad.append("recovery-evidence")
+if m.pass_cache_eligible(["api"] + H + ["rate_limit"]): bad.append("memoised-meter")
+if m.api_endpoint(["api", "--frobnicate", "repos/o/r"]) is not None: bad.append("unknown-flag")
+# ⛔ `--preview` is a real `gh api` VALUE flag; before it was in the vocabulary an unattributable
+# argv fell through `makes_request` as "some non-meter endpoint" and a `/rate_limit` behind it counted
+# as RECOVERY EVIDENCE — erasing a live limit (review round 5).
+for pre in (["-p", "preview"], ["--preview=preview"]):
+    if m.api_endpoint(["api"] + pre + ["rate_limit"]) != "rate_limit": bad.append("preview-endpoint")
+    if m.makes_request(["api"] + pre + ["rate_limit"]): bad.append("preview-recovery-evidence")
+if m.makes_request(["api", "--frobnicate", "rate_limit"]): bad.append("unattributable-recovery-evidence")
+print("ok" if not bad else "BROKEN %s" % bad)' "$HELPER")"
+ck "endpoint: bucket, recovery-evidence, memoisation and coalescing all attribute it the same way [$_ep]" \
+   "$([ "$_ep" = ok ] && echo 0 || echo 1)"
+
+# ⛔ A SHORT FLAG'S VALUE MAY BE ATTACHED (cobra/pflag): `-fbody=x`, `-Fbody=x`, `-f=body=x` are all
+# `-f body=x`, and a field makes `gh api` infer POST. Only the SEPARATE and the LONG attached forms
+# were recognised, so a create spelled `-fbody=x` classified as a READ and two concurrent identical
+# creates were coalesced — one of them never happened (review round 4).
+reset_env g2d8
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/issues/1/comments -fbody=hello >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) an ATTACHED short data flag (-fbody=x) is a mutation, never coalesced [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d9
+for _i in 1 2 3; do
+  ( GH_LIMIT_SCENARIO=coalesce python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api graphql -fquery='{viewer{login}}' >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) … while a GraphQL QUERY written the same attached way still coalesces (3 callers, one load) [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ A LOCAL SIDE EFFECT IS NOT A READ. `gh run download` writes artifact files into the CWD and its
+# stdout is near-empty, so coalescing it would hand a follower the leader's rc 0 while its own files
+# were never fetched (review round 6). The allowlist's criterion is "stdout IS the whole result".
+reset_env g2d10
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- run download 12345 >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) a read-SHAPED command with a local side effect (gh run download) is never coalesced [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+_dfl="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+bad = []
+for a in ("-fbody=x", "-Fbody=x", "-f=body=x", "--field=body=x", "--raw-field=q=1"):
+    if not m._data_flag_value(a)[0]: bad.append(a)
+for a in ("-f", "-F", "--field", "--input"):
+    if not m._data_flag_value(a)[0]: bad.append("bare:" + a)
+for a in ("-X", "--paginate", "repos/o/r"):
+    if m._data_flag_value(a)[0]: bad.append("false-positive:" + a)
+for shape in (["api", "ep", "-fbody=x"], ["api", "ep", "-Fbody=x"], ["api", "ep", "-f=body=x"]):
+    if not m.api_is_mutating(shape) or m.flight_eligible(shape): bad.append("not-mutation:" + shape[-1])
+if m.flight_key(["api", "x", "-X", "GET", "-fbody=x"]) == m.flight_key(["api", "x", "-fbody=x"]):
+    bad.append("key-collapse")
+print("ok" if not bad else "BROKEN %s" % bad)' "$HELPER")"
+ck "data flags: attached short forms are mutations, a GET-with-data keeps its own key [$_dfl]" \
+   "$([ "$_dfl" = ok ] && echo 0 || echo 1)"
+
+# ⛔ TAKEOVER IS A COMPARE-AND-SWAP, NOT unlink-then-create. Two waiters must not both pass the
+# staleness test and both become leader (a peer's fresh claim deleted by the loser), and a claim we did
+# not judge must be PUT BACK, not destroyed — otherwise a takeover deletes a live peer's claim.
+_tk="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" python3 -c 'import importlib.util,json,os,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+d, p = m.flight_dir(), None
+p = os.path.join(d, "k.leader")
+bad = []
+def claim(fid, started):
+    rec = {"pid": os.getpid(), "started_at": started, "flight": fid}
+    open(p, "w").write(json.dumps(rec))
+    return rec
+# (1) two waiters race one stale claim: exactly ONE may win it
+judged = claim("A", 1)
+first = m._take_over(p, judged)
+second = m._take_over(p, judged)
+if not (first is True and second is False):
+    bad.append("cas:%s/%s" % (first, second))
+# (2) a claim we did NOT judge is a live peer: put it back, do not destroy it
+stale = {"pid": 0, "started_at": 1, "flight": "A"}
+claim("B", m._now())
+if m._take_over(p, stale) is not False:
+    bad.append("restore-verdict")
+if (m._read_json(p) or {}).get("flight") != "B":
+    bad.append("peer-claim-lost")
+# (2b) identity is NOT "is one of them readable": judged UNREADABLE while a peer had written a GOOD
+# claim, and judged GOOD while the peer claim is UNREADABLE, must BOTH back off and destroy nothing
+claim("C", m._now())
+if m._take_over(p, None) is not False or (m._read_json(p) or {}).get("flight") != "C":
+    bad.append("unreadable-judged-ate-a-peer")
+open(p, "w").write("")
+if m._take_over(p, {"pid": os.getpid(), "started_at": 2, "flight": "C"}) is not False or not os.path.exists(p):
+    bad.append("readable-judged-ate-an-unreadable-peer")
+# (2c) and BOTH unreadable IS the claim we judged: that one is stale, so it goes
+if m._take_over(p, None) is not True or os.path.exists(p):
+    bad.append("same-unreadable-not-removed")
+# (2d) and a claim with NO flight id (hand-written / older) is still ours to reclaim by content
+open(p, "w").write(json.dumps({"pid": 999999999, "started_at": 1, "request": "gh api x"}))
+if m._take_over(p, m._read_json(p)) is not True or os.path.exists(p):
+    bad.append("no-flight-id-not-removed")
+# (3) no moved-aside debris
+left = [n for n in os.listdir(d) if ".stale-" in n]
+if left:
+    bad.append("debris:%s" % left)
+# (4) `_unlink_claim` needs a POSITIVE identity match: an unreadable file may be a successor inside its
+# own create/write window, so it must NOT be removed (round 6) — and a FRESH claim must survive the
+# reaper sweep entirely.
+open(p, "w").write("")
+if m._unlink_claim(p, "OURS") is not False or not os.path.exists(p):
+    bad.append("unlink-ate-an-unreadable-successor")
+claim("D", m._now())
+if m._unlink_claim(p, "SOMEONE-ELSE") is not False or (m._read_json(p) or {}).get("flight") != "D":
+    bad.append("unlink-ate-a-peer")
+m.prune_flights(d)
+if not os.path.exists(p):
+    bad.append("reaper-ate-a-fresh-claim")
+try:
+    os.unlink(p)
+except OSError:
+    pass
+print("ok" if not bad else "BROKEN %s" % bad)' "$HELPER")"
+ck "(6) takeover is atomic: ONE winner per stale claim, a live peer's claim put BACK, no debris [$_tk]" \
+   "$([ "$_tk" = ok ] && echo 0 || echo 1)"
+
+# (e) a waiter past the bound: a DISTINCT `busy` (EX_TEMPFAIL) naming the holder's age — never a hang
+# and never an unbounded queue. The holder is parked in the stub, so it is genuinely in flight.
+reset_env g2e
+( GH_LIMIT_SCENARIO=slow python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+    >/dev/null 2>&1 ) &
+_holder=$!
+sleep 2.2                              # the flight ledger is REAL time, so the age is really earned
+_t0=$(date +%s)
+busy_out="$(GH_LIMIT_SCENARIO=slow GH_LIMIT_FLIGHT_WAIT=0.4 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+              -- api repos/o/r/pulls/9426 2>"$TMP/err-busy")"; _busyrc=$?
+_el=$(( $(date +%s) - _t0 ))
+: > "$GH_LIMIT_TEST_RELEASE"; wait "$_holder" 2>/dev/null
+ck "(e) a waiter past the bound returns BUSY at once, not a hang (rc=$_busyrc in ${_el}s)" \
+   "$([ "$_busyrc" -eq 75 ] && [ "$_el" -le 5 ] && echo 0 || echo 1)"
+ck "(e) … and the outcome is DISTINCT and minimal: no answer on stdout, the age on stderr" \
+   "$([ -z "$busy_out" ] && grep -qE 'is being loaded by pid [0-9]+, 2s in flight' "$TMP/err-busy" && echo 0 || echo 1)"
+# ⛔ THE CLASSIFIER'S MARKER MUST NOT APPEAR, NOT EVEN NEGATED. `scripts/objective.py` decides a gh
+# failure is `RATE-LIMITED` with `if "rate limit" in low` over `TRANSPORT_MARKERS` — a plain substring
+# scan — so "This is NOT a rate limit" contains the marker and a `busy` was classified as a quota
+# refusal: the fleet waits out a limit that was never exhausted (review round 6). The markers are READ
+# OFF objective.py here, so this assertion tracks the classifier instead of a copy of its vocabulary.
+_marks="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("ob", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m); print("|".join(m.TRANSPORT_MARKERS))' "$HERE/../objective.py" 2>/dev/null)"
+_hit=""
+IFS='|' read -ra _ma <<<"$_marks"
+for _m in "${_ma[@]}"; do [ -n "$_m" ] && grep -qiF "$_m" "$TMP/err-busy" && _hit="$_hit [$_m]"; done
+ck "(e) … saying it is neither an answer nor quota exhaustion [classifier markers hit:${_hit:-none}]" \
+   "$(grep -q 'NOT an answer and NOT quota exhaustion' "$TMP/err-busy" && [ -z "$_hit" ] && echo 0 || echo 1)"
+ck "(e) … and it sent no request of its own [$(calls) load(s)]" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+
+# (f) STALE IS LABELLED. An answer from an earlier flight may be served while a refresh is in flight
+# — but only when the caller asks, and then the AGE goes on stderr. Never presented as current.
+reset_env g2f
+GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+  >"$TMP/g2f-first" 2>/dev/null                       # 1. one COMPLETED flight, on record
+( GH_LIMIT_SCENARIO=slow python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+    >/dev/null 2>&1 ) &                                # 2. … and an IDENTICAL read now in flight
+_holder=$!
+sleep 2.2
+ck "(f) WITHOUT the opt-in the stale answer is NOT served (the caller waits, then goes BUSY)" \
+   "$(GH_LIMIT_SCENARIO=slow GH_LIMIT_FLIGHT_WAIT=0.4 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+        -- api repos/o/r/pulls/9426 >"$TMP/g2f-nostale" 2>/dev/null; [ "$?" -eq 75 ] && [ ! -s "$TMP/g2f-nostale" ] && echo 0 || echo 1)"
+stale_out="$(GH_LIMIT_SCENARIO=slow GH_LIMIT_FLIGHT_WAIT=0.4 GH_LIMIT_FLIGHT_STALE_SERVE=1 \
+               python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>"$TMP/err-stale")"
+_stalerc=$?
+: > "$GH_LIMIT_TEST_RELEASE"; wait "$_holder" 2>/dev/null
+ck "(f) a cached value served during a refresh reports its AGE on stderr" \
+   "$(grep -qE 'STALE — served a [0-9]+s-old answer' "$TMP/err-stale" && echo 0 || echo 1)"
+ck "(f) … and it is the PREVIOUS answer, not a fresh read, and it says so [rc=$_stalerc]" \
+   "$([ "$_stalerc" -eq 0 ] && [ "$stale_out" = "$(cat "$TMP/g2f-first")" ] && ! has 'fresh' "$stale_out" && echo 0 || echo 1)"
+
+# (6) STALLED-HOLDER SAFETY: a leader that DIED leaves no orphan claim, and the next caller for that
+# request runs and answers instead of waiting out the age bound.
+reset_env g2g
+_key="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m); print(m.flight_key(["api", "repos/o/r/pulls/9426"]))' "$HELPER")"
+mkdir -p "$GH_LIMIT_DIR/flights"
+sleep 0.1 & _deadpid=$!; wait "$_deadpid" 2>/dev/null          # a pid that is DEAD by the time we use it
+printf '{"pid":%s,"started_at":%s,"request":"gh api repos/o/r/pulls/9426"}' \
+  "$_deadpid" "$(( $(date +%s) - 3 ))" > "$GH_LIMIT_DIR/flights/$_key.leader"
+_out="$(GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>/dev/null)"; _rc=$?
+ck "(6) a DEAD leader's key is taken over — the next caller answers (rc=$_rc)" \
+   "$([ "$_rc" -eq 0 ] && [ -n "$_out" ] && echo 0 || echo 1)"
+ck "(6) … no orphan claim survives it" \
+   "$([ ! -e "$GH_LIMIT_DIR/flights/$_key.leader" ] && echo 0 || echo 1)"
+ck "(6) … and the takeover is RECORDED, so a stalled holder is visible to an operator" \
+   "$(has 'taking the key over' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
+
+# A DEGRADED flight dir must not break — or SLOW — a gh call: without this branch every eligible call
+# would wait its whole bound for a leader that can never be created. Two shapes, because they fail in
+# different places: `makedirs` (the path is not a directory) and `open(O_EXCL)` (it is one, unwritable).
+reset_env g2h
+: > "$GH_LIMIT_DIR/flights"                 # a FILE where the directory belongs
+_t0=$(date +%s)
+_nf="$(GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>/dev/null)"; _nrc=$?
+_nel=$(( $(date +%s) - _t0 ))
+ck "(6) an unusable flight dir neither fails nor SLOWS the call (rc=$_nrc in ${_nel}s)" \
+   "$([ "$_nrc" -eq 0 ] && [ -n "$_nf" ] && [ "$_nel" -le 5 ] && echo 0 || echo 1)"
+ck "(6) … and it records that this call ran UNSHARED (never a silent claim of coalescing)" \
+   "$(has 'UNSHARED' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
+
+# ⛔ AN UNREADABLE CLAIM MUST NOT BE IMMORTAL. A leader SIGKILLed between `os.open(O_EXCL)` and its
+# `json.dump` leaves a ZERO-LENGTH claim; if nothing removes it, `flight_claim` answers EEXIST for ever
+# and EVERY caller for that key gets `busy` — the orphan lock file #2243 forbids. Its age is the
+# evidence that the holder is gone (a fresh unreadable claim is a leader about to write).
+reset_env g2j
+_key="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m); print(m.flight_key(["api", "repos/o/r/pulls/9426"]))' "$HELPER")"
+mkdir -p "$GH_LIMIT_DIR/flights"
+: > "$GH_LIMIT_DIR/flights/$_key.leader"
+python3 -c 'import os,sys,time; os.utime(sys.argv[1], (time.time()-30, time.time()-30))' \
+  "$GH_LIMIT_DIR/flights/$_key.leader"
+_orc="$(GH_LIMIT_SCENARIO=etag GH_LIMIT_FLIGHT_LEADER_MAX_AGE=2 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+         -- api repos/o/r/pulls/9426 2>/dev/null)"; _orc_r=$?
+ck "(6) an UNREADABLE orphan claim is reclaimed by its AGE, so a key is never held for ever (rc=$_orc_r)" \
+   "$([ "$_orc_r" -eq 0 ] && [ -n "$_orc" ] && [ ! -e "$GH_LIMIT_DIR/flights/$_key.leader" ] && echo 0 || echo 1)"
+ck "(6) … and the removal is RECORDED, not silent" \
+   "$(has 'UNREADABLE claim' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
+
+# ⛔ NO FLAG VALUE IS EVER PERSISTED. The flight ledger writes a request name to disk (claim, result,
+# events.log); a credential passed IN ARGV (`-H 'Authorization: Bearer …'`, a token in a query) must not
+# reach those files — the key carries a credential DIGEST for exactly this reason, and the label must
+# not undo it. The label stops at the first flag, so this cannot regress by a "first positional" scan.
+reset_env g2k
+GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+  -- api -H 'Authorization: Bearer S3CRET-TOKEN' repos/o/r/pulls/9426 >/dev/null 2>&1
+ck "(6) a credential passed in argv is NOT written into the flight ledger" \
+   "$(grep -rq 'S3CRET-TOKEN' "$GH_LIMIT_DIR" 2>/dev/null && echo 1 || echo 0)"
+reset_env g2l
+GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 >/dev/null 2>&1
+ck "(6) … while a flag-free request IS still named in the ledger (subcommand + endpoint)" \
+   "$(grep -rq 'gh api repos/o/r/pulls/9426' "$GH_LIMIT_DIR/flights" 2>/dev/null && echo 0 || echo 1)"
+if [ "$(id -u)" -eq 0 ]; then
+  printf '  skip (root: an unwritable dir is writable) (6) an unwritable flights dir runs the call unshared\n'
+else
+  reset_env g2i
+  mkdir -p "$GH_LIMIT_DIR/flights"; chmod 500 "$GH_LIMIT_DIR/flights"
+  _t0=$(date +%s)
+  _uf="$(GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>/dev/null)"; _urc=$?
+  _uel=$(( $(date +%s) - _t0 ))
+  chmod 700 "$GH_LIMIT_DIR/flights" 2>/dev/null || true
+  ck "(6) an UNWRITABLE flights dir still answers, unshared, without spending the bound (rc=$_urc in ${_uel}s)" \
+     "$([ "$_urc" -eq 0 ] && [ -n "$_uf" ] && [ "$_uel" -le 5 ] && echo 0 || echo 1)"
+fi
+
+# The KEY is the NORMALISED REQUEST: a decoration that cannot change the answer is not part of it, and
+# one that can most certainly is (a shared entry across those would replay another request's body).
+_keys="$(python3 -c 'import importlib.util, os, sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+k = m.flight_key
+bad = []
+if k(["api", "-X", "GET", "repos/o/r"]) != k(["api", "repos/o/r"]): bad.append("explicit-GET")
+if k(["search", "code", "--", "--owner=x"]) == k(["search", "code", "--owner=x"]): bad.append("dashdash")
+for f in (["--jq", ".state"], ["--paginate"], ["--limit", "5"], ["--json", "state"]):
+    if k(["api", "repos/o/r"] + f) == k(["api", "repos/o/r"]): bad.append("dropped:%s" % f[0])
+for var, vals in (("GH_REPO", ("o/r1", "o/r2")), ("GH_HOST", ("github.com", "ent.example"))):
+    seen = set()
+    for v in vals:
+        os.environ[var] = v; seen.add(k(["pr", "view", "9"]))
+    os.environ.pop(var, None)
+    if len(seen) != 2: bad.append("env-not-in-key:%s" % var)
+print("same" if not bad else "BROKEN %s" % bad)' "$HELPER")"
+ck "key: explicit-GET collapses, -- and GH_REPO/GH_HOST do NOT (no wrong-repo replay) [$_keys]" \
+   "$([ "$_keys" = same ] && echo 0 || echo 1)"
+# ⛔ A MULTI-OPERATION DOCUMENT CAN SELECT A MUTATION BY NAME. `query Foo {…} mutation M {…}` with
+# `-f operationName=M` starts with `query`, so a leading-keyword test called it a read (round 7).
+reset_env g2d11
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api graphql \
+      -f 'query=query Foo { viewer { login } } mutation M { addComment(input:{body:"x"}) { id } }' \
+      -f operationName=M >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) a multi-operation document selecting a MUTATION is not coalesced [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+# ⛔ AND A CLAIM NOBODY CAN READ HAS NO AGE: `now - 0` is the epoch, not a holder age (round 7).
+reset_env g2e2
+_key2="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m); print(m.flight_key(["api", "repos/o/r/pulls/9426"]))' "$HELPER")"
+mkdir -p "$GH_LIMIT_DIR/flights"
+: > "$GH_LIMIT_DIR/flights/$_key2.leader"          # a leader killed between create and write
+_uage="$(GH_LIMIT_FLIGHT_WAIT=0.4 python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>&1 >/dev/null)"
+ck "(e) an UNREADABLE holder yields a real age (the claim MTIME), never the epoch [$(sed -n 's/.*holder, \([^,]*\),.*/\1/p' <<<"$_uage")]" \
+   "$(sed -n 's/.*holder, \([0-9]*\)s in flight.*/\1/p' <<<"$_uage" | grep -qE '^[0-9]+$' && [ "$(sed -n 's/.*holder, \([0-9]*\)s in flight.*/\1/p' <<<"$_uage")" -lt 120 ] && echo 0 || echo 1)"
 
 # ── H. Re-entrancy: a gh child that re-enters must not deadlock on the box lock ────────────────
 reset_env reentrant
@@ -640,6 +1207,15 @@ printf 'at=%s bucket=graphql reset=0 attempts=1 waited=0 status=403\n' "$n" > "$
 tok="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" HOME="$TMP/home" "$(command -v bash)" "$TMP/token.sh")"
 ck "heartbeat: a record with no reset says '?', never a fabricated epoch" \
    "$(has 'reset=?' "$tok" && echo 0 || echo 1)"
+# ⛔ AND IT NAMES THE WINDOW THE LAYER HONOURS (`until=`), BESIDE THE RESET. A secondary/unclassified
+# refusal retries in ~60 s while the bucket reset is ~43 min out; a token carrying only `reset=` told
+# the human reading the cycle line that the box was blocked for 43 minutes. `reset=` is kept — every
+# existing reader of the token still works — but it is no longer the only window on the line.
+printf 'at=%s bucket=graphql reset=%s until=%s attempts=1 waited=0 status=? kind=unclassified\n' \
+   "$n" "$(( n + 2580 ))" "$(( n + 60 ))" > "$GH_LIMIT_DIR/last-limit"
+tok="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" HOME="$TMP/home" "$(command -v bash)" "$TMP/token.sh")"
+ck "heartbeat: the token names the WINDOW it honours (until=), not only the bucket's reset" \
+   "$(has "until=$(( n + 60 ))" "$tok" && has "reset=$(( n + 2580 ))" "$tok" && echo 0 || echo 1)"
 
 # ── K. ROUND-2 REGRESSIONS: identity without the helper, knob coercion, NO_WAIT, recovery ───────
 # ⛔ K1. THE SHIM'S IDENTITY MUST NOT BE ITS HELPER'S PRESENCE. Both seed dirs are the reachable
@@ -1274,15 +1850,330 @@ cp "$HERE/../gh-shim/gh" "$TMP/chain/shims/gh"; chmod +x "$TMP/chain/shims/gh"
 printf '#!/usr/bin/env bash\necho REAL-GH "$@"\n' > "$TMP/chain/real/bin/gh"; chmod +x "$TMP/chain/real/bin/gh"
 # `GH_LIMIT_REAL_GH=`/`AGENT_GH_REAL=`: the suite exports the stub pin globally (line 193), and the
 # whole point here is that NEITHER side may be told the answer — it has to come from the walk.
+# ⛔ AND THE MACHINE-GLOBAL GATE DIR IS ISOLATED. Hop 2 is `scripts/gh-shim/gh`, whose courtesy gate
+# reads `${AGENT_GH_GATE_DIR:-$HOME/.pi/agent/gh-gate}` — state this suite cannot fake (it is neither
+# `GH_LIMIT_DIR` nor `GH_LIMIT_SLEEP_CMD`). Measured: while the box's account was in a live 60-120 s
+# shared window, the shim slept 52 s, `timeout 30` killed the chain, and this assertion failed as if
+# the delegation had broken (rc 124, empty output) — a host reading, not a code change. A fresh dir
+# makes the assertion measure the CHAIN and not the host's quota.
+CHAIN_GATE="$TMP/chain-gate"; mkdir -p "$CHAIN_GATE"
 _chain="$(PATH="$TMP/chain/wrap:$TMP/chain/shims:$TMP/chain/real/bin:/usr/bin:/bin" \
-          GH_LIMIT_REAL_GH= AGENT_GH_REAL= GH_LIMIT_DIR="$GH_LIMIT_DIR" \
+          GH_LIMIT_REAL_GH= AGENT_GH_REAL= AGENT_GH_GATE_DIR="$CHAIN_GATE" GH_LIMIT_DIR="$GH_LIMIT_DIR" \
           timeout 30 gh pr view 9 --repo o/r 2>&1)"; _chainrc=$?
 ck "a three-shim chain (layer -> gh-shim -> real) reaches the REAL gh (rc=0, not 127)" \
    "$([ "$_chainrc" -eq 0 ] && has 'REAL-GH' "$_chain" && ! has '127' "$_chain" && echo 0 || echo 1)"
 ck "and #984's guard still runs for the commands it guards (gh-shim is not skipped by the layer)" \
    "$(has 'gh-shim' "$(PATH="$TMP/chain/wrap:$TMP/chain/shims:$TMP/chain/real/bin:/usr/bin:/bin" \
-        GH_LIMIT_REAL_GH= AGENT_GH_REAL= GH_LIMIT_DIR="$GH_LIMIT_DIR" \
+        GH_LIMIT_REAL_GH= AGENT_GH_REAL= AGENT_GH_GATE_DIR="$CHAIN_GATE" GH_LIMIT_DIR="$GH_LIMIT_DIR" \
         timeout 30 gh pr merge 9 --repo o/r --admin --squash 2>&1 | tr '\n' ' ')" && echo 0 || echo 1)"
+
+# ── M. ACCOUNT SCOPE (agent-infra#2137): the budget and the block window belong to the ACCOUNT ──
+# ⛔ WHY A WHOLE SECTION. Everything above bounds what THIS BOX sends. Four boxes act as ONE GitHub
+# account, so the account's burst is ~4x a per-box budget and GitHub enforces its SECONDARY limit on
+# the ACCOUNT. Measured 2026-10-20: `gh api rate_limit` reported graphql ~4573/5000 while every call
+# was refused, and a `status=?` marker carrying a reset ~43 min ahead blocked every client on the box
+# for the full window although the layer's own wait had never run. These assertions pin the three
+# properties that fix it: a PARTITION derived from a declared fleet size, an UNCLASSIFIED refusal that
+# can never claim a bucket reset as its window, and a marker that is revalidated and aged before it
+# is allowed to block anything.
+
+# ⛔ M1. THE SHARE IS THE ACCOUNT'S BUDGET DIVIDED BY THE DECLARED FLEET — not by the box's own
+# measured rate, because a box cannot measure a peer it cannot reach. 5000/hr x 0.8 safety = 4000/hr
+# for the fleet: 66/min for 1 box, 33 for 2, 16 for 4. A share that rounds to 0 would brick the box,
+# so the floor is 1.
+_share() {  # <ENV assignment>… -> "<per_window> <per_min as int>"
+  env "$@" python3 -c 'import importlib.util,sys
+spec=importlib.util.spec_from_file_location("gl", sys.argv[1])
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+s=m.account_share(); print(s["per_window"], int(s["per_min"]))' "$HELPER"
+}
+ck "account: N=1 gets 66/min of the account's 5000/hr (x0.8 safety), N=2 gets 33" \
+   "$([ "$(_share GH_LIMIT_ACCOUNT_FLEET_SIZE=1)" = "66 66" ] && [ "$(_share GH_LIMIT_ACCOUNT_FLEET_SIZE=2)" = "33 33" ] && echo 0 || echo 1)"
+ck "account: N=4 (the default) gets 16/min — the account's budget split four ways" \
+   "$([ "$(_share GH_LIMIT_ACCOUNT_FLEET_SIZE=4)" = "16 16" ] && echo 0 || echo 1)"
+ck "account: a share that would round to ZERO is floored at 1 call/window, never a dead box" \
+   "$([ "$(_share GH_LIMIT_ACCOUNT_FLEET_SIZE=64 GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR=60)" = "1 0" ] && echo 0 || echo 1)"
+ck "account: the safety fraction and the budget are separate knobs (5000 x 1.0 / 4 = 20/min)" \
+   "$([ "$(_share GH_LIMIT_ACCOUNT_FLEET_SIZE=4 GH_LIMIT_ACCOUNT_SAFETY=1.0)" = "20 20" ] && echo 0 || echo 1)"
+# ⛔ A SPELLING MUST NOT SILENCE THE PARTITION. `bucket_for` returns lowercase literals, so an
+# operator writing `GraphQL` in the bucket list made every call miss the partition — inert, silent.
+_part="$(env GH_LIMIT_ACCOUNT_PARTITION_BUCKETS='GraphQL, CORE' python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1])
+m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(",".join(m.ACCOUNT_PARTITION_BUCKETS))' "$HELPER")"
+ck "account: the partition bucket list is CASE-FOLDED (a spelling cannot silence the partition) [$_part]" \
+   "$([ "$_part" = "graphql,core" ] && echo 0 || echo 1)"
+
+# ⛔ M2. AND IT IS HONOURED ON THE WIRE, with the cap derived from the DECLARED FLEET SIZE. A budget of
+# 120/hr at safety 1.0 is 2 calls/min for ONE declared box and 1/min for TWO, so the same second call
+# is free under one declaration and paced under the other. That difference IS the partition, and it is
+# the reason a box must declare its peers rather than measure them.
+reset_env share1
+_share_env="GH_LIMIT_ACCOUNT_FLEET_SIZE=1 GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR=120 GH_LIMIT_ACCOUNT_SAFETY=1.0"
+env $_share_env python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+env $_share_env python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+_first_two="$(sleeps)"
+env $_share_env python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "account: N=1 — two graphql calls fit its share, and neither waits" "$([ -z "$_first_two" ] && echo 0 || echo 1)"
+ck "account: … and the THIRD waits out the window (it does not burst past the partition)" \
+   "$(sleep_at_least 0 55 && sleep_below 0 90 && echo 0 || echo 1)"
+ck "account: the wait is RECORDED with the share it enforced (an operator can see the partition)" \
+   "$(has 'at this box' "$(cat "$GH_LIMIT_DIR/events.log")" && echo 0 || echo 1)"
+reset_env share2
+_share_env2="GH_LIMIT_ACCOUNT_FLEET_SIZE=2 GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR=120 GH_LIMIT_ACCOUNT_SAFETY=1.0"
+env $_share_env2 python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+_one_call="$(sleeps)"
+env $_share_env2 python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "account: the SAME budget declared as a 2-box fleet paces the SECOND call (the share is N-derived)" \
+   "$([ -z "$_one_call" ] && sleep_at_least 0 55 && echo 0 || echo 1)"
+# A caller with its own subprocess bound cannot be paced without outliving it; it proceeds and the
+# OVERDRAW is recorded rather than the box going blind (the #2137/NO_WAIT contract).
+reset_env share3
+for _i in 1 2 3; do
+  GH_LIMIT_NO_WAIT=1 env $_share_env2 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+    -- api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+done
+ck "account: a NO_WAIT caller is never parked by the partition — it proceeds and says it overdrew" \
+   "$([ -z "$(sleeps)" ] && has 'OVER the box' "$(cat "$GH_LIMIT_DIR/events.log")" && echo 0 || echo 1)"
+# ⛔ AND THE OVERDRAW LINE CANNOT EAT THE RECORD. A ~500-call NO_WAIT refresh against a 16-call share
+# would emit ~500 overdraw lines; past `EVENTS_MAX_BYTES` every one of them rewrites the log to its
+# last 500 lines, so refusals, probes and marker decisions would be evicted by this feature's own
+# noise — turning a limited box into a box that looks merely slow. One line per window per bucket.
+for _i in $(seq 1 20); do
+  GH_LIMIT_NO_WAIT=1 env $_share_env2 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+    -- api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+done
+ck "account: 20 over-share calls record the overdraw ONCE, not 20 times (the log stays evidence)" \
+   "$([ "$(grep -c 'OVER the box' "$GH_LIMIT_DIR/events.log")" -eq 1 ] && echo 0 || echo 1)"
+
+# ⛔ M3. AN UNCLASSIFIED REFUSAL (`status=?`) IS ITS OWN CLASS: >=1 min with jitter, doubling — and it
+# must NOT adopt the bucket reset. The stub probes `remaining=4999, reset=+3600`, so a run that waited
+# the reset would sleep ~3600s; the assertion is that every wait stays inside the documented curve.
+reset_env unclassified
+GH_LIMIT_SCENARIO=unclassified run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>"$TMP/err-M3" || true
+_rec="$(limit_record)"
+ck "unclassified: classified and RECORDED as kind=unclassified (the classification is evidence)" \
+   "$(has 'kind=unclassified' "$_rec" && echo 0 || echo 1)"
+ck "unclassified: waits >=60s then >=120s then >=240s — the documented curve, not the reset" \
+   "$(sleep_at_least 0 60 && sleep_at_least 1 120 && sleep_at_least 2 240 && echo 0 || echo 1)"
+ck "unclassified: NO wait is anywhere near the bucket reset (nothing >= 600s) [$(sleeps)]" \
+   "$(python3 -c 'import sys
+v=[float(x) for x in sys.argv[1].split()]
+sys.exit(0 if v and max(v) < 600 else 1)' "$(sleeps)" && echo 0 || echo 1)"
+_until="$(python3 -c 'import sys
+d=dict(kv.split("=",1) for kv in open(sys.argv[1]).read().split() if "=" in kv)
+print(d.get("until",""))' "$GH_LIMIT_DIR/last-limit" 2>/dev/null)"
+_at="$(python3 -c 'import sys
+d=dict(kv.split("=",1) for kv in open(sys.argv[1]).read().split() if "=" in kv)
+print(d.get("at",""))' "$GH_LIMIT_DIR/last-limit" 2>/dev/null)"
+ck "unclassified: the recorded BLOCK WINDOW is at most the one-minute floor past the record [at=$_at until=$_until]" \
+   "$([ -n "$_until" ] && [ -n "$_at" ] && [ "$(( _until - _at ))" -gt 0 ] && [ "$(( _until - _at ))" -le 80 ] && echo 0 || echo 1)"
+ck "unclassified: the refusal line names kind, the marker's AGE, the remaining count and the attempt" \
+   "$(grep -qE 'kind=unclassified.*FAILED after 4 attempt.*remaining=[0-9?].*marker_age=[0-9]+s' "$TMP/err-M3" && echo 0 || echo 1)"
+
+# ⛔ M4. THE MEASURED STALE MARKER, AS IT WAS FOUND ON DISK: `status=? attempts=1 waited=0` with a reset
+# ~43 min in the future and NO kind/until (written before this change). The gate must bound it to the
+# unclassified window (~60s) and never to that reset — and it must say what it is waiting on.
+reset_env legacy-marker
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=?\n' > "$GH_LIMIT_DIR/last-limit"
+GH_LIMIT_SCENARIO=probeempty run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "marker: a legacy status=? marker waits ~60s (its classification's window), NOT the 43-min reset" \
+   "$(sleep_at_least 0 55 && sleep_below 0 90 && echo 0 || echo 1)"
+ck "marker: … and the call still ran afterwards (a window is a wait, not a refusal)" \
+   "$(has 'api graphql' "$(cat "$STUB_LOG")" && echo 0 || echo 1)"
+ck "marker: the backoff line states its own evidence — kind, AGE, remaining, attempt" \
+   "$(grep -qE 'kind=unclassified marker_age=[0-9]+s remaining=0 attempt=preflight' "$GH_LIMIT_DIR/events.log" && echo 0 || echo 1)"
+
+# ⛔ M4b. THE REFUSAL LINE'S "waited" MUST INCLUDE THE GATE'S PAUSE. `waited` is the number the final
+# line reports as the time this call spent; a 60-300 s gate window that the layer honoured but did not
+# count made that evidence wrong by exactly the wait it claims to have observed (measured: 499 s of
+# sleeps reported as "439s waited"). ⛔ THE GATE MUST ACTUALLY PAUSE HERE: with the default 30 s
+# revalidate threshold the probe answers 4999 and CLEARS the marker, so the asserted wait came entirely
+# from the backoff curve and the assertion passed with the `waited +=` deleted (found in review).
+# Raising the threshold makes the 60 s window payable, so `waited` is ~60 s larger than the backoff
+# alone.
+reset_env gate-waited
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=?\n' > "$GH_LIMIT_DIR/last-limit"
+GH_LIMIT_GATE_REVALIDATE_S=600 GH_LIMIT_SCENARIO=unclassified \
+  run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>"$TMP/err-M4b" || true
+_sum="$(python3 -c 'import sys
+print(int(sum(float(x) for x in sys.argv[1].split())))' "$(sleeps)")"
+_w="$(grep -oE '[0-9]+s waited' "$TMP/err-M4b" | grep -oE '[0-9]+')"
+_gate="$(python3 -c 'import sys
+v=[float(x) for x in sys.argv[1].split()]
+print(v[0] if v else 0)' "$(sleeps)")"
+ck "marker: the gate pause is PAID here, so the 'waited' assertion is not vacuous [gate=${_gate}s]" \
+   "$(python3 -c 'import sys
+sys.exit(0 if float(sys.argv[1]) >= 55 else 1)' "$_gate" && echo 0 || echo 1)"
+ck "marker: the refusal's 'waited' counts the gate pause too (reported ${_w}s of ${_sum}s slept)" \
+   "$([ -n "$_w" ] && [ "$_sum" -gt 400 ] && [ "$_w" -ge "$(( _sum - 8 ))" ] && echo 0 || echo 1)"
+
+# ⛔ M5. REQUIREMENT 3: REVALIDATE BEFORE A LONG WAIT. One REST `rate_limit` read is unmetered, so a
+# marker claiming a 43-minute window is checked against the bucket before it is paid. The bucket has
+# 4573 left => the marker is STALE => it is annotated (age kept, because the age is the evidence) and
+# the call proceeds with NO wait.
+reset_env stale-marker
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=403 kind=primary until=1700002580 remaining=0\n' > "$GH_LIMIT_DIR/last-limit"
+out="$(GH_LIMIT_SCENARIO=probehead run_helper api graphql -f query='{viewer{login}}' 2>&1)"; _rc=$?
+ck "revalidate: a marker contradicted by the live bucket does NOT block (zero waits)" \
+   "$([ "$_rc" -eq 0 ] && [ -z "$(sleeps)" ] && echo 0 || echo 1)"
+ck "revalidate: … and the bucket was actually READ (one exempt /rate_limit request)" \
+   "$(has 'api rate_limit' "$(cat "$STUB_LOG")" && echo 0 || echo 1)"
+ck "revalidate: the decision is RECORDED, with the remaining count that decided it" \
+   "$(grep -qE 'STALE graphql marker.*remaining=4573' "$GH_LIMIT_DIR/events.log" && echo 0 || echo 1)"
+ck "revalidate: the record keeps its AGE and gains stale= + reval_remaining= (annotated, not deleted)" \
+   "$(has 'at=1700000000' "$(limit_record)" && has 'stale=' "$(limit_record)" && has 'reval_remaining=4573' "$(limit_record)" && echo 0 || echo 1)"
+# ⛔ AND THE ANNOTATION ITSELF MUST NOT CLAIM `recovered=`. The cycle token prints
+# `gh=recovered(…)` for that field, and the ONLY honest source of it is a real request that succeeded
+# (`record_recovery`). The exempt `/rate_limit` read is measured to say 4999/5000 while every GraphQL
+# call is refused, so deriving it from that probe would make a box that is still being refused report
+# itself recovered. Driven at the FUNCTION level, because in a full run the call that follows a cleared
+# marker legitimately succeeds and would write the field for the right reason.
+reset_env stale-annotation
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=403 kind=primary until=1700002580 remaining=0\n' > "$GH_LIMIT_DIR/last-limit"
+GH_LIMIT_DIR="$GH_LIMIT_DIR" GH_LIMIT_NOW_CMD="cat $CLOCK" python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1])
+m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+m.mark_marker_stale(4573, "remaining-gt-0")' "$HELPER"
+_ann="$(limit_record)"
+ck "revalidate: the annotation records stale= + reval_remaining= and does NOT claim recovered=" \
+   "$(has 'stale=' "$_ann" && has 'reval_remaining=4573' "$_ann" && ! has 'recovered=' "$_ann" && has 'at=1700000000' "$_ann" && echo 0 || echo 1)"
+# ⛔ AND IT MUST NOT ANNOTATE A RECORD IT DID NOT READ. `record_limit` writes `last-limit` outside the
+# box lock, so a concurrent client can replace the file between this gate's read and its write; a
+# blind `stale=` would then clear a FRESH genuine refusal's window (the gate suppresses on `stale=`
+# for good) — a silent, permanent fail-open. Stale writes require matching identity (at+bucket+kind).
+reset_env stale-identity
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=403 kind=primary until=1700002580 remaining=0\n' > "$GH_LIMIT_DIR/last-limit"
+_marker_json="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" GH_LIMIT_NOW_CMD="cat $CLOCK" python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1])
+m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+# a DIFFERENT observation than the one on disk (another attempt), then the real one
+print(m.mark_marker_stale(4573, "remaining-gt-0", expect={"at": "1699999000", "bucket": "graphql", "kind": "primary"}))' "$HELPER")"
+ck "revalidate: a REPLACED record is not annotated stale= (fail-open closed) — the write was refused" \
+   "$([ "$_marker_json" = "False" ] && ! has 'stale=' "$(limit_record)" && echo 0 || echo 1)"
+GH_LIMIT_DIR="$GH_LIMIT_DIR" GH_LIMIT_NOW_CMD="cat $CLOCK" python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1])
+m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(m.mark_marker_stale(4573, "remaining-gt-0", expect={"at": "1700000000", "bucket": "graphql", "kind": "primary"}))' "$HELPER" >/dev/null
+ck "revalidate: … while the SAME record (same at+bucket+kind) is annotated as before" \
+   "$(has 'stale=' "$(limit_record)" && echo 0 || echo 1)"
+# ⛔ AND THE STALE ANNOTATION MUST ACTUALLY STOP THE GATE. `read_marker` returns a DICT, so a
+# membership test spelled `"stale=" in marker` checks KEYS and is always false — the suppressor was
+# inert and an annotated marker still blocked (and re-probed). ⛔ THE MARKER IS WRITTEN BY HAND here,
+# WITHOUT `recovered=`: after a real run the record carries BOTH, and the `recovered` check would
+# short-circuit first, so the assertion would pin the other spelling and pass with the `stale` check
+# deleted (found in review).
+reset_env stale-suppressor
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=403 kind=primary until=1700002580 remaining=0 stale=1700000001 reval_remaining=4573 why=remaining-gt-0\n' > "$GH_LIMIT_DIR/last-limit"
+run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "revalidate: a marker already annotated stale= does not block and spends NO probe" \
+   "$([ -z "$(sleeps)" ] && ! has 'api rate_limit' "$(cat "$STUB_LOG")" && echo 0 || echo 1)"
+# ⛔ BUT A `retry-after` WINDOW IS NEVER CLEARED BY HEADROOM. That wait is the SERVER'S instruction,
+# and the primary counter does not contradict it (secondary limits strike while it looks healthy —
+# the reason `plan_wait` honours the header verbatim). Clearing it put every later client back inside
+# a cool-down the layer was still obeying.
+reset_env retryafter-marker
+printf 'at=1700000000 bucket=graphql reset=1700003600 attempts=1 waited=0 status=403 kind=retry-after until=1700000200 remaining=45\n' > "$GH_LIMIT_DIR/last-limit"
+GH_LIMIT_SCENARIO=probehead run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "revalidate: primary headroom does NOT clear a retry-after window — the server's delay stands" \
+   "$(sleep_at_least 0 195 && sleep_below 0 210 && ! has 'stale=' "$(limit_record)" && echo 0 || echo 1)"
+# ⛔ AND A RECORD REPLACED MID-GATE IS NOT ANNOTATED *AND* IS NOT CLAIMED AS CLEARED. `record_limit`
+# writes `last-limit` outside the box lock, so the stub replaces it during the probe — the case the
+# identity guard exists for. Logging "cleared it" over a refused write put two contradictory
+# decisions in `events.log` and named a record that was still in force.
+reset_env replaced-under-gate
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=403 kind=primary until=1700002580 remaining=0\n' > "$GH_LIMIT_DIR/last-limit"
+GH_LIMIT_SCENARIO=probereplace run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "revalidate: a record REPLACED under the gate is left alone AND the log says so (no false 'cleared')" \
+   "$(grep -q 'NOT annotated' "$GH_LIMIT_DIR/events.log" && ! grep -q 'cleared it and proceeding' "$GH_LIMIT_DIR/events.log" && ! has 'stale=' "$(limit_record)" && echo 0 || echo 1)"
+
+# ⛔ M6. REQUIREMENT 5: NEVER BLOCK ON A MARKER OLDER THAN THE WINDOW IT RECORDED. A record written 10
+# minutes ago whose own 60s window has long expired is a fact about the past, not a state — and no
+# request may be spent revalidating it.
+reset_env old-window
+printf 'at=1699999600 bucket=graphql reset=1700002580 attempts=1 waited=0 status=?\n' > "$GH_LIMIT_DIR/last-limit"
+run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "stale-age: a marker whose recorded window ENDED blocks nothing and spends no probe" \
+   "$([ -z "$(sleeps)" ] && ! has 'api rate_limit' "$(cat "$STUB_LOG")" && echo 0 || echo 1)"
+ck "stale-age: … and events.log says the window had ended (the reading is explainable)" \
+   "$(has 'window ended' "$(cat "$GH_LIMIT_DIR/events.log")" && echo 0 || echo 1)"
+# …and the absolute age bound, for a marker whose window was recorded absurdly far ahead.
+reset_env old-age
+printf 'at=1699999000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=403 kind=primary until=1700002580 remaining=0\n' > "$GH_LIMIT_DIR/last-limit"
+run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "stale-age: a marker older than MARKER_MAX_AGE is ignored even with a future window (>900s)" \
+   "$([ -z "$(sleeps)" ] && has 'IGNORED a graphql marker aged' "$(cat "$GH_LIMIT_DIR/events.log")" && echo 0 || echo 1)"
+
+# ⛔ M7. THE OLD BEHAVIOUR STILL HOLDS. A GENUINELY exhausted bucket (remaining 0, reset inside the
+# in-call bound) is still waited out exactly as GitHub documents, and the classification says primary.
+reset_env nearreset
+out="$(GH_LIMIT_SCENARIO=nearreset run_helper api repos/o/r 2>"$TMP/err-M7")"; _rc=$?
+ck "primary: an exhausted bucket still waits for its reset (121s) and then SUCCEEDS" \
+   "$([ "$_rc" -eq 0 ] && sleep_at_least 0 120 && sleep_below 0 130 && echo 0 || echo 1)"
+ck "primary: … and the record classifies it as primary with the remaining it read" \
+   "$(has 'kind=primary' "$(limit_record)" && echo 0 || echo 1)"
+
+# ⛔ M8. NO_WAIT IS NEVER PARKED BY THE MARKER GATE. The bounded callers are the ones whose blindness
+# produced the measured `queue_read=BLIND` line; parking them behind a marker would turn a rate-limit
+# verdict into a timeout, which is the failure #2137's NO_WAIT half exists to prevent.
+reset_env gate-nowait
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=?\n' > "$GH_LIMIT_DIR/last-limit"
+GH_LIMIT_NO_WAIT=1 run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "marker: a NO_WAIT caller is not parked by a fresh marker (it keeps its own bound)" \
+   "$([ -z "$(sleeps)" ] && echo 0 || echo 1)"
+
+# ⛔ M8b. A MARKER WHOSE WINDOW IS BEYOND THE IN-CALL BOUND MUST NOT BE SLEPT AND THEN IGNORED. Sleeping
+# MAX_WAIT and sending anyway pays the caller's whole bound for a request the marker says is doomed;
+# the gate declines instead, so the refusal itself (which fails fast in the normal path) is the
+# cheaper evidence. Pre-fix this slept 300s.
+reset_env gate-farwindow
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=403 kind=primary until=1700002580 remaining=0\n' > "$GH_LIMIT_DIR/last-limit"
+GH_LIMIT_SCENARIO=probeempty run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1
+ck "marker: a marker 2580s away does not park the caller for MAX_WAIT and then send anyway" \
+   "$([ -z "$(sleeps)" ] && has 'beyond the 300s in-call bound' "$(cat "$GH_LIMIT_DIR/events.log")" && echo 0 || echo 1)"
+
+# ⛔ M9. THE GATE IS BUCKET-SCOPED. A graphql marker must not park a REST read: the two pools are
+# separate, and the REST path is what keeps dispatch alive while GraphQL is refused (#1962/#1939).
+reset_env gate-bucket
+printf 'at=1700000000 bucket=graphql reset=1700002580 attempts=1 waited=0 status=?\n' > "$GH_LIMIT_DIR/last-limit"
+run_helper api repos/o/r/pulls/1 >/dev/null 2>&1
+# ⛔ AND IT SPENDS NO PROBE. Without this half the assertion was vacuous: a foreign marker that was
+# read would be REVALIDATED (the stub answers 4999) and cleared, so "no sleep" passed even with the
+# bucket scoping deleted (found in review).
+ck "marker: a GRAPHQL marker does not block a CORE call (the pools are separate, no probe spent)" \
+   "$([ -z "$(sleeps)" ] && ! has 'api rate_limit' "$(cat "$STUB_LOG")" && echo 0 || echo 1)"
+
+# ⛔ M10. A STAMP FROM THE FUTURE IS NOT PERMISSION TO REFUSE EVERY CALL. A clock that stepped back
+# leaves `budget-<bucket>` entries ahead of `now`; honouring them made `next slot` hours away and
+# refused EVERY graphql call with rc 75 until wall-clock caught up — the `last-mutation` future-stamp
+# class, in the new file. Future stamps are DROPPED.
+reset_env future-budget
+mkdir -p "$GH_LIMIT_DIR"
+for _i in $(seq 1 20); do printf '%s\n' "$(( 1700000000 + 3600 ))"; done > "$GH_LIMIT_DIR/budget-graphql"
+out="$(run_helper api graphql -f query='{viewer{login}}' 2>"$TMP/err-M10")"; _rc=$?
+ck "account: a budget file stamped in the FUTURE does not refuse every call (rc=0, no wait)" \
+   "$([ "$_rc" -eq 0 ] && [ -z "$(sleeps)" ] && echo 0 || echo 1)"
+
+# ⛔ M11. A BUDGET REFUSAL IS RECORDED WHERE IT CAN BE SEEN, BUT NOT AS GITHUB'S. `last-limit` is what
+# the heartbeat prints as `gh=rate_limited(...)`, so a LOCAL partition refusal written there would be
+# a false attribution; it gets its own file, and its text avoids the phrase objective.py maps to
+# GH-RATE-LIMITED.
+reset_env budget-record
+# A 600 s window with a 1-call/min share (120/hr across a 2-box fleet) caps at 10 slots; filling it
+# puts the next slot 600 s away, past the 300 s in-call bound => the fail-fast branch.
+for _i in $(seq 1 10); do printf '%s\n' 1700000000; done > "$GH_LIMIT_DIR/budget-graphql"
+GH_LIMIT_ACCOUNT_WINDOW_S=600 GH_LIMIT_ACCOUNT_FLEET_SIZE=2 GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR=120 \
+  GH_LIMIT_ACCOUNT_SAFETY=1.0 run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>"$TMP/err-M11"; _rc=$?
+ck "account: a budget refusal RECORDS itself (next slot + the share it enforced) in last-budget" \
+   "$(has 'next_slot=' "$(cat "$GH_LIMIT_DIR/last-budget" 2>/dev/null)" && has 'fleet=' "$(cat "$GH_LIMIT_DIR/last-budget" 2>/dev/null)" && echo 0 || echo 1)"
+ck "account: … and it is NOT written to last-limit (a local refusal is not GitHub's rate limit)" \
+   "$(! has 'bucket=graphql' "$(limit_record)" && ! has 'rate limit' "$(cat "$TMP/err-M11")" && echo 0 || echo 1)"
+# ⛔ AND IT ACTUALLY REFUSES. The record alone is not the decision: with the `return 75` removed (or
+# turned into 0) a locally-refused call was still SENT — the refusal's own record and the caller's
+# SUCCESS agreed with each other while the partition was defeated (found in review; both assertions
+# above stayed green). The exit code is the contract the caller reads, and no request may leave.
+ck "account: the budget fail-fast exits 75 and sends NOTHING (the refusal is real, not just recorded)" \
+   "$([ "$_rc" -eq 75 ] && ! has 'api graphql' "$(cat "$STUB_LOG")" && echo 0 || echo 1)"
 
 echo
 printf 'gh-limit: %d passed, %d failed\n' "$pass" "$fail"

@@ -126,15 +126,21 @@ row names its verdict, its reason, its evidence and its size, and the footer rep
 
 ## Byte accounting — two numbers, because only one pair is honest
 
-* `du` per venv: the blocks the tree occupies. It **over-reports** what removal frees,
-  because a venv hardlinks into the `uv` cache and the same cache blocks are counted
-  again for every venv that shares them.
+* `du` per venv: the blocks the tree occupies. Whether it **over-reports** what removal
+  frees is **PER MACHINE, not universal**. ⛔ The old universal claim ("a venv hardlinks
+  into the `uv` cache, so the same cache blocks are counted again for every venv that
+  shares them" ⇒ `du` always over-states) was FALSIFIED 2026-10-16 (#1851). Measured
+  regimes: APFS **clonefile** (`du` 22.0 MB vs `df` used +0.6 MB, `nlink=1`), a
+  **hardlink** into the cache (`du` 5,704 MB vs 186 MB released, `nlink>1`), and
+  **neither**, where `du` is accurate (5,647 MiB vs 5.90 GB, ratio 1.004). Measure the
+  box in front of you with `scripts/worktree-disk-probe.sh`; never infer it.
 * `df` delta across the pass: what the filesystem actually got back.
 
 MEASURED on cell-2 (2026-10-17, `/tmp/cell-t`, 23 lane venvs): `du` said
 **77,438 MB** reclaimable; the filesystem returned **1,330 MB**. Both are printed and
-the `du` figure is labelled an over-count. Do not quote a `du` total as reclaimed
-space.
+the `du` figure is labelled an over-count. That is cell-2's regime, not a law: on a box
+in the "neither" regime the same `du` figure IS the real one (ratio 1.004, above). Do
+not quote a `du` total as reclaimed space on either kind of box.
 
 ## Capacity — N measured, a stated floor, both printed
 
@@ -181,9 +187,10 @@ retired drop-the-5 claim without re-measuring it.
 
 ## ⛔ The `uv` download cache is never touched
 
-A venv hardlinks into the cache: removing the cache does not free the space it
-appears to (the links keep the blocks alive) and it forces every later `uv sync` to
-write a full copy. That is the measured regression this issue started from: 6.1 GB
+Where a venv shares blocks with the cache — a hardlink, or an APFS clonefile; per
+machine, see "Byte accounting" above, #1851 — removing the cache does not free the
+space it appears to (the shared blocks stay alive) and it forces every later `uv sync`
+to write a full copy. That is the measured regression this issue started from: 6.1 GB
 "freed" by deleting the cache, then re-spent as duplicated venvs. Bounding the cache
 is `uv cache prune` (which preserves live links) — a different tool, deliberately not
 this one. The reaper references no cache path and performs exactly one `rm -rf`, on

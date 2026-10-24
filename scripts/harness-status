@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# harness-status — ONE line per harness component (pid + age) and ONE verdict.
+#
+# A thin name over `scripts/harness-up status`, on purpose: there is exactly ONE implementation of the
+# component table and the verdict, so a status verb and a start verb cannot disagree about what
+# "healthy" means (#1745's `check` green / `start` dead class). Same for `harness-down`.
+#
+#   ./scripts/harness-status [--plain] [--no-fetch] [-o <state-dir>] [--harness <dir>]
+#
+# Exit: 0 HEALTHY · 1 DEGRADED · 2 BROKEN (cannot-verify is never a pass).
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -x "$HERE/harness-up" ] || { printf 'harness-status: no executable harness-up beside %s\n' "$0" >&2; exit 2; }
+HARNESS_UP_FORCED_VERB=status; export HARNESS_UP_FORCED_VERB
+exec "$HERE/harness-up" status "$@"

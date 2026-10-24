@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# harness-down — stop the harness, through the platform authority that owns the stop.
+#
+# A thin name over `scripts/harness-up down`, on purpose (see harness-status): one implementation, so
+# the start and stop verbs cannot drift apart. Nothing is killed here that a sanctioned verb does not
+# own — `orchestrator-bringup.sh stop` (and, on a cell, `cloud-cell-supervisor.sh stop`) hold the
+# ownership rules, the duplicate handling and the "never kill a process the registry cannot prove".
+#
+#   ./scripts/harness-down [-o <state-dir>] [--harness <dir>]
+#
+# Exit: 0 ok · non-zero the stop reported a problem (read its output).
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -x "$HERE/harness-up" ] || { printf 'harness-down: no executable harness-up beside %s\n' "$0" >&2; exit 2; }
+HARNESS_UP_FORCED_VERB=down; export HARNESS_UP_FORCED_VERB
+exec "$HERE/harness-up" down "$@"

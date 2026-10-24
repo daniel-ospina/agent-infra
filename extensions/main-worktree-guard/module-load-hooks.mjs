@@ -16,9 +16,18 @@
  *   1. `.ts` files are loaded as ESM with types stripped
  *      (`module.stripTypeScriptTypes`, Node >= 22.13). pi's jiti does the
  *      equivalent transform, including the `.js` → `.ts` mapping below.
- *   2. `@earendil-works/pi-coding-agent` is aliased to a minimal stub exporting
- *      the runtime value index.ts actually imports (`isToolCallEventType`);
- *      `ExtensionAPI` is a type-only import and is erased by the strip.
+ *   2. `@earendil-works/pi-coding-agent` is aliased to a minimal stub that
+ *      RE-EXPORTS the repo's one shared predicate copy
+ *      (`../shared/tool-call-event.ts`); `ExtensionAPI` is a type-only import
+ *      and is erased by the strip.
+ *
+ * #1330 — the stub used to carry its OWN copy of the predicate body, which made
+ * this file a second un-pinned copy of an SDK function: a pi upgrade could change
+ * the real predicate while this stub kept the old shape and every test here
+ * stayed green over it. It now re-exports `shared/tool-call-event.ts`, so the
+ * single shared copy is the one the SDK-bearing parity pin
+ * (`extensions/verification-gate/tool-call-event-parity.test.ts`) asserts
+ * against the real export.
  *
  * The transform is deliberately the REAL module source — not a copy — so a
  * scope/level error in the shipped file is caught here.
@@ -40,11 +49,12 @@ const PI_PACKAGE_SPECIFIERS = new Set([
   "@mariozechner/pi-coding-agent",
 ]);
 
+/** The repo's ONE predicate copy — the same module production imports (#1330). */
+const SHARED_PREDICATE_URL = new URL("../shared/tool-call-event.ts", import.meta.url).href;
+
 /** The runtime value surface index.ts imports from the pi package. */
 const PI_STUB_SOURCE = `
-export function isToolCallEventType(toolName, event) {
-  return event.toolName === toolName;
-}
+export { isToolCallEventType } from ${JSON.stringify(SHARED_PREDICATE_URL)};
 export default {};
 `;
 

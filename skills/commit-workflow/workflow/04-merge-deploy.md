@@ -12,11 +12,12 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    (skills/extensions/.mcp.json/ontology) → Skill Infrastructure / Ontology & Templates /
    Extension Safety; UX → ux-verification; config/research/docs → proportional review.
    Dispatch per `code-review` Step 0.8 (infra detection) + Step 3.6 (surface-first dispatch; ratings scale depth)
-   and `test-routing` (domain-aware verification). P2s are BLOCKERS — every finding with
-   confidence ≥ 50 (any severity) must be resolved before merge (aligns with the code-review
-   fixer loop exit: zero issues with confidence ≥ 50). Low-confidence items (< 50, scored false
-   positives) do not block. (Confidence scores are produced by code-review Step 5 — isolated
-   sub-agent scoring on a 0-100 scale; < 50 = false positives, filtered at Step 6.)
+   and `test-routing` (domain-aware verification). **What blocks is the CONSEQUENCE, not the letter** —
+   the rule is owned by `code-review` §"Finding disposition — what BLOCKS, what is a FOLLOW-UP"
+   (#1537); this file does not restate it. Every follow-up must name an issue number. Low-confidence
+   items (< 50, scored false positives) do not block either. (Confidence scores are produced by
+   code-review Step 5 — isolated sub-agent scoring on a 0-100 scale; < 50 = false positives,
+   filtered at Step 6.)
 2. **Pre-flight passed** — tests/typecheck per the risk tier in `01-preflight.md`; for PRs
    touching runtime code, the affected test suites are green (regression check — no regressions).
 3. **Verification gate passed** — the [VGATE] sub-agent verified all staged files (matching hashes).
@@ -58,7 +59,24 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    tier and the #485 ≥1-dispatch floor are enforced by their own gates. Where
    the linked ref's complexity label cannot be read (label-fetch failure,
    absent label, no closing ref, or only cross-repo refs) record-review.sh
-   WARNS and proceeds — tier attestation UNVERIFIED at mint. **Content-only
+   WARNS and proceeds — tier attestation UNVERIFIED at mint. **The tier is also
+   CAPPED by the diff's surfaces**: while any changed path is an ALWAYS-FULL
+   surface (the merge/land/repair rails `scripts/admin-merge.sh`,
+   `scripts/ci-failure-set.sh`, `scripts/atomic-land.sh`,
+   `scripts/check-pipeline-compliance.sh`, the recorder `scripts/record-review.sh`,
+   `.github/workflows/**`, `.github/actions/**`, `.husky/**`, `extensions/**`,
+   `skills/**`, `templates/**`, `enforcement/**`, `scripts/check-*`,
+   `scripts/lib/diff-normalize.py`, and the rail-exec'd decision modules
+   (`scripts/ci_exemption.py`, `scripts/ci-workflow-pr-evaluable.sh`,
+   `scripts/checkout_guard.sh`, `scripts/ci_runner_gate.sh`) — the last five
+   because they are agent-executable instructions or gate bodies), `record-review.sh` REFUSES
+   (exit 4) a `clean-micro` record whose readable diff touches one; a TRANSPORT
+   failure only warns, and a payload the API answered with but the classifier
+   cannot certify refuses. A `complexity:micro` label does not make a merge-rail
+   edit reviewable at micro depth. Ask first with
+   `record-review.sh --print-tier <pr> [owner/repo]` → `<status>\t<full|low|micro>`
+   (only `ok` carries a tier; see `proportional-gates` §Review Cycles, "The
+   SURFACE CAP"). **Content-only
    diffs record `clean-low`** regardless of the linked issue's tier (#1348):
    when EVERY changed path is prose or a stylesheet (`docs/**` with a content
    extension, or a named root prose file) the Low value of the canonical tier

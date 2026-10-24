@@ -68,12 +68,22 @@ flag does either.
    without it (exit 3), because naming the current head is not evidence that a review happened.
    `--evidence` takes `comment:<id>`, `review:<id>`, `review-comment:<id>`, or the artifact's URL.
    `clean-low` (content-only diff) and `clean-micro` (micro issue) do not require it.
-   A record bound to an older head is stale and the rail refuses it, so record AFTER the last push.
+   A record bound to an older head is stale and the rail refuses it, so record AFTER the last push —
+   UNLESS the CARRY below applies.
 4. Only then run the rail:
 
    ```
    scripts/admin-merge.sh <PR>
    ```
+
+   ⛔ **The ONE-COMMAND alternative to steps 1-3.** If you would otherwise assemble a reviewer prompt
+   by hand, do not: `~/.pi/agent/scripts/review-pr.sh <PR>` spawns a genuinely fresh-context
+   reviewer over the PR's CURRENT head, posts its findings as the PR comment step 3 names, and —
+   ONLY when the reviewer comes back clean — records the attestation with
+   `record-review.sh` at that same head. Findings ⇒ exit 7, NO record, findings printed: fix, push,
+   re-run. It resolves the repo and head from the PR itself, so it needs no `--repo` inside the repo
+   (`--repo owner/name` when run from elsewhere). This does NOT relax the requirement — it is the
+   same artifact, produced by the same recorder (agent-infra scripts/review-pr.sh).
 
    A lane that cannot type the rail's name literally can assemble it — a bare `admin` token next
    to a `$` is what the enforcer's admin-merge detector reads as a fail-closed guess (#1776):
@@ -84,6 +94,15 @@ flag does either.
 
 ⛔ **Never edit the PR body after recording.** `record-review.sh --evidence` verifies the review
 artifact; an edited body is a changed artifact the next reader cannot trust.
+⛔ **A CARRY IS NOT A RE-REVIEW (#2343).** You do not pay for a second review when a **valid** record
+   already exists. Pass the head **and the verdict** that record already names — the REVIEWED head, not the live one;
+   a `clean-micro` record stays `clean-micro`, because the lane arm does not compare verdicts — and
+   `record-review.sh` re-binds that verdict onto the live head — `mint:"carried"`, no
+   `--evidence`, no new reviewer. The script decides the arm itself, so there is no `--carry` flag.
+   It re-binds when the reviewed artifact is provably unchanged AND the live head is not measurably
+   red: the same PR DIFF, or a forward merge of the new base into your reviewed head (a **rebase**
+   rewrites the head so the LANE arm cannot carry it, but an unchanged **DIFF digest** still carries
+   through the DIFF arm). A **fresh** mint still requires the dispatched reviewer.
 ⛔ **If the rail refuses, read the reason** — it names the command to run. Do not retry at the same
 head; a refusal at an unchanged head means the evidence, not the attempt, is what must change.
 

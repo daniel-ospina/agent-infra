@@ -68,11 +68,21 @@
 # because git WILL refuse on them; a refusal is reported, never swallowed.
 #   `--force` is never passed and `git branch -D` is never called.
 #
-# DISK-SAVINGS HONESTY: per-worktree `.venv`s are hardlinked to the uv cache,
-# so `du` over-reports them (measured: 84 GB `du` delta vs 22 GB actually
-# freed). This script therefore NEVER calls `du` and NEVER claims a byte
-# saving. The real, deliverable win is FILE COUNT — the amplification that
-# produced the 10-18 minute repo-wide searches.
+# DISK-SAVINGS HONESTY: there is NO single apparent-to-real ratio, because the gap
+# is a SHARING property of the filesystem, not of worktrees. Measured 2026-10-16
+# (#1851), three regimes: (a) APFS with the uv cache on the SAME volume shares
+# blocks by copy-on-write (`clonefile`) — one venv `du` 22.0 MB vs a `df` used
+# delta of +0.6 MB, nlink=1 throughout, and a `--link-mode=hardlink` control at
+# nlink=2 proving the flag is honoured; (b) hardlinks into the cache (nlink>1)
+# make a venv`s marginal cost the CACHE`s — `du` 5,704 MB vs 186 MB actually
+# released on a Linux cell; (c) neither (Linux/overlayfs, a cache on another
+# mount, `--link-mode=copy`) leaves the venv REAL — 75 worktrees at `du`
+# 5,647 MiB vs `df` 5.90 GB released, ratio 1.004. So this script NEVER calls
+# `du` and NEVER claims a byte saving: a `du` figure is an upper bound whose
+# error is machine-specific and unmeasured. The real, portable win is FILE
+# COUNT — the amplification that produced the 10-18 minute repo-wide searches.
+# Real bytes are measured per machine, on the machine that removes, by
+# scripts/worktree-disk-probe.sh (a `df` used delta), never inferred from `du`.
 #
 # BOUNDEDNESS (a reaper that hangs the fleet is worse than no reaper):
 #   * enumeration is `git worktree list --porcelain [-z]` (admin files only) —
@@ -723,6 +733,16 @@ clean_gate() {
 GH_OK=0
 PR_APPLICABLE=0
 PR_REFS=""
+# ⛔ WHY THE OPEN-PR GATE COULD NOT BE EVALUATED, AS A TOKEN RATHER THAN A GUESS, and the sentence
+# that says what to DO about it. The abort used to say "gh unavailable or the origin-remote probe
+# failed" — naming two causes it could not distinguish, while the one that actually happens on a cell
+# (an INSTALLED and WORKING `gh` that is NOT AUTHENTICATED for this pass's HOME, so `gh` exits 4) was
+# not named at all. Measured 2026-10-23 on a cell at 95% used: `/usr/bin/gh` v2.102.0 present,
+# `gh pr list` exit 4, HOME with no `~/.config/gh` -> the worktree class aborted for BOTH repos and
+# freed 0 MB, reported as "gh unavailable" (#2443). A caller now reads the token: disk-reaper.sh turns
+# it into `skipped=<repo> reason=<why>` and keeps reclaiming the repos it CAN verify.
+PR_SKIP_REASON=""
+PR_SKIP_REMEDY=""
 github_slug() {
     local url="$1"
     case "$url" in
@@ -750,7 +770,17 @@ pr_head_refs_load() {
         url_rc=$?
         if [ "$url_rc" != 0 ] && [ "$url_rc" != 2 ]; then
             PR_APPLICABLE=1; GH_OK=0; GH_STATE="unavailable"
-            log "GH slug probe failed (rc=$url_rc) for $REPO_CANON — fail-closed (origin cannot be resolved)"
+            # A git-level failure (127 = no git, 124 = timeout, 128 = the repo itself is unreadable).
+            # NOT an authentication problem: the remedy names git, never `gh auth login`.
+            case "$url_rc" in
+                124) PR_SKIP_REASON="origin-probe-timeout(rc=124)"
+                     PR_SKIP_REMEDY="bounded \`git remote get-url origin\` did not answer within ${REAP_WT_GIT_TIMEOUT}s — the checkout or its mount is unresponsive" ;;
+                127) PR_SKIP_REASON="git-missing(rc=127)"
+                     PR_SKIP_REMEDY="git is not executable for this pass (GIT_BIN=${GIT_BIN})" ;;
+                *)   PR_SKIP_REASON="origin-probe-failed(rc=$url_rc)"
+                     PR_SKIP_REMEDY="the origin remote of $REPO_CANON could not be read (bounded \`git remote get-url origin\` exit $url_rc) — check the checkout's .git/config" ;;
+            esac
+            log "GH slug probe failed (rc=$url_rc) for $REPO_CANON — fail-closed (reason=$PR_SKIP_REASON)"
             return 1
         fi
         slug="$(github_slug "$(head -1 "$GIT_OUT" 2>/dev/null)")"
@@ -760,14 +790,40 @@ pr_head_refs_load() {
         *) PR_APPLICABLE=0; GH_OK=1; GH_STATE="na"; return 0 ;;
     esac
     PR_APPLICABLE=1
-    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-pr.XXXXXX")" || { GH_OK=0; GH_STATE="unavailable"; return 1; }
+    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-pr.XXXXXX")" || {
+        GH_OK=0; GH_STATE="unavailable"
+        # ⛔ THE TOKEN IS SPACE-FREE BY CONTRACT (a caller parses this line). The scratch PATH goes in
+        # the remedy, never in the token: a TMPDIR containing a space (`/Users/me/My Temp`) would
+        # otherwise split the token and make the repo's skip invisible to the reader again (#2443).
+        PR_SKIP_REASON="scratch-unwritable"
+        PR_SKIP_REMEDY="the PR probe needs ONE scratch file and could not create it under ${TMPDIR:-/tmp} — a full or read-only scratch dir"
+        return 1
+    }
     run_bounded "$REAP_WT_GH_TIMEOUT" "$out" \
         "$GH_BIN" pr list --repo "$slug" --state open --limit "$REAP_WT_PR_LIMIT" \
         --json headRefName --jq '.[].headRefName'
     rc=$?
     if [ "$rc" != 0 ]; then
-        rm -f "$out"; GH_OK=0; GH_STATE="unavailable"
-        log "GH pr-list failed (rc=$rc) for $slug — fail-closed"
+        rm -f "$out"; GH_OK=0
+        # ⛔ THE EXIT CODE IS THE DIAGNOSIS, and the arms are disjoint remedies: `gh` documents 4 as
+        # "requires authentication" (gh help exit-codes), which is a DIFFERENT fix from a missing
+        # binary, a timeout, or an API error. Collapsing them into "gh unavailable" is how a cell
+        # spent hours on a full disk with a working gh (#2443).
+        case "$rc" in
+            4)   GH_STATE="auth"
+                 PR_SKIP_REASON="gh-not-authenticated(rc=4)"
+                 PR_SKIP_REMEDY="gh is INSTALLED but NOT AUTHENTICATED for this pass's HOME (${HOME:-unset}): gh reads credentials from \$HOME/.config/gh or GH_TOKEN. Install the timer as the user that owns the lanes (the unit renders Environment=HOME=), or export GH_TOKEN/GITHUB_TOKEN. gh's own words: run 'gh auth login' for that HOME" ;;
+            124) GH_STATE="unavailable"
+                 PR_SKIP_REASON="gh-timeout(rc=124)"
+                 PR_SKIP_REMEDY="gh did not answer within REAP_WT_GH_TIMEOUT=${REAP_WT_GH_TIMEOUT}s — a busy shared account; raise the timeout or let the next pass retry" ;;
+            127) GH_STATE="missing"
+                 PR_SKIP_REASON="gh-missing(rc=127)"
+                 PR_SKIP_REMEDY="gh is not executable for this pass (GH_BIN=${GH_BIN}) — install it or point GH_BIN at an absolute path" ;;
+            *)   GH_STATE="unavailable"
+                 PR_SKIP_REASON="gh-error(rc=$rc)"
+                 PR_SKIP_REMEDY="gh pr list failed for ${slug} (exit $rc) — see the pass log for gh's own message" ;;
+        esac
+        log "GH pr-list failed (rc=$rc) for $slug — fail-closed (reason=$PR_SKIP_REASON)"
         return 1
     fi
     PR_REFS="$(cat "$out")"
@@ -1220,9 +1276,16 @@ run() {
     done <<<"$WT_LIST"
     if [ "$need_pr" = 1 ]; then
         if ! pr_head_refs_load; then
-            echo "FAIL-CLOSED abort: gh unavailable or the origin-remote probe failed — cannot verify the open-PR gate (exit 3)" >&2
-            echo "   set REAP_WT_REPO_SLUG, install/auth gh, or run against a repo with no GitHub remote" >&2
-            log "FAIL-CLOSED abort: gh unavailable with candidates (exit 3)"
+            # ⛔ THE REASON, NOT A GUESS — and it is MACHINE-READABLE. The first line names the gate,
+            # the second carries `skipped=<repo> reason=<token>` for the caller (disk-reaper.sh reads
+            # it to report a per-repo skip and keep reclaiming the repos it CAN verify), and the third
+            # is the remedy for THIS cause. `skipped=` is on stderr like every other abort line and
+            # `run_class` merges both streams, so the entry point sees it either way.
+            echo "FAIL-CLOSED abort: the open-PR gate cannot be verified for this repo (exit 3)" >&2
+            echo "SKIPPED-REPO: skipped=${REPO_CANON:-$REPO} reason=${PR_SKIP_REASON:-unknown}" >&2
+            echo "   ${PR_SKIP_REMEDY:-set REAP_WT_REPO_SLUG, or replace the origin remote with a GitHub URL}" >&2
+            echo "   NOTHING in this repo was touched: a checkout whose PR state is unknown is never removed (the other repos in the pass are unaffected)" >&2
+            log "FAIL-CLOSED abort: open-PR gate unverifiable for ${REPO_CANON:-$REPO} (reason=${PR_SKIP_REASON:-unknown}) with candidates (exit 3)"
             print_footer "$now"
             exit 3
         fi
@@ -1240,8 +1303,15 @@ run() {
     cwd_probe_load
 
     say "note: \`git worktree remove\` deletes the CHECKOUT only — branch refs are never deleted by this tool."
-    say "note: no byte-savings figure is reported — per-worktree .venv dirs are hardlinked to the uv cache"
-    say "      (measured 84 GB du delta vs 22 GB actual). The deliverable win is FILE COUNT."
+    say "note: no byte-savings figure is reported — a per-worktree .venv shares blocks with the uv"
+    say "      cache on SOME machines (APFS clonefile, or a hardlink) and is REAL on others"
+    say "      (Linux/overlayfs, a cache on another volume — measured 2026-10-16: du 22.0 MB vs df"
+    say "      +0.6 MB when cloned; du 5,647 MiB vs df 5.90 GB real, ratio 1.004). The deliverable"
+    say "      win is FILE COUNT. Real bytes are measured per machine, never inferred from du:"
+    # The probe is FARMED (pi-bootstrap/setup.sh fleet_srcs) because cells run this reaper from
+    # $DEST/scripts, not from a checkout — so a repo-relative `scripts/...` hint would not resolve
+    # where this line is actually read. Name the SIBLING this script was invoked as (#1858 review P2).
+    say "      bash ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh --help   (#1851)"
     say ""
 
     local elapsed=0 crumb verdict reason detail rc

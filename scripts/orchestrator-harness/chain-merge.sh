@@ -72,7 +72,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was capacity-refused
+cap_refusal_gate() { # -> prints `fork|load|disk|land` and returns 0 iff THIS dispatch was refused by a gate
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
@@ -105,13 +105,19 @@ cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was
   # of turning the slack negative — it buys no slack, exactly as documented above.
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
-  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (75 load / 77 disk), not a
-  # gate: an unrecognised value is reported as `load` because the refusal itself is already proven by
-  # fields 1-2, and refusing to end the wait over one corrupt byte is the fleet-wide idleness R8
-  # removes. Field 2 is deliberately NOT consulted here — the yield window is the controller's
+  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (73 fork / 74 land-backlog /
+  # 75 load / 77 disk), not a gate: an unrecognised value is reported as `load` because the refusal
+  # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
+  # fleet-wide idleness R8 removes. `fork` is named rather than folded into `load` because its remedy is
+  # the OPPOSITE of a load wait — the box must be restarted or drained from OUTSIDE (agent-infra#2293) —
+  # and a chain that told its caller "load" would send the operator to wait for a retry the box cannot
+  # even spawn. Its code is 73, NOT 74: 74 is the land-backlog gate below, and two gates that share a
+  # code with opposite remedies make every caller mislabel one of them (measured on this integration
+  # branch — the batch's own review caught it as a P0; see also spawn-gate.sh's AGENT_FORK_REFUSED).
+  # Field 2 is deliberately NOT consulted here — the yield window is the controller's
   # business (`capacity_yield_live`), and an incoherent window must not make a proven refusal
   # unreadable. README §7.2d states exactly this per-reader split.
-  case "${gate:-}" in disk) printf 'disk' ;; *) printf 'load' ;; esac
+  case "${gate:-}" in disk) printf 'disk' ;; fork) printf 'fork' ;; land) printf 'land' ;; *) printf 'load' ;; esac
   return 0
 }
 
@@ -161,7 +167,7 @@ release_issue_claim() {
     return 0
   fi
   if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
-    echo "[chain $N] ⚠️ $csh predates the issue-claim RELEASE (no claim_issue_release_record) — the claim is NOT released; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+    echo "[chain $N] ⚠️ $csh predates the issue-claim RELEASE (no claim_issue_release_record) — the claim is NOT released; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
     return 0
   fi
   # ⛔ NO CAPTURED GENERATION → DO NOT RELEASE (acceptance-review finding). The capture at chain start
@@ -200,9 +206,24 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
   if _cap_gate="$(cap_refusal_gate)"; then
     case "$_cap_gate" in
       disk) _cap_rc=77 ;;
+      # 73 is spawn-gate.sh's AGENT_FORK_REFUSED: the box is out of PROCESSES, so the remedy is a
+      # restart or a drain from OUTSIDE — never a wait for load to fall (#2293). ⛔ 73 and not the
+      # 74 this PR originally used: 74 is the LAND-BACKLOG code in the arm below, and two gates
+      # sharing a code with opposite remedies is exactly the instrument false positive both issues
+      # exist to delete (the batch review caught this as a P0 before it could land).
+      fork) _cap_rc=73 ;;
+      # 74 is spawn-gate.sh's AGENT_LAND_BACKLOG: the lane was refused because the REPO's open-PR
+      # backlog is over its own measured landing ceiling (#2409), not because this box is short of
+      # anything. The exit code must differ for the same reason 75 and 77 differ from each other —
+      # the remedy is different — and it must be a STOP here for the same reason: no PR can appear.
+      land) _cap_rc=74 ;;
       *)    _cap_rc=75 ;;
     esac
-    echo "[chain $N] capacity transfer: lane-$N was refused at the $_cap_gate gate, so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N, so a peer with capacity can claim it; this box stands down via state/capacity-refused-$N for the record's yield window (agent-infra#1909)" >> "$LOG"
+    if [ "$_cap_gate" = "land" ]; then
+      echo "[chain $N] land-backlog: lane-$N was refused because the repo's open-PR backlog is over its own landing ceiling (#2409), so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N. This is NOT a capacity transfer: the backlog is repo-wide, so handing the issue to a peer box would not clear it — the remedy is to LAND the open queue (or dispatch a P0-blocker / base-red repair, which are exempt)" >> "$LOG"
+    else
+      echo "[chain $N] capacity transfer: lane-$N was refused at the $_cap_gate gate, so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N, so a peer with capacity can claim it; this box stands down via state/capacity-refused-$N for the record's yield window (agent-infra#1909)" >> "$LOG"
+    fi
     exit "$_cap_rc"
   fi
   # ⛔ A PRESENT-BUT-REJECTED RECORD IS THE ONLY MISS THIS MECHANISM CAN PRODUCE, and it used to be

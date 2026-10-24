@@ -28,10 +28,52 @@
 #     a poll that changes nothing costs nothing. (GraphQL has no ETag — that is why this layer
 #     targets `gh api`, and why the sweeps moved to REST.)
 #
+# ⛔ ACCOUNT SCOPE, NOT BOX SCOPE (agent-infra#2137). The two remedies above bound what THIS BOX
+# sends; they do not bound what the ACCOUNT sends. Four boxes acting as ONE account share ONE pair of
+# buckets, so a per-box budget is ~4x the account's, and GitHub's SECONDARY (burst/concurrency)
+# limit is enforced on the ACCOUNT. Measured 2026-10-20: `gh api rate_limit` honestly reported
+# graphql ~4573/5000 while the fleet was refused — the primary counter does not predict a secondary
+# limit, so a box cannot tell "the account is out" from "my box is fine". Two things follow, and
+# neither needs cross-box messaging:
+#
+#   * PARTITION THE ACCOUNT BUDGET. GitHub's primary limit is per ACCOUNT (5,000/hr per bucket for
+#     authenticated users, shared by every token and app acting for that user). A declared fleet size
+#     (`GH_LIMIT_ACCOUNT_FLEET_SIZE`, default 4) divides that budget, a safety fraction
+#     (`GH_LIMIT_ACCOUNT_SAFETY`, default 0.8) keeps headroom, and this box then sends at most its
+#     share per window (`GH_LIMIT_ACCOUNT_WINDOW_S`, default 60 s) — 5000 x 0.8 / 4 / 60 ≈ 16/min at
+#     the defaults. A partition is testable and needs no peer to be reachable.
+#   * AN UNCLASSIFIED REFUSAL IS ITS OWN CLASS. `status=?` — a limit whose bucket/status could not be
+#     parsed — used to be the one case that produced a FULL-WINDOW block, because the only number
+#     available was a bucket reset ~43 minutes away while the refusal was secondary. It is now
+#     classified `unclassified` and treated like a secondary limit: >= 1 minute with upward jitter,
+#     doubling per attempt, and the classification is RECORDED. It never adopts a bucket reset as its
+#     wait, because the primary counter does not predict a secondary limit.
+#
+# ⛔ THE RECORD IS EVIDENCE WITH A WINDOW, NOT A STATE. `last-limit` now carries `kind=` (the
+# classification used), `until=` (the block window that classification justifies — never a reset for
+# an unclassified/secondary refusal) and `remaining=` (what the exempt `/rate_limit` read said). The
+# layer blocks a call on that marker ONLY within `until`, NEVER on a marker older than the window it
+# recorded, and it REVALIDATES with one exempt REST `rate_limit` read before any long wait: if that
+# bucket reports headroom, the marker is stale, it is annotated `stale=` (the age stays — the age is
+# evidence) and the call proceeds. Every refusal/backoff line names its own evidence: the
+# classification, the AGE of the evidence it used (`0s` when the refusal is in hand, the marker's age
+# when the marker is what it waited on), the remaining count read, and the attempt number — a line
+# that cannot say how old its evidence is reads the same as a live one.
+#
 # WHAT THIS IS NOT. It is not a retry that hides the problem. A limited call RECORDS itself — in
 # `$GH_LIMIT_DIR/last-limit` (read by the controller's heartbeat) and in `events.log` — and a final
 # failure says so on stderr in the API's own terms. A cycle that was limited never looks like a
 # cycle that was idle.
+#
+# AND IT IS NOT ONLY A QUEUE (#2243). Serialising decides WHO GOES NEXT; it does not decide whether
+# the work is worth doing twice. Thirteen lanes on one box asking for the SAME read queued thirteen
+# times for one answer that was already known after the first (measured: 0.676 s at 3 lane processes,
+# 63 s at 13, while `curl /rate_limit` took 0.091 s on 4658/5000 quota — the queue was ours). So
+# identical concurrent READS are now COALESCED (single flight, `single_flight` below): one in-flight
+# load per normalised request, waiters share its result — or its failure — under a bounded wait, and
+# a waiter that exceeds the bound gets a distinct `busy` outcome naming the holder's age. #2005's
+# "one request in flight per box" is COMPLETED by this, not reversed: there is still exactly one
+# request in flight, and the `flock` is still what guarantees it.
 #
 # ⛔ THE STREAMS ARE SACRED. On a call that eventually SUCCEEDS this helper must be invisible: the
 # child's stdout and stderr are replayed byte for byte and nothing else is written. That is not
@@ -120,6 +162,28 @@ MUTATION_GAP = cfg_secs("GH_LIMIT_MUTATION_GAP", 1.0, 1.0, 60)     # ">= 1 secon
 NO_WAIT = cfg_int("GH_LIMIT_NO_WAIT", 0, 0, 1)
 # The lock budget under NO_WAIT — small enough to fit inside a 90 s caller alongside one request.
 NO_WAIT_LOCK_S = cfg_secs("GH_LIMIT_NO_WAIT_LOCK_S", 5.0, 1.0, 600)
+
+# ── ACCOUNT SCOPE (agent-infra#2137): the budget is the ACCOUNT's, so a box must assume its peers exist ──
+# The declared fleet size is an ENV VALUE, not a measurement: boxes cannot see each other, and a
+# partition derived from an unreachable peer would be unavailable exactly when it is needed. A
+# declaration is conservative in the safe direction (too few boxes => too generous a share => the
+# account limit is hit, which the backoff below handles; too many => a box is slower than it needs to
+# be, which costs latency, not correctness).
+ACCOUNT_FLEET_SIZE = cfg_int("GH_LIMIT_ACCOUNT_FLEET_SIZE", 4, 1, 64)
+ACCOUNT_BUDGET_PER_HOUR = cfg_int("GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR", 5000, 60, 100000)
+ACCOUNT_SAFETY = max(0.1, min(_finite("GH_LIMIT_ACCOUNT_SAFETY", 0.8), 1.0))
+ACCOUNT_WINDOW_S = cfg_secs("GH_LIMIT_ACCOUNT_WINDOW_S", 60, 10, 3600)
+# WHICH buckets are partitioned. `graphql` by default: that is the measured exhaustion (#1762/#1939)
+# and the bucket the heartbeat's ~513-call refresh bursts use. `core` is deliberately NOT paced by
+# default — #1962/#2137 move the hot reads ONTO REST, so pacing REST here would push the fleet back
+# onto the bucket that is already refusing. An operator who measures core pressure opts in with
+# `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql,core`.
+ACCOUNT_PARTITION_BUCKETS = tuple(
+    b.strip().lower() for b in cfg("GH_LIMIT_ACCOUNT_PARTITION_BUCKETS", "graphql").split(",") if b.strip())
+# A marker older than this is not evidence about now (matches `orch-loop.sh`'s GH_LIMIT_STALE_S).
+MARKER_MAX_AGE = cfg_secs("GH_LIMIT_MARKER_MAX_AGE", 900, 60, 86400)
+# A wait longer than this is worth ONE exempt REST read before committing to it (requirement 3).
+GATE_REVALIDATE_S = cfg_secs("GH_LIMIT_GATE_REVALIDATE_S", 30, 1, 600)
 CACHE_MAX_BODY = 1024 * 1024
 CACHE_MAX_BYTES = cfg_int("GH_LIMIT_CACHE_MAX_BYTES", 64 * 1024 * 1024, 1024, 1 << 30)  # whole cache
 CACHE_MAX_ENTRIES = cfg_int("GH_LIMIT_CACHE_MAX_ENTRIES", 500, 1, 100000)
@@ -297,12 +361,139 @@ def write_state(name, text):
         return False
 
 
-def record_limit(bucket, reset, attempts, waited, status):
-    """The durable record the controller's heartbeat reads (`gh=<bucket> reset=<epoch>`)."""
+def record_limit(bucket, reset, attempts, waited, status, kind="unclassified", until=None, remaining=None):
+    """The durable record the controller's heartbeat reads (`gh=<bucket> reset=<epoch>`).
+
+    ⛔ IT CARRIES ITS OWN EVIDENCE AND ITS OWN WINDOW (#2137). `kind=` is the classification this
+    observation used, `until=` is the block window that classification justifies, and `remaining=` is
+    what the exempt `/rate_limit` read said. Before this, the record carried the BUCKET RESET and
+    nothing else — so a refusal classified `status=?` (secondary, ~1 minute) wrote a reset ~43
+    minutes away, and every consumer that trusted it blocked the box for the full window. A reader
+    must block until `until`, never until `reset`. The older fields stay where they were and keep
+    their meaning, so `orch-loop.sh`'s token (and any older reader) still parses the line."""
     write_state("last-limit",
-                "at=%d bucket=%s reset=%s attempts=%d waited=%d status=%s"
+                "at=%d bucket=%s reset=%s attempts=%d waited=%d status=%s kind=%s until=%s remaining=%s"
                 % (int(clock()), bucket, ("%d" % reset) if reset else "0", attempts, int(waited),
-                   status if status is not None else "?"))
+                   status if status is not None else "?", kind or "unclassified",
+                   ("%d" % until) if until else "0",
+                   ("%d" % remaining) if remaining is not None else "?"))
+
+
+def marker_until(kind, reset, wait, now):
+    """The BLOCK WINDOW an observation justifies — and the whole point of requirement 2/5.
+
+    A PRIMARY exhaustion is honest about the full window: `remaining == 0` and a reset in the future
+    is exactly "this bucket is out until then", and the docs say not to call again before it. A
+    SECONDARY or UNCLASSIFIED refusal is not: the primary counter does not predict it (documented,
+    and measured — graphql ~4573/5000 while refused), so its reset is NOT a recovery time. Its window
+    is the wait this layer itself will honour, capped at the documented one-minute floor, so a
+    `status=?` observation can never become an hour-long box-wide block again."""
+    if kind == "primary" and reset and reset > now:
+        return int(reset)
+    # ⛔ A `retry-after` WINDOW IS THE SERVER'S OWN DELAY, NOT THE FLOOR. `plan_wait` honours that
+    # header exactly (bounded by MAX_WAIT), so capping the RECORD at the one-minute floor published a
+    # window shorter than the one this process was obeying: with `Retry-After: 300` the box slept 300 s
+    # while its own marker told every peer client it was free again in 60 — 240 s of peer traffic inside
+    # a cool-down the layer itself respected.
+    if kind == "retry-after" and wait and wait > 0:
+        return int(now + min(float(wait), float(MAX_WAIT)))
+    if wait and wait > 0:
+        return int(now + min(float(wait), float(BASE_WAIT)))
+    return int(now + BASE_WAIT)
+
+
+def record_window(limit, kind, reset, wait, now):
+    """The window a refusal justifies, for the paths that have no `plan_wait` result to hand.
+
+    ⛔ ONE EXPRESSION, THREE CALL SITES. The give-up and NO_WAIT paths pass `wait=None`, so a
+    `retry-after` refusal recorded the 60 s floor while `plan_wait` was obeying the server's delay —
+    publishing a window shorter than the one the layer honoured. `limit.retry_after` is the only wait
+    those paths can imply, and it is exactly what `plan_wait` would have used."""
+    if wait is None and kind == "retry-after" and limit.retry_after:
+        wait = float(limit.retry_after)
+    return marker_until(kind, reset, wait, now)
+
+
+def _parse_marker(raw):
+    """`key=value …` text into a dict (the on-disk `last-limit` shape), or None when unparsable."""
+    try:
+        parts = dict(kv.split("=", 1) for kv in raw.split() if "=" in kv)
+    except ValueError:
+        return None
+    return parts or None
+
+
+def read_marker():
+    """`last-limit` as a dict, or None. Read defensively: a torn/dir/corrupt record is not an error."""
+    try:
+        with open(os.path.join(state_dir(), "last-limit")) as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    return _parse_marker(raw)
+
+
+def marker_window(marker):
+    """(kind, until_epoch) — the classification the marker recorded and the window it justifies.
+
+    ⛔ A MARKER WITH NO `kind=` IS `unclassified`, NEVER `primary`. Records written before this change
+    carry `reset=` and nothing else, and the measured stale marker was exactly that shape with a
+    reset ~43 min ahead. Deriving a primary window from it would restore the full-window block for
+    every marker already on disk, so the migration default is the bounded one."""
+    kind = (marker.get("kind") or "unclassified").strip()
+    at = as_int(marker.get("at"))
+    until = as_int(marker.get("until"))
+    if until and until > 0:
+        return kind, until
+    # No window recorded (a legacy marker): bound it by what this layer will actually wait.
+    if at is None:
+        return kind, 0
+    return kind, marker_until(kind, as_int(marker.get("reset")), BASE_WAIT, at)
+
+
+def marker_age(marker):
+    """Seconds since the marker was written, or None. The AGE is part of every line that uses it."""
+    at = as_int(marker.get("at")) if marker else None
+    return None if at is None else int(clock()) - at
+
+
+def mark_marker_stale(remaining, why, expect=None):
+    """Annotate a marker whose own evidence contradicts it. ⛔ ANNOTATE, NEVER DELETE.
+
+    The age is the evidence an operator needs ("refused 4 minutes ago, probe says 4573 left"), so the
+    record keeps its `at=` and gains `stale=`/`reval_remaining=`/`why=`. Deleting it would make the
+    next reader unable to tell "no limit happened" from "a limit happened and was cleared".
+
+    ⛔ AND IT DOES **NOT** WRITE `recovered=`. That field is the cycle token's "this limit was read
+    past" mark, and the only honest source of it is a REAL REQUEST THAT SUCCEEDED (`record_recovery`).
+    A `/rate_limit` read is exempt from the primary limit — measured at 4999/5000 while every GraphQL
+    call was refused — so deriving `recovered=` from it would make a box that is still being refused
+    report itself recovered, which is the false pass this whole layer exists to prevent. The gate
+    suppresses on `stale=`, so nothing needs that field."""
+    path = os.path.join(state_dir(), "last-limit")
+    try:
+        with open(path) as fh:
+            cur = fh.read().strip()
+    except OSError:
+        return False
+    if not cur or "stale=" in cur:
+        return False
+    # ⛔ ANNOTATE ONLY THE RECORD WE READ. `record_limit` writes `last-limit` OUTSIDE the box lock (a
+    # refusal must not queue behind a sleeping gate), so between this gate's read and this write a
+    # concurrent client can have replaced the file — with another bucket's marker, or with a FRESH
+    # genuine refusal whose `until` is a real window. Stamping `stale=` on that record would clear a
+    # block that must hold, and the gate suppresses on `stale=` for good, so the drop would be silent
+    # and permanent (fail-open). Identity is `at` + `bucket` + `kind`: same observation, same record.
+    if expect is not None:
+        now_rec = _parse_marker(cur) or {}
+        if (as_int(now_rec.get("at")), now_rec.get("bucket"), now_rec.get("kind")) != \
+           (as_int(expect.get("at")), expect.get("bucket"), expect.get("kind")):
+            log_event("marker-gate: NOT annotating last-limit — it was replaced under me (read at=%s, found at=%s)"
+                      % (expect.get("at"), now_rec.get("at")))
+            return False
+    now = int(clock())
+    extra = " stale=%d reval_remaining=%s why=%s" % (now, ("%d" % remaining) if remaining is not None else "?", why)
+    return write_state("last-limit", cur + extra)
 
 
 def record_recovery(bucket):
@@ -423,6 +614,221 @@ def release_lock(fd):
         pass
 
 
+# ── the ACCOUNT partition (agent-infra#2137, requirement 1) ────────────────────────────────────
+def account_share():
+    """This box's share of the ACCOUNT's hourly budget, as calls per window.
+
+    GitHub's primary limit is per ACCOUNT, not per machine: a personal access token, an OAuth app and
+    a GitHub App acting for the same user all draw on the same 5,000/hr bucket ("All of these requests
+    count towards your personal rate limit of 5,000 requests per hour"). Four boxes therefore act as
+    ONE client of a 5,000/hr budget, and bounding each box at 5,000/hr bounds the account at 20,000/hr
+    — four times what it has. This is the partition: budget x safety / fleet, per window.
+
+    ⛔ THE FLOOR IS 1, NOT 0. A share that rounds to zero would refuse EVERY call on a box and turn a
+    conservative configuration into a dead harness; one call per window is slow, and slow is
+    recoverable. The knob's value is a DECLARATION (`GH_LIMIT_ACCOUNT_FLEET_SIZE`), not a measurement:
+    a peer that cannot be reached is still a peer spending the same budget."""
+    per_min = (float(ACCOUNT_BUDGET_PER_HOUR) * float(ACCOUNT_SAFETY)
+               / float(ACCOUNT_FLEET_SIZE) / 60.0)
+    per_window = max(1, int(per_min * float(ACCOUNT_WINDOW_S) / 60.0))
+    return {"fleet": ACCOUNT_FLEET_SIZE, "budget": ACCOUNT_BUDGET_PER_HOUR,
+            "safety": ACCOUNT_SAFETY, "window": int(ACCOUNT_WINDOW_S),
+            "per_min": per_min, "per_window": per_window}
+
+
+def _budget_file(bucket):
+    return "budget-%s" % re.sub(r"[^a-z0-9]", "", str(bucket).lower() or "core")
+
+
+def _budget_take(bucket, now, cap, window):
+    """Record one slot in this box's sliding window, or report when the next one frees up.
+
+    Called under the box lock: the window file is shared by every process of this uid on this box, so
+    a read-modify-write outside the lock would let N callers each see "one slot left" and take it
+    (measured shape: the same defect the mutation stamp had). Returns (allowed, wait_seconds, used)."""
+    path = os.path.join(state_dir(), _budget_file(bucket))
+    try:
+        with open(path) as fh:
+            stamps = [int(x) for x in fh.read().split() if x.strip().lstrip("-").isdigit()]
+    except (OSError, ValueError):
+        stamps = []
+    cut = now - window
+    # ⛔ LOWER *AND* UPPER BOUND. A stamp from the FUTURE is invalid by construction (a clock that
+    # stepped back: NTP, a VM resume — the same class `last-mutation` guards), and honouring one made
+    # `oldest + window - now` a huge number, i.e. every call refused with `rc 75` until wall-clock
+    # caught up. Future stamps are DROPPED, not believed.
+    stamps = sorted(s for s in stamps if cut < s <= now)
+    if len(stamps) < cap:
+        stamps.append(int(now))
+        write_state(_budget_file(bucket), "\n".join("%d" % s for s in stamps) + "\n")
+        return True, 0.0, len(stamps)
+    # The window is full: the next slot frees when the OLDEST entry leaves it.
+    return False, max(1.0, float(stamps[0] + window - now)), len(stamps)
+
+
+def record_budget(bucket, next_slot, share):
+    """A durable record of a LOCAL budget refusal, kept OUT of `last-limit`.
+
+    ⛔ SEPARATE FILE ON PURPOSE. `last-limit` is what the heartbeat prints as
+    `gh=rate_limited(...)`, so writing a partition refusal there would publish OUR refusal as GitHub's
+    -- the false attribution that the local-refusal rule exists to prevent. This file is the evidence
+    an operator needs to see why a box is quiet (`next_slot`, the share it enforced, the declared
+    fleet), and `events.log` carries the same line in sequence."""
+    write_state("last-budget",
+                "at=%d bucket=%s next_slot=%ds per_window=%d window=%ds fleet=%d budget=%d/hr safety=%.2f"
+                % (int(clock()), bucket, int(next_slot), share["per_window"], share["window"],
+                   share["fleet"], share["budget"], share["safety"]))
+
+
+def _overdraw_once(bucket, now, window):
+    """True for the FIRST over-share call in the current window, so the overdraw line is evidence
+    rather than a flood.
+
+    ⛔ WHY THIS EXISTS. The heartbeat's refresh is ~513 graphql calls in one bounded run with
+    `GH_LIMIT_NO_WAIT=1` (the file's own P9 reasoning). Against a 16-call window share that is ~497
+    over-share calls; one line each would cross `EVENTS_MAX_BYTES` mid-run, and from then on
+    `log_event` rewrites the file to its last 500 lines on EVERY call — so the log would converge to
+    100% overdraw lines and evict every refusal, probe and marker decision this layer exists to keep.
+    The overdraw is still VISIBLE (once per window per bucket); it just cannot eat the record."""
+    name = _budget_file(bucket) + ".over"
+    try:
+        with open(os.path.join(state_dir(), name)) as fh:
+            last = int((fh.read() or "0").split()[0])
+    except (OSError, ValueError, IndexError):
+        last = 0
+    if last and 0 <= now - last < window:
+        return False
+    write_state(name, "%d" % int(now))
+    return True
+
+
+def budget_gate(bucket, now):
+    """Seconds to wait before sending, or 0.0 when a slot was taken for THIS send.
+
+    ⛔ A BOUNDED CALLER IS NOT PARKED. `GH_LIMIT_NO_WAIT` exists because its caller has its own
+    subprocess bound (the heartbeat's 90 s refresh); spending that bound in a queue here would turn a
+    rate-limit verdict into a timeout — the failure #2137's NO_WAIT half exists to prevent. Such a
+    caller proceeds and the OVERDRAW is recorded, so the partition is enforced for every caller that
+    can wait and the one class that cannot is visible instead of silent."""
+    if bucket not in ACCOUNT_PARTITION_BUCKETS:
+        return 0.0
+    share = account_share()
+    lock = acquire_lock()
+    try:
+        allowed, wait, used = _budget_take(bucket, now, share["per_window"], share["window"])
+    finally:
+        release_lock(lock)
+    if allowed:
+        if used == share["per_window"]:
+            log_event("account budget: %s at its share (%d/%d per %ds, fleet=%d budget=%d/hr safety=%.2f)"
+                      % (bucket, used, share["per_window"], share["window"], share["fleet"],
+                         share["budget"], share["safety"]))
+        return 0.0
+    if NO_WAIT:
+        if _overdraw_once(bucket, now, share["window"]):
+            log_event("account budget: %s OVER the box's share (%d/%d per %ds) — NO_WAIT caller proceeds over the "
+                      "partition (it cannot be paced without outliving its own bound); further overdraw in "
+                      "this window is not repeated here"
+                      % (bucket, used, share["per_window"], share["window"]))
+        return 0.0
+    return wait
+
+
+def marker_gate(gh_argv, real_gh, now):
+    """The ACCOUNT view shared by every client on this box: may this call be sent at all?
+
+    Returns the seconds waited (0.0 = proceed). This is the half that makes an observation on ONE box
+    useful to every other client on it: a refusal writes `until=` and the box's next calls wait out
+    that window instead of each spending four attempts to discover the same thing.
+
+    ⛔ FOUR BOUNDS, EACH ONE CLOSING A MEASURED FAILURE:
+      1. only within `until` — the window the CLASSIFICATION justifies, never the bucket reset for an
+         unclassified/secondary refusal (that is the 43-minute block that blinded the beat);
+      2. never on a marker OLDER than the window it recorded, nor older than `MARKER_MAX_AGE` — an
+         old observation is a fact about the past, not a state (the `last-mutation` future-stamp class);
+      3. revalidated with ONE exempt REST `rate_limit` read before any long wait: if that bucket now
+         reports headroom, the marker is stale, it is annotated (age kept) and the call proceeds;
+      4. never for a NO_WAIT caller, and never for a call that makes no request (`gh --version`, `help`,
+         `auth token`) — those cannot be refused, and parking them would only hide the tooling."""
+    if NO_WAIT or not makes_request(gh_argv):
+        return 0.0
+    marker = read_marker()
+    # ⛔ `marker` IS A DICT, so membership tests its KEYS (`recovered`, `stale`) — the `=` spelling
+    # made both checks always false, which quietly disabled the suppressor this gate depends on: a
+    # marker already marked recovered (by `record_recovery`) or stale (by `mark_marker_stale`) still
+    # blocked, and if the probe could not answer it paid the WHOLE window again.
+    if not marker or "recovered" in marker or "stale" in marker:
+        return 0.0
+    bucket = bucket_for(gh_argv)
+    if marker.get("bucket") != bucket:
+        return 0.0
+    age = marker_age(marker)
+    if age is None or age < 0 or age > MARKER_MAX_AGE:
+        if age is not None and age >= 0:
+            log_event("marker-gate: IGNORED a %s marker aged %ds (> %ds) — an old record is not a state"
+                      % (bucket, age, int(MARKER_MAX_AGE)))
+        return 0.0
+    kind, until = marker_window(marker)
+    if until <= now:
+        # ⛔ REQUIREMENT 5: the marker is older than the window it recorded. This is the measured
+        # stale shape — `attempts=1 waited=0` with a reset ~43 min ahead — and it must not block.
+        log_event("marker-gate: IGNORED a %s marker whose window ended %ds ago (kind=%s age=%ds)"
+                  % (bucket, int(now - until), kind, age))
+        return 0.0
+    wait = float(until - now)
+    remaining = as_int(marker.get("remaining"))
+    if wait > GATE_REVALIDATE_S:
+        # ⛔ REQUIREMENT 3: one REST `rate_limit` read is UNMETERED, so a long wait is worth checking
+        # before it is paid. A bucket that reports headroom contradicts the marker: the refusal was
+        # secondary, or the window has moved on — either way the marker must stop blocking.
+        p_remaining, p_reset = probe_rate_limit(real_gh, bucket)
+        if p_remaining is not None:
+            remaining = p_remaining
+        if p_remaining is not None and p_remaining > 0 and kind != "retry-after":
+            # ⛔ EXCEPT FOR `retry-after`. That window is the SERVER'S own instruction, and headroom on
+            # the primary counter does not contradict it — GitHub's own docs say secondary limits strike
+            # while the primary counter looks healthy, which is exactly why `plan_wait` honours the
+            # header verbatim and `probe_rate_limit` documents its `remaining` as untrusted for health.
+            # Clearing a 300 s cool-down on `remaining > 0` put every later client on the box back
+            # inside a cool-down this layer was still obeying — the same failure the recorded window
+            # itself was fixed for.
+            # ⛔ THE LINE MUST DESCRIBE WHAT ACTUALLY HAPPENED. `mark_marker_stale` refuses to annotate a
+            # record that was REPLACED between this gate's read and its write (another client's refusal,
+            # possibly a real primary window that must hold). Logging "cleared it" then would put two
+            # contradictory decisions in `events.log` and claim to have cleared a record that is still
+            # blocking the next client.
+            if mark_marker_stale(p_remaining, "remaining-gt-0", expect=marker):
+                log_event("marker-gate: STALE %s marker (kind=%s age=%ds) — revalidation read remaining=%d > 0, "
+                          "cleared it and proceeding instead of waiting %ds"
+                          % (bucket, kind, age, p_remaining, int(wait)))
+            else:
+                log_event("marker-gate: %s marker (kind=%s age=%ds) contradicted by revalidation (remaining=%d > 0) "
+                          "but NOT annotated — it was replaced under me; proceeding, the new record stands for the "
+                          "next client"
+                          % (bucket, kind, age, p_remaining))
+            return 0.0
+        log_event("marker-gate: revalidated %s (kind=%s age=%ds remaining=%s) — the wait stands"
+                  % (bucket, kind, age, "%d" % p_remaining if p_remaining is not None else "?"))
+    if wait > MAX_WAIT:
+        # ⛔ THE IN-CALL BOUND APPLIES TO THE GATE TOO. Sleeping the cap and then SENDING anyway is
+        # the worst of both: the caller pays the full bound and the request is one the marker says is
+        # doomed. The gate declines, the attempt is made (it is now the cheaper evidence), and the
+        # normal refusal path fails fast in `plan_wait`-time so the caller's own deferral takes over.
+        log_event("marker-gate: a %s marker's window is %ds away (kind=%s age=%ds remaining=%s) — beyond "
+                  "the %ds in-call bound, so NOT holding the call for it"
+                  % (bucket, int(wait), kind, age,
+                     "%d" % remaining if remaining is not None else "?", int(MAX_WAIT)))
+        return 0.0
+    # ⛔ THE LINE STATES ITS OWN EVIDENCE (requirement 4): classification, marker AGE, the remaining
+    # count read, and the attempt number. A refusal that cannot say how old its evidence is reads the
+    # same as a live one.
+    log_event("marker-gate: waiting %ds on a %s marker — evidence: kind=%s marker_age=%ds remaining=%s "
+              "attempt=preflight"
+              % (int(wait), bucket, kind, age, "%d" % remaining if remaining is not None else "?"))
+    pause(wait)
+    return wait
+
+
 # ── argv shape ─────────────────────────────────────────────────────────────────────────────────
 # Mutative = a request that CHANGES something. Getting this wrong in the permissive direction only
 # costs latency (an extra 1s wait), so the list errs wide rather than narrow.
@@ -436,6 +842,28 @@ MUTATING_PAIRS = {
 }
 METHOD_FLAGS = ("-X", "--method")
 DATA_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
+
+
+def _data_flag_value(a):
+    """Is this argv token a DATA flag, and if its value is attached, what is that value?
+
+    ⛔ `gh` IS COBRA/PFLAG, SO A SHORT FLAG'S VALUE MAY BE ATTACHED. `-fbody=x`, `-Fbody=x` and
+    `-f=body=x` are all `-f body=x` (verified against gh 2.102.0 — none is an "unknown flag"); only
+    the SEPARATE form and the LONG attached form (`--field=x`) used to be recognised, so a write
+    spelled `gh api <endpoint> -fbody=x` classified as a READ. Since a field makes `gh api` infer
+    POST, two concurrent identical creates were then coalesced and one of them never happened — a
+    silent lost mutation, and a key that could not tell it from a GET (review round 4). Every consumer
+    now asks THIS function, so the flag vocabulary has one definition."""
+    if a in DATA_FLAGS:
+        return True, None
+    for f in ("--field", "--raw-field", "--input"):
+        if a.startswith(f + "="):
+            return True, a[len(f) + 1:]
+    for f in ("-f", "-F"):
+        if a.startswith(f) and len(a) > 2:
+            v = a[2:]
+            return True, v[1:] if v.startswith("=") else v
+    return False, None
 
 
 def api_is_mutating(argv):
@@ -455,7 +883,7 @@ def api_is_mutating(argv):
             method = a.split("=", 1)[1].upper()
         elif a.startswith("-X") and len(a) > 2:
             method = a[2:].upper()
-        elif a in DATA_FLAGS or any(a.startswith(f + "=") for f in DATA_FLAGS if f.startswith("--")):
+        elif _data_flag_value(a)[0]:
             has_data = True
         i += 1
     if method:
@@ -770,8 +1198,14 @@ PASS_CACHE_MAX_BYTES = cfg_int("GH_LIMIT_PASS_CACHE_MAX_BYTES", 64 * 1024 * 1024
 
 def pass_cache_enabled():
     """Is the feature on at all? Read-only — no directory work, because this is asked once per
-    invocation on a path that also handles `gh auth token`."""
-    return bool(cfg(PASS_CACHE_ENV, ""))
+    invocation on a path that also handles `gh auth token`.
+
+    ⛔ `0` IS OFF. The value is a DIRECTORY, so this used to be `bool(value)` — which made the
+    documented disable (`GH_LIMIT_PASS_CACHE=0`) ENABLE the cache and create a directory literally
+    named `0` in the caller's CWD. A switch that does the opposite of what it says is worse than no
+    switch: an operator who turned the cache off kept writing to disk."""
+    raw = cfg(PASS_CACHE_ENV, "").strip()
+    return bool(raw) and raw != "0"
 
 
 def pass_cache_dir():
@@ -779,7 +1213,7 @@ def pass_cache_dir():
     that only exports the name still gets a working cache; ANY inability to use it is returned as
     None (a broken cache must never break the call)."""
     d = cfg(PASS_CACHE_ENV, "")
-    if not d:
+    if not d or d.strip() == "0":
         return None
     try:
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -797,8 +1231,10 @@ def pass_cache_eligible(gh_argv):
     if is_mutating(gh_argv):
         return False
     if gh_argv[0] == "api":
-        rest = [a for a in gh_argv[1:] if not a.startswith("-")]
-        if rest and rest[0].split("?")[0] in ("rate_limit", "rate_limit/"):
+        ep = api_endpoint(gh_argv)
+        if ep is None:
+            return False            # unattributable: not memoised either (a meter must be able to move)
+        if ep.split("?")[0].strip("/").lower() == "rate_limit":
             return False
     return True
 
@@ -815,7 +1251,11 @@ def pass_cache_key(gh_argv):
         cwd = os.getcwd()
     except OSError:
         cwd = ""
-    parts = [host, _cred_digest(), cwd] + list(gh_argv)
+    # ⛔ `GH_REPO` IS PART OF THE IDENTITY HERE TOO (`#2243` review round 7): gh resolves a
+    # `--repo`-less call from `--repo` > `GH_REPO` > the cwd remote, and substitutes `{owner}`/`{repo}`
+    # in an `api` endpoint from the same place — so the cwd pin alone lets two GH_REPO values share a
+    # memoised answer.
+    parts = [host, os.environ.get("GH_REPO") or "", _cred_digest(), cwd] + list(gh_argv)
     return hashlib.sha256("\x00".join(parts).encode("utf-8", "surrogateescape")).hexdigest()[:40]
 
 
@@ -891,8 +1331,771 @@ class _StreamCapture(object):
         return self.buffer.getvalue()
 
 
+# ── SINGLE FLIGHT: identical concurrent READS share ONE load (agent-infra#2243) ─────────────────
+# WHY THIS LAYER EXISTS AT ALL. `acquire_lock` makes the box's `gh` traffic SERIAL, which #1988/#2005
+# decided and this section does not revisit. Serialisation says who goes next; it says nothing about
+# whether the next request is the SAME request. Thirteen lanes reading `repos/o/r/pulls/9426` ran it
+# thirteen times — the last lane waiting for the twelve before it — to produce one answer the first
+# call already had. Measured on one box, one account, 2026-10-21: 0.676 s at 3 lane processes, 63 s
+# at 13, while a raw `curl https://api.github.com/rate_limit` took 0.091 s on 4658/5000 quota. The
+# cost was OURS.
+#
+# So: request coalescing (single flight), in the form the research converged on, with each piece
+# named where it lives:
+#
+#   * ONE IN-FLIGHT LOAD PER KEY (`flight_key`). The key is the NORMALISED REQUEST — the endpoint,
+#     the argv, the host, the credential digest and the cwd repo pin — never the whole command line.
+#     Only decorations that CANNOT change the answer are dropped (`normalised_request`); anything
+#     that can (`--json`, `--jq`, `--paginate`, `--limit`, `-H`, `?query`) stays in the key verbatim,
+#     because a key that dropped one would replay another request's body with rc 0 — the wrong-answer
+#     class every other key in this file already refuses.
+#   * A BOUNDED WAIT (`GH_LIMIT_FLIGHT_WAIT`, default 5 s — Nginx's own `proxy_cache_lock_timeout`
+#     default). Past the bound a waiter returns a DISTINCT `busy` outcome naming the holder's AGE and
+#     exits 75 (`EX_TEMPFAIL`). It never inherits an unbounded queue: "bounded" cannot mean "bounded
+#     in the other queue".
+#   * FAILURES ARE SHARED, NEVER LAUNDERED. The leader publishes its exit code beside its bytes, so
+#     a follower leaves with the LEADER'S code and error. A fake success is the one thing a follower
+#     may never report (Go's singleflight shares the error for the same reason).
+#   * MUTATIONS ARE NEVER COALESCED (`flight_eligible`). Two callers asking for a merge are two
+#     merges; coalescing one would DROP it — a lost merge is not a latency bug. `auth` is excluded
+#     too (its stdout is the credential, and this runs through files on disk), and so is `/rate_limit`
+#     (the pass's own meter: a shared meter cannot move).
+#   * STALE IS LABELLED, NEVER PRESENTED AS CURRENT. A previous answer still on record while a
+#     refresh is in flight may be served instead of waiting — but only when the CALLER asks
+#     (`GH_LIMIT_FLIGHT_STALE_SERVE=1`; off by default because the label is a stderr write and the
+#     harness's callers merge stderr into the bytes they parse), and then the age goes on stderr.
+#   * A STALLED HOLDER CANNOT HOLD THE KEY. Nginx `proxy_cache_lock_age`: a leader whose pid is gone,
+#     or whose claim is older than `GH_LIMIT_FLIGHT_LEADER_MAX_AGE`, is taken over by the next waiter,
+#     so a dead leader is a retry rather than a deadlock. The leader unlinks its claim in a `finally`
+#     and `prune_flights` sweeps one a killed leader left behind — no orphan lock file survives.
+#
+# ⛔ WHAT THIS IS NOT: a cache. A follower shares only a result that COMPLETED AFTER IT ARRIVED, so
+# this path can never hand out an old answer as a fresh one. The ETag cache is the cache and it is
+# untouched; the result file is kept only for `GH_LIMIT_FLIGHT_KEEP_S` so the stale-while-refresh
+# path above has something to offer and an operator has evidence.
+FLIGHT_ENV = "GH_LIMIT_FLIGHT"
+FLIGHT_WAIT = cfg_secs("GH_LIMIT_FLIGHT_WAIT", 5.0, 0.1, 300)              # nginx proxy_cache_lock_timeout
+FLIGHT_LEADER_MAX_AGE = cfg_secs("GH_LIMIT_FLIGHT_LEADER_MAX_AGE", 120, 2, 3600)  # proxy_cache_lock_age
+FLIGHT_KEEP_S = cfg_secs("GH_LIMIT_FLIGHT_KEEP_S", 30, 0, 3600)
+FLIGHT_STALE_SERVE = cfg_int("GH_LIMIT_FLIGHT_STALE_SERVE", 0, 0, 1)
+FLIGHT_STALE_MAX_AGE = cfg_secs("GH_LIMIT_FLIGHT_STALE_MAX_AGE", 30, 1, 3600)
+FLIGHT_MAX_ENTRY = cfg_int("GH_LIMIT_FLIGHT_MAX_ENTRY", 4 * 1024 * 1024, 1024, 1 << 30)
+FLIGHT_POLL_S = 0.02
+# EX_TEMPFAIL, the same "retry later" code the give-up path's callers already know. DISTINCT from
+# every answer and from every refusal this layer produces, because "busy" is neither.
+BUSY_EXIT = 75
+
+
+# Flags of `gh api` whose NEXT argv token is a VALUE (never the endpoint), and the ones that stand
+# alone. Both sets exist for `api_endpoint` below — see the ⛔ there.
+API_VALUE_FLAGS = frozenset(METHOD_FLAGS) | frozenset(DATA_FLAGS) | frozenset({
+    "-H", "--header", "--hostname", "-t", "--template", "-q", "--jq", "--cache", "--cache-ttl",
+    "-p", "--preview",
+})
+API_BARE_FLAGS = frozenset({
+    "-i", "--include", "--paginate", "--slurp", "--silent", "--silent-errors", "--verbose",
+})
+
+
+def api_endpoint(gh_argv):
+    """The ENDPOINT of a `gh api …` invocation, or None when it cannot be attributed with certainty.
+
+    ⛔ "THE FIRST TOKEN THAT DOES NOT START WITH `-`" IS A FLAG'S VALUE. `gh api -H 'Accept: x' graphql
+    -f 'query=mutation { … }'` makes that scan answer `Accept: x`: the GRAPHQL routing is skipped, the
+    call looks like a plain REST read, and the gate that must inspect a GraphQL payload is bypassed —
+    a LOST MUTATION, reached by a route the tests that fed the gate a bare `api graphql …` never
+    exercised (review round 3). The same scan was wrong in `bucket_for` (a `gh api -H … graphql`
+    refusal was pinned on the `core` pool), in `makes_request` (a `-H`-prefixed `/rate_limit` counted
+    as recovery evidence) and in `pass_cache_eligible` (it could be MEMOISED, freezing the meter), so
+    all four now share THIS function.
+
+    A flag we do not know how to consume returns None, and every caller treats None as the
+    conservative answer (not coalesced, not memoised, `core`), because a mis-attributed endpoint is
+    how this class came back."""
+    i = 1
+    while i < len(gh_argv):
+        a = gh_argv[i]
+        if a == "--":
+            i += 1
+            continue
+        if a in API_VALUE_FLAGS:
+            i += 2                          # the flag AND its value are not the endpoint
+            continue
+        if a in API_BARE_FLAGS:
+            i += 1
+            continue
+        if "=" in a and a.split("=", 1)[0] in API_VALUE_FLAGS:
+            i += 1                          # `--jq=…` / `--method=GET`: one token, no separate value
+            continue
+        if a.startswith("-X") or a.startswith("--method=") or a.startswith("--"):
+            if a.startswith("-X") and len(a) > 2:
+                i += 1                      # `-XGET`: attached method, no separate value
+                continue
+            if a.startswith("--method="):
+                i += 1
+                continue
+            return None                     # an unknown flag: we cannot say what the next token is
+        if a.startswith("-"):
+            return None
+        return a
+    return None
+
+
+def flight_enabled():
+    return cfg(FLIGHT_ENV, "1") != "0"
+
+
+def _now():
+    """REAL wall clock for the flight ledger — deliberately NOT `clock()`.
+
+    ⛔ THE FAKE-CLOCK SEAM IS FOR THE DOCUMENTED WAITS. `GH_LIMIT_NOW_CMD` exists so a test can assert
+    a 60/120/240 s backoff without sleeping it. The flight ledger instead measures how long a LIVE
+    process has been on a key and how old an answer is — and BOTH are safety labels: a stale answer
+    must never read as current, and a stalled holder must be visible with its age. Making those
+    fudgeable from the environment would let a knob make a fresh answer look stale (or a stale one
+    look fresh), which is the exact failure the labels exist to prevent. So the ledger is real time,
+    and the price is that a test asserting an AGE waits for it."""
+    return time.time()
+
+
+# ⛔ COALESCING NEEDS A FAIL-CLOSED GATE, AND THAT IS THE OPPOSITE DIRECTION FROM `is_mutating`'s.
+# `MUTATING_PAIRS` says of itself that it "errs wide rather than narrow" because mistaking a READ for a
+# mutation costs one wasted 1 s pace — cheap. Reused as the coalescing gate, the same widening is not
+# cheap at all: an unlisted MUTATING subcommand (`gh run delete`, `gh secret set`, `gh repo create`,
+# `gh workflow disable`, `gh issue lock`, …) would read as a read, two concurrent identical calls would
+# collapse into ONE, and the second would be handed the first one's rc 0 — a LOST mutation. (Found in
+# review: the pacing predicate is deliberately permissive, so it can never be the coalescing one.)
+# So this is a READ allowlist: a subcommand not named here is simply not coalesced (it runs serialised
+# exactly as before — no regression, no lost effect), and `api graphql` additionally requires a payload
+# that is PROVABLY a query.
+FLIGHT_READ_PAIRS = {
+    # ⛔ THE CRITERION IS "STDOUT IS THE WHOLE OBSERVABLE RESULT", not "it does not take a method". A
+    # command with a LOCAL SIDE EFFECT cannot be coalesced even when it looks like a read: `gh run
+    # download` writes artifact files into the CWD, so a follower would be handed the leader's rc 0
+    # while its own files were never fetched (review round 6 removed it). Anything whose effect is not
+    # in the bytes must run serialised, exactly as before.
+    ("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "checks"), ("pr", "status"),
+    ("issue", "view"), ("issue", "list"), ("issue", "status"),
+    ("repo", "view"), ("repo", "list"),
+    ("run", "view"), ("run", "list"),
+    ("workflow", "view"), ("workflow", "list"),
+    ("release", "view"), ("release", "list"),
+    ("label", "list"), ("cache", "list"), ("secret", "list"), ("variable", "list"),
+    ("search", "code"), ("search", "commits"), ("search", "issues"), ("search", "prs"),
+    ("search", "repos"),
+}
+# GraphQL's own grammar: a payload that starts with `query` or with `{` (the unnamed-query shorthand) is
+# a read. `mutation`, `subscription`, a fragment-only document and anything we cannot see are not.
+GRAPHQL_READ_RE = re.compile(r"^\s*(query\b|\{)")
+
+
+def _graphql_query_is_read(gh_argv):
+    """Is this `gh api graphql` invocation PROVABLY a query? Fail-closed, deliberately.
+
+    ⛔ `api_is_mutating` RETURNS FALSE FOR EVERY `gh api graphql` CALL and states why: for PACING the
+    cheap direction is to treat a GraphQL payload as a read (a false mutation costs a 1 s gap). That
+    reasoning inverts under coalescing — a GraphQL MUTATION treated as a read is two concurrent
+    identical mutations collapsed into one, i.e. one of them never happens. So the payload is read
+    here: only a `query` document or the `{ … }` shorthand qualifies; `mutation`/`subscription`, a
+    `--input` file and a `-F query=@file` we cannot inspect are all NOT-a-read.
+    """
+    seen = []
+    i = 0
+    while i < len(gh_argv):
+        a = gh_argv[i]
+        if a == "--input" or a.startswith("--input="):
+            return False                    # the payload is a FILE: not visible, so not provable
+        if a in DATA_FLAGS and i + 1 < len(gh_argv):
+            val, i = gh_argv[i + 1], i + 2
+        else:
+            is_data, attached = _data_flag_value(a)
+            if not is_data or attached is None:
+                i += 1
+                continue
+            val, i = attached, i + 1
+        if val.startswith(("mutation=", "subscription=")):
+            return False
+        if val.startswith("operationName="):
+            # ⛔ A MULTI-OPERATION DOCUMENT CAN SELECT A MUTATION BY NAME. `query Foo { … } mutation M { … }`
+            # with `-f operationName=M` is a MUTATION whose payload STARTS with `query`, so a
+            # leading-keyword test alone called it a read and coalesced it — the round-6/7 class again
+            # (review round 7). A named operation is therefore not provable either way.
+            return False
+        if val.startswith("query="):
+            seen.append(val.split("=", 1)[1])
+    if not seen:
+        return False                        # no payload we can judge (e.g. `-F query=@file`)
+    # ⛔ "STARTS WITH `query`" IS NOT ENOUGH: a document may carry SEVERAL operations. Any
+    # `mutation`/`subscription` anywhere in it means the executed operation is not provably a read
+    # (and with no `operationName` gh executes the FIRST, which such a document may still make a
+    # mutation if it is written `query … mutation …` — the keyword test below is the cheap, sound half).
+    if any(re.search(r"\b(mutation|subscription)\b", q) for q in seen):
+        return False
+    return all(GRAPHQL_READ_RE.match(q) for q in seen)
+
+
+def flight_eligible(gh_argv):
+    """May THIS invocation be shared with an identical caller already in flight?"""
+    if not flight_enabled() or not gh_argv:
+        return False
+    if os.environ.get(REENTRANCY_ENV):
+        # ⛔ A NESTED CALL IS NEVER A DUPLICATE OF ITS PARENT. A gh child that re-enters this helper
+        # would wait for the flight ITS OWN PARENT is leading, which cannot finish until the child
+        # returns — the bound would turn that into a spurious `busy` on every nested call. Same rule
+        # as `acquire_lock`, for the same reason.
+        return False
+    if gh_argv[0] == "auth":
+        return False            # its stdout IS the credential — never into a file that outlives the call
+    if not makes_request(gh_argv):
+        return False            # nothing to share (`gh --version`, `gh help`) — and no file written for it
+    if gh_argv[0] == "api":
+        ep = api_endpoint(gh_argv)
+        if ep is None:
+            return False        # an argv we cannot attribute: FAIL CLOSED (never coalesced)
+        if ep.strip("/").lower() == "rate_limit":
+            return False        # the pass's own budget METER: a shared meter cannot see the last call
+        if api_is_mutating(gh_argv):
+            return False        # a non-GET method, or a data-carrying call gh infers POST for
+        if ep.strip("/").lower() == "graphql":
+            return _graphql_query_is_read(gh_argv)
+        return True
+    # ⛔ FAIL CLOSED FOR SUBCOMMANDS TOO: only an allowlisted READ pair is coalesced. `is_mutating` is
+    # the PACING predicate and errs wide by design; this direction cannot afford that (see the comment
+    # on FLIGHT_READ_PAIRS — an unlisted mutation would be silently dropped).
+    return len(gh_argv) >= 2 and (gh_argv[0], gh_argv[1]) in FLIGHT_READ_PAIRS
+
+
+def normalised_request(gh_argv):
+    """argv with ONLY the decorations that provably cannot change the answer removed.
+
+    ⛔ NOTHING ELSE IS DROPPED, AND THAT IS THE SAFETY RULE. `--json`, `--jq`, `-q`, `--limit`,
+    `--paginate`, `--slurp`, `-i`, `-H` and a `?query` in the path each change the bytes the caller
+    receives, so a key that ignored one would hand a caller ANOTHER request's answer with rc 0 (the
+    #1959/#1981 class). ⛔ AND `--` IS KEPT: after it a positional may legitimately START WITH `-`
+    (`gh search code -- '--owner=x'` is a literal-text search, while `gh search code --owner=x` is an
+    owner filter), so dropping it made two different requests share a key (review round 7). The one
+    decoration that provably cannot change the answer is an explicit `-X GET` / `--method GET` on a
+    call carrying NO data fields (gh infers GET there anyway). With data fields present the flag is
+    KEPT — and such a call is not eligible at all, because a data-carrying `gh api` is a mutation to
+    this file (`api_is_mutating`)."""
+    has_data = any(_data_flag_value(a)[0] for a in gh_argv)
+    out = []
+    i = 0
+    while i < len(gh_argv):
+        a = gh_argv[i]
+        if not has_data:
+            if a in METHOD_FLAGS and i + 1 < len(gh_argv) and gh_argv[i + 1].strip().upper() == "GET":
+                i += 2
+                continue
+            if a.startswith("--method=") and a.split("=", 1)[1].strip().upper() == "GET":
+                i += 1
+                continue
+            if a.startswith("-X") and len(a) > 2 and a[2:].strip().upper() == "GET":
+                i += 1
+                continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def flight_key(gh_argv):
+    """The NORMALISED REQUEST: host + credential + the cwd repo pin + endpoint + argv.
+
+    All four decorations are here for the reasons the ETag key already states them: a GHES host or a
+    second credential yields a DIFFERENT representation for the same argv, and a `--repo`-less
+    subcommand resolves its repository from the CWD, so two checkouts of two repos issue an identical
+    argv that must not share an answer."""
+    toks = normalised_request(gh_argv)
+    lead = _leading_tokens(toks)
+    endpoint = lead[1] if len(lead) > 1 and lead[0] == "api" else ""
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    # ⛔ `GH_REPO` IS PART OF THE IDENTITY. gh resolves a `--repo`-less call from `--repo` > `GH_REPO` >
+    # the cwd's remote, and it substitutes `{owner}`/`{repo}`/`{branch}` in an `api` endpoint from the
+    # same source — so two processes in the SAME cwd with DIFFERENT `GH_REPO` issue different requests
+    # that the cwd pin alone cannot tell apart (the wrong-repo class this key exists to prevent, found
+    # in review round 7). `GH_HOST` is here for the identical reason.
+    parts = [os.environ.get("GH_HOST") or "", os.environ.get("GH_REPO") or "", _cred_digest(), cwd,
+             endpoint] + toks
+    return hashlib.sha256("\x00".join(parts).encode("utf-8", "surrogateescape")).hexdigest()[:40]
+
+
+def flight_dir():
+    d = os.path.join(state_dir(), "flights")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    return d
+
+
+def _read_json(path):
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _holder_dead(meta):
+    """Is the leader's PROCESS gone? An unknown pid proves nothing (the age bound then decides) —
+    and `os.kill` is not arbitrary-precision, so a junk pid in a hand-edited claim is refused rather
+    than raised out of every gh call on the box (the same trap `_dead_writer` documents)."""
+    pid = meta.get("pid") if isinstance(meta, dict) else None
+    if not isinstance(pid, int) or not (0 < pid < 1 << 22) or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+        return False
+    except OverflowError:
+        return False
+    except OSError as exc:
+        return exc.errno != errno.EPERM
+
+
+def flight_claim(key, gh_argv):
+    """Become the leader for `key`. Returns `("leader", path, meta)`, `("held", None, None)` when
+    another caller holds the key, or `("error", None, None)` when the claim could not even be
+    attempted.
+
+    ⛔ ONE ATOMIC CREATE IS THE CLAIM. Write-then-rename would let two callers both believe they won,
+    which is two leaders for one key and exactly the duplicate work this section removes.
+
+    ⛔ AND THE THREE OUTCOMES ARE DISTINCT ON PURPOSE. `held` means WAIT for that peer; `error` means
+    the flight directory itself is unusable (unwritable, full, gone), where waiting would turn a
+    broken cache dir into a slow failure on every eligible call and flying unshared is the honest
+    degradation. Collapsing them into a `None` plus a later `os.path.exists` test loses the
+    distinction exactly when it bites: a peer that finishes between the failed create and the
+    existence check then reads as "no directory", and the duplicate request comes straight back."""
+    d = flight_dir()
+    if d is None:
+        return "error", None, None
+    path = os.path.join(d, key + ".leader")
+    started = _now()
+    meta = {"pid": os.getpid(), "started_at": started,
+            # ⛔ EVERY CLAIM CARRIES ITS OWN IDENTITY, so a later step can ask "is the file on disk
+            # still MINE?" before removing it. Without it a leader whose key was taken over unlinks
+            # its SUCCESSOR's claim in its own `finally` (the cascade in review round 2), and a
+            # takeover cannot tell the claim it judged from the one that replaced it.
+            "flight": "%d@%.3f@%s" % (os.getpid(), started, os.urandom(4).hex()),
+            "request": _flight_label(gh_argv)}
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return "held", None, None
+    except OSError:
+        return "error", None, None
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(meta, fh)
+    except OSError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return "error", None, None
+    return "leader", path, meta
+
+
+def flight_publish(key, meta, rc, out, err):
+    """Publish THIS flight's outcome — its bytes AND its exit code, a failure included."""
+    d = flight_dir()
+    if d is None:
+        return False
+    size = len(out) + len(err)
+    if size > FLIGHT_MAX_ENTRY:
+        # Too big to share. Publishing nothing makes the waiters take the key over and run the call
+        # themselves (serialised by the lock, as before) — the honest degradation, and stated here so
+        # a 4 MiB read never turns into a silent `busy`.
+        log_event("single-flight: `%s` produced %dB — too large to share; waiters take the key over"
+                  % (meta.get("request", ""), size))
+        return False
+    path = os.path.join(d, key + ".json")
+    tmp = path + ".tmp-%d" % os.getpid()
+    rec = {"flight": meta.get("flight") or "%d@%.3f" % (meta["pid"], meta["started_at"]),
+           "request": meta.get("request", ""),
+           "started_at": meta["started_at"], "finished_at": _now(), "rc": rc,
+           "out_b64": base64.b64encode(out).decode("ascii"),
+           "err_b64": base64.b64encode(err).decode("ascii")}
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(rec, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def flight_result(d, key):
+    """The last PUBLISHED outcome for `key`, with its completion time, or None. A corrupt or
+    half-written entry is a miss, never an error."""
+    rec = _read_json(os.path.join(d, key + ".json"))
+    if rec is None:
+        return None
+    try:
+        return {"rc": int(rec["rc"]),
+                "out": base64.b64decode(rec["out_b64"].encode("ascii")),
+                "err": base64.b64decode(rec["err_b64"].encode("ascii")),
+                "started_at": float(rec.get("started_at") or 0),
+                "finished_at": float(rec["finished_at"]),
+                "request": rec.get("request", "")}
+    except (KeyError, TypeError, ValueError, binascii.Error):
+        return None
+
+
+def _leading_tokens(gh_argv, cap=3):
+    """The leading NON-FLAG tokens of an argv, stopping at the FIRST flag.
+
+    ⛔ THIS IS THE ONLY SAFE WAY TO NAME A REQUEST. A "first positional" scan takes a flag's VALUE
+    (`gh api -H 'Authorization: Bearer …' repos/o/r` has `Authorization: Bearer …` as its first
+    non-dash token), so a human-readable label built that way would write a credential wherever the
+    label goes — the claim file, the result file and `events.log`. Stopping at the first flag makes
+    that impossible by construction, while `gh api repos/o/r/pulls/9426` (no flags) still reads
+    exactly as an operator expects."""
+    out = []
+    for a in gh_argv:
+        if a.startswith("-"):
+            break
+        out.append(a)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _flight_label(gh_argv):
+    """A request name that is SAFE TO PERSIST: the subcommand and the leading positionals, never a
+    flag or a flag's value. This label is written to the claim file, to the result file (which
+    outlives the call by `GH_LIMIT_FLIGHT_KEEP_S`) and to `events.log` — the ETag cache stores only a
+    digest for precisely this reason, and a label must not undo what the key protects."""
+    return ("gh " + " ".join(_leading_tokens(gh_argv)))[:120].strip()
+
+
+def _leader_stale(meta, path, now):
+    """Has the holder given up on the key? Gone (a kill, a crash, a power loss) or older than the age
+    bound.
+
+    ⛔ AN UNREADABLE OR UNATTRIBUTABLE CLAIM IS JUDGED BY ITS MTIME — it must not be declared stale on
+    sight (a leader that has just created the file is alive and about to write it, and stealing its
+    key would run the request twice), and it must not be immortal either. A leader killed between
+    `os.open(O_EXCL)` and its `json.dump` leaves a ZERO-LENGTH claim, and one that is never removed
+    holds that key for every later caller: the orphan lock file #2243 forbids. A parsed claim whose
+    pid is not a live int AND whose `started_at` is unusable is in the same class, so it falls back
+    to the file's age too."""
+    started = 0.0
+    if isinstance(meta, dict):
+        try:
+            started = float(meta.get("started_at") or 0)
+        except (TypeError, ValueError):
+            started = 0.0
+        if _holder_dead(meta):
+            return True
+    if started > 0:
+        return (now - started) > FLIGHT_LEADER_MAX_AGE
+    try:
+        return (now - os.path.getmtime(path)) > FLIGHT_LEADER_MAX_AGE
+    except OSError:
+        return True
+
+
+def _take_over(leader_path, judged):
+    """Atomically REMOVE a stale claim, so exactly ONE waiter can then claim the key.
+
+    ⛔ `os.rename` IS THE COMPARE-AND-SWAP. Unlink-then-create is two steps, and in the microseconds
+    between them a peer that has just claimed is deleted by the loser — two leaders for one key, i.e.
+    the duplicate load this whole section exists to remove (review round 2, found in exactly the
+    burst this feature targets). A rename of the SAME path is atomic: the first waiter moves the
+    stale claim aside and the second gets ENOENT and simply loses the race; `flight_claim`'s O_EXCL
+    then decides which of them leads.
+
+    ⛔ AND A CLAIM WE DID NOT JUDGE IS PUT BACK, NOT DESTROYED. `os.link` restores it WITHOUT clobbering
+    a third claim (a plain rename back could), and if a third claim is already there (EEXIST) the moved
+    file is LEFT for the reaper rather than unlinked — destroying a live peer's claim is the one
+    outcome this function must not produce.
+
+    ⛔ "DID WE MOVE THE CLAIM WE JUDGED?" IS AN IDENTITY TEST, NOT "is one of them readable". The
+    first version only restored when BOTH sides parsed (`judged_id and moved is a dict and ids
+    differ`), so two cases still deleted a live peer's claim (review round 5): we judged an UNREADABLE
+    claim and a peer had since written a good one, or we judged a good one and a peer had since
+    written an unreadable one. Identity now means "both unreadable" or "both readable with the SAME
+    flight id"; anything else is a claim we did not judge."""
+    aside = leader_path + ".stale-%d" % os.getpid()
+    try:
+        os.rename(leader_path, aside)
+    except OSError:
+        return False                    # someone else moved it first: we lost, just wait for them
+    moved = _read_json(aside)
+    # "Is the file still EXACTLY the claim I judged?" — content identity, not "do the ids match". The
+    # flight id is the claim's own name, but a claim can legitimately arrive without one (a hand-written
+    # or older claim is still judged stale by pid/age), and comparing the id alone then answered
+    # "not mine" for a claim we HAD judged — leaving a dead holder's key unreleased for ever (caught by
+    # the dead-pid fixture). Equality of the parsed claim answers both questions at once: unchanged ⇒ it
+    # is ours to remove; anything else ⇒ a peer replaced it, so restore.
+    same = judged == moved
+    if same:
+        try:
+            os.unlink(aside)
+        except OSError:
+            pass
+        return True                     # the claim we judged: it IS stale, so the key is free
+    try:
+        os.link(aside, leader_path)     # atomic: refuses to clobber a third claim
+        os.unlink(aside)
+    except OSError:
+        pass                            # EEXIST: a third claim is live — leave the aside to the reaper
+    return False                        # a claim we did not judge: a live peer owns the key, back off
+
+
+def _unlink_claim(leader_path, flight_id):
+    """Remove the claim at `leader_path` ONLY IF it is provably OURS (`flight_id`).
+
+    ⛔ A LEADER MUST NOT UNLINK ITS SUCCESSOR'S CLAIM. When a stale claim is taken over, the old
+    leader may still be running; its `finally` would otherwise delete the new leader's claim and a
+    third caller could claim concurrently — the same double-lead, reached from the other side.
+
+    ⛔ AND AN UNREADABLE FILE IS NOT "OURS BY DEFAULT". The first version unlinked whenever the read
+    came back None, which includes a SUCCESSOR's claim inside its own `os.open(O_EXCL)` → `json.dump`
+    window: the successor then writes to an orphaned inode and a third caller claims concurrently
+    (review round 6). Removal now requires a POSITIVE identity match; anything else is left to
+    `_leader_stale` / `prune_flights`, which reclaim by age."""
+    cur = _read_json(leader_path)
+    if not (isinstance(cur, dict) and flight_id and cur.get("flight") == flight_id):
+        return False
+    try:
+        os.unlink(leader_path)
+        return True
+    except OSError:
+        return False
+
+
+def prune_flights(d):
+    """Keep the flight directory bounded, and collect what a KILLED leader left behind: its claim
+    (the orphan lock file #2243 forbids) and a staging file whose writer is gone."""
+    if not d:
+        return
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    now = _now()
+    for n in names:
+        fp = os.path.join(d, n)
+        try:
+            if ".tmp-" in n or ".stale-" in n:
+                # A staging file or a moved-aside claim: ours only to collect once its writer is gone
+                # (`_take_over` removes its own aside on the normal path, so this is the crash half).
+                if _dead_writer(fp):
+                    os.unlink(fp)
+                continue
+            if ".leader" in n:
+                # ⛔ ONE READ FEEDS BOTH THE VERDICT AND `_take_over`'s IDENTITY. Reading twice let a
+                # peer's fresh claim land between them: the staleness verdict used the OLD claim while
+                # `_take_over` judged (and so removed) the NEW one — a live peer's claim destroyed by
+                # the reaper (review round 6).
+                judged = _read_json(fp)
+                if _leader_stale(judged, fp, now):
+                    _take_over(fp, judged)
+                continue
+            if n.endswith(".json"):
+                rec = _read_json(fp)
+                try:
+                    fin = float((rec or {}).get("finished_at") or 0)
+                except (TypeError, ValueError):
+                    fin = 0.0
+                if not fin or (now - fin) > FLIGHT_KEEP_S:
+                    os.unlink(fp)
+        except OSError:
+            continue
+
+
+def _run_captured(real_gh, gh_argv):
+    """`_dispatch` with BOTH streams captured, returning (rc, out, err) — the caller's own bytes.
+    Two separate captures, never one shared object: merging them here would break every caller that
+    redirects stderr to a file and parses stdout as JSON (the rule `_StreamCapture` states)."""
+    cap_out, cap_err = _StreamCapture(), _StreamCapture()
+    saved = (sys.stdout, sys.stderr)
+    sys.stdout, sys.stderr = cap_out, cap_err
+    try:
+        rc = _dispatch(real_gh, gh_argv)
+    finally:
+        sys.stdout, sys.stderr = saved
+        out, err = cap_out.getvalue(), cap_err.getvalue()
+    return rc, out, err
+
+
+def _emit_streams(rc, out, err):
+    """Write captured bytes to the caller exactly as the child produced them — never one stream
+    without the other, and never an added line."""
+    if out:
+        sys.stdout.buffer.write(out)
+    if err:
+        sys.stderr.buffer.write(err)
+    return rc
+
+
+def _lead(real_gh, gh_argv, key, claimed):
+    """Perform the shared load (this process is the leader for `key`), publish it, release the key."""
+    path, meta = claimed
+    try:
+        rc, out, err = _run_captured(real_gh, gh_argv)
+        flight_publish(key, meta, rc, out, err)
+        return rc, out, err
+    finally:
+        # ⛔ THE LEADER ALWAYS RELEASES ITS OWN KEY: a failed publish, an exception, any exit path. A
+        # claim left behind is an orphan lock file, and waiters would spend their whole bound on a
+        # holder that has already gone. `_unlink_claim` keeps that from becoming the OPPOSITE bug —
+        # deleting a successor's claim after a takeover.
+        _unlink_claim(path, meta.get("flight"))
+        prune_flights(os.path.dirname(path))
+
+
+def _busy(gh_argv, leader, age, budget):
+    """The DISTINCT outcome of a waiter whose bound expired: not an answer, and never a QUOTA refusal.
+
+    ⛔ THE WORDS "rate limit" MAY NOT APPEAR, NOT EVEN NEGATED. `scripts/objective.py` classifies a gh
+    failure with `TRANSPORT_MARKERS`, a plain substring scan whose first entry is `"rate limit"`
+    (`_note_gh_failure` then records `RATE-LIMITED`). "This is NOT a rate limit" CONTAINS the marker,
+    so a `busy` — the one outcome this layer says is deliberately not a refusal — was classified as a
+    limit and the fleet waited out a quota that was never exhausted (review round 6). The message
+    therefore says `quota`, and the test asserts the ABSENCE of the classifier's marker rather than the
+    presence of a parenthesis."""
+    req = (leader or {}).get("request") or _flight_label(gh_argv)
+    who = ("pid %s" % leader.get("pid")) if leader else "an unreadable holder"
+    aged = ("%ds in flight" % age) if age >= 0 else "of unknown age"
+    msg = ("gh-limit: BUSY single-flight — `%s` is being loaded by %s, %s, and this caller's "
+           "bound is %.1fs. This is NOT an answer and NOT quota exhaustion: retry.\n"
+           % (req, who, aged, budget))
+    log_event("single-flight: BUSY after %.1fs for `%s` (holder=%s age=%ds)" % (budget, req, who, age))
+    return BUSY_EXIT, b"", msg.encode()
+
+
+def single_flight(real_gh, gh_argv):
+    """One load per key, shared by every identical caller in flight. Returns (rc, out, err).
+
+    THREE outcomes, all distinct: the answer (own or the leader's), the LEADER'S FAILURE (his exit
+    code and his error — never a success he did not have), or BUSY (exit 75 and the holder's age)
+    when the bound expires."""
+    key = flight_key(gh_argv)
+    d = flight_dir()
+    if d is None:
+        # A state dir that cannot hold flights must not fail a gh call — but it must not silently
+        # claim the call was shared either: `state_dir()` has already announced the degraded dir, and
+        # this line names the consequence for THIS call.
+        log_event("single-flight: no usable %s — this call runs UNSHARED"
+                  % os.path.join(state_dir(), "flights"))
+        return _run_captured(real_gh, gh_argv)
+    leader_path = os.path.join(d, key + ".leader")
+    # ⛔ A BOUNDED CALLER MUST NOT DIE IN THIS QUEUE EITHER. `GH_LIMIT_NO_WAIT` bounds the backoff and
+    # the lock; the flight wait is the third wait this layer imposes, so it takes the same budget rule
+    # (`acquire_lock`), or a bounded caller's flight wait outlives the caller it is trying to help.
+    budget = min(FLIGHT_WAIT, NO_WAIT_LOCK_S) if NO_WAIT else FLIGHT_WAIT
+    t_arrive = _now()                          # arrival, from the same real clock as the records
+    deadline = time.monotonic() + budget        # real monotonic: the BOUND is not the ledger's clock
+    while True:
+        res = flight_result(d, key)
+        if res is not None and res["finished_at"] >= t_arrive:
+            # ⛔ ONLY A FLIGHT THAT COMPLETED AFTER THIS CALLER ARRIVED IS SHARED. An older result is
+            # a cache entry, and this is not a cache: handing one out as current is the exact failure
+            # #2243 clause 5 forbids.
+            log_event("single-flight: shared the in-flight answer for `%s` (rc=%d)" % (res["request"], res["rc"]))
+            return res["rc"], res["out"], res["err"]
+        leader = _read_json(leader_path)
+        # ⛔ A MISSING CLAIM IS NOT A STALE ONE. `_leader_stale(None, …)` answers True for an absent
+        # path (getmtime raises), and an UNCONDITIONAL unlink on that verdict is itself a race: a peer
+        # can create the claim between the check and the unlink, and the loser then deletes the
+        # WINNER's fresh claim — two leaders for one key, which is the duplicate load this exists to
+        # remove (review round 2). Absent ⇒ claim directly, remove nothing.
+        if leader is None and not os.path.exists(leader_path):
+            how, claim_path, claim_meta = flight_claim(key, gh_argv)
+            if how == "leader":
+                return _lead(real_gh, gh_argv, key, (claim_path, claim_meta))
+            if how == "error":
+                # The directory cannot hold a claim at all — waiting the bound for a leader that can
+                # never exist is the one thing a degraded state dir may not do. Announced, because a
+                # box whose flight dir is broken is running uncoalesced and must be findable.
+                log_event("single-flight: cannot claim a key in %s — this call runs UNSHARED" % d)
+                return _run_captured(real_gh, gh_argv)
+            leader = _read_json(leader_path)    # "held": a peer won the create — wait for ITS answer
+        elif _leader_stale(leader, leader_path, _now()):
+            # Nginx's `proxy_cache_lock_age` half: the holder is gone, has been at it far too long, or
+            # left a claim nobody can read — so the key is released and exactly ONE waiter may take it
+            # (`_take_over` is atomic: the rename is the compare-and-swap).
+            # ⛔ THE REMOVAL IS NOT CONDITIONAL ON THE CLAIM PARSING. An unparseable claim is exactly
+            # the one that would otherwise be immortal: `flight_claim` would answer EEXIST for ever and
+            # every caller for the key would get `busy`. Announced in both shapes — a box taking keys
+            # over is a box with a stalled request, which an operator must see.
+            if leader is not None:
+                try:
+                    age = int(max(0.0, _now() - float(leader.get("started_at") or 0)))
+                except (TypeError, ValueError):
+                    age = 0
+                log_event("single-flight: taking the key over from `%s` (age=%ds, holder_alive=%s)"
+                          % (leader.get("request", "?"), age,
+                             "no" if _holder_dead(leader) else "yes"))
+            else:
+                try:
+                    age = int(max(0.0, _now() - os.path.getmtime(leader_path)))
+                except OSError:
+                    age = 0
+                log_event("single-flight: removing an UNREADABLE claim that is %ds old (%s)" % (age, key))
+            if _take_over(leader_path, leader):
+                how, claim_path, claim_meta = flight_claim(key, gh_argv)
+                if how == "leader":
+                    return _lead(real_gh, gh_argv, key, (claim_path, claim_meta))
+                if how == "error":
+                    log_event("single-flight: cannot claim a key in %s — this call runs UNSHARED" % d)
+                    return _run_captured(real_gh, gh_argv)
+            leader = _read_json(leader_path)        # a peer won it, or took it over: wait for theirs
+        if FLIGHT_STALE_SERVE and leader is not None:
+            stale = flight_result(d, key)
+            if stale is not None and stale["rc"] == 0 and stale["finished_at"] < t_arrive:
+                age = int(max(0.0, t_arrive - stale["finished_at"]))
+                if age <= FLIGHT_STALE_MAX_AGE:
+                    # STALE-WHILE-REFRESH, and LABELLED: the caller asked for this trade, and it is
+                    # never presented as a current read (this fleet has been burned by exactly that).
+                    label = ("gh-limit: STALE — served a %ds-old answer for `%s` because a refresh is in "
+                             "flight (pid %s). Not a fresh read (GH_LIMIT_FLIGHT_STALE_SERVE=1).\n"
+                             % (age, stale["request"], leader.get("pid")))
+                    log_event("single-flight: STALE age=%ds served for `%s` (refresh in flight)"
+                              % (age, stale["request"]))
+                    return stale["rc"], stale["out"], stale["err"] + label.encode()
+        if time.monotonic() >= deadline:
+            try:
+                started = float((leader or {}).get("started_at") or 0)
+            except (TypeError, ValueError):
+                started = 0.0
+            if started <= 0:
+                # ⛔ A CLAIM NOBODY CAN READ HAS NO `started_at`, AND `now - 0` IS THE EPOCH. A leader
+                # killed mid-claim leaves a zero-length file, and the waiter then reported
+                # "1792603104s in flight" — an age label that names nothing (review round 7). The
+                # claim file's own mtime is the evidence of how long the holder has had the key.
+                try:
+                    age = int(max(0.0, _now() - os.path.getmtime(leader_path)))
+                except OSError:
+                    age = -1                       # unknown: `_busy` says so instead of inventing one
+            else:
+                age = int(max(0.0, _now() - started))
+            return _busy(gh_argv, leader, age, budget)
+        time.sleep(FLIGHT_POLL_S)
+
+
+def _run_shared(real_gh, gh_argv):
+    """(rc, out, err) for this invocation: coalesced when eligible, plainly captured otherwise."""
+    if flight_eligible(gh_argv):
+        return single_flight(real_gh, gh_argv)
+    return _run_captured(real_gh, gh_argv)
+
+
 def dispatch(real_gh, gh_argv):
-    """The public entry: pass-scoped memoisation (when enabled) ABOVE the real dispatch."""
+    """The public entry: pass-scoped memoisation (when enabled) ABOVE the real dispatch, and single
+    flight (#2243) in it. A memo HIT spends no request, so there is nothing to coalesce; a miss is
+    exactly the call another lane may be making at the same moment."""
     if pass_cache_eligible(gh_argv):
         hit = pass_cache_get(gh_argv)
         if hit is not None:
@@ -901,26 +2104,17 @@ def dispatch(real_gh, gh_argv):
                 sys.stdout.buffer.write(out)
             if err:
                 sys.stderr.buffer.write(err)
-            log_event("pass-cache: hit for `gh %s` — served from this pass's memo, no request"
-                      % " ".join(gh_argv)[:180])
+            log_event("pass-cache: hit for `%s` — served from this pass's memo, no request"
+                      % _flight_label(gh_argv))
             return rc
-        cap_out, cap_err = _StreamCapture(), _StreamCapture()
-        saved = (sys.stdout, sys.stderr)
-        sys.stdout, sys.stderr = cap_out, cap_err
-        try:
-            rc = _dispatch(real_gh, gh_argv)
-        finally:
-            sys.stdout, sys.stderr = saved
-            out, err = cap_out.getvalue(), cap_err.getvalue()
-        # ⛔ THE CALLER'S BYTES ARE WRITTEN WHATEVER HAPPENS — a memoisation that swallowed one
-        # stream on an unusual exit path would be a layer that SUBTRACTS from the child, which this
-        # file forbids in every other branch. `finally` is what guarantees it even on an exception.
-        if out:
-            saved[0].buffer.write(out)
-        if err:
-            saved[1].buffer.write(err)
+        rc, out, err = _run_shared(real_gh, gh_argv)
+        # ⛔ THE CALLER'S BYTES ARE WRITTEN WHATEVER HAPPENS — a layer that swallowed one stream on an
+        # unusual exit path would SUBTRACT from the child, which this file forbids in every branch.
+        _emit_streams(rc, out, err)
         pass_cache_put(gh_argv, out, err, rc)
         return rc
+    if flight_eligible(gh_argv):
+        return _emit_streams(*_run_shared(real_gh, gh_argv))
     return _dispatch(real_gh, gh_argv)
 
 
@@ -997,6 +2191,11 @@ def conditional_fetch(real_gh, plan):
 
 # ── rate-limit classification and the documented backoff ──────────────────────────────────────
 LIMIT_PHRASES = ("rate limit", "rate-limit", "abuse detection", "secondary rate")
+# GitHub's own vocabulary for the SECONDARY (burst/concurrency) limit. `already exceeded for user ID`
+# is the measured wording the fleet receives when the primary budget is healthy (#1762/#1910), so it
+# is the strongest available signal that the refusal is not about the point budget.
+SECONDARY_PHRASES = ("abuse detection", "secondary rate", "already exceeded for user id",
+                     "exceeded a secondary")
 
 
 class Limit(object):
@@ -1050,8 +2249,16 @@ def makes_request(argv):
     # being refused. It reaches the API but it is the one call the limit cannot refuse (review
     # round 10). This is the "exempt by design, therefore not evidence" class.
     if argv[0] == "api":
-        sub = next((a for a in argv[1:] if not a.startswith("-")), "")
-        if sub.strip("/").lower() == "rate_limit":
+        # ⛔ NOT "the first token that does not start with `-`": with a value-taking flag first that is
+        # the flag's VALUE, so `gh api -H 'Accept: x' rate_limit` counted as recovery evidence and
+        # ERASED a live limit (review round 3 — the same mis-attribution as `bucket_for`).
+        # ⛔ AND AN UNATTRIBUTABLE ARGV IS "NO EVIDENCE", not "some non-meter endpoint" (review round
+        # 5): `api_endpoint` answers None for a flag it cannot consume (`gh api -p preview rate_limit`
+        # before `--preview` was added to the vocabulary), and answering True there would re-open the
+        # erase from a new spelling. The docstring's promise — callers treat None conservatively — now
+        # holds here too.
+        ep = api_endpoint(argv)
+        if ep is None or ep.strip("/").lower() == "rate_limit":
             return False
     return not any(a in NO_REQUEST_ANY for a in argv)
 
@@ -1062,9 +2269,12 @@ def bucket_for(argv):
     if argv[0] == "api":
         # `gh api graphql …` reaches the GRAPHQL pool through the REST-shaped command. ⛔ Match the
         # SUBCOMMAND, not any occurrence: `gh api repos/o/graphql-tools/pulls` is a REST call, and
-        # naming the healthy graphql pool there points an operator at the wrong bucket.
-        sub = next((a for a in argv[1:] if not a.startswith("-")), "")
-        return "graphql" if sub.lower() == "graphql" else "core"
+        # naming the healthy graphql pool there points an operator at the wrong bucket. ⛔ AND NOT
+        # "the first token that does not start with `-`" — with a value-taking flag before the
+        # endpoint that is a FLAG'S VALUE, which pinned a `-H`-prefixed GraphQL refusal on `core`
+        # (review round 3); an unattributable argv answers `core`, the conservative label.
+        sub = api_endpoint(argv) or ""
+        return "graphql" if sub.strip("/").lower() == "graphql" else "core"
     return "core" if argv[0] in REST_SUBCOMMANDS else "graphql"
 
 
@@ -1139,9 +2349,36 @@ def classify(res, argv, headers):
     return None
 
 
-def plan_wait(limit, attempt, real_gh, now):
+def limit_kind(limit):
+    """What KIND of refusal this is. Drives both the wait and the evidence recorded for it.
+
+    ⛔ `unclassified` IS A REAL CLASS, NOT A FALLBACK. A refusal whose HTTP status could not be parsed
+    (GraphQL reports it in prose alone) and whose text names no secondary vocabulary used to fall
+    through to "no usable header" — where the only number available was a bucket reset, which for a
+    secondary refusal is not a recovery time. `unclassified` is therefore treated like a secondary
+    limit (>= 1 minute, jittered, doubling) and NEVER adopts a reset as its wait."""
+    if limit.retry_after is not None:
+        return "retry-after"
+    low = (limit.message or "").lower()
+    if any(p in low for p in SECONDARY_PHRASES):
+        return "secondary"
+    if limit.status is None:
+        return "unclassified"
+    if limit.remaining == 0:
+        return "primary"
+    return "unclassified"
+
+
+def plan_wait(limit, attempt, real_gh, now, kind=None):
     """The documented order, and nothing invented: retry-after, then the bucket's reset when the
-    bucket is empty, then >= BASE_WAIT doubling. Returns (seconds, reset_epoch, why)."""
+    bucket is empty, then >= BASE_WAIT doubling. Returns (seconds, reset_epoch, why, remaining).
+
+    ⛔ THE RESET IS HONOURED FOR A PRIMARY REFUSAL ONLY (agent-infra#2137, requirement 2). GitHub
+    documents that the primary counter does NOT predict a secondary limit — measured, graphql
+    ~4573/5000 while every call was refused — so a reset read beside a secondary/unclassified refusal
+    is not a recovery time. Adopting it produced the full-window block this change removes."""
+    if kind is None:
+        kind = limit_kind(limit)
     if limit.retry_after is not None and limit.retry_after >= 0:
         # ⛔ A `retry-after: 0` IS NOT PERMISSION TO RETRY AT ONCE. Taken verbatim it produced four
         # back-to-back requests with zero seconds waited — the burst secondary limits react to, and
@@ -1149,8 +2386,8 @@ def plan_wait(limit, attempt, real_gh, now):
         # attempt cap still bounds the total.
         if limit.retry_after < 1:
             log_event("retry-after=%ds is below the 1s floor — waiting 1s" % limit.retry_after)
-            return 1.0, limit.reset, "retry-after-floor"
-        return float(limit.retry_after), limit.reset, "retry-after"
+            return 1.0, limit.reset, "retry-after-floor", limit.remaining
+        return float(limit.retry_after), limit.reset, "retry-after", limit.remaining
     remaining, reset = limit.remaining, limit.reset
     if remaining is None or reset is None:
         # No usable header: ask the exempt endpoint for THIS bucket's reset (the refused call did
@@ -1159,23 +2396,31 @@ def plan_wait(limit, attempt, real_gh, now):
         p_remaining, p_reset = probe_rate_limit(real_gh, limit.bucket)
         remaining = p_remaining if remaining is None else remaining
         reset = p_reset if reset is None else reset
-    if remaining == 0 and reset and reset > now:
-        return float(reset - now) + 1.0, reset, "reset"
+    if kind == "primary" and remaining == 0 and reset and reset > now:
+        return float(reset - now) + 1.0, reset, "reset", remaining
     # Exponential, JITTERED UPWARDS only, so the floor the docs state (>= 1 minute) is never
-    # breached by jitter: 60, 120, 240 …
+    # breached by jitter: 60, 120, 240 … A secondary/unclassified refusal lands here, with the reset
+    # recorded as EVIDENCE (the bucket's own number) but never as this call's wait.
     base = BASE_WAIT * (2 ** (attempt - 1))
-    return base * (1.0 + random.random() * 0.2), reset, "backoff"
+    return base * (1.0 + random.random() * 0.2), reset, "backoff", remaining
 
 
-def fail_loudly(limit, attempts, waited, reset):
+def fail_loudly(limit, attempts, waited, reset, kind=None, remaining=None, marker_age_s=None):
     # ⛔ THE WORDS MATTER: the harness's own classifiers look for "rate limit" (objective.py's
     # TRANSPORT_MARKERS) to turn a refused read into `VERDICT=GH-RATE-LIMITED` instead of
     # `UNKNOWN`/`STALL`. "rate_limited" does not contain it, so the token would be lost at exactly the
     # boundary this layer exists to make honest.
+    #
+    # ⛔ AND THE LINE CARRIES ITS OWN EVIDENCE (agent-infra#2137, requirement 4): the classification
+    # used, the marker's AGE, the remaining count read, and the attempt number. Without the age a
+    # refusal built on a 40-minute-old record is indistinguishable from one that just happened, so an
+    # operator cannot tell whether to wait or to fix something else.
     sys.stderr.write(
-        "gh-limit: gh rate limit (bucket=%s reset=%s) — FAILED after %d attempt(s), %ds waited. "
-        "This is a REFUSED call, not an empty answer%s\n"
-        % (limit.bucket, reset if reset else "?", attempts, int(waited),
+        "gh-limit: gh rate limit (bucket=%s reset=%s kind=%s) — FAILED after %d attempt(s), %ds waited. "
+        "evidence: remaining=%s marker_age=%s. This is a REFUSED call, not an empty answer%s\n"
+        % (limit.bucket, reset if reset else "?", kind or limit_kind(limit), attempts, int(waited),
+           ("%d" % remaining) if remaining is not None else "?",
+           ("%ds" % marker_age_s) if marker_age_s is not None else "none",
            (" (%s)" % limit.message) if limit.message else ""))
 
 
@@ -1270,6 +2515,15 @@ def _dispatch(real_gh, gh_argv):
     attempt = 0
     waited = 0.0
     mutating = is_mutating(gh_argv)
+    # ⛔ THE ACCOUNT VIEW COMES FIRST (#2137). If this BOX's record says the bucket is inside a
+    # window, every client on the box waits it out: that is what makes one box's observation useful
+    # to its peers instead of each client spending four attempts to rediscover the same refusal. The
+    # gate is bounded (see marker_gate), so a bad record cannot park the box — that failure is the
+    # reason this whole change exists.
+    # ⛔ AND ITS WAIT COUNTS. `waited` is what the refusal line reports as the time this call spent;
+    # dropping a 60-300 s gate pause from it made that evidence wrong by exactly the window it claims
+    # to have honoured (measured: 499 s of waits reported as 439 s).
+    waited += marker_gate(gh_argv, real_gh, clock())
     if mutating:
         # The bulk of the mutation gap is waited OUTSIDE the lock (a 1 s pause under the box lock
         # would park every unrelated gh call); the remainder is re-checked inside it, immediately
@@ -1278,7 +2532,60 @@ def _dispatch(real_gh, gh_argv):
         if w > 0:
             log_event("pacing mutation: waiting %.2fs (>= %.1fs between mutative calls)" % (w, MUTATION_GAP))
             pause(w)
+    bucket = bucket_for(gh_argv)
+    # A call that makes no request cannot spend the ACCOUNT's budget (`gh auth token` is an offline
+    # keyring read the harness runs every refresh; `--version`/`help` are local). Counting them would
+    # pace local commands against a network budget.
+    counts_budget = makes_request(gh_argv)
+    res = None
     while True:
+        # ⛔ THE PARTITION IS TAKEN IMMEDIATELY BEFORE THE SEND (requirement 1): the slot is a
+        # REQUEST, so a retry spends another one, and NO_WAIT callers proceed over the partition with
+        # the overdraw recorded rather than dying in a queue they cannot afford. ONE pause at most: a
+        # second full window means a peer (or a clock jump) took the slot, and waiting again would
+        # multiply the layer's in-call bound by the attempt count.
+        if counts_budget:
+            bwait = budget_gate(bucket, clock())
+            if bwait > 0:
+                if bwait > MAX_WAIT:
+                    share = account_share()
+                    record_budget(bucket, bwait, share)
+                    sys.stderr.write(
+                        "gh-limit: this box's share of the ACCOUNT's %s budget is exhausted (fleet=%d,"
+                        " %d per %ds) and the next slot is %ds away — beyond the %ds in-call bound, so"
+                        " refusing now rather than holding the call\n"
+                        % (bucket, share["fleet"], share["per_window"], share["window"], int(bwait),
+                           int(MAX_WAIT)))
+                    log_event("account budget: %s next slot %ds away (> %ds bound) — failing fast"
+                              % (bucket, int(bwait), int(MAX_WAIT)))
+                    # ⛔ NEVER SUBTRACT WHAT THE CHILD PRINTED. This branch is reachable on a RETRY, so
+                    # a previous attempt's stdout/stderr may be the only evidence the caller has; the
+                    # local refusal must ADD its reason, not replace the child's answer.
+                    if res is not None:
+                        if res.out:
+                            sys.stdout.buffer.write(res.out)
+                        if res.err:
+                            sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
+                    # ⛔ AND THE CALLER READS THE VERDICT FROM THE EXIT CODE. 75 (EX_TEMPFAIL) is the
+                    # layer's "refused LOCALLY, retry later" signal — the same one the give-up path uses
+                    # — so a caller that only inspects stderr cannot mistake a partition refusal for a
+                    # success. Nothing was sent, and the rejection is what makes the partition real.
+                    return 75
+                log_event("account budget: %s at this box's share — waiting %ds before attempt %d"
+                          % (bucket, int(bwait), attempt + 1))
+                w0 = bwait
+                pause(bwait)
+                waited += w0
+                bwait = budget_gate(bucket, clock())
+                if bwait > 0:
+                    # ⛔ NEVER FALL THROUGH SILENTLY. Sending with no slot and no line is exactly the
+                    # invisible over-partition burst this change exists to remove; the send happens
+                    # (the caller has already waited its bounded share) and the overdraw is recorded.
+                    # The line names the time actually WAITED (`w0`), not the time still remaining,
+                    # and it is bounded to once per window so it cannot flood `events.log`.
+                    if _overdraw_once(bucket, clock(), account_share()["window"]):
+                        log_event("account budget: %s still at its share after waiting %ds — proceeding "
+                                  "OVER the partition (recorded, not silent)" % (bucket, int(w0)))
         attempt += 1
         lock = acquire_lock()
         try:
@@ -1325,15 +2632,24 @@ def _dispatch(real_gh, gh_argv):
                 sys.stderr.buffer.write(res.err)
             return res.rc
         now = clock()
+        kind = limit_kind(limit)
         if attempt >= MAX_ATTEMPTS:
             # ⛔ CHECKED BEFORE `plan_wait`, because that may spend one more `/rate_limit` request
             # (the probe) — and this is the attempt that is about to fail, on a box that is already
             # refusing calls. `limit.reset` is what the refused response itself carried.
             reset = limit.reset or recorded_reset(limit.bucket)
-            record_limit(limit.bucket, reset, attempt, waited, limit.status)
-            log_event("GAVE UP bucket=%s status=%s attempts=%d waited=%ds reset=%s"
-                      % (limit.bucket, limit.status, attempt, int(waited), reset))
-            fail_loudly(limit, attempt, waited, reset)
+            # ⛔ THE AGE NAMES THE EVIDENCE THAT WAS USED. If this response carried its own reset, the
+            # evidence is the refusal in hand (age 0). Only when the reset was BORROWED from an earlier
+            # record does that record's age describe this line — and reporting a 40-minute-old marker
+            # as the basis of a live refusal is precisely the reading `fail_loudly` must not create.
+            prior = read_marker() if limit.reset is None else None
+            page = marker_age(prior) if prior and prior.get("bucket") == limit.bucket else 0
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, kind,
+                         record_window(limit, kind, reset, None, now), limit.remaining)
+            log_event("GAVE UP bucket=%s status=%s kind=%s attempts=%d waited=%ds reset=%s remaining=%s marker_age=%ds"
+                      % (limit.bucket, limit.status, kind, attempt, int(waited), reset,
+                         "%d" % limit.remaining if limit.remaining is not None else "?", page))
+            fail_loudly(limit, attempt, waited, reset, kind, limit.remaining, page)
             # The failed attempt's own words still reach the caller, AFTER the announcement that
             # names the bucket and the reset — never instead of it. BOTH streams: the "never
             # subtract what the child printed" rule is unconditional (review round 8).
@@ -1349,21 +2665,32 @@ def _dispatch(real_gh, gh_argv):
             # skipped too — it may spend a `/rate_limit` probe, and this caller is not going to wait
             # for the answer anyway.
             reset = limit.reset or recorded_reset(limit.bucket)
-            record_limit(limit.bucket, reset, attempt, waited, limit.status)
-            log_event("rate_limited bucket=%s status=%s attempt=%d reset=%s — NO_WAIT, returning at once"
-                      % (limit.bucket, limit.status, attempt, reset))
-            fail_loudly(limit, attempt, waited, reset)
+            prior = read_marker() if limit.reset is None else None
+            page = marker_age(prior) if prior and prior.get("bucket") == limit.bucket else 0
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, kind,
+                         record_window(limit, kind, reset, None, now), limit.remaining)
+            log_event("rate_limited bucket=%s status=%s kind=%s attempt=%d reset=%s remaining=%s — NO_WAIT, returning at once (evidence_age=%ds)"
+                      % (limit.bucket, limit.status, kind, attempt, reset,
+                         "%d" % limit.remaining if limit.remaining is not None else "?", page))
+            fail_loudly(limit, attempt, waited, reset, kind, limit.remaining, page)
             if res.out:
                 sys.stdout.buffer.write(res.out)
             if res.err:
                 sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
             return res.rc or 1
-        wait, reset, why = plan_wait(limit, attempt, real_gh, now)
-        record_limit(limit.bucket, reset, attempt, waited, limit.status)
+        wait, reset, why, remaining = plan_wait(limit, attempt, real_gh, now, kind)
+        # ⛔THE WINDOW IS WRITTEN FROM THE CLASSIFICATION, NOT FROM THE RESET (requirement 2/5). An
+        # unclassified/secondary observation blocks its peers for at most the documented floor; only a
+        # PRIMARY exhaustion may claim the bucket's reset as its window.
+        record_limit(limit.bucket, reset, attempt, waited, limit.status, kind,
+                     marker_until(kind, reset, wait, now), remaining)
         if wait > MAX_WAIT:
-            log_event("reset beyond the in-call bound bucket=%s wait=%ds reset=%s — failing fast"
-                      % (limit.bucket, int(wait), reset))
-            fail_loudly(limit, attempt, waited, reset)
+            log_event("reset beyond the in-call bound bucket=%s wait=%ds reset=%s kind=%s attempt=%d "
+                      "remaining=%s evidence_age=0s — failing fast"
+                      % (limit.bucket, int(wait), reset, kind, attempt,
+                         "%d" % remaining if remaining is not None else "?"))
+            # The wait is `reset`-derived here, so the evidence age is this response's own (0).
+            fail_loudly(limit, attempt, waited, reset, kind, remaining, 0)
             if res.out:
                 sys.stdout.buffer.write(res.out)
             sys.stderr.write("gh-limit: the next wait is %ds away (%s), beyond the %ds in-call bound — "
@@ -1372,8 +2699,9 @@ def _dispatch(real_gh, gh_argv):
             if res.err:
                 sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
             return res.rc or 1
-        log_event("rate_limited bucket=%s status=%s attempt=%d/%d reset=%s why=%s waiting=%ds"
-                  % (limit.bucket, limit.status, attempt, MAX_ATTEMPTS, reset, why, int(wait)))
+        log_event("rate_limited bucket=%s status=%s kind=%s attempt=%d/%d reset=%s why=%s remaining=%s evidence_age=0s waiting=%ds"
+                  % (limit.bucket, limit.status, kind, attempt, MAX_ATTEMPTS, reset, why,
+                     "%d" % remaining if remaining is not None else "?", int(wait)))
         # NOT under the lock: see the docstring. The wait is what the docs demand; the lock is only
         # about overlap.
         pause(wait)

@@ -40,6 +40,14 @@
 #                                    installs). Ships DISARMED — see #1678.
 #   install-launchd.sh --disarm-worktree-hygiene
 #                                    reverse it: the job goes back to --dry-run
+#   install-launchd.sh --arm-orphan-reaper [--reason TEXT]
+#                                    ARM the orphan reaper on THIS box (#1863):
+#                                    writes the dated record that renders
+#                                    REAP_ORPHAN_DRY_RUN=0, refuses unless the
+#                                    farmed script the job execs is present,
+#                                    then reinstalls. Ships DISARMED — #1142.
+#   install-launchd.sh --disarm-orphan-reaper
+#                                    reverse it: the job goes back to dry-run
 #   install-launchd.sh --help
 #
 # Env overrides (also used by install-launchd.test.sh):
@@ -47,6 +55,8 @@
 #   AGENTS_DIR      install dir   (default: $HOME/Library/LaunchAgents)
 #   WORKTREE_HYGIENE_ARM_FILE   the arming record (default:
 #                   $HOME/.pi/agent/state/worktree-hygiene.armed)
+#   REAP_ORPHAN_ARM_FILE        the arming record (default:
+#                   $HOME/.pi/agent/state/pi-reap-orphans.armed)
 #   ELDATO_ALLOW_TEST_HOME   permit launchd management when $HOME is not the
 #                            real user home (tests ONLY — requires a launchctl
 #                            shim on PATH so nothing reaches the real domain)
@@ -61,7 +71,7 @@ DOMAIN="gui/$(id -u)"
 
 # The range is literal and moves with the header: it ends on `set -uo pipefail`,
 # exactly as it did before the {{PATH}} note above was added.
-usage() { sed -n '2,56p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # Resolve this repo's MAIN checkout (not a worktree) so installed jobs point
 # at a stable path that survives worktree teardown. `git worktree list
@@ -107,6 +117,7 @@ resolve_env() {
     # Materialised here (never an env default the job reads at run time) so that
     # --status and the installed unit both say plainly whether this box deletes.
     WORKTREE_HYGIENE_MODE="$(wt_hygiene_mode)"
+    REAP_ORPHAN_MODE="$(reap_orphan_mode)"
 }
 
 # launchd_path — the PATH a rendered plist receives: {{PATH}} minus the pi SHIM directory.
@@ -279,6 +290,102 @@ disarm_worktree_hygiene() {
     return 0
 }
 
+# ── orphan-reaper ARMING (#1863 review ISSUE 2, P2) ────────────────────────
+#
+# com.eldato.pi-reap-orphans is a KILLER on an hourly timer. #1142's acceptance
+# criterion is that it "exists, is scheduled, and logs what it kills; dry-run by
+# default", and the reaper policy forbids an unowned always-on killer — so the
+# template shipped `<key>REAP_ORPHAN_DRY_RUN</key><string>1</string>` as a
+# LITERAL. That literal made the documented arming step UNREACHABLE, which is
+# the defect this block fixes: the plist note, README §6.5.5 and the PR body all
+# described arming as a per-machine, owned, dated decision — while nothing could
+# perform it. The only lever was hand-editing the installed plist, which the
+# next `install_job()` render silently reverted (`mv "$tmp" "$installed"`), so
+# an operator who "armed" a box would believe a killer was running while every
+# pass still wrote `MODE=dry-run` — the installed-but-inert shape #1862 exists to
+# eliminate.
+#
+# The mechanism is the one this repo already ruled for deletion tools (#1678,
+# PR #2053): a PLACEHOLDER that renders the SAFE value, plus a DATED RECORD in
+# the box's own state dir as the only way to render the armed value.
+#
+#   * the template carries {{REAP_ORPHAN_MODE}}, which renders `1` (= dry-run);
+#   * `0` (= armed) is renderable ONLY from `$REAP_ORPHAN_ARM_FILE` carrying BOTH
+#     `armed-by=` and `armed-date=`, written by --arm-orphan-reaper and removed
+#     by --disarm-orphan-reaper;
+#   * there is NO environment default that can arm it (an ambient export would
+#     arm a fleet with nothing on disk to show for it);
+#   * the armed state IS the installed unit's EnvironmentVariables, so `cat` of
+#     the plist and `--status` both answer "is this box killing?" without
+#     reading code;
+#   * a half-written record renders DISARMED — a truncated arming file must never
+#     count as an arming (fail-closed, same as the worktree record).
+#
+# ⛔ ARMING REFUSES A BOX THAT CANNOT RUN THE PASS. `ProgramArguments` execs the
+# FARMED copy (`~/.pi/agent/scripts/pi-reap-orphans.sh`; launchd cannot read
+# ~/Documents under macOS TCC, #427), so arming a box that never farmed it
+# produces a unit launchd cannot start and whose failure nobody reads. The repo
+# copy is NOT an acceptable substitute: it is not what the job runs.
+REAP_ORPHAN_ARM_FILE="${REAP_ORPHAN_ARM_FILE:-$HOME/.pi/agent/state/pi-reap-orphans.armed}"
+reap_orphan_mode() {
+    if [ -f "$REAP_ORPHAN_ARM_FILE" ] \
+        && grep -q '^armed-by=.' "$REAP_ORPHAN_ARM_FILE" 2>/dev/null \
+        && grep -q '^armed-date=.' "$REAP_ORPHAN_ARM_FILE" 2>/dev/null; then
+        printf '%s' '0'      # REAP_ORPHAN_DRY_RUN=0 => --apply passes
+    else
+        printf '%s' '1'      # the shipped, default, safe value
+    fi
+}
+
+arm_orphan_reaper() { # $1 = optional reason
+    local reason="${1:-}" farmed="$HOME/.pi/agent/scripts/pi-reap-orphans.sh"
+    if [ -f "$REAP_ORPHAN_ARM_FILE" ]; then
+        echo "  orphan-reaper: ALREADY ARMED — $(sed -n 's/^armed-date=/since /p' "$REAP_ORPHAN_ARM_FILE" | head -1)"
+        echo "    record: $REAP_ORPHAN_ARM_FILE (not re-dated: the date is the audit datum)"
+        return 0
+    fi
+    # ⛔ The FARMED copy must exist: it is what ProgramArguments names.
+    if [ ! -f "$farmed" ]; then
+        echo "ERROR: refusing to arm the orphan reaper: the farmed copy the job execs is absent" >&2
+        echo "       ($farmed). Run pi-bootstrap/setup.sh first — arming a unit whose" >&2
+        echo "       target does not exist produces an hourly job launchd cannot start." >&2
+        return 1
+    fi
+    # ⛔ The script must PARSE as what the job execs. A syntax error here is a
+    # silent hourly failure (launchd records an exit code nobody reads), so it is
+    # refused at arming time rather than discovered in the log afterwards.
+    if ! bash -n "$farmed" 2>/dev/null; then
+        echo "ERROR: refusing to arm the orphan reaper: $farmed does not parse (bash -n)." >&2
+        echo "       An armed pass would fail hourly and kill nothing." >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$REAP_ORPHAN_ARM_FILE")" 2>/dev/null || {
+        echo "ERROR: cannot create $(dirname "$REAP_ORPHAN_ARM_FILE") — refusing to arm" >&2; return 1; }
+    {
+        printf 'armed-by=%s\n' "$(id -un 2>/dev/null || printf 'unknown')"
+        printf 'armed-date=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+        printf 'armed-host=%s\n' "$(hostname 2>/dev/null || printf 'unknown')"
+        printf 'repo=%s\n' "${TORTOISE_REPO:-<unset>}"
+        printf 'reason=%s\n' "${reason:-<none given>}"
+    } > "$REAP_ORPHAN_ARM_FILE" || {
+        echo "ERROR: cannot write $REAP_ORPHAN_ARM_FILE — refusing to arm" >&2; rm -f "$REAP_ORPHAN_ARM_FILE"; return 1; }
+    echo "  orphan-reaper: ARMED ($REAP_ORPHAN_ARM_FILE) — every hourly pass now signals"
+    return 0
+}
+
+disarm_orphan_reaper() {
+    if [ -f "$REAP_ORPHAN_ARM_FILE" ]; then
+        echo "  orphan-reaper: disarming — the record being removed:"
+        sed 's/^/    /' "$REAP_ORPHAN_ARM_FILE"
+        rm -f "$REAP_ORPHAN_ARM_FILE" || {
+            echo "ERROR: cannot remove $REAP_ORPHAN_ARM_FILE — the job is STILL ARMED" >&2; return 1; }
+        echo "  orphan-reaper: DISARMED — every hourly pass goes back to reporting only"
+    else
+        echo "  orphan-reaper: not armed (no $REAP_ORPHAN_ARM_FILE)"
+    fi
+    return 0
+}
+
 render() {
     # $1 = template path → stdout rendered plist
     sed -e "s|{{HOME}}|$(sed_repl "$HOME")|g" \
@@ -290,6 +397,7 @@ render() {
         -e "s|{{PYTHON_BIN}}|$(sed_repl "$PYTHON_BIN")|g" \
         -e "s|{{PI_BIN_DIR}}|$(sed_repl "$PI_BIN_DIR")|g" \
         -e "s|{{WORKTREE_HYGIENE_MODE}}|$(sed_repl "$WORKTREE_HYGIENE_MODE")|g" \
+        -e "s|{{REAP_ORPHAN_MODE}}|$(sed_repl "$REAP_ORPHAN_MODE")|g" \
         "$1"
 }
 
@@ -351,7 +459,7 @@ install_job() {
     # Unresolved placeholder → legitimate skip (e.g. no swarm root), loud.
     # Checked on the TEMPLATE against resolved env values (not the rendered
     # output — sed would substitute the empty string and hide the gap).
-    for ph in HOME PATH AGENT_INFRA_PATH TORTOISE_REPO SWARM_ROOT SWARM_ENV_FILE PYTHON_BIN PI_BIN_DIR WORKTREE_HYGIENE_MODE; do
+    for ph in HOME PATH AGENT_INFRA_PATH TORTOISE_REPO SWARM_ROOT SWARM_ENV_FILE PYTHON_BIN PI_BIN_DIR WORKTREE_HYGIENE_MODE REAP_ORPHAN_MODE; do
         if grep -q "{{$ph}}" "$template" && [ -z "${!ph:-}" ]; then
             unset_ph="$unset_ph {{$ph}}"
         fi
@@ -557,6 +665,11 @@ if [ "${1:-}" = "--status" ]; then
     else
         echo "     worktree-hygiene: DISARMED (dry-run; arm with --arm-worktree-hygiene)"
     fi
+    if [ "$REAP_ORPHAN_MODE" = '0' ]; then
+        echo "     orphan-reaper: ARMED ($REAP_ORPHAN_ARM_FILE) — hourly passes SIGNAL"
+    else
+        echo "     orphan-reaper: DISARMED (report-only; arm with --arm-orphan-reaper)"
+    fi
     exit 0
 fi
 
@@ -584,8 +697,26 @@ if [ $# -gt 0 ]; then
             disarm_worktree_hygiene || exit 1
             WORKTREE_HYGIENE_MODE="$(wt_hygiene_mode)"
             ;;
+        --arm-orphan-reaper)
+            shift
+            arm_reason=""
+            if [ "${1:-}" = "--reason" ]; then arm_reason="${2:-}"; shift 2 || true; fi
+            if [ $# -gt 0 ]; then
+                echo "ERROR: unknown argument: $1 (use --arm-orphan-reaper [--reason TEXT])" >&2; exit 2
+            fi
+            arm_orphan_reaper "$arm_reason" || exit 1
+            REAP_ORPHAN_MODE="$(reap_orphan_mode)"   # the record just changed it
+            ;;
+        --disarm-orphan-reaper)
+            shift
+            if [ $# -gt 0 ]; then
+                echo "ERROR: unknown argument: $1 (use --disarm-orphan-reaper)" >&2; exit 2
+            fi
+            disarm_orphan_reaper || exit 1
+            REAP_ORPHAN_MODE="$(reap_orphan_mode)"
+            ;;
         *)
-            echo "ERROR: unknown argument: $1 (use --status, --uninstall, --arm-worktree-hygiene, --disarm-worktree-hygiene, or nothing)" >&2
+            echo "ERROR: unknown argument: $1 (use --status, --uninstall, --arm-worktree-hygiene, --disarm-worktree-hygiene, --arm-orphan-reaper, --disarm-orphan-reaper, or nothing)" >&2
             exit 2 ;;
     esac
 fi

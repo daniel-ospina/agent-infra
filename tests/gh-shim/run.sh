@@ -26,6 +26,29 @@ failures=0
 pass() { checks=$((checks + 1)); echo "   ✅ $1"; }
 fail() { checks=$((checks + 1)); failures=$((failures + 1)); echo "   ❌ $1"; }
 
+# ⛔ KILL THE WHOLE LADDER, NOT JUST THE LEADER (review of #2295). `kill -9 $p` signals ONE pid and
+# SIGKILL does NOT propagate, so on exactly the recursion these cases exist to detect the descendants
+# outlive their leader — still holding this suite's two gate slots, which makes every later case burn
+# up to AGENT_GH_GATE_ACQUIRE_TIMEOUT before failing open. Reap by the case's own unique temp path
+# (present only in the shim processes' argv, never in this script's), and `wait` the leader so the
+# suite cannot race ahead of a half-dead process tree. Defined up here because §10(a) needs it too.
+bound_then_reap() {  # $1=pid  $2=argv pattern unique to THIS case  $3=sentinel file to mark on hang
+  local hung=1
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    kill -0 "$1" 2>/dev/null || { hung=0; break; }
+    sleep 0.5
+  done
+  # ⛔ REAP ON EVERY PATH, NOT ONLY ON A HANG (review of #2295). A leader that exits while a
+  # descendant lives on is the SAME leak: the orphan still holds this suite's gate slots, so later
+  # cases burn up to AGENT_GH_GATE_ACQUIRE_TIMEOUT. The first version returned early in the loop
+  # and never reached `pkill` — measured: survivors=1 with a fast-exiting leader.
+  kill -9 "$1" 2>/dev/null
+  pkill -9 -f "$2" 2>/dev/null
+  wait "$1" 2>/dev/null
+  [ "$hung" -eq 1 ] && printf 'HUNG' >>"$3"
+  return 0
+}
+
 HEAD_A="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 HEAD_B="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 CAPTURED=""
@@ -332,11 +355,16 @@ mkdir -p "$TMP/neutral" "$TMP/bin"
 ln -sf "$SHIM" "$TMP/neutral/gh"
 printf '#!/usr/bin/env bash\nprintf "REALGH-CALLED %%s\\n" "$*"\n' > "$TMP/bin/gh"
 chmod +x "$TMP/bin/gh"
-out="$( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
-  bash "$TMP/neutral/gh" pr view 1 2>&1 & 
-  p=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
-  if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG'; fi )"
+# ⛔ FILE, NOT A CAPTURE PIPE (review of #2295). This is the case that detects the neutral-symlink
+# recursion, and it was in the one shape that CANNOT report it: the ladder's descendants inherit the
+# substitution's write end, so after `kill -9 $p` the substitution waits for an EOF that never comes
+# and the `*HUNG*` arm below is exactly the arm that cannot fire (reproduced rc=124, no output).
+: > "$TMP/a1b.out"
+( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+  bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a1b.out" 2>&1 &
+p=$!
+bound_then_reap "$p" "$TMP/neutral/gh" "$TMP/a1b.out"
+out="$(cat "$TMP/a1b.out")"
 case "$out" in
   *HUNG*) fail "through the neutral symlink it re-exec'd ITSELF — every gh call would hang" ;;
   "")     fail "through the neutral symlink nothing ran" ;;
@@ -347,6 +375,91 @@ case "$out" in
   *HUNG*) ;;  # already reported
   *) fail "  …but the real gh never ran: $out" ;;
 esac
+
+# (a2) THE INHERITED-VALUE SEAM (#2266). `AGENT_GH_REAL` exists so a NESTED call does not
+# recurse — but its value is whatever an outer process exported, and it used to be accepted
+# on `-x` alone. A launcher that exported it as THIS SCRIPT turned every call into a ladder:
+# one generation per `AGENT_GH_GATE_ACQUIRE_TIMEOUT`, each waiting on the slot its own child
+# held. Measured 2026-10-21: 2,543 shim processes, load 12.8, every gh call on the box dead
+# for ~10 hours. Bound it in time (a hang is not a status) and require the FALL-THROUGH: the
+# call must reach the real gh, so refusing the bad value is not enough by itself.
+#
+# ⛔ THE TIME BOUND NEEDS A FILE, NOT A CAPTURE PIPE (review of #2295). `out="$( … & …)"`
+# cannot deliver a verdict on the regression this case exists to catch: the recursion's
+# descendants INHERIT the substitution's write end, so after `kill -9 $p` the substitution
+# still waits for an EOF that never comes — the case hangs the suite instead of reporting,
+# and the in-test bound fires too late to be read (measured: rc=137 from an outer timeout,
+# no case output at all). A regular file has no EOF to wait for, so the sentinel is delivered.
+: > "$TMP/a2.out"
+( cd "$TMP" && env AGENT_GH_REAL="$TMP/neutral/gh" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a2.out" 2>&1 &
+p=$!
+bound_then_reap "$p" "$TMP/neutral/gh" "$TMP/a2.out"
+out="$(cat "$TMP/a2.out")"
+case "$out" in
+  *HUNG*) fail "AGENT_GH_REAL=<this shim> re-exec'd ITSELF — a self-recursion ladder, every gh call hangs" ;;
+  *REALGH-CALLED*) pass "AGENT_GH_REAL=<this shim> is refused and resolution FALLS THROUGH to the real gh" ;;
+  *) fail "AGENT_GH_REAL=<this shim> did not reach the real gh: $out" ;;
+esac
+
+# (a3) `-x` IS TRUE FOR A SEARCHABLE DIRECTORY (review of #2295). The env seam accepted the
+# inherited value on `-x` alone while the PATH walk has always carried `-f`, so the two halves
+# of one decision disagreed: a directory-valued AGENT_GH_REAL was "resolved" and exec'd,
+# giving rc 126 "Is a directory" on EVERY gh call. Same file-redirect reasoning as (a2).
+mkdir -p "$TMP/ghdir"
+: > "$TMP/a3.out"
+( cd "$TMP" && env AGENT_GH_REAL="$TMP/ghdir" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a3.out" 2>&1 &
+p=$!
+bound_then_reap "$p" "$TMP/neutral/gh" "$TMP/a3.out"
+out="$(cat "$TMP/a3.out")"
+case "$out" in
+  *HUNG*) fail "AGENT_GH_REAL=<a directory> left the shim spinning/hung" ;;
+  *REALGH-CALLED*) pass "AGENT_GH_REAL=<a directory> is refused (never exec'd) and resolution FALLS THROUGH to the real gh" ;;
+  *) fail "AGENT_GH_REAL=<a directory> did not reach the real gh: $out" ;;
+esac
+
+# (a4) THE INHERITED VALUE IS USUALLY A REAL ELF, SO THE READ MUST BE SILENT (#2184/#2305, review
+# of #2295). On a delegated call the inherited value IS the genuine gh — a binary full of NUL bytes —
+# and `_is_harness_layer` reads it on EVERY call. The form that leaks is a command substitution over
+# it: bash >=4.4 then prints `warning: command substitution: ignored null byte in input` onto a call
+# that SUCCEEDS, and `gh-rest/gh` parses stderr as JSON (`2>&1 | jq`), so that is a JSONDecodeError on
+# every gh call in the tree — #2305 grades exactly this. The assertion is BYTE-CLEAN stderr, which is
+# the property itself and is form-agnostic: reverting the helper to `case "$(head -c 8192 …)"` fails
+# here (measured 96 stderr bytes on an rc=0 call), while both legitimate outcomes — the value accepted
+# as the real gh, or refused and fallen through — must be silent.
+ELFGH="$TMP/elfgh-$$"; ELFERR="$TMP/elfgh.err"
+if [ -x /bin/true ]; then cp /bin/true "$ELFGH"; else printf '\177ELF\0\0\0\0\0\0\0\0' > "$ELFGH"; fi
+chmod +x "$ELFGH"
+: > "$ELFERR"
+( cd "$TMP" && env AGENT_GH_REAL="$ELFGH" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >/dev/null 2>"$ELFERR"
+if [ -s "$ELFERR" ]; then
+  fail "a binary (ELF) AGENT_GH_REAL leaked $(wc -c <"$ELFERR") bytes onto a SUCCESSFUL call's stderr — gh-rest's 2>&1 parse is a JSONDecodeError (#2184/#2305): $(head -1 "$ELFERR")"
+else
+  pass "a binary (ELF) AGENT_GH_REAL leaves a successful call's stderr byte-clean (#2184/#2305)"
+fi
+
+# (a5) ⛔ AN UNREADABLE CANDIDATE MUST NOT TOUCH A SUCCESSFUL CALL'S STDERR (#2305, review of #2295).
+# The marker is read through `< "$1"` inside a process substitution, and a failed open is reported by
+# the SHELL, not by `head` — redirections apply LEFT TO RIGHT, so `head -c 8192 < "$1" 2>/dev/null`
+# prints `shim: line N: <path>: Permission denied` onto a call that SUCCEEDS. `-f` and `-x` are both
+# TRUE for a mode-111 file, so it reaches this read, and the leak is gh-rest's `2>&1 | jq`
+# JSONDecodeError — the class this seam was fixed for, reintroduced by moving the open from `head` to
+# the shell. (a4) cannot catch it (its fixture is readable). Measured pre-fix: 82 bytes at rc=0.
+UNREAD="$TMP/unreadable-gh-$$"; UNREADERR="$TMP/unreadable-gh.err"
+if [ -x /bin/true ]; then cp /bin/true "$UNREAD"; else printf '\177ELF\0\0\0\0\0\0\0\0' > "$UNREAD"; fi
+chmod 111 "$UNREAD"
+: > "$UNREADERR"
+( cd "$TMP" && env AGENT_GH_REAL="$UNREAD" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >/dev/null 2>"$UNREADERR"
+if [ -s "$UNREADERR" ]; then
+  fail "an unreadable (mode 111) AGENT_GH_REAL leaked $(wc -c <"$UNREADERR") bytes onto a SUCCESSFUL call's stderr — gh-rest's 2>&1 parse is a JSONDecodeError (#2305): $(head -1 "$UNREADERR")"
+elif [ -r "$UNREAD" ]; then
+  pass "unreadable-candidate stderr is clean (vacuous as root — uid 0 reads a mode-111 file anyway)"
+else
+  pass "an unreadable (mode 111) AGENT_GH_REAL leaves a successful call's stderr byte-clean (#2305)"
+fi
 
 # (b) A query supplied from a FILE or STDIN cannot be inspected at all — no argv token
 # carries `mergePullRequest`. Refuse rather than assume benign.
@@ -1106,15 +1219,21 @@ GHEOF
 }
 
 # (a) a sentinel-marked harness layer sits BETWEEN this shim and the real gh.
+# ⛔ FILE, NOT A CAPTURE PIPE (review of #2295). `out="$( … & … )"` cannot report the very failure
+# it exists to detect: the recursion's descendants INHERIT the substitution's write end, so after
+# `kill -9 $p` the substitution still waits for an EOF that never comes — the CASE HANGS instead of
+# reporting, and the `*HUNG*` arm below is precisely the arm that cannot fire (reproduced: rc=124).
+# Same file + reap shape as (a2)/(a3), which is why they carry this reasoning too.
 HRAN="$TMP/harness-layer-ran-14a"
 rm -f "$HRAN"
 harness_layer_at "$TMP/gh-limit-14a" "$HRAN"
-out="$( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN \
+: > "$TMP/a1.out"
+( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN \
   PATH="$TMP/neutral:$TMP/gh-limit-14a:$TMP/bin:/usr/bin:/bin" \
-  bash "$TMP/neutral/gh" pr view 1 2>&1 &
-  p=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
-  if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG'; fi )"
+  bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a1.out" 2>&1 &
+p=$!
+bound_then_reap "$p" "$TMP/neutral/gh" "$TMP/a1.out"
+out="$(cat "$TMP/a1.out")"
 case "$out" in
   *HUNG*) fail "with a harness layer on PATH the shim HUNG — the two wrappers resolve into each other" ;;
   *HARNESS-LAYER-RAN*) fail "the shim EXEC'd the harness gh layer (#1988) — that layer resolves back here, so the pair fork-loops" ;;
@@ -1141,6 +1260,47 @@ out="$( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN PATH="$TMP/plaingh:/usr/bin:/b
 case "$out" in
   *PLAIN-GH-RAN*) pass "an UNMARKED gh earlier on PATH is used (the skip is a sentinel, not a name)" ;;
   *) fail "an unmarked gh earlier on PATH was not used: $out" ;;
+esac
+
+# (c) THE ENV SEAM REFUSES A HARNESS LAYER TOO (#1988, review of #2295). The seam's third refusal —
+#     an inherited `AGENT_GH_REAL` naming `$O/gh-rest/gh` or `$O/gh-limit/gh` — was silently
+#     missing: the value was accepted as "the real gh", re-entered the shim chain, and the
+#     harness's own depth guard ended EVERY gh call in the tree with rc 127 (measured). (a)/(b)
+#     above pin the PATH half only, and pinning one half is exactly how the halves drifted apart:
+#     the `-f` half of this same seam had the same shape. The harness layer is placed BEFORE the
+#     real-gh stub on PATH, so if the shim wrongly execs it the side-effect file proves it.
+HL4="$TMP/gh-limit-14c"; HRAN4="$TMP/harness-layer-ran-14c"
+rm -f "$HRAN4"
+harness_layer_at "$HL4" "$HRAN4"
+: > "$TMP/a4.out"
+( cd "$TMP" && env AGENT_GH_REAL="$HL4/gh" SCEN= PATH="$TMP/neutral:$HL4:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a4.out" 2>&1 &
+p=$!
+bound_then_reap "$p" "$TMP/neutral/gh" "$TMP/a4.out"
+out="$(cat "$TMP/a4.out")"
+case "$out" in
+  *HUNG*) fail "AGENT_GH_REAL=<a harness layer> HUNG — the env seam re-entered the shim chain" ;;
+  *HARNESS-LAYER-RAN*) fail "AGENT_GH_REAL=<a harness layer> was EXEC'd (#1988) — the env seam does not skip what the PATH walk skips" ;;
+  *REALGH-CALLED*) pass "AGENT_GH_REAL=<a harness layer> is refused and resolution FALLS THROUGH to the real gh" ;;
+  *) fail "AGENT_GH_REAL=<a harness layer> did not reach the real gh: $out" ;;
+esac
+[ -e "$HRAN4" ] \
+  && fail "  …but the harness layer WAS executed (a side-effect file proves it ran, whatever the output looked like)" \
+  || pass "  …and the harness layer was never executed (no side-effect file)"
+
+# (d) ⛔ THE MARKER'S ABSENCE IS LOAD-BEARING, SO PIN IT (review of #2295). `gh-rest/gh` resolves
+#     `REAL_GH` through this same sentinel test and then execs it, so if THIS shim's first 8 KiB
+#     ever carried the marker, gh-rest would skip the shim and mutations would reach the real gh
+#     DIRECTLY — silently bypassing #984's argv-level admin-merge guard. It holds today only by
+#     byte count (the marker sits outside the first 8 KiB — pinned by §15(d) rather than by an offset
+#     written here, because this very commit moved one such number), so a future comment edit could move it into
+#     the window with nothing failing. No pipe and no command substitution over a binary: this
+#     file is a text script, so `head` here can never emit a null byte.
+_h8="$(head -c 8192 "$SHIM")"
+case "$_h8" in
+  *harness-gh-shim-marker*)
+    fail "THIS SHIM carries the harness marker in its first 8 KiB — gh-rest would SKIP it, so mutations would bypass the admin-merge guard (#984)" ;;
+  *) pass "this shim does not carry the harness marker in its first 8 KiB, so gh-rest still delegates mutations through it" ;;
 esac
 
 
