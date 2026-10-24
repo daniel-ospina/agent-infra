@@ -262,6 +262,30 @@ def test_the_render_guard_holds_when_compute_returns_an_unformattable_shape(
             "failure this guard exists for", unformattable)
 
 
+# ── a FUTURE cache stamp never renders a NEGATIVE age ──────────────
+# ⛔ CLAMPED, NOT REFUSED. `CACHE_TS_SKEW_S` admits a few seconds of future `ts` on purpose
+# (writer/reader clock skew is real), but the age is computed as `int((now - ts) / 60)`, so an
+# accepted future stamp rendered `-1m ago` (`ts = now+120`) or `-4m ago` (`now+299`) on the
+# owner's line -- the symptom the bound's own comment cites as its reason, surviving INSIDE the
+# band the bound allows. Unpinned before this: nothing drove a future-but-accepted stamp.
+def test_a_slightly_future_cache_stamp_never_prints_a_negative_age(monkeypatch, no_cache, capsys):
+    import json as _json
+    import time as _time
+
+    for ahead_s in (1, 120, 299):
+        no_cache.write_text(_json.dumps(
+            {"ts": int(_time.time()) + ahead_s, "open_prs": 2, "merged_today": 1,
+             "p0": {"open": 1, "with_pr": 1, "without": 0},
+             "p1": {"open": 0, "with_pr": 0, "without": 0}}))
+        # If the stamp were refused as stale this would be a refresh; either way the line is
+        # real. What must NEVER appear is a negative age.
+        monkeypatch.setattr(bp, "compute", lambda: None)
+        assert bp.main() == 0
+        out = capsys.readouterr().out
+        assert "-" not in out.split("ago]")[0].split(", ")[-1], (
+            "a future-but-accepted cache stamp rendered a NEGATIVE age: %r" % (out,))
+
+
 # ── (c) REST `closed` also carries unmerged PRs -> excluded ──────────────────
 def test_rest_closed_window_excludes_unmerged_prs(monkeypatch):
     """`gh pr list --state merged` never returned a closed-unmerged PR, so REST must not
@@ -459,6 +483,39 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
     monkeypatch.setattr(bp, "_token", lambda: "")
     assert bp._rest_prs("open", limit=500) is None
     assert reached == [], "an unauthenticated read must be refused BEFORE any request"
+
+
+# ── the PER-REQUEST timeout is clamped by the SHARED budget ──────────────────
+# ⛔ THIS GUARD WAS UNPINNED. `min(REST_TIMEOUT_S, remaining)` is the only thing that makes
+# `REST_BUDGET_S` a bound on a HANGING page: mutate it to a bare `REST_TIMEOUT_S` (valid,
+# compiles, reads plausibly) and the suite stayed at 15 passed, while a request landing near the
+# deadline was allowed a full 15 s PAST it -- 30 + 15 = 45 s against the `run_bounded 390 s` tick
+# the module comment says this read must fit inside. The budget test above cannot catch it: it
+# sets `REST_BUDGET_S = 0`, so the refusal happens BEFORE any request and the clamp is never
+# exercised. This one spends the budget ACROSS a page boundary, so a request is always issued
+# with less than a full timeout left.
+def test_a_request_near_the_deadline_gets_only_the_time_left(monkeypatch):
+    """The budget is shared by the open/merged PAIR, so a page that hangs must not eat the
+    remainder in a single 15 s request -- the timeout handed to the transport is the remaining
+    budget, whichever is smaller."""
+    budget = 0.5
+    monkeypatch.setattr(bp, "REST_BUDGET_S", budget)
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+    timeouts = []
+
+    def slow_get(url, tok, timeout=None):
+        timeouts.append(timeout)
+        import time as _t
+        _t.sleep(min(timeout or 0, 0.05))          # a page that never answers promptly
+        return [rest_row(n, merged_at=LONG_AGO) for n in range(100)]   # a FULL page: keep paging
+
+    monkeypatch.setattr(bp, "_rest_get_json", slow_get)
+    assert bp._rest_prs("merged", limit=400) is None, "a spent budget must refuse the window"
+    assert timeouts, "a request must have been issued with budget left"
+    assert max(timeouts) <= budget, (
+        "the per-request timeout must be CLAMPED by the remaining budget, not handed a full "
+        "REST_TIMEOUT_S (%r); measured timeouts=%r against a %r s budget"
+        % (bp.REST_TIMEOUT_S, timeouts, budget))
 
 
 # ── a row that moves across a page boundary REFUSES the window ──────────────
