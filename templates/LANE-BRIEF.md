@@ -61,8 +61,9 @@ it). Four of them are only producible while you work, so produce them as you go.
 - **[b] the scoping comment, whose FIRST CONTENT LINE is the marker — `<!-- issue-scoping: … -->`
   (the producer, `skills/issue-scoping`, writes `<!-- issue-scoping: v5.1 double diamond + verify -->`;
   only the `<!-- issue-scoping:` prefix is examined). Then the scoping content: boundaries,
-  alternatives considered, the wiring table. POSITION is the contract — no leading whitespace on that
-  first line, because a line indented by four columns renders as a CODE BLOCK (a mention). Two other
+  alternatives considered, the wiring table. POSITION is the contract — the check matches at column
+  0, so ANY leading whitespace fails (at four columns it is also rendered as a CODE BLOCK, i.e. a
+  mention, which is why the position is not merely cosmetic). Two other
   documented shapes are ALSO accepted: a leading ATX heading (`## Scope — …`) with the marker on the
   first content line after it, and the marker as the LAST line with content, set off by a blank line
   as a footer block. A marker quoted in a table, fence or discussion counts nowhere: those are
@@ -79,9 +80,14 @@ it). Four of them are only producible while you work, so produce them as you go.
   older-head record certifies a revision that is no longer the PR, and the check refuses it. Record
   the verdict the work EARNS: `clean-micro` is refused on a non-micro issue (#513) and `clean-low` only
   on a diff whose every changed path is in the Low content-shape class (#1356), so in doubt use
-  `clean`. And if the PR body already carries an older verdict line, DELETE it — the recorder
-  APPENDS, it never removes, so a stale `verdict=clean-micro` keeps the check failing even after a
-  fresh `clean` record at the current head. The recorder's `--evidence` artifact is the PR comment
+  `clean`. If the PR body carries a line whose verdict is one the issue does NOT earn — a
+  `verdict=clean-micro` on a non-micro issue, or a `verdict=clean-low` on a diff with a path
+  outside the Low class — DELETE it after re-recording at the current head: the recorder
+  APPENDS and never removes, so such a line keeps the check failing even after a fresh `clean`
+  record. KEEP an older plain `verdict=clean` line: it does not fail the check (the head binding
+  makes an older-head `clean` inert) and its `diff=… sig=…` fields are the signed marker
+  `record-review.sh` carries forward when only the base moves, so deleting it turns a free carry
+  into a re-review. The recorder's `--evidence` artifact is the PR comment
   carrying the reviewer's verdict (see the reviewer step below):
   `~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>`
 - **[d] plan evidence** (`complexity:standard` / `complexity:complex` only): the PR changes a file
