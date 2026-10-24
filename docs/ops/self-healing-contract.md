@@ -460,13 +460,18 @@ The measured freeze that this pins: a refresh ABORTed mid-pass leaving a **parti
 of 42 entries — and `42` is not `< 6`, so the old backlog trigger never fired again and the queue froze
 for **six hours**. `refresh-candidates.sh` REFUSES with the pre-flight's OWN rc and carries its command
 and stderr line (#2659) — a failed refresh is never a silent success — while `harness-refresh.sh` reports its own
-outcomes by code, in its own words — `0` current (no-op), `10` repinned (the materialiser ran and recorded
-whether the pin advanced or `$O` was re-seeded), `11` mended (the pin was empty/absent/not-a-commit),
+outcomes by code, in its own words — **`0` `current` OR `restart-pending`** (the pin names the tip and the
+running controller still executes an OLDER tree: reported as `restart-pending`, never as `current`, because
+calling it `current` *"would be a false PASS about code that is not running yet"* — read the record for
+which), `10` repinned (the materialiser ran and recorded whether the pin advanced or `$O` was re-seeded),
+`11` mended (the pin was empty/absent/not-a-commit),
 `20` REFUSED dirty, `21` REFUSED ahead, `22` REFUSED diverged, **`23` REFUSED unknown** (the ref/repo/running
 commit cannot be resolved — *cannot-verify is not a pass* — or the materialiser failed), `25` behind with
 NO materialiser, `26` REFUSED blocked (a `--re-seed` would change the code under a running controller).
-⛔ `23` is **not** a usage code: reading it as one would let an operator dismiss a cannot-verify refusal as
-their own typo.
+⛔ `23` is the SCRIPT'S SHARED CODE: it means cannot-verify **or** an unusable command line — the argument
+parser has no separate usage code, so a missing option value and an unresolvable ref both exit 23. Read the
+reason line before deciding which; do not read `23` as "always my typo" (an operator then dismisses a
+cannot-verify refusal) and do not read it as "always the instrument" (a typo then looks like a fleet fault).
 
 **What repairs it.** A frozen pool → `refresh-candidates.sh` by hand and read the funnel; a pin that
 cannot advance → `cloud-cell-supervisor.sh apply`.
@@ -620,8 +625,8 @@ flatten them again — and neither should a reader who quotes only this list):
 CI means `scripts/run-bash-shards.sh` — **the one list both lanes call**
 (`.github/workflows/ci.yml` job `bash-suites`; `.github/workflows/ci-main.yml` job `script-validate`),
 plus the pytest list in `ci.yml`'s single `python3.12 -m pytest …` step. ⛔ **No shard count is
-written down here on purpose** — an earlier draft said "85", which was wrong the moment this PR added
-one, and a live count rots on every subsequent PR exactly as a line number does (§2). Ask the file:
+written down here on purpose**: an earlier draft froze a number, which was stale the moment this PR added
+a shard, and a live count rots on every subsequent PR exactly as a line number does (§2). Ask the file:
 `bash scripts/run-bash-shards.sh --list | wc -l`.
 
 ### 5.1 Already proven by an effect test (name the shard, not the file)
@@ -635,15 +640,18 @@ one, and a live count rots on every subsequent PR exactly as a line number does 
 | precedence rule | `scripts/orchestrator-harness/test-gates.sh` | `mp_reason` extracted from the LIVE script: 1 un-owned PR closes the gate, an unreadable count drains |
 | spawn gate | `scripts/orchestrator-harness/spawn-gate.test.sh` | the gate refuses and ledgers |
 | repair actuator | `scripts/test_pr_doctor.py` §10 | `rc=2` has exactly one meaning and **the record always agrees with launchd** |
-| deployment provenance | `scripts/orchestrator-harness/selftest.sh` (15 `check-deployed-drift:` assertions) | through the SHIPPED script: match→0, a dirty source→1, a post-install edit→1, a missing record→2, `commit: UNKNOWN`→2, an unresolvable ref→2, an unknown commit object→2, BEHIND→1, a missing shipped file→1, an extra hand-placed script→1, a failed `mktemp`→2, an unreadable deployed `*.sh`→2 |
+| deployment provenance | `scripts/orchestrator-harness/selftest.sh` — its deployed-drift block: 24 assertions, 15 of them carrying the `check-deployed-drift:` prefix (the other 9 grade `install.sh`'s stamp writer, its provenance fields, and a git-absent fallback) | through the SHIPPED script: match→0, a dirty source→1, a post-install edit→1, a missing record→2, `commit: UNKNOWN`→2, an unresolvable ref→2, an unknown commit object→2, BEHIND→1, a missing shipped file→1, an extra hand-placed script→1, a failed `mktemp`→2, an unreadable deployed `*.sh`→2 |
 | deployment provenance — **which file** | `scripts/orchestrator-harness/check-deployed-drift.test.sh` **(new here, #2700)** | a **one-byte** difference is `DRIFT` (1) and the report **NAMES that file** (and not the unchanged one); restoring the byte is `OK` (0) again; and the suite asserts its own presence in the shard list |
 | supervisor / reaper / cell surface | `scripts/harness-cohesion.test.sh`, `scripts/orchestrator-harness/install-launchd-durability.test.sh`, `scripts/cloud-cell-supervisor.test.sh` | a drifted copy is NAMED and an unreadable one is BROKEN (2, never OK); a redeploy cannot persistently disable the entrypoint; and a `keys.env` top-level exit cannot turn a failed cell start into a silent success |
 
 ⛔ **The new suite is a DELTA, not a second implementation — and a mutant proves it.** `selftest.sh`
 asserts exit CODES; it cannot see a report that stops naming the file. Measured: replacing the
-file-level `drift` call with a bare `drift "$d — differs"` leaves every `selftest.sh` assertion green
-and reds **exactly one** arm of the new suite (`the report NAMES a.sh`). That is the arm's whole reason
-to exist, and it is why the new suite does not re-test the 15 arms `selftest.sh` already owns.
+file-level `drift` call so the report keeps the path but loses the `the deployed copy DIFFERS` verdict
+reds **exactly one** arm of the new suite — the one asserting that verdict — while every `selftest.sh`
+arm stays green. That is the arm's reason to exist: `selftest.sh` grades EXIT CODES, and this mutant
+changes no exit code, so its 15 arms cannot see the loss. (The arm asserts the per-file verdict line;
+it does not, by itself, prove a report that prints no filename at all would be caught — that is the
+same code path but a distinct property.)
 
 Its non-vacuity is also **structural**: §1/§2/§3 are one fixture, **one byte apart**, with opposite
 verdicts — a check that cannot see a one-byte change fails §2, and a check that is permanently red fails

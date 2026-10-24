@@ -4,11 +4,13 @@
 #
 # ── WHY THIS FILE EXISTS, AND WHY IT IS SMALL (agent-infra#2700) ────────────────────────────────
 # `scripts/orchestrator-harness/selftest.sh` already drives the shipped `check-deployed-drift.sh` end
-# to end with 15 assertions — match→0, DIRTY source→1, re-record→0, post-install edit→1, MISSING
-# record→2, `commit: UNKNOWN`→2, unresolvable ref→2, unknown commit object→2, BEHIND→1, fresh install
-# →0, MISSING shipped file→1, an extra hand-placed script→1, a failed `mktemp`→2, an unreadable
-# deployed `*.sh`→2, and the empty-`$O` payload. **That is the capability's effect test and it is
-# already in CI in both lanes.** ⛔ So this file does NOT re-implement it: a second implementation of a
+# to end — 24 assertions in that block, 15 of them carrying the `check-deployed-drift:` prefix (the
+# other 9 grade `install.sh`'s stamp writer, its provenance fields, and a git-absent fallback). The
+# prefixed 15 read: match→0, DIRTY source→1, re-record→0, post-install
+# edit→1, MISSING record→2, `commit: UNKNOWN`→2, unresolvable ref→2, unknown commit object→2,
+# BEHIND→1, fresh install→0, MISSING shipped file→1, an extra hand-placed script→1, a failed
+# `mktemp`→2, an unreadable deployed `*.sh`→2, and an empty `$O` with a real record→1.
+# **That is the capability's effect test and it is already in CI in both lanes.** ⛔ So this file does NOT re-implement it: a second implementation of a
 # live shard is a duplicate, not coverage, and it would rot independently of the first.
 #
 # The two things `selftest.sh` does not assert, and which an operator needs:
