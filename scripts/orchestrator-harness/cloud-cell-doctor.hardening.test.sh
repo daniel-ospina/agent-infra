@@ -287,6 +287,25 @@ printf '%s\n' "$*" >> "${DOCTOR_TEST_WT:?}/calls"
 exit "$(cat "${DOCTOR_TEST_WT:?}/rc" 2>/dev/null || echo 0)"
 SH
 
+# ⛔ lane-reap (#2163) IS A DOUBLE, for the same reason as in `cloud-cell-doctor.test.sh`: this suite's
+# contract is the DOCTOR's classification and hardening, not the process census — and lane-reap.sh has
+# its own hermetic suite. Without the double the doctor's process pass reads THIS fixture's stub `ps`,
+# which knows nothing of lane trees, so `lane-reap: CANNOT-VERIFY — the process table could not be
+# read` (rc=3) turned every "a clean pass is rc=0" leg red — a fact about the fixture, not about the
+# doctor. RED before this stub: 14 legs (`reap: rc=3 on a fresh box`, `reap: rc=3 for a session that
+# simply ended`, `doctor: rc=3 on a fresh box`, `status: rc=1 after passes`, the two --dry-run legs …).
+# The census's OWN unreadability doctrine is covered by lane-reap.test.sh (§UNREADABLE) and by
+# cloud-cell-doctor.test.sh (DOCTOR_TEST_REAP_ABSTAIN/INERT/TREES), not here.
+cat > "$T/bin/lane-reap" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "${DOCTOR_TEST_LANE_REAP:?}/calls"
+case "${1:-}" in
+  count) printf 'lanes=1/1 zombie=0\n' ;;
+  reap)  printf 'lane-reap: trees=1/1 zombie=0 candidates=0 reaped=0 refused=0 inert=0 unidentifiable=0 abstained=0 mode=%s\n' "${2:-dry-run}" ;;
+esac
+exit 0
+SH
+
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 
@@ -302,6 +321,9 @@ export DOCTOR_TEST_TMUX="$T/tmux" DOCTOR_TEST_PS="$T/ps" DOCTOR_TEST_GH="$T/gh" 
 # $SELF_DIR, $REPO or $CELL_HOME in this fixture. Either way the "every role passed -> status is green"
 # arm was exercising FAILING passes.
 export DOCTOR_TEST_UV="$T/uv" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt"
+# The lane-reap double (see its stub above): the doctor must delegate the process pass, and this
+# fixture must not let a second reaper loose on the runner's real process table.
+export DOCTOR_LANE_REAP_BIN="$T/bin/lane-reap" DOCTOR_TEST_LANE_REAP="$T/lane-reap"
 # The mid-pass `stop` hook in the tmux double bumps this (the file `stop` writes first), so an arm can
 # make a stop arrive DURING a pass that is already running.
 export DOCTOR_TEST_STOPGEN="$T/o/state/roles/.stop-generation"
@@ -322,7 +344,7 @@ chmod +x "$T/bin/cwdprobe"
 export LO_CWD_PROBE="$T/bin/cwdprobe" FAKE_CWD="$T/nowhere-unheld"
 export REAP_MIN_S=60 REAP_SAMPLE_S=2 DOCTOR_INTERVAL=1 MERGE_INTERVAL=1 HYGIENE_INTERVAL=1
 export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
-mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/stat"
+mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/stat" "$T/lane-reap"
 
 doc() { # <role> [extra env assignments via env]
   OUT="$(bash "$DOCTOR" "$@" 2>&1)"; RC=$?
