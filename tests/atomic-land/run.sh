@@ -2743,7 +2743,9 @@ if true; then
   # non-zero exactly like a caught mutation; reading that as "class covered" is a FALSE PASS over an
   # unchecked class. `rc` is therefore REPORTED, never trusted: only `failures > 0` is coverage.
   # And when there is no artifact, the report NAMES THE CAUSE — rc, the signal, the log path and the
-  # first diagnostic in it — because "did not run to a verdict" with a section header as its only
+  # diagnostic NEAREST THE DEATH (the LAST match, not the first: a fixture that kills a rail legitimately
+  # prints its own 'Killed' line earlier — see the note in the body) — because "did not run to a verdict"
+  # with a section header as its only
   # evidence is the unattributable-failure class (#1185) that made this shard impossible to triage.
   mutation_verdict() { # <name> <rc>
     local name="$1" rc="$2" verdict="$MUT/$1.verdict" waited=0 f c signame diag sig present=0 cap

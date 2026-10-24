@@ -145,13 +145,14 @@ trap 'rm -f "$shard_ran_log"' EXIT
 # for hours, `bash-suites` red on every PR head, and every lane re-derived those four from CI logs by
 # hand, over a 5-minute fix. The names were in the log all along; they were just not in the answer.
 #
-# ⛔ WHAT THIS DOES *NOT* DO: it does not give the merge rail a failure IDENTITY. The rail derives
-# that set from `scripts/ci_exemption.py ids`, which recognises a nodeid, a guard-step annotation or
-# ONE runner aggregate shape (`❌ <label>: <N> passed, <M> failed`) — measured against the exact lines
-# this block prints, it returns `ids=0`. A red `bash-suites` step is therefore still identified only
-# by its JOB name, an identity that does not change when a shard does, so a base red cannot be
-# subtracted by shard. That is #2643's remaining half, and it needs a line the parser RECOGNISES —
-# not a better sentence. Do not read this block as "the rail is fixed".
+# ⛔ TWO READERS, TWO MECHANISMS — and the rail is served by the OTHER one. `run_shard` emits
+# `::error::bash shard failed: <path>`, a GitHub annotation, and `scripts/ci_exemption.py ids`
+# recognises it as a guard-step identity that CARRIES the shard path — measured on a log with two of
+# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. That is what
+# makes a red `bash-suites` step comparable to main's baseline PER SHARD, and it is NOT this block:
+# measured against the prose lines printed here, the same parser returns `ids=0` — they neither help
+# nor hurt it. Do not "fix" the rail here, and never delete the annotation while keeping these lines:
+# that would leave every lane unattributable again.
 #
 # Two prints, on purpose — and the REASON is the early exits: the recap below is reached only at the
 # END of a run, while this file has several `exit 1` paths ABOVE it (`shard target resolves outside
@@ -216,11 +217,14 @@ swept=0
 # and covers BOTH classes, so a recap that DERIVES "the sweep half" by subtracting the named shards
 # is guessing: when the naming arm itself is broken, a failing SHARD opens the "all sweeps" branch and
 # points the reader at the wrong subsystem. One counter, incremented where the failure happens.
-# ⛔ AND THE ` || shard_errors=$((shard_errors + 1))` LITERAL MUST SURVIVE HERE (
-# `tests/ci-lane-parity/run.sh` §8h pins it by `sed` across BOTH functions). So the second counter is
-# charged from the same delta idiom `run_shard` uses, rather than by rewriting the recorder into a
-# `{ …; }` group: a grouped rewrite silently narrowed that pin to `run_shard` alone, meaning a
-# refactor could delete the sweep recorder and nothing would notice (caught by review, cycle 2).
+# ⛔ THE ` || shard_errors=$((shard_errors + 1))` LITERAL SURVIVES IN `sweep_file` because
+# `tests/ci-lane-parity/run.sh` §8h pins it by `sed` — and MEASURED, that `sed` changes ONLY
+# `sweep_file` (plus a comment). `run_shard`'s recorder is the grouped form main added on 2026-10-24
+# (`bash "$1" || { shard_errors=…; … echo "::error::…"; }`), so the sed never matched it, before or
+# after this branch; `run_shard`'s recorder is pinned by the runtime failure-recording sentinel
+# instead. The second counter below is therefore charged from the same DELTA idiom rather than by
+# rewriting the recorder into another group, so a reader who trusts §8h keeps seeing exactly what
+# §8h covers.
 sweep_errors=0
 sweep_file() { swept=$((swept + 1)); shard_err0=$shard_errors; bash -n "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_errors" -ne "$shard_err0" ] && sweep_errors=$((sweep_errors + 1)); }
 
@@ -472,10 +476,13 @@ if [ "$shard_errors" -gt 0 ]; then
     if [ "$sweep_errors" -gt 0 ]; then
       echo "❌ …and $sweep_errors of them are SYNTAX-SWEEP failures, not shards — each named at its own 'bash -n' line"
     fi
-  elif [ "$sweep_errors" -gt 0 ]; then
-    echo "❌ no shard is named here — every failure above is a syntax-sweep failure, named at its own 'bash -n' line"
+  elif [ "$sweep_errors" -eq "$shard_errors" ] && [ "$sweep_errors" -gt 0 ]; then
+    echo "❌ every failure above is a syntax-sweep failure, named at its own 'bash -n' line"
   else
-    echo "❌ no shard is named here and no syntax sweep failed — the naming arm is NOT WIRED (a shard failed and nothing recorded its name). This is a defect in scripts/run-bash-shards.sh, not in the shard: read the per-shard output above for the path."
+    # Mixed AND unnamed: a broken naming arm alongside a failing sweep. Do NOT claim the sweep caused
+    # everything — measure it. (Final review: this branch used to say "every failure above is a
+    # syntax-sweep failure", which sent triage to fix the sweep and lose the unnamed shard with it.)
+    echo "❌ no shard is named, and $((shard_errors - sweep_errors)) of the $shard_errors failure(s) is/are NOT a syntax sweep — the naming arm is not wired for them. This is a defect in scripts/run-bash-shards.sh, not in the shard: read the per-shard output above for the path."
   fi
   exit 1
 fi

@@ -310,9 +310,10 @@ test("resolvePiRoot honors an explicit PI_ROOT", () => {
 test("detectSourcePatch reports PRESENT for a PATCHED bundle (hermetic fixture)", () => {
 	// The positive arm used to be the LIVE install only, so the detector's "present" answer was
 	// pinned nowhere else — and a box whose pi is unpatched or upgraded failed here for a reason that
-	// has nothing to do with this checkout. Measured 2026-10-24: the SAME commit and the SAME job
-	// (`verify`) passed on a GitHub-hosted runner and failed on the self-hosted cell runner, because
-	// the two boxes carry different pi installs — a host dependency wearing a test's clothes, and one
+	// has nothing to do with this checkout. Measured 2026-10-24, same JOB (`verify`) one commit apart:
+	// 616d44a0 (GitHub-hosted runner, `GitHub Actions 1000589718`) PASSED and d1024c5d (self-hosted
+	// `ai-runner-cell1-x64-1`) FAILED — the diff between them is EMPTY for this file, so the two boxes
+	// differ in their pi install, not in the code: a host dependency wearing a test's clothes, and one
 	// that reddens every PR's evaluated tree (§4.5 of the merge rail) whichever runner picks the job.
 	// The detector's answer is now pinned against a FIXTURE, exactly as its negative control is.
 	const dir = mkdtempSync(join(tmpdir(), "clamp-floor-probe-ok-"));
