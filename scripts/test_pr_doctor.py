@@ -636,7 +636,7 @@ def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
     monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "failed")
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: (False, "gate refused rc=75", False))
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d, *_rest: (False, "gate refused rc=75", False))
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -661,7 +661,7 @@ def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, d: (False, "worktree dirty -- refusing", True))
+                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True))
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -1589,7 +1589,7 @@ def _drive(monkeypatch, *, prs, action, cap_env, dispatch=None):
                         lambda p, a, why=None, cr=None: "brief-%s" % p["number"])
     monkeypatch.setattr(pr, "log", lambda msg: None)
     if dispatch is None:
-        def dispatch(p, a, text, dry):
+        def dispatch(p, a, text, dry, *_rest):
             sent.append("prd-%s" % p["number"])
             return True, "", False
     monkeypatch.setattr(pr, "dispatch", dispatch)
@@ -1809,7 +1809,7 @@ def test_a_head_change_does_not_bypass_the_live_worker_guard(monkeypatch):
     monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "running")   # prd-7 is alive
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: calls.append(p["number"]) or (True, "", True))
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d, *_rest: calls.append(p["number"]) or (True, "", True))
     monkeypatch.setattr(pr, "save_state", lambda st2: None)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -2821,7 +2821,7 @@ def test_a_running_pr_is_never_dispatched(monkeypatch):
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
     sent = []
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry: sent.append("prd-%s" % p["number"]) or (True, "", False))
+                        lambda p, a, t, dry, *_rest: sent.append("prd-%s" % p["number"]) or (True, "", False))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
     assert sent == ["prd-2"], sent                       # the running PR got NO order
@@ -2867,7 +2867,7 @@ def test_a_partly_blind_pass_that_DID_work_is_a_clean_pass(monkeypatch):
     # that path does not exist -- the pass would refuse to spawn BLIND (correctly) and this test
     # would read rc 2 for the wrong reason.
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry: (True, "", False))
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry, *_rest: (True, "", False))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
     assert any("UNREADABLE" in m for m in logs), logs
@@ -2906,7 +2906,7 @@ def test_a_pass_whose_every_order_was_refused_is_not_a_clean_pass(monkeypatch):
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry: (False, "dispatcher exited rc=78", False))
+                        lambda p, a, t, dry, *_rest: (False, "dispatcher exited rc=78", False))
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     # ⛔ 3, NOT 2 (2026-10-18). "I could not READ" and "I read, I placed, nobody took it" are
@@ -2934,7 +2934,7 @@ def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monk
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
 
     # PR #1 is placed. PR #2's spawn fails transiently (not recorded -> undeliverable).
-    def dispatch(p, a, t, dry):
+    def dispatch(p, a, t, dry, *_rest):
         return (True, "", False) if p["number"] == 1 else (False, "dispatcher exited rc=78", False)
 
     monkeypatch.setattr(pr, "dispatch", dispatch)
@@ -3775,7 +3775,7 @@ def test_a_recovered_pass_is_published_as_a_degradation_not_a_plain_ok(monkeypat
     # `(launched, detail, record)`, and `worker_live()` is the per-PR liveness probe. Stubbing the
     # old `idle_lanes`/`dispatch -> bool` pair is what made this helper-shaped test inert on main.
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry: (True, "spawned", False))
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry, *_rest: (True, "spawned", False))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--repo", _TEST_REPO])
     assert pr.main() == 0, "\n".join(logs)
     import json as _json
@@ -4311,7 +4311,7 @@ def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("p
     monkeypatch.setattr(pr, "worker_live", live if callable(live) else (lambda name: live))
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry: ((True, "spawned", False) if launched
+                        lambda p, a, t, dry, *_rest: ((True, "spawned", False) if launched
                                               else (False, "dispatcher exited rc=78", False)))
     monkeypatch.setattr(pr, "log", logs.append)
     # The repo-resolution tests are their OWN section; every other pass test names the repo it
@@ -4515,7 +4515,7 @@ def test_un_owned_prs_are_dispatched_before_owned_ones(monkeypatch):
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry: order.append("prd-%s" % p["number"]) or (True, "", False))
+                        lambda p, a, t, dry, *_rest: order.append("prd-%s" % p["number"]) or (True, "", False))
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
@@ -5482,10 +5482,10 @@ def test_a_crash_in_one_repo_does_not_stop_the_set_and_reaches_the_canonical_rec
     logs = []
     real_run_pass = pr.run_pass
 
-    def boom(args):
+    def boom(args, *_rest, **_kw):
         if pr.REPO == _REPO_A:
             raise RuntimeError("classifier exploded")
-        return real_run_pass(args)
+        return real_run_pass(args, *_rest, **_kw)
 
     monkeypatch.setattr(pr, "run_pass", boom)
     monkeypatch.setattr(pr, "open_prs", lambda: [])
@@ -5896,3 +5896,110 @@ def test_the_per_repo_log_is_the_file_the_readme_names(monkeypatch, tmp_path):
         assert pr._log_path() == canonical
     finally:
         pr.canonical_paths()
+
+
+# ── #2280 review (cycle 1) — the three findings, each pinned by its OWN failing arm ──────────
+def test_the_SHIPPED_plist_names_the_repo_the_armed_job_grades(tmp_path, monkeypatch):
+    """The armed job's own evidence must resolve, or the job is dark and looks armed.
+
+    ⛔ WHY THIS TEST EXISTS AT ALL. `resolve_repo()` REPLACED a module constant with a refusal, so
+    every launcher that used to work only because of that constant is now a candidate for exit 2.
+    Measured on the shipped `com.tortoise.pr-doctor` template: it carried `GH_REPO`
+    (`daniel-ospina/tortoise`) and no `--repo`, no `OR`, no `REPO` and no `WorkingDirectory` — and
+    launchd runs a job with cwd `/`. `GH_REPO` is deliberately NOT evidence (#2235), so that job
+    would have exited 2 on every 1800 s tick and dispatched nothing for ever. The template ships in
+    THIS tree, so the fix ships with the change that broke it, and this test reads the SHIPPED FILE
+    rather than a hand-built env: a future edit that re-adds `GH_REPO` and drops the flag goes red.
+    """
+    import plistlib
+    spec = plistlib.loads(
+        (_REPO / "templates" / "launchd" / "com.tortoise.pr-doctor.plist").read_bytes())
+    argv = list(spec["ProgramArguments"])
+    # ⛔ NO WorkingDirectory, DELIBERATELY: the job's cwd is `/`, so the cwd can never be its
+    # evidence. If that key is ever added, this assertion should be revisited WITH the plist.
+    assert "WorkingDirectory" not in spec
+    assert "--repo" in argv, "the shipped job names no repo: %r" % (argv,)
+    explicit = argv[argv.index("--repo") + 1]
+
+    co = _checkout(tmp_path, "co-tortoise", _REPO_B)
+    env = {k: v for k, v in spec["EnvironmentVariables"].items() if "{{" not in v}
+    env["REPO"] = str(co)            # what install-launchd.sh renders {{TORTOISE_REPO}} into
+    slug, checkout, source, why = pr.resolve_repo(explicit=explicit, env=env)
+    assert slug == _REPO_B
+    assert source == "--repo" and why == ""
+    assert checkout == str(co), "the checkout must be ADOPTED, not merely named"
+
+    # AND THE PRE-FIX SHAPE MUST REFUSE -- otherwise this test would pass on a resolver that still
+    # had a default, which is the whole defect.
+    _neutral_cwd(monkeypatch, tmp_path)
+    monkeypatch.chdir("/")
+    with pytest.raises(pr.RepoUnresolved):
+        pr.resolve_repo(explicit=None, env={"GH_REPO": _REPO_B, "PATH": "/usr/bin"})
+
+
+def test_a_machine_wide_rubric_cannot_attribute_a_SET_of_repos(tmp_path, monkeypatch):
+    """One declaration names no repo, so a set of repos cannot be judged by it.
+
+    The seams are process-wide (`OBJECTIVE_REQUIRED`/`OBJECTIVE_SURFACE` carry values, no slug), so
+    a set grading two repos has no way to say which one the operator declared. Guessed, the loser
+    gets the failure this change exists to stop (a surface-touching diff handed to the automated
+    lander, every green PR `rerun-checks`). `set_rubric_note()` is the derived, per-pass answer.
+    """
+    assert pr._rubric_supplied(), "the fixture supplies the seams; this test is about the SET"
+    two = "%s=%s,%s=%s" % (_REPO_A, "/co/a", _REPO_B, "/co/b")
+    assert pr.set_rubric_note(pr.configured_repos([_REPO_A, _REPO_B],
+                                                  env={"PR_DOCTOR_REPOS": two}))
+    # ONE repo is attributable, in either spelling (a set of one, or the same repo twice).
+    assert pr.set_rubric_note([_REPO_A]) == ""
+    assert pr.set_rubric_note([_REPO_A, "%s=/co/other" % _REPO_A]) == ""
+    # AND IT REACHES THE DISPATCHER, per repo, from the set's own computation -- not a stored flag.
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "%s=%s,%s=%s" % (_REPO_A, co_a, _REPO_B, co_b))
+    seen = []
+
+    def _rp(args, note="", *_r, **_k):
+        seen.append((pr.REPO, note))
+        return 0
+
+    monkeypatch.setattr(pr, "run_pass", _rp)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    pr.main()
+    assert [s for s, _n in seen] == [_REPO_A, _REPO_B], seen
+    assert all(note for _s, note in seen), seen
+    assert "MACHINE-wide" in seen[0][1]
+    assert seen[0][1] == seen[1][1], "one attribution must hold for the whole set"
+    # The refusal is a REFUSAL on the dispatch path too, so a set that skips `run_pass` cannot
+    # still place an order.
+    assert pr.dispatch({"number": 1}, "rerun-checks", "brief", True,
+                       seen[0][1]) == (False, seen[0][1], False)
+
+
+def test_the_machine_wide_status_view_NAMES_its_own_age_and_the_per_repo_records(tmp_path,
+                                                                                monkeypatch):
+    """`--status` with no `--repo` must not present a frozen file as the current machine view.
+
+    `--all-repos` re-points `STATE` per repo and restores only the PATH at the end, so a set-only
+    box never writes the canonical `pr-doctor.json` — the unlabelled view is then whatever the last
+    SINGLE-repo pass left, possibly days old, for a repo the set may no longer contain. Its rows
+    carry no repo field, which is exactly why the per-repo printer refuses to substitute it; the
+    same reason applies to the file that IS presented as the machine-wide view.
+    """
+    st = tmp_path / "pr-doctor.json"
+    st.write_text("{}")
+    three_days = time.time() - 3 * 86400
+    os.utime(str(st), (three_days, three_days))
+    monkeypatch.setattr(pr, "STATE", str(st))
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    (tmp_path / "pr-doctor.daniel-ospina-tortoise.json").write_text("{}")
+    note = pr._status_age_note()
+    assert str(st) in note and "3d ago" in note, note
+    assert "no repo field" in note, note
+    assert "pr-doctor.daniel-ospina-tortoise.json" in note, note
+    assert "--all-repos" in note, note
+    # AN ABSENT FILE IS NOT "NOTHING IN COOLDOWN": the rows are missing, the fact is not.
+    monkeypatch.setattr(pr, "STATE", str(tmp_path / "absent.json"))
+    assert "NOT the same" in pr._status_age_note()
