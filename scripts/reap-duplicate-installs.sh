@@ -159,8 +159,14 @@ acquire_lock() {
         printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
         LOCK_HELD=1; return 0
     fi
-    owner="$(sed -n 's/^pid=//p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
-    started="$(sed -n 's/^started=//p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
+    # ⛔ THE TOKEN IS ONE LINE: `pid=<n> started=<epoch>`. Parsing `s/^pid=//` captures the whole
+    # tail (`"1234 started=5678"`), which `num` rejects — so the live-owner check never ran, the
+    # tokenless arm (anchored `^started=`) never matched either, and EVERY existing lock was declared
+    # stale and DELETED WHILE ITS OWNER WAS LIVE. That removed the only exclusion between two
+    # concurrent sweeps of one root: both classify the same directory, both remove it, and the loser
+    # reports a removal failure for something already gone. Capture the FIELDS, not the tail.
+    owner="$(sed -n 's/^.*pid=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
+    started="$(sed -n 's/.*started=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     if num "$owner" && kill -0 "$owner" 2>/dev/null; then say "SKIP reason=lock-held pid=$owner"; return 3; fi
     if num "$started" && [ -f "$LOCK_DIR/token" ] && [ $(( $(now) - started )) -le "$LOCK_STALE_SECONDS" ]; then
         say "SKIP reason=lock-tokenless age=$(( $(now) - started ))s"; return 3

@@ -240,18 +240,28 @@ case_c() { # <owner-script>
 
 # ── D: the pinned sha is never reaped, even when old and apparently idle ────────────────────────
 case_d() { # <owner-script>
-    local owner="$1" base root repo byname bypath free out rc sha stamp
+    local owner="$1" base root repo byname bypath byalias free out rc sha stamp
     base="$(newbase d)"; root="$base/scratch"
     repo="$(mk_repo "$base")"
     sha="0123456789abcdef0123456789abcdef01234567"
     byname="$(mk_linked_wt "$repo" "$root" "${sha:0:12}" feat/d-sha)"
     bypath="$(mk_linked_wt "$repo" "$root" pinned feat/d-path)"
     free="$(mk_linked_wt "$repo" "$root" free feat/d-free)"
+    # ⛔ A STAMP THAT NAMES ITS TREE THROUGH A SYMLINK. Candidates are compared by PHYSICAL path, so a
+    # stamp spelling that goes via a link matched nothing: on macOS (`/tmp` -> `/private/tmp`) the
+    # default `--root /tmp` makes EVERY candidate `/private/tmp/…`, so the path arm of the pin was dead
+    # by construction there — and the pinned checkout was reaped.
+    # The alias points at the CANDIDATE itself: its raw spelling shares no prefix with the physical
+    # path, so only canonicalisation can protect it — and it covers nothing else (an alias to the
+    # scratch ROOT would pin every sibling and the "free" assertion would stop discriminating).
+    byalias="$(mk_linked_wt "$repo" "$root" pinned-via-alias feat/d-alias)"
+    ln -s "$byalias" "$base/alias-worktree"
+    age_path "$byalias" 900
     age_path "$byname" 900; age_path "$bypath" 900; age_path "$free" 900
     stamp="$base/.agent-infra-stamp.json"
     mkdir -p "$base"
-    printf '{\n  "version": 1,\n  "surface": "cloud-cell",\n  "harness": "%s",\n  "commit": "%s"\n}\n' \
-        "$bypath/scripts" "$sha" >"$stamp"
+    printf '{\n  "version": 1,\n  "surface": "cloud-cell",\n  "harness": "%s",\n  "harness_alias": "%s",\n  "commit": "%s"\n}\n' \
+        "$bypath/scripts" "$base/alias-worktree" "$sha" >"$stamp"
     out="$(REAP_AW_STAMP="$stamp" REAP_AW_STATE_DIR="$base/state" REAP_AW_ROOTS="$root" \
            bash "$owner" --apply 2>&1)"; rc=$?
     [ -n "${DRC_DEBUG:-}" ] && printf 'D rc=%s\n%s\n' "$rc" "$out" >&2
@@ -261,6 +271,8 @@ case_d() { # <owner-script>
     case_check "$([ -d "$bypath" ] && echo 0 || echo 1)" "the directory UNDER the stamped harness path SURVIVED"
     case_check "$(grep -qF "KEPT   $bypath reason=pinned" <<<"$out" && echo 0 || echo 1)" \
                "and is KEPT BY NAME with reason=pinned (the path arm)"
+    case_check "$([ -d "$byalias" ] && echo 0 || echo 1)" \
+               "a checkout reached by the stamp's SYMLINKED spelling SURVIVED (pins are canonicalised)"
     case_check "$([ ! -d "$free" ] && echo 0 || echo 1)" \
                "a sibling candidate in the SAME run was reaped — the pin is not a blanket refusal"
     return $((CASE_FAIL > 0))
@@ -415,6 +427,28 @@ case_i() { # <owner-script>
     return $((CASE_FAIL > 0))
 }
 
+# ── J: a lock held by a LIVE pid is honoured, never reclaimed as stale ──────────────────────────
+# The token is ONE line (`pid=<n> started=<epoch>`). Parsing it as `s/^pid=//` captures the whole tail,
+# which `num` rejects — so the live-owner check never ran, the tokenless arm (anchored `^started=`)
+# never matched either, and EVERY existing lock was declared stale and DELETED WHILE ITS OWNER WAS
+# LIVE. That removed the only exclusion between two concurrent sweeps of one root.
+case_j() { # <owner-script> <lock-dir-name>
+    local owner="$1" lockname="$2" base root state out rc
+    base="$(newbase j)"; root="$base/root"; state="$base/state"
+    mkdir -p "$root" "$state/$lockname"
+    # the owner's OWN token format, naming a pid that is certainly alive (this test shell)
+    printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$state/$lockname/token"
+    out="$(REAP_AW_STATE_DIR="$state" REAP_DI_STATE_DIR="$state" REAP_AW_ROOTS="$root" REAP_DI_ROOTS="$root" \
+           bash "$owner" --apply 2>&1)"; rc=$?
+    [ -n "${DRC_DEBUG:-}" ] && printf 'J %s rc=%s\n%s\n' "$lockname" "$rc" "$out" >&2
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" "a LIVE lock is a refusal (rc=$rc, expected 3)"
+    case_check "$(grep -qF 'SKIP reason=lock-held' <<<"$out" && echo 0 || echo 1)" \
+               "and it says so by name (SKIP reason=lock-held)"
+    case_check "$([ -d "$state/$lockname" ] && echo 0 || echo 1)" \
+               "and the live owner's lock is still there (never reclaimed)"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 MUT_A='s/if lp_path_held "\$CENSUS" "\$canon"; then/if false; then/'
 MUT_B='s/if remove_one "\$canon" "\$repo"; then/if false; then/'
@@ -425,6 +459,8 @@ MUT_F='s/REPO_ARM_OK=0; REPOS=""/return 3/'
 MUT_G='s/if \[ "\$reaped" = 0 \] \&\& ! is_dry; then/if false; then/'
 MUT_H='s/if \[ -L "\$d" \]; then/if false; then/'
 MUT_I='s/        dirty="?"$/        dirty="0"/'
+MUT_D2='s/^        PIN_PATHS="\$_pc"$/        :/'
+MUT_J='s/kill -0/false/'
 
 echo "── disk-reaper-classes.test.sh — #2542 classes ─────────────────────────────────────────────"
 
@@ -500,6 +536,19 @@ if apply_mutation "$AW_OWNER" "$T/mut-i/reap-abandoned-worktrees.sh" "$MUT_I"; t
     expect_fail "I mutation: reading a failed git status as dirty=0 turns the case RED" case_i "$T/mut-i/reap-abandoned-worktrees.sh"
 else
     bad "I mutation could not be applied (the unreadable-tree arm moved) — the case is not checking it any more"
+fi
+
+expect_pass "J a lock held by a LIVE pid is honoured (abandoned-worktree owner)" case_j "$AW_OWNER" reap-abandoned-worktrees.lock
+expect_pass "J a lock held by a LIVE pid is honoured (duplicate-install owner)" case_j "$DI_OWNER" reap-duplicate-installs.lock
+if apply_mutation "$AW_OWNER" "$T/mut-j/reap-abandoned-worktrees.sh" "$MUT_J"; then
+    expect_fail "J mutation: mis-parsing the lock token turns the case RED" case_j "$T/mut-j/reap-abandoned-worktrees.sh" reap-abandoned-worktrees.lock
+else
+    bad "J mutation could not be applied (the lock token parse moved) — the case is not checking it any more"
+fi
+if apply_mutation "$AW_OWNER" "$T/mut-d2/reap-abandoned-worktrees.sh" "$MUT_D2"; then
+    expect_fail "D mutation: dropping the pin canonicalisation turns the symlinked-stamp case RED" case_d "$T/mut-d2/reap-abandoned-worktrees.sh"
+else
+    bad "D canonicalisation mutation could not be applied — the aliased pin is not being checked"
 fi
 
 echo
