@@ -313,8 +313,18 @@ def _count(budget: Budget, query: str) -> tuple[int | None, str]:
     if rc != 0:
         return None, f"UNREADABLE rc={rc} {one_line(err)}"
     try:
-        return int(json.loads(out)["total_count"]), ""
-    except (ValueError, KeyError, TypeError):
+        obj = json.loads(out)
+    except ValueError:
+        return None, "UNREADABLE — the search answer was not JSON"
+    if not isinstance(obj, dict) or obj.get("incomplete_results"):
+        # ⛔ GITHUB ITSELF CAN SAY THE ANSWER IS INCOMPLETE, and an incomplete answer is not a count:
+        # `total_count: 0, incomplete_results: true` would render `open P0=0` - i.e. `STANDING=DONE` -
+        # on the one rule this file is built on (a `0` is a CLAIM that the goal is met).
+        return None, ("UNREADABLE — the search answer was INCOMPLETE (incomplete_results)"
+                      if isinstance(obj, dict) else "UNREADABLE — the answer was not a JSON object")
+    try:
+        return int(obj["total_count"]), ""
+    except (KeyError, TypeError, ValueError):
         return None, "UNREADABLE — the search answer carried no total_count"
 
 
@@ -1544,8 +1554,10 @@ def read_prs(budget: Budget, slug: str, max_prs: int) -> list[dict]:
         # could never be dispatched. This file already refuses a full statuses page and a
         # page-truncated check surface for the same reason; the listing was the one read that did not.
         raise Skipped(f"UNREADABLE pulls — the listing filled its {max_prs}-row page "
-                      f"({len(rows)} row(s) read), so the queue may be truncated — page the listing "
-                      f"(`--max-prs` cannot exceed the API's own 100-row cap)")
+                      f"({len(rows)} row(s) read), so the queue may be truncated. ⛔ THIS TOOL CANNOT "
+                      f"PAGE IT (no Link-header pagination) and `--max-prs` cannot exceed the API's "
+                      f"100-row cap: the actionable bound is to bring the open-PR queue under 100, and "
+                      f"pagination is a named follow-up - not a flag an operator can raise")
     prs = []
     for r in rows:
         if not isinstance(r, dict):
@@ -1754,13 +1766,28 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
         # evidence from minutes ago — which is why the two can disagree within one report: the deploy
         # table is the later, authoritative read.
         d = probe_box(name, status_cmd, timeout=15)
-        on_pin = bool(d["readable"] and d["relation"] == "current"
-                      and d.get("source") != "stamp"
-                      and main_sha and d["harness"][:12] == main_sha[:12])
+        # ⛔ `on_pin` CARRIES EVERY TERM, INCLUDING THE ACTIVATION. Goal 2 is "the SAME harness
+        # version DEPLOYED **AND ACTIVATED**": a box whose pin is main but whose controller is
+        # STOPPED has deployed the version and is not running it — and that is exactly the row this
+        # arm's own damage leaves behind (a `stop -> apply -> start` whose `apply` advances the pin
+        # and whose `start` fails). Counting it as `MARKERS-HOLD` reported the fleet as autonomous in
+        # the one state the deploy arm exists to repair, so `controller != RUNNING` is a reason too.
+        reasons: list[str] = []
+        if d["relation"] != "current":
+            reasons.append(f"relation={d['relation'] or '?'}")
+        if not main_sha:
+            reasons.append("main=UNREADABLE (not compared)")
+        elif d["harness"][:12] != main_sha[:12]:
+            reasons.append("a different commit from this cycle's main")
+        if d.get("source") == "stamp":
+            reasons.append("source=stamp(seeded, not running)")
+        if d["controller"] != "RUNNING":
+            reasons.append(f"controller={d['controller'] or '<unread>'}")
         rows.append({"box": name, "harness": d["harness"][:12], "relation": d["relation"],
                      "source": d.get("source", ""), "controller": d["controller"],
                      "roles": d["roles"], "readable": bool(d["readable"]),
-                     "on_pin": on_pin, "note": ""})
+                     "on_pin": bool(d["readable"] and not reasons), "reasons": reasons,
+                     "note": ""})
     return rows
 
 
@@ -1773,10 +1800,8 @@ def _drift_text(rows: list[dict]) -> str:
             parts.append(f"{r['box']}=UNREADABLE")
         else:
             tag = f"{r['harness'] or '<none>'} [{r['relation'] or '?'}]"
-            if r.get("source") == "stamp":
-                tag += " source=stamp(seeded, not running)"
-            elif r["relation"] == "current" and not r.get("on_pin"):
-                tag += " (a different commit from this cycle's main)"
+            if r.get("reasons"):
+                tag += " — " + "; ".join(r["reasons"])
             parts.append(f"{r['box']}={tag}")
     return " · ".join(parts)
 
@@ -1831,9 +1856,10 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
 
     currents = [r for r in drift if r.get("on_pin")]
     boxes_bad = [r for r in drift if not r.get("on_pin")]
-    if not drift or qo_why or qm_why or not main_sha:
-        # ⛔ WITHOUT `origin/main` THERE IS NO "SAME VERSION EVERYWHERE" TO ASSERT: every row could be
-        # `[current]` against its own ref and the goal would still read like a fleet on one pin.
+    # ⛔ THE STANDING IS DECIDED BY THE DRIFT ALONE. A queue count that did not come back is its OWN
+    # sub-note: folding it in here downgraded a MEASURED drift (a box provably off-pin) to
+    # `NOT-MEASURED` on exactly the degraded cycles where the owner needs the drift reported.
+    if not drift:
         goal2 = "NOT-MEASURED"
     elif boxes_bad:
         goal2 = "MARKERS-BROKEN"
@@ -1853,9 +1879,10 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
                      "cannot be asserted at all")
     for name, why in unreadable:
         lines.append(f"  ⚠️ {name}: {why}")
-    for why in (qo_why, qm_why):
-        if why:
-            lines.append(f"  ⚠️ queue: {why}")
+    if qo_why or qm_why:
+        # ONE line, not one per failed count: two identical `⚠️ queue:` lines said the same thing
+        # twice and read like two separate failures.
+        lines.append("  ⚠️ queue: " + "; ".join(w for w in (qo_why, qm_why) if w))
     if not (qo_why or qm_why) and qo.isdigit() and qm.isdigit() and int(qm) < int(qo):
         # NOT a standing flip: how many of those open PRs are stale or drafts is not read here, so
         # calling this "the queue is behind" as a verdict would be inventing a threshold. It is
@@ -1877,12 +1904,13 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
                        f"come back (see the ⚠️ lines). Repair the read; do not assume the goal holds.")
 
     if goal2 == "MARKERS-BROKEN":
-        drift_names = ", ".join(r["box"] for r in boxes_bad) or "<unread>"
+        drift_names = ", ".join(f"{r['box']} ({'; '.join(r.get('reasons') or ['not verified'])})"
+                                for r in boxes_bad) or "<unread>"
         actions.append(
-            f"**Goal 2 (harness autonomy):** {len(currents)}/{len(drift)} boxes report `[current]` — "
-            f"NOT all: {drift_names}. The SAME harness version deployed AND activated everywhere is "
-            f"the marker; activate/deploy it (the deploy arm below) before anything else one box at a "
-            f"time.")
+            f"**Goal 2 (harness autonomy):** {len(currents)}/{len(drift)} boxes run this cycle's "
+            f"main, deployed AND activated — NOT all: {drift_names}. The SAME harness version on "
+            f"every box is the marker; deploy/activate it (the deploy arm below) before anything else, "
+            f"one box at a time.")
     elif goal2 == "MARKERS-HOLD":
         actions.append(
             f"**Goal 2 (harness autonomy):** markers HOLD — all {len(drift)} box(es) report `[current]`, "
@@ -2398,8 +2426,14 @@ def main(argv=None) -> int:
             "core": {"remaining": budget.core_remaining, "limit": budget.core_limit},
             "search_calls": budget.search_calls, "search_budget": GOAL_SEARCH_BUDGET,
             "goals": goal_lines, "goal_actions": goal_actions,
+            # ⛔ THE MACHINE SURFACE MUST CARRY THE SAME READING AS THE REPORT. Publishing only
+            # `relation` let a consumer re-derive the marker as `relation == "current"` - exactly the
+            # fail-open the human report was just fixed for. `on_pin` + its `reasons` are the answer.
             "drift": [{"box": r["box"], "harness": r["harness"],
-                       "relation": r["relation"], "readable": r["readable"]} for r in drift],
+                       "relation": r["relation"], "readable": r["readable"],
+                       "source": r.get("source", ""), "controller": r.get("controller", ""),
+                       "on_pin": bool(r.get("on_pin")), "reasons": list(r.get("reasons") or [])}
+                      for r in drift],
             "landing": [{"pr": r["pr"]["number"], "head": r["pr"]["head"], "rank": r["rank"],
                          "verdict": r["verdict"], "readings": r["readings"],
                          "detail": r["detail"], "dispatch": r.get("dispatch", False),

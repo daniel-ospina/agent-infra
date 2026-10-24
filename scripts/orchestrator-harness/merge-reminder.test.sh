@@ -1862,8 +1862,8 @@ ck "§27 the goals block precedes the landing table in the report" \
         "$O/MERGE-REMINDER.md" && echo 0 || echo 1)"
 ck "§27 the goal reads never spend the landing arm's CORE bound" \
    "$([ "$(wc -l < "$FX/calls.txt")" -eq 5 ] && echo 0 || echo 1)"
-ck "§27 ...and no SEARCH read is counted in the core bucket at all" \
-   "$(nq 'search/' "$(cat "$FX/calls.txt")" && echo 0 || echo 1)"
+ck "§27 ...and the SUT's OWN accounting separates the two buckets (search 7/8, REST 4/9)" \
+   "$(qF '**search:** 7/8' "$MDF" && qF '**REST:** 4/9' "$MDF" && echo 0 || echo 1)"
 
 # A count that could not be READ is NOT-MEASURED — never 0. "0 open P0" is a claim (the goal is
 # met), and it is exactly the claim this block exists to refuse to invent.
@@ -1875,6 +1875,14 @@ ck "§27 an unreadable goal count is NOT-MEASURED, never 0" \
    "$(qF 'STANDING=NOT-MEASURED' "$MDF" && nq 'open P0=0' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and the reason it could not be read is printed" \
    "$(qF 'no total_count' "$MDF" && echo 0 || echo 1)"
+# GitHub can flag its OWN answer incomplete; `total_count: 0` with `incomplete_results: true` would
+# otherwise render `open P0=0`, i.e. STANDING=DONE, on the one rule this file is built on.
+write_baseline; reset_o
+printf '{"total_count":0,"incomplete_results":true}\n' > "$FX/search.json"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 an INCOMPLETE search answer is not a count (never P0=0 / DONE)" \
+   "$(qF 'was INCOMPLETE' "$MDF" && nq 'open P0=0' "$MDF" && nq 'STANDING=DONE' "$MDF" && echo 0 || echo 1)"
 
 # GOAL 2's markers: every box on the pin, else the marker is BROKEN and the drifted box is NAMED.
 write_no_landing; reset_o
@@ -1947,6 +1955,23 @@ out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a source=stamp box cannot hold the marker (seeded ≠ running)" \
    "$(qF 'STANDING=MARKERS-BROKEN' "$MDF" && qF 'source=stamp(seeded, not running)' "$MDF" && echo 0 || echo 1)"
+# ⛔ DEPLOYED IS NOT ACTIVATED. A box whose pin is main but whose controller is STOPPED is the row a
+# `stop -> apply -> start` leaves when `apply` advances the pin and `start` fails - and reporting it as
+# MARKERS-HOLD called the fleet autonomous in the exact state the deploy arm exists to repair.
+printf 'harness: %s [current] source=pin\ncontroller: STOPPED\nroles: idle\n' \
+  "$MAIN12" > "$FX/box.stopped.txt"
+cat > "$TMP/box-stopped.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.stopped.txt"
+STUB
+chmod +x "$TMP/box-stopped.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-stopped.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27 a box at the pin with controller=STOPPED cannot hold the marker" \
+   "$(qF 'STANDING=MARKERS-BROKEN' "$MDF" && qF 'controller=STOPPED' "$MDF" && echo 0 || echo 1)"
+ck "§27 ...and the action says deployed is not activated" \
+   "$(qF 'deployed AND activated' "$MDF" && echo 0 || echo 1)"
 rm -f "$O/state/boxes.tsv"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
