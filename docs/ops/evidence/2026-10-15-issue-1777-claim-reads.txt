@@ -1,0 +1,178 @@
+========================================================================
+EVIDENCE — agent-infra#1777: a LIVE orchestrator lane read as free
+host: Daniels-MacBook-Air-new   date: 2026-10-15T15:58:50Z
+branch: fix/orchestrator-lane-visibility
+HEAD:   934f883a46205c09a499f6190c127132ebf9becd
+origin/main at generation: 26ad39a33fff665fde92d0aa3701df18ba922429
+========================================================================
+
+── (0) THE INCIDENT'S INPUT, RECONSTRUCTED ─────────────────────────────
+The incident's own ref (tortoise refs/claims/8697-f5282009634e) has since
+been RELEASED/PRUNED, so it is rebuilt here in a temp bare repo: a LIVE
+local lease owned by THIS host, which is exactly the shape that was read as
+'nobody is on it' on 2026-10-15.
+
+$ git -C <tmp>/incident.git commit-tree $EMPTY -m 'claim owner=<this-host>:<pid> lease_until=<$now+1800> nonce=…'
+$ git -C <tmp>/incident.git update-ref refs/claims/8697-f5282009634e <sha>
+
+rebuilt ref: refs/claims/8697-f5282009634e -> 33ce32035caf
+message:     claim owner=Daniels-MacBook-Air-new:44972 lease_until=1792081730 nonce=1777
+
+── (1) PRE-FIX — the shipped classifier, asked about a lane with no session ──
+    liveness.evaluate(Evidence(candidates=[]))
+      -> state=unknown reason=no-holder-record
+    and the read a controller actually performed at the time:
+      $ grep -l 'fix/7951-atomic-write-outbox' ~/.pi/agent/sessions/*/*.jsonl
+      (no output)
+    => the transcript signal is structurally blind here: an orchestrator lane
+       runs `pi -p --no-session` and writes NO session file. The emptiness is
+       the blind spot, and it read as CLEAN over a live writer.
+
+    does the PRE-FIX classifier have any claim vocabulary at all?
+      hasattr(ClaimRead)=False  hasattr(claim_verdict)=False  hasattr(claim_read on Evidence)=False
+
+── (2) POST-FIX — the same input, through the reader and the SAME verdict function ──
+$ python3 tools/fleet/claim_lanes.py --remote-url <tmp>/incident.git --pr 8697
+
+claim-lanes: pull /var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/claim1777-ykov67za/incident.git refs/claims
+ADVISORY: the claim registry does not decide freedom; every claim verdict is an abstention (#1777)
+readable=yes present(namespace)=yes claims=1
+verdict: unknown (ABSTENTION) — reason=claim-held
+  detail: owner=Daniels-MacBook-Air-new:44972 lease_until=1792081730 lease=live scope=local ref=refs/claims/8697-f5282009634e (declared ownership window; process liveness not asserted)
+  holder_pid: never set for a claim — a ref-claim records no process start to fence against
+claims:
+  refs/claims/8697-f5282009634e  owner=Daniels-MacBook-Air-new:44972  lease=live  scope=local
+reader limits (what this read cannot see):
+  - HEAD-scoped key: `refs/claims/<pr>-<sha12>` is keyed on the head sha, and a ref is DELETED on release and PRUNED on expiry — an absent key is not a free PR
+  - remote-only: only claims pushed to the target remote are visible; a lane that has not yet claimed, or whose claim was deleted, is invisible
+  - local harness state NOT read: `~/orchestrator/state/*` and the tmux `lane-*` / `fix-<pr>` sessions are a genuine on-box population with an unversioned layout (#1552) — a local-only lane is invisible here
+  - no branch resolution: a claim names its owner box, not a branch (sha12 -> branch is deliberately not derived)
+(exit 0 — 0 = a claim IS VISIBLE for this head · 3 = nothing established, which
+ includes a readable 'no claim visible' — never read 3 as freedom · 2 = usage)
+
+── (3) THE REAL REGISTRIES ON THIS HOST (read-only, 2026-10-15) ────────
+
+$ python3 tools/fleet/claim_lanes.py --repo /Users/danielospina/Documents/GitHub/agent-infra --pr 1525
+claim-lanes: pull https://github.com/daniel-ospina/agent-infra.git refs/claims
+ADVISORY: the claim registry does not decide freedom; every claim verdict is an abstention (#1777)
+readable=yes present(namespace)=yes claims=1
+verdict: unknown (ABSTENTION) — reason=holder-on-foreign-box
+  detail: owner=cmux:2774092 lease_until=1792040449 lease=expired scope=foreign ref=refs/claims/1525-d056ccbd321f (foreign owner is never probed locally)
+  holder_pid: never set for a claim — a ref-claim records no process start to fence against
+claims:
+  refs/claims/1525-d056ccbd321f  owner=cmux:2774092  lease=expired  scope=foreign
+reader limits (what this read cannot see):
+  (exit 0 — 0 = a claim IS VISIBLE for this head, 3 = nothing established)
+
+$ python3 tools/fleet/claim_lanes.py --repo /Users/danielospina/Documents/GitHub/agent-infra --pr 1771
+claim-lanes: pull https://github.com/daniel-ospina/agent-infra.git refs/claims
+ADVISORY: the claim registry does not decide freedom; every claim verdict is an abstention (#1777)
+readable=yes present(namespace)=yes claims=1
+verdict: unknown (ABSTENTION) — reason=holder-on-foreign-box
+  detail: owner=cmux:2421281 lease_until=1792039903 lease=expired scope=foreign ref=refs/claims/1771-3ccc81b8ef8d (foreign owner is never probed locally)
+  holder_pid: never set for a claim — a ref-claim records no process start to fence against
+claims:
+  refs/claims/1771-3ccc81b8ef8d  owner=cmux:2421281  lease=expired  scope=foreign
+reader limits (what this read cannot see):
+  (exit 0 — 0 = a claim IS VISIBLE for this head, 3 = nothing established)
+
+$ python3 tools/fleet/claim_lanes.py --repo /Users/danielospina/Documents/GitHub/tortoise --pr 8721
+claim-lanes: pull https://github.com/daniel-ospina/tortoise.git refs/claims
+ADVISORY: the claim registry does not decide freedom; every claim verdict is an abstention (#1777)
+readable=yes present(namespace)=yes claims=1
+verdict: unknown (ABSTENTION) — reason=claim-held
+  detail: owner=Daniels-MacBook-Air-new:43963 lease_until=1792081260 lease=live scope=local ref=refs/claims/8721-52f44f1cb6f3 (declared ownership window; process liveness not asserted)
+  holder_pid: never set for a claim — a ref-claim records no process start to fence against
+claims:
+  refs/claims/8721-52f44f1cb6f3  owner=Daniels-MacBook-Air-new:43963  lease=live  scope=local
+reader limits (what this read cannot see):
+  (exit 0 — 0 = a claim IS VISIBLE for this head, 3 = nothing established)
+
+$ python3 tools/fleet/claim_lanes.py --repo /Users/danielospina/Documents/GitHub/tortoise --pr 8697
+claim-lanes: pull https://github.com/daniel-ospina/tortoise.git refs/claims
+ADVISORY: the claim registry does not decide freedom; every claim verdict is an abstention (#1777)
+readable=yes present(namespace)=yes claims=0
+  ⚠️ the namespace HAS refs but NONE for the queried head — `present` describes the namespace, NOT this PR
+verdict: unknown (ABSTENTION) — reason=no-claim-visible
+  detail: key is HEAD-scoped and the registry is transient: refs are DELETED on release and PRUNED on expiry, and fix-one.sh releases its claim before merge-one.sh re-claims the new head (a designed no-claim window inside a live lane) — absence of a claim is NOT freedom
+  holder_pid: never set for a claim — a ref-claim records no process start to fence against
+reader limits (what this read cannot see):
+  - HEAD-scoped key: `refs/claims/<pr>-<sha12>` is keyed on the head sha, and a ref is DELETED on release and PRUNED on expiry — an absent key is not a free PR
+  (exit 3 — 0 = a claim IS VISIBLE for this head, 3 = nothing established)
+
+── (4) WHAT THE FLEET REPORTED (the population gap) ────────────────────
+The LIVE scheduled report on this host, at generation time. Note the lane
+count — the live fix-<pr> lane is NOT among them, because it has no session:
+
+$ python3 tools/fleet/lane_liveness.py --dry-run
+2026-10-15T15:58:55Z PASS lanes=22 running-quiet=21 unknown=1 — no escalatable dead lane
+## Lane liveness — 2026-10-15T15:58:55Z
+
+Scheduled lane-liveness report (#1178) on `Daniels-MacBook-Air-new`. **22 lane(s):** 21 running-quiet · 1 unknown. Population: open workspaces from cmux's persisted layout.
+
+**Coverage gaps (declared).** Population: the cmux population. **Orchestrator lanes are ABSENT FROM THIS POPULATION BY CONSTRUCTION.** `lane.sh` / `fix-one.sh` / `merge-one.sh` run `pi -p --no-session`, so they write no transcript and no cmux store record — they have no session id to enumerate and no JSONL to grow. A lane missing from this report is NOT a lane that is not running (#1777). **The remedy is not a wider population here.** Adding the process table would make a dead lane drop out of the report (#1178), and this job runs behind launchd's TCC wall, where a network read is not available every pass. `tools/fleet/claim_lanes.py` reads the holder-authored `refs/claims/<pr>-<sha12>` registry instead, through the SAME verdict function (`liveness.py`): every claim verdict is an ABSTENTION, and an absent or unreadable claim is NOT freedom. **The harness's local durable state is NOT read here.** `~/orchestrator/state/mergeclaim-<PR>.lock`, `fixbail-<PR>-<sha40>`, the `fixcount-*` counters and the tmux `lane-*` / `fix-<PR>` sessions are a real on-box population, but their layout is unversioned (#1552) and tmux is not readable from launchd. Until that is versioned, a local-only lane is invisible here — which is a declared gap, not a verdict of freedom.
+
+   …
+
+$ python3 tools/fleet/lane_liveness.py --dry-run --json | jq .coverage_gaps
+  3 declared gaps:
+  - **Orchestrator lanes are ABSENT FROM THIS POPULATION BY CONSTRUCTION.** `lane.sh` / `fix-one.sh` / `merge-one.sh` run `pi -p --no-session`, so they write no transcript and no cmux store record — they have no session id to enumerate and no JSONL to grow. A lane missing from this report is NOT a lane that is not running (#1777).
+  - **The remedy is not a wider population here.** Adding the process table would make a dead lane drop out of the report (#1178), and this job runs behind launchd's TCC wall, where a network read is not available every pass. `tools/fleet/claim_lanes.py` reads the holder-authored `refs/claims/<pr>-<sha12>` registry instead, through the SAME verdict function (`liveness.py`): every claim verdict is an ABSTENTION, and an absent or unreadable claim is NOT freedom.
+  - **The harness's local durable state is NOT read here.** `~/orchestrator/state/mergeclaim-<PR>.lock`, `fixbail-<PR>-<sha40>`, the `fixcount-*` counters and the tmux `lane-*` / `fix-<PR>` sessions are a real on-box population, but their layout is unversioned (#1552) and tmux is not readable from launchd. Until that is versioned, a local-only lane is invisible here — which is a declared gap, not a verdict of freedom.
+
+The gap is now declared in the report itself (and in --json), so its silence
+can no longer read as a verdict. Doc: docs/ops/fleet-liveness.md, section 5
+item 7 (the population boundary) and section 7 (the ref-claim registry).
+
+── (5) THE SUITES THAT PIN ALL OF THIS ─────────────────────────────────
+(re-run at the merge head after `origin/main` integration, and again at the
+revision that added the `issue-<N>` key shape + its three mutations; counts
+below match it)
+$ python3 tools/fleet/liveness.test.py
+PASS=31 FAIL=0
+$ python3 tools/fleet/liveness.test.py --mutations
+MUTATIONS=38 CAUGHT=38 MISSED=0
+$ python3 tools/fleet/claim_lanes.test.py
+PASS=25 FAIL=0
+$ python3 tools/fleet/claim_lanes.test.py --mutations
+MUTATIONS=30 CAUGHT=30 MISSED=0
+$ python3 tools/fleet/lane_liveness.test.py
+
+PASS=112 FAIL=0
+$ python3 tools/fleet/lane_liveness.test.py          # its RED control is printed above PASS:
+                                                    #   RED-CONTROL mutations=10 caught=10 missed=0
+$ bash scripts/check-agents-materialized.sh ; echo "rc=$?"
+rc=0
+$ node scripts/check-workflow-lock.mjs
+✅ workflow content lock matches (3 files)
+$ bash pi-bootstrap/tests/test-setup-no-nesting.sh | tail -1
+OK: no nesting, active files refreshed, farm links preserved (clone path: …)
+
+── (6) THE SECOND KEY SHAPE: `refs/claims/issue-<N>` IS NOT HEAD-SCOPED ─────
+`claims.sh` puts ISSUE claims in the SAME namespace as HEAD claims
+(`claim_issue_key`, claims.sh:219). Parsing every ref as `<pr>-<sha12>` read
+`issue-1850` as pr="issue"/sha12="1850", so a short `--sha 1850` (or `18`)
+PREFIX-MATCHED it and the CLI exited 0 — "a claim IS VISIBLE for the queried
+head" — for a head nobody holds. Reproduced on a temp bare repo holding ONE
+issue claim and no head claim:
+
+$ git -C <tmp>/issue.git update-ref refs/claims/issue-1850 <sha>   # no head refs
+$ python3 tools/fleet/claim_lanes.py --remote-url <tmp>/issue.git --sha 1850
+readable=yes present(namespace)=yes claims=0
+  ⚠️ the namespace HAS refs but NONE for the queried head — `present` describes the namespace, NOT this PR
+  ⚠️ 1 claim key(s) in the namespace are not HEAD-scoped (issue-1850) and cannot answer for a head
+verdict: unknown (ABSTENTION) — reason=no-claim-visible
+rc=3
+    PRE-FIX the same command: claims=1 (issue-1850), reason=claim-held, rc=0.
+
+$ python3 tools/fleet/claim_lanes.py --remote-url <tmp>/issue.git --json --sha 1850
+  present_for_target: False   claims: []   read_detail: 1 claim key(s) … not HEAD-scoped (issue-1850) …
+
+$ python3 tools/fleet/claim_lanes.py --remote-url <tmp>/issue.git --json   # all rows
+  {"ref": "refs/claims/issue-1850", "key": "issue-1850", "kind": "issue",
+   "issue": "1850", "pr": "", "sha12": "", "owner": "…", "lease_state": "live", …}
+    the row is still REPORTED (presence is presence), it simply cannot answer for
+    a head, and its `pr`/`sha12` are empty rather than an invented "issue"/"1850".
+
+Pinned by L25 + three paired mutations (conflated key shapes; every JSON row
+published as `head`; the excluded keys no longer named) — 30/30 CAUGHT.
