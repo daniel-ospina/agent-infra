@@ -200,11 +200,16 @@ function findVerifierGateOwner(): SkillState | undefined {
  * `read` of another SKILL.md — an escape tool at a verifier step — pushes a frame
  * whose `auto` step would otherwise hide the real gate for the rest of the
  * session: the lane parks nothing and the gate it is stuck at is never named.
- * Skips `auto`/empty steps (nothing is gated), `checkpoint` (its own branch runs
- * first) and `human_*` (a person, not a machine, is the owner — see HUMAN_GATE).
+ * Classification, in order: `auto` is skipped (nothing is gated); `human_*` is
+ * TERMINAL and returned as `kind:"human"` (a person, not a machine, owns the
+ * stall — see HUMAN_GATE); `checkpoint` is returned as `kind:"checkpoint"` (it IS
+ * a machine gate — the single timer path decides between reported/bounded); an
+ * empty gate is returned as `kind:"gate"` (enforced as the standard work phase,
+ * which blocks git/destructive calls).
  */
 type StallOwner =
   | { kind: "gate"; skill: SkillState; step: Step }
+  | { kind: "checkpoint"; skill: SkillState; step: Step }
   | { kind: "human"; skill: SkillState; step: Step };
 
 function findStalledGateOwner(): StallOwner | undefined {
@@ -215,8 +220,13 @@ function findStalledGateOwner(): StallOwner | undefined {
     const gate = step.gate || "";
     // `auto` is the ONE ungated value (it blocks nothing in any mode).
     if (gate === "auto") continue;
-    // `checkpoint` has its own branch that runs BEFORE this one.
-    if (gate === "checkpoint") continue;
+    // A `checkpoint` IS a machine gate (it blocks every non-escape tool until a
+    // fresh token exists), so it is returned here like any other — the single
+    // timer path classifies it (warn → reported, interactive → parked, print
+    // gate/strict → bounded). It used to have its own branch that ran FIRST,
+    // which is how a human gate above it got bypassed and how an in-flight call
+    // was ignored (final review of cycle 6).
+    if (gate === "checkpoint") return { kind: "checkpoint", skill, step };
     // ⛔ A HUMAN gate is TERMINAL here: do NOT keep descending (VGATE review of
     // cycle 5 — descending handed back a machine gate BELOW the human one, and
     // the lane was killed with a verdict naming a step it was not at). A person
@@ -614,141 +624,113 @@ export function handleSequenceTimeout(
     sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
     return;
   }
-  // #357 (Task 8, j): checkpoint-stall PARK takes precedence over the 10-min POP
-  // in ALL modes — a checkpoint is never popped (pop → re-read/re-pop loop +
-  // silent enforcement loss). This is also the timer-driven path for a fully
-  // idle session at an un-CLEAR-able checkpoint (the only trigger that fires
-  // with ZERO further events). #357 review (Bug-scan P2): the owner is resolved
-  // via the stack-walk — a checkpoint owner can sit BELOW a sub-skill frame
-  // (read is an escape tool and pushes sub-skill frames); a top-only check
-  // would pop the sub-skill instead of parking the owner.
-  const owner = findCheckpointGateOwner();
-  if (owner) {
-    const step = owner.steps[owner.stepIndex];
-    const mode = resolveMode(env, MODE_FILE, argv);
-    const print = isPrintMode(env, argv);
-    // Review cycle 2 (finding 5): the verdict is PER STALL. Without this the
-    // re-arm below would re-park and re-verdict the same checkpoint every cap
-    // cycle wherever the exit does not land (the test seam, or a host that
-    // ignores process.exit) — "one stall, one verdict".
-    if (unsatisfiableKeys.has(stallKey(owner))) return;
-    if (
-      step?.gate === "checkpoint" && mode !== "warn" &&
-      Date.now() - owner.stepStartedAt > WALL_CLOCK_STALL_MS
-    ) {
-      // ⛔ NO in-flight suppression here, and that is deliberate (review cycle 3
-      // finding 2 asked for one; it is unreachable — verified, not assumed). A
-      // checkpoint step that is still current has no fresh token, and then EVERY
-      // non-escape tool is blocked by the checkpoint branch of the tool_call
-      // handler (a long `task`/`bash` never reaches "in flight"), while the
-      // escape tools it does allow — read, loop_enforcer, the checker — are
-      // instantaneous. So a lane parked here is genuinely not working, and a
-      // token-ok checkpoint has already advanced. Adding the suppression would be
-      // dead code that also disabled the bound it exists to enforce.
-      // (An in-flight call CAN coexist with a checkpoint owner below a sub-skill
-      // in WARN mode only — and warn does not park checkpoints at all.)
-      parkCheckpoint(owner, "checkpoint stall (sequence timeout)");
-      // #1770: BOUND it (review cycle 1, finding 4). `parkCheckpoint` is one-shot,
-      // so the LINE never repeated — but the lane still sat forever with rc 0 at
-      // the very gate that blocks every git op. A human is present in an
-      // interactive session (and can run the checker / the force-pass), so the
-      // bound applies to print lanes only; interactive keeps the old behaviour.
-      if (print) {
-        const parks = bumpParkStreak(owner);
-        if (parks >= SEQUENCE_PARK_CAP) {
-          emitUnsatisfiable(owner, step, parks, mode);
-          return; // NEVER re-arm after the verdict (cycle 2, finding 5)
-        }
+  // #357 (Task 8, j) / #1770: ONE timer path. The stall OWNER is resolved first
+  // (stack-walk), then classified, then bounded — never a branch order that can
+  // pick the wrong frame. Two blockers came from ordering (final review of
+  // cycle 6):
+  //   • the old checkpoint branch ran BEFORE the walk, so a human gate on top did
+  //     not protect a checkpoint below it — a lane waiting for a person was ended
+  //     with a checkpoint verdict;
+  //   • and it never consulted in-flight state, so a long call started at an
+  //     earlier step and still running across an auto-advance into a checkpoint
+  //     step was killed at 30 min (the old "unreachable" argument only considered
+  //     a call STARTED at the checkpoint — a call started before it survives the
+  //     advance, and any SKILL.md read auto-advances into the checkpoint).
+  const stall = findStalledGateOwner();
+  if (!stall) {
+    // No machine gate anywhere on the stack. Interactive keeps the established
+    // stale-sequence pop; print reports idleness once per episode.
+    if (!isPrintMode(env, argv)) {
+      console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
+      skillStack.pop();
+      const parent = topSkill();
+      if (parent) {
+        console.log(`[sequence-enforcer] ↩ Restored parent: ${parent.path} (step ${parent.stepIndex}/${parent.steps.length})`);
+        writeBridgeState();
+      } else {
+        clearBridgeState();
       }
-    } else if (step?.gate === "checkpoint" && mode === "warn" && print) {
-      // Review cycle 2 (finding 2): warn mode applies NO checkpoint gate (nothing
-      // blocks, the first call auto-advances), so a warn print lane sitting at one
-      // is the same shape as an `auto` step. It used to be silent AND unbounded;
-      // it now keeps the one coalesced liveness line and never a verdict — the
-      // default `pi -p` lane is warn, so this is the common case.
-      noteNotGatedIdle(owner, step, mode, WARN_CHECKPOINT_NO_GATE);
+      return;
     }
-    // re-arm: parked state preserved; one-shot suppresses repeat parks
+    noteNotGatedIdle(top, top.steps[top.stepIndex], resolveMode(env, MODE_FILE, argv), NO_GATE);
     sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
     return;
   }
-  // #357 (Task 4): park predicate is argv-aware — bare-shell `pi -p` (no
-  // PI_MODE env) parks too; the audited mode uses the same (env, argv) seam so
-  // it matches the parked behavior under test.
-  const topStep = top.steps[top.stepIndex];
-  if (isPrintMode(env, argv)) {
-    const mode = resolveMode(env, MODE_FILE, argv);
-    // #1770 rule 3 — a tool call IN FLIGHT is not idle: a blocking `task` (the
-    // reviewer dispatch this very step prescribes) can run for tens of minutes
-    // with no events at all. Re-arm silently until it outlives the fleet's own
-    // bounds, so a working lane is never failed and a hung one still is.
-    if (suppressForInFlight()) {
-      sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
-      return;
-    }
-    // #1770 rule 1 — an UNGATED step does not park. `gate: auto` blocks no tool
-    // in any mode (see the SEQUENCE_PARK_CAP rationale above), so there is no
-    // gate here to stall: log ONE coalesced idle line for liveness and move on.
-    // ⛔ ONLY an explicit `auto`. A step with an EMPTY gate is NOT ungated —
-    // `getExpectedToolsForStep` routes it to the standard work phase, which
-    // blocks every git/destructive call, and it has no auto-advance trigger
-    // (that loop is keyed on `gate === "auto"`). Such a step stalls for real and
-    // must still park, be named and be bounded.
-    // The owner of the stall is found by STACK-WALK (review cycle 4, finding 3):
-    // a gate below a sub-skill frame is the gate the lane is stuck at.
-    const stall = findStalledGateOwner();
-    if (!stall) {
-      noteNotGatedIdle(top, topStep, mode, NO_GATE);
-      sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
-      return;
-    }
-    if (stall.kind === "human") {
-      // A human gate on top is reported with ITS OWN reason (never "declares NO
-      // gate" — it blocks everything except read/web/loop_enforcer), and never
-      // bounded: a person is the owner.
-      noteNotGatedIdle(stall.skill, stall.step, mode, HUMAN_GATE, true);
-      sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
-      return;
-    }
-    const owner = stall.skill;
-    const ownerStep = stall.step;
-    // #1770 rule 2 — a GATED step's park is bounded, coalesced and NAMED.
-    if (unsatisfiableKeys.has(stallKey(owner))) return; // verdict already emitted — never re-arm, never repeat
-    const parks = bumpParkStreak(owner);
-    const { cause, remedy } = parkDiagnosis(ownerStep, mode);
-    if (!parkAnnounced.has(stallKey(owner))) {
-      parkAnnounced.add(stallKey(owner));
-      console.log(
-        `[sequence-enforcer] ⏰ Sequence timeout — parking "${owner.path}" at step ${owner.stepIndex} "${ownerStep.name}" (gate: ${ownerStep.gate || "none"}) — 10 min with no tool call. ` +
-        `WHY IT CANNOT ADVANCE BY WAITING: ${cause}. REMEDY: ${remedy}. ` +
-        `(silent window ${parks}; reported once per step — the next line for this step is a verdict)`,
-      );
-      auditLog({
-        ts: new Date().toISOString(), event: "timeout_park", skill: owner.path, step: owner.stepIndex,
-        step_name: ownerStep.name, gate: ownerStep.gate || "none", mode, parks,
-        cap: SEQUENCE_PARK_CAP, cause, remedy,
-      });
-    }
-    if (parks < SEQUENCE_PARK_CAP) {
-      // park: keep stack/stepIndex/reviewers intact, re-arm the timer (silently —
-      // the line above already named the cause, and repeats add no information).
-      sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
-      return;
-    }
-    // The bound was crossed — the gate is UNSATISFIABLE by waiting. Say so, and exit.
-    emitUnsatisfiable(owner, ownerStep, parks, mode);
-    return; // NEVER re-arm: no further parks, no further lines
+  const mode = resolveMode(env, MODE_FILE, argv);
+  const print = isPrintMode(env, argv);
+  const owner = stall.skill;
+  const ownerStep = stall.step;
+
+  if (stall.kind === "human") {
+    // A person owns this stall: reported with its own reason, never bounded.
+    if (print) noteNotGatedIdle(owner, ownerStep, mode, HUMAN_GATE, true);
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
   }
-  console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
-  // ponytail: pop only the stale skill, preserve parent (#7276)
-  skillStack.pop();
-  const parent = topSkill();
-  if (parent) {
-    console.log(`[sequence-enforcer] ↩ Restored parent: ${parent.path} (step ${parent.stepIndex}/${parent.steps.length})`);
-    writeBridgeState();
-  } else {
-    clearBridgeState();
+  if (stall.kind === "checkpoint" && mode === "warn") {
+    // Warn applies NO checkpoint gate (the first call auto-advances), so nothing
+    // is holding the lane — the same shape as an `auto` step (cycle 2 finding 2).
+    if (print) noteNotGatedIdle(owner, ownerStep, mode, WARN_CHECKPOINT_NO_GATE);
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
   }
+  // A long call IN FLIGHT is not silence, on EVERY gated kind — including a
+  // checkpoint (final review of cycle 6). `blockedResult` and
+  // `tool_execution_end` clear the entry for a call that was refused or never
+  // ran, so a genuinely blocked lane is still bounded.
+  if (suppressForInFlight()) {
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
+  }
+  // A checkpoint must have STALLED on the wall clock (its pre-existing gate) —
+  // and, like the interactive pop, is never bounded in a host where a human can
+  // run the checker / force-pass.
+  if (stall.kind === "checkpoint") {
+    parkCheckpoint(owner, "checkpoint stall (sequence timeout)");
+    if (!print || Date.now() - owner.stepStartedAt <= WALL_CLOCK_STALL_MS) {
+      sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+      return;
+    }
+  }
+  if (!print) {
+    // Interactive: the established stale-sequence pop (unchanged behaviour).
+    console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
+    skillStack.pop();
+    const parent = topSkill();
+    if (parent) {
+      console.log(`[sequence-enforcer] ↩ Restored parent: ${parent.path} (step ${parent.stepIndex}/${parent.steps.length})`);
+      writeBridgeState();
+    } else {
+      clearBridgeState();
+    }
+    return;
+  }
+  // ── print mode, gated owner: bounded, coalesced, NAMED ──
+  if (unsatisfiableKeys.has(stallKey(owner))) return; // one verdict per stall — never re-arm, never repeat
+  const parks = bumpParkStreak(owner);
+  const { cause, remedy } = parkDiagnosis(ownerStep, mode);
+  if (!parkAnnounced.has(stallKey(owner))) {
+    parkAnnounced.add(stallKey(owner));
+    console.log(
+      `[sequence-enforcer] ⏰ Sequence timeout — parking "${owner.path}" at step ${owner.stepIndex} "${ownerStep.name}" (gate: ${ownerStep.gate || "none"}) — 10 min with no tool call. ` +
+      `WHY IT CANNOT ADVANCE BY WAITING: ${cause}. REMEDY: ${remedy}. ` +
+      `(silent window ${parks}; reported once per step — the next line for this step is a verdict)`,
+    );
+    auditLog({
+      ts: new Date().toISOString(), event: "timeout_park", skill: owner.path, step: owner.stepIndex,
+      step_name: ownerStep.name, gate: ownerStep.gate || "none", mode, parks,
+      cap: SEQUENCE_PARK_CAP, cause, remedy,
+    });
+  }
+  if (parks < SEQUENCE_PARK_CAP) {
+    // park: keep stack/stepIndex/reviewers intact, re-arm the timer (silently —
+    // the line above already named the cause, and repeats add no information).
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
+  }
+  // The bound was crossed — the gate is UNSATISFIABLE by waiting. Say so, and exit.
+  emitUnsatisfiable(owner, ownerStep, parks, mode);
+  return; // NEVER re-arm: no further parks, no further lines
 }
 
 /**

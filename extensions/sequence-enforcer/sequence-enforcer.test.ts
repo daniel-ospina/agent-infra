@@ -3959,26 +3959,33 @@ await test("#1770.14 the ungated idle line is per EPISODE — activity ends the 
   } finally { auditRelease(); }
 });
 
-await test("#1770.15 a long call cannot be in flight at a current CHECKPOINT — it is blocked, so the park there is correct (cycle 3, finding 2)", async () => {
+await test("#1770.15 a long call IN FLIGHT suppresses the bound at a CHECKPOINT too — a call started before the auto-advance survives into it (final review of cycle 6)", async () => {
   _resetStateForTest();
   auditCapture();
   const { pi, handlers } = fakePi();
   sequenceEnforcer(pi as any);
   try {
-    _pushSkillForTest("/repo/skills/a/SKILL.md", [makeStep({ name: "implement", gate: "checkpoint", token_phase: "implement" })], 0);
-    _pushSkillForTest("/repo/skills/b/SKILL.md", AUTO_THEN_VERIFIER(), 1);
+    // commit-workflow's real shape: preflight(auto) auto-advances into
+    // parallel_check_implement(checkpoint) — and a call started at preflight is
+    // still running when the step becomes the checkpoint. The old branch ignored
+    // in-flight state here and killed the lane at 30 min.
+    _pushSkillForTest("/repo/skills/ckpt/SKILL.md", [makeStep({ name: "implement", gate: "checkpoint", token_phase: "implement" })], 0);
     _stackForTest()[0]!.stepStartedAt = Date.now() - 60 * 60 * 1000;
     _setTokenFileForTest(null);
     await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate" }, async () => {
-      // The claim under test: at a current checkpoint nothing long-running can be
-      // in flight, because the checkpoint blocks every non-escape tool.
-      const res: any = await handlers.tool_call!({ toolName: "task", toolCallId: "reviewer-blocking", input: { prompt: "review" } });
-      equal(res?.block, true, "the reviewer dispatch is BLOCKED by the checkpoint — it never becomes in-flight");
-      deepEqual(_inFlightForTest(), [], "so no in-flight state exists to suppress the idle clock");
+      await handlers.tool_execution_start!({ toolCallId: "long-1", toolName: "task" }); // in flight across the advance
       captureStart();
       try { for (let i = 0; i < 3; i++) handleSequenceTimeout(); } finally { captureStop(); }
     });
-    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 1, "parking a genuinely blocked lane is correct, not a false kill");
+    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, "no verdict while a reviewer call is running");
+    equal(_exitRequestsForTest().length, 0, "the lane is not ended");
+    // …and a lane whose call has ENDED is still bounded (the entry is cleared)
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate" }, async () => {
+      await handlers.tool_execution_end!({ toolCallId: "long-1", toolName: "task", isError: false });
+      captureStart();
+      try { for (let i = 0; i < 3; i++) handleSequenceTimeout(); } finally { captureStop(); }
+    });
+    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 1, "once the call is over, a silent checkpoint lane is bounded");
     deepEqual(_exitRequestsForTest(), [3]);
   } finally { auditRelease(); }
 });
@@ -4081,6 +4088,23 @@ await test("#1770.18 a HUMAN gate is reported with its own reason and NEVER boun
     equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, "no verdict");
     ok(/HUMAN decision/.test(logs.join("\n")), "the human reason is emitted for the sole-gated case too");
     equal(_exitRequestsForTest().length, 0);
+
+    // (c) a human gate ABOVE a CHECKPOINT: the checkpoint must not be bounded
+    // behind a person (the old branch order did exactly that — final review of
+    // cycle 6, blocker 2).
+    _resetStateForTest();
+    auditCapture();
+    _pushSkillForTest("/repo/skills/ckpt/SKILL.md", [makeStep({ name: "implement", gate: "checkpoint", token_phase: "implement" })], 0);
+    _stackForTest()[0]!.stepStartedAt = Date.now() - 60 * 60 * 1000;
+    _pushSkillForTest("/repo/skills/approve/SKILL.md", [makeStep({ name: "approve", gate: "human_approval" })], 0);
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate" }, () => {
+      captureStart();
+      try { for (let i = 0; i < 6; i++) handleSequenceTimeout(); } finally { captureStop(); }
+    });
+    equal(logs.filter((l) => l.includes("SEQUENCE-GATE-UNSATISFIABLE")).length, 0, "a person above a checkpoint still stops the bound");
+    equal(_exitRequestsForTest().length, 0, "no exit");
+    ok(auditEntries.filter((e) => e.event === "timeout_idle_human").length >= 1, "reported as human-owned");
+    equal(auditEntries.filter((e) => e.event === "checkpoint_block_recovery").length, 0, "and the checkpoint is not parked behind the person");
   } finally { auditRelease(); }
 });
 
