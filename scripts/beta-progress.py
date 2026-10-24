@@ -494,7 +494,12 @@ def main():
     try:
         p0, p1 = data["p0"], data["p1"]
         ts = data.get("ts", 0)
-        age_m = int((time.time() - ts) / 60)
+        # ⛔ NEVER A NEGATIVE AGE. `CACHE_TS_SKEW_S` deliberately admits a few seconds of FUTURE
+        # `ts` (writer/reader clock skew is real), but `int((now - ts) / 60)` then renders
+        # `-1m ago` on the owner's line -- measured: `ts = now+120` -> `-1m ago`, `now+299` ->
+        # `-4m ago`. Clamped rather than refused: the tolerance exists for the TTL comparison,
+        # and a future stamp inside that band is still a usable cache.
+        age_m = max(0, int((time.time() - ts) / 60))
         stamp = time.strftime("%H:%M", time.localtime(ts)) if ts else "unknown"
         line = ("DELIVERY [as of %s, %dm ago]: P0 %d open (%d with PR, %d NONE)"
                 " | P1 %d open (%d with PR, %d NONE)"
