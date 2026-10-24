@@ -139,12 +139,24 @@ echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO A
 mkdir -p "$TMP/bin" "$TMP/o/state" "$TMP/fakehome"
 printf '#!/bin/sh\necho "PI_RAN" >> "$PI_LOG"\nexit 0\n' > "$TMP/bin/pi"; chmod +x "$TMP/bin/pi"
 export PI_LOG="$TMP/pi.log"
+# ⛔ THE CREATION BACK-PRESSURE GATE NEEDS A READING AND A REPO — NOT AN OFF SWITCH (#2409). `run_agent`
+# measures the repo's landing ratio through `gh` immediately before any spawn, and this suite drives the
+# SHIPPED helper from whatever checkout the runner started in: on a repo over its ceiling every positive
+# control below is refused by the LAND-BACKLOG gate instead of running (MEASURED on this box: 66 open /
+# 2.3 landings, so `good-brief: rc=74 started=0` and `!! positive control did NOT run pi`). Supplying the
+# reading is the fix `spawn-gate.test.sh` established (#2333 review: an env var that opens a gate is not
+# a gate), and the repo is supplied for the same reason — a driver run from a directory with no GitHub
+# origin makes `land_backlog_repo` unreadable and refuses there too.
+printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin/gh"
+chmod +x "$TMP/bin/gh"
+FIXREPO="$TMP/repofix"; mkdir -p "$FIXREPO"
+git init -q "$FIXREPO" && git -C "$FIXREPO" remote add origin https://github.com/owner/repo.git
 # drive_run_agent <brief> — the SHIPPED run_agent, with the load probe pinned and a stub pi.
 drive_run_agent() { # drive_run_agent <brief-file>
   : > "$PI_LOG"
-  PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
-  bash -c '. "$1"; load1() { printf "1"; }; run_agent 1 "$2" "$3" "brief-gate test" >/dev/null 2>&1
-           printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$HERE/spawn-gate.sh" "$TMP/ra.log" "$1"
+  ( cd "$FIXREPO" && PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+    bash -c '. "$1"; load1() { printf "1"; }; run_agent 1 "$2" "$3" "brief-gate test" >/dev/null 2>&1
+             printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$HERE/spawn-gate.sh" "$TMP/ra.log" "$1" )
 }
 res="$(drive_run_agent "$TMP/no-research.txt")"
 [ "$res" = "rc=80 started=0" ]; ck $? "run_agent REFUSES an invalid brief: 80, AGENT_STARTED=0 ($res)"
@@ -164,9 +176,9 @@ grep -q 'PI_RAN' "$PI_LOG"; ck $? "…the stub pi really ran (the refusal above 
 mkdir -p "$TMP/nolib"
 cp "$HERE/spawn-gate.sh" "$TMP/nolib/"
 : > "$PI_LOG"
-res="$(PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+res="$( cd "$FIXREPO" && PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
   bash -c '. "$1"; load1() { printf "1"; }; run_agent 1 "$2" "$3" "no validator" >/dev/null 2>&1
-           printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$TMP/nolib/spawn-gate.sh" "$TMP/nolib.log" "$CANON")"
+           printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$TMP/nolib/spawn-gate.sh" "$TMP/nolib.log" "$CANON" )"
 [ "$res" = "rc=78 started=0" ]; ck $? "a MISSING validator is 78/cannot-verify, not a pass ($res)"
 [ -s "$PI_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and no agent ran on cannot-verify either"
@@ -178,9 +190,9 @@ sed -n '/^run_agent() {/,/^}/p' "$HERE/merge-one.sh" > "$TMP/m1-runagent.sh"
 [ -s "$TMP/m1-runagent.sh" ]; ck $? "merge-one.sh's run_agent() was extracted from the shipped file"
 drive_m1() { # drive_m1 <brief-file>
   : > "$PI_LOG"
-  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" brief_gate_sh="$GATE" log="$TMP/m1.log" L="$TMP/m1" O="$TMP/o" \
-  bash -c '. "$1"; run_agent 1 "$2" "$3" >/dev/null 2>&1; printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' \
-    _ "$TMP/m1-runagent.sh" "$TMP/m1.log" "$1"
+  ( cd "$FIXREPO" && PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" brief_gate_sh="$GATE" log="$TMP/m1.log" L="$TMP/m1" O="$TMP/o" \
+    bash -c '. "$1"; run_agent 1 "$2" "$3" >/dev/null 2>&1; printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' \
+      _ "$TMP/m1-runagent.sh" "$TMP/m1.log" "$1" )
 }
 res="$(drive_m1 "$TMP/no-contradiction.txt")"
 [ "$res" = "rc=80 started=0" ]; ck $? "merge-one.sh's run_agent REFUSES an invalid reviewer brief: 80, started=0 ($res)"
@@ -203,15 +215,15 @@ NB="$HERE/nonblocking-dispatch.sh"
 # symptom of getting this wrong: the "positive control" ran the REAL pi and wrote a real session.)
 cp "$TMP/bin/pi" "$TMP/bg-o/gh-rest/pi"; chmod +x "$TMP/bg-o/gh-rest/pi"
 : > "$PI_LOG"
-out="$(O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
-       bash "$NB" bgtest "$TMP/wt" "$TMP/no-research.txt" 5 2>&1)"; rc=$?
+out="$( cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+       bash "$NB" bgtest "$TMP/wt" "$TMP/no-research.txt" 5 2>&1 )"; rc=$?
 [ "$rc" -eq 80 ]; ck $? "nonblocking-dispatch.sh REFUSES an invalid brief in the FOREGROUND with 80 (rc=$rc)"
 grep -q 'RESEARCH FIRST' <<<"$out"; ck $? "…and the teaching message reached the CALLER (not a detached log)"
 [ ! -f "$TMP/bg-o/bg/bgtest.pid" ]; ck $? "…and NO worker was started (no pid file, so no launch to report)"
 [ -s "$PI_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and no agent ran"
-out="$(O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
-       bash "$NB" bgok "$TMP/wt" "$CANON" 20 2>&1)"; rc=$?
+out="$( cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+       bash "$NB" bgok "$TMP/wt" "$CANON" 20 2>&1 )"; rc=$?
 [ "$rc" -eq 0 ]; ck $? "POSITIVE CONTROL: nonblocking-dispatch.sh LAUNCHES for a valid brief ($(printf '%s' "$out" | tail -1))"
 # The worker is backgrounded; wait for its durable verdict rather than sleeping a guess.
 for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgok.rc" ] && break; sleep 0.1; done

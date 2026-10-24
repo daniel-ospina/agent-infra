@@ -1025,9 +1025,13 @@ PI_GATE_REFUSED=76
 # lane.sh's own `land` arm) AND is `pi`'s own EX_IOERR — so one number meant "re-author the brief",
 # "yield the item to a peer" and "the model run hit a disk I/O error". `lane.sh` tests the brief arm
 # first, so a genuine land-backlog refusal was classified as a brief refusal and its `land` arm was
-# unreachable through rc=74. 73/74/75/76/77/78 are now all taken (fork, land, load, pi, disk,
-# cannot-verify), 79 belongs to adopt-fix.sh, so this code lives OUTSIDE the sysexits range the rest
-# borrow — which is the point: no third-party process can produce it by accident.
+# unreachable through rc=74. 73/74/75/76/77/78 are now all taken (fork, land, load, pi, disk and the
+# cannot-verify pair), 79 belongs to adopt-fix.sh, so this code lives OUTSIDE the sysexits range the
+# rest borrow — which is the point: no third-party process can produce it by accident.
+# ⛔ 78 IS SHARED BY TWO CONSTANTS BELOW (`BRIEF_GATE_UNAVAILABLE` and the spawn point's internal
+# `PI_FORK_REFUSED`), and that is inherited, not introduced here: both mean "this run could not be
+# verified" to a caller, and the fork one is translated to 73 inside run_agent. Flagged rather than
+# silently tidied — renumbering it is main's decision to make, not this branch's.
 AGENT_BRIEF_REFUSED=80
 # The CANNOT-VERIFY code (agent-infra#2258), shared with brief-gate.sh's own exit codes and declared
 # here because this file must be able to answer when the helper is MISSING — that is exactly the case
@@ -1063,6 +1067,67 @@ AGENT_STARTED=0
 # silently passes because it could not find its own rules is the failure mode this whole layer
 # exists to prevent (#1884's argument, applied to the brief instead of to the load).
 BRIEF_GATE_SH=""
+# ── the fork reading, from the fleet's ONE instrument ──────────────────────────────────────────
+# ⛔ NOT A SECOND PROBE. `capacity.sh` already reads the process count against the per-uid/cgroup
+# ceiling and proves it with a two-fork probe; this file CONSUMES it. If the module cannot be found
+# (a hand-copied shim, a fixture), the gate ABSTAINS and SAYS SO — the same polarity as the disk
+# probe's unreadable arm, and for the same reason: an instrument that cannot run must not be reported
+# as a refusal (that would stop every lane on a healthy box) NOR as a silent pass.
+CAP_GATE_MOD_LOADED=0
+spawn_gate_load_capacity() {
+  [ "${CAP_GATE_MOD_LOADED:-0}" = "1" ] && return 0
+  declare -f cap_procs_pair_vars >/dev/null 2>&1 && { CAP_GATE_MOD_LOADED=1; return 0; }
+  local d cand=""
+  for d in "${O:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
+    [ -n "$d" ] || continue
+    [ -f "$d/capacity.sh" ] && { cand="$d/capacity.sh"; break; }
+  done
+  [ -n "$cand" ] || return 1
+  # shellcheck source=/dev/null
+  . "$cand" 2>/dev/null || return 1
+  declare -f cap_procs_pair_vars >/dev/null 2>&1 && { CAP_GATE_MOD_LOADED=1; return 0; }
+  return 1
+}
+
+# spawn_fork_state <stateVar> <detailVar> — sets state = ok | refused | unknown.
+# The arithmetic is `capacity.sh`'s (`cap_procs_pair_vars` + `cap_h_for_vars`), so this gate and the
+# placement decision can never disagree about what "out of headroom" means.
+# ⛔ EVERY WORKING LOCAL IS PREFIXED `_sf_`, for the reason `cap_procs_pair_vars` states: bash `local`
+# is DYNAMIC and this function also writes CALLER-NAMED variables (`printf -v "$_sf_sv"`). Working
+# locals called `p`/`m`/`h`/`src` shadowed a caller that happened to pass those names — the caller
+# read `<UNSET>` and the gate answered `ok` on a box that could not take another lane (verification
+# gate, P0). Both the gate and its test now use non-colliding names AND drive the colliding shape.
+spawn_fork_state() {
+  local _sf_sv="${1:-}" _sf_dv="${2:-}" _sf_p="" _sf_m="" _sf_h="" _sf_prc=0 _sf_src=""
+  printf -v "$_sf_sv" '%s' 'unknown'; printf -v "$_sf_dv" '%s' 'no fork reading was taken'
+  if ! spawn_gate_load_capacity; then
+    printf -v "$_sf_dv" '%s' 'capacity.sh is not reachable from this spawn gate, so fork headroom was NOT read'
+    return 0
+  fi
+  if ! cap_procs_pair_vars _sf_p _sf_m _sf_src; then
+    printf -v "$_sf_dv" '%s' 'neither a process count nor a ceiling could be read'
+    return 0
+  fi
+  cap_h_for_vars "$_sf_p" "$_sf_m" _sf_h || _sf_h='?'
+  printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} headroom=${_sf_h} src=${_sf_src:-?}"
+  if [ "$_sf_h" != '?' ] && [ "$_sf_h" != 'unbounded' ] && [ "$_sf_h" -lt "${CAP_MIN_FORK_HEADROOM:-200}" ]; then
+    printf -v "$_sf_dv" '%s' "headroom=${_sf_h} < min_fork_headroom=${CAP_MIN_FORK_HEADROOM:-200} (procs=${_sf_p}/${_sf_m}, src=${_sf_src:-?})"
+    printf -v "$_sf_sv" '%s' 'refused'
+    return 0
+  fi
+  # The two-fork probe, IN A CHILD: a fork failure terminates the shell that attempted it (measured,
+  # rc 254), so the probe must not share fate with the caller it is protecting.
+  ( cap_fork_probe ) >/dev/null 2>&1 || _sf_prc=$?
+  if [ "$_sf_prc" -eq 254 ]; then
+    printf -v "$_sf_dv" '%s' "the two-fork probe could not fork (rc=254 EAGAIN) with procs=${_sf_p}/${_sf_m}"
+    printf -v "$_sf_sv" '%s' 'refused'
+    return 0
+  fi
+  [ "$_sf_prc" -eq 0 ] || { printf -v "$_sf_dv" '%s' "the two-fork probe could not be read (rc=$_sf_prc)"; return 0; }
+  printf -v "$_sf_sv" '%s' 'ok'
+  return 0
+}
+
 brief_gate_lib() {
   local c here
   if [ -n "$BRIEF_GATE_SH" ]; then printf '%s\n' "$BRIEF_GATE_SH"; return 0; fi

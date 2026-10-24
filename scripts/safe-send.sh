@@ -67,7 +67,7 @@ if [ "$MODE" != "--force" ]; then
   fi
   if ! bash "$_bg_lib" --check "$FILE" lane; then
     echo "REFUSED [$LABEL] $WS — $FILE did not pass the research-first gate; NOT sent, and the pane was not even read." >&2
-    echo "         Re-author the brief (the [brief-gate] block above names every missing element and prints\n         the canonical section), then re-send. --force sends a STOP over this gate, not a brief." >&2
+    printf '         Re-author the brief (the [brief-gate] block above names every missing element and prints\n         the canonical section), then re-send. --force sends a STOP over this gate, not a brief.\n' >&2
     exit 80
   fi
 fi
