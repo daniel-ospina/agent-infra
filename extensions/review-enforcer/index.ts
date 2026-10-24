@@ -1812,6 +1812,35 @@ export function evidenceCommandIsPlain(command: string): boolean {
   return true;
 }
 
+/**
+ * The command's argv. Valid ONLY after `evidenceCommandIsPlain` has proved the command carries no
+ * shell syntax at all — at which point its whitespace-separated tokens ARE the argv and nothing can
+ * hide behind a quote or a substitution.
+ *
+ * Leading `NAME=value` assignments are skipped: they set the ENVIRONMENT, not the operand. (An
+ * inline `GIT_DIR=` / `GIT_WORK_TREE=` redirect is refused separately by `commandMovesRefs`; it
+ * cannot retarget the checkout through this helper.)
+ */
+function plainArgv(command: string): string[] {
+  const words = command.split(/\s+/).filter((w) => w.length > 0);
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i++;
+  return words.slice(i);
+}
+
+/** `gh [--repo|-R <slug>] pr create …` — including the global form the gate's own messages print. */
+function ghPrCreateArgv(argv: readonly string[]): boolean {
+  if (argv[0] !== "gh") return false;
+  let i = 1;
+  const flag = argv[i];
+  if (flag === "--repo" || flag === "-R") i += 2; // space form
+  else if (typeof flag === "string" && (flag.startsWith("--repo=") || (flag.startsWith("-R") && flag.length > 2))) i += 1; // attached value
+  return argv[i] === "pr" && argv[i + 1] === "create";
+}
+
+/** The remote `repoFromGitRemote` reads. The record's repo slug comes from THIS remote's URL. */
+const ORIGIN_REMOTE = "origin";
+
 export function resolveShippedHeads(
   command: string,
   ctx: unknown,
@@ -1834,8 +1863,16 @@ export function resolveShippedHeads(
   const ctxCwd = (ctx as { cwd?: unknown } | undefined)?.cwd;
   const cwd = opCtx.cwd ?? (typeof ctxCwd === "string" ? ctxCwd : process.cwd());
 
-  const isPush = /(^|\s)git\s+push(\s|$)/.test(command) && !/(^|\s)git\s+commit(\s|$)/.test(command);
-  const isPrCreate = /(^|\s)gh\s+pr\s+create(\s|$)/.test(command) && !/(^|\s)gh\s+pr\s+merge(\s|$)/.test(command);
+  // ⛔ ANCHOR TO THE COMMAND POSITION, NOT TO THE TEXT (fresh review round 5, P2). The plain-command
+  // check above proves this is ONE simple command with no shell syntax, so its TOKENS ARE THE ARGV
+  // and the op is the FIRST word — not "a word somewhere in the line". The free-text test accepted
+  // `echo gh pr create` (nothing ships) at 0 dispatches, and accepted `git commit -m gh pr create`
+  // only INCIDENTALLY, because the ref-moving-verb guard caught the commit — not the "a commit ships
+  // bytes that do not exist at hook time" rule named below. Anchoring makes both refuse by
+  // construction instead of by luck.
+  const argv = plainArgv(command);
+  const isPush = argv[0] === "git" && argv[1] === "push";
+  const isPrCreate = ghPrCreateArgv(argv);
   // `git commit` ships bytes that do not exist at hook time - a record can never describe them.
   if (!isPush && !isPrCreate) return null;
 
@@ -1866,19 +1903,28 @@ export function resolveShippedHeads(
   if (branch === "" || branch === "HEAD") return null; // detached: no named branch to reason about
 
   if (isPush) {
-    // Accept ONLY `<git push> [remote] [<thisBranch>]` - no refspec (`:`), no forced refspec
-    // (`+`), no extra positionals. Anything else ships something we cannot name here.
-    const pushAt = command.search(/(^|\s)git\s+push(\s|$)/);
-    const tail = pushAt === -1 ? "" : command.slice(pushAt).replace(/^.*?git\s+push\b/, "").trim();
-    const words = tail.split(/\s+/).filter((w) => w.length > 0 && !w.startsWith("-"));
-    // ⛔ EXACTLY `<remote> <thisBranch>` (fresh review, P2). A bare `git push` / `git push origin`
+    // `git push <flags> <remote> <ref>` — the argv is positional now, so there is no text to slice.
+    const tail = argv.slice(2);
+    const words = tail.filter((w) => !w.startsWith("-"));
+    // ⛔ EXACTLY `<remote> <ref>` (fresh review, P2). A bare `git push` / `git push origin`
     // ships whatever `push.default` or `remote.<remote>.push` selects — possibly refs that are not
     // HEAD — while the record is bound to HEAD.
     if (words.length !== 2) return null;
     if (words[0] === "" || words[1] === "") return null;
     if (words.some((w) => w.includes(":"))) return null; // explicit refspec -> not necessarily HEAD
-    if (tail.includes("+")) return null; // forced refspec
-    if (words[1] !== branch) return null; // a DIFFERENT branch than this checkout's
+    if (tail.some((w) => w.includes("+"))) return null; // forced refspec
+    // ⛔ THE REMOTE MUST BE THE ONE THE RECORD'S REPO WAS READ FROM (fresh review round 5, P2).
+    // `repoFromGitRemote` reads `remote.origin.url`, so the record is bound to ORIGIN's slug — but
+    // the push arm accepted ANY remote name and still matched against that slug. `git push upstream
+    // main` shipped HEAD and was authorized by ORIGIN's record: HEAD is still exactly what ships, so
+    // this was not a byte-integrity hole, but "the op's repo" was not the binding that got checked,
+    // and a doc/behaviour mismatch is how the next reader gets it wrong. Fail-closed: another remote
+    // falls back to the ≥1-dispatch floor, which is always available.
+    if (words[0] !== ORIGIN_REMOTE) return null;
+    // `git push origin HEAD` ships exactly the commit HEAD resolves to — at least as precise as the
+    // branch name, and git infers the same destination branch — so it is accepted. Refusing it was a
+    // false block on a shape lanes actually use.
+    if (words[1] !== branch && words[1] !== "HEAD") return null;
   }
 
   const repo = opCtx.repo ?? repoFromGitRemote(cwd);
@@ -4188,23 +4234,39 @@ const BLOCK_MESSAGE = [
   // the harness reviewer) does not need to re-do it through `task` — the registry record
   // bound to this op's head is accepted. Naming it here keeps the refusal satisfiable
   // from EITHER path, which is the whole point of the disclosure.
-  "   → A spawned reviewer PROCESS counts too: a review record bound to this op's current HEAD",
-  "     (`review-pr.sh <PR>`, or record one with the command below) satisfies this floor.",
+  // ⛔ AND NAME ITS CONDITION (fresh review round 5, P1). The record path is open only for a command
+  // carrying NO shell syntax (see evidenceCommandIsPlain) — naming the record WITHOUT the shape
+  // reproduced the #2287 defect one spelling over: a lane pushing `git push --force-with-lease`,
+  // `git push -u origin $BR`, `cd … && git push` or `git push origin HEAD:refs/heads/<b>` was told
+  // "a record satisfies this floor", followed the instruction, and stayed blocked. So the accepted
+  // shapes are printed, and the sentence says plainly that anything else falls back to a dispatch.
+  "   → A spawned reviewer PROCESS counts too — FOR THESE EXACT SHAPES ONLY. A review record bound",
+  "     to this op's current HEAD (`review-pr.sh <PR>`, or record one with the command below)",
+  "     satisfies this floor when the refused command is one of:",
+  "        git push origin <this-branch>",
+  "        git push origin HEAD",
+  "        gh pr create …            (no -H/--head, and no --repo pointing at another repo)",
+  "     Any shell syntax closes that path — a pipe, `&&`, a quote, a redirect, `$VAR`, `cd … &&`,",
+  "     `git push -u origin $BR` — because a shell can change WHAT RUNS and the record is bound to",
+  "     BYTES. Run the push as its own bare command to use the record path; otherwise this floor",
+  "     needs a reviewer DISPATCH (the `task` / `subagent` tool) in THIS session.",
   // #2148: name the command the RAIL will demand, not just the missing action. A lane told only
   // "dispatch a reviewer" satisfies this gate and is then refused by the merge registry for lack of
   // an attestation — the second refusal needs a command, and this is the moment to hand it over.
   "   → A dispatch alone does not land the PR: the rail also needs the attestation at the FINAL head —",
   `      ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
-  // #2349: say WHAT THIS FLOOR READ. It counts dispatches in this process and reads
-  // no record, so "no review exists" and "the record is on another box" are the same
-  // sentence to it (the registry is per-machine). Without this, a lane whose reviewer
-  // ran in the parent (#825) or elsewhere reads the refusal as "the review is missing"
-  // and aborts with no correct next action.
-  "   → WHAT THIS GATE READ: the number of reviewer DISPATCHES counted in THIS pi process (still 0).",
-  "     It reads NO review record, so it cannot tell \"no review exists\" from \"a review exists but its",
-  "     record is not on this box\": the registry is PER-MACHINE (~/.pi/agent/reviews/<owner>-<repo>-<pr>.json),",
-  "     and a record minted on another box, or by a parent session, is invisible here. A record would not",
-  "     satisfy this floor in any case — the datum it needs is a dispatch IN THIS SESSION.",
+  // #2349: say WHAT THIS FLOOR READ. Before #2287 it read only a dispatch count and the text said
+  // so. #2287 gave it a head-bound-record path, which made that sentence FALSE — and left the
+  // message CONTRADICTING its own spawn-path paragraph four lines above (fresh review round 5, P1).
+  // The block below is only reached when no usable record was found, so "none" is a true statement
+  // at the moment it prints. The registry-is-per-machine disclosure survives from #2349 because it
+  // is still the reason a record can be invisible to THIS box.
+  "   → WHAT THIS GATE READ: a head-bound review record for THIS op — found: NONE (no record at this",
+  "     head for this repo on this box, or the command's shape closed that path — see above) — and the",
+  "     reviewer DISPATCHES counted in THIS pi process (still 0). The registry is PER-MACHINE",
+  "     (~/.pi/agent/reviews/<owner>-<repo>-<pr>.json), so a record minted on another box, or by a",
+  "     parent session, is invisible here: for a lane whose reviewer ran elsewhere, a dispatch is the",
+  "     only thing this floor can see. The datum it still needs is a dispatch IN THIS SESSION.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
@@ -4240,11 +4302,11 @@ export function auditCommand(command: string, limit = 2000): string {
 
 // ── #2349: the ≥1-dispatch floor says WHAT IT READ ─────────────────────────────
 //
-// The floor counts reviewer dispatches in THIS pi process and reads NO review
-// record. Its text said "no reviewers dispatched" and nothing else, so a lane whose
-// reviewer ran in the parent session (dispatch is parent-enforced, #825) or on
-// another box read it as "the review is missing" — a different fact, with a
-// different next action, which this line now distinguishes explicitly.
+// The floor counts reviewer dispatches in THIS pi process, and (since #2287) first tries a
+// head-bound `record-review.sh` registry record for the op. Its text said "no reviewers dispatched"
+// and nothing else, so a lane whose reviewer ran in the parent session (dispatch is
+// parent-enforced, #825) or on another box read it as "the review is missing" — a different fact,
+// with a different next action, which this line now distinguishes explicitly.
 //
 // `recordState` exists so the value lands in the durable audit row: the fleet can
 // then count how many refusals were "no record on this box" (the condition that was
@@ -4257,8 +4319,9 @@ export function describeDispatchFloorRead(
   const stateText = tier === "" ? "unlabeled" : tier;
   const lines = [
     `   → READ: reviewer dispatches counted in THIS pi process = ${dispatchCount}; tier=${stateText}.`,
-    "     This floor reads NO review record, so by itself it cannot distinguish \"no review exists\"",
-    "     from \"a review exists but its record is not on this box\" (the registry is PER-MACHINE).",
+    "     This floor ALSO tried a head-bound review record for this op and found NONE visible here,",
+    "     so \"no record at this head\" and \"a record exists on another box\" read the same at this",
+    "     point (the registry is PER-MACHINE).",
   ];
   // A command that reaches this floor names no PR BY CONSTRUCTION: every `gh pr merge`
   // and every `gh pr <verb> <n>` came back from the merge-registry branch above, which
@@ -4286,8 +4349,8 @@ export function describeDispatchFloorRead(
       : `     REGISTRY on this box: ${total} record(s) at ${dir}${repo ? `, ${forRepo} for ${repo}` : " (repo unresolved)"}.`
   );
   lines.push(
-    "     This command names no PR, so no single record can be attributed to it — the datum this gate" +
-      " needs is a reviewer dispatch in THIS session (or the parent's, for a sub-agent)."
+    "     This command names no PR, and its SHAPE decides whether a record could have been used at all" +
+      " — the datum this gate needs is a reviewer dispatch in THIS session (or the parent's, for a sub-agent)."
   );
   return { lines, recordState: `no-pr-named (registry=${total}${repo ? `, repo=${forRepo}` : ""})` };
 }
@@ -4311,11 +4374,12 @@ export const MICRO_BLOCK_MESSAGE = [
   "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
   // #2148: micro's record command, so the refusal at the git op also names what the rail will read.
   `   → Then record the attestation at the FINAL head (micro): ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
-  // #2349: same disclosure as the generic message — this floor counts DISPATCHES and
-  // reads no record, so it cannot distinguish "no review" from "not visible here".
-  "   → WHAT THIS GATE READ: the number of reviewer DISPATCHES counted in THIS pi process (still 0).",
-  "     It reads NO review record, so \"no review exists\" and \"a record exists on another box\" are the",
-  "     same sentence here (the registry is PER-MACHINE). What unlocks this floor is a dispatch NOW.",
+  // #2349: same disclosure as the generic message, corrected post-#2287: the floor DOES consult a
+  // head-bound record before it refuses, so "reads NO review record" was no longer true.
+  "   → WHAT THIS GATE READ: a head-bound review record for THIS op — found: NONE (no record at this",
+  "     head for this repo on this box, or the command carried shell syntax) — and the reviewer",
+  "     DISPATCHES counted in THIS pi process (still 0). The registry is PER-MACHINE, so a record on",
+  "     another box is invisible here. What unlocks this floor is a dispatch NOW.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 

@@ -330,6 +330,19 @@ test("unit: splitMutationFromCommit splits at the commit arm, and is null withou
     "a command substitution is not slice-safe");
   equal(mod.splitMutationFromCommit("cat <<'EOT' > f.md\nbody\nEOT\ngit add f.md && git commit -m x"), null,
     "a heredoc is not slice-safe");
+
+  // ⛔ A CANDIDATE INSIDE A QUOTE IS A MENTION, NOT AN INVOCATION (fresh review round 5, P1).
+  // `findGitVerbInvocation` scans a bare `\bgit\b`, so `git commit` INSIDE a quoted string was
+  // taken as the commit arm and the cut landed mid-quote — printing `1) printf '` / `2) git commit
+  // -m x\n' > msg.txt && …`, whose first arm bash cannot parse. Writing a file whose CONTENT
+  // mentions `git commit` is an ordinary lane shape, so the cut must also be at a command START.
+  equal(mod.splitMutationFromCommit("printf 'git commit -m x\\n' > msg.txt && git add msg.txt && git commit -F msg.txt"),
+    null, "a quoted MENTION of `git commit` must not become the cut point (it printed unparseable bash)");
+  equal(mod.splitMutationFromCommit('echo "run git commit now" > note.md && git add note.md && git commit -m x'),
+    null, "the same for a double-quoted mention");
+  const afterQuote = mod.splitMutationFromCommit("git add a.txt && git commit -m 'a && b'");
+  equal(afterQuote?.mutation, "git add a.txt", "control: a quote AFTER the cut point does not disturb the split");
+  equal(afterQuote?.commit, "git commit -m 'a && b'", "control: the commit arm keeps its quoted argument verbatim");
 });
 
 // ── runner ────────────────────────────────────────────

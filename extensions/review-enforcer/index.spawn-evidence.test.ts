@@ -20,8 +20,10 @@
  * ⛔ AND ONLY FOR A COMMAND WITH NO SHELL SYNTAX. Four review rounds proved that modelling the
  * shell by pattern enumeration cannot be completed (quotes, escapes, substitutions, aliases,
  * `pushd`, attached short-flag values, `fetch -u` — each was a live accept). The path is open
- * only for a bare `git push <remote> <branch>` or a plain `gh pr create` with no head override;
- * anything containing `'"`\$(){}<>|&;`, a backslash or a newline falls back to the ordinary
+ * only for the op AT THE COMMAND POSITION — `git push origin <this-branch>`, `git push origin HEAD`
+ * (HEAD is exactly the commit the record is bound to), or a plain `gh pr create` with no head
+ * override — and only when the push's remote is the one the repo slug is read from (`origin`).
+ * Anything containing `'"`\$(){}<>|&;`, a backslash or a newline falls back to the ordinary
  * ≥1-dispatch floor. A lane that wants the record path runs the push as its own command.
  *
  * WHAT IS STILL REFUSED (each pinned below):
@@ -30,7 +32,9 @@
  *   • a record belonging to ANOTHER repo      → block (the #426 collision class)
  *   • two records for one head, no repo ctx   → block (ambiguous is not evidence)
  *
- * MUTATIONS (each was RUN against this file; each reddens the test named beside it):
+ * MUTATIONS. Each was RUN against this file. The target named is the test that ACTUALLY reddened;
+ * rows marked NOT PINNED are recorded because a green run does NOT prove the guard is exercised,
+ * which is the class of false claim an earlier revision shipped:
  *   M1 delete the `headBoundReviewEvidence` acceptance block  → §ALLOW
  *   M2 drop the `head_sha` comparison (accept any record)     → §OLD-HEAD (+ 3 siblings)
  *   M3 drop the `repo` filter                                 → §FOREIGN (+ §ALLOW, via ambiguity)
@@ -39,28 +43,44 @@
  *      #426 parity line)                                        alone is sufficient, so neither
  *                                                               single deletion reddens — which is
  *                                                               why the pair is pinned together.
- *   M6 drop the `-H` spelling (keep only `--head`)            → §REFUSE--H
- *   M7 drop the ref-moving-verb guard                         → §REFUSE-ref-moving
+ *   M6 drop the `-H`/`--head` refusal                          → §REFUSE--H AND §REFUSE--Hattached
+ *                                                                (verified: TWO reds. An earlier
+ *                                                                revision listed this same mutation
+ *                                                                twice, as M6 and M12)
+ *   M7 drop the ref-moving-verb guard                          → NOT PINNED for its `&&` fixtures:
+ *                                                                `evidenceCommandIsPlain` closes them
+ *                                                                first. Verified: 21 passed / 1
+ *                                                                failed, and the red is §unit —
+ *                                                                gitVerbs, NOT §REFUSE-ref-moving.
+ *                                                                An earlier revision claimed the
+ *                                                                latter; that was false.
  *   M8 drop `words.length !== 2` (accept extra positionals)      → §REFUSE-extra-refspec
- *   M9 treat `-c <k>=<v>` as an ordinary global                  → §REFUSE--c-global, but ONLY
- *                                                                  together with M10: the verb
- *                                                                  scanner already sees `commit`
- *                                                                  through a `-c` value, so the
- *                                                                  refusal and the scanner cover
- *                                                                  for each other (the same
- *                                                                  relationship as M5's pair).
- *   M10 do not consume a global option's VALUE in `gitVerbs`      → §REFUSE--c-global, again only
- *                                                                  with M9; the `gitVerbs` unit
- *                                                                  test reddens on this one ALONE.
+ *   M9 treat `-c <k>=<v>` as an ordinary global                  → NOT PINNED, and now
+ *                                                                UNREACHABLE: a plain command has no
+ *                                                                room for a `-c` global before
+ *                                                                `push`, so the command-position
+ *                                                                ANCHOR refuses `git -c … push`
+ *                                                                first. Verified: deleting the guard
+ *                                                                changes nothing (25/25 green). Kept
+ *                                                                as defence in depth, not as a pin.
+ *   M10 do not consume a global option's VALUE in `gitVerbs`      → §unit — gitVerbs (ALONE)
  *   M11 allow shell syntax (`evidenceCommandIsPlain` removed)      → §REFUSE-shell-syntax (+ the
  *                                                                  chained-fetch control)
- *   M12 drop `-H` (keep only the `--head` spelling)                → §REFUSE--H and
- *                                                                  §REFUSE--Hattached
+ *   M12 anchor `isPush`/`isPrCreate` back to free text             → §REFUSE-command-position
+ *   M13 drop the `words[0] !== ORIGIN_REMOTE` binding              → §REFUSE-non-origin-remote
+ *   M14 refuse `HEAD` again (`words[1] !== branch` only)           → §ALLOW — git push origin HEAD
  *
- * NOT mutation targets, and the tests do NOT claim otherwise: `pushd`/`popd` and an unattributable
- * `cd` are rejected by `evidenceCommandIsPlain` FIRST (both shapes need `&&`, `$` or a quote to
- * reach a push in the same command), so those two arms are defence in depth for a future widening
- * of the whitelist. Stated here so a reader does not mistake a green mutation for a dead guard.
+ * NOT mutation targets — `evidenceCommandIsPlain` closes these BEFORE the named arm can run, so a
+ * green run says nothing about the arm. The list is EXHAUSTIVE, because an earlier revision said
+ * "exactly two" and that was false: the ref-moving-verb guard, BOTH `fetch` detectors, the
+ * `-c`/`--config` guard, `pushd`/`popd`, and an unattributable `cd`. Every fixture for them needs
+ * `&&`, `$` or a quote to reach a push in the same command. They are defence in depth for a future
+ * widening of the whitelist. Stated so a reader does not mistake a green mutation for a live guard.
+ *
+ * REACHABLE arms each decided by ONE guard, so a single deletion reddens: the `-H`/`--head`
+ * refusal, the command-position ANCHOR, the `<remote> <ref>` positional parse (extra refspec, `:`,
+ * `+`, side branch), the origin-remote binding, the `GIT_DIR=` family (an inline assignment is
+ * legal shell with no metacharacter), and both repo-null layers.
  *
  * (An earlier revision of this header claimed `words.length !== 2` was redundant. That was
  * false and a fresh reviewer disproved it: `git push origin main extra` shipped a SECOND
@@ -285,8 +305,47 @@ async function main() {
     ]) {
       equal(mod.resolveShippedHeads(cmd, { cwd: repoDir() }), null, `a -c global closes the evidence path: ${cmd}`);
     }
+    // The PLAIN `git -c … push` shape — no separator, so `evidenceCommandIsPlain` passes. It IS
+    // refused, but MEASURED: the command-position ANCHOR decides it (a plain command has no room for
+    // a `-c` global before `push`, so `argv[1] !== "push"`), NOT the `-c` guard — deleting that guard
+    // leaves this suite green. Asserted as BEHAVIOUR, and the header records the guard as unreachable
+    // rather than claiming a pin the mutation does not support.
+    equal(mod.resolveShippedHeads("git -c core.hooksPath=/dev/null push origin main", { cwd: repoDir() }), null,
+      "a PLAIN `git -c <k>=<v> push` must refuse (decided by the command-position anchor)");
     const res = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: "git -c user.name=x commit -m evil && git push origin main" } }, { cwd: repoDir() });
     ok(res?.block === true, "the chained -c commit + push must fall back to the dispatch floor");
+  });
+
+  // ⛔ Fresh review round 5 — the record path's SHAPE, the op's POSITION, and the remote its
+  // repo slug came from. All three were undisclosed or unenforced; the first is also what made
+  // the refusal unsatisftable for a lane that followed the instruction it printed (#2287).
+  test("§ALLOW — `git push origin HEAD` ships exactly HEAD, so the record covers it", async () => {
+    const r = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: "git push origin HEAD" } }, { cwd: repoDir() });
+    equal(r, undefined, "HEAD IS the commit the record is bound to — refusing it was a false block");
+    ok(mod.resolveShippedHeads("git push origin HEAD", { cwd: repoDir() }) !== null, "…and the resolver agrees");
+  });
+
+  test("§REFUSE — the op must be at the COMMAND POSITION, not merely present in the text", async () => {
+    for (const cmd of [
+      "echo gh pr create",
+      "echo git push origin main",
+      "git commit -m gh pr create",
+    ]) {
+      equal(mod.resolveShippedHeads(cmd, { cwd: repoDir() }), null,
+        `a MENTION of the op is not the op (free-text matching accepted these): ${cmd}`);
+    }
+    ok(mod.resolveShippedHeads("gh pr create --title x --body y", { cwd: repoDir() }) !== null,
+      "control: the op at the command position still opens the evidence path");
+    ok(mod.resolveShippedHeads(`gh --repo ${REPO} pr create --title x`, { cwd: repoDir() }) !== null,
+      "control: the gh global --repo form is still read as the op");
+  });
+
+  test("§REFUSE — a push to a remote that is not the record's origin is not covered", async () => {
+    execSync("git remote add upstream https://github.com/daniel-ospina/somewhere-else.git", { cwd: repoDir(), encoding: "utf8" });
+    equal(mod.resolveShippedHeads("git push upstream main", { cwd: repoDir() }), null,
+      "the record's repo slug comes from remote.origin.url, so any other remote names a different repo");
+    const r = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: "git push upstream main" } }, { cwd: repoDir() });
+    ok(r?.block === true, "an upstream push must fall back to the ≥1-dispatch floor");
   });
 
   test("§REFUSE — `git push origin main extra` ships a SECOND refspec", async () => {

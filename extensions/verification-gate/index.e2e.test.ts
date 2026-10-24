@@ -3982,10 +3982,13 @@ async function main() {
     });
     ok(legA && legA.block === true, "Leg A: in-batch write+add+commit must be REFUSED (pre-fix: empty-allow → code ships unverified)");
     ok(/in-batch mutation chain/.test(legA.reason), "Leg A: block reason names the in-batch chain class");
-    // #540 (2026-10-22): the refusal now prints the EXACT split — the two tool_calls, derived from
-    // the same segmenter that classified the chain — instead of only naming the ceremony. Both the
-    // new form and the pre-fix generic sentence are acceptable here; what must hold is that the
-    // lane is told HOW to split, not merely that it should.
+    // #540 (2026-10-22): the refusal now prints the EXACT split — the two tool_calls, sliced from
+    // the ORIGINAL command at the commit arm — instead of only naming the ceremony. This Leg is a
+    // plain `&&` chain, so the split form is REQUIRED here: the generic sentence is the fallback for
+    // shapes where a cut would be UNFAITHFUL (subshell, substitution, heredoc, wrapper) and for a
+    // candidate that is a MENTION inside a quote — those are pinned in the lane-satisfiable suite,
+    // not excused here. An earlier version of this comment said both forms were acceptable while the
+    // assertion below accepted only the split (fresh review round 5, P2).
     ok(/TWO separate bash tool_calls/.test(legA.reason) && /1\) .*echo .*f\.ts/.test(legA.reason) && /2\) git commit/.test(legA.reason),
       "Leg A: block reason prints the exact two commands (mutation arm, then commit arm)");
     ok(!/fileA\.txt|f\.ts/.test(legA.reason.split("in-batch mutation chain")[0]), "Leg A: refusal precedes any file-scope naming (no diff was computed)");

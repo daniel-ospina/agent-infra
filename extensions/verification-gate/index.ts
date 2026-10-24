@@ -2319,6 +2319,15 @@ export function splitMutationFromCommit(command: string): { mutation: string; co
   const inv = findGitVerbInvocation(command, GIT_VERB_SET.commit, "skip");
   if (inv === null) return null;
   if (!splitIsFaithful(command)) return null;
+  // ⛔ THE CANDIDATE MAY BE A MENTION, NOT AN INVOCATION (fresh review round 5, P1).
+  // `findGitVerbInvocation` scans a bare `\bgit\b`, so the words `git commit` INSIDE a quoted
+  // string are taken as the invocation and the cut lands within that quote:
+  //   printf 'git commit -m x\n' > msg.txt && git add msg.txt && git commit -F msg.txt
+  //     arm 1 = "printf '"        (unparseable: unexpected EOF looking for matching ')
+  //     arm 2 = "git commit -m x\n' > msg.txt && … && git commit -F msg.txt"
+  // Writing a file whose CONTENT mentions `git commit` is an ordinary lane shape, and the remedy
+  // we printed could not be run. The cut must therefore also be at a real command START.
+  if (!cutIsAtCommandStart(command, inv.index)) return null;
   const cut = inv.index;
   const mutation = command.slice(0, cut).replace(/[\s;&|]+$/, "");
   const commit = command.slice(cut).trim();
@@ -2331,6 +2340,41 @@ export function splitMutationFromCommit(command: string): { mutation: string; co
  * False for every construct in which the commit sits INSIDE something (parenthesised group /
  * subshell, command substitution, backtick, heredoc, `sh -c`-style wrapper) — see the note above.
  */
+/**
+ * Is byte offset `cut` a command START — outside every quoted/escaped region, preceded by nothing
+ * but start-of-command or a chain separator (`&&`, `;`, `|`, newline)?
+ *
+ * `splitIsFaithful` answers "is the commit INSIDE a construct?" (subshell, substitution, heredoc,
+ * wrapper). This answers the complementary question: "is the thing we identified as the commit
+ * actually the command?" A candidate found inside a quote is a MENTION — a file's content, a
+ * `--body` value, a doc line — and slicing there hands the lane a broken command.
+ *
+ * Over-rejecting is the SAFE direction: null prints the generic sentence, which is honest about
+ * what the gate can show. Under-rejecting prints a remedy that does not run.
+ */
+function cutIsAtCommandStart(command: string, cut: number): boolean {
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < cut; i++) {
+    const ch = command[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") { i++; continue; } // escaped char inside double quotes
+      if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "\\") { i++; continue; } // escaped char outside quotes
+  }
+  if (quote !== null) return false; // the candidate sits inside a quoted region — a mention
+  const before = command.slice(0, cut).replace(/[ \t]+$/, "");
+  if (before.length === 0) return true; // the command starts with this invocation
+  const last = before[before.length - 1];
+  return last === "&" || last === ";" || last === "|" || last === "\n";
+}
+
 function splitIsFaithful(command: string): boolean {
   if (/[()]/.test(command)) return false;
   if (command.includes("`")) return false;
