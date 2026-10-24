@@ -86,6 +86,45 @@ wt_dir() { printf '%s\n' "${WT_DIR:-${O:-$HOME/orchestrator}/state}"; }
 wt_warn() {
   printf '[worker-terminal] %s\n' "$*" >&2
   if [ -n "${LOG:-}" ]; then printf '[worker-terminal] %s\n' "$*" >> "$LOG" 2>/dev/null || true; fi
+  # ⛔ A REFUSAL IS A MEASUREMENT, NOT ONLY A LOG LINE (measured 2026-10-22 on a cloud cell).
+  # The cmux registry's own volume reached 100% (`database or disk is full`), so EVERY `wt_spawn`
+  # returned 1 with that reason — 1,562 refusals in ONE controller log, and not one lane started for
+  # six hours. The controller recorded each refusal as a per-PR `wait` and its cycle line still read
+  # `N acted, M named wait(s)`: the reason lived in a line nobody reads and never reached the decision
+  # line. Recording it HERE is what makes it reachable: this is the single point every LAUNCHER
+  # refusal passes through, so a future spawn site cannot forget it. (Two earliest guards — a missing
+  # argument and an unsafe worker name — are ARGUMENT errors rather than launcher refusals and are
+  # deliberately not recorded: they mean the caller is broken, not that the actuator refused.)
+  case "$*" in
+    'REFUSED '*)
+      _wt_refmsg="${*#REFUSED }"
+      wt_refusal_record "${_wt_refmsg%%:*}" "${_wt_refmsg#*: }"
+      ;;
+  esac
+  return 0
+}
+
+# ── the refusal record the CONTROLLER's summary reads ─────────────────────────────────────────────
+# ONE TAB-delimited row per refused spawn: `<worker name>\t<the launcher's reason>`. The controller
+# TRUNCATES it per cycle (orch-loop.sh, beside the per-PR disposition ledger) and folds the count and
+# the first reason into the `[pr]` line, the `[dispatch]` tail and the DRAIN STALLED line — so
+# `lanes=0` can never again be printed without the actuator's own answer beside it.
+# ⛔ BOUNDED BY CONSTRUCTION, NOT BY HOPE: at most 200 REFUSAL rows per cycle (201 lines, because
+# the controller's probe row occupies one). A refusal storm is exactly the moment a growing file
+# must not become the next full volume.
+wt_refused_file() { printf '%s\n' "$(wt_dir)/spawn-refused.tsv"; }
+wt_refusal_record() { # <name> <reason>
+  local f name reason n=0
+  f="$(wt_refused_file)" 2>/dev/null || return 0
+  [ -n "${f:-}" ] || return 0
+  name="${1:-?}"; reason="${2:-no reason given}"
+  if [ -f "$f" ]; then
+    n="$(wc -l < "$f" 2>/dev/null | tr -d ' ')"
+    case "${n:-}" in ''|*[!0-9]*) n=0 ;; esac
+  fi
+  [ "$n" -ge 201 ] && return 0
+  { printf '%s\t%s\n' "$(printf '%s' "$name" | tr -d '\t\n')" \
+      "$(printf '%s' "$reason" | tr '\t\n' '  ' | cut -c1-240)" >> "$f"; } 2>/dev/null || true
   return 0
 }
 
@@ -1312,7 +1351,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
       # reason discarded (a permission-broken socket dir answers `directory … has unsafe permissions`)
       # is the one diagnostic that matters most where it was missing.
       spmsg="${spout//$'\n'/ }"
-      wt_warn "tmux could not start $name: ${spmsg:0:300}"
+      wt_warn "REFUSED $name: tmux could not start it: ${spmsg:0:300}"
       return 1 ;;
     terminal) : ;;
     *) wt_warn "REFUSED $name: unreadable launcher '$kind'"; return 1 ;;
