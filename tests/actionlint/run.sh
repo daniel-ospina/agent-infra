@@ -445,7 +445,8 @@ conc_run 0 "the well-formed fixtures pass" \
   "$CFIX/pr-number-key.yml" "$CFIX/pr-group-folded.yml" "$CFIX/pr-cancel-capital.yml" \
   "$CFIX/pr-event-number.yml" "$CFIX/pr-target-headref.yml" "$CFIX/pr-eof.yml" \
   "$CFIX/pr-workflow-ws-a.yml" "$CFIX/pr-workflow-ws-b.yml" \
-  "$CFIX/pr-cancel-continuation-comment.yml"
+  "$CFIX/pr-cancel-continuation-comment.yml" "$CFIX/push-concurrency-flow-child-ok.yml" \
+  "$CFIX/pr-concurrency-flow-child.yml"
 
 # name + the rule tag the refusal must carry
 for pair in \
@@ -481,6 +482,10 @@ for pair in \
   "pr-group-continuation-comment.yml R1" \
   "push-bom.yml R2" \
   "push-on-anchor.yml R2" \
+  "push-concurrency-flow-child.yml R2" \
+  "push-explicit-top-key.yml R0" \
+  "push-concurrency-merge-key.yml R0" \
+  "push-job-flow-value.yml R0" \
   "reusable-concurrency.yml R3" \
   "push-job-level.yml R0" \
   "pr-unreadable-on.yml R0"; do
@@ -506,6 +511,37 @@ conc_run 0 "one file under two spellings is one workflow" "$CFIX/pr-ok.yml" "$CF
 grep -q '1 file(s) scanned' "$OUT" \
   && pass "the second spelling resolved to the same file" \
   || { fail "a second spelling was counted as a second workflow"; sed 's/^/      /' "$OUT"; }
+
+# The comment strip must be LINEAR in a leading-whitespace run. The regex form re-scanned the run
+# from every start position, so one line of 100 000 spaces took 16 s — a workflow file an author can
+# commit could stall the lane. The generated input keeps the check honest without a timing rule.
+longf="$CASE6_DIR/whitespace-run.yml"
+{
+  printf 'name: whitespace run\non:\n  push:\n    branches: [main]\n'
+  # NO trailing comment: with a `#` on the run the anchored whole-line rule matches first and the
+  # unanchored trailing rule is a no-op on that input (measured: old 0.108 s vs new 0.098 s), so an
+  # arm built that way passes against the pre-change implementation. On a comment-free run the same
+  # comparison is 17.5 s vs 0.11 s — the shape that actually costs.
+  awk 'BEGIN { for (i = 0; i < 100000; i++) printf " "; print "" }'
+  printf 'jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n'
+} >"$longf"
+if command -v timeout >/dev/null 2>&1; then
+  # The bound must sit BELOW the cost it guards against, or the arm passes with the regression
+  # present: the old two-sub strip needs 16-19.5 s on this file, the linear one 0.03 s, so 5 s is
+  # ~150x headroom for a slow runner and still an order of magnitude under the failure it names.
+  timeout 5 bash "$CONC" "$longf" >"$OUT" 2>&1
+  conc_rc=$?
+  if [ "$conc_rc" -eq 124 ]; then
+    fail "a 100 000-space line still stalls the check (timeout) — the comment strip is not linear"
+  elif [ "$conc_rc" -eq 0 ]; then
+    pass "a 100 000-space line is stripped in bounded time (exit 0)"
+  else
+    fail "a whitespace-run workflow should be GREEN, got exit $conc_rc"
+    sed 's/^/      /' "$OUT"
+  fi
+else
+  pass "timeout(1) unavailable — whitespace-run arm skipped (the shape is covered by the fixtures)"
+fi
 
 # The BOM fixture only tests the BOM path while the BOM is still there: assert the bytes, so a
 # formatter that strips it cannot quietly turn this arm into a duplicate of push-cancel-true.yml.

@@ -243,11 +243,34 @@ function parseconc(v,   n, i, parts, t, k) {
   }
 }
 function opens(v)  { return gsub(/[\[{]/, "", v) }
+# stripcomment(s) — remove a trailing `#` comment, leftmost first, in LINEAR time. The regex form
+# (`sub(/[ \t]+#.*$/,"")`) re-scans the whitespace run from every start position, so one line of
+# 100 000 spaces cost 16 s: a gate that can be made to hang by a whitespace run is a gate an author
+# can stall. split() is linear, and a `#` with no whitespace before it is NOT a comment.
+function stripcomment(s,   n, seg, res, k, hit) {
+  n = split(s, seg, "#")
+  if (n < 2) return s
+  res = seg[1]; hit = 0
+  for (k = 2; k <= n; k++) {
+    if (seg[k-1] == "" || seg[k-1] ~ /[ \t]$/) { hit = 1; break }
+    res = res "#" seg[k]
+  }
+  if (!hit) return s
+  sub(/[ \t]+$/, "", res)
+  return res
+}
 function closes(v) { return gsub(/[\]}]/, "", v) }
 # flush() — print the record for the file just finished, then clear its state. Called at the first
 # line of the NEXT file (so a previous record never carries content from the next file) and at EOF.
 function flush(   tg, k, n) {
   if (fname == "") return
+  # A `concurrency:` block was declared but NOTHING in it could be read (e.g. a YAML merge key, whose
+  # group and cancel arrive through `<<:`). "Declared, unreadable" must not be treated as "declared,
+  # no cancellation": the absent-key arm of R2 reads that as the non-cancelling default (round 7).
+  if (hasconc && group == "" && cancel == "" && concbad == 0 && joblevel == 0) {
+    concbad = 1
+    concwhy = "a `concurrency:` block is declared but no `group`/`cancel-in-progress` value could be read from it (an unmodelled child, such as a YAML merge key)"
+  }
   if (pendkey != "") {                    # a value that ran to EOF: still a value
     if (pendkey == "group") { group = unq(trim(pendval)) } else { cancel = tolower(unq(trim(pendval))) }
     pendkey = ""; pendval = ""; pendind = -1
@@ -291,8 +314,7 @@ BEGIN {
   if (pendkey != "" && lineindent > pendind) {
     piece = trim(line)
     if (pendblock == 0) {               # a plain continuation: a `#` here is a YAML COMMENT
-      sub(/[ \t]+#.*$/, "", piece)
-      sub(/^#.*$/, "", piece)
+      piece = stripcomment(piece)
       if (piece == "") next
     }
     pendval = pendval " " piece
@@ -300,8 +322,8 @@ BEGIN {
     next
   }
 
-  sub(/^[ \t]*#.*$/, "", line)            # whole-line comment
-  sub(/[ \t]+#.*$/, "", line)             # trailing comment (the comment may itself contain a hash: #2474)
+  line = stripcomment(line)               # trailing comment (the comment may itself contain a hash: #2474)
+  if (trim(line) == "") next              # whole-line comment
   if (trim(line) == "") next
 
   if (scalarindent >= 0 && lineindent <= scalarindent) scalarindent = -1
@@ -337,6 +359,12 @@ BEGIN {
       if (flowmode == "concurrency") { parseconc(flowbuf) } else { addflow(flowbuf) }
       flowopen = 0; flowbuf = ""; flowmode = ""; flowdepth = 0
     }
+    next
+  }
+
+  if (line ~ /^[ \t]*\?[ \t]/) {        # explicit-key form, at ANY indent: not modelled
+    concbad = 1
+    concwhy = "the file uses YAML explicit-key syntax (`? key`), which this reader does not model"
     next
   }
 
@@ -395,18 +423,20 @@ BEGIN {
     next
   }
 
-  if (line ~ /^[ \t]*\?[ \t]/) {        # explicit-key form, at any indent: not modelled
-    concbad = 1
-    concwhy = "the file uses YAML explicit-key syntax (`? key`), which this reader does not model"
-    next
-  }
-
   # A JOB-level `concurrency:` (indented while we are NOT in the workflow-level section). GitHub
   # honours it and this check does not model it, so it is refused (R0) rather than ignored.
   if (match(substr(line, lineindent + 1), "^" QCH "?concurrency" QCH "?[ \t]*:")) { joblevel = 1; next }
+  # A job written as a FLOW mapping (`build: {…, concurrency: {…}}`) hides the key from the line test
+  # above, so it is looked for anywhere a flow mapping can put it (round 7, P2).
+  if (line ~ /[\[{,][ \t]*["]?concurrency["]?[ \t]*:/) { joblevel = 1; next }
 
   if (cur == "concurrency") {
     t = trim(line)
+    if (t ~ /^\{/) {                    # an indented FLOW mapping: same parser, one line down
+      if (opens(t) > closes(t)) { flowopen = 1; flowmode = "concurrency"; flowbuf = t; flowdepth = opens(t) - closes(t) }
+      else { parseconc(t) }
+      next
+    }
     if (match(t, "^" QCH "?group" QCH "?[ \t]*:")) {
       v = unq(trim(substr(t, index(t, ":") + 1)))
       if (v == "" || v ~ /^[|>]/) { pendkey = "group"; pendval = ""; pendind = lineindent; pendblock = (v ~ /^[|>]/ ? 1 : 0) } else { group = v }
