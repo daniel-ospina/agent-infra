@@ -239,6 +239,101 @@ git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
 #               difference is `restart-pending`, not a reason to redeploy what is already deployed.
 RUNNING="$(git -C "$SELF" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
 RUNNING_FROM="self:$SELF"
+# ── RUNNING when the script's own directory is not a checkout — the CELL shape (#2641) ────────
+# ⛔ MEASURED 2026-10-24, twelve minutes after a CORRECT activation of pi-cell-3: the pin, the seeded
+# `$O` and the running controller were all `848ba4b133a7`, and the record still said
+# `relation=restart-pending running=848ba4b133a7 …` — because `$SELF` is `$O` (orch-loop.sh prefers
+# `$O/harness-refresh.sh`), a cell's `$O` is a FLAT SEED with no git identity, so `self:` can never
+# resolve there, the stamp fallback answers instead, and the `stamp:*` arm below then downgrades
+# `current` to `restart-pending` on EVERY live cycle. Permanent `restart-pending` is the always-on
+# alarm shape: a token that is never absent is a token nobody reads, and the one record that answers
+# "is this box on the deployed commit?" could never say yes on any cell.
+# ⛔ THE IDENTITY IS AVAILABLE AND AUTHORITATIVE. `$O/.orch.lock` names the pid that OWNS this state
+# dir — the same ownership record the `CONTROLLER_LIVE` read below already trusts and the
+# supervisor's own controller census uses — and THAT process's argv names the tree it executes. So the
+# read is one pid, not a scan of the box's process table: there is nothing to disambiguate and nothing
+# else on the box can answer for it.
+# ⛔ MATCH THE INVOCATION, NEVER A MENTION OF A PATH — the rule this repo settled twice already
+# (`cloud-cell-supervisor.sh`'s `_controller_ps_awk`: "Match the INVOCATION, not the string … a
+# `bash -c` whose script text mentions the path"; `check-deployed-drift.sh`: the shell in `t[1]`, the
+# path in `t[2]`). So the path must be the SCRIPT OPERAND (argv[1]) of a shell: `orch-loop.sh` takes no
+# arguments, so `<shell> <path>` is the whole of a controller's invocation. A `sed`/`tail`/`diff` that
+# merely READS the new tree must not resolve RUNNING — that reports `current` for a controller still
+# executing the old tree (the exact false PASS this file exists to end).
+# ⛔ WHICH TREES MAY ANSWER comes from the fleet's own records, not from a new knob: the per-commit
+# child under `HARNESS_PIN_DIR` (what `apply` creates), `HARNESS_PIN_DIR` ITSELF (a legacy flat pin,
+# where the ROOT is the worktree), and the tree `HARNESS_PIN_FILE` names — the only record that can
+# name a READ dir OUTSIDE the pin root (the #2216 shape `check-deployed-drift.sh` documents). A tree
+# outside every recorded root is a PEER repo's controller and must never answer for this box; without
+# the pin file and flat-pin arms, a box on either would keep the permanent `restart-pending` this stage
+# exists to remove.
+# ⛔ It does NOT require `CONTROLLER_LIVE`: that is computed BELOW this block (it exists for the
+# `stamp:*` downgrade), and this stage establishes liveness itself from the lock pid it names.
+if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
+  _ctrl_pid=""
+  [ -n "${O:-}" ] && _ctrl_pid="$(head -1 "$O/.orch.lock" 2>/dev/null)"
+  _ctrl_pid="${_ctrl_pid//[!0-9]/}"
+  _ctrl_tree=""
+  if [ -n "$_ctrl_pid" ] && kill -0 "$_ctrl_pid" 2>/dev/null; then
+    _argv="$(ps -o command= -p "$_ctrl_pid" 2>/dev/null)"
+    _prev=""
+    # The tmux launcher's argv QUOTES the script path, so a token is de-quoted before comparison. The
+    # quote characters live in variables, not as `\'` escapes: this file is read by a gate that
+    # dequotes it statically (see #2175), and a backslash-quote in the body changes what that read sees.
+    _sq="'"; _dq='"'
+    for _w in $_argv; do
+      _w="${_w#$_sq}"; _w="${_w%$_sq}"; _w="${_w#$_dq}"; _w="${_w%$_dq}"
+      case "$_w" in
+        */orchestrator-harness/orch-loop.sh)
+          # A shell, named without a `case` alternation: the same static read treats `|` as a pipeline.
+          _base="${_prev##*/}"
+          if [ -n "$_base" ]; then
+            case " bash sh dash zsh ksh " in
+              *" $_base "*) _ctrl_tree="${_w%/orchestrator-harness/orch-loop.sh}" ;;
+            esac
+          fi ;;
+      esac
+      _prev="$_w"
+    done
+  fi
+  if [ -n "$_ctrl_tree" ]; then
+    _ok=0
+    _nl="$(printf '\n')"
+    _acc="${_nl}"
+    [ -n "${HARNESS_PIN_DIR:-}" ] && _acc="${_acc}${HARNESS_PIN_DIR%/}/scripts/orchestrator-harness/orch-loop.sh${_nl}"
+    if [ -n "${HARNESS_PIN_FILE:-}" ] && [ -r "$HARNESS_PIN_FILE" ]; then
+      _pinh="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+      case "$_pinh" in
+        */scripts/orchestrator-harness) _acc="${_acc}${_pinh}/orch-loop.sh${_nl}" ;;
+      esac
+    fi
+    case "$_acc" in *"${_nl}${_ctrl_tree}/orchestrator-harness/orch-loop.sh${_nl}"*) _ok=1 ;; esac
+    if [ "$_ok" = 0 ] && [ -n "${HARNESS_PIN_DIR:-}" ]; then
+      case "$_ctrl_tree" in
+        "${HARNESS_PIN_DIR%/}"/*)
+          _rest="${_ctrl_tree#"${HARNESS_PIN_DIR%/}"/}"
+          case "$_rest" in
+            */scripts)
+              _rest="${_rest%/scripts}"
+              case "$_rest" in */*) ;; *) _ok=1 ;; esac ;;
+          esac ;;
+      esac
+    fi
+    if [ "$_ok" = 1 ]; then
+      # ⛔ THE TREE MUST BE ITS OWN TOPLEVEL. `_ctrl_tree` always ends in `/scripts` (the harness lives
+      # at `<tree>/scripts/orchestrator-harness`), so `git -C` on a child that lost its own `.git` would
+      # ASCEND to an enclosing worktree and hand back ITS head — a stale child under a repo pin root
+      # would then report `current` for a tree the controller is not executing. An answer that does not
+      # match the tree the process names is cannot-verify, and falls to the stamp path.
+      _want_root="${_ctrl_tree%/scripts}"
+      _top="$(git -C "$_ctrl_tree" rev-parse --show-toplevel 2>/dev/null)"
+      if [ -n "$_top" ] && [ "$_top" = "$_want_root" ]; then
+        _run_c="$(git -C "$_ctrl_tree" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"
+        if [ -n "$_run_c" ]; then RUNNING="$_run_c"; RUNNING_FROM="proc:$_ctrl_tree"; fi
+      fi
+    fi
+  fi
+fi
 if [ -z "$RUNNING" ]; then
   RUNNING="$(stamp_field commit)"
   RUNNING_FROM="stamp:$STAMP"
