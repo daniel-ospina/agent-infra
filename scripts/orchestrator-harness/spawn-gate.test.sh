@@ -823,7 +823,14 @@ i=0; while ! grep -q PI_RAN "$PI_LOG" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.
 held="$(cat "$PRLOCK7" 2>/dev/null)"
 { [ -n "$held" ] && kill -0 "$held" 2>/dev/null; }; rc=$?
 ck "while the agent works the claim names the LIVE fixer (lock=${held:-<none>}) — the crash arm is not vacuous" $rc
-kill -TERM "$fixpid" 2>/dev/null; : > "$PI_STOP"; wait "$fixpid" 2>/dev/null; crc=$?
+# ⛔ SIGNAL THE LOCK OWNER, NOT THE SUBSHELL WRAPPER. `$fixpid` is the `( … ) &` subshell, NOT
+# `fix-one.sh` — measured on this box: wrapper=11948, lock owner=11953. Killing the wrapper makes
+# `wait` return 143 the instant the WRAPPER dies, while the fixer is still inside its `pi` stub, so
+# its claim is legitimately still present at assert time: the arm failed on TIMING, not on a leak
+# (the lock did disappear ~0.5 s later, unchanged). It also proved less than it claims — the signal
+# never reached the process whose EXIT trap is under test. `$held` IS that process (the pid
+# `prlock_take` wrote), so signal it, and the wrapper's `wait` then observes the fixer's own death.
+kill -TERM "${held:-$fixpid}" 2>/dev/null; : > "$PI_STOP"; wait "$fixpid" 2>/dev/null; crc=$?
 [ ! -f "$PRLOCK7" ]; rc=$?
 ck "a SIGTERM'd fixer RELEASES the claim (exit $crc, lock=${PRLOCK7##*/}) — a lock leaked by a dead fixer stalls the PR one step later" $rc
 [ ! -s "$MERGE_LOG" ]; rc=$?
