@@ -952,8 +952,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${WT_INIT_LOCK_MIN_AGE:-300}",
     axis: "reap",
     guardedBy:
-      "scripts/orchestrator-harness/wt-lifecycle.test.sh behaviour pin (fixtures tm-5/tm-6 drive BOTH sides of the floor: a 60 s floor treats the fresh lock as live and a 3600 s floor treats it as stale)",
-    note: "#2033 — how old a surviving `initializing` worktree lock must be before the lifecycle helper calls the add DEAD and rolls the partial materialisation back. The age is NOT the safety: the signal is the lock file itself, which git removes when a checkout completes, so a lock that survived is positive evidence of an add that never finished. The floor only excludes an add that is in progress RIGHT NOW.",
+      "scripts/orchestrator-harness/wt-lifecycle.test.sh behaviour pin (fixtures tm-5/tm-6 drive BOTH sides of the floor: a 3600 s floor makes the fresh lock STALE — the interrupted add is repaired — and a 60 s floor makes it YOUNG — the record is REFUSED with rc=2 and left untouched; neither side is ever reported as a reusable worktree)",
+    note: "#2033 — how old a surviving `initializing` worktree lock must be before the lifecycle helper calls the add DEAD and rolls the partial materialisation back. The age is NOT the safety: the signal is the lock file itself, which git removes when a checkout completes, so a lock that survived is positive evidence of an add that never finished. The floor only excludes an add that is in progress RIGHT NOW. ⛔ BELOW THE FLOOR IS NOT 'USABLE' (#2102 review P1, MEASURED): a young lock used to fall through to the reuse test, which asks only `symbolic-ref`/`rev-parse HEAD` — both already true in a killed add, because git writes the ref and HEAD before it populates the tree — so a half-materialised checkout answered rc=0 'reused existing worktree' and a lane was spawned into it. A record git still marks `initializing` cannot PROVE a usable checkout, so it is refused (rc=2, nothing changed, retried next cycle) whether the add is running or dead.",
   },
   {
     name: "VENV_MIN_AGE",
