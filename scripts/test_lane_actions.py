@@ -833,7 +833,7 @@ class TestActionVocabulary:
         needed" while `scripts/admin-merge.sh` refuses that very PR (`CONFLICTED`), so NO lane
         was ever told to rebase and the PR sat. `rail_block_reason` reads checks only and
         returns None here, so the mergeability term has to enter the DECISION, which is why
-        the DIRTY arm sits above arm 1.
+        the conflict arm (arm 1) sits above `call-rail` (arm 2).
 
         `resolve-conflict`, not `blocked-by-rail`: no rail GATE is proven non-green (the
         `why` a `blocked-by-rail` token carries would be empty), and the work is a rebase --
@@ -886,17 +886,21 @@ class TestActionVocabulary:
             == "rerun-checks"
 
     def test_NOTHING_reported_yet_while_checks_RUN_is_running_not_rerun(self):
-        """⛔ ARM 2 MUST CONCEDE TO ARM 3 (#1872 review -- a real defect found in review).
+        """⛔ THE NOT-YET-REPORTED `rerun-checks` ARM (arm 3) MUST CONCEDE TO `running` (arm 4)
+        (#1872 review -- a real defect found in review).
 
-        ⚠️ ARM NUMBERS SHIFTED WITH #1936: `resolve-conflict` was inserted as arm 0, so `running` is
-        arm 3 and `record-review` arm 4. This sentence read "ARM 4" before that insertion.
+        ⚠️ ARM NUMBERS MOVE WITH EVERY INSERTION ABOVE THEM (#1936, then the WEDGED re-trigger), so
+        the NAMES are authoritative and the numbers are only a reading aid: `resolve-conflict` is
+        arm 1 and the WEDGED re-trigger is arm 0, which puts `running` at arm 4 and `record-review`
+        at arm 5. This sentence has now been renumbered twice; cite the classes, not the ordinals.
 
         A fresh head where NO required context has reported yet while other checks are already
         in flight is the NORMAL first state of a push (`python-ci-gate`, `docs` and `legal-e2e`
         are created seconds after the children). `not req_seen` cannot tell "not reported yet"
         from "never ran", and the two need OPPOSITE actions: wait, versus START the workflow.
 
-        Before the fix arm 2 fired first and this shape read `rerun-checks`; the dispatcher's
+        Before the fix the not-yet-reported `rerun-checks` arm fired first and this shape read
+        `rerun-checks`; the dispatcher's
         brief for that class asserts "(Nothing is in flight ...)" and tells the lane to push an
         empty commit -- so a 20-second-old head was churned, wasting runner capacity and staling
         every attestation.

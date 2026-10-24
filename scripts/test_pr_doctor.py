@@ -2436,15 +2436,16 @@ def test_a_rail_gate_in_flight_is_running_and_a_red_one_is_the_rail(monkeypatch)
         == "call-rail"
 
     # ⛔ AND A DIRTY HEAD BEATS EVERYTHING, INCLUDING THE RAIL'S OWN GATE (#1872 review round 12,
-    # superseded by #1936): `resolve-conflict` is ARM 0 in `classify_pr`. The intermediate fix
-    # returned it from INSIDE arm 1, which left the DIRTY case answering per gate state -- and that
+    # superseded by #1936): `resolve-conflict` is ARM 1 in `classify_pr`. The intermediate fix
+    # returned it from INSIDE arm 2 (the `call-rail` arm inside whose `_rail` branch the check used
+    # to live), which left the DIRTY case answering per gate state -- and that
     # was still a lie on two of the three shapes. A `blocked-by-rail` brief reads "THE RAIL REFUSES
     # IT ON `drift-guard`. REPAIR THAT, THEN MERGE." -- but the rail refuses a `CONFLICTED` PR on
     # the CONFLICT, so repairing the gate and merging is still refused: the instruction omits the
     # only required step. And `call-rail` (the green-gate shape, previously pinned here as #1936's
     # "not endorsed" edge) says "MERGE #N -- nothing else is needed" on a PR the rail will refuse.
     # Both consumers skip `running`, whose only escalation (`STUCK`) is emitted for `call-rail`
-    # alone, so any of them can wait forever. ARM 0 answers all three shapes with the REBASE first:
+    # alone, so any of them can wait forever. ARM 1 answers all three shapes with the REBASE first:
     # it is the only action that can land the PR, and it re-runs every check at the new head, so a
     # pre-rebase gate result is stale evidence anyway.
     assert classify({"mergeStateStatus": "DIRTY"}, with_rail("in_progress", None), True) \
@@ -3336,9 +3337,9 @@ def test_rest_and_graphql_reads_of_one_pr_classify_the_same(monkeypatch):
     rest_shaped = _REAL_OPEN_PRS_REST()[0]
     # the same PR as the GraphQL read would hand it over
     gql_shaped = dict(rest_shaped, mergeStateStatus="DIRTY")
-    # A RED required check is the shortest path to `fix-ci` (arm 6), so a conflict that is ALSO red
+    # A RED required check is the shortest path to `fix-ci` (arm 7), so a conflict that is ALSO red
     # is the case where the two arms compete; asserting the class pins that `resolve-conflict`
-    # (arm 0) wins, rather than a lane being sent to repair CI on a head whose only fix is a rebase.
+    # (arm 1) wins, rather than a lane being sent to repair CI on a head whose only fix is a rebase.
     cr = _cr(red=["python-ci-gate"])
     klass = pr.CLASSIFIER.classify_pr(rest_shaped, cr, False)
     assert klass == pr.CLASSIFIER.classify_pr(gql_shaped, cr, False), (

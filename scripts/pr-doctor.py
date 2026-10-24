@@ -722,7 +722,7 @@ def _open_prs_rest():
     ⚠️ ONE FIELD IS GENUINELY NOT SERVED BY THIS ENDPOINT, AND IT IS DOCUMENTED RATHER THAN
     FAKED: the LIST payload's `mergeable_state` is null (GitHub computes mergeability per PR,
     lazily -- measured: 18/18 and 19/19 open PRs), so `mergeStateStatus` is "" on a REST pass and
-    `resolve-conflict` (arm 0) cannot match on the fields THIS payload returns today -- `mergeable`
+    `resolve-conflict` (the conflict arm) cannot match on the fields THIS payload returns today -- `mergeable`
     is ABSENT on that payload too (0/3 rows carried either key, `objective._rest_pr()`'s
     measurement), which maps to `UNKNOWN`, and `UNKNOWN` is not an answer. The mapper's
     `CONFLICTING` branch is therefore reachable only from a payload that DOES carry the field
@@ -752,7 +752,7 @@ def _open_prs_rest():
                 "isDraft": bool(p.get("draft")),
                 # ⛔ `.upper()` IS DEFENSIVE VOCABULARY NORMALISATION, AND THAT IS ALL IT IS. REST
                 # spells this `dirty`/`clean`; `gh --json` and `objective.classify_pr()` spell it
-                # `DIRTY`/`CLEAN` (the `== "DIRTY"` comparison in that module's arm 0), so a
+                # `DIRTY`/`CLEAN` (the `== "DIRTY"` comparison in that module's conflict arm), so a
                 # passthrough is a silent
                 # logic error whenever the field is populated -- the fleet's own REST adapter
                 # (`orchestrator-harness/gh-rest/gh`) maps it the same way, for the same reason.

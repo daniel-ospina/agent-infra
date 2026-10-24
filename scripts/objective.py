@@ -972,12 +972,13 @@ def rollup_checks(cr):
 # `fix-ci`, i.e. the beat told the fleet to go REPAIR CODE for a job that never ran (measured on
 # this branch's base at main=57edbd7a0: `{'fix-ci': 1}`). With #1872 landed (#1930) the same shape
 # is worse in the way that matters: `rollup_checks` puts ANY non-`completed` status in `flight`,
-# so arm 5 answers `running` -- "the head is still executing" -- and both readers SKIP the PR and
-# wait for a completion that will never arrive. #1930 said so as it landed: "#1926 (`running` has
-# no age bound, so a wedged check-run parks a PR forever)". The re-trigger arms cannot reach it
-# either: a wedged run IS a required context that REPORTED (so `req_seen` is non-empty, and the
-# `gated_absent` arm 7 sees it as present) while never reaching `completed` -- so every
-# absence-based arm is structurally blind to it, and only an AGE can tell it from a healthy run.
+# so the `running` arm (arm 4) answers -- "the head is still executing" -- and both readers SKIP
+# the PR and wait for a completion that will never arrive. #1930 said so as it landed: "#1926
+# (`running` has no age bound, so a wedged check-run parks a PR forever)". The re-trigger arms
+# cannot reach it either: a wedged run IS a required context that REPORTED (so `req_seen` is
+# non-empty, and the partial-absence `rerun-checks` arm (arm 6) sees it as present) while never
+# reaching `completed` -- so every absence-based arm is structurally blind to it, and only an AGE
+# can tell it from a healthy run.
 #
 # THE BOUND, and what it is derived from. Two clocks have to be covered, because the age of a
 # non-completed check is measured from whichever applies (see `flight_age_min`): a STARTED run's
@@ -1008,15 +1009,16 @@ def rollup_checks(cr):
 # ⛔ SCOPE, STATED -- AND THE TWO SHAPES ARE NOT THE SAME SHAPE (#1948 review cycle 4, P3).
 # The aged set is the REQUIRED contexts (`GATED_CHECKS`). A wedged RAIL gate
 # (`drift-guard`/`flip-gate`/`provenance`) is not in it, and it is never a `blocked-by-rail`
-# REPAIR: `rail_block_reason` ACCEPTS an in-flight gate, but arm 1 returns `blocked-by-rail` only
-# when that gate is in `red` (`if _rail in red`), so a wedged rail gate is non-`completed`, never
-# `red`. That is DELIBERATE, one block above (#1872 review round 7: "an in-flight rail gate reads
-# `running` and a RED one still reads `blocked-by-rail`") -- an in-flight gate is not work to
-# repair. WHAT THEN HAPPENS DEPENDS ON WHETHER A REQUIRED GATE IS PRESENT:
-#   * EVERY gated context present: `rail_block_reason` names the wedged gate, arm 1 falls through
-#     to `running`, and the head WAITS -- unbounded, which is the one wait this change does not
-#     bound. Ageing it there would change the ladder for a non-required surface, and that is a
-#     separate call, deliberately not made here.
+# REPAIR: `rail_block_reason` ACCEPTS an in-flight gate, but `call-rail` (arm 2) returns
+# `blocked-by-rail` only when that gate is in `red` (`if _rail in red`), so a wedged rail gate is
+# non-`completed`, never `red`. That is DELIBERATE, one block above (#1872 review round 7: "an
+# in-flight rail gate reads `running` and a RED one still reads `blocked-by-rail`") -- an in-flight
+# gate is not work to repair. WHAT THEN HAPPENS DEPENDS ON WHETHER A REQUIRED GATE IS PRESENT:
+#   * EVERY gated context present: `rail_block_reason` names the wedged gate, `call-rail` falls
+#     through to `running`, and the head WAITS -- unbounded, which is the one wait this change does
+#     not bound. Ageing it there would change the ladder for a non-required surface, and that is a
+#     separate call, deliberately not made here. (A CONFLICTED head no longer reaches that wait at
+#     all: arm 1 answers it with the REBASE, which is the #1936 change.)
 #   * a REQUIRED gate ABSENT: `wedge_evidence`'s all-contexts read (below) ages EVERY context, so
 #     the rail gate can be the ONLY name in the reason -- `«drift-guard» queued <age>m` -- and the
 #     head reads `rerun-checks` even when it is DIRTY. Measured through `classify_one` with the
@@ -1033,8 +1035,9 @@ def rollup_checks(cr):
 # children finish, so when a required gate is absent AND every check in flight is past the bound,
 # nothing can create it and the `gated_absent and flight` term of `running` would wait for ever.
 # A rail gate appears in THAT read only as one of the stuck jobs to START -- it is named as work to
-# do, never as a `blocked-by-rail` repair -- and arm 1 still answers first on a fully-green gated
-# set, where nothing is named as an order at all.
+# do, never as a `blocked-by-rail` repair -- and `call-rail` (arm 2) still decides a fully-green
+# gated set, where nothing is named as an order at all, except for a CONFLICTED head, which arm 1
+# takes as the REBASE.
 FLIGHT_BOUND_MIN = 90.0
 
 # The contexts a landing actually waits on. `ai-review-gate` is EXCLUDED for the same reason
