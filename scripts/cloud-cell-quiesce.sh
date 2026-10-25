@@ -81,8 +81,15 @@ step "seeded $O with $(ls "$O"/*.sh 2>/dev/null | wc -l | tr -d ' ') scripts (cl
 # 5. Start exactly one controller.
 step "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
 if [ -n "$SW" ]; then
+  # ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, AND THIS CALLER IS NOT THE SERVICE MANAGER (review P1 round 19,
+  # #2402 / C). The unit exports `ORCH_FOREGROUND=1` and every lane shell inherits it through the tmux server
+  # the controller created; quiesce is the LAST unpinned `start` caller. It is also the worst one to leave
+  # unpinned: quiesce STOPS the unit a few lines above, so `foreground_handover` has nothing to wait for and
+  # `start` execs `orch-loop.sh` inside quiesce's own child — a dispatcher OUTSIDE the unit's cgroup while the
+  # enabled unit is stopped. Quiesce's own "exactly one orch-loop" assertions then pass and it prints DONE:
+  # the cell is left unsupervised with a green report, which is #2402 restored silently.
   CELL_HOME="$CELL_HOME" ENV_FILE="$ENV_FILE" REPO="$REPO" O="$O" OR="$OR" \
-    SCOPE="$SCOPE" MAX_LANES="$MAX_LANES" \
+    SCOPE="$SCOPE" MAX_LANES="$MAX_LANES" ORCH_FOREGROUND=0 \
     bash "$SW" start >/dev/null 2>&1 || true
 else
   # Direct start, mirroring the supervisor's launch line.
