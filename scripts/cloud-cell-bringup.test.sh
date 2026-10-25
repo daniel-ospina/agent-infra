@@ -73,6 +73,12 @@
 
 set -uo pipefail
 
+# #2235: the suite must not inherit an ambient repo selector. gh gives `GH_REPO` precedence over the
+# checkout for every call that omits `--repo`, so a value exported by the developer's shell (or by a
+# cell's keys.env) would be judged against every fixture checkout's origin — reddening unrelated arms
+# and letting this harness carry the very defect the new conformance arm exists to catch.
+unset GH_REPO
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRINGUP="$HERE/cloud-cell-bringup.sh"
 
@@ -403,6 +409,24 @@ case "$BR_OUT" in
   *"disk reaper scheduled"*) ok "bring-up INSTALLS and reports the disk reaper timer (#2032)" ;;
   *) bad "bring-up does not schedule the disk reaper — the sinks are unbounded again: $BR_OUT" ;;
 esac
+# #2416 — harness ACTIVATION is scheduled by the same pass, and the bring-up refuses `CELL READY`
+# without it. A cell that runs whatever code it had at its last start is the drift the pass exists to
+# stop, and this step was the only one whose failure mode (an unscheduled clock) is invisible in
+# `status`: the box looks healthy and simply stops receiving every merged harness fix.
+case "$BR_OUT" in
+  *"harness activation scheduled"*) ok "bring-up INSTALLS and reports the harness-apply timer (#2416)" ;;
+  *) bad "bring-up does not schedule harness activation — the cell will run stale code: $BR_OUT" ;;
+esac
+if [ -f "$T/systemd-units/eldato-harness-apply.timer" ]; then
+  ok "the harness-apply timer unit was rendered and installed"
+else
+  bad "no harness-apply timer unit was installed under $T/systemd-units"
+fi
+if grep -q 'ExecStart=/bin/bash .*harness-apply-pass.sh' "$T/systemd-units/eldato-harness-apply.service" 2>/dev/null; then
+  ok "and it runs the pass, not the scheduler's own copy of the logic"
+else
+  bad "the harness-apply unit does not name the pass"
+fi
 if [ -f "$T/systemd-units/eldato-disk-reaper.timer" ]; then
   ok "the timer unit was rendered and installed"
 else
@@ -1350,6 +1374,33 @@ if [ -s "$T/target.sh" ]; then
     || bad "predicate drift: got '$got', expected '4096 4096 8192 16384 512'"
 else
   bad "swap_target_mb() is no longer extractable from the shipped script"
+fi
+
+# ── 16) the ARMING PREDICATE, driven from the shipped function ────────────────────────────────
+# #2164: a cell reported CELL READY while every lane on it logged `#984 … only the string scanner is
+# active`. The ready path now conditions its claim on the layer's own activation line, and the
+# direction of that condition is the whole point — read backwards it certifies a DISARMED cell as
+# armed, which is the defect. Driven from the shipped predicate (extracted, not re-derived), and
+# driven in BOTH directions so a predicate that always answers the same way cannot pass.
+say_case "arming predicate: a DISARMED activation line is DEGRADED, an armed one is not"
+sed -n '/^gh_shim_disarmed() {/,/^}/p' "$BRINGUP" > "$T/shimsed.sh"
+if [ -s "$T/shimsed.sh" ]; then
+  ( . "$T/shimsed.sh"
+    armed='activation: gh shim PRESENT at /home/cell/.pi/agent/gate-bin/gh'
+    disarmed='activation: gh shim PRESENT at /home/cell/.pi/agent/gate-bin/gh (DISARMED: AGENT_GH_SHIM=0)'
+    absent='activation: (none) gh shim absent — string scanner only'
+    gh_shim_disarmed "$armed"    && printf '1' || printf '0'
+    gh_shim_disarmed "$disarmed" && printf '1' || printf '0'
+    gh_shim_disarmed "$absent"   && printf '1' || printf '0'
+  ) > "$T/shim.out"
+  got=$(cat "$T/shim.out")
+  # armed=0 (the caller's else: NOT degraded), DISARMED=1 (the caller's warn arm), absent=0 — an
+  # absent shim is settled by `--verify`'s rc=0 before this predicate is ever consulted.
+  [ "$got" = "010" ] \
+    && ok "armed->NOT degraded, DISARMED->DEGRADED, no activation line->not this predicate's call" \
+    || bad "the arming predicate is INVERTED or blind: got '$got', expected '010' (armed, DISARMED, absent)"
+else
+  bad "gh_shim_disarmed() is no longer extractable from the shipped script"
 fi
 
 echo

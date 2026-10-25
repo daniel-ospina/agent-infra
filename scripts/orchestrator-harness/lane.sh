@@ -1,8 +1,54 @@
 #!/usr/bin/env bash
 # Runs ONE lane's pi inside its own worktree (cwd must already be the worktree).
-#   lane.sh <issue> <branch> <owner/repo>
+#   lane.sh [--repo-dir <checkout>] [--repo <owner/name>] <issue> <branch> [<owner/name>]
+#
+# ⛔ THE TARGET REPO IS AN ARGUMENT, AND IT IS ASSERTED (agent-infra#2724/#2694). The positional
+# `<owner/name>` is the legacy spelling; `--repo` and `--repo-dir` are the explicit ones. There is NO
+# default: a lane with no target REFUSES (reason=no-target) rather than guessing from the brief.
+# After the worktree exists (this cwd) the lane reads its OWN origin and checkout identity and
+# refuses to start when they are not the target — a lattice of pre-build checks can only prove what
+# was asked for. A refusal is exit 72 and is logged as one `[repo-target]` line naming the repo, the
+# worktree and the result, so a wrong-repo lane is a grep rather than an investigation.
 set -u
-N="$1"; BR="$2"; OR="$3"
+N=""; BR=""; OR=""; _or_pos=""; _lt_pos=0
+LANE_REPO_DIR=""; LANE_REPO_SLUG=""
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --repo-dir)
+      [ $# -ge 2 ] || { echo "[lane] refusing: --repo-dir needs a checkout path" >&2; exit 78; }
+      LANE_REPO_DIR="$2"; shift 2 ;;
+    --repo)
+      [ $# -ge 2 ] || { echo "[lane] refusing: --repo needs an owner/name slug" >&2; exit 78; }
+      LANE_REPO_SLUG="$2"; shift 2 ;;
+    --)
+      shift
+      while [ $# -gt 0 ]; do
+        _lt_pos=$((_lt_pos + 1))
+        [ "$_lt_pos" -le 3 ] || { echo "[lane] refusing: too many positional arguments (expected <issue> <branch> [<owner/name>])" >&2; exit 78; }
+        case "$_lt_pos" in 1) N="$1" ;; 2) BR="$1" ;; 3) _or_pos="$1" ;; esac
+        shift
+      done ;;
+    -*) echo "[lane] refusing unknown option: $1" >&2; exit 78 ;;
+    *)
+      _lt_pos=$((_lt_pos + 1))
+      [ "$_lt_pos" -le 3 ] || { echo "[lane] refusing: too many positional arguments (expected <issue> <branch> [<owner/name>])" >&2; exit 78; }
+      case "$_lt_pos" in 1) N="$1" ;; 2) BR="$1" ;; 3) _or_pos="$1" ;; esac
+      shift ;;
+  esac
+done
+# A flag and a positional that disagree are a contradiction in the dispatch itself — refuse rather
+# than let one silently win.
+if [ -n "$LANE_REPO_SLUG" ] && [ -n "$_or_pos" ] && [ "$LANE_REPO_SLUG" != "$_or_pos" ]; then
+  echo "[lane] refusing: --repo '$LANE_REPO_SLUG' contradicts the positional target '$_or_pos'" >&2
+  exit 72
+fi
+OR="${LANE_REPO_SLUG:-$_or_pos}"
+# Validate the two values every artifact below is built from. lane.sh is also invoked by hand, and
+# `$N=../../x` would build a path outside $O/state (the same reason its capacity record is screened).
+case "${N:-}" in
+  ''|*[!0-9]*) echo "[lane] refusing non-numeric issue id: ${N:-<empty>}" >&2; exit 78 ;;
+esac
+[ -n "${BR:-}" ] || { echo "[lane] refusing: no branch named" >&2; exit 78; }
 # ⛔ EXPORTED, not just set: the SPAWN POINT (`pi` itself, agent-infra#1884) is a CHILD process, and a
 # shell variable it cannot see makes its refusal say "untagged" about the very item it just refused.
 # An operator reading "[pi-gate] REFUSED … item NOT started: <x>" must be able to name the lane.
@@ -27,6 +73,20 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # failure the portable probe exists to prevent.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[lane $N] FATAL: $SELF/spawn-gate.sh missing — refusing to start an ungated agent" >&2; exit 78; }
+# ⛔ THE REPO-IDENTITY GATE (agent-infra#2724/#2694). Required, not optional: a lane that cannot
+# prove which repository its worktree is has no business starting an agent in it. Missing helper =
+# FATAL, because a silently skipped assertion is exactly the "nothing refuses" failure being fixed.
+. "$SELF/repo-target.sh" || { echo "[lane $N] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
+# ⛔ NAME EVERY SYMBOL THIS FILE REACHES, TRANSITIVELY (#2762 review, 4th cycle, P2). The assert alone
+# is not enough: `repo_target_head_branch` GATES the branch half (`if [ -n "$HEAD_BRANCH" ]`), so a
+# module that has the assertions but not the head read made `HEAD_BRANCH` empty — the branch
+# assertion was SKIPPED SILENTLY, the one direction in which this gate can be defeated (the `prfixup`
+# shape this file exists to refuse). `repo_target_slug`/`repo_target_refuse` happen to fail closed;
+# `head_branch` does not, so the guard has to be the whole set, not the two obvious ones.
+command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
+  && command -v repo_target_head_branch >/dev/null 2>&1 && command -v repo_target_slug >/dev/null 2>&1 \
+  && command -v repo_target_refuse >/dev/null 2>&1 && [ -n "${REPO_TARGET_REFUSED:-}" ] \
+  || { echo "[lane $N] FATAL: $SELF/repo-target.sh is stale (needs repo_target_assert/repo_target_branch_assert/repo_target_head_branch/repo_target_slug/repo_target_refuse and REPO_TARGET_REFUSED) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
 # (measured 2026-10-19: three lanes did the whole job, then were refused at the rail). A lane's gate is
@@ -35,6 +95,20 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # generated brief below. Fail LOUD if the helper is missing: an unsourced helper would silently drop
 # both halves, and a lane that never heard the requirement is the defect this exists to remove.
 . "$SELF/reviewer-preflight.sh" || { echo "[lane $N] FATAL: $SELF/reviewer-preflight.sh missing — refusing to start a lane that is never told a reviewer is mandatory (#2148)" >&2; exit 78; }
+# ── the RESEARCH contract is part of the brief, not the orchestrator's memory (#2258) ───────────────
+# Measured twice in one day: a lane re-derived a root the tracker already held, and a lane opened a
+# DUPLICATE PR (#2247 vs #2250). Both were brief defects. The block below is the ONE canonical text
+# (`brief-gate.sh --section`), spliced into the generated brief, and the brief is then CHECKED with
+# that same validator before the agent starts — so a heredoc regression that loses the block refuses
+# the lane with exit 78 instead of dispatching a lane nobody asked to look first. Same discipline as
+# #2148's reviewer section directly above, for the same reason: a requirement that lives only in the
+# dispatcher's head is invisible to the lane.
+brief_gate_sh="$(brief_gate_lib)" || {
+  echo "[lane $N] FATAL: brief-gate.sh not found (looked in \$O, $SELF, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — refusing to start a lane whose brief nothing validated (#2258)" >&2; exit 78; }
+RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section lane)" || {
+  echo "[lane $N] FATAL: brief-gate.sh --section failed — refusing to start a lane whose brief omits the research contract (#2258)" >&2; exit 78; }
+RESEARCH_PREFLIGHT="$(bash "$brief_gate_sh" --line lane)"
+printf '%s\n' "$RESEARCH_PREFLIGHT" | tee -a "$O/logs/lane-$N.log"
 # ── the lane's own `.venv` is reaped on the way out (agent-infra#1932) ──────────────────────────────
 # A venv is a build artifact that belongs to a RUNNING lane: `uv sync` writes it inside the worktree,
 # and nothing removed it, so 5 lanes held 7.3 GB (~4 lanes, not 6, on a 32 GB box). The EXIT trap is
@@ -54,7 +128,46 @@ fi
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless lanes use no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
-echo "[lane $N] cwd=$(pwd) branch=$(git branch --show-current 2>/dev/null) $(date)" >> "$O/logs/lane-$N.log"
+echo "[lane $N] cwd=$(pwd) branch=$(repo_target_head_branch "$PWD") $(date)" >> "$O/logs/lane-$N.log"
+# ── THE POST-BUILD ASSERTION, BEFORE ANY LANE ARTIFACT (agent-infra#2724/#2694) ─────────────────
+# The worktree exists (it is cwd). Read WHAT IT IS and refuse when it is not the target. The line is
+# written to the lane log AND echoed, so it is the one grep that answers "which repo did this lane
+# run in, and did anything check?". A valid target is mandatory: an absent one is a REFUSAL, not a
+# default (#1974: a shipped default is a path two programs invented).
+REPO_ASSERT_LINE="$(repo_target_assert "lane $N" "$PWD" "$OR" "$LANE_REPO_DIR")"; REPO_ASSERT_RC=$?
+printf '%s\n' "$REPO_ASSERT_LINE" | tee -a "$O/logs/lane-$N.log"
+if [ "$REPO_ASSERT_RC" -ne 0 ]; then
+  echo "[lane $N] NOT started: repo-target REFUSED (exit $REPO_ASSERT_RC) — no agent, no PR, nothing measured in the wrong repository" >> "$O/logs/lane-$N.log"
+  exit "$REPO_ASSERT_RC"
+fi
+# ⛔ A `--repo-dir`-ONLY CALL MUST NOT LEAVE `$OR` EMPTY (#2762 review, P1). The module supports
+# naming ONLY a directory, and it derives the target slug internally — but `$OR` is what the brief's
+# `gh issue view … --repo $OR` and the branch assertion use. Left empty, the lane STARTS and writes a
+# brief whose `--repo` argument is empty: `gh` then falls back to ambient `GH_REPO` (the #2235
+# wrong-repo fail-open this change exists to close) or errors. The dir assertion has just PROVED this
+# worktree is the target, so deriving the slug from it is not a guess; if it still cannot be read,
+# refuse rather than start.
+if [ -z "$OR" ]; then
+  OR="$(repo_target_slug "$PWD" 2>/dev/null || true)"
+  if [ -z "$OR" ]; then
+    echo "$(repo_target_refuse "lane $N" target-underivable "the target directory passed the assertion but its origin slug cannot be read, so the lane has no repo to name in its brief or its gh calls")" | tee -a "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: no target slug could be derived from the asserted worktree" >> "$O/logs/lane-$N.log"
+    exit "$REPO_TARGET_REFUSED"
+  fi
+fi
+# The branch half: a worktree of the right repo checked out on a DIFFERENT named branch is the
+# `prfixup` shape. A DETACHED HEAD is deliberately allowed — the cell template creates `worktree add
+# --detach` and the lane creates its branch at push time — so the branch assertion applies only when
+# HEAD is attached to a named branch.
+HEAD_BRANCH="$(repo_target_head_branch "$PWD")"
+if [ -n "${BR:-}" ] && [ -n "$HEAD_BRANCH" ]; then
+  BRANCH_ASSERT_LINE="$(repo_target_branch_assert "lane $N" "$PWD" "$BR" "$OR")"; BRANCH_ASSERT_RC=$?
+  printf '%s\n' "$BRANCH_ASSERT_LINE" | tee -a "$O/logs/lane-$N.log"
+  if [ "$BRANCH_ASSERT_RC" -ne 0 ]; then
+    echo "[lane $N] NOT started: branch assertion REFUSED (exit $BRANCH_ASSERT_RC) — no agent started" >> "$O/logs/lane-$N.log"
+    exit "$BRANCH_ASSERT_RC"
+  fi
+fi
 # ONCE, up front, and to BOTH surfaces: the lane log (what an operator greps) and the lane's own
 # stdout (what the controller reads). The brief carries the long form; this is the one-line reminder
 # that the requirement exists at all, so no lane can discover it only by being refused at the rail.
@@ -67,6 +180,15 @@ printf '%s\n' "$REVIEWER_PREFLIGHT" | tee -a "$O/logs/lane-$N.log"
 # class silently erases prompt text (agent-infra#1835). Precomputing keeps the expansion inert.
 REVIEWER_BRIEF="$(reviewer_brief_section harness)" || {
   echo "[lane $N] FATAL: reviewer_brief_section failed — refusing to start a lane whose brief omits the reviewer step" >&2; exit 78; }
+# ── the LANDING ARTIFACTS, disclosed for the same reason (#2325) ──────────────────────────────────
+# `pipeline-compliance` blocked 36 of 40 open agent-infra PRs and the count GREW faster than lanes
+# could be rescued (33 → 36 in one hour). The brief told a lane to READ the pipeline skills and
+# never to PRODUCE what they exist to create, so each lane finished real work, opened a PR, and was
+# refused — with its evidence retro-fitted afterwards. Same treatment as the reviewer step above:
+# rendered ONCE, spliced as a VARIABLE (never a `$(...)` inside the unquoted heredoc — #1835), and
+# FAIL LOUD if the helper cannot render it, because a brief that silently drops it is the defect.
+LANDING_BRIEF="$(landing_artifacts_brief_section harness)" || {
+  echo "[lane $N] FATAL: landing_artifacts_brief_section failed — refusing to start a lane whose brief omits the landing artifacts" >&2; exit 78; }
 
 # ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound in the test line
 # below. A lane's worktree normally HAS a `.venv`, but when it does not the agent used to hunt for an
@@ -88,7 +210,7 @@ Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:c
 ## Rules
 - The review/VGATE extensions are BYPASSED for you and you have NO "task" tool — do NOT dispatch. The PARENT runs the review gate.
 - Commit with \`git commit -F <message-file>\` (repo-unique temp path per AGENTS.md "Editing Rules"). Stage specific files; never \`git add -A\`.
-- Push (\`git push -u origin $BR\`), then open a PR against main: title "<type>(<scope>): <subject> (#$N)". The body MUST contain "Closes #$N". ⛔ Do NOT reach for "Refs #$N" on work you have finished: GitHub never closes an issue from a \`Refs\`, and NOTHING in this fleet re-reads an open issue whose PR merged — measured 2026-10-13, 25 of 36 open P0-blockers already had MERGED PRs on main while 48 PRs merged in one day and 0 blockers closed (#8468). Use "Refs #$N" ONLY when a specific acceptance indicator is genuinely unmet, and then name it on its own line as \`Still open: <indicator>\` — a bare \`Refs\` is a lane failing to take a position, not a partial delivery. Include what changed and exact test evidence. Do NOT merge.
+- Push (\`git push -u origin $BR\`), then open a PR against main: title "<type>(<scope>): <subject> (#$N)". The body MUST carry "Closes #$N" ON ITS OWN LINE — check [a] reads the LINE position, so a mid-sentence "(fixes #$N)" does not count. ⛔ Do NOT reach for "Refs #$N" on work you have finished: GitHub never closes an issue from a \`Refs\`, and NOTHING in this fleet re-reads an open issue whose PR merged — measured 2026-10-13, 25 of 36 open P0-blockers already had MERGED PRs on main while 48 PRs merged in one day and 0 blockers closed (#8468). Use "Refs #$N" ONLY when a specific acceptance indicator is genuinely unmet, and then name it on its own line as \`Still open: <indicator>\` — a bare \`Refs\` is a lane failing to take a position, not a partial delivery. Include what changed and exact test evidence. Do NOT merge.
 - Do NOT change the MCP tool registry or the public TortoiseSDK surface (needs owner approval — STOP and report instead).
 - Read skills/issue-workflow/SKILL.md and skills/issue-scoping/SKILL.md first.
 - If the defect is already fixed (in-repo or elsewhere) report ALREADY_FIXED / OUT-OF-REPO with file/line/commit evidence instead of forcing a PR. A no-change verdict with evidence is a good outcome.
@@ -96,11 +218,25 @@ Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:c
 - Use the research skill for non-trivial research; never call web_search directly. Auto-file any pre-existing bug with no open issue. Never ask the human anything.
 - Collision pre-flight is CLEAN for this issue.
 
+$RESEARCH_BRIEF
+
+$LANDING_BRIEF
+
 $REVIEWER_BRIEF
 
 ## Deliverable (final message, <=25 lines)
 issue #, status (PR_OPENED | ALREADY_FIXED | OUT-OF-REPO | BLOCKED), branch + PR URL, files changed, exact test commands + pass/fail counts, blockers.
 EOF
+# ── THE GENERATED BRIEF IS CHECKED AT BUILD TIME (#2258) ───────────────────────────────────────
+# Before the dry-run seam and before any capacity bookkeeping. `LANE_DRY_RUN=1` then proves the brief
+# a lane would ACTUALLY receive (the #2148 suite drives that seam), and a heredoc regression that
+# drops the research block refuses at BUILD time instead of being discovered by the gate inside
+# `run_agent` minutes later. When this fires the author is not at fault — the brief is GENERATED
+# here — so it is 78 (cannot run), never 80 (brief refused).
+bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.log" || {
+  echo "[lane $N] FATAL: the GENERATED brief fails brief-gate.sh — refusing to start a lane whose brief lost its research contract (a harness defect in the heredoc above, NOT a brief-authoring error) (#2258)" >&2
+  exit 78
+}
 # ── CAPACITY TRANSFER: make the refusal a DURABLE, READABLE record (agent-infra#1909) ──────
 # R8: "when a machine refuses an item for capacity, the item remains eligible for another
 # machine." The refusal itself is fine and stays (R1); what made it fleet-wide idleness was that
@@ -150,7 +286,8 @@ run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" 
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
-# A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74)
+# A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
+# AGENT_BRIEF_REFUSED (80)
 # or AGENT_DISK_REFUSED (77);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
@@ -163,6 +300,21 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `disk` and
   # `land` are the four values the gate can refuse on, and each is chosen by the code its own caller
   # already distinguishes, so the record can never disagree with the exit status.
+  # ⛔ THE BRIEF REFUSAL IS NOT A CAPACITY REFUSAL, AND SAYING SO IS THE WHOLE POINT (#2258). A
+  # capacity refusal clears (load) or clears when the volume is reclaimed (disk), and both travel
+  # with the BOX — so `capacity-refused-<N>` correctly yields the item to a peer, and
+  # refresh-candidates.sh correctly returns it to the pool. A BRIEF refusal has neither property: it
+  # is a property of the brief, it never clears by waiting or reclaiming, and re-dispatching the item
+  # to another machine refuses there too. Recording it as `gate=load` would tell the whole fleet a
+  # remedy that cannot arrive and would hide the one writer who CAN fix it. So: NO capacity record,
+  # a loud line on both surfaces, and the item is NOT yielded — it stays this box's to re-author.
+  # ⛔ AND IT IS DECIDED FIRST, ABOVE the capacity record, because that block's `else` is `load`:
+  # falling through to it would mint the very capacity record this arm exists to prevent.
+  if [ "$rc" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
+    echo "[lane $N] NOT started: THE BRIEF WAS REFUSED (brief gate, exit $rc) — no agent ran, nothing was consumed, and this is NOT a capacity refusal, so the issue is NOT yielded to a peer: re-author the brief (the [brief-gate] block above names every missing element and prints the canonical section), then re-dispatch." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] brief refused — see $O/logs/lane-$N.log; re-author and re-dispatch (not a capacity refusal)" >&2
+    exit "$rc"
+  fi
   if [ -n "${capacity_record:-}" ]; then
     # ⛔ FORK IS CONSUMED, NOT BUCKETED AS LOAD (review P1, agent-infra#2293). `run_agent` returns
     # AGENT_FORK_REFUSED for a box that is out of PROCESSES, and this branch used to fold every code
