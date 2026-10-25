@@ -1,0 +1,12 @@
+# `False` in the flow form is NOT cancelling, and was refused as if it were any non-literal spelling
+# (#2660 round 8).
+name: Push flow false capital
+on:
+  push:
+    branches: [main]
+concurrency: {group: push-flow-false-capital, cancel-in-progress: False}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

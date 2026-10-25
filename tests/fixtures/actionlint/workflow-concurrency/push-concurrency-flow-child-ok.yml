@@ -1,0 +1,13 @@
+# The safe direction of the same shape: an indented flow mapping that does NOT cancel is compliant,
+# so reading the shape must not turn it into a false red (#2660 round 7).
+name: Push concurrency flow child ok
+on:
+  push:
+    branches: [main]
+concurrency:
+  {group: push-concurrency-flow-child-ok, cancel-in-progress: false}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

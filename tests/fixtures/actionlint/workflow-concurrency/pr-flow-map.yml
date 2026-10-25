@@ -1,0 +1,12 @@
+# FAILURE-CLASS FIXTURE (positive): the flow-mapping form used CORRECTLY on a PR entry point
+# (`concurrency: {group: …, cancel-in-progress: true}`). The push-side negative is push-flow-map.yml;
+# without this arm the PR side of the flow-mapping parse has no positive control.
+name: pr-flow-map
+on:
+  pull_request:
+concurrency: {group: "pr-flow-map-${{ github.ref }}", cancel-in-progress: true}
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

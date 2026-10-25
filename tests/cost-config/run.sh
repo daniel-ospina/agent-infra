@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off runs in a dedicated job in BOTH lanes (ci.yml `cost-config`, ci-main `cost-config-guard`) - a shard here would be the duplicate run site #2439 removed
 # #341 — cost-config drift-guard tests.
 #
 # Exercises scripts/check-cost-config.sh semantics:

@@ -1,0 +1,9 @@
+# The same phantom string in a flow `on:` mapping: every entry after the apostrophe was folded away, so
+# `pull_request` vanished and a PR entry point with NO concurrency block reported GREEN (#2660 round 13).
+name: pr on flow apostrophe plain
+on: {workflow_dispatch: {}, description: legacy '90s gate, pull_request: {}}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
