@@ -24,7 +24,18 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 GATE="$HERE/spawn-gate.sh"
 mkdir -p "$TMP/bin" "$TMP/O/state"
 LOG="$TMP/log"; PROMPT="$TMP/prompt"; PI_LOG="$TMP/pi.log"; MERGE_LOG="$TMP/merge.log"
-printf 'a prompt\n' > "$PROMPT"
+# ⛔ THE FIXTURE IS A REAL BRIEF NOW (agent-infra#2258). `run_agent` refuses a brief that carries no
+# research contract (AGENT_BRIEF_REFUSED, 80) BEFORE it reads load or disk, so a fixture of
+# `printf 'a prompt\n'` would turn every control below into a brief refusal and the load/disk
+# assertions would pass while testing nothing. Rendering the canonical block from the shipped helper
+# keeps this suite's fixture HONEST (it is the same text a real dispatch carries) and pins the gate's
+# own advice as admissible — if the canonical block ever stopped satisfying the validator, this line
+# fails here rather than in production.
+PROMPT_SECTION="$(bash "$HERE/brief-gate.sh" --section lane 2>/dev/null)"
+[ -n "$PROMPT_SECTION" ] || { echo "  ❌ brief-gate.sh --section produced nothing — cannot build a valid fixture" >&2; exit 1; }
+{ printf 'a prompt for a lane\n\n'; printf '%s\n' "$PROMPT_SECTION"; } > "$PROMPT"
+bash "$HERE/brief-gate.sh" --check "$PROMPT" lane 2>/dev/null \
+  || { echo "  ❌ the suite's own fixture brief is REFUSED by the gate — the fixture is not a brief" >&2; exit 1; }
 
 echo "==> spawn-gate self-test ($HERE)"
 
@@ -104,25 +115,42 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # `extensions/` also launches `pi` and is outside this guard's declared population. It can also
   # FALSE-POSITIVE on a non-launcher carrying a `-p` token and a `--no-session` mention, which fails
   # CLOSED (RED, and the file is named), so it cannot hide a launch path.
+  # A NON-LAUNCHER PATH IS EXCLUDED BY NAME, and the exclusion is ASSERTED rather than trusted.
+  # `pi-done-not-exited.py` (#2163) INSPECTS print-mode `pi` processes: it quotes
+  # `pi -p --no-session` in its prose and matches the launch shape in a regex (it is how it tells a
+  # launcher from a bystander), but it launches nothing. Carrying those tokens is precisely the
+  # false-positive class this detector's STATED LIMITS paragraph names, and the exclusion list is
+  # where the paragraph says a non-launcher belongs — declaring it in EXPECTED_PI instead would
+  # assert the opposite of the truth, that a census of launch paths contains a file with none.
+  # The exclusion hides nothing: the assertion below the censuses requires that file to carry no
+  # spawn primitive at all, so a future launch path added to it comes back into the census.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
   done < <(git -C "$ROOT" ls-files --cached --others --exclude-standard "$@")
-  printf '%s' "${found# }"
+  # ⛔ SORTED, so the EQUALITY below is a SET equality. `git ls-files --cached --others` emits
+  # UNTRACKED files first and then the sorted index, so a brand-new invoker (this suite's own
+  # #2163 case: lane-exec.sh before it was committed) made the census disagree with a sorted
+  # EXPECTED list for a reason that has nothing to do with the population — a red that says
+  # "a launch path is ungated" when the truth is "the file is not staged yet". Sorting both sides
+  # keeps the assertion strict about MEMBERSHIP and indifferent to staging state.
+  [ -n "$found" ] || { printf ''; return 0; }
+  printf '%s\n' ${found# } | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 # The censuses need a git work tree: `git ls-files` is the index-bounded primitive (per AGENTS.md
 # "Search"), and if it fails the set comes back empty and the EQUALITY below goes RED — fail-closed,
 # which is the right direction for a guard whose job is "no ungated launch path exists".
 ROOT="$(cd "$HERE/../.." && pwd)"
-# merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). The assertion
-# is deliberately an EQUALITY, so the residual is asserted rather than left silent, and a THIRD
-# pi-invoker — or a regression in either of these two — fails it.
-EXPECTED_PI="merge-one.sh spawn-gate.sh"
+# merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). lane-exec.sh is
+# the #2163 launcher, which carries no wrapper BY DESIGN (see its own assertion below). The assertion
+# is deliberately an EQUALITY, so each residual is asserted rather than left silent, and a NEW
+# pi-invoker — or a regression in these — fails it.
+EXPECTED_PI="lane-exec.sh merge-one.sh spawn-gate.sh"
 got_pi="$(scan_pi 'scripts/orchestrator-harness/*' | sed "s#scripts/orchestrator-harness/##g")"
 [ "$got_pi" = "$EXPECTED_PI" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      pi-invokers found: [${got_pi:-<none>}]"
@@ -138,11 +166,27 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # wall-clock watchdog), the SAME posture merge-one.sh's reviewer has — the installed `pi` shim is the
 # load gate at the spawn point, and its rc=76 refusal is handled explicitly (exit 75, nothing
 # consumed) — but no load gate of its OWN, so it belongs in this list by name, not silently.
-EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
+# `scripts/orchestrator-harness/lane-exec.sh` (#2163) is the launcher that `exec`s pi (declared below).
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/lane-exec.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
 got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
-ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh declared)" $rc
+ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh + lane-exec.sh declared)" $rc
+# ⛔ lane-exec.sh (#2163) is the SPAWN-POINT-GATED launcher: it `exec`s `pi`, so it has no wrapper to
+# route through run_agent() and no place to apply the DISK gate (which is per-worktree and therefore
+# a caller's business, the same named residual cloud-cell-bringup.sh carries). The LOAD gate reaches
+# it anyway, at the shim. What this pins is the half that made it worth writing: it must EXEC, never
+# background — a fork here would re-create the surviving wrapper the issue exists to remove.
+grep -qE '^[[:space:]]*exec pi ' "$HERE/lane-exec.sh" && rc=0 || rc=1
+ck "lane-exec.sh EXECs pi (no wrapper survives the turn)" $rc
+
+# ... and the one path excluded by NAME is really a NON-launcher, because that is the whole reason it
+# may sit outside the census. Asserted on the SPAWN PRIMITIVES, deliberately not on `run_agent` —
+# this file names `run_agent` and `pi` in prose and matches both in regexes on purpose (telling a
+# launcher from a bystander is its job). If it ever gains a way to START a process, this goes RED and
+# the path comes out of the exclusion list above.
+if grep -qE 'subprocess|Popen|os\.system|os\.exec|os\.spawn|os\.fork|popen' "$HERE/pi-done-not-exited.py" 2>/dev/null; then rc=1; else rc=0; fi
+ck "the excluded pi-done-not-exited.py is a NON-launcher (carries no spawn primitive), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -351,6 +395,53 @@ ck "a started run appends one 6-field row to walltime.tsv carrying the ASKED-FOR
 case "$f5" in ''|*[!0-9]*) rc=1 ;; *) rc=0 ;; esac
 ck "the recorded elapsed is a non-negative INTEGER, not merely present (f5='${f5:-<empty>}')" $rc
 
+# ── 7b) A TURN'S STRAGGLERS DO NOT OUTLIVE run_agent (#2163) ────────────────────
+# The group the agent runs in is the whole reason the launch is under job control: a `pi` that
+# finished its turn can leave a tool child behind, and a wrapper that only `wait`s for pi then exits
+# lets it be reparented to init. Measured on the box that motivated #2163: 76 pi-shaped processes for
+# 14 working lanes. The stub forks a long sleeper and exits; after run_agent returns the sleeper must
+# be GONE. (A red here means the group reap is inert — e.g. the watchdog was launched outside the
+# job-control window, which was a real cycle-1 defect.)
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+# A DIRECT background `sleep` (not a subshell), so `$!` IS the sleeper the test must see gone, and a
+# cleanup can end exactly that process.
+sleep 300 &
+printf '%s\n' "$!" > "$STRAGGLER_PID"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+: > "$TMP/straggler.pid"
+PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" STRAGGLER_PID="$TMP/straggler.pid" O="$TMP/O" DISK_MIN_FREE_MB=1 bash -c '
+  . "$1"
+  LOG="$2"; PROMPT="$3"
+  load1() { printf "1"; }
+  run_agent 30 "$LOG" "$PROMPT" "straggler test" >/dev/null 2>&1
+' _ "$GATE" "$LOG" "$PROMPT" 2>/dev/null
+sp="$(cat "$TMP/straggler.pid" 2>/dev/null)"
+# ⛔ AN EMPTY PID FILE IS A FAILED LEG, NOT A PASS (#2163 review, P3). The stub writes the sleeper's
+# pid; if it is absent the agent never ran, and `[ -n "$sp" ] && …` would then fall through to success
+# — making the ONLY behavioural proof of the group reap vacuously green on an inert launch.
+survivor=0
+case "$sp" in
+  ''|*[!0-9]*) rc=1 ;;
+  *) if kill -0 "$sp" 2>/dev/null; then rc=1; survivor=1; else rc=0; fi ;;
+esac
+if [ "$survivor" = "1" ]; then
+  # Cleanup, fenced on WHAT the pid is: a recycled pid must not be killed blindly.
+  case "$(ps -o args= -p "$sp" 2>/dev/null)" in
+    *"sleep 300"*) kill -KILL "$sp" 2>/dev/null ;;
+  esac
+fi
+ck "run_agent reaps the turn's straggler (pid ${sp:-<none>} is gone after the turn)" $rc
+# restore the plain stub for the cases below
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+echo "PI_RAN" >> "$PI_LOG"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+
 # ── 8) the gate RE-READS at the spawn, and a refusal is not a `pi` exit status ───
 # This is the whole point of the port: a chain-<N> worker dispatched on a quiet box may open its PR
 # 90 minutes later, and the reading that governs is the one taken at the spawn.
@@ -533,6 +624,12 @@ ck "fix-one.sh NAMES the load gate on a load refusal — the disk wording is not
 # tracks the file under test instead of re-implementing a pre-fix helper by hand.
 mkdir -p "$RIG/stale"
 cp "$HERE/fix-one.sh" "$RIG/stale/"
+# ⛔ THE VALIDATOR TRAVELS WITH THE STALE HELPER, AND THAT IS NOT A WEAKENING (#2258). What is stale
+# here is `spawn-gate.sh`'s refusal CONSTANTS, not the brief rules: a fixture that omitted
+# `brief-gate.sh` would make fix-one.sh exit 78 (cannot verify) and this arm would read "78" as the
+# stale-helper behaviour it is meant to test — passing for the wrong reason. The fixer's dependency on
+# the validator is the same class as its dependency on spawn-gate.sh.
+cp "$HERE/brief-gate.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
     "$HERE/spawn-gate.sh" > "$RIG/stale/spawn-gate.sh"
@@ -872,6 +969,10 @@ unset -f gh; unset 'BASH_FUNC_gh%%'
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
+# …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
+# `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
+# of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
+cp "$HERE/brief-gate.sh" "$RO/"
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
@@ -1988,7 +2089,16 @@ ck "…and its replay line contains no git-apply invocation at all" $rc
 # a real dispatch, a worker killed at a 1 s cap, and the status line read back.
 BG="$CAPRIG/bg"; mkdir -p "$BG/logs" "$BG/state"
 cap_clean; cap_dirty
-printf 'a prompt\n' > "$BG/prompt"
+# ⛔ THIS FIXTURE IS GATED TOO (review cycle 4, P1). `nonblocking-dispatch.sh` runs the research-first
+# gate in the FOREGROUND, so a bare `a prompt` brief is refused with 80 and NO worker is ever started —
+# the three cap-kill arms below then read "lost (no exit status recorded)" and assert a cap kill on a
+# dispatch that never happened. MEASURED: 165 passed / 3 failed, and the same rc/status string reproduced
+# standalone. Rendered from the validator with the role the dispatcher gates on (`worker`, i.e. KIND=bg),
+# and asserted at BUILD time: a fixture that drifts must fail here, by name, not three arms later as a
+# mysterious "lost" lane.
+{ printf 'a prompt for a background worker\n\n'; bash "$HERE/brief-gate.sh" --section worker; } > "$BG/prompt"
+bash "$HERE/brief-gate.sh" --check "$BG/prompt" worker 2>/dev/null \
+  || { echo "  ❌ the cap-kill fixture brief is REFUSED by the research-first gate" >&2; exit 1; }
 pi() { sleep 30; }            # exported: a FUNCTION beats the launcher's own PATH prepend (#1828)
 export -f pi
 ( cd "$CWT" && O="$BG" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \

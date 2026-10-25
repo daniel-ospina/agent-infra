@@ -103,18 +103,20 @@ if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
-# Extracted from orch-loop.sh verbatim. The required set and the review-gate NAME are read from
-# the ENVIRONMENT by the shipped classifier (agent-infra#1764), so the driver supplies them the
-# same way the loop does — there is no bash-side $REQ splice to substitute any more.
+# ⛔ THE CLASSIFIER IS A FILE, NOT A HEREDOC ANY MORE (agent-infra#2719). It lived in orch-loop.sh as an
+# inline `python3 -c` string, and the NOCHECKS arm has to ask the SAME question on a re-read — two
+# copies of these rules is how the harness and the merge rail disagreed before (#1714). So the shipped
+# artifact IS `check-class.py`: a missing file is a hard FAIL here (never a silently empty classifier,
+# which would grade GREEN on an empty answer). The required set and the review-gate NAME are still read
+# from the ENVIRONMENT (agent-infra#1764), so the driver supplies them the same way the loop does.
 CL_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
 CL_GATE="ai-review-gate"
-awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+cat "$HERE/check-class.py" > "$TMP/classify.py" 2>/dev/null || : > "$TMP/classify.py"
 cl() { printf '%s' "$1" | REQ="$CL_REQ" REVIEW_GATE="$CL_GATE" python3 "$TMP/classify.py" 2>/dev/null; }
 # clreq <required-set> <payload> [<review-gate>] — the SAME shipped classifier against an
 # ARBITRARY repo's required set. Used by the repo-shape fixtures below, and by test-gates.sh.
 clreq() { printf '%s' "$2" | REQ="$1" REVIEW_GATE="${3:-ai-review-gate}" python3 "$TMP/classify.py" 2>/dev/null; }
-if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
+if need "$TMP/classify.py" "the classifier is the shipped check-class.py"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: ai-review-gate SKIPPED is not satisfied" $rc
@@ -290,7 +292,11 @@ fi
 # PR exists to close), and a backticked `gh pr checks` spliced a multi-line table into the Python
 # source (SyntaxError -> V="" -> no case arm matched). Extract the real assignment and drive it
 # through a logged `gh` shim so the shell, not an awk extraction, is what runs.
-awk '/^    V="\$\(gh pr checks/{f=1} f{print} /^" 2>\/dev\/null\)"$/{f=0}' "$LOOP" > "$TMP/classify_bash.sh"
+# ⛔ THE ASSIGNMENT IS ONE LINE NOW (agent-infra#2719): the Python moved to `check-class.py`, so the
+# heredoc's closing `" 2>/dev/null)"` terminator no longer exists — the old range-capture ran to the END
+# OF THE FILE (1547 lines measured) and the driver then aborted on `set -u` before printing `V`, which
+# made this whole block report a red it could not explain. Capture the ONE assignment line.
+grep -m1 '^    V="\$(gh pr checks' "$LOOP" > "$TMP/classify_bash.sh"
 if need "$TMP/classify_bash.sh" "the classifier's bash assignment is extracted from orch-loop.sh"; then
   mkdir -p "$TMP/bin"
   cat > "$TMP/bin/gh" <<'SH'
@@ -309,6 +315,9 @@ SH
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
     printf '%s\n' "REVIEW_GATE='ai-review-gate'"
+    # the pipeline's classifier path is resolved by the loop at startup; the driver supplies the
+    # SHIPPED file so the shell runs the real classifier, not a missing path.
+    printf '%s\n' "_CK_PY='$HERE/check-class.py'"
     cat "$TMP/classify_bash.sh"
     printf '%s\n' 'printf "V=%s\n" "$V"'
   } > "$TMP/drive.sh"
@@ -2110,7 +2119,14 @@ if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped merge-one.
   cat > "$TMP/ra.sh" <<SH
 pi() { sleep 60; }
 . "$TMP/runagent.sh"
-start=\$(date +%s); run_agent 2 "$TMP/ra.log" /dev/null; rc=\$?; end=\$(date +%s)
+# ⛔ THE PROMPT IS A REAL BRIEF, NOT /dev/null (agent-infra#2258). run_agent now refuses a brief with
+# no research contract (80) BEFORE it spawns, so this arm's `/dev/null` would make the shipped
+# run_agent return 80 without ever launching `pi` — and the assertion below ("it ran, and was cut off
+# at the wall limit") would fail for a reason that has nothing to do with the timeout it exists to
+# test. Rendering the canonical block keeps the fixture HONEST: the function under test still gets a
+# brief of the shape a real dispatch carries.
+brief_gate_sh="$HERE/brief-gate.sh"; bash "\$brief_gate_sh" --section reviewer > "$TMP/ra-brief.txt"
+start=\$(date +%s); run_agent 2 "$TMP/ra.log" "$TMP/ra-brief.txt"; rc=\$?; end=\$(date +%s)
 echo "\$((end-start)) \$rc"
 SH
   ra="$(bash "$TMP/ra.sh" 2>/dev/null | tail -1)"
@@ -4032,6 +4048,17 @@ if [ -f "$HERE/refresh-scout.test.sh" ]; then
   fi
 else
   ck "refresh-scout.test.sh: the #1736 suite is present" 1
+fi
+
+if [ -f "$HERE/refresh-provision.test.sh" ]; then
+  if bash "$HERE/refresh-provision.test.sh" > "$TMP/refresh-provision.out" 2>&1; then
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 0
+  else
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 1
+    grep -E '❌|==>' "$TMP/refresh-provision.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "refresh-provision.test.sh: the #2229 suite is present" 1
 fi
 
 # #2229: ORIGINATION MUST FAIL LOUDLY. The refresh is backgrounded, so its failure is a log line — and
