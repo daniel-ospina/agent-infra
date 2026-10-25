@@ -202,7 +202,33 @@ unit_reference() { # <copy-path> -> prints the unit file that names it, rc 0
 }
 
 # ── one family ────────────────────────────────────────────────────────────────────────────────
-FAMILIES=0; CAND=0; REAPED=0; KEPT=0; FAILED=0
+FAMILIES=0; CAND=0; REAPED=0; KEPT=0; FAILED=0; TOCTOU_WHY=""
+
+# ── the pre-removal RE-PROBE (§ "one family" calls it immediately before `rm -rf`) ────────────
+# ⛔ WHY THIS EXISTS AT ALL (#2676 review, cycle 1, P1): every liveness test in `family()` reads the
+# census taken ONCE at pass start, and a pass may run for the whole BUDGET. A listener started in that
+# interval is not in the snapshot, so the copy it runs from looked idle and was `rm -rf`'d under it.
+# The sibling owner (`reap-abandoned-worktrees.sh::toctou_preserve`) re-probes for exactly this window;
+# this owner now does the same, and for the same reason. An UNREADABLE fresh census is a PRESERVE.
+toctou_preserve() { # <canon> <copy-path> -> 0 = still removable, 1 = PRESERVE (TOCTOU_WHY names it)
+    local canon="$1" c="$2" fresh out
+    TOCTOU_WHY=""
+    fresh="$(mktemp -d "${TMPDIR:-/tmp}/reap-di-reprobe.XXXXXX" 2>/dev/null)" || { TOCTOU_WHY="re-probe-unavailable"; return 1; }
+    if ! lp_census "$fresh" >/dev/null 2>&1; then
+        rm -rf "$fresh" 2>/dev/null
+        TOCTOU_WHY="re-probe-census-unreadable"
+        return 1
+    fi
+    # ⛔ THE FILE, NOT THE DIRECTORY: `lp_census DIR` writes `DIR/live-paths.tsv`, and the witnesses
+    # `read` the path they are handed. Handed the DIRECTORY they find no witness and return "clean",
+    # which would make this whole re-probe dead code — the defect the sibling owner recorded.
+    if lp_path_held "$fresh/live-paths.tsv" "$canon"; then TOCTOU_WHY="entered-during-pass ($LP_HOLD_WHY)"; rm -rf "$fresh"; return 1; fi
+    if lp_path_named "$fresh/live-paths.tsv" "$canon"; then TOCTOU_WHY="argv-named-during-pass ($LP_NAME_WHY)"; rm -rf "$fresh"; return 1; fi
+    # A unit file EDITED mid-pass to point at this copy is the same hazard one step later.
+    if out="$(unit_reference "$c")"; then TOCTOU_WHY="unit-referenced-now ($out)"; rm -rf "$fresh"; return 1; fi
+    rm -rf "$fresh" 2>/dev/null
+    return 0
+}
 
 family() { # <parent-dir> <marker-rel>
     local parent="$1" marker="$2" c copies="" n newest="" newest_mt=-1 mt age out cp_count=0 left other canon newest_tie=0
@@ -298,6 +324,18 @@ family() { # <parent-dir> <marker-rel>
         done
         if [ "$left" -lt 1 ]; then
             KEPT=$((KEPT + 1)); say "KEPT   $c reason=last-copy (no other copy of $marker survives — refusing to empty the family)"; continue
+        fi
+        # ⛔ RE-PROBE IMMEDIATELY BEFORE THE DESTRUCTIVE CALL (#2676 review, cycle 1, P1). The liveness
+        # tests above read a census taken ONCE at pass start, and a pass may run for the whole BUDGET,
+        # so that snapshot can be minutes stale: a listener started mid-pass (`./run.sh` by hand, a
+        # tmux-launched listener — the common shape here, since `unit_reference` only sees
+        # unit-configured runners) would be `rm -rf`'d underneath. The sibling owner in this same PR
+        # (`reap-abandoned-worktrees.sh::toctou_preserve`) exists for exactly this window and re-probes;
+        # this owner did not, which made "only a copy that is PROVABLY IDLE is removed" true only at
+        # pass start. An unreadable fresh census is a PRESERVE, never a pass — the same polarity as
+        # every other unreadable read in this file.
+        if ! toctou_preserve "$canon" "$c"; then
+            KEPT=$((KEPT + 1)); say "KEPT   $c reason=toctou ($TOCTOU_WHY — the pass-start snapshot was stale; re-probed immediately before removal)"; continue
         fi
         if rm -rf "$c" 2>/dev/null && [ ! -d "$c" ]; then
             REAPED=$((REAPED + 1)); say "REAPED $c how=rm (duplicate $marker copy; newest kept is $newest)"
