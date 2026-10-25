@@ -290,6 +290,22 @@ REQ=""
 # `ensure_agent_gh_real`, and an unguarded call would print a 127 into the cycle log on every pass.
 if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real || true; fi
 
+# ── THE NOCHECKS ARM'S TWO FILES (agent-infra#2719) ──────────────────────────────────────────────
+# `$O` first (the pinned deployment this controller runs from), the running script's own directory
+# second — the same look-here order repo-authority.sh gets, and for the same reason: a rolling deploy
+# leaves `$O` one file behind for one cycle, and a harness that can only find its own arm in one of the
+# two places would fail exactly then. ⛔ An ABSOLUTE path, resolved ONCE, because the sweep is a
+# pipeline subshell and a relative path resolved inside it would follow the subshell's cwd.
+# ⛔ `check-class.py` IS NOT "ONE ARM" — IT IS EVERY PR'S CLASSIFICATION, SO ITS ABSENCE FAILS CLOSED
+# (review P2, agent-infra#2719). Measured: with the file missing, `python3 <missing>` writes to stderr
+# and prints nothing, so `V=""` for EVERY PR — no merge arm, no fixer arm, no reviewer — and the sweep
+# falls to the residual `*)` wait arm, re-reading each PR for ever with class `""`. That is a total,
+# indefinite stop of the controller's work, so it takes the `exit 78` treatment `repo-authority.sh`
+# already gets a few lines above, NOT a warning: a warning on a box whose classification has stopped
+# is the "one startup line nobody reads" failure.
+# `nochk-resolve.py` is genuinely ONE ARM: without it a NOCHECKS PR is named `READ-FAILED: the arm
+# produced no verdict` and re-read next cycle — degraded, honest, not fatal — so that one only warns.
+
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
 # ── THE WORKER LAUNCHER (worker-terminal.sh) ────────────────────────────────────
@@ -348,6 +364,37 @@ safe_ref() {
   case "${1:-}" in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac
   git -C "$REPO" check-ref-format --branch "$1" >/dev/null 2>&1
 }
+
+# ⛔ THIS BLOCK SITS BELOW `safe_ref()` ON PURPOSE (agent-infra#2719). Several shipped suites
+# extract a one-line helper with `sed -n "/^$1()/,/^}/p"`; `is_num()` is such a one-liner, so its
+# extraction runs to the NEXT `^}` — anything placed above that brace is swallowed into those
+# fixtures, and this block is evaluated in their `set -u` subshell (measured: placing it higher
+# took capacity-transfer.test.sh from 90/0 to 89/4 with `_HERE_RS: unbound variable`). Below the
+# brace, every peer extraction is unchanged.
+# ⛔ THE LOG DIRECTORY IS MADE FIRST (review P3, agent-infra#2719): this message fires exactly on a
+# fresh or partially re-seeded `$O`, which is exactly when `$O/logs` may not exist yet — writing the
+# warning before the `mkdir -p` below meant the ONE case it exists for was the one where the redirect
+# failed and the warning vanished. Same order the repo-slug.sh fatal paths use.
+mkdir -p "$O/logs" 2>/dev/null || true
+_CK_PY="$O/check-class.py"; [ -f "$_CK_PY" ] || _CK_PY="$_HERE_RS/check-class.py"
+_NCHK_PY="$O/nochk-resolve.py"; [ -f "$_NCHK_PY" ] || _NCHK_PY="$_HERE_RS/nochk-resolve.py"
+[ -f "$_CK_PY" ] || _CK_PY=""
+[ -f "$_NCHK_PY" ] || _NCHK_PY=""
+# ⛔ THE STARTUP GUARD LIVES IN ITS OWN MODULE (review P1, agent-infra#2719), for a reason that is
+# measured rather than stylistic: several shipped suites extract a ONE-LINE helper with
+# `sed -n "/^$1()/,/^}/p"`, so ANY new function with a closing `}` above that point silently re-points
+# their extraction — inserting this guard inline took `capacity-transfer.test.sh` from 90/0 to 89/4
+# (`_HERE_RS: unbound variable` from the swallowed text). `$O` first, the running script's own
+# directory second, the same look-here order repo-authority.sh gets.
+if [ -f "$O/nochk-guard.sh" ]; then . "$O/nochk-guard.sh"
+elif [ -f "${_HERE_RS:-}/nochk-guard.sh" ]; then . "${_HERE_RS:-}/nochk-guard.sh"
+fi
+# ⛔ THE MODULE ITSELF CANNOT BE ABSENT: without it the guard below would be a "command not found"
+# (127) and the loop would carry on with an unclassified sweep — the fail-open this guard exists to
+# prevent, one layer up.
+command -v nochk_require_classifier >/dev/null 2>&1 \
+  || { _fatal_guard="FATAL nochk-guard.sh is missing (looked in $O and ${_HERE_RS:-<unresolved>}) — the controller cannot prove it can classify a single PR, so it refuses to start; re-seed it: bash $O/deploy-harness.sh --src <harness checkout> --o $O"; echo "orch-loop: $_fatal_guard" >&2; printf '%s [startup] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_fatal_guard" >> "$O/logs/orch-loop.log" 2>/dev/null || true; exit 78; }
+nochk_require_classifier "$_CK_PY" "$_NCHK_PY" "$O" "$_HERE_RS"
 
 # shq <value> -> a POSIX-sh-safe single-quoted word.
 # ⛔ NOT `printf %q`. bash's %q emits `$'…'` for any byte outside [[:print:]], and `$'…'` is NOT a
@@ -3750,6 +3797,12 @@ while true; do
   # [prdisp:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
   PRDISP="$O/state/prdisp.tsv"; PRDISP_OK=1
   : > "$PRDISP" 2>/dev/null || { PRDISP=/dev/null; PRDISP_OK=0; }
+  # ⛔ THE TRANSPORT BREAKER IS TRUNCATED HERE, WITH THE LEDGER, AND FOR THE SAME REASON (agent-infra
+  # #2719). It records "the gh transport was down for THIS sweep", which is a fact about a few seconds
+  # — so it must die with the cycle that observed it. A breaker that outlived its cycle would be a
+  # stale flag: the next cycle would name every NOCHECKS PR from an outage that had already ended, and
+  # (worse) would skip the re-read that recovers the 82% of the class a retry fixes.
+  : > "$O/state/nochk-breaker" 2>/dev/null || true
   DISP_SEP="$(printf '\t')"
   # ⛔ SANITISE EVERY FIELD. Field 3 is the classifier token (`FAILED:<name>,<name>`) and field 5 is a
   # reason, and check names come from the GitHub API. The record is TAB-delimited and every consumer
@@ -4226,83 +4279,76 @@ while true; do
     # spawns — the one action worse than doing nothing here would be acting on a contract this
     # repo never declared (review P2, round 1).
     [ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && { disp "$PR" "${HEAD_N:-}" - wait "merge authority UNREADABLE this cycle (fail-closed: nothing spawned)"; continue; }
-    V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 -c "
-import sys,json
-import os
-try: d=json.load(sys.stdin)
-except Exception: print('NOCHECKS'); raise SystemExit
-# The source is either the check-runs API shape (an object carrying a check_runs list) or the flat
-# list \`gh pr checks --json\` prints. Both normalise to one row list; anything else is unreadable.
-rows=d.get('check_runs') if isinstance(d,dict) else d
-if not isinstance(rows,list): print('NOCHECKS'); raise SystemExit
-want=(os.environ.get('REQ') or '').split()
-# ⛔ ALLOW-LISTS, NEVER A DENY-LIST (agent-infra#1714). A conclusion is NON-RED only if it is NAMED
-# here - the identical five spellings admin-merge.sh (NON_RED_CONC) and record-review.sh
-# (target_head_red) use, so the harness and the merge rail cannot disagree. 'not in the red set' is
-# not a synonym for non-red: a token this code has never seen (a vendor adds a conclusion, GitHub
-# returns a newer spelling, the value is null) must FAIL CLOSED, so it is RED. The deny-list this
-# replaced named the red tokens and filed EVERYTHING ELSE as PENDING, so an unrecognised or NULL
-# conclusion reached \`gh pr merge --auto\` instead of blocking - the fail-open the issue is about.
-NONRED=('success','neutral','skipped','cancelled','stale')
-# IN FLIGHT means a status the API NAMES as in flight - the same five the rail uses. Any OTHER
-# non-completed spelling is judged by its CONCLUSION under the allow-list, so an unrecognised status
-# with a null conclusion is RED, not pending (the rail's #1353 fail-open shape, closed the same
-# way). \`expected\` is deliberately NOT here: it is not a named in-flight spelling, so a check
-# GitHub has announced but not reported reads RED - the fail-closed direction, matching the rule.
-INFLIGHT=('queued','in_progress','waiting','requested','pending')
-# One entry per (app, name) - NOT per name: a same-named check under two apps must not let one
-# app's result mask the other's (agent-infra#1714). \`app.slug\` when the source supplies it (the
-# check-runs API), otherwise the workflow name (\`gh pr checks\` exposes no app field), and the
-# NEWEST attempt by id when the source supplies one. Ties, and sources with no id at all, take the
-# last row seen - all the information \`gh pr checks\` carries.
-groups={}
-for c in rows:
-    if not isinstance(c,dict): continue
-    name=str(c.get('name') or '')
-    app=c.get('app')
-    if isinstance(app,dict): app=app.get('slug') or ''
-    if not app: app=c.get('workflow') or ''
-    try: cid=int(c.get('id') or c.get('databaseId') or 0)
-    except Exception: cid=0
-    if 'status' in c or 'conclusion' in c:
-        status=str(c.get('status') or '').lower(); concl=str(c.get('conclusion') or '').lower()
-    else:
-        st=str(c.get('state') or '').lower()
-        status,concl=(st,'') if st in INFLIGHT else ('completed',st)
-    k=(str(app),name)
-    prev=groups.get(k)
-    if prev is None or cid>=prev[0]: groups[k]=(cid,status,concl)
-rank={'nonred':0,'pending':1,'red':2}
-# The repo's review-gate NAME is an INPUT (agent-infra#1764), not the literal 'ai-review-gate'.
-# It is read from the env the bash side passes in, with the same default repo-authority.sh uses.
-rgate=os.environ.get('REVIEW_GATE') or 'ai-review-gate'
-named={}
-gate=[]
-for k in groups:
-    status=groups[k][1]; concl=groups[k][2]
-    v='pending' if status in INFLIGHT else ('nonred' if concl in NONRED else 'red')
-    if k[1]==rgate: gate.append((v,concl))
-    if k[1] not in named or rank[v]>rank[named[k[1]]]: named[k[1]]=v
-# THE REVIEW GATE IS THE MERGE AUTHORITY **WHERE THE REPO REQUIRES IT**, so it must be an explicit
-# SUCCESS there. SKIPPED/NEUTRAL means no signed review exists; reading that as satisfied would
-# merge without evidence. This is also why GREEN always carries at least one MEASURING success: a
-# surface of nothing but cancelled/stale/skipped/neutral rows can never read green - those are
-# non-red, never green.
-# ⛔ SCOPED BY 'rgate in want', WHICH IS THE WHOLE POINT (#1764). On a repo whose protection does
-# not require the gate (agent-infra), the name is NOT in 'want' and the rule below never fires -
-# otherwise its ABSENCE forced RED and deadlocked the queue. The rule is NOT weakened: on tortoise
-# the gate IS required, so a missing/red/skipped gate still blocks exactly as before. The
-# fail-closed posture is unchanged and stays INSIDE the repo's own required set.
-gate_ok=len(gate)>0 and all(v=='nonred' and c=='success' for v,c in gate)
-# Read it in this order: RED if any required check is red (a completed red is final - nothing in
-# flight can un-fail it); otherwise NOT YET KNOWN while any is in flight or never reported;
-# otherwise GREEN. An EMPTY surface is NOCHECKS, never GREEN - a missing check is not a green check,
-# and NOCHECKS reaches neither the merge nor the fixer arm below.
-fail=[n for n in want if named.get(n)=='red']
-pend=[n for n in want if named.get(n)=='pending' or n not in named]
-if rgate in want and not gate_ok and rgate not in fail: fail.insert(0,rgate)
-print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PENDING:'+','.join(pend) if pend else ('GREEN' if want else 'NOCHECKS'))))
-" 2>/dev/null)"
+    # ⛔ THE CLASSIFIER IS A FILE, NOT A HEREDOC (agent-infra#2719). It used to be an inline `python3 -c`
+    # here, which meant the ONLY implementation of "what class is this check surface" was a string no
+    # other caller could run — and the NOCHECKS arm below has to answer that SAME question on a re-read.
+    # Two copies of these rules is exactly how the harness and the merge rail disagreed before (#1714),
+    # so the arm calls this file instead of a lookalike. `$_CK_PY` is resolved once at startup (see
+    # there) and is an ABSOLUTE path, so this pipeline's subshell inherits it.
+    V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 "${_CK_PY:-/nonexistent/check-class.py}" 2>/dev/null)"
+    # ── THE NOCHECKS CLASS GETS AN ARM (agent-infra#2719) ─────────────────────────────────────────
+    # ⛔ WHAT THIS REPLACES. `NOCHECKS` used to mean THREE different events at once — the read failed,
+    # no run had registered yet, and no run will ever exist — because the pipeline above discards the
+    # read's stderr. The sweep then printed "no acting arm for class 'NOCHECKS' — nothing spawned
+    # (re-read next cycle)" and re-read the same PR for ever. MEASURED over every occurrence in this
+    # controller's own log (77 occurrences / 42 cycles / 47 PRs, 2026-10-20 → 10-24), classified
+    # against the check-runs AUTHORITY at the head that existed then: 63 (82%) had a surface that
+    # ALREADY EXISTED and the read failed; 6 (8%) had no check-run and no run at all; 4 (5%) were a
+    # head whose surface arrived minutes later; 4 (5%) unresolvable.
+    # ⛔ SO THE ARM'S FIRST JOB IS TO RE-ASK, NOT TO RE-READ NEXT CYCLE. A transient transport failure
+    # is retried INSIDE this cycle (two attempts, short backoff) — that alone turns most of the class
+    # back into a real classification at no cost. Only when the answer is still empty does it consult
+    # the authority (which distinguishes "the surface is absent" from "the read is blind"), and only
+    # when the surface is genuinely absent does it name a cause.
+    # ⛔ IT NEVER MERGES AND NEVER SPAWNS. Every verdict leaves the PR exactly as unmergeable as it
+    # was: an empty surface is not a green and not a pending, so the merge arm must not see one. A
+    # RECOVERED class is handed to the ORDINARY arms below, so it is treated like any other PR.
+    # ⛔ AND IT NEVER STARTS A RUN BEHIND THE REPO'S BACK. The sanctioned repair for a head with no run
+    # is the repo's OWN (tortoise: the scheduled `ci-check-repair` workflow, which re-runs a held run or
+    # close/reopens the PR); the arm names that owner and counts the wait, then emits a TERMINAL verdict
+    # at the bound. A named dead end is the deliverable; an unbounded re-read is the bug.
+    # [nochk-begin] (extracted and DRIVEN by nochk-resolve.test.sh — keep the markers)
+    if [ "${V:-}" = "NOCHECKS" ]; then
+      # ⛔ THE RESOLVER'S OWN STDERR GOES TO THE LOG, NOT TO /dev/null (review P2, agent-infra#2719):
+      # a post that FAILED writes its reason there, and discarding it made the ledger's `[post=…]` the
+      # only trace of a verdict no human could see.
+      _NCHK="$(REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 "${_NCHK_PY:-/nonexistent/nochk-resolve.py}" \
+                --repo "$OR" --pr "$PR" --head "${HEAD_N:-}" --state-dir "$O/state" \
+                --repo-dir "${REPO:-}" --breaker "$O/state/nochk-breaker" --post 2>>"$LOG")"
+      _NTOK="$(printf '%s' "$_NCHK" | cut -f1)"
+      _NDET="$(printf '%s' "$_NCHK" | cut -f2-)"
+      case "$_NTOK" in
+        RECOVERED)
+          # ⛔ A RECOVERY THAT CANNOT BE GRADED IS A READ FAILURE, NEVER A VERDICT (review P1,
+          # agent-infra#2719). `classify()` answered `NOCHECKS` for four different failures — the
+          # classifier file absent (the `$O`-one-file-behind deploy state), an exception, a non-zero rc,
+          # no output — and the first version of this arm turned that non-answer into a TERMINAL verdict
+          # on cycle 1: no bound, no post, and a false cause ("the repo declares no required check" —
+          # with REQ provably non-empty, or the sweep would have stopped long before this arm). So a
+          # failure token or a bare `NOCHECKS` leaves the PR IN the class, NAMED, and retried next cycle.
+          case "${_NDET:-}" in
+            NOCHECKS|UNCLASSIFIABLE:*)
+              V="NOCHECKS:READ-FAILED:the re-read answered but could not be graded (${_NDET:-<no label>})"
+              echo "#$PR NOCHECKS: the re-read answered but the classifier could not grade it — ${_NDET:-<no label>}" >>"$LOG" ;;
+            *)
+              V="${_NDET}"
+              echo "#$PR NOCHECKS RESOLVED -> '${_NDET}' on a re-read this cycle (the surface was there; the first read failed)" >>"$LOG" ;;
+          esac ;;
+        UNRESOLVABLE)
+          # Terminal. The resolver posted it on the PR (once per head); the arm below parks the head.
+          V="NOCHECKS:UNRESOLVABLE:${_NDET}" ;;
+        WAIT|DEFERRED-REPAIR|READ-FAILED|BUDGET)
+          V="NOCHECKS:${_NTOK}:${_NDET}" ;;
+        "")
+          # NO VERDICT AT ALL — the arm itself could not run (a missing file, a python error). That is
+          # a harness defect, not a state of the PR, and it must be NAMED rather than folded back into
+          # the silent `NOCHECKS` this change exists to remove.
+          V="NOCHECKS:READ-FAILED:the arm produced no verdict (nochk-resolve.py missing or failed — see $_NCHK_PY)" ;;
+        *)
+          V="NOCHECKS:UNKNOWN:${_NTOK} ${_NDET}" ;;
+      esac
+    fi
+    # [nochk-end]
     # ── the class cache the NEXT cycle's ordering reads (see lo_order) ─────────────
     # Written from the observation this loop just made, one row per PR per cycle; lo_class_compact
     # folds it at the top of the next cycle. It decides ONLY which PR gets a scarce fixer/reviewer
@@ -4813,14 +4859,91 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             fi
           fi
         fi ;;
+      NOCHECKS:UNRESOLVABLE:*)
+        # ⛔ THE NAMED DEAD END (#2719). The resolver has already decided this head cannot be checked
+        # and posted the verdict on the PR (once per head). PARK IT so no further cycle is spent: the
+        # sweep's own `parked-<PR>` guard names it from now on, and a push re-arms it automatically.
+        # ⛔ STILL WAIT-ONLY, STILL NO SPAWN: a named dead end is a reason to stop spending cycles, not
+        # a licence to merge, fix, or fake a check.
+        _NR="${V#NOCHECKS:UNRESOLVABLE:}"
+        # ⛔ A PARK NEEDS A HEAD TO BE BOUND TO (review P3, agent-infra#2719). `park_ctrl` writes the
+        # head it is given, and the sweep's park guard needs a NON-EMPTY head to match the next cycle's
+        # row — so parking an unreadable head writes a park that is never honoured while the ledger
+        # reports "parked at this head" every cycle. Name it instead.
+        if [ -z "${HEAD_N:-}" ]; then
+          echo "#$PR NOCHECKS-UNRESOLVABLE but the head is UNREADABLE this cycle, so it cannot be parked: ${_NR}" >>"$LOG"
+          disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (head unreadable — nothing parked, re-named next cycle)"
+        # ⛔ A LITERAL, NOT A BRACKET EXPRESSION. `[ "${_NR#*[post=failed]}" != "$_NR" ]` reads
+        # `[post=failed]` as a CHARACTER CLASS, so the test matched every detail that contains any of
+        # those letters — i.e. always — and the arm never parked at all (measured: 4 assertions red).
+        elif case "$_NR" in *"[post=ok-nomarker]"*) true ;; *) false ;; esac; then
+          # The verdict WAS published; the marker that stops a second comment could not be written.
+          # park_ctrl is the terminator, so the comment cannot be published again.
+          if park_ctrl "$PR" "${HEAD_N:-}" "NOCHECKS-UNRESOLVABLE: ${_NR} (published once; the posted marker could not be written)"; then
+            echo "#$PR PARKED — NOCHECKS-UNRESOLVABLE was published once and its marker could not be written: ${_NR}" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (parked so the verdict cannot be published twice)"
+          else
+            echo "#$PR NOCHECKS-UNRESOLVABLE published once, the marker write FAILED and the park write FAILED: ${_NR}" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (post marker unwritable; park write failed)"
+          fi
+        elif case "$_NR" in *"[post=failed-inert]"*) true ;; *) false ;; esac; then
+          # ⛔ THE BOUND ITSELF IS BROKEN (state/ unwritable): the post cannot be counted, so it cannot be
+          # bounded — and an unbounded comment loop is worse than a named dead end. Park it, and say so.
+          if park_ctrl "$PR" "${HEAD_N:-}" "NOCHECKS-UNRESOLVABLE: ${_NR} (post attempts could not be counted)"; then
+            echo "#$PR PARKED — NOCHECKS-UNRESOLVABLE and its post attempts could not be counted (state/ unwritable): ${_NR}" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (parked; the post bound was INERT)"
+          else
+            echo "#$PR NOCHECKS-UNRESOLVABLE post bound INERT and the park write FAILED: ${_NR}" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (post bound INERT; park write failed)"
+          fi
+        elif case "$_NR" in *"[post=failed-parked]"*) true ;; *) false ;; esac; then
+          # The post has now failed `attempt_bound` times AT THIS HEAD: retrying further is the
+          # unbounded loop (measured: 8 attempts / 172 gh calls over 9 cycles). Park it, and make the
+          # failure the park REASON, so the next cycle reports WHY nothing was ever published.
+          if park_ctrl "$PR" "${HEAD_N:-}" "NOCHECKS-UNRESOLVABLE: ${_NR} (the verdict could not be posted)"; then
+            echo "#$PR PARKED — NOCHECKS-UNRESOLVABLE and its verdict could not be posted after N attempts: ${_NR}" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (parked; the verdict could NOT be published)"
+          else
+            echo "#$PR NOCHECKS-UNRESOLVABLE post kept failing and the park write FAILED too: ${_NR}" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (post failed; park write failed — re-enters)"
+          fi
+        elif case "$_NR" in *"[post=failed]"*) true ;; *) false ;; esac; then
+          # ⛔ THE POST IS THE POINT OF A TERMINAL VERDICT (review P2, agent-infra#2719). Parking a head
+          # whose verdict never reached the PR dead-ends it with no explanation anywhere a human looks:
+          # the arm never re-enters a parked head, so the post is never retried. It stays in the class,
+          # NAMED, and the next cycle tries again.
+          echo "#$PR NOCHECKS-UNRESOLVABLE but the verdict could NOT be posted, so nothing is parked (it is retried): ${_NR}" >>"$LOG"
+          disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (verdict not posted — not parked, retried)"
+        elif park_ctrl "$PR" "${HEAD_N:-}" "NOCHECKS-UNRESOLVABLE: ${_NR}"; then
+          echo "#$PR PARKED — NOCHECKS-UNRESOLVABLE: ${_NR}" >>"$LOG"
+          # ⛔ THE POST STATUS IS THE RESOLVER'S, NOT THIS LINE'S CLAIM (review P2, agent-infra#2719):
+          # the verdict carries `[post=ok|failed|already-posted|off]` and this row repeats it, so a
+          # verdict nobody could post is never recorded as delivered.
+          disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (parked at this head)"
+        else
+          echo "#$PR NOCHECKS-UNRESOLVABLE (the park write FAILED, so it re-enters): ${_NR}" >>"$LOG"
+          disp "$PR" "${HEAD_N:-}" "$V" wait "NOCHECKS-UNRESOLVABLE: ${_NR} (park write failed — re-enters next cycle)"
+        fi ;;
+      NOCHECKS:*)
+        # ⛔ THE CAUSE IS NAMED, WHICH IS THE WHOLE REPAIR (#2719). Before this, all four causes arrived
+        # as one token and the only thing the cycle could say was "re-read next cycle". A budget window,
+        # a transport failure, a run that is still executing, and a repo whose repair simply has not
+        # fired yet have four different remedies and now read as four different rows.
+        # ⛔ WAIT-ONLY: this arm must never spawn and never merge. `NOCHECKS` is not evidence of health
+        # (an empty surface is never GREEN in this file) and it is not evidence of breakage either.
+        _NR="${V#NOCHECKS:}"
+        echo "#$PR no acting arm for class '${V:-<empty>}' — nothing spawned (${_NR})" >>"$LOG"
+        disp "$PR" "${HEAD_N:-}" "$V" wait "check surface ${_NR} — nothing spawned" ;;
       *)
         # ⛔ THE DANGLING CLASS (#2126 T4). `NOCHECKS` (an empty check surface, or an unreadable
         # `gh pr checks` — the pipeline's stderr is discarded, so a FAILED read and an empty surface
         # both arrive here) used to reach NO arm: no merge, no fixer, and not one line. A PR could
         # therefore hold the issue path shut while the log said nothing at all about it.
-        # ⛔ WAIT-ONLY: this arm must never spawn. `NOCHECKS` is not evidence of health (an empty
-        # surface is never GREEN in this file) and it is not evidence of breakage either, so the only
-        # honest action is to name it and re-read next cycle.
+        # ⛔ SINCE #2719 THIS ARM IS THE RESIDUAL, NOT THE CLASS: the sweep resolves `NOCHECKS` into a
+        # NAMED verdict above (`NOCHECKS:BUDGET:…`, `NOCHECKS:READ-FAILED:…`, `NOCHECKS:WAIT:…`,
+        # `NOCHECKS:DEFERRED-REPAIR:…`, `NOCHECKS:UNRESOLVABLE:…`) and a recovered class is handed to
+        # the ordinary arms. What reaches here is a class token this file has never been taught, which
+        # still must be named and still must spawn nothing.
         echo "#$PR no acting arm for class '${V:-<empty>}' — nothing spawned (unreadable/empty check surface; re-read next cycle)" >>"$LOG"
         disp "$PR" "${HEAD_N:-}" "${V:-NONE}" wait "check surface unreadable or empty (${V:-no class}) — nothing spawned" ;;
     esac
