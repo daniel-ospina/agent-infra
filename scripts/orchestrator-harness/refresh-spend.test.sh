@@ -62,13 +62,24 @@ trap 'rm -rf "$T"' EXIT
 
 CEILING=26          # 6 candidates: 5 listing pages + 4 fleet reads + 6*2 per-candidate + slack
 
-# mk_case <name> <budget> <rows> — sandbox: repo, an EXISTING scout worktree (so the shipped script
-# never runs `git worktree add`), a sandbox HOME, $O, and a counting `gh` chain.
+# mk_case <name> <budget> <rows> — sandbox: a REAL git repo (with a real local origin), an EXISTING
+# scout worktree (so the shipped script never runs `git worktree add`), a sandbox HOME, $O, and a
+# counting `gh` chain.
+# ⛔ THE REPO MUST BE PROVISIONABLE (agent-infra#1935 review, P1). `resolve_repo` verifies an EXPLICIT
+# $REPO too: it reads `git -C $REPO config --get remote.origin.url` and REFUSES (exit 3, before the
+# pool is read) a checkout that cannot prove which repo it is — pre-flighting one repo's issues
+# against another repo's tree is #1901, so "cannot prove" is never "proved". A `mkdir -p` fixture
+# therefore reds EVERY run-path arm of this suite. The origin is a bare dir INSIDE the sandbox: real
+# git semantics and no network. `rf` also clears $OR (see there), so a local-path origin takes the
+# documented OR_DECLARED=0 tolerance instead of needing a URL that matches a declared target.
 D=""
 mk_case() {
   D="$T/$1"; rm -rf "$D"
   mkdir -p "$D/home" "$D/bin" "$D/o" "$D/calls" "$D/ghlimit" \
            "$D/repo/.worktrees/dispatch-scout/tools"
+  git init -q --bare "$D/origin.git"
+  git init -q "$D/repo"
+  git -C "$D/repo" remote add origin "$D/origin.git"
   printf '%s' "${2:-9000}" > "$D/core"
   printf '%s' "${3:-[]}" > "$D/rows"
   # THE CHAIN: PATH `gh` -> the real helper -> a counting stub as the "real" gh.
@@ -156,12 +167,18 @@ rows() {  # <n> — n unassigned P0-blocker rows
   printf '%s]' "$out"
 }
 OUT=""; RC=0
+# ⛔ $OR IS CLEARED TOO (#1935 review, P1): `OR_DECLARED` is 1 whenever the caller's environment names
+# a queue target, and a DECLARED target makes the fixture's local-path origin a REFUSAL (a local path
+# cannot prove a declared pair) — so on any box that exports $OR this suite would red for a reason
+# that has nothing to do with the spend contract. Cleared, the fixture runs in the documented
+# OR_DECLARED=0 state and the resolver's tolerance branch is the one under test.
 rf() {  # <case-dir> [LIMIT] [KEY=VAL ...]
   local dir="$1"; local lim="${2:-6}"; shift 2 2>/dev/null || shift 1
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
             -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR -u COLLISION_PREFLIGHT_BOARD_CACHE \
             -u COLLISION_PREFLIGHT_CORE_RESERVE -u COLLISION_PREFLIGHT_CORE_PER_CANDIDATE \
             -u COLLISION_PREFLIGHT_CORE_PACING -u GH_PASS_CACHE_DIR -u REFRESH_UNCHANGED_SKIP_TTL \
+            -u OR \
             HOME="$dir/home" PATH="$dir/bin:$PATH" REPO="$dir/repo" O="$dir/o" \
             GH_LIMIT_DIR="$dir/ghlimit" SPEND_CASE="$dir" SPEND_STUB="$dir/bin/gh-stub" \
             SPEND_HELPER="$HELPER" \

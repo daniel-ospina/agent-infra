@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off runs in ci.yml's dedicated `pi-config-extensions` job (PR lane only - ci-main's `pi-config-extensions-guard` job runs scripts/check-pi-config-extensions.sh, NOT this suite, so there is no post-merge suite run site, agent-infra#2610); a shard here would be a second run site (#2439)
 # #498/#502 — pi-config extension-farm parity gate tests.
 #
 # Exercises scripts/check-pi-config-extensions.sh semantics against

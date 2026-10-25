@@ -1,0 +1,15 @@
+# FAILURE-CLASS FIXTURE (positive): a per-PR group keyed on `github.head_ref` is ALSO correct — it is
+# stable across the heads of one PR and distinct between PRs, so it cancels superseded heads without
+# merging two PRs into one group. R1 must accept it (refusing it would be a false red on a correct
+# declaration).
+name: pr-head-ref
+on:
+  pull_request:
+concurrency:
+  group: pr-head-ref-${{ github.head_ref }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

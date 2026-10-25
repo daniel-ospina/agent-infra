@@ -626,9 +626,14 @@ ck "  …and the resolver spawns NOTHING: it answers under \`ulimit -u 1\` ($CGR
 # ── §10 self-registration ───────────────────────────────────────────────────────────────────────
 echo
 echo "── §10 this suite is EXECUTED by CI, not merely named ──"
+# ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (agent-infra#2609). The list
+# is DERIVED from the tree now, so the driver's text names no suite at all — a `grep` of the driver
+# file would read 1 for `git show HEAD:…` and 0 here, i.e. it asserted the OLD enumeration and went
+# red the moment the list became a derivation. `--list` is the runner's own oracle (the same one the
+# CI lane reads), exactly as spawn-gate.test.sh asserts its own membership.
 SHARDS="$ROOT/scripts/run-bash-shards.sh"
-ck "capacity-placement.test.sh is registered in run-bash-shards.sh (the ONE list both lanes run)" \
-   "$(grep -q 'capacity-placement.test.sh' "$SHARDS" && echo 0 || echo 1)"
+ck "capacity-placement.test.sh is EXECUTED by run-bash-shards.sh --list (the ONE list both lanes run)" \
+   "$(bash "$SHARDS" --list 2>/dev/null | grep -qx 'scripts/orchestrator-harness/capacity-placement.test.sh' && echo 0 || echo 1)"
 
 echo
 echo "───────────────────────────────────────────────────────────────────────────────"

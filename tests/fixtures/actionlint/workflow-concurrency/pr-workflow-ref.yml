@@ -1,0 +1,13 @@
+# The safe direction: `github.workflow_ref` names the workflow FILE and its ref, not a commit, so it is
+# per-ref and compliant — the per-commit arm must not widen into a blanket `_ref` refusal (#2660 round 12).
+name: pr workflow ref
+on:
+  pull_request:
+concurrency:
+  group: ${{ github.workflow_ref }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

@@ -1,0 +1,14 @@
+# The GREEN-direction control for `on:` written as a block sequence: the same YAML data as
+# `on: [push]`, which was read fine, while the sequence form was refused as "could not read any
+# trigger" although `on:` is right there. A non-cancelling push workflow must be GREEN (#2660 round 8).
+name: Push on sequence ok
+on:
+  - push
+concurrency:
+  group: push-on-sequence-ok
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

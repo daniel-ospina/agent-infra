@@ -1,0 +1,14 @@
+# The safe direction: a multi-line value with no per-commit variable is compliant, and the reader
+# must not truncate it into something that looks wrong (#2660 round 10).
+name: PR multiline value ok
+on:
+  pull_request:
+concurrency:
+  group: pr-multiline-value-ok-${{ github.ref }}
+    -suffix
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

@@ -1,0 +1,11 @@
+# `True` in the FLOW form was refused while the identical block form was accepted — the same value
+# judged two ways, which round 4 fixed for the block path only (#2660 round 8).
+name: PR flow capital
+on:
+  pull_request:
+concurrency: {group: "pr-flow-capital-${{ github.ref }}", cancel-in-progress: True}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
