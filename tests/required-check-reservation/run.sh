@@ -562,9 +562,13 @@ fi
 
 # ── 43–46. VGATE round 8: an UNTERMINATED construct must not defer "children are legal" ────────
 # Exempting `&`, `!`, `[`, `{` without closure tracking meant an unterminated one accepted every
-# following indented line forever — rc 0 over a file yaml.safe_load REJECTS. Only a block scalar
-# (`|` / `>`) is exempt now, because its children are literal TEXT and can never hide a job; a
-# legitimate multi-line flow is REFUSED rather than guessed.
+# following indented line forever — rc 0 over a file yaml.safe_load REJECTS.
+# ⛔ There is NO exemption left. A block scalar (`|` / `>`) was briefly exempt on the theory that its
+# children are literal TEXT and cannot hide a job — but the exemption was undecidable by first
+# character (a malformed header `run-name: |#x` and an illegally dedented body both graded GREEN over
+# YAML PyYAML rejects; arms 48/49). So a top-level INLINE value now refuses indented children of ANY
+# kind, and a legitimate block scalar or multi-line flow is a deliberate over-block (arm 47).
+# Do not "align the code with an older comment" here: re-adding that exemption re-opens arms 48/49.
 for spec in \
   'permissions: [|43 UNREADABLE an unterminated flow sequence is REFUSED' \
   'permissions: {|44 UNREADABLE an unterminated flow mapping is REFUSED' \
