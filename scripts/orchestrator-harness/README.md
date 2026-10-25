@@ -417,8 +417,8 @@ a killed worker cannot take the controller down with it.
 
 | Session | Script | Writes to | Purpose |
 |---|---|---|---|
-| `lane-<N>` | `lane.sh` | `.worktrees/tm-<N>` on `feat/<N>-tm` | implement issue #N → commit → push → open PR |
-| `chain-<N>` | `chain-merge.sh` | — | wait for the lane's PR, then delegate to `merge-one.sh` |
+| `lane-<N>` | `lane.sh` | `.worktrees/tm-<N>` on `feat/<N>-tm` | implement issue #N → commit → push → open PR → **take it to `merged`** through `lane-merge.sh` (bounded) |
+| `chain-<N>` | `chain-merge.sh` | — | wait for the PR **and for the lane's merge-phase verdict**, then delegate to `merge-one.sh` if the lane did not merge it |
 | `merge-<PR>` | `merge-one.sh` | — | **repo-authority-dependent**: gate mode = fresh review → signed record → wait green → squash-merge; rail mode = (a head-bound record already at the head, else the same fresh review → signed record first) → the repo's own `scripts/admin-merge.sh` (#1825) |
 | `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings, **a failing required check**, or **a rail refusal that names a red tree** (agent-infra#2223 — the RED-FIXER role in the sweep), push, re-run the merge chain. ONE fixer per PR by construction: all three reasons spawn under this session name, so a second reason while a fixer lives finds the session and spawns nothing |
 | `cell-doctor` | `cloud-cell-doctor.sh loop` | `state/roles/`, `logs/doctor.log` | the cell's **own** scheduled roles — `doctor` (reap + restart a missing controller), `merge` (land attested PRs on the standard rail), `hygiene` (caches/worktrees). Started by `cloud-cell-supervisor.sh start`; see §6.5.7 |
@@ -453,13 +453,17 @@ a killed worker cannot take the controller down with it.
 | `state/parked-<PR>` | terminal state: the fixer cap was reached at the head recorded inside the file, so the sweep skips it until a new push re-arms it |
 | `state/rerun-<PR>-<runid>` | CI re-run already requested for this run — prevents loops |
 | `state/merged-<PR>.done` | merge confirmation |
+| `state/lanemerge-<PR>.phase` | the lane entered its **merge phase** (it, not the controller, is driving the merge). `chain-merge.sh` waits on it so a review is never recorded at a head the lane then fixes |
+| `state/lanemerge-<PR>.round` | fix rounds spent by `lane-merge.sh` — the **cap is 3**, and the tool refuses the next round rather than granting it |
+| `state/lanemerge-<PR>.verdict` | the merge phase's machine verdict (`MERGED <sha>`, `FIX_REQUIRED`, `BLOCKED_ATTESTATION`, `BLOCKED_ATTEMPTS`, `BLOCKED`, `WAITING_*`). `lanemerge-issue-<N>.verdict` is the issue-keyed copy **`lane.sh` reads** for its post-run "no merge-phase verdict" diagnostic (chain-merge reads the PR-keyed file), and `lanemerge-<PR>.issue` persists the issue number so a later `--watch` can still write it |
+| `state/lanemerge-<PR>.last` | the last failing check NAMES observed — what the handoff comment quotes, so the next holder inherits the diagnosis |
 | `state/last-open-n` | the last SUCCESSFUL open-PR count; reused only when positive if a later count fails — a failure never reads as 0 |
 | `state/last-open-prs` | the `number:headOid:headRefName` rows from that same SUCCESSFUL listing — the **ownership scan's** input (`unowned_pr_count`) and the selection's population. The head ref is what the live-process predicate is matched against; a row is only used when it has all three fields, so a truncated file cannot read as "nothing is owned". A missing/unreadable file is UNKNOWN, not empty: `open_pr_count` REMOVES it on a failed read and the gate then blocks on the fail-closed listing count. Written on success and REMOVED on a failed listing, so a fallback count is never paired with the previous listing's rows; absent rows mean **nothing is owned** (the whole count is unowned), which is the fail-closed direction. Both files come from ONE `gh pr list` call. |
 | `state/roles/<role>.state` | the cell doctor's LAST-PASS record per role (`last_pass_at`, `last_pass_epoch`, `passes`, `last_rc`, `last_result`), written atomically and only by a completed pass — `status` reads it, so "never ran" is distinguishable from "idle" (§6.5.7) |
 | `state/roles/.desired` | the cell is SUPPOSED to be running; written by `start`, removed by `stop`, so the doctor restarts a controller that `stop` did not silence |
 | `state/roles/loop.ident` | `pid|<identity>` for the doctor loop, where the identity is `proc:<starttime>` from `/proc/<pid>/stat` on Linux and `ps -o lstart=` where `/proc` does not exist — `status` verifies BOTH before reporting the loop RUNNING, so a recycled pid (after a tmux server restart, an OOM kill or a crash) cannot make a dead loop read as alive |
 | `state/roles/merge.attempts` | `PR head epoch reason` for every rail call the merge role made — the head-level cooldown that stops a REFUSED head being retried blind |
-| `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
+| `logs/` | one log per worker: `lane-*.log`, `lane-merge-<PR>.log` (the lane's merge-loop chain), `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` — `merge-rate.sh` deliberately does NOT count `lane-merge-*.log` as a lane |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6), plus one `capwip-<stamp>-<pid>/` per lane KILLED AT ITS WALL-CLOCK CAP (#2045): `tracked.patch`, `untracked.tgz`, `untracked.list`, `tracked.numstat` (the re-parse's own output, kept as evidence that the patch was verified) and `SNAPSHOT.txt`. The newest `WIP_SNAPSHOT_KEEP` (10) directories are kept — a cell's disk is the first thing that stops dispatch, so this is a bounded directory, not a log |
 | `state/capwip.tsv` | one row per cap kill **on every path** — epoch, label, cap seconds, elapsed, exit status, the verdict (`COMPLETE`/`PARTIAL`/`NOTHING-LOST`/`LOST`/`UNSNAPSHOTABLE`) and the snapshot dir (empty where no directory exists). The companion to `state/walltime.tsv` (`report.sh` computes the cap-hit RATE there; this is what says whether the kill cost any work) and the reason a cap hit is no longer an absence in the fleet's accounting |
 
@@ -1216,7 +1220,7 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `PRODUCT_REPOS` | `daniel-ospina/tortoise` | **comma-separated** `owner/repo` list (no spaces, matched as an element — `$(printf '%s' "$PRODUCT_REPOS" | tr ',' ' ')` then `*" $repo "*`), read by `refresh-candidates.sh` and deciding **which repo counts as PRODUCT**: an issue is product work when its repo is in this list AND it does not carry the `harness` label. ⛔ **TODAY ONLY THE ENTRY EQUAL TO `$OR` CAN EVER MATCH**: the backlog is read from `$OR` alone, and the intake is called with `$OR`, so every other element in the list is inert until a pass spans more than one repo. The list form is kept because that is the shape the decision has; it is not a multi-repo queue. If `$OR` is absent from the list, EVERY candidate is harness and the loop prints `product-floor N/A` — which is how a box says "no product channel here", not an error. This is the single input the whole floor rests on, so it is documented here rather than only in `ARCHITECTURE.md`: a repo **outside** the list reports `NOT-A-PRODUCT-REPO` and the loop prints `product-floor N/A`, which is **not** an unmet floor and **not** a finding about product work. ⛔ **`$ENV_FILE`-only: `install.sh` neither renders nor validates it** (its numeric `[`-based validator would reject a list, so a `__PRODUCT_REPOS__` placeholder is deliberately absent), which means exporting it and re-running `install.sh` has no effect, and a hand-added plist key is overwritten by the next render — set it in `$ENV_FILE` on a cell, or edit the `PRODUCT_REPOS=` default in `refresh-candidates.sh` (search the assignment, not a line number — it moved once already) |
 | `CYC` | `240` | seconds between cycles |
 | `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
-| `LANE_TIMEOUT` | `2400` | wall-clock limit on a lane's `pi` run (s) |
+| `LANE_TIMEOUT` | `3300` | wall-clock limit on a lane's `pi` run (s). Raised from 2400 when a lane took ownership of its merge (#2029) — the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
 | `REVIEW_TIMEOUT` | `1800` | wall-clock limit on a reviewer `pi` run (s) |
 | `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
 | `SWEEP_MAX_AGE` | `600` | (s) the longest a `304 Not Modified` may reuse the cached PR listing before the sweep forces a full one. A completed check run does **not** reliably change the listing's ETag, so this floor is what stops a green PR sitting behind a cached "unchanged" forever (#1762) |
@@ -1493,6 +1497,58 @@ clear about what is and is not enforced:
   agent that has read a hostile PR body.
 
 ---
+
+### 5.4 A lane owns its merge — bounded, in code (2026-10-18)
+
+**The failure this closes.** Measured 2026-10-18: **22 open PRs against 3 merged**. Every lane treated
+"PR opened" as success and exited, so the merge work queued behind the running lanes and the backlog grew
+while the fleet looked busy. The instruction alone was not enough — a brief that says "keep merging" leaves
+each lane to invent its own polling loop, and an invented loop is **unbounded**.
+
+**What the lane does now.** After the PR exists, the lane runs
+
+```
+bash $O/lane-merge.sh <PR> --issue <n> --repo OWNER/REPO --branch <br>
+```
+
+and the exit code **is** the next action (0 MERGED · 10 FIX_REQUIRED · 15 FIX_CONFLICT · 11 WAITING ·
+12/13/14 BLOCKED_*). One round is: wait for THIS head's checks to be terminal (bounded) → read the failing
+NAMES → fix, push, repeat; when green, launch the harness's per-PR chain **detached** and supervise it with
+`--watch` (short chunks — a lane blocked for 20 minutes inside one shell call reads as wedged to every
+liveness instrument we have). Supervision is **bounded and sized to what the lane can actually spend**:
+`WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (1500 + 7 × 120 + 900 = 3240 of the 3300 s
+clock), so the merge phase can never consume the implementation time the same clock pays for — a bound
+the lane itself reaches before its own kill, not one only a later lane could inherit.
+
+**The cap is 3 fix rounds, enforced by the tool**, not by the brief: a lane that would start round 4 is
+refused, the verdict becomes `BLOCKED_ATTEMPTS`, and a **PR comment names the exact blocker**. A lane stuck
+in round 5 is a failure, not thoroughness.
+
+**Why the lane does not review itself.** The merge path is `$O/merge-one.sh`, unchanged: in a *rail* repo it
+runs the repo's own `scripts/admin-merge.sh`; in a *gate* repo it dispatches a **fresh-context** reviewer,
+then `record-review.sh` (which verifies the evidence comment) signs the record, and only then does it merge.
+`lane-merge.sh` contains **zero** calls to `record-review.sh` — a lane that attested to its own review would
+be a review that did not happen, and the suite pins that as a property.
+
+**Two more rules the brief states, because each has a real incident behind it:**
+- **never edit the PR body once a review is recorded** — the attestation lives in that body and an unrelated
+  edit wipes the proof the gate reads (twice measured: agent-infra #1209, premise-labs #3788);
+- **a dirty PR** means re-apply the lane's own change onto current main and force-push ITS OWN branch;
+  never resolve a **generated** file's conflict by picking a side — regenerate it.
+
+**The controller's chain yields to it.** `chain-merge.sh` waits for `state/lanemerge-<PR>.phase` (a local
+file — **zero GitHub calls**) and then for that lane's verdict before it reviews, because a review recorded
+at T while the lane pushes a fix at T+1 strands the attestation: the gate reddens on an unchanged verdict,
+the review is paid for twice, and `admin-merge.sh` refuses to move a branch carrying a record bound to it.
+A lane that predates this writes no phase marker, so the chain proceeds after a short grace exactly as it
+always did — the live fleet is not delayed by a template it never received.
+
+**The measurement.** `merge-rate.sh [--hours N] [--json]` counts lane END states from durable artifacts
+only (zero GitHub calls): the last status token in `logs/lane-<n>.log`, plus the machine-written verdicts
+and `merged-*` markers as cross-checks. A lane with no status line is counted as **UNKNOWN and printed**,
+never dropped and never folded into the rate; an empty population prints `n/a`, never a flattering 0% or
+100%. Before this change the fleet measured **191 lane logs: 99 ended at `PR_OPENED`, 2 at `MERGED` → a
+1.9% merge rate**, with 61 `merged-<PR>.done` markers showing the *controller* was carrying the merging.
 
 ## 6. Operating notes
 
@@ -2677,7 +2733,8 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(10800s) are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
+(14400s — raised from 10800s by #2029, whose merge phase lengthened the wait the lease must outlive)
+are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
 caller may stamp. Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
 stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
@@ -2830,7 +2887,7 @@ reap. The decisions that are not obvious:
   every exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
   §7.2d — a capacity refusal, where it exits at once rather than waiting) through
   a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
-  which is sized (`CLAIM_ISSUE_TTL`, default 3 h) to cover lane + chain — releasing early is the
+  which is sized (`CLAIM_ISSUE_TTL`, default 4 h since #2029) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on
@@ -3859,7 +3916,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `lane.sh` | the implementation worker (prompt template included). Since agent-infra#2148 it hard-requires `reviewer-preflight.sh`, prints the reviewer requirement once **before** any work, and splices the reviewer step into the generated brief — the requirement is no longer discovered by being refused at the rail. Since agent-infra#2258 it ALSO splices the canonical `RESEARCH FIRST` block (from `brief-gate.sh --section lane`) and refuses (78) if the brief it just generated fails the validator, so a brief that lost the contract cannot reach a lane |
 | `brief-gate.sh` | the RESEARCH contract, enforced at the dispatch seam (agent-infra#2258): a brief must carry a `RESEARCH FIRST` section (`INTERNAL:` + `EXTERNAL:` + a `RUNG:`/tool line) and a `CONTRADICTION TEST:` line, or the dispatch is REFUSED with **80** — nothing consumed — by a message that names every missing element and prints the block to paste. `--check <file\|-> [role]` · `--section [role]` (the ONE source of the block every generated brief splices and `templates/LANE-BRIEF.md` copies) · `--missing` · `--line`. Executed by `spawn-gate.sh::run_agent`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`, `orch-send.sh`, `safe-send.sh` and `pr-doctor.py`; `0` pass / `80` refused / `78` cannot-verify (missing, empty, unknown role, or an unresolvable validator — never a pass). Presence and shape only: it cannot judge the research itself, and its own refusal says so |
 | `reviewer-preflight.sh` | the reviewer requirement, disclosed up front (agent-infra#2148): `reviewer_preflight_line` / `reviewer_brief_section` for the three audiences (`self` = the lane lands through the rail; `harness` = a worker that pushes code while `merge-one.sh` mints the attestation; `reviewer` = merge-one.sh's own reviewer session, which posts the verdict comment and must not push, record or merge — no brief section, by design). The `self` line also names the override for a launcher that exports no `KIND` ("if your brief says you have no `task` tool, that overrides this") — the content-repo copy of `lane.sh` is in that state today (tortoise#8432). Sourced by `lane.sh`; also `--line`/`--brief`. Its wording is drift-pinned against the pi side (`extensions/shared/reviewer-preflight.ts`) and carried by `templates/LANE-BRIEF.md` |
-| `chain-merge.sh` | waits for the lane's PR, then runs the merge chain |
+| `chain-merge.sh` | waits for the lane's PR **and its merge-phase verdict** (zero GitHub calls), then runs the merge chain if the lane did not merge it — and exits at once, releasing its issue claim, when the lane recorded a capacity refusal (agent-infra#1909) |
+| `lane-merge.sh` | **the lane's bounded merge loop** (#2029): wait for its own checks → fix rounds (cap 3, enforced here) → launch the harness chain detached → `--watch`. Emits `MERGED` / `FIX_REQUIRED` / `FIX_CONFLICT` / `BLOCKED_ATTESTATION` / `BLOCKED_ATTEMPTS` / `BLOCKED`, and posts the handoff comment |
+| `merge-rate.sh` | the before/after measurement (#2029): lane END states (`PR_OPENED` vs `MERGED`) from durable artifacts only — zero GitHub calls. `--hours`, `--json` |
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` for a verdict with findings, `needsreview-*` for no usable verdict (#2132) |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
@@ -3876,6 +3935,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`; the repo-authority contract and the rail branch driven from `merge-one.sh`; and (agent-infra#1952) the **landing claim** — a second box refused the same PR, three independent keys, fenced release, release frees the PR, non-vacuity, and `merge-one.sh`'s acquire-before-the-review ordering. Hermetic. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
+| `lane-merge.test.sh` | #2029 **the lane's own merge loop under test**, offline with a stub `gh` and a stub chain: the bounded wait (a queued run is never green), the red NAMES published for the handoff, the (app, name) grouping that keeps one workflow from masking another, the **round cap enforced where the fix is emitted** (a pre-check cannot verify the last allowed fix), the exit-code contract (`10/11/12/13/14/15/0`) with the **one blocker a lane cannot supply** on its own code, the detach + refusal to select the merge authority from a lane's own branch — **including the hand-off's printed remedy, which must hand over that same trusted checkout or refuse** — the derived supervision budget that leaves the lane its implementation time, and the failed-read guard (an unreadable PR is a WAIT, never an attestation). Hermetic, a CI shard |
+| `merge-rate.test.sh` | #2029 **the measurement's own honesty:** last status token per lane wins, `ALREADY_FIXED`/`OUT-OF-REPO` are `other` and never "an opened PR", a lane with no status line is `unknown` and printed, an empty population is `n/a` (never 0% or 100%), the PR-keyed and issue-keyed verdicts are ONE outcome, `lane-merge-*.log` is not a lane, and a merge attested only by `state/merged-<PR>.done` is attributed and reported as an inference — **only for a lane whose own deliverable named that PR and whose own last word was `PR_OPENED`/`UNKNOWN`** (a `BLOCKED*` lane is never upgraded, and a mid-transcript mention of another lane's PR is not this lane's). Hermetic, a CI shard |
+| `chain-merge-verdict.test.sh` | #2029 **the controller's chain yields to the lane:** no phase marker → review now (a lane that predates the change is not delayed), a current `FIX_REQUIRED` → keep waiting (reviewing early strands the attestation), a `MERGED` marker → exit 0 without reviewing, a current `BLOCKED_*` → review, a STALE verdict ignored by mtime. Drives the shipped `chain-merge.sh`. Hermetic, a CI shard |
 | `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. **Plus #2243's coalescing**: 5 identical concurrent reads ⇒ 1 load (byte-identical bodies carrying the first call's answer), 5 different reads ⇒ 5 loads still serialised, a failing leader's error reaching every follower (none seeing success), 2 concurrent mutations ⇒ 2 loads, a waiter past the bound getting `busy` (75) with the holder's age, a stale answer served during a refresh carrying its age, and a dead leader's key taken over with no orphan claim. #2137 ACCOUNT scope: the share is the account budget ÷ declared fleet (N=1,2,4), enforced on the wire; an `unclassified` refusal is classified, waits the ≥60s curve and records a ~60 s window instead of the 43-minute reset; a stale marker is revalidated with one exempt `/rate_limit` read, cleared and annotated; a marker older than the window it recorded (or than `MARKER_MAX_AGE`) blocks nothing and spends no probe; a genuinely exhausted bucket still waits for its reset. Fake clock, stub gh, hermetic, a CI shard |
 | `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
