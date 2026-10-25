@@ -1,0 +1,11 @@
+# FAILURE-CLASS FIXTURE (R1, readability): the trigger keys are indented FOUR spaces. Valid YAML,
+# and GitHub reads them — so the reader must NOT silently treat this file as non-PR (its first
+# revision did exactly that, and reported GREEN over a PR workflow with no concurrency block).
+name: pr-on-four-space
+on:
+    pull_request:
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

@@ -1,0 +1,16 @@
+# FAILURE-CLASS FIXTURE (positive): a `run: |` body whose OWN lines begin with `concurrency:` and
+# `group:` (writing a workflow fragment). The body is TEXT — treating it as keys refuses a correct
+# workflow with a message about a job-level block that does not exist (round-3 P2).
+name: push-heredoc
+on:
+  push:
+    branches: [main]
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat > generated.yml <<'YAML'
+          concurrency:
+            group: generated
+          YAML

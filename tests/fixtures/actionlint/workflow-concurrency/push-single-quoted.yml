@@ -1,0 +1,15 @@
+# FAILURE-CLASS FIXTURE (R2, readability): the `concurrency` key is SINGLE-quoted — valid YAML, and the
+# form a mapping-key-quoting formatter emits. A reader that only accepts `"concurrency":` reports
+# "push workflows never cancel" over a workflow that cancels on every main push (round-2 P0).
+name: push-single-quoted
+on:
+  push:
+    branches: [main]
+'concurrency':
+  group: push-single-quoted-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

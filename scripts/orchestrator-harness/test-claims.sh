@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off a live-origin loop proof, not a CI suite: it drives the claim CAS against a real (bare) origin from scratch repos. `spawn-gate.test.sh` pins the unwired population to exactly {this, test-crossbox.sh}
 # test-claims.sh — prove the git-ref CAS claim is real, using TWO independent scratch repositories
 # (`git init` + `remote add origin <bare repo>`) as stand-ins for two boxes. Not a mock: both talk to
 # the live origin.
