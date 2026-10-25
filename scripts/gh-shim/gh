@@ -122,14 +122,14 @@
 #     file heals on the next read.
 #   - the retry is per WHOLE COMMAND. Below `gh-limit.py`'s own 4 attempts this MULTIPLIES: a
 #     call can execute up to 3 (this gate) x 4 (that layer) times, including non-idempotent
-#     creates and comments — and for a READ the transport arm adds to that: see the additive bound in
-#     the transport bullet below (5 x 4 = 20 for a read, 1 x 4 = 4 for a write, which is retried zero
-#     times here). "The tighter layer wins" is true for concurrency and for a single
-#     wait, and FALSE for attempts. A caller that declared its own bound suppresses the RATE-LIMIT
-#     wait entirely (`AGENT_GH_GATE_NO_WAIT=1`, or gh-limit's `GH_LIMIT_NO_WAIT=1`); it does NOT
-#     suppress the transport retry's 1 s + 3 s, which is two orders below those budgets and is the
-#     whole fix for a bounded caller that would otherwise lose the call to a dropped socket (see the
-#     transport bullet).
+#     creates and comments — the transport arm below does NOT add to a WRITE (it is retried zero times
+#     on a transport failure), so a write's bound stays 3 x 4 = 12. For a READ the arms are additive:
+#     see the transport bullet (5 x 4 = 20). "The tighter layer wins" is true for concurrency and for
+#     a single wait, and FALSE for attempts. A caller that declared its own bound suppresses the
+#     RATE-LIMIT wait entirely (`AGENT_GH_GATE_NO_WAIT=1`, or gh-limit's `GH_LIMIT_NO_WAIT=1`); it
+#     does NOT suppress the transport retry's 1 s + 3 s, which is two orders below those budgets and
+#     is the whole fix for a bounded caller that would otherwise lose the call to a dropped socket
+#     (see the transport bullet).
 #   - `AGENT_GH_GATE_SLOT` is FORGEABLE: any caller that can set its environment may point it at
 #     an existing directory and take no slot at all. It is an INTERNAL inheritance seam between
 #     this shim and the child it spawns, not a security boundary — the same class as

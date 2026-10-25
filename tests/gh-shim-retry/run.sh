@@ -399,7 +399,11 @@ echo "== 9. the stdout capture is 0600 for the life of the call (a secret-printi
 # OUTSIDE, on the real file the shim is holding: the fake answers slowly so the capture exists while
 # we look.
 scen_init mode slowok
-shim issue view 3 >"$TMP/mode-out" 2>/dev/null &
+# ⛔ THE WRAPPER'S UMASK MUST NOT BE ABLE TO SATISFY THIS. Under `umask 077` a file created with no
+# `chmod` is ALREADY `0600`, so the assertion passed on a shim with the `chmod` deleted — a false
+# CLEAN on any runner whose umask is strict (review of #2768, round 5). The call runs under an
+# explicit permissive umask, so the shim's own `chmod 600` is the only thing that can make it 0600.
+( umask 022; shim issue view 3 >"$TMP/mode-out" 2>/dev/null ) &
 _mode_pid=$!
 _modes=""
 _i=0
