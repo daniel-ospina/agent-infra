@@ -31,7 +31,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { computePin, diskTree, gitTree, pinReport, PIN_REL } from "./sanctioned-pin-tree.mjs";
+import { computePin, diskTree, gitTree, parseRefArg, pinReport, PIN_REL } from "./sanctioned-pin-tree.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..", "..");
@@ -218,6 +218,38 @@ try {
     rmSync(root, { recursive: true, force: true });
   }
 
+  // ── (b″) a pin that DROPPED a delegate is stale, not fresh ──
+  // Both directions of the closure must be part of the freshness verdict: the
+  // shipped gate asserted "the pin names every executed helper" separately, so a
+  // `stale` that only walked pin→tree reported a shrunk closure as fresh — and any
+  // caller trusting it alone (this suite included) would have turned that into a
+  // false PASS on exactly the `ci_exemption.py` class the closure exists for.
+  {
+    const root = makeRepo();
+    const doc = computePin(diskTree(root), "fixture pin — #2818");
+    const dropped = Object.keys(doc.delegates).find((r) => r === HELPER) ?? Object.keys(doc.delegates)[0];
+    delete doc.delegates[dropped];
+    writeFileSync(join(root, PIN_REL), JSON.stringify(doc, null, 2) + "\n");
+    git(root, "add", "-A");
+    git(root, "commit", "-qm", "pr: drop a delegate from the pin, leave the script executing it");
+    expect(`(b″) a pin whose closure DROPPED ${dropped} (still executed) FAILS`,
+      staleOf(gitTree(root, "HEAD")).includes(`${dropped} (unpinned delegate)`), true);
+    rmSync(root, { recursive: true, force: true });
+  }
+
+  // ── (r) the reference argument itself: no silent fall back ──
+  // `--ref ""` selecting the working tree is the treadmill returning invisibly:
+  // the check would read the merged tree again and report green.
+  {
+    const throws = (argv) => { try { parseRefArg(argv); return false; } catch { return true; } };
+    expect("(r1) `--ref` with an empty value is an ERROR, not a fall back to the working tree",
+      throws(["--ref", ""]), true);
+    expect("(r1) `--ref` with no value is an ERROR", throws(["--ref"]), true);
+    expect("(r2) no `--ref` means the working tree (a push to main, or the change itself)",
+      parseRefArg([]).ref, null);
+    expect("(r3) `--ref <rev>` selects that commit", parseRefArg(["--ref", "abc123"]).ref, "abc123");
+  }
+
   // ── WIRING: the fix is only a fix where CI actually judges the change's commit.
   // The check is a no-op gate if the step omits `--ref` (the merged tree is read
   // again) or if the checkout cannot see the head commit. Both are asserted here
@@ -231,14 +263,21 @@ try {
       const next = rest.slice(1).search(/\n  [a-z][a-z0-9-]*:\n/);
       return next < 0 ? rest : rest.slice(0, next + 1);
     })();
-    expect("(w1) ci.yml's `verify` job exists", verifyBlock !== null, true);
+    expect("(w0) ci.yml's `verify` job exists", verifyBlock !== null, true);
     if (verifyBlock) {
+      // ⛔ COMMENT LINES ARE STRIPPED FIRST. These comments quote the very
+      // literals asserted below (`--ref …`, `fetch-depth: 2`, this suite's
+      // filename), so a substring test over the raw block stays TRUE after the
+      // run lines are deleted — an assertion that cannot fail, guarding the one
+      // failure it exists for (review P2, 2026-10-25). Only executable YAML is
+      // searched, so each assertion is falsified by removing what it names.
+      const live = verifyBlock.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
       expect("(w1) …judges freshness on the PR HEAD COMMIT, not the synthetic merge",
-        verifyBlock.includes('test-sanctioned-identity.mjs --ref "${{ github.event.pull_request.head.sha }}"'), true);
+        live.includes('test-sanctioned-identity.mjs --ref "${{ github.event.pull_request.head.sha }}"'), true);
       expect("(w2) …and its checkout carries the merge commit's two parents (fetch-depth: 2), so the head tree is present",
-        verifyBlock.includes("fetch-depth: 2"), true);
+        /actions\/checkout@v4\n\s+with:\n(?:\s+#.*\n)*\s+fetch-depth: 2/.test(live), true);
       expect("(w3) …and this suite runs in the same job (an unwired suite passes by never running)",
-        verifyBlock.includes("test-sanctioned-pin-merge-base.mjs"), true);
+        /^\s+(?:run:|- run:)\s*node extensions\/main-worktree-guard\/test-sanctioned-pin-merge-base\.mjs\s*$/m.test(live), true);
     }
     expect("(w4) the post-merge lane collects this suite by the extensions/*/test*.mjs glob",
       /(^|\/)test[^/]*\.mjs$/.test("extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs"), true);

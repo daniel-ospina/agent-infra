@@ -112,6 +112,29 @@ export function gitTree(root, rev) {
   };
 }
 
+/**
+ * `parseRefArg(argv)` — the gate's ONE way to choose the tree under test.
+ *
+ * `--ref <rev>` names a COMMIT; its absence means the working tree. An empty or
+ * missing value is an ERROR, never "fall back to the working tree": that fallback
+ * is indistinguishable from a green run (review P2, 2026-10-25 — `--ref ""` passed
+ * while reading the very merged tree this change exists to stop reading), and a
+ * check that cannot read its reference must never report a PASS about another
+ * tree. There is deliberately no environment-variable spelling: an ambient
+ * variable would let the tree under test be redirected without appearing in the
+ * command the workflow runs.
+ */
+export function parseRefArg(argv) {
+  const cut = argv.includes("--cut");
+  const at = argv.indexOf("--ref");
+  if (at < 0) return { cut, ref: null };
+  const value = argv[at + 1];
+  if (typeof value !== "string" || value === "" || value.startsWith("--")) {
+    throw new Error("--ref requires a non-empty <rev> (omit --ref entirely to judge the working tree)");
+  }
+  return { cut, ref: value };
+}
+
 /** The sanctioned LEAF relpaths, read from `index.ts` in `tree`. */
 export function sanctionedPaths(tree) {
   const src = tree.read(INDEX_REL);
@@ -224,6 +247,15 @@ export function pinReport(tree) {
     ...Object.keys(report.delegates)
       .filter((r) => !tree.has(r) || report.delegates[r] !== sha256(tree.read(r)))
       .map((r) => `${r} (delegate)`),
+    // BOTH directions of the closure. The loop above asks "is every delegate the
+    // PIN names still the bytes beside it?"; this asks "is every helper the scripts
+    // actually EXECUTE still pinned?" — the direction that catches a pin edited to
+    // drop a delegate (the `ci_exemption.py` class). Without it `stale` reports
+    // fresh for a pin whose closure shrank, and any caller that trusts `stale`
+    // alone turns that into a false PASS (review P2, 2026-10-25).
+    ...Object.keys(report.closure)
+      .filter((r) => typeof report.delegates[r] !== "string")
+      .map((r) => `${r} (unpinned delegate)`),
   ];
   return report;
 }
