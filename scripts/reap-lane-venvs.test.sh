@@ -1125,12 +1125,23 @@ K7_CANON="$(canon "$W_K7")"
   done
   printf '5100 1 /usr/bin/python3 %s/.venv/bin/python\n' "$K7_CANON"
 } > "$T/k7-ps.txt"
+: > "$T/reap.log"   # the log is APPEND-ONLY across the whole suite: read only THIS pass
 out="$(run_shimmed FAKE_PS_TABLE="$T/k7-ps.txt" FAKE_LSOF_FAIL=1 \
         REAP_VENV_PROC_ROOT="$T/no-proc" REAP_VENV_ALLOW_DEGRADED_CWD=1 FAKE_ETIMES=600 \
         --worktree "$W_K7" --apply)"
 assert_contains "$out" "KEEP" "the scan reaches the FIFTH holder and keeps the env (the cap does not truncate)"
 assert_contains "$out" "live-argv" "…and the verdict names the argv witness that decided it"
 exists "$W_K7/.venv" "the env survives — an idle shell and a working lane share the worktree"
+# ⛔ AND THE SCAN WAS NOT TRUNCATED (review round 3, P2). Mutation-verified: reverting the cap to the
+# round-2 form (cwd+tmux only) left this arm GREEN, because a truncation prints `live-argv` for the
+# fifth holder too — byte-identical to reaching it. The pass log's `TRUNCATED` line is the ONLY
+# observable that separates "the cap holds" from "the cap cut the scan short and we got lucky", so the
+# assertion has to read it, and its ABSENCE is the claim.
+if grep -q 'stale-shell-scan TRUNCATED' "$T/reap.log" 2>/dev/null; then
+  bad "…but the scan WAS truncated (reap.log names it) — the cap cut the witness list short"
+else
+  ok "…and the scan was NOT truncated, so the cap cannot hide a holder behind a lucky witness (log clean)"
+fi
 
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
