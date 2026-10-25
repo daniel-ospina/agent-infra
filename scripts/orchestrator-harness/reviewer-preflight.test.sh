@@ -503,54 +503,74 @@ echo "§F.5 NON-VACUITY — composer-level: drop ONE requirement and the asserti
 STRIP="$TMP/strip"; mkdir -p "$STRIP"
 cp "$HERE/spawn-gate.sh" "$STRIP/spawn-gate.sh"
 cp "$LANE" "$STRIP/lane.sh"
-# ⛔ THE RIG MUST CARRY THE IDENTITY MODULE, AND ITS CWD MUST BE A CHECKOUT OF THE REPO IT NAMES
-# (#2724 follow-up, found by review). `lane.sh` sources `repo-target.sh` from ITS OWN directory and
-# exits 78 when it is absent, and it then asserts the origin slug AND the branch (72). Both rigs used
-# to `cd "$TMP"`, which §C leaves checked out on `fix/2148-reviewer-preflight`, so even with the
-# module copied the lane refused with `branch-checkout-mismatch` and composed NOTHING — the two arms
-# below then PASSED because the artifact was missing, which is precisely the vacuity this section
-# exists to disprove (an absent artifact is indistinguishable from a successful strip).
+# ⛔ THE RIG MUST CARRY THE MODULE THE LANE HARD-REQUIRES, AND ITS CWD MUST PASS THE REPO GATE
+# (#2724 follow-up; the cause was MEASURED, not guessed). `lane.sh` sources `repo-target.sh` from ITS
+# OWN directory and exits 78 without it; it then exits 78 AGAIN when `brief-gate.sh` cannot be resolved
+# (#2258), and `brief_gate_lib` looks only in `$O`, `$SELF`, `$AGENT_INFRA_PATH/...` and
+# `~/.pi/agent/scripts` — none of which exist on a CI runner or under a hidden HOME. That was the real
+# reason this section composed NOTHING in CI (`rc=78 brief-gate.sh not found`, measured) while it passed
+# on a dev box whose `~/.pi/agent/scripts` supplied the fallback; with no brief, the arms below reported
+# ✅ on nothing — the vacuity this section exists to disprove. Same rule as `spawn-gate.test.sh`'s rig:
+# copy the validator in, so resolution cannot depend on the box. The identity module is copied too.
 cp "$HERE/repo-target.sh" "$STRIP/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP/repo-slug.sh"
+cp "$HERE/brief-gate.sh" "$STRIP/brief-gate.sh"
 sed '/^- \*\*\[d\] plan evidence\*\*/,+2d' "$HELPER" > "$STRIP/reviewer-preflight.sh"
 [ -s "$STRIP/reviewer-preflight.sh" ]; ck $? "the stripped helper copy was produced"
-# A checkout BORN on the branch the lane is told it is on (no `git checkout`, so no branch state is
-# ever mutated to build a fixture) with a real origin slug, so the gate is satisfied by identity and
-# the assertion under test is the brief's, not the repo's.
-STRIPREPO="$TMP/strip-repo"; mkdir -p "$STRIPREPO" "$TMP/o3/logs"
-git -c init.defaultBranch=fix/strip init -q "$STRIPREPO" 2>/dev/null \
-  && git -C "$STRIPREPO" remote add origin https://github.com/acme/widget.git 2>/dev/null \
-  && git -C "$STRIPREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null
+# The cwd is the §C fixture — a checkout of `acme/widget` that this suite already proves works in CI —
+# told it is on a DIFFERENT branch. Both branch refs are created from its own HEAD and the worktree is
+# DETACHED: a detached HEAD is an allowed lane shape, so the repo gate is satisfied by IDENTITY while
+# the assertion under test stays the brief's. `update-ref` + detach, never a branch SWITCH, so building
+# the rig cannot leave the fixture on some third branch.
+for _rigbr in fix/strip fix/strip2; do
+  git -C "$TMP" update-ref "refs/heads/$_rigbr" HEAD 2>/dev/null || true
+done
+git -C "$TMP" checkout -q --detach 2>/dev/null || true
+git -C "$TMP" rev-parse --verify -q refs/heads/fix/strip >/dev/null 2>&1 \
+  && git -C "$TMP" rev-parse --verify -q refs/heads/fix/strip2 >/dev/null 2>&1 \
+  && [ -z "$(git -C "$TMP" symbolic-ref -q --short HEAD 2>/dev/null || true)" ]
+ck $? "the non-vacuity fixture is DETACHED with both branch refs present (the lane's repo gate cannot be what refuses)"
+mkdir -p "$TMP/o3/logs"
 (
-  cd "$STRIPREPO" || exit 1
+  cd "$TMP" || exit 1
   O="$TMP/o3" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     bash "$STRIP/lane.sh" 2325 fix/strip acme/widget
-) >/dev/null 2>&1
+) >"$TMP/o3/lane.out" 2>&1
+_rc3=$?
 STRIPPED="$(cat "$TMP/o3/logs/prompt-2325.txt" 2>/dev/null || true)"
+# ⛔ NAME THE REASON ON THE SPOT (a rig that silently composes nothing is what hid the defect): the
+# lane's own stdout/stderr is printed the moment the artifact is absent, so the CI log says WHY.
+if [ -z "$STRIPPED" ]; then echo "  · [d]-strip lane refused/failed (rc=$_rc3) — its output follows:"; sed -n '1,6p' "$TMP/o3/lane.out"; fi
+# ⛔ COMPOSITION IS A PRECONDITION OF THE ARM, NOT A NOTE BESIDE IT (review, P2). `has_req_d ""` fails by
+# construction, so this arm was GREEN on an empty file — it could not tell "stripped correctly" from
+# "composed nothing", which is the exact sentence in the comment above. A rig that produced no brief now
+# fails the arm that claims it.
+_composed3=1; [ -n "$STRIPPED" ] || _composed3=0
 has_req_d "$STRIPPED"; rc=$?
-[ "$rc" -ne 0 ]; ck $? "⛔ removing the [d] bullet from the composer MAKES the §F.1 [d] assertion FAIL (non-vacuous)"
+[ "$_composed3" = "1" ] && [ "$rc" -ne 0 ]; ck $? "⛔ removing the [d] bullet from the composer MAKES the §F.1 [d] assertion FAIL (non-vacuous, and the rig composed a brief)"
 has_req_a "$STRIPPED" && has_req_e "$STRIPPED"; ck $? "…and the untouched requirements still pass (the control is targeted, not a broken fixture)"
 # …and the same control for the HEAD-BINDING sentence, which is the rule a lane most needs.
 STRIP2="$TMP/strip2"; mkdir -p "$STRIP2"
 cp "$HERE/spawn-gate.sh" "$STRIP2/spawn-gate.sh"; cp "$LANE" "$STRIP2/lane.sh"
 cp "$HERE/repo-target.sh" "$STRIP2/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP2/repo-slug.sh"
+cp "$HERE/brief-gate.sh" "$STRIP2/brief-gate.sh"
 sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
 [ -s "$STRIP2/reviewer-preflight.sh" ]; ck $? "the head-binding-stripped helper copy was produced"
-STRIPREPO2="$TMP/strip2-repo"; mkdir -p "$STRIPREPO2" "$TMP/o4/logs"
-git -c init.defaultBranch=fix/strip2 init -q "$STRIPREPO2" 2>/dev/null \
-  && git -C "$STRIPREPO2" remote add origin https://github.com/acme/widget.git 2>/dev/null \
-  && git -C "$STRIPREPO2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null
+mkdir -p "$TMP/o4/logs"
 (
-  cd "$STRIPREPO2" || exit 1
+  cd "$TMP" || exit 1
   O="$TMP/o4" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     bash "$STRIP2/lane.sh" 2325 fix/strip2 acme/widget
-) >/dev/null 2>&1
+) >"$TMP/o4/lane.out" 2>&1
+_rc4=$?
 STRIPPED2="$(cat "$TMP/o4/logs/prompt-2325.txt" 2>/dev/null || true)"
+if [ -z "$STRIPPED2" ]; then echo "  · head-binding strip lane refused/failed (rc=$_rc4) — its output follows:"; sed -n '1,6p' "$TMP/o4/lane.out"; fi
 # ⛔ THE FIXTURE MUST HAVE COMPOSED (review, P2): an absent/empty artifact is indistinguishable from a
 # successful strip, so this control asserts the ONE-THING-CHANGED shape: the other requirements are
 # still on the brief, and only the stripped sentence is gone.
 has_req_a "$STRIPPED2" && has_req_e "$STRIPPED2"; ck $? "the head-binding fixture still composed a brief with [a] and [e] (not an empty file)"
 case "$STRIPPED2" in *"a moved head must be RE-RECORDED at the new head"*) rc=0;; *) rc=1;; esac
-[ "$rc" -ne 0 ]; ck $? "⛔ removing the HEAD-BINDING sentence MAKES the §F.1 head-binding assertion FAIL"
+_composed4=1; [ -n "$STRIPPED2" ] || _composed4=0
+[ "$_composed4" = "1" ] && [ "$rc" -ne 0 ]; ck $? "⛔ removing the HEAD-BINDING sentence MAKES the §F.1 head-binding assertion FAIL (and the rig composed a brief)"
 
 echo
 
