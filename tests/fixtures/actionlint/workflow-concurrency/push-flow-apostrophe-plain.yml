@@ -1,0 +1,15 @@
+# An apostrophe preceded by a SPACE inside a plain flow scalar (`shell 'em out`) is ordinary text, not
+# a quote. Opening a phantom string there swallowed the separating comma, so `cancel-in-progress: true`
+# was never read and R2's absent-key arm took the non-cancelling default — GREEN on a main-branch
+# workflow that cancels. The reader now opens a quote in a flow mapping ONLY at a value position, and
+# falls back to an unquoted split when a quote never closes (#2660 round 13).
+name: push flow apostrophe plain
+on:
+  push:
+    branches: [main]
+concurrency: {group: shell 'em out, cancel-in-progress: true}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

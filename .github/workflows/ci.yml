@@ -223,6 +223,10 @@ jobs:
         # green while the real module drifts. The suite lives here, loads the
         # canonical file BY LOCATION and pins `__file__` to it. This step is what
         # keeps it non-inert — an unwired suite passes in CI by never running.
+        # #2139 — `scripts/test_beta_progress.py` is named for the same reason as the two
+        # suites above: the DELIVERY line's REST second source lives in a file CI could not
+        # execute, so the fallback, the same-source rule and the paged window were pinned by
+        # nothing. A suite the repo does not RUN is a suite it does not HAVE.
         # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
         # #1552 — `scripts/test_objective.py` and `scripts/test_turn_classify_state.py`
         # are named here for the SAME reason: both lived ONLY on the laptop
@@ -230,7 +234,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -244,6 +248,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # #2818 — the pin-freshness gate below judges the PR's OWN COMMIT, not
+          # the synthetic merge GitHub checks out for `pull_request` (a merge
+          # result mixes the branch's pin with `main`'s scripts, so the verdict
+          # tracked how far `main` had moved). Depth 2 = the merge commit plus its
+          # two parents, i.e. the head tree, without a full clone.
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -403,6 +414,31 @@ jobs:
         # second command in the step above — sequencing would suppress one
         # verdict when the other fails (the same rule as every suite here).
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
+      - name: Dispatch-preflight suite (zero-dep)
+        # The complementary question to the successor preflight above: that tool
+        # asks "is a predecessor still ALIVE", this one asks "is there anything
+        # left to LAND". Measured 2026-10-18: 12 of 15 dispatched worktrees sat on
+        # a HEAD that origin/main already contained, and ALL 12 produced +0 commits
+        # — a whole lane spent discovering there was nothing to do. The suite is
+        # zero-dep and hermetic (temp git repos, a refs/remotes/origin/main base,
+        # no network, and the process's GIT_* environment cleared so a leaked
+        # GIT_DIR cannot redirect a fixture into the caller's repo), and it carries
+        # its own RED control: 16 mutations of the shipped file (the contained-delta
+        # read skipped, the merge result trusted on its own, a merge conflict
+        # treated as an error, an unsupported merge-tree losing its name, a
+        # `--help` exit reported as HAS-WORK, dirty files ignored,
+        # `--untracked-files=normal` dropped, dirty gated behind base resolution,
+        # the work-tree-root identity check dropped, and six fail-closed reads
+        # turned into HAS-WORK) must each turn their paired leg RED. The control
+        # refuses to run at all if the unmutated suite is not green.
+        # Visible, not merge-blocking, for the same reason as its sibling above:
+        # `pipeline-compliance` is the repo's only required check.
+        run: python3.12 tools/fleet/dispatch_preflight.test.py
+      - name: Dispatch-preflight mutation evidence (zero-dep)
+        # Its own step, not a second command in the step above — sequencing would
+        # suppress one verdict when the other fails (the rule every suite here
+        # follows).
+        run: python3.12 tools/fleet/dispatch_preflight.test.py --red-control
       - name: fleet-health REAPER-table suite (#1862, zero-dep)
         # #1862 — the restored orphan reaper (`com.eldato.pi-reap-orphans`) is installed
         # unconditionally by install-launchd.sh, but `fleet-health.py`'s `reaper_section()` reads a
@@ -787,10 +823,38 @@ jobs:
         # them executes by its own location — without re-cutting
         # `sanctioned-scripts.pin.json` reds here, so a stale pin cannot reach
         # main and silently block the rail.
-        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~2s. Its own step
+        #
+        # ⛔ #2818 — `--ref` is the whole fix for the treadmill. Without it the
+        # gate reads the pin and the scripts out of the SAME CHECKOUT, which here
+        # is GitHub's synthetic MERGE of head onto the base TIP: a merge result
+        # takes each file from whichever side changed it, so a branch that re-cut
+        # its pin beside ITS OWN sanctioned-script edit carried that pin next to
+        # scripts an unrelated merge had since changed — red until someone re-cut,
+        # and every new merge re-opened it on every other open PR. Naming the head
+        # commit answers the question the gate exists to answer ("did THIS change
+        # drift the sanctioned surface without re-cutting?"), which no unrelated
+        # merge can invalidate. The polarity is unchanged and is pinned by
+        # `test-sanctioned-pin-merge-base.mjs`: untouched surface ⇒ pass however
+        # far main moved; edited surface without a re-cut ⇒ fail; edited +
+        # re-cut ⇒ pass.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~3s. Its own step
         # for the same reason as the suite above: the `extensions/*/test*.mjs`
         # glob in ci-main.yml is POST-MERGE only.
-        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs
+        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs --ref "${{ github.event.pull_request.head.sha }}"
+      - name: main-worktree-guard pin freshness is a property of ONE commit (#2818)
+        # The non-vacuity rig for the line above. Hermetic git repos build the
+        # treadmill: a branch re-cuts its pin beside its OWN sanctioned-script
+        # edit, an unrelated merge moves another sanctioned script on `main`, and
+        # the merge GitHub would build then carries the branch's pin beside main's
+        # scripts. Asserts (a) the change PASSES judged on its own commit; (a′)
+        # the SAME change FAILS judged on the merged tree — the pre-#2818 reading,
+        # so dropping `--ref` reds this suite instead of silently restoring the
+        # treadmill; (b) an edit without a re-cut still FAILS; (b′) a deletion
+        # without one still FAILS; (c) edit + re-cut PASSES, base moved or not.
+        # It also asserts this wiring (`--ref`, `fetch-depth: 2`, this step),
+        # because an unwired suite passes by never running.
+        # Zero-dep (`node:*` + the `git` binary), ~2s.
+        run: node extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked

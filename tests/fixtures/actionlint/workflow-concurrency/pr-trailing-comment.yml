@@ -1,0 +1,15 @@
+# FAILURE-CLASS FIXTURE (positive): a trailing comment that itself contains a `#` (this repo cites
+# `#2474` in comments constantly). Stripping only up to the FIRST `#` leaves the comment text in the
+# value, so a correct declaration is refused and the refusal quotes prose as if it were the value
+# (round-3 P2).
+name: pr-trailing-comment
+on:
+  pull_request:
+concurrency:
+  group: pr-trailing-comment-${{ github.ref }}
+  cancel-in-progress: true   # never cancel on main (#2474)
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

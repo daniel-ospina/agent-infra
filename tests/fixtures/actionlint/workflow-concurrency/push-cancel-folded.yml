@@ -1,0 +1,15 @@
+# The same value as a folded block scalar. Unreadable-in-silence is the dangerous direction for a
+# push workflow: the safe default is the one being violated (#2660 round 4).
+name: Push cancel folded
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: push-cancel-folded-${{ github.ref }}
+  cancel-in-progress: >-
+    true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
