@@ -1,0 +1,8 @@
+# A job written as a FLOW mapping hides its `concurrency:` from a line-prefix test, so a JOB-level
+# block (which GitHub honours and this check does not model) went unreported (#2660 round 7).
+name: Push job flow value
+on:
+  push:
+    branches: [main]
+jobs:
+  build: {runs-on: ubuntu-latest, concurrency: {group: push-job-flow-value, cancel-in-progress: true}}

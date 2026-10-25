@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off runs in ci.yml's `drift-check` job (PR lane only - no post-merge site, agent-infra#2610); a shard here would be a second run site (#2439)
 # #305 — drift-check CI-mode tests.
 #
 # Verifies the tiered `agent-infra check --ci` semantics that the reusable

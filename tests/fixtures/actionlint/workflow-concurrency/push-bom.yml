@@ -1,0 +1,12 @@
+﻿concurrency:
+  group: push-bom-${{ github.ref }}
+  cancel-in-progress: true
+name: Push bom
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
