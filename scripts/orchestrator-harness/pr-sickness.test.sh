@@ -29,8 +29,8 @@ PASS=0; FAIL=0
 ok()  { echo "  ✅ $1"; PASS=$((PASS+1)); }
 bad() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 eq()  { [ "$1" = "$2" ] && ok "$3" || bad "$3 (got '$1', want '$2')"; }
-has() { printf '%s' "$1" | grep -qF -- "$2" && ok "$3" || bad "$3 (missing '$2')"; }
-no()  { printf '%s' "$1" | grep -qF -- "$2" && bad "$3 (FOUND '$2')" || ok "$3"; }
+has() { grep -qF -- "$2" <<<"$1" && ok "$3" || bad "$3 (missing '$2')"; }
+no()  { grep -qF -- "$2" <<<"$1" && bad "$3 (FOUND '$2')" || ok "$3"; }
 
 # ── the fake `gh`: one binary, both surfaces (api + run view) ────────────────────────────────────
 cat > "$TMP/bin/gh" <<'GH'
@@ -524,7 +524,7 @@ m="$(mut noRed 'RED*) ;;' 'RED*) printf "skip #%s: green\n" "$pr"; return 1 ;;')
 if [ -n "$m" ] && [ -f "$m" ]; then
   reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
   out="$(run_pass "$m")"
-  printf '%s' "$out" | grep -q ' -> dispatch' && bad "(a) still dispatches with the RED arm mutated — vacuous" \
+  grep -q ' -> dispatch' <<<"$out" && bad "(a) still dispatches with the RED arm mutated — vacuous" \
     || ok "(a) FAILS when the RED arm is removed (no work item emitted)"
 else bad "could not build the (a) mutant"; fi
 # (b) the holder gate removed ⇒ a second spawn while the fixer is alive
