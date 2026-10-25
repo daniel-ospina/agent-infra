@@ -97,24 +97,30 @@ esac
 # duplicate dispatch this file exists to prevent happens anyway. The arithmetic, from the shipped
 # defaults (orch-loop.sh's LANE_TIMEOUT is orch-loop.sh's own variable and is NOT readable here):
 #
-#   lane (LANE_TIMEOUT)            2400s   (~40 min — spawn-gate.sh's wall clock)
+#   lane (LANE_TIMEOUT)            3300s   (~55 min — spawn-gate.sh's wall clock; raised from 2400
+#                                            when a lane took ownership of its merge, #2029)
 #   chain-merge.sh waits for the PR 5400s  (90 x 60s) — it exits AT ONCE when the lane recorded a
 #                                           capacity refusal, releasing this claim within a poll
 #                                           interval (agent-infra#1909), so the ceiling below is a
 #                                           ceiling and no longer the normal cost of a refused lane
+#   chain-merge.sh merge-phase wait 1890s  (LANE_PHASE_GRACE 90 + LANE_HANDOFF_WAIT 1800, #2029)
 #   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + the 1200s bound)
 #                                 ------  =======
-#                                 10800s  (3 h)
+#                                 13590s  -> 14400s (4 h)
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
-# box dies mid-lane. Raising LANE_TIMEOUT without raising this leaves a claim that expires before
-# the lane finishes — override CLAIM_ISSUE_TTL (env, or the cell's keys.env) at the same time.
+# box dies mid-lane. ⛔ RAISING ANY TERM OF THIS SUM WITHOUT RAISING THIS LEAVES A CLAIM THAT EXPIRES
+# BEFORE THE LANE FINISHES — a peer then reads the claim as free and reclaims it, which is the
+# DUPLICATE DISPATCH this file exists to prevent (agent-infra#1850). #2029 raised TWO terms
+# (LANE_TIMEOUT +900s, and the new merge-phase wait +1890s) and this default moved with them in the
+# same commit; any future change to one of the four must do the same, or override CLAIM_ISSUE_TTL
+# (env, or the cell's keys.env).
 # The same digit clamp as CLAIM_TTL: an unparseable lease is worse than the default (see above).
-CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-10800}"
+CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-14400}"
 case "${CLAIM_ISSUE_TTL:-}" in
-  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=10800 ;;
-  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=10800 ;;
+  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=14400 ;;
+  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=14400 ;;
 esac
 
 # ── THE LEASE CEILING (agent-infra#2094) ──────────────────────────────────────────────────────

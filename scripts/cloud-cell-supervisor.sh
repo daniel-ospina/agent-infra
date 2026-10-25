@@ -1539,8 +1539,13 @@ linked_worktree_of() {
 # `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
 # allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
 # worktree of $HARNESS_REPO, an empty directory, a pin ROOT holding only hex-named pin dirs, or a root
-# whose only other entries are OS droppings (`​.DS_Store` / `._*` REGULAR files — one Finder visit to the
-# default root must not brick the cell; a hidden DIRECTORY or a dangling symlink is still refused).
+# whose only other entries are ONE OF TWO ENUMERATED classes of REGULAR, NON-SYMLINK file: OS droppings
+# (​`.DS_Store` / `._*` — one Finder visit to the default root must not brick the cell) and the harness's
+# OWN named records (`.agent-infra-version`, `AGENTS.md`, `MEMORY.md`, `README.md`, `VENDOR.md`,
+# `HARNESS-PIN`, `manifest.json`, `package.json` — agent-infra#2812: a shipped sibling component writes
+# into this root, so refusing them kept the cell unstartable for ever, once per 10-minute tick).
+# ⛔ Both classes are NAMED, never "any file", and THIS header is the whole allow-list: a hidden
+# DIRECTORY, a dangling symlink, a symlink wearing an allowed NAME, and any unlisted entry are refused.
 #
 # Is $1 a NAME `apply` could have produced for a pin directory? `apply` names each pin by the hex of
 # the commit it pins to (`cut -c1-12` below), but the LENGTH is a MOVING CONVENTION, not a property
@@ -1626,10 +1631,13 @@ pin_path_real() {
 # ⛔ The enumeration is `ls -A`, not a `"$dir"/*` glob: a glob skips HIDDEN entries and dangling
 # symlinks, so a root whose only entry was `.DS_Store` read as EMPTY-AND-SAFE on the check side while
 # the delete side refused the same root — the same false pass, one branch over. `ls -A` sees every
-# entry, and each one must be a hex-named directory — EXCEPT an OS-droppings regular file
-# (`.DS_Store` / `._*`), which is skipped: refusing it bricked all four verbs after a single Finder
-# visit to the default root on the operators' macOS server (see the header above, which states the
-# whole allow-list; this line is the one it is easiest to contradict by accident).
+# entry, and each one must be a hex-named directory — EXCEPT two ENUMERATED classes of regular,
+# NON-SYMLINK file: OS droppings (`.DS_Store` / `._*`) and the harness's OWN named records (below).
+# Refusing the first bricked all four verbs after a single Finder visit to the default root on the
+# operators' macOS server; refusing the second bricked the cell permanently against a shipped sibling
+# component. (See the header above, which states the whole allow-list; this line is the one it is
+# easiest to contradict by accident.) ⛔ Both classes are NAMED, never "any file": an unlisted entry
+# is still refused, which is the whole point of the guard.
 # ⛔ Deliberately NOT a per-entry `git worktree list` path comparison: on macOS a `$TMPDIR`-derived
 # path carries a `//` that git normalizes in its listing output, so a literal comparison reports our
 # OWN pin as foreign and the guard becomes a false block.
@@ -1675,6 +1683,12 @@ pin_root_conformance() {
     # root from reaching the cannot-verify branch below: there is nothing of ours in it to protect.
     case "$p" in
       .DS_Store|._*) if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
+      # ⛔ HARNESS METADATA IS NOT A STRAY (#2812): `harness-apply` records the commit it converged
+      # this box to INSIDE the pin root, so the guard refused forever and the entry returns on every
+      # 10-minute tick — "remove it by hand" is not a remedy. Named explicitly, so an UNKNOWN entry is
+      # still refused.
+      .agent-infra-version|AGENTS.md|MEMORY.md|README.md|VENDOR.md|HARNESS-PIN|manifest.json|package.json)
+        if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
     esac
     entries=$((entries + 1))
     if [ ! -d "$dir/$p" ] || ! pin_name_ok "$p"; then
@@ -2125,6 +2139,10 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
+  # lane.sh's prompt EXECUTES lane-merge.sh for the merge phase and merge-rate.sh for the
+  # before/after measurement (#2029), so a $O missing either makes every lane's merge phase exit 127
+  # while this check still printed "CELL CAN RUN A CONTROLLER" — the false PASS this list exists to
+  # prevent. Keep this list in step with install.sh's DRIFTED list (which seeds $O from it).
   # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
   # calls it for the process pass. A $O without it still runs (the census falls back to the launch
   # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
@@ -2132,10 +2150,13 @@ cmd_check() {
   # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
   # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
   # reports success.
+  # UNION of both sides of this merge (neither is a superset): lane-merge.sh + merge-rate.sh from this
+  # branch (#2029), lane-reap.sh from origin/main (#2163). Taking either alone leaves a worker the
+  # controller executes unseeded, which is the false PASS above.
   # repo-target.sh (#2724/#2694) is SOURCED by lane.sh, dispatch-merge.sh, fix-one.sh and adopt-fix.sh;
   # all four `exit 78` without it, so its absence would make every dispatch refuse at startup while
   # `check` still certified the cell — the same false PASS one layer down.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
@@ -3875,7 +3896,8 @@ cmd_prune() {
     # subdirectory of a misconfigured root: `HARNESS_PIN_DIR=$CELL_HOME` deleted the cell home and its
     # state dir BEFORE the guard in `harness_apply` could fire. `assert_pin_dir_safe` refuses any root
     # that is not an empty dir, a linked worktree, or a pin root of hex-named directories (plus a root
-    # whose only other entries are `.DS_Store`/`._*` regular files — see its header for the allow-list).
+    # whose only other entries are `.DS_Store`/`._*` regular files or the harness's OWN named records —
+    # see its header for the whole allow-list).
     assert_pin_dir_safe "$HARNESS_PIN_DIR"
     if linked_worktree_of "$HARNESS_REPO" "$HARNESS_PIN_DIR"; then
       # The legacy FLAT PIN: the root IS the live worktree, so `"$HARNESS_PIN_DIR"/*/` would enumerate

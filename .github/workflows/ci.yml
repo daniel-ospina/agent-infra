@@ -248,6 +248,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # #2818 — the pin-freshness gate below judges the PR's OWN COMMIT, not
+          # the synthetic merge GitHub checks out for `pull_request` (a merge
+          # result mixes the branch's pin with `main`'s scripts, so the verdict
+          # tracked how far `main` had moved). Depth 2 = the merge commit plus its
+          # two parents, i.e. the head tree, without a full clone.
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -816,10 +823,38 @@ jobs:
         # them executes by its own location — without re-cutting
         # `sanctioned-scripts.pin.json` reds here, so a stale pin cannot reach
         # main and silently block the rail.
-        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~2s. Its own step
+        #
+        # ⛔ #2818 — `--ref` is the whole fix for the treadmill. Without it the
+        # gate reads the pin and the scripts out of the SAME CHECKOUT, which here
+        # is GitHub's synthetic MERGE of head onto the base TIP: a merge result
+        # takes each file from whichever side changed it, so a branch that re-cut
+        # its pin beside ITS OWN sanctioned-script edit carried that pin next to
+        # scripts an unrelated merge had since changed — red until someone re-cut,
+        # and every new merge re-opened it on every other open PR. Naming the head
+        # commit answers the question the gate exists to answer ("did THIS change
+        # drift the sanctioned surface without re-cutting?"), which no unrelated
+        # merge can invalidate. The polarity is unchanged and is pinned by
+        # `test-sanctioned-pin-merge-base.mjs`: untouched surface ⇒ pass however
+        # far main moved; edited surface without a re-cut ⇒ fail; edited +
+        # re-cut ⇒ pass.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~3s. Its own step
         # for the same reason as the suite above: the `extensions/*/test*.mjs`
         # glob in ci-main.yml is POST-MERGE only.
-        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs
+        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs --ref "${{ github.event.pull_request.head.sha }}"
+      - name: main-worktree-guard pin freshness is a property of ONE commit (#2818)
+        # The non-vacuity rig for the line above. Hermetic git repos build the
+        # treadmill: a branch re-cuts its pin beside its OWN sanctioned-script
+        # edit, an unrelated merge moves another sanctioned script on `main`, and
+        # the merge GitHub would build then carries the branch's pin beside main's
+        # scripts. Asserts (a) the change PASSES judged on its own commit; (a′)
+        # the SAME change FAILS judged on the merged tree — the pre-#2818 reading,
+        # so dropping `--ref` reds this suite instead of silently restoring the
+        # treadmill; (b) an edit without a re-cut still FAILS; (b′) a deletion
+        # without one still FAILS; (c) edit + re-cut PASSES, base moved or not.
+        # It also asserts this wiring (`--ref`, `fetch-depth: 2`, this step),
+        # because an unwired suite passes by never running.
+        # Zero-dep (`node:*` + the `git` binary), ~2s.
+        run: node extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked
