@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-09-20
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup
+aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup, workspace-ownership, dispatch-target, lane-dispatch
 ---
 
 # Fleet session liveness (#1178)
@@ -39,6 +39,11 @@ liveness rule: it is documented in `docs/ops/pi-idle-repl-reaper-policy.md`. **A
 here cannot kill anything** — `lane_liveness.py` never calls `os.kill`. The kill path is the separate,
 own-account reaper `scripts/orchestrator-harness/pi-done-not-exited.py` (see the table above): it is
 gated on the recorded host decision and signals nothing unless `--authorise-hostless` is passed.
+
+**Whose session is it? (§2a).** Liveness is not the same question as **ownership**: a lane can be
+provably alive and still be the OWNER's, which is what decides whether a dispatcher may type into
+it. That rule lives in its own section (§2a) because getting it wrong does not produce a wrong
+label — it produces a dispatch into the owner's own work.
 
 ---
 
@@ -173,6 +178,140 @@ The mirror failure is real too: a working child was once declared `wedged` with
 > liveness must therefore be the tracked, tested, reviewed artifact
 > (`tools/fleet/liveness.py`), not a lone state-directory script. Unit 4 (rewiring the three
 > consumers) is blocked on a decision about their repo home and is **not** done.
+
+---
+
+### 2a. Ownership — whose workspace is it? (identity is EVIDENCE, not a name list)
+
+> **The rule:** a workspace is a **fleet lane** only when that is *demonstrable*. Everything else is
+> the **owner's**, and the owner's is protected by default. Owner ruling, 2026-10-20: *"we shouldn't
+> use a stale list of workspaces [...] we use a decision tree that was designed to know what lane has
+> WIP and which not."*
+
+This is a different question from liveness: a lane can be provably alive (§1) and still not be ours
+to dispatch into. There are two demonstrable forms:
+
+| evidence | where it comes from |
+|---|---|
+| the session cwd is a **fleet worktree** — a **real linked** worktree under `.../.worktrees/<name>` (a `.git` FILE whose `gitdir:` points at `<main>/.git/worktrees/<name>`, which is what `git worktree add` writes), or `<$FLEET_HOME>/wt-<slug>` | `lane-status.py` publishes cmux's own `current_directory` on every snapshot row |
+| the cwd carries a **fleet spawn marker** — `$O/bg/<name>.started` naming its `worktree=`, where that path is itself a **real linked worktree** (a `.git` FILE pointing at `<main>/.git/worktrees/<name>`) | `nonblocking-dispatch.sh`, when it backgrounds a worker; a marker whose directory no longer exists is ignored, and so is one naming a plain directory or a main checkout (`.git` as a DIR) — the writer only checks `-d`, so a marker is evidence about a *worktree*, never about a container |
+
+The cwd is **resolved** (`realpath`: `..` collapsed, symlinks followed) before it is judged, so a
+path that only *spells* like a lane is not one — and being *named* is never enough on its own. The
+path must be inside a real linked worktree, which means its `.git` is a **file pointing at
+`<main>/.git/worktrees/<name>`** — the pointer `git worktree add` writes. A plain directory of that
+name is not a lane, and neither is a `.git` file written by `git submodule` or `git init
+--separate-git-dir` (they point at `…/.git/modules/<name>` or a custom dir).
+
+**The `wt-<slug>` shape is anchored to the roots the fleet actually writes in**, not to a list of
+homes: `$FLEET_HOME` / `$CELL_HOME` / `$FLEET_CELL_HOME`, `$HOME`, the cell home, **and the temp
+root**. The temp root is measured, not a convenience: the fleet's own recipe is
+`git worktree add /tmp/wt-<slug>`, and the reap log (`state/pi-reap-worktrees.log`) records `/tmp/wt-*`
+lanes whose `.git` file points at a cell checkout (`gitdir: /tmp/cell-t3/.git/worktrees/wt-9204`) —
+every one of them read as the owner's under the first version of this rule, which listed only
+`$HOME` and `/tmp/cell-home`: a home whitelist re-creating the very defect the shape was introduced
+to fix. The digit-only rule the shape replaced had the same problem in the other direction: it
+classified this box's own `wt-lane-identity` worktree as the owner's.
+
+**A `wt-` NAME is not the evidence either.** The path must be a real linked worktree (a `.git`
+FILE pointing at `<main>/.git/worktrees/<name>`) inside one of those roots: `/tmp` is world-writable, so a bare `/tmp/wt-anything` directory
+would otherwise be a dispatch target — acceptance without evidence. Measured, the `/tmp/wt-*` lanes
+in the reap log are real linked worktrees, so nothing real is lost.
+
+⛔ **Stated boundary: the name is also a GATE, and unknown provenance resolves to the OWNER.** The
+`wt-<slug>` arm requires both the anchored name *and* the worktree artifact. So a **real** linked
+worktree directly under a fleet root whose name is anything else — `/tmp/w9516`, `/tmp/p9660-resid`,
+`/tmp/l9400` — does **not** match, and is PROTECTED. Measured on this box: **25 of the 33** real
+linked `/tmp` worktrees in `state/pi-reap-worktrees.log` are classified that way. Those lanes are not
+dispatchable, and a report line for one says "not a fleet worktree — PROTECTED as the owner's own
+work", which is the fail-closed answer, not a measurement of ownership.
+
+This is deliberate, and the tempting repair is the defect. Dropping the name and accepting any real
+linked worktree at depth 1 would re-open exactly what this section exists to close: `git worktree add
+~/tortoise-wip fix/x` produces that shape, so the owner's own scratch work would become a dispatch
+target, a pr-doctor `reset --hard` target, and a heartbeat typing target — the `Personal website`
+incident re-created. Pinned by
+`test_a_real_worktree_in_a_fleet_root_is_still_not_a_lane_without_the_NAME`; do not flip that test.
+
+Neither spelling is the real question, in *either* direction. Both need **provenance** — a durable
+record of which worktrees the *fleet* created — which is **agent-infra#2213**. The only such record
+today is `$O/bg/<name>.started`, and measurement shows it names only `<repo>/.worktrees/prd-*`, so it
+cannot yet adjudicate these. Until that registry exists, an unprovenanced worktree is the owner's: a
+wrong refusal costs a lane one dispatch cycle, a wrong acceptance types into someone's uncommitted
+work. Loud in the report, safe in the direction that matters.
+
+**A bare cell checkout is not a lane.** `/tmp/cell-ai`, `/tmp/cell-t3` (a main checkout, `.git` a
+DIR) are PROTECTED: work is dispatched into *worktrees*, never into a cell's main checkout.
+
+**Unreadable is PROTECTED, never "idle lane".** An absent cwd is not evidence of idleness; it is the
+absence of evidence, and the fail-closed direction for *may I type into this?* is **no**. The
+predicate is `_is_fleet_worktree()` in `scripts/lane-actions.py`, unit-tested against both
+directions: a worktree `git worktree add` created under a fleet root (a `.git` FILE pointing at
+`<main>/.git/worktrees/<name>`) → fleet; the same name with no such pointer, or the owner's project
+path → owner. A path carrying an embedded NUL is **rejected before resolution**, not caught after it:
+`realpath` only raises for a NUL from Python 3.10, while the 3.9 interpreter the orchestrator scripts
+run returns the poisoned string — so a cwd nobody could read would otherwise decide its own
+classification from its own first segment (`agent-infra#2219`, review round 11).
+
+**Deploy order.** Identity reads the `cwd` field that `lane-status.py` publishes, and the two
+files deploy independently. `lane-status.py` must land first: until it does, every row carries no
+`cwd`, every lane reads PROTECTED, and the beat says `IDENTITY-UNREAD->N (… NOT a quiet fleet)`
+rather than going silent — loud, but still a fleet with no dispatch list.
+
+**A blind instrument says so.** Because the rule is fail-closed, a fleet-wide loss of the cwd
+evidence would otherwise present as a *quiet* fleet: every lane PROTECTED, LIST 1 empty, beat line
+`NOTHING-ACTIONABLE`. `build()` therefore counts `n_protected` / `n_identity_unread` (both published
+in `--json` next to `dispatch_targets`); the beat says `IDENTITY-UNREAD->N (… NOT a quiet fleet)`
+when no lane's cwd was readable, and `PROTECTED->N` whenever the identity rule is what emptied the
+list (no lane offered, and at least one PROTECTED) — a lane excluded by a wrong *identity* rule has
+a readable cwd, so it raises no unread counter and would otherwise vanish silently. A list emptied
+by the **mechanical** tree instead (every lane WORKING, nothing protected, nothing unread) is a
+genuinely quiet fleet and carries neither clause. `lane-status.workspace_cwds()` writes a
+failure to stderr instead of swallowing it, per row as well as for the whole roster.
+
+**The defect this replaced, with its evidence.** Protection used to be
+`PROTECTED = ("DMeer", "DMer", "HANG")` matched by **substring** against the workspace *name*. The
+owner's workspace is titled **"Personal website"**, so it matched nothing: the roster classified it
+as an idle fleet lane and the PR doctor dispatched a tortoise PR brief **into it** — twice, reported
+by the owner. A name list protects the names somebody remembered; every name it misses fails toward
+*idle: dispatch it*. The historical names survive only as an additional **union**.
+
+**A dispatch target is EVIDENCED idle, not "quiet".** `scripts/lane-actions.py` publishes
+`dispatch_targets` (== LIST 1 in `state/NEEDS-ACTION.md`), and only a lane that passes
+`is_dispatch_target()` is in it: fleet identity, not already nudged, **DONE-IDLE**, a **completed**
+last turn (`last == "assistant"`), no child and no tool in flight, and a confident `DONE_READY` from
+the words layer. `WORKING` / `TOOL-IN-FLIGHT` / `CHILD-*` / `UNBOUND` / `WEDGED` are never targets,
+however quiet they look and whatever their words say.
+
+**The dispatcher that acts on this never uses a cmux pane.** `scripts/pr-doctor.py` retired the
+lane-table send (#1874) and **spawns** a background worker in a worktree it created
+(`<repo>/.worktrees/prd-<n>`) via `nonblocking-dispatch.sh`. Two gates stand in front of that spawn,
+and they are not in the same place: the `WORKTREE_ROOT` shape refusal happens **before any git
+call**, while the adopt-arm refusal (the one arm that reaches a directory *this job did not create*)
+happens **after** `git worktree list` and the liveness probe, and **before** the path is returned for
+`dispatch()` / `reset --hard` — which is the property that actually protects the directory.
+
+**Stated boundaries** (each is filed, not forgotten):
+
+1. **Provenance is inferred from shape.** An owner who runs `git worktree add` inside their own
+   project (`~/Personal website/.worktrees/preview`), or puts a `wt-<slug>` directory in a fleet
+   home, produces a path this rule accepts. Closing it needs a durable **fleet-created-worktree
+   registry** (#2213); it is not narrowed to a registry *now* because on the box the directive was
+   written on there are 0 spawn markers and 40+ live lanes under `.worktrees`, so a registry-only
+   rule would empty LIST 1 — the silent failure the same file legislates against. Pinned by
+   `test_an_owners_own_real_worktree_is_the_documented_boundary`.
+   **The same root has a second, opposite symptom, and it is NOT a reason to widen the rule:** a real
+   linked worktree under a fleet root whose name is not `wt-<slug>` reads PROTECTED (§2a, measured
+   **25 of 33** in the reap log), so those lanes are not dispatchable. Widening to "any real linked
+   worktree at depth 1" would fix that by accepting the owner's own scratch work instead — the
+   failure in the paragraph above, which is the more expensive one. Both are #2213.
+2. **Three senders still decide by name** (#2214): `turn-classify.py`'s `NEVER_NUDGE`,
+   `orchestrator-heartbeat.sh`'s `free=`/`wip=` capacity list, and `orch-send.sh`'s map-row
+   refusal. They predate this rule and each holds a *different* datum (a session file, a Bash
+   snapshot row, a generated map), so applying it there is its own change — one of them
+   (`turn-classify`) would go fleet-wide silent if the rule were copied in naively, because a
+   session without a `cwd` record yields no evidence. **The guarantee in this section is the
+   dispatcher's** (`lane_actions` + `pr-doctor`), not the fleet's.
 
 ---
 

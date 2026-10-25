@@ -75,6 +75,13 @@ set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_NAME="${CONTROLLER_UNIT:-eldato-orchestrator.service}"
+# THE UNIT NAME IS A NAME, NOT A PATH (review residual round 6, #2666). `CONTROLLER_UNIT` is concatenated
+# onto the directory this installer GRADES (`$UNIT_DIR/$UNIT_NAME`), so a value carrying `/` or `..` would
+# write outside the directory that was checked — the guard would grade one path and `install` the other. The
+# template filename is taken from the same value, so a traversal here is also a template traversal.
+case "$UNIT_NAME" in
+    ''|.|..|*/*) printf '%s: %s\n' "${0##*/}" "REFUSING CONTROLLER_UNIT='$UNIT_NAME': it must be a bare unit file name (no '/', not '.' or '..') — it is appended to the unit directory this installer grades, so a path here would write outside it, and the template filename comes from the same value" >&2; exit 2 ;;
+esac
 # Templates are NOT farmed (only scripts are), so a farmed copy of this installer must be able to find
 # them in the checkout that installed the layer. ⛔ THE CANDIDATE MUST CARRY *THIS* TEMPLATE, not merely
 # exist: $AGENT_INFRA_PATH is set on every cell and is often a DIFFERENT (older) checkout, so a
@@ -171,53 +178,50 @@ TARGET=""; UNIT_DIR=""; SC=""; WANTED_BY="multi-user.target"
 # so re-pointing `CONTROLLER_SYSTEM_UNIT_DIR` at a refused directory cannot make the guard agree with
 # itself. A directory OUTSIDE every systemd tree (a hermetic test fixture under `$TMPDIR`) is always
 # allowed: nothing boots it.
-normalize_path() { # <absolute path> — LEXICAL normalisation: drop `.`, collapse `..` and repeated slashes
-    local part out=""
-    local IFS=/
-    for part in $1; do
-        case "$part" in
-            ''|.) continue ;;
-            ..)   [ -n "$out" ] && out="${out%/*}"; continue ;;   # a pop above / is a no-op, as on the kernel
-        esac
-        out="$out/$part"
-    done
-    printf '%s\n' "${out:-/}"
-}
-canon_dir() { # <dir> — the path `mkdir -p` WOULD land on, physically
-    local d="${1:-}" par base rest="" out=""
+# ⛔ THE PATH IS RESOLVED WITH `mkdir -p` SEMANTICS, OR NOT AT ALL (review P1 rounds 4 and 5, #2666). Four
+# successive fixes each graded a slightly different path than the one `mkdir -p` writes to: a literal that
+# never collapsed `..`; a `..` collapsed LEXICALLY across a missing component; then a `..` popped across a
+# MISSING component that landed on an existing SYMLINK (`<tmp>/tree/new/../lnk/systemd/user` — `new` does not
+# exist, so a lexical pop skips it and then reads `lnk` as a plain name, while `mkdir -p` creates `new`,
+# steps back, and FOLLOWS `lnk`). `realpath -m` has exactly the semantics needed — it resolves every
+# component that exists, follows symlinks wherever the filesystem can answer, and collapses only what does
+# not exist.
+#
+# ⛔ AND WHEN THE BOX CANNOT ANSWER, THE GUARD REFUSES INSTEAD OF GRADING A GUESS. `__unresolved__:<raw>` is
+# returned and `choose_target` turns it into a loud refusal naming the missing tool: a directory that cannot
+# be shown to be outside systemd's unit trees is not one this installer may arm a unit in. The alternative —
+# the best-effort literal every earlier round shipped — is a fail-OPEN, and a fail-open here puts an enabled,
+# boot-armed unit somewhere `start`/`stop`/`status` cannot see it (#1761).
+CANON_UNRESOLVED='__unresolved__:'
+canon_dir() { # <dir> — the physical path `mkdir -p` WOULD land on, or `__unresolved__:<dir>`
+    local d="${1:-}" out=""
     [ -n "$d" ] || return 0
-    # ⛔ `readlink -f` FIRST, WHEN IT CAN ANSWER (re-review P1, #2666): it resolves the whole chain physically.
-    # It cannot answer while ANY ancestor is missing, which is what the branches below cover — and bash's
-    # `pwd -P` preserves exactly TWO leading slashes (`cd //etc/systemd/user && pwd -P` → `//etc/systemd/user`),
-    # so a doubled-slash spelling used to miss every tree pattern AND be counted as a second copy by the
-    # resolved dedupe. (dash collapses them; the normalisation below is what makes both shells agree.)
+    if command -v realpath >/dev/null 2>&1; then
+        out="$(realpath -m -- "$d" 2>/dev/null || true)"
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    fi
     if command -v readlink >/dev/null 2>&1 && readlink -f -- "$d" >/dev/null 2>&1; then
         out="$(readlink -f -- "$d")"
-    elif [ -d "$d" ]; then
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    fi
+    if [ -d "$d" ]; then
         out="$( cd "$d" 2>/dev/null && pwd -P )"
-    else
-        # ⛔ RESOLVE THE DEEPEST ANCESTOR THAT EXISTS AND APPEND THE REST (re-review P2, #2666). Resolving
-        # only the immediate parent left the LITERAL when more than the leaf was missing, so the graded path
-        # was not the path the write landed on.
-        par="$d"
-        while [ -n "$par" ] && [ "$par" != "/" ] && [ "$par" != "." ] && [ ! -d "$par" ]; do
-            base="$(basename "$par")"
-            rest="${base}${rest:+/$rest}"
-            par="$(dirname "$par")"
-        done
-        if [ -d "${par:-/}" ]; then
-            out="$( cd "${par:-/}" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$rest" )"
+        # A LEADING SLASH RUN IS ONE SLASH (review P1 round 6, #2666): POSIX makes a leading `//`
+        # implementation-defined and bash's `pwd -P` PRESERVES it, so on a box where neither `realpath` nor
+        # `readlink -f` can answer, `//etc/systemd/user` came back spelled with two slashes and matched no
+        # tree pattern — ADMITTED, where the same directory with one slash is refused. Collapsing it here
+        # means every branch returns the same spelling for the same directory.
+        # ⛔ AND ONLY WHEN `cd` ACTUALLY ANSWERED (VGATE round 6, #2666): collapsing BEFORE the emptiness
+        # test turned a failed `cd` — a directory that exists but cannot be entered (mode), or one removed
+        # between `-d` and `cd` — into `/`, which the `[ -n "$out" ]` gate then accepted. That is the exact
+        # fail-open this branch is not allowed to have: a directory the guard cannot grade must reach the
+        # `__unresolved__` sentinel below, never be read as the root.
+        if [ -n "$out" ]; then
+            while [ "${out#/}" != "$out" ]; do out="${out#/}"; done
+            printf '%s\n' "/$out"; return 0
         fi
     fi
-    [ -n "$out" ] || out="${d%/}"
-    # ⛔ AND THE `..` SEGMENTS IN THE REMAINDER ARE COLLAPSED LEXICALLY (re-review P1, #2666). Appending the
-    # remainder verbatim kept its `..`s, and the tree patterns cannot see through them: a chain that climbs
-    # PAST the resolved ancestor (`<tmp>/x/../../../../etc/systemd/system.control`) graded as a fixture path
-    # while `mkdir -p` created the directory inside `/etc/systemd`. Lexical is correct here and not a
-    # shortcut: the ancestor is already PHYSICAL, and the remainder does not exist yet, so there is no
-    # symlink left in it to follow. A `..` that pops above `/` is a no-op, exactly as on the kernel.
-    case "$out" in /*) out="$(normalize_path "$out")" ;; esac
-    printf '%s\n' "$out"
+    printf '%s%s\n' "$CANON_UNRESOLVED" "$d"
 }
 unit_dir_under() { # <resolved dir> <root> — true when <dir> IS <root> or inside it (both resolved)
     local d="${1%/}" r
@@ -277,6 +281,18 @@ choose_target() {
     fi
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
         _unit_dir_resolved="$(canon_dir "$SYSTEMD_UNIT_DIR")"
+        # ⛔ AN UNRESOLVABLE DIRECTORY IS REFUSED, NOT GUESSED (review P1 round 5, #2666). Grading the raw
+        # spelling is how four earlier rounds each failed open; a path that cannot be shown to be outside
+        # systemd's unit trees is not one this installer may arm a unit in.
+        case "$_unit_dir_resolved" in
+            "$CANON_UNRESOLVED"*)
+                err "REFUSING SYSTEMD_UNIT_DIR=$SYSTEMD_UNIT_DIR: it cannot be resolved to a physical path on this"
+                err "  box (no 'realpath -m' and no usable 'readlink -f'), so it cannot be shown to be OUTSIDE systemd's"
+                err "  unit trees. A unit installed where systemd loads it and start/stop/status do not look is an"
+                err "  enabled, boot-armed SECOND dispatcher (#1761)."
+                err "  Fix: install coreutils ('realpath'), or install into the system or the user unit dir."
+                return 1 ;;
+        esac
         if [ -n "$_unit_dir_resolved" ] && unit_dir_in_systemd_tree "$_unit_dir_resolved" \
            && ! unit_dir_is_read_by_default "$_unit_dir_resolved"; then
             err "REFUSING SYSTEMD_UNIT_DIR=$SYSTEMD_UNIT_DIR (resolves to $_unit_dir_resolved): systemd loads units"
@@ -1271,15 +1287,31 @@ unit_is_ours() { # <unit file>
     [ "$rendered" = "${O%/}" ]
 }
 # Every installed copy that PROVABLY belongs to another state dir — reported, never addressed.
-foreign_units() {
+foreign_units() { # the copies that provably supervise ANOTHER state dir — reported, never acted on
     local d seen=" "
-    for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" "$HOME/.config/systemd/user"; do
+    # ⛔ ENUMERATED THE SAME WAY THE OWNED COPIES ARE (review P2 round 5, #2666): this reader kept the raw
+    # spellings, so one foreign copy reached as two spellings was printed twice — a report-only defect (this
+    # function decides nothing) but a confusing one, and the fix is the shared enumeration it should have used.
+    for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}"; do
         [ -n "$d" ] || continue
+        d="$(canon_dir "$d")"
+        [ -n "$d" ] || continue
+        case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
         [ -f "$d/$UNIT_NAME" ] || continue
         unit_is_ours "$d/$UNIT_NAME" || printf '%s\n' "$d/$UNIT_NAME"
     done
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        d="$(canon_dir "$d")"
+        [ -n "$d" ] || continue
+        case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac
+        case "$seen" in *" $d "*) continue ;; esac
+        seen="$seen$d "
+        [ -f "$d/$UNIT_NAME" ] || continue
+        unit_is_ours "$d/$UNIT_NAME" || printf '%s\n' "$d/$UNIT_NAME"
+    done < <(installed_user_unit_dirs)
     return 0
 }
 # ⛔ FIND THE INSTALLED COPY, DO NOT RE-DERIVE THE SCOPE (review P2, #2402). `choose_target` answers "where
@@ -1336,6 +1368,7 @@ installed_unit_copies() { # every copy of OUR unit this box can find: system sco
         [ -n "$d" ] || continue
         d="$(canon_dir "$d")"
         [ -n "$d" ] || continue
+        case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac   # unresolvable: never a copy we can reason about
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
         [ -f "$d/$UNIT_NAME" ] || continue
@@ -1346,6 +1379,7 @@ installed_unit_copies() { # every copy of OUR unit this box can find: system sco
         [ -n "$d" ] || continue
         d="$(canon_dir "$d")"
         [ -n "$d" ] || continue
+        case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac   # unresolvable: never a copy we can reason about
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
         [ -f "$d/$UNIT_NAME" ] || continue
