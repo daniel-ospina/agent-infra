@@ -103,18 +103,20 @@ if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
-# Extracted from orch-loop.sh verbatim. The required set and the review-gate NAME are read from
-# the ENVIRONMENT by the shipped classifier (agent-infra#1764), so the driver supplies them the
-# same way the loop does — there is no bash-side $REQ splice to substitute any more.
+# ⛔ THE CLASSIFIER IS A FILE, NOT A HEREDOC ANY MORE (agent-infra#2719). It lived in orch-loop.sh as an
+# inline `python3 -c` string, and the NOCHECKS arm has to ask the SAME question on a re-read — two
+# copies of these rules is how the harness and the merge rail disagreed before (#1714). So the shipped
+# artifact IS `check-class.py`: a missing file is a hard FAIL here (never a silently empty classifier,
+# which would grade GREEN on an empty answer). The required set and the review-gate NAME are still read
+# from the ENVIRONMENT (agent-infra#1764), so the driver supplies them the same way the loop does.
 CL_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
 CL_GATE="ai-review-gate"
-awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+cat "$HERE/check-class.py" > "$TMP/classify.py" 2>/dev/null || : > "$TMP/classify.py"
 cl() { printf '%s' "$1" | REQ="$CL_REQ" REVIEW_GATE="$CL_GATE" python3 "$TMP/classify.py" 2>/dev/null; }
 # clreq <required-set> <payload> [<review-gate>] — the SAME shipped classifier against an
 # ARBITRARY repo's required set. Used by the repo-shape fixtures below, and by test-gates.sh.
 clreq() { printf '%s' "$2" | REQ="$1" REVIEW_GATE="${3:-ai-review-gate}" python3 "$TMP/classify.py" 2>/dev/null; }
-if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
+if need "$TMP/classify.py" "the classifier is the shipped check-class.py"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: ai-review-gate SKIPPED is not satisfied" $rc
@@ -290,7 +292,11 @@ fi
 # PR exists to close), and a backticked `gh pr checks` spliced a multi-line table into the Python
 # source (SyntaxError -> V="" -> no case arm matched). Extract the real assignment and drive it
 # through a logged `gh` shim so the shell, not an awk extraction, is what runs.
-awk '/^    V="\$\(gh pr checks/{f=1} f{print} /^" 2>\/dev\/null\)"$/{f=0}' "$LOOP" > "$TMP/classify_bash.sh"
+# ⛔ THE ASSIGNMENT IS ONE LINE NOW (agent-infra#2719): the Python moved to `check-class.py`, so the
+# heredoc's closing `" 2>/dev/null)"` terminator no longer exists — the old range-capture ran to the END
+# OF THE FILE (1547 lines measured) and the driver then aborted on `set -u` before printing `V`, which
+# made this whole block report a red it could not explain. Capture the ONE assignment line.
+grep -m1 '^    V="\$(gh pr checks' "$LOOP" > "$TMP/classify_bash.sh"
 if need "$TMP/classify_bash.sh" "the classifier's bash assignment is extracted from orch-loop.sh"; then
   mkdir -p "$TMP/bin"
   cat > "$TMP/bin/gh" <<'SH'
@@ -309,6 +315,9 @@ SH
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
     printf '%s\n' "REVIEW_GATE='ai-review-gate'"
+    # the pipeline's classifier path is resolved by the loop at startup; the driver supplies the
+    # SHIPPED file so the shell runs the real classifier, not a missing path.
+    printf '%s\n' "_CK_PY='$HERE/check-class.py'"
     cat "$TMP/classify_bash.sh"
     printf '%s\n' 'printf "V=%s\n" "$V"'
   } > "$TMP/drive.sh"
@@ -435,7 +444,9 @@ ck "shipped reaper: the skipped pass says so (an unreadable listing is not an em
 # the same guard for the neighbouring `.open_iss` probe, which had the safe polarity by accident
 RO="$TMP/reap-failopen"; mkdir -p "$RO"
 printf '4114\n8888\n' > "$RO/dispatched.txt"
-printf '4114\n8888\n' > "$RO/checked.txt"
+# 5252 is checked and has NO local keep-fact (not queued, not dispatched, no PR, no lane): it is the
+# entry the CHECKED classification must publish as releasable even though `.open_iss` is unreadable.
+printf '4114\n8888\n5252\n' > "$RO/checked.txt"
 printf 'feat/8888-tm\n' > "$RO/.pr_brs"
 ( PATH="$R:$PATH" python3 "$R/reap.py" "$RO" ) > "$TMP/reap-failopen.out" 2>&1
 case "$(tr '\n' ' ' < "$RO/dispatched.txt")" in *4114*) rc=0;; *) rc=1;; esac
@@ -448,6 +459,17 @@ ck "shipped reaper: an UNREADABLE open-issue listing reaps nothing either" $rc
 # what the guard produces and what the pre-fix `|| : >` shape could not.
 grep -qF 'SKIPPED: .open_iss' "$TMP/reap-failopen.out" && rc=0 || rc=1
 ck "shipped reaper: the open-issue guard fires and names .open_iss (not vacuously safe)" $rc
+# ⛔ THE GUARD IS *SPLIT*, AND THIS IS ITS ONLY DISCRIMINATING ASSERTION (review P2, #2183). An
+# unreadable `.open_iss` must disable ONLY the `dispatched.txt` reap; the CHECKED classification
+# reads `candidates.txt`/`dispatched.txt`/`.pr_brs`/`tmux`/the claim registry and must still run.
+# Re-joining the guards (refusing both on either missing listing) leaves every assertion above
+# GREEN — the old single message also carries `SKIPPED: .open_iss` and `dispatched.txt` is
+# untouched under both — so only the ARTIFACT below can tell the two designs apart. 5252 has no
+# keep-fact and must be published as releasable; a re-joined guard publishes nothing, and the
+# entry stays suppressed for ever, which is the defect this patch removes.
+relopen="$(tr '\n' ' ' < "$RO/state/checked-release-candidates" 2>/dev/null)"
+case "$relopen" in *5252*) rc=0;; *) rc=1; echo "      releasable: '$relopen'";; esac
+ck "shipped reaper: an unreadable open-issue listing still RUNS the checked classification (the guard is split)" $rc
 # a PRESENT but EMPTY list is a REAL answer and must still reap
 RE="$TMP/reap-emptypr"; mkdir -p "$RE"
 printf '4114\n7777\n' > "$RE/dispatched.txt"
@@ -460,6 +482,51 @@ case "$kept" in *4114*) rc=1;; *) rc=0;; esac
 ck "shipped reaper: a genuinely EMPTY (readable) PR listing still reaps 4114" $rc
 case "$kept" in *7777*) rc=0;; *) rc=1;; esac
 ck "shipped reaper: the empty-listing pass still keeps a non-open issue (7777)" $rc
+
+# ── 5a2) THE CHECKED CLASSIFICATION: a suppression survives only while a re-checkable fact holds ──
+# `checked.txt` short-circuits the walk before ANY network call, so an entry in it is invisible to
+# every later pass — and before agent-infra#2183 nothing revalidated it: the only remover walked
+# `dispatched.txt`, a different file. A CLEAN-judged candidate that was never dispatched was therefore
+# suppressed for ever. These fixtures drive the SHIPPED heredoc (extracted above) and assert the
+# ARTIFACTS it publishes, never a log string.
+#   CQ: 4114 no keep-fact -> RELEASABLE (the queue can fill again)
+#   CQ: 5151 in candidates.txt -> kept as `queued`
+#   CQ: 6161 has a PR head ref -> kept as `pr`
+CK="$TMP/reap-checked"; mkdir -p "$CK"
+printf '5151\n' > "$CK/candidates.txt"
+printf '4114\n5151\n6161\n' > "$CK/checked.txt"
+printf '6161\n' > "$CK/.pr_brs"
+printf '4114\n5151\n6161\n' > "$CK/.open_iss"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$CK" ) > "$TMP/reap-checked.out" 2>&1
+rel="$(tr '\n' ' ' < "$CK/state/checked-release-candidates" 2>/dev/null)"
+case "$rel" in *4114*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: a checked entry with NO keep-fact is RELEASABLE (it is not suppressed for ever)" $rc
+case "$rel" in *5151*|*6161*) rc=1;; *) rc=0;; esac
+ck "shipped reaper: a queued or PR-backed checked entry is never released" $rc
+kq="$(grep -c '^5151	queued$' "$CK/state/checked-kept" 2>/dev/null || :)"
+[ "${kq:-0}" -eq 1 ]; rc=$?
+ck "shipped reaper: the checked KEEP-FACT for a queued issue is recorded as 'queued'" $rc
+kp="$(grep -c '^6161	pr$' "$CK/state/checked-kept" 2>/dev/null || :)"
+[ "${kp:-0}" -eq 1 ]; rc=$?
+ck "shipped reaper: the checked KEEP-FACT for a PR-backed issue is recorded as 'pr'" $rc
+# ⛔ AND THE HEREDOC NEVER REWRITES checked.txt ITSELF: it publishes the classification and leaves the
+# single release rewrite to the claim filter, so an entry the registry KEEPS never has to be put back.
+ckx="$(tr '\n' ' ' < "$CK/checked.txt")"
+case "$ckx" in *4114*5151*6161*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: the classification does NOT rewrite checked.txt (one release writer, later)" $rc
+# ⛔ THE SPLIT GUARD, the other direction: an UNREADABLE `.pr_brs` refuses the whole classification and
+# says so — releasing on the facts it happens to have would un-suppress entries that DO have a PR.
+CP="$TMP/reap-checked-nopr"; mkdir -p "$CP"
+printf '4114\n' > "$CP/checked.txt"
+printf '4114\n' > "$CP/.open_iss"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$CP" ) > "$TMP/reap-checked-nopr.out" 2>&1
+[ -f "$CP/state/checked-release-candidates" ]; rc=$?
+[ "$rc" -eq 0 ] && rc=1 || rc=0
+ck "shipped reaper: with no PR listing the checked classification publishes NO candidates" $rc
+grep -q 'unjustified=-' "$CP/state/checked-reap" 2>/dev/null; rc=$?
+ck "shipped reaper: a refused classification records unjustified=- (unknown, not 0)" $rc
+grep -qF 'SKIPPED (checked: .pr_brs unreadable)' "$TMP/reap-checked-nopr.out"; rc=$?
+ck "shipped reaper: the refused classification NAMES the missing listing" $rc
 fi
 unset -f tmux
 
@@ -1630,7 +1697,14 @@ if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped merge-one.
   cat > "$TMP/ra.sh" <<SH
 pi() { sleep 60; }
 . "$TMP/runagent.sh"
-start=\$(date +%s); run_agent 2 "$TMP/ra.log" /dev/null; rc=\$?; end=\$(date +%s)
+# ⛔ THE PROMPT IS A REAL BRIEF, NOT /dev/null (agent-infra#2258). run_agent now refuses a brief with
+# no research contract (80) BEFORE it spawns, so this arm's `/dev/null` would make the shipped
+# run_agent return 80 without ever launching `pi` — and the assertion below ("it ran, and was cut off
+# at the wall limit") would fail for a reason that has nothing to do with the timeout it exists to
+# test. Rendering the canonical block keeps the fixture HONEST: the function under test still gets a
+# brief of the shape a real dispatch carries.
+brief_gate_sh="$HERE/brief-gate.sh"; bash "\$brief_gate_sh" --section reviewer > "$TMP/ra-brief.txt"
+start=\$(date +%s); run_agent 2 "$TMP/ra.log" "$TMP/ra-brief.txt"; rc=\$?; end=\$(date +%s)
 echo "\$((end-start)) \$rc"
 SH
   ra="$(bash "$TMP/ra.sh" 2>/dev/null | tail -1)"
@@ -3554,6 +3628,17 @@ else
   ck "refresh-scout.test.sh: the #1736 suite is present" 1
 fi
 
+if [ -f "$HERE/refresh-provision.test.sh" ]; then
+  if bash "$HERE/refresh-provision.test.sh" > "$TMP/refresh-provision.out" 2>&1; then
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 0
+  else
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 1
+    grep -E '❌|==>' "$TMP/refresh-provision.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "refresh-provision.test.sh: the #2229 suite is present" 1
+fi
+
 # #2229: ORIGINATION MUST FAIL LOUDLY. The refresh is backgrounded, so its failure is a log line — and
 # the beat printed `[dispatch] skipped (merge-priority …)` for it, making "PRs outrank issues" and "issue
 # work can never start" the same sentence. The suite drives the shipped pass and the shipped caller block.
@@ -4179,6 +4264,11 @@ nb_expand() { # nb_expand <script>
     # `$(...)` inside the unquoted heredoc — that is the bug class this rig exists for).
     # The rig renders it from the SHIPPED helper so the assertion below sees real text.
     REVIEWER_BRIEF="$(bash "$HERE/reviewer-preflight.sh" --brief harness)"
+    # #2325: lane.sh ALSO splices the landing-artifacts section as a precomputed variable. Rendered
+    # here from the SHIPPED helper for the same reason: under `set +u` an unset variable expands to
+    # nothing, so without this line every prompt this rig builds would silently lack the section and
+    # none of its backtick spans would be exercised.
+    LANDING_BRIEF="$(bash "$HERE/reviewer-preflight.sh" --landing-brief harness)"
     . "$NB/snip.sh" ) >/dev/null 2>&1
 }
 if nb_expand "$MERGE"; then
@@ -4202,6 +4292,14 @@ if nb_expand "$HERE/lane.sh"; then
     && grep -qF 'do NOT dispatch it' "$NB/o/logs/prompt-7.txt"; }; rc=$?
 else rc=1; fi
 ck "lane.sh's prompt CARRIES the #2148 reviewer step (requirement + record + rail, harness role)" $rc
+# #2325: and the LANDING ARTIFACTS section, from the same expanded artifact. A heredoc edit that
+# loses it (or a splice that quietly renders empty) goes red here rather than at a compliance gate.
+if nb_expand "$HERE/lane.sh"; then
+  { grep -qF '## Landing artifacts' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'Do NOT reach for "Refs #' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'scripts/admin-merge.sh <PR>' "$NB/o/logs/prompt-7.txt"; }; rc=$?
+else rc=1; fi
+ck "lane.sh's prompt CARRIES the #2325 landing artifacts ([a] issue ref line, [c] record command)" $rc
 if nb_expand "$HERE/fix-one.sh"; then
   { grep -qF 'Never search the filesystem for an interpreter' "$NB/log-fixer.txt" \
     && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/log-fixer.txt" \
