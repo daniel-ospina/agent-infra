@@ -648,10 +648,13 @@ resolve_log() {
       # counter so `log-evidence-unreadable` stays reserved for a read that actually failed.
       if [ "$trc" = "2" ] || [ "$pblind" = "1" ]; then unident=1; continue; fi
       # not this lane's stdout ⇒ this tee is not its writer, whatever log it happens to hold
-      # ⛔ NO PIPE INTO A QUIET grep (#841/#864, `sigpipe-grep`): under `pipefail` a producer that
-      # exits early on SIGPIPE turns the whole pipeline red — or, with `grep -q` returning before its
-      # input is drained, reports "no match" for a line that IS there. The here-string inverts the
-      # builtin writer with no pipe at all.
+      # ⛔ THIS IS A SHAPE FIX, NOT A BEHAVIOUR FIX (#841/#864 `sigpipe-grep`; stated accurately after
+      # review). `pipefail` is NOT active in this file (`set -u` only) and the caller runs it as a
+      # child `bash`, which does not inherit it — so the 141 race is not reachable here, and `pstd`
+      # (a single `pipe:[<inode>]`/`->0x…` line) is far below the size where grep -q's early exit could
+      # lose a match. What reds is the IDIOM: the guard rejects a producer piped into a quiet grep
+      # regardless, and this here-string is its sanctioned form. The stream is byte-identical
+      # (`printf '%s\n'` and `<<<` each append exactly one newline), so the comparison cannot change.
       grep -Fxq -e "$pname" <<<"$pstd" || continue
       out="$(collect_evidence "$p")" || { blind=1; continue; }
       [ -n "$out" ] && cands="$cands$out
