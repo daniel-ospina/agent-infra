@@ -1143,6 +1143,59 @@ else
   ok "…and the scan was NOT truncated, so the cap cannot hide a holder behind a lucky witness (log clean)"
 fi
 
+# ── K8/K9: the per-record EXCLUDE LIST is what makes the CWD and TMUX arms terminate ─────────────
+# The idle-shell rule demotes a holder and adds its pid to the exclude list, so the next probe call
+# advances instead of re-reporting the pid it just demoted. K7 pins that for the ARGV table only, and
+# the missing pins were not hypothetical: deleting the skip from `cwd_witness_for` or
+# `tmux_witness_for` left this suite at 207/207 while the verdict flipped from REAP to KEEP+TRUNCATED
+# (the scan re-reads the same pid until the runaway cap, then fails closed) — i.e. the KEEP rule
+# silently stopped firing for the exact cell-4 shape (#2721: 59 checkouts held by idle shells), with
+# every arm green. Each fixture has ONE holder, in ONE table, so the arm is only green when the scan
+# advances past it and reaps.
+RK8="$(newrepo k8)"
+W_K8="$(mkwt "$RK8" cwdskip)"
+K8_TS=$(( $(date +%s) - 1000 ))
+GIT_AUTHOR_DATE="@$K8_TS" GIT_COMMITTER_DATE="@$K8_TS" \
+  git -C "$W_K8" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD 1000s before this pass"
+K8_CANON="$(canon "$W_K8")"
+printf '1 0 /sbin/launchd\n65002 1 /bin/bash\n' > "$T/k8-ps.txt"
+printf 'p65002\nn%s\n' "$K8_CANON" > "$T/k8-lsof.txt"
+: > "$T/reap.log"
+out="$(run_shimmed FAKE_PS_TABLE="$T/k8-ps.txt" FAKE_LSOF_TABLE="$T/k8-lsof.txt" \
+        FAKE_ETIME='10:00:00' REAP_VENV_PROC_ROOT="$T/no-proc" \
+        --worktree "$W_K8" --apply)"
+assert_contains "$out" "REAP" "K8 a lone CWD holder that is an idle shell is demoted and the env reaped"
+absent "$W_K8/.venv" "K8 the env was actually removed"
+assert_contains "$(cat "$T/reap.log" 2>/dev/null)" "stale-shell: pid=65002(cwd)" \
+    "K8 ...and the CWD demotion is named with its witness"
+if grep -q 'TRUNCATED' "$T/reap.log" 2>/dev/null; then
+  bad "K8 the scan was TRUNCATED - the cwd witness did not advance past the demoted pid"
+else
+  ok "K8 and the scan advanced (no TRUNCATED line): the exclude list is consulted by the cwd probe"
+fi
+
+RK9="$(newrepo k9)"
+W_K9="$(mkwt "$RK9" tmuxskip)"
+K9_TS=$(( $(date +%s) - 1000 ))
+GIT_AUTHOR_DATE="@$K9_TS" GIT_COMMITTER_DATE="@$K9_TS" \
+  git -C "$W_K9" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD 1000s before this pass"
+K9_CANON="$(canon "$W_K9")"
+printf '1 0 /sbin/launchd\n65003 1 /bin/bash\n' > "$T/k9-ps.txt"
+printf '65003\t%s\n' "$K9_CANON" > "$T/k9-tmux.txt"
+: > "$T/reap.log"
+out="$(run_shimmed FAKE_PS_TABLE="$T/k9-ps.txt" FAKE_TMUX_TABLE="$T/k9-tmux.txt" \
+        FAKE_ETIME='10:00:00' REAP_VENV_PROC_ROOT="$T/no-proc" \
+        --worktree "$W_K9" --apply)"
+assert_contains "$out" "REAP" "K9 a lone TMUX-PANE holder that is an idle shell is demoted too (the pane witness has the same rule)"
+absent "$W_K9/.venv" "K9 the env was actually removed"
+assert_contains "$(cat "$T/reap.log" 2>/dev/null)" "stale-shell: pid=65003(tmux-pane)" \
+    "K9 ...and the pane demotion is named with its witness"
+if grep -q 'TRUNCATED' "$T/reap.log" 2>/dev/null; then
+  bad "K9 the scan was TRUNCATED - the tmux witness did not advance past the demoted pid"
+else
+  ok "K9 and the scan advanced (no TRUNCATED line): the exclude list is consulted by the tmux probe"
+fi
+
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then
