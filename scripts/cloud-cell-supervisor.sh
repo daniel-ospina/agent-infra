@@ -132,7 +132,16 @@
 set -uo pipefail
 
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
-REPO="${REPO:-/tmp/cell}"
+# ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1935). This line used to be `REPO="${REPO:-/tmp/cell}"`,
+# and that path does not exist on the cloud cell: `start` died with `FATAL: no git repo at /tmp/cell`
+# — a controller that will not start, for a directory the operator never chose and nothing creates.
+# (The sibling defect is worse, in refresh-candidates.sh: ITS default was one developer's HOME
+# DIRECTORY, baked into every machine's harness.) A default is only safe if it is TRUE ON EVERY
+# BOX, so there is none — the value is REQUIRED, and resolve_repo() below may DERIVE it from a path
+# that really is a git checkout. The derivation is timid on purpose and never guesses between two
+# repos: this checkout decides the QUEUE (resolve_queue_target reads its `origin`), so adopting the
+# wrong one dispatches the wrong repo's work — the measured agent-infra#1901 defect.
+REPO="${REPO:-}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 # The harness is a SIBLING of this script inside agent-infra (scripts/orchestrator-harness/),
@@ -275,6 +284,64 @@ WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
+
+# ── the TARGET checkout: the operator's value, else DERIVED from a real checkout ───────────────
+# Adoption rule, in order: $REPO as given; else exactly ONE candidate that is a git checkout; else,
+# when several are, the ones whose `origin` names the declared $OR — and if that is still not exactly
+# one, REFUSE. Two distinct checkouts on one box is precisely the case where a guess is unrecoverable
+# (the derivation feeds OR, and OR decides which queue the controller works), so the refusal names
+# both and asks. The candidate list is the harness's own provisioning locations — nothing walks the
+# filesystem — and `run`/`git` are the only tools this needs: no network, no config, no agent.
+REPO_SEEN=""       # what the derivation looked at, for the refusal
+resolve_repo() {
+  local cand url hits="" n=0
+  [ -n "$REPO" ] && return 0
+  REPO_SEEN=""
+  for cand in "${WORKDIR:-}" "$CELL_HOME/cell" "/tmp/cell" \
+              "${OR:+$CELL_HOME/${OR##*/}}" "${OR:+/tmp/cell-${OR##*/}}" "${OR:+/tmp/${OR##*/}}"; do
+    [ -n "$cand" ] || continue
+    case " $REPO_SEEN " in *" $cand "*) continue ;; esac
+    REPO_SEEN="${REPO_SEEN:+$REPO_SEEN }$cand"
+    [ -d "$cand" ] || continue
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
+    if [ -n "${OR:-}" ]; then
+      url="$(git -C "$cand" config --get remote.origin.url 2>/dev/null || true)"
+      case "$url" in
+        "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+        *) continue ;;
+      esac
+    fi
+    hits="$hits$cand\n"
+  done
+  n="$(printf '%b' "$hits" | grep -c .)"
+  case "$n" in
+    1) REPO="$(printf '%b' "$hits" | head -1)"; REPO="$(cd "$REPO" && pwd -P)" || { REPO=""; return 1; }
+       say "REPO was not set — using $REPO (a checkout from the provisioning candidates${OR:+, origin $OR})"
+       return 0 ;;
+    0) return 1 ;;
+  esac
+  say "REPO was not set and ${n} candidate checkouts match${OR:+ $OR}:"
+  printf '%b' "$hits" | sed 's/^/       /' >&2
+  return 1
+}
+
+# ONE actionable line, on the verbs that cannot work without a checkout. `status` deliberately does
+# not call it: it is the verb an operator runs to DISCOVER this, so it must still answer.
+assert_repo() {
+  if ! resolve_repo; then
+    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell"
+  fi
+  # ⛔ THE GUARD MUST SEE THE VALUE THAT IS INTERPOLATED, not only the one the OPERATOR passed
+  # (agent-infra#1935 review). `cmd_start` validates REPO before this derives it — and skips an
+  # EMPTY value — so a DERIVED path was the one interpolated value that reached the tmux command
+  # string unvalidated: a checkout directory named with a quote would close the quote in
+  # `REPO='$REPO'` and the rest would be parsed as shell. This is the same class as the `$HARNESS`
+  # re-check below, which exists for exactly this reason (a value that changes after the guard).
+  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO"
+  # A DERIVED checkout changes the queue target (resolve_queue_target reads its origin), so re-derive
+  # OR before anything asserts the pair.
+  resolve_queue_target || true; OR="$QUEUE_REPO"
+}
 
 # A quote or shell metacharacter in any value interpolated into the session command string would
 # break out of it — the string is handed to tmux, which runs it with sh -c. The harness applies
@@ -1039,13 +1106,24 @@ QUEUE_REMOTE=""      # the origin URL we READ from the checkout (empty = nothing
 QUEUE_DERIVED=""     # owner/repo parsed out of it (empty = underivable)
 QUEUE_REPO=""        # the EFFECTIVE queue target the controller session will receive
 QUEUE_DECLARED=""    # what the operator/keys.env asked for (empty = not declared)
-QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|underivable = refuse
+QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|underivable|nocheckout = refuse
 
 # Read the pair. NEVER dies: `status` must still answer when the pair cannot be read — it is the verb
 # an operator runs to discover that it cannot — and every other verb keeps its own preconditions. The
 # verbs that cannot do their job call assert_queue_target() below.
 resolve_queue_target() {
   QUEUE_DECLARED="${OR:-}"
+  # ⛔ AN EMPTY $REPO IS NOT "read the queue from the CURRENT DIRECTORY". `git -C ""` silently means
+  # no `-C` at all, so the pre-#1935 load-time call derived the queue from whatever directory the
+  # operator happened to be standing in — and then held the REAL checkout against it. A controller's
+  # queue must follow the checkout it names, never the caller's cwd.
+  if [ -z "$REPO" ]; then
+    # ⛔ ITS OWN STATE, NOT `unreadable` (#1977 review, P2). With no checkout there is no origin
+    # remote to be unreadable, and rendering it as one sent the operator hunting an origin problem on
+    # a repo that does not exist — while `status`, the verb that is supposed to DISCOVER this, printed
+    # an empty path. The cause is the missing checkout, so the state names it.
+    QUEUE_REMOTE=""; QUEUE_DERIVED=""; QUEUE_REPO="$QUEUE_DECLARED"; QUEUE_STATE="nocheckout"; return 1
+  fi
   QUEUE_REMOTE="$(git -C "$REPO" remote get-url origin 2>/dev/null)"
   QUEUE_DERIVED=""
   [ -n "$QUEUE_REMOTE" ] && QUEUE_DERIVED="$(queue_repo_from_url "$QUEUE_REMOTE")"
@@ -1157,6 +1235,10 @@ assert_gh_repo_conformance() {
 # does not start, with an error naming BOTH values, the remote that was read, and the repo this
 # machine needs so provisioning is unambiguous.
 assert_queue_target() {
+  # ⛔ REPO first: with no checkout, every QUEUE_STATE below is a SYMPTOM, and the old message read
+  # `cannot read the QUEUE … 'git -C  remote get-url origin' returned no URL` — an error about an
+  # empty path. The cause is the missing checkout, so name it.
+  [ -n "$REPO" ] || assert_repo
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
   esac
@@ -1186,6 +1268,7 @@ queue_state_text() {
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
     mismatch)    printf 'MISMATCH — start/check refuse (agent-infra#1901)' ;;
+    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
     invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse' ;;
@@ -1456,8 +1539,13 @@ linked_worktree_of() {
 # `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
 # allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
 # worktree of $HARNESS_REPO, an empty directory, a pin ROOT holding only hex-named pin dirs, or a root
-# whose only other entries are OS droppings (`​.DS_Store` / `._*` REGULAR files — one Finder visit to the
-# default root must not brick the cell; a hidden DIRECTORY or a dangling symlink is still refused).
+# whose only other entries are ONE OF TWO ENUMERATED classes of REGULAR, NON-SYMLINK file: OS droppings
+# (​`.DS_Store` / `._*` — one Finder visit to the default root must not brick the cell) and the harness's
+# OWN named records (`.agent-infra-version`, `AGENTS.md`, `MEMORY.md`, `README.md`, `VENDOR.md`,
+# `HARNESS-PIN`, `manifest.json`, `package.json` — agent-infra#2812: a shipped sibling component writes
+# into this root, so refusing them kept the cell unstartable for ever, once per 10-minute tick).
+# ⛔ Both classes are NAMED, never "any file", and THIS header is the whole allow-list: a hidden
+# DIRECTORY, a dangling symlink, a symlink wearing an allowed NAME, and any unlisted entry are refused.
 #
 # Is $1 a NAME `apply` could have produced for a pin directory? `apply` names each pin by the hex of
 # the commit it pins to (`cut -c1-12` below), but the LENGTH is a MOVING CONVENTION, not a property
@@ -1543,10 +1631,13 @@ pin_path_real() {
 # ⛔ The enumeration is `ls -A`, not a `"$dir"/*` glob: a glob skips HIDDEN entries and dangling
 # symlinks, so a root whose only entry was `.DS_Store` read as EMPTY-AND-SAFE on the check side while
 # the delete side refused the same root — the same false pass, one branch over. `ls -A` sees every
-# entry, and each one must be a hex-named directory — EXCEPT an OS-droppings regular file
-# (`.DS_Store` / `._*`), which is skipped: refusing it bricked all four verbs after a single Finder
-# visit to the default root on the operators' macOS server (see the header above, which states the
-# whole allow-list; this line is the one it is easiest to contradict by accident).
+# entry, and each one must be a hex-named directory — EXCEPT two ENUMERATED classes of regular,
+# NON-SYMLINK file: OS droppings (`.DS_Store` / `._*`) and the harness's OWN named records (below).
+# Refusing the first bricked all four verbs after a single Finder visit to the default root on the
+# operators' macOS server; refusing the second bricked the cell permanently against a shipped sibling
+# component. (See the header above, which states the whole allow-list; this line is the one it is
+# easiest to contradict by accident.) ⛔ Both classes are NAMED, never "any file": an unlisted entry
+# is still refused, which is the whole point of the guard.
 # ⛔ Deliberately NOT a per-entry `git worktree list` path comparison: on macOS a `$TMPDIR`-derived
 # path carries a `//` that git normalizes in its listing output, so a literal comparison reports our
 # OWN pin as foreign and the guard becomes a false block.
@@ -1592,6 +1683,12 @@ pin_root_conformance() {
     # root from reaching the cannot-verify branch below: there is nothing of ours in it to protect.
     case "$p" in
       .DS_Store|._*) if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
+      # ⛔ HARNESS METADATA IS NOT A STRAY (#2812): `harness-apply` records the commit it converged
+      # this box to INSIDE the pin root, so the guard refused forever and the entry returns on every
+      # 10-minute tick — "remove it by hand" is not a remedy. Named explicitly, so an UNKNOWN entry is
+      # still refused.
+      .agent-infra-version|AGENTS.md|MEMORY.md|README.md|VENDOR.md|HARNESS-PIN|manifest.json|package.json)
+        if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
     esac
     entries=$((entries + 1))
     if [ ! -d "$dir/$p" ] || ! pin_name_ok "$p"; then
@@ -1997,6 +2094,11 @@ cmd_check() {
     esac
   fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
+  # ⛔ RESOLVE THE CHECKOUT BEFORE ANYTHING READS IT. Every verdict below is about THIS repo, and an
+  # unresolved $REPO used to reach `die "no git repo at "` — an error naming an empty path, for a
+  # value the operator never set. assert_repo() derives it or refuses with one actionable line, and
+  # re-derives OR when it derived the checkout (the queue follows the checkout's origin).
+  assert_repo
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
   # refused a worktree with "FATAL: no git repo at <path>" even though every git command in it works
@@ -2037,6 +2139,10 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
+  # lane.sh's prompt EXECUTES lane-merge.sh for the merge phase and merge-rate.sh for the
+  # before/after measurement (#2029), so a $O missing either makes every lane's merge phase exit 127
+  # while this check still printed "CELL CAN RUN A CONTROLLER" — the false PASS this list exists to
+  # prevent. Keep this list in step with install.sh's DRIFTED list (which seeds $O from it).
   # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
   # calls it for the process pass. A $O without it still runs (the census falls back to the launch
   # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
@@ -2044,10 +2150,13 @@ cmd_check() {
   # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
   # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
   # reports success.
+  # UNION of both sides of this merge (neither is a superset): lane-merge.sh + merge-rate.sh from this
+  # branch (#2029), lane-reap.sh from origin/main (#2163). Taking either alone leaves a worker the
+  # controller executes unseeded, which is the false PASS above.
   # repo-target.sh (#2724/#2694) is SOURCED by lane.sh, dispatch-merge.sh, fix-one.sh and adopt-fix.sh;
   # all four `exit 78` without it, so its absence would make every dispatch refuse at startup while
   # `check` still certified the cell — the same false PASS one layer down.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
@@ -3197,7 +3306,7 @@ cmd_status() {
   # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
   # the checkout it is standing in, and the remote that fact was read from. Reported, never refused:
   # `status` is the verb an operator runs to DISCOVER that the pair is wrong.
-  say "queue: ${QUEUE_REPO:-<unknown>} @ $REPO — origin ${QUEUE_REMOTE:-<none>} [$(queue_state_text)]"
+  say "queue: ${QUEUE_REPO:-<unknown>} @ ${REPO:-<unset>} — origin ${QUEUE_REMOTE:-<none>} [$(queue_state_text)]"
   # agent-infra#1745: the answer to "which commit is this cell running?", from the record `start`
   # wrote. Printed even when the controller is stopped — a stale cell is a stale cell.
   if [ -f "$STAMP" ]; then
@@ -3787,7 +3896,8 @@ cmd_prune() {
     # subdirectory of a misconfigured root: `HARNESS_PIN_DIR=$CELL_HOME` deleted the cell home and its
     # state dir BEFORE the guard in `harness_apply` could fire. `assert_pin_dir_safe` refuses any root
     # that is not an empty dir, a linked worktree, or a pin root of hex-named directories (plus a root
-    # whose only other entries are `.DS_Store`/`._*` regular files — see its header for the allow-list).
+    # whose only other entries are `.DS_Store`/`._*` regular files or the harness's OWN named records —
+    # see its header for the whole allow-list).
     assert_pin_dir_safe "$HARNESS_PIN_DIR"
     if linked_worktree_of "$HARNESS_REPO" "$HARNESS_PIN_DIR"; then
       # The legacy FLAT PIN: the root IS the live worktree, so `"$HARNESS_PIN_DIR"/*/` would enumerate

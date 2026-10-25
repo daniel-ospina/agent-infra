@@ -8,8 +8,8 @@ set -u
 # nothing behind it: the guard just below killed the controller at startup, and under KeepAlive that
 # is a crash loop whose only trace is launchd.err — it reads exactly like a box with nothing to do.
 # (The other shape, "the controller keeps beating while the refresh aborts every cycle", is a REPO
-# that EXISTS but is the wrong repo — refresh-candidates.sh still carries its own default of that
-# kind, #1935/#1977.) A path is not a thing this repo can guess — the daemon gets it from install.sh
+# that EXISTS but is the wrong repo — #1935/#1977 closed that one too: refresh-candidates.sh no longer
+# carries a default of its own either, it derives the checkout and VERIFIES the origin, or refuses.) A path is not a thing this repo can guess — the daemon gets it from install.sh
 # (`__REPO__` in the plist), a cell from its keys.env/supervisor, and an operator from §4 step 2.
 # Unset is a CONFIGURATION ERROR and it is refused HERE, before any command can run against it.
 REPO="${REPO:-}"
@@ -63,6 +63,15 @@ command -v derive_or >/dev/null 2>&1 \
     exit 78
   }
 OR_EXPLICIT="${OR:-}"
+# ⛔ WHETHER THE OPERATOR NAMED OR, TOLD TO THE CHILD EXPLICITLY (#1977 review, P1). The export
+# below is UNCONDITIONAL (#2040), so the child cannot tell an operator's `OR=…` from the default this
+# script fell back to — and it must: refresh-candidates.sh REFUSES a checkout whose `origin` is a
+# local path only when the queue target was DECLARED, because a path cannot prove a declared pair.
+# Reading mere presence as "declared" therefore condemned the exact box the warning below calls
+# legitimate (a local mirror / file:// origin), turning a WARN into a dead cell on every pass.
+OR_OPERATOR_DECLARED=0
+[ -n "$OR_EXPLICIT" ] && OR_OPERATOR_DECLARED=1
+export OR_OPERATOR_DECLARED
 OR_RC=0
 OR="$(derive_or "$REPO" "$OR_EXPLICIT")" || OR_RC=$?
 if [ "$OR_RC" = "2" ]; then
