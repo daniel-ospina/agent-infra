@@ -138,7 +138,7 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
   # ⛔ the REAL launcher module (agent-infra#2210), not an empty placeholder: `start`'s unattended
@@ -372,7 +372,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do : > "$W/harness/$f"; done
+for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do : > "$W/harness/$f"; done
 write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
@@ -655,7 +655,7 @@ ai_worktree "$F/harness"
 # `harness-refresh.sh` joined the set in agent-infra#2215 (the loop spawns it from $O every cycle), for
 # the same reason — and the same failure mode is what a fixture gap produces: the FATAL upstream of the
 # assertions decides them, so the probe under test is never reached.
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
@@ -766,7 +766,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
@@ -1790,7 +1790,7 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do : > "$Q/harness/$f"; done
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do : > "$Q/harness/$f"; done
 write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
@@ -2029,6 +2029,26 @@ qsup status "$Q/agent-repo" "$Q/st-status-bad" OR=daniel-ospina/tortoise
 case "$Q_OUT" in
   *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
+esac
+# ⛔ NO CHECKOUT IS ITS OWN STATE, NOT AN "UNREADABLE ORIGIN" (#1977 review, P2). With `REPO` unset
+# there is no checkout and therefore no origin remote to be unreadable, and rendering it as one sends
+# the operator hunting an origin problem on a repo that does not exist — while the path printed empty
+# (`@ — origin <none>`). `status` is the very verb that must DISCOVER this, so it names the cause and
+# the missing value. rc stays 0: the verb reports, it does not refuse.
+qsup status "" "$Q/st-status-nocheckout"
+[ "$Q_RC" -eq 0 ] && ok "status: an UNSET REPO still answers (rc=0) — it is the verb an operator discovers it with" \
+                  || bad "status exited $Q_RC with no checkout, so nothing answers the discovery question"
+case "$Q_OUT" in
+  *"@ <unset>"*) ok "status: names the missing checkout value (<unset>) instead of printing an empty path" ;;
+  *) bad "status printed no <unset> placeholder for a missing REPO — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"NO CHECKOUT"*) ok "status: says NO CHECKOUT when REPO is unset" ;;
+  *) bad "status did not name the missing checkout as the cause — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"no origin remote"*) bad "status blamed a missing origin remote on a checkout that does not exist — $Q_OUT" ;;
+  *) ok "status: does not misattribute the missing checkout to an unreadable origin" ;;
 esac
 # ── (l) THE SESSION'S ENV IS CARRIED INSIDE THE COMMAND STRING — AND GH_REPO IS NOT ──────────────
 # MEASURED 2026-10-21, two failures with one root: a tmux session is served the TMUX SERVER's
@@ -3542,6 +3562,64 @@ else
   fi
 fi
 
+# (10) A DERIVED $REPO IS VALIDATED BEFORE IT REACHES THE TMUX COMMAND STRING (#1935 review).
+# `cmd_start` runs its metacharacter guard BEFORE `assert_repo` derives the checkout (`start` calls
+# `cmd_check`, which is where the derivation happens) — and that guard SKIPS an empty value. So a
+# derived path was the one interpolated value that reached `new-session "… REPO='$REPO' …"`
+# unvalidated: a checkout directory whose name carries a quote closes the quote and the remainder is
+# parsed as shell. The fix mirrors the `$HARNESS` re-check that exists for exactly this class (a value
+# that CHANGES after the guard). Driven through the shipped `check`, because that is the path a real
+# `start` takes.
+say_case "a DERIVED REPO is validated before it reaches the tmux command string (#1935)"
+# ⛔ THE ARM MUST BE HERMETIC IN BOTH DIRECTIONS (#1935 review, P2 ×2).
+#  1. The fixture repos carry a UNIQUE origin slug and `OR` is DECLARED to match it. With `OR` unset
+#     the resolver applies NO origin filter (cloud-cell-supervisor.sh: the comparison lives inside
+#     `if [ -n "${OR:-}" ]`), so EVERY provisioning candidate that is a checkout counts — and the
+#     candidate list hardcodes `/tmp/cell` and `$CELL_HOME/cell`, precisely where bring-up clones on
+#     a real cell. On such a box this control arm refused with "2 candidate checkouts match" and the
+#     quote arm reded on its second assertion ("an UNRELATED reason"), so the section proved nothing
+#     there and failed there.
+#  2. Every path literal is compared against the resolver's `pwd -P` form (it prints the value AFTER
+#     `cd … && pwd -P`), so the expected side is canonicalized too — macOS `/var` -> `/private/var`
+#     rewrites `$TMPDIR`, and a raw `$T`-spelled expectation then matches nowhere.
+#     (Same rule the claim-cwd/refresh-scout suites state.)
+# ⛔ $Q IS NOT THE QUEUE FIXTURE AT THIS POINT, AND IT IS NOT ONE ON main EITHER (#1935 review).
+# `Q` is re-assigned by LATER sections for their own private fixtures (the pin-check section sets
+# `Q="$T/pincheck"`), so aliasing this section through `Q` made it depend on SECTION ORDER: after that
+# section landed, `$Q/harness` became a checkout with no root-level worker scripts and `check` died
+# "…/orch-loop.sh missing" BEFORE the derived-REPO guard — the quote arm then "passed" for an unrelated
+# reason (a false PASS this arm's own second assertion exists to forbid) and the control reded. The
+# queue fixture is therefore referenced by ITS OWN path, captured where it is built.
+D3Q="$T/queue"
+D3="$T/derived"; mkdir -p "$D3/o" "$D3/st" "$D3/we'ird"
+ai_init_repo "$D3/we'ird"
+# The unique slug is what makes the origin filter bind to EXACTLY these fixtures: no real box has a
+# checkout whose origin is acme/widget, so a stray /tmp/cell cannot join the candidate set.
+git -C "$D3/we'ird" remote set-url origin https://github.com/acme/widget.git
+D3_OUT=''; D3_RC=0
+D3_OUT="$(env -u REPO Q_STATE="$D3/st" PATH="$D3Q/bin:$PATH" CELL_HOME="$D3Q/home" ENV_FILE="$D3Q/keys.env" \
+         OR=acme/widget SESSION="ai1935-$$" O="$D3/o" WORKDIR="$D3/we'ird" HARNESS="$D3Q/harness" HARNESS_REPO="$AI" \
+         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D3_RC=$?
+[ "$D3_RC" -ne 0 ] && ok "check REFUSED a DERIVED checkout path carrying a quote" \
+                   || bad "check ACCEPTED a derived REPO carrying a quote — it would be interpolated into the tmux command string: $D3_OUT"
+case "$D3_OUT" in
+  *"must not contain a quote or shell metacharacter"*) ok "the refusal names the metacharacter guard (not an unrelated failure)" ;;
+  *) bad "check refused for an UNRELATED reason, so the derived-REPO guard is unproven: $D3_OUT" ;;
+esac
+# …and the control: the SAME shape with a safe directory name DERIVES and proceeds, so the arm above
+# proves the guard rather than "a WORKDIR-derived repo never works".
+mkdir -p "$D3/fine" "$D3/st2"; ai_init_repo "$D3/fine"
+git -C "$D3/fine" remote set-url origin https://github.com/acme/widget.git
+D4_OUT=''; D4_RC=0
+D4_OUT="$(env -u REPO Q_STATE="$D3/st2" PATH="$D3Q/bin:$PATH" CELL_HOME="$D3Q/home" ENV_FILE="$D3Q/keys.env" \
+         OR=acme/widget SESSION="ai1935b-$$" O="$D3/o2" WORKDIR="$D3/fine" HARNESS="$D3Q/harness" HARNESS_REPO="$AI" \
+         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D4_RC=$?
+D3F_REAL="$(cd "$D3/fine" && pwd -P)"
+case "$D4_OUT" in
+  *"REPO was not set — using $D3F_REAL"*) ok "the control case DERIVES a quote-free checkout (the guard is not a general refusal)" ;;
+  *) bad "a quote-free derived checkout was NOT adopted, so the arm above proves nothing — $D4_OUT" ;;
+esac
+
 echo
 # ── §7b) agent-infra#1989: the stop/start fence, the verb path's configuration, and doctor
 # idempotency. A PRIVATE fixture (its own repo, harness and cell home): every assertion here is about
@@ -3553,7 +3631,7 @@ ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
 # without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
-for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do : > "$W2/harness/$f"; done
+for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do : > "$W2/harness/$f"; done
 write_doctor_stub "$W2/harness"
 write_doctor_stub "$W2/o"
 cat > "$W2/harness/orch-loop.sh" <<EOF

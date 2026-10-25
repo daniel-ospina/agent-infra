@@ -188,6 +188,15 @@ echo
 echo "§C lane.sh's REAL output (LANE_DRY_RUN=1)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/o/logs"
+# ⛔ THE DRY-RUN CWD MUST BE THE TARGET REPO (agent-infra#2724/#2694). lane.sh now refuses (72) when
+# the worktree's origin is not the repo it was dispatched for. This section asserts the RENDERED
+# brief, not the repo gate, so the fixture is a checkout of the `acme/widget` it names.
+git init -q "$TMP" 2>/dev/null && git -C "$TMP" remote add origin https://github.com/acme/widget.git 2>/dev/null
+# …and it is checked out on the branch the lane was told it is on: lane.sh refuses a worktree on a
+# DIFFERENT named branch (the `prfixup` shape), so a fixture on `main` would be refused for the
+# branch before this section could read the rendered brief.
+git -C "$TMP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null \
+  && git -C "$TMP" checkout -q -b fix/2148-reviewer-preflight 2>/dev/null
 # A throwaway worktree dir: lane.sh reads $PWD for the log header and the venv reaper, and
 # REAP_LANE_VENV_DISABLE keeps the reaper out of the fixture's way.
 (
@@ -494,10 +503,25 @@ echo "§F.5 NON-VACUITY — composer-level: drop ONE requirement and the asserti
 STRIP="$TMP/strip"; mkdir -p "$STRIP"
 cp "$HERE/spawn-gate.sh" "$STRIP/spawn-gate.sh"
 cp "$LANE" "$STRIP/lane.sh"
+# ⛔ THE RIG MUST CARRY THE IDENTITY MODULE, AND ITS CWD MUST BE A CHECKOUT OF THE REPO IT NAMES
+# (#2724 follow-up, found by review). `lane.sh` sources `repo-target.sh` from ITS OWN directory and
+# exits 78 when it is absent, and it then asserts the origin slug AND the branch (72). Both rigs used
+# to `cd "$TMP"`, which §C leaves checked out on `fix/2148-reviewer-preflight`, so even with the
+# module copied the lane refused with `branch-checkout-mismatch` and composed NOTHING — the two arms
+# below then PASSED because the artifact was missing, which is precisely the vacuity this section
+# exists to disprove (an absent artifact is indistinguishable from a successful strip).
+cp "$HERE/repo-target.sh" "$STRIP/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP/repo-slug.sh"
 sed '/^- \*\*\[d\] plan evidence\*\*/,+2d' "$HELPER" > "$STRIP/reviewer-preflight.sh"
 [ -s "$STRIP/reviewer-preflight.sh" ]; ck $? "the stripped helper copy was produced"
+# A checkout BORN on the branch the lane is told it is on (no `git checkout`, so no branch state is
+# ever mutated to build a fixture) with a real origin slug, so the gate is satisfied by identity and
+# the assertion under test is the brief's, not the repo's.
+STRIPREPO="$TMP/strip-repo"; mkdir -p "$STRIPREPO" "$TMP/o3/logs"
+git -c init.defaultBranch=fix/strip init -q "$STRIPREPO" 2>/dev/null \
+  && git -C "$STRIPREPO" remote add origin https://github.com/acme/widget.git 2>/dev/null \
+  && git -C "$STRIPREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null
 (
-  cd "$TMP" || exit 1
+  cd "$STRIPREPO" || exit 1
   O="$TMP/o3" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     bash "$STRIP/lane.sh" 2325 fix/strip acme/widget
 ) >/dev/null 2>&1
@@ -508,10 +532,15 @@ has_req_a "$STRIPPED" && has_req_e "$STRIPPED"; ck $? "…and the untouched requ
 # …and the same control for the HEAD-BINDING sentence, which is the rule a lane most needs.
 STRIP2="$TMP/strip2"; mkdir -p "$STRIP2"
 cp "$HERE/spawn-gate.sh" "$STRIP2/spawn-gate.sh"; cp "$LANE" "$STRIP2/lane.sh"
+cp "$HERE/repo-target.sh" "$STRIP2/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP2/repo-slug.sh"
 sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
 [ -s "$STRIP2/reviewer-preflight.sh" ]; ck $? "the head-binding-stripped helper copy was produced"
+STRIPREPO2="$TMP/strip2-repo"; mkdir -p "$STRIPREPO2" "$TMP/o4/logs"
+git -c init.defaultBranch=fix/strip2 init -q "$STRIPREPO2" 2>/dev/null \
+  && git -C "$STRIPREPO2" remote add origin https://github.com/acme/widget.git 2>/dev/null \
+  && git -C "$STRIPREPO2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null
 (
-  cd "$TMP" || exit 1
+  cd "$STRIPREPO2" || exit 1
   O="$TMP/o4" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     bash "$STRIP2/lane.sh" 2325 fix/strip2 acme/widget
 ) >/dev/null 2>&1
