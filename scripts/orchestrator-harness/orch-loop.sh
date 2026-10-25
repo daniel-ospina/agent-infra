@@ -628,6 +628,28 @@ elif [ -n "$_lo_mod" ]; then
   printf '[select] live-ownership.sh is present but INCOMPLETE (needs lo_scan/lo_order/lo_select_rows/lo_select/lo_class_compact) — ownership stays registry-only this cycle\n' >> "$LOG" 2>/dev/null || true
 fi
 
+# ── OWNERSHIP PROOF-OF-LIFE AND THE DRAIN ESCAPE (agent-infra#2831) ──────────────────────────────
+# `pr-owner-liveness.sh` answers two questions the loop could not answer about itself: "is the thing
+# that claims this PR still ALIVE?" and "when the PR path has started nothing for N stalled passes,
+# does the box ever get to do its other job?". Sourced from the SAME two homes as every module here,
+# and gated on the INTERFACE (`declare -f`), not on the file — a present-but-stale `$O` copy must
+# degrade to the pre-#2831 behaviour (the loose lock guard, and no escape) and SAY so, never enable
+# half of it. A silent absence would read exactly like a working proof.
+PL_MOD=0
+_pl_mod=""
+if [ -f "$O/pr-owner-liveness.sh" ]; then _pl_mod="$O/pr-owner-liveness.sh"
+elif [ -f "$(dirname "$0")/pr-owner-liveness.sh" ]; then _pl_mod="$(dirname "$0")/pr-owner-liveness.sh"
+fi
+if [ -n "$_pl_mod" ]; then
+  # shellcheck source=/dev/null
+  . "$_pl_mod"
+fi
+if declare -f pl_verdict pl_escape_open pl_escape_line pl_escape_record pl_note_pass pl_idle_streak pl_streak_reset pl_escape_bound >/dev/null 2>&1; then
+  PL_MOD=1
+elif [ -n "$_pl_mod" ]; then
+  printf '[select] pr-owner-liveness.sh is present but INCOMPLETE (needs pl_verdict/pl_escape_open/pl_escape_line/pl_escape_record/pl_note_pass/pl_idle_streak/pl_streak_reset/pl_escape_bound) — PR ownership keeps the loose lock guard and DRAIN STALLED keeps its old no-action verdict this cycle\n' >> "$LOG" 2>/dev/null || true
+fi
+
 # ── the record a RAIL REFUSAL leaves behind (the red-fixer role reads it) ────────
 # `merge-one.sh` writes it (`rail-refusal.sh` classifies and stores the refusal, head-bound), and
 # the PR sweep below turns it into a fixer lane. Sourced from the SAME two homes as every module
@@ -2995,6 +3017,43 @@ pr_owned() { # <pr> <head-sha> [<head-ref>] -> 0 when something is currently wor
   return 1
 }
 
+# ── OWNERSHIP IN THE SPAWN ARMS: PROVEN, OR RELEASED (agent-infra#2831) ─────────────────────────
+# ⛔ THE MEASURED DEFECT: `[pr] PR path: NO UNIT SPAWNED this cycle — 8 row(s) with a named reason
+# (most common: 5 a worker already owns this PR)` while `lanes=0/0` and NO such workers existed. The
+# arms below tested `claim_live` — the SPAWN GUARD, whose first arm is a deliberately-loose "any live
+# pid holds the lock" test — so a `mergeclaim-<PR>.lock` whose writer had died (and whose pid was
+# recycled by any unrelated process) kept its PR owned for ever: not spawnable (owned), not in the
+# un-owned queue (owned), and never released (nothing reaps it). `claim_live`'s looseness is CORRECT
+# for its own question ("may I work this?" — one lost merge is cheaper than a second worker); it is
+# WRONG for the question these arms are asked, which is "is someone ALREADY working it?". Two
+# questions, two predicates — the same split `pr_owned`/`claim_live` already documents above.
+# So ownership here is `pr_owned` (a live process's cwd, a cmdline-BOUND lock, or a live foreign lease)
+# plus the live worker record, and when NOT ONE of them holds while a lock exists, that lock is
+# RELEASED with its reason in the log. That is the same proof-of-life `[reap]` applies to checked.txt
+# entries: "no proven fact -> release". The over-release direction is bounded by the arms: a released
+# PR simply re-enters the un-owned queue, where the rail and the cross-box CAS still refuse a second
+# worker — while staying "owned" is unbounded and is what stopped the box doing either job.
+pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (reaps a stale lock)
+  local pr="${1:-}" sha="${2:-}" br="${3:-}" _v _lk
+  case "$pr" in ''|*[!0-9]*) return 1 ;; esac
+  # 1. the live facts `pr_owned` already proves (cwd scan, cmdline-bound lock, foreign lease).
+  if pr_owned "$pr" "$sha" "$br"; then return 0; fi
+  # 2. the worker RECORD (census: a `dead` row is excluded there, `unknown` counts live).
+  if sess "fix-$pr" || sess "merge-$pr"; then return 0; fi
+  # 3. NOTHING PROVEN. With the proof module available the verdict is a RELEASE — and it removes the
+  #    record, because a verdict of "not owned" that leaves the un-spawnable record on disk would
+  #    leave the PR exactly as stuck as before (that is the defect, not the fix). Without the module
+  #    the pre-#2831 loose guard stands, unchanged and named, rather than being silently dropped.
+  if [ "${PL_MOD:-0}" = "1" ]; then
+    _lk="$O/state/mergeclaim-$pr.lock"
+    [ -f "$_lk" ] || return 1
+    _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)" || true
+    echo "[reap] #$pr released — ${_v#RELEASED	}" >> "$LOG" 2>/dev/null || true
+    return 1
+  fi
+  claim_live "$pr" "$sha"
+}
+
 # claim_foreign_live <pr> <head-sha> -> 0 when a LIVE claim on that head is held by ANOTHER BOX.
 # ⛔ A claim held by THIS box is NOT covered here: its liveness must be proven by a live process
 # (arms 1-2 above), never by the lease it wrote. `claim_live` remains the SPAWN guard — it answers
@@ -4222,7 +4281,7 @@ while true; do
             fi
             park_ctrl "$PR" "$HEAD_N" "rail refused a RED TREE and $RF_N red-fixer attempt(s) at this head did not clear it (MAX_RED_FIX_TRIES=${MAX_RED_FIX_TRIES:-2}). REFUSAL (verbatim): ${RF_REASON:-<none recorded>} -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/railrefusal-$PR' '$O/state/redfix-$PR' '$O/state/fixcount-$PR'"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "parked: the rail still refuses a RED TREE after $RF_N fixer attempt(s) at this head"
-          elif sess "fix-$PR" || sess "merge-$PR" || claim_live "$PR" "$HEAD_N"; then
+          elif pr_owner_live "$PR" "$HEAD_N" "${BR:-}"; then
             # (2) EXACTLY ONE LIVE FIXER PER PR. The key is the PR number in the session/lock name, so a
             # second refusal while a fixer works spawns NOTHING (a second lane is how two workers push
             # to one branch).
@@ -4403,7 +4462,7 @@ while true; do
             fi
             park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC fixes (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "parked: still conflicted after $NFC fixes — needs a human"
-          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
@@ -4492,7 +4551,7 @@ while true; do
           # minutes of a BLOCKED controller cycle with dispatch halted — the very starvation this
           # issue is about. The worker is single-owner (merge-one.sh's local lock + cross-box claim)
           # and slot- and load-gated like every other spawn.
-          if sess "merge-$PR" || claim_live "$PR" "${HEAD_N:-}"; then
+          if pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a rail worker already owns this PR
             disp "$PR" "${HEAD_N:-}" GREEN wait "a rail worker already owns this PR"
           elif [ "$(wt_count merge-)" -lt "$MR" ] && can_spawn; then
@@ -4603,7 +4662,7 @@ while true; do
           fi
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
-          if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
+          if pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # this PR already has a worker in flight
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           else
@@ -4804,7 +4863,7 @@ while true; do
             fi
             park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
             disp "$PR" "${HEAD_N:-}" "$V" wait "parked: CI still red after $NFC2 fixes — needs a human"
-          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
@@ -5513,6 +5572,22 @@ PY
           # only: a failed write must keep the COULD-NOT-RECORD message, not an ESCALATED one.
           _escl="$(drain_stall_label)"; [ -n "${_escl:-}" ] || _escl="UNMEASURED"
           _esc="ESCALATED -> state/drain-stall (pass ${_dpass}); the cycle status line now carries drain=${_escl} until a PR lands"
+          # ── THE INERT-PATH COUNTER (#2831) ────────────────────────────────────────────────────
+          # ⛔ WHAT MAKES THIS AN ACTION INSTEAD OF A LOG LINE. The stall has always been able to
+          # say "nothing landed"; it could not say whether ANYONE STARTED ANYTHING, so a box whose
+          # PR path was spawn-dead and a box whose workers were running but blocked read the same and
+          # both idled. The counter advances ONLY on a MEASURED zero spawns (`_spk` empty =
+          # UNMEASURED, which neither advances nor resets — inventing progress from a directory the
+          # cycle could not read is the exact defect this file keeps deleting). Any spawn resets it,
+          # so the owner's 2026-10-18 ruling keeps applying unchanged to every real land/capacity
+          # stall; only the "started nothing" degenerate state is escaped from, and the escape is
+          # bounded because it resets the counter after firing.
+          _escbound="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}")"
+          if [ "${PL_MOD:-0}" = "1" ]; then
+            _streak="$(pl_note_pass "$O/state" "${_spk:-}" "${UPN_WORK:-}")"
+            is_num "${_streak:-}" || _streak=0
+            _esc="$_esc; the PR path has STARTED NOTHING for ${_streak}/${_escbound} consecutive stalled pass(es) — at ${_escbound} the issue path opens (state/pr-path-idle)"
+          fi
         else
           _esc="ESCALATION COULD NOT BE RECORDED (state/ is unwritable) — this line is the only trace"
         fi
@@ -5568,6 +5643,35 @@ PY
     fi
     # [drain-clear:end]
   fi
+  # [drain-escape:begin] (DRIVEN by pr-owner-liveness.test.sh through the module; the WIRING here is
+  # reviewed, not extracted — keep the markers)
+  # ⛔ THE DETECTOR NOW ACTS (agent-infra#2831 ask 2). Measured on the live box: `DRAIN STALLED — no PR
+  # merged within the last 360m while 3 un-owned remain. The issue path stays CLOSED` printed pass
+  # after pass while the PR path had spawned nothing in 93 cycles. The box could neither land nor open
+  # work — a detector that cannot act is a log line, not a control.
+  # ⛔ THE RULING IS KEPT WHERE IT APPLIES. "No new work while un-owned PRs remain" exists so a
+  # stalled drain cannot be hidden behind fresh activity. That reasoning holds while the PR path is
+  # WORKING; it does not hold when the PR path has started nothing for N consecutive stalled passes,
+  # because then nothing is being hidden and nothing is being drained. Any spawn resets the streak, so
+  # a land/capacity stall (workers running, nothing landing) still never opens the issue path —
+  # unchanged. OVERRIDES: the 2026-10-18 "never a release valve" ruling, for the "started nothing"
+  # state only, bounded and logged here with the counts the decision was taken from.
+  # ⛔ ONE ESCAPE PER N INERT PASSES, NOT ONE PER PASS: `pl_escape_record` resets the streak on a
+  # successful write, so the loop cannot spin, and it reports when the record could NOT be written.
+  _eb="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}")"
+  if [ "${LO_CHOICE:-none}" != "pr" ]; then
+    # Not blocked by un-owned PRs: a streak from an earlier stall is a stale flag and is cleared.
+    [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
+  elif [ "${PL_MOD:-0}" = "1" ] && pl_escape_open "$O/state" "${UPN_WORK:-}" "$_eb"; then
+    printf '%s\n' "$(pl_escape_line "$O/state" "${UPN_WORK:-}" "$_eb")" >> "$LOG"
+    if PL_ESCAPE_BOUND="$_eb" pl_escape_record "$O/state" "${UPN_WORK:-}" "${PRDISP_SPAWNS:-}"; then
+      echo "[dispatch] DRAIN ESCAPE RECORDED -> state/drain-escape (issue path OPEN this cycle; the inert-path counter reset to 0, so the next escape needs $_eb more stalled pass(es))" >> "$LOG"
+    else
+      echo "[dispatch] DRAIN ESCAPE RECORD COULD NOT BE WRITTEN (state/ is unwritable) — the issue path still OPENS this cycle (an unpersisted action must not be withheld), but the counter could not be reset and the bound cannot be proven" >> "$LOG"
+    fi
+    LO_CHOICE=issue
+  fi
+  # [drain-escape:end]
   # The printed decision is AUTHORITATIVE over the issue path: if the funnel did not choose issue
   # work, nothing opens a lane for an issue, even if every capacity gate below happens to pass.
   # ⛔ FAIL-CLOSED DEFAULT, AND IT IS LOAD-BEARING (#2126). `LO_CHOICE` is set by `lo_select`, but the
