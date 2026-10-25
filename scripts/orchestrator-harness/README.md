@@ -4124,8 +4124,13 @@ session-started controller with `pkill -f "[b]ash $O/orch-loop.sh"` (§6) rather
 
 ⚠️ **Ask for the label, not for `grep orchestrator`.** The watchdog (§7.2g) makes a second label
 containing `orchestrator` exist, so `launchctl list | grep orchestrator` now answers about BOTH jobs —
-it prints the watchdog's row for a box whose controller is not running at all. The same substring bug
-had `report.sh` printing `UP` for a stopped controller (pinned in `watchdog.test.sh`).
+it prints the watchdog's row for a box whose controller is not running at all. ⛔ The same two-label
+list is why `report.sh` and `bin/harness` carry a shared `-watchdog` exclusion (`HARNESS_SIDECAR_RE`)
+beside the anchored `HARNESS_UNIT_RE`: a `StartInterval` agent holds a real pid exactly while it runs,
+so without it the controller line printed `UP (pid <watchdog>)` for a box with NO controller
+(measured). `selftest.sh` drives BOTH instruments against that list from any platform (it stubs
+`uname`, so the macOS arm is exercised in the Linux lane too); `watchdog.test.sh`'s arm of the same
+fixture is macOS-only, and the `bash-suites` lane runs `ubuntu-latest`, so it cannot be the pin.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `lane.sh`'s `uv sync --extra embeddings --extra parity`, the
@@ -4363,6 +4368,15 @@ the report called a box whose own job was LOADED-but-not-running `UP (pid 999)` 
 pid, while `doctor` said `supervisor: none`). The pattern is duplicated rather than sourced because
 `bin/harness` ships from `bin/` and the `$O` copier would not carry a shared file to both — so
 `selftest.sh` asserts the two literals are IDENTICAL, and a loosening on one side reds the suite.
+
+⛔ **An orchestrator-named SIDECAR is not the controller either (#1986).** The anchored pattern
+matches any orchestrator-named job on purpose (that is how a foreign label is resisted), so the
+watchdog the same change installs matches it — and a `StartInterval` job holds a real pid exactly
+while it runs. Without an exclusion, a box whose controller was STOPPED and whose watchdog was armed
+reported `UP (pid <watchdog>)` in the report and `supervisor: launchd [job …-watchdog is RUNNING]` in
+`doctor`. Both now read `HARNESS_SIDECAR_RE='-watchdog$'` (a second literal, byte-identical in both
+files and asserted by the same `selftest.sh` check), and `selftest.sh` drives both instruments against
+a two-label `launchctl` stub from ANY platform by stubbing `uname`.
 
 ### Ports taken from the retired fork
 

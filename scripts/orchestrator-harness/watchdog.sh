@@ -304,6 +304,15 @@ fi
 #        (#1975, and the durability suite refuses a shipped line that issues one).
 if [ "$ST" -eq 0 ]; then
   say "present but not running (pid=none) — kickstarting"
+  # ⛔ `enable` HERE IS A NO-OP IN THE ORDINARY CASE and it STAYS (review P2, non-blocking, recorded
+  # rather than silently dropped). Enabling a job that is already in the domain changes nothing, so
+  # `kick_svc` is the verb that matters in this branch. It is kept because the one read that produced
+  # `ST=0` cannot distinguish "loaded and stopped" from "loaded but a Disabled override was written
+  # while it was loaded" — and a disabled job is exactly one `kickstart` may refuse to start, which
+  # would leave this branch logging RECOVERY FAILED with its remedy in its own hands. Clearing the
+  # override costs one syscall and cannot start, stop or interrupt anything. The user-domain case in
+  # `watchdog.test.sh` also pins that BOTH verbs reach the domain holding the job, since they are
+  # `gui/`-vs-`user/`-specific while the READ is domain-agnostic.
   enable_svc || true
   kick_svc || true
 else

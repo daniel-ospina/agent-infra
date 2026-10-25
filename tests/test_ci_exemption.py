@@ -27,6 +27,7 @@ import pytest
 import importlib.util
 import itertools
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -2854,27 +2855,31 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
     `bash-shard::scripts-a-b.test.sh`, and `decide` returned `exempt` for the colliding key.
     The constant `bash-shard` signature cannot save it, because EVERY shard carries it.
 
-    Reads the REAL list (not a fixture), and asserts the token IS the path verbatim — the
-    earlier version of this vector fed `path` + its trailing `# comment` (every listed line has
-    one), so all 80 took the old slug fallback and the vector stayed green while asserting a
-    token nobody would ever compare. Caught in #2648 review cycle 3.
+    Reads the REAL list (not a fixture) — from the runner's OWN `--list`, which is the list it
+    EXECUTES. ⛔ NOT by parsing the script's text: since agent-infra#2614 the shard list is DERIVED
+    from the tree (`SUITE_GLOBS`), so the 79 hand-appended `run_shard <path>` lines this vector used
+    to scan no longer exist. A text parse then reads 0 paths and the vector reddens its own
+    non-vacuity floor (`parsed only 0 listed shards`) instead of testing anything — measured on the
+    `test` job after #2614 landed. `--list` is also the stronger source: it prints exactly the paths
+    the run executes, resolved from ONE place, so a suite the runner excludes (a `# shard: off`
+    marker) is not asserted about here.
+
+    The rest is unchanged and still the point: the token IS the path verbatim, and the mapping is
+    injective.
     """
-    src = (Path(__file__).resolve().parent.parent / "scripts/run-bash-shards.sh").read_text()
-    listed = []
-    for line in src.splitlines():
-        line = line.strip()
-        if not line.startswith("run_shard "):
-            continue
-        # The runner's own `--list` derives the path with `\([^ ]*\.sh\)`, i.e. the first
-        # space-free token ending in `.sh`. Match that, so a trailing `# comment` is never
-        # part of the path this vector tests.
-        m = re.search(r"(\S+\.sh)\b", line.split(None, 1)[1])
-        if m is None or m.group(1).startswith("$"):
-            continue  # an interpolated or sentinel call, not a listed path
-        listed.append(m.group(1))
+    repo = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        ["bash", str(repo / "scripts/run-bash-shards.sh"), "--list"],
+        cwd=str(repo), capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 0, (
+        f"the runner's own `--list` failed (rc {proc.returncode}), so this vector cannot see the real "
+        f"list: {(proc.stderr or proc.stdout).strip()[:400]}"
+    )
+    listed = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
     assert len(listed) >= 60, (
-        f"parsed only {len(listed)} listed shards — the list format changed, so this vector "
-        "would pass vacuously"
+        f"`--list` printed only {len(listed)} shards — the runner's own discovery is broken, so "
+        "this vector would pass vacuously"
     )
     ids = {}
     for path in listed:

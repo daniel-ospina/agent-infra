@@ -3967,15 +3967,45 @@ LC
   esac
   [ "$rc" -eq 0 ] || echo "      $(printf '%s' "$rout5" | tr '\n' '|')"
   ck "report.sh: ANOTHER repo's orchestrator job is never this box's controller (no false UP)" $rc
+  # ⛔ A SECOND, ORCHESTRATOR-NAMED JOB ON THIS BOX IS STILL NOT THE CONTROLLER (#1986). The anchored
+  # pattern above matches ANY orchestrator-named job on purpose (that is how a foreign label is
+  # resisted), so an agent added BESIDE the controller matches it too — and a `StartInterval` job
+  # holds a real pid exactly while it runs. Driven with the loop LOADED-BUT-STOPPED (`-`) and the
+  # sidecar RUNNING, which is the state the fleet is in whenever the controller dies on a box whose
+  # watchdog is armed: the pre-fix read took the sidecar's pid and printed `UP (pid 4242)` for a box
+  # with NO controller — the false UP this read exists to end, one label over (measured).
+  cat > "$RB/launchctl" <<'LC'
+#!/bin/bash
+[ "$1" = list ] || exit 1
+printf 'PID\tStatus\tLabel\n'
+printf '%s\t0\tcom.apple.powerd\n' '-'
+printf '%s\t0\tcom.eldato.orchestrator-loop\n' '-'
+printf '%s\t0\tcom.eldato.orchestrator-watchdog\n' '4242'
+exit 0
+LC
+  chmod +x "$RB/launchctl"
+  rout6="$(PATH="$RB:$PATH" O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout6" in
+    *"UP (pid"*|*4242*) rc=1 ;;
+    *"NOT RUNNING"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  [ "$rc" -eq 0 ] || echo "      $(printf '%s' "$rout6" | tr '\n' '|')"
+  ck "report.sh: a sidecar 'orchestrator-watchdog' job is not this box's controller (control: loop STOPPED)" $rc
   # ⛔ TWO COPIES OF ONE ANCHORED PATTERN, SO ASSERT THEY AGREE. `HARNESS_UNIT_RE` is duplicated on
   # purpose (bin/harness ships from bin/, these scripts ship to $O, so a sourced file would not reach
   # both) — which means it can DRIFT, and a loosening on one side would silently reopen the very
   # attribution defect both comments cite. Byte equality is cheap to assert and impossible to forget.
   if [ -f "$HERE/../../bin/harness" ]; then
-    pat_of() { sed -n "s/^[[:space:]]*HARNESS_UNIT_RE='\\(.*\\)'[[:space:]]*$/\\1/p" "$1" | head -1; }
-    rpat="$(pat_of "$HERE/report.sh")"; hpat="$(pat_of "$HERE/../../bin/harness")"
+    pat_of() { sed -n "s/^[[:space:]]*$2='\\(.*\\)'[[:space:]]*$/\\1/p" "$1" | head -1; }
+    rpat="$(pat_of "$HERE/report.sh" HARNESS_UNIT_RE)"; hpat="$(pat_of "$HERE/../../bin/harness" HARNESS_UNIT_RE)"
     [ -n "$rpat" ] && [ "$rpat" = "$hpat" ] && rc=0 || { rc=1; echo "      report.sh=[$rpat] bin/harness=[$hpat]"; }
     ck "report.sh and bin/harness match the launchd label on the SAME anchored pattern (no drift)" $rc
+    # …and the SIDECAR exclusion is the same second literal on both sides (a drift here re-opens
+    # #1986 on one instrument only, which is how the two disagreed about a stopped controller before).
+    rside="$(pat_of "$HERE/report.sh" HARNESS_SIDECAR_RE)"; hside="$(pat_of "$HERE/../../bin/harness" HARNESS_SIDECAR_RE)"
+    [ -n "$rside" ] && [ "$rside" = "$hside" ] && rc=0 || { rc=1; echo "      report.sh=[$rside] bin/harness=[$hside]"; }
+    ck "report.sh and bin/harness exclude the same sidecar label (the watchdog never answers for the controller)" $rc
   fi
   case "$rout" in *"orchestrator report"*) rc=0;; *) rc=1;; esac
   ck "report.sh prints the window header" $rc
@@ -4099,6 +4129,24 @@ LC
   hout2="$(PATH="$TMP/lstub:$PATH" O="$HL/absent" "$HARNESS" doctor --json 2>/dev/null)"
   printf '%s' "$hout2" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["supervisor"]!="launchd", d["supervisor"]' 2>/dev/null && rc=0 || rc=1
   ck "bin/harness doctor: ANOTHER repo's orchestrator label is NOT this box's supervisor" $rc
+  # ⛔ …AND A SIDECAR ON THIS BOX IS NOT THE SUPERVISOR EITHER (#1986). `com.eldato.orchestrator-
+  # watchdog` matches the anchored pattern, is loaded beside the controller, and holds a real pid
+  # while it runs — so doctor answered `supervisor: launchd [job com.eldato.orchestrator-watchdog is
+  # RUNNING]` for a box whose controller was STOPPED. The loop is listed LOADED-BUT-STOPPED (`-`)
+  # and the sidecar RUNNING: the verdict must not come from the sidecar's pid.
+  cat > "$TMP/lstub/launchctl" <<'LC'
+#!/bin/bash
+[ "$1" = list ] || exit 1
+printf 'PID\tStatus\tLabel\n'
+printf '%s\t0\tcom.apple.powerd\n' '-'
+printf '%s\t0\tcom.eldato.orchestrator-loop\n' '-'
+printf '%s\t0\tcom.eldato.orchestrator-watchdog\n' '4242'
+exit 0
+LC
+  chmod +x "$TMP/lstub/launchctl"
+  hout2="$(PATH="$TMP/lstub:$PATH" O="$HL/absent" "$HARNESS" doctor --json 2>/dev/null)"
+  printf '%s' "$hout2" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["supervisor"]!="launchd", d.get("supervisorEvidence")' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: a sidecar 'orchestrator-watchdog' job is NOT this box's supervisor" $rc
   # ⛔ BOTH DEFECTS AT ONCE NAME BOTH (review P2, round 3): a reappeared fork used to MASK an
   # incomplete canonical copy, so the missing file went unnamed and was discoverable only by deleting
   # the fork and re-running. Driven through `doctor` in a fixture tree (CANON is resolved from the

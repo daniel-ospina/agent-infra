@@ -640,7 +640,14 @@ chmod +x "$SEED/bin/launchctl" "$SEED/bin/plutil" "$SEED/bin/tmux" "$SEED/bin/gh
 # surface from OR. Inheriting them made this section pass only where the caller's environment happened to
 # carry a valid REPO, i.e. the non-hermetic shape every other install.sh caller in this repo avoids
 # (`selftest.sh`, the durability suite). Every claim below depends on this run completing.
+# ⛔ `HARNESS_REPO` BELONGS TO THE SANDBOX TOO, for the same reason and one more. install.sh resolves
+# the checkout it MATERIALISES the pin from through `git worktree list` on its own dir — i.e. the
+# repo's MAIN worktree, which on a fleet box is whatever checkout happens to be there (measured: an
+# incomplete one, where install.sh refused with 'no materialiser exists at …/cloud-cell-supervisor.sh'
+# and the three claims below went unproven, i.e. a GREEN section that proves nothing). The sandbox
+# names the checkout explicitly, so this section does not depend on box state.
 _seed_run() { env HOME="$SEED/home" O="$SEED/o" REPO="$(cd "$HERE/../.." && pwd)" OR="acme/widget" \
+                  HARNESS_REPO="$(cd "$HERE/../.." && pwd)" \
                   PATH="$SEED/bin:$PATH" STUB_CALLS="$SEED/calls" \
                   STUB_DIR="$SEED" ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
                   bash "$INST" "$@"; }
@@ -739,6 +746,7 @@ INST_O="$U/o<x>y"
 # from OR, so an inherited-or-absent pair made this Darwin group pass only on a box whose
 # environment happened to carry a valid checkout. Self-contained, like `_seed_run` above.
 iu() { env HOME="$U/home" O="$INST_O" REPO="$(cd "$HERE/../.." && pwd)" OR="acme/widget" \
+            HARNESS_REPO="$(cd "$HERE/../.." && pwd)" \
             PATH="$U/bin:$PATH" STUB_CALLS="$U/calls" STUB_DIR="$U" bash "$INST"; }
 : > "$U/calls"
 # ⛔ GATE ON THE PLATFORM, NOT ON A TOOL. install.sh refuses outright off macOS ("this harness uses
@@ -773,10 +781,24 @@ if [ "$(uname)" = "Darwin" ]; then
     # writer dies of SIGPIPE, so the PIPELINE reports failure while the pattern DID match — the idiom the
     # repo's own `check-no-sigpipe-grep.sh` bans (#841/#864), and the same mechanism that made a healthy
     # controller read as dead in `watchdog.sh`. Capture, then test in the shell.
-    _banner="$(grep -F 'undeclared' "$U/out" 2>/dev/null || true)"
-    case "$_banner" in
-      *'watchdog-off'*) ok "the install banner keeps the declared-stop sentence (a bare backtick in the unquoted heredoc would have eaten it)" ;;
-      *) bad "the install banner lost the declared-stop sentence — a backtick in the unquoted heredoc consumed it: $(printf '%s' "$_banner" | head -1)" ;;
+    # ⛔ THE ASSERTION IS OVER A WINDOW, NOT ONE LINE. The declared-stop sentence WRAPS: the sentinel is
+    # named on the `STOPPING BY HAND: declare the stop FIRST (touch $O/.watchdog-off)` line and the
+    # consequence (`undeclared hand-stop …`) begins on the next one, so a single-line reader asserted a
+    # combination the banner cannot produce and the case could only ever be red where the banner is
+    # printed — measured: green in CI (macOS-only group) and red on any box whose install run completes.
+    _ban_stop="$(grep -F -A2 'STOPPING BY HAND' "$U/out" 2>/dev/null || true)"
+    case "$_ban_stop" in
+      *'.watchdog-off'*'undeclared hand-stop'*) ok "the install banner keeps the declared-stop sentence and names the sentinel (touch \$O/.watchdog-off)" ;;
+      *) bad "the install banner lost the declared-stop sentence: $(printf '%s' "$_ban_stop" | head -2 | tr '\n' ' ')" ;;
+    esac
+    # …and the ACTUAL backtick hazard: the verbs on the `persistent-disable verb` line are wrapped in
+    # backticks, so an UNESCAPED one is command substitution — the word is executed away and the operator
+    # reads "or a  whose  then fails" at rc 0, with the BACKTICKS also gone. The sentence must survive
+    # WITH its backticks, so the pattern keeps them (and is therefore not satisfiable by the eaten form).
+    _ban_verbs="$(grep -F 'persistent-disable verb' "$U/out" 2>/dev/null || true)"
+    case "$_ban_verbs" in
+      *'or a `bootout` whose `bootstrap` then fails'*) ok "the install banner's backticked verbs survive the unquoted heredoc as text (bootout/bootstrap are not executed away)" ;;
+      *) bad "the install banner lost its backticked verbs — an UNESCAPED backtick in the unquoted heredoc executed them: $(printf '%s' "$_ban_verbs" | head -1)" ;;
     esac
     if grep -q 'launchctl bootstrap' "$U/out" && ! grep -qE 'launchctl (load|unload) -w' "$U/out"; then
       ok "the install banner hands over the bootstrap form only — never a -w verb"

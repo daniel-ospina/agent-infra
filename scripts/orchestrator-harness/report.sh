@@ -63,7 +63,16 @@ if [ "$PLATFORM" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
   # TWO-COPY constant rather than a sourced one because `bin/harness` ships from `bin/` while these
   # scripts ship to `$O` — the `install.sh` copier would not carry a shared file to both.
   HARNESS_UNIT_RE='^(com\.eldato\.)?(orchestrator|eldato-orchestrator)[-.]'
-  # ⛔ THE PATTERN IS PASSED THROUGH THE ENVIRONMENT, NOT `-v`: a `-v` assignment is
+  # ⛔ A SECOND JOB IS NOT THE CONTROLLER (#1986). The pattern above deliberately matches ANY
+  # orchestrator-named job (that is how another repo's label is RESISTED), so an agent added BESIDE
+  # the controller — `com.eldato.orchestrator-watchdog` — matches it too. A `StartInterval` job holds
+  # a real pid exactly while it runs, so with the controller stopped and that job alive the read
+  # below took the WATCHDOG's pid and printed `UP (pid <watchdog>)`: the same false UP the anchored
+  # pattern was introduced to end, one label over (measured, and pinned in `selftest.sh` from any
+  # platform by stubbing `uname`). The sidecar is excluded BY NAME, and the exclusion is a second
+  # literal shared byte-for-byte with `bin/harness` (asserted by `selftest.sh` like the pattern).
+  HARNESS_SIDECAR_RE='-watchdog$'
+  # ⛔ THE PATTERNS ARE PASSED THROUGH THE ENVIRONMENT, NOT `-v`: a `-v` assignment is
   # ESCAPE-PROCESSED by awk, so on gawk/BSD awk `\.` becomes a bare `.` and the anchor degrades to
   # a wildcard — the very class this closes. `ENVIRON` is read verbatim.
   # `launchctl list` prints `PID\tStatus\tLabel`, and `-` in the PID column means LOADED but NOT
@@ -71,7 +80,8 @@ if [ "$PLATFORM" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
   # branching on the field also closes the second half of the measured defect: with two matching
   # jobs `$pid` was a MULTI-LINE value, which `[ "$pid" = "-" ]` cannot read as "not running", so
   # `UP (pid 4242<newline>-)` was printed for a box with no controller.
-  _ll="$(launchctl list 2>/dev/null | RE="$HARNESS_UNIT_RE" awk '$3 ~ ENVIRON["RE"] { print $1" "$3 }' || true)"
+  _ll="$(launchctl list 2>/dev/null | RE="$HARNESS_UNIT_RE" SIDE="$HARNESS_SIDECAR_RE" \
+        awk '$3 ~ ENVIRON["RE"] && $3 !~ ENVIRON["SIDE"] { print $1" "$3 }' || true)"
   pid="$(printf '%s\n' "$_ll" | awk '$1 ~ /^[0-9]+$/ { print $1; exit }')"
   _job="$(printf '%s\n' "$_ll" | awk 'NF { print $2; exit }')"
   if [ -n "${pid:-}" ]; then
