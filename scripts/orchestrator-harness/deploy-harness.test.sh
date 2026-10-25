@@ -1191,6 +1191,14 @@ done
 # "$O/claims.sh"`), a systemd `install -m … "$UNIT_DIR/"`, or prose that merely mentions `$O` later
 # on the line.
 BARE_PAT='cp[[:space:]][^|;&]*[*]\.sh[[:space:]]+[^[:space:]`]'
+# ⛔ BARE_PAT IS SOURCE-FIRST ONLY, so it can never see `cp -t "$O"/ "$H"/*.sh` — the DESTINATION-FIRST
+# spelling of the very same copy (review P2 2026-10-25, measured: 0 hits). `-t`/`-pt`/`--target-directory`
+# are one-token respellings of the guarded shape, so the pair would otherwise be defeated by reordering
+# the arguments. Two shapes go into the positive control below, so this arm is pinned the same way.
+# The optional `([^|;&]*[[:space:]])?` lets the flag follow `cp ` directly OR appear after other
+# arguments; the flag token must END in `t` (`-t`, `-pt`, `-Rt`) and be followed by a space, so a
+# legitimate `cp -R "$f" "$O/"` or `cp -p x.txt y/` is not flagged.
+BARE_T_PAT='(^|[^[:alnum:]_])(cp|rsync)[[:space:]]([^|;&]*[[:space:]])?(-[[:alpha:]]*t[[:space:]]|--target-directory(=|[[:space:]]))[^|;&]*[*]\.sh'
 # ⛔ THE DESTINATION MATCHES BOTH SPELLINGS OF THE VARIABLE (review P2 2026-10-25): the first version
 # anchored on a literal `$(O|OUT)`, so `cp -R "$H"/. "${O}"/` — a one-token respelling of the #2041
 # incident line, and `${O}` is live spelling in the shipped scripts — escaped the detector built to
@@ -1209,8 +1217,8 @@ _bare_cp_hits() {  # $1 = file → offending "LINENO: line" records, comments st
   # function used to carry, that failure was SILENT: every file scanned to zero hits, so the guard
   # reported a clean tree while matching nothing. ENVIRON is not escape-processed, and stderr is left
   # unwrapped so a future breakage is visible instead of absorbed.
-  BARE_PAT="$BARE_PAT" DEPTH_PAT="$DEPTH_PAT" awk '
-  BEGIN { bare=ENVIRON["BARE_PAT"]; depth=ENVIRON["DEPTH_PAT"] }
+  BARE_PAT="$BARE_PAT" BARE_T_PAT="$BARE_T_PAT" DEPTH_PAT="$DEPTH_PAT" awk '
+  BEGIN { bare=ENVIRON["BARE_PAT"]; bare_t=ENVIRON["BARE_T_PAT"]; depth=ENVIRON["DEPTH_PAT"] }
   {
     out=""; q=""; n=length($0)
     for (i=1;i<=n;i++) {
@@ -1227,7 +1235,7 @@ _bare_cp_hits() {  # $1 = file → offending "LINENO: line" records, comments st
         out=out c
       } else { out=out c; if (c==q) q="" }
     }
-    if (out ~ bare || out ~ depth) print NR ": " out
+    if (out ~ bare || out ~ bare_t || out ~ depth) print NR ": " out
   }' "$1"
 }
 # ⛔ A POSITIVE CONTROL, because an effect-scan with no positive control cannot fail (review P1
@@ -1254,8 +1262,13 @@ _FIX="$T/bare-cp-fixtures.txt"
   # previous version: neither was reported).
   printf '%s\n' 'cp -R "$H"/. "${O}"/'
   printf '%s\n' 'echo "a \" # b"; cp "$H"/*.sh "$O"/'
+  # ⛔ THE DESTINATION-FIRST SPELLING (review P2 2026-10-25). `cp -t "$O"/ "$H"/*.sh` is the same
+  # copy with the arguments reordered; BARE_PAT is source-first only and reported 0 of these, so
+  # without these two fixtures a one-token reorder escaped both arms.
+  printf '%s\n' 'cp -t "$O"/ "$H"/*.sh'
+  printf '%s\n' 'cp --target-directory="$O" "$H"/*.sh'
 } > "$_FIX"
-_FC_EXPECT=13
+_FC_EXPECT=15
 _FC_GOT="$(_bare_cp_hits "$_FIX" | wc -l | tr -d ' ')"
 [ "$_FC_GOT" = "$_FC_EXPECT" ] \
   && ok "positive control: all $_FC_EXPECT forbidden copy shapes are detected by the live matcher" \
@@ -1268,6 +1281,9 @@ _FC_GOT="$(_bare_cp_hits "$_FIX" | wc -l | tr -d ' ')"
   printf '%s\n' 'cp "$HERE/claims.sh" "$O/claims.sh"'
   printf '%s\n' 'install -m 0644 "$tmpd/x.service" "$UNIT_DIR/"'
   printf '%s\n' 'cp -R "$f" "$O/"'
+  # A flag that does NOT end in `t` is not a destination-first copy — the BARE_T_PAT arm must not
+  # fire on it. (`-R`/`-p` are real cp flags; neither names a target directory.)
+  printf '%s\n' 'cp -p "$H"/gh-limit.py "$O/"'
   printf '%s\n' 'cp it into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '\''$O/state/parked-$PR'\'''
 } > "$_FIX"
 _FC_GOT="$(_bare_cp_hits "$_FIX" | wc -l | tr -d ' ')"
@@ -1294,6 +1310,16 @@ NAMED_DEPLOY_IMPLS="deploy-crossbox.sh cloud-cell-quiesce.sh"
 # walk was widened to close. `cd … && pwd` resolves it once, before the walk.
 _SCRIPTS_ROOT="$(cd "$HERE/.." && pwd)"
 BARE_HITS=""; NAMED_HITS=""; SCANNED_HARNESS=0; SCANNED_SCRIPTS=0; EXCL=0
+# ⛔ THE POPULATION IS MATERIALISED ONCE, SO THE PER-DIRECTORY PINS READ THE WALK ITSELF (review P1
+# 2026-10-25). They used to run their OWN `find <dir> -maxdepth 1`, which proves only that a
+# directory holds scripts — never that the population walk REACHED it. Measured on a mutant whose
+# population `find` was regressed to `-maxdepth 2`: `retired/`'s 6 scripts vanished from the scan,
+# `SCANNED_HARNESS` fell 49→43 (still above its floor of 30) and every pin still printed ✅
+# "the population reaches scripts/orchestrator-harness/retired" — the suite read RESULT: CLEAN over
+# the exact regression the pins exist to catch. Writing the walk to a file and counting from THAT
+# file makes the pin an assertion about the population, not about the filesystem.
+_POP_FILE="$T/deploy-harness-population.txt"
+find "$_SCRIPTS_ROOT" -maxdepth 3 -name '*.sh' -type f 2>/dev/null | sort >"$_POP_FILE"
 while IFS= read -r _f; do
   [ -n "$_f" ] || continue
   _b="$(basename "$_f")"
@@ -1326,16 +1352,16 @@ while IFS= read -r _f; do
     *) BARE_HITS="$BARE_HITS
   $_b: $_h" ;;
   esac
-done < <(find "$_SCRIPTS_ROOT" -maxdepth 3 -name '*.sh' -type f 2>/dev/null | sort)
+done <"$_POP_FILE"
 [ "$SCANNED_HARNESS" -ge 30 ] && ok "scanned $SCANNED_HARNESS harness scripts for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_HARNESS harness scripts scanned — that half of the population is gone"
 # ⛔ THE TWO TOTALS ABOVE CANNOT SEE A WHOLE DIRECTORY DROP OUT (review P2 2026-10-25): measured at
-# head they carry 50 and 100 against floors of 30 and 90, so deleting `scripts/lib/` (6), a
+# head they carry 49 and 101 against floors of 30 and 90, so deleting `scripts/lib/` (6), a
 # `checkout-hygiene/` half or `orchestrator-harness/retired/` (6) still leaves both green — including
 # the last one, which the maxdepth-3 walk exists to reach, i.e. a regression back to `-maxdepth 2`
 # reds nothing. Per-directory presence pins are the assertion that matches the CLAIM (a bounded walk
 # over the named tree), and unlike an exact total they do not red on a legitimate file being added.
 for _pd in lib checkout-hygiene ci pi-patches orchestrator-harness/retired; do
-  _pn="$(find "$_SCRIPTS_ROOT/$_pd" -maxdepth 1 -name '*.sh' -type f 2>/dev/null | wc -l | tr -d ' ')"; [ -n "$_pn" ] || _pn=0
+  _pn="$(grep -cF -- "$_SCRIPTS_ROOT/$_pd/" "$_POP_FILE" || true)"; [ -n "$_pn" ] || _pn=0
   [ "$_pn" -ge 1 ] \
     && ok "the population reaches scripts/$_pd ($_pn script(s))" \
     || bad "  scripts/$_pd contributed NO script to the scan — the walk stopped reaching a directory the population claims to cover (a depth bound, a renamed dir, or a broken root)"
