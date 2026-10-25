@@ -21,6 +21,15 @@
 #   3. IT FAILS CLOSED. An unreadable origin is a REFUSAL, never a pass. The refusal names BOTH
 #      slugs (and both directories, when a target dir was named), so the operator can see the
 #      mismatch without an investigation.
+#      ⛔ A NON-GitHub ORIGIN IS THEREFORE A DISPATCH-LEVEL REFUSAL (#2762 review, 5th cycle, P2).
+#      repo-slug.sh refuses `file://` and local-path remotes on purpose, so a MIRROR or local-clone
+#      checkout cannot NAME its repo. orch-loop keeps such a box alive for GRADING (it falls back to
+#      its own OR, loudly), but a lane cannot run in a checkout whose identity cannot be proven: the
+#      assertion compares the ARTIFACT with the target, so `set OR=<owner/name>` cannot clear it. The
+#      remedy is one command on that box —
+#        git -C <checkout> remote set-url origin https://github.com/<owner>/<name>.git
+#      — and there is deliberately NO env override: an escape hatch that turns this gate off is the
+#      fail-open the file exists to remove.
 #
 # ONE DEFINITION, NOT A FOURTH PARSER: the slug comes from repo-slug.sh's `repo_slug_from_remote`,
 # the same resolver `orch-loop.sh` and `refresh-candidates.sh` read (#2040). This file adds only the

@@ -82,6 +82,13 @@ if [ "$OR_RC" != "0" ]; then
   # reached stderr was invisible for the hours this defect lasted. Not fatal: a local mirror or a
   # `file://` origin is a legitimate checkout, and refusing to start would turn a grading mismatch
   # into a dead cell. The line stays, loudly, in both streams.
+  # ⛔ THIS IS A GRADING DECISION ONLY (#2762 review, 5th cycle, P2). Dispatch is stricter on purpose:
+  # `repo-target.sh` compares the ARTIFACT (the worktree's own origin) with the target, so on a box
+  # whose origin cannot name a repo EVERY batch is refused 72 — and `set OR=…` cannot help, because
+  # the pin is what the artifact is compared TO. The remedy is re-pointing the checkout's origin
+  # (`git -C <checkout> remote set-url origin https://github.com/<owner>/<name>.git`); there is
+  # deliberately no env override, since an escape hatch that opens the gate is the fail-open the gate
+  # exists to remove. Named here so a mirror-origin cell is a known state, not a mystery.
   _or_warn="WARN cannot derive owner/name from REPO=$REPO origin remote ('$(git -C "$REPO" remote get-url origin 2>/dev/null || echo none)') — grading $OR; set OR=<owner/name> to name the repo explicitly"
   echo "orch-loop: $_or_warn" >&2
   [ -d "$O" ] && echo "$(date) [startup] $_or_warn" >> "$O/logs/orch-loop.log" 2>/dev/null
@@ -5904,8 +5911,6 @@ PY
         echo "[dispatch] repo-target gate REFUSED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
         K=0; : > "$O/.batch"
         [ -n "${GATE_WHY:-}" ] || GATE_WHY="repo-target(refused: checkout is not the target)"
-      fi
-      # [dmrecount:begin] (extracted and DRIVEN by repo-target.test.sh — keep the markers)
       # ⛔ RECOUNT FROM WHAT ACTUALLY SPAWNED (#2762 review, 2nd cycle, P1). `K` counts CLAIMS, and a
       # PER-ISSUE refusal (`continue` in dispatch-merge.sh) leaves the batch's exit status 0 — so a
       # batch whose every lane was refused still printed `-> N dispatched` and recorded
@@ -5913,7 +5918,14 @@ PY
       # against a REUSED `.worktrees/tm-<N>`, e.g. one left on another named branch), and a wrong-repo
       # pair never clears by waiting, so the record would be a permanent false PASS. dispatch-merge.sh
       # publishes the ids that reached a spawn; the cycle's count and ids come from that, not claims.
-      if [ "$_dmrc" != "3" ] && [ "$_dmrc" != "72" ] && [ -f "$O/.dispatched-ids" ]; then
+      # ⛔ THE RECOUNT IS AN `elif` OF THE SAME CHAIN, NOT A SIBLING `if` (#2762 review, 5th cycle,
+      # P1). `product-floor.test.sh` P6 pins that every `.batch` reset sits INSIDE a modelled arm of
+      # this chain, because a reset outside one is how a batch that started nothing gets recorded as
+      # dispatched. A sibling `if` with its own `_dmrc` guard is equivalent in behaviour but invisible
+      # to that rule — the suite reds, correctly, on a reset it cannot attribute to an arm.
+      # markers: the BODY is extracted and driven by repo-target.test.sh (D6), so they sit inside.
+      elif [ -f "$O/.dispatched-ids" ]; then
+        # [dmrecount:begin] (extracted and DRIVEN by repo-target.test.sh — keep the markers)
         _dm_spawned="$(sed '/^$/d' "$O/.dispatched-ids" 2>/dev/null || true)"
         _dm_n="$(printf '%s\n' "$_dm_spawned" | sed '/^$/d' | wc -l | tr -d ' ')"
         is_num "${_dm_n:-}" || _dm_n=0
@@ -5932,8 +5944,8 @@ PY
             [ -n "${GATE_WHY:-}" ] || GATE_WHY="dispatch(no lane reached a spawn — see the dispatch log for the cause)"
           fi
         fi
+        # [dmrecount:end]
       fi
-      # [dmrecount:end]
       # …and the deferral's reason rides the SAME funnel line (#2333 cycle 6 review, P2): arg 3 was
       # `""` while `GATE_WHY` had just been set, so the cycle's one `-> 0 dispatched` line dropped the
       # `held:` clause and the reason survived only in the cycle record and a separate log line — the
