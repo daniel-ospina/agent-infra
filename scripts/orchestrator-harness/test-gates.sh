@@ -208,10 +208,13 @@ _CLS_RULE="want=(os.environ.get('REQ') or '').split()"
 # its FIRST match, the upstream `grep -vE` takes SIGPIPE (141), and under `pipefail`
 # a FAILING drift guard reads as a pass (#864's class; the producer here writes the
 # whole non-comment stream, so it is a live window, not a shape flag).
-_ORCH_RULE_HITS="$(grep -vE '^[[:space:]]*#' "$ORCH" 2>/dev/null || true)"
+# ⛔ THE RULE MOVED WITH THE CLASSIFIER (agent-infra#2719): the split rule now ships inside
+# `check-class.py`, and the sweep runs THAT file. The pin reads BOTH, because a rule that survives in
+# one file while the other runs is precisely the drift this assertion exists to catch.
+_ORCH_RULE_HITS="$({ grep -vE '^[[:space:]]*#' "$ORCH" 2>/dev/null; grep -vE '^[[:space:]]*#' "$HERE/check-class.py" 2>/dev/null; } || true)"
 case "$_ORCH_RULE_HITS" in
   *"$_CLS_RULE"*) { echo "  ✅ the classifier still splits with Python .split() — the rule _normalise_set shares"; PASS=$((PASS+1)); } ;;
-  *) { echo "  ❌ the classifier's split rule changed in orch-loop.sh; _normalise_set shares it and must change with it (the two MUST agree) "; FAIL=$((FAIL+1)); } ;;
+  *) { echo "  ❌ the classifier's split rule is in NEITHER orch-loop.sh nor check-class.py; _normalise_set shares it and must change with it (the two MUST agree) "; FAIL=$((FAIL+1)); } ;;
 esac
 _agree() { # _agree <set> -> both readers' verdicts on the SAME string
   printf 'authority=%s classifier=%s' "$(merge_authority "${1:-}")" \
@@ -239,8 +242,10 @@ eqv "a TAB-separated OVERRIDE is normalised onto the space-joined contract" "a b
 
 # (d) the shipped classifier against BOTH shapes. Rendered from the measured surfaces:
 #     agent-infra PR #1763 = 22 checks, all non-red, NO ai-review-gate row.
-awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$ORCH" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+# ⛔ THE SHIPPED ARTIFACT IS NOW `check-class.py` (agent-infra#2719) — the classifier moved out of the
+# orch-loop.sh heredoc so the sweep and the NOCHECKS arm run ONE implementation. A missing file leaves
+# `$TMP/classify.py` empty and the block below reports its own "not extracted" red, as before.
+cat "$HERE/check-class.py" > "$TMP/classify.py" 2>/dev/null || : > "$TMP/classify.py"
 if [ -s "$TMP/classify.py" ]; then
   clr() { printf '%s' "$2" | REQ="$1" REVIEW_GATE=ai-review-gate python3 "$TMP/classify.py" 2>/dev/null; }
   AISURF='[{"name":"vendor-drift","state":"SUCCESS"},{"name":"cost-config","state":"SUCCESS"},{"name":"verify","state":"SUCCESS"},{"name":"admin-merge","state":"SUCCESS"},{"name":"drift-check","state":"SUCCESS"},{"name":"ci / lint","state":"SUCCESS"},{"name":"sigpipe-grep","state":"SUCCESS"},{"name":"bash-suites","state":"SUCCESS"},{"name":"http-pool-hygiene","state":"SUCCESS"},{"name":"pipeline-compliance","state":"SUCCESS"},{"name":"Mergify Merge Queue","state":"NEUTRAL"}]'
