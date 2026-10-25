@@ -30,12 +30,17 @@
 //
 // WHAT THE READER GUARANTEES, EXACTLY. It models a strict SUBSET of YAML: a block `jobs:` mapping,
 // 2-space job keys, 4-space job keys, and a `runs-on:` value that is a scalar, a block sequence, or
-// a flow sequence (single- or multi-line). EVERY line outside that subset — an unmodelled column-0
-// line, a tab anywhere, an indented line under an inline top-level value, a second `jobs:`, an
-// illegal `key :value`, an indented line at job indent that is not a job start, a `---` — makes the
-// file `could-not-measure` rather than silently skipped. That is what makes the T2 sweep
-// trustworthy: it can only report "no other job asks for the reservation" over a file it actually
-// read end to end.
+// a flow sequence (single- or multi-line). Every STRUCTURAL line outside that subset — an unmodelled
+// column-0 line, a tab anywhere, an indented line under an inline top-level value, a second `jobs:`,
+// an illegal `key :value`, an indented line at job indent that is not a job start, a `---` — makes
+// the file `could-not-measure` rather than silently skipped. No structural line is ever dropped, so
+// a job cannot hide in the gaps; that is what makes the T2 sweep trustworthy.
+//
+// What is deliberately NOT modelled, and is SKIPPED rather than refused: the BODY of a job (only its
+// 4-space `runs-on:` carries routing — `steps:`/`with:`/`env:` content cannot name a runner) and the
+// body of any top-level key other than `jobs:`. Neither can contain a job, so neither can hide a
+// reservation, and refusing them would red every real workflow (`run.sh` arm 42 pins the top-level
+// case: `permissions:` + `contents: read` stays GREEN).
 //
 // ⚠️ RESIDUAL, stated so it is not mistaken for totality: this is NOT a YAML parser, so an INVALID
 // document spelled in a way the subset happens to accept can still grade clean. The consequence is

@@ -499,7 +499,9 @@ done
 # content is now allowed only under a key whose value really is nested.
 # ⛔ The fixture must NOT prepend a second `jobs:`: that refuses first (arm 32's mechanism) and this
 # arm would then pass whatever `reusableJobExempt` does — the vacuous-arm defect review round 8
-# found. Guarded here by `arm37-guard` in the mutation check below.
+# found. Arm 55 below is the STANDING guard for that: it re-injects the regression into a copy of the
+# checker and requires THIS arm's fixture to fail, so a future edit that puts a second `jobs:` back
+# into the fixture cannot silently re-vacuumize it.
 if append "$WF" "$TMP/wf-usesstray.yml" $'  sneaky:\n    uses: actions/checkout@v4\n      runs-on: [ubuntu-latest, required-check]\n'; then
   run_expect 2 "37 UNREADABLE a stray nested line in a 'uses:' job is not swallowed" "$TMP/wf-usesstray.yml" "$DOC"
 else
@@ -644,6 +646,40 @@ else
 fi
 
 echo
+
+# ── 55. SELF-TEST: arm 37 must actually DISCRIMINATE ───────────────────────────────────────────
+# A mutation arm that cannot fail is worse than no arm: it asserts coverage it does not provide.
+# Round 8 found arm 37 vacuous (its fixture prepended a second `jobs:`, so arm 32 refused first and
+# arm 37 passed whatever `reusableJobExempt` did). This arm is the standing guard against that
+# recurring: it re-injects the round-6 regression into a COPY of the checker and requires arm 37's
+# own fixture to be judged unclean by it.
+if node -e '
+  const fs = require("fs");
+  const [src, dst] = process.argv.slice(1);
+  const s = fs.readFileSync(src, "utf8");
+  const from = "if (nestable && /^ {5,}\\S/.test(line)) continue;";
+  if (!s.includes(from)) process.exit(3);
+  fs.writeFileSync(dst, s.replace(from, "if (/^ {5,}\\S/.test(line)) continue;"));
+' "$CHECK" "$TMP/check-vacuous.mjs"; then
+  # ⛔ RC_WORKFLOWS_DIR MUST be overridden: the mutant copy lives in $TMP, so check.mjs derives its
+  # DEFAULT_ROOT as `/` and would exit 2 on an unreadable `/.github/workflows` — a non-zero rc that
+  # this arm would read as success. That is exactly the no-op-gate defect this arm exists to prevent
+  # (the first version of this arm passed unconditionally for that reason; review round 9).
+  RC_WORKFLOW_FILE="$TMP/wf-usesstray.yml" RC_WORKFLOWS_DIR="$ROOT/.github/workflows" \
+    RC_DOC_FILE="$DOC" node "$TMP/check-vacuous.mjs" >/dev/null 2>&1
+  rc=$?
+  # The assertion is EQUALITY, not "non-zero": the regression must make the mutant grade arm 37's
+  # fixture CLEAN (rc 0). If the fixture were re-vacuumized (a second `jobs:` prepended), the mutant
+  # would exit 2 for that reason instead, and this arm fails.
+  if [ "$rc" -eq 0 ]; then
+    pass "55 SELF-TEST arm 37 DISCRIMINATES — the regression makes its fixture grade clean (mutant rc=$rc, real checker rc=2)"
+  else
+    fail "55 SELF-TEST arm 37 is VACUOUS — the regression does NOT make its fixture grade clean (mutant rc=$rc, expected 0): the fixture no longer isolates reusableJobExempt (did a second 'jobs:' get prepended again?)"
+  fi
+else
+  fail "55 SELF-TEST-NOT-APPLIED (the reusableJobExempt regression anchor was not found in $CHECK)"
+fi
+
 if [ "$fails" -ne 0 ]; then
   echo "❌ required-check reservation: $fails failed, $passes passed"
   exit 1
