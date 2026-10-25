@@ -326,6 +326,17 @@ The bound applies to the **gate** — the loop, or the area under review — not
 
 **Only exception — trivial single-fact lookup:** "What version is X?" "What port does Y use?" One answer, no analysis needed. For everything else: `research`.
 
+**⛔ RESEARCH FIRST is a DISPATCH CONTRACT, not a habit — the dispatch path REFUSES a brief without it.**
+A brief handed to a lane, a fixer, a reviewer, a background worker or a pane order must carry a
+`RESEARCH FIRST` section (`INTERNAL:` + `EXTERNAL:` + a `RUNG:` line naming the tool) and a
+`CONTRADICTION TEST:` line. Absent any of them the dispatch is refused with exit 80 by
+`scripts/orchestrator-harness/brief-gate.sh` — no model call, no session, no claim — and the refusal
+names every missing element and prints the block to paste. The canonical block is
+`brief-gate.sh --section <lane|fixer|reviewer|worker>`; `templates/LANE-BRIEF.md` carries it for
+controller-written briefs. If YOUR brief is refused, add what it names; do not route around the gate
+(agent-infra#2258: two lanes in one day acted on a false premise — one re-derived a root the tracker
+already held, one opened a duplicate PR — both brief defects, not lane defects).
+
 **Sub-agents inherit this rule.** When dispatching sub-agents, instruct them to use the `research` skill — never let a sub-agent call `web_search` directly.
 
 ---

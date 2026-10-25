@@ -425,7 +425,7 @@ ck "(c) …and the fixed cap is REPORTED as IGNORED, not silently discarded" "$(
 DISKCOST=5000 DISKFLOOR=0 PS_TABLE="$TMP/ps-none" run_status_fix
 cap_disk="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
 ck "(c) with the disk as the BINDING leg the row reports lanes=4 (not the load bound, 7) [$cap_disk]" \
-   "$(case "$cap_disk" in *"lanes=4 "*"disk_free=20000MB"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(case "$cap_disk" in *"disk free=20000MB"*"lanes=4 (binding=disk"*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ THE DEFAULT 500MB RESERVE IS PART OF THE RULE, and it must be exercised WITHOUT the helper (which
 # always passes the knob explicitly, so the launcher's own default is otherwise unreachable) AND through
 # the FIXTURE launcher — the repo's own `$UP` would let its real `capacity.sh` probe the HOST (measured:
@@ -469,8 +469,12 @@ OUT="$( cd "$REPO_FIX" && PATH="$TMP/dfsmall:$TMP:$PATH" FIX_LOG="$FIXCELL/fix.l
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         HU_DISK_PER_LANE_MB=300 HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" status --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"
 cap_small="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
+# ⛔ THE ROW'S DIMENSION LINE NAMES THE THREE BOUNDS IN THE ORDER THEY FAIL (`fork headroom= → disk
+# free= → load=`), so the disk reading no longer rides as `disk_free=`. The assertion is unchanged in
+# WHAT it checks (this disk answers 4 lanes and is NAMED as the binding leg); only the field spelling
+# and the reading's position moved with the row (#2293).
 ck "(c) on a 2000MB volume the documented 500MB reserve answers 5 lanes (a drifted 1000 would answer 3) [$cap_small]" \
-   "$(case "$cap_small" in *"lanes=5 "*"disk_free=2000MB"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(case "$cap_small" in *"disk free=2000MB "*"lanes=5 (binding=disk"*) echo 0 ;; *) echo 1 ;; esac)"
 OUT="$( cd "$REPO_FIX" && PATH="$TMP/dfsmall:$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
         HOME="$TMP/home" CELL_HOME="$FIXCELL" \
         HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \

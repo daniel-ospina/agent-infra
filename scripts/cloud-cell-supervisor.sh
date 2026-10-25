@@ -187,10 +187,12 @@ SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$
 OR="${OR:-}"
 
 # ── the worker census (agent-infra#2210) ────────────────────────────────────────────────────────
-# ⛔ THE TMUX NAME MATCH IS DEAD ON A CELL. The harness spawns workers into cmux DURABLE TERMINALS
-# there (worker-terminal.sh's header records the measurement), so `tmux ls | grep -c '^lane-'` answers
-# 0 while lanes run — and this file used that answer to decide whether it may delete caches under a
-# live lane, and to report `lanes:` in `status`. Both read a confident 0 for a busy box.
+# ⛔ THE TMUX NAME MATCH IS DEAD WHERE THE CMUX DAEMON ANSWERS. There the harness spawns workers into
+# cmux DURABLE TERMINALS (worker-terminal.sh's header records the measurement), so
+# `tmux ls | grep -c '^lane-'` answers 0 while lanes run — and this file used that answer to decide
+# whether it may delete caches under a live lane, and to report `lanes:` in `status`. Both read a
+# confident 0 for a busy box. (tmux IS the launch surface where the daemon does NOT answer — on a
+# launchd Mac and on a cell alike, agent-infra#2210 — so the defect is the single surface, not tmux.)
 # The count comes from the launcher module's own census, and UNKNOWN (exit 3) is NOT zero: every
 # caller treats it as "workers may be live", which is the direction that cannot destroy a live lane.
 worker_census() { # stdout: the live worker count; exit 3 when no answer can be had
@@ -434,6 +436,12 @@ CONTROLLER_UNIT_IN="${CONTROLLER_UNIT:-}"
 SYSTEMCTL_IN="${SYSTEMCTL:-}"
 CONTROLLER_SYSTEM_UNIT_DIR_IN="${CONTROLLER_SYSTEM_UNIT_DIR:-}"
 CONTROLLER_USER_UNIT_DIR_IN="${CONTROLLER_USER_UNIT_DIR:-}"
+# ⛔ AND `PS_BIN` BELONGS TO THE FAMILY TOO (review P1 round 19, #2402 / B). It is read at CALL time by
+# `_proc_start_epoch`, and its answer (`_proc_began_after`) is what decides which pids `stop` may signal.
+# A pushed `PS_BIN` stub forges the age rule: a recycled pid that merely LOOKS like `<shell> <…/orch-loop.sh>`
+# is then classified as the lock owner and gets TERM/KILL — the peer-repo controller that rule exists to
+# protect. Absent a caller value the restored state is "unset" = the real `/bin/ps` default.
+PS_BIN_IN="${PS_BIN:-}"
 source_env_file
 ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
 ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
@@ -446,8 +454,17 @@ ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
 # exists to prevent, now reachable from keys.env instead of from the caller's shell.
 [ -z "$CONTROLLER_INVOKER_HOME_IN" ]     || CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"
 SYSTEMCTL="$SYSTEMCTL_IN"
-[ -z "$CONTROLLER_SYSTEM_UNIT_DIR_IN" ]  || CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
-[ -z "$CONTROLLER_USER_UNIT_DIR_IN" ]    || CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+# ⛔ THESE TWO ARE RE-ASSERTED UNCONDITIONALLY, WHICH IS THE WHOLE POINT (review P1 round 19, #2402 / B).
+# The timeout siblings above use `[ -z "$_IN" ] ||` because an UNSET one legitimately comes from the env
+# file (tmux mode has no unit to provide it). A unit DIRECTORY has no such reading: its default is computed
+# downstream (`${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}`), so "unset" is the CORRECT restored
+# state, and the conditional form left the keys.env value in force — the fence was inert in production,
+# where the unit renders no such variable and every caller supplies nothing. Reproduced: a keys.env line
+# `CONTROLLER_SYSTEM_UNIT_DIR=/tmp/nowhere` hid the installed unit with 0 systemctl calls and `stop`
+# printing "not running", which is the exact false pass the fence was added to close.
+CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
+CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+PS_BIN="$PS_BIN_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -675,6 +692,12 @@ controller_user_unit_dirs() {
   local h
   [ -n "${CONTROLLER_USER_UNIT_DIR:-}" ] && printf '%s\n' "$CONTROLLER_USER_UNIT_DIR"
   h="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  # ⛔ A MISSING `getent` MUST NOT FAIL SILENTLY (review P2 round 19, #2402 / B). The passwd home is the
+  # candidate the doctor's `HOME=$CELL_HOME` session depends on; without `getent` it would simply disappear
+  # from the list and re-open the duplicate-dispatcher defect with no diagnostic anywhere. stderr only —
+  # stdout is a list.
+  command -v getent >/dev/null 2>&1 \
+    || printf '%s\n' "cloud-cell-supervisor: getent not found — the passwd-home unit lookup is unavailable on this box, so a reader whose HOME is not the installer's may miss the unit" >&2
   h="$(passwd_home "$(id -u)")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   h="$(passwd_home "${SUDO_USER:-}")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   return 0
@@ -1950,7 +1973,17 @@ cmd_check() {
   # before/after measurement (#2029), so a $O missing either makes every lane's merge phase exit 127
   # while this check still printed "CELL CAN RUN A CONTROLLER" — the false PASS this list exists to
   # prevent. Keep this list in step with install.sh's DRIFTED list (which seeds $O from it).
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh; do
+  # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
+  # calls it for the process pass. A $O without it still runs (the census falls back to the launch
+  # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
+  # terminals AND tmux sessions (launchd Mac or cell, #2210); `tmux ls` alone sees one of the two
+  # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
+  # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
+  # reports success.
+  # UNION of both sides of this merge (neither is a superset): lane-merge.sh + merge-rate.sh from this
+  # branch (#2029), lane-reap.sh from origin/main (#2163). Taking either alone leaves a worker the
+  # controller executes unseeded, which is the false PASS above.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"

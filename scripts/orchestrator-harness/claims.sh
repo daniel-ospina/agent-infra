@@ -1055,9 +1055,34 @@ _claim_status_at() {
 #                  merge is not refused by a network blip): there, refusing costs one PR's merge;
 #                  here, certifying a free issue costs duplicated work on two boxes.
 # Sets CLAIM_RESULT; echoes it, so a caller in a subshell still sees the reason.
+# claim_pr_preflight <repo> <pr> — the SAME pre-flight read, keyed by the coarse PR claim
+# (agent-infra#1952's `pr-<N>` key, the one merge-one.sh takes for LANDING). The PR SICKNESS QUEUE
+# (pr-sickness.sh) uses it as its holder read: the question it asks is "does a lane already own this
+# PR?", and the answer must carry a registry's polarity rather than a local pid's — rc=2
+# (INCOMPLETE) is NOT FREE, because an abstention is not permission.
+#  0 CLEAN / 1 COLLISION / 2 INCOMPLETE. Sets CLAIM_RESULT exactly as the issue-keyed sibling does.
+claim_pr_preflight() {
+  _claim_preflight_at "$(claim_pr_ref "$2")" "PR #$2"
+}
+
+# claim_head_preflight <repo> <pr> <sha> — the PER-HEAD question, and the one a FIXER/reviewer asks.
+# ⛔ THE COARSE `pr-<N>` KEY ANSWERS A DIFFERENT QUESTION: claims.sh documents it as taken ONLY by the
+# landing path (merge-one.sh). A peer fixing head H holds `refs/claims/<PR>-<sha12>` (claim_acquire),
+# which claim_pr_preflight never looks at — so a two-box fleet read CLEAN for a head another box was
+# already fixing, and only fix-one.sh's own CAS stopped the duplicate AFTER the attempt was booked.
+claim_head_preflight() {
+  _claim_preflight_at "$(claim_ref "$2" "$3")" "PR #$2 at $(printf '%s' "${3:-}" | cut -c1-12)"
+}
+
 claim_issue_preflight() {
-  local issue="$1" ref out rc cur tmp lease owner until now
-  ref="$(claim_issue_ref "$issue")"
+  _claim_preflight_at "$(claim_issue_ref "$1")" "#$1"
+}
+
+# _claim_preflight_at <ref> <label> — ONE polarity for every keying (per-head, issue, landing).
+# `label` is what the line says ("#123" / "PR #123"). Two copies of this decision is exactly how a
+# reader and a writer of the same datum drift.
+_claim_preflight_at() {
+  local ref="$1" label="$2" out rc cur tmp lease owner until now
   # ⛔ THE EXIT STATUS IS THE DISTINCTION THAT MATTERS HERE. `git ls-remote <ref>` exits 0 with
   # EMPTY output when the ref simply does not exist, and NON-ZERO only when the remote itself could
   # not be consulted (measured: rc=128 for an unreachable remote). Collapsing the two — which is
@@ -1070,13 +1095,13 @@ claim_issue_preflight() {
   fi
   cur="$(printf '%s\n' "$out" | awk '{print $1}')"
   if [ -z "$cur" ]; then
-    CLAIM_RESULT="no claim on #$issue"
+    CLAIM_RESULT="no claim on $label"
     echo "$CLAIM_RESULT"; return 0
   fi
   tmp="$CLAIM_TMP_NS/pre-$RANDOM$$"
   if ! _git fetch -q origin "+$ref:$tmp" 2>/dev/null; then
     _git update-ref -d "$tmp" 2>/dev/null
-    CLAIM_RESULT="a claim ref exists for #$issue but its lease could not be read — INCOMPLETE, never CLEAN"
+    CLAIM_RESULT="a claim ref exists for $label but its lease could not be read — INCOMPLETE, never CLEAN"
     echo "$CLAIM_RESULT"; return 2
   fi
   lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
@@ -1092,7 +1117,7 @@ claim_issue_preflight() {
   # answer, which is the one direction this gate must never fail in (it duplicates the work).
   now="$(date +%s)"
   if _lease_unparseable "$until"; then
-    CLAIM_RESULT="a claim on #$issue is held by ${owner:-?} (lease unreadable — treated as live; held-by-live)"
+    CLAIM_RESULT="a claim on $label is held by ${owner:-?} (lease unreadable — treated as live; held-by-live)"
     echo "$CLAIM_RESULT"; return 1
   fi
   case "${now:-}" in
@@ -1109,13 +1134,13 @@ claim_issue_preflight() {
     local orph
     orph="$(claim_orphan_reason "$owner" "$ref")" || orph=""
     if [ -n "$orph" ]; then
-      CLAIM_RESULT="the only claim on #$issue is ORPHANED (${owner:-?}: $orph; held-by-orphan) — free to reclaim"
+      CLAIM_RESULT="the only claim on $label is ORPHANED (${owner:-?}: $orph; held-by-orphan) — free to reclaim"
       echo "$CLAIM_RESULT"; return 0
     fi
-    CLAIM_RESULT="a claim on #$issue is held by ${owner:-?} until $until ($(( until - now ))s left; held-by-live)"
+    CLAIM_RESULT="a claim on $label is held by ${owner:-?} until $until ($(( until - now ))s left; held-by-live)"
     echo "$CLAIM_RESULT"; return 1
   fi
-  CLAIM_RESULT="the only claim on #$issue EXPIRED at $until (was ${owner:-?}) — free to reclaim"
+  CLAIM_RESULT="the only claim on $label EXPIRED at $until (was ${owner:-?}) — free to reclaim"
   echo "$CLAIM_RESULT"; return 0
 }
 
