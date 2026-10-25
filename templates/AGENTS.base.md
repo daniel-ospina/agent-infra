@@ -33,6 +33,35 @@ If none of those apply: **keep going.** The user can interrupt if they disagree.
 
 ---
 
+## ⛔ HARD RULE: A lane's work is MERGED, not opened
+
+**A lane is not done when it opens a PR. It is done when its PR is MERGED — or when it reports the one
+thing that blocks the merge and that nobody else can supply.**
+
+- **Opening a PR is a checkpoint, not a completion.** Measured 2026-10-18: the fleet held **22 open PRs
+  against 3 merged**, because every lane treated "PR opened" as success and exited. The merge work then
+  piled up behind the running lanes, and the backlog grew while the fleet looked busy.
+- **Drive your own PR to terminal.** Wait for its own checks to finish (bounded), read the *failing
+  names*, fix them, push, re-wait — then take it to the repo's merge path (its rail, or the harness's
+  per-PR chain). Spare capacity flows to MERGING, not just to producing.
+- **Cap the loop.** The harness cap is 3 rounds, enforced in code (`lane-merge.sh`). **A lane stuck in
+  round 5 is a failure, not thoroughness** — a fix round that has not converged is a diagnosis to report.
+- **Never attest your own review.** A review record is minted only from a fresh-context reviewer's
+  verified evidence. Recording a review that did not happen is a gate bypass, whichever way it is framed.
+- **Never edit the PR body after a review is recorded** — the attestation lives in that body and an
+  unrelated edit wipes the proof the gate reads. New information goes in a **comment**.
+- **A dirty PR** means: re-apply your own change onto current main and force-push **your own** branch.
+  Never resolve a **generated** file's conflict by picking a side — regenerate it.
+- **A handoff is a diagnosis, not a mystery.** If you cannot merge, the exact blocking reason goes on the
+  PR as a comment, so the next lane or the human inherits what you learned.
+
+Where the repo ships a merge loop — agent-infra's harness lanes get one as code,
+`scripts/orchestrator-harness/lane-merge.sh <PR>`, whose exit code is the next action — use it. Where it
+does not, take the repo's own merge path. The before/after measurement is
+`scripts/orchestrator-harness/merge-rate.sh` in the repo that ships it.
+
+---
+
 ## ⛔ HARD RULE: Process Discipline
 
 Your role is to work within the skills and processes framework we have explicitly designed. The skills, workflows, and tools embed the accumulated learnings from all previous work and should not be bypassed nor hacked. If there are difficulties or inefficiencies, the right process is to do the work as designated regardless and provide feedback in the reflection phase (after the work), for systematic improvement of all future runs. Following this process allows us to treat our system as a product we can evolve and eventually sell, but only if properly used instead of bypassed. If in absolute need, ask for permission to bypass before doing so.

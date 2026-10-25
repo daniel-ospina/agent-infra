@@ -1295,7 +1295,7 @@ SHIPPED="${HARNESS:-$HERE}"
 # absent ⇒ LO_SCAN=0 ⇒ the registry fallback), which does not crash — it silently sends the fleet back
 # to opening work on top of an un-worked queue, which is the exact defect the module exists to fix.
 DRIFTED=""
-# BOTH sides of the merge, deliberately, and this is what the UNION of them looks like — the note
+# BOTH sides of this merge, deliberately, and this is what the UNION of them looks like — the note
 # records why, because the asymmetry only existed for one rebase. `nonblocking-dispatch.sh` is main's
 # (the transport pr-doctor dispatches through, #1890); `merged-not-closed.sh` and
 # `check-single-source.sh` are this PR's (the single-source instruments); `live-ownership.sh` (the
@@ -1303,10 +1303,10 @@ DRIFTED=""
 # side alone leaves the installed $O without a file the loop, the dispatcher, or the anti-relapse check
 # calls — a silent drift, not a loud failure — which is why this list is checked at all.
 # ⛔ AND NEITHER LIST IS A SUPERSET OF THE OTHER, WHICH IS WHY THE UNION IS TAKEN EXPLICITLY. The
-# branch added `nonblocking-dispatch.sh` (the transport pr-doctor now dispatches through, #1890) and
-# `reviewer-preflight.sh` (the #2148 disclosure helper lane.sh calls as `$O/reviewer-preflight.sh`),
-# while origin/main added `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the
-# derived repo surface, #2040).
+# branch added `lane-merge.sh` (the bounded lane merge loop, #2029) and `merge-rate.sh` (its
+# before/after measurement); origin/main added `live-ownership.sh` (the selection predicate),
+# `repo-slug.sh` (the derived repo surface, #2040), `merge-reminder.py` and `box-status.sh`. Taking
+# either list alone installs a $O missing a file a live path execs — a silent 127, not a loud error.
 # worker-terminal.sh (#2210) is SOURCED by both controllers: their own guard only checks that the
 # verbs EXIST, so a partial older copy at $O passes it and the box silently executes a stale launcher
 # (a census that reads 0 workers, a reap that cannot prove a kill).
@@ -1340,7 +1340,7 @@ DRIFTED=""
 # `$O/nochk-resolve.py`. A `$O` with the new `orch-loop.sh` and an OLD file set classifies EVERY PR as
 # `V=""` — no merge arm, no fixer, the controller silently stops working — and the only trace is one
 # startup warning. That is exactly the partial-reseed drift this list exists to catch.
-for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done

@@ -60,6 +60,9 @@ class of lifetime #2402 removed for the controller and this unit removes for rep
    `PR_DOCTOR_REPO`, `PR_DOCTOR_REPO_DIR`, `OBJECTIVE_REPO`. ⛔ `pr-doctor.py` shipped the slug and
    `$HOME/Documents/GitHub/tortoise` as literals; on a cell that path does not exist, so every git read
    and worktree add failed and reported `UNREADABLE` — indistinguishable from an empty queue (#1974).
+   ⛔ AND THE PAIR IS EVIDENCE, NOT A FALLBACK: `pr-doctor.py` no longer carries those literals at all,
+   so it refuses (exit 2) when nothing names a repo — and an unset pair is a launcher bug this loop
+   surfaces rather than a default it quietly adopts (#2716 reconciled with #2235).
 4. **Record** one status row (`$O/state/pr-repair.status.json`): the measurement, the cap, the
    **decision**, the reason and every step's rc. The vocabulary is exhaustive, and each value means one
    thing a reader can act on:

@@ -194,6 +194,31 @@ LANDING_BRIEF="$(landing_artifacts_brief_section harness)" || {
 # below. A lane's worktree normally HAS a `.venv`, but when it does not the agent used to hunt for an
 # interpreter across the filesystem — a `find` over $HOME blocks for minutes and has consumed whole
 # agent budgets with nothing produced. Point it at `uv sync` instead. Do NOT drop it in a re-port.
+# ⛔ THE BRIEF NAMES A COMMAND, SO IT MUST NAME ONE THAT EXISTS ON THIS BOX (A12). install.sh never
+# copies — `$O` is synced by the operator — so on a cell that has not been re-synced `$O/lane-merge.sh`
+# is absent while the shipped copy sits beside this script. Emitting the `$O` path unconditionally
+# would tell the lane "use it, do not hand-roll a polling loop" and then hand it nothing (the lane's
+# only remaining options are an invented loop or a handoff). Resolve once, here, and say so in the log.
+LANE_MERGE_CMD="$O/lane-merge.sh"
+# Always set (the brief interpolates it): empty means "the tool exists, say nothing extra".
+MERGE_LOOP_NOTE=""
+if [ ! -f "$LANE_MERGE_CMD" ]; then
+  # ⛔ THE FALLBACK IS ONLY A FALLBACK IF IT IS A DIFFERENT PATH (reviewer finding, P2, verified). When
+  # this script was itself loaded FROM `$O` (the shipped `dispatch-merge.sh` route) `$SELF == $O`, so
+  # the "fallback" resolves to the very file that is missing: the log claimed a substitute was named
+  # while the brief pointed at nothing. Say nothing rather than something false, and name the remedy.
+  if [ "$SELF/lane-merge.sh" != "$LANE_MERGE_CMD" ] && [ -f "$SELF/lane-merge.sh" ]; then
+    LANE_MERGE_CMD="$SELF/lane-merge.sh"
+    echo "[lane $N] ⚠️ $O/lane-merge.sh is absent (this \$O predates the lane-owns-merge change) — the brief names $LANE_MERGE_CMD instead. Sync: cp scripts/orchestrator-harness/*.sh $O/" >> "$O/logs/lane-$N.log"
+  else
+    # ⛔ THE BRIEF MUST SAY WHAT THIS LINE SAYS (landing-review finding 2): the merge-loop section below is
+    # rendered from $MERGE_LOOP_NOTE, so this arm now really does tell the lane the tool is missing and
+    # what to do instead — previously the log promised that and the brief named a path that did not exist
+    # (exit 127, unmapped by the brief's own exit-code table).
+    MERGE_LOOP_NOTE="⛔ THE MERGE LOOP IS NOT INSTALLED ON THIS BOX ($LANE_MERGE_CMD does not exist). Do NOT hand-roll a polling loop: if you cannot reach \`merged\`, report the exact blocker as a hand-off comment per **Handoff** below and stop. An operator can install it with: \`cp $SELF/*.sh $O/\`"
+    echo "[lane $N] ⛔ $O/lane-merge.sh is ABSENT and this harness was loaded FROM $SELF — there is no other copy to name. The brief now says so and tells the lane to hand off instead of running a missing path; sync first: cp $SELF/*.sh $O/" >> "$O/logs/lane-$N.log"
+  fi
+fi
 cat > "$O/logs/prompt-$N.txt" <<EOF
 Autonomous engineering lane. You are ALREADY inside your own worktree (that is your cwd, on branch \`$BR\`). Do NOT create, switch, or remove worktrees, and NEVER touch the repo's main checkout.
 
@@ -207,11 +232,65 @@ The comment thread supersedes the body where they disagree. Several issues here 
     uv sync --extra embeddings --extra parity        # tortoise: installs the canonical dev env
 Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`  (NEVER bare \`uv run\` — it strips the extras). If \`.venv\` is missing in YOUR worktree, run \`uv sync --extra embeddings --extra parity\` once — ⛔ never search the filesystem for an interpreter (no \`find\`/\`rg\`/\`du\` outside this worktree: a \`find\` under \`$HOME\` blocks for many minutes and has consumed whole agent budgets, producing no result).
 
+## ⛔ ACCEPTANCE CRITERIA — the PR is not the finish line
+**You are done when your PR is MERGED, or when you report the one thing that blocks the merge that nobody
+else can supply.** A lane that stops at "PR opened" has NOT finished: the fleet measured 22 open PRs against
+3 merged, because every lane treated the opened PR as success and left the merge work behind 16 running lanes.
+So after the PR exists you must:
+  1. drive YOUR OWN checks to terminal and fix what is red (lint, tests, a committed conflict marker);
+  2. keep the PR mergeable — if it goes DIRTY, re-apply your own change onto current main and force-push
+     YOUR branch (see Conflicts below);
+  3. take it to the repo's merge path and stay until it is merged. Do not ask the parent to do the fixing
+     you can do here.
+
+## The merge loop is a TOOL, not an instruction — use it
+${MERGE_LOOP_NOTE:+$MERGE_LOOP_NOTE
+}
+    bash $LANE_MERGE_CMD <PR> --issue $N --repo $OR --branch $BR
+It is bounded BY CODE (3 fix rounds, then it refuses); do not hand-roll a polling loop and do not run
+\`gh pr merge\` yourself. Its exit code IS your next action:
+    0  MERGED              done — report the merge sha
+    10 FIX_REQUIRED        the printed check names are red — fix, commit, push, run the tool again
+    15 FIX_CONFLICT        PR is dirty — see Conflicts below, force-push, run again
+    11 WAITING             the harness's merge chain owns the PR now; call
+                           \`bash $LANE_MERGE_CMD <PR> --watch --issue $N --repo $OR\` (a bounded chunk —
+                           repeat it). It is DETACHED on purpose, so it keeps running even if your wall
+                           clock ends. ⛔ READ the printed line before repeating: a chunk that says the
+                           PR head MOVED past the chain's head means run the loop again, not --watch.
+    12 BLOCKED_ATTESTATION green and mergeable, but there is no signed review at this head and you may
+                           not mint one — hand off (this is the one thing only a fresh reviewer supplies)
+    13/14 BLOCKED_*        stop fixing and HAND OFF (see Handoff below)
+The merge itself is \`$O/merge-one.sh\`, the harness's one per-PR chain: it resolves the repo's own merge
+authority (a rail repo merges through its rail; a gate repo dispatches a FRESH-CONTEXT reviewer, records the
+verdict, and only then merges). ⛔ **NEVER call \`record-review.sh\` yourself and never post a review verdict of
+your own** — a lane attesting to its own review is a review that did not happen, and it is the one thing the
+chain exists to make impossible.
+
+## Conflicts
+If the PR is DIRTY, re-apply YOUR OWN change onto current main (\`git fetch origin main\`, then rebase or
+merge origin/main onto your branch), resolve conflicts keeping both sides' intent, re-run your tests, and
+force-push YOUR OWN branch (\`git push --force-with-lease origin $BR\`). ⛔ **Never resolve a conflict in a
+GENERATED file by picking a side** — regenerate it with its own generator (lockfile, snapshot, manifest, codegen).
+Never force-push anyone else's branch, and never touch the repo's main checkout.
+
+## Attestation — read this BEFORE you touch the PR body
+Once a review has been recorded at your head, **any PR body edit WIPES the attestation the gate reads** (that
+exact failure has happened twice on real PRs). So: write the body ONCE, before the merge loop starts; after
+that, do not edit it. Put new information in a **comment**, never in the body. And never re-record a review
+to "refresh" it.
+
+## Handoff — a diagnosis, not a mystery
+If you cannot merge, the exact blocking reason MUST be on the PR as a comment. \`lane-merge.sh\` posts it for
+the terminal BLOCKED_* exits; for any other handoff you write it yourself:
+    gh pr comment <PR> --repo $OR --body "<the exact blocker: the check name + its failure, the conflict, the missing precondition, and what you already tried>"
+Then report it. "Blocked" with no reason forces the next lane to re-derive everything you learned.
+
 ## Rules
-- The review/VGATE extensions are BYPASSED for you and you have NO "task" tool — do NOT dispatch. The PARENT runs the review gate.
+- The review/VGATE extensions are BYPASSED for you and you have NO "task" tool — do NOT dispatch. The PARENT runs the review gate (that is the chain in the merge loop above, not you).
 - Commit with \`git commit -F <message-file>\` (repo-unique temp path per AGENTS.md "Editing Rules"). Stage specific files; never \`git add -A\`.
-- Push (\`git push -u origin $BR\`), then open a PR against main: title "<type>(<scope>): <subject> (#$N)". The body MUST carry "Closes #$N" ON ITS OWN LINE — check [a] reads the LINE position, so a mid-sentence "(fixes #$N)" does not count. ⛔ Do NOT reach for "Refs #$N" on work you have finished: GitHub never closes an issue from a \`Refs\`, and NOTHING in this fleet re-reads an open issue whose PR merged — measured 2026-10-13, 25 of 36 open P0-blockers already had MERGED PRs on main while 48 PRs merged in one day and 0 blockers closed (#8468). Use "Refs #$N" ONLY when a specific acceptance indicator is genuinely unmet, and then name it on its own line as \`Still open: <indicator>\` — a bare \`Refs\` is a lane failing to take a position, not a partial delivery. Include what changed and exact test evidence. Do NOT merge.
+- Push (\`git push -u origin $BR\`), then open a PR against main: title "<type>(<scope>): <subject> (#$N)". The body MUST carry "Closes #$N" ON ITS OWN LINE — check [a] reads the LINE position, so a mid-sentence "(fixes #$N)" does not count. ⛔ Do NOT reach for "Refs #$N" on work you have finished: GitHub never closes an issue from a \`Refs\`, and NOTHING in this fleet re-reads an open issue whose PR merged — measured 2026-10-13, 25 of 36 open P0-blockers already had MERGED PRs on main while 48 PRs merged in one day and 0 blockers closed (#8468). Use "Refs #$N" ONLY when a specific acceptance indicator is genuinely unmet, and then name it on its own line as \`Still open: <indicator>\` — a bare \`Refs\` is a lane failing to take a position, not a partial delivery. Include what changed and exact test evidence.
 - Do NOT change the MCP tool registry or the public TortoiseSDK surface (needs owner approval — STOP and report instead).
+- REMEMBER what load is: 22 landers share one rate-limited GitHub account. Read the PR once per loop turn, use \`lane-merge.sh\` (REST + local state), and never poll in a tight loop.
 - Read skills/issue-workflow/SKILL.md and skills/issue-scoping/SKILL.md first.
 - If the defect is already fixed (in-repo or elsewhere) report ALREADY_FIXED / OUT-OF-REPO with file/line/commit evidence instead of forcing a PR. A no-change verdict with evidence is a good outcome.
 - **If you add a test file, you MUST register it in \`config/ci-surfaces.yml\`** — an unregistered file is never selected on the relevant source diff and the unconditional \`manifest-integrity\` leg fails. Verify with \`python tools/ci_selection.py --integrity\`.
@@ -225,7 +304,11 @@ $LANDING_BRIEF
 $REVIEWER_BRIEF
 
 ## Deliverable (final message, <=25 lines)
-issue #, status (PR_OPENED | ALREADY_FIXED | OUT-OF-REPO | BLOCKED), branch + PR URL, files changed, exact test commands + pass/fail counts, blockers.
+issue #, status (**MERGED | BLOCKED_ATTESTATION | BLOCKED_ATTEMPTS | BLOCKED | ALREADY_FIXED | OUT-OF-REPO**),
+branch + PR URL, the MERGE SHA when merged, files changed, exact test commands + pass/fail counts, and — if
+not merged — the single blocking reason and the PR comment URL where you recorded it. Write the status token
+EXACTLY as one of those words on its own line: the fleet's merge-rate instrument reads this line, and a lane
+that ends "PR_OPENED" is counted as unfinished.
 EOF
 # ── THE GENERATED BRIEF IS CHECKED AT BUILD TIME (#2258) ───────────────────────────────────────
 # Before the dry-run seam and before any capacity bookkeeping. `LANE_DRY_RUN=1` then proves the brief
@@ -281,11 +364,31 @@ if [ "${LANE_DRY_RUN:-0}" = "1" ]; then
   echo "[lane $N] DRY RUN — prompt written to $O/logs/prompt-$N.txt; no agent started" | tee -a "$O/logs/lane-$N.log"
   exit 0
 fi
-run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
+# ⛔ THE WALL LIMIT GREW BECAUSE THE JOB DID (3300s, was 2400s). A lane now owns its merge: after the
+# PR exists it waits for its own checks, fixes them, and supervises the merge chain — a merge phase that
+# queues behind 24-minute CI. At 2400s the kill would land mid-merge on a lane that had done nothing
+# wrong, and the lane log would end with no MERGED line even on a PR that merges (the chain is detached,
+# so the merge itself still completes — which is exactly why the missing line would be silent). The
+# bound is still a bound, and LANE_TIMEOUT overrides it as before.
+run_agent "${LANE_TIMEOUT:-3300}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
+# ⛔ A LANE THAT ENDS WITHOUT A MERGE-PHASE VERDICT IS A RECORDED FAILURE, NOT SILENCE (#2029).
+# The merge phase is the lane's own job now, so its absence is the exact defect this change targets —
+# and the only place it is visible is here. `merge-rate.sh` counts such a lane as UNKNOWN (it reads
+# the log's last status token), so the line below is what lets an operator see WHY a lane is UNKNOWN
+# without re-reading a 25-minute transcript. It never changes the exit status.
+# ⛔ GATE ON "THIS LANE OPENED A PR" (E5). The bare verdict test fired for every lane that
+# legitimately never reached a PR — ALREADY_FIXED and OUT-OF-REPO are documented GOOD outcomes in the
+# same brief — and told the operator merge-rate would count them as UNKNOWN, which is false: its
+# classifier includes both tokens, so they land in `other`, never `unknown`. An instrument that alarms
+# on the healthy path and misstates its own measurement teaches the next reader to ignore it.
+if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/logs/lane-$N.log" 2>/dev/null \
+   && [ ! -s "$O/state/lanemerge-issue-$N.verdict" ]; then
+  echo "[lane $N] ⚠️ NO merge-phase verdict (state/lanemerge-issue-$N.verdict absent) — the lane ended without either reaching merged or naming a blocker; merge-rate.sh will count it as PR_OPENED (or UNKNOWN if the log carries no status token), never as MERGED." >> "$O/logs/lane-$N.log"
+fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
 # AGENT_BRIEF_REFUSED (80)
 # or AGENT_DISK_REFUSED (77);
