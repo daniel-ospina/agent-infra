@@ -93,8 +93,22 @@ if [ -n "$SW" ]; then
     bash "$SW" start >/dev/null 2>&1 || true
 else
   # Direct start, mirroring the supervisor's launch line.
+  #
+  # ⛔ `unset GH_REPO` AFTER `set +a`, the same two-token strip the supervisor's session command
+  # carries: `$ENV_FILE` is re-sourced INSIDE the session, so a global `export GH_REPO=…` in it
+  # answers every `gh` call that omits `--repo` from this controller onward — the #2235 fail-open
+  # (a rail printing '✅ PR #2232 is ALREADY MERGED' for a tortoise PR while grading agent-infra).
+  # This path builds its OWN session instead of going through the supervisor, so it needs its own
+  # strip; `cloud-cell-supervisor.test.sh` §12 pins the supervisor's two and cannot see this one.
+  #
+  # ⛔ WHY THESE COMMENTS ARE HERE AND NOT INSIDE THE CONTINUATION BELOW (#2235 review P1): a
+  # backslash-newline is joined LEXICALLY, so a `#` line placed between `tmux new-session … \` and
+  # the command string ENDS THE COMMAND — tmux then starts a bare default shell named `orch` with
+  # NO command argument, the string runs as a separate command (127, swallowed by `2>/dev/null ||
+  # true`), and the script reports success having started nothing. Verified by the reviewer with a
+  # stub `tmux` recording `new-session -d -s orch -c <dir>` and no argv[7].
   tmux new-session -d -s orch -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; \
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; \
      HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' MAX_LANES='$MAX_LANES' \
      bash '$O/orch-loop.sh' >> '$O/logs/orch-loop.log' 2>&1" >/dev/null 2>&1 || true
 fi

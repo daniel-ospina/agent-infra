@@ -464,6 +464,74 @@ check_repo() {
     git clone --depth 1 -q "https://github.com/$REPO_SLUG.git" "$WORKDIR" \
       && ok "cloned $REPO_SLUG -> $WORKDIR" || die "clone failed"
   fi
+  # ── #2235: `GH_REPO` MUST NOT BE EXPORTED BY A CELL'S ENV ────────────────────
+  # gh resolves its repo as flag > `GH_REPO` > the local checkout, so a GLOBAL
+  # `GH_REPO` in `keys.env` makes every call that omits `--repo` answer for another
+  # repo. Measured 2026-10-20/21 on every cell (`GH_REPO=daniel-ospina/tortoise`):
+  #
+  #   $ bash scripts/admin-merge.sh 2232
+  #   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+  #                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+  #
+  # a SEPTEMBER tortoise PR, exit 0, over an OPEN agent-infra one; and
+  # `GraphQL: Could not resolve to a PullRequest with the number of 2231` for real open PRs.
+  #
+  # THE SUBJECT IS THE CHECKOUT THE CONTROLLER RUNS IN (`$WORKDIR`'s own origin), which is what
+  # the requirement names. TWO OUTCOMES, deliberately different:
+  #   * DISAGREEMENT ⇒ `die`. The env is actively wrong: every rail on the box would grade and
+  #     report another repo's PRs, and that is the failure this check exists to make loud.
+  #   * AGREEMENT ⇒ `warn` + `unset`. Nothing is wrong today, but a global export is still the
+  #     DEFECT (it answers for every gh call that omits --repo, so the next checkout or renamed
+  #     repo on this box turns it into a wrong answer with no signal). Refusing a cell whose env
+  #     is merely redundant would be a false block with no safety gain — so it is stripped and
+  #     reported instead. (The strip is local: the controller session re-sources keys.env, which
+  #     is why `cloud-cell-supervisor.sh` strips it there too.)
+  if [ -n "${GH_REPO:-}" ]; then
+    local want have got
+    want="$(git -C "$WORKDIR" remote get-url origin 2>/dev/null)" || want=""
+    # Derive `<owner>/<name>` from the checkout's own origin — the same evidence the
+    # controller's queue gate reads, with the same accepted shapes. ⛔ `.git` is stripped
+    # AFTER the trailing slash (`…agent-infra.git/` is a shape the fleet's lockstep table
+    # supports; stripping `.git` first left the dot-suffix in place and this check then DIED
+    # with "names a DIFFERENT repository" for two spellings of the SAME repo — a false block
+    # on the provisioning path, #2235 review P1).
+    case "$want" in
+      https://*|http://*|ssh://*) got="${want#*://}"; got="${got#*/}" ;;
+      *@*:*)                      got="${want#*:}" ;;
+      *)                          got="" ;;
+    esac
+    case "$got" in /*) got="" ;; esac          # empty path segment — refuse, never repair
+    got="${got%/}"; got="${got%.git}"
+    case "$got" in */*/*) got="" ;; esac
+    if [ -z "$want" ]; then
+      die "GH_REPO is exported by this cell's env ($GH_REPO) but $WORKDIR has no readable 'origin' remote, so the export cannot be verified against the checkout the controller runs in. A global GH_REPO is what produced the #2235 fail-open (a rail printing 'ALREADY MERGED' for a tortoise PR while grading agent-infra). Remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never cell state."
+    fi
+    if [ -z "$got" ]; then
+      # A READABLE origin that is not a slug (a local path, `file://`, a bare mirror…): the
+      # export cannot be checked, so it is stripped rather than refused. Stripping is the safe
+      # half — an unverifiable global export is exactly the defect — and dying here would block
+      # provision on a legitimate non-GitHub origin with a diagnosis that does not apply.
+      warn "GH_REPO is set to '$GH_REPO' but $WORKDIR's origin ($want) is not an <owner>/<name> slug, so the export cannot be verified against this checkout. Stripping it from this shell: gh gives GH_REPO precedence over the checkout for every call that omits --repo, so leaving it set lets a rail grade another repo (#2235)."
+      unset GH_REPO
+    fi
+    if [ -n "${GH_REPO:-}" ]; then
+      have="$(printf '%s' "$GH_REPO" | tr '[:upper:]' '[:lower:]')"
+      # `[HOST/]OWNER/REPO` is the documented GH_REPO form (`gh help environment`), so
+      # `github.com/o/r` names the SAME repo as `o/r` — comparing it verbatim died with
+      # 'a DIFFERENT repository' on a correct cell (§2235 review P2). Drop a leading segment
+      # only when it IS a host (dotted).
+      case "$have" in
+        */*/*)
+          case "${have%%/*}" in *.*|*:*) have="${have#*/}" ;; esac ;;
+      esac
+      got="$(printf '%s' "$got" | tr '[:upper:]' '[:lower:]')"
+      if [ "$have" != "$got" ]; then
+        die "GH_REPO names a DIFFERENT repository than this cell's checkout: GH_REPO='$GH_REPO' but $WORKDIR is a checkout of '$got' (origin $want). gh gives GH_REPO precedence over the checkout for every call that omits --repo, so every rail on this cell would grade and report '$GH_REPO' PRs while believing it graded '$got' — measured as '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state; a command that needs another repo passes --repo."
+      fi
+      warn "GH_REPO is set to '$GH_REPO' (from $ENV_FILE or the ambient shell) and matches this checkout ($got) — nothing is wrong today, but the export is the DEFECT (#2235): it silently answers for every gh call that omits --repo, so the next checkout, clone or renamed repo on this box makes it a wrong answer with no signal. Remove the GH_REPO line from $ENV_FILE (per-invocation state; a command that needs another repo passes --repo). Stripping it from this shell."
+      unset GH_REPO
+    fi
+  fi
   git -C "$WORKDIR" config user.email "cloud-lane@premiselabs.co"
   git -C "$WORKDIR" config user.name  "cmux cloud lane"
 }

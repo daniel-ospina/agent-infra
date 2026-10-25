@@ -1,0 +1,15 @@
+# A `#` line INSIDE a `group: |` block is literal text, not a comment. Comment-stripping ran before the
+# block was read, which deleted the line — and with it the per-commit variable it carried, so an inert
+# gate read GREEN (#2660 round 5).
+name: PR hidden sha
+on: pull_request
+concurrency:
+  group: |
+    pr-hidden-sha-${{ github.ref }}
+    # ${{ github.sha }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

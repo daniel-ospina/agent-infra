@@ -73,6 +73,12 @@
 
 set -uo pipefail
 
+# #2235: the suite must not inherit an ambient repo selector. gh gives `GH_REPO` precedence over the
+# checkout for every call that omits `--repo`, so a value exported by the developer's shell (or by a
+# cell's keys.env) would be judged against every fixture checkout's origin — reddening unrelated arms
+# and letting this harness carry the very defect the new conformance arm exists to catch.
+unset GH_REPO
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRINGUP="$HERE/cloud-cell-bringup.sh"
 

@@ -1,0 +1,11 @@
+# FAILURE-CLASS FIXTURE (R1): the SCALAR shorthand `concurrency: <group>` — valid YAML, a group with no
+# cancellation, so it can never satisfy R1 (the value form the guard header advertises as modelled).
+name: pr-scalar-concurrency
+on:
+  pull_request:
+concurrency: pr-scalar-concurrency
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
