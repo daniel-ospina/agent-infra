@@ -287,6 +287,28 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     expect("(b) an UNRELATED script at a framework tree's scripts/admin-merge.sh (right name, wrong bytes) → BLOCKED",
       blocked(await bash(guard, `bash "${join(fw2, "scripts", "admin-merge.sh")}" 123`, hub)), true);
 
+    // ── (b3) THE #1228 BODY ARM IS DIGEST-KEYED, NOT PATH-KEYED ──
+    // `_sanctionedScriptExemption` arm 1 is PATH ONLY by spec (the pre-existing #1129
+    // anchor, deliberately unchanged) and `deploy()` makes its root the MODULE root — so a
+    // body planted at `<moduleRoot>/scripts/<sanctioned relpath>` is admitted by arm 1
+    // alone. This fixture is exactly that shape and carries a runtime-EXPANDED operand, so
+    // the only thing that can refuse it is the digest in `_isAuditedSanctionedScript`. The
+    // 2026-10-24 defect: the #1228 refusal was stood down for a sanctioned script's body
+    // keyed on the PATH, which made an unaudited file at an audited relpath runnable — the
+    // fail-open (an operand the shell resolves at runtime, discarding work the gate never
+    // read). M6 below drops the digest and requires this invocation to be ALLOWED, so this
+    // arm fails if the key ever becomes the path again.
+    const plant = (root) => {
+      mkdirSync(join(root, "scripts"), { recursive: true });
+      const p = join(root, "scripts", "scratch-worktree.sh");
+      writeFileSync(p, '#!/bin/bash\ngrep -qa m <(head -c 10 "$HOME/x")\n');
+      return p;
+    };
+    const planted = plant(join(work, "deploy"));
+    const plantedRes = await bash(guard, `bash "${planted}" --help`, hub);
+    expect("(b3) unaudited bytes at a SANCTIONED relpath under the MODULE root → BLOCKED (#709: the DIGEST decides, not the path)",
+      blocked(plantedRes) && /#709/.test(String(plantedRes.reason)) && /shell-expansion form/.test(String(plantedRes.reason)), true);
+
     // ── (c) THE AUDITED BYTES AT AN ARBITRARY PATH → BLOCKED (#1485 B5b) ──
     // The pin alone would exempt this; the framework-root half is what does not.
     const hubScripts = join(hub, "scripts");
@@ -398,6 +420,25 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     if (m5) {
       expect("(d6) MUTATION M5 — an ABSENT delegate skipped instead of declining ⇒ (e) FAILS (a bare pinned leaf is admitted)",
         blocked(await bash(m5, `bash "${join(fwBare, "scripts", "admin-merge.sh")}" 123`, hub)), false);
+    }
+    // M6 drops the DIGEST from `_isAuditedSanctionedScript`. If (b3) then passes, the whole
+    // stand-down rests on a path an agent can reproduce — which is the fail-open it replaced.
+    const M6 = {
+      name: "M6 body-arm-digest-dropped",
+      // The anchor tracks the CURRENT body of `_isAuditedSanctionedScript`, re-cut on
+      // 2026-10-24 when `bodyDigest` became a REQUIRED parameter and the disk-read fallback was
+      // removed; the previous anchor (`got !== null && got === want`) no longer occurs there.
+      // `deploy()` refuses to run a mutation whose anchor is absent (`fatal()` → nonzero exit),
+      // so a stale anchor reds this suite rather than silently testing unmutated code — which
+      // is why re-cutting it is a one-line maintenance task and not a silent hole.
+      from: 'return typeof want === "string" && want.length === 64 && bodyDigest === want;',
+      to: 'return true; // MUTATION M6: the body-arm digest dropped — the anchor alone grants',
+    };
+    const m6 = await loadGuard(join(work, "mut-m6"), M6);
+    if (m6) {
+      const m6Planted = plant(join(work, "mut-m6"));
+      expect("(d7) MUTATION M6 — digest dropped from _isAuditedSanctionedScript ⇒ (b3) FAILS (unaudited bytes at a sanctioned relpath are admitted)",
+        blocked(await bash(m6, `bash "${m6Planted}" --help`, hub)), false);
     }
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
