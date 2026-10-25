@@ -793,6 +793,25 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "the spacing between the reap role's two observations of a candidate lane's CPU. Two samples are what separate an idle lane from one that is mid-command (a single snapshot cannot), so this is the width of that gate — NOT a bound on how long work may take.",
   },
   {
+    name: "HYGIENE_TMP_MIN_AGE_S",
+    owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
+    value: "${HYGIENE_TMP_MIN_AGE_S:-3600}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/cloud-cell-doctor.hygiene.test.sh §temp — a dir whose embedded pid is dead AND whose mtime is past this floor is reaped, while a FRESH one (dead pid, written seconds ago) is KEPT with its reason; the `> 0` bound is refused at load by cloud-cell-doctor.sh's numeric validation, because a zero floor leaves a recycled pid as the only proof a temp dir is idle",
+    note: "#2573 — how long a `cloud-cell-<pid>.<rand>` temp dir must have been untouched before the hygiene role may reclaim it, once its embedded pid is provably gone. The pid is the primary proof; this floor is the SECOND gate that covers pid RECYCLING (the name's pid can be dead now and have belonged to something else by the time the dir was written). A zero floor makes the recycling hole unbounded, which is why the loader refuses it by name rather than silently accepting a vacuous bound.",
+  },
+  {
+    name: "LANE_IDLE_MIN",
+    owners: ["scripts/orchestrator-harness/lane-reap.sh"],
+    value: "${LANE_REAP_IDLE_MIN:-120}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/lane-reap.test.sh §idle — a lane whose log has not advanced past the bound is a reap candidate, and one that HAS keeps it; the value is asserted by THIS registry's forward check, since the suite drives its own LANE_REAP_IDLE_MIN in the environment",
+    overrides: ["LANE_IDLE_MIN=120"],
+    note: "#2163 — how long a lane's own activity log must have gone untouched before the reaper treats the lane as finished (2 h), in MINUTES. Deliberately NOT named `IDLE_MIN`: that symbol is a REGISTERED term owned by `scripts/orchestrator-heartbeat.sh` (a 9-minute spinner-absent classification bound, declared-not-read), and sharing the name made one authority out of two unrelated numbers — exactly the divergence this registry exists to surface. This one is READ (it decides a kill), and it is the log-evidence gate that outranks age: a lane with no log takes the 12 h `NO_LOG_H` path instead, and a lane whose log advanced inside this window is never signalled.",
+  },
+  {
     name: "MAX_AGE",
     owners: ["scripts/monitor-worker.sh"],
     value: "${2:-60}",
@@ -891,6 +910,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "retention",
     guardedBy: NONE,
     note: "#2032 — the age floor applied to a MERGED worktree head (default 0: merged is reclaimed the same day, because the merge is the proof the work landed and the tree is separately required to be clean). It REPLACES REAP_WT_AGED_DAYS for that row only; an UNMERGED head keeps the blanket floor, where age still separates a stale scratch checkout from work in progress. Set it equal to REAP_WT_AGED_DAYS to restore the pre-exemption behaviour. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used: the merge proves the work landed, and the tree is separately required to be clean, so age has nothing left to protect. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used. An UNMERGED head keeps the blanket floor — there age still separates a stale scratch checkout from work in progress. 0 restores the pre-exemption behaviour, so the exemption is visible and reversible rather than baked in.",
+  },
+  {
+    name: "REAP_WT_SCRATCH_AGE_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_SCRATCH_AGE_DAYS:-1}",
+    axis: "retention",
+    guardedBy: NONE,
+    note: "#2354 — the age floor for a LANE SCRATCH checkout (`wt-*` / `cell-wt-*` at any depth), 1 day. A dead lane's scratch dir is a throwaway, not the 7-day review surface a named issue branch is; the 7-day blanket floor held it (and its disk) for a week after the lane was gone, which is why the reaper reclaimed zero. It only ever CAPS DOWN (a value above the floor in force has no effect, so 14 cannot mean 'keep longer'), it never replaces a merged/patch-equivalent floor, and it touches AGE ONLY — every survival gate (clean / no live holder / no open PR / ref-holding) is unchanged, so a young-but-finished scratch dir is still reclaimed and an old-but-dirty one is not. Registered rather than exempted because it IS a retention bound in the same family as REAP_WT_AGED_DAYS/REAP_WT_MERGED_AGE_DAYS above, and a reader must be able to see the floor move.",
   },
   {
     name: "REAP_WT_MAX_DAYS",
@@ -1275,6 +1302,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
     rationale:
       "a MEASURED age in seconds (the claim commit's own %ct subtracted from now), never a bound: the `_AGE` suffix rule matches the accumulator's initializer line, but the value is read from the claim commit and compared against the registered CR_MIN_AGE floor. Registering it as a term would put a measurement in a vocabulary of bounds",
     owner: "#2246",
+  },
+  {
+    symbol: "CIQ_AGE",
+    rationale:
+      "a MEASURED age in seconds — how old the cached CI-queue reading is (0 on a fresh read, the record's own `at=` delta on a cache hit) — printed in the verdict token so an operator can judge it. It is never a bound: the freshness DECISION is `CIQ_STALE_MAX`/`CIQ_TTL`, and the age is compared against them, not used as one. The `_AGE` suffix rule matches its initializer/assignment lines. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE is exempted (#2333 review)",
+    owner: "#2426",
   },
   {
     symbol: "DEFAULT_TASK_RUNS_MAX_AGE_MS",

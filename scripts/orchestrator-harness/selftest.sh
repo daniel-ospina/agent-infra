@@ -103,18 +103,20 @@ if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
-# Extracted from orch-loop.sh verbatim. The required set and the review-gate NAME are read from
-# the ENVIRONMENT by the shipped classifier (agent-infra#1764), so the driver supplies them the
-# same way the loop does — there is no bash-side $REQ splice to substitute any more.
+# ⛔ THE CLASSIFIER IS A FILE, NOT A HEREDOC ANY MORE (agent-infra#2719). It lived in orch-loop.sh as an
+# inline `python3 -c` string, and the NOCHECKS arm has to ask the SAME question on a re-read — two
+# copies of these rules is how the harness and the merge rail disagreed before (#1714). So the shipped
+# artifact IS `check-class.py`: a missing file is a hard FAIL here (never a silently empty classifier,
+# which would grade GREEN on an empty answer). The required set and the review-gate NAME are still read
+# from the ENVIRONMENT (agent-infra#1764), so the driver supplies them the same way the loop does.
 CL_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
 CL_GATE="ai-review-gate"
-awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+cat "$HERE/check-class.py" > "$TMP/classify.py" 2>/dev/null || : > "$TMP/classify.py"
 cl() { printf '%s' "$1" | REQ="$CL_REQ" REVIEW_GATE="$CL_GATE" python3 "$TMP/classify.py" 2>/dev/null; }
 # clreq <required-set> <payload> [<review-gate>] — the SAME shipped classifier against an
 # ARBITRARY repo's required set. Used by the repo-shape fixtures below, and by test-gates.sh.
 clreq() { printf '%s' "$2" | REQ="$1" REVIEW_GATE="${3:-ai-review-gate}" python3 "$TMP/classify.py" 2>/dev/null; }
-if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
+if need "$TMP/classify.py" "the classifier is the shipped check-class.py"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: ai-review-gate SKIPPED is not satisfied" $rc
@@ -290,7 +292,11 @@ fi
 # PR exists to close), and a backticked `gh pr checks` spliced a multi-line table into the Python
 # source (SyntaxError -> V="" -> no case arm matched). Extract the real assignment and drive it
 # through a logged `gh` shim so the shell, not an awk extraction, is what runs.
-awk '/^    V="\$\(gh pr checks/{f=1} f{print} /^" 2>\/dev\/null\)"$/{f=0}' "$LOOP" > "$TMP/classify_bash.sh"
+# ⛔ THE ASSIGNMENT IS ONE LINE NOW (agent-infra#2719): the Python moved to `check-class.py`, so the
+# heredoc's closing `" 2>/dev/null)"` terminator no longer exists — the old range-capture ran to the END
+# OF THE FILE (1547 lines measured) and the driver then aborted on `set -u` before printing `V`, which
+# made this whole block report a red it could not explain. Capture the ONE assignment line.
+grep -m1 '^    V="\$(gh pr checks' "$LOOP" > "$TMP/classify_bash.sh"
 if need "$TMP/classify_bash.sh" "the classifier's bash assignment is extracted from orch-loop.sh"; then
   mkdir -p "$TMP/bin"
   cat > "$TMP/bin/gh" <<'SH'
@@ -309,6 +315,9 @@ SH
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
     printf '%s\n' "REVIEW_GATE='ai-review-gate'"
+    # the pipeline's classifier path is resolved by the loop at startup; the driver supplies the
+    # SHIPPED file so the shell runs the real classifier, not a missing path.
+    printf '%s\n' "_CK_PY='$HERE/check-class.py'"
     cat "$TMP/classify_bash.sh"
     printf '%s\n' 'printf "V=%s\n" "$V"'
   } > "$TMP/drive.sh"
@@ -435,7 +444,9 @@ ck "shipped reaper: the skipped pass says so (an unreadable listing is not an em
 # the same guard for the neighbouring `.open_iss` probe, which had the safe polarity by accident
 RO="$TMP/reap-failopen"; mkdir -p "$RO"
 printf '4114\n8888\n' > "$RO/dispatched.txt"
-printf '4114\n8888\n' > "$RO/checked.txt"
+# 5252 is checked and has NO local keep-fact (not queued, not dispatched, no PR, no lane): it is the
+# entry the CHECKED classification must publish as releasable even though `.open_iss` is unreadable.
+printf '4114\n8888\n5252\n' > "$RO/checked.txt"
 printf 'feat/8888-tm\n' > "$RO/.pr_brs"
 ( PATH="$R:$PATH" python3 "$R/reap.py" "$RO" ) > "$TMP/reap-failopen.out" 2>&1
 case "$(tr '\n' ' ' < "$RO/dispatched.txt")" in *4114*) rc=0;; *) rc=1;; esac
@@ -448,6 +459,17 @@ ck "shipped reaper: an UNREADABLE open-issue listing reaps nothing either" $rc
 # what the guard produces and what the pre-fix `|| : >` shape could not.
 grep -qF 'SKIPPED: .open_iss' "$TMP/reap-failopen.out" && rc=0 || rc=1
 ck "shipped reaper: the open-issue guard fires and names .open_iss (not vacuously safe)" $rc
+# ⛔ THE GUARD IS *SPLIT*, AND THIS IS ITS ONLY DISCRIMINATING ASSERTION (review P2, #2183). An
+# unreadable `.open_iss` must disable ONLY the `dispatched.txt` reap; the CHECKED classification
+# reads `candidates.txt`/`dispatched.txt`/`.pr_brs`/`tmux`/the claim registry and must still run.
+# Re-joining the guards (refusing both on either missing listing) leaves every assertion above
+# GREEN — the old single message also carries `SKIPPED: .open_iss` and `dispatched.txt` is
+# untouched under both — so only the ARTIFACT below can tell the two designs apart. 5252 has no
+# keep-fact and must be published as releasable; a re-joined guard publishes nothing, and the
+# entry stays suppressed for ever, which is the defect this patch removes.
+relopen="$(tr '\n' ' ' < "$RO/state/checked-release-candidates" 2>/dev/null)"
+case "$relopen" in *5252*) rc=0;; *) rc=1; echo "      releasable: '$relopen'";; esac
+ck "shipped reaper: an unreadable open-issue listing still RUNS the checked classification (the guard is split)" $rc
 # a PRESENT but EMPTY list is a REAL answer and must still reap
 RE="$TMP/reap-emptypr"; mkdir -p "$RE"
 printf '4114\n7777\n' > "$RE/dispatched.txt"
@@ -460,6 +482,51 @@ case "$kept" in *4114*) rc=1;; *) rc=0;; esac
 ck "shipped reaper: a genuinely EMPTY (readable) PR listing still reaps 4114" $rc
 case "$kept" in *7777*) rc=0;; *) rc=1;; esac
 ck "shipped reaper: the empty-listing pass still keeps a non-open issue (7777)" $rc
+
+# ── 5a2) THE CHECKED CLASSIFICATION: a suppression survives only while a re-checkable fact holds ──
+# `checked.txt` short-circuits the walk before ANY network call, so an entry in it is invisible to
+# every later pass — and before agent-infra#2183 nothing revalidated it: the only remover walked
+# `dispatched.txt`, a different file. A CLEAN-judged candidate that was never dispatched was therefore
+# suppressed for ever. These fixtures drive the SHIPPED heredoc (extracted above) and assert the
+# ARTIFACTS it publishes, never a log string.
+#   CQ: 4114 no keep-fact -> RELEASABLE (the queue can fill again)
+#   CQ: 5151 in candidates.txt -> kept as `queued`
+#   CQ: 6161 has a PR head ref -> kept as `pr`
+CK="$TMP/reap-checked"; mkdir -p "$CK"
+printf '5151\n' > "$CK/candidates.txt"
+printf '4114\n5151\n6161\n' > "$CK/checked.txt"
+printf '6161\n' > "$CK/.pr_brs"
+printf '4114\n5151\n6161\n' > "$CK/.open_iss"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$CK" ) > "$TMP/reap-checked.out" 2>&1
+rel="$(tr '\n' ' ' < "$CK/state/checked-release-candidates" 2>/dev/null)"
+case "$rel" in *4114*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: a checked entry with NO keep-fact is RELEASABLE (it is not suppressed for ever)" $rc
+case "$rel" in *5151*|*6161*) rc=1;; *) rc=0;; esac
+ck "shipped reaper: a queued or PR-backed checked entry is never released" $rc
+kq="$(grep -c '^5151	queued$' "$CK/state/checked-kept" 2>/dev/null || :)"
+[ "${kq:-0}" -eq 1 ]; rc=$?
+ck "shipped reaper: the checked KEEP-FACT for a queued issue is recorded as 'queued'" $rc
+kp="$(grep -c '^6161	pr$' "$CK/state/checked-kept" 2>/dev/null || :)"
+[ "${kp:-0}" -eq 1 ]; rc=$?
+ck "shipped reaper: the checked KEEP-FACT for a PR-backed issue is recorded as 'pr'" $rc
+# ⛔ AND THE HEREDOC NEVER REWRITES checked.txt ITSELF: it publishes the classification and leaves the
+# single release rewrite to the claim filter, so an entry the registry KEEPS never has to be put back.
+ckx="$(tr '\n' ' ' < "$CK/checked.txt")"
+case "$ckx" in *4114*5151*6161*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: the classification does NOT rewrite checked.txt (one release writer, later)" $rc
+# ⛔ THE SPLIT GUARD, the other direction: an UNREADABLE `.pr_brs` refuses the whole classification and
+# says so — releasing on the facts it happens to have would un-suppress entries that DO have a PR.
+CP="$TMP/reap-checked-nopr"; mkdir -p "$CP"
+printf '4114\n' > "$CP/checked.txt"
+printf '4114\n' > "$CP/.open_iss"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$CP" ) > "$TMP/reap-checked-nopr.out" 2>&1
+[ -f "$CP/state/checked-release-candidates" ]; rc=$?
+[ "$rc" -eq 0 ] && rc=1 || rc=0
+ck "shipped reaper: with no PR listing the checked classification publishes NO candidates" $rc
+grep -q 'unjustified=-' "$CP/state/checked-reap" 2>/dev/null; rc=$?
+ck "shipped reaper: a refused classification records unjustified=- (unknown, not 0)" $rc
+grep -qF 'SKIPPED (checked: .pr_brs unreadable)' "$TMP/reap-checked-nopr.out"; rc=$?
+ck "shipped reaper: the refused classification NAMES the missing listing" $rc
 fi
 unset -f tmux
 
@@ -1427,12 +1494,32 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   # shellcheck disable=SC1090
   . "$TMP/refund-all.sh"
   # (a) reviewer-findings arm: booked to 2, findings marker deleted at spawn, bail recorded.
+  # ⛔ THE SPEND RECORD IS PART OF THE FIXTURE (review round 4, P3). `refund_bailed_fixer … 1` now
+  # restores only what the dispatch ACTUALLY TOOK, and `fixspend-<PR>-<head>` is the record of that
+  # take — written by the one spawn site that deletes a findings marker. A fixture WITHOUT it drove
+  # the "another arm bailed" case by accident, so this arm asserted the wrong contract (selftest went
+  # RED at round 5 while test-gates stayed green). The spend file is now seeded here and asserted
+  # CONSUMED below; the no-spend contract is driven separately in (a2).
+  rm -f "$O/state/needsfix-77-abc" "$O/state/fixspend-77-abc"
   echo 2 > "$O/state/fixcount-77"; : > "$O/state/fixbail-77-abc"; : > "$O/state/parked-77"
+  : > "$O/state/fixspend-77-abc"
   refund_bailed_fixer 77 abc 1
   if [ "$(cat "$O/state/fixcount-77" 2>/dev/null)" = "1" ] && [ ! -f "$O/state/fixbail-77-abc" ] \
-     && [ -f "$O/state/needsfix-77-abc" ] && [ ! -f "$O/state/parked-77" ]; then rc=0
-  else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no)"; fi
-  ck "a bailed fixer refunds the attempt AND restores the findings marker" $rc
+     && [ -f "$O/state/needsfix-77-abc" ] && [ ! -f "$O/state/parked-77" ] \
+     && [ ! -f "$O/state/fixspend-77-abc" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no) spend=$([ -f "$O/state/fixspend-77-abc" ] && echo yes || echo no)"; fi
+  ck "a bailed fixer refunds the attempt AND restores the findings marker (spend consumed)" $rc
+  # (a2) ⛔ A BAIL WITH NO SPEND MUST NOT MANUFACTURE A FINDINGS MARKER (review round 4, P3). The
+  # bail may have been written by the CI-red or CONFLICTING arm, which never delete a findings marker;
+  # refunded on a later gate-red cycle, an unconditional touch invented a fixer authorisation for a
+  # head no reviewer reported on. The attempt is still refunded — only the marker is withheld.
+  rm -f "$O/state/needsfix-78-abc" "$O/state/fixspend-78-abc"
+  echo 2 > "$O/state/fixcount-78"; : > "$O/state/fixbail-78-abc"
+  refund_bailed_fixer 78 abc 1
+  if [ "$(cat "$O/state/fixcount-78" 2>/dev/null)" = "1" ] && [ ! -f "$O/state/fixbail-78-abc" ] \
+     && [ ! -f "$O/state/needsfix-78-abc" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-78" 2>/dev/null) bail=$([ -f "$O/state/fixbail-78-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-78-abc" ] && echo yes || echo no)  <- a findings marker was MANUFACTURED"; fi
+  ck "a bail that consumed NO findings marker is refunded WITHOUT manufacturing one" $rc
   # (b) CI-red / CONFLICTING arm: no findings marker was deleted, so NONE may be invented.
   rm -f "$O/state/needsfix-88-abc" "$O/state/parked-88"; echo 1 > "$O/state/fixcount-88"; : > "$O/state/fixbail-88-abc"
   refund_bailed_fixer 88 abc 0
@@ -1610,7 +1697,14 @@ if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped merge-one.
   cat > "$TMP/ra.sh" <<SH
 pi() { sleep 60; }
 . "$TMP/runagent.sh"
-start=\$(date +%s); run_agent 2 "$TMP/ra.log" /dev/null; rc=\$?; end=\$(date +%s)
+# ⛔ THE PROMPT IS A REAL BRIEF, NOT /dev/null (agent-infra#2258). run_agent now refuses a brief with
+# no research contract (80) BEFORE it spawns, so this arm's `/dev/null` would make the shipped
+# run_agent return 80 without ever launching `pi` — and the assertion below ("it ran, and was cut off
+# at the wall limit") would fail for a reason that has nothing to do with the timeout it exists to
+# test. Rendering the canonical block keeps the fixture HONEST: the function under test still gets a
+# brief of the shape a real dispatch carries.
+brief_gate_sh="$HERE/brief-gate.sh"; bash "\$brief_gate_sh" --section reviewer > "$TMP/ra-brief.txt"
+start=\$(date +%s); run_agent 2 "$TMP/ra.log" "$TMP/ra-brief.txt"; rc=\$?; end=\$(date +%s)
 echo "\$((end-start)) \$rc"
 SH
   ra="$(bash "$TMP/ra.sh" 2>/dev/null | tail -1)"
@@ -2504,29 +2598,131 @@ fi
 # ── load gate: an agent spawn must not be piled onto a post-boot indexing storm ──
 # Driven, not grep'd: a text-presence check passes against a build with the gate neutered to
 # `can_spawn() { true; }` — reproduced before this version replaced it.
+# ⛔ AND SINCE #1732 THE SPAWN GATE HAS A SECOND DIMENSION, so the extraction takes BOTH halves.
+# Against the pre-fix tree TEN checks below fail — SIX `MEMAVAIL_MB` cases (the shipped `can_spawn`
+# there reads `L` alone, so a box with 100M available and load 3 still spawns), the order assertion,
+# the evidence-token count, and the two extraction checks for `spawn_gate_tok()`/`measure_mem()` — on
+# a log where every pre-existing load case still passes (measured: 462 passed / 10 failed on
+# `origin/main`, 475 passed / 0 failed on the fixed tree). That is the reproduction: the new checks
+# bite, and nothing old was weakened.
 grep -m1 '^can_spawn() {' "$LOOP" > "$TMP/canspawn.sh"
+grep -m1 '^mem_spawn_ok() {' "$LOOP" >> "$TMP/canspawn.sh"
 if need "$TMP/canspawn.sh" "can_spawn() is extracted from the shipped loop"; then
-  MAX_LOAD=16
+  MAX_LOAD=16; MIN_MEM_FREE_MB=512
+  # An AMPLE reading is the baseline for the load cases: memory must not mask a load assertion
+  # (both halves are ANDed, so a missing reading would refuse every case below and the load
+  # assertions would "pass" for the wrong reason).
+  MEMAVAIL_MB=9000; MEM_UNKNOWN=0
   . "$TMP/canspawn.sh"
   L=0;   can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): load 0 < 16 -> spawn allowed" $rc
   L=15;  can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): load 15 < 16 -> spawn allowed" $rc
   L=16;  can_spawn && rc=1 || rc=0; ck "shipped can_spawn(): load 16 -> spawn held back" $rc
   L=221; can_spawn && rc=1 || rc=0; ck "shipped can_spawn(): load 221 (post-boot storm) -> held back" $rc
   L="";  can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): unset load defaults to 0 (documented fail-open)" $rc
+  # ── the MEMORY arm (#1732): available memory below the floor refuses at a calm load ──
+  L=3
+  MEMAVAIL_MB=513; MEM_UNKNOWN=0; can_spawn && rc=0 || rc=1
+  ck "shipped can_spawn(): mem 513M > floor 512M at load 3 -> spawn allowed" $rc
+  MEMAVAIL_MB=512; MEM_UNKNOWN=0; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): mem 512M == floor (the dispatch gate's own boundary) -> held back" $rc
+  MEMAVAIL_MB=100; MEM_UNKNOWN=0; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): mem 100M < floor 512M at load 3 -> held back" $rc
+  MEMAVAIL_MB=653; MEM_UNKNOWN=0; MIN_MEM_FREE_MB=700; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): a raised MIN_MEM_FREE_MB binds the spawn sites (653M < 700M) -> held back" $rc
+  # UNKNOWN is not ample, and it must hold even with a STALE ample number beside it: that is the
+  # shape a failed probe leaves behind in any tree where the two are not set together.
+  MIN_MEM_FREE_MB=512
+  MEMAVAIL_MB=9000; MEM_UNKNOWN=1; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): MEM_UNKNOWN=1 with a stale ample reading -> held back (unknown is not ample)" $rc
+  MEMAVAIL_MB=""; MEM_UNKNOWN=0; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): unset MEMAVAIL_MB -> held back (fail-CLOSED, unlike the load fail-open)" $rc
+  MEMAVAIL_MB="garbage"; MEM_UNKNOWN=0; can_spawn && rc=1 || rc=0
+  ck "shipped can_spawn(): non-numeric MEMAVAIL_MB -> held back (an errored comparison must not open the gate)" $rc
+fi
+# ⛔ THE READING MUST BE TAKEN BEFORE THE SITES THAT READ IT (#1732). This is the half a behavioural
+# test on the extracted function CANNOT see: `measure_mem` used to run only in the [cap] block, which
+# sits BELOW all six spawn sites, so a `can_spawn` that consults MEMAVAIL_MB there would decide on the
+# previous cycle's figure (and on cycle 1, on nothing at all) — while every unit case above passes.
+# Assert the ORDER in the shipped file: the prologue call precedes the first spawn site.
+_mm_line=$(grep -n '^  measure_mem$' "$LOOP" | head -1 | cut -d: -f1)
+_site_line=$(grep -nE '&& can_spawn' "$LOOP" | head -1 | cut -d: -f1)
+if [ -n "$_mm_line" ] && [ -n "$_site_line" ] && [ "$_mm_line" -lt "$_site_line" ]; then rc=0; else
+  rc=1; echo "      measure_mem at '${_mm_line:-<none>}', first can_spawn site at '${_site_line:-<none>}'"
+fi
+ck "the shipped loop MEASURES memory before the first spawn site reads it (line $_mm_line < $_site_line)" $rc
+# ⛔ A HELD-BACK SPAWN MUST NAME THE ARM THAT HELD IT (#1732). The five slot refusals printed
+# `load-gate=<L>/<MAX>` only, which was complete while load WAS the gate; with a memory arm it reads as
+# a load refusal. Assert both halves: every refusal site prints the token, and the token spells out an
+# UNKNOWN probe instead of printing a `0M` that looks like a measurement.
+_slot_n=$(grep -cE 'but NO [a-z-]+ slot \(' "$LOOP")
+_slot_t=$(grep -E 'but NO [a-z-]+ slot \(' "$LOOP" | grep -cF '$(spawn_gate_tok)')
+# ⛔ ANCHORED TO THE REFUSAL LINES, NOT A FILE-WIDE COUNT (review, #1732). A bare `grep -c` of the
+# token is satisfied by a COMMENT that mentions it — and this very function's comment block discusses
+# the token, so a decoy there would keep the check green while a real refusal line lost its evidence.
+# The comment 40 lines below names the same class; this is it.
+# 5 -> 6 for agent-infra#2653: the review arm gained a refusal for a head that HAS findings at a full
+# fixer ceiling. It names the FIX side (a fixer is the remedy there, never a review), and it carries the
+# same gate token because the same two gates can have held the spawn.
+[ "$_slot_n" = "6" ] && [ "$_slot_t" = "$_slot_n" ] && rc=0 || { rc=1; echo "      $_slot_t of $_slot_n refusal line(s) print the token (expected 6 of 6)"; }
+ck "all six held-back-spawn lines print the gate evidence token (load-gate + mem-gate)" $rc
+sed -n '/^spawn_gate_tok() {/,/^}/p' "$LOOP" > "$TMP/spawntok.sh"
+if need "$TMP/spawntok.sh" "spawn_gate_tok() is extracted from the shipped loop"; then
+  got="$(bash -c '. "$1"; L=3; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=100; MEM_UNKNOWN=0; spawn_gate_tok' _ "$TMP/spawntok.sh")"
+  [ "$got" = "load-gate=3/40 mem-gate=100M/512" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped spawn_gate_tok(): prints the READING and the FLOOR for both arms" $rc
+  got="$(bash -c '. "$1"; L=3; MAX_LOAD=40; MIN_MEM_FREE_MB=512; MEMAVAIL_MB=0; MEM_UNKNOWN=1; spawn_gate_tok' _ "$TMP/spawntok.sh")"
+  [ "$got" = "load-gate=3/40 mem-gate=UNKNOWN/512" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped spawn_gate_tok(): a FAILED probe prints UNKNOWN, not a 0M that reads as a measurement" $rc
+fi
+# ...and the measurement's own failure polarity, driven: a probe that cannot answer must ZERO the
+# reading and set UNKNOWN, which is what makes the fail-closed claim above independent of MEM_UNKNOWN.
+sed -n '/^measure_mem() {/,/^}/p' "$LOOP" > "$TMP/measuremem.sh"
+if need "$TMP/measuremem.sh" "measure_mem() is extracted from the shipped loop"; then
+  { grep -m1 '^is_num() {' "$LOOP"; cat "$TMP/measuremem.sh"; } > "$TMP/measuremem-full.sh"
+  got="$(bash -c '. "$1"; mem_avail_mb() { return 1; }; MEMAVAIL_MB=9000; MEM_UNKNOWN=0; measure_mem; printf "%s %s" "$MEMAVAIL_MB" "$MEM_UNKNOWN"' _ "$TMP/measuremem-full.sh")"
+  [ "$got" = "0 1" ] && rc=0 || { rc=1; echo "      got '$got' (expected '0 1')"; }
+  ck "shipped measure_mem(): a FAILED probe zeroes the reading and sets MEM_UNKNOWN" $rc
+  got="$(bash -c '. "$1"; mem_avail_mb() { printf "garbage\\n"; }; MEMAVAIL_MB=9000; MEM_UNKNOWN=0; measure_mem; printf "%s %s" "$MEMAVAIL_MB" "$MEM_UNKNOWN"' _ "$TMP/measuremem-full.sh")"
+  [ "$got" = "0 1" ] && rc=0 || { rc=1; echo "      got '$got' (expected '0 1')"; }
+  ck "shipped measure_mem(): a NON-NUMERIC probe zeroes the reading and sets MEM_UNKNOWN" $rc
+  got="$(bash -c '. "$1"; mem_avail_mb() { printf "4096\\n"; }; MEMAVAIL_MB=0; MEM_UNKNOWN=1; measure_mem; printf "%s %s" "$MEMAVAIL_MB" "$MEM_UNKNOWN"' _ "$TMP/measuremem-full.sh")"
+  [ "$got" = "4096 0" ] && rc=0 || { rc=1; echo "      got '$got' (expected '4096 0')"; }
+  ck "shipped measure_mem(): a GOOD probe clears MEM_UNKNOWN and publishes the reading" $rc
 fi
 # Assert each spawn SITE, not a count — a count is satisfied by decoy comments,
 # which is exactly how an earlier version of this check passed against a stripped build.
 # NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
 # and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
-# NOTE (#2223): the `^fix-` selector now appears at THREE sites — conflict, CI-red, and the
+# NOTE (#2223): the `^fix-` selector now appears at THREE SPAWN sites — conflict, CI-red, and the
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
-# Each is asserted to carry can_spawn, which is the property under test.
+# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY (#2333 review P1). The defer arms
+# must not be miscounted as spawn sites, and a defer arm that stops deferring must still redden.
+# ⛔ …AND THEY NO LONGER OVERLAP AT ALL (#2333 merge review P1). The deferral now NESTS inside the
+# spawn arm's own eligibility (`if ciq_push_ok; then <spawn> else <defer> fi`) instead of being a
+# sibling `elif … && ! ciq_push_ok; then`: one predicate per spawn site, which is also the count
+# test-gates.sh asserts ("every fixer spawn site compares against the drain-aware budget") — a
+# duplicated predicate would have inflated that count from 3 to 5 purely to express one decision.
+# With nesting, the two populations are disjoint by construction, so each is counted directly. The
+# stated power is kept in both directions: a spawn site that loses (or gains, ungated) its load gate
+# reddens `fixer_sites`, and a spawn site whose deferral is removed reddens `fixer_defer_sites`.
+# ⛔ THREE fixer defer arms, in TWO spellings (#2333 review, P2). Two sites write the predicate as
+# the WHOLE condition (`if ciq_push_ok; then`, counted by `fixer_defer_sites`); the REVIEW-GATE site
+# SHARES the condition with its own eligibility (`if [ "$_fix_eligible" = "1" ] && ciq_push_ok;
+# then`), which the literal pattern cannot see — so without `fixer_defer_shared`, deleting that
+# `&& ciq_push_ok` left this check green while the site stopped deferring. (The fourth CI-queue
+# defer, the #PR CI RERUN, is not a fixer spawn and is pinned by ci-queue.test.sh's wiring arms.)
+fixer_defer_sites=$(grep -cF 'if ciq_push_ok; then' "$LOOP")
+fixer_defer_shared=$(grep -cF '] && ciq_push_ok; then' "$LOOP")
 fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
 merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
+[ "$fixer_defer_sites" = "2" ] && rc=0 || rc=1
+ck "the two wholly-predicated CI-queue defer arms NEST inside a spawn site's load-gated eligibility (they are not spawn sites of their own)" $rc
+[ "$fixer_defer_shared" = "1" ] && rc=0 || rc=1
+ck "the review-gate fixer's SHARED-eligibility CI-queue defer arm is present (three fixer defer arms, two spellings)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
 ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
@@ -2862,8 +3058,12 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # a coercion added without its pin must redden this check, not pass as "more is better".
 # 16 -> 18 for agent-infra#2223 (MAX_RED_FIX + MAX_RED_FIX_TRIES: the red-fixer role's box cap and
 # its per-head cap — both feed `[ … -ge ]` at a spawn decision, so both fail OPEN uncoerced).
-[ "$_ngrd_n" = "18" ] && rcn=0 || { rcn=1; echo "      expected 18 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 18 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 18 -> 19 for agent-infra#2653 (MAX_REVIEW_TRIES: the controller now keys its own review dispatches
+# on merge-one.sh's per-head review budget, so the SAME limit feeds a `-ge` in a SECOND file — an
+# uncoerced copy there would let a typo run the review budget unbounded, which is the loop the bound
+# exists to prevent).
+[ "$_ngrd_n" = "19" ] && rcn=0 || { rcn=1; echo "      expected 19 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 19 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
@@ -2878,21 +3078,21 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 # enough -- an earlier section sets STALE_MIN=1, the subshell inherits it, is_limit sees a valid value
 # and does not coerce, and the assertion then measures the wrong thing while still passing its shape.
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
-           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
-           eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
-[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; MAX_RED_FIX=; MAX_RED_FIX_TRIES=; STALE_MIN=; MAX_REVIEW_TRIES=
+           eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s revtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$MAX_REVIEW_TRIES" "$STALE_MIN" ); }
+[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
 # ⛔ AND MAX_LANES IS REPAIRED TO ITS DERIVED DEFAULT, NOT TO A FLAT NUMBER (owner ruling, 2026-10-17):
 # the driver pins `_NCPU=10`, so a garbage lane ceiling must come back as 25 — the value the box's
 # CORES imply — not the 4 it used to be repaired to. Reverting the coercion to `|| MAX_LANES=4`
 # reddens the two cases above and below.
-[ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || rc=1
+[ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || rc=1
 ck "numeric plist limits survive the coercion unchanged" $rc
 # ⛔ A 2**63-shaped value is the SECOND failure mode, and is_num alone cannot see it: `[ -ge ]` on it
 # prints "integer expression expected" and exits 2, which under `set -e` aborts the gate chain -- or,
 # read as false, OPENS it. `is_limit` bounds the digits, so this must coerce exactly as a typo does.
 # Review found MAX_LOAD was still is_num while the README claimed otherwise: this is that gap, driven.
-[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
+[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
 ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the gate chain" $rc
 # ⛔ THE DERIVATION, not just the coercion (P3, fourth review round, 2026-10-14). Every fixture above
 # passes MAX_LOAD EXPLICITLY, so nothing drove the fallback `is_limit … || MAX_LOAD=$(( 10#$_NCPU * 10 ))`
@@ -2935,17 +3135,17 @@ fi
 # `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
 # that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
 # single `0`-followed-by-digit forms.)
-[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
 # ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
 # integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
 # cycle, revisiting with no delay and hammering the GitHub API (P3, third review round, 2026-10-14).
 # The floor is part of the same block, so this drives it: CYC=0 must come out 240. A mutation that
 # drops the floor line leaves cyc=0 here — RED.
-[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
+[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
 ck "CYC=0 is floored to 240 (a zero-delay cycle re-hits the GitHub API with no delay)" $rc
 # Non-vacuity: the floor must not swallow a deliberately SMALL cycle. 5 is allowed and must survive.
-[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
+[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
 ck "a deliberate small CYC=5 survives the floor unchanged" $rc
 # And pin the predicate itself, so the coercion above cannot be satisfied by some unrelated path:
 # `is_num 08` must be FALSE, while `0` and a real number stay true.
@@ -3241,7 +3441,20 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   # (agent-infra#1709 rec 4): the shipped sleep is now `sleep $(( CYC - JIT + RANDOM % (2*JIT+1) ))`,
   # so JIT must be in the extracted driver or the arithmetic fails. A bare `grep 'sleep "$CYC"'`
   # matched the pre-jitter form ONLY and silently extracted nothing once jitter landed.
-  awk '/^  JIT=/{f=1} f{print} f&&/& wait \$!$/{exit}' "$LOOP" > "$TMP/cycsleep.sh"
+  # ⛔ EXTRACT THROUGH THE ENCLOSING `fi`, NOT ONLY TO THE FIRST `& wait $!` (agent-infra#2293). The
+  # shipped nap is now `if [ "${FORK_STARVED:-0}" = "1" ]; then fork_free_sleep … ; else sleep … & wait $!; fi`,
+  # so ending the extraction at the `wait` line handed the driver an UNCLOSED `if` — `bash -n` failed and
+  # this whole section went red (4 checks) on a tree whose shipped code is correct. The lookahead is
+  # BOUNDED: a tree with no `fi` after the wait keeps the old behaviour (extract through the wait line)
+  # rather than swallowing the rest of orch-loop.sh into the driver.
+  awk '
+    /^  JIT=/ { f=1 }
+    f { buf[++n] = $0 }
+    f && /& wait \$!$/ { w = n }
+    f && w && /^  fi$/ { last = n; done = 1; exit }
+    f && w && (n - w) >= 8 { last = w; done = 1; exit }
+    END { m = (done ? last : n); for (i = 1; i <= m; i++) print buf[i] }
+  ' "$LOOP" > "$TMP/cycsleep.sh"
   if need "$TMP/cycsleep.sh" "the interruptible cycle sleep is extracted from the shipped orch-loop.sh"; then
     # The extraction must still carry the JITTER, or a revert to a fixed interval would pass the
     # interruptibility check below while re-introducing the thundering herd it exists to prevent.
@@ -3389,6 +3602,21 @@ else
   ck "merged-not-closed.test.sh is present (the ported instrument has coverage)" 1
 fi
 
+# #2603: THE MERGE REMINDER'S ACTUATOR ARM. The reminder is a fleet-critical timer that until now
+# lived outside version control; its arm decides whether to spend a rail attempt, so its gates are
+# pinned here as well as in `scripts/run-bash-shards.sh` (CI runs both lanes from that one list —
+# this block is what makes `./selftest.sh` the single local command that covers it).
+if [ -f "$HERE/merge-reminder.test.sh" ]; then
+  if bash "$HERE/merge-reminder.test.sh" > "$TMP/merge-reminder.out" 2>&1; then
+    ck "merge-reminder.test.sh: the actuator arm is gated on evidence (#2603)" 0
+  else
+    ck "merge-reminder.test.sh: the actuator arm is gated on evidence (#2603)" 1
+    grep -E '❌|PASS=' "$TMP/merge-reminder.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "merge-reminder.test.sh is present (the actuator arm has coverage)" 1
+fi
+
 if [ -f "$HERE/refresh-scout.test.sh" ]; then
   if bash "$HERE/refresh-scout.test.sh" > "$TMP/refresh-scout.out" 2>&1; then
     ck "refresh-scout.test.sh: repo-aware scout provisioning + no silent retry (#1736)" 0
@@ -3398,6 +3626,17 @@ if [ -f "$HERE/refresh-scout.test.sh" ]; then
   fi
 else
   ck "refresh-scout.test.sh: the #1736 suite is present" 1
+fi
+
+if [ -f "$HERE/refresh-provision.test.sh" ]; then
+  if bash "$HERE/refresh-provision.test.sh" > "$TMP/refresh-provision.out" 2>&1; then
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 0
+  else
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 1
+    grep -E '❌|==>' "$TMP/refresh-provision.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "refresh-provision.test.sh: the #2229 suite is present" 1
 fi
 
 # #2229: ORIGINATION MUST FAIL LOUDLY. The refresh is backgrounded, so its failure is a log line — and
@@ -4025,6 +4264,11 @@ nb_expand() { # nb_expand <script>
     # `$(...)` inside the unquoted heredoc — that is the bug class this rig exists for).
     # The rig renders it from the SHIPPED helper so the assertion below sees real text.
     REVIEWER_BRIEF="$(bash "$HERE/reviewer-preflight.sh" --brief harness)"
+    # #2325: lane.sh ALSO splices the landing-artifacts section as a precomputed variable. Rendered
+    # here from the SHIPPED helper for the same reason: under `set +u` an unset variable expands to
+    # nothing, so without this line every prompt this rig builds would silently lack the section and
+    # none of its backtick spans would be exercised.
+    LANDING_BRIEF="$(bash "$HERE/reviewer-preflight.sh" --landing-brief harness)"
     . "$NB/snip.sh" ) >/dev/null 2>&1
 }
 if nb_expand "$MERGE"; then
@@ -4048,6 +4292,14 @@ if nb_expand "$HERE/lane.sh"; then
     && grep -qF 'do NOT dispatch it' "$NB/o/logs/prompt-7.txt"; }; rc=$?
 else rc=1; fi
 ck "lane.sh's prompt CARRIES the #2148 reviewer step (requirement + record + rail, harness role)" $rc
+# #2325: and the LANDING ARTIFACTS section, from the same expanded artifact. A heredoc edit that
+# loses it (or a splice that quietly renders empty) goes red here rather than at a compliance gate.
+if nb_expand "$HERE/lane.sh"; then
+  { grep -qF '## Landing artifacts' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'Do NOT reach for "Refs #' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'scripts/admin-merge.sh <PR>' "$NB/o/logs/prompt-7.txt"; }; rc=$?
+else rc=1; fi
+ck "lane.sh's prompt CARRIES the #2325 landing artifacts ([a] issue ref line, [c] record command)" $rc
 if nb_expand "$HERE/fix-one.sh"; then
   { grep -qF 'Never search the filesystem for an interpreter' "$NB/log-fixer.txt" \
     && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/log-fixer.txt" \
@@ -4099,40 +4351,51 @@ ck "non-vacuity: the name-blind check FIRES on a bare \`-maxdepth\` that no stub
 # keeps its single `.pool` artifact, and that IS covered by the #8465 ordering check above.
 
 # ── the reviewer's verdict classifies into THREE outcomes, and only one authorises a fixer ────
-# Ported IN from the tortoise fork (agent-infra#8602): a verdict-less run (stall/crash/timeout) and a
-# real `ISSUES` verdict must never share an arm, because `needsfix-<PR>-<head>` is the only thing that
-# spawns a FIXER. Sharing it burnt a MAX_FIX_TRIES attempt per stall and parked PRs that had never
-# been reviewed. These drive the SHIPPED functions; a grep would stay green if an arm were deleted.
+# agent-infra#2132 (superseding the #8602 port this section used to drive): a verdict-less run
+# (stall/crash/timeout) and a real `ISSUES` verdict must never share an arm, because
+# `needsfix-<PR>-<head>` is the only thing that spawns a FIXER — and the two remedies differ (a fixer
+# vs another REVIEW). The pre-#2132 arm wrote the FIXER marker for BOTH, which burnt a MAX_FIX_TRIES
+# attempt per stall and parked PRs that had never been reviewed. These drive the SHIPPED functions;
+# a grep would stay green if an arm were deleted. The producer is now the #2132 pair
+# (`verdict_class` + `review_state_record`), so the SAME contracts are pinned at the new API:
+#   empty/unrecognised -> NO-VERDICT    |   `ISSUES 0` -> NO-VERDICT (the count is part of the verdict)
+#   ISSUES -> needsfix marker           |   NO-VERDICT -> needsreview marker and NO needsfix
+#   an empty head writes nothing (a marker must name a head)
 if [ -s "$MERGE" ]; then
-  { awk '/^verdict_kind\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"
-    awk '/^apply_verdict_marker\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"; } > "$TMP/verdict.sh" 2>/dev/null
-  if [ -s "$TMP/verdict.sh" ] && grep -q 'verdict_kind' "$TMP/verdict.sh"; then
-    vk() { ( . "$TMP/verdict.sh"; verdict_kind "$1" ); }
-    [ "$(vk 'CLEAN https://x/1')" = clean ] && rc=0 || rc=1
-    ck "verdict_kind: a CLEAN verdict classifies as clean" $rc
-    [ "$(vk 'ISSUES 3')" = issues ] && rc=0 || rc=1
-    ck "verdict_kind: an ISSUES verdict classifies as issues" $rc
-    [ "$(vk '')" = none ] && rc=0 || rc=1
-    ck "verdict_kind: an EMPTY verdict is 'none' (a stall is not a finding)" $rc
-    [ "$(vk 'garbage without a verdict')" = none ] && rc=0 || rc=1
-    ck "verdict_kind: an unrecognised line is 'none', never 'issues'" $rc
+  { awk '/^verdict_class\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"
+    awk '/^review_state_record\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"; } > "$TMP/verdict.sh" 2>/dev/null
+  if [ -s "$TMP/verdict.sh" ] && grep -q 'verdict_class' "$TMP/verdict.sh" \
+     && grep -q 'review_state_record' "$TMP/verdict.sh"; then
+    vk() { ( . "$TMP/verdict.sh"; verdict_class "$1" ); }
+    [ "$(vk 'CLEAN https://x/1')" = CLEAN ] && rc=0 || rc=1
+    ck "verdict_class: a CLEAN verdict classifies as CLEAN" $rc
+    [ "$(vk 'ISSUES 3')" = ISSUES ] && rc=0 || rc=1
+    ck "verdict_class: an ISSUES verdict classifies as ISSUES" $rc
+    [ "$(vk '')" = NO-VERDICT ] && rc=0 || rc=1
+    ck "verdict_class: an EMPTY verdict is NO-VERDICT (a stall is not a finding)" $rc
+    [ "$(vk 'garbage without a verdict')" = NO-VERDICT ] && rc=0 || rc=1
+    ck "verdict_class: an unrecognised line is NO-VERDICT, never ISSUES" $rc
+    [ "$(vk 'ISSUES 0')" = NO-VERDICT ] && rc=0 || rc=1
+    ck "verdict_class: ISSUES 0 is NO-VERDICT (a zero count authorises no fixer)" $rc
 
     # The marker is what authorises the fixer, so drive its WRITE behaviour, not just its name.
     vdir="$TMP/vmark"; mkdir -p "$vdir/state"
     # ⛔ A VAR IN FRONT OF `.` APPLIES ONLY TO THE SOURCE, not to the function called after it — so
     # `O=… . file; fn` runs fn with O UNSET (the same per-command-env trap that bit an earlier test).
     # The whole call is one subshell here.
-    m1="$( O="$vdir" PR=42 bash -c '. "$1"; apply_verdict_marker issues abc123' _ "$TMP/verdict.sh" )"
-    [ -n "$m1" ] && [ -f "$vdir/state/needsfix-42-abc123" ] && rc=0 || rc=1
-    ck "apply_verdict_marker: an ISSUES verdict WRITES needsfix-<PR>-<head> (the fixer's authority)" $rc
-    m2="$( O="$vdir" PR=42 bash -c '. "$1"; apply_verdict_marker none abc123' _ "$TMP/verdict.sh" )"
-    [ -z "$m2" ] && rc=0 || rc=1
-    ck "apply_verdict_marker: a verdict-LESS run writes NO marker (no burnt retry, no false park)" $rc
-    m3="$( O="$vdir" PR=43 bash -c '. "$1"; apply_verdict_marker issues ""' _ "$TMP/verdict.sh" )"
-    [ -z "$m3" ] && rc=0 || rc=1
-    ck "apply_verdict_marker: an empty head writes no marker (a marker must name a head)" $rc
+    m1="$( O="$vdir" PR=42 HEAD=abc123 L="$vdir/log" MAX_REVIEW_TRIES=3 bash -c '. "$1"; review_state_record ISSUES' _ "$TMP/verdict.sh" )"
+    [ -f "$vdir/state/needsfix-42-abc123" ] && [ ! -f "$vdir/state/needsreview-42-abc123" ] && rc=0 || rc=1
+    ck "review_state_record: an ISSUES verdict WRITES needsfix-<PR>-<head> (the fixer's authority)" $rc
+    rm -f "$vdir"/state/needsfix-* "$vdir"/state/needsreview-* "$vdir"/state/reviewcount-* 2>/dev/null
+    m2="$( O="$vdir" PR=42 HEAD=abc123 L="$vdir/log" MAX_REVIEW_TRIES=3 bash -c '. "$1"; review_state_record NO-VERDICT' _ "$TMP/verdict.sh" )"
+    [ -f "$vdir/state/needsreview-42-abc123" ] && [ ! -f "$vdir/state/needsfix-42-abc123" ] && rc=0 || rc=1
+    ck "review_state_record: a verdict-LESS run writes needsreview (another REVIEW), never needsfix (no fixer)" $rc
+    rm -f "$vdir"/state/needsfix-* "$vdir"/state/needsreview-* "$vdir"/state/reviewcount-* 2>/dev/null
+    m3="$( O="$vdir" PR=43 HEAD="" L="$vdir/log" MAX_REVIEW_TRIES=3 bash -c '. "$1"; review_state_record ISSUES' _ "$TMP/verdict.sh" )"
+    [ -z "$(ls -A "$vdir/state" 2>/dev/null)" ] && rc=0 || rc=1
+    ck "review_state_record: an empty head writes no marker (a marker must name a head)" $rc
   else
-    ck "merge-one.sh carries verdict_kind/apply_verdict_marker (#8602 port)" 1
+    ck "merge-one.sh carries verdict_class/review_state_record (#2132)" 1
   fi
 fi
 

@@ -44,6 +44,14 @@ are actually invoked by a LaunchAgent: `pi-cache-reap.sh` → `com.eldato.pi-cac
 `com.eldato.disk-reaper` runs `disk-reaper.sh` through that same wrapper, because a launchd-spawned
 `bash` cannot read a repo under `~/Documents`. It is installed by `install-disk-reaper-timer.sh`, not
 by `install-launchd.sh` — see `docs/ops/disk-reaper.md`.)
+
+⛔ **AND ACTIVATION ITSELF IS ON A CLOCK SINCE #2416** (`com.eldato.harness-apply` on Darwin,
+`eldato-harness-apply.timer` on a cell). Every row above answers *what is deployed*; none of them
+answers *whether the deployed code is still main* — and measured 2026-10-23 it was not: the Mac ran 91
+commits behind while every signal read `auto`. `scripts/harness-apply-pass.sh` calls the box's existing
+verb (`cloud-cell-supervisor.sh apply` on a cell, `./sync.sh` on a Mac) behind the safety predicates
+that decide whether the box may be moved at all, repairs a pin that disagrees with its own checkout, and
+writes a pass record that `tools/fleet/fleet-health.py` alarms on. See `docs/ops/harness-apply.md`.
 **`orphan-reap.py` and `lane-watchdog.py` are referenced by no LaunchAgent on this box** — they are
 armed elsewhere or not at all; do not infer that they run from their presence.
 
@@ -257,8 +265,15 @@ FATAL: the QUEUE and the CHECKOUT name DIFFERENT repos … (agent-infra#1901)
 **first** (before `harness_apply`), so `start` refuses *without touching the harness tree*. But the
 documented deploy is `stop` → `start` (because `cmd_apply` refuses while a controller runs), and the
 refusal then lands *after* the stop. So the sequence would leave the box **stopped, with the harness not
-refreshed** — strictly worse than leaving it on `bed278f4`. Fix the pair first (point `REPO` at an
-agent-infra checkout, or drop the `OR` line so it derives from the checkout), then `stop` → `start`.
+refreshed** — strictly worse than leaving it on `bed278f4`. Fix the pair first, then `stop` → `start`.
+
+**The pair is `OR` + `REPO`** — set `OR` to the repo `$REPO`'s checkout actually is, or drop the `OR`
+line so it derives from that checkout (`resolve_repo_identity` in `scripts/orchestrator-bringup.sh`
+reads those two values and nothing else, so this is the only remedy that changes either side of the
+comparison). `HARNESS_REPO` (or `--repo` on a `harness-up` run) names where the **harness** lives — a
+different question that this refusal never asks: on cell-3 the harness already resolved, and pointing
+those at agent-infra leaves the FATAL intact. And `REPO` is the **work** repo the controller drains, so
+it must NOT name the harness.
 
 ### 3.3 Not deployed for scheduling reasons, not for correctness
 
@@ -278,13 +293,18 @@ candidate is refused. (Measured before this baseline: 793 consecutive `could not
 refusals alongside healthy `[cap]` lines.) A real dispatch is:
 
 ```
-[cap] load=54/100 lanes=3/25 …                      <- the cycle runs
+[cap] load=54/100 lanes=3/11 max_lanes=25 zombie=0 lanes_src=census …   <- the cycle runs (live/total + corpses)
 [dispatch] load=45 lanes=2 -> 4628 4643             <- candidates actually entered the batch
 + a matching `tmux ls` session per issue (lane-4628, chain-4628)
 ```
 
 Read both. `lanes=0` with a healthy `[cap]` and a non-empty backlog is the "alive but dispatching
 nothing" shape, and it is the state this audit found on the Mac.
+
+⛔ **`lanes=` is `<live>/<total>` since #2163, and the TOTAL is the half that exposes a leak.** The
+old field was live lane sessions over the ceiling; it could not show finished residents at all.
+`lanes=3/11` says three lanes are working and the box is carrying eight more — the measured shape
+was 14 working of 76 resident, and `zombie=` is in the same line so a box full of corpses says so.
 
 ---
 

@@ -25,6 +25,16 @@ import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
 import { redactCommand } from "../shared/redact-command.js";
+import {
+  attemptClass,
+  classifySpawnOutcome,
+  describeSpawnCapacity,
+  readMachineCapacity,
+  spawnFaultClass,
+  spawnFaultLabel,
+  SPAWN_UNSPAWNABLE_TOKEN,
+  type SpawnAttempt,
+} from "../shared/spawn-capacity.js";
 // #2148 — the reviewer requirement disclosed UP FRONT. The ≥1-dispatch rule and the merge-registry
 // gate were both correct and both spoke only at the finish line, so a lane did the whole job (rebase,
 // implement, test, push, PR) and was then refused. This module holds the disclosure's ONE wording
@@ -400,15 +410,20 @@ function unquotedOnly(command: string): string {
 export function stripHeredocBodies(command: string): string {
   const lines = command.split("\n");
   const out: string[] = [];
+  // The SAME carried state `maskHeredocData` uses (#1382 review cycle 1, P2): without it this path
+  // read a `<< n` on an arithmetic continuation line as an opener and dropped a real `git push`
+  // after it — behaviour inherited from the old regex, but it contradicted the "ONE opener reader"
+  // claim in `heredocOpenersIn`, and an invariant the code does not keep is how the next reader
+  // deletes the fix.
+  const state: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
   for (let i = 0; i < lines.length; i++) {
-    // `(?<!<)` — see the doc comment: the second `<<` of a `<<<WORD` here-string is not an opener.
-    const open = /(?<!<)<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(lines[i]);
-    if (!open) {
+    const openers = heredocOpenersIn(lines[i], state);
+    if (openers.length === 0) {
       out.push(lines[i]);
       continue;
     }
-    const stripTabs = open[1] === "-";
-    const word = open[3];
+    const stripTabs = openers[0].stripTabs;
+    const word = openers[0].delim;
     // KEEP THE OPENING LINE WHOLE, drop the body and the terminator. The whole line is bash COMMAND
     // syntax — text after the redirect (`<<'MSG' && git push`) is still the command — so cutting at
     // the token dropped a real push that followed it on the same line, and a quoted `<<EOF` earlier
@@ -441,6 +456,940 @@ export function stripHeredocBodies(command: string): string {
 export function isPushOrPrCreateCommand(command: string): boolean {
   const text = unquotedOnly(stripHeredocBodies(command));
   return GIT_PUSH_PATTERN.test(text) || GH_PR_CREATE_PATTERN.test(text);
+}
+
+/** One heredoc redirect found on a line. */
+export interface HeredocOpener {
+  /** The delimiter word, quotes already removed (`EOF`, `MSG`, `E-O-F`). */
+  delim: string;
+  /** `<<-`: leading TABS are stripped from the body and the terminator. */
+  stripTabs: boolean;
+}
+
+/**
+ * EVERY heredoc opener on one line, read QUOTE-, COMMENT- and ARITHMETIC-aware.
+ *
+ * ONE opener reader for the whole file: `stripHeredocBodies` (the #2148 notice) and
+ * `maskHeredocData` (the admin-merge gate's data model) both take their openers from here, so the
+ * two cannot disagree about which body exists — the drift this file keeps re-learning (two
+ * predicates, two answers). Ported from `extensions/main-worktree-guard/index.ts`
+ * (`_wtMaskHeredocBodies`), where four review rounds closed exactly these shapes; the reasons are
+ * kept with the code because each one was a measured defect, not a hypothetical:
+ *
+ *  - `<<` inside a QUOTED string or after a `#` comment is not a redirection (`echo "a << EOF"`
+ *    must not blank the rest of the command);
+ *  - `$(( 8 << n ))` is a SHIFT, not a heredoc — arithmetic depth is tracked (and, by
+ *    `maskHeredocData`, carried ACROSS lines, because an arithmetic expression may span them);
+ *  - `<<<WORD` is a HERE-STRING: an opener starts at the FIRST `<` of a `<` run, so none of the
+ *    three `<` may be read as a heredoc and no body may be hunted for;
+ *  - the delimiter is a SHELL WORD, so `<<1`, `<<9EOF` and `<<E-O-F` are legal (an
+ *    identifier-only regex never saw them, and their bodies were then scanned as commands);
+ *  - SEVERAL openers on one line (`cat <<A > x <<B`) have their bodies in opener order, so all of
+ *    them are returned; masking only the first left the second body readable.
+ *
+ * A `$`/backtick/backslash delimiter is EXPANDED by the shell at run time, so its terminator cannot
+ * be known statically: those are refused here and the body stays unmasked (fail-closed), exactly as
+ * before.
+ */
+export function heredocOpenersIn(line: string, state?: HeredocScanState): HeredocOpener[] {
+  const hits: HeredocOpener[] = [];
+  // ⛔ QUOTE STATE IS CARRIED ACROSS LINES (#1382 review cycle 1, P1 — verified: `echo "start` …
+  // `cat <<'EOF'` … `end"` is a quoted STRING to bash, but a fresh per-line state read the middle
+  // line as an opener and blanked every real command after it). A quoted string may span lines in
+  // bash, so a caller scanning a WHOLE command passes `state`, and this function resumes inside the
+  // string it left open.
+  let quote: string | null = state?.quote ?? null;
+  let atWordStart = true;
+  // Depth of `$(( … ))` / `(( … ))` on THIS line, where `<<` can only be a SHIFT. `state` carries
+  // it across lines for a caller that masks a WHOLE command: an arithmetic expression may span
+  // lines, and a continuation line starting `<< n ))` would otherwise be read as an opener with
+  // delimiter `n` — whose body never ends, blanking the rest of the command (a fail-OPEN, the one
+  // direction this file may not be wrong in).
+  let arith = state?.arith ?? 0;
+  let bare = state?.bare ?? 0;
+  const bareStack: number[] = state?.bareStack ?? [];
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      atWordStart = false;
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      continue;
+    }
+    if (ch === "#" && atWordStart) break; // comment: no redirection after it
+    if (ch === "$" && line[c + 1] === "(" && line[c + 2] === "(") {
+      bareStack.push(bare);
+      bare = 0;
+      arith++;
+      c += 2;
+      atWordStart = false;
+      continue;
+    }
+    if (ch === "(" && line[c + 1] === "(") {
+      bareStack.push(bare);
+      bare = 0;
+      arith++;
+      c++;
+      atWordStart = false;
+      continue;
+    }
+    if (arith > 0 && ch === "(") {
+      bare++;
+      atWordStart = false;
+      continue;
+    }
+    if (arith > 0 && ch === ")") {
+      if (bare === 0 && line[c + 1] === ")") {
+        arith--;
+        bare = bareStack.pop() ?? 0;
+        c++;
+        atWordStart = false;
+        continue;
+      }
+      if (bare > 0) bare--;
+      atWordStart = false;
+      continue;
+    }
+    // An opener is the FIRST `<` of its run, and never a `<<<` here-string.
+    if (arith === 0 && ch === "<" && line[c + 1] === "<" && line[c + 2] !== "<" && line[c - 1] !== "<") {
+      const stripTabs = line[c + 2] === "-";
+      // The delimiter is the WHOLE shell WORD, which bash builds by CONCATENATION: `<<'E''OF'`,
+      // `<<'EOF'x` and `<<E"OF"x` are one word. Reading only the first quoted/unquoted segment (the
+      // first cut of this reader) produced a terminator that is a strict PREFIX of bash's, so the
+      // body search never ended, the mask ran to end of command, and every REAL command after the
+      // shell's true terminator became invisible — a fail-OPEN the reviewer measured (`cat <<'EOF'x`
+      // … `EOFx` … two admin merges → ALLOWED, where the pre-change text BLOCKED).
+      const word = heredocDelimiterWord(line, c + 2 + (stripTabs ? 1 : 0));
+      if (word !== null) hits.push({ delim: word, stripTabs });
+    }
+    atWordStart = /\s/.test(ch);
+  }
+  if (state) {
+    state.quote = quote;
+    state.arith = arith;
+    state.bare = bare;
+    state.bareStack = bareStack;
+  }
+  return hits;
+}
+
+/**
+ * The heredoc DELIMITER as the shell builds it: ONE word, assembled from every quoted and unquoted
+ * segment (`'E''OF'` → `EOF`, `'EOF'x` → `EOFx`, `E"OF"` → `EOF`).
+ *
+ * Returns null when the word cannot be resolved STATICALLY — it contains a `$` or a backtick (the
+ * shell EXPANDS the delimiter at run time, so the terminator is unknowable) or a backslash escape
+ * (bash removes it, so the literal word is not the delimiter either). Null means "no opener": the
+ * body stays READABLE, which is the fail-closed direction. No opener is recorded rather than a
+ * guessed one, because a guessed delimiter that is a PREFIX of the real one masks to end of command
+ * and hides real commands — the fail-OPEN this reader exists to prevent.
+ */
+function heredocDelimiterWord(line: string, from: number): string | null {
+  let i = from;
+  while (i < line.length && (line[i] === " " || line[i] === "\t")) i++;
+  let word = "";
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === "'") {
+      const end = line.indexOf("'", i + 1);
+      if (end === -1) return null;
+      word += line.slice(i + 1, end);
+      i = end + 1;
+      continue;
+    }
+    if (ch === '"') {
+      const end = line.indexOf('"', i + 1);
+      if (end === -1) return null;
+      const inner = line.slice(i + 1, end);
+      // A `$`/backtick inside double quotes is still an EXPANSION.
+      if (/[$`]/.test(inner)) return null;
+      // ⛔ A BACKSLASH INSIDE DOUBLE QUOTES MAKES THE WORD UNKNOWABLE (#1382 review cycle 2, P0).
+      // Bash removes it only before ``$\`"\\`` and newline (`<<"E\OF"` keeps `E\OF`); the previous
+      // line removed it before ANY character and produced the delimiter `EOF`, which never matches
+      // bash's terminator — so the mask ran to end of command and hid every real command after it
+      // (measured: two admin merges ALLOWED). Resolving bash's exact rule is possible but pointless:
+      // the body is only ever MASKED as an optimisation, so an escape here returns null (body
+      // readable, fail-closed) instead of risking a second, subtler disagreement with the shell.
+      if (inner.includes("\\")) return null;
+      word += inner;
+      i = end + 1;
+      continue;
+    }
+    if (ch === "\\") return null; // an escape bash removes: the literal word is not the delimiter
+    // ⛔ ONLY blanks and metacharacters END the word — `\r` is a WORD character to bash (#1382
+    // cycle-3 hardening). With `\s` here, a CRLF opener (`… <<'EOF'\r`) read the delimiter as `EOF`
+    // while bash's is `EOF\r`, so the terminator never matched and the mask ran to end of command.
+    if (/[\n \t;&|<>()]/.test(ch)) break;
+    if (ch === "$" || ch === "`") return null; // expanded at run time
+    word += ch;
+    i++;
+  }
+  return word === "" ? null : word;
+}
+
+/** Carried scan state for a caller reading a WHOLE command line by line. */
+export interface HeredocScanState {
+  /** An UNCLOSED quote character carried across lines (a quoted string may span them). */
+  quote: string | null;
+  arith: number;
+  bare: number;
+  bareStack: number[];
+}
+
+/**
+ * Commands whose STDIN is DATA: they consume a heredoc body without executing it, so the body is
+ * prose (a file's contents, a commit message, a report) and never a command.
+ *
+ * THE LIST IS SHAPED SO ITS FAILURE DIRECTION IS A REFUSAL: a consumer that is not here keeps its
+ * body READABLE (fail-closed, so an unknown command may still be scanned as before), and every
+ * entry must be a program that cannot run its stdin as code. That is why `sed`/`awk`/`ed`/
+ * `python`/`perl`/`node`/`xargs`/`eval`/`source` are ABSENT (each can execute text), and why `git`
+ * is handled separately and narrowly below.
+ */
+const HEREDOC_STDIN_DATA_CONSUMERS = new Set([
+  "cat", "tee", "wc", "head", "tail", "grep", "egrep", "fgrep", "sort", "uniq", "cut", "tr",
+  "nl", "rev", "tac", "paste", "fold", "expand", "unexpand", "strings", "od", "xxd", "base64",
+  "md5sum", "sha1sum", "sha256sum", "shasum", "cksum", "file", "column", "comm", "join", "diff",
+  "jq", "less", "more",
+]);
+
+/**
+ * Commands that can only NAME a file: they neither run it nor hand it to something that can.
+ *
+ * ⛔ SEPARATE FROM `HEREDOC_STDIN_DATA_CONSUMERS`, which answers a different question (what may
+ * CONSUME a heredoc body). `ls` does not read stdin at all, so listing it there would be a category
+ * error — but `ls *.md` after `cat >> notes.md <<'EOF'` is one of the most common lane sequences
+ * there is, and without it the glob arm reports the write-then-list shape as "written then executed"
+ * and the reported prose refusal comes back (measured in this change's own final probe). Every entry
+ * here can only display, stat or test a name: none of them can run a file's CONTENTS.
+ */
+const HEREDOC_FILE_NAMING_ONLY = new Set([
+  ...HEREDOC_STDIN_DATA_CONSUMERS,
+  "ls", "stat", "du", "readlink", "realpath", "dirname", "basename", "echo", "printf", "test", "[",
+  // Filesystem MOVERS: they name a file, they never run its contents. Without these, the glob arm's
+  // basename match made the ordinary write-then-clean-up sequence (`cat >> notes.md <<'EOF'` …
+  // `rm *.md`) a "written then executed" refusal — the reported prose false positive returning from
+  // the other side (#1382 cycle 11 review, P2). `chmod` is here too: it cannot run a file, and the
+  // `chmod +x f; ./f` shape is caught by the SECOND segment's command word.
+  "rm", "mv", "cp", "find", "touch", "mkdir", "chmod", "ln",
+]);
+
+/**
+ * Is the reader at `word` SHADOWED anywhere in the command — by an alias, a function, or a `NAME=`
+ * assignment — so that the word no longer names the program we proved it was?
+ *
+ * ⛔ DEQUOTED, not spelled. Measured on the sibling change (#1382 cycle 8): `alias c\at=bash` and
+ * `alias c"a"t=bash` define `cat` as `bash`, and a scan that matched the SPELLING `cat` saw neither
+ * — the body was masked while bash executed it. The text is dequoted first, so every spelling of
+ * the name is considered; over-matching here only costs a refusal (the body stays readable).
+ */
+function heredocReaderIsShadowed(text: string, word: string): boolean {
+  const w = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const dequoted = text.replace(/["'\\]/g, "");
+  const anchored = (body: string) => new RegExp(`(^|[\\s;&|])${body}`);
+  return (
+    anchored(`alias\\s+${w}\\s*=`).test(dequoted) ||
+    anchored(`function\\s+${w}\\b`).test(dequoted) ||
+    anchored(`${w}\\s*\\(\\)`).test(dequoted) ||
+    anchored(`${w}=`).test(dequoted)
+  );
+}
+
+/**
+ * The FILE PATHS a heredoc-opening line may write its body to: every `>`/`>>` redirect target, and
+ * every non-flag argument of `tee`.
+ *
+ * WHY THIS EXISTS. Masking a body is sound only while the body cannot be EXECUTED. A body written
+ * to a file and run by a LATER line of the SAME command is executable in one more step than the
+ * `cat > x.sh <<'EOF' … EOF && bash x.sh` shape (which rule (1) already refuses) — and there the
+ * file's name appears again as a word, which is the one thing that can be checked statically:
+ *
+ *   cat > /tmp/x.sh <<'EOF'
+ *   gh pr merge 999 --admin
+ *   EOF
+ *   bash /tmp/x.sh
+ *
+ * Before masking, that body was scanned (over-broad, but it caught this). So a target that
+ * reappears on a line that can EXECUTE a file — after an interpreter/runner word, or as that
+ * line's own COMMAND WORD — is treated as unprovable and the body STAYS READABLE. A refusal, the
+ * direction this file is allowed to be wrong in, and narrow on purpose: a target that recurs in a
+ * plain command (`git add CHANGELOG.md` after `cat >> CHANGELOG.md <<'EOF'`, the most common lane
+ * sequence there is) executes nothing, so it must not bring the prose refusal back. The argv layer
+ * (#984) would catch the execution anyway; not relying on that is the point, because the residual
+ * must not be silent.
+ */
+/**
+ * The COMMAND WORD of a heredoc-opening line — its reader name as bash would resolve it, with the
+ * opener and everything after it cut off and every quote removed (`c"a"t <<'EOF'` → `cat`,
+ * `cat<<'EOF'` → `cat`).
+ *
+ * ⛔ FULLY DEQUOTED, edges and interior alike (#1382 review cycle 1, P2): stripping only the edges
+ * left `c"a"t` and `c\at` unrecognised as the data consumer they are, so a two-merge PROSE body
+ * under them was still refused — the exact false positive this change exists to remove.
+ */
+function heredocCommandWord(line: string): string {
+  const head = line.replace(/<<-?[\s\S]*$/, "");
+  const first = head.trim().split(/\s+/)[0] ?? "";
+  return first.replace(/["'\\]/g, "");
+}
+
+/**
+ * The `git` subcommands that can only NAME a file — never run one. Everything else (`bisect run`,
+ * `rebase --exec`, `submodule foreach`, `-c alias.x=!sh`, …) may EXECUTE the target, so an unknown
+ * subcommand is treated as an executor: the body stays readable, which is the refusal direction.
+ */
+const GIT_FILE_NAMING_SUBCOMMANDS = new Set([
+  "add", "rm", "mv", "status", "diff", "log", "show", "commit", "push", "fetch", "pull",
+  "checkout", "switch", "restore", "stash", "reset", "revert", "cherry-pick", "clone", "apply",
+  "tag", "branch", "remote", "blame", "grep", "ls-files", "rev-parse", "describe", "merge-base",
+  "worktree", "notes", "config", "cat-file", "hash-object",
+]);
+
+/** Would `line` EXECUTE the file named `target`?
+ *
+ * ⛔ SUBSTRING, not whole word, and the FIRST word decides (#1382 review cycle 1, P2 + cycle-2
+ * hardening). Three runner spellings bash ran were missed by a whole-word runner list — `bash x`,
+ * `. /tmp/x.sh` (POSIX dot-source) and `"$SHELL" /tmp/x.sh` — and so was `BASH_ENV=/tmp/x.sh` written
+ * on a LATER line: a list of executor words cannot be complete. So any line that MENTIONS the target
+ * may be running it, except a `git` line whose subcommand can only name a file. The over-refusal cost
+ * is paid only by a command that writes a file and then merely mentions it outside git (`cat >> X` …
+ * `grep X`), which is rare; the ordinary `cat >> CHANGELOG.md` … `git add CHANGELOG.md` sequence
+ * stays masked, which is the case that would otherwise bring the reported false positive back.
+ */
+function heredocLineExecutes(line: string, target: string, scope = line): boolean {
+  // ⛔ A PROCESS SUBSTITUTION RUNS A PROGRAM WITH THE TARGET AS ITS STDIN (#1382 cycle 10 review, P0 —
+  // measured: `cat /tmp/x.sh > >(bash)` executes the file and contains NO `|` at all, so the pipe arm
+  // never fired). `<(…)`/`>(…)` is a handle to the named file exactly like a pipe is, so a line that
+  // names the target AND carries one is treated as executing it.
+  if (/[<>]\(/.test(line) && heredocNamesTarget(line, target)) return true;
+  // FIND RUNS WHAT IT FINDS, so the target need not be named on the line (#1382 cycle 12 review, P0 —
+  // measured: `find . -execdir bash {}` masked the body, and `find` searches a TREE, so the written
+  // file may never appear by name). A NON-runner exec (`-exec rm {}`) is still naming, which is why
+  // the program word decides rather than the primary alone.
+  {
+    const prog = heredocFindExecProgram(line);
+    if (prog !== null && heredocWordIsProgram(prog)) return true;
+  }
+  // ⛔ EVERY SEGMENT, not the whole line (#1382 review cycle 2, P1): `git status >/dev/null; bash
+  // /tmp/r.sh` starts with `git`, so a whole-line command-word test ruled the LINE a naming command
+  // and the body was masked while bash ran the file. A separator starts a new command, so each
+  // segment is judged on its OWN first word — and a GLOB is a mention too (`. /tmp/g1.*`), which is
+  // why the mention test lives INSIDE the loop rather than before it.
+  //
+  // ⛔ A READER THAT NAMES THE FILE MAY STILL RUN IT, ONE PIPE LATER (#1382 cycle 9 review, P0 —
+  // measured fail-open introduced by the reader exemption below). `heredocSegmentIsNaming` proves
+  // the READER cannot execute its argument, and the first version concluded the LINE could not
+  // either. That is false: the reader's own STDOUT is a handle. `cat > /tmp/x.sh <<'EOF' … EOF`
+  // followed by `cat /tmp/x.sh | bash` (or `| sh`, `| xargs … sh -c {}`) writes the body to a file
+  // and runs it, while the only segment naming the target starts with `cat` — so the body was
+  // masked and main refused the same command. The pipe is judged on the RAW line, before the
+  // separator split, because the split discards exactly the `|` that carries the meaning.
+  const pipedIntoProgram = heredocPipedIntoProgram(line);
+  for (const segment of line.split(/[;|&]+/)) {
+    if (!heredocNamesTarget(segment, target) && !heredocGlobMentions(segment, target)) continue;
+    if (pipedIntoProgram) return true;
+    if (!heredocSegmentIsNaming(segment, scope)) return true;
+  }
+  return false;
+}
+
+/** Does this word name a PROGRAM that can run text handed to it? The ONE vocabulary shared by the
+ *  pipe arm and the `find -exec` arm, so the two cannot disagree. */
+function heredocWordIsProgram(w: string): boolean {
+  if (!w) return false;
+  return (
+    STDIN_PROGRAM_RUNNERS.has(w) ||
+    STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
+    /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(w)
+  );
+}
+
+/** The word after `find`'s exec primaries (`-exec`, `-execdir`, `-ok`, `-okdir`), or null. */
+function heredocFindExecProgram(line: string): string | null {
+  const words = line.trim().split(/\s+/).map((w) => w.replace(/["'\\]/g, ""));
+  for (let i = 0; i < words.length; i++) {
+    if (/^-(exec|execdir|ok|okdir)$/.test(words[i]) && words[i + 1]) return words[i + 1];
+  }
+  return null;
+}
+
+/** Is any stage AFTER the first of this line's pipeline a PROGRAM RUNNER (`… | bash`,
+ *  `… | sh -s`, `… | python3`, `… | xargs … sh -c {}`)?
+ *
+ *  Reuses `STDIN_PROGRAM_RUNNERS` / `STDIN_PROGRAM_INTERPRETER_RE` — the same vocabulary
+ *  `dataCharMask`'s `pipedIntoRunner` uses — so the two cannot disagree about what a program is.
+ *  A bare `||` is a FALLBACK, not a pipe: its right-hand side never receives the left's stdout.
+ *
+ *  ⛔ "THE SAME VOCABULARY" IS NOT "THE SAME PREDICATE" (#1382 cycle 10 review, P2 — corrected):
+ *  `pipedIntoRunner` accepts a WRAPPER word only when the word after it is a `STDIN_PROGRAM_RUNNERS`
+ *  member, while this function also accepts an interpreter or a path-spelled shell one word along
+ *  (`| env python3` is a runner here, data there). Today THIS side is the stricter one, so nothing
+ *  is open — but a reader who "unifies" them by copying `pipedIntoRunner`'s wrapper arm would
+ *  re-open `| env python3` on a body that python then executes. Narrowing this one to match is not
+ *  a simplification; it is a fail-open. */
+function heredocPipedIntoProgram(line: string): boolean {
+  // ⛔ SHELL GROUPING IS NOT PART OF THE PROGRAM NAME (#1382-c9 review, measured): a downstream stage
+  // written `(bash)`, `( bash )` or `{ bash; }` runs bash, and the first version compared the raw word
+  // `(bash)` against the runner sets, missed it, and MASKED the body — a fail-open on the same shape
+  // the pipe rule exists to catch. Leading `(`/`{`/`!` and trailing `)`/`}`/`;` are stripped before
+  // the comparison. Only the FIRST word is de-grouped, not every word: matching any word in the
+  // stage would re-break the ordinary `cat x.md | grep -i "sh"`, which is the false positive this
+  // whole change removes.
+  const deGroup = (w: string) => w.replace(/^[({!]+/, "").replace(/[)};]+$/, "");
+  const isRunner = heredocWordIsProgram;
+  // ⛔ A TOKEN BEFORE THE PROGRAM HIDES IT (#1382 cycle 10 review, P0 — measured: `| FOO=1 bash` and
+  // `| 2>/dev/null bash` both executed the written file while the body stayed masked). An assignment
+  // prefix and a leading redirection are both ordinary spellings, so they are SKIPPED — never the
+  // whole tail of the stage (see the grouping note above: that is what re-breaks `| grep -i "sh"`).
+  const isPrefixToken = (w: string) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || /^\d*[<>]/.test(w) || w === "!";
+  const stages = line.split(/(?<!\|)\|(?!\|)/);
+  for (let i = 1; i < stages.length; i++) {
+    // `|&` is a pipe with stderr folded in — the `&` is not a command word.
+    const words = stages[i].trim().replace(/^&\s*/, "").split(/\s+/).map((w) => w.replace(/["'\\]/g, ""));
+    let k = 0;
+    while (k < words.length && isPrefixToken(words[k])) k++;
+    const first = deGroup(words[k] ?? "");
+    // `{ bash; }` — the first WORD is nothing but grouping, so the program is the NEXT word. This
+    // second look happens ONLY when the first word de-grouped to nothing; testing every word of a
+    // stage instead would make the ordinary `cat x.md | grep -i "sh"` a program runner and bring
+    // back the false positive this change exists to remove.
+    if (!first) {
+      let n = k + 1;
+      while (n < words.length && isPrefixToken(words[n])) n++;
+      if (isRunner(deGroup(words[n] ?? ""))) return true;
+      continue;
+    }
+    if (isRunner(first)) return true;
+    // A wrapper word can hide the program one word along (`| env FOO=1 bash`, `| nice -n 5 sh`).
+    if (/(^|\/)(?:env|exec|command|nohup|nice|timeout|setsid|stdbuf|su|doas)$/.test(first)) {
+      for (const w of words.slice(k + 1)) {
+        const bare = deGroup(w);
+        if (!bare || isPrefixToken(bare) || bare.startsWith("-")) continue;
+        if (isRunner(bare)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** A path as WRITTEN, normalized textually: `./a//b/./c` and `a/b/c` are the same file, and this
+ *  function makes them the same STRING. No filesystem access — the shell may not have run yet. */
+function heredocNormalizePath(p: string): string {
+  const abs = p.startsWith("/");
+  const parts: string[] = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") {
+      parts.pop();
+      continue;
+    }
+    parts.push(seg);
+  }
+  return (abs ? "/" : "") + parts.join("/");
+}
+
+/** Does any word in `text` NAME `target` the file?
+ *
+ *  ⛔ NORMALIZED, NOT SUBSTRING (#1382 cycle 9 review, P0 — second measured fail-open introduced by
+ *  the first version). Comparing the raw redirect target to the raw later word missed every spelling
+ *  that reaches the SAME file: `cat > ./rq.sh …` then `bash rq.sh`; `cat > /tmp/x.sh …` then
+ *  `cd /tmp; bash x.sh`; `bash /tmp//x.sh`; `bash /tmp/./x.sh`. Each was masked at the fix and
+ *  refused by main. So the BASENAME counts as a form too: a `cd` or a `./` prefix changes the word
+ *  without changing the file. Over-matching only keeps a body readable (a refusal), which is the
+ *  direction this file is allowed to be wrong in. */
+function heredocNamesTarget(text: string, target: string): boolean {
+  // ⛔ THE RAW SUBSTRING IS KEPT, on purpose, and it is not redundant with the word walk below: a
+  // path can hide inside a word that no path normalization reaches — `BASH_ENV=CHANGELOG.md bash -c
+  // true` names the file with an assignment prefix, and the normalized word comparison missed it
+  // (measured: an existing suite case went red within this change). Over-matching only keeps a body
+  // readable, which is a refusal, so the crude arm stays and the normalized arms are added ON TOP.
+  if (text.includes(target)) return true;
+  // ⛔ `~` / `$HOME` ARE THE SAME DIRECTORY, and on this fleet's macOS default the filesystem is
+  // case-INSENSITIVE (#1382 cycle 10 review, P2 — measured ALLOWED: `cat > ~/x.sh … bash $HOME/x.sh`,
+  // and `bash /tmp/X.SH` for `/tmp/x.sh`). Both sides are expanded to a placeholder home and folded
+  // to lower case before comparison; over-matching is a refusal here, the allowed direction.
+  const canon = (p: string) =>
+    heredocNormalizePath(
+      p
+        .replace(/^~(?=\/|$)/, "/@HOME")
+        .replace(/^\$\{?HOME\}?(?=\/|$)/, "/@HOME")
+        .replace(/["'\\]/g, ""),
+    ).toLowerCase();
+  const norm = canon(target);
+  if (!norm) return false;
+  const base = norm.slice(norm.lastIndexOf("/") + 1);
+  for (const rawWord of text.split(/\s+/)) {
+    const w = canon(rawWord);
+    if (!w) continue;
+    if (w === norm) return true;
+    if (base && w === base) return true;
+    // An ABSOLUTE spelling whose tail is the target's path from some point (`bash sub/x.sh` for
+    // `./sub/x.sh`) — the `cd` that makes it absolute may sit on an earlier line.
+    if (w.endsWith("/" + norm)) return true;
+  }
+  return false;
+}
+
+/** Could a GLOB word on this line reach `target`? `. /tmp/g1.*` runs a file whose exact name the
+ *  written-target comparison cannot match, so a glob sharing the target's DIRECTORY counts. */
+function heredocGlobMentions(line: string, target: string): boolean {
+  // ⛔ THE GLOB ARM WAS DEAD FOR EVERY `./`, `../`, ROOT AND BARE-NAME TARGET (#1382 cycle 10
+  // review, P1 — a regression this change introduced). Normalizing the target's DIRECTORY turns
+  // `"./"` into `""`, so the `dir.length < 1` guard returned false before any comparison, and the
+  // pre-fix code (which compared the RAW `"./"` prefix) refused those same commands. Measured:
+  // `cat > ./x.sh … bash ./*.sh` and `cat > ../x.sh … bash ../*.sh` went from REFUSED on main to
+  // MASKED here.
+  //
+  // The glob is now expanded to a REGEX and matched against the target itself (normalized, folded to
+  // lower case, `~`/`$HOME` canonicalized), not against a directory prefix — so `./x.sh` vs `*.sh`,
+  // a bare `x.sh` vs `x*.sh`, and `/tmp/e.sh` vs `/tmp/e.s[h]` all match, while a glob naming a
+  // DIFFERENT file in the same directory does not. `[` is a metachar too (`bash /tmp/e.s[h]`).
+  if (!/[?*[]/.test(line)) return false;
+  const canon = (p: string) =>
+    heredocNormalizePath(
+      p
+        .replace(/^~(?=\/|$)/, "/@HOME")
+        .replace(/^\$\{?HOME\}?(?=\/|$)/, "/@HOME")
+        .replace(/["'\\]/g, ""),
+    ).toLowerCase();
+  const norm = canon(target);
+  if (!norm) return false;
+  const base = norm.slice(norm.lastIndexOf("/") + 1);
+  for (const rawWord of line.split(/\s+/)) {
+    const w = canon(rawWord);
+    if (!w || !/[?*[]/.test(w)) continue;
+    const re = globToRegExp(w);
+    // ⛔ A GLOB THAT IS NOT A VALID REGEX MUST NOT THROW OUT OF THE GATE (#1382 cycle 11 review, P1 —
+    // measured: `bash f[z-a]` after writing `f.sh` threw `Range out of order in character class`
+    // from `maskHeredocData` inside the `tool_call` handler). It fails CLOSED today because pi blocks
+    // a tool call whose handler throws — but an unhandled exception on ordinary input is one
+    // `try/catch` away from being a fail-open, so an uncompilable glob is treated as MATCHING (the
+    // body stays readable) instead.
+    // `null` means the glob could not be compiled — treat it as MATCHING (the body stays readable).
+    let matched = re === null;
+    if (re !== null) {
+      try {
+        matched = re.test(norm) || (base ? re.test(base) : false);
+      } catch {
+        matched = true;
+      }
+    }
+    if (matched) return true;
+  }
+  return false;
+}
+
+/** `*`/`?`/`[...]` as a shell glob, anchored. Everything else is literal. */
+function globToRegExp(glob: string): RegExp | null {
+  let re = "^";
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === "*") re += ".*";
+    else if (ch === "?") re += ".";
+    else if (ch === "[") {
+      const close = glob.indexOf("]", i + 1);
+      if (close === -1) re += "\\[";
+      else {
+        re += glob.slice(i, close + 1).replace(/\\/g, "\\\\");
+        i = close;
+      }
+    } else re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  // An invalid character class (`[z-a]`) is a shell glob bash LEAVES LITERAL but a regex compiler
+  // REJECTS. Returning null (rather than throwing) keeps the gate's decision in the gate.
+  try {
+    return new RegExp(re + "$");
+  } catch {
+    return null;
+  }
+}
+
+/** Is this segment UNABLE to run a file it names — a `git` subcommand that only names one, or a
+ *  proven text reader (`wc -l file`, `grep x file`, `cat file`)?
+ *
+ * ⛔ THE READER EXEMPTION IS NOT A LOOPHOLE (#1382 cycle 2, and a measured self-inflicted false
+ * positive): without it, `cat >> notes.md <<'EOF' … EOF` followed by `wc -l notes.md` counted as
+ * "written then executed" and the prose refusal came back — writing a file and then CHECKING it is
+ * one of the most common lane sequences there is. A reader's own `exec` surface is what it does
+ * with its STDOUT, so it can only ever DISPLAY a file, never run it; anything outside that set
+ * (`bash`, `python3`, `source`, `chmod`, an unknown word) is still treated as an executor and keeps
+ * the body readable.
+ *
+ * ⛔ THAT SENTENCE WAS FALSE AND IS CORRECTED HERE (#1382 cycle 10 review, P2 — measured): several
+ * members of `HEREDOC_STDIN_DATA_CONSUMERS` carry an OPTION that runs a program — `sort
+ * --compress-program=/tmp/x.sh FILE` (executed on temp spill) and `less` (`LESSOPEN=|cmd`, `!cmd`)
+ * both MASK a body they can execute. The EXEMPTION is still right for the ordinary `grep x f` /
+ * `wc -l f` / `cat f` case, and the pipe/execution arms above bound the rest, but the guarantee is
+ * NOT "a reader can only display". What it really says is: this reader, with the arguments written
+ * here, cannot run the file. So the reason a future reader would give for adding the NEXT "reader"
+ * to that set — display-only — does not exist, and a member with an exec-bearing flag should be
+ * REMOVED from it. Stated rather than fixed: the option-flag class is not covered by this change.
+ * (See the declared residual in the #1382 issue comment; the argv layer (#984) is the layer that
+ * sees the real invocation.)
+ */
+function heredocSegmentIsNaming(segment: string, scope = segment): boolean {
+  // ⛔ A NAMING WORD THAT WRAPS A COMMAND SUBSTITUTION PROVES NOTHING (#1382 cycle 11 review, P0 —
+  // measured ALLOWED: `ls "$(bash x.sh)"` and `echo "$(bash x.sh)"` masked a body they then ran).
+  // The substitution's OUTPUT is the argument, so the reader is not reading the file — something else
+  // is running it. Any `$(`, backtick or process substitution in the segment returns "not naming".
+  if (/\$\(|`|[<>]\(/.test(segment)) return false;
+  const words = segment.trim().split(/\s+/);
+  const commandWord = (words[0] ?? "").replace(/["'\\]/g, "");
+  // ⛔ SHADOWED IS NOT NAMING (#1382 cycle 11 review, P0 — measured ALLOWED: `ls() { bash "$@"; }`
+  // then `ls x.sh` masked a body the function then RAN, and the same for `echo()`/`stat()`/`du()`).
+  // The naming set is a claim about a PROGRAM; a function, alias or assignment of that name in the
+  // command replaces the program. `heredocReaderIsShadowed` is the same test the OPENER's reader gets
+  // — applying it here is what makes the two halves of the proof agree. The scope is the whole
+  // command (over-conservative on ordering), which keeps a body readable, the allowed direction.
+  if (heredocReaderIsShadowed(scope, commandWord)) return false;
+  // ⛔ `find` IS NOT A NAMER WHEN IT EXECUTES (#1382 cycle 12 review, P0 — measured: `find x.sh -exec
+  // bash {} \;` ran the body WHILE IT WAS MASKED, and five spellings that were REFUSED at e4e78a6f
+  // — `-exec`, `-exec bash {} +`, `-name … -exec`, `-execdir`, `-ok` — became masks the moment `find`
+  // joined the naming set wholesale). Its other primaries only name a file, which is why the whole
+  // command was tempting; the exec primaries are the exception, and they are the one that matters.
+  if (HEREDOC_FILE_NAMING_ONLY.has(commandWord)) return true;
+  if (commandWord !== "git") return false;
+  // A git GLOBAL flag can re-point what runs (`-c alias.x=!sh`, `--exec-path`, `--upload-pack`).
+  if (words.some((w) => /^(-c|--config-env|--exec-path|--upload-pack|--receive-pack)$/.test(w))) return false;
+  const sub = words.slice(1).map((w) => w.replace(/["'\\]/g, "")).find((w) => !w.startsWith("-"));
+  return GIT_FILE_NAMING_SUBCOMMANDS.has(sub ?? "");
+}
+function heredocWrittenTargets(line: string): string[] {
+  const out: string[] = [];
+  const dequoteWord = (w: string) => w.replace(/["'\\]/g, "");
+  // `>`/`>>` targets, quote-aware (a `>` inside a quoted delimiter or message is not a redirect).
+  let quote: string | null = null;
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      continue;
+    }
+    if (ch === ">") {
+      if (line[c + 1] === ">") c++;
+      if (line[c + 1] === "&") continue; // `>&2` is an FD, not a file
+      const m = /^\s*(?:"([^"]*)"|'([^']*)'|([^\s;&|<>()+]+))/.exec(line.slice(c + 1));
+      const target = m ? (m[1] ?? m[2] ?? m[3] ?? "") : "";
+      if (target && target !== "/dev/null") out.push(dequoteWord(target));
+      continue;
+    }
+  }
+  const words = line.trim().split(/\s+/).map(dequoteWord);
+  const reader = heredocCommandWord(line);
+  if (reader === "tee") {
+    for (const w of words.slice(1)) if (w && !w.startsWith("-") && w !== "-") out.push(w);
+  }
+  // `sort -o FILE` / `sort --output=FILE` writes its stdin to a file too (#1382 review cycle 2, P2:
+  // `sort` is a proven DATA consumer, so its `-o` target was the one writer this list missed).
+  if (reader === "sort") {
+    for (let k = 0; k < words.length; k++) {
+      if (words[k] === "-o" || words[k] === "--output") {
+        if (words[k + 1]) out.push(words[k + 1]);
+      } else if (words[k].startsWith("--output=")) {
+        out.push(words[k].slice("--output=".length));
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Can something EARLIER in the command change what the reader resolves to, or capture the body?
+ *
+ * ⛔ THE PROOF MUST COVER THE WHOLE COMMAND, NOT THE OPENER LINE (#1382 review cycle 2, P1 — two
+ * measured bypasses, both of which bash executed while the gate ALLOWED):
+ *
+ *   PATH=/tmp/e:$PATH; export PATH     # /tmp/e/cat is `exec bash`
+ *   cat <<'SH' … SH                    # body masked, then EXECUTED by the fake reader
+ *
+ *   x=$(cat <<'EOF' … EOF              # the `$(` is on an EARLIER line, so the opener line carried
+ *   )                                  # no substitution …
+ *   eval "$x"                          # … and the captured body reached eval
+ *
+ * So the rule is: refuse to mask when the PREFIX (a) assigns a PATH-relevant variable or exports one,
+ * (b) leaves a command substitution OPEN, or (c) assigns a variable whose VALUE is a file this
+ * heredoc writes (the path travels through the variable into `source "$f"`). Over-refusing only
+ * costs a refusal; the ordinary `cat >> file <<'EOF'` prefix is empty and unaffected.
+ */
+function heredocPrefixIsUnprovable(prefix: string, targets: string[]): boolean {
+  if (/(^|[\s;&|()])(?:export\s+)?(PATH|IFS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|LD_PRELOAD|LD_LIBRARY_PATH|CDPATH)=/.test(prefix)) {
+    return true;
+  }
+  // ⛔ ANY SUBSTITUTION IN THE PREFIX REFUSES THE MASK. A depth COUNTER was here, and it was a
+  // measured fail-OPEN: it treated a `)` inside a DOUBLE-QUOTED string, a `#` comment, or an escaped
+  // `\)` as closing a substitution, so all four spellings below reached `eval` with the body masked
+  // (fresh review, and re-measured here at the real gate before the fix):
+  //
+  //     x=$(                     # depth 1
+  //     # ) closing note         # the counter reads this `)` and drops to 0 …
+  //     cat <<'EOF'              # … so the body is "proven" DATA and masked …
+  //     gh pr merge 1 --admin
+  //     EOF
+  //     )                        # … while bash is still INSIDE the substitution
+  //     eval "$x"                # … and the captured body executes.
+  //
+  // A correct count is a shell parser — the class this file has already learned it cannot enumerate.
+  // So the boundary moves instead of the parser growing: a prefix with NO `$(` and NO backtick is
+  // provable; anything else is not. The cost is the pre-#1382 refusal for a heredoc written after a
+  // substitution — a refusal this file was already making, never a permission it newly grants.
+  if (prefix.includes("$(") || prefix.includes("`")) return true;
+  for (const t of targets) if (t !== "" && t !== "-" && prefix.includes(t)) return true;
+  return false;
+}
+
+/**
+ * Does this line END IN A LINE CONTINUATION — an ODD number of trailing backslashes (the shell
+ * removes a backslash-newline outright, so `\` + newline joins the next physical line onto this
+ * one)? `\r` is stripped first: a CRLF command is the same command.
+ *
+ * ⛔ WHY THE MASK MUST SEE THIS (fresh review, P0, measured): the proof is LINE-LOCAL, and bash is
+ * not. A trailing `\` hides everything the proof checks for on the NEXT line, so
+ *
+ *     cat <<'X' \
+ *     | bash
+ *     gh pr merge 1 --admin
+ *     X
+ *
+ * read as "one simple command with no pipe" (`cat`, a data consumer) and the body was masked —
+ * while bash joins the lines into `cat <<'X' | bash` and EXECUTES the body. The same continuation
+ * split a redirect target (`cat <<'X' > \` / `/tmp/x.sh`) so the written-target scan saw no target
+ * at all and a later `bash /tmp/x.sh` went unchecked. Both were measured ALLOWING at the real gate.
+ * A command with continuations is therefore never masked: over-refusal is the direction this file
+ * may be wrong in.
+ */
+function endsWithContinuation(line: string): boolean {
+  const t = line.replace(/\r$/, "");
+  let n = 0;
+  for (let i = t.length - 1; i >= 0 && t[i] === "\\"; i--) n++;
+  return n % 2 === 1;
+}
+
+/**
+ * May this heredoc's body be treated as DATA — i.e. blanked before any gate reads the command?
+ *
+ * THE INVARIANT THIS SERVES, stated once: **a gate that fires on prose teaches agents to write
+ * around it, which is how real bypasses hide.** A body under `cat >> file <<'EOF'` is the single
+ * most common way an agent writes a Markdown file or a commit message, and prose ABOUT a merge is
+ * not a merge. The measured cost of getting this wrong is a lane that cannot RECORD a defect it
+ * just measured (#1382, and this lane's own first tool call).
+ *
+ * The proof is a SHAPE, not a guess, and everything it cannot prove keeps the body readable:
+ *
+ *  1. the opener line is ONE SIMPLE COMMAND — no `;`, `&`, `|`, `(`, `)` and no second `<`
+ *     redirect outside quotes, so the heredoc has exactly one consumer and nothing else on the
+ *     line changes what runs. A `>`/`>>` redirect IS allowed: writing the body to a file is the
+ *     archetypal data sink (`cat >> NOTES.md <<'EOF'`), and excluding it was this fix's first bug —
+ *     it left the reported command refused.
+ *  2. no `$(`, backtick or `NAME=value` prefix before the opener: a command substitution puts the
+ *     body's text back in COMMAND position (`$(cat <<'EOF' … EOF)`), and an assignment can shadow
+ *     `PATH`.
+ *  3. the command word is a proven DATA consumer (see the set above), or `git commit|tag` (whose
+ *     `-F -` stdin is a message).
+ *  4. that word is not shadowed by an alias/function/assignment anywhere in the command
+ *     (`heredocReaderIsShadowed`).
+ *
+ * What this does NOT cover, stated rather than implied: a body written to a FILE that a LATER
+ * command executes (`cat > x.sh <<'EOF' … EOF && bash x.sh` — the `&&` in (1) already keeps that
+ * body readable). The argv layer (#984) is the answer for execution, which is why the caller only
+ * masks while that layer is enforcing.
+ *
+ * ⛔ AND IT IS THE HEREDOC CLASS ONLY. A construct inside a QUOTED ARGUMENT (`echo 'the `gh pr`
+ * guard refused merge-2235'`) still counts as a candidate and is still refused for carrying no
+ * resolvable PR number. That over-block is KEPT, not fixed: #1425 records that four narrowing
+ * attempts at the candidate rule each regressed a real bypass, and #1776's boundary test pins the
+ * ACCEPTED OVER-BLOCK. A heredoc body is different in kind — it is not part of the command's words
+ * at all — which is why it can be masked and a quoted argument cannot.
+ */
+function heredocBodyIsData(line: string): boolean {
+  // (2) a substitution can put the body back in command position; an assignment can shadow PATH.
+  if (/\$\(|`/.test(line)) return false;
+  // (1) one simple command, quote-aware. `>`/`>>` allowed; a second `<` (e.g. another heredoc
+  // opener, or `<file` input redirection) is not provable, so it is refused.
+  let quote: string | null = null;
+  let openerSeen = 0;
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      continue;
+    }
+    if (/[;&|()]/.test(ch)) return false;
+    if (ch === "<") {
+      if (line[c + 1] === "<") {
+        openerSeen++;
+        c++; // the opener pair itself
+        if (line[c + 1] === "-") c++;
+        continue;
+      }
+      return false; // `<file` input redirection
+    }
+  }
+  if (openerSeen === 0) return false;
+  // (3) the command word, read the SAME way `maskHeredocData` reads it (`heredocCommandWord`): the
+  // opener and everything after it cut off, every quote removed — so `cat<<'EOF'` and `c"a"t <<'EOF'`
+  // are the data consumers they are, instead of two more spellings that keep the prose refusal.
+  const words = line.trim().split(/\s+/);
+  const first = words[0] ?? "";
+  if (first === "" || /^[A-Za-z_][A-Za-z0-9_]*=/.test(first)) return false;
+  const cmd = heredocCommandWord(line);
+  if (cmd === "git") {
+    // Only the subcommands whose stdin is a MESSAGE (`git commit -F -`, `git tag -F -`). A global
+    // flag can move the subcommand or re-point git's config, so any `-c`/`--config*`/`--exec-path`
+    // before it refuses the mask.
+    const rest = words.slice(1).map((w) => w.replace(/["'\\]/g, ""));
+    const sub = rest.find((w) => !w.startsWith("-"));
+    if (sub !== "commit" && sub !== "tag") return false;
+    if (rest.some((w) => /^-(c|C)$/.test(w) || /^--(config|config-env|exec-path)/.test(w))) return false;
+    return true;
+  }
+  return HEREDOC_STDIN_DATA_CONSUMERS.has(cmd);
+}
+
+/**
+ * #1382 — blank out every heredoc BODY (and its terminator) whose body is DATA, LENGTH-PRESERVING so
+ * every offset a later reader holds stays valid.
+ *
+ * This is the admin-merge gate's data model, applied ONCE at the `tool_call` entry so every gate
+ * reads the same text: the candidate test, `hasLiteralAdminFlag`, `mergeVerbInText`,
+ * `countMergeVerbs`, `extractPrNumber` and the merge registry. The AUDIT record keeps the caller's
+ * raw text, and the shell is given the caller's raw command — masking is a READING of the command,
+ * never a rewrite of it.
+ *
+ * Deliberately conservative in the only direction this file is allowed to be wrong in: a body under
+ * a consumer that is not proven data, an unterminated body, a compound opener line, a command with a
+ * LINE CONTINUATION (bash joins those lines, so a line-local proof reads a fragment), a substitution
+ * anywhere in the prefix, or a shadowed reader keeps its body READABLE, so the gate refuses exactly
+ * as it did before. Those shapes are the safety argument, and they are why the mask is applied
+ * UNCONDITIONALLY rather than only while the argv layer (#984) enforces: what it blanks is proven
+ * DATA, i.e. text this command cannot execute, so there is no invocation for a downstream reader to
+ * catch. See the gate entry for the measured reason the old condition kept the false positive alive
+ * on this fleet.
+ *
+ * ⛔ STATED RESIDUAL — AN OPEN GAP, NOT A SAFE ASSUMPTION. The proof is scoped to THIS command. A
+ * body written to a file (`cat > /tmp/x.sh <<'EOF'`) is DATA to the writer, and nothing here follows
+ * that file into a LATER tool call, where `bash /tmp/x.sh` carries no `gh` word for any text gate
+ * to read. The argv-level shim (#984) is the layer that saw that execution, and
+ * `docs/ops/ACTIVATION-MATRIX.md` row 1 records it as ABSENT on this fleet — the load-time #984
+ * warning names the gap. Pinned by `#1382 (e)` in the suite so no lane reads this as covered. (The
+ * same outcome was always reachable through surfaces this gate never inspected — the `write` tool, a
+ * `python3 -c` payload — so this is a boundary of the INSTRUMENT, declared, not a control removed.)
+ */
+export function maskHeredocData(command: string): string {
+  const lines = command.split("\n");
+  const out: string[] = [];
+  const blank = (s: string) => " ".repeat(s.length);
+  // Carried ACROSS lines: an arithmetic expression can span them (a `<<` on a continuation line is a
+  // SHIFT, not an opener), and so can a QUOTED STRING (an opener inside one is text). A false opener
+  // masks to EOF — a fail-open.
+  const state: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
+  for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i]);
+    const openers = heredocOpenersIn(lines[i], state);
+    if (openers.length === 0) continue;
+    // ⛔ NO LINE CONTINUATIONS, ANYWHERE (fresh review, P0 — measured fail-OPEN). The proof below is
+    // LINE-LOCAL; bash removes a backslash-newline and joins the next physical line onto this one.
+    // So `cat <<'X' \` / `| bash` read as "one simple command, no pipe" and the body was masked
+    // while bash piped it into `bash`; `cat <<'X' > \` / `/tmp/x.sh` hid the redirect target from
+    // `heredocWrittenTargets`, so a later `bash /tmp/x.sh` was never checked either. A continuation
+    // in the opener line OR in the prefix that feeds it makes every rule here a reading of a
+    // FRAGMENT, which is not a proof — so nothing is masked. Over-refusal is the direction this
+    // file may be wrong in.
+    if (endsWithContinuation(lines[i])) continue;
+    if (lines.slice(0, i).some(endsWithContinuation)) continue;
+    if (!heredocBodyIsData(lines[i])) continue;
+    const reader = heredocCommandWord(lines[i]);
+    // ⛔ THE SHADOW SCAN STOPS AT THE OPENER LINE (#1382 review cycle 1, P2): it used to read the
+    // WHOLE command, body included, so a report that QUOTED `cat() { bash; }` — an evidence file about
+    // this very gate — disarmed the mask and brought the reported false positive back. An alias or a
+    // function must be defined BEFORE the line that uses it, so the prefix is the sound scope (and a
+    // later definition cannot retroactively change what an earlier line ran).
+    if (heredocReaderIsShadowed(lines.slice(0, i + 1).join("\n"), reader)) continue;
+    // A body written to a FILE that this same command can EXECUTE by a later line — unprovable, so
+    // keep it readable (see `heredocLineExecutes`).
+    const targets = heredocWrittenTargets(lines[i]);
+    // ⛔ A REDIRECT TARGET THE SHELL WILL EXPAND IS NOT A NAME WE CAN COMPARE (#1382 cycle 10 review).
+    // Measured: `cat > $HOME/x.sh <<'EOF' … EOF` + `bash ~/x.sh` was MASKED — the written-target
+    // reader does not carry `$HOME` through as one word, so no comparison could see that the runner
+    // reaches the same file. `$VAR` cannot be resolved here at all, so a `$`/backtick in any target
+    // keeps the whole body READABLE (a refusal) instead of guessing. `~` is left maskable: it expands
+    // to one known directory, and `heredocNamesTarget` canonicalizes it.
+    if (targets.some((t) => /[$`]/.test(t))) continue;
+    // The LATER lines are read with continuations resolved, for the same reason as the opener: a
+    // runner spelled `bash \` / `/tmp/x.sh` executes the body just as plainly as `bash /tmp/x.sh`,
+    // and a line-by-line scan saw neither half.
+    const otherLines = lines
+      .filter((_, n) => n !== i)
+      .join("\n")
+      .replace(/\\\r?\n/g, " ")
+      // ⛔ A LINENBREAK AFTER `|` CONTINUES THE PIPELINE (POSIX). Only `\`-continuations were joined,
+      // so `cat /tmp/x.sh |` <newline> `bash` read as two unrelated commands and the body was masked
+      // while bash ran it (#1382 cycle 10 review, P0 — measured ALLOWED).
+      .replace(/\|[ \t]*\r?\n/g, "| ")
+      .split("\n");
+    // The scope passed to the naming test is the WHOLE command (a function/alias/assignment may be
+    // defined on any line), so a shadowed reader keeps the body readable from any direction.
+    const scope = lines.join("\n");
+    if (targets.some((t) => t !== "" && t !== "-" && otherLines.some((l) => heredocLineExecutes(l, t, scope)))) continue;
+    // …and the PREFIX must not be able to change what the reader resolves to, capture the body, or
+    // hold the written path in a variable.
+    if (heredocPrefixIsUnprovable(lines.slice(0, i).join("\n"), targets)) continue;
+    for (const opener of openers) {
+      let closed = false;
+      for (i++; i < lines.length; i++) {
+        const probe = opener.stripTabs ? lines[i].replace(/^\t+/, "") : lines[i];
+        out.push(blank(lines[i]));
+        if (probe === opener.delim) {
+          closed = true;
+          break;
+        }
+      }
+      // An UNTERMINATED heredoc is NOT a bash syntax error — measured: `printf 'cat <<EOF\nhi\n' > /tmp/u.sh;
+      // bash /tmp/u.sh` WARNS ("here-document at line 1 delimited by end-of-file") and then EXECUTES the
+      // command with the remainder as the body, exit 0 (#1382 cycle 9 review, P2 — the first version of
+      // this comment asserted the opposite, and a later widening to a non-proven consumer would have
+      // leaned on it). Masking the remainder is still sound HERE and for a narrower reason: the opener
+      // passed `heredocBodyIsData`, so whatever follows is the body of a consumer this file proved
+      // cannot execute its stdin, and nothing follows the body. If that proof ever widens, this branch
+      // must stop masking — it is the proof, not the "syntax error", that carries the safety.
+      if (!closed) break;
+    }
+  }
+  return out.join("\n");
 }
 
 /**
@@ -1583,6 +2532,362 @@ export function reviewRecordFile(repo: string | undefined, pr: number): string {
     : resolvePath(dir, `${pr}.json`);
 }
 
+/**
+ * #2287/#2148 (measured 2026-10-22, this lane): the ≥1-dispatch floor counted ONLY
+ * the in-session `task`/`subagent` tool_result, so a lane that obtained its review
+ * from a SPAWNED reviewer PROCESS — `scripts/review-pr.sh`, the harness's
+ * `merge-one.sh` reviewer, any `pi -p` child — was refused at its next git op with
+ * "no reviewers dispatched" even though a reviewer HAD run and its verdict was on
+ * the record. The floor was therefore satisfiable only one way, and the way the
+ * documentation tells a lane to land (`review-pr.sh`, then the rail) was not it.
+ *
+ * The acceptance is a MECHANICAL artifact, not prose: `record-review.sh`'s registry
+ * record (`~/.pi/agent/reviews/…json`) is the one thing a reviewer process leaves
+ * behind, and the merge gate ALREADY trusts it as the attestation. This adds NO new
+ * trust boundary — it reads the same file the rail reads — and it is bound to the
+ * EXACT head being pushed/committed, so a record made at an older head still needs
+ * a fresh review (no record for these bytes ⇒ still refused).
+ *
+ * ⛔ The negative case is the protection: no spawn ⇒ no record ⇒ refuse (pinned by
+ * `index.spawn-evidence.test.ts`; the recorder refuses to mint one without the
+ * evidence artifact, and `tests/review-pr/run.sh` §AE proves the no-spawn mutant
+ * writes nothing). A record whose `repo` disagrees with the op's repo is treated as
+ * absent (the #426 collision class), and ambiguity (two records for one head with
+ * no repo context) is not evidence either.
+ */
+export interface ReviewProcessEvidence {
+  pr: number;
+  head_sha: string;
+  verdict: string;
+  repo?: string;
+  recordPath: string;
+}
+
+/**
+ * A review record bound EXACTLY to `headSha`. `repo` narrows the search when known
+ * (a foreign repo's record must never satisfy this repo — #426). Returns null when
+ * nothing matches, or when the match is ambiguous without repo context.
+ */
+export function headBoundReviewEvidence(headSha: string, repo: string | null): ReviewProcessEvidence | null {
+  if (typeof headSha !== "string" || !/^[0-9a-f]{7,64}$/i.test(headSha.trim())) return null;
+  const want = headSha.trim().toLowerCase();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(reviewsDir()).filter((f) => f.endsWith(".json"));
+  } catch {
+    return null; // no registry → no evidence
+  }
+  const matches: ReviewProcessEvidence[] = [];
+  for (const f of entries) {
+    const path = resolvePath(reviewsDir(), f);
+    const rec = readRecordFile(path);
+    if (rec === null) continue;
+    if (typeof rec.head_sha !== "string" || rec.head_sha.trim().toLowerCase() !== want) continue;
+    if (repo !== null && rec.repo !== undefined && rec.repo !== repo) continue; // foreign record → inert
+    if (repo !== null && rec.repo === undefined) continue; // no repo on the record ⇒ cannot be bound to THIS repo
+    // #426 P0-2 parity: with NO repo context, a record that NAMES a repo cannot be bound to
+    // this op (it may be another repo's PR with the same number); only a repo-less legacy record
+    // is admissible, and only as the unique match (checked below).
+    if (repo === null && rec.repo !== undefined) continue;
+    matches.push({ pr: rec.pr, head_sha: want, verdict: rec.verdict, repo: rec.repo, recordPath: path });
+  }
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    // Two records at one head, no way to choose: not evidence. (With repo context
+    // the loop above already filtered to this repo's records; a genuine duplicate
+    // for one repo+head is still ambiguous.)
+    logGateEvent("review_record_collision", { ambiguous: matches.map((m) => m.recordPath), head_sha: want });
+    return null;
+  }
+  return matches[0];
+}
+
+/**
+ * THE COMMITS AN OP ACTUALLY SHIPS - and nothing but the ones it ships.
+ *
+ * #2287 fresh-review P0 (2026-10-22, reproduced): the first revision of this helper asked only
+ * "what is HEAD?", and HEAD is NOT the shipped object in several ordinary shapes. Each of these
+ * authorized a git op from a record that describes other bytes:
+ *
+ *   git push origin side        HEAD is on the reviewed commit; the pushed BRANCH is not.
+ *   git -C <other> push ...     the checkout, HEAD and repo are read from the session cwd.
+ *   git commit -m wip           the committed bytes DO NOT EXIST YET - no record can describe them.
+ *   git push --all / --mirror   many refs ship, one HEAD describes one of them.
+ *
+ * So the evidence path is opened ONLY for the shapes whose shipped commit is exactly HEAD, and is
+ * closed (null => the >=1-dispatch floor applies unchanged) everywhere else. That is the
+ * fail-closed direction: an unrecognised option, a refspec, a redirect, an unresolvable branch
+ * name, or a commit all fall back to the ordinary floor rather than to an accept.
+ */
+/**
+ * Git verbs that move a ref or rewrite the working tree. A command containing one of these cannot
+ * be certified by a record bound to the HEAD read before it ran.
+ */
+const REF_MOVING_VERBS = new Set([
+  "commit", "reset", "checkout", "switch", "branch", "merge", "rebase", "cherry-pick", "revert",
+  "stash", "pull", "am", "apply", "restore", "rm", "mv", "tag", "update-ref", "symbolic-ref",
+  "worktree", "clean", "notes", "filter-branch", "fast-import",
+]);
+
+/**
+ * Git GLOBAL options that consume the following word as their VALUE. The first revision of this
+ * file used the regex `git\s+(?:-[^\s]+\s+)*(verb)`, which only skips VALUELESS flags — so
+ * `git -c user.name=x commit …` and `git -c core.hooksPath=/dev/null commit …` slipped past BOTH
+ * the ref-moving guard and the "a commit ships bytes that do not exist yet" rule, and a record
+ * bound to the superseded HEAD authorized the chained push (fresh review round 3, P0). The
+ * verification-gate's `findGitVerbInvocation` models exactly this and consumes the `-c` value;
+ * that scanner is not exported, so the model is mirrored here (see the drift note below).
+ */
+const GIT_GLOBAL_OPTS_WITH_VALUE = new Set([
+  "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--exec-path",
+  "--config-env", "--attr-source",
+]);
+
+/**
+ * The verb of every `git` invocation in the command, with its global options skipped.
+ *
+ * ⛔ DRIFT NOTE: this is a SECOND model of "git + global options + verb" (the first is
+ * `findGitVerbInvocation` in extensions/verification-gate). It is duplicated because that module
+ * value-imports the pi SDK and the shared parser module does not export a verb scanner; the
+ * shapes it must agree on are pinned by `index.spawn-evidence.test.ts` (§unit — `-c` forms), so a
+ * divergence shows up as a failing test rather than as a silent bypass.
+ *
+ * A FALSE POSITIVE (a quoted mention that splits into words) only closes the evidence path —
+ * the ordinary dispatch floor applies — so the cheap split is safe in the fail-closed direction.
+ */
+export function gitVerbs(command: string): string[] {
+  const words = command.split(/[\s;|&()]+/).filter((w) => w.length > 0);
+  const verbs: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (w !== "git" && !w.endsWith("/git")) continue;
+    let j = i + 1;
+    while (j < words.length) {
+      const tok = words[j];
+      if (tok.startsWith("-")) {
+        j += GIT_GLOBAL_OPTS_WITH_VALUE.has(tok) ? 2 : 1;
+        continue;
+      }
+      verbs.push(tok);
+      break;
+    }
+  }
+  return verbs;
+}
+
+/**
+ * Does this command move a ref (or rewrite the tree) ANYWHERE in it — including behind a
+ * `git -c …` global, an inline `GIT_DIR=` assignment, or a `fetch` that retargets the checked-out
+ * branch (`--update-head-ok` with a `src:dst` refspec)?
+ *
+ * Every branch here CLOSES the evidence path (the ≥1-dispatch floor applies); none loosens a gate.
+ */
+export function commandMovesRefs(command: string): boolean {
+  // An inline environment assignment can retarget the whole invocation (F4): `GIT_DIR=/other/.git
+  // git push` reads THIS checkout's HEAD while git operates on another repository entirely.
+  if (/(^|\s)GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|COMMON_DIR|NAMESPACE)=/.test(command)) return true;
+  // A shell builtin that moves the CHECKOUT (or an unattributable `cd`, whose target the gate
+  // cannot resolve) makes the HEAD read here describe a different repository than the op ships.
+  if (/(^|\s)(pushd|popd)(\s|$)/.test(command)) return true;
+  if (parseCdChains(command).unattributable) return true;
+  const verbs = gitVerbs(command);
+  if (verbs.some((v) => REF_MOVING_VERBS.has(v))) return true;
+  // `fetch` is not ref-moving on its own (it moves remote-tracking refs), but these two forms move
+  // the CHECKED-OUT branch: verified locally (fresh review round 3, P1) — `git fetch
+  // --update-head-ok origin +side:main` advanced main, i.e. the push then shipped unreviewed bytes.
+  if (verbs.includes("fetch")) {
+    // BOTH spellings: `--update-head-ok` and its short form `-u` (fresh review round 4, P0).
+    if (/(^|\s)(-u|--update-head-ok)(\s|=|$)/.test(command)) return true;
+    // A `src:dst` refspec token can write a destination ref — including a FULLY-QUALIFIED
+    // `refs/heads/main`, which the first detector excluded by forbidding `/` in the dst.
+    const tokens = command.split(/\s+/).filter((t) => t.length > 0);
+    if (tokens.some((t) => /^[^:\s]+:[^:\s]+$/.test(t) && !t.includes("://"))) return true;
+  }
+  return false;
+}
+
+/**
+ * Is this bash command FREE of every construct that can hide or move what it really runs?
+ *
+ * ⛔ WHY THIS EXISTS (fresh review round 4, P0 ×3). Rounds 1–3 tried to MODEl the command text:
+ * a list of ref-moving verbs, a list of global options, a list of redirects. Each round found
+ * another spelling that walks past the model, and every one was a live accept:
+ *
+ *   git "commit" -m x && git push origin main      (quotes — bash strips them and runs the verb)
+ *   git c"ommit" -m x && git push origin main      (quoting INSIDE the word)
+ *   git \commit -m x && git push origin main       (backslash escape)
+ *   git $(printf commit) -m x && git push origin main   (command substitution)
+ *   git co -m x && git push origin main            (alias — the noun is not the verb that runs)
+ *   pushd /other && git push origin main           (a shell builtin moves the checkout)
+ *   cd $OTHER && git push origin main              (an unattributable cd: HEAD read here, push there)
+ *   git fetch -u . +refs/heads/side:refs/heads/main && git push …   (the short -u form)
+ *   gh pr create -Hother                            (-H with an ATTACHED value)
+ *
+ * The lesson is not "add another pattern": a text model of a Turing-complete shell cannot be
+ * completed by enumeration. So the evidence path is opened only for a command that contains NO
+ * shell syntax at all — no quoting, no escapes, no substitution, no variables, no control
+ * operators, no redirects, no subshells, no brace expansion, no newlines. With none of those, the
+ * tokens ARE the argv, the verb is the verb, and `git commit`/`pushd`/an alias cannot hide.
+ *
+ * THIS IS A WHITELIST, and the fallback is the ordinary ≥1-dispatch floor — never an accept. A
+ * lane that wants the record path runs the push as its own bare command:
+ *
+ *     git push origin <branch>          # accepted (with a head-bound record)
+ *     gh pr create --title … --body-file …   # accepted (no -H/--head)
+ *
+ * `git push origin main 2>&1 | tail -3`, `git fetch && git push`, a quoted body, `cd … && push` —
+ * all of them fall back to "dispatch a reviewer", which is the pre-existing, still-supported path.
+ *
+ * DECLARED RESIDUAL: this models the COMMAND, not the repository. A ref written outside git (a
+ * direct write under .git/refs) in a PREVIOUS tool call is invisible here; the record is bound to
+ * the head read at this op, so moving the branch to an unreviewed commit between calls is the
+ * pre-existing TOCTOU of any pre-execution hook, not something this resolver can see.
+ */
+export function evidenceCommandIsPlain(command: string): boolean {
+  // Any shell metacharacter, quote, escape, substitution, operator, redirect or newline: refuse.
+  if (/['"`\\$(){}<>|&;\n\r]/.test(command)) return false;
+  // A trailing/bare backslash would be an escape even without a following metacharacter.
+  if (/\\/.test(command)) return false;
+  // ⛔ PATHNAME EXPANSION IS ALSO "THE SHELL CHANGES THE TOKENS" (fresh review round 6, P1).
+  // `*`, `?`, `[...]` and `~` are expanded BEFORE the command runs, so a command containing one
+  // is NOT "its tokens are the argv" — which is the only reason a positional read is valid here.
+  // Measured: `git push origin main -*` was ACCEPTED at the previous head, and in a checkout
+  // containing a file named `--tags` bash expands the flag slot to it, so the dropped token
+  // became `--tags` and the push shipped every tag — the exact long form the guard at the top of
+  // `resolveShippedHeads` refuses. No legitimate accepted shape contains any of these: git forbids
+  // `*`, `?`, `[` and `~` in a refname, and `!` is history expansion in an interactive shell.
+  if (/[*?[\]~!]/.test(command)) return false;
+  return true;
+}
+
+/**
+ * The command's argv. Valid ONLY after `evidenceCommandIsPlain` has proved the command carries no
+ * shell syntax at all — at which point its whitespace-separated tokens ARE the argv and nothing can
+ * hide behind a quote or a substitution.
+ *
+ * Leading `NAME=value` assignments are skipped: they set the ENVIRONMENT, not the operand. (An
+ * inline `GIT_DIR=` / `GIT_WORK_TREE=` redirect is refused separately by `commandMovesRefs`; it
+ * cannot retarget the checkout through this helper.)
+ */
+function plainArgv(command: string): string[] {
+  const words = command.split(/\s+/).filter((w) => w.length > 0);
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i++;
+  return words.slice(i);
+}
+
+/** `gh [--repo|-R <slug>] pr create …` — including the global form the gate's own messages print. */
+function ghPrCreateArgv(argv: readonly string[]): boolean {
+  if (argv[0] !== "gh") return false;
+  let i = 1;
+  const flag = argv[i];
+  if (flag === "--repo" || flag === "-R") i += 2; // space form
+  else if (typeof flag === "string" && (flag.startsWith("--repo=") || (flag.startsWith("-R") && flag.length > 2))) i += 1; // attached value
+  return argv[i] === "pr" && argv[i + 1] === "create";
+}
+
+/** The remote `repoFromGitRemote` reads. The record's repo slug comes from THIS remote's URL. */
+const ORIGIN_REMOTE = "origin";
+
+export function resolveShippedHeads(
+  command: string,
+  ctx: unknown,
+): { heads: string[]; repo: string | null; cwd: string } | null {
+  // ⛔ FIRST: the command must be free of shell syntax (see evidenceCommandIsPlain). Everything
+  // below is a reading of a command that provably runs exactly its tokens.
+  if (!evidenceCommandIsPlain(command)) return null;
+
+  // A repo/checkout redirect makes the op's HEAD unattributable from here (the gate has no
+  // `-C` model - see resolveRepoContext) -> no evidence.
+  if (/(^|\s)(-C|--git-dir|--work-tree|--namespace|--super-prefix)(=|\s|$)/.test(command)) return null;
+  if (/(^|\s)(--all|--mirror|--tags|--follow-tags|--delete)([\s=]|$)/.test(command)) return null;
+  // ⛔ A `-c <name>=<value>` global can change what a git command DOES (hooksPath, push.default,
+  // refspec behaviour, an alias), so the shape the record was bound to is no longer the shape that
+  // runs. A `git -c core.hooksPath=/dev/null commit && git push` is an ordinary idiom (fresh review
+  // round 3, P0) — refuse the whole class rather than enumerate what a config can alter.
+  if (/(^|\s)(-c|--config|--config-env)(=|\s)/.test(command)) return null;
+
+  const opCtx = resolveRepoContext(command, null);
+  const ctxCwd = (ctx as { cwd?: unknown } | undefined)?.cwd;
+  const cwd = opCtx.cwd ?? (typeof ctxCwd === "string" ? ctxCwd : process.cwd());
+
+  // ⛔ ANCHOR TO THE COMMAND POSITION, NOT TO THE TEXT (fresh review round 5, P2). The plain-command
+  // check above proves this is ONE simple command with no shell syntax, so its TOKENS ARE THE ARGV
+  // and the op is the FIRST word — not "a word somewhere in the line". The free-text test accepted
+  // `echo gh pr create` (nothing ships) at 0 dispatches, and accepted `git commit -m gh pr create`
+  // only INCIDENTALLY, because the ref-moving-verb guard caught the commit — not the "a commit ships
+  // bytes that do not exist at hook time" rule named below. Anchoring makes both refuse by
+  // construction instead of by luck.
+  const argv = plainArgv(command);
+  const isPush = argv[0] === "git" && argv[1] === "push";
+  const isPrCreate = ghPrCreateArgv(argv);
+  // `git commit` ships bytes that do not exist at hook time - a record can never describe them.
+  if (!isPush && !isPrCreate) return null;
+
+  // ⛔ REF-MOVING PREFIX (fresh review, P1): HEAD is read BEFORE the command runs, so a same-call
+  // mutator moves the branch that the push/PR then ships. All of these authorized an op on a record
+  // bound to the PRE-mutation HEAD: `git reset --hard side && git push origin main`,
+  // `git branch -f main side && git push origin main`, `git checkout -B main side && git push`,
+  // `git checkout side && gh pr create -f`. Any ref-moving verb anywhere in the command closes the
+  // evidence path (fail-closed: the >=1-dispatch floor applies, nothing is bypassed).
+  if (commandMovesRefs(command)) return null;
+  // `gh pr create --head|-H <branch>` can open a PR for a branch that is not this checkout's.
+  // ⛔ BOTH SPELLINGS (fresh review, P0): matching only `--head` left `gh pr create -H other`
+  // opening the evidence path for another branch's commits. `gh pr create --help` lists
+  // `-H, --head branch`.
+  // `-H` with an ATTACHED value (`-Hother`) is the same flag (fresh review round 4, P0): match the
+  // short form wherever it starts a word, not only when whitespace/= follows.
+  if (isPrCreate && /(^|\s)(--head(=|\s|$)|-H)/.test(command)) return null;
+
+  let head: string;
+  let branch: string;
+  try {
+    head = execSync("git rev-parse HEAD", { cwd, timeout: 3000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd, timeout: 3000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return null; // not a git checkout / detached lookup failed -> no evidence, floor stands
+  }
+  if (!/^[0-9a-f]{40,64}$/i.test(head)) return null;
+  if (branch === "" || branch === "HEAD") return null; // detached: no named branch to reason about
+
+  if (isPush) {
+    // `git push <remote> <ref>` — and NOTHING ELSE. The argv is positional now, so there is no
+    // text to slice and also no flag to reason about.
+    const tail = argv.slice(2);
+    // ⛔ NO FLAGS AT ALL (fresh review round 6, P1). Round 5 DROPPED every `-`-prefixed token and
+    // then required exactly `<remote> <ref>`, which left the short forms of the flags the long-form
+    // guard refuses: `git push origin main -d` (== `--delete`) was ACCEPTED and DELETES the remote
+    // branch, and `git push --force-with-lease origin main` / `-f` / `-u` were accepted the same
+    // way. A flag can change WHAT the op does without changing its positionals, so this arm accepts
+    // the bare shape only. The cost is a false block on `git push -u origin <b>`: that falls back to
+    // the ≥1-dispatch floor, which is always available and is what the printed remedy already names.
+    if (tail.some((w) => w.startsWith("-"))) return null;
+    const words = tail;
+    // ⛔ EXACTLY `<remote> <ref>` (fresh review, P2). A bare `git push` / `git push origin`
+    // ships whatever `push.default` or `remote.<remote>.push` selects — possibly refs that are not
+    // HEAD — while the record is bound to HEAD.
+    if (words.length !== 2) return null;
+    if (words[0] === "" || words[1] === "") return null;
+    if (words.some((w) => w.includes(":"))) return null; // explicit refspec -> not necessarily HEAD
+    if (tail.some((w) => w.includes("+"))) return null; // forced refspec
+    // ⛔ THE REMOTE MUST BE THE ONE THE RECORD'S REPO WAS READ FROM (fresh review round 5, P2).
+    // `repoFromGitRemote` reads `remote.origin.url`, so the record is bound to ORIGIN's slug — but
+    // the push arm accepted ANY remote name and still matched against that slug. `git push upstream
+    // main` shipped HEAD and was authorized by ORIGIN's record: HEAD is still exactly what ships, so
+    // this was not a byte-integrity hole, but "the op's repo" was not the binding that got checked,
+    // and a doc/behaviour mismatch is how the next reader gets it wrong. Fail-closed: another remote
+    // falls back to the ≥1-dispatch floor, which is always available.
+    if (words[0] !== ORIGIN_REMOTE) return null;
+    // `git push origin HEAD` ships exactly the commit HEAD resolves to — at least as precise as the
+    // branch name, and git infers the same destination branch — so it is accepted. Refusing it was a
+    // false block on a shape lanes actually use.
+    if (words[1] !== branch && words[1] !== "HEAD") return null;
+  }
+
+  const repo = opCtx.repo ?? repoFromGitRemote(cwd);
+  return { heads: [head], repo, cwd };
+}
+
 function readRecordFile(path: string): ReviewRecord | null {
   try {
     const raw = fs.readFileSync(path, "utf8");
@@ -2275,12 +3580,66 @@ function describeNonDiffValue(v: string): string {
 }
 
 /**
+ * How long the LIVE diff read may take (ms).
+ *
+ * ⛔ THIS BOUND WAS 60s AND THAT WAS A SILENT FALSE NEGATIVE (measured 2026-10-22).
+ * The read is one `gh api` inside `record-review.sh`, and on this fleet every `gh`
+ * invocation first queues at the SHARED gh gate (`~/.pi/agent/shims/gh`), whose
+ * slot-acquire budget alone is 300s by default (`AGENT_GH_GATE_ACQUIRE_TIMEOUT`)
+ * before a single byte of HTTP is sent. So under fleet contention — the exact
+ * condition in which a dozen open PRs are waiting on the carry ARM — the child was
+ * killed at 60s WHILE THE GATE WAS STILL QUEUEING, `execFileSync` threw, and the
+ * caller received `null`.
+ *
+ * `null` is the arm's fail-closed signal, so nothing unsafe happened — but the
+ * refusal it produced was `head_advanced` ("the branch moved — re-review the new
+ * head"), i.e. a QUEUEING DELAY was rendered as a CONTENT CHANGE, and the lane paid
+ * a whole fresh review for a diff that never changed. That is the same speech-act
+ * error #1690 fixed for the head read ("an unreadable head is NOT a claim about
+ * reality"), in the diff dimension — so it gets the same treatment: a bound that
+ * outlasts the queue, and a refusal that says which of the two happened.
+ *
+ * The default mirrors the budget the HEAD read already waits under
+ * (`rateLimitMaxWaitMs`, 10 min): a diff read is the same kind of shared-pool call and
+ * was MEASURED at 399s end-to-end on 2026-10-22 while 40 PRs were open, so any bound
+ * below that class keeps killing reads that were merely queued. Raise it where the
+ * gate is configured with a longer acquire timeout. A genuinely unreachable API still
+ * ends in `null` — bounded, and now legible.
+ */
+export function diffHashReadTimeoutMs(): number {
+  // ⛔ A FULL-INTEGER PARSE, AND A FLOOR ON THE OVERRIDE. `parseInt` accepts any
+  // leading-integer prefix, so a human spelling like `10m` yielded TEN MILLISECONDS —
+  // the same killed-while-queueing read this function exists to prevent, silently
+  // reintroduced fleet-wide by a config value (review, #2353 P2). An override is an
+  // operator's stated intent, so a legitimate short value is honoured under test, but
+  // outside test a bound below the floor is ignored rather than trusted.
+  const raw = (process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS ?? "").trim();
+  const FLOOR_MS = 60_000;
+  if (/^[0-9]+$/.test(raw)) {
+    const explicit = Number.parseInt(raw, 10);
+    if (explicit > 0 && (explicit >= FLOOR_MS || process.env.NODE_ENV === "test")) return explicit;
+  }
+  const acquire = parseInt(process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT ?? "", 10);
+  const acquireMs = (Number.isInteger(acquire) && acquire > 0 ? acquire : 300) * 1000;
+  // NOTE: the read itself retries (record-review.sh DIFF_FETCH_ATTEMPTS=3), so a path
+  // whose every attempt queues can still outlast any single bound. That residual is
+  // declared rather than papered over: the failure is now `diff_unreadable` (RETRY),
+  // which is cheap and re-decidable, instead of a false "the content changed".
+  return Math.max(600_000, acquireMs + 120_000);
+}
+
+/**
  * The PR's live normalized three-dot diff digest, or null when it cannot be
  * computed. The repo is taken from the SAME resolved context the gate verified
  * the head through, and is RE-VALIDATED here (a `--repo` flag is user-controlled
  * text) before it reaches an argv element. Every failure — no repo, no helper,
  * no `gh`/`openssl`/`python3`, the 300-file cap, a network failure, a timeout —
  * returns null, which the gate reads as "no identity" and blocks on the head.
+ *
+ * ⛔ NULL MEANS "COULD NOT READ", NEVER "READ AND DIFFERS". The two are
+ * different operational events with different remedies (retry vs re-review), so
+ * the caller must not collapse them: `evaluateMergeGate`'s `diffReadFailed`
+ * argument exists to keep them apart at the one point that prints the remedy.
  */
 export function getPrLiveDiffHash(pr: number, ctx: RepoContext): string | null {
   return getPrLiveDiffHashObserved(pr, ctx).hash;
@@ -2312,7 +3671,7 @@ export function getPrLiveDiffHashObserved(
     // element, so no value here can be re-parsed as shell syntax.
     const out = execFileSync("bash", [helper, "--print-diff-hash", String(pr), repo], {
       cwd: ctx.cwd,
-      timeout: 60000,
+      timeout: diffHashReadTimeoutMs(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -2532,6 +3891,33 @@ export type MergeGateResult =
   | { status: "failopen"; warning: string }
   | { status: "allow"; message: string; carried?: boolean };
 
+/**
+ * #513/#2347 — the ONE place the "a fresh review is owed" recipe is written, per tier.
+ * Every arm that tells a lane to re-review uses it, so a future arm cannot re-introduce
+ * the three defects this text has already shipped with: a truncated sha (refused by
+ * record-review.sh, exit 2), a hardcoded `clean` laid over a tier verdict (a micro PR
+ * sent to the full standard review its tier exempts, a clean-low one told to re-record
+ * a shape it must re-derive), and `--evidence` promised to the two verdicts that accept
+ * it and drop it.
+ */
+export function freshReviewAdvice(verdict: string, pr: number): string {
+  const cmd = `${RECORD_SH} ${pr} <head_sha>`;
+  if (verdict === "clean-low") {
+    return (
+      "     → Re-derive the SHAPE rather than re-recording it: re-check whether the NEW head is still\n" +
+      `       content-only, then name the verdict explicitly — ${cmd} clean-low [owner/repo].\n` +
+      `       If it is no longer content-only, run the code-review skill and record ${cmd} clean [owner/repo] --evidence comment:<review-comment-id>.`
+    );
+  }
+  if (verdict === "clean-micro") {
+    return (
+      `     → Micro issue (complexity:micro): complete the micro flow, then ${cmd} clean-micro [owner/repo]\n` +
+      "       (no --evidence: clean-micro certifies the micro PROCESS, not a review artifact)."
+    );
+  }
+  return `     → Run the code-review skill, post its verdict as a PR comment, then ${cmd} clean [owner/repo] --evidence comment:<review-comment-id>`;
+}
+
 // Pure gate decision — separated from I/O so it is unit-testable.
 export function evaluateMergeGate(
   pr: number,
@@ -2546,6 +3932,20 @@ export function evaluateMergeGate(
   // failure. Every one of those is a FAILED READ, and a failed read is not a
   // matching read, so null blocks on the head binding like any other mismatch.
   currentDiffHash: string | null = null,
+  // #1351 — WHY `currentDiffHash` is null. The caller ATTEMPTED a read (the
+  // record carries a usable digest and the head moved) and it came back null:
+  // either the read failed, or the body was empty/non-diff/over the 300-file
+  // cap. That is NOT a statement that the content changed, and the two remedies
+  // are opposites (RETRY the merge vs pay for a fresh review), so the caller
+  // says which happened rather than letting the arm guess. Defaults to false
+  // because the common null is "never asked" (a matching head, or a legacy
+  // record with no digest), which must keep the unchanged `head_advanced` path.
+  //
+  // ⛔ ORDER: it is deliberately LAST. #2349's `observation` / `liveDiffReadReason`
+  // (below) are the two message inputs that landed on `main` while this branch was
+  // open, and they occupy positions 8-9 in every existing caller and test. Appending
+  // the flag after them keeps that contract intact instead of silently re-binding
+  // an observation object to a boolean parameter.
   // #2349: these two arguments are MESSAGE INPUTS ONLY. They reach a refusal's
   // text and nothing else — no branch below tests them, and no return value
   // depends on them (pinned by the "decision code" extraction in index.test.ts).
@@ -2555,6 +3955,7 @@ export function evaluateMergeGate(
   //                        moved-head arm (a failed READ is not a failed review).
   observation: ReviewRecordObservation | null = null,
   liveDiffReadReason: string | null = null,
+  diffReadFailed: boolean = false,
 ): MergeGateResult {
   if (!record) {
     // #285 Fix C: the emergency-bypass line is FALSE for task sub-agents — the
@@ -2697,6 +4098,67 @@ export function evaluateMergeGate(
         // allow and the refusal cannot describe the rule differently). A lane that has
         // only ever read refusals needs to learn this arm EXISTS.
         `   ⇒ ${RECORD_STATE_CARRY_ALLOWED}.`,
+    };
+  }
+  if (
+    record.head_sha !== currentHead &&
+    diffReadFailed &&
+    // The flag says the caller ATTEMPTED a read, and a read is only attempted
+    // when the record carries an identity. Requiring it here keeps the branch
+    // self-consistent even for a caller that sets the flag unconditionally: a
+    // record with NO usable digest can never be a "could not read" case, its
+    // remedy is the unchanged one, and the text below quotes the digest.
+    isDiffSha256(record.diff_sha256)
+  ) {
+    // #1351 — A FAILED READ IS NOT A CHANGED DIFF (#1690's speech act, in the
+    // diff dimension). We got here because the record DOES carry a usable
+    // digest and the head moved, i.e. the carry arm was REACHABLE — and then the
+    // live digest could not be read (a shared-gh-gate queue longer than the
+    // read bound, a rate-limit window, an empty/over-cap/non-diff body, a
+    // network failure). Rendering that as `head_advanced` told the lane to pay
+    // 20-40 minutes for a fresh review of content that may be byte-identical.
+    //
+    // FAIL CLOSED, and state the remedy that actually applies: RETRY. The retry
+    // is cheap and it re-asks the only question that decides. The `[diff_unreadable]`
+    // tag exists so the audit trail (gate-events.jsonl) can reconstruct these by
+    // reason — `head_advanced` was two different operational events behind one tag.
+    return {
+      status: "block",
+      reasonTag: "diff_unreadable",
+      reason: [
+        `❌ PR #${pr} head has moved (${record.head_sha.slice(0, 12)} → ${currentHead.slice(0, 12)}) and the`,
+        "   reviewed DIFF could not be READ, so it could not be compared.",
+        "   This is NOT a claim that the content changed — a read that failed is not a diff that differs.",
+        // #2349 — say WHAT the read reported. This arm is the one place that
+        // declares a failed read, so the reason #2349 threads through for the
+        // head-stale arm belongs here too; dropping it would make this refusal
+        // less informative than the narrower one it precedes.
+        `   What the read reported: ${liveDiffReadReason ?? "(no reason reported by the caller)"}`,
+        "   → RETRY the merge. A shared gh-gate queue, a rate-limit window or a transient API"
+        + " failure is far cheaper than a re-review, and the carry arm re-decides on every attempt.",
+        "   → Do NOT mint a fresh record for this: an unchanged diff CARRIES on the digest alone",
+        `     (record diff_sha256 ${record.diff_sha256!.slice(0, 12)}…).`,
+        "   → To see which case you are in without merging, compare the two digests:",
+        `     ${RECORD_SH} --print-diff-hash ${pr} ${ctx.repo ?? "<owner/repo>"}`,
+        `     (or in one step: ${RECORD_SH} --check-carry ${pr} ${ctx.repo ?? "<owner/repo>"}).`,
+        "   → Only if that prints a digest DIFFERENT from the record's is a fresh review owed:",
+        // ⛔ THREE DEFECTS HAVE LIVED ON THIS ONE LINE, each with its own wrong outcome
+        // (reviews, #2353 P1 + round 2 F1):
+        //   1. a TRUNCATED sha (`${currentHead.slice(0,12)}…`) LOOKS runnable — the two
+        //      lines above ARE literal — and record-review.sh refuses anything short of
+        //      40 hex with exit 2, so the advice dead-ended at the moment a lane tried to land;
+        //   2. a hardcoded `clean` overrode the TIER: a micro PR was sent to the full
+        //      standard review its tier exempts, and a clean-low one was told to re-record at
+        //      the same verdict — which the sibling arm at `head_advanced` forbids verbatim,
+        //      because that shape must be RE-DERIVED rather than carried forward;
+        //   3. `--evidence` was appended unconditionally although only `clean` binds
+        //      evidence (clean-micro/clean-low accept it and drop it), promising an artifact
+        //      the record would not carry.
+        // So the recipe is TIER-AWARE — written once, in `freshReviewAdvice` below, which
+        // every "a fresh review is owed" arm shares — and `<head_sha>` is the placeholder
+        // every neighbouring arm uses.
+        freshReviewAdvice(record.verdict, pr),
+      ].join("\n"),
     };
   }
   if (record.head_sha !== currentHead) {
@@ -3882,21 +5344,43 @@ const BLOCK_MESSAGE = [
   "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
+  // #2287/#2148: a lane whose review came from a SPAWNED reviewer process (review-pr.sh,
+  // the harness reviewer) does not need to re-do it through `task` — the registry record
+  // bound to this op's head is accepted. Naming it here keeps the refusal satisfiable
+  // from EITHER path, which is the whole point of the disclosure.
+  // ⛔ AND NAME ITS CONDITION (fresh review round 5, P1). The record path is open only for a command
+  // carrying NO shell syntax (see evidenceCommandIsPlain) — naming the record WITHOUT the shape
+  // reproduced the #2287 defect one spelling over: a lane pushing `git push --force-with-lease`,
+  // `git push -u origin $BR`, `cd … && git push` or `git push origin HEAD:refs/heads/<b>` was told
+  // "a record satisfies this floor", followed the instruction, and stayed blocked. So the accepted
+  // shapes are printed, and the sentence says plainly that anything else falls back to a dispatch.
+  "   → A spawned reviewer PROCESS counts too — FOR THESE EXACT SHAPES ONLY. A review record bound",
+  "     to this op's current HEAD (`review-pr.sh <PR>`, or record one with the command below)",
+  "     satisfies this floor when the refused command is one of:",
+  "        git push origin <this-branch>          (NO flags — `-f`, `-d`, `-u`, `-o …` fall back)",
+  "        git push origin HEAD",
+  "        gh pr create …            (no -H/--head, and no --repo pointing at another repo)",
+  "     Any shell syntax closes that path — a pipe, `&&`, a quote, a redirect, `$VAR`, `cd … &&`,",
+  "     `git push -u origin $BR` — because a shell can change WHAT RUNS and the record is bound to",
+  "     BYTES. Run the push as its own bare command to use the record path; otherwise this floor",
+  "     needs a reviewer DISPATCH (the `task` / `subagent` tool) in THIS session.",
   // #2148: name the command the RAIL will demand, not just the missing action. A lane told only
   // "dispatch a reviewer" satisfies this gate and is then refused by the merge registry for lack of
   // an attestation — the second refusal needs a command, and this is the moment to hand it over.
   "   → A dispatch alone does not land the PR: the rail also needs the attestation at the FINAL head —",
   `      ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
-  // #2349: say WHAT THIS FLOOR READ. It counts dispatches in this process and reads
-  // no record, so "no review exists" and "the record is on another box" are the same
-  // sentence to it (the registry is per-machine). Without this, a lane whose reviewer
-  // ran in the parent (#825) or elsewhere reads the refusal as "the review is missing"
-  // and aborts with no correct next action.
-  "   → WHAT THIS GATE READ: the number of reviewer DISPATCHES counted in THIS pi process (still 0).",
-  "     It reads NO review record, so it cannot tell \"no review exists\" from \"a review exists but its",
-  "     record is not on this box\": the registry is PER-MACHINE (~/.pi/agent/reviews/<owner>-<repo>-<pr>.json),",
-  "     and a record minted on another box, or by a parent session, is invisible here. A record would not",
-  "     satisfy this floor in any case — the datum it needs is a dispatch IN THIS SESSION.",
+  // #2349: say WHAT THIS FLOOR READ. Before #2287 it read only a dispatch count and the text said
+  // so. #2287 gave it a head-bound-record path, which made that sentence FALSE — and left the
+  // message CONTRADICTING its own spawn-path paragraph four lines above (fresh review round 5, P1).
+  // The block below is only reached when no usable record was found, so "none" is a true statement
+  // at the moment it prints. The registry-is-per-machine disclosure survives from #2349 because it
+  // is still the reason a record can be invisible to THIS box.
+  "   → WHAT THIS GATE READ: a head-bound review record for THIS op — found: NONE (no record at this",
+  "     head for this repo on this box, or the command's shape closed that path — see above) — and the",
+  "     reviewer DISPATCHES counted in THIS pi process (still 0). The registry is PER-MACHINE",
+  "     (~/.pi/agent/reviews/<owner>-<repo>-<pr>.json), so a record minted on another box, or by a",
+  "     parent session, is invisible here: for a lane whose reviewer ran elsewhere, a dispatch is the",
+  "     only thing this floor can see. The datum it still needs is a dispatch IN THIS SESSION.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
@@ -3932,11 +5416,11 @@ export function auditCommand(command: string, limit = 2000): string {
 
 // ── #2349: the ≥1-dispatch floor says WHAT IT READ ─────────────────────────────
 //
-// The floor counts reviewer dispatches in THIS pi process and reads NO review
-// record. Its text said "no reviewers dispatched" and nothing else, so a lane whose
-// reviewer ran in the parent session (dispatch is parent-enforced, #825) or on
-// another box read it as "the review is missing" — a different fact, with a
-// different next action, which this line now distinguishes explicitly.
+// The floor counts reviewer dispatches in THIS pi process, and (since #2287) first tries a
+// head-bound `record-review.sh` registry record for the op. Its text said "no reviewers dispatched"
+// and nothing else, so a lane whose reviewer ran in the parent session (dispatch is
+// parent-enforced, #825) or on another box read it as "the review is missing" — a different fact,
+// with a different next action, which this line now distinguishes explicitly.
 //
 // `recordState` exists so the value lands in the durable audit row: the fleet can
 // then count how many refusals were "no record on this box" (the condition that was
@@ -3949,8 +5433,9 @@ export function describeDispatchFloorRead(
   const stateText = tier === "" ? "unlabeled" : tier;
   const lines = [
     `   → READ: reviewer dispatches counted in THIS pi process = ${dispatchCount}; tier=${stateText}.`,
-    "     This floor reads NO review record, so by itself it cannot distinguish \"no review exists\"",
-    "     from \"a review exists but its record is not on this box\" (the registry is PER-MACHINE).",
+    "     This floor ALSO tried a head-bound review record for this op and found NONE visible here,",
+    "     so \"no record at this head\" and \"a record exists on another box\" read the same at this",
+    "     point (the registry is PER-MACHINE).",
   ];
   // A command that reaches this floor names no PR BY CONSTRUCTION: every `gh pr merge`
   // and every `gh pr <verb> <n>` came back from the merge-registry branch above, which
@@ -3978,8 +5463,8 @@ export function describeDispatchFloorRead(
       : `     REGISTRY on this box: ${total} record(s) at ${dir}${repo ? `, ${forRepo} for ${repo}` : " (repo unresolved)"}.`
   );
   lines.push(
-    "     This command names no PR, so no single record can be attributed to it — the datum this gate" +
-      " needs is a reviewer dispatch in THIS session (or the parent's, for a sub-agent)."
+    "     This command names no PR, and its SHAPE decides whether a record could have been used at all" +
+      " — the datum this gate needs is a reviewer dispatch in THIS session (or the parent's, for a sub-agent)."
   );
   return { lines, recordState: `no-pr-named (registry=${total}${repo ? `, repo=${forRepo}` : ""})` };
 }
@@ -4003,13 +5488,55 @@ export const MICRO_BLOCK_MESSAGE = [
   "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
   // #2148: micro's record command, so the refusal at the git op also names what the rail will read.
   `   → Then record the attestation at the FINAL head (micro): ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
-  // #2349: same disclosure as the generic message — this floor counts DISPATCHES and
-  // reads no record, so it cannot distinguish "no review" from "not visible here".
-  "   → WHAT THIS GATE READ: the number of reviewer DISPATCHES counted in THIS pi process (still 0).",
-  "     It reads NO review record, so \"no review exists\" and \"a record exists on another box\" are the",
-  "     same sentence here (the registry is PER-MACHINE). What unlocks this floor is a dispatch NOW.",
+  // #2349: same disclosure as the generic message, corrected post-#2287: the floor DOES consult a
+  // head-bound record before it refuses, so "reads NO review record" was no longer true.
+  "   → WHAT THIS GATE READ: a head-bound review record for THIS op — found: NONE (no record at this",
+  "     head for this repo on this box, or the command carried shell syntax or a flag) — and the reviewer",
+  "     DISPATCHES counted in THIS pi process (still 0). The registry is PER-MACHINE, so a record on",
+  "     another box is invisible here. What unlocks this floor is a dispatch NOW.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
+
+/**
+ * #2665 — the CAPACITY refusal: a DISTINCT block message, not an extra sentence on the
+ * compliance one.
+ *
+ * The two states are different faults with different remedies, and printing the wrong one
+ * sends the lane to the wrong action:
+ *
+ *   compliance (`BLOCK_MESSAGE`)   the lane never dispatched → dispatch a reviewer NOW
+ *   capacity   (this message)      a spawn was ATTEMPTED and produced no verdict → retry on a
+ *                                  box that can serve it, and at the cap, stop and report
+ *
+ * ⛔ This is TIGHTER than the pre-#2665 floor, never looser: the attempt no longer counts as
+ * a review (it used to, which let an unreviewed push through — `shared/spawn-capacity.ts`
+ * carries the measured false PASS), and the requirement itself is untouched.
+ */
+export function unspawnableMessage(
+  attempts: readonly SpawnAttempt[],
+  /** The session's true attempt total — the ledger is a bounded RENDERING window. */
+  total: number = attempts.length,
+): string {
+  return [
+    "✅ Review enforcement gate is working correctly.",
+    // ⛔ The header DERIVES its class from the same switch the body uses (review of #2665): the
+    // previous hardcoded "CAPACITY fault" contradicted a body that said "SPAWN-SIDE refusal" in
+    // the same message, and mislabelled a breaker as capacity.
+    `⛔ Blocked — a \`task\`/\`subagent\` spawn produced NO verdict; 0 reviewer verdicts counted`,
+    `   (${spawnFaultLabel(spawnFaultClass(attempts))}, not a compliance one).`,
+    ...describeSpawnCapacity(attempts, readMachineCapacity(), total),
+    "   → THE REQUIREMENT IS UNCHANGED: a reviewer verdict is still mandatory before this git op",
+    `     (${SPAWN_UNSPAWNABLE_TOKEN} is what the BOX did, not a waiver). The rail will also demand`,
+    `     the attestation at the FINAL head — ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
+  ].join("\n");
+}
+
+/**
+ * How many attempt records the session keeps for rendering. Bounded so a re-dispatch loop
+ * on a starved box cannot grow this state without limit; the TOTAL is counted separately
+ * (`spawnAttemptsTotal`) so the refusal never understates how many were made.
+ */
+export const SPAWN_ATTEMPT_KEEP = 10;
 
 // #485: uniform ≥1-dispatch policy declaration — every tier blocks at 0
 // dispatches. Declarative: consumed by the drift-pin test (fence ↔ export
@@ -4033,6 +5560,12 @@ export default function (pi: ExtensionAPI) {
     // ── State ──────────────────────────────────────
     let extensionEnabled = true;
     let dispatchCount = 0;
+    // #2665 — the ATTEMPT ledger, deliberately separate from `dispatchCount`. A spawn that
+    // returned no verdict is not a dispatch (the floor's datum is a reviewer VERDICT), but it
+    // IS evidence about the BOX, and the floor's refusal must be able to name it instead of
+    // telling a lane that tried that it never dispatched at all.
+    let spawnAttempts: SpawnAttempt[] = [];
+    let spawnAttemptsTotal = 0;
     // #1662 review: run_ids whose terminal `task_collect` already counted as a
     // reviewer dispatch. `task_collect` is idempotent (the same terminal run
     // can be reaped repeatedly), so without this a repeated collect inflates
@@ -4051,6 +5584,8 @@ export default function (pi: ExtensionAPI) {
     // ── session_start ──────────────────────────────
     pi.on("session_start", async (_event, _ctx) => {
       dispatchCount = 0;
+      spawnAttempts = [];
+      spawnAttemptsTotal = 0;
       countedCollectRuns.clear();
       preflightInjected = false;
       earlyPushNoticePrinted = false;
@@ -4171,7 +5706,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     // ── tool_call: block git ops if no reviewers (uniform ≥1-dispatch, all tiers) ──
-    pi.on("tool_call", async (event, _ctx) => {
+    pi.on("tool_call", async (event, toolCtx) => {
       if (!isToolCallEventType("bash", event)) return undefined;
       // `rawCommand` is read BEFORE the `extensionEnabled` gate: the #2148 early notice below must
       // also reach a BYPASSED lane (that is the one which reaches the rail unstopped).
@@ -4238,14 +5773,38 @@ export default function (pi: ExtensionAPI) {
         ghShimAbsenceWarned = true;
         console.log(
           "[review-enforcer] ⚠️  #984 argv-level gh shim not found — only the string scanner " +
-            "is active, so bash token splicing can still hide an admin merge. " +
+            "is active, so bash token splicing can still hide an admin merge, and a heredoc body " +
+            "written to a script file and run by a LATER command is not followed by any text gate. " +
             "Set AGENT_GH_SHIM_DIR, or install scripts/gh-shim."
         );
       }
       const shimmed = withGhShim(rawCommand, shimDir);
       if (shimmed !== null) event.input.command = shimmed;
 
-      const command = rawCommand;
+      // #1382: THE GATE READS A DATA MODEL, NOT THE BYTES THE USER TYPED. A heredoc body is stdin
+      // DATA, not command lines: `cat >> evidence.md <<'EOF' … a log line that MENTIONS a merge …
+      // EOF` writes a file and runs nothing, and refusing it is an INSTRUMENT FALSE POSITIVE — the
+      // measured cost is an agent that cannot RECORD a defect it just found (this lane's own first
+      // tool call, and #1382 before it). INVARIANT: a gate that fires on prose teaches agents to
+      // write around it, which is how real bypasses hide.
+      //
+      // ⛔ UNCONDITIONAL, AND THAT IS THE POINT — masking is NOT a deferral. The first cut of this
+      // fix applied the mask only while the argv layer (#984) enforced, on #1485's rule that "a
+      // deferral is sound only while what it defers TO is installed". That rule is about standing a
+      // DECISION down for text the scanner cannot read (the `merges === 0 && readsNonMergeGhCall`
+      // path below, which stays shim-conditioned). Masking a body that `heredocBodyIsData` has
+      // PROVEN is data is not that: such a body is never executed by this command (a proven stdin
+      // consumer cannot run its stdin; a target it writes is refused when a later line can execute
+      // it; a shadowed reader, a pipe, a substitution or an assignment prefix leaves the body
+      // readable), so the mask cannot hide an invocation — it corrects a mis-read of one.
+      //
+      // THE CONDITION WAS WORSE THAN USELESS, it was the bug: this fleet runs with the argv layer
+      // ABSENT (`docs/ops/ACTIVATION-MATRIX.md` row 1 — nothing installs `scripts/gh-shim`, and the
+      // resolver returns null: measured on this cell), so tying the mask to it left the reported
+      // defect refusing the reporter — a harmless `cat >> notes.md <<'EOF'` — in the only
+      // environment where anybody hit it. Verified, not assumed: with the shim absent the
+      // shim-conditioned build still refuses that command verbatim.
+      const command = maskHeredocData(rawCommand);
       if (!isGitOp(command)) return undefined;
 
       // #930: the admin-merge evidence gate runs FIRST (before the merge
@@ -4348,7 +5907,7 @@ export default function (pi: ExtensionAPI) {
             logGateEvent("merge_gate_block", {
               pr: adminPr,
               reason: "admin_merge_no_evidence",
-              command: auditCommand(command), // #1492: the refused command, not just the reason
+              command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
             });
             return { block: true, reason: adminResult.reason };
           }
@@ -4432,15 +5991,30 @@ export default function (pi: ExtensionAPI) {
         // head block — never to an accept). The read is the SAME normalized
         // digest the record stores and the GitHub gate computes, so the two
         // gates cannot disagree about what "reviewed" means.
+        // #1351 — fetch the PR's LIVE diff digest only when it can change the
+        // verdict: a record that carries a usable `diff_sha256` AND a head that
+        // has actually moved. Nothing else reads it, so a matching head must not
+        // pay for the read (the head binding already allows), and a record
+        // without the field must not either (its absence falls through to the
+        // head block — never to an accept). The read is the SAME normalized
+        // digest the record stores and the GitHub gate computes, so the two
+        // gates cannot disagree about what "reviewed" means.
+        const diffReadAttempted =
+          !!record && isDiffSha256(record.diff_sha256) &&
+          currentHead !== null &&
+          record.head_sha !== currentHead;
         // #2349: the live digest read reports WHY it yielded nothing, for the refusal
         // text only (a failed READ is not a failed review). The DECISION still consumes
         // `currentDiffHash` and nothing else, through the same predicate as before.
-        const liveDiffRead = record && isDiffSha256(record.diff_sha256) &&
-          currentHead !== null &&
-          record.head_sha !== currentHead
-            ? getPrLiveDiffHashObserved(prNumber, ctx)
-            : { hash: null, reason: null };
+        const liveDiffRead = diffReadAttempted
+          ? getPrLiveDiffHashObserved(prNumber, ctx)
+          : { hash: null, reason: null };
         const currentDiffHash = liveDiffRead.hash;
+        // #1351: an ATTEMPTED read that came back null is a FAILED READ — never a
+        // changed diff. Without this the arm cannot tell "the content moved" from
+        // "the shared gh gate queued longer than the read bound", and its refusal
+        // told the lane to re-review in both cases (measured 2026-10-22).
+        const diffReadFailed = diffReadAttempted && currentDiffHash === null;
         // #2349: the registry observation, taken ONCE and passed to the gate as a
         // MESSAGE INPUT. `record` above is still what `readReviewRecord` returned —
         // the observation is never consulted for a decision.
@@ -4449,7 +6023,7 @@ export default function (pi: ExtensionAPI) {
         // sub-agents get the "parent must record the review" variant).
         const result = evaluateMergeGate(
           prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase, currentDiffHash,
-          recordObservation, liveDiffRead.reason
+          recordObservation, liveDiffRead.reason, diffReadFailed
         );
         if (result.status === "block") {
           // #2349: name the state in the line the operator reads, reusing the SAME
@@ -4480,6 +6054,35 @@ export default function (pi: ExtensionAPI) {
         return undefined;
       }
 
+      // #2287/#2148: a SPAWNED reviewer process is equivalent evidence to an
+      // in-session `task` dispatch. The artifact is `record-review.sh`'s registry
+      // record, bound to the EXACT head this op ships — the same file the merge
+      // registry gate reads as the attestation. No record ⇒ no reviewer verdict ⇒
+      // the floor below still refuses (the protection is unchanged).
+      if (!taskSubAgent && dispatchCount === 0) {
+        const op = resolveShippedHeads(command, toolCtx);
+        // `repo === null` means the op's repo could not be resolved - then a record CANNOT be
+        // bound to it (the #426 P0-2 rule the merge gate already applies: with no repo context
+        // only a repo-less legacy record may match, never one that embeds somebody's repo).
+        const evidence = op === null || op.repo === null
+          ? null
+          : headBoundReviewEvidence(op.heads[0], op.repo);
+        if (evidence !== null) {
+          console.log(
+            `[review-enforcer] ✅ Reviewer process evidenced — review record for ${evidence.repo ?? "<unresolved repo>"}#${evidence.pr} ` +
+              `bound to the pushed head ${evidence.head_sha.slice(0, 12)} (verdict: ${evidence.verdict}) — allowing git op`
+          );
+          logGateEvent("review_dispatch", {
+            dispatch_count: dispatchCount,
+            reason: "review_record_bound_head",
+            pr: evidence.pr,
+            head_sha: evidence.head_sha,
+            record: evidence.recordPath,
+          });
+          return undefined;
+        }
+      }
+
       // #485: uniform ≥1-dispatch block — every tier (micro, standard, complex,
       // unlabeled) blocks at 0 dispatches. The tier read survives ONLY for
       // message selection: micro skips the multi-agent code-review gate
@@ -4502,6 +6105,26 @@ export default function (pi: ExtensionAPI) {
       // blocked op — the docs-only micro class (#485) included — is
       // reconstructible. Pinned by index.test.ts T1 (micro) + T1b (others).
       if (tier === "micro") {
+        // #2665: CAPACITY first — the fault is upstream of the tier, so the micro remediation
+        // (which is about WHICH reviewer to dispatch) would misdirect here.
+        if (spawnAttemptsTotal > 0) {
+          const fault = spawnFaultClass(spawnAttempts).toUpperCase();
+          console.error(
+            `[review-enforcer] ⛔ Blocked — spawn produced NO verdict, 0 reviewer verdicts counted (${fault}: ${spawnAttemptsTotal} attempt(s))`
+          );
+          for (const line of describeSpawnCapacity(spawnAttempts, readMachineCapacity(), spawnAttemptsTotal))
+            console.log(line);
+          logGateEvent("gate_block", {
+            reason: "review_gate_unspawnable",
+            tier: "micro",
+            spawn_attempts: spawnAttemptsTotal,
+            spawn_outcomes: spawnAttempts.map((a) => a.outcome),
+            // #1382: audit the caller's command. `command` is the heredoc-masked READING the
+            // gates use, and masking blanks proven DATA — recording it would erase evidence.
+            command: auditCommand(rawCommand),
+          });
+          return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
+        }
         const floor = describeDispatchFloorRead(command, "micro", dispatchCount);
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
         for (const line of floor.lines) console.log(line);
@@ -4511,9 +6134,30 @@ export default function (pi: ExtensionAPI) {
           // #2349: WHAT the floor read about the registry, so the fleet can count
           // "no record on this box" refusals instead of hand-measuring them.
           record_state: floor.recordState,
-          command: auditCommand(command), // #1492: the refused command, not just the reason
+          // #1382: the audit row records the command the CALLER wrote. `command` is the
+          // heredoc-masked READING used by the gates; masking is never a rewrite of the record.
+          command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
         }); // #516: durable audit
         return { block: true, reason: MICRO_BLOCK_MESSAGE };
+      }
+
+      // #2665: the lane that TRIED and could not get a verdict is a different state from the
+      // lane that never dispatched. Same floor, different verdict — see `unspawnableMessage`.
+      if (spawnAttemptsTotal > 0) {
+        const fault = spawnFaultClass(spawnAttempts).toUpperCase();
+        console.error(
+          `[review-enforcer] ⛔ Blocked — spawn produced NO verdict, 0 reviewer verdicts counted (${fault}: ${spawnAttemptsTotal} attempt(s))`
+        );
+        for (const line of describeSpawnCapacity(spawnAttempts, readMachineCapacity(), spawnAttemptsTotal))
+          console.log(line);
+        logGateEvent("gate_block", {
+          reason: "review_gate_unspawnable",
+          tier: tier === "" ? "unlabeled" : tier,
+          spawn_attempts: spawnAttemptsTotal,
+          spawn_outcomes: spawnAttempts.map((a) => a.outcome),
+          command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
+        });
+        return { block: true, reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal) };
       }
 
       const floor = describeDispatchFloorRead(command, tier, dispatchCount);
@@ -4523,7 +6167,8 @@ export default function (pi: ExtensionAPI) {
         reason: "no_reviewers_dispatch",
         tier: tier === "" ? "unlabeled" : tier,
         record_state: floor.recordState, // #2349
-        command: auditCommand(command), // #1492: the refused command, not just the reason
+        // #1382: audit the caller's command, not the masked reading (see the micro arm above).
+        command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
       }); // #516: durable audit
       return { block: true, reason: BLOCK_MESSAGE };
     });
@@ -4563,7 +6208,6 @@ export default function (pi: ExtensionAPI) {
       if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
       if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
-      if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
       // #1662 review: `task_collect` is idempotent — every result carries the
       // `run_id` it reaped (`details: view`). Count each run's verdict once, so
       // re-collecting a finished lane cannot inflate the dispatch total (and
@@ -4576,6 +6220,72 @@ export default function (pi: ExtensionAPI) {
           countedCollectRuns.add(collectRunId);
         }
       }
+
+      // #2665: a spawn that produced NO VERDICT is an ATTEMPT, not a dispatch — classified BEFORE
+      // the background early-return, because a REFUSED background spawn (`status:"invalid-cwd"`
+      // with `background:true`, the #1662 shape) used to return as "no reviewers dispatched": the
+      // capacity-read-as-compliance mislabel this change exists to remove. Before the split, the
+      // counter below fired on ANY `task`/`subagent` result, so a retry-exhausted
+      // (`status:"failed"`), cut (`killed:true`) or pre-spawn-refused child satisfied the
+      // ≥1-dispatch floor and the lane's unreviewed `git push` was ALLOWED — a false PASS,
+      // measured (see `shared/spawn-capacity.ts`). The classification reads ONLY fields the
+      // producer set, and the evidence it read is carried into the audit row and the refusal.
+      const spawn = classifySpawnOutcome({
+        // A terminal `task_collect` result is a `TaskRunStatusView`: the CHILD's composed payload
+        // sits at `view.details`, and the run's own `status`/`reason` sit at the top level. Read
+        // BOTH (nested last, so the child's own `killed`/`exitCode` win), because classifying on
+        // the view alone re-opened the same fail-open one path over (review of #2665): the
+        // background status mapping reports a no-output `clean-empty` settle as `done`, so the
+        // view said "done" while the child's details carried `exitCode:0` with no output — and
+        // the FOREGROUND path already classifies that same shape as `cut`.
+        details: isTerminalCollect
+          ? {
+              ...(reviewDetails as Record<string, unknown>),
+              ...((typeof (reviewDetails as { details?: unknown })?.details === "object" &&
+              (reviewDetails as { details?: unknown }).details !== null
+                ? (reviewDetails as { details: Record<string, unknown> }).details
+                : {}) as Record<string, unknown>),
+            }
+          : (reviewDetails as Record<string, unknown> | undefined),
+        isError: (event as { isError?: unknown }).isError,
+      });
+      if (spawn.outcome !== "verdict") {
+        spawnAttemptsTotal++;
+        spawnAttempts.push({ tool: event.toolName, outcome: spawn.outcome, evidence: spawn.evidence });
+        // Bounded ledger WITH CLASS COVERAGE (review of #2665): dropping the oldest entry
+        // unconditionally let a breaker seen once age out of the window, after which a
+        // breaker-plus-failures ledger printed the CAPACITY "retry under less load" remedy. Drop
+        // the OLDEST entry whose class has a LATER duplicate, so every class that occurred
+        // survives the window. (A first-match drop was wrong in the not-found case: it evicted
+        // exactly the UNIQUE-class oldest the rule protects — measured [breaker, 11×failed].)
+        if (spawnAttempts.length > SPAWN_ATTEMPT_KEEP) {
+          let dropAt = -1;
+          for (let i = 0; i < spawnAttempts.length - 1; i++) {
+            const cls = attemptClass(spawnAttempts[i]);
+            if (spawnAttempts.slice(i + 1).some((a) => attemptClass(a) === cls)) {
+              dropAt = i;
+              break;
+            }
+          }
+          spawnAttempts.splice(dropAt >= 0 ? dropAt : 0, 1);
+        }
+        console.error(
+          `[review-enforcer] ⚠️ Sub-agent spawn produced NO verdict (${spawn.outcome}: ${spawn.evidence}) — ` +
+            `recorded as ATTEMPT ${spawnAttemptsTotal}, NOT counted as a dispatch (#2665)`
+        );
+        logGateEvent("review_spawn_no_verdict", {
+          tool: event.toolName,
+          outcome: spawn.outcome,
+          evidence: spawn.evidence,
+          spawn_attempts: spawnAttemptsTotal,
+          dispatch_count: dispatchCount,
+        });
+        return undefined;
+      }
+      // #1662: a `task({ background: true })` dispatch returns at DISPATCH — counting it would
+      // satisfy the ≥1-dispatch gate while the reviewer is still running. A verdict-less
+      // background result was classified ABOVE (as an attempt); this guards the COUNTING only.
+      if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
 
       dispatchCount++;
       console.log(

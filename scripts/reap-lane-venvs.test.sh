@@ -938,6 +938,96 @@ assert_contains "$out" "REAP dead-lane" "with the floor lifted the same env is r
 absent "$W_J/.venv" "so the KEEP above was the floor, not an inability to remove"
 
 echo
+echo "── K. the idle-shell rule: a shell at a prompt is not a live lane (#2721) ───────────"
+# WHY THIS SECTION EXISTS. The cwd/tmux-pane witnesses answer "is a process sitting here?" — and a
+# shell that `cd`'d in and never exited answers YES for ever, which is how #2721's wedged cell kept 59
+# checkouts (5-6 GB `du` each) while losing its disk. The rule under test is NARROW:
+#   live unless it is a SHELL whose start time is BEFORE the worktree's HEAD commit AND which has no
+#   child process.
+# Every arm below is REAL (a real bash, the real ps, the real /proc) because a shim can only prove the
+# matcher agrees with the shim. Both directions are asserted against the SAME fixture shape, so a gate
+# that simply stopped reading cwd would fail the control arm.
+RK="$(newrepo k)"
+W_K="$(mkwt "$RK" idle)"
+# An IDLE shell: `bash` blocked opening a fifo for read, no children, cwd inside the worktree. It is a
+# shell (is_shell_pid), it has no child (has_child), and it starts NOW — so the HEAD commit below is
+# what makes it "started before the last commit".
+mkfifo "$T/kfifo"
+( cd "$W_K" && exec bash -c 'read -r _x' < "$T/kfifo" ) 2>/dev/null &
+IDLE_SHELL_PID=$!
+sleep 1
+# HEAD AFTER the shell started: that is what "idle since before the worktree's last commit" means, and
+# the rule reads the COMMIT's own time — so the fixture stamps it in the future by a stated margin
+# rather than lie about the process start (only the kernel sets that).
+K_HEAD_TS=$(( $(date +%s) + 600 ))
+GIT_AUTHOR_DATE="@$K_HEAD_TS" GIT_COMMITTER_DATE="@$K_HEAD_TS" \
+  git -C "$W_K" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "committed after the shell sat down"
+idle_cwd="$(readlink "/proc/$IDLE_SHELL_PID/cwd" 2>/dev/null || true)"
+if [ "${idle_cwd:-}" = "$(canon "$W_K")" ]; then
+  echo " K1 the same fixture reads LIVE when the shell is DOING something (a child)"
+  # The control: a shell with a child is a lane doing work — the witness must still decide KEEP.
+  ( cd "$W_K" && exec bash -c 'while :; do sleep 3600; done' ) 2>/dev/null &
+  BUSY_PID=$!
+  sleep 1
+  out="$(run_real --worktree "$W_K" --apply)"
+  assert_contains "$out" "KEEP live-cwd" "a shell WITH a child is still a live holder (the control)"
+  exists "$W_K/.venv" "so its env survives"
+  # ⛔ KILL THE WHOLE HOLDER TREE, not just the shell (measured while writing this section): the busy
+  # shell's `sleep` child is REPARENTED when its parent dies, keeps `cwd=$W_K` by inheritance, and then
+  # the NEXT arm sees a NON-shell holder and reads LIVE — K2 would "fail" for a leftover, not for the
+  # rule. `pkill -P` cannot help after the parent is gone, so sweep every pid still cwd'd in the
+  # worktree except the idle shell this section deliberately keeps.
+  kill -9 "$BUSY_PID" 2>/dev/null; wait "$BUSY_PID" 2>/dev/null
+  for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    [ "$_p" = "$IDLE_SHELL_PID" ] && continue
+    [ "$(readlink "/proc/$_p/cwd" 2>/dev/null)" = "$(canon "$W_K")" ] && kill -9 "$_p" 2>/dev/null
+  done
+  sleep 1
+
+  echo " K2 an IDLE shell predating HEAD is DEMOTED — the env is reaped, and the demotion is NAMED"
+  # The demotion is recorded in the PASS LOG (it is emitted from inside the witness reader, i.e. a
+  # command substitution — a `say` there would be captured as the witness string). The log is where an
+  # operator reads why a holder stopped counting, so that is what this asserts on.
+  : > "$T/reap-real.log"
+  out="$(run_real --worktree "$W_K" --apply)"
+  logtxt="$(cat "$T/reap-real.log" 2>/dev/null)"
+  assert_contains "$logtxt" "stale-shell:" "the demotion is stated in the pass log, not silent"
+  assert_contains "$logtxt" "idle shell predating HEAD is not a live lane" "…and it says WHY, in the rule's own words"
+  assert_contains "$out" "REAP" "with the idle shell demoted the lane reads dead"
+  absent "$W_K/.venv" "the env is reclaimed"
+  exists "$W_K/f.txt" "the worktree's TRACKED content is untouched (only .venv was removed)"
+
+  echo " K3 the switch restores the strict reading (an operator can undo this without editing code)"
+  # Rebuild the env; the SAME idle shell is still sitting there.
+  mkvenv "$W_K"
+  out="$(REAP_VENV_IDLE_SHELL=0 run_real --worktree "$W_K" --apply)"
+  assert_contains "$out" "KEEP live-cwd" "with REAP_VENV_IDLE_SHELL=0 the idle shell counts as live again"
+  exists "$W_K/.venv" "and nothing is removed"
+
+  echo " K4 FAIL CLOSED: a shell that does NOT predate HEAD is not demoted"
+  # The other direction of the SAME rule, and it needs its own HEAD: the previous arms' HEAD is stamped
+  # in the FUTURE (that is how a fixture makes a holder predate it), so it would also "predate" a shell
+  # started now. So the idle shell is put away and HEAD is moved BACK behind the young shell — then the
+  # holder does NOT satisfy "predates HEAD" and must keep the env.
+  kill "$IDLE_SHELL_PID" 2>/dev/null; wait "$IDLE_SHELL_PID" 2>/dev/null
+  OLD_TS=$(( $(date +%s) - 600 ))
+  GIT_AUTHOR_DATE="@$OLD_TS" GIT_COMMITTER_DATE="@$OLD_TS" \
+    git -C "$W_K" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "committed before the shell sat down"
+  rm -rf "$W_K/.venv"; mkvenv "$W_K"
+  ( cd "$W_K" && exec bash -c 'read -r _x' < "$T/kfifo" ) 2>/dev/null &
+  YOUNG_PID=$!
+  sleep 1
+  out="$(run_real --worktree "$W_K" --apply)"
+  assert_contains "$out" "KEEP live-cwd" "a shell that started AFTER the last commit is still a live holder"
+  exists "$W_K/.venv" "so its env survives — the rule is 'predates HEAD', not 'is a shell'"
+  kill "$YOUNG_PID" 2>/dev/null; wait "$YOUNG_PID" 2>/dev/null
+else
+  echo "  ⏭ SKIP K1-K4: could not place a shell with its cwd inside the worktree (got '${idle_cwd:-<none>}')"
+  kill "$IDLE_SHELL_PID" 2>/dev/null; wait "$IDLE_SHELL_PID" 2>/dev/null
+fi
+rm -f "$T/kfifo"
+
+echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL PASS ($PASS assertions)"

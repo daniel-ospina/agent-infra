@@ -9,12 +9,13 @@
 # worker log exists and the load/swap gates bind on Linux — `worker-terminal.test.sh` §H drives
 # both platform shapes. (a) remains, and is what this supervisor is for.
 #
-# The lanes were never launchd's, and they are no longer tmux's either: both controllers spawn
-# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL on a cell and
-# uses tmux only on macOS (the launchd surface). A tmux window — or a `setsid` child of a
-# transient `cloud exec` — dies at ~21 log lines (measured on all three cells, 2026-10-20). Where
-# neither surface exists the launcher REFUSES loudly rather than falling back; there is no env
-# override, because a gate an agent can defeat with an export is not a gate.
+# The lanes were never launchd's, and they belong to neither launcher camp: both controllers spawn
+# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL wherever it answers
+# and otherwise uses tmux (the launchd Mac, and a cell whose guest CLI cannot run) **with an explicit
+# HOME + keys.env environment contract**. A tmux worker started without that contract is the measured
+# `~21 log lines` death (agent-infra#2210, reopened: the credential is HOME-bound, so a worker with the
+# wrong HOME has none). Where NO surface exists the launcher REFUSES loudly; there is no env override,
+# because a gate an agent can defeat with an export is not a gate.
 #
 # Runs ON THE CELL (Linux). Usage:
 #   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
@@ -25,7 +26,10 @@
 #           normally not needed by hand — it exists for a cell you want to fix without starting.
 #   prune   reclaim the regenerable disk the lanes leave behind and report the review scratch that
 #           accumulates under /tmp. --scratch[=DAYS] also deletes scratch checkouts older than DAYS.
-#           A full disk is what breaks a cell FIRST.
+#           A full disk is what breaks a cell FIRST. --exclude-root=PATH (repeatable, absolute) skips
+#           the per-worktree cache sweep at PATH — the seam the doctor's hygiene role uses to leave a
+#           worktree a LIVE process is sitting in alone while still reclaiming the idle ones
+#           (agent-infra#2573; the exclusion is reported by path, never applied silently).
 #           ⛔ A per-worktree `.venv` is NOT removed here any more (agent-infra#1932). This sweep used
 #           to `rm -rf` it at every worktree root, with no idea whether the lane using it was alive;
 #           the only guard on the unattended path was a tmux NAME regex (`^(lane|fix|merge)-`) that
@@ -48,8 +52,11 @@
 #   reap    one wedged-session pass, gated (namespace, log, two observations, human ancestry)
 #   merge   land PRs with a clean attestation at head, through `admin-merge.sh`, and record every
 #           refusal with its reason (never an override; never a blind retry at the same head)
-#   hygiene `uv cache prune`, worktree-root caches (only when no worker is live), stale worktrees
-#           via the shipped `pi-reap-worktrees.sh` (armed only under disk pressure by default)
+#   hygiene `uv cache prune`, the `cloud-cell-*` temp dirs (agent-infra#2573), idle docker
+#           images/volumes, worktree-root caches (a root a live process holds is EXCLUDED and named,
+#           never a reason to skip every root), stale worktrees via the shipped
+#           `pi-reap-worktrees.sh` (armed only under disk pressure by default). Every pass reports a
+#           `df` delta and never a `du` sum.
 #
 # The verbs run ONE pass and are idempotent; `start` runs the loop that schedules them. Both write
 # the same `$O/state/roles/<role>.state` records, so "configured" and "ran a pass at HH:MM:SSZ" are
@@ -180,10 +187,12 @@ SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$
 OR="${OR:-}"
 
 # ── the worker census (agent-infra#2210) ────────────────────────────────────────────────────────
-# ⛔ THE TMUX NAME MATCH IS DEAD ON A CELL. The harness spawns workers into cmux DURABLE TERMINALS
-# there (worker-terminal.sh's header records the measurement), so `tmux ls | grep -c '^lane-'` answers
-# 0 while lanes run — and this file used that answer to decide whether it may delete caches under a
-# live lane, and to report `lanes:` in `status`. Both read a confident 0 for a busy box.
+# ⛔ THE TMUX NAME MATCH IS DEAD WHERE THE CMUX DAEMON ANSWERS. There the harness spawns workers into
+# cmux DURABLE TERMINALS (worker-terminal.sh's header records the measurement), so
+# `tmux ls | grep -c '^lane-'` answers 0 while lanes run — and this file used that answer to decide
+# whether it may delete caches under a live lane, and to report `lanes:` in `status`. Both read a
+# confident 0 for a busy box. (tmux IS the launch surface where the daemon does NOT answer — on a
+# launchd Mac and on a cell alike, agent-infra#2210 — so the defect is the single surface, not tmux.)
 # The count comes from the launcher module's own census, and UNKNOWN (exit 3) is NOT zero: every
 # caller treats it as "workers may be live", which is the direction that cannot destroy a live lane.
 worker_census() { # stdout: the live worker count; exit 3 when no answer can be had
@@ -202,7 +211,12 @@ worker_census() { # stdout: the live worker count; exit 3 when no answer can be 
     # right after "a worker is live" inherited the memo and stood down with no worker running.
     WT_TABLE_TTL=0
     command -v wt_count >/dev/null 2>&1 || { printf 'census: %s defines no wt_count (a stale/empty copy?)\n' "$m" >&2; exit 3; }
-    _c="$(wt_count lane- fix- merge- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
+    # ⛔ `chain-` IS COUNTED HERE TOO (review finding on #2210's fix). `dispatch-merge.sh` spawns
+    # `chain-<N>` workers that live up to ~90 min, and the census filter in worker-terminal.sh counts
+    # them — but this list did not, so a chain-only box read "no workers" and `workers_maybe_live()`
+    # (which gates the destructive cache/disk sweep) stood DOWN to "safe to delete" under a live
+    # chain. The population this decision reads and the population the census reports must be one list.
+    _c="$(wt_count lane- fix- merge- chain- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
     case "${_c:-}" in ''|*[!0-9]*) printf 'census: wt_count printed [%s] (not a number)\n' "${_c:-}" >&2; exit 3 ;; esac
     printf '%s\n' "$_c" )
 }
@@ -293,6 +307,14 @@ keyfile_has_key() {
 
 # LOCK is recomputed AFTER $ENV_FILE is sourced (below): keys.env may set $O, and a lock derived
 # from a stale $O makes `stop` release and announce the wrong path.
+# ⛔ THE INVOKER'S HOME IS CAPTURED BEFORE THE RE-POINT (review P2, #2402). The USER unit directory is the
+# INSTALLER's `$HOME/.config/systemd/user` (the installer writes there), but everything below re-points
+# `HOME` to `$CELL_HOME`. With CELL_HOME != HOME (a `CELL_HOME=` line in keys.env, or an installer invoked
+# as `CELL_HOME=… bash install-controller-service.sh`) every verb looked in `$CELL_HOME/.config/systemd/user`
+# while the unit sat in the operator's own home: `status` printed `supervision: NONE` over an ENABLED unit
+# and `stop` never issued the `systemctl stop` — the "reported stopped, still running" shape, one layer in.
+# Writer and readers must agree on ONE directory, so the pre-re-point value is kept deliberately.
+CONTROLLER_INVOKER_HOME_IN="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"
 export HOME="$CELL_HOME"
 
 # Publish WORKER_ENV_NAMES into the tmux server's `update-environment`, APPENDING to whatever is
@@ -372,7 +394,77 @@ source_env_file() {
   [ "$probe" = "$ENV_SENTINEL" ] || die "$ENV_FILE did not finish sourcing — it contains a top-level 'exit'/'exec' (or a command that fails under its own 'set -e'), which would end this script and report success (rc=0) having done nothing. Remove it; put the work in a script, not in keys.env."
   set -a; . "$ENV_FILE"; set +a
 }
+# ⛔ ORCH_FOREGROUND DESCRIBES THE CALLER, NOT THE BOX (review P2, #2402). It decides whether `start`
+# `exec`s the loop in THIS process or delegates to the unit, so keys.env must not be able to set it: the
+# doctor pins ORCH_FOREGROUND=0 in its session string, and an `ORCH_FOREGROUND=1` line in keys.env would
+# then be re-applied here and reparent the controller into the DOCTOR's tmux pane instead of the unit's
+# cgroup (#2402's defect, one indirection out). Snapshotted BEFORE the source, put back AFTER it — the
+# same shape as the HOME re-assert below.
+ORCH_FOREGROUND_IN="${ORCH_FOREGROUND:-0}"
+# ⛔ AN AUTOMATED RESTART IS NOT AN OPERATOR'S START (review P1, #2402), and keys.env must not be able to
+# say otherwise — the same caller-describes-the-caller rule as ORCH_FOREGROUND above. The doctor's restart
+# arm sets it; `cmd_start` refuses to re-arm a unit the service manager reports NOT ACTIVE under it (see
+# the service branch), so a `keys.env` line carrying it would make every operator `start` inert over a
+# stopped or failed unit.
+ORCH_AUTOMATED_RESTART_IN="${ORCH_AUTOMATED_RESTART:-0}"
+# ⛔ THE BOUNDS THE INSTALLER VALIDATED MUST BE THE BOUNDS IN FORCE (review P1, #2402). The unit renders
+# `CONTROLLER_*_TIMEOUT` into the ENVIRONMENT precisely so the supervisor reads the values the installer
+# proved fit StartLimitBurst inside StartLimitIntervalSec. But `source_env_file` runs with `set -a`, so a
+# `CONTROLLER_ORPHAN_TIMEOUT=3600` line in keys.env silently replaced the validated 60 — and at 3600 the
+# burst can never fill (3 x (3600+15) >> 300 s), so the unit restarted forever and every surface read
+# supervised: exactly the pre-fix state the arithmetic exists to remove, with the artifact the operator
+# reads still printing 60. Only a value the CALLER/unit actually provided is re-asserted; an unset one
+# legitimately comes from the env file (tmux mode has no unit to provide it).
+CONTROLLER_ORPHAN_TIMEOUT_IN="${CONTROLLER_ORPHAN_TIMEOUT:-}"
+CONTROLLER_HANDOVER_TIMEOUT_IN="${CONTROLLER_HANDOVER_TIMEOUT:-}"
+# ⛔ AND THE UNIT NAME ITSELF IS THE FOURTH MEMBER OF THAT FAMILY (review P1 round 14, #2402). The template
+# renders `Environment=CONTROLLER_UNIT={{UNIT_NAME}}` so the name is ONE fact; but `source_env_file` runs with
+# `set -a`, so a `keys.env` line `CONTROLLER_UNIT=other.service` re-pointed `controller_unit_copies` at a unit
+# that does not exist. Measured consequence on this checkout: `stop` printed "released lock" with NOT ONE
+# `systemctl` call (the installed unit invisible), and `Restart=always` brought the controller back inside
+# RestartSec — the "reported stopped, still running" false pass this PR exists to remove; `start` read
+# `is-enabled other.service` → `not-found` → "a real DISABLED answer" → launched a TMUX controller beside the
+# ENABLED unit (#1761). Snapshotted before the source and put back after it, like its three siblings.
+CONTROLLER_UNIT_IN="${CONTROLLER_UNIT:-}"
+# ⛔ AND THE THREE THAT DECIDE WHERE THE UNIT IS LOOKED FOR, AND WITH WHAT (review P1 round 18, #2402).
+# `SYSTEMCTL` and the two unit DIRECTORIES are read AFTER `source_env_file` and were the last unfenced
+# siblings of the family above, so a `keys.env` line still reached the same measured pair of false passes:
+# `CONTROLLER_USER_UNIT_DIR=/nowhere` made the installed unit invisible (`status` → "nothing supervises
+# this cell"; `stop` → zero systemctl calls while `Restart=always` re-created the controller seconds
+# later), and `SYSTEMCTL=/bin/true` let `stop` print "controller stopped (systemd …)" and exit 0 without
+# issuing the verb. Snapshotted before the source, put back after it.
+SYSTEMCTL_IN="${SYSTEMCTL:-}"
+CONTROLLER_SYSTEM_UNIT_DIR_IN="${CONTROLLER_SYSTEM_UNIT_DIR:-}"
+CONTROLLER_USER_UNIT_DIR_IN="${CONTROLLER_USER_UNIT_DIR:-}"
+# ⛔ AND `PS_BIN` BELONGS TO THE FAMILY TOO (review P1 round 19, #2402 / B). It is read at CALL time by
+# `_proc_start_epoch`, and its answer (`_proc_began_after`) is what decides which pids `stop` may signal.
+# A pushed `PS_BIN` stub forges the age rule: a recycled pid that merely LOOKS like `<shell> <…/orch-loop.sh>`
+# is then classified as the lock owner and gets TERM/KILL — the peer-repo controller that rule exists to
+# protect. Absent a caller value the restored state is "unset" = the real `/bin/ps` default.
+PS_BIN_IN="${PS_BIN:-}"
 source_env_file
+ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
+ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
+[ -z "$CONTROLLER_ORPHAN_TIMEOUT_IN" ]   || CONTROLLER_ORPHAN_TIMEOUT="$CONTROLLER_ORPHAN_TIMEOUT_IN"
+[ -z "$CONTROLLER_HANDOVER_TIMEOUT_IN" ] || CONTROLLER_HANDOVER_TIMEOUT="$CONTROLLER_HANDOVER_TIMEOUT_IN"
+[ -z "$CONTROLLER_UNIT_IN" ]             || CONTROLLER_UNIT="$CONTROLLER_UNIT_IN"
+# ⛔ AND THE INVOKER'S HOME CARRIES THE SAME OVERRIDE FENCE AS THE FOUR ABOVE (review P2 round 17, #2402):
+# `set -a; . "$ENV_FILE"` would otherwise let a pushed `CONTROLLER_INVOKER_HOME=` re-point the USER unit
+# directory every reader uses — reproducing the exact "reported stopped, still running" defect the capture
+# exists to prevent, now reachable from keys.env instead of from the caller's shell.
+[ -z "$CONTROLLER_INVOKER_HOME_IN" ]     || CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"
+SYSTEMCTL="$SYSTEMCTL_IN"
+# ⛔ THESE TWO ARE RE-ASSERTED UNCONDITIONALLY, WHICH IS THE WHOLE POINT (review P1 round 19, #2402 / B).
+# The timeout siblings above use `[ -z "$_IN" ] ||` because an UNSET one legitimately comes from the env
+# file (tmux mode has no unit to provide it). A unit DIRECTORY has no such reading: its default is computed
+# downstream (`${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}`), so "unset" is the CORRECT restored
+# state, and the conditional form left the keys.env value in force — the fence was inert in production,
+# where the unit renders no such variable and every caller supplies nothing. Reproduced: a keys.env line
+# `CONTROLLER_SYSTEM_UNIT_DIR=/tmp/nowhere` hid the installed unit with 0 systemctl calls and `stop`
+# printing "not running", which is the exact false pass the fence was added to close.
+CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
+CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+PS_BIN="$PS_BIN_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -541,6 +633,328 @@ _pids_minus() { # <seen> <owned>
   comm -23 <(printf '%s\n' "$1" | awk 'NF' | sort -u) <(printf '%s\n' "$2" | awk 'NF' | sort -u)
 }
 _pids_join() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ *$//'; }
+
+# ── the controller SERVICE (agent-infra#2402) ───────────────────────────────────────────────────
+# A cell's controller used to live and die as a tmux session, with nothing above it: when the last
+# session closed the server exited and no surface restarted the controller, so an empty box lost its
+# dispatcher and read as a healthy idle cell (measured 2026-10-23 on cell-1).
+# `install-controller-service.sh` installs `eldato-orchestrator.service` (Restart=always) whose ExecStart
+# is `cloud-cell-supervisor.sh start` with ORCH_FOREGROUND=1 — so `start` `exec`s the loop in this very
+# process instead of creating a session, and systemd's cgroup owns the controller's lifetime.
+# ⛔ THESE HELPERS EXIST BECAUSE THE OTHER VERBS MUST COOPERATE WITH THAT, and both directions are
+# false-pass shapes if they do not: a `stop` that only kills the pid is undone by Restart=always within
+# RestartSec ("stopped" over a dispatcher that is back seconds later), and a `start` that launches a
+# tmux session beside an ENABLED unit is two dispatchers on one queue (#1761).
+CONTROLLER_UNIT="${CONTROLLER_UNIT:-eldato-orchestrator.service}"
+# The scopes the unit may live in, in the order install-controller-service.sh tries them (system first:
+# that is the cell's shape, because the cells have passwordless sudo and no queryable user manager).
+# A unit file's PRESENCE answers "is this box service-managed?"; whether it is ENABLED is a second
+# question, and only "enabled" means the manager will bring the controller back.
+# ⛔ A UNIT FILE'S PRESENCE IS NOT AN OWNERSHIP CLAIM (review P1, #2402), and this file refuses that
+# inference everywhere else — by the SYMBOL the rule lives in, not by a line number (a number here went
+# stale the moment this comment grew the file): `seen_controller_pids`'s "$HARNESS LEG IS NOT AN
+# OWNERSHIP CLAIM", `cmd_stop`'s "refusing to kill a session this state dir cannot prove it owns", and
+# `doctor_session_foreign` for the doctor session. The unit name
+# is MACHINE-scoped, so "the first copy found" can be another cell's — measured with two state dirs: B's
+# `stop` stopped A's unit, reported `controller stopped`, and B's `--status` called A's unit "installed but
+# NOT ACTIVE — nothing will restart a dead controller". The rendered unit CARRIES its owner
+# (`Environment=O=`), so ownership is a READ, not a guess.
+controller_unit_copies() { # every copy on the box, system then user
+  local d seen=" "
+  for d in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}"; do
+    [ -n "$d" ] && [ -f "$d/$CONTROLLER_UNIT" ] && printf '%s\n' "$d/$CONTROLLER_UNIT"
+  done
+  # ⛔ THE USER UNIT'S DIRECTORY HAS NO RECORDED OWNER, SO THE READ TRIES EVERY HONEST CANDIDATE (review P1
+  # round 18, #2402). `$HOME` at read time is the INVOKER's, and the invoker is deliberately NOT the
+  # installer: the doctor's session string forces `HOME=$CELL_HOME`, while the operator's standalone
+  # `install-controller-service.sh --install` wrote the unit under the OPERATOR's home. With
+  # `CELL_HOME != $HOME` — the shape this file's own round-16 note names — the doctor looked in
+  # `$CELL_HOME/.config/systemd/user`, found nothing, skipped the ENTIRE service branch (the NOT-ACTIVE
+  # fence included) and launched a tmux controller BESIDE the enabled unit: #1761's duplicate dispatcher,
+  # which is the invariant this PR exists to close. The passwd home is what `systemctl --user` itself
+  # resolves (the user manager takes HOME from the database, not from our environment), so it is the
+  # authoritative candidate; the invoker's HOME stays because the bring-up installs under it. Widening the
+  # SEARCH cannot make a foreign unit look ours — every copy is still ownership-checked by `unit_owner_dir`.
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    case "$seen" in *" $d "*) continue ;; esac
+    seen="$seen$d "
+    [ -f "$d/$CONTROLLER_UNIT" ] && printf '%s\n' "$d/$CONTROLLER_UNIT"
+  done < <(controller_user_unit_dirs)
+  return 0
+}
+# The home the passwd database names for a user — NEVER `$HOME`, which the caller re-points.
+passwd_home() {
+  [ -n "${1:-}" ] || return 0
+  getent passwd "$1" 2>/dev/null | cut -d: -f6
+}
+controller_user_unit_dirs() {
+  local h
+  [ -n "${CONTROLLER_USER_UNIT_DIR:-}" ] && printf '%s\n' "$CONTROLLER_USER_UNIT_DIR"
+  h="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  # ⛔ A MISSING `getent` MUST NOT FAIL SILENTLY (review P2 round 19, #2402 / B). The passwd home is the
+  # candidate the doctor's `HOME=$CELL_HOME` session depends on; without `getent` it would simply disappear
+  # from the list and re-open the duplicate-dispatcher defect with no diagnostic anywhere. stderr only —
+  # stdout is a list.
+  command -v getent >/dev/null 2>&1 \
+    || printf '%s\n' "cloud-cell-supervisor: getent not found — the passwd-home unit lookup is unavailable on this box, so a reader whose HOME is not the installer's may miss the unit" >&2
+  h="$(passwd_home "$(id -u)")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  h="$(passwd_home "${SUDO_USER:-}")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  return 0
+}
+# The state dir a rendered unit ACTUALLY supervises, and the one it CLAIMS.
+#
+# ⛔ OWNERSHIP IS TWO READS, AND A UNIT IS OURS IF EITHER SAYS SO (review P1 round 9, #2402). The unit
+# carries its owner TWICE — the `Environment=O=` it RENDERS (what `verify_unit` pins to the installing state
+# dir) and what it RESOLVES to (`ENV_FILE` re-sourced, and `keys.env` may repoint `O`) — and the two
+# legitimately differ in BOTH directions. Reading renders only classified this cell's OWN installed, enabled
+# unit as ANOTHER state dir's as soon as keys.env repointed `O`: `stop` fell through to the pid teardown (a
+# kill `Restart=always` undoes within RestartSec), printed "released lock" with no `systemctl stop` behind it
+# — the „reported stopped, still running" false pass this file exists to remove — while `status` printed
+# "nothing will restart it" over a supervised cell and `start` fell through to the tmux path beside an
+# enabled unit (#1761's duplicate). Reading RESOLUTIONS only does the mirror damage to the INSTALLER, whose
+# `$O` is the rendered value: `verify_unit` guarantees its own copies render it, so a `keys.env` `O=` line
+# made its own unit look foreign — a status that never asks the manager, and an uninstall that reports "not
+# installed" over an ENABLED unit. Either answer is the unit's own claim about itself, so ownership is the
+# UNION (see `unit_is_ours`); a unit that provably matches NEITHER is still foreign, so §L's negative
+# control and #1761's "never arm a second supervisor" both hold.
+#
+# `unit_owner_dir` answers the RESOLUTION: evaluate the unit's own env file the way the controller will
+# (`set -a; . file`), with the unit's own CELL_HOME/O in scope, and print the `O` that results. Only the
+# copy's own declared file is evaluated, and only in a throwaway subshell whose output is captured — the
+# same posture and the same completion guard `source_env_file` uses (a file with a top-level `exit` ends the
+# subshell silently, and an EMPTY answer here falls back to the rendered value rather than reading as "no
+# owner"). `env -u` is load-bearing: an inherited O/CELL_HOME must not shadow the unit's own.
+# Prints nothing when the unit carries neither a resolvable `Environment=O=` nor a readable env file, which
+# is a HAND-WRITTEN unit: unprovable either way, and treated as this state dir's (the pre-#2402 behaviour —
+# the fail-safe side for #1761 is "assume it may be ours, never launch a session beside it").
+#
+# ⛔ AND ROOT MUST NEVER EXECUTE AN OPERATOR-WRITABLE FILE (review P2 round 9, #2402). `keys.env` is the
+# operator's file and `sudo bash … stop`/`--status` is a documented invocation, so evaluating it AS ROOT lets
+# any account that can write that file execute with root's authority. As root the file is therefore
+# evaluated as the account that OWNS it (the account that could have written it, and the account the
+# controller runs as), via `runuser`; when that cannot be arranged — no `runuser`, or an owner that cannot be
+# read — it is NOT evaluated at all and the caller falls back to the RENDERED owner, which the unit carries
+# in cleartext. That fallback is lossless for ownership because ownership is the union above.
+unit_rendered_owner() { # <unit file> -> the owner the unit RENDERS; nothing when it carries no O= line
+  local v
+  [ -f "$1" ] || return 1
+  v="$(sed -n 's/^Environment=O=//p' "$1" 2>/dev/null | head -1)"
+  [ -n "${v:-}" ] || return 1
+  # A trailing slash is a spelling difference, not a different state dir.
+  printf '%s\n' "${v%/}"
+}
+env_file_owner_o() { # <envf> <unit_cell_home> <rendered_o> [<unit_home>] -> resolved O; nothing when not evaluated
+  local f="$1" home="$2" rendered="$3" unit_homeenv="${4:-}" owner="" runner=() out=""
+  [ -n "${f:-}" ] && [ -r "$f" ] || return 1
+  if [ "$(id -u)" = "0" ]; then
+    # ⛔ THE TEST IS "WHO CAN WRITE IT", NOT "WHO OWNS IT" (review P2 round 9, #2402). Ownership alone missed
+    # the shape `sudo tee`/`sudo cp` leaves behind: a `keys.env` OWNED by root and group- or other-WRITABLE
+    # (`-rw-rw-r-- root:staff`, umask 002 in a shared group) was used as its own "owner", ran as root, and
+    # executed with root's authority — the escalation this guard exists to close, one permission bit away.
+    # Two changes, both fail-closed: do not evaluate the file AT ALL when any account but its owner can write
+    # it, so the caller falls back to the RENDERED `O=` — cleartext in the unit, and lossless for ownership
+    # because ownership is the UNION; and derive the RUNNER FROM THE FILE (see below). Keep this body identical
+    # to the installer's.
+    local fmode fowner
+    fmode="$(stat -c %A -- "$f" 2>/dev/null)" || return 1
+    [ -n "${fmode:-}" ] || return 1
+    # Group/other WRITE on the file itself. (The directory is deliberately not tested: if another account
+    # can REPLACE the file, the replacement's owner is that account — which the runner rule below covers — so
+    # a directory test would only cause false refusals on shared-group cells without closing anything.)
+    case "${fmode:5:1}${fmode:8:1}" in *w*) return 1 ;; esac
+    # ⛔ THE RUNNER IS DERIVED FROM THE FILE, NEVER FROM THE CALLER (review P1 round 11, #2402). Preferring
+    # `SUDO_USER` ran the file as the INVOKING operator rather than as the account that can write it: a
+    # `keys.env` owned by account A, read through a documented `sudo bash … --status`, executed A's code with
+    # the SUDOER's authority — the same escalation this guard closes for the group-writable shape, one
+    # ownership bit away (the mode test only rejects group/other WRITE, so a `0644` file owned by another
+    # account passes it). The file's OWNER is the account that can write it, so that is who it runs as;
+    # `SUDO_USER` is only the non-root stand-in for the one case ownership cannot answer — the owner IS root,
+    # and root can write anything, so "owned by root" says nothing about who could have written it. No
+    # stand-in ⇒ do not evaluate at all (fall back to the rendered `O=`).
+    fowner="$(stat -c %U -- "$f" 2>/dev/null)" || return 1
+    [ -n "${fowner:-}" ] || return 1
+    if [ "$fowner" = "root" ]; then
+      owner="${SUDO_USER:-}"
+      [ -n "${owner:-}" ] || return 1
+      [ "$owner" != "root" ] || return 1
+    else
+      owner="$fowner"
+    fi
+    if [ "$owner" != "root" ]; then
+      command -v runuser >/dev/null 2>&1 || return 1
+      runner=(runuser -u "$owner" --)
+    fi
+  fi
+  # ⛔ THE UNIT'S OWN `HOME` IS PART OF THE EVALUATION (review P2, #2402). A `keys.env` may spell the state
+  # dir in terms of `$HOME` (`O=$HOME/orchestrator`), and the unit carries `Environment=HOME=` precisely
+  # because the controller resolves it that way. With HOME inherited from the CALLER, the same unit file
+  # resolved to the caller's home — measured: caller HOME=/tmp/cell-home -> /tmp/cell-home/orchestrator,
+  # caller HOME=/home/cellA -> /home/cellA/orchestrator — so cell B read cell A's unit as its OWN and
+  # `stop`/`--status`/`--uninstall` acted on another state dir's dispatcher. Set it from the unit, exactly
+  # like CELL_HOME/O above; an empty value means "the unit states no HOME", which keeps the caller's.
+  # ⛔ `-u HOME` MUST NOT BE ADDED (review P2 round 17, #2402): unsetting it made the documented fallback
+  # impossible — with no `Environment=HOME=` in the unit, `O=$HOME/o` resolved to `/o` (an empty-variable
+  # expansion), a path no cell has, and `unit_owner_dir` fed that to every "supervises <dir>" answer. The
+  # inherited value IS the caller's HOME, which is the documented fallback.
+  out="$(${runner[@]:+"${runner[@]}"} env -u O -u CELL_HOME -u ENV_FILE bash -c '
+      [ -z "$4" ] || HOME="$4"
+      CELL_HOME="$2"; O="$3"; ENV_FILE="$1"
+      set -a; . "$1" >/dev/null 2>&1
+      printf "%s" "${O:-}"
+    ' _ "$f" "${home:-}" "${rendered:-}" "${unit_homeenv:-}" 2>/dev/null || true)"
+  [ -n "${out:-}" ] || return 1
+  printf '%s\n' "$out"
+}
+unit_owner_dir() { # <unit file>
+  local f="$1" rendered_o envf unit_home unit_homeenv eff
+  [ -f "$f" ] || return 1
+  rendered_o="$(unit_rendered_owner "$f")" || rendered_o=""
+  envf="$(sed -n 's/^Environment=ENV_FILE=//p' "$f" 2>/dev/null | head -1)"
+  unit_home="$(sed -n 's/^Environment=CELL_HOME=//p' "$f" 2>/dev/null | head -1)"
+  # the HOME the unit itself runs with — see env_file_owner_o's note: `O=$HOME/...` must resolve against the
+  # INSTALLING cell's home, not the caller's.
+  unit_homeenv="$(sed -n 's/^Environment=HOME=//p' "$f" 2>/dev/null | head -1)"
+  eff=""
+  if [ -n "${envf:-}" ]; then
+    eff="$(env_file_owner_o "$envf" "${unit_home:-}" "${rendered_o:-}" "${unit_homeenv:-}")" || eff=""
+  fi
+  [ -n "${eff:-}" ] || eff="${rendered_o:-}"
+  [ -n "${eff:-}" ] || return 1
+  printf '%s\n' "${eff%/}"
+}
+# May this verb address <unit file>? YES for our own copy by EITHER read, and YES for an UNPROVABLE one (no
+# O= line and no readable env file — a hand-written or pre-#2402 unit), the fail-safe side of #1761. NO only
+# when BOTH reads name a DIFFERENT state dir, and then nothing here may disable, delete, or report on it.
+unit_is_ours() { # <unit file>
+  local own rendered
+  own="$(unit_owner_dir "$1")" || own=""
+  rendered="$(unit_rendered_owner "$1")" || rendered=""
+  [ -n "$own" ] || [ -n "$rendered" ] || return 0
+  [ "$own" = "${O%/}" ] && return 0
+  [ "$rendered" = "${O%/}" ]
+}
+# The copy the VERBS address, resolved once and remembered: `_UNIT_PATH` (empty = none of ours), plus the
+# FIRST copy that is NOT this state dir's (`_UNIT_FOREIGN`, provably another state dir) and the FIRST that
+# proves nothing (`_UNIT_UNPROVABLE`, no O= line). One report line each — a box carries at most one copy per
+# scope (system, user) — and the reports need them to be truthful.
+_UNIT_PATH=""; _UNIT_FOREIGN=""; _UNIT_UNPROVABLE=""
+controller_unit_path() {
+  local f own="" rendered="" first="" unp="" act="" en=""
+  _UNIT_PATH=""; _UNIT_FOREIGN=""; _UNIT_UNPROVABLE=""
+  while IFS= read -r f; do
+    own="$(unit_owner_dir "$f")" || own=""
+    rendered="$(unit_rendered_owner "$f")" || rendered=""
+    if [ -z "$own" ] && [ -z "$rendered" ]; then
+      [ -n "$unp" ] || unp="$f"
+      [ -n "$_UNIT_UNPROVABLE" ] || _UNIT_UNPROVABLE="$f"
+      continue
+    fi
+    if [ "$own" != "${O%/}" ] && [ "$rendered" != "${O%/}" ]; then
+      [ -n "$_UNIT_FOREIGN" ] || _UNIT_FOREIGN="$f"
+      continue
+    fi
+    [ -n "$first" ] || first="$f"
+    # ⛔ ADDRESS THE COPY THE MANAGER WILL BRING BACK (review P1, #2402). With two of OUR copies — the
+    # state the code's own note names, "an image-baked disabled system unit plus the live user unit" —
+    # addressing the first made every read answer "disabled", so `stop` took the pid-teardown shortcut,
+    # printed success, and the enabled unit's Restart=always re-created the controller within RestartSec.
+    _UNIT_PATH="$f"
+    # ⛔ AND `ACTIVE` OUTRANKS MERELY `ENABLED` (review P1, #2402). Returning on the first copy that is
+    # EITHER active OR enabled let an ENABLED-but-`failed` system copy (an image-baked unit that hit its
+    # StartLimit, or one whose supervisor already died — the measured #2402 shape) win over the LIVE user
+    # copy, because the copies are walked system-first. The verb then stopped the dead manager and left the
+    # running controller alone, and its "stopped" was only caught by a pid watch whose window is shorter
+    # than the surviving unit's own restart path. The copy that is RUNNING NOW is the one a stop must
+    # address; an enabled copy is only the fallback (it is what will come back when nothing is up).
+    # ⛔ THE ACTIVE TIER IS THE LITERAL WORD (review P2, #2402). `controller_unit_active_state` maps
+    # `activating` to 0, and `activating` is the auto-restart window of a unit whose controller just exited —
+    # so ranking on it let an auto-restarting copy outrank the copy that is actually RUNNING, which is the
+    # exact mis-resolution the tiering was added to fix, one state wider. `reloading`/`activating` fall to the
+    # ENABLED tier; `--status` keeps the three-word mapping, which it needs for its own verdict.
+    if [ -z "$act" ] && [ "$(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null)" = active ]; then act="$f"; continue; fi
+    if [ -z "$en" ] && controller_unit_state >/dev/null 2>&1; then en="$f"; fi
+  done < <(controller_unit_copies)
+  # ACTIVE, else ENABLED, else the first of ours (a unit that is neither is still the one installed here).
+  local chosen=""
+  if [ -n "$act" ]; then chosen="$act"; elif [ -n "$en" ]; then chosen="$en"; elif [ -n "$first" ]; then chosen="$first"; fi
+  if [ -n "$chosen" ]; then _UNIT_PATH="$chosen"; printf '%s\n' "$chosen"; return 0; fi
+  # ⛔ AN UNPROVABLE COPY IS ADDRESSED, NOT IGNORED (review P1, #2402). A hand-written unit with no
+  # `Environment=O=` line proves nothing either way, and the fail-safe side for #1761 is "assume it may be
+  # ours": treating it as foreign would launch a tmux controller beside the very unit that may be
+  # enabled and will start at boot — the duplicate this file refuses everywhere else. `_UNIT_UNPROVABLE`
+  # carries it so `status`/`stop` can say the ownership was NOT proven.
+  if [ -n "$unp" ]; then _UNIT_PATH="$unp"; printf '%s\n' "$unp"; return 0; fi
+  _UNIT_PATH=""
+  return 1
+}
+# The scope is decided by WHERE the unit lives, never by $EUID: the cell's unit is a SYSTEM unit owned by
+# the operator's sudo, while the controller runs as the operator. SYSTEMCTL is the test seam (a shim),
+# exactly as install-disk-reaper-timer.sh spells it.
+# ⛔ THE SCOPE FOLLOWS THE COPY THE VERB RESOLVED (review P1, #2402). Re-deriving it by "does a SYSTEM copy
+# exist" addressed the wrong manager whenever two copies existed: a disabled system copy made every read
+# answer for the system scope and the enabled USER unit was never asked — the wrong-unit stop above.
+sup_systemctl() { # <systemctl verb…>
+  local sc user_scope=0
+  if [ -n "${_UNIT_PATH:-}" ]; then
+    # Where the RESOLVED copy lives decides the manager, for ANY candidate user directory — not just the
+    # one this invocation would have guessed (see `controller_user_unit_dirs`).
+    [ "$(dirname "$_UNIT_PATH")" != "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" ] && user_scope=1
+  elif [ ! -f "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}/$CONTROLLER_UNIT" ]; then
+    user_scope=1
+  fi
+  # ⛔ THE SCOPE IS A WORD ON THE SHIM TOO (review P1, #2402). `SYSTEMCTL` replaces the whole command string,
+  # so dropping the scope with it made a scope-aware shim answer for the SYSTEM manager even when the copy the
+  # verb resolved lives in the USER one — the wrong-unit read/stop, hidden from every test whose stub keys on
+  # `--user`. Independent of whether the scope was resolved or inferred (the `elif` above).
+  if [ -n "${SYSTEMCTL:-}" ]; then
+    if [ "$user_scope" -eq 1 ]; then sc="$SYSTEMCTL --user"; else sc="$SYSTEMCTL"; fi
+  elif [ "$user_scope" -eq 1 ]; then sc="systemctl --user"
+  else sc="sudo -n systemctl"
+  fi
+  # shellcheck disable=SC2086  # deliberate word splitting: $sc may be "sudo -n systemctl"
+  $sc "$@"
+}
+# ⛔ THREE ANSWERS, NOT TWO (review P1, #2402). `is-enabled --quiet` collapses "DISABLED" and "CANNOT
+# READ" into one false value, and the start branch reads that value as "this box is not service-managed"
+# — so a `sudo -n systemctl` that fails (no NOPASSWD entry, a locked sudo, a transient failure) would
+# launch a tmux controller beside a unit that IS enabled and WILL start at boot: two dispatchers on one
+# queue, which is the #1761 duplicate this branch exists to prevent. Everywhere else in this file an
+# unreadable read is fatal, and here it must be too.
+#   0 = enabled (the manager brings it back) · 1 = a real disabled/masked/static answer · 3 = cannot read
+# The state WORDS are systemd's own (`man systemctl`: enabled, enabled-runtime, linked, linked-runtime,
+# alias, masked, masked-runtime, static, indirect, disabled, generated, transient), so a real answer is
+# never mistaken for an unreadable one; anything else printed, or nothing at all, is unreadable.
+controller_unit_state() {
+  local out
+  out="$(sup_systemctl is-enabled "$CONTROLLER_UNIT" 2>/dev/null)"
+  case "$out" in
+    # ⛔ THE WHOLE TABLE, not the words that came to mind (review P2). `not-found` and `bad` are DEFINITE
+    # answers ("this manager does not have a usable unit"), and folding them into "cannot read" made
+    # `start` refuse on a box that is simply not service-managed — the case a failed `daemon-reload`
+    # during install leaves behind (file on disk, manager has not loaded it). `alias` is exit 0 in
+    # systemd's table (the unit IS enabled through an alias); scoring it as "disabled" would start a tmux
+    # controller beside a boot-enabled unit, the #1761 duplicate. `generated`/`transient`/`indirect` are
+    # not enabled-by-unit-file, so they stay on the "not service-managed" side.
+    enabled|enabled-runtime|alias) return 0 ;;
+    disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|transient|not-found|bad) return 1 ;;
+  esac
+  return 3
+}
+# Active is the same question one layer in, and the same trap: `is-active --quiet` answers "no" for both
+# `inactive` and `cannot read`. The status row uses this to say which one it saw.
+controller_unit_active()  { sup_systemctl is-active --quiet "$CONTROLLER_UNIT" 2>/dev/null; }
+controller_unit_active_state() {
+  local out
+  out="$(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null)"
+  case "$out" in
+    active|reloading|activating) return 0 ;;
+    inactive|failed|deactivating|maintenance|unknown|not-found|bad) return 1 ;;
+  esac
+  return 3
+}
+
+
 # ── the QUEUE's repo and the CHECKOUT are ONE fact (agent-infra#1901) ────────────────────────────
 # MEASURED 2026-10-15 on `pi-cell-2`: harness pin `a4a1249794e7` standing in an AGENT-INFRA checkout
 # (`git -C $REPO remote get-url origin` → https://github.com/daniel-ospina/agent-infra.git) while the
@@ -1457,6 +1871,64 @@ cmd_check() {
   # uv is the ONE non-fatal dependency (its absence only stops a lane syncing its worktree venv),
   # and install.sh warns rather than dying for it — so the two surfaces agree.
   command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
+  # ── the RESOLVED LANE MODEL, and whether THIS box's catalog lists it (agent-infra#2208) ─────
+  # `spawn-gate.sh`'s and `merge-one.sh`'s `run_agent` default to `deepseek/deepseek-flash`
+  # (env-overridable). A box's model list is its OWN — `pi-bootstrap/cell-install.sh` deliberately
+  # does not manage `models.json` ("the cell's identity") — so a drifted cell can hand every lane an
+  # id its provider entry does not list, and pi answers that with
+  # `Warning: Model "…" not found … Using custom model id`: a lane that STARTS, spends tokens and
+  # degrades silently. The failure is silent, so a certification command is where it should be
+  # named.
+  #
+  # ⛔ THIS IS AN INSTRUMENT, NOT A GATE, AND THE DISTINCTION IS THE WHOLE DESIGN (review cycle 2).
+  # pi's resolution is a UNION — its built-in catalog, MERGED with the box's `models` array and with
+  # `modelOverrides` — so absence from the box's array does NOT prove the id fails to resolve.
+  # Measured: the shipped catalog lists `deepseek-v4-flash-vision-exp` only under `modelOverrides`,
+  # and it IS a pi built-in, so `PI_LANE_MODEL=` it resolves cleanly while a `die` here would have
+  # refused a healthy cell. A refusal set out of a question this file cannot answer is a false block.
+  # So: "listed" is reported as listed; anything else is reported as NOT VERIFIED, with the reason,
+  # and nothing refuses. (If it must become a gate, ask pi itself — `pi --list-models` — not this
+  # file's guess at pi's merge rules.)
+  #
+  # ⛔ AND THE PAIR MUST BE THE ONE THE SESSIONS WILL SEE (same review). `cmd_check` runs in the
+  # operator's shell, but the controller and doctor sessions are launched with an explicit env
+  # allow-list and re-source `$ENV_FILE` — they do NOT inherit ambient `PI_LANE_*`. So the pair is
+  # resolved the way a session resolves it (from `$ENV_FILE` when it carries one, defaults
+  # otherwise), and an ambient-only value is named as NOT reaching the lanes rather than reported as
+  # if it governed them.
+  local lane_provider lane_model models_json lane_state lane_chan
+  lane_provider="${PI_LANE_PROVIDER:-deepseek}"
+  lane_model="${PI_LANE_MODEL:-deepseek-flash}"
+  lane_chan="ambient shell (does NOT reach the tmux sessions — put it in $ENV_FILE)"
+  if [ -f "$ENV_FILE" ]; then
+    local lane_in_file
+    lane_in_file="$(env -u PI_LANE_PROVIDER -u PI_LANE_MODEL bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s\t%s" "${PI_LANE_PROVIDER:-}" "${PI_LANE_MODEL:-}"' _ "$ENV_FILE" 2>/dev/null || true)"
+    if [ -n "$lane_in_file" ]; then
+      lane_provider="${lane_in_file%%	*}"; lane_provider="${lane_provider:-deepseek}"
+      lane_model="${lane_in_file##*	}"; lane_model="${lane_model:-deepseek-flash}"
+      lane_chan="$ENV_FILE (re-sourced by the controller and doctor sessions)"
+    fi
+  fi
+  models_json="$CELL_HOME/.pi/agent/models.json"
+  if ! command -v jq >/dev/null 2>&1; then
+    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (jq missing, so $models_json cannot be read; channel: $lane_chan)"
+  elif [ ! -f "$models_json" ]; then
+    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (no $models_json on this box; channel: $lane_chan)"
+  else
+    lane_state="$(jq -r --arg p "$lane_provider" --arg m "$lane_model" '
+        (.providers[$p]) as $pv
+        | if $pv == null then "no-provider"
+          else
+            (($pv.models // {}) | (if type == "array" then ([.[] | .id]) else (keys) end)) as $ids
+            | (($pv.modelOverrides // {}) | keys) as $ovr
+            | if ($ids | index($m)) != null or ($ovr | index($m)) != null then "listed" else "absent" end
+          end' "$models_json" 2>/dev/null)" || lane_state="unreadable"
+    case "$lane_state" in
+      listed) say "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json; channel: $lane_chan)" ;;
+      absent) say "      lane model: $lane_provider/$lane_model — NOT RESOLVABLE FROM $models_json, and this id has no pi BUILT-IN: providers.$lane_provider there does not list it, and pi's built-in catalog carries only deepseek-v4-flash / deepseek-v4-flash-vision-exp / deepseek-v4-pro. pi MERGES the built-in catalog, so a PI_LANE_MODEL that IS built in still resolves from here — the SHIPPED DEFAULT ('deepseek-flash') is not, and on this box every harness lane would start on pi's 'Using custom model id' fallback: it runs, spends tokens, and degrades silently, which is the defect #2208 exists to remove. Remedy: add providers.$lane_provider.models.$lane_model to $models_json (pi-bootstrap/pi-config/models.json ships it, so a provisioned box is not affected — this fires on a box whose models.json was trimmed), or set PI_LANE_MODEL to a built-in id. Verify with the unfiltered: pi --list-models   [channel: $lane_chan]" ;;
+      *) say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (providers.$lane_provider unreadable/absent in $models_json; channel: $lane_chan)" ;;
+    esac
+  fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
@@ -1497,10 +1969,17 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
+  # calls it for the process pass. A $O without it still runs (the census falls back to the launch
+  # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
+  # terminals AND tmux sessions (launchd Mac or cell, #2210); `tmux ls` alone sees one of the two
+  # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
+  # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
+  # reports success.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
-  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
+  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
   # ── the gh-limit layer (#1988): present, AND able to run ──────────────────────────────────────
   # Presence alone is the false-green this file refuses everywhere else: a shim that cannot find the
   # real gh exits 127 on EVERY call, which would stop merges altogether. So resolve `gh` through the
@@ -1751,8 +2230,85 @@ cmd_start() {
     # enough, and the fence makes a double-kill safe.)
     end_loop_pid || say "warn: the doctor loop survived the abort and could not be ended"
     rm -f "$ROLES_DIR/.desired" "$ROLES_DIR/loop.pid" "$ROLES_DIR/loop.ident"
+    # ⛔ A UNIT THIS START STARTED IS NOT KILLED BY ANY OF THE ABOVE (review P1, #2402). The delegated start
+    # hands the controller to the service manager, so the teardown above ends nothing — and under
+    # `Restart=always` ANY kill would be undone within RestartSec anyway. The only way to leave nothing
+    # running, which is what this function promises, is to stop the unit. Best-effort: a failure is said
+    # out loud, because the operator's `stop` has already returned successfully.
+    if controller_unit_path >/dev/null 2>&1; then
+      sup_systemctl stop "$CONTROLLER_UNIT" >/dev/null 2>&1 \
+        || say "warn: a STOP arrived, but $CONTROLLER_UNIT could not be stopped — it may restart the controller within RestartSec (systemctl stop $CONTROLLER_UNIT)"
+    fi
     return 0
   }
+  # ── SERVICE MODE ADOPTS A RUNNING CONTROLLER (agent-infra#2402) ─────────────────────────────────
+  # ⛔ THIS IS THE MIGRATION PATH, NOT AN EDGE CASE: the box being upgraded is running a controller in
+  # a tmux session right now. Every "already running" branch below returns 0, and under
+  # `Restart=always` that is a start/exit/start loop — three immediate orderly exits inside the start
+  # window and systemd leaves the unit `failed`. The unit installed to catch an empty box is then
+  # `failed` exactly when the box empties, so the defect survives the fix (and now has a failed unit to
+  # explain). So the unit WAITS for the controller that is already running and takes over when it goes;
+  # the live controller keeps landing its PRs in the meantime.
+  # ⛔ IT WAITS ON THE SESSION TOO, NOT JUST ON A PID (review P2). The wait's first version broke as soon
+  # as `owned_controller_pids` went empty, so a lingering tmux session with no owned pid — the orphaning
+  # `cmd_stop` documents, where the pane's `bash … | tee` outlives the loop — fell through to the
+  # "already running" branches below and returned 0. Under `Restart=always` that is three orderly exits
+  # and a `failed` unit, i.e. the P1 this wait exists to remove, in the state the migration itself
+  # produces. The branch-level returns are therefore not reachable in service mode (they hand over).
+  # ⛔ TWO BOUNDS, BECAUSE THE TWO WAITS ARE NOT THE SAME WAIT (review P1, #2402). An earlier revision of
+  # this comment said the unit's `TimeoutStartSec` bounded this loop. It does not: for `Type=simple` the
+  # start job completes when the main process is forked (systemd.service(5)), so `ExecStart` was bounded
+  # only by the default below — a parks-forever start read `active (running)` for an hour. The bounds are
+  # the process's own now, and install-controller-service.sh renders BOTH into the unit's environment:
+  #   CONTROLLER_HANDOVER_TIMEOUT — an owned controller is still running. That is the MIGRATION path and it
+  #     is landing work, so the bound is long by default; the loop exists so the upgrade does not shoot it.
+  #   CONTROLLER_ORPHAN_TIMEOUT — nothing owns the loop, but the session outlived it. An orphan never exits,
+  #     so that start can NEVER succeed: the ceiling is short, and the installer refuses a value whose
+  #     attempts cannot fill StartLimitIntervalSec=300, so the unit converges to `failed` instead of
+  #     looking supervised forever.
+  foreground_handover() {
+    local _own _seen _saidd=0 _waited=0 _bound="${CONTROLLER_HANDOVER_TIMEOUT:-3600}"
+    local _orphan_bound="${CONTROLLER_ORPHAN_TIMEOUT:-60}"
+    while :; do
+      _own="$(owned_controller_pids 2>/dev/null)" \
+        || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+      if [ -z "$_own" ] && ! tmux has-session -t "$SESSION" 2>/dev/null; then break; fi
+      # ⛔ A SESSION THAT IS NOT OURS IS NOT A HANDOVER, IT IS A DUPLICATE (review P2, #2402). `$SESSION`
+      # names one machine-scoped session (`orch` by default), so a PEER repo's controller holds the same
+      # name — the #1856 shape this file refuses loudly everywhere else ("not provably this state dir's").
+      # Waiting on it parks the unit's ExecStart forever: start never returns, nothing reaches cmd_check or
+      # that refusal, and `--status` reads the unit as enabled+active with a live MainPID while the cell
+      # dispatches nothing. So: no owned controller + a SEE-able one that is not ours = die, as the
+      # non-service path does.
+      if [ -z "$_own" ]; then
+        _seen="$(seen_controller_pids 2>/dev/null)" || _seen=""
+        if [ -n "$_seen" ]; then
+          die "a controller runs from this machine's shared harness path (pid $(_pids_join "$_seen")) and is not provably this state dir's — refusing to wait for it (that would supervise nothing while reporting an active unit); stop it from the state dir that owns it, or give this repo its own SESSION in $ENV_FILE"
+        fi
+      fi
+      # ⛔ THE CEILING DEPENDS ON WHICH WAIT THIS IS. An owned pid is a controller doing its work — long
+      # bound. No owned pid but a session that is still there is an ORPHAN, and an orphan never exits: the
+      # short bound is what turns "impossible start" into a filled start limit instead of an active unit.
+      local _bound_now="$_bound" _who=""
+      [ -z "$_own" ] && _bound_now="$_orphan_bound"
+      # ⛔ ONE PHRASE, COMPOSED ONCE (review P3 round 9, #2402): `${_own:-word}` yields `_own`'s VALUE when it
+      # is non-empty, so the two halves below concatenated — "pid 15562491556249", a pid `ps -p` cannot
+      # resolve, handed to the operator inside the FATAL that tells them what to wait for.
+      if [ -n "$_own" ]; then _who="pid $(_pids_join "$_own")"; else _who="tmux session '$SESSION'"; fi
+      # ⛔ THE BOUND IS A CEILING ON THE WHOLE ATTEMPT, AND THE SLEEP IS 5 s GRANULAR (review P1 round 12,
+      # #2402). Testing BEFORE the sleep let a bound of T cost T+5 s of wall time, and the installer's
+      # start-limit arithmetic (`burst × (ceiling + RestartSec) < window`) assumed the ceiling was the cost:
+      # at the accepted maximum the burst could never fill, so `Restart=always` restarted for ever while
+      # `--status` read the unit supervised. Check the NEXT step, not the last one.
+      [ "$((_waited + 5))" -le "$_bound_now" ] || die "still waiting, ${_waited}s after this start began, for $_who — refusing to become a second dispatcher; ${_own:+raise CONTROLLER_HANDOVER_TIMEOUT if this box is genuinely draining a long merge}${_own:-nothing owns that session, so it will never exit: stop it from the state dir that owns it}"
+      [ "$_saidd" = 1 ] || say "controller already running ($_who) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)"
+      _saidd=1
+      sleep 5; _waited=$((_waited + 5))
+      superseded && return 1
+    done
+    return 0
+  }
+  if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then foreground_handover || return 1; fi
   # Every value below is interpolated into the session command string, so every one must be
   # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
   # are skipped (cmd_check reports an unresolvable HARNESS with its own message).
@@ -1787,27 +2343,59 @@ cmd_start() {
     seen0="$(seen_controller_pids)" \
       || die "cannot read the process table (ps) — refusing to answer 'already running' from an unreadable read"
     if [ -n "$down" ]; then
+      # ⛔ SERVICE MODE NEVER ANSWERS "ALREADY RUNNING" (see foreground_handover): an orderly exit is a
+      # start/exit loop under `Restart=always`, and the handover is what makes the unit converge instead.
+      # ⛔ AND IT MUST NOT FALL THROUGH TO THE `say` EITHER (review P2 round 11, #2402). `foreground_handover`
+      # returns 0 when the controller it waited for is GONE — so running the tail after it announced
+      # "already running (controller pid <the dead pid>)" and returned 0 WITHOUT launching anything: a
+      # documented `CELL READY` over a cell with no dispatcher, and under Restart=always another orderly
+      # exit. In service mode the handover IS the whole answer: the predecessor is gone, so execution falls
+      # through to the launch path below.
+      if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+        foreground_handover || return 1
+      else
       say "already running (controller pid $(_pids_join "$down")) — use: status | logs | stop"
       # agent-infra#1989: a live controller with no doctor is exactly the measured state (one loop on
       # the box). `start` is the idempotent launch verb, so it heals that half too rather than
       # answering "already running" about a cell that cannot reap or land.
-      start_doctor_loop
+      start_doctor_loop; local drc=$?
       # ⛔ ...and that heal is fenced like every other path in this function: a `stop` that lands while
       # `start_doctor_loop` runs must not be undone by the `.desired` marker / doctor session it just
       # created.
+      # ⛔ THE FENCE RUNS WHETHER THE HEAL SUCCEEDED OR NOT (#2306 review): `start_doctor_loop || return 1`
+      # ran BEFORE it, so a launch failure — and a `stop` that killed the last tmux session is exactly
+      # what makes `new-session` fail — returned with the `.desired` marker the failed heal had just
+      # written still on disk, i.e. it left the cell reading as STARTED after the operator's stop. The
+      # rc is carried past the fence, never used instead of it.
       superseded && return 1
+      [ "$drc" -eq 0 ] || return 1
       return 0
+      fi
     fi
     # Nothing of ours holds it. Either this repo's loop has not written its lock yet (the seconds
     # `start` spends in check/seed — report it, do not refuse), or the session belongs to ANOTHER
     # repo sharing this cell's harness path (then it is not evidence about $OR at all).
     if [ -z "$seen0" ]; then
+      # Same rule as above: in service mode the handover replaces the answer, because a session with no
+      # controller of ours is an ORPHAN the handover waits out (short bound) and then falls through to.
+      if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+        foreground_handover || return 1
+      else
       say "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
-      start_doctor_loop
+      start_doctor_loop; local drc=$?
       superseded && return 1
+      [ "$drc" -eq 0 ] || return 1
       return 0
+      fi
     fi
-    die "session '$SESSION' is held by a controller that is NOT provably this state dir's (pid $(_pids_join "$seen0"), no $LOCK owner, no $O/orch-loop.sh) — a session name is shared across repos, so it is not evidence that $OR is running; attach with: tmux attach -t $SESSION, or pin a distinct SESSION per repo in $ENV_FILE"
+    if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+      # The handover waits on the SESSION too, so a completed one means $seen0 is stale: re-read before
+      # deciding, and never die on the pid list the wait just outlived (review P2 round 12, #2402).
+      foreground_handover || return 1
+      seen0="$(seen_controller_pids)" \
+        || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+    fi
+    [ -z "$seen0" ] || die "session '$SESSION' is held by a controller that is NOT provably this state dir's (pid $(_pids_join "$seen0"), no $LOCK owner, no $O/orch-loop.sh) — a session name is shared across repos, so it is not evidence that $OR is running; attach with: tmux attach -t $SESSION, or pin a distinct SESSION per repo in $ENV_FILE"
   fi
   # A controller can be running OUTSIDE the session (a leftover harness copy, or one whose lock a
   # launcher removed). Refuse, naming it: a second controller either exits on the lock (leaving a
@@ -1818,13 +2406,27 @@ cmd_start() {
     || die "cannot read the process table (ps) — refusing to start on an unreadable read"
   own="$(owned_controller_pids)" \
     || die "cannot read the process table (ps) — refusing to start on an unreadable read"
-  if [ -n "$own" ]; then
+  # ⛔ A COMPLETED HANDOVER INVALIDATES THESE READS (review P2 round 12, #2402). They are taken BEFORE it,
+  # and the handover waits for exactly the controller they name — so falling through with them intact sent
+  # control into the `die` below ("a controller runs from this machine's shared harness path … refusing")
+  # on a controller that had just exited: a FATAL after a successful wait, burning a start against
+  # `StartLimitBurst`. In service mode the handover is the answer; the facts are re-read after it, and the
+  # non-foreground tail (which must still answer "already running") is fenced to the operator path.
+  if [ "${ORCH_FOREGROUND:-0}" = 1 ] && { [ -n "$own" ] || [ -n "$live" ]; }; then
+    foreground_handover || return 1
+    own="$(owned_controller_pids)" \
+      || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+    live="$(seen_controller_pids)" \
+      || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+  fi
+  if [ -n "$own" ] && [ "${ORCH_FOREGROUND:-0}" != 1 ]; then
     say "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
     # agent-infra#1989: heal the doctor half on THIS path too — it returns "already running" about a
     # live controller exactly like the session branch above, and a cell with a controller but no
     # doctor still cannot reap, land or prune. Fenced like every other path in this function.
-    start_doctor_loop
+    start_doctor_loop; local drc=$?
     superseded && return 1
+    [ "$drc" -eq 0 ] || return 1
     return 0
   fi
   if [ -n "$live" ]; then
@@ -1834,6 +2436,124 @@ cmd_start() {
     # exact state (#1856 review, reproduced). Starting here would put a second controller on one
     # queue, which is what #1761 forbids, so refuse and say exactly what is and is not known.
     die "a controller runs from this machine's shared harness path (pid $(_pids_join "$live")) and is not provably this state dir's — refusing to start a second controller; it is left alone. Give this repo its own SESSION in $ENV_FILE, or stop it from the state dir that owns it"
+  fi
+  # ── a box whose controller is a SERVICE is started BY the service manager (agent-infra#2402) ────
+  # Reaching this line means nothing of this cell's is running (every branch above returned or died), so
+  # an ENABLED unit means the controller is DOWN. Launching a tmux controller here would put a second
+  # dispatcher on this queue the moment the unit's `Restart=always` fires — the #1761 duplicate, produced
+  # by the fix for #2402. An INSTALLED-but-NOT-enabled unit deliberately falls through to the tmux path:
+  # "disabled" is an operator saying this box's controller is not service-managed.
+  # ⛔ NOT in the foreground: that IS the unit's own ExecStart, and delegating from there would ask the
+  # service manager to start the job this process is already running.
+  if [ "${ORCH_FOREGROUND:-0}" != 1 ] && controller_unit_path >/dev/null 2>&1; then
+    local ust
+    controller_unit_state; ust=$?
+    # ⛔ rc 3 must NOT read as "not service-managed": see controller_unit_state's note. Continuing would
+    # start a tmux controller beside a unit that may be enabled, and that unit starts itself at boot.
+    [ "$ust" -eq 3 ] && die "cannot read whether $CONTROLLER_UNIT is enabled — refusing to start a tmux controller beside a unit that may be enabled and start at boot (two dispatchers on one queue, #1761). Read it yourself: systemctl is-enabled $CONTROLLER_UNIT"
+    # rc 1 is a real DISABLED answer: the operator said this box's controller is not service-managed, so
+    # fall through to the tmux path below.
+    # ⛔ AND A DISABLED-BUT-STILL-RUNNING UNIT IS THE DECISION, NOT AN OVERSIGHT (review P2 round 10, #2402,
+    # NOT adopted). `systemctl disable` without `--now` keeps the loaded unit and its `Restart=always`, so a
+    # `start` landing inside that RestartSec window can put a tmux controller beside a unit the manager is
+    # about to bring back. A round-10 reviewer proposed deciding from the ACTIVE read instead. That reverses
+    # the rule this PR states twice and pins with arms — "disabled is an OPERATOR saying this box is not
+    # service-managed", so `start` uses tmux and never starts the unit — and a review round is not the place
+    # to reverse it: the reopen argument lives in #2607, with the measured window and the cost of both
+    # directions.
+    if [ "$ust" -eq 0 ]; then
+      # ⛔ A UNIT THAT HIT ITS START LIMIT IS FAILED BY DESIGN, AND `start` REFUSES IT (review P1, #2402).
+      # StartLimitBurst=3 is what turns a configuration fault into an operator-visible `failed`; systemd then
+      # refuses every later start until `reset-failed`. An operator who fixes the key/repo/pin and runs
+      # `start` is asking for exactly one more attempt, so the counter is cleared first — a no-op on a
+      # healthy unit, and the start plus the controller proof below still decide.
+      # ⛔ AN AUTOMATED RESTART MUST NOT RE-ARM WHAT THE SERVICE MANAGER HAS STOPPED OR FAILED (review P1,
+      # #2402). Every branch above establishes that no controller of this cell is RUNNING, which is NOT the
+      # same fact as "the cell should be running": after a deliberate `systemctl stop` (the stop the unit's
+      # own doc tells an operator to use) the marker `.desired` survives, so the doctor's next pass 120 s
+      # later reaches this line — and `reset-failed` + `start` both (a) undoes the operator's stop, so the
+      # manager reports `inactive` over a live dispatcher (the "reported stopped, still running" shape this
+      # PR removes), and (b) CLEARS the start-limit counter that is supposed to converge a configuration
+      # fault to `failed` — measured against a keyless cell, which retried forever with every surface
+      # reading supervised. A HUMAN running `$0 start` is asking for exactly one more attempt, so the fence
+      # is scoped to the automated caller and reported as its own outcome (rc 4), never as a failure.
+      if [ "${ORCH_AUTOMATED_RESTART:-0}" = 1 ]; then
+        local ast=0 _ast_word=""
+        _ast_word="$(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null || true)"
+        controller_unit_active_state || ast=$?
+        # ⛔ rc 3 IS CANNOT-READ, NOT "STOPPED" (review P1, #2402). `is-active` answers with an empty or
+        # unrecognised word when it could not ASK — an expired `sudo -n` timestamp, a user-scope manager with
+        # no DBus from inside the doctor's session, a transient — and folding that into the rc-4 outcome made
+        # the doctor record a CLEAN pass over a cell with no dispatcher, for ever: the #2402 false green this
+        # whole change removes, one layer in. It also contradicts the rule ~70 lines above, which treats the
+        # same unreadable answer to `is-enabled` as fatal. Only a READ answer of not-active skips the re-arm.
+        if [ "$ast" -eq 3 ]; then
+          die "cannot read whether $CONTROLLER_UNIT is active — refusing to re-arm it on a guess (systemctl is-active $CONTROLLER_UNIT)"
+        fi
+        # ⛔ `activating` IS THE RESTART WINDOW, NOT A RUNNING CONTROLLER (review P2 round 9, #2402).
+        # `controller_unit_active_state` maps `active|reloading|ACTIVATING` to 0, and `activating` is exactly
+        # what `Restart=always` reports inside its RestartSec — the state a configuration-faulting unit spends
+        # its life in. Scoring that as "running" let the fence fall through to the `reset-failed` below, which
+        # ALSO ZEROES the per-unit start rate limit, and the doctor runs this every DOCTOR_INTERVAL (120 s)
+        # against a 300 s window: two passes inside one window cleared the counter twice, so convergence to
+        # `failed` became probabilistic instead of guaranteed — the endless retry the arithmetic exists to
+        # stop. Only a literal `active`/`reloading` (a process that exists) takes the re-arm path.
+        if [ "$ast" -eq 1 ] || [ "$_ast_word" = "activating" ]; then
+          # ⛔ A FAILED UNIT IS NOT AN OPERATOR DECISION (review P1 round 11, #2402). This branch folded every
+          # not-active word — `inactive`, `deactivating`, `failed` — into rc 4, which the doctor records as a
+          # CLEAN pass. But `failed` is systemd's own throttle, not a human's decision: a `Restart=always` unit
+          # whose controller keeps exiting converges to `failed` in ~45 s (3 attempts at RestartSec=15) with
+          # `.desired` still present, and folding it into rc 4 made `doctor status` exit 0 over a STARTED cell
+          # with NO dispatcher — the false green this whole change removes, one layer in. The distinction the
+          # word already carries is now reported: rc 4 only for the states a manager stop leaves, and rc 5 for
+          # a unit that has given up, which the doctor scores as a NON-clean pass.
+          if [ "$_ast_word" = "failed" ]; then
+            say "REFUSING: $CONTROLLER_UNIT is FAILED — its start limit converged and this state dir has NO dispatcher. The service manager will not bring it back without a human: run '$0 start' to re-arm it."
+            return 5
+          fi
+          say "note: NOT re-arming $CONTROLLER_UNIT — the service manager owns this controller and reports it $(sup_systemctl is-active "$CONTROLLER_UNIT" 2>/dev/null || printf unknown): a deliberate stop is the operator's decision. Run '$0 start' to re-arm it."
+          return 4
+        fi
+      fi
+      # ⛔ AND AN AUTOMATED RESTART NEVER CLEARS THE COUNTER (review P2, #2402). The fence above only exits
+      # for `inactive`/`failed`, while an auto-restarting unit is `activating`/`active` for almost all of its
+      # life — so `reset-failed` ran on exactly the state whose burst is still filling, and a slow-failing
+      # configuration fault (each attempt costing CONTROLLER_ORPHAN_TIMEOUT) restarted forever with `--status`
+      # reading `supervised`: the pre-fix state the StartLimit block, the doc and the installer's arithmetic
+      # all assert is gone. A HUMAN running `$0 start` is asking for one more attempt and keeps the reset.
+      [ "${ORCH_AUTOMATED_RESTART:-0}" = 1 ] || sup_systemctl reset-failed "$CONTROLLER_UNIT" >/dev/null 2>&1 || true
+      sup_systemctl start "$CONTROLLER_UNIT" \
+        || die "could not start $CONTROLLER_UNIT — this box's controller is service-managed, so no tmux controller was launched (systemctl status $CONTROLLER_UNIT)"
+      # The same proof the tmux path gives: a PROCESS this state dir can see, within the start timeout.
+      # Reporting success on an is-active alone is the false green this file refuses elsewhere — a unit can
+      # be `active` while its controller died before it took the lock.
+      # ⛔ 600 s, NOT THE 60 s THE REST OF THIS FILE USES (review P2, #2402). The unit's ExecStart runs the
+      # WHOLE of `start` — harness_apply (a git fetch into a detached worktree) and cmd_check (network
+      # reads) — BEFORE the loop takes the lock, and cloud-cell-doctor.sh already defaults this same call
+      # to 600 s. At 60 s a healthy service-managed start was reported as FATAL while its controller came
+      # up a minute later, and the doctor recorded the restart as failed.
+      local waited=0
+      while [ "$waited" -lt "${CONTROLLER_SERVICE_START_TIMEOUT:-${CONTROLLER_START_TIMEOUT:-600}}" ]; do
+        if [ -n "$(owned_controller_pids 2>/dev/null)" ]; then break; fi
+        sleep 1; waited=$((waited + 1))
+      done
+      [ -n "$(owned_controller_pids 2>/dev/null)" ] \
+        || die "$CONTROLLER_UNIT is active but no controller of this state dir is running after ${waited}s — read: journalctl -u $CONTROLLER_UNIT -n 40"
+      say "controller started (systemd $CONTROLLER_UNIT, pid $(_pids_join "$(owned_controller_pids)")) — service-managed: use '$0 stop', not a session"
+      # ⛔ THE FENCE APPLIES TO THIS PATH TOO (#2402 review P2). Every other launch in this function
+      # re-checks the stop generation; without it a STOP that landed between the pid read above and the
+      # unit start is UNDONE — `stop` prints "controller stopped (systemd …)" and returns 0, and the
+      # controller comes up seconds later. That is the "reported stopped, still running" shape this verb
+      # exists to remove, on the one path that controls a unit.
+      superseded && return 1
+      return 0
+    fi
+  fi
+  # ⛔ A UNIT THAT IS ANOTHER STATE DIR'S IS NOT THIS CELL'S SUPERVISOR (review P1, #2402), so the tmux
+  # path below is the RIGHT answer — but silently ignoring it would hide the only unit on the box from the
+  # operator whose cell has just lost its controller. Say it, once, and start this cell normally.
+  if [ "${ORCH_FOREGROUND:-0}" != 1 ] && [ -z "${_UNIT_PATH:-}" ] && [ -n "$_UNIT_FOREIGN" ]; then
+    say "note: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — starting this cell's controller as a session; nothing on this box will restart IT (#2402). Install a unit for this state dir: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
   fi
   # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
   # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
@@ -1981,8 +2701,63 @@ cmd_start() {
   # worktree nobody reads and write a pin pointing at it — a re-pin that advances nothing while reporting
   # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
   # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
+  # ── SERVICE MODE: this process IS the controller (agent-infra#2402) ──────────────────────────────
+  # ⛔ THERE IS NO SECOND BOUNDARY HERE, SO THERE IS NO SECOND COPY OF THE ENVIRONMENT. The tmux command
+  # string just below exists because a session is served the SERVER's environment, not this shell's —
+  # which is why it re-sources $ENV_FILE and re-sets every value inside the session. In this process
+  # there is no server: `start` already sourced $ENV_FILE at load, cmd_check has just proved the merge
+  # key arrives, and these exports ARE the controller's environment. `exec` (not a child) is what makes
+  # the service manager's cgroup the owner of the controller — and the argv is the SAME
+  # `<bash> $HARNESS/orch-loop.sh` the tmux path runs, so every existing pid/ownership read still works.
+  if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
+    mkdir -p "$ROLES_DIR" 2>/dev/null && : > "$ROLES_DIR/.desired" 2>/dev/null || say "warn: could not record the desired running state at $ROLES_DIR/.desired"
+    export HOME="$CELL_HOME" CELL_HOME O REPO OR SCOPE ENV_FILE SESSION
+    export HARNESS_REPO HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_MATERIALISER="${SUP_SELF:-}"
+    # ⛔ AND THE GLOBAL REPO IS DROPPED ON THIS PATH TOO (review P1 round 18, #2402). The tmux path below
+    # unsets it inside its command string, and the doctor's string unsets its own copy — this branch had
+    # neither, so a `keys.env` carrying `GH_REPO=` (which `set -a; . "$ENV_FILE"` exports into THIS process)
+    # was inherited by the `exec`ed controller: every gh-driven rail on a service-managed cell then graded
+    # whatever repo keys.env named, printing `ALREADY MERGED` over zero work on the wrong repo (measured
+    # 2026-10-21, and the same class the rail's own #2235 fixes). `exec` REPLACES this process, so the unset
+    # has to happen before it — a later statement never runs. `unset` works whether or not the variable is
+    # exported, and the unit renders no `UnsetEnvironment=`.
+    unset GH_REPO
+    # ⛔ THE gh-limit LAYER IS PART OF THE ENVIRONMENT, NOT OF THE TMUX PATH (#1988). The session string
+    # below puts `$O/gh-limit` FIRST on PATH; in service mode there is no session string, so the same
+    # export has to happen HERE or the controller silently loses the gh wrapper — every gh call
+    # unserialised and unbacked-off, on the one box shape this unit creates. `start` has already seeded
+    # it (cmd_check refuses a cell whose layer cannot run), so this only ever prepends a real directory;
+    # the guard keeps a cell that legitimately ships no layer (the "NOT serialised" warning above) from
+    # gaining a PATH entry that does not exist.
+    [ -d "$O/gh-limit" ] && export PATH="$O/gh-limit:$PATH"
+    # ⛔ THE DOCTOR ROLE IS NOT OPTIONAL ON THIS PATH EITHER (#2402 review P1). The tmux path launches it a
+    # few lines below; `exec` REPLACES this process, so anything placed after it never runs. Without this
+    # call a service-managed cell dispatches but never reaps, lands, repairs or prunes — the "dispatches
+    # but cannot land" shape `start` refuses to report as started everywhere else. The fence is re-checked
+    # after it, for the same reason every other launch in this function re-checks it.
+    # ⛔ AND ITS FAILURE IS REFUSED HERE TOO (review P2, #2402). `exec` replaces this process, so a doctor
+    # that could not start is invisible a character later: the unit reads `active`, `--status` reports the
+    # cell supervised, and nothing reaps, lands, repairs or merges — the "dispatches but cannot land" state
+    # `start` refuses to report as started on every other launch path in this function (the tmux path two
+    # dozen lines below captures `drc` for exactly this reason). Returning non-zero also lets StartLimit
+    # converge to `failed` instead of hiding the fault behind a running-looking unit.
+    start_doctor_loop || return 1
+    superseded && return 1
+    say "controller: FOREGROUND — this process is the controller (pid $$); its lifetime belongs to the service manager"
+    exec bash "$HARNESS/orch-loop.sh"
+  fi
+  # ⛔ AND THE REPO A COMMAND ACTS ON IS PER-INVOCATION STATE, NEVER A GLOBAL EXPORT (measured
+  # 2026-10-21). A pushed `keys.env` on a cell carried `GH_REPO=daniel-ospina/tortoise`; `gh` honours
+  # `GH_REPO` as its default repo for EVERY command, so an agent-infra rail on that box graded the
+  # TORTOISE repo and printed `ALREADY MERGED` for a September tortoise PR — success over zero work, on
+  # the wrong repo, with nothing in the output saying so (the same class #2235 fixes in the rail itself).
+  # The session RE-SOURCES $ENV_FILE, so unsetting it out here would be undone a few characters later;
+  # the `unset` therefore lives INSIDE the command string, immediately after the source, and the same
+  # `unset` is in the doctor's string because that loop can restart the controller.
+  # ⛔ THE SESSION IS SERVED THE TMUX SERVER'S ENV, NOT THIS SHELL'S — so the `unset` cannot be done
+  # here and must be part of the string, exactly like every other value below.
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"
@@ -1993,8 +2768,9 @@ cmd_start() {
   # The SECOND role. `start` is not successful unless the repair/merge loop is also up: a cell that
   # dispatches but cannot land is the measured #1989 state, and a start that reported success over
   # it would be the same false green this file refuses everywhere else.
-  start_doctor_loop
+  start_doctor_loop; local drc=$?
   superseded && return 1
+  [ "$drc" -eq 0 ] || return 1
   return 0
 }
 
@@ -2038,6 +2814,30 @@ sup_pid_ident() {
   ps -p "$1" -o lstart= 2>/dev/null
 }
 
+# ⛔ THE EFFECT OF A UNIT STOP IS READ AFTER THE TEARDOWN, AND ON **BOTH** EXITS OF `stop` (#2402 review,
+# cycle 2). Reading it at the `systemctl stop` call cannot separate the two states that look identical
+# there: (a) the migration state — a unit installed but DISABLED, where the unit stop is a deliberate
+# no-op and the PID TEARDOWN stops the controller; and (b) the wrong-scope case — the stop landed on `
+# the other manager and the live unit's `Restart=always` brings a controller back. (a) must be a clean
+# stop (reading early failed it, and `harness-down` turned that into a refusal over a quiet box); (b) must
+# fail. Only a POST-teardown observation distinguishes them, and gating on the unit's own state cannot:
+# in (b) the ADDRESSED unit is equally disabled+inactive. The window is held OPEN for the manager —
+# breaking on the first empty read would let a controller whose RestartSec is 15 s return after this
+# function had printed success.
+# 0 = nothing of this state dir came back · 1 = a controller is alive after the teardown.
+unit_stop_effect_verdict() { # <unit>
+  [ -n "${1:-}" ] || return 0
+  local w=0 own
+  while [ "$w" -lt "${CONTROLLER_STOP_TIMEOUT:-20}" ]; do
+    [ -z "$(owned_controller_pids 2>/dev/null)" ] || break
+    sleep 1; w=$((w + 1))
+  done
+  own="$(owned_controller_pids)" \
+    || die "cannot read the process table (ps) — refusing to report a stop from an unreadable read"
+  [ -n "$own" ] || return 0
+  say "warn: $1 was stopped but a controller of this state dir (pid $(_pids_join "$own")) is STILL running ${w}s AFTER the teardown — either it is the OTHER scope's unit under Restart=always, or something restarted it; not reporting a stop"
+  return 1
+}
 cmd_stop() {
   local rc=0 lpid lident rpid rident i
   # FIRST: drop the desired-state marker, THEN bump the generation. Both orders matter:
@@ -2055,6 +2855,59 @@ cmd_stop() {
   # doctor, and the loop's own identity record proves it directly.
   rm -f "$ROLES_DIR/.desired" 2>/dev/null || { say "warn: could not remove $ROLES_DIR/.desired — an in-flight restart may re-arm this cell"; rc=1; }
   bump_stop_generation || { say "warn: could not record the stop generation in $O/$STOP_GEN_FILE_REL — an in-flight start may still complete and undo this stop"; rc=1; }
+  # ── a SERVICE-MANAGED controller is stopped by its service manager (agent-infra#2402) ─────────
+  # ⛔ THIS IS NOT AN OPTIMISATION. `Restart=always` re-creates the controller within RestartSec of ANY
+  # kill this function performs (the session kill, the pid TERM, the -9 sweep), so a stop that skips the
+  # unit returns success over a dispatcher that is back seconds later — the "reported stopped, still
+  # running" shape this whole verb exists to remove. Done BEFORE the pid logic so the reads below see the
+  # controller already gone instead of racing its restart; an INSTALLED-but-not-written-down unit is
+  # stopped anyway (stopping an inactive unit is a no-op), because the durable state must be "stopped"
+  # whatever the job was doing.
+  local stop_unit="" have_unit=0
+  controller_unit_path >/dev/null 2>&1 && have_unit=1
+  # ⛔ OWNERSHIP IS REPORTED WHETHER OR NOT A COPY WAS ADDRESSED (verification P1, #2402). The resolver
+  # ADDRESSES an unprovable copy (a hand-written unit with no `Environment=O=` line) instead of ignoring it,
+  # so the warnings below used to live in the `else` of the stop block — a branch an unprovable copy can
+  # never reach, because resolving it returns 0. They were therefore dead code, and `stop` quietly stopped a
+  # unit whose ownership it could not prove: the report has to sit beside the DECISION, not beside a
+  # non-zero rc.
+  if [ -n "$_UNIT_UNPROVABLE" ] && [ "${_UNIT_PATH:-}" = "$_UNIT_UNPROVABLE" ]; then
+    say "warn: $_UNIT_UNPROVABLE carries no Environment=O= line, so it cannot be proven to be this state dir's ($O) — it is addressed because treating it as foreign would launch a second dispatcher beside it (#1761); re-render it (install-controller-service.sh --install) so ownership is readable"
+  fi
+  # ⛔ A UNIT THAT IS ANOTHER STATE DIR'S IS NOT THIS CELL'S SUPERVISOR (review P1, #2402), so it is never
+  # stopped on this cell's behalf — but it is NAMED: before ownership was read, this verb stopped whatever
+  # copy the box happened to carry, so B's `stop` stopped A's unit and reported `controller stopped` for a
+  # controller it never touched.
+  if [ -n "$_UNIT_FOREIGN" ]; then
+    if [ "$have_unit" -eq 1 ]; then
+      say "note: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — left alone"
+    else
+      say "note: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)', NOT this one ($O) — it is not this cell's supervisor, so this stop leaves it alone; the pid teardown below is what stops this cell"
+    fi
+  fi
+  if [ "$have_unit" -eq 1 ]; then
+    if sup_systemctl stop "$CONTROLLER_UNIT" 2>/dev/null; then
+      stop_unit="$CONTROLLER_UNIT"
+      # ⛔ A SUCCESSFUL `stop` ON THE UNIT WE ADDRESSED IS NOT PROOF THE CONTROLLER IS GONE (review P3,
+      # #2402). The scope is the unit FILE this verb RESOLVED — a copy proven to be this state dir's, and
+      # the enabled/active one when two of ours exist (`controller_unit_path`) — which is not necessarily
+      # "the unit that is running": with two unit files on the box (an image-baked disabled system unit
+      # plus the live user unit) the stop can land on the wrong manager, the live unit's `Restart=always`
+      # brings the controller straight back, and the pid reads below can conclude before the new
+      # controller writes its lock — so this verb would print "controller stopped (systemd …)" over a live
+      # dispatcher. The EFFECT is therefore read — but AT THE END, AFTER THE TEARDOWN (see the note at the
+      # post-kill assertion), never here. Reading it here cannot work: in the state the migration doc
+      # calls normal (a unit installed but DISABLED, controller in tmux) the stop above is a deliberate
+      # NO-OP, so this read would sleep the whole window over a controller this function has not killed
+      # yet and fail a stop that then succeeds. Gating on the unit's own state does not separate the two
+      # cases either, because in the wrong-scope case the ADDRESSED unit is equally disabled+inactive.
+    else
+      say "warn: could not stop $CONTROLLER_UNIT — the service manager may restart the controller after this stop"; rc=1
+    fi
+  fi
+  if [ -n "$_UNIT_UNPROVABLE" ] && [ "${_UNIT_PATH:-}" != "$_UNIT_UNPROVABLE" ]; then
+    say "warn: a second copy, $_UNIT_UNPROVABLE, carries no Environment=O= line — its ownership is UNKNOWN, not proven; this verb addressed $_UNIT_PATH"
+  fi
   # ORDER: the desired-state marker is dropped first (with the generation bump, above — the two stop
   # signals), then the restart child, then the doctor loop, then its pid backstop, then the marker is
   # removed again defensively, and only then the controller. If the marker outlived the loop, a
@@ -2131,7 +2984,17 @@ cmd_stop() {
           rm -f "$LOCK" && say "released a stale lock $LOCK (its owner pid $lp is gone)"
         fi
       fi
-      say "not running"
+      # A stop that went through the SERVICE MANAGER says so: "not running" is true but reads as "there
+      # was nothing to stop", which is the opposite of what happened and hides the unit from the operator
+      # who is about to check that the box stays stopped.
+      # ⛔ AND THE UNIT'S EFFECT IS VERIFIED HERE TOO (this branch returns before the common tail): a
+      # clean "stopped (systemd …)" must not be printed over a controller that came back after the
+      # teardown — nor a failure over one that is genuinely gone.
+      if [ -n "$stop_unit" ]; then
+        unit_stop_effect_verdict "$stop_unit" || rc=1
+        [ "$rc" -eq 0 ] || return 1
+      fi
+      if [ -n "$stop_unit" ]; then say "controller stopped (systemd $stop_unit)"; else say "not running"; fi
       # A doctor-loop stop failure recorded above still fails the verb: "not running" is about the
       # CONTROLLER, and this branch used to return 0 over it.
       [ "$rc" -eq 0 ] || return 1
@@ -2182,6 +3045,12 @@ cmd_stop() {
   own="$(owned_controller_pids)" \
     || die "cannot read the process table (ps) — NOT releasing $LOCK on an unreadable read"
   [ -z "$own" ] || die "controller(s) still alive after stop (pid $(_pids_join "$own")) — NOT releasing $LOCK"
+  # ⛔ The unit's effect, read AFTER the teardown (see unit_stop_effect_verdict). A controller that
+  # reappeared here makes the verb fail, and the lock below is NOT released — its owner is alive, and a
+  # lock removed while its owner lives is #1761's duplicate.
+  if [ -n "$stop_unit" ]; then
+    unit_stop_effect_verdict "$stop_unit" || return 1
+  fi
   live="$(seen_controller_pids)" \
     || die "cannot read the process table (ps) — NOT releasing $LOCK on an unreadable read"
   foreign="$(_pids_minus "$live" "$own")"
@@ -2215,6 +3084,40 @@ cmd_status() {
     say "controller: STOPPED"
   fi
   [ -z "$foreign" ] || say "also seen:  pid $(_pids_join "$foreign") runs this machine's harness but does not hold $LOCK — another repo's controller; reported, never signalled"
+  # agent-infra#2402: is there anything ABOVE the controller that restarts it? A dead controller and an
+  # idle box print the same `controller: STOPPED` / `lanes: 0`, so "who would restart this" belongs in
+  # this output and not in an operator's memory. Reported, never refused: `status` must stay answerable
+  # on a box that has no service at all — that is exactly the box this line is for.
+  local _svc=""
+  # ⛔ A DIRECT CALL, NOT `_svc="$(controller_unit_path)"` (review P1, #2402): a command substitution
+  # runs in a SUBSHELL, so the resolved `_UNIT_PATH`/`_UNIT_FOREIGN`/`_UNIT_UNPROVABLE` would be lost in
+  # this shell — and `sup_systemctl` below derives its SCOPE from `_UNIT_PATH`. The row would then be
+  # read through the wrong manager and report the copy this verb did not resolve.
+  controller_unit_path >/dev/null 2>&1 && _svc="$_UNIT_PATH"
+  if [ -n "$_svc" ]; then
+    # ⛔ THE ROW NAMES WHICH ANSWER IT GOT (review P2, #2402). `is-active --quiet` says "no" for both
+    # `inactive` and "could not read", and printing "nothing will restart a dead controller" over an
+    # unreadable read is a false verdict about the one thing this row exists to be true about.
+    local _ast
+    controller_unit_active_state; _ast=$?
+    case "$_ast" in
+      0) say "supervision: $CONTROLLER_UNIT ACTIVE ($(basename "$(dirname "$_svc")") scope) — Restart=always; a dead controller comes back without a human" ;;
+      1) say "supervision: ⛔ $CONTROLLER_UNIT installed but NOT ACTIVE — nothing will restart a dead controller: systemctl start $CONTROLLER_UNIT" ;;
+      *) say "supervision: ⚠ $CONTROLLER_UNIT is installed but its STATE COULD NOT BE READ ($(sup_systemctl is-active "$CONTROLLER_UNIT" 2>&1 | head -1)) — whether anything restarts a dead controller is UNKNOWN, not 'no'" ;;
+    esac
+    # ⛔ AND THE ROW SAYS WHETHER OWNERSHIP WAS PROVEN (review P1, #2402): a unit of ANOTHER state dir's
+    # must never be reported as this cell's supervision, and a unit that declares no owner at all is
+    # UNKNOWN rather than either answer.
+    [ "${_UNIT_UNPROVABLE:-}" != "$_svc" ] || say "supervision: ⚠ ownership NOT proven — $_svc carries no Environment=O= line, so whether it supervises this state dir ($O) is UNKNOWN; the row above describes the copy this verb addressed"
+    [ -z "$_UNIT_FOREIGN" ] || say "supervision: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)' — NOT this one ($O)"
+  else
+    say "supervision: ⛔ NONE — the controller is a tmux session and nothing restarts it (#2402); install the service: bash $(dirname "$SUP_SELF")/install-controller-service.sh --install"
+    # ⛔ "NONE" IS A CLAIM ABOUT THIS STATE DIR, not about the box (review P1, #2402). A unit for another
+    # cell is not this cell's supervision, and printing only NONE left an operator with no way to see
+    # that the box DOES have a unit — pointed at a different state dir.
+    [ -z "$_UNIT_FOREIGN" ] || say "supervision: also installed: $_UNIT_FOREIGN supervises state dir '$(unit_owner_dir "$_UNIT_FOREIGN" 2>/dev/null)' — NOT this one ($O), so it will not restart this cell's controller"
+    [ -z "$_UNIT_UNPROVABLE" ] || say "supervision: ⚠ $_UNIT_UNPROVABLE carries no Environment=O= line — whether it supervises this state dir ($O) is UNKNOWN, not 'no'"
+  fi
   say "state dir: $O"
   # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
   # the checkout it is standing in, and the remote that fact was read from. Reported, never refused:
@@ -2340,8 +3243,11 @@ cmd_status() {
   fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
-  # ⛔ NOT `tmux ls | grep -c '^lane-'`: a cell's lanes are durable terminals now, so that answered 0
-  # for a busy box. An unreadable census prints UNKNOWN, never 0.
+  # ⛔ NOT `tmux ls | grep -c '^lane-'`: where the cmux daemon answers a cell's lanes are durable
+  # terminals, so that answered 0 for a busy box. (The `grep -c` form is SIGPIPE-safe — it consumes all
+  # input — but it is still the wrong SOURCE: where the launcher is tmux (#2210) it lists only that
+  # surface, and the census is the one read that is right on both.) An unreadable census prints
+  # UNKNOWN, never 0.
   say "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
@@ -2367,8 +3273,14 @@ cmd_logs() { tail -30 "$O/logs/orch-loop.log" 2>/dev/null || say "no log yet at 
 # usable on a cell that has not been started yet.
 doctor_path() {
   local c
+  # ⛔ THE PINNED HARNESS IS CONSULTED TOO (#2306). $O is the seed and stays first — it is what the
+  # provenance record describes — but a cell whose $O seed is incomplete while the harness it is
+  # actually running still ships the doctor must not be told the doctor "does not exist": the file was
+  # measured present in the pinned harness dir while this lookup answered not-found.
   for c in "$O/cloud-cell-doctor.sh" "$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh" \
-           "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh"; do
+           "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh" \
+           "${HARNESS:-}/scripts/orchestrator-harness/cloud-cell-doctor.sh" \
+           "${HARNESS_PIN_DIR:-}/scripts/orchestrator-harness/cloud-cell-doctor.sh"; do
     [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
   done
   return 1
@@ -2399,10 +3311,16 @@ run_role() {
 # marker is what tells the doctor that the cell is SUPPOSED to be up — without it a `stop` would be
 # undone by the next pass, and an operator's stop would never stick.
 start_doctor_loop() {
-  local d
+  local d _lrc=0 _launch_err _why _i
   mkdir -p "$ROLES_DIR" "$O/logs" || die "cannot create $ROLES_DIR"
   : > "$ROLES_DIR/.desired" || die "cannot record the desired running state at $ROLES_DIR/.desired"
-  d="$(doctor_path)" || die "cloud-cell-doctor.sh not found (looked in $O, then beside $SUP_SELF in orchestrator-harness/, then beside $SUP_SELF) — the cell cannot run its repair/merge roles"
+  # ⛔ AN ABSENT DOCTOR IS #2211's POPULATION AND KEEPS ITS RULING: a retired/absent doctor must not
+  # take the CONTROLLER down with it, so this is a NAMED warning and rc 0. A PRESENT doctor that fails
+  # to LAUNCH is a different fact entirely and must never be reported this way (#2306).
+  if ! d="$(doctor_path)"; then
+    say "warning: the doctor is not shipped (cloud-cell-doctor.sh absent — #2160 retired the forks, and no copy was found in $O, beside $SUP_SELF, or in the pinned harness) — the controller runs, but reaping/hygiene/merge is NOT automatic; read $O/logs/cell-doctor.log"
+    return 0
+  fi
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
     # ⛔ A DOCTOR SESSION NAME IS MACHINE-SCOPED (`cell-doctor` is the default for EVERY cell on a
     # box), so "a session with this name exists" is not evidence that it is OURS — the same hazard the
@@ -2444,18 +3362,70 @@ start_doctor_loop() {
   # controller's command string. `safe_argv` covers every value EXCEPT two, which are safe by other
   # means and are named here so this note is not an overclaim: MIN_FREE_MB is normalised to a base-10
   # integer above, and `$d` (the doctor path) is derived from the guarded `$O`/`$SUP_SELF`.
+  _launch_err="$O/logs/.cell-doctor-launch.$$"
+  : > "$_launch_err" 2>/dev/null || _launch_err=/dev/null
+  # ⛔ AND ORCH_FOREGROUND MUST NOT REACH THE DOCTOR (review P1, #2402). A tmux session is served from
+  # the SERVER's environment (this file documents that twice above), and on a service-managed cell the
+  # SERVER is first started by the unit's own `start`, which carries ORCH_FOREGROUND=1. Inherited here,
+  # the doctor's restart (`run_doctor` → `$SUPERVISOR start`) would take the FOREGROUND branch and `exec`
+  # the loop inside the doctor's tmux session — outside the unit's cgroup, with the start fence killing
+  # it at CONTROLLER_START_TIMEOUT. Pin it to 0 for the loop and everything it launches.
+  # ⛔ AND IT IS `export`ED, not merely assigned (review P2, #2402). A bare `ORCH_FOREGROUND=0` works only
+  # by two accidents: when the value came in EXPORTED (the case this pin exists for) bash keeps the export
+  # attribute, and when it did not, the child reads its own `:-0` default. Neither is the pin — the first
+  # re-arms the very inheritance the paragraph above says must not reach the doctor, the second is a no-op.
+  # An explicit export makes the guarantee the child actually needs.
+  _launch_err="$O/logs/.cell-doctor-launch.$$"
+  : > "$_launch_err" 2>/dev/null || _launch_err=/dev/null
   tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
-  sleep 2
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; export ORCH_FOREGROUND=0; unset GH_REPO; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'" \
+    2>"$_launch_err" || _lrc=$?
+  # ⛔ A FLAT `sleep 2` WAS A GUESS AT HOW LONG TMUX NEEDS, AND IT DISCARDED THE EVIDENCE (#2306):
+  # `new-session`'s rc and stderr were dropped, so the only signal left was "a session appeared", and
+  # its absence was blamed on a retired artifact. Poll the same wall time instead, and keep the file.
+  _i=0
+  while [ "$_i" -lt 20 ]; do
+    tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null && break
+    sleep 0.1
+    _i=$((_i + 1))
+  done
+  # ⛔ ONE OBSERVATION IS NOT "STARTED" (#2306 review): the old flat `sleep 2` gave a doctor that died
+  # on its first line time to disappear before the check, and the poll above breaks on the FIRST
+  # sighting — so an unrunnable seed would be reported started. Require the session to still be there
+  # after the launch settles: strictly stronger than before, and the same total wall time.
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
-    say "doctor loop started (tmux '$DOCTOR_SESSION')"
+    sleep 0.5
+    if ! tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
+      say "FATAL: the doctor session came up and then EXITED (tmux '$DOCTOR_SESSION', doctor $d) —" >&2
+      say "       no role is scheduling. Read $O/logs/cell-doctor.log${_why:+ (tmux said: ${_why% })}" >&2
+      [ "$_launch_err" = /dev/null ] || rm -f "$_launch_err"
+      return 1
+    fi
+    say "doctor loop started (tmux '$DOCTOR_SESSION', doctor $d)"
+    [ "$_launch_err" = /dev/null ] || rm -f "$_launch_err"
   else
-    # NOT fatal: cloud-cell-doctor.sh was retired (#2160) and is no longer shipped, so a
-    # missing doctor must not take the CONTROLLER down with it. Measured 2026-10-20: `start`
-    # reported FATAL one second after the controller began dispatching correctly, on every
-    # cell that used the shipped start path.
-    say "warning: the doctor loop is unavailable (cloud-cell-doctor.sh not shipped) — the controller runs, but reaping/hygiene is NOT automatic; read $O/logs/cell-doctor.log"
-    return 0
+    # ⛔ THE MESSAGE IS DECIDED BY THE FILE, NOT BY THE SESSION (#2306). This branch used to print
+    # "cloud-cell-doctor.sh not shipped" — comment and all — for ANY failed launch, including one
+    # where `doctor_path` had succeeded two lines above (it would have warned otherwise). Measured on
+    # pi-cell-4: the file was at $O/cloud-cell-doctor.sh the whole time, `tmux new-session` had printed
+    # "server exited unexpectedly" into a discarded stderr, and `start` returned 0 — so the operator
+    # was told a false cause for a real failure. A present doctor that will not launch is FATAL for
+    # this verb: the controller is up, but reap/merge/hygiene will never run.
+    _why="$(head -3 "$_launch_err" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')"
+    [ "$_launch_err" = /dev/null ] || rm -f "$_launch_err"
+    say "FATAL: the doctor loop did NOT start (tmux new-session rc=${_lrc:-0}${_why:+: ${_why% }})" >&2
+    if [ ! -s "$d" ]; then
+      # A file that exists but is EMPTY is neither absent nor a launch failure (#2306 review): it is a
+      # seed killed mid-write or a full disk, and the remedy is a re-seed, not a retry.
+      say "       $d is present but EMPTY — a copy killed mid-write or a full disk, which is worse than" >&2
+      say "       absent. Re-seed it: $0 apply" >&2
+      return 1
+    fi
+    say "       the doctor IS present at $d — this is a LAUNCH failure, NOT a retired artifact (#2160" >&2
+    say "       retired the forks; the doctor survived). The controller is up but reap/merge/hygiene" >&2
+    say "       are NOT automatic until a doctor loop runs. Read $O/logs/cell-doctor.log, then retry:" >&2
+    say "       $0 start   (replacing a stale session: tmux kill-session -t '=$DOCTOR_SESSION')" >&2
+    return 1
   fi
 }
 
@@ -2675,14 +3645,58 @@ registered_worktree() {
   return 1
 }
 
+# ⛔ THE CALLER'S PER-ROOT EXCLUSION (agent-infra#2573) — an EXCLUSION list, never an INCLUSION one.
+# The doctor's hygiene role can prove, PER WORKTREE ROOT, whether a live process is sitting in it
+# (the shipped `orchestrator-harness/live-ownership.sh` cwd census), so it excludes exactly the roots
+# a worker is in and lets the rest be swept. An INCLUSION list ("sweep only these") would silently
+# drop every root the caller did not enumerate — including $HARNESS_REPO's, which the doctor does not
+# even know about — so the sweep would lose coverage while still reporting success. Newline-separated
+# (a path can contain spaces), canonicalised at COMPARE time so a symlinked spelling cannot slip
+# past, and matched as a PATH PREFIX in ONE direction only (#2573 review, P1):
+#   * a held root is excluded EXACTLY, and
+#   * every ANCESTOR of it is excluded too — `sweep_root_caches` at an ancestor runs
+#     `find -maxdepth 5 -name __pycache__`, which reaches INTO the held worktree.
+# ⛔ The prefix must NOT run the other way. `case "$root" in "$cand"/*)` would make one held root
+# exclude every SIBLING under it — and on the fleet layout (`<repo>/.worktrees/<lane>`) a single live
+# lane holds `<repo>`, so ALL other lanes' roots would be skipped while the caller reported N roots
+# swept. That is the same self-disable shape #2573 exists to remove, one level down; measured
+# 2026-10-19 on the two-worktree fixture.
+EXCLUDE_ROOTS=""
+root_excluded() { # <root> -> 0 when the caller proved a LIVE process holds it
+  local root cand
+  [ -n "${EXCLUDE_ROOTS:-}" ] || return 1
+  root="$(cd "$1" 2>/dev/null && pwd -P)" || return 1   # unresolvable: nothing of ours to spare
+  [ "$root" != "/" ] || return 1
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    # A root that no longer exists cannot be held by anything: nothing to exclude (and nothing to
+    # sweep either — `sweep_root_caches` skips a missing root).
+    cand="$(cd "$cand" 2>/dev/null && pwd -P)" || continue
+    [ "$root" = "$cand" ] && return 0
+    # The held path protects itself and the roots whose sweep would recurse INTO it — never its
+    # siblings (see the header).
+    case "$cand" in "$root"/*) return 0 ;; esac
+  done <<< "$EXCLUDE_ROOTS"
+  return 1
+}
+
+exclude_root_add() { # <absolute path>
+  if [ -n "${EXCLUDE_ROOTS:-}" ]; then EXCLUDE_ROOTS="$EXCLUDE_ROOTS"$'\n'"$1"; else EXCLUDE_ROOTS="$1"; fi
+}
+
 cmd_prune() {
   local caches_only=0 do_scratch=0 days="$SCRATCH_DAYS" a
+  EXCLUDE_ROOTS=""
   for a in "$@"; do
     case "$a" in
       --caches) caches_only=1 ;;
+      --exclude-root=*) case "${a#*=}" in
+                          /*) exclude_root_add "${a#*=}" ;;
+                          *) die "prune: --exclude-root needs an ABSOLUTE path (got '${a#*=}'): a relative one would be resolved against whatever directory the caller happened to be in" ;;
+                        esac ;;
       --scratch) do_scratch=1 ;;
       --scratch=*) do_scratch=1; days="${a#*=}" ;;
-      *) die "usage: $0 prune [--caches] [--scratch[=DAYS]]" ;;
+      *) die "usage: $0 prune [--caches] [--exclude-root=PATH]… [--scratch[=DAYS]]" ;;
     esac
   done
   case "$days" in ''|*[!0-9]*) die "prune: DAYS must be a number (got '$days')";; esac
@@ -2772,9 +3786,22 @@ cmd_prune() {
     # `for root in "$(git … worktree list …)" "$r"` quoted the whole list into ONE word, so
     # `[ -d "$root" ]` skipped it and only the main checkout was ever swept: the incident's single
     # largest consumer was a 5.6G `.venv` in ONE LINKED worktree, which this loop could never reach.
-    while IFS= read -r root; do sweep_root_caches "$root"; done \
+    while IFS= read -r root; do
+      # ⛔ A HELD ROOT IS NAMED, NOT SILENTLY DROPPED. The caller excluded it because a live process
+      # has a cwd inside it; a skip nobody can see is the same defect as the clamp this replaces
+      # (the doctor declining to reclaim precisely when the box is busiest).
+      if root_excluded "$root"; then
+        say "prune: caches NOT swept at $root — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
+        continue
+      fi
+      sweep_root_caches "$root"
+    done \
       < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
-    sweep_root_caches "$r"
+    if root_excluded "$r"; then
+      say "prune: caches NOT swept at $r — a LIVE process holds it (excluded by the caller, agent-infra#2573)"
+    else
+      sweep_root_caches "$r"
+    fi
   done
   reap_global_caches
   [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }

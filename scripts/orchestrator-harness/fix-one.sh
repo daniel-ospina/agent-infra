@@ -52,6 +52,16 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # under the pre-export PATH pins _NCPU=4 / MAX_LOAD=40 for every cell (the #1702 failure).
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[fix $PR] FATAL: $SELF/spawn-gate.sh missing — refusing to run an ungated fixer" >&2; exit 78; }
+# ── the RESEARCH contract is part of the fixer's brief too (#2258) ──────────────────────────────────
+# A fixer acts on a reviewer's findings, and the measured duplicate-PR incident (#2247 vs #2250) was
+# two lanes fixing the same three things from two briefs that never forced either to look first. The
+# block is the ONE canonical text (`brief-gate.sh --section fixer`), and the brief is CHECKED after it
+# is written — a heredoc regression refuses here (78) instead of dispatching a fixer nobody asked to
+# look first. Same shape as lane.sh's reviewer section (#2148).
+brief_gate_sh="$(brief_gate_lib)" || {
+  echo "[fix $PR] FATAL: brief-gate.sh not found — refusing to run a fixer whose brief nothing validated (#2258)" >&2; exit 78; }
+FIX_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section fixer)" || {
+  echo "[fix $PR] FATAL: brief-gate.sh --section failed — refusing to run a fixer whose brief omits the research contract (#2258)" >&2; exit 78; }
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless fixer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
@@ -79,6 +89,287 @@ echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
 # PR/head. Same key and lease shape as merge-one.sh's — the claim is on the PR's CURRENT head, so a
 # fixer and a reviewer never race each other for the same content version.
 HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+# ── CI BACK-PRESSURE: the lane that PUSHES reads the CI queue first ──────────────
+# A fixer's product is a NEW HEAD, and a new head is a full CI pass plus (because the review
+# attestation is SHA-bound) the destruction of the artifact this lane's review chain just produced.
+# Measured 2026-10-22: tortoise queued=92 running=6 on 5 runners, agent-infra queued=97 running=7 —
+# a push into that finishes nothing. So the read happens HERE, in the lane's own path, before the
+# cross-box claim: a deferred fixer must not hold a claim it is not going to use.
+# ⛔ THE CONTROLLER GATES THIS TOO (orch-loop.sh defers the spawn), AND THAT IS DELIBERATE
+# belt-and-braces rather than duplication: `fix-one.sh` is also reached directly and by
+# `adopt-fix.sh`, so a gate that lived only in the controller would leave those paths pushing into
+# a stampede. Both read the same module, so they cannot disagree about the queue.
+# ⛔ AND THE DEFERRAL IS NOT STICKY: it writes the SAME bail marker the cross-box refusal writes,
+# which orch-loop.sh refunds, so the PR loses no attempt and is re-decided from a FRESH read on the
+# next dispatch. Nothing is dropped; nothing remembers that the queue was deep.
+# ⛔ THE ALLOW IS NOT RE-READ BEFORE THIS LANE'S OWN PUSH (#2333 review, P3). The reading above happens
+# once, at LANE START; the agent runs for up to `FIX_TIMEOUT` (default 2400 s) and pushes in its own
+# shell at the end of that window, so a lane can be allowed on a shallow queue and push into a deep
+# one - a window 2.7x `CIQ_STALE_MAX`, which no cache bound in the module describes. Disclosed rather
+# than closed here (residual (ii) in ci-queue.sh's header): a second reading at the push site has to
+# answer what a refusal would do to work that is already done.
+if [ -f "$SELF/ci-queue.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$SELF/ci-queue.sh"
+  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count ciq_ceiling ciq_defer_line ciq_horizon_min ciq_job_p90_min >/dev/null 2>&1; then
+    if ! ciq_ci_allowed "$OR"; then
+      # `ciq_defer_note_here` evaluates the record the predicate JUST made in this shell — a second
+      # read could disagree with the decision and (before #2333's review) print no line at all.
+      ciq_defer_note_here "fixer #$PR (a push to $BR would invalidate head ${HEAD:-?})" >> "$L.log"
+      # ⛔ THE BAIL MARKER IS WHAT MAKES "no attempt consumed" TRUE. Two ways it used to be false
+      # (#2333 review P2): (a) a MANUAL run wrote it too, and `refund_bailed_fixer` consumes it to
+      # decrement a `fixcount` the manual run never incremented — this file's own invariant at the
+      # top says a manual run must not decrement a counter it never incremented; and (b) when
+      # `gh pr view` failed, HEAD was empty, NO marker was written, and the refund could not match
+      # anyway (`refund_bailed_fixer` returns on an empty head) — so the deferral DID consume an
+      # attempt while the log claimed it did not. Both are now said out loud instead of implied.
+      if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then
+        : > "$O/state/fixbail-$PR-$HEAD"
+        echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed, attempt refundable (bail marker written for head $HEAD)" >> "$L.log"
+      elif [ "${CTRL:-0}" = "1" ]; then
+        echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed, but the head could NOT be read so no bail marker could be written — the controller cannot refund this attempt (it is re-decided next cycle)" >> "$L.log"
+      else
+        echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed; manual run, so no attempt was booked and none is refunded" >> "$L.log"
+      fi
+      exit 0
+    fi
+    echo "[fix $PR] ci-queue ok: queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} ceiling=${CIQ_CEILING:-?} state=${CIQ_STATE:-?} age=${CIQ_AGE:-?}s — pushing is worth it" >> "$L.log"
+  else
+    # ⛔ A MODULE THAT IS PRESENT BUT INCOMPLETE IS SAID OUT LOUD (#2333 cycle 7, P2). Without this
+    # arm the guard's `else` was silent on the ONE surface whose product is a pushed head, while the
+    # other two callers announce the same state (dispatch-merge.sh, orch-loop.sh) — the "silence in
+    # one of three callers is how a gate rots into a decoration" rule this module's own header states.
+    # Keep the name list below byte-identical to the `declare -f` list above (#2333 review cycle 12,
+    # P2): a stale `$O` copy is exactly the case this message reports, so the list is LITERAL and
+    # cannot be rendered from a variable defined in the module being reported as incomplete.
+    echo "[fix $PR] WARNING — $SELF/ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count/ciq_ceiling/ciq_defer_line/ciq_horizon_min/ciq_job_p90_min); the CI-queue gate is INERT for this run and the push proceeds UNMEASURED" >> "$L.log"
+  fi
+else
+  # …and so is an ABSENT one: the stale-`$O` shape `install.sh`/`check-single-source.sh` now detect.
+  # ⛔ THE REMEDY MUST BE A COMMAND THAT CAN SUCCEED (#2333 review, P2). It said
+  # `deploy-harness.sh --o <dir>`, but that script REFUSES any invocation without `--src`/`--repo`
+  # (`--src <harness dir> (or --repo <checkout>) is required`, exit 78) — so the one line printed
+  # exactly when the module is missing told the operator to run a bad invocation and get "nothing was
+  # copied" instead of a re-seed. Every sibling message (`dispatch-merge.sh`, `install.sh`,
+  # `report.sh`) passes `--repo <checkout>`; this one now does too.
+  echo "[fix $PR] WARNING — no ci-queue.sh at $SELF/ci-queue.sh; the CI-queue gate is UNMEASURED for this run and the push proceeds (re-seed the running copy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <dir>)" >> "$L.log"
+fi
+# ── THE LANDER'S LOCK: a fixer must not be in flight on a PR a lander owns ─────────
+# ⛔ THE HOLE THIS CLOSES (measured 2026-10-23). `merge-one.sh` (the reviewer/lander chain) and the
+# doctor's `merge` role both take `$O/state/mergeclaim-<PR>.lock` before doing anything to a PR, and
+# the controller's `claim_live` reads that SAME file as its spawn guard. `fix-one.sh` took NEITHER
+# it nor anything else the lander reads — only the cross-box `<PR>-<head>` claim, which the doctor
+# also does not take. So on one box the lander and the ONE worker whose product is a PUSH could be
+# in flight on the same PR at the same time: the lander re-resolves the head, the fixer pushes under
+# it, and the rail refuses — with the attestation the review chain had just minted gone stale.
+# Measured on the tortoise queue the same day: of 11 open non-draft PRs, 6 carried a CLEAN record
+# bound to a head that had since moved, and `[merge] candidates=12 attempted=1 landed=0` — the
+# lander's own fixer lanes are a pusher it cannot see.
+#
+# ⛔ WHY THIS FILE AND NOT THE CALLER. The controller already refuses to spawn when `claim_live`
+# says the lock is held, but `fix-one.sh` is ALSO reached directly and by `adopt-fix.sh`, and a
+# guard that lives only in the controller leaves those paths pushing at a live lander — the same
+# argument the CI-queue gate above makes for itself, and the reason both read the same state.
+#
+# ⛔ THE DIRECTION IS DEFER, NEVER BLOCK-AND-HOLD. Contention writes the SAME refundable bail marker
+# the CI-queue and cross-box refusals write, so the controller refunds the attempt and re-decides
+# from a fresh read next cycle: nothing is dropped, and a lander that lands the PR ends the work
+# entirely. Nothing here is sticky — the marker describes one cycle, not a state.
+#
+# ⛔ A STALE CLAIM IS TAKEN OVER, NOT REFUSED (#2574 (b)) — AND THE TAKEOVER IS A RENAME, NEVER
+# `rm && write`. Measured staleness is the whole licence: the record's pid is numeric and `kill -0`
+# says it is GONE. The naive reclaim (`read owner -> is it live? -> rm -> write`) is two syscalls, so
+# between them a peer can win the noclobber create — and the `rm`, issued on the strength of an
+# EARLIER read, then deletes that peer's LIVE lock, re-opening the hole this block exists to close
+# (review of PR #2576, P3, reproduced). `mv` moves whatever is at the path at the instant it runs, so
+# what we detached is OBSERVABLE afterwards: if it is not the pid we measured, we detached someone's
+# live claim, put it back with `ln` (create-if-absent — a real CAS) and defer. Nothing is deleted
+# blind, and a refusal is still refundable, so the worst case is one re-decided cycle.
+#
+# ⛔ WHY A TAKEOVER AT ALL, WHEN `claim_live()` ALSO RECLAIMS. The controller's spawn guard reclaims a
+# dead owner's claim, so on the CONTROLLER path a stale lock is already gone before this file runs.
+# But this file is also reached directly and by `adopt-fix.sh` (nothing is dispatching, so no reclaim
+# is coming), and `merge-one.sh` reclaims this same file by `rm` + retry on its own path — so a fixer
+# that merely deferred would leave the PR blocked behind bookkeeping that recorded a past state and
+# is never revalidated. The fleet has been blocked for hours by exactly that shape.
+#
+# ⛔ AN UNREADABLE RECORD IS **NOT** STALE, AND THAT IS THE ONE WAY TO STEAL A LIVE LANDER'S CLAIM.
+# `merge-one.sh` claims with `( set -o noclobber; echo $$ > "$CLAIM" )`: the file exists for an
+# instant BEFORE the pid is written, so "empty content ⇒ dead owner" would take a lock whose owner
+# is alive and mid-claim. Only a numeric pid that `kill -0` proves gone is stale; empty, unparseable
+# or unreadable content is treated as LIVE and deferred (#1985's recycled-pid risk is the mirror of
+# this one: there a live pid reads dead, here a claiming pid has not been written yet).
+#
+# ⛔ THE LOOSE-LIVENESS READ IS THE FLEET'S EXISTING CONVENTION, NOT A NEW ONE. "Any live pid holds"
+# is `claim_live`'s documented spawn-guard direction (a recycled pid means "do not spawn", one lost
+# cycle, nothing deleted) and the doctor's `merge` role reads the same file the same way. The
+# recycled-pid risk of reclaiming on liveness alone is #1985's, already filed; this arm joins the
+# existing mechanism rather than inventing a second lock with its own semantics.
+PRLOCK="$O/state/mergeclaim-$PR.lock"
+prlock_live_owner() { # prints the owner pid and returns 0 only when the lock is held by a LIVE pid
+  local p
+  [ -f "$PRLOCK" ] || return 1
+  p="$(cat "$PRLOCK" 2>/dev/null || echo 0)"
+  case "${p:-}" in ''|*[!0-9]*) p=0 ;; esac
+  [ "$p" -gt 0 ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  printf '%s\n' "$p"
+  return 0
+}
+# ⛔ THE RECORD APPEARS WITH ITS PID ALREADY IN IT, AND THAT IS NOT TIDINESS. A noclobber create
+# followed by a separate write leaves the file EMPTY for an instant, and the other three readers of
+# this SAME file — `merge-one.sh:144-147`, the doctor's `merge` role and `claim_live()` in
+# `orch-loop.sh` — treat an empty record as "no owner" and `rm` it. So the window let a lander delete a
+# live fixer's claim by reading it mid-create, i.e. the hole this block closes, reopened from the other
+# side (review of PR #2576, P2). Writing the pid to a private file and `ln`-ing it into place makes
+# the create and the content ONE atomic step: `ln` refuses an existing destination (no `-f`), which IS
+# the compare-and-swap.
+prlock_take() {
+  local tmp rc name
+  tmp="$O/state/.mergeclaim-$PR.$$.tmp"
+  name="${tmp##*/}"
+  printf '%s\n' "$$" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  ln "$tmp" "$PRLOCK" 2>/dev/null; rc=$?
+  rm -f "$tmp" 2>/dev/null
+  [ "$rc" -eq 0 ] || return 1
+  # ⛔ `ln` EXITS 0 WHEN THE DESTINATION IS A DIRECTORY — it links INSIDE it instead of replacing it, so
+  # success is not proof that the record is ours (measured: a `mergeclaim-<PR>.lock` directory made this
+  # function report a successful claim, and the unusable-path refusal below never fired). The path must
+  # now BE our record. The stray inner link is removed so a corrupt path is not also littered.
+  [ "$(cat "$PRLOCK" 2>/dev/null || echo 0)" = "$$" ] && return 0
+  rm -f "$PRLOCK/$name" 2>/dev/null
+  return 1
+}
+prlock_stale_owner() { # prints the pid and returns 0 ONLY when staleness is MEASURED
+  # The three ways this returns 1 are all "not stale", and the last two are the two ways to steal a
+  # LIVE claim: (a) the lock is gone or is not a regular file; (b) the pid is empty/unparseable —
+  # `merge-one.sh`'s noclobber create and its `echo $$` are separate operations, so a claiming
+  # lander's file is briefly EMPTY; (c) `kill -0` succeeds — a live pid holds, deliberately loose,
+  # the same direction `claim_live` documents. A recycled pid therefore reads LIVE (one lost cycle,
+  # nothing deleted) rather than as a claim to take (#1985).
+  local p
+  [ -f "$PRLOCK" ] || return 1
+  p="$(cat "$PRLOCK" 2>/dev/null || echo 0)"
+  case "${p:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$p" -gt 0 ] || return 1
+  kill -0 "$p" 2>/dev/null && return 1
+  printf '%s\n' "$p"; return 0
+}
+prlock_takeover() { # $1 = the pid we MEASURED stale; 0 = we own it · 1 = nothing displaced · 2 = a claim was LOST
+  # ⛔ FOUR STEPS, AND EACH ONE IS A CAS OR A VERIFICATION. (1) the record must still be the pid we
+  # measured — a re-read before the steal, so a peer that reclaimed while we were deciding is not
+  # displaced; (2) DETACH by `mv`, never `rm`, so what we moved can be inspected; (3) verify what we
+  # actually moved is the dead pid — if it is not, we took someone's LIVE claim in the instant between
+  # (1) and (2), so put it back with `ln` (create-if-absent) and defer; (4) claim the vacated path.
+  # A `mv` that finds the path already gone (a peer detached it first) fails, which is the CAS: only
+  # one racer can detach a given record.
+  # ⛔ THE RETURN CODES ARE DISTINCT BECAUSE THE OUTCOMES ARE OPPOSITE (review of PR #2576, P2). 1 =
+  # nothing was displaced (the record changed, the mv found it gone, or the create lost a race), so
+  # "the peer holds it, nothing was lost" is TRUE. 2 = we displaced a claim that could not be put back,
+  # so a live peer's lock is GONE; reporting that as "nothing was deleted" would hand the operator two
+  # contradictory lines and the wrong repair. The caller writes a different sentence for each.
+  local stale="$1" side cur
+  side="$PRLOCK.reclaim.$$"
+  cur="$(cat "$PRLOCK" 2>/dev/null || echo 0)"
+  [ "$cur" = "$stale" ] || return 1
+  mv -f "$PRLOCK" "$side" 2>/dev/null || return 1
+  cur="$(cat "$side" 2>/dev/null || echo 0)"
+  if [ "$cur" != "$stale" ]; then
+    if ln "$side" "$PRLOCK" 2>/dev/null; then
+      rm -f "$side"
+      return 1
+    fi
+    echo "[fix $PR] WARNING — a peer claimed state/mergeclaim-$PR.lock between the stale read and the takeover; its claim (pid ${cur:-unreadable}) was DETACHED and could NOT be restored (the path was re-claimed first)" >> "$L.log"
+    rm -f "$side"
+    return 2
+  fi
+  if prlock_take; then rm -f "$side"; return 0; fi
+  rm -f "$side"   # lost the create race: drop only the stale artifact
+  return 1
+}
+release_prlock() { # never removes a lock we do not own: a lander that outlived us keeps its claim
+  [ -n "${PRLOCK:-}" ] || return 0
+  [ "$(cat "$PRLOCK" 2>/dev/null)" = "$$" ] && rm -f "$PRLOCK" 2>/dev/null
+  rm -f "$O/state/.mergeclaim-$PR.$$.tmp" 2>/dev/null   # a create interrupted between write and ln
+  return 0
+}
+# The refusal has the SAME three arms as the other two gates: the controller refunds by consuming
+# `fixbail-<PR>-<HEAD>`, and an empty HEAD (the cross-box marker's own documented hole) or a manual
+# run must not pretend to have booked one.
+# ⛔ THE FIRST LINE IS A STABLE TOKEN (`DEFERRED: the LANDER`), because `adopt-fix.sh` — the operator
+# surface onto this script — has to name the cause in the log the operator reads, exactly as it does
+# for the CI-queue deferral. A second, cosmetic reword would silently make `adopt-fix <PR>` report
+# SUCCESS for a run that pushed nothing (review of PR #2576, P2).
+prlock_defer() { # prlock_defer <why>
+  echo "[fix $PR] DEFERRED: ${1} — nothing pushed, so no attestation was invalidated by this lane" >> "$L.log"
+  if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then
+    : > "$O/state/fixbail-$PR-$HEAD"
+    echo "[fix $PR] attempt refundable (bail marker written for head $HEAD)" >> "$L.log"
+  elif [ "${CTRL:-0}" = "1" ]; then
+    echo "[fix $PR] the head could NOT be read, so no bail marker could be written — the controller cannot refund this attempt (re-decided next cycle)" >> "$L.log"
+  else
+    echo "[fix $PR] manual run: no attempt was booked and none is refunded" >> "$L.log"
+  fi
+  exit 0
+}
+# ⛔ A REFUSAL THAT CANNOT CLEAR BY ITSELF IS NOT REFUNDABLE (review of PR #2576, cycle 2 — P2). Every
+# arm above writes the bail marker, so the controller refunds the attempt and re-decides — which is
+# right for a lock a LANDER holds or one whose dead owner this lane could not take over (a lost
+# race). It is WRONG for a lock state that no re-dispatch can change: a `$PRLOCK` that is not a regular
+# file (a directory, an unreadable object) or a `$O/state` this box cannot write. There the refund
+# makes spawn -> defer -> refund a PERMANENT SPIN: `fixcount` nets to zero every cycle, so MAX_FIX_TRIES
+# never trips, nothing parks, and nothing surfaces — the same shape `orch-loop.sh` documents for a
+# deferral that cannot clear itself. Those two arms therefore consume the attempt (no bail marker) and
+# name the repair, so the cap parks the PR in front of a human instead of hiding the state forever.
+prlock_refuse() { # prlock_refuse <why> — NOT refundable: re-dispatching cannot change this state
+  echo "[fix $PR] REFUSED (NOT refundable — a re-dispatch cannot clear this): ${1} — nothing pushed" >> "$L.log"
+  if [ "${CTRL:-0}" = "1" ]; then
+    echo "[fix $PR] this attempt is CONSUMED so MAX_FIX_TRIES parks the PR in front of a human; no bail marker was written" >> "$L.log"
+  else
+    echo "[fix $PR] manual run: nothing was consumed" >> "$L.log"
+  fi
+  exit 0
+}
+if PL_OWNER="$(prlock_live_owner)"; then
+  prlock_defer "the LANDER owns this PR (state/mergeclaim-$PR.lock held by live pid $PL_OWNER) — a push now would move the head out from under the attestation it is landing"
+elif PL_STALE="$(prlock_stale_owner)"; then
+  # ⛔ THE OVERRIDE IS LOGGED WITH ITS EVIDENCE, not just announced: WHICH lock, WHOSE pid, and the
+  # measurement that made it stale. An operator reading `fix-<PR>.log` afterwards must be able to
+  # tell a takeover from a normal acquisition without re-deriving it.
+  if prlock_takeover "$PL_STALE"; then
+    echo "[fix $PR] PR-owner lock: RECLAIMED a STALE claim — state/mergeclaim-$PR.lock named pid $PL_STALE, which is not alive (measured with kill -0), so this lane took the claim over instead of refusing the PR" >> "$L.log"
+  else
+    case $? in
+      2) prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) named pid $PL_STALE (not alive), and a peer's claim that appeared while this lane was taking it over was DISPLACED AND COULD NOT BE RESTORED — the WARNING line above names that pid. Nothing was pushed by this lane; REPAIR: confirm no worker is live (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh') and re-run, and treat any worker that lost its claim as having lost it" ;;
+      *) prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) named pid $PL_STALE, which is NOT alive (measured with kill -0), but the takeover LOST a race with a peer that reclaimed it first — this lane displaced nothing; the peer now holds it. REPAIR only if this repeats with NO live worker and nothing dispatching this PR: confirm none is running (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh'), then rm -f state/mergeclaim-$PR.lock" ;;
+    esac
+  fi
+elif prlock_take; then
+  echo "[fix $PR] PR-owner lock: acquired state/mergeclaim-$PR.lock (no lander is in flight on this PR)" >> "$L.log"
+else
+  # ⛔ A FAILED CAS IS NOT PROOF THAT AN OWNER EXISTS (review of PR #2576, cycle 2 — P3). It also fails
+  # when the path is a directory or `$O/state` is unwritable, and the re-read below cannot tell an
+  # ABSENT lock from a stale one — so each condition is named for what it is instead of being reported
+  # as "the owner is not live", which sent an operator to wait for the reclaim of nothing.
+  if PL_OWNER="$(prlock_live_owner)"; then
+    prlock_defer "the LANDER claimed this PR while this lane was starting (state/mergeclaim-$PR.lock held by live pid $PL_OWNER)"
+  fi
+  if [ -e "$PRLOCK" ] || [ -L "$PRLOCK" ]; then
+    if [ ! -f "$PRLOCK" ]; then
+      prlock_refuse "state/mergeclaim-$PR.lock exists but is NOT a regular file (a directory, a dangling symlink, or an object this box cannot read), so no owner can be read and no claim can be taken. REPAIR: inspect it (ls -ld '$PRLOCK'), confirm no lander is running for #$PR, then rm -f (or rmdir) it"
+    fi
+    # A REGULAR FILE WE CANNOT MEASURE AS STALE: empty or unparseable content (a lander mid-claim), or
+    # a pid that went live between the two reads above. NEVER stolen — see prlock_stale_owner.
+    prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) exists and holds no pid this lane can prove dead (its content is empty, unparseable, or names a pid that is now alive), so it is treated as LIVE and left untouched — nothing was deleted. REPAIR only if this persists with NO live worker and nothing dispatching this PR: confirm none is running (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh'), then rm -f state/mergeclaim-$PR.lock"
+  fi
+  # The file is ABSENT at the re-read: its owner released it between the CAS and this read (a fast
+  # lander exit runs its EXIT trap). That is not a stale claim — retry ONCE rather than reporting one.
+  if prlock_take; then
+    echo "[fix $PR] PR-owner lock: acquired state/mergeclaim-$PR.lock (an earlier holder released it while this lane was starting; no lander is in flight on this PR)" >> "$L.log"
+  else
+    prlock_refuse "state/mergeclaim-$PR.lock could not be CREATED although no file exists there — $O/state is unwritable, full, or not a directory. REPAIR: check the permissions and free space of '$O/state'"
+  fi
+fi
 CROSS_OWN=""; CROSS_RC=0
 release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT path
   # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
@@ -97,7 +388,7 @@ release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT pat
   kill "$w" 2>/dev/null
   return "$rc"
 }
-trap 'release_fix_claim' EXIT
+trap 'release_prlock; release_fix_claim' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
@@ -136,10 +427,26 @@ fi
 # test-isolation, license-surface, pricing-artifact). Without this it would read only the review
 # comment — which for such a PR may not exist at all — and fix blind.
 : > "$L-failing.txt"
-FAILING_CHECKS="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null | python3 -c "
+# ⛔ THE READ IS OBSERVED BEFORE IT IS TRUSTED (agent-infra#2121, empty-as-pass). `gh pr checks …
+# 2>/dev/null | python3 -c` collapsed THREE different outcomes into the same empty string: the read
+# FAILED (gh non-zero, stderr discarded), the payload was UNPARSEABLE (the old `except: raise
+# SystemExit` exited 0 with nothing printed), and there genuinely ARE no failing checks. Only the
+# third is a fact — but this file is the fixer's ONLY evidence that CI is red, so a fixer was
+# dispatched believing the checks were green when the read had never happened. The read and the
+# parse are now observed separately, and an observation that did not happen is written INTO that
+# file as UNKNOWN (which also keeps it non-empty, so the fixer's prompt still sends it there).
+checks_json="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null)" || checks_rc=$?
+FAILING_CHECKS=''
+checks_unknown=''
+if [ "${checks_rc:-0}" -ne 0 ]; then
+  checks_unknown="the required-check read FAILED (gh rc=$checks_rc)"
+elif [ -z "$checks_json" ]; then
+  checks_unknown="the required-check read returned NO JSON"
+else
+FAILING_CHECKS="$(printf '%s' "$checks_json" | python3 -c "
 import sys,json
 try: d=json.load(sys.stdin)
-except Exception: raise SystemExit
+except Exception: raise SystemExit(1)
 # The SAME allow-list polarity the loop's classifier and admin-merge.sh use (agent-infra#1714): a
 # check is FAILING only when its state is neither a NAMED in-flight spelling nor one of the NON-RED
 # conclusions. CANCELLED/STALE are non-red by that rule - a superseded run
@@ -154,6 +461,20 @@ for c in (d if isinstance(d,list) else []):
     red.append(str(c.get('name') or ''))
 print(' '.join(red))
 " 2>/dev/null)"
+# ⛔ THE END LINE ABOVE IS PINNED BY SHAPE, deliberately: scripts/orchestrator-harness/selftest.sh
+# extracts this assignment with `awk '/^FAILING_CHECKS="/,/^" 2>\/dev\/null\)"$/'` and runs the
+# result as python. Appending `|| parse_rc=$?` to that line made the END MARKER unreachable, awk then
+# ran to EOF and the extracted "python" became the rest of the script — so the PARSE status is read
+# on the NEXT line instead of on the closing one. Keep the two marker lines exactly as they are.
+checks_parse_rc=$?
+if [ "$checks_parse_rc" -ne 0 ]; then
+  checks_unknown="the required-check payload could not be PARSED (rc=$checks_parse_rc)"
+fi
+fi
+if [ -n "$checks_unknown" ]; then
+  echo "=== NOTE: $checks_unknown — this file does NOT establish that CI is green. Treat the required checks as UNKNOWN and read them yourself before concluding the build is clean ===" >> "$L-failing.txt"
+  echo "[fix $PR] required-check read UNKNOWN ($checks_unknown) — proceeding (fail-open on purpose, and recorded in $L-failing.txt so the fixer sees it)" >> "$L.log"
+fi
 for c in $FAILING_CHECKS; do
   echo "=== failing required check: $c ===" >> "$L-failing.txt"
   RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq ".[]|select(.name==\"$c\")|.link" 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p' | head -1)"
@@ -168,9 +489,14 @@ gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 # an interpreter across the filesystem — a `find` over $HOME blocks for minutes and has consumed whole
 # agent budgets with nothing produced. Point it at `uv sync` instead. Do NOT drop it in a re-port.
 cat > "$L-fixer.txt" <<EOF
+$FIX_RESEARCH_BRIEF
+
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
-If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
+If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (`head12: <12 chars>`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
+
+If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
+>>>>>>> b718dc981 (feat(harness): a PR sickness QUEUE — a red PR nobody holds is now selected, briefed and fixed)
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3
@@ -187,6 +513,15 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
 EOF
+# ── THE GENERATED FIXER BRIEF IS CHECKED AT BUILD TIME (#2258) ─────────────────────────────────────
+# The fixer's brief is written HERE, so a failure is a harness defect (78, cannot run) and never a
+# brief-authoring refusal (80). Checking it before the spawn means a heredoc regression is caught with
+# the reason, instead of arriving as an empty fixer run that the caller reads as "the fix did not work".
+bash "$brief_gate_sh" --check "$L-fixer.txt" fixer 2>>"$L.log" || {
+  echo "[fix $PR] FATAL: the GENERATED fixer brief fails brief-gate.sh — refusing to run a fixer whose brief lost its research contract (a harness defect in the heredoc above) (#2258)" >> "$L.log"
+  echo "[fix $PR] FATAL: generated fixer brief refused by brief-gate.sh (harness defect, see $L.log)" >&2
+  exit 78
+}
 # ⛔ THE VOLUME IS THE WORKTREE, AND IT MUST BE PASSED EXPLICITLY (review round 2, P2). This script
 # does `cd "$REPO"` (above) and only NAMES the worktree inside the agent's prompt, so `$PWD` here is
 # the MAIN CHECKOUT — the gate's `DISK_GATE_PATH:-$PWD` default would measure a directory the agent
@@ -194,7 +529,12 @@ EOF
 # a box that splits them: a healthy main checkout would let the fixer start onto a full worktree
 # volume, which is the precise "cannot name the volume that actually fills" failure #1765 exists to
 # remove. `uv sync` writes the venv in $WT, so $WT is the reading that matters.
-DISK_GATE_PATH="$WT" run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
+# ⛔ AND `WIP_PATH="$WT"` FOR THE SAME REASON, ONE STEP LATER (#2045). `DISK_GATE_PATH` names the
+# volume the fixer FILLS; `WIP_PATH` names the worktree whose UNCOMMITTED WORK a cap kill would
+# destroy. This script `cd`s into $REPO, so run_agent's default (`$PWD`, the main checkout) would
+# snapshot the wrong tree and report a CLEAN worktree while the fixer's work sat unsaved one
+# directory away — the loud-but-wrong verdict, which is worse than no snapshot at all.
+DISK_GATE_PATH="$WT" WIP_PATH="$WT" run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
 # ⛔ THE GATE'S OWN CODE, captured immediately. It is the ONLY thing that distinguishes the two
 # refusals below, and `$?` read after any later command would be that command's status (§7.4).
 ar=$?
@@ -206,11 +546,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # unchanged head — pure cost on an already-overloaded box, and the re-review would be refused by
   # the same gate anyway. Exit and let the controller's next cycle re-dispatch.
   #
-  # ⛔ WHICH GATE REFUSED DECIDES THE REMEDY, and the two are OPPOSITE (#1765). A load refusal
-  # clears when the box quietens and the controller re-dispatches next cycle; a DISK refusal never
-  # clears on its own — no amount of waiting frees a filesystem. Naming a disk refusal "load gate"
-  # sends the operator to wait for an event that cannot fix it, which is the instrument false
-  # positive this file's callers exist to avoid.
+  # ⛔ WHICH GATE REFUSED DECIDES THE REMEDY, and they are OPPOSITE (#1765, and agent-infra#2293 for the
+  # third). A load refusal clears when the box quietens and the controller re-dispatches next cycle; a
+  # DISK refusal never clears on its own — no amount of waiting frees a filesystem; a FORK refusal never
+  # clears on its own either AND the box cannot start the retry it is being told to wait for. Naming
+  # either un-clearable one "load gate" sends the operator to wait for an event that cannot fix it,
+  # which is the instrument false positive this file's callers exist to avoid.
   # ⛔ TOLERANT REFERENCE, AND THE REASON IS A REAL SKEW (review round 2, P2 — REPRODUCED). The daemon
   # executes `$O/<script>` and $O is seeded file by file (cloud-cell-supervisor.sh's seed_and_stamp),
   # so a NEW caller can run against an OLD `$O/spawn-gate.sh` — the pre-#1765 helper defines
@@ -221,7 +562,23 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # pre-#1765 helper can never return 77, so 77 falls through to the load branch on the tree it came
   # from. install.sh's DRIFTED list now carries spawn-gate.sh, so the skew is DETECTED as well as
   # survived.
-  if [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
+  # ⛔ FORK FIRST AMONG THE CAPACITY CODES, AND IT IS THE P1 THE REVIEW FOUND: `run_agent` returns
+  # AGENT_FORK_REFUSED (73) for a box that is out of PROCESSES, and before this arm both that code and
+  # 75 reported "load gate: re-dispatched when 1-min load falls below MAX_LOAD" — a remedy for a box
+  # that cannot spawn the retry, and one that says nothing about the external restart that is the only
+  # thing that helps. The same tolerant default (73) covers AGENT_FORK_REFUSED: a pre-#2293 helper
+  # cannot return it, so the fork arm is inert on that tree and the code falls through as before.
+  #
+  # ⛔ A BRIEF REFUSAL IS A THIRD REMEDY, AND NOT ONE OF THE CAPACITY ONES (#2258). The brief is
+  # GENERATED here (`brief-gate.sh --section fixer`), so it can only be refused if the heredoc lost the
+  # block or the helper drifted — a HARNESS defect. Naming it "load" or "disk" would send the operator
+  # to wait for a box or a filesystem that is fine, and the refund below still applies: nothing ran, so
+  # no attempt was consumed. Tolerant reference for the same $O-skew reason as the disk code.
+  if [ "$ar" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
+    why="BRIEF gate: the generated fixer brief failed brief-gate.sh (a HARNESS defect, not a capacity refusal and not a finding about this PR) — read the [brief-gate] block in the log; the fix is in the brief's own build, not in the box"
+  elif [ "$ar" = "${AGENT_FORK_REFUSED:-73}" ]; then
+    why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
+  elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
     why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
@@ -287,6 +644,13 @@ if [ -n "${CROSS_OWN:-}" ]; then
   fi
 fi
 # re-run the full chain at the new head
+# ⛔ RELEASE THE PR-OWNER LOCK FIRST, AND BEFORE THE CHAIN — not only at exit. `merge-one.sh` takes
+# this SAME lock as its first act and, finding a live pid, exits 0 with "already owns this PR" — so
+# keeping ours across the handoff would turn the fixer's own re-review into a silent no-op (the
+# "fixer pushed, nothing re-recorded" strand #2132 removed). Releasing here is the same reason the
+# cross-box claim above is released here: after a push the downstream worker claims the NEW head,
+# and without a push the SAME head is still ours, so leaving it held would refuse our own re-review.
+release_prlock
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
 echo "[fix $PR] end $(date)" >> "$L.log"
 # ── and the fixer's `.venv` goes with it (agent-infra#1932) ─────────────────────────────────────────

@@ -2943,7 +2943,13 @@ def plan_notifications(verdicts, state, capturing=False):
 # the text may be in the composer while the caller knows nothing).
 SAFE_SEND_RC = {0: "DELIVERED (consumed)", 3: "REFUSED (lane busy or state unknown)",
                 1: "AMBIGUOUS (sent, not consumed)", 2: "usage/missing input",
-                4: "AMBIGUOUS (sent, not consumed)", 5: "AMBIGUOUS (send state not established)"}
+                4: "AMBIGUOUS (sent, not consumed)", 5: "AMBIGUOUS (send state not established)",
+                # ⛔ THE BRIEF GATE'S OWN CODES (#2258). Both are emitted BEFORE the pane is read, so
+                # nothing was consumed and a retry is free — the same fact rc 3 carries. Without them
+                # they fell through to the AMBIGUOUS default, which SUPPRESSES: one gate refusal was
+                # enough to silence the fleet's alert path permanently (review cycle 5).
+                78: "REFUSED (brief validator missing on this box)",
+                80: "REFUSED (brief refused by the research-first gate)"}
 
 # Phrases with which safe-send.sh says NOTHING was consumed. These are the only refusals that may be
 # retried on the next poll; everything else non-zero is suppressed until the failure shape changes.
@@ -2975,7 +2981,10 @@ def classify_send(rc, out):
     # consumable" and never "Nothing consumed" — so a controller busy mid-turn got exactly ONE
     # attempt per failure shape and then permanent silence, while nothing had been consumed and a
     # retry was free. (The same "the tool holds the datum and does not read it" class as the census.)
-    if rc in (2, 3):
+    if rc in (2, 3, 78, 80):
+        # 78/80 are the brief gate's: safe-send.sh exits them BEFORE it probes the pane, so nothing was
+        # consumed (the same reasoning as rc 3, and the same bug class: an unlisted refusal code is
+        # silently promoted to AMBIGUOUS, i.e. suppressed forever).
         return "refused"
     if any(ph.lower() in out.lower() for ph in NOTHING_CONSUMED_PHRASES):
         return "refused"
@@ -3057,7 +3066,13 @@ def send_message(msg, cfg, sh, dry_run=False, ws=None, label=None):
         # report, an exit code that mimics a FAIL, and the composed message in no artifact at all.
         return False, "NOT DELIVERED: cannot write the message to the outbox (%s: %s)" % (
             type(exc).__name__, exc)
-    rc, out = sh.sh("bash %s %s %s %s" % (_q(script), _q(ws), _q(label), _q(path)), timeout=300)
+    # ⛔ `--notice`, NOT a bare send (review cycle 5, P1). This message is a MACHINE-COMPOSED ALERT —
+    # a statement about a fleet condition, with no brief and no research question — so it goes through
+    # safe-send.sh's scoped notice mode. Without it the research-first gate (#2258) refused every alert
+    # with 80, and because an unknown rc classified as AMBIGUOUS it was then suppressed on every later
+    # poll: the controller was never told, and the report said "bytes may have landed" about a message
+    # that was provably never sent. The no-pi and busy guards still apply under --notice.
+    rc, out = sh.sh("bash %s %s %s %s --notice" % (_q(script), _q(ws), _q(label), _q(path)), timeout=300)
     verdict = classify_send(rc, out)
     if verdict == "delivered":
         detail = SAFE_SEND_RC[0]

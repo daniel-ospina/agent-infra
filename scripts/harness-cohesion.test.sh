@@ -17,6 +17,26 @@
 #         dir the RUNNING controller executes that main does not carry, and — fail-closed — an
 #         unreadable one is BROKEN (exit 2), never OK. Plus: no candidate dir at all is exit 2.
 set -u
+# ⛔ THE AMBIENT ENVIRONMENT IS NOT THIS SUITE'S INPUT — `harness-up` now PREFERS the caller's `REPO`
+# (the WORK repo, #2356) over `--repo` (the HARNESS checkout), so an arm that passes only `--repo`
+# inherits whatever the shell exports as `REPO`. A fleet shell exports `REPO=<its work repo>`; a STALE
+# one (a deleted or mistyped path) is now REFUSED by the launcher (rc 2), which surfaced here as 25
+# pin/start failures about a tree this suite never named — measured `REPO=/tmp/plaindir-stale`: **25
+# failed** here against **1 failed** on the pre-#2356 tree, i.e. a false RED the next reader attributes
+# to the launcher. Arms that need a work repo set `REPO` explicitly.
+# ⛔ …AND THE SAME FALSE RED ARRIVES THROUGH THE OTHER KNOBS, so clearing only `REPO` was an over-claim
+# (measured before this line was widened): `HARNESS_REF=origin/nope` -> **17 failed** (every embedded
+# `check-deployed-drift.sh --surface` arm), `HARNESS=/tmp/nope` -> 5, `HARNESS_PIN_DIR=/tmp/nope` -> 3.
+# `HARNESS_REF` in particular is a value a real cell shell carries. Arms that exercise one of these set
+# it per-arm, so clearing them here costs nothing.
+unset REPO HARNESS_REPO ENV_FILE HARNESS_PIN O HARNESS_UP_SELFTESTS HARNESS_UP_OS \
+      HU_LOAD_PER_CPU HU_LOAD_PER_LANE HARNESS HARNESS_REF HARNESS_PIN_DIR HARNESS_PIN_FILE \
+      HU_NCPU HU_LOADAVG_FILE HU_DISK_FLOOR_MB HU_DISK_PER_LANE_MB HU_LAUNCHD_LABEL HARNESS_UP_MAX_LANES
+# ⛔ THE CAPACITY KNOBS ARE PART OF THAT LIST, NOT ONLY THE REF/PIN ONES (review P2): `hu_capacity` reads
+# HU_NCPU/HU_LOADAVG_FILE/HU_DISK_* directly, so an ambient `HU_LOADAVG_FILE=/nonexistent` (or
+# `HU_NCPU=abc`) made lanes=3 and every `up` arm REFUSE — measured **8 failed**, attributed to the launcher
+# this suite grades. Its sibling (harness-surface.test.sh) already clears exactly these; the two suites
+# must not disagree about what "ambient" means. HU_LAUNCHD_LABEL is the same class one row over.
 # ⛔ AS ROOT THIS SUITE CANNOT PROVE MOST OF WHAT IT ASSERTS, SO IT REFUSES TO RUN RATHER THAN REPORT A
 # GREEN IT DID NOT EARN. A third of the assertions are permission DENIALS (an unreadable file, an
 # unlistable dir, an unsearchable ancestor, a mode-000 pin record): root's CAP_DAC_OVERRIDE makes every
@@ -72,6 +92,17 @@ cp "$REPO_FIX/scripts/orchestrator-harness"/*.sh "$TMP/home/orchestrator/"
 # `FLEET_PS`); the default stub prints NOTHING, and the running-controller case supplies a table.
 printf '#!/bin/sh\ncat "$PS_TABLE" 2>/dev/null\nexit 0\n' > "$TMP/ps-stub"; chmod +x "$TMP/ps-stub"
 : > "$TMP/ps-empty"
+# ⛔ THE CAPACITY DIMENSION IS A REQUIRED INPUT OF `up`, SO THE FIXTURES MUST SUPPLY IT (2026-10-24).
+# `up` now measures FORK HEADROOM before load and disk (#2293) and REFUSES (rc=3) when it cannot: "a
+# box that cannot prove it can fork must not be given lanes". These arms stub `HU_PS` for the process
+# CENSUS and give it an empty table, so the fork probe had nothing to count and the walk stopped at
+# capacity — before the self-test gate and the platform authority every one of them is about. Four
+# assertions went red for that reason alone (`self-test gate: the FAILING TEST IS NAMED`, and the
+# three DRIFT-reported-not-refused arms), which reads as a self-test regression and is not one.
+# The fork reading is supplied through the seam the launcher documents (`HU_FORK_LIMITS_FILE`), the
+# same way `PS_TABLE` supplies the census: generous limits, so fork never binds and the arms keep
+# testing what they name.
+printf 'cgroup-pids 100000 1000\nrlimit-nproc 100000 1000\nthreads-max 100000 1000\n' > "$TMP/fork-generous"
 
 run_drift() { # <args…> — PATH/HOME isolated so the box's real dirs cannot leak in
   OUT="$( cd "$TMP" && HOME="$TMP/home" CELL_HOME="$TMP/cell" HARNESS_PIN_DIR="$TMP/cell/harness" \
@@ -454,7 +485,7 @@ run_up() { # <fixture> <args…>
   local r="$1"; shift
   OUT="$( cd "$TMP" && FIX_LOG="$r/fix.log" HOME="$TMP/home" CELL_HOME="$TMP/cell" \
           DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
-          HU_PS="$TMP/ps-stub" \
+          HU_PS="$TMP/ps-stub" HU_FORK_LIMITS_FILE="$TMP/fork-generous" \
           bash "$r/scripts/harness-up" up --repo "$REPO_FIX" --harness "$r/scripts/orchestrator-harness" \
           "$@" 2>&1 )"
   RC=$?
@@ -580,6 +611,7 @@ printf '#!/usr/bin/env bash\necho "DRIFT: something differs"\nexit 1\n' > "$F6/s
 chmod +x "$F6/scripts/orchestrator-harness/check-deployed-drift.sh"
 OUT="$( cd "$TMP" && FIX_LOG="$F6/fix.log" HOME="$TMP/home" CELL_HOME="$CELL6" \
         DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HU_PS="$TMP/ps-stub" \
+        HU_FORK_LIMITS_FILE="$TMP/fork-generous" \
         bash "$F6/scripts/harness-up" up --repo "$REPO_FIX" --harness "$F6/scripts/orchestrator-harness" 2>&1 )"; RC=$?
 case "$OUT" in *"reports DRIFT"*) ck "a DRIFT self-test is REPORTED, not swallowed" 0 ;; *) ck "a DRIFT self-test is REPORTED, not swallowed [$(printf '%s' "$OUT" | tr '\n' ' ' | cut -c1-200)]" 1 ;; esac
 ck "a DRIFT self-test does not refuse the start (rc=$RC, not 3)" "$([ "$RC" -ne 3 ] && echo 0 || echo 1)"
@@ -613,9 +645,15 @@ OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" H
         bash "$F9/scripts/harness-up" status --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" 2>&1 )"; RC=$?
 case "$OUT" in *"claims"*"LATE"*) ck "claims row: an AGED record is LATE, never OK" 0 ;; *) ck "claims row: an AGED record is LATE, never OK [$(printf '%s' "$OUT" | grep -i '^claims' | tr '\n' ' ')]" 1 ;; esac
 # the refresh RECORD shape: canonical keys, and `fetch=` present (a `--no-fetch` run must not read fresh)
+# ⛔ THIS FIXTURE ALSO SUPPLIES THE FORK READING (2026-10-24). It calls `up` DIRECTLY rather than
+# through `run_up`, so it missed the `HU_FORK_LIMITS_FILE` the other arms were given — and because it
+# stubs `HU_PS` with an EMPTY table, the shim's process read is unmeasured and `up` REFUSES (rc=3)
+# before writing the refresh record, so this whole block collapsed into "the record was written at
+# all". The seam is the same one `run_up` uses: generous limits, so fork never binds and what is
+# measured here stays the record shape.
 rm -f "$CELL9/orchestrator/state/harness-refresh"
 OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
-        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
+        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HU_FORK_LIMITS_FILE="$TMP/fork-generous" \
         bash "$F9/scripts/harness-up" up --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" --no-fetch 2>&1 )"; RC=$?
 REC="$CELL9/orchestrator/state/harness-refresh"
 if [ -f "$REC" ]; then
@@ -630,7 +668,7 @@ if [ -f "$REC" ]; then
   printf '#!/usr/bin/env bash\nprintf "harness relation=current running=deadbeef ref=deadbeef pin=deadbeef action=none fetch=notfetched\\n"\nexit 0\n' \
     > "$F9/scripts/orchestrator-harness/harness-refresh.sh"; chmod +x "$F9/scripts/orchestrator-harness/harness-refresh.sh"
   OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
-          DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
+          DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HU_FORK_LIMITS_FILE="$TMP/fork-generous" \
           bash "$F9/scripts/harness-up" up --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" --no-fetch 2>&1 )"; RC=$?
   case "$(cat "$REC")" in
     *"fetch=notfetched"*) ck "a NOT-FRESH comparison is recorded as fetch=notfetched, not defaulted to ok" 0 ;;

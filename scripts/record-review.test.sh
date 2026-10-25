@@ -39,6 +39,9 @@ assert_eq() {
 assert_contains() {
     if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
 }
+assert_not_contains() {
+    if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpectedly present: $2)"; else ok "$3"; fi
+}
 
 T="$(mktemp -d /tmp/record-review-test.XXXXXX)"
 # tortoise#7391 (friction, found while adding §13): `trap 'rm -rf "$T"' EXIT` LAUNDERED the
@@ -63,6 +66,13 @@ cleanup() {
     exit 1
 }
 trap cleanup EXIT
+# HERMETICITY: this suite owns a FAKE HOME and a STUBBED gh, so it must not let the
+# ambient shell decide what the subject sees. `GH_REPO` is the sharp one: the script
+# falls back to it whenever no repo is passed, and several repo-less vectors (and
+# §11.13i) exist precisely to assert the REPO-LESS behaviour — with it exported the
+# suite reported 5 failures on an unmodified tree, and with it unset the same tree
+# passed, which is a false red in one direction and a false green in the other.
+unset GH_REPO
 SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 
 # Stubbed gh: answers the stale-sha head query + PR-body read/PATCH + the
@@ -252,6 +262,27 @@ if [ "$1" = "api" ]; then
     # simulate a response with no merge base (→ refuse).
     if grep -qF -- "compare/" <<<"$*"; then
         [ "${STUB_COMPARE_FAIL:-0}" = "1" ] && exit 1
+        # #2470/#2511 — the API ANSWERING and REFUSING this revision (a fork head,
+        # a rewritten sha): HTTP 404/422, a NON-ZERO exit, and the status on
+        # STDERR, which is where `gh` puts it and where `review_surface_rows`
+        # classifies it. (#2472 introduced the CAP; #2511 introduced this
+        # status-aware refusal — the two are cited where they belong, here and in
+        # the §8 preamble.) rc 3 (positive evidence → refuse) must never be
+        # confused with a TRANSPORT failure (rc 1 → warn and proceed); §8.16 pins
+        # both, and pins a STATUS-BEARING transport failure (403 rate limit / 5xx)
+        # separately, because `gh` reports one too and the classifier keys on the
+        # status, not on its absence.
+        if [ -n "${STUB_COMPARE_HTTP:-}" ]; then
+            case "$STUB_COMPARE_HTTP" in
+                404) _why="Not Found" ;;
+                422) _why="Unprocessable Entity" ;;
+                403) _why="API rate limit exceeded" ;;
+                5*)  _why="Server Error" ;;
+                *)   _why="Error" ;;
+            esac
+            printf 'gh: %s (HTTP %s)\n' "$_why" "$STUB_COMPARE_HTTP" >&2
+            exit 1
+        fi
         printf 'mb\t%s\n' "${STUB_MERGE_BASE-cccccccccccccccccccccccccccccccccccccccc}"
         if [ -n "${STUB_COMPARE:-}" ]; then
             printf '%s\n' "$STUB_COMPARE"
@@ -381,6 +412,16 @@ run_record_verdict() { # <verdict> <repo-or-empty> <pr> [sha] → $RECORD_RC $RE
         export PATH="$T/bin:$PATH"
         export GH_STUB_LOG="$LOG"
         export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        # ⛔ THE clean-micro SURFACE CAP NEEDS A READABLE CHANGED-PATH PAYLOAD, and this runner never
+        # supplied one: the stub's `compare/` branch answers with a merge base and NO rows, which the
+        # shipped cap reads as rc 3 ("the changed-path payload cannot be certified") and refuses with
+        # exit 4 — so every §8/§9 arm that expects a clean-micro ALLOW came back 4, and the 22
+        # assertions pinning the LABEL guard were reporting the CAP's refusal instead of the guard they
+        # are about. Pre-existing on origin/main (`PASS=622 FAIL=22`), not caused by this change. One
+        # benign docs path is enough: the cap refuses a merge/land rail, a CI workflow or an extension,
+        # none of which this fixture claims to touch.
+        # `-`, not `:-`: C3's arm proves an EMPTY file list refuses, so an explicit "" must survive.
+        export STUB_FILES="${STUB_FILES-docs/notes.md}"
         rc=0
         if [ -n "$repo" ]; then
             bash "$RECORD" "$pr" "$sha" "$verdict" "$repo" $ev 2>"$errfile" || rc=$?
@@ -533,53 +574,106 @@ RC7="$RECORD_RC"
 
 echo "── 8. #513 clean-micro tier guard ────────────────────────────"
 
+# ── THE SURFACE FIXTURE (fixture-vs-code, decided at #2615) ─────────────────
+# #2472 added the clean-micro SURFACE CAP to record-review.sh (arm a0): the
+# guard reads the recorded revision's CHANGED PATHS before it reads the tier,
+# because a tier chosen from a linked issue's label alone could clear a one-line
+# edit to a merge/land rail for a process that dispatches no reviewers. So every
+# vector below has to model a PR that HAS a surface — one docs path, the shape a
+# genuine micro change has.
+#
+# It did not, and this suite went RED the moment the cap landed (measured:
+# PASS=644 FAIL=0 at aa6c1600f^ → PASS=622 FAIL=22 at aa6c1600f). The stub's
+# meta arm answered `changed_files=1` (its `derived` default) and its `compare/`
+# arm answered with a merge base and NO row (it emits a row only when
+# `STUB_COMPARE`/`STUB_FILES` is set), so `review_surface_rows` returned rc 3 and
+# the cap refused exit 4.
+#
+# ⛔ THE REFUSAL WAS CORRECT — this is a FIXTURE fix, not a code fix (#2615).
+# `changed_files>=1` with an empty `.files[]` is not an answer GitHub gives, and
+# the SURFACE CAP's own contract (#2470/#2472) is that an EMPTY payload must
+# never certify a changed-path surface ("0 changed paths ⇒ no surface change" is
+# the fail-open). Loosening this arm to make the vectors pass is that defect
+# coming back. (The #2982 citations elsewhere in this file are the DIFF-BINDING
+# sink — the sha-keyed carry-forward — not this contract; the empty-payload rule
+# arrived with the cap in #2472, and the 404/422 positive-evidence rule with
+# #2511. Cited correctly here so the next lane reads the rule where it lives.)
+# The competing hypothesis is falsified by measurement: a 0-byte DIFF BODY is not
+# refused at all — with a truthful one-row surface and `/dev/null` as the diff,
+# clean-micro records rc 0 and only loses the carry-forward digest (a legacy
+# sha-only marker). §8.16 pins the cap's four outcomes apart, including the
+# "claims-a-surface, delivers-none" shape as a REFUSAL, so it can never again be
+# read as a stale vector and "fixed" by loosening it.
+#
+# A refusal assertion is only meaningful next to the WORDING its own arm emits:
+# the cap and the tier guard BOTH exit 4, so every vector that asserts `rc 4`
+# kept passing while the cap was the one refusing. Measured on the stale fixture:
+# neutering the tier guard's own `exit 4` left this suite at FAIL=22, the SAME
+# count it had without the mutation — the rc=4 arms did not move at all, and only
+# §8.2's two stderr assertions noticed. Hence `assert_tier_refusal` on every
+# arm-(b) vector below (it fires on 9 of them when the cap is what refuses).
+MICRO_SURFACE="docs/plans/2026-09-22-x.md"
+run_micro_verdict() { # <pr> [sha] — clean-micro on a REAL one-file diff
+    # `STUB_FILES` stays overridable (and `-`, not `:-`, so an EXPLICIT empty
+    # value means "no changed-path rows") because §8.16 has to express the
+    # surface states this suite now distinguishes.
+    STUB_FILES="${STUB_FILES-$MICRO_SURFACE}" run_record_verdict clean-micro "daniel-ospina/agent-infra" "$@"
+}
+assert_tier_refusal() { # <label> — the rc is asserted by the caller
+    assert_contains "$RECORD_ERR" "is REFUSED for a non-micro linked issue" \
+        "$1: the TIER guard refused it (not the surface cap)"
+}
+
 # 8.1 arm (a): linked same-repo issue complexity:micro → allow, marker carries the verdict.
-STUB_BODY="Fixes #424300" STUB_LABELS="complexity:micro" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424300
+STUB_BODY="Fixes #424300" STUB_LABELS="complexity:micro" run_micro_verdict 424300
 Q81="$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424300.json"
 [ "$RECORD_RC" = "0" ] && ok "arm (a): complexity:micro linked issue allows (rc 0)" || bad "arm (a): allows (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ -f "$Q81" ] && ok "arm (a): record written" || bad "arm (a): record written"
 assert_contains "$(cat "$Q81" 2>/dev/null || true)" '"verdict":"clean-micro"' "arm (a): record carries verdict clean-micro"
 
 # 8.2 arm (b): complexity:standard → exit 4, NO record.
-STUB_BODY="Fixes #424301" STUB_LABELS="complexity:standard" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424301
+STUB_BODY="Fixes #424301" STUB_LABELS="complexity:standard" run_micro_verdict 424301
 Q82="$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424301.json"
 [ "$RECORD_RC" = "4" ] && ok "arm (b): complexity:standard refuses (exit 4)" || bad "arm (b): refuses (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ ! -f "$Q82" ] && ok "arm (b): no record written on refusal" || bad "arm (b): no record written on refusal"
+assert_tier_refusal "arm (b)"
 assert_contains "$RECORD_ERR" "record-review.sh 424301 <head-sha> clean daniel-ospina/agent-infra --evidence" "arm (b): exit-4 stderr prescribes the standard/complex remedy"
 assert_contains "$RECORD_ERR" "relabel complexity:micro" "arm (b): exit-4 stderr names the mislabel remedy"
 
 # 8.3 arm (b): complexity:complex → exit 4 (label-space totality: any non-micro complexity:*).
-STUB_BODY="Fixes #424302" STUB_LABELS="complexity:complex" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424302
+STUB_BODY="Fixes #424302" STUB_LABELS="complexity:complex" run_micro_verdict 424302
 [ "$RECORD_RC" = "4" ] && ok "arm (b): complexity:complex refuses (exit 4)" || bad "arm (b): complexity:complex (rc=$RECORD_RC)"
+assert_tier_refusal "arm (b) complex"
 
 # 8.4 arm (b): pre-existing valid record survives a refusal byte-identical.
 Q84="$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424303.json"
 printf '{"pr":424303,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"old"}\n' "$SHA" > "$Q84"
 BEFORE84="$(cat "$Q84")"
-STUB_BODY="Fixes #424303" STUB_LABELS="complexity:standard" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424303
+STUB_BODY="Fixes #424303" STUB_LABELS="complexity:standard" run_micro_verdict 424303
 [ "$RECORD_RC" = "4" ] && ok "arm (b): refuses over a pre-existing clean record (rc 4)" || bad "arm (b): pre-existing (rc=$RECORD_RC)"
 [ "$(cat "$Q84")" = "$BEFORE84" ] && ok "arm (b): pre-existing record survives byte-identical" || bad "arm (b): pre-existing record mutated by the refusal"
+assert_tier_refusal "arm (b) over a pre-existing record"
 
 # 8.5 arm (c): labels carry no complexity:* → fail-open, record written, loud warning.
-STUB_BODY="Fixes #424304" STUB_LABELS="enhancement" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424304
+STUB_BODY="Fixes #424304" STUB_LABELS="enhancement" run_micro_verdict 424304
 Q85="$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424304.json"
 [ "$RECORD_RC" = "0" ] && ok "arm (c): no complexity label fails open (rc 0)" || bad "arm (c): no complexity label (rc=$RECORD_RC)"
 [ -f "$Q85" ] && ok "arm (c): record written" || bad "arm (c): record written"
 assert_contains "$RECORD_ERR" "UNVERIFIED" "arm (c): warning names the unverified tier"
 
 # 8.6 arm (c): labels fetch failure (stub exit 1) → fail-open, no refusal.
-STUB_BODY="Fixes #424305" STUB_LABELS="complexity:micro" STUB_LABELS_FAIL=1 run_record_verdict clean-micro "daniel-ospina/agent-infra" 424305
+STUB_BODY="Fixes #424305" STUB_LABELS="complexity:micro" STUB_LABELS_FAIL=1 run_micro_verdict 424305
 Q86="$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424305.json"
 [ "$RECORD_RC" = "0" ] && ok "arm (c): labels fetch failure fails open (rc 0)" || bad "arm (c): labels fetch failure (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ -f "$Q86" ] && ok "arm (c): record written on fetch failure" || bad "arm (c): record written on fetch failure"
 
 # 8.7 arm (c): no closing ref in the body → fail-open warning.
-STUB_BODY="Just a docs change, no issue referenced" STUB_LABELS="complexity:micro" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424306
+STUB_BODY="Just a docs change, no issue referenced" STUB_LABELS="complexity:micro" run_micro_verdict 424306
 [ "$RECORD_RC" = "0" ] && ok "arm (c): body without closing ref fails open (rc 0)" || bad "arm (c): no closing ref (rc=$RECORD_RC)"
 assert_contains "$RECORD_ERR" "no same-repo closing-issue ref" "arm (c): warning names the missing linkage"
 
 # 8.8 arm (c): cross-repo-only closing ref → never binds tier → fail-open.
-STUB_BODY="Fixes daniel-ospina/tortoise#424307" STUB_LABELS="complexity:standard" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424308
+STUB_BODY="Fixes daniel-ospina/tortoise#424307" STUB_LABELS="complexity:standard" run_micro_verdict 424308
 [ "$RECORD_RC" = "0" ] && ok "arm (c): cross-repo-only ref fails open (rc 0)" || bad "arm (c): cross-repo-only (rc=$RECORD_RC, err=$RECORD_ERR)"
 
 # 8.9 multi-ref: ANY same-repo non-micro closing ref refuses; all-micro allows.
@@ -593,9 +687,10 @@ printf 'complexity:micro\n' > "$T/labels/424313"
 # even when these pins fail (the only failure gate is top-level FAIL=0).
 export STUB_LABELS_DIR="$T/labels"
 export STUB_LABELS=""   # per-issue map takes precedence in the stub
-STUB_BODY=$'Fixes #424310\nCloses #424311' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424309 "$SHA"
+STUB_BODY=$'Fixes #424310\nCloses #424311' run_micro_verdict 424309 "$SHA"
 [ "$RECORD_RC" = "4" ] && ok "multi-ref: any same-repo non-micro ref refuses (rc 4)" || bad "multi-ref: any non-micro refuses (rc=$RECORD_RC, err=$RECORD_ERR)"
-STUB_BODY=$'Fixes #424312\nCloses #424313' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424314 "$SHA"
+assert_tier_refusal "multi-ref non-micro"
+STUB_BODY=$'Fixes #424312\nCloses #424313' run_micro_verdict 424314 "$SHA"
 [ "$RECORD_RC" = "0" ] && ok "multi-ref: all-micro refs allow (rc 0)" || bad "multi-ref: all-micro allows (rc=$RECORD_RC, err=$RECORD_ERR)"
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
@@ -612,13 +707,14 @@ printf 'complexity:micro\n'   > "$T/labels/424330"
 printf 'complexity:complex\n' > "$T/labels/424331"
 export STUB_LABELS_DIR="$T/labels"
 export STUB_LABELS=""   # per-issue map takes precedence in the stub
-STUB_BODY=$'Closes #424330\nThis also closes #424331' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424332 "$SHA"
+STUB_BODY=$'Closes #424330\nThis also closes #424331' run_micro_verdict 424332 "$SHA"
 [ "$RECORD_RC" = "4" ] && ok "github-parity bind: mid-sentence complex ref refuses (rc 4)" || bad "github-parity bind: mid-sentence complex ref must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424332.json" ] && ok "github-parity bind: no record written on refusal" || bad "github-parity bind: record written on refusal"
+assert_tier_refusal "github-parity mid-sentence complex"
 # Positive control: when the mid-sentence ref is ALSO micro, the union must not
 # manufacture a refusal.
 printf 'complexity:micro\n' > "$T/labels/424333"
-STUB_BODY=$'Closes #424330\nThis also closes #424333' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424334 "$SHA"
+STUB_BODY=$'Closes #424330\nThis also closes #424333' run_micro_verdict 424334 "$SHA"
 [ "$RECORD_RC" = "0" ] && ok "github-parity bind: mid-sentence micro ref still allows (rc 0)" || bad "github-parity bind: all-micro union must allow (rc=$RECORD_RC, err=$RECORD_ERR)"
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
@@ -632,12 +728,15 @@ mkdir -p "$T/labels"
 printf 'complexity:standard\n' > "$T/labels/424316"
 export STUB_LABELS_DIR="$T/labels"
 export STUB_LABELS=""   # per-issue map takes precedence in the stub
-STUB_BODY="Fixes DANIEL-OSPINA/Agent-Infra#424316" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424317 "$SHA"
+STUB_BODY="Fixes DANIEL-OSPINA/Agent-Infra#424316" run_micro_verdict 424317 "$SHA"
 [ "$RECORD_RC" = "4" ] && ok "mixed-case slug: same-repo ref with different casing still refuses (rc 4)" || bad "mixed-case slug: casing bypassed the tier bind (rc=$RECORD_RC, err=$RECORD_ERR)"
-STUB_BODY="Fixes https://github.com/Daniel-Ospina/Agent-Infra/issues/424316" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424318 "$SHA"
+assert_tier_refusal "mixed-case slug"
+STUB_BODY="Fixes https://github.com/Daniel-Ospina/Agent-Infra/issues/424316" run_micro_verdict 424318 "$SHA"
 [ "$RECORD_RC" = "4" ] && ok "mixed-case URL: full-URL casing still refuses (rc 4)" || bad "mixed-case URL: casing bypassed the tier bind (rc=$RECORD_RC, err=$RECORD_ERR)"
-STUB_BODY="Fixes https://GITHUB.com/Daniel-Ospina/Agent-Infra/issues/424316" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424319 "$SHA"
+assert_tier_refusal "mixed-case URL"
+STUB_BODY="Fixes https://GITHUB.com/Daniel-Ospina/Agent-Infra/issues/424316" run_micro_verdict 424319 "$SHA"
 [ "$RECORD_RC" = "4" ] && ok "mixed-case HOST URL: uppercase host still refuses (rc 4)" || bad "mixed-case HOST URL: host casing bypassed the tier bind (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_tier_refusal "mixed-case HOST URL"
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
 
@@ -766,13 +865,13 @@ printf 'complexity:standard\n' > "$T/labels/424341"
 printf 'complexity:standard\n' > "$T/labels/424342"
 export STUB_LABELS_DIR="$T/labels"
 export STUB_LABELS=""   # per-issue map takes precedence in the stub
-STUB_BODY='The prefix #424340 is unrelated.' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424340 "$SHA"
+STUB_BODY='The prefix #424340 is unrelated.' run_micro_verdict 424340 "$SHA"
 [ "$RECORD_RC" = "0" ] && ok "false-refusal: 'prefix #N' is not a closing ref (rc 0)" || bad "false-refusal: 'prefix #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424340.json" ] && ok "false-refusal: 'prefix #N' record written" || bad "false-refusal: 'prefix #N' record must be written"
 assert_contains "$RECORD_ERR" "no same-repo closing-issue ref" "false-refusal: 'prefix #N' reached arm (c), not a tier bind"
-STUB_BODY='This discloses #424341 but does not close it.' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424341 "$SHA"
+STUB_BODY='This discloses #424341 but does not close it.' run_micro_verdict 424341 "$SHA"
 [ "$RECORD_RC" = "0" ] && ok "false-refusal: 'discloses #N' is not a closing ref (rc 0)" || bad "false-refusal: 'discloses #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
-STUB_BODY='Unresolved #424342 remains open.' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424342 "$SHA"
+STUB_BODY='Unresolved #424342 remains open.' run_micro_verdict 424342 "$SHA"
 [ "$RECORD_RC" = "0" ] && ok "false-refusal: 'unresolved #N' is not a closing ref (rc 0)" || bad "false-refusal: 'unresolved #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
@@ -790,18 +889,175 @@ printf 'complexity:standard\n' > "$T/labels/424350"
 printf 'complexity:standard\n' > "$T/labels/424351"
 export STUB_LABELS_DIR="$T/labels"
 export STUB_LABELS=""
-STUB_BODY='This also _closes #424350_ in passing' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424350 "$SHA"
+STUB_BODY='This also _closes #424350_ in passing' run_micro_verdict 424350 "$SHA"
 [ "$RECORD_RC" = "4" ] && ok "#1336: mid-sentence '_closes #N_' refuses a non-micro ref (rc 4)" || bad "#1336: mid-sentence '_closes #N_' must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424350.json" ] && ok "#1336: underscore-emphasis refusal wrote no record" || bad "#1336: refusal must write no record"
+assert_tier_refusal "#1336 underscore-emphasis"
 # Negative control, and it is the whole point of `[^[:alnum:]_]` over
 # `[^[:alnum:]]`: an INTRA-WORD underscore is not an emphasis opener and GitHub
 # does NOT close `foo_closes #N`, so the guard must PROCEED (arm (c)). A fix that
 # widened the class by deleting `_` from the non-word set would false-refuse.
-STUB_BODY='This is a foo_closes #424351 reference' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424351 "$SHA"
+STUB_BODY='This is a foo_closes #424351 reference' run_micro_verdict 424351 "$SHA"
 [ "$RECORD_RC" = "0" ] && ok "#1336: intra-word 'foo_closes #N' is not a closing ref (rc 0)" || bad "#1336: 'foo_closes #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
 assert_contains "$RECORD_ERR" "no same-repo closing-issue ref" "#1336: 'foo_closes #N' reached arm (c), not a tier bind"
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
+
+# 8.16 (#2615) — THE SURFACE CAP'S FOUR OUTCOMES, PINNED APART. The cap is the
+# one place where "the API answered EMPTY" and "I could not read it" were read by
+# a human as the same thing: tonight's red was diagnosed from a log that showed
+# an empty DIFF BODY beside a refusal, although the refusal came from the
+# CHANGED-PATH payload and the empty body only cost the carry-forward digest.
+# No vector in this suite exercised the cap at all — the only ones that did
+# lived in tests/record-review/run.sh §30viii/30ix/30x — so its arms could
+# collapse without a red. Each arm below asserts its own rc and whether a record
+# was written; the WORDING is a class, not an arm: `review_surface_rows` returns
+# one rc per cause CLASS, so REFUSED (a compare 404/422) and INCONSISTENT (a
+# `mb` header with no row) are the SAME rc 3 and share its cause-list message —
+# they are pinned as one class with two causes. rc 0/1/2 each have wording of
+# their own. The count/parity refusal ("changes N path(s) but GitHub reports M —
+# the changed-path list is truncated or inconsistent") is a rc-0 path with its OWN
+# message, so it is pinned separately below: without that vector, deleting the
+# arm (`[ "$MICRO_DISTINCT" -ge 300 ] || [ "$MICRO_DISTINCT" != "$MICRO_EXPECT" ]`)
+# leaves this suite green (measured), i.e. a truncated or forged changed-path
+# list could certify a surface. `tests/record-review/run.sh` §30vi pins only the
+# `--print-tier` classification (`too_large`), never this record-path refusal.
+#
+#   EMPTY        the API ANSWERED: 0 changed files            → rc 2, exit 4
+#   UNREADABLE   transport, no status / status-bearing 403/5xx → rc 1, WARN + record
+#   REFUSED      the API answered and REFUSED this revision    → rc 3, exit 4
+#   INCONSISTENT claims a surface and delivers no row          → rc 3, exit 4
+#
+# The split is load-bearing, not cosmetic: a transport blip must not strand a
+# legitimate micro record (fail-open), while a payload that cannot certify a
+# surface must never clear a tier that dispatches no reviewers (fail-closed).
+# Both halves of the refusal set are pinned: the classifier keys on
+# `HTTP (404|422)`, so a 422-only regression (a rewritten sha) would be invisible
+# to a 404-only vector — measured: narrowing that regex to `HTTP 404` left this
+# suite green before the 422 vector existed.
+echo "── 8.16 (#2615) the clean-micro surface cap tells its four outcomes apart ──"
+
+# EMPTY — the API answered with NO changed files. The `empty` status, not a
+# truncation and not a read failure: there is no surface to certify.
+STUB_CHANGED_FILES=0 STUB_FILES="" run_micro_verdict 424360
+[ "$RECORD_RC" = "4" ] && ok "8.16 empty: 0 changed files refuses (exit 4)" || bad "8.16 empty: must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424360.json" ] && ok "8.16 empty: no record written" || bad "8.16 empty: wrote a record for a diff with no surface"
+assert_contains "$RECORD_ERR" "has NO changed files, so there is no surface to certify" "8.16 empty: the refusal names the EMPTY payload"
+assert_not_contains "$RECORD_ERR" "could not read the changed paths" "8.16 empty: an answered-empty is NOT reported as a read failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 empty: the EMPTY arm is distinct from the uncertifiable arm"
+
+# UNREADABLE (1/2) — a TRANSPORT failure with NO status at all: `gh` exits
+# non-zero with empty stderr (a dead socket, a killed process). NOTHING was read,
+# so the cap is UNVERIFIED and the record PROCEEDS with a loud warning (the
+# pre-existing fail-open posture). If this ever starts refusing, a legitimate
+# micro PR is stranded on a network blip and told to pay for a full review.
+STUB_COMPARE_FAIL=1 STUB_BODY="Fixes #424361" STUB_LABELS="complexity:micro" run_micro_verdict 424361
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a transport failure warns and PROCEEDS (rc 0)" || bad "8.16 unreadable: must proceed (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424361.json" ] && ok "8.16 unreadable: the record IS written (fail-open)" || bad "8.16 unreadable: no record written — a transport blip stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the warning names the READ failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a read failure is NOT reported as an uncertifiable payload"
+
+# UNREADABLE (2/2) — a TRANSPORT failure that DOES carry a status (a 403 rate
+# limit / a 5xx). `gh` reports those on stderr just as it reports a 404, so the
+# classifier must key on WHICH status, not on whether one is present: only
+# 404/422 refuse. This vector is the reason the stub's HTTP arm prints a
+# status-appropriate reason string.
+STUB_COMPARE_HTTP=503 STUB_BODY="Fixes #424365" STUB_LABELS="complexity:micro" run_micro_verdict 424365
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a status-bearing transport failure (503) PROCEEDS (rc 0)" || bad "8.16 unreadable: a 503 must proceed, not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424365.json" ] && ok "8.16 unreadable: the 503 record IS written" || bad "8.16 unreadable: a 503 stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 503 warning names the READ failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 503 is NOT reported as an uncertifiable payload"
+
+# UNREADABLE (3/3) — the OTHER rc-1 cause: the `pulls` meta read itself failed,
+# so the cap never reaches the compare. Same posture (warn, record proceeds), and
+# pinned because `review_surface_rows`' contract names three rc-1 causes while a
+# compare-only vector exercises one.
+# ⚠️ PINNED AS-IS, NOT AS SHOULD (#2628). The pulls read does
+# `2>/dev/null ... || return 1`, so it cannot tell a dead socket from a 401/403/
+# 5xx/404 — the #2511 review's P1, still unfixed and was untracked until #2628.
+# This vector therefore pins the CURRENT behaviour deliberately; when #2628 makes
+# that read status-aware (404/422 → rc 3), THIS assertion must change with it.
+# Do not read it as an endorsement.
+STUB_META_FAIL=1 STUB_BODY="Fixes #424366" STUB_LABELS="complexity:micro" run_micro_verdict 424366
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a failed meta read PROCEEDS (rc 0)" || bad "8.16 unreadable: a failed meta read must proceed (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424366.json" ] && ok "8.16 unreadable: the record IS written after a failed meta read" || bad "8.16 unreadable: a failed meta read stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the failed-meta warning names the READ failure"
+
+# UNREADABLE (4/4) — and a rate-limit window (403), which `gh` reports WITH a
+# status. Pinned separately from the 503 because it is the shape a lane actually
+# hits and the one #2511's review measured as a false-refusal risk: if the
+# classifier ever widened to `HTTP 403`, a throttled compare would REFUSE and
+# strand a legitimate micro record. Measured: widening `HTTP (404|422)` to
+# include 403 now reds this vector.
+STUB_COMPARE_HTTP=403 STUB_BODY="Fixes #424368" STUB_LABELS="complexity:micro" run_micro_verdict 424368
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a rate-limited compare (403) PROCEEDS (rc 0)" || bad "8.16 unreadable: a 403 must proceed, not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424368.json" ] && ok "8.16 unreadable: the 403 record IS written" || bad "8.16 unreadable: a 403 stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 403 warning names the READ failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 403 is NOT reported as an uncertifiable payload"
+
+# REFUSED (1/2) — the API ANSWERED and refused this revision (HTTP 404: an
+# unreachable fork head, a rewritten sha). POSITIVE evidence, so it refuses: the
+# surface of THIS sha cannot be read, and a tier that dispatches no reviewers must
+# not be cleared on a guess. The wording must not blame the network.
+STUB_COMPARE_HTTP=404 STUB_BODY="Fixes #424362" STUB_LABELS="complexity:micro" run_micro_verdict 424362
+[ "$RECORD_RC" = "4" ] && ok "8.16 refused: a compare 404 refuses (exit 4)" || bad "8.16 refused: must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424362.json" ] && ok "8.16 refused: no record written" || bad "8.16 refused: wrote a record over a refused revision"
+assert_contains "$RECORD_ERR" "cannot be certified" "8.16 refused: the refusal names the uncertifiable payload"
+assert_not_contains "$RECORD_ERR" "could not read the changed paths" "8.16 refused: an API REFUSAL is NOT reported as a transport failure"
+
+# REFUSED (2/2) — and the SAME class's other status, 422 (a rewritten sha).
+# The classifier's pattern is `HTTP (404|422)`, so a 404-only vector cannot see a
+# regression that drops 422 — measured: narrowing it to `HTTP 404` left this
+# suite green, which is a fail-open on the rewritten-sha class the cap exists for.
+STUB_COMPARE_HTTP=422 STUB_BODY="Fixes #424367" STUB_LABELS="complexity:micro" run_micro_verdict 424367
+[ "$RECORD_RC" = "4" ] && ok "8.16 refused: a compare 422 refuses (exit 4)" || bad "8.16 refused: a 422 must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424367.json" ] && ok "8.16 refused: no record written for a 422" || bad "8.16 refused: wrote a record over a 422-refused revision"
+assert_contains "$RECORD_ERR" "cannot be certified" "8.16 refused: the 422 refusal names the uncertifiable payload"
+assert_not_contains "$RECORD_ERR" "could not read the changed paths" "8.16 refused: a 422 is NOT reported as a transport failure"
+
+# INCONSISTENT — the payload CLAIMS a surface (changed_files=1) and delivers no
+# changed-path row. THIS IS TONIGHT'S SHAPE (#2615): the fixture produced it and
+# the cap refused, correctly. Pinned as a REFUSAL so a future stale vector can
+# never be "fixed" by loosening this arm back into the #2470/#2472 fail-open.
+STUB_CHANGED_FILES=1 STUB_FILES="" STUB_COMPARE="" STUB_BODY="Fixes #424363" STUB_LABELS="complexity:micro" run_micro_verdict 424363
+[ "$RECORD_RC" = "4" ] && ok "8.16 inconsistent: a claimed-but-absent surface refuses (exit 4)" || bad "8.16 inconsistent: must refuse — an empty payload must never certify a surface (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424363.json" ] && ok "8.16 inconsistent: no record written" || bad "8.16 inconsistent: certified a tier from an empty changed-path payload"
+assert_contains "$RECORD_ERR" "cannot be certified" "8.16 inconsistent: the refusal names the uncertifiable payload"
+
+# ...and the boundary on the other side, so 8.16 cannot pass by refusing
+# everything: a rail path in the SAME one-file shape still refuses, and names
+# the surface it hit.
+STUB_FILES="scripts/admin-merge.sh" STUB_BODY="Fixes #424364" STUB_LABELS="complexity:micro" run_micro_verdict 424364
+[ "$RECORD_RC" = "4" ] && ok "8.16 rail: a rail path in a micro diff still refuses (exit 4)" || bad "8.16 rail: must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424364.json" ] && ok "8.16 rail: no record written" || bad "8.16 rail: wrote a clean-micro record for a rail edit"
+assert_contains "$RECORD_ERR" "touches an ALWAYS-FULL surface" "8.16 rail: the refusal names the ALWAYS-FULL surface"
+
+# PARITY/TRUNCATION — the payload delivers a DIFFERENT number of distinct paths
+# than GitHub's own `changed_files` says the PR has (the compare endpoint caps at
+# 300 entries and does not paginate, so an AT-THE-CAP list may be short — and a
+# short list could be missing the one rail path that would have selected `full`).
+# This arm had no vector anywhere: `tests/record-review/run.sh` §30vi pins the
+# `--print-tier` `too_large` status only, so deleting the record-path arm left
+# both suites green (measured). Note the message is its OWN, not the rc-3 list.
+STUB_CHANGED_FILES=2 STUB_BODY="Fixes #424369" STUB_LABELS="complexity:micro" run_micro_verdict 424369
+[ "$RECORD_RC" = "4" ] && ok "8.16 parity: a 1-row payload for a 2-file PR refuses (exit 4)" || bad "8.16 parity: a truncated list must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424369.json" ] && ok "8.16 parity: no record written for a truncated list" || bad "8.16 parity: certified a surface from a list GitHub says is short"
+assert_contains "$RECORD_ERR" "the changed-path list is truncated or inconsistent" "8.16 parity: the refusal names the truncated/inconsistent list"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 parity: the truncation arm has its own wording (not the rc-3 cause list)"
+
+# THE 300-ENTRY CEILING — the arm's OTHER disjunct, and it is a different failure
+# mode from the parity one above: the compare endpoint returns at most 300 entries
+# and does not paginate, so a diff AT the cap may have been silently shortened —
+# and `a diff that large is never micro` is the policy besides. Pinned separately
+# because each disjunct guards a different hole: the parity vector above catches a
+# COUNT MISMATCH, this one catches a COMPLETE-LOOKING 300-path diff, which the
+# `-ge 300` half refuses on size alone. Measured: deleting just `[ "$MICRO_DISTINCT"
+# -ge 300 ] ||` left this suite green before this vector existed, i.e. a 300-path
+# diff could have recorded clean-micro — the tier that dispatches no reviewers.
+STUB_CHANGED_FILES=300 STUB_FILES="$(seq -f 'docs/f%g.md' 1 300)" STUB_BODY="Fixes #424370" STUB_LABELS="complexity:micro" run_micro_verdict 424370
+[ "$RECORD_RC" = "4" ] && ok "8.16 ceiling: a 300-path diff refuses (exit 4)" || bad "8.16 ceiling: a 300-path diff must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424370.json" ] && ok "8.16 ceiling: no record written at the 300-entry cap" || bad "8.16 ceiling: certified a 300-path diff clean-micro"
+assert_contains "$RECORD_ERR" "the changed-path list is truncated or inconsistent" "8.16 ceiling: the refusal names the truncated/inconsistent list"
 
 # 9. #980 argv/env fail-closed guard ─────────────────────────────
 # The second-model flag/env surface was REMOVED. Its removal must fail CLOSED:
@@ -1266,10 +1522,39 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #      its own PR number, so a leftover record there would let the parse pass even
 #      if A's writer silently failed (the vacuity this block exists to close).
 #      424520-424523 is verified unused by every other vector in this file.
-#  (2) The env-prefix assignments LEAK: `VAR=val func` does not restore VAR if it
-#      was previously UNSET (bash semantics), so STUB_FILES/STUB_DIFF_FILE would
-#      persist into §10 and make its code-bearing vectors see a docs-only diff.
-unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA P2 MB
+#  (2) The env-prefix assignments: `VAR=val func` is NOT a leak — a prefix
+#      assignment before a FUNCTION call is restored when the call returns, and a
+#      PLAIN assignment inside the callee is discarded too (measured on bash
+#      5.2.21: `g(){ W=inside; }; W=pre; W=pfx g` → W=pre; prev-unset → unset;
+#      `k(){ :; }` → restored either way). What DEFEATS the restore is the callee
+#      EXPORTING that variable, whatever its previous value:
+#      `h(){ export W=inside; }; W=pre; W=pfx h` → W=inside (prev-unset → inside
+#      too), and even a bare `export W` leaves the TEMPORARY value behind
+#      (`j(){ export W; }; W=pre; W=pfx j` → W=pfx). Special builtins OTHER than
+#      `export` keep the value only under `set -o posix`, which this suite does
+#      not use (`C=pre; C=pfx :` → C=pre here, C=pfx under --posix) — but `export`
+#      IS a special builtin and keeps it in BOTH modes (`A=pre; A=pfx export A`
+#      → A=pfx either way), so a top-level `VAR=… export VAR` idiom is not safe
+#      here on posix-mode grounds.
+#      That export case is exactly why every runner here does its `export`s
+#      INSIDE its own `( … )` subshell: nothing a runner exports can escape the
+#      call (measured: after a `run_record_diff_with` the four variables come back
+#      unset, or at their pre-set value). NOTE: an earlier revision of this note
+#      restricted the exception to the previously-UNSET case — a probe with the
+#      callee exporting a DIFFERENT variable appeared to confirm it. That was a
+#      buggy probe; the sentence you are reading is the measured one.
+#      The carriers that survive a call are the TOP-LEVEL exports: `export
+#      STUB_LABELS_DIR` / `export STUB_LABELS` in §8.9 / §8.9a / §8.9b / §8.14 /
+#      §8.15 (the five blocks that install a per-issue label map). Each unsets its
+#      own after use; the line below is DEFENSIVE for a future block that returns
+#      early, and it now names them so the belt is real rather than claimed
+#      (measured: the line is removable today without changing the suite — that is
+#      what "defensive" means here, not that it is unnecessary).
+#      §8.16's `run_micro_verdict` relies on the RESTORE half of the same
+#      semantics — `STUB_FILES="${STUB_FILES-$MICRO_SURFACE}"` must not leak a
+#      surface into the next vector — and this note documented that behaviour
+#      backwards until a review measured it (#2615).
+unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA STUB_LABELS_DIR STUB_LABELS P2 MB
 
 # ─────────────────────────────────────────────────────────────────────────
 # 11.11 #1398 — the 300-file diff cap: classify by CONTENT, fall back to a
@@ -1809,6 +2094,275 @@ assert_eq "$PDH_OUT" "ok${PDH_TAB}${L_SHA}" "11.12f the size-cap fallback mints 
 unset PDH_OUT PDH_RC PDH_TAB PDH_EMPTY_DIGEST PDH_NONDIFF
 
 unset STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD STUB_LOCAL_META_FAIL STUB_LOCAL_BASE_REF RECORD_REVIEW_LOCAL_DIFF_NOFETCH STUB_DIFF_FAIL STUB_DIFF_FILE NORM1398 L_REPO L_BASE L_HEAD L_SHA CAP406 CAP406_SHA CAP406_PRETTY CAP406_PRETTY_SHA CAP406_SPLIT CAP406_SPLIT_SHA SPLIT_DIFF SPLIT_DIFF_SHA API_STYLE API_STYLE_SHA REAL_WITH_CODE REAL_WITH_CODE_SHA L_WRONG L_NOFETCH L_FETCH BARE1398 L_BIN LB_BASE LB_HEAD LB_SHA LB_SHA4
+
+# ─────────────────────────────────────────────────────────────────────────
+# 11.13 #1351 — `--check-carry`: THE LANE'S QUESTION, answered by the gate's own
+#      predicate ("my record's head is stale; is the diff I reviewed still the
+#      diff that would merge?").
+# ─────────────────────────────────────────────────────────────────────────
+# WHY THIS EXISTS. The local merge gate carries a record across a base move when
+# the recorded `diff_sha256` equals the PR's live normalized three-dot diff. No
+# surface TOLD a lane that, so lanes inferred "the branch moved, therefore the
+# review is stale" and paid for a fresh 20-40 minute review after every base
+# move — while the content was byte-identical. This mode is the ONE way to ask,
+# and it adds NO second definition of "unchanged": it reuses the same
+# `diff_hash_for_pr` the record path and the GitHub gate share, and the gate's
+# own identity rule (full lowercase 64-hex, never the empty-body constant).
+#
+# The negatives carry the weight: a MISSING record, a missing digest, a CHANGED
+# diff and an UNREADABLE diff must each be distinguishable from a carry, because
+# every one of them has a different remedy — and "could not read" must never be
+# reported as "unchanged" (that is the fail-open this whole design forbids).
+echo "── 11.13 #1351: --check-carry (the lane's carry question) ────────"
+CC_REPO="daniel-ospina/agent-infra"
+CC_RDIR="$F_HOME/.pi/agent/reviews"
+mkdir -p "$CC_RDIR"
+CC_TAB="$(printf '\t')"
+CC_HEAD="$(printf 'a%.0s' $(seq 1 40))"     # the stub's .head.sha
+CC_STALE="$(printf 'd%.0s' $(seq 1 40))"
+# SELF-CONTAINED fixtures: §11.12's are unset above, and a section that leaned on
+# them would abort under `set -u` (or, worse, silently compare against a digest
+# some other section computed with different bytes).
+CC_DIFF="$T/cc-real.diff"
+printf 'diff --git a/docs/cc.md b/docs/cc.md\nindex 1111111..2222222 100644\n--- a/docs/cc.md\n+++ b/docs/cc.md\n@@ -1,3 +1,4 @@\n a\n+b\n c\n d\n' > "$CC_DIFF"
+# The digest is computed with the ONE shared normalizer (scripts/lib/diff-normalize.py)
+# — the same primitive the producer and the GitHub gate use. A local second
+# implementation here would let the fixture agree with itself and disagree with
+# production, which is the drift the single-implementation rule forbids.
+CC_SHA="$(python3 "$SCRIPT_DIR/lib/diff-normalize.py" < "$CC_DIFF" | openssl dgst -sha256 | awk '{print $NF}')"
+CC_DIFF_B="$(printf '2%.0s' $(seq 1 64))"
+CC_NONDIFF="$T/cc-nondiff.json"
+printf '%s' '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}' > "$CC_NONDIFF"
+CC_CAP406="$T/cc-cap-406.json"
+printf '%s' '{"message":"Sorry, the diff exceeded the maximum number of files (300).","errors":[{"resource":"PullRequest","field":"diff","code":"too_large"}],"documentation_url":"https://docs.github.com/rest/pulls/pulls","status":"406"}' > "$CC_CAP406"
+CC_FILE="$CC_RDIR/daniel-ospina-agent-infra"
+cc_rec() { # <pr> <head> <diff-or-EMPTY>
+    if [ "$3" = "EMPTY" ]; then
+        printf '{"pr":%s,"head_sha":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' "$1" "$2" "$CC_REPO" > "$CC_FILE-$1.json"
+    else
+        printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' "$1" "$2" "$3" "$CC_REPO" > "$CC_FILE-$1.json"
+    fi
+}
+run_check_carry() { # <pr> <repo> [script] -> CC_OUT / CC_RC
+    local sh="${3:-$RECORD}"
+    # ⛔ CC_RC IS RESET *AND* CAPTURED WITH `||`. A bare `CC_OUT=$(…)` assignment
+    # inherits the command's exit status, so under this harness's `set -e` the
+    # FIRST non-zero verdict (a `fresh`, an `unreadable`, a `norecord` — i.e.
+    # every answer this section exists to assert) would abort the whole suite and
+    # the missing summary would be attributed to the next section. The `||` keeps
+    # the compound list's status 0 while still recording the real code.
+    CC_RC=0
+    # GH_REPO="" (not merely unset): the script falls back to it when no repo is
+    # passed, and this suite must answer from what the FIXTURE says, not from the
+    # ambient shell a developer happens to have exported.
+    CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="${STUB_DIFF_FILE:-$CC_DIFF}" STUB_DIFF_FAIL="${STUB_DIFF_FAIL:-0}" \
+        STUB_DIFF_406_FILE="${STUB_DIFF_406_FILE:-}" \
+        STUB_LOCAL_BASE="${STUB_LOCAL_BASE:-}" STUB_LOCAL_HEAD="${STUB_LOCAL_HEAD:-}" \
+        STUB_HEAD_SHA="${STUB_HEAD_SHA:-$CC_HEAD}" \
+        RECORD_REVIEW_LOCAL_REPO="${RECORD_REVIEW_LOCAL_REPO:-.}" \
+        bash "$sh" --check-carry "$1" "$2" 2>"$T/cc-err")" || CC_RC=$?
+}
+
+# (a) a record bound to the CURRENT head is valid with NO digest at all — and it
+#     must report `head`, not `carry`: "nothing is stale" and "the content is
+#     identical" are different statements, and only one of them is true here.
+cc_rec 424901 "$CC_HEAD" EMPTY
+run_check_carry 424901 "$CC_REPO"
+assert_eq "$CC_RC" "0" "11.13a a record at the current head is accepted (exit 0)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "head" "11.13a …and reports 'head', not 'carry'"
+
+# (b) THE CARRY: base-only move, diff unchanged. This is the answer that saves the
+#     lane a whole review cycle.
+cc_rec 424902 "$CC_STALE" "$CC_SHA"
+run_check_carry 424902 "$CC_REPO"
+assert_eq "$CC_RC" "0" "11.13b a stale head with an UNCHANGED diff is a carry (exit 0)"
+assert_eq "$CC_OUT" "carry${CC_TAB}${CC_SHA}${CC_TAB}${CC_SHA}" "11.13b …and prints both digests, so the claim is checkable"
+assert_contains "$(cat "$T/cc-err")" "Do NOT re-review" "11.13b …and says the one thing a lane needs to hear"
+
+# (c) the DIFF CHANGED → a fresh review IS owed. Distinct exit code, distinct advice.
+cc_rec 424903 "$CC_STALE" "$CC_DIFF_B"
+run_check_carry 424903 "$CC_REPO"
+assert_eq "$CC_RC" "1" "11.13c a CHANGED diff is NOT a carry (exit 1)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "fresh" "11.13c …and reports 'fresh'"
+assert_contains "$(cat "$T/cc-err")" "the DIFF CHANGED" "11.13c …and names the finding, not a read failure"
+
+# (d) AN UNREADABLE DIFF IS NEVER A CARRY — checked for every non-ok status the
+#     seam can emit. This is the fail-open the design forbids: "we could not read
+#     it" must not become "it is unchanged".
+cc_rec 424904 "$CC_STALE" "$CC_SHA"
+for cc_status in empty nondiff too_large unavailable; do
+    case "$cc_status" in
+        empty) STUB_DIFF_FILE=/dev/null STUB_DIFF_FAIL=0 run_check_carry 424904 "$CC_REPO" ;;
+        nondiff) STUB_DIFF_FILE="$CC_NONDIFF" STUB_DIFF_FAIL=0 run_check_carry 424904 "$CC_REPO" ;;
+        too_large) STUB_DIFF_406_FILE="$CC_CAP406" RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" run_check_carry 424904 "$CC_REPO" ;;
+        unavailable) STUB_DIFF_FAIL=1 run_check_carry 424904 "$CC_REPO" ;;
+    esac
+    if [ "$CC_RC" = "0" ]; then bad "11.13d an unreadable diff ($cc_status) was reported as a carry (exit 0)";
+    else ok "11.13d an unreadable diff ($cc_status) is refused (exit $CC_RC), never a carry"; fi
+    assert_eq "${CC_OUT%%"$CC_TAB"*}" "unreadable" "11.13d …reported as 'unreadable', not 'fresh' (different remedy)"
+    assert_eq "$(printf '%s' "$CC_OUT" | cut -f3)" "$cc_status" "11.13d …and names the seam status ($cc_status)"
+done
+unset STUB_DIFF_FILE STUB_DIFF_FAIL STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD RECORD_REVIEW_LOCAL_REPO
+
+# (e) no record at all → nothing to carry, and it says so rather than guessing.
+rm -f "$CC_FILE-424905.json" "$CC_RDIR/424905.json"
+run_check_carry 424905 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13e no record → exit 4 (nothing to carry)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13e …reports 'norecord'"
+
+# (f) a legacy/degraded record (NO diff_sha256) beside a stale head → `nodigest`,
+#     whose remedy is the RECORDER's own carry arm (a carry, not a review). It
+#     must not be reported as `fresh` — that is the 20-40 minute mistake.
+cc_rec 424906 "$CC_STALE" EMPTY
+run_check_carry 424906 "$CC_REPO"
+assert_eq "$CC_RC" "5" "11.13f a record with no usable digest → exit 5 (nodigest)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "nodigest" "11.13f …reports 'nodigest', not 'fresh'"
+assert_contains "$(cat "$T/cc-err")" "that is a CARRY, not a fresh review" "11.13f …and points at the recorder's carry arms"
+
+# (g) #426: a legacy <pr>.json naming ANOTHER repo is not this PR's record.
+rm -f "$CC_FILE-424907.json"
+printf '{"pr":424907,"head_sha":"%s","verdict":"clean","repo":"someone-else/other"}\n' "$CC_STALE" > "$CC_RDIR/424907.json"
+run_check_carry 424907 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13g another repo's legacy record is not read (exit 4)"
+rm -f "$CC_RDIR/424907.json"
+
+# (g2) THE GATE'S COLLISION RULE, APPLIED TO THE QUALIFIED FILE TOO (review, #2353 P1).
+# The merge gate treats a qualified record whose embedded `repo` names ANOTHER repo as
+# ABSENT (the identical-slug overwrite class). A surface that reported `carry … land it`
+# for it would be a second definition of "the record" — the exact divergence this mode
+# exists to prevent.
+printf '{"pr":424909,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"someone-else/other"}\n' "$CC_STALE" "$CC_SHA" > "$CC_FILE-424909.json"
+run_check_carry 424909 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13g2 a qualified record naming ANOTHER repo is not read (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13g2 …reports 'norecord', like the gate"
+rm -f "$CC_FILE-424909.json"
+
+# (g2b) …AND THE COLLISION MUST NOT FALL THROUGH TO THE LEGACY FILE (review round 2, F3).
+# The gate returns NULL on a qualified collision — it does not then look for `<pr>.json`.
+# A fall-through shape answers `head`/`carry` ("land it") on the same fixtures while the
+# gate blocks, which IS the round-1 P1b re-introduced. The qualified file and a matching
+# legacy sibling must disagree in exactly one direction: norecord.
+printf '{"pr":424912,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"someone-else/other"}\n' "$CC_STALE" "$CC_SHA" > "$CC_FILE-424912.json"
+printf '{"pr":424912,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"%s"}\n' "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_RDIR/424912.json"
+run_check_carry 424912 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13g2b a qualified collision does NOT fall through to the legacy sibling (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13g2b …norecord, exactly as the gate finds no record"
+rm -f "$CC_FILE-424912.json" "$CC_RDIR/424912.json"
+
+# (g3) THE KEY IS CASE-EXACT. `repo` is compared as a string by the gate, and the record
+# path is derived from the spelling the writer was handed; folding case here would make
+# this mode accept a key the gate never looks up.
+printf '{"pr":424910,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"Daniel-Ospina/agent-infra"}\n' "$CC_STALE" "$CC_SHA" > "$CC_FILE-424910.json"
+run_check_carry 424910 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13g3 a differently-CASED repo is a different key (exit 4)"
+rm -f "$CC_FILE-424910.json"
+
+# (g4) NO REPO IS A DIFFERENT RULE, NOT A DEGENERATE ONE (review, #2353 P2).
+# With no repo context the gate cannot derive a qualified name, so it trusts a key that
+# PROVES its repo: one uniquely-matching <owner>-<repo>-<pr>.json. This mode looked only
+# at <pr>.json, so in the exact state it exists for — repo auto-detection failing under a
+# contested gh gate — it said "no record … run the review" about a record the gate reads.
+# The record IS found here (so NOT `norecord`); what fails is the diff READ, which needs a
+# repo — and a failed read is `unreadable`, never `norecord` and never a carry.
+cc_rec 424913 "$CC_STALE" "$CC_SHA"
+run_check_carry 424913 ""
+assert_eq "$CC_RC" "3" "11.13g4 with no repo, a UNIQUE qualified record is FOUND (exit 3 = the read failed, not 'no record')"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "unreadable" "11.13g4 …reports 'unreadable', not 'norecord'"
+rm -f "$CC_FILE-424913.json"
+
+# (g5) …while an AMBIGUOUS lookup is genuinely no record: two repos claim #PR, and the
+# gate treats that as absent (it cannot tell which is yours). The remedy must name the
+# missing repo, not "run the review".
+cc_rec 424914 "$CC_STALE" "$CC_SHA"
+printf '{"pr":424914,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"someone-else/other"}\n' "$CC_STALE" "$CC_SHA" > "$CC_RDIR/someone-else-other-424914.json"
+run_check_carry 424914 ""
+assert_eq "$CC_RC" "4" "11.13g5 with no repo, TWO qualified records are ambiguous (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13g5 …reports 'norecord'"
+assert_contains "$(cat "$T/cc-err")" "pass owner/repo" "11.13g5 …and names the actual remedy (a repo), not a re-review"
+rm -f "$CC_FILE-424914.json" "$CC_RDIR/someone-else-other-424914.json"
+
+# (g6) …and a legacy record that EMBEDS a repo is rejected with no repo context (#426
+# review P0-2): it may be another repo's PR with this number.
+printf '{"pr":424915,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"%s"}\n' "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_RDIR/424915.json"
+run_check_carry 424915 ""
+assert_eq "$CC_RC" "4" "11.13g6 with no repo, a repo-EMBEDDING legacy record is not trusted (exit 4)"
+rm -f "$CC_RDIR/424915.json"
+
+# (g7) THE POSITIVE LEGACY DIRECTION (review, #2353 round 3 note). With a repo resolved
+# and NO qualified file, a legacy <pr>.json naming THIS repo IS the record — the #426
+# migration fallback. Unpinned, the `elif` could be narrowed away and every pre-#426 lane
+# would be told there is no record.
+printf '{"pr":424916,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"%s"}\n' "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_RDIR/424916.json"
+run_check_carry 424916 "$CC_REPO"
+assert_eq "$CC_RC" "0" "11.13g7 with a repo, the legacy record naming this repo is READ (exit 0)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "carry" "11.13g7 …and carries on the matching digest"
+rm -f "$CC_RDIR/424916.json"
+
+# (f2) `nodigest` NEEDS NO READ, so it must be decided BEFORE the diff read (review,
+# #2353 P2). With a digest-less record AND an unreadable diff, the answer is the one
+# that unsticks the lane (re-run the recorder's carry arms), not an endless RETRY.
+cc_rec 424911 "$CC_STALE" EMPTY
+STUB_DIFF_FAIL=1 run_check_carry 424911 "$CC_REPO"
+assert_eq "$CC_RC" "5" "11.13f2 a digest-less record answers nodigest even when the diff cannot be read"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "nodigest" "11.13f2 …not 'unreadable' (a RETRY loop that cannot converge)"
+
+# (f3) THE `nodigest` REMEDY MUST BE RUNNABLE IN THE STATE IT FIRES IN (review, #2353
+# round 4). It used to end `… $REPO`, which with REPO empty is an EMPTY SLOT: the advised
+# command is refused by the recorder's own carry arms (they must compute the diff, which
+# needs a repo), names "run the review" — the 20-40 minute path this mode exists to avoid
+# — and re-running --check-carry answers `nodigest` again. A remedy that cannot converge
+# is not a remedy; with no repo it must name what is missing instead.
+cc_rec 424917 "$CC_STALE" EMPTY
+run_check_carry 424917 ""
+assert_eq "$CC_RC" "5" "11.13f3 no repo + digest-less record → still 'nodigest' (exit 5), not a carry"
+assert_contains "$(cat "$T/cc-err")" "owner/repo" "11.13f3 …and the remedy NAMES the missing repo instead of printing an empty slot"
+assert_contains "$(cat "$T/cc-err")" "NO repo was resolved here" "11.13f3 …stating that the carry arms cannot verify identity without it"
+rm -f "$CC_FILE-424917.json"
+
+# (h) READ-ONLY means read-only: a record-minting flag is REFUSED, not ignored —
+#     otherwise a caller believes it recorded something it did not.
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" bash "$RECORD" --check-carry 424902 "$CC_REPO" --evidence comment:1 2>/dev/null)" || CC_RC=$?
+assert_eq "$CC_RC" "2" "11.13h --evidence is refused in --check-carry (exit 2)"
+assert_eq "$CC_OUT" "" "11.13h …and prints no verdict (it did not answer)"
+
+# (i) NO REPO → the diff CANNOT be read (the read is keyed on the repo), so the mode
+#     must FAIL CLOSED: `unreadable`, exit 3 — never a carry, even with a record present.
+#     A verdict that claims "unchanged" without having read the diff is exactly the
+#     fail-open this design forbids.
+printf '{"pr":424908,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh"}\n' "$CC_STALE" "$CC_SHA" > "$CC_RDIR/424908.json"
+run_check_carry 424908 ""
+assert_eq "$CC_RC" "3" "11.13i with no repo the mode fails CLOSED (exit 3, never a carry)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "unreadable" "11.13i …reports 'unreadable', not 'carry'"
+rm -f "$CC_RDIR/424908.json"
+
+# (j) MUTATION PIN — the comparison itself must be load-bearing. A real copy of
+#     the script with the equality replaced by "always equal" must report the
+#     CHANGED-diff case (11.13c) as a CARRY; if it does not, 11.13c proves nothing.
+CC_MUT="$T/record-review-cc-mutant.sh"
+cp "$RECORD" "$CC_MUT"
+if grep -qF 'if [ "$CC_DIFF" = "$DIFF_HASH" ]; then' "$CC_MUT"; then
+    # The anchor allows LEADING WHITESPACE: the comparison sits inside the
+    # `if [ "$CHECK_CARRY" -eq 1 ]` block, so `^if` would never match and the
+    # mutant would silently stay an exact copy of the script — a mutation pin
+    # pinned to a line that never changes proves nothing.
+    sed -i.bak 's/^[[:space:]]*if \[ "\$CC_DIFF" = "\$DIFF_HASH" \]; then$/  if [ -n "$DIFF_HASH" ]; then/' "$CC_MUT"
+    rm -f "$CC_MUT.bak"
+    if cmp -s "$RECORD" "$CC_MUT"; then
+        bad "11.13j the mutant is byte-identical to the script — the sed did not apply (re-anchor it)"
+    fi
+    run_check_carry 424903 "$CC_REPO" "$CC_MUT"
+    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$CC_TAB"*}" = "carry" ]; then
+        ok "11.13j mutation CAUGHT: with the digest comparison removed the CHANGED-diff case IS reported as a carry — so 11.13c is load-bearing"
+    else
+        bad "11.13j mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — 11.13c cannot fail, so it proves nothing"
+    fi
+else
+    bad "11.13j the mutation anchor 'if [ \"\\\$CC_DIFF\" = \"\\\$DIFF_HASH\" ]; then' is gone — re-anchor the mutant rather than dropping the pin"
+fi
+unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_FILE CC_MUT CC_TAB CC_NONDIFF CC_CAP406
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # 12. #1362 D1 — the review-evidence digest is computed over the NORMALIZED

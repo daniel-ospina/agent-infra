@@ -12,8 +12,10 @@ Signals combined (owner, 2026-09-25):
                      store (#1777).
                      Never read its absence as "nobody is on it" — the holder-authored
                      existence datum is the `refs/claims/<pr>-<sha12>` ref namespace
-                     written by `scripts/orchestrator-harness/claims.sh`; the fleet's
-                     readers of those stores include `tools/fleet/liveness.py`,
+                     written by `scripts/orchestrator-harness/claims.sh`. Its reader IS
+                     `tools/fleet/claim_lanes.py` (#1784), so the binding #1777
+                     tracked is done rather than pending; the fleet's other readers of
+                     those stores include `tools/fleet/liveness.py`,
                      `tools/fleet/lane_liveness.py`, `tools/fleet/fleet-health.py` and
                      `tools/fleet/map-sessions.py`.
   2. TRANSCRIPT    — the last 1-3 messages: tells WIP from DONE, which a
@@ -120,9 +122,9 @@ CHILD_SUPPRESSED = ACTION_VERDICTS   # back-compat alias; the set is no longer c
 # record of a lane: an orchestrator lane runs pi in print mode with sessions disabled, so it has no
 # session file at all, and a `grep` for its branch over the session store comes back empty while it is
 # live and committing (#1777, 2026-10-15). Absence here is not freedom — the holder-authored existence
-# datum is the `refs/claims/<pr>-<sha12>` ref namespace (#1777 tracks binding it into the fleet's read
-# set), and `tools/fleet/liveness.py` stays the ONE verdict function (per #1178). The stores and their
-# readers are named in the module docstring above.
+# datum is the `refs/claims/<pr>-<sha12>` ref namespace, read by `tools/fleet/claim_lanes.py` (the
+# binding #1777 tracked), and `tools/fleet/liveness.py` stays the ONE verdict function (per #1178).
+# The stores and their readers are named in the module docstring above.
 # Inbound-recency is reported BESIDE it, never in place of it.
 #
 # ⛔ AND IT MUST NOT VETO THE SERIOUS VERDICTS. A fresh inbound is not proof of life, so it discounts
@@ -281,6 +283,97 @@ OVERDUE_S = 25 * 60
 # /usr/bin/python3 pgrep+lsof walk is paid once instead of once per lane.
 _PI_MAP = None
 _PI_PROCS = None
+
+# ⛔ THE SCAN IS BOUNDED BY WORK, NOT BY A TIMEOUT (#2227).
+# MEASURED 2026-10-20: on the 95-process local box this tool's caller reported
+# `lane-actions read failed rc=1: lane-status.py failed: TimeoutExpired` -- i.e. the only thing
+# bounding the scan was a `subprocess.run(timeout=…)` in the CALLER, and a busy box exceeded it.
+# A timeout is not a bound: it converts "this box has more work than the budget" into "the fleet
+# is unreadable", which is the same false-absence shape as reporting a late `gh` answer as BLIND.
+# So every walk below is capped, the caps that BITE are named on stderr and carried into the
+# consumer, and the two GLOB walks (`_jsonl_files`) sample NEWEST-FIRST -- the right sample for
+# their question, since a transcript older than the dispatch cannot be the child's.
+# ⛔ STATED RESIDUAL, because "capped" is not the same claim as "sampled well": `child_activity`
+# walks a directory tree in `os.walk` order and cannot cheaply sort 100k files, so its cap is a
+# PREFIX OF WALK ORDER, not a newest-first sample. A fresh write sitting beyond the cap can
+# therefore be missed, and the age it returns is the newest it SAW, not the newest that exists. The
+# cap is sized above the observed working set and the truncation is named, so this is bounded --
+# but it is a real residual and pretending otherwise is how a `SAMPLED` note stops being believed.
+# A truncated read that says what it sampled is usable evidence; a silent one is a lower bound
+# published as the fleet.
+#
+# SIZING: TASK_SD held 14,934 child dirs when this was measured, but the mtime prune
+# (`task_child_candidates`) reduces that to a handful per dispatch; the caps are set ABOVE the
+# observed working set so today's box is read fully, and they exist to bound a runaway one.
+SCAN_MAX_TASK_DIRS = 60          # candidate child-transcript dirs examined per dispatch
+SCAN_MAX_SESSION_FILES = 60      # *.jsonl files examined per candidate directory
+SCAN_MAX_PROCS = 128             # pids taken from ONE `pgrep -x pi` (measured: 95 procs/box)
+SCAN_MAX_ACTIVITY_FILES = 4000   # files inspected by one `child_activity` walk
+# kind -> (kept, total) for every cap that actually truncated. Read by `scan_sampled_line()`.
+_SCAN_SAMPLED = {}
+
+
+def _note_sampled(kind, kept, total=None):
+    """Record that a walk was capped.
+
+    `total=None` means the true total is UNKNOWN because the walk stopped counting at the cap --
+    which is the honest answer for `child_activity` (it has no complete list to measure against).
+    Called ONLY when a cap bit, so an untouched scan reports nothing at all.
+    """
+    if total is not None and total <= kept:
+        return
+    prev_kept, prev_total = _SCAN_SAMPLED.get(kind, (0, None))
+    _SCAN_SAMPLED[kind] = (max(kept, prev_kept),
+                           None if total is None else max(total, prev_total or 0))
+
+
+def scan_sampled_line():
+    """The `SAMPLED` sentence, or "" when nothing was truncated.
+
+    ONE line, on stderr, because the JSON contract of `--json` is a LIST of lane rows and a
+    synthetic metadata row would be parsed as a lane by every consumer (lane-actions iterates
+    rows and refuses a DEGRADED one; a row with no `lane` would be a lost lane, not a note).
+    lane-actions reads it back off stderr and puts it in the generated header.
+    """
+    if not _SCAN_SAMPLED:
+        return ""
+    parts = []
+    for k, (kept, total) in sorted(_SCAN_SAMPLED.items()):
+        parts.append(f"{k}={kept}/{total}" if total is not None
+                     else f"{k}={kept}/>={kept + 1}")
+    return ("lane-status: SAMPLED " + " ".join(parts)
+            + " -- the walk was CAPPED, newest first; lanes beyond the cap were not read")
+
+
+def _bounded_pids(pids, cap, kind="procs"):
+    """At most `cap` pids, recording the truncation. Sample, do not enumerate."""
+    if len(pids) > cap:
+        _note_sampled(kind, cap, len(pids))
+        return pids[:cap]
+    return pids
+
+
+def _jsonl_files(d, cap=None):
+    """`*.jsonl` in `d`, NEWEST FIRST, at most `cap` -- and the total it was drawn from.
+
+    Newest-first is the correct sample for every caller here: each one is looking for the
+    transcript a dispatch just produced, so the freshest files are the candidates and an old one
+    is the least likely hit. `total` is returned rather than stashed globally so a caller can
+    report a cap it does not itself enforce.
+    """
+    try:
+        hits = glob.glob(os.path.join(d, "*.jsonl"))
+    except Exception:
+        return [], 0
+    try:
+        hits.sort(key=os.path.getmtime, reverse=True)
+    except Exception:
+        pass
+    total = len(hits)
+    if cap is not None and total > cap:
+        _note_sampled("session_files", cap, total)
+        return hits[:cap], total
+    return hits, total
 # NOTE: a child's own transcript is NOT inspectable. `task` children run `pi -p`
 # and do not persist a session file anywhere under ~/.pi/agent/sessions, so the
 # parent is blind to the child between dispatch and result. Only elapsed time and
@@ -385,7 +478,7 @@ def _cpu_seconds(tok):
 
 def _pi_cpu_map():
     """{pid: cumulative CPU seconds} for every live `pi`, in ONE ps call."""
-    pids = (sh(["pgrep", "-x", "pi"]) or "").split()
+    pids = _bounded_pids((sh(["pgrep", "-x", "pi"]) or "").split(), SCAN_MAX_PROCS)
     if not pids:
         return {}
     out = sh(["ps", "-o", "pid=,time=", "-p", ",".join(pids)])
@@ -410,7 +503,7 @@ def _pi_cwd_map():
     if _PI_PROCS is not None:
         return _PI_PROCS
     m = {}
-    pids = (sh(["pgrep", "-x", "pi"]) or "").split()
+    pids = _bounded_pids((sh(["pgrep", "-x", "pi"]) or "").split(), SCAN_MAX_PROCS)
     if pids:
         out = sh(["lsof", "-a", "-d", "cwd", "-Fn", "-p", ",".join(pids)], timeout=45)
         cur = None
@@ -761,6 +854,67 @@ def _inbound_message(ws):
     return None
 
 
+def workspace_cwds():
+    """{UPPER-CASE WORKSPACE UUID: cwd} -- the lane's session directory, straight from cmux.
+
+    ⛔ THIS IS THE DISPATCHER'S IDENTITY EVIDENCE, so it is a FIRST-CLASS field, not a display
+    detail (owner, 2026-10-20). `lane-actions.py` decides whether a workspace is a FLEET lane or the
+    OWNER's from this path alone; there used to be no cwd anywhere in the snapshot, so the only
+    available rule was a list of workspace NAMES -- and the owner's own workspace ("Personal
+    website") was not on it.
+
+    Costs nothing: `_live_workspaces()` is cached and already holds this object for every row
+    (`_live_label()` reads `current_directory` from the same shape). Tolerant BY ROW: a workspace
+    with no `current_directory` -- or with a value that is not even a string -- is simply ABSENT
+    from the map, and is counted on stderr; the whole roster being unreadable is announced
+    separately. An absent cwd stays absent: `lane-actions.py` turns it into PROTECTED, and a
+    placeholder here would defeat exactly that.
+    """
+    out = {}
+    bad = 0
+    try:
+        rows = _live_workspaces()
+    except Exception as e:                                        # defensive: see below
+        _cwds_unreadable("raised %s: %s" % (type(e).__name__, e))
+        return out
+    # ⛔ TOLERANCE IS PER-ROW (review round 6, P3, MEASURED). The `try` used to wrap the WHOLE loop,
+    # so one workspace with an unexpected type (`"current_directory": 123`) discarded EVERY cwd and
+    # the fleet lost its identity evidence for that tick -- while the docstring promised "a workspace
+    # with no `current_directory` is simply ABSENT from the map". A bad row is skipped and counted;
+    # the whole roster failing is a different fact, and that is the `except` above.
+    for w, x in rows:
+        try:
+            d = (x.get("current_directory") or "").strip()
+            if w and d:
+                out[str(w).strip().upper()] = d
+        except (AttributeError, TypeError, ValueError):
+            bad += 1
+            continue
+    if bad:
+        sys.stderr.write("lane-status: %d workspace row(s) had an unreadable current_directory and "
+                         "were SKIPPED -- those lanes will read PROTECTED this tick\n" % bad)
+    # ⛔ SAY IT OUT LOUD (review round 2, P2) -- AND ON THE ARM THAT ACTUALLY FIRES (review round 4,
+    # P2, MEASURED). `_live_workspaces()` does NOT raise on an unreadable roster: `sh_rc` catches its
+    # own failures and the reader catches everything else, returning `[]` with `LIVE_READABLE=False`.
+    # So the `except` above is unreachable in production and the stderr line never printed: `{}` came
+    # back silently, every row published cwd=None, `lane-actions.py` called every lane PROTECTED
+    # (fail-closed, correct) and the beat read NOTHING-ACTIONABLE -- indistinguishable from a quiet
+    # fleet, from a fix that was supposed to announce it. The datum is the module's own
+    # `LIVE_READABLE` / `LAST_FAILURE`, read here after the call.
+    if LIVE_READABLE is False:
+        _cwds_unreadable("cmux roster unreadable (%s)" % (LAST_FAILURE or "no failure recorded"))
+    return out
+
+
+def _cwds_unreadable(why):
+    """One loud stderr line: the identity evidence is missing, so every lane will read PROTECTED.
+
+    Same polarity as `live_workspaces()`'s "UNREADABLE -- the filter is INERT": a blind instrument
+    must announce itself, because its silence is a valid answer for a different question."""
+    sys.stderr.write("lane-status: workspace cwds UNREADABLE (%s) -- every lane will be classified "
+                     "PROTECTED; this is NOT an idle fleet\n" % why)
+
+
 def _live_label(wsid, x):
     t = (x.get("custom_title") or "").strip()
     if t:
@@ -964,7 +1118,7 @@ def _live_sibling_session(bound_file, exclude_labels=()):
     except OSError:
         return None
     now = time.time()
-    for f in glob.glob(os.path.join(d, "*.jsonl")):
+    for f in _jsonl_files(d, SCAN_MAX_SESSION_FILES)[0]:
         try:
             mt = os.path.getmtime(f)
         except OSError:
@@ -1112,7 +1266,7 @@ def _content_session(label, stale_file):
         base = 0
     cutoff = time.time() - 6 * 3600
     best, bmt = None, 0
-    for f in glob.glob(os.path.join(d, "*.jsonl")):
+    for f in _jsonl_files(d, SCAN_MAX_SESSION_FILES)[0]:
         try:
             mt = os.path.getmtime(f)
         except OSError:
@@ -1234,7 +1388,7 @@ def _pi_pid_cwds():
         return _PI_MAP
     m = {}
     try:
-        pids = sh(["pgrep", "-x", "pi"]).split()
+        pids = _bounded_pids(sh(["pgrep", "-x", "pi"]).split(), SCAN_MAX_PROCS)
     except Exception:
         pids = []
     for p in pids:
@@ -1284,11 +1438,22 @@ def child_activity(cwd, minutes=20):
 
     The only observable effect a `task` child has on the world, since its
     transcript is not persisted. Bounded depth and .git excluded for speed.
+
+    ⛔ AND BOUNDED BY FILE COUNT, NOT ONLY BY DEPTH (#2227). Depth 3 is not a bound on WORK: a
+    worktree at depth 3 can hold 100k files, and this is -- by this file's own note -- "the most
+    expensive thing in this file", called per lane while a `task` child is quiet. On the
+    95-process box it was the walk that made the whole scan unreadable. The cap stops ONCE the
+    answer can no longer change: the first file younger than 60 s already decides the branch the
+    caller takes (`child_activity` is only consulted to say "the child is working"), so a walk that
+    has found one is finished. When the cap is reached WITHOUT a hit, the age reported is the
+    newest seen so far and the truncation is NAMED, so a partial walk is evidence rather than a
+    silent lower bound.
     """
     if not cwd or not os.path.isdir(cwd):
         return None
     newest = None
     now = time.time()
+    seen = 0
     try:
         for root, dirs, files in os.walk(cwd):
             if root.count(os.sep) - cwd.count(os.sep) > 3:
@@ -1296,6 +1461,12 @@ def child_activity(cwd, minutes=20):
                 continue
             dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "node_modules", ".venv")]
             for fn in files:
+                seen += 1
+                if seen > SCAN_MAX_ACTIVITY_FILES:
+                    # `total` is UNKNOWN here: the walk stopped counting, so the honest report is
+                    # "at least cap+1 files", not a total this function does not have.
+                    _note_sampled("activity_files", SCAN_MAX_ACTIVITY_FILES)
+                    return int(time.time() - newest) if newest else None
                 try:
                     mt = os.path.getmtime(os.path.join(root, fn))
                 except Exception:
@@ -1490,6 +1661,14 @@ def task_child_candidates(after_ts):
     except OSError:
         return []
     out.sort(reverse=True)
+    # ⛔ CAPPED, NEWEST FIRST, AND THE CAP IS REPORTED (#2227). The mtime prune above is what
+    # normally reduces 14,934 dirs to a handful, but a burst of dispatches inside one window can
+    # leave hundreds "after" the timestamp -- so the walk is bounded HERE rather than left to the
+    # caller's subprocess timeout, which is not a bound (it reports a busy box as an unreadable
+    # fleet).
+    if len(out) > SCAN_MAX_TASK_DIRS:
+        _note_sampled("task_dirs", SCAN_MAX_TASK_DIRS, len(out))
+        out = out[:SCAN_MAX_TASK_DIRS]
     return [p for _, p in out]
 
 
@@ -1527,8 +1706,7 @@ def find_child_session(cwd, after_ts, exclude=None):
         return None
 
     for d in task_child_candidates(after_ts):
-        for f in sorted(glob.glob(os.path.join(d, "*.jsonl")),
-                        key=os.path.getmtime, reverse=True):
+        for f in _jsonl_files(d, SCAN_MAX_SESSION_FILES)[0]:
             try:
                 if after_ts is not None and os.path.getmtime(f) < after_ts - 120:
                     continue
@@ -1543,7 +1721,11 @@ def find_child_session(cwd, after_ts, exclude=None):
         return None
     excl = os.path.abspath(exclude) if exclude else None
     best, fallback = None, None
-    for f in glob.glob(os.path.join(d, "*.jsonl")):
+    # ⛔ NEWEST-FIRST AND CAPPED (#2227), WHICH IS THE SAME ANSWER THIS LOOP GAVE UNCAPPED.
+    # `fallback` is the newest file overall and `best` is the newest one that passes the dispatch
+    # filter -- both are drawn from the TOP of a newest-first list, so dropping the OLDEST files
+    # past `SCAN_MAX_SESSION_FILES` cannot change either. The cap bounds the walk, not the answer.
+    for f in _jsonl_files(d, SCAN_MAX_SESSION_FILES)[0]:
         if excl and os.path.abspath(f) == excl:
             continue
         mt = os.path.getmtime(f)
@@ -1897,7 +2079,8 @@ def _publish_snapshot(out, cache_path, key):
         return False
     _tmp = cache_path + ".tmp"
     with open(_tmp, "w") as fh:
-        json.dump({"key": key, "t": time.time(), "out": out}, fh, default=str)
+        json.dump({"key": key, "t": time.time(), "out": out,
+                   "sampled": scan_sampled_line() or None}, fh, default=str)
     os.replace(_tmp, cache_path)   # atomic: a reader never sees a half-written snapshot
     return True
 
@@ -1959,6 +2142,12 @@ def main():
             with open(_cf) as fh:
                 _c = json.load(fh)
             if _c.get("key") == _ck and (time.time() - _c.get("t", 0)) < 420:
+                # ⛔ THE SAMPLING NOTE TRAVELS WITH THE SNAPSHOT (#2227). A pass-opening scan that
+                # hit a cap cached its rows; if the note stayed behind, every consumer in that
+                # same pass would receive a truncated roster with nothing saying so -- the silent
+                # lower bound this change exists to remove, reintroduced by the cache.
+                if _c.get("sampled"):
+                    sys.stderr.write(str(_c["sampled"]) + " (from the cached snapshot)\n")
                 print(json.dumps(_c.get("out"), indent=2, default=str))
                 return 0
         except Exception:
@@ -2042,6 +2231,17 @@ def main():
                     _screens[_ws] = _scr or ""
         except Exception:
             _screens = {}   # fall back to the serial path below, never to no screen
+
+    # ⛔ THE WORKSPACE'S OWN cwd, PUBLISHED ON EVERY ROW (owner, 2026-10-20).
+    # The dispatcher has to know WHOSE workspace it is about to type into, and the only evidence
+    # for that is the directory the lane was started in. This read is FREE: `_live_workspaces()`
+    # already fetched the full cmux object for every workspace (it is where `_live_label()` gets
+    # `current_directory`), and the result is cached, so this adds no cmux call.
+    # It is published rather than resolved by the consumer because the consumer (the beat) CANNOT
+    # run cmux at all ("Access denied -- only processes started inside cmux can connect"), and a
+    # cwd guessed from a session-directory name is LOSSY (lane-status's `mangled()` turns both "/"
+    # and "." into "-", so `/x/.worktrees/y` and `/x/-worktrees/y` encode identically).
+    _ws_cwd = workspace_cwds()
 
     out = []
     for label, ws, ilabel in rows:
@@ -2232,6 +2432,8 @@ def main():
                        declared=declared, pane_children=pane_kids,
                         spinner=spinner, sid=s["sid"], ws=s["ws"], size=cur_size,
                         issue_label=ilabel,
+                        # the lane's session cwd, from cmux -- the dispatcher's identity evidence
+                        cwd=(_ws_cwd.get((s["ws"] or "").strip().upper()) or None),
                         last=(last_kind or "-"),
                         recent=[f"{k}:{t[:66]}" for k, t in descs[-3:]],
                         child=child, child_file=os.path.basename(child_file) if child_file else None,
@@ -2252,11 +2454,21 @@ def main():
             _publish_snapshot(out, _cf, json.dumps([a.only]))
         except Exception:
             pass      # caching is an optimisation; failing to cache must not fail the scan
+        # ⛔ SAY WHAT WAS SAMPLED, ON THE PATH THAT TRUNCATES (#2227). stderr, because stdout here
+        # is a LIST of lane rows and a metadata element would be parsed as a lane by every
+        # consumer. A capped walk that names its cap is usable evidence; a silent one publishes a
+        # lower bound as the fleet.
+        _sm = scan_sampled_line()
+        if _sm:
+            sys.stderr.write(_sm + "\n")
         print(_blob)
         return
 
     order = VERDICT_RANK
     out.sort(key=lambda r: order.get(r["verdict"], 9))
+    _sm = scan_sampled_line()
+    if _sm:
+        print(_sm)
     print(f"{'LANE':<26} {'VERDICT':<{VERDICT_COL}} {'SELF':>7} {'UI':<8} {'INBOUND':>10}  "
           "CHILD / LAST")
     print("-" * (106 + VERDICT_COL - 14))

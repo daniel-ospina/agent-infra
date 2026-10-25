@@ -48,6 +48,12 @@
 #
 # Env seams (tests + unusual cells):
 #   DISK_REAPER            the entry point to install (default: the farmed copy, else beside this)
+#   DISK_REAPER_RUN        the SCHEDULED wrapper beside the reaper (default: disk-reaper-run.sh). It
+#                          supplies HOME/keys, resolves the REAL gh and unsets AGENT_GH_REAL, so a
+#                          timer-started pass is not parked in the interactive pacing queue (#2354)
+#   (The worktree class's own floors — REAP_WT_SCRATCH_AGE_DAYS/REAP_WT_SCRATCH_GLOB — are NOT
+#    rendered here: the reaper's defaults (1 day, wt-*|cell-wt-*) are what a unit runs with. To pin
+#    one, add it to the templates and render it, the way DISK_REAPER_WT_AGED_DAYS is.)
 #   DISK_REAPER_STATE_DIR  status/log dir the unit exports (default $HOME/.pi/agent/state)
 #   DISK_REAPER_REPOS      colon-separated repos the venv/worktree classes scan
 #   DISK_REAPER_WT_AGED_DAYS  worktree age floor for the scheduled pass (default 7)
@@ -140,6 +146,22 @@ for cand in "${DISK_REAPER:-}" "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" "$IN
     [ -n "$cand" ] || continue
     if [ -f "$cand" ]; then REAPER="$cand"; break; fi
 done
+# #2354: prefer the WRAPPER beside the resolved reaper. A timer-started pass inherits no HOME, no
+# keys and no usable `gh`, and the raw script then fails its open-PR gate closed and reaps NOTHING
+# (measured on a cell at 99% used: REMOVE=0 PRESERVE=0 REMOVED=0, hourly). The wrapper supplies exactly
+# that environment — and it is a REPO artifact (farmed by pi-bootstrap), so it cannot drift into a
+# hand-maintained file on one box, which is the failure this whole installer exists to prevent.
+if [ -n "${DISK_REAPER_RUN:-}" ] && [ ! -f "$DISK_REAPER_RUN" ]; then
+    err "\$DISK_REAPER_RUN is set to '$DISK_REAPER_RUN' but that is not a regular file — refusing to install a unit that points at a DIFFERENT scheduled wrapper (the beside-copy would be installed silently, and the rendered plist/unit is the only place that would have said so)"
+    exit 2
+fi
+if [ -n "$REAPER" ]; then
+    for cand in "${DISK_REAPER_RUN:-}" "$(dirname "$REAPER")/disk-reaper-run.sh"; do
+        [ -n "$cand" ] || continue
+        [ -f "$cand" ] || continue
+        REAPER="$cand"; break
+    done
+fi
 
 # ── repos: what this box actually has ───────────────────────────────────────────────────────────
 # Rendered into the unit so the scheduled pass never depends on a shell's environment. A candidate
@@ -433,7 +455,7 @@ resolve_launcher() {
     LAUNCHER="${ELDATO_LAUNCHER:-}"
     if [ -z "$LAUNCHER" ]; then
         for cand in "${HOME:-}/.pi/agent/scripts/pi-reap-worktrees-launchd.py" \
-                    "${REAPER%/disk-reaper.sh}/pi-reap-worktrees-launchd.py" \
+                    "${REAPER%/*}/pi-reap-worktrees-launchd.py" \
                     "$INFRA_ROOT/scripts/pi-reap-worktrees-launchd.py"; do
             [ -n "$cand" ] && [ -f "$cand" ] && { LAUNCHER="$cand"; break; }
         done
@@ -480,6 +502,54 @@ choose_target() {
     return 1
 }
 
+# ── the worktree class's gh prerequisite, NAMED AT INSTALL TIME ────────────────
+# ⛔ MEASURED (2026-10-23, a cell at 95% used): the installed unit renders `Environment=HOME={{HOME}}`,
+# the pass ran with a HOME that has no `~/.config/gh`, so its PR query exited 4 ("requires
+# authentication" per that tool's own exit-code documentation) and the worktree class aborted for
+# EVERY repo — `freed_df=0MB` every hour, on a box where the tool itself was installed and working.
+# The unit pins the delegates, the bounded library and GH_TIMEOUT; the one dependency it CANNOT pin is
+# the credential store, which is per-HOME. This installer is the only component that knows the HOME it
+# is rendering, so it is the only place that can say the class will be inert BEFORE an operator waits
+# an hour for a red unit and then reads a message about the wrong cause.
+# ⛔ NOT A REFUSAL. A box with no working credentials still wants its uv and venv classes to run, and
+# refusing would leave it with NO reaper at all — worse than a reaper whose third class skips every
+# repo BY NAME. The answer is kept in GH_PREFLIGHT so the install summary carries it too.
+GH_PREFLIGHT=""
+gh_preflight() { # gh_preflight <home> -> "" (fine) | missing | unauthenticated
+    local home="$1" ghbin="${GH_BIN:-gh}"
+    # ⛔ GH_BIN IS THE SAME SEAM THE DELEGATE USES, and it is what makes the `missing` arm testable
+    # without doctoring PATH (a suite that asserts an AMBIENT host property — "gh happens to be in
+    # /usr/bin" — goes red for an environment reason unrelated to the change). A pin also lets an
+    # operator install a unit for a gh that is not on the unit's PATH.
+    command -v "$ghbin" >/dev/null 2>&1 || { printf 'missing'; return 0; }
+    # Run it with the SAME HOME the unit will carry, and with any inherited token removed, so the
+    # answer is about the UNIT's environment rather than this shell's.
+    if HOME="$home" env -u GH_TOKEN -u GITHUB_TOKEN "$ghbin" auth status >/dev/null 2>&1; then
+        printf ''
+    else
+        printf 'unauthenticated'
+    fi
+}
+
+warn_gh_prerequisite() { # warn_gh_prerequisite <home> <user>
+    local home="$1" user="$2" why
+    why="$(gh_preflight "$home")"
+    GH_PREFLIGHT="$why"
+    [ -n "$why" ] || return 0
+    case "$why" in
+        missing)
+            err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is not installed, so its PR-state gate cannot be evaluated"
+            err "  install gh (or point GH_BIN at it), or accept that only the uv and venv classes run on this box" ;;
+        *)
+            err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is installed but NOT AUTHENTICATED for the HOME this unit will run with ($home)"
+            err "  the credential store is per-HOME (\$HOME/.config/gh, or GH_TOKEN), and the rendered HOME decides it"
+            err "  remedy: sudo -u $user -H gh auth login   (or install with the HOME the lanes actually use), then re-run this installer" ;;
+    esac
+    err "  the uv and venv classes are unaffected; each pass reports skipped=<repo> reason=<why> (#2443)"
+    return 0
+}
+
+
 # ── actions ────────────────────────────────────────────────────────────────────────────────────
 # do_install dispatches to the platform's own installer. Both refuse rather than skip: a reaper that
 # was "installed" but never fires is the false PASS this installer exists to remove.
@@ -491,6 +561,8 @@ do_install() {
     case "${AGED_DAYS:-}" in
         ''|*[!0-9]*) err "REFUSING: DISK_REAPER_WT_AGED_DAYS must be a whole number of days (got '$AGED_DAYS')"; return 1 ;;
     esac
+    # The worktree class's ONE unpinnable dependency, named before the unit is written (#2443).
+    warn_gh_prerequisite "$HOME" "$(id -un)"
     if [ "$PLATFORM" = "Darwin" ]; then do_install_launchd; else do_install_systemd; fi
 }
 
@@ -563,6 +635,7 @@ except ET.ParseError as e:
     say "  reaper: $REAPER"
     say "  launch: $PY_BIN $LAUNCHER --script $REAPER -- $MODE_FLAG"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
+    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
     say "  state:  $STATE_DIR/disk-reaper.status"
     if $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
         say "  agent:  loaded"
@@ -674,6 +747,7 @@ do_install_systemd() {
     say "  reaper: $REAPER"
     say "  mode:   $MODE_FLAG"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
+    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
     say "  state:  $STATE_DIR/disk-reaper.status"
     if $SC is-enabled "$UNIT_NAME.timer" >/dev/null 2>&1; then
         say "  timer:  enabled"

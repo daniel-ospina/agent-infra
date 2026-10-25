@@ -300,6 +300,17 @@ The bound applies to the **gate** — the loop, or the area under review — not
 
 **Only exception — trivial single-fact lookup:** "What version is X?" "What port does Y use?" One answer, no analysis needed. For everything else: `research`.
 
+**⛔ RESEARCH FIRST is a DISPATCH CONTRACT, not a habit — the dispatch path REFUSES a brief without it.**
+A brief handed to a lane, a fixer, a reviewer, a background worker or a pane order must carry a
+`RESEARCH FIRST` section (`INTERNAL:` + `EXTERNAL:` + a `RUNG:` line naming the tool) and a
+`CONTRADICTION TEST:` line. Absent any of them the dispatch is refused with exit 80 by
+`scripts/orchestrator-harness/brief-gate.sh` — no model call, no session, no claim — and the refusal
+names every missing element and prints the block to paste. The canonical block is
+`brief-gate.sh --section <lane|fixer|reviewer|worker>`; `templates/LANE-BRIEF.md` carries it for
+controller-written briefs. If YOUR brief is refused, add what it names; do not route around the gate
+(agent-infra#2258: two lanes in one day acted on a false premise — one re-derived a root the tracker
+already held, one opened a duplicate PR — both brief defects, not lane defects).
+
 **Sub-agents inherit this rule.** When dispatching sub-agents, instruct them to use the `research` skill — never let a sub-agent call `web_search` directly.
 
 ---
@@ -350,6 +361,34 @@ A per-name rollup answers *"has main EVER been red?"* — almost always yes — 
   signature of an artifact, not a durable state** — and an over-read symptom plus a
   plausible-sounding remedy is exactly how an agent talks a human into a destructive action on a
   healthy system.
+
+## ⛔ Reading lane liveness — an ABSENCE is not a verdict
+
+**A lane can be live and absent from every population the fleet can enumerate.** An orchestrator
+lane runs `pi -p --no-session` (`lane.sh` / `fix-one.sh` / `merge-one.sh`), so it writes **no
+transcript and no cmux store record**: no session id to enumerate, no JSONL to grow, and no place in
+any population built from the cmux hook store or `~/.pi/agent/sessions/`. Measured 2026-10-15: the
+scheduled report listed `lanes=22` with the live `fix-<pr>` lane absent, and a controller read
+`grep -l <branch> ~/.pi/agent/sessions/*/*.jsonl` returning nothing as CLEAN — over a fixer that was
+committing to that branch.
+
+So **grepping the sessions directory for a branch is not a liveness test**, and "the report does not
+list it" is not "nobody is on it". For *which lanes exist*, read the durable, holder-authored
+**ref-claim registry** — `refs/claims/<pr>-<sha12>`, written by agent-infra's
+`scripts/orchestrator-harness/claims.sh` and read by its `tools/fleet/claim_lanes.py`. **Every claim
+verdict is an abstention**: `claim-held` asserts a declared **ownership** window, never that a process
+is alive, and `claims-unreadable` / `no-claim-visible` / `claim-owner-unparseable` /
+`holder-on-foreign-box` / `claim-holder-unverifiable` are **not** freedom — an absent key is a
+HEAD-scoped, transient fact (refs are deleted on release and pruned on expiry, and a live lane has a
+*designed* no-claim window between `fix-one.sh`'s release and `merge-one.sh`'s re-claim).
+
+**One verdict function** (agent-infra's `tools/fleet/liveness.py`), never a second: a reader acquires
+evidence, it does not decide a state. The five states, the ordering, the abstention doctrine, and the
+four inputs: agent-infra's `docs/ops/fleet-liveness.md`.
+
+The paths above are **agent-infra's**; a consumer repo that has not materialized that tree still owes
+the RULE — an absence is not a verdict, and a lane's absence from a population is not evidence about
+the lane.
 
 ## Sub-agent Dispatch
 
