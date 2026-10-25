@@ -1499,6 +1499,51 @@ scripts/harness-status             # one line per component + ONE verdict; exit 
 scripts/harness-down               # stop it via the platform authority (never a bare pkill)
 ```
 
+⛔ `harness-status` IS A READ; `harness-up status` HEALS. The launcher repairs by default (`--no-heal`
+for a pure read): it starts a controller that is not running and re-pins a pin that is behind. The thin
+`harness-status` name keeps the read-only contract it has always documented and passes `--no-heal`, so
+`harness-down` followed by a status read (or a monitoring poll) cannot silently restart a stack an
+operator deliberately stopped; ask for the repairs with `harness-status --heal` or `harness-up status`.
+Neither verb kills a duplicate or cycles a live-but-late controller — those are labelled
+`NOT HEALED` with whose decision they are.
+
+**What `harness-status` answers, row by row** — and what each row READS, because a health check that
+only passes by remembering is a defect. Every row below is a live read of an artefact, never a record
+of a previous run:
+
+| row | the question | read from |
+|---|---|---|
+| `exec` | which sha is **EXECUTING** (not which is pinned) | the RUNNING controller's own argv → the tree that path lives in → that tree's `HEAD`, compared with the pin |
+| `loop` | is the loop alive | the process census (ARGV-shape match) + `$O/heartbeat` age |
+| `capacity` | is **placement** healthy | fork headroom → free disk → load, in that order (below), each printed with the number it contributed and the one that BOUND |
+| `lanes` | how many lanes, and are they **advancing** | the launcher's own live worker records (`$O/state/run-*.sh`, removed by `wt_close`) × their `$O/logs/<name>.log` mtime, against the controller's own `STALE_MIN` (40 min). Finished logs are counted and IGNORED, never judged |
+| `selftest` | does this tree survive its own probes | `bash -n` over the live `$HARNESS/*.sh`, plus each platform probe in the shim called NOW |
+| `next` | what would it do next | the controller's own `[select]` decision line, with the log's age (LATE rather than "the current plan") |
+| `launchd` / `supervisor` / `refresh` / `claims` / `drift` | the supporting components | each component's own authority, or `SKIPPED` with its reason when the platform has no such component |
+
+**The capacity order is the failure order**: fork headroom first (a box can fork *nothing* at 0.32x
+load — #2293 — while load and disk read healthy), then disk (what breaks a box first in practice),
+then load. `lanes_by_fork` / `lanes_by_disk` / `lanes_by_load` are all computed and the smallest wins;
+`binding=` names which one did, so "the box could not fork" and "the box is busy" stop printing as one
+lane count. `capacity.sh` (the fleet instrument) answers the `fork` verb with `headroom=` and
+`min_fork_headroom=` (plus `src=` naming the limit that bounded it: `uid`/`cgroup`/`unbounded`), and
+those are the only fork names it publishes; `harness-up` re-labels them `fork_headroom`/
+`fork_source` in its OWN decision record, which is a launcher field, not a capacity one. A box where
+no ceiling could be found reads `unbounded`, which prints as `unbounded` — never as `0`, which would
+say no ceiling permits no lanes. The shim in `harness-up` is the documented fallback when
+`capacity.sh` is not beside the launcher, and the row names which one answered (`via=`). An
+**unmeasurable** fork limit refuses the start — "I could not look" is never spent as "there is room"
+— and a box that could not fork at all is refused by name (`fork_exhausted`), because its remedy is
+external to it.
+
+**Status heals**, by default (`--no-heal` for a pure read), and only the two repairs that are safe
+while lanes work: a controller that is **not running** is started (nothing live is interrupted), and a
+pin that is **BEHIND** is re-pinned (`harness-refresh.sh`'s advance kills nothing, #2278). It never
+kills a **duplicate** controller (a human decision) and never cycles a live-but-**LATE** one (that
+would drop in-flight lanes); `restart-pending` is reported with its deliberate remedy (`harness-down`
+then `harness-up`) and left alone. The rows are re-read after a repair, so the table an operator reads
+is the POST-heal state.
+
 `harness-up` does four things, in this order, and refuses rather than starting something wrong:
 
 1. **Resolves the pin** (`HARNESS-PIN`, else `origin/main`) and then **verifies the resolved pin
