@@ -130,6 +130,13 @@ SH
     # mk_repo's local bare origin, because THOSE do push and fetch.
     "$REAL_GIT" -C "$repo" remote set-url origin https://github.com/daniel-ospina/agent-infra.git
 }
+# ⛔ THE TARGET PASSED TO THE LANE MUST BE THE SLUG THE FIXTURE'S ORIGIN **IS** (agent-infra#2724,
+# merged after this suite was written). `lane.sh` now asserts the (checkout, target) pair BEFORE it
+# spawns anything and refuses with exit 72 on a mismatch — so the old `owner/repo` target made every
+# L6/L7 arm stop at the identity gate: L6 lost its tail line, and L7's agent never ran, so its
+# worktree was reaped as "0 commits ahead" and the arm reported a lifecycle defect that was really a
+# fixture that no longer matched the gate. Keeping the two in one variable is the point.
+LANE_SLUG="daniel-ospina/agent-infra"
 
 # mk_failing_git <dir> <repo> <branch> — a `git` that performs the real `worktree add`, then makes
 # the result the MEASURED residue (lock = initializing, files missing) and exits 1. Everything else
@@ -476,7 +483,7 @@ in_wt "wt_provision '$REPO' .worktrees/tm-15 feat/15-tm origin/main" "$REPO" >/d
 OUT="$( cd "$REPO/.worktrees/tm-15" && \
         O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
         REAP_LANE_VENV_DISABLE=1 AGENT_INFRA_PATH="$T/.." \
-        bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" "$@"' "$LANE" 15 feat/15-tm owner/repo 2>&1 )"
+        bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" "$@"' "$LANE" 15 feat/15-tm "$LANE_SLUG" 2>&1 )"
 assert_contains "$(cat "$T/$ENV/o/logs/lane-15.log" 2>/dev/null)" "exited" "L6 the shipped lane.sh ran to its exit path"
 # ⛔ THE AGENT MUST HAVE ACTUALLY RUN. Without this the arm cannot tell "the trap reaped a 0-commit
 # lane" from "the lane refused to start and the trap reaped what provisioning left" — and the second
@@ -508,7 +515,7 @@ mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-16 feat/16-tm origin/main" "$REPO" >/dev/null
 ( cd "$REPO/.worktrees/tm-16" && O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
   REAP_LANE_VENV_DISABLE=1 \
-  bash -c '. "$1"; exec bash "$2" 16 feat/16-tm owner/repo' _ "$T/$ENV/o/stub-pi.sh" "$LANE" \
+  bash -c '. "$1"; exec bash "$2" 16 feat/16-tm '"$LANE_SLUG"'' _ "$T/$ENV/o/stub-pi.sh" "$LANE" \
   >/dev/null 2>&1 )
 assert_not_contains "$(cat "$T/$ENV/o/logs/lane-16.log" 2>/dev/null)" "land-backlog] REFUSED" \
     "L7 the lane REACHED its agent (the creation gate did not refuse the fixture)"
