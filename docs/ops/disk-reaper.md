@@ -687,7 +687,18 @@ monorepo whose lock sits in `backend/`, installs the same ~5.7 GB venv and would
 the 64 MB harness pair. The detection fails toward the *expensive* pair on purpose — over-estimating a
 harness lane withholds a few spawns on an almost-full cell; under-estimating a python lane fills it.
 
-⚠️ **What the reserve does not buy.** The admission rule guarantees that the lane admitted *now* cannot
+⚠️ **What the reserve does not buy.** Two things, both stated rather than implied.
+
+**Concurrent spawns inside the materialisation window.** Admission compares one fresh reading against one
+lane's worst case, so it is correct for the lane it is deciding and for any lane spawned AFTER that lane's
+tree exists. It is **not** a reservation: a python lane's 5,772 MB materialises over minutes, and two or
+three dispatches inside that window all read the same free value and are all admitted. On a cell sitting
+at the bound with the sharing regime lost, k concurrent python spawns can consume k x 5,772 MB against
+~8.1 GB free — the #2721 wedge, with every log line saying *admitted*. Closing it needs a reservation
+(a lane marker held from admission to install, or a dispatcher-side counter), and no such marker exists
+today; the gate narrows the window, it does not remove it.
+
+**How the reserve itself can be lost.** The admission rule guarantees that the lane admitted *now* cannot
 consume the reserve even in its worst case. It does not guarantee `free >= reserve` for ever: a cell
 can lose the sharing regime wholesale (a `pi-cache-reap.sh --caches` sweep frees the cache but the NEXT
 sync re-materialises every venv it prunes), and the gate then refuses one lane at a time as the free
@@ -721,7 +732,9 @@ du -sm .venv                       # the APPARENT figure (upper bound, never the
 then set `DISK_LANE_TREE_MB` / `DISK_LANE_SELF_MB` / `DISK_LANE_RESERVE_MB` for that cell, and say so
 where an operator will read it. `scripts/worktree-disk-probe.sh` classifies which byte regime the
 machine is in. The gate's own ledger (`$O/state/disk.tsv`) records all three per spawn, so a series
-always separates *what a lane cost* (field 6) from *what it would have cost with sharing lost* (field 7).
+always separates *what a lane cost* (field 6) from *what it would have cost with sharing lost* (field 8)
+— field 7 is the reserve, not the worst case; reading it as the per-lane unshared cost budgets ~2000 MB
+where the real figure is ~5,772 MB.
 
 ### The KEEP rule: a shell at a prompt is not a live lane
 

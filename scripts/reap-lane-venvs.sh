@@ -662,9 +662,10 @@ proc_start_epoch() {
     case "$e" in ''|*[!0-9:-]*) return 1 ;; esac
     # ⛔ EVERY FIELD IS FORCED TO BASE 10 (review round 1, P2-falsified-in-part): `ps -o etime` prints
     # zero-padded components, so a perfectly ordinary `1:08:30` reaches the arithmetic as `08` and bash
-    # rejects it as a bad OCTAL constant — the error left `v` short by the whole hours component, which
-    # reads as a process that started EARLIER than it did, i.e. it biased the rule toward demoting a
-    # live holder. `10#` makes the parse literal decimal.
+    # rejects it as a bad OCTAL constant, and the expansion ABORTS: `proc_start_epoch` returns NOTHING,
+    # the rule could not prove the holder predated HEAD, and the holder stayed LIVE — an INERT
+    # enforcer, never a false reap, on every host that reaches this fallback (on macOS it is the
+    # PRIMARY path). `10#` makes the parse literal decimal.
     v=0
     case "$e" in
         *-*) v=$(( 10#${e%%-*} * 86400 )); e="${e#*-}" ;;
