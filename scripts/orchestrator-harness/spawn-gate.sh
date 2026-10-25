@@ -30,6 +30,20 @@
 #     directory-scoped census silently says nothing about the tree outside it. (cloud-cell-bringup.sh
 #     is a 120 s provider reachability probe, not a lane dispatch, and is NOT load-gated: a named,
 #     asserted residual.)
+#   * ⛔ THE BRIEF GATE (#2258) REACHES EVERY PATH THAT RUNS AN AGENT, AND NOT THE ONES THAT DO NOT.
+#     `run_agent` below refuses a brief with no research contract (AGENT_BRIEF_REFUSED, 80) for
+#     `lane.sh`, `fix-one.sh`, `nonblocking-dispatch.sh` and any future caller; `merge-one.sh` gates
+#     its OWN `run_agent`; the AUTHORED-brief paths (`nonblocking-dispatch.sh` in the foreground,
+#     `orch-send.sh`, `safe-send.sh`) gate before they send. Two things are deliberately OUT, and
+#     both are stated rather than glossed: (a) THE `pi` SHIM DOES NOT GATE BRIEFS — its argv cannot
+#     distinguish a work order from a one-line provider probe (`scripts/cloud-cell-bringup.sh:342`
+#     asks the model to "reply with OK"), so a gate here would refuse the box's own health probe, and
+#     any name/heuristic list that told them apart would be the bypass the next caller hides behind;
+#     the dispatch entry points are enumerated AND asserted as an equality by brief-gate.test.sh
+#     instead, so a new path reddens a test rather than drifting in unvalidated. (b) THE `task` TOOL
+#     resolves its child through `process.execPath`, not PATH (see the spawn-point limits below), and
+#     a TS-native rule set would be a SECOND implementation of the validator — the thing #2258's
+#     "one implementation" requires it not have. Both are named residuals, not oversights.
 #
 # Why this file exists (agent-infra#1720): the gate used to be a one-liner inside orch-loop.sh plus
 # a copy-pasted `run_agent()` in three workers, and only the controller's decision sites consulted
@@ -1073,6 +1087,29 @@ AGENT_LAND_BACKLOG=74
 # depends on a `pi` that exits 75 for its own reason being read as STARTED. 76 is that signal, and
 # run_agent below translates it into AGENT_LOAD_REFUSED so no caller has to learn a new code.
 PI_GATE_REFUSED=76
+# The BRIEF gate's refusal code (agent-infra#2258). It is NOT interchangeable with the capacity
+# codes: 75 clears when the box quietens, 77 never clears but is a property of the VOLUME, 76 is the
+# installed `pi` refusing for its own reason — and this one is a property of the BRIEF, which no
+# amount of waiting or disk space will fix, and which follows the item onto any other box it is
+# re-dispatched to. A caller that folded it into a capacity refusal would send the item around the
+# fleet reporting a remedy that cannot arrive.
+#
+# ⛔ IT IS **80**, NOT 74 (#2258 review, blocking). 74 is `AGENT_LAND_BACKLOG` (see this file and
+# lane.sh's own `land` arm) AND is `pi`'s own EX_IOERR — so one number meant "re-author the brief",
+# "yield the item to a peer" and "the model run hit a disk I/O error". `lane.sh` tests the brief arm
+# first, so a genuine land-backlog refusal was classified as a brief refusal and its `land` arm was
+# unreachable through rc=74. 73/74/75/76/77/78 are now all taken (fork, land, load, pi, disk and the
+# cannot-verify pair), 79 belongs to adopt-fix.sh, so this code lives OUTSIDE the sysexits range the
+# rest borrow — which is the point: no third-party process can produce it by accident.
+# ⛔ 78 IS SHARED BY TWO CONSTANTS BELOW (`BRIEF_GATE_UNAVAILABLE` and the spawn point's internal
+# `PI_FORK_REFUSED`), and that is inherited, not introduced here: both mean "this run could not be
+# verified" to a caller, and the fork one is translated to 73 inside run_agent. Flagged rather than
+# silently tidied — renumbering it is main's decision to make, not this branch's.
+AGENT_BRIEF_REFUSED=80
+# The CANNOT-VERIFY code (agent-infra#2258), shared with brief-gate.sh's own exit codes and declared
+# here because this file must be able to answer when the helper is MISSING — that is exactly the case
+# where nothing else can supply the constant.
+BRIEF_GATE_UNAVAILABLE=78
 # The spawn point's FORK refusal. It is a FOURTH code for the third process's second gate, and it is
 # ⛔ 78, NOT 74 (review P2, agent-infra#2293). 74 is where the spawn point COLLIDES with a real exit
 # status: `pi` itself can exit 74 (EX_IOERR), and with this code at 74 `[ "$rc" = "$PI_FORK_REFUSED" ]`
@@ -1083,6 +1120,26 @@ PI_GATE_REFUSED=76
 # margin: the spawn point's code is INTERNAL and run_agent translates it into AGENT_FORK_REFUSED, so no
 # caller ever learns a second code and no caller can collide with one either.
 PI_FORK_REFUSED=78
+# The spawn-point ledger's rotation cap, in bytes (see pi_gate_ledger). A module constant, NOT an env
+# knob: the size of the box's own measurement is not something a caller should be able to lift.
+PI_GATE_LEDGER_MAX_BYTES=5242880
+# Authoritative "an agent ran" flag, set by run_agent() itself. `rc == AGENT_LOAD_REFUSED` alone is
+# ambiguous: `pi` shares the 0–255 exit-status namespace, so a pi that exited 75 for its own reason
+# would be read as a load refusal — and a caller that acts on that (fix-one.sh skips its merge-chain
+# re-run, merge-one.sh skips recording a verdict) would silently do the wrong thing. The flag is set
+# only after the gate passed and pi was actually launched, so it cannot be produced by a refusal.
+AGENT_STARTED=0
+
+# brief_gate_lib — WHERE the one brief validator is, resolved rather than assumed.
+#
+# ⛔ MULTI-LOCATION FOR THE REASON `reap_lane_venv_path` IS: the harness runs from `$O` on a cell
+# (seeded by `install.sh`), from this directory on a laptop, and from `~/.pi/agent/scripts` on a
+# farmed copy — and this file is ALSO installed as the `pi` shim on PATH, where its own directory is
+# `$HOME/.pi/agent/bin`, which holds no harness at all. So the search order is explicit and the
+# failure is LOUD: an unresolved validator returns non-zero, and run_agent REFUSES. A gate that
+# silently passes because it could not find its own rules is the failure mode this whole layer
+# exists to prevent (#1884's argument, applied to the brief instead of to the load).
+BRIEF_GATE_SH=""
 # ── the fork reading, from the fleet's ONE instrument ──────────────────────────────────────────
 # ⛔ NOT A SECOND PROBE. `capacity.sh` already reads the process count against the per-uid/cgroup
 # ceiling and proves it with a two-fork probe; this file CONSUMES it. If the module cannot be found
@@ -1105,9 +1162,6 @@ spawn_gate_load_capacity() {
   return 1
 }
 
-# spawn_fork_state <stateVar> <detailVar> — sets state = ok | refused | unknown.
-# The arithmetic is `capacity.sh`'s (`cap_procs_pair_vars` + `cap_h_for_vars`), so this gate and the
-# placement decision can never disagree about what "out of headroom" means.
 # spawn_fork_state <stateVar> <detailVar> — sets state = ok | refused | unknown.
 # The arithmetic is `capacity.sh`'s (`cap_procs_pair_vars` + `cap_h_for_vars`), so this gate and the
 # placement decision can never disagree about what "out of headroom" means.
@@ -1146,21 +1200,81 @@ spawn_fork_state() {
   printf -v "$_sf_sv" '%s' 'ok'
   return 0
 }
-# The spawn-point ledger's rotation cap, in bytes (see pi_gate_ledger). A module constant, NOT an env
-# knob: the size of the box's own measurement is not something a caller should be able to lift.
-PI_GATE_LEDGER_MAX_BYTES=5242880
-# Authoritative "an agent ran" flag, set by run_agent() itself. `rc == AGENT_LOAD_REFUSED` alone is
-# ambiguous: `pi` shares the 0–255 exit-status namespace, so a pi that exited 75 for its own reason
-# would be read as a load refusal — and a caller that acts on that (fix-one.sh skips its merge-chain
-# re-run, merge-one.sh skips recording a verdict) would silently do the wrong thing. The flag is set
-# only after the gate passed and pi was actually launched, so it cannot be produced by a refusal.
-AGENT_STARTED=0
+
+brief_gate_lib() {
+  local c here
+  if [ -n "$BRIEF_GATE_SH" ]; then printf '%s\n' "$BRIEF_GATE_SH"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for c in "${O:-}/brief-gate.sh" "$here/brief-gate.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh" \
+           "${HOME:-}/.pi/agent/scripts/brief-gate.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    BRIEF_GATE_SH="$c"
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
+# brief_gate_role — the validator role for THIS dispatch, from the harness's own `KIND` vocabulary.
+#
+# ⛔ THIS IS A MAPPING, NOT A GUESS. The validator's roles are lane|fixer|reviewer|worker (its `--section`
+# text differs per role; its RULES do not), while `KIND` carries the harness's dispatch labels. `bg` and
+# `worker` are the same role, and an UNRECOGNISED KIND maps to `lane` — the strictest text — rather than
+# being passed through: a validator that answered "unknown role" would turn a cosmetic label into a
+# cannot-verify refusal for every worker on the box (measured, this file's own first cut: KIND=bg made
+# every `nonblocking-dispatch.sh` launch exit 78). `BRIEF_ROLE` is the explicit override.
+brief_gate_role() {
+  if [ -n "${BRIEF_ROLE:-}" ]; then printf '%s' "$BRIEF_ROLE"; return 0; fi
+  case "${KIND:-lane}" in
+    fixer|fix-ci) printf 'fixer' ;;
+    reviewer)     printf 'reviewer' ;;
+    bg|worker)    printf 'worker' ;;
+    *)            printf 'lane' ;;
+  esac
+}
+
+# brief_gate_run <brief-file> <role> — 0 admitted · 80 REFUSED · 78 CANNOT-VERIFY. The refusal text
+# goes where the CALLER sends it (run_agent appends it to the agent log, which is what an operator
+# greps); nothing here writes to stdout, because lane.sh's stdout is the lane's own report surface.
+brief_gate_run() { # brief_gate_run <brief-file> <role>
+  local f="$1" role="${2:-lane}" lib
+  lib="$(brief_gate_lib)" || {
+    printf '[brief-gate] CANNOT VERIFY: brief-gate.sh not found (looked in \$O, %s, \$AGENT_INFRA_PATH/scripts/orchestrator-harness and ~/.pi/agent/scripts) — refusing to dispatch a brief nothing validated.\n' \
+      "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" >&2
+    return "$BRIEF_GATE_UNAVAILABLE"
+  }
+  bash "$lib" --check "$f" "$role"
+}
 run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed was_m jobctl
   AGENT_STARTED=0
   # The cap signal is per-invocation state, like AGENT_STARTED: a caller that reads it after a
   # refusal or a clean run must see 0, never a previous lane's answer.
   AGENT_CAP_HIT=0; WIP_SNAPSHOT_DIR=""; WIP_SNAPSHOT_RESULT=""
+  # ── THE BRIEF GATE (agent-infra#2258). FIRST, BEFORE the load and disk readings, and the order is
+  # the mirror of the disk-before-load ruling below: a brief refusal is DETERMINISTIC. It cannot clear
+  # by waiting and it follows the item to any other box, so reporting a load refusal first would send
+  # the controller to wait for an event that changes nothing — and only then surface a brief the author
+  # must rewrite. The gates below are transient; this one is not, so it answers first. It also costs
+  # nothing to run: no filesystem probe, no load read, one `awk` over the brief.
+  #
+  # ⛔ REFUSING HERE IS NOT ENOUGH ON ITS OWN, and the header says so: this is the seam that makes the
+  # gate TOTAL for everything that goes through the helper (`lane.sh`, `fix-one.sh`, and any caller
+  # added later, including a hand-written one), while the AUTHORED-brief paths
+  # (`nonblocking-dispatch.sh`, `orch-send.sh`, `safe-send.sh`) gate in their own foreground so the
+  # refusal is visible to the author rather than swallowed by `exec >/dev/null`.
+  local bgrc
+  brief_gate_run "$prompt" "$(brief_gate_role)" >> "$log" 2>&1
+  bgrc=$?
+  if [ "$bgrc" != 0 ]; then
+    AGENT_STARTED=0
+    # BOTH surfaces, because the two readers differ: the log is what an operator greps for the item,
+    # and stderr is what a caller piping the helper into a summary sees.
+    echo "[brief-gate] REFUSED $label: the brief was not admitted (exit $bgrc) — no agent started, nothing consumed. NOT a capacity refusal: this will not clear by waiting, and re-dispatching it elsewhere refuses there too — re-author the brief." >> "$log"
+    echo "[brief-gate] REFUSED $label: brief not admitted (exit $bgrc) — see the [brief-gate] block in $log" >&2
+    return "$bgrc"
+  fi
   # ── the disk gate (#1765). Read FRESH immediately before the spawn, for the load gate's reason plus
   # one of its own: a lane can sit waiting for a claim for 90 minutes, and the filesystem it will
   # fill is not the one that was measured when it was dispatched.
@@ -1573,7 +1687,10 @@ reap_lane_venv() {
 #     That is the one fan-out path #1874's per-item dispatcher would use, so it is named rather than
 #     glossed: an agent on an over-ceiling box can still spawn sub-agents through `task`. Filed as
 #     agent-infra#1920 (a second spawn point is its own change; folding a TS dispatcher gate into
-#     this one would have put two unreviewed mechanisms behind one PR).
+#     this one would have put two unreviewed mechanisms behind one PR). ⛔ AND IT IS ALSO OUTSIDE THE
+#     BRIEF GATE for the same structural reason plus one of its own (#2258): the rules live in ONE
+#     bash implementation, and a TS-native copy would be a second implementation that can drift from
+#     the first — so `task` is a NAMED, CENSUSED residual of the brief gate, not a silent hole.
 
 # pi_gate_real <self> — the real pi: the first `pi` on PATH that is not this file.
 # The exclusion is `-ef` (device+inode THROUGH symlinks), not a path comparison: the harness already

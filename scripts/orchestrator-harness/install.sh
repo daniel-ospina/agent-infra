@@ -1247,6 +1247,14 @@ DRIFTED=""
 # reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
 # #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
 # render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
+# brief-gate.sh (#2258) is the same class, one step sharper: it is the RESEARCH validator that
+# `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh` and `orch-send.sh`/`safe-send.sh`
+# all execute, and a $O copy that predates it makes every one of those refuse (78 = cannot verify) —
+# a whole fleet that cannot dispatch, caused by a half-synced $O. Detecting the divergence here is
+# what turns that into a warning with the cp line instead of a silent, box-wide standstill.
+# merge-reminder.py + box-status.sh arrive from main's side of this merge for the same reason: both are
+# executed by the controller, so a stale $O copy must be DETECTED (the list's whole job) rather than
+# discovered later as a mystery.
 # ⛔ launchd-controller.sh IS IN THIS LIST BECAUSE ITS STALE BYTES **ARE** THE DEFECT (agent-infra#2098).
 # The installed plist on a Mac runs `/bin/bash $O/launchd-controller.sh`, and that file used
 # `new-session -A -d`, which ATTACHES — impossible for a launchd job — so the job crash-looped for
@@ -1261,7 +1269,7 @@ DRIFTED=""
 # `$O/nochk-resolve.py`. A `$O` with the new `orch-loop.sh` and an OLD file set classifies EVERY PR as
 # `V=""` — no merge arm, no fixer, the controller silently stops working — and the only trace is one
 # startup warning. That is exactly the partial-reseed drift this list exists to catch.
-for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done

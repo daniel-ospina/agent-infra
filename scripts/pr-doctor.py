@@ -2304,7 +2304,7 @@ def _push_block(branch) -> str:
             "Use that explicit refspec, never a bare `git push`.\n" % _push_command(b))
 
 
-def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
+def _brief_body(pr: dict, action: str, why: str | None = None, cr=None) -> str:
     """The order text for ONE PR. `action`/`why`/`cr` come from `evaluate()` -- the SAME
     classification and the SAME evidence the beat counts (#1872), so a brief cannot describe a
     PR differently from the line the fleet read."""
@@ -2515,6 +2515,63 @@ next step of merging. Do the work:
 
     return ""
 
+
+# ---------------------------------------------------------------------------
+# 3b. THE RESEARCH CONTRACT EVERY WORKER BRIEF MUST CARRY (agent-infra#2258)
+# ---------------------------------------------------------------------------
+# The brief THIS file writes is the fleet's own dispatch order -- one per PR, per pass -- and it is
+# the exact text the two measured defects came through: a lane re-derived a root the tracker already
+# held, and a lane opened a duplicate PR. The contract is therefore PREPENDED to every non-empty
+# brief, from the ONE implementation (`brief-gate.sh --section worker`) rather than copied here: a
+# second copy of the text is a second thing to drift, and the validator would then refuse a brief
+# whose only defect is that this file fell behind.
+#
+# ⛔ FAIL-CLOSED AND LOUD WHEN THE HELPER IS GONE. `nonblocking-dispatch.sh` gates every brief in the
+# FOREGROUND with the same validator, so a brief that lost this block is REFUSED (rc=80) and appears
+# in the log with the helper's own teaching message -- a worker is never dispatched with a silent
+# half-contract. The line below makes the CAUSE visible here too, because "the spawn was refused" and
+# "this file could not render the contract" are different bugs.
+_RESEARCH_SECTION = None
+
+
+def research_section() -> str:
+    """The canonical RESEARCH FIRST block, or "" (loudly) if the validator cannot be found."""
+    global _RESEARCH_SECTION
+    if _RESEARCH_SECTION is not None:
+        return _RESEARCH_SECTION
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(ORCH_DIR, "brief-gate.sh"),
+                 os.path.join(here, "orchestrator-harness", "brief-gate.sh")):
+        if not os.path.isfile(cand):
+            continue
+        try:
+            out = subprocess.run(["bash", cand, "--section", "worker"],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode == 0 and out.stdout.strip():
+            _RESEARCH_SECTION = out.stdout.rstrip() + "\n"
+            return _RESEARCH_SECTION
+    log("brief: brief-gate.sh --section produced nothing (looked in %s and %s/orchestrator-harness) "
+        "-- this worker brief carries NO research contract and nonblocking-dispatch.sh will REFUSE "
+        "the spawn (agent-infra#2258)" % (ORCH_DIR, here))
+    # ⛔ A FAILURE IS NOT CACHED. Only a SUCCESS is. A one-off (an install mid-flight, a $O being
+    # re-seeded) must not degrade every later brief in this process for ever — and a cached ""
+    # is exactly the "fix that is not live" shape: the box would keep composing section-less briefs
+    # long after the validator appeared. The cost of not caching is one `bash` call per brief.
+    return ""
+
+
+def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
+    """The order text for ONE PR, with the research contract prepended (agent-infra#2258).
+
+    The contract goes on EVERY non-empty brief and on no empty one: `_brief_body` returns "" when it
+    has no action to order, and `spawn()` treats that as "nothing to dispatch" -- prepending a section
+    to an empty order would manufacture a dispatch of nothing."""
+    body = _brief_body(pr, action, why, cr)
+    if not body:
+        return body
+    return research_section() + "\n" + body
 
 # ---------------------------------------------------------------------------
 # 4. WHAT HAPPENED TO A WORKER — the harness's own artifacts, never a guess
@@ -2810,9 +2867,14 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bo
     _, errout, rc = sh_err(spawn_argv(name, wt, path), timeout=SPAWN_CALL_TIMEOUT_S,
                            cwd=HOME, env=_orch_env(), capture=False)
     if rc != 0:
-        # ⛔ carry the CODE and the dispatcher's OWN words. rc=78 (no/stale spawn-gate.sh), rc=2 (no
+        # ⛔ carry the CODE and the dispatcher's OWN words. rc=78 (no/stale spawn-gate.sh or a missing
+        # brief-gate.sh), rc=80 (THE BRIEF WAS REFUSED by the research-first gate -- see
+        # agent-infra#2258: the fix is in `brief()`/`brief-gate.sh`, not in the box), rc=2 (no
         # worktree / no brief) and rc=127 (dispatcher missing) are permanent, fleet-wide causes, and
-        # the message is the only thing that names which one it is.
+        # the message is the only thing that names which one it is. 80 is deliberately NOT in
+        # GATE_REFUSALS: that tuple is the 75/77 LOAD/DISK class written by run_agent into a
+        # backgrounded worker's `.rc`, whereas 80 comes back on the FOREGROUND call and no worker
+        # ever exists to have an `.rc`.
         detail = "rc=%s: %s" % (rc, (errout or "").strip()
                                 or "the dispatcher exited non-zero with no stderr")
         log("spawn %s -> %s: FAIL %s" % (name, wt, detail[:200]))
