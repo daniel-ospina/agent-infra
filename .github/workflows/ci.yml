@@ -410,13 +410,16 @@ jobs:
         # a HEAD that origin/main already contained, and ALL 12 produced +0 commits
         # — a whole lane spent discovering there was nothing to do. The suite is
         # zero-dep and hermetic (temp git repos, a refs/remotes/origin/main base,
-        # no network), and it carries its own RED control: 12 mutations of the
-        # shipped file (the three-way merge verdict replaced by a plain tree
-        # identity test, a merge conflict treated as an error, dirty files
-        # ignored, `--untracked-files=normal` dropped, dirty gated behind base
-        # resolution, the work-tree-root identity check dropped, and six
-        # fail-closed reads turned into HAS-WORK) must each turn their paired leg
-        # RED.
+        # no network, and the process's GIT_* environment cleared so a leaked
+        # GIT_DIR cannot redirect a fixture into the caller's repo), and it carries
+        # its own RED control: 16 mutations of the shipped file (the contained-delta
+        # read skipped, the merge result trusted on its own, a merge conflict
+        # treated as an error, an unsupported merge-tree losing its name, a
+        # `--help` exit reported as HAS-WORK, dirty files ignored,
+        # `--untracked-files=normal` dropped, dirty gated behind base resolution,
+        # the work-tree-root identity check dropped, and six fail-closed reads
+        # turned into HAS-WORK) must each turn their paired leg RED. The control
+        # refuses to run at all if the unmutated suite is not green.
         # Visible, not merge-blocking, for the same reason as its sibling above:
         # `pipeline-compliance` is the repo's only required check.
         run: python3.12 tools/fleet/dispatch_preflight.test.py

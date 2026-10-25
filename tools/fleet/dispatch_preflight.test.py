@@ -66,8 +66,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REAL_GIT = shutil.which("git") or "/usr/bin/git"
 
-# The environment keys `_git_env()` pins, so tearDownModule can restore exactly
-# what it changed instead of guessing.
+# The environment keys `_git_env()` pins or CLEARS, so tearDownModule can restore
+# exactly what it changed instead of guessing.
 _ENV_KEYS = (
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
@@ -79,6 +79,27 @@ _ENV_KEYS = (
     "GIT_AUTHOR_DATE",
     "GIT_COMMITTER_DATE",
     "PATH",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+
+# A LEAKED GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE redirects EVERY fixture git call
+# into whatever repo the caller had exported. Measured before this was cleared:
+# `GIT_DIR=$PWD/.git python3 tools/fleet/dispatch_preflight.test.py` errored 26
+# setUps AND wrote into the AMBIENT repo — a commit parented on the PR head and
+# an index containing only the fixture's file. A suite must not be able to mutate
+# a checkout, so these are CLEARED, not merely inherited.
+_GIT_LEAKS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 )
 
 
@@ -108,6 +129,8 @@ def _git_env() -> dict:
     runs on is not a pin. Dates are pinned so fixtures are reproducible.
     """
     env = dict(os.environ)
+    for leak in _GIT_LEAKS:
+        env.pop(leak, None)
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -135,6 +158,13 @@ def setUpModule() -> None:  # noqa: N802 (unittest's own name)
     """
     global _SAVED_ENV
     _SAVED_ENV = {k: os.environ.get(k) for k in _ENV_KEYS}
+    # `os.environ.update()` cannot REMOVE a key, so clearing the GIT_* leaks is an
+    # explicit POP first: a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE redirects
+    # every fixture git call into the caller's repo (measured: an exported
+    # `GIT_DIR` errored 26 setUps AND wrote a commit + an index into the ambient
+    # checkout).
+    for leak in _GIT_LEAKS:
+        os.environ.pop(leak, None)
     os.environ.update(_git_env())
 
 
@@ -168,26 +198,72 @@ def _commit(repo: Path, msg: str, allow_empty: bool = False) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
-def _git_shim(root: Path, fail_subcommands: tuple) -> Path:
+def _git_shim(root: Path, fail_subcommands: tuple, code: int = 128) -> Path:
     """A ``git`` on PATH that FAILS for the named subcommands, delegating the rest.
 
     The fail-closed branches are only pinned if something can MAKE the read fail;
     a shim is the only way to force one probe to fail while the rest of the
-    worktree stays readable.
+    worktree stays readable. ``code`` carries the failure's SHAPE: 128 is a read
+    error, 129 is git's usage error (what an old git answers to an option it does
+    not have).
     """
     bindir = root / "bindir"
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "git"
-    alts = "|".join(fail_subcommands)
     shim.write_text(
         "#!/bin/sh\n"
         'case " $* " in\n'
-        + "".join(f'  *" {c} "*) echo "shim: refusing {c}" >&2; exit 128;;\n'
+        + "".join(f'  *" {c} "*) echo "shim: refusing {c}" >&2; exit {code};;\n'
                   for c in fail_subcommands)
         + f'esac\nexec "{REAL_GIT}" "$@"\n'
     )
     shim.chmod(0o755)
     return bindir
+
+
+def _merge_driver_shape(repo: Path) -> tuple:
+    """A branch whose content a MERGE DRIVER would DISCARD: (feature_sha, main_sha).
+
+    ``.gitattributes: *.lock merge=ours`` + a true driver makes the three-way
+    merge keep the BASE side, so ``merged == tree(base)`` for a branch that
+    really does carry unlanded work. Nothing else in the tool can see that, which
+    is why the contained-delta read exists: without it this shape is a false
+    NO-WORK, the direction the module header calls unflippable.
+    """
+    _write(repo, ".gitattributes", "*.lock merge=ours\n")
+    _write(repo, "a.lock", "base-content\n")
+    _commit(repo, "attributes + base lock")
+    _git(repo, "config", "merge.ours.driver", "true")
+    _git(repo, "checkout", "-q", "-b", "feat")
+    _write(repo, "a.lock", "branch-content\n")
+    feature = _commit(repo, "branch lock content")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, "a.lock", "main-content\n")
+    main = _commit(repo, "main lock content")
+    _git(repo, "update-ref", "refs/remotes/origin/main", main)
+    _git(repo, "checkout", "-q", "--detach", feature)
+    return feature, main
+
+
+def _squash_then_same_path_fixup(repo: Path) -> tuple:
+    """Squash-merged, then the base edited the SAME path: (feature_sha, main_sha).
+
+    THE DOCUMENTED BOUNDARY. Here the branch's content really IS landed, but the
+    base then rewrote that path, so HEAD's bytes are not the base's bytes and a
+    three-way merge CONFLICTS. Every read available to the tool answers "this
+    path differs from the base", so the verdict is HAS-WORK — conservative, and
+    the case is recorded as a boundary rather than guessed at.
+    """
+    base = _git(repo, "rev-parse", "HEAD")
+    _write(repo, "feat.txt", "feat\n")
+    feature = _commit(repo, "feat work")
+    squash = _git(repo, "commit-tree", f"{feature}^{{tree}}", "-p", base, "-m", "squash of feat")
+    _git(repo, "checkout", "-q", "--detach", squash)
+    _write(repo, "feat.txt", "feat+FIXUP\n")
+    fixup = _commit(repo, "main fixes the same path up")
+    _git(repo, "update-ref", "refs/remotes/origin/main", fixup)
+    _git(repo, "checkout", "-q", "--detach", feature)
+    return feature, fixup
 
 
 def _squash_shape(repo: Path) -> tuple:
@@ -266,6 +342,15 @@ def _fixture(root: Path) -> Path:
     repo = root / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
+    # A LEAK GUARD, before the first commit: if a GIT_DIR/GIT_WORK_TREE ever
+    # survives into this process, every command below would run against that
+    # repo instead of the fixture. Assert the identity FIRST so a leak aborts
+    # loudly rather than writing into somebody's checkout.
+    toplevel = _git(repo, "rev-parse", "--show-toplevel")
+    if os.path.realpath(toplevel) != os.path.realpath(repo):
+        raise AssertionError(
+            f"fixture git calls did not land in the fixture: git says {toplevel!r}, "
+            f"fixture is {str(repo)!r} — a GIT_* variable leaked into this process")
     _write(repo, "base.txt", "base\n")
     _commit(repo, "base")
     base = _git(repo, "rev-parse", "HEAD")
@@ -285,13 +370,13 @@ class _PreflightTest(unittest.TestCase):
     def verdict(self, base: str = "origin/main") -> dict:
         return self.mod.evaluate(str(self.repo), base)
 
-    def with_git_shim(self, *fail_subcommands: str):
+    def with_git_shim(self, *fail_subcommands: str, code: int = 128):
         """Context manager: run this leg with a `git` that fails for those reads."""
         import contextlib
 
         @contextlib.contextmanager
         def _cm():
-            bindir = _git_shim(self.tmp, tuple(fail_subcommands))
+            bindir = _git_shim(self.tmp, tuple(fail_subcommands), code=code)
             previous = os.environ.get("PATH", "")
             os.environ["PATH"] = f"{bindir}{os.pathsep}{previous}"
             try:
@@ -397,6 +482,17 @@ class RealWorkIsHasWork(_PreflightTest):
         _conflicting_branch(self.repo)
         res = self.verdict()
         self.assertTrue(res["would_change_base"], res)
+        self.assertEqual(res["verdict"], "HAS-WORK", res)
+        self.assertEqual(self.mod.main(["--quiet", str(self.repo)]), 0)
+
+    def test_squash_landed_then_a_same_path_fixup_is_the_documented_boundary(self):
+        # Recorded, not pretended away: the branch's content IS landed, but the
+        # base rewrote the same path, so every read available here says "this
+        # path differs from the base". HAS-WORK is the conservative answer; the
+        # module header and docs/ops/fleet-liveness.md §10.4 name it as a
+        # boundary so nobody reads the NO-WORK rule as unconditional.
+        _squash_then_same_path_fixup(self.repo)
+        res = self.verdict()
         self.assertEqual(res["verdict"], "HAS-WORK", res)
         self.assertEqual(self.mod.main(["--quiet", str(self.repo)]), 0)
 
@@ -523,12 +619,46 @@ class UnreadableFailsClosed(_PreflightTest):
         with self.with_git_shim("merge-tree"):
             self.assertEqual(self.verdict()["verdict"], "UNREADABLE")
 
+    def test_an_old_git_without_write_tree_is_unreadable_and_says_why(self):
+        # git < 2.38 answers rc 129 to an option it does not have. That is a
+        # blanket UNREADABLE (fail closed), and the reason must NAME the cause —
+        # a generic "cannot tell" would send an operator hunting the worktree.
+        with self.with_git_shim("merge-tree", code=129):
+            res = self.verdict()
+        self.assertEqual(res["verdict"], "UNREADABLE", res)
+        self.assertTrue(any("2.38" in w for w in res["why"]), res["why"])
+
+    def test_a_merge_driver_that_discards_the_branch_is_unreadable(self):
+        # THE FALSE-NO-WORK DIRECTION. With `.gitattributes: *.lock merge=ours`
+        # the merge keeps the BASE side, so `merged == tree(base)` for a branch
+        # carrying real unlanded content — nothing but the contained-delta read
+        # can see it. "Already landed" must never be certified from the merge
+        # result alone.
+        _merge_driver_shape(self.repo)
+        res = self.verdict()
+        self.assertEqual(res["verdict"], "UNREADABLE", res)
+        self.assertIsNone(res["would_change_base"], res)
+        self.assertTrue(any("merge driver" in w for w in res["why"]), res["why"])
+        self.assertEqual(self.mod.main(["--quiet", str(self.repo)]), 4)
+
     def test_a_malformed_invocation_is_a_refusal_not_exit_two(self):
         # The documented contract is 0/3/4. argparse's default exit 2 sits
         # OUTSIDE it, so a caller written as "refuse on 3, escalate on 4,
         # otherwise dispatch" would DISPATCH on its own typo.
         with self.assertRaises(SystemExit) as caught:
             self.mod.main(["--not-a-flag", str(self.repo)])
+        self.assertEqual(caught.exception.code, 4)
+
+    def test_help_is_a_refusal_not_has_work(self):
+        # argparse exits 0 for `--help`, and 0 IS the contract's HAS-WORK — a
+        # caller reading 0 as "dispatch" would dispatch on a help screen, which
+        # answered nothing at all.
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                self.mod.main(["--help"])
         self.assertEqual(caught.exception.code, 4)
 
 
@@ -562,20 +692,38 @@ MUTATIONS = [
     # (name, [(before, after), ...], the leg name that MUST go red)
     (
         # NB: "own_delta = bool(ahead)" was tried here and REMOVED — under this
-        # predicate it is behaviourally EQUIVALENT on every shape the suite
-        # builds (own_delta does not decide the verdict), so it changes no
-        # verdict and reporting it as "unpinned" would be a false alarm. An
-        # equivalent mutation is not a missing pin.
-        "the merge verdict becomes a plain tree-identity test (the squash-then-advance trap)",
-        [('    would_change = _would_change_base(worktree, base_sha, head)',
-          '    would_change = _diff_is_nonempty(worktree, base_sha, head)')],
+        # predicate `own_delta` does not decide the verdict, so it is
+        # behaviourally EQUIVALENT on every shape the suite builds. An equivalent
+        # mutation changes no verdict, and calling it "unpinned" would be a false
+        # alarm.
+        "the contained-delta read is skipped (the squash-then-advance trap comes back)",
+        [('    if contained:\n        return False, ""',
+          '    if False:\n        return False, ""')],
         "SquashMergedIsNoWork",
     ),
     (
-        "a merge CONFLICT is treated as an error (the branch with the most work is refused)",
-        [('    if rc == 1:\n        return True\n    if rc != 0:\n        return None',
-          '    if rc != 0:\n        return None')],
+        "the merge result is trusted on its own (a merge driver discards the branch and it reads as landed)",
+        [('    differing = {p for p in out.split("\\0") if p}\n'
+          '    return not any(p in differing for p in paths)',
+          '    return True')],
+        "UnreadableFailsClosed",
+    ),
+    (
+        "a merge CONFLICT is treated as a read error (the branch with the most work is refused)",
+        [('    if rc == 1:\n        return "conflict", ""',
+          '    if rc == 1:\n        return "error", "conflict"')],
         "RealWorkIsHasWork",
+    ),
+    (
+        "an unsupported merge-tree loses its name (an operator cannot tell an old git from a read fault)",
+        [('    if rc == 129:', '    if False:')],
+        "UnreadableFailsClosed",
+    ),
+    (
+        "a --help exit is reported as HAS-WORK (argparse's status 0 leaks into the contract)",
+        [('            raise SystemExit(EXIT_UNREADABLE if status == 0 else status)',
+          '            raise SystemExit(status)')],
+        "UnreadableFailsClosed",
     ),
     (
         "ignore dirty files (refuses work that only exists uncommitted)",
@@ -600,56 +748,49 @@ MUTATIONS = [
         "IdentityIsTheTarget",
     ),
     (
-        "unreadable becomes HAS-WORK (a failed probe answers yes)",
-        [
-            ('        why.append(f"worktree path does not exist: {worktree}")\n        return result',
-             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
-        ],
+        "a missing path becomes HAS-WORK (a failed probe answers yes)",
+        [('        why.append(f"worktree path does not exist: {worktree}")\n        return result',
+          '        result["verdict"] = VERDICT_HAS_WORK\n        return result')],
         "UnreadableFailsClosed",
     ),
     (
-        "unresolvable base becomes HAS-WORK",
-        [
-            ('        why.append(f"base {base!r} does not resolve in this worktree (no origin/{base} either)")\n        return result',
-             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
-        ],
+        "an unresolvable base becomes HAS-WORK",
+        [('        why.append(f"base {base!r} does not resolve in this worktree (no origin/{base} either)")\n        return result',
+          '        result["verdict"] = VERDICT_HAS_WORK\n        return result')],
         "UnreadableFailsClosed",
     ),
     (
         "an unborn HEAD becomes HAS-WORK",
-        [
-            ('        why.append("HEAD does not resolve (unborn or detached-empty worktree)")\n        return result',
-             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
-        ],
+        [('        why.append("HEAD does not resolve (unborn or detached-empty worktree)")\n        return result',
+          '        result["verdict"] = VERDICT_HAS_WORK\n        return result')],
         "UnreadableFailsClosed",
     ),
     (
         "a failed status read becomes HAS-WORK",
-        [
-            ('        why.append(f"git status failed (rc={rc}) — cannot tell dirty from clean")\n        return result',
-             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
-        ],
+        [('        why.append(f"git status failed (rc={rc}) — cannot tell dirty from clean")\n        return result',
+          '        result["verdict"] = VERDICT_HAS_WORK\n        return result')],
         "UnreadableFailsClosed",
     ),
     (
         "a missing merge-base becomes HAS-WORK",
-        [
-            ('        why.append(f"no merge-base between HEAD {head[:12]} and {base} {base_sha[:12]} "\n'
-             '                   "(unrelated histories?) — cannot compute a diff")\n        return result',
-             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
-        ],
+        [('        why.append(f"no merge-base between HEAD {head[:12]} and {base} {base_sha[:12]} "\n'
+          '                   "(unrelated histories?) — cannot compute a diff")\n        return result',
+          '        result["verdict"] = VERDICT_HAS_WORK\n        return result')],
         "UnreadableFailsClosed",
     ),
     (
-        "a failed diff read becomes HAS-WORK",
-        [
-            ('        why.append("git could not report a merge verdict — cannot tell whether a diff exists")\n        return result',
-             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
-        ],
+        "a failed own-delta diff becomes HAS-WORK",
+        [('        why.append("git could not report a diff verdict — cannot tell whether a diff exists")\n        return result',
+          '        result["verdict"] = VERDICT_HAS_WORK\n        return result')],
+        "UnreadableFailsClosed",
+    ),
+    (
+        "an unreadable merge verdict becomes HAS-WORK",
+        [('    if would_change is None:\n        why.append(reason)\n        return result',
+          '    if would_change is None:\n        result["verdict"] = VERDICT_HAS_WORK\n        return result')],
         "UnreadableFailsClosed",
     ),
 ]
-
 
 def run_suite() -> "unittest.result.TestResult":
     loader = unittest.TestLoader()
@@ -657,10 +798,47 @@ def run_suite() -> "unittest.result.TestResult":
     return unittest.TextTestRunner(verbosity=1, stream=sys.stdout).run(suite)
 
 
+def _hermeticity_probe() -> list:
+    """Run the suite ONCE under a HOSTILE git environment; it must stay green.
+
+    The suite's fixture git calls land in whatever `GIT_DIR` says, so a leaked
+    one turns a test run into a WRITE against the caller's checkout (measured:
+    a commit parented on the PR head, and an index holding only the fixture's
+    file). `setUpModule` clears it; this probe is what makes that removal
+    visible — without it the pop could be deleted and every run would still be
+    green on a clean box.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="dp-hermetic-"))
+    try:
+        scratch = tmp / "scratch"
+        subprocess.run(["git", "init", "-q", str(scratch)], capture_output=True, check=False)
+        env = dict(os.environ)
+        env.update({
+            "GIT_DIR": str(scratch / ".git"),
+            "GIT_WORK_TREE": str(scratch),
+            "GIT_INDEX_FILE": str(tmp / "leak-index"),
+        })
+        p = subprocess.run([sys.executable, str(Path(__file__).resolve())],
+                           capture_output=True, text=True, env=env)
+        if p.returncode != 0:
+            combined = (p.stdout + p.stderr).splitlines()
+            # Name the FIRST leg that failed, not the last line printed: the
+            # `--help` leg writes argparse's message to stderr, and quoting that
+            # would send an operator looking in the wrong place.
+            first = next((ln.strip() for ln in combined
+                          if ln.startswith("FAIL:") or ln.startswith("ERROR:")), None)
+            detail = first or (combined[-1].strip() if combined else "no output")
+            return [f"hermeticity: the suite FAILS (or writes) under a leaked GIT_DIR — "
+                    f"it is not pinned to this process ({detail})"]
+        return []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def red_control() -> int:
     src = HERE / "dispatch_preflight.py"
     original = src.read_text()
-    failures = []
+    failures = _hermeticity_probe()
     for name, subs, leg in MUTATIONS:
         mutant_text = original
         applied = 0
@@ -716,6 +894,16 @@ def main(argv=None) -> int:
     ap.add_argument("--red-control", action="store_true")
     ns = ap.parse_args(argv)
     if ns.red_control:
+        # THE BASELINE COMES FIRST. Without it, a suite that is red for its own
+        # reasons still prints "RED CONTROL OK": the paired leg's class name is
+        # already in the FAIL/ERROR headers, so every mutation looks "caught by
+        # its paired leg". A red control that certifies a broken suite is a
+        # false PASS.
+        baseline = run_suite()
+        if not baseline.wasSuccessful():
+            print("\nRED CONTROL REFUSED — the suite is RED before any mutation is applied; "
+                  "fix the baseline first (a mutation cannot be judged against a broken one).")
+            return 1
         return red_control()
     result = run_suite()
     return 0 if result.wasSuccessful() else 1
