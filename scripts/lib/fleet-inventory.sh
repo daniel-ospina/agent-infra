@@ -964,10 +964,11 @@ fleet_row_lander_drain() {
 # recurring one — the job is installed and simply never runs (launchd's `RunAtLoad` never fires, or
 # the job was booted out), and NOTHING else in the fleet notices: no PR moves, no check goes red, and
 # a backlog looks like a backlog rather than a broken scheduler.
-# ⛔ THE FRESHNESS FILE IS THE DRAINER'S OWN BEAT, not its log. A pass can legitimately last
-# LANE_TIMEOUT (3000s) while it holds its lock waiting for the lane it dispatched, and this row's
-# bound is 2×StartInterval+slack (2700s) — so a healthy long pass would read LATE against its own log.
-# The script overwrites `$AI/state/ai-drainer.beat` on every poll for exactly this row.
+# ⛔ THE FRESHNESS FILE IS THE DRAINER'S OWN BEAT, not its log. The normal steady state of a tick is a
+# SKIP (already at target, a swap/load/memory floor, another tick holding the lock), and a skip writes
+# no log line a health reader could date — so a beat written only after a dispatch would make a
+# correctly-idle job read LATE for ever. The script stamps `$AI/state/ai-drainer.beat` as soon as it
+# owns the lock, on every path, for exactly this row.
 # ⛔ MISSING, NOT SKIPPED, WHEN THE CODE IS PRESENT AND NO JOB INSTALLS IT. Both templates ship
 # UNSCHEDULED by default (an env-only placeholder — see the plist header), so "the drainer exists and
 # nothing runs it" is a state an operator chose and then forgot. `_fleet_row_launchd_job` already

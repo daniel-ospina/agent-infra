@@ -1406,10 +1406,13 @@ FAKE
   wpin "the fixer budget is derived from the UNOWNED count" "$ORCH" 'MF="$(fix_slots "$UPN")"'
   # …at EVERY fixer spawn site (a count, not a find: a partial revert that leaves one site on the
   # unraised MAX_FIX is exactly the asymmetry this change removes).
-  _mf_sites="$(grep -cF -- '-lt "$MF"' "$ORCH")"
+  # ⛔ COUNT CODE, NOT PROSE (#2762): two COMMENTS in orch-loop.sh quote the same predicate to explain
+  # the ceiling, so a raw `grep -c` counted 5 and redded main — a false RED on a correct tree, which
+  # is the same class as a false PASS: the arm stopped being evidence of the spawn sites.
+  _mf_sites="$(grep -F -- '-lt "$MF"' "$ORCH" | grep -vc '^[[:space:]]*#')"
   [ "${_mf_sites:-0}" = "3" ] \
     && { echo "  ✅ all 3 fixer spawn sites compare against the drain-aware budget"; PASS=$((PASS+1)); } \
-    || { echo "  ❌ expected 3 fixer spawn sites on \$MF, found ${_mf_sites:-0} — some still use the unraised MAX_FIX"; FAIL=$((FAIL+1)); }
+    || { echo "  ❌ expected 3 fixer spawn sites on \$MF (code lines, comments excluded), found ${_mf_sites:-0} — some still use the unraised MAX_FIX"; FAIL=$((FAIL+1)); }
   if grep -qF -- '-lt "${MAX_FIX:-3}"' "$ORCH"; then
     echo "  ❌ a fixer spawn site still compares against the unraised MAX_FIX (the asymmetry is back)"; FAIL=$((FAIL+1))
   else

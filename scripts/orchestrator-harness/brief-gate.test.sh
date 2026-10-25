@@ -316,6 +316,15 @@ rm -f "$ROOT/.pd-brief.txt"
 # ── lane.sh: the GENERATED lane brief must pass the gate, and a missing validator must STOP the lane.
 # LANE_DRY_RUN=1 is the shipped seam that renders the real brief without starting an agent (#2148).
 mkdir -p "$TMP/lane-o"
+# ⛔ THE LANE'S CWD MUST BE A CHECKOUT OF THE REPO AND BRANCH IT IS TOLD (agent-infra#2724/#2694):
+# lane.sh asserts the worktree's own origin and its attached branch before writing a brief, so driving
+# it from a bare `mktemp -d` refuses 72 and drops the three brief assertions below. Same fixture shape
+# the sibling suites carry (reviewer-preflight, capacity-transfer, spawn-gate).
+# ⛔ `init.defaultBranch` NAMES THE BRANCH, so the fixture is born ON the branch it is told
+# (no worktree switch: this suite is run where a branch-state command is not available).
+( cd "$TMP" && git -c init.defaultBranch=fix/research-first-gate init -q . \
+    && git remote add origin https://github.com/daniel-ospina/agent-infra.git \
+    && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init ) >/dev/null 2>&1
 ( cd "$TMP" && O="$TMP/lane-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     bash "$HERE/lane.sh" 2258 fix/research-first-gate daniel-ospina/agent-infra ) >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "lane.sh --dry-run renders its brief and exits 0 (rc=$rc)"

@@ -1,0 +1,16 @@
+# FAILURE-CLASS FIXTURE (R0): a `concurrency:` value supplied by an ALIAS. Valid YAML (the anchor is
+# defined above it), and the reader cannot resolve it — R0 refuses rather than treating the block as
+# absent, which on a push workflow would mean silently passing a cancellation policy it never read.
+x-shared-concurrency: &shared
+  group: push-concurrency-alias-${{ github.ref }}
+  cancel-in-progress: true
+name: push-concurrency-alias
+on:
+  push:
+    branches: [main]
+concurrency: *shared
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
