@@ -499,8 +499,11 @@ is neither `queued` nor `cancelled` on the head before trusting the rail.
 
 - **The label is not durable on its own.** `scripts/ci_runner_gate.sh` preserves custom labels it
   did not add, so it will not strip `required-check` — but on its fallback arm it *adds*
-  `ubuntu-latest` to the pool, which leaks reserved slots back to advisory work. Keep the reserved
-  runners out of that gate's pool, or re-assert §9.2 after a fallback flip.
+  `ubuntu-latest` to the pool, which leaks reserved slots back to advisory work. Re-assert §9.2
+  after a fallback flip. (Do **not** try to solve this by taking the reserved runners out of that
+  gate's pool: `self-hosted-x64` is the pool selector the gate resolves (`POOL_LABEL_X64`), so
+  dropping it strands the whole x86 arm — the #2373 failure §9.2 warns about. The leak is repaired
+  by re-asserting §9.2, not by removing the marker.)
 - **A dead reserved listener is a single point of failure** for the only required check. This is
   #2682 blocker 2 (the `ai-runner-*` restart loop) and it is *why* the fallback in §9.3 exists.
 - **#2682 blocker 1 is still open.** It recorded: keep the required check off self-hosted capacity

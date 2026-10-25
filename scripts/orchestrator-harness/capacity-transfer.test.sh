@@ -66,6 +66,16 @@ for f in "$LANE" "$CHAIN" "$ORCH" "$CLAIMS"; do
   [ -s "$f" ] || { echo "❌ missing $f"; exit 2; }
 done
 
+# ⛔ A COMPLIANT BRIEF FIXTURE (#2258): `run_agent` now runs the research-first gate BEFORE the load,
+# disk, land-backlog and fork gates, so a fixture whose whole body is `prompt` is refused with 80 and
+# every arm below that asserts a CAPACITY outcome reads that refusal instead of its subject (measured
+# on this suite: 8 arms — `bgrc=80` and `frc=80` where 74 and 0 were wanted, and the land-backlog lines
+# they grep for never appear). RENDERED from the shipped validator, never hand-typed, so the fixture
+# cannot drift from the gate’s own advice — the same rule `spawn-gate.test.sh` follows.
+BRIEF_OK="$TMP/brief-ok.txt"; export BRIEF_OK   # every driver below is a `bash -c` child
+{ printf 'RESEARCH FIRST\n'; "$HERE/brief-gate.sh" --section lane; } > "$BRIEF_OK"
+[ -s "$BRIEF_OK" ] || { echo "❌ could not render the compliant brief fixture"; exit 2; }
+
 echo "==> capacity-transfer self-test ($HERE)"
 
 # ── stubs on PATH ────────────────────────────────────────────────────────────────────────────────
@@ -813,7 +823,7 @@ lbgh_install "$TMP/lbgh-deep"
 : > "$PI_LOG"
 ( O="$O" KIND=bg TAG=107 \
     bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; \
-             printf "prompt\n" > "$2/bg.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             cp "$BRIEF_OK" "$2/bg.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/bg.log" "$2/bg.txt" "bg 107"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 bgrc=$?
 { [ "$bgrc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
@@ -836,7 +846,7 @@ ck "§LB lambda is the BEST of the two 24h windows (10 today / 40 yesterday -> c
 lbgh_install "$TMP/lbgh-broken"
 ( O="$O" KIND=fixer TAG=42 \
     bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; \
-             printf "prompt\n" > "$2/p.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
+             cp "$BRIEF_OK" "$2/p.txt"; MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/fix.log" "$2/p.txt" "fixer 42"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 frc=$?
 { [ "$frc" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
@@ -873,7 +883,7 @@ lbgh_shape "$TMP/lbgh-prfix-name"   81 0 15 0 "bug" "a normal issue" 7 "01234567
 # a) the branch rule, tied to this HEAD
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-yes"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=78 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pg.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pg.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pg.log" "$2/pg.txt" "prfix 78"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pgrc=$?
@@ -884,7 +894,7 @@ ck "§LB …and the exemption NAMES the PR it proved, not a count or a bare 'yes
 # b) a branch NAME alone is not proof: the PR found by name is at a different commit
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-name"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=79 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/ph.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/ph.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/ph.log" "$2/ph.txt" "prfix 79"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 phrc=$?
@@ -897,7 +907,7 @@ ck "§LB …and the reason reported is the BACKLOG, not an unprovable claim (the
 # d) the same unprovable claim UNDER the ceiling RUNS — an unprovable kind is measured, not held
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-ok"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=80 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pi.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pi.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pi.log" "$2/pi.txt" "prfix 80"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pirc=$?
@@ -923,7 +933,7 @@ lbgh_shape "$TMP/lbgh-prfix-fork" 81 0 15 0 "bug" "a normal issue" 9 "$(git -C "
 lbgh_shape "$TMP/lbgh-prfix-closed" 81 0 15 0 "bug" "a normal issue" 9 "$(git -C "$LBWT2" rev-parse HEAD 2>/dev/null)" closed
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-fork"
 ( cd "$TMP/lbdet" && O="$O" KIND=prfix TAG=81 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pk.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pk.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pk.log" "$2/pk.txt" "prfix 81"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pkrc=$?
@@ -933,7 +943,7 @@ ck "§LB …and a DETACHED (fork-shape) worktree is proven by its COMMIT (rc=$pk
 #    load-bearing (a commit on `main` otherwise "proves" itself via the MERGED PR that introduced it).
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-prfix-closed"
 ( cd "$TMP/lbdet" && O="$O" KIND=prfix TAG=82 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pl.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pl.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pl.log" "$2/pl.txt" "prfix 82"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 plrc=$?
@@ -942,7 +952,7 @@ ck "§LB …and a CLOSED PR at this head does NOT exempt (rc=$plrc): the state s
 # c) no proof and over the ceiling — the arm that keeps the bypass shut
 : > "$PI_LOG"; lbgh_install "$TMP/lbgh-nopr"
 ( cd "$LBWT2" && O="$O" KIND=prfix TAG=77 \
-    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; printf "prompt\n" > "$2/pf.txt"; \
+    bash -c '. "$1/spawn-gate.sh" >/dev/null 2>&1; cp "$BRIEF_OK" "$2/pf.txt"; \
              MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$2" \
              run_agent 5 "$2/pf.log" "$2/pf.txt" "prfix 77"' _ "$HERE" "$TMP" ) >/dev/null 2>&1
 pfrc=$?

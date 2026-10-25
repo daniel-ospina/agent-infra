@@ -912,6 +912,9 @@ OUT="$(PATH="$T/t5/bin:$PATH" SUDO="$T/t5/bin/sudo" HOME="$T/t5/home" HARNESS_AP
 assert_eq "$RC" "1" "T5 a box with no scheduler exits NON-ZERO"
 assert_contains "$OUT" "no scheduler available" "T5 and it says exactly that"
 assert_contains "$OUT" "NOT silently skipping" "T5 and names the failure mode it refuses to become"
+# The count is of the OUTPUT directory AFTER the failed install attempt, not pre-existing state: the
+# assertion is "nothing was installed", and `$T/t5/units` is created by this case.
+# verified: a post-run observation of the output dir, not a count of pre-existing state.
 assert_eq "$(ls -A "$T/t5/units" 2>/dev/null | wc -l | tr -d ' ')" "0" "T5 nothing was installed"
 
 say_case "T12 a unit rendered from transient scratch is refused"

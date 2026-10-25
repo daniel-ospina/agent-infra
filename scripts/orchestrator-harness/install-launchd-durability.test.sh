@@ -913,10 +913,19 @@ STAGE="$T/stage"; mkdir -p "$STAGE"
 # loop's files made the installer die on the first check, which reddened 27 checks downstream of it.
 # (`2>/dev/null` is deliberately NOT relied on here: a silent copy failure is exactly how this stage
 # would go stale again. The files are asserted present below.)
-cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$HARNESS/merge-reminder.py" "$STAGE/" 2>/dev/null
+# ⛔ EVERY FILE THE INSTALLER GATES ON MUST BE STAGED (agent-infra#2719). `install.sh` parse-gates
+# `check-class.py` and `nochk-resolve.py` (the controller cannot classify a single PR without the
+# first), so a fixture that stages four files makes the installer DIE — measured: §F went 31 red the
+# moment that gate landed, and the gate was right, the fixture was incomplete.
+# Both sides ADDED to this stage (this branch the watchdog pair, main the two classify helpers), so
+# the merge stages both sets and then ASSERTS every one of them — the assertion is what makes a
+# silent copy failure loud, which is the whole point of the stage.
+cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$HARNESS/merge-reminder.py" \
+   "$HARNESS/check-class.py" "$HARNESS/nochk-resolve.py" "$STAGE/" 2>/dev/null
 cp "$HARNESS/watchdog.sh" "$HARNESS/watchdog.plist.template" "$STAGE/" 2>/dev/null
-for _needed in install.sh launchd-cycle.sh launchd.plist.template watchdog.sh watchdog.plist.template; do
-  [ -f "$STAGE/$_needed" ] || { bad "the install stage is missing $_needed — install.sh ships two agents and refuses without both"; }
+for _needed in install.sh launchd-cycle.sh launchd.plist.template watchdog.sh watchdog.plist.template \
+               check-class.py nochk-resolve.py merge-reminder.py; do
+  [ -f "$STAGE/$_needed" ] || { bad "the install stage is missing $_needed — install.sh ships two agents and refuses without both, and parse-gates the classify helpers"; }
 done
 SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin" \
   "$SHOME/.pi/agent/scripts"

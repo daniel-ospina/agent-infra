@@ -33,6 +33,26 @@
 #   empty or non-diff body NEVER does. Exit 0 — the status field carries the
 #   outcome, so a non-zero exit stays reserved for a usage/argument error.
 #
+# record-review.sh --check-carry <pr> [owner/repo]
+#   READ-ONLY, and the ONE way a lane asks "my record's head is stale — is the
+#   diff I reviewed still the diff that would merge?". It runs the SAME
+#   `diff_hash_for_pr` the record path and the GitHub gate use, compares that
+#   digest to the record's `diff_sha256` with the merge gate's own identity rule
+#   (full lowercase 64-hex, never the empty-body constant), and prints ONE
+#   tab-separated line `<verdict>\t<record digest|->\t<live digest|status>`.
+#   verdict, and exit code:
+#     head        0  the record is bound to the CURRENT head — nothing is stale
+#     carry       0  the reviewed DIFF is unchanged; the gate carries the record
+#     fresh       1  the DIFF changed; a fresh review is genuinely owed
+#     unreadable  3  the live diff could not be READ — RETRY, do NOT re-review
+#     norecord    4  no record for this PR/repo — there is no verdict to carry
+#                    (with no repo resolved: no unique `<owner>-<repo>-<pr>.json`
+#                    and no repo-less `<pr>.json` — pass owner/repo)
+#     nodigest    5  the record has no usable digest — re-run the recorder at the
+#                    head and let its carry arms decide (a CARRY, not a review)
+#   A usage/argument error is exit 2. ⛔ It is a PREDICTION, not an authorization:
+#   the merge gate re-decides on the live diff, and it never writes a record.
+#
 # Records a code-review verdict for a PR into ~/.pi/agent/reviews/<PR>.json,
 # consumed by the review-enforcer merge registry gate
 # (extensions/review-enforcer/index.ts, issue #138).
@@ -919,6 +939,9 @@ EXPECT_HEAD=""
 # #1351 — set by --print-diff-hash (read-only consumer seam, see the header).
 # Initialised here so `set -u` is satisfied when the flag is absent.
 PRINT_DIFF_HASH=0
+# #1351 — the LANE's question, answered: "my record's head is stale; is the DIFF I
+# reviewed still the diff that would merge?" Set by --check-carry (read-only).
+CHECK_CARRY=0
 # Set by --print-tier: the READ-ONLY surface-cap selector (see the header).
 PRINT_TIER=0
 EVIDENCE=""
@@ -934,6 +957,7 @@ while [ "$_i" -lt "${#_argv[@]}" ]; do
   _arg="${_argv[$_i]}"
   case "$_arg" in
     --print-diff-hash) PRINT_DIFF_HASH=1 ;;
+    --check-carry) CHECK_CARRY=1 ;;
     --print-tier) PRINT_TIER=1 ;;
     --force-stale) FORCE_STALE=1 ;;
     --expect-head)
@@ -981,6 +1005,21 @@ if [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; then
   SHA=""
   VERDICT=""
   REPO="${2:-}"
+elif [ "$CHECK_CARRY" -eq 1 ]; then
+  # Same shape, same reason. --check-carry answers the lane's question with the
+  # merge gate's own predicate instead of leaving it to inference.
+  SHA=""
+  VERDICT=""
+  REPO="${2:-}"
+  # ⛔ A FLAG THAT CANNOT AFFECT A READ-ONLY ANSWER IS REFUSED, NOT IGNORED.
+  # `--evidence`/`--force-stale`/`--expect-head` are RECORD-MINTING inputs; this
+  # mode writes nothing, so accepting them would make the caller believe it had
+  # recorded (or pinned) something it did not. Same posture as the removed
+  # --second-model flag above.
+  if [ -n "$EVIDENCE" ] || [ "$FORCE_STALE" -eq 1 ] || [ -n "$EXPECT_HEAD" ]; then
+    echo "record-review.sh: --check-carry is READ-ONLY (it answers 'would this record carry?' and writes nothing), so it takes no --evidence/--force-stale/--expect-head — those describe a record to mint. Run the mode without them, then record separately if the answer is 'fresh'." >&2
+    exit 2
+  fi
 else
   SHA="${2:?missing head_sha}"
   VERDICT="${3:-clean}"
@@ -993,7 +1032,7 @@ case "$VERDICT" in
     # record path is refused here. The arm is expressed this way — rather than
     # folding the case into the else above — so the mutation harness's
     # `sed 's#^  clean|clean-micro|clean-low) ;;#…#'` anchor keeps matching.
-    if [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$PRINT_TIER" -ne 1 ]; then
+    if [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne 1 ] && [ "$PRINT_TIER" -ne 1 ]; then
       echo "verdict must be 'clean', 'clean-micro' or 'clean-low'; refusing to record '$VERDICT'" >&2; exit 2
     fi ;;
 esac
@@ -1014,7 +1053,7 @@ fi
 if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
   echo "PR number must be numeric; refusing to record '$PR'" >&2; exit 2
 fi
-if [ "$PRINT_DIFF_HASH" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+if [ "$PRINT_DIFF_HASH" -eq 0 ] && [ "$CHECK_CARRY" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "head_sha must be a full 40-char hex sha (got '${SHA:0:12}…'); refusing to record" >&2; exit 2
 fi
 # tortoise#7391: the sha the CALLER named, kept before any carry re-binds $SHA to the
@@ -1573,6 +1612,167 @@ fi
 if [ "$PRINT_DIFF_HASH" -eq 1 ]; then
   printf '%s\t%s\n' "${DIFF_FETCH:-unavailable}" "${DIFF_HASH:-}"
   exit 0
+fi
+
+# ── --check-carry: THE LANE'S QUESTION, ANSWERED BY THE GATE'S OWN PREDICATE ──
+# #1351. `extensions/review-enforcer` already carries a record across a base move
+# when the recorded `diff_sha256` equals the PR's LIVE normalized three-dot diff.
+# Nothing told a LANE that, so lanes inferred "the branch moved, therefore the
+# review is stale" and paid for a fresh 20-40 minute review — re-minting records
+# after every base move, which is how a fleet reaches a dozen blocked PRs while
+# the content never changed.
+#
+# This is the ONE way to ask. It deliberately adds NO second definition of
+# "unchanged": it runs `diff_hash_for_pr` (the single normalizer the record path
+# and the GitHub gate share) and compares that digest to the record's field with
+# the same validity rule the local gate uses (full lowercase 64-hex, never the
+# empty-body constant). A second hashing path — or a second rule for what counts
+# as an identity — is exactly what this design avoids.
+#
+# ⛔ IT IS READ-ONLY AND IT CANNOT MAKE A RECORD VALID. It prints what the GATE
+# would decide; the gate re-decides at merge time, and an unreadable diff is
+# NEVER reported as a carry (see the status arm below).
+if [ "$CHECK_CARRY" -eq 1 ]; then
+  # The record path is the WRITER's own convention (see DIR/FILE below), so the
+  # reader cannot disagree with the writer. The legacy <pr>.json is honoured
+  # only when it names no repo or THIS repo — the #426 collision rule the local
+  # gate and admin-merge.sh both apply.
+  CC_DIR="$HOME/.pi/agent/reviews"
+  CC_FILE=""
+  CC_LEGACY=""
+  if [ -n "$REPO" ]; then
+    CC_FILE="$CC_DIR/${REPO%/*}-${REPO#*/}-$PR.json"
+    CC_LEGACY="$CC_DIR/$PR.json"
+  else
+    # NO REPO: the legacy <pr>.json is the ONLY name known in advance — a qualified
+    # record cannot be derived without the repo, so it is discovered by SCAN below
+    # (exactly what the gate does). Using CC_FILE for it made the no-repo path
+    # believe the legacy file WAS the qualified one.
+    CC_FILE=""
+    CC_LEGACY="$CC_DIR/$PR.json"
+  fi
+  # `|| true` is load-bearing: `head -1` closes the pipe, and under this script's
+  # `set -uo pipefail` a sed killed by SIGPIPE makes the whole pipeline 141 — which,
+  # under `set -e`, would abort the mode on a record it had merely finished reading
+  # (the same SIGPIPE flake class the test suite shows intermittently under load).
+  cc_field() { # <file> <field>
+    command sed -n "s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p" "$1" 2>/dev/null | command head -1 || true
+  }
+  # ⛔ MIRROR THE GATE'S LOOKUP EXACTLY, INCLUDING ITS COLLISION RULE (review, #2353 P1).
+  # `extensions/review-enforcer::readReviewRecord` returns NULL when the QUALIFIED file
+  # exists but its embedded `repo` differs (the identical-slug overwrite class: PR
+  # numbers collide across repos), and it compares `repo` CASE-SENSITIVELY. Reading the
+  # qualified file unconditionally made this surface answer `carry … land it` for a
+  # record the gate treats as ABSENT — a divergent second definition of "the record",
+  # which is the very thing this mode exists to avoid. Both arms now use one predicate,
+  # and the comparison is exact: a differently-cased repo is a DIFFERENT key.
+  cc_names_this_repo() { # <file> -> 0 when its embedded repo is absent or exactly $REPO
+    local r
+    r="$(cc_field "$1" repo)"
+    [ -z "$r" ] || [ "$r" = "$REPO" ]
+  }
+  CC_REC=""
+  CC_LOOKUP_HINT="Run the review, then record it."
+  if [ -n "$REPO" ]; then
+    if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then
+      if cc_names_this_repo "$CC_FILE"; then CC_REC="$CC_FILE"; fi
+    elif [ -n "$CC_LEGACY" ] && [ -f "$CC_LEGACY" ]; then
+      if cc_names_this_repo "$CC_LEGACY"; then CC_REC="$CC_LEGACY"; fi
+    fi
+  else
+    # ⛔ THE NO-REPO BRANCH IS A DIFFERENT RULE, NOT A DEGENERATE ONE (review, #2353 P2).
+    # `readReviewRecord(pr)` with no repo context cannot derive a qualified name, so it
+    # TRUSTS A KEY THAT PROVES ITS REPO: a single uniquely-matching qualified file
+    # (<owner>-<repo>-<pr>.json), and NOTHING ELSE — an ambiguous set is a collision, and
+    # a legacy file that EMBEDS a repo is rejected (#426 review P0-2: it may be another
+    # repo's PR with the same number). This mode read only <pr>.json here, so in the very
+    # state it exists for — repo auto-detection failing under a contested gh gate, REPO
+    # empty — it told a lane "no record … run the review" about a record the gate reads
+    # and would carry: the 20-40 minute re-review, triggered BY the check meant to prevent it.
+    CC_MATCHES=()
+    for _f in "$CC_DIR"/*-"$PR".json; do
+      [ -f "$_f" ] || continue
+      CC_MATCHES+=("$_f")
+    done
+    if [ "${#CC_MATCHES[@]}" -eq 1 ]; then
+      CC_REC="${CC_MATCHES[0]}"
+    elif [ "${#CC_MATCHES[@]}" -gt 1 ]; then
+      CC_LOOKUP_HINT="More than one repo has a record for #$PR (${#CC_MATCHES[@]} files) and no repo was resolved, so the record CANNOT be identified — pass owner/repo: record-review.sh --check-carry $PR owner/repo. (The merge gate treats an ambiguous lookup as NO record, so nothing would carry.)"
+    elif [ -n "$CC_LEGACY" ] && [ -f "$CC_LEGACY" ]; then
+      if [ -z "$(cc_field "$CC_LEGACY" repo)" ]; then CC_REC="$CC_LEGACY"; fi
+    fi
+  fi
+  if [ -z "$CC_REC" ]; then
+    printf 'norecord\t-\t%s\n' "${DIFF_HASH:--}"
+    echo "record-review.sh --check-carry: no review record for ${REPO:-<no repo resolved>}#$PR — there is no verdict to carry. $CC_LOOKUP_HINT" >&2
+    exit 4
+  fi
+  CC_HEAD="$(cc_field "$CC_REC" head_sha)"
+  CC_DIFF="$(cc_field "$CC_REC" diff_sha256)"
+  # The gate's own identity rule (isDiffSha256 in extensions/review-enforcer):
+  # full lowercase 64-hex, and NEVER the sha256 of the empty body — that constant
+  # would make every record "match" every PR.
+  cc_is_identity() {
+    case "$1" in
+      *[!0-9a-f]*) return 1 ;;
+    esac
+    [ "${#1}" -eq 64 ] || return 1
+    [ "$1" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ] || return 1
+    return 0
+  }
+  # The CURRENT head, read-only. A read failure is UNKNOWN, never a mismatch: the
+  # whole point of this mode is to stop rendering "could not read" as "changed".
+  # Same read (and same idiom) as the stale-sha guard below, so one fixture models
+  # both and the two can never disagree about which head is current.
+  CC_LIVE_HEAD="$(command gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
+  case "$CC_LIVE_HEAD" in
+    *[!0-9a-f]* | "") CC_LIVE_HEAD="" ;;
+  esac
+  if [ "${#CC_LIVE_HEAD}" -ne 40 ]; then CC_LIVE_HEAD=""; fi
+  # HEAD BINDING FIRST: a record at the CURRENT head is valid with no digest at
+  # all, and that is the commonest healthy case — it must not read as "carry".
+  if [ -n "$CC_LIVE_HEAD" ] && [ "$CC_HEAD" = "$CC_LIVE_HEAD" ]; then
+    printf 'head\t%s\t%s\n' "${CC_DIFF:--}" "${DIFF_HASH:--}"
+    echo "record-review.sh --check-carry: the record is bound to the CURRENT head (${CC_HEAD:0:12}…) — nothing is stale and nothing needs re-review." >&2
+    exit 0
+  fi
+  # ⛔ ORDER: THE ANSWER THAT NEEDS NO READ COMES FIRST (review, #2353 P2). A record
+  # with no usable digest can NEVER carry, and that is decidable from the record alone —
+  # so putting it after the diff-read arm made it unreachable exactly when the gate is
+  # contended (every attempt returned `unreadable`/RETRY forever, while the guidance
+  # that unsticks the lane needs no read at all). Neither branch is reachable from
+  # `carry`, so the swap weakens nothing.
+  if ! cc_is_identity "$CC_DIFF"; then
+    printf 'nodigest\t-\t%s\n' "${DIFF_HASH:--}"
+    # ⛔ THE REMEDY MUST BE RUNNABLE IN THE STATE THAT FIRES IT (review, #2353 round 4).
+    # Printing `… $REPO` with REPO empty promised a carry that CANNOT exist: the recorder's
+    # carry arms verify identity by computing the diff, which needs the repo, so the advised
+    # command refuses and names "→ Run the review" — the 20-40 minute path this mode exists
+    # to avoid — and re-running --check-carry answers `nodigest` again, so the advice cannot
+    # converge. With no repo the command is not merely incomplete, it is the wrong command,
+    # so say what is missing instead of printing an empty slot.
+    if [ -n "$REPO" ]; then
+      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… carries no usable diff digest (a legacy record, or one minted while the diff read was degraded), so it cannot carry on content identity. Re-run the recorder at the current head and let its carry arms decide: record-review.sh $PR <current head> <same verdict> $REPO — that is a CARRY, not a fresh review, and it refuses if the lane's commits changed." >&2
+    else
+      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… carries no usable diff digest (a legacy record, or one minted while the diff read was degraded), so it cannot carry on content identity — and NO repo was resolved here, so the recorder's carry arms cannot compute the identity that would let it. Pass it explicitly: record-review.sh $PR <current head> <same verdict> owner/repo — that is a CARRY, not a fresh review, and it refuses if the lane's commits changed." >&2
+    fi
+    exit 5
+  fi
+  # ⛔ AN UNREADABLE DIFF IS NEVER A CARRY. Every non-ok status means the diff
+  # could not be READ, and a failed read is not a matching read.
+  if [ "${DIFF_FETCH:-unavailable}" != "ok" ] || ! cc_is_identity "${DIFF_HASH:-}"; then
+    printf 'unreadable\t%s\t%s\n' "$CC_DIFF" "${DIFF_FETCH:-unavailable}"
+    echo "record-review.sh --check-carry: the PR's live diff could not be READ (status ${DIFF_FETCH:-unavailable}) — this is NOT a changed diff and NOT a carry. RETRY (a shared gh-gate queue, a rate-limit window or a transient API failure is far cheaper than a re-review)." >&2
+    exit 3
+  fi
+  if [ "$CC_DIFF" = "$DIFF_HASH" ]; then
+    printf 'carry\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
+    echo "record-review.sh --check-carry: the reviewed DIFF is UNCHANGED (diff_sha256 ${CC_DIFF:0:12}… matches the PR's live diff) — the merge gate CARRIES this record across the head move (${CC_HEAD:0:12}…). Do NOT re-review and do NOT mint a fresh record: land it." >&2
+    exit 0
+  fi
+  printf 'fresh\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
+  echo "record-review.sh --check-carry: the DIFF CHANGED (recorded ${CC_DIFF:0:12}… vs live ${DIFF_HASH:0:12}…) — the record genuinely does not cover what would merge. Run the code-review skill, post its verdict as a PR comment, then record clean with --evidence comment:<id>." >&2
+  exit 1
 fi
 
 # ── Stale-sha guard (#2133, extended by #2982): $SHA must be the CURRENT head
@@ -2270,7 +2470,7 @@ fi
 # --expect-head would be silently ignored and a record written — the pin would
 # look enforced while enforcing nothing. A pin that cannot be verified is a
 # refusal, not a pass (the #784 fail-open is about an UNPINNED record).
-if [ -n "$EXPECT_HEAD" ] && [ "$PRINT_DIFF_HASH" -ne 1 ]; then
+if [ -n "$EXPECT_HEAD" ] && [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne 1 ]; then
   if ! [[ "${CURRENT_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] || [ "${CURRENT_HEAD:-}" != "$EXPECT_HEAD" ]; then
     echo "⛔ --expect-head: could not verify the PR head against ${EXPECT_HEAD} — refusing to record (no record written, no marker posted)." >&2
     echo "   Resolved head: ${CURRENT_HEAD:-<unavailable: no \$REPO, or gh missing/failing>}. A pin exists only if it is checked; recording without checking it would make --expect-head decorative." >&2
