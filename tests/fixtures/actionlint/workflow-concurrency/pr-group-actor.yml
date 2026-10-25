@@ -1,0 +1,13 @@
+# A group keyed on neither the ref nor the PR: every run on the PR shares one group with the actor,
+# so it neither cancels superseded heads nor distinguishes them. Pins R1's "not keyed on the PR" arm,
+# which nothing else in this suite reached (#2660 round 4).
+name: PR group actor
+on: pull_request
+concurrency:
+  group: pr-group-actor-${{ github.actor }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

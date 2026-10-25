@@ -1,0 +1,17 @@
+# A pending `cancel-in-progress:` value as the LAST LINE OF THE FILE — `jobs:` comes BEFORE the
+# concurrency block, so nothing follows the value and only the record flush can resolve it. It was
+# resolved only when a later, less-indented line arrived, so at EOF it stayed ABSENT — and absent is
+# R2's safe default, which made a cancelling push workflow report GREEN (#2660 round 5).
+name: Push eof
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+concurrency:
+  group: push-eof-${{ github.ref }}
+  cancel-in-progress:
+    true
