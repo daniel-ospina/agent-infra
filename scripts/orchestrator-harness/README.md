@@ -1499,6 +1499,51 @@ scripts/harness-status             # one line per component + ONE verdict; exit 
 scripts/harness-down               # stop it via the platform authority (never a bare pkill)
 ```
 
+⛔ `harness-status` IS A READ; `harness-up status` HEALS. The launcher repairs by default (`--no-heal`
+for a pure read): it starts a controller that is not running and re-pins a pin that is behind. The thin
+`harness-status` name keeps the read-only contract it has always documented and passes `--no-heal`, so
+`harness-down` followed by a status read (or a monitoring poll) cannot silently restart a stack an
+operator deliberately stopped; ask for the repairs with `harness-status --heal` or `harness-up status`.
+Neither verb kills a duplicate or cycles a live-but-late controller — those are labelled
+`NOT HEALED` with whose decision they are.
+
+**What `harness-status` answers, row by row** — and what each row READS, because a health check that
+only passes by remembering is a defect. Every row below is a live read of an artefact, never a record
+of a previous run:
+
+| row | the question | read from |
+|---|---|---|
+| `exec` | which sha is **EXECUTING** (not which is pinned) | the RUNNING controller's own argv → the tree that path lives in → that tree's `HEAD`, compared with the pin |
+| `loop` | is the loop alive | the process census (ARGV-shape match) + `$O/heartbeat` age |
+| `capacity` | is **placement** healthy | fork headroom → free disk → load, in that order (below), each printed with the number it contributed and the one that BOUND |
+| `lanes` | how many lanes, and are they **advancing** | the launcher's own live worker records (`$O/state/run-*.sh`, removed by `wt_close`) × their `$O/logs/<name>.log` mtime, against the controller's own `STALE_MIN` (40 min). Finished logs are counted and IGNORED, never judged |
+| `selftest` | does this tree survive its own probes | `bash -n` over the live `$HARNESS/*.sh`, plus each platform probe in the shim called NOW |
+| `next` | what would it do next | the controller's own `[select]` decision line, with the log's age (LATE rather than "the current plan") |
+| `launchd` / `supervisor` / `refresh` / `claims` / `drift` | the supporting components | each component's own authority, or `SKIPPED` with its reason when the platform has no such component |
+
+**The capacity order is the failure order**: fork headroom first (a box can fork *nothing* at 0.32x
+load — #2293 — while load and disk read healthy), then disk (what breaks a box first in practice),
+then load. `lanes_by_fork` / `lanes_by_disk` / `lanes_by_load` are all computed and the smallest wins;
+`binding=` names which one did, so "the box could not fork" and "the box is busy" stop printing as one
+lane count. `capacity.sh` (the fleet instrument) answers the `fork` verb with `headroom=` and
+`min_fork_headroom=` (plus `src=` naming the limit that bounded it: `uid`/`cgroup`/`unbounded`), and
+those are the only fork names it publishes; `harness-up` re-labels them `fork_headroom`/
+`fork_source` in its OWN decision record, which is a launcher field, not a capacity one. A box where
+no ceiling could be found reads `unbounded`, which prints as `unbounded` — never as `0`, which would
+say no ceiling permits no lanes. The shim in `harness-up` is the documented fallback when
+`capacity.sh` is not beside the launcher, and the row names which one answered (`via=`). An
+**unmeasurable** fork limit refuses the start — "I could not look" is never spent as "there is room"
+— and a box that could not fork at all is refused by name (`fork_exhausted`), because its remedy is
+external to it.
+
+**Status heals**, by default (`--no-heal` for a pure read), and only the two repairs that are safe
+while lanes work: a controller that is **not running** is started (nothing live is interrupted), and a
+pin that is **BEHIND** is re-pinned (`harness-refresh.sh`'s advance kills nothing, #2278). It never
+kills a **duplicate** controller (a human decision) and never cycles a live-but-**LATE** one (that
+would drop in-flight lanes); `restart-pending` is reported with its deliberate remedy (`harness-down`
+then `harness-up`) and left alone. The rows are re-read after a repair, so the table an operator reads
+is the POST-heal state.
+
 `harness-up` does four things, in this order, and refuses rather than starting something wrong:
 
 1. **Resolves the pin** (`HARNESS-PIN`, else `origin/main`) and then **verifies the resolved pin
@@ -3794,7 +3839,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
 | `spawn-gate.sh` | the load and disk gate (`disk_free_mb`/`disk_ok` `:193-231`, `can_spawn` `:269`) plus the ONE `run_agent()` (`:305`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
-| `lane.sh` | the implementation worker (prompt template included). Since agent-infra#2148 it hard-requires `reviewer-preflight.sh`, prints the reviewer requirement once **before** any work, and splices the reviewer step into the generated brief — the requirement is no longer discovered by being refused at the rail |
+| `lane.sh` | the implementation worker (prompt template included). Since agent-infra#2148 it hard-requires `reviewer-preflight.sh`, prints the reviewer requirement once **before** any work, and splices the reviewer step into the generated brief — the requirement is no longer discovered by being refused at the rail. Since agent-infra#2258 it ALSO splices the canonical `RESEARCH FIRST` block (from `brief-gate.sh --section lane`) and refuses (78) if the brief it just generated fails the validator, so a brief that lost the contract cannot reach a lane |
+| `brief-gate.sh` | the RESEARCH contract, enforced at the dispatch seam (agent-infra#2258): a brief must carry a `RESEARCH FIRST` section (`INTERNAL:` + `EXTERNAL:` + a `RUNG:`/tool line) and a `CONTRADICTION TEST:` line, or the dispatch is REFUSED with **80** — nothing consumed — by a message that names every missing element and prints the block to paste. `--check <file\|-> [role]` · `--section [role]` (the ONE source of the block every generated brief splices and `templates/LANE-BRIEF.md` copies) · `--missing` · `--line`. Executed by `spawn-gate.sh::run_agent`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`, `orch-send.sh`, `safe-send.sh` and `pr-doctor.py`; `0` pass / `80` refused / `78` cannot-verify (missing, empty, unknown role, or an unresolvable validator — never a pass). Presence and shape only: it cannot judge the research itself, and its own refusal says so |
 | `reviewer-preflight.sh` | the reviewer requirement, disclosed up front (agent-infra#2148): `reviewer_preflight_line` / `reviewer_brief_section` for the three audiences (`self` = the lane lands through the rail; `harness` = a worker that pushes code while `merge-one.sh` mints the attestation; `reviewer` = merge-one.sh's own reviewer session, which posts the verdict comment and must not push, record or merge — no brief section, by design). The `self` line also names the override for a launcher that exports no `KIND` ("if your brief says you have no `task` tool, that overrides this") — the content-repo copy of `lane.sh` is in that state today (tortoise#8432). Sourced by `lane.sh`; also `--line`/`--brief`. Its wording is drift-pinned against the pi side (`extensions/shared/reviewer-preflight.ts`) and carried by `templates/LANE-BRIEF.md` |
 | `chain-merge.sh` | waits for the lane's PR, then runs the merge chain |
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` for a verdict with findings, `needsreview-*` for no usable verdict (#2132) |

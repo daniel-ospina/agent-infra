@@ -706,6 +706,10 @@ human_above() { # 0 = a human is above; 1 = none; 2 = the ancestry could not be 
 
 run_reap() {
   begin_pass
+  # ${1:-}: NO mode means a LIVE pass (an empty string never equals `--dry-run`). An ABSENT or
+  # empty `$1` MUST be survivable — a bare `"$1"` here is what killed the scheduler on its first
+  # tick (#2424), and the loop still asks this role to run with an empty mode on every schedule;
+  # see "POSITIONAL PARAMETERS: WHICH MAY BE ABSENT" before run_role_pass for the file-wide audit.
   local dry="${1:-}" s log m0 m1 c0 c1 age now pid clients ls0 ls1 started elapsed sp ha
   local seen=0 skipped=0 reaped=0 would=0 unverifiable=0 failed=0 result=""
   # ⛔ A POLICY-INERT PROCESS PASS IS A THIRD VERDICT, TRACKED APART (#2163 review r8, P1). It was a
@@ -1120,7 +1124,11 @@ attempt_record() { # <pr> <head> [<rc>]
 
 run_merge() {
   begin_pass
-  local dry="${1:-}" rail err prs line pr head draft now ep aep arc cl opid merge_parse_failed=0 started
+  # ${1:-}: NO mode means a LIVE pass (an empty string never equals `--dry-run`). An ABSENT or
+  # empty `$1` MUST be survivable — a bare `"$1"` here is what killed the scheduler on its first
+  # tick (#2424), and the loop still asks this role to run with an empty mode on every schedule;
+  # see "POSITIONAL PARAMETERS: WHICH MAY BE ABSENT" before run_role_pass for the file-wide audit.
+  local dry="${1:-}" rail err prs line pr head draft now ep aep arc cl opid merge_parse_failed=0 started ws_only
   local candidates=0 attempted=0 landed=0 skipped=0 unverifiable=0 result="" out rc
   if [ -z "$OR" ]; then
     log "[merge] CANNOT-VERIFY: \$OR is unset (the queue target is resolved by the supervisor)"
@@ -1142,7 +1150,18 @@ run_merge() {
   err="$ROLES_DIR/.merge-read.$$"
   prs="$(bounded "$MERGE_READ_TIMEOUT" "$GH_BIN" api "repos/$OR/pulls?state=open&per_page=$MERGE_MAX_PRS" 2>"$err")"
   rc=$?
-  if [ "$rc" -ne 0 ] || [ -z "${prs//[[:space:]]/}" ]; then
+  # ⛔ NEVER `[ -z "${prs//[[:space:]]/}" ]` HERE (the same hole `cleanup-stale-branches.sh:694`
+  # documents). The pattern substitution is SUPERLINEAR, and a real open-PR answer is large. Measured
+  # on THIS box, bash 5.2.21, one-builtin cost with nothing else running: 322 KiB (330,246 B) took
+  # 14.5 s, 843 KiB (862,802 B — the suite's fixture) took 99.8 s — 2.6x the bytes for 6.9x the time,
+  # i.e. quadratic, not linear. Both with the merge lock held and no syscalls, so `MERGE_BUDGET_S`
+  # cannot bound it: a `timeout` cannot interrupt a builtin, so the whole sequential loop (doctor,
+  # then reap, then hygiene) stalls behind it on the first tick of every cell. The `case` glob answers
+  # "empty or whitespace-only" in 9 ms (322 KiB) / 26 ms (843 KiB) and matches exactly the same set
+  # (POSIX `[:space:]`); a NUL cannot reach here (command substitution strips it).
+  ws_only=0
+  case "$prs" in *[![:space:]]*) ;; *) ws_only=1 ;; esac
+  if [ "$rc" -ne 0 ] || [ "$ws_only" = 1 ]; then
     local why; why="$(head -3 "$err" 2>/dev/null | tr '\n' ' ')"
     rm -f "$err"
     log "[merge] CANNOT-VERIFY: the open-PR read failed (rc=$rc) ${why:+— $why}"
@@ -1814,6 +1833,10 @@ $(git -C "$HARNESS_REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree
 }
 run_hygiene() {
   begin_pass
+  # ${1:-}: NO mode means a LIVE pass (an empty string never equals `--dry-run`). An ABSENT or
+  # empty `$1` MUST be survivable — a bare `"$1"` here is what killed the scheduler on its first
+  # tick (#2424), and the loop still asks this role to run with an empty mode on every schedule;
+  # see "POSITIONAL PARAMETERS: WHICH MAY BE ABSENT" before run_role_pass for the file-wide audit.
   local dry="${1:-}" before after mb rc wt mode out result="" h_rc=0 prev frag df_before df_after stop_reaper=0
   # ⛔ THE PASS-LEVEL `df` READ COMES FIRST, and the delta printed at the END is the ONLY savings this
   # role may claim. Not a `du` sum (see the section header), and not docker's own "Total reclaimed"
@@ -2065,6 +2088,10 @@ service_controller_present() {
 
 run_doctor() {
   begin_pass
+  # ${1:-}: NO mode means a LIVE pass (an empty string never equals `--dry-run`). An ABSENT or
+  # empty `$1` MUST be survivable — a bare `"$1"` here is what killed the scheduler on its first
+  # tick (#2424), and the loop still asks this role to run with an empty mode on every schedule;
+  # see "POSITIONAL PARAMETERS: WHICH MAY BE ABSENT" before run_role_pass for the file-wide audit.
   local dry="${1:-}" rc hb age result="" tmp rpid
   # Through the ROLED PASS, not run_reap directly: a nested reap must take the reap role lock like
   # any other pass, or an operator's concurrent `reap` and this one would sample each other's lanes
@@ -2504,6 +2531,113 @@ run_status() {
 # worktree sweep) delays the roles after it in that tick, so the intervals are bounds on "at least
 # this often", not deadlines. Each role also takes its own lock (role_lock), so an operator verb and
 # this loop can meet without a second pass starting.
+# ⛔ AN ABSENT MODE IS A LIVE PASS — the invariant every role carries itself (agent-infra#2135/#2424).
+# `run_loop` USED TO dispatch `doctor`, `merge` and `hygiene` with NO second argument, so `"$@"`
+# expanded to nothing and each of those roles' `local dry="$1"` read an UNBOUND `$1`: under `set -u`
+# the loop died on its first tick, every time a cell started it (`cloud-cell-doctor.sh: line 1385: $1: unbound
+# variable` — three recorded instances on cell-4). `doctor` is first in the tick, so it was the one
+# that crashed; `merge` and `hygiene` carried the identical latent crash and would have died on the
+# tick after it. `status` kept printing a live loop off the stale pid file, so the outage read as a
+# slow first pass — the inert-enforcer shape the whole role set exists to prevent. (The `start`
+# message that blamed a file that was present is a separate fix, shipped by #2306.)
+#
+# The default therefore lives in EACH ROLE (`local dry="${1:-}"`), not only in this dispatcher: the
+# invariant is "no mode means a live pass", not "this caller happens to pass one". That redundancy is
+# deliberate — #2424 shipped twice (#2555 had ALREADY made the loop bind it explicitly,
+# `run_role_pass doctor ""`, before this branch was rebased onto it) — so a FUTURE bare dispatch
+# cannot reintroduce the crash, and the
+# invariant is testable at the role boundary rather than through the loop's timing. `reap` is not
+# bare-dispatched today (`run_doctor`'s nested `run_role_pass reap "$dry"` and the CLI's `${dry}` both
+# bind it) and gets the same default anyway, for that same future-proofing.
+# ⛔ The `[ "$dry" = "--dry-run" ]` branches are safe with an empty mode BY CONSTRUCTION: an empty
+# string equals `--dry-run` nowhere, so every rehearsal arm falls through to the live path.
+#
+# ── POSITIONAL PARAMETERS: WHICH MAY BE ABSENT, AND WHICH STAY FATAL ─────────────────────────────
+# The audit behind those four defaults, so the next `local x="$1"` in this file is a DECISION
+# rather than an imitation of whichever shape happens to be nearby. Same rule `rail-refusal.sh`
+# already follows (`"${1:-}"` on its readers): a default is right only when the EMPTY value is
+# already meaningful AND is the safe direction. Otherwise the read stays fatal and names the caller
+# as the buggy party — a default there would ARM the dangerous path with an empty identity.
+#
+#   MODE FLAGS — defaulted "${1:-}"; absent/empty = a LIVE pass (not a rehearsal):
+#     run_reap, run_merge, run_hygiene, run_doctor.
+#     ⛔ WHY empty means LIVE, not dry: `parse_dry` prints NOTHING for a live run and `--dry-run`
+#     for a rehearsal, so "" is ALREADY the live value at every bound caller (the CLI's `${dry}`, the
+#     loop's explicit `""`, `run_doctor`'s nested `run_role_pass reap "$dry"`). Flipping "" to mean
+#     rehearsal would turn every live verb — including the loop's own scheduled pass — into a silent
+#     no-op: an inert enforcer, strictly worse than the crash it would fix. Rehearsal stays OPT-IN
+#     (`--dry-run`), and the suite pins BOTH directions so the distinction cannot drift.
+#
+#   REQUIRED — deliberately bare `"$1"`/`"$2"`, NO default; absent stays fatal:
+#     state_write(role, rc), state_write_rehearsal(role, own), lock_claim(d, tmp), reclaim_lock(d),
+#     role_lock(role), role_unlock(role), bounded(s), run_bounded(s), pid_ident(pid),
+#     human_above(pid), attestation_clean(pr, head), role_row(role, bound), run_role_pass(role),
+#     controller_heartbeat_verdict(who).
+#     * who (controller_heartbeat_verdict) — it NAMES what is up (`tmux '<session>'`, `the
+#       controller (service-managed)`) in the line the operator reads. An empty default would print a
+#       diagnosis that names nobody — `⛔ CONTROLLER STALE:  is up but …` — so the read stays fatal
+#       and the caller that omitted it is the bug. The BARE read arrived with #2402, after this audit
+#       was written, and the suite's exhaustive walk is what caught it — the audit working.
+#     * role/rc/own/bound — an empty ROLE records a pass nowhere, and an empty BOUND makes
+#       `[ "" -ge N ]` an arithmetic error: the caller is wrong and saying so beats a silent write
+#       to nowhere.
+#     * d, s — an empty lock dir takes a lock nowhere; an empty timeout bounds nothing.
+#     * pid (pid_ident, human_above) — an empty pid matches no process, and `human_above` would then
+#       answer "no human is above" about NOTHING: exactly the false negative the reaper must not be
+#       able to produce before a kill.
+#     * pr/head (attestation_clean) — an empty HEAD would be graded as an attestation "for this
+#       head", i.e. a false PASS onto the rail. That is the false-green class the rail exists for,
+#       so this read must never acquire a default.
+#     * run_role_pass's role — "" would fall to the `*)` arm's `unknown role ""`; not bare-dispatched
+#       anywhere, so it stays fatal.
+#   EMBEDDING — an ANNOTATION, never an exemption (review P2): a value that embeds the positional —
+#   `tmp="$1/.own.tmp.$$"`, `d="$ROLES_DIR/.$1.lock"` — is GRADED on the read (`bare` above, hence
+#   `lock_claim`'s `tmp` and `role_unlock`'s `d` are on the REQUIRED list) and merely ANNOTATED as
+#   embedding.
+#   It used to be a separate ungraded bucket, and that bucket swallowed `local dry="$1 "` and
+#   `local x="$1$2"` — both read an absent argument exactly like `local x="$1"` and both died the
+#   #2424 death — while printing a ✅ "reported, not graded". A bucket that reports instead of grading
+#   is how a fail-open classifier looks.
+# ⛔ SCOPE — WHAT THIS AUDIT DOES NOT COVER (review P2). It walks `local` BINDINGS, i.e. lines matching
+#   `^[[:space:]]*local `. A positional read that is not bound by `local` is NOT graded by it. The
+#   instances today, all in functions whose every caller binds: `free_mb` (`${1:-.}`), `hyg_df_mb`
+#   (`${1:-$CELL_HOME}`), `hyg_df_delta` (`${1:-?}`, `${2:-?}`), `num_ok` (`${1:-}`), `row_rc_merge`
+#   (`${1:-0}`), `state_get` (`$1`, `$2`), `mtime_epoch`, `pane_pid`, `session_present`,
+#   `attached_clients`, `subtree_cpu_secs`, `attempt_epoch`, `attempt_record`,
+#   `service_controller_present` (`${1##*/}`, `${2##*/}` — self-bound via `set -- $c`, so the
+#   caller's argv never reaches them), and the CLI dispatch's own `case "${1:-status}"`,
+#   `role="$1"` and `$1`. Two of those — `free_mb` and `hyg_df_mb` — are the NON-EMPTY-DEFAULT
+#   shape this audit rejects for a binding, so the exemption is deliberate here and would not be
+#   there: they are pure helpers whose default is the harmless current directory / cell home. Named
+#   so the omission is a recorded decision, not an implication of coverage: extending the walk to
+#   function bodies is the fix if a positional read outside a `local` ever carries a real hazard.
+#   Read this as "every `local` binding of a positional", never "every positional read in the file".
+#   A positional is counted in ANY spelling this audit recognises: `$N`, `${N}`, `${N:-…}`,
+#   `${N##*/}`, and the operators `${#N}` (length) and `${!N}` (indirect) — the last two were blind
+#   spots until review found that `local n="${#1}"` died on an absent argument while the scan saw no
+#   read at all and the fail-closed counter had nothing to compare against.
+# ⛔ AND `local` MUST BE THE LINE'S FIRST TOKEN. The walk greps `^[[:space:]]*local[[:space:]]` (any
+#   whitespace, so `local<TAB>` is found), so a binding
+#   written inside a ONE-LINE function body (`f() { local x="$1"; }`) is not scanned either, and
+#   neither is the continuation half of a binding split over lines (`local s="$1" \` + `tmp="$2"`)
+#   — only the first line is seen (review P2). Neither exists in this file today (one binding per
+#   line, no continuations), and the style here is what keeps the walk complete: stated because a
+#   future one-liner or continuation would be invisible rather than graded.
+# ⛔ The suite (final pass 3) walks this MECHANICALLY, by VALUE, keyed by (FUNCTION, NAME) and over a
+#   DERIVED role list: `"${N:-}"` passes at any index, `"${N:-<anything>}"` FAILS (a non-empty default
+#   would let an absent argument arm a mode by itself), a bare `$N` must be a `function:name` pair on
+#   the list above — the NAME ALONE is not enough, because `s`/`rc`/`d`/`role` are reused across
+#   helpers and a name-keyed list grandfathers the next `local s="$1"` anywhere in the file — and a
+#   role added to `run_role_pass` tomorrow is graded on the day it is added, not only the four that
+#   exist today.
+# ⛔ THE KEY IS (FUNCTION, NAME) AND DELIBERATELY NOT THE INDEX (declared residual, review P2). One
+#   listed pair therefore covers every read of that name inside that function: `local pid="$1$2"` in
+#   `human_above` (whose only caller passes one argument) inherits `human_above:pid`'s REQUIRED verdict
+#   and its `$2` read is not separately decided. It is caught BEHAVIOURALLY — the suite's reap arm runs
+#   the function and the unbound `$2` fails it — so it is not a silent pass, but the static audit alone
+#   would allow it. Keying by index was rejected for now because it multiplies the list by every
+#   read position and the index is not what makes a read safe (the FUNCTION's contract is); if this
+#   ever needs closing, key the list by `function:name:index` and re-derive it mechanically.
 run_role_pass() { # <role> [--dry-run]
   local role="$1" rc; shift
   if ! role_lock "$role"; then

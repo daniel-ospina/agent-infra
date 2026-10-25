@@ -194,7 +194,7 @@ WT_TALLY_COVER=0/0
 RC_UV=0; RC_VENV=0; RC_WT=0
 VERDICT_UV="not-run"; VERDICT_VENV="not-run"; VERDICT_WT="not-run"
 NOTE_UV=""; NOTE_VENV=""; NOTE_WT=""
-# Repos whose open-PR gate could not be verified, and the reason, as `<repo>[<reason>]` — one entry
+# Repos whose PR-state gate could not be verified, and the reason, as `<repo>[<reason>]` — one entry
 # each. A SKIPPED repo is not a failed CLASS: its own checkouts are untouched (fail closed) while the
 # other repos in the same class are still reclaimed. Reported per repo so a single unverifiable repo
 # cannot hide what the pass did do, and cannot disable the repos it could not reach (#2443).
@@ -1558,8 +1558,8 @@ reap_worktree() {
     # `verdict_worktree=fail-closed` already carry the red (#2443 review P2).
     if [ "$SKIPPED_WT_N" -gt 0 ]; then
         case "; $NOTE_WT;" in
-            *"; open-PR gate unverifiable;"*) : ;;
-            *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }open-PR gate unverifiable" ;;
+            *"; PR-state gate unverifiable;"*) : ;;
+            *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }PR-state gate unverifiable" ;;
         esac
     fi
     if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi

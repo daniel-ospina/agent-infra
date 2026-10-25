@@ -79,9 +79,14 @@ jobs:
     # queued and `bash-suites` alone is 8 matrix jobs. A required check that is `queued`
     # is indistinguishable from a broken pipeline, so nothing merges for hours.
     #
-    # THE FIX. Four reserved runner slots, label `required-check`, that ONLY this job asks
-    # for. Same check, same commit, same assertions — it just does not wait behind 1,600
-    # advisory jobs. No other job's routing is touched (see tests/required-check-reservation).
+    # THE FIX. Reserve slots (this design assumes FOUR) carrying the label `required-check`, which
+    # ONLY this job asks for: one operator adds the label per docs/ops/fleet-capacity.md §9.2 and
+    # sets PIPELINE_COMPLIANCE_RUNS_ON per §9.3. ⛔ NOTHING IS RESERVED TODAY — no runner carries
+    # `required-check` and the variable is unset, so this job still runs on `ubuntu-latest`. Do not
+    # engage the variable before the label exists: a reserved routing with no listener queues to the
+    # 24 h cancel and lands `cancelled`, which is non-red in the merge rail (§9.4).
+    # Same check, same commit, same assertions — it just does not wait behind 1,600 advisory jobs.
+    # No other job's routing is touched (see tests/required-check-reservation).
     #
     # ⛔ WHY THE RESERVATION IS OPT-IN, AND WHY THE FALLBACK IS THE *DEFAULT*. `runs-on` has NO
     #   fallback/OR semantics in GitHub Actions: a label list is ANDed, and a job whose labels
