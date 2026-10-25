@@ -735,8 +735,22 @@ case "$_row43" in *harness=*) bad "a current box's row carries a token anyway: '
                    *) ok "…and a current box's row stays clean" ;; esac
 
 _CASE=$((_CASE+1)); echo "=== C2: the issue-lane spawn line carries it too (dispatch-merge.sh, driven with stubs) ==="
-D="$T/c2"; mkdir -p "$D/bin" "$D/O" "$D/repo/.worktrees"
-printf '#!/bin/bash\nexit 0\n'       > "$D/bin/git";    chmod +x "$D/bin/git"
+D="$T/c2"; mkdir -p "$D/bin" "$D/O" "$D/repo/.git" "$D/repo/.worktrees/tm-7" "$D/repo/.worktrees/tm-8" "$D/repo/.worktrees/tm-9"
+# ⛔ THE STUB MUST ANSWER THE REPO-IDENTITY READS (#2762 review, 4th cycle, P1). `dispatch-merge.sh`
+# now asserts the checkout's origin before ANY lane work, so a stub that answers nothing makes the
+# batch refuse 72 and every spawn/chain assertion below goes empty — a registered shard red for a
+# reason it does not test. The origin read is the module's `config --local --get remote.origin.url`;
+# `--git-common-dir` answers "./.git" and `$D/repo/.git` exists, so the post-build dir half matches.
+cat > "$D/bin/git" <<GITS
+#!/bin/bash
+case "\$*" in
+  *"config --local --get remote.origin.url"*) echo "https://github.com/owner/repo.git" ;;
+  # ABSOLUTE, so the post-build dir half compares equal for the worktree and its checkout.
+  *"rev-parse --git-dir"*|*"rev-parse --git-common-dir"*) echo "$D/repo/.git" ;;
+esac
+exit 0
+GITS
+chmod +x "$D/bin/git"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/tmux";   chmod +x "$D/bin/tmux"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/sleep";  chmod +x "$D/bin/sleep"
 printf '#!/bin/bash\necho load\n'    > "$D/bin/uptime"; chmod +x "$D/bin/uptime"
@@ -779,8 +793,16 @@ case "$ALL9" in *harness=*) bad "an EMPTY (current) token still stamped a spawn 
 # by a box that started nothing — and skipped by this box until the row was reaped. Measured here:
 # the claims are released and the rows are dropped, so the batch really is back in the pool.
 _CASE=$((_CASE+1)); echo "=== C2b: a CI-CONGESTED batch releases the claims and rows it never used ==="
-DQ="$T/c2b"; mkdir -p "$DQ/bin" "$DQ/O/state" "$DQ/repo"
-printf '#!/bin/bash\nexit 0\n' > "$DQ/bin/git";   chmod +x "$DQ/bin/git"
+DQ="$T/c2b"; mkdir -p "$DQ/bin" "$DQ/O/state" "$DQ/repo/.git" "$DQ/repo/.worktrees/tm-7" "$DQ/repo/.worktrees/tm-9"
+cat > "$DQ/bin/git" <<GITQ
+#!/bin/bash
+case "\$*" in
+  *"config --local --get remote.origin.url"*) echo "https://github.com/owner/repo.git" ;;
+  *"rev-parse --git-dir"*|*"rev-parse --git-common-dir"*) echo "$DQ/repo/.git" ;;
+esac
+exit 0
+GITQ
+chmod +x "$DQ/bin/git"
 printf '#!/bin/bash\nexit 0\n' > "$DQ/bin/tmux";  chmod +x "$DQ/bin/tmux"
 printf '#!/bin/bash\nexit 0\n' > "$DQ/bin/uptime"; chmod +x "$DQ/bin/uptime"
 # ⛔ NO EMPTY worker-terminal.sh IN THIS RIG (#2296 cycle 4 verification): an EMPTY module is worse

@@ -98,7 +98,9 @@ Run:  python3 -m pytest scripts/test_dispatch_wiring.py -q
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
+import plistlib
 import re
 import subprocess
 
@@ -2597,3 +2599,76 @@ def test_a_defeated_gate_odd_heredoc_delimiters_are_refused(tmp_path):
         "a heredoc opened with these delimiters was NOT stripped, so this scanner treated the "
         "launch as live code while bash treated it as heredoc body (the beat dispatches nothing): "
         "%r" % survivors)
+
+
+# ── #2280: the beat must carry REPO EVIDENCE into the pinned launch ──────────────────────────────
+def _beat_function(name: str) -> str:
+    """The source of one shell function in the beat, by its own delimiters.
+
+    The launch is PINNED to `nohup … pr-doctor.py` with NO ARGUMENTS (a reading flag is still an
+    argument, and that pin exists so an argument cannot turn the pass into a no-op), so the child's
+    repo evidence can only be what the beat EXPORTS. That makes the exporter part of the wiring, and
+    it is driven here by extraction rather than by starting a loop.
+    """
+    lines = _BEAT.read_text().splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith(name + "() {"))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start:end + 1])
+
+
+def test_the_beat_EXPORTS_the_repo_the_pinned_pass_will_grade(tmp_path):
+    """`pr-doctor.py` has no default repo (#2280): a pinned launch that exports no evidence refuses.
+
+    ⛔ MEASURED BEFORE THIS TEST. The beat pins HOME/O/PATH and nothing else, exports no OR/REPO, and
+    `cd "$HOME"` — which is not a checkout — then launches `pr-doctor.py` with no arguments. Remove
+    the module constant (this PR) and the beat's only dispatch entry point exits 2 on EVERY pass:
+    armed, logging, dispatching nothing. The box's own declaration (the orchestrator plist
+    `install.sh` renders) is the evidence, read only when the variable is not already set.
+    """
+    fn = _beat_function("_beat_repo_evidence") + "\n" + _beat_function("_beat_pin_repo_evidence")
+    home = tmp_path / "home"
+    (home / "Library" / "LaunchAgents").mkdir(parents=True)
+    (home / "Library" / "LaunchAgents" / "com.eldato.orchestrator-loop.plist").write_bytes(
+        plistlib.dumps({"EnvironmentVariables": {"OR": "daniel-ospina/agent-infra",
+                                                 "REPO": "/co/ai", "O": "/o"}}))
+
+    def drive(**preset):
+        env = {k: v for k, v in os.environ.items() if k not in ("OR", "REPO")}
+        env["HOME"] = str(home)
+        env.update(preset)
+        return subprocess.run(
+            ["bash", "-c", fn + '\n_beat_pin_repo_evidence\n'
+             'printf "OR=%s\\nREPO=%s\\n" "${OR:-}" "${REPO:-}"'],
+            capture_output=True, text=True, env=env, check=False).stdout.strip().splitlines()
+
+    assert drive() == ["OR=daniel-ospina/agent-infra", "REPO=/co/ai"], (
+        "the beat exported no repo evidence for the detached pass — the pinned launch would refuse")
+    # ⛔ THE PLIST IS FILLED AS ONE DECLARATION (review cycle 4, P2). Filling REPO from the plist
+    # beside an operator's `OR` for a DIFFERENT repo hands `resolve_repo()` two disagreeing answers
+    # ("the launcher named two different repos") and the pass refuses for ever — while the operator
+    # believes the pin took effect. A re-point keeps its own rank and inherits NO foreign checkout.
+    assert drive(OR="acme/pinned") == ["OR=acme/pinned", "REPO="], drive(OR="acme/pinned")
+    # The same repo as the plist declares IS the same repo: its checkout is still evidence.
+    assert drive(OR="daniel-ospina/agent-infra") == ["OR=daniel-ospina/agent-infra", "REPO=/co/ai"]
+    # A REPO-only pin is left alone too: rank 3 proves the slug from that checkout's own origin.
+    assert drive(REPO="/only/co") == ["OR=", "REPO=/only/co"], drive(REPO="/only/co")
+    # AND NOTHING IS INVENTED when the box declares nothing: the pass then refuses LOUDLY, naming
+    # every source, which is the whole design — a default here would grade a repo nobody named.
+    (home / "Library" / "LaunchAgents" / "com.eldato.orchestrator-loop.plist").unlink()
+    assert drive() == ["OR=", "REPO="], drive()
+    # A CORRUPT plist is "no evidence", not a crash in the beat (the loop must keep running).
+    (home / "Library" / "LaunchAgents" / "com.eldato.orchestrator-loop.plist").write_bytes(b"junk")
+    assert drive() == ["OR=", "REPO="], drive()
+
+
+def test_the_beat_CALLS_the_repo_evidence_pin_before_the_launch():
+    """The exporter is dead code unless an executable line calls it — before the launch line."""
+    lines = _executable_raw(_BEAT)
+    calls = [i for i, l in enumerate(lines) if l.strip() == "_beat_pin_repo_evidence"]
+    assert len(calls) == 1, (
+        "the beat must CALL `_beat_pin_repo_evidence` exactly once (found %d). Without the call the "
+        "pinned launch inherits no repo evidence and pr-doctor refuses every pass (#2280)."
+        % len(calls))
+    launch = [i for i, l in enumerate(lines) if _DISPATCH_STEP in l]
+    assert launch and calls[0] < launch[0], (
+        "the pin must run BEFORE the launch (call at %r, launch at %r)" % (calls, launch))
