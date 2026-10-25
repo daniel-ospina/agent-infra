@@ -48,6 +48,12 @@
 #
 # Env seams (tests + unusual cells):
 #   DISK_REAPER            the entry point to install (default: the farmed copy, else beside this)
+#   DISK_REAPER_RUN        the SCHEDULED wrapper beside the reaper (default: disk-reaper-run.sh). It
+#                          supplies HOME/keys, resolves the REAL gh and unsets AGENT_GH_REAL, so a
+#                          timer-started pass is not parked in the interactive pacing queue (#2354)
+#   (The worktree class's own floors — REAP_WT_SCRATCH_AGE_DAYS/REAP_WT_SCRATCH_GLOB — are NOT
+#    rendered here: the reaper's defaults (1 day, wt-*|cell-wt-*) are what a unit runs with. To pin
+#    one, add it to the templates and render it, the way DISK_REAPER_WT_AGED_DAYS is.)
 #   DISK_REAPER_STATE_DIR  status/log dir the unit exports (default $HOME/.pi/agent/state)
 #   DISK_REAPER_REPOS      colon-separated repos the venv/worktree classes scan
 #   DISK_REAPER_WT_AGED_DAYS  worktree age floor for the scheduled pass (default 7)
@@ -140,6 +146,22 @@ for cand in "${DISK_REAPER:-}" "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" "$IN
     [ -n "$cand" ] || continue
     if [ -f "$cand" ]; then REAPER="$cand"; break; fi
 done
+# #2354: prefer the WRAPPER beside the resolved reaper. A timer-started pass inherits no HOME, no
+# keys and no usable `gh`, and the raw script then fails its open-PR gate closed and reaps NOTHING
+# (measured on a cell at 99% used: REMOVE=0 PRESERVE=0 REMOVED=0, hourly). The wrapper supplies exactly
+# that environment — and it is a REPO artifact (farmed by pi-bootstrap), so it cannot drift into a
+# hand-maintained file on one box, which is the failure this whole installer exists to prevent.
+if [ -n "${DISK_REAPER_RUN:-}" ] && [ ! -f "$DISK_REAPER_RUN" ]; then
+    err "\$DISK_REAPER_RUN is set to '$DISK_REAPER_RUN' but that is not a regular file — refusing to install a unit that points at a DIFFERENT scheduled wrapper (the beside-copy would be installed silently, and the rendered plist/unit is the only place that would have said so)"
+    exit 2
+fi
+if [ -n "$REAPER" ]; then
+    for cand in "${DISK_REAPER_RUN:-}" "$(dirname "$REAPER")/disk-reaper-run.sh"; do
+        [ -n "$cand" ] || continue
+        [ -f "$cand" ] || continue
+        REAPER="$cand"; break
+    done
+fi
 
 # ── repos: what this box actually has ───────────────────────────────────────────────────────────
 # Rendered into the unit so the scheduled pass never depends on a shell's environment. A candidate
@@ -433,7 +455,7 @@ resolve_launcher() {
     LAUNCHER="${ELDATO_LAUNCHER:-}"
     if [ -z "$LAUNCHER" ]; then
         for cand in "${HOME:-}/.pi/agent/scripts/pi-reap-worktrees-launchd.py" \
-                    "${REAPER%/disk-reaper.sh}/pi-reap-worktrees-launchd.py" \
+                    "${REAPER%/*}/pi-reap-worktrees-launchd.py" \
                     "$INFRA_ROOT/scripts/pi-reap-worktrees-launchd.py"; do
             [ -n "$cand" ] && [ -f "$cand" ] && { LAUNCHER="$cand"; break; }
         done

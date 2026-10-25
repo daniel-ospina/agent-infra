@@ -187,10 +187,12 @@ SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$
 OR="${OR:-}"
 
 # ── the worker census (agent-infra#2210) ────────────────────────────────────────────────────────
-# ⛔ THE TMUX NAME MATCH IS DEAD ON A CELL. The harness spawns workers into cmux DURABLE TERMINALS
-# there (worker-terminal.sh's header records the measurement), so `tmux ls | grep -c '^lane-'` answers
-# 0 while lanes run — and this file used that answer to decide whether it may delete caches under a
-# live lane, and to report `lanes:` in `status`. Both read a confident 0 for a busy box.
+# ⛔ THE TMUX NAME MATCH IS DEAD WHERE THE CMUX DAEMON ANSWERS. There the harness spawns workers into
+# cmux DURABLE TERMINALS (worker-terminal.sh's header records the measurement), so
+# `tmux ls | grep -c '^lane-'` answers 0 while lanes run — and this file used that answer to decide
+# whether it may delete caches under a live lane, and to report `lanes:` in `status`. Both read a
+# confident 0 for a busy box. (tmux IS the launch surface where the daemon does NOT answer — on a
+# launchd Mac and on a cell alike, agent-infra#2210 — so the defect is the single surface, not tmux.)
 # The count comes from the launcher module's own census, and UNKNOWN (exit 3) is NOT zero: every
 # caller treats it as "workers may be live", which is the direction that cannot destroy a live lane.
 worker_census() { # stdout: the live worker count; exit 3 when no answer can be had
@@ -434,6 +436,12 @@ CONTROLLER_UNIT_IN="${CONTROLLER_UNIT:-}"
 SYSTEMCTL_IN="${SYSTEMCTL:-}"
 CONTROLLER_SYSTEM_UNIT_DIR_IN="${CONTROLLER_SYSTEM_UNIT_DIR:-}"
 CONTROLLER_USER_UNIT_DIR_IN="${CONTROLLER_USER_UNIT_DIR:-}"
+# ⛔ AND `PS_BIN` BELONGS TO THE FAMILY TOO (review P1 round 19, #2402 / B). It is read at CALL time by
+# `_proc_start_epoch`, and its answer (`_proc_began_after`) is what decides which pids `stop` may signal.
+# A pushed `PS_BIN` stub forges the age rule: a recycled pid that merely LOOKS like `<shell> <…/orch-loop.sh>`
+# is then classified as the lock owner and gets TERM/KILL — the peer-repo controller that rule exists to
+# protect. Absent a caller value the restored state is "unset" = the real `/bin/ps` default.
+PS_BIN_IN="${PS_BIN:-}"
 source_env_file
 ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
 ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
@@ -446,8 +454,17 @@ ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
 # exists to prevent, now reachable from keys.env instead of from the caller's shell.
 [ -z "$CONTROLLER_INVOKER_HOME_IN" ]     || CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"
 SYSTEMCTL="$SYSTEMCTL_IN"
-[ -z "$CONTROLLER_SYSTEM_UNIT_DIR_IN" ]  || CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
-[ -z "$CONTROLLER_USER_UNIT_DIR_IN" ]    || CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+# ⛔ THESE TWO ARE RE-ASSERTED UNCONDITIONALLY, WHICH IS THE WHOLE POINT (review P1 round 19, #2402 / B).
+# The timeout siblings above use `[ -z "$_IN" ] ||` because an UNSET one legitimately comes from the env
+# file (tmux mode has no unit to provide it). A unit DIRECTORY has no such reading: its default is computed
+# downstream (`${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}`), so "unset" is the CORRECT restored
+# state, and the conditional form left the keys.env value in force — the fence was inert in production,
+# where the unit renders no such variable and every caller supplies nothing. Reproduced: a keys.env line
+# `CONTROLLER_SYSTEM_UNIT_DIR=/tmp/nowhere` hid the installed unit with 0 systemctl calls and `stop`
+# printing "not running", which is the exact false pass the fence was added to close.
+CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
+CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+PS_BIN="$PS_BIN_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -675,6 +692,12 @@ controller_user_unit_dirs() {
   local h
   [ -n "${CONTROLLER_USER_UNIT_DIR:-}" ] && printf '%s\n' "$CONTROLLER_USER_UNIT_DIR"
   h="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  # ⛔ A MISSING `getent` MUST NOT FAIL SILENTLY (review P2 round 19, #2402 / B). The passwd home is the
+  # candidate the doctor's `HOME=$CELL_HOME` session depends on; without `getent` it would simply disappear
+  # from the list and re-open the duplicate-dispatcher defect with no diagnostic anywhere. stderr only —
+  # stdout is a list.
+  command -v getent >/dev/null 2>&1 \
+    || printf '%s\n' "cloud-cell-supervisor: getent not found — the passwd-home unit lookup is unavailable on this box, so a reader whose HOME is not the installer's may miss the unit" >&2
   h="$(passwd_home "$(id -u)")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   h="$(passwd_home "${SUDO_USER:-}")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   return 0
@@ -1848,6 +1871,64 @@ cmd_check() {
   # uv is the ONE non-fatal dependency (its absence only stops a lane syncing its worktree venv),
   # and install.sh warns rather than dying for it — so the two surfaces agree.
   command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
+  # ── the RESOLVED LANE MODEL, and whether THIS box's catalog lists it (agent-infra#2208) ─────
+  # `spawn-gate.sh`'s and `merge-one.sh`'s `run_agent` default to `deepseek/deepseek-flash`
+  # (env-overridable). A box's model list is its OWN — `pi-bootstrap/cell-install.sh` deliberately
+  # does not manage `models.json` ("the cell's identity") — so a drifted cell can hand every lane an
+  # id its provider entry does not list, and pi answers that with
+  # `Warning: Model "…" not found … Using custom model id`: a lane that STARTS, spends tokens and
+  # degrades silently. The failure is silent, so a certification command is where it should be
+  # named.
+  #
+  # ⛔ THIS IS AN INSTRUMENT, NOT A GATE, AND THE DISTINCTION IS THE WHOLE DESIGN (review cycle 2).
+  # pi's resolution is a UNION — its built-in catalog, MERGED with the box's `models` array and with
+  # `modelOverrides` — so absence from the box's array does NOT prove the id fails to resolve.
+  # Measured: the shipped catalog lists `deepseek-v4-flash-vision-exp` only under `modelOverrides`,
+  # and it IS a pi built-in, so `PI_LANE_MODEL=` it resolves cleanly while a `die` here would have
+  # refused a healthy cell. A refusal set out of a question this file cannot answer is a false block.
+  # So: "listed" is reported as listed; anything else is reported as NOT VERIFIED, with the reason,
+  # and nothing refuses. (If it must become a gate, ask pi itself — `pi --list-models` — not this
+  # file's guess at pi's merge rules.)
+  #
+  # ⛔ AND THE PAIR MUST BE THE ONE THE SESSIONS WILL SEE (same review). `cmd_check` runs in the
+  # operator's shell, but the controller and doctor sessions are launched with an explicit env
+  # allow-list and re-source `$ENV_FILE` — they do NOT inherit ambient `PI_LANE_*`. So the pair is
+  # resolved the way a session resolves it (from `$ENV_FILE` when it carries one, defaults
+  # otherwise), and an ambient-only value is named as NOT reaching the lanes rather than reported as
+  # if it governed them.
+  local lane_provider lane_model models_json lane_state lane_chan
+  lane_provider="${PI_LANE_PROVIDER:-deepseek}"
+  lane_model="${PI_LANE_MODEL:-deepseek-flash}"
+  lane_chan="ambient shell (does NOT reach the tmux sessions — put it in $ENV_FILE)"
+  if [ -f "$ENV_FILE" ]; then
+    local lane_in_file
+    lane_in_file="$(env -u PI_LANE_PROVIDER -u PI_LANE_MODEL bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s\t%s" "${PI_LANE_PROVIDER:-}" "${PI_LANE_MODEL:-}"' _ "$ENV_FILE" 2>/dev/null || true)"
+    if [ -n "$lane_in_file" ]; then
+      lane_provider="${lane_in_file%%	*}"; lane_provider="${lane_provider:-deepseek}"
+      lane_model="${lane_in_file##*	}"; lane_model="${lane_model:-deepseek-flash}"
+      lane_chan="$ENV_FILE (re-sourced by the controller and doctor sessions)"
+    fi
+  fi
+  models_json="$CELL_HOME/.pi/agent/models.json"
+  if ! command -v jq >/dev/null 2>&1; then
+    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (jq missing, so $models_json cannot be read; channel: $lane_chan)"
+  elif [ ! -f "$models_json" ]; then
+    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (no $models_json on this box; channel: $lane_chan)"
+  else
+    lane_state="$(jq -r --arg p "$lane_provider" --arg m "$lane_model" '
+        (.providers[$p]) as $pv
+        | if $pv == null then "no-provider"
+          else
+            (($pv.models // {}) | (if type == "array" then ([.[] | .id]) else (keys) end)) as $ids
+            | (($pv.modelOverrides // {}) | keys) as $ovr
+            | if ($ids | index($m)) != null or ($ovr | index($m)) != null then "listed" else "absent" end
+          end' "$models_json" 2>/dev/null)" || lane_state="unreadable"
+    case "$lane_state" in
+      listed) say "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json; channel: $lane_chan)" ;;
+      absent) say "      lane model: $lane_provider/$lane_model — NOT RESOLVABLE FROM $models_json, and this id has no pi BUILT-IN: providers.$lane_provider there does not list it, and pi's built-in catalog carries only deepseek-v4-flash / deepseek-v4-flash-vision-exp / deepseek-v4-pro. pi MERGES the built-in catalog, so a PI_LANE_MODEL that IS built in still resolves from here — the SHIPPED DEFAULT ('deepseek-flash') is not, and on this box every harness lane would start on pi's 'Using custom model id' fallback: it runs, spends tokens, and degrades silently, which is the defect #2208 exists to remove. Remedy: add providers.$lane_provider.models.$lane_model to $models_json (pi-bootstrap/pi-config/models.json ships it, so a provisioned box is not affected — this fires on a box whose models.json was trimmed), or set PI_LANE_MODEL to a built-in id. Verify with the unfiltered: pi --list-models   [channel: $lane_chan]" ;;
+      *) say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (providers.$lane_provider unreadable/absent in $models_json; channel: $lane_chan)" ;;
+    esac
+  fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
@@ -1888,10 +1969,17 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
+  # calls it for the process pass. A $O without it still runs (the census falls back to the launch
+  # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
+  # terminals AND tmux sessions (launchd Mac or cell, #2210); `tmux ls` alone sees one of the two
+  # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
+  # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
+  # reports success.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
-  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
+  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
   # ── the gh-limit layer (#1988): present, AND able to run ──────────────────────────────────────
   # Presence alone is the false-green this file refuses everywhere else: a shim that cannot find the
   # real gh exits 127 on EVERY call, which would stop merges altogether. So resolve `gh` through the
