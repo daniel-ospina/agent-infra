@@ -249,6 +249,13 @@ grep -v '^run_shard ' "$RUNNER" >"$TMP/runner-gutted.sh"
 if cmp -s "$RUNNER" "$TMP/runner-gutted.sh"; then
   fail "the gutted-runner mutation did not change the file"
 else
+  # The mutant must be VALID shell, or the red below could be a syntax failure wearing the floor's
+  # message. `^run_shard ` is anchored and matches only top-level one-line calls (see 6b).
+  if bash -n "$TMP/runner-gutted.sh"; then
+    pass "the gutted mutant is VALID shell (bash -n clean)"
+  else
+    fail "the gutted mutant is not valid shell"
+  fi
   guard_rc "$MAIN" "$PR" "$TMP/runner-gutted.sh"
   if [ "$RC" -eq 2 ] && grep -q 'shard(s) (floor' <<<"$OUT"; then
     pass "a gutted runner exits 2 and names the floor (rc 2)"
@@ -260,18 +267,109 @@ fi
 echo ""
 echo "6. A RUNNER WITH NO SWEEPS (0 syntax targets) → rc 2"
 # The sweep half is DATA now (SWEEP_GLOBS) plus the loops that iterate it, and the guard reads the
-# list from the runner's own `--list-sweeps`. So the mutation must remove the LIST; deleting only
+# list from the runner's own `--list-sweeps`. So the mutation must EMPTY THE LIST; deleting only
 # the loops leaves the list advertising globs nothing iterates, which the guard cannot see and the
-# RUNNER's `swept` sentinel catches at runtime (pinned by 8q below).
-grep -v -e 'for f in' -e 'SWEEP_GLOBS' "$RUNNER" >"$TMP/runner-nosweep.sh"
+# RUNNER's `swept` sentinel catches at runtime (pinned by 8n below, which asserts `syntax sweep
+# executed no file`; 8q is its counter-preserving sibling).
+#
+# ⛔ EMPTY THE DECLARATION — never delete the lines that MENTION it. This arm used to be
+# `grep -v -e 'for f in' -e 'SWEEP_GLOBS'`, which matches by IDENTIFIER and therefore took out far
+# more than the sweep: the `SWEEP_GLOBS=(…)` definition, the `printf` inside `--list-sweeps`, every
+# comment naming it, and — collateral and silent — the whole `run_shard
+# scripts/harness-cohesion.test.sh` line, whose trailing comment mentions SWEEP_GLOBS. Deleting the
+# two `for` headers left a dangling `[ -f "$f" ] || continue … done done` body, so the mutant was
+# NOT VALID SHELL: `bash -n` fails at mutant line 258 — `syntax error near unexpected token
+# 'done'`, the FIRST ORPHANED `done` — while the `--list`/`--list-sweeps` branches above it parse
+# and exit fine. ⛔ AND THE ARM DID NOT GO RED FOR IT: `grep` took the `printf '%s\n' "${SWEEP_GLOBS[@]}"`
+# INSIDE the `--list-sweeps` branch, leaving `if … then exit 0; fi` — a branch that exits 0 having
+# printed nothing. The guard's floor then fired on 0 targets (the intended message, by luck), and
+# because bash parses and executes incrementally the dangling `done` is never reached on the
+# `--list`/`--list-sweeps` paths the guard uses. So the arm PASSED over a mutant that was (i) not
+# parseable, and (ii) silently missing a real shard — the `run_shard scripts/harness-cohesion.test.sh`
+# line — since MIN_SUITES is 14 and losing one stays above the floor. Two defects, neither
+# asserted. The `bash -n`, `--list`-identity and 0-target assertions below close both; the
+# non-vacuity control keeps the red attributable to the emptied LIST. An anchored single-line
+# substitution leaves the rest byte-identical.
+#
+# `SWEEP_GLOBS=""` and NOT `SWEEP_GLOBS=()`: under `set -u` on bash 3.2 (macOS `/bin/bash`)
+# expanding an EMPTY ARRAY is an "unbound variable" error, which would take this arm red locally
+# for a reason of its own. A defined-but-empty scalar expands to one blank line, which the guard
+# filters out — both bash 3.2 and 5.x then report 0 targets.
+awk '
+  /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=\"\""; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-nosweep.sh"
 if cmp -s "$RUNNER" "$TMP/runner-nosweep.sh"; then
   fail "the no-sweep mutation did not change the file"
 else
+  # (a) the mutant is VALID shell — a syntax error here would make the arm's red meaningless
+  if bash -n "$TMP/runner-nosweep.sh" 2>"$TMP/runner-nosweep.syntax"; then
+    pass "the no-sweep mutant is VALID shell (bash -n clean)"
+  else
+    fail "the no-sweep mutant is not valid shell: $(cat "$TMP/runner-nosweep.syntax")"
+  fi
+  # (b) the mutation is SURGICAL — the mutant lists the same shards, line for line, as the runner.
+  # ⛔ Measure the INPUTS: two `--list` invocations that both fail compare equal under `cmp -s`, so
+  # asserting only the comparison would pass having read nothing (the exact class this change is
+  # about). The real list must be non-empty — the 14 floor mirrors the guard's MIN_SUITES.
+  bash "$RUNNER" --list >"$TMP/sweeps-real-list.txt" 2>&1
+  real_list_rc=$?
+  bash "$TMP/runner-nosweep.sh" --list >"$TMP/sweeps-mutant-list.txt" 2>&1
+  mutant_list_rc=$?
+  real_list_n="$(grep -c . "$TMP/sweeps-real-list.txt" || true)"
+  if [ "$real_list_rc" -ne 0 ] || [ "$real_list_n" -lt 14 ]; then
+    fail "the runner's own --list is unreadable (rc $real_list_rc, $real_list_n line(s)) — the comparison below would measure nothing"
+  elif [ "$mutant_list_rc" -ne 0 ]; then
+    fail "the no-sweep mutant's --list exited $mutant_list_rc — it cannot be compared to the real list"
+  elif cmp -s "$TMP/sweeps-real-list.txt" "$TMP/sweeps-mutant-list.txt"; then
+    pass "the no-sweep mutant keeps the real shard list intact ($real_list_n shard(s), only the sweep declaration moved)"
+  else
+    fail "the no-sweep mutant ALSO changed the shard list: $(diff "$TMP/sweeps-real-list.txt" "$TMP/sweeps-mutant-list.txt" | head -3 | tr '\n' ' ')"
+  fi
+  # (c) …and it really declares no sweeps: 0 non-blank lines from its own `--list-sweeps`
+  bash "$TMP/runner-nosweep.sh" --list-sweeps >"$TMP/sweeps-mutant-sweeps.txt" 2>&1
+  if [ "$(grep -c . "$TMP/sweeps-mutant-sweeps.txt" || true)" -eq 0 ]; then
+    pass "the no-sweep mutant declares 0 sweep target(s) — the neuter is behavioural"
+  else
+    fail "the no-sweep mutant still declares sweeps: $(tr '\n' ' ' <"$TMP/sweeps-mutant-sweeps.txt")"
+  fi
   guard_rc "$MAIN" "$PR" "$TMP/runner-nosweep.sh"
   if [ "$RC" -eq 2 ] && grep -q 'syntax target' <<<"$OUT"; then
     pass "a runner with no sweeps exits 2 — the syntax half cannot go uncovered in silence"
   else
     fail "a runner with no sweeps returned rc $RC (want 2, naming the sweeps): $OUT"
+  fi
+  # (d) NON-VACUITY — the same $TMP path with the sweep list NON-EMPTY (one real glob, everything
+  # else byte-identical) must PASS. Without this the red above could be attributable to the guard
+  # being handed a file outside the checkout rather than to the emptied list.
+  awk '
+    /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=(\"scripts/*.sh\")"; next }
+    { print }
+  ' "$RUNNER" >"$TMP/runner-onesweep.sh"
+  guard_rc "$MAIN" "$PR" "$TMP/runner-onesweep.sh"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: the same temp-dir path with ONE sweep target PASSES (rc 0) — the red is the emptied list"
+  else
+    fail "control: a runner with one sweep target returned rc $RC (want 0): $OUT"
+  fi
+  # (e) …and the guard READS the list rather than grepping the declaration. The mutant above empties
+  # the DECLARATION, which a text scan of the runner would also see, so on its own it cannot tell a
+  # behavioural read (`bash <runner> --list-sweeps`, the design the .mjs header records) from a grep
+  # over the file. This mutant keeps the declaration intact and silences only the print, so a
+  # text-scanning guard passes it and this arm goes red.
+  awk '
+    /^  printf .*SWEEP_GLOBS\[@\]/ { print "  :"; next }
+    { print }
+  ' "$RUNNER" >"$TMP/runner-silentsweeps.sh"
+  if cmp -s "$RUNNER" "$TMP/runner-silentsweeps.sh"; then
+    fail "the silent-sweeps mutation did not change the file"
+  else
+    guard_rc "$MAIN" "$PR" "$TMP/runner-silentsweeps.sh"
+    if [ "$RC" -eq 2 ] && grep -q 'syntax target' <<<"$OUT"; then
+      pass "a runner whose declaration is intact but whose --list-sweeps prints nothing still exits 2 (the list is READ, not grepped)"
+    else
+      fail "an intact declaration with a silent --list-sweeps returned rc $RC (want 2): $OUT"
+    fi
   fi
 fi
 
@@ -279,7 +377,16 @@ fi
 # independent, so a mutation that satisfies one must not carry the other.
 echo ""
 echo "6b. FLOOR INDEPENDENCE — sweeps intact but no shards still exits 2"
+# Safe by construction, and checked: `grep -v '^run_shard '` is ANCHORED (line start) and matches
+# only top-level one-line calls, so it cannot delete a definition or leave a block dangling —
+# `bash -n` on this mutant and the gutted one at 5 is clean. The identifier-wide match at 6 was the
+# fragile one; an anchored grep over a call list is not.
 grep -v '^run_shard ' "$RUNNER" >"$TMP/runner-noshards-but-sweeps.sh"
+if bash -n "$TMP/runner-noshards-but-sweeps.sh"; then
+  pass "the empty-shard-list mutant is VALID shell (bash -n clean)"
+else
+  fail "the empty-shard-list mutant is not valid shell"
+fi
 guard_rc "$MAIN" "$PR" "$TMP/runner-noshards-but-sweeps.sh"
 if [ "$RC" -eq 2 ]; then
   pass "the shard floor fires even while the sweep floor is satisfied (rc 2)"
