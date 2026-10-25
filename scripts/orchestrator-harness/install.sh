@@ -561,6 +561,18 @@ command -v python3 >/dev/null 2>&1 \
   || die "python3 is not on PATH — the merge reminder (merge-reminder.py) cannot run without it"
 python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/merge-reminder.py" 2>/dev/null \
   || die "merge-reminder.py is missing or does not parse"
+# check-class.py / nochk-resolve.py (agent-infra#2719) are HARD DEPENDENCIES of the loop's own
+# classification, so they take the SAME parse gate: a syntax error in either one installs clean (the
+# files exist, so the loop's startup check does not fire), `python3 $O/check-class.py` exits 1 with
+# stderr discarded, and EVERY PR classifies `V=""` — no merge, no fixer, no reviewer — with no signal.
+# UNGUARDED, like their neighbours: a `[ -f ]` guard made a MISSING file pass a gate that exists to
+# catch a broken one.
+for _py in check-class.py nochk-resolve.py; do
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is not on PATH — the NOCHECKS arm ($_py) cannot run without it"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/$_py" 2>/dev/null \
+    || die "$_py is missing or does not parse — the controller cannot classify a single PR without it"
+done
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
@@ -927,9 +939,12 @@ ok "pinned scripts parse ($HARNESS)"
 # commit" (measured: 793 consecutive refusals beside healthy `[cap]` lines; full record in
 # docs/ops/fleet-harness-baseline.md §3.1). The live workaround is a small entrypoint that keeps the
 # controller inside the tmux pane that holds the Full Disk Access grant.
-# ⛔ AS OF THIS CHANGE THAT ENTRYPOINT (`launchd-controller.sh`) IS NOT ON MAIN — it exists only in
-# `~/orchestrator` (docs/ops/ACTIVATION-MATRIX.md row 7 records the installed plist naming it, and
-# `git ls-tree origin/main` → absent). PR #2020 lifts it; it is not merged. So the installer does the
+# ⛔ WHEN THIS WAS WRITTEN that entrypoint (`launchd-controller.sh`) was NOT on main — it existed only
+# in `~/orchestrator` (docs/ops/ACTIVATION-MATRIX.md row 7 records the installed plist naming it, and
+# `git ls-tree origin/main` → absent). agent-infra#2020 has since LANDED it (this branch rewrites it),
+# so the pin now carries the file and the first arm below wins on every box. The clause is kept
+# because the arms still have to hold for a box whose INSTALLED plist names a program the pinned tree
+# does not carry. The installer does the
 # ONLY thing that neither loses it nor keeps running a home-dir copy silently:
 #   · if the PINNED tree carries an entrypoint, that is the program (pin wins, same as every other file);
 #   · if it does not, and this box is LIVE on a home-dir entrypoint the repo does not carry, REFUSE and
@@ -1232,7 +1247,21 @@ DRIFTED=""
 # reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
 # #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
 # render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
-for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
+# ⛔ launchd-controller.sh IS IN THIS LIST BECAUSE ITS STALE BYTES **ARE** THE DEFECT (agent-infra#2098).
+# The installed plist on a Mac runs `/bin/bash $O/launchd-controller.sh`, and that file used
+# `new-session -A -d`, which ATTACHES — impossible for a launchd job — so the job crash-looped for
+# 7,633 launches while every other instrument read the box as merely idle. A stale $O copy of the
+# entry point is therefore the most expensive drift on the box, and the one verb an operator actually
+# runs (`install.sh`) must say so. The template ALREADY renders `/bin/bash __HARNESS__/launchd-controller.sh`
+# (its `<string>__HARNESS__/__ENTRY__</string>` argument) with `WorkingDirectory __O__` on this head
+# (#2020 lifted it), so this row guards the live file the job executes, not a future flip.
+#
+# check-class.py / nochk-resolve.py (agent-infra#2719) are HARD DEPENDENCIES of the loop's own
+# classification: `V` is computed by `python3 $O/check-class.py` on every PR, and the NOCHECKS arm runs
+# `$O/nochk-resolve.py`. A `$O` with the new `orch-loop.sh` and an OLD file set classifies EVERY PR as
+# `V=""` — no merge arm, no fixer, the controller silently stops working — and the only trace is one
+# startup warning. That is exactly the partial-reseed drift this list exists to catch.
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -1475,11 +1504,32 @@ LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
 # the command reports success. It is one `-f` test away from being knowable, so it is refused here.
 case "$ACTION" in
   start|restart)
-    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: cp '$HERE'/*.sh '$O'/"; ;;
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'"; ;;
 esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
-  restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                              || exit 1 ;;
+  restart)
+    # ⛔ AN EXPLICIT `--restart` MUST APPLY THIS RENDER'S ENVIRONMENT, WHICH MEANS THE OLD PANE MUST GO
+    # (this PR's entry point adopts a live session instead of replacing it — see its `else` arm).
+    # `launchctl bootout` stops only the SUPERVISOR: the controller pane's parent is the tmux SERVER, so
+    # the session outlives the job. Without this kill, `--restart` bootstraped a fresh supervisor, which
+    # adopted the still-running pane — and the closing banner then printed "this run did it and PROVED
+    # it" (pid + heartbeat, both true) over a controller still running the OLD MAX_LANES/MAX_LOAD. It is
+    # also what makes `launchd-cycle.sh`'s wedged-controller remedy (`install.sh --restart`) actually
+    # recover: re-supervising the SAME wedged pane cannot unwedge anything. Adopt stays correct for the
+    # implicit path (a KeepAlive relaunch must never interrupt a healthy controller); it is wrong for
+    # this one, which is a deliberate operator act. Same target as the --uninstall path below: the
+    # job's own session name only, so this can only ever stop the controller this job started.
+    CTRL_SESS="${CONTROLLER_SESSION:-orch-controller}"
+    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$CTRL_SESS" 2>/dev/null; then
+      warn "restarting: ending the '$CTRL_SESS' session first, so the new job starts a controller with THIS render's environment"
+      tmux kill-session -t "=$CTRL_SESS" 2>/dev/null || true
+      # Ordered, not racy: the replacement must not start while the old lock pid is still alive, or the
+      # new controller exits 0 at once with `already running` and the assertion below reads a stale pid.
+      _kn=0
+      while tmux has-session -t "=$CTRL_SESS" 2>/dev/null && [ "$_kn" -lt 50 ]; do sleep 0.2; _kn=$(( _kn + 1 )); done
+    fi
+    lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                                    || exit 1 ;;
 esac
 # Record the render launchd is now running, so the NEXT run can tell "current" from "the file was
 # overwritten earlier and never reloaded" (see PLIST_CHANGED above). Written AFTER the start succeeded —
