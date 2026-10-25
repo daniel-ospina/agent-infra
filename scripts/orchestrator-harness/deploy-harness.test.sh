@@ -1163,7 +1163,12 @@ fi
 # keeps the mention count identical. That is arm (2)'s job, so (2) now covers the whole-tree copy
 # shapes too (`cp -R "$H"/. "$O"/` — the #2041 incident line verbatim — plus `cp "$H"/*`, `rsync -a
 # "$H"/`), not just the `*.sh` glob.
-REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:20 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:4 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1"
+# ⛔ THE FLOORS ARE THE MEASURED COUNTS, NOT ONE BELOW THEM (review P1 2026-10-25). `-ge` is used
+# below, so a floor one BELOW today's count is a floor that tolerates exactly one reverted remedy:
+# at head `orch-loop.sh` carried 21 mentions and `refresh-candidates.sh` 5, while the floors said 20
+# and 4 — reverting a single remedy left both green, which is the defect this arm exists to catch.
+# The rule: each number is `grep -c 'deploy-harness\.sh' <file>` as measured NOW.
+REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:21 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1"
 for _sf in $REMEDY_SITES_FLOOR; do
   _site="${_sf%%:*}"; _floor="${_sf##*:}"
   if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
@@ -1254,12 +1259,17 @@ _FC_GOT="$(_bare_cp_hits "$_FIX" | wc -l | tr -d ' ')"
   && ok "positive control: no SAFE shape (comment, prose, named-file copy, systemd install) is flagged" \
   || bad "  positive control FAILED: the matcher flags $_FC_GOT safe shape(s) — false positives are how this check gets deleted: $(_bare_cp_hits "$_FIX" | tr '\n' ' ')"
 
-# ⛔ THE POPULATION IS EVERY SHIPPED SCRIPT UNDER scripts/, to depth 2 — not the two directories a
+# ⛔ THE POPULATION IS EVERY SHIPPED SCRIPT UNDER scripts/, to depth 3 — not the two directories a
 # pair of globs happened to name. `"$HERE"/*.sh "$HERE"/../*.sh` never reached `scripts/lib/`,
 # `scripts/checkout-hygiene/`, `scripts/ci/`, `scripts/pi-patches/` or `orchestrator-harness/retired/`,
 # while the comment claimed "every shipped script in the harness directory and in `scripts/`": a
 # remedy added there was invisible to a guard calling itself site-level. Bounded walk (one named
-# tree, maxdepth 2) — never a root walk.
+# tree, maxdepth 3) — never a root walk.
+# ⛔ DEPTH 3, NOT 2 (review P1 2026-10-25): the walk root is `scripts/`, so `retired/` sits at depth 3
+# (`scripts/orchestrator-harness/retired/*.sh`) and a maxdepth-2 walk could not see the very
+# directory this comment names as a blind spot it closes — the claim was false and 6 shipped scripts
+# stayed unscanned. Depth 3 also brings `scripts/<dir>/<sub>/*.sh` into the population, which is
+# stricter and costs nothing.
 NAMED_DEPLOY_IMPLS_FLOOR="deploy-crossbox.sh:1 cloud-cell-quiesce.sh:1"
 NAMED_DEPLOY_IMPLS="deploy-crossbox.sh cloud-cell-quiesce.sh"
 # ⛔ NORMALISE THE WALK ROOT (found by this case's own guard): feeding `find` a path ending in `/..`
@@ -1277,7 +1287,14 @@ while IFS= read -r _f; do
     EXCL=$((EXCL + _n)); continue
   fi
   case "$_f" in "$HERE"/*) SCANNED_HARNESS=$((SCANNED_HARNESS + 1)) ;; *) SCANNED_SCRIPTS=$((SCANNED_SCRIPTS + 1)) ;; esac
-  _h="$(_bare_cp_hits "$_f")"
+  # ⛔ A DEAD MATCHER MUST NOT READ AS A CLEAN FILE (review P2 2026-10-25): the exit status of the
+  # substitution was discarded, so an awk abort on ONE of the ~150 population files yielded an empty
+  # `_h` and `continue` — a green line for a file nothing examined. The fixture positive control
+  # proves the PATTERN works on `$_FIX`; this proves the matcher RAN on every file.
+  if ! _h="$(_bare_cp_hits "$_f")"; then
+    bad "  the bare-cp matcher ABORTED on $_b — a matcher that cannot run reports no hits, so this file would otherwise be certified clean"
+    continue
+  fi
   [ -n "$_h" ] || continue
   case " $NAMED_DEPLOY_IMPLS " in
     *" $_b "*) NAMED_HITS="$NAMED_HITS
@@ -1285,9 +1302,9 @@ while IFS= read -r _f; do
     *) BARE_HITS="$BARE_HITS
   $_b: $_h" ;;
   esac
-done < <(find "$_SCRIPTS_ROOT" -maxdepth 2 -name '*.sh' -type f 2>/dev/null | sort)
+done < <(find "$_SCRIPTS_ROOT" -maxdepth 3 -name '*.sh' -type f 2>/dev/null | sort)
 [ "$SCANNED_HARNESS" -ge 30 ] && ok "scanned $SCANNED_HARNESS harness scripts for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_HARNESS harness scripts scanned — that half of the population is gone"
-[ "$SCANNED_SCRIPTS" -ge 90 ] && ok "scanned $SCANNED_SCRIPTS scripts/ scripts (depth 2) for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_SCRIPTS scripts/ scripts scanned — that half is gone (run this suite from the checkout, not from \$O)"
+[ "$SCANNED_SCRIPTS" -ge 90 ] && ok "scanned $SCANNED_SCRIPTS scripts/ scripts (depth 3) for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_SCRIPTS scripts/ scripts scanned — that half is gone (run this suite from the checkout, not from \$O)"
 # ⛔ THE EXCLUSION IS BOUNDED, not merely counted. `EXCL` only ever printed, so the fixture exclusion
 # could grow into a hole with the suite green; and a NEW bare copy added to `selftest.sh` would have
 # been absorbed into the same counter. Pin the exact number, so the exclusion cannot grow silently.
