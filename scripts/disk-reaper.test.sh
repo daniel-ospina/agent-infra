@@ -1900,8 +1900,9 @@ inst55() { # inst55 <args...>
     # wrapper beside the reaper (`disk-reaper-run.sh`), and after that landed this repo has one — so the
     # rendered unit would name the WRAPPER, while every assertion in T58/T58b/c/d is about the ARTIFACT
     # READ-BACK gate (does the unit systemd LOADS run what we rendered?) and is written against $REAPER.
-    # Pinning the seam keeps this fixture measuring that gate and nothing else; the wrapper preference
-    # has its own coverage in T20, which asserts disk-reaper-run.sh exists and is what a timer runs.
+    # Pinning the seam keeps this fixture measuring that gate and nothing else. The wrapper preference
+    # is measured at the END of this block, on its own unpinned install — it is NOT covered by T20,
+    # which only asserts that `disk-reaper-run.sh` exists and runs standalone.
     HOME="$T/t55/home" DISK_REAPER="$REAPER" DISK_REAPER_RUN="$REAPER" DISK_REAPER_REPOS="$REPO" \
     DISK_REAPER_STATE_DIR="$T/t55/home/.pi/agent/state" \
     SYSTEMD_UNIT_DIR="$T/t55/units" SYSTEMCTL="$T/t55/bin/systemctl" \
@@ -2034,6 +2035,26 @@ if PATH="/usr/bin:/bin" command -v gh >/dev/null 2>&1; then
 else
     assert_contains "$OUT" "no \`gh\` on the PATH this unit renders" \
         "T58 a missing gh is REPORTED at install (the class would fail closed every pass)"
+fi
+
+# ⛔ THE WRAPPER PREFERENCE IS MEASURED HERE (#2354), because nothing else measures it: T20 asserts
+# `scripts/disk-reaper-run.sh` EXISTS and runs it directly, but NOTHING fails if the installer stops
+# PREFERRING it — and that regression is silent in production (a timer-started raw reaper inherits no
+# HOME/keys/gh, fails the open-PR gate closed and reclaims nothing: the measured outage the wrapper
+# exists to fix). Deliberately UNPINNED, so the beside-wrapper is what the rendered unit names.
+WRAPPER58="$(dirname "$REAPER")/disk-reaper-run.sh"
+mkdir -p "$T/t55w/units"
+OUT="$(HOME="$T/t55/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_STATE_DIR="$T/t55/home/.pi/agent/state" \
+    SYSTEMD_UNIT_DIR="$T/t55w/units" SYSTEMCTL="$T/t55/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/t55/calls.log" TEMPLATES_DIR="$HERE/../templates/systemd" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 the UNPINNED install (wrapper preference live) succeeds"
+if [ -f "$WRAPPER58" ]; then
+    assert_contains "$(cat "$T/t55w/units/eldato-disk-reaper.service")" "ExecStart=/bin/bash $WRAPPER58" \
+        "T58 the installer PREFERS the scheduled wrapper beside the reaper (#2354) — delete the preference loop and this fails"
+else
+    bad "T58 $WRAPPER58 is missing — a timer would run the raw reaper, the #2354 outage shape"
 fi
 
 # ── T58b: the plist TEXTUAL fallback (no parser) must still refuse a stale arming decision ──────

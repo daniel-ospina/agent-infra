@@ -1571,6 +1571,24 @@ reap_worktree() {
     # requirement is "byte counts in dry-run", so the ENTRY POINT measures each selected checkout
     # with a bounded `du` and labels it for what it is. The owner's contract is untouched: it still
     # never claims a saving.
+    # ⛔ WHETHER THIS CLASS ANSWERED IS DECIDED HERE, BEFORE THE CLASS LINE IS PRINTED. The record's
+    # `candidates_worktree` already distinguishes a measured count from a REFUSAL (`?`), but the class
+    # line printed the raw counter — so a delegate that exited 3 and printed only
+    # `FAIL-CLOSED gh unavailable` reported `candidates=0` on the line while the record written in the
+    # same pass said `candidates_worktree=?`. Two surfaces of one pass disagreeing about the very field
+    # this tool exists to report is the false PASS one layer up — T59's shape, worktree arm.
+    #
+    # ⛔ `candidates` is OUR measurement only where we measured it. In a DRY run it is the count of
+    # `remove` rows this class scanned with `du`, so any delegate output makes it real (0 rows = 0
+    # candidates). In an APPLY pass it is the delegate's own `remove=` from the SUMMARY, so it is
+    # answerable ONLY with a tally — hardcoding `have_tally=1` recorded a measured `0` beside
+    # `classified_worktree=?` on a selected class whose delegate printed nothing.
+    HAVE_WT_CAND="$have_tally"
+    # ⛔ A REFUSAL IS NOT A MEASUREMENT EITHER. `[ -n "$rows" ]` was true for a delegate that printed
+    # only `class=worktree FAIL-CLOSED gh unavailable` and exited 3, so the record claimed
+    # `candidates_worktree=0` (a measured zero) beside `classified_worktree=?`. Count it only when the
+    # output actually contains CLASSIFICATION rows — that is what the `du` sweep measured.
+    if is_dry && grep -qE '^(remove|preserve|SUMMARY) ' <<<"$rows"; then HAVE_WT_CAND=1; fi
     if is_dry; then
         # CLASS_TIMEOUT bounds the DELEGATE, not this sweep: N candidates x DU_TIMEOUT each would let a
         # single pass hold the lock for hours. The sweep gets ONE budget for the whole class.
@@ -1603,7 +1621,7 @@ reap_worktree() {
         done <<<"$rows"
         CAND_WT="$all_c"
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$(_tally_num "$HAVE_WT_CAND" "$CAND_WT") would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
     else
         # `candidates_worktree` used to be structurally 0 on an ARMED pass (it was only accumulated in
         # the dry-run branch), so the record answered "no candidates" for a pass that classified fifty.
@@ -1619,17 +1637,6 @@ reap_worktree() {
     # only here repaired the record while the class line still said `?`).
     CLASSIFIED_WT="$sum_classified"; PRESERVED_WT="$sum_preserved"; REASONS_WT="$sum_reasons"
     PROOF_WT="$proof"; PRM_WT="$prm"; HAVE_WT_TALLY="$have_tally"
-    # ⛔ `candidates` is OUR measurement only where we measured it. In a DRY run it is the count of
-    # `remove` rows this class scanned with `du`, so any delegate output makes it real (0 rows = 0
-    # candidates). In an APPLY pass it is the delegate's own `remove=` from the SUMMARY, so it is
-    # answerable ONLY with a tally — hardcoding `have_tally=1` recorded a measured `0` beside
-    # `classified_worktree=?` on a selected class whose delegate printed nothing.
-    HAVE_WT_CAND="$have_tally"
-    # ⛔ A REFUSAL IS NOT A MEASUREMENT EITHER. `[ -n "$rows" ]` was true for a delegate that printed
-    # only `class=worktree FAIL-CLOSED gh unavailable` and exited 3, so the record claimed
-    # `candidates_worktree=0` (a measured zero) beside `classified_worktree=?`. Count it only when the
-    # output actually contains CLASSIFICATION rows — that is what the `du` sweep measured.
-    if is_dry && grep -qE '^(remove|preserve|SUMMARY) ' <<<"$rows"; then HAVE_WT_CAND=1; fi
     return 0
 }
 
@@ -1694,8 +1701,19 @@ UNMEASURED=""
 [ "${DF_UV_OK:-0}"  = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }uv"
 [ "${DF_VENV_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }venv"
 [ "${DF_WT_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }worktree"
+# ⛔ AN UNANSWERABLE TOTAL IS `?`, NOT THE INITIALISED ZERO. `CAND_*` are initialised to 0 and are
+# only lifted to a sentinel on the CLASS line, so a fail-closed class printed `candidates=?` on its own
+# line and the pass-end line then summed the zeroes into a confident `candidates=0` — the last line of
+# the pass, and the one an operator reads to decide whether the sweep had anything to do. That is
+# verbatim the "reads as a passing pass" failure this report exists to remove, the same shape T59 pins
+# for the class line. One vocabulary: a class that was NOT SELECTED contributes nothing; a class that
+# ran with no tally makes the TOTAL unknown. Computed once, before either the line or the log uses it,
+# so the two surfaces cannot disagree again.
+CAND_TOTAL="$(( CAND_UV + CAND_VENV + CAND_WT ))"
+{ [ "${WANT_VENV:-0}" != 1 ] || [ "${HAVE_VENV_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
+{ [ "${WANT_WT:-0}" != 1 ] || [ "${HAVE_WT_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
 if is_dry; then
-    say "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT ))MB candidates=$(( CAND_UV + CAND_VENV + CAND_WT )) — NOTHING was removed"
+    say "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT ))MB candidates=$CAND_TOTAL — NOTHING was removed"
 else
     # third arg: was the class SELECTED at all? not-run is a third state, distinct from both
     # "measured zero" and "unmeasured".
@@ -1811,6 +1829,6 @@ write_record "$RECORD_DIR" 2>/dev/null \
              # channel left, so any non-3 verdict becomes 4 (a filesystem problem) instead of exiting green
              # over an un-writable state dir.
              [ "$verdict" = 3 ] || verdict=4; }
-log "==== pass end mode=$MODE_TEXT verdict=$verdict freed_mb=$TOTAL uv=$FREED_UV venv=$FREED_VENV worktree=$FREED_WT candidates=$(( CAND_UV + CAND_VENV + CAND_WT )) ===="
+log "==== pass end mode=$MODE_TEXT verdict=$verdict freed_mb=$TOTAL uv=$FREED_UV venv=$FREED_VENV worktree=$FREED_WT candidates=$CAND_TOTAL ===="
 
 exit "$verdict"

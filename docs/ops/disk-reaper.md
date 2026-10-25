@@ -624,7 +624,7 @@ when the last run has never happened, and when the pass record's own `rc` is one
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 466 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 590 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -680,10 +680,10 @@ when the last run has never happened, and when the pass record's own `rc` is one
 | T51 | the USER install target — reachable only when the sudo probe fails, and it used to route its file copy through sudo (so it could never install): the files land in `~/.config/systemd/user` with no sudo, every `systemctl` call keeps `--user`, an unconfirmed `Linger` refuses with the exact remedy, and `--uninstall` really removes them |
 | T52 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder (#2159) |
 | T53 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is RED in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; a uv deferral cannot mask a venv removal failure across classes; and the `7` row is asserted on BOTH sides — uv `7` defers, a venv delegate's out-of-vocabulary `7` is RED (#2156, #2036) |
-| T55b | the plist **textual** fallback (no usable parser) still refuses a stale arming decision: a good artifact passes and the message names `EnvironmentVariables.HOME` as NOT verified; a stale one (no `--apply`) is refused, naming the missing flag |
-| T55 | the INSTALLED ARTIFACT is read back before `enable --now`: a clean install says it read `ExecStart` + `HOME` out of the artifact; a `50-mask.conf` drop-in that REPLACES `ExecStart` makes the install refuse (naming the drop-in files that exist) and nothing is armed; removing it restores a clean install; an ADDED `ExecStart` (a pre-flight) is accepted and still verified; a drop-in that moves `Environment=HOME` is refused and names both HOMEs; and a `gh` that does not resolve is reported |
 | T54 | the stale threshold and the help text: a non-numeric `DISK_REAPER_STALE_SECONDS` is refused on read (never a green `status=ok`), and `--help` still reaches the end of the header — it carries the DEFERRED exit-code bullet and the watchdog pin, so the derived range is what is printing |
 | T55 | **a full disk does not stop the pass** (#2443): an uncreatable state dir falls back to a tmpfs candidate — the classes RUN, the record is written with `state_dir=`/`state_dir_primary=` and says why, and the pass discloses it; the fallback lock is a REAL lock (a live holder still defers, 6); nothing writable anywhere is still a refusal naming every candidate; a writable configured dir produces the unchanged record; and the record returns to the configured path on the next pass once it can be written |
+| T58 | the INSTALLED ARTIFACT is read back before `enable --now`: a clean install says it read `ExecStart` + `HOME` out of the artifact; a `50-mask.conf` drop-in that REPLACES `ExecStart` makes the install refuse (naming the drop-in files that exist) and nothing is armed; removing it restores a clean install; an ADDED `ExecStart` (a pre-flight) is accepted and still verified; a drop-in that moves `Environment=HOME` is refused and names both HOMEs; and a `gh` that does not resolve is reported |
+| T58b | the plist **textual** fallback (no usable parser) still refuses a stale arming decision: a good artifact passes and the message names `EnvironmentVariables.HOME` as NOT verified; a stale one (no `--apply`) is refused, naming the missing flag |
 
 ⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is
 flaky (~4%: one invocation fail-closes with `tmux probe FAILED` and empty probe output, so every §B1
