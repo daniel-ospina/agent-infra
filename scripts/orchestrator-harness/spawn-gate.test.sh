@@ -995,10 +995,13 @@ echo
 echo "── THE HEADROOM GATE (#2721): a lane's own tree against the space it has left ──"
 
 # ⛐ THE `df` STUB IS CREATED HERE, BEFORE ANY ARM USES IT (review round 6, VGATE). It used to be created
-# two hundred lines down, so the THREE arms added above it (target selection, the advance warning's
-# terms, the band warning's terms) ran with `$TMP/bindf` ABSENT: `PATH` found the real `df`, and those
+# two hundred lines down, so ONE arm added above it — the target-selection arm — ran with `$TMP/bindf`
+# ABSENT: `PATH` found the real `df`, and those
 # arms decided on this host's free space instead of the fixture — green on a full cell, red on a roomy
-# one, and in neither case a test of the code they name. The stub is a FIXTURE, not part of one arm.
+# one, and in neither case a test of the code it names. The other two new arms (the advance-warning and
+# band-warning term arms) sit BELOW the stub's old position and were never exposed — counted exactly,
+# because "which arms were host-measuring" is a fact a later audit should not have to re-derive.
+# The stub is a FIXTURE, not part of one arm.
 mkdir -p "$TMP/bindf"
 printf '#!/bin/sh\navail=$(( ${FAKE_DF_AVAIL_MB:-0} * 1024 ))\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "fake 9999999 0 $avail 1%% /"\n' > "$TMP/bindf/df"
 chmod +x "$TMP/bindf/df"
@@ -1069,7 +1072,7 @@ ck "...and it says waiting will not clear it, so an operator is not sent to a lo
 # called "the false PASS this gate exists to close" had no arm behind it. The fixture puts the GATED PATH
 # on a directory that is NOT a checkout (the operator pointing `DISK_GATE_PATH` at a mount root) while
 # the cwd IS one carrying `uv.lock`. Both triples are known: python is 350/6144/2000 (need 8144) and
-# harness is 64/64/2000 (need 2064), and the stubbed reading sits BETWEEN them (4884MB), so the verdict
+# harness is 64/64/2000 (need 2064), and the stubbed reading sits BETWEEN them (5000MB), so the verdict
 # alone identifies which target was classified — refused means the CHECKOUT was measured, admitted means
 # the mount root was.
 TGT="$TMP/target"

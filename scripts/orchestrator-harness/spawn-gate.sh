@@ -1257,28 +1257,27 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ONE lane's measured cost for THIS target (agent-infra#2721). Read once, here, so the ledger row,
   # the refusal and the warning below all quote the SAME numbers — a gate that measures twice is a
   # gate whose report can disagree with its verdict.
-  # ⛔ THE COSTS ARE MEASURED ON THE CHECKOUT, NOT ON THE `df` VOLUME (review round 5, P2).
+  # ⛔ THE COSTS ARE MEASURED ON THE CHECKOUT, NOT ON THE `df` VOLUME (review rounds 5 and 6, P2).
   # `$dpath` is `DISK_GATE_PATH` — documented as the VOLUME ("the override exists for a box that splits
   # them"), and an operator may legitimately point it at a mount root, where `df` answers correctly and
   # `python_target` finds nothing: a python lane would then be classified as the 64MB harness lane and
-  # admitted on 2 GB of headroom instead of 8 GB. So the target is `$dpath` only when it IS a checkout,
-  # otherwise the caller's cwd (every shipped caller cds to the worktree, and `fix-one.sh` passes the
-  # worktree explicitly).
-  # ⛐ WHICH PATH IS CLASSIFIED, STATED EXACTLY (review round 6, P2). The earlier comment claimed "every
-  # shipped caller cds to the worktree", which is false: `fix-one.sh` does `cd "$REPO"` (it also overrides
-  # `DISK_GATE_PATH` with the worktree, which is why its path is right today) and `lane.sh` never cds at
-  # all — it is LAUNCHED inside the worktree, and port-provenance D5 records "their $PWD is the MAIN
-  # CHECKOUT". The fallback is still the cwd, because the MAIN checkout is itself a checkout: classifying
-  # it charges the python bound, i.e. it errs STRICT, which is the safe direction.
+  # admitted on 2 GB of headroom instead of 8 GB. So the target is `$dpath` only when it IS a checkout.
   #
-  # ⛐ WHEN NEITHER PATH IS A CHECKOUT the target is genuinely unknown, and the verdict is the one that
-  # does not wedge a cell: the harness pair, ANNOUNCED. (Reached rarely: a cwd that is not a checkout is
-  # refused further down by the LAND-BACKLOG gate, which cannot read PRs there. So this branch is
-  # instrumentation for a broken caller, not a policy that decides which lanes run.) Charging the python bound there would refuse every
-  # harness lane on any cell with less than ~8 GB free — and `DISK_GATE_PATH` is legitimately pointed at a
-  # scratch VOLUME, whose cwd need not be a checkout at all. That is an over-block (which this repo treats
-  # as the cheaper failure only when something is actually unknown), so it is named in the log, where a
-  # caller that stopped passing a worktree is visible in the next pass instead of silent.
+  # The fallback is the caller's cwd, and the shipped callers reach here for DIFFERENT reasons — so no
+  # single sentence covers them, and stating one as if it did is how this comment was wrong twice:
+  # `lane.sh` is LAUNCHED with its cwd already inside the worktree (its own header: "cwd must already be
+  # the worktree"; `dispatch-merge.sh` hands `$REPO/.worktrees/$WT` as the spawn cwd), while
+  # `fix-one.sh` / `adopt-fix.sh` do `cd "$REPO"` and override `DISK_GATE_PATH` with the worktree — which
+  # is port-provenance D5's "their `$PWD` is the MAIN CHECKOUT", said about THOSE TWO and not about
+  # `lane.sh`. Both routes classify a checkout, and the main checkout is itself a checkout (python pair),
+  # so the fallback errs STRICT.
+  #
+  # ⛔ WHEN NEITHER PATH IS A CHECKOUT the target is genuinely unknown: the harness pair is charged and
+  # the line is NAMED in the log. Charging the python bound there would refuse every harness lane on any
+  # cell below ~8 GB free, and `DISK_GATE_PATH` is legitimately pointed at a scratch VOLUME whose cwd need
+  # not be a checkout at all — an over-block, traded for instrumentation instead of policy. (Rarely
+  # reached: a cwd that is not a checkout is refused further down by the LAND-BACKLOG gate, which cannot
+  # read PRs there. So this branch reports a broken caller; it does not decide which lanes run.)
   _lane_target="$dpath"
   [ -e "$_lane_target/.git" ] || _lane_target="$PWD"
   if [ ! -e "$_lane_target/.git" ]; then

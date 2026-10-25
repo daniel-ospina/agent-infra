@@ -621,6 +621,12 @@ case is a caller bug, and the log is where it surfaces.
 monorepo whose lock sits in `backend/`, installs the same ~5.7 GB venv and would have been admitted on
 the 64 MB harness pair. The detection fails toward the *expensive* pair on purpose — over-estimating a
 harness lane withholds a few spawns on an almost-full cell; under-estimating a python lane fills it.
+**Where that rationale does not hold, stated rather than implied:** the markers are matched as *exact
+names*, so a project whose only requirement file is `requirements/base.txt` (Django's default layout),
+`requirements-dev.txt`, or `environment.yml` matches nothing and derives the 64 MB harness pair — the
+failure is then toward the CHEAP pair, and a ~5.7 GB venv can materialise on 2,064 MB of headroom. The
+fleet's own lanes are covered (`uv.lock` in tortoise, no install step in agent-infra); a repo adopting
+one of those layouts should add its marker, or set `DISK_LANE_TREE_MB`/`DISK_LANE_SELF_MB` for the cell.
 
 ⚠️ **What the reserve does not buy.** Two things, both stated rather than implied.
 
@@ -648,9 +654,14 @@ is a *budget*, not a hard floor enforced by construction.
   `max(tree, self) + reserve` and not by the marginal figure: a budget built only on 316 MB admits
   exactly the spawns that filled cell-4.
 * Consequence for the concurrency target (`MAX_LANES = vCPU * 5/2` = **20** on 8 vCPU): with sharing,
-  20 lanes ≈ 6.3 GB + 5.7 GB cache + 6 GB reserve ≈ **18 GB**, which fits a 128 GB cell with room for
-  the CI runners. **Without sharing, 20 lanes need 115 GB + the base image — it does not fit**, and the
-  honest answer is that such a cell can carry ~9 lanes. If a cell starts refusing `DISK-NOHEADROOM`
+  20 lanes ≈ 6.3 GB + 5.7 GB cache + **2 GB reserve** (`4 x the 500 MB dispatch floor`, the value the
+  code computes) ≈ **14 GB**, which fits a 128 GB cell with room for the CI runners.
+  **Without sharing, 20 lanes need 117 GB (115 GB of trees + the 2 GB reserve) + the base image — it does
+  not fit**, and the honest answer is that such a cell can carry ~9 lanes. ⛔ The reserve is **2 GB, not
+  the 6 GB python worst case**: those are different numbers doing different jobs (the reserve is what
+  must survive the *next* lane; `self` is what one lane costs when sharing is lost), and setting
+  `DISK_LANE_RESERVE_MB=6144` to "match the worst case" raises every python spawn's bar from 8,144 MB to
+  12,288 MB — mass `DISK-NOHEADROOM` refusals from a line of documentation. If a cell starts refusing `DISK-NOHEADROOM`
   while it has tens of GB free, the sharing regime was lost; measure it before raising the reserve.
 
 **Measure your own cell** (never infer it from `du`): in a fresh worktree,
