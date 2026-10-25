@@ -48,6 +48,12 @@
 #
 # Env seams (tests + unusual cells):
 #   DISK_REAPER            the entry point to install (default: the farmed copy, else beside this)
+#   DISK_REAPER_RUN        the SCHEDULED wrapper beside the reaper (default: disk-reaper-run.sh). It
+#                          supplies HOME/keys, resolves the REAL gh and unsets AGENT_GH_REAL, so a
+#                          timer-started pass is not parked in the interactive pacing queue (#2354)
+#   (The worktree class's own floors — REAP_WT_SCRATCH_AGE_DAYS/REAP_WT_SCRATCH_GLOB — are NOT
+#    rendered here: the reaper's defaults (1 day, wt-*|cell-wt-*) are what a unit runs with. To pin
+#    one, add it to the templates and render it, the way DISK_REAPER_WT_AGED_DAYS is.)
 #   DISK_REAPER_STATE_DIR  status/log dir the unit exports (default $HOME/.pi/agent/state)
 #   DISK_REAPER_REPOS      colon-separated repos the venv/worktree classes scan
 #   DISK_REAPER_WT_AGED_DAYS  worktree age floor for the scheduled pass (default 7)
@@ -140,6 +146,22 @@ for cand in "${DISK_REAPER:-}" "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" "$IN
     [ -n "$cand" ] || continue
     if [ -f "$cand" ]; then REAPER="$cand"; break; fi
 done
+# #2354: prefer the WRAPPER beside the resolved reaper. A timer-started pass inherits no HOME, no
+# keys and no usable `gh`, and the raw script then fails its open-PR gate closed and reaps NOTHING
+# (measured on a cell at 99% used: REMOVE=0 PRESERVE=0 REMOVED=0, hourly). The wrapper supplies exactly
+# that environment — and it is a REPO artifact (farmed by pi-bootstrap), so it cannot drift into a
+# hand-maintained file on one box, which is the failure this whole installer exists to prevent.
+if [ -n "${DISK_REAPER_RUN:-}" ] && [ ! -f "$DISK_REAPER_RUN" ]; then
+    err "\$DISK_REAPER_RUN is set to '$DISK_REAPER_RUN' but that is not a regular file — refusing to install a unit that points at a DIFFERENT scheduled wrapper (the beside-copy would be installed silently, and the rendered plist/unit is the only place that would have said so)"
+    exit 2
+fi
+if [ -n "$REAPER" ]; then
+    for cand in "${DISK_REAPER_RUN:-}" "$(dirname "$REAPER")/disk-reaper-run.sh"; do
+        [ -n "$cand" ] || continue
+        [ -f "$cand" ] || continue
+        REAPER="$cand"; break
+    done
+fi
 
 # ── repos: what this box actually has ───────────────────────────────────────────────────────────
 # Rendered into the unit so the scheduled pass never depends on a shell's environment. A candidate
@@ -272,8 +294,13 @@ refuse_transient_target() {
     fi
     # The unit PINS the three delegates beside $REAPER, so a missing one is a class that fails
     # closed (exit 3, red) on every pass — name it at install time rather than after the fact.
-    for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh; do
-        [ -f "${REAPER%/*}/$d" ] || err "WARNING: ${REAPER%/*}/$d is missing — the unit pins it, so that class will fail closed (exit 3, red) every pass"
+    for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh \
+             reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/live-paths.sh; do
+        # #2542 adds the two new owners AND the census library they share. The library is in this list
+        # rather than in the REFUSING arm below because a missing library breaks TWO classes, not the
+        # pass: a red unit that names them is a worse failure than a refusal, but a silent one is worse
+        # again — so it is named at install time, exactly like a missing delegate.
+        [ -f "${REAPER%/*}/$d" ] || err "WARNING: ${REAPER%/*}/$d is missing — the unit pins it, so $([ "${d%%/*}" = lib ] && printf 'the abandoned-worktree arm and the duplicate-install class' || printf 'that class') will fail closed (exit 3, red) every pass"
     done
     # ⛔ AND THE BOUNDED-EXECUTION LIBRARY, WHICH IS WORSE THAN A CLASS: both artifacts pin it, and
     # without it the WHOLE pass refuses at startup (exit 3, every hour) — no class runs at all. That is
@@ -433,7 +460,7 @@ resolve_launcher() {
     LAUNCHER="${ELDATO_LAUNCHER:-}"
     if [ -z "$LAUNCHER" ]; then
         for cand in "${HOME:-}/.pi/agent/scripts/pi-reap-worktrees-launchd.py" \
-                    "${REAPER%/disk-reaper.sh}/pi-reap-worktrees-launchd.py" \
+                    "${REAPER%/*}/pi-reap-worktrees-launchd.py" \
                     "$INFRA_ROOT/scripts/pi-reap-worktrees-launchd.py"; do
             [ -n "$cand" ] && [ -f "$cand" ] && { LAUNCHER="$cand"; break; }
         done
@@ -516,7 +543,7 @@ warn_gh_prerequisite() { # warn_gh_prerequisite <home> <user>
     [ -n "$why" ] || return 0
     case "$why" in
         missing)
-            err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is not installed, so its open-PR gate cannot be evaluated"
+            err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is not installed, so its PR-state gate cannot be evaluated"
             err "  install gh (or point GH_BIN at it), or accept that only the uv and venv classes run on this box" ;;
         *)
             err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is installed but NOT AUTHENTICATED for the HOME this unit will run with ($home)"
@@ -613,7 +640,7 @@ except ET.ParseError as e:
     say "  reaper: $REAPER"
     say "  launch: $PY_BIN $LAUNCHER --script $REAPER -- $MODE_FLAG"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
-    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the open-PR gate can run}"
+    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
     say "  state:  $STATE_DIR/disk-reaper.status"
     if $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
         say "  agent:  loaded"
@@ -725,7 +752,7 @@ do_install_systemd() {
     say "  reaper: $REAPER"
     say "  mode:   $MODE_FLAG"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
-    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the open-PR gate can run}"
+    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
     say "  state:  $STATE_DIR/disk-reaper.status"
     if $SC is-enabled "$UNIT_NAME.timer" >/dev/null 2>&1; then
         say "  timer:  enabled"

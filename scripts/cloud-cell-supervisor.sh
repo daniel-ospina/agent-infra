@@ -132,7 +132,16 @@
 set -uo pipefail
 
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
-REPO="${REPO:-/tmp/cell}"
+# ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1935). This line used to be `REPO="${REPO:-/tmp/cell}"`,
+# and that path does not exist on the cloud cell: `start` died with `FATAL: no git repo at /tmp/cell`
+# — a controller that will not start, for a directory the operator never chose and nothing creates.
+# (The sibling defect is worse, in refresh-candidates.sh: ITS default was one developer's HOME
+# DIRECTORY, baked into every machine's harness.) A default is only safe if it is TRUE ON EVERY
+# BOX, so there is none — the value is REQUIRED, and resolve_repo() below may DERIVE it from a path
+# that really is a git checkout. The derivation is timid on purpose and never guesses between two
+# repos: this checkout decides the QUEUE (resolve_queue_target reads its `origin`), so adopting the
+# wrong one dispatches the wrong repo's work — the measured agent-infra#1901 defect.
+REPO="${REPO:-}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 # The harness is a SIBLING of this script inside agent-infra (scripts/orchestrator-harness/),
@@ -187,10 +196,12 @@ SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$
 OR="${OR:-}"
 
 # ── the worker census (agent-infra#2210) ────────────────────────────────────────────────────────
-# ⛔ THE TMUX NAME MATCH IS DEAD ON A CELL. The harness spawns workers into cmux DURABLE TERMINALS
-# there (worker-terminal.sh's header records the measurement), so `tmux ls | grep -c '^lane-'` answers
-# 0 while lanes run — and this file used that answer to decide whether it may delete caches under a
-# live lane, and to report `lanes:` in `status`. Both read a confident 0 for a busy box.
+# ⛔ THE TMUX NAME MATCH IS DEAD WHERE THE CMUX DAEMON ANSWERS. There the harness spawns workers into
+# cmux DURABLE TERMINALS (worker-terminal.sh's header records the measurement), so
+# `tmux ls | grep -c '^lane-'` answers 0 while lanes run — and this file used that answer to decide
+# whether it may delete caches under a live lane, and to report `lanes:` in `status`. Both read a
+# confident 0 for a busy box. (tmux IS the launch surface where the daemon does NOT answer — on a
+# launchd Mac and on a cell alike, agent-infra#2210 — so the defect is the single surface, not tmux.)
 # The count comes from the launcher module's own census, and UNKNOWN (exit 3) is NOT zero: every
 # caller treats it as "workers may be live", which is the direction that cannot destroy a live lane.
 worker_census() { # stdout: the live worker count; exit 3 when no answer can be had
@@ -273,6 +284,64 @@ WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
+
+# ── the TARGET checkout: the operator's value, else DERIVED from a real checkout ───────────────
+# Adoption rule, in order: $REPO as given; else exactly ONE candidate that is a git checkout; else,
+# when several are, the ones whose `origin` names the declared $OR — and if that is still not exactly
+# one, REFUSE. Two distinct checkouts on one box is precisely the case where a guess is unrecoverable
+# (the derivation feeds OR, and OR decides which queue the controller works), so the refusal names
+# both and asks. The candidate list is the harness's own provisioning locations — nothing walks the
+# filesystem — and `run`/`git` are the only tools this needs: no network, no config, no agent.
+REPO_SEEN=""       # what the derivation looked at, for the refusal
+resolve_repo() {
+  local cand url hits="" n=0
+  [ -n "$REPO" ] && return 0
+  REPO_SEEN=""
+  for cand in "${WORKDIR:-}" "$CELL_HOME/cell" "/tmp/cell" \
+              "${OR:+$CELL_HOME/${OR##*/}}" "${OR:+/tmp/cell-${OR##*/}}" "${OR:+/tmp/${OR##*/}}"; do
+    [ -n "$cand" ] || continue
+    case " $REPO_SEEN " in *" $cand "*) continue ;; esac
+    REPO_SEEN="${REPO_SEEN:+$REPO_SEEN }$cand"
+    [ -d "$cand" ] || continue
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
+    if [ -n "${OR:-}" ]; then
+      url="$(git -C "$cand" config --get remote.origin.url 2>/dev/null || true)"
+      case "$url" in
+        "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+        *) continue ;;
+      esac
+    fi
+    hits="$hits$cand\n"
+  done
+  n="$(printf '%b' "$hits" | grep -c .)"
+  case "$n" in
+    1) REPO="$(printf '%b' "$hits" | head -1)"; REPO="$(cd "$REPO" && pwd -P)" || { REPO=""; return 1; }
+       say "REPO was not set — using $REPO (a checkout from the provisioning candidates${OR:+, origin $OR})"
+       return 0 ;;
+    0) return 1 ;;
+  esac
+  say "REPO was not set and ${n} candidate checkouts match${OR:+ $OR}:"
+  printf '%b' "$hits" | sed 's/^/       /' >&2
+  return 1
+}
+
+# ONE actionable line, on the verbs that cannot work without a checkout. `status` deliberately does
+# not call it: it is the verb an operator runs to DISCOVER this, so it must still answer.
+assert_repo() {
+  if ! resolve_repo; then
+    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell"
+  fi
+  # ⛔ THE GUARD MUST SEE THE VALUE THAT IS INTERPOLATED, not only the one the OPERATOR passed
+  # (agent-infra#1935 review). `cmd_start` validates REPO before this derives it — and skips an
+  # EMPTY value — so a DERIVED path was the one interpolated value that reached the tmux command
+  # string unvalidated: a checkout directory named with a quote would close the quote in
+  # `REPO='$REPO'` and the rest would be parsed as shell. This is the same class as the `$HARNESS`
+  # re-check below, which exists for exactly this reason (a value that changes after the guard).
+  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO"
+  # A DERIVED checkout changes the queue target (resolve_queue_target reads its origin), so re-derive
+  # OR before anything asserts the pair.
+  resolve_queue_target || true; OR="$QUEUE_REPO"
+}
 
 # A quote or shell metacharacter in any value interpolated into the session command string would
 # break out of it — the string is handed to tmux, which runs it with sh -c. The harness applies
@@ -434,6 +503,12 @@ CONTROLLER_UNIT_IN="${CONTROLLER_UNIT:-}"
 SYSTEMCTL_IN="${SYSTEMCTL:-}"
 CONTROLLER_SYSTEM_UNIT_DIR_IN="${CONTROLLER_SYSTEM_UNIT_DIR:-}"
 CONTROLLER_USER_UNIT_DIR_IN="${CONTROLLER_USER_UNIT_DIR:-}"
+# ⛔ AND `PS_BIN` BELONGS TO THE FAMILY TOO (review P1 round 19, #2402 / B). It is read at CALL time by
+# `_proc_start_epoch`, and its answer (`_proc_began_after`) is what decides which pids `stop` may signal.
+# A pushed `PS_BIN` stub forges the age rule: a recycled pid that merely LOOKS like `<shell> <…/orch-loop.sh>`
+# is then classified as the lock owner and gets TERM/KILL — the peer-repo controller that rule exists to
+# protect. Absent a caller value the restored state is "unset" = the real `/bin/ps` default.
+PS_BIN_IN="${PS_BIN:-}"
 source_env_file
 ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
 ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
@@ -446,8 +521,17 @@ ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
 # exists to prevent, now reachable from keys.env instead of from the caller's shell.
 [ -z "$CONTROLLER_INVOKER_HOME_IN" ]     || CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"
 SYSTEMCTL="$SYSTEMCTL_IN"
-[ -z "$CONTROLLER_SYSTEM_UNIT_DIR_IN" ]  || CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
-[ -z "$CONTROLLER_USER_UNIT_DIR_IN" ]    || CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+# ⛔ THESE TWO ARE RE-ASSERTED UNCONDITIONALLY, WHICH IS THE WHOLE POINT (review P1 round 19, #2402 / B).
+# The timeout siblings above use `[ -z "$_IN" ] ||` because an UNSET one legitimately comes from the env
+# file (tmux mode has no unit to provide it). A unit DIRECTORY has no such reading: its default is computed
+# downstream (`${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}`), so "unset" is the CORRECT restored
+# state, and the conditional form left the keys.env value in force — the fence was inert in production,
+# where the unit renders no such variable and every caller supplies nothing. Reproduced: a keys.env line
+# `CONTROLLER_SYSTEM_UNIT_DIR=/tmp/nowhere` hid the installed unit with 0 systemctl calls and `stop`
+# printing "not running", which is the exact false pass the fence was added to close.
+CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
+CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+PS_BIN="$PS_BIN_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -675,6 +759,12 @@ controller_user_unit_dirs() {
   local h
   [ -n "${CONTROLLER_USER_UNIT_DIR:-}" ] && printf '%s\n' "$CONTROLLER_USER_UNIT_DIR"
   h="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  # ⛔ A MISSING `getent` MUST NOT FAIL SILENTLY (review P2 round 19, #2402 / B). The passwd home is the
+  # candidate the doctor's `HOME=$CELL_HOME` session depends on; without `getent` it would simply disappear
+  # from the list and re-open the duplicate-dispatcher defect with no diagnostic anywhere. stderr only —
+  # stdout is a list.
+  command -v getent >/dev/null 2>&1 \
+    || printf '%s\n' "cloud-cell-supervisor: getent not found — the passwd-home unit lookup is unavailable on this box, so a reader whose HOME is not the installer's may miss the unit" >&2
   h="$(passwd_home "$(id -u)")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   h="$(passwd_home "${SUDO_USER:-}")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   return 0
@@ -1016,13 +1106,24 @@ QUEUE_REMOTE=""      # the origin URL we READ from the checkout (empty = nothing
 QUEUE_DERIVED=""     # owner/repo parsed out of it (empty = underivable)
 QUEUE_REPO=""        # the EFFECTIVE queue target the controller session will receive
 QUEUE_DECLARED=""    # what the operator/keys.env asked for (empty = not declared)
-QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|underivable = refuse
+QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|underivable|nocheckout = refuse
 
 # Read the pair. NEVER dies: `status` must still answer when the pair cannot be read — it is the verb
 # an operator runs to discover that it cannot — and every other verb keeps its own preconditions. The
 # verbs that cannot do their job call assert_queue_target() below.
 resolve_queue_target() {
   QUEUE_DECLARED="${OR:-}"
+  # ⛔ AN EMPTY $REPO IS NOT "read the queue from the CURRENT DIRECTORY". `git -C ""` silently means
+  # no `-C` at all, so the pre-#1935 load-time call derived the queue from whatever directory the
+  # operator happened to be standing in — and then held the REAL checkout against it. A controller's
+  # queue must follow the checkout it names, never the caller's cwd.
+  if [ -z "$REPO" ]; then
+    # ⛔ ITS OWN STATE, NOT `unreadable` (#1977 review, P2). With no checkout there is no origin
+    # remote to be unreadable, and rendering it as one sent the operator hunting an origin problem on
+    # a repo that does not exist — while `status`, the verb that is supposed to DISCOVER this, printed
+    # an empty path. The cause is the missing checkout, so the state names it.
+    QUEUE_REMOTE=""; QUEUE_DERIVED=""; QUEUE_REPO="$QUEUE_DECLARED"; QUEUE_STATE="nocheckout"; return 1
+  fi
   QUEUE_REMOTE="$(git -C "$REPO" remote get-url origin 2>/dev/null)"
   QUEUE_DERIVED=""
   [ -n "$QUEUE_REMOTE" ] && QUEUE_DERIVED="$(queue_repo_from_url "$QUEUE_REMOTE")"
@@ -1062,11 +1163,82 @@ resolve_queue_target || true
 # keys.env happened to carry, and not a default.
 OR="$QUEUE_REPO"
 
+# ── #2235: `GH_REPO` IS PER-INVOCATION STATE, NEVER CELL STATE ─────────────────────────────────
+# `keys.env` on every cell exported `GH_REPO=daniel-ospina/tortoise` GLOBALLY. gh's own resolution is
+# flag > `GH_REPO` > the local checkout, so EVERY call that did not pass `--repo` answered for
+# tortoise while the cell graded agent-infra: measured twice in one session (2026-10-20/21), a rail
+# printed
+#   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+#                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+# for a SEPTEMBER tortoise PR, exit 0, over an open agent-infra PR — and the same leak produced
+# `GraphQL: Could not resolve to a PullRequest with the number of 2231` for real open PRs. Four
+# agent-infra PRs looked "already merged" while unmerged on origin/main.
+#
+# TWO INDEPENDENT EDITS, because either one alone leaves the defect reachable:
+#   1. THIS CHECK — a cell whose env carries a GH_REPO naming a DIFFERENT repo than the checkout the
+#      controller runs in is a STOP-WORK condition (the same class and shape as the queue/checkout
+#      mismatch above: a wrong pair must not be a cell that starts and looks healthy). It is checked
+#      against $QUEUE_DERIVED — the repo READ FROM the checkout's own origin — which is exactly the
+#      subject #2235 names, and against $QUEUE_REPO when the origin could not be read.
+#   2. THE SESSION COMMANDS below carry `unset GH_REPO` AFTER `$ENV_FILE` is sourced. The check alone
+#      would be bypassed by any path that creates a session without calling it, and keys.env is
+#      re-sourced INSIDE the session command — so the strip has to live where the sourcing happens.
+#      A correct value is stripped too: the rail resolves its own repo by evidence now, so a global
+#      export buys nothing and only arms the next leak.
+assert_gh_repo_conformance() {
+  [ -n "${GH_REPO:-}" ] || return 0
+  local want="${QUEUE_DERIVED:-$QUEUE_REPO}" have got got_src _h="" _whost=""
+  got_src="the checkout's origin remote"
+  if [ -z "$want" ]; then
+    die "GH_REPO is set ($GH_REPO) but this cell's CHECKOUT repo could not be read, so it cannot be verified against the tree the controller would grade ('git -C $REPO remote get-url origin' => '${QUEUE_REMOTE:-<none>}'). A global GH_REPO is what produced the #2235 fail-open — gh gives it precedence over the checkout for every call that does not pass --repo, so the rail graded daniel-ospina/tortoise PRs while reporting on agent-infra ones. Remove the GH_REPO line from $ENV_FILE (it is per-invocation state, not cell state); the controller resolves its repo from the checkout."
+  fi
+  [ "$want" = "$QUEUE_REPO" ] || got_src="the queue target"
+  have="$(printf '%s' "$GH_REPO" | tr '[:upper:]' '[:lower:]')"
+  # ⛔ `[HOST/]OWNER/REPO` IS THE DOCUMENTED FORM (`gh help environment`), so `github.com/o/r`
+  # names the SAME repo as `o/r` and must not be graded as a different one — comparing verbatim
+  # made `check` FATAL on a cell whose keys.env used the documented spelling (§2235 review P2).
+  # The leading segment is dropped only when it IS a host (dotted, or this checkout's host).
+  case "$have" in
+    */*/*)
+      _h="${have%%/*}"
+      case "$_h" in
+        *.*|*:*)
+          # ⛔ THE CHECKOUT'S OWN HOST IS PARSED FROM `$QUEUE_REMOTE`, NOT FROM A VARIABLE THAT
+          # IS NEVER ASSIGNED (#2235 review round 3, P2): the first cut referenced
+          # `${QUEUE_HOST:-}`, which appears nowhere else in the repo — so `[ "$_h" = "" ]` was
+          # always false and a GHE checkout could not accept `GH_REPO=ghe.corp/o/r`, while the
+          # RAIL (which does read its own remote host) accepted it. Two authorities grading one
+          # input two ways is the #1856 shape; the evidence is the remote this cell already read.
+          _whost="${QUEUE_REMOTE:-}"
+          case "$_whost" in
+            *://*) _whost="${_whost#*://}" ;;
+            *@*:*) _whost="${_whost%%:*}" ;;
+            *)     _whost="" ;;
+          esac
+          _whost="${_whost%%/*}"; _whost="${_whost#*@}"; _whost="${_whost%%:*}"
+          _whost="$(printf '%s' "$_whost" | tr '[:upper:]' '[:lower:]')"
+          if [ "$_h" = "github.com" ] || { [ -n "$_whost" ] && [ "$_h" = "$_whost" ]; }; then
+            have="${have#*/}"
+          fi ;;
+      esac ;;
+  esac
+  got="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
+  if [ "$have" != "$got" ]; then
+    die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering: this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)"
+  fi
+  say "ok: GH_REPO ('$GH_REPO', from $ENV_FILE or the ambient shell) names this checkout's repo ($want, case-insensitively) — it is stripped from the controller session anyway (#2235)"
+  return 0
+}
+
 # The named REFUSAL, in the shape `apply` uses when it declines because a controller is running — not
 # a warning. A wrong pair must not be a cell that starts and looks healthy; it must be a cell that
 # does not start, with an error naming BOTH values, the remote that was read, and the repo this
 # machine needs so provisioning is unambiguous.
 assert_queue_target() {
+  # ⛔ REPO first: with no checkout, every QUEUE_STATE below is a SYMPTOM, and the old message read
+  # `cannot read the QUEUE … 'git -C  remote get-url origin' returned no URL` — an error about an
+  # empty path. The cause is the missing checkout, so name it.
+  [ -n "$REPO" ] || assert_repo
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
   esac
@@ -1096,6 +1268,7 @@ queue_state_text() {
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
     mismatch)    printf 'MISMATCH — start/check refuse (agent-infra#1901)' ;;
+    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
     invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse' ;;
@@ -1366,8 +1539,13 @@ linked_worktree_of() {
 # `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
 # allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
 # worktree of $HARNESS_REPO, an empty directory, a pin ROOT holding only hex-named pin dirs, or a root
-# whose only other entries are OS droppings (`​.DS_Store` / `._*` REGULAR files — one Finder visit to the
-# default root must not brick the cell; a hidden DIRECTORY or a dangling symlink is still refused).
+# whose only other entries are ONE OF TWO ENUMERATED classes of REGULAR, NON-SYMLINK file: OS droppings
+# (​`.DS_Store` / `._*` — one Finder visit to the default root must not brick the cell) and the harness's
+# OWN named records (`.agent-infra-version`, `AGENTS.md`, `MEMORY.md`, `README.md`, `VENDOR.md`,
+# `HARNESS-PIN`, `manifest.json`, `package.json` — agent-infra#2812: a shipped sibling component writes
+# into this root, so refusing them kept the cell unstartable for ever, once per 10-minute tick).
+# ⛔ Both classes are NAMED, never "any file", and THIS header is the whole allow-list: a hidden
+# DIRECTORY, a dangling symlink, a symlink wearing an allowed NAME, and any unlisted entry are refused.
 #
 # Is $1 a NAME `apply` could have produced for a pin directory? `apply` names each pin by the hex of
 # the commit it pins to (`cut -c1-12` below), but the LENGTH is a MOVING CONVENTION, not a property
@@ -1453,10 +1631,13 @@ pin_path_real() {
 # ⛔ The enumeration is `ls -A`, not a `"$dir"/*` glob: a glob skips HIDDEN entries and dangling
 # symlinks, so a root whose only entry was `.DS_Store` read as EMPTY-AND-SAFE on the check side while
 # the delete side refused the same root — the same false pass, one branch over. `ls -A` sees every
-# entry, and each one must be a hex-named directory — EXCEPT an OS-droppings regular file
-# (`.DS_Store` / `._*`), which is skipped: refusing it bricked all four verbs after a single Finder
-# visit to the default root on the operators' macOS server (see the header above, which states the
-# whole allow-list; this line is the one it is easiest to contradict by accident).
+# entry, and each one must be a hex-named directory — EXCEPT two ENUMERATED classes of regular,
+# NON-SYMLINK file: OS droppings (`.DS_Store` / `._*`) and the harness's OWN named records (below).
+# Refusing the first bricked all four verbs after a single Finder visit to the default root on the
+# operators' macOS server; refusing the second bricked the cell permanently against a shipped sibling
+# component. (See the header above, which states the whole allow-list; this line is the one it is
+# easiest to contradict by accident.) ⛔ Both classes are NAMED, never "any file": an unlisted entry
+# is still refused, which is the whole point of the guard.
 # ⛔ Deliberately NOT a per-entry `git worktree list` path comparison: on macOS a `$TMPDIR`-derived
 # path carries a `//` that git normalizes in its listing output, so a literal comparison reports our
 # OWN pin as foreign and the guard becomes a false block.
@@ -1502,6 +1683,12 @@ pin_root_conformance() {
     # root from reaching the cannot-verify branch below: there is nothing of ours in it to protect.
     case "$p" in
       .DS_Store|._*) if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
+      # ⛔ HARNESS METADATA IS NOT A STRAY (#2812): `harness-apply` records the commit it converged
+      # this box to INSIDE the pin root, so the guard refused forever and the entry returns on every
+      # 10-minute tick — "remove it by hand" is not a remedy. Named explicitly, so an UNKNOWN entry is
+      # still refused.
+      .agent-infra-version|AGENTS.md|MEMORY.md|README.md|VENDOR.md|HARNESS-PIN|manifest.json|package.json)
+        if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
     esac
     entries=$((entries + 1))
     if [ ! -d "$dir/$p" ] || ! pin_name_ok "$p"; then
@@ -1907,6 +2094,11 @@ cmd_check() {
     esac
   fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
+  # ⛔ RESOLVE THE CHECKOUT BEFORE ANYTHING READS IT. Every verdict below is about THIS repo, and an
+  # unresolved $REPO used to reach `die "no git repo at "` — an error naming an empty path, for a
+  # value the operator never set. assert_repo() derives it or refuses with one actionable line, and
+  # re-derives OR when it derived the checkout (the queue follows the checkout's origin).
+  assert_repo
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
   # refused a worktree with "FATAL: no git repo at <path>" even though every git command in it works
@@ -1923,6 +2115,7 @@ cmd_check() {
   # validate_scope).
   assert_queue_target
   say "ok: queue $QUEUE_REPO == checkout $REPO (origin $QUEUE_REMOTE) — $QUEUE_STATE"
+  assert_gh_repo_conformance
   cmd_check_disk
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
   # orch-loop.sh spawns its workers as `bash '$O/<script>'` (fix-one.sh, merge-one.sh, …), NOT
@@ -1946,10 +2139,27 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  # lane.sh's prompt EXECUTES lane-merge.sh for the merge phase and merge-rate.sh for the
+  # before/after measurement (#2029), so a $O missing either makes every lane's merge phase exit 127
+  # while this check still printed "CELL CAN RUN A CONTROLLER" — the false PASS this list exists to
+  # prevent. Keep this list in step with install.sh's DRIFTED list (which seeds $O from it).
+  # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
+  # calls it for the process pass. A $O without it still runs (the census falls back to the launch
+  # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
+  # terminals AND tmux sessions (launchd Mac or cell, #2210); `tmux ls` alone sees one of the two
+  # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
+  # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
+  # reports success.
+  # UNION of both sides of this merge (neither is a superset): lane-merge.sh + merge-rate.sh from this
+  # branch (#2029), lane-reap.sh from origin/main (#2163). Taking either alone leaves a worker the
+  # controller executes unseeded, which is the false PASS above.
+  # repo-target.sh (#2724/#2694) is SOURCED by lane.sh, dispatch-merge.sh, fix-one.sh and adopt-fix.sh;
+  # all four `exit 78` without it, so its absence would make every dispatch refuse at startup while
+  # `check` still certified the cell — the same false PASS one layer down.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
-  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
+  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
   # ── the gh-limit layer (#1988): present, AND able to run ──────────────────────────────────────
   # Presence alone is the false-green this file refuses everywhere else: a shim that cannot find the
   # real gh exits 127 on EVERY call, which would stop merges altogether. So resolve `gh` through the
@@ -2298,6 +2508,10 @@ cmd_start() {
   # for a pair that is wrong. Placed here, ahead of the return and of every write below, so nothing
   # is seeded and no session is created on a refusal.
   assert_queue_target
+  # #2235: a global GH_REPO is a wrong-pair config of the same class as the queue/checkout mismatch,
+  # and it must refuse START (not merely be stripped) so the misconfiguration is surfaced rather than
+  # silently absorbed. The session commands below strip it either way.
+  assert_gh_repo_conformance
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.
@@ -3092,7 +3306,7 @@ cmd_status() {
   # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
   # the checkout it is standing in, and the remote that fact was read from. Reported, never refused:
   # `status` is the verb an operator runs to DISCOVER that the pair is wrong.
-  say "queue: ${QUEUE_REPO:-<unknown>} @ $REPO — origin ${QUEUE_REMOTE:-<none>} [$(queue_state_text)]"
+  say "queue: ${QUEUE_REPO:-<unknown>} @ ${REPO:-<unset>} — origin ${QUEUE_REMOTE:-<none>} [$(queue_state_text)]"
   # agent-infra#1745: the answer to "which commit is this cell running?", from the record `start`
   # wrote. Printed even when the controller is stopped — a stale cell is a stale cell.
   if [ -f "$STAMP" ]; then
@@ -3682,7 +3896,8 @@ cmd_prune() {
     # subdirectory of a misconfigured root: `HARNESS_PIN_DIR=$CELL_HOME` deleted the cell home and its
     # state dir BEFORE the guard in `harness_apply` could fire. `assert_pin_dir_safe` refuses any root
     # that is not an empty dir, a linked worktree, or a pin root of hex-named directories (plus a root
-    # whose only other entries are `.DS_Store`/`._*` regular files — see its header for the allow-list).
+    # whose only other entries are `.DS_Store`/`._*` regular files or the harness's OWN named records —
+    # see its header for the whole allow-list).
     assert_pin_dir_safe "$HARNESS_PIN_DIR"
     if linked_worktree_of "$HARNESS_REPO" "$HARNESS_PIN_DIR"; then
       # The legacy FLAT PIN: the root IS the live worktree, so `"$HARNESS_PIN_DIR"/*/` would enumerate

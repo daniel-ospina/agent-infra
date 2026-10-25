@@ -1,5 +1,5 @@
 ---
-title: "Disk reaper — one scheduled pass over the three disk sinks (#2032)"
+title: "Disk reaper — one scheduled pass over every disk sink that stops a cell (#2032, #2542)"
 type: engineering
 domain: operations
 doc_status: live
@@ -12,14 +12,22 @@ aboutObjects: agent-infra, issue-2032, disk-reclaim, uv-cache, lane-venvs, workt
 # Disk reaper (#2032)
 
 One entry point — `scripts/disk-reaper.sh` — that runs, accounts for and reports
-the three sinks that exhaust a cell's disk. It **owns no deletion rule**. Each
-class has one owner, and the owners are the only code that deletes:
+the sinks that exhaust a cell's disk. The **scheduled** entry point is
+`scripts/disk-reaper-run.sh`, which wraps it and supplies exactly what a
+timer-started process does not inherit: `HOME` and `keys.env`, the REAL `gh`
+binary by absolute path (rejecting any `gh-shim`/`gh-limit` interposer and
+unsetting a poisoned `AGENT_GH_REAL`), `AGENT_GH_GATE_NO_WAIT=1`, and
+`REAP_WT_GH_TIMEOUT=120`. Without that wrapper the worktree class fails CLOSED
+on a box whose only `gh` on PATH is the interactive pacing shim (#2354). Each class has
+one owner (one class has two, for the two shapes of one sink), and the owners are the
+only code that deletes:
 
 | class | owner (policy) | reclaims |
 |---|---|---|
 | `uv` | `scripts/pi-cache-reap.sh` (#1987) | machine-global uv/npm/pip caches, bounded **by size** (`CACHE_REAP_MAX_MB`, default 2048 per cache), prune-then-escalate |
 | `venv` | `scripts/reap-lane-venvs.sh` (#1932 / #1949) | per-worktree `.venv`s whose lane is gone, proven by three liveness witnesses; fail-closed |
-| `worktree` | `scripts/pi-reap-worktrees.sh` (#1095) | clean, reachable, holder-free checkouts; merged heads are exempt from the 7-day floor |
+| `worktree` | `scripts/pi-reap-worktrees.sh` (#1095) **+** `scripts/reap-abandoned-worktrees.sh` (#2542) | the first arm: clean, reachable, holder-free checkouts; merged heads are exempt from the 7-day floor. The second arm: abandoned LINKED worktree directories under a scratch root — age > 180 min **and** no live process's cwd/exe inside (see *The two classes that were missing* below) |
+| `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
 
 ## Why one entry point
 
@@ -81,12 +89,19 @@ A live holder is **never** selected. The witnesses are mechanical and fail close
   `bash -c 'cd <wt> && pytest'`, whose argv never names the path);
 * `live-argv` — any process whose command line names the path.
 
+⛔ **ONE IMPLEMENTATION.** The census the two #2542 classes use is `scripts/lib/live-paths.sh`
+(`lp_census` / `lp_path_held` / `lp_path_named`): one bulk `ls -l /proc/<pid>/{cwd,exe}` plus argv,
+the same probe the merged #2594 hygiene pass makes its per-root exclusion from, and the same
+`(deleted)`-stripping and path-boundary rules. A second copy of this predicate is how two deletion
+policies drift, and the drift is silent in the dangerous direction — the copy that forgets one arm
+deletes live work.
+
 A probe that cannot be evaluated is a refusal (`exit 3` **from the owner**), not a pass. Through the
 entry point that refusal arrives as exit **6** with `ok=0` in the pass record and
 `verdict=<class>=refused` — the unit stays green because the box is busy, and the RECORD is what
 alarms (see **Exit codes** below).
 
-**The open-PR probe is the one refusal that is PER REPO** (#2443). It needs a credential store, and
+**The PR-state probe is the one refusal that is PER REPO** (#2443). It needs a credential store, and
 that store is per-`HOME` (`$HOME/.config/gh`, or `GH_TOKEN`); the installed unit renders
 `Environment=HOME={{HOME}}`, so the unit's own `HOME` decides whether the class can run at all. When
 the probe cannot answer, only the repo it could not answer FOR is skipped: its checkouts are left
@@ -116,11 +131,103 @@ names a cause nobody can act on.
 
 The worktree owner additionally requires the checkout to be
 **clean** (uncommitted work is never destroyed), **reachable** (its commits survive the checkout's
-deletion), and not an open-PR head.
+deletion), and not an open-PR head — and, since #2721, no younger than
+`REAP_WT_MIN_AGE_MINUTES` (45) with a live-cwd check that matches a process standing
+ANYWHERE INSIDE the tree, not only at its root (see the seven-rule table below).
 
 `disk-reaper.test.sh` T2 is the load-bearing test: a real process cwd'd into a real
 linked worktree is kept by both the worktree and venv classes, and the *same*
 fixture is reclaimed once the holder is gone.
+
+## The two classes that were missing (#2542)
+
+Measured 2026-10-24, all three cells. The guard fired on a nearly-full box and reclaimed **4 MB per
+cycle**:
+
+```
+cell-1: LOW free=6618MB use=95% floor=8000MB — reclaiming   →  reclaimed: 6618MB -> 6614MB
+        (six cycles in 25 minutes; its classes uv, venv, worktree matched nothing)
+```
+
+Two consumers were in **none** of the classes, and they are the ones that fill a cell:
+
+| sink | measured | what it is |
+|---|---|---|
+| abandoned `/tmp` worktree directories | **12.3 GB, 133 directories** across c4/c1/c3 (`df` deltas +5,595 / +3,001 / +3,738 MB); oldest 4,801 min, newest three 5 GB each | linked worktrees of lanes that finished or died. Their HEAD is young and their tree is dirty, so `pi-reap-worktrees.sh`'s clean/aged/reachable policy never lets go |
+| duplicate tool installs | **11.3 GB** — eight identical `actions-runner` installs on an 8-core cell | copies of one tool where one would serve |
+
+### `class=worktree`, second arm — abandoned scratch worktrees
+
+`scripts/reap-abandoned-worktrees.sh` owns the rule. **Two dials, both required:**
+
+1. **AGE** — the directory's mtime older than `--aged-minutes` (default **180**;
+   `DISK_REAPER_ABANDONED_MINUTES` / `REAP_AW_AGED_MINUTES`).
+2. **LIVE-CWD** — no live process's cwd *or* exe resolves inside it, enumerated by reading
+   `/proc/<pid>/cwd` (plus `exe` and argv) for **every** pid — never `pgrep -f`, which self-matches the
+   shell running the check and shows the nesting stack rather than the population.
+
+Dial 2 is what makes it safe, and it earned its place on the first run: it **kept** five directories
+whose age alone would have condemned them — `cell-wt-tmainred70` (226 m), `cell-wt-zombiepi` (742 m),
+`cell-wt-trebase6` (823 m), `cell-wt-venvlink` (1,080 m), `wt-pinfix` (2,200 m) — each with a live
+process inside it. A reaper without that arm deletes live work, which is worse than a full disk.
+
+**What is a candidate, exactly** — a directory immediately under a scratch root (`--root`, default
+`/tmp`) whose `.git` is a **file**, i.e. a *linked* worktree. That one test is what keeps this from
+being a reaper for the machine: a primary checkout's `.git` is a *directory*, so `/tmp/cell-ai` (the
+hub) and `/tmp/cell-t3` (the cell's repo) cannot be reached by an age or liveness accident; depth 1
+means `/tmp/cell-home/...` (state, harness pins) is not swept; and a directory that is not a checkout
+at all is never touched.
+
+**The rest of the contract is kept verbatim (#2542 / #2594):**
+
+* the sha pinned in `.agent-infra-stamp.json` is **never** reaped — by path (`harness`, `scripts`, …)
+  or by name (a directory named after the commit);
+* a path a **live** process's `/proc/<pid>/args` names is never reaped (a controller can be started
+  elsewhere and still hold the tree it was pointed at);
+* a live lane's worktree is never reaped — that is dial 2;
+* when the process list cannot be read **at all**, the sweep is *skipped* and says so
+  (`SKIP reason=census-unreadable`, exit 3) — "could not enumerate" is never read as "nothing is live".
+  A **partial** read (another uid's `/proc` entries are unreadable) is a real census and is reported
+  with its population size; refusing on a partial read would make the sweep inert on every real box,
+  which is the inert-enforcer shape this family exists to remove;
+* the report is a **`df` delta** taken by the entry point, never a `du` sum.
+
+**The third dial, `--dirty keep|reap` (default `keep`).** A candidate whose `git status --porcelain`
+is non-empty is KEPT and named (`reason=dirty(<n>)`). `git worktree remove` never deletes a branch,
+the commits live in the shared object store, and a detached sha is still findable with
+`git fsck --unreachable` — so the one thing removal genuinely destroys is **uncommitted work**
+(measured on the same box: a 33-hour-old abandoned checkout holding 212 dirty entries). `--dirty reap`
+restores exactly the six-cycle measurement's two-dial predicate. Both settings are reported, so the
+choice is never implicit: on this box the default kept 26 dirty directories and reaped 43;
+`--dirty reap` made 69 candidates.
+
+> **OVERRIDES:** the #1095 worktree policy's *clean* gate and 7-day HEAD floor, for **scratch-root
+> linked worktrees only** — the owner ruled (2026-10-24, #2542) that an abandoned `/tmp` checkout is
+> reclaimable at age > 180 min with no live cwd inside it, because the debris is a dead lane's
+> checkout and the repo-layout gates kept 12.3 GB of it forever while the cells filled to 95%. The
+> uncommitted-work dial above is the guard that makes that ruling safe by default.
+
+### `class=duplicate-install` — surplus copies of the same tool install
+
+`scripts/reap-duplicate-installs.sh` owns the rule. A **family** is a directory whose children each
+carry the same install **marker** (default `bin/Runner.Listener` — a file only a GitHub Actions runner
+install has; markers are a table, never inferred from a directory name). Then:
+
+* the **newest copy is never a candidate** — it is the survivor;
+* a copy with a live process's cwd/exe inside it is KEPT (`reason=live-listener`), as is one a live
+  process was started from (`reason=argv-named`) and one a systemd/launchd **unit file names**
+  (`reason=unit-referenced` — a configured-but-stopped runner is not idle in intent);
+* a copy younger than `--aged-minutes` (default 180) is KEPT (`reason=young`);
+* if the number of copies, or which is newest, cannot be established, **the family is untouched**;
+* if the process list cannot be read, the pass **fails closed** and removes nothing.
+
+⛔ **The asymmetry is the policy.** A duplicate left on disk costs disk; a duplicate reaped while live
+costs **work** — a runner killed mid-job is a lost job and the run goes unserved (#2542: a runner died
+mid-`packaging-smoke` on ENOSPC). Every uncertain case therefore takes the keep arm, and every keep is
+named with its reason.
+
+Both owners need no `--repo`: they run on a cell whose repo list is empty, which is the #2443 failure
+mode (the repo-scoped classes fail closed there while the disk keeps filling).
 
 ## Bounded execution — the pass cannot assume GNU `timeout` (#2046)
 
@@ -167,6 +274,95 @@ separately required to be clean — so `REAP_WT_MERGED_AGE_DAYS` (default `0`) g
 that row. Unmerged heads keep the blanket floor, where age still separates a stale
 scratch checkout from work in progress. Setting it equal to `REAP_WT_AGED_DAYS`
 restores the pre-exemption behaviour.
+
+## The seven-rule decision table, PR state as a proof, and the freshness floor (#2721)
+
+The floor above is a *staleness* floor. It does not answer the opposite question —
+"is anything using this tree RIGHT NOW" — and until 2026-10-24 the tool answered it
+with an **exact-match** cwd test. Measured: a worktree dispatched to a lane four
+minutes earlier was deleted underneath it while the lane stood in a SUBDIRECTORY of
+it; the lane then sat at 0% CPU in a deleted cwd logging `getcwd() failed`. The gate
+tested the path, not the tree.
+
+Every row now prints the rule that decided it and the proof it used
+(`rule=4 … proof=pr-merged head-ref fix/x state=MERGED (#9862)`), so a KEEP that
+cannot name its evidence is visibly a bug rather than a verdict:
+
+| # | condition (all previously applicable rules still hold) | verdict |
+|---|---|---|
+| 1 | a process has the tree, or **any path inside it**, as cwd, or names it in argv | KEEP |
+| 2 | dirty, or a clean gate that cannot be evaluated | KEEP |
+| 3 | clean + HEAD is an ancestor of `origin/main` | REMOVE |
+| 4 | clean + the PR **whose `headRefOid` IS this commit** is `MERGED` (merge, squash or rebase) | REMOVE |
+| 5 | clean + PR `CLOSED` unmerged + head not an ancestor | KEEP, and **name the PR** |
+| 6 | clean + no PR matches this head, still inside the floor in force | KEEP (`no PR — cannot prove it is landed`) |
+| 7 | younger than `REAP_WT_MIN_AGE_MINUTES` (45) | KEEP |
+| P | pre-existing gates: main/self checkout, `worktree lock`, unreadable path, bare repo, OPEN PR head, commit held only by a revocable ref, detached on no ref. Past the floor in force, a clean no-PR checkout whose commits survive on a branch is REMOVED by the pre-existing #1095 aged rule (`rule=P … no-pr=`) — rule 6 is the KEEP row and never labels a removal | KEEP |
+
+**Rule 4 is why this exists.** `git merge-base --is-ancestor` cannot see a squash
+merge: the branch head is not an ancestor of `main` even though the work landed. So a
+fully landed, clean, holder-free checkout was loggable only as `no upstream — cannot
+prove it is pushed` and kept indefinitely. Measured on cell-4: `/tmp/cell-wt-p9555b`
+was clean, its PR **#9862 was MERGED**, and removing it freed **6004 MB**. The read is
+ONE batched `gh pr list --state all --json headRefName,state,number,headRefOid` per
+pass — never one call per worktree (the fleet's `gh` budget is real) — and it now runs
+for **detached** records too, matched by `headRefOid`, because a detached head has no
+branch name to match and is exactly the class that sat unprovable.
+
+⛔ **A branch NAME is not identity, and the limit is not a licence.** A merged PR is
+matched to this checkout by its `headRefOid`, which must equal this HEAD: after a
+branch lands, the next lane can check the same name out again and commit new work, and
+a name-only match would "prove" that unlanded work disposable (the revocable-ref waiver
+at rule P rests on the same equality — GitHub holds the **PR's** sha, not necessarily
+this one). And because `--state all` spends ONE limit on every state, a repo with a long
+merged history can exhaust it; gh then returns the newest N rows and silently drops the
+rest. An absent row is NOT "no PR" — inside the floor it is rule 6, past the floor the
+aged rule — so a row count AT `REAP_WT_PR_LIMIT` is a **refusal** (exit 3, nothing
+removed), never a KEEP: a live branch must not be reaped on a list that never
+contained it. The bound therefore has to exceed the largest repo's total PR
+count — **`REAP_WT_PR_LIMIT` defaults to 5000** because `daniel-ospina/tortoise`
+measured **3,987** PRs across all states on 2026-10-24, and a default below that
+would refuse every pass on the very repo with the most worktrees (a reaper that
+reaps nothing is the failure this change exists to remove). `gh` pages past 1000,
+so a bigger repo is a bigger number here, not a code change.
+
+**Rule 7 is the freshness floor, and its witness is two-sided.** A lane dispatched
+minutes ago is detached at `main`, clean and holder-free for exactly the same reason an
+abandoned checkout is; only time separates them. HEAD's *commit* date does not measure
+that time — a checkout created minutes ago from an hours-old `main` has an hours-old
+HEAD — so the age is the **younger** of HEAD's commit date and the checkout's own
+ctime (`REAP_WT_TREE_TS` supplies an already-measured value for a caller that probed
+the tree). Nothing younger than 45 minutes is removable by rules 3–4, and the footer
+records `MIN_AGE_MINUTES=` so the floor in force is auditable.
+
+⛔ Rules 3–4 still require the commit to be *survivable*: a checkout whose commits are
+held only by `refs/remotes/*`, a tag, stash or a bisect ref is preserved with that ref
+named, **except** when the PR is `MERGED` **and its head is this commit** — GitHub then
+durably holds that sha, so the merged PR is the stronger proof and rule 4 applies.
+
+Rule 4 also honours the merged cooldown: a PR-merged head takes
+`REAP_WT_MERGED_AGE_DAYS` (and a scratch cap may only lower it), exactly like the
+ancestry proof — and unlike patch-equivalence, it does not need `git cherry` to have
+seen the squash (a multi-commit branch squashed into one commit has no per-commit twin).
+
+**Patch equivalence (a squash the ancestry test cannot see) lifts the floor too (#2354).**
+A **squash-merged** head is never an ancestor of `MAIN_REF`, so the ancestry test
+alone cannot see it. `patch_equivalent()` (`git cherry MAIN_REF <head>`, no `+`
+line) supplies that evidence and takes the same `REAP_WT_MERGED_AGE_DAYS` floor.
+⛔ It is an AGE-FLOOR signal only, never a reachability proof: a detached head on
+no ref is still `detached-unreachable` and preserved, because `git cherry` matches
+patch-ids against all of main's history (a reverted change still matches, and
+whitespace is ignored) and says nothing about whether any ref still holds the
+commit. Multi-commit squash merges do not match either, so they stay on the floor.
+
+A lane **scratch** checkout — a directory whose basename matches
+`REAP_WT_SCRATCH_GLOB` (default `wt-*|cell-wt-*`) — has its floor **capped at**
+`REAP_WT_SCRATCH_AGE_DAYS` (default `1`): a dead lane's throwaway dir is not a
+week's worth of review surface. The cap only ever lowers, so a value above the
+floor in force has no effect (14 does not mean "keep longer"), and a
+merged/patch-equivalent scratch row keeps `REAP_WT_MERGED_AGE_DAYS`. Every other
+gate still applies, and the pattern is anchored (`wtfoo/` is not `wt-*`), so a
+named checkout is unaffected.
 
 ## Scheduling — installed by the bring-up, armed by owner instruction
 
@@ -454,6 +650,31 @@ when the last run has never happened, and when the pass record's own `rc` is one
 
 ## Tests
 
+`scripts/disk-reaper-classes.test.sh` covers the two #2542 classes and is **mutation-checked**: each
+case runs twice, once against the real owner (must pass) and once against a mutant of the same file
+with that case's arm neutered (must fail), so a case that has stopped checking anything says so.
+
+| case | proves | mutant that must turn it red |
+|---|---|---|
+| A | an old directory with a **live cwd** inside is KEPT and named, while an identical old directory in the same run is reaped | `if lp_path_held …` → `if false` |
+| B | an old directory with **no** live cwd is reaped **and the entry point reports a `df` delta** (not a `du` sum) | `if remove_one …` → `if false` |
+| C | with the process list **unreadable** the sweep is skipped and reports the skip (exit 3, nothing removed) | `if ! lp_census …` → `if false` |
+| D | the **pinned sha** is never reaped, by name and by path, while a sibling candidate in the same run is | `if pinned …` → `if false` |
+| E | duplicate-install **keeps the last copy**: newest never a candidate, live-hosted copy kept, only the provably-idle surplus removed | `[ "$c" = "$newest" ]` → `[ "$c" = "__never__" ]` |
+| F | with **no resolvable repo** the abandoned arm still runs (the #2443 shape: the registered arm fails closed as `misconfigured`, the arm that needs no repo does not) | `REPO_ARM_OK=0; REPOS=""` → `return 3` |
+| G | a class that removed **nothing** reports `freed=0` and names the un-attributed `df` change in the pass record, instead of claiming another process' free space as its own | `if [ "$reaped" = 0 ] && ! is_dry` → `if false` |
+| H | a **symlink** in the scratch root is never followed out of it: the link is kept and named, the target outside the root is untouched | `if [ -L "$d" ]` → `if false` |
+| I | a tree **git cannot read** is not a clean tree: `dirty=?` KEEPS it (`reason=clean-unknown`), so uncommitted work survives a dangling `.git` | `dirty="?"` → `dirty="0"` |
+| J | a lock whose owner is **live** is honoured by both owners (`SKIP reason=lock-held`, rc 3, lock left in place) | `kill -0 "$owner"` → `false` |
+| K | a class that could not be **set up** is `misconfigured` (not `fail-closed`, which means the delegate ran) | `AW_SETUP_FAIL=1` → `:` |
+| L | a live process that names the tree through a **symlinked** spelling still protects it — sub-path, alias-to-tree, and `--flag=<abs>` (argv tokens are canonicalised) | `_lp_rel "$_cand" "$path"` → `_lp_rel "" "$path"` |
+| M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
+| N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
+
+The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
+own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
+(it did once, on this box, before the scoping was added).
+
 `scripts/disk-reaper.test.sh` — 375 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
@@ -529,6 +750,97 @@ the floor lifted — so the KEEP is the floor's doing rather than an inability t
 
 T9, T10 and T12 were each red on the build that preceded the fresh-context review
 that found them.
+
+## The dispatch headroom budget — one lane's tree, measured (#2721)
+
+The reaper answers *"what can be reclaimed?"*. It cannot answer *"does the checkout this spawn is
+about to provision fit?"* — and on 2026-10-24 cell-4 (8 vCPU) reached **~2,286 MB free** carrying
+**59** `/tmp/cell-wt-*` checkouts at 5-6 GB `du` each, went unreachable for ~40 minutes (`cmux cloud
+exec` timed out on `date` and `df`), and was recovered by a human `pause`/`resume`. Every one of those
+spawns passed `DISK_MIN_FREE_MB=500`, because a floor answers "is the filesystem full?" and 2,286 MB
+is 4.5x that floor. `spawn-gate.sh`'s `run_agent` now also applies a **headroom** gate:
+
+```
+ADMIT  iff  free_mb >= tree_mb + reserve_mb      (fresh `df` reading, at every spawn)
+REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM — …`  (AGENT_DISK_REFUSED, 77)
+```
+
+`tree` is what ONE more lane costs. `reserve` is the headroom a spawn must leave behind. Both are
+**measured per target**, never one global constant: #1852 recorded that a single constant cannot serve
+an agent-infra lane (48 MB, no install) and a tortoise lane (5.7 GB of python), and a tortoise-sized
+floor would refuse every harness spawn on every cell — a false *block*, which is its own defect.
+
+### Measured (2026-10-24, 8-vCPU cell, `/dev/root` 128,828 MB, `uv` 0.12.5, warm uv cache)
+
+`df -Pm /` **used**-column deltas, two readings before and after, nothing else provisioning:
+
+| repo | `git worktree add` | install step | **marginal / lane** | **self-contained tree** |
+|---|---|---|---|---|
+| `tortoise` | **147 MB** | `uv sync --extra embeddings --extra parity` = **169 MB** (2 s, warm cache) | **316 MB** | **5,772 MB** (`du` 5,625 MB venv + 147 MB checkout) |
+| `agent-infra` | **48 MB** | none (no `pyproject`/`uv.lock`, zero npm deps) | **48 MB** | 48 MB |
+
+The venv's `du` is ~18x its real cost because **28,730 of its files are hardlinked into the shared
+cache** (`nlink=3` measured on every `site-packages/*.so`): those blocks belong to
+`~/.cache/uv`, and deleting one venv releases ~124 MB, not 5,625 MB. That sharing is a property of the
+*cache state*, not of the lane — `pi-cache-reap.sh` prunes the cache under pressure, `--link-mode=copy`
+and a cache on another mount never share at all — so the gate ships both numbers:
+
+| target | `DISK_LANE_TREE_MB` (default) | `DISK_LANE_RESERVE_MB` (default) |
+|---|---|---|
+| `uv.lock` present (python lane) | **350** | **6144** (6 GiB = the 5,772 MB self-contained tree, rounded up) |
+| no install step (harness lane) | **64** | **1024** |
+
+### The number the fleet must budget **per lane**
+
+* **316 MB/lane** on a cell whose shared uv cache is populated (measured above) — plus **~5.7 GB once**
+  per cell for the cache itself.
+* **5,772 MB/lane** the moment the sharing is lost, which is why the reserve is 6 GiB and not 316 MB:
+  a budget built only on the marginal figure admits exactly the spawns that filled cell-4.
+* Consequence for the concurrency target (`MAX_LANES = vCPU * 5/2` = **20** on 8 vCPU): with sharing,
+  20 lanes ≈ 6.3 GB + 5.7 GB cache + 6 GB reserve ≈ **18 GB**, which fits a 128 GB cell with room for
+  the CI runners. **Without sharing, 20 lanes need 115 GB + the base image — it does not fit**, and the
+  honest answer is that such a cell can carry ~9 lanes. If a cell starts refusing `DISK-NOHEADROOM`
+  while it has tens of GB free, the sharing regime was lost; measure it before raising the reserve.
+
+**Measure your own cell** (never infer it from `du`): in a fresh worktree,
+
+```bash
+df -Pm / | awk 'NR==2{print $3}'   # used, before
+git -C <repo> worktree add --detach /tmp/measure-wt HEAD
+df -Pm / | awk 'NR==2{print $3}'   # after the checkout  -> the add cost
+cd /tmp/measure-wt && uv sync --extra embeddings --extra parity
+df -Pm / | awk 'NR==2{print $3}'   # after the install   -> the marginal venv cost
+du -sm .venv                       # the APPARENT figure (upper bound, never the budget)
+```
+
+then set `DISK_LANE_TREE_MB` / `DISK_LANE_RESERVE_MB` for that cell, and say so where an operator
+will read it. `scripts/worktree-disk-probe.sh` classifies which byte regime the machine is in.
+
+### The KEEP rule: a shell at a prompt is not a live lane
+
+Both liveness reapers (`reap-lane-venvs.sh` for the env, `pi-reap-worktrees.sh` for the checkout) now
+apply one rule:
+
+> A cwd / argv / tmux-pane holder is **live evidence unless it is a shell whose start time is before
+> the worktree's HEAD commit and which has no child process.**
+
+A shell at its prompt answers "yes, someone is here" for ever, and that single false positive is why 59
+checkouts accumulated on cell-4 while the logs said `KEEP … (a live process has it as cwd)`. A lane
+between turns still holds its `pi`/test **child**, so it is not demoted; a lane that finished and left
+its pane or its `cd` behind is. Every other gate is untouched (`dirty`, `ignored-artifact`, `open-pr`,
+`too-recent`, `detached-unreachable`, `remote-only-ref`), so the blast radius of a wrong reading is a
+re-created env or checkout — never uncommitted or unpushed work. Every unprovable input (pid not in the
+`ps` table, unreadable start time, undatable HEAD, failed probe) leaves the holder **live**, and each
+demotion is named in the pass log (`stale-shell:` / `STALE-SHELL`) and in the row
+(`unref=stale-shell:<pids>`). `REAP_VENV_IDLE_SHELL=0` / `REAP_WT_IDLE_SHELL=0` restore the strict
+reading without editing a shipped script.
+
+⛔ **A shared *environment* is not the fix, and was not adopted.** The recorded decision in
+`docs/ops/lane-venv-reaper-policy.md` rejects a machine-wide venv because `uv` installs the project in
+EDITABLE mode pointing at ONE worktree, so a shared env silently imports the wrong code for every other
+lane. The shared thing the fleet already uses is the **uv cache** (block sharing via hardlinks), which
+is sanctioned and keeps each lane's editable install its own. Reviving a shared venv would be a reopen
+of that decision, not an optimisation.
 
 ## Deliberately out of scope
 

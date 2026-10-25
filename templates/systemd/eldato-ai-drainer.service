@@ -1,0 +1,51 @@
+[Unit]
+# eldato ai-drainer — TOP UP this box's lane capacity against a repo's PR backlog, every tick
+# (`scripts/orchestrator-harness/ai-drainer.sh`).
+#
+# ⛔ WHY A TIMER AND NOT A DOCTOR ROLE (#2281's second half). The cell already has a role loop
+# (`cloud-cell-doctor.sh`, roles doctor/reap/merge/hygiene) and this could have been a fifth role.
+# It is not, for two measured reasons — and note the FIRST reason this file used to give is WITHDRAWN:
+# "the drainer's lock must outlive its own pass (it waits up to LANE_TIMEOUT for the lane it
+# dispatched)" was true of #2639 and is no longer true: the lock now covers ONE TICK'S CRITICAL
+# SECTION (settle → census → target → dispatch), the tick never waits for a lane, and a lane that
+# outlives it is simply counted by the next tick. So the drainer is no longer a 50-minute pass.
+#   1. a role is ONE cell's controller, and the backlog the drainer exists for belongs to a repo the
+#      cell's controller may not even be bound to;
+#   2. the fleet ALREADY schedules a periodic one-shot job this way: the disk reaper
+#      (templates/systemd/eldato-disk-reaper.*, installed by install-disk-reaper-timer.sh). Using
+#      systemd here reuses the mechanism that exists on cells rather than inventing a second loop,
+#      and it keeps the guards where they belong — in the script, identical on both platforms.
+#
+# ⛔ NOT INSTALLED BY THE CELL BRING-UP, DELIBERATELY. `cloud-cell-bringup.sh` installs the disk
+# reaper because every cell needs it; a lane DISPATCHER is per-repo and costs model spend, so it is
+# activated explicitly with the installer (scripts/orchestrator-harness/install-drainer-timer.sh),
+# which renders this template from machine state.
+Description=eldato ai-drainer — top up the box's measured lane capacity against a PR backlog
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/ai-drainer.md
+# Never hold up a boot, and never be a reason to keep a box up: a tick that is missed is a tick.
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+Environment=O={{O}}
+Environment=AI={{AI}}
+Environment=REPO_SLUG={{REPO_SLUG}}
+Environment=SEED_REPO={{SEED_REPO}}
+# ⛔ RENDERED BLANK BY DEFAULT, ON PURPOSE: an explicit value here is a PIN the script never
+# recomputes. Blank means "derive it from this box's cores every tick" (floor(ncpu x 5/2) — the
+# fleet's 2026-10-17 ruling for the lane ceiling), which is what a resized box needs.
+Environment=MAX_LANES={{MAX_LANES}}
+Environment=MIN_SWAP_MB={{MIN_SWAP_MB}}
+Environment=LANE_TIMEOUT={{LANE_TIMEOUT}}
+# The pass is a dispatch, not a deadline: never compete with a live lane for CPU.
+Nice=10
+IOSchedulingClass=best-effort
+# A SKIP (swap floor, memory ceiling, load ceiling, already at target, another tick holding the lock)
+# exits 0 by design — it is the tick correctly doing nothing. Only a REFUSED dispatch or an uncreatable worktree exits 1, and that
+# must surface as a failed unit: an installed-but-inert dispatcher is the false PASS this repo keeps
+# removing. No `-` prefix, no quiet stdout: the pass's own log is
+# $AI/logs/ai-drainer.log and systemd keeps the exit status beside it.
+ExecStart=/bin/bash {{DRAINER}}

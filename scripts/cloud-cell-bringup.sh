@@ -451,6 +451,74 @@ check_repo() {
     git clone --depth 1 -q "https://github.com/$REPO_SLUG.git" "$WORKDIR" \
       && ok "cloned $REPO_SLUG -> $WORKDIR" || die "clone failed"
   fi
+  # ── #2235: `GH_REPO` MUST NOT BE EXPORTED BY A CELL'S ENV ────────────────────
+  # gh resolves its repo as flag > `GH_REPO` > the local checkout, so a GLOBAL
+  # `GH_REPO` in `keys.env` makes every call that omits `--repo` answer for another
+  # repo. Measured 2026-10-20/21 on every cell (`GH_REPO=daniel-ospina/tortoise`):
+  #
+  #   $ bash scripts/admin-merge.sh 2232
+  #   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+  #                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+  #
+  # a SEPTEMBER tortoise PR, exit 0, over an OPEN agent-infra one; and
+  # `GraphQL: Could not resolve to a PullRequest with the number of 2231` for real open PRs.
+  #
+  # THE SUBJECT IS THE CHECKOUT THE CONTROLLER RUNS IN (`$WORKDIR`'s own origin), which is what
+  # the requirement names. TWO OUTCOMES, deliberately different:
+  #   * DISAGREEMENT ⇒ `die`. The env is actively wrong: every rail on the box would grade and
+  #     report another repo's PRs, and that is the failure this check exists to make loud.
+  #   * AGREEMENT ⇒ `warn` + `unset`. Nothing is wrong today, but a global export is still the
+  #     DEFECT (it answers for every gh call that omits --repo, so the next checkout or renamed
+  #     repo on this box turns it into a wrong answer with no signal). Refusing a cell whose env
+  #     is merely redundant would be a false block with no safety gain — so it is stripped and
+  #     reported instead. (The strip is local: the controller session re-sources keys.env, which
+  #     is why `cloud-cell-supervisor.sh` strips it there too.)
+  if [ -n "${GH_REPO:-}" ]; then
+    local want have got
+    want="$(git -C "$WORKDIR" remote get-url origin 2>/dev/null)" || want=""
+    # Derive `<owner>/<name>` from the checkout's own origin — the same evidence the
+    # controller's queue gate reads, with the same accepted shapes. ⛔ `.git` is stripped
+    # AFTER the trailing slash (`…agent-infra.git/` is a shape the fleet's lockstep table
+    # supports; stripping `.git` first left the dot-suffix in place and this check then DIED
+    # with "names a DIFFERENT repository" for two spellings of the SAME repo — a false block
+    # on the provisioning path, #2235 review P1).
+    case "$want" in
+      https://*|http://*|ssh://*) got="${want#*://}"; got="${got#*/}" ;;
+      *@*:*)                      got="${want#*:}" ;;
+      *)                          got="" ;;
+    esac
+    case "$got" in /*) got="" ;; esac          # empty path segment — refuse, never repair
+    got="${got%/}"; got="${got%.git}"
+    case "$got" in */*/*) got="" ;; esac
+    if [ -z "$want" ]; then
+      die "GH_REPO is exported by this cell's env ($GH_REPO) but $WORKDIR has no readable 'origin' remote, so the export cannot be verified against the checkout the controller runs in. A global GH_REPO is what produced the #2235 fail-open (a rail printing 'ALREADY MERGED' for a tortoise PR while grading agent-infra). Remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never cell state."
+    fi
+    if [ -z "$got" ]; then
+      # A READABLE origin that is not a slug (a local path, `file://`, a bare mirror…): the
+      # export cannot be checked, so it is stripped rather than refused. Stripping is the safe
+      # half — an unverifiable global export is exactly the defect — and dying here would block
+      # provision on a legitimate non-GitHub origin with a diagnosis that does not apply.
+      warn "GH_REPO is set to '$GH_REPO' but $WORKDIR's origin ($want) is not an <owner>/<name> slug, so the export cannot be verified against this checkout. Stripping it from this shell: gh gives GH_REPO precedence over the checkout for every call that omits --repo, so leaving it set lets a rail grade another repo (#2235)."
+      unset GH_REPO
+    fi
+    if [ -n "${GH_REPO:-}" ]; then
+      have="$(printf '%s' "$GH_REPO" | tr '[:upper:]' '[:lower:]')"
+      # `[HOST/]OWNER/REPO` is the documented GH_REPO form (`gh help environment`), so
+      # `github.com/o/r` names the SAME repo as `o/r` — comparing it verbatim died with
+      # 'a DIFFERENT repository' on a correct cell (§2235 review P2). Drop a leading segment
+      # only when it IS a host (dotted).
+      case "$have" in
+        */*/*)
+          case "${have%%/*}" in *.*|*:*) have="${have#*/}" ;; esac ;;
+      esac
+      got="$(printf '%s' "$got" | tr '[:upper:]' '[:lower:]')"
+      if [ "$have" != "$got" ]; then
+        die "GH_REPO names a DIFFERENT repository than this cell's checkout: GH_REPO='$GH_REPO' but $WORKDIR is a checkout of '$got' (origin $want). gh gives GH_REPO precedence over the checkout for every call that omits --repo, so every rail on this cell would grade and report '$GH_REPO' PRs while believing it graded '$got' — measured as '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state; a command that needs another repo passes --repo."
+      fi
+      warn "GH_REPO is set to '$GH_REPO' (from $ENV_FILE or the ambient shell) and matches this checkout ($got) — nothing is wrong today, but the export is the DEFECT (#2235): it silently answers for every gh call that omits --repo, so the next checkout, clone or renamed repo on this box makes it a wrong answer with no signal. Remove the GH_REPO line from $ENV_FILE (per-invocation state; a command that needs another repo passes --repo). Stripping it from this shell."
+      unset GH_REPO
+    fi
+  fi
   git -C "$WORKDIR" config user.email "cloud-lane@premiselabs.co"
   git -C "$WORKDIR" config user.name  "cmux cloud lane"
 }
@@ -507,6 +575,16 @@ check_dispatch() {
 # reads a cell that never received it.) A "CELL READY" over an unguarded cell is exactly the
 # false PASS this repo keeps removing, and the remedy is one env var
 # (`INFRA_ROOT=<checkout>`) — so refuse.
+# gh_shim_disarmed <layer --verify output> — TRUE when the shim is installed but the kill switch has it
+# DISARMED. A named predicate, not an inline test, so the suite can DRIVE the shipped decision: an
+# inversion here certifies a degraded cell as armed, which is the whole defect #2164 records.
+# ⛔ IT MATCHES THE ACTIVATION LINE, NOT ITS ABSENCE. `--verify` always prints the line when the shim
+# is present, so "no DISARMED line" is a POSITIVE arming statement — and it is only read as one after
+# rc=0 proved the shim exists (the caller reaches here only after that check).
+gh_shim_disarmed() {
+  grep -q 'gh shim PRESENT .*DISARMED' <<<"$1"
+}
+
 check_operational_layer() {
   local cand root="" installer os_release self_root trusted=0
   # A cell keeps its agent-infra checkout in any of a few places (this script is normally
@@ -579,6 +657,31 @@ check_operational_layer() {
     die "the operational layer FAILED to install from $root (rc=$rc) — a cell without it is unguarded (no review-enforcer/verification-gate/main-worktree-guard/search-guard/audit-logger, no skills) and its merge path dies rc=127. Fix the failure above, or install it by hand: CELL_HOME=$CELL_HOME INFRA_ROOT=$root bash $installer --install"
   fi
   ok "operational layer present and verified ($CELL_HOME/.pi/agent)"
+  # THE MERGE GATE'S SECOND LAYER, NAMED AT THE READY MOMENT (#2164). A cell reported CELL READY
+  # while every lane on it logged `#984 argv-level gh shim not found — only the string scanner is
+  # active`: two definitions of ready, and only one of them measured the merge gate. `--verify` is
+  # the AUTHORITY (it fails BY NAME when the shim is absent, non-executable, or missing its evidence
+  # verifier), so reaching this line already implies the layer carries one. ⛔ NO PATH HERE: the
+  # resolved shim may legitimately live elsewhere (AGENT_GH_SHIM_DIR is a candidate the extension
+  # tries first), and a literal path on this line would be a second copy of the layout that nothing
+  # derives — a datum an operator would read as measured when it is only typed.
+  # ⛔ INSTALLED AND VERIFIED IS NOT ARMED (fresh review of this PR, P2). `--verify`'s activation
+  # line is REPORT-ONLY: with `AGENT_GH_SHIM=0` the shim is present and `guard_gh_shim` passes, so
+  # rc=0 and the line above was reached while the DISARMED note sat in `$out` — and the ready path
+  # then stated the opposite of what it had measured. The claim is now conditional on the measured
+  # state. The kill switch stays honoured (it is a documented, audited hatch): a cell that carries
+  # it simply must not also read as "NOT degraded", and the degraded state is named where an
+  # operator greps for readiness.
+  # ⛔ NOT A PIPE, AND NOT AN INLINE TEST (#841/#864). `printf … | grep -q` is the SIGPIPE
+  # false-negative idiom — under `set -o pipefail` a first-match `grep -q` kills the writer and the
+  # PIPELINE reports the writer's failure, so a DISARMED cell could read as "no match" and certify
+  # NOT degraded: the exact inversion this branch exists to prevent. The here-string form lives in
+  # `gh_shim_disarmed` (named so this suite DRIVES it rather than re-deriving it below).
+  if gh_shim_disarmed "$out"; then
+    warn "merge gate DEGRADED — the argv-level gh shim is installed, but AGENT_GH_SHIM=0 disarms it: the review-enforcer injects nothing and the string scanner is the only layer the gate has (#984/#2164). Fix the env to arm it, or keep this box out of the landing path."
+  else
+    ok "merge gate NOT degraded — the argv-level gh shim is installed, enabled and verified (#984)"
+  fi
   # A cell is Linux. Say which one, because the layer's own selection is surface-aware (no
   # cmux desktop app, no launchd) and a reviewer reading a cell log should see the surface.
   if [ -r /etc/os-release ]; then
@@ -1180,6 +1283,104 @@ check_disk_reaper() {
   ok "disk reaper scheduled — timer next=${next:-?} last_pass=${last:-never} (state: ${DISK_REAPER_STATE_DIR:-$HOME/.pi/agent/state}/disk-reaper.status)"
 }
 
+# check_harness_apply — put ACTIVATION on the clock too (#2416), through the SAME one-install-verb
+# split as the disk reaper above. The pass calls the box's existing verbs (`cloud-cell-supervisor.sh
+# apply`, or the checkout's `./sync.sh`) and owns only the safety predicates; this function owns WHERE
+# and HOW the schedule lives, and REFUSES rather than skipping — a cell that runs whatever code it had
+# when it was last started is the drift the pass exists to stop, and "no timer" must never be quiet.
+check_harness_apply() {
+  local installer="" pass="" cand out rc next repo
+  for cand in "${HARNESS_APPLY_TIMER_INSTALLER:-}" \
+              "${HOME:-}/.pi/agent/scripts/install-harness-apply-timer.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-harness-apply-timer.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
+  done
+  for cand in "${HARNESS_APPLY_PASS:-}" \
+              "${HOME:-}/.pi/agent/scripts/harness-apply-pass.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/harness-apply-pass.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { pass="$cand"; break; }
+  done
+  [ -n "$installer" ] || die "install-harness-apply-timer.sh not found — cannot schedule harness activation, and an unscheduled activation never happens (the measured state: a cell 91 commits behind main with every signal reading auto)"
+  [ -n "$pass" ] || die "harness-apply-pass.sh not found — the timer would have nothing to run"
+  # ⛔ THE CHECKOUT IS RESOLVED HERE, NOT INHERITED FROM ONE VARIABLE. The farmed installer has no
+  # checkout beside it ($HOME/.pi/agent is not a git repo), so leaving it to that default would refuse
+  # on every cell — or, worse, be defaulted onto a directory that is not a checkout and fail every tick
+  # while list-timers showed the job healthy. `LAYER_ROOT` alone is not enough either: measured on this
+  # suite's own fixture, it was empty at this point and the install REFUSED on a perfectly good box.
+  # Same candidate order the installer and harness-refresh use, and the MAIN worktree is what is taken.
+  repo=""
+  # ⛔ THE TREE THE LAYER CAME FROM OUTRANKS AN AMBIENT `$AGENT_INFRA_PATH`. Measured: with a stale
+  # ambient path in the environment, the timer was rendered from a DIFFERENT checkout than the layer
+  # this run just installed — and that checkout had no harness-apply templates at all, so the whole
+  # bring-up died on a box that was perfectly healthy.
+  for cand in "${HARNESS_APPLY_REPO:-}" "${LAYER_ROOT:-}" "${INFRA_ROOT:-}" "${AGENT_INFRA_PATH:-}" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"; do
+    [ -n "$cand" ] && [ -d "$cand" ] || continue
+    # `rev-parse --git-dir` is the TEST that this is a checkout; `worktree list` only PREFERS the main
+    # worktree (so a pin is never taken for the repo). A listing that cannot be read must not turn a
+    # confirmed checkout into "no checkout on this box" — that false refusal is measured, under this
+    # very suite's functional `git` stub.
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
+    repo="$(git -C "$cand" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+    repo="${repo:-$cand}"
+    break
+  done
+  [ -n "$repo" ] || die "no agent-infra checkout resolved for the harness-apply timer (looked at \$HARNESS_APPLY_REPO, \$AGENT_INFRA_PATH, \$LAYER_ROOT, \$INFRA_ROOT, and this script's own checkout) — set HARNESS_APPLY_REPO=<checkout>"
+  # The templates come from the tree that SHIPS this installer when that tree carries them (the farmed
+  # copy at $HOME/.pi/agent/scripts has no ../templates, so it falls back to the resolved checkout).
+  # Without this split the unit and the pass it runs can come from two different versions of the repo.
+  local inst_root tpl_sys tpl_launchd
+  inst_root="$(cd "$(dirname "$installer")/.." 2>/dev/null && pwd)"
+  tpl_sys="$repo/templates/systemd"
+  [ -n "$inst_root" ] && [ -f "$inst_root/templates/systemd/eldato-harness-apply.timer" ] && tpl_sys="$inst_root/templates/systemd"
+  tpl_launchd="${tpl_sys%/systemd}/launchd/harness-apply"
+
+  rc=0
+  out="$(HARNESS_APPLY_PASS="$pass" HARNESS_APPLY_REPO="$repo" \
+         TEMPLATES_DIR="$tpl_sys" LAUNCHD_TEMPLATES_DIR="$tpl_launchd" \
+         bash "$installer" --install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" -eq 0 ] || die "the harness-apply timer could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager) before this cell is used"
+
+  rc=0
+  out="$(HARNESS_APPLY_PASS="$pass" HARNESS_APPLY_REPO="$repo" \
+         TEMPLATES_DIR="$tpl_sys" LAUNCHD_TEMPLATES_DIR="$tpl_launchd" \
+         bash "$installer" --status 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" -eq 0 ] || die "the harness-apply timer is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+  next="$(printf '%s\n' "$out" | sed -n 's/^next_run=//p' | head -1)"
+  ok "harness activation scheduled — timer next=${next:-?} (record: ${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply.status)"
+}
+# ── the two periodic passes: objective reminder + controller watchdog (agent-infra#2691) ────────
+# Both were built on the operator's Mac and stayed there. On a cell they are systemd timers (the same
+# mechanism the disk reaper uses), rendered by install-cell-timers.sh. This check RUNS that install verb
+# and READS IT BACK, exactly as check_disk_reaper and check_controller_service do — a cell that cannot
+# schedule them is REFUSED, because a reminder that never fires is the failure mode with no signal (it
+# exits 0 and writes one log line nobody reads), and a watchdog with no clock protects nothing.
+check_cell_timers() {
+  local installer="" out rc
+  for cand in "${CELL_TIMERS_INSTALLER:-}" \
+              "${LAYER_ROOT:-}/scripts/install-cell-timers.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-cell-timers.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
+  done
+  [ -n "$installer" ] || die "install-cell-timers.sh not found (looked at \$CELL_TIMERS_INSTALLER, \$LAYER_ROOT/scripts, and beside this script) — the objective reminder and the controller watchdog would never run on this cell, and neither absence reds anything"
+  # The env is built as an ARRAY, not a string: a checkout path with a space in it would otherwise split
+  # into two assignments and render units pointing at the wrong tree (the same failure the disk reaper's
+  # installer refuses at install time; this avoids producing it at all).
+  local -a cenv=(CELL_HOME="${CELL_HOME:-$HOME}" O="${O:-${CELL_HOME:-$HOME}/orchestrator}")
+  [ -n "${LAYER_ROOT:-}" ] && cenv+=("TEMPLATES_DIR=$LAYER_ROOT/templates/systemd")
+
+  rc=0
+  out="$(env "${cenv[@]}" bash "$installer" --install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" -eq 0 ] || die "the cell timers could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager with linger) before this cell is used; an unscheduled reminder and watchdog are silent by construction"
+  rc=0
+  out="$(env "${cenv[@]}" bash "$installer" --status 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] || die "the cell timers are not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+  ok "periodic passes scheduled — objective reminder (10 min) and controller watchdog (5 min) are enabled and active"
+}
+
 # ── controller: the SERVICE that keeps the dispatcher alive (agent-infra#2402) ──────────────────
 # The controller lived and died as a tmux SESSION, and a tmux session has nothing above it: when the box
 # emptied, the last session closed, the tmux server exited and the dispatcher was gone — the cell read as
@@ -1276,15 +1477,21 @@ main() {
       # after the scheduler work — and the reading is what the operator needs from the refusal.
       check_swap
       check_disk_reaper
-      # AFTER the operational layer exists: the installer is resolved from that layer (#2402), and the
-      # unit's ExecStart names the supervisor it ships.
+      # Both schedulers/supervisors are installed AFTER the layer exists: each installer is resolved
+      # FROM that layer (the harness-apply one from #2416, the controller one from #2402), so measuring
+      # either earlier would probe a directory that has not been populated yet.
+      check_harness_apply
       check_controller_service
+      # AFTER the controller service: the two periodic passes (objective reminder, controller watchdog)
+      # are systemd timers on the SAME manager this box just proved it has. Without this check they are
+      # "reachable" only in the sense that a template exists — which is the inert-enforcer shape.
+      check_cell_timers
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported, swap active)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported, swap active, harness activation scheduled)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;

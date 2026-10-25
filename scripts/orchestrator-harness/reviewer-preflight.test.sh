@@ -188,6 +188,15 @@ echo
 echo "§C lane.sh's REAL output (LANE_DRY_RUN=1)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/o/logs"
+# ⛔ THE DRY-RUN CWD MUST BE THE TARGET REPO (agent-infra#2724/#2694). lane.sh now refuses (72) when
+# the worktree's origin is not the repo it was dispatched for. This section asserts the RENDERED
+# brief, not the repo gate, so the fixture is a checkout of the `acme/widget` it names.
+git init -q "$TMP" 2>/dev/null && git -C "$TMP" remote add origin https://github.com/acme/widget.git 2>/dev/null
+# …and it is checked out on the branch the lane was told it is on: lane.sh refuses a worktree on a
+# DIFFERENT named branch (the `prfixup` shape), so a fixture on `main` would be refused for the
+# branch before this section could read the rendered brief.
+git -C "$TMP" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null \
+  && git -C "$TMP" checkout -q -b fix/2148-reviewer-preflight 2>/dev/null
 # A throwaway worktree dir: lane.sh reads $PWD for the log header and the venv reaper, and
 # REAP_LANE_VENV_DISABLE keeps the reaper out of the fixture's way.
 (
@@ -274,6 +283,276 @@ TWO_LINE="$(printf '%s\n%s' "$LINE" extra)"
 NOCARRY="$(printf '%s\n' "$LINE" | sed "s# $REVIEWER_PREFLIGHT_CARRY_CLAUSE##")"
 case "$NOCARRY" in *"$REVIEWER_PREFLIGHT_CARRY_CLAUSE"*) rc=0;; *) rc=1;; esac
 [ "$rc" -ne 0 ]; ck $? "the CARRY assertion FIRES when the clause is stripped from the line (#2343)"
+
+echo
+echo "§F landing artifacts — the brief must make a PR PASSABLE, not just reviewed (#2325)"
+# THE DEFECT (agent-infra#2325, measured 2026-10-25 on agent-infra). `pipeline-compliance` blocked 36
+# of 40 open agent-infra PRs and the count GREW faster than lanes could be rescued from it (33 -> 36
+# in one hour). The brief told a lane to READ `issue-workflow` / `issue-scoping` and never to PRODUCE
+# the artifacts those skills exist to create, so every lane finished real work, opened a PR, and was
+# refused — its evidence retro-fitted by a human or a drain lane afterwards. These checks read the
+# ARTIFACTS a lane receives (the composed brief + the template block), and §F.4 drives the GATE'S OWN
+# PARSERS over the shapes this text prescribes — a shape that stops being accepted there goes red here.
+LANDING_SELF="$(landing_artifacts_brief_section self)"
+LANDING_HARNESS="$(landing_artifacts_brief_section harness)"
+landing_artifacts_brief_section SCOPE=banana >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "an unknown role is refused (never the wrong audience's record duty)"
+[ -n "$LANDING_SELF" ] && [ -n "$LANDING_HARNESS" ]; ck $? "the helper renders the section for both roles"
+case "$LANDING_SELF" in *"$LANDING_ARTIFACTS_HEADING"*) rc=0;; *) rc=1;; esac
+ck $rc "the section carries its findable heading (the check this exists for is named in it)"
+
+# ONE predicate per requirement, used by BOTH the composed-brief check and the non-vacuity control —
+# so the control exercises the SAME pattern it claims to validate (a control that strips a DIFFERENT,
+# weaker token proves nothing; the #2148 suite's own §E lesson).
+has_req_a()  { case "$1" in *"[a] the issue reference must BEGIN A LINE"*) return 0;; *) return 1;; esac; }
+has_req_b()  { case "$1" in *"FIRST CONTENT LINE"*"<!-- issue-scoping:"*) return 0;; *) return 1;; esac; }
+has_req_c()  { case "$1" in *"CURRENT head"*"$LANDING_HEAD_BINDING"*"~/.pi/agent/scripts/record-review.sh"*) return 0;; *) return 1;; esac; }
+has_req_d()  { case "$1" in *"[d] plan evidence"*) ;; *) return 1;; esac
+                case "$1" in *'`## Wiring`'*) ;; *) return 1;; esac
+                case "$1" in *"docs/plans/*.md"*) return 0;; *) return 1;; esac; }
+has_req_e()  { case "$1" in *"[e] test evidence"*"*.test.ts"*) return 0;; *) return 1;; esac; }
+has_mech_1() { case "$1" in *'`git commit -F <message-file>`'*) return 0;; *) return 1;; esac; }
+has_mech_2() { case "$1" in *'never `git add -A`'*) return 0;; *) return 1;; esac; }
+has_honesty() { case "$1" in *"never write a scoping comment for a plan you did not follow"*"fabricated one MERGES"*) return 0;; *) return 1;; esac; }
+
+echo
+echo "§F.1 the composed brief a lane.sh lane RECEIVES (the same dry-run artifact §C asserts on)"
+[ -f "$BRIEF_FILE" ]; ck $? "the composed brief exists"
+COMPOSED="$(cat "$BRIEF_FILE" 2>/dev/null || true)"
+has_req_a "$COMPOSED"; ck $? "[a] the issue ref must BEGIN A LINE (a mid-sentence ref does not count)"
+has_req_b "$COMPOSED"; ck $? "[b] the scoping marker is the comment's FIRST CONTENT LINE at column 0"
+has_req_c "$COMPOSED"; ck $? "[c] the record is bound to the CURRENT head, with the recorder command"
+has_req_d "$COMPOSED"; ck $? "[d] plan evidence: docs/plans/*.md or a ## Wiring section"
+has_req_e "$COMPOSED"; ck $? "[e] test evidence for runtime code"
+has_mech_1 "$COMPOSED"; ck $? "mechanic: git commit -F <message-file> (never -m)"
+has_mech_2 "$COMPOSED"; ck $? "mechanic: never git add -A"
+has_honesty "$COMPOSED"; ck $? "⛔ the brief forbids FABRICATION (evidence describes work actually done; else BLOCKED)"
+case "$COMPOSED" in *"a moved head must be RE-RECORDED at the new head"*) rc=0;; *) rc=1;; esac
+ck $rc "the HEAD-BINDING rule is stated: a moved head invalidates the record, so it is re-recorded"
+# The five artifacts must not have displaced what the brief already said (an insertion that drops a
+# line is invisible to every check above).
+grep -q '## Reviewer step' "$BRIEF_FILE" 2>/dev/null; ck $? "…and the reviewer step SURVIVES the insertion"
+grep -q '## Deliverable' "$BRIEF_FILE" 2>/dev/null; ck $? "…as does the Deliverable section"
+grep -q 'never search the filesystem for an interpreter' "$BRIEF_FILE" 2>/dev/null; ck $? "…and the no-search bound"
+
+echo
+echo "§F.2 role-correct on [c] only — who mints the record differs, what is owed does not"
+case "$LANDING_SELF" in *"Record AFTER your last push, then RE-RECORD if the head moves"*) rc=0;; *) rc=1;; esac
+ck $rc "self: the LANE records (after the last push) and re-records when the head moves"
+case "$LANDING_SELF" in *"insert ABOVE the footer BLOCK"*"KEEPING the blank line"*) rc=0;; *) rc=1;; esac
+ck $rc "…and says how to extend a FOOTER-shaped scoping comment without destroying its position"
+case "$LANDING_SELF" in *"posting a SECOND"*"satisfies the check"*) rc=0;; *) rc=1;; esac
+ck $rc "…and that a second comment is accepted (the check scans every comment)"
+case "$LANDING_SELF" in *'`merge-one.sh` mints'*) rc=1;; *) rc=0;; esac
+ck $rc "…and is not told merge-one.sh mints it (the two roles cannot collapse)"
+case "$LANDING_HARNESS" in *'`merge-one.sh` mints'*) rc=0;; *) rc=1;; esac
+ck $rc "harness: merge-one.sh mints the record for this lane"
+case "$LANDING_HARNESS" in *"Record AFTER your last push"*) rc=1;; *) rc=0;; esac
+ck $rc "⛔ …and is NOT told to record it (this lane has no reviewer to point --evidence at)"
+case "$LANDING_HARNESS" in *"do NOT amend, rebase or push again"*) rc=0;; *) rc=1;; esac
+ck $rc "…its duty is the head: no amend/rebase/push once the record exists"
+# ⛔ NOT JUST THE SENTENCE, THE ADVICE (cycle-3 review, P2): "in doubt use `clean`" and the stale-line
+# deletion are the RECORDER's business, so a harness lane must not be handed them four lines before
+# being told merge-one.sh mints the record.
+case "$LANDING_HARNESS" in *"in doubt use"*|*"DELETE it"*) rc=1;; *) rc=0;; esac
+ck $rc "⛔ …and is NOT given the recorder's verdict/stale-line advice (it does not run the recorder)"
+case "$LANDING_SELF" in *"in doubt use"*) rc=0;; *) rc=1;; esac
+ck $rc "the SELF role does carry the verdict advice (it is the one that runs the recorder)"
+case "$LANDING_SELF" in *"DELETE it"*) rc=0;; *) rc=1;; esac
+ck $rc "…and the stale-line deletion (the remedy for a body carrying an older verdict)"
+# …and the post-record body-edit ban must carry its ONE exception, or the [c] remedy contradicts it.
+# It lives in the REVIEWER brief section (where the ban is stated), not in the landing section.
+case "$SELF_BRIEF" in *"ONE exception is the [c] remedy"*) rc=0;; *) rc=1;; esac
+ck $rc "the body-edit ban names its one exception (deleting a stale record line — the [c] remedy)"
+for L in "$LANDING_SELF" "$LANDING_HARNESS"; do has_honesty "$L"; ck $? "each role carries the no-fabrication paragraph (neither can be the honest one by accident)"; done
+has_mech_1 "$LANDING_HARNESS" && has_mech_2 "$LANDING_HARNESS"; ck $? "both commit mechanics are in the harness section lane.sh splices"
+# ⛔ ALL FIVE, IN BOTH ROLES (cycle-2 review, P2). §F.1 reads the composed HARNESS brief; §F.3 pins the
+# template to the SELF render — so without this loop a self-branch regression (e.g. losing the recorder
+# invocation) plus a regenerated template block was invisible to the whole suite.
+for L in "$LANDING_SELF" "$LANDING_HARNESS"; do
+  has_req_a "$L" && has_req_b "$L" && has_req_c "$L" && has_req_d "$L" && has_req_e "$L"
+  ck $? "every role carries [a]-[e] (the self render is what templates/LANE-BRIEF.md pins)"
+done
+
+echo
+echo "§F.3 the controller brief template mirrors the section BYTE FOR BYTE (drift-pinned block)"
+BLOCK="$(awk '/^<!-- BEGIN landing-artifacts/{f=1;next} /^<!-- END landing-artifacts -->$/{exit} f' "$TEMPLATE")"
+[ -n "$BLOCK" ]; ck $? "templates/LANE-BRIEF.md carries a landing-artifacts block"
+if [ "$BLOCK" = "$LANDING_SELF" ]; then rc=0; else rc=1; fi
+ck $rc "the block EQUALS the helper's rendered self section (one home: edit the helper, not the template)"
+if grep -qF 'BEGIN landing-artifacts' "$TEMPLATE"; then rc=0; else rc=1; fi
+ck $rc "…under named markers, so the pin cannot silently drift to a stale block"
+grep -q 'edit THERE, not here' "$TEMPLATE" 2>/dev/null; ck $? "…and the marker says where the text actually lives"
+
+echo
+echo "§F.4 GATE PARITY — the shapes this text prescribes are the shapes the CHECK accepts"
+# The section is only worth anything if its samples pass the real gate, and its warnings are true.
+# Neither script sources cleanly (check-pipeline-compliance.sh is a top-level program), so its
+# functions and constants are EXTRACTED and driven here — the same technique selftest.sh uses to
+# drive the required-check derivation. A parser rename/removal makes this go red rather than quietly
+# turning the assertions below into prose checks.
+GATE="$(cd "$HERE/../.." && pwd)/scripts/check-pipeline-compliance.sh"
+[ -f "$GATE" ]; ck $? "the gate scripts/check-pipeline-compliance.sh is present beside the harness"
+extract_fn() { awk -v n="$1" '$0 == n"() {"{f=1} f{print} f&&/^}$/{exit}' "$GATE"; }
+gate_const() { grep -E "^$1=" "$GATE" | head -1; }
+eval "$(extract_fn has_scoping_marker)" 2>/dev/null
+eval "$(extract_fn has_review_record)" 2>/dev/null
+eval "$(extract_fn parse_issue_ref)" 2>/dev/null
+# parse_trace_ref and has_test_evidence are ONE-LINERS in the gate (`name() { …; }`), so the
+# brace-terminated extractor above cannot lift them; lift the LINES themselves, verbatim. A reword
+# goes red in the `declare -f` guard below — it must never degrade into a local re-implementation,
+# which is a copy of the gate that can agree with itself while the gate disagrees (caught in review:
+# the first version declared its own `has_test_evidence` fallback and stayed green against a gate
+# whose [e] matcher had been inverted).
+eval "$(grep -E '^parse_trace_ref\(\) \{' "$GATE" | head -1)" 2>/dev/null
+eval "$(grep -E '^has_test_evidence\(\) \{' "$GATE" | head -1)" 2>/dev/null
+# …and the pattern it reads, so the extracted matcher is the gate's mechanism, not an empty variable.
+eval "$(gate_const TEST_EVIDENCE_RE)" 2>/dev/null
+eval "$(gate_const REVIEW_RECORD_MARKER_RE)" 2>/dev/null
+eval "$(gate_const REFCTX)" 2>/dev/null
+eval "$(gate_const CLOSING_KW)" 2>/dev/null
+eval "$(gate_const TRACE_KW)" 2>/dev/null
+GH_REPO='daniel-ospina/agent-infra'
+if declare -f has_scoping_marker >/dev/null && declare -f has_review_record >/dev/null && declare -f parse_issue_ref >/dev/null && declare -f parse_trace_ref >/dev/null && declare -f has_test_evidence >/dev/null && [ -n "${REVIEW_RECORD_MARKER_RE:-}" ] && [ -n "${TEST_EVIDENCE_RE:-}" ]; then rc=0; else rc=1; fi
+ck $rc "the gate's own parsers + patterns were EXTRACTED (a rename would make this section vacuous)"
+
+# [a] — the shape the brief prescribes passes; the shape it warns about does not.
+GH_REPO='daniel-ospina/agent-infra'
+[ "$(parse_issue_ref $'Stuff.\n\nCloses #2325\n')" = "daniel-ospina/agent-infra#2325" ]; ck $? "[a] 'Closes #2325' at line start IS a reference"
+[ "$(parse_issue_ref '- Closes #2325')" = "daniel-ospina/agent-infra#2325" ]; ck $? "…including after a bullet (the brief says so)"
+[ "$(parse_issue_ref 'This (fixes #2325) inline.')" = "" ]; ck $? "⛔ …while a MID-SENTENCE '(fixes #N)' is NOT (the brief says so)"
+[ "$(parse_trace_ref 'Refs #2325')" != "" ]; ck $? "…and 'Refs #N' on its own line satisfies [a] (traceability form, which the gate resolves second)"
+
+# [b] — first content line at column 0 passes; the three mention shapes the brief warns about fail.
+SC_BRIEF='<!-- issue-scoping: 2026-10-25 (standard) -->
+
+## Scope
+boundaries, alternatives, wiring table.'
+has_scoping_marker "$SC_BRIEF"; ck $? "[b] the brief's shape (marker = FIRST content line, column 0) PASSES the gate"
+has_scoping_marker 'Discussed first.
+
+<!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a BLANK-LINE-SEPARATED FOOTER is ACCEPTED (one of the two documented alternatives — an earlier draft claimed the marker must be first, and THIS gate falsified it)"
+# ⛔ THE HEADING SHAPE IS THE THIRD (cycle-3 review, P2): the brief names it, so it must be driven, or a
+# gate that stopped skipping headings would leave a lane following the brief rejected with §F all green.
+has_scoping_marker $'## Scope — #2325\n<!-- issue-scoping: v5.1 double diamond + verify -->\n\nboundaries.'; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a leading ATX heading with the marker on the next content line is ACCEPTED (the #729/#843 shape the brief names)"
+has_scoping_marker 'Discussed first.
+<!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …while a marker CROWDED under a preamble (no blank line) FAILS (that is the mention shape)"
+# …and the FOOTER remedy has the same trap: text inserted directly above the marker (no blank line) is
+# the shape the [b] remedy must not produce — measured, not assumed.
+has_scoping_marker '## Scope
+preamble.
+
+NEW CONTENT
+<!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and inserting text directly ABOVE a footer marker (no blank line) FAILS — the blank line is part of the shape"
+has_scoping_marker '    <!-- issue-scoping: 2026-10-25 (standard) -->'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …an INDENTED marker FAILS (a code block is a mention — column 0 is the contract)"
+has_scoping_marker 'The artifact looks like `<!-- issue-scoping: 2026-10-25 (standard) -->` in a table.'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …a quoted marker FAILS (a mention is not an artifact)"
+
+# [c] — a record in the brief's shape binds at the current head and is STALE at an older one.
+H40='0123456789abcdef0123456789abcdef01234567'
+O40='89abcdef0123456789abcdef0123456789abcdef'
+MARK="review recorded: reviews/2325.json verdict=clean @ $H40 (daniel-ospina/agent-infra)"
+has_review_record "$MARK" 2325 daniel-ospina/agent-infra "$H40"; ck $? "[c] the brief's marker shape binds at the CURRENT head"
+has_review_record "$MARK" 2325 daniel-ospina/agent-infra "$O40"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and is REFUSED once the head moves (why the brief says re-record)"
+has_review_record 'code-review done, reviewer approved' 2325 daniel-ospina/agent-infra "$H40"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and no phrase satisfies [c] (only the recorder's line does)"
+
+# [d] — the gate's OWN wiring predicate, lifted from the line that computes it (:1368). Driven as
+# source, so "the brief says ## Wiring and the gate accepts it" is proved, not asserted. The brief is
+# STRICTER than the gate here (the gate accepts any occurrence of the word), which is the safe
+# direction and is stated in the brief itself.
+WIRING_LINE="$(grep -E "^ *if grep -qi 'wiring' <<<\"\\\$SCOPING_COMMENT\"; then wiring_found=\"yes\"; fi$" "$GATE" | head -1)"
+if [ -n "$WIRING_LINE" ]; then
+  eval "gate_wiring_found() { local SCOPING_COMMENT=\"\$1\" wiring_found=no; ${WIRING_LINE#"${WIRING_LINE%%[![:space:]]*}"}; printf '%s' \"\$wiring_found\"; }"
+  rc=0
+else rc=1; fi
+ck $rc "the gate's [d] wiring predicate was EXTRACTED (a reword goes red, never silently vacuous)"
+WIRING_SAMPLE='<!-- issue-scoping: v5.1 double diamond + verify -->
+## Scope
+body.
+
+## Wiring
+| surface | change |
+|---|---|
+| lane.sh | splice |'
+[ "$(gate_wiring_found "$WIRING_SAMPLE")" = "yes" ]; ck $? "[d] the brief's shape (a \`## Wiring\` section) satisfies the gate's wiring branch"
+[ "$(gate_wiring_found '## Scope
+no plan evidence here')" = "no" ]; ck $? "…and a scoping comment without one does not"
+
+# [e] — the evidence markers the brief tells a lane to report, through the GATE's matcher.
+has_test_evidence 'pytest: 412 passed, 0 failed'; ck $? "[e] 'pytest … N passed' is accepted as test evidence"
+has_test_evidence 'VGATE PASS'; ck $? "…and 'VGATE PASS'"
+# ⛔ AND THE DIRECTION THAT MATTERS AS MUCH (cycle-2 review, P2): a matcher that accepts EVERYTHING
+# (`TEST_EVIDENCE_RE='.*'`) passed every positive above. A negative vector is what makes the parity
+# two-directional.
+has_test_evidence 'no evidence was produced'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …while prose with NO evidence is REFUSED (an accept-everything matcher cannot pass this)"
+
+echo
+echo "§F.5 NON-VACUITY — composer-level: drop ONE requirement and the assertions fire"
+# ⛔ THIS IS THE ONE THAT MATTERS. §F.1 greps text; if the composer could lose a requirement while
+# the greps still passed, the whole section would be a test that cannot fail. So a COPY of the
+# harness is built with ONE bullet deleted from the helper and lane.sh run against it, forbidding any
+# stub of the real files: the failure must be OBSERVED in the composed brief.
+STRIP="$TMP/strip"; mkdir -p "$STRIP"
+cp "$HERE/spawn-gate.sh" "$STRIP/spawn-gate.sh"
+cp "$LANE" "$STRIP/lane.sh"
+# ⛔ THE RIG MUST CARRY THE IDENTITY MODULE, AND ITS CWD MUST BE A CHECKOUT OF THE REPO IT NAMES
+# (#2724 follow-up, found by review). `lane.sh` sources `repo-target.sh` from ITS OWN directory and
+# exits 78 when it is absent, and it then asserts the origin slug AND the branch (72). Both rigs used
+# to `cd "$TMP"`, which §C leaves checked out on `fix/2148-reviewer-preflight`, so even with the
+# module copied the lane refused with `branch-checkout-mismatch` and composed NOTHING — the two arms
+# below then PASSED because the artifact was missing, which is precisely the vacuity this section
+# exists to disprove (an absent artifact is indistinguishable from a successful strip).
+cp "$HERE/repo-target.sh" "$STRIP/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP/repo-slug.sh"
+sed '/^- \*\*\[d\] plan evidence\*\*/,+2d' "$HELPER" > "$STRIP/reviewer-preflight.sh"
+[ -s "$STRIP/reviewer-preflight.sh" ]; ck $? "the stripped helper copy was produced"
+# A checkout BORN on the branch the lane is told it is on (no `git checkout`, so no branch state is
+# ever mutated to build a fixture) with a real origin slug, so the gate is satisfied by identity and
+# the assertion under test is the brief's, not the repo's.
+STRIPREPO="$TMP/strip-repo"; mkdir -p "$STRIPREPO" "$TMP/o3/logs"
+git -c init.defaultBranch=fix/strip init -q "$STRIPREPO" 2>/dev/null \
+  && git -C "$STRIPREPO" remote add origin https://github.com/acme/widget.git 2>/dev/null \
+  && git -C "$STRIPREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null
+(
+  cd "$STRIPREPO" || exit 1
+  O="$TMP/o3" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+    bash "$STRIP/lane.sh" 2325 fix/strip acme/widget
+) >/dev/null 2>&1
+STRIPPED="$(cat "$TMP/o3/logs/prompt-2325.txt" 2>/dev/null || true)"
+has_req_d "$STRIPPED"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ removing the [d] bullet from the composer MAKES the §F.1 [d] assertion FAIL (non-vacuous)"
+has_req_a "$STRIPPED" && has_req_e "$STRIPPED"; ck $? "…and the untouched requirements still pass (the control is targeted, not a broken fixture)"
+# …and the same control for the HEAD-BINDING sentence, which is the rule a lane most needs.
+STRIP2="$TMP/strip2"; mkdir -p "$STRIP2"
+cp "$HERE/spawn-gate.sh" "$STRIP2/spawn-gate.sh"; cp "$LANE" "$STRIP2/lane.sh"
+cp "$HERE/repo-target.sh" "$STRIP2/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP2/repo-slug.sh"
+sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
+[ -s "$STRIP2/reviewer-preflight.sh" ]; ck $? "the head-binding-stripped helper copy was produced"
+STRIPREPO2="$TMP/strip2-repo"; mkdir -p "$STRIPREPO2" "$TMP/o4/logs"
+git -c init.defaultBranch=fix/strip2 init -q "$STRIPREPO2" 2>/dev/null \
+  && git -C "$STRIPREPO2" remote add origin https://github.com/acme/widget.git 2>/dev/null \
+  && git -C "$STRIPREPO2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init 2>/dev/null
+(
+  cd "$STRIPREPO2" || exit 1
+  O="$TMP/o4" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+    bash "$STRIP2/lane.sh" 2325 fix/strip2 acme/widget
+) >/dev/null 2>&1
+STRIPPED2="$(cat "$TMP/o4/logs/prompt-2325.txt" 2>/dev/null || true)"
+# ⛔ THE FIXTURE MUST HAVE COMPOSED (review, P2): an absent/empty artifact is indistinguishable from a
+# successful strip, so this control asserts the ONE-THING-CHANGED shape: the other requirements are
+# still on the brief, and only the stripped sentence is gone.
+has_req_a "$STRIPPED2" && has_req_e "$STRIPPED2"; ck $? "the head-binding fixture still composed a brief with [a] and [e] (not an empty file)"
+case "$STRIPPED2" in *"a moved head must be RE-RECORDED at the new head"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "⛔ removing the HEAD-BINDING sentence MAKES the §F.1 head-binding assertion FAIL"
+
+echo
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

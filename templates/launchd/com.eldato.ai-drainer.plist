@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ai-drainer: periodically start ONE bounded lane against a PR backlog
+         (scripts/orchestrator-harness/ai-drainer.sh).
+
+         ⛔ WHAT IT IS FOR. A second controller for another repo cycles but dispatches
+         nothing (its candidate funnel stays empty — agent-infra #2281), so a 70-PR
+         backlog depended on a human remembering to dispatch. This job schedules the
+         one thing that demonstrably works: a bounded lane that makes PRs mergeable and
+         merges what goes green. It is NOT a second funnel and NOT a second controller.
+
+         ⛔ SHIPS UNSCHEDULED BY DEFAULT, AND THAT IS THE DESIGN. install-launchd.sh
+         installs every template in this directory with no arguments, and
+         pi-bootstrap/setup.sh runs exactly that on every Darwin box — so a plain
+         placeholder would put a lane dispatcher on every machine in the fleet. The two
+         identity placeholders below ({{AI_DRAINER_O}}, {{AI_DRAINER_STATE}}) are
+         ENV-ONLY with no default, the same convention the SWARM_ROOT placeholder uses: unset means
+         the template is SKIPPED with a loud warning, so nothing is dispatched anywhere
+         until an operator says where. Activate on one box with:
+
+           AI_DRAINER_O=$HOME/orchestrator AI_DRAINER_STATE=$HOME/orchestrator-ai \
+             bash scripts/install-launchd.sh
+
+         ⛔ THE THREE GUARDS LIVE IN THE SCRIPT, NOT HERE (the plist only says WHEN):
+           * a LOCK around ONE TICK'S decision (settle → census → target → dispatch). It is
+             NOT held for a lane's lifetime: two ticks computing `target − alive` at the same
+             time would each dispatch the full remainder, which is what the lock prevents —
+             and holding it for a lane's lifetime is what made a 20-minute tick dispatch once
+             an hour (ai-drainer.test.sh arm (d) is the regression test: a lane that outlives
+             its tick must neither block the next tick nor hide from its census);
+           * a MEASURED CAPACITY TARGET — min(cpu ceiling, memory ceiling), with the swap and
+             load floors refusing to ADD work; a cell with NO swap is not a box with no
+             capacity, which is why the swap floor applies only where swap exists;
+           * a ROTATING SLICE that advances PER LANE, skipping the windows live lanes hold, so
+             two lanes never work the same PRs.
+
+         ⛔ 1200s = 20 min, and a tick is a TOP-UP: count the live lanes, dispatch
+         `target − alive`, exit. A lane's own cap is 3000s, so a lane routinely outlives the
+         tick that started it — the next tick counts it and fills the remainder, so the box
+         converges on its measured capacity instead of on one lane per poll. A tick that
+         lands while ANOTHER tick holds the drainer lock skips by design. A 20-minute poll is
+         what the inventory row's freshness bound is derived from rather than guessed.
+
+         ⛔ ON A LINUX CELL there is no launchd and this template is not installed: the same
+         script is scheduled by templates/systemd/eldato-ai-drainer.timer through
+         scripts/orchestrator-harness/install-drainer-timer.sh. One job, two platform
+         schedulers — no third mechanism is invented, and the guards are identical because
+         the guards are in the script.
+
+         ⛔ NO StandardOutPath/StandardErrorPath, deliberately — the convention every
+         self-logging job in this directory follows (lane-liveness, pi-cache-reap). This job
+         writes its own record: $AI/logs/ai-drainer.log for the decisions (skip / start /
+         done / fail) and $AI/state/ai-drainer.beat as its freshness signal. Declaring a
+         /tmp capture would make `scripts/lib/fleet-inventory.sh` date THAT file instead
+         (it prefers the plist's StandardOutPath over the row's own-log), and since this
+         script writes nothing to stdout on any normal path, a perfectly healthy drainer
+         would read LATE for ever — the false red that teaches operators to ignore the one
+         health screen they are meant to read.
+
+         Rendered by scripts/install-launchd.sh (#304) — placeholders only. -->
+    <key>Label</key>
+    <string>com.eldato.ai-drainer</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{AGENT_INFRA_PATH}}/scripts/orchestrator-harness/ai-drainer.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>O</key>
+        <string>{{AI_DRAINER_O}}</string>
+        <key>AI</key>
+        <string>{{AI_DRAINER_STATE}}</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>1200</integer>
+</dict>
+</plist>

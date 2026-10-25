@@ -53,6 +53,7 @@ import {
   getPrMergeBaseSha,
   getPrHeadSha,
   getPrLiveDiffHash,
+  diffHashReadTimeoutMs,
   resolveDiffHashHelper,
   parseDiffHashHelperOutput,
   _setPrDiffHashOverride,
@@ -529,6 +530,318 @@ test("audit: a carried allow is a merge_gate_pass with carried:true; a head-boun
   const headBound = evaluateMergeGate(138, diffRecord, "a".repeat(40), { source: "record", repo: "owner/repo" });
   logMergeGateDecision(138, headBound as any, diffRecord, f2);
   equal(readAuditLines(f2)[0].carried, undefined, "a matching-head allow records no carry flag");
+});
+
+// ── #1351: "COULD NOT READ" IS NOT "READ AND DIFFERS" ─────────────────────
+// The measured defect (2026-10-22). `getPrLiveDiffHash` ran under a hard 60s
+// bound while every `gh` invocation on this fleet first queues at the shared
+// gh gate (300s default slot-acquire BEFORE any HTTP). Under fleet contention
+// the child was killed while the gate was still QUEUEING, `execFileSync` threw,
+// and the arm received `null` — which is the fail-closed signal, so nothing
+// unsafe merged. But the refusal it produced was `head_advanced` ("the branch
+// moved — re-review the new head"), i.e. a QUEUEING DELAY was rendered as a
+// CONTENT CHANGE, and the lane paid a whole fresh review for a diff that never
+// changed. Same speech act #1690 fixed for the head read, in the diff dimension.
+// So the two are now separate arms with separate tags and separate remedies.
+section("#1351 — a FAILED diff read is not a changed diff (retry, not re-review)");
+
+test("an ATTEMPTED read that came back null refuses as diff_unreadable (RETRY)", () => {
+  const r = evaluateMergeGate(
+    138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" },
+    false, null, null, null, null, /* diffReadFailed */ true
+  );
+  equal(r.status, "block", "fail CLOSED: an unreadable diff can never authorize a merge");
+  equal((r as any).reasonTag, "diff_unreadable", "the tag is distinct from head_advanced");
+  const reason = (r as any).reason as string;
+  ok(/RETRY/.test(reason), "names the remedy that applies (a retry, not 40 minutes of review)");
+  ok(/NOT a claim that the content changed/.test(reason), "does not render a failed read as a content change");
+  ok(/Do NOT mint a fresh record/.test(reason), "explicitly forbids the paid-for workaround");
+  ok(reason.includes("--check-carry"), "names the ONE way to ask the question without merging");
+  ok(reason.includes(DIFF_A.slice(0, 12)), "quotes the record's digest, so the retry is checkable");
+});
+
+test("the diff_unreadable remedy is TIER-AWARE and runnable — pinned per verdict (review round 2, F1+F2)", () => {
+  // ⛔ REVERTING THE FIX LEFT THE SUITE GREEN (review round 2, F2), so the two defects that
+  // lived on this one line could return silently: a TRUNCATED head (record-review.sh refuses
+  // anything short of 40 hex, exit 2 — the advice dead-ends at the moment a lane tries to
+  // land) and a hardcoded `clean` laid over the record's tier (a micro PR sent to the full
+  // standard review, a clean-low one told to re-record the shape it must re-derive).
+  const stale = "b".repeat(40);
+  const adviceFor = (verdict: string) => {
+    const r = evaluateMergeGate(
+      138, { ...diffRecord, verdict } as any, stale, { source: "record", repo: "owner/repo" },
+      false, null, null, null, null, /* diffReadFailed */ true
+    );
+    equal(r.status, "block", `${verdict}: still fail-CLOSED`);
+    equal((r as any).reasonTag, "diff_unreadable", `${verdict}: still the RETRY tag`);
+    return (r as any).reason as string;
+  };
+  for (const verdict of ["clean", "clean-micro", "clean-low"]) {
+    const reason = adviceFor(verdict);
+    ok(reason.includes("<head_sha>"), `${verdict}: the re-record command uses the RUNNABLE placeholder`);
+    ok(!reason.includes(`${stale.slice(0, 12)}…`), `${verdict}: never prints a TRUNCATED head (exit 2)`);
+    ok(reason.includes(`<head_sha> ${verdict} `), `${verdict}: names the RECORD's verdict, not a hardcoded one`);
+  }
+  const clean = adviceFor("clean");
+  ok(/code-review skill/.test(clean), "clean: owes a review artifact");
+  ok(clean.includes("--evidence comment:"), "clean: …and the flag that binds it");
+  const micro = adviceFor("clean-micro");
+  ok(/micro flow/.test(micro), "clean-micro: the MICRO flow, not the full standard review its tier exempts");
+  ok(!micro.includes("--evidence comment:"), "clean-micro: no --evidence (the recorder accepts and DROPS it)");
+  const low = adviceFor("clean-low");
+  ok(/Re-derive/i.test(low), "clean-low: re-derives the SHAPE (the same-verdict advice is unsatisfiable)");
+  ok(/clean-low \[owner\/repo\]/.test(low), "clean-low: names the explicit re-record, so the shape is re-derived");
+  ok(!/clean-low \[owner\/repo\] --evidence/.test(low),
+    "clean-low: --evidence is never attached to the clean-low invocation (only to a genuine clean escape)");
+});
+
+test("the flag cannot turn a READ MATCH into a block (the carry arm still wins)", () => {
+  const r = evaluateMergeGate(
+    138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" },
+    false, null, DIFF_A, null, null, true
+  );
+  equal(r.status, "allow");
+  equal((r as any).carried, true);
+});
+
+test("a readable-but-DIFFERENT digest keeps head_advanced (a fresh review IS owed)", () => {
+  const r = evaluateMergeGate(
+    138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" },
+    false, null, DIFF_B, null, null, false
+  );
+  equal(r.status, "block");
+  equal((r as any).reasonTag, "head_advanced", "a real content change must NOT read as unreadable");
+  ok(/re-review the new head/.test((r as any).reason), "…and its remedy is a re-review");
+});
+
+test("a record with NO usable digest is never diff_unreadable (absence is not identity)", () => {
+  // Defence in depth: the caller only attempts a read when the record HAS a
+  // digest, but the arm must not depend on that. A digest-less record whose head
+  // moved keeps the unchanged refusal — and the diff_unreadable text (which
+  // quotes a digest) must never be built for it.
+  for (const rec of [{ ...cleanRecord }, { ...cleanRecord, diff_sha256: "" }]) {
+    const r = evaluateMergeGate(
+      138, rec, "b".repeat(40), { source: "record", repo: "owner/repo" },
+      false, null, null, null, null, true
+    );
+    equal(r.status, "block");
+    equal((r as any).reasonTag, "head_advanced", `record ${JSON.stringify(rec.diff_sha256)} keeps head_advanced`);
+  }
+});
+
+test("the live-diff read bound outlasts the shared gh gate's queue", () => {
+  // The 60s constant was SHORTER than the fleet's gh slot-acquire budget, so the
+  // read was killed while merely queueing. The bound is now derived from that
+  // budget (env-overridable), and it may never fall back to a sub-minute value.
+  const prevT = process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS;
+  const prevA = process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT;
+  try {
+    delete process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS;
+    delete process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT;
+    equal(diffHashReadTimeoutMs(), 600_000, "default = the same 10-minute budget the HEAD read already waits under");
+    process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT = "600";
+    equal(diffHashReadTimeoutMs(), 720_000, "a longer acquire window lengthens the read bound with it");
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "90000";
+    equal(diffHashReadTimeoutMs(), 90_000, "the explicit override wins");
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "0";
+    equal(diffHashReadTimeoutMs(), 720_000, "a non-positive override is ignored, never a zero bound");
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "nope";
+    equal(diffHashReadTimeoutMs(), 720_000, "an unparseable override is ignored too");
+    // ⛔ `parseInt` ACCEPTS A PREFIX, so `10m` used to yield TEN MILLISECONDS — the
+    // killed-while-queueing read this function exists to prevent, reintroduced by a
+    // config value with no warning (review, #2353 P2). A value below the floor is
+    // ignored outside test, and a non-integer spelling is not a number at all.
+    process.env.NODE_ENV = "production";
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "10m";
+    equal(diffHashReadTimeoutMs(), 720_000, "an SI-suffixed spelling is not silently read as 10ms");
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "1000";
+    equal(diffHashReadTimeoutMs(), 720_000, "a sub-floor override is refused in production (not trusted)");
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "90000";
+    equal(diffHashReadTimeoutMs(), 90_000, "…while a legitimate override above the floor is honoured");
+    process.env.NODE_ENV = "test";
+    process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "500";
+    equal(diffHashReadTimeoutMs(), 500, "…and under test a short bound is honoured, so the knob stays testable");
+  } finally {
+    if (prevT === undefined) delete process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS;
+    else process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = prevT;
+    if (prevA === undefined) delete process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT;
+    else process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT = prevA;
+  }
+});
+
+// ── #1351: MUTATION PINS ─────────────────────────────────────────────────
+// The negative tests above only protect the arm if they FAIL when the arm is
+// weakened. That is a property of the SUITE, not of the code, so it is proven by
+// running the suite's own expectations against a mutated copy of the module:
+// every mutant below must make an expectation the shipped module satisfies go
+// RED. A mutation that goes undetected is a hole in this suite, not in the mutant.
+//
+// Each mutant gets its own temp tree because the module resolves its helper from
+// its own location (`<dir>/../../scripts/record-review.sh`) and imports its
+// shared modules relatively; node_modules is symlinked so the pi SDK resolves.
+const MUT_ROOT_PARENT = fs.mkdtempSync(resolvePath(os.tmpdir(), "rev-enf-mut-"));
+process.on("exit", () => {
+  try {
+    fs.rmSync(MUT_ROOT_PARENT, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+});
+
+function buildMutantTree(name: string, mutate: ((src: string) => string) | null): { dir: string; driver: string } {
+  const dir = resolvePath(MUT_ROOT_PARENT, name);
+  fs.mkdirSync(resolvePath(dir, "extensions", "review-enforcer"), { recursive: true });
+  // The shared modules are copied whole: index.ts imports four of them and the
+  // list may grow. `extensions/shared` has no node_modules of its own.
+  fs.cpSync(resolvePath(EXTENSION_DIR, "..", "shared"), resolvePath(dir, "extensions", "shared"), {
+    recursive: true,
+    filter: (src) => !src.includes(`${resolvePath(EXTENSION_DIR, "..", "shared")}/node_modules`),
+  });
+  const real = resolvePath(EXTENSION_DIR, "index.ts");
+  const src = fs.readFileSync(real, "utf8");
+  const out = mutate ? mutate(src) : src;
+  if (mutate) equal(out === src, false, `mutant ${name} must actually change the source`);
+  fs.writeFileSync(resolvePath(dir, "extensions", "review-enforcer", "index.ts"), out);
+  fs.writeFileSync(resolvePath(dir, "extensions", "review-enforcer", "package.json"),
+    JSON.stringify({ name: "review-enforcer", private: true, type: "module" }));
+  // The SDK must resolve from the temp tree; nothing else in the tree needs it.
+  fs.symlinkSync(resolvePath(EXTENSION_DIR, "node_modules"), resolvePath(dir, "node_modules"), "dir");
+  return { dir, driver: resolvePath(dir, "driver.mts") };
+}
+
+/** Run the mutant driver and return its parsed assertions. `null` means the
+ *  driver could not even load (a syntax-broken mutant is a test bug, not a
+ *  caught mutation), so the caller fails loudly instead of crediting a refusal. */
+function runDriver(tree: { dir: string; driver: string }): any {
+  const out = execFileSync("npx", ["tsx", tree.driver], {
+    cwd: tree.dir,
+    encoding: "utf8",
+    timeout: 180_000,
+    env: { ...process.env, NODE_ENV: "test" },
+  });
+  const line = out.split("\n").filter((l) => l.trim().startsWith("{")).pop();
+  return line ? JSON.parse(line) : null;
+}
+
+// The driver asserts the three load-bearing expectations and prints them. Run
+// against the SHIPPED module first, so the same driver is proven able to pass:
+// a mutant is only "caught" if the mutation flips a PASS into a FAIL.
+const DIFF_DRIVER_SRC = `
+process.env.NODE_ENV = "test";
+const m = await import("./extensions/review-enforcer/index.ts");
+const A = "1".repeat(64), B = "2".repeat(64);
+const rec = { pr: 138, head_sha: "a".repeat(40), verdict: "clean", diff_sha256: A };
+const ctx = { source: "record", repo: "owner/repo" };
+const stale = "b".repeat(40);
+const out = {
+  // (a) base-only move, diff unchanged -> CARRY
+  a: m.evaluateMergeGate(138, rec, stale, ctx, false, null, A).status,
+  // (b) a NEW commit touching code -> refused, head binding applies
+  b: m.evaluateMergeGate(138, rec, stale, ctx, false, null, B).status,
+  // (c) the diff could not be read at all -> refused, never a hash
+  c: m.evaluateMergeGate(138, rec, stale, ctx, false, null, null, null, null, true).status,
+  // (c-legacy) a record with NO digest beside a stale head -> refused
+  d: m.evaluateMergeGate(138, { ...rec, diff_sha256: undefined }, stale, ctx, false, null, A).status,
+};
+console.log(JSON.stringify(out));
+`;
+
+test("(control) the driver PASSES against the shipped module — so a mutant CAN be caught", () => {
+  const tree = buildMutantTree("control", null);
+  fs.writeFileSync(tree.driver, DIFF_DRIVER_SRC);
+  const got = runDriver(tree);
+  ok(got !== null, "the driver emitted a verdict object");
+  equal(got.a, "allow", "(a) a base-only move with an unchanged diff carries");
+  equal(got.b, "block", "(b) a changed diff is refused");
+  equal(got.c, "block", "(c) an unreadable diff is refused");
+  equal(got.d, "block", "(c-legacy) a digest-less record beside a stale head is refused");
+});
+
+test("MUTANT 1 (the identity comparison dropped) is CAUGHT by (b)", () => {
+  // The defect the arm exists to prevent: two digests that merely both LOOK like
+  // digests are treated as equal, so a brand-new commit on the branch rides the
+  // old verdict. (a) still carries — the mutant is narrow, which is what makes it
+  // a mutation and not a rewrite.
+  const tree = buildMutantTree("m1", (src) =>
+    src.replace(
+      "    isDiffSha256(record.diff_sha256) &&\n    isDiffSha256(currentDiffHash) &&\n    record.diff_sha256 === currentDiffHash",
+      "    isDiffSha256(record.diff_sha256) &&\n    isDiffSha256(currentDiffHash)"
+    )
+  );
+  fs.writeFileSync(tree.driver, DIFF_DRIVER_SRC);
+  const got = runDriver(tree);
+  ok(got !== null, "the mutant loaded");
+  equal(got.b, "allow", "the mutant DOES let a changed diff through — so (b) is load-bearing");
+  equal(got.d, "block", "…while a digest-less record is still refused (the mutant is narrow)");
+});
+
+test("MUTANT 2 (absence is identity) is CAUGHT by (c-legacy)", () => {
+  // The subtler weakening: keep the equality but stop requiring the RECORD side to
+  // be a usable digest, so a legacy/degraded record matches by coalescing its
+  // (absent) value onto the live one — how "we could not read it" becomes
+  // "it matched".
+  const tree = buildMutantTree("m2", (src) =>
+    src.replace(
+      "    isDiffSha256(record.diff_sha256) &&\n    isDiffSha256(currentDiffHash) &&\n    record.diff_sha256 === currentDiffHash",
+      "    isDiffSha256(currentDiffHash) &&\n    (record.diff_sha256 ?? currentDiffHash) === currentDiffHash"
+    )
+  );
+  fs.writeFileSync(tree.driver, DIFF_DRIVER_SRC);
+  const got = runDriver(tree);
+  ok(got !== null, "the mutant loaded");
+  equal(got.d, "allow", "the mutant DOES carry a digest-less record — so (c-legacy) is load-bearing");
+  equal(got.b, "block", "…while a genuinely different diff is still refused (the mutant is narrow)");
+});
+
+test("MUTANT 3 (a FAILED read counted as a match) is CAUGHT by (c)", () => {
+  // The mutation a lane would write to make the retry pain go away: `null` (the
+  // fail-closed signal) coalesced onto the record's own digest, so "we could not
+  // read the diff" reads as "the diff is unchanged". TWO edits, because a mutant
+  // that lets null reach the carry MESSAGE crashes — a crashing mutant would be
+  // caught by the TypeError rather than by this suite, and would prove nothing.
+  const tree = buildMutantTree("m3", (src) =>
+    src
+      .replace(
+        "    isDiffSha256(currentDiffHash) &&\n    record.diff_sha256 === currentDiffHash",
+        "    (currentDiffHash ?? record.diff_sha256) === record.diff_sha256"
+      )
+      .replace(
+        "but the reviewed DIFF is unchanged — diff_sha256 ${currentDiffHash.slice(0, 12)}",
+        "but the reviewed DIFF is unchanged — diff_sha256 ${String(currentDiffHash).slice(0, 12)}"
+      )
+  );
+  fs.writeFileSync(tree.driver, DIFF_DRIVER_SRC);
+  const got = runDriver(tree);
+  ok(got !== null, "the mutant loaded");
+  equal(got.c, "allow", "the mutant DOES accept an unreadable diff — so (c) is load-bearing");
+  equal(got.b, "block", "…while a readable-but-different diff is still refused (the mutant is narrow)");
+  equal(got.d, "block", "…and a digest-less record is still refused");
+});
+
+test("the read bound is APPLIED to the child, not merely computed", () => {
+  // The knob test above pins the arithmetic; this pins that the arithmetic is the
+  // one the child actually runs under. A 2s helper with a 0.5s bound must come
+  // back null (the fail-closed signal), and the same helper with room must return
+  // the digest — i.e. the bound is what killed the read, exactly as it did on the
+  // fleet while the read was a 60s constant.
+  const tree = buildMutantTree("timeout", null);
+  fs.mkdirSync(resolvePath(tree.dir, "scripts"), { recursive: true });
+  const helper = resolvePath(tree.dir, "scripts", "record-review.sh");
+  fs.writeFileSync(helper, `#!/usr/bin/env bash\nsleep 2\nprintf 'ok\\t%s\\n' "${DIFF_A}"\n`);
+  fs.writeFileSync(tree.driver, `
+process.env.NODE_ENV = "test";
+const m = await import("./extensions/review-enforcer/index.ts");
+const ctx = { source: "record", repo: "owner/repo" };
+process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "500";
+const killed = m.getPrLiveDiffHash(138, ctx);
+process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS = "20000";
+const read = m.getPrLiveDiffHash(138, ctx);
+console.log(JSON.stringify({ killed, read }));
+`);
+  const got = runDriver(tree);
+  ok(got !== null, "the driver emitted a verdict object");
+  equal(got.killed, null, "a read that outlives its bound yields NULL (never a digest)");
+  equal(got.read, DIFF_A, "…and the SAME read with room yields the digest (the bound is the only difference)");
 });
 
 // ── #1348: the clean-low verdict (C7 head binding + C8 content binding) ──
@@ -7605,13 +7918,21 @@ test("#2349 evidence gate — its four block states print four DISTINCT lines (t
   ok(!noEvidence.reason.includes("STATE: no resolvable PR number"), "a resolved PR is never reported as unresolvable");
 });
 
-// ── The dispatch floor: says it read a DISPATCH COUNT, not a review ──
-test("#2349 dispatch floor — the refusal says it counts DISPATCHES and reads NO record", () => {
+// ── The dispatch floor: says WHAT IT READ (a head-bound record AND a dispatch count) ──
+// Before #2287 the floor read only a dispatch count and both messages said so. #2287 gave it a
+// head-bound-record path, which made "reads NO review record" FALSE — and left each message
+// CONTRADICTING its own spawn-path paragraph (fresh review round 5, P1; invisible to every test,
+// because the old pin asserted the stale sentence). The pin is now the TRUE disclosure.
+test("#2349 dispatch floor — the refusal says it read a head-bound record AND a dispatch count", () => {
   const staticText = BLOCK_MESSAGE + MICRO_BLOCK_MESSAGE;
   ok(staticText.includes("WHAT THIS GATE READ"), "both dispatch-floor messages disclose what they read");
-  ok(staticText.includes("reads NO review record"), "…and that no record is read at all");
+  ok(staticText.includes("head-bound review record"), "…and that the record path IS consulted (post-#2287 truth)");
   ok(staticText.includes("PER-MACHINE"), "…and that the registry is per-machine");
   ok(staticText.includes("IN THIS SESSION"), "…and what the lane's next action is");
+  // Anti-regression: the pre-#2287 claim must not come back. It is false now that
+  // resolveShippedHeads consults a record, and it flatly contradicted the spawn-path paragraph.
+  ok(!/reads NO review record/.test(staticText), "must NOT claim no record is read (#2287 made that false)");
+  ok(!/A record would not\s+satisfy this floor in any case/.test(staticText), "must NOT deny the record path it documents");
   const noPr = describeDispatchFloorRead("git commit -m x", "standard", 0);
   ok(noPr.recordState.startsWith("no-pr-named"), "a command naming no PR is diagnosed as such");
   ok(noPr.lines.join("\n").includes("= 0"), "prints the count it read (0)");
@@ -8233,6 +8554,82 @@ testAsync("#spawngate 4/4 — ZERO attempts is still the lane's fault: the never
       }
     });
   });
+});
+
+// ── #1382 — a COMPOUND frame can carry a heredoc body to a program ────────
+// The masker's proof ("this body is stdin DATA") is scoped to the opener's OWN consumer. A compound
+// changes where that consumer's STDOUT goes, so `… fi | bash` executes a body the masker blanked,
+// and the gate — reading masked text — returned before any check. Measured at the pre-fix head:
+// isGitOp(raw) true, isGitOp(maskHeredocData(raw)) false, for every shape below (each run through a
+// real `bash`, which printed its marker). These are EXECUTIONS, not mentions.
+test("#1382 (i): a KEYWORD compound carries a body to a runner (if/for/while/case)", () => {
+  const MERGE = "gh pr merge 999 --admin";
+  const executed: ReadonlyArray<readonly [string, string]> = [
+    ["if/fi + pipe", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | bash`],
+    ["if/fi + store", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi > /tmp/p.sh\nbash /tmp/p.sh`],
+    ["for/done + pipe", `for x in 1; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone | bash`],
+    ["while/done + pipe", `while true; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone | bash`],
+    ["until/done + pipe", `until false; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone | bash`],
+    ["case/esac + pipe", `case x in\nx)\ncat <<'EOF'\n${MERGE}\nEOF\n:\n;;\nesac | bash`],
+    ["nested if+for + pipe", `if true; then\nfor x in 1; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone\nfi | bash`],
+    ["for/done + store then bash", `for x in 1; do\ncat <<'EOF'\n${MERGE}\nEOF\n:\ndone > /tmp/p.sh\nbash /tmp/p.sh`],
+    ["brace frame + pipe", `{\ncat <<'EOF'\n${MERGE}\nEOF\n:; } | bash`],
+  ];
+  for (const [label, command] of executed) {
+    ok(isGitOp(maskHeredocData(command)),
+      `${label}: a compound carries the body to a runner, so the merge must stay VISIBLE`);
+    ok(isAdminMergeCommand(maskHeredocData(command)),
+      `${label}: and it must still classify as an ADMIN merge, not merely a git op`);
+  }
+  // A construct that CLOSES before the opener line does not enclose it, so the body is data again —
+  // the guard must not fire on an `if` that already ended.
+  // The `| bash` is deliberately PRESENT here and deliberately unrelated: the heredoc sits in no
+  // open frame (the `if` closed on the line above), so the body cannot reach that pipe. A frame
+  // test that merely saw the word `if` in the prefix would unmask it — this is what pins the STACK.
+  ok(!isGitOp(maskHeredocData(`if true; then\ntrue\nfi\ncat <<'EOF'\n${MERGE}\nEOF\necho ok | bash`)),
+    "an `if` closed before the opener line is not an enclosing construct");
+  // And the reported false positive is still masked: a LONE writer inside no frame is untouched.
+  ok(!isGitOp(maskHeredocData(`cat >> /tmp/evidence.md <<'EOF'\n${MERGE}\n${MERGE}\nEOF\nwc -l /tmp/evidence.md`)),
+    "the reported prose shape is still DATA, so the guard did not bring the false positive back");
+});
+
+// The seven shapes a fresh review measured PAST the first version of this guard. Each was an
+// EXECUTION with the gate silent (a real `bash` printed a marker; `isGitOp(raw)` true,
+// `isGitOp(maskHeredocData(raw))` false). They are the reason the guard now refuses to mask ANY
+// body inside a frame instead of testing whether that frame's stdout reaches a program: enumerating
+// frame spellings × sink routes is a shell parser, and this file has recorded that it cannot
+// enumerate that class. Every one of these must now keep the merge VISIBLE.
+test("#1382 (i2): the frame guard cannot be walked past by a spelling it does not model", () => {
+  const MERGE = "gh pr merge 999 --admin";
+  const walkedPast: ReadonlyArray<readonly [string, string]> = [
+    // A prose `fi`/`}`/`)`/`esac` inside an EARLIER heredoc body popped the frame, so the next
+    // opener read as "no frame". Both a keyword frame and a subshell are pinned.
+    ["prose `fi` in an earlier body", `if true; then\ncat <<'A' > /tmp/notes.md\nfi\nA\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | bash`],
+    ["prose `)` in an earlier body", `(\ncat <<'A' > /tmp/notes.md\n)\nA\ncat <<'EOF'\n${MERGE}\nEOF\n:\n) | bash`],
+    // POSIX: a linebreak may follow `|`, so this is ONE pipeline — the pipe arm read it per line.
+    ["pipe then newline", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi |\nbash`],
+    // The write and the run share a line, so a "later lines" scan never saw the run.
+    ["same-line redirect then run", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi > /tmp/p_e.sh; bash /tmp/p_e.sh`],
+    ["same-line tee then run", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | tee /tmp/p_f.sh; bash /tmp/p_f.sh`],
+    // The sink is on a line BEFORE the opener (process substitution), so a from-the-opener scan missed it.
+    ["process substitution before the opener", `bash <(if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi)`],
+    // The program is a VARIABLE, so no vocabulary of program names can see it.
+    ["variable program", `if true; then\ncat <<'EOF'\n${MERGE}\nEOF\n:\nfi | $SHELL`],
+  ];
+  for (const [label, command] of walkedPast) {
+    ok(isGitOp(maskHeredocData(command)),
+      `${label}: the body reaches a program, so the merge must stay VISIBLE`);
+    ok(isAdminMergeCommand(maskHeredocData(command)),
+      `${label}: and it must still classify as an ADMIN merge`);
+  }
+  // ⛔ THE STATED COST, PINNED SO IT CANNOT DRIFT SILENTLY: a heredoc that IS data, written INSIDE a
+  // frame, is NO LONGER masked — a framed report quoting the verb is refused again. This is a false
+  // POSITIVE and it is the direction this file is allowed to be wrong in; the alternative measured
+  // above is a silent admin merge. Pinned as behaviour, so relaxing it requires changing this test.
+  // The body is genuinely DATA and its PROSE quotes the verb and a pipe — at origin/main this was
+  // MASKED (no false positive); it is refused now, and that is the price of closing the fail-opens.
+  ok(isGitOp(maskHeredocData(`if true; then\ncat >> /tmp/notes.md <<'EOF'\nBoth landed: ${MERGE}\nthe old flow was cat x.sh | bash\nEOF\nfi\nwc -l /tmp/notes.md`)),
+    "a framed DATA writer is NOT masked — the declared over-block, for a silent admin merge avoided");
 });
 
 // ── Summary ───────────────────────────────────────────

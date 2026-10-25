@@ -35,11 +35,20 @@ Environment=BOUNDED_LIB={{BOUNDED_LIB}}
 Environment=CACHE_REAPER={{REAPER_DIR}}/pi-cache-reap.sh
 Environment=VENV_REAPER={{REAPER_DIR}}/reap-lane-venvs.sh
 Environment=WORKTREE_REAPER={{REAPER_DIR}}/pi-reap-worktrees.sh
-# The worktree owner must ask GitHub which PRs are open before it may delete anything. A busy cell
-# shares one account with every other box, so the harness gh shim backs off; this timeout is above
-# that backoff window. If it still cannot answer, the class FAILS CLOSED (a checkout with an open PR
-# is never guessed at) and the supervisor shows which class failed.
-Environment=REAP_WT_GH_TIMEOUT=300
+# The scheduled entry point is disk-reaper-run.sh; pin what it execs, so the wrapper's own
+# location is never load-bearing (on the Darwin arm it runs under `bash -s`, where BASH_SOURCE
+# is unset and it could not resolve a sibling).
+Environment=DISK_REAPER={{REAPER_DIR}}/disk-reaper.sh
+# The worktree owner must ask GitHub which PRs are open before it may delete anything.
+# #2354: the scheduled pass queries the REAL gh (scripts/disk-reaper-run.sh), not the interactive
+# pacing shim, so this bound only has to cover a slow API — not the shim's shared-slot wait. If the
+# query still cannot answer, the class FAILS CLOSED (a checkout with an open PR is never guessed at)
+# and the supervisor shows which class failed.
+Environment=REAP_WT_GH_TIMEOUT=120
+# #2542: the two owners of the classes that actually filled the cells (abandoned /tmp worktrees, and
+# surplus copies of the same runner install). Pinned for the same reason as the three above.
+Environment=ABANDONED_WT_REAPER={{REAPER_DIR}}/reap-abandoned-worktrees.sh
+Environment=DUP_INSTALL_REAPER={{REAPER_DIR}}/reap-duplicate-installs.sh
 # Never compete with a lane for CPU or I/O: the pass is a background sweep, not a deadline.
 Nice=10
 IOSchedulingClass=idle

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off NO CI run site in either lane (pre-existing; tracked in agent-infra#2610) - wiring it is a coverage decision, not a side effect of a refactor
 # fleet-cost-report.test.sh — self-check for scripts/fleet-cost-report.sh
 # (#373). Synthetic fixtures, no real sessions. Run:
 #   bash scripts/fleet-cost-report.test.sh
