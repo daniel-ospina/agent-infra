@@ -5887,6 +5887,8 @@ PY
       # exits 3 on a deferral (after releasing the claims and dropping the rows); this reads it and
       # records `dispatched=0` with the gate named, which is the same fact its own log line states.
       _dmrc=0
+      # The recount below reads a file THIS call writes, so a stale one must not be mistaken for it.
+      rm -f "$O/.dispatched-ids" 2>/dev/null || true
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1 || _dmrc=$?
       if [ "$_dmrc" = "3" ]; then
         echo "[dispatch] ci-queue gate DEFERRED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
@@ -5903,6 +5905,30 @@ PY
         K=0; : > "$O/.batch"
         [ -n "${GATE_WHY:-}" ] || GATE_WHY="repo-target(refused: checkout is not the target)"
       fi
+      # [dmrecount:begin] (extracted and DRIVEN by repo-target.test.sh — keep the markers)
+      # ⛔ RECOUNT FROM WHAT ACTUALLY SPAWNED (#2762 review, 2nd cycle, P1). `K` counts CLAIMS, and a
+      # PER-ISSUE refusal (`continue` in dispatch-merge.sh) leaves the batch's exit status 0 — so a
+      # batch whose every lane was refused still printed `-> N dispatched` and recorded
+      # `dispatched=N … nothing=none`. That path is reachable in the field (the branch assertion runs
+      # against a REUSED `.worktrees/tm-<N>`, e.g. one left on another named branch), and a wrong-repo
+      # pair never clears by waiting, so the record would be a permanent false PASS. dispatch-merge.sh
+      # publishes the ids that reached a spawn; the cycle's count and ids come from that, not claims.
+      if [ "$_dmrc" != "3" ] && [ "$_dmrc" != "72" ] && [ -f "$O/.dispatched-ids" ]; then
+        _dm_spawned="$(sed '/^$/d' "$O/.dispatched-ids" 2>/dev/null || true)"
+        _dm_n="$(printf '%s\n' "$_dm_spawned" | sed '/^$/d' | wc -l | tr -d ' ')"
+        is_num "${_dm_n:-}" || _dm_n=0
+        if [ "$_dm_n" -ne "$K" ]; then
+          echo "[dispatch] repo-target gate REFUSED $((K - _dm_n)) of $K issue(s) per-lane — only the $_dm_n that reached a spawn are counted" >> "$LOG"
+          K="$_dm_n"
+          if [ "$K" -gt 0 ]; then
+            printf '%s\n' "$_dm_spawned" > "$O/.batch"
+          else
+            : > "$O/.batch"
+            [ -n "${GATE_WHY:-}" ] || GATE_WHY="repo-target(refused per-lane: worktree is not the target)"
+          fi
+        fi
+      fi
+      # [dmrecount:end]
       # …and the deferral's reason rides the SAME funnel line (#2333 cycle 6 review, P2): arg 3 was
       # `""` while `GATE_WHY` had just been set, so the cycle's one `-> 0 dispatched` line dropped the
       # `held:` clause and the reason survived only in the cycle record and a separate log line — the

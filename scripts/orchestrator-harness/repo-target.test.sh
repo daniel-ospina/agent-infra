@@ -304,6 +304,36 @@ O="$DMO4" bash "$DM" "$TT" "" 5008 > "$T/dm4.out" 2>&1
 d4=$?
 { [ "$d4" -eq 72 ] && [ -f "$DMO4/dispatched.txt" ] && ! grep -qx '5008' "$DMO4/dispatched.txt"; }; ck "D4 no-target refusal drops the row too" $?
 
+# ⛔ A PER-ISSUE REFUSAL IS NOT A DISPATCH EITHER (#2762 review, 2nd cycle, P1). The batch-level
+# assertion exits 72, but the branch half runs per ISSUE and can refuse a REUSED worktree (the lane
+# was left on another named branch) — then the loop `continue`s and the script exits 0 with `K` still
+# counting the claim. `dispatch-merge.sh` publishes what reached a spawn; the controller recounts.
+DMO5="$T/o-dm5"; mkdir -p "$DMO5/logs" "$DMO5/state"; printf '6001\n' > "$DMO5/dispatched.txt"
+# the CI-queue gate must ALLOW this batch, or the deferral (rc 3) exits before the per-issue arm.
+printf '%s\n' 'ciq_read() { return 0; }' 'ciq_eval() { return 0; }' 'ciq_defer_note_here() { return 0; }' \
+  'ciq_ci_allowed() { return 0; }' 'ciq_verdict() { return 0; }' 'ciq_is_count() { return 0; }' \
+  'ciq_ceiling() { return 0; }' 'ciq_defer_line() { return 0; }' 'ciq_horizon_min() { return 0; }' \
+  'ciq_job_p90_min() { return 0; }' > "$DMO5/ci-queue.sh"
+$REAL_GIT -C "$TT" worktree add -q "$TT/.worktrees/tm-6001" -b d5-other 2>/dev/null || true
+O="$DMO5" bash "$DM" "$TT" daniel-ospina/tortoise 6001 > "$T/dm5.out" 2>&1
+d5=$?
+{ [ "$d5" -eq 0 ] && grep -q 'REFUSED (branch assertion)' "$T/dm5.out" \
+    && [ -f "$DMO5/.dispatched-ids" ] && [ ! -s "$DMO5/.dispatched-ids" ] \
+    && ! grep -qx '6001' "$DMO5/dispatched.txt"; }; ck "D5 per-issue branch refusal -> exit 0 BUT .dispatched-ids is EMPTY and the row dropped (rc=$d5)" $?
+# ...and the controller's recount, extracted from orch-loop.sh and driven through both shapes.
+sed -n '/# \[dmrecount:begin\]/,/# \[dmrecount:end\]/p' "$HERE/orch-loop.sh" | sed '1d;$d' > "$T/dmrecount.sh"
+sed -n '/^is_num() {/p' "$HERE/orch-loop.sh" > "$T/isnum.sh"
+[ -s "$T/dmrecount.sh" ] && grep -q 'dispatched-ids' "$T/dmrecount.sh"
+ck "D6 the controller's recount block is extractable from orch-loop.sh" $?
+RC_O="$T/o-rc"; mkdir -p "$RC_O"; : > "$RC_O/.batch"; printf '6002\n' >> "$RC_O/.batch"; : > "$RC_O/.dispatched-ids"
+( LOG="$T/rc0.log"; : > "$LOG"; O="$RC_O"; K=1; _dmrc=0; . "$T/isnum.sh"; . "$T/dmrecount.sh"; \
+    printf 'K=%s batch=[%s] gate=[%s]\n' "$K" "$(tr '\n' ' ' < "$RC_O/.batch")" "${GATE_WHY:-}" ) > "$T/rc0.out" 2>&1
+{ grep -q 'K=0 batch=\[\] gate=\[repo-target' "$T/rc0.out"; }; ck "D6 zero-spawn batch -> K=0, .batch cleared, GATE_WHY names repo-target (a false PASS cannot be recorded)" $?
+RC_O2="$T/o-rc2"; mkdir -p "$RC_O2"; printf '6003\n6004\n' > "$RC_O2/.batch"; printf '6003\n' > "$RC_O2/.dispatched-ids"
+( LOG="$T/rc1.log"; : > "$LOG"; O="$RC_O2"; K=2; _dmrc=0; . "$T/isnum.sh"; . "$T/dmrecount.sh"; \
+    printf 'K=%s batch=[%s]\n' "$K" "$(tr '\n' ' ' < "$RC_O2/.batch")" ) > "$T/rc1.out" 2>&1
+{ grep -q 'K=1 batch=\[6003 \]' "$T/rc1.out"; }; ck "D6 partial batch -> K counts only the lanes that reached a spawn (2 -> 1) and .batch is pruned" $?
+
 # ═══ F. the module is REQUIRED in every caller (T9) ═════════════════════════════════════════════
 echo
 echo "── F. a deployed box without repo-target.sh must REFUSE (exit 78), never silently skip ──"

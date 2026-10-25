@@ -592,9 +592,13 @@ echo "  -- (3c2) the refund PRODUCER (fix-one.sh) writes the marker the controll
 rm -rf "$TMP/gO"; mkdir -p "$TMP/gO/state"
 printf '2\n' > "$TMP/gO/state/fixcount-4242"
 : > "$TMP/gO/log"
+# ⛔ THE FRAGMENT IS THE FUNCTION ITSELF (agent-infra#2762 review, 2nd cycle, P2): fix-one.sh now
+# defines `refund_gate_attempt` so the repo-identity refusals — which exit BEFORE any agent could be
+# booked — reuse the SAME refund instead of a second copy. Sourcing defines it; the call below is the
+# entry point the two production paths use.
 (
   PR=4242; HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; O="$TMP/gO"; L="$TMP/gO/log"; CTRL=1
-  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"
+  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"; refund_gate_attempt
 ) >/dev/null 2>&1
 [ -f "$TMP/gO/state/fixgate-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ] \
   && ok "(3c2) a gate refusal writes fixgate-<PR>-<HEAD> (the marker the controller refunds on)" \
@@ -604,7 +608,7 @@ printf '2\n' > "$TMP/gO/state/fixcount-4242"
   || bad "(3c2) fixcount=[$(cat "$TMP/gO/state/fixcount-4242" 2>/dev/null)] — the refund block is not wired"
 rm -rf "$TMP/gO2"; mkdir -p "$TMP/gO2/state"; printf '2\n' > "$TMP/gO2/state/fixcount-4242"
 ( PR=4242; HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; O="$TMP/gO2"; L="$TMP/gO2/log"; CTRL=0
-  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh" ) >/dev/null 2>&1
+  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"; refund_gate_attempt ) >/dev/null 2>&1
 [ ! -f "$TMP/gO2/state/fixgate-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ] && [ "$(cat "$TMP/gO2/state/fixcount-4242")" = "2" ] \
   && ok "(3c2) a MANUAL run (CTRL=0) refunds nothing (it never booked an attempt)" \
   || bad "(3c2) a manual run refunded an attempt it never booked"

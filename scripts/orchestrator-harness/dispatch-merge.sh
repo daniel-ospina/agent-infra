@@ -73,11 +73,12 @@ release_issue_claim_unspawned() { # <issue>
 # says `dispatched=0`); the BATCH-level repo-target refusals must do the same, and do — every one of
 # them exits 72, which orch-loop.sh's `_dmrc` arm turns into `K=0` for the batch. One helper, used by
 # every refusal path, so no path can drop a claim and keep the row.
-#   ⚠️ SCOPE: a PER-ISSUE refusal (`continue`, below) still drops its row and releases its claim, but
-#   leaves this script's exit status 0 — the controller still counts that batch as dispatched. It is
-#   latent, not measured: after the batch-level assertion the worktree is created inside the asserted
-#   checkout, so the per-issue slug/dir half cannot fire today. Recorded here so the next refusal path
-#   added below reads the real invariant instead of "the funnel is fixed" (follow-up issue).
+#   ⚠️ SCOPE: a PER-ISSUE refusal (`continue`, below) used to leave this script's exit status 0 — the
+#   controller then counted a batch that started nothing as dispatched. It is not latent: the same arm
+#   gates on the BRANCH assertion, and a REUSED `.worktrees/tm-<N>` (checked out on another named
+#   branch, the `prfixup` shape) reaches it in the field. So the batch publishes what actually reached
+#   a spawn in `$O/.dispatched-ids`, and the controller recounts from that instead of from claims.
+SPAWNED_IDS=""
 drop_dispatched_rows() {
   local ids="" n tmp
   for n in "$@"; do case "${n:-}" in ''|*[!0-9]*) continue ;; esac; ids="$ids $n"; done
@@ -253,7 +254,12 @@ for N in "$@"; do
   LANE_BRANCH_LINE="$(repo_target_branch_assert "lane #$N" "$WT_ABS" "$BR" "$OR")"; LANE_BRANCH_RC=$?
   printf '%s\n%s\n' "$LANE_REPO_LINE" "$LANE_BRANCH_LINE" | tee -a "$O/logs/lane-$N.log"
   if [ "$LANE_REPO_RC" -ne 0 ] || [ "$LANE_BRANCH_RC" -ne 0 ]; then
-    echo "#$N: REFUSED — the worktree built for this lane is not $OR; no lane, no chain, claim released (#2724/#2694)"
+    # ⛔ NAME THE ASSERTION THAT REFUSED (#2762 review, 2nd cycle, P1): the reason token lives on the
+    # `[repo-target]` line above, and the human line claimed "the worktree is not $OR" even when the
+    # repo half PASSED and only the branch was wrong (a reused worktree on another named branch).
+    _refr="repo"
+    [ "$LANE_REPO_RC" -eq 0 ] && _refr="branch"
+    echo "#$N: REFUSED ($_refr assertion) — this lane's worktree/branch is not $OR; no lane, no chain, claim released (#2724/#2694)"
     release_issue_claim_unspawned "$N"
     drop_dispatched_rows "$N"
     continue
@@ -272,6 +278,7 @@ for N in "$@"; do
   _lan="$(wt_launcher)"
   _hd="${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   if wt_spawn "lane-$N" "$WT_ABS" "bash '$O/lane.sh' --repo-dir '$REPO_ABS' --repo '$OR' $N '$BR'"; then
+    SPAWNED_IDS="$SPAWNED_IDS $N"
     echo "#$N: lane-$N (implement+PR, launcher=$_lan)$_hd"
   else
     echo "#$N: lane-$N NOT spawned (launcher=$_lan)$_hd"
@@ -320,5 +327,11 @@ for N in "$@"; do
   fi
   sleep 30   # stagger uv sync
 done
+# ⛔ WHAT ACTUALLY REACHED A SPAWN, IN ONE FILE THE CONTROLLER READS (#2762 review, 2nd cycle, P1).
+# `K` in orch-loop.sh is incremented per CLAIM, so a batch whose every lane was refused per-issue was
+# still recorded as `dispatched=N … nothing=none` — a permanent false PASS (the pair does not clear by
+# waiting) and an unattended no-progress loop. Written on EVERY run, including zero, and the controller
+# recounts from it; the batch-level refusal exits 72 above, so it writes nothing and the rc arm governs.
+printf '%s\n' $SPAWNED_IDS | sed '/^$/d' > "$O/.dispatched-ids" 2>/dev/null || true
 echo "--- workers (launcher=$(wt_launcher)): $(wt_count lane- chain-) ---"
 uptime | sed 's/.*load/load/'
