@@ -7918,13 +7918,21 @@ test("#2349 evidence gate — its four block states print four DISTINCT lines (t
   ok(!noEvidence.reason.includes("STATE: no resolvable PR number"), "a resolved PR is never reported as unresolvable");
 });
 
-// ── The dispatch floor: says it read a DISPATCH COUNT, not a review ──
-test("#2349 dispatch floor — the refusal says it counts DISPATCHES and reads NO record", () => {
+// ── The dispatch floor: says WHAT IT READ (a head-bound record AND a dispatch count) ──
+// Before #2287 the floor read only a dispatch count and both messages said so. #2287 gave it a
+// head-bound-record path, which made "reads NO review record" FALSE — and left each message
+// CONTRADICTING its own spawn-path paragraph (fresh review round 5, P1; invisible to every test,
+// because the old pin asserted the stale sentence). The pin is now the TRUE disclosure.
+test("#2349 dispatch floor — the refusal says it read a head-bound record AND a dispatch count", () => {
   const staticText = BLOCK_MESSAGE + MICRO_BLOCK_MESSAGE;
   ok(staticText.includes("WHAT THIS GATE READ"), "both dispatch-floor messages disclose what they read");
-  ok(staticText.includes("reads NO review record"), "…and that no record is read at all");
+  ok(staticText.includes("head-bound review record"), "…and that the record path IS consulted (post-#2287 truth)");
   ok(staticText.includes("PER-MACHINE"), "…and that the registry is per-machine");
   ok(staticText.includes("IN THIS SESSION"), "…and what the lane's next action is");
+  // Anti-regression: the pre-#2287 claim must not come back. It is false now that
+  // resolveShippedHeads consults a record, and it flatly contradicted the spawn-path paragraph.
+  ok(!/reads NO review record/.test(staticText), "must NOT claim no record is read (#2287 made that false)");
+  ok(!/A record would not\s+satisfy this floor in any case/.test(staticText), "must NOT deny the record path it documents");
   const noPr = describeDispatchFloorRead("git commit -m x", "standard", 0);
   ok(noPr.recordState.startsWith("no-pr-named"), "a command naming no PR is diagnosed as such");
   ok(noPr.lines.join("\n").includes("= 0"), "prints the count it read (0)");
