@@ -1,0 +1,12 @@
+# The safe direction of the same shape: the same two apostrophes and the same mangling pressure, with
+# the non-cancelling pair. The triggers must survive here too, and the verdict is GREEN (#2660 round 12).
+name: push on flow apostrophes false
+on: {workflow_dispatch: {}, description: Don't ask, push: {branches: [main]}, description2: it's fine}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

@@ -1,0 +1,16 @@
+# The value on the NEXT line is a plain-scalar continuation — valid YAML, and the cancelling boolean
+# is what GitHub reads. Reading only the key's line left `cancel` absent, and absent is R2's SAFE
+# default, so a cancelling push workflow reported GREEN (#2660 round 4).
+name: Push cancel next line
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: push-cancel-nextline-${{ github.ref }}
+  cancel-in-progress:
+    true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

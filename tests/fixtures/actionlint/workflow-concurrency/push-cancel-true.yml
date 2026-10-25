@@ -1,0 +1,14 @@
+# FAILURE-CLASS FIXTURE (R2): cancels a DEFAULT-BRANCH run. A main-branch run that never produced a
+# verdict is a base-tree hole, and nothing re-creates it for that head.
+name: push-cancel-true
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: push-cancel-true
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

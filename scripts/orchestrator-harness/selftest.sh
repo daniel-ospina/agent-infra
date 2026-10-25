@@ -50,16 +50,52 @@ on_darwin() { [ "${PLATFORM:-}" = "Darwin" ]; }
 # need the real resolution build their own PATH explicitly (§17 daemon-PATH, §6c) and are unaffected.
 GSTUB="$TMP/stub-bin"; mkdir -p "$GSTUB"
 printf '#!/bin/bash\n[ -n "${GH_HOME_RECORD:-}" ] && printf "%%s\\n" "$HOME" >> "$GH_HOME_RECORD"\nexit 0\n' > "$GSTUB/gh"; chmod +x "$GSTUB/gh"
-# ⛔ AND A `launchctl` STUB. install.sh READS the domain on every run (the closing banner) and
-# `--uninstall` removes the job — against the REAL launchd, from a sandbox $HOME whose rendered plist
-# carries the PRODUCTION label. Measured 2026-10-17: that removal resolves by label, so this self-test
-# booted the live controller out. Nothing here may reach the real launchd.
-# ⛔ AND IT MUST SPEAK launchd's OWN NOT-FOUND LANGUAGE (`Could not find service …`, exit != 0), not a
-# bare `exit 1`: `lc_probe` classifies a non-zero read with UNRECOGNISED output as UNKNOWN and the guard
-# then refuses, so a silent stub made every `install.sh --uninstall` here fail — and the failing check
-# was labelled "blocked by SCOPE=banana", pointing the next lane at config validation instead of a
-# fixture (review finding: a registered shard went red). Real launchd prints exactly this line.
-printf '#!/bin/bash\nprintf "Bad request.\\nCould not find service in domain for user gui: 0\\n" >&2\nexit 1\n' > "$GSTUB/launchctl"; chmod +x "$GSTUB/launchctl"
+# ⛔ THE SANDBOX LABEL (agent-infra#1996). launchd labels are GLOBAL, so a plist rendered under a
+# throwaway $HOME still addresses the PRODUCTION job by name when it carries the production label —
+# addressing it writes a PERSISTENT Disabled override for the controller the box is actually running,
+# i.e. a "sandboxed" test can silence production. Every install.sh invocation in this file therefore
+# installs a TEST label (install.sh refuses a non-default label on a real $HOME), and every sandbox
+# plist below is addressed by $TPL, never by the production filename.
+PROD_LABEL="com.eldato.orchestrator-loop"
+# ⛔ BOTH PRODUCTION LABELS, not just the loop's (review catch, 2026-10-18). Disabling the production
+# WATCHDOG writes the same persistent override (PR #1986 ships it), and leaving it unguarded meant the
+# stated property ("no test can address production") was wider than the measured one.
+PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
+TEST_LABEL="$PROD_LABEL-test"
+TPL="$TEST_LABEL.plist"
+# ⛔ `LABEL_OVERRIDE`, NOT `LABEL` (review catch, 2026-10-18): install.sh assigns the production label
+# as a QUOTED LITERAL (scripts/test_pr_doctor.py pins that line), so an exported `LABEL` does not reach
+# it — the suite would render the production label into a sandbox $HOME and the label guard would
+# (correctly) refuse every install here.
+export LABEL_OVERRIDE="$TEST_LABEL"
+export PROD_LABEL PROD_WD_LABEL TEST_LABEL TPL
+
+# ⛔ AND A `launchctl` STUB, WHICH REFUSES THE PRODUCTION LABELS. install.sh READS the domain on every
+# run and `--uninstall` removes the job; against the REAL launchd, from a sandbox $HOME, that removal
+# resolved the PRODUCTION label and booted the live controller out (measured 2026-10-17). The stub is
+# first on PATH for the whole suite, records every invocation, and exits 97 when the call NAMES a
+# production label — asserted at the end of the run (§6g), so "no test addressed production" is
+# MEASURED, not assumed. The pattern excludes the test labels, which carry a `-` suffix
+# (`…-loop-test`).
+# ⛔ AND FOR EVERYTHING ELSE IT MUST SPEAK launchd's OWN NOT-FOUND LANGUAGE (`Could not find service …`,
+# exit != 0), not a bare `exit 1`: `lc_probe` classifies a non-zero read with UNRECOGNISED output as
+# UNKNOWN and the caller then refuses, so a silent stub made every `install.sh --uninstall` here fail —
+# and the failing check was labelled "blocked by SCOPE=banana", pointing the next lane at config
+# validation instead of at the fixture (review finding: a registered shard went red).
+LM_LOG="${LM_LOG:-$TMP/launchctl-calls.log}"
+export LM_LOG
+cat > "$GSTUB/launchctl" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "${LM_LOG:-/dev/null}"
+if [[ " $* " =~ (^|[^a-z-])com\.eldato\.orchestrator-loop([^a-z-]|$) ]] \
+   || [[ " $* " =~ (^|[^a-z-])com\.eldato\.orchestrator-watchdog([^a-z-]|$) ]]; then
+  printf 'REFUSED: a selftest tried to address a PRODUCTION launchd label: %s\n' "$*" >&2
+  exit 97
+fi
+printf 'Bad request.\nCould not find service in domain for user gui: 0\n' >&2
+exit 1
+SH
+chmod +x "$GSTUB/launchctl"
 PATH="$GSTUB:$PATH"; export PATH
 echo "==> offline self-test ($HERE)"
 
@@ -103,18 +139,20 @@ if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
-# Extracted from orch-loop.sh verbatim. The required set and the review-gate NAME are read from
-# the ENVIRONMENT by the shipped classifier (agent-infra#1764), so the driver supplies them the
-# same way the loop does — there is no bash-side $REQ splice to substitute any more.
+# ⛔ THE CLASSIFIER IS A FILE, NOT A HEREDOC ANY MORE (agent-infra#2719). It lived in orch-loop.sh as an
+# inline `python3 -c` string, and the NOCHECKS arm has to ask the SAME question on a re-read — two
+# copies of these rules is how the harness and the merge rail disagreed before (#1714). So the shipped
+# artifact IS `check-class.py`: a missing file is a hard FAIL here (never a silently empty classifier,
+# which would grade GREEN on an empty answer). The required set and the review-gate NAME are still read
+# from the ENVIRONMENT (agent-infra#1764), so the driver supplies them the same way the loop does.
 CL_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
 CL_GATE="ai-review-gate"
-awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+cat "$HERE/check-class.py" > "$TMP/classify.py" 2>/dev/null || : > "$TMP/classify.py"
 cl() { printf '%s' "$1" | REQ="$CL_REQ" REVIEW_GATE="$CL_GATE" python3 "$TMP/classify.py" 2>/dev/null; }
 # clreq <required-set> <payload> [<review-gate>] — the SAME shipped classifier against an
 # ARBITRARY repo's required set. Used by the repo-shape fixtures below, and by test-gates.sh.
 clreq() { printf '%s' "$2" | REQ="$1" REVIEW_GATE="${3:-ai-review-gate}" python3 "$TMP/classify.py" 2>/dev/null; }
-if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
+if need "$TMP/classify.py" "the classifier is the shipped check-class.py"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: ai-review-gate SKIPPED is not satisfied" $rc
@@ -290,7 +328,11 @@ fi
 # PR exists to close), and a backticked `gh pr checks` spliced a multi-line table into the Python
 # source (SyntaxError -> V="" -> no case arm matched). Extract the real assignment and drive it
 # through a logged `gh` shim so the shell, not an awk extraction, is what runs.
-awk '/^    V="\$\(gh pr checks/{f=1} f{print} /^" 2>\/dev\/null\)"$/{f=0}' "$LOOP" > "$TMP/classify_bash.sh"
+# ⛔ THE ASSIGNMENT IS ONE LINE NOW (agent-infra#2719): the Python moved to `check-class.py`, so the
+# heredoc's closing `" 2>/dev/null)"` terminator no longer exists — the old range-capture ran to the END
+# OF THE FILE (1547 lines measured) and the driver then aborted on `set -u` before printing `V`, which
+# made this whole block report a red it could not explain. Capture the ONE assignment line.
+grep -m1 '^    V="\$(gh pr checks' "$LOOP" > "$TMP/classify_bash.sh"
 if need "$TMP/classify_bash.sh" "the classifier's bash assignment is extracted from orch-loop.sh"; then
   mkdir -p "$TMP/bin"
   cat > "$TMP/bin/gh" <<'SH'
@@ -309,6 +351,9 @@ SH
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
     printf '%s\n' "REVIEW_GATE='ai-review-gate'"
+    # the pipeline's classifier path is resolved by the loop at startup; the driver supplies the
+    # SHIPPED file so the shell runs the real classifier, not a missing path.
+    printf '%s\n' "_CK_PY='$HERE/check-class.py'"
     cat "$TMP/classify_bash.sh"
     printf '%s\n' 'printf "V=%s\n" "$V"'
   } > "$TMP/drive.sh"
@@ -892,7 +937,7 @@ printf '#!/bin/bash\nexit 0\n' > "$SB/.local/share/pi-node/current/bin/pi"; chmo
 if on_darwin; then
 HOSTILE="$TMP/x<y>z"
 HOME="$SB" O="$HOSTILE" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst.out" 2>&1
-PL="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+PL="$SB/Library/LaunchAgents/$TPL"
 [ -f "$PL" ] && rc=0 || { rc=1; echo "      install.sh did not render a plist: $(tail -3 "$TMP/inst.out")"; }
 ck "install.sh renders a plist" $rc
 if [ -f "$PL" ]; then
@@ -938,7 +983,7 @@ ln -s "$HOME/.config/gh" "$SB2/.config/gh" 2>/dev/null || true
 mkdir -p "$SB2/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB2/.local/share/pi-node/current/bin/pi"; chmod +x "$SB2/.local/share/pi-node/current/bin/pi"
 HOME="$SB2" O="$TMP/fresh-o" REPO="$FR/repo" OR="acme/widget" bash "$INST" > "$TMP/inst-fresh.out" 2>&1
-PL2="$SB2/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+PL2="$SB2/Library/LaunchAgents/$TPL"
 [ -f "$PL2" ] && rc=0 || { rc=1; echo "      fresh checkout: $(tail -2 "$TMP/inst-fresh.out")"; }
 ck "install.sh renders a plist on a fresh checkout (no .worktrees dir yet)" $rc
 else
@@ -969,10 +1014,10 @@ for b in tmux gh pi jq; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
 # ⛔ AND THE STUB MUST STAY ON *EVERY* PATH THIS FILE HANDS THE INSTALLER (review finding, T5): this
 # line used to be PATH="$FB:/usr/bin:/bin", which DROPPED $GSTUB, so install.sh's post-install banner read
-# the REAL domain (`launchctl print gui/<uid>/com.eldato.orchestrator-loop`). Read-only that day — and one
-# added mutating call away from the 2026-10-17 incident this whole file guards against.
+# the REAL domain. Read-only that day — and one added mutating call away from the 2026-10-17 incident
+# this whole file guards against.
 HOME="$TMP/sb3" O="$TMP/path-o" REPO="$HERE/../.." OR="acme/widget" PATH="$FB:$GSTUB:/usr/bin:/bin" bash "$INST" > "$TMP/inst-path.out" 2>&1
-PL3="$TMP/sb3/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+PL3="$TMP/sb3/Library/LaunchAgents/$TPL"
 [ -f "$PL3" ] && rc=0 || { rc=1; echo "      controlled-PATH install did not render: $(tail -3 "$TMP/inst-path.out")"; }
 ck "install.sh renders with a controlled PATH (uv absent stays non-fatal)" $rc
 PLP="$(plutil -extract EnvironmentVariables.PATH raw "$PL3" 2>/dev/null || echo MISSING)"
@@ -1000,7 +1045,7 @@ printf '#!/bin/bash\nexit 0\n' > "$SB4/.local/share/pi-node/current/bin/pi"; chm
 ck "non-vacuity: the fresh sandbox HOME has no Library/LaunchAgents" $rc
 HOME="$SB4" O="$TMP/plistdir-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst-plistdir.out" 2>&1
 inst_rc=$?
-[ "$inst_rc" -eq 0 ] && [ -f "$SB4/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && rc=0 \
+[ "$inst_rc" -eq 0 ] && [ -f "$SB4/Library/LaunchAgents/$TPL" ] && rc=0 \
   || { rc=1; echo "      install.sh rc=$inst_rc did not create the plist dir: $(tail -3 "$TMP/inst-plistdir.out")"; }
 ck "install.sh creates the plist directory on a HOME that lacks it" $rc
 else
@@ -1688,7 +1733,14 @@ if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped merge-one.
   cat > "$TMP/ra.sh" <<SH
 pi() { sleep 60; }
 . "$TMP/runagent.sh"
-start=\$(date +%s); run_agent 2 "$TMP/ra.log" /dev/null; rc=\$?; end=\$(date +%s)
+# ⛔ THE PROMPT IS A REAL BRIEF, NOT /dev/null (agent-infra#2258). run_agent now refuses a brief with
+# no research contract (80) BEFORE it spawns, so this arm's `/dev/null` would make the shipped
+# run_agent return 80 without ever launching `pi` — and the assertion below ("it ran, and was cut off
+# at the wall limit") would fail for a reason that has nothing to do with the timeout it exists to
+# test. Rendering the canonical block keeps the fixture HONEST: the function under test still gets a
+# brief of the shape a real dispatch carries.
+brief_gate_sh="$HERE/brief-gate.sh"; bash "\$brief_gate_sh" --section reviewer > "$TMP/ra-brief.txt"
+start=\$(date +%s); run_agent 2 "$TMP/ra.log" "$TMP/ra-brief.txt"; rc=\$?; end=\$(date +%s)
 echo "\$((end-start)) \$rc"
 SH
   ra="$(bash "$TMP/ra.sh" 2>/dev/null | tail -1)"
@@ -1895,7 +1947,7 @@ ck "install.sh refuses it for the SCOPE reason, naming the accepted values" $rc
 # both greps above stay green while the pin silently evaporates at install time. Assert the value
 # that actually lands in the plist, through the real installer.
 if on_darwin; then
-PL2="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+PL2="$SB/Library/LaunchAgents/$TPL"
 render_scope() {   # $1 = a value, or the literal __UNSET__
   if [ "$1" = "__UNSET__" ]; then
     HOME="$SB" O="$TMP/sb-o" REPO="$HERE/../.." OR="acme/widget" env -u SCOPE bash "$INST" >/dev/null 2>&1
@@ -3174,12 +3226,12 @@ mk_sb() { local d; d="$(mktemp -d "$TMP/sbx.XXXXXX")"
   ln -s "$HOME/.config/gh" "$d/.config/gh" 2>/dev/null || true
   [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$d/.pi/agent/scripts/record-review.sh"
   printf '#!/bin/bash\nexit 0\n' > "$d/.local/share/pi-node/current/bin/pi"; chmod +x "$d/.local/share/pi-node/current/bin/pi"
-  printf 'SEED\n' > "$d/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+  printf 'SEED\n' > "$d/Library/LaunchAgents/$TPL"
   printf '%s' "$d"; }
 run_inst_at() { # <installer> <sandbox> [VAR=VAL…] -> "<rc>|<live-plist first line>|<stderr tail>"
   local i="$1" d="$2"; shift 2
   env HOME="$d" O="$TMP/glt-o" REPO="$HERE/../.." OR="acme/widget" "$@" bash "$i" >"$d/out" 2>&1
-  printf '%s|%s|%s' "$?" "$(head -1 "$d/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" 2>/dev/null)" "$(tail -1 "$d/out")"; }
+  printf '%s|%s|%s' "$?" "$(head -1 "$d/Library/LaunchAgents/$TPL" 2>/dev/null)" "$(tail -1 "$d/out")"; }
 run_inst() { run_inst_at "$INST" "$@"; }
 # Fields are "<rc>|<live-plist-first-line>|<stderr tail>" -- slice by FIELD, not by ${out#*|}.
 inst_rc()  { printf '%s' "$1" | cut -d'|' -f1; }
@@ -3334,7 +3386,7 @@ ck "a POST-render rejection leaves the live plist intact (the render is atomic)"
 SBG="$(mk_sb)"; out="$(run_inst "$SBG")"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      a clean render failed: '$out'"; }
 ck "install.sh still installs the happy path (the new guards do not refuse a legal config)" $rc
-SBPL="$SBG/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+SBPL="$SBG/Library/LaunchAgents/$TPL"
 grep -q '__[A-Z_]*__' "$SBPL" && rc=1 || rc=0
 ck "no unrendered token survives a successful render (driven through the real installer)" $rc
 plutil -lint "$SBPL" >/dev/null 2>&1 && rc=0 || rc=1
@@ -3342,6 +3394,85 @@ ck "the freshly rendered plist is valid XML" $rc
 else
   skipd "install.sh's render guards, DRIVEN (§6 follow-on) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
 fi
+
+# ── 6f) the sandbox LABEL seam (agent-infra#1996) ──────────────────────────────────────────────
+# launchd labels are GLOBAL: a plist rendered under a throwaway $HOME still addresses the PRODUCTION
+# job by name when it carries the production label, so a `launchctl bootout` addressed at a sandbox
+# plist reaches the controller the box is actually RUNNING — a "sandboxed" test can silence
+# production, and this suite's own `launchctl` stub would have answered for it. Two halves here: the
+# real installer driven under a TEST label, and `label_guard` driven in all four directions.
+# ⛔ THE OTHER TWO HALVES OF THIS SECTION ARE NOT RE-ASSERTED HERE, AND THAT IS DELIBERATE: the
+# `WorkingDirectory` property belongs to PR #2020 (main's measured answer is the install dir, not the
+# checkout — docs/ops/fleet-harness-baseline.md:162) and the watchdog — its plist, its decisions and
+# its disarm sentinel — belongs to PR #1986, which owns that agent. One implementation, one
+# description, one suite; a second copy here is how a fleet ends up with two disarm sentinels.
+WDSB=""
+if on_darwin; then
+WDSB="$(mk_sb)"
+out="$(run_inst "$WDSB")"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      install for §6f failed: '$out'"; }
+ck "§6f: install.sh installs cleanly under the sandbox label" $rc
+PLW="$WDSB/Library/LaunchAgents/$TPL"
+lbl="$(plutil -extract Label raw "$PLW" 2>/dev/null || echo MISSING)"
+[ "$lbl" = "$TEST_LABEL" ] && rc=0 || { rc=1; echo "      rendered Label='$lbl', wanted '$TEST_LABEL'"; }
+ck "§6f: the sandbox install carries the TEST label" $rc
+# ⛔ NOT `grep -F "$PROD_LABEL"`: the TEST label CONTAINS the production one as a substring
+# (`…-loop-test`), so a substring read would fail on a correctly-labelled plist — the arm would be red
+# for the wrong reason and would be "fixed" by weakening it. The production label only counts when it
+# is NOT followed by a `-suffix`.
+# ⛔ XML COMMENTS ARE STRIPPED FIRST. The templates DOCUMENT the production label in prose, and a
+# comment cannot address launchd — but a plain grep over the file reads it as a hit and the arm goes
+# red on a correctly-labelled plist. Only the EFFECTIVE plist counts.
+if sed '/<!--/,/-->/d' "$PLW" 2>/dev/null | grep -qE "$PROD_LABEL([^a-z-]|$)"; then rc=1; else rc=0; fi
+ck "§6f: ...and no sandbox plist names the PRODUCTION label anywhere" $rc
+else
+  skipd "§6f: the sandbox-label render — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
+
+# §6f (second half) drives `label_guard` as the PURE decision it is (label, HOME, real home), so the
+# rule is proven in BOTH directions without ever installing into the real LaunchAgents — a test that
+# reproduced the failure would be the failure. No launchd and no macOS: this runs everywhere.
+awk '/^label_guard\(\) \{/,/^}/' "$INST" > "$TMP/labelguard.sh"
+if need "$TMP/labelguard.sh" "§6f: extract label_guard from install.sh"; then
+  # shellcheck source=/dev/null
+  . "$TMP/labelguard.sh"
+  BASE_LABEL="$PROD_LABEL"
+  PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
+  # A "sandbox home" for the guard: a throwaway dir, NOT $WDSB — that one exists only on macOS, and
+  # the guard's rule must be provable on every host (`label_guard` never touches launchd).
+  LG_SB="$TMP/labelguard-sb"; mkdir -p "$LG_SB"
+  label_guard "$PROD_LABEL" "$HOME" "$HOME"; lg_prod=$?
+  label_guard "$TEST_LABEL" "$LG_SB" "$HOME"; lg_sbx=$?
+  lg_msg="$( label_guard "$TEST_LABEL" "$HOME" "$HOME" 2>&1 )"; lg_real=$?
+  [ "$lg_prod" = "0" ] && [ "$lg_sbx" = "0" ] && [ "$lg_real" = "1" ] && rc=0 \
+    || { rc=1; echo "      prod=$lg_prod sandbox=$lg_sbx real=$lg_real"; }
+  ck "§6f: the label guard allows production-on-real and test-in-sandbox, and REFUSES a test label on the real \$HOME" $rc
+  grep -q 'SANDBOX seam' <<<"$lg_msg" && rc=0 || { rc=1; echo "      refusal: $lg_msg"; }
+  ck "§6f: ...and the refusal names the seam" $rc
+  # ⛔ THE DIRECTION THAT ACTUALLY REACHES PRODUCTION (review catch, 2026-10-18): a PRODUCTION label
+  # rendered into a sandbox \$HOME. launchd resolves the label in the user domain and ignores \$HOME, so
+  # that plist addresses the live controller — the half-guard this replaces allowed exactly that.
+  # BOTH production labels: the loop's AND the watchdog's (a second production label the guard did not
+  # know about is installable from a sandbox — the same defect, one job over).
+  lg_msg2="$( label_guard "$PROD_LABEL" "$LG_SB" "$HOME" 2>&1 )"; lg_sbxprod=$?
+  lg_msg3="$( label_guard "$PROD_WD_LABEL" "$LG_SB" "$HOME" 2>&1 )"; lg_sbxprodwd=$?
+  [ "$lg_sbxprod" = "1" ] && [ "$lg_sbxprodwd" = "1" ] && rc=0 \
+    || { rc=1; echo "      production-labels-in-sandbox guard: loop=$lg_sbxprod watchdog=$lg_sbxprodwd"; }
+  ck "§6f: ...and it REFUSES a PRODUCTION label under a sandbox \$HOME (loop and watchdog labels)" $rc
+  grep -q 'PRODUCTION label' <<<"$lg_msg2" && grep -q 'IGNORES' <<<"$lg_msg2" && rc=0 || { rc=1; echo "      refusal: $lg_msg2"; }
+  ck "§6f: ...and THAT refusal explains why \$HOME does not protect anything (launchd ignores it)" $rc
+fi
+
+# ── 6g) NO TEST ADDRESSED PRODUCTION ─────────────────────────────────────────────────────────────
+# The PATH stub refuses a production label (exit 97) and records every call, so this is a measurement
+# over the WHOLE run, not a promise about one section: every install.sh invocation in this file goes
+# through the test label, and any call that named a live job would be listed here.
+if [ -f "$LM_LOG" ] && grep -qE "$PROD_LABEL([^a-z-]|$)|$PROD_WD_LABEL([^a-z-]|$)" "$LM_LOG"; then
+  rc=1; echo "      a selftest addressed a production label:"; grep -E "$PROD_LABEL([^a-z-]|$)|$PROD_WD_LABEL([^a-z-]|$)" "$LM_LOG" | head -3
+else
+  rc=0
+fi
+ck "§6g: NO launchd call in this run addressed a production label (loop AND watchdog; the sandbox label held)" $rc
 
 # ── 20) a TERM'd controller EXITS; the lock/claim is not released while it is still running ──
 # agent-infra#1715. The shipped trap was `trap 'rm -f "$LOCKF"' EXIT INT TERM`: for INT/TERM a
@@ -3610,6 +3741,17 @@ if [ -f "$HERE/refresh-scout.test.sh" ]; then
   fi
 else
   ck "refresh-scout.test.sh: the #1736 suite is present" 1
+fi
+
+if [ -f "$HERE/refresh-provision.test.sh" ]; then
+  if bash "$HERE/refresh-provision.test.sh" > "$TMP/refresh-provision.out" 2>&1; then
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 0
+  else
+    ck "refresh-provision.test.sh: a provision failure RECORDS its sub-step/rc/cause, a stale git lock is repaired by path (#2229)" 1
+    grep -E '❌|==>' "$TMP/refresh-provision.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "refresh-provision.test.sh: the #2229 suite is present" 1
 fi
 
 # #2229: ORIGINATION MUST FAIL LOUDLY. The refresh is backgrounded, so its failure is a log line — and

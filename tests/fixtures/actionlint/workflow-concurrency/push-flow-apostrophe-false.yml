@@ -1,0 +1,12 @@
+# The safe direction of the same shape: a plain flow scalar carrying an apostrophe, with the pair that
+# does NOT cancel. The apostrophe must not turn a compliant push workflow RED (#2660 round 11).
+name: push flow apostrophe false
+on:
+  push:
+    branches: [main]
+concurrency: {group: dont's-group, cancel-in-progress: false}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

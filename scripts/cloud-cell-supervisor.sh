@@ -187,10 +187,12 @@ SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$
 OR="${OR:-}"
 
 # ── the worker census (agent-infra#2210) ────────────────────────────────────────────────────────
-# ⛔ THE TMUX NAME MATCH IS DEAD ON A CELL. The harness spawns workers into cmux DURABLE TERMINALS
-# there (worker-terminal.sh's header records the measurement), so `tmux ls | grep -c '^lane-'` answers
-# 0 while lanes run — and this file used that answer to decide whether it may delete caches under a
-# live lane, and to report `lanes:` in `status`. Both read a confident 0 for a busy box.
+# ⛔ THE TMUX NAME MATCH IS DEAD WHERE THE CMUX DAEMON ANSWERS. There the harness spawns workers into
+# cmux DURABLE TERMINALS (worker-terminal.sh's header records the measurement), so
+# `tmux ls | grep -c '^lane-'` answers 0 while lanes run — and this file used that answer to decide
+# whether it may delete caches under a live lane, and to report `lanes:` in `status`. Both read a
+# confident 0 for a busy box. (tmux IS the launch surface where the daemon does NOT answer — on a
+# launchd Mac and on a cell alike, agent-infra#2210 — so the defect is the single surface, not tmux.)
 # The count comes from the launcher module's own census, and UNKNOWN (exit 3) is NOT zero: every
 # caller treats it as "workers may be live", which is the direction that cannot destroy a live lane.
 worker_census() { # stdout: the live worker count; exit 3 when no answer can be had
@@ -434,6 +436,12 @@ CONTROLLER_UNIT_IN="${CONTROLLER_UNIT:-}"
 SYSTEMCTL_IN="${SYSTEMCTL:-}"
 CONTROLLER_SYSTEM_UNIT_DIR_IN="${CONTROLLER_SYSTEM_UNIT_DIR:-}"
 CONTROLLER_USER_UNIT_DIR_IN="${CONTROLLER_USER_UNIT_DIR:-}"
+# ⛔ AND `PS_BIN` BELONGS TO THE FAMILY TOO (review P1 round 19, #2402 / B). It is read at CALL time by
+# `_proc_start_epoch`, and its answer (`_proc_began_after`) is what decides which pids `stop` may signal.
+# A pushed `PS_BIN` stub forges the age rule: a recycled pid that merely LOOKS like `<shell> <…/orch-loop.sh>`
+# is then classified as the lock owner and gets TERM/KILL — the peer-repo controller that rule exists to
+# protect. Absent a caller value the restored state is "unset" = the real `/bin/ps` default.
+PS_BIN_IN="${PS_BIN:-}"
 source_env_file
 ORCH_FOREGROUND="$ORCH_FOREGROUND_IN"
 ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
@@ -446,8 +454,17 @@ ORCH_AUTOMATED_RESTART="$ORCH_AUTOMATED_RESTART_IN"
 # exists to prevent, now reachable from keys.env instead of from the caller's shell.
 [ -z "$CONTROLLER_INVOKER_HOME_IN" ]     || CONTROLLER_INVOKER_HOME="$CONTROLLER_INVOKER_HOME_IN"
 SYSTEMCTL="$SYSTEMCTL_IN"
-[ -z "$CONTROLLER_SYSTEM_UNIT_DIR_IN" ]  || CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
-[ -z "$CONTROLLER_USER_UNIT_DIR_IN" ]    || CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+# ⛔ THESE TWO ARE RE-ASSERTED UNCONDITIONALLY, WHICH IS THE WHOLE POINT (review P1 round 19, #2402 / B).
+# The timeout siblings above use `[ -z "$_IN" ] ||` because an UNSET one legitimately comes from the env
+# file (tmux mode has no unit to provide it). A unit DIRECTORY has no such reading: its default is computed
+# downstream (`${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}`), so "unset" is the CORRECT restored
+# state, and the conditional form left the keys.env value in force — the fence was inert in production,
+# where the unit renders no such variable and every caller supplies nothing. Reproduced: a keys.env line
+# `CONTROLLER_SYSTEM_UNIT_DIR=/tmp/nowhere` hid the installed unit with 0 systemctl calls and `stop`
+# printing "not running", which is the exact false pass the fence was added to close.
+CONTROLLER_SYSTEM_UNIT_DIR="$CONTROLLER_SYSTEM_UNIT_DIR_IN"
+CONTROLLER_USER_UNIT_DIR="$CONTROLLER_USER_UNIT_DIR_IN"
+PS_BIN="$PS_BIN_IN"
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -675,6 +692,12 @@ controller_user_unit_dirs() {
   local h
   [ -n "${CONTROLLER_USER_UNIT_DIR:-}" ] && printf '%s\n' "$CONTROLLER_USER_UNIT_DIR"
   h="${CONTROLLER_INVOKER_HOME:-${HOME:-}}"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
+  # ⛔ A MISSING `getent` MUST NOT FAIL SILENTLY (review P2 round 19, #2402 / B). The passwd home is the
+  # candidate the doctor's `HOME=$CELL_HOME` session depends on; without `getent` it would simply disappear
+  # from the list and re-open the duplicate-dispatcher defect with no diagnostic anywhere. stderr only —
+  # stdout is a list.
+  command -v getent >/dev/null 2>&1 \
+    || printf '%s\n' "cloud-cell-supervisor: getent not found — the passwd-home unit lookup is unavailable on this box, so a reader whose HOME is not the installer's may miss the unit" >&2
   h="$(passwd_home "$(id -u)")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   h="$(passwd_home "${SUDO_USER:-}")"; [ -n "$h" ] && printf '%s\n' "$h/.config/systemd/user"
   return 0
@@ -1061,6 +1084,73 @@ resolve_queue_target || true
 # The session command string interpolates this, so it must be the RESOLVED value — not the raw $OR a
 # keys.env happened to carry, and not a default.
 OR="$QUEUE_REPO"
+
+# ── #2235: `GH_REPO` IS PER-INVOCATION STATE, NEVER CELL STATE ─────────────────────────────────
+# `keys.env` on every cell exported `GH_REPO=daniel-ospina/tortoise` GLOBALLY. gh's own resolution is
+# flag > `GH_REPO` > the local checkout, so EVERY call that did not pass `--repo` answered for
+# tortoise while the cell graded agent-infra: measured twice in one session (2026-10-20/21), a rail
+# printed
+#   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+#                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+# for a SEPTEMBER tortoise PR, exit 0, over an open agent-infra PR — and the same leak produced
+# `GraphQL: Could not resolve to a PullRequest with the number of 2231` for real open PRs. Four
+# agent-infra PRs looked "already merged" while unmerged on origin/main.
+#
+# TWO INDEPENDENT EDITS, because either one alone leaves the defect reachable:
+#   1. THIS CHECK — a cell whose env carries a GH_REPO naming a DIFFERENT repo than the checkout the
+#      controller runs in is a STOP-WORK condition (the same class and shape as the queue/checkout
+#      mismatch above: a wrong pair must not be a cell that starts and looks healthy). It is checked
+#      against $QUEUE_DERIVED — the repo READ FROM the checkout's own origin — which is exactly the
+#      subject #2235 names, and against $QUEUE_REPO when the origin could not be read.
+#   2. THE SESSION COMMANDS below carry `unset GH_REPO` AFTER `$ENV_FILE` is sourced. The check alone
+#      would be bypassed by any path that creates a session without calling it, and keys.env is
+#      re-sourced INSIDE the session command — so the strip has to live where the sourcing happens.
+#      A correct value is stripped too: the rail resolves its own repo by evidence now, so a global
+#      export buys nothing and only arms the next leak.
+assert_gh_repo_conformance() {
+  [ -n "${GH_REPO:-}" ] || return 0
+  local want="${QUEUE_DERIVED:-$QUEUE_REPO}" have got got_src _h="" _whost=""
+  got_src="the checkout's origin remote"
+  if [ -z "$want" ]; then
+    die "GH_REPO is set ($GH_REPO) but this cell's CHECKOUT repo could not be read, so it cannot be verified against the tree the controller would grade ('git -C $REPO remote get-url origin' => '${QUEUE_REMOTE:-<none>}'). A global GH_REPO is what produced the #2235 fail-open — gh gives it precedence over the checkout for every call that does not pass --repo, so the rail graded daniel-ospina/tortoise PRs while reporting on agent-infra ones. Remove the GH_REPO line from $ENV_FILE (it is per-invocation state, not cell state); the controller resolves its repo from the checkout."
+  fi
+  [ "$want" = "$QUEUE_REPO" ] || got_src="the queue target"
+  have="$(printf '%s' "$GH_REPO" | tr '[:upper:]' '[:lower:]')"
+  # ⛔ `[HOST/]OWNER/REPO` IS THE DOCUMENTED FORM (`gh help environment`), so `github.com/o/r`
+  # names the SAME repo as `o/r` and must not be graded as a different one — comparing verbatim
+  # made `check` FATAL on a cell whose keys.env used the documented spelling (§2235 review P2).
+  # The leading segment is dropped only when it IS a host (dotted, or this checkout's host).
+  case "$have" in
+    */*/*)
+      _h="${have%%/*}"
+      case "$_h" in
+        *.*|*:*)
+          # ⛔ THE CHECKOUT'S OWN HOST IS PARSED FROM `$QUEUE_REMOTE`, NOT FROM A VARIABLE THAT
+          # IS NEVER ASSIGNED (#2235 review round 3, P2): the first cut referenced
+          # `${QUEUE_HOST:-}`, which appears nowhere else in the repo — so `[ "$_h" = "" ]` was
+          # always false and a GHE checkout could not accept `GH_REPO=ghe.corp/o/r`, while the
+          # RAIL (which does read its own remote host) accepted it. Two authorities grading one
+          # input two ways is the #1856 shape; the evidence is the remote this cell already read.
+          _whost="${QUEUE_REMOTE:-}"
+          case "$_whost" in
+            *://*) _whost="${_whost#*://}" ;;
+            *@*:*) _whost="${_whost%%:*}" ;;
+            *)     _whost="" ;;
+          esac
+          _whost="${_whost%%/*}"; _whost="${_whost#*@}"; _whost="${_whost%%:*}"
+          _whost="$(printf '%s' "$_whost" | tr '[:upper:]' '[:lower:]')"
+          if [ "$_h" = "github.com" ] || { [ -n "$_whost" ] && [ "$_h" = "$_whost" ]; }; then
+            have="${have#*/}"
+          fi ;;
+      esac ;;
+  esac
+  got="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
+  if [ "$have" != "$got" ]; then
+    die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering: this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)"
+  fi
+  say "ok: GH_REPO ('$GH_REPO', from $ENV_FILE or the ambient shell) names this checkout's repo ($want, case-insensitively) — it is stripped from the controller session anyway (#2235)"
+  return 0
+}
 
 # The named REFUSAL, in the shape `apply` uses when it declines because a controller is running — not
 # a warning. A wrong pair must not be a cell that starts and looks healthy; it must be a cell that
@@ -1923,6 +2013,7 @@ cmd_check() {
   # validate_scope).
   assert_queue_target
   say "ok: queue $QUEUE_REPO == checkout $REPO (origin $QUEUE_REMOTE) — $QUEUE_STATE"
+  assert_gh_repo_conformance
   cmd_check_disk
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
   # orch-loop.sh spawns its workers as `bash '$O/<script>'` (fix-one.sh, merge-one.sh, …), NOT
@@ -1946,7 +2037,17 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
+  # calls it for the process pass. A $O without it still runs (the census falls back to the launch
+  # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
+  # terminals AND tmux sessions (launchd Mac or cell, #2210); `tmux ls` alone sees one of the two
+  # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
+  # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
+  # reports success.
+  # repo-target.sh (#2724/#2694) is SOURCED by lane.sh, dispatch-merge.sh, fix-one.sh and adopt-fix.sh;
+  # all four `exit 78` without it, so its absence would make every dispatch refuse at startup while
+  # `check` still certified the cell — the same false PASS one layer down.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
@@ -2298,6 +2399,10 @@ cmd_start() {
   # for a pair that is wrong. Placed here, ahead of the return and of every write below, so nothing
   # is seeded and no session is created on a refusal.
   assert_queue_target
+  # #2235: a global GH_REPO is a wrong-pair config of the same class as the queue/checkout mismatch,
+  # and it must refuse START (not merely be stripped) so the misconfiguration is surfaced rather than
+  # silently absorbed. The session commands below strip it either way.
+  assert_gh_repo_conformance
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.

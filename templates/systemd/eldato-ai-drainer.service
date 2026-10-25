@@ -1,0 +1,48 @@
+[Unit]
+# eldato ai-drainer — one bounded dispatch pass against a repo's PR backlog
+# (`scripts/orchestrator-harness/ai-drainer.sh`).
+#
+# ⛔ WHY A TIMER AND NOT A DOCTOR ROLE (#2281's second half). The cell already has a role loop
+# (`cloud-cell-doctor.sh`, roles doctor/reap/merge/hygiene) and this could have been a fifth role.
+# It is not, for three measured reasons:
+#   1. the drainer's lock must OUTLIVE ITS OWN PASS: the dispatcher returns immediately, so the
+#      drainer blocks until the LANE it started dies (up to LANE_TIMEOUT=3000s). A role pass that
+#      blocks for 50 minutes is a role the loop's stall bound fires on, and it delays the merge and
+#      doctor passes that share that loop — health work waiting behind a dispatch;
+#   2. a role is ONE cell's controller, and the backlog the drainer exists for belongs to a repo the
+#      cell's controller may not even be bound to;
+#   3. the fleet ALREADY schedules a periodic one-shot job this way: the disk reaper
+#      (templates/systemd/eldato-disk-reaper.*, installed by install-disk-reaper-timer.sh). Using
+#      systemd here reuses the mechanism that exists on cells rather than inventing a second loop,
+#      and it keeps the guards where they belong — in the script, identical on both platforms.
+#
+# ⛔ NOT INSTALLED BY THE CELL BRING-UP, DELIBERATELY. `cloud-cell-bringup.sh` installs the disk
+# reaper because every cell needs it; a lane DISPATCHER is per-repo and costs model spend, so it is
+# activated explicitly with the installer (scripts/orchestrator-harness/install-drainer-timer.sh),
+# which renders this template from machine state.
+Description=eldato ai-drainer — one bounded dispatch pass against a PR backlog
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/ai-drainer.md
+# Never hold up a boot, and never be a reason to keep a box up: a tick that is missed is a tick.
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+Environment=O={{O}}
+Environment=AI={{AI}}
+Environment=REPO_SLUG={{REPO_SLUG}}
+Environment=SEED_REPO={{SEED_REPO}}
+Environment=MAX_LANES={{MAX_LANES}}
+Environment=MIN_SWAP_MB={{MIN_SWAP_MB}}
+Environment=LANE_TIMEOUT={{LANE_TIMEOUT}}
+# The pass is a dispatch, not a deadline: never compete with a live lane for CPU.
+Nice=10
+IOSchedulingClass=best-effort
+# A SKIP (capacity floor, another drainer holding the lock, lane cap) exits 0 by design — it is the
+# tick correctly doing nothing. Only a REFUSED dispatch or an uncreatable worktree exits 1, and that
+# must surface as a failed unit: an installed-but-inert dispatcher is the false PASS this repo keeps
+# removing. No `-` prefix, no quiet stdout: the pass's own log is
+# $AI/logs/ai-drainer.log and systemd keeps the exit status beside it.
+ExecStart=/bin/bash {{DRAINER}}
