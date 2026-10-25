@@ -791,9 +791,14 @@ case "$_landed_arm" in *'fixgate-$pr-'*) rc=0 ;; *) rc=1 ;; esac
 
 echo
 echo "  -- wiring: the role's own shard is registered in the ONE shard list --"
-grep -q 'red-fixer.test.sh' "$HERE/../../scripts/run-bash-shards.sh" \
-  && ok "red-fixer.test.sh is a shard (a suite nobody runs is not a gate)" \
-  || bad "red-fixer.test.sh is NOT in scripts/run-bash-shards.sh — it would never run in CI"
+# ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (agent-infra#2609): the list
+# is DERIVED from the tree, so the driver's text names no suite and a `grep` of the file would always
+# fail — and it failed with a message that told the next lane to hand-edit the driver.
+if bash "$HERE/../../scripts/run-bash-shards.sh" --list 2>/dev/null | grep -qx 'scripts/orchestrator-harness/red-fixer.test.sh'; then
+  ok "red-fixer.test.sh is a shard (a suite nobody runs is not a gate)"
+else
+  bad "red-fixer.test.sh is NOT executed by run-bash-shards.sh --list — it would never run in CI"
+fi
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

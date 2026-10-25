@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off NO CI run site in either lane (pre-existing; tracked in agent-infra#2610) - wiring it is a coverage decision, not a side effect of a refactor
 # fleet-cost-weekly.test.sh — self-check for the weekly cadence driver
 # scripts/fleet-cost-weekly.sh (#373). Uses a stubbed GH_BIN that records
 # invocations — no network, no real ~/.pi/agent sessions. Run:

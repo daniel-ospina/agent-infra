@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off a live-origin loop proof, not a CI suite; `spawn-gate.test.sh` pins the unwired population to exactly {test-claims.sh, this}
 # TEST 2 — the ACQUIRE path of the cross-box claim in merge-one.sh, the trap release, and the P1
 # coercion of a non-integer REVIEW_TIMEOUT.
 # Hermetic: `gh` and `pi` are exported bash functions (functions shadow PATH lookup), so no reviewer
