@@ -414,6 +414,11 @@ commit_in_wt() { # <dir> <date> <label> — a commit with a chosen committer dat
 run_reaper() {
     local envname="$1"; shift
     local nowval="${REAP_WT_NOW_EPOCH_OVERRIDE-$NOW}"
+    # ⛔ EVERY FIXTURE IS OFFLINE: REAP_WT_MAIN_PROOF is pinned to `local` in the env list below.
+    # `auto` (the production default) asks the remote that pushes which branch it calls HEAD — a
+    # network round trip that would make a fixture's verdict depend on the host's connectivity and the
+    # remote's state. `local` is the documented test seam; the `auto` path has its own coverage in the
+    # disk-reaper suite (T3), against a LOCAL bare origin.
     HOME="$T/$envname/home" \
     PATH="$T/bin:$PATH" \
     REAP_WT_STATE_DIR="$T/$envname/state" \
@@ -451,6 +456,7 @@ run_reaper() {
     FAKE_LSOF_CWD_PID="${FAKE_LSOF_CWD_PID:-}" \
     FAKE_GH_REFS="${FAKE_GH_REFS:-}" \
     FAKE_GH_PRS="${FAKE_GH_PRS:-}" \
+    REAP_WT_MAIN_PROOF="local" \
     REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES_OVERRIDE:-45}" \
     REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-}" \
     FAKE_GH_FAIL="${FAKE_GH_FAIL:-}" \
@@ -2025,7 +2031,7 @@ assert_contains "$(row_for "$OUT" "$WT_M")" "reason=reclaimable" \
 # M2: drop the ANCESTRY/PATCH check (every head is "merged") => N4's unmerged,
 # young row escapes the age floor, so N4(d) fails.
 ENV=N4
-MUT2="$(mutate_reaper 's#\[ "\$rc" = 0 \] && merged=1#merged=1#')" || exit 1
+MUT2="$(mutate_reaper 's#if is_ancestor_of_main "\$sha"; then merged=1; fi#merged=1#')" || exit 1
 OUT="$(REAPER="$MUT2" run_reaper $ENV --dry-run --repo "$T/$ENV/repo")"
 assert_contains "$(row_for "$OUT" "$WT_U")" "refs=merged" "M2 mutation really removed the ancestry test"
 assert_contains "$(row_for "$OUT" "$WT_U")" "reason=reclaimable" \
