@@ -42,7 +42,11 @@
 #   bash cloud-cell-doctor.sh loop
 #
 # Exit codes: 0 = pass completed (including "nothing to do"); 2 = usage; 3 = the read a pass needs
-# could not be taken (cannot-verify is never a pass).
+# could not be taken (cannot-verify is never a pass); 4 = POLICY-INERT — the pass COMPLETED and judged
+# nothing because the reaper's ancestry policy refuses this surface's lanes (the Linux-cell steady
+# state, docs/ops/fleet-liveness.md §11.4). 4 is a named verdict, NOT a failure: `status` prints it and
+# stays green, and the `doctor` role never lets it mask a controller that is down (rc=1) or a real
+# cannot-verify (rc=3).
 
 set -uo pipefail
 
@@ -74,6 +78,22 @@ fi
 # No startup warning here on purpose: `log()` is defined further down, and a message emitted before
 # it exists would be a bare "command not found" on the operator's terminal. The degraded state is
 # named at the REFUSAL instead (see the merge role), which is the moment it costs something.
+
+# The PROCESS reaper (#2163), resolved ONCE. It is the lane-reap.sh shipped beside this file (or
+# seeded into $O, which is what a running cell executes). It is deliberately NOT a second
+# implementation of the gates below: `lane-reap.sh` owns the process population (a `pi` tree holding
+# a fleet log open, judged on zero CPU + no human + a stale artefact) and this role only SCHEDULES
+# it. A cell whose $O predates it says so in the pass line rather than silently skipping the class
+# the session pass cannot see.
+# `DOCTOR_LANE_REAP_BIN` is the tool seam (one per external tool, like DOCTOR_PS_BIN): the suite
+# stands a stub in front of the process pass so it can assert the DELEGATION without letting a
+# second reaper loose on the fixture's process table. Production leaves it unset.
+LANE_REAP_BIN="${DOCTOR_LANE_REAP_BIN:-}"
+if [ -z "$LANE_REAP_BIN" ]; then
+  for _lr in "${O%/}/lane-reap.sh" "$SELF_DIR/lane-reap.sh"; do
+    [ -n "$_lr" ] && [ -f "$_lr" ] && { LANE_REAP_BIN="$_lr"; break; }
+  done
+fi
 
 # The tool seams. Every external command a pass depends on is overridable so the suite can drive the
 # DECISIONS hermetically (and so the real tmux server is never touched by a test). They are not a
@@ -287,14 +307,26 @@ state_write() {
 # `dry-run (a rehearsal, no action taken)`. No record ⇒ nothing to overwrite ⇒ the rehearsal's own rc
 # stands. A record that EXISTS but holds no readable rc ⇒ fail-closed at 3.
 state_write_rehearsal() { # <role> <own_rc> <result...>
-  local role="$1" own="$2" prev; shift 2
+  local role="$1" own="$2" prev _sr_prev_fail _sr_own_fail; shift 2
   if [ -f "$ROLES_DIR/$role.state" ]; then
     prev="$(state_get "$role" last_rc)"
     case "${prev:-}" in ''|*[!0-9]*) prev=3 ;; esac
   else
     prev="$own"
   fi
-  num_ok "${own:-}" && [ "$own" -gt "$prev" ] && prev="$own"
+  num_ok "${own:-}" || own=3
+  # ⛔ rc=4 IS A POLICY VERDICT, NOT A SEVERITY (#2163 review r8, P1). "Keep whichever rc is larger"
+  # ranked a policy-inert pass (4) ABOVE a stored cannot-verify (3) and a failed restart (1), so a
+  # rehearsal recorded INERT over a failure that was still true — the same defect this function exists
+  # to prevent, one arm over. Only a FAILING rc (1/2/3) supersedes; 4 is carried only when neither
+  # side is failing, and a clean 0 still never clears a failure.
+  case "${prev:-}" in 1|2|3) _sr_prev_fail=1 ;; *) _sr_prev_fail=0 ;; esac
+  case "$own" in 1|2|3) _sr_own_fail=1 ;; *) _sr_own_fail=0 ;; esac
+  if [ "$_sr_own_fail" = 1 ]; then
+    prev="$own"
+  elif [ "$_sr_prev_fail" = 0 ] && [ "$own" -gt "$prev" ]; then
+    prev="$own"
+  fi
   state_write "$role" "$prev" "dry-run (a rehearsal, no action taken): $*"
 }
 
@@ -414,7 +446,7 @@ BOUND_TIMEOUT_BIN="${DOCTOR_TIMEOUT_BIN:-timeout}"
 BOUND_KILL_S="${DOCTOR_TIMEOUT_KILL_S:-15}"
 bounded() {
   local s="$1"; shift
-  local p w rc tmp
+  local p w rc tmp tmpe
   if [ -n "$BOUND_TIMEOUT_BIN" ] && command -v "$BOUND_TIMEOUT_BIN" >/dev/null 2>&1; then
     "$BOUND_TIMEOUT_BIN" -k "$BOUND_KILL_S" "$s" "$@"; return $?
   fi
@@ -676,6 +708,10 @@ run_reap() {
   begin_pass
   local dry="${1:-}" s log m0 m1 c0 c1 age now pid clients ls0 ls1 started elapsed sp ha
   local seen=0 skipped=0 reaped=0 would=0 unverifiable=0 failed=0 result=""
+  # ⛔ A POLICY-INERT PROCESS PASS IS A THIRD VERDICT, TRACKED APART (#2163 review r8, P1). It was a
+  # `pass_rc=3`, which on a Linux cell is the STEADY STATE — so the cell's health verb was red for
+  # ever and a REAL cannot-verify could not be told from a policy decision nobody can act on.
+  local inert_pass=0
   note() { log "[reap] $*"; result="${result}${result:+; }$*"; }
   started="$(date +%s)"
   local names; names="$(harness_sessions)"
@@ -866,14 +902,131 @@ run_reap() {
   # verified to have taken effect"), named separately in the record so an operator can tell an
   # unreadable read from a refused kill.
   [ "$failed" -gt 0 ] && pass_rc=3
-  # ⛔ A REHEARSAL IS NOT A VERDICT: in `--dry-run` this pass did not kill anything, so its rc=0 says
-  # nothing about the lane a previous real pass recorded `KILL FAILED` (or an unreadable read) for.
-  if [ "$dry" = "--dry-run" ]; then
-    state_write_rehearsal reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result"
+  # ⛔ ONE `state_write` PER PASS, AND IT CARRIES THE CENSUS (#2163 review, P3). A pre-census write sat
+  # here and was superseded by the one below, so `passes=` (which `state_write` INCREMENTS) advanced
+  # twice per pass, and the FIRST `[reap]` line an operator reads omitted `lanes=`/`zombie=`/
+  # `unidentifiable=` — the three readings this role exists to publish. The rehearsal rule
+  # (`--dry-run` never records a verdict) is applied at that single write below.
+  # ── the census: lanes by EVIDENCE, and the box's zombies (#2163) ────────────────────────────────
+  # `lanes=<live>/<total>` is the reading a session count cannot produce: a leaked wrapper + pi whose
+  # pane died is invisible to `tmux ls`, and the string count (`ps | grep -c 'pi --model'`) counted
+  # wrappers (76 for 14 working lanes, measured 2026-10-19). `zombie=<n>` sits in the SAME pass line
+  # because a box full of corpses otherwise reads as busy. An unreadable census is `?`, never 0.
+  local census="lanes=?/? zombie=?" proc_result="" proc_out="" proc_refusal=""
+  if [ -n "$LANE_REAP_BIN" ]; then
+    # 60s, not the 15s per-read bound: `count` resolves each lane's log, which on a 76-lane box is a
+    # per-process lsof sweep. A census killed at 15s would print `?/?` on every busy box — an
+    # instrument that fails exactly when it matters.
+    # The tool's OWN budget is set BELOW the external bound, so a slow census is an abstention it
+    # reports (`lanes=?/?`, exit 3) rather than a SIGKILL that leaves the pass with no answer at all.
+    census="$(LANE_REAP_PASS_TIMEOUT=50 bounded 60 bash "$LANE_REAP_BIN" count 2>/dev/null)"
+    case "$census" in
+      lanes=*' 'zombie=*) ;;
+      # ⛔ A READ THE PASS COULD NOT TAKE IS NOT A PASS (#2163 review, P2). Recording `?` in the line
+      # while leaving rc=0 is the "looks alive while doing nothing" class this role exists to remove:
+      # the census is the only instrument that sees the population the session pass cannot.
+      # ⛔ AND IT IS COUNTED ONCE, BY THE NEXT CASE (#2163 review cycle 8, P2). This arm REWRITES the
+      # census into exactly the `?`-numerator shape the arm below escalates on, so incrementing
+      # `unverifiable` here as well counted ONE failed read twice: the shipped pass line read
+      # `unverifiable=2` for a single garbled `count`, and `unverifiable=` is the field an operator
+      # reads to decide whether the instrument is trustworthy. Rewrite only; the arm below owns the
+      # count and the rc — and reverting that one turns the suite red (185 PASS / 2 FAIL, measured), so
+      # the escalation the classifier owns is pinned.
+      *) census="lanes=?/? zombie=?" ;;
+    esac
+    # A `?` NUMERATOR with readable totals is the same abstention one lane at a time (`count` exits 3
+    # when a liveness age could not be read); it must not read as a clean pass either.
+    case "$census" in lanes='?'/*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;; esac
+    # ── the PROCESS pass: the population the session pass above cannot see ─────────────────────────
+    # Armed with the SAME dry/apply posture as this pass: `--dry-run` reports, the armed role acts.
+    # The reaper keeps its own gates and its own default (dry run); this call only decides whether
+    # the armed role is allowed to apply them.
+    # ⛔ Bounded by REAP_TIMEOUT, NOT READ_CALL_TIMEOUT: the reaper sleeps its own CPU SAMPLE WINDOW
+    # (default 30s), so the 15s per-read bound would kill the pass before it judged anything — an
+    # inert reaper that looks scheduled. REAP_TIMEOUT is the budget this role already gives its whole
+    # session pass.
+    # ⛔ THE REAPER'S OWN LINES ARE THE ONLY EVIDENCE OF *WHY* IT JUDGED NOTHING (#2163 review r3,
+    # P2). Keeping `tail -1` alone discarded every per-tree `REFUSE`/`SKIP` reason, so `[reap]` — the
+    # operator's log — showed a summary with no cause, and a refusal could not be told from an idle
+    # box. The full output is kept, the summary is the LAST line (as before), and the FIRST refusal is
+    # logged beside it.
+    if [ "$dry" = "--dry-run" ]; then
+      proc_out="$(LANE_REAP_LOG="$O/state/lane-reap.log" LANE_REAP_LOCK="$O/state/lane-reap" \
+        bounded "$REAP_TIMEOUT" bash "$LANE_REAP_BIN" reap 2>&1)"
+    else
+      proc_out="$(LANE_REAP_LOG="$O/state/lane-reap.log" LANE_REAP_LOCK="$O/state/lane-reap" \
+        bounded "$REAP_TIMEOUT" bash "$LANE_REAP_BIN" reap --apply 2>&1)"
+    fi
+    proc_result="$(printf '%s\n' "$proc_out" | tail -1)"
+    proc_refusal="$(printf '%s\n' "$proc_out" | grep -E '^  (REFUSE|SKIP|FENCE-ABSTAIN|CANNOT-VERIFY)' | head -1)"
+    case "$proc_result" in
+      *"CANNOT-VERIFY"*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+      # ⛔ AN ABSTAINING PASS IS NOT AN IDLE ONE (#2163 review, P2). lane-reap.sh counts every tree it
+      # could not judge (a descriptor it could not read, an ancestry it could not classify, a CPU delta
+      # that went backwards, a log age it could not stat) into `abstained=`, and exits 3. Only the
+      # literal CANNOT-VERIFY token used to escalate here, so a pass reporting
+      # `reaped=0 refused=0 abstained=4` was indistinguishable from a quiet, healthy reaper — the
+      # "looks alive while doing nothing" class this role exists to remove.
+      *abstained=[!0]*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+      # ⛔ AN UNUSABLE PIPE IDENTITY IS AN ABSTENTION, BUT NOT A FAILED READ (#2163 review r5, P3).
+      # `unidentifiable=` counts trees whose descriptors were READ and whose pipe simply has no
+      # per-pipe name on this platform (`lsof 4.95` prints the literal `pipe`), so a `tee` beside the
+      # tree cannot be shown to be its writer. The reaper exits 3 for it, and this arm reads the FIELD
+      # too — but the point of the separate field is that the escalated cause must NAME IDENTITY. It
+      # used to arrive as `abstained=`, whose per-tree line said "the descriptors could not be read";
+      # the operator then chased an lsof/permissions fault that never happened on a box where every
+      # read succeeded. The first refusal line logged below now carries `pipe-identity-unusable`.
+      # ⛔ IT MUST PRECEDE THE `abstained=0` ARM BELOW: with an abstention-free line the catch-all
+      # would record this pass as clean.
+      *unidentifiable=[!0]*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+      # ⛔ …AND NEITHER IS AN `inert` PASS (#2163 review r3, P2). `inert=` counts the LANES a POLICY
+      # refused (a resolved lane log under a human or unclassifiable ancestry). On a cell EVERY lane is
+      # `ancestry-unknown`, so the armed pass judged zero trees, printed `trees=0/0 … refused=1
+      # abstained=0`, exited 0 and this role recorded a healthy reaper every pass. The reaper now
+      # exits 3 for that shape too; this arm reads the FIELD as well, so the escalation does not depend
+      # on a consumer ever checking the reaper's exit code (the `bounded | tail` shape loses it, and
+      # `--json`/summary parsing is what this role actually has in hand).
+      # ⛔ BUT ONLY THE PASS THAT JUDGED NOTHING (#2163 review r4, P2). `inert=` is a POLICY count, not
+      # a failure: `lane-reap.sh` returns 3 for it only when `total == 0 && inert > 0`, and returns 0
+      # for a pass that judged trees while refusing a human-owned one beside them (its own
+      # `INERT-MIXED` leg pins that). Escalating every non-zero `inert=` therefore wrote
+      # `reap FAILED rc=3` every pass over a pass the reaper calls clean — on any box with one
+      # human-owned or `ancestry-unknown` lane. The arm is the INERT PASS's SHAPE (`trees=0/0`: the
+      # same `total == 0` the reaper tests), never the field alone.
+      *inert=[!0]*)
+        case "$proc_result" in
+          # ⛔ A POLICY VERDICT, NOT A FAILED READ (rc=4, #2163 review r8, P1). `3` means cannot-verify
+          # — a read that FAILED, which a consumer must escalate — and this shape is the recorded cell
+          # steady state (§11.4): the policy refused every lane because gate 2 requires positive fleet
+          # evidence and a cell's ancestry carries none. Recording 3 here made the doctor role red for
+          # ever (`role_row` → `status` rc=1) AND collapsed a genuine restart failure into the same
+          # number. It is recorded as its own verdict below (`pass_rc=4`), so it is still never a clean
+          # `reaped=0` while it says exactly what it is.
+          *"trees=0/0"*|*'"trees":"0/0"'*) inert_pass=1 ;;
+        esac ;;
+      *abstained=0*) ;;
+      *) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+    esac
+    log "[reap] proc: ${proc_result:-<no output>}"
+    [ -n "$proc_refusal" ] && log "[reap] proc-first: $proc_refusal"
   else
-    state_write reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result"
+    log "[reap] WARN: lane-reap.sh NOT FOUND (looked in $O and beside this script) — the leaked lane processes were NOT judged; re-run 'start' to seed it"
   fi
-  log "[reap] seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed"
+  local proc_note=""
+  [ -n "$proc_result" ] && proc_note="; proc: $proc_result"
+  # ⛔ A POLICY-INERT PROCESS PASS IS ITS OWN VERDICT (rc=4), NEVER A FAILED ONE (#2163 review r8, P1).
+  # It is promoted ONLY where nothing failed: a real abstention (3) still dominates, so this can never
+  # hide a read that could not be taken — it only stops a WORKING policy from reading as a fault.
+  [ "$inert_pass" = "1" ] && [ "$pass_rc" -eq 0 ] && pass_rc=4
+  # The FIRST refusal travels with the state line too: the summary says how many, never why, and an
+  # operator reading `state_write` is the operator who needs the why.
+  [ -n "$proc_refusal" ] && proc_note="$proc_note; first: ${proc_refusal#  }"
+  if [ "$dry" = "--dry-run" ]; then
+    state_write_rehearsal reap "$pass_rc" "$census seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result$proc_note"
+  else
+    state_write reap "$pass_rc" "$census seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result$proc_note"
+  fi
+  log "[reap] $census seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed${proc_result:+; proc: $proc_result}"
   return "$pass_rc"
 }
 
@@ -1918,8 +2071,14 @@ run_doctor() {
   # and could both decide the same session is wedged (two kills, one corpse — the double-act the
   # lock exists to prevent). A lock held elsewhere makes this a logged SKIP, and the reap state is
   # then the sibling pass's record, which is the truth either way.
-  local rrc=0
+  local rrc=0 src_rc=0
   run_role_pass reap "$dry" >/dev/null || rrc=$?
+  # ⛔ A POLICY VERDICT FROM THE NESTED REAP IS NOT A FAILURE OF THIS PASS (#2163 review r8, P1).
+  # `rrc=4` says the reaper judged nothing because its ancestry policy refuses every lane on this
+  # surface (§11.4) — that fact is recorded in the REAP row, and this pass's own work (supervision)
+  # is unaffected. Carrying 4 into the doctor's record would make the row read `INERT` for a doctor
+  # that restarted the controller correctly. It collapses to 0 HERE, not into a failure.
+  [ "$rrc" -eq 4 ] && rrc=0
   result="reap: $(state_get reap last_result | cut -c1-160)"
   if [ ! -f "$DESIRED" ]; then
     log "[doctor] cell is not started (no $DESIRED) — supervising nothing; reap still ran"
@@ -1953,8 +2112,15 @@ run_doctor() {
     # "controller restarted" from a start that answered "already running", and a WEDGED controller —
     # alive, heartbeat stale — was never reported: the one signal that tells "dispatches nothing" from
     # "idle" was dead on exactly the box shape this PR creates.
-    log "[doctor] controller is up WITHOUT a tmux session (service-managed) — evaluating its heartbeat instead of restarting it"
-    controller_heartbeat_verdict "the controller (service-managed)"
+    # ⛔ THE LABEL MUST NOT CLAIM MORE THAN THE READ (review P2 round 19, #2402 / C). `service_controller_present`
+    # proves a LIVE, lock-owning controller with no session — not that a unit supervises it. This file reads no
+    # unit here, so an orphaned controller that outlived its session (the shape `cmd_stop` documents), or a box
+    # after `--uninstall`, was logged as "service-managed": supervision asserted from a lock, the
+    # "claim nobody measured" shape this PR removes elsewhere. The substance (evaluate the heartbeat, do not
+    # restart a live controller) is unchanged; the authoritative supervision read is `cmd_status`'s
+    # `supervision:` row, which is not consulted on this path.
+    log "[doctor] controller is up WITHOUT a tmux session — evaluating its heartbeat instead of restarting it (this read proves the CONTROLLER; whether a unit supervises it is decided by the rc-4/rc-5 arms, not here)"
+    controller_heartbeat_verdict "the controller (no session)"
   elif [ "$dry" = "--dry-run" ]; then
     log "[doctor] WOULD restart the controller (tmux '$SESSION' absent, cell is started)"
     result="$result; would restart controller"
@@ -1996,7 +2162,10 @@ run_doctor() {
         # failed unit is exactly what `--status` prints as unsupervised, so this pass must not certify it.
         log "[doctor] controller restart NOT launched — ${CONTROLLER_UNIT:-the controller unit} has CONVERGED TO FAILED (start limit): this cell has NO dispatcher and only a human re-arm brings it back"
         result="$result; controller restart not launched (unit FAILED — no dispatcher)"
-        [ "$rrc" -eq 0 ] && rrc=1
+        # ⛔ ITS OWN SLOT, like the `else` arm below (#2163 review r8, P1): `[ "$rrc" -eq 0 ] && rrc=1`
+        # only RAISES a zero, so a nested reap that recorded cannot-verify (3) would swallow this
+        # failure and the pass would say "cannot verify" over a cell whose unit has converged to failed.
+        src_rc=1
       elif [ "$rc" -eq 4 ]; then
         # ⛔ THE SERVICE MANAGER OWNS A CONTROLLER IT HAS STOPPED (review P1, #2402). `start` answers rc 4
         # when an AUTOMATED restart would have to re-arm a unit the manager reports not active — a
@@ -2005,20 +2174,33 @@ run_doctor() {
         # is what made a keyless cell retry forever with every surface reading supervised). Honouring it is
         # NOT a failed pass: the stop is the decision, and a failed unit is handled by the rc-5 arm above —
         # which is why this message no longer claims "a start limit that converged to failed" as well.
-        log "[doctor] controller restart NOT launched — the service manager owns ${CONTROLLER_UNIT:-the controller unit} and reports it not active (a deliberate stop, or a start limit that converged to failed); a human 'cloud-cell-supervisor.sh start' re-arms it"
+        log "[doctor] controller restart NOT launched — the service manager owns ${CONTROLLER_UNIT:-the controller unit} and reports it not active (a deliberate stop); a human 'cloud-cell-supervisor.sh start' re-arms it"
         result="$result; controller restart not launched (service-managed, unit not active)"
       else
         log "[doctor] controller restart FAILED (supervisor start rc=$rc) — see $O/logs/doctor.log"
         result="$result; controller restart FAILED rc=$rc"
         # ⛔ The supervision OUTCOME is part of the pass's rc. A started cell whose dispatcher is
         # absent and could not be restarted is not a clean pass, however well the reap half went.
-        [ "$rrc" -eq 0 ] && rrc=1
+        # ⛔ AND IT HAS ITS OWN SLOT (`src_rc`) SO IT STAYS EXPRESSIBLE (#2163 review r8, P1):
+        # `[ "$rrc" -eq 0 ] && rrc=1` only ever RAISED a zero, so when the nested reap recorded
+        # cannot-verify (3) a controller that was DOWN and could not be restarted recorded 3 as well —
+        # "controller is down" was no longer sayable in the rc at all.
+        src_rc=1
       fi
     else
       log "[doctor] CANNOT-VERIFY: controller absent and DOCTOR_SUPERVISOR is not a file — cannot restart"
       result="$result; controller restart cannot-verify (no supervisor)"
-      [ "$rrc" -eq 0 ] && rrc=3
+      src_rc=3
     fi
+  fi
+  # ── ONE place where the two halves' verdicts combine. The supervision FAILURE is dominant (a cell
+  # with a dead controller is the more urgent fact and must survive in the rc, whatever the reap
+  # recorded); a supervision that could not be VERIFIED raises a clean/ policy-inert pass to
+  # cannot-verify — it never lowers a 3 it found already there.
+  if [ "$src_rc" -eq 1 ]; then
+    rrc=1
+  elif [ "$src_rc" -eq 3 ] && [ "$rrc" -eq 0 ]; then
+    rrc=3
   fi
   # A nested reap that could not be taken makes THIS pass partial too: the supervision half ran, but
   # the pass as a whole must not be recorded as a clean one (cannot-verify is never a pass).
@@ -2213,6 +2395,13 @@ role_row() { # <role> <stale-bound-seconds>
   esac
   case "${rc:-0}" in
     0) ;;
+    # ⛔ rc=4 IS A POLICY VERDICT, NOT A FAILURE (#2163 review r8, P1). The reaper COMPLETED and judged
+    # nothing because its ancestry policy refuses every lane this surface has (§11.4) — the Linux-cell
+    # steady state, not an incident. Printing FAILED here made the operator's health verb permanently
+    # red on a healthy cell (and an alarm that can never clear is trained-to-be-ignored). It is NAMED
+    # (never a silent green), and the staleness bound below still applies: a reaper that stopped
+    # passing reads STALE.
+    4) printf '%-8s INERT     last pass rc=4 — judged no tree and refused every lane it found BY POLICY (this surface has no fleet ancestry marker; §11.4) — reported, not failed\n' "$role" ;;
     *) printf '%-8s FAILED    last pass rc=%s (the pass did not complete)\n' "$role" "${rc:-?}"; return 1 ;;
   esac
   if [ "$age" -gt "$bound" ]; then
