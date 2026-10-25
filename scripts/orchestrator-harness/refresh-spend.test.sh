@@ -29,6 +29,32 @@ HELPER="$HERE/gh-limit.py"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ok   $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL $1"; }
+# shell_valid <path> — a stub this suite GENERATES must be NON-EMPTY and must PARSE, and if it is not
+# the suite must say so BY NAME. What that buys: an invalid generated program stops being an opaque
+# `line 1: syntax error` from an unnamed /tmp file, which tells a reader neither which of the three
+# generated programs is broken nor which assertion never ran.
+# ⛔ WHAT IT DOES NOT CATCH, stated so nobody over-trusts it: a stub made WRONG by an interpolating
+# heredoc is still syntactically VALID (the measured form emitted empty framed bodies, so `bash -n`
+# returns 0 and the suite reddens on the ASSERTIONS instead). `bash -n` proves the program parses —
+# nothing more. The defence against the interpolation class is the quoted heredoc in `mk_case` below.
+shell_valid() { # <path>
+  local err
+  if [ ! -s "$1" ]; then
+    bad "generated stub is EMPTY: $1"
+  elif ! err="$(bash -n "$1" 2>&1)"; then
+    # `bash -n` prefixes EVERY line with the path it was given; drop the FIRST prefix so the header names
+    # the file (later lines keep their own prefix — that is bash's context line, and it is useful).
+    bad "generated stub is not valid shell: $1: ${err#*: }"
+  else
+    return 0
+  fi
+  # A generated program that cannot run makes every remaining assertion meaningless, so the suite
+  # stops — and says it STOPPED: a bare `0 passed, 1 failed` reads like an ordinary one-assertion red
+  # and hides that the rest never executed.
+  echo "ABORT: refresh-spend stops here — every assertion after this point never ran (a generated stub could not run)"
+  printf 'refresh-spend: %d passed, %d failed (ABORTED, not a complete run)\n' "$PASS" "$FAIL"
+  exit 1
+}
 echo "==> refresh-candidates per-pass spend contract ($HERE)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/refresh-spend.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
@@ -87,6 +113,8 @@ case "$ARGV" in
 esac
 SH
   chmod +x "$D/bin/gh" "$D/bin/gh-stub"
+  shell_valid "$D/bin/gh"
+  shell_valid "$D/bin/gh-stub"
   # The pre-flight stand-in: the SAME shape of reads the real tool makes — three FLEET-WIDE ones
   # plus one per candidate — so "fleet-wide is read once per pass" is measured on the shipped layer.
   cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
@@ -104,6 +132,20 @@ gh("issue", "view", sys.argv[1])                        # per candidate
 print("VERDICT: %s" % os.environ.get("VERDICT", "CLEAN"))
 PY
   chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+  # ⛔ THE FIXTURE PROVISIONS THE CROSS-BOX CLAIM REGISTRY, because the shipped pass now REQUIRES it
+  # (agent-infra#2466 / #2534). A missing `$O/claims.sh` is `INCOMPLETE — never CLEAN`: the pass
+  # judges nothing, prints `ABORT: none of the 6 candidate(s) … produced a usable verdict` and exits 1.
+  # A fixture without one therefore measures the ABORT, not the spend — measured on #2534's head:
+  # `once: rc=1` plus `limit: LIMIT=3 judged 6` (an INCOMPLETE fills no slot, so LIMIT never binds).
+  # One line, and deliberately NOT the shipped `$HERE/claims.sh`: this fixture's `$D/repo` is a plain
+  # directory, not a git repo with an origin, so the real `claim_issue_preflight` has no refs to read
+  # and would answer INCOMPLETE — the same abort, from the other side. The stub is what makes the CLEAN
+  # path reachable. (The sibling `refresh-scout.test.sh` runs the SHIPPED registry, which it can because
+  # its fixture builds a real bare origin; #2534 uses this same one-line stub for the one case there
+  # that needs a reader which answers CLEAN.) It answers "no claim" and issues no `gh` call, so the
+  # CEILING below still measures the LISTINGS and the pre-flight, which is what this shard is about.
+  # The missing-registry polarity itself is pinned by `refresh-scout.test.sh` case (c), not here.
+  printf 'claim_issue_preflight() { return 0; }\n' > "$D/o/claims.sh"
 }
 rows() {  # <n> — n unassigned P0-blocker rows
   local i out="["
@@ -229,6 +271,7 @@ case "$ARGV" in
 esac
 SH
 chmod +x "$D/bin/gh-stub"
+shell_valid "$D/bin/gh-stub"
 rf "$D" 4
 case "$OUT" in
   *"queue=UNREADABLE"*|*"queue=PARTIAL"*) ok "unreadable: the pass names the unreadable pool and refuses" ;;
