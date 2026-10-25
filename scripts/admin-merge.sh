@@ -95,19 +95,23 @@
 # unsubstantiated, i.e. the false absence came back through the citation instead of the
 # logic. A later merge onto main moved it AGAIN, :945 -> :970, and the rebase of this
 # branch re-created the same rot: the numbers below were re-located by their quotes and
-# corrected — which is the rule working, not an exception to it). Re-locate by the quote,
-# and fix the number when you move it.
-#   * ci.yml:970 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
-#     `shard: [1, 2, …]` at :1060, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
+# corrected — which is the rule working, not an exception to it). A THIRD move re-created
+# it once more: merging main into this branch pushed the job :970 -> :993 and
+# `script-validate` ci-main.yml:376 -> :386, and every coordinate below was re-located by
+# its quote again, in the same commit that moved it — because a citation that rots in the
+# very commit that moves the lines reads to the next lane as proof the claim is false.
+# Re-locate by the quote, and fix the number when you move it.
+#   * ci.yml:993 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
+#     `shard: [1, 2, …]` at :1083, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
 #     one check per slice, and each slice's step is `bash scripts/run-bash-shards.sh`
-#     (ci.yml:1098, `run: bash scripts/run-bash-shards.sh`);
-#   * ci-main.yml:378 — "the main lane runs the SAME sweep as ci.yml's `bash-suites`
-#     — this job calls the one runner below, UNSHARDED", and ci-main.yml:455 is that
+#     (ci.yml:1121, `run: bash scripts/run-bash-shards.sh`);
+#   * ci-main.yml:388 — "the main lane runs the SAME sweep as ci.yml's `bash-suites`
+#     — this job calls the one runner below, UNSHARDED", and ci-main.yml:476 is that
 #     call: `bash scripts/run-bash-shards.sh`; main publishes ONE check named
-#     `script-validate` (ci-main.yml:376);
-#   * ci.yml:1072 — "ci-main.yml's `script-validate`: one runtime for the list, in
-#     both lanes" (also ci.yml:372, "today — ci-main.yml's script-validate job runs bash
-#     shards only"). ⛔ NOT ci.yml:973: that line is the HISTORY of the pre-#1369 split
+#     `script-validate` (ci-main.yml:386);
+#   * ci.yml:1095 — "ci-main.yml's `script-validate`: one runtime for the list, in
+#     both lanes" (also ci.yml:395, "today — ci-main.yml's script-validate job runs bash
+#     shards only"). ⛔ NOT ci.yml:996: that line is the HISTORY of the pre-#1369 split
 #     ("while main's `script-validate` ran the bash sweeps + the hermetic suites") and
 #     describes a body WIDER than the list, so citing it here would argue AGAINST the
 #     containment this pair rests on (review cycle 3).
@@ -115,9 +119,9 @@
 #   base reports this program under the other lane's name.
 #
 # ⛔ CONTAINMENT, NOT EQUALITY — and the difference is load-bearing. Main's
-# `script-validate` job has SIX steps, of which FOUR are validation steps (ci-main.yml:422
-# `node --check`, :440 the lane-parity guard, :444 its mutation self-test, :455 the shard
-# list) and the other two are `actions/checkout` (:413) and `actions/setup-node` (:418) —
+# `script-validate` job has SIX steps, of which FOUR are validation steps (ci-main.yml:444
+# `node --check`, :456 the lane-parity guard, :462 its mutation self-test, :476 the shard
+# list) and the other two are `actions/checkout` (:429) and `actions/setup-node` (:434) —
 # while a `bash-suites (<n>)` slice runs only the shard list. So a red under that name may
 # be the shard list's red — or ANY other step's, including the setup ones. The equivalence
 # therefore establishes that the base RUNS this program and carries A red under its name;
@@ -1319,7 +1323,7 @@ fetch_run_failed_job_names() {
 # ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED. Main has NO
 # `bash-suites-gate` JOB (`grep -c bash-suites-gate ci-main.yml` = 0): on main the two
 # programs that PR job runs — the lane-parity guard and its mutation self-test — are
-# STEPS inside `script-validate` (ci-main.yml:440, :444). So a `bash-suites-gate` red
+# STEPS inside `script-validate` (ci-main.yml:456, :462). So a `bash-suites-gate` red
 # ALSO has a base counterpart under that name, and this ONE pair does not map it: that
 # refusal keeps today's unqualified absence answer, which is a KNOWN RESIDUAL (a
 # scoping decision recorded on #2610), NOT a claim that the programs differ. Mapping
@@ -1520,11 +1524,11 @@ named_unattributable_runs() {
               say_err "       DECLARED LANE EQUIVALENCE, not an identity and not an exemption: the two"
               say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
               say_err "       scripts/run-bash-shards.sh UNSHARDED as ONE of its steps"
-              say_err "       (.github/workflows/ci-main.yml:455), and '${name}' is one shard of that same"
-              say_err "       list on a PR (.github/workflows/ci.yml:970/1098), one runtime in both lanes"
-              say_err "       (ci.yml:1072). The base therefore carries a red under a name that RUNS this"
-              say_err "       list — but that job has FIVE other steps (node --check :422, the lane-parity"
-              say_err "       guard :440, its self-test :444, plus checkout :413 and setup-node :418), so the"
+              say_err "       (.github/workflows/ci-main.yml:476), and '${name}' is one shard of that same"
+              say_err "       list on a PR (.github/workflows/ci.yml:993/1121), one runtime in both lanes"
+              say_err "       (ci.yml:1095). The base therefore carries a red under a name that RUNS this"
+              say_err "       list — but that job has FIVE other steps (node --check :444, the lane-parity"
+              say_err "       guard :456, its self-test :462, plus checkout :429 and setup-node :434), so the"
               say_err "       base's red may be this suite's or any of theirs. A CANDIDATE counterpart, not"
               say_err "       an established identity: no identity was produced, so nothing here is"
               say_err "       comparable yet"
