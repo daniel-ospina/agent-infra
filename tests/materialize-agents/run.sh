@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off runs in ci.yml's `drift-check` job and in pipeline-compliance.yml (both PR-triggered; no post-merge site, agent-infra#2610); a shard here would be a second run site (#2439)
 # tests/materialize-agents/run.sh — #1027 suite for the AGENTS.md materialize gate.
 #
 # Covers the adversarial threat surface declared in #1027:

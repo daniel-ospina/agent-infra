@@ -24,9 +24,33 @@ on:
       - '.github/workflows/enforce-skills.yml'   # gate changes self-verify
   workflow_dispatch:           # manual
 
+# ⛔ NO CANCELLATION HERE — this workflow runs on `schedule` AND on `push: [main]`, and BOTH of
+# those execute ON THE DEFAULT BRANCH. A `cancel-in-progress: true` group therefore cancels a
+# main-branch run of this gate: a later push (or the nightly, which shares the same ref) kills the
+# in-flight run for an earlier commit.
+#
+# WHAT IS ACTUALLY LOST (stated precisely — an earlier revision of this comment, and the PR that
+# introduced it, claimed "the drift verdict, silently, forever"; a review disproved that, and the
+# weaker true claim is the one that belongs here): this job does not branch on the event, so a
+# cancelling push whose own diff matches the `paths` filter re-runs the SAME gate against the newer
+# tree and, on failure, files/updates the drift issue from there. So the verdict for the NEW tree is
+# never lost. What IS lost is (a) the per-commit run record — main @ the cancelled head was never
+# observed, and the rail's lane bookkeeping reads run rows — and (b) any drift that existed ONLY on
+# the cancelled head (introduced by A, removed by B): that intermediate tree is never checked, and
+# `!cancelled()` on `auto-file-on-failure` means a cancelled run files nothing at all. (A push whose
+# diff does NOT match the `paths` filter creates no run at all, so it cancels nothing — that case is
+# not part of the loss.)
+#
+# The group carries `github.event_name` as well as the ref (`schedule` and `push` both evaluate
+# `github.ref` to refs/heads/main, so a ref-only key puts the nightly and the push gate in the same
+# cancellation domain). With cancellation off, a push and a nightly on the same ref run side by side
+# instead of one eating the other. Residual, disclosed: GitHub keeps at most one RUNNING and one
+# PENDING run per group, so a third simultaneous arrival evicts the pending one — at this delivery
+# rate (one nightly, path-filtered pushes, ~1-2 min each) that is not reachable, and it is the same
+# trade ci-main.yml's auto-file-on-failure documents rather than a new one.
 concurrency:
-  group: enforce-skills
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
