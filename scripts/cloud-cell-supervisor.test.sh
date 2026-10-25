@@ -3806,10 +3806,18 @@ grep -q 'env ORCH_FOREGROUND=0 bash "\$SUPERVISOR" start' "$HERE/orchestrator-br
 # has nothing to hand over to and execs the loop inside quiesce's own child, outside the unit's cgroup, while
 # quiesce's own "exactly one orch-loop" assertions still pass and it prints DONE. `watchdog-loop.sh` carries
 # the pin already; it had no arm, so deleting it left every suite green.
-grep -q 'ORCH_FOREGROUND=0 \\' "$HERE/cloud-cell-quiesce.sh" \
+# ⛔ ANCHORED for the same reason as the watchdog arm above: an unanchored grep is satisfied by the
+# comment carrying the same text. This one is a MID-LINE assignment (it continues a multi-var prefix),
+# so the anchor is "the line is not a comment" — `^[^#]*` cannot cross a `#`, while the real line at
+# cloud-cell-quiesce.sh:92 (`    SCOPE=… MAX_LANES=… ORCH_FOREGROUND=0 \`) matches it.
+grep -qE '^[^#]*ORCH_FOREGROUND=0 \\$' "$HERE/cloud-cell-quiesce.sh" \
   && ok 'caller pin: cloud-cell-quiesce.sh starts the supervisor with ORCH_FOREGROUND=0 (it stops the unit first, so an inherited =1 would exec a dispatcher outside the cgroup)' \
   || bad 'caller pin: cloud-cell-quiesce.sh starts the supervisor WITHOUT the ORCH_FOREGROUND=0 pin — an inherited =1 leaves an unsupervised dispatcher behind a DONE report'
-grep -q 'ORCH_FOREGROUND=0' "$HERE/orchestrator-harness/watchdog-loop.sh" \
+# ⛔ ANCHORED, BECAUSE AN UNANCHORED GREP IS SATISFIED BY THIS FILE'S OWN COMMENT (review P1, #2675):
+# `grep -q 'ORCH_FOREGROUND=0'` matched the prose at watchdog-loop.sh:318, so deleting the real
+# assignment at :324 left this arm GREEN — a pin with no state in which it fails, which is the exact
+# defect this commit exists to close. The pattern now matches the ASSIGNMENT shape only.
+grep -qE '^[[:space:]]*ORCH_FOREGROUND=0 bash "\$sup" start' "$HERE/orchestrator-harness/watchdog-loop.sh" \
   && ok 'caller pin: watchdog-loop.sh starts the supervisor with ORCH_FOREGROUND=0' \
   || bad 'caller pin: watchdog-loop.sh lost its ORCH_FOREGROUND=0 pin — an inherited =1 changes what its start does'
 # ⏱ THE ANTI-ROT PIN FOR THE SERVICE-MANAGED AUTOMATED RESTART (review P1, #2402). The doctor's restart arm
