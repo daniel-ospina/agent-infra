@@ -1,0 +1,15 @@
+# FAILURE-CLASS FIXTURE (positive, pair with pr-github-workflow-a.yml): the canonical per-workflow
+# idiom, `github.workflow`, which resolves to this file's `name:` — so two files with DIFFERENT names
+# have DIFFERENT runtime groups and must both pass. Refusing them would be a false red on the idiom
+# the header recommends.
+name: pr-github-workflow-beta
+on:
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
