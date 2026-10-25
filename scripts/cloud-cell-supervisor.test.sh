@@ -66,6 +66,42 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 
+# ⛔ EVERY MODULE A CARRIER HARD-REQUIRES MUST BE IN THE SUPERVISOR'S REQUIRED-WORKER LIST (review
+# round 6, P1 — the defect was live and the comment claiming it fixed was not). `lane.sh:75/79/97/134`,
+# `fix-one.sh:54/69/73`, `merge-one.sh`, `adopt-fix.sh` and `dispatch-merge.sh` each `. "$SELF/<mod>"`
+# and `exit 78` when it is missing — so a deployment WITHOUT that module dies at the first lane start.
+# `cmd_check` is the box's own answer to "can this cell run a controller", and a module missing from
+# its list made it answer YES about a box where every lane refuses: a FALSE PASS of exactly the kind
+# this file exists to prevent. The list had `gate-policy.sh` added while `spawn-gate.sh` — same class,
+# added by the same change — was left out, and no arm connected the two, so the comment above the
+# loop asserted a requirement the loop did not carry.
+# ⛔ THE EXPECTED SIDE IS DERIVED, BOTH WAYS: the carriers are read for what they source (never
+# re-typed here), and the shipped list is parsed out of $SUP — so neither copy can drift silently.
+# It is an INCLUSION, not an equality: a worker that no carrier sources (a controller-owned script)
+# belongs in the list and must not be reddened by this arm.
+# NB: the carriers live one directory down from $SUP, so the two sides are read from DIFFERENT paths on
+# purpose — `$SUP` is the script under test (overridable), the carriers are always this tree's.
+_CARRIERS="$HERE/orchestrator-harness"
+_REQ=""
+for _c in lane fix-one merge-one adopt-fix dispatch-merge nonblocking-dispatch; do
+  [ -f "$_CARRIERS/$_c.sh" ] || continue
+  while IFS= read -r _m; do
+    [ -n "$_m" ] || continue
+    case " $_REQ " in *" $_m "*) ;; *) _REQ="$_REQ $_m" ;; esac
+  done < <(sed -n 's/^\. "\$SELF\/\([A-Za-z0-9._-]*\.sh\)".*/\1/p' "$_CARRIERS/$_c.sh")
+done
+_REQ="${_REQ# }"
+_REQMISS=""
+for _m in $_REQ; do
+  case " $SEED_WORKERS " in *" $_m "*) ;; *) _REQMISS="$_REQMISS $_m" ;; esac
+done
+[ -n "$_REQ" ]; rc=$?
+[ "$rc" -eq 0 ] && ok "the carriers' hard-required modules were read from lane/fix-one/merge-one/adopt-fix/dispatch-merge ($_REQ) — the parity arm below is not vacuous" \
+  || bad "could not read ANY \`. \$SELF/<mod>\` source from the carriers — the parity arm below would pass on nothing"
+[ -z "$_REQMISS" ]; rc=$?
+[ "$rc" -eq 0 ] && ok "every module a carrier HARD-REQUIRES is in cmd_check's required-worker list (${_REQ// /, }) — a box missing one cannot read as 'CELL CAN RUN A CONTROLLER'" \
+  || bad "cmd_check's required-worker list is MISSING a module a carrier exits 78 without:${_REQMISS} — the box would pass check and every lane would refuse at startup"
+
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-test.XXXXXX")"
 SEED_LOG="$T/seed-sites"; : > "$SEED_LOG"
 # ⛔ HERMETIC means the CALLER's environment must not decide a fixture. agent-infra#1901 makes `OR`

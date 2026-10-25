@@ -23,6 +23,12 @@ BOX="$HERE/lib/box.sh"
 PASS=0; FAIL=0; SKIP=0
 ok()   { PASS=$((PASS+1)); printf 'PASS %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$1"; }
+# ⛔ `skip()` MUST EXIST FOR THE PLATFORM-DEPENDENT ARMS (review, P2). Arm 17 calls it on a root/container
+# runner — the exact box its own comment says the branch was MEASURED on — where it used to print
+# `skip: command not found`, leave `SKIP` unincremented and report a shell error instead of the named
+# SKIP the summary line counts. Latent on the ubuntu CI runner (arm 17 takes its real branch there),
+# so it could only ever appear on the platform where the fail-closed branch is unexercised.
+skip() { SKIP=$((SKIP+1)); printf 'SKIP %s\n' "$1"; }
 
 [ -f "$SHIM" ] || { echo "❌ harness-exec.sh missing beside this suite"; exit 1; }
 [ -f "$BOX" ]  || { echo "❌ lib/box.sh missing — the shim's portability dependency"; exit 1; }
@@ -199,8 +205,8 @@ esac
 
 # ── arm 11: the scheduler question, on the platform that has one. The skip names WHY.
 case "$(bash "$BOX" --selftest 2>/dev/null | sed -n 's/^box: os=\([a-z]*\).*/\1/p' | head -1)" in
-  darwin) SKIP=$((SKIP+1)); printf 'SKIP scheduler-arm: macOS has launchd, but the live job still names a home-dir program (arm 10 asserts the shim REFUSES it); the install-side fix is #2271\n' ;;
-  *)      SKIP=$((SKIP+1)); printf 'SKIP scheduler-arm: %s has no launchctl — answered by `bash %s --selftest` instead\n' "$(uname -s)" "scripts/lib/box.sh" ;;
+  darwin) skip "scheduler-arm: macOS has launchd, but the live job still names a home-dir program (arm 10 asserts the shim REFUSES it); the install-side fix is #2271" ;;
+  *)      skip "scheduler-arm: $(uname -s) has no launchctl — answered by \`bash scripts/lib/box.sh --selftest\` instead" ;;
 esac
 
 # ── arm 12: the ENTRY may not walk out of the pin (found by review: `--entry ../../../evil.sh` was

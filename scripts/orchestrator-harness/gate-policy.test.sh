@@ -194,6 +194,30 @@ printf '%s' "$probe_flat" | grep -q 'note=repo-root-unresolved' \
   || bad "flat-deploy: the unresolved repo root is not reported: $probe_flat"
 
 
+# ⛔ THE LIVING TREE'S OWN VERDICT, WHICH NOTHING ELSE ASSERTED (review, P2). README §5.4's `today`
+# column said `review-pr.sh` (#2288) was MISSING, while the file has been executable, non-empty and
+# `bash -n`-clean in this tree since 9b80ee4c — so the doc pointed a reader diagnosing "why is the
+# bypass still on" at a component that had already shipped. No arm could catch that: the
+# "unsatisfiable" fixture is an EMPTY repo, so the probe's answer for the REAL checkout was never
+# asserted, and a doc claim with no arm behind it drifts silently on the next merge.
+# ⛔ HOME IS NEUTRALISED so the operator's own `~/.pi/agent/scripts/record-review.sh` cannot supply the
+# half being measured (same reason as the isolating fixtures above); `GP_REPO` names this checkout, so
+# the answer is a property of the tree under test and not of the box.
+# ⛔ WHAT GOES RED, AND WHY THAT IS THE POINT: when #2313 lands a real `record)` verb (or the review
+# half regresses), this arm fails and sends the author to README §5.4's table. That coupling is
+# deliberate — the table is the change's measured claim, and the flip is exactly when it must change.
+probe_live="$(HOME="$NH" GP_REPO="$REPO" bash "$POLICY" --probe 2>&1)"
+printf '%s' "$probe_live" | grep -q 'review_satisfiable=1 vgate_satisfiable=0' \
+  && ok "live-tree: this checkout SATISFIES the review half (record-review.sh + review-pr.sh #2288) — the README §5.4 table's measured claim" \
+  || bad "live-tree: README §5.4 says the review half is satisfied; the probe says otherwise (update the table WITH the change): $probe_live"
+printf '%s' "$probe_live" | grep -q 'review-pr.sh(#2288)' \
+  && bad "live-tree: the probe still names review-pr.sh(#2288) as missing — that file is in this tree (9b80ee4c), so the seam search is what is broken: $probe_live" \
+  || ok "live-tree: the review seam is NOT reported missing (the doc's old claim is now falsifiable in one assertion)"
+printf '%s' "$probe_live" | grep -q 'vgate-record(#2313)' \
+  && ok "live-tree: the bypass is carried by the VGATE half ALONE, and the reason names it (#2313) — deleting the review half first would have stopped every lane at its first push" \
+  || bad "live-tree: expected the VGATE half to be the only unsatisfied one, got: $probe_live"
+
+
 # 3. satisfier absent -> AUDITED bypass, naming #2319 and what is missing.
 EMPTY="$TMP/empty-repo"
 mkdir -p "$EMPTY/scripts"

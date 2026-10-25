@@ -1513,13 +1513,21 @@ head-bound review. So the decision moved into ONE probe:
 
 | probe | asked | today |
 |---|---|---|
-| review | is there a recorder for the head-bound record **and** a seam a non-interactive lane can call to obtain it? | `record-review.sh` yes, `review-pr.sh` (#2288) **no** |
-| VGATE | can a non-interactive session record verification where the gate reads it? | no `record` verb, no lane-satisfiable acceptance (#2313) |
+| review | is there a recorder for the head-bound record **and** a seam a non-interactive lane can call to obtain it? | **satisfiable.** `record-review.sh` yes, `review-pr.sh` (#2288, landed 9b80ee4c) yes — `--probe` on this checkout prints `review_satisfiable=1` (pinned by `gate-policy.test.sh` "live-tree") |
+| VGATE | can a non-interactive session record verification where the gate reads it? | **not satisfiable.** no `record` verb, no lane-satisfiable acceptance (#2313) — so the bypass below is still ACTIVE, on the VGATE half alone |
 
 - **Both satisfiable** → nothing is exported, and any INHERITED skip flag is removed from the carrier's
   environment (a daemon captures its environment once; that is how a stale hatch outlives its reason).
 - **Either missing** → the two flags ARE exported, and **one** audit line naming #2319, the carrier and
   the missing component is appended to `logs/gate-policy.jsonl`.
+
+⛔ **The `today` column above is MEASURED, not remembered (review round 6).** It once said `review-pr.sh`
+was missing while the file had already been in this tree for weeks — so a reader diagnosing "why is the
+bypass still on" was pointed at a component that had shipped. `gate-policy.test.sh`'s "live-tree" arm now
+probes THIS checkout and asserts the pair the table states, so the table cannot drift again: **when either
+half flips, that arm goes RED until the doc changes with it.** The bypass today is carried by the VGATE
+half alone — that is the sequencing #2319 asks for, and the reason nothing fleet-stopping follows from the
+review half being satisfied.
 
 ⛔ There is no third state: `gate-policy.test.sh` fails if any live carrier exports either flag
 outside the policy, so a silent reintroduction is RED. When the satisfier merges, the probe flips and
