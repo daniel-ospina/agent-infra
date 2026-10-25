@@ -1156,7 +1156,7 @@ PI_GATE_LEDGER_MAX_BYTES=5242880
 # only after the gate passed and pi was actually launched, so it cannot be produced by a refusal.
 AGENT_STARTED=0
 run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
-  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed
+  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed was_m jobctl
   AGENT_STARTED=0
   # The cap signal is per-invocation state, like AGENT_STARTED: a caller that reads it after a
   # refusal or a clean run must see 0, never a previous lane's answer.
@@ -1336,12 +1336,57 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # (#1852). Resolve ONCE into locals so the log and the argv cannot disagree.
   local lane_provider="${PI_LANE_PROVIDER:-deepseek}" lane_model="${PI_LANE_MODEL:-deepseek-flash}"
   echo "[agent] provider=$lane_provider model=$lane_model label=$label" >> "$log"
-  pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
+  # ⛔ THE AGENT GETS ITS OWN PROCESS GROUP AND NONE OF ITS CHILDREN OUTLIVE THE TURN (#2163).
+  # A `pi` that has finished its turn can leave tool children behind, and a wrapper that merely
+  # `wait`s for pi then exits lets those children be reparented to init where nothing owns them —
+  # measured 2026-10-19: **76 `pi`-shaped processes for 14 working lanes**, and one cell OOM-killed
+  # 37 processes plus its tmux server. With job control on, the background job is a process-GROUP
+  # leader, so after `wait` returns the whole group can be reaped instead of orphaned.
+  # `set -m` is bash's job control in a non-interactive shell: supported by /bin/bash 3.2 (the
+  # launchd interpreter) and by the cells' bash. If it is refused, the launch is byte-identical and
+  # the group kill below simply finds nothing — a refused `set` must never be a refused spawn.
+  # ⛔ THE CALLER'S JOB-CONTROL STATE IS RESTORED EXACTLY (#2163 review, P0). `was_m`/`jobctl` are
+  # assigned HERE, after the `local` declaration at the top of run_agent and BEFORE the first read:
+  # an earlier cut declared them and never assigned them, so under `set -u` this line aborted the
+  # function AFTER `pi` had been launched — no waiter, no group reap, no walltime row, and an
+  # orphaned agent. `jobctl` records whether `set -m` actually took effect.
+  was_m=0; case $- in *m*) was_m=1 ;; esac
+  jobctl=0
+  set -m 2>/dev/null && jobctl=1
+  # ⛔ `< /dev/null` IS PART OF THE JOB-CONTROL CHANGE (#2163 review, P2). With job control ON, bash
+  # no longer redirects an async command's stdin from /dev/null (it hands over the terminal/pipe), so
+  # a tool child could read the pane's pty — typed input stolen from a human — or, under
+  # `nonblocking-dispatch.sh`'s closed stdin, inherit a CLOSED fd 0. The agent is headless: it never
+  # reads stdin, so binding it to /dev/null restores the pre-change behaviour explicitly.
+  pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
+  # ⛔ THE WATCHDOG IS LAUNCHED UNDER THE SAME JOB CONTROL, and that is not cosmetic: `set +m`
+  # between the two launches left the watchdog in the CALLER's process group, so `-${w}` named a
+  # group that did not exist and its `sleep "$t"` child (up to the lane's 40-minute wall limit) was
+  # never reached by the group kill below — a no-op dressed as a reap. Both children are group
+  # leaders only if both are started while `set -m` is ON.
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
+  [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
   wait "$pid" 2>/dev/null; rc=$?
-  kill "$w" 2>/dev/null
+  # ⛔ KILL THE WATCHDOG'S WHOLE GROUP, not just its shell (#2163). `kill $w` ends the subshell but
+  # leaves its `sleep "$t"` child (up to the lane's 40-minute wall limit) reparented to init — a
+  # resident the census would then have to account for. With job control on, `$w` is a group leader.
+  kill "$w" 2>/dev/null; kill -TERM -- "-$w" 2>/dev/null; wait "$w" 2>/dev/null
+  # ── reap the turn's stragglers ────────────────────────────────────────────────────────────────
+  # The leader (pi) is gone by definition here, so the group can only still exist while a member of
+  # the tree it measured lives. `kill` returning 0 is what tells us a member DOES still exist — a
+  # group that is already empty costs nothing and, importantly, no `sleep`. The residual: a pid
+  # recycled as a NEW group leader inside the microseconds between `wait` and this call would be
+  # signalled; that is the same bound every group-signalling tool accepts, and the alternative
+  # (tracking every descendant while the agent runs) is a per-spawn process-table poll.
+  if [ "${pid:-0}" -gt 1 ]; then
+    if kill -TERM -- "-$pid" 2>/dev/null; then
+      echo "[reap-agent] agent group $pid had stragglers after the turn — TERM, then KILL after 1s" >> "$log"
+      sleep 1
+      kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
+  fi
   # ⛔ A REFUSAL AT THE SPAWN POINT IS THIS GATE'S OWN REFUSAL (agent-infra#1884). Without this arm
   # the installed `pi`'s 76 is read by every caller as "the agent ran and failed" — and the two
   # consequences are both real: fix-one.sh re-runs the merge chain for a fixer that never ran, and

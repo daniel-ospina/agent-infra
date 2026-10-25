@@ -538,7 +538,7 @@ warn_gh_prerequisite() { # warn_gh_prerequisite <home> <user>
     [ -n "$why" ] || return 0
     case "$why" in
         missing)
-            err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is not installed, so its open-PR gate cannot be evaluated"
+            err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is not installed, so its PR-state gate cannot be evaluated"
             err "  install gh (or point GH_BIN at it), or accept that only the uv and venv classes run on this box" ;;
         *)
             err "WARNING: the worktree class WILL SKIP EVERY REPO — gh is installed but NOT AUTHENTICATED for the HOME this unit will run with ($home)"
@@ -635,7 +635,7 @@ except ET.ParseError as e:
     say "  reaper: $REAPER"
     say "  launch: $PY_BIN $LAUNCHER --script $REAPER -- $MODE_FLAG"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
-    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the open-PR gate can run}"
+    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
     say "  state:  $STATE_DIR/disk-reaper.status"
     if $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
         say "  agent:  loaded"
@@ -747,7 +747,7 @@ do_install_systemd() {
     say "  reaper: $REAPER"
     say "  mode:   $MODE_FLAG"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
-    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the open-PR gate can run}"
+    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
     say "  state:  $STATE_DIR/disk-reaper.status"
     if $SC is-enabled "$UNIT_NAME.timer" >/dev/null 2>&1; then
         say "  timer:  enabled"
