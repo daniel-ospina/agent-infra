@@ -74,8 +74,8 @@ merged_value() { # <pr>
   gh api "repos/$1/pulls/$2" --jq .merged 2>/dev/null
 }
 
-confirm() { # <pr>
-  local repo merged
+confirm() { # <pr> [pending]
+  local repo merged mode="${2:-}"
   repo="$(resolve_repo)" || { printf 'CONFIRMED merged=UNREADABLE reason=unresolved-repo\n'; return 1; }
   merged="$(merged_value "$repo" "$1")"
   case "$merged" in
@@ -84,6 +84,13 @@ confirm() { # <pr>
   esac
   if [ "$merged" = "true" ]; then
     printf 'RECOMMEND: %s LANDED "merged=true %s"\n' "$1" "$(date -u +%H:%M:%SZ)"
+  elif [ "$mode" = "pending" ]; then
+    # ⛔ A TIMEOUT IS NOT A REFUSAL (P2, fresh review). On a `wait`/`poll` timeout this read is taken
+    # while the rail is STILL RUNNING, so `merged=false` is the state so far, not an outcome — and
+    # `REFUSED` is a verdict a merge-duty lane may record for a rail that has not finished (and
+    # frequently does land). The positive direction was already constrained; the negative one now
+    # says PENDING instead of claiming a result that does not exist yet.
+    printf 'RECOMMEND: %s PENDING (rail still running — merged=false so far, NOT a refusal)\n' "$1"
   else
     printf 'RECOMMEND: %s REFUSED\n' "$1"
   fi
@@ -140,14 +147,29 @@ cmd_wait() {
     die "no rail started for $pr — run 'rail-bg.sh start $pr' first"
   fi
   start=$SECONDS
+  local saw_live=0
   while pid_alive "$pr"; do
+    saw_live=1
     if [ $(( SECONDS - start )) -ge "$max" ]; then
       printf 'STILL RUNNING after %ss — %s\n' "$max" "$(tail -2 "$log" 2>/dev/null | tr '\n' ' ')"
-      confirm "$pr" || true
+      confirm "$pr" pending || true
       return 0
     fi
     sleep 15
   done
+  # ⛔ ARTIFACTS OUTLIVING THE RUN ARE NOT "FINISHED AFTER 0s" (P2, fresh review). pid/log files
+  # persist after every completed run, so a second `wait` on the same PR printed
+  # `── rail finished after 0s ──` and then the PREVIOUS run's log tail as if this call had watched
+  # it end — a fabricated rail event, and the tail is the part a lane quotes (it can be a different
+  # PR's STOP line). Only claim a finish the loop actually observed.
+  if [ "$saw_live" -eq 0 ]; then
+    printf 'no rail is running for %s (nothing to wait for)\n' "$pr"
+    printf '── log below is an EARLIER run, not one this call watched end ──\n'
+    tail -30 "$log" 2>/dev/null
+    printf 'NOTE: the rail process ending (and its exit code) is NOT proof of a landing — the API read below is.\n'
+    confirm "$pr" || true
+    return 0
+  fi
   printf '── rail finished after %ss ──\n' "$(( SECONDS - start ))"
   tail -30 "$log" 2>/dev/null
   printf 'NOTE: the rail process ending (and its exit code) is NOT proof of a landing — the API read below is.\n'
@@ -156,6 +178,12 @@ cmd_wait() {
 
 cmd_poll() {
   local max="$LAND_POLL_MAX" prs=() a
+  # ⛔ THE ENV DEFAULT IS VALIDATED TOO (P2, fresh review). `wait` validated its `max_s` but `poll`
+  # took `LAND_POLL_MAX` straight from the environment: with a non-numeric value the guard
+  # `[ $(( SECONDS - start )) -ge "$max" ]` returned 2, so the timeout arm never fired and the
+  # `while :` loop NEVER TERMINATED — the bound the README promises became inert, spamming a shell
+  # error every 20 s. An enforcer whose condition can never fire is worse than no bound.
+  is_numeric "$max" || die_usage "LAND_POLL_MAX must be numeric (got '$max')"
   while [ $# -gt 0 ]; do
     case "$1" in
       --max) [ -n "${2:-}" ] || die_usage "--max needs a value"; is_numeric "$2" || die_usage "max_s must be numeric (got '$2')"; max="$2"; shift 2 ;;
@@ -186,7 +214,8 @@ cmd_poll() {
   for pr in "${prs[@]}"; do
     printf '════ PR %s ════\n' "$pr"
     tail -14 "$(log_file "$pr")" 2>/dev/null
-    confirm "$pr" || true
+    # Same rule as the `wait` timeout: a rail that is still running has no outcome to recommend.
+    if pid_alive "$pr"; then confirm "$pr" pending || true; else confirm "$pr" || true; fi
   done
 }
 

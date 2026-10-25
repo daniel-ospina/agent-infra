@@ -75,8 +75,13 @@ python3.12 scripts/landing/landability.py <pr> [--repo owner/name] [--repo-dir P
 # real run, from an agent-infra worktree, against a tortoise PR:
 python3.12 scripts/landing/landability.py 6872 \
   --repo daniel-ospina/tortoise \
-  --repo-dir <tortoise-checkout>   # e.g. a tortoise worktree, not a path from one machine
+  --repo-dir <agent-infra-checkout>   # the checkout carrying scripts/lib/diff-normalize.py — NOT the PR's repo
 ```
+
+⛔ `--repo-dir` is **not** the PR's repo. It selects the *normalizer implementation* the review
+contract is defined in (`agent-infra` #1362 D1), so for a `tortoise` PR it is still an
+**agent-infra** checkout: `tortoise` carries no `scripts/lib/diff-normalize.py`, and pointing there
+fails closed with exit 2 rather than answering with a different normalization.
 
 - `--repo` defaults to `gh repo view --json nameWithOwner` resolved **in `--repo-dir`**.
 - `--repo-dir` defaults to the current directory; it is the checkout `gh` runs in and the one the
@@ -166,7 +171,7 @@ scripts/landing/rail-bg.sh poll  [--max s] <pr> [pr...]  # wait for several, the
 
 ```bash
 # real run: a tortoise PR with no review record — the rail stops, and the report says so
-LAND_DIR=<tortoise-checkout> \
+LAND_DIR=<agent-infra-checkout> \
 LAND_LOG_DIR=/tmp/pi-railbg-test LAND_REPO=daniel-ospina/tortoise \
   scripts/landing/rail-bg.sh start 6872
 LAND_DIR=... LAND_LOG_DIR=/tmp/pi-railbg-test LAND_REPO=daniel-ospina/tortoise \
@@ -181,10 +186,10 @@ LAND_DIR=... LAND_LOG_DIR=/tmp/pi-railbg-test LAND_REPO=daniel-ospina/tortoise \
 
 | Env | Default | What |
 |---|---|---|
-| `LAND_DIR` | git top level of this script's directory | the checkout the rail runs in; the rail is `$LAND_DIR/scripts/atomic-land.sh` |
+| `LAND_DIR` | git top level of this script's directory | the checkout the rail runs in; the rail is `$LAND_DIR/scripts/atomic-land.sh` — an **agent-infra** checkout, never the PR's repo (`tortoise` has no `scripts/atomic-land.sh`) |
 | `LAND_LOG_DIR` | `$TMPDIR/pi-landing-lane` | where `rail-<pr>.log` and `rail-<pr>.pid` live |
 | `LAND_REPO` | `gh repo view` **in `LAND_DIR`** | repo for the merged-state read |
-| `LAND_POLL_MAX` | `1500` | default `max_s` for `wait`/`poll` |
+| `LAND_POLL_MAX` | `1500` | default `max_s` for `wait`/`poll`; must be numeric, and a non-numeric value is refused (a bound that can never fire is not a bound) |
 
 Extra `start` args pass straight through to `atomic-land.sh` (`--dry-run`, `--no-wait`, or
 `-- --squash` for `admin-merge.sh`), which is how the tool was tested without mutating anything.
@@ -195,7 +200,12 @@ Extra `start` args pass straight through to `atomic-land.sh` (`--dry-run`, `--no
 `gh api repos/<o>/<r>/pulls/<n> --jq .merged`. A failed API read prints
 **`CONFIRMED merged=UNREADABLE reason=…`** — never an empty field, because an empty field is read
 as whatever the parser wants, and `false` would be a claim the tool cannot make. `RECOMMEND: …
-LANDED` is printed only on a read that returned `true`.
+LANDED` is printed only on a read that returned `true`, and `RECOMMEND: … REFUSED` only on a `false`
+read taken after the rail was observed to EXIT. A `false` read taken at a timeout — the rail is still
+running — prints `RECOMMEND: … PENDING` instead: the rail has no outcome yet, and a still-running
+rail frequently does land. Likewise `wait` on a PR whose pid/log files are left over from an earlier
+run says `no rail is running for <pr>` and labels the tail as an EARLIER run, rather than claiming
+it watched a finish.
 
 Exit `0` means the wait/start completed. It is **not** a landing verdict. Read the printed value.
 
@@ -223,12 +233,12 @@ anything is read **the first column as a PR number**, which every queue, `gh pr 
 list already is:
 
 ```bash
-python3.12 scripts/landing/bulk.py --repo daniel-ospina/tortoise --repo-dir <tortoise-checkout> \
+python3.12 scripts/landing/bulk.py --repo daniel-ospina/tortoise --repo-dir <agent-infra-checkout> \
   6872 6862 6860 6837 6804 6794 6791 6788 6762 6742 6731 6719
 
 # or any file whose first column is a PR number ('-' = stdin)
 gh pr list --repo daniel-ospina/tortoise --state open --limit 45 --json number --jq '.[].number' \
-  | python3.12 scripts/landing/bulk.py --repo daniel-ospina/tortoise --repo-dir <checkout> --prs-file -
+  | python3.12 scripts/landing/bulk.py --repo daniel-ospina/tortoise --repo-dir <agent-infra-checkout> --prs-file -
 ```
 
 Blank lines and `#` comments are skipped. `--jobs` (default 8) sets concurrency.

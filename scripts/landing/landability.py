@@ -406,6 +406,15 @@ def check(pr, repo, repo_dir, normalizer):
         d = json.loads(out)
     except ValueError:
         raise Failure(f"gh pr view {pr} returned unparseable JSON: {out.strip()[:200]}")
+    # ⛔ A PR BODY THAT PARSES TO A NON-OBJECT IS AN ABSTENTION (P2, fresh review). `gh pr view`
+    # answered, but with a shape this tool cannot read, so every `.get()` below would raise
+    # AttributeError — which `main()` does not catch and `bulk.py`'s `except Failure` does not
+    # either, so one bad row aborted the WHOLE batch from `ThreadPoolExecutor.map`. Same guard
+    # `parse_ndjson` applies to a check-run line and `read_record` applies to a record.
+    if not isinstance(d, dict):
+        raise Failure(
+            f"gh pr view {pr} returned a non-object JSON body: {out.strip()[:200]}"
+        )
 
     head = d.get("headRefOid") or ""
     base = d.get("baseRefName") or ""
@@ -533,10 +542,16 @@ def report(res):
     if res["record"] is None:
         print(f"record: NONE ({res['record_file'] or 'no record file'})")
     else:
+        # ⛔ COERCE AT THE PRINT BOUNDARY TOO (P1, fresh review). `head_matches()` and
+        # `record_binding()` were hardened against a non-string field, but this slice is one call
+        # AFTER them: a legacy record with `"head_sha": 12345` computed a correct verdict and then
+        # raised `TypeError: 'int' object is not subscriptable` — exit 1 with a traceback, on the
+        # one tool a merge-duty lane runs to decide whether it may land. The record is an
+        # unqualified, hand-editable file, so every field read must be a `str` at the point of use.
         print(
-            f"record: verdict={rec.get('verdict')} head={(rec.get('head_sha') or '')[:12]} "
-            f"diff={(rec.get('diff_sha256') or '')[:12] or 'none'} "
-            f"merge_base={(rec.get('merge_base_sha') or '')[:12] or 'none'} "
+            f"record: verdict={rec.get('verdict')} head={str(rec.get('head_sha') or '')[:12]} "
+            f"diff={str(rec.get('diff_sha256') or '')[:12] or 'none'} "
+            f"merge_base={str(rec.get('merge_base_sha') or '')[:12] or 'none'} "
             f"reviewed={rec.get('reviewed_at')} file={res['record_file']}"
         )
     print(f"live diff: {res['live_diff'][:12] or 'none'}")
@@ -583,6 +598,15 @@ def main(argv=None):
         report(check(args.pr, repo, repo_dir, normalizer))
     except Failure as exc:
         print(f"GH-FAIL {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — see the comment; this IS the documented contract
+        # ⛔ THE DOCUMENTED CONTRACT IS "0 = a verdict was printed; 2 = it could not answer" (P1,
+        # fresh review). Anything the `Failure` path does not name used to escape as an
+        # undocumented exit 1 with a traceback, and `bulk.py` catches only `Failure`, so it also
+        # aborted a whole batch. An unexpected exception means NO verdict was answered — that is
+        # exit 2, named, never a guess and never a crash. `SystemExit`/`KeyboardInterrupt` are
+        # BaseExceptions and still propagate, so Ctrl-C is not swallowed here.
+        print(f"GH-FAIL {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     return 0
 

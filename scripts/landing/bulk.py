@@ -127,6 +127,19 @@ def main(argv=None):
             return landability.check(pr, repo, repo_dir, normalizer)
         except landability.Failure as exc:
             return {"pr": pr, "verdict": "BLOCKED(unreadable)", "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — the batch boundary must not abort on one row
+            # ⛔ ONE UNREADABLE ROW MUST NOT ABORT THE REPORT (P2, fresh review). `check()` was
+            # hardened against four field-shape hazards (non-object record, non-string sha,
+            # non-string digest, unnamed run), but every one of them arrives as a NON-`Failure`
+            # exception, and `ThreadPoolExecutor.map` re-raises on first iteration — so a single
+            # bad row produced a traceback and exit 1 with ZERO rows printed, using the exit code
+            # this module reserves for "a report was printed and a row needs attention". The
+            # aggregate handler at the batch boundary is the one that must be unconditional.
+            return {
+                "pr": pr,
+                "verdict": "BLOCKED(unreadable)",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
     with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
         rows = list(ex.map(one, targets))

@@ -159,6 +159,26 @@ ck(m.record_binding({"verdict": "clean", "head_sha": 12345, "diff_sha256": "b" *
 ck(m.record_binding({"verdict": "clean", "head_sha": "c" * 40, "diff_sha256": 999},
                     "a" * 40, "b" * 64) == "NEEDS-REVIEW(no-diff-identity)",
    "record_binding: a non-string digest is an abstention (at a non-matching head)")
+# (5c) the PRINTER is the last unguarded read of the same field class (P1, fresh review):
+# `report()` sliced `head_sha` directly, so the record blessed by the assertion above computed a
+# correct CARRY verdict and then raised TypeError — exit 1 with a traceback, on the tool a
+# merge-duty lane runs to decide whether it may land. Printing must not be able to crash.
+_res = {"pr": "1", "repo": "o/r", "state": "OPEN", "draft": False, "head": "a" * 40,
+        "branch": "b", "base": "main", "mergeable": "MERGEABLE", "merge_state": "CLEAN",
+        "record": {"verdict": "clean", "head_sha": 12345, "diff_sha256": 999,
+                   "merge_base_sha": {"not": "a string"}, "reviewed_at": "t"},
+        "record_file": "/x/1.json", "live_diff": "b" * 64, "checks_total": 1,
+        "in_flight": [], "failed": [], "untested": [], "not_tested": [],
+        "base_repointed": False, "binding": "CARRY", "verdict": "CARRY"}
+import io, contextlib
+_buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_buf):
+        m.report(_res)
+    ck("record: verdict=clean" in _buf.getvalue(),
+       "report(): a non-string record field is coerced, not sliced", _buf.getvalue()[:120])
+except Exception as exc:
+    ck(False, "report(): a non-string record field must not crash", f"{type(exc).__name__}: {exc}")
 
 # (6) `check()`'s PRECEDENCE LADDER — the fail-open guard the tool actually runs (P2, fresh review):
 # `elif not runs: BLOCKED(checks-unmeasured)` is the only arm that stops an EMPTY check surface from
@@ -170,11 +190,22 @@ PR = {"state": "OPEN", "isDraft": False, "headRefOid": "a" * 40, "baseRefName": 
       "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "headRefName": "b"}
 _rec = {"verdict": "clean", "head_sha": "a" * 40, "diff_sha256": "b" * 64}
 
-def run_check(*, pr=None, runs="", diff=b"diff --git a/x b/x\n+1\n", record=_rec, bytes_rc=0):
+def run_check(*, pr=None, runs="", diff=b"diff --git a/x b/x\n+1\n", record=_rec, bytes_rc=0,
+              merge_base=None):
     saved = (m.gh_text, m.gh_bytes, m.read_record, m.normalize)
     prj = dict(PR, **(pr or {}))
-    m.gh_text = lambda argv, d: (0, __import__("json").dumps(prj), "") if argv[:2] == ["pr", "view"] \
-        else (0, runs, "")
+
+    def _gh_text(argv, d):
+        if argv[:2] == ["pr", "view"]:
+            return (0, __import__("json").dumps(prj), "")
+        # `merge_base_of` reads `compare/<base>...<head>`; without this arm the stub below would
+        # hand it the CHECK-RUN surface and the two reads would be indistinguishable (P2, fresh
+        # review: the base-repointed arm of the ladder was unpinnable for exactly that reason).
+        if merge_base is not None and any("compare/" in str(x) for x in argv):
+            return (0, merge_base + "\n", "")
+        return (0, runs, "")
+
+    m.gh_text = _gh_text
     m.gh_bytes = lambda argv, d: types.SimpleNamespace(returncode=bytes_rc, stdout=diff, stderr=b"")
     m.read_record = lambda repo, n: (record, "/home/x/.pi/agent/reviews/1.json")
     m.normalize = lambda raw, n: raw
@@ -198,6 +229,30 @@ r = run_check(pr={"isDraft": True, "mergeable": "CONFLICTING", "mergeStateStatus
 ck(r["verdict"] == "BLOCKED(draft)", "check(): draft outranks merge-conflict", r["verdict"])
 r = run_check(pr={"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"})
 ck(r["verdict"] == "BLOCKED(merge-conflict)", "check(): a conflict blocks", r["verdict"])
+
+# ⛔ THE THREE UNPINNED LADDER ARMS (P2, fresh review). The four cases above leave `untested`,
+# `not-tested` and `base-repointed` unconstrained: a regression that moved the `untested` arm BELOW
+# the record binding would report a head whose newest attempt is `cancelled` as `AT`/`CARRY` — a
+# false clear, the class this file exists to defend — with every assertion above still green.
+# (a) `cancelled`/`stale` ran but exercised nothing → BLOCKED, never a clear
+r = run_check(runs='{"id":1,"name":"t","status":"completed","conclusion":"cancelled"}\n')
+ck(r["verdict"] == "BLOCKED(checks-untested)",
+   "check(): a cancelled head is BLOCKED(checks-untested), never AT", r["verdict"])
+# (b) `skipped`/`neutral` are green for TREE HEALTH and credit nothing in the rail's vocabulary —
+# deliberately NOT a blocking reason (blocking on them would refuse every PR, not the vacuous ones).
+r = run_check(runs='{"id":1,"name":"t","status":"completed","conclusion":"skipped"}\n')
+ck(r["verdict"] == "AT",
+   "check(): a skipped job does NOT block a head-bound record", r["verdict"])
+# (c) a base repoint leaves every head-bound check green while the certified diff is not the diff
+# that would merge, so it must outrank the (empty) check surface.
+r = run_check(
+    runs="",
+    record={"verdict": "clean", "head_sha": "a" * 40, "diff_sha256": "b" * 64,
+            "merge_base_sha": "e" * 40},
+    merge_base="f" * 40,
+)
+ck(r["verdict"] == "BLOCKED(base-repointed)",
+   "check(): base-repointed outranks checks-unmeasured", r["verdict"])
 # a 2xx body that is NOT a diff must not be hashed and reported as "changed"
 try:
     run_check(diff=b'{"message":"Not Found"}')
