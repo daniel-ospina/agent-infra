@@ -1,0 +1,15 @@
+# An aliased `on:` value is not a trigger this reader can resolve — recording `*t` AS a trigger name
+# left the file neither PR nor push, so every rule became vacuous and it reached GREEN (#2660 round 4).
+name: Push on alias
+x-triggers: &t
+  push:
+    branches: [main]
+on: *t
+concurrency:
+  group: push-on-alias-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

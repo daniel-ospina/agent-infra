@@ -1,0 +1,9 @@
+# The same pairing hazard on the PR side: with `pull_request` folded into the neighbouring entry, R1
+# went vacuous and a PR workflow with NO concurrency block at all reported GREEN (#2660 round 12).
+name: pr on flow apostrophes
+on: {workflow_dispatch: {}, description: Don't ask, pull_request: {}, description2: it's fine}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

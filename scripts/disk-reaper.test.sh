@@ -55,7 +55,7 @@
 #
 # Hermetic: every fixture is under $T, HOME is redirected, the delegates' state dirs are $T, and the
 # only real tools are git/ps/lsof/tmux plus real processes. The private repo has NO GitHub remote, so
-# the worktree owner's open-PR gate is not-applicable and this suite never calls gh.
+# the worktree owner's PR-state gate is not-applicable and this suite never calls gh.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,6 +80,14 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-test.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
+# ⛔ THE SCRATCH-ROOT ARMS MUST BE SCOPED TO THE FIXTURE (#2542). The abandoned-worktree arm and the
+# duplicate-install class sweep a SCRATCH ROOT (`/tmp` by default) rather than a repo, so without this
+# a `--apply` assertion anywhere in this suite would reap the machine's own `/tmp` worktrees — it did,
+# once, on this very box (four clean abandoned checkouts). A test suite that can delete outside its
+# fixture is not a test suite. Every case that needs a synthetic root sets its own.
+REAP_AW_ROOTS="$T/scratch/absent"
+REAP_DI_ROOTS="$T/scratch/absent"
+export REAP_AW_ROOTS REAP_DI_ROOTS
 SLEEPERS=""
 cleanup() {
     local p
@@ -135,6 +143,16 @@ RECENT_DATE="2026-09-13T12:00:00+00:00"
 # ONE rung: the pass runs with HOME redirected, its state under $T, the uv cache seam pointed at a
 # fixture, and the owner state dirs under $T. Nothing here can read or write the real box's state.
 ENVNAME=""
+# ⛔ RULE 7 IS PART OF THE FIXTURE (#2721). Every worktree this suite creates is
+# seconds old, so under the 45-minute freshness floor NOTHING here would be a
+# removal candidate — and this suite is about the DELEGATION and accounting, not
+# about the floor. Pinning the witness to an ancient timestamp restores the
+# pre-#2721 age model for these fixtures; the floor itself is covered by
+# pi-reap-worktrees.test.sh G6e (deterministic) and G6f (real clock + real ctime).
+# ⚠️ This block sits ABOVE the assignment chain on purpose: a comment line put
+# INSIDE a `\`-continued list ends the command word, so every assignment before
+# it stops being part of the invocation's environment and the pass silently runs
+# against the REAL $HOME — 79 unrelated assertions went red that way once.
 run_reaper() { # run_reaper <args...>
     HOME="$T/home" \
     DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" \
@@ -149,6 +167,8 @@ run_reaper() { # run_reaper <args...>
     REAP_WT_LOG="$T/$ENVNAME/state/pi-reap-worktrees.log" \
     REAP_VENV_LOG="$T/$ENVNAME/state/reap-lane-venvs.log" \
     REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}" \
+    REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES:-0}" \
+    REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-1}" \
     VENV_REAPER="${VENV_REAPER:-}" \
     WORKTREE_REAPER="${WORKTREE_REAPER:-}" \
     CACHE_REAPER="${CACHE_REAPER:-}" \
@@ -1875,7 +1895,7 @@ ST_T55="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
 assert_contains "$ST_T55" "skipped_worktree=$REPO_BAD[gh-not-authenticated(rc=4)]" \
     "T55 the pass record carries the skipped repo AND its reason"
 assert_contains "$ST_T55" "verdict_worktree=fail-closed" "T55 the class verdict is still fail-closed"
-assert_contains "$ST_T55" "open-PR gate unverifiable" "T55 and names the cause in detail="
+assert_contains "$ST_T55" "PR-state gate unverifiable" "T55 and names the cause in detail="
 # ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST: `--print-status` is the surface
 # `cloud-cell-supervisor.sh` reads, so the skipped repo must be reachable from it and not only from a
 # hand-`cat` of the record (the same defect `classes=`/`repos=` had).
@@ -1920,7 +1940,7 @@ assert_eq "$(printf '%s\n' "$OUT" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | hea
 
 # ── T56: the installer NAMES the worktree class's gh prerequisite (#2443) ───────────────────────
 # The unit pins the delegates, the bounded library and GH_TIMEOUT — but gh's credentials are PER-HOME
-# and the rendered `Environment=HOME={{HOME}}` decides whether the open-PR gate can ever run. On the
+# and the rendered `Environment=HOME={{HOME}}` decides whether the PR-state gate can ever run. On the
 # measured cell that HOME held no `~/.config/gh`, so the class skipped every repo every hour while the
 # unit went red for a reason nobody could read. The installer is the only component that knows the HOME
 # it is rendering, so it must say so BEFORE the hour is wasted — and must NOT refuse (a box with no

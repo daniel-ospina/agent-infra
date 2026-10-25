@@ -592,9 +592,13 @@ echo "  -- (3c2) the refund PRODUCER (fix-one.sh) writes the marker the controll
 rm -rf "$TMP/gO"; mkdir -p "$TMP/gO/state"
 printf '2\n' > "$TMP/gO/state/fixcount-4242"
 : > "$TMP/gO/log"
+# ⛔ THE FRAGMENT IS THE FUNCTION ITSELF (agent-infra#2762 review, 2nd cycle, P2): fix-one.sh now
+# defines `refund_gate_attempt` so the repo-identity refusals — which exit BEFORE any agent could be
+# booked — reuse the SAME refund instead of a second copy. Sourcing defines it; the call below is the
+# entry point the two production paths use.
 (
   PR=4242; HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; O="$TMP/gO"; L="$TMP/gO/log"; CTRL=1
-  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"
+  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"; refund_gate_attempt
 ) >/dev/null 2>&1
 [ -f "$TMP/gO/state/fixgate-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ] \
   && ok "(3c2) a gate refusal writes fixgate-<PR>-<HEAD> (the marker the controller refunds on)" \
@@ -604,7 +608,7 @@ printf '2\n' > "$TMP/gO/state/fixcount-4242"
   || bad "(3c2) fixcount=[$(cat "$TMP/gO/state/fixcount-4242" 2>/dev/null)] — the refund block is not wired"
 rm -rf "$TMP/gO2"; mkdir -p "$TMP/gO2/state"; printf '2\n' > "$TMP/gO2/state/fixcount-4242"
 ( PR=4242; HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; O="$TMP/gO2"; L="$TMP/gO2/log"; CTRL=0
-  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh" ) >/dev/null 2>&1
+  . "$TMP/isnum.sh"; . "$TMP/gaterefund.sh"; refund_gate_attempt ) >/dev/null 2>&1
 [ ! -f "$TMP/gO2/state/fixgate-4242-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" ] && [ "$(cat "$TMP/gO2/state/fixcount-4242")" = "2" ] \
   && ok "(3c2) a MANUAL run (CTRL=0) refunds nothing (it never booked an attempt)" \
   || bad "(3c2) a manual run refunded an attempt it never booked"
@@ -791,9 +795,14 @@ case "$_landed_arm" in *'fixgate-$pr-'*) rc=0 ;; *) rc=1 ;; esac
 
 echo
 echo "  -- wiring: the role's own shard is registered in the ONE shard list --"
-grep -q 'red-fixer.test.sh' "$HERE/../../scripts/run-bash-shards.sh" \
-  && ok "red-fixer.test.sh is a shard (a suite nobody runs is not a gate)" \
-  || bad "red-fixer.test.sh is NOT in scripts/run-bash-shards.sh — it would never run in CI"
+# ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (agent-infra#2609): the list
+# is DERIVED from the tree, so the driver's text names no suite and a `grep` of the file would always
+# fail — and it failed with a message that told the next lane to hand-edit the driver.
+if bash "$HERE/../../scripts/run-bash-shards.sh" --list 2>/dev/null | grep -qx 'scripts/orchestrator-harness/red-fixer.test.sh'; then
+  ok "red-fixer.test.sh is a shard (a suite nobody runs is not a gate)"
+else
+  bad "red-fixer.test.sh is NOT executed by run-bash-shards.sh --list — it would never run in CI"
+fi
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

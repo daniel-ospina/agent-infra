@@ -82,11 +82,14 @@ from datetime import datetime, timedelta, timezone
 # `REPO` BEFORE it execs this file, then restores it -- so the default below is what every OTHER
 # caller still gets, and that is the property `test_objective.py`'s seam block pins (it deletes the
 # variable first, so it pins the default rather than the ambient state of whichever suite ran before
-# it). The remaining shipped callers that do NOT supply it, and are therefore still answered about
-# tortoise, are the direct script callers of this file: `heartbeat-loop.sh:470`,
-# `orchestrator-heartbeat.sh:224`, `cadence-nudge.sh:329,475`, `lane-scan-fallback.sh:76`, and
-# `pr-loop.py`'s own `_objective()`. Fixing those, and the required-set half of the same seam, is
-# the open work on **#2518** (the live root -- #1989 is CLOSED and its P1s were carried to #2518).
+# it). `pr-loop.py` is the SECOND (#2708): its `_objective()` derives the slug from its checkout's
+# `origin` (through `repo-slug.sh`, the ONE deriver) and REFUSES when it cannot, rather than letting
+# the default answer for another repo -- its effect is pinned by
+# `tests/inert-capability-effects/run.sh` §1. The remaining shipped callers that do NOT supply it,
+# and are therefore still answered about tortoise, are the direct script callers of this file:
+# `heartbeat-loop.sh:470`, `orchestrator-heartbeat.sh:224`, `cadence-nudge.sh:329,475`, and
+# `lane-scan-fallback.sh:76`. Fixing those, and the required-set half of the same seam, is the open
+# work on **#2518** (the live root -- #1989 is CLOSED and its P1s were carried to #2518).
 # Naming them here is so the next lane can find them from the file that knows.
 REPO = os.environ.get("OBJECTIVE_REPO") or "daniel-ospina/tortoise"
 STATE = os.path.expanduser("~/.pi/agent/state")

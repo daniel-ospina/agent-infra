@@ -24,7 +24,18 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 GATE="$HERE/spawn-gate.sh"
 mkdir -p "$TMP/bin" "$TMP/O/state"
 LOG="$TMP/log"; PROMPT="$TMP/prompt"; PI_LOG="$TMP/pi.log"; MERGE_LOG="$TMP/merge.log"
-printf 'a prompt\n' > "$PROMPT"
+# ⛔ THE FIXTURE IS A REAL BRIEF NOW (agent-infra#2258). `run_agent` refuses a brief that carries no
+# research contract (AGENT_BRIEF_REFUSED, 80) BEFORE it reads load or disk, so a fixture of
+# `printf 'a prompt\n'` would turn every control below into a brief refusal and the load/disk
+# assertions would pass while testing nothing. Rendering the canonical block from the shipped helper
+# keeps this suite's fixture HONEST (it is the same text a real dispatch carries) and pins the gate's
+# own advice as admissible — if the canonical block ever stopped satisfying the validator, this line
+# fails here rather than in production.
+PROMPT_SECTION="$(bash "$HERE/brief-gate.sh" --section lane 2>/dev/null)"
+[ -n "$PROMPT_SECTION" ] || { echo "  ❌ brief-gate.sh --section produced nothing — cannot build a valid fixture" >&2; exit 1; }
+{ printf 'a prompt for a lane\n\n'; printf '%s\n' "$PROMPT_SECTION"; } > "$PROMPT"
+bash "$HERE/brief-gate.sh" --check "$PROMPT" lane 2>/dev/null \
+  || { echo "  ❌ the suite's own fixture brief is REFUSED by the gate — the fixture is not a brief" >&2; exit 1; }
 
 echo "==> spawn-gate self-test ($HERE)"
 
@@ -104,25 +115,42 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # `extensions/` also launches `pi` and is outside this guard's declared population. It can also
   # FALSE-POSITIVE on a non-launcher carrying a `-p` token and a `--no-session` mention, which fails
   # CLOSED (RED, and the file is named), so it cannot hide a launch path.
+  # A NON-LAUNCHER PATH IS EXCLUDED BY NAME, and the exclusion is ASSERTED rather than trusted.
+  # `pi-done-not-exited.py` (#2163) INSPECTS print-mode `pi` processes: it quotes
+  # `pi -p --no-session` in its prose and matches the launch shape in a regex (it is how it tells a
+  # launcher from a bystander), but it launches nothing. Carrying those tokens is precisely the
+  # false-positive class this detector's STATED LIMITS paragraph names, and the exclusion list is
+  # where the paragraph says a non-launcher belongs — declaring it in EXPECTED_PI instead would
+  # assert the opposite of the truth, that a census of launch paths contains a file with none.
+  # The exclusion hides nothing: the assertion below the censuses requires that file to carry no
+  # spawn primitive at all, so a future launch path added to it comes back into the census.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
   done < <(git -C "$ROOT" ls-files --cached --others --exclude-standard "$@")
-  printf '%s' "${found# }"
+  # ⛔ SORTED, so the EQUALITY below is a SET equality. `git ls-files --cached --others` emits
+  # UNTRACKED files first and then the sorted index, so a brand-new invoker (this suite's own
+  # #2163 case: lane-exec.sh before it was committed) made the census disagree with a sorted
+  # EXPECTED list for a reason that has nothing to do with the population — a red that says
+  # "a launch path is ungated" when the truth is "the file is not staged yet". Sorting both sides
+  # keeps the assertion strict about MEMBERSHIP and indifferent to staging state.
+  [ -n "$found" ] || { printf ''; return 0; }
+  printf '%s\n' ${found# } | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 # The censuses need a git work tree: `git ls-files` is the index-bounded primitive (per AGENTS.md
 # "Search"), and if it fails the set comes back empty and the EQUALITY below goes RED — fail-closed,
 # which is the right direction for a guard whose job is "no ungated launch path exists".
 ROOT="$(cd "$HERE/../.." && pwd)"
-# merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). The assertion
-# is deliberately an EQUALITY, so the residual is asserted rather than left silent, and a THIRD
-# pi-invoker — or a regression in either of these two — fails it.
-EXPECTED_PI="merge-one.sh spawn-gate.sh"
+# merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). lane-exec.sh is
+# the #2163 launcher, which carries no wrapper BY DESIGN (see its own assertion below). The assertion
+# is deliberately an EQUALITY, so each residual is asserted rather than left silent, and a NEW
+# pi-invoker — or a regression in these — fails it.
+EXPECTED_PI="lane-exec.sh merge-one.sh spawn-gate.sh"
 got_pi="$(scan_pi 'scripts/orchestrator-harness/*' | sed "s#scripts/orchestrator-harness/##g")"
 [ "$got_pi" = "$EXPECTED_PI" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      pi-invokers found: [${got_pi:-<none>}]"
@@ -138,11 +166,27 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # wall-clock watchdog), the SAME posture merge-one.sh's reviewer has — the installed `pi` shim is the
 # load gate at the spawn point, and its rc=76 refusal is handled explicitly (exit 75, nothing
 # consumed) — but no load gate of its OWN, so it belongs in this list by name, not silently.
-EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
+# `scripts/orchestrator-harness/lane-exec.sh` (#2163) is the launcher that `exec`s pi (declared below).
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/lane-exec.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh scripts/review-pr.sh"
 got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
-ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh declared)" $rc
+ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh + lane-exec.sh declared)" $rc
+# ⛔ lane-exec.sh (#2163) is the SPAWN-POINT-GATED launcher: it `exec`s `pi`, so it has no wrapper to
+# route through run_agent() and no place to apply the DISK gate (which is per-worktree and therefore
+# a caller's business, the same named residual cloud-cell-bringup.sh carries). The LOAD gate reaches
+# it anyway, at the shim. What this pins is the half that made it worth writing: it must EXEC, never
+# background — a fork here would re-create the surviving wrapper the issue exists to remove.
+grep -qE '^[[:space:]]*exec pi ' "$HERE/lane-exec.sh" && rc=0 || rc=1
+ck "lane-exec.sh EXECs pi (no wrapper survives the turn)" $rc
+
+# ... and the one path excluded by NAME is really a NON-launcher, because that is the whole reason it
+# may sit outside the census. Asserted on the SPAWN PRIMITIVES, deliberately not on `run_agent` —
+# this file names `run_agent` and `pi` in prose and matches both in regexes on purpose (telling a
+# launcher from a bystander is its job). If it ever gains a way to START a process, this goes RED and
+# the path comes out of the exclusion list above.
+if grep -qE 'subprocess|Popen|os\.system|os\.exec|os\.spawn|os\.fork|popen' "$HERE/pi-done-not-exited.py" 2>/dev/null; then rc=1; else rc=0; fi
+ck "the excluded pi-done-not-exited.py is a NON-launcher (carries no spawn primitive), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -351,6 +395,53 @@ ck "a started run appends one 6-field row to walltime.tsv carrying the ASKED-FOR
 case "$f5" in ''|*[!0-9]*) rc=1 ;; *) rc=0 ;; esac
 ck "the recorded elapsed is a non-negative INTEGER, not merely present (f5='${f5:-<empty>}')" $rc
 
+# ── 7b) A TURN'S STRAGGLERS DO NOT OUTLIVE run_agent (#2163) ────────────────────
+# The group the agent runs in is the whole reason the launch is under job control: a `pi` that
+# finished its turn can leave a tool child behind, and a wrapper that only `wait`s for pi then exits
+# lets it be reparented to init. Measured on the box that motivated #2163: 76 pi-shaped processes for
+# 14 working lanes. The stub forks a long sleeper and exits; after run_agent returns the sleeper must
+# be GONE. (A red here means the group reap is inert — e.g. the watchdog was launched outside the
+# job-control window, which was a real cycle-1 defect.)
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+# A DIRECT background `sleep` (not a subshell), so `$!` IS the sleeper the test must see gone, and a
+# cleanup can end exactly that process.
+sleep 300 &
+printf '%s\n' "$!" > "$STRAGGLER_PID"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+: > "$TMP/straggler.pid"
+PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" STRAGGLER_PID="$TMP/straggler.pid" O="$TMP/O" DISK_MIN_FREE_MB=1 bash -c '
+  . "$1"
+  LOG="$2"; PROMPT="$3"
+  load1() { printf "1"; }
+  run_agent 30 "$LOG" "$PROMPT" "straggler test" >/dev/null 2>&1
+' _ "$GATE" "$LOG" "$PROMPT" 2>/dev/null
+sp="$(cat "$TMP/straggler.pid" 2>/dev/null)"
+# ⛔ AN EMPTY PID FILE IS A FAILED LEG, NOT A PASS (#2163 review, P3). The stub writes the sleeper's
+# pid; if it is absent the agent never ran, and `[ -n "$sp" ] && …` would then fall through to success
+# — making the ONLY behavioural proof of the group reap vacuously green on an inert launch.
+survivor=0
+case "$sp" in
+  ''|*[!0-9]*) rc=1 ;;
+  *) if kill -0 "$sp" 2>/dev/null; then rc=1; survivor=1; else rc=0; fi ;;
+esac
+if [ "$survivor" = "1" ]; then
+  # Cleanup, fenced on WHAT the pid is: a recycled pid must not be killed blindly.
+  case "$(ps -o args= -p "$sp" 2>/dev/null)" in
+    *"sleep 300"*) kill -KILL "$sp" 2>/dev/null ;;
+  esac
+fi
+ck "run_agent reaps the turn's straggler (pid ${sp:-<none>} is gone after the turn)" $rc
+# restore the plain stub for the cases below
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+echo "PI_RAN" >> "$PI_LOG"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+
 # ── 8) the gate RE-READS at the spawn, and a refusal is not a `pi` exit status ───
 # This is the whole point of the port: a chain-<N> worker dispatched on a quiet box may open its PR
 # 90 minutes later, and the reading that governs is the one taken at the spawn.
@@ -439,6 +530,11 @@ ck "the spawn point's fork code ($_pf) is DISTINCT from the caller-facing one ($
 RIG="$TMP/rig"; RREPO="$RIG/repo"; RO="$RIG/O"
 mkdir -p "$RIG/bin" "$RO/logs" "$RO/state" "$RREPO"
 git -C "$RREPO" init -q -b main
+# ⛔ THE FIXTURE IS A CHECKOUT OF THE REPO THE ARMS NAME (agent-infra#2724/#2694). lane.sh/fix-one.sh
+# now assert the worktree's origin against the target slug and refuse (72) when it differs or is
+# unreadable — so a fixture with no origin would be refused by the REPO gate and every load/disk arm
+# below would assert a gate that never ran.
+git -C "$RREPO" remote add origin https://github.com/daniel-ospina/agent-infra.git
 git -C "$RREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 git -C "$RREPO" branch work
 git -C "$RREPO" branch adoptbranch   # adopt-fix gets its OWN branch: `work` is already checked out
@@ -486,7 +582,12 @@ export CIQ_GH="$RIG/bin/gh-queue"
 # PATH edit; the stub is therefore defined as an exported function as well as a file. The file stub
 # is KEPT because it is what the pre-export `drive` checks above resolve — and because dropping the
 # `export -f` below costs a RED control (fail-closed), never another silently-real agent.
-pi() { echo PI_RAN >> "$PI_LOG"; return 0; }
+# ⛔ AND WHETHER THE PR-OWNER LOCK WAS HELD WHILE IT RAN (review of PR #2576, P2). §9b's other
+# assertions are satisfied by a tree that takes the lock, RELEASES it immediately, and then runs
+# the agent that pushes — which is the whole defect. The lock must be held ACROSS the run, so the
+# only place that can witness it is the agent stub itself. It records the RECORD'S CONTENT too, so a
+# takeover can be told apart from a steal that kept the dead pid in place.
+pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && { echo PI_SAW_LOCK >> "$PI_LOG"; echo "PI_LOCK_OWNER=$(cat "$PRLOCK_PATH" 2>/dev/null)" >> "$PI_LOG"; }; return 0; }
 export -f pi
 # ...and pin the MECHANISM, not only its effect: the whole fix rests on the function surviving into
 # the callers' environment, so assert it is there BY NAME. Otherwise a future edit that drops the
@@ -527,7 +628,14 @@ ck "fix-one.sh NAMES the load gate on a load refusal — the disk wording is not
 # The fixture is derived FROM THE SHIPPED HELPER (only the constant's definition is removed), so it
 # tracks the file under test instead of re-implementing a pre-fix helper by hand.
 mkdir -p "$RIG/stale"
+cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RIG/stale/"
+# ⛔ THE VALIDATOR TRAVELS WITH THE STALE HELPER, AND THAT IS NOT A WEAKENING (#2258). What is stale
+# here is `spawn-gate.sh`'s refusal CONSTANTS, not the brief rules: a fixture that omitted
+# `brief-gate.sh` would make fix-one.sh exit 78 (cannot verify) and this arm would read "78" as the
+# stale-helper behaviour it is meant to test — passing for the wrong reason. The fixer's dependency on
+# the validator is the same class as its dependency on spawn-gate.sh.
 cp "$HERE/fix-one.sh" "$RIG/stale/"
+cp "$HERE/brief-gate.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
     "$HERE/spawn-gate.sh" > "$RIG/stale/spawn-gate.sh"
@@ -606,6 +714,262 @@ dp_p="$(cd "$dp" 2>/dev/null && pwd -P)"; wt_p="$(cd "$RREPO/.worktrees/fix-7" 2
 [ -n "$dp_p" ] && [ "$dp_p" = "$wt_p" ]; rc=$?
 ck "the fixer's disk reading is the WORKTREE volume, not the main checkout (path='${dp:-<none>}')" $rc
 
+# ── 9b) THE PR-OWNER LOCK: a fixer never runs while a LANDER owns the PR ──────
+# ⛔ THE SUBJECT IS THE SHIPPED `fix-one.sh`, DRIVEN. The defect is that `merge-one.sh` and the
+# doctor's `merge` role serialise on `$O/state/mergeclaim-<PR>.lock` while the ONE worker whose
+# product is a PUSH did not, so a lander could re-resolve a head that a fixer then moved under it —
+# and the rail refuses, with the attestation the review chain had just minted gone stale. A grep for
+# the filename would pass on an arm that opens the lock and never tests it, so every check below runs
+# the real script and asserts on what it DID: whether the stub agent ran, whether the chain was
+# re-run, which marker was written, and whether a LIVE owner's lock survived.
+#
+# ⛔ THE HEAD IS STUBBED AS A FUNCTION, NOT AS A FILE, for the reason the `pi` stub above documents:
+# fix-one.sh prepends /opt/homebrew/bin and /usr/local/bin to PATH, so a file stub is SHADOWED by a
+# system `gh` on any box that has one — and then these arms depend on the host. A function is
+# resolved before any PATH lookup, so it cannot be. It answers ONLY the head read and fails
+# everything else, which keeps the cross-box claim block and the check read on their documented
+# degraded paths (the head is what the bail marker needs).
+gh() { # exported: fix-one.sh's PATH prepend would shadow a file stub
+  case "$*" in
+    *"pr view"*) case "$*" in *"--json headRefOid"*) printf '%s\n' 0123456789abcdef0123456789abcdef01234567; return 0 ;; esac ;; esac
+  return 1
+}
+export -f gh
+# The chain stub records the HANDOFF's lock state: "the fixer released the PR-owner lock before
+# re-running the chain" is otherwise unobservable (a stub that ignores the lock passes either way).
+# MERGE_RC stays honoured — section 10 drives the wrappers through this same stub.
+printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\n[ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo MERGE_ONE_SAW_LOCK >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' > "$RO/merge-one.sh"
+chmod +x "$RO/merge-one.sh"
+PRLOCK7="$RO/state/mergeclaim-7.lock"
+
+# A LIVE lander: the fixer must defer, refundably, and MUST NOT touch the lander's lock.
+sleep 300 & LANDER_PID=$!
+printf '%s\n' "$LANDER_PID" > "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc=$?
+[ "$plrc" -eq 0 ]; rc=$?
+ck "a fixer DEFERS (rc=0) when the LANDER holds the PR-owner lock (rc=$plrc) — contention is not a failure" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "a lander-owned PR starts no agent and does NOT re-run the merge chain" $rc
+grep -q 'LANDER owns this PR (state/mergeclaim-7.lock held by live pid' "$RO/logs/fix-7.log"; rc=$?
+ck "...and NAMES the lander and its pid, not a generic refusal" $rc
+[ -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; rc=$?
+ck "...and writes the refundable bail marker for the head it saw (no attempt consumed)" $rc
+[ "$(cat "$RO/state/fixcount-7" 2>/dev/null)" = "2" ]; rc=$?
+ck "...and leaves fixcount alone — the controller refunds, the fixer does not decrement it" $rc
+{ [ -f "$PRLOCK7" ] && [ "$(cat "$PRLOCK7" 2>/dev/null)" = "$LANDER_PID" ]; }; rc=$?
+ck "...and the LIVE lander's lock SURVIVES — a deferred fixer must never clear another worker's claim" $rc
+kill "$LANDER_PID" 2>/dev/null; wait "$LANDER_PID" 2>/dev/null
+
+# A STALE claim — its owner is MEASURABLY gone — is TAKEN OVER, not refused (#2574 (b)). `merge-one.sh`
+# itself reclaims this same file with `rm` + a retry, and `claim_live()` reclaims a dead owner's claim at
+# the controller's next dispatch; a fixer that only deferred would leave a manual `adopt-fix` blocked
+# behind bookkeeping that recorded a past state and is never revalidated. The takeover must still not be
+# the naive `rm && write` (two syscalls, so a peer's LIVE lock can be deleted between them): it renames
+# the record aside, VERIFIES what it detached is the dead pid it measured, and only then claims the
+# vacated path — so the assertions below check the outcome AND the evidence line.
+sleep 0.05 & STALE_PID=$!; wait "$STALE_PID" 2>/dev/null
+printf '%s\n' "$STALE_PID" > "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2=$?
+{ [ "$plrc2" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q PI_SAW_LOCK "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG" && grep -q 'RECLAIMED a STALE claim' "$RO/logs/fix-7.log"; }; rc=$?
+ck "a STALE claim is TAKEN OVER, not refused: the fixer runs holding it and the chain re-runs (rc=$plrc2)" $rc
+grep -qF "RECLAIMED a STALE claim — state/mergeclaim-7.lock named pid $STALE_PID, which is not alive (measured with kill -0)" "$RO/logs/fix-7.log"; rc=$?
+ck "...and the takeover NAMES what it reclaimed — the lock and the pid it measured dead" $rc
+grep -qx "PI_LOCK_OWNER=$STALE_PID" "$PI_LOG" && rc=1 || rc=0
+ck "...and the record the agent worked under is NOT the dead pid (a steal that kept the stale record would pass the line above)" $rc
+{ ! grep -q 'DEFERRED' "$RO/logs/fix-7.log" && [ ! -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; }; rc=$?
+ck "...and it is NOT a deferral — no bail marker, so no attempt is refunded for work that actually ran" $rc
+{ [ ! -f "$PRLOCK7" ] && [ -z "$(ls "$PRLOCK7".reclaim.* 2>/dev/null)" ]; }; rc=$?
+ck "...and neither the claim nor the detached stale record is left behind" $rc
+
+# ⛔ THE SAFETY ARM OF THE TAKEOVER, DRIVEN IN ISOLATION — this is the race the review reproduced.
+# Between the stale read and the detach a PEER may have reclaimed the lock, and a `rm && write`
+# reclaim then deletes that peer's LIVE claim and holds a lock two workers each believe they own.
+# `fix-one.sh` detaches by `mv`, CHECKS what it detached against the pid it measured, and puts a peer's
+# claim back with `ln` (create-if-absent) before deferring. The functions are EXTRACTED from the
+# shipped file — never re-implemented here, or the check would pass on a tree that does the wrong thing.
+# ⛔ AND THE PEER'S CLAIM MUST APPEAR *AFTER* THE READ, or the arm is VACUOUS (review of PR #2576, P2):
+# writing the live pid before the call makes the function's OWN first re-read fail, so `mv`, the
+# verification and the `ln` restore never execute — the check then passes on the banned `rm && write`
+# too. So the read is intercepted ONCE (the record answering the pid we measured) and the real file
+# already holds the peer's claim: the detach moves the PEER's record, which is exactly the case.
+PLG="$TMP/pl"; mkdir -p "$PLG"
+awk '/^prlock_take\(\)/{f=1} /^release_prlock\(\)/{f=0} f' "$HERE/fix-one.sh" > "$PLG/lib.sh"
+[ -s "$PLG/lib.sh" ] && bash -n "$PLG/lib.sh"; rc=$?
+ck "the takeover functions are EXTRACTABLE from the shipped fix-one.sh (the isolated arm below is not vacuous)" $rc
+cat > "$PLG/drive.sh" <<'PLGDRIVE'
+set -u
+PRLOCK="$1/lock"; L="$1/log"; PR=7; O="$1"
+. "$1/lib.sh"
+live="$2"; stale="$3"
+rm -f "$PRLOCK.seen"
+printf '%s\n' "$live" > "$PRLOCK"     # the record a PEER holds: it reclaimed after our measurement
+cat() { # the FIRST read of the record answers the pid we MEASURED; every later read is the real file
+  if [ "$1" = "$PRLOCK" ] && [ ! -e "$PRLOCK.seen" ]; then : > "$PRLOCK.seen"; printf '%s\n' "$stale"; return 0; fi
+  command cat "$@"
+}
+prlock_takeover "$stale"; rc=$?
+printf 'rc=%s got=%s leftovers=%s\n' "$rc" "$(command cat "$PRLOCK" 2>/dev/null)" "$(ls "$PRLOCK".reclaim.* 2>/dev/null | wc -l | tr -d ' ')"
+PLGDRIVE
+bash "$PLG/drive.sh" "$PLG" "$$" "$STALE_PID" > "$PLG/out" 2>&1
+{ grep -qx "rc=1 got=$$ leftovers=0" "$PLG/out"; }; rc=$?
+ck "a takeover that detaches a PEER's live claim puts it BACK and defers — nothing deleted, nothing left behind ($(cat "$PLG/out" 2>/dev/null))" $rc
+# ... and the SAME interception with a record that cannot be restored proves the outcome is REPORTED as
+# the different thing it is: a third party re-claims the path while our `ln` restore is being attempted.
+cat > "$PLG/drive2.sh" <<'PLGDRIVE2'
+set -u
+PRLOCK="$1/lock"; L="$1/log"; PR=7; O="$1"
+. "$1/lib.sh"
+live="$2"; stale="$3"; third="$4"
+rm -f "$PRLOCK.seen"
+printf '%s\n' "$live" > "$PRLOCK"
+cat() {
+  if [ "$1" = "$PRLOCK" ] && [ ! -e "$PRLOCK.seen" ]; then : > "$PRLOCK.seen"; printf '%s\n' "$stale"; return 0; fi
+  command cat "$@"
+}
+ln() { if [ "$1" = "$PRLOCK.reclaim.$$" ]; then printf '%s\n' "$third" > "$PRLOCK"; return 1; fi; command ln "$@"; }
+prlock_takeover "$stale"; rc=$?
+printf 'rc=%s\n' "$rc"
+PLGDRIVE2
+bash "$PLG/drive2.sh" "$PLG" "$$" "$STALE_PID" "1" > "$PLG/out2" 2>&1
+{ grep -qx 'rc=2' "$PLG/out2" && grep -q 'could NOT be restored' "$PLG/log.log"; }; rc=$?
+ck "an unrestorable displacement is reported as its OWN outcome (rc=2 + a WARNING), not as 'nothing was deleted' ($(cat "$PLG/out2" 2>/dev/null))" $rc
+
+# ⛔ AN UNREADABLE RECORD IS NOT A STALE ONE, AND STEALING IT IS THE ONE WAY TO TAKE A LIVE LANDER'S
+# CLAIM. `merge-one.sh` claims with `( set -o noclobber; echo $$ > "$CLAIM" )`: the file exists for an
+# instant BEFORE the pid is written, so "empty ⇒ dead owner" would take a lock whose owner is alive and
+# mid-claim. The fixer must treat it as LIVE: defer, and leave it exactly as it found it.
+: > "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2b=$?
+{ [ "$plrc2b" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an EMPTY claim record is treated as LIVE and DEFERS (rc=$plrc2b, no agent) — a lander mid-claim is not a dead one" $rc
+{ [ -f "$PRLOCK7" ] && [ ! -s "$PRLOCK7" ]; }; rc=$?
+ck "...and it is left EXACTLY as found — never stolen from a claim whose pid may not be written yet" $rc
+grep -q 'no pid this lane can prove dead' "$RO/logs/fix-7.log"; rc=$?
+ck "...and says WHICH fact was missing, instead of reporting a stale owner it never measured" $rc
+rm -f "$PRLOCK7"
+
+# ⛔ AND A LOCK STATE NO RE-DISPATCH CAN CLEAR IS NOT REFUNDED (review of PR #2576, cycle 2 — P2). A
+# `mergeclaim-<PR>.lock` that is a DIRECTORY can never be read as an owner and never be taken; if the
+# refusal were refundable, spawn -> defer -> refund would spin for ever with `fixcount` netting to
+# zero, so `MAX_FIX_TRIES` would never park the PR and nothing would surface.
+rm -f "$PRLOCK7"; mkdir -p "$PRLOCK7"
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc4=$?
+{ [ "$plrc4" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an UNUSABLE lock path (a directory) refuses before any agent runs (rc=$plrc4)" $rc
+grep -q 'REFUSED (NOT refundable' "$RO/logs/fix-7.log"; rc=$?
+ck "...and says it is NOT refundable, so the cap can park the PR" $rc
+[ ! -f "$RO/state/fixbail-7-0123456789abcdef0123456789abcdef01234567" ]; rc=$?
+ck "...and writes NO bail marker — a refundable spin would net fixcount to zero for ever" $rc
+grep -q 'REPAIR: inspect it' "$RO/logs/fix-7.log"; rc=$?
+ck "...and NAMES the repair for the unusable path" $rc
+rmdir "$PRLOCK7" 2>/dev/null || rm -rf "$PRLOCK7"
+
+# ⛔ THE OTHER NON-REFUNDABLE ARM — a `$O/state` that cannot be WRITTEN — had no test (review of PR
+# #2576, P3). There the lock path does not exist, so the fixer reaches the create-failure refusal, and
+# if a regression made that arm refundable, spawn -> defer -> refund would spin with `fixcount`
+# netting to zero for ever. Driven with a separate `$O` whose `state` is a REGULAR FILE, which needs no
+# root: every `state/...` write then fails with ENOTDIR, exactly the unwritable/corrupt shape this arm
+# exists for.
+RO3="$RIG/O3"; rm -rf "$RO3"; mkdir -p "$RO3/logs"; : > "$RO3/state"
+: > "$PI_LOG"; : > "$MERGE_LOG"
+( cd "$RREPO" && O="$RO3" CIQ_STATE_DIR="$RO/state" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$RO3/state/mergeclaim-7.lock" bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; plrc5=$?
+{ [ "$plrc5" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "an UNWRITABLE state dir refuses before any agent runs (rc=$plrc5) — the second non-refundable arm" $rc
+grep -q 'REFUSED (NOT refundable' "$RO3/logs/fix-7.log"; rc=$?
+ck "...and says it is NOT refundable — otherwise spawn -> defer -> refund spins with fixcount netting to zero" $rc
+grep -q 'could not be CREATED although no file exists there' "$RO3/logs/fix-7.log"; rc=$?
+ck "...and names the CAUSE it measured (the create failed on an absent path), not a stale owner it never saw" $rc
+
+# POSITIVE CONTROL, and the assertion that pins the property the change exists for: with NO lock the
+# fixer runs, the lock is HELD WHILE THE AGENT RUNS, and it is RELEASED before the merge-one handoff
+# (otherwise merge-one.sh takes the same lock first and exits "already owns this PR", skipping the
+# fixer's own re-review — #2132's strand).
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc3=$?
+{ [ "$plrc3" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
+ck "POSITIVE CONTROL: with no lander the fixer RUNS and the chain is re-run (rc=$plrc3)" $rc
+grep -q PI_SAW_LOCK "$PI_LOG"; rc=$?
+ck "...and the lock is HELD WHILE THE AGENT RUNS — the property, not just the acquisition line" $rc
+{ grep -q MERGE_ONE_RAN "$MERGE_LOG" && ! grep -q MERGE_ONE_SAW_LOCK "$MERGE_LOG"; }; rc=$?
+ck "...and it is RELEASED before handing the PR to merge-one.sh (else the chain refuses its own re-review)" $rc
+[ ! -f "$PRLOCK7" ]; rc=$?
+ck "...so no lock is left behind by a completed fixer run (a stale lock would defer the next cycle)" $rc
+
+# ⛔ (c) THE CLAIM IS RELEASED ON THE CRASH PATH TOO — a lock leaked by a KILLED fixer is the same
+# stall one step later, and it is the path an operator never sees (nothing in the log after the
+# signal). The fixer is backgrounded, the `pi` stub BLOCKS so the worker is provably mid-run when it
+# is signalled, and the assertion is on the record: it named a live process before, and it is gone
+# after. A tree that releases only on its success path passes the positive control above and fails here.
+rm -f "$PRLOCK7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+# ⛔ THE BLOCKING STUB POLLS A STOP FILE INSTEAD OF `sleep 20` (review of PR #2576, P3). A bare
+# `sleep` is a CHILD of the fixer: `kill -TERM` reaches the shell, whose EXIT trap releases the claim
+# and exits, so the sleep survives — reparented and outliving the suite for its full duration (measured:
+# `pgrep -af '^sleep 20$'` after the run). Polling with a 0.1 s tick and a STOP file lets this arm stop
+# it deterministically without weakening what it proves (the fixer is mid-agent when it is signalled).
+PI_STOP="$TMP/pi.stop"; rm -f "$PI_STOP"
+pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo PI_SAW_LOCK >> "$PI_LOG"; i=0; while [ "$i" -lt 600 ]; do [ -f "${PI_STOP:-/nonexistent}" ] && return 0; sleep 0.1; i=$((i+1)); done; return 0; }
+export -f pi
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=60 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    PI_STOP="$PI_STOP" PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1 & fixpid=$!
+i=0; while ! grep -q PI_RAN "$PI_LOG" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+held="$(cat "$PRLOCK7" 2>/dev/null)"
+{ [ -n "$held" ] && kill -0 "$held" 2>/dev/null; }; rc=$?
+ck "while the agent works the claim names the LIVE fixer (lock=${held:-<none>}) — the crash arm is not vacuous" $rc
+# ⛔ SIGNAL THE LOCK OWNER, NOT THE SUBSHELL WRAPPER. `$fixpid` is the `( … ) &` subshell, NOT
+# `fix-one.sh` — measured on this box: wrapper=11948, lock owner=11953. Killing the wrapper makes
+# `wait` return 143 the instant the WRAPPER dies, while the fixer is still inside its `pi` stub, so
+# its claim is legitimately still present at assert time: the arm failed on TIMING, not on a leak
+# (the lock did disappear ~0.5 s later, unchanged). It also proved less than it claims — the signal
+# never reached the process whose EXIT trap is under test. `$held` IS that process (the pid
+# `prlock_take` wrote), so signal it, and the wrapper's `wait` then observes the fixer's own death.
+kill -TERM "${held:-$fixpid}" 2>/dev/null; : > "$PI_STOP"; wait "$fixpid" 2>/dev/null; crc=$?
+[ ! -f "$PRLOCK7" ]; rc=$?
+ck "a SIGTERM'd fixer RELEASES the claim (exit $crc, lock=${PRLOCK7##*/}) — a lock leaked by a dead fixer stalls the PR one step later" $rc
+[ ! -s "$MERGE_LOG" ]; rc=$?
+ck "...and the killed run did NOT hand the PR to the chain (a half-finished fixer must not trigger a re-review)" $rc
+# the blocking stub must not outlive the arm: its poll observes the stop file on the next 0.1s tick
+sleep 0.4
+{ ! grep -q 'while \[ "\$i" -lt 600 \]' "$HERE/spawn-gate.test.sh" || grep -q 'PI_STOP' "$HERE/spawn-gate.test.sh"; }; rc=$?
+ck "...and the blocking stub waits on a STOP FILE, not a bare \`sleep\` that outlives the killed worker" $rc
+# restore the fast stub for the section that follows, and reap the blocked one
+pi() { echo PI_RAN >> "$PI_LOG"; return 0; }
+export -f pi
+# ⛔ AND THE CROSS-BOX REFUSAL — the FIFTH rc=0-with-nothing-pushed arm (review of PR #2576, P3).
+# `fix-one.sh` refuses when another box already holds the per-head claim, and its line carries no
+# `DEFERRED` token, so without its own arm the operator's log got no line and the status said
+# SUCCESS for a run that did nothing. Driven with a claims.sh stub that refuses, and removed again so
+# the arms below are not diverted onto this path.
+# the deployed copies §10 uses; made here because this arm runs before §10's cp
+# ⛔ AND THE IDENTITY MODULE GOES WITH THEM (#2762/#2694): adopt-fix.sh and fix-one.sh source
+# `$SELF/repo-target.sh` (and it sources repo-slug.sh), so a copy without them exits 78 — a
+# half-deployed box — instead of reaching the claim refusal this arm is about.
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RO/"
+printf '#!/bin/sh\nclaim_acquire() { CLAIM_RESULT="another box owns this head (test stub)"; return 1; }\n' > "$RO/claims.sh"
+: > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; rm -f "$RO/state/fixbail-7-"*
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arccb=$?
+[ "$arccb" -eq 79 ]; rc=$?
+ck "adopt-fix.sh reports a CROSS-BOX claim refusal as 79 (got $arccb) — not SUCCESS for a run that pushed nothing" $rc
+grep -q 'CROSS-BOX claim' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it in the log the operator reads" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "...and nothing ran: no agent, no merge chain" $rc
+rm -f "$RO/claims.sh" "$RO/state/fixbail-7-"*
+unset -f gh; unset 'BASH_FUNC_gh%%'
+
 # ── 10) the WRAPPERS propagate the status ───────────────────────────────────────
 # adopt-fix.sh and chain-merge.sh are report-then-`echo` scripts: their LAST command used to be a
 # reporting `echo`, so `$?` was echo's — always 0 — and a wrapper doing `… && next` took the SUCCESS
@@ -613,7 +977,12 @@ ck "the fixer's disk reading is the WORKTREE volume, not the main checkout (path
 # ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
+# …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
+# `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
+# of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
+cp "$HERE/brief-gate.sh" "$RO/"
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
@@ -645,6 +1014,35 @@ ck "adopt-fix.sh NAMES the load gate on a load refusal" $rc
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc0=$?
 { [ "$arc0" -eq 0 ] && grep -q PI_RAN "$PI_LOG"; }; rc=$?
 ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not a constant" $rc
+# ⛔ ... AND A DEFERRAL IS NOT SUCCESS EITHER (#2576, review of PR #2576 P2). `fix-one.sh` now defers
+# (rc=0, nothing pushed) when a LANDER holds `mergeclaim-<PR>.lock`. `adopt-fix.sh` maps ITS OWN
+# deferrals to exit 79 precisely so an operator's `adopt-fix … && next` stops; a deferral it does not
+# recognise returns 0 and writes no line into `adopt-<PR>.log` — the log this wrapper exists to fill
+# (#1720) — so the operator sees SUCCESS for a fixer that did nothing and a chain that ran nothing.
+sleep 300 & ADOPT_LANDER=$!
+printf '%s\n' "$ADOPT_LANDER" > "$RO/state/mergeclaim-7.lock"
+: > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79=$?
+[ "$arc79" -eq 79 ]; rc=$?
+ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS for a run that pushed nothing" $rc
+# ... and the UNUSABLE-lock refusal: also rc=0 with nothing pushed, and also invisible to an operator
+# who reads only adopt-<PR>.log unless this wrapper names it.
+rm -f "$RO/state/mergeclaim-7.lock"; mkdir -p "$RO/state/mergeclaim-7.lock"
+: > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79b=$?
+[ "$arc79b" -eq 79 ]; rc=$?
+ck "adopt-fix.sh reports an UNUSABLE PR-owner lock as 79 (got $arc79b) — not SUCCESS" $rc
+grep -q 'PR-OWNER lock, UNUSABLE' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it (UNUSABLE, with the repair pointer) in the operator's log" $rc
+rmdir "$RO/state/mergeclaim-7.lock" 2>/dev/null || rm -rf "$RO/state/mergeclaim-7.lock"
+grep -q 'PR-OWNER lock' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it in the log the operator reads" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "...and nothing ran: no agent, no merge chain" $rc
+kill "$ADOPT_LANDER" 2>/dev/null; wait "$ADOPT_LANDER" 2>/dev/null
+rm -f "$RO/state/mergeclaim-7.lock"
 # The DISK arm of the same wrapper: 77 must PROPAGATE too, and be named. A 75-only mapping would
 # report a full filesystem as "wait for the load to fall" — a remedy that cannot ever work.
 printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"
@@ -662,7 +1060,15 @@ ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
 # lane.sh: the third ported caller. Assert it gets as far as the spawn (the prompt is written) and
 # then refuses WITHOUT starting an agent — the whole point, since lane.sh is what opens the PR.
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
+# ⛔ THE LANE'S CWD IS A WORKTREE OF THE TARGET REPO, ON THE BRANCH IT IS TOLD IT IS ON
+# (agent-infra#2724/#2694): lane.sh now refuses a wrong-repo worktree (72) and a worktree checked out
+# on a different named branch. These arms test the LOAD/DISK gate, so the fixture satisfies both.
+# ⛔ FROM THE WORKTREE THAT IS CHECKED OUT ON `work` (#2762 review, 6th cycle, P1). `$RREPO`'s HEAD is
+# `main` (the fixture creates `work` as a BRANCH and materialises `.worktrees/fix-7` on it), so running
+# the lane from `$RREPO` made the BRANCH assertion refuse 72 before the load gate was ever reached —
+# these two arms test the LOAD gate, so the fixture must satisfy the identity gate, exactly as the DISK
+# arm below already does.
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
 { [ "$lrc" -eq 75 ] && [ ! -s "$PI_LOG" ] && [ -s "$RO/logs/prompt-9999.txt" ]; }; rc=$?
 ck "lane.sh on a refused load exits 75, writes the prompt, and NEVER spawns (rc=$lrc)" $rc
@@ -672,7 +1078,7 @@ ck "lane.sh NAMES the load gate on a load refusal" $rc
 # what opens a PR, so a lane refused here consumed nothing — but an operator told "load gate" would
 # re-dispatch into the same full filesystem for ever.
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc2=$?
 [ "$lrc2" -eq 77 ]; rc=$?
@@ -1701,7 +2107,16 @@ ck "…and its replay line contains no git-apply invocation at all" $rc
 # a real dispatch, a worker killed at a 1 s cap, and the status line read back.
 BG="$CAPRIG/bg"; mkdir -p "$BG/logs" "$BG/state"
 cap_clean; cap_dirty
-printf 'a prompt\n' > "$BG/prompt"
+# ⛔ THIS FIXTURE IS GATED TOO (review cycle 4, P1). `nonblocking-dispatch.sh` runs the research-first
+# gate in the FOREGROUND, so a bare `a prompt` brief is refused with 80 and NO worker is ever started —
+# the three cap-kill arms below then read "lost (no exit status recorded)" and assert a cap kill on a
+# dispatch that never happened. MEASURED: 165 passed / 3 failed, and the same rc/status string reproduced
+# standalone. Rendered from the validator with the role the dispatcher gates on (`worker`, i.e. KIND=bg),
+# and asserted at BUILD time: a fixture that drifts must fail here, by name, not three arms later as a
+# mysterious "lost" lane.
+{ printf 'a prompt for a background worker\n\n'; bash "$HERE/brief-gate.sh" --section worker; } > "$BG/prompt"
+bash "$HERE/brief-gate.sh" --check "$BG/prompt" worker 2>/dev/null \
+  || { echo "  ❌ the cap-kill fixture brief is REFUSED by the research-first gate" >&2; exit 1; }
 pi() { sleep 30; }            # exported: a FUNCTION beats the launcher's own PATH prepend (#1828)
 export -f pi
 ( cd "$CWT" && O="$BG" PATH="$CAPRIG/bin:$PATH" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \

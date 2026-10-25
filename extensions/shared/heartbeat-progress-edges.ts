@@ -638,6 +638,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: "extensions/loop-enforcer/tier-config-parity.test.ts (#847 STALL_THRESHOLD_SURFACES, 7 surfaces)",
     note: "POINTER ONLY — this registry deliberately holds no `stall_threshold` value",
   },
+  // — hygiene axis: the lane's merge-phase marker (#2029) —
+  {
+    name: "_PHASE_AGE",
+    owners: ["scripts/orchestrator-harness/chain-merge.sh"],
+    value: null,
+    axis: "hygiene",
+    guardedBy:
+      "scripts/orchestrator-harness/chain-merge-verdict.test.sh (case 4b: a marker older than the lane's wall limit is called STALE, reviewed immediately and removed) + this registry's presence check",
+    note: "DERIVED, not a bound: the age in SECONDS of state/lanemerge-<PR>.phase, computed as now minus the epoch the marker itself carries. It belongs in this vocabulary because it answers a staleness question ('is this marker still a claim about the present'), but there is no local literal for the forward check to pin — the value is a subtraction of a value read at runtime — hence `value: null`. Its partner `_PHASE_STALE_AFTER` is the comparison bound and is deliberately NOT registered: it is not a local literal either (it is `LANE_TIMEOUT + 60s`, a pointer to the lane's own declared wall clock), and registering a pointer-to-a-pointer would imply an independence that does not exist.",
+  },
   // — gate axis —
   {
     name: "WALL_CLOCK_STALL_MS",
@@ -800,6 +810,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy:
       "scripts/orchestrator-harness/cloud-cell-doctor.hygiene.test.sh §temp — a dir whose embedded pid is dead AND whose mtime is past this floor is reaped, while a FRESH one (dead pid, written seconds ago) is KEPT with its reason; the `> 0` bound is refused at load by cloud-cell-doctor.sh's numeric validation, because a zero floor leaves a recycled pid as the only proof a temp dir is idle",
     note: "#2573 — how long a `cloud-cell-<pid>.<rand>` temp dir must have been untouched before the hygiene role may reclaim it, once its embedded pid is provably gone. The pid is the primary proof; this floor is the SECOND gate that covers pid RECYCLING (the name's pid can be dead now and have belonged to something else by the time the dir was written). A zero floor makes the recycling hole unbounded, which is why the loader refuses it by name rather than silently accepting a vacuous bound.",
+  },
+  {
+    name: "LANE_IDLE_MIN",
+    owners: ["scripts/orchestrator-harness/lane-reap.sh"],
+    value: "${LANE_REAP_IDLE_MIN:-120}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/lane-reap.test.sh §idle — a lane whose log has not advanced past the bound is a reap candidate, and one that HAS keeps it; the value is asserted by THIS registry's forward check, since the suite drives its own LANE_REAP_IDLE_MIN in the environment",
+    overrides: ["LANE_IDLE_MIN=120"],
+    note: "#2163 — how long a lane's own activity log must have gone untouched before the reaper treats the lane as finished (2 h), in MINUTES. Deliberately NOT named `IDLE_MIN`: that symbol is a REGISTERED term owned by `scripts/orchestrator-heartbeat.sh` (a 9-minute spinner-absent classification bound, declared-not-read), and sharing the name made one authority out of two unrelated numbers — exactly the divergence this registry exists to surface. This one is READ (it decides a kill), and it is the log-evidence gate that outranks age: a lane with no log takes the 12 h `NO_LOG_H` path instead, and a lane whose log advanced inside this window is never signalled.",
   },
   {
     name: "MAX_AGE",

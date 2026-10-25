@@ -287,6 +287,25 @@ printf '%s\n' "$*" >> "${DOCTOR_TEST_WT:?}/calls"
 exit "$(cat "${DOCTOR_TEST_WT:?}/rc" 2>/dev/null || echo 0)"
 SH
 
+# ⛔ lane-reap (#2163) IS A DOUBLE, for the same reason as in `cloud-cell-doctor.test.sh`: this suite's
+# contract is the DOCTOR's classification and hardening, not the process census — and lane-reap.sh has
+# its own hermetic suite. Without the double the doctor's process pass reads THIS fixture's stub `ps`,
+# which knows nothing of lane trees, so `lane-reap: CANNOT-VERIFY — the process table could not be
+# read` (rc=3) turned every "a clean pass is rc=0" leg red — a fact about the fixture, not about the
+# doctor. RED before this stub: 14 legs (`reap: rc=3 on a fresh box`, `reap: rc=3 for a session that
+# simply ended`, `doctor: rc=3 on a fresh box`, `status: rc=1 after passes`, the two --dry-run legs …).
+# The census's OWN unreadability doctrine is covered by lane-reap.test.sh (§UNREADABLE) and by
+# cloud-cell-doctor.test.sh (DOCTOR_TEST_REAP_ABSTAIN/INERT/TREES), not here.
+cat > "$T/bin/lane-reap" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "${DOCTOR_TEST_LANE_REAP:?}/calls"
+case "${1:-}" in
+  count) printf 'lanes=1/1 zombie=0\n' ;;
+  reap)  printf 'lane-reap: trees=1/1 zombie=0 candidates=0 reaped=0 refused=0 inert=0 unidentifiable=0 abstained=0 mode=%s\n' "$([ "${2:-}" = "--apply" ] && echo apply || echo dry-run)" ;;
+esac
+exit 0
+SH
+
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH"
 
@@ -302,6 +321,9 @@ export DOCTOR_TEST_TMUX="$T/tmux" DOCTOR_TEST_PS="$T/ps" DOCTOR_TEST_GH="$T/gh" 
 # $SELF_DIR, $REPO or $CELL_HOME in this fixture. Either way the "every role passed -> status is green"
 # arm was exercising FAILING passes.
 export DOCTOR_TEST_UV="$T/uv" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt"
+# The lane-reap double (see its stub above): the doctor must delegate the process pass, and this
+# fixture must not let a second reaper loose on the runner's real process table.
+export DOCTOR_LANE_REAP_BIN="$T/bin/lane-reap" DOCTOR_TEST_LANE_REAP="$T/lane-reap"
 # The mid-pass `stop` hook in the tmux double bumps this (the file `stop` writes first), so an arm can
 # make a stop arrive DURING a pass that is already running.
 export DOCTOR_TEST_STOPGEN="$T/o/state/roles/.stop-generation"
@@ -322,14 +344,22 @@ chmod +x "$T/bin/cwdprobe"
 export LO_CWD_PROBE="$T/bin/cwdprobe" FAKE_CWD="$T/nowhere-unheld"
 export REAP_MIN_S=60 REAP_SAMPLE_S=2 DOCTOR_INTERVAL=1 MERGE_INTERVAL=1 HYGIENE_INTERVAL=1
 export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
-mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/stat"
+# ⛔ HERMETIC REGISTRY. This suite drives the REAL roles (the `status` fixture), so the hygiene pass
+# would resolve the SHIPPED `registry-sync.sh` beside this file and perform a real `ls-remote`/fetch
+# of the fleet's 3201 `refs/reviews/*` records against the checkout's real `origin` — and it would
+# provision a worktree in that checkout to do it. That is the #2374 lesson `atomic-land.sh` records
+# (its suite ran two real round trips per invocation), one role over; the seam turns it into a
+# stated skip. The registry's OWN behaviour is covered in cloud-cell-doctor.test.sh against a real
+# local store, which is where a network-shaped assertion belongs.
+export DOCTOR_REGISTRY_SYNC=off
+mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/stat" "$T/lane-reap"
 
 doc() { # <role> [extra env assignments via env]
   OUT="$(bash "$DOCTOR" "$@" 2>&1)"; RC=$?
 }
 reset_tmux() { rm -f "$T/tmux/sessions" "$T/tmux/killed" "$T/tmux/new-session" "$T/tmux/refuse-kill" "$T/tmux/fail-ls" "$T/tmux/fail-ls-after-kill" "$T/tmux/no-server" "$T/tmux/no-server-after-kill" "$T/tmux/no-socket" "$T/tmux/fail-clients" "$T/tmux/slow-ls" "$T/tmux/fail-panes" "$T/tmux/end-after-list" "$T/tmux/end-after-clients" "$T/tmux/stop-midpass" "$T/tmux/ls-calls"; touch "$T/tmux/sessions"; }
 reset_ps()   { rm -f "$T/ps/calls" "$T/ps/mode" "$T/ps/pfail" "$T/ps/pfail-ppid" "$T/ps/args."* "$T/ps/lstart."*; rm -f "$T/stat/fail" "$T/gh/slow"; }
-reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; }
+reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; rm -f "$T/lane-reap/calls"; }
 # ⛔ The pane pid is a process THIS SUITE owns, never a literal. After the lstart fence the reaper
 # signals the pane pid it measured, and the `ps` double returns a constant `lstart` for any pid with
 # no file — so the fence always passes and a literal fixture pid (4242, 4747, 4848 …) is a request to
@@ -642,6 +672,16 @@ say_case "a fresh box (no server ever started) is an EMPTY list, not cannot-veri
 reset_tmux; reset_ps; reset_state
 : > "$T/tmux/no-socket"
 doc reap
+# ⛔ THE DELEGATION IS THE CONTRACT THIS SUITE PINS (#2163 review, cycle 6): with the census doubled
+# above, nothing here would go red if the doctor stopped calling `lane-reap.sh` at all — i.e. if the
+# population the session pass cannot see went unjudged again, which is the class #2163 exists for.
+# These two legs are the sibling suite's (`cloud-cell-doctor.test.sh`), copied because the seam moved.
+grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null \
+  && ok "reap: read the evidence census (count)" \
+  || bad "reap: the census was NOT read — $(cat "$T/lane-reap/calls" 2>/dev/null | tr '\n' ' ')"
+grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null \
+  && ok "reap: delegated the process pass ARMED (reap --apply)" \
+  || bad "reap: the process pass was not delegated armed — $(cat "$T/lane-reap/calls" 2>/dev/null | tr '\n' ' ')"
 [ "$RC" -eq 0 ] && ok "reap: rc=0 on a box with no tmux server yet" || bad "reap: rc=$RC on a fresh box (want 0) — $OUT"
 result_has "seen=0" && ok "reap: reports an empty namespace (seen=0, rc=0)" || bad "reap: the empty namespace is not reported — $OUT"
 case "$OUT" in *"cannot-verify"*|*"CANNOT-VERIFY"*) bad "reap: a fresh box is reported as cannot-verify — $OUT" ;; *) ok "reap: a fresh box is not cannot-verify (that row would never clear)" ;; esac
