@@ -11,6 +11,12 @@ set -u
 REPO="${1:-}"; OR="${2:-}"; shift 2 2>/dev/null || true
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
+# ⛔ PUBLISHED UP FRONT, OVERWRITTEN AT THE END (#2762 review, 4th cycle, P2). The controller recounts
+# from this file, and it used to exist only on the paths that reached the loop's tail — so the two
+# earlier "nothing started" exits (worker-terminal FATAL 78, a failed `cd`) left the batch counted as
+# dispatched. An empty file here says "this call spawned nothing" from the first instant; the final
+# write replaces it with the ids that did.
+: > "$O/.dispatched-ids" 2>/dev/null || true
 # ⛔ THE SPAWN LINE MUST SAY SO WHEN THE BOX IS STALE (agent-infra#2215). `orch-loop.sh` exports this
 # from its once-per-cycle refresh: EMPTY when the controller's harness IS origin/main's tip, else
 # `<relation>:<sha12>` (behind / dirty / ahead / unknown …) or `refresh-off`.
@@ -315,7 +321,12 @@ for N in "$@"; do
   # RELEASED or to reach its CLAIM_ISSUE_TTL (3h) first — not because the gap is small. Do not shorten
   # the TTL without revisiting this line.
   chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
-  if wt_spawn "chain-$N" "$REPO_ABS" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO_ABS' '$OR' $N '$BR'"; then
+  # ⛔ `${REPO_ABS:-$REPO}`, NOT `$REPO_ABS` (#2762 review, 4th cycle, P1): refresh-scout.test.sh
+  # EXTRACTS this branch and drives it under `set -u` without REPO_ABS, and the bare expansion aborted
+  # the fragment — reding a registered shard and losing the only witness to the "stop the lane BEFORE
+  # releasing the claim" ordering. Same rule as `${_lan-}` below: every variable this branch reads
+  # must be safe when unset.
+  if wt_spawn "chain-$N" "${REPO_ABS:-$REPO}" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '${REPO_ABS:-$REPO}' '$OR' $N '$BR'"; then
     echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else
     # The same disclosure on the refusal path (see the lane spawn above): a chain that never started

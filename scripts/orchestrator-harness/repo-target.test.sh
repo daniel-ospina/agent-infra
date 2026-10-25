@@ -400,6 +400,16 @@ printf '#!/usr/bin/env bash\nrepo_slug_from_remote() { printf "%%s\\n" "$1"; }\n
 f10=$?
 { [ "$f10" -eq 78 ] && grep -q 'missing or stale' "$T/f-half.out"; }; ck "F10 shipped module + OLD repo-slug.sh (no repo_slug_valid) -> FATAL 78, not target-invalid (rc=$f10)" $?
 
+# A PARTIALLY stale module is the one shape that can DEFEAT the gate instead of failing closed: with
+# the assertions present but `repo_target_head_branch` missing, HEAD_BRANCH is empty and the branch
+# assertion is SKIPPED SILENTLY (the `prfixup` shape). The guard must name every symbol lane.sh reaches.
+RIG_PART="$T/rig-partial"; mkdir -p "$RIG_PART"; cp "$HERE"/*.sh "$RIG_PART/"
+sed '/^repo_target_head_branch() {/,/^}/d' "$HERE/repo-target.sh" > "$RIG_PART/repo-target.sh"
+grep -q 'repo_target_head_branch()' "$RIG_PART/repo-target.sh" && echo "     (fixture build failed: function still present)"
+( cd "$TWT" && O="$RIG_PART/o-lane" LANE_DRY_RUN=1 bash "$RIG_PART/lane.sh" --repo daniel-ospina/tortoise 5015 feat/5015 ) > "$T/f-part.out" 2>&1
+f12=$?
+{ [ "$f12" -eq 78 ] && grep -q 'repo_target_head_branch' "$T/f-part.out"; }; ck "F12 module missing ONLY repo_target_head_branch -> FATAL 78 (the branch half cannot be silently skipped) (rc=$f12)" $?
+
 # ...and the SAME half-deploy on the BATCH path must not strand what the controller already did
 # (#2762 review, 3rd cycle, P2): release the claims, drop the rows, and publish an EMPTY
 # `.dispatched-ids` so the cycle records zero instead of a phantom dispatch.

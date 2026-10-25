@@ -77,8 +77,16 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # prove which repository its worktree is has no business starting an agent in it. Missing helper =
 # FATAL, because a silently skipped assertion is exactly the "nothing refuses" failure being fixed.
 . "$SELF/repo-target.sh" || { echo "[lane $N] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
+# ⛔ NAME EVERY SYMBOL THIS FILE REACHES, TRANSITIVELY (#2762 review, 4th cycle, P2). The assert alone
+# is not enough: `repo_target_head_branch` GATES the branch half (`if [ -n "$HEAD_BRANCH" ]`), so a
+# module that has the assertions but not the head read made `HEAD_BRANCH` empty — the branch
+# assertion was SKIPPED SILENTLY, the one direction in which this gate can be defeated (the `prfixup`
+# shape this file exists to refuse). `repo_target_slug`/`repo_target_refuse` happen to fail closed;
+# `head_branch` does not, so the guard has to be the whole set, not the two obvious ones.
 command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
-  || { echo "[lane $N] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
+  && command -v repo_target_head_branch >/dev/null 2>&1 && command -v repo_target_slug >/dev/null 2>&1 \
+  && command -v repo_target_refuse >/dev/null 2>&1 && [ -n "${REPO_TARGET_REFUSED:-}" ] \
+  || { echo "[lane $N] FATAL: $SELF/repo-target.sh is stale (needs repo_target_assert/repo_target_branch_assert/repo_target_head_branch/repo_target_slug/repo_target_refuse and REPO_TARGET_REFUSED) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
 # (measured 2026-10-19: three lanes did the whole job, then were refused at the rail). A lane's gate is
