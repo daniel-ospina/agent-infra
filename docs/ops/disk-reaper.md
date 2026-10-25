@@ -12,7 +12,13 @@ aboutObjects: agent-infra, issue-2032, disk-reclaim, uv-cache, lane-venvs, workt
 # Disk reaper (#2032)
 
 One entry point — `scripts/disk-reaper.sh` — that runs, accounts for and reports
-the three sinks that exhaust a cell's disk. It **owns no deletion rule**. Each
+the three sinks that exhaust a cell's disk. The **scheduled** entry point is
+`scripts/disk-reaper-run.sh`, which wraps it and supplies exactly what a
+timer-started process does not inherit: `HOME` and `keys.env`, the REAL `gh`
+binary by absolute path (rejecting any `gh-shim`/`gh-limit` interposer and
+unsetting a poisoned `AGENT_GH_REAL`), `AGENT_GH_GATE_NO_WAIT=1`, and
+`REAP_WT_GH_TIMEOUT=120`. Without that wrapper the worktree class fails CLOSED
+on a box whose only `gh` on PATH is the interactive pacing shim (#2354). It **owns no deletion rule**. Each
 class has one owner, and the owners are the only code that deletes:
 
 | class | owner (policy) | reclaims |
@@ -167,6 +173,24 @@ separately required to be clean — so `REAP_WT_MERGED_AGE_DAYS` (default `0`) g
 that row. Unmerged heads keep the blanket floor, where age still separates a stale
 scratch checkout from work in progress. Setting it equal to `REAP_WT_AGED_DAYS`
 restores the pre-exemption behaviour.
+
+A **squash-merged** head is never an ancestor of `MAIN_REF`, so the ancestry test
+alone cannot see it. `patch_equivalent()` (`git cherry MAIN_REF <head>`, no `+`
+line) supplies that evidence and takes the same `REAP_WT_MERGED_AGE_DAYS` floor.
+⛔ It is an AGE-FLOOR signal only, never a reachability proof: a detached head on
+no ref is still `detached-unreachable` and preserved, because `git cherry` matches
+patch-ids against all of main's history (a reverted change still matches, and
+whitespace is ignored) and says nothing about whether any ref still holds the
+commit. Multi-commit squash merges do not match either, so they stay on the floor.
+
+A lane **scratch** checkout — a directory whose basename matches
+`REAP_WT_SCRATCH_GLOB` (default `wt-*|cell-wt-*`) — has its floor **capped at**
+`REAP_WT_SCRATCH_AGE_DAYS` (default `1`): a dead lane's throwaway dir is not a
+week's worth of review surface. The cap only ever lowers, so a value above the
+floor in force has no effect (14 does not mean "keep longer"), and a
+merged/patch-equivalent scratch row keeps `REAP_WT_MERGED_AGE_DAYS`. Every other
+gate still applies, and the pattern is anchored (`wtfoo/` is not `wt-*`), so a
+named checkout is unaffected.
 
 ## Scheduling — installed by the bring-up, armed by owner instruction
 
@@ -529,6 +553,97 @@ the floor lifted — so the KEEP is the floor's doing rather than an inability t
 
 T9, T10 and T12 were each red on the build that preceded the fresh-context review
 that found them.
+
+## The dispatch headroom budget — one lane's tree, measured (#2721)
+
+The reaper answers *"what can be reclaimed?"*. It cannot answer *"does the checkout this spawn is
+about to provision fit?"* — and on 2026-10-24 cell-4 (8 vCPU) reached **~2,286 MB free** carrying
+**59** `/tmp/cell-wt-*` checkouts at 5-6 GB `du` each, went unreachable for ~40 minutes (`cmux cloud
+exec` timed out on `date` and `df`), and was recovered by a human `pause`/`resume`. Every one of those
+spawns passed `DISK_MIN_FREE_MB=500`, because a floor answers "is the filesystem full?" and 2,286 MB
+is 4.5x that floor. `spawn-gate.sh`'s `run_agent` now also applies a **headroom** gate:
+
+```
+ADMIT  iff  free_mb >= tree_mb + reserve_mb      (fresh `df` reading, at every spawn)
+REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM — …`  (AGENT_DISK_REFUSED, 77)
+```
+
+`tree` is what ONE more lane costs. `reserve` is the headroom a spawn must leave behind. Both are
+**measured per target**, never one global constant: #1852 recorded that a single constant cannot serve
+an agent-infra lane (48 MB, no install) and a tortoise lane (5.7 GB of python), and a tortoise-sized
+floor would refuse every harness spawn on every cell — a false *block*, which is its own defect.
+
+### Measured (2026-10-24, 8-vCPU cell, `/dev/root` 128,828 MB, `uv` 0.12.5, warm uv cache)
+
+`df -Pm /` **used**-column deltas, two readings before and after, nothing else provisioning:
+
+| repo | `git worktree add` | install step | **marginal / lane** | **self-contained tree** |
+|---|---|---|---|---|
+| `tortoise` | **147 MB** | `uv sync --extra embeddings --extra parity` = **169 MB** (2 s, warm cache) | **316 MB** | **5,772 MB** (`du` 5,625 MB venv + 147 MB checkout) |
+| `agent-infra` | **48 MB** | none (no `pyproject`/`uv.lock`, zero npm deps) | **48 MB** | 48 MB |
+
+The venv's `du` is ~18x its real cost because **28,730 of its files are hardlinked into the shared
+cache** (`nlink=3` measured on every `site-packages/*.so`): those blocks belong to
+`~/.cache/uv`, and deleting one venv releases ~124 MB, not 5,625 MB. That sharing is a property of the
+*cache state*, not of the lane — `pi-cache-reap.sh` prunes the cache under pressure, `--link-mode=copy`
+and a cache on another mount never share at all — so the gate ships both numbers:
+
+| target | `DISK_LANE_TREE_MB` (default) | `DISK_LANE_RESERVE_MB` (default) |
+|---|---|---|
+| `uv.lock` present (python lane) | **350** | **6144** (6 GiB = the 5,772 MB self-contained tree, rounded up) |
+| no install step (harness lane) | **64** | **1024** |
+
+### The number the fleet must budget **per lane**
+
+* **316 MB/lane** on a cell whose shared uv cache is populated (measured above) — plus **~5.7 GB once**
+  per cell for the cache itself.
+* **5,772 MB/lane** the moment the sharing is lost, which is why the reserve is 6 GiB and not 316 MB:
+  a budget built only on the marginal figure admits exactly the spawns that filled cell-4.
+* Consequence for the concurrency target (`MAX_LANES = vCPU * 5/2` = **20** on 8 vCPU): with sharing,
+  20 lanes ≈ 6.3 GB + 5.7 GB cache + 6 GB reserve ≈ **18 GB**, which fits a 128 GB cell with room for
+  the CI runners. **Without sharing, 20 lanes need 115 GB + the base image — it does not fit**, and the
+  honest answer is that such a cell can carry ~9 lanes. If a cell starts refusing `DISK-NOHEADROOM`
+  while it has tens of GB free, the sharing regime was lost; measure it before raising the reserve.
+
+**Measure your own cell** (never infer it from `du`): in a fresh worktree,
+
+```bash
+df -Pm / | awk 'NR==2{print $3}'   # used, before
+git -C <repo> worktree add --detach /tmp/measure-wt HEAD
+df -Pm / | awk 'NR==2{print $3}'   # after the checkout  -> the add cost
+cd /tmp/measure-wt && uv sync --extra embeddings --extra parity
+df -Pm / | awk 'NR==2{print $3}'   # after the install   -> the marginal venv cost
+du -sm .venv                       # the APPARENT figure (upper bound, never the budget)
+```
+
+then set `DISK_LANE_TREE_MB` / `DISK_LANE_RESERVE_MB` for that cell, and say so where an operator
+will read it. `scripts/worktree-disk-probe.sh` classifies which byte regime the machine is in.
+
+### The KEEP rule: a shell at a prompt is not a live lane
+
+Both liveness reapers (`reap-lane-venvs.sh` for the env, `pi-reap-worktrees.sh` for the checkout) now
+apply one rule:
+
+> A cwd / argv / tmux-pane holder is **live evidence unless it is a shell whose start time is before
+> the worktree's HEAD commit and which has no child process.**
+
+A shell at its prompt answers "yes, someone is here" for ever, and that single false positive is why 59
+checkouts accumulated on cell-4 while the logs said `KEEP … (a live process has it as cwd)`. A lane
+between turns still holds its `pi`/test **child**, so it is not demoted; a lane that finished and left
+its pane or its `cd` behind is. Every other gate is untouched (`dirty`, `ignored-artifact`, `open-pr`,
+`too-recent`, `detached-unreachable`, `remote-only-ref`), so the blast radius of a wrong reading is a
+re-created env or checkout — never uncommitted or unpushed work. Every unprovable input (pid not in the
+`ps` table, unreadable start time, undatable HEAD, failed probe) leaves the holder **live**, and each
+demotion is named in the pass log (`stale-shell:` / `STALE-SHELL`) and in the row
+(`unref=stale-shell:<pids>`). `REAP_VENV_IDLE_SHELL=0` / `REAP_WT_IDLE_SHELL=0` restore the strict
+reading without editing a shipped script.
+
+⛔ **A shared *environment* is not the fix, and was not adopted.** The recorded decision in
+`docs/ops/lane-venv-reaper-policy.md` rejects a machine-wide venv because `uv` installs the project in
+EDITABLE mode pointing at ONE worktree, so a shared env silently imports the wrong code for every other
+lane. The shared thing the fleet already uses is the **uv cache** (block sharing via hardlinks), which
+is sanctioned and keeps each lane's editable install its own. Reviving a shared venv would be a reopen
+of that decision, not an optimisation.
 
 ## Deliberately out of scope
 
