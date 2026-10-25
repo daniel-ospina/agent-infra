@@ -38,9 +38,17 @@
 //
 // What is deliberately NOT modelled, and is SKIPPED rather than refused: the BODY of a job (only its
 // 4-space `runs-on:` carries routing — `steps:`/`with:`/`env:` content cannot name a runner) and the
-// body of any top-level key other than `jobs:`. Neither can contain a job, so neither can hide a
-// reservation, and refusing them would red every real workflow (`run.sh` arm 42 pins the top-level
-// case: `permissions:` + `contents: read` stays GREEN).
+// body of a top-level key whose value is DEFERRED to its children (`permissions:` + `contents: read`,
+// arm 42). Neither can contain a job, so neither can hide a reservation, and refusing them would red
+// every real workflow.
+//
+// ⛔ The mirror case IS refused: the body of a top-level key whose value is INLINE on the key line
+// (`run-name: |`, `permissions: [`, `permissions: &p`). Exempting those is undecidable here — a
+// malformed header (`run-name: |#x`) and an illegally dedented body are not detectable by first
+// character, and each graded GREEN over a document yaml.safe_load REJECTS. So a legitimate top-level
+// block scalar or multi-line flow is a DELIBERATE OVER-BLOCK (exit 2, arm 47): no workflow in this
+// repo uses one (arm 0 proves the 11 real files stay green) and the refusal names the construct, so
+// the cost of a future one is a fixable message rather than a wrong verdict.
 //
 // ⚠️ RESIDUAL, stated so it is not mistaken for totality: this is NOT a YAML parser, so an INVALID
 // document spelled in a way the subset happens to accept can still grade clean. The consequence is

@@ -500,8 +500,8 @@ done
 # ⛔ The fixture must NOT prepend a second `jobs:`: that refuses first (arm 32's mechanism) and this
 # arm would then pass whatever `reusableJobExempt` does — the vacuous-arm defect review round 8
 # found. Arm 55 below is the STANDING guard for that: it re-injects the regression into a copy of the
-# checker and requires THIS arm's fixture to fail, so a future edit that puts a second `jobs:` back
-# into the fixture cannot silently re-vacuumize it.
+# checker and requires the mutant to grade THIS arm's fixture CLEAN (rc 0) — a re-vacuumized fixture
+# makes the mutant exit 2 for the wrong reason instead, which arm 55 fails on.
 if append "$WF" "$TMP/wf-usesstray.yml" $'  sneaky:\n    uses: actions/checkout@v4\n      runs-on: [ubuntu-latest, required-check]\n'; then
   run_expect 2 "37 UNREADABLE a stray nested line in a 'uses:' job is not swallowed" "$TMP/wf-usesstray.yml" "$DOC"
 else
@@ -651,8 +651,9 @@ echo
 # A mutation arm that cannot fail is worse than no arm: it asserts coverage it does not provide.
 # Round 8 found arm 37 vacuous (its fixture prepended a second `jobs:`, so arm 32 refused first and
 # arm 37 passed whatever `reusableJobExempt` did). This arm is the standing guard against that
-# recurring: it re-injects the round-6 regression into a COPY of the checker and requires arm 37's
-# own fixture to be judged unclean by it.
+# recurring: it re-injects the round-6 regression into a COPY of the checker and requires the MUTANT
+# to grade arm 37's own fixture CLEAN (rc 0) — because that is what arm 37 exists to refuse. A fixture
+# re-vacuumized by a second `jobs:` makes the mutant exit 2 for that reason, and this arm fails.
 if node -e '
   const fs = require("fs");
   const [src, dst] = process.argv.slice(1);
@@ -672,7 +673,7 @@ if node -e '
   # fixture CLEAN (rc 0). If the fixture were re-vacuumized (a second `jobs:` prepended), the mutant
   # would exit 2 for that reason instead, and this arm fails.
   if [ "$rc" -eq 0 ]; then
-    pass "55 SELF-TEST arm 37 DISCRIMINATES — the regression makes its fixture grade clean (mutant rc=$rc, real checker rc=2)"
+    pass "55 SELF-TEST arm 37 DISCRIMINATES — the regression makes its fixture grade clean (mutant rc=$rc; arm 37 measured the real checker)"
   else
     fail "55 SELF-TEST arm 37 is VACUOUS — the regression does NOT make its fixture grade clean (mutant rc=$rc, expected 0): the fixture no longer isolates reusableJobExempt (did a second 'jobs:' get prepended again?)"
   fi
