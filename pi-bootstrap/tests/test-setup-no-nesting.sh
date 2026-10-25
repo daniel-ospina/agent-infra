@@ -507,7 +507,7 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:cadence-nudge.sh script:fleet-cost-report.sh
+script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:disk-reaper-run.sh script:cadence-nudge.sh script:fleet-cost-report.sh
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
 script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py
@@ -516,9 +516,23 @@ script:publish-live-workspaces.py
 script:session-postmortem.sh
 script:record-review.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
+script:harness-apply-pass.sh
 lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py"
+# `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
+# its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
+# producer a farmed consumer EXECS. It is DELIVERED — `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it,
+# which is what makes the timer able to run on a cell at all — so this is a re-pin of the derived
+# population, not an exemption. Verified against the CODE, not the diff (#1899): the exec site is
+# `templates/systemd/eldato-harness-apply.service` + `templates/launchd/harness-apply/*.plist`, both
+# naming `$HOME/.pi/agent/scripts/harness-apply-pass.sh`.
+# `script:disk-reaper-run.sh` joined on 2026-10-24 (#2354, PR #2361): the scheduled wrapper the
+# timer unit execs, ADDED to `fleet_srcs` in the same landing (a fresh $DEST/scripts otherwise gets
+# `install-disk-reaper-timer.sh` + `disk-reaper.sh` without the entry point the unit calls — the exact
+# #1552/#1899 shape). It is DELIVERED — `fleet_srcs` is what puts it at $DEST/scripts/disk-reaper-run.sh
+# — so this is a re-pin of the derived population, NOT a `LANE_PRODUCERS_EXEMPT` entry.
+#
 # `script:record-review.sh` joined on 2026-10-21 (PR #2288, #2287): `review-pr.sh` is now farmed by
 # the SAME `merge_gate_srcs` array and EXECS it, so the derivation sees the recorder as a producer
 # for the first time. It is DELIVERED — that array is what puts it at $DEST/scripts/record-review.sh
@@ -1525,6 +1539,14 @@ check_fleet_tools_farmed() {
   else
     fail "$label: farmed map-sessions.py differs from (or is missing vs) tools/fleet/map-sessions.py"
   fi
+  # #1777 — the ref-claim reader. It imports the sibling liveness.py, so farming it
+  # without the classifier is the same loud exit-2 abort, and a stale copy means an
+  # operator reads a DIFFERENT claim polarity than the repo's.
+  if diff -q "$ROOT/tools/fleet/claim_lanes.py" "$DEST/scripts/fleet/claim_lanes.py" >/dev/null 2>&1; then
+    echo "ok: $label farmed claim_lanes.py == repo copy (#1777)"
+  else
+    fail "$label: farmed claim_lanes.py differs from (or is missing vs) tools/fleet/claim_lanes.py"
+  fi
   # The farmed driver must actually start from the farmed layout: it imports its
   # sibling classifier and forks the shared identity library. `--help` is the
   # read-only mode (no cmux call, no store read, no issue); the pinned
@@ -1888,13 +1910,15 @@ merge_n="$(printf '%s\n' "$merge_decl" | wc -w | tr -d ' ')"
 if [ -z "${merge_n:-}" ] || [ "$merge_n" -eq 0 ]; then
   fail "run 1: could not read the merge_gate_srcs array from setup.sh — the merge-gate farm assertion cannot be derived (#562)"
 else
-  # `|| true`: under `set -euo pipefail` a bare assignment from a failing `grep -m1` would
-  # abort the whole suite and skip every later section, making the diagnostic below
-  # unreachable (P3, sixth fresh review of PR #2288).
+  # ⛔ `|| true`: this file runs `set -euo pipefail`, so an UNGUARDED `grep -m1` in a command
+  # substitution ABORTS THE SUITE when the line is absent — which is exactly the case the assertion
+  # exists for: the `*)` branch never prints its diagnostic, and every assertion after this block
+  # (the lib farm, identity-lib, fleet-tools, runs 1b/2) is silently skipped. Red for the wrong
+  # reason, with the evidence gone. The `lib_line` block below carried the same latent shape.
   merge_line="$(grep -m1 'scripts merge-gate farm: [0-9][0-9]* copied' "$RUNS_LOG" || true)"
   case "$merge_line" in
     *"scripts merge-gate farm: $merge_n copied"*) ;;
-    *) fail "run 1 did not report the merge-gate scripts farm copies (expected $merge_n copied, #562): ${merge_line:-<no merge-gate-farm line at all>}" ;;
+    *) fail "run 1 did not report the merge-gate scripts farm copies (expected $merge_n copied, #562/#984): ${merge_line:-<no merge-gate-farm line at all>}" ;;
   esac
   for merge_base in $merge_decl; do
     case "$merge_line" in
@@ -1913,7 +1937,7 @@ lib_n="$(printf '%s\n' "$lib_decl" | wc -w | tr -d ' ')"
 if [ -z "${lib_n:-}" ] || [ "$lib_n" -eq 0 ]; then
   fail "run 1: could not read the lib_srcs array from setup.sh — the lib-farm assertion cannot be derived"
 else
-  lib_line="$(grep -m1 'scripts lib farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  lib_line="$(grep -m1 'scripts lib farm: [0-9][0-9]* copied' "$RUNS_LOG" || true)"
   case "$lib_line" in
     *"scripts lib farm: $lib_n copied"*) ;;
     *) fail "run 1 did not report the shared-library farm copies (expected $lib_n copied, #1178/#1362): ${lib_line:-<no lib-farm line at all>}" ;;
@@ -1925,8 +1949,28 @@ else
     esac
   done
 fi
-grep -q "scripts/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
-  || fail "run 1 did not report the fleet-tools farm copy (4 files, #1178)"
+# SAME DERIVATION for the fleet-tools farm (#1777 adds claim_lanes.py to it): the count comes from the
+# ARRAY, so a declared sixth tool cannot turn a correct farm into a red, and a summary that lies about
+# how many it copied is still caught.
+tools_decl="$(farm_array_entries fleet_tools | tr '\n' ' ')"
+tools_n="$(printf '%s\n' "$tools_decl" | wc -w | tr -d ' ')"
+if [ -z "${tools_n:-}" ] || [ "$tools_n" -eq 0 ]; then
+  fail "run 1: could not read the fleet_tools array from setup.sh — the fleet-tools farm assertion cannot be derived"
+else
+  tools_line="$(grep -m1 'scripts/fleet farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  case "$tools_line" in
+    *"scripts/fleet farm: $tools_n copied"*) ;;
+    *) fail "run 1 did not report the fleet-tools farm copy (expected $tools_n copied, #1178/#1777): ${tools_line:-<no fleet-tools farm line at all>}" ;;
+  esac
+  for tool_base in $tools_decl; do
+    # The summary spells the tools with HYPHENS (`lane-liveness`), the array with underscores.
+    tool_norm="$(printf '%s' "${tool_base%.py}" | tr '_' '-')"
+    case "$tools_line" in
+      *"$tool_norm"*) ;;
+      *) fail "run 1: the fleet-tools summary does not NAME the declared tool '$tool_base' — a summary that omits a tool it farmed misreports the farm (#1777)" ;;
+    esac
+  done
+fi
 check_tools_dir_clean "run1-final"
 
 # --- run 1b: #1277 legacy migration + durable regression guard -----------------
@@ -1939,7 +1983,7 @@ check_tools_dir_clean "run1-final"
 # the farm FAIL LOUD rather than recreate one.
 echo "== run 1b: legacy tools/fleet migration + tools/ regression guard (#1277)"
 mkdir -p "$DEST/tools/fleet"
-for f in lane_liveness.py liveness.py fleet-health.py map-sessions.py; do
+for f in lane_liveness.py liveness.py claim_lanes.py fleet-health.py map-sessions.py; do
   echo "# legacy farm replica (the pi boot-blocker)" > "$DEST/tools/fleet/$f"
 done
 if [ -f "$DEST/tools/fleet/lane_liveness.py" ]; then

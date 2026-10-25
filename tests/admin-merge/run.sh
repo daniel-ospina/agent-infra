@@ -966,9 +966,46 @@ case "$key" in
     if [ -f "$SCEN/jobs-count" ]; then
       case "$(flag_val --jq "$@")" in *total_count*) cat "$SCEN/jobs-count"; exit 0 ;; esac
     fi
+    # ── #2481: A RUN WHOSE JOB/STEP STATE ADVANCES BETWEEN POLLS ─────────────
+    # The progress test is a comparison of ONE POLL WITH THE LAST, which a static
+    # fixture cannot express: it would make every run look wedged (or, read the
+    # other way, make every run look fine). `jobs-gen-<id>-1.json`, `-2`, … are
+    # served in ORDER, one per read, and the LAST one repeats — the shape the
+    # wait sees live when a job moves from step 4/8 to 5/8 and then sits there.
+    # The counter is per RUN, so two pending runs each advance on their own reads
+    # and a scenario can pin that a change in EITHER is progress.
+    if [ -n "$id" ] && [ -f "$SCEN/jobs-gen-$id-1.json" ]; then
+      # ⛔ THE `.total_count` PROJECTION MUST NOT CONSUME A GENERATION. The
+      # parser's zero-job probe asks the SAME URL with `--jq .total_count`, so an
+      # unfiltered seam would let the parser eat the first generation and make
+      # the wait see no change on its own first poll — a fixture that silently
+      # destroys the very thing it exists to model. It is answered from the
+      # CURRENT generation instead: it is a question about the run, not about
+      # progress.
+      case "$(flag_val --jq "$@")" in
+        *total_count*)
+          gn=$(cat "$SCEN/jobs-gen-count-$id" 2>/dev/null || echo 1)
+          while [ "$gn" -gt 1 ] && [ ! -f "$SCEN/jobs-gen-$id-$gn.json" ]; do gn=$((gn - 1)); done
+          sed -n 's/.*"total_count":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$SCEN/jobs-gen-$id-$gn.json" | head -1
+          exit 0 ;;
+      esac
+      case "$(flag_val --jq "$@")" in
+        ?*) exit 1 ;;  # any OTHER projection is not modelled by a gen fixture
+      esac
+      gn=$(( $(cat "$SCEN/jobs-gen-count-$id" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$gn" > "$SCEN/jobs-gen-count-$id"
+      while [ "$gn" -gt 1 ] && [ ! -f "$SCEN/jobs-gen-$id-$gn.json" ]; do gn=$((gn - 1)); done
+      # ── #2481(g): AN INTERMITTENTLY UNREADABLE SURFACE. `jobs-gen-fail-<id>-<n>`
+      # makes generation n a FAILED read instead of a document, so a scenario can
+      # interleave unreadable polls with readable ones. That is the shape that must
+      # never let unreadable time be counted as "no observable change": a surface
+      # that fails for a while and then recovers has observed nothing in between,
+      # and treating the gap as silence is how a healthy run gets called wedged.
+      if [ -f "$SCEN/jobs-gen-fail-$id-$gn" ]; then exit 1; fi
+      cat "$SCEN/jobs-gen-$id-$gn.json"; exit 0
+    fi
     if [ -n "$id" ] && [ -f "$SCEN/jobs-$id.json" ]; then cat "$SCEN/jobs-$id.json"; exit 0; fi
-    exit 1 ;;
-  *)
+    exit 1 ;;  *)
     exit 1 ;;
 esac
 FAKEEOF
@@ -1007,10 +1044,20 @@ run_admin() {
   # NOSLEEP_BIN below): for a scenario whose subject is the ACCUMULATED clock, not the waiting.
   # An array, like run_admin_here, so the extra variable is one element rather than a
   # conditional word inside a line continuation.
+  # #2481: the FIRST-CHECKS wait is PROGRESS-AWARE now, so a scenario that sets
+  # only the legacy window would otherwise fall to the DERIVED ceiling (18064s)
+  # and hold the suite for hours. SUITE_FIRST_CHECKS_CEILING therefore DEFAULTS to
+  # SUITE_FIRST_CHECKS_WAIT: "expire the wait in N seconds" keeps meaning exactly
+  # that, for every scenario written before the progress test existed. A scenario
+  # that wants the STALL arm says so with SUITE_FIRST_CHECKS_STALL (and may keep a
+  # larger ceiling).
   local -a env_args=(
     "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
     "ADMIN_MERGE_REPRO_CMD=${REPRO_CMD:-true}"
     "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
+    "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
+    "ADMIN_MERGE_FIRST_CHECKS_STALL=${SUITE_FIRST_CHECKS_STALL:-}"
+    "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
     "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
   )
@@ -1029,6 +1076,9 @@ run_admin_here() {
   local -a env_args=(
     "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
     "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
+    "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
+    "ADMIN_MERGE_FIRST_CHECKS_STALL=${SUITE_FIRST_CHECKS_STALL:-}"
+    "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
     "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
   )
@@ -1043,13 +1093,16 @@ run_admin_here() {
 
 # ── the virtual-clock scenarios must not REAL-sleep (agent-infra#2483) ──────────
 # `wait_for_run` accumulates its own clock arithmetically — `waited=$((waited + adv))` at
-# scripts/admin-merge.sh:4698 — and never reads the wall clock. The step is clamped at :4652
+# scripts/admin-merge.sh:5189 — and never reads the wall clock. The step is clamped at :5143
 # (`step="$POLL_INTERVAL"; [ "$step" -gt 0 ] || step=1`), so the `ADMIN_MERGE_POLL_INTERVAL=0`
 # this suite already passes still means ONE arithmetic second per poll; the only real time is
-# `sleep "$adv"` at :4699, which merely PACES a `gh` that is stubbed here. Three scenarios drive
+# `sleep "$adv"` at :5188, which merely PACES a `gh` that is stubbed here. Three scenarios drive
 # that clock across a bound by issuing 605/60/60 polls, which used to cost 614 s + 62 s + 62 s of
 # real sleeping for an arithmetic clock — ~13 of this shard's ~17 minutes, i.e. ~22% of the whole
 # `bash-suites` step (measured 2026-10-22, run 39857849778).
+#
+# (Line numbers re-pointed for this tree: #2481 adds ~640 lines to admin-merge.sh ABOVE
+# `wait_for_run`, so the citations that were correct on main landed elsewhere here.)
 # This stub removes the pacing and nothing else: the poll COUNT, the accumulated clock and every
 # assertion are unchanged, which is why (a2) below asserts the clock still passes 600 s. Same shape
 # as the `sleep() { :; }` probes in this file, but on PATH because the rail is a child process.
@@ -1189,8 +1242,14 @@ main_red_n() {  # <sha> <base-run-id> <n> <id>  -> lane-run lines on stdout
 #   A shard is COVERAGE only when its conclusion is success|failure|timed_out;
 #   `skipped` exercised nothing, so a fixture that lists a shard as skipped
 #   models a run that did NOT execute it — the #4457 hole.
-lane_jobs() {
-  local id="$1"; shift
+# jobs_shards_file <file> <name:conclusion>... — a TERMINAL job listing written
+# to an explicit path. Split out of lane_jobs so a `jobs-gen-<id>-<n>.json`
+# generation can carry a real shard set: the lane-coverage gate (#1319) reads the
+# SAME jobs document the progress test reads, so the LAST generation has to be a
+# listing that gate can accept, or a scenario about the WAIT would fail on an
+# unrelated parity refusal.
+jobs_shards_file() {
+  local file="$1"; shift
   local json='{"total_count":0,"jobs":[' first=1 pair name concl
   for pair in "$@"; do
     name="${pair%:*}"; concl="${pair##*:}"
@@ -1204,7 +1263,12 @@ lane_jobs() {
   # contradicts its own list is a fixture a future reader has to disbelieve.
   local count=$(( $# ))
   json="$(printf '%s' "$json" | sed "s/\"total_count\":0/\"total_count\":$count/")"
-  printf '%s\n' "$json" > "$SCEN/jobs-$id.json"
+  printf '%s\n' "$json" > "$file"
+}
+
+lane_jobs() {
+  local id="$1"; shift
+  jobs_shards_file "$SCEN/jobs-$id.json" "$@"
 }
 
 # lane_jobset <run-id> <conclusion> <shard>... — every shard with one conclusion.
@@ -1213,6 +1277,58 @@ lane_jobset() {
   local pairs=() s
   for s in "$@"; do pairs+=("$s:$concl"); done
   lane_jobs "$id" ${pairs[@]+"${pairs[@]}"}
+}
+
+# ── #2481: an IN-FLIGHT job, with REAL per-step state ────────────────────────
+# The progress signal is each job's `steps[]` (`number`/`status`/timestamps), so
+# a fixture that only carries `name`/`status`/`conclusion` cannot express the one
+# thing the wait now reads. `job_step` writes ONE job:
+#
+#   job_step <file> <job-name> <job-status> <done-steps> <total-steps> \
+#            <step-name> [<in-progress-step-name>] [<secs-per-completed-step>]
+#
+# Steps `1..done` are `completed` (each lasting <secs-per-completed-step>, so the
+# runtime stall PROMOTION has something to promote from), step done+1 is
+# `in_progress` when the job is not completed, and the rest are `queued`. Writing
+# it one job at a time lets a scenario build a listing with a completed shard and
+# an in-flight one, which is what a real lane looks like.
+job_step() {
+  local file="$1" name="$2" jst="$3" done_n="$4" tot="$5" sname="$6" curname="${7:-}" secs="${8:-5}"
+  local steps="" i st started completed
+  # SECOND precision, because a fixture whose steps collapse to the same minute
+  # would report a 0s step and silently disable the runtime stall PROMOTION this
+  # fixture family exists to exercise.
+  _jstep_ts() { printf '2026-01-01T%02d:%02d:%02dZ' $(( $1 / 3600 )) $(( ($1 % 3600) / 60 )) $(( $1 % 60 )); }
+  for i in $(seq 1 "$tot"); do
+    if [ "$i" -le "$done_n" ]; then
+      st=completed
+      started="$(_jstep_ts $(( (i - 1) * secs )))"
+      completed="$(_jstep_ts $(( i * secs )))"
+    elif [ "$i" -eq "$((done_n + 1))" ] && [ "$jst" != "completed" ]; then
+      st=in_progress
+      started="$(_jstep_ts $(( i * secs )))"
+      completed="null"
+    else
+      st=queued; started="null"; completed="null"
+    fi
+    local label="$sname"
+    [ "$i" -eq "$((done_n + 1))" ] && [ -n "$curname" ] && label="$curname"
+    steps="$steps{\"name\":\"$label $i\",\"number\":$i,\"status\":\"$st\",\"conclusion\":$( [ "$st" = completed ] && printf '"success"' || printf 'null' ),\"started_at\":$( [ "$started" = null ] && printf 'null' || printf '"%s"' "$started" ),\"completed_at\":$( [ "$completed" = null ] && printf 'null' || printf '"%s"' "$completed" )},"
+  done
+  steps="${steps%,}"
+  printf '{"total_count":1,"jobs":[{"name":"%s","status":"%s","conclusion":%s,"started_at":"2026-01-01T00:00:00Z","completed_at":%s,"steps":[%s]}]}\n' \
+    "$name" "$jst" \
+    "$( [ "$jst" = completed ] && printf '"success"' || printf 'null' )" \
+    "$( [ "$jst" = completed ] && printf '"2026-01-01T01:00:00Z"' || printf 'null' )" \
+    "$steps" > "$file"
+}
+
+# first_checks_jobs_gen <run-id> <generation> <done-steps> <total-steps> — one
+# poll's worth of an IN-FLIGHT lane run advancing one step per generation, which
+# is the `slow but progressing` shape #2481 is about.
+first_checks_jobs_gen() {
+  job_step "$SCEN/jobs-gen-$1-$2.json" "bash-suites" in_progress "$3" "$4" \
+    "Bash shards — the ONE list both lanes run" "Bash shards — step $3 running"
 }
 
 # ── #6928: the TARGET repo's diff selector, FETCHED AT THE HEAD ──────────
@@ -2907,6 +3023,82 @@ grep -q "no failure in test-d" "$TMP/err" && pass "(g) …the JOB SLUG is named 
   || fail "(g) a different-job main baseline was mis-reported: $(grep 'no failure in\|measured on this lane' "$TMP/err" | head -1)"
 grep -q "pr merge" "$SCEN/calls" && fail "(g) a merge was attempted on a PR-unique job-unreadable" \
   || pass "(g) no merge attempted"
+
+# ── the SAME rule for the file-coarse aggregates (#2643), raised in #2648 review ─
+# `failure_file_key` and `main_baseline_units` had no arm for `bash-shard::`/`runner::`,
+# so BOTH fell through to the generic `${1%%::*}` / `s/::.*//` and returned the bare
+# literal `bash-shard` for EVERY shard. Every failing shard then collapsed onto ONE unit:
+# a main baseline red in one shard matched the PR's failure in a DIFFERENT shard and the
+# operator was told the lane was re-measuring main's failure when it was not — the same
+# false conclusion #7131 exists to prevent, one family over. Main is red on
+# `scripts/aa-main.test.sh`; the PR's shard is `scripts/zz-pr.test.sh`, so the PR's unit
+# is NOT on main and must be named as a PATH.
+new_scen bashshard-resid
+sha_bs='aa26430000000000000000000000000000000088'
+printf '%s\n' "$sha_bs" > "$SCEN/head"
+lane_fail "$sha_bs" 7152 > "$SCEN/runs-$sha_bs"
+printf 'bash-suites (1)\tBash shards\t2026-10-24T03:57:16Z ❌ failed shard: scripts/zz-pr.test.sh\n' > "$SCEN/log-7152"
+printf '3\n' > "$SCEN/jobs-count-7152"
+lane_fail mainbs 7153 > "$SCEN/runs-main"
+printf 'bash-suites (1)\tBash shards\t2026-10-24T03:57:16Z ❌ failed shard: scripts/aa-main.test.sh\n' > "$SCEN/log-7153"
+printf '3\n' > "$SCEN/jobs-count-7153"
+run_admin 45 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(h) a PR-unique bash shard BLOCKS (exit $rc)" \
+  || fail "(h) a PR-unique bash shard was certified (exit $rc)"
+grep -q "no failure in bash-shard" "$TMP/err" && fail "(h) the bare 'bash-shard' literal was reported as the unit" \
+  || pass "(h) …never the bare 'bash-shard' literal as a unit"
+grep -q "no failure in scripts/zz-pr.test.sh" "$TMP/err" && pass "(h) …the SHARD PATH is named as the unit" \
+  || fail "(h) a different-shard main baseline was mis-reported: $(grep 'no failure in\|measured on this lane' "$TMP/err" | head -1)"
+grep -q "pr merge" "$SCEN/calls" && fail "(h) a merge was attempted on a PR-unique bash shard" \
+  || pass "(h) no merge attempted"
+
+# ── (i) the THIRD reader: `main_baseline_units` (raised in #2648 review cycle 3) ──
+# Scenario (h) only ever pins `failure_file_key` — with `main_baseline_units` still collapsing
+# `bash-shard::…` to the literal `bash-shard`, main's unit never matches and the rail prints the
+# PR's path anyway, so (h) stays green with that arm reverted. The arm is only observable where
+# it is used: main red on the SAME shard, so the id IS the residual and `attribute_residual`
+# compares it against main's units — and there the collapse makes the rail say "main carries no
+# failure in <shard>", the exact opposite of the truth. Drive the derivation directly: the
+# scenario fixtures cannot reach that comparison without a three-run rate table.
+  # ⛔ NOT IN A SUBSHELL (#2648 cycle-4 review): `pass`/`fail` increment the SUITE's counters,
+  # and inside `( … )` they incremented a child's — all six assertions printed ✅ and counted for
+  # nothing, so the arms they exist to pin stayed revertible with the suite green. Measured.
+  # shellcheck disable=SC1090
+  eval "$(sed -n '/^main_baseline_units() {/,/^}/p' "$ADM")"
+  eval "$(sed -n '/^main_measured_files() {/,/^}/p' "$ADM")"
+  eval "$(sed -n '/^failure_file_key() {/,/^}/p' "$ADM")"
+  printf '%s\n' 'bash-shard::scripts/aa-main.test.sh' 'runner::python-ci' \
+                 'job-unreadable::test-d' 'collect-error::tests/x.py' \
+                 'tests/test_x.py::test_y' > "$TMP/units-in"
+  main_baseline_units "$TMP/units-in" > "$TMP/units-out"
+  main_measured_files "$TMP/units-in" > "$TMP/measured-out"
+  # The SHARD PATH is the unit — never the bare family literal — or a main baseline red in one
+  # shard reads as pre-existing in a different one (the #7131 false conclusion, one family over).
+  if grep -qx 'scripts/aa-main.test.sh' "$TMP/units-out"; then
+    pass "(i) main_baseline_units keys bash-shard:: by SHARD PATH"
+  else
+    fail "(i) main_baseline_units collapsed bash-shard:: to '$(grep -m1 '^bash-shard' "$TMP/units-out" || echo '<none>')" 
+  fi
+  grep -qx 'bash-shard' "$TMP/units-out" \
+    && fail "(i) the bare literal 'bash-shard' is still a unit" \
+    || pass "(i) …never the bare 'bash-shard' literal"
+  grep -qx 'python-ci' "$TMP/units-out" \
+    && pass "(i) main_baseline_units keys runner:: by JOB SLUG" \
+    || fail "(i) main_baseline_units collapsed runner:: to a literal"
+  # …and the FILE reader agrees for the one aggregate that names a file, and only that one.
+  grep -qx 'scripts/aa-main.test.sh' "$TMP/measured-out" \
+    && pass "(i) main_measured_files counts the shard PATH as a measured file" \
+    || fail "(i) main_measured_files did not count the shard path as measured"
+  if grep -qx 'python-ci' "$TMP/measured-out" || grep -qx 'test-d' "$TMP/measured-out" \
+     || grep -qx 'tests/x.py' "$TMP/measured-out"; then
+    fail "(i) main_measured_files invented a measurement for an aggregate that names no file"
+  else
+    pass "(i) …and does not invent one for runner:: / job-unreadable:: / collect-error::"
+  fi
+  # `failure_file_key` must derive the SAME unit, or the rail's words and its clearance drift.
+  [ "$(failure_file_key 'bash-shard::scripts/aa-main.test.sh')" = 'scripts/aa-main.test.sh' ] \
+    && pass "(i) failure_file_key derives the same unit (words and clearance cannot drift)" \
+    || fail "(i) failure_file_key and main_baseline_units disagree about the unit"
 
 # And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
 # (This is the case that made the refusals look redundant in review cycle 7.)
@@ -5909,7 +6101,10 @@ echo "== 43. a leading zero is refused (the octal/decimal split) =="
 for spec in "ADMIN_MERGE_RERUN_FLOOR|0700" \
             "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010" \
             "ADMIN_MERGE_HEAD_ATTEMPTS|08" "ADMIN_MERGE_HEAD_READ_SLEEP|010" \
-            "ADMIN_MERGE_VERIFY_ATTEMPTS|08"; do
+            "ADMIN_MERGE_VERIFY_ATTEMPTS|08" \
+            "ADMIN_MERGE_FIRST_CHECKS_STALL|08760" \
+            "ADMIN_MERGE_FIRST_CHECKS_CEILING|018064" \
+            "ADMIN_MERGE_FIRST_CHECKS_POLL|060"; do
   knob="${spec%%|*}"; val="${spec#*|}"
   new_scen "leading-zero-$knob"
   env "$knob=$val" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
@@ -13618,6 +13813,343 @@ grep -qx 'unreadable=parse:9831' "$TMP/sg-psig-rep.txt" 2>/dev/null \
   && pass "(g3) …and the collector labels it parse:9831" \
   || fail "(g3) the parse label is missing: $(tr '\n' ' ' < "$TMP/sg-psig-rep.txt" 2>/dev/null)"
 
+# ── 78. THE FIRST-CHECKS WAIT IS PROGRESS-AWARE, NOT A FIXED WINDOW (#2481) ──
+# MEASURED DEFECT: the window was 3900s while one green STEP of this repo's own
+# `ci.yml` lane is 3960-4380s — so a healthy run could not clear it, and #2412
+# refused with "no classification attempted" four minutes before the PR merged.
+# The wait is now driven by the pending runs' per-job/per-step state, so this
+# section pins BOTH DIRECTIONS on the same fixture machinery:
+#
+#   (a) SLOW BUT PROGRESSING past the old window → KEEPS WAITING, then lands (the
+#       legacy window is set to 1s here: under the old code this scenario REFUSED,
+#       which is exactly the discriminating power the test needs)
+#   (b) WEDGED (job steps frozen) → a STALL verdict naming the last transition
+#   (c) STILL PROGRESSING but out of ceiling → a TIMEOUT verdict, not a stall
+#   (d) the wait cleared, and the CLASSIFICATION still refused a genuine red
+#   (e) the progress signal ITSELF unavailable → NOT a stall (the failure mode
+#       that turns a progress-aware wait into a false-stall machine)
+#   (f) the bounds are DERIVED and stated, and the stall period is PROMOTED at
+#       runtime by a step longer than the derived period
+#   (g) an INTERMITTENTLY unreadable surface is not a silent one: unreadable time
+#       feeds the `missing` budget, never the stall clock
+#   (h) a SHORT digest (a partially-read surface) is not "every run terminal": the
+#       wait must not CLEAR on it, and must not blame a stall
+echo "== 78. the FIRST-CHECKS wait distinguishes SLOW from STUCK (#2481) =="
+
+# (a) SLOW BUT PROGRESSING. Three polls show the job advancing one step at a time
+# (1/8 → 2/8 → 3/8); the fourth shows the run itself completed. The legacy window
+# is 1s, i.e. the OLD bound would have expired after the FIRST poll.
+new_scen fc-progress
+HEAD_WSP="f7f7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WSP" > "$SCEN/head"
+lane_queued "$HEAD_WSP" 9761 > "$SCEN/runs-$HEAD_WSP"
+first_checks_line in_progress  ""                "$HEAD_WSP" 9761 2026-10-23T10:00:00Z > "$SCEN/first-checks-gen-1"
+first_checks_line in_progress  ""                "$HEAD_WSP" 9761 2026-10-23T10:00:00Z > "$SCEN/first-checks-gen-2"
+first_checks_line in_progress  ""                "$HEAD_WSP" 9761 2026-10-23T10:00:00Z > "$SCEN/first-checks-gen-3"
+first_checks_line completed    success           "$HEAD_WSP" 9761 2026-10-23T10:00:00Z > "$SCEN/first-checks-gen-4"
+first_checks_jobs_gen 9761 1 1 8
+first_checks_jobs_gen 9761 2 2 8
+first_checks_jobs_gen 9761 3 3 8
+# Every LATER read of this run's jobs is the terminal SHARD LISTING: the wait stops
+# reading it the moment the run goes terminal, and the #1319 lane-coverage gate
+# then reads the SAME document and needs a real shard set on both sides.
+for g in 4 5 6 7 8 9; do
+  jobs_shards_file "$SCEN/jobs-gen-9761-$g.json" 'test (a):success' 'test (b):success'
+done
+lane_pass mainsp 9762 > "$SCEN/runs-main"
+pr_green_surface
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=60 SUITE_FIRST_CHECKS_STALL=30 \
+  SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) a slow-but-PROGRESSING lane is not refused: the rail waited and landed (exit 0)" \
+  || { fail "(a) a progressing lane was refused (exit $rc) — the fixed window is back"; sed 's/^/      /' "$SCEN/err" | head -12; }
+grep -q 'FIRST-CHECKS wait expired' "$SCEN/out" "$SCEN/err" \
+  && fail "(a) the wait reported an expiry even though it was progressing" \
+  || pass "(a) …no expiry was reported at all"
+grep -q 'still RUNNING and PROGRESSING' "$SCEN/out" \
+  && pass "(a) …it said so: the run was PROGRESSING, not merely tolerated" \
+  || { fail "(a) the progress is not named"; sed 's/^/      /' "$SCEN/out" | head -12; }
+grep -qE 'change #[1-9][0-9]* observed at [1-9][0-9]*s' "$SCEN/out" \
+  && pass "(a) …quoting an observed transition AND the elapsed time past the 1s legacy window" \
+  || fail "(a) no transition/elapsed pair past the old window: $(grep -c 'PROGRESSING' "$SCEN/out") progress line(s)"
+grep -qE "bash-suites in_progress step [1-9]/8" "$SCEN/out" \
+  && pass "(a) …naming the JOB and the STEP that advanced" \
+  || fail "(a) the observed job/step is not named"
+grep -q 'pr merge 42 --admin' "$SCEN/calls" \
+  && pass "(a) …and the PR LANDED, on the real classification (evidence + merge)" \
+  || fail "(a) the PR did not merge after the wait cleared"
+[ -f "$SCEN/comment" ] \
+  && pass "(a) …the classification step ran and POSTED its head-bound evidence" \
+  || fail "(a) no evidence comment — the wait cleared but §1b never classified"
+
+# (b) WEDGED. The run is in flight and its job sits at step 4/8 for every poll:
+# no status change, no step advance. That is a STALL, and the verdict must SAY so
+# — naming the last observed transition — instead of timing out quietly.
+new_scen fc-stall
+HEAD_WST="f7f8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WST" > "$SCEN/head"
+lane_queued "$HEAD_WST" 9771 > "$SCEN/runs-$HEAD_WST"
+first_checks_jobs_gen 9771 1 4 8
+lane_fail mainst 9772 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9772"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=60 SUITE_FIRST_CHECKS_STALL=3 \
+  SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) a wedged run BLOCKS (exit $rc)" \
+  || fail "(b) a wedged run certified the merge"
+grep -q 'STALLED' "$SCEN/err" \
+  && pass "(b) …with a STALL verdict" \
+  || { fail "(b) the stall verdict is missing"; sed 's/^/      /' "$SCEN/err" | head -12; }
+grep -q 'a STALL verdict, NOT a timeout' "$SCEN/err" \
+  && pass "(b) …and it says which of the two verdicts it is" \
+  || fail "(b) the stall verdict does not distinguish itself from a timeout"
+grep -q 'TIMEOUT, not a stall' "$SCEN/err" \
+  && fail "(b) the stall was reported in the CEILING wording — the two are indistinguishable" \
+  || pass "(b) …the CEILING wording is absent, so the two verdicts are distinguishable"
+grep -q 'last observed TRANSITION' "$SCEN/err" \
+  && pass "(b) …naming the last observed transition" \
+  || fail "(b) the last observed transition is not named"
+grep -qE "bash-suites in_progress step [0-9]/8" "$SCEN/err" \
+  && pass "(b) …which is the job/step that stopped advancing" \
+  || { fail "(b) the frozen job/step is not named"; sed 's/^/      /' "$SCEN/err" | head -14; }
+grep -qE 'NO observable change for [0-9]+s' "$SCEN/err" \
+  && pass "(b) …and the elapsed stall time (the period it stayed silent)" \
+  || fail "(b) the elapsed stall time is missing"
+grep -q 'pr merge' "$SCEN/calls" && fail "(b) a merge was attempted on a stalled lane" || pass "(b) no merge attempted"
+[ -f "$SCEN/comment" ] && fail "(b) evidence was posted on a stalled lane" || pass "(b) no evidence posted"
+
+# (c) PROGRESSING BUT OUT OF CEILING. One observed change, then the ceiling: the
+# verdict is a TIMEOUT, and it must be worded as one — "still moving, out of room
+# to wait" — because that recommends a different remedy from (b)'s.
+new_scen fc-ceiling
+HEAD_WSC="f7f9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WSC" > "$SCEN/head"
+lane_queued "$HEAD_WSC" 9781 > "$SCEN/runs-$HEAD_WSC"
+first_checks_jobs_gen 9781 1 1 8
+first_checks_jobs_gen 9781 2 2 8
+lane_fail mainsc 9782 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9782"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=2 SUITE_FIRST_CHECKS_STALL=60 \
+  SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) out of ceiling BLOCKS (exit $rc)" || fail "(c) the ceiling was not enforced"
+grep -q 'TIMEOUT, not a stall' "$SCEN/err" \
+  && pass "(c) …as a TIMEOUT, not a stall" \
+  || { fail "(c) the ceiling verdict does not name itself"; sed 's/^/      /' "$SCEN/err" | head -12; }
+grep -q 'it WAS PROGRESSING' "$SCEN/err" \
+  && pass "(c) …and states that the run was still moving when the ceiling hit" \
+  || fail "(c) the ceiling verdict does not say the run was progressing"
+grep -q 'STALLED' "$SCEN/err" \
+  && fail "(c) a progressing run was called STALLED — patience was misread as a hang" \
+  || pass "(c) …and it does NOT claim a stall"
+grep -q 'pr merge' "$SCEN/calls" && fail "(c) a merge was attempted" || pass "(c) no merge attempted"
+
+# (d) PATIENCE DID NOT WEAKEN THE GATE. The wait CLEARS (the run finishes), and
+# the classification that §1b then runs still REFUSES — the residual failure is
+# printed, nothing merges, no evidence is posted. Waiting longer changed WHEN the
+# gate runs, never WHETHER it runs or WHAT it requires.
+new_scen fc-cleared-then-red
+HEAD_WSR="f7fa000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WSR" > "$SCEN/head"
+NEW_SR='tests/test_new.py::test_brand_new_failure'
+lane_queued "$HEAD_WSR" 9791 > "$SCEN/runs-$HEAD_WSR"
+first_checks_line in_progress ""      "$HEAD_WSR" 9791 2026-10-23T10:00:00Z > "$SCEN/first-checks-gen-1"
+first_checks_line completed   failure "$HEAD_WSR" 9791 2026-10-23T10:00:00Z > "$SCEN/first-checks-gen-2"
+log_failed "$NEW_SR" > "$SCEN/log-9791"
+cp "$SCEN/log-9791" "$SCEN/log-after-9791"
+first_checks_jobs_gen 9791 1 2 8
+for g in 2 3 4 5 6 7; do
+  jobs_shards_file "$SCEN/jobs-gen-9791-$g.json" 'test (a):failure' 'test (b):success'
+done
+lane_fail mainsr 9792 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9792"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=30 SUITE_FIRST_CHECKS_STALL=30 \
+  SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) a red that survives the wait still BLOCKS (exit $rc)" \
+  || fail "(d) the longer wait weakened the merge gate"
+grep -q 'FIRST-CHECKS wait expired' "$SCEN/out" "$SCEN/err" \
+  && fail "(d) the wait expired instead of clearing on the terminal run" \
+  || pass "(d) …the wait CLEARED (the lane went terminal)"
+grep -q "$NEW_SR" "$SCEN/err" \
+  && pass "(d) …and the classification ran: the residual failure is printed" \
+  || { fail "(d) the classification did not run after the wait cleared"; sed 's/^/      /' "$SCEN/err" | head -14; }
+grep -q 'pr merge' "$SCEN/calls" && fail "(d) a merge was attempted on a red" || pass "(d) no merge attempted on a red"
+[ -f "$SCEN/comment" ] && fail "(d) evidence was posted on a red" || pass "(d) no evidence posted on a red"
+
+# (e) THE PROGRESS SIGNAL IS ITSELF UNAVAILABLE. No jobs fixture → the Jobs API
+# cannot answer. "No change" would then be evidence of NOTHING, so the wait must
+# keep the legacy bounded window and must NOT claim a stall — this is the failure
+# mode that turns progress-aware waiting into a false-stall machine.
+new_scen fc-unobservable
+HEAD_WSU="f7fb000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WSU" > "$SCEN/head"
+lane_queued "$HEAD_WSU" 9801 > "$SCEN/runs-$HEAD_WSU"
+lane_fail mainsu 9802 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9802"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=60 SUITE_FIRST_CHECKS_STALL=30 \
+  SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e) an unreadable progress surface BLOCKS (exit $rc)" \
+  || fail "(e) an unread surface certified the merge"
+grep -q 'PROGRESS SIGNAL is unavailable' "$SCEN/out" \
+  && pass "(e) …naming the MISSING SIGNAL rather than calling it no-progress" \
+  || { fail "(e) the missing signal is not named"; sed 's/^/      /' "$SCEN/out" | head -10; }
+grep -q 'unread instrument is not a stalled run' "$SCEN/out" \
+  && pass "(e) …and refusing to read that as a stall" \
+  || fail "(e) the wait equated an unread instrument with a stalled run"
+grep -q 'A running job is not a failure, and this is NOT a stall claim' "$SCEN/err" \
+  && pass "(e) …the refusal keeps the still-running wording (not a stall claim)" \
+  || fail "(e) the refusal lost its not-a-stall wording"
+grep -q 'STALLED' "$SCEN/err" "$SCEN/out" \
+  && fail "(e) an unreadable surface produced a STALL verdict" \
+  || pass "(e) …and no STALL verdict was produced"
+
+# (f) THE BOUNDS ARE DERIVED, STATED, AND PROMOTED. The derived period is 2 × the
+# measured longest step; a run that demonstrably HAS a step longer than that must
+# raise it, or the rail would call a run stalled for behaving as it already has.
+new_scen fc-bounds
+env -u ADMIN_MERGE_FIRST_CHECKS_WAIT bash "$ADM" --print-bounds > "$SCEN/fcb.txt" 2>&1 || true
+grep -q '^first-checks-stall=8760$' "$SCEN/fcb.txt" \
+  && pass "(f) the stall period is 8760s = 2 × the measured longest step (4380s)" \
+  || fail "(f) the derived stall period is not stated: $(grep '^first-checks-stall' "$SCEN/fcb.txt")"
+grep -q '^first-checks-ceiling=18064$' "$SCEN/fcb.txt" \
+  && pass "(f) the ceiling is 18064s = 2 × the slowest measured green run (9032s)" \
+  || fail "(f) the derived ceiling is not stated: $(grep '^first-checks-ceiling' "$SCEN/fcb.txt")"
+grep -q '^first-checks-window=3900$' "$SCEN/fcb.txt" \
+  && pass "(f) the legacy window is unchanged at 3900s (it bounds only no-run/unreadable)" \
+  || fail "(f) the legacy window changed: $(grep '^first-checks-window' "$SCEN/fcb.txt")"
+grep -q 'MEASURED' "$SCEN/fcb.txt" \
+  && pass "(f) …and the DERIVATION is printed beside them" \
+  || fail "(f) no derivation is stated"
+grep -q '^first-checks-source=.*4380s' "$SCEN/fcb.txt" \
+  && pass "(f) …naming the measured quantity each bound comes from" \
+  || fail "(f) the source does not name the measured quantity"
+ADMIN_MERGE_FIRST_CHECKS_STALL=5000 bash "$ADM" --print-bounds > "$SCEN/fcb2.txt" 2>&1 || true
+grep -q '^first-checks-stall=5000$' "$SCEN/fcb2.txt" \
+  && pass "(f) …and each bound is an operator seam" \
+  || fail "(f) ADMIN_MERGE_FIRST_CHECKS_STALL did not reach the bound"
+# PROMOTION: a COMPLETED step lasting 5000s on the run being waited on raises the
+# stall period to 2 × 5000 = 10000s, so the wait cannot call that run wedged for
+# running exactly as long as it already has.
+new_scen fc-promote
+HEAD_WPR="f7fc000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WPR" > "$SCEN/head"
+lane_queued "$HEAD_WPR" 9811 > "$SCEN/runs-$HEAD_WPR"
+job_step "$SCEN/jobs-gen-9811-1.json" "bash-suites" in_progress 1 2 \
+  "Bash shards — the ONE list both lanes run" "Bash shards — step 1 running" 5000
+lane_fail mainpr 9812 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9812"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=1 SUITE_FIRST_CHECKS_STALL=2 \
+  SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+grep -q 'stall bound 10000s' "$SCEN/out" "$SCEN/err" \
+  && pass "(f) …and a 5000s completed step PROMOTES the stall period to 10000s at runtime" \
+  || { fail "(f) the stall period was not promoted from the observed step"; sed 's/^/      /' "$SCEN/out" "$SCEN/err" | head -12; }
+
+# (g) AN UNREADABLE STRETCH IS NOT A SILENT ONE. The Jobs surface fails for SIX
+# polls and then recovers with the SAME fingerprint (the job never left step 4/8).
+# Nothing was OBSERVED during those six polls, so the stall clock must not absorb
+# them: `quiet` is evidence of no-progress and the gap is evidence of nothing. If
+# the gap were counted, this healthy run would be reported wedged — "NO observable
+# change for 7s" — on six seconds nobody could see, which is a false block with an
+# untrue message, and it is the one way a progress-aware wait deteriorates into a
+# false-stall machine. (Measured before the fix: quiet went 1s→6s across the failed
+# reads and the first recovered poll fired STALLED at quiet=7s.)
+new_scen fc-intermittent
+HEAD_WSI="f7fd000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WSI" > "$SCEN/head"
+lane_queued "$HEAD_WSI" 9821 > "$SCEN/runs-$HEAD_WSI"
+# EIGHT in-flight polls: six UNREADABLE (generations 1-6) and then two that read
+# fine and show the SAME fingerprint (7-8). The run only goes terminal on the
+# NINTH, so the recovered polls are actually classified while still in flight —
+# that is where the pre-fix clock fires the stall, and a scenario that went
+# terminal on the first recovered poll could not tell the two behaviours apart.
+_i=0; while [ "$_i" -lt 8 ]; do
+  first_checks_line in_progress "" "$HEAD_WSI" 9821 2026-10-23T10:00:00Z > "$SCEN/first-checks-gen-$((_i + 1))"
+  _i=$((_i + 1))
+done
+first_checks_line completed success "$HEAD_WSI" 9821 2026-10-23T10:00:00Z > "$SCEN/first-checks-gen-9"
+# ONE-SECOND completed steps on purpose: the runtime PROMOTION raises the stall
+# period to 2 x the longest COMPLETED step, so 5s steps would lift the bound to
+# 10s and hide the very over-count this case exists to catch.
+for g in 1 2 3 4 5 6 7 8; do
+  job_step "$SCEN/jobs-gen-9821-$g.json" "bash-suites" in_progress 4 8 \
+    "Bash shards — the ONE list both lanes run" "Bash shards — step 5 running" 1
+done
+for g in 1 2 3 4 5 6; do : > "$SCEN/jobs-gen-fail-9821-$g"; done
+jobs_shards_file "$SCEN/jobs-gen-9821-9.json" 'test (a):success' 'test (b):success'
+lane_pass mainsi 9822 > "$SCEN/runs-main"
+pr_green_surface
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+# STALL=6 and WAIT=60: six unreadable polls alone would reach the stall bound if
+# the gap were counted (pre-fix: quiet≈6 at recovery, then the stall fires on the
+# next no-change poll), while the fixed wait has observed only 2-3s of real silence
+# when the run goes terminal — a 2× margin that a slow poll cannot manufacture.
+SUITE_FIRST_CHECKS_WAIT=60 SUITE_FIRST_CHECKS_CEILING=120 SUITE_FIRST_CHECKS_STALL=6 \
+  SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(g) an unreadable stretch that RECOVERS is not a stall: the rail waited and landed (exit 0)" \
+  || { fail "(g) a healthy run was called wedged on time it could not observe (exit $rc)"; sed 's/^/      /' "$SCEN/err" | head -14; }
+grep -q 'STALLED' "$SCEN/err" \
+  && fail "(g) unreadable time was counted as 'no observable change' — a STALL verdict was manufactured" \
+  || pass "(g) …no STALL verdict was manufactured from the unreadable interval"
+grep -q 'PROGRESS SIGNAL is unavailable' "$SCEN/out" \
+  && pass "(g) …the unavailable signal was named while it lasted" \
+  || { fail "(g) the unreadable interval was not reported"; sed 's/^/      /' "$SCEN/out" | head -10; }
+grep -q 'unreadable for [0-9]*s of the 60s fallback window in total, [0-9]*s consecutively' "$SCEN/out" \
+  && pass "(g) …and reported as CUMULATIVE and CONSECUTIVE time, not as one continuous silence" \
+  || fail "(g) the unreadable time is reported as if it were continuous: $(grep -c 'unavailable' "$SCEN/out") line(s)"
+grep -q 'pr merge 42 --admin' "$SCEN/calls" \
+  && pass "(g) …and the PR landed on its real classification" \
+  || fail "(g) no merge after the surface recovered"
+
+# (h) A SHORT DIGEST IS NOT "EVERY RUN TERMINAL". Both Jobs reads SUCCEED, but the
+# digest parser dies on the second document — an unparseable step number raises
+# OverflowError, and the inner handlers catch only TypeError/ValueError — so
+# `first_checks_digest` prints PARTIAL stdout for the FIRST run and nothing for
+# the second, while its `2>/dev/null || true` hides the traceback. Two pending
+# runs, ONE digest line. Counting that against `pending` reads "all runs
+# terminal" and CLEARS the wait; §1b then refuses with a false diagnosis ("the
+# wait CLEARED (the lane was terminal), but a NEW run appeared") — the pre-#2481
+# "gave up before classifying" shape, caused by a broken instrument rather than a
+# slow one. A line-count mismatch must be handled EXACTLY like a failed read:
+# every run stays pending, the signal is marked missing, and the legacy window
+# bounds it. RED on the pre-fix rail: `pending` stayed 0 on this path, so the
+# CLEARED wording appeared in place of the missing-signal one.
+new_scen fc-shortdigest
+HEAD_WSH="f7fe000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WSH" > "$SCEN/head"
+{
+  first_checks_line in_progress "" "$HEAD_WSH" 9831 2026-10-23T10:00:00Z
+  first_checks_line in_progress "" "$HEAD_WSH" 9832 2026-10-23T10:00:00Z
+} > "$SCEN/first-checks-gen-1"
+cp "$SCEN/first-checks-gen-1" "$SCEN/runs-$HEAD_WSH"
+first_checks_jobs_gen 9831 1 1 8
+# The SECOND document is the one the parser cannot finish: `1e400` is valid JSON
+# and Python reads it as `inf`, so `int(s.get("number"))` raises OverflowError —
+# an exception the inner try/except deliberately does not name.
+printf '%s\n' '{"jobs":[{"name":"bash-suites","status":"in_progress","steps":[{"number":1e400,"name":"Bash shards — step 1 running","status":"in_progress"}]}]}' \
+  > "$SCEN/jobs-gen-9832-1.json"
+lane_fail mainsh 9833 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9833"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=60 SUITE_FIRST_CHECKS_STALL=30 \
+  SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) a short Jobs digest does not clear the wait — the rail BLOCKS (exit $rc)" \
+  || fail "(h) a partial digest was read as 'all runs terminal' and the lane was certified"
+grep -q 'PROGRESS SIGNAL is unavailable' "$SCEN/out" \
+  && pass "(h) …the short digest is named as a MISSING SIGNAL, not as a terminal lane" \
+  || { fail "(h) the short digest was not reported as a missing signal"; sed 's/^/      /' "$SCEN/out" | head -10; }
+grep -q 'wait CLEARED' "$SCEN/out" "$SCEN/err" \
+  && fail "(h) the wait reported CLEARING on an incomplete digest" \
+  || pass "(h) …and it never claimed the lane was terminal"
+grep -q 'STALLED' "$SCEN/out" "$SCEN/err" \
+  && fail "(h) a broken instrument produced a STALL verdict" \
+  || pass "(h) …and no STALL verdict was manufactured from a partial read"
+grep -q 'pr merge 42' "$SCEN/calls" \
+  && fail "(h) a merge was attempted on a lane the rail could not classify" \
+  || pass "(h) …and no merge was attempted"
 
 # ── #1185. a pipeline-compliance GATE failure NAMES its check ────────────────
 #
@@ -13728,6 +14260,223 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
   && fail "(#1185 c) …but the SUPERSEDED run's log was fetched — the identity resurrected a replaced red" \
   || pass "(#1185 c) …and the superseded run's log was never read"
 
+# ── 79. THE REFUSAL NAMES ITS SUBJECT — THE RUN, THE CHECK, AND THE BASE ANSWER (#2610) ─
+# A count is not a subject. Measured on agent-infra 2026-10-24: three rails (#2430, #2608,
+# #2623) refused with "N of M failing PR run(s) yielded NO parseable failure identity" for
+# heads whose surface was red on `bash-suites (1)/(5)/(7)`, and the refusal named NOTHING —
+# not the run, not the check, not what the base carries under that name. Reconstructing the
+# subject took a `gh api` survey by hand, and in the meantime the refusal read as
+# "unattributable", which is a conclusion this rail must never deliver without evidence.
+#
+# ⛔ WHAT THIS DOES **NOT** PIN. The EXEMPTION DECISION compares failures by IDENTITY, not by
+# check name, so a name answer is CONTEXT — it never exempts. The fixture carries the real
+# agent-infra split (the PR lane's `bash-suites (5)` vs main's `script-validate`) in its REAL
+# shape: main's red sits on a `push` run of a workflow that declares no `pull_request`
+# trigger, so the base probe measures it and then EXEMPTS it as not-PR-evaluable. A reader
+# built on the blocking-red set alone would answer "no such red" about the one red that
+# exists — that is the shape pinned here, not the `unknown`-evaluability arm.
+echo "== 79. an unattributable failing run is refused BY NAME, with its base counterpart (#2610) =="
+new_scen named-refusal
+HEAD_NR="f9f90000000000000000000000000000000000ab"
+printf '%s\n' "$HEAD_NR" > "$SCEN/head"
+lane_fail "$HEAD_NR" 9901 > "$SCEN/runs-$HEAD_NR"
+: > "$SCEN/log-9901"                       # the failed-step log carries NO identity
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9901"
+write_pr_checks "$(check_run 5001 'bash-suites (5)' completed failure 9901)"
+# The base's OWN surface: the same suite under a DIFFERENT name — the split this repo has.
+write_main_checks "$(check_run 4001 'script-validate' completed failure 6101)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6101"
+wf_declares .github/workflows/ci-main.yml push          # …declaring NO pull_request trigger
+main_run_map 6101 push 'CI on main'
+{ main_red_n mainnr01 9902 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a) the unattributable failing run still BLOCKS (exit $rc)" \
+  || fail "(a) the rail merged over a run whose failures entered neither side of the comparison"
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN/err" \
+  && pass "(a) …at step 1c, the arm this issue is about" \
+  || fail "(a) the refusal did not fire at step 1c: $(head -4 "$SCEN/err" 2>/dev/null)"
+grep -q "check 'bash-suites (5)'" "$SCEN/err" \
+  && pass "(b) the refusal NAMES the check that yielded nothing — not just a count" \
+  || fail "(b) the refusal names no check: $(grep -n 'run 9901' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "run 9901" "$SCEN/err" \
+  && pass "(b) …and the RUN it failed in" \
+  || fail "(b) the refusal names no run"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(c) …and answers the base question BY NAME: no base counterpart for 'bash-suites (5)'" \
+  || fail "(c) the base-counterpart answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+# ⛔ THE EXEMPTED-BASE-RED ARM. main's `script-validate` is measured by the probe and then
+# EXEMPTED (its workflow declares no pull_request trigger), so it is NOT in the blocking set.
+# An arm reading only the blocking reds prints an EMPTY list here — the false absence this
+# fixture exists to catch, and the exact shape of the real repo tonight.
+grep -q "red: script-validate" "$SCEN/err" \
+  && pass "(c) …naming the base's own red even though the probe EXEMPTED it as not-PR-evaluable" \
+  || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader answers 'none'): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
+grep -q "The EXEMPTION DECISION compares failures by FAILURE IDENTITY" "$SCEN/err" \
+  && pass "(d) …and says a NAME answer is not an exemption (the identity is what decides)" \
+  || fail "(d) the message could be read as an exemption — the two questions are not separated"
+# ── (e)/(f) THE RUN'S OWN ATTRIBUTION, NOT THE RUN'S MERE PRESENCE (#2610 review, P1-2) ────
+# `--provenance` holds EVERY examined failing run, so a refusal derived from it names runs
+# that DID yield ids. The subset comes from the collector's `--unattributed`, and this
+# fixture proves the two are told apart: run A yields an id (exempt on main, so it does not
+# change the verdict), run B yields nothing. Only B may be named.
+new_scen named-refusal-partial
+HEAD_NP="f9f90000000000000000000000000000000000ef"
+printf '%s\n' "$HEAD_NP" > "$SCEN/head"
+{ lane_fail "$HEAD_NP" 9921; lane_fail "$HEAD_NP" 9922; } > "$SCEN/runs-$HEAD_NP"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9921"
+: > "$SCEN/log-9922"
+echo 'test (z)' > "$SCEN/jobs-failed-9922"
+write_pr_checks "$(check_run 5021 'test (z)' completed failure 9922)"
+write_main_checks "$(check_run 4021 'script-validate' completed failure 6103)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6103"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6103 push 'CI on main'
+{ main_red_n mainnp01 9923 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(e) a partially attributing head still BLOCKS (exit $rc)" \
+  || fail "(e) the rail merged with one failing run unattributable"
+grep -q "BLOCKED — 1 of 2 failing PR run(s)" "$SCEN/err" \
+  && pass "(e) …reporting 1 of 2 unattributable" \
+  || fail "(e) the 1c refusal did not fire as expected: $(head -3 "$SCEN/err" 2>/dev/null)"
+grep -q "run 9922" "$SCEN/err" \
+  && pass "(f) the refusal NAMES the run that yielded nothing (9922)" \
+  || fail "(f) the unattributable run is not named: $(grep -n 'run 99' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "run 9921" "$SCEN/err" \
+  && fail "(f) it ALSO named run 9921, which DID yield an id — provenance was used as the subset" \
+  || pass "(f) …and does NOT name run 9921, which contributed an id"
+# ── (h) A GREEN BASE — the COMMON case, and the one a `paste`-then-`sed` default misses.
+# `paste -sd, -` emits no line at all for zero input lines, so a `sed 's/^$/none/'` placed
+# AFTER it is dead code and the answer ends at `red: ` (#2610 review, P2-1). This arm is
+# the one that fails if that default regresses.
+new_scen named-refusal-greenbase
+HEAD_NG="f9f9000000000000000000000000000000000012"
+printf '%s\n' "$HEAD_NG" > "$SCEN/head"
+lane_fail "$HEAD_NG" 9931 > "$SCEN/runs-$HEAD_NG"
+: > "$SCEN/log-9931"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9931"
+write_pr_checks "$(check_run 5031 'bash-suites (5)' completed failure 9931)"
+main_green_surface
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) a green base with an unattributable PR run still BLOCKS (exit $rc)" \
+  || fail "(h) the refusal did not fire against a green base"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(h) …and still answers the base question BY NAME" \
+  || fail "(h) no counterpart answer against a green base: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -qE "^       red: none$" "$SCEN/err" \
+  && pass "(h) …printing 'red: none' for a base with no reds (not an empty 'red: ')" \
+  || fail "(h) the empty red list renders as nothing at all: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
+# ── (i) AN UNRESOLVED BASE REF IS NOT 'main'. A failed `pr view --json baseRefName` must
+# not be narrated as a claim about a branch nobody resolved.
+new_scen named-refusal-nobase
+HEAD_NB="f9f9000000000000000000000000000000000034"
+printf '%s\n' "$HEAD_NB" > "$SCEN/head"
+printf '\n' > "$SCEN/base-ref"                      # the resolution answers EMPTY
+lane_fail "$HEAD_NB" 9941 > "$SCEN/runs-$HEAD_NB"
+: > "$SCEN/log-9941"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9941"
+write_pr_checks "$(check_run 5041 'bash-suites (5)' completed failure 9941)"
+main_green_surface
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(i) an unresolvable base ref still refuses (exit $rc)" \
+  || fail "(i) the rail proceeded with no base ref"
+grep -q "the base ref could NOT be resolved" "$SCEN/err" \
+  && pass "(i) …saying the counterpart question is UNANSWERED" \
+  || fail "(i) an unresolved base ref was narrated as a claim about a branch: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "IS red on 'main'" "$SCEN/err" \
+  && fail "(i) it asserted a red is 'on main' about a base it never resolved" \
+  || pass "(i) …and asserts nothing about 'main'"
+# ── (j) A COUNT THAT COULD NOT BE MADE IS NOT A ZERO COUNT. The header's count comes from
+# `grep -c`; when grep cannot read the file at all (exit 2/127) the function must say the count
+# is UNKNOWN and print NO number — a header asserting `NAMED (0)` over a list that then prints
+# runs is a measured-looking claim about something never measured (#2610 review, round 5). The
+# status is forced here with a PATH shim that behaves as the real grep EXCEPT for the
+# unattributed list, so nothing else in the rail is affected.
+new_scen named-refusal-uncountable
+HEAD_NU="f9f9000000000000000000000000000000000056"
+printf '%s\n' "$HEAD_NU" > "$SCEN/head"
+lane_fail "$HEAD_NU" 9961 > "$SCEN/runs-$HEAD_NU"
+: > "$SCEN/log-9961"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9961"
+write_pr_checks "$(check_run 5061 'bash-suites (5)' completed failure 9961)"
+main_green_surface
+UNC_BIN="$TMP/grep-uncountable"
+mkdir -p "$UNC_BIN"
+printf '%s\n' '#!/bin/sh' \
+  'case "$*" in *pr-unattributed*) echo "grep: cannot read the unattributable list" >&2; exit 2 ;; esac' \
+  'exec /usr/bin/grep "$@"' > "$UNC_BIN/grep"
+chmod +x "$UNC_BIN/grep"
+PATH="$UNC_BIN:$PATH" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+# ⛔ ANCHORED TO THE ARM, NOT TO THE EXIT (#2610 review, round 6): step 1c's `exit 1` fires on
+# `pr_extracted < pr_examined` whether or not the naming arm ran, so an `rc != 0` assertion alone
+# could not redden if the arm regressed. Both halves are required: the refusal AND the unknown
+# header, on the same run.
+[ "$rc" -ne 0 ] && grep -q 'failing PR run(s)' "$SCEN/err" \
+  && grep -q 'The failing run(s), NAMED —' "$SCEN/err" \
+  && pass "(j) an uncountable list still BLOCKS (exit $rc) and still names the runs" \
+  || fail "(j) the refusal or the named header is missing (exit $rc)"
+grep -q "could not be COUNTED" "$SCEN/err" \
+  && pass "(j) …and says the count could not be made" \
+  || fail "(j) the uncountable arm is silent: $(sed -n '/NAMED/,$p' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "UNKNOWN, not zero" "$SCEN/err" \
+  && pass "(j) …naming it UNKNOWN rather than zero" \
+  || fail "(j) the message does not distinguish unknown from zero"
+grep -q 'NAMED (0)' "$SCEN/err" \
+  && fail "(j) it asserted a count of 0 for a list it could not count" \
+  || pass "(j) …and prints NO number it did not measure"
+grep -q "run 9961 — check 'bash-suites (5)'" "$SCEN/err" \
+  && pass "(j) …while the runs themselves are still named (the lines are real)" \
+  || fail "(j) the runs were dropped along with the count: $(grep -n '9961' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q 'INCOMPLETE' "$SCEN/err" \
+  && fail "(j) the completeness cross-check ran against an UNKNOWN count" \
+  || pass "(j) …and no completeness verdict is claimed from an unknown count"
+
+# ── (g) THE SAME-NAME ARM. An arm that always answers "no counterpart" would pass (c) and
+# lie about this surface, so a blocking base red with the same NAME is its own case.
+new_scen named-refusal-shared
+HEAD_NS="f9f90000000000000000000000000000000000cd"
+printf '%s\n' "$HEAD_NS" > "$SCEN/head"
+lane_fail "$HEAD_NS" 9911 > "$SCEN/runs-$HEAD_NS"
+: > "$SCEN/log-9911"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9911"
+write_pr_checks "$(check_run 5011 'bash-suites (5)' completed failure 9911)"
+write_main_checks "$(check_run 4011 'bash-suites (5)' completed failure 6102)"
+main_run_map 6102 push 'CI on main'
+{ main_red_n mainns01 9912 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(g) a shared red NAME still REFUSES (a name match is not an exemption)" \
+  || fail "(g) a same-named base red exempted the PR by NAME — the decision is by identity"
+grep -q "'bash-suites (5)' IS red on 'main'" "$SCEN/err" \
+  && pass "(g) …and reports the base as carrying the same name RED (not as an absence)" \
+  || fail "(g) the same-name arm is wrong: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "NO BASE COUNTERPART" "$SCEN/err" \
+  && fail "(g) it ALSO claimed no counterpart — the arms are not exclusive" \
+  || pass "(g) …and does NOT claim an absent counterpart on the same surface"
+# ── MUTATION: the assertions above must rest on the naming arm, not on other text ──
+MUTD="$TMP/mut-named"; rm -rf "$MUTD"; mkdir -p "$MUTD"
+grep -v 'named_unattributable_runs "$TMP/pr-unattributed.txt"' "$ADM" > "$MUTD/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD/"
+bash -n "$MUTD/admin-merge.sh" \
+  && pass "(m) the mutant (naming arm deleted) is still valid bash" \
+  || fail "(m) the mutant does not parse — the mutation is not a clean arm deletion"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  bash "$MUTD/admin-merge.sh" 42 --main-runs 1 >"$SCEN/mut-out" 2>"$SCEN/mut-err"
+mrc=$?
+# The SAME refusal must still fire — a mutant that died earlier would make the absence arm
+# vacuously true, so the arm below is only meaningful once THIS one holds.
+grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN/mut-err" 2>/dev/null \
+  && pass "(m) the mutant still refuses at step 1c — the refusal is not what this arm adds" \
+  || fail "(m) the mutant did not reach step 1c (exit $mrc): $(head -3 "$SCEN/mut-err" 2>/dev/null)"
+grep -q "check 'bash-suites (5)'" "$SCEN/mut-err" 2>/dev/null \
+  && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
+  || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

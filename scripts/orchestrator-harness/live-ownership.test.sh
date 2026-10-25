@@ -272,6 +272,27 @@ case "$line" in *"4 recorded row(s)"*) ok "(h) ...and it says exactly that" ;;
 sel3 3 0 3 0 42 '' 9; choice="$LO_CHOICE_V"
 case "$line" in *"dispatching PR-takeover"*) ok "(f) an absent acted count keeps the old wording (compatible)" ;;
   *) bad "(f) the absent-acted path changed wording: $line" ;; esac
+# ⛔ #2590: ACT IS NOT SPAWN. A measured ZERO SPAWNS must take the word "dispatch" out of the line even
+# though the ledger reported actions — the live defect was `2 acted (#9812,#9528)` where #9528's row was
+# `auto-armed`, i.e. a button press counted as a dispatch.
+sel3 3 0 3 0 42 '' 9 2 4 ok 0; choice="$LO_CHOICE_V"
+eqv "(i) acts but 0 spawns -> still the PR choice" "pr" "$choice"
+case "$line" in *"dispatching"*) bad "(i) the funnel claimed 'dispatching' on a pass that started NO worker: $line" ;;
+  *) ok "(i) 2 actions and 0 spawns does NOT claim a dispatch" ;; esac
+case "$line" in *"NO WORKER SPAWNED"*"0 worker records"*) ok "(i) ...it names the measured zero, and says an arm/rerun starts nothing" ;;
+  *) bad "(i) the zero-spawn wording is missing: $line" ;; esac
+# ...and one real spawn restores the claim, WITH the count, so the line is backed by an artifact.
+sel3 3 0 3 0 42 '' 9 2 4 ok 1; choice="$LO_CHOICE_V"
+case "$line" in *"dispatching PR-takeover (first #42"*"1 worker(s) spawned"*) ok "(j) a measured spawn restores the claim and prints the count behind it" ;;
+  *) bad "(j) the funnel dropped its claim (or its evidence) with 1 spawn: $line" ;; esac
+# 0 spawns AND nothing recorded is BOTH readings, not one: the spawn count WAS measured.
+sel3 3 0 3 0 42 '' 9 0 0 unknown 0; choice="$LO_CHOICE_V"
+case "$line" in *"measured: 0 worker records"*"UNKNOWN, not zero"*) ok "(k) a measured zero spawn beside an unwritable ledger says BOTH" ;;
+  *) bad "(k) the two readings were collapsed: $line" ;; esac
+# An UNREADABLE spawn count is not a zero: an old module/caller must not be rendered as "nothing spawned".
+sel3 3 0 3 0 42 '' 9 2 4 ok ''; choice="$LO_CHOICE_V"
+case "$line" in *"dispatching PR-takeover"*) ok "(l) an UNREPORTED spawn count leaves the acted-based wording alone (compatible)" ;;
+  *) bad "(l) an unreported spawn count changed the wording: $line" ;; esac
 # An unreadable count must not open the issue path (assuming 0 would be the fail-open direction).
 sel3 5 0 '' 0 - '' 9; choice="$LO_CHOICE_V"
 eqv "an UNREADABLE un-owned count -> PRs (drain), never issues" "pr" "$choice"

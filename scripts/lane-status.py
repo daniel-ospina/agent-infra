@@ -12,8 +12,10 @@ Signals combined (owner, 2026-09-25):
                      store (#1777).
                      Never read its absence as "nobody is on it" — the holder-authored
                      existence datum is the `refs/claims/<pr>-<sha12>` ref namespace
-                     written by `scripts/orchestrator-harness/claims.sh`; the fleet's
-                     readers of those stores include `tools/fleet/liveness.py`,
+                     written by `scripts/orchestrator-harness/claims.sh`. Its reader IS
+                     `tools/fleet/claim_lanes.py` (#1784), so the binding #1777
+                     tracked is done rather than pending; the fleet's other readers of
+                     those stores include `tools/fleet/liveness.py`,
                      `tools/fleet/lane_liveness.py`, `tools/fleet/fleet-health.py` and
                      `tools/fleet/map-sessions.py`.
   2. TRANSCRIPT    — the last 1-3 messages: tells WIP from DONE, which a
@@ -120,9 +122,9 @@ CHILD_SUPPRESSED = ACTION_VERDICTS   # back-compat alias; the set is no longer c
 # record of a lane: an orchestrator lane runs pi in print mode with sessions disabled, so it has no
 # session file at all, and a `grep` for its branch over the session store comes back empty while it is
 # live and committing (#1777, 2026-10-15). Absence here is not freedom — the holder-authored existence
-# datum is the `refs/claims/<pr>-<sha12>` ref namespace (#1777 tracks binding it into the fleet's read
-# set), and `tools/fleet/liveness.py` stays the ONE verdict function (per #1178). The stores and their
-# readers are named in the module docstring above.
+# datum is the `refs/claims/<pr>-<sha12>` ref namespace, read by `tools/fleet/claim_lanes.py` (the
+# binding #1777 tracked), and `tools/fleet/liveness.py` stays the ONE verdict function (per #1178).
+# The stores and their readers are named in the module docstring above.
 # Inbound-recency is reported BESIDE it, never in place of it.
 #
 # ⛔ AND IT MUST NOT VETO THE SERIOUS VERDICTS. A fresh inbound is not proof of life, so it discounts
@@ -850,6 +852,67 @@ def _inbound_message(ws):
         one = " ".join(m.split())
         return one if len(one) <= INBOUND_MSG_MAX else one[:INBOUND_MSG_MAX] + "..."
     return None
+
+
+def workspace_cwds():
+    """{UPPER-CASE WORKSPACE UUID: cwd} -- the lane's session directory, straight from cmux.
+
+    ⛔ THIS IS THE DISPATCHER'S IDENTITY EVIDENCE, so it is a FIRST-CLASS field, not a display
+    detail (owner, 2026-10-20). `lane-actions.py` decides whether a workspace is a FLEET lane or the
+    OWNER's from this path alone; there used to be no cwd anywhere in the snapshot, so the only
+    available rule was a list of workspace NAMES -- and the owner's own workspace ("Personal
+    website") was not on it.
+
+    Costs nothing: `_live_workspaces()` is cached and already holds this object for every row
+    (`_live_label()` reads `current_directory` from the same shape). Tolerant BY ROW: a workspace
+    with no `current_directory` -- or with a value that is not even a string -- is simply ABSENT
+    from the map, and is counted on stderr; the whole roster being unreadable is announced
+    separately. An absent cwd stays absent: `lane-actions.py` turns it into PROTECTED, and a
+    placeholder here would defeat exactly that.
+    """
+    out = {}
+    bad = 0
+    try:
+        rows = _live_workspaces()
+    except Exception as e:                                        # defensive: see below
+        _cwds_unreadable("raised %s: %s" % (type(e).__name__, e))
+        return out
+    # ⛔ TOLERANCE IS PER-ROW (review round 6, P3, MEASURED). The `try` used to wrap the WHOLE loop,
+    # so one workspace with an unexpected type (`"current_directory": 123`) discarded EVERY cwd and
+    # the fleet lost its identity evidence for that tick -- while the docstring promised "a workspace
+    # with no `current_directory` is simply ABSENT from the map". A bad row is skipped and counted;
+    # the whole roster failing is a different fact, and that is the `except` above.
+    for w, x in rows:
+        try:
+            d = (x.get("current_directory") or "").strip()
+            if w and d:
+                out[str(w).strip().upper()] = d
+        except (AttributeError, TypeError, ValueError):
+            bad += 1
+            continue
+    if bad:
+        sys.stderr.write("lane-status: %d workspace row(s) had an unreadable current_directory and "
+                         "were SKIPPED -- those lanes will read PROTECTED this tick\n" % bad)
+    # ⛔ SAY IT OUT LOUD (review round 2, P2) -- AND ON THE ARM THAT ACTUALLY FIRES (review round 4,
+    # P2, MEASURED). `_live_workspaces()` does NOT raise on an unreadable roster: `sh_rc` catches its
+    # own failures and the reader catches everything else, returning `[]` with `LIVE_READABLE=False`.
+    # So the `except` above is unreachable in production and the stderr line never printed: `{}` came
+    # back silently, every row published cwd=None, `lane-actions.py` called every lane PROTECTED
+    # (fail-closed, correct) and the beat read NOTHING-ACTIONABLE -- indistinguishable from a quiet
+    # fleet, from a fix that was supposed to announce it. The datum is the module's own
+    # `LIVE_READABLE` / `LAST_FAILURE`, read here after the call.
+    if LIVE_READABLE is False:
+        _cwds_unreadable("cmux roster unreadable (%s)" % (LAST_FAILURE or "no failure recorded"))
+    return out
+
+
+def _cwds_unreadable(why):
+    """One loud stderr line: the identity evidence is missing, so every lane will read PROTECTED.
+
+    Same polarity as `live_workspaces()`'s "UNREADABLE -- the filter is INERT": a blind instrument
+    must announce itself, because its silence is a valid answer for a different question."""
+    sys.stderr.write("lane-status: workspace cwds UNREADABLE (%s) -- every lane will be classified "
+                     "PROTECTED; this is NOT an idle fleet\n" % why)
 
 
 def _live_label(wsid, x):
@@ -2169,6 +2232,17 @@ def main():
         except Exception:
             _screens = {}   # fall back to the serial path below, never to no screen
 
+    # ⛔ THE WORKSPACE'S OWN cwd, PUBLISHED ON EVERY ROW (owner, 2026-10-20).
+    # The dispatcher has to know WHOSE workspace it is about to type into, and the only evidence
+    # for that is the directory the lane was started in. This read is FREE: `_live_workspaces()`
+    # already fetched the full cmux object for every workspace (it is where `_live_label()` gets
+    # `current_directory`), and the result is cached, so this adds no cmux call.
+    # It is published rather than resolved by the consumer because the consumer (the beat) CANNOT
+    # run cmux at all ("Access denied -- only processes started inside cmux can connect"), and a
+    # cwd guessed from a session-directory name is LOSSY (lane-status's `mangled()` turns both "/"
+    # and "." into "-", so `/x/.worktrees/y` and `/x/-worktrees/y` encode identically).
+    _ws_cwd = workspace_cwds()
+
     out = []
     for label, ws, ilabel in rows:
         s = snap[label]
@@ -2358,6 +2432,8 @@ def main():
                        declared=declared, pane_children=pane_kids,
                         spinner=spinner, sid=s["sid"], ws=s["ws"], size=cur_size,
                         issue_label=ilabel,
+                        # the lane's session cwd, from cmux -- the dispatcher's identity evidence
+                        cwd=(_ws_cwd.get((s["ws"] or "").strip().upper()) or None),
                         last=(last_kind or "-"),
                         recent=[f"{k}:{t[:66]}" for k, t in descs[-3:]],
                         child=child, child_file=os.path.basename(child_file) if child_file else None,
