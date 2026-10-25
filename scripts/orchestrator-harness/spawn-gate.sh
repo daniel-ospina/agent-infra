@@ -281,9 +281,12 @@ disk_low() { # disk_low <free-mb>
 #     4x the dispatch floor"), and the band is how loudly that is reported.
 # ⛔ NOT ONE GLOBAL CONSTANT (#1852's recorded finding, reused): an agent-infra lane materialises
 # 48 MB and installs nothing, so a tortoise-sized floor would refuse every harness spawn on every
-# cell — a false BLOCK, which is its own defect class. The pair is derived from the TARGET: a
-# `uv.lock` in the gated path means a python lane. Both halves stay overridable for a cell whose
-# measurement differs (`DISK_LANE_TREE_MB` / `DISK_LANE_RESERVE_MB`) — but MEASURE THAT CELL with a
+# cell — a false BLOCK, which is its own defect class. `tree` and `self` are derived from the TARGET
+# (`python_target`: any of NINE package-manager markers — `uv.lock`, `pyproject.toml`,
+# `requirements.txt`, `poetry.lock`, `pdm.lock`, `Pipfile`, `setup.py`, … — at the top level or ONE
+# level down; `uv.lock` alone was a false PASS and is no longer the discriminator), and `reserve` from
+# the CELL's dispatch floor. All THREE stay overridable for a cell whose measurement differs
+# (`DISK_LANE_TREE_MB` / `DISK_LANE_SELF_MB` / `DISK_LANE_RESERVE_MB`) — but MEASURE THAT CELL with a
 # `df` used-delta (the recipe is in `docs/ops/disk-reaper.md`), never a guess: a guessed constant is
 # how this number was 7x wrong in the first place.
 #
@@ -1254,7 +1257,16 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ONE lane's measured cost for THIS target (agent-infra#2721). Read once, here, so the ledger row,
   # the refusal and the warning below all quote the SAME numbers — a gate that measures twice is a
   # gate whose report can disagree with its verdict.
-  _lane_costs="$(disk_lane_costs "$dpath")"
+  # ⛔ THE COSTS ARE MEASURED ON THE CHECKOUT, NOT ON THE `df` VOLUME (review round 5, P2).
+  # `$dpath` is `DISK_GATE_PATH` — documented as the VOLUME ("the override exists for a box that splits
+  # them"), and an operator may legitimately point it at a mount root, where `df` answers correctly and
+  # `python_target` finds nothing: a python lane would then be classified as the 64MB harness lane and
+  # admitted on 2 GB of headroom instead of 8 GB. So the target is `$dpath` only when it IS a checkout,
+  # otherwise the caller's cwd (every shipped caller cds to the worktree, and `fix-one.sh` passes the
+  # worktree explicitly).
+  _lane_target="$dpath"
+  [ -e "$dpath/.git" ] || _lane_target="$PWD"
+  _lane_costs="$(disk_lane_costs "$_lane_target")"
   _lane_tree="$(printf '%s' "$_lane_costs" | awk '{print $1}')"
   _lane_self="$(printf '%s' "$_lane_costs" | awk '{print $2}')"
   _lane_reserve="$(printf '%s' "$_lane_costs" | awk '{print $3}')"
@@ -1300,11 +1312,14 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # the disk; the number they were missing is THIS lane's own cost. The verdict is NAMED
   # (`DISK-NOHEADROOM`) and carries both terms, so the operator can tell "the box is out of room for
   # one more lane" from "the disk is full" and from "the box is busy" without reading this file.
-  # ⛔ THE BAND IS EVALUATED BEFORE THE HEADROOM REFUSAL (review round 3, P2). `disk_low`'s band is
-  # 4x the floor and the headroom bound is `max(tree,self) + reserve`, which is ALWAYS above it for every
-  # shipped target — so with the band last, the "a device that fills SILENTLY is the defect" warning
-  # could never fire on ANY lane, and the first signal an operator got was a refusal. Warning first costs
-  # nothing (it starts nothing and refuses nothing) and restores the advance instrument.
+  # ⛔ THE BAND IS EVALUATED BEFORE THE HEADROOM REFUSAL, AND IT IS NOT THE ADVANCE WARNING (review
+  # rounds 3 and 5). `disk_low`'s band is 4x the floor (2,000) and the headroom bound is
+  # `max(tree,self) + reserve` (2,064 harness / 8,144 python), so for every shipped target a reading
+  # inside the band ALSO fails the bound: the band WARN is emitted at the refusal, not before it, and
+  # the two land in the same log for the same spawn. That is deliberate — the operator gets "this cell
+  # is filling" and the named verdict together — but the ADVANCE warning is the `within one lane of the
+  # headroom bound` arm below, which fires while a spawn is still admitted. Ordering the band first is
+  # what keeps the band reachable at all, which is the property the old order had lost.
   elif disk_low "$dfree"; then
     echo "[disk-gate] WARN $label: only ${dfree}MB free on $dpath (floor ${DISK_MIN_FREE_MB}MB, warn band ${DISK_WARN_FREE_MB}MB, one more lane needs ${_lane_need}MB = worst case ${_lane_self}MB/marginal ${_lane_tree}MB + reserve ${_lane_reserve}MB) — a full disk is what breaks a cell first; reclaim with 'cloud-cell-supervisor.sh prune' before it fills" >> "$log"
     if ! disk_headroom_ok "$dfree" "$_lane_tree" "$_lane_self" "$_lane_reserve"; then

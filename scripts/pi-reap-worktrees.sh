@@ -251,6 +251,9 @@ ISSUE_REF="#1095"
 GIT_BIN="${GIT_BIN:-git}"
 GH_BIN="${GH_BIN:-gh}"
 PS_BIN="${PS_BIN:-/bin/ps}"
+# REAP_WT_PROC_ROOT — where the process table lives (`/proc`). A seam for the suites, and for an
+# exotic host that mounts proc elsewhere; it is read by `proc_start_epoch` ONLY.
+REAP_WT_PROC_ROOT="${REAP_WT_PROC_ROOT:-/proc}"
 LSOF_BIN="${LSOF_BIN:-lsof}"
 # Only the ephemeral pre-delete in remove_one uses this; the script's own
 # scratch/log cleanup keeps the real `rm` (it must not be defeated by a seam).
@@ -778,8 +781,12 @@ IDLE_SHELL="${REAP_WT_IDLE_SHELL:-1}"
 proc_start_epoch() {
     local pid="${1:-}" v e f1 f2 f3 rest
     is_pos_int "$pid" || return 1
-    if [ -r "/proc/$pid" ]; then
-        v="$(stat -c '%Y' "/proc/$pid" 2>/dev/null)"
+    # ⛐ THE ROOT IS `$REAP_WT_PROC_ROOT`, NOT A LITERAL `/proc` (review round 5, P2): the same seam
+    # `REAP_VENV_PROC_ROOT` gives the venv reaper, for the same reason — pinning this read to `/proc`
+    # makes the fallback untestable on a Linux host (a live fixture pid takes THIS branch, so an arm for
+    # the `10#` parse decides on whatever process owns that pid). Default `/proc`: production unchanged.
+    if [ -r "$REAP_WT_PROC_ROOT/$pid" ]; then
+        v="$(stat -c '%Y' "$REAP_WT_PROC_ROOT/$pid" 2>/dev/null)"
         case "$v" in ''|*[!0-9]*) v="" ;; esac
         [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
     fi

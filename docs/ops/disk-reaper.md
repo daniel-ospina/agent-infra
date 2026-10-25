@@ -682,7 +682,10 @@ demotion is named in the pass log (`stale-shell:` / `STALE-SHELL`), and `pi-reap
 carries it into the row (`unref=stale-shell:<pids>`) — the venv reaper's row has no `unref` column, so
 for an env the pass log is the record (stated here because the difference otherwise reads as a missing
 field). `REAP_VENV_IDLE_SHELL=0` / `REAP_WT_IDLE_SHELL=0` restore the strict
-reading without editing a shipped script.
+reading without editing a shipped script. The start time comes from the process table's own creation
+time (`/proc/<pid>`), and both reapers read it through a root seam — `REAP_VENV_PROC_ROOT` /
+`REAP_WT_PROC_ROOT`, default `/proc` — so a test can drive the `ps` fallback deterministically on a
+host where the fixture pid happens to be live; in production the seam is never set.
 
 The scan that applies the rule examines **every** holder (an idle shell and a working lane routinely
 share a checkout) and carries a per-record exclude list instead of mutating the probe output, so one

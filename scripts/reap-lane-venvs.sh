@@ -649,8 +649,15 @@ IDLE_SHELL="${REAP_VENV_IDLE_SHELL:-1}"
 proc_start_epoch() {
     local pid="${1:-}" v e rest
     [ -n "$pid" ] && is_pos_int "$pid" || return 1
-    if [ -r "/proc/$pid" ]; then
-        v="$(stat -c '%Y' "/proc/$pid" 2>/dev/null)"
+    # ⛐ THE ROOT IS `$REAP_VENV_PROC_ROOT`, NOT A LITERAL `/proc` (review round 5, P2). The variable
+    # already means "where the process table lives" (the cwd scan reads it), and leaving this one read
+    # pinned to `/proc` made the fallback UNTESTABLE on a Linux host: a fixture pid that happens to be
+    # live takes this branch, so an arm for the `10#` parse below passes (or fails) on whatever process
+    # owns that pid — it discriminates only in a fresh container. With the seam honoured, a fixture
+    # root that does not contain the pid falls through to `ps` deterministically, in production it is
+    # still `/proc`, and the arm pins the parse it claims to pin.
+    if [ -r "$REAP_VENV_PROC_ROOT/$pid" ]; then
+        v="$(stat -c '%Y' "$REAP_VENV_PROC_ROOT/$pid" 2>/dev/null)"
         case "$v" in ''|*[!0-9]*) v="" ;; esac
         [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
     fi

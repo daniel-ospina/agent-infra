@@ -2005,6 +2005,49 @@ else
     ok "G2721k and it was not truncated: the cap counts every table, not just the cwd one"
 fi
 
+# ── G2721l: a ZERO-PADDED `ps -o etime` parses as DECIMAL, so the BSD fallback can demote at all ─
+# `ps -o etime` prints zero-padded fields (`1:08:30`) and bash rejects `08` as a bad OCTAL constant: the
+# expansion ABORTS, the start time comes back EMPTY, and the holder stays LIVE for ever — an inert
+# rule, silently, on every host that reaches this fallback (macOS is the primary one). No arm reached
+# this branch before this one (`FAKE_ETIMES` takes the `etimes` path, which has no zero padding), so
+# reverting `10#` left all 329 assertions green. The HOURS component is what makes it discriminating:
+# HEAD is 1,000s in the past and elapsed is 1:08:30, so a parse that DROPS the hours reads the shell as
+# YOUNGER than HEAD and keeps it. HERMETIC by `REAP_WT_PROC_ROOT`: a real `/proc` read would take
+# precedence and decide the arm on whatever process owns the fixture pid on the machine running it.
+echo ""
+echo "── G2721l: the zero-padded \`etime\` fallback (hermetic, no /proc) ─────────────────────"
+ENV=G2721l; REPO="$(mk_repo $ENV)"
+WT_ETIME="$(add_named_wt "$REPO" "$ENV-etime" feat/g2721l-etime)"
+mkdir -p "$WT_ETIME/.venv"; printf 'x\n' >"$WT_ETIME/.venv/marker"
+# HEAD 1,000s in the PAST, and "now" after it by more than the 7-day floor: the shell (start = now-4110)
+# predates HEAD, so the schedule gate (REAP_WT_AGED_DAYS_OVERRIDE=0) would allow removal and the HOLDER
+# rule is the only thing under test.
+# `now` is the REAL clock here: the suite's fixed fixture date would put HEAD 39 days in the FUTURE,
+# and a start-before-HEAD comparison against a future HEAD can never hold. Only the AGE floor is
+# overridden, so the schedule gate allows the removal and the HOLDER rule is the only thing under test.
+RNOW="$(date +%s)"
+ETIME_TS=$(( RNOW - 1000 ))
+commit_in_wt "$WT_ETIME" "@$ETIME_TS" etime
+ETIME_CANON="$(cd "$WT_ETIME" && pwd -P)"
+mkdir -p "$T/seq-gl"
+{ printf '1 0 /sbin/launchd\n'; printf '65000 1 /bin/bash -c cd %s idle\n' "$ETIME_CANON"; } >"$T/seq-gl/1"
+# CONTROL FIRST: with `ps` unable to report a start time at all, the holder is UNPROVABLE and must stay
+# LIVE. Without this arm a gate that demoted every shell would pass the assertion below.
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gl" REAP_WT_PROC_ROOT="$T/no-proc" FAKE_ETIMES= REAP_ETIME=\
+    REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW" REAP_WT_AGED_DAYS_OVERRIDE=0 \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+assert_contains "$(row_for "$OUT" "$WT_ETIME")" "reason=live" \
+    "G2721l a holder whose start time cannot be read at all stays LIVE (unprovable is not stale)"
+# ...and with `1:08:30`, the pre-fix parse ABORTS (bash: 08: value too great for base) and prints the
+# SAME live verdict — the mutation is invisible above. `10#` is what makes the demotion possible.
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gl" REAP_WT_PROC_ROOT="$T/no-proc" FAKE_ETIME='1:08:30' \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW" REAP_WT_AGED_DAYS_OVERRIDE=0 \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+assert_contains "$(row_for "$OUT" "$WT_ETIME")" "reason=reclaimable" \
+    "G2721l ...and a 1:08:30 idle shell that predates HEAD is DEMOTED (the hours component is parsed)"
+assert_contains "$(row_for "$OUT" "$WT_ETIME")" "unref=stale-shell: pid=65000(argv)" \
+    "G2721l ...and the row names the demoted pid, so the fallback is provably the path taken"
+
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
 [ "$FAIL" -eq 0 ] || exit 1

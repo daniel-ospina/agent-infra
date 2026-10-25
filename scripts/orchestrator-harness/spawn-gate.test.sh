@@ -1034,6 +1034,24 @@ ck "it states BOTH terms and their sum, so the arithmetic can be checked from th
 grep -q 'disk_min_free_mb=' "$LOG"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
 ck "...and it does NOT claim the floor refused: the floor is at 1MB, and the two verdicts differ" $rc
+
+# ⛐ THREE DISTINCT VALUES, because the equal-value triple above cannot see a MIS-ATTRIBUTED term
+# (review round 5, P2): with `9999999 9999999 9999999` every assertion is satisfied by any assignment of
+# the three variables, so swapping `${_lane_self}` with `${_lane_tree}` or with `${_lane_reserve}` in the
+# refusal message left the verdict and all 199 arms green — the operator's only account of WHICH term
+# bound the refusal would name the wrong one, the same label-mix-up class the field-7/field-8 defect was.
+# Distinct values make each term's position load-bearing: self is the `costs up to` figure, tree is the
+# parenthesised marginal one, reserve is the `must keep free` one, and the sum is max(tree,self)+reserve.
+: > "$LOG"
+res="$(drive_hd "$TMP" 99999997 99999999 99999998)"; rc=$?
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "DISK-NOHEADROOM with three DISTINCT costs is still a refusal (77) ($res)" $rc
+grep -q 'costs up to 99999999MB (99999997MB while' "$LOG"; rc=$?
+ck "...and the message names the WORST CASE (self 99999999) first and the MARGINAL (tree 99999997) in the parenthetical" $rc
+grep -q 'keep 99999998MB free' "$LOG"; rc=$?
+ck "...and names the reserve (99999998) as the figure the cell must keep free" $rc
+grep -q '199999997MB is required' "$LOG"; rc=$?
+ck "...and the required total is max(tree,self)+reserve = 99999999+99999998 = 199999997" $rc
 grep -q 'NOT a load refusal' "$LOG"; rc=$?
 ck "...and it says waiting will not clear it, so an operator is not sent to a load remedy" $rc
 
