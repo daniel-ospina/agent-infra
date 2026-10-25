@@ -86,8 +86,9 @@ trap 'rm -rf "$TMP"' EXIT
 # Until this line changed, the fixture was the runner's own list with a few slow shards grepped
 # out (`runner-fast.sh`), and the pins executed it THREE times (8h, 8d, 8e) — after #2414 had
 # already stopped 8n/8q pointing at a repo-wide guard whose verdict cost ~9.6 s per invocation.
-# On `origin/main` (`6ae9d509`) that made this suite take 23m37s while its ~180 static arms ran in
-# under 40 s; the three fixture executions were the other 23 minutes, all of it RE-RUNNING suites
+# On `origin/main` (`6ae9d509`) that made this suite take 23m37s while its ~180 pass/fail branch
+# sites (90 assertions) ran in under 40 s; the three fixture executions were the other 23 minutes,
+# all of it RE-RUNNING suites
 # that the lane's own `Bash shards` step already runs on the same commit (#2439 recorded the same
 # duplicate-work class for other folded jobs).
 #
@@ -98,6 +99,15 @@ trap 'rm -rf "$TMP"' EXIT
 # blamed the fixture). An inert stand-in cannot move for a reason this file does not name.
 #
 # Keep `CHEAP` pointed at something hermetic: its rc must depend on nothing but itself.
+#
+# ⛔ WHAT THE SUITE COSTS NOW (measured 2026-10-24, after #2529 landed). CI: the whole suite is
+# 6-12 s on `bash-suites-gate` step 5 (17 PR runs sampled from the Actions API; one 17 s outlier),
+# 6-9 s on ci-main's `script-validate` step 6 (8 successful main runs) — the ~90 static arms and ONE
+# fixture execution per runtime pin, not the shard list, are the wall. Locally (macOS, loaded box)
+# 27-67 s for 94 assertions. The 38m41s / "38.7 min" figure that still circulates is PR #2412's job
+# 120365087427 (2026-10-23T10:25Z), taken BEFORE #2529 replaced the real list in the fixture with
+# `stand-in-shard.sh`; it is not this suite's current cost and a bound sized from it protects
+# nothing. Re-measure before quoting a number here.
 CHEAP="tests/ci-lane-parity/stand-in-shard.sh"
 awk -v cheap="$CHEAP" '
   /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
@@ -239,6 +249,13 @@ grep -v '^run_shard ' "$RUNNER" >"$TMP/runner-gutted.sh"
 if cmp -s "$RUNNER" "$TMP/runner-gutted.sh"; then
   fail "the gutted-runner mutation did not change the file"
 else
+  # The mutant must be VALID shell, or the red below could be a syntax failure wearing the floor's
+  # message. `^run_shard ` is anchored and matches only top-level one-line calls (see 6b).
+  if bash -n "$TMP/runner-gutted.sh"; then
+    pass "the gutted mutant is VALID shell (bash -n clean)"
+  else
+    fail "the gutted mutant is not valid shell"
+  fi
   guard_rc "$MAIN" "$PR" "$TMP/runner-gutted.sh"
   if [ "$RC" -eq 2 ] && grep -q 'shard(s) (floor' <<<"$OUT"; then
     pass "a gutted runner exits 2 and names the floor (rc 2)"
@@ -250,18 +267,109 @@ fi
 echo ""
 echo "6. A RUNNER WITH NO SWEEPS (0 syntax targets) → rc 2"
 # The sweep half is DATA now (SWEEP_GLOBS) plus the loops that iterate it, and the guard reads the
-# list from the runner's own `--list-sweeps`. So the mutation must remove the LIST; deleting only
+# list from the runner's own `--list-sweeps`. So the mutation must EMPTY THE LIST; deleting only
 # the loops leaves the list advertising globs nothing iterates, which the guard cannot see and the
-# RUNNER's `swept` sentinel catches at runtime (pinned by 8q below).
-grep -v -e 'for f in' -e 'SWEEP_GLOBS' "$RUNNER" >"$TMP/runner-nosweep.sh"
+# RUNNER's `swept` sentinel catches at runtime (pinned by 8n below, which asserts `syntax sweep
+# executed no file`; 8q is its counter-preserving sibling).
+#
+# ⛔ EMPTY THE DECLARATION — never delete the lines that MENTION it. This arm used to be
+# `grep -v -e 'for f in' -e 'SWEEP_GLOBS'`, which matches by IDENTIFIER and therefore took out far
+# more than the sweep: the `SWEEP_GLOBS=(…)` definition, the `printf` inside `--list-sweeps`, every
+# comment naming it, and — collateral and silent — the whole `run_shard
+# scripts/harness-cohesion.test.sh` line, whose trailing comment mentions SWEEP_GLOBS. Deleting the
+# two `for` headers left a dangling `[ -f "$f" ] || continue … done done` body, so the mutant was
+# NOT VALID SHELL: `bash -n` fails at mutant line 258 — `syntax error near unexpected token
+# 'done'`, the FIRST ORPHANED `done` — while the `--list`/`--list-sweeps` branches above it parse
+# and exit fine. ⛔ AND THE ARM DID NOT GO RED FOR IT: `grep` took the `printf '%s\n' "${SWEEP_GLOBS[@]}"`
+# INSIDE the `--list-sweeps` branch, leaving `if … then exit 0; fi` — a branch that exits 0 having
+# printed nothing. The guard's floor then fired on 0 targets (the intended message, by luck), and
+# because bash parses and executes incrementally the dangling `done` is never reached on the
+# `--list`/`--list-sweeps` paths the guard uses. So the arm PASSED over a mutant that was (i) not
+# parseable, and (ii) silently missing a real shard — the `run_shard scripts/harness-cohesion.test.sh`
+# line — since MIN_SUITES is 14 and losing one stays above the floor. Two defects, neither
+# asserted. The `bash -n`, `--list`-identity and 0-target assertions below close both; the
+# non-vacuity control keeps the red attributable to the emptied LIST. An anchored single-line
+# substitution leaves the rest byte-identical.
+#
+# `SWEEP_GLOBS=""` and NOT `SWEEP_GLOBS=()`: under `set -u` on bash 3.2 (macOS `/bin/bash`)
+# expanding an EMPTY ARRAY is an "unbound variable" error, which would take this arm red locally
+# for a reason of its own. A defined-but-empty scalar expands to one blank line, which the guard
+# filters out — both bash 3.2 and 5.x then report 0 targets.
+awk '
+  /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=\"\""; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-nosweep.sh"
 if cmp -s "$RUNNER" "$TMP/runner-nosweep.sh"; then
   fail "the no-sweep mutation did not change the file"
 else
+  # (a) the mutant is VALID shell — a syntax error here would make the arm's red meaningless
+  if bash -n "$TMP/runner-nosweep.sh" 2>"$TMP/runner-nosweep.syntax"; then
+    pass "the no-sweep mutant is VALID shell (bash -n clean)"
+  else
+    fail "the no-sweep mutant is not valid shell: $(cat "$TMP/runner-nosweep.syntax")"
+  fi
+  # (b) the mutation is SURGICAL — the mutant lists the same shards, line for line, as the runner.
+  # ⛔ Measure the INPUTS: two `--list` invocations that both fail compare equal under `cmp -s`, so
+  # asserting only the comparison would pass having read nothing (the exact class this change is
+  # about). The real list must be non-empty — the 14 floor mirrors the guard's MIN_SUITES.
+  bash "$RUNNER" --list >"$TMP/sweeps-real-list.txt" 2>&1
+  real_list_rc=$?
+  bash "$TMP/runner-nosweep.sh" --list >"$TMP/sweeps-mutant-list.txt" 2>&1
+  mutant_list_rc=$?
+  real_list_n="$(grep -c . "$TMP/sweeps-real-list.txt" || true)"
+  if [ "$real_list_rc" -ne 0 ] || [ "$real_list_n" -lt 14 ]; then
+    fail "the runner's own --list is unreadable (rc $real_list_rc, $real_list_n line(s)) — the comparison below would measure nothing"
+  elif [ "$mutant_list_rc" -ne 0 ]; then
+    fail "the no-sweep mutant's --list exited $mutant_list_rc — it cannot be compared to the real list"
+  elif cmp -s "$TMP/sweeps-real-list.txt" "$TMP/sweeps-mutant-list.txt"; then
+    pass "the no-sweep mutant keeps the real shard list intact ($real_list_n shard(s), only the sweep declaration moved)"
+  else
+    fail "the no-sweep mutant ALSO changed the shard list: $(diff "$TMP/sweeps-real-list.txt" "$TMP/sweeps-mutant-list.txt" | head -3 | tr '\n' ' ')"
+  fi
+  # (c) …and it really declares no sweeps: 0 non-blank lines from its own `--list-sweeps`
+  bash "$TMP/runner-nosweep.sh" --list-sweeps >"$TMP/sweeps-mutant-sweeps.txt" 2>&1
+  if [ "$(grep -c . "$TMP/sweeps-mutant-sweeps.txt" || true)" -eq 0 ]; then
+    pass "the no-sweep mutant declares 0 sweep target(s) — the neuter is behavioural"
+  else
+    fail "the no-sweep mutant still declares sweeps: $(tr '\n' ' ' <"$TMP/sweeps-mutant-sweeps.txt")"
+  fi
   guard_rc "$MAIN" "$PR" "$TMP/runner-nosweep.sh"
   if [ "$RC" -eq 2 ] && grep -q 'syntax target' <<<"$OUT"; then
     pass "a runner with no sweeps exits 2 — the syntax half cannot go uncovered in silence"
   else
     fail "a runner with no sweeps returned rc $RC (want 2, naming the sweeps): $OUT"
+  fi
+  # (d) NON-VACUITY — the same $TMP path with the sweep list NON-EMPTY (one real glob, everything
+  # else byte-identical) must PASS. Without this the red above could be attributable to the guard
+  # being handed a file outside the checkout rather than to the emptied list.
+  awk '
+    /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=(\"scripts/*.sh\")"; next }
+    { print }
+  ' "$RUNNER" >"$TMP/runner-onesweep.sh"
+  guard_rc "$MAIN" "$PR" "$TMP/runner-onesweep.sh"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: the same temp-dir path with ONE sweep target PASSES (rc 0) — the red is the emptied list"
+  else
+    fail "control: a runner with one sweep target returned rc $RC (want 0): $OUT"
+  fi
+  # (e) …and the guard READS the list rather than grepping the declaration. The mutant above empties
+  # the DECLARATION, which a text scan of the runner would also see, so on its own it cannot tell a
+  # behavioural read (`bash <runner> --list-sweeps`, the design the .mjs header records) from a grep
+  # over the file. This mutant keeps the declaration intact and silences only the print, so a
+  # text-scanning guard passes it and this arm goes red.
+  awk '
+    /^  printf .*SWEEP_GLOBS\[@\]/ { print "  :"; next }
+    { print }
+  ' "$RUNNER" >"$TMP/runner-silentsweeps.sh"
+  if cmp -s "$RUNNER" "$TMP/runner-silentsweeps.sh"; then
+    fail "the silent-sweeps mutation did not change the file"
+  else
+    guard_rc "$MAIN" "$PR" "$TMP/runner-silentsweeps.sh"
+    if [ "$RC" -eq 2 ] && grep -q 'syntax target' <<<"$OUT"; then
+      pass "a runner whose declaration is intact but whose --list-sweeps prints nothing still exits 2 (the list is READ, not grepped)"
+    else
+      fail "an intact declaration with a silent --list-sweeps returned rc $RC (want 2): $OUT"
+    fi
   fi
 fi
 
@@ -269,7 +377,16 @@ fi
 # independent, so a mutation that satisfies one must not carry the other.
 echo ""
 echo "6b. FLOOR INDEPENDENCE — sweeps intact but no shards still exits 2"
+# Safe by construction, and checked: `grep -v '^run_shard '` is ANCHORED (line start) and matches
+# only top-level one-line calls, so it cannot delete a definition or leave a block dangling —
+# `bash -n` on this mutant and the gutted one at 5 is clean. The identifier-wide match at 6 was the
+# fragile one; an anchored grep over a call list is not.
 grep -v '^run_shard ' "$RUNNER" >"$TMP/runner-noshards-but-sweeps.sh"
+if bash -n "$TMP/runner-noshards-but-sweeps.sh"; then
+  pass "the empty-shard-list mutant is VALID shell (bash -n clean)"
+else
+  fail "the empty-shard-list mutant is not valid shell"
+fi
 guard_rc "$MAIN" "$PR" "$TMP/runner-noshards-but-sweeps.sh"
 if [ "$RC" -eq 2 ]; then
   pass "the shard floor fires even while the sweep floor is satisfied (rc 2)"
@@ -1250,6 +1367,127 @@ bash "$GUARD" --no-such-flag >"$TMP/badflag.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/badflag.out")"
 if [ "$RC" -eq 2 ]; then pass "an unknown argument exits 2"; else fail "an unknown argument exited $RC (want 2)"; fi
+
+echo ""
+echo "8am. ATTRIBUTION — a failed shard is NAMED in the verdict, not only counted (#2643)"
+# ⛔ WHAT THIS ARM EXISTS FOR. On 2026-10-24 four shards were red on `main` and FOUR PR slices each
+# printed `❌ 1 bash shard(s) failed`; the merge rail refused the PR with "yielded NO parseable failure
+# identity", and the only way to learn which suite was red was to download an 18,695-line job log and
+# bisect it against this runner's own `▸ <secs> <path>` rows. A count is not an identity, so the
+# verdict now names its shards. Nothing asserted that, and nothing could: every existing arm here
+# asserts COUNTS and SETS (listed==executed, the slice's exact set, the sweep counter), and a red that
+# prints nothing still satisfies all of them.
+#
+# The fixture is the runner with EVERY `run_shard` line pointed at a hermetic stand-in, exactly as
+# arms 8d/8e/8h do — with ONE of them pointed at the failing stand-in, so the run is red for a reason
+# this arm chose. Three assertions, and the second and third are what make the first mean something:
+#   (a) the failing shard's PATH appears in the verdict block;
+#   (b) the PASSING stand-in's path does NOT appear there (a block that names every shard satisfies
+#       (a) while telling a reader nothing);
+#   (c) RED CONTROL — gut the recorder and the run must STILL fail (rc 1, the counter is untouched)
+#       while naming nothing. Without (c), (a) could be satisfied by any future line that happens to
+#       print a path.
+PASS_SHARD="tests/ci-lane-parity/stand-in-shard.sh"
+FAIL_SHARD="tests/ci-lane-parity/stand-in-shard-fail.sh"
+awk -v pass="$PASS_SHARD" -v fails="$FAIL_SHARD" '
+  /^run_shard / && $2 !~ /^\"/ { n++; print "run_shard " (n == 2 ? fails : pass); next }
+  { print }
+' "$RUNNER" >"$TMP/runner-named.sh"
+if cmp -s "$RUNNER" "$TMP/runner-named.sh"; then
+  fail "the attribution fixture rewrote no run_shard line"
+else
+  $FIXTURE_BOUND bash "$TMP/runner-named.sh" >"$TMP/runner-named.out" 2>&1
+  RC=$?
+  OUT="$(cat "$TMP/runner-named.out")"
+  # The verdict block is everything from the `N bash shard(s) failed` line on: the per-shard line is
+  # printed mid-run and is NOT what a parser sees at the end, so assert on the block.
+  VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-named.out")"
+  if [ "$RC" -eq 1 ] && grep -qF "$FAIL_SHARD" <<<"$VERDICT"; then
+    pass "a failed shard is NAMED in the verdict block (rc 1)"
+  else
+    fail "the verdict did not name the failed shard (rc $RC): $VERDICT"
+  fi
+  if grep -qF "$PASS_SHARD" <<<"$VERDICT"; then
+    fail "the verdict names the PASSING stand-in too — a block naming every shard attributes nothing: $VERDICT"
+  else
+    pass "…and it names only the shard that actually failed"
+  fi
+  # RED CONTROL (c): the recorder's body replaced by `: ` — the failure is still COUNTED, so the run is
+  # still rc 1; only the name is gone. That is the shape that proves (a) is pinning the recorder.
+  # ⛔ ASSERTED ON THE VERDICT SLICE, NEVER ON `$OUT` (review cycle 1). `shard_note` prints a timeline
+  # row — `▸ 0s <path>` — for every listed shard whether it passed or failed, so the WHOLE log always
+  # contains the failing path and `! grep -qF "$FAIL_SHARD" <<<"$OUT"` would fail this arm on every
+  # commit, reddening `bash-suites` for the very reason it exists to attribute.
+  awk '{ if ($0 ~ /^shard_record_failure\(\) \{/) { print "shard_record_failure() { :; }"; next } print }' \
+    "$TMP/runner-named.sh" >"$TMP/runner-noname.sh"
+  if cmp -s "$TMP/runner-named.sh" "$TMP/runner-noname.sh"; then
+    fail "the no-name mutation did not change the fixture"
+  else
+    $FIXTURE_BOUND bash "$TMP/runner-noname.sh" >"$TMP/runner-noname.out" 2>&1
+    RC=$?
+    NONAME_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-noname.out")"
+    if [ "$RC" -eq 1 ] && ! grep -qF "$FAIL_SHARD" <<<"$NONAME_VERDICT"; then
+      pass "RED CONTROL: a gutted recorder still fails the run (rc 1) and names nothing in the verdict"
+    else
+      fail "with the recorder gutted the run returned rc $RC and/or named a shard in the verdict: $NONAME_VERDICT"
+    fi
+    # …and it must SAY SO rather than end on a bare count: an unnamed failure has to read as unnamed.
+    if grep -q 'could NOT be named' <<<"$NONAME_VERDICT"; then
+      pass "…and an unnamed failure says so, instead of ending as a silent count"
+    else
+      fail "an unnamed failure did not announce that it could not be named: $NONAME_VERDICT"
+    fi
+  fi
+fi
+
+echo ""
+echo "8an. ATTRIBUTION — a SWEEP failure is named too, so a MIXED run has no un-named red (#2643)"
+# ⛔ WHAT THIS ARM EXISTS FOR (#2648 cycle-4 review): the first version named only the shard LOOP, so
+# a MIXED run — one listed shard failing PLUS a `bash -n` failure from the syntax sweep — yielded
+# exactly ONE identity. The rail's step-1c (`examined > extracted`) then PASSED, and the un-named file
+# disappeared from a certificate that named no residual: a truthful refusal turned into a FALSE PASS.
+# Nothing reddened if the sweep-naming half were reverted, which is what this arm closes.
+#
+# The fixture: every `run_shard` points at the PASSING stand-in (so the run is red ONLY because of the
+# sweep), and SWEEP_GLOBS is narrowed to a temp dir holding one file with a syntax error. Assert the
+# broken file is NAMED in the verdict block and that the run does NOT fall back to `could NOT be named`.
+BROKEN_DIR="$TMP/sweep-broken"
+mkdir -p "$BROKEN_DIR"
+printf 'if then\n' >"$BROKEN_DIR/broken.sh"
+awk -v pass="$PASS_SHARD" -v dir="$BROKEN_DIR" '
+  /^SWEEP_GLOBS=\(/ { print "SWEEP_GLOBS=(\"" dir "/*.sh\")"; next }
+  /^run_shard / && $2 !~ /^\"/ { print "run_shard " pass; next }
+  { print }
+' "$RUNNER" >"$TMP/runner-sweepname.sh"
+if cmp -s "$RUNNER" "$TMP/runner-sweepname.sh"; then
+  fail "the sweep-attribution fixture rewrote neither SWEEP_GLOBS nor a run_shard line"
+else
+  $FIXTURE_BOUND bash "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepname.out" 2>&1
+  RC=$?
+  SWEEP_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepname.out")"
+  if [ "$RC" -eq 1 ] && grep -qF "broken.sh" <<<"$SWEEP_VERDICT"; then
+    pass "a bash -n failure is NAMED in the verdict block (rc 1)"
+  else
+    fail "a sweep failure was counted but not named (rc $RC): $SWEEP_VERDICT"
+  fi
+  if grep -q 'could NOT be named' <<<"$SWEEP_VERDICT"; then
+    fail "a sweep failure was left UNNAMED — the rail gets an identity for the other shard and merges: $SWEEP_VERDICT"
+  else
+    pass "…and the verdict has no un-named remainder (the rail sees every failure)"
+  fi
+  # RED CONTROL: gut the recorder that the SWEEP calls, and the same run must go back to the count-only
+  # verdict — proving this arm pins the sweep's naming rather than any other line that prints a path.
+  awk '{ if ($0 ~ /^shard_named_failure\(\) \{/) { print "shard_named_failure() { :; }"; next } print }' \
+    "$TMP/runner-sweepname.sh" >"$TMP/runner-sweepnoname.sh"
+  $FIXTURE_BOUND bash "$TMP/runner-sweepnoname.sh" >"$TMP/runner-sweepnoname.out" 2>&1
+  RC2=$?
+  SWEEP_NONAME="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-sweepnoname.out")"
+  if [ "$RC2" -eq 1 ] && ! grep -qF "broken.sh" <<<"$SWEEP_NONAME" && grep -q 'could NOT be named' <<<"$SWEEP_NONAME"; then
+    pass "RED CONTROL: with the naming helper gutted the sweep failure is un-named again (rc 1)"
+  else
+    fail "the no-name control did not revert to an un-named verdict (rc $RC2): $SWEEP_NONAME"
+  fi
+fi
 
 echo ""
 echo "10. WIRING — a guard (or runner) nothing invokes protects nothing"

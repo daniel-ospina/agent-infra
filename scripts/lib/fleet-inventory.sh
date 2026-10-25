@@ -958,6 +958,129 @@ fleet_row_lander_drain() {
   fleet_row lander-drain "$exp" "last run $(fleet_human_age "$age") ago: $counts, $qs" OK ""
 }
 
+# ── component: the AI DRAINER (a scheduled DISPATCH job) ─────────────────────────────────────
+# ⛔ WHY A ROW AT ALL, and why it is a _launchd_job row: the drainer is the ONE scheduled thing that
+# dispatches lanes against a backlog no controller is draining. Its failure mode is the fleet's
+# recurring one — the job is installed and simply never runs (launchd's `RunAtLoad` never fires, or
+# the job was booted out), and NOTHING else in the fleet notices: no PR moves, no check goes red, and
+# a backlog looks like a backlog rather than a broken scheduler.
+# ⛔ THE FRESHNESS FILE IS THE DRAINER'S OWN BEAT, not its log. A pass can legitimately last
+# LANE_TIMEOUT (3000s) while it holds its lock waiting for the lane it dispatched, and this row's
+# bound is 2×StartInterval+slack (2700s) — so a healthy long pass would read LATE against its own log.
+# The script overwrites `$AI/state/ai-drainer.beat` on every poll for exactly this row.
+# ⛔ MISSING, NOT SKIPPED, WHEN THE CODE IS PRESENT AND NO JOB INSTALLS IT. Both templates ship
+# UNSCHEDULED by default (an env-only placeholder — see the plist header), so "the drainer exists and
+# nothing runs it" is a state an operator chose and then forgot. `_fleet_row_launchd_job` already
+# renders that case MISSING, which is why this row passes the script as `requires`.
+FLEET_DRAINER_STATE="${FLEET_DRAINER_STATE:-${AI:-$FLEET_HOME/orchestrator-ai}}"
+fleet_row_ai_drainer() { # <harness-path>
+  local harness="${1:-}" code=""
+  # ⛔ `$harness` IS the directory that HOLDS the harness scripts (the caller passes
+  # `harness_ctl_path`, and `fleet_row_controller` reads "$harness/orch-loop.sh"). Appending
+  # `scripts/orchestrator-harness/` doubled the path, so `requires` never resolved and the row took
+  # the SKIPPED branch — i.e. the one state it exists for ("the code is here and nothing installs
+  # it") rendered as a PASS, which is the green-by-absence this file exists to end.
+  local state="$FLEET_DRAINER_STATE" declared
+  [ -n "$harness" ] && code="$harness/ai-drainer.sh"
+  # ⛔ THE JOB'S OWN DECLARATION WINS, exactly as the `second-controller` row does: the plist renders
+  # `AI={{AI_DRAINER_STATE}}`, and an operator who activated the job at a non-default state dir would
+  # otherwise be judged against the seam's default — a permanent LATE on a healthy drainer (the false
+  # red that teaches operators to ignore the screen).
+  declared="$(fleet_plist_value com.eldato.ai-drainer EnvironmentVariables.AI)"
+  [ -n "$declared" ] && state="$declared"
+  _fleet_row_launchd_job ai-drainer com.eldato.ai-drainer "$code" "ai-drainer" \
+    "$state/state/ai-drainer.beat" \
+    "${code:-$FLEET_AGENT_SCRIPTS/ai-drainer.sh}"
+}
+
+# ── component: the SECOND (multi-repo) CONTROLLER ────────────────────────────────────────────
+# A second controller is not a second `controller` row: its state dir is DIFFERENT by design, and the
+# whole point of the launcher is that it refuses to share the first one's. So its liveness predicate
+# is the SAME one the `controller` row uses (`orch-loop.sh` for THIS state dir, plus the lock owner,
+# plus heartbeat freshness), applied to `$FLEET_AI_STATE` — with one addition: the JOB must exist and
+# be loaded, because a second controller is launched by a job rather than by the box's platform verb.
+# ⛔ "State dir present, no job" is MISSING: that is the measured state that produced this whole
+# change — a hand-run second controller that vanishes on reboot, which nothing reported.
+FLEET_AI_STATE="${FLEET_AI_STATE:-$FLEET_HOME/orchestrator-ai}"
+fleet_row_second_controller() {
+  local o="$FLEET_AI_STATE" label="com.eldato.ai-multi-repo" plist pids lock n hb_age declared
+  plist="$(fleet_plist "$label")"
+  # ⛔ THE JOB'S OWN DECLARATION WINS over the seam. The second controller's state dir is rendered into
+  # its plist as `O`, so an operator who activated it somewhere else would otherwise be judged against
+  # a directory the job does not use (a permanent false MISSING, or worse a false OK against the wrong
+  # dir). The seam stays as the fallback for a box with no job.
+  # ⛔ `EnvironmentVariables.O`, not `O`: the template declares it inside the env dict, and
+  # `fleet_plist_value` extracts a TOP-LEVEL key (plutil -extract). Reading the root key returned
+  # nothing and the row silently fell back to the seam — a healthy controller at a non-default path
+  # read MISSING, which is the false red this line exists to prevent.
+  # ⛔ THREE OUTCOMES, and they must not collapse: a value, ABSENT, and COULD-NOT-READ (rc 2). The
+  # plain assignment swallowed the third, so an unreadable definition silently fell back to the seam and
+  # the row then judged a directory the job does not use — the false verdict this line prevents.
+  if ! declared="$(fleet_plist_value "$label" EnvironmentVariables.O)"; then
+    fleet_row second-controller "one orch-loop.sh for its declared state dir, with a fresh heartbeat" \
+      "$label: job definition unreadable" UNKNOWN \
+      "$plist exists but its declared O could not be read, so which directory this controller owns cannot be determined — an unreadable read is never a pass"; return 0
+  fi
+  [ -n "$declared" ] && o="$declared"
+  local exp="one orch-loop.sh for $o, with a fresh heartbeat and a loaded job"
+  if [ ! -f "$plist" ]; then
+    # ⛔ EVIDENCE THE SECOND CONTROLLER CREATED, not a directory something else owns. `-d "$o"` was the
+    # wrong predicate: `$HOME/orchestrator-ai` is ALSO the ai-drainer's default state dir, which the
+    # drainer creates on its first tick — so activating only the DRAINER manufactured a red row
+    # instructing the operator to install a second controller (model spend, per box). The `--init`
+    # artefact is the one thing only the launcher writes.
+    if [ -s "$o/state/HARNESS-PIN" ]; then
+      fleet_row second-controller "$exp" "no job definition" MISSING \
+        "$o/state/HARNESS-PIN exists — so a second controller's identity was created on this box — but no job installs it (looked for $plist): it is hand-run or gone, and a reboot ends it silently. Render it: AI_MULTI_REPO_SLUG=… AI_MULTI_REPO_REPO=… AI_MULTI_REPO_STATE=$o bash scripts/install-launchd.sh"
+      return 0
+    fi
+    fleet_row second-controller "$exp" "not installed" SKIPPED \
+      "neither a job definition ($plist) nor a second controller's identity ($o/state/HARNESS-PIN) exists here — this box runs one repo's controller, which is the normal case (NOT a healthy second controller)"
+    return 0
+  fi
+  if [ ! -d "$o" ]; then
+    fleet_row second-controller "$exp" "state dir absent" MISSING \
+      "the job definition exists but ITS state dir $o does not — the launcher REFUSES to start without one (it will not conjure a controller's identity mid-launch), so this job can never dispatch. Create it once: O=$o … bash scripts/orchestrator-harness/multi-repo-controller.sh --init"
+    return 0
+  fi
+  if ! fleet_launchctl_available; then
+    fleet_row second-controller "$exp" "no launchctl" SKIPPED \
+      "this platform has no launchctl, so a launchd job cannot be run or checked here (on a cell the second controller is started by the cell supervisor)"
+    return 0
+  fi
+  local loaded; loaded="$(fleet_job_loaded "$label")" || {
+    fleet_row second-controller "$exp" "<launchctl unreadable>" UNKNOWN \
+      "launchctl could not be read, so the job's state cannot be determined"; return 0; }
+  if [ "$loaded" != "yes" ]; then
+    fleet_row second-controller "$exp" "not loaded" MISSING \
+      "the job definition exists but $label is NOT in the launchd domain — it will never run, and the repo it serves gets no automatic dispatch (the measured agent-infra #2281 gap)"; return 0
+  fi
+  pids="$(fleet_pids_for "$o/orch-loop.sh")" || {
+    fleet_row second-controller "$exp" "<ps unreadable>" UNKNOWN "the process table could not be read — an unreadable read is never a pass"; return 0; }
+  lock="$(_fleet_lock_owner "$o")" || {
+    fleet_row second-controller "$exp" "<ps unreadable>" UNKNOWN "the process table could not be read while resolving the lock owner"; return 0; }
+  pids="$(printf '%s\n%s\n' "$pids" "$lock" | fleet_uniq_pids)"
+  n="$(printf '%s' "$pids" | awk 'NF' | wc -l | tr -d ' ')"
+  if [ "${n:-0}" -eq 0 ]; then
+    fleet_row second-controller "$exp" "job loaded, no controller" MISSING \
+      "$label is loaded but no orch-loop.sh is running for $o — the job exists and nothing is cycling, so this repo's backlog is still drained by nobody"; return 0
+  fi
+  if [ "${n:-0}" -gt 1 ]; then
+    fleet_row second-controller "$exp" "$n live for this state dir" DUPLICATE \
+      "MORE THAN ONE controller owns $o: pid $(printf '%s' "$pids" | tr '\n' ' ' | sed 's/ *$//') — every one drains the same queue; stop all but one by hand (no health check kills a process)"; return 0
+  fi
+  hb_age="$(fleet_file_age "$o/heartbeat")"
+  if [ -z "$hb_age" ]; then
+    fleet_row second-controller "$exp" "pid $pids (no heartbeat file)" LATE \
+      "a controller is running but $o/heartbeat is absent or undatable, so whether it CYCLES cannot be read — the measured 'alive and dispatching nothing' shape"; return 0
+  fi
+  if [ "$hb_age" -gt "$FLEET_CONTROLLER_LATE_S" ]; then
+    fleet_row second-controller "$exp" "pid $pids, last cycle $(fleet_human_age "$hb_age") ago" LATE \
+      "live but its heartbeat is $(fleet_human_age "$hb_age") old (bound ${FLEET_CONTROLLER_LATE_S}s) — alive and dispatching nothing; check $o/logs/orch-loop.log"; return 0
+  fi
+  fleet_row second-controller "$exp" "pid $pids, last cycle $(fleet_human_age "$hb_age") ago" OK ""
+}
+
 # ── the inventory, and the one table ──────────────────────────────────────────────────────────
 # `fleet_rows <harness-path>` — every row, in a fixed order: the controller first (it is what every
 # other component exists to serve), then the things that keep it alive, then the maintenance jobs.
@@ -987,6 +1110,8 @@ fleet_rows() {
   fleet_row_cell_supervisor
   fleet_row_landers "$harness"
   fleet_row_lander_drain
+  fleet_row_ai_drainer "$harness"
+  fleet_row_second_controller
 }
 
 # fleet_state_severity <state> — 0 pass (OK, SKIPPED) · 1 not OK · 2 cannot determine.
@@ -1066,6 +1191,8 @@ _fleet_label_for() { # <name>
     reaper.branch-reaper)      printf 'com.tortoise.branch-reaper\n' ;;
     reaper.pi-session-reaper)  printf 'com.eldato.pi-session-reaper\n' ;;
     reaper.lane-liveness)      printf 'com.eldato.lane-liveness\n' ;;
+    ai-drainer)                printf 'com.eldato.ai-drainer\n' ;;
+    second-controller)         printf 'com.eldato.ai-multi-repo\n' ;;
   esac
 }
 

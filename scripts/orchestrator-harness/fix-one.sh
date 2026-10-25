@@ -144,6 +144,222 @@ else
   # `report.sh`) passes `--repo <checkout>`; this one now does too.
   echo "[fix $PR] WARNING — no ci-queue.sh at $SELF/ci-queue.sh; the CI-queue gate is UNMEASURED for this run and the push proceeds (re-seed the running copy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <dir>)" >> "$L.log"
 fi
+# ── THE LANDER'S LOCK: a fixer must not be in flight on a PR a lander owns ─────────
+# ⛔ THE HOLE THIS CLOSES (measured 2026-10-23). `merge-one.sh` (the reviewer/lander chain) and the
+# doctor's `merge` role both take `$O/state/mergeclaim-<PR>.lock` before doing anything to a PR, and
+# the controller's `claim_live` reads that SAME file as its spawn guard. `fix-one.sh` took NEITHER
+# it nor anything else the lander reads — only the cross-box `<PR>-<head>` claim, which the doctor
+# also does not take. So on one box the lander and the ONE worker whose product is a PUSH could be
+# in flight on the same PR at the same time: the lander re-resolves the head, the fixer pushes under
+# it, and the rail refuses — with the attestation the review chain had just minted gone stale.
+# Measured on the tortoise queue the same day: of 11 open non-draft PRs, 6 carried a CLEAN record
+# bound to a head that had since moved, and `[merge] candidates=12 attempted=1 landed=0` — the
+# lander's own fixer lanes are a pusher it cannot see.
+#
+# ⛔ WHY THIS FILE AND NOT THE CALLER. The controller already refuses to spawn when `claim_live`
+# says the lock is held, but `fix-one.sh` is ALSO reached directly and by `adopt-fix.sh`, and a
+# guard that lives only in the controller leaves those paths pushing at a live lander — the same
+# argument the CI-queue gate above makes for itself, and the reason both read the same state.
+#
+# ⛔ THE DIRECTION IS DEFER, NEVER BLOCK-AND-HOLD. Contention writes the SAME refundable bail marker
+# the CI-queue and cross-box refusals write, so the controller refunds the attempt and re-decides
+# from a fresh read next cycle: nothing is dropped, and a lander that lands the PR ends the work
+# entirely. Nothing here is sticky — the marker describes one cycle, not a state.
+#
+# ⛔ A STALE CLAIM IS TAKEN OVER, NOT REFUSED (#2574 (b)) — AND THE TAKEOVER IS A RENAME, NEVER
+# `rm && write`. Measured staleness is the whole licence: the record's pid is numeric and `kill -0`
+# says it is GONE. The naive reclaim (`read owner -> is it live? -> rm -> write`) is two syscalls, so
+# between them a peer can win the noclobber create — and the `rm`, issued on the strength of an
+# EARLIER read, then deletes that peer's LIVE lock, re-opening the hole this block exists to close
+# (review of PR #2576, P3, reproduced). `mv` moves whatever is at the path at the instant it runs, so
+# what we detached is OBSERVABLE afterwards: if it is not the pid we measured, we detached someone's
+# live claim, put it back with `ln` (create-if-absent — a real CAS) and defer. Nothing is deleted
+# blind, and a refusal is still refundable, so the worst case is one re-decided cycle.
+#
+# ⛔ WHY A TAKEOVER AT ALL, WHEN `claim_live()` ALSO RECLAIMS. The controller's spawn guard reclaims a
+# dead owner's claim, so on the CONTROLLER path a stale lock is already gone before this file runs.
+# But this file is also reached directly and by `adopt-fix.sh` (nothing is dispatching, so no reclaim
+# is coming), and `merge-one.sh` reclaims this same file by `rm` + retry on its own path — so a fixer
+# that merely deferred would leave the PR blocked behind bookkeeping that recorded a past state and
+# is never revalidated. The fleet has been blocked for hours by exactly that shape.
+#
+# ⛔ AN UNREADABLE RECORD IS **NOT** STALE, AND THAT IS THE ONE WAY TO STEAL A LIVE LANDER'S CLAIM.
+# `merge-one.sh` claims with `( set -o noclobber; echo $$ > "$CLAIM" )`: the file exists for an
+# instant BEFORE the pid is written, so "empty content ⇒ dead owner" would take a lock whose owner
+# is alive and mid-claim. Only a numeric pid that `kill -0` proves gone is stale; empty, unparseable
+# or unreadable content is treated as LIVE and deferred (#1985's recycled-pid risk is the mirror of
+# this one: there a live pid reads dead, here a claiming pid has not been written yet).
+#
+# ⛔ THE LOOSE-LIVENESS READ IS THE FLEET'S EXISTING CONVENTION, NOT A NEW ONE. "Any live pid holds"
+# is `claim_live`'s documented spawn-guard direction (a recycled pid means "do not spawn", one lost
+# cycle, nothing deleted) and the doctor's `merge` role reads the same file the same way. The
+# recycled-pid risk of reclaiming on liveness alone is #1985's, already filed; this arm joins the
+# existing mechanism rather than inventing a second lock with its own semantics.
+PRLOCK="$O/state/mergeclaim-$PR.lock"
+prlock_live_owner() { # prints the owner pid and returns 0 only when the lock is held by a LIVE pid
+  local p
+  [ -f "$PRLOCK" ] || return 1
+  p="$(cat "$PRLOCK" 2>/dev/null || echo 0)"
+  case "${p:-}" in ''|*[!0-9]*) p=0 ;; esac
+  [ "$p" -gt 0 ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  printf '%s\n' "$p"
+  return 0
+}
+# ⛔ THE RECORD APPEARS WITH ITS PID ALREADY IN IT, AND THAT IS NOT TIDINESS. A noclobber create
+# followed by a separate write leaves the file EMPTY for an instant, and the other three readers of
+# this SAME file — `merge-one.sh:144-147`, the doctor's `merge` role and `claim_live()` in
+# `orch-loop.sh` — treat an empty record as "no owner" and `rm` it. So the window let a lander delete a
+# live fixer's claim by reading it mid-create, i.e. the hole this block closes, reopened from the other
+# side (review of PR #2576, P2). Writing the pid to a private file and `ln`-ing it into place makes
+# the create and the content ONE atomic step: `ln` refuses an existing destination (no `-f`), which IS
+# the compare-and-swap.
+prlock_take() {
+  local tmp rc name
+  tmp="$O/state/.mergeclaim-$PR.$$.tmp"
+  name="${tmp##*/}"
+  printf '%s\n' "$$" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  ln "$tmp" "$PRLOCK" 2>/dev/null; rc=$?
+  rm -f "$tmp" 2>/dev/null
+  [ "$rc" -eq 0 ] || return 1
+  # ⛔ `ln` EXITS 0 WHEN THE DESTINATION IS A DIRECTORY — it links INSIDE it instead of replacing it, so
+  # success is not proof that the record is ours (measured: a `mergeclaim-<PR>.lock` directory made this
+  # function report a successful claim, and the unusable-path refusal below never fired). The path must
+  # now BE our record. The stray inner link is removed so a corrupt path is not also littered.
+  [ "$(cat "$PRLOCK" 2>/dev/null || echo 0)" = "$$" ] && return 0
+  rm -f "$PRLOCK/$name" 2>/dev/null
+  return 1
+}
+prlock_stale_owner() { # prints the pid and returns 0 ONLY when staleness is MEASURED
+  # The three ways this returns 1 are all "not stale", and the last two are the two ways to steal a
+  # LIVE claim: (a) the lock is gone or is not a regular file; (b) the pid is empty/unparseable —
+  # `merge-one.sh`'s noclobber create and its `echo $$` are separate operations, so a claiming
+  # lander's file is briefly EMPTY; (c) `kill -0` succeeds — a live pid holds, deliberately loose,
+  # the same direction `claim_live` documents. A recycled pid therefore reads LIVE (one lost cycle,
+  # nothing deleted) rather than as a claim to take (#1985).
+  local p
+  [ -f "$PRLOCK" ] || return 1
+  p="$(cat "$PRLOCK" 2>/dev/null || echo 0)"
+  case "${p:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$p" -gt 0 ] || return 1
+  kill -0 "$p" 2>/dev/null && return 1
+  printf '%s\n' "$p"; return 0
+}
+prlock_takeover() { # $1 = the pid we MEASURED stale; 0 = we own it · 1 = nothing displaced · 2 = a claim was LOST
+  # ⛔ FOUR STEPS, AND EACH ONE IS A CAS OR A VERIFICATION. (1) the record must still be the pid we
+  # measured — a re-read before the steal, so a peer that reclaimed while we were deciding is not
+  # displaced; (2) DETACH by `mv`, never `rm`, so what we moved can be inspected; (3) verify what we
+  # actually moved is the dead pid — if it is not, we took someone's LIVE claim in the instant between
+  # (1) and (2), so put it back with `ln` (create-if-absent) and defer; (4) claim the vacated path.
+  # A `mv` that finds the path already gone (a peer detached it first) fails, which is the CAS: only
+  # one racer can detach a given record.
+  # ⛔ THE RETURN CODES ARE DISTINCT BECAUSE THE OUTCOMES ARE OPPOSITE (review of PR #2576, P2). 1 =
+  # nothing was displaced (the record changed, the mv found it gone, or the create lost a race), so
+  # "the peer holds it, nothing was lost" is TRUE. 2 = we displaced a claim that could not be put back,
+  # so a live peer's lock is GONE; reporting that as "nothing was deleted" would hand the operator two
+  # contradictory lines and the wrong repair. The caller writes a different sentence for each.
+  local stale="$1" side cur
+  side="$PRLOCK.reclaim.$$"
+  cur="$(cat "$PRLOCK" 2>/dev/null || echo 0)"
+  [ "$cur" = "$stale" ] || return 1
+  mv -f "$PRLOCK" "$side" 2>/dev/null || return 1
+  cur="$(cat "$side" 2>/dev/null || echo 0)"
+  if [ "$cur" != "$stale" ]; then
+    if ln "$side" "$PRLOCK" 2>/dev/null; then
+      rm -f "$side"
+      return 1
+    fi
+    echo "[fix $PR] WARNING — a peer claimed state/mergeclaim-$PR.lock between the stale read and the takeover; its claim (pid ${cur:-unreadable}) was DETACHED and could NOT be restored (the path was re-claimed first)" >> "$L.log"
+    rm -f "$side"
+    return 2
+  fi
+  if prlock_take; then rm -f "$side"; return 0; fi
+  rm -f "$side"   # lost the create race: drop only the stale artifact
+  return 1
+}
+release_prlock() { # never removes a lock we do not own: a lander that outlived us keeps its claim
+  [ -n "${PRLOCK:-}" ] || return 0
+  [ "$(cat "$PRLOCK" 2>/dev/null)" = "$$" ] && rm -f "$PRLOCK" 2>/dev/null
+  rm -f "$O/state/.mergeclaim-$PR.$$.tmp" 2>/dev/null   # a create interrupted between write and ln
+  return 0
+}
+# The refusal has the SAME three arms as the other two gates: the controller refunds by consuming
+# `fixbail-<PR>-<HEAD>`, and an empty HEAD (the cross-box marker's own documented hole) or a manual
+# run must not pretend to have booked one.
+# ⛔ THE FIRST LINE IS A STABLE TOKEN (`DEFERRED: the LANDER`), because `adopt-fix.sh` — the operator
+# surface onto this script — has to name the cause in the log the operator reads, exactly as it does
+# for the CI-queue deferral. A second, cosmetic reword would silently make `adopt-fix <PR>` report
+# SUCCESS for a run that pushed nothing (review of PR #2576, P2).
+prlock_defer() { # prlock_defer <why>
+  echo "[fix $PR] DEFERRED: ${1} — nothing pushed, so no attestation was invalidated by this lane" >> "$L.log"
+  if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then
+    : > "$O/state/fixbail-$PR-$HEAD"
+    echo "[fix $PR] attempt refundable (bail marker written for head $HEAD)" >> "$L.log"
+  elif [ "${CTRL:-0}" = "1" ]; then
+    echo "[fix $PR] the head could NOT be read, so no bail marker could be written — the controller cannot refund this attempt (re-decided next cycle)" >> "$L.log"
+  else
+    echo "[fix $PR] manual run: no attempt was booked and none is refunded" >> "$L.log"
+  fi
+  exit 0
+}
+# ⛔ A REFUSAL THAT CANNOT CLEAR BY ITSELF IS NOT REFUNDABLE (review of PR #2576, cycle 2 — P2). Every
+# arm above writes the bail marker, so the controller refunds the attempt and re-decides — which is
+# right for a lock a LANDER holds or one whose dead owner this lane could not take over (a lost
+# race). It is WRONG for a lock state that no re-dispatch can change: a `$PRLOCK` that is not a regular
+# file (a directory, an unreadable object) or a `$O/state` this box cannot write. There the refund
+# makes spawn -> defer -> refund a PERMANENT SPIN: `fixcount` nets to zero every cycle, so MAX_FIX_TRIES
+# never trips, nothing parks, and nothing surfaces — the same shape `orch-loop.sh` documents for a
+# deferral that cannot clear itself. Those two arms therefore consume the attempt (no bail marker) and
+# name the repair, so the cap parks the PR in front of a human instead of hiding the state forever.
+prlock_refuse() { # prlock_refuse <why> — NOT refundable: re-dispatching cannot change this state
+  echo "[fix $PR] REFUSED (NOT refundable — a re-dispatch cannot clear this): ${1} — nothing pushed" >> "$L.log"
+  if [ "${CTRL:-0}" = "1" ]; then
+    echo "[fix $PR] this attempt is CONSUMED so MAX_FIX_TRIES parks the PR in front of a human; no bail marker was written" >> "$L.log"
+  else
+    echo "[fix $PR] manual run: nothing was consumed" >> "$L.log"
+  fi
+  exit 0
+}
+if PL_OWNER="$(prlock_live_owner)"; then
+  prlock_defer "the LANDER owns this PR (state/mergeclaim-$PR.lock held by live pid $PL_OWNER) — a push now would move the head out from under the attestation it is landing"
+elif PL_STALE="$(prlock_stale_owner)"; then
+  # ⛔ THE OVERRIDE IS LOGGED WITH ITS EVIDENCE, not just announced: WHICH lock, WHOSE pid, and the
+  # measurement that made it stale. An operator reading `fix-<PR>.log` afterwards must be able to
+  # tell a takeover from a normal acquisition without re-deriving it.
+  if prlock_takeover "$PL_STALE"; then
+    echo "[fix $PR] PR-owner lock: RECLAIMED a STALE claim — state/mergeclaim-$PR.lock named pid $PL_STALE, which is not alive (measured with kill -0), so this lane took the claim over instead of refusing the PR" >> "$L.log"
+  else
+    case $? in
+      2) prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) named pid $PL_STALE (not alive), and a peer's claim that appeared while this lane was taking it over was DISPLACED AND COULD NOT BE RESTORED — the WARNING line above names that pid. Nothing was pushed by this lane; REPAIR: confirm no worker is live (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh') and re-run, and treat any worker that lost its claim as having lost it" ;;
+      *) prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) named pid $PL_STALE, which is NOT alive (measured with kill -0), but the takeover LOST a race with a peer that reclaimed it first — this lane displaced nothing; the peer now holds it. REPAIR only if this repeats with NO live worker and nothing dispatching this PR: confirm none is running (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh'), then rm -f state/mergeclaim-$PR.lock" ;;
+    esac
+  fi
+elif prlock_take; then
+  echo "[fix $PR] PR-owner lock: acquired state/mergeclaim-$PR.lock (no lander is in flight on this PR)" >> "$L.log"
+else
+  # ⛔ A FAILED CAS IS NOT PROOF THAT AN OWNER EXISTS (review of PR #2576, cycle 2 — P3). It also fails
+  # when the path is a directory or `$O/state` is unwritable, and the re-read below cannot tell an
+  # ABSENT lock from a stale one — so each condition is named for what it is instead of being reported
+  # as "the owner is not live", which sent an operator to wait for the reclaim of nothing.
+  if PL_OWNER="$(prlock_live_owner)"; then
+    prlock_defer "the LANDER claimed this PR while this lane was starting (state/mergeclaim-$PR.lock held by live pid $PL_OWNER)"
+  fi
+  if [ -e "$PRLOCK" ] || [ -L "$PRLOCK" ]; then
+    if [ ! -f "$PRLOCK" ]; then
+      prlock_refuse "state/mergeclaim-$PR.lock exists but is NOT a regular file (a directory, a dangling symlink, or an object this box cannot read), so no owner can be read and no claim can be taken. REPAIR: inspect it (ls -ld '$PRLOCK'), confirm no lander is running for #$PR, then rm -f (or rmdir) it"
+    fi
+    # A REGULAR FILE WE CANNOT MEASURE AS STALE: empty or unparseable content (a lander mid-claim), or
+    # a pid that went live between the two reads above. NEVER stolen — see prlock_stale_owner.
+    prlock_defer "the PR-owner lock (state/mergeclaim-$PR.lock) exists and holds no pid this lane can prove dead (its content is empty, unparseable, or names a pid that is now alive), so it is treated as LIVE and left untouched — nothing was deleted. REPAIR only if this persists with NO live worker and nothing dispatching this PR: confirm none is running (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh'), then rm -f state/mergeclaim-$PR.lock"
+  fi
+  # The file is ABSENT at the re-read: its owner released it between the CAS and this read (a fast
+  # lander exit runs its EXIT trap). That is not a stale claim — retry ONCE rather than reporting one.
+  if prlock_take; then
+    echo "[fix $PR] PR-owner lock: acquired state/mergeclaim-$PR.lock (an earlier holder released it while this lane was starting; no lander is in flight on this PR)" >> "$L.log"
+  else
+    prlock_refuse "state/mergeclaim-$PR.lock could not be CREATED although no file exists there — $O/state is unwritable, full, or not a directory. REPAIR: check the permissions and free space of '$O/state'"
+  fi
+fi
 CROSS_OWN=""; CROSS_RC=0
 release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT path
   # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
@@ -162,7 +378,7 @@ release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT pat
   kill "$w" 2>/dev/null
   return "$rc"
 }
-trap 'release_fix_claim' EXIT
+trap 'release_prlock; release_fix_claim' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
@@ -265,7 +481,10 @@ gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 cat > "$L-fixer.txt" <<EOF
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
-If $L-failing.txt is non-empty, READ IT FIRST: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. A named failing check is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
+If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (`head12: <12 chars>`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
+
+If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
+>>>>>>> b718dc981 (feat(harness): a PR sickness QUEUE — a red PR nobody holds is now selected, briefed and fixed)
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3
@@ -396,6 +615,13 @@ if [ -n "${CROSS_OWN:-}" ]; then
   fi
 fi
 # re-run the full chain at the new head
+# ⛔ RELEASE THE PR-OWNER LOCK FIRST, AND BEFORE THE CHAIN — not only at exit. `merge-one.sh` takes
+# this SAME lock as its first act and, finding a live pid, exits 0 with "already owns this PR" — so
+# keeping ours across the handoff would turn the fixer's own re-review into a silent no-op (the
+# "fixer pushed, nothing re-recorded" strand #2132 removed). Releasing here is the same reason the
+# cross-box claim above is released here: after a push the downstream worker claims the NEW head,
+# and without a push the SAME head is still ours, so leaving it held would refuse our own re-review.
+release_prlock
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
 echo "[fix $PR] end $(date)" >> "$L.log"
 # ── and the fixer's `.venv` goes with it (agent-infra#1932) ─────────────────────────────────────────
