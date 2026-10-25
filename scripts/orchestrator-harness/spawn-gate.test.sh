@@ -994,6 +994,15 @@ ck "...and an unreadable probe is ANNOUNCED, so a misconfigured path is not sile
 echo
 echo "── THE HEADROOM GATE (#2721): a lane's own tree against the space it has left ──"
 
+# ⛐ THE `df` STUB IS CREATED HERE, BEFORE ANY ARM USES IT (review round 6, VGATE). It used to be created
+# two hundred lines down, so the THREE arms added above it (target selection, the advance warning's
+# terms, the band warning's terms) ran with `$TMP/bindf` ABSENT: `PATH` found the real `df`, and those
+# arms decided on this host's free space instead of the fixture — green on a full cell, red on a roomy
+# one, and in neither case a test of the code they name. The stub is a FIXTURE, not part of one arm.
+mkdir -p "$TMP/bindf"
+printf '#!/bin/sh\navail=$(( ${FAKE_DF_AVAIL_MB:-0} * 1024 ))\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "fake 9999999 0 $avail 1%% /"\n' > "$TMP/bindf/df"
+chmod +x "$TMP/bindf/df"
+
 # drive_hd <path> <tree-mb> <self-mb> <reserve-mb> [<kind>] — the same rig as drive_disk, with the
 # lane's costs supplied EXPLICITLY so the verdict is decided by arithmetic rather than by this host's
 # free space. THREE terms because the gate has three: marginal tree, worst case (sharing lost), and
@@ -1054,6 +1063,37 @@ grep -q '199999997MB is required' "$LOG"; rc=$?
 ck "...and the required total is max(tree,self)+reserve = 99999999+99999998 = 199999997" $rc
 grep -q 'NOT a load refusal' "$LOG"; rc=$?
 ck "...and it says waiting will not clear it, so an operator is not sent to a load remedy" $rc
+
+# ⛐ THE COSTS ARE MEASURED ON THE CHECKOUT, NOT ON THE `df` PATH (review round 6, P2). Reverting
+# `_lane_target` to `disk_lane_costs "$dpath"` left 203/203 and 93/93 green, i.e. the one fix in round 5
+# called "the false PASS this gate exists to close" had no arm behind it. The fixture puts the GATED PATH
+# on a directory that is NOT a checkout (the operator pointing `DISK_GATE_PATH` at a mount root) while
+# the cwd IS one carrying `uv.lock`. Both triples are known: python is 350/6144/2000 (need 8144) and
+# harness is 64/64/2000 (need 2064), and the stubbed reading sits BETWEEN them (4884MB), so the verdict
+# alone identifies which target was classified — refused means the CHECKOUT was measured, admitted means
+# the mount root was.
+TGT="$TMP/target"
+mkdir -p "$TGT/repo-with-uv" "$TGT/mount-root"
+(cd "$TGT/repo-with-uv" && mkdir -p .git && : > uv.lock)
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=5000 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$TGT/mount-root" DISK_MIN_FREE_MB=500 DISK_WARN_FREE_MB=2000 \
+  bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "target selection" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$PROMPT" "$TGT/repo-with-uv" 2>/dev/null)"
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "a PYTHON lane is refused on 5000MB free even when DISK_GATE_PATH is a non-checkout mount root ($res)" $rc
+grep -q 'so 8144MB is required' "$LOG"; rc=$?
+ck "...because it was charged the python pair (8144), not the 64MB harness pair — the df path is not the target" $rc
+# ⛐ AND THE READING IS THE FIXTURE'S, not this host's (review round 6, VGATE): the three arms here once
+# ran before the `df` stub existed, so `PATH` found the real one and the verdict was a function of the
+# machine. Pinning the number in the refusal proves the stub answered.
+grep -q 'only 5000MB is available' "$LOG"; rc=$?
+ck "...and the free reading in that line is the STUB's (5000MB), so the arm is not measuring this host" $rc
 
 # THE OTHER DIRECTION — a tree that fits is admitted even inside the WARN band, i.e. the headroom gate
 # is a predicate and not a second, unconditional refusal.
@@ -1161,9 +1201,6 @@ ck "an ALLOWED run records tree + reserve + worst case in disk.tsv (6,7,8), keep
 # can fire is "within one marginal lane tree of the bound". Driven with a STUBBED `df` so the free
 # reading is chosen by the test instead of by this host — the same reason every other arm here avoids
 # a real measurement.
-mkdir -p "$TMP/bindf"
-printf '#!/bin/sh\navail=$(( ${FAKE_DF_AVAIL_MB:-0} * 1024 ))\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "fake 9999999 0 $avail 1%% /"\n' > "$TMP/bindf/df"
-chmod +x "$TMP/bindf/df"
 # free 150MB, tree 100, worst case 0, reserve 0 => need 100: admitted, and 150 < 100 + 100.
 : > "$LOG"; : > "$PI_LOG"
 res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=150 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
@@ -1200,6 +1237,66 @@ grep -q 'disk-gate.*WARN.*warn band 2000MB' "$LOG"; rc=$?
 ck "...and the BAND warning fired first, so the advance instrument is not dead code" $rc
 grep -q 'DISK-NOHEADROOM' "$LOG"; rc=$?
 ck "...and the refusal is still the named one, so the two are distinguishable in the same log" $rc
+
+# ⛐ THE WARN LINES' THREE TERMS ARE PINNED TOO (review round 6, P2). The arms above drive the
+# advance warning and the band warning with `self=0`, so every term in them is either zero or repeated:
+# swapping `${_lane_self}` with `${_lane_tree}` (or `${_lane_reserve}`) in those two `echo` lines left
+# every arm green. They are the lines an operator reads MOST: the advance warning is the only one that
+# fires while a spawn is still ADMITTED, so nothing downstream cross-checks its arithmetic. Distinct
+# values and a stubbed `df` make each position load-bearing. free=5100, tree=3000, worst case=3001,
+# reserve=2000 => need 5001: admitted, and 5100 < 5001 + 3000, so the advance warning fires.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=5100 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 DISK_WARN_FREE_MB=1 \
+  DISK_LANE_TREE_MB=3000 DISK_LANE_SELF_MB=3001 DISK_LANE_RESERVE_MB=2000 bash -c '
+    . "$1"
+    cd "$3" || exit 2
+    LOG="$2"; PROMPT="$4"
+    run_agent 1 "$LOG" "$PROMPT" "advance warning terms" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$FIXREPO" "$PROMPT" 2>/dev/null)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "the advance warning's own arm is ADMITTED, so its terms are all an operator has ($res)" $rc
+grep -q 'needs 5001MB = worst case 3001MB (marginal 3000MB, and 3001MB if sharing is lost) + reserve 2000MB' "$LOG"; rc=$?
+ck "...and it names need=5001 = worst case 3001 + reserve 2000, with the marginal 3000 in its own position" $rc
+
+# ... and with the two offsets the OTHER WAY ROUND (tree > self, which the documented overrides allow:
+# "then set DISK_LANE_TREE_MB / DISK_LANE_SELF_MB for that cell") the worst case is the TREE. Naming
+# `self` unconditionally made the message internally inconsistent — "costs up to 64MB ... so 7000MB is
+# required" — which reads as a broken override and invites loosening admission. free=5100, tree=3001,
+# worst case=3000, reserve=2000 => need 5001, and 5100 < 5001 + 3001.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=5100 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 DISK_WARN_FREE_MB=1 \
+  DISK_LANE_TREE_MB=3001 DISK_LANE_SELF_MB=3000 DISK_LANE_RESERVE_MB=2000 bash -c '
+    . "$1"
+    cd "$3" || exit 2
+    LOG="$2"; PROMPT="$4"
+    run_agent 1 "$LOG" "$PROMPT" "tree above self" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$FIXREPO" "$PROMPT" 2>/dev/null)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "an override with tree > self is admitted on the same arithmetic ($res)" $rc
+grep -q 'worst case 3001MB (marginal 3001MB, and 3000MB if sharing is lost)' "$LOG"; rc=$?
+ck "...and the worst case named is the TREE (3001), the term the predicate actually took — not a fixed field" $rc
+
+# ... and the BAND warning's three terms are pinned the same way (its numbers were unpinned too): the
+# reading is inside `DISK_WARN_FREE_MB` but above the headroom bound, so this is the WARN-only path — the
+# one an admitted lane leaves behind with no refusal next to it to cross-check the arithmetic.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=6000 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=1 DISK_WARN_FREE_MB=999999 \
+  DISK_LANE_TREE_MB=3000 DISK_LANE_SELF_MB=3001 DISK_LANE_RESERVE_MB=2000 bash -c '
+    . "$1"
+    cd "$3" || exit 2
+    LOG="$2"; PROMPT="$4"
+    run_agent 1 "$LOG" "$PROMPT" "band terms" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$FIXREPO" "$PROMPT" 2>/dev/null)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "a reading inside the band with room for this lane is ADMITTED ($res)" $rc
+grep -q 'one more lane needs 5001MB = worst case 3001MB (marginal 3000MB, and 3001MB if sharing is lost) + reserve 2000MB' "$LOG"; rc=$?
+ck "...and the BAND line names all three in their own positions (worst 3001, marginal 3000, reserve 2000)" $rc
 
 # ... and the same reading with room for three lanes says nothing.
 : > "$LOG"; : > "$PI_LOG"

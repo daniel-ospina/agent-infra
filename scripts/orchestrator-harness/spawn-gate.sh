@@ -1264,17 +1264,44 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # admitted on 2 GB of headroom instead of 8 GB. So the target is `$dpath` only when it IS a checkout,
   # otherwise the caller's cwd (every shipped caller cds to the worktree, and `fix-one.sh` passes the
   # worktree explicitly).
+  # ⛐ WHICH PATH IS CLASSIFIED, STATED EXACTLY (review round 6, P2). The earlier comment claimed "every
+  # shipped caller cds to the worktree", which is false: `fix-one.sh` does `cd "$REPO"` (it also overrides
+  # `DISK_GATE_PATH` with the worktree, which is why its path is right today) and `lane.sh` never cds at
+  # all — it is LAUNCHED inside the worktree, and port-provenance D5 records "their $PWD is the MAIN
+  # CHECKOUT". The fallback is still the cwd, because the MAIN checkout is itself a checkout: classifying
+  # it charges the python bound, i.e. it errs STRICT, which is the safe direction.
+  #
+  # ⛐ WHEN NEITHER PATH IS A CHECKOUT the target is genuinely unknown, and the verdict is the one that
+  # does not wedge a cell: the harness pair, ANNOUNCED. (Reached rarely: a cwd that is not a checkout is
+  # refused further down by the LAND-BACKLOG gate, which cannot read PRs there. So this branch is
+  # instrumentation for a broken caller, not a policy that decides which lanes run.) Charging the python bound there would refuse every
+  # harness lane on any cell with less than ~8 GB free — and `DISK_GATE_PATH` is legitimately pointed at a
+  # scratch VOLUME, whose cwd need not be a checkout at all. That is an over-block (which this repo treats
+  # as the cheaper failure only when something is actually unknown), so it is named in the log, where a
+  # caller that stopped passing a worktree is visible in the next pass instead of silent.
   _lane_target="$dpath"
-  [ -e "$dpath/.git" ] || _lane_target="$PWD"
+  [ -e "$_lane_target/.git" ] || _lane_target="$PWD"
+  if [ ! -e "$_lane_target/.git" ]; then
+    echo "[disk-gate] WARN $label: the lane target is not identifiable (DISK_GATE_PATH=$dpath and cwd=$PWD are neither a checkout) — classifying on the HARNESS pair; a python lane dispatched this way is admitted on the wrong bound, so fix the CALLER's cwd" >> "$log"
+  fi
   _lane_costs="$(disk_lane_costs "$_lane_target")"
   _lane_tree="$(printf '%s' "$_lane_costs" | awk '{print $1}')"
   _lane_self="$(printf '%s' "$_lane_costs" | awk '{print $2}')"
   _lane_reserve="$(printf '%s' "$_lane_costs" | awk '{print $3}')"
   _lane_need="$(disk_lane_need "${_lane_tree:-0}" "${_lane_self:-0}" "${_lane_reserve:-0}")"
+  # ⛐ THE MESSAGE NAMES THE TERM THE PREDICATE ACTUALLY USED (review round 6, P2). Every phrasing
+  # below used to say "costs up to ${self}MB (marginal ${tree}MB …)" and "worst case ${self}/marginal
+  # ${tree}". Both are false once an operator sets the documented overrides the other way round
+  # (`DISK_LANE_TREE_MB=5000 DISK_LANE_SELF_MB=64`, measured): the bound becomes max = 5000 and the
+  # message then prints "costs up to 64MB … so 7000MB is required" — internally inconsistent, so an
+  # operator concludes the OVERRIDE is wrong and loosens admission, which is a capacity change made from
+  # a log line. `_lane_worst` is the same `max` the predicate takes, and it is always one of the two
+  # printed figures, so the total can be checked from the message alone.
+  if [ "${_lane_tree:-0}" -gt "${_lane_self:-0}" ]; then _lane_worst="$_lane_tree"; else _lane_worst="$_lane_self"; fi
   # ONE message for BOTH arms that can refuse on headroom (the band branch below and the plain one):
   # two copies of a 4-line verdict is how the numbers in a log start disagreeing with the numbers in
   # the gate. It is rendered here, where the terms are, and printed where the decision is made.
-  _lane_nh_msg="[disk-gate] REFUSED $label: DISK-NOHEADROOM — this lane's tree costs up to ${_lane_self}MB (${_lane_tree}MB while the shared uv cache holds) and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree:-?}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it"
+  _lane_nh_msg="[disk-gate] REFUSED $label: DISK-NOHEADROOM — this lane costs up to ${_lane_worst}MB (${_lane_tree}MB while the shared uv cache holds, ${_lane_self}MB if sharing is lost) and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree:-?}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it"
   # DURABLE, and written for ALLOWED runs too — a series that only records refusals cannot answer
   # "how close did we get", which is the question that would have caught either incident early.
   # Same append-only shape as walltime.tsv; a refusal writes a row here (unlike walltime, where a
@@ -1321,7 +1348,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # headroom bound` arm below, which fires while a spawn is still admitted. Ordering the band first is
   # what keeps the band reachable at all, which is the property the old order had lost.
   elif disk_low "$dfree"; then
-    echo "[disk-gate] WARN $label: only ${dfree}MB free on $dpath (floor ${DISK_MIN_FREE_MB}MB, warn band ${DISK_WARN_FREE_MB}MB, one more lane needs ${_lane_need}MB = worst case ${_lane_self}MB/marginal ${_lane_tree}MB + reserve ${_lane_reserve}MB) — a full disk is what breaks a cell first; reclaim with 'cloud-cell-supervisor.sh prune' before it fills" >> "$log"
+    echo "[disk-gate] WARN $label: only ${dfree}MB free on $dpath (floor ${DISK_MIN_FREE_MB}MB, warn band ${DISK_WARN_FREE_MB}MB, one more lane needs ${_lane_need}MB = worst case ${_lane_worst}MB (marginal ${_lane_tree}MB, and ${_lane_self}MB if sharing is lost) + reserve ${_lane_reserve}MB) — a full disk is what breaks a cell first; reclaim with 'cloud-cell-supervisor.sh prune' before it fills" >> "$log"
     if ! disk_headroom_ok "$dfree" "$_lane_tree" "$_lane_self" "$_lane_reserve"; then
       printf '%s\n' "$_lane_nh_msg" >> "$log"
       return "$AGENT_DISK_REFUSED"
@@ -1335,7 +1362,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     # in the band BETWEEN the band and the bound — i.e. the cell is above its warning band but the NEXT
     # spawn of this kind is the one that gets refused. It is a threshold, not a constant: it stays
     # silent while there is room for several lanes.
-    echo "[disk-gate] WARN $label: ${dfree}MB free on $dpath is within one lane of the headroom bound (an admitted spawn needs ${_lane_need}MB = worst case ${_lane_self}MB/marginal ${_lane_tree}MB + reserve ${_lane_reserve}MB) — the next lane OF THIS KIND will be refused DISK-NOHEADROOM. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) while there is still room to do it" >> "$log"
+    echo "[disk-gate] WARN $label: ${dfree}MB free on $dpath is within one lane of the headroom bound (an admitted spawn needs ${_lane_need}MB = worst case ${_lane_worst}MB (marginal ${_lane_tree}MB, and ${_lane_self}MB if sharing is lost) + reserve ${_lane_reserve}MB) — the next lane OF THIS KIND will be refused DISK-NOHEADROOM. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) while there is still room to do it" >> "$log"
   fi
   l="$(load1)"
   if ! can_spawn "$l"; then

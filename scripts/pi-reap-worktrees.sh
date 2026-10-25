@@ -237,7 +237,7 @@
 #   REAP_WT_CWD_TIMEOUT REAP_WT_GH_TIMEOUT REAP_WT_REMOVE_TIMEOUT
 #   REAP_WT_GIT_TIMEOUT
 #   REAP_WT_BUDGET_SECONDS REAP_WT_STATE_DIR REAP_WT_LOCK_STALE_SECONDS
-#   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT
+#   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT REAP_WT_PROC_ROOT
 # Exit codes: 0 pass completed with nothing failed, 2 usage, 3 fail-closed
 # abort (nothing trusted), 4 pass completed but >=1 removal FAILED.
 # (`remove_one`'s internal 2 — "the checkout changed since classification, it

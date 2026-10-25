@@ -609,6 +609,14 @@ the worst case into it would silently re-label every historical row — a `64 10
 as "this lane costs 1024 MB without sharing", 16x its real cost, i.e. exactly the figure a per-cell
 budget is calibrated from.
 
+**Which path is measured.** The triple is derived from the lane's **checkout** — `DISK_GATE_PATH` when
+that path is one, otherwise the caller's cwd — and never from the mount root `df` was read on: an
+operator legitimately points `DISK_GATE_PATH` at a volume, where `df` is right and no marker exists, and
+classifying that would admit a python lane on the 64 MB harness pair. If neither path is a checkout the
+target is genuinely unknown; the gate charges the harness pair and **names it in the pass log**, because
+the alternative (charging the python bound) refuses every harness lane on any cell below ~8 GB free. That
+case is a caller bug, and the log is where it surfaces.
+
 `uv.lock` alone was the first discriminator and it was a **false pass**: a pip/poetry/pdm service, or a
 monorepo whose lock sits in `backend/`, installs the same ~5.7 GB venv and would have been admitted on
 the 64 MB harness pair. The detection fails toward the *expensive* pair on purpose — over-estimating a
