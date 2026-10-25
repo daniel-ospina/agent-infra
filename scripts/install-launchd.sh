@@ -118,6 +118,19 @@ resolve_env() {
     # --status and the installed unit both say plainly whether this box deletes.
     WORKTREE_HYGIENE_MODE="$(wt_hygiene_mode)"
     REAP_ORPHAN_MODE="$(reap_orphan_mode)"
+    # ⛔ ENV-ONLY, NO DEFAULTS, like {{SWARM_ROOT}} above — and here the reason is stronger than
+    # "which host has the canary": `install-launchd.sh` with no arguments installs EVERY template in
+    # templates/launchd/, and pi-bootstrap/setup.sh runs exactly that on every Darwin box. A default
+    # for these two jobs would (a) put a lane DISPATCHER on the whole fleet and (b) start a SECOND
+    # CONTROLLER per box, which double-dispatches every queue. Unset → the template is SKIPPED with a
+    # loud warning naming the variable, so activation is an explicit, per-box operator step:
+    #   AI_DRAINER_O=… AI_DRAINER_STATE=… bash scripts/install-launchd.sh
+    #   AI_MULTI_REPO_SLUG=… AI_MULTI_REPO_REPO=… AI_MULTI_REPO_STATE=… bash scripts/install-launchd.sh
+    AI_DRAINER_O="${AI_DRAINER_O:-}"
+    AI_DRAINER_STATE="${AI_DRAINER_STATE:-}"
+    AI_MULTI_REPO_SLUG="${AI_MULTI_REPO_SLUG:-}"
+    AI_MULTI_REPO_REPO="${AI_MULTI_REPO_REPO:-}"
+    AI_MULTI_REPO_STATE="${AI_MULTI_REPO_STATE:-}"
 }
 
 # launchd_path — the PATH a rendered plist receives: {{PATH}} minus the pi SHIM directory.
@@ -398,6 +411,11 @@ render() {
         -e "s|{{PI_BIN_DIR}}|$(sed_repl "$PI_BIN_DIR")|g" \
         -e "s|{{WORKTREE_HYGIENE_MODE}}|$(sed_repl "$WORKTREE_HYGIENE_MODE")|g" \
         -e "s|{{REAP_ORPHAN_MODE}}|$(sed_repl "$REAP_ORPHAN_MODE")|g" \
+        -e "s|{{AI_DRAINER_O}}|$(sed_repl "$AI_DRAINER_O")|g" \
+        -e "s|{{AI_DRAINER_STATE}}|$(sed_repl "$AI_DRAINER_STATE")|g" \
+        -e "s|{{AI_MULTI_REPO_SLUG}}|$(sed_repl "$AI_MULTI_REPO_SLUG")|g" \
+        -e "s|{{AI_MULTI_REPO_REPO}}|$(sed_repl "$AI_MULTI_REPO_REPO")|g" \
+        -e "s|{{AI_MULTI_REPO_STATE}}|$(sed_repl "$AI_MULTI_REPO_STATE")|g" \
         "$1"
 }
 
@@ -459,7 +477,8 @@ install_job() {
     # Unresolved placeholder → legitimate skip (e.g. no swarm root), loud.
     # Checked on the TEMPLATE against resolved env values (not the rendered
     # output — sed would substitute the empty string and hide the gap).
-    for ph in HOME PATH AGENT_INFRA_PATH TORTOISE_REPO SWARM_ROOT SWARM_ENV_FILE PYTHON_BIN PI_BIN_DIR WORKTREE_HYGIENE_MODE REAP_ORPHAN_MODE; do
+    for ph in HOME PATH AGENT_INFRA_PATH TORTOISE_REPO SWARM_ROOT SWARM_ENV_FILE PYTHON_BIN PI_BIN_DIR WORKTREE_HYGIENE_MODE REAP_ORPHAN_MODE \
+              AI_DRAINER_O AI_DRAINER_STATE AI_MULTI_REPO_SLUG AI_MULTI_REPO_REPO AI_MULTI_REPO_STATE; do
         if grep -q "{{$ph}}" "$template" && [ -z "${!ph:-}" ]; then
             unset_ph="$unset_ph {{$ph}}"
         fi
