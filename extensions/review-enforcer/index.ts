@@ -1281,6 +1281,127 @@ function heredocBodyIsData(line: string): boolean {
 }
 
 /**
+ * #1382 — THE COMPOUND FRAME a heredoc opener sits INSIDE, if any.
+ *
+ * `heredocBodyIsData` proves the body is stdin DATA for the opener's OWN consumer, and for a LONE
+ * simple command that is the whole story. A COMPOUND changes what happens to that consumer's
+ * STDOUT, and the masker did not model it. Measured at the landed head of this file (run through a
+ * real `bash`, each printing its marker — EXECUTIONS, not mentions):
+ *
+ *     if true; then             for x in 1; do              case x in
+ *     cat <<'EOF'               cat <<'EOF'                 x) cat <<'EOF'
+ *     gh pr merge 999 --admin   gh pr merge 999 --admin    gh pr merge 999 --admin
+ *     EOF                       EOF                        EOF
+ *     :                         done | bash                :;;
+ *     fi | bash                                            esac | bash
+ *
+ * In each, `| bash` receives the COMPOUND's stdout, so the body executes while the gate — reading the
+ * masked text — sees no `gh` word at all and returns before any check. Measured before this fix:
+ * `isGitOp(raw)` true, `isGitOp(maskHeredocData(raw))` false. That is a FAIL-OPEN in the one gate
+ * that guards every merge, and it is why the proof below is scoped: it holds for a lone command,
+ * not for a body whose stdout still has somewhere to go.
+ *
+ * A STACK, not a depth counter: a `case` ARM ends in `)` (`case x in x) …`), which a bare counter
+ * reads as closing a `(`, while a stack whose top is `case` ignores it. An unmatched closer is
+ * IGNORED rather than decrementing, so the error stays on the fail-CLOSED side — an unmatched `fi`
+ * can never make a deeper frame read as shallower.
+ *
+ * Conservative by construction: quoted text and `#` comments cannot open or close a frame, and
+ * anything the scan cannot read leaves frames OPEN, i.e. "no mask" — a refusal, the direction this
+ * file is allowed to be wrong in.
+ */
+type HeredocFrame = "if" | "loop" | "case" | "paren" | "brace";
+
+/** The words of one line that can open or close a shell frame, quotes and comments removed. */
+function heredocFrameTokens(line: string): string[] {
+  let quote: string | null = null;
+  let buf = "";
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      buf += " ";
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      buf += " ";
+      continue;
+    }
+    if (ch === "#" && (buf === "" || /\s$/.test(buf))) break; // comment: no frame after it
+    buf += ch;
+  }
+  return buf
+    .replace(/([(){}])/g, " $1 ")
+    .split(/[\s;&|]+/)
+    .filter((t) => t !== "");
+}
+
+/** Apply one line's frame openers/closers to the carried stack. */
+function heredocFramesAdvance(line: string, stack: HeredocFrame[]): void {
+  const top = () => stack[stack.length - 1];
+  for (const w of heredocFrameTokens(line)) {
+    if (w === "if") stack.push("if");
+    else if (w === "for" || w === "while" || w === "until" || w === "select") stack.push("loop");
+    else if (w === "case") stack.push("case");
+    else if (w === "(") stack.push("paren");
+    else if (w === "{") stack.push("brace");
+    else if (w === "fi") { if (top() === "if") stack.pop(); }
+    else if (w === "done") { if (top() === "loop") stack.pop(); }
+    else if (w === "esac") { if (top() === "case") stack.pop(); }
+    else if (w === ")") { if (top() === "paren") stack.pop(); }
+    else if (w === "}") { if (top() === "brace") stack.pop(); }
+  }
+}
+
+/**
+ * Is the heredoc opened on `openerIndex` inside a frame that is still OPEN there?
+ *
+ * The opener line's own PREFIX counts too (`{ cat <<'EOF'`): the `<<` is what delimits it.
+ */
+function heredocOpenerIsInsideFrame(lines: string[], openerIndex: number): boolean {
+  const stack: HeredocFrame[] = [];
+  // ⛔ THE SCAN MUST SKIP EARLIER HEREDOC BODIES. A body is DATA, so its text cannot close a frame —
+  // but reading it as shell code let ONE prose `fi` / `}` / `)` / `esac` inside an earlier body pop a
+  // frame bash still has open, after which this function reported "no frame" and the body below was
+  // masked while the shell executed it. Measured fail-OPEN (marker printed by a real `bash`, gate
+  // silent): `if true; then` / `cat <<'A' > notes.md` / `fi` / `A` / `cat <<'EOF'` … `EOF` / `:` /
+  // `fi | bash`. Deliberately the same opener reader `maskHeredocData` uses, so the two cannot
+  // disagree about which body exists.
+  const st: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
+  for (let n = 0; n < openerIndex; n++) {
+    const openers = heredocOpenersIn(lines[n], st);
+    heredocFramesAdvance(lines[n], stack);
+    if (openers.length === 0) continue;
+    for (const op of openers) {
+      let closed = false;
+      for (n++; n < openerIndex; n++) {
+        const probe = op.stripTabs ? lines[n].replace(/^\t+/, "") : lines[n];
+        if (probe === op.delim) {
+          closed = true;
+          break;
+        }
+      }
+      // The body never ended before the opener: the "opener" under test is inside a body, i.e. not
+      // an opener at all. Treat it as enclosed — nothing is masked, which is the safe direction.
+      if (!closed) return true;
+    }
+  }
+  const at = lines[openerIndex].indexOf("<<");
+  heredocFramesAdvance(at >= 0 ? lines[openerIndex].slice(0, at) : "", stack);
+  return stack.length > 0;
+}
+
+
+/**
  * #1382 — blank out every heredoc BODY (and its terminator) whose body is DATA, LENGTH-PRESERVING so
  * every offset a later reader holds stays valid.
  *
@@ -1331,6 +1452,27 @@ export function maskHeredocData(command: string): string {
     // file may be wrong in.
     if (endsWithContinuation(lines[i])) continue;
     if (lines.slice(0, i).some(endsWithContinuation)) continue;
+    // ⛔ A COMPOUND FRAME CAN HAND THE BODY TO A PROGRAM (#1382 — measured fail-OPEN in every
+    // keyword and bracket frame; see `HeredocFrame`). `if … cat <<'EOF' … EOF … fi | bash` gives the
+    // COMPOUND's stdout to bash, so the body EXECUTES while every rule below proves DATA for the
+    // WRONG consumer and the gate, reading masked text, returns before any check.
+    //
+    // ⛔ INSIDE A FRAME, NOTHING IS MASKED — deliberately, with NO attempt to test whether this
+    // particular frame's stdout reaches a program. A first version DID test it, and a fresh review
+    // measured seven ways past the test, every one an execution with the gate silent: a prose `fi`
+    // in an EARLIER heredoc body popping the frame; a POSIX `|` followed by a newline; `fi > f; bash
+    // f` on ONE line; `bash <(if … fi)` (the sink precedes the opener); `fi | $SHELL` (the program is
+    // a variable). Enumerating frame spellings × sink routes is a shell parser, and this file has
+    // already recorded that it cannot enumerate that class — `heredocPrefixIsUnprovable` moved from a
+    // depth counter to "ANY `$(` refuses the mask" for the same reason. So the boundary moves again:
+    // a frame means "not provable", and the body keeps the pre-change refusal.
+    //
+    // STATED COST, and it is a real one: a heredoc that IS data, written INSIDE a frame (`if …; then
+    // cat >> notes.md <<'EOF' … EOF; fi`), is no longer masked — so a framed report that quotes
+    // `gh pr merge` is refused again. That is a false POSITIVE, the direction this file is allowed to
+    // be wrong in; the alternative measured above is a silent admin merge. A lone writer with no
+    // enclosing frame — the reported shape — is untouched.
+    if (heredocOpenerIsInsideFrame(lines, i)) continue;
     if (!heredocBodyIsData(lines[i])) continue;
     const reader = heredocCommandWord(lines[i]);
     // ⛔ THE SHADOW SCAN STOPS AT THE OPENER LINE (#1382 review cycle 1, P2): it used to read the
@@ -3580,12 +3722,66 @@ function describeNonDiffValue(v: string): string {
 }
 
 /**
+ * How long the LIVE diff read may take (ms).
+ *
+ * ⛔ THIS BOUND WAS 60s AND THAT WAS A SILENT FALSE NEGATIVE (measured 2026-10-22).
+ * The read is one `gh api` inside `record-review.sh`, and on this fleet every `gh`
+ * invocation first queues at the SHARED gh gate (`~/.pi/agent/shims/gh`), whose
+ * slot-acquire budget alone is 300s by default (`AGENT_GH_GATE_ACQUIRE_TIMEOUT`)
+ * before a single byte of HTTP is sent. So under fleet contention — the exact
+ * condition in which a dozen open PRs are waiting on the carry ARM — the child was
+ * killed at 60s WHILE THE GATE WAS STILL QUEUEING, `execFileSync` threw, and the
+ * caller received `null`.
+ *
+ * `null` is the arm's fail-closed signal, so nothing unsafe happened — but the
+ * refusal it produced was `head_advanced` ("the branch moved — re-review the new
+ * head"), i.e. a QUEUEING DELAY was rendered as a CONTENT CHANGE, and the lane paid
+ * a whole fresh review for a diff that never changed. That is the same speech-act
+ * error #1690 fixed for the head read ("an unreadable head is NOT a claim about
+ * reality"), in the diff dimension — so it gets the same treatment: a bound that
+ * outlasts the queue, and a refusal that says which of the two happened.
+ *
+ * The default mirrors the budget the HEAD read already waits under
+ * (`rateLimitMaxWaitMs`, 10 min): a diff read is the same kind of shared-pool call and
+ * was MEASURED at 399s end-to-end on 2026-10-22 while 40 PRs were open, so any bound
+ * below that class keeps killing reads that were merely queued. Raise it where the
+ * gate is configured with a longer acquire timeout. A genuinely unreachable API still
+ * ends in `null` — bounded, and now legible.
+ */
+export function diffHashReadTimeoutMs(): number {
+  // ⛔ A FULL-INTEGER PARSE, AND A FLOOR ON THE OVERRIDE. `parseInt` accepts any
+  // leading-integer prefix, so a human spelling like `10m` yielded TEN MILLISECONDS —
+  // the same killed-while-queueing read this function exists to prevent, silently
+  // reintroduced fleet-wide by a config value (review, #2353 P2). An override is an
+  // operator's stated intent, so a legitimate short value is honoured under test, but
+  // outside test a bound below the floor is ignored rather than trusted.
+  const raw = (process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS ?? "").trim();
+  const FLOOR_MS = 60_000;
+  if (/^[0-9]+$/.test(raw)) {
+    const explicit = Number.parseInt(raw, 10);
+    if (explicit > 0 && (explicit >= FLOOR_MS || process.env.NODE_ENV === "test")) return explicit;
+  }
+  const acquire = parseInt(process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT ?? "", 10);
+  const acquireMs = (Number.isInteger(acquire) && acquire > 0 ? acquire : 300) * 1000;
+  // NOTE: the read itself retries (record-review.sh DIFF_FETCH_ATTEMPTS=3), so a path
+  // whose every attempt queues can still outlast any single bound. That residual is
+  // declared rather than papered over: the failure is now `diff_unreadable` (RETRY),
+  // which is cheap and re-decidable, instead of a false "the content changed".
+  return Math.max(600_000, acquireMs + 120_000);
+}
+
+/**
  * The PR's live normalized three-dot diff digest, or null when it cannot be
  * computed. The repo is taken from the SAME resolved context the gate verified
  * the head through, and is RE-VALIDATED here (a `--repo` flag is user-controlled
  * text) before it reaches an argv element. Every failure — no repo, no helper,
  * no `gh`/`openssl`/`python3`, the 300-file cap, a network failure, a timeout —
  * returns null, which the gate reads as "no identity" and blocks on the head.
+ *
+ * ⛔ NULL MEANS "COULD NOT READ", NEVER "READ AND DIFFERS". The two are
+ * different operational events with different remedies (retry vs re-review), so
+ * the caller must not collapse them: `evaluateMergeGate`'s `diffReadFailed`
+ * argument exists to keep them apart at the one point that prints the remedy.
  */
 export function getPrLiveDiffHash(pr: number, ctx: RepoContext): string | null {
   return getPrLiveDiffHashObserved(pr, ctx).hash;
@@ -3617,7 +3813,7 @@ export function getPrLiveDiffHashObserved(
     // element, so no value here can be re-parsed as shell syntax.
     const out = execFileSync("bash", [helper, "--print-diff-hash", String(pr), repo], {
       cwd: ctx.cwd,
-      timeout: 60000,
+      timeout: diffHashReadTimeoutMs(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -3837,6 +4033,33 @@ export type MergeGateResult =
   | { status: "failopen"; warning: string }
   | { status: "allow"; message: string; carried?: boolean };
 
+/**
+ * #513/#2347 — the ONE place the "a fresh review is owed" recipe is written, per tier.
+ * Every arm that tells a lane to re-review uses it, so a future arm cannot re-introduce
+ * the three defects this text has already shipped with: a truncated sha (refused by
+ * record-review.sh, exit 2), a hardcoded `clean` laid over a tier verdict (a micro PR
+ * sent to the full standard review its tier exempts, a clean-low one told to re-record
+ * a shape it must re-derive), and `--evidence` promised to the two verdicts that accept
+ * it and drop it.
+ */
+export function freshReviewAdvice(verdict: string, pr: number): string {
+  const cmd = `${RECORD_SH} ${pr} <head_sha>`;
+  if (verdict === "clean-low") {
+    return (
+      "     → Re-derive the SHAPE rather than re-recording it: re-check whether the NEW head is still\n" +
+      `       content-only, then name the verdict explicitly — ${cmd} clean-low [owner/repo].\n` +
+      `       If it is no longer content-only, run the code-review skill and record ${cmd} clean [owner/repo] --evidence comment:<review-comment-id>.`
+    );
+  }
+  if (verdict === "clean-micro") {
+    return (
+      `     → Micro issue (complexity:micro): complete the micro flow, then ${cmd} clean-micro [owner/repo]\n` +
+      "       (no --evidence: clean-micro certifies the micro PROCESS, not a review artifact)."
+    );
+  }
+  return `     → Run the code-review skill, post its verdict as a PR comment, then ${cmd} clean [owner/repo] --evidence comment:<review-comment-id>`;
+}
+
 // Pure gate decision — separated from I/O so it is unit-testable.
 export function evaluateMergeGate(
   pr: number,
@@ -3851,6 +4074,20 @@ export function evaluateMergeGate(
   // failure. Every one of those is a FAILED READ, and a failed read is not a
   // matching read, so null blocks on the head binding like any other mismatch.
   currentDiffHash: string | null = null,
+  // #1351 — WHY `currentDiffHash` is null. The caller ATTEMPTED a read (the
+  // record carries a usable digest and the head moved) and it came back null:
+  // either the read failed, or the body was empty/non-diff/over the 300-file
+  // cap. That is NOT a statement that the content changed, and the two remedies
+  // are opposites (RETRY the merge vs pay for a fresh review), so the caller
+  // says which happened rather than letting the arm guess. Defaults to false
+  // because the common null is "never asked" (a matching head, or a legacy
+  // record with no digest), which must keep the unchanged `head_advanced` path.
+  //
+  // ⛔ ORDER: it is deliberately LAST. #2349's `observation` / `liveDiffReadReason`
+  // (below) are the two message inputs that landed on `main` while this branch was
+  // open, and they occupy positions 8-9 in every existing caller and test. Appending
+  // the flag after them keeps that contract intact instead of silently re-binding
+  // an observation object to a boolean parameter.
   // #2349: these two arguments are MESSAGE INPUTS ONLY. They reach a refusal's
   // text and nothing else — no branch below tests them, and no return value
   // depends on them (pinned by the "decision code" extraction in index.test.ts).
@@ -3860,6 +4097,7 @@ export function evaluateMergeGate(
   //                        moved-head arm (a failed READ is not a failed review).
   observation: ReviewRecordObservation | null = null,
   liveDiffReadReason: string | null = null,
+  diffReadFailed: boolean = false,
 ): MergeGateResult {
   if (!record) {
     // #285 Fix C: the emergency-bypass line is FALSE for task sub-agents — the
@@ -4002,6 +4240,67 @@ export function evaluateMergeGate(
         // allow and the refusal cannot describe the rule differently). A lane that has
         // only ever read refusals needs to learn this arm EXISTS.
         `   ⇒ ${RECORD_STATE_CARRY_ALLOWED}.`,
+    };
+  }
+  if (
+    record.head_sha !== currentHead &&
+    diffReadFailed &&
+    // The flag says the caller ATTEMPTED a read, and a read is only attempted
+    // when the record carries an identity. Requiring it here keeps the branch
+    // self-consistent even for a caller that sets the flag unconditionally: a
+    // record with NO usable digest can never be a "could not read" case, its
+    // remedy is the unchanged one, and the text below quotes the digest.
+    isDiffSha256(record.diff_sha256)
+  ) {
+    // #1351 — A FAILED READ IS NOT A CHANGED DIFF (#1690's speech act, in the
+    // diff dimension). We got here because the record DOES carry a usable
+    // digest and the head moved, i.e. the carry arm was REACHABLE — and then the
+    // live digest could not be read (a shared-gh-gate queue longer than the
+    // read bound, a rate-limit window, an empty/over-cap/non-diff body, a
+    // network failure). Rendering that as `head_advanced` told the lane to pay
+    // 20-40 minutes for a fresh review of content that may be byte-identical.
+    //
+    // FAIL CLOSED, and state the remedy that actually applies: RETRY. The retry
+    // is cheap and it re-asks the only question that decides. The `[diff_unreadable]`
+    // tag exists so the audit trail (gate-events.jsonl) can reconstruct these by
+    // reason — `head_advanced` was two different operational events behind one tag.
+    return {
+      status: "block",
+      reasonTag: "diff_unreadable",
+      reason: [
+        `❌ PR #${pr} head has moved (${record.head_sha.slice(0, 12)} → ${currentHead.slice(0, 12)}) and the`,
+        "   reviewed DIFF could not be READ, so it could not be compared.",
+        "   This is NOT a claim that the content changed — a read that failed is not a diff that differs.",
+        // #2349 — say WHAT the read reported. This arm is the one place that
+        // declares a failed read, so the reason #2349 threads through for the
+        // head-stale arm belongs here too; dropping it would make this refusal
+        // less informative than the narrower one it precedes.
+        `   What the read reported: ${liveDiffReadReason ?? "(no reason reported by the caller)"}`,
+        "   → RETRY the merge. A shared gh-gate queue, a rate-limit window or a transient API"
+        + " failure is far cheaper than a re-review, and the carry arm re-decides on every attempt.",
+        "   → Do NOT mint a fresh record for this: an unchanged diff CARRIES on the digest alone",
+        `     (record diff_sha256 ${record.diff_sha256!.slice(0, 12)}…).`,
+        "   → To see which case you are in without merging, compare the two digests:",
+        `     ${RECORD_SH} --print-diff-hash ${pr} ${ctx.repo ?? "<owner/repo>"}`,
+        `     (or in one step: ${RECORD_SH} --check-carry ${pr} ${ctx.repo ?? "<owner/repo>"}).`,
+        "   → Only if that prints a digest DIFFERENT from the record's is a fresh review owed:",
+        // ⛔ THREE DEFECTS HAVE LIVED ON THIS ONE LINE, each with its own wrong outcome
+        // (reviews, #2353 P1 + round 2 F1):
+        //   1. a TRUNCATED sha (`${currentHead.slice(0,12)}…`) LOOKS runnable — the two
+        //      lines above ARE literal — and record-review.sh refuses anything short of
+        //      40 hex with exit 2, so the advice dead-ended at the moment a lane tried to land;
+        //   2. a hardcoded `clean` overrode the TIER: a micro PR was sent to the full
+        //      standard review its tier exempts, and a clean-low one was told to re-record at
+        //      the same verdict — which the sibling arm at `head_advanced` forbids verbatim,
+        //      because that shape must be RE-DERIVED rather than carried forward;
+        //   3. `--evidence` was appended unconditionally although only `clean` binds
+        //      evidence (clean-micro/clean-low accept it and drop it), promising an artifact
+        //      the record would not carry.
+        // So the recipe is TIER-AWARE — written once, in `freshReviewAdvice` below, which
+        // every "a fresh review is owed" arm shares — and `<head_sha>` is the placeholder
+        // every neighbouring arm uses.
+        freshReviewAdvice(record.verdict, pr),
+      ].join("\n"),
     };
   }
   if (record.head_sha !== currentHead) {
@@ -5834,15 +6133,30 @@ export default function (pi: ExtensionAPI) {
         // head block — never to an accept). The read is the SAME normalized
         // digest the record stores and the GitHub gate computes, so the two
         // gates cannot disagree about what "reviewed" means.
+        // #1351 — fetch the PR's LIVE diff digest only when it can change the
+        // verdict: a record that carries a usable `diff_sha256` AND a head that
+        // has actually moved. Nothing else reads it, so a matching head must not
+        // pay for the read (the head binding already allows), and a record
+        // without the field must not either (its absence falls through to the
+        // head block — never to an accept). The read is the SAME normalized
+        // digest the record stores and the GitHub gate computes, so the two
+        // gates cannot disagree about what "reviewed" means.
+        const diffReadAttempted =
+          !!record && isDiffSha256(record.diff_sha256) &&
+          currentHead !== null &&
+          record.head_sha !== currentHead;
         // #2349: the live digest read reports WHY it yielded nothing, for the refusal
         // text only (a failed READ is not a failed review). The DECISION still consumes
         // `currentDiffHash` and nothing else, through the same predicate as before.
-        const liveDiffRead = record && isDiffSha256(record.diff_sha256) &&
-          currentHead !== null &&
-          record.head_sha !== currentHead
-            ? getPrLiveDiffHashObserved(prNumber, ctx)
-            : { hash: null, reason: null };
+        const liveDiffRead = diffReadAttempted
+          ? getPrLiveDiffHashObserved(prNumber, ctx)
+          : { hash: null, reason: null };
         const currentDiffHash = liveDiffRead.hash;
+        // #1351: an ATTEMPTED read that came back null is a FAILED READ — never a
+        // changed diff. Without this the arm cannot tell "the content moved" from
+        // "the shared gh gate queued longer than the read bound", and its refusal
+        // told the lane to re-review in both cases (measured 2026-10-22).
+        const diffReadFailed = diffReadAttempted && currentDiffHash === null;
         // #2349: the registry observation, taken ONCE and passed to the gate as a
         // MESSAGE INPUT. `record` above is still what `readReviewRecord` returned —
         // the observation is never consulted for a decision.
@@ -5851,7 +6165,7 @@ export default function (pi: ExtensionAPI) {
         // sub-agents get the "parent must record the review" variant).
         const result = evaluateMergeGate(
           prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase, currentDiffHash,
-          recordObservation, liveDiffRead.reason
+          recordObservation, liveDiffRead.reason, diffReadFailed
         );
         if (result.status === "block") {
           // #2349: name the state in the line the operator reads, reusing the SAME

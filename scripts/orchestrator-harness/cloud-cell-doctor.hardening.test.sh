@@ -344,6 +344,14 @@ chmod +x "$T/bin/cwdprobe"
 export LO_CWD_PROBE="$T/bin/cwdprobe" FAKE_CWD="$T/nowhere-unheld"
 export REAP_MIN_S=60 REAP_SAMPLE_S=2 DOCTOR_INTERVAL=1 MERGE_INTERVAL=1 HYGIENE_INTERVAL=1
 export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
+# ⛔ HERMETIC REGISTRY. This suite drives the REAL roles (the `status` fixture), so the hygiene pass
+# would resolve the SHIPPED `registry-sync.sh` beside this file and perform a real `ls-remote`/fetch
+# of the fleet's 3201 `refs/reviews/*` records against the checkout's real `origin` — and it would
+# provision a worktree in that checkout to do it. That is the #2374 lesson `atomic-land.sh` records
+# (its suite ran two real round trips per invocation), one role over; the seam turns it into a
+# stated skip. The registry's OWN behaviour is covered in cloud-cell-doctor.test.sh against a real
+# local store, which is where a network-shaped assertion belongs.
+export DOCTOR_REGISTRY_SYNC=off
 mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/stat" "$T/lane-reap"
 
 doc() { # <role> [extra env assignments via env]

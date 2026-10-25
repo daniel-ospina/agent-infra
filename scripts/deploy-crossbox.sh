@@ -92,9 +92,16 @@ fi
 say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present)"
 
 # ── 4. restart the controller, cold, with HOME carried into tmux ──────────────
+# ⛔ `unset GH_REPO` AFTER `set +a` (#2235). `keys.env` is re-sourced INSIDE the session, so a
+# global `export GH_REPO=…` in it answers every `gh` call that omits `--repo` from this controller
+# onward — the fail-open that made `admin-merge.sh 2232` print '✅ PR #2232 is ALREADY MERGED' for a
+# September TORTOISE PR over an open agent-infra one, exit 0. This is the fourth place that creates
+# a session (with the supervisor's two and cloud-cell-quiesce.sh's one), so it carries the same
+# strip; `cloud-cell-supervisor.test.sh` sweeps every session creator for it rather than naming
+# files, so a fifth cannot be forgotten.
 say "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
 tmux new-session -d -s orch -c "$H" \
-  "set -a; [ ! -f '$CELL_HOME/keys.env' ] || . '$CELL_HOME/keys.env'; set +a; \
+  "set -a; [ ! -f '$CELL_HOME/keys.env' ] || . '$CELL_HOME/keys.env'; set +a; unset GH_REPO; \
    PATH='$O/gh-limit':\"\$PATH\" \
    HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' MAX_LANES='$MAX_LANES' \
    bash '$H/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"

@@ -1,0 +1,12 @@
+# A quoted group containing a COMMA was truncated at the comma by a blind split, so the per-commit
+# variable after it vanished and an inert block read GREEN; the same group in block form is refused
+# (#2660 round 8).
+name: PR flow group comma sha
+on:
+  pull_request:
+concurrency: {group: "${{ github.workflow }}-${{ github.ref }},${{ github.sha }}", cancel-in-progress: true}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
