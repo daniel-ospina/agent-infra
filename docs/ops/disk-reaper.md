@@ -193,12 +193,26 @@ cannot name its evidence is visibly a bug rather than a verdict:
 |---|---|---|
 | 1 | a process has the tree, or **any path inside it**, as cwd, or names it in argv | KEEP |
 | 2 | dirty, or a clean gate that cannot be evaluated | KEEP |
-| 3 | clean + HEAD is an ancestor of `origin/main` | REMOVE |
-| 4 | clean + the PR **whose `headRefOid` IS this commit** is `MERGED` (merge, squash or rebase) | REMOVE |
+| 3 | clean + HEAD is an ancestor of `origin/main` | REMOVE || 4 | clean + the PR **whose `headRefOid` IS this commit** is `MERGED` (merge, squash or rebase) | REMOVE |
 | 5 | clean + PR `CLOSED` unmerged + head not an ancestor | KEEP, and **name the PR** |
 | 6 | clean + no PR matches this head, still inside the floor in force | KEEP (`no PR — cannot prove it is landed`) |
 | 7 | younger than `REAP_WT_MIN_AGE_MINUTES` (45) | KEEP |
 | P | pre-existing gates: main/self checkout, `worktree lock`, unreadable path, bare repo, OPEN PR head, commit held only by a revocable ref, detached on no ref. Past the floor in force, a clean no-PR checkout whose commits survive on a branch is REMOVED by the pre-existing #1095 aged rule (`rule=P … no-pr=`) — rule 6 is the KEEP row and never labels a removal | KEEP |
+
+**What "main" is, and why it is not the local cache.** Rules 3-4 both prove a head is
+*landed*, so the answer is only as good as the `main` it is compared against. The local
+`refs/remotes/origin/main` is a **cache** and can lag the remote by hours, which would
+let a pass prove "merged into main" against a stale tip. `REAP_WT_MAIN_PROOF=auto`
+(default) therefore asks the remote that PUSHES (`git remote get-url --push --all`,
+one url or none) which branch it calls HEAD (`ls-remote --symref`) and then reads that
+exact ref — so a `master`- or `dev`-default repo is not silently proved against a `main`
+that does not exist there. The remote oid is tried FIRST and the local ref chain
+SECOND, every failure mode (`unavailable`, `ambiguous` for two push urls,
+`auto-unfetched` when the remote's oid is not in this repository) claims **no**
+evidence rather than falling back silently, and `REAP_WT_MAIN_PROOF=local` forces the
+local chain — which is the test seam and what keeps every fixture offline. The proof
+that was used is printed on every row (`main_proof=`), so a verdict can never cite a
+source it did not read.
 
 **Rule 4 is why this exists.** `git merge-base --is-ancestor` cannot see a squash
 merge: the branch head is not an ancestor of `main` even though the work landed. So a
@@ -426,6 +440,28 @@ is a zero: the pass prints `freed_df=unmeasured` and records the classes in `fre
 the `detail` line. A reader must treat both sentinels as "no measurement", never as a byte count (the
 supervisor prints the raw value; the total is the sum of the classes that WERE measured).
 
+⛔ **The worktree class is REPORTED, not just counted.** `pi-reap-worktrees.sh` ends every pass with
+ONE machine-readable line —
+
+```
+SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferred_remove=<n>
+        removed=<n> failed=<n> late_preserved=<n> prune_blocked=<0|1> reasons=<reason>:<n>,…
+        main_proof=<auto|local|unavailable|auto-unfetched|ambiguous> pr_merged=<ok|na|unavailable>
+```
+
+— and the record lifts it into `candidates_worktree=` (the delegate's own `remove=`),
+`classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=` and
+`pr_merged=`. `examined = classified + deferred` and `classified = remove + preserved` are the two
+identities, and a deferred REMOVAL is its own counter: an armed overrun defers a record whose verdict
+was already `remove`, so folding it into `deferred` would deflate `preserved` and make the line
+contradict itself. `main_proof=` names which source proved "merged into main" (`auto` = the remote's
+own advertised default branch, `local` = the local ref chain, `unavailable`/`ambiguous`/
+`auto-unfetched` = no evidence claimed), and `pr_merged=` says whether the pass's batched
+`gh pr list` read was answerable at all. ⛔ **Every one of these fields reads `?` — never `0` — when
+the delegate ran but produced no tally**, and `not-run` when the class was not selected: a refusal
+(`FAIL-CLOSED gh unavailable`) is not a measurement, and a measured zero beside an unknown
+classification is the false PASS this record exists to remove.
+
 `watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
 `internal`, see **Bounded execution** above), so "the bound was real" is answerable
 from the record on macOS too.
@@ -551,7 +587,7 @@ when the last run has never happened, and when the pass record's own `rc` is one
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 375 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 590 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -608,6 +644,8 @@ when the last run has never happened, and when the pass record's own `rc` is one
 | T52 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder (#2159) |
 | T53 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is RED in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; a uv deferral cannot mask a venv removal failure across classes; and the `7` row is asserted on BOTH sides — uv `7` defers, a venv delegate's out-of-vocabulary `7` is RED (#2156, #2036) |
 | T54 | the stale threshold and the help text: a non-numeric `DISK_REAPER_STALE_SECONDS` is refused on read (never a green `status=ok`), and `--help` still reaches the end of the header — it carries the DEFERRED exit-code bullet and the watchdog pin, so the derived range is what is printing |
+| T58 | the INSTALLED ARTIFACT is read back before `enable --now`: a clean install says it read `ExecStart` + `HOME` out of the artifact; a `50-mask.conf` drop-in that REPLACES `ExecStart` makes the install refuse (naming the drop-in files that exist) and nothing is armed; removing it restores a clean install; an ADDED `ExecStart` (a pre-flight) is accepted and still verified; a drop-in that moves `Environment=HOME` is refused and names both HOMEs; and a `gh` that does not resolve is reported. It also pins the **wrapper preference** (`disk-reaper-run.sh` beside the reaper) on a deliberately UNPINNED install — nothing else measures it, and a timer-started raw reaper inherits no HOME/keys/`gh`, fails the open-PR gate closed and reclaims nothing (#2354) |
+| T58b | the plist **textual** fallback (no usable parser) still refuses a stale arming decision: a good artifact passes and the message names `EnvironmentVariables.HOME` as NOT verified; a stale one (no `--apply`) is refused, naming the missing flag |
 | T55 | **a full disk does not stop the pass** (#2443): an uncreatable state dir falls back to a tmpfs candidate — the classes RUN, the record is written with `state_dir=`/`state_dir_primary=` and says why, and the pass discloses it; the fallback lock is a REAL lock (a live holder still defers, 6); nothing writable anywhere is still a refusal naming every candidate; a writable configured dir produces the unchanged record; and the record returns to the configured path on the next pass once it can be written |
 
 ⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is
