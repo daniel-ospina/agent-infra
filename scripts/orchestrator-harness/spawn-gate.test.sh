@@ -953,7 +953,10 @@ export -f pi
 # SUCCESS for a run that did nothing. Driven with a claims.sh stub that refuses, and removed again so
 # the arms below are not diverted onto this path.
 # the deployed copies §10 uses; made here because this arm runs before §10's cp
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/adopt-fix.sh" "$RO/"
+# ⛔ AND THE IDENTITY MODULE GOES WITH THEM (#2762/#2694): adopt-fix.sh and fix-one.sh source
+# `$SELF/repo-target.sh` (and it sources repo-slug.sh), so a copy without them exits 78 — a
+# half-deployed box — instead of reaching the claim refusal this arm is about.
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RO/"
 printf '#!/bin/sh\nclaim_acquire() { CLAIM_RESULT="another box owns this head (test stub)"; return 1; }\n' > "$RO/claims.sh"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; rm -f "$RO/state/fixbail-7-"*
 ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
@@ -1060,7 +1063,12 @@ ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
 # ⛔ THE LANE'S CWD IS A WORKTREE OF THE TARGET REPO, ON THE BRANCH IT IS TOLD IT IS ON
 # (agent-infra#2724/#2694): lane.sh now refuses a wrong-repo worktree (72) and a worktree checked out
 # on a different named branch. These arms test the LOAD/DISK gate, so the fixture satisfies both.
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
+# ⛔ FROM THE WORKTREE THAT IS CHECKED OUT ON `work` (#2762 review, 6th cycle, P1). `$RREPO`'s HEAD is
+# `main` (the fixture creates `work` as a BRANCH and materialises `.worktrees/fix-7` on it), so running
+# the lane from `$RREPO` made the BRANCH assertion refuse 72 before the load gate was ever reached —
+# these two arms test the LOAD gate, so the fixture must satisfy the identity gate, exactly as the DISK
+# arm below already does.
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
 { [ "$lrc" -eq 75 ] && [ ! -s "$PI_LOG" ] && [ -s "$RO/logs/prompt-9999.txt" ]; }; rc=$?
 ck "lane.sh on a refused load exits 75, writes the prompt, and NEVER spawns (rc=$lrc)" $rc
