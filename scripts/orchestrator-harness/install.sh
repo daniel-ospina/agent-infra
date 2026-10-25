@@ -128,9 +128,37 @@ CYC="${CYC:-240}"
 # silently evaporate the pin — the exact failure the whole SCOPE override exists to prevent.
 [ -z "${SCOPE+x}" ] && SCOPE=auto
 
+# ⛔ THE LABEL IS A SEAM ONLY FOR A SANDBOX (agent-infra#1996). launchd labels are GLOBAL: a plist
+# rendered under a throwaway $HOME still addresses the PRODUCTION job by name when it carries the
+# production label, so `launchctl bootout <sandbox plist>` — and any `-w` verb — reaches the job the
+# box is actually running. A test that answers a production label is therefore a false PASS on the one
+# thing the test exists to prove it is not touching. selftest.sh installs
+# `com.eldato.orchestrator-loop-test`, and `label_guard()` below refuses a non-default label on the
+# invoking user's real $HOME.
+BASE_LABEL="com.eldato.orchestrator-loop"
+# ⛔ THIS LINE STAYS A QUOTED LITERAL. `scripts/test_pr_doctor.py` pins pr-doctor's plist name to it
+# with `^LABEL="([^"]+)"` — written as an expression the pin still MATCHES but then compares against
+# `${LABEL:-$BASE_LABEL}.plist`, i.e. it asserts a name nothing installs and the regression it exists
+# for (a renamed label silently making pr-doctor read capacity 3/4) returns. The sandbox override is
+# therefore a SEPARATE line.
 LABEL="com.eldato.orchestrator-loop"
+[ -n "${LABEL_OVERRIDE:-}" ] && LABEL="$LABEL_OVERRIDE"
+# The OTHER production label: the recovery agent PR #1986 ships (`watchdog.plist.template`). It is
+# listed here so `label_guard` treats it as production too — the guard's rule is about the LIVE jobs,
+# and a second production label that the guard did not know about would be installable from a sandbox.
+PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 TEMPLATE="$HERE/launchd.plist.template"
+# The invoking user's REAL home, from the passwd database rather than $HOME — that is the whole point
+# of the comparison, and `~user` expansion (not "$HOME") is what supplies it.
+# ⛔ BOTH SIDES CANONICALISED. A raw string compare reads a trailing slash (`HOME=/Users/me/`) as a
+# DIFFERENT home, so a real box reports itself as a sandbox and the guard refuses a production install
+# on the operator's own machine. Physical resolution also matches what launchd does with the path.
+_canon_dir() { ( cd "$1" 2>/dev/null && pwd -P ) || printf '%s' "$1"; }
+REAL_HOME="$(_canon_dir "$(eval printf '%s' "~$(id -un)" 2>/dev/null || true)")"
+HOME_C="$(_canon_dir "$HOME")"
+IS_SANDBOX=0
+[ -n "$REAL_HOME" ] && [ "$HOME_C" != "$REAL_HOME" ] && IS_SANDBOX=1
 # Seconds to wait for the label to show a pid AND for $O/heartbeat to advance after a start. The loop
 # writes the heartbeat at the TOP of every cycle, so a live controller refreshes it within seconds of
 # being launched; 30s is slack for a cold start, not a cycle's worth of work.
@@ -146,6 +174,40 @@ START_TIMEOUT="${START_TIMEOUT:-30}"
 die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
+
+# ── the LABEL guard: a non-default label is a sandbox seam, never a real install ─────────────
+# ⛔ A FUNCTION, NOT AN INLINE `if`, FOR ONE REASON: the decision has to be DRIVEN by selftest in both
+# directions, and a test that would have to run the installer on the real $HOME to prove the refusal is
+# a test that writes into the operator's LaunchAgents when the guard is broken. The decision is pure —
+# label, HOME, real home — so it is expressed as one and extracted.
+# ⛔ THE RULE IS AN XOR, NOT A HALF (review catch, 2026-10-18): a label is allowed only when it MATCHES
+# the $HOME it will be rendered into — production on the real home, test in a sandbox. Refusing only
+# `test label on the real home` leaves the MILD direction guarded and the one that reaches the live
+# controller open, because launchd resolves the label in the USER DOMAIN and ignores $HOME.
+label_guard() { # <label> <HOME> <real-home> -> 0 allowed, 1 refused (with the reason on stderr)
+  local label="$1" home="$2" real="$3" prod=0
+  case "$label" in "$BASE_LABEL"|"$PROD_WD_LABEL") prod=1 ;; esac
+  [ -n "$real" ] || return 0          # no passwd entry to compare against: nothing to protect
+  # ⛔ AND THE #446 TEST OPT-IN DOES **NOT** LIFT THIS ONE, deliberately. `ELDATO_ALLOW_TEST_HOME=1`
+  # authorises a sandbox HOME for launchd-cycle.sh's guard; it says nothing about WHICH job is
+  # addressed. The two are not the same question, and the whole seam exists because launchd resolves
+  # the label in the user domain and ignores `$HOME`: with the opt-in honoured here, a stray export
+  # would let a throwaway home address the LIVE controller — the exact failure this guard prevents.
+  # A suite that installs into a fixture `$HOME` therefore installs a TEST label (`LABEL_OVERRIDE`),
+  # which is what selftest.sh and install-launchd-durability.test.sh do.
+  if [ "$home" = "$real" ] && [ "$prod" = "0" ]; then
+    printf 'LABEL=%s on the real $HOME (%s): a non-default label is a SANDBOX seam (selftest.sh) — production installs the %s job. Refusing, so a test can never write into the live LaunchAgents.\n' \
+      "$label" "$home" "$BASE_LABEL" >&2
+    return 1
+  fi
+  if [ "$home" != "$real" ] && [ "$prod" = "1" ]; then
+    printf 'LABEL=%s under a non-real $HOME (%s; the real home is %s): a PRODUCTION label is refused outside the real home — launchd resolves the label in the user domain and IGNORES $HOME, so a plist written here still addresses the live controller and a `-w` verb would disable it. Use LABEL_OVERRIDE=<name>-test for a sandbox install.\n' \
+      "$label" "$home" "$real" >&2
+    return 1
+  fi
+  return 0
+}
+case "$LABEL" in ''|*/*|*' '*) die "LABEL='$LABEL' is not a usable launchd label" ;; esac
 
 # ── the launchd lifecycle seam ───────────────────────────────────────────────────
 # ⛔ ONE implementation for THIS job's lifecycle, sourced — never a second copy of the
@@ -170,6 +232,14 @@ case "${1:-}" in
   --uninstall) ACTION=uninstall ;;
   *) die "unknown argument '$1' (accepted: --start, --restart, --uninstall, or no argument)" ;;
 esac
+
+# ⛔ ABOVE THE `--uninstall` BRANCH, WHICH IS THE POINT (review catch, 2026-10-18). `--uninstall`
+# addresses the job BY LABEL, and launchd ignores $HOME — so an uninstall run from a sandbox $HOME
+# carrying the production label would silence the live controller by name: exactly the failure the
+# seam exists to prevent, arriving through the one branch that does not render. The config checks
+# below stay AFTER this branch (an uninstall must not be blocked by a REPO or SCOPE typo it does not
+# use); the label guard cannot follow that rule, because uninstall DOES use the label.
+label_guard "$LABEL" "$HOME" "$REAL_HOME" || exit 1
 
 # ── uninstall ────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = uninstall ]; then
@@ -1126,6 +1196,7 @@ sed \
   -e "s|__HARNESS_REPO__|$(esc "$HARNESS_REPO")|g" \
   -e "s|__HARNESS_MATERIALISER__|$(esc "$MAT_FOR_PLIST")|g" \
   -e "s|__O__|$(esc "$O")|g" \
+  -e "s|__LABEL__|$(esc "$LABEL")|g" \
   -e "s|__REPO__|$(esc "$REPO")|g" \
   -e "s|__OR__|$(esc "$OR")|g" \
   -e "s|__SCOPE__|$(esc "$SCOPE")|g" \
@@ -1269,7 +1340,7 @@ DRIFTED=""
 # `$O/nochk-resolve.py`. A `$O` with the new `orch-loop.sh` and an OLD file set classifies EVERY PR as
 # `V=""` — no merge arm, no fixer, the controller silently stops working — and the only trace is one
 # startup warning. That is exactly the partial-reseed drift this list exists to catch.
-for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
