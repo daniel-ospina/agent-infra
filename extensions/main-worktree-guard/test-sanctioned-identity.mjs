@@ -425,7 +425,13 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     // stand-down rests on a path an agent can reproduce — which is the fail-open it replaced.
     const M6 = {
       name: "M6 body-arm-digest-dropped",
-      from: 'return got !== null && got === want;',
+      // The anchor tracks the CURRENT body of `_isAuditedSanctionedScript`, re-cut on
+      // 2026-10-24 when `bodyDigest` became a REQUIRED parameter and the disk-read fallback was
+      // removed; the previous anchor (`got !== null && got === want`) no longer occurs there.
+      // `deploy()` refuses to run a mutation whose anchor is absent (`fatal()` → nonzero exit),
+      // so a stale anchor reds this suite rather than silently testing unmutated code — which
+      // is why re-cutting it is a one-line maintenance task and not a silent hole.
+      from: 'return typeof want === "string" && want.length === 64 && bodyDigest === want;',
       to: 'return true; // MUTATION M6: the body-arm digest dropped — the anchor alone grants',
     };
     const m6 = await loadGuard(join(work, "mut-m6"), M6);

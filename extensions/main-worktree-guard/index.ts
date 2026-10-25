@@ -3681,6 +3681,12 @@ function _worktreeDiscardBlock(command: string): string | null {
   const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>();
   const gatedSets = sets.filter((s) => {
     if (s.script === null) return true; // the command's own argv is never exempt
+    // ⛔ PATH-ONLY, and therefore a KNOWN FAIL-OPEN (#2775) — same shape as the #1129 skip
+    // above: arm 1 of `_sanctionedScriptExemption` is path-keyed by spec, so a destructive
+    // script minted at a sanctioned relpath under the module's own root has its discards
+    // dropped from the set instead of being gated. Tracked as #2775 (with the measured
+    // reproduction); when it is closed, this decision must be keyed on the body's digest
+    // (`_sha256OfBody` + `_sanctionedScriptPin`), not on the path.
     let rel: string | null = null;
     // Fail closed on a probe failure: keep the set gated.
     try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script))?.rel ?? null; } catch { rel = null; }
@@ -4047,43 +4053,6 @@ const _frameworkRoot: string | null = (() => {
  *  is intentional: once the closure is pinned, WHERE the audited program runs
  *  from does not change what it does, and pretending the anchor is narrower than
  *  it is would be the more dangerous error. */
-/** #2332 / #1485 — TRUE only when `resolved` is a sanctioned script whose bytes ARE the
- *  pinned, audited ones: arm 1 or arm 2 of `_sanctionedScriptExemption`, PLUS the digest.
- *
- *  ⛔ The digest is not belt-and-braces. `_sanctionedScriptExemption`'s arm 1 is PATH ONLY,
- *  deliberately (it is the pre-existing `~/.pi/agent` anchor, kept unchanged by #2332), so
- *  "the exemption applied" is ALSO true for arbitrary bytes written to a sanctioned relpath
- *  under the module's own root — which on a copy-deployed box (a real `scripts/` copy inside
- *  `~/.pi/agent`, which is not a git checkout and so is outside the write gate) an agent can
- *  mint. A caller that stands down a CONTENT-derived refusal is making a claim about the
- *  BYTES, so it must ask THIS question and never `_sanctionedScriptExemption(...) !== null`.
- *  The difference is measurable: at review, an unaudited `#!/bin/bash` + `bash ./undo*.sh`
- *  minted at a farm relpath was BLOCKED before such a stand-down and ALLOWED after it — the
- *  #1228 fail-open (silent destruction of other sessions' uncommitted work) that this
- *  helper's digest check keeps shut.
- *
- *  Both arms are considered, because both anchors were already trusted by their own
- *  callers; the digest then narrows BOTH to the shipped bytes.
- *
- *  ⛔ `bodyDigest` EXISTS BECAUSE OF A TOCTOU, not for tidiness: the callers below hold a
- *  body they ALREADY READ (`readFileSync(real, "utf8")`), and comparing a digest re-read
- *  from the same path pairs "the body I judged" with "the bytes I hashed" only if nothing
- *  writes the file in between — and an agent may run a writer concurrently. Hashing the
- *  bytes in hand makes the pairing true by construction. This mirrors the pin's own reason
- *  for being read at load (`_sanctionedScriptPin`): any read that happens AFTER the process
- *  started is a read an agent can influence. Callers that hold no body (the two walks pass
- *  the text they just read, so they pass it too) fall back to the disk read. */
-function _isAuditedSanctionedScript(resolved: string, bodyDigest?: string | null): boolean {
-  let real: string;
-  try { real = realpathSync(resolved); } catch { return false; }
-  const sa = _sanctionedScriptExemption(real);
-  if (sa === null) return false;
-  const want = _sanctionedScriptPin().sha256[sa.rel];
-  if (typeof want !== "string" || want.length !== 64) return false;
-  const got = bodyDigest === undefined ? _sha256Of(real) : bodyDigest;
-  return got !== null && got === want;
-}
-
 function _sanctionedScriptExemption(resolvedScript: string): { rel: string; via: "module-root" | "identity" } | null {
   let real: string;
   try {
@@ -4125,6 +4094,42 @@ function _sanctionedScriptExemption(resolvedScript: string): { rel: string; via:
   return null;
 }
 
+/** #2332 / #1485 — TRUE only when `resolved` is a sanctioned script whose bytes ARE the
+ *  pinned, audited ones: arm 1 or arm 2 of `_sanctionedScriptExemption`, PLUS the digest.
+ *
+ *  ⛔ The digest is not belt-and-braces. `_sanctionedScriptExemption`'s arm 1 is PATH ONLY,
+ *  deliberately (it is the pre-existing `~/.pi/agent` anchor, kept unchanged by #2332), so
+ *  "the exemption applied" is ALSO true for arbitrary bytes written to a sanctioned relpath
+ *  under the module's own root — which on a copy-deployed box (a real `scripts/` copy inside
+ *  `~/.pi/agent`, which is not a git checkout and so is outside the write gate) an agent can
+ *  mint. A caller that stands down a CONTENT-derived refusal is making a claim about the
+ *  BYTES, so it must ask THIS question and never `_sanctionedScriptExemption(...) !== null`.
+ *  The difference is measurable: at review, an unaudited `#!/bin/bash` + `bash ./undo*.sh`
+ *  minted at a farm relpath was BLOCKED before such a stand-down and ALLOWED after it — the
+ *  #1228 fail-open (silent destruction of other sessions' uncommitted work) that this
+ *  helper's digest check keeps shut.
+ *
+ *  Both arms are considered, because both anchors were already trusted by their own
+ *  callers; the digest then narrows BOTH to the shipped bytes.
+ *
+ *  ⛔ `bodyDigest` EXISTS BECAUSE OF A TOCTOU, not for tidiness: the callers below hold a
+ *  body they ALREADY READ (`readFileSync(real, "utf8")`), and comparing a digest re-read
+ *  from the same path pairs "the body I judged" with "the bytes I hashed" only if nothing
+ *  writes the file in between — and an agent may run a writer concurrently. Hashing the
+ *  bytes in hand makes the pairing true by construction. This mirrors the pin's own reason
+ *  for being read at load (`_sanctionedScriptPin`): any read that happens AFTER the process
+ *  started is a read an agent can influence. The digest is therefore REQUIRED: every call
+ *  site has the body in hand, and there is deliberately no disk-read fallback for a caller
+ *  that does not, because that fallback is the defect this parameter exists to remove. */
+function _isAuditedSanctionedScript(resolved: string, bodyDigest: string): boolean {
+  let real: string;
+  try { real = realpathSync(resolved); } catch { return false; }
+  const sa = _sanctionedScriptExemption(real);
+  if (sa === null) return false;
+  const want = _sanctionedScriptPin().sha256[sa.rel];
+  return typeof want === "string" && want.length === 64 && bodyDigest === want;
+}
+
 /** The execution the exemption actually grants is leaf PLUS everything the leaf
  *  executes. `admin-merge.sh` runs `$SELF_DIR/ci_exemption.py` (the exemption
  *  GRADER) and `gh-shim/gh` runs `$SELF_DIR/../verify-admin-merge-evidence.sh`
@@ -4152,12 +4157,6 @@ function _delegationClosurePinned(root: string, delegates: Record<string, string
 
 /** sha256 of a file, or null when it cannot be read (callers compare against a
  *  digest, so null never equals one — the fail-closed direction). */
-/** sha256 of the IN-MEMORY body a caller already holds — the TOCTOU-free form for a
- *  decision about specific bytes (see `_isAuditedSanctionedScript`'s `bodyDigest`). */
-function _sha256OfBody(body: string): string {
-  return createHash("sha256").update(body, "utf8").digest("hex");
-}
-
 function _sha256Of(path: string): string | null {
   try {
     return createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -4165,6 +4164,13 @@ function _sha256Of(path: string): string | null {
     return null;
   }
 }
+
+/** sha256 of the IN-MEMORY body a caller already holds — the TOCTOU-free form for a
+ *  decision about specific bytes (see `_isAuditedSanctionedScript`'s `bodyDigest`). */
+function _sha256OfBody(body: string): string {
+  return createHash("sha256").update(body, "utf8").digest("hex");
+}
+
 
 /** Is `root` a framework CHECKOUT (the `isAgentInfraRepo` fingerprint, read
  *  from disk so this stays a pure path probe with no git invocation)? Arm 2
@@ -4295,6 +4301,13 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // content walk (see SANCTIONED_SCRIPT_RELPATHS for why this is a named
     // list keyed on the guard's own checkout). Deliberate gate relaxation →
     // audited (best-effort, never blocks) so the exemption is observable.
+    // ⛔ THIS CALL SITE IS PATH-ONLY AND THEREFORE A KNOWN FAIL-OPEN (#2775): it takes
+    // `_sanctionedScriptExemption`'s arm 1, which is path-keyed by spec, so arbitrary bytes
+    // planted at a sanctioned relpath under the module's own root skip the walk — the very
+    // hole `_isAuditedSanctionedScript`'s docblock warns about, still open HERE. Not closed in
+    // the 2026-10-24 #1228 fix because tightening it blocks the mandated rail on every box
+    // whose copy-deployed `~/.pi/agent/scripts` is not yet refreshed to the pin. Tracked as
+    // #2775; the digest must be carried into this decision when it is closed.
     const sanctionedMatch = _sanctionedScriptExemption(resolved);
     if (sanctionedMatch) {
       try {
