@@ -1085,6 +1085,73 @@ resolve_queue_target || true
 # keys.env happened to carry, and not a default.
 OR="$QUEUE_REPO"
 
+# ── #2235: `GH_REPO` IS PER-INVOCATION STATE, NEVER CELL STATE ─────────────────────────────────
+# `keys.env` on every cell exported `GH_REPO=daniel-ospina/tortoise` GLOBALLY. gh's own resolution is
+# flag > `GH_REPO` > the local checkout, so EVERY call that did not pass `--repo` answered for
+# tortoise while the cell graded agent-infra: measured twice in one session (2026-10-20/21), a rail
+# printed
+#   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+#                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+# for a SEPTEMBER tortoise PR, exit 0, over an open agent-infra PR — and the same leak produced
+# `GraphQL: Could not resolve to a PullRequest with the number of 2231` for real open PRs. Four
+# agent-infra PRs looked "already merged" while unmerged on origin/main.
+#
+# TWO INDEPENDENT EDITS, because either one alone leaves the defect reachable:
+#   1. THIS CHECK — a cell whose env carries a GH_REPO naming a DIFFERENT repo than the checkout the
+#      controller runs in is a STOP-WORK condition (the same class and shape as the queue/checkout
+#      mismatch above: a wrong pair must not be a cell that starts and looks healthy). It is checked
+#      against $QUEUE_DERIVED — the repo READ FROM the checkout's own origin — which is exactly the
+#      subject #2235 names, and against $QUEUE_REPO when the origin could not be read.
+#   2. THE SESSION COMMANDS below carry `unset GH_REPO` AFTER `$ENV_FILE` is sourced. The check alone
+#      would be bypassed by any path that creates a session without calling it, and keys.env is
+#      re-sourced INSIDE the session command — so the strip has to live where the sourcing happens.
+#      A correct value is stripped too: the rail resolves its own repo by evidence now, so a global
+#      export buys nothing and only arms the next leak.
+assert_gh_repo_conformance() {
+  [ -n "${GH_REPO:-}" ] || return 0
+  local want="${QUEUE_DERIVED:-$QUEUE_REPO}" have got got_src _h="" _whost=""
+  got_src="the checkout's origin remote"
+  if [ -z "$want" ]; then
+    die "GH_REPO is set ($GH_REPO) but this cell's CHECKOUT repo could not be read, so it cannot be verified against the tree the controller would grade ('git -C $REPO remote get-url origin' => '${QUEUE_REMOTE:-<none>}'). A global GH_REPO is what produced the #2235 fail-open — gh gives it precedence over the checkout for every call that does not pass --repo, so the rail graded daniel-ospina/tortoise PRs while reporting on agent-infra ones. Remove the GH_REPO line from $ENV_FILE (it is per-invocation state, not cell state); the controller resolves its repo from the checkout."
+  fi
+  [ "$want" = "$QUEUE_REPO" ] || got_src="the queue target"
+  have="$(printf '%s' "$GH_REPO" | tr '[:upper:]' '[:lower:]')"
+  # ⛔ `[HOST/]OWNER/REPO` IS THE DOCUMENTED FORM (`gh help environment`), so `github.com/o/r`
+  # names the SAME repo as `o/r` and must not be graded as a different one — comparing verbatim
+  # made `check` FATAL on a cell whose keys.env used the documented spelling (§2235 review P2).
+  # The leading segment is dropped only when it IS a host (dotted, or this checkout's host).
+  case "$have" in
+    */*/*)
+      _h="${have%%/*}"
+      case "$_h" in
+        *.*|*:*)
+          # ⛔ THE CHECKOUT'S OWN HOST IS PARSED FROM `$QUEUE_REMOTE`, NOT FROM A VARIABLE THAT
+          # IS NEVER ASSIGNED (#2235 review round 3, P2): the first cut referenced
+          # `${QUEUE_HOST:-}`, which appears nowhere else in the repo — so `[ "$_h" = "" ]` was
+          # always false and a GHE checkout could not accept `GH_REPO=ghe.corp/o/r`, while the
+          # RAIL (which does read its own remote host) accepted it. Two authorities grading one
+          # input two ways is the #1856 shape; the evidence is the remote this cell already read.
+          _whost="${QUEUE_REMOTE:-}"
+          case "$_whost" in
+            *://*) _whost="${_whost#*://}" ;;
+            *@*:*) _whost="${_whost%%:*}" ;;
+            *)     _whost="" ;;
+          esac
+          _whost="${_whost%%/*}"; _whost="${_whost#*@}"; _whost="${_whost%%:*}"
+          _whost="$(printf '%s' "$_whost" | tr '[:upper:]' '[:lower:]')"
+          if [ "$_h" = "github.com" ] || { [ -n "$_whost" ] && [ "$_h" = "$_whost" ]; }; then
+            have="${have#*/}"
+          fi ;;
+      esac ;;
+  esac
+  got="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
+  if [ "$have" != "$got" ]; then
+    die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering: this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)"
+  fi
+  say "ok: GH_REPO ('$GH_REPO', from $ENV_FILE or the ambient shell) names this checkout's repo ($want, case-insensitively) — it is stripped from the controller session anyway (#2235)"
+  return 0
+}
+
 # The named REFUSAL, in the shape `apply` uses when it declines because a controller is running — not
 # a warning. A wrong pair must not be a cell that starts and looks healthy; it must be a cell that
 # does not start, with an error naming BOTH values, the remote that was read, and the repo this
@@ -1946,6 +2013,7 @@ cmd_check() {
   # validate_scope).
   assert_queue_target
   say "ok: queue $QUEUE_REPO == checkout $REPO (origin $QUEUE_REMOTE) — $QUEUE_STATE"
+  assert_gh_repo_conformance
   cmd_check_disk
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
   # orch-loop.sh spawns its workers as `bash '$O/<script>'` (fix-one.sh, merge-one.sh, …), NOT
@@ -2331,6 +2399,10 @@ cmd_start() {
   # for a pair that is wrong. Placed here, ahead of the return and of every write below, so nothing
   # is seeded and no session is created on a refusal.
   assert_queue_target
+  # #2235: a global GH_REPO is a wrong-pair config of the same class as the queue/checkout mismatch,
+  # and it must refuse START (not merely be stripped) so the misconfiguration is surfaced rather than
+  # silently absorbed. The session commands below strip it either way.
+  assert_gh_repo_conformance
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.
