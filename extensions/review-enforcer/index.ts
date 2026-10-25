@@ -2674,6 +2674,362 @@ export function reviewRecordFile(repo: string | undefined, pr: number): string {
     : resolvePath(dir, `${pr}.json`);
 }
 
+/**
+ * #2287/#2148 (measured 2026-10-22, this lane): the ≥1-dispatch floor counted ONLY
+ * the in-session `task`/`subagent` tool_result, so a lane that obtained its review
+ * from a SPAWNED reviewer PROCESS — `scripts/review-pr.sh`, the harness's
+ * `merge-one.sh` reviewer, any `pi -p` child — was refused at its next git op with
+ * "no reviewers dispatched" even though a reviewer HAD run and its verdict was on
+ * the record. The floor was therefore satisfiable only one way, and the way the
+ * documentation tells a lane to land (`review-pr.sh`, then the rail) was not it.
+ *
+ * The acceptance is a MECHANICAL artifact, not prose: `record-review.sh`'s registry
+ * record (`~/.pi/agent/reviews/…json`) is the one thing a reviewer process leaves
+ * behind, and the merge gate ALREADY trusts it as the attestation. This adds NO new
+ * trust boundary — it reads the same file the rail reads — and it is bound to the
+ * EXACT head being pushed/committed, so a record made at an older head still needs
+ * a fresh review (no record for these bytes ⇒ still refused).
+ *
+ * ⛔ The negative case is the protection: no spawn ⇒ no record ⇒ refuse (pinned by
+ * `index.spawn-evidence.test.ts`; the recorder refuses to mint one without the
+ * evidence artifact, and `tests/review-pr/run.sh` §AE proves the no-spawn mutant
+ * writes nothing). A record whose `repo` disagrees with the op's repo is treated as
+ * absent (the #426 collision class), and ambiguity (two records for one head with
+ * no repo context) is not evidence either.
+ */
+export interface ReviewProcessEvidence {
+  pr: number;
+  head_sha: string;
+  verdict: string;
+  repo?: string;
+  recordPath: string;
+}
+
+/**
+ * A review record bound EXACTLY to `headSha`. `repo` narrows the search when known
+ * (a foreign repo's record must never satisfy this repo — #426). Returns null when
+ * nothing matches, or when the match is ambiguous without repo context.
+ */
+export function headBoundReviewEvidence(headSha: string, repo: string | null): ReviewProcessEvidence | null {
+  if (typeof headSha !== "string" || !/^[0-9a-f]{7,64}$/i.test(headSha.trim())) return null;
+  const want = headSha.trim().toLowerCase();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(reviewsDir()).filter((f) => f.endsWith(".json"));
+  } catch {
+    return null; // no registry → no evidence
+  }
+  const matches: ReviewProcessEvidence[] = [];
+  for (const f of entries) {
+    const path = resolvePath(reviewsDir(), f);
+    const rec = readRecordFile(path);
+    if (rec === null) continue;
+    if (typeof rec.head_sha !== "string" || rec.head_sha.trim().toLowerCase() !== want) continue;
+    if (repo !== null && rec.repo !== undefined && rec.repo !== repo) continue; // foreign record → inert
+    if (repo !== null && rec.repo === undefined) continue; // no repo on the record ⇒ cannot be bound to THIS repo
+    // #426 P0-2 parity: with NO repo context, a record that NAMES a repo cannot be bound to
+    // this op (it may be another repo's PR with the same number); only a repo-less legacy record
+    // is admissible, and only as the unique match (checked below).
+    if (repo === null && rec.repo !== undefined) continue;
+    matches.push({ pr: rec.pr, head_sha: want, verdict: rec.verdict, repo: rec.repo, recordPath: path });
+  }
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    // Two records at one head, no way to choose: not evidence. (With repo context
+    // the loop above already filtered to this repo's records; a genuine duplicate
+    // for one repo+head is still ambiguous.)
+    logGateEvent("review_record_collision", { ambiguous: matches.map((m) => m.recordPath), head_sha: want });
+    return null;
+  }
+  return matches[0];
+}
+
+/**
+ * THE COMMITS AN OP ACTUALLY SHIPS - and nothing but the ones it ships.
+ *
+ * #2287 fresh-review P0 (2026-10-22, reproduced): the first revision of this helper asked only
+ * "what is HEAD?", and HEAD is NOT the shipped object in several ordinary shapes. Each of these
+ * authorized a git op from a record that describes other bytes:
+ *
+ *   git push origin side        HEAD is on the reviewed commit; the pushed BRANCH is not.
+ *   git -C <other> push ...     the checkout, HEAD and repo are read from the session cwd.
+ *   git commit -m wip           the committed bytes DO NOT EXIST YET - no record can describe them.
+ *   git push --all / --mirror   many refs ship, one HEAD describes one of them.
+ *
+ * So the evidence path is opened ONLY for the shapes whose shipped commit is exactly HEAD, and is
+ * closed (null => the >=1-dispatch floor applies unchanged) everywhere else. That is the
+ * fail-closed direction: an unrecognised option, a refspec, a redirect, an unresolvable branch
+ * name, or a commit all fall back to the ordinary floor rather than to an accept.
+ */
+/**
+ * Git verbs that move a ref or rewrite the working tree. A command containing one of these cannot
+ * be certified by a record bound to the HEAD read before it ran.
+ */
+const REF_MOVING_VERBS = new Set([
+  "commit", "reset", "checkout", "switch", "branch", "merge", "rebase", "cherry-pick", "revert",
+  "stash", "pull", "am", "apply", "restore", "rm", "mv", "tag", "update-ref", "symbolic-ref",
+  "worktree", "clean", "notes", "filter-branch", "fast-import",
+]);
+
+/**
+ * Git GLOBAL options that consume the following word as their VALUE. The first revision of this
+ * file used the regex `git\s+(?:-[^\s]+\s+)*(verb)`, which only skips VALUELESS flags — so
+ * `git -c user.name=x commit …` and `git -c core.hooksPath=/dev/null commit …` slipped past BOTH
+ * the ref-moving guard and the "a commit ships bytes that do not exist yet" rule, and a record
+ * bound to the superseded HEAD authorized the chained push (fresh review round 3, P0). The
+ * verification-gate's `findGitVerbInvocation` models exactly this and consumes the `-c` value;
+ * that scanner is not exported, so the model is mirrored here (see the drift note below).
+ */
+const GIT_GLOBAL_OPTS_WITH_VALUE = new Set([
+  "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--exec-path",
+  "--config-env", "--attr-source",
+]);
+
+/**
+ * The verb of every `git` invocation in the command, with its global options skipped.
+ *
+ * ⛔ DRIFT NOTE: this is a SECOND model of "git + global options + verb" (the first is
+ * `findGitVerbInvocation` in extensions/verification-gate). It is duplicated because that module
+ * value-imports the pi SDK and the shared parser module does not export a verb scanner; the
+ * shapes it must agree on are pinned by `index.spawn-evidence.test.ts` (§unit — `-c` forms), so a
+ * divergence shows up as a failing test rather than as a silent bypass.
+ *
+ * A FALSE POSITIVE (a quoted mention that splits into words) only closes the evidence path —
+ * the ordinary dispatch floor applies — so the cheap split is safe in the fail-closed direction.
+ */
+export function gitVerbs(command: string): string[] {
+  const words = command.split(/[\s;|&()]+/).filter((w) => w.length > 0);
+  const verbs: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (w !== "git" && !w.endsWith("/git")) continue;
+    let j = i + 1;
+    while (j < words.length) {
+      const tok = words[j];
+      if (tok.startsWith("-")) {
+        j += GIT_GLOBAL_OPTS_WITH_VALUE.has(tok) ? 2 : 1;
+        continue;
+      }
+      verbs.push(tok);
+      break;
+    }
+  }
+  return verbs;
+}
+
+/**
+ * Does this command move a ref (or rewrite the tree) ANYWHERE in it — including behind a
+ * `git -c …` global, an inline `GIT_DIR=` assignment, or a `fetch` that retargets the checked-out
+ * branch (`--update-head-ok` with a `src:dst` refspec)?
+ *
+ * Every branch here CLOSES the evidence path (the ≥1-dispatch floor applies); none loosens a gate.
+ */
+export function commandMovesRefs(command: string): boolean {
+  // An inline environment assignment can retarget the whole invocation (F4): `GIT_DIR=/other/.git
+  // git push` reads THIS checkout's HEAD while git operates on another repository entirely.
+  if (/(^|\s)GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|COMMON_DIR|NAMESPACE)=/.test(command)) return true;
+  // A shell builtin that moves the CHECKOUT (or an unattributable `cd`, whose target the gate
+  // cannot resolve) makes the HEAD read here describe a different repository than the op ships.
+  if (/(^|\s)(pushd|popd)(\s|$)/.test(command)) return true;
+  if (parseCdChains(command).unattributable) return true;
+  const verbs = gitVerbs(command);
+  if (verbs.some((v) => REF_MOVING_VERBS.has(v))) return true;
+  // `fetch` is not ref-moving on its own (it moves remote-tracking refs), but these two forms move
+  // the CHECKED-OUT branch: verified locally (fresh review round 3, P1) — `git fetch
+  // --update-head-ok origin +side:main` advanced main, i.e. the push then shipped unreviewed bytes.
+  if (verbs.includes("fetch")) {
+    // BOTH spellings: `--update-head-ok` and its short form `-u` (fresh review round 4, P0).
+    if (/(^|\s)(-u|--update-head-ok)(\s|=|$)/.test(command)) return true;
+    // A `src:dst` refspec token can write a destination ref — including a FULLY-QUALIFIED
+    // `refs/heads/main`, which the first detector excluded by forbidding `/` in the dst.
+    const tokens = command.split(/\s+/).filter((t) => t.length > 0);
+    if (tokens.some((t) => /^[^:\s]+:[^:\s]+$/.test(t) && !t.includes("://"))) return true;
+  }
+  return false;
+}
+
+/**
+ * Is this bash command FREE of every construct that can hide or move what it really runs?
+ *
+ * ⛔ WHY THIS EXISTS (fresh review round 4, P0 ×3). Rounds 1–3 tried to MODEl the command text:
+ * a list of ref-moving verbs, a list of global options, a list of redirects. Each round found
+ * another spelling that walks past the model, and every one was a live accept:
+ *
+ *   git "commit" -m x && git push origin main      (quotes — bash strips them and runs the verb)
+ *   git c"ommit" -m x && git push origin main      (quoting INSIDE the word)
+ *   git \commit -m x && git push origin main       (backslash escape)
+ *   git $(printf commit) -m x && git push origin main   (command substitution)
+ *   git co -m x && git push origin main            (alias — the noun is not the verb that runs)
+ *   pushd /other && git push origin main           (a shell builtin moves the checkout)
+ *   cd $OTHER && git push origin main              (an unattributable cd: HEAD read here, push there)
+ *   git fetch -u . +refs/heads/side:refs/heads/main && git push …   (the short -u form)
+ *   gh pr create -Hother                            (-H with an ATTACHED value)
+ *
+ * The lesson is not "add another pattern": a text model of a Turing-complete shell cannot be
+ * completed by enumeration. So the evidence path is opened only for a command that contains NO
+ * shell syntax at all — no quoting, no escapes, no substitution, no variables, no control
+ * operators, no redirects, no subshells, no brace expansion, no newlines. With none of those, the
+ * tokens ARE the argv, the verb is the verb, and `git commit`/`pushd`/an alias cannot hide.
+ *
+ * THIS IS A WHITELIST, and the fallback is the ordinary ≥1-dispatch floor — never an accept. A
+ * lane that wants the record path runs the push as its own bare command:
+ *
+ *     git push origin <branch>          # accepted (with a head-bound record)
+ *     gh pr create --title … --body-file …   # accepted (no -H/--head)
+ *
+ * `git push origin main 2>&1 | tail -3`, `git fetch && git push`, a quoted body, `cd … && push` —
+ * all of them fall back to "dispatch a reviewer", which is the pre-existing, still-supported path.
+ *
+ * DECLARED RESIDUAL: this models the COMMAND, not the repository. A ref written outside git (a
+ * direct write under .git/refs) in a PREVIOUS tool call is invisible here; the record is bound to
+ * the head read at this op, so moving the branch to an unreviewed commit between calls is the
+ * pre-existing TOCTOU of any pre-execution hook, not something this resolver can see.
+ */
+export function evidenceCommandIsPlain(command: string): boolean {
+  // Any shell metacharacter, quote, escape, substitution, operator, redirect or newline: refuse.
+  if (/['"`\\$(){}<>|&;\n\r]/.test(command)) return false;
+  // A trailing/bare backslash would be an escape even without a following metacharacter.
+  if (/\\/.test(command)) return false;
+  // ⛔ PATHNAME EXPANSION IS ALSO "THE SHELL CHANGES THE TOKENS" (fresh review round 6, P1).
+  // `*`, `?`, `[...]` and `~` are expanded BEFORE the command runs, so a command containing one
+  // is NOT "its tokens are the argv" — which is the only reason a positional read is valid here.
+  // Measured: `git push origin main -*` was ACCEPTED at the previous head, and in a checkout
+  // containing a file named `--tags` bash expands the flag slot to it, so the dropped token
+  // became `--tags` and the push shipped every tag — the exact long form the guard at the top of
+  // `resolveShippedHeads` refuses. No legitimate accepted shape contains any of these: git forbids
+  // `*`, `?`, `[` and `~` in a refname, and `!` is history expansion in an interactive shell.
+  if (/[*?[\]~!]/.test(command)) return false;
+  return true;
+}
+
+/**
+ * The command's argv. Valid ONLY after `evidenceCommandIsPlain` has proved the command carries no
+ * shell syntax at all — at which point its whitespace-separated tokens ARE the argv and nothing can
+ * hide behind a quote or a substitution.
+ *
+ * Leading `NAME=value` assignments are skipped: they set the ENVIRONMENT, not the operand. (An
+ * inline `GIT_DIR=` / `GIT_WORK_TREE=` redirect is refused separately by `commandMovesRefs`; it
+ * cannot retarget the checkout through this helper.)
+ */
+function plainArgv(command: string): string[] {
+  const words = command.split(/\s+/).filter((w) => w.length > 0);
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i++;
+  return words.slice(i);
+}
+
+/** `gh [--repo|-R <slug>] pr create …` — including the global form the gate's own messages print. */
+function ghPrCreateArgv(argv: readonly string[]): boolean {
+  if (argv[0] !== "gh") return false;
+  let i = 1;
+  const flag = argv[i];
+  if (flag === "--repo" || flag === "-R") i += 2; // space form
+  else if (typeof flag === "string" && (flag.startsWith("--repo=") || (flag.startsWith("-R") && flag.length > 2))) i += 1; // attached value
+  return argv[i] === "pr" && argv[i + 1] === "create";
+}
+
+/** The remote `repoFromGitRemote` reads. The record's repo slug comes from THIS remote's URL. */
+const ORIGIN_REMOTE = "origin";
+
+export function resolveShippedHeads(
+  command: string,
+  ctx: unknown,
+): { heads: string[]; repo: string | null; cwd: string } | null {
+  // ⛔ FIRST: the command must be free of shell syntax (see evidenceCommandIsPlain). Everything
+  // below is a reading of a command that provably runs exactly its tokens.
+  if (!evidenceCommandIsPlain(command)) return null;
+
+  // A repo/checkout redirect makes the op's HEAD unattributable from here (the gate has no
+  // `-C` model - see resolveRepoContext) -> no evidence.
+  if (/(^|\s)(-C|--git-dir|--work-tree|--namespace|--super-prefix)(=|\s|$)/.test(command)) return null;
+  if (/(^|\s)(--all|--mirror|--tags|--follow-tags|--delete)([\s=]|$)/.test(command)) return null;
+  // ⛔ A `-c <name>=<value>` global can change what a git command DOES (hooksPath, push.default,
+  // refspec behaviour, an alias), so the shape the record was bound to is no longer the shape that
+  // runs. A `git -c core.hooksPath=/dev/null commit && git push` is an ordinary idiom (fresh review
+  // round 3, P0) — refuse the whole class rather than enumerate what a config can alter.
+  if (/(^|\s)(-c|--config|--config-env)(=|\s)/.test(command)) return null;
+
+  const opCtx = resolveRepoContext(command, null);
+  const ctxCwd = (ctx as { cwd?: unknown } | undefined)?.cwd;
+  const cwd = opCtx.cwd ?? (typeof ctxCwd === "string" ? ctxCwd : process.cwd());
+
+  // ⛔ ANCHOR TO THE COMMAND POSITION, NOT TO THE TEXT (fresh review round 5, P2). The plain-command
+  // check above proves this is ONE simple command with no shell syntax, so its TOKENS ARE THE ARGV
+  // and the op is the FIRST word — not "a word somewhere in the line". The free-text test accepted
+  // `echo gh pr create` (nothing ships) at 0 dispatches, and accepted `git commit -m gh pr create`
+  // only INCIDENTALLY, because the ref-moving-verb guard caught the commit — not the "a commit ships
+  // bytes that do not exist at hook time" rule named below. Anchoring makes both refuse by
+  // construction instead of by luck.
+  const argv = plainArgv(command);
+  const isPush = argv[0] === "git" && argv[1] === "push";
+  const isPrCreate = ghPrCreateArgv(argv);
+  // `git commit` ships bytes that do not exist at hook time - a record can never describe them.
+  if (!isPush && !isPrCreate) return null;
+
+  // ⛔ REF-MOVING PREFIX (fresh review, P1): HEAD is read BEFORE the command runs, so a same-call
+  // mutator moves the branch that the push/PR then ships. All of these authorized an op on a record
+  // bound to the PRE-mutation HEAD: `git reset --hard side && git push origin main`,
+  // `git branch -f main side && git push origin main`, `git checkout -B main side && git push`,
+  // `git checkout side && gh pr create -f`. Any ref-moving verb anywhere in the command closes the
+  // evidence path (fail-closed: the >=1-dispatch floor applies, nothing is bypassed).
+  if (commandMovesRefs(command)) return null;
+  // `gh pr create --head|-H <branch>` can open a PR for a branch that is not this checkout's.
+  // ⛔ BOTH SPELLINGS (fresh review, P0): matching only `--head` left `gh pr create -H other`
+  // opening the evidence path for another branch's commits. `gh pr create --help` lists
+  // `-H, --head branch`.
+  // `-H` with an ATTACHED value (`-Hother`) is the same flag (fresh review round 4, P0): match the
+  // short form wherever it starts a word, not only when whitespace/= follows.
+  if (isPrCreate && /(^|\s)(--head(=|\s|$)|-H)/.test(command)) return null;
+
+  let head: string;
+  let branch: string;
+  try {
+    head = execSync("git rev-parse HEAD", { cwd, timeout: 3000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd, timeout: 3000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return null; // not a git checkout / detached lookup failed -> no evidence, floor stands
+  }
+  if (!/^[0-9a-f]{40,64}$/i.test(head)) return null;
+  if (branch === "" || branch === "HEAD") return null; // detached: no named branch to reason about
+
+  if (isPush) {
+    // `git push <remote> <ref>` — and NOTHING ELSE. The argv is positional now, so there is no
+    // text to slice and also no flag to reason about.
+    const tail = argv.slice(2);
+    // ⛔ NO FLAGS AT ALL (fresh review round 6, P1). Round 5 DROPPED every `-`-prefixed token and
+    // then required exactly `<remote> <ref>`, which left the short forms of the flags the long-form
+    // guard refuses: `git push origin main -d` (== `--delete`) was ACCEPTED and DELETES the remote
+    // branch, and `git push --force-with-lease origin main` / `-f` / `-u` were accepted the same
+    // way. A flag can change WHAT the op does without changing its positionals, so this arm accepts
+    // the bare shape only. The cost is a false block on `git push -u origin <b>`: that falls back to
+    // the ≥1-dispatch floor, which is always available and is what the printed remedy already names.
+    if (tail.some((w) => w.startsWith("-"))) return null;
+    const words = tail;
+    // ⛔ EXACTLY `<remote> <ref>` (fresh review, P2). A bare `git push` / `git push origin`
+    // ships whatever `push.default` or `remote.<remote>.push` selects — possibly refs that are not
+    // HEAD — while the record is bound to HEAD.
+    if (words.length !== 2) return null;
+    if (words[0] === "" || words[1] === "") return null;
+    if (words.some((w) => w.includes(":"))) return null; // explicit refspec -> not necessarily HEAD
+    if (tail.some((w) => w.includes("+"))) return null; // forced refspec
+    // ⛔ THE REMOTE MUST BE THE ONE THE RECORD'S REPO WAS READ FROM (fresh review round 5, P2).
+    // `repoFromGitRemote` reads `remote.origin.url`, so the record is bound to ORIGIN's slug — but
+    // the push arm accepted ANY remote name and still matched against that slug. `git push upstream
+    // main` shipped HEAD and was authorized by ORIGIN's record: HEAD is still exactly what ships, so
+    // this was not a byte-integrity hole, but "the op's repo" was not the binding that got checked,
+    // and a doc/behaviour mismatch is how the next reader gets it wrong. Fail-closed: another remote
+    // falls back to the ≥1-dispatch floor, which is always available.
+    if (words[0] !== ORIGIN_REMOTE) return null;
+    // `git push origin HEAD` ships exactly the commit HEAD resolves to — at least as precise as the
+    // branch name, and git infers the same destination branch — so it is accepted. Refusing it was a
+    // false block on a shape lanes actually use.
+    if (words[1] !== branch && words[1] !== "HEAD") return null;
+  }
+
+  const repo = opCtx.repo ?? repoFromGitRemote(cwd);
+  return { heads: [head], repo, cwd };
+}
+
 function readRecordFile(path: string): ReviewRecord | null {
   try {
     const raw = fs.readFileSync(path, "utf8");
@@ -3366,12 +3722,66 @@ function describeNonDiffValue(v: string): string {
 }
 
 /**
+ * How long the LIVE diff read may take (ms).
+ *
+ * ⛔ THIS BOUND WAS 60s AND THAT WAS A SILENT FALSE NEGATIVE (measured 2026-10-22).
+ * The read is one `gh api` inside `record-review.sh`, and on this fleet every `gh`
+ * invocation first queues at the SHARED gh gate (`~/.pi/agent/shims/gh`), whose
+ * slot-acquire budget alone is 300s by default (`AGENT_GH_GATE_ACQUIRE_TIMEOUT`)
+ * before a single byte of HTTP is sent. So under fleet contention — the exact
+ * condition in which a dozen open PRs are waiting on the carry ARM — the child was
+ * killed at 60s WHILE THE GATE WAS STILL QUEUEING, `execFileSync` threw, and the
+ * caller received `null`.
+ *
+ * `null` is the arm's fail-closed signal, so nothing unsafe happened — but the
+ * refusal it produced was `head_advanced` ("the branch moved — re-review the new
+ * head"), i.e. a QUEUEING DELAY was rendered as a CONTENT CHANGE, and the lane paid
+ * a whole fresh review for a diff that never changed. That is the same speech-act
+ * error #1690 fixed for the head read ("an unreadable head is NOT a claim about
+ * reality"), in the diff dimension — so it gets the same treatment: a bound that
+ * outlasts the queue, and a refusal that says which of the two happened.
+ *
+ * The default mirrors the budget the HEAD read already waits under
+ * (`rateLimitMaxWaitMs`, 10 min): a diff read is the same kind of shared-pool call and
+ * was MEASURED at 399s end-to-end on 2026-10-22 while 40 PRs were open, so any bound
+ * below that class keeps killing reads that were merely queued. Raise it where the
+ * gate is configured with a longer acquire timeout. A genuinely unreachable API still
+ * ends in `null` — bounded, and now legible.
+ */
+export function diffHashReadTimeoutMs(): number {
+  // ⛔ A FULL-INTEGER PARSE, AND A FLOOR ON THE OVERRIDE. `parseInt` accepts any
+  // leading-integer prefix, so a human spelling like `10m` yielded TEN MILLISECONDS —
+  // the same killed-while-queueing read this function exists to prevent, silently
+  // reintroduced fleet-wide by a config value (review, #2353 P2). An override is an
+  // operator's stated intent, so a legitimate short value is honoured under test, but
+  // outside test a bound below the floor is ignored rather than trusted.
+  const raw = (process.env.REVIEW_ENFORCER_DIFF_HASH_TIMEOUT_MS ?? "").trim();
+  const FLOOR_MS = 60_000;
+  if (/^[0-9]+$/.test(raw)) {
+    const explicit = Number.parseInt(raw, 10);
+    if (explicit > 0 && (explicit >= FLOOR_MS || process.env.NODE_ENV === "test")) return explicit;
+  }
+  const acquire = parseInt(process.env.AGENT_GH_GATE_ACQUIRE_TIMEOUT ?? "", 10);
+  const acquireMs = (Number.isInteger(acquire) && acquire > 0 ? acquire : 300) * 1000;
+  // NOTE: the read itself retries (record-review.sh DIFF_FETCH_ATTEMPTS=3), so a path
+  // whose every attempt queues can still outlast any single bound. That residual is
+  // declared rather than papered over: the failure is now `diff_unreadable` (RETRY),
+  // which is cheap and re-decidable, instead of a false "the content changed".
+  return Math.max(600_000, acquireMs + 120_000);
+}
+
+/**
  * The PR's live normalized three-dot diff digest, or null when it cannot be
  * computed. The repo is taken from the SAME resolved context the gate verified
  * the head through, and is RE-VALIDATED here (a `--repo` flag is user-controlled
  * text) before it reaches an argv element. Every failure — no repo, no helper,
  * no `gh`/`openssl`/`python3`, the 300-file cap, a network failure, a timeout —
  * returns null, which the gate reads as "no identity" and blocks on the head.
+ *
+ * ⛔ NULL MEANS "COULD NOT READ", NEVER "READ AND DIFFERS". The two are
+ * different operational events with different remedies (retry vs re-review), so
+ * the caller must not collapse them: `evaluateMergeGate`'s `diffReadFailed`
+ * argument exists to keep them apart at the one point that prints the remedy.
  */
 export function getPrLiveDiffHash(pr: number, ctx: RepoContext): string | null {
   return getPrLiveDiffHashObserved(pr, ctx).hash;
@@ -3403,7 +3813,7 @@ export function getPrLiveDiffHashObserved(
     // element, so no value here can be re-parsed as shell syntax.
     const out = execFileSync("bash", [helper, "--print-diff-hash", String(pr), repo], {
       cwd: ctx.cwd,
-      timeout: 60000,
+      timeout: diffHashReadTimeoutMs(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -3623,6 +4033,33 @@ export type MergeGateResult =
   | { status: "failopen"; warning: string }
   | { status: "allow"; message: string; carried?: boolean };
 
+/**
+ * #513/#2347 — the ONE place the "a fresh review is owed" recipe is written, per tier.
+ * Every arm that tells a lane to re-review uses it, so a future arm cannot re-introduce
+ * the three defects this text has already shipped with: a truncated sha (refused by
+ * record-review.sh, exit 2), a hardcoded `clean` laid over a tier verdict (a micro PR
+ * sent to the full standard review its tier exempts, a clean-low one told to re-record
+ * a shape it must re-derive), and `--evidence` promised to the two verdicts that accept
+ * it and drop it.
+ */
+export function freshReviewAdvice(verdict: string, pr: number): string {
+  const cmd = `${RECORD_SH} ${pr} <head_sha>`;
+  if (verdict === "clean-low") {
+    return (
+      "     → Re-derive the SHAPE rather than re-recording it: re-check whether the NEW head is still\n" +
+      `       content-only, then name the verdict explicitly — ${cmd} clean-low [owner/repo].\n` +
+      `       If it is no longer content-only, run the code-review skill and record ${cmd} clean [owner/repo] --evidence comment:<review-comment-id>.`
+    );
+  }
+  if (verdict === "clean-micro") {
+    return (
+      `     → Micro issue (complexity:micro): complete the micro flow, then ${cmd} clean-micro [owner/repo]\n` +
+      "       (no --evidence: clean-micro certifies the micro PROCESS, not a review artifact)."
+    );
+  }
+  return `     → Run the code-review skill, post its verdict as a PR comment, then ${cmd} clean [owner/repo] --evidence comment:<review-comment-id>`;
+}
+
 // Pure gate decision — separated from I/O so it is unit-testable.
 export function evaluateMergeGate(
   pr: number,
@@ -3637,6 +4074,20 @@ export function evaluateMergeGate(
   // failure. Every one of those is a FAILED READ, and a failed read is not a
   // matching read, so null blocks on the head binding like any other mismatch.
   currentDiffHash: string | null = null,
+  // #1351 — WHY `currentDiffHash` is null. The caller ATTEMPTED a read (the
+  // record carries a usable digest and the head moved) and it came back null:
+  // either the read failed, or the body was empty/non-diff/over the 300-file
+  // cap. That is NOT a statement that the content changed, and the two remedies
+  // are opposites (RETRY the merge vs pay for a fresh review), so the caller
+  // says which happened rather than letting the arm guess. Defaults to false
+  // because the common null is "never asked" (a matching head, or a legacy
+  // record with no digest), which must keep the unchanged `head_advanced` path.
+  //
+  // ⛔ ORDER: it is deliberately LAST. #2349's `observation` / `liveDiffReadReason`
+  // (below) are the two message inputs that landed on `main` while this branch was
+  // open, and they occupy positions 8-9 in every existing caller and test. Appending
+  // the flag after them keeps that contract intact instead of silently re-binding
+  // an observation object to a boolean parameter.
   // #2349: these two arguments are MESSAGE INPUTS ONLY. They reach a refusal's
   // text and nothing else — no branch below tests them, and no return value
   // depends on them (pinned by the "decision code" extraction in index.test.ts).
@@ -3646,6 +4097,7 @@ export function evaluateMergeGate(
   //                        moved-head arm (a failed READ is not a failed review).
   observation: ReviewRecordObservation | null = null,
   liveDiffReadReason: string | null = null,
+  diffReadFailed: boolean = false,
 ): MergeGateResult {
   if (!record) {
     // #285 Fix C: the emergency-bypass line is FALSE for task sub-agents — the
@@ -3788,6 +4240,67 @@ export function evaluateMergeGate(
         // allow and the refusal cannot describe the rule differently). A lane that has
         // only ever read refusals needs to learn this arm EXISTS.
         `   ⇒ ${RECORD_STATE_CARRY_ALLOWED}.`,
+    };
+  }
+  if (
+    record.head_sha !== currentHead &&
+    diffReadFailed &&
+    // The flag says the caller ATTEMPTED a read, and a read is only attempted
+    // when the record carries an identity. Requiring it here keeps the branch
+    // self-consistent even for a caller that sets the flag unconditionally: a
+    // record with NO usable digest can never be a "could not read" case, its
+    // remedy is the unchanged one, and the text below quotes the digest.
+    isDiffSha256(record.diff_sha256)
+  ) {
+    // #1351 — A FAILED READ IS NOT A CHANGED DIFF (#1690's speech act, in the
+    // diff dimension). We got here because the record DOES carry a usable
+    // digest and the head moved, i.e. the carry arm was REACHABLE — and then the
+    // live digest could not be read (a shared-gh-gate queue longer than the
+    // read bound, a rate-limit window, an empty/over-cap/non-diff body, a
+    // network failure). Rendering that as `head_advanced` told the lane to pay
+    // 20-40 minutes for a fresh review of content that may be byte-identical.
+    //
+    // FAIL CLOSED, and state the remedy that actually applies: RETRY. The retry
+    // is cheap and it re-asks the only question that decides. The `[diff_unreadable]`
+    // tag exists so the audit trail (gate-events.jsonl) can reconstruct these by
+    // reason — `head_advanced` was two different operational events behind one tag.
+    return {
+      status: "block",
+      reasonTag: "diff_unreadable",
+      reason: [
+        `❌ PR #${pr} head has moved (${record.head_sha.slice(0, 12)} → ${currentHead.slice(0, 12)}) and the`,
+        "   reviewed DIFF could not be READ, so it could not be compared.",
+        "   This is NOT a claim that the content changed — a read that failed is not a diff that differs.",
+        // #2349 — say WHAT the read reported. This arm is the one place that
+        // declares a failed read, so the reason #2349 threads through for the
+        // head-stale arm belongs here too; dropping it would make this refusal
+        // less informative than the narrower one it precedes.
+        `   What the read reported: ${liveDiffReadReason ?? "(no reason reported by the caller)"}`,
+        "   → RETRY the merge. A shared gh-gate queue, a rate-limit window or a transient API"
+        + " failure is far cheaper than a re-review, and the carry arm re-decides on every attempt.",
+        "   → Do NOT mint a fresh record for this: an unchanged diff CARRIES on the digest alone",
+        `     (record diff_sha256 ${record.diff_sha256!.slice(0, 12)}…).`,
+        "   → To see which case you are in without merging, compare the two digests:",
+        `     ${RECORD_SH} --print-diff-hash ${pr} ${ctx.repo ?? "<owner/repo>"}`,
+        `     (or in one step: ${RECORD_SH} --check-carry ${pr} ${ctx.repo ?? "<owner/repo>"}).`,
+        "   → Only if that prints a digest DIFFERENT from the record's is a fresh review owed:",
+        // ⛔ THREE DEFECTS HAVE LIVED ON THIS ONE LINE, each with its own wrong outcome
+        // (reviews, #2353 P1 + round 2 F1):
+        //   1. a TRUNCATED sha (`${currentHead.slice(0,12)}…`) LOOKS runnable — the two
+        //      lines above ARE literal — and record-review.sh refuses anything short of
+        //      40 hex with exit 2, so the advice dead-ended at the moment a lane tried to land;
+        //   2. a hardcoded `clean` overrode the TIER: a micro PR was sent to the full
+        //      standard review its tier exempts, and a clean-low one was told to re-record at
+        //      the same verdict — which the sibling arm at `head_advanced` forbids verbatim,
+        //      because that shape must be RE-DERIVED rather than carried forward;
+        //   3. `--evidence` was appended unconditionally although only `clean` binds
+        //      evidence (clean-micro/clean-low accept it and drop it), promising an artifact
+        //      the record would not carry.
+        // So the recipe is TIER-AWARE — written once, in `freshReviewAdvice` below, which
+        // every "a fresh review is owed" arm shares — and `<head_sha>` is the placeholder
+        // every neighbouring arm uses.
+        freshReviewAdvice(record.verdict, pr),
+      ].join("\n"),
     };
   }
   if (record.head_sha !== currentHead) {
@@ -4973,21 +5486,43 @@ const BLOCK_MESSAGE = [
   "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
+  // #2287/#2148: a lane whose review came from a SPAWNED reviewer process (review-pr.sh,
+  // the harness reviewer) does not need to re-do it through `task` — the registry record
+  // bound to this op's head is accepted. Naming it here keeps the refusal satisfiable
+  // from EITHER path, which is the whole point of the disclosure.
+  // ⛔ AND NAME ITS CONDITION (fresh review round 5, P1). The record path is open only for a command
+  // carrying NO shell syntax (see evidenceCommandIsPlain) — naming the record WITHOUT the shape
+  // reproduced the #2287 defect one spelling over: a lane pushing `git push --force-with-lease`,
+  // `git push -u origin $BR`, `cd … && git push` or `git push origin HEAD:refs/heads/<b>` was told
+  // "a record satisfies this floor", followed the instruction, and stayed blocked. So the accepted
+  // shapes are printed, and the sentence says plainly that anything else falls back to a dispatch.
+  "   → A spawned reviewer PROCESS counts too — FOR THESE EXACT SHAPES ONLY. A review record bound",
+  "     to this op's current HEAD (`review-pr.sh <PR>`, or record one with the command below)",
+  "     satisfies this floor when the refused command is one of:",
+  "        git push origin <this-branch>          (NO flags — `-f`, `-d`, `-u`, `-o …` fall back)",
+  "        git push origin HEAD",
+  "        gh pr create …            (no -H/--head, and no --repo pointing at another repo)",
+  "     Any shell syntax closes that path — a pipe, `&&`, a quote, a redirect, `$VAR`, `cd … &&`,",
+  "     `git push -u origin $BR` — because a shell can change WHAT RUNS and the record is bound to",
+  "     BYTES. Run the push as its own bare command to use the record path; otherwise this floor",
+  "     needs a reviewer DISPATCH (the `task` / `subagent` tool) in THIS session.",
   // #2148: name the command the RAIL will demand, not just the missing action. A lane told only
   // "dispatch a reviewer" satisfies this gate and is then refused by the merge registry for lack of
   // an attestation — the second refusal needs a command, and this is the moment to hand it over.
   "   → A dispatch alone does not land the PR: the rail also needs the attestation at the FINAL head —",
   `      ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
-  // #2349: say WHAT THIS FLOOR READ. It counts dispatches in this process and reads
-  // no record, so "no review exists" and "the record is on another box" are the same
-  // sentence to it (the registry is per-machine). Without this, a lane whose reviewer
-  // ran in the parent (#825) or elsewhere reads the refusal as "the review is missing"
-  // and aborts with no correct next action.
-  "   → WHAT THIS GATE READ: the number of reviewer DISPATCHES counted in THIS pi process (still 0).",
-  "     It reads NO review record, so it cannot tell \"no review exists\" from \"a review exists but its",
-  "     record is not on this box\": the registry is PER-MACHINE (~/.pi/agent/reviews/<owner>-<repo>-<pr>.json),",
-  "     and a record minted on another box, or by a parent session, is invisible here. A record would not",
-  "     satisfy this floor in any case — the datum it needs is a dispatch IN THIS SESSION.",
+  // #2349: say WHAT THIS FLOOR READ. Before #2287 it read only a dispatch count and the text said
+  // so. #2287 gave it a head-bound-record path, which made that sentence FALSE — and left the
+  // message CONTRADICTING its own spawn-path paragraph four lines above (fresh review round 5, P1).
+  // The block below is only reached when no usable record was found, so "none" is a true statement
+  // at the moment it prints. The registry-is-per-machine disclosure survives from #2349 because it
+  // is still the reason a record can be invisible to THIS box.
+  "   → WHAT THIS GATE READ: a head-bound review record for THIS op — found: NONE (no record at this",
+  "     head for this repo on this box, or the command's shape closed that path — see above) — and the",
+  "     reviewer DISPATCHES counted in THIS pi process (still 0). The registry is PER-MACHINE",
+  "     (~/.pi/agent/reviews/<owner>-<repo>-<pr>.json), so a record minted on another box, or by a",
+  "     parent session, is invisible here: for a lane whose reviewer ran elsewhere, a dispatch is the",
+  "     only thing this floor can see. The datum it still needs is a dispatch IN THIS SESSION.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
@@ -5023,11 +5558,11 @@ export function auditCommand(command: string, limit = 2000): string {
 
 // ── #2349: the ≥1-dispatch floor says WHAT IT READ ─────────────────────────────
 //
-// The floor counts reviewer dispatches in THIS pi process and reads NO review
-// record. Its text said "no reviewers dispatched" and nothing else, so a lane whose
-// reviewer ran in the parent session (dispatch is parent-enforced, #825) or on
-// another box read it as "the review is missing" — a different fact, with a
-// different next action, which this line now distinguishes explicitly.
+// The floor counts reviewer dispatches in THIS pi process, and (since #2287) first tries a
+// head-bound `record-review.sh` registry record for the op. Its text said "no reviewers dispatched"
+// and nothing else, so a lane whose reviewer ran in the parent session (dispatch is
+// parent-enforced, #825) or on another box read it as "the review is missing" — a different fact,
+// with a different next action, which this line now distinguishes explicitly.
 //
 // `recordState` exists so the value lands in the durable audit row: the fleet can
 // then count how many refusals were "no record on this box" (the condition that was
@@ -5040,8 +5575,9 @@ export function describeDispatchFloorRead(
   const stateText = tier === "" ? "unlabeled" : tier;
   const lines = [
     `   → READ: reviewer dispatches counted in THIS pi process = ${dispatchCount}; tier=${stateText}.`,
-    "     This floor reads NO review record, so by itself it cannot distinguish \"no review exists\"",
-    "     from \"a review exists but its record is not on this box\" (the registry is PER-MACHINE).",
+    "     This floor ALSO tried a head-bound review record for this op and found NONE visible here,",
+    "     so \"no record at this head\" and \"a record exists on another box\" read the same at this",
+    "     point (the registry is PER-MACHINE).",
   ];
   // A command that reaches this floor names no PR BY CONSTRUCTION: every `gh pr merge`
   // and every `gh pr <verb> <n>` came back from the merge-registry branch above, which
@@ -5069,8 +5605,8 @@ export function describeDispatchFloorRead(
       : `     REGISTRY on this box: ${total} record(s) at ${dir}${repo ? `, ${forRepo} for ${repo}` : " (repo unresolved)"}.`
   );
   lines.push(
-    "     This command names no PR, so no single record can be attributed to it — the datum this gate" +
-      " needs is a reviewer dispatch in THIS session (or the parent's, for a sub-agent)."
+    "     This command names no PR, and its SHAPE decides whether a record could have been used at all" +
+      " — the datum this gate needs is a reviewer dispatch in THIS session (or the parent's, for a sub-agent)."
   );
   return { lines, recordState: `no-pr-named (registry=${total}${repo ? `, repo=${forRepo}` : ""})` };
 }
@@ -5094,11 +5630,12 @@ export const MICRO_BLOCK_MESSAGE = [
   "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
   // #2148: micro's record command, so the refusal at the git op also names what the rail will read.
   `   → Then record the attestation at the FINAL head (micro): ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
-  // #2349: same disclosure as the generic message — this floor counts DISPATCHES and
-  // reads no record, so it cannot distinguish "no review" from "not visible here".
-  "   → WHAT THIS GATE READ: the number of reviewer DISPATCHES counted in THIS pi process (still 0).",
-  "     It reads NO review record, so \"no review exists\" and \"a record exists on another box\" are the",
-  "     same sentence here (the registry is PER-MACHINE). What unlocks this floor is a dispatch NOW.",
+  // #2349: same disclosure as the generic message, corrected post-#2287: the floor DOES consult a
+  // head-bound record before it refuses, so "reads NO review record" was no longer true.
+  "   → WHAT THIS GATE READ: a head-bound review record for THIS op — found: NONE (no record at this",
+  "     head for this repo on this box, or the command carried shell syntax or a flag) — and the reviewer",
+  "     DISPATCHES counted in THIS pi process (still 0). The registry is PER-MACHINE, so a record on",
+  "     another box is invisible here. What unlocks this floor is a dispatch NOW.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 
@@ -5311,7 +5848,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     // ── tool_call: block git ops if no reviewers (uniform ≥1-dispatch, all tiers) ──
-    pi.on("tool_call", async (event, _ctx) => {
+    pi.on("tool_call", async (event, toolCtx) => {
       if (!isToolCallEventType("bash", event)) return undefined;
       // `rawCommand` is read BEFORE the `extensionEnabled` gate: the #2148 early notice below must
       // also reach a BYPASSED lane (that is the one which reaches the rail unstopped).
@@ -5596,15 +6133,30 @@ export default function (pi: ExtensionAPI) {
         // head block — never to an accept). The read is the SAME normalized
         // digest the record stores and the GitHub gate computes, so the two
         // gates cannot disagree about what "reviewed" means.
+        // #1351 — fetch the PR's LIVE diff digest only when it can change the
+        // verdict: a record that carries a usable `diff_sha256` AND a head that
+        // has actually moved. Nothing else reads it, so a matching head must not
+        // pay for the read (the head binding already allows), and a record
+        // without the field must not either (its absence falls through to the
+        // head block — never to an accept). The read is the SAME normalized
+        // digest the record stores and the GitHub gate computes, so the two
+        // gates cannot disagree about what "reviewed" means.
+        const diffReadAttempted =
+          !!record && isDiffSha256(record.diff_sha256) &&
+          currentHead !== null &&
+          record.head_sha !== currentHead;
         // #2349: the live digest read reports WHY it yielded nothing, for the refusal
         // text only (a failed READ is not a failed review). The DECISION still consumes
         // `currentDiffHash` and nothing else, through the same predicate as before.
-        const liveDiffRead = record && isDiffSha256(record.diff_sha256) &&
-          currentHead !== null &&
-          record.head_sha !== currentHead
-            ? getPrLiveDiffHashObserved(prNumber, ctx)
-            : { hash: null, reason: null };
+        const liveDiffRead = diffReadAttempted
+          ? getPrLiveDiffHashObserved(prNumber, ctx)
+          : { hash: null, reason: null };
         const currentDiffHash = liveDiffRead.hash;
+        // #1351: an ATTEMPTED read that came back null is a FAILED READ — never a
+        // changed diff. Without this the arm cannot tell "the content moved" from
+        // "the shared gh gate queued longer than the read bound", and its refusal
+        // told the lane to re-review in both cases (measured 2026-10-22).
+        const diffReadFailed = diffReadAttempted && currentDiffHash === null;
         // #2349: the registry observation, taken ONCE and passed to the gate as a
         // MESSAGE INPUT. `record` above is still what `readReviewRecord` returned —
         // the observation is never consulted for a decision.
@@ -5613,7 +6165,7 @@ export default function (pi: ExtensionAPI) {
         // sub-agents get the "parent must record the review" variant).
         const result = evaluateMergeGate(
           prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase, currentDiffHash,
-          recordObservation, liveDiffRead.reason
+          recordObservation, liveDiffRead.reason, diffReadFailed
         );
         if (result.status === "block") {
           // #2349: name the state in the line the operator reads, reusing the SAME
@@ -5642,6 +6194,35 @@ export default function (pi: ExtensionAPI) {
             : `[review-enforcer] ✅ ${dispatchCount} reviewer dispatch(es) — allowing git op`
         );
         return undefined;
+      }
+
+      // #2287/#2148: a SPAWNED reviewer process is equivalent evidence to an
+      // in-session `task` dispatch. The artifact is `record-review.sh`'s registry
+      // record, bound to the EXACT head this op ships — the same file the merge
+      // registry gate reads as the attestation. No record ⇒ no reviewer verdict ⇒
+      // the floor below still refuses (the protection is unchanged).
+      if (!taskSubAgent && dispatchCount === 0) {
+        const op = resolveShippedHeads(command, toolCtx);
+        // `repo === null` means the op's repo could not be resolved - then a record CANNOT be
+        // bound to it (the #426 P0-2 rule the merge gate already applies: with no repo context
+        // only a repo-less legacy record may match, never one that embeds somebody's repo).
+        const evidence = op === null || op.repo === null
+          ? null
+          : headBoundReviewEvidence(op.heads[0], op.repo);
+        if (evidence !== null) {
+          console.log(
+            `[review-enforcer] ✅ Reviewer process evidenced — review record for ${evidence.repo ?? "<unresolved repo>"}#${evidence.pr} ` +
+              `bound to the pushed head ${evidence.head_sha.slice(0, 12)} (verdict: ${evidence.verdict}) — allowing git op`
+          );
+          logGateEvent("review_dispatch", {
+            dispatch_count: dispatchCount,
+            reason: "review_record_bound_head",
+            pr: evidence.pr,
+            head_sha: evidence.head_sha,
+            record: evidence.recordPath,
+          });
+          return undefined;
+        }
       }
 
       // #485: uniform ≥1-dispatch block — every tier (micro, standard, complex,
