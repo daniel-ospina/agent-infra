@@ -130,9 +130,10 @@
 #        it is additive: re-copying the original produces a file that parses, passes every gate test
 #        that predates the change, and simply never refuses. It is a to-do item on any future merge
 #        of the two copies, not drift.
-#        ⛔ AND THE VOLUME IS A CALLER'S ARGUMENT, NOT `$PWD` (`DISK_GATE_PATH`). `fix-one.sh` and
-#        `adopt-fix.sh` `cd "$REPO"` and only NAME the worktree in the agent's prompt, so their `$PWD`
-#        is the MAIN CHECKOUT; `fix-one.sh` therefore passes `DISK_GATE_PATH="$WT"` explicitly. On a
+#        ⛔ AND THE VOLUME IS A CALLER'S ARGUMENT, NOT `$PWD` (`DISK_GATE_PATH`). `fix-one.sh` cds to
+#        `$REPO` — whose `$PWD` is therefore the MAIN CHECKOUT, not the worktree — so it passes
+#        `DISK_GATE_PATH="$WT"` explicitly; `adopt-fix.sh` also cds to `$REPO`, creates `$WT` itself and
+#        then RUNS `fix-one.sh` as a child, so it reaches that explicit path and sets none of its own. On a
 #        cell the two share one volume (the worktree lives under `$REPO/.worktrees`), which is why the
 #        wrong reading stayed invisible; on a box that splits them it would measure a healthy
 #        directory and start the agent onto a full one.

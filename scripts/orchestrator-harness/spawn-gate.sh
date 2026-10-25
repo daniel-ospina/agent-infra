@@ -1268,9 +1268,10 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # `lane.sh` is LAUNCHED with its cwd already inside the worktree (its own header: "cwd must already be
   # the worktree"; `dispatch-merge.sh` hands `$REPO/.worktrees/$WT` as the spawn cwd), while `fix-one.sh`
   # does `cd "$REPO"` and then sets `DISK_GATE_PATH="$WT"` explicitly — which is port-provenance D5's
-  # "their `$PWD` is the MAIN CHECKOUT". `adopt-fix.sh` cds to the repo and EXECS `fix-one.sh`, so it
-  # inherits that explicit path; it sets no `DISK_GATE_PATH` of its own, and a sentence that says it does
-  # is the same stretch this paragraph exists to stop. Both routes classify a checkout, and the main
+  # "their `$PWD` is the MAIN CHECKOUT". `adopt-fix.sh` cds to the repo and RUNS `fix-one.sh` as a CHILD
+  # (`bash "$O/fix-one.sh" …`, then dispatches on its exit code), so it reaches that explicit path rather
+  # than inheriting it: `DISK_GATE_PATH` is a per-call prefix assignment inside `fix-one.sh`, and a
+  # sentence that says adopt-fix sets or inherits it is the same stretch this paragraph exists to stop. Both routes classify a checkout, and the main
   # checkout is itself a checkout (python pair), so the fallback errs STRICT.
   #
   # ⛔ WHEN NEITHER PATH IS A CHECKOUT the target is genuinely unknown: the harness pair is charged and
