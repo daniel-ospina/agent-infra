@@ -9,21 +9,34 @@ dispatched worktrees sat on a HEAD that ``origin/main`` already contained, and
 ALL 12 produced +0 commits — a whole lane's context spent discovering there was
 nothing to do, then up to 9 h parked at 0.00 % CPU.
 
-The three cases below are the whole contract, and the second and third exist
-because a simpler tool gets them WRONG in the dangerous direction:
+The cases below are the whole contract, and the middle ones exist because a
+simpler tool gets them WRONG in the dangerous direction:
 
   * **contained HEAD** -> NO-WORK. The "sitting on main's tip" incident case.
   * **squash-merged branch** -> NO-WORK. This one carries ``ahead > 0`` with an
-    EMPTY tree diff. A tool keying on the commit COUNT reports HAS-WORK here and
-    re-creates the wasted lane with a bigger number to make it look productive —
-    so there is a leg whose only job is to hold that distinction.
-  * **dirty worktree at the base tip** -> HAS-WORK. Uncommitted/untracked
-    changes ARE work to land (measured: ``retire-fork``). A false refusal here
-    destroys real work; a false allow only costs an untouched worktree. The
-    asymmetry is deliberate and this leg is the one that must never flip.
+    EMPTY own delta. A tool keying on the commit COUNT reports HAS-WORK here and
+    re-creates the wasted lane with a bigger number to make it look productive.
+  * **squash-merged, then the base ADVANCED** -> NO-WORK. The most common
+    lifecycle shape of all, and the one a tree-identity test gets wrong: the
+    base moved, so ``tree(HEAD) != tree(base)`` even though every byte HEAD
+    carries is already in the base. A three-way merge is the only read that
+    answers it (see the module header for the measured falsification).
+  * **dirty worktree** -> HAS-WORK, even when the base cannot be resolved.
+    Uncommitted/untracked changes ARE work to land (measured: ``retire-fork``).
+    A false refusal here destroys real work; a false allow only costs an
+    untouched worktree. The asymmetry is deliberate and these legs are the ones
+    that must never flip.
+  * **the target is not its own work-tree root** -> UNREADABLE. ``git -C`` walks
+    upward, so a stale ``.worktrees/x/`` would otherwise be answered from the
+    MAIN checkout — a confident verdict about a tree nobody asked about.
+  * **a conflicting branch** -> HAS-WORK. git answered; a branch that will not
+    merge cleanly certainly has something that still has to land.
 
-Unreadable states (no git, missing path, unresolvable base) exit with their OWN
-code and never report HAS-WORK: a probe that cannot answer must not answer "yes".
+Unreadable states (missing path, non-git dir, unborn HEAD, unresolvable base,
+and a FAILED ``status`` / ``merge-base`` / ``diff`` / ``merge-tree`` read) exit
+with their OWN code and never report HAS-WORK: a probe that cannot answer must
+not answer "yes". Every one of those paths has a leg here and a mutation in
+``--red-control`` — an unpinned fail-closed branch is prose, not a pin.
 
 RUN
 ---
@@ -51,6 +64,22 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REAL_GIT = shutil.which("git") or "/usr/bin/git"
+
+# The environment keys `_git_env()` pins, so tearDownModule can restore exactly
+# what it changed instead of guessing.
+_ENV_KEYS = (
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_AUTHOR_NAME",
+    "GIT_COMMITTER_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_DATE",
+    "PATH",
+)
 
 
 def _module_path() -> Path:
@@ -88,6 +117,35 @@ def _git_env() -> dict:
     return env
 
 
+_SAVED_ENV: dict = {}
+
+
+def setUpModule() -> None:  # noqa: N802 (unittest's own name)
+    """Pin the git environment for THIS PROCESS, not only for the fixture helpers.
+
+    Every verdict is computed by ``evaluate()`` IN THIS PROCESS, and the tool's
+    ``_git()`` shells out with no ``env=``, so it inherits whatever this process
+    carries. Pinning only the fixtures' own git calls left the verdicts computed
+    under the developer's ambient config — measured: a global
+    ``core.excludesFile`` matching ``*.md`` reddened
+    ``test_untracked_file_at_base_tip_is_has_work`` on one box and greened it on
+    another. So the pin is applied to ``os.environ`` here, which covers the
+    in-process legs AND every subprocess spawned without an explicit ``env=``
+    (including the mutants ``--red-control`` runs).
+    """
+    global _SAVED_ENV
+    _SAVED_ENV = {k: os.environ.get(k) for k in _ENV_KEYS}
+    os.environ.update(_git_env())
+
+
+def tearDownModule() -> None:  # noqa: N802 (unittest's own name)
+    for key, value in _SAVED_ENV.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
 def _git(repo: Path, *args: str) -> str:
     p = subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True, env=_git_env()
@@ -108,6 +166,28 @@ def _commit(repo: Path, msg: str, allow_empty: bool = False) -> str:
     extra = ["--allow-empty"] if allow_empty else []
     _git(repo, "commit", "-qm", msg, *extra)
     return _git(repo, "rev-parse", "HEAD")
+
+
+def _git_shim(root: Path, fail_subcommands: tuple) -> Path:
+    """A ``git`` on PATH that FAILS for the named subcommands, delegating the rest.
+
+    The fail-closed branches are only pinned if something can MAKE the read fail;
+    a shim is the only way to force one probe to fail while the rest of the
+    worktree stays readable.
+    """
+    bindir = root / "bindir"
+    bindir.mkdir(parents=True, exist_ok=True)
+    shim = bindir / "git"
+    alts = "|".join(fail_subcommands)
+    shim.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in\n'
+        + "".join(f'  *" {c} "*) echo "shim: refusing {c}" >&2; exit 128;;\n'
+                  for c in fail_subcommands)
+        + f'esac\nexec "{REAL_GIT}" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return bindir
 
 
 def _squash_shape(repo: Path) -> tuple:
@@ -139,6 +219,43 @@ def _squash_shape(repo: Path) -> tuple:
     return feature, squash
 
 
+def _squash_then_advance(repo: Path) -> tuple:
+    """A squash-merged branch, with the base then moving ON: (feature_sha, main_sha).
+
+    This is the falsifying fixture for a tree-identity predicate. ``tree(feature)``
+    equals the squash commit's tree, and main's tip has since changed, so
+    ``tree(feature) != tree(main)`` holds for a branch carrying NOTHING unlanded.
+    The feature's file is byte-identical in main — asserted in the leg.
+    """
+    base = _git(repo, "rev-parse", "HEAD")
+    _write(repo, "feat.txt", "feat\n")
+    feature = _commit(repo, "feat work")
+    squash = _git(repo, "commit-tree", f"{feature}^{{tree}}", "-p", base, "-m", "squash of feat")
+    # main ADVANCES past the squash: the squash commit is checked out, so the new
+    # commit is parented on it and carries the feature tree plus one new file.
+    _git(repo, "checkout", "-q", "--detach", squash)
+    _write(repo, "later.txt", "later\n")
+    advance = _commit(repo, "main moves on")
+    _git(repo, "update-ref", "refs/remotes/origin/main", advance)
+    _git(repo, "checkout", "-q", "--detach", feature)
+    return feature, advance
+
+
+def _conflicting_branch(repo: Path) -> tuple:
+    """main and the branch edit the SAME line differently: (feature_sha, main_sha)."""
+    _write(repo, "base.txt", "one\n")
+    _commit(repo, "base line")
+    _git(repo, "checkout", "-q", "-b", "feat")
+    _write(repo, "base.txt", "two\n")
+    feature = _commit(repo, "feat edit")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, "base.txt", "three\n")
+    main = _commit(repo, "main edit")
+    _git(repo, "update-ref", "refs/remotes/origin/main", main)
+    _git(repo, "checkout", "-q", "--detach", feature)
+    return feature, main
+
+
 def _fixture(root: Path) -> Path:
     """A repo whose ``origin/main`` is a real remote-tracking ref, like the fleet.
 
@@ -168,6 +285,22 @@ class _PreflightTest(unittest.TestCase):
     def verdict(self, base: str = "origin/main") -> dict:
         return self.mod.evaluate(str(self.repo), base)
 
+    def with_git_shim(self, *fail_subcommands: str):
+        """Context manager: run this leg with a `git` that fails for those reads."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            bindir = _git_shim(self.tmp, tuple(fail_subcommands))
+            previous = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bindir}{os.pathsep}{previous}"
+            try:
+                yield
+            finally:
+                os.environ["PATH"] = previous
+
+        return _cm()
+
 
 class ContainedHeadIsNoWork(_PreflightTest):
     """The incident case: HEAD is already in the base, nothing is dirty."""
@@ -177,7 +310,7 @@ class ContainedHeadIsNoWork(_PreflightTest):
         self.assertEqual(res["verdict"], "NO-WORK", res)
         self.assertEqual(res["ahead"], 0)
         self.assertFalse(res["own_delta"])
-        self.assertFalse(res["tree_differs_from_base"])
+        self.assertFalse(res["would_change_base"])
         self.assertEqual(res["dirty"], 0)
 
     def test_exit_code_is_its_own_three(self):
@@ -190,9 +323,23 @@ class ContainedHeadIsNoWork(_PreflightTest):
         _git(self.repo, "checkout", "-q", "--detach", "origin/main")
         self.assertEqual(self.verdict()["verdict"], "NO-WORK")
 
+    def test_head_behind_the_base_is_no_work(self):
+        # HEAD strictly behind the base: own_delta=0 but the trees DIFFER, so
+        # this is the one shape where `own_delta` and `would_change_base` point
+        # in different directions. Nothing to land: the branch is contained.
+        old = _git(self.repo, "rev-parse", "HEAD")
+        _write(self.repo, "later.txt", "later\n")
+        _commit(self.repo, "base moves on")
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        _git(self.repo, "checkout", "-q", "--detach", old)
+        res = self.verdict()
+        self.assertFalse(res["own_delta"], res)
+        self.assertFalse(res["would_change_base"], res)
+        self.assertEqual(res["verdict"], "NO-WORK", res)
+
 
 class SquashMergedIsNoWork(_PreflightTest):
-    """``ahead > 0`` with an IDENTICAL tree to the base — a real squash merge."""
+    """``ahead > 0`` with the branch's whole delta already landed."""
 
     def test_real_squash_merge_is_no_work(self):
         feature, squash = _squash_shape(self.repo)
@@ -204,7 +351,7 @@ class SquashMergedIsNoWork(_PreflightTest):
         # The property that makes this a REAL squash and not a no-op commit:
         # merge-base sits at the fork point, so the branch's own delta exists.
         self.assertTrue(res["own_delta"], res)
-        self.assertFalse(res["tree_differs_from_base"], res)
+        self.assertFalse(res["would_change_base"], res)
         self.assertEqual(res["verdict"], "NO-WORK", res)
         self.assertEqual(self.mod.main(["--quiet", str(self.repo)]), 3)
 
@@ -215,13 +362,41 @@ class SquashMergedIsNoWork(_PreflightTest):
         self.assertGreater(res["ahead"], 0)
         self.assertEqual(res["verdict"], "NO-WORK", res)
 
+    def test_squash_landed_then_the_base_advanced_is_no_work(self):
+        # THE FALSIFYING SHAPE for a tree-identity predicate: the base moved after
+        # the squash, so tree(HEAD) != tree(base) while every byte HEAD carries is
+        # already in the base. A tree comparison says HAS-WORK here and the reason
+        # it prints is the opposite of the truth.
+        feature, main = _squash_then_advance(self.repo)
+        self.assertEqual(_git(self.repo, "show", f"{main}:feat.txt"), "feat",
+                         "fixture must already carry the branch's content")
+        res = self.verdict()
+        self.assertTrue(res["own_delta"], res)
+        self.assertFalse(res["would_change_base"], res)
+        self.assertEqual(res["verdict"], "NO-WORK", res)
+        self.assertEqual(self.mod.main(["--quiet", str(self.repo)]), 3)
+
+
+class RealWorkIsHasWork(_PreflightTest):
+    """The control for the legs above: a REAL diff must still be dispatched."""
+
     def test_a_real_commit_in_the_branch_is_has_work(self):
-        # The control for the legs above: same shape (ahead > 0) but a REAL diff.
         _write(self.repo, "new.txt", "content\n")
         _commit(self.repo, "real change")
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD~1")
         res = self.verdict()
         self.assertTrue(res["own_delta"])
-        self.assertTrue(res["tree_differs_from_base"])
+        self.assertTrue(res["would_change_base"])
+        self.assertEqual(res["verdict"], "HAS-WORK", res)
+        self.assertEqual(self.mod.main(["--quiet", str(self.repo)]), 0)
+
+    def test_a_conflicting_branch_is_has_work_not_unreadable(self):
+        # git ANSWERED (merge-tree exits 1 on conflict); a branch that cannot
+        # merge cleanly certainly has unlanded work. Treating the conflict as an
+        # error would refuse a lane that has the most work of all.
+        _conflicting_branch(self.repo)
+        res = self.verdict()
+        self.assertTrue(res["would_change_base"], res)
         self.assertEqual(res["verdict"], "HAS-WORK", res)
         self.assertEqual(self.mod.main(["--quiet", str(self.repo)]), 0)
 
@@ -260,6 +435,37 @@ class DirtyWorktreeIsHasWork(_PreflightTest):
         self.assertEqual(payload["dirty"], 1, payload)
         self.assertEqual(payload["verdict"], "HAS-WORK", payload)
 
+    def test_dirty_work_survives_an_unresolvable_base(self):
+        # THE DIRECTION THE HEADER CALLS UNFLIPPABLE. A fork/interrupted worktree
+        # may have no `origin/main` at all; its uncommitted work is still work, so
+        # the dirty read must short-circuit BEFORE anything that needs the base.
+        _write(self.repo, "kept.txt", "real uncommitted work\n")
+        res = self.verdict(base="origin/does-not-exist")
+        self.assertEqual(res["verdict"], "HAS-WORK", res)
+        self.assertEqual(res["dirty"], 1)
+        self.assertEqual(self.mod.main(["--quiet", "--base", "origin/does-not-exist",
+                                        str(self.repo)]), 0)
+
+
+class IdentityIsTheTarget(_PreflightTest):
+    """A path inside some repo is not the same thing as ITS OWN work tree root."""
+
+    def test_a_nested_directory_is_unreadable_not_the_enclosing_repo(self):
+        # `git -C <dir>` walks UPWARD. A stale/pruned `.worktrees/x/` would
+        # otherwise be answered from the main checkout: a confident verdict about
+        # the wrong tree, and an ALLOWED dispatch whose commits would land on the
+        # main checkout's branch.
+        stale = self.repo / ".worktrees" / "stale"
+        stale.mkdir(parents=True)
+        _write(self.repo, ".gitignore", ".worktrees/\n")
+        _commit(self.repo, "ignore worktrees")
+        _git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        _write(stale, "NOTES.md", "lane notes\n")
+        res = self.mod.evaluate(str(stale), "origin/main")
+        self.assertEqual(res["verdict"], "UNREADABLE", res)
+        self.assertIsNone(res["head"], "the enclosing repo's HEAD must not be reported")
+        self.assertEqual(self.mod.main(["--quiet", str(stale)]), 4)
+
 
 class UnreadableFailsClosed(_PreflightTest):
     """A probe that cannot answer must never answer 'there is work'."""
@@ -273,6 +479,13 @@ class UnreadableFailsClosed(_PreflightTest):
         plain.mkdir()
         self.assertEqual(self.mod.evaluate(str(plain), "origin/main")["verdict"], "UNREADABLE")
 
+    def test_a_repo_child_directory_is_unreadable(self):
+        # Not the same thing as the bare-dir leg above: this one is INSIDE a git
+        # work tree, which is the shape a stale `.worktrees/x/` actually has.
+        child = self.repo / "subdir"
+        child.mkdir()
+        self.assertEqual(self.mod.evaluate(str(child), "origin/main")["verdict"], "UNREADABLE")
+
     def test_unresolvable_base_is_unreadable_not_has_work(self):
         res = self.verdict(base="origin/does-not-exist")
         self.assertEqual(res["verdict"], "UNREADABLE", res)
@@ -283,6 +496,52 @@ class UnreadableFailsClosed(_PreflightTest):
         plain.mkdir()
         self.assertEqual(self.mod.main(["--quiet", str(plain)]), 4)
 
+    def test_unborn_head_is_unreadable(self):
+        # A repo with commits is required for every question; an unborn HEAD with
+        # untracked files is NOT "nothing to land" (we cannot read the state).
+        unborn = self.tmp / "unborn"
+        unborn.mkdir()
+        _git(unborn, "init", "-q", "-b", "main")
+        _write(unborn, "scratch.txt", "x\n")
+        res = self.mod.evaluate(str(unborn), "origin/main")
+        self.assertEqual(res["verdict"], "UNREADABLE", res)
+        self.assertEqual(self.mod.main(["--quiet", str(unborn)]), 4)
+
+    def test_a_failed_status_read_is_unreadable(self):
+        with self.with_git_shim("status"):
+            self.assertEqual(self.verdict()["verdict"], "UNREADABLE")
+
+    def test_a_failed_merge_base_read_is_unreadable(self):
+        with self.with_git_shim("merge-base"):
+            self.assertEqual(self.verdict()["verdict"], "UNREADABLE")
+
+    def test_a_failed_own_delta_diff_is_unreadable(self):
+        with self.with_git_shim("diff"):
+            self.assertEqual(self.verdict()["verdict"], "UNREADABLE")
+
+    def test_a_failed_merge_tree_read_is_unreadable(self):
+        with self.with_git_shim("merge-tree"):
+            self.assertEqual(self.verdict()["verdict"], "UNREADABLE")
+
+    def test_a_malformed_invocation_is_a_refusal_not_exit_two(self):
+        # The documented contract is 0/3/4. argparse's default exit 2 sits
+        # OUTSIDE it, so a caller written as "refuse on 3, escalate on 4,
+        # otherwise dispatch" would DISPATCH on its own typo.
+        with self.assertRaises(SystemExit) as caught:
+            self.mod.main(["--not-a-flag", str(self.repo)])
+        self.assertEqual(caught.exception.code, 4)
+
+
+class RenderBlock(_PreflightTest):
+    def test_the_dirty_evidence_is_indented_once_not_twice(self):
+        # The dirty file lines arrive already prefixed; the renderer adds ONE
+        # margin for every reason. A ternary with two identical arms (the shape
+        # this leg exists to catch) emitted them seven spaces deep.
+        _write(self.repo, "brand-new.md", "doc\n")
+        rendered = self.mod.render_block(self.verdict()).splitlines()
+        detail = [ln for ln in rendered if "?? brand-new.md" in ln]
+        self.assertEqual(detail, ["     ?? brand-new.md"], rendered)
+
 
 class JsonSurface(_PreflightTest):
     def test_json_carries_the_evidence_not_just_the_verdict(self):
@@ -292,7 +551,7 @@ class JsonSurface(_PreflightTest):
         )
         payload = json.loads(out.stdout)
         for key in ("worktree", "verdict", "head", "base_sha", "ahead",
-                    "own_delta", "tree_differs_from_base", "dirty", "why"):
+                    "own_delta", "would_change_base", "dirty", "why"):
             self.assertIn(key, payload)
         self.assertEqual(payload["verdict"], "NO-WORK")
         # The refusal must be readable: a verdict with no reason is unactionable.
@@ -302,27 +561,21 @@ class JsonSurface(_PreflightTest):
 MUTATIONS = [
     # (name, [(before, after), ...], the leg name that MUST go red)
     (
-        # NB: "own_delta = bool(ahead)" was tried here and REMOVED — with the two-diff
-        # predicate it is behaviourally EQUIVALENT (ahead > 0 implies a non-empty
-        # own delta once the tree check is also present), so it changed no verdict
-        # and the red control correctly refused to call it pinned. An equivalent
-        # mutation is a false alarm, not a missing pin.
-        "conflate diff rc=1 with an error (every diff becomes UNREADABLE)",
-        [
-            ('    if rc == 1:\n        return True\n    return None',
-             '    if rc == 1:\n        return None\n    return None'),
-        ],
+        # NB: "own_delta = bool(ahead)" was tried here and REMOVED — under this
+        # predicate it is behaviourally EQUIVALENT on every shape the suite
+        # builds (own_delta does not decide the verdict), so it changes no
+        # verdict and reporting it as "unpinned" would be a false alarm. An
+        # equivalent mutation is not a missing pin.
+        "the merge verdict becomes a plain tree-identity test (the squash-then-advance trap)",
+        [('    would_change = _would_change_base(worktree, base_sha, head)',
+          '    would_change = _diff_is_nonempty(worktree, base_sha, head)')],
         "SquashMergedIsNoWork",
     ),
     (
-        "diff only against the merge-base (a real squash reads as HAS-WORK)",
-        [('differs = _diff_is_nonempty(worktree, base_sha, head)', 'differs = True')],
-        "SquashMergedIsNoWork",
-    ),
-    (
-        "drop the own-delta check (every contained HEAD looks like work)",
-        [('own_delta = _diff_is_nonempty(worktree, merge_base, head)', 'own_delta = True')],
-        "ContainedHeadIsNoWork",
+        "a merge CONFLICT is treated as an error (the branch with the most work is refused)",
+        [('    if rc == 1:\n        return True\n    if rc != 0:\n        return None',
+          '    if rc != 0:\n        return None')],
+        "RealWorkIsHasWork",
     ),
     (
         "ignore dirty files (refuses work that only exists uncommitted)",
@@ -333,6 +586,18 @@ MUTATIONS = [
         "drop --untracked-files=normal (an ambient config hides untracked work)",
         [('["status", "--porcelain", "--untracked-files=normal"]', '["status", "--porcelain"]')],
         "DirtyWorktreeIsHasWork",
+    ),
+    (
+        "dirty only wins when the base resolves (real work is refused on a worktree with no base)",
+        [('    if result["dirty"]:',
+          '    if result["dirty"] and _resolve_base(worktree, base) is not None:')],
+        "DirtyWorktreeIsHasWork",
+    ),
+    (
+        "the target is accepted inside ANY repo (a stale .worktrees/x is answered from the main checkout)",
+        [('    if rc != 0 or not toplevel or os.path.realpath(toplevel) != os.path.realpath(worktree):',
+          '    if rc != 0:')],
+        "IdentityIsTheTarget",
     ),
     (
         "unreadable becomes HAS-WORK (a failed probe answers yes)",
@@ -346,6 +611,39 @@ MUTATIONS = [
         "unresolvable base becomes HAS-WORK",
         [
             ('        why.append(f"base {base!r} does not resolve in this worktree (no origin/{base} either)")\n        return result',
+             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
+        ],
+        "UnreadableFailsClosed",
+    ),
+    (
+        "an unborn HEAD becomes HAS-WORK",
+        [
+            ('        why.append("HEAD does not resolve (unborn or detached-empty worktree)")\n        return result',
+             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
+        ],
+        "UnreadableFailsClosed",
+    ),
+    (
+        "a failed status read becomes HAS-WORK",
+        [
+            ('        why.append(f"git status failed (rc={rc}) — cannot tell dirty from clean")\n        return result',
+             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
+        ],
+        "UnreadableFailsClosed",
+    ),
+    (
+        "a missing merge-base becomes HAS-WORK",
+        [
+            ('        why.append(f"no merge-base between HEAD {head[:12]} and {base} {base_sha[:12]} "\n'
+             '                   "(unrelated histories?) — cannot compute a diff")\n        return result',
+             '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
+        ],
+        "UnreadableFailsClosed",
+    ),
+    (
+        "a failed diff read becomes HAS-WORK",
+        [
+            ('        why.append("git could not report a merge verdict — cannot tell whether a diff exists")\n        return result',
              '        result["verdict"] = VERDICT_HAS_WORK\n        return result'),
         ],
         "UnreadableFailsClosed",
@@ -413,10 +711,10 @@ def red_control() -> int:
     return 0
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--red-control", action="store_true")
-    ns = ap.parse_args()
+    ns = ap.parse_args(argv)
     if ns.red_control:
         return red_control()
     result = run_suite()
@@ -424,4 +722,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

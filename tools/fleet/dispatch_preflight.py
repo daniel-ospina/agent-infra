@@ -47,28 +47,54 @@ read is WRONG in both directions:
    deliberate: a false refusal costs a delay, a false allow costs an untouched
    worktree, and only one of those loses work.
 
-THE PREDICATE IS TWO DIFFS, AND BOTH MUST BE NON-EMPTY
-------------------------------------------------------
-Case 2 is why a single diff is not enough, and the measured shape of it is
-precise: for a squash merge, ``tree(HEAD) == tree(base)`` while HEAD is NOT an
-ancestor of the base, so ``merge-base`` is the FORK POINT and
-``diff(merge-base, HEAD)`` is the branch's own delta — NON-EMPTY. Diffing only
-against the merge-base therefore reports HAS-WORK for exactly the case this
-tool exists to refuse (verified against a real squash: ahead=1, identical trees,
-``diff(merge-base,HEAD)=1``).
+THE PREDICATE: WOULD LANDING HEAD STILL CHANGE THE BASE?
+--------------------------------------------------------
+The question is not "is HEAD different from the base" — it is "does HEAD still
+add something to the base". Those are different questions, and the first one
+answers WRONGLY in the most common lifecycle shape of all.
 
-So there are two distinct questions and a worktree must answer YES to both:
+``would_change_base`` is a THREE-WAY MERGE, not a tree comparison:
 
-    own_delta             = diff(merge-base, HEAD) is non-empty   (I changed something)
-    tree_differs_from_base = diff(base, HEAD)      is non-empty   (it would still change base)
+    merged = git merge-tree --write-tree <base> <head>
+    would_change_base = merged_tree != tree(base)
 
-    contained HEAD       -> own_delta=0                     -> NO-WORK
-    squash-merged        -> tree_differs_from_base=0        -> NO-WORK
-    real work            -> both 1                          -> HAS-WORK
+Why a tree comparison (``diff --quiet base head``) is not enough — the measured
+falsification, on this repo's git 2.43: branch F adds ``feat.txt``, main takes F
+as a SQUASH commit S (so ``tree(F) == tree(S)``), and main then ADVANCES to M.
+Now ``tree(F) != tree(M)`` only because M moved, not because F carries anything
+unlanded — ``feat.txt`` is byte-identical in ``origin/main``. A tree comparison
+reports HAS-WORK, exit 0, and the reason string states the OPPOSITE of the
+truth ("HEAD carries content not in origin/main"), for exactly the lane this
+tool exists to refuse. The three-way merge yields ``tree(M)`` itself, so the
+answer is NO-WORK — and the reason can say "already landed".
 
-``tree_differs_from_base`` alone would also be wrong: a branch whose change was
-ALREADY applied upstream in a different form shows an empty base diff while
-carrying no own delta, and either read on its own admits one of the two cases.
+Symmetrically, ``diff(merge-base, HEAD)`` is NOT the answer either: for a squash
+merge ``merge-base`` sits at the FORK POINT, so the branch's own delta is
+non-empty for a branch whose whole content is already in the base. It is kept
+here as ``own_delta`` EVIDENCE — it is what lets the tool tell an operator
+"already contained" apart from "ahead, but already landed" — but it does not
+decide the verdict on its own.
+
+    contained HEAD                  -> merged == tree(base)   -> NO-WORK
+    squash-merged                   -> merged == tree(base)   -> NO-WORK
+    squash-merged, base then moved  -> merged == tree(base)   -> NO-WORK
+    real unlanded work              -> merged != tree(base)   -> HAS-WORK
+    a CONFLICTING branch            -> merge-tree exits 1     -> HAS-WORK
+
+A conflict is HAS-WORK, not UNREADABLE: git answered, and a branch that cannot
+merge cleanly certainly carries something that still has to land.
+
+THE PROBE MUST BE ABOUT THE TARGET, NOT ABOUT WHATEVER REPO ENCLOSES IT
+----------------------------------------------------------------------
+``git -C <dir>`` WALKS UPWARD. Every ``.worktrees/<name>`` lives inside the
+superproject, so a stale or half-pruned worktree — its ``.git`` link gone, its
+notes still inside — makes every read land in the MAIN CHECKOUT and the tool
+reports a confident verdict about a tree nobody asked about (measured: a nested
+``.worktrees/stale/`` answered NO-WORK with the superproject's HEAD, and
+HAS-WORK when the superproject was one commit ahead — i.e. a lane dispatched
+into a plain directory whose commits would go onto the main checkout's branch).
+So the target's own root is asserted: ``rev-parse --show-toplevel`` must be the
+realpath of the worktree passed in, else UNREADABLE.
 
 UNREADABLE IS A REFUSAL, NOT AN ALLOW
 -------------------------------------
@@ -80,8 +106,18 @@ from "I could not read it" — those need different operator responses.
 EXIT CODES
 ----------
     0  HAS-WORK      dispatch may proceed
-    3  NO-WORK       refuse: nothing to land (no diff, no dirty files)
-    4  UNREADABLE   refuse: could not read the git state (fail closed)
+    3  NO-WORK       refuse: nothing to land (would not change the base, nothing dirty)
+    4  UNREADABLE   refuse: the git state could not be read, OR the invocation was
+                     malformed (a usage error is a refusal too — a caller that
+                     writes "0 -> dispatch, anything else -> refuse" must not
+                     dispatch on a typo in its own argv)
+
+ONE SIDE EFFECT, STATED
+-----------------------
+A three-way merge has to materialise its result, so ``merge-tree --write-tree``
+writes ONE loose tree object into the worktree's object database (no ref, no
+commit, nothing reachable). The tool writes nothing else, moves no ref, and
+touches no network.
 
 USAGE
 -----
@@ -156,10 +192,37 @@ def _diff_is_nonempty(worktree: str, a: str, b: str) -> Optional[bool]:
     return None
 
 
+def _would_change_base(worktree: str, base_sha: str, head: str) -> Optional[bool]:
+    """True if landing ``head`` on ``base_sha`` would still change the base.
+
+    THE THREE-WAY MERGE, not a tree comparison (see the module header for the
+    measured falsification of the tree comparison: a squash-merged branch whose
+    base has since advanced compares UNEQUAL while carrying nothing unlanded).
+
+    ``git merge-tree --write-tree`` exits 0 on a clean merge (printing the merged
+    tree as its first line), 1 on CONFLICT (also printing a tree, with conflict
+    stages) and >1 on an error. A conflict is HAS-WORK, not a refusal: git
+    answered, and a branch that cannot merge cleanly carries something that
+    still has to land. Only an actual error is None.
+    """
+    rc, out = _git(worktree, ["merge-tree", "--write-tree", base_sha, head])
+    if rc == 1:
+        return True
+    if rc != 0:
+        return None
+    merged = out.splitlines()[0].strip() if out.strip() else ""
+    rc, base_tree = _git(worktree, ["rev-parse", f"{base_sha}^{{tree}}"])
+    if rc != 0 or not base_tree or not merged:
+        return None
+    return merged != base_tree
+
+
 def evaluate(worktree: str, base: str = "origin/main") -> dict:
     """Classify a worktree as HAS-WORK / NO-WORK / UNREADABLE.
 
-    Pure-ish: reads git state only, never writes and never touches the network.
+    Reads git state only: no ref is moved, nothing is committed, no network, and
+    the only write is the one loose tree object a three-way merge materialises
+    (``merge-tree --write-tree``).
     """
     result = {
         "worktree": os.path.realpath(worktree),
@@ -170,7 +233,7 @@ def evaluate(worktree: str, base: str = "origin/main") -> dict:
         "base_sha": None,
         "ahead": None,
         "own_delta": None,
-        "tree_differs_from_base": None,
+        "would_change_base": None,
         "dirty": None,
     }
     why: List[str] = result["why"]
@@ -184,6 +247,16 @@ def evaluate(worktree: str, base: str = "origin/main") -> dict:
         why.append(f"not a git work tree (git said rc={rc} {inside!r})")
         return result
 
+    # THE TARGET MUST BE ITS OWN ROOT. `git -C <dir>` walks UPWARD, so a stale
+    # or half-pruned directory under `.worktrees/` would otherwise be answered
+    # from the superproject — a confident verdict, and an allowed dispatch whose
+    # commits would land on the MAIN checkout's branch.
+    rc, toplevel = _git(worktree, ["rev-parse", "--show-toplevel"])
+    if rc != 0 or not toplevel or os.path.realpath(toplevel) != os.path.realpath(worktree):
+        why.append(f"the path is not its own work tree root (git reports {toplevel or 'nothing'!r}) — "
+                   "git -C would answer about the ENCLOSING repo, not the target")
+        return result
+
     rc, head = _git(worktree, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
     if rc != 0 or not head:
         # An empty repo / unborn HEAD. There is no content to land, but this is
@@ -192,13 +265,14 @@ def evaluate(worktree: str, base: str = "origin/main") -> dict:
         return result
     result["head"] = head
 
-    base_sha = _resolve_base(worktree, base)
-    if base_sha is None:
-        # We cannot see the base, so we cannot answer the question. Fail closed.
-        why.append(f"base {base!r} does not resolve in this worktree (no origin/{base} either)")
-        return result
-    result["base_sha"] = base_sha
-
+    # DIRTY IS PROBED FIRST, AND IT SHORT-CIRCUITS. It is the one answer that
+    # never needs the base: uncommitted/untracked changes ARE work to land even
+    # when the base cannot even be resolved (a fork worktree with no
+    # `origin/main`, a shallow checkout, unrelated histories). Probing it after
+    # base resolution would refuse real work — the direction the header
+    # documents as unflippable — so the short-circuit is the contract, not an
+    # optimisation.
+    #
     # `--untracked-files=normal` is passed EXPLICITLY: `git status --porcelain`
     # honours the ambient `status.showUntrackedFiles`, and a config value of `no`
     # (set in any global/system config file) hides untracked files entirely,
@@ -212,6 +286,20 @@ def evaluate(worktree: str, base: str = "origin/main") -> dict:
         return result
     dirty_lines = [ln for ln in status.splitlines() if ln.strip()]
     result["dirty"] = len(dirty_lines)
+    if result["dirty"]:
+        result["verdict"] = VERDICT_HAS_WORK
+        why.append(f"the working tree has {result['dirty']} uncommitted/untracked path(s) — "
+                   "that IS work to land")
+        for ln in dirty_lines[:5]:
+            why.append(f"  {ln}")
+        return result
+
+    base_sha = _resolve_base(worktree, base)
+    if base_sha is None:
+        # We cannot see the base, so we cannot answer the question. Fail closed.
+        why.append(f"base {base!r} does not resolve in this worktree (no origin/{base} either)")
+        return result
+    result["base_sha"] = base_sha
 
     rc, merge_base = _git(worktree, ["merge-base", head, base_sha])
     if rc != 0 or not merge_base:
@@ -222,34 +310,28 @@ def evaluate(worktree: str, base: str = "origin/main") -> dict:
     rc, ahead_s = _git(worktree, ["rev-list", "--count", f"{base_sha}..{head}"])
     result["ahead"] = int(ahead_s) if rc == 0 and ahead_s.isdigit() else None
 
-    # THE PREDICATE: two diffs, and BOTH must be non-empty. See the module header
-    # for why one is not enough (the squash-merge trap) and why neither alone is
-    # sufficient (a change already applied upstream).
+    # own_delta is EVIDENCE, not the verdict: it is what lets the reason below
+    # tell "already contained" apart from "ahead, but already landed".
     own_delta = _diff_is_nonempty(worktree, merge_base, head)
-    differs = _diff_is_nonempty(worktree, base_sha, head)
-    if own_delta is None or differs is None:
-        why.append("git diff failed to report a verdict — cannot tell whether a diff exists")
+    would_change = _would_change_base(worktree, base_sha, head)
+    if own_delta is None or would_change is None:
+        why.append("git could not report a merge verdict — cannot tell whether a diff exists")
         return result
     result["own_delta"] = own_delta
-    result["tree_differs_from_base"] = differs
+    result["would_change_base"] = would_change
 
-    if result["dirty"]:
+    if would_change:
         result["verdict"] = VERDICT_HAS_WORK
-        why.append(f"the working tree has {result['dirty']} uncommitted/untracked path(s) — "
-                   "that IS work to land")
-        for ln in dirty_lines[:5]:
-            why.append(f"    {ln}")
-    elif own_delta and differs:
-        result["verdict"] = VERDICT_HAS_WORK
-        why.append(f"HEAD {head[:12]} carries content not in {base} (ahead={result['ahead']})")
+        why.append(f"HEAD {head[:12]} still adds content to {base} "
+                   f"(ahead={result['ahead']})")
     else:
         result["verdict"] = VERDICT_NO_WORK
         if not own_delta:
             why.append(f"HEAD {head[:12]} is already contained in {base} "
                        f"(ahead={result['ahead']}, no own delta)")
         else:
-            why.append(f"HEAD {head[:12]} is ahead={result['ahead']} but ships the SAME TREE as "
-                       f"{base} — the change is already landed (squash-merged or re-applied)")
+            why.append(f"HEAD {head[:12]} is ahead={result['ahead']} but adds nothing to {base} — "
+                       "the change is already landed (squash-merged or re-applied)")
         why.append("a lane dispatched here has nothing to land: it can only stand down")
 
     return result
@@ -264,7 +346,7 @@ def render_block(res: dict) -> str:
         + (f" ({str(res['base_sha'])[:12]})" if res["base_sha"] else ""),
     ]
     for w in res["why"]:
-        lines.append(f"   {w}" if not w.startswith("    ") else f"   {w}")
+        lines.append(f"   {w}")
     if res["verdict"] == VERDICT_NO_WORK:
         lines.append("")
         lines.append("   → Do NOT spawn a lane here. Point the dispatch at work that is still open,")
@@ -274,7 +356,22 @@ def render_block(res: dict) -> str:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
+    class _RefusingParser(argparse.ArgumentParser):
+        """A usage error is a REFUSAL, never a silent pass-through.
+
+        argparse exits 2 on a malformed invocation, which sits OUTSIDE the
+        0/3/4 contract a caller switches on — a caller written as "refuse on 3,
+        escalate on 4, otherwise dispatch" would DISPATCH on its own typo.
+        Mapping it onto the refusal code makes every non-0 outcome a refusal.
+        """
+
+        def error(self, message: str) -> "None":  # type: ignore[override]
+            self.print_usage(sys.stderr)
+            print(f"dispatch-preflight: {message} — a malformed invocation is a refusal "
+                  f"(exit {EXIT_UNREADABLE})", file=sys.stderr)
+            raise SystemExit(EXIT_UNREADABLE)
+
+    ap = _RefusingParser(
         description="Refuse a lane dispatch into a worktree that has nothing to land.",
     )
     ap.add_argument("worktree", help="path to the worktree a lane would be dispatched into")
