@@ -61,8 +61,14 @@ grep -E '^is_num\(\) \{' "$ORCH" > "$TMP/isnum.sh"
 # ("a capacity refusal NAMES itself") stays green on the prefix alone. Same defect the red-fixer drive
 # had, in the suite that drives the other four lines.
 sed -n '/^spawn_gate_tok() {/,/^}/p' "$ORCH" > "$TMP/spawntok.sh"
+# ⛔ THE SPAWN-EVIDENCE READER IS EXTRACTED TOO (agent-infra#2590). The `[spawn]` line inside the
+# [prsum] block calls `spawns_since`, which is DEFINED OUTSIDE it — an undefined command there yields
+# an empty count, which reads as UNMEASURED and would leave every assertion below green while the
+# shipped reader was broken. Same class as the `spawn_gate_tok` extraction above.
+sed -n '/^spawns_since() {/,/^}/p' "$ORCH" > "$TMP/spawns.sh"
 [ -s "$TMP/shq.sh" ] || { echo "FATAL: shq() not found in orch-loop.sh"; exit 1; }
 [ -s "$TMP/isnum.sh" ] || { echo "FATAL: is_num() not found in orch-loop.sh"; exit 1; }
+[ -s "$TMP/spawns.sh" ] || { echo "FATAL: spawns_since() not found in orch-loop.sh"; exit 1; }
 # ⛔ THE REVIEW-GATE ARM'S OWN CLASSIFIER, EXTRACTED AND NOT STUBBED (#2333 review, P2). Since
 # agent-infra#2132 the arm decides NEEDS-FIX vs NEEDS-REVIEW through `review_gate_state()`, which
 # reads the findings marker. A driver that stubbed it would grade its own copy and could never reach
@@ -415,6 +421,82 @@ drive "" rail 0
 [ "$(waits)" -ge 1 ] && [ "$(spawns)" = "0" ] \
   && ok "an EMPTY class (unreadable check read) also gets a named wait" \
   || bad "an empty class still falls through (waits=$(waits) spawns=$(spawns))"
+
+# ⛔ THE NAMED VERDICTS (agent-infra#2719). Before the arm, all four causes arrived as the ONE token
+# above and the only thing the cycle could print was "re-read next cycle". Each cause has its own
+# remedy, so each must reach its own row — and NOT ONE of them may spawn: an empty check surface is
+# never a green and never a reason to act on the code.
+for _nm in \
+  "NOCHECKS:READ-FAILED:transport: error connecting to api.github.com" \
+  "NOCHECKS:BUDGET:this box's share of the ACCOUNT's core budget is exhausted (fleet=4)" \
+  "NOCHECKS:WAIT:a run is executing and has produced no check-run yet (Python CI run 77 in_progress)" \
+  "NOCHECKS:DEFERRED-REPAIR:ci-check-repair (scheduled workflow) owns the re-trigger" \
+  "NOCHECKS:RUN-STARTED:a token the resolver never emits (a NEW token must still not spawn)"; do
+  drive "$_nm" rail 0
+  _k="${_nm%%:*}"; _r="$(reason)"
+  [ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] \
+    && ok "${_nm%%:*}…: one wait row, NOTHING spawned (the cause is named, not acted on)" \
+    || bad "${_nm}: spawns=$(spawns) acts=$(acts) waits=$(waits)"
+  case "$_r" in *"${_nm#NOCHECKS:}"*) ok "…and the ledger row CARRIES the named cause" ;;
+    *) bad "the ledger row does not carry the cause: '$_r'" ;; esac
+  # ⛔ AND IT MUST HAVE REACHED THE NAMED ARM, NOT THE RESIDUAL `*)` CATCH-ALL (review P3,
+  # agent-infra#2719). Both arms write one `wait` row carrying `$V`, so every other assertion here
+  # passed with the `NOCHECKS:*` arm DELETED — measured. The residual arm's reason text is the
+  # distinguishing fact: it says "unreadable or empty", which is exactly the collapse this change
+  # removes.
+  case "$_r" in *"unreadable or empty"*) bad "'${_nm%%:*}' fell through to the residual catch-all: '$_r'" ;;
+    *) ok "…and it was the NAMED arm that handled it (not the residual catch-all)" ;; esac
+  [ ! -f "$TMP/O/state/parked-4242" ] \
+    && ok "…and a non-terminal cause never parks the head" \
+    || bad "'${_nm%%:*}' PARKED a head that a later cycle can still resolve"
+done
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head (head abc1234)" rail 0
+[ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] \
+  && ok "NOCHECKS:UNRESOLVABLE: one wait row and NOTHING spawned (a dead end is never a fix or a merge)" \
+  || bad "NOCHECKS:UNRESOLVABLE: spawns=$(spawns) acts=$(acts) waits=$(waits)"
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "…and it PARKS the head (no further cycle is spent on a named dead end)" \
+  || bad "the unresolvable verdict did not park the head ($(cat "$TMP/O/state/parked-4242" 2>/dev/null))"
+grep -q 'NOCHECKS-UNRESOLVABLE' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…with the verdict as the park REASON (so the next cycle reports why, not 'parked')" \
+  || bad "the park carries no reason ($(cat "$TMP/O/state/parkreason-4242" 2>/dev/null))"
+grep -q 'PARKED — NOCHECKS-UNRESOLVABLE' "$TMP/d.log" \
+  && ok "…and the log line says PARKED with the verdict" \
+  || bad "the log does not report the park"
+# ⛔ A VERDICT THAT NEVER REACHED THE PR MUST NOT PARK (agent-infra#2719 review P2): the arm never
+# re-enters a parked head, so a failed post would be retried never and the PR would be dead-ended with
+# no explanation anywhere a human looks.
+# the earlier drive PARKED this head, and `drive()` does not clear the park files (they are the very
+# state this assertion is about) — so clear them first or the assertion reads the previous drive's park.
+rm -f "$TMP/O/state/parked-4242" "$TMP/O/state/parkreason-4242"
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head (head abc1234) [post=failed]" rail 0
+[ ! -f "$TMP/O/state/parked-4242" ] \
+  && ok "[post=failed]: the head is NOT parked (the verdict is retried instead of lost)" \
+  || bad "a verdict that could not be posted still parked the head"
+[ "$(waits)" = "1" ] && [ "$(spawns)" = "0" ] \
+  && ok "[post=failed]: still one wait row and nothing spawned" \
+  || bad "[post=failed]: waits=$(waits) spawns=$(spawns)"
+grep -q 'verdict could NOT be posted' "$TMP/d.log" \
+  && ok "…and the log NAMES the failed post" \
+  || bad "the log does not report the failed post"
+# …but a post that has now failed its bounded number of times IS parked, with the failure as the reason.
+rm -f "$TMP/O/state/parked-4242" "$TMP/O/state/parkreason-4242"
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head (head abc1234) [post=failed-parked]" rail 0
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "[post=failed-parked]: the bounded-retry case DOES park (the token is not terminal for ever)" \
+  || bad "a post that exhausted its attempts was not parked — the retry would loop for ever"
+grep -q 'could not be posted' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…and the park reason records the post failure (a human can see why nothing was published)" \
+  || bad "the park reason does not record the post failure"
+# …and when the post bound itself cannot be COUNTED (state/ unwritable), it is named and parked.
+rm -f "$TMP/O/state/parked-4242" "$TMP/O/state/parkreason-4242"
+drive "NOCHECKS:UNRESOLVABLE:no workflow run exists at this head [post=failed-inert]" rail 0
+[ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+  && ok "[post=failed-inert]: an UNCOUNTABLE post bound parks too (a named dead end beats a comment loop)" \
+  || bad "an uncountable post bound was left retrying for ever"
+grep -q 'could not be counted' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+  && ok "…and the park reason says the bound was INERT" \
+  || bad "the park reason does not name the inert bound"
 
 echo
 echo "=== T1: a claim has a spawn behind it, and a failed spawn is never silent ==="
@@ -888,13 +970,17 @@ if [ -s "$TMP/sum.sh" ] && grep -q 'PR path:' "$TMP/sum.sh"; then
       O="$TMP/O"; LOG="$TMP/s.log"; PRDISP="$TMP/s.tsv"; PRDISP_OK="$2"; POP="$3"; UPN_WORK="$4"
       SPAWNREF="$TMP/O/state/spawn-refused.tsv"
       SCOPE_MODE=BROAD; FLOOR_NOTE=""; PR_FIRST_TOK=""
+      # CYCLE_T0 is the SPAWN BASELINE the shipped block reads. Unset, the reader must say UNMEASURED
+      # rather than "NONE" — driven by the `summarise_u` case below.
+      if [ "${5+x}" = x ]; then CYCLE_T0="$5"; fi
       WT_DIR="$TMP/O/state"; WT_TABLE_TTL=0
       # shellcheck disable=SC1090
       . "$HERE/worker-terminal.sh"
       cmux() { printf '{"workspaces":[],"screens":[],"tabs":[],"terminals":[]}\n'; return 0; }
       . "$TMP/isnum.sh"
+      . "$TMP/spawns.sh"
       . "$TMP/sum.sh"
-      printf 'FIRSTTOK=%s\n' "$PR_FIRST_TOK"
+      printf 'FIRSTTOK=%s\nSPAWNS=%s\n' "$PR_FIRST_TOK" "${PRDISP_SPAWNS:-}"
     ) > "$TMP/s.tok" 2>&1
   }
   summarise "$(printf '11\tabc\tGREEN\tact\tmerged (gate authority)\n')" 1 open-rows 3
@@ -929,6 +1015,70 @@ else
 fi
 
 fi  # /acting-case extractable
+
+echo
+echo "=== T7: ACT IS NOT SPAWN — the pass must say what it STARTED (agent-infra#2590) ==="
+# ⛔ THE MEASURED DEFECT. A disposition row is `act` for an auto-merge ARM, a draft-ready and a rerun —
+# none of which starts a worker — so `N acted` was printed beside `lanes=0` on a box that had started
+# nothing at all (live log: `[pr] PR path: 2 acted (#9812,#9528)` where #9528's row was `auto-armed`).
+# The spawn count therefore comes from the worker records `wt_spawn` writes, never from the ledger.
+if [ -s "$TMP/sum.sh" ] && [ -s "$TMP/spawns.sh" ]; then
+  # ── the reader, on its own ──────────────────────────────────────────────────────────────────────
+  SP="$TMP/spawnO"; mkdir -p "$SP/state"; BASE=1700000000
+  rm -f "$SP"/state/worker-*
+  printf 'kind=tmux\ncreated=%s\n' "$((BASE + 5))"  > "$SP/state/worker-merge-11"
+  printf 'kind=tmux\ncreated=%s\n' "$((BASE + 9))"  > "$SP/state/worker-fix-12"
+  printf 'kind=tmux\ncreated=%s\n' "$((BASE - 600))" > "$SP/state/worker-merge-8"   # LAST cycle's
+  printf 'kind=tmux\n'                              > "$SP/state/worker-merge-7"    # no created= field
+  printf 'kind=tmux\ncreated=%s\n' "$((BASE + 5))"  > "$SP/state/worker-bad name"   # not a wt tag
+  _rs() { ( O="$SP"; . "$TMP/spawns.sh"; . "$TMP/isnum.sh"; WT_DIR="$SP/state" spawns_since "$@" ); }
+  _got="$(_rs "$BASE")"
+  case "$_got" in
+    "2"*"fix-12,merge-11") ok "the reader counts ONLY records created at/after the cycle start, by tag" ;;
+    *) bad "the spawn reader returned '$_got' (want 2 + fix-12,merge-11: a stale/foreign record proves nothing)" ;;
+  esac
+  _got="$(_rs "")"
+  [ -z "$_got" ] && ok "an UNREADABLE baseline yields NO answer (never a zero — a zero is a measurement)" \
+                 || bad "an empty baseline produced '$_got' instead of no answer"
+  _got="$(_rs "$((BASE + 100))")"
+  case "$_got" in "0"*) ok "a baseline after every record measures a real ZERO" ;;
+                 *) bad "a baseline past every record returned '$_got', not a measured 0" ;; esac
+  # ── the shipped terminal line ──────────────────────────────────────────────────────────────────
+  _sp() { # _sp <cycle-t0>  -> the [spawn] line the shipped block printed
+    : > "$TMP/s.log"
+    ( O="$TMP/O"; LOG="$TMP/s.log"; PRDISP="$TMP/s.tsv"; PRDISP_OK=1; POP=open-rows; UPN_WORK=3
+      SCOPE_MODE=BROAD; FLOOR_NOTE=""; PR_FIRST_TOK=""; WT_DIR="$SP/state"; WT_TABLE_TTL=0
+      CYCLE_T0="$1"
+      . "$HERE/worker-terminal.sh"
+      cmux() { printf '{"workspaces":[],"screens":[],"tabs":[],"terminals":[]}\n'; return 0; }
+      . "$TMP/isnum.sh"; . "$TMP/spawns.sh"; . "$TMP/sum.sh" >/dev/null 2>&1
+      printf '%s' "${PRDISP_SPAWNS:-<unset>}" > "$TMP/sp.out" ) >/dev/null 2>&1
+    grep -h '^\[spawn\]' "$TMP/s.log" 2>/dev/null
+  }
+  _got="$(_sp "$BASE")"; _c="$(cat "$TMP/sp.out" 2>/dev/null)"
+  case "$_got" in
+    "[spawn] SPAWNED 2 worker(s) in this pass's PR sweep: fix-12,merge-11"*) ok "a pass that started workers SAYS so, and names them" ;;
+    *) bad "the [spawn] line did not name the workers this pass started: '$_got'" ;;
+  esac
+  if [ "$_c" = "2" ]; then ok "…and the count the funnel and the drain guard read is set to it"
+  else bad "PRDISP_SPAWNS was '$_c' after a 2-spawn pass"; fi
+  _got="$(_sp "$((BASE + 100))")"; _c="$(cat "$TMP/sp.out" 2>/dev/null)"
+  case "$_got" in
+    "[spawn] NONE"*"the PR sweep started no worker this pass"*) ok "a pass that started NOTHING says NONE — and says acts may still exist" ;;
+    *) bad "a zero-spawn pass did not say NONE: '$_got'" ;;
+  esac
+  if [ "$_c" = "0" ]; then ok "…and the count is a MEASURED 0, so the funnel cannot borrow the word 'dispatch'"
+  else bad "PRDISP_SPAWNS was '$_c' after a zero-spawn pass"; fi
+  _got="$(_sp "")"; _c="$(cat "$TMP/sp.out" 2>/dev/null)"
+  case "$_got" in
+    "[spawn] UNMEASURED"*) ok "an UNREADABLE spawn answer says UNMEASURED — never 'NONE' (a claim from no measurement)" ;;
+    *) bad "an unreadable spawn answer printed '$_got' instead of UNMEASURED" ;;
+  esac
+  if [ "$_c" = "<unset>" ]; then ok "…and no count is published, so a reader cannot mistake it for zero"
+  else bad "an UNMEASURED pass published a count of '$_c'"; fi
+else
+  bad "the [prsum] or the spawns_since reader is missing — the terminal spawn line is untested"
+fi
 
 echo
 echo "=== T6: the ledger is a RECORD, never a gate input ==="
