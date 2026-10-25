@@ -1147,8 +1147,8 @@ fi
 # The idle-shell rule demotes a holder and adds its pid to the exclude list, so the next probe call
 # advances instead of re-reporting the pid it just demoted. K7 pins that for the ARGV table, and the two
 # remaining sites were UNEVEN in coverage — measured on the 207-assertion tree: deleting the skip from
-# `cwd_witness_for` turned 203/207 red (K2's `k/idle` and K6's `1:08:30` arm already reached it), while
-# deleting the skip from `tmux_witness_for` left 207/207 GREEN. So K9 is the arm that closed a real gap
+# `cwd_witness_for` left it at 203/207 (FOUR red: K2's `k/idle` pair and K6's `1:08:30` pair already
+# reached that site), while deleting the skip from `tmux_witness_for` left 207/207 GREEN. So K9 is the arm that closed a real gap
 # and K8 makes the cwd site explicit rather than incidental — stated that way round because the failure
 # mode of a lost skip is the same at both sites: the scan re-reads the pid it just demoted until the
 # runaway cap, then fails closed, i.e. the KEEP rule silently stops firing for the exact cell-4 shape
