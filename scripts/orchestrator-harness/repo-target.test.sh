@@ -346,6 +346,23 @@ RC_O2="$T/o-rc2"; mkdir -p "$RC_O2"; printf '6003\n6004\n' > "$RC_O2/.batch"; pr
 ( LOG="$T/rc1.log"; : > "$LOG"; O="$RC_O2"; K=2; _dmrc=0; . "$T/isnum.sh"; . "$T/dmrecount.sh"; \
     printf 'K=%s batch=[%s]\n' "$K" "$(tr '\n' ' ' < "$RC_O2/.batch")" ) > "$T/rc1.out" 2>&1
 { grep -q 'K=1 batch=\[6003 \]' "$T/rc1.out"; }; ck "D6 partial batch -> K counts only the lanes that reached a spawn (2 -> 1) and .batch is pruned" $?
+# ⛔ THE SHAPE WHERE THE CALL ITSELF CANNOT RUN (#2762 review, 6th cycle, P2): bash 127 because
+# dispatch-merge.sh is absent from a HALF-DEPLOYED $O (the very shape this change is about), or 126 when
+# it is not executable. `rm -f .dispatched-ids` ran, so no file exists and NO recound arm above matched:
+# the chain fell through with K still counting CLAIMS and the funnel recorded `dispatched=N` for a batch
+# that spawned nothing — the permanent false PASS, in the shape the PR is otherwise about. The else arm
+# is extracted and driven directly so the assertion survives a refactor of the surrounding chain.
+sed -n '/# \[dmnofile:begin\]/,/# \[dmnofile:end\]/p' "$HERE/orch-loop.sh" | sed '1d;$d' > "$T/dmnofile.sh"
+[ -s "$T/dmnofile.sh" ] && grep -q 'K=0' "$T/dmnofile.sh"
+ck "D7 the 'dispatch-merge.sh never ran' arm is extractable from orch-loop.sh" $?
+RC_O3="$T/o-rc3"; mkdir -p "$RC_O3"; printf '6005\n6006\n' > "$RC_O3/.batch"
+( LOG="$T/rc2.log"; : > "$LOG"; O="$RC_O3"; K=2; _dmrc=127; unset GATE_WHY; . "$T/dmnofile.sh"; \
+    printf 'K=%s batch=[%s] gate=[%s]\n' "$K" "$(tr '\n' ' ' < "$RC_O3/.batch")" "${GATE_WHY:-}" ) > "$T/rc2.out" 2>&1
+{ grep -q 'K=0 batch=\[\] gate=\[dispatch(dispatch-merge.sh did not run: rc=127)' "$T/rc2.out"; }; ck "D7 no .dispatched-ids and rc=127 -> K=0, .batch cleared, GATE_WHY names the rc (never 'dispatched=N')" $?
+RC_O4="$T/o-rc4"; mkdir -p "$RC_O4"; printf '6007\n' > "$RC_O4/.batch"
+( LOG="$T/rc3.log"; : > "$LOG"; O="$RC_O4"; K=1; _dmrc=126; GATE_WHY="ci-queue(already set)"; . "$T/dmnofile.sh"; \
+    printf 'K=%s gate=[%s]\n' "$K" "${GATE_WHY:-}" ) > "$T/rc3.out" 2>&1
+{ grep -q 'K=0 gate=\[ci-queue(already set)\]' "$T/rc3.out"; }; ck "D7 an existing GATE_WHY is not overwritten by the no-file arm (same rule as every other arm)" $?
 
 # ═══ F. the module is REQUIRED in every caller (T9) ═════════════════════════════════════════════
 echo

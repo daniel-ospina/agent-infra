@@ -5945,6 +5945,21 @@ PY
           fi
         fi
         # [dmrecount:end]
+      else
+        # [dmnofile:begin] (extracted and DRIVEN by repo-target.test.sh — keep the markers)
+        # ⛔ `dispatch-merge.sh` DID NOT RUN AT ALL (#2762 review, 6th cycle, P2). `rm -f` above removed a
+        # stale `.dispatched-ids`, so when the call itself cannot execute — bash returns 127 because the
+        # script is absent from a HALF-DEPLOYED `$O`, or 126 because it is not executable — no arm above
+        # matches, no file is published, and the chain fell through with `K` still counting CLAIMS: the
+        # funnel then recorded `dispatched=N … nothing=none` for a batch that spawned nothing. That is
+        # the permanent false PASS the recount exists to remove, surviving in the one shape this change is
+        # otherwise about (a partial `$O`), so it is its OWN counted arm rather than a silent skip. The
+        # cause is named here because `_dmrc` is unambiguous (the call produced no file AND failed), unlike
+        # the delta branch above where bare ids cannot say what refused.
+        echo "[dispatch] dispatch-merge.sh produced no .dispatched-ids (rc=$_dmrc) — nothing was dispatched; the batch is re-decided next cycle" >> "$LOG"
+        K=0; : > "$O/.batch"
+        [ -n "${GATE_WHY:-}" ] || GATE_WHY="dispatch(dispatch-merge.sh did not run: rc=$_dmrc)"
+        # [dmnofile:end]
       fi
       # …and the deferral's reason rides the SAME funnel line (#2333 cycle 6 review, P2): arg 3 was
       # `""` while `GATE_WHY` had just been set, so the cycle's one `-> 0 dispatched` line dropped the
