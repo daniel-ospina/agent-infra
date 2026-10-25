@@ -643,14 +643,18 @@ REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM — …`  (AGENT_DISK
 
 `tree` is what ONE more lane costs *while the shared uv cache holds*; `self` is what the same lane
 costs when it does not (a pruned cache, `--link-mode=copy`, a cache on another mount); `reserve` is the
-headroom that must still be free **after** that worst case. `max(tree, self)` is not a redundancy: a
+headroom that must still be free **after** that worst case — **4x the dispatch floor**, which is the
+number the cell's warning band defaults to, derived independently: the reserve is an *enforcement* bound
+and the band is a *reporting* threshold, so an operator lowering the band to quiet the logs cannot be
+lowering admission with it. `max(tree, self)` is not a redundancy: a
 gate that admitted on `tree + reserve` lets one lane eat the whole reserve and leaves the cell at
 ~700 MB, which is below the 2,286 MB cell-4 wedged at. `tree` and `self` are **measured per target**,
-never one global constant (`reserve` comes from the cell's own warning band): #1852 recorded that a single constant cannot serve an agent-infra lane
+never one global constant (`reserve` is 4x the dispatch
+floor, which is enforcement, not a per-target measurement): #1852 recorded that a single constant cannot serve an agent-infra lane
 (48 MB, no install) and a tortoise lane (5.7 GB of python), and a tortoise-sized floor would refuse
-every harness spawn on every cell — a false *block*, which is its own defect. `reserve` defaults to the
-cell's own warning band (`DISK_WARN_FREE_MB` = 4x `DISK_MIN_FREE_MB`), so an admitted spawn can never
-be the one that drops the cell into the band its supervisor calls "filling".
+every harness spawn on every cell — a false *block*, which is its own defect. The band is
+evaluated **before** the headroom refusal (a warning that can never fire is not an instrument), and an
+admitted spawn cannot drop the cell below 4x the dispatch floor.
 
 ### Measured (2026-10-24, 8-vCPU cell, `/dev/root` 128,828 MB, `uv` 0.12.5, warm uv cache)
 
@@ -669,8 +673,14 @@ and a cache on another mount never share at all — so the gate ships both numbe
 
 | target | `DISK_LANE_TREE_MB` | `DISK_LANE_SELF_MB` | `DISK_LANE_RESERVE_MB` |
 |---|---|---|---|
-| python project (any package-manager marker, `uv.lock`/`pyproject.toml`/`requirements.txt`/`poetry.lock`/… here or one level down) | **350** | **6144** (6 GiB = the 5,772 MB self-contained tree, rounded up) | **2000** (the supervisor's warning band; admit iff free >= 8144) |
+| python project (any of nine package-manager markers — `uv.lock`, `pyproject.toml`, `requirements.txt`, `poetry.lock`, `pdm.lock`, `Pipfile`, `setup.py`, … — at the top level **or one level down**) | **350** | **6144** (6 GiB = the 5,772 MB self-contained tree, rounded up) | **2000** (4x the floor; admit iff free >= 8144) |
 | no install step (harness lane) | **64** | **64** | **2000** (admit iff free >= 2064) |
+
+The gate's ledger records `tree` (field 6), `reserve` (7) and `self` (8) per spawn. ⛔ `self` is
+appended **last** on purpose: field 7 already means *reserve* in the series already shipped, and moving
+the worst case into it would silently re-label every historical row — a `64 1024` harness row would read
+as "this lane costs 1024 MB without sharing", 16x its real cost, i.e. exactly the figure a per-cell
+budget is calibrated from.
 
 `uv.lock` alone was the first discriminator and it was a **false pass**: a pip/poetry/pdm service, or a
 monorepo whose lock sits in `backend/`, installs the same ~5.7 GB venv and would have been admitted on
@@ -728,8 +738,10 @@ its pane or its `cd` behind is. Every other gate is untouched (`dirty`, `ignored
 `too-recent`, `detached-unreachable`, `remote-only-ref`), so the blast radius of a wrong reading is a
 re-created env or checkout — never uncommitted or unpushed work. Every unprovable input (pid not in the
 `ps` table, unreadable start time, undatable HEAD, failed probe) leaves the holder **live**, and each
-demotion is named in the pass log (`stale-shell:` / `STALE-SHELL`) and in the row
-(`unref=stale-shell:<pids>`). `REAP_VENV_IDLE_SHELL=0` / `REAP_WT_IDLE_SHELL=0` restore the strict
+demotion is named in the pass log (`stale-shell:` / `STALE-SHELL`), and `pi-reap-worktrees.sh` also
+carries it into the row (`unref=stale-shell:<pids>`) — the venv reaper's row has no `unref` column, so
+for an env the pass log is the record (stated here because the difference otherwise reads as a missing
+field). `REAP_VENV_IDLE_SHELL=0` / `REAP_WT_IDLE_SHELL=0` restore the strict
 reading without editing a shipped script.
 
 The scan that applies the rule examines **every** holder (an idle shell and a working lane routinely

@@ -1451,7 +1451,17 @@ got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$T
 ck "a target with no install step derives the harness triple (want '64 64 2000', got '${got:-<none>}')" $rc
 got="$(DISK_MIN_FREE_MB=1000 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
 [ "$got" = "350 6144 4000" ]; rc=$?
-ck "...and the RESERVE tracks the cell's own warning band rather than a fourth constant to keep in sync (floor 1000 -> want '350 6144 4000', got '${got:-<none>}')" $rc
+ck "...and the RESERVE is 4x the DISPATCH floor (floor 1000 -> want '350 6144 4000', got '${got:-<none>}')" $rc
+# THE RESERVE MUST NOT FOLLOW THE *REPORTING* KNOB (review round 3, P2; the arm above cannot see this).
+# `DISK_WARN_FREE_MB` is a NOISE threshold an operator lowers to quiet the logs. While the reserve
+# defaulted to it, silencing a warning silently loosened admission - a capacity change nobody would
+# review as one. Driven with the band at 1 and at 999999: the reserve must not move either way.
+got="$(DISK_MIN_FREE_MB=500 DISK_WARN_FREE_MB=1 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
+[ "$got" = "350 6144 2000" ]; rc=$?
+ck "lowering the WARN BAND does not lower admission: the reserve stays 4x the floor (got '${got:-<none>}')" $rc
+got="$(DISK_MIN_FREE_MB=500 DISK_WARN_FREE_MB=999999 bash -c '. "$1"; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
+[ "$got" = "350 6144 2000" ]; rc=$?
+ck "and raising it does not raise admission either - the two knobs are separate on purpose (got '${got:-<none>}')" $rc
 got="$(DISK_MIN_FREE_MB=500 bash -c '. "$1"; DISK_LANE_TREE_MB=912 DISK_LANE_SELF_MB=4000 DISK_LANE_RESERVE_MB=5; disk_lane_costs "$2"' _ "$GATE" "$TMP/uvtarget")"
 [ "$got" = "912 4000 5" ]; rc=$?
 ck "an operator OVERRIDE wins over the derived triple — a cell that measured differently can say so (got '${got:-<none>}')" $rc
@@ -1506,8 +1516,12 @@ ck "an UNREADABLE reading fails OPEN, matching disk_ok/disk_low — a probe that
 : > "$TMP/O/state/disk.tsv"
 res="$(drive_hd "$TMP" 7 13 11)"; rc=$?
 row="$(tail -1 "$TMP/O/state/disk.tsv" 2>/dev/null)"
-{ [ "$res" = "rc=0 started=1" ] && [ "$(printf '%s' "$row" | cut -f6)" = "7" ] && [ "$(printf '%s' "$row" | cut -f7)" = "13" ] && [ "$(printf '%s' "$row" | cut -f8)" = "11" ]; }; rc=$?
-ck "an ALLOWED run records marginal tree + worst case + reserve in disk.tsv, so the series separates 'what it cost' from 'what it would have cost' (row='${row}')" $rc
+# ⛔ FIELD 7 IS THE RESERVE, NOT THE WORST CASE (review round 3, P2): main already ships `tree reserve`
+# in 6-7, so putting `self` there re-labels every historical row — a pre-change harness row `64 1024`
+# would read as "this lane costs 1024 MB without sharing", 16x its real cost, i.e. the number a
+# per-cell budget gets calibrated from. `self` is APPENDED as field 8.
+{ [ "$res" = "rc=0 started=1" ] && [ "$(printf '%s' "$row" | cut -f6)" = "7" ] && [ "$(printf '%s' "$row" | cut -f7)" = "11" ] && [ "$(printf '%s' "$row" | cut -f8)" = "13" ]; }; rc=$?
+ck "an ALLOWED run records tree + reserve + worst case in disk.tsv (6,7,8), keeping field 7's shipped meaning (row='${row}')" $rc
 
 # ── THE ADVANCE WARNING MUST BE ABLE TO FIRE ON A PYTHON TARGET (review round 1, P2) ──────────────
 # The band (`DISK_WARN_FREE_MB`, 4x the floor) sits ENTIRELY below a python lane's admission bound
@@ -1535,6 +1549,28 @@ res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=150 PI_LOG="$PI_LOG" O=
 ck "one lane's-worth of headroom left still ADMITS this spawn ($res)" $rc
 grep -q 'within one lane of the headroom bound' "$LOG"; rc=$?
 ck "...and WARNS that the NEXT lane will be refused DISK-NOHEADROOM — the warning fires where the band cannot reach" $rc
+# ── THE BAND IS EVALUATED BEFORE THE HEADROOM REFUSAL (review round 3, P2) ─────────────────────
+# The band is 4x the floor and the headroom bound is `max(tree,self) + reserve`, which is ALWAYS above
+# it for every shipped target — so with the band last, "a device that fills SILENTLY is the defect"
+# could never fire for ANY lane and the first signal an operator got was a refusal. Both lines must
+# appear: the warning (the advance instrument) AND the refusal (the verdict).
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=1000 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=100 DISK_WARN_FREE_MB=2000 \
+  DISK_LANE_TREE_MB=2000 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+    . "$1"
+    cd "$3" || exit 2
+    LOG="$2"; PROMPT="$4"
+    run_agent 1 "$LOG" "$PROMPT" "band before headroom" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$FIXREPO" "$PROMPT" 2>/dev/null)"
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "a reading inside the band that also fails the headroom bound is REFUSED ($res)" $rc
+grep -q 'disk-gate.*WARN.*warn band 2000MB' "$LOG"; rc=$?
+ck "...and the BAND warning fired first, so the advance instrument is not dead code" $rc
+grep -q 'DISK-NOHEADROOM' "$LOG"; rc=$?
+ck "...and the refusal is still the named one, so the two are distinguishable in the same log" $rc
+
 # ... and the same reading with room for three lanes says nothing.
 : > "$LOG"; : > "$PI_LOG"
 res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=1000 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
