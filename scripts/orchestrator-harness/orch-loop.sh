@@ -5918,13 +5918,18 @@ PY
         _dm_n="$(printf '%s\n' "$_dm_spawned" | sed '/^$/d' | wc -l | tr -d ' ')"
         is_num "${_dm_n:-}" || _dm_n=0
         if [ "$_dm_n" -ne "$K" ]; then
-          echo "[dispatch] repo-target gate REFUSED $((K - _dm_n)) of $K issue(s) per-lane — only the $_dm_n that reached a spawn are counted" >> "$LOG"
+          # ⛔ NAME NO CAUSE (#2762 review, 3rd cycle, P2). `.dispatched-ids` carries bare ids, so a
+          # delta between claims and spawns can be a repo-identity refusal, a launcher refusal, or a
+          # claim/login skip — the `[repo-target]`/spawn lines in the dispatch log name the cause. An
+          # attributed reason here wrote "repo-target refused 1" into the durable cycle record for a
+          # launcher failure (where the claim is deliberately KEPT because chain-<N> is alive).
+          echo "[dispatch] $((K - _dm_n)) of $K issue(s) did not reach a spawn — counted only the $_dm_n that did (see the dispatch log for the cause)" >> "$LOG"
           K="$_dm_n"
           if [ "$K" -gt 0 ]; then
             printf '%s\n' "$_dm_spawned" > "$O/.batch"
           else
             : > "$O/.batch"
-            [ -n "${GATE_WHY:-}" ] || GATE_WHY="repo-target(refused per-lane: worktree is not the target)"
+            [ -n "${GATE_WHY:-}" ] || GATE_WHY="dispatch(no lane reached a spawn — see the dispatch log for the cause)"
           fi
         fi
       fi

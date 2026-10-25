@@ -10,10 +10,6 @@
 set -u
 REPO="${1:-}"; OR="${2:-}"; shift 2 2>/dev/null || true
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-# Required module: without it the lane's worktree identity can never be asserted. FATAL, not optional.
-. "$SELF/repo-target.sh" || { echo "dispatch-merge: FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to dispatch worktrees whose repo cannot be asserted (#2724)"; exit 78; }
-command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
-  || { echo "dispatch-merge: FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to dispatch worktrees whose repo cannot be asserted (#2724)"; exit 78; }
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 # ⛔ THE SPAWN LINE MUST SAY SO WHEN THE BOX IS STALE (agent-infra#2215). `orch-loop.sh` exports this
 # from its once-per-cycle refresh: EMPTY when the controller's harness IS origin/main's tip, else
@@ -147,6 +143,28 @@ cd "$REPO" || { echo "dispatch-merge: cannot cd into $REPO — releasing every c
 # Physical path, so every assertion and spawn below names the checkout even when the caller passed a
 # relative one (after `cd`, `$REPO` would otherwise resolve from INSIDE itself).
 REPO_ABS="$(pwd -P)"
+
+# ── REQUIRED MODULE, AND ITS FAILURE UNDOES WHAT THE CONTROLLER DID (#2762 review, 3rd cycle, P2) ──
+# Without repo-target.sh the worktree identity can never be asserted, so this is FATAL (78). The guard
+# lives HERE — below the claim/row helpers — because a half-deployed `$O` must not strand the batch it
+# was called for: the controller has already CLAIMED every issue and appended every row, so exiting 78
+# at the top of the file left those claims running their 3 h lease and the batch counted as
+# dispatched. Release them, drop the rows, and publish an EMPTY `.dispatched-ids` so the controller's
+# recount records zero instead of a phantom dispatch.
+_repo_target_fatal() { # <why> <issue...>
+  local why="$1" n; shift
+  echo "dispatch-merge: FATAL: $why"
+  for n in "$@"; do
+    case "${n:-}" in ''|*[!0-9]*) continue ;; esac
+    release_issue_claim_unspawned "$n"
+  done
+  drop_dispatched_rows "$@"
+  : > "$O/.dispatched-ids" 2>/dev/null || true
+  exit 78
+}
+. "$SELF/repo-target.sh" || _repo_target_fatal "$SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to dispatch worktrees whose repo cannot be asserted" "$@"
+command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
+  || _repo_target_fatal "$SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to dispatch worktrees whose repo cannot be asserted" "$@"
 
 # ── THE TARGET ASSERTION BEFORE ANY WORKSTREE IS BUILT (agent-infra#2724/#2694) ─────────────────
 # A pre-build check proves what was asked for. The POST-BUILD check below (on each worktree) proves

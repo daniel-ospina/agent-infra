@@ -269,6 +269,19 @@ c2=$?
 # CI-queue gate defers (rc 2 "unreadable" -> DEFER, fail closed) and fix-one exits 0 — an unrelated
 # mechanism. The three `[repo-target]` assertions below are what prove the gate passed, and the built
 # worktree proves the work happened after them.
+# ⛔ A CONTROLLER-SPAWNED (--argv, CTRL=1) IDENTITY REFUSAL MUST REFUND THE PER-HEAD BUDGET TOO
+# (#2762 review, 3rd cycle, P1). The refund's per-head marker is keyed on `HEAD`; it used to be read
+# AFTER these refusal sites, so the marker was silently skipped and two such refusals parked the PR
+# as "attempts exhausted" having never run a fixer.
+printf '%s\n' "2" > "$FO/state/fixcount-4004"
+printf '%s\n' "$TT" daniel-ospina/agent-infra 4004 work > "$T/argv-4004"
+( gh() { case "$*" in *headRefOid*) echo "cafebabe"; return 0 ;; esac; return 1; }; export -f gh
+  REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 \
+    bash "$FIX" --argv "$T/argv-4004" ) >/dev/null 2>&1
+c4=$?
+{ [ "$c4" -eq 72 ] && [ -f "$FO/state/fixgate-4004-cafebabe" ] \
+    && [ "$(cat "$FO/state/fixcount-4004" 2>/dev/null)" = "1" ]; }; ck "C4 --argv (CTRL=1) identity refusal -> REFUNDS fixcount AND writes fixgate-<PR>-<head> (rc=$c4)" $?
+
 "$REAL_GIT" -C "$AI" branch work >/dev/null 2>&1 || true
 REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$AI" daniel-ospina/agent-infra 4003 work >/dev/null 2>&1
@@ -328,7 +341,7 @@ ck "D6 the controller's recount block is extractable from orch-loop.sh" $?
 RC_O="$T/o-rc"; mkdir -p "$RC_O"; : > "$RC_O/.batch"; printf '6002\n' >> "$RC_O/.batch"; : > "$RC_O/.dispatched-ids"
 ( LOG="$T/rc0.log"; : > "$LOG"; O="$RC_O"; K=1; _dmrc=0; . "$T/isnum.sh"; . "$T/dmrecount.sh"; \
     printf 'K=%s batch=[%s] gate=[%s]\n' "$K" "$(tr '\n' ' ' < "$RC_O/.batch")" "${GATE_WHY:-}" ) > "$T/rc0.out" 2>&1
-{ grep -q 'K=0 batch=\[\] gate=\[repo-target' "$T/rc0.out"; }; ck "D6 zero-spawn batch -> K=0, .batch cleared, GATE_WHY names repo-target (a false PASS cannot be recorded)" $?
+{ grep -q 'K=0 batch=\[\] gate=\[dispatch(no lane reached a spawn' "$T/rc0.out"; }; ck "D6 zero-spawn batch -> K=0, .batch cleared, GATE_WHY names the DISPATCH (no cause attributed)" $?
 RC_O2="$T/o-rc2"; mkdir -p "$RC_O2"; printf '6003\n6004\n' > "$RC_O2/.batch"; printf '6003\n' > "$RC_O2/.dispatched-ids"
 ( LOG="$T/rc1.log"; : > "$LOG"; O="$RC_O2"; K=2; _dmrc=0; . "$T/isnum.sh"; . "$T/dmrecount.sh"; \
     printf 'K=%s batch=[%s]\n' "$K" "$(tr '\n' ' ' < "$RC_O2/.batch")" ) > "$T/rc1.out" 2>&1
@@ -386,6 +399,15 @@ printf '#!/usr/bin/env bash\nrepo_slug_from_remote() { printf "%%s\\n" "$1"; }\n
 ( cd "$TWT" && O="$RIG_HALF/o-lane" LANE_DRY_RUN=1 bash "$RIG_HALF/lane.sh" --repo daniel-ospina/tortoise 5013 feat/5013 ) > "$T/f-half.out" 2>&1
 f10=$?
 { [ "$f10" -eq 78 ] && grep -q 'missing or stale' "$T/f-half.out"; }; ck "F10 shipped module + OLD repo-slug.sh (no repo_slug_valid) -> FATAL 78, not target-invalid (rc=$f10)" $?
+
+# ...and the SAME half-deploy on the BATCH path must not strand what the controller already did
+# (#2762 review, 3rd cycle, P2): release the claims, drop the rows, and publish an EMPTY
+# `.dispatched-ids` so the cycle records zero instead of a phantom dispatch.
+DMOM="$T/o-dm-missing"; mkdir -p "$DMOM/logs" "$DMOM/state"; printf '5014\n' > "$DMOM/dispatched.txt"
+O="$DMOM" bash "$RIG_MISS/dispatch-merge.sh" "$TT" daniel-ospina/tortoise 5014 >/dev/null 2>&1
+f11=$?
+{ [ "$f11" -eq 78 ] && [ -f "$DMOM/.dispatched-ids" ] && [ ! -s "$DMOM/.dispatched-ids" ] \
+    && ! grep -qx '5014' "$DMOM/dispatched.txt"; }; ck "F11 half-deployed batch -> FATAL 78 but the row is DROPPED and .dispatched-ids is empty (rc=$f11)" $?
 
 # ═══ E. the pre-fix tree does NOT refuse (the non-vacuity proof) ══════════════════════════════
 # Optional because the baseline must be a commit BEFORE this change: run it manually with

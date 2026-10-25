@@ -128,6 +128,12 @@ refund_gate_attempt() {
 WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
 echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
 
+# ⛔ THE HEAD IS READ BEFORE THE REFUSALS, NOT AFTER (#2762 review, 3rd cycle, P1).
+# The refund for a pre-agent refusal names the head (`fixgate-<PR>-<HEAD>`), and the identity
+# assertions below exit long before the old position of this line — so a repo-identity refusal
+# refunded `fixcount` but could NOT refund the per-head budget, and after two such cycles the PR
+# parked as "2 red-fixer attempt(s) at this head did not clear it" having never run a fixer.
+HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
 # ── THE TARGET ASSERTION, BEFORE ANY WORK (agent-infra#2694) ──────────────────────────────────
 # A fixer is handed BOTH a checkout ($1) and the repo it is fixing for ($2). If those disagree, every
 # git and gh call below would act on one while reporting about the other — the measured wrong-repo
@@ -189,7 +195,6 @@ fi
 # merge-one.sh (the sole claim_acquire caller), so two boxes could each spawn a fixer for the same
 # PR/head. Same key and lease shape as merge-one.sh's — the claim is on the PR's CURRENT head, so a
 # fixer and a reviewer never race each other for the same content version.
-HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
 # ── CI BACK-PRESSURE: the lane that PUSHES reads the CI queue first ──────────────
 # A fixer's product is a NEW HEAD, and a new head is a full CI pass plus (because the review
 # attestation is SHA-bound) the destruction of the artifact this lane's review chain just produced.
