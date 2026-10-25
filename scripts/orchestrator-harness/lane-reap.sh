@@ -648,7 +648,11 @@ resolve_log() {
       # counter so `log-evidence-unreadable` stays reserved for a read that actually failed.
       if [ "$trc" = "2" ] || [ "$pblind" = "1" ]; then unident=1; continue; fi
       # not this lane's stdout ⇒ this tee is not its writer, whatever log it happens to hold
-      printf '%s\n' "$pstd" | grep -Fxq -e "$pname" || continue
+      # ⛔ NO PIPE INTO A QUIET grep (#841/#864, `sigpipe-grep`): under `pipefail` a producer that
+      # exits early on SIGPIPE turns the whole pipeline red — or, with `grep -q` returning before its
+      # input is drained, reports "no match" for a line that IS there. The here-string inverts the
+      # builtin writer with no pipe at all.
+      grep -Fxq -e "$pname" <<<"$pstd" || continue
       out="$(collect_evidence "$p")" || { blind=1; continue; }
       [ -n "$out" ] && cands="$cands$out
 "
