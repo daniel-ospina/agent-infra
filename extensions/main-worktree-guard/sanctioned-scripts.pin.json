@@ -7,7 +7,7 @@
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/record-review.sh": "935fb9dd77379a1cf097267d3d17899962b10c41ca1eda726ce84127fce45185",
     "scripts/admin-merge.sh": "4ac08b33cf02a43ae4357af1eaeb98effa3d70c3d0060930f228892e778fae79",
-    "scripts/gh-shim/gh": "07f611852e67e1cd232d2294509b076e79a19a787f44339b5053a6da2f3fc5fd"
+    "scripts/gh-shim/gh": "11a0f554a923eb459a26b98d2f8c7f21d0cabe324d7c3b4754dc7c8ce3c909d0"
   },
   "delegates": {
     "scripts/admin-merge.sh": "4ac08b33cf02a43ae4357af1eaeb98effa3d70c3d0060930f228892e778fae79",
@@ -18,7 +18,7 @@
     "scripts/ci-failure-set.sh": "69f826018b5ed5abdd9d74f75a58ca0d2ec27a8b5297ceb7510d705ac69891a6",
     "scripts/ci-workflow-pr-evaluable.sh": "9db2703be4442e2cd11ccb983d5312cb62934e9cbfd51d20e7fd6fb5c0430bb3",
     "scripts/ci_exemption.py": "9abbbb070cc7245bc1328e5d48521d471bb7bc35bab9446ad6747f75a3c956ca",
-    "scripts/gh-shim/gh": "07f611852e67e1cd232d2294509b076e79a19a787f44339b5053a6da2f3fc5fd",
+    "scripts/gh-shim/gh": "11a0f554a923eb459a26b98d2f8c7f21d0cabe324d7c3b4754dc7c8ce3c909d0",
     "scripts/lib/diff-normalize.py": "86eb2434a7a3dd04afca00407cb25cfe47def2384c3cd1e455c20572ee5c2938",
     "scripts/record-review.sh": "935fb9dd77379a1cf097267d3d17899962b10c41ca1eda726ce84127fce45185",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
