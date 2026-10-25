@@ -3047,8 +3047,15 @@ pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (
   if [ "${PL_MOD:-0}" = "1" ]; then
     _lk="$O/state/mergeclaim-$pr.lock"
     [ -f "$_lk" ] || return 1
-    _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)" || true
-    echo "[reap] #$pr released — ${_v#RELEASED	}" >> "$LOG" 2>/dev/null || true
+    # ⛔ THE VERDICT'S EXIT STATUS IS THE ANSWER (review P1, 2026-10-25). An earlier draft discarded
+    # it and returned 1 unconditionally — so when the probe said OWNED (a lock that appeared between the
+    # `pr_owned` call and this one, or a claim caught mid-creation) the arms SPAWNED A SECOND WORKER on
+    # a live claim and logged it as a release. Only rc=1 is a release.
+    if _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)"; then return 0; fi
+    # Strip the verdict label with a REAL TAB: `${_v#RELEASED\t}` never matched (bash reads `\t` in a
+    # pattern as an escaped `t`), so every reap line printed a duplicated label and a raw tab — review P2.
+    _tab="$(printf '\t')"
+    echo "[reap] #$pr released — ${_v#*"$_tab"}" >> "$LOG" 2>/dev/null || true
     return 1
   fi
   claim_live "$pr" "$sha"
@@ -5582,8 +5589,12 @@ PY
           # so the owner's 2026-10-18 ruling keeps applying unchanged to every real land/capacity
           # stall; only the "started nothing" degenerate state is escaped from, and the escape is
           # bounded because it resets the counter after firing.
-          _escbound="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}")"
+          # ⛔ THE GLUE IS GATED TOO (review P2): the module may be ABSENT on a box whose `$O` is
+          # stale, and an unguarded call would print `pl_escape_bound: command not found` on launchd's
+          # stderr (not `$LOG`) every cycle — invisible exactly where the operator reads.
+          _escbound=${DRAIN_ESCAPE_PASSES:-3}
           if [ "${PL_MOD:-0}" = "1" ]; then
+            _escbound="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}" 2>/dev/null)" || _escbound=3
             _streak="$(pl_note_pass "$O/state" "${_spk:-}" "${UPN_WORK:-}")"
             is_num "${_streak:-}" || _streak=0
             _esc="$_esc; the PR path has STARTED NOTHING for ${_streak}/${_escbound} consecutive stalled pass(es) — at ${_escbound} the issue path opens (state/pr-path-idle)"
@@ -5622,6 +5633,11 @@ PY
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
         # A land clears the escalation: a marker that outlives its condition is a stale flag.
         rm -f "$O/state/drain-stall" 2>/dev/null || true
+        # ⛔ A LAND ALSO CLEARS THE INERT STREAK (review P2). Without this the counter described "stalled
+        # passes since the last escape" rather than "CONSECUTIVE stalled passes": a box that stalled
+        # N-1 times, landed for hours, then stalled once opened the issue path on its FIRST stall while
+        # its own line claimed N — a false statement about consecutiveness and a bound quietly cut to 1.
+        [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
       fi
     elif [ "${_land_any:-0}" = "1" ]; then
       echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
@@ -5658,7 +5674,8 @@ PY
   # state only, bounded and logged here with the counts the decision was taken from.
   # ⛔ ONE ESCAPE PER N INERT PASSES, NOT ONE PER PASS: `pl_escape_record` resets the streak on a
   # successful write, so the loop cannot spin, and it reports when the record could NOT be written.
-  _eb="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}")"
+  _eb=${DRAIN_ESCAPE_PASSES:-3}
+  if [ "${PL_MOD:-0}" = "1" ]; then _eb="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}" 2>/dev/null)" || _eb=3; fi
   if [ "${LO_CHOICE:-none}" != "pr" ]; then
     # Not blocked by un-owned PRs: a streak from an earlier stall is a stale flag and is cleared.
     [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
@@ -5669,6 +5686,15 @@ PY
     else
       echo "[dispatch] DRAIN ESCAPE RECORD COULD NOT BE WRITTEN (state/ is unwritable) — the issue path still OPENS this cycle (an unpersisted action must not be withheld), but the counter could not be reset and the bound cannot be proven" >> "$LOG"
     fi
+    # ⛔ `GATE_WHY` MUST BE CLEARED, OR THE ESCAPE IS A LOG LINE THAT CANNOT ACT (review P0, 2026-10-25).
+    # It was set from the SAME un-owned count earlier in this pass (`GATE_WHY="$(mp_reason ...)"`, which
+    # echoes a reason whenever un-owned > 0), and the ONE line that opens the dispatch block is
+    # `if [ -z "$GATE_WHY" ]`. Setting LO_CHOICE alone therefore printed "OPENING the issue path",
+    # recorded the escape, reset the counter — and dispatched NOTHING, for ever. The gate is precisely
+    # what the escape exists to lift, so the lift is named in the log.
+    _lifted="${GATE_WHY:-<none>}"
+    GATE_WHY=""
+    echo "[dispatch] DRAIN ESCAPE lifted the issue-path gate (was: ${_lifted}) — the merge-priority gate is what this escape overrides for one cycle" >> "$LOG"
     LO_CHOICE=issue
   fi
   # [drain-escape:end]

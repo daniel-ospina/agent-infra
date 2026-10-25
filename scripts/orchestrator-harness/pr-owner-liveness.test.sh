@@ -85,29 +85,44 @@ check "fixture: the worker pid is alive"   "pl_pid_alive '$WP'"
 OUT="$(pl_verdict "$B" 4242 1 1)"; RC=$?
 check "(a-control) the same lock with a LIVE worker reads OWNED (so (a) is not vacuous)" "[ $RC -eq 0 ] && [ -e '$(pl_lock_path "$B" 4242)' ]"
 
-echo "(a2) a RECYCLED pid is not ownership either"
+echo "(a2) a LIVE pid is never reaped — even an unrelated one (#1985 residue, the safe direction)"
+# ⛔ THIS ARM WAS INVERTED BY REVIEW (P0, 2026-10-25) AND THE INVERSION WAS THE HARD-RULE BREACH. Three
+# roles write `mergeclaim-<PR>.lock` (`merge-one.sh`, `fix-one.sh` — held for a fixer's whole run — and
+# `cloud-cell-doctor.sh`), so "the pid is not a merge-one.sh" is NOT evidence of a recycled pid: keying
+# on it reaped LIVE fixers and let a second worker push to the same branch. Whatever is alive stays.
 C="$TMP/c"; mkdir -p "$C"
 RP="$(spawn_unrelated)"; sleep 0.2
 printf '%s\n' "$RP" > "$(pl_lock_path "$C" 5151)"
-check "fixture: the recycled pid IS alive"  "pl_pid_alive '$RP'"
+check "fixture: the unrelated pid IS alive"  "pl_pid_alive '$RP'"
 OUT="$(pl_verdict "$C" 5151 1 1)"; RC=$?
-check "(a2) verdict is RELEASED despite a live pid" "[ $RC -eq 1 ] && case \"\$OUT\" in RELEASED*) true ;; *) false ;; esac"
-check "(a2) the reason names the recycled pid"      "case \"\$OUT\" in *'is ALIVE but is not a merge worker'*) true ;; *) false ;; esac"
-check "(a2) the lock was REMOVED"                    "[ ! -e '$(pl_lock_path "$C" 5151)' ]"
+check "(a2) a LIVE pid reads OWNED (never reaped)"    "[ $RC -eq 0 ] && case \"\$OUT\" in OWNED*) true ;; *) false ;; esac"
+check "(a2) the reason says WHY it is not judged"    "case \"\$OUT\" in *'#1985'*) true ;; *) false ;; esac"
+check "(a2) the live lock is KEPT"                   "[ -e '$(pl_lock_path "$C" 5151)' ]"
+# ⛔ AND THE CREATION WINDOW: `merge-one.sh` claims with `noclobber; echo $$ > LOCK`, so the file exists
+# EMPTY for an instant. An empty lock is a claim IN PROGRESS, not a dead owner (fix-one.sh documents the
+# same hole). Reaping it deletes a live lander's claim.
+D="$TMP/d"; mkdir -p "$D"
+: > "$(pl_lock_path "$D" 6161)"
+OUT="$(pl_verdict "$D" 6161 1 1)"; RC=$?
+check "(a3) an EMPTY lock (claim mid-creation) reads OWNED" "[ $RC -eq 0 ] && case \"\$OUT\" in *'mid-creation'*) true ;; *) false ;; esac"
+check "(a3) …and the mid-create lock is NOT removed"       "[ -e '$(pl_lock_path "$D" 6161)' ]"
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 echo "(c) a PR whose worker is ALIVE is still respected"
 OUT="$(pl_verdict "$B" 4242 1 1)"; RC=$?
 check "(c) verdict is OWNED"                 "[ $RC -eq 0 ] && case \"\$OUT\" in OWNED*) true ;; *) false ;; esac"
-check "(c) the reason names the live worker" "case \"\$OUT\" in *\"lock pid $WP\"*) true ;; *) false ;; esac"
+check "(c) the reason names the live worker pid" "case \"\$OUT\" in *\"lock pid $WP\"*) true ;; *) false ;; esac"
 check "(c) the live worker's lock is KEPT"   "[ -e '$(pl_lock_path "$B" 4242)' ]"
 # The external live fact (cwd scan / cross-box lease) and the worker record are each sufficient alone:
 OUT="$(pl_verdict "$TMP/c" 5151 0 1)"; RC=$?
 check "(c) a live cwd/lease fact alone reads OWNED even with no lock" "[ $RC -eq 0 ]"
 OUT="$(pl_verdict "$TMP/c" 5151 1 0)"; RC=$?
 check "(c) a live worker RECORD alone reads OWNED"                    "[ $RC -eq 0 ]"
-# ⛔ NON-VACUITY for the respect arm: with EVERY proof removed the SAME state is RELEASED.
-OUT="$(pl_verdict "$TMP/c" 5151 1 1)"; RC=$?
+# ⛔ NON-VACUITY for the respect arm: with EVERY proof removed (a fresh state dir: no lock, no cwd
+# fact, no worker record) the verdict is RELEASED. The SAME call shape as above, so the only difference
+# is the evidence — not the arguments.
+Z="$TMP/c-control"; mkdir -p "$Z"
+OUT="$(pl_verdict "$Z" 5151 1 1)"; RC=$?
 check "(c-control) with no proof at all it is RELEASED (so (c) is not vacuous)" "[ $RC -eq 1 ]"
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -154,43 +169,67 @@ check "(b-control) the bound cannot be zero (a zero bound would fire on a health
 echo "(b-wired) the shipped [drain-escape] block, extracted and DRIVEN"
 LOOP="$HERE/orch-loop.sh"
 EXTRACT="$TMP/escape-block.sh"
+# The block, PLUS the two gate lines it must un-block (the `LO_CHOICE != issue` reason, and the
+# `[ -z "$GATE_WHY" ]` body entry). The body's first statement is replaced by a sentinel write so the
+# assertion is "dispatch was ENTERED", not "a line was printed".
 awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(f) exit}' "$LOOP" > "$EXTRACT"
+# ⛔ `\$O` MUST BE ESCAPED FOR AWK, AND THE `if` MUST BE CLOSED. Inside an awk string `$O` is awk's
+# FIELD reference (unset -> `$0`, the whole line), so the first version emitted the matched line as the
+# sentinel; and an extracted `if … then` with no `fi` is a SYNTAX ERROR at EOF, which aborted the source
+# midway (the escape's own log lines still landed, which is exactly how a "wired" test reads green while
+# nothing dispatches — the same failure the real block had).
+awk '/^  if \[ "\$\{LO_CHOICE:-none\}" != "issue" \] && \[ -z "\$GATE_WHY" \]/{f=1} f&&/^  if \[ -z "\$GATE_WHY" \]; then/{print; print "    : > \"\$O/state/dispatched\""; print "  fi"; exit}' "$LOOP" >> "$EXTRACT"
+bash -n "$EXTRACT" || bad "(b-wired) the extracted block is not valid shell — the drive would abort midway"
 check "(b-wired) the block was found in orch-loop.sh (a marker rename would otherwise skip it)" "[ -s '$EXTRACT' ] && grep -q 'pl_escape_open' '$EXTRACT' && grep -q 'LO_CHOICE=issue' '$EXTRACT'"
 
-drive_escape() { # <state-dir> -> prints "LO_CHOICE=<x>"; log at <state-dir>/log
-  local st="$1"
+drive_escape() { # <state-dir> [<gate-why>] -> prints "LO_CHOICE=<x> DISPATCH=<yes|no>"
+  local st="$1" gw="${2-}"
   ( set +e
     # ⛔ `O` MUST BE THE PARENT OF `$st`: the shipped block addresses `$O/state/...`, so a fixture that
     # pointed the two at different directories would drive a block that reads an EMPTY state dir and
-    # the test would "pass" by never reaching the escape (this fixture did exactly that on its first
-    # run — the assertion that caught it is the one that greps the log).
+    # the test would "pass" by never reaching the escape.
     O="$(dirname "$st")"; LOG="$st/log"; LO_CHOICE=pr; PL_MOD=1; UPN_WORK=2; PRDISP_SPAWNS=0
     DRAIN_ESCAPE_PASSES=2
+    # ⛔ `GATE_WHY` IS THE WHOLE POINT (review P0, 2026-10-25). The escape fires only on a pass where
+    # the merge-priority gate is SET — that is the state `mp_reason` produces whenever un-owned > 0 —
+    # and the ONE line that opens dispatch is `[ -z "$GATE_WHY" ]`. An earlier version of this fixture
+    # left GATE_WHY unset, so it proved the escape "opens the issue path" while the real loop could
+    # dispatch nothing. The gate lines are extracted and driven too, and a sentinel records that the
+    # dispatch branch was actually ENTERED.
+    GATE_WHY="$gw"
     # shellcheck source=/dev/null
     . "$MOD"
     # shellcheck source=/dev/null
     . "$EXTRACT"
-    printf 'LO_CHOICE=%s\n' "$LO_CHOICE" ) 2>/dev/null
+    printf 'LO_CHOICE=%s DISPATCH=%s\n' "$LO_CHOICE" "$( [ -e "$st/dispatched" ] && echo yes || echo no )" ) 2>/dev/null
 }
+
 W1="$TMP/w1"; mkdir -p "$W1/state"
 pl_note_pass "$W1/state" 0 2 >/dev/null; pl_note_pass "$W1/state" 0 2 >/dev/null
-OUT="$(drive_escape "$W1/state")"
+OUT="$(drive_escape "$W1/state" "GW_SENTINEL")"
 check "(b-wired) at the bound the SHIPPED block flips LO_CHOICE to issue" "case \"\$OUT\" in *'LO_CHOICE=issue'*) true ;; *) false ;; esac"
+# ⛔ THE ASSERTION THE FIRST VERSION OF THIS SUITE COULD NOT MAKE. With GATE_WHY set (the real state on
+# any pass with un-owned PRs) and LO_CHOICE flipped, the dispatch branch must actually be REACHED —
+# otherwise the escape records an action that did not happen: a false PASS, not a harmless no-op.
+check "(b-wired) …and the dispatch branch is actually ENTERED (the gate was lifted, not just printed)" "case \"\$OUT\" in *'DISPATCH=yes'*) true ;; *) false ;; esac"
+check "(b-wired) it logs the lift, naming what it overrode" "grep -q 'DRAIN ESCAPE lifted the issue-path gate (was: GW_SENTINEL)' '$W1/state/log'"
 check "(b-wired) it logs ONE auditable line naming the counts/bound/issue" "grep -q 'DRAIN ESCAPE — the PR path started NOTHING for 2 consecutive' '$W1/state/log' && grep -q 'bound 2' '$W1/state/log' && grep -q 'agent-infra#2831' '$W1/state/log'"
 check "(b-wired) and it RECORDS the escape" "grep -q '^issue=OPENED-BY-ESCAPE' '$W1/state/drain-escape' && grep -q 'DRAIN ESCAPE RECORDED' '$W1/state/log'"
 check "(b-wired) the counter is reset, so the next cycle does NOT re-escape" "[ \"\$(pl_idle_streak '$W1/state')\" = 0 ]"
 W2="$TMP/w2"; mkdir -p "$W2/state"
 pl_note_pass "$W2/state" 0 2 >/dev/null
-OUT="$(drive_escape "$W2/state")"
+OUT="$(drive_escape "$W2/state" "GW_SENTINEL")"
 check "(b-wired) BELOW the bound the same block leaves the issue path CLOSED (contrast half)" "case \"\$OUT\" in *'LO_CHOICE=pr'*) true ;; *) false ;; esac"
-check "(b-wired) …and it logs no escape" "! grep -q 'DRAIN ESCAPE' '$W2/state/log' 2>/dev/null"
+check "(b-wired) …and it dispatches NOTHING and logs no escape" "case \"\$OUT\" in *'DISPATCH=no'*) true ;; *) false ;; esac"; ! grep -q 'DRAIN ESCAPE' "$W2/state/log" 2>/dev/null || bad "(b-wired) an escape was logged below the bound"
 W3="$TMP/w3"; mkdir -p "$W3/state"
 pl_note_pass "$W3/state" 0 2 >/dev/null; pl_note_pass "$W3/state" 0 2 >/dev/null
-# A working PR path (spawns > 0) must never escape even at the bound: this is the owner's ruling kept.
+# A WORKING PR path (a spawn happened) must never escape even at a stale streak: the owner's ruling kept.
 ( O="$W3"; LOG="$W3/state/log"; LO_CHOICE=pr; PL_MOD=1; UPN_WORK=2; PRDISP_SPAWNS=4; DRAIN_ESCAPE_PASSES=2
+  GATE_WHY="merge-priority (2 un-owned)"
   . "$MOD"; pl_note_pass "$W3/state" 1 2 >/dev/null
-  . "$EXTRACT"; printf '%s\n' "$LO_CHOICE" ) > "$TMP/w3/out" 2>/dev/null
-check "(b-wired) a WORKING PR path (a spawn happened) keeps the issue path closed" "[ \"\$(cat '$TMP/w3/out')\" = pr ]"
+  . "$EXTRACT"; printf '%s %s\n' "$LO_CHOICE" "$( [ -e "$W3/state/dispatched" ] && echo yes || echo no )" ) > "$TMP/w3/out" 2>/dev/null
+check "(b-wired) a WORKING PR path keeps the issue path closed AND dispatches nothing" "[ \"\$(cat '$TMP/w3/out')\" = 'pr no' ]"
+
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 printf '\n%s\n' "──────────────────────────────────────────────"
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"

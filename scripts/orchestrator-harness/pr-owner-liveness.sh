@@ -19,16 +19,19 @@
 # THE TWO RULES, IN CODE
 # ----------------------
 #  1. OWNERSHIP IS PROVEN OR RELEASED. A PR is owned iff something that DIES WITH A WORKER says so:
-#     a live process whose cwd is in the PR's checkout (live-ownership.sh's `lo_pr_owned`), a live
-#     merge worker whose COMMAND LINE names this PR, a live worker record (fix-<PR>/merge-<PR>), or a
-#     cross-box lease. A local lock whose pid is gone — or whose pid now belongs to some unrelated
-#     process (pids recycle) — is NOT ownership: it is reaped, with a logged reason, and the PR goes
-#     back into the un-owned queue. This is the SAME proof-of-life `[reap]` already applies to
+#     a live process whose cwd is in the PR's checkout (live-ownership.sh's `lo_pr_owned`), a LIVE pid
+#     holding `mergeclaim-<PR>.lock`, a live worker record (fix-<PR>/merge-<PR>), or a cross-box lease.
+#     A local lock whose pid is GONE is not ownership: it is reaped, with a logged reason, and the PR
+#     goes back into the un-owned queue. This is the SAME proof-of-life `[reap]` already applies to
 #     checked.txt entries (`released … no queued/dispatched/PR/lane/claim fact`).
-#     ⛔ NOTHING PROVEN ⇒ RELEASE. That is the direction the owner's rule takes: the queue un-worked
-#     is the failure being fixed; a double-spawned fixer is refused by the worker's own rail and the
-#     cross-box CAS. And the release is only taken when NOT ONE arm proves life, so a live worker
-#     holding its lock is never reaped by a weaker reading.
+#     ⛔ WHAT IS NOT REAPED, AND WHY (review P0, 2026-10-25). Anything alive stays: a live pid on the
+#     lock, or a lock with no readable pid (the noclobber create window). Three roles write that same
+#     file (`merge-one.sh`, `fix-one.sh` — held for a fixer's whole run — and `cloud-cell-doctor.sh`),
+#     so a matcher on the command line NOT being merge-one.sh is not evidence of a recycled pid; it
+#     reaped live fixers. Loose liveness is the fleet's convention (fix-one.sh's `prlock_live_owner`,
+#     `claim_live`, the doctor) for exactly this reason. The residue — a recycled pid reads live until
+#     it exits — is #1985, already filed, and it is the SAFE direction: one PR waits, versus a second
+#     worker pushing to a branch a live worker already holds.
 #  2. A DETECTOR THAT CANNOT ACT IS A LOG LINE. `[dispatch] DRAIN STALLED` detected zero merges for
 #     360m, un-owned PRs, and a closed issue path — and then did nothing, cycle after cycle. The stall
 #     now feeds a bounded counter of passes in which the PR path STARTED NOTHING, and at the bound the
@@ -60,32 +63,6 @@ pl_pid_alive() { # <pid> -> 0 alive
   kill -0 "$p" 2>/dev/null
 }
 
-pl_cmdline() { # <pid> -> the command line, or nothing
-  local p="${1:-}" _ps="${PL_PS:-ps}"
-  "$_ps" -o command= -p "$p" 2>/dev/null
-}
-
-# pl_names_merge_worker <pr> <cmdline> -> 0 when the command line IS a merge worker FOR THIS PR.
-# ⛔ THE TWO SPAWN FORMS ARE BOTH LOAD-BEARING (inherited from pr_owned's review R2): the controller's
-# rail path spawns `bash merge-one.sh --argv state/argv-<PR>` (the number appears only in a FILENAME),
-# while chain-merge.sh/fix-one.sh pass it positionally. Matching only one form made a genuinely live
-# worker read UN-OWNED. The matcher is the SAME one pr_owned uses — a looser one here would let an
-# unrelated recycled pid block a PR for ever, which is the defect this file exists to remove.
-pl_names_merge_worker() { # <pr> <cmdline>
-  local pr="${1:-}" cl="${2:-}"
-  pl_num "$pr" || return 1
-  [ -n "$cl" ] || return 1
-  case "$cl" in
-    *merge-one*|*dispatch-merge*) : ;;
-    *) return 1 ;;
-  esac
-  case " $cl " in
-    *" $pr "*) return 0 ;;
-    *"/argv-$pr "*) return 0 ;;
-  esac
-  return 1
-}
-
 # ── the lock ─────────────────────────────────────────────────────────────────────────────────────
 pl_lock_path() { printf '%s/mergeclaim-%s.lock' "${1:-}" "${2:-}"; }
 
@@ -95,17 +72,27 @@ pl_lock_pid() { # <state> <pr> -> the recorded pid, or nothing
   tr -dc '0-9' < "$f" 2>/dev/null
 }
 
-# ── THE VERDICT ─────────────────────────────────────────────────────────────────────────────────
+# ── THE VERDICT ───────────────────────────────────────────────────────────────────────────────
 # pl_verdict <state-dir> <pr> <other-proof-rc> <sess-proof-rc>
 #   other-proof-rc  0 when an EXTERNAL live fact proves ownership (the cwd scan / cross-box lease —
 #                   the caller computes it; this file does not duplicate `lo_pr_owned`)
 #   sess-proof-rc   0 when a worker RECORD for this PR reads alive (census: `dead` excluded)
 # prints one line: "OWNED<TAB><why>" or "RELEASED<TAB><why>"; rc 0 owned, 1 released.
-# SIDE EFFECT: a lock that proves nothing is REMOVED, so the PR is genuinely releasable — a verdict
-# that says "not owned" while the record that made it un-spawnable still sits on disk would leave the
-# PR exactly as stuck as before, which is the defect, not the fix.
+# SIDE EFFECT: a lock whose pid is PROVABLY GONE is REMOVED, so the PR is genuinely releasable — a
+# verdict that says "not owned" while the record that made it un-spawnable still sits on disk would
+# leave the PR exactly as stuck as before, which is the defect, not the fix.
+# ⛔ WHAT MAY BE REAPED, AND NOTHING ELSE (review P0/P1, 2026-10-25). The fleet's lock convention —
+# `fix-one.sh`'s `prlock_live_owner`, `claim_live`, the doctor's `merge` role — is LOOSE LIVENESS: any
+# live pid holds. Two independent reasons, both measured by review:
+#   • The lock is written by three different roles (lander, fixer, doctor), and a fixer holds it for
+#     its whole run, so "the pid is not a merge-one.sh" is NOT evidence the holder is unrelated.
+#   • `merge-one.sh` claims with `noclobber; echo $$ > LOCK`, so the file exists EMPTY for an instant
+#     before the pid is written. "Empty ⇒ dead owner" reaps a claim that is mid-creation.
+# So only a NUMERIC pid that `kill -0` proves GONE is stale; empty, unparseable or alive is LIVE.
+# The residue is #1985's (a recycled pid reads live until it exits) — stated, already filed, and the
+# mirror image of the one that MUST NOT happen here (deleting a live worker's lock).
 pl_verdict() {
-  local st="${1:-}" pr="${2:-}" other="${3:-1}" sess="${4:-1}" f p cl why
+  local st="${1:-}" pr="${2:-}" other="${3:-1}" sess="${4:-1}" f p why
   pl_num "$pr" || { printf 'RELEASED\tnon-numeric PR ref (%s) is not a PR\n' "${pr:-<empty>}"; return 1; }
   f="$(pl_lock_path "$st" "$pr")"
   # 1. THE LIVE FACT (cwd scan / cross-box lease) — a process that is working the PR right now.
@@ -113,21 +100,22 @@ pl_verdict() {
     printf 'OWNED\t%s\n' "a live process (cwd in the PR's checkout) or a live cross-box lease holds it"
     return 0
   fi
-  # 2. THE LOCAL LOCK, BOUND TO ITS WORKER. A live pid alone is NOT ownership: pids recycle, and a
-  #    recycled pid then blocks this PR for ever — the dangerous direction, and self-reinforcing (the
-  #    controller never spawns the worker that would delete the lock).
+  # 2. THE LOCAL LOCK — loose liveness, and the ONE thing that may be reaped is a pid proven GONE.
   p="$(pl_lock_pid "$st" "$pr" 2>/dev/null)"
-  if [ -n "${p:-}" ] && pl_pid_alive "$p"; then
-    cl="$(pl_cmdline "$p")"
-    if pl_names_merge_worker "$pr" "$cl"; then
-      printf 'OWNED\t%s\n' "lock pid $p is a live merge worker for #$pr"
+  if [ -f "$f" ]; then
+    if [ -z "${p:-}" ]; then
+      # ⛔ THE CREATION WINDOW IS NOT A DEAD OWNER (fix-one.sh documents this exact hole): the record
+      # exists before its pid does, so an unreadable/empty lock is a claim IN PROGRESS.
+      printf 'OWNED\t%s\n' "lock exists but carries no readable pid (a claim mid-creation, or an unreadable record) — treated LIVE, never reaped"
       return 0
     fi
-    why="pid $p is ALIVE but is not a merge worker for #$pr (\"$(printf '%s' "${cl:-<no command line>}" | cut -c1-80)\") — a recycled pid is a record, not a worker"
-  elif [ -n "${p:-}" ]; then
+    if pl_pid_alive "$p"; then
+      printf 'OWNED\t%s\n' "lock pid $p is ALIVE — a lander/fixer/doctor worker holds it for its whole run (a recycled pid is indistinguishable here by design; that residue is #1985, and reaping on it would delete a live worker's lock)"
+      return 0
+    fi
     why="lock pid $p is GONE"
   else
-    why="lock has no readable pid"
+    why="no lock"
   fi
   # 3. THE WORKER RECORD (census). `dead` was already excluded by the caller; `unknown` counts as
   #    alive there on purpose (a census read failure must not free a slot under a live worker).
@@ -135,7 +123,7 @@ pl_verdict() {
     printf 'OWNED\t%s\n' "a live worker record (fix-$pr/merge-$pr) holds it"
     return 0
   fi
-  # 4. NOTHING PROVEN ⇒ RELEASE (and say exactly what died).
+  # 4. NOTHING ALIVE ⇒ RELEASE, and say exactly what died.
   if [ -f "$f" ]; then
     if rm -f "$f" 2>/dev/null; then
       printf 'RELEASED\t%s; stale lock mergeclaim-%s.lock REMOVED — the PR is un-owned and releasable\n' "$why" "$pr"
