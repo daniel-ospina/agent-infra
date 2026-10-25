@@ -1,0 +1,12 @@
+# The canonical per-head spelling, `github.event.pull_request.head.sha`, contains no `github.sha`
+# substring — a closed list of spellings accepted it while it cancels nothing (#2660 round 4).
+name: PR head sha
+on: pull_request
+concurrency:
+  group: pr-head-sha-${{ github.ref }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

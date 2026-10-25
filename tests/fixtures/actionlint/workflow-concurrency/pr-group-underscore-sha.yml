@@ -1,0 +1,15 @@
+# A compliant per-ref group whose own TEXT contains `_sha`. The per-commit arm matched `_sha` as a
+# blanket substring, so this was refused as a per-commit key — and a workflow whose name ends in `_sha`
+# had no compliant spelling at all, because the identity arm forces its own name into the prefix
+# (#2660 round 13).
+name: pr group underscore sha
+on:
+  pull_request:
+concurrency:
+  group: pr-group-underscore-sha-x_sha-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
