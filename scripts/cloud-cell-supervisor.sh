@@ -2139,6 +2139,10 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
+  # lane.sh's prompt EXECUTES lane-merge.sh for the merge phase and merge-rate.sh for the
+  # before/after measurement (#2029), so a $O missing either makes every lane's merge phase exit 127
+  # while this check still printed "CELL CAN RUN A CONTROLLER" — the false PASS this list exists to
+  # prevent. Keep this list in step with install.sh's DRIFTED list (which seeds $O from it).
   # ⛔ lane-reap.sh IS IN THIS LIST (#2163): orch-loop.sh calls it for the `[cap]` census and the doctor
   # calls it for the process pass. A $O without it still runs (the census falls back to the launch
   # surface's own worker count — `wt_count lane-`, which answers for every launcher: durable cmux
@@ -2146,10 +2150,13 @@ cmd_check() {
   # surfaces and reads 0 on a busy cmux box, #2163 review r8) and the doctor says so in its pass line —
   # which is exactly the "leaked lanes are not judged" state this list exists to refuse before `start`
   # reports success.
+  # UNION of both sides of this merge (neither is a superset): lane-merge.sh + merge-rate.sh from this
+  # branch (#2029), lane-reap.sh from origin/main (#2163). Taking either alone leaves a worker the
+  # controller executes unseeded, which is the false PASS above.
   # repo-target.sh (#2724/#2694) is SOURCED by lane.sh, dispatch-merge.sh, fix-one.sh and adopt-fix.sh;
   # all four `exit 78` without it, so its absence would make every dispatch refuse at startup while
   # `check` still certified the cell — the same false PASS one layer down.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-reap.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"

@@ -720,7 +720,7 @@ SC_EOF
   out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T/state" DRAINER_REPO_SLUG='a|b' bash "$INSTALLER" 2>&1)"; rc=$?
   check "installer: a value that breaks the render ABORTS (no zero-byte unit, no success line)" \
-    '[ "$rc" -ne 0 ] && ! printf "%s" "$out" | grep -q "scheduled"' \
+    '[ "$rc" -ne 0 ] && ! grep -q "scheduled" <<<"$out"' \
     "rc=$rc · $(printf "%s" "$out" | tail -1)"
   T3="$ROOT/inst3"; mkdir -p "$T3"
   PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T3/units" DRAINER="$DRAINER" DRAINER_STATE="$T3/state" \
@@ -731,7 +731,7 @@ SC_EOF
         DRAINER_STATE="$T/state" DRAINER_O="$T" bash "$INSTALLER" 2>&1)"; rc=$?
   check "installer: a good install writes BOTH units and reports the timer active" \
     '[ "$rc" -eq 0 ] && [ -s "$T/units/eldato-ai-drainer.service" ] && [ -s "$T/units/eldato-ai-drainer.timer" ] \
-      && printf "%s" "$out" | grep -q "active"' "rc=$rc · $(printf "%s" "$out" | tail -1)"
+      && grep -q "active" <<<"$out"' "rc=$rc · $(printf "%s" "$out" | tail -1)"
   check "installer: the installed service carries an ExecStart" \
     'grep -q "^ExecStart=" "$T/units/eldato-ai-drainer.service"'
 else
