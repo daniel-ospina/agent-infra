@@ -5,11 +5,27 @@
 # component table and the verdict, so a status verb and a start verb cannot disagree about what
 # "healthy" means (#1745's `check` green / `start` dead class). Same for `harness-down`.
 #
-#   ./scripts/harness-status [--plain] [--no-fetch] [-o <state-dir>] [--harness <dir>]
+#   ./scripts/harness-status [--plain] [--no-fetch] [-o <state-dir>] [--harness <dir>] [--heal]
+#
+# ⛔ THIS VERB IS A READ; `--heal` IS THE OPT-IN TO MUTATE (2026-10-24). `harness-up status` heals by
+# default — it starts a controller that is not running and re-pins a pin that is behind — which is the
+# right default for the launcher an operator reaches for after something looks wrong. It is the WRONG
+# default for the verb documented here as "ONE verdict": `harness-down && harness-status` would
+# silently restart the stack an operator deliberately stopped, and a monitoring poll would do it on
+# every tick with nothing in the output saying a repair had happened. So this name keeps the
+# read-only contract it has always documented and passes `--no-heal`; a caller that WANTS the repairs
+# asks for them (`harness-status --heal`, or `harness-up status`). The repairs themselves are
+# unchanged, and neither verb ever kills a duplicate or cycles a live-but-late controller.
 #
 # Exit: 0 HEALTHY · 1 DEGRADED · 2 BROKEN (cannot-verify is never a pass).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -x "$HERE/harness-up" ] || { printf 'harness-status: no executable harness-up beside %s\n' "$0" >&2; exit 2; }
 HARNESS_UP_FORCED_VERB=status; export HARNESS_UP_FORCED_VERB
-exec "$HERE/harness-up" status "$@"
+# `--heal` in argv is the ONE way to keep the launcher's mutating default from this verb; anything
+# else is forced back to a read. `grep` is deliberately not used on the argv (a `--heal` inside an
+# operand must not be read as a flag): the loop compares whole words.
+HEAL=0
+for _a in "$@"; do [ "$_a" = "--heal" ] && HEAL=1; done
+if [ "$HEAL" -eq 1 ]; then exec "$HERE/harness-up" status "$@"; fi
+exec "$HERE/harness-up" status --no-heal "$@"
