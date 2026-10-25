@@ -193,7 +193,8 @@ cannot name its evidence is visibly a bug rather than a verdict:
 |---|---|---|
 | 1 | a process has the tree, or **any path inside it**, as cwd, or names it in argv | KEEP |
 | 2 | dirty, or a clean gate that cannot be evaluated | KEEP |
-| 3 | clean + HEAD is an ancestor of `origin/main` | REMOVE || 4 | clean + the PR **whose `headRefOid` IS this commit** is `MERGED` (merge, squash or rebase) | REMOVE |
+| 3 | clean + HEAD is an ancestor of `origin/main` | REMOVE |
+| 4 | clean + the PR **whose `headRefOid` IS this commit** is `MERGED` (merge, squash or rebase) | REMOVE |
 | 5 | clean + PR `CLOSED` unmerged + head not an ancestor | KEEP, and **name the PR** |
 | 6 | clean + no PR matches this head, still inside the floor in force | KEEP (`no PR — cannot prove it is landed`) |
 | 7 | younger than `REAP_WT_MIN_AGE_MINUTES` (45) | KEEP |
@@ -210,9 +211,14 @@ that does not exist there. The remote oid is tried FIRST and the local ref chain
 SECOND, every failure mode (`unavailable`, `ambiguous` for two push urls,
 `auto-unfetched` when the remote's oid is not in this repository) claims **no**
 evidence rather than falling back silently, and `REAP_WT_MAIN_PROOF=local` forces the
-local chain — which is the test seam and what keeps every fixture offline. The proof
-that was used is printed on every row (`main_proof=`), so a verdict can never cite a
-source it did not read.
+local chain — which is the test seam and what keeps every fixture offline. Which source
+answered is printed once per pass (`main_proof=` on the `SUMMARY` line, and
+`main_ref=` for the branch the remote named), so a pass can never cite a remote it
+did not read. ⛔ It answers "could the REMOTE be read", not "which chain decided this
+row": with the remote unreadable the report says `main_proof=unavailable` while
+`is_ancestor_of_main` still evaluated the LOCAL chain — which is why the field is
+pass-level and the per-row `proof=` cites the actual command (`merge-base
+--is-ancestor <sha> <main>`).
 
 **Rule 4 is why this exists.** `git merge-base --is-ancestor` cannot see a squash
 merge: the branch head is not an ancestor of `main` even though the work landed. So a
@@ -457,10 +463,14 @@ was already `remove`, so folding it into `deferred` would deflate `preserved` an
 contradict itself. `main_proof=` names which source proved "merged into main" (`auto` = the remote's
 own advertised default branch, `local` = the local ref chain, `unavailable`/`ambiguous`/
 `auto-unfetched` = no evidence claimed), and `pr_merged=` says whether the pass's batched
-`gh pr list` read was answerable at all. ⛔ **Every one of these fields reads `?` — never `0` — when
-the delegate ran but produced no tally**, and `not-run` when the class was not selected: a refusal
-(`FAIL-CLOSED gh unavailable`) is not a measurement, and a measured zero beside an unknown
-classification is the false PASS this record exists to remove.
+`gh pr list` read was answerable at all (`ok` / `na` no GitHub origin / `unavailable`; the
+record reports `mixed` when two repos in one pass disagree). ⛔ **Every one of these fields
+reads `?` — never `0` — when the delegate ran but produced no tally**, and `not-run` when
+the class was not selected **or was selected but could not run at all** (a missing delegate
+or no repo to scan — `want_class` was true and the record says
+`verdict_<class>=misconfigured`, so `not-run` here means "no measurement", not "no
+candidates"): a refusal (`FAIL-CLOSED gh unavailable`) is not a measurement, and a measured
+zero beside an unknown classification is the false PASS this record exists to remove.
 
 `watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
 `internal`, see **Bounded execution** above), so "the bound was real" is answerable

@@ -187,6 +187,7 @@ CAND_UV=0; CAND_VENV=0; CAND_WT=0
 CLASSIFIED_VENV=0; PRESERVED_VENV=0
 HAVE_WT_TALLY=0
 HAVE_WT_CAND=0
+DEFERRED_REMOVE_WT=0
 HAVE_VENV_TALLY=0
 HAVE_VENV_CAND=0
 VENV_TALLY_COVER=0/0
@@ -1427,7 +1428,7 @@ reap_worktree() {
     # (`not-run`), or it ran and its delegate printed no SUMMARY (`?`). Both are recorded, neither is
     # reported as 0 — a `classified=0` beside `verdict=not-run` is a self-contradicting record, and it
     # is exactly the shape that reads as "healthy, nothing to do" on a pass that produced no answer.
-    local have_tally=0 REASON_ROWS="" wt_repos=0 wt_tally_repos=0
+    local have_tally=0 REASON_ROWS="" wt_repos=0 wt_tally_repos=0 sum_deferred_remove=0
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — pi-reap-worktrees.sh not found"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
@@ -1500,6 +1501,11 @@ reap_worktree() {
             _n="$(kv_field "$_sum" removed)";  case "$_n" in ''|*[!0-9]*) : ;; *) sum_removed=$((sum_removed + _n)) ;; esac
             _n="$(kv_field "$_sum" failed)";   case "$_n" in ''|*[!0-9]*) : ;; *) sum_failed=$((sum_failed + _n)) ;; esac
             _n="$(kv_field "$_sum" deferred)"; case "$_n" in ''|*[!0-9]*) : ;; *) sum_deferred=$((sum_deferred + _n)) ;; esac
+            # ⛔ A DEFERRED REMOVAL IS NOT A DEFERRED CLASSIFICATION. The record let one vanish: an
+            # armed pass whose budget ran out mid-removal printed `removed=0 failed=0 late_preserved=0`
+            # — indistinguishable from "the removals silently did nothing" — with only the echoed
+            # delegate text explaining it. Lift it so the alarm channel names it.
+            _n="$(kv_field "$_sum" deferred_remove)"; case "$_n" in ''|*[!0-9]*) : ;; *) sum_deferred_remove=$((sum_deferred_remove + _n)) ;; esac
             _n="$(kv_field "$_sum" late_preserved)"; case "$_n" in ''|*[!0-9]*) : ;; *) sum_late=$((sum_late + _n)) ;; esac
             _v="$(kv_field "$_sum" main_proof)"
             if [ -n "$_v" ]; then if [ -z "$proof" ]; then proof="$_v"; elif [ "$proof" != "$_v" ]; then proof="mixed"; fi; fi
@@ -1628,15 +1634,16 @@ reap_worktree() {
         # Lift the delegate's `remove=` instead of re-deriving it.
         CAND_WT="$sum_remove"
         if [ "${DF_WT_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
         else
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
         fi
     fi
     # An ANSWERED `reasons=none` is normalised ABOVE, before the class line prints it (a fix applied
     # only here repaired the record while the class line still said `?`).
     CLASSIFIED_WT="$sum_classified"; PRESERVED_WT="$sum_preserved"; REASONS_WT="$sum_reasons"
     PROOF_WT="$proof"; PRM_WT="$prm"; HAVE_WT_TALLY="$have_tally"
+    DEFERRED_REMOVE_WT="$sum_deferred_remove"
     return 0
 }
 
@@ -1781,6 +1788,10 @@ record_body() {
     printf 'classified_worktree=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${CLASSIFIED_WT:-}")"
     printf 'preserved_worktree=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PRESERVED_WT:-}")"
     printf 'preserved_reasons_worktree=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${REASONS_WT:-}")"
+    # The delegate's deferred REMOVALS, on their own field: an armed pass whose budget ran out mid
+    # removal records `removed=0 failed=0 late_preserved=0`, which reads as "nothing to do" unless
+    # this is visible. `?`/`not-run` polarity is the same as every other class field.
+    printf 'deferred_remove_worktree=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${DEFERRED_REMOVE_WT:-}")"
     printf 'main_proof=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PROOF_WT:-}")"
     printf 'pr_merged=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PRM_WT:-}")"
     printf 'verdict_uv=%s\n' "$VERDICT_UV"

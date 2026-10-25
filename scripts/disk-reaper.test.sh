@@ -249,6 +249,15 @@ assert_contains "$STAT" "mode=apply" "T3 the record names the mode"
 assert_contains "$STAT" "classified_worktree=" "T3 the record carries the delegate's classification tally"
 assert_contains "$STAT" "preserved_reasons_worktree=" "T3 ... and WHY each preserved record was kept"
 assert_contains "$STAT" "main_proof=auto" "T3 ... and which main the merge proof was read from"
+# ⛔ THE FIELD MUST BE ANSWERABLE, NOT MERELY PRESENT. `pr_merged=` was defined and then never
+# assigned, so the record carried `unknown` on every pass — an instrument that can only ever say
+# "I did not measure", which is the shape this record exists to remove. This origin is a LOCAL bare
+# repo, not a GitHub URL, so the PR-state read is genuinely N/A and the honest value is `na`.
+assert_contains "$STAT" "pr_merged=na" "T3 ... and whether the PR-state read was answerable (na: no GitHub origin)"
+assert_absent "$STAT" "pr_merged=unknown" "T3 ... the field is not left UNASSIGNED (a pass that read nothing says so)"
+# ...and the branch the remote actually named, so `main_proof=auto` is auditable (was assigned and
+# never read: the one piece of evidence the remote probe collected and then discarded).
+assert_contains "$OUT" "main_ref=refs/heads/main" "T3 ... and which branch the remote called HEAD"
 assert_eq "$(sed -n 's/^candidates_worktree=//p' <<<"$STAT" | head -1)" "1" \
     "T3 an ARMED pass records its candidate count (it used to be a structural 0)"
 assert_contains "$OUT" "classified=" "T3 the class line is readable without the log"
@@ -1748,7 +1757,7 @@ assert_contains "$ST" "ok=0" "T53 and the record is not healthy"
 assert_contains "$ST" "rc=3" "T53 and it carries the red code"
 assert_contains "$ST" "verdict_venv=fail-closed" "T53 the class verdict says fail-closed"
 assert_contains "$ST" "exited 3" "T53 the detail names the DELEGATE's own code, not the pass's"
-assert_absent "$ST" "deferred" "T53 a fail-closed class is never recorded as a deferral"
+assert_absent "$ST" "verdict_venv=deferred" "T53 a fail-closed class is never recorded as a deferral"
 SRC2=0; HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t53/state" bash "$REAPER" --print-status >/dev/null 2>&1 || SRC2=$?
 assert_eq "$SRC2" "3" "T53 --print-status exits 3 for a failed pass"
 
@@ -1809,7 +1818,7 @@ OUT="$(VENV_REAPER="$T/t53/removal.sh" run_reaper --apply --repo "$T/t53/repo-a"
 ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
 assert_eq "$RC" "4" "T53 venv's 4 (a removal FAILED) is 4 — red"
 assert_contains "$ST" "verdict_venv=removal-failed" "T53 and the class verdict names the failed removal"
-assert_absent "$ST" "deferred" "T53 a failed removal is never recorded as a deferral"
+assert_absent "$ST" "verdict_venv=deferred" "T53 a failed removal is never recorded as a deferral"
 
 # (c) COULD NOT RUN AS ASKED: the delegate returned 2 (bad arguments / wrong invocation). This is 3 —
 #     red — and it must NOT be mistaken for either a deferral or a delegate's own fail-closed 3.

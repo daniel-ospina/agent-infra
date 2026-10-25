@@ -1899,9 +1899,9 @@ summary_reasons() {
 # pass that removes nothing is visible HERE (`examined=51 classified=51 remove=0 preserved=51
 # reasons=too-recent:51`), which `REMOVED=0` alone never was.
 summary_line() {
-    printf 'SUMMARY examined=%s classified=%s remove=%s preserved=%s deferred=%s deferred_remove=%s removed=%s failed=%s late_preserved=%s prune_blocked=%s reasons=%s main_proof=%s pr_merged=%s\n' \
+    printf 'SUMMARY examined=%s classified=%s remove=%s preserved=%s deferred=%s deferred_remove=%s removed=%s failed=%s late_preserved=%s prune_blocked=%s reasons=%s main_proof=%s main_ref=%s pr_merged=%s\n' \
         "$WT_TOTAL" "$CLASSIFIED_C" "$REMOVE_C" "$((PRESERVE_C - DEFERRED))" "$DEFERRED" "$DEFERRED_REMOVE" \
-        "$REMOVED" "$FAILED" "$LATE_PRESERVE" "$PRUNE_BLOCKED" "$(summary_reasons)" "$MAIN_PROOF" "$PR_MERGED_STATE"
+        "$REMOVED" "$FAILED" "$LATE_PRESERVE" "$PRUNE_BLOCKED" "$(summary_reasons)" "$MAIN_PROOF" "${MAIN_REF_NAME:-${MAIN_REF:-?}}" "$PR_MERGED_STATE"
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -1956,12 +1956,11 @@ run() {
     done
     awk -v a="$REAP_WT_AGED_DAYS" -v m="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(a >= 0 && a <= m)}' \
         || { echo "bad --aged-days: out of range (0..$REAP_WT_MAX_DAYS)" >&2; exit 2; }
-    # ⛔ THE MERGED FLOOR IS AN OPERATOR-SETTABLE NUMBER TOO, and the loop above used to omit it: a
-    # non-numeric value reached `$((age_floor * 86400))` INSIDE `classify_one`'s command substitution,
-    # where the arithmetic error aborted the subshell — so `crumb` came back EMPTY, the record printed
-    # `preserve <path>` with NO reason, and `preserved` no longer reconciled with `reasons=` (the
-    # reconciliation this pass advertises). It was rare while the floor only applied to `refs=merged`
-    # (unreachable pre-squash-support); it is the common arm now, so it is validated here.
+    # `--aged-days` range is bounded above as well as below. The loop above already REFUSES a
+    # non-numeric floor (`is_pos_int`), so what this adds is the upper bound: a value that is numeric
+    # but beyond REAP_WT_MAX_DAYS. Same bound, same remedy line, for the merged floor — it governs the
+    # common arm now (every squash-landed head), so an out-of-range value must fail here, loudly,
+    # rather than silently changing every verdict in the pass.
     awk -v m="$REAP_WT_MERGED_AGE_DAYS" -v x="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(m >= 0 && m <= x)}' \
         || { echo "bad REAP_WT_MERGED_AGE_DAYS: $REAP_WT_MERGED_AGE_DAYS (want 0..$REAP_WT_MAX_DAYS)" >&2; exit 2; }
     # An unrecognised proof mode must not silently become "local" OR "auto": one skips the remote
@@ -2074,6 +2073,10 @@ run() {
     else
         GH_STATE="na"; GH_OK=1; PR_APPLICABLE=0
     fi
+    # The pass's PR-state read IS the merged evidence (rules 4-6: a squash-merged head is never an
+    # ancestor of main, so PR state is the only proof available). Record whether it was answerable, so
+    # a consumer can tell `pr_merged=ok` (read, answered) from `pr_merged=unavailable` (never read).
+    pr_merged_state_from_gh
 
     if ! ps_load; then
         echo "FAIL-CLOSED abort: ps enumeration failed or empty — cannot verify the live-reference gate (exit 3)" >&2

@@ -1163,6 +1163,16 @@ except ET.ParseError as e:
     cp -f "$tmpd/$LABEL.plist" "$UNIT_DIR/$LABEL.plist" || { err "copy failed"; rm -rf "$tmpd"; return 1; }
     rm -rf "$tmpd"
 
+    # ⛔ THE READ-BACK RUNS BEFORE THE JOB IS ARMED. A plist that launchd would load but that does not
+    # launch THIS reaper — a stale one, a `--dry-run` one, one whose `EnvironmentVariables.HOME` is
+    # another tree (no gh auth) — must not be left scheduled and firing while the installer exits 1.
+    # The systemd arm states the same rule ("the install has to fail before the clock starts, not
+    # after"); this arm bootstrapped first and verified second, so a refusal here armed the very job it
+    # refused. The artifact is already the copied file at this point, so the check is equally valid.
+    # The installed plist is the artifact launchd loads, not the one we rendered: verify the artifact,
+    # never the bytes we hoped it would be.
+    verify_installed_artifact_plist || return 1
+
     # Only re-bootstrap when the bytes moved or the job is not loaded: a bootout/bootstrap on every
     # bring-up would reset launchd's start interval bookkeeping for no reason. The loaded test matches
     # the WHOLE label (third field), not a substring — `grep -qF com.eldato.disk-reaper` would also
@@ -1174,10 +1184,6 @@ except ET.ParseError as e:
             || $SC load -w "$UNIT_DIR/$LABEL.plist" >/dev/null 2>&1 \
             || { err "could not bootstrap $LABEL from $UNIT_DIR/$LABEL.plist — the reaper will NOT run unattended"; return 1; }
     fi
-
-    # The installed plist is the artifact launchd loads, not the one we rendered. Same rule, other
-    # platform: verify the artifact, never the bytes we hoped it would be.
-    verify_installed_artifact_plist || return 1
 
     say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
     say "  reaper: $REAPER"
