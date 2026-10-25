@@ -984,6 +984,66 @@ The procfs is a **hermetic fixture** in the suite (`--proc-root`), so the `/proc
 exercised by a leg rather than assumed — including the two shapes that must abstain (a refused
 `cwd`) and the one that is a real answer (a pid that is gone).
 
+### 10.4 The dispatch-yield preflight — is there anything to LAND? (#2747)
+
+§10 asks *"is the predecessor still ALIVE"*. The complementary question is about the WORKTREE:
+*"does a dispatch there have anything to land?"* Measured 2026-10-18: 14 live `pi` lanes, **12 with
++0 commits**, and every one of those 12 sat on a HEAD `origin/main` already contained. The lane ran
+to completion, stood down, and the fleet read as "busy but unproductive" — so the expensive thing is
+the DISPATCH, not the lane.
+
+`tools/fleet/dispatch_preflight.py <worktree>` answers it locally (no network, no ref moved):
+
+| exit | verdict | meaning |
+|---|---|---|
+| `0` | `HAS-WORK` | dispatch may proceed |
+| `3` | `NO-WORK` | refuse — landing HEAD would not change the base |
+| `4` | `UNREADABLE` | refuse — the git state could not be read, **or the invocation was malformed** |
+
+The predicate is a **three-way merge**, not a tree comparison: `would_change_base` is
+`merge-tree --write-tree <base> <head>` compared against `tree(base)` (git **≥ 2.38**; an older git
+is `UNREADABLE` with the version named, never a guess). A tree comparison answers this wrongly in
+the most common lifecycle shape of all — branch squash-merged, base then advanced: `tree(HEAD) !=
+tree(base)` while every byte HEAD carries is already in the base.
+
+And the merge is **not trusted on its own**: a repo-declared merge driver
+(`.gitattributes: *.lock merge=ours`) makes the merge keep the BASE side, so it reports "nothing
+changes" for a branch that really does carry unlanded work. Whenever the merge says nothing changes,
+the tool also asks the path-level question — for every path HEAD changed, is the base's content
+identical? — and a disagreement is `UNREADABLE` ("already landed" cannot be certified), never
+`NO-WORK`. **Dirty worktrees are `HAS-WORK` unconditionally** (uncommitted/untracked content is work
+to land, and a false refusal destroys it — the dirty read short-circuits before anything that needs
+the base), and the target must be **its own work-tree root** — `git -C` walks upward, so a stale
+`.worktrees/x/` would otherwise be answered from the main checkout.
+
+**Boundary, stated:** squash-merged and then the base **rewrote the same path**. HEAD's bytes are not
+the base's bytes, so every read available here says "this path differs" and the verdict is
+`HAS-WORK` — conservative (a wasted lane at worst). The `NO-WORK` rule is about an advance on
+**other** paths.
+
+⛔ **What is NOT wired, stated plainly (#1890).** Nothing calls this today: not `lane.sh`,
+`fix-one.sh`, `spawn-gate.sh`, `nonblocking-dispatch.sh`, `pr-doctor.py` or `merge-one.sh`. Merging
+the tool does **not** by itself stop a lane being spawned into a `NO-WORK` worktree — it is
+**operator-run** until the call site lands, and issue #2747 stays open for it (the call site belongs
+beside the gates in §10, honouring exit `3` as *refuse and yield* and exit `4` as *refuse, different
+reason* — a gate that changes fleet-wide dispatch behaviour gets its own change and its own review).
+
+Run the pinned suite after any change (the red control proves each leg fails without its fix):
+
+```bash
+python3 tools/fleet/dispatch_preflight.test.py               # 31 legs
+python3 tools/fleet/dispatch_preflight.test.py --red-control # 16 mutations, each must go RED
+```
+
+The suite is hermetic by pinning **this process's** git environment (`GIT_CONFIG_GLOBAL`/`SYSTEM`
+neutralised, and `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_OBJECT_DIRECTORY` **cleared** — a
+leaked one redirects every fixture git call into the caller's repo; measured: an exported `GIT_DIR`
+not only errored 26 setUps, it WROTE into the ambient checkout). Every verdict is computed
+in-process, so pinning only the fixtures leaves the result depending on the box (a global
+`core.excludesFile` matching `*.md` reddened the untracked-file leg). `--red-control` runs the
+unmutated suite FIRST and refuses if it is red: otherwise a broken suite reports every mutation as
+"caught by its paired leg" and certifies itself.
+
 ---
 
 ## 11. `idle` must pass through Step 2, and a stale binding is never verified (#1867)

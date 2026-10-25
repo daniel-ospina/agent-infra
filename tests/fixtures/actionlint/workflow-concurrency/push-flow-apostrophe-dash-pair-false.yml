@@ -1,0 +1,11 @@
+# The safe direction: the same apostrophes with the non-cancelling pair must stay GREEN (#2660 round 14).
+name: push flow apostrophe dash pair false
+on:
+  push:
+    branches: [main]
+concurrency: {group: shard-'a, cancel-in-progress: false}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

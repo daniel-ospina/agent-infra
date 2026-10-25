@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off runs in ci-main's `extension-tests` job ONLY (no PR-lane site - a pre-existing lane split, agent-infra#2610); a shard here would be a second run site (#2439), not a fix
 # commit-msg-check.test.sh — unit tests for the #668 commit-msg mangle hook.
 #
 # The hook (.husky/commit-msg) is run DIRECTLY here — `.husky/commit-msg <file>`

@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2227, gh-rate-limits, gh-limit
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2227, gh-rate-limits, gh-limit, issue-2139, issue-2143
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -89,7 +89,97 @@ documented policy, so this file does not restate the numbers — it names where 
 | **≥ 1 s between mutative calls** (POST/PATCH/PUT/DELETE) | `pace_mutation` |
 | Conditional REST for polling: ETag stored per URL (host + path + credential digest), `if-none-match` sent, a **304 replayed from cache** and charged nothing. The cached body is base64 (a 304 replay is byte-exact, binary included) and the cache is bounded in ENTRIES and BYTES (`GH_LIMIT_CACHE_MAX_ENTRIES` 500, `GH_LIMIT_CACHE_MAX_BYTES` 64 MiB) | `conditional_fetch` / `cache_put` / `prune_cache` |
 | The shim stays FIRST on PATH even though every gh-calling harness script prepends `/opt/homebrew/bin:/usr/local/bin` | the `$O/gh-limit` / `$O/gh-rest` re-assert in the harness scripts that prepend and invoke `gh` |
-| The heartbeat's tooling (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`) reaches the layer instead of a pinned real binary | each resolver prefers `$O/gh-rest/gh` then `$O/gh-limit/gh` (`$O`-derived, never PATH); the five that HAVE a pinned candidate also hand it through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` (see the residual below for the three that never pinned). Was nine/six until agent-infra#1874 retired `retired/queue-dispatch.py` — a retired tool is not in the beat, so it is not counted here |
+| The heartbeat's tooling (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`) reaches the layer instead of a pinned real binary — **except `beta-progress.py`'s two PR-list REST reads, which go direct (see "A reader with its OWN REST second source" below and the matching residual)** | each resolver prefers `$O/gh-rest/gh` then `$O/gh-limit/gh` (`$O`-derived, never PATH); the five that HAVE a pinned candidate also hand it through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` (see the residual below for the three that never pinned). Was nine/six until agent-infra#1874 retired `retired/queue-dispatch.py` — a retired tool is not in the beat, so it is not counted here |
+### A reader with its OWN REST second source (#2139)
+
+`beta-progress.py` (the heartbeat's DELIVERY line) reads both PR lists with `gh pr list --json`.
+Where a box has the REST adapter (`$O/gh-rest`, #1959) the OPEN read is already served over REST —
+`number,title,headRefName` are all in its `PR_FIELDS` — but **`mergedAt` is not**, so the MERGED
+read delegates to the real `gh`, i.e. GraphQL. On the cells there is no `$O/gh-rest` (#1978), so
+both reads are GraphQL. Under fleet concurrency a SECONDARY-limit refusal then took the line out
+entirely (`DELIVERY: unavailable (metrics read failed)`) while `core` read 1599/5000 and a single
+REST call answered in 0.43 s — the fleet lost its own progress measurement while a readable source
+existed. That reader therefore keeps a REST fallback of its own (`_rest_prs`), and the rules it
+follows are the reusable ones:
+
+* **Same source or no metric.** If EITHER GraphQL list fails, BOTH are re-read over REST. A REST
+  open-count beside a GraphQL merged-count compares two differently-wrong reads.
+* **`limit` bounds ROWS READ, not rows returned.** The loop advances on the rows it FETCHED, so it
+  spends the same row budget `gh pr list --limit` spent. In the closed window those rows are then
+  filtered to merges, so the merged list holds the merges among the `limit` most-recently-updated
+  **closed** PRs and is SHORTER than `limit` when some were closed without merging (measured:
+  396/400). This is the bound, not a short read — and it is why the REST read is not
+  interchangeable with `gh pr list --state merged --limit 400`. Filling the window with merges
+  instead would cost an UNBOUNDED number of requests against the very bucket this fallback exists
+  because we are rationing, so the row bound is the deliberate trade: `merged_today` stays exact
+  while a day's merges (plus the abandoned rows updated beside them) fit inside it.
+* **`state=closed` is not `state=merged`.** REST's closed window carries PRs closed WITHOUT
+  merging; only rows with a non-null `merged_at` may count toward `merged_today`.
+* **The window is paged, `per_page` never shrinks, and a window that MOVED is refused.** REST
+  caps `per_page` at 100, so the
+  500/400 windows are `ceil(limit/100)` requests. A page that cannot be read — or the pair
+  spending its shared 30 s budget — refuses the WHOLE read instead of returning a short list: a
+  silently short window under-counts `merged_today`, which is the one error a fallback must not
+  add. `per_page` stays 100 on every page because GitHub derives a request's offset from THAT
+  request's `per_page`, so a shrunk final page re-reads an earlier range and leaves a hole; the
+  final page is trimmed after it arrives. `updated desc` is a LIVE order read by offset, so a PR
+  updated between two requests jumps to offset 0 — INSIDE the page already read — and every row
+  below it shifts down by one. One event, two symptoms: the row that sat at the END of the page
+  just read is pushed across the boundary and returned a SECOND time, while the mover itself is
+  behind the cursor and returned by NO page, so the just-merged PR is precisely what goes missing
+  (measured with the shipped loop: #150 bumped after page 1 → `100` repeated, `150` never
+  returned; end-to-end, one merge landing mid-read left `merged_today` at 0 where the truth was
+  1). Keeping the window would hide the missing row, so a repeat — which can only arise from the
+  list changing mid-read — abandons that ATTEMPT; the read is retried **once**, and a second
+  repeat REFUSES the whole read (`None` → `unavailable`). The retry exists because on a box
+  running ~17 concurrent `gh` clients most movers are churn that has settled by the time the page
+  set is re-read, so without it the fallback would spend its requests and still lose the line. It
+  is bounded and stated: at most ONE extra page-set (`ceil(limit/100)` requests), spent only on a
+  path that was going to print `unavailable` anyway, out of the SAME shared 30 s budget — and a
+  retry can never turn two DIFFERENT windows into a number, because a repeat on the second attempt
+  refuses. A reorder that leaves
+  the identity at every later offset unchanged — a same-second tie-break swap inside one page —
+  produces no repeat and costs nothing; anything whose effect crosses a request boundary either
+  repeats (an update) or is the removal case below.
+  **The detector is one-way, and that is a stated residual:** a row that LEAVES the list mid-read
+  (a PR reopened or deleted) shifts every later row UP, nothing repeats, and the row that should
+  sit at each later offset is skipped — measured: 250 closed rows with #101 merged today, #5
+  reopened after page 1 → the window came back with #101 ABSENT and `merged_today` 0 where the
+  truth was 1. Offset paging cannot see that from the rows alone. The successor detector is the
+  collection total from the `Link: rel="last"` header compared across the read (an insertion and
+  a removal both change it; a pure update does not); it is NOT implemented, so a mid-read removal
+  can leave this window short by one row per removal — rare (a reopen inside a ~2 s read), and the
+  one path where the fallback under-counts instead of refusing. The window is the 400
+  most-recently-updated **closed**
+  PRs and unmerged rows are dropped after it is read, so today's updated closed PRs — not today's
+  merges alone — must fit in 400 for `merged_today` to be exact. That is a stated bound, not a
+  promise.
+* **It goes direct (urllib + the token), NOT through the layer — a deliberate, costed trade-off.**
+  The layer cannot serve `mergedAt` at all (a `PR_FIELDS` change is its own follow-up), and it does
+  not help the cells, which have no adapter; a fallback that queues behind the refusing path is not
+  a fallback. The cost is named in the residual below: no single-flight, no ETag/304 replay, and no
+  entry in `last-limit`. The token is read from `GH_TOKEN`/`GITHUB_TOKEN`, else the `oauth_token`
+  of the **`github.com:` block** in `${GH_CONFIG_DIR:-~/.config/gh}/hosts.yml` (a `hosts.yml` that
+  lists another host first must not donate that host's token — it answers 401 against
+  `api.github.com`; nor may a token nested under a per-account `users:` map, whose entries belong
+  to other accounts and are skipped by depth. The block's own `oauth_token` is what gh itself
+  uses — switching accounts moves the active user's token UP to block level — so a config with
+  both a `users:` map and a block-level token still answers with the ACTIVE account. With no
+  block-level token the fall-through splits in two, and the halves are NOT the same outcome: a
+  KEYRING-BACKED config is answered the ACTIVE account by `gh auth token` (an OFFLINE lookup the
+  layer does not count as a request), while a file whose tokens are ALL nested under `users:` is
+  answered NOTHING (measured, gh 2.102.0: `no oauth token found for github.com`, empty stdout) —
+  `_token()` then returns `""` and the read refuses `unavailable`, which is the correct outcome
+  rather than a regression). The token is never logged — pinned
+  at the finder as well as the transport, since a `print()` inside `_token()` is upstream of the
+  value the rest of the file sees — and a box with no credential at all refuses (`unavailable`)
+  rather than reading anonymously.
+
+**Not covered by this fallback, stated rather than assumed:** the two `gh issue list` reads (the
+P0/P1 tiers) are still GraphQL, so where the adapter is absent a refusal there still takes the
+whole line out — after the PR lists were paid for. `merge-queue.py`'s own `--state merged` read is
+the same class and is what prints `VERDICT=UNKNOWN (merge-rate read failed)`; #2139 names both as
+residuals so the next lane does not read this section as covering them.
 
 Two properties worth knowing before you debug it:
 
@@ -217,6 +307,16 @@ Two properties worth knowing before you debug it:
   of the beat — retired in agent-infra#1874, so it is no longer a resolver here.) The shell call sites
   keep the waits: they have no
   subprocess bound of their own.
+- **`beta-progress.py`'s REST fallback is OUTSIDE the layer (#2139).** Its two `/pulls`
+  reads use urllib + the token directly, so they are not serialised by the box's single-flight
+  lock, get no ETag/304 replay, and are invisible to `$GH_LIMIT_DIR/last-limit`. Deliberate: the
+  adapter cannot serve `mergedAt` (`PR_FIELDS` omits it, so the merged read delegates to
+  GraphQL), and the cells have no adapter at all. The read is bounded (shared 30 s budget, paged,
+  refusing rather than truncating) and it runs only after a GraphQL read already failed.
+  Follow-up (#2143): model `mergedAt` in `PR_FIELDS` **and map `--state merged` to `state=closed`
+  plus a non-null-`merged_at` filter** — the adapter forwards the state verbatim and REST has no
+  `merged` state, so sending it as-is is a 4xx, not a list. That fixes `merge-queue.py`'s
+  merge-rate read too.
 - **The layer resolves the REAL gh by walking PATH.** A tool that has a pinned candidate hands it
   through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` — `objective.py`, `merge-queue.py`,
   `beta-progress.py`, `ask-owner.py` and `pr-doctor.py` (via `objective.py`'s

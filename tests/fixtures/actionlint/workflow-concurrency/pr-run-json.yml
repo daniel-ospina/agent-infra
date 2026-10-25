@@ -1,0 +1,13 @@
+# The flow-mapping job search fired on a QUOTED `run:` value containing JSON, refusing a correct
+# workflow for text inside a string (#2660 round 8).
+name: PR run json
+on:
+  pull_request:
+concurrency:
+  group: pr-run-json-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo '{"gate":1,"concurrency":false}'

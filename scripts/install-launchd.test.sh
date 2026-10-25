@@ -494,10 +494,13 @@ for _tpl in "$TEMPLATES"/*.plist; do
     GATED_TEMPLATES1=$((GATED_TEMPLATES1 + 1))
     case "$OUT1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
 done
-# 3 since #2053 added com.tortoise.worktree-hygiene (also {{TORTOISE_REPO}}-gated): the pin was left at
-# 2, so this assertion was red on EVERY box — the shard could not pass anywhere, which is worse than a
-# host-dependent count because it reads as "the inventory is wrong" while the inventory is right.
-assert_eq "$GATED_TEMPLATES1" "3" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #1095/#1678)"
+# ⛔ THE PIN IS AN ACKNOWLEDGEMENT, NOT A CACHE. A newly added gated job must be named HERE, by a human,
+# in the same commit that adds it — that is the point of pinning the count instead of deriving it, so a
+# template cannot raise both sides of the equation at once. This number went stale when #2047/#2053 added
+# `com.tortoise.worktree-hygiene` to the gated set (branch-reaper #1787 + worktree-reaper #1311 +
+# worktree-hygiene #2047), and the result was a RED `bash-suites` on main that had nothing to do with any
+# PR that touched it. Keep this list in step with `grep -l '{{TORTOISE_REPO}}' templates/launchd/*.plist`.
+assert_eq "$GATED_TEMPLATES1" "3" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #2047)"
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).
