@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off runs in a dedicated job in BOTH lanes (ci.yml `sigpipe-grep`, ci-main `sigpipe-grep-guard`) - a shard here would be the duplicate run site #2439 removed
 # tests/sigpipe-grep/run.sh — #841 SIGPIPE false-negative regression suite.
 #
 # The bug: under `set -o pipefail`, `printf … | grep -q PAT` takes the ELSE branch when

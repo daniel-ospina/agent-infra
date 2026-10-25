@@ -1,0 +1,14 @@
+# A flow `on:` mapping whose two plain scalars each carry an apostrophe. A quote rule that opened a
+# scalar whenever another apostrophe followed paired those two up across the separating comma, folded
+# every entry between them into one, and DROPPED the `push` trigger — so a push workflow that cancels
+# reported GREEN. The triggers must survive: this file is RED for cancelling on main (#2660 round 12).
+name: push on flow apostrophes
+on: {workflow_dispatch: {}, description: Don't ask, push: {branches: [main]}, description2: it's fine}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

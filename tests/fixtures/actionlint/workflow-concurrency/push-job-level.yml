@@ -1,0 +1,14 @@
+# FAILURE-CLASS FIXTURE (R0): the cancellation is declared at JOB level, where GitHub honours it and
+# this check does not model it. Refused rather than ignored — silence is not compliance.
+name: push-job-level
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: push-job-level-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - run: 'true'
