@@ -2048,6 +2048,38 @@ assert_contains "$(row_for "$OUT" "$WT_ETIME")" "reason=reclaimable" \
 assert_contains "$(row_for "$OUT" "$WT_ETIME")" "unref=stale-shell: pid=65000(argv)" \
     "G2721l ...and the row names the demoted pid, so the fallback is provably the path taken"
 
+# ── G2721m: a TRUNCATED holder scan keeps the checkout (never "no live holder") ─────────────
+# The cap is a runaway guard whose exhaustion branch is unreachable in a healthy pass (the default
+# exceeds any holder count, and each iteration consumes a distinct pid), so its POLARITY had no arm:
+# reverting `HL_VERDICT=...; return 0` to `return 1` kept all 332 assertions green while a truncated scan
+# would read as "every holder was demoted" — and `remove_one` would then delete the checkout out from
+# under a live lane (review round 8, P2). `REAP_WT_SCAN_CAP` (a test seam; production never sets it)
+# makes it reachable: three demotable idle shells and a cap of two.
+echo ""
+echo "── G2721m: the cap-exhaustion backstop (truncated => LIVE) ────────────────────"
+ENV=G2721m; REPO="$(mk_repo $ENV)"
+WT_CAP="$(add_named_wt "$REPO" "$ENV-caps" feat/g2721m-caps)"
+mkdir -p "$WT_CAP/.venv"; printf 'x\n' >"$WT_CAP/.venv/marker"
+CAP_TS=$(( $(date +%s) - 1000 ))
+commit_in_wt "$WT_CAP" "@$CAP_TS" caps
+CAP_CANON="$(cd "$WT_CAP" && pwd -P)"
+mkdir -p "$T/seq-gm"
+{
+  printf '1 0 /sbin/launchd\n'
+  i=0
+  while [ "$i" -lt 3 ]; do
+    i=$((i + 1)); printf '%s 1 /bin/bash -c cd %s idle-%s\n' "$((63000 + i))" "$CAP_CANON" "$i"
+  done
+} >"$T/seq-gm/1"
+RNOW_CAP="$(date +%s)"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gm" FAKE_ETIME='10:00:00' REAP_WT_PROC_ROOT="$T/no-proc" \
+    REAP_WT_SCAN_CAP=2 REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW_CAP" REAP_WT_AGED_DAYS_OVERRIDE=0 \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+assert_contains "$(row_for "$OUT" "$WT_CAP")" "reason=live" \
+    "G2721m a TRUNCATED holder scan PRESERVES the checkout (it is never read as unheld)"
+assert_contains "$(cat "$T/$ENV/reap.log" 2>/dev/null)" "STALE-SHELL-SCAN TRUNCATED" \
+    "G2721m ...and the pass names the truncation, so the preservation is explainable"
+
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
 [ "$FAIL" -eq 0 ] || exit 1

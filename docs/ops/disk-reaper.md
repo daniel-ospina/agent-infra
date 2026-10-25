@@ -574,8 +574,9 @@ headroom that must still be free **after** that worst case — **4x the dispatch
 number the cell's warning band defaults to, derived independently: the reserve is an *enforcement* bound
 and the band is a *reporting* threshold, so an operator lowering the band to quiet the logs cannot be
 lowering admission with it. `max(tree, self)` is not a redundancy: a
-gate that admitted on `tree + reserve` lets one lane eat the whole reserve and leaves the cell at
-~700 MB, which is below the 2,286 MB cell-4 wedged at. `tree` and `self` are **measured per target**,
+gate that admitted on `tree + reserve` alone (2,350 MB with the shipped numbers) admits a lane that then
+writes 5,772 MB and drives the cell ~3,400 MB SHORT of zero — the cell-4 wedge, reached from a rule that
+looked one term cheaper. `tree` and `self` are **measured per target**,
 never one global constant (`reserve` is 4x the dispatch
 floor, which is enforcement, not a per-target measurement): #1852 recorded that a single constant cannot serve an agent-infra lane
 (48 MB, no install) and a tortoise lane (5.7 GB of python), and a tortoise-sized floor would refuse
@@ -705,6 +706,13 @@ reading without editing a shipped script. The start time comes from the process 
 time (`/proc/<pid>`), and both reapers read it through a root seam — `REAP_VENV_PROC_ROOT` /
 `REAP_WT_PROC_ROOT`, default `/proc` — so a test can drive the `ps` fallback deterministically on a
 host where the fixture pid happens to be live; in production the seam is never set.
+
+Two more seams exist ONLY to make backstops testable, and production never sets them either:
+`REAP_VENV_SCAN_CAP` / `REAP_WT_SCAN_CAP` lower the scan's runaway cap so its **exhaustion** branch can be
+reached. That branch is otherwise unreachable by construction (the derived cap exceeds any holder count
+and each iteration consumes a distinct pid), which is exactly why it needs an arm: its polarity is
+`truncated => LIVE`, and the opposite reading — "no holder found" — deletes a live lane's env or
+checkout. Both suites drive it (`K10`, `G2721m`) and both fail if the branch is reverted.
 
 The scan that applies the rule examines **every** holder (an idle shell and a working lane routinely
 share a checkout) and carries a per-record exclude list instead of mutating the probe output, so one

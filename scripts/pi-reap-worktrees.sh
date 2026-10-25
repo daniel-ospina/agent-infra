@@ -238,6 +238,8 @@
 #   REAP_WT_GIT_TIMEOUT
 #   REAP_WT_BUDGET_SECONDS REAP_WT_STATE_DIR REAP_WT_LOCK_STALE_SECONDS
 #   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT REAP_WT_PROC_ROOT
+#   REAP_WT_SCAN_CAP (test seam: pins the runaway-guard exhaustion branch, which is unreachable with
+#   the derived cap)
 # Exit codes: 0 pass completed with nothing failed, 2 usage, 3 fail-closed
 # abort (nothing trusted), 4 pass completed but >=1 removal FAILED.
 # (`remove_one`'s internal 2 — "the checkout changed since classification, it
@@ -1169,6 +1171,11 @@ holders_live() {
     HL_VERDICT=""; HL_DETAIL=""; HL_STALE=""
     cap=$(( $(wc -l <"${PS_OUT:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${CWD_OUT:-/dev/null}" 2>/dev/null || echo 0) + 4 ))
     [ "$cap" -ge 4 ] || cap=4
+    # ⛐ THE CAP HAS A TEST SEAM (`REAP_WT_SCAN_CAP`) for the same reason as its venv twin: the default
+    # exceeds any reachable holder count, so the exhaustion branch is unreachable in a healthy pass and
+    # its POLARITY (`truncated => LIVE`, never "no holder") was unpinned — reverting it kept the suite
+    # green while a truncated scan would read as unheld and the checkout deleted (review round 8, P2).
+    if is_pos_int "${REAP_WT_SCAN_CAP:-}" && [ "${REAP_WT_SCAN_CAP}" -ge 1 ]; then cap="$REAP_WT_SCAN_CAP"; fi
     while pid="$(live_process_for "$canon" "$recorded" "$seen")"; do
         n=$((n + 1))
         if [ "$n" -gt "$cap" ]; then

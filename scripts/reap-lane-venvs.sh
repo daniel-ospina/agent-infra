@@ -144,6 +144,8 @@
 #   at the point it is read — see `is_pos_int "$REAP_VENV_FREE_FLOOR_MB"`.)
 #   REAP_VENV_PS_TIMEOUT REAP_VENV_CWD_TIMEOUT REAP_VENV_TMUX_TIMEOUT REAP_VENV_GIT_TIMEOUT
 #   REAP_VENV_REMOVE_TIMEOUT REAP_VENV_ALLOW_DEGRADED_CWD REAP_VENV_PROC_ROOT
+#   REAP_VENV_SCAN_CAP (test seam: pins the runaway-guard exhaustion branch, which is unreachable with
+#   the derived cap)
 #
 # Exit codes: 0 pass completed (removals or none), 2 usage, 3 fail-closed abort (nothing removed),
 #             4 pass completed but at least one removal FAILED,
@@ -768,6 +770,13 @@ live_witness() {
     # tmux server, and a worktree with five holders was then truncated and read as unheld).
     cap=$(( $(wc -l <"${CWD_TABLE:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${TMUX_TABLE:-/dev/null}" 2>/dev/null || echo 0) + $(wc -l <"${PS_TABLE:-/dev/null}" 2>/dev/null || echo 0) + 4 ))
     [ "$cap" -ge 4 ] || cap=4
+    # ⛐ THE CAP HAS A TEST SEAM (`REAP_VENV_SCAN_CAP`), because its EXHAUSTION BRANCH is otherwise
+    # unreachable: the default is rows(cwd)+rows(tmux)+rows(ps)+4 and every iteration consumes a distinct
+    # pid, so "n > cap" cannot fire in a healthy pass — which meant the branch's POLARITY (a truncated
+    # scan is a LIVE holder, never "no holder") had no arm at all, and reverting it to `return 1` kept the
+    # suite green while a truncated scan would read as "every holder was demoted" and the env deleted
+    # (review round 8, P2). Production never sets this; a suite does, to drive the backstop.
+    if is_pos_int "${REAP_VENV_SCAN_CAP:-}" && [ "${REAP_VENV_SCAN_CAP}" -ge 1 ]; then cap="$REAP_VENV_SCAN_CAP"; fi
     while hit="$(tmux_witness_for "$canon" "$seen")"; do
         n=$((n + 1))
         if [ "$n" -gt "$cap" ]; then

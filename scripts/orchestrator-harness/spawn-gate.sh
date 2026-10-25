@@ -1266,11 +1266,12 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # The fallback is the caller's cwd, and the shipped callers reach here for DIFFERENT reasons — so no
   # single sentence covers them, and stating one as if it did is how this comment was wrong twice:
   # `lane.sh` is LAUNCHED with its cwd already inside the worktree (its own header: "cwd must already be
-  # the worktree"; `dispatch-merge.sh` hands `$REPO/.worktrees/$WT` as the spawn cwd), while
-  # `fix-one.sh` / `adopt-fix.sh` do `cd "$REPO"` and override `DISK_GATE_PATH` with the worktree — which
-  # is port-provenance D5's "their `$PWD` is the MAIN CHECKOUT", said about THOSE TWO and not about
-  # `lane.sh`. Both routes classify a checkout, and the main checkout is itself a checkout (python pair),
-  # so the fallback errs STRICT.
+  # the worktree"; `dispatch-merge.sh` hands `$REPO/.worktrees/$WT` as the spawn cwd), while `fix-one.sh`
+  # does `cd "$REPO"` and then sets `DISK_GATE_PATH="$WT"` explicitly — which is port-provenance D5's
+  # "their `$PWD` is the MAIN CHECKOUT". `adopt-fix.sh` cds to the repo and EXECS `fix-one.sh`, so it
+  # inherits that explicit path; it sets no `DISK_GATE_PATH` of its own, and a sentence that says it does
+  # is the same stretch this paragraph exists to stop. Both routes classify a checkout, and the main
+  # checkout is itself a checkout (python pair), so the fallback errs STRICT.
   #
   # ⛔ WHEN NEITHER PATH IS A CHECKOUT the target is genuinely unknown: the harness pair is charged and
   # the line is NAMED in the log. Charging the python bound there would refuse every harness lane on any

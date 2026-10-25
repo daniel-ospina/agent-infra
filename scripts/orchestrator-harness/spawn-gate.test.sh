@@ -1077,7 +1077,14 @@ ck "...and it says waiting will not clear it, so an operator is not sent to a lo
 # the mount root was.
 TGT="$TMP/target"
 mkdir -p "$TGT/repo-with-uv" "$TGT/mount-root"
-(cd "$TGT/repo-with-uv" && mkdir -p .git && : > uv.lock)
+# ⛐ `.git` IS A FILE HERE, because that is what a LINKED WORKTREE has (review round 8, P2). Every
+# shipped caller passes a worktree, and a worktree's `.git` is a 38-byte file pointing at the gitdir —
+# so a check written as `[ -d "$path/.git" ]` passes this suite's old `mkdir .git` fixture and fails on
+# every real lane, silently classifying a python worktree as the 64MB harness lane. The fixture is the
+# shape the code meets in production, not the convenient one.
+(cd "$TGT/repo-with-uv" && : > .git && : > uv.lock)
+mkdir -p "$TGT/harness-checkout"
+(cd "$TGT/harness-checkout" && : > .git)   # a checkout with NO install marker
 : > "$LOG"; : > "$PI_LOG"
 res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=5000 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
   DISK_GATE_PATH="$TGT/mount-root" DISK_MIN_FREE_MB=500 DISK_WARN_FREE_MB=2000 \
@@ -1097,6 +1104,50 @@ ck "...because it was charged the python pair (8144), not the 64MB harness pair 
 # machine. Pinning the number in the refusal proves the stub answered.
 grep -q 'only 5000MB is available' "$LOG"; rc=$?
 ck "...and the free reading in that line is the STUB's (5000MB), so the arm is not measuring this host" $rc
+
+# ⛐ THE WORKTREE SHAPE ITSELF (review round 8, P2). The arm above is saved by its own fallback: its cwd
+# IS the checkout, so a check written `[ -d "$path/.git" ]` — which is FALSE for a linked worktree, whose
+# `.git` is a file — still classifies a checkout and the arm stays green. Here the gated path is the
+# worktree and the cwd is a DIFFERENT checkout with no marker, so only the `-e` test on `$dpath` gets the
+# python pair: fall through to `$PWD` and the harness pair is charged, which at 5000 MB free is ADMITTED.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=5000 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$TGT/repo-with-uv" DISK_MIN_FREE_MB=500 \
+  bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "worktree .git is a file" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$PROMPT" "$TGT/harness-checkout" 2>/dev/null)"
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "a worktree (whose .git is a FILE, not a dir) is recognised as the lane's target ($res)" $rc
+grep -q 'so 8144MB is required' "$LOG"; rc=$?
+ck "...so the python pair was charged from DISK_GATE_PATH, not the marker-less cwd" $rc
+
+# ⛐ AND WHEN NEITHER PATH IS A CHECKOUT, the branch that reports it is DRIVEN, not just described
+# (review round 8, P2): deleting its WARN line, or making it charge the python bound instead of the
+# harness pair, both left the suite green, and this branch's whole product IS the instrumentation. The
+# verdict here is the land-backlog gate (74, a cwd that is not a checkout cannot read PRs), so the arm
+# asserts the DISK gate's own two observables: the named line, and the ledger's three costs. They must
+# be the HARNESS triple — charging the python one here would refuse every harness lane on a cell below
+# ~8 GB, which is the over-block the doc records as rejected.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bindf:$TMP/bin:$PATH" FAKE_DF_AVAIL_MB=5000 PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$TGT/mount-root" DISK_MIN_FREE_MB=500 \
+  bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "unidentifiable target" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$PROMPT" "$TGT/mount-root" 2>/dev/null)"
+grep -q 'the lane target is not identifiable' "$LOG"; rc=$?
+ck "a target that is neither path logs 'the lane target is not identifiable' ($res)" $rc
+urow="$(tail -1 "$TMP/O/state/disk.tsv" 2>/dev/null)"
+uf="$(printf '%s' "$urow" | awk -F'\t' '{printf "%s %s %s", $6, $7, $8}')"
+[ "$uf" = "64 2000 64" ]; rc=$?
+ck "...and the ledger charges the HARNESS triple (got '$uf', want '64 2000 64' = tree, reserve, self)" $rc
 
 # THE OTHER DIRECTION — a tree that fits is admitted even inside the WARN band, i.e. the headroom gate
 # is a predicate and not a second, unconditional refusal.

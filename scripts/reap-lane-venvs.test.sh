@@ -1145,13 +1145,15 @@ fi
 
 # ── K8/K9: the per-record EXCLUDE LIST is what makes the CWD and TMUX arms terminate ─────────────
 # The idle-shell rule demotes a holder and adds its pid to the exclude list, so the next probe call
-# advances instead of re-reporting the pid it just demoted. K7 pins that for the ARGV table only, and
-# the missing pins were not hypothetical: deleting the skip from `cwd_witness_for` or
-# `tmux_witness_for` left this suite at 207/207 while the verdict flipped from REAP to KEEP+TRUNCATED
-# (the scan re-reads the same pid until the runaway cap, then fails closed) — i.e. the KEEP rule
-# silently stopped firing for the exact cell-4 shape (#2721: 59 checkouts held by idle shells), with
-# every arm green. Each fixture has ONE holder, in ONE table, so the arm is only green when the scan
-# advances past it and reaps.
+# advances instead of re-reporting the pid it just demoted. K7 pins that for the ARGV table, and the two
+# remaining sites were UNEVEN in coverage — measured on the 207-assertion tree: deleting the skip from
+# `cwd_witness_for` turned 203/207 red (K2's `k/idle` and K6's `1:08:30` arm already reached it), while
+# deleting the skip from `tmux_witness_for` left 207/207 GREEN. So K9 is the arm that closed a real gap
+# and K8 makes the cwd site explicit rather than incidental — stated that way round because the failure
+# mode of a lost skip is the same at both sites: the scan re-reads the pid it just demoted until the
+# runaway cap, then fails closed, i.e. the KEEP rule silently stops firing for the exact cell-4 shape
+# (#2721: 59 checkouts held by idle shells) with every arm green. Each fixture has ONE holder, in ONE
+# table, so the arm is only green when the scan advances past it and reaps.
 RK8="$(newrepo k8)"
 W_K8="$(mkwt "$RK8" cwdskip)"
 K8_TS=$(( $(date +%s) - 1000 ))
@@ -1195,6 +1197,41 @@ if grep -q 'TRUNCATED' "$T/reap.log" 2>/dev/null; then
 else
   ok "K9 and the scan advanced (no TRUNCATED line): the exclude list is consulted by the tmux probe"
 fi
+
+# ── K10: the CAP-EXHAUSTION branch keeps the env (a truncated scan is never "no holder") ───────
+# The cap is a runaway guard, and its exhaustion branch is otherwise unreachable (the default exceeds any
+# holder count, and each iteration consumes a distinct pid) — so its POLARITY was unpinned: reverting it to
+# "give up" kept this suite green while a truncated scan would read as "every holder was demoted" and the
+# lane's env deleted (review round 8, P2). `REAP_VENV_SCAN_CAP` (a test seam; production never sets it)
+# makes the branch reachable: three demotable idle shells and a cap of two.
+RK10="$(newrepo k10)"
+W_K10="$(mkwt "$RK10" caps)"
+K10_TS=$(( $(date +%s) - 1000 ))
+GIT_AUTHOR_DATE="@$K10_TS" GIT_COMMITTER_DATE="@$K10_TS" \
+  git -C "$W_K10" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "HEAD 1000s before this pass"
+K10_CANON="$(canon "$W_K10")"
+{
+  printf '1 0 /sbin/launchd\n'
+  i=0
+  while [ "$i" -lt 3 ]; do
+    i=$((i + 1))
+    printf '%s 1 /bin/bash\n' "$((64000 + i))"
+  done
+} > "$T/k10-ps.txt"
+# The cwd table carries the same three pids (lsof's `p<pid>` / `n<path>` records), so the cwd witness
+# alone can exhaust the cap and the demotions never drain it.
+{
+  i=0
+  while [ "$i" -lt 3 ]; do i=$((i + 1)); printf 'p%s\nn%s\n' "$((64000 + i))" "$K10_CANON"; done
+} > "$T/k10-lsof.txt"
+: > "$T/reap.log"
+out="$(run_shimmed FAKE_PS_TABLE="$T/k10-ps.txt" FAKE_LSOF_TABLE="$T/k10-lsof.txt" \
+        FAKE_ETIME='10:00:00' REAP_VENV_PROC_ROOT="$T/no-proc" REAP_VENV_SCAN_CAP=2 \
+        --worktree "$W_K10" --apply)"
+assert_contains "$out" "KEEP" "K10 a TRUNCATED scan keeps the env (it is never read as 'no live holder')"
+exists "$W_K10/.venv" "K10 ...the env is still there"
+assert_contains "$(cat "$T/reap.log" 2>/dev/null)" "TRUNCATED" \
+    "K10 ...and the pass says the scan was truncated, so the keeper is explainable"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
