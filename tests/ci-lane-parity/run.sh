@@ -86,8 +86,9 @@ trap 'rm -rf "$TMP"' EXIT
 # Until this line changed, the fixture was the runner's own list with a few slow shards grepped
 # out (`runner-fast.sh`), and the pins executed it THREE times (8h, 8d, 8e) — after #2414 had
 # already stopped 8n/8q pointing at a repo-wide guard whose verdict cost ~9.6 s per invocation.
-# On `origin/main` (`6ae9d509`) that made this suite take 23m37s while its ~180 static arms ran in
-# under 40 s; the three fixture executions were the other 23 minutes, all of it RE-RUNNING suites
+# On `origin/main` (`6ae9d509`) that made this suite take 23m37s while its ~180 pass/fail branch
+# sites (90 assertions) ran in under 40 s; the three fixture executions were the other 23 minutes,
+# all of it RE-RUNNING suites
 # that the lane's own `Bash shards` step already runs on the same commit (#2439 recorded the same
 # duplicate-work class for other folded jobs).
 #
@@ -98,6 +99,15 @@ trap 'rm -rf "$TMP"' EXIT
 # blamed the fixture). An inert stand-in cannot move for a reason this file does not name.
 #
 # Keep `CHEAP` pointed at something hermetic: its rc must depend on nothing but itself.
+#
+# ⛔ WHAT THE SUITE COSTS NOW (measured 2026-10-24, after #2529 landed). CI: the whole suite is
+# 6-12 s on `bash-suites-gate` step 5 (17 PR runs sampled from the Actions API; one 17 s outlier),
+# 6-9 s on ci-main's `script-validate` step 6 (8 successful main runs) — the ~90 static arms and ONE
+# fixture execution per runtime pin, not the shard list, are the wall. Locally (macOS, loaded box)
+# 27-67 s for 94 assertions. The 38m41s / "38.7 min" figure that still circulates is PR #2412's job
+# 120365087427 (2026-10-23T10:25Z), taken BEFORE #2529 replaced the real list in the fixture with
+# `stand-in-shard.sh`; it is not this suite's current cost and a bound sized from it protects
+# nothing. Re-measure before quoting a number here.
 CHEAP="tests/ci-lane-parity/stand-in-shard.sh"
 awk -v cheap="$CHEAP" '
   /^run_shard / && $2 !~ /^\"/ { print "run_shard " cheap; next }
