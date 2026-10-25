@@ -25,7 +25,8 @@ fleet's ONE classifier -- what the PR needs, and DISPATCHES that work:
                      run carries the check, its state and its age (`python-ci-gate queued
                      150m`), and the brief says WEDGED; a head whose checks never got created
                      carries `why is None` and the brief says NEVER RAN.
-    resolve-conflict GitHub says DIRTY -> dispatch: rebase on main, then record + rail
+    resolve-conflict GitHub answers a POSITIVE conflict (`mergeStateStatus=DIRTY`, or
+                     `mergeable=CONFLICTING`) -> dispatch: rebase on main, then record + rail
     record-review    the six gated checks green, no clean attestation at this head
                      -> dispatch: review, record, rail -- in ONE run
     fix-ci           a required check is RED -> dispatch: FIX it, then re-review, then rail
@@ -166,8 +167,27 @@ OWNERSHIP_NOTE = ""
 # and `SNAPSHOT`/`SNAPSHOT_MAX_AGE_S` its published roster. This file spawns load-gated workers
 # instead and reads no roster at all, so the constants went with the path that used them -- a
 # constant nobody reads is how a retired path still looks alive.
-REPO = "daniel-ospina/tortoise"
-REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
+# ⛔ THE TARGET IS TWO FACTS, AND ON A CELL NEITHER HAD A WAY IN (agent-infra#2716, #1974).
+# Both were literals: the slug, and `$HOME/Documents/GitHub/tortoise`. On the Mac that path is the
+# checkout, so nothing was ever missing. On a Linux cell `HOME` is `/tmp/cell-home`, so
+# `REPO_DIR` resolved to a directory that does not exist -- `WORKTREE_ROOT` (below), every
+# `git -C REPO_DIR` read and every worktree `add` then failed on a path invented by two shipped
+# defaults, while the cell's actual checkout sat at `/tmp/cell-t3` (the fleet partition's own
+# record: `docs/ops/fleet-harness-baseline.md`, and #2700's per-cell table). A repair loop that
+# points at a non-existent checkout does not crash loudly: it reads nothing and reports
+# `UNREADABLE`, which is exactly the ALIVE/REFUSING/IDLE confusion #2700 exists to remove.
+#
+# So the same seam `objective.py` already grew for the SLUG (`OBJECTIVE_REPO`) is grown here for
+# both facts, and a caller that sets neither gets the previous behaviour byte for byte (the
+# property `scripts/pr-repair-loop.test.sh`'s "pr-doctor's repo seams" block pins — NOT
+# `test_pr_doctor.py`, which only monkeypatches the attributes and never asserts these literals).
+# ⛔ `OBJECTIVE_REPO` IS NOT READ HERE: the classifier reads it, and a caller that wants one repo for
+# both must set both -- which is why `pr-repair-loop.sh` exports the pair together rather than
+# deriving one from the other. Deriving would make a box's dispatch and its classification silently
+# disagreeable again (#1872).
+REPO = os.environ.get("PR_DOCTOR_REPO") or "daniel-ospina/tortoise"
+REPO_DIR = (os.environ.get("PR_DOCTOR_REPO_DIR")
+            or os.path.join(HOME, "Documents", "GitHub", "tortoise"))
 
 
 # ⛔ THE DISPATCH REGISTER BELONGS TO ONE REPO, AND THE FILE NAME IS THE ONLY THING THAT SAYS SO
@@ -492,25 +512,215 @@ def capacity() -> dict:
             "max_review": _limit("MAX_REVIEW", DEFAULT_MAX_REVIEW)}
 
 
+# ── A SLOT IS OCCUPIED BY A PROCESS, NOT BY A RECORD (agent-infra#2700 C5) ─────────────────
+# ⛔ THE BOOKKEEPING IS NOT THE WORKER (measured 2026-10-24 19:26-19:31Z on the Mac).
+# `pass_budgets()` charged every row inside `STALE_DISPATCH_S` to its class ceiling and NEVER asked
+# whether the worker the row names still exists. The register held sixteen rows left by workers that
+# had finished, failed, or been killed by a machine sleep; sixteen is a full MAX_FIX, so the pass
+# printed `inflight=16, budget fix=0` and `dispatched 0 of 44 queued` on every pass for hours, with
+# **zero** of the box's 60 `bg/prd-*.pid` pids alive. That is the nasty shape: the numbers were
+# internally consistent (16 in flight against a ceiling of 16 is a coherent story), so the refusal it
+# produced was correct by its own rules and false about reality. The same register, re-read after the
+# fix below, dispatched 6 of the same 44 in the same minute.
+#
+# ⛔ SO UNKNOWN MUST READ **ALIVE**. Only a pid file that is READABLE and whose pid is PROVABLY GONE
+# may drop a slot. The two errors are not symmetric: a dead worker counted as in flight costs
+# throughput (visible, and it expires in 90 min); a live worker counted as dead costs a SECOND WORKER
+# ON THE SAME PR (invisible, and two agents sharing one index and one branch is how a conflict gets
+# resolved twice). An empty register, an unreadable pid file, a row with no `worker` at all -- all
+# read ALIVE.
+#
+# ⚠️ AND THE NAME IS NOT AN IDENTITY. This file's own `dispatch()` writes the SHORT worker name
+# (`prd-2035`, `name = "prd-%d" % n`) under a box-global `$O/bg`, but the repo-scoped form
+# (`prd-agent-infra-2035.pid`) is what the MULTI-REPO launcher writes (`worker_name()` in
+# `fix/pr-doctor-repo-resolution`, #2280) and what the Mac's deployed copy wrote in the measurement
+# above (`spawn prd-agent-infra-2027`). A doctor in that mode writes scoped pid files while a
+# register carried over from single-repo mode still holds short names -- and an exact-name lookup
+# then finds NOTHING, where "nothing found => assume alive" (the safe direction) faithfully keeps
+# every ghost. So the TRAILING NUMBER is matched as well. That over-matches deliberately: another
+# repo's LIVE worker with the same PR number keeps a slot (throughput), and it never frees one (a
+# duplicate dispatch).
+#
+# ⛔ AND THE SELF-REPORT NEEDS THREE STATES, NOT TWO (#2746 review). `alive` used to mean "not provably
+# gone", which counts a row with no `worker`, a row whose pid file was pruned, and a pid file we
+# cannot parse the same as a running process -- so a register of sixteen workerless rows printed
+# `(alive=16)` over NOTHING, which is the misread this field exists to remove, merely asserted by the
+# field itself. `_worker_state` therefore answers `alive` (positive evidence: a readable pid that is
+# running), `gone` (a readable pid that is not), or `unknown` (no usable evidence), and the pass line
+# names all three. Only `gone` frees a slot.
+#
+# ⛔ THE PID FILE MUST BE TERMINATED, for the same reason `_RC_RE` requires it of an exit code: a
+# reader landing mid-write sees the prefix of the number (`99999` of `999999`), and a pid that is
+# very likely gone would free a LIVE worker's slot -- the one direction this must never fail in. The
+# launcher writes `echo "$PID" > "$PIDF"`, which always terminates; an unterminated file is treated
+# as unreadable, i.e. `unknown`, i.e. the slot is held.
+_PID_RE = re.compile(r"[ \t]*([0-9]{1,10})[ \t]*\n\Z")
+
+
+def _pid_running(pid: int) -> bool:
+    """True if `pid` may still be a process. EPERM means it EXISTS and belongs to somebody else."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True          # cannot ask (EPERM, and anything else): believe the pid
+    return True
+
+
+def _read_pid(path: str):
+    """The pid in `path`, or None when the file cannot be read or does not hold a usable one.
+
+    ⛔ `errors="replace"` AND THE RANGE CHECK ARE NOT TIDINESS -- both close a path that ABORTS THE
+    PASS on a single garbage artifact (#2746 review, measured):
+      * text mode decodes strictly, so a non-UTF8 byte raises `UnicodeDecodeError`, which is a
+        `ValueError` and NOT an `OSError` -- it escaped every handler here, escaped `pass_budgets()`,
+        and reached `main()`'s `except BaseException` as `EXIT_CRASH` with zero dispatches, for
+        every pass, until a human deleted the file;
+      * `os.kill` raises `OverflowError` (also not OSError) outside the platform's pid range, so a
+        ten-digit pid file was the same bomb one line later.
+    Both are now ordinary "unreadable" readings: unknown, therefore alive.
+    """
+    try:
+        with open(path, errors="replace") as fh:
+            data = fh.read(64)
+    except OSError:
+        return None
+    m = _PID_RE.match(data)
+    if not m:
+        return None
+    pid = int(m.group(1))
+    return pid if 0 < pid < 2 ** 31 else None
+
+
+def _worker_pid_files(worker: str) -> list:
+    """The EXISTING pid files under `$O/bg` that could belong to `worker`.
+
+    Two shapes, because the row and the launcher disagree about the name (see the block above): the
+    exact one (`prd-2035.pid`) and any repo-scoped one whose TRAILING NUMBER is the same
+    (`bg/*-2035.pid`, i.e. `prd-agent-infra-2035.pid`). Leading zeros are tolerated; a PREFIX is not,
+    because `-20350.pid` is PR 20350 and must never answer for PR 2035.
+
+    `isfile` rather than `exists`: a directory at the pid path is handled by the read, but a FIFO is
+    not -- `open()` on one BLOCKS with no writer, which would hang the pass on an artifact instead
+    of answering about it.
+
+    Nothing here decides anything: an empty list is "no evidence", not "gone".
+    """
+    exact = bg_path(worker, "pid")
+    paths = [exact] if os.path.isfile(exact) else []
+    # ⛔ BOUNDED, LIKE EVERY OTHER DIGIT PARSE IN THIS FILE: `int()` raises ValueError past
+    # 4300 characters (a ValueError, not an OSError -- it would abort the pass from inside the
+    # counter, the same class as the `UnicodeDecodeError` fixed in `_read_pid`). `dispatch()` writes
+    # `prd-<n>`, but the register is read back from JSON, so the row is not necessarily ours.
+    m = re.search(r"([0-9]{1,10})\Z", worker)
+    if not m:
+        return paths
+    n = int(m.group(1))
+    try:
+        names = os.listdir(os.path.join(ORCH_DIR, "bg"))
+    except OSError:
+        return paths          # an unreadable directory adds no evidence; the exact file still stands
+    for f in names:
+        mm = re.match(r".*-0*([0-9]+)\.pid\Z", f)
+        if not mm or int(mm.group(1)) != n:
+            continue
+        p = os.path.join(ORCH_DIR, "bg", f)
+        if p not in paths and os.path.isfile(p):
+            paths.append(p)
+    return paths
+
+
+def _worker_state(worker) -> str:
+    """`alive` | `unknown` | `gone` for the worker a state row names -- ONE reader, three states.
+
+    `gone` is returned ONLY when at least one pid file exists AND every pid file that belongs to the
+    worker is readable AND every pid in it is gone: the slot is released on the process table's word,
+    never on the absence of a record. Everything else -- no name, no pid file, a pid file we cannot
+    read or parse -- is `unknown`, and the caller holds the slot, deliberately: a dead worker counted
+    in flight costs throughput (visible, and it expires in 90 min); a live worker counted dead costs
+    a SECOND WORKER ON THE SAME PR (invisible, and two agents sharing one index and one branch is how
+    a conflict gets resolved twice). `unknown` is reported separately so the pass line can say how
+    much of `inflight` is merely unproven.
+
+    The reading comes from `$O/bg` (`bg_path`/`ORCH_DIR`, resolved at CALL time so a test can point
+    it at a temp directory), never from `worker_status()`: that shells out to
+    `nonblocking-dispatch.sh --status` once per row, and this is a counter over up to MAX_FIX +
+    MAX_REVIEW rows inside a pass that is already spending its gh budget.
+
+    ⚠️ A RECYCLED PID READS `alive`, and that is intended: it costs one budget slot until
+    `STALE_DISPATCH_S` expires, which is the cheap error. `worker_live()` bounds the same artifact by
+    the `.started` stamp because a live spawn would COLLIDE with a recycled pid; a budget slot does
+    not collide with anything.
+
+    Total: it never raises.
+    """
+    name = str(worker or "").strip()
+    if not name:
+        return "unknown"      # a row with no worker named: no evidence at all
+    paths = _worker_pid_files(name)
+    if not paths:
+        return "unknown"      # no pid file is NOT proof of absence
+    readable = False
+    unreadable = False
+    for path in paths:
+        pid = _read_pid(path)
+        if pid is None:
+            unreadable = True     # this one proves nothing -- and must not be skipped SILENTLY
+            continue
+        readable = True
+        if _pid_running(pid):
+            return "alive"        # one live candidate is enough; over-matching is the safe direction
+    # `gone` requires EVERY candidate to be readable AND dead. An unreadable sibling is not a free
+    # slot: it could name the live worker we would then dispatch a second one alongside.
+    return "gone" if readable and not unreadable else "unknown"
+
+
 def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> dict:
     """Available dispatches this pass, per work class and in total.
 
     The machine's own MAX_FIX / MAX_REVIEW (see `capacity()`) set the per-class ceilings. A
-    state row still inside STALE_DISPATCH_S consumes one slot of its class. `total_override`
-    (the CLI `--max`) is an optional extra hard ceiling on the whole pass. Pure, so the cap
-    can be asserted without a fleet.
+    state row still inside STALE_DISPATCH_S **whose worker still exists** consumes one slot of its
+    class. `total_override` (the CLI `--max`) is an optional extra hard ceiling on the whole pass.
+
+    ⛔ THE ROW IS NOT THE WORKER (see the block above `_worker_state`): a row whose pid file proves
+    the worker gone is SKIPPED, so a register full of finished workers stops refusing the machine's
+    capacity. `used`/`fix`/`review` count the slots actually consumed; `inflight` is the bookkeeping
+    count (every fresh row, ghosts included), `alive` is how many of those the process table backs,
+    and `unknown` is how many are held for lack of proof -- so a pass can say
+    `inflight=16 (alive=0 unknown=0)` (sixteen records, sixteen provably dead) or
+    `inflight=16 (alive=0 unknown=16)` (sixteen records and no evidence either way) instead of
+    reading as a full machine. That field is the self-report: a counter that cannot distinguish
+    ghosts from processes drifts in the safe direction and then refuses honestly and wrongly, and
+    nothing in its own output says so.
+
+    Pure with respect to its ARGUMENTS (`now_epoch` still pins the clock, and a test can assert the
+    cap without a fleet); NOT pure with respect to the filesystem, deliberately -- `$O/bg/*.pid` is
+    the fact this function has to consult, and a pure counter is what produced the ghosts.
     """
     if now_epoch is None:
         now_epoch = now()
     used = {"fix": 0, "review": 0}
+    inflight = alive = unknown = 0
     for k, v in st.items():
         if k.startswith("_") or v.get("action") == "closed":
             continue
         if now_epoch - v.get("at_epoch", 0) >= STALE_DISPATCH_S:
             continue
+        inflight += 1
+        state = _worker_state(v.get("worker"))
+        if state == "gone":
+            continue          # the worker is PROVABLY gone: the slot is free again
+        if state == "alive":
+            alive += 1
+        else:
+            unknown += 1      # held, because nothing proves it dead -- reported, never hidden
         used[ACTION_CLASS.get(v.get("action", ""), "fix")] += 1
     out = {c: max(0, cap["max_" + c] - used[c]) for c in ("fix", "review")}
     out["used"] = used["fix"] + used["review"]
+    out["inflight"] = inflight
+    out["alive"] = alive
+    out["unknown"] = unknown
     out["total"] = out["fix"] + out["review"]
     if total_override is not None:
         out["total"] = min(out["total"], max(0, total_override))
@@ -806,10 +1016,20 @@ def _open_prs_rest():
     discriminator -- see `_rest_is_cross_repository()`): it is derived from the element's
     `head.repo`/`base.repo` objects, not faked, and an unreadable identity defaults to fork.
 
+    `mergeable` IS MAPPED TOO (#1936), and its absence from the LIST payload is handled as the
+    VALUE `UNKNOWN` rather than as a missing key: an absent key would fail the parity guard that
+    compares this mapper's shape against the `--json` argument, and a `False`-as-CONFLICTING guess
+    would report a conflict that was never measured.
+
     ⚠️ ONE FIELD IS GENUINELY NOT SERVED BY THIS ENDPOINT, AND IT IS DOCUMENTED RATHER THAN
     FAKED: the LIST payload's `mergeable_state` is null (GitHub computes mergeability per PR,
     lazily -- measured: 18/18 and 19/19 open PRs), so `mergeStateStatus` is "" on a REST pass and
-    `resolve-conflict` (arm 3) can never match. Where such a PR lands is the ARM ORDER's answer,
+    `resolve-conflict` (the conflict arm) cannot match on the fields THIS payload returns today -- `mergeable`
+    is ABSENT on that payload too (0/3 rows carried either key, `objective._rest_pr()`'s
+    measurement), which maps to `UNKNOWN`, and `UNKNOWN` is not an answer. The mapper's
+    `CONFLICTING` branch is therefore reachable only from a payload that DOES carry the field
+    (`/pulls/<n>`, not the LIST), which is why it is mapped rather than omitted. Where such a PR
+    lands is the ARM ORDER's answer,
     not this file's: `record-review`/`fix-ci` (that lane calls the rail, which refuses a DIRTY
     head), or -- when a required check is merely in flight, the dominant live shape -- `running`,
     i.e. SKIPPED WITH NOTHING DISPATCHED until the primary read recovers (agent-infra #2136
@@ -834,7 +1054,8 @@ def _open_prs_rest():
                 "isDraft": bool(p.get("draft")),
                 # ⛔ `.upper()` IS DEFENSIVE VOCABULARY NORMALISATION, AND THAT IS ALL IT IS. REST
                 # spells this `dirty`/`clean`; `gh --json` and `objective.classify_pr()` spell it
-                # `DIRTY`/`CLEAN` (two `== "DIRTY"` comparisons), so a passthrough is a silent
+                # `DIRTY`/`CLEAN` (the `== "DIRTY"` comparison in that module's conflict arm), so a
+                # passthrough is a silent
                 # logic error whenever the field is populated -- the fleet's own REST adapter
                 # (`orchestrator-harness/gh-rest/gh`) maps it the same way, for the same reason.
                 # ⚠️ BUT IT DOES NOT MAKE `resolve-conflict` REACHABLE TODAY: this endpoint returns
@@ -843,6 +1064,19 @@ def _open_prs_rest():
                 # is recorded in this function's docstring above -- do not let this line read as
                 # "the conflict arm is fixed".
                 "mergeStateStatus": (p.get("mergeable_state") or "").upper(),
+                # ⛔ `mergeable` IS MAPPED FROM THE ELEMENT, NOT INVENTED (#1936). REST spells it a
+                # boolean; `gh --json` spells it MERGEABLE/CONFLICTING/UNKNOWN, and
+                # `objective.classify_pr()` compares against the STRING `"CONFLICTING"` -- so a
+                # passthrough here would be a silent logic error, exactly like the line above.
+                # The three words are `objective._rest_pr()`'s spelling on purpose: ONE
+                # definition of the vocabulary shared by both readers, not a second one.
+                # ⚠️ `null` on this endpoint is COMMON (the same lazy computation that leaves
+                # `mergeable_state` empty), so the live value is usually UNKNOWN -- which is NOT a
+                # pass and does not make the conflict arm reachable over REST. It keeps the
+                # mapper's SHAPE at parity with the primary read, which is what the parity guard
+                # asserts; the residual is the same one recorded on the line above.
+                "mergeable": ("MERGEABLE" if p.get("mergeable") is True else
+                              "CONFLICTING" if p.get("mergeable") is False else "UNKNOWN"),
                 "headRefOid": head.get("sha") or "",
                 "headRefName": head.get("ref") or "",
                 # ⛔ MAPPED, NOT OMITTED -- and it is not recoverable at the call sites, because
@@ -981,7 +1215,11 @@ def open_prs() -> list[dict]:
     REST_RECOVERED = False         # per pass: a stale True would mislabel a healthy pass
     _GH_TOKEN_CACHE = None         # per pass: one credential resolution, not one per request
     out, err, rc = sh_err([GH, "pr", "list", "--repo", REPO, "--state", "open", "--limit", "60",
-                           "--json", "number,title,isDraft,mergeStateStatus,headRefOid,headRefName,isCrossRepository,files"])
+                           # BOTH fields are load-bearing: `mergeable` is this PR's (#1936 -- a
+                           # positive CONFLICTING answer is the trigger even when the state word is
+                           # not DIRTY), `isCrossRepository` is main's. Neither may be dropped.
+                           "--json", "number,title,isDraft,mergeStateStatus,mergeable,headRefOid,"
+                           "headRefName,isCrossRepository,files"])
     parsed = True
     why = ""
     try:
@@ -1099,6 +1337,183 @@ class _Refusal(str):
         return self
 
 
+def _owns_worktree_root(path: str) -> bool:
+    """True only when `path` is a FLEET worktree root this job may create worktrees under.
+
+    ⛔ THE IDENTITY RULE, APPLIED AT THE SPAWN BOUNDARY (owner, 2026-10-20): *pr-doctor must never
+    send work into a workspace it did not create.* Its own lanes are `<repo>/.worktrees/prd-<n>`,
+    and this is the place that decides the directory, so it is the place to refuse a root that is
+    not a worktree root BY SHAPE.
+
+    ⛔ IT IS DEFENCE IN DEPTH, NOT A LIVE BOUNDARY (review round 3, P3, MEASURED). `WORKTREE_ROOT`
+    is `os.path.join(REPO_DIR, ".worktrees")` with both operands fixed constants, so on the shipped
+    configuration this test is TRUE by construction and the refusal below cannot fire; it fires
+    only if a future change makes the root configurable, or under a test that patches it. Saying so
+    is the point -- a guard described as protecting something it structurally cannot reach is how a
+    real gap gets left open, and an earlier draft of this docstring claimed the root guard would
+    stop the repo being placed "in the owner's own project", which the shape test alone does not
+    prove: an owner's own `.../Personal website/.worktrees` PASSES it.
+
+    ⛔ AND A LATER DRAFT OVER-CLAIMED THE OTHER WAY, so it is stated here plainly (review round 5,
+    P2, MEASURED): the ADOPT arm's `_is_spawn_target()` does NOT refuse an owner's own REAL git
+    worktree either. `~/Personal website/.worktrees/preview` is `.worktrees` PLUS a linked worktree,
+    which is exactly the shape the adopt arm accepts; `materialise_worktree()` then returns it, so
+    `dispatch()` / `_ensure_head()` can spawn there and `reset --hard` it. That is the same accepted
+    boundary the classifier carries, for the same reason -- this job cannot tell WHICH repos the
+    fleet owns without a provenance record -- and it is filed as agent-infra#2213, with
+    `docs/ops/fleet-liveness.md` §2a stating it. Both sides are pinned by tests
+    (`test_an_owners_own_real_worktree_is_the_documented_boundary` in the classifier's suite,
+    `test_the_adopt_arm_shares_the_documented_owner_worktree_boundary` here), so closing #2213 has
+    two tests to flip rather than a docstring to argue with.
+
+    Deliberately its OWN small predicate rather than an import of the classifier: this asks
+    "is this MY worktree root", which is a stricter question than "is this a lane of the fleet".
+    The ADOPT arm (a worktree the branch is already checked out in) is a different directory and is
+    governed by `_is_spawn_target()` below, not by this function.
+    """
+    rp = _rp(path)
+    parts = [x for x in rp.split(os.sep) if x] if rp else []
+    if not parts:
+        return False
+    # ⛔ THE SHAPE IS READ FROM THE SPELLED PATH, NOT THE RESOLVED ONE (review round 7, P2,
+    # MEASURED). Resolving first made an ordinary disk-management move -- `<repo>/.worktrees` as a
+    # SYMLINK to another volume -- resolve away its own last segment, so the root stopped being
+    # owned, `materialise_worktree()` refused EVERY PR at its first statement, and `_is_spawn_target()`
+    # (which gates on this) disabled the ADOPT arm too: the branch-already-checked-out deadlock
+    # adoption exists to fix came back, on a box that had done nothing wrong. What this function asks
+    # is "is the CONFIGURED root spelled like a worktree root", and a symlink to one is still one.
+    spelled = [x for x in os.path.normpath(path).split(os.sep) if x] if path else []
+    name = spelled[-1] if spelled else (parts[-1] if parts else "")
+    # ⛔ `wt-<slug>`, NOT `wt-<digits>` (review round 6, P3). The fleet's own lane shape is
+    # `wt-<slug>` -- the classifier accepts it (`len(first) > len("wt-")`) and so does this file's
+    # own `_is_spawn_target` home arm. A digit-only test here made a SLUG-shaped `WORKTREE_ROOT`
+    # (e.g. `$HOME/wt-tortoise`) fail the precondition of `_is_spawn_target`, silently disabling the
+    # ADOPT arm for every path rather than refusing one root.
+    return name == ".worktrees" or (name.startswith("wt-") and len(name[3:]) > 0)
+
+
+def _rp(path: str) -> str:
+    """`realpath`, or "" when the path cannot be resolved. Never raises.
+
+    `realpath` raises ValueError (not just OSError) for an embedded NUL; an unresolvable path is
+    unreadable EVIDENCE, and manufacturing a spelling of it would let a poisoned value decide its
+    own answer (the same fail-closed rule the lane classifier's `_real` uses)."""
+    if not isinstance(path, str) or not path:
+        return ""
+    # ⛔ REJECT AN EMBEDDED NUL EXPLICITLY, DO NOT CATCH IT (review round 11, P2, MEASURED). On
+    # Python **3.9** `realpath` does not raise for a NUL — `islink()` swallows it — so the path came
+    # back unchanged and `_is_spawn_target`'s `p.startswith(root + os.sep)` arm accepted it `by
+    # construction`, making a poisoned path a spawn target. `/usr/bin/python3` here is 3.9.6 and it is
+    # the interpreter the orchestrator scripts invoke; CI pins 3.12, where the `except` fires, so the
+    # suite was green while the deployed runtime failed open. Must stay in step with the lane
+    # classifier's `_real` (pinned by `test_identity_evidence_never_raises_on_a_poisoned_path` and
+    # `test_is_spawn_target_accepts_only_fleet_shaped_worktrees`).
+    if "\x00" in path:
+        return ""
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return ""
+
+
+def _is_linked_worktree(path: str) -> bool:
+    """True when `path` sits inside a REAL linked git worktree.
+
+    ⛔ A `.git` FILE IS NOT ENOUGH (review round 8, P3): `git submodule` and `git init
+    --separate-git-dir` write one too. `git worktree add` writes a pointer to
+    `<main>/.git/worktrees/<name>`, so that is what is required. Must stay in step with
+    `_is_fleet_worktree` in the lane classifier module (pinned by
+    `test_the_two_fleet_worktree_predicates_agree`).
+    """
+    cur = _rp(path)
+    for _ in range(64):
+        if not cur:
+            return False
+        g = os.path.join(cur, ".git")
+        if os.path.isdir(g):
+            return False           # a main checkout, not a worktree
+        if os.path.isfile(g):
+            try:
+                with open(g, errors="ignore") as fh:
+                    head = fh.read(512)
+            except OSError:
+                return False
+            up = head.strip().splitlines()[0] if head.strip() else ""
+            if not up.startswith("gitdir:"):
+                return False
+            target = up.split(":", 1)[1].strip().replace(os.sep, "/")
+            return "/worktrees/" in (target + "/")
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+    return False
+
+
+def _fleet_roots() -> tuple:
+    """The roots the fleet creates lanes in, named exactly as the lane classifier names them
+    (`$FLEET_HOME` / `$CELL_HOME` / `$FLEET_CELL_HOME`, `$HOME`, the cell home, the temp root) -- so
+    the two predicates cannot disagree about where a lane may live.
+
+    ⛔ THE TEMP ROOT IS MEASURED, NOT A CONVENIENCE (review round 3, P1): the fleet's own recipe on
+    the box is `git worktree add /tmp/wt-<slug>` (15 real linked worktrees in
+    `state/pi-reap-worktrees.log`), so omitting it here refused the ADOPT arm for every real fleet
+    lane -- a PERMANENT block, since an adopted worktree is the only way through for a base-repo PR
+    whose branch is already checked out."""
+    return tuple(dict.fromkeys(
+        h for h in (
+            os.environ.get("FLEET_HOME"), os.environ.get("CELL_HOME"),
+            os.environ.get("FLEET_CELL_HOME"), os.path.expanduser("~"),
+            "/tmp/cell-home", tempfile.gettempdir(), "/tmp", "/private/tmp") if h))
+
+
+def _is_spawn_target(path: str) -> bool:
+    """True when a worker may be spawned into `path`: ours, or demonstrably a fleet worktree.
+
+    The same evidence rule the lane classifier applies (`_is_fleet_worktree` in the `lane_actions`
+    module), read at the ONE other place this job chooses a directory: the ADOPT arm of
+    `materialise_worktree`. Two
+    shapes, because the fleet creates lanes in two ways:
+      * under this job's own root (`<repo>/.worktrees/prd-<n>`), by construction;
+      * a lane's own worktree -- a REAL linked worktree under a `.worktrees` path, or `wt-<slug>`
+        directly inside a fleet home.
+    Anything else (a plain directory that spells `.worktrees`, a scratch checkout, an owner project
+    directory, the shared checkout) is refused.
+
+    ⛔ IT IS DELIBERATELY ITS OWN COPY, AND SAYS SO (review round 2, P3). A previous version of this
+    docstring claimed it WAS the classifier's rule while using a narrower home set, so the two
+    answered "is this a fleet worktree?" differently -- two answers to one question. They now read
+    the same homes and the same linked-worktree evidence, and
+    `test_the_two_fleet_worktree_predicates_agree` pins the agreement. The copy stays because
+    importing that module here would re-introduce the lane-table coupling `#1874` removed (it is the
+    retired roster reader, and a source test pins its ABSENCE by name -- which is why this docstring
+    does not spell its filename).
+    """
+    if not WORKTREE_ROOT or not _owns_worktree_root(WORKTREE_ROOT):
+        return False                     # a misconfigured root grants nothing
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return False                     # a relative path is resolved against OUR cwd: no evidence
+    p = _rp(path)
+    if not p:
+        return False
+    root = _rp(WORKTREE_ROOT)
+    if root and p.startswith(root + os.sep):
+        return True                      # by construction
+    if ".worktrees" in [x for x in p.split(os.sep) if x] and _is_linked_worktree(p):
+        return True
+    for home in _fleet_roots():
+        h = _rp(home)
+        if not h or not p.startswith(h + os.sep):
+            continue
+        first = p[len(h) + 1:].split(os.sep)[0]
+        if first.startswith("wt-") and len(first) > 3:
+            # ⛔ THE NAME IS NOT THE EVIDENCE (review round 4, P2): the path must be a REAL linked
+            # worktree, else any `/tmp/wt-anything` directory is a spawn target on a world-writable
+            # `/tmp`. Same rule as the classifier's `_is_fleet_wt_dir`, which this must match.
+            return _is_linked_worktree(p)
+    return False
+
+
 def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
     """Ensure a git worktree for the PR's branch at the PR's head; return (path, "") or ("", why).
 
@@ -1125,6 +1540,15 @@ def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
     """
     branch = pr["headRefName"]
     head = pr["headRefOid"]
+    # ⛔ THE ROOT IS CHECKED BEFORE ANY GIT CALL, so a misconfigured `WORKTREE_ROOT` refuses instead
+    # of creating (and then dispatching a worker into) `prd-<n>` inside a checkout or inside the
+    # owner's own project. NOT `persistent`: a bad root is ONE shared cause like a missing
+    # dispatcher, and recording it would cool down every open PR for a single broken install.
+    if not _owns_worktree_root(WORKTREE_ROOT):
+        return "", _Refusal(
+            "WORKTREE_ROOT %r is not a fleet worktree root (expected `.../.worktrees` or `.../wt-<n>`) "
+            "-- refusing to create or dispatch into a directory this job does not own"
+            % (WORKTREE_ROOT,))
     # A fork PR's headRefName can COLLIDE with a base-repo branch (e.g. a fork of `main`), so branch
     # existence is NOT the fork discriminator -- GitHub's `isCrossRepository` is. A fork's head is
     # published in the base repo at refs/pull/<n>/head; a base PR is its own branch.
@@ -1170,6 +1594,19 @@ def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
                             "failed) -- refusing to adopt or reset it; inspect it" % (p, branch))
             if not live:
                 continue      # exists but is not a worktree: not ours to adopt; `add` will report
+            # ⛔ ADOPTION IS STILL A DISPATCH, SO THE OWNERSHIP RULE APPLIES TO IT (review round 1,
+            # P2). This arm returns a worktree that is NOT under WORKTREE_ROOT, and `dispatch()` then
+            # spawns a worker into it (and `_ensure_head` may `reset --hard` there). Adoption is
+            # wanted -- a lane's branch must not be locked out -- but only into a FLEET worktree:
+            # either one of ours, or a path with the fleet's own worktree shape. An
+            # owner-created `~/scratch/tortoise-wip` is refused, because "pr-doctor must never send
+            # work into a workspace it did not create" does not stop applying one branch over.
+            if not _is_spawn_target(p):
+                return "", _Refusal(
+                    "%s is already on %s, but it is neither under %s nor a fleet-shaped worktree "
+                    "(`.../.worktrees/<name>`, `$HOME/wt-<slug>`) -- refusing to adopt and "
+                    "dispatch a worker into a directory this job did not create"
+                    % (p, branch, WORKTREE_ROOT))
             log("materialise: adopting %s, already on %s (the lane's own worktree)" % (p, branch))
             err = _ensure_head(p, branch, head, fetch_ref, dry=dry)
             return (p, "") if not err else ("", err)
@@ -2035,7 +2472,10 @@ pending: {absent}
         return """# #{n} — CONFLICTED WITH MAIN. Rebase, then merge it.
 
 **#{n}** {title}
-Head `{head}`. GitHub reports this PR **DIRTY** (a real conflict, not a failing gate).
+Head `{head}`. GitHub reports a POSITIVE conflict — `mergeable: CONFLICTING`, or
+`mergeStateStatus: DIRTY` — a real conflict: the rail refuses a conflicted head whatever the
+checks say, so neither waiting nor repairing a gate can land it. (A rail gate that is ALSO red is
+re-run by the rebase, and this brief is re-derived from the post-rebase head.)
 **A rebase CHANGES THE HEAD, so any attestation recorded before it is worth nothing -- record
 again at the new head.**
 
@@ -2935,10 +3375,16 @@ def main() -> int:
         counts[a] = counts.get(a, 0) + 1
     for a, c in skipped.items():
         counts["skipped-" + a] = c
-    log("pass: %d open PRs :: %s (capacity fix=%d review=%d, inflight=%d, budget fix=%d review=%d total=%d)" %
+    # ⛔ `inflight` IS THE BOOKKEEPING, `alive`/`unknown` ARE THE EVIDENCE (agent-infra#2700 C5).
+    # Printing only the first is what made a register full of finished workers read as a saturated
+    # machine: `inflight=16 (alive=0 unknown=0)` names the gap on the operator's own line, and
+    # `unknown` keeps "I could not prove it either way" from being silently counted as a process.
+    # `used` is the slots actually consumed (= alive + unknown).
+    log("pass: %d open PRs :: %s (capacity fix=%d review=%d, inflight=%d (alive=%d unknown=%d), "
+        "budget fix=%d review=%d total=%d)" %
         (len(prs), " ".join("%s=%d" % kv for kv in sorted(counts.items())),
-         cap["max_fix"], cap["max_review"], budgets["used"],
-         budgets["fix"], budgets["review"], budgets["total"]))
+         cap["max_fix"], cap["max_review"], budgets["inflight"], budgets["alive"],
+         budgets["unknown"], budgets["fix"], budgets["review"], budgets["total"]))
 
     # ⛔ NO LANE-TABLE GATE. The old path read `lane-actions.py` and dispatched only to an idle
     # lane; with the fleet busy it printed "no idle lanes -- nothing dispatched this pass" and
@@ -3019,7 +3465,14 @@ def main() -> int:
             parts.append("ok")
         else:
             if budgets["total"] == 0:
-                parts.append("no capacity budget (all of MAX_FIX+MAX_REVIEW is in flight)")
+                # ⛔ AND IT NAMES THE SPLIT, because `total == 0` no longer means "saturated" (#2746
+                # review round 2). A ceiling can now be held entirely by rows whose worker is
+                # UNPROVEN, so "all of MAX_FIX+MAX_REVIEW is in flight" would be the same
+                # internally-consistent-and-false story this change removes, one line below the pass
+                # line that contradicts it: measured `inflight=2 (alive=0 unknown=2)` printing
+                # "all … is in flight" over ZERO processes.
+                parts.append("no capacity budget (inflight=%d: alive=%d unproven=%d)"
+                             % (budgets["inflight"], budgets["alive"], budgets["unknown"]))
             for k, v in sorted(stalls.items()):
                 if v:
                     parts.append("%s=%d" % (k, v))

@@ -1,0 +1,336 @@
+<!-- research-path: none (issue #2183 scoping comment) -->
+
+# Dispatch funnel accounting + checked.txt terminal facts — Implementation Plan
+
+> **For Pi:** Use `executing-plans` to implement this plan task-by-task.
+
+**Goal:** Make the dispatch refresh's funnel explain its own largest bucket with a *measured* cause, name the unanswerable pre-flight surface in aggregate, and let `checked.txt` suppress a candidate only while a re-checkable keep-fact holds — so a CLEAN-but-undispatched candidate is re-judged instead of suppressed forever.
+
+> **Scope honesty (read before quoting any acceptance line):** on a cell whose pre-flight cannot answer (today: the fleet-board lane registry is missing, #1935/#2119), **this patch cannot fill the queue** — the CLEAN arm is never reached. It makes that reason measurable and stops `checked.txt` from hiding work. Filling the queue needs #1935/#2119, or an owner-approved policy change. The expected post-fix live line is `0 queued, … 12 unjudged (pre-flight), …, 230 not reached (run budget: 12 pre-flight run(s) spent, 12 unjudged) … failing surface: issue-assignee-holder:12` — not `queued > 0`.
+
+**Team:** organisation-design-team
+
+**Architecture:** Extend the existing single `state/refresh-funnel` record (no second source of truth): the walk records *why it stopped*; each checked skip records *which keep-fact justifies it*; each unusable pre-flight run contributes a *named surface*. The reaper classifies every `checked.txt` entry against positive local evidence (still queued in `candidates.txt`, dispatched, a PR head ref, a live `lane-N`) and hands the residue to the **authoritative claim reader already shipped** (`issue_claim_verdict`, whose lease polarity — absent / `0` / non-numeric / orphaned — it reuses rather than re-deriving). It releases only what has no keep-fact, rewrites `checked.txt` atomically, and writes the classification for the walk to count by reason. The reader (`orch-loop.sh`'s `dispatch_funnel`) renders the recorded cause instead of asserting `(limit)`.
+
+**Ordering fact the design relies on:** the reaper (`refresh-candidates.sh:1100`) runs **before** the #1984 unchanged-listing skip (`:1414–1421`), so every pass that can release does so, and a released entry changes `checked.txt` — which is inside the digest, so a release necessarily defeats the skip. No digest-gate change is needed or made.
+
+### Pattern Research
+
+**No third-party dependency is added** — bash + python3 stdlib, and `git`/`tmux`/`awk` are pre-existing harness prerequisites. One **vendored producer contract** is parsed and is *not* a dependency of ours: `tortoise/tools/collision_preflight.py` (resolved per repo by `resolve_preflight()`), which prints an `INCOMPLETE SURFACES` block as `  [<surface name>] <note>` after the table and before `ADVISORY SURFACES`. Verified against the producer's emitted output on this box (`INCOMPLETE SURFACES` + `  [issue assignee/holder] claim gate: …`, followed by an unindented `ADVISORY SURFACES` line). **Parse failure must not become a claim:** any unusable run whose block yields no surface is counted as `unknown:<n>` (and a verdict line the reader cannot parse as `unrecognised-verdict`), never omitted. Phase 1.5 external findings (Prometheus per-stage counters; `client-go` workqueue: requeue on failure, `Forget` on success; AWS Builders' Library) are recorded in the issue's scoping comment.
+
+### Integration Surface Map
+
+| Surface | Type | Consumer | Test layer |
+|---|---|---|---|
+| `state/refresh-funnel` (write) | state record, `key=value` | `orch-loop.sh:dispatch_funnel` | writer arithmetic: `test-gates.sh` (extracted block: `test-gates.sh:1869`) |
+| `state/refresh-funnel` (read) | rendering | operator / dispatch line | reader cases: `test-gates.sh:1776–1844` (the writer block is `1847–1884`) |
+| `checked.txt` | state, 1 number/line | refresh walk, reaper | unit: `selftest.sh:344–372`; end-to-end: `refresh-scout.test.sh` |
+| `state/checked-kept` (new) | `N<TAB>reason` per kept entry, per pass | walk (skip reason) | `refresh-scout.test.sh` (Control B asserts the file) |
+| `state/checked-release-candidates` (new) | numbers with no local keep-fact | bash claim filter | `refresh-scout.test.sh` |
+| `state/checked-release` (new) | numbers released this pass | bash checked.txt rewrite, funnel | `refresh-scout.test.sh` |
+| `state/checked-release-cursor` (new) | the **last candidate asked, in ask order**, reset to `0` when a pass swept the whole ring without hitting the cap — so the release cap rotates over a numerically sorted list (restated after the cycle-1 P1: the numeric maximum is monotone and freezes the ring on the largest candidate, after which the smallest `MAX` entries are re-asked for ever and a lease that lapsed mid-list is never re-checked) | bash claim filter | `refresh-scout.test.sh` Controls H, I, I-bis |
+| `state/checked-reap` (new) | **two shapes**: a classification writes `released=<n> deferred=<n> unjustified=<n\|-> sort_failed=<0\|1> at=<epoch>`; a refusal writes `released=0 deferred=0 unjustified=- refused=<slug> at=<epoch>` (restated in cycle 5 — the fields are never co-present, so a parser built from one shape alone misses the other) | funnel writer — `released`, `unjustified`, and (per the cycle-2 E-P2 finding) `deferred`, plus `refused`/`sort_failed` (cycle 3): a refusal and a release that could not run are statements on the operator line, not absent tails. `deferred` is the CAP residue (`unknown` is the never-askable residue, kept separate so the reader's "raise the cap" advice is never given about a row no pass could ask). **`at=` is informational only — nothing verifies it**; the "this pass's record" guarantee comes from truncating the file at pass start (Task 2 Step 2), which is a property of the mechanism rather than a comparison that could silently never fire | `refresh-scout.test.sh` |
+| `.open_iss` / `.pr_brs` | listings, deleted after the reaper | reaper | existing fail-closed guard (`refresh-candidates.sh:1112`) stays |
+| `state/claims-snapshot` | cross-box claims | **not read by this patch** — the bash filter asks `issue_claim_verdict` instead (one authority, orphan/clock arms included) | `refresh-scout.test.sh` claim controls |
+| `candidates.txt` | queue | dispatcher (unchanged) | **end-to-end assertion: the candidate must ENTER it** |
+| `dispatched.txt` | suppression | reaper (unchanged semantics) | `selftest.sh` existing cases must stay green |
+| `scripts/orchestrator-harness/ARCHITECTURE.md:176` | docs: funnel key set | operators | Task 5 |
+| `selftest.sh:341–370` (extracted reaper) | test harness | reaper unit cases | fixtures gain `state/` (the heredoc creates it, so they need not) |
+
+**Failure-mode flags:** (1) an unreadable `.pr_brs` must never release a suppression (same polarity as #1705) — and `.open_iss` failing must NOT block the checked classification, which does not read it; (2) a producer rewording must yield `unknown:<n>`, never `none` and never a claimed surface; (3) mixed-version fleet: a record with no `stop=` must never be given an invented cause — and, stated plainly, **a new writer + an already-deployed reader still prints `(limit)`** until `$O/orch-loop.sh` is re-stamped (a delivery dependency, Task 5); (4) the single bash rewrite of `checked.txt` is atomic (temp + `mv`), and `released=` is published only after it succeeds; the heredoc's own pre-existing `dispatched.txt` drop is unchanged.
+
+### Journey Test Map
+
+### Journey: an operator asks "why did nothing dispatch?"
+1. **Step:** read the `[dispatch] …` line → **Acceptance:** the largest bucket carries the cause the writer recorded (`230 not reached (run budget: 12 pre-flight run(s) spent, 12 unjudged)`) and, when there is one, the failing surface → **Test:** `test-gates.sh` reader cases.
+2. **Step:** read the `[refresh]` log → **Acceptance:** ONE aggregate line names the surface and its reason, so the cause survives after the 12 per-candidate lines scroll away (both remain — the per-candidate lines are kept for traceability) → **Test:** `refresh-scout.test.sh` unusable-surface case.
+
+### Journey: a CLEAN-judged candidate that was never dispatched
+1. **Step:** the next pass reaches the reaper → **Acceptance:** the entry has no keep-fact, is released, re-pre-flighted, and lands in `candidates.txt` → **Test:** `refresh-scout.test.sh` "checked with no keep-fact is re-judged and queued" (fails on the pre-fix script).
+2. **Step:** the same entry is still in `candidates.txt` → **Acceptance:** kept, NOT re-pre-flighted → **Test:** Control B.
+
+### Failure Modes
+- Unreadable `.open_iss`/`.pr_brs` → **Expected:** release nothing, keep every entry, record `unjustified=-`, WARN (today's behaviour preserved) → **Test:** Control F.
+- Claim registry not installed → **Expected:** WARN, release allowed (the documented no-registry fallback; the box has no cross-box claim mechanism) → **Test:** Control G.
+- Claim registry installed but cannot answer (`rc=2/3`) → **Expected:** keep the entry, reason `claim-unknown`, count it in `unjustified` (a *measured* non-zero), WARN → **Test:** Control E.
+- Producer prints no `INCOMPLETE SURFACES` block / an unrecognised verdict → **Expected:** `unknown:<n>` / `unrecognised-verdict:<n>`, never `none` → **Test:** `refresh-scout.test.sh` parse cases.
+- A record whose `stop=` and residue contradict → **Expected:** `stop_conflict=1` with **`reconciled` UNCHANGED** (the parts did sum; the *cause* is what disagrees), and the reader says so in its own words (`STOP CONTRADICTION …`), never "the parts do not sum" → **Test:** `test-gates.sh` writer + reader cases.
+- The `skipped_checked` sub-breakdown failing to sum → **Expected:** `reason_conflict=1` with `reconciled` UNCHANGED — the pool parts still sum, so a `reconciled=0` here would make the operator line assert something false about the pool → **Test:** `test-gates.sh` writer case.
+- Crash between the release and the walk → **Expected:** the entry is gone from `checked.txt` and simply re-judged next pass (never a lost queue entry; nothing is removed from `candidates.txt`).
+
+**Tech Stack:** bash, python3 (stdlib), existing harness test suite.
+
+---
+
+## Task 1: Writer — record the stop reason, the checked reasons, and the unusable surfaces
+
+**Intent:** the largest bucket must carry a cause written by the arm that caused it, and every `skipped_checked` row must name the keep-fact that justified it (issue Required #1; P0 comment item 3).
+**Acceptance:** `state/refresh-funnel` contains `stop=<limit|run_budget|spend|none>`; per-reason `skipped_checked_<reason>=` counters that sum to `skipped_checked`; `unusable=<slug>:<n>,…|unknown:<n>|none`; `repo=<owner/name>`; `checked_released=`, `checked_unjustified=`; `stop_conflict=1` when the cause and the residue contradict **with `reconciled` untouched**; `reason_conflict=1` when the checked breakdown does not sum **with `reconciled` untouched**; `reconciled=0` **only** when the pool's own parts do not sum.
+**Files:**
+- Modify: `scripts/orchestrator-harness/refresh-candidates.sh` (counters block `n=0`…:1520; break arms :1552, :1553, :1596; checked skip :1540; the six `V_UNJUDGED` sites :1653, :1732, :1742, :1754, :1773, :1776; funnel writer :1803–1842)
+
+**Step 1:** Inside the extracted region (`n=0` → the walk's `done < "$O/.pool"`), add `STOP=none`, `UNUSABLE_LIST=""`, `STOP_CONFLICT=0`, `REASON_CONFLICT=0`, `UNUSABLE_WHY=""`, the eight reason counters (`SKIP_CHECKED_QUEUED/_DISPATCHED/_PR/_LANE/_CLAIM/_CLAIM_UNKNOWN/_DEFERRED/_UNKNOWN`), and load the keep-fact map once from `state/checked-kept` into `CHECKED_REASONS=" 42:queued 43:pr "`. ⛔ **The loop that fills it must be INDENTED.** `selftest.sh:427` extracts this region with `awk '/^n=0$/{f=1} f{print} /^done < /{f=0}'`, which stops at the first **column-0** `done < `; an unindented read loop truncates the extracted body there — the positive checks redden loudly, and the *negative* ones (`selftest.sh:468–471`, "an ERRORED pre-flight does NOT blacklist" / "queues nothing") go **vacuously green** against a walk the extraction no longer contains. Use the **indented read loop**, exactly like the existing in-region loader at `:1529–1536`:
+`  while IFS="$(printf '\t')" read -r _n _r; do [ -n "$_n" ] && CHECKED_REASONS="$CHECKED_REASONS $_n:$_r"; done < "$O/state/checked-kept"`
+(the indentation is load-bearing — see the extraction note above — and the redirection keeps the loop in the current shell, so the variable survives).
+⛔ **Do NOT use `sed -n 's/^\([0-9]*\)\t\(.*\)$/…/p'`.** BSD sed — macOS, which is where most cells run — does not expand `\t`, so it matches a literal `t` and the same file yields an EMPTY map. The failure is silent and total: every checked skip falls to `_unknown`, the eight counters still sum, so `reason_conflict` cannot fire, every Task 4 control asserts a heredoc-written artifact or `candidates.txt`, and CI is `ubuntu-latest` (GNU sed) — a green suite reporting `unknown N` on every Mac. This exact class is already recorded in this repo at `scripts/worktree-hygiene-sweep.sh:231` ("BSD sed … so the probe matched nothing and the probe read as READY however broken the box was").
+**Step 2:** Set `STOP=limit` at :1552, `STOP=run_budget` at :1553, `STOP=spend` in the STARVED arm (:1596) — immediately before each `break`. A `break` that sets nothing leaves `none` = the walk reached the end of the pool.
+**Step 3:** In the checked skip arm (:1540), derive `_why` from `$CHECKED_REASONS` by `case "$CHECKED_REASONS" in *" $N:"*)` + parameter expansion, increment the matching counter — `queued|dispatched|pr|lane|claim|claim-unknown|deferred`, else `_unknown` — and keep the single `continue`. ⛔ **`deferred` must be in that list.** It is written by the claim filter (Task 2 Step 6) into the same `state/checked-kept`, and the filter runs *before* the walk (`:1176–1210` vs `n=0` at `:1429`), so it is present when the map is loaded. Without the branch a deferred entry lands in `_unknown`: `SKIP_CHECKED_DEFERRED` is structurally 0 forever, the dispatch line's `deferred R` term is a hard-coded zero, and because the sum still closes `reason_conflict` cannot catch it.
+**Step 4:** Define `pre_incomplete_surfaces()` **inside the extracted region** (immediately after the reason counters, so `selftest.sh`'s extraction still supplies it; a helper above `n=0` is undefined there — the file records that wound for `CORE_PACING` at :1578–1587): awk emits the `[...]` name from each `^  \[name]` line, starting at `^INCOMPLETE SURFACES`, ending at the first line that is neither blank nor `  [`. Slugify `sed -e 's/[^A-Za-z0-9]\+/-/g' -e 's/^-//' -e 's/-$//'` **and lowercase it** (`tr 'A-Z' 'a-z'`): producer surface names keep their own casing (`[open PRs]` → `open-PRs`), and a case-preserving slug made every assertion written against the canonical lowercase form match nothing — vacuously green (review P2, #2183). Capture the first reason line into `UNUSABLE_WHY`. The fixture for this is a **captured transcript** of the real producer on this box, committed next to the test (not hand-authored), because the format is a vendored producer's stdout.
+**Step 5:** Call it from all **six** `V_UNJUDGED` sites — DEGRADED CLEAN (:1653), DEGRADED COLLISION (:1754), INCOMPLETE (:1773), `*)` (:1776, split: `$PRE` has a `^VERDICT` line the sed could not classify ⇒ `unrecognised-verdict`, else `unknown` via the producer-block parser — the shipped slug, recorded here after cycle 2; `no-verdict` was the plan's name and is emitted nowhere), ICR 2 (:1732) and ICR unrecognised (:1742) ⇒ `claim-registry`.
+**Step 6:** Build `UNUSABLE_FIELD`: `none` **only** when `V_UNJUDGED=0`; otherwise `slug:<n>` pairs — the count is carried *inside* the pair (`issue-assignee-holder:12`), so the reader must not append a second literal — and, for any unusable run that produced no surface, `unknown:<n>` — so an unparsed block can never publish "surface(s): none". **Bash 3.2 has no associative arrays** (`declare -A` is bash 4+; this harness targets /bin/bash 3.2): accumulate `UNUSABLE_LIST=" slug "` and count distinct slugs at end of pass with `sort -u` + `grep -cx` per slug (≤ a handful of forks, never per-candidate).
+**Step 7:** Emit `stop=`, `unusable=`, `repo=$OR`, the reason counters, `checked_released=`/`checked_unjustified=`/`checked_deferred=`/`checked_refused=`/`checked_sort_failed=` (all from `state/checked-reap`, default `-`). ⛔ `checked_deferred` **IS** published (restated after the cycle-2 E-P2 finding): this step originally forbade it, arguing the walk's `skipped_checked_deferred` recounts the same set — but the two measure DIFFERENT populations (`checked-reap`'s `deferred` is the cap residue for THIS pass; `skipped_checked_deferred` is what the walk saw in `state/checked-kept`, which a later pass re-truncates), and the merged reading was worse: `checked-reap`'s `deferred` was read by NOTHING, so a cap that bound every cycle was invisible on the operator line. `checked_refused` (a slug, `none` when nothing was refused) and `checked_sort_failed` (`0`/`1`) exist for the same reason: `unjustified=-` alone rendered as nothing. Also emit `reconciled=`, `stop_conflict=`, `reason_conflict=`. `repo=` is emitted because the `[cap]` line beside it already carries `@${OR}` (`orch-loop.sh:2173`) for exactly this reason: the operator cross-reads the two lines, and "is this pool the right repo" must be answerable from the record rather than from the log above it. All references use `${VAR:-default}` (the extracted writer runs under `set -u` with a hand-set environment).
+**Step 8:** Falsifiers. `reconciled` keeps exactly its documented meaning ("the parts sum"); the cause/residue contradiction gets its OWN key so the reader cannot print "the parts do not sum" about a pass whose parts did sum:
+ - `stop=none` (the walk reached the end, which by construction means `POOL_SWEPT=1`) with `not_reached≠0` ⇒ `stop_conflict=1` + WARN. The only reachable benign cause is a `.pool`/listing disagreement (a row vanished or the pool shrank between counting and walking); the WARN says exactly that, and `reconciled` is untouched.
+ - `sum(SKIP_CHECKED_*) == SKIP_CHECKED` ⇒ else `reason_conflict=1` + WARN naming the breakdown, and **`reconciled` untouched**: the pool's own parts still sum, so setting it here would print `UNRECONCILED (the parts do not sum to the pool)` about a pool that did sum — the very false accusation `stop_conflict` was split out to prevent. (Today the sum is closed by construction: every non-matching reason lands in `_unknown`. This guard exists so a future arm that `continue`s without a counter cannot pass silently.)
+ - `listed="-"` ⇒ the stop falsifier does not apply.
+**Step 9:** When `V_UNJUDGED>0`, print one aggregate line: `[refresh] <u> of <judged> pre-flight run(s) unusable — surface(s): <field> — <first reason>` (in ADDITION to the per-candidate lines, which stay), and carry the same surface into the `ABORT: none of the N …` message.
+
+## Task 2: Reaper + claim filter — a suppression survives only while a keep-fact holds
+
+**Intent:** `checked.txt` becomes a *cache of derivable facts*, revalidated on every pass that reaches the reaper, not an append-only ledger of decisions (issue Required #2/#3 and its design question). It must never be re-judged while it is still queued.
+**Acceptance:** an entry with no keep-fact is released and re-judged in the same pass; entries that are queued/dispatched/have-PR/have-lane/have-live-claim are kept; any unreadable `.pr_brs` releases nothing; the classification is written every pass and cannot be read from an earlier pass (pass-start truncation, not an epoch comparison); `checked.txt` has exactly ONE writer of the **release** — the bash block, after the claim filter, rewriting atomically (the reaper heredoc keeps its own pre-existing, unchanged `dispatched.txt` drop; that is a separate decision, not a second release writer), and `released=` is published only when the release rewrite succeeded. Drain rate is stated: `CHECKED_RELEASE_MAX=24` releases/pass vs `LIMIT=6` judged/pass, so a 300-entry terminal-less file drains in ~13 passes (~1 h at a 240 s cycle).
+**Files:**
+- Modify: `scripts/orchestrator-harness/refresh-candidates.sh` (`mkdir -p "$O/state"` next to :622, fail-closed unlike the cache's own at :143–152; reaper heredoc :1100–1146 — invocation line byte-identical, it is a test anchor; post-reaper / pre-affordability block :1147–1176)
+
+**Step 1:** `mkdir -p "$O/state"` on the bash side (next to `:622`) and `os.makedirs(os.path.join(O,"state"), exist_ok=True)` in the heredoc. `gh_pass_cache_start` (`:236`) does create `$O/state/.gh-pass-cache`, but it does so **fail-open** (`if mkdir -p … 2>/dev/null` → WARN at `:146–152`), so the directory can legitimately be absent when the reaper (`:1100`) runs — and the reaper's own writer, unlike the cache, is fail-closed: a failure aborts every pass (`reap_rc` ⇒ `ABORT … exit EXIT_TRANSIENT`), which is a permanent no-dispatch loop.
+**Step 2:** `rm -f "$O/state/checked-reap" "$O/state/checked-kept" "$O/state/checked-release-candidates" "$O/state/checked-release"` at the top of the pass (before the reaper) — an **explicit four-file list, never a `checked-*` glob**, because a glob would also delete `state/checked-release-cursor` every pass and silently reduce the rotation to "always start at the head", which is exactly the head-of-line starvation it exists to prevent (and no test in Task 4 would notice). Absence is then the only reading a later step can make of "this pass did not classify"; a record from an earlier pass can never speak for this one.
+**Step 3 (fail-closed split):** the existing guard is split by what each half actually reads. `.pr_brs` absent ⇒ the checked classification cannot rule out a PR: print `[reap] SKIPPED (checked: .pr_brs unreadable)`, release nothing, write `checked-reap` with `released=0 deferred=0 unjustified=- at=<epoch>`, and leave `checked.txt` untouched. `.open_iss` absent ⇒ **only** the `dispatched.txt` reap is skipped (it is the one that needs it); the checked classification still runs, because its facts are `candidates.txt`, `dispatched.txt`, `.pr_brs`, `tmux` and the claim registry. Its message must keep the literal substring `SKIPPED: .open_iss` — `selftest.sh:405–406` pins it with `grep -qF`, and its fixture (`:391–398`: `.open_iss` absent, `.pr_brs` present) is exactly the new split branch, so the wording is `[reap] SKIPPED: .open_iss not readable — dispatched reap skipped, checked classification still runs`. Without that substring the pre-existing assertion reddens on correct code. Today's single guard couples them and would keep suppressing forever on an issues-listing failure — the defect this patch exists to remove.
+**Step 4:** In the heredoc, compute the local keep-fact for each `checked.txt` entry: `dispatched` (in `dispatched.txt`) → `queued` (in `candidates.txt`) → `pr` (a `.pr_brs` head ref names it) → `lane` (a live `lane-N` from the **one** `tmux ls` call the reaper already makes) → else **release candidate**. Keep facts are POSITIVE evidence only. Deliberately **not** keep-facts: absence from `.open_iss` (a 500-row created-DESC window that permanently drops the oldest open issues — its documented loss "only NARROWS" the reaper, so absence is not "closed"), and a branch ref (the scout is fetched without `--prune`, so a deleted branch's ref is unbounded evidence; the pre-flight's own branch/PR COLLISION already refuses to queue such an issue, TTL-bounded by the collision ledger). **Stated residual:** `.pr_brs` is the same 500-row window, and a PR whose head ref does not embed the issue number never matches — both make the `pr` keep-fact MISSING for old/odd PRs, which releases the entry and buys one re-judge; that is safe (the pre-flight answers COLLISION for a live PR) but it is a cost, not a correctness guarantee.
+**Step 5:** Write `state/checked-kept` (`N<TAB>reason` for every KEPT entry only — release candidates are not written, so a claim-kept entry never loses its `checked.txt` row) and `state/checked-release-candidates` (numbers, atomic). **The heredoc does NOT rewrite `checked.txt` beyond its existing `dispatched.txt` drop** — that drop stays exactly as it is (it is pinned by `selftest.sh:369–370`).
+**Step 6 (claim filter, above the affordability refusal):** immediately after the reaper's cleanup and **above** the "can this pass afford anything" refusal (:1176–1181, whose message must be amended to say the reaper AND the release have run — cycle 3: built from the reaper's own `unjustified=-` rather than asserted, so a pass whose classification was REFUSED does not name it as done). Rationale is the file's own #1736-follow-up note (:1155–1172): housekeeping placed below an affordability gate stops happening exactly on the starved box. If `$O/claims.sh` does not exist → WARN `[reap] the claim registry is NOT INSTALLED — releasing on local facts only (documented fallback)` and treat every candidate as releasable. Else, **sort the candidate list numerically** and then walk it starting after a persisted cursor (`state/checked-release-cursor` = the **last candidate asked, in ask order**, wrapping to the start when nothing lies after it, and reset to `0` when a pass swept the whole ring below the cap — restated after the cycle-1 P1; the numeric maximum is monotone and freezes the ring) — a rotation is only a rotation over an **ordered** list: `checked.txt` is append-order (`:1702`), so on an unsorted list a window whose last element is its numeric maximum repeats forever and the tail is never asked (candidates `[10,30,20]`, `MAX=2` ⇒ asks 10,30, wraps, asks 10,30 again, `20` starves). This is what stops ≥`MAX` permanently-held head entries from starving the tail: `issue_claim_verdict` → `0` ⇒ release; `1` ⇒ keep as `claim`; `2` ⇒ keep as `claim-unknown`; `3` ⇒ **provisioning channel**: print `NOT PROVISIONABLE` and exit 3 (same as the walk's rc=3 arm, :1734–1740); any other rc (`*`) ⇒ keep as `claim-unknown` — never release on a code this reader does not recognise. Bound the network reads at `CHECKED_RELEASE_MAX` (default 24) per pass (each is one `git ls-remote`; it is git transport, not the REST core budget the starve gate protects); the remainder are `deferred` and are recorded with reason `deferred` in `checked-kept`. The cap applies **only** to the registry branch: when `claims.sh` is absent no network read happens, so every candidate is released in that pass.
+**Step 7:** Append the claim outcomes to `state/checked-kept`; write `state/checked-release`; then perform the **single** atomic `checked.txt` rewrite: current content − released (the heredoc has already applied − dispatched_reaped). On a failed `mv`, publish `released=-` (unknown) with a WARN and leave the file alone — never a count for entries the file still suppresses (#1853's "every state write is checked").
+**Step 8:** Write `state/checked-reap`: `released=<n> deferred=<n> unjustified=<n|-> at=<epoch>`, where `unjustified` counts entries kept on an **unproven** fact (`claim-unknown` — a fact nobody could check) and **not** `deferred` entries (a fact not yet asked, counted separately as `deferred`), or is `-` when the classification did not run. Print `[reap] released from checked.txt (no queued/dispatched/PR/lane/claim fact): <nums>` and, when the file is non-empty, a bound line: `<size> entr(ies), <released> released, <deferred> deferred, <unjustified> without a proven fact (expected bound: 0)`.
+**Step 9:** Do **not** touch the #1984 digest token: the reaper runs *before* the digest is taken (:1366) and the skip decision (:1414), so a release changes `checked.txt` and necessarily defeats the skip; gating the token on the new counters would disable a legitimate saving and redden `refresh-spend.test.sh` §3.
+
+## Task 3: Reader — render the cause, never invent `(limit)`
+
+**Intent:** the dispatch line is the operator's only view; it must state the recorded cause or say it has none.
+**Acceptance:** `stop=run_budget` renders `not reached (run budget: J pre-flight run(s) spent, U unjudged)`; `stop=none` with a residue renders `— STOP CONTRADICTION (the recorded cause and the residue disagree)` (never "the parts do not sum", and never a change to the `reconciled` wording); a record with no `stop=` renders `(cause not recorded)`; `unusable=` renders `— failing surface: <field>` with no extra literal (the counts already live in the field); `checked_released>0` renders `— K released from checked`; `checked_unjustified>0` renders `— UNPROVEN suppression: K checked entr(ies) with no proven fact`.
+**One separator only:** every appended trailing fact uses `— ` (em dash, space) as its prefix, so the line reads `… -> D dispatched (…) — failing surface: F — 3 released from checked — UNPROVEN suppression: …`. Nothing is appended with `;` and nothing is appended bare; `deferred` is **not** an appended fact (it is a term inside the checked parenthetical, so it appears exactly once).
+**Files:**
+- Modify: `scripts/orchestrator-harness/orch-loop.sh` (`dispatch_funnel()`, :674–777; the hardcoded literal is at :759)
+
+**Step 1:** Parse the new keys into initialised locals (`set -u`: every key is optional; the initialise-every-key lesson is :684–688, the parse `case` is :694–700). Add `limit` (already in the record).
+**Step 2:** Replace the hardcoded `"$notr not reached (limit)"` (**`orch-loop.sh:759`** — `:753` is a comment inside the #2124 note) with a cause map: `limit` → `slot limit: L slot(s) filled`; `run_budget` → `run budget: J pre-flight run(s) spent, U unjudged`; `spend` → `REST spend reserve`; `none` → `the walk reached the end of the pool`; absent → `cause not recorded`.
+**Step 3:** Render the checked part from ALL present reason keys — including `dispatched`, `deferred` and `unknown` — as `N blacklisted (checked: queued K, dispatched L, pr M, lane O, claim P, claim-unknown Q, deferred R, unknown S)` (SHIPPED wording — see the Step 3 note below); a record without the keys keeps `N blacklisted (checked)`. The writer counts all eight (`SKIP_CHECKED_DEFERRED` included), so the parenthetical sums to `N` exactly.
+
+> **Wording reconciliation (review P3, #2183).** This step originally specified `N already checked (…)`.
+> The shipped reader renders `N blacklisted (checked: …)` instead, because `blacklisted (checked)` is
+> the token the PRE-FIX reader already printed and operators already read — replacing it would have
+> changed two things at once (the numbers *and* the word) in the one line an operator uses to decide
+> whether the funnel is lying, and `test-gates.sh` pins the shipped string. The acceptance that
+> matters is unchanged: the parenthetical is present, sums to N, and every reason is named.
+**Step 4:** Append after the parts join, each with the single `— ` separator: `— failing surface: <field>` when `unusable` is neither empty nor `none`; `— K released from checked` when `checked_released>0`; `— UNPROVEN suppression: K checked entr(ies) with no proven fact` when `checked_unjustified` is a positive number; and `— STOP CONTRADICTION (the recorded cause and the residue disagree)` when `stop_conflict=1`. The last three must NOT change the `reconciled` wording: a `stop_conflict` pass's parts DO sum, so `UNRECONCILED` would be false.
+
+## Task 4: Tests — the queue must fill, and the pre-fix script must fail them
+
+**Intent:** prove the funnel QUEUES a candidate end-to-end where the only failure mode is the one fixed, and prove each new field is measured rather than asserted.
+**RED rule, stated precisely.** Two kinds of assertion, both required:
+- **New-artifact assertions** (`state/checked-kept`, `state/checked-reap`, the new funnel keys) must be **RED on the pre-fix script** — the artifact does not exist there, so red is guaranteed and the assertion cannot pass by coincidence.
+- **Mutation-discriminating assertions** cover behaviour a new artifact cannot witness (e.g. "a previous pass's stale candidate list releases nothing"): these are **green pre-fix by construction** — a truncation rule must be tested by mutation, not by absence. Each such case states the mutation it discriminates (which line, removed, turns it red) in the test's own comment.
+- Every control also carries its **pre-existing** assertions (`candidates.txt`, `checked.txt` contents): regression controls, green before and after.
+A control that can name neither its pre-fix red nor its discriminating mutation is not a test — delete it rather than ship it.
+**Acceptance:** the end-to-end case fails against `HEAD` (pre-fix) because `candidates.txt` stays empty; every new field has a test that reads a *state artifact* (or `candidates.txt`), never only a log line.
+**Files:**
+- Modify: `scripts/orchestrator-harness/refresh-scout.test.sh` (add `mk_tmux`, `mk_git_fail` helpers next to `mk_tool`/`mk_case`; add a `pr_rows` parameter to `mk_gh_rest` — its `/pulls?` answer is hardcoded `[]` today, so Control A cannot be seeded otherwise)
+- Modify: `scripts/orchestrator-harness/selftest.sh` (reaper unit cases at :344–419 — the range must reach the 5a guard block at :372–419, because :405–406 pins `SKIPPED: .open_iss` and the split guard re-shapes that message)
+- Modify: `scripts/orchestrator-harness/test-gates.sh` (reader :1776–1844, writer :1847–1884 — the file ends at 1888, so there is no :1905 to edit)
+- Modify: `scripts/orchestrator-harness/capacity-transfer.test.sh` (:530, :546 fixtures gain `stop=`)
+
+**Step 1 (the queue fills):** `mk_case`; `.pool`=`42`; `checked.txt`=`42`; `candidates.txt`/`dispatched.txt` empty; gh stub answers open issues containing 42, `pulls=[]`; `mk_tool` → `VERDICT: CLEAN`; `mk_tmux` prints no `lane-42`; `claims.sh` present and answering no claim (the sandbox's real bare origin, `mk_case`). **Assert (a) `grep -qx 42 "$D/o/candidates.txt"` — the queue filled** (pre-fix: `SKIP_CHECKED` ⇒ empty ⇒ RED), **(b) `checked_released=1`**, **(c) `42` in `state/checked-release`**.
+DO NOT assert that `42` is absent from `checked.txt`: in the same pass the released candidate is pre-flighted CLEAN and the CLEAN arm appends it straight back (`refresh-candidates.sh:1701–1704`, after `candidates.txt`), so absence is unsatisfiable on the FIXED script — the assertion would be red pre-fix and red post-fix, and an implementer would "repair" it into something that no longer proves the queue fills.
+**Step 2 (Control A — PR keep-fact):** `mk_gh_rest "$D" 42 'fix/42-thing'` (new `pr_rows` param; REST shape `[{"head":{"ref":"fix/42-thing"}}]`, since `rest_list` projects `.head.ref`) ⇒ assert `candidates.txt` does NOT contain 42, `checked.txt` still does, `checked_released=0`, `42<TAB>pr` in `state/checked-kept`.
+**Step 3 (Control B — queued keep-fact):** `candidates.txt`=`42` too ⇒ assert the pre-flight tool log is EMPTY, `checked.txt` still has 42, `candidates.txt` has exactly one `42`, **and `state/checked-kept` contains `42<TAB>queued`** (the new-artifact assertion is red pre-fix; the three pre-existing ones are green pre-fix, as regression controls should be).
+**Step 4 (Control C — lane keep-fact):** `mk_tmux` prints `lane-42` ⇒ assert kept, `checked_released=0`, `42<TAB>lane` in `state/checked-kept`.
+**Step 5 (Control D — live claim):** `mk_issue_claim "$D" 42 3600` (shipped `claims.sh`, real bare origin) ⇒ assert kept, `42<TAB>claim`, `checked_released=0`.
+**Step 6 (Control E — unanswerable claim registry):** `mk_git_fail ls-remote` (wrapper execs real git for every argv except `ls-remote`) ⇒ assert kept, `42<TAB>claim-unknown`, `checked_unjustified=1`, WARN names the registry.
+**Step 7 (Control F — unreadable `.pr_brs`, and a stale candidate file):** gh stub answers the pulls listing with an error ⇒ assert 42 stays in `checked.txt`, `checked_unjustified=-`, `[reap] SKIPPED` present, `candidates.txt` empty; **and**, after seeding a `state/checked-release-candidates` containing 42 by hand before the pass, assert 42 is still suppressed (the truncate-at-pass-start rule means a previous pass's candidate list can never release anything). Also assert that an issues-listing failure alone still RUNS the checked classification (split guard) — 42 is released in that variant.
+**Step 8 (Control G — registry not installed):** remove `$D/o/claims.sh` ⇒ assert 42 IS released (documented fallback) and a WARN says the registry is not installed.
+**Step 9 (run-cap deferral, then real rotation — two fixtures, because they prove different things):**
+- *Deferral:* 30 terminal-less entries, `CHECKED_RELEASE_MAX=24` ⇒ `state/checked-reap` reads `released=24 deferred=6`, and `deferred` appears in `state/checked-kept`.
+- *Rotation:* the deferral fixture CANNOT fail if the cursor is absent, wiped or ignored — after pass 1 the 24 released entries have left `checked.txt`, so pass 2 has only 6 candidates and `MAX=24` releases them all. Construct the starvation instead. Note the cap counts **asks, not releases** (Task 2 Step 6), so a head entry consumes budget whether or not it is released. Fixture: `CHECKED_RELEASE_MAX=2`; **two head entries `8` and `9` held by a live claim** (`mk_issue_claim`, as Control D — a claim is not a local keep-fact, so they stay candidates every pass); **two releasable tail entries `10` and `11`**.
+  - Pass 1: both asks are spent on `8`/`9` ⇒ **0 released**, cursor `9`, `deferred` = `10`,`11`. Assert that — and assert `skipped_checked_deferred=2` after the walk, which is the only place the walk's `deferred` derivation is graded at all.
+  - Pass 2: no candidate is numerically greater than `9`… except `10`/`11`, which are ⇒ both released, cursor `11`. Assert **both**, not "the remaining one".
+  - Mutations this discriminates: (a) drop the cursor / ignore it ⇒ pass 2 asks `8`,`9` again and `10`/`11` are never released; (b) compare the cursor with `>`/`\>` instead of `-gt` ⇒ `[ "10" \> "9" ]` is FALSE, so `10`/`11` are skipped, the walk wraps to `8`/`9`, and they starve. The `9`→`10` pair is why the fixture must span a **digit-length boundary**: with every number two digits, a string comparison and a numeric one agree and mutation (b) passes.
+**Step 10 (unusable surface):** stub prints a `HITS` block naming `[open PRs]` and an `INCOMPLETE SURFACES` block naming `[issue assignee/holder]` ⇒ assert `unusable=issue-assignee-holder:1` (the HITS surface must NOT appear), the aggregate line names it, and the ABORT carries it. Second fixture with no block ⇒ `unusable=unknown:1`; third with an unrecognised `VERDICT: FOO` ⇒ `unrecognised-verdict:1`.
+**Step 11 (writer/reader):** `test-gates.sh` — add `STOP=limit` (NOT `none`: `_funnel_write` drives `not_reached=179`, and `stop=none` would fire the new falsifier against the existing `reconciled=1` assertion) + reason counters to `_funnel_write`; likewise give the `capacity-transfer.test.sh` fixtures `stop=limit` (they use `limit=0`, `not_reached=3`). New writer cases: `STOP=none` with `not_reached=0` ⇒ clean; `STOP=none` with a residue ⇒ `stop_conflict=1` and `reconciled` UNCHANGED (it must not print "parts do not sum"); reason counters that do not sum to `skipped_checked` ⇒ `reason_conflict=1` with `reconciled` UNCHANGED. New reader cases: `run_budget`+surface rendering; `none`+residue ⇒ `STOP CONTRADICTION` (the exact string Task 3 Step 4 specifies — any divergence reds correct code); absent `stop` ⇒ `cause not recorded`; per-reason checked breakdown summing to N; `checked_unjustified>0` ⇒ `UNPROVEN suppression`; and a `reconciled=0` record still reading `UNRECONCILED (the parts do not sum to the pool)`. Update the existing exact-string fixtures to carry `stop=` (they must still prove peer-held ≠ "limit").
+**Step 12 (reaper unit, `selftest.sh:344–419`):** extend the extracted-reaper block with checked-only fixtures — release (42 open, no PR, no lane), keep by queued, keep by PR — and keep the existing dispatched cases untouched, INCLUDING :405–406's `SKIPPED: .open_iss` pin (the split guard must still name the missing list on that fixture, and the `.pr_brs`-absent variant must still name `checked`).
+
+## Task 5: Record and report
+
+**Intent:** the P0 record must say what was measured, on which build, and what this patch does NOT fix.
+**Acceptance:** issue #2183 carries the four measurements with provenance (cell / repo / harness commit / funnel `at=`), the build-drift note (cell harness `f6f8ec5c` vs main `d20de1c8`; a re-stamp is a delivery dependency), the two owner questions, the diff summary and the test that proves the queue fills; #1935 carries the reproduction as **evidence on the existing root** (not a peer issue).
+**Files:**
+- Create: `docs/plans/2026-10-20-issue-2183-dispatch-funnel-accounting.md` (this file)
+- Modify: `scripts/orchestrator-harness/ARCHITECTURE.md` (:176 funnel key set) and, if the funnel row is described there, `scripts/orchestrator-harness/README.md` (:1035)
+
+**Step 1:** Update `ARCHITECTURE.md`'s funnel key list with `stop`, `unusable`, `repo`, `checked_released`, `checked_unjustified`, `checked_deferred`, `checked_refused`, `checked_sort_failed`, `stop_conflict`, `reason_conflict` and the `skipped_checked_*` family (eight counters), plus the new `state/checked-*` files and the single-writer rule.
+**Step 2:** Post the measurement record, the two owner questions and the honest scope line on #2183; comment the reproduction on #1935. Question 2 (fairness rotation for unusable *pre-flight* heads) **re-opens #1729's recorded choice** (slot budget + `RUN_BUDGET`, not rotation) — it must be argued in #1729's home, not decided in #2183's thread. Question 1 (early-abort threshold) is a new decision and belongs on #2183. Neither is implemented here.
+
+## Code review — cycle log
+
+**Risk class:** medium-high (cap 5 cycles), `INFRA_RISK=medium`. Three reviewers dispatched in parallel
+on cycle 1: **B** (correctness/security), **A** (guidance/history), **E** (infrastructure).
+
+### Cycle 1
+
+**P1 — the release cursor saturates, found INDEPENDENTLY by all three reviewers, each with a replay.**
+The cursor was stored as the numeric maximum ever asked. That value is monotone and it is reached in the
+pass whose forward half walks off the end of the list; from then on `_n -gt cursor` is false for *every*
+entry, the forward half is permanently empty, and every later pass asks the numerically smallest `MAX`
+entries. With more permanently-held `checked.txt` entries than `MAX`, band 2 is never asked again — and a
+claim is a **lease**: the holder finishes, the lease lapses, the entry stays suppressed, and no pass ever
+looks again. That is #2183's own defect one layer down, while the record reports those entries as
+`deferred` ("reached by a later pass") — a false statement.
+*Fix:* the cursor is the **last entry asked, in ask order**; a pass that swept the whole ring without
+hitting the cap resets it to 0. Bounded stated cost: after a wrap, the band just behind the old cursor can
+be asked once more in the next pass — one repeated band per cycle, where the maximum's failure was
+permanent starvation. *Test:* Control I-bis (new) — two held bands plus a releasable tail, `MAX=2`, five
+passes, band 2's claims deleted after pass 3, so the only pass that can queue `10`/`11` is the one that
+re-asks band 2. **Mutation-verified, and the mutation is named exactly:** replacing `_ck_next_cursor`
+with the monotone numeric maximum over the sorted list yields `PASS=315 FAIL=11` — Control I, the ring
+case's pass 3 and pass 5, and both `#10`/`#11 not queued` assertions red, with the ring case's
+`candidates.txt` EMPTY (measured). A *different* mutation — ignoring the cursor entirely — also empties
+the queue (`PASS=316 FAIL=10`, measured); the two are not interchangeable, which is why the log names
+the one it ran.
+
+| # | Finding | Disposition |
+|---|---|---|
+| B-P3-1 / E-2 | `CHECKED_RELEASE_MAX` unvalidated: `[ 3 -ge abc ]` prints to stderr and is FALSE, so a typo removes the cap entirely | **Fixed** — `case` guard; non-numeric **and `0`** coerce to 24 (a zero would ask nothing and publish every entry as `deferred` for ever: a silent disable wearing the shape of a measurement) |
+| B-P3-2 | `read_soft` catches `OSError` only; one stray byte in a listing raises `UnicodeDecodeError`, aborts the reap and takes every pass down — a permanent no-dispatch loop | **Fixed** — `(OSError, UnicodeDecodeError)` ⇒ the documented UNREADABLE, refused by name |
+| A-P2 | README (:1442) still describes the single reaper guard | **Fixed** — states the split and what each part reads |
+| A-P3 | README (`checked.txt` row) still says a reaped number is dropped, nothing about revalidation | **Fixed** — release rule + cursor semantics |
+| A-P3 | README sample renders (`(limit)`, `K released from checked`) predate the cause map and `released=-` | **Fixed** — samples now show the cause map, and `released from checked: UNKNOWN (the rewrite failed)` |
+| A-P3 | Docs claim `unusable` is parsed from the producer only; two slugs are local | **Fixed** — README + ARCHITECTURE name `claim-registry`, `unrecognised-verdict` and `unknown` as local |
+| A-P3 | `awk NR==FNR` with an EMPTY first file swallows the first record of file 2 | **Fixed** — `-s` guard, with a second arm that writes the whole list (and dedupes); Control J drives it through a failing `mktemp` |
+| A-P4 | `state/checked-kept` append unchecked, and it feeds the published reason map | **Fixed** — checked, WARN (not fatal: a missing reason is a worse line, not a lost queue entry) |
+| A-P4 / E | the reader parses `repo=` into a local nothing renders | **Fixed** — parse removed; the field stays in the RECORD, which is what the plan promised |
+| E-3 | `mkdir -p "$O/state"` succeeds on a read-only dir; the first write then tracebacks | **Fixed** — probe write, same shape as the existing `$O` probe |
+| E-4 | a duplicated fixture line in `selftest.sh` made one reaper check unfalsifiable | **Fixed** — the fixture now carries a checked number with no keep-fact, which is the only assertion that can tell the split guard from the joined one |
+| E not-finding | tmux absent ⇒ the lane fact is unreadable ⇒ release | **Confirmed not a finding** — an absent `tmux` means no lane is live on this box; the entry is re-judged next pass, which is the intent |
+
+**Suites after cycle 1:** `refresh-scout` 324/0 (was 315), `selftest` 390/0, `test-gates` 296/0,
+`capacity-transfer` 52/0; `refresh-spend`, `refresh-quota`, `live-ownership`, `gh-rest`, `gh-limit`,
+`claim-cwd`, `claim-orphan`, `sweep-quota`, `spawn-gate` all green.
+
+### Cycle 2
+
+Fresh reviewers (B correctness, A guidance, E infrastructure). Every finding below was verified against
+the source before it was applied, and each new control was **mutation-verified** (revert the fix, watch
+the named assertion red).
+
+| # | Finding | Disposition |
+|---|---|---|
+| B-P2 | `lines()` in the reap heredoc read every listing with no error handling: ONE non-UTF-8 byte in `dispatched.txt`/`.pr_brs`/`.open_iss`/`checked.txt` raised out of the heredoc, `reap_rc` aborted the pass with `EXIT_TRANSIENT` — on every pass, for ever: a permanent no-dispatch loop presenting as a RUNNING cell. Reachable from ordinary data (a git ref may legally carry bytes ≥ 0x80, and `.pr_brs` comes from `gh`'s head-ref) | **Fixed.** `lines()` returns `None` for unreadable, and every caller treats that as the ABSENT case for its half. ⛔ **And the first cut of this fix was wrong in the destructive direction**: it substituted `[]` and let the reap run, which REWROTE `dispatched.txt` as empty — silent destruction of the one fact that prevents a duplicate lane, hidden behind a refusal that then read a healthy empty file. Now the reap is disabled outright and byte-equality is asserted. Control K reds four of its five assertions when reverted (the byte-equality one is pinned by the separate `[]`-substitution cut) |
+| B-P3 / E-P3 | `CHECKED_RELEASE_MAX` admitted any all-digit value; past intmax `[ n -ge X ]` errors to FALSE, so the cap never bound (measured: 30 held candidates, all asked in one pass, `deferred=0`) | **Fixed** — a length clamp to 24. Control M: 26 free candidates + a huge cap must still spend exactly 24 asks and defer 2 (`released=26 deferred=0` when reverted) |
+| E-P2 | the CURSOR was read with `tr -dc '0-9'`, so a file holding two stamps produced a 20-digit value for which BOTH ring comparisons error to FALSE: 0 asks on every pass, and the poisoned value re-persisted itself. A permanent stall that reported `unjustified=0` | **Fixed** — a cursor this reader cannot compare resets to `0` (head), loudly. Control L (`released=0 deferred=3` and the poisoned value surviving when reverted) |
+| E-P2 | `deferred` was published in `state/checked-reap` and read by NOTHING, so a cap that bound every cycle — the one reading that says "raise `CHECKED_RELEASE_MAX`" — looked like a quiet pass | **Fixed** — `checked_deferred` in the record, rendered as `N checked entr(ies) deferred by the release cap`; `0` renders nothing (test-gates, both directions) |
+| E-P2 | the release writer's temp paths (`.checked-decided`, `.checked-new`, cursor temp) are fixed per-`$O`, and this script takes no `$O/.refresh.lock` of its own — a hung git call can outlive the loop's stale bound, and two writers on one truncated path can install a partial line as `checked.txt` | **Fixed** — `$$`-suffixed temps, as `checked-reap.$$` already was |
+| E-P3 | `tmux ls`'s exit status was discarded and every failure collapsed into `""`, silently REMOVING the `lane` keep fact — moving a live lane toward release, the duplicate-dispatch direction | **Fixed** — the two benign readings are named (no tmux binary, tmux's own "no server running"); anything else refuses the classification. Control N (reverted: `released=1`, i.e. the entry WAS freed on a missing fact) |
+| E-P3 | the affordability refusal asserted the checked release "HAS run" even when the classification had refused | **Fixed** — the sentence is built from the reaper's own `unjustified=-` |
+| E-note | a non-numeric row in `checked.txt` can never be asked, yet the sweep called it `deferred` ("reached by a later pass") — false for ever | **Fixed** — `unknown` |
+| A-P2 | ARCHITECTURE's "known sharp edges" still described the joined guard this PR split | **Fixed** |
+| A-P2 | ARCHITECTURE's cursor row still said "the highest candidate ASKED" — the defective semantics cycle 1 reverted | **Fixed** |
+| A-P3 | README stated the cap bounds the release unconditionally; the no-registry fallback takes no cap | **Fixed** — the bound is stated for the registry path, with the fallback named |
+| A-P3 | README's "current output" samples still rendered `not reached (limit)`, which the shipped reader cannot print | **Fixed** — cause-mapped samples; the remaining `(limit)` mentions are explicitly historical |
+| A-P3 | the plan's mutation evidence (`7 assertions`, `PASS=315 FAIL=11`, `candidates.txt EMPTY`) mixed two different mutations | **Fixed** — the mutation is named exactly and the measured numbers given; the second mutation is recorded separately |
+| A-P4 | the plan named a `no-verdict` slug the code never emits | **Fixed** — `unknown` via the producer-block parser |
+| A-P4 | a dead `printf` in `selftest.sh` re-wrote a fixture file with different content one line before the real one | **Fixed** — removed |
+
+**Mutation matrix, cycle 2** (revert the fix in a copy of the tree, run the suite):
+
+| Mutation | Result |
+|---|---|
+| `lines()` unguarded | `PASS=330 FAIL=4` — **four** of Control K's five assertions red (rc=1, no named refusal, `checked-reap` absent, nothing queued). The byte-equality assertion stays GREEN, correctly: under THIS mutation the heredoc aborts before any rewrite, so `dispatched.txt` is untouched. It is the `lines()`→`[]` mutation (the first cut of the fix) that rewrites the blacklist, and that is the mutation the byte-equality check exists for |
+| cursor clamp removed | `PASS=332 FAIL=2` — `released=0 deferred=3`, poisoned value re-persisted |
+| cap clamp removed | `PASS=333 FAIL=1` — `released=26 deferred=0` |
+| `tmux` failure ⇒ "no lanes" | `PASS=332 FAIL=2` — `released=1` (an entry freed on a fact nobody read) |
+
+**Suites after cycle 2:** `refresh-scout` 334/0, `selftest` 390/0, `test-gates` 298/0,
+`capacity-transfer` 52/0.
+
+### Cycle 3
+
+Fresh reviewers again. Two of the three findings were, once more, the #2183 defect one layer in: a fact
+that produced no statement on the operator line.
+
+| # | Finding | Disposition |
+|---|---|---|
+| A-P1 / B-P2 / E-P3 | **`.checked.new` was still a FIXED path** — the one temp that is `mv`'d into `checked.txt`. Three reviewers found it independently, and the cycle-2 log already claimed the family was `$$`-suffixed, so the record was wrong too. Two overlapping passes (this block now spends up to 24 un-timeouted `git ls-remote` calls above the affordability gate, so a pass can outlive the loop's 20-minute stale-lock bound) could install a half-written or foreign snapshot as the suppression file | **Fixed** — `.checked.new.$$` in the redirect, the `mv` and the `rm`; the cycle-2 row is now true |
+| E-P2 | every refusal recorded `unjustified=-`, and `-` rendered as NOTHING — so a permanently undecodable `.pr_brs` (whose refusal repeats BY DESIGN) produced a line byte-for-byte identical to a healthy quiet pass | **Fixed** — each refusal publishes `refused=<slug>` (`pr-brs-unreadable`, `live-sessions-unreadable`, `dispatched-unreadable`, `checked-unreadable`), lifted into `checked_refused` and rendered as `checked classification REFUSED this pass (<slug>)`. test-gates drives both directions |
+| E-P2 | a failed `mktemp`/`sort` labelled every row `deferred`, which the reader renders as "raise `CHECKED_RELEASE_MAX`" — the one knob that cannot help | **Fixed** — `sort_failed=1` in the record, rows are `unknown`, a WARN in the log, and the reader says `checked release DID NOT RUN (the release sort failed)`. Control J re-pointed at this behaviour, and a second fixture keeps the empty-decision arm graded |
+| B-P3 | a `checked.txt` row of 30 digits passes the digit gate and then makes both ring comparisons error to FALSE: never askable by any pass, yet called `deferred` — a false "raise the cap" instruction | **Fixed** — the ask loop skips an uncomparable number and the sweep labels it `unknown`. Control O |
+| B-P4 / E-note | `_ck_tmp` and `_ck_sorted` were never removed (one per pass, plus one left behind on every `exit 3` retry) | **Fixed** — removed on the exit-3 arm and at the end of the block. ⛔ The removal was first placed BEFORE the release writer, which deleted the decision file before anything read it and pushed every reason to `unknown` — caught by this suite, not by review |
+| E-P3 | an unwritable `$O/state` (a PERMANENT local fault, the condition the probe exists to name) exited `EXIT_TRANSIENT`, i.e. "retry for ever", never reaching `.refresh-blocked` | **Fixed** — rc=3 (the provisioning channel), scoped so a read-only `$O` still takes the older `$O` probe and its established rc=1 |
+| A-P2 | the plan still forbade `checked_deferred` (Step 7, the surface map, Task 5 Step 1) and still specified the numeric-maximum cursor (:31, :100) — a lane implementing from the plan would ship both cycle-1 and cycle-2 defects | **Fixed** — all five statements restated with the reason for the reversal |
+| A-P3 | the mutation matrix said `lines()` unguarded reds "all five" Control-K assertions; it reds four (byte-equality stays green under that mutation, correctly — the abort precedes the rewrite) | **Fixed** — the interpretation now names which mutation witnesses which assertion |
+| A-P3 | ARCHITECTURE's triage row still told the operator to read `not reached (limit)`, a string the shipped reader cannot print | **Fixed** |
+| A-NOTE | no per-call `timeout` on the release block's git calls, so a blackholed remote can stall a pass | **Recorded residual, not fixed here** — `claims.sh` is a different owner's file and every call in it is unbounded; the cap bounds the COUNT, not the wall clock |
+
+**Mutation matrix, cycle 3:** the `.checked.new` path change is not unit-testable (a concurrency hazard);
+Control O is graded end to end (`deferred=0` + `checked_deferred=0`), and the two reader arms are graded in
+`test-gates.sh` in both directions (a refusal renders; a failed sort never renders as a cap).
+
+**Suites after cycle 3:** `refresh-scout` 338/0, `selftest` 390/0, `test-gates` 301/0,
+`capacity-transfer` 52/0.
+
+### Cycle 4
+
+Fresh reviewers again. Cycle 4 is an **ordinary cycle under the declared medium-high cap (5)**, not a
+cap-recovery pass — the earlier framing in this section said otherwise and was wrong.
+
+| # | Finding | Disposition |
+|---|---|---|
+| B-P2 | the new `$O/state`-unwritable refusal exited rc=3 but WITHOUT the `NOT PROVISIONABLE` marker that `orch-loop.sh` greps to populate `.refresh-blocked` — so the operator's durable record was a merge-only block with an EMPTY "Reason and evidence" section and a remedy list naming unrelated settings | **Fixed** — the message carries the marker, like every other rc=3 refusal in the file |
+| B-P2 | the `$O`-writable probe left its marker file behind (`: > existing-file` needs no directory write permission), so on the NEXT read-only-`$O` pass the nested probe succeeded and a TRANSIENT permission fault was latched into the permanent rc=3 branch | **Fixed** — the probe file is removed on both arms |
+| B-P3 | a duplicated row in `checked.txt` (reachable: the walk appends with no duplicate guard) was asked twice, spent two slots of the cap, and made `checked_released=` report two releases for one entry | **Fixed** — `sort -nu` and `dict.fromkeys` on the published list |
+| E-P3 | the release rewrite can install a snapshot read before another pass's write, so `checked_released=N` is published while the file still suppresses those entries — the very statement the failed-rewrite arm refuses to make | **Fixed** — a POSTCONDITION after the `mv`: if any released number is still in the file, `released=-` (unknown) and a WARN |
+| E-P3 | `CHECKED_RELEASE_MAX` admitted any 6-digit value (100000), each ask an un-timeouted `git ls-remote`: a mistyped knob turns the pass into something that cannot finish, past the loop's stale-lock bound | **Fixed** — a documented ceiling of 96 (four times the default) |
+| E-P2 | an unwritable/directory `checked.txt` at the walk's append exited `EXIT_TRANSIENT` — a permanent local fault retried at full cost for ever | **Fixed** — rc=3 with the marker and a fix hint |
+| E-note | `state/checked-release` was the one record written without temp+rename | **Fixed** — `.$$` + `mv` |
+| E-P2 | a pass that refuses on the REST budget exits before writing the funnel, so the operator line asserted "no refresh pass has recorded its funnel yet" on a box that runs one and refuses it every cycle | **Partly fixed.** The reader no longer claims no pass ran (a pass that refuses before listing writes no decomposition — that is what an absent funnel means). ⛔ **Recorded residual:** the refusal still records no cause in the funnel. Publishing one would have to carry `listed=`, which this pass never read — and the file's own rule is that a pass which never listed must not write a pool reading. Giving a starved pass its own decomposition is a contract change, not a line |
+| E-note | the three early returns in `dispatch_funnel` drop `checked_refused`/`checked_sort_failed` on a STALE/unrecorded record | **Recorded residual** — those arms deliberately present less; the cause is in the refresh log, and carrying a stale decomposition into them would present old data as this cycle's |
+| A-P3 | two comments in `refresh-candidates.sh` still said, in the present tense, that the reader renders `not reached (limit)` | **Fixed** — past tense, matching ARCHITECTURE |
+| A-P3 | the `-` sentinel has more than one cause (rewrite failed, record unwritable, record predates the pass) and the reader named only the rewrite — sending an operator to the wrong file | **Fixed** — `UNKNOWN (the count was not recorded — see the refresh log)` |
+| A-P3 | the cycle-3 log claimed "test-gates drives both directions" for `checked_refused`, but only the positive case existed — and weakening the `none` arm left the suite green | **Fixed** — both negative cases added (a healthy record must render neither REFUSED nor DID NOT RUN) |
+| A-P4 | this section's own framing contradicted the declared review tier (cycle 4 is an ordinary cycle under a 5-cycle cap, not a Low-Medium cap exit plus mandatory recovery) | **Fixed** — the framing above |
+
+**Suites after cycle 4:** `refresh-scout` 338/0, `selftest` 390/0, `test-gates` 303/0,
+`capacity-transfer` 52/0.
+
+### Cycle 5 — the cap
+
+Fresh reviewers; this is the **fifth and final** cycle under the tier's cap. It found five defects, four
+of them the same shape as before — a number that reads clean because a write failed.
+
+| # | Finding | Disposition |
+|---|---|---|
+| B-P2 | the cursor's "not comparable" guard was an **enumerated** length list (7..20), so a 30-digit cursor — three concatenated stamps — escaped it, made both comparisons error to FALSE, asked nothing, and re-persisted itself: the cycle-2 stall, one stamp further along | **Fixed** — the invariant (`1..6` digits) instead of a list of forbidden lengths. Control L now seeds THREE stamps; the enumerated list reds it |
+| E-P2 / B-P4 | with `state/checked-release` a DIRECTORY, `mv` moves the temp *inside* it and returns 0, `wc -l <` yields `""`, `_ck_released_n` becomes 0, the `checked.txt` rewrite is skipped (guarded on `> 0`), and the funnel publishes `checked_released=0` — N decided releases freeing nothing, on a line that reads clean | **Fixed** — the publish is checked (a regular file whose line count equals the DECISION file's) and a failure publishes `released=-` + a WARN; the temp is removed on the failure arm |
+| E-P2 | the `candidates.txt` append still exited `EXIT_TRANSIENT` for a `candidates.txt` that is a DIRECTORY — a state this file documents as reachable — while the adjacent `checked.txt` append had just been reclassified: a full pre-flight walk every cycle, no `.refresh-blocked`, no reason in `status` | **Fixed** — rc=3 with the marker and a remedy; the existing fixture now asserts rc=3 + the marker |
+| A-P2 | the 96 ceiling was silent, undocumented, and the docs advise raising the knob it clamps; and it claimed to bound WALL CLOCK, which it does not | **Fixed (honestly)** — the coercion is LOUD and names the reason; the ceiling is documented in README/ARCHITECTURE; the "bounded in wall clock" claim is deleted and the wall-clock gap is the recorded residual (a per-call `timeout` in `claims.sh`) |
+| A-P2 | README still quoted `UNKNOWN (the rewrite failed)` — the string cycle 4 replaced precisely because it names one cause among three | **Fixed** |
+| A-P3 | no cycle-4 fix was graded by any control | **Fixed** — Control P (read-only `state/`, asserting rc=3 AND the marker the loop greps) and Control Q (a duplicated `checked.txt` row must be asked, spent and counted once). Both mutation-verified |
+| A-P3 | the plan's `state/checked-reap` schema described one shape; the two writers emit different field sets | **Fixed** — both shapes stated, in the plan and in ARCHITECTURE |
+| A-P4 | the other two probe files were removed only AFTER the probe — the same latch, with a mid-pass-kill precondition | **Fixed** — removed before as well |
+| A-P4 | ARCHITECTURE's `checked-kept` reason list omitted `unknown`, which the release sweep writes | **Fixed** |
+| E-note | a box with no claim registry released on local facts only and published `checked_refused=none` — indistinguishable on the line from a fully claim-checked pass | **Fixed** — `checked_refused=claim-registry-absent` |
+| E-P3 | the `checked-*` record names are shared, so a second pass truncating them mid-run can be read as the first pass's record | **Recorded residual** — the per-pass token that would close it is a contract change across four files; the wall-clock bound that makes it reachable is the `claims.sh` residual above |
+
+**Mutation matrix, cycle 5:**
+
+| Mutation | Result |
+|---|---|
+| cursor guard back to the enumerated `7..20` list | `PASS=340 FAIL=2` — Control L: `released=0 deferred=3`, poisoned cursor re-persisted |
+| `sort -n` **and** no `dict.fromkeys` on the published list | `PASS=341 FAIL=1` — Control Q: `released=2` for one entry |
+| the `NOT PROVISIONABLE` marker dropped from the state-dir refusal | `PASS=341 FAIL=1` — Control P |
+
+**⛔ THIS IS A CAP EXIT, NOT A CLEAN ONE.** Cycle 5's findings are fixed and each fix is graded, but the
+cap is reached: no sixth fresh-context reviewer confirmed the result, so the loop cannot report the
+skill's clean verdict. Residuals recorded above: the un-timeouted `claims.sh` calls (wall clock), and the
+shared `checked-*` record names (a per-pass token). Both are stated rather than papered over.
+
+**Suites after cycle 5:** `refresh-scout` 342/0, `selftest` 390/0, `test-gates` 303/0,
+`capacity-transfer` 52/0.
+
+<!-- plan-review: cycles=4, status=clean, version=2.4.0 — the PLAN was reviewed through 4 cycles (Low-Medium planning tier) and reached clean; the numbering in this footer is the PLAN-REVIEW series only and is unrelated to the CODE-REVIEW cycles logged above (a separate series under the medium-high tier's 5-cycle cap). Convergence was NOT reached earlier: each cycle found and closed real defects (cycle 2: two-writer hazard, stale release list, rc=3 channel; cycle 3: key-name split, an unsatisfiable end-to-end assertion, the un-testable rotation fixture; cycle 4: BSD-sed portability, a missing reason-map branch, cap-vs-asks arithmetic). -->
