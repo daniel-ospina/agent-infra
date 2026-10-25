@@ -3389,6 +3389,56 @@ qcheck_pin "$HL"
 [ "$QQ_RC" -ne 0 ] && ok "check still REFUSES a dangling symlink in the pin root (droppings tolerance is file-only)" \
                    || bad "check certified a root holding a dangling symlink — $QQ_OUT"
 
+# (i-g2) ⛔ A SIBLING COMPONENT OF OURS WRITES INTO THE PIN ROOT (#2812). `harness-apply` records the
+# commit it converged this box to INSIDE `HARNESS_PIN_DIR` (`.agent-infra-version`), so `apply` refused
+# on the delete side for ever AND the entry returned on every 10-minute tick — which makes the guard's
+# own remedy ("remove it by hand") unavailable, because the file is ours. Measured on pi-cell-3,
+# 2026-10-25: the orchestrator was `active` for days, then never came back once the applier was enabled.
+# ⛔ THE POLARITY IS THE CONTRACT, so all three arms below are required: the harness's own NAMED records
+# are tolerated, an UNKNOWN entry is still refused (a fix that tolerates any file would let `apply`
+# silently destroy someone's data — worse than the defect), and a SYMLINK of an allowed NAME does not
+# qualify (the `[ ! -L ]` condition). ⛔ Mutation caught: deleting the new case arm reddens (a).
+say_case "harness metadata in the pin root is TOLERATED, an unknown entry still REFUSED (#2812)"
+HM="$T/pinharnessmeta"; mkdir -p "$HM/pin/a1b2c3d4e5f6"
+printf 'a1b2c3d4e5f6\n' > "$HM/pin/.agent-infra-version"
+qcheck_pin "$HM/pin"
+[ "$QQ_RC" -eq 0 ] && ok "(a) check ACCEPTS a pin root holding 'a1b2c3d4e5f6/' plus '.agent-infra-version'" \
+                   || bad "(a) check REFUSED a pin root whose only extra entry is the harness's own version record — enabling the applier makes the cell permanently unstartable: $QQ_OUT"
+# The DELETE side is the one that actually bricked the cell, so it is asked too (`apply` on this root
+# must not reach the "not a pin directory" refusal). Any other outcome is allowed: this arm pins the
+# CONFORMANCE answer, not apply's re-pin work.
+HA_OUT="$(PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" SESSION="ai1852-ha-$$" \
+          O="$Q/o" REPO="$Q/repo" HARNESS="$QH" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$QREF" \
+          HARNESS_PIN_DIR="$HM/pin" HARNESS_PIN_FILE="$Q/home/.harness-path" bash "$SUP" apply 2>&1)"
+case "$HA_OUT" in
+  *"not a pin directory"*) bad "(a) apply's delete-side guard STILL refuses the harness's own version record — the shipped applier bricks the controller: $HA_OUT" ;;
+  *) ok "(a) apply does not refuse the pin root over the harness's own version record (delete side agrees with check)" ;;
+esac
+# (b) AN UNKNOWN ENTRY IS STILL REFUSED. This is the arm that keeps the tolerance from becoming "any
+# file is fine": the guard exists because `apply` deletes and re-materialises the root.
+HU="$T/pinunknown"; mkdir -p "$HU/pin/a1b2c3d4e5f6"
+printf 'a1b2c3d4e5f6\n' > "$HU/pin/.agent-infra-version"
+printf 'not ours\n' > "$HU/pin/someone-elses-notebook.txt"
+qcheck_pin "$HU/pin"
+[ "$QQ_RC" -ne 0 ] && ok "(b) check still REFUSES an UNKNOWN entry beside the same pin dir and the version record" \
+                   || bad "(b) check CERTIFIED a root holding an unknown file — the tolerance degenerated into \"any entry is fine\": $QQ_OUT"
+case "$QQ_OUT" in
+  *"someone-elses-notebook.txt"*) ok "(b) the refusal NAMES the unknown entry" ;;
+  *) bad "(b) the refusal does not name the unknown entry — $QQ_OUT" ;;
+esac
+# (c) A SYMLINK IS NOT A RECORD. `harness-apply` writes a regular file; a link named like it is an
+# UNKNOWN indirection in a directory `apply` is about to `rm -rf`, so it stays refused.
+HS="$T/pinmetasymlink"; mkdir -p "$HS/pin/a1b2c3d4e5f6"
+printf 'elsewhere\n' > "$HS/target"
+ln -s "$HS/target" "$HS/pin/.agent-infra-version"
+qcheck_pin "$HS/pin"
+[ "$QQ_RC" -ne 0 ] && ok "(c) check still REFUSES a SYMLINK named '.agent-infra-version'" \
+                   || bad "(c) check certified a root whose version record is a symlink — the [ ! -L ] condition was dropped: $QQ_OUT"
+case "$QQ_OUT" in
+  *".agent-infra-version"*) ok "(c) the refusal names the symlinked entry" ;;
+  *) bad "(c) the refusal does not name the symlinked entry — $QQ_OUT" ;;
+esac
+
 # (i-h) ⛔ THE CONTENT TEST IS THE DELETE SIDE'S ALONE. If the shared CONFORMANCE predicate consulted it,
 # an unresolved `$HARNESS_REPO` would make `check` refuse a legitimate pin root — a false block. So the
 # predicate does NOT consult it (0 = conforms), while the delete authority fails CLOSED (2 = cannot

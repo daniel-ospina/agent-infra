@@ -122,9 +122,14 @@
 #     file heals on the next read.
 #   - the retry is per WHOLE COMMAND. Below `gh-limit.py`'s own 4 attempts this MULTIPLIES: a
 #     call can execute up to 3 (this gate) x 4 (that layer) times, including non-idempotent
-#     creates and comments. "The tighter layer wins" is true for concurrency and for a single
-#     wait, and FALSE for attempts. A caller that declared its own bound suppresses the sleep
-#     entirely (`AGENT_GH_GATE_NO_WAIT=1`, or gh-limit's `GH_LIMIT_NO_WAIT=1`).
+#     creates and comments — the transport arm below does NOT add to a WRITE (it is retried zero times
+#     on a transport failure), so a write's bound stays 3 x 4 = 12. For a READ the arms are additive:
+#     see the transport bullet (5 x 4 = 20). "The tighter layer wins" is true for concurrency and for
+#     a single wait, and FALSE for attempts. A caller that declared its own bound suppresses the
+#     RATE-LIMIT wait entirely (`AGENT_GH_GATE_NO_WAIT=1`, or gh-limit's `GH_LIMIT_NO_WAIT=1`); it
+#     does NOT suppress the transport retry's 1 s + 3 s, which is two orders below those budgets and
+#     is the whole fix for a bounded caller that would otherwise lose the call to a dropped socket
+#     (see the transport bullet).
 #   - `AGENT_GH_GATE_SLOT` is FORGEABLE: any caller that can set its environment may point it at
 #     an existing directory and take no slot at all. It is an INTERNAL inheritance seam between
 #     this shim and the child it spawns, not a security boundary — the same class as
@@ -138,6 +143,59 @@
 #     permissions error is not retried (a mutating command must not run twice). A
 #     genuinely rate-limit-shaped text that is NOT one — impossible to distinguish in
 #     principle from the real thing — can cost one extra attempt.
+#   - ⛔ THE TRANSPORT RETRY (#2148) IS A *SECOND* RETRY ARM, AND THE THIRD ATTEMPT MULTIPLIER.
+#     It exists for the failure measured on 2026-10-24: two lanes died to ONE network blip
+#     (`Connection error.` -> rc=1 -> lane EXIT), and three identical `gh api rate_limit` calls
+#     two seconds apart on cell-1 returned ok / ok / `error connecting to api.github.com` with
+#     2431 of 5000 requests still in hand — a per-CALL, intermittent transport fault, which is
+#     the shape a single-shot call cannot survive and a retry can. It is bounded at 3 attempts
+#     with a 1 s then 3 s backoff (<= 4 s added latency). ⛔ THE ARMS ARE ADDITIVE, NOT
+#     MULTIPLICATIVE: they share ONE loop, so a single shim invocation issues at most
+#     1 + (MAX_ATTEMPTS-1) + (TRANSPORT_ATTEMPTS-1) = 5 executions — and `gh-limit.py` above this
+#     layer may make 4 of those invocations, so the real worst case for the SAME READ is 20.
+#     STATED, not silent, and READS only (next bullet).
+#   - ⛔ A MUTATION IS RETRIED ZERO TIMES ON A TRANSPORT FAILURE. A dropped connection may mean the
+#     write SUCCEEDED (GitHub applied it, then the socket died), and a retry would then perform it
+#     twice — two comments, two merges, two releases. The classification is argv-level (this
+#     layer's whole advantage: `-X POST` is ONE token by now) and it is a WHITELIST: `gh api` is
+#     retried only when it is provably a GET (no `-X`, no `-f/-F/--field/--raw-field/--input`), and
+#     any `graphql` spelling is refused — `graphql`, `/graphql`, or a full
+#     `https://api.github.com/graphql?query=…` URL. A query can BE the `mergePullRequest` mutation
+#     and a file/stdin body cannot be classified at all (#984), so the match is on the WHOLE
+#     positional, not a prefix. Other commands are retried only when the verb is one of gh's read
+#     verbs; an UNRECOGNISED shape is NOT retried — its failure mode is one flaky-call failure,
+#     exactly the pre-change behaviour, never a write run twice.
+#   - ⛔ AND ITS RETRY LINE NEVER TOUCHES A SUCCESSFUL CALL'S STDERR, for the reason the pacing
+#     notes do not (see the ⛔ above `gate_note`). The line is written to `events.log` on EVERY
+#     retry (greppable: `gh-shim: transport retry 1/3`) and replayed to stderr only when the call
+#     finally FAILS — which is exactly the case that kills a lane, so the lane log still shows it;
+#     a call that RECOVERS leaves stderr byte-clean, which is what keeps every `--json` read above
+#     this layer parseable (`gh-rest/gh` does `2>&1 | jq`). This is a deliberate departure from a
+#     reading of #2148 that asked for a stderr line per retry: that line would turn every recovered
+#     call into a JSONDecodeError upstairs, i.e. it would deliver the retry and lose its benefit.
+#     Pinned in both directions by `tests/gh-shim-retry/run.sh` §1/§2 and `tests/gh-shim/run.sh`
+#     §14(a).
+#   - ⛔ STDOUT IS CAPTURED PER ATTEMPT, AND ONLY THE ATTEMPT WHOSE RC IS REPORTED IS REPLAYED. That is
+#     the other half of a correct retry, not a buffering preference: `connection reset` and
+#     `unexpected eof` leave EARLIER BYTES on stdout, so a streamed retry of `gh api --paginate`
+#     returns rc=0 with page 1 from the FAILED attempt in front of the whole successful answer —
+#     duplicated/half-written JSON, a double-counted tree in `atomic-land.sh`, and a false failure in
+#     any `--json` reader. Consequences to know, all stated rather than discovered: (a) the capture
+#     is a FILE in the gate workdir for the life of the call, so a command that PRINTS A SECRET
+#     (`gh auth token`) now touches disk where it used to be streamed — created `0600` inside the
+#     `0700` gate dir and removed on every exit path this layer controls (the exit trap, TERM/INT/HUP),
+#     and it survives a SIGKILL, exactly as the pre-existing STDERR capture already does; (b) a call
+#     whose stdout is a TERMINAL is still captured (gh sees a file, so its own colour/pager
+#     autodetection is off and output arrives at exit) — a terminal on STDIN is what selects the old
+#     streaming, never-retried branch, unchanged by this layer; (c) an output larger than the disk is
+#     now a real bound on the call.
+#   - ⛔ `rc=1` WITH EMPTY STDERR IS *NOT* A TRANSPORT FAILURE, though #2148's brief listed it. gh
+#     exits 1 silently ON PURPOSE (`cmdutil.SilentError`) exactly where the answer is a VERDICT:
+#     `gh pr checks` when checks FAILED, `gh run view --exit-status` when the run failed. Both are
+#     whitelisted reads and `pr checks` is one of the fleet's hottest, so retrying that shape would
+#     re-run every red PR three times and write a false `transport retry` cause into events.log. The
+#     failures actually MEASURED (2026-10-24) all print, so the text signature is the whole test.
+#     `tests/gh-shim-retry/run.sh` §8 pins the absence.
 #   - pacing adds latency by design: the default is at most 2 calls in flight and 250 ms
 #     between starts, so ~50 sweep calls cost ~12 s instead of ~0 s. That trade is the
 #     point of the gate; `AGENT_GH_GATE_INTERVAL_MS=0` widens the throughput at the cost
@@ -608,6 +666,7 @@ cleanup_workdir() {
   # `set -u` an unguarded "$errf" would abort the cleanup it exists to perform.
   [ -n "${NOTEF:-}" ] && rm -f "$NOTEF" 2>/dev/null
   [ -n "${errf:-}" ] && rm -f "$errf" 2>/dev/null
+  [ -n "${outf:-}" ] && rm -f "$outf" 2>/dev/null
   [ "${WORKDIR_OWNED:-0}" -eq 1 ] && [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR" 2>/dev/null
   return 0
 }
@@ -825,6 +884,133 @@ pace_tick() {
   return 0
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# THE TRANSPORT RETRY (#2148) — a dropped connection is not a decision.
+#
+# MEASURED (2026-10-24). cell-3 lane `mainredai`: `[http-pool-hygiene] rotated connection pool
+# (message_end: Connection error.; rotation #3)`, then `Connection error.`, then the reflect hook
+# exited rc=1 — the lane's work was lost. Lane `confA2` died the same way two bursts later. cell-1,
+# three IDENTICAL `gh api rate_limit` calls two seconds apart: `ok 704ms remaining=2431`, `ok 891ms
+# remaining=2419`, `FAIL error connecting to api.github.com`. Quota was healthy, so the fault is
+# TRANSPORT, and cell-3's next four calls all succeeded — intermittent per call, which a single-shot
+# `gh` cannot survive and a retry can.
+#
+# WHAT IS NEVER RETRIED HERE:
+#   * a response GitHub produced — any HTTP 4xx/5xx, `422`, `Not Found`, a usage error. Retrying a
+#     422 turns one honest refusal into three; retrying a 4xx is how a real error is mistaken for
+#     flake.
+#   * a RATE-LIMIT refusal — that is a DECISION the pacing gate above already owns, with its own
+#     wait and its own shared cooldown. Retrying it here would hammer through the ceiling that gate
+#     exists to hold, so the transport arm refuses on the same signatures `rate_limited` matches.
+#   * any command that might MUTATE — see the STATED LIMITS bullet; zero retries by default.
+TRANSPORT_ATTEMPTS=3   # total attempts, NOT retries: retries 1 and 2, then the caller's rc
+
+# Is this stderr a TRANSPORT failure? Prints the matched reason (the parenthetical of the log line)
+# and returns 0 on a match, fails otherwise. A TEXT test for the same reason `rate_limited` is one:
+# stderr is all `gh` leaves.
+transport_reason() {
+  local f="$1" rc="$2" hit
+  [ "$rc" -ne 0 ] || return 1
+  # ⛔ AN HTTP RESPONSE IS NEVER TRANSPORT, AND THIS IS CHECKED FIRST. If any status reached stderr,
+  # GitHub ANSWERED — no transport-looking word inside an error body may reclassify it, and the
+  # rate-limit signatures are included here so this arm can never pick up a decision that the gate's
+  # own arm owns.
+  if [ -s "$f" ] && grep -Eqi 'http[ /:]?[0-9][0-9][0-9]|status code:?[[:space:]]*[0-9][0-9][0-9]|not found|bad credentials|unprocessable|api rate limit|secondary rate limit|abuse detection|retry-after:' "$f" 2>/dev/null; then
+    return 1
+  fi
+  if [ ! -s "$f" ]; then
+    # ⛔ THE "EMPTY STDERR" SHAPE IS *NOT* A TRANSPORT FAILURE — MEASURED, AND IT MATTERS. gh exits 1
+    # with NO message on purpose (`cmdutil.SilentError`) precisely where the ANSWER is a verdict:
+    # `gh pr checks` does it when checks FAILED, `gh run view --exit-status` when the run failed.
+    # Both are on this layer's read whitelist and `pr checks` is one of the fleet's hottest reads, so
+    # treating rc=1+empty stderr as a blip would re-run EVERY RED PR three times, add 4 s to it and
+    # write `transport retry … (no response)` into events.log — a false cause on the surface the
+    # runbook tells operators to read. Every transport failure actually measured (2026-10-24) PRINTS
+    # (`error connecting to api.github.com`, `Connection error.`, `i/o timeout`), so the text test
+    # above is the whole signature and this arm stays closed.
+    return 1
+  fi
+  # `-m1` and NOT `| head -1`: a quiet early-exiting consumer in a pipeline reads as FAILURE under
+  # `pipefail` once stderr outgrows the pipe buffer (the #841 class this file refuses elsewhere).
+  hit="$(grep -oiE -m1 'error connecting|connection error|connection reset|i/o timeout|tls handshake timeout|no such host|temporary failure in name resolution|unexpected eof' "$f" 2>/dev/null)"
+  [ -n "$hit" ] || return 1
+  printf '%s' "$hit"
+  return 0
+}
+
+# ⛔ A TRANSPORT RETRY RE-RUNS THE WHOLE ARGV, SO "MAY THIS CALL WRITE?" IS THE SAFETY QUESTION.
+# A WHITELIST, not a blacklist: an unrecognised shape is NOT retried (cost: one flaky-call failure,
+# i.e. today's behaviour), whereas a blacklist missing one spelling runs a write twice.
+read_only_call() {
+  local a w1="" w2="" prev="" method="" body=0
+  for a in "$@"; do
+    case "$a" in
+      --method) prev="method" ;;
+      --method=*) method="${a#--method=}" ;;
+      -X) prev="method" ;;
+      -X?*) method="${a#-X}" ;;
+      # ⛔ A FLAG'S VALUE IS NOT A POSITIONAL. It matters most for flags that PRECEDE the
+      # subcommand: `gh -R o/r pr view 1` put `o/r` in the w1 slot, so the call read as "not pr" and
+      # was silently not retried — a shape the fleet actually issues. These take a value; skip it.
+      -H|--header|-q|--jq|-t|--template|--cache|--hostname|-p|--preview|-R|--repo) prev="flagval" ;;
+      -f|--field|-F|--raw-field|--input) body=1; prev="flagval" ;;
+      -f?*|-F?*|--field=*|--raw-field=*|--input=*) body=1 ;;
+      -*) ;;
+      *)
+        case "$prev" in
+          method) method="$a" ;;
+          flagval) : ;;
+          *)
+            if [ -z "$w1" ]; then w1="$a"
+            elif [ -z "$w2" ]; then w2="$a"
+            fi ;;
+        esac
+        prev="" ;;
+    esac
+  done
+  case "$w1" in
+    api)
+      # `graphql` can BE the merge mutation, and a file/stdin body is unclassifiable (#984) — never
+      # retried. `-f/-F/--input` imply POST even with no `-X`; with no method at all it is a GET.
+      # `graphql` — ANY spelling: `graphql`, `/graphql`, a full `https://api.github.com/graphql?…` URL.
+      # A prefix test let the path/URL forms through, contradicting the STATED LIMITS bullet.
+      case "$w2" in *graphql*) return 1 ;; esac
+      [ "$body" -eq 0 ] || return 1
+      case "${method:-GET}" in GET|get|HEAD|head) return 0 ;; esac
+      return 1 ;;
+    # gh's READ verbs. Anything absent here — `pr merge`, `pr create|comment|ready`, `issue close`,
+    # `release create`, `workflow run`, `variable set`, `auth login`, … — is NOT retried.
+    pr)       case "$w2" in view|list|checks|diff|status) return 0 ;; esac ;;
+    issue)    case "$w2" in view|list) return 0 ;; esac ;;
+    run)      case "$w2" in view|list) return 0 ;; esac ;;
+    workflow) case "$w2" in view|list) return 0 ;; esac ;;
+    release)  case "$w2" in view|list) return 0 ;; esac ;;
+    repo)     case "$w2" in view|list) return 0 ;; esac ;;
+    label|secret|variable|cache|gist) case "$w2" in list|view) return 0 ;; esac ;;
+    search)   return 0 ;;
+    auth)     case "$w2" in status) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+# The retry is VISIBLE — in events.log always, and on stderr ONLY when the call finally fails (the
+# ⛔ above `gate_note`: a line beside a good answer is a JSONDecodeError for `gh-rest/gh`, and a
+# reported FAILURE for a `pr merge` GitHub already performed).
+transport_note() {
+  local line="$1"
+  [ -n "${NOTEF:-}" ] && printf 'gh-shim: %s\n' "$line" 2>/dev/null >> "$NOTEF"
+  # ⛔ REDIRECT ORDER: `>> file` then `2>/dev/null` would send a FAILED redirection to the caller's
+  # stderr — the exact contamination this function exists to avoid.
+  if [ -n "${GATE_DIR:-}" ] && [ -d "$GATE_DIR" ]; then
+    printf '%s gh-shim: %s\n' "$(date -u +%s 2>/dev/null)" "$line" 2>/dev/null >> "$GATE_DIR/events.log"
+  else
+    mkdir -p "${HOME:-${TMPDIR:-/tmp}}/.pi/agent" 2>/dev/null
+    printf '%s gh-shim: %s\n' "$(date -u +%s 2>/dev/null)" "$line" 2>/dev/null \
+      >> "${HOME:-${TMPDIR:-/tmp}}/.pi/agent/gh-gate-degraded.log"
+  fi
+  return 0
+}
+
 # Is this stderr a RATE-LIMIT refusal? Deliberately NOT "any 403": a permissions 403 is
 # not a burst, and retrying a mutating command on it would run the command twice.
 rate_limited() {
@@ -918,10 +1104,11 @@ gate_init() {
 # exec cannot inspect stderr, so it can neither honour `retry-after` nor tell a burst
 # refusal from a real failure.
 run_paced() {
-  local rc=0 tries=0 rem wait_ms interactive=0 errf adm=0
+  local rc=0 tries=0 ttries=0 treason="" rem wait_ms interactive=0 errf="" outf="" adm=0
   gate_init
   NOTEF="$WORKDIR/notes.$$"
   errf="$WORKDIR/err.$$"
+  outf="$WORKDIR/out.$$"
   CHILD_PID=""
   trap 'on_exit' EXIT
   # ⛔ THE CALLER'S TERM MUST REACH `gh`. A bare fork (the obvious way to read stderr) leaves the
@@ -930,10 +1117,16 @@ run_paced() {
   # from the API docs). Forward the signal to the child we are waiting on.
   trap 'on_signal' TERM INT HUP
   # An INTERACTIVE call (a human at a terminal: `gh auth login`, and `gh` prompts on STDERR while
-  # READING STDIN) is paced like every other call but never retried and never stderr-captured —
-  # capturing the prompt would leave the human staring at a blank screen while gh waits for input.
-  # Keyed on STDIN, which is what gh reads: `gh pr create 2>log` also prompts, and would render
-  # invisibly on the capture path.
+  # READING STDIN) is paced like every other call but never retried and never captured — capturing
+  # the prompt would leave the human staring at a blank screen while gh waits for input. Keyed on
+  # STDIN, which is what gh reads: `gh pr create 2>log` also prompts, and would render invisibly on
+  # the capture path.
+  # ⛔ AND STDOUT IS CAPTURED, WHICH A HUMAN AT A TERMINAL CAN NOTICE: gh sees a FILE rather than a
+  # terminal, so its own colour and pager autodetection are off, and the output arrives when the call
+  # finishes instead of streaming. That is the price of a retry that does not duplicate output (see
+  # the capture block below), and it is stated here rather than discovered. It does NOT change WHICH
+  # calls are retried: a terminal on stdin still takes the un-retried streaming branch, exactly as it
+  # did before this change (and it keeps the rate-limit wait it always had).
   if [ -t 0 ]; then interactive=1; fi
   if [ "$GATE_ON" -eq 0 ]; then
     gate_note "cannot use the gate directory ($GATE_DIR) — running UNGATED (announced); retries still apply"
@@ -992,8 +1185,8 @@ run_paced() {
     # exec, so `2>"$errf"` on an unusable path (read-only fs, FULL disk) means `gh` NEVER RUNS and
     # the caller gets rc=1 — a gate that is meant to be a courtesy turning its own disk problem
     # into a total gh outage, while the note above it claims the call ran ungated.
-    if ! : 2>/dev/null > "$errf"; then
-      gate_note "cannot create the stderr capture ($errf) — running this call UNGATED, with no retry"
+    if ! : 2>/dev/null > "$errf" || ! : 2>/dev/null > "$outf"; then
+      gate_note "cannot create the capture files ($errf, $outf) — running this call UNGATED, with no retry"
       "$REAL" "$@"
       rc=$?
       release_slot
@@ -1001,33 +1194,81 @@ run_paced() {
       cleanup_workdir
       exit "$rc"
     fi
+    # ⛔ THE CAPTURE IS OWNER-ONLY (`0600`). A command that PRINTS A SECRET — `gh auth token` is the
+    # one that matters — now has its stdout in a FILE for the life of the call, where it used to be
+    # streamed. The parent gate dir is 0700; this narrows it again, and the exit trap / TERM/INT/HUP
+    # remove the file on every path this layer controls. A SIGKILL leaves it behind, exactly as the
+    # pre-existing STDERR capture already can (STATED LIMITS).
+    chmod 600 "$outf" "$errf" 2>/dev/null
     # `<&0` is REQUIRED: a background job in a non-interactive shell is handed /dev/null for stdin
     # by POSIX, which would break `gh api --input -` (the documented REST fallback).
-    "$REAL" "$@" 2>"$errf" <&0 &
+    # ⛔ STDOUT IS CAPTURED PER ATTEMPT, AND THAT IS LOAD-BEARING (review of #2768, P1). The failing
+    # transport signatures here — `connection reset` and `unexpected eof` — are exactly the ones that
+    # leave EARLIER BYTES on stdout. With stdout streamed straight to the caller, a retried
+    # `gh api --paginate` returned rc=0 with page 1 from the FAILED attempt followed by the whole
+    # successful answer (duplicated/half-written JSON), so `atomic-land.sh`'s tree count double-counts
+    # and a `--json` reader gets a JSONDecodeError from a call that SUCCEEDED. Capturing means a
+    # discarded attempt's output never reaches the caller; only the attempt whose rc we report is
+    # replayed, below.
+    "$REAL" "$@" >"$outf" 2>"$errf" <&0 &
     CHILD_PID=$!
     wait "$CHILD_PID"
     rc=$?
     CHILD_PID=""
-    if [ "$rc" -eq 0 ] || [ "$tries" -ge $(( MAX_ATTEMPTS - 1 )) ] || ! rate_limited "$errf"; then
-      break
+    [ "$rc" -eq 0 ] && break
+    # ── ARM 1: RATE LIMIT (unchanged) ────────────────────────────────────────────────────────────
+    if [ "$tries" -lt $(( MAX_ATTEMPTS - 1 )) ] && rate_limited "$errf"; then
+      tries=$(( tries + 1 ))
+      wait_ms="$(retry_wait_ms "$errf" "$tries")"
+      # Share the window with the WHOLE box before deciding whether to sleep in it.
+      [ "$GATE_ON" -eq 1 ] && set_cooldown_ms "$wait_ms"
+      # ⛔ A CALLER THAT DECLARED ITS OWN BOUND IS NOT SLEPT INSIDE. gh-limit.py sets
+      # GH_LIMIT_NO_WAIT=1 precisely so a caller with a 60-420 s timeout gets the refusal back AT
+      # ONCE and can report RATE-LIMITED instead of STALL — a lower layer must not override the
+      # upper layer's declared policy. The cooldown above is still written, so the box benefits.
+      if no_wait_wanted; then
+        gate_note "caller set NO_WAIT — returning the refusal at once instead of sleeping $(( (wait_ms + 999) / 1000 ))s (the cooldown is shared)"
+        break
+      fi
+      release_slot
+      gate_note "GitHub refused this call (rate limit) — waiting $(( (wait_ms + 999) / 1000 ))s, then retrying (retry $tries of $(( MAX_ATTEMPTS - 1 )))"
+      sleep_ms "$wait_ms"
+      continue
     fi
-    tries=$(( tries + 1 ))
-    wait_ms="$(retry_wait_ms "$errf" "$tries")"
-    # Share the window with the WHOLE box before deciding whether to sleep in it.
-    [ "$GATE_ON" -eq 1 ] && set_cooldown_ms "$wait_ms"
-    # ⛔ A CALLER THAT DECLARED ITS OWN BOUND IS NOT SLEPT INSIDE. gh-limit.py sets
-    # GH_LIMIT_NO_WAIT=1 precisely so a caller with a 60-420 s timeout gets the refusal back AT
-    # ONCE and can report RATE-LIMITED instead of STALL — a lower layer must not override the
-    # upper layer's declared policy. The cooldown above is still written, so the box benefits.
-    if no_wait_wanted; then
-      gate_note "caller set NO_WAIT — returning the refusal at once instead of sleeping $(( (wait_ms + 999) / 1000 ))s (the cooldown is shared)"
-      break
+    # ── ARM 2: TRANSPORT (#2148) ─────────────────────────────────────────────────────────────────
+    # `rate_limited` is re-tested here so a rate-limit refusal that has spent its own attempts is
+    # NOT picked up by this arm: a refusal is a decision, and this arm exists for a dropped socket.
+    if [ "$ttries" -lt $(( TRANSPORT_ATTEMPTS - 1 )) ] && treason="$(transport_reason "$errf" "$rc")" \
+       && ! rate_limited "$errf" && read_only_call "$@"; then
+      ttries=$(( ttries + 1 ))
+      # 1 s, then 3 s — <= 4 s in total, and every value is a literal so no knob can unbound it.
+      case "$ttries" in 1) wait_ms=1000 ;; *) wait_ms=3000 ;; esac
+      # ⛔ NO COOLDOWN AND NO `no_wait_wanted` GATE. A transport blip is not a shared window, so
+      # nothing here may park the box the way a rate-limit refusal does; and a 1 s/3 s backoff is
+      # two orders below the 60-420 s budgets the NO_WAIT contract exists to protect, so suppressing
+      # it would delete the fix for exactly the bounded callers that can least afford a dead read.
+      transport_note "transport retry $ttries/$TRANSPORT_ATTEMPTS ($treason)"
+      release_slot
+      sleep_ms "$wait_ms"
+      continue
     fi
-    release_slot
-    gate_note "GitHub refused this call (rate limit) — waiting $(( (wait_ms + 999) / 1000 ))s, then retrying (retry $tries of $(( MAX_ATTEMPTS - 1 )))"
-    sleep_ms "$wait_ms"
+    # Name the exhaustion — but ONLY when the call ACTUALLY died of transport, and only with the
+    # attempt count that really happened (review of #2768, P2): a transport blip followed by an
+    # honest `HTTP 422` used to print "exhausted after 3 attempts" for a 2-attempt call whose last
+    # failure was GitHub answering. That is a false cause in the operator's diagnostic surface.
+    if [ "$ttries" -gt 0 ] && transport_reason "$errf" "$rc" >/dev/null; then
+      # ⛔ THE COUNT IS EVERY ATTEMPT THIS LOOP MADE, NOT THE TRANSPORT ONES. The two arms share this
+      # loop, so a rate-limit retry before the transport ones made `ttries + 1` UNDERSTATE the real
+      # count (measured: `ratelimit, connect, connect, connect` = 4 invocations reported as 3).
+      transport_note "transport failure persisted after $(( tries + ttries + 1 )) attempt(s) — returning rc=$rc"
+    fi
+    break
   done
   release_slot
+  # ⛔ THE ATTEMPT WHOSE RC WE REPORT IS THE ATTEMPT WHOSE OUTPUT THE CALLER GETS — once. Nothing is
+  # replayed from a discarded attempt (see the capture comment above), and stdout keeps its own
+  # stream so a `--jq`/`--json` reader above this layer sees exactly one document.
+  [ -s "$outf" ] && cat "$outf" 2>/dev/null
   [ -s "$errf" ] && cat "$errf" >&2 2>/dev/null
   flush_notes "$rc"
   cleanup_workdir
