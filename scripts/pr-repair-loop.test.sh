@@ -201,30 +201,49 @@ echo "── pr-doctor's repo seams: the cell's checkout is an INPUT, not a macO
 # `pr-doctor.py` shipped `REPO = "daniel-ospina/tortoise"` and `$HOME/Documents/GitHub/tortoise`. On a
 # cell that path does not exist, so every git read and every worktree add failed against a directory two
 # shipped defaults invented — and it reported the result as `UNREADABLE`, indistinguishable from an empty
-# queue. The seam is asserted directly (the module is loaded by path; its name has a dash):
-# a caller that sets neither variable must get the previous values byte for byte, and a caller that sets
-# them must get exactly what it set.
-seam_rc=0
-seam_out="$(PR_DOCTOR_REPO=example/fork PR_DOCTOR_REPO_DIR=/tmp/some-checkout python3 - "$HERE/pr-doctor.py" <<'PY' 2>/dev/null
+# queue. The seam is asserted directly (the module is loaded by path; its name has a dash).
+# ⛔ RECONCILED WITH #2280, WHICH LANDED SECOND (2026-10-24): the pair is honoured as EVIDENCE -- rank
+# 2 of `resolve_repo`, just below `--repo` -- and the macOS LITERALS ARE GONE. So a caller that sets
+# them gets exactly what it set, and a caller that sets NEITHER now gets a REFUSAL (exit 2), not the
+# previous values byte for byte: a default that stands in for a repo nobody named is the defect
+# #2235/#9388 measured (a clean `nothing to do` over a repo nobody asked about). Both halves are
+# pinned here, because the seam silently dropping out is one bug and the default silently coming
+# back is the other.
+# ⛔ THE PROBE IS A REAL FILE, NOT A HEREDOC INSIDE `$( )`. macOS ships bash 3.2, whose parser
+# mis-tracks `$(` when the substitution contains a here-document (a `)` inside the body ends it), so the
+# inline form made this whole suite a syntax error past that line -- the seam this arm guards silently
+# swallowed every assertion after it.
+seam_probe="$TMP/seam-probe.py"
+cat >"$seam_probe" <<'PY'
 import importlib.util, sys
+mode = sys.argv[2] if len(sys.argv) > 2 else "seam"
 spec = importlib.util.spec_from_file_location("pr_doctor_seam", sys.argv[1])
 mod = importlib.util.module_from_spec(spec)
 sys.argv = [sys.argv[1], "--status"]          # keep the module's argparse block out of the way
 spec.loader.exec_module(mod)
-print(mod.REPO, mod.REPO_DIR)
+if mode == "unset":
+    try:
+        mod.resolve_repo()
+    except mod.RepoUnresolved:
+        print("REFUSED")
+    else:
+        print("RESOLVED %r" % (mod.REPO,))
+else:
+    print(mod.REPO == "" and mod.REPO_DIR == "", end=" ")   # empty until evidence answers
+    slug, checkout, source, why = mod.resolve_repo()
+    print(slug, source, checkout == "")
 PY
-)"
-check "PR_DOCTOR_REPO/_DIR are honoured" "example/fork /tmp/some-checkout" "$seam_out"
-default_out="$(env -u PR_DOCTOR_REPO -u PR_DOCTOR_REPO_DIR python3 - "$HERE/pr-doctor.py" <<'PY' 2>/dev/null
-import importlib.util, os, sys
-spec = importlib.util.spec_from_file_location("pr_doctor_seam", sys.argv[1])
-mod = importlib.util.module_from_spec(spec)
-sys.argv = [sys.argv[1], "--status"]
-spec.loader.exec_module(mod)
-print(mod.REPO, mod.REPO_DIR == os.path.join(mod.HOME, "Documents", "GitHub", "tortoise"))
-PY
-)"
-check "unset seams keep the previous defaults" "daniel-ospina/tortoise True" "$default_out"
+seam_out="$(PR_DOCTOR_REPO=example/fork PR_DOCTOR_REPO_DIR=/tmp/some-checkout \
+    python3 "$seam_probe" "$HERE/pr-doctor.py" seam 2>/dev/null)"
+check "PR_DOCTOR_REPO/_DIR are honoured as evidence" "True example/fork PR_DOCTOR_REPO True" "$seam_out"
+# ⛔ AND WITH NO EVIDENCE AT ALL IT REFUSES. `cd` is a fixture directory with no `origin`, and every
+# seam is unset -- so the only honest answers are "refuse" or "guess", and the cwd's git absence
+# must produce the former. The literals `daniel-ospina/tortoise` / `$HOME/Documents/GitHub/tortoise`
+# appearing here again would be this defect returning.
+mkdir -p "$TMP/no-origin"
+default_out="$(cd "$TMP/no-origin" && env -u PR_DOCTOR_REPO -u PR_DOCTOR_REPO_DIR -u OR -u REPO \
+    -u GH_REPO -u TORTOISE_REPO python3 "$seam_probe" "$HERE/pr-doctor.py" unset 2>/dev/null)"
+check "unset seams REFUSE instead of defaulting" "REFUSED" "$default_out"
 
 
 # ⛔ THE CENSUS READS THE BOX, SO THE FIXTURE MUST OWN THAT READ (review rounds 7–8): every `--install`

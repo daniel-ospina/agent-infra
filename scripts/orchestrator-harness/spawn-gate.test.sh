@@ -530,6 +530,11 @@ ck "the spawn point's fork code ($_pf) is DISTINCT from the caller-facing one ($
 RIG="$TMP/rig"; RREPO="$RIG/repo"; RO="$RIG/O"
 mkdir -p "$RIG/bin" "$RO/logs" "$RO/state" "$RREPO"
 git -C "$RREPO" init -q -b main
+# ⛔ THE FIXTURE IS A CHECKOUT OF THE REPO THE ARMS NAME (agent-infra#2724/#2694). lane.sh/fix-one.sh
+# now assert the worktree's origin against the target slug and refuse (72) when it differs or is
+# unreadable — so a fixture with no origin would be refused by the REPO gate and every load/disk arm
+# below would assert a gate that never ran.
+git -C "$RREPO" remote add origin https://github.com/daniel-ospina/agent-infra.git
 git -C "$RREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 git -C "$RREPO" branch work
 git -C "$RREPO" branch adoptbranch   # adopt-fix gets its OWN branch: `work` is already checked out
@@ -623,12 +628,13 @@ ck "fix-one.sh NAMES the load gate on a load refusal — the disk wording is not
 # The fixture is derived FROM THE SHIPPED HELPER (only the constant's definition is removed), so it
 # tracks the file under test instead of re-implementing a pre-fix helper by hand.
 mkdir -p "$RIG/stale"
-cp "$HERE/fix-one.sh" "$RIG/stale/"
+cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RIG/stale/"
 # ⛔ THE VALIDATOR TRAVELS WITH THE STALE HELPER, AND THAT IS NOT A WEAKENING (#2258). What is stale
 # here is `spawn-gate.sh`'s refusal CONSTANTS, not the brief rules: a fixture that omitted
 # `brief-gate.sh` would make fix-one.sh exit 78 (cannot verify) and this arm would read "78" as the
 # stale-helper behaviour it is meant to test — passing for the wrong reason. The fixer's dependency on
 # the validator is the same class as its dependency on spawn-gate.sh.
+cp "$HERE/fix-one.sh" "$RIG/stale/"
 cp "$HERE/brief-gate.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
@@ -947,7 +953,10 @@ export -f pi
 # SUCCESS for a run that did nothing. Driven with a claims.sh stub that refuses, and removed again so
 # the arms below are not diverted onto this path.
 # the deployed copies §10 uses; made here because this arm runs before §10's cp
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/adopt-fix.sh" "$RO/"
+# ⛔ AND THE IDENTITY MODULE GOES WITH THEM (#2762/#2694): adopt-fix.sh and fix-one.sh source
+# `$SELF/repo-target.sh` (and it sources repo-slug.sh), so a copy without them exits 78 — a
+# half-deployed box — instead of reaching the claim refusal this arm is about.
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RO/"
 printf '#!/bin/sh\nclaim_acquire() { CLAIM_RESULT="another box owns this head (test stub)"; return 1; }\n' > "$RO/claims.sh"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; rm -f "$RO/state/fixbail-7-"*
 ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
@@ -968,10 +977,11 @@ unset -f gh; unset 'BASH_FUNC_gh%%'
 # ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
 # …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
 # `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
 # of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
 cp "$HERE/brief-gate.sh" "$RO/"
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
@@ -1050,7 +1060,15 @@ ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
 # lane.sh: the third ported caller. Assert it gets as far as the spawn (the prompt is written) and
 # then refuses WITHOUT starting an agent — the whole point, since lane.sh is what opens the PR.
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
+# ⛔ THE LANE'S CWD IS A WORKTREE OF THE TARGET REPO, ON THE BRANCH IT IS TOLD IT IS ON
+# (agent-infra#2724/#2694): lane.sh now refuses a wrong-repo worktree (72) and a worktree checked out
+# on a different named branch. These arms test the LOAD/DISK gate, so the fixture satisfies both.
+# ⛔ FROM THE WORKTREE THAT IS CHECKED OUT ON `work` (#2762 review, 6th cycle, P1). `$RREPO`'s HEAD is
+# `main` (the fixture creates `work` as a BRANCH and materialises `.worktrees/fix-7` on it), so running
+# the lane from `$RREPO` made the BRANCH assertion refuse 72 before the load gate was ever reached —
+# these two arms test the LOAD gate, so the fixture must satisfy the identity gate, exactly as the DISK
+# arm below already does.
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
 { [ "$lrc" -eq 75 ] && [ ! -s "$PI_LOG" ] && [ -s "$RO/logs/prompt-9999.txt" ]; }; rc=$?
 ck "lane.sh on a refused load exits 75, writes the prompt, and NEVER spawns (rc=$lrc)" $rc
@@ -1060,7 +1078,7 @@ ck "lane.sh NAMES the load gate on a load refusal" $rc
 # what opens a PR, so a lane refused here consumed nothing — but an operator told "load gate" would
 # re-dispatch into the same full filesystem for ever.
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc2=$?
 [ "$lrc2" -eq 77 ]; rc=$?

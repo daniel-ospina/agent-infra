@@ -273,6 +273,20 @@ export DOCTOR_TEST_UV="$T/uv"
 export DOCTOR_LANE_REAP_BIN="$T/bin/lane-reap" DOCTOR_TEST_LANE_REAP="$T/lane-reap"
 export REAP_MIN_S=60 REAP_SAMPLE_S=2 DOCTOR_INTERVAL=1 MERGE_INTERVAL=1 HYGIENE_INTERVAL=1
 export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
+# ⛔ HERMETIC BY DEFAULT: the hygiene role's registry sub-step resolves the SHIPPED `registry-sync.sh`
+# beside this suite, and exec'ing the real verb from every hygiene case would make two real round
+# trips to github.com per pass — and, worse, pull the fleet's LIVE records into each fixture's
+# `$CELL_HOME` (the same defect `ATOMIC_LAND_REGISTRY_SYNC` exists to prevent in tests/atomic-land).
+# The cases that DO exercise the registry set it back to a fixture script and a fixture store.
+export DOCTOR_REGISTRY_SYNC=off
+# Same reason, one variable over: `AGENT_INFRA_PATH` is set for real in the operator's (and CI's)
+# environment, so a case that does not name `HARNESS_REPO` would silently resolve the CHECKOUT'S OWN
+# agent-infra remote as the store and do a real union against github (measured: a 300 s real fetch
+# from the case that deliberately leaves every candidate unset).
+# `HARNESS_PIN_DIR` is in every cell controller's env (harness-refresh.sh), and it is the THIRD
+# store candidate — leaving it ambient let the "non-agent-infra origin is refused" case fall through to
+# a real checkout and do a real union (measured by a reviewer). Neutralised for the same reason.
+export AGENT_INFRA_PATH= HARNESS_PIN_DIR=
 mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/lane-reap"
 
 doc() { # <role> [extra env assignments via env]
@@ -973,6 +987,390 @@ grep -q 'prune --caches' "$T/sup/calls" 2>/dev/null \
   && bad "hygiene: swept caches while the session list was UNREADABLE (fail-open)" \
   || ok "hygiene: unreadable session list -> the cache sweep is SKIPPED (fail-closed)"
 
+# ── 12b) THE CROSS-BOX REVIEW-RECORD REGISTRY (agent-infra#2577) ────────────────────────────────────
+# The measured defect: `~/.pi/agent/reviews/` is PER BOX, so a verdict minted on a peer box is
+# invisible here and the merge role skips its PR as `NO-RECORD` (live: store held 3201 records, this
+# box 366, merge logged `candidates=11 attempted=1 landed=0 skipped=11`). Nothing ran the converging
+# verb (`registry-sync.sh union`) on a schedule, so the box could not leave that state on its own.
+#
+# The fixture is TWO REAL git repos joined by a real `origin` remote — a bare "store" and a hub — so
+# the assertions are about the shipped verb's behaviour (refs, records, bytes), never a stub's. The
+# "peer box" is a clone that mints one record and publishes `refs/reviews/<key>`; the record is at the
+# hub's head, which is what the merge role's `attestation_clean` compares against.
+say_case "hygiene: a record that exists only on a PEER box becomes visible to the merge role in ONE pass"
+reset_state; reset_tmux; : > "$T/tmux/sessions"; rm -f "$T/sup/calls"
+R="$T/reg"; rm -rf "$R"; mkdir -p "$R" "$T/home/.pi/agent/reviews"
+# The fixture git calls are pinned (`-c user.*`) so a runner with no global identity — and one with
+# `commit.gpgsign` on — cannot turn a fixture step into a red that blames the doctor.
+GITQ=(git -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false)
+git init --bare -q "$R/agent-infra.git"   # named for the origin-identity check in registry_store
+git init -q "$R/hub"
+printf 'x\n' > "$R/hub/f"
+git -C "$R/hub" add f
+"${GITQ[@]}" -C "$R/hub" commit -qm init
+"${GITQ[@]}" -C "$R/hub" push -q "$R/agent-infra.git" HEAD:refs/heads/main
+git -C "$R/hub" remote add origin "$R/agent-infra.git"
+RHEAD="$(git -C "$R/hub" rev-parse HEAD)"
+# The peer box: one clean record for PR 7 at RHEAD, published on the shared store's ref namespace.
+git clone -q "$R/agent-infra.git" "$R/peer" 2>/dev/null
+printf '{"pr":7,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-23T20:00:00Z"}\n' "$RHEAD" > "$R/peer/record.json"
+PBLOB="$(git -C "$R/peer" hash-object -w "$R/peer/record.json")"
+PTREE="$(printf '100644 blob %s\trecord.json\n' "$PBLOB" | git -C "$R/peer" mktree)"
+PCOMMIT="$(git -C "$R/peer" -c user.email=fixture@example.invalid -c user.name=fixture commit-tree "$PTREE" -m record)"
+git -C "$R/peer" push -q origin "$PCOMMIT:refs/reviews/daniel-ospina-agent-infra-7" 2>/dev/null
+[ -n "$(git ls-remote "$R/agent-infra.git" 'refs/reviews/*' 2>/dev/null)" ] \
+  && ok "registry fixture: the PEER published a review record the store holds" \
+  || bad "registry fixture: the peer's record did not reach the store"
+REC="$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-7.json"
+printf '[]\n' > "$T/gh/prs.json"
+printf '[{"number":7,"head":{"sha":"%s"},"draft":false}]\n' "$RHEAD" > "$T/gh/prs.json"
+# BEFORE: the merge role cannot see the verdict — this is the defect, stated as an assertion.
+OUT="$(DOCTOR_ADMIN_MERGE="$T/bin/rail.sh" DOCTOR_TEST_RAIL="$T/rail" DOCTOR_REGISTRY_SYNC=off \
+        bash "$DOCTOR" merge --dry-run 2>&1)"; RC=$?
+[ ! -e "$REC" ] && ! result_has "WOULD call the rail on #7" \
+  && ok "registry: BEFORE any pass the merge role does NOT see the peer's verdict (the measured blindness)" \
+  || bad "registry: the merge role already saw #7 before the sync — the fixture proves nothing ($OUT)"
+# ONE pass of the role that now carries the sync. `DOCTOR_REGISTRY_SYNC` is UNSET so the SHIPPED
+# resolution order runs, and `$HARNESS_REPO` names the agent-infra checkout to provision from.
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC; DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         HARNESS_REPO="$R/hub" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "registry: ONE hygiene pass completes (rc=0)" || bad "registry: hygiene rc=$RC — $OUT"
+result_has "registry synced" && ok "registry: the pass records that the registry was synced" \
+  || bad "registry: the pass did not record a sync — $OUT"
+[ -f "$REC" ] && cmp -s "$REC" "$R/peer/record.json" \
+  && ok "registry: the peer's record is now IN this box's registry, byte-identical ($REC)" \
+  || bad "registry: the peer's record is still missing or altered here ($(cat "$REC" 2>/dev/null))"
+# ⛔ FROM A WORKTREE. The verb performs git ref operations, and the hub checkout is what an agent
+# session is refused for (#2520) — so the store must be a provisioned worktree, and the log must name
+# it. Asserting the PATH (not merely "it worked") is what keeps the scheduled path the reproducible one.
+case "$OUT" in
+  *".worktrees/registry-sync"*) ok "registry: the sync ran from a provisioned WORKTREE, and the log names it" ;;
+  *) bad "registry: the sync did not run from a worktree — $OUT" ;;
+esac
+git -C "$R/hub/.worktrees/registry-sync" rev-parse --git-dir >/dev/null 2>&1 \
+  && ok "registry: the store worktree exists as a real git worktree of the hub" \
+  || bad "registry: no worktree was provisioned at \$hub/.worktrees/registry-sync"
+
+# AFTER: the merge role now OFFERS the PR to the rail — the whole point of the sync.
+OUT="$(DOCTOR_ADMIN_MERGE="$T/bin/rail.sh" DOCTOR_TEST_RAIL="$T/rail" DOCTOR_REGISTRY_SYNC=off \
+        bash "$DOCTOR" merge --dry-run 2>&1)"
+result_has "WOULD call the rail on #7" \
+  && ok "registry: after ONE pass the merge role SEES the peer's clean verdict for #7" \
+  || bad "registry: the merge role still cannot see the synced record — $OUT"
+# A rehearsal must not write: `--dry-run` is the verb an operator runs FIRST.
+rm -f "$REC"
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC; DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         HARNESS_REPO="$R/hub" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene --dry-run ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && [ ! -e "$REC" ] && result_has "would sync the review registry" \
+  && ok "registry: --dry-run does NOT write to the registry (a rehearsal performs no action)" \
+  || bad "registry: --dry-run synced (rc=$RC, record present=$([ -e "$REC" ] && echo yes || echo no)) — $OUT"
+
+say_case "hygiene: a FAILED registry sync is logged, NAMES the box, and leaves the pass SUCCESSFUL"
+reset_state
+cat > "$T/bin/sync-fail.sh" <<'SH'
+#!/bin/bash
+# Stand-in for a box that is offline / rate-limited: the verb cannot read the store.
+printf "registry-sync.sh: cannot READ the 'origin' registry from '%s' — it is UNKNOWN, not empty. Not syncing.\n" "$2" >&2
+exit 7
+SH
+chmod +x "$T/bin/sync-fail.sh"
+rm -f "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-7.json"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/sync-fail.sh" DOCTOR_REGISTRY_STORE="$R/hub" \
+        DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+        DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+        MIN_FREE_MB=0 bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+# ⛔ THE HARD REQUIREMENT: a failed sync must never fail the pass nor block a merge decision.
+[ "$RC" -eq 0 ] && ok "registry: a FAILED sync leaves the pass SUCCESSFUL (rc=0)" \
+  || bad "registry: a failed sync failed the pass (rc=$RC) — $OUT"
+result_has "SYNC FAILED" && case "$OUT" in
+  *"SYNC FAILED on $(hostname 2>/dev/null || uname -n)"*) ok "registry: the failure is logged against the box that could not sync" ;;
+  *) bad "registry: the failure log does not name this box — $OUT" ;;
+esac || bad "registry: a failed sync was not logged at all — $OUT"
+case "$OUT" in
+  *"cannot READ the 'origin' registry"*) ok "registry: the log carries the verb's OWN complaint (WHICH side failed)" ;;
+  *) bad "registry: the log discards the verb's complaint — $OUT" ;;
+esac
+# Visible in `status` (the row prints `last_result`), WITHOUT being a failing rc.
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = "0" ] \
+  && grep -qF 'registry SYNC FAILED' "$T/o/state/roles/hygiene.state" \
+  && ok "registry: the failure is recorded on the role (status shows it) while last_rc stays 0" \
+  || bad "registry: the failure is invisible to status — $(cat "$T/o/state/roles/hygiene.state" 2>/dev/null)"
+[ ! -e "$T/home/.pi/agent/reviews/daniel-ospina-agent-infra-7.json" ] \
+  && ok "registry: a failed sync wrote nothing into the registry" \
+  || bad "registry: a failed sync touched the registry"
+# ⛔ rc=0 IS NOT EVIDENCE OF CONVERGENCE — the verb's own `union:` line is. A seam that exits 0 silently
+# (a truncated capture on a full disk, or an older copy of the verb) used to be recorded as
+# `converged`: a blind box reading synced, which is the false-PASS direction that matters most here.
+printf '#!/bin/bash\nexit 0\n' > "$T/bin/sync-silent.sh"; chmod +x "$T/bin/sync-silent.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$T/bin/sync-silent.sh" DOCTOR_REGISTRY_STORE="$R/hub" \
+        DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+        DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+        MIN_FREE_MB=0 bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry UNPROVEN" \
+  && ok "registry: rc=0 with NO 'union:' summary is recorded UNPROVEN, not converged" \
+  || bad "registry: a silent exit 0 was recorded as converged (rc=$RC) — $OUT"
+case "$OUT" in
+  *"converged with the fleet"*) bad "registry: a silent exit 0 claimed convergence — $OUT" ;;
+  *) ok "registry: no convergence claim without the verb's own evidence line" ;;
+esac
+
+# ⛔ AND IT IS BOUNDED. `timeout(1)` is absent on the cells, so this exercises the shell-watchdog
+# fallback: an offline store must cost the bound once, not hang the one loop that supervises the cell.
+cat > "$T/bin/sync-hang.sh" <<'SH'
+#!/bin/bash
+"$DOCTOR_TEST_REAL_SLEEP" 30
+exit 0
+SH
+chmod +x "$T/bin/sync-hang.sh"
+T0="$(date +%s)"
+# ⛔ `DOCTOR_TIMEOUT_BIN` names a tool that cannot exist, which forces `bounded`'s SHELL-WATCHDOG
+# fallback — the branch a cell without `timeout(1)` actually runs. Without this override every Linux
+# runner takes the `timeout -k` branch and the deployed path is never executed (the suite's own
+# `/nonexistent/…` idiom, used for the tmux read too).
+OUT="$(DOCTOR_TEST_REAL_SLEEP="$REAL_SLEEP" DOCTOR_REGISTRY_SYNC="$T/bin/sync-hang.sh" \
+        DOCTOR_REGISTRY_STORE="$R/hub" DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+        DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+        DOCTOR_TIMEOUT_BIN=/nonexistent/registry-timeout \
+        DOCTOR_REGISTRY_STEP_TIMEOUT=2 MIN_FREE_MB=0 bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+ELAPSED=$(( $(date +%s) - T0 ))
+[ "$RC" -eq 0 ] && [ "$ELAPSED" -lt 25 ] \
+  && ok "registry: a HANGING sync is cut at its bound (${ELAPSED}s) and the pass still succeeds" \
+  || bad "registry: a hanging sync was not bounded (rc=$RC after ${ELAPSED}s) — $OUT"
+result_has "SYNC FAILED" && ok "registry: a bounded-out sync is reported as a failure, not a silent no-op" \
+  || bad "registry: the timed-out sync produced no failure line — $OUT"
+
+# ⛔ THE COPY NEEDS ITS SIBLINGS. Since #2573 the hygiene pass also sweeps worktree-root caches,
+# and that step FAILS CLOSED (`CANNOT-VERIFY`, rc=3) unless `live-ownership.sh` sits beside the
+# script it runs from — correct in production, and a real deployment ships the whole directory.
+# Without it these legs assert the registry store against a pass that died at step 4.
+# ── 12c) the STORE is the checkout ROOT, and only an agent-infra checkout is a store at all ───────
+# Both are review findings that the first cut of this change shipped, and both are silent: the worktree
+# lands inside the tracked source tree, or records are pushed to the WRONG repository. The fixture asks
+# the question the deployed layout actually asks — a harness copy at `<checkout>/scripts/…`, with no
+# `HARNESS_REPO`/`AGENT_INFRA_PATH` set, so `$SELF_DIR/../..` is the only candidate left.
+say_case "hygiene: the store is the checkout ROOT (not the scripts/ dir), and a non-agent-infra origin is REFUSED"
+reset_state
+mkdir -p "$R/hub/scripts/orchestrator-harness"
+cp "$DOCTOR" "$R/hub/scripts/orchestrator-harness/cloud-cell-doctor.sh"
+cp "$HERE/live-ownership.sh" "$R/hub/scripts/orchestrator-harness/live-ownership.sh"
+cp "$HERE/../registry-sync.sh" "$R/hub/scripts/registry-sync.sh"
+rm -f "$REC"; rm -rf "$R/hub/scripts/.worktrees"
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_REPO HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$R/hub/scripts/orchestrator-harness/cloud-cell-doctor.sh" hygiene ) 2>&1)"; RC=$?
+case "$OUT" in
+  *"via $R/hub/.worktrees/registry-sync"*) ok "registry: the store resolves to the checkout ROOT's worktree" ;;
+  *) bad "registry: the store did not resolve to <checkout>/.worktrees/registry-sync — $OUT" ;;
+esac
+[ ! -e "$R/hub/scripts/.worktrees" ] \
+  && ok "registry: no worktree is provisioned inside the tracked scripts/ dir" \
+  || bad "registry: a worktree was created inside the source tree — $(ls -d "$R/hub/scripts/.worktrees"/* 2>/dev/null)"
+[ -f "$REC" ] && ok "registry: the shipped-layout pass still converged (the record is here)" \
+  || bad "registry: the shipped-layout pass did not sync — $OUT"
+# ⛔ The cross-repo guard: a repo whose `origin` is NOT agent-infra must never be used as the store —
+# `registry-sync.sh` would faithfully push `refs/reviews/*` to whatever remote it is given.
+# The doctor is a COPY outside any git repo, so the last candidate (`$SELF_DIR/../..`) cannot fall
+# through to this very worktree's own agent-infra origin and reveal nothing about the guard.
+git init -q "$R/notagentinfra" && git -C "$R/notagentinfra" remote add origin "$R/tortoise.git"
+mkdir -p "$T/nc" && cp "$DOCTOR" "$T/nc/cloud-cell-doctor.sh"
+cp "$HERE/live-ownership.sh" "$T/nc/live-ownership.sh"
+OUT="$(DOCTOR_REGISTRY_SYNC="$HERE/../registry-sync.sh" HARNESS_REPO="$R/notagentinfra" \
+        DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+        DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+        MIN_FREE_MB=0 bash "$T/nc/cloud-cell-doctor.sh" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (no worktree to sync from)" \
+  && ok "registry: a checkout whose origin is NOT agent-infra is REFUSED as the store (rc stays 0)" \
+  || bad "registry: a non-agent-infra checkout was used as the store (rc=$RC) — $OUT"
+[ ! -e "$R/notagentinfra/.worktrees" ] \
+  && ok "registry: nothing was provisioned in the refused checkout" \
+  || bad "registry: a worktree was provisioned in a refused checkout"
+# ⛔ The OVERRIDE is a pointer, not an exemption: naming a non-agent-infra checkout explicitly must be
+# refused too (measured before this: the override pushed a record into a tortoise remote's
+# `refs/reviews/*` — a silent cross-repo write, and rule 2 means nothing can delete it).
+OUT="$(DOCTOR_REGISTRY_SYNC="$HERE/../registry-sync.sh" DOCTOR_REGISTRY_STORE="$R/notagentinfra" \
+        DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+        DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+        MIN_FREE_MB=0 bash "$T/nc/cloud-cell-doctor.sh" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (no worktree to sync from)" \
+  && ok "registry: a DOCTOR_REGISTRY_STORE whose origin is not agent-infra is REFUSED" \
+  || bad "registry: the store override bypassed the origin identity check (rc=$RC) — $OUT"
+result_has "refusing to push review records to it" \
+  && ok "registry: the refusal says what it prevented (a cross-repo push)" \
+  || bad "registry: the refusal does not name the hazard — $OUT"
+
+say_case "hygiene: a PLAIN directory where the store worktree belongs is refused (the hub is never the store)"
+# ⛔ `git -C <dir>` walks UPWARD, so `is_work_tree(<hub>/.worktrees/registry-sync)` is TRUE for an
+# ordinary leftover directory — it reports the HUB. Accepting one therefore runs the verb against the
+# hub checkout (the one thing "never the hub" forbids) while the convergence line names that path as
+# "the worktree", silently and self-perpetuatingly (provisioning never re-runs). Reachable without
+# hand-editing: a provisioning killed at its bound, or an out-of-band delete, leaves exactly this.
+reset_state
+git -C "$R/hub" worktree remove --force "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 || true
+git -C "$R/hub" worktree prune >/dev/null 2>&1 || true
+rm -rf "$R/hub/.worktrees/registry-sync"
+mkdir -p "$R/hub/.worktrees/registry-sync"          # plain, UNREGISTERED
+rm -f "$REC"
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         HARNESS_REPO="$R/hub" \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (no worktree to sync from)" \
+  && ok "registry: a plain dir where the worktree belongs is REFUSED" \
+  || bad "registry: a plain directory was accepted as the store worktree (rc=$RC) — $OUT"
+result_has "is not the root of a git worktree" \
+  && ok "registry: the refusal is LOGGED (that branch is reachable)" \
+  || bad "registry: the refusal is silent — $OUT"
+[ ! -e "$REC" ] && ok "registry: nothing was synced through the hub path" \
+  || bad "registry: the pass used the hub as its store — $REC exists"
+# ⛔ AND THE REHEARSAL must say the same thing (the occupancy check needs no side effects). Leaving it
+# out let a box that skips EVERY hourly pass print `would sync`, and `state_write_rehearsal` keeps the
+# worse rc but REPLACES `last_result` — so the operator's first verb erased the recorded skip.
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         HARNESS_REPO="$R/hub" \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene --dry-run ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (no worktree to sync from)" \
+  && ok "registry: --dry-run reports an OCCUPIED store path as the skip too" \
+  || bad "registry: --dry-run claimed a sync on a box whose store path is unusable (rc=$RC) — $OUT"
+case "$OUT" in
+  *"WOULD run: registry-sync.sh"*) bad "registry: --dry-run still printed a positive WOULD — $OUT" ;;
+  *) ok "registry: no false WOULD when the store path is unusable" ;;
+esac
+rm -rf "$R/hub/.worktrees/registry-sync"
+
+say_case "hygiene: a REUSED store worktree of a DIFFERENT repository is refused (never a cross-repo push)"
+# ⛔ "is the root of SOME worktree" is not identity. A worktree carries the CONFIG of the repo that
+# registered it, so a leftover worktree of another repository at the store path makes the verb push this
+# box's `refs/reviews/*` to THAT repo's remote — permanently (rule 2 has no delete path) — while the
+# pass reports `converged with the fleet` and the fleet store receives nothing.
+reset_state
+git init --bare -q "$R/tortoise.git"
+git init -q "$R/foreign"
+printf 'y\n' > "$R/foreign/g"
+git -C "$R/foreign" add g
+"${GITQ[@]}" -C "$R/foreign" commit -qm init
+git -C "$R/foreign" remote add origin "$R/tortoise.git"
+git -C "$R/hub" worktree remove --force "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 || true
+git -C "$R/hub" worktree prune >/dev/null 2>&1 || true
+rm -rf "$R/hub/.worktrees/registry-sync"
+git -C "$R/foreign" worktree add --detach --no-checkout "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 \
+  || bad "registry fixture: could not register the FOREIGN worktree at the store path"
+rm -f "$REC"
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         HARNESS_REPO="$R/hub" \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (no worktree to sync from)" \
+  && ok "registry: a worktree registered by ANOTHER repository is REFUSED as the store" \
+  || bad "registry: a foreign worktree was used as the store (rc=$RC) — $OUT"
+result_has "a worktree of a DIFFERENT repository" \
+  && ok "registry: the refusal names the hazard (a push to that repository's remote)" \
+  || bad "registry: the refusal is silent — $OUT"
+[ -z "$(git ls-remote "$R/tortoise.git" 'refs/reviews/*' 2>/dev/null)" ] \
+  && ok "registry: nothing was pushed to the foreign remote" \
+  || bad "registry: a review record reached the foreign repository — $(git ls-remote "$R/tortoise.git" 'refs/reviews/*' 2>/dev/null)"
+[ ! -e "$REC" ] && ok "registry: nothing was pulled from the foreign remote either" \
+  || bad "registry: a record was materialised from the foreign remote — $REC"
+git -C "$R/foreign" worktree remove --force "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 || true
+rm -rf "$R/hub/.worktrees/registry-sync"
+
+say_case "hygiene: a STALE worktree registration (dir gone) is re-created, not a permanent deadlock"
+# ⛔ The worktree is a THROWAWAY, so `rm -rf`-ing it — what any disk cleanup does — leaves the
+# registration behind, and a plain `worktree add` then refuses FOR EVER with rc=128 ("missing but
+# already registered"). Measured: every hourly pass logged `could not provision … rc=128` and skipped,
+# so the sub-step was dead on that box while `--dry-run` still said `would sync`. The fix re-creates
+# OUR OWN registration with `-f` (not `worktree prune`, which would also drop other, possibly merely
+# unmounted, registrations that are not this role's to remove).
+reset_state
+git -C "$R/foreign" worktree remove --force "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 || true
+git -C "$R/hub" worktree prune >/dev/null 2>&1 || true
+rm -rf "$R/hub/.worktrees/registry-sync"
+git -C "$R/hub" worktree add --detach --no-checkout "$R/hub/.worktrees/registry-sync" >/dev/null 2>&1 \
+  || bad "registry fixture: could not register the throwaway worktree"
+rm -rf "$R/hub/.worktrees/registry-sync"          # the registration survives; the directory does not
+rm -f "$REC"
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC DOCTOR_REGISTRY_STORE HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         HARNESS_REPO="$R/hub" \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$DOCTOR" hygiene ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry synced" \
+  && ok "registry: a stale registration is RE-CREATED and the pass converges (not a permanent skip)" \
+  || bad "registry: a stale registration deadlocked the sub-step (rc=$RC) — $OUT"
+result_has "REGISTERED as a worktree but its directory is gone" \
+  && ok "registry: the repair is LOGGED (the state is visible, not silent)" \
+  || bad "registry: the repair is silent — $OUT"
+case "$OUT" in
+  *"rc=128"*) bad "registry: the pass still hit the 'missing but already registered' refusal — $OUT" ;;
+  *) ok "registry: no rc=128 provisioning refusal" ;;
+esac
+[ -f "$REC" ] && ok "registry: the record was synced through the re-created worktree" \
+  || bad "registry: nothing was synced after the repair — $OUT"
+
+say_case "hygiene: no registry-sync.sh anywhere is a SKIP (not cannot-verify, unlike every other step)"
+reset_state
+# ⛔ A COPY, in a directory with no `registry-sync.sh` beside or above it: the shipped resolution order
+# looks beside the supervisor, one level up from this file, in `$HARNESS_REPO`/`$HARNESS_PIN_DIR` and
+# in the two cell script dirs — so "not found" can only be asserted from a location none of them
+# reaches. (Pointing the seam at a nonexistent path is NOT the same test: the search would simply fall
+# through to the SHIPPED script and sync, which is exactly what a first attempt at this case did.)
+mkdir -p "$T/copy"; cp "$DOCTOR" "$T/copy/cloud-cell-doctor.sh"
+cp "$HERE/live-ownership.sh" "$T/copy/live-ownership.sh"
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC HARNESS_REPO HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$T/copy/cloud-cell-doctor.sh" hygiene ) 2>&1)"; RC=$?
+# ⛔ The asymmetry with the reaper above is deliberate and is the whole non-fatal ruling: a doctor
+# with no registry verb is BLIND, not broken, and a permanently red hygiene row would hide the disk
+# failures this role actually exists to catch.
+[ "$RC" -eq 0 ] && ok "registry: a missing sync script does NOT fail the pass (rc=0, unlike the reaper's rc=3)" \
+  || bad "registry: a missing sync script failed the pass (rc=$RC) — $OUT"
+result_has "registry SKIPPED (registry-sync.sh not found)" && ok "registry: the skip is RECORDED (a silent clean pass would be the silent-no-op class)" \
+  || bad "registry: the skip is not recorded — $OUT"
+result_has "LOCAL-ONLY" && ok "registry: the log says what the skip MEANS (this box's registry stays local-only)" \
+  || bad "registry: the skip's consequence is not stated — $OUT"
+# ⛔ AND THE REHEARSAL MUST NOT PRETEND. `hygiene --dry-run` is the verb an operator runs FIRST; on a
+# box with no sync script it used to print `WOULD run: registry-sync.sh union`, i.e. a positive claim
+# about an action this box cannot take — the misinformation direction the role's rehearsal doctrine
+# exists to prevent. It now reports the same SKIP the live pass records.
+OUT="$( ( unset DOCTOR_REGISTRY_SYNC HARNESS_REPO HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$T/copy/cloud-cell-doctor.sh" hygiene --dry-run ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (registry-sync.sh not found)" \
+  && ok "registry: --dry-run reports the SKIP, not a WOULD it cannot perform" \
+  || bad "registry: --dry-run claimed an action this box cannot take (rc=$RC) — $OUT"
+case "$OUT" in
+  *"WOULD run: registry-sync.sh"*) bad "registry: --dry-run still prints a positive WOULD on a box that cannot sync — $OUT" ;;
+  *) ok "registry: no false WOULD line on a box that cannot sync" ;;
+esac
+# ⛔ And the SCRIPT is only half the answer: a box with the verb but NO usable store is equally blind,
+# and it is the documented farmed shape (a copy under `$CELL_HOME/.pi/agent/scripts` with no checkout
+# above it). The rehearsal must say the same thing the live pass says — otherwise, because
+# `state_write_rehearsal` replaces `last_result`, the operator's first verb ERASES the recorded skip
+# from the role row and a blind box reads clean.
+OUT="$( ( unset DOCTOR_REGISTRY_STORE HARNESS_REPO HARNESS_PIN_DIR AGENT_INFRA_PATH; \
+         DOCTOR_REGISTRY_SYNC="$HERE/../registry-sync.sh" \
+         DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+         DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+         MIN_FREE_MB=0 bash "$T/nc/cloud-cell-doctor.sh" hygiene --dry-run ) 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry SKIPPED (no worktree to sync from)" \
+  && ok "registry: --dry-run also reports a MISSING STORE as a skip (the farmed shape)" \
+  || bad "registry: --dry-run claimed a sync on a box with no store (rc=$RC) — $OUT"
+# The hermetic switch the rest of this suite depends on states itself, rather than degrading silently.
+OUT="$(DOCTOR_REGISTRY_SYNC=off DOCTOR_SUPERVISOR="$T/bin/sup" DOCTOR_TEST_SUP="$T/sup" \
+        DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt" \
+        MIN_FREE_MB=0 bash "$DOCTOR" hygiene 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && result_has "registry skipped (by request)" \
+  && ok "registry: the DOCTOR_REGISTRY_SYNC=off seam reports itself (the suite's hermetic switch)" \
+  || bad "registry: the off seam is silent (rc=$RC) — $OUT"
+
 say_case "doctor: a failed or impossible restart is NOT a clean pass"
 reset_state; : > "$T/o/state/roles/.desired"; reset_tmux
 rm -f "$T/sup/calls"; printf '1\n' > "$T/sup/rc"
@@ -1057,8 +1455,8 @@ kill "$SL_PID" 2>/dev/null || true
 [ "$RC" -eq 0 ] && ! result_has "STALE" \
   && ok "status: passes 300s old are not stale under a bound that covers the longest rail call" \
   || bad "status: reported a healthy cell stale (rc=$RC) — $OUT"
-[ "$(grep -cF 'WORST_PASS_S=$(( MERGE_BUDGET_S + RAIL_TIMEOUT + HYGIENE_TIMEOUT ))' "$DOCTOR")" -ge 1 ] \
-  && ok "status: the default doctor bound is DERIVED from the worst PASS (merge budget + one overrun), not one call" \
+[ "$(grep -cF 'WORST_PASS_S=$(( MERGE_BUDGET_S + RAIL_TIMEOUT + HYGIENE_TIMEOUT + REGISTRY_STEP_TIMEOUT + REGISTRY_STEP_TIMEOUT ))' "$DOCTOR")" -ge 1 ] \
+  && ok "status: the default doctor bound is DERIVED from the worst PASS (merge budget + one overrun + the hygiene pass's own bounded registry sub-step, #2577), not one call" \
   || bad "the default stale bound is not derived from the worst pass"
 
 # And a pass that has been inside a legitimate multi-candidate merge is NOT stale: 3000 s is past the
