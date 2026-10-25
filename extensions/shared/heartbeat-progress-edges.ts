@@ -638,6 +638,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: "extensions/loop-enforcer/tier-config-parity.test.ts (#847 STALL_THRESHOLD_SURFACES, 7 surfaces)",
     note: "POINTER ONLY — this registry deliberately holds no `stall_threshold` value",
   },
+  // — hygiene axis: the lane's merge-phase marker (#2029) —
+  {
+    name: "_PHASE_AGE",
+    owners: ["scripts/orchestrator-harness/chain-merge.sh"],
+    value: null,
+    axis: "hygiene",
+    guardedBy:
+      "scripts/orchestrator-harness/chain-merge-verdict.test.sh (case 4b: a marker older than the lane's wall limit is called STALE, reviewed immediately and removed) + this registry's presence check",
+    note: "DERIVED, not a bound: the age in SECONDS of state/lanemerge-<PR>.phase, computed as now minus the epoch the marker itself carries. It belongs in this vocabulary because it answers a staleness question ('is this marker still a claim about the present'), but there is no local literal for the forward check to pin — the value is a subtraction of a value read at runtime — hence `value: null`. Its partner `_PHASE_STALE_AFTER` is the comparison bound and is deliberately NOT registered: it is not a local literal either (it is `LANE_TIMEOUT + 60s`, a pointer to the lane's own declared wall clock), and registering a pointer-to-a-pointer would imply an independence that does not exist.",
+  },
   // — gate axis —
   {
     name: "WALL_CLOCK_STALL_MS",
