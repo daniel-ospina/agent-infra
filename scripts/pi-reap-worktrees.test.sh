@@ -140,6 +140,8 @@ cat >"$T/bin/ps" <<'SHIM'
 # snapshot" are indistinguishable, and the re-probe would be an inert gate. Only the full enumeration
 # advances the sequence; any other ps call keeps the static behaviour below.
 case " $* " in
+  *" -o etimes="*) [ -n "${FAKE_ETIMES:-}" ] && { printf '%s\n' "$FAKE_ETIMES"; exit 0; }; exit 1 ;;
+  *" -o etime="*)  [ -n "${FAKE_ETIME:-}" ]  && { printf '%s\n' "$FAKE_ETIME";  exit 0; }; exit 1 ;;
   *"-axo"*)
     if [ -n "${FAKE_PS_SEQ_DIR:-}" ]; then
         N=0; [ -f "$FAKE_PS_SEQ_DIR/.n" ] && N="$(cat "$FAKE_PS_SEQ_DIR/.n")"
@@ -1921,6 +1923,87 @@ assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (live-probe-
 assert_dir "$WT_CWDF" "G2721h …the checkout survives (it would have gone on argv-only evidence)"
 assert_contains "$(cat "$T/$ENV/reap.log" 2>/dev/null)" "cwd re-probe degraded" \
     "G2721h …and the log says WHICH probe was lost, so the weakened witness set is visible"
+
+# ── G2721i: the holder rule is asked as the LAST step before the fork (review round 3, P2) ──
+# The first fix ran the re-probe FIRST, then two `git status` calls and the ephemeral deletions (up to
+# REAP_WT_REMOVE_TIMEOUT each) before `git worktree remove` — while the comment called it "right before
+# the delete". That tail is the largest part of the window by this file's own reasoning for re-check #2.
+# Reading #1 is the classification, #2 the early check, #3 the late one: the holder appears ONLY on the
+# third, so a tree that stopped at the early check removes a checkout that came back to life.
+ENV=G2721i; REPO="$(mk_repo $ENV)"
+WT_TAIL="$(add_named_wt "$REPO" "$ENV-tail" feat/g2721i-tail)"
+mkdir -p "$WT_TAIL/.venv"; printf 'x\n' >"$WT_TAIL/.venv/marker"
+mkdir -p "$T/seq-g9"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}" >"$T/seq-g9/1"
+cp "$T/seq-g9/1" "$T/seq-g9/2"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n9402 1 /usr/bin/python3 %s/.venv/bin/python\n' \
+    "${REAP_WT_SELF_PID:-1}" "$(cd "$WT_TAIL" && pwd -P)" >"$T/seq-g9/3"
+: >"$T/seq-g9/.n"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g9" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (live-refound)" \
+    "G2721i a holder that appears in the TAIL window (after the early check) STOPS the delete"
+assert_dir "$WT_TAIL" "G2721i …the checkout survives"
+
+# ── G2721j: the re-probe must not LEAK its process table into the volume being reclaimed ──────
+# `ps_load` mints a fresh table per call and the EXIT trap removes only the CURRENT one, so each
+# re-check leaked a `pi-reap-ps.*` file into /tmp — measured 19 in one suite run. On a cell where /tmp
+# is the volume the reaper exists to reclaim, that is the reaper feeding its own problem.
+ENV=G2721j; REPO="$(mk_repo $ENV)"
+WT_LEAK="$(add_named_wt "$REPO" "$ENV-leak" feat/g2721j-leak)"
+mkdir -p "$WT_LEAK/.venv"
+mkdir -p "$T/leaktmp"
+OUT="$(TMPDIR="$T/leaktmp" REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_nodir "$WT_LEAK" "G2721j (fixture) the checkout was removed, so the removal path really ran"
+left="$(ls "$T/leaktmp" 2>/dev/null | grep -cE '^pi-reap-(ps|cwd)\.' || true)"
+assert_eq "$left" "0" "G2721j no probe table is left behind in TMPDIR (leaked: ${left})"
+# AND THE HOLDER SCAN WAS NOT TRUNCATED (review round 3). `holders_live`'s cap must exceed the number of
+# DISTINCT holders any probe can report, so it counts EVERY table plus 4; a cap that counts only the cwd
+# table collapses on a host whose cwd probe is degraded and then reads "no holder" for a worktree that
+# has one - the silent-destruction class. The pass log is the only observable (a truncated scan prints a
+# live verdict for the boundary holder, byte-identical to reaching it), so its ABSENCE is the claim.
+if grep -q 'STALE-SHELL-SCAN TRUNCATED' "$T/$ENV/reap.log" 2>/dev/null; then
+    bad "but the holder scan WAS truncated (reap.log names it) - the cap cut the witness list short"
+else
+    ok "and the holder scan was not truncated, so the cap cannot hide a holder behind a lucky verdict"
+fi
+
+# ── G2721k: the cap counts EVERY table, so a five-holder checkout is not read as UNHELD ─────────
+# The worktree reaper's cap must exceed the number of DISTINCT holders any probe can report. Counting
+# only the cwd table collapses on a host whose cwd probe is degraded (or whose holders live in argv),
+# and a scan cut short at the boundary returns "no live holder" — the silent-destruction class. Four
+# idle shells (demoted) and a working `python3` (never demotable) put the verdict on the FIFTH row, so
+# the arm is only green when the scan reaches it. Reverting the cap to a cwd-only count prints the
+# `STALE-SHELL-SCAN TRUNCATED` line, which is what the assertion after it reads.
+ENV=G2721k; REPO="$(mk_repo $ENV)"
+WT_FIVE="$(add_named_wt "$REPO" "$ENV-five" feat/g2721k-five)"
+mkdir -p "$WT_FIVE/.venv"; printf 'x\n' >"$WT_FIVE/.venv/marker"
+# HEAD AFTER the holders sit down: the rule reads the COMMIT's own time, so the fixture stamps it ahead
+# by a stated margin rather than lie about a process start (only the kernel sets that).
+commit_in_wt "$WT_FIVE" "@$(( $(date +%s) + 600 ))" five
+FIVE_CANON="$(cd "$WT_FIVE" && pwd -P)"
+mkdir -p "$T/seq-gk"
+{
+    printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}"
+    # EIGHT idle shells, not four: the default cwd shim contributes two rows of its own, so the
+    # malformed cap (cwd rows + 4 = 6) only truncates a scan with MORE than six holders. The point of
+    # the arm is that a cut-short scan must be observable, so the fixture has to out-run the bad cap.
+    i=0
+    while [ "$i" -lt 8 ]; do
+        i=$((i + 1)); printf '%s 1 /bin/bash -c cd %s idle-%s\n' "$((6000 + i))" "$FIVE_CANON" "$i"
+    done
+    printf '6100 1 /usr/bin/python3 %s/.venv/bin/python\n' "$FIVE_CANON"
+} >"$T/seq-gk/1"
+: >"$T/seq-gk/.n"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gk" FAKE_ETIMES=600 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" \
+    run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+assert_contains "$(row_for "$OUT" "$WT_FIVE")" "reason=live" \
+    "G2721k the scan reaches the FIFTH holder (argv) and keeps the checkout"
+if grep -q 'STALE-SHELL-SCAN TRUNCATED' "$T/$ENV/reap.log" 2>/dev/null; then
+    bad "G2721k but the holder scan WAS truncated - the cap cut the witness list short"
+else
+    ok "G2721k and it was not truncated: the cap counts every table, not just the cwd one"
+fi
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

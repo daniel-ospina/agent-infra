@@ -749,11 +749,11 @@ stale_shell_holder() {
 # It also leaked across worktrees: a pid inside a NESTED worktree matches both canons, so demoting it
 # for the inner one removed the evidence the outer one needed.
 # The scan therefore carries its own EXCLUDE LIST (pid-scoped, per classification) and a hard
-# iteration cap one greater than the probe tables' total row count: a demotion that somehow fails to
+# iteration cap four greater than the probe tables' total row count: a demotion that somehow fails to
 # advance the cursor ends the loop instead of spinning it, and one worktree's demotion cannot affect
 # another's.
 live_witness() {
-    local canon="$1" hit pid note="" seen="" cap n=0
+    local canon="$1" hit pid seen="" cap n=0
     # The cap is a RUNAWAY GUARD, not a schedule: it must exceed the number of DISTINCT holders any
     # probe could report, so it counts EVERY table — including PS, which the argv arm reads (review
     # round 2, P2: counting only cwd+tmux made the cap collapse to 4 on a host with no lsof and no
@@ -768,7 +768,6 @@ live_witness() {
         fi
         pid="$(printf '%s' "$hit" | sed -n 's/^pane_pid=\([0-9][0-9]*\).*/\1/p')"
         if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
-            note="$note pid=$pid(tmux-pane)"
             log "stale-shell: pid=$pid(tmux-pane) — an idle shell predating HEAD is not a live lane (#2721); the other gates still decide"
             seen="$seen$pid "
         else
@@ -783,7 +782,6 @@ live_witness() {
         fi
         pid="$(printf '%s' "$hit" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p')"
         if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
-            note="$note pid=$pid(cwd)"
             log "stale-shell: pid=$pid(cwd) — an idle shell predating HEAD is not a live lane (#2721); the other gates still decide"
             seen="$seen$pid "
         else
@@ -798,7 +796,6 @@ live_witness() {
         fi
         pid="$(printf '%s' "$hit" | sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p')"
         if [ -n "$pid" ] && stale_shell_holder "$pid" "$canon"; then
-            note="$note pid=$pid(argv)"
             log "stale-shell: pid=$pid(argv) — an idle shell predating HEAD is not a live lane (#2721); the other gates still decide"
             seen="$seen$pid "
         else
