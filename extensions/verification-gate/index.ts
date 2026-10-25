@@ -737,11 +737,20 @@ function recoverBridgeForRoot(normRoot: string): number {
       // outside the root; drop such keys before hashing.
       const relPath = normalizeRegistryPath(parsed.root, parsed.path);
       if (relPath.startsWith("..") || isAbsolute(relPath)) continue;
-      // Match-or-drop: only merge when the stored (verifier-authoritative)
-      // hash still matches the file on disk (sha1 or sha256, #320). Never
-      // recompute a fresh hash — a post-PASS edit must fail closed.
-      if (!hashMatchesDisk(parsed.root, relPath, vf.hash)) continue;
-      verifiedSet.set(vf.path, vf.hash);
+      // Match-or-drop: only merge when the stored (verifier-authoritative) hash still matches the
+      // file on disk (md5/sha1/sha256, #320/#1460). Never recompute a fresh hash — a post-PASS
+      // edit must fail closed. ONE read answers BOTH questions (#1460 round 6): matching with
+      // `hashMatchesDisk` and then storing with `storedDigestFor` read the file twice, which is the
+      // window that lets the record hold a digest of bytes the verifier did not see.
+      // The containment-checked `relPath` is used for the digest too, not `parsed.path`: the key is
+      // still `vf.path`, but there must be ONE path expression for what was read.
+      const digest = matchAndStoredDigest(parsed.root, relPath, vf.hash);
+      if (!digest.matched) continue;
+      // #1460: the SAME invariant as mergeVerifiedFiles — recovery re-installs the
+      // gate's own sha256 of the matched bytes, never a supplied md5/sha1 verbatim (a
+      // supplied digest is evidence, not the standing identity). `parsed` carries the
+      // root/path this entry is keyed by.
+      verifiedSet.set(vf.path, digest.stored);
       blockAttempts.delete(vf.path);
       recovered++;
     } catch {
@@ -2290,6 +2299,114 @@ export function commandRunsCommit(command: string): boolean {
   return chainCommandClasses(command, 0).some((c) => c === "commit");
 }
 
+/**
+ * #540 (measured 2026-10-22, this lane): the refusal for an in-batch mutation chain named the
+ * RULE but not the exact two commands that satisfy it, so a lane re-tried the same chained shape
+ * or guessed at a split.
+ *
+ * ⛔ SLICE THE ORIGINAL TEXT, NEVER RE-JOIN THE SEGMENTS (fresh review, P1). The first revision
+ * rejoined `splitCommandSegments` output with " && ", which DELETED a pipe (`echo hi | tee a.txt`
+ * printed as `echo hi && tee a.txt` — a remedy that no longer writes the file), produced invalid
+ * bash around subshells (`(cd sub` / `git commit -m x)`), and truncated heredocs. The fix is to
+ * cut the ORIGINAL command at the commit invocation's byte offset, so every separator, redirect
+ * and quote survives verbatim.
+ *
+ * A cut is offered only where it is FAITHFUL: a plain `&&`/`;`/newline chain. Inside a subshell,
+ * a command substitution, a heredoc, or an executing shell wrapper (`bash -c …`), the commit sits
+ * INSIDE a construct — slicing there hands the lane text that is not the command to run, and a
+ * wrapper re-classifies as the same in-batch chain, i.e. a remedy that loops. Those shapes get
+ * the generic sentence instead (null), which is honest about what the gate can print.
+ *
+ * Returns null when there is no commit invocation, the cut would be unfaithful, or no mutation
+ * precedes it. DISPLAY ONLY — the decision is `commitChainMutationClass`, unchanged.
+ */
+export function splitMutationFromCommit(command: string): { mutation: string; commit: string } | null {
+  const inv = findGitVerbInvocation(command, GIT_VERB_SET.commit, "skip");
+  if (inv === null) return null;
+  if (!splitIsFaithful(command)) return null;
+  // ⛔ THE CANDIDATE MAY BE A MENTION, NOT AN INVOCATION (fresh review round 5, P1).
+  // `findGitVerbInvocation` scans a bare `\bgit\b`, so the words `git commit` INSIDE a quoted
+  // string are taken as the invocation and the cut lands within that quote:
+  //   printf 'git commit -m x\n' > msg.txt && git add msg.txt && git commit -F msg.txt
+  //     arm 1 = "printf '"        (unparseable: unexpected EOF looking for matching ')
+  //     arm 2 = "git commit -m x\n' > msg.txt && … && git commit -F msg.txt"
+  // Writing a file whose CONTENT mentions `git commit` is an ordinary lane shape, and the remedy
+  // we printed could not be run. The cut must therefore also be at a real command START.
+  if (!cutIsAtCommandStart(command, inv.index)) return null;
+  const cut = inv.index;
+  const mutation = command.slice(0, cut).replace(/[\s;&|]+$/, "");
+  const commit = command.slice(cut).trim();
+  if (mutation.length === 0 || commit.length === 0) return null;
+  return { mutation, commit };
+}
+
+/**
+ * Is byte offset `cut` a command START — outside every quoted/escaped region, preceded by nothing
+ * but start-of-command or a chain separator (`&&`, `;`, `|`, newline)?
+ *
+ * `splitIsFaithful` answers "is the commit INSIDE a construct?" (subshell, substitution, heredoc,
+ * wrapper). This answers the complementary question: "is the thing we identified as the commit
+ * actually the command?" A candidate found inside a quote is a MENTION — a file's content, a
+ * `--body` value, a doc line — and slicing there hands the lane a broken command.
+ *
+ * Over-rejecting is the SAFE direction: null prints the generic sentence, which is honest about
+ * what the gate can show. Under-rejecting prints a remedy that does not run.
+ */
+function cutIsAtCommandStart(command: string, cut: number): boolean {
+  // ⛔ `$'…'` IS ANSI-C QUOTING, and inside it `\'` is an ESCAPED QUOTE (fresh review round 6,
+  // P2). The single-quote state below closes at `\'`, so a command that uses the ANSI-C form
+  // — `printf $'x\' && git commit -m y' > m.txt && …` — was read as "outside a quote" and cut
+  // inside a MENTION of `git commit`: arm 1 came out as `printf $'x\'` (bash: unexpected EOF
+  // while looking for matching '). `$'` therefore enters a state where a backslash skips the
+  // next character. `$"…"` needs no own state: a `"` inside it is still escaped the same way the
+  // plain double-quote state already models.
+  let quote: '"' | "'" | "$'" | null = null;
+  for (let i = 0; i < cut; i++) {
+    const ch = command[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === "$'") {
+      if (ch === "\\") { i++; continue; } // ANSI-C: the escape is honoured INSIDE the quotes
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") { i++; continue; } // escaped char inside double quotes
+      if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "$" && command[i + 1] === "'") { quote = "$'"; i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "\\") { i++; continue; } // escaped char outside quotes
+  }
+  if (quote !== null) return false; // the candidate sits inside a quoted region — a mention
+  const before = command.slice(0, cut).replace(/[ \t]+$/, "");
+  if (before.length === 0) return true; // the command starts with this invocation
+  const last = before[before.length - 1];
+  return last === "&" || last === ";" || last === "|" || last === "\n";
+}
+
+/**
+ * Is a byte-offset cut of `command` at its commit arm the command a lane should actually run?
+ * False for every construct in which the commit sits INSIDE something (parenthesised group /
+ * subshell, command substitution, backtick, heredoc, `sh -c`-style wrapper) — see the note above.
+ */
+function splitIsFaithful(command: string): boolean {
+  if (/[()]/.test(command)) return false;
+  if (command.includes("`")) return false;
+  if (command.includes("$(")) return false;
+  // ⛔ A BACKSLASH-QUOTED DELIMITER IS STILL A HEREDOC (fresh review round 6, P2). `<<\EOF` is
+  // the standard no-expansion spelling, and `['"]?\w` did not match it, so a heredoc body
+  // containing `git commit` was cut as if it were a command: arm 1 became a truncated heredoc
+  // and arm 2 started with the rest of the BODY, so following the remedy committed the wrong
+  // message. `-?` (dash form), `\` (no-expansion) and quotes are all the same construct.
+  if (/<<-?\s*['"\\]?\w/.test(command)) return false;
+  if (/\b(?:bash|sh|zsh|dash|ksh|eval|exec)\b[^;&|\n]*\s-c\b/.test(command)) return false;
+  return true;
+}
+
 // ── #487 — content-push RANGE scoping (T1: a content push verifies the pushed
 // range, never the whole index) ───────────────────────
 // Pure layer: classifier → tier resolver → argv builder (present state; the
@@ -3510,13 +3627,90 @@ function hashFile(projectRoot: string, filePath: string): string {
  * algorithm (inferred by hex length; hex compare is case-insensitive). The
  * check is anti-drift (file changed between verification and commit) and any
  * content change flips both digests, so sha1 acceptance does not weaken it.
- * Unknown lengths are compared as sha256 → fail closed (no match → block).
+ *
+ * ⛔ #1460 (measured 2026-10-22, this lane): md5 (32-hex) was NOT accepted, and
+ * an unrecognised length was "compared as sha256" — i.e. it could never match.
+ * A verifier that ran `md5sum` therefore produced a record the gate could never
+ * validate: EVERY commit touching that file blocked as "mismatched", and
+ * RE-VERIFYING could not clear it — the same verifier keeps producing md5, and
+ * the printed remedy ("re-dispatch the exact sha256") asks an LLM to transcribe
+ * a 64-hex digest by hand, which is how the class reproduces itself. A record
+ * the gate cannot check is not evidence — it is a permanent block.
+ *
+ * The digest algorithm is NOT the anti-drift property: the property is "some
+ * digest of the bytes the verifier saw equals a digest of the bytes on disk",
+ * and ANY of md5/sha1/sha256 changes when one byte changes. So all three are
+ * ACCEPTED as the record's digest, and the merge path re-stores the gate's own
+ * sha256 of the matched bytes (`storedDigestFor`) so a collision-broken md5 can
+ * never be the standing record. Unknown lengths still fail CLOSED (no match →
+ * block) — a value that is not a digest at all must never authorize a commit.
  */
+const DIGEST_ALGO_BY_HEX_LENGTH: ReadonlyMap<number, "md5" | "sha1" | "sha256"> = new Map([
+  [32, "md5"],
+  [40, "sha1"],
+  [64, "sha256"],
+]);
+
+/** The digest algorithm a stored record's value is in — `null` when it is not a digest. */
+export function digestAlgoForRecord(storedHash: string): "md5" | "sha1" | "sha256" | null {
+  const value = storedHash.trim();
+  // A digest is HEX of a known length. A 32-character non-hex string is not an md5 — the
+  // length table alone would claim it was (fresh review of #1460, P2), and the contract this
+  // exported helper publishes would then be false.
+  if (!/^[0-9a-f]+$/i.test(value)) return null;
+  return DIGEST_ALGO_BY_HEX_LENGTH.get(value.length) ?? null;
+}
+
 export function hashMatchesDisk(projectRoot: string, filePath: string, storedHash: string): boolean {
   const absPath = resolve(projectRoot, filePath);
   const content = hashContent(absPath); // #1092: symlink ⇒ link target, same rule as hashFile
-  const algo = storedHash.length === 40 ? "sha1" : "sha256";
-  return createHash(algo).update(content).digest("hex") === storedHash.toLowerCase();
+  const algo = digestAlgoForRecord(storedHash);
+  if (algo === null) return false; // not a digest → fail closed (#1460: never silently compare as sha256)
+  return createHash(algo).update(content).digest("hex") === storedHash.trim().toLowerCase();
+}
+
+/**
+ * #1460: the value the REGISTRY should store for a verifier-supplied digest.
+ *
+ * The rule: a supplied digest that MATCHES the bytes on disk is verified evidence
+ * about those bytes, so the record holds the gate's own sha256 of them (md5/sha1
+ * supplied → upgraded, never trusted as the standing identity). A supplied digest
+ * that does NOT match is kept VERBATIM — that is the disagreement the block check
+ * must report ("file changed since verification" / "the verifier read different
+ * bytes"), and replacing it here would silently bless the current bytes.
+ * Unhashable (deleted/unreadable) → the supplied value, unchanged.
+ */
+function storedDigestFor(projectRoot: string, relPath: string, supplied: string): string {
+  return matchAndStoredDigest(projectRoot, relPath, supplied).stored;
+}
+
+/**
+ * #1460 (fresh review round 6, P2): BOTH answers — "does the supplied digest match the bytes on
+ * disk?" and "what should the registry store?" — from ONE read of the file, in ONE place.
+ *
+ * The reason is the one `storedDigestFor`'s comment states: a writer landing between two reads (a
+ * peer lane, a build watcher, lint-staged) can make the record hold a digest of bytes the verifier
+ * did not see. `mergeVerifiedFiles` already reached `storedDigestFor` alone, but BRIDGE RECOVERY
+ * still matched with `hashMatchesDisk` (read #1) and stored with `storedDigestFor` (read #2) — so
+ * the invariant `storedDigestFor` claims held on one path and not the other. Both callers use this
+ * now, so "one read" is a property of the code rather than of one call site.
+ */
+function matchAndStoredDigest(
+  projectRoot: string,
+  relPath: string,
+  supplied: string
+): { matched: boolean; stored: string } {
+  let content: Buffer;
+  try {
+    content = hashContent(resolve(projectRoot, relPath));
+  } catch {
+    return { matched: false, stored: supplied }; // unhashable (deleted/unreadable) — fail closed
+  }
+  const algo = digestAlgoForRecord(supplied);
+  if (algo === null) return { matched: false, stored: supplied }; // not a digest → fail closed
+  const matched = createHash(algo).update(content).digest("hex") === supplied.trim().toLowerCase();
+  if (!matched) return { matched: false, stored: supplied }; // a disagreement is never blessed
+  return { matched: true, stored: createHash("sha256").update(content).digest("hex") };
 }
 
 /**
@@ -3644,7 +3838,10 @@ export function mergeVerifiedFiles(
       skipped++;
       continue;
     }
-    verifiedSet.set(key, vf.hash);
+    // #1460: store the gate's own sha256 of the bytes the supplied digest MATCHED
+    // (a matching md5/sha1 is evidence, not a standing identity); a non-matching
+    // digest is stored verbatim so the block check still reports the disagreement.
+    verifiedSet.set(key, storedDigestFor(projectRoot, relPath, vf.hash));
     blockAttempts.delete(key);
     merged++;
   }
@@ -4117,6 +4314,9 @@ export default function (pi: ExtensionAPI) {
     if (commitChainMutationClass(command) === "in-batch-mutation") {
       appendJsonl({ event: "gate_block_in_batch_chain", extension: "verification-gate", reason: "state_mutation_before_commit_same_tool_call", session_cwd: process.cwd(), command: redactCommand(command), target_cwd: cwd });
       console.log("[verification-gate] 🚫 Blocked — in-batch mutation chain (state mutation + commit in one command)");
+      // #540: print the EXACT split form — derived from the same segmenter that
+      // classified the refusal, so the remedy cannot disagree with the verdict.
+      const split = splitMutationFromCommit(command);
       return {
         block: true,
         reason: [
@@ -4124,7 +4324,13 @@ export default function (pi: ExtensionAPI) {
           "  The gate verifies the state that exists BEFORE the command runs; content created or staged inside the same",
           "  command (file writes, git add/checkout/reset/restore/rm, program output) is invisible to it — an empty",
           "  pre-state would ride the 'no changed files' allow and commit unverified content.",
-          "  → Split the operation: run the file write / staging as its OWN tool_call, then commit separately.",
+          ...(split === null
+            ? ["  → Split the operation: run the file write / staging as its OWN tool_call, then commit separately."]
+            : [
+                "  → Run them as TWO separate bash tool_calls, in this order:",
+                `    1) ${redactCommand(split.mutation)}`,
+                `    2) ${redactCommand(split.commit)}`,
+              ]),
           "    The pure commit is then gated against the real staged/working-tree state (this refusal does NOT",
           "    auto-bypass — a repeated identical chain is refused every time).",
           "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
@@ -4538,7 +4744,14 @@ export default function (pi: ExtensionAPI) {
         // and an unquoted path word-splits) — both measured against a
         // newline-terminated target, which it hashes to a different digest.
         reasons.push(`      remedy: file edited after verification OR verifier hash typo — never hand-type sha256: run sha256sum ${m.file} and re-dispatch the exact hash. If ${m.file} is a SYMLINK it commits its LINK TARGET, not whatever it points at: hash the RAW LINK BYTES with node -e 'const f=require("fs"),c=require("crypto");console.log(c.createHash("sha256").update(f.readlinkSync(process.argv[1],{encoding:"buffer"})).digest("hex"))' -- "${m.file}" (plain sha256sum follows the link — always wrong for a symlink) — #1092`);
+        // #1460: the SATISFIABLE half. Transcribing a digest is the step that
+        // reproduces this class, so the refusal must also name the digest-free
+        // route the gate already accepts (#336): a PASS with NO per-file hashes
+        // records the bytes on disk AT MERGE TIME, still diff-scoped to the
+        // blocked set. That is a converging remedy available to any verifier,
+        // and it is what makes "re-verify" actually clear the block.
       });
+      reasons.push(`    → Re-dispatch either with the exact sha256sum value, or with verified_files: [] (a PASS carrying NO per-file hashes) — the gate then records the bytes on disk at merge time, still scoped to the blocked set.`);
     }
 
     const allBlocked = [...unverified, ...mismatched.map(m => m.file)];

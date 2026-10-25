@@ -98,19 +98,22 @@ for vf in files:
         # lstat/readlink rule; os.fsencode keeps the target bytes exact.
         if os.path.islink(full) or os.path.isfile(full):
             try:
-                # Length-branch sha1/sha256 like the extension's hashMatchesDisk
-                # (#320: verifier-submitted hashes stored verbatim — 40-hex sha1
-                # entries legitimately reach the bridge; #561 review r5 P2).
-                algo = hashlib.sha1 if len(h) == 40 else hashlib.sha256
+                # Length-branch md5/sha1/sha256, mirroring the extension's
+                # `digestAlgoForRecord`/`hashMatchesDisk` (#1460: a verifier that ran `md5sum`
+                # stores a 32-hex digest; the extension now CHECKS it, and this diagnostic must
+                # agree or it reports a live record as "NO MATCH — recovery drops this entry",
+                # which is the second implementation of the same rule drifting from the first).
+                _ALGO_BY_LEN = {32: hashlib.md5, 40: hashlib.sha1, 64: hashlib.sha256}
+                algo = _ALGO_BY_LEN.get(len(h.strip())) if all(c in "0123456789abcdefABCDEF" for c in h.strip()) else None
                 blob = os.readlink(os.fsencode(full)) if os.path.islink(full) else open(full, "rb").read()
-                disk = algo(blob).hexdigest()
+                disk = algo(blob).hexdigest() if algo is not None else "not-a-digest"
             except Exception:
                 disk = "unreadable"
         else:
             disk = "missing"
     print(f"  - {path}")
     print(f"      stored: {h}")
-    print(f"      disk:   {disk}   ({'match' if disk not in ('n/a','missing','unreadable') and disk == h.lower() else 'NO MATCH — recovery drops this entry (fail-closed)' if disk != 'n/a' else ''})")
+    print(f"      disk:   {disk}   ({'match' if disk not in ('n/a','missing','unreadable','not-a-digest') and disk == h.strip().lower() else 'NO MATCH — recovery drops this entry (fail-closed)' if disk != 'n/a' else ''})")
 PYEOF
   # Explicit exit 0: the final [ -f "$AUDIT" ] && { … } short-circuits to exit
   # 1 under set -euo pipefail when the audit file has never been created — a

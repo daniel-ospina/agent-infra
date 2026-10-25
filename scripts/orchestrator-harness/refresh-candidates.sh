@@ -374,6 +374,18 @@ refresh_fail() {   # <stage> <rc> <cause> [<extra key=value>…]
   printf '[refresh] FAILED stage=%s rc=%s cmd=%s — %s\n' "$stage" "$rc" "${REFRESH_CMD:-?}" "$cause"
   exit "$rc"
 }
+# ⛔ THE PROVISION STAGE'S ONE FAILURE SHAPE (agent-infra#2229). It differs from `refresh_fail` in
+# exactly one way, and that difference is a CONTRACT rather than cosmetics: `orch-loop.sh` builds its
+# `.refresh-blocked` marker by grepping this pass's own log for `NOT PROVISIONABLE`, so a provision
+# refusal that printed only `FAILED … sub-step=interpreter …` would write a MERGE-ONLY marker with an
+# EMPTY "Reason and evidence" section. The token is therefore preserved on every arm, and the
+# sub-step, the rc and the measured cause follow it — which is what the controller's
+# `[dispatch] BLOCKED` line quotes instead of "the failing step recorded no cause".
+provision_fail() {   # <rc> <"sub-step=<name>: <cause>">
+  local rc="$1" cause="$2" tok="TRANSIENT"
+  [ "$rc" = "$EXIT_NOT_PROVISIONABLE" ] && tok="NOT PROVISIONABLE"
+  refresh_fail provision "$rc" "$tok: $cause"
+}
 # THE FLOOR. An exit this pass did not account for is recorded as a FAILURE with the stage it reached:
 # rc=0 included, because an unrecorded zero is not evidence that origination worked.
 refresh_on_exit() {
@@ -1094,8 +1106,17 @@ SCOUT_VERSIONED=0
 # Set when the resolved gate lives in a tree that CANNOT be refreshed (a vendored/scratch scout), so
 # the pass's gate line carries `unversioned=1` and the log never reads as "the current gate judged".
 SCOUT_UNVERSIONED=""
-scout_refuse() {   # <rc> <one-sentence reason> — sets the caller's exit code and logs it
+# ⛔ THE REFUSAL'S REASON MUST REACH THE RECORD, NOT ONLY THE LOG (agent-infra#2229, measured
+# 2026-10-23). `scout_sync`/`scout_verify_tool` used to end with `|| exit "$SCOUT_REFUSE_RC"`, so the
+# pass exited with the RIGHT code and no `refresh_fail` — the EXIT trap then wrote
+# `why=... the failing step recorded no cause`, and the controller's `[dispatch] BLOCKED` line (which
+# reads `state/refresh-last`, not the log) carried an unfalsifiable sentence for every pass of a
+# 26-hour outage while the real reason sat one log line above it. This variable is how the reason
+# crosses from the refusal to `refresh_fail`.
+SCOUT_REFUSE_WHY=""
+scout_refuse() {   # <rc> <one-sentence reason> — sets the caller's exit code AND the recorded cause
   SCOUT_REFUSE_RC="$1"
+  SCOUT_REFUSE_WHY="$2"
   # ⛔ THE MARKER TOKEN IS PART OF THE CONTRACT (review cycle 2, P1). `orch-loop.sh` builds
   # `.refresh-blocked` by grepping the pass's own log for `NOT PROVISIONABLE` — so an rc=3 refusal
   # that prints only prose writes a MERGE-ONLY marker with an EMPTY "Reason and evidence" section,
@@ -1107,6 +1128,110 @@ scout_refuse() {   # <rc> <one-sentence reason> — sets the caller's exit code 
     echo "[refresh] TRANSIENT: $2 (#2174). Nothing was queued or marked checked."
   fi
   return 1
+}
+# How old an `index.lock` must be before this pass treats it as ORPHANED. A live writer holds its lock
+# for the duration of one git command (seconds); a killed writer's lock lives until someone removes it.
+# 300s is 100x the slowest checkout measured here, and the failure mode of guessing LOW is corruption
+# of a live writer's index, so the seam errs high.
+SCOUT_LOCK_STALE_SECS="${SCOUT_LOCK_STALE_SECS:-300}"
+# 0 = no lock, or a stale one was removed and the reason logged; 1 = a lock is held and must not be
+# touched (SCOUT_REFUSE_WHY names its path, age and the remedy). Never silent: every arm logs, because
+# `git checkout` is what fails next and its message does not say which of the two it was.
+scout_clear_stale_lock() {
+  local gd lock age mtime age_cmp
+  gd="$(git -C "$SC" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
+  lock="$gd/index.lock"
+  # ⛔ `-e` FOLLOWS SYMLINKS, SO A DANGLING ONE READS AS "NO LOCK" (#2688 review cycle 2, P2).
+  # MEASURED: with `index.lock` a symlink to a nonexistent path, `[ -e ]` is false, so nothing aged,
+  # refused or repaired it — yet git still cannot create the lock (`File exists`), so the checkout
+  # refusal promised a self-heal ("cleared by the next pass once it is older than Ns") that could
+  # never happen and the cell loops TRANSIENT forever on an unrepaired lock. `-L` 
+  # makes the symlink visible, and the NON-REGULAR ARM below then refuses with its truthful remedy.
+  [ -e "$lock" ] || [ -L "$lock" ] || return 0
+  # ⛔ THE BOUND IS OPERATOR INPUT AND IT IS VALIDATED, NOT TRUSTED (#2688 review cycles 2-3, P1).
+  # MEASURED: `SCOUT_LOCK_STALE_SECS=5m` makes `[ "$age" -lt "5m" ]` exit 2 with `integer expression
+  # expected`, and `if` reads ANY non-zero status as FALSE — so the live-writer arm was skipped and a
+  # 0-second-old LIVE lock reached the `rm -f` below, with a `REPAIR:` line asserting it was "0s old
+  # > 5ms". The FIRST fix refused the literal `0`, and cycle 3 measured two spellings that got past it:
+  # `00`/`000` (zero-equivalent, but `$(( 00 ))` is 0 and `[ 0 -lt 0 ]` is false) and anything above
+  # INT64_MAX (accepted by a digits-only test, then the comparison itself errors). So the bound is
+  # constrained to a CANONICAL positive decimal — no leading zero, at most 9 digits (~31 years, well
+  # inside the integer range bash can compare) — and the comparison below refuses on ANY status > 1, so
+  # "could not compare" can never again be read as "not younger than the bound".
+  case "$SCOUT_LOCK_STALE_SECS" in
+    ''|*[!0-9]*|0*)
+      SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+      SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock and SCOUT_LOCK_STALE_SECS='${SCOUT_LOCK_STALE_SECS}' is not a canonical positive whole number of seconds (no leading zero, no sign, no unit), so the staleness bound CANNOT BE EVALUATED and this pass cannot tell an orphaned lock from a LIVE WRITER'S — REFUSING TO JUDGE rather than delete it. Fix: unset SCOUT_LOCK_STALE_SECS (the default is 300s), or set it to a positive integer, then re-run"
+      return 1 ;;
+  esac
+  if [ "${#SCOUT_LOCK_STALE_SECS}" -gt 9 ]; then
+    SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+    SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock and SCOUT_LOCK_STALE_SECS='${SCOUT_LOCK_STALE_SECS}' is ${#SCOUT_LOCK_STALE_SECS} digits long — beyond the range this pass can compare without an arithmetic error, so the staleness bound CANNOT BE EVALUATED and it REFUSES TO JUDGE rather than delete a lock it cannot call stale. Fix: unset SCOUT_LOCK_STALE_SECS (the default is 300s), then re-run"
+    return 1
+  fi
+  if [ ! -f "$lock" ]; then
+    SCOUT_REFUSE_RC="$EXIT_NOT_PROVISIONABLE"
+    SCOUT_REFUSE_WHY="scout at $SC has a NON-REGULAR FILE at $lock — git refuses every index write while it exists, and this pass will not delete something it cannot identify. Remove it by hand, then re-run"
+    return 1
+  fi
+  # ⛔ AN UNKNOWN AGE IS NOT AN ORPHANED LOCK (#2688 review, P1). The `|| echo 0` fallback made a
+  # FAILED `stat` report an mtime of 0, i.e. an age of ~1.7e9 — "far over the ${SCOUT_LOCK_STALE_SECS}s bound" —
+  # and the `-1` sentinel the `case` arm minted fell through the `-ge 0` test to the same place: BOTH
+  # reached the `rm -f` below, and the `REPAIR:` line they printed asserted "ORPHANED … over the
+  # bound" — a fact the code did not have. That is the one destructive path in this pass, and its
+  # failure mode (two writers interleaving index updates) is exactly what the staleness bound exists
+  # to prevent. So every arm that cannot PROVE staleness now refuses, and says what it could not read.
+  # BSD `stat -f %m` first, GNU `stat -c %Y` second — each in its OWN command substitution, because
+  # GNU's `stat -f` prints the whole filesystem record to STDOUT before exiting 1, so a shared
+  # `||` would feed that text into the arithmetic (measured on Linux).
+  mtime="$(stat -f %m "$lock" 2>/dev/null)" || mtime="$(stat -c %Y "$lock" 2>/dev/null)" || mtime=""
+  case "$mtime" in
+    ''|*[!0-9]*)
+      SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+      SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock whose AGE COULD NOT BE DETERMINED — no usable mtime could be read from it, so this pass cannot tell an orphaned lock from a LIVE WRITER'S and REFUSES TO JUDGE rather than delete something that may belong to a running git process. The next cycle retries; if the lock is known to be orphaned, rm -f $lock, then re-run"
+      return 1 ;;
+  esac
+  age=$(( $(date +%s) - mtime ))
+  case "$age" in ''|*[!0-9]*)   # a clock that jumped must not make an unreadable age look young OR stale
+    SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+    SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock whose age is not a sane number (mtime=${mtime}s, now=$(date +%s)s, age='${age}') — this pass cannot tell an orphaned lock from a LIVE WRITER'S, so it REFUSES TO JUDGE rather than delete it. The next cycle retries; if the lock is known to be orphaned, rm -f $lock, then re-run"
+    return 1 ;;
+  esac
+  # ⛔ THE COMPARISON IS CHECKED FOR ITS STATUS, NOT JUST FOR "TRUE" (#2688 review cycle 3, P1).
+  # `if [ … ]` reads every non-zero status as FALSE, so a comparison that ERRORED was indistinguishable
+  # from "the lock is NOT younger than the bound" — which is how a live lock reached `rm -f` twice.
+  # Status 0 = the lock IS at or under the bound (the live-writer refusal); status 1 = provably STALE
+  # (fall through and remove); anything else is "could not compare" and refuses.
+  # ⛔ AT EQUALITY IT REFUSES (#2688 review cycle 4, P2). The comparison was `<`, so a lock aged
+  # EXACTLY `SCOUT_LOCK_STALE_SECS` was removed while the `REPAIR:` line below printed "300s old >
+  # 300s" — an inequality the code did not hold, the same class cycle 2 fixed one line up. `-le`
+  # makes the printed relation true AND errs high at the seam, which is what the bound's own
+  # comment says it does. The (`c2`) arm pins the boundary, which nothing reached before.
+  # ⛔ THE `*)` ARM IS DELIBERATE DEFENCE IN DEPTH (review cycle 4, P2). As shipped it is
+  # UNREACHABLE: the canonical-form arm above admits 1-9 digits and `age` is digits by its own
+  # case, so the comparison can only return 0 or 1. It exists because that is a property of TWO
+  # other guards rather than of this line — the (`c3`) arm deletes both and proves this arm still
+  # refuses, so the guard cannot rot into dead code unnoticed.
+  age_cmp=0
+  [ "$age" -le "$SCOUT_LOCK_STALE_SECS" ] || age_cmp=$?
+  case "$age_cmp" in
+    0|1) ;;
+    *) SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+       SCOUT_REFUSE_WHY="scout at $SC has an index.lock at $lock whose age (${age}s, mtime=${mtime}s) could not be compared against the ${SCOUT_LOCK_STALE_SECS}s staleness bound (the comparison exited ${age_cmp}) — this pass cannot tell an orphaned lock from a LIVE WRITER'S, so it REFUSES TO JUDGE rather than delete it. The next cycle retries; if the lock is known to be orphaned, rm -f $lock, then re-run"
+       return 1 ;;
+  esac
+  if [ "$age_cmp" -eq 0 ]; then
+    SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+    SCOUT_REFUSE_WHY="scout at $SC has a LIVE git lock at $lock (${age}s old, under the ${SCOUT_LOCK_STALE_SECS}s staleness bound) — a writer may hold it and removing it could corrupt the index, so this pass REFUSES TO JUDGE rather than delete it. It is cleared automatically once orphaned; the next cycle retries"
+    return 1
+  fi
+  if ! rm -f "$lock" 2>/dev/null || [ -e "$lock" ]; then
+    SCOUT_REFUSE_RC="$EXIT_NOT_PROVISIONABLE"
+    SCOUT_REFUSE_WHY="scout at $SC has an ORPHANED git lock at $lock (${age}s old, over the ${SCOUT_LOCK_STALE_SECS}s staleness bound) that this pass could not REMOVE — git refuses every index write while it exists, so the gate can never be refreshed. Fix: rm -f $lock, then re-run"
+    return 1
+  fi
+  echo "[refresh] REPAIR: removed an ORPHANED git lock at $lock (${age}s old > ${SCOUT_LOCK_STALE_SECS}s) — it was blocking every index write in $SC, and the previous pass could only report that the checkout 'did not take' (#2229)"
+  return 0
 }
 scout_sync() {
   local before target after heads commits
@@ -1175,10 +1300,12 @@ scout_sync() {
     # must never destroy (worktree-hygiene-sweep.sh:26, AGENTS.md). UNTRACKED files are not at risk —
     # a checkout leaves them alone — which is why the scout venv survives this and is not re-paid for.
     if [ -n "$(git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-      SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
-      echo "[refresh] TRANSIENT: scout at $SC carries UNCOMMITTED changes to tracked files — moving the gate would destroy them, so it REFUSES TO JUDGE (#2174):"
-      git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null | head -5 | sed 's/^/[refresh]   /'
-      echo "[refresh]   fix: commit or discard them in $SC (it is a dedicated throwaway checkout), then re-run. Nothing was queued or marked checked."
+      # ⛔ THE REASON MUST CROSS TO THE RECORD, NOT ONLY TO THE LOG (#2688 review cycle 2, P2). This
+      # arm set `SCOUT_REFUSE_RC` and printed its own lines, but never `SCOUT_REFUSE_WHY` — so
+      # `state/refresh-last`, which is what the controller's `[dispatch] BLOCKED` line quotes, said
+      # `scout_sync refused without a recorded reason` while the cause sat one log line above it.
+      # That is #2229's symptom surviving in the change that exists to remove it.
+      scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries UNCOMMITTED changes to tracked files ($(git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null | head -5 | tr '\n' ';')) — moving the gate would destroy them; commit or discard them in $SC (it is a dedicated throwaway checkout), then re-run"
       return 1
     fi
     # ⛔ COMMITS ARE WORK TOO (review cycle 2 P2, cycle 3 P2). `checkout -B` REWRITES the branch ref
@@ -1188,18 +1315,33 @@ scout_sync() {
     commits="$(git -C "$SC" rev-list --count "$target..HEAD" 2>/dev/null || echo 0)"
     case "${commits:-0}" in
       ''|0) ;;
-      *) SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
-         echo "[refresh] TRANSIENT: scout at $SC carries $commits commit(s) not in origin/main — moving the gate would orphan them, so it REFUSES TO JUDGE (#2174). Nothing was queued or marked checked."
-         echo "[refresh]   keep them: git -C $SC branch scout-work-$(date +%s), or push them; then clear the refusal with: git -C $SC checkout -B chore/dispatch-scout origin/main"
+      *) # same defect as the arm above: RC without WHY (#2688 review cycle 2, P2).
+         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries $commits commit(s) not in origin/main — moving the gate would orphan them. Keep them: git -C $SC branch scout-work-$(date +%s), or push them; then clear the refusal with: git -C $SC checkout -B chore/dispatch-scout origin/main"
          return 1 ;;
     esac
     echo "[refresh] scout STALE at $before, refreshing to origin/main ${target:0:9} (#2174)"
+    # ⛔ AN ORPHANED GIT LOCK IS THE MEASURED CAUSE OF THE #2229 OUTAGE, AND IT IS REPAIRED HERE.
+    # 2026-10-24: `git checkout --quiet -B chore/dispatch-scout <origin/main>` exited 128 in
+    # `/Users/home/eldato/tortoise/.worktrees/dispatch-scout` with
+    #     fatal: Unable to create '…/.git/worktrees/dispatch-scout/index.lock': File exists.
+    # — a zero-byte lock left by a git process killed on 22 Oct 19:03. Every pass since refused, the
+    # stderr was swallowed by `>/dev/null 2>&1`, and the refusal PREDICTED a cause it never measured
+    # ("an UNTRACKED file is in the way") that was simply false: the scout had no untracked files and
+    # no commits ahead. An orphaned lock cannot be repaired by pretending, and it never clears itself,
+    # so a pass that only refuses here refuses forever. Repair it — but ONLY when nothing can be
+    # holding it: a lock younger than SCOUT_LOCK_STALE_SECS may belong to a LIVE writer, and removing
+    # that one would corrupt its index. Fresh ⇒ refuse and NAME the path; stale ⇒ remove and re-sync.
+    scout_clear_stale_lock || { scout_refuse "$SCOUT_REFUSE_RC" "$SCOUT_REFUSE_WHY"; return 1; }
     # ⛔ NO `--force` (review cycle 3, P2). `checkout --force` THROWS AWAY untracked files that the
     # target commits start tracking — so the old comment's "untracked files are not at risk" was only
     # true for paths no commit adds. The tracked-dirty case is refused above, so a plain checkout can
     # only fail on an untracked collision — and that failure is a refusal, not a deletion.
-    if ! git -C "$SC" checkout --quiet -B chore/dispatch-scout "$target" >/dev/null 2>&1; then
-      scout_refuse "$EXIT_TRANSIENT" "scout STALE at $before, refresh failed: 'git checkout -B chore/dispatch-scout ${target:0:9}' did not take in $SC (an UNTRACKED file is in the way of the new revision, and it is not discarded) — REFUSING TO JUDGE. Fix: move or commit it, then re-run; the next cycle retries"
+    # ⛔ ITS STDERR IS KEPT (agent-infra#2229). The refusal below quotes the tail git actually printed
+    # instead of naming a guessed cause; the guessed version survived a 26-hour outage because the
+    # real message was discarded one line before it would have been recorded.
+    if ! _co_err="$(git -C "$SC" checkout --quiet -B chore/dispatch-scout "$target" 2>&1)"; then
+      _co_tail="$(printf '%s' "$_co_err" | tr '\n' ' ' | cut -c1-400)"
+      scout_refuse "$EXIT_TRANSIENT" "scout STALE at $before, refresh failed: 'git checkout -B chore/dispatch-scout ${target:0:9}' did not take in $SC — git said: ${_co_tail:-<no output>} — REFUSING TO JUDGE. A colliding UNTRACKED file must be moved or committed; an orphaned index.lock is cleared by the next pass once it is older than ${SCOUT_LOCK_STALE_SECS}s"
       return 1
     fi
     after="$(git -C "$SC" rev-parse --short=9 HEAD 2>/dev/null || echo unknown)"
@@ -1261,11 +1403,11 @@ refresh_stage provision "provisioning (state dir, gh environment, scout worktree
 # state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
 # persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits RUNNING with `lanes: 0`
 # — the merge-only shape this change exists to remove (#1853 review).
-mkdir -p "$O" || refresh_fail provision "$EXIT_TRANSIENT" "cannot create the state directory $O — nothing can be persisted, so an empty backlog would be a false report"
+mkdir -p "$O" || provision_fail "$EXIT_TRANSIENT" "sub-step=state-dir: cannot create the state directory $O — nothing can be persisted, so an empty backlog would be a false report"
 # ⛔ FAIL-CLOSED, unlike the cache's own `mkdir -p … 2>/dev/null` further up: the reap pass records
 # its classification here and its writes abort the pass on failure, so an absent state subdirectory
 # would abort EVERY pass — a permanent no-dispatch loop whose cause was never printed (#2183).
-mkdir -p "$O/state" || refresh_fail provision "$EXIT_TRANSIENT" "cannot create $O/state — the reap pass records what it kept and released there, and cannot run without it (#2183)"
+mkdir -p "$O/state" || provision_fail "$EXIT_TRANSIENT" "sub-step=state-dir: cannot create $O/state — the reap pass records what it kept and released there, and cannot run without it (#2183)"
 # ⛔ AND WRITABLE, NOT MERELY PRESENT — the rule the `$O` probe below already states for `$O` (review
 # P3, #2183). `mkdir -p` SUCCEEDS on an existing read-only or root-owned directory, and the reap's
 # first write there then raises a Python traceback that reads to an operator as "the blacklist is
@@ -1295,7 +1437,7 @@ if ! ( : > "$O/state/.write-probe" ) 2>/dev/null; then
   # read-only `$O` next pass — latching a transient permission fault into the permanent rc=3 branch
   # (and into `.refresh-blocked`, after which the refresh is never re-spawned).
   rm -f "$O/.write-probe-pre" 2>/dev/null
-  refresh_fail provision "${EXIT_NOT_PROVISIONABLE:-3}" "NOT PROVISIONABLE: $O/state is not WRITABLE — the reap pass records what it kept and released there, so no pass could classify checked.txt (#2183). fix: chown/chmod $O/state so the orchestrating user can write it (then re-run)"
+  provision_fail "${EXIT_NOT_PROVISIONABLE:-3}" "sub-step=state-dir: $O/state is not WRITABLE — the reap pass records what it kept and released there, so no pass could classify checked.txt (#2183). fix: chown/chmod $O/state so the orchestrating user can write it (then re-run)"
   fi
 fi
 rm -f "$O/state/.write-probe"
@@ -1311,7 +1453,7 @@ rm -f "$O/state/.write-probe"
 rm -f "$O/.write-probe" 2>/dev/null
 if ! ( : > "$O/.write-probe" ) 2>/dev/null; then
   echo "[refresh] ABORT: $O is not WRITABLE — the pass could not persist its backlog (#1736)"
-  refresh_fail provision "$EXIT_TRANSIENT" "$O is not WRITABLE — the pass could not persist its backlog (agent-infra#1736)"
+  provision_fail "$EXIT_TRANSIENT" "$O is not WRITABLE — the pass could not persist its backlog (agent-infra#1736)"
 fi
 rm -f "$O/.write-probe"
 # ⛔ THE TOMBSTONE (review P1, two reviewers). Every `refresh_record_write` below can only run if the
@@ -1352,7 +1494,7 @@ if ! ( mkdir -p "$O/state" && : > "$O/state/.write-probe.$$" ) 2>/dev/null; then
   else
     _state_rc="$EXIT_TRANSIENT"
   fi
-  refresh_fail provision "$_state_rc" "$O/state is not WRITABLE — the controller reads this pass's OUTCOME there, so a pass that cannot store its record would leave the PREVIOUS outcome in place and the beat would report it as this cycle's health (agent-infra#2229)"
+  provision_fail "$_state_rc" "$O/state is not WRITABLE — the controller reads this pass's OUTCOME there, so a pass that cannot store its record would leave the PREVIOUS outcome in place and the beat would report it as this cycle's health (agent-infra#2229)"
 fi
 rm -f "$O/state/.write-probe.$$"
 # NOTE: the stage was set to `provision` with the accurate command ABOVE; it is deliberately NOT
@@ -1363,7 +1505,7 @@ refresh_record_write running provision 0 \
   "cmd=?"
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
-gh_env_verdict || { _ghev=$?; refresh_fail provision "$_ghev" "the gh environment precondition refused (the refusal line above names which one) — no candidate can be judged from this box"; }
+gh_env_verdict || { _ghev=$?; provision_fail "$_ghev" "the gh environment precondition refused (the refusal line above names which one) — no candidate can be judged from this box"; }
 
 # ── THE CORE BUDGET IS FINITE AND SHARED — ASK BEFORE YOU SPEND IT (#1736 follow-up) ─────────────
 # MEASURED 2026-10-18 on the live Mac, from consecutive `[refresh]` lines in
@@ -1444,31 +1586,47 @@ STARVED=0
 # refresh subshell exited 1 every cycle, wrote nothing, and the backlog silently never refilled.
 if [ ! -d "$SC" ]; then
   echo "[refresh] provisioning scout worktree at $SC"
-  cd "$REPO" || { echo "[refresh] ABORT: repo not found at $REPO"; exit "$EXIT_TRANSIENT"; }
+  cd "$REPO" || provision_fail "$EXIT_TRANSIENT" "sub-step=scout-worktree: the repo checkout is not at $REPO (REPO='${REPO}') — no scout worktree can be created without it"
   git fetch origin main --quiet 2>/dev/null || true
+  # ⛔ `git worktree add`'s OWN MESSAGE IS THE ONLY THING THAT SAYS WHICH WAY IT FAILED (`already
+  # registered`, a stale `worktrees/<name>` record, an ownership/safe.directory refusal, a lock). It
+  # used to be discarded with `>/dev/null 2>&1` and the pass then continued to a `cd $SC` that failed
+  # for an unrelated-looking reason (#2229).
+  # ⛔ RESET BEFORE THE BRANCH, not only on failure (#2688 review, P2): `_wt_rc` was assigned ONLY
+  # in the failure arm, so it persists whatever it was last set to — the "set it and hope nothing
+  # reuses the name" class. Any refactor that reuses the name turns a SUCCESSFUL `worktree add` into
+  # a recorded failure, so the status is cleared here and the two arms are the only writers.
+  _wt_rc=0
   if git rev-parse --verify -q "refs/heads/chore/dispatch-scout" >/dev/null 2>&1; then
-    git worktree add "$SC" chore/dispatch-scout >/dev/null 2>&1
+    _wt_err="$(git worktree add "$SC" chore/dispatch-scout 2>&1)" || _wt_rc=$?
   else
-    git worktree add "$SC" -b chore/dispatch-scout origin/main >/dev/null 2>&1
+    _wt_err="$(git worktree add "$SC" -b chore/dispatch-scout origin/main 2>&1)" || _wt_rc=$?
+  fi
+  if [ "${_wt_rc:-0}" -ne 0 ]; then
+    provision_fail "$EXIT_TRANSIENT" "sub-step=scout-worktree: 'git worktree add' FAILED rc=${_wt_rc} in $REPO creating $SC — git said: $(printf '%s' "${_wt_err:-<no output>}" | tr '\n' ' ' | cut -c1-400) — the scout is what runs the gate, so without it no candidate can be judged"
   fi
 fi
-cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-flight issues"; exit "$EXIT_TRANSIENT"; }
+cd "$SC" || provision_fail "$EXIT_TRANSIENT" "sub-step=scout-worktree: no usable scout worktree at $SC — 'git worktree add' reported success (or the directory already existed) but the tree cannot be entered, so the gate cannot run. If the directory exists and is a broken worktree record: rm -rf $SC && git -C $REPO worktree prune, then re-run"
 # ⛔ BEFORE THE TOOL IS RESOLVED, not after: a tool that only exists at `origin/main` must be found
 # in the refreshed tree, and a refusal must land before a `uv sync` is paid for.
-scout_sync || exit "$SCOUT_REFUSE_RC"
+# ⛔ AND ITS REASON IS RECORDED, NOT JUST EXITED WITH (#2229). `|| exit "$SCOUT_REFUSE_RC"` produced
+# `rc=1` with `why=... recorded no cause` in `state/refresh-last` for 26 hours; `scout_refuse` now
+# publishes `SCOUT_REFUSE_WHY` so the controller's BLOCKED line names the failing sub-step, the
+# command and git's own message.
+scout_sync || provision_fail "$SCOUT_REFUSE_RC" "sub-step=scout-sync: ${SCOUT_REFUSE_WHY:-scout_sync refused without a recorded reason}"
 
 # Resolve the tool BEFORE spending time on a venv: a repo with no tool can never dispatch, whatever
 # its environment, and the reason must be the one an operator sees.
 if ! resolve_preflight; then
-  echo "[refresh] NOT PROVISIONABLE: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
+  # ⛔ THE SEARCH LIST SURVIVES THE CONVERSION TO `provision_fail` (rebase onto #2382): it was added
+  # on main after this branch forked, and it is the only line that names WHERE the tool was looked for.
+  # The branch's contribution is the RECORDED CAUSE, not a shorter diagnostic — so both are kept.
   echo "[refresh]   looked for (in this order): $(preflight_search_paths_one_line)"
-  echo "[refresh]   this repo cannot be pre-flighted for dispatch — the cell would merge only (#1736)"
-  echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env) or vendor tools/collision_preflight.py into the repo"
-  exit "$EXIT_NOT_PROVISIONABLE"
+  provision_fail "$EXIT_NOT_PROVISIONABLE" "sub-step=preflight-tool: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}') — this repo cannot be pre-flighted for dispatch, so the cell would merge only (#1736). Fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env) or vendor tools/collision_preflight.py into the repo"
 fi
 # The identity of the bytes that will judge this pass — ONE line per pass, so "which gate decided
 # this?" is answerable from the log instead of inferred from the branch (#2174).
-scout_verify_tool || exit "$SCOUT_REFUSE_RC"
+scout_verify_tool || provision_fail "$SCOUT_REFUSE_RC" "sub-step=scout-verify-tool: ${SCOUT_REFUSE_WHY:-the resolved gate is not the versioned one}"
 echo "[refresh] gate: $(scout_gate_id "$PREFLIGHT")${SCOUT_UNVERSIONED:+ unversioned=1}"
 
 # ── the scout venv: ONLY for a repo that declares a Python/uv environment ─────────────────────
@@ -1486,11 +1644,7 @@ if [ ! -x "$PY" ]; then
     # ⛔ Not "any python3": the tool REFUSES <3.12 with exit 3 and no VERDICT, which the loop below
     # would absorb as a per-issue "no verdict" and exit 0 — merge-only and silent (#1748 review).
     if ! resolve_python; then
-      echo "[refresh] NOT PROVISIONABLE: no Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR to run the pre-flight tool — $PY_WHY"
-      echo "[refresh]   the tool refuses an older interpreter (exit 3, NO VERDICT), so the backlog would"
-      echo "[refresh]   stay empty and the refresh would exit 0 — a cell that looks RUNNING and MERGE ONLY (#1736)"
-      echo "[refresh]   fix: set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>, or put one on PATH"
-      exit "$EXIT_NOT_PROVISIONABLE"
+      provision_fail "$EXIT_NOT_PROVISIONABLE" "sub-step=interpreter: no Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR to run the pre-flight tool — $PY_WHY. The tool refuses an older interpreter (exit 3, NO VERDICT), so the backlog would stay empty and the refresh would exit 0 — a cell that looks RUNNING and MERGE ONLY (#1736). Fix: set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>, or put one on PATH"
     fi
   else
     # Read the extras from the PROJECT rather than hardcoding tortoise's: `uv sync --extra X`
@@ -1513,24 +1667,18 @@ if [ ! -x "$PY" ]; then
     echo "[refresh] provisioning scout venv (uv sync${EXTRAS:+ $EXTRAS})"
     # shellcheck disable=SC2086  # $EXTRAS is a deliberate, space-separated argv list
     if ! UVOUT="$(cd "$SC" && "$UV" sync $EXTRAS 2>&1)"; then
-      echo "[refresh] ABORT: uv sync failed in $SC — run it by hand, then re-run the refresh"
-      printf '%s\n' "$UVOUT" | tail -5 | sed 's/^/[refresh]   /'
-      exit "$EXIT_TRANSIENT"
+      provision_fail "$EXIT_TRANSIENT" "sub-step=scout-venv: uv sync failed in $SC — uv said: $(printf '%s' "$UVOUT" | tr '\n' ' ' | tail -c 400)"
     fi
-    [ -x "$PY" ] || { echo "[refresh] ABORT: uv sync reported success but $PY is missing"; exit "$EXIT_TRANSIENT"; }
+    [ -x "$PY" ] || provision_fail "$EXIT_TRANSIENT" "sub-step=scout-venv: 'uv sync' reported SUCCESS but the interpreter it should have produced is MISSING at $PY — nothing can run the gate, so this is a venv-provisioning failure, not a healthy pass"
   fi
 fi
 if [ -z "$PY" ] || ! "$PY" -c '' >/dev/null 2>&1; then
-  echo "[refresh] NOT PROVISIONABLE: no usable python to run the pre-flight tool (no scout venv, no python3)"
-  exit "$EXIT_NOT_PROVISIONABLE"
+  provision_fail "$EXIT_NOT_PROVISIONABLE" "sub-step=interpreter: no usable python to run the pre-flight tool — the selected interpreter $PY cannot execute (no scout venv, and PY_WHY='${PY_WHY:-}')"
 fi
 # ⛔ The VENV interpreter is version-gated too: `uv sync` honours the project's `requires-python`,
 # which may be lower than the tool needs, so an existing venv is not evidence the tool can run in it.
 if ! py_satisfies_min "$PY"; then
-  echo "[refresh] NOT PROVISIONABLE: the selected interpreter $PY is older than Python $MIN_PY_MAJOR.$MIN_PY_MINOR, which the pre-flight tool requires"
-  echo "[refresh]   it would refuse it (exit 3, NO VERDICT) and the refresh would exit 0 having queued nothing (#1748 review)"
-  echo "[refresh]   fix: set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>, or rebuild the scout venv on a newer requires-python"
-  exit "$EXIT_NOT_PROVISIONABLE"
+  provision_fail "$EXIT_NOT_PROVISIONABLE" "sub-step=interpreter: the selected interpreter $PY is older than Python $MIN_PY_MAJOR.$MIN_PY_MINOR, which the pre-flight tool requires — it would refuse it (exit 3, NO VERDICT) and the refresh would exit 0 having queued nothing (#1748 review). Fix: set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>, or rebuild the scout venv on a newer requires-python"
 fi
 git fetch origin --quiet 2>/dev/null || true
 

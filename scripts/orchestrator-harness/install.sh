@@ -561,6 +561,18 @@ command -v python3 >/dev/null 2>&1 \
   || die "python3 is not on PATH — the merge reminder (merge-reminder.py) cannot run without it"
 python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/merge-reminder.py" 2>/dev/null \
   || die "merge-reminder.py is missing or does not parse"
+# check-class.py / nochk-resolve.py (agent-infra#2719) are HARD DEPENDENCIES of the loop's own
+# classification, so they take the SAME parse gate: a syntax error in either one installs clean (the
+# files exist, so the loop's startup check does not fire), `python3 $O/check-class.py` exits 1 with
+# stderr discarded, and EVERY PR classifies `V=""` — no merge, no fixer, no reviewer — with no signal.
+# UNGUARDED, like their neighbours: a `[ -f ]` guard made a MISSING file pass a gate that exists to
+# catch a broken one.
+for _py in check-class.py nochk-resolve.py; do
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is not on PATH — the NOCHECKS arm ($_py) cannot run without it"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/$_py" 2>/dev/null \
+    || die "$_py is missing or does not parse — the controller cannot classify a single PR without it"
+done
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
@@ -1251,7 +1263,13 @@ DRIFTED=""
 # runs (`install.sh`) must say so. The template ALREADY renders `/bin/bash __HARNESS__/launchd-controller.sh`
 # (its `<string>__HARNESS__/__ENTRY__</string>` argument) with `WorkingDirectory __O__` on this head
 # (#2020 lifted it), so this row guards the live file the job executes, not a future flip.
-for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
+#
+# check-class.py / nochk-resolve.py (agent-infra#2719) are HARD DEPENDENCIES of the loop's own
+# classification: `V` is computed by `python3 $O/check-class.py` on every PR, and the NOCHECKS arm runs
+# `$O/nochk-resolve.py`. A `$O` with the new `orch-loop.sh` and an OLD file set classifies EVERY PR as
+# `V=""` — no merge arm, no fixer, the controller silently stops working — and the only trace is one
+# startup warning. That is exactly the partial-reseed drift this list exists to catch.
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
