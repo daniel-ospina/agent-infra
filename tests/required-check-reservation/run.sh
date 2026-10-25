@@ -497,7 +497,10 @@ done
 # A stray INDENTED line inside a `uses:` job made the file invalid YAML but was swallowed as
 # "nested content" — while the suite treats the analogous stripes elsewhere as unreadable. Nested
 # content is now allowed only under a key whose value really is nested.
-if append "$WF" "$TMP/wf-usesstray.yml" $'jobs: {}\n  sneaky:\n    uses: actions/checkout@v4\n      runs-on: [ubuntu-latest, required-check]\n'; then
+# ⛔ The fixture must NOT prepend a second `jobs:`: that refuses first (arm 32's mechanism) and this
+# arm would then pass whatever `reusableJobExempt` does — the vacuous-arm defect review round 8
+# found. Guarded here by `arm37-guard` in the mutation check below.
+if append "$WF" "$TMP/wf-usesstray.yml" $'  sneaky:\n    uses: actions/checkout@v4\n      runs-on: [ubuntu-latest, required-check]\n'; then
   run_expect 2 "37 UNREADABLE a stray nested line in a 'uses:' job is not swallowed" "$TMP/wf-usesstray.yml" "$DOC"
 else
   fail "37 MUTATION-NOT-APPLIED"
@@ -537,6 +540,107 @@ if mutate "$WF" "$TMP/wf-eqblock.yml" "$EXPR_FIND" $'    runs-on:\n      - '"$EX
   run_expect 1 "40 MUTANT a one-item block sequence carrying a token is REFUSED" "$TMP/wf-eqblock.yml" "$DOC"
 else
   fail "40 MUTATION-NOT-APPLIED (the variable expression was not found)"
+fi
+
+# ── 41. Round 8: an INDENTED line under a top-level key whose value is already complete ───────
+# Such a line cannot legally exist: the document does not parse. Skipping it certified a tree that
+# yaml.safe_load REJECTS, with the reservation hidden inside the skipped job.
+if append "$WF" "$TMP/wf-completekey.yml" $'permissions: read-all\n  sneaky:\n    runs-on: [ubuntu-latest, required-check]\n'; then
+  run_expect 2 "41 UNREADABLE an indented line under a COMPLETE top-level key is REFUSED" "$TMP/wf-completekey.yml" "$DOC"
+else
+  fail "41 MUTATION-NOT-APPLIED"
+fi
+
+# …and a top-level key whose value is DEFERRED to its children must still accept them.
+if append "$WF" "$TMP/wf-blockkey.yml" $'permissions:\n  contents: read\n'; then
+  run_expect 0 "42 CONTROL a top-level key with a nested value stays GREEN" "$TMP/wf-blockkey.yml" "$DOC"
+else
+  fail "42 MUTATION-NOT-APPLIED"
+fi
+
+# ── 43–46. VGATE round 8: an UNTERMINATED construct must not defer "children are legal" ────────
+# Exempting `&`, `!`, `[`, `{` without closure tracking meant an unterminated one accepted every
+# following indented line forever — rc 0 over a file yaml.safe_load REJECTS. Only a block scalar
+# (`|` / `>`) is exempt now, because its children are literal TEXT and can never hide a job; a
+# legitimate multi-line flow is REFUSED rather than guessed.
+for spec in \
+  'permissions: [|43 UNREADABLE an unterminated flow sequence is REFUSED' \
+  'permissions: {|44 UNREADABLE an unterminated flow mapping is REFUSED' \
+  'permissions: \&|45 UNREADABLE a dangling anchor is REFUSED' \
+  'run-name: !foo|46 UNREADABLE a dangling tag is REFUSED'; do
+  head_text="${spec%%|*}"
+  label="${spec#*|}"
+  if append "$WF" "$TMP/wf-unterm.yml" "$head_text"$'\n  sneaky:\n    runs-on: [ubuntu-latest, required-check]\n'; then
+    run_expect 2 "$label" "$TMP/wf-unterm.yml" "$DOC"
+  else
+    fail "$label — MUTATION-NOT-APPLIED"
+  fi
+done
+
+# ── 47–49. The no-exemption rule: a top-level INLINE value refuses indented children ──────────
+# Round 8 tried to exempt block scalars (their children are literal TEXT, so they cannot hide a job).
+# The VGATE showed the exemption is undecidable by first character: a MALFORMED header
+# (`run-name: |#x`) and an ILLEGALLY DEDENTED body are both accepted by a first-character check and
+# both make yaml.safe_load REJECT the document — GREEN over an unparseable file. There is no small
+# correct subset, so the rule is now total: an inline top-level value refuses indented children.
+# ⚠️ This deliberately over-blocks a legitimate top-level block scalar / multi-line flow. No workflow
+# in this repo uses one (arm 0 proves the 11 real files stay green), and the refusal NAMES the
+# construct, so the cost of a future one is a fixable message, never a wrong verdict.
+if append "$WF" "$TMP/wf-scalar.yml" $'run-name: |\n  a literal string, not structure\n'; then
+  run_expect 2 "47 REFUSED a top-level block scalar is not graded (deliberate over-block)" "$TMP/wf-scalar.yml" "$DOC"
+else
+  fail "47 MUTATION-NOT-APPLIED"
+fi
+
+if append "$WF" "$TMP/wf-badheader.yml" $'run-name: |#x\n  sneaky:\n    runs-on: [ubuntu-latest, required-check]\n'; then
+  run_expect 2 "48 UNREADABLE a malformed block-scalar header is not graded" "$TMP/wf-badheader.yml" "$DOC"
+else
+  fail "48 MUTATION-NOT-APPLIED"
+fi
+
+if append "$WF" "$TMP/wf-dedent.yml" $'run-name: |\n    a\n  sneaky:\n    runs-on: [ubuntu-latest, required-check]\n'; then
+  run_expect 2 "49 UNREADABLE an illegally dedented block-scalar body is not graded" "$TMP/wf-dedent.yml" "$DOC"
+else
+  fail "49 MUTATION-NOT-APPLIED"
+fi
+
+# …while a top-level BLOCK MAPPING and a childless scalar stay green (the rule is about INLINE values
+# owning children, not about top-level keys existing).
+if append "$WF" "$TMP/wf-topscalar.yml" $'run-name: CI\n'; then
+  run_expect 0 "50 CONTROL a childless top-level scalar stays GREEN" "$TMP/wf-topscalar.yml" "$DOC"
+else
+  fail "50 MUTATION-NOT-APPLIED"
+fi
+
+# ── 51–54. VGATE round 8 (second pass): a TAB, and `key :value` ────────────────────────────────
+# A first-column-only tab guard let `runs-on:\tubuntu-latest` and a merely TRAILING tab through as
+# GREEN over files yaml.safe_load REJECTS. A tab is not decidable in the general case without
+# tracking quoted scalars and block-scalar bodies, so the whole character is refused (no workflow in
+# this repo contains one — arm 0 proves it).
+if mutate "$WF" "$TMP/wf-tabsep.yml" '    runs-on: ubuntu-latest' $'    runs-on:\tubuntu-latest'; then
+  run_expect 2 "51 UNREADABLE a tab used as a separator is REFUSED" "$TMP/wf-tabsep.yml" "$DOC"
+else
+  fail "51 MUTATION-NOT-APPLIED"
+fi
+
+if mutate "$WF" "$TMP/wf-tabtrail.yml" '    runs-on: ubuntu-latest' $'    runs-on: ubuntu-latest\t'; then
+  run_expect 2 "52 UNREADABLE a trailing tab is REFUSED" "$TMP/wf-tabtrail.yml" "$DOC"
+else
+  fail "52 MUTATION-NOT-APPLIED"
+fi
+
+# `key :value` — whitespace before the colon with a value that does NOT start at the next space — is
+# not valid YAML, but it was modelled as a key with an inline value and graded GREEN.
+if append "$WF" "$TMP/wf-spacecolon.yml" $'a :b\n'; then
+  run_expect 2 "53 UNREADABLE 'key :value' (invalid YAML) is REFUSED" "$TMP/wf-spacecolon.yml" "$DOC"
+else
+  fail "53 MUTATION-NOT-APPLIED"
+fi
+
+if append "$WF" "$TMP/wf-spacecolonok.yml" $'a : b\n'; then
+  run_expect 0 "54 CONTROL 'key : value' (valid YAML) stays GREEN" "$TMP/wf-spacecolonok.yml" "$DOC"
+else
+  fail "54 MUTATION-NOT-APPLIED"
 fi
 
 echo
