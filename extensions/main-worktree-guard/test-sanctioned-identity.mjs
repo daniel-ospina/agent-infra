@@ -62,20 +62,17 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
-import { closureOf, computePin, diskTree, gitTree, pinReport, sanctionedPaths } from "./sanctioned-pin-tree.mjs";
+import { closureOf, computePin, diskTree, gitTree, parseRefArg, pinReport, sanctionedPaths } from "./sanctioned-pin-tree.mjs";
 
 const HERE = realpathSync(fileURLToPath(new URL(".", import.meta.url)));
 const REPO = realpathSync(join(HERE, "..", ".."));
 const PIN_JSON = join(HERE, "sanctioned-scripts.pin.json");
 const HOOKS = new URL("./module-load-hooks.mjs", import.meta.url).href;
 
-// `--ref <rev>` / SANCTIONED_PIN_REF select the commit freshness is judged on
-// (#2818). Absent ⇒ the working tree, which is the only correct reading on a
-// push to `main` and on a checkout of the change itself.
-const ARGV = process.argv.slice(2);
-const CUT = ARGV.includes("--cut");
-const REF_FLAG = ARGV.indexOf("--ref");
-const REF = REF_FLAG >= 0 ? ARGV[REF_FLAG + 1] : process.env.SANCTIONED_PIN_REF;
+// `--ref <rev>` selects the COMMIT freshness is judged on (#2818). Absent ⇒ the
+// working tree, which is the only correct reading on a push to `main` and on a
+// checkout of the change itself. An empty/missing value is an ERROR, never a
+// silent fall back to the working tree (`parseRefArg` carries the reasoning).
 
 // A blocked git op, assembled so this file's own text does not carry the
 // operation as one literal (the guard would refuse to run its own suite).
@@ -90,6 +87,15 @@ function expect(name, got, expected) {
 function fatal(name, detail) {
   console.log(`❌ ${name}: ${detail}`);
   fail++;
+}
+
+let CUT = false;
+let REF = null;
+try {
+  ({ cut: CUT, ref: REF } = parseRefArg(process.argv.slice(2)));
+} catch (e) {
+  fatal("--ref", String((e && e.message) || e));
+  process.exit(1);
 }
 
 // ── the TREE the sanctioned surface and the pin are read from ─────────────

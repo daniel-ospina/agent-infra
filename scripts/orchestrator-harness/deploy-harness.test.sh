@@ -1152,31 +1152,252 @@ fi
 # SHOULD red — a depth-1 glob copy is exactly what this forbids — and the correct resolution is to
 # emit `deploy-harness.sh --src '$SHIPPED' --o '$O'`, not to relax this check. Do not "fix" a red here
 # by deleting the assertion; that re-introduces #2041.
-REMEDY_SITES="install.sh orch-loop.sh dispatch-merge.sh chain-merge.sh refresh-candidates.sh check-deployed-drift.sh report.sh merge-one.sh cloud-cell-supervisor.sh"
-for _site in $REMEDY_SITES; do
+# ⛔ ARM (1) IS PER-FILE *COUNTED*, NOT PER-FILE *MENTIONED* (review P1 2026-10-24). `grep -q` asked
+# only "does this file name the helper ANYWHERE", so reverting ONE of orch-loop.sh's twenty remedy
+# sites left the arm green — the overclaim the deleted paragraph used to admit. A FLOOR of 
+# `deploy-harness.sh` mentions per file is the cheapest honest pin: reverting a remedy drops the count
+# below the floor and reds; ADDING a remedy raises it and stays green (so this is not a churn tax).
+# Floors are today's measured counts (`grep -c 'deploy-harness\.sh'`); when a file gains a remedy,
+# raising its floor is a deliberate one-token edit, which is the point.
+# ⛔ AND A FLOOR ALONE STILL CANNOT SEE A *SWAP* — a remedy replaced in place by a third mechanism
+# keeps the mention count identical. That is arm (2)'s job, so (2) now covers the whole-tree copy
+# shapes too (`cp -R "$H"/. "$O"/` — the #2041 incident line verbatim — plus `cp "$H"/*`, `rsync -a
+# "$H"/`), not just the `*.sh` glob.
+# ⛔ THE FLOORS ARE THE MEASURED COUNTS, NOT ONE BELOW THEM (review P1 2026-10-25). `-ge` is used
+# below, so a floor one BELOW today's count is a floor that tolerates exactly one reverted remedy:
+# at head `orch-loop.sh` carried 21 mentions and `refresh-candidates.sh` 5, while the floors said 20
+# and 4 — reverting a single remedy left both green, which is the defect this arm exists to catch.
+# The rule: each number is `grep -c 'deploy-harness\.sh' <file>` as measured NOW.
+REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:21 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1"
+for _sf in $REMEDY_SITES_FLOOR; do
+  _site="${_sf%%:*}"; _floor="${_sf##*:}"
   if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
   if [ -z "$_sp" ]; then
     bad "remedy site missing from the harness: $_site"
   else
-    grep -q 'deploy-harness\.sh' "$_sp" 2>/dev/null \
-      && ok "remedy site names the verified redeploy helper: $_site" \
-      || bad "  $_site does not name deploy-harness.sh — its remedy is the unverified copy again"
+    _m="$(grep -c 'deploy-harness\.sh' "$_sp" 2>/dev/null)"; [ -n "$_m" ] || _m=0
+    [ "$_m" -ge "$_floor" ] \
+      && ok "remedy site names the verified redeploy helper: $_site ($_m mention(s), floor $_floor)" \
+      || bad "  $_site names deploy-harness.sh only $_m time(s), floor $_floor — a remedy reverted to the unverified copy (or to a third mechanism)"
   fi
 done
 
-BARE_PAT='cp[[:space:]][^|;&]*[*]\.sh[[:space:]]+[^[:space:]`]'
-NAMED_DEPLOY_IMPLS="deploy-crossbox.sh cloud-cell-quiesce.sh"
+# ── the detectors ────────────────────────────────────────────────────────────────────────────────
+# BARE_PAT: a `cp … *.sh` handed to a human/agent.  DEPTH_PAT: a whole-tree copy INTO the harness
+# output dir (`$O`) — `cp -R "$H"/. "$O"/`, `cp "$H"/* "$O"/`, `rsync -a "$H"/ "$O"/`. The
+# second exists because no `*.sh`-glob pattern can ever see those, and `cp -R "$H"/. "$O"/` is the
+# #2041 incident line verbatim. It is anchored on a source path ending in `/[.*]` or `/` AND a
+# destination of `$O`, so it does NOT flag a legitimate named-file copy (`cp "$HERE/claims.sh"
+# "$O/claims.sh"`), a systemd `install -m … "$UNIT_DIR/"`, or prose that merely mentions `$O` later
+# on the line.
+# ⛔ A LEFT BOUNDARY, like its two siblings below (review P2 2026-10-25). Without it the literal
+# `cp ` matched INSIDE `scp `: measured `scp "$H"/*.sh box:"$O"/` reported a hit. A false positive
+# here is how this check gets deleted ("cry wolf until someone turns it off"), so the boundary is
+# free insurance — it costs none of the forbidden shapes, because a real `cp` sits at line start, or
+# after a space or a separator, none of which is an alnum/underscore.
+# ⛔ `install` IS A THIRD MECHANISM AND WAS IN NEITHER ALTERNATION (review P1 2026-10-25). The header
+# above names `install -m 755` as a mechanism arm (1) cannot see; `rsync` was put into (2) and
+# `install` was not, so measured `install -m 0755 "$H"/*.sh "$O"/` was reported by NO arm at all —
+# the pair was defeatable by the exact third mechanism its own comment names.
+BARE_PAT='(^|[^[:alnum:]_])(cp|install)[[:space:]][^|;&]*[*]\.sh[[:space:]]+[^[:space:]`]'
+# ⛔ BARE_PAT IS SOURCE-FIRST ONLY, so it can never see `cp -t "$O"/ "$H"/*.sh` — the DESTINATION-FIRST
+# spelling of the very same copy (review P2 2026-10-25, measured: 0 hits). `-t`/`-pt`/`--target-directory`
+# are one-token respellings of the guarded shape, so the pair would otherwise be defeated by reordering
+# the arguments. Two shapes go into the positive control below, so this arm is pinned the same way.
+# The optional `([^|;&]*[[:space:]])?` lets the flag follow `cp ` directly OR appear after other
+# arguments; the flag token must END in `t` (`-t`, `-pt`, `-Rt`) and be followed by a space, so a
+# legitimate `cp -R "$f" "$O/"` or `cp -p x.txt y/` is not flagged.
+BARE_T_PAT='(^|[^[:alnum:]_])(cp|rsync|install)[[:space:]]([^|;&]*[[:space:]])?(-[[:alpha:]]*t[[:space:]]|--target-directory(=|[[:space:]]))[^|;&]*[*]\.sh'
+# ⛔ THE DESTINATION MATCHES BOTH SPELLINGS OF THE VARIABLE (review P2 2026-10-25): the first version
+# anchored on a literal `$(O|OUT)`, so `cp -R "$H"/. "${O}"/` — a one-token respelling of the #2041
+# incident line, and `${O}` is live spelling in the shipped scripts — escaped the detector built to
+# catch it. `\$\{?(O|OUT)\}?` covers `$O`, `${O}`, `$OUT`, `${OUT}`.
+DEPTH_PAT='(^|[^[:alnum:]_])(cp|rsync|install)[[:space:]]+[^|;&]*/(\.|\*)?\\?["'"'"']?[[:space:]]+\\?"?\$\{?(O|OUT)\}?([^[:alnum:]_]|$)'
+# ⛔ THE HITS ARE COMPUTED AFTER A QUOTE-AWARE TRAILING-COMMENT STRIP, and the matcher is ONE
+# function so the fixtures below test THE SAME CODE the scan uses. The old `grep -v '^\s*#'`
+# dropped only lines that BEGIN with `#`, so an inline note (`echo x   # cp '$H'/*.sh '$O'/`) would
+# have reddened the suite — a latent false positive, which is how a real check gets deleted. The
+# strip tracks quote parity, so `echo "a # b"; cp "$H"/*.sh "$O"/` still MATCHES (the `#` is inside
+# the quotes) and no genuine hit is lost.
+_bare_cp_hits() {  # $1 = file → offending "LINENO: line" records, comments stripped
+  # ⛔ THE PATTERNS GO THROUGH ENVIRON, NOT `-v` (found by THIS case's own positive control). `awk -v`
+  # runs the value through ESCAPE PROCESSING, so `\.` became `.` and `\*` became a BARE `*` — an
+  # illegal ERE primary that made awk ABORT on its first record. Combined with the `2>/dev/null` this
+  # function used to carry, that failure was SILENT: every file scanned to zero hits, so the guard
+  # reported a clean tree while matching nothing. ENVIRON is not escape-processed, and stderr is left
+  # unwrapped so a future breakage is visible instead of absorbed.
+  BARE_PAT="$BARE_PAT" BARE_T_PAT="$BARE_T_PAT" DEPTH_PAT="$DEPTH_PAT" awk '
+  BEGIN { bare=ENVIRON["BARE_PAT"]; bare_t=ENVIRON["BARE_T_PAT"]; depth=ENVIRON["DEPTH_PAT"]; pend=""; pend_nr=0 }
+  function scan(logical, nr,   out,q,n,i,c) {
+    out=""; q=""; n=length(logical)
+    for (i=1;i<=n;i++) {
+      c=substr(logical,i,1)
+      # ⛔ A BACKSLASH CONSUMES THE NEXT CHARACTER (review P2 2026-10-25). Without this the strip was
+      # BLIND to escapes: in `echo "a \" # b"; cp "$H"/*.sh "$O"/` the escaped quote closed the
+      # string early, the whitespace-preceded `#` then read as a comment, and `break` dropped a
+      # GENUINE bare-cp hit — a real remedy certified clean, which is the false negative this whole
+      # case exists to prevent. Copying the escaped pair keeps quote parity truthful.
+      if (c=="\\") { out=out c; i++; if (i<=n) out=out substr(logical,i,1); continue }
+      if (q=="") {
+        if (c=="\"" || c=="\047") { q=c; out=out c; continue }
+        if (c=="#" && (i==1 || substr(logical,i-1,1) ~ /[[:space:]]/)) break
+        out=out c
+      } else { out=out c; if (c==q) q="" }
+    }
+    if (out ~ bare || out ~ bare_t || out ~ depth) print nr ": " out
+  }
+  # ⛔ A BACKSLASH LINE-CONTINUATION IS JOINED BEFORE MATCHING (review P2 2026-10-25). The patterns
+  # were applied per PHYSICAL line, so `cp -R "$H"/. \` + `<newline>  "$O"/` — the #2041 incident
+  # line wrapped by a formatter, or by a long `|| die "…"` — read CLEAN in the two newer arms: the
+  # `cp` token and the `$O` destination were on different records. Joining continuations first makes
+  # the matcher see the command the shell will actually run; the reported line number is the FIRST
+  # physical line, so the operator is pointed at the start of the statement.
+  {
+    if (pend=="") { pend_nr=NR; pend=$0 }
+    else { pend = pend " " $0 }
+    if (pend ~ /\\$/) { pend = substr(pend, 1, length(pend)-1); next }
+    scan(pend, pend_nr); pend=""
+  }
+  END { if (pend != "") scan(pend, pend_nr) }' "$1"
+}
+# ⛔ A POSITIVE CONTROL, because an effect-scan with no positive control cannot fail (review P1
+# 2026-10-24). Once the tree is clean, `[ -z "$HITS" ]` is true for ANY pattern — including one broken
+# into never matching — so the suite would go green over the exact regression it was rewritten to
+# catch, and did. These fixtures drive _bare_cp_hits ITSELF: every BAD shape must be reported, every
+# SAFE shape must not. A pattern change that loses a shape, or gains a false positive, reds HERE.
+_FIX="$T/bare-cp-fixtures.txt"
+{
+  printf '%s\n' 'cp "$H"/*.sh "$O"/'
+  printf "%s\n" "cp '\$H'/*.sh '\$O'/"
+  printf '%s\n' 'cp -p "$H"/*.sh "$O"/ || die "seed failed"'
+  printf '%s\n' '    cp "$H"/*.sh "$O"/'
+  printf '%s\n' 'echo x; cp "$H"/*.sh "$O"/'
+  printf '%s\n' 'sudo cp "$H"/*.sh "$O"/'
+  printf '%s\n' 'echo "a # b"; cp "$H"/*.sh "$O"/'
+  printf '%s\n' 'cp -R "$H"/. "$O"/'
+  printf '%s\n' 'cp "$H"/* "$O"/'
+  printf '%s\n' 'rsync -a "$H"/ "$O"/'
+  printf '%s\n' 'deploy() { cp -R "$R"/scripts/orchestrator-harness/. "$O"/; }'
+  # ⛔ THE BRACE SPELLING AND AN ESCAPED QUOTE BEFORE A REAL HIT (review P2 2026-10-25). `"${O}"` is
+  # `$O` respelled, and `${O}` is live in the shipped scripts; the escaped quote is what defeated the
+  # comment stripper's quote parity. Both are forbidden shapes and both are REAL (measured on the
+  # previous version: neither was reported).
+  printf '%s\n' 'cp -R "$H"/. "${O}"/'
+  printf '%s\n' 'echo "a \" # b"; cp "$H"/*.sh "$O"/'
+  # ⛔ THE DESTINATION-FIRST SPELLING (review P2 2026-10-25). `cp -t "$O"/ "$H"/*.sh` is the same
+  # copy with the arguments reordered; BARE_PAT is source-first only and reported 0 of these, so
+  # without these two fixtures a one-token reorder escaped both arms.
+  printf '%s\n' 'cp -t "$O"/ "$H"/*.sh'
+  printf '%s\n' 'cp --target-directory="$O" "$H"/*.sh'
+  # ⛔ THE THIRD MECHANISM THE HEADER NAMES (review P1 2026-10-25). `install -m …` is named above as a
+  # swap arm (1) cannot see, and `rsync` was put into (2) while `install` was not — so these two
+  # shapes, each a depth-1 redeploy of the whole harness, were reported by NO arm (measured: 0 hits).
+  printf '%s\n' 'install -m 0755 "$H"/*.sh "$O"/'
+  printf '%s\n' 'install -m 0755 "$H"/. "$O"/'
+  # ⛔ A BACKSLASH LINE-CONTINUATION (review P2 2026-10-25): the matcher now joins continuations, so
+  # a wrapped copy is one logical command and both shapes below are forbidden. Each PAIR is one hit.
+  printf '%s\n' 'cp -R "$H"/. \'
+  printf '%s\n' '  "$O"/'
+  printf '%s\n' 'cp \'
+  printf '%s\n' '  "$H"/*.sh "$O"/'
+} > "$_FIX"
+_FC_EXPECT=19
+_FC_GOT="$(_bare_cp_hits "$_FIX" | wc -l | tr -d ' ')"
+[ "$_FC_GOT" = "$_FC_EXPECT" ] \
+  && ok "positive control: all $_FC_EXPECT forbidden copy shapes are detected by the live matcher" \
+  || bad "  positive control FAILED: the matcher reports $_FC_GOT of $_FC_EXPECT forbidden shapes — it can no longer see every shape it forbids (a broken pattern would otherwise certify a clean tree)"
+{
+  printf '%s\n' '# cp "$H"/*.sh "$O"/'
+  printf '%s\n' '   # cp "$H"/*.sh "$O"/'
+  printf '%s\n' 'echo x   # cp "$H"/*.sh "$O"/'
+  printf '%s\n' 'a bare `cp *.sh` can deploy an unverified tree'
+  printf '%s\n' 'cp "$HERE/claims.sh" "$O/claims.sh"'
+  printf '%s\n' 'install -m 0644 "$tmpd/x.service" "$UNIT_DIR/"'
+  # ⛔ `scp` CONTAINS `cp ` (review P2 2026-10-25): without BARE_PAT's left boundary this remote copy
+  # was reported as a bare LOCAL redeploy. Pinned so the boundary cannot be dropped again.
+  printf '%s\n' 'scp "$H"/*.sh box:"$O"/'
+  printf '%s\n' 'cp -R "$f" "$O/"'
+  # A flag that does NOT end in `t` is not a destination-first copy — the BARE_T_PAT arm must not
+  # fire on it. (`-R`/`-p` are real cp flags; neither names a target directory.)
+  printf '%s\n' 'cp -p "$H"/gh-limit.py "$O/"'
+  printf '%s\n' 'cp it into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '\''$O/state/parked-$PR'\'''
+} > "$_FIX"
+_FC_GOT="$(_bare_cp_hits "$_FIX" | wc -l | tr -d ' ')"
+[ "$_FC_GOT" = "0" ] \
+  && ok "positive control: no SAFE shape (comment, prose, named-file copy, systemd install) is flagged" \
+  || bad "  positive control FAILED: the matcher flags $_FC_GOT safe shape(s) — false positives are how this check gets deleted: $(_bare_cp_hits "$_FIX" | tr '\n' ' ')"
+
+# ⛔ THE POPULATION IS EVERY SHIPPED SCRIPT UNDER scripts/, to depth 3 — not the two directories a
+# pair of globs happened to name. `"$HERE"/*.sh "$HERE"/../*.sh` never reached `scripts/lib/`,
+# `scripts/checkout-hygiene/`, `scripts/ci/`, `scripts/pi-patches/` or `orchestrator-harness/retired/`,
+# while the comment claimed "every shipped script in the harness directory and in `scripts/`": a
+# remedy added there was invisible to a guard calling itself site-level. Bounded walk (one named
+# tree, maxdepth 3) — never a root walk.
+# ⛔ DEPTH 3, NOT 2 (review P1 2026-10-25): the walk root is `scripts/`, so `retired/` sits at depth 3
+# (`scripts/orchestrator-harness/retired/*.sh`) and a maxdepth-2 walk could not see the very
+# directory this comment names as a blind spot it closes — the claim was false and 6 shipped scripts
+# stayed unscanned. Depth 3 also brings `scripts/<dir>/<sub>/*.sh` into the population, which is
+# stricter and costs nothing.
+NAMED_DEPLOY_IMPLS_FLOOR="deploy-crossbox.sh:1 cloud-cell-quiesce.sh:1"
+# ⛔ THE EXEMPTION IS DERIVED FROM ITS PIN, NEVER A SECOND LITERAL (review P1 2026-10-25). These were
+# TWO independent hardcoded strings: the SCAN dispatched on `NAMED_DEPLOY_IMPLS` while the
+# "the exemption did not grow" pin iterated `NAMED_DEPLOY_IMPLS_FLOOR`. Adding one name to the
+# exemption therefore moved that file's hits out of the forbidden arm and into the reported one while
+# the pin stayed GREEN — measured: appending `cp "$H"/*.sh "$O"/` to a shipped script and adding it
+# to `NAMED_DEPLOY_IMPLS` printed PASS=240 FAIL=0 RESULT: CLEAN. A shipped script handing an operator
+# a bare depth-1 copy was certified clean by a one-word edit. Deriving the list from the pin means
+# every exemption HAS an exact pinned count BY CONSTRUCTION, and the pin loop below covers all of
+# them — so a new exemption cannot be added without its count being measured and pinned.
+NAMED_DEPLOY_IMPLS="$(printf '%s\n' $NAMED_DEPLOY_IMPLS_FLOOR | sed 's/:.*$//' | tr '\n' ' ')"
+# ⛔ NORMALISE THE WALK ROOT (found by this case's own guard): feeding `find` a path ending in `/..`
+# makes EVERY emitted path contain `/../`, which then matches `"$HERE"/*` — so the whole population
+# was counted as the harness half and `scripts/` read 0, re-opening the exact population hole this
+# walk was widened to close. `cd … && pwd` resolves it once, before the walk.
+_SCRIPTS_ROOT="$(cd "$HERE/.." && pwd)"
 BARE_HITS=""; NAMED_HITS=""; SCANNED_HARNESS=0; SCANNED_SCRIPTS=0; EXCL=0
-for _f in "$HERE"/*.sh "$HERE"/../*.sh; do
-  [ -f "$_f" ] || continue
+# ⛔ THE POPULATION IS MATERIALISED ONCE, SO THE PER-DIRECTORY PINS READ THE WALK ITSELF (review P1
+# 2026-10-25). They used to run their OWN `find <dir> -maxdepth 1`, which proves only that a
+# directory holds scripts — never that the population walk REACHED it. Measured on a mutant whose
+# population `find` was regressed to `-maxdepth 2`: `retired/`'s 6 scripts vanished from the scan,
+# `SCANNED_HARNESS` fell 49→43 (still above its floor of 30) and every pin still printed ✅
+# "the population reaches scripts/orchestrator-harness/retired" — the suite read RESULT: CLEAN over
+# the exact regression the pins exist to catch. Writing the walk to a file and counting from THAT
+# file makes the pin an assertion about the population, not about the filesystem.
+_POP_FILE="$T/deploy-harness-population.txt"
+# ⛔ THE WALK'S STATUS AND STDERR ARE BOTH READ (review P2 2026-10-25). `find … 2>/dev/null | sort`
+# discarded both, so a walk that ERRORED (an unsearchable directory, a root that moved mid-walk)
+# wrote a TRUNCATED population and the scan below certified it clean — the same measured
+# FALSE-PASS `deploy-harness.sh` refuses for its own inventory, and the same repair this case already
+# applies a few lines below to the matcher. Capture first, test the status, then write.
+if ! _pop="$(find "$_SCRIPTS_ROOT" -maxdepth 3 -name '*.sh' -type f)"; then
+  bad "  the population walk FAILED under $_SCRIPTS_ROOT — a truncated population is not a clean tree"
+fi
+printf '%s\n' "$_pop" | sort >"$_POP_FILE"
+while IFS= read -r _f; do
+  [ -n "$_f" ] || continue
   _b="$(basename "$_f")"
   case "$_b" in *.test.sh|test*.sh) continue ;; esac
   if [ "$_b" = "selftest.sh" ]; then
-    _n="$(grep -cE "$BARE_PAT" "$_f" 2>/dev/null)"; [ -n "$_n" ] || _n=0
+    # ⛔ THE SAME DISCARDED EXIT STATUS AS THE SCAN BELOW (review P2 2026-10-25), five lines above the
+    # site that was fixed for exactly this: `_bare_cp_hits | wc -l` reads an awk ABORT as "0 hits",
+    # so the exclusion-grew pin would print "selftest.sh 0 of at most 6" and PASS over a file nothing
+    # examined. Capture the records first, then count them.
+    if ! _recs="$(_bare_cp_hits "$_f")"; then
+      bad "  the bare-cp matcher ABORTED on selftest.sh — the exclusion pin below would read 0 and pass"
+      continue
+    fi
+    _n="$(printf '%s\n' "$_recs" | sed '/^$/d' | wc -l | tr -d ' ')"; [ -n "$_n" ] || _n=0
     EXCL=$((EXCL + _n)); continue
   fi
-  if [ "$_f" = "$HERE/$_b" ]; then SCANNED_HARNESS=$((SCANNED_HARNESS + 1)); else SCANNED_SCRIPTS=$((SCANNED_SCRIPTS + 1)); fi
-  _h="$(grep -nE "$BARE_PAT" "$_f" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+  case "$_f" in "$HERE"/*) SCANNED_HARNESS=$((SCANNED_HARNESS + 1)) ;; *) SCANNED_SCRIPTS=$((SCANNED_SCRIPTS + 1)) ;; esac
+  # ⛔ A DEAD MATCHER MUST NOT READ AS A CLEAN FILE (review P2 2026-10-25): the exit status of the
+  # substitution was discarded, so an awk abort on ONE of the ~150 population files yielded an empty
+  # `_h` and `continue` — a green line for a file nothing examined. The fixture positive control
+  # proves the PATTERN works on `$_FIX`; this proves the matcher RAN on every file.
+  if ! _h="$(_bare_cp_hits "$_f")"; then
+    bad "  the bare-cp matcher ABORTED on $_b — a matcher that cannot run reports no hits, so this file would otherwise be certified clean"
+    continue
+  fi
   [ -n "$_h" ] || continue
   case " $NAMED_DEPLOY_IMPLS " in
     *" $_b "*) NAMED_HITS="$NAMED_HITS
@@ -1184,18 +1405,63 @@ for _f in "$HERE"/*.sh "$HERE"/../*.sh; do
     *) BARE_HITS="$BARE_HITS
   $_b: $_h" ;;
   esac
+done <"$_POP_FILE"
+[ "$SCANNED_HARNESS" -ge 30 ] && ok "scanned $SCANNED_HARNESS harness scripts for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_HARNESS harness scripts scanned — that half of the population is gone"
+# ⛔ THE TWO TOTALS ABOVE CANNOT SEE A WHOLE DIRECTORY DROP OUT (review P2 2026-10-25): measured at
+# head they carry 49 and 101 against floors of 30 and 90, so deleting `scripts/lib/` (6), a
+# `checkout-hygiene/` half or `orchestrator-harness/retired/` (6) still leaves both green — including
+# the last one, which the maxdepth-3 walk exists to reach, i.e. a regression back to `-maxdepth 2`
+# reds nothing. Per-directory presence pins are the assertion that matches the CLAIM (a bounded walk
+# over the named tree), and unlike an exact total they do not red on a legitimate file being added.
+# ⛔ THE PINS ARE THE MEASURED COUNTS, NOT `-ge 1` (review P2 2026-10-25). A presence pin catches
+# only a directory that vanished ENTIRELY: measured at head, moving 5 of `retired/`'s 6 scripts aside
+# still printed ✅ "(1 script(s))" and RESULT: CLEAN — five shipped scripts left the scan uncounted.
+# Same off-by-slack this file already rejects for the remedy floors ("a floor one BELOW today's count
+# tolerates exactly one reverted remedy"); `-ge 1` tolerated five. `-ge <measured>` reds on a removal
+# and stays green on a legitimate addition, so it is not a churn tax.
+for _pd in lib:6 checkout-hygiene:10 ci:2 pi-patches:2 orchestrator-harness/retired:6; do
+  _pdn="${_pd%%:*}"; _pdexp="${_pd##*:}"
+  _pn="$(grep -cF -- "$_SCRIPTS_ROOT/$_pdn/" "$_POP_FILE" || true)"; [ -n "$_pn" ] || _pn=0
+  [ "$_pn" -ge "$_pdexp" ] \
+    && ok "the population reaches scripts/$_pdn ($_pn script(s), floor $_pdexp)" \
+    || bad "  scripts/$_pdn contributed $_pn script(s) to the scan, floor $_pdexp — the walk stopped reaching part of a directory the population claims to cover (a depth bound, a renamed dir, or a broken root)"
 done
-[ "$SCANNED_HARNESS" -ge 20 ] && ok "scanned $SCANNED_HARNESS harness scripts for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_HARNESS harness scripts scanned — that half of the population is gone"
-[ "$SCANNED_SCRIPTS" -ge 40 ] && ok "scanned $SCANNED_SCRIPTS scripts/ scripts for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_SCRIPTS scripts/ scripts scanned — that half is gone (run this suite from the checkout, not from \$O)"
-ok "test fixtures excluded and COUNTED, not silent: selftest.sh $EXCL bare-cp fixture line(s); *.test.sh / test*.sh suites skipped"
+[ "$SCANNED_SCRIPTS" -ge 90 ] && ok "scanned $SCANNED_SCRIPTS scripts/ scripts (depth 3) for a bare 'cp *.sh' redeploy (scan is not vacuous)" || bad "only $SCANNED_SCRIPTS scripts/ scripts scanned — that half is gone (run this suite from the checkout, not from \$O)"
+# ⛔ THE EXCLUSION IS BOUNDED, not merely counted. `EXCL` only ever printed, so the fixture exclusion
+# could grow into a hole with the suite green; and a NEW bare copy added to `selftest.sh` would have
+# been absorbed into the same counter. Pin the exact number, so the exclusion cannot grow silently.
+# ⛔ EXACT, NOT A CEILING (review P2 2026-10-25). The comment above says "Pin the exact number" while
+# the code accepted 0-6, so `selftest.sh` contributing ZERO bare-cp lines — renamed out of the
+# population, or its branch above no longer counting — still printed ✅ and left the exclusion
+# silently counting nothing. Both directions now need a deliberate re-pin, which is the point.
+[ "$EXCL" -eq 6 ] \
+  && ok "test fixtures excluded and COUNTED, not silent: selftest.sh $EXCL bare-cp fixture line(s), pinned exactly at 6; *.test.sh / test*.sh suites skipped" \
+  || bad "  selftest.sh carries $EXCL bare-cp line(s), pinned at exactly 6 — if it GREW the exclusion now covers more than it claims, and if it SHRANK the exclusion stopped counting fixtures it was written to count. Re-pin deliberately."
 if [ -z "$BARE_HITS" ]; then
   ok "no shipped script hands anyone a bare 'cp *.sh' redeploy outside the named deploy implementations"
 else
   bad "shipped script(s) still hand an operator the unverified depth-1 copy (remedy must name deploy-harness.sh):$BARE_HITS"
 fi
+# ⛔ THE NAMED-IMPLEMENTATION EXEMPTION IS PINNED TOO (review P2 2026-10-24). It used to report only
+# when NON-EMPTY and never fail, so a NEW bare copy added to one of those two files was absorbed as
+# green — an exemption that can quietly absorb a violation is the hole it exists to document.
 if [ -n "$NAMED_HITS" ]; then
   ok "named deploy IMPLEMENTATIONS still use depth-1 cp (issue #2041 remaining work — reported, not hidden):$NAMED_HITS"
+else
+  bad "  the named deploy implementations report NO depth-1 cp — they either stopped (update NAMED_DEPLOY_IMPLS_FLOOR, then this pin) or the scan lost them"
 fi
+for _nf in $NAMED_DEPLOY_IMPLS_FLOOR; do
+  _nb="${_nf%%:*}"; _nexp="${_nf##*:}"
+  # ⛔ COUNT HIT LINES, NOT RECORDS. The first version of this pin counted entries in `$NAMED_HITS`,
+  # which joins every hit for a file into ONE record — so a SECOND bare copy appended to an exempted
+  # implementation left the pin at 1 and the suite GREEN (found by mutation 4). Re-scanning the two
+  # files is free and counts lines.
+  _nfp="$HERE/$_nb"; [ -f "$_nfp" ] || _nfp="$_SCRIPTS_ROOT/$_nb"
+  _ngot="$(_bare_cp_hits "$_nfp" | wc -l | tr -d ' ')"; [ -n "$_ngot" ] || _ngot=0
+  [ "$_ngot" = "$_nexp" ] \
+    && ok "named implementation $_nb still has exactly $_nexp depth-1 cp site(s) — the exemption did not grow" \
+    || bad "  named implementation $_nb has $_ngot matching line(s), pinned at $_nexp — a NEW bare copy was added there and absorbed by the exemption"
+done
 
 echo
 # ── 21. PRODUCER/CHECKER AGREEMENT — driven from install.sh's OWN fold ───────────────────────
