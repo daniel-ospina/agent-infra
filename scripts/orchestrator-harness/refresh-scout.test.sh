@@ -111,6 +111,13 @@ mk_issue_claim() {   # <dir> <issue> <lease-seconds-from-now> [<owner-host>]
 # RF_PATH overrides the constructed PATH for the one case that must have no `uv` on it. The ambient
 # provisioning knobs are CLEARED every run, so a case's own values are the only ones in play and an
 # operator's exported TORTOISE_REPO/TORTOISE/SCOUT_UV cannot leak into the sandbox.
+# ⛔ $OR IS CLEARED TOO (agent-infra#1935 review). Every fixture here builds a bare LOCAL origin
+# (`git init -q --bare "$D/origin.git"`), and `resolve_repo` tolerates a local-path origin only while
+# the queue target is UNDECLARED (`OR_DECLARED=0`): a DECLARED $OR cannot be proven by a path, so it
+# is refused. An operator's shell exporting $OR (a cell's keys.env does — measured on this box) then
+# turned 114 arms of this suite red for a reason that has nothing to do with provisioning. A case
+# that WANTS a declared target sets `OR=` on its own invocation (the acme/widget arms do), so
+# clearing the ambient value costs nothing and makes the shard deterministic on any box.
 OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
@@ -120,7 +127,7 @@ rf() {
   local args=("${RF_LIMIT:-6}"); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
-          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
+          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR -u OR \
           HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
           bash "$REFRESH" "${args[@]}" 2>&1)"
   RC=$?
@@ -939,7 +946,7 @@ echo; echo "── an unwritable state dir is refused, not absorbed ──"
 mk_case unwritable-o
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#' > "$D/state-file" # a REGULAR FILE where $O must be a directory
-OUT="$(env -u GH_HOST -u CELL_HOME HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
+OUT="$(env -u GH_HOST -u CELL_HOME -u OR HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
         O="$D/state-file" bash "$REFRESH" 2>&1)"; RC=$?
 [ "$RC" -eq 1 ] && ok "unwritable \$O: rc=1 (TRANSIENT — loud, and no permanent marker)" \
                || bad "unwritable \$O: rc=$RC (want 1) — output: $OUT"
@@ -3429,7 +3436,13 @@ rf "$D" check
 [ "$RC" -eq 3 ] && ok "--check: a scout worktree with no 'origin' is REFUSED (rc=3)" \
                 || bad "--check: rc=$RC (want 3) — $OUT"
 case "$OUT" in
-  *"no 'origin' remote"*) ok "--check: the refusal names the missing remote" ;;
+  # #1935: with `resolve_repo` in the shipped script, a checkout with NO readable `origin` is refused
+  # one layer EARLIER, by the resolver, and its refusal is the one that names the missing remote. The
+  # arm's intent is unchanged (no-origin is refused, and the reason NAMES it) — only the layer that
+  # answers is. `git remote remove` in a linked worktree edits the SHARED config, so $D/repo loses its
+  # origin too and the resolver cannot prove it against $OR either.
+  *"no readable 'origin' remote"*|*"no 'origin' remote"*)
+    ok "--check: the refusal names the missing remote" ;;
   *) bad "--check: no missing-origin reason — $OUT" ;;
 esac
 
