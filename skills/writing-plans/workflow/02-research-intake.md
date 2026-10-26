@@ -6,7 +6,7 @@ Before drafting the plan, gather all existing research. This avoids re-researchi
 
 ### Step A — Locate Prior Research
 
-**If invoked directly from `issue-scoping` in the same session (auto-invoke path):** Skip Step A's *search* — research findings, codebase context, and requirements are already live in context — but **validate the scoping artifact exists**: the scoping comment must contain `### Axis Research` (+ `### Integration Docs` for standard+) or a justified-skip trigger assessment; if absent, note the gap and proceed (the plan's `### Pattern Research` is still authored by Step B). Proceed to Step B (checking for any remaining implementation gaps).
+**If invoked directly from `issue-scoping` in the same session (auto-invoke path):** Skip Step A's *search* — research findings, codebase context, and requirements are already live in context — but **validate the scoping artifact exists**: the scoping comment must contain `### Axis Research` (+ `### Integration Docs` for standard+) or a justified-skip trigger assessment; if absent, note the gap and proceed (the plan's `### Pattern Research` is still authored by Step B) — **except under `task-workflow-standard` (agent-infra#2861), where the dual-granularity split is merged into one `<!-- research: v1 -->` comment whose `### Targeted Research Findings` block already carries both granularities. There, verify that comment exists and skip Step B's separate `### Pattern Research` block** (a second block is the duplicate research the redesign removed). Proceed to Step B for any remaining implementation gaps.
 
 **Otherwise:** Check for research artifacts in this order:
 

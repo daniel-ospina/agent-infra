@@ -196,7 +196,7 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 
 5. **Determine unfamiliar:** Any package NOT covered by the research evidence is "unfamiliar". Also treat as unfamiliar if:
    - the research evidence is absent entirely (neither the `<!-- research: v1 -->` comment nor a `### Pattern Research` section)
-   - Pattern Research exists, contains **actual findings**, but carries **no `> **Findings date:** YYYY-MM-DD` stamp** — findings-date ABSENT → unfamiliar directly (fail-safe re-verify; NO plan-date fallback for the coverage question — legacy unstamped plans get re-verified, issue #231 D4). **Carve-out (issue #231 H5): a documented whole-section skip is NOT "findings-date absent" — a block carrying `> Gate skipped: <justification>` / `> Bucket [name] skipped: <justification>` / `> Research skipped: no demonstrated gap` takes precedence over the stamp rule (per Step 4); only blocks containing actual findings are subject to the stamp requirement.**
+   - the research evidence (either form — `### Pattern Research`, or `### Targeted Research Findings` for `task-workflow-standard`) exists, contains **actual findings**, but carries **no `> **Findings date:** YYYY-MM-DD` stamp** — findings-date ABSENT → unfamiliar directly (fail-safe re-verify; NO plan-date fallback for the coverage question — legacy unstamped plans get re-verified, issue #231 D4). **Carve-out (issue #231 H5): a documented whole-section skip is NOT "findings-date absent" — a block carrying `> Gate skipped: <justification>` / `> Bucket [name] skipped: <justification>` / `> Research skipped: no demonstrated gap` takes precedence over the stamp rule (per Step 4); only blocks containing actual findings are subject to the stamp requirement.**
    - The stamped findings are older than 6 months by **findings date** (staleness threshold unchanged; plan date plays no role in the new algorithm)
    - The plan references a different major version than what's imported (detected via package.json or import style)
 
@@ -649,7 +649,7 @@ The `verification-gate` extension (loaded in this session) blocks `git commit`, 
    - If verification fails: fix the issue and re-verify. Do NOT claim "done" with failing checks.
 2. **Verification clean → proceed:**
 
-**Label Transition — removed (agent-infra#2861 §8.2).** No `--remove-label implementing` / `--add-label implemented`: the label has no reader, and the durable completion signal is the issue being closed by the merge.
+**Label Transition — removed (agent-infra#2861 §8.2).** This step writes **no workflow-state label**: `implementing` / `implemented` had no reader, so the durable completion signal is the issue being closed by the merge.
 
 - Announce: "I'm using the commit-workflow skill to land this work."
 

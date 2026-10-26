@@ -23,6 +23,8 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 > **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
+> **Scope of this skill under `task-workflow-standard` (agent-infra#2861).** That pipeline consumes **§Tier Scaling only** (verifier counts/depth) — its `Phase 2.5 problem-verify`, `Phase 5.5 solution-verify` and every `Gate Loop — MANDATORY` below are **not dispatched** there, because `task-workflow-standard`'s merged PLAN-VERIFY is the one pre-code round. They remain mandatory for `epic-workflow`/`project-workflow`, which consume this skill directly. Read the mandates below with that exception attached — paying them twice is the cost the redesign removed.
+
 Multi-phase planning for **existing** GitHub issues. Uses the **double diamond** design framework with integrated verification:
 1. **problem-diverge** — explore alternative problem definitions, root causes, dependencies
 2. **problem-converge** — evaluate framings, pick best, confirm with evidence
@@ -881,6 +883,8 @@ All agents run **in parallel** via `task`. Skip for Micro.
 
 ### Gate Loop — MANDATORY
 
+> **Not dispatched by `task-workflow-standard`** (see the banner at the top of this file).
+
 #### Merge-Dedup
 
 After parallel agents return: group by similarity, keep highest severity.
@@ -955,7 +959,7 @@ PLANEOF
 
 ### Label Management — Exit — removed (agent-infra#2861 §8.2)
 
-`scoping` and `scoped` are deleted with `planning`/`implementing`/`planned`: none has a reader anywhere in the fleet (eight write sites, zero reads). The durable state is `doc_status` on the plan doc and the issue's open/closed state.
+`scoping` and `scoped` are deleted with `planning`/`implementing`/`planned`: none has a reader anywhere in the fleet (13 write sites across 4 skills, zero reads). The durable state is `doc_status` on the plan doc and the issue's open/closed state.
 
 ### Human Gate (conditional)
 

@@ -259,7 +259,8 @@ it). Four of them are only producible while you work, so produce them as you go.
   \`Refs #<ISSUE>\` when something genuinely stays open). A mid-sentence \`(fixes #N)\` does NOT
   count, and an unintended closing keyword can auto-close an issue on merge.
 - **[b] the scoping comment, whose FIRST CONTENT LINE is the marker — \`<!-- issue-scoping: … -->\`
-  (the producer, \`skills/issue-scoping\`, writes \`<!-- issue-scoping: v5.1 double diamond + verify -->\`;
+  (the producer is \`skills/issue-scoping\` for the epic/project tiers, or \`skills/task-workflow-standard\`
+   for the task tier — either writes a \`<!-- issue-scoping: v1 -->\`-style marker;
   only the \`<!-- issue-scoping:\` prefix is examined). Then the scoping content: boundaries,
   alternatives considered, the wiring table. POSITION is the contract — the check matches at column
   0, so ANY leading whitespace fails (at four columns it is also rendered as a CODE BLOCK, i.e. a

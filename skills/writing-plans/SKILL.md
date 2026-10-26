@@ -100,7 +100,7 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 | `workflow/02` | Third-party library versions not verified. Plan uses hallucinated API calls from training data. Perplexity gate skipped — no triangulation, stale syntax shipped. |
 | `workflow/03` | Integration boundaries untested. SQL business logic gets TypeScript mocks instead of pgTAP. Production bugs from untested cross-system interactions. |
 | `workflow/04` | Plan doc header missing research-path comment. Task structure not TDD. Micro/Standard/Complex tier path not selected. No bite-sized steps. |
-| `workflow/05` | Plan-review gate skipped entirely — plan ships with no quality check. No review cycles, no reviewer feedback. `planned` label not applied. Execution mode not selected — handoff fails. |
+| `workflow/05` | Plan-review gate skipped entirely — plan ships with no quality check. No review cycles, no reviewer feedback. Execution mode not selected — handoff fails. (`task-workflow-standard` lanes: PLAN-VERIFY writes the signature, so this file's gate is already satisfied — see `workflow/05`.) |
 
 ## Plan Review Gate — Human Approval
 

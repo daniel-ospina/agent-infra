@@ -47,6 +47,10 @@ Canons live in different repos, and a relative path that works in one is absent 
 
 **A mixed diff has a mixed contract.** One class per `### Review Scope Contract` block, split by **claim**, not by file: when a single file is simultaneously an executable instruction (gate-enforcement / code) and product prose (docs-product), declare both blocks and say which paths each covers. A file that carries two canons gets two reviewers' questions, not one reviewer's guess.
 
+**Which contract wins, when there are two.** A change can carry a contract in the **PR body** (written at commit time, by the author, at the head that is being reviewed) and another in the **linked issue's plan comment** (written at plan time). They can disagree — this design's own PR did. The rule is one line: **the PR-body contract wins; the issue contract is the fallback when the PR has none.** A **mismatch between the two is itself reported** as `class-uncertain: issue says <X>, PR says <Y>` with the verdict — a disagreement means the change's canon was never decided, and silence about it is how a review answers the wrong question.
+
+**A mixed diff carries N blocks, and each is reviewed separately.** One `### Review Scope Contract` block per class, each with its own `Class:` line and its own `R<n>` surface. The reviewer resolves a class **per block** (a `code` block gets the code question set, a `protocol` block gets the protocol set) and reports per block. A **single** `Class:` line listing several classes (`code | protocol`) is **not** a mixed diff, it is an ambiguity: that resolves to `code` + `class-uncertain`, because "review it as three things at once" is the universal-checklist failure this section exists to remove. One class per block, one value per line.
+
 **Unknown class ⇒ `code` (strictest), recorded in the contract as `class-uncertain: <why>`.** The reviewer may re-declare the class in the same round if the artifact clearly belongs elsewhere — and must say so in its verdict. An unstated class is never "no questions"; a *guessed* class is never silent.
 
 ## The Review Scope Contract (declared by the author, before review)
@@ -55,7 +59,7 @@ The author writes this into the plan/scoping artifact — not into the reviewer'
 
 ```markdown
 ### Review Scope Contract
-**Class:** code | gate-enforcement | protocol | docs-product | docs-marketing | ops-infra | research-decision
+**Class:** <exactly one of: code | gate-enforcement | protocol | docs-product | docs-marketing | ops-infra | research-decision>
 **Risk surface** — what this change can break, each with the check that would catch it:
 - R1 <failure this change can cause> → caught by <test / assertion / gate / measurement>
 **Threat classes** (gate-enforcement only) — `T1 <bypass class>`, or `(not adversarial)`.

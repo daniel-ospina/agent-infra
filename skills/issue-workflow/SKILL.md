@@ -77,7 +77,7 @@ issue-workflow (entry-point router)
       ├── Level: epic  ──────────────▶ epic-workflow (6 stages, full depth)
       ├── Level: project ────────────▶ project-workflow (6 stages, proportional)
       └── Level: task ──┬── decided ruling (recorded) ────────────────▶ task-workflow-standard
-                        │                                              §decided-ruling path — no scope/plan/design gate
+                        │                                              §decided-ruling path — no SCOPE stage; PLAN kept (one paragraph + contract)
                         ├── complexity:micro ───────────▶ task-workflow (6 stages, inline)
                         └── complexity:standard/complex ─▶ task-workflow-standard (4 stages, one
                             (or unknown — fail-closed)      blocking pre-code round: RESEARCH →
@@ -177,7 +177,7 @@ python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_A
 | `project` | any | `project-workflow` | Proportional: shared sub-skills, reduced depth |
 | `task` | `micro` (or all-low) | `task-workflow` | Inline: all 6 stages, no sub-skill dispatch |
 | `task` | `standard` \| `complex` (or missing/unknown) | `task-workflow-standard` | 4 stages: RESEARCH (checked artifact) → PLAN (scope+plan merged, declares the Review Scope Contract) → **one** PLAN-VERIFY round → BUILD → PROVE |
-| `task` | any, **decision already recorded** | `task-workflow-standard` §decided-ruling | Lean: no research gate, no PLAN-VERIFY — the decision *is* the design (see below) |
+| `task` | any, **decision already recorded** | `task-workflow-standard` §decided-ruling | Lean: the research *work* is skipped (the artifact is kept as `**Basis:**`), PLAN is kept (one paragraph + contract), PLAN-VERIFY → one question (see below) |
 
 **Task complexity routing rules:**
 
@@ -210,7 +210,7 @@ python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_A
 
 ## Label Lifecycle — DELETED (agent-infra#2861 §8.2). Do not re-add it.
 
-`implementing` / `scoping` / `planning` — and `planned`, removed in the same pass — had **no reader anywhere in the fleet**: six write sites, zero reads (no label filter, no gate, no report). Worse, the block's first step removed `implementing` **unconditionally** before checking who held the issue — so lane B stripped lane A's only marker while A was working, i.e. the mechanism could silently delete the one thing it provided.
+`implementing` / `scoping` / `planning` — and `planned`, removed in the same pass — had **no reader anywhere in the fleet**: 13 write sites across 4 skills, zero reads (no label filter, no gate, no report). Worse, the block's first step removed `implementing` **unconditionally** before checking who held the issue — so lane B stripped lane A's only marker while A was working, i.e. the mechanism could silently delete the one thing it provided.
 
 **Ownership is not a label.** Use the mechanisms that actually decide it. Both the pre-flight and `who-is-on.sh` live in a **tortoise** checkout — resolve that path exactly as the pre-flight block above does (`$TORTOISE`, else the cwd's main-checkout sibling `tortoise`, else `$HOME/Documents/GitHub/tortoise`); a bare `tools/…` is relative and resolves to nothing:
 

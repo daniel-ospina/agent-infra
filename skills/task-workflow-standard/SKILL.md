@@ -36,15 +36,16 @@ Post one comment:
 > **Findings date:** <YYYY-MM-DD>
 **Search:** rung <N> (`<tool>`) — <attempted>/<returned>
 
-**Internal** (≥1, with a locator): `<path:line>` | `#<issue>` | `<owner/repo>#<n>` → what it settles
-**External** (≥1, with a URL): <url> → what it settles
+**Internal** (≥1, each with a locator **and the quoted line**): `<path:line>` — "<the line, verbatim>" → what it settles
+**External** (≥1, each with a URL): <url> → what it settles
 **FALSIFIER:** <the observation that would overturn the chosen approach, and the consequence>
 **Gaps:** <unanswered questions — carried as plan risk, named (or `none`, stated)>
 ## Raw Notes
 - <ts> [internal|external] <finding, source-tagged, append-only>
 ```
 
-- **A locator must RESOLVE, not merely look like one.** Each `path:line` must exist at the head you are working on and the line must say what the finding claims. **PLAN-VERIFY Q2 re-opens every one and quotes it** — that is the check that runs *today*; the CI half (`check-pipeline-compliance.sh`, landing in agent-infra#2861 §11 **sequence step 2** — *not* the pipeline's stage 2) will open them automatically later. Do not wait for it, and do not claim it ran. A locator that points at a real file but a line about something else is the failure this gate exists to catch: it is the one field a lazy or pre-empted lane cannot cheaply fabricate.
+- **Quote the line, at write time.** The quoted text is what makes the locator checkable by whoever reads the block — and it is the cheapest hardening available with no new stage: a fabricated citation is caught while you are still writing, before a verifier is spent on it. A locator without its quoted line is an assertion, not evidence.
+- **A locator must RESOLVE, not merely look like one.** Each `path:line` must exist at the head you are working on, and the quoted line must be that line and must say what the finding claims. **PLAN-VERIFY Q2 re-opens every one and quotes it** — that is the check that runs *today*; the CI half (`check-pipeline-compliance.sh`, landing in agent-infra#2861 §11 **sequence step 2** — *not* the pipeline's stage 2) will open them automatically later. Do not wait for it, and do not claim it ran. A locator that points at a real file but a line about something else is the failure this gate exists to catch: it is the one field a lazy or pre-empted lane cannot cheaply fabricate.
 - **Research is done by the lane, not inherited.** A brief that already contains research is context, never a substitute. `PRIOR_RESEARCH` (a parent epic's brief) is deduplicated against, with the dedup noted.
 - **Depth is proportional:** `standard` = axis matrix capped at 8 queries, `complex` = 14 (`issue-scoping` §Tier Scaling). Codebase-first; fire external queries on a demonstrated gap.
 - **Merge, don't add:** this block replaces `issue-scoping` Phase 1.5's `### Axis Research` *and* `writing-plans` Step B's `### Pattern Research` **for this pipeline**. One block, one format, one pointer — the plan doc's `<!-- research-path: … -->` resolves to it. (`### Axis Research` and `### Pattern Research` stay live for epic/project pipelines; do not confuse the two.)
@@ -110,9 +111,9 @@ One dispatch per verifier, one round. The verifier prompt asks exactly three thi
 - **Q2 — research-to-validate:** extract the plan's **load-bearing factual claims** (a claim whose falsity changes the design). For each, open the cited locator **and quote the line**; report every uncited claim, every locator that does not resolve, and every citation that does not bear on the claim it is attached to. *This question exists because planning changes which research was needed* — the research was written before the plan named its claims.
 - **Q3 — contract coverage (plan-side half):** does each `R<n>` name a check that **could exist and be falsified** — specifically, would deleting the branch the check guards make it red? Is anything in the diff's blast radius missing from the surface? (Running it and pasting the red is PROVE's half; Q3 does not run it.)
 
-On close, write `**Rounds:** <n> (verifiers: <n>, class: <class>)` into the plan comment (field 8) **and** `<!-- plan-review: status=<clean|threat-surface-covered> rounds=<n> -->` into the plan doc. The `Rounds` line is the datum §13 of agent-infra#2861 reads; the signature is what `writing-plans/05` requires before Execution Handoff.
+On close, write `**Rounds:** <n> (verifiers: <n>, class: <class>)` into the plan comment (field 8), where **`<n>` = verifier rounds spent at this gate, the initial round included** — a fix plus its fresh re-check is `2`. The field is a measurement, not a claim of virtue: write what was spent. **and** `<!-- plan-review: status=<clean|threat-surface-covered> rounds=<n> -->` into the plan doc. The `Rounds` line is the datum §13 of agent-infra#2861 reads; the signature is what `writing-plans/05` requires before Execution Handoff.
 
-Verdict is `NO ISSUES FOUND`, or issues tagged with the `R<n>` they violate. **Residual rules:** an issue on the declared surface blocks and is fixed; anything outside it is `OUT-OF-SCOPE:` — recorded, filed, **not looped on**. A fix is re-checked **against the whole declared surface, by a FRESH verifier dispatch (a new `task`), inside the same round** — *rounds and contexts are orthogonal*: "one round" bounds the loop, never the reviewer's memory (`AGENTS.md` §Review Loop Protocol forbids a same-context re-review, and that rule is unchanged by this skill).
+Verdict is `NO ISSUES FOUND`, or issues tagged with the `R<n>` they violate. **Residual rules:** an issue on the declared surface blocks and is fixed; anything outside it is `OUT-OF-SCOPE:` — recorded, filed, **not looped on**. A fix is re-checked **against the whole declared surface, by a FRESH verifier dispatch (a new `task`)** — and that re-check is a **round in the `AGENTS.md` §Hard Cap sense**: it increments `<n>`, and it **consumes** the bound exactly as any cycle does (`AGENTS.md`: *"dispatching a fresh reviewer does not reset, extend, or replenish the budget"*). "One round" is this gate's **plan**, not a rebate on the ceiling. A second dispatch is earned by a fix, never by a differing opinion, and the ceiling exits — 10 cycles, or a stall — escalate to the owner rather than being reported clean.
 
 **Adversarial domain — declared threat surface (bound: 2 cycles).** When the plan declares a `Threat classes` sub-block (gate/enforcement code whose correctness is "an attacker cannot make it fail open"), that domain is bounded by the surface rather than by reviewer exhaustion: acceptance = every declared class covered by a test + green CI, residuals **filed from cycle 1, not chased**, and a fresh verifier returning **`THREAT SURFACE COVERED`** (no in-scope bypass reproduced) is this domain's clean exit, substituting for `NO ISSUES FOUND`. When the merge rests on threat-list coverage rather than a literal `NO ISSUES FOUND`, disclose it in the PR body (`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`). Statement of record: `AGENTS.md` §Hard Cap. <!-- adversarial-bound: cap=2 -->
 
@@ -126,7 +127,7 @@ Write the code, following the plan and `executing-plans`. The leverage is the te
 
 - `verification-before-completion`: typecheck + the targeted tests, output pasted, not summarized.
 - **Mutation proof** for any branch that is *supposed* to refuse: delete/neuter the branch and show the guarding test goes red. A fail-closed branch with no test that fails without it is unproven — measured failure mode: deleting a reconcile arm left the sibling tests green.
-- **Contract close-out:** paste the Review Scope Contract with each `R<n>` marked `covered` and the command + output that covers it, plus an `OUT-OF-SCOPE: <n>` count. This is the artifact a reviewer (and the next lane) reads to see the acceptance was met — without it, the scope contract replaced a machine-parsed cap with nothing.
+- **Contract close-out:** one line per risk in the PR body, in exactly this shape — `- R<n>: covered — <command> → <output>`, or `- R<n>: open — <what is missing>` — plus a final `OUT-OF-SCOPE: <n>` (and a filed-issue reference per item, or `0`). The literal shape is what §13 of agent-infra#2861 greps; a prose paragraph is not readable by it. This is the artifact a reviewer (and the next lane) reads to see the acceptance was met — without it, the scope contract replaced a machine-parsed cap with nothing.
 - Commit and merge through `commit-workflow` (PR, discipline-scoped review, head-bound attestation, rail).
 
 ## Decided-ruling path (owner ruling 2026-10-26 #3)
@@ -141,7 +142,7 @@ A lane whose issue says *"implement this ruling"* does not pay for stages that e
 
 **Skips:** the RESEARCH *work* (the queries) and PLAN-VERIFY's three questions. **Kept:** the research *artifact* (as a `**Basis:**` reference, below), **PLAN** (one paragraph of design plus the `### Review Scope Contract`, posted in the same plan comment), the doc's `### Wiring` table, and a **one-question verifier round** in place of PLAN-VERIFY.
 
-Write `**Rounds:** 0 (one-question verifier, class=<class>)` with the plan comment so the round is counted rather than inferred.
+Write `**Rounds:** 1 (one-question verifier, class=<class>)` with the plan comment so the round is counted rather than inferred — one verifier round is spent on this path, and saying `0` would misreport a round that ran.
 
 **Does not skip:** the contract; **PROVE** (tests, mutation proof, exact-head review + attestation); every `AGENTS.md` hard rule the change touches; and a **one-question verifier round** — *"is the pointed artifact a decision that governs THIS change, or merely an artifact that exists?"* That round replaces PLAN-VERIFY's three questions because this is the path with the least scrutiny: skipping the review *and* the research check is exactly what would make the lean path a bypass.
 
@@ -156,7 +157,7 @@ The stages are **instructions**. What *binds* is CI, from the repo being merged 
 ## Key Principles
 
 - **Research is a gate on your own artifact, never a paragraph in a brief.** Wrong or missing research is our most expensive defect class; a *resolvable* citation with a falsifier is the cheapest way to catch it.
-- **One round per gate, a fresh verifier per re-check.** Rounds bound the loop; contexts bound confirmation bias. Both, together.
+- **One round per gate as the target, a fresh verifier per re-check, and the ceiling still counts.** A re-check consumes the budget like any cycle; the design predicts one round, it does not exempt the gate from the bound.
 - **The scope contract is the acceptance criterion, not a cycle count.** A count truncates a review that is finding real defects and flatters one that is finding none.
 - **Proportional depth, not proportional correctness.** Depth scales with the tier; the declared surface is covered or it is not.
 - **Fresh context at the exact head** for every reviewer (`task`), because same-context re-review defends its own prior fixes.

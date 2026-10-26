@@ -667,7 +667,7 @@ a slot in the capped panel. A surface match must never increase the number of re
 | `DATA_TOUCHED` | schema-correctness section | same | + ontology-alignment section | **C** |
 | `CONFIG_TOUCHED` | config-validation section | — | — | **D** |
 
-Store all variables (`RISK_CLASS`, `UX_RATING`, `ARCH_RATING`, `ONTOLOGY_RATING`, the four
+Store all variables (`RISK_CLASS`, `REVIEW_CLASS`, `UX_RATING`, `ARCH_RATING`, `ONTOLOGY_RATING`, the four
 `*_TOUCHED` flags, and `INFRA_RISK`) for Step 4 dispatch.
 
 > Whether a matched surface reviewer actually **runs** is Step 4's panel cap: at the smaller
@@ -787,7 +787,7 @@ if [ -n "$INFRA_RISK" ]; then
   echo "[code-review] Infrastructure files detected (risk: $INFRA_RISK) — dispatching reviewer E; the tier scales depth inside it"
 fi
 
-echo "[code-review] RISK_CLASS=${RISK_CLASS:-<unset>} panel_max=$PANEL_MAX — dispatching: $AGENTS"
+echo "[code-review] RISK_CLASS=${RISK_CLASS:-<unset>} REVIEW_CLASS=${REVIEW_CLASS:-<unset>} panel_max=$PANEL_MAX — dispatching: $AGENTS"
 ```
 
 > ⛔ **A surface match is not a reviewer.** `UI_TOUCHED`/`ARCH_TOUCHED`/`DATA_TOUCHED`/
@@ -798,6 +798,12 @@ echo "[code-review] RISK_CLASS=${RISK_CLASS:-<unset>} panel_max=$PANEL_MAX — d
 
 **Shared dispatch preamble — inject into EVERY reviewer prompt below** (#1141):
 ```
+REVIEW_CLASS: <resolved in Step 3.6 / 0a — one value>. Questions your class asks:
+  <that class's questions, from `review-discipline`>. Questions it must NOT ask:
+  <same row>. Your remit is the contract's declared risk surface (R1..Rn): a finding
+  outside it is recorded as OUT-OF-SCOPE, never looped on. Acceptance is coverage of
+  that surface, not a cycle count. If no contract reached you, say
+  `class-uncertain: <why>` in your output and review as `code`.
 ISOLATED CHECKOUTS — never copy the repo. If your review needs a checkout other
 than the one you are in (e.g. to run a check or probe the PR branch), get it with
     bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> [--paths <p1,p2> | --full] -- <cmd...>

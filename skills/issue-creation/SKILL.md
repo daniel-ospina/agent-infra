@@ -80,6 +80,16 @@ The bar for each indicator:
 - Lighthouse score ≥ 90
 ```
 
+### Body lint — three assertions, run before you file (agent-infra#2861)
+
+O/I/T is a **body lint at creation**, not a workflow stage: nothing downstream can decide what the issue meant to achieve, so the check belongs where the fields are authored. Assert, against the body you are about to create:
+
+1. `**Objective:**` present and non-empty — one sentence, a problem or a function.
+2. `**Indicators:**` carries **≥ 2** distinct measurable items (a single indicator invites Goodhart's gaming, above).
+3. `**Targets:**` carries **≥ 1** bar, and every indicator has one.
+
+Any failure = do not file; fix the body. This is decidable by eye and by grep, which is the point: an automated equivalent (`check-pipeline-compliance.sh`, sequence step 2 of #2861) can only check the same three things, and a *stage* would have to invent judgement it does not have.
+
 ---
 
 ## Section 2 — Affiliation (Team / Role)
