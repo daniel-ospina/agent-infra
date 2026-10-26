@@ -671,7 +671,12 @@ fi
 # reason fleet-health.py does: it imports that sibling classifier. It is NOT
 # invoked by the launchd job (no network read behind the TCC wall) — the farm is
 # for the operator/agent CLI.
-fleet_tools=(liveness.py lane_liveness.py claim_lanes.py fleet-health.py map-sessions.py)
+# pr_state.py (#2866): the PR STATE ROUTER — the ONE answer to "what does this PR need next, and
+# should anything be running for it right now". Farmed because the harness actors that consume it
+# (`pr-sickness.sh`, `lane-merge.sh`, via `scripts/orchestrator-harness/pr-state.sh`) live in `$O`,
+# which is NOT a checkout of this repo: without the farm the seam resolves nothing there and every
+# actor prints `router unavailable` — the wiring would exist and never run.
+fleet_tools=(liveness.py lane_liveness.py claim_lanes.py fleet-health.py map-sessions.py pr_state.py)
 mkdir -p "$DEST/scripts/fleet"
 tools_copied=0
 for base in "${fleet_tools[@]}"; do
@@ -690,7 +695,7 @@ for base in "${fleet_tools[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   tools_copied=$((tools_copied+1))
 done
-echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions, #1178/#1777)"
+echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions + pr-state, #1178/#1777/#2866)"
 
 # Migration off the deprecated location (#1277). The farm used to write
 # $DEST/tools/fleet/, one of the very paths pi's startup scan rejects — so a
