@@ -62,6 +62,30 @@ command -v derive_or >/dev/null 2>&1 \
     [ -d "$O" ] && { mkdir -p "$O/logs" 2>/dev/null; echo "$(date) [startup] $_fatal_rs" >> "$O/logs/orch-loop.log" 2>/dev/null; }
     exit 78
   }
+# ── THE PRE-DISPATCH DISK FLOOR (agent-infra — two cells stopped dispatching on bytes, one night) ──
+# A cell whose filesystem fills stops dispatching ENTIRELY and presents as something else: a controller
+# that stopped beating with its unit still `active`, or a refresh that failed at
+# `stage=provision sub-step=scout-venv` because `uv sync` could not write a torch library. Both were
+# BYTES; freeing them fixed both instantly (864MB -> 9378MB). The floor lives in disk-floor.sh, SHARED
+# with refresh-candidates.sh for the same reason repo-slug.sh is shared: the loop's cycle and the
+# refresh's provision stage must answer this question ONE way, or a box can hold one and provision the
+# other. Resolved like repo-slug.sh ($O first, then beside the loop) so a re-seed and a checkout agree.
+# ⛔ A MISSING/STALE COPY IS NOT FATAL HERE, AND THAT IS DELIBERATE. `derive_or` above is fatal because
+# a wrong guess grades the WRONG REPO — a silent wrong answer. A missing floor is a DEPLOY SKEW, and
+# refusing to start the controller over it would take a healthy box down to fix a log line. The cycle
+# says CANNOT-VERIFY, once per cycle, and proceeds unguarded for that cycle only: the disclosure is
+# what keeps it out of the silent class, and the next re-seed restores the gate.
+DISK_FLOOR_STATE=absent    # absent | ok  (decided at load; the CYCLE reads it)
+for _dfc in "${O:-}/disk-floor.sh" "${_HERE_RS:-}/disk-floor.sh"; do
+  [ -n "$_dfc" ] && [ -f "$_dfc" ] || continue
+  # shellcheck disable=SC1090
+  . "$_dfc" 2>/dev/null || continue
+  # ⛔ THE FILE IS NOT THE FUNCTION (repo-slug.sh's rule, same reason): a stale copy sources cleanly and
+  # defines nothing, and a gate that silently does not exist reads exactly like a floor that is met.
+  command -v disk_floor_gate >/dev/null 2>&1 || { unset -f disk_floor_gate disk_floor_free_mb 2>/dev/null; continue; }
+  DISK_FLOOR_STATE=ok; DISK_FLOOR_SRC="$_dfc"; break
+done
+[ "$DISK_FLOOR_STATE" = "ok" ] || DISK_FLOOR_STATE=absent
 OR_EXPLICIT="${OR:-}"
 # ⛔ WHETHER THE OPERATOR NAMED OR, TOLD TO THE CHILD EXPLICITLY (#1977 review, P1). The export
 # below is UNCONDITIONAL (#2040), so the child cannot tell an operator's `OR=…` from the default this
@@ -3268,6 +3292,50 @@ while true; do
   K=0; Y=0
   heartbeat
   res_line   # MEASURE every resource; decide nothing from it
+  # ── 0b) THE PRE-DISPATCH DISK FLOOR (agent-infra — the night two cells stopped on bytes) ──────
+  # ⛔ IT RUNS BEFORE `harness_refresh_cycle`, `reap_stale_workers` and EVERY provisioning path, and
+  # that placement IS the fix. Measured twice in one night: a cell at 872MB free failed
+  # `stage=provision sub-step=scout-venv` (`uv sync` could not write a torch library) and a cell at 0
+  # avail died with its unit still `active` — both discovered from the SYMPTOM, never from the cause,
+  # because nothing measured the floor before paying for the work. `eldato-disk-reaper.timer` cannot
+  # close this: it is hourly, it is not on this path, and the failure it must prevent is what stops it
+  # from running.
+  # ⛔ IT RUNS AFTER `heartbeat` ON PURPOSE. A held cycle still stamps liveness, because the supervisor
+  # treats a missing heartbeat as a DEAD controller and relaunches it into the same wall (the fork arm
+  # above documents the same lesson). A hold is a decision, and a decision must not look like a crash.
+  # rc 1 = HOLD (below the floor after the reclaim pass): no refresh, no dispatch, no PR sweep this
+  # cycle, ONE line naming free/floor/reclaimed, and the box naps like any other held cycle. rc 2 =
+  # CANNOT-VERIFY: proceed unguarded, but SAY so — an unseen reading is not a healthy one, and the
+  # disk-floor.sh header carries the measured reason that reading must not stop the box.
+  if [ "${DISK_FLOOR_STATE:-absent}" = "ok" ]; then
+    _df_line="$(disk_floor_gate "$O")"; _df_rc=$?
+  else
+    _df_line="[disk] CANNOT-VERIFY: no disk-floor.sh in $O or beside the loop (DISK_FLOOR_SRC='${DISK_FLOOR_SRC:-none}') — the pre-dispatch floor did NOT run this cycle, so a full disk will surface again as a provision failure, a stalled controller, or a silent 100%. Fix: re-seed \$O (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)"
+    _df_rc=2
+  fi
+  # Best-effort on BOTH streams: at a full disk the log write is itself the thing that fails, and the
+  # line is worthless if it only exists where nobody is reading. `|| true` is not swallowing an error
+  # here — the disk is already the error, and this line is the report of it.
+  [ -n "${_df_line:-}" ] && { printf '%s\n' "$_df_line" >> "$LOG"; } 2>/dev/null || true
+  if [ "${_df_rc:-0}" = "1" ]; then
+    # ── THE HELD CYCLE: NAMED, RECORDED, AND STILL ALIVE ────────────────────────────────────────
+    # Modelled on the fork-starved arm above rather than invented: same shape (one line, a cycle
+    # record with `nothing=`, a nap, a `continue`) so `bin/harness status` and `cycle-record.sh`
+    # answer "why did this box dispatch nothing" from the record instead of from a grep.
+    printf '%s\n' "$_df_line" >&2 2>/dev/null || true
+    if [ "${CYCREC:-0}" = "1" ]; then
+      cycle_record_write "$O" \
+        start="${CYCLE_T0:-0}" end="$(date +%s 2>/dev/null || echo 0)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
+        selected="none" selected_n=0 dispatched=0 ids=- \
+        nothing="disk_floor" placement="disk_held" placed_on=none bound="disk_floor" disk="${_df_line:-}" \
+        || printf '[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable) — a disk-held box with no record is SILENT, which is the failure this block exists to end\n' >> "$LOG" 2>/dev/null || true
+    else
+      printf '[cycle] disk_held (cycle-record.sh absent — this state is NOT recorded anywhere)\n' >> "$LOG" 2>/dev/null || true
+    fi
+    _nap="$(( 10#${CYC:-240} + (10#${CYC:-240} / 5) ))"
+    fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
+    continue
+  fi
   reap_stale_workers
   # ⛔ THE LATCH IS RELEASED HERE, ONCE PER ITERATION — NOT AT LOAD. `_HR_DONE` starts at 0 and the
   # function sets it on entry, so a per-PROCESS latch would refresh once in the controller's whole
