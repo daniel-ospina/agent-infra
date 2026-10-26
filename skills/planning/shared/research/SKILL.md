@@ -25,7 +25,7 @@ Routes the workflow's research stage at the correct granularity rung of the ladd
 |---|---|---|
 | **epic-workflow** (stage 2) | Deep (research skill, full brief) | Produce the epic research brief (5 canonical sections + `## Raw Notes`) via `epic-research` |
 | **project-workflow** (stage 2) | Medium (research skill, targeted) | If parent epic has a brief → targeted research appends findings (granularity: issue-level questions the brief doesn't cover); otherwise run the research skill at Medium depth |
-| **task-workflow-standard** (scope/plan stages) | Via issue-scoping Phase 1.5 + writing-plans Step B | No standalone research stage — the ladder rungs handle it (task-workflow-standard research-path note) |
+| **task-workflow-standard** (stage 1 — a STANDALONE stage since agent-infra#2861) | Medium (`research` skill, axis matrix 8-cap standard / 14-cap complex) | Produce the `### Targeted Research Findings` block **as a comment on the issue**, per §Output Contract below, carrying ≥1 internal locator and ≥1 external URL, a `FALSIFIER:`, `Gaps:` and `> **Findings date:**`. It is a **gate on the artifact the lane produces**, not a paragraph the brief can supply — checked by `check-pipeline-compliance.sh` (step 2 of #2861). The pre-#2861 shape (research via `issue-scoping` Phase 1.5 + `writing-plans` Step B, no standalone stage) is superseded: the two blocks are now ONE, and the plan's `<!-- research-path: … -->` resolves to it. Vocabulary note retained: `### Axis Research` remains `issue-scoping` Phase 1.5's own artifact for **epic/project** workflows — do not confuse the two. |
 
 ## Instructions
 
@@ -39,16 +39,19 @@ After the research stage completes (epics + standalone projects — any stage th
 
 ```
 Review this research output for:
-1. BRIEF COMPLETENESS: Do the fixed sections exist (canonical headings per epic-research contract, or the output contract for the level)?
-2. ADVERSARIAL BALANCE: Were disconfirming queries run, not just confirming ones?
-3. DEDUP HONESTY: Are skipped/deduplicated questions justified with a section citation?
-4. FINDINGS-DATE: Does the output carry a `> **Findings date:**` stamp or documented skip?
-5. RAW NOTES: Are findings persisted to `## Raw Notes` (append-only, timestamped, source-tagged) per research-protocol §13?
+1. LOCATORS RESOLVE (`### Targeted Research Findings` blocks — the task tier applies this FIRST): does every cited `path:line` exist at the PR head, and does the cited line say what the finding claims? Open each one and quote it. A locator that does not resolve, or resolves to a line about something else, is a P1 — not a formatting nit.
+2. BRIEF COMPLETENESS: Do the fixed sections exist (canonical headings per epic-research contract, or the output contract for the level)?
+3. ADVERSARIAL BALANCE: Were disconfirming queries run, not just confirming ones?
+4. DEDUP HONESTY: Are skipped/deduplicated questions justified with a section citation?
+5. FINDINGS-DATE: Does the output carry a `> **Findings date:**` stamp or documented skip?
+6. RAW NOTES: Are findings persisted to `## Raw Notes` (append-only, timestamped, source-tagged) per research-protocol §13?
 
 Return: NO ISSUES FOUND | ISSUES: <list>
 ```
 
 Fix-loop until clean or convergence (10-cycle cap).
+
+> **The task tier does not dispatch this checklist.** `task-workflow-standard` declares no `steps:` frontmatter, so it is not one of the `gate: verifier` stages above; for that pipeline item 1 (locator resolution) is asked as **PLAN-VERIFY Q2 inside the single round**, and a separate research reviewer plus a fix loop would be the second blocking pre-code round the #2861 redesign removes. "The task tier applies this FIRST" in item 1 means *first in this list*, not *as a separate dispatch*.
 
 ## Output Contract
 

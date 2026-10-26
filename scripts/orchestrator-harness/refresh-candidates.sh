@@ -810,6 +810,56 @@ gh_probe_bounded() { # gh_probe_bounded <secs> <cmd…>; sets GH_PROBE_ERR (stde
   fi
 }
 
+# ── A FLAKY PROBE CALL MUST NOT BLIND THE WHOLE CYCLE (#2830) ───────────────────────────────────
+# MEASURED: the `[refresh]` pass failed on 39% of the local box's cycles (305/764) and 70% of
+# pi-cell-4's (102/145), and EVERY one of those cycles enumerated nothing — no candidates, no per-PR
+# rows, no dispatch — because the precondition probe below returned TRANSIENT after a SINGLE
+# attempt. Run by hand seconds after a refusal, from the same box and the same environment, the same
+# call answered rc=0 in 903-1872 ms. So the defect was never the network: it was a one-shot probe
+# whose first failure costs the entire cycle, and `refresh` is the only path to work on a cell.
+#
+# So the probe retries. Three properties are the contract, and each is deliberate:
+#   1. BOUNDED IN TOTAL, NOT PER ATTEMPT. `GH_PROBE_TIMEOUT` bounds ONE call and defaults to 20 s, so
+#      three attempts at full bound would be 60 s; the budget below caps ALL attempts (backoff
+#      included) at ~30 s, and each attempt is clamped to what is LEFT of it. A retry that could
+#      stretch the pass's stall is not a fix for a pass that stalls.
+#   2. JITTERED BACKOFF, so two cells that failed on the same blip do not retry in lockstep.
+#   3. POLARITY IS UNCHANGED. All attempts failing (or the budget running out) returns exactly what
+#      one attempt returned, through the same arms, with the same messages and the same exit code —
+#      the cycle still refuses to dispatch. Failing closed is correct; going blind on one flaky call
+#      is not. A 401 is a VERDICT, not a flake, so it is not retried (a rejected credential is what
+#      the permanent MERGE-ONLY marker is for).
+GH_PROBE_ATTEMPTS="${GH_PROBE_ATTEMPTS:-3}"
+case "$GH_PROBE_ATTEMPTS" in ''|*[!0-9]*) GH_PROBE_ATTEMPTS=3 ;; esac
+[ "$GH_PROBE_ATTEMPTS" -ge 1 ] 2>/dev/null || GH_PROBE_ATTEMPTS=3
+GH_PROBE_BUDGET="${GH_PROBE_BUDGET:-30}"
+case "$GH_PROBE_BUDGET" in ''|*[!0-9]*) GH_PROBE_BUDGET=30 ;; esac
+[ "$GH_PROBE_BUDGET" -ge 1 ] 2>/dev/null || GH_PROBE_BUDGET=30
+# gh_probe_retry <secs> <cmd…> — bounded retry around gh_probe_bounded; GH_PROBE_ERR is the LAST
+# attempt's stderr, and the return code is the LAST attempt's, so the caller's arms are unchanged.
+gh_probe_retry() {
+  local _s="$1"; shift
+  local started attempt=1 rc=0 left bound nap
+  started="$(date +%s)"
+  while :; do
+    left=$(( GH_PROBE_BUDGET - ( $(date +%s) - started ) ))
+    [ "$left" -ge 1 ] || break          # budget spent: report the last attempt's failure
+    bound="$_s"; [ "$bound" -le "$left" ] || bound="$left"
+    gh_probe_bounded "$bound" "$@"; rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    [ "$attempt" -lt "$GH_PROBE_ATTEMPTS" ] || break
+    # A 401 is the API's own VERDICT (a rejected credential): retrying it only delays the permanent
+    # marker, and cannot change the answer.
+    [ -n "$GH_PROBE_ERR" ] && grep -q 'HTTP 401' "$GH_PROBE_ERR" 2>/dev/null && break
+    nap=$(( 1 + RANDOM % 2 ))          # 1-2 s of jitter; the budget clamp below keeps the TOTAL bound
+    left=$(( GH_PROBE_BUDGET - ( $(date +%s) - started ) ))
+    [ "$nap" -lt "$left" ] || break
+    sleep "$nap"
+    attempt=$(( attempt + 1 ))
+  done
+  return "$rc"
+}
+
 # 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
 gh_probe_env() {
   local terr err prc presence=""
@@ -860,7 +910,7 @@ gh_probe_env() {
   # proxy or a wedged tunnel parks it exactly like the credential lookup did. A bound here is already
   # TRANSIENT-shaped (the fall-through below is TRANSIENT unless the API answers 401), so it cannot
   # latch anything.
-  gh_probe_bounded "$GH_PROBE_TIMEOUT" gh api rate_limit; prc=$?
+  gh_probe_retry "$GH_PROBE_TIMEOUT" gh api rate_limit; prc=$?
   [ "$prc" -eq 0 ] && { gh_probe_err_cleanup; return 0; }
   err="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
   if gh_probe_timed_out "$prc"; then
@@ -1544,6 +1594,47 @@ if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 # The pass records its own outcome from here on (see the pass-record block above). `provision` covers
 # everything up to the pool listing: the state dir, the gh environment, the scout, the interpreter.
 refresh_stage provision "provisioning (state dir, gh environment, scout worktree, interpreter)"
+# ── THE PRE-DISPATCH DISK FLOOR (agent-infra — `uv sync` at 872MB free, twice in one night) ───────
+# ⛔ IT IS HERE, BEFORE `resolve_repo`, BEFORE THE STATE-DIR PROBES, AND BEFORE THE SCOUT — the
+# earliest point in the provision stage that can still PREVENT work. The measured failure was a cell
+# at `126G 120G 872M 100%` whose pass died as:
+#     [refresh] FAILED stage=provision sub-step=scout-venv: uv sync failed … failed to write
+#     /tmp/cell-home/.cache/uv/…/libtorch_cuda.so: No space left on device
+# Every layer of that message is misleading: it names the LAST writer (`uv sync`) as the cause, it
+# arrives minutes after the real condition was already true, and the remedy it implies (rebuild the
+# venv) is exactly what cannot run. Freeing bytes fixed it instantly (864MB -> 9378MB; the uv cache
+# alone was ~8.5 GB) and the pre-flight went to `VERDICT: CLEAN (exit 0)`.
+# ⛔ AND IT MUST PRECEDE THE `$O`/`$O/state` WRITE PROBES. On a full disk those probes FAIL, and the
+# pass then records `state-dir: … is not WRITABLE` — a true statement about a symptom that sends the
+# operator to chown/chmod while the filesystem is the actual problem. The floor is asked FIRST, so a
+# full disk is reported as bytes.
+# ⛔ SHARED WITH orch-loop.sh (disk-floor.sh, the repo-slug.sh pattern): the controller's cycle and
+# this pass must answer the floor question ONE way, or a box can hold one and provision the other.
+# ⛔ A MISSING COPY IS A NAMED SKEW, NOT A SKIP: this pass runs on cells whose `$O` is re-seeded
+# separately, and refusing every pass over a seed skew would be a false block. The line says so every
+# pass it fires, which is what keeps it out of the silent class.
+DISK_FLOOR_STATE=absent
+for _dfc in "${O:-}/disk-floor.sh" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/disk-floor.sh"; do
+  [ -n "$_dfc" ] && [ -f "$_dfc" ] || continue
+  # shellcheck disable=SC1090
+  . "$_dfc" 2>/dev/null || continue
+  command -v disk_floor_gate >/dev/null 2>&1 || { unset -f disk_floor_gate disk_floor_free_mb 2>/dev/null; continue; }
+  DISK_FLOOR_STATE=ok; break
+done
+if [ "$DISK_FLOOR_STATE" = "ok" ]; then
+  _df_line="$(disk_floor_gate "$O")"; _df_rc=$?
+else
+  _df_line="[disk] CANNOT-VERIFY: no disk-floor.sh in $O or beside this pass — the pre-dispatch floor did NOT run, so a full disk will surface again as `uv sync`/`worktree add` write errors instead of as bytes. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)"
+  _df_rc=2
+fi
+[ -n "${_df_line:-}" ] && printf '%s\n' "$_df_line"
+if [ "${_df_rc:-0}" = "1" ]; then
+  # ⛔ THE REFUSAL NAMES BYTES, NOT THE LAST WRITER. `provision_fail` carries it into `state/refresh-last`,
+  # so `orch-loop.sh`'s own `[dispatch] BLOCKED: refresh failed — stage=provision …` line quotes the
+  # free MB, the floor and what was reclaimed instead of an `uv sync` error an operator would chase.
+  # TRANSIENT, not permanent: freeing space fixes it and the next cycle retries on its own.
+  provision_fail "$EXIT_TRANSIENT" "sub-step=disk-floor: declined BEFORE provisioning, because the filesystem is below the pre-dispatch floor — this is a BYTES condition, not a build or a network failure, and nothing below this line could have written (the venv, the worktree and the pre-flight all write). ${_df_line}"
+fi
 # Same refusal on the run path, before any network work: a pass that cannot say which checkout it
 # stands in must not pre-flight anything (the scout worktree is created INSIDE $REPO below).
 if ! resolve_repo; then
