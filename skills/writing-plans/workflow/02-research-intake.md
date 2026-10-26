@@ -6,7 +6,7 @@ Before drafting the plan, gather all existing research. This avoids re-researchi
 
 ### Step A — Locate Prior Research
 
-**If invoked directly from `issue-scoping` in the same session (auto-invoke path):** Skip Step A's *search* — research findings, codebase context, and requirements are already live in context — but **validate the scoping artifact exists**: the scoping comment must contain `### Axis Research` (+ `### Integration Docs` for standard+) or a justified-skip trigger assessment; if absent, note the gap and proceed (the plan's `### Pattern Research` is still authored by Step B) — **except under `task-workflow-standard` (agent-infra#2861), where the dual-granularity split is merged into one `<!-- research: v1 -->` comment whose `### Targeted Research Findings` block already carries both granularities. There, verify that comment exists and skip Step B's separate `### Pattern Research` block** (a second block is the duplicate research the redesign removed). Proceed to Step B for any remaining implementation gaps.
+**If invoked directly from `issue-scoping` in the same session (auto-invoke path):** Skip Step A's *search* — research findings, codebase context, and requirements are already live in context — but **validate the scoping artifact exists**: the scoping comment must contain `### Axis Research` (+ `### Integration Docs` for standard+) or a justified-skip trigger assessment; if absent, note the gap and proceed (the plan's `### Pattern Research` is still authored by Step B) — **except under `task-workflow-standard` (agent-infra#2861), where the dual-granularity split is merged into one `<!-- research: v1 -->` comment whose `### Targeted Research Findings` block already carries both granularities. There, verify that comment exists and **Step B is not run at all** — its per-bucket gate (3+ calls per bucket, below) is the second research pass stage 1 already covers at the declared depth (`issue-scoping` §Tier Scaling: 8 axis queries standard / 14 complex), and its output block is the one this pipeline does not write. Record the skip in the plan comment's field 5, and carry any genuinely new gap as a plan risk rather than running B.**
 
 **Otherwise:** Check for research artifacts in this order:
 
@@ -51,7 +51,7 @@ If the plan touches **zero** third-party libraries / SDKs / frameworks (rare —
 
 #### Sub-step B.1 — Multi-Call Perplexity Verification Gate
 
-**Topic buckets** — for each bucket below that **applies** to the plan's third-party deps, fire **Perplexity calls proportional to topic novelty (see Research Depth table in proportional-gates). Well-known patterns: 0-1 calls. Novel patterns: 3+ calls.** (one per framing — see protocol). Skip a bucket entirely if it does not apply (see "When NOT to fire" below). Document any skip in the `### Pattern Research` output block.
+**Topic buckets** — for each bucket below that **applies** to the plan's third-party deps, fire **Perplexity calls proportional to topic novelty (see Research Depth table in proportional-gates). Well-known patterns: 0-1 calls. Novel patterns: 3+ calls.** (one per framing — see protocol). Skip a bucket entirely if it does not apply (see "When NOT to fire" below). Document any skip in the research evidence you are writing — `### Pattern Research` for the epic/project pipelines, or the `<!-- research: v1 -->` block's `Gaps:` field where Step B is not run (`task-workflow-standard`, see the note above).
 
 | Bucket | When it applies | What it surfaces |
 |---|---|---|
@@ -59,7 +59,7 @@ If the plan touches **zero** third-party libraries / SDKs / frameworks (rare —
 | **Idiomatic usage patterns** | Plan introduces a new usage pattern for a library (hooks, edge function patterns, query builders, streaming, batch APIs) | Idiomatic API usage for the exact version + known anti-patterns |
 | **Library/framework pitfalls** | Plan touches any third-party dep where misuse has known footguns (auth flows, retries, timeouts, state machines, side effects in renderers) | Common pitfalls, post-mortems, "we tried this and reverted" cases |
 
-**Per-bucket protocol (mandatory minimum, identical to epic-workflow + issue-scoping gates):**
+**Per-bucket protocol (mandatory minimum, identical to epic-workflow + issue-scoping gates) — epic/project pipelines only; `task-workflow-standard` does not run Step B (see the note at the top of this file):**
 
 For each bucket that applies, issue at least **3 separate** `mcp__seo-intelligence__perplexity_research` invocations, each with a distinct framing:
 

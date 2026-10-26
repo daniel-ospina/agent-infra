@@ -144,7 +144,7 @@ A lane whose issue says *"implement this ruling"* does not pay for stages that e
 
 **Skips:** the RESEARCH *work* (the queries) and PLAN-VERIFY's three questions. **Kept:** the research *artifact* (as a `**Basis:**` reference, below), **PLAN** (one paragraph of design plus the `### Review Scope Contract`, posted in the same plan comment), the doc's `### Wiring` table, and a **one-question verifier round** in place of PLAN-VERIFY.
 
-Write `**Rounds:** 1 (verifiers: 1, class=<class>)` with the plan comment **and** `<!-- plan-review: cycles=1, status=clean, version=2.3.0 -->` into the plan doc — so `writing-plans/05`'s pre-check finds a record rather than an absence, and the round is counted rather than inferred — one verifier round is spent on this path, and saying `0` would misreport a round that ran.
+Write `**Rounds:** 1 (verifiers: 1, class: <class>)` with the plan comment **and** `<!-- plan-review: cycles=1, status=clean, version=2.3.0 -->` into the plan doc — so `writing-plans/05`'s pre-check finds a record rather than an absence, and the round is counted rather than inferred — one verifier round is spent on this path, and saying `0` would misreport a round that ran.
 
 **Does not skip:** the contract; **PROVE** (tests, mutation proof, exact-head review + attestation); every `AGENTS.md` hard rule the change touches; and a **one-question verifier round** — *"is the pointed artifact a decision that governs THIS change, or merely an artifact that exists?"* That round replaces PLAN-VERIFY's three questions because this is the path with the least scrutiny: skipping the review *and* the research check is exactly what would make the lean path a bypass.
 

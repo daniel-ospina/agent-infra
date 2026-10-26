@@ -189,10 +189,10 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 
 3. **Parse the research evidence:** For a `task-workflow-standard` lane, read the `### Targeted Research Findings` block from the issue comment marked `<!-- research: v1 -->`; otherwise read the plan's `### Pattern Research` section. Either way use an **anchored, line-level exact heading match** (`^### Pattern Research$` / `^### Targeted Research Findings$`) — a substring match would let epic-brief headings such as `### UX Pattern Research` / `### Tech Stack Research` falsely satisfy coverage. Those epic-brief headings are PRIOR_RESEARCH context and **never** coverage evidence (issue #231 D5). Extract library/SDK/package names that appear in section headings or findings text. Also note `> Gate skipped`, `> Bucket [name] skipped`, and `> Research skipped: no demonstrated gap` justifications.
 
-4. **Cross-reference:** For each extracted package name, check if it (or its parent scope, e.g. `@supabase/supabase-js` matches `supabase`) is mentioned in Pattern Research. A package is "covered" if:
-   - Its name appears in a Pattern Research bucket heading or finding
-   - The Pattern Research explicitly mentions skipping it with a valid reason (e.g., "uses in-repo wrapper exclusively") — a **documented skip takes precedence over findings-date absence** (issue #231 H5)
-   - The Pattern Research says "plan touches zero third-party deps" AND no third-party imports were found
+4. **Cross-reference:** For each extracted package name, check if it (or its parent scope, e.g. `@supabase/supabase-js` matches `supabase`) is mentioned in the **research evidence read in step 3** (`### Pattern Research`, or `### Targeted Research Findings` from the `<!-- research: v1 -->` comment for a `task-workflow-standard` lane). A package is "covered" if:
+   - Its name appears in a research bucket heading or finding
+   - The research evidence explicitly mentions skipping it with a valid reason (e.g., "uses in-repo wrapper exclusively") — a **documented skip takes precedence over findings-date absence** (issue #231 H5)
+   - The research evidence says "plan touches zero third-party deps" AND no third-party imports were found
 
 5. **Determine unfamiliar:** Any package NOT covered by the research evidence is "unfamiliar". Also treat as unfamiliar if:
    - the research evidence is absent entirely (neither the `<!-- research: v1 -->` comment nor a `### Pattern Research` section)
@@ -355,8 +355,8 @@ Pass ratings to Step 3 verifier as context. When all ratings are empty, verifier
 |-----------|--------|
 | Dep already used elsewhere in codebase | Skip verification — pattern is known |
 | Dep is well-known stdlib-adjacent | Skip — common knowledge |
-| Dep is new to codebase AND not in plan Pattern Research | Verify: 1-2 Perplexity calls |
-| Dep is novel, unfamiliar, AND no Pattern Research | Verify: 2-3 calls. Pause if unavailable. |
+| Dep is new to codebase AND not in the plan's research evidence | Verify: 1-2 Perplexity calls |
+| Dep is novel, unfamiliar, AND no research evidence | Verify: 2-3 calls. Pause if unavailable. |
 
 **Perplexity unavailable:** If dep is well-known, proceed with note. Only pause for genuinely novel deps.
 
