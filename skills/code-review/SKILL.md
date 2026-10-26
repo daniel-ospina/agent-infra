@@ -598,7 +598,7 @@ Resolve the change's **risk class** and extract complexity ratings from the link
 
 **0. Resolve the risk class — BEFORE dispatch (do not skip):**
 
-Classify the **change** with `proportional-gates` §Change Classification (overall risk = the highest dimension), and read the reviewer count and cycle cap from `proportional-gates` §Review Cycles — the **single owner** of reviewer counts and cycle caps. Do **not** restate its cells here. This step must produce **one** of the four values §Review Cycles' own row labels name, and Step 4 consumes that exact value:
+Classify the **change** with `proportional-gates` §Change Classification (overall risk = the highest dimension), and read the reviewer count and cycle cap from `proportional-gates` §Review Cycles — the **single owner** of the **code panel's** reviewer counts and cycle caps. (The pre-code `PLAN-VERIFY` verifier count in `task-workflow-standard` is a different gate and takes its count from `issue-scoping` §Tier Scaling; `review-discipline` §Boundaries states the exception.) Do **not** restate its cells here. This step must produce **one** of the four values §Review Cycles' own row labels name, and Step 4 consumes that exact value:
 
 | Classification result (overall = the highest dimension) | `RISK_CLASS` |
 |---|---|

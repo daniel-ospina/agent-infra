@@ -706,7 +706,7 @@ Consume the `### Deferred to Research` queue from `clarifying-questions` (Phase 
 ### Sub-step C — Persist
 
 1. Append timestamped, source-tagged findings to the research brief via `bash scripts/_research_append.sh --issue-body "$ISSUE_BODY" --issue-number $ISSUE_NUMBER --append "<text>" --source-tag <canonical|competitor|precedent|pitfalls|adversarial|question> --create` (create-if-missing; `**Research:**` backfill is best-effort).
-2. Stage `### Axis Research` (from Sub-steps A/B findings) for the Phase 8 post comment. `### Integration Docs` (deps + versions + API-surface findings) is **drafted at solution-converge (Phase 4/5)** from Codebase Explorer DEPENDENCIES (Phase 3) + Phase 1.5 findings; solution-verify (Phase 5.5) checks the draft; Phase 8 posts it. *(Disambiguation: `### Integration Docs` is distinct from the plan doc's `### Integration Surface Map` — different documents, different consumers; never merge or relocate.)*
+2. Stage `### Axis Research` (from Sub-steps A/B findings) for the Phase 8 post comment — **epic/project pipelines only**: under `task-workflow-standard` this is merged into the single `<!-- research: v1 -->` block and Phase 8 is not dispatched (agent-infra#2861). `### Integration Docs` (deps + versions + API-surface findings) is **drafted at solution-converge (Phase 4/5)** from Codebase Explorer DEPENDENCIES (Phase 3) + Phase 1.5 findings; solution-verify (Phase 5.5) checks the draft; Phase 8 posts it. *(Disambiguation: `### Integration Docs` is distinct from the plan doc's `### Integration Surface Map` — different documents, different consumers; never merge or relocate.)*
 
 ### Activation Rule (necessary-not-sufficient)
 
@@ -911,6 +911,8 @@ Each review cycle dispatches FRESH `task` sub-agents.
 ---
 
 ## Phase 8 — Finalize
+
+> **Not dispatched by `task-workflow-standard` (agent-infra#2861).** That pipeline posts **its own** plan comment from `task-workflow-standard` §2b — marker `<!-- issue-scoping: merged scope+plan -->`, no `## Verification Gates` block (those gates are not dispatched there), no `### Adversarial Threat Surface`, and no `### Axis Research` (merged into the one `<!-- research: v1 -->` block). Posting this one as well creates a second scoping artifact and a cycle attestation for gates that did not run.
 
 ### Post Plan Comment
 
