@@ -39,6 +39,12 @@ fi
 if [ -n "${STUB_COMMENTS_FILE:-}" ]; then
   case "$*" in *"/comments"*) cat "$STUB_COMMENTS_FILE"; exit 0 ;; esac
 fi
+# §Z(e): an UNPARSEABLE body with rc 0 — the "a failed read is not an empty surface" contract has to
+# be reachable from the suite, and the only way to make the READ succeed while its BODY is garbage is
+# to serve the garbage. (STUB_STS_FAIL fails the read in bash, which is a different path.)
+if [ -n "${STUB_STATUSES_FILE:-}" ]; then
+  case "$*" in *"/status") cat "$STUB_STATUSES_FILE"; exit 0 ;; esac
+fi
 case "$*" in *"/comments?per_page"*)
   if [ "${STUB_COMMENTS_FAIL:-0}" = 1 ]; then
     printf 'gh-limit: gh rate limit (bucket=core reset=1700003600) — FAILED after 4 attempts\n' >&2
@@ -357,7 +363,11 @@ ck "a refused legacy commit-status read FAILS the call (rc!=0) and says the set 
 # ARG_MAX cannot silently turn this into a vacuous pass.
 _argmax="$(getconf ARG_MAX 2>/dev/null || true)"
 case "${_argmax:-}" in ''|*[!0-9]*) _argmax=1048576 ;; esac
-[ "$_argmax" -gt 2097152 ] && _argmax=2097152
+# ⛔ SIZE FROM THE KERNEL LIMIT AND COMPARE LIKE WITH LIKE. An earlier version capped `_argmax` at
+# 2 MiB and then sized the fixture at 2 × that cap — so the "cannot be vacuous" assertion compared the
+# fixture against the SAME capped number it was derived from, which is ALWAYS true and is a false
+# assurance on any box whose limit is bigger. The fixture is 2 × the kernel's own ARG_MAX and it is
+# asserted against the kernel's own ARG_MAX (2 × ARG_MAX >= min(ARG_MAX, 2 MiB) on every box).
 _big_n=$(( _argmax * 2 ))
 python3 - "$TMP/big-runs.json" "$TMP/big-comments.json" "$_big_n" <<'PY'
 import json, sys
@@ -380,7 +390,7 @@ open(comments_path, "w").write(json.dumps([
 ]) + "\n")
 PY
 _big_sz="$(wc -c <"$TMP/big-runs.json" | tr -d '[:space:]')"
-ck "§Z fixture really exceeds the kernel limit (${_big_sz}B > ${_argmax}B) — the arm cannot be vacuous" \
+ck "§Z fixture really exceeds the KERNEL limit (${_big_sz}B > ARG_MAX ${_argmax}B) — the arm cannot be vacuous" \
    "$([ "${_big_sz:-0}" -gt "$_argmax" ] && echo 0 || echo 1)"
 out="$(STUB_CHECKRUNS_FILE="$TMP/big-runs.json" run pr checks 8833 --repo o/r --json name,state 2>&1)"; rc=$?
 # The check set must be CORRECT, not merely non-empty: the two runs from page 1 AND the legacy
@@ -407,22 +417,37 @@ ck "§Z a >ARG_MAX COMMENTS payload survives intact (both comments, the big body
 ck "§Z …and that path reports no 'Argument list too long' either" \
    "$(! has 'Argument list too long' "$out" && echo 0 || echo 1)"
 
+# ⛔ AN UNPARSEABLE BODY WITH rc 0 IS A FAILED READ, NOT AN EMPTY CHECK SET — and without an arm this
+# guarantee rots: reverting it to the old `except Exception: return []` left every assertion green
+# (measured). The read SUCCEEDS here (the stub exits 0) and only the document is garbage, which is the
+# one path that used to answer `[]` with rc 0 — a check surface that reads "no checks".
+printf '<html>oops</html>\n' >"$TMP/bad-sts.json"
+out="$(STUB_STATUSES_FILE="$TMP/bad-sts.json" run pr checks 8833 --repo o/r --json name,state 2>"$TMP/err-p")"; rc=$?
+ck "§Z an UNPARSEABLE check payload FAILS the read (rc!=0, no surface) and names the key" \
+   "$([ "$rc" -ne 0 ] && [ -z "$out" ] && has 'cannot parse the statuses payload' "$(cat "$TMP/err-p")" && echo 0 || echo 1)"
+# …while an EMPTY body with rc 0 stays benign: that is "no rows", not a refused read, so the surface
+# must still be produced from the check runs alone.
+printf '' >"$TMP/empty-sts.json"
+out="$(STUB_STATUSES_FILE="$TMP/empty-sts.json" run pr checks 8833 --repo o/r --json name,state 2>&1)"; rc=$?
+_empt_ok="$(printf '%s' "$out" | json_eq 'any(x["name"]=="ai-review-gate" for x in d)')"
+ck "§Z an EMPTY status body (rc 0) still yields the check set — it is 'no rows', not a failed read" \
+   "$([ "$rc" -eq 0 ] && [ "${_empt_ok:-1}" = 0 ] && echo 0 || echo 1)"
+
 # ⛔ NON-VACUITY, PINNED IN THE SUITE RATHER THAN ONLY IN THE PR TEXT: no projection site may pass
 # its payload through the environment or argv. The env form is the one the kernel refused; the
-# comments form put it in argv. A grep is enough here because the SHAPE is the defect and the two
-# arms above already prove the behaviour (reverting to either form fails them: measured on the
-# pre-fix shim, the check-runs arm dies rc=1 with `Argument list too long` and prints the kernel
-# message instead of a check set).
-# The env shape is identified by its loader: `os.environ.get(k)` is how a payload is read OUT of the
-# environment. (`$`-escaping a regex through nested quotes silently produced a zero-match pattern
-# here once, which is why this one needs no `$`.)
-_env_sites="$(grep -vE '^[[:space:]]*#' "$SHIM" | grep -cF 'os.environ' || true)"
+# comments form put it in argv. A grep is enough here because the SHAPE is the defect and the arms
+# above already prove the behaviour (reverting to either form fails them: measured on the pre-fix
+# shim, the check-runs arm dies rc=1 with `Argument list too long` and prints the kernel message
+# instead of a check set).
+# The patterns name the SHAPE, not the two exact lines that were removed: any payload read out of the
+# environment (`os.environ`, `os.getenv`), and any of the three payload variables handed to python as
+# a value. (`[$]` rather than `\$`: a `\$` inside nested quotes is consumed by the OUTER double
+# quotes and silently produced a zero-match pattern here once.)
+_env_sites="$(grep -vE '^[[:space:]]*#' "$SHIM" | grep -cE 'os[.](environ|getenv)' || true)"
 ck "§Z no projection reads its payload from the process ENVIRONMENT" \
    "$([ "${_env_sites:-0}" -eq 0 ] && echo 0 || echo 1)"
-# A payload variable as an ARGUMENT to python3 on one line is the argv form. The staged form hands
-# python a PATH ("$__cs_f"), never the bytes.
-_argv_sites="$(grep -vE '^[[:space:]]*#' "$SHIM" | grep -cE 'python3.*"\$cs"' || true)"
-ck "§Z no projection hands its payload to python through ARGV" \
+_argv_sites="$(grep -vE '^[[:space:]]*#' "$SHIM" | grep -cE 'python3.*"[$](cs|runs|sts)"' || true)"
+ck "§Z no projection hands a payload VARIABLE to python as a value" \
    "$([ "${_argv_sites:-0}" -eq 0 ] && echo 0 || echo 1)"
 
 echo
