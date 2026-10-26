@@ -810,6 +810,56 @@ gh_probe_bounded() { # gh_probe_bounded <secs> <cmd…>; sets GH_PROBE_ERR (stde
   fi
 }
 
+# ── A FLAKY PROBE CALL MUST NOT BLIND THE WHOLE CYCLE (#2830) ───────────────────────────────────
+# MEASURED: the `[refresh]` pass failed on 39% of the local box's cycles (305/764) and 70% of
+# pi-cell-4's (102/145), and EVERY one of those cycles enumerated nothing — no candidates, no per-PR
+# rows, no dispatch — because the precondition probe below returned TRANSIENT after a SINGLE
+# attempt. Run by hand seconds after a refusal, from the same box and the same environment, the same
+# call answered rc=0 in 903-1872 ms. So the defect was never the network: it was a one-shot probe
+# whose first failure costs the entire cycle, and `refresh` is the only path to work on a cell.
+#
+# So the probe retries. Three properties are the contract, and each is deliberate:
+#   1. BOUNDED IN TOTAL, NOT PER ATTEMPT. `GH_PROBE_TIMEOUT` bounds ONE call and defaults to 20 s, so
+#      three attempts at full bound would be 60 s; the budget below caps ALL attempts (backoff
+#      included) at ~30 s, and each attempt is clamped to what is LEFT of it. A retry that could
+#      stretch the pass's stall is not a fix for a pass that stalls.
+#   2. JITTERED BACKOFF, so two cells that failed on the same blip do not retry in lockstep.
+#   3. POLARITY IS UNCHANGED. All attempts failing (or the budget running out) returns exactly what
+#      one attempt returned, through the same arms, with the same messages and the same exit code —
+#      the cycle still refuses to dispatch. Failing closed is correct; going blind on one flaky call
+#      is not. A 401 is a VERDICT, not a flake, so it is not retried (a rejected credential is what
+#      the permanent MERGE-ONLY marker is for).
+GH_PROBE_ATTEMPTS="${GH_PROBE_ATTEMPTS:-3}"
+case "$GH_PROBE_ATTEMPTS" in ''|*[!0-9]*) GH_PROBE_ATTEMPTS=3 ;; esac
+[ "$GH_PROBE_ATTEMPTS" -ge 1 ] 2>/dev/null || GH_PROBE_ATTEMPTS=3
+GH_PROBE_BUDGET="${GH_PROBE_BUDGET:-30}"
+case "$GH_PROBE_BUDGET" in ''|*[!0-9]*) GH_PROBE_BUDGET=30 ;; esac
+[ "$GH_PROBE_BUDGET" -ge 1 ] 2>/dev/null || GH_PROBE_BUDGET=30
+# gh_probe_retry <secs> <cmd…> — bounded retry around gh_probe_bounded; GH_PROBE_ERR is the LAST
+# attempt's stderr, and the return code is the LAST attempt's, so the caller's arms are unchanged.
+gh_probe_retry() {
+  local _s="$1"; shift
+  local started attempt=1 rc=0 left bound nap
+  started="$(date +%s)"
+  while :; do
+    left=$(( GH_PROBE_BUDGET - ( $(date +%s) - started ) ))
+    [ "$left" -ge 1 ] || break          # budget spent: report the last attempt's failure
+    bound="$_s"; [ "$bound" -le "$left" ] || bound="$left"
+    gh_probe_bounded "$bound" "$@"; rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    [ "$attempt" -lt "$GH_PROBE_ATTEMPTS" ] || break
+    # A 401 is the API's own VERDICT (a rejected credential): retrying it only delays the permanent
+    # marker, and cannot change the answer.
+    [ -n "$GH_PROBE_ERR" ] && grep -q 'HTTP 401' "$GH_PROBE_ERR" 2>/dev/null && break
+    nap=$(( 1 + RANDOM % 2 ))          # 1-2 s of jitter; the budget clamp below keeps the TOTAL bound
+    left=$(( GH_PROBE_BUDGET - ( $(date +%s) - started ) ))
+    [ "$nap" -lt "$left" ] || break
+    sleep "$nap"
+    attempt=$(( attempt + 1 ))
+  done
+  return "$rc"
+}
+
 # 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
 gh_probe_env() {
   local terr err prc presence=""
@@ -860,7 +910,7 @@ gh_probe_env() {
   # proxy or a wedged tunnel parks it exactly like the credential lookup did. A bound here is already
   # TRANSIENT-shaped (the fall-through below is TRANSIENT unless the API answers 401), so it cannot
   # latch anything.
-  gh_probe_bounded "$GH_PROBE_TIMEOUT" gh api rate_limit; prc=$?
+  gh_probe_retry "$GH_PROBE_TIMEOUT" gh api rate_limit; prc=$?
   [ "$prc" -eq 0 ] && { gh_probe_err_cleanup; return 0; }
   err="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
   if gh_probe_timed_out "$prc"; then

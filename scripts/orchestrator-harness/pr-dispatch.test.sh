@@ -253,8 +253,17 @@ PY
     # lane-count assertions then read 12/9 and depended on what the machine happened to be doing. A
     # stub that answers nothing makes the tmux arm UNKNOWN, which invents no rows.
     PATH="$TMP/bin-tmuxnone:$PATH"
-    sess() { return 1; }
+    # ⛔ `OWN_LIVE=1` IS THE SEAM THE ARM-LEVEL OWNERSHIP PAIR DRIVES (#2831 (c)). It answers the one
+    # question the fixture owns — "does the census see a worker for this PR?" — through `sess`, which is
+    # inert everywhere else (`return 1`) so no other drive changes meaning.
+    sess() { [ "${OWN_LIVE:-0}" = "1" ] && return 0; return 1; }
     claim_live() { return 1; }
+    # The SHIPPED `pr_owner_live` (extracted above), not a re-implementation — see the note at the
+    # extraction. `PL_MOD=0` keeps it on the documented pre-module path, so this drive never reaps a
+    # lock; the module's own verdict is graded by pr-owner-liveness.test.sh against real lock files.
+    PL_MOD=0
+    # shellcheck source=/dev/null
+    . "$TMP/owner-live.sh"
     can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }
     # ⛔ THE SHIPPED park_ctrl (review of #2664, P2) — a stub makes every "PARKED" assertion a claim
@@ -886,6 +895,13 @@ echo "=== T1b: a cycle that acted on nothing must SAY so (never 'dispatching') =
 # live-ownership.test.sh §8(d)-(f). Here we assert the orchestrator half: the ledger exists for the
 # PR, and the parent summariser turns it into words.
 sed -n '/# \[prdisp-apply:begin\]/,/# \[prdisp-apply:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/apply.sh"
+# ⛔ THE SHIPPED OWNERSHIP PREDICATE IS DRIVEN, NOT STUBBED (#2831, review P2). An earlier version of
+# T9 re-implemented the PRE-change guard in a stub, so the five arms were exercised against a
+# predicate that no longer ships: a shipped `pr_owner_live` that always returned 1 (the #2831 defect
+# itself) would have passed. This extraction is the real function from the loop, driven with the
+# fixture's own `sess`/`claim_live` answers.
+sed -n '/^pr_owner_live() {/,/^}/p' "$ORCH" > "$TMP/owner-live.sh"
+grep -q 'pl_verdict' "$TMP/owner-live.sh" || bad "the shipped pr_owner_live() could not be extracted — T9 would grade a stub"
 if [ -s "$TMP/apply.sh" ] && grep -q 'no per-PR read this cycle' "$TMP/apply.sh"; then
   # One counted PR the sweep never saw (a 304 / scope-filtered row) must still be NAMED.
   apply() { # apply <OPEN_ROWS> <SWEEP_LIST> [<row the SWEEP already wrote>]
@@ -1414,6 +1430,26 @@ if [ -n "$_GATE_ON" ]; then
 else
   bad "the merge-priority gate did not fire on 1 un-owned PR — T8 cannot bind"
 fi
+
+echo
+echo "=== T9 (#2831): a PR a LIVE worker owns is never stolen, and the same arm still spawns when it is not ==="
+# ⛔ THE PAIR IS THE TEST. A one-sided assertion ("owned -> no spawn") passes on an arm that NEVER
+# spawns, and the real defect (#2831) was exactly that: 5 PRs reported "a worker already owns this PR"
+# with no workers alive, so nothing was ever taken. The contrast half — same arm, same fixture, owner
+# NOT live — must spawn, or the ownership guard is indistinguishable from an inert arm.
+OWN_LIVE=1 drive 'FAILED:pipeline-compliance' rail 0 1
+_owns_n="$(spawns)"; _owns_rows="$(rows)"; _owns_why="$(cat "$LEDGER" 2>/dev/null | awk -F'\t' '$4=="wait"{print $5}' | head -1)"
+[ "$_owns_n" = "0" ] && [ "$_owns_rows" -ge 1 ] \
+  && ok "a LIVE owner: 0 spawns, and the PR still carries a named wait ($_owns_rows row(s))" \
+  || bad "a live owner was not respected: spawns=$_owns_n rows=$_owns_rows"
+case "$_owns_why" in
+  *"already owns this PR"*) ok "…and the wait names OWNERSHIP, not capacity (so the reason a reader sees is the truth)" ;;
+  *) bad "…the wait reason is not ownership: '$_owns_why'" ;;
+esac
+OWN_LIVE=0 drive 'FAILED:pipeline-compliance' rail 0 1
+[ "$(spawns)" = "1" ] \
+  && ok "CONTRAST: with the owner NOT live the same arm spawns the fixer (so the guard above is not an inert arm)" \
+  || bad "CONTRAST half failed: the arm spawned nothing even with no owner (spawns=$(spawns)) — the ownership assertion above would be vacuous"
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
