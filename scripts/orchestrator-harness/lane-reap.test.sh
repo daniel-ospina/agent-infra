@@ -979,6 +979,30 @@ has "$out" "ancestry-unknown" "SURFACE-TMUX-ORPHAN: no fleet evidence above the 
 hasnt "$out" "human-ancestor" "SURFACE-TMUX-ORPHAN: still never classified as a HUMAN ancestor"
 hasnt "$out" "REAP   root=972" "SURFACE-TMUX-ORPHAN: never reaped"
 eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "SURFACE-TMUX-ORPHAN: no signal"
+# ── CELL-TMUX: the cell supervisor's marker is POSITIVE fleet evidence (#2868) ──────────────────
+# ⛔ THE CELL-INERT DEFECT. On a Linux cell the launch surface is a systemd unit, not cmux.app, so
+# `host_verdict` read every cell lane as `unknown` and the ARMED reaper refused it for ever (the
+# CELL-INERT note in this file's header). The supervisor writes TWO markers into every spawned
+# process — an environ variable (CONTROLLER_UNIT=…) and the unit's cgroup — and either, read from
+# /proc, is fleet evidence. This leg is the SURFACE-TMUX-ORPHAN shape (a tmux server daemonised from
+# init) PLUS the marker, and it must now be a CANDIDATE — proving the cell reaper is armed, not
+# inert. The environ marker is matched on the variable NAME (any value carries it); the cgroup on
+# the unit basename under a slice. A HUMAN sshd ancestor still refuses first (the human checks run
+# before this branch), and an unreadable /proc answers NOTHING — neither is asserted here but both
+# are pinned by the HUMAN and ANCESTRY-INCOMPLETE legs.
+echo "== CELL-TMUX (the cell supervisor marker lifts the fleet's own launcher out of unknown)"
+: > "$T/t-cell1"; psinit >> "$T/t-cell1"
+psrow 430 1 Ss 00:00:00 10:00:00 "tmux: server" >> "$T/t-cell1"
+psrow 974 430 Ss 00:00:00 05:00:00 "bash -c pi > $DEAD_LOG 2>&1 &" >> "$T/t-cell1"
+psrow 975 974 Sl 00:00:05 05:00:00 pi >> "$T/t-cell1"
+fdlink 975 1 "$DEAD_LOG"
+mkdir -p "$PROC/430"
+printf 'CONTROLLER_UNIT=eldato-orchestrator.service\0HARNESS_MATERIALISER=/tmp/cell-home\0' > "$PROC/430/environ"
+printf '0::/system.slice/eldato-orchestrator.service\n' > "$PROC/430/cgroup"
+out="$(run_reap "$T/t-cell1" "" -- --dry-run)"; rc=$?
+hasnt "$out" "ancestry-unknown" "CELL-TMUX: the cell marker lifts the tmux server out of unknown"
+has "$out" "fleet ancestry" "CELL-TMUX: the cell supervisor is POSITIVE fleet evidence"
+has "$out" "WOULD REAP root=974" "CELL-TMUX: a stale cell lane IS a candidate (the cell reaper is armed, not inert)"
 echo "== ORPHAN-PARENTLESS (a pi reparented to init is ancestry-unknown, and refuses)"
 # ⛔ THE ORPHAN BOUNDARY IS PINNED HERE, NOT ONLY IN PROSE (#2163 review, P2). When the launcher
 # wrapper exits, the surviving `pi` is reparented to init and its only ancestor is `/sbin/init`, so
