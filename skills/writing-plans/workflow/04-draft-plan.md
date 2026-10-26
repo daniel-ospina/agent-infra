@@ -20,6 +20,8 @@
 
 ### Pattern Research
 
+> **`task-workflow-standard` (agent-infra#2861): this whole step (B.1 buckets, B.0 preflight) is not run** — this block is **not produced** — the evidence lives in the `<!-- research: v1 -->` issue comment's `### Targeted Research Findings`, and Step B does not run. Keep `### Integration Surface Map`; omit this section.
+
 [Embed the full `### Pattern Research` block produced by Step B — the three buckets with their canonical / competitor-variance / pitfall findings, plus the library docs preflight summary and any skip justifications. Or "Skipped — plan touches zero third-party deps" if applicable.]
 
 ### Integration Surface Map
