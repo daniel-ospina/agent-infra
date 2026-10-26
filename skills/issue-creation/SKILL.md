@@ -84,11 +84,13 @@ The bar for each indicator:
 
 O/I/T is a **body lint at creation**, not a workflow stage: nothing downstream can decide what the issue meant to achieve, so the check belongs where the fields are authored. Assert, against the body you are about to create:
 
-1. `**Objective:**` present and non-empty — one sentence, a problem or a function.
-2. `**Indicators:**` carries **≥ 2** distinct measurable items (a single indicator invites Goodhart's gaming, above).
-3. `**Targets:**` carries **≥ 1** bar, and every indicator has one.
+Assert on the shape **§1 above actually emits** — an `##`/`###` heading (`Objective`, `Indicators`, `Targets`), not a `**Bold:**` field, which §1 does not produce:
 
-Any failure = do not file; fix the body. This is decidable by eye and by grep, which is the point: an automated equivalent (`check-pipeline-compliance.sh`, sequence step 2 of #2861) can only check the same three things, and a *stage* would have to invent judgement it does not have.
+1. The `Objective` heading is present and its body is non-empty — one sentence, a problem or a function.
+2. `Indicators` has **≥ 2** list items, and each names something observable (a test, a count, a measured value) rather than a mood.
+3. `Targets` has **≥ 1** list item, and every indicator has one.
+
+Any failure = do not file; fix the body. 1 and 3 are decidable mechanically; **2's "observable" is a judgement, and is stated as one** — the count is the mechanical half, the quality of the item is the author's. An automated equivalent (`check-pipeline-compliance.sh`, sequence step 2 of #2861) can only check presence and counts, and a *stage* would have to invent the judgement it does not have.
 
 ---
 

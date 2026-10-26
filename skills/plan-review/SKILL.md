@@ -547,7 +547,7 @@ Append a summary line to the plan comment when double-gate runs:
 On exit, append to the bottom of the plan doc:
 
 ```markdown
-<!-- plan-review: cycles=N, status=clean|capped|stalled, version=2.3.0 -->
+<!-- plan-review: cycles=N, status=clean|threat-surface-covered|capped|stalled, version=2.3.0 -->
 ```
 
 **Clean exit:** Return control to writing-plans for Execution Handoff. **Do NOT pause or ask the user for confirmation.** The review cycle IS the quality gate — if it passed, proceed immediately.

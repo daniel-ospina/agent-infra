@@ -210,7 +210,7 @@ python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_A
 
 ## Label Lifecycle — DELETED (agent-infra#2861 §8.2). Do not re-add it.
 
-`implementing` / `scoping` / `planning` — and `planned`, removed in the same pass — had **no reader anywhere in the fleet**: 13 write sites across 4 skills, zero reads (no label filter, no gate, no report). Worse, the block's first step removed `implementing` **unconditionally** before checking who held the issue — so lane B stripped lane A's only marker while A was working, i.e. the mechanism could silently delete the one thing it provided.
+`implementing` / `scoping` / `planning` — and `planned`, removed in the same pass — had **no reader anywhere in the fleet**: 16 write commands across 4 skills, zero reads (no label filter, no gate, no report). Worse, the block's first step removed `implementing` **unconditionally** before checking who held the issue — so lane B stripped lane A's only marker while A was working, i.e. the mechanism could silently delete the one thing it provided.
 
 **Ownership is not a label.** Use the mechanisms that actually decide it. Both the pre-flight and `who-is-on.sh` live in a **tortoise** checkout — resolve that path exactly as the pre-flight block above does (`$TORTOISE`, else the cwd's main-checkout sibling `tortoise`, else `$HOME/Documents/GitHub/tortoise`); a bare `tools/…` is relative and resolves to nothing:
 
@@ -218,7 +218,7 @@ python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_A
 |---|---|
 | May I dispatch on #N at all? | `"$TORTOISE"/tools/collision_preflight.py <N> --repo <owner/name>` — exit 0 is the only dispatch authorisation (below); its claim gate reads the **holder**, not labels and not comment prose (#8175) |
 | Who is on #N right now? | `bash "$TORTOISE"/tools/who-is-on.sh <N> --repo <owner/name>` — sees local-only branches and worktrees a label never could |
-| Cross-box claim on a PR head | `refs/claims/<pr>-<sha12>` via `scripts/orchestrator-harness/claims.sh`, read by `tools/fleet/claim_lanes.py` |
+| Cross-box claim on a PR head | `refs/claims/<pr>-<sha12>` via `agent-infra:scripts/orchestrator-harness/claims.sh`, read by `agent-infra:tools/fleet/claim_lanes.py` — both live in **agent-infra**, not the tortoise checkout |
 | Stranded local work | `bash "$TORTOISE"/tools/who-is-on.sh --inventory` |
 
 **Accepted risk:** a human loses the one-glance "someone is on this" marker *on the issue page*; the verb above answers the same question better but must be asked. Tracked in agent-infra#2861 §8.2 — reopen there if the glance matters more than the coordination.
