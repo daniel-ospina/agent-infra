@@ -1270,6 +1270,16 @@ ck "binary candidate: a binary shim on PATH is SKIPPED and the walk still lands 
 ck "binary candidate: reading it leaves NO 'ignored null byte' on the caller's merged stream" \
    "$(has 'ignored null byte' "$_bw" && echo 1 || echo 0)"
 
+# The CELL WRAPPER carries the same read on its FAIL-OPEN walk — the state a half-installed box is in
+# (adapter seeded, helper missing), which is exactly the state that path exists for. Same fixture, so
+# the class is pinned at BOTH entry points rather than only where it was measured.
+mkdir -p "$TMP/binwalk/wrap"
+cp "$WRAPPER" "$TMP/binwalk/wrap/gh"; chmod +x "$TMP/binwalk/wrap/gh"
+_ww="$(PATH="$TMP/binwalk/wrap:$TMP/binwalk/bin:$TMP/binwalk/real:$PATH" HOME="$TMP/home" \
+        GH_LIMIT_REAL_GH= gh --version 2>&1)"; _wwrc=$?
+ck "binary candidate: … and the cell wrapper's fail-open walk is silent too (rc=0, real gh reached)" \
+   "$([ "$_wwrc" -eq 0 ] && has 'REAL-GH' "$_ww" && ! has 'ignored null byte' "$_ww" && echo 0 || echo 1)"
+
 # ⛔ K2. THE FLOAT KNOBS ARE BOUNDED TOO. `cfg_int` was bounded in round 1 while the four SECONDS
 # knobs still took `nan`/`inf` verbatim, and each one dies differently: nan → a traceback from
 # `int(nan)` instead of gh's message, inf LOCK_TIMEOUT → a lock wait that never expires, nan MAX_WAIT
