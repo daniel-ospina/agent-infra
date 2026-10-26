@@ -1594,6 +1594,47 @@ if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 # The pass records its own outcome from here on (see the pass-record block above). `provision` covers
 # everything up to the pool listing: the state dir, the gh environment, the scout, the interpreter.
 refresh_stage provision "provisioning (state dir, gh environment, scout worktree, interpreter)"
+# ── THE PRE-DISPATCH DISK FLOOR (agent-infra — `uv sync` at 872MB free, twice in one night) ───────
+# ⛔ IT IS HERE, BEFORE `resolve_repo`, BEFORE THE STATE-DIR PROBES, AND BEFORE THE SCOUT — the
+# earliest point in the provision stage that can still PREVENT work. The measured failure was a cell
+# at `126G 120G 872M 100%` whose pass died as:
+#     [refresh] FAILED stage=provision sub-step=scout-venv: uv sync failed … failed to write
+#     /tmp/cell-home/.cache/uv/…/libtorch_cuda.so: No space left on device
+# Every layer of that message is misleading: it names the LAST writer (`uv sync`) as the cause, it
+# arrives minutes after the real condition was already true, and the remedy it implies (rebuild the
+# venv) is exactly what cannot run. Freeing bytes fixed it instantly (864MB -> 9378MB; the uv cache
+# alone was ~8.5 GB) and the pre-flight went to `VERDICT: CLEAN (exit 0)`.
+# ⛔ AND IT MUST PRECEDE THE `$O`/`$O/state` WRITE PROBES. On a full disk those probes FAIL, and the
+# pass then records `state-dir: … is not WRITABLE` — a true statement about a symptom that sends the
+# operator to chown/chmod while the filesystem is the actual problem. The floor is asked FIRST, so a
+# full disk is reported as bytes.
+# ⛔ SHARED WITH orch-loop.sh (disk-floor.sh, the repo-slug.sh pattern): the controller's cycle and
+# this pass must answer the floor question ONE way, or a box can hold one and provision the other.
+# ⛔ A MISSING COPY IS A NAMED SKEW, NOT A SKIP: this pass runs on cells whose `$O` is re-seeded
+# separately, and refusing every pass over a seed skew would be a false block. The line says so every
+# pass it fires, which is what keeps it out of the silent class.
+DISK_FLOOR_STATE=absent
+for _dfc in "${O:-}/disk-floor.sh" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/disk-floor.sh"; do
+  [ -n "$_dfc" ] && [ -f "$_dfc" ] || continue
+  # shellcheck disable=SC1090
+  . "$_dfc" 2>/dev/null || continue
+  command -v disk_floor_gate >/dev/null 2>&1 || { unset -f disk_floor_gate disk_floor_free_mb 2>/dev/null; continue; }
+  DISK_FLOOR_STATE=ok; break
+done
+if [ "$DISK_FLOOR_STATE" = "ok" ]; then
+  _df_line="$(disk_floor_gate "$O")"; _df_rc=$?
+else
+  _df_line="[disk] CANNOT-VERIFY: no disk-floor.sh in $O or beside this pass — the pre-dispatch floor did NOT run, so a full disk will surface again as `uv sync`/`worktree add` write errors instead of as bytes. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)"
+  _df_rc=2
+fi
+[ -n "${_df_line:-}" ] && printf '%s\n' "$_df_line"
+if [ "${_df_rc:-0}" = "1" ]; then
+  # ⛔ THE REFUSAL NAMES BYTES, NOT THE LAST WRITER. `provision_fail` carries it into `state/refresh-last`,
+  # so `orch-loop.sh`'s own `[dispatch] BLOCKED: refresh failed — stage=provision …` line quotes the
+  # free MB, the floor and what was reclaimed instead of an `uv sync` error an operator would chase.
+  # TRANSIENT, not permanent: freeing space fixes it and the next cycle retries on its own.
+  provision_fail "$EXIT_TRANSIENT" "sub-step=disk-floor: declined BEFORE provisioning, because the filesystem is below the pre-dispatch floor — this is a BYTES condition, not a build or a network failure, and nothing below this line could have written (the venv, the worktree and the pre-flight all write). ${_df_line}"
+fi
 # Same refusal on the run path, before any network work: a pass that cannot say which checkout it
 # stands in must not pre-flight anything (the scout worktree is created INSIDE $REPO below).
 if ! resolve_repo; then
