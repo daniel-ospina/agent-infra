@@ -65,7 +65,7 @@ _is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling he
   # ⛔ NO PIPE: `head | grep -q` races — grep exits at its first match, head takes SIGPIPE, and under
   # `pipefail` the pipeline reads FAILED even though the marker was found (the #841 class). A false
   # negative here would let the walk pick a shim as the real gh, i.e. recurse.
-  # ⛔ NO COMMAND SUBSTITUTION EITHER — THE CANDIDATE IS USUALLY A COMPILED BINARY (#10009). Reading a
+  # ⛔ NO COMMAND SUBSTITUTION EITHER — THE CANDIDATE IS USUALLY A COMPILED BINARY (#2184). Reading a
   # binary into a variable makes bash >= 4.4 print `warning: command substitution: ignored null byte in
   # input` on STDERR of a call that SUCCEEDS, and callers here merge stderr into the bytes they parse
   # (`2>&1`). MEASURED on all three cloud cells: that warning became the reported OUTPUT of every PR
