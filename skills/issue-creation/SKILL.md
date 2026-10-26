@@ -185,7 +185,7 @@ Before creating the issue, verify nothing was forgotten from the parent. This ca
 ### Research
 Two independent questions — an issue body must answer both without conflating them:
 
-1. **Investigation** — does implementation need external knowledge or codebase research first? If yes, say what (and link any brief via `**Research:**`). For standard+complex issues this feeds `issue-scoping` Phase 1.5's `### Axis Research` matrix (external best-practice research per axis). For micro issues, skip.
+1. **Investigation** — does implementation need external knowledge or codebase research first? If yes, say what (and link any brief via `**Research:**`). For standard+complex issues this feeds `issue-scoping` Phase 1.5's `### Axis Research` matrix (`task-workflow-standard` merges both granularities into its one `<!-- research: v1 -->` block instead — agent-infra#2861) (external best-practice research per axis). For micro issues, skip.
 2. **Open decisions** — which design choices must the Scope stage resolve? List them explicitly under `### Research Needed`. This is independent of question 1: "no investigation needed" says nothing about whether decisions are still open.
 
 **Never write "None — scope is clear" in `### Research Needed`:** "no research needed" answers only the investigation question — scope is not "clear" by default, and the Scope stage re-derives the approach regardless. An issue body that asserts a fix ("the fix is X") states the author's **hypothesis**, never a settled plan — `issue-scoping` treats it as a hypothesis to verify in the double diamond.

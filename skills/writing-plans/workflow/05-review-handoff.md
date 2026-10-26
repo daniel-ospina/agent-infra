@@ -17,6 +17,7 @@ reviewers have no memory of prior cycles, preventing confirmation bias.
 See `.pi/APPEND_SYSTEM.md` → Review Loop Protocol for the full protocol.
 
 - **If `status=clean`:** proceed to Execution Handoff
+- **If `status=threat-surface-covered`:** proceed, and record the `[ADVERSARIAL-BOUND] …` disclosure in the PR body (the declared-surface clean exit).
 - **If `status=capped` or `status=stalled`:** surface the remaining issues to the user. Do NOT proceed to Execution Handoff until the user either fixes the issues or explicitly approves the plan as-is.
 
 **FORBIDDEN — these bypass the quality gate entirely:**
