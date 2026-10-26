@@ -1,0 +1,16 @@
+# A `#` on a PLAIN continuation of the group is a YAML COMMENT, and YAML discards it. The reader
+# absorbed it into the value — so a group that carried NO per-PR key passed the "keyed on the PR"
+# rule, because the COMMENT supplied `github.ref` and the comment is not part of the group GitHub
+# builds. Every PR then shared one cancellation domain: PR B killed PR A's run (#2660 round 6).
+name: Group continuation comment
+on:
+  pull_request:
+concurrency:
+  group:
+    pr-group-continuation-comment-${{ github.workflow }}   # deliberately NOT ${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

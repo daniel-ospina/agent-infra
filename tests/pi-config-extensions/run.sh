@@ -1,4 +1,5 @@
 #!/bin/bash
+# shard: off runs in ci.yml's dedicated `pi-config-extensions` job (PR lane only - ci-main's `pi-config-extensions-guard` job runs scripts/check-pi-config-extensions.sh, NOT this suite, so there is no post-merge suite run site, agent-infra#2610); a shard here would be a second run site (#2439)
 # #498/#502 — pi-config extension-farm parity gate tests.
 #
 # Exercises scripts/check-pi-config-extensions.sh semantics against
@@ -112,7 +113,8 @@ write_manifest() {
 #       manifest-stale | no-manifest | bad-manifest | live-healthy |
 #       live-dangling | ignored-node-modules | mixed-ignored | no-git |
 #       all-untracked | nested-git | newline-name | dash-name |
-#       dangling-ext | dotfile-ext | dot-extension | dotdot-untracked
+#       dangling-ext | dotfile-ext | dot-extension | dotdot-untracked |
+#       live-test-file
 # The live-farm dir is always $TMP/live-extensions (run_gate points
 # PI_EXTENSIONS_DIR at it); only the live-* modes create it, so every other mode
 # exercises check 5's explicit skip.
@@ -224,6 +226,13 @@ build_farm() {
   case "$mode" in
     live-healthy)  mkdir -p "$TMP/live-extensions"
                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts" ;;
+    # #1509 — a *.test.ts in the LIVE materialised dir. pi's extension loader
+    # executes every `.ts` it finds there, so this is not a test: it runs its
+    # suite at session start and that output becomes the session's answer.
+    live-test-file) ln -s ../../../extensions/b.ts "$FARM/b.ts"   # farm otherwise fine, like live-healthy, so exit 1 is attributable to check 6 ALONE
+                    mkdir -p "$TMP/live-extensions"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    touch "$TMP/live-extensions/leaked.test.ts" ;;
     live-dangling) mkdir -p "$TMP/live-extensions"
                    ln -s "$TMP/extensions/gone.ts" "$TMP/live-extensions/a.ts" ;;
   esac
@@ -440,6 +449,13 @@ echo "23. #2425 review — an UNTRACKED '..'-prefixed extension is NAMED, never 
 run_gate 0 "untracked ..-prefixed extension is named" dotdot-untracked \
   "not gated (UNTRACKED" \
   "..hidden.ts"
+
+echo ""
+echo "24. #1509 — a *.test.ts in the LIVE farm is executed by pi's loader, not run as a test"
+run_gate 1 "test file in the live farm" live-test-file \
+  "test file(s) in the live extension farm" \
+  "leaked.test.ts" \
+  "!symlink farm into extensions/"
 
 echo ""
 if [ "$failures" -gt 0 ]; then

@@ -8,8 +8,8 @@ set -u
 # nothing behind it: the guard just below killed the controller at startup, and under KeepAlive that
 # is a crash loop whose only trace is launchd.err — it reads exactly like a box with nothing to do.
 # (The other shape, "the controller keeps beating while the refresh aborts every cycle", is a REPO
-# that EXISTS but is the wrong repo — refresh-candidates.sh still carries its own default of that
-# kind, #1935/#1977.) A path is not a thing this repo can guess — the daemon gets it from install.sh
+# that EXISTS but is the wrong repo — #1935/#1977 closed that one too: refresh-candidates.sh no longer
+# carries a default of its own either, it derives the checkout and VERIFIES the origin, or refuses.) A path is not a thing this repo can guess — the daemon gets it from install.sh
 # (`__REPO__` in the plist), a cell from its keys.env/supervisor, and an operator from §4 step 2.
 # Unset is a CONFIGURATION ERROR and it is refused HERE, before any command can run against it.
 REPO="${REPO:-}"
@@ -63,6 +63,15 @@ command -v derive_or >/dev/null 2>&1 \
     exit 78
   }
 OR_EXPLICIT="${OR:-}"
+# ⛔ WHETHER THE OPERATOR NAMED OR, TOLD TO THE CHILD EXPLICITLY (#1977 review, P1). The export
+# below is UNCONDITIONAL (#2040), so the child cannot tell an operator's `OR=…` from the default this
+# script fell back to — and it must: refresh-candidates.sh REFUSES a checkout whose `origin` is a
+# local path only when the queue target was DECLARED, because a path cannot prove a declared pair.
+# Reading mere presence as "declared" therefore condemned the exact box the warning below calls
+# legitimate (a local mirror / file:// origin), turning a WARN into a dead cell on every pass.
+OR_OPERATOR_DECLARED=0
+[ -n "$OR_EXPLICIT" ] && OR_OPERATOR_DECLARED=1
+export OR_OPERATOR_DECLARED
 OR_RC=0
 OR="$(derive_or "$REPO" "$OR_EXPLICIT")" || OR_RC=$?
 if [ "$OR_RC" = "2" ]; then
@@ -82,6 +91,13 @@ if [ "$OR_RC" != "0" ]; then
   # reached stderr was invisible for the hours this defect lasted. Not fatal: a local mirror or a
   # `file://` origin is a legitimate checkout, and refusing to start would turn a grading mismatch
   # into a dead cell. The line stays, loudly, in both streams.
+  # ⛔ THIS IS A GRADING DECISION ONLY (#2762 review, 5th cycle, P2). Dispatch is stricter on purpose:
+  # `repo-target.sh` compares the ARTIFACT (the worktree's own origin) with the target, so on a box
+  # whose origin cannot name a repo EVERY batch is refused 72 — and `set OR=…` cannot help, because
+  # the pin is what the artifact is compared TO. The remedy is re-pointing the checkout's origin
+  # (`git -C <checkout> remote set-url origin https://github.com/<owner>/<name>.git`); there is
+  # deliberately no env override, since an escape hatch that opens the gate is the fail-open the gate
+  # exists to remove. Named here so a mirror-origin cell is a known state, not a mystery.
   _or_warn="WARN cannot derive owner/name from REPO=$REPO origin remote ('$(git -C "$REPO" remote get-url origin 2>/dev/null || echo none)') — grading $OR; set OR=<owner/name> to name the repo explicitly"
   echo "orch-loop: $_or_warn" >&2
   [ -d "$O" ] && echo "$(date) [startup] $_or_warn" >> "$O/logs/orch-loop.log" 2>/dev/null
@@ -610,6 +626,28 @@ if declare -f lo_scan lo_order lo_select_rows lo_select lo_class_compact >/dev/n
   LO_SCAN=1
 elif [ -n "$_lo_mod" ]; then
   printf '[select] live-ownership.sh is present but INCOMPLETE (needs lo_scan/lo_order/lo_select_rows/lo_select/lo_class_compact) — ownership stays registry-only this cycle\n' >> "$LOG" 2>/dev/null || true
+fi
+
+# ── OWNERSHIP PROOF-OF-LIFE AND THE DRAIN ESCAPE (agent-infra#2831) ──────────────────────────────
+# `pr-owner-liveness.sh` answers two questions the loop could not answer about itself: "is the thing
+# that claims this PR still ALIVE?" and "when the PR path has started nothing for N stalled passes,
+# does the box ever get to do its other job?". Sourced from the SAME two homes as every module here,
+# and gated on the INTERFACE (`declare -f`), not on the file — a present-but-stale `$O` copy must
+# degrade to the pre-#2831 behaviour (the loose lock guard, and no escape) and SAY so, never enable
+# half of it. A silent absence would read exactly like a working proof.
+PL_MOD=0
+_pl_mod=""
+if [ -f "$O/pr-owner-liveness.sh" ]; then _pl_mod="$O/pr-owner-liveness.sh"
+elif [ -f "$(dirname "$0")/pr-owner-liveness.sh" ]; then _pl_mod="$(dirname "$0")/pr-owner-liveness.sh"
+fi
+if [ -n "$_pl_mod" ]; then
+  # shellcheck source=/dev/null
+  . "$_pl_mod"
+fi
+if declare -f pl_verdict pl_escape_open pl_escape_line pl_escape_record pl_note_pass pl_idle_streak pl_streak_reset pl_escape_bound >/dev/null 2>&1; then
+  PL_MOD=1
+elif [ -n "$_pl_mod" ]; then
+  printf '[select] pr-owner-liveness.sh is present but INCOMPLETE (needs pl_verdict/pl_escape_open/pl_escape_line/pl_escape_record/pl_note_pass/pl_idle_streak/pl_streak_reset/pl_escape_bound) — PR ownership keeps the loose lock guard and DRAIN STALLED keeps its old no-action verdict this cycle\n' >> "$LOG" 2>/dev/null || true
 fi
 
 # ── the record a RAIL REFUSAL leaves behind (the red-fixer role reads it) ────────
@@ -2979,6 +3017,50 @@ pr_owned() { # <pr> <head-sha> [<head-ref>] -> 0 when something is currently wor
   return 1
 }
 
+# ── OWNERSHIP IN THE SPAWN ARMS: PROVEN, OR RELEASED (agent-infra#2831) ─────────────────────────
+# ⛔ THE MEASURED DEFECT: `[pr] PR path: NO UNIT SPAWNED this cycle — 8 row(s) with a named reason
+# (most common: 5 a worker already owns this PR)` while `lanes=0/0` and NO such workers existed. The
+# arms below tested `claim_live` — the SPAWN GUARD, whose first arm is a deliberately-loose "any live
+# pid holds the lock" test — so a `mergeclaim-<PR>.lock` whose writer had died (and whose pid was
+# recycled by any unrelated process) kept its PR owned for ever: not spawnable (owned), not in the
+# un-owned queue (owned), and never released (nothing reaps it). `claim_live`'s looseness is CORRECT
+# for its own question ("may I work this?" — one lost merge is cheaper than a second worker); it is
+# WRONG for the question these arms are asked, which is "is someone ALREADY working it?". Two
+# questions, two predicates — the same split `pr_owned`/`claim_live` already documents above.
+# So ownership here is `pr_owned` (a live process's cwd, a cmdline-BOUND lock, or a live foreign lease)
+# plus the live worker record, and when NOT ONE of them holds while a lock exists, that lock is
+# RELEASED with its reason in the log. That is the same proof-of-life `[reap]` applies to checked.txt
+# entries: "no proven fact -> release". The over-release direction is bounded by the arms: a released
+# PR simply re-enters the un-owned queue, where the rail and the cross-box CAS still refuse a second
+# worker — while staying "owned" is unbounded and is what stopped the box doing either job.
+pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (reaps a stale lock)
+  local pr="${1:-}" sha="${2:-}" br="${3:-}" _v _lk
+  case "$pr" in ''|*[!0-9]*) return 1 ;; esac
+  # 1. the live facts `pr_owned` already proves (cwd scan, cmdline-bound lock, foreign lease).
+  if pr_owned "$pr" "$sha" "$br"; then return 0; fi
+  # 2. the worker RECORD (census: a `dead` row is excluded there, `unknown` counts live).
+  if sess "fix-$pr" || sess "merge-$pr"; then return 0; fi
+  # 3. NOTHING PROVEN. With the proof module available the verdict is a RELEASE — and it removes the
+  #    record, because a verdict of "not owned" that leaves the un-spawnable record on disk would
+  #    leave the PR exactly as stuck as before (that is the defect, not the fix). Without the module
+  #    the pre-#2831 loose guard stands, unchanged and named, rather than being silently dropped.
+  if [ "${PL_MOD:-0}" = "1" ]; then
+    _lk="$O/state/mergeclaim-$pr.lock"
+    [ -f "$_lk" ] || return 1
+    # ⛔ THE VERDICT'S EXIT STATUS IS THE ANSWER (review P1, 2026-10-25). An earlier draft discarded
+    # it and returned 1 unconditionally — so when the probe said OWNED (a lock that appeared between the
+    # `pr_owned` call and this one, or a claim caught mid-creation) the arms SPAWNED A SECOND WORKER on
+    # a live claim and logged it as a release. Only rc=1 is a release.
+    if _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)"; then return 0; fi
+    # Strip the verdict label with a REAL TAB: `${_v#RELEASED\t}` never matched (bash reads `\t` in a
+    # pattern as an escaped `t`), so every reap line printed a duplicated label and a raw tab — review P2.
+    _tab="$(printf '\t')"
+    echo "[reap] #$pr released — ${_v#*"$_tab"}" >> "$LOG" 2>/dev/null || true
+    return 1
+  fi
+  claim_live "$pr" "$sha"
+}
+
 # claim_foreign_live <pr> <head-sha> -> 0 when a LIVE claim on that head is held by ANOTHER BOX.
 # ⛔ A claim held by THIS box is NOT covered here: its liveness must be proven by a live process
 # (arms 1-2 above), never by the lease it wrote. `claim_live` remains the SPAWN guard — it answers
@@ -3493,11 +3575,20 @@ while true; do
   if [ -f "$O/claims.sh" ]; then
     # shellcheck source=/dev/null
     . "$O/claims.sh"
-    # REQUIRED: this loop runs from launchd with cwd=$HOME. Without CLAIM_REPO every git call
-    # inside claims.sh targets a non-repo, the fetch fails silently and the snapshot is empty
-    # even with live claims — measured: 3 claims on origin, 0 snapshot lines.
+    # ⛔ CLAIM_REPO IS STILL SET EXPLICITLY HERE (agent-infra#1996). launchd starts the job at cwd `/`
+    # and macOS DENIES the read of it, so a relative registry resolves against a cwd that cannot even
+    # be read: every git call inside claims.sh then fails, and the snapshot came back empty with live
+    # claims on origin — measured: 3 claims on origin, 0 snapshot lines. Setting it explicitly also
+    # means the sweep does not depend on $REPO being exported in this shell. The `.` DEFAULT still
+    # exists in claims.sh for the workers that `cd "$REPO"` first; what changed is that the
+    # controller no longer relies on it.
     CLAIM_REPO="$REPO"
-    claim_snapshot "$O/state/claims-snapshot"
+    # ⛔ ITS FAILURE REASON GOES TO $LOG, not to stderr. This job runs in a DETACHED tmux pane (see
+    # launchd-controller.sh), so anything on stderr reaches no file at all: a registry refresh that
+    # failed for ever was silent, and the sweep then decided from a frozen snapshot — expired leases
+    # read free (spawn -> CAS-refusal churn) and live ones read held (the fleet refuses work) with
+    # nothing in the operator's only surface saying why. Same idiom as `claim_prune` below.
+    claim_snapshot "$O/state/claims-snapshot" 2>>"$LOG"
     # Expired refs are unbounded otherwise. Hourly, in the background, never blocking the sweep.
     if [ -z "$(find "$O/state/.claims-pruned" -mmin -60 2>/dev/null)" ]; then
       touch "$O/state/.claims-pruned"
@@ -4197,7 +4288,7 @@ while true; do
             fi
             park_ctrl "$PR" "$HEAD_N" "rail refused a RED TREE and $RF_N red-fixer attempt(s) at this head did not clear it (MAX_RED_FIX_TRIES=${MAX_RED_FIX_TRIES:-2}). REFUSAL (verbatim): ${RF_REASON:-<none recorded>} -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/railrefusal-$PR' '$O/state/redfix-$PR' '$O/state/fixcount-$PR'"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "parked: the rail still refuses a RED TREE after $RF_N fixer attempt(s) at this head"
-          elif sess "fix-$PR" || sess "merge-$PR" || claim_live "$PR" "$HEAD_N"; then
+          elif pr_owner_live "$PR" "$HEAD_N" "${BR:-}"; then
             # (2) EXACTLY ONE LIVE FIXER PER PR. The key is the PR number in the session/lock name, so a
             # second refusal while a fixer works spawns NOTHING (a second lane is how two workers push
             # to one branch).
@@ -4378,7 +4469,7 @@ while true; do
             fi
             park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC fixes (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "parked: still conflicted after $NFC fixes — needs a human"
-          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
@@ -4467,7 +4558,7 @@ while true; do
           # minutes of a BLOCKED controller cycle with dispatch halted — the very starvation this
           # issue is about. The worker is single-owner (merge-one.sh's local lock + cross-box claim)
           # and slot- and load-gated like every other spawn.
-          if sess "merge-$PR" || claim_live "$PR" "${HEAD_N:-}"; then
+          if pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a rail worker already owns this PR
             disp "$PR" "${HEAD_N:-}" GREEN wait "a rail worker already owns this PR"
           elif [ "$(wt_count merge-)" -lt "$MR" ] && can_spawn; then
@@ -4578,7 +4669,7 @@ while true; do
           fi
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
-          if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
+          if pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # this PR already has a worker in flight
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           else
@@ -4779,7 +4870,7 @@ while true; do
             fi
             park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
             disp "$PR" "${HEAD_N:-}" "$V" wait "parked: CI still red after $NFC2 fixes — needs a human"
-          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
@@ -5488,6 +5579,26 @@ PY
           # only: a failed write must keep the COULD-NOT-RECORD message, not an ESCALATED one.
           _escl="$(drain_stall_label)"; [ -n "${_escl:-}" ] || _escl="UNMEASURED"
           _esc="ESCALATED -> state/drain-stall (pass ${_dpass}); the cycle status line now carries drain=${_escl} until a PR lands"
+          # ── THE INERT-PATH COUNTER (#2831) ────────────────────────────────────────────────────
+          # ⛔ WHAT MAKES THIS AN ACTION INSTEAD OF A LOG LINE. The stall has always been able to
+          # say "nothing landed"; it could not say whether ANYONE STARTED ANYTHING, so a box whose
+          # PR path was spawn-dead and a box whose workers were running but blocked read the same and
+          # both idled. The counter advances ONLY on a MEASURED zero spawns (`_spk` empty =
+          # UNMEASURED, which neither advances nor resets — inventing progress from a directory the
+          # cycle could not read is the exact defect this file keeps deleting). Any spawn resets it,
+          # so the owner's 2026-10-18 ruling keeps applying unchanged to every real land/capacity
+          # stall; only the "started nothing" degenerate state is escaped from, and the escape is
+          # bounded because it resets the counter after firing.
+          # ⛔ THE GLUE IS GATED TOO (review P2): the module may be ABSENT on a box whose `$O` is
+          # stale, and an unguarded call would print `pl_escape_bound: command not found` on launchd's
+          # stderr (not `$LOG`) every cycle — invisible exactly where the operator reads.
+          _escbound=${DRAIN_ESCAPE_PASSES:-3}
+          if [ "${PL_MOD:-0}" = "1" ]; then
+            _escbound="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}" 2>/dev/null)" || _escbound=3
+            _streak="$(pl_note_pass "$O/state" "${_spk:-}" "${UPN_WORK:-}")"
+            is_num "${_streak:-}" || _streak=0
+            _esc="$_esc; the PR path has STARTED NOTHING for ${_streak}/${_escbound} consecutive stalled pass(es) — at ${_escbound} the issue path opens (state/pr-path-idle)"
+          fi
         else
           _esc="ESCALATION COULD NOT BE RECORDED (state/ is unwritable) — this line is the only trace"
         fi
@@ -5522,6 +5633,11 @@ PY
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
         # A land clears the escalation: a marker that outlives its condition is a stale flag.
         rm -f "$O/state/drain-stall" 2>/dev/null || true
+        # ⛔ A LAND ALSO CLEARS THE INERT STREAK (review P2). Without this the counter described "stalled
+        # passes since the last escape" rather than "CONSECUTIVE stalled passes": a box that stalled
+        # N-1 times, landed for hours, then stalled once opened the issue path on its FIRST stall while
+        # its own line claimed N — a false statement about consecutiveness and a bound quietly cut to 1.
+        [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
       fi
     elif [ "${_land_any:-0}" = "1" ]; then
       echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
@@ -5543,6 +5659,45 @@ PY
     fi
     # [drain-clear:end]
   fi
+  # [drain-escape:begin] (DRIVEN by pr-owner-liveness.test.sh through the module; the WIRING here is
+  # reviewed, not extracted — keep the markers)
+  # ⛔ THE DETECTOR NOW ACTS (agent-infra#2831 ask 2). Measured on the live box: `DRAIN STALLED — no PR
+  # merged within the last 360m while 3 un-owned remain. The issue path stays CLOSED` printed pass
+  # after pass while the PR path had spawned nothing in 93 cycles. The box could neither land nor open
+  # work — a detector that cannot act is a log line, not a control.
+  # ⛔ THE RULING IS KEPT WHERE IT APPLIES. "No new work while un-owned PRs remain" exists so a
+  # stalled drain cannot be hidden behind fresh activity. That reasoning holds while the PR path is
+  # WORKING; it does not hold when the PR path has started nothing for N consecutive stalled passes,
+  # because then nothing is being hidden and nothing is being drained. Any spawn resets the streak, so
+  # a land/capacity stall (workers running, nothing landing) still never opens the issue path —
+  # unchanged. OVERRIDES: the 2026-10-18 "never a release valve" ruling, for the "started nothing"
+  # state only, bounded and logged here with the counts the decision was taken from.
+  # ⛔ ONE ESCAPE PER N INERT PASSES, NOT ONE PER PASS: `pl_escape_record` resets the streak on a
+  # successful write, so the loop cannot spin, and it reports when the record could NOT be written.
+  _eb=${DRAIN_ESCAPE_PASSES:-3}
+  if [ "${PL_MOD:-0}" = "1" ]; then _eb="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}" 2>/dev/null)" || _eb=3; fi
+  if [ "${LO_CHOICE:-none}" != "pr" ]; then
+    # Not blocked by un-owned PRs: a streak from an earlier stall is a stale flag and is cleared.
+    [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
+  elif [ "${PL_MOD:-0}" = "1" ] && pl_escape_open "$O/state" "${UPN_WORK:-}" "$_eb"; then
+    printf '%s\n' "$(pl_escape_line "$O/state" "${UPN_WORK:-}" "$_eb")" >> "$LOG"
+    if PL_ESCAPE_BOUND="$_eb" pl_escape_record "$O/state" "${UPN_WORK:-}" "${PRDISP_SPAWNS:-}"; then
+      echo "[dispatch] DRAIN ESCAPE RECORDED -> state/drain-escape (issue path OPEN this cycle; the inert-path counter reset to 0, so the next escape needs $_eb more stalled pass(es))" >> "$LOG"
+    else
+      echo "[dispatch] DRAIN ESCAPE RECORD COULD NOT BE WRITTEN (state/ is unwritable) — the issue path still OPENS this cycle (an unpersisted action must not be withheld), but the counter could not be reset and the bound cannot be proven" >> "$LOG"
+    fi
+    # ⛔ `GATE_WHY` MUST BE CLEARED, OR THE ESCAPE IS A LOG LINE THAT CANNOT ACT (review P0, 2026-10-25).
+    # It was set from the SAME un-owned count earlier in this pass (`GATE_WHY="$(mp_reason ...)"`, which
+    # echoes a reason whenever un-owned > 0), and the ONE line that opens the dispatch block is
+    # `if [ -z "$GATE_WHY" ]`. Setting LO_CHOICE alone therefore printed "OPENING the issue path",
+    # recorded the escape, reset the counter — and dispatched NOTHING, for ever. The gate is precisely
+    # what the escape exists to lift, so the lift is named in the log.
+    _lifted="${GATE_WHY:-<none>}"
+    GATE_WHY=""
+    echo "[dispatch] DRAIN ESCAPE lifted the issue-path gate (was: ${_lifted}) — the merge-priority gate is what this escape overrides for one cycle" >> "$LOG"
+    LO_CHOICE=issue
+  fi
+  # [drain-escape:end]
   # The printed decision is AUTHORITATIVE over the issue path: if the funnel did not choose issue
   # work, nothing opens a lane for an issue, even if every capacity gate below happens to pass.
   # ⛔ FAIL-CLOSED DEFAULT, AND IT IS LOAD-BEARING (#2126). `LO_CHOICE` is set by `lo_select`, but the
@@ -5887,11 +6042,72 @@ PY
       # exits 3 on a deferral (after releasing the claims and dropping the rows); this reads it and
       # records `dispatched=0` with the gate named, which is the same fact its own log line states.
       _dmrc=0
+      # The recount below reads a file THIS call writes, so a stale one must not be mistaken for it.
+      rm -f "$O/.dispatched-ids" 2>/dev/null || true
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1 || _dmrc=$?
       if [ "$_dmrc" = "3" ]; then
         echo "[dispatch] ci-queue gate DEFERRED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
         K=0; : > "$O/.batch"
         [ -n "${GATE_WHY:-}" ] || GATE_WHY="ci-queue(batch deferred)"
+      elif [ "$_dmrc" = "72" ]; then
+        # ⛔ A REPO-IDENTITY REFUSAL IS NOT A DISPATCH EITHER (#2762 review, P1). Same shape as the
+        # deferral arm above: `K` was incremented as each issue was CLAIMED, so without this branch a
+        # batch that `dispatch-merge.sh` refused with 72 is counted as `-> N dispatched` and written
+        # into the cycle record as `dispatched=N … nothing=none` — a permanent false PASS, because a
+        # wrong-repo pair does not clear by waiting. The claims are released and the rows dropped by
+        # dispatch-merge.sh itself; only the counting and `.batch` need undoing here.
+        echo "[dispatch] repo-target gate REFUSED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
+        K=0; : > "$O/.batch"
+        [ -n "${GATE_WHY:-}" ] || GATE_WHY="repo-target(refused: checkout is not the target)"
+      # ⛔ RECOUNT FROM WHAT ACTUALLY SPAWNED (#2762 review, 2nd cycle, P1). `K` counts CLAIMS, and a
+      # PER-ISSUE refusal (`continue` in dispatch-merge.sh) leaves the batch's exit status 0 — so a
+      # batch whose every lane was refused still printed `-> N dispatched` and recorded
+      # `dispatched=N … nothing=none`. That path is reachable in the field (the branch assertion runs
+      # against a REUSED `.worktrees/tm-<N>`, e.g. one left on another named branch), and a wrong-repo
+      # pair never clears by waiting, so the record would be a permanent false PASS. dispatch-merge.sh
+      # publishes the ids that reached a spawn; the cycle's count and ids come from that, not claims.
+      # ⛔ THE RECOUNT IS AN `elif` OF THE SAME CHAIN, NOT A SIBLING `if` (#2762 review, 5th cycle,
+      # P1). `product-floor.test.sh` P6 pins that every `.batch` reset sits INSIDE a modelled arm of
+      # this chain, because a reset outside one is how a batch that started nothing gets recorded as
+      # dispatched. A sibling `if` with its own `_dmrc` guard is equivalent in behaviour but invisible
+      # to that rule — the suite reds, correctly, on a reset it cannot attribute to an arm.
+      # markers: the BODY is extracted and driven by repo-target.test.sh (D6), so they sit inside.
+      elif [ -f "$O/.dispatched-ids" ]; then
+        # [dmrecount:begin] (extracted and DRIVEN by repo-target.test.sh — keep the markers)
+        _dm_spawned="$(sed '/^$/d' "$O/.dispatched-ids" 2>/dev/null || true)"
+        _dm_n="$(printf '%s\n' "$_dm_spawned" | sed '/^$/d' | wc -l | tr -d ' ')"
+        is_num "${_dm_n:-}" || _dm_n=0
+        if [ "$_dm_n" -ne "$K" ]; then
+          # ⛔ NAME NO CAUSE (#2762 review, 3rd cycle, P2). `.dispatched-ids` carries bare ids, so a
+          # delta between claims and spawns can be a repo-identity refusal, a launcher refusal, or a
+          # claim/login skip — the `[repo-target]`/spawn lines in the dispatch log name the cause. An
+          # attributed reason here wrote "repo-target refused 1" into the durable cycle record for a
+          # launcher failure (where the claim is deliberately KEPT because chain-<N> is alive).
+          echo "[dispatch] $((K - _dm_n)) of $K issue(s) did not reach a spawn — counted only the $_dm_n that did (see the dispatch log for the cause)" >> "$LOG"
+          K="$_dm_n"
+          if [ "$K" -gt 0 ]; then
+            printf '%s\n' "$_dm_spawned" > "$O/.batch"
+          else
+            : > "$O/.batch"
+            [ -n "${GATE_WHY:-}" ] || GATE_WHY="dispatch(no lane reached a spawn — see the dispatch log for the cause)"
+          fi
+        fi
+        # [dmrecount:end]
+      else
+        # [dmnofile:begin] (extracted and DRIVEN by repo-target.test.sh — keep the markers)
+        # ⛔ `dispatch-merge.sh` DID NOT RUN AT ALL (#2762 review, 6th cycle, P2). `rm -f` above removed a
+        # stale `.dispatched-ids`, so when the call itself cannot execute — bash returns 127 because the
+        # script is absent from a HALF-DEPLOYED `$O`, or 126 because it is not executable — no arm above
+        # matches, no file is published, and the chain fell through with `K` still counting CLAIMS: the
+        # funnel then recorded `dispatched=N … nothing=none` for a batch that spawned nothing. That is
+        # the permanent false PASS the recount exists to remove, surviving in the one shape this change is
+        # otherwise about (a partial `$O`), so it is its OWN counted arm rather than a silent skip. The
+        # cause is named here because `_dmrc` is unambiguous (the call produced no file AND failed), unlike
+        # the delta branch above where bare ids cannot say what refused.
+        echo "[dispatch] dispatch-merge.sh produced no .dispatched-ids (rc=$_dmrc) — nothing was dispatched; the batch is re-decided next cycle" >> "$LOG"
+        K=0; : > "$O/.batch"
+        [ -n "${GATE_WHY:-}" ] || GATE_WHY="dispatch(dispatch-merge.sh did not run: rc=$_dmrc)"
+        # [dmnofile:end]
       fi
       # …and the deferral's reason rides the SAME funnel line (#2333 cycle 6 review, P2): arg 3 was
       # `""` while `GATE_WHY` had just been set, so the cycle's one `-> 0 dispatched` line dropped the
