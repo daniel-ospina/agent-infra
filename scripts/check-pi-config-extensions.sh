@@ -387,6 +387,29 @@ if [ "$parse_ok" -eq 1 ]; then
   fi
 fi
 
+# --- check 6: NO test file in the live farm (#1509) --------------------------
+# ⛔ pi's extension loader EXECUTES every `.ts` under the farm. A `*.test.ts`
+# living there is therefore not a test — it is an extension that runs its whole
+# suite at session start, and that suite's stdout becomes the session's answer.
+# Measured 2026-10-25: twelve test files sat in ~/.pi/agent/extensions, every
+# dispatched child on the box returned `auto-sync.test.ts` output instead of a
+# reply, and reviewer verdicts, verification records and parallel lanes were all
+# dead — with nothing in any log naming the cause. Checks 1-5 cannot catch it:
+# they inspect the entries the manifest LISTS, and a stray leaf file is listed by
+# nobody.
+if [ -d "$LIVE_FARM" ]; then
+  leaked=""
+  while IFS= read -r lap; do
+    [ -n "$lap" ] && leaked="$leaked$lap"$'\n'
+  done <<< "$(find "$LIVE_FARM" -maxdepth 3 -name '*.test.ts' 2>/dev/null | head -10)"
+  if [ -n "$leaked" ]; then
+    echo "❌ test file(s) in the live extension farm — pi EXECUTES these as extensions, so each one runs its suite at session start and its output replaces the session's answer:"
+    printf '%s' "$leaked" | while IFS= read -r lap; do [ -n "$lap" ] && echo "   $lap"; done
+    echo "   → remove them (\`mv\` them out of the farm); a test belongs in the repo's extensions/, never in the farm."
+    FAILURES=$((FAILURES + 1))
+  fi
+fi
+
 if [ "$FAILURES" -gt 0 ]; then
   echo ""
   echo "❌ $FAILURES pi-config/extensions drift issue(s) — fix or the bootstrap ships stale/partial extensions"
