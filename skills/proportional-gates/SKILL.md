@@ -113,8 +113,8 @@ Ask BEFORE dispatching: `record-review.sh --print-tier <pr> [owner/repo]` prints
 |-----------|--------|
 | Dep already used elsewhere in codebase | Skip verification — pattern is known |
 | Dep is well-known stdlib-adjacent (lodash, date-fns) | Skip — common knowledge |
-| Dep is new to codebase AND not in plan's Pattern Research | Verify: 1-2 Perplexity calls |
-| Dep is novel, unfamiliar, AND plan has no Pattern Research | Verify: 2-3 Perplexity calls. Pause if unavailable. |
+| Dep is new to codebase AND not in the plan's research evidence | Verify: 1-2 Perplexity calls |
+| Dep is novel, unfamiliar, AND plan has no research evidence | Verify: 2-3 Perplexity calls. Pause if unavailable. |
 
 **Perplexity unavailable:** If dep is well-known (used in 2+ other repos, documented extensively), proceed with note. Only pause for genuinely novel deps.
 

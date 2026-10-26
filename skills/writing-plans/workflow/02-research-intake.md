@@ -59,7 +59,9 @@ If the plan touches **zero** third-party libraries / SDKs / frameworks (rare —
 | **Idiomatic usage patterns** | Plan introduces a new usage pattern for a library (hooks, edge function patterns, query builders, streaming, batch APIs) | Idiomatic API usage for the exact version + known anti-patterns |
 | **Library/framework pitfalls** | Plan touches any third-party dep where misuse has known footguns (auth flows, retries, timeouts, state machines, side effects in renderers) | Common pitfalls, post-mortems, "we tried this and reverted" cases |
 
-**Per-bucket protocol (mandatory minimum, identical to epic-workflow + issue-scoping gates) — epic/project pipelines only; `task-workflow-standard` does not run Step B (see the note at the top of this file):**
+> **Do you run Step B at all?** Epic/project pipelines: yes, per the protocol below. **`task-workflow-standard`: no** — stage 1's `<!-- research: v1 -->` comment already carries both granularities at the declared axis depth, and Step A's note (top of this file) is the rule. Decide this *before* the bucket table, not after it.
+
+**Per-bucket protocol (mandatory minimum, identical to epic-workflow + issue-scoping gates) — epic/project pipelines only:**
 
 For each bucket that applies, issue at least **3 separate** `mcp__seo-intelligence__perplexity_research` invocations, each with a distinct framing:
 

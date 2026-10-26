@@ -12,7 +12,7 @@ The surface map is embedded in the plan doc's Test Strategy section. It ensures:
 - Failure modes per surface are enumerated and tested
 - The plan's task steps reference the correct test commands from the surface map
 
-**Output:** The `test-design` skill produces a structured Integration Surface Map table + Bug Pattern Flags + Checklist Notes. Embed this directly into the plan doc's `### Integration Surface Map` section, placed after `### Pattern Research` and before the task list. Each task's test steps should reference the relevant surface map entries.
+**Output:** The `test-design` skill produces a structured Integration Surface Map table + Bug Pattern Flags + Checklist Notes. Embed this directly into the plan doc's `### Integration Surface Map` section, placed after `### Pattern Research` (or, for `task-workflow-standard`, after the research pointer — that block is not produced there, agent-infra#2861) and before the task list. Each task's test steps should reference the relevant surface map entries.
 
 ---
 

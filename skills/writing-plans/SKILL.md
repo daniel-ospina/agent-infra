@@ -97,7 +97,7 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 |----------------|----------------|
 | All sub-files | No plan produced. No tasks. Nothing to execute. Implementation blocked. |
 | `workflow/01` | Plan drafted without verifying issue-scoping ran. Epic architecture contract not checked. Plan silently diverges from approved design. |
-| `workflow/02` | Third-party library versions not verified. Plan uses hallucinated API calls from training data. Perplexity gate skipped — no triangulation, stale syntax shipped. |
+| `workflow/02` | **(`task-workflow-standard`: Step B does not run — stage 1's `<!-- research: v1 -->` comment is the evidence; this row applies to epic/project.)** Third-party library versions not verified. Plan uses hallucinated API calls from training data. Perplexity gate skipped — no triangulation, stale syntax shipped. |
 | `workflow/03` | Integration boundaries untested. SQL business logic gets TypeScript mocks instead of pgTAP. Production bugs from untested cross-system interactions. |
 | `workflow/04` | Plan doc header missing research-path comment. Task structure not TDD. Micro/Standard/Complex tier path not selected. No bite-sized steps. |
 | `workflow/05` | Plan-review gate skipped entirely — plan ships with no quality check. No review cycles, no reviewer feedback. Execution mode not selected — handoff fails. (`task-workflow-standard` lanes: PLAN-VERIFY writes the signature, so this file's gate is already satisfied — see `workflow/05`.) |
