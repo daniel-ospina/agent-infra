@@ -28,6 +28,7 @@ and a passing draft must still exit 0).
 """
 import importlib.util
 import io
+import json
 import os
 from contextlib import redirect_stdout
 
@@ -650,3 +651,100 @@ def test_headings_do_not_dilute_the_sentence_average():
     prose = "\n".join(["## What happened"] + [" ".join(["word"] * 55) + "."] * 2)
     marks, _ = _marks(prose)
     assert marks["understandable"] < BAR, marks
+
+
+# ── THE VENDOR IS TYPESAFE (2026-10-26) ────────────────────────────────────────────────────────
+# This file's bars were measured against `jev-1.13.0` on a host that is NOT the vendor's API
+# (tortoise#7864 paid that lookalike). The endpoint/model legs live in
+# test_turn_classify_state.py (same constants, same sweep); what is pinned HERE is the key and
+# the request `ao.jev()` actually builds, so a migration can never unkey the gate into a silent
+# "no question was checked", nor reshape the payload into the array form the API rejects.
+
+def test_key_reads_the_typesafe_name_then_the_legacy_one(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))          # no ~/.pi/agent/jev-config.json in play
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    assert ao._key() is None, "no key must read as None — the caller turns that into 'NOT a pass'"
+    monkeypatch.setenv("JEV_API_KEY", "legacy-name-key")
+    assert ao._key() == "legacy-name-key"
+    monkeypatch.setenv("TYPESAFE_API_KEY", "vendor-name-key")
+    assert ao._key() == "vendor-name-key"
+
+
+def test_this_files_copy_of_the_endpoint_and_model_is_the_real_vendor():
+    """⛔ EVERY COPY OF THE CONSTANTS NEEDS ITS OWN LEG. They live in three files (turn-classify.py,
+    this file, and the deployed state/lane-verdict.py that lane-actions.py reads as LV.*) plus the
+    deployed ~/.pi/agent/scripts copies — and a review measured that reverting THIS file alone to
+    `jevtypesafeai.com` left the whole suite green, because the turn-classify legs assert
+    turn-classify's copies. A partial rotation that misses one file is silent, which is the exact
+    stale-constant class the migration exists to end.
+
+    The MODEL stays pinned at 1.13 across the host move: that is the version every bar in this
+    file was calibrated on, and the vendor's own guidance is to send the version ID rather than an
+    alias when thresholds are tuned (an alias moves under you on the next release)."""
+    assert ao.JEV_URL == "https://api.typesafe.ai/v1/systemone", ao.JEV_URL
+    assert ao.JEV_MODEL == "jev-1.13.0", ao.JEV_MODEL
+
+
+def test_jev_sends_a_name_keyed_questions_map_with_instructions(monkeypatch):
+    """THE PAYLOAD, ASSERTED. `ao.jev()` is stubbed by nine other legs in this file, so its real
+    request was exercised by nothing. The API rejects an ARRAY of questions (422) and rejects a
+    question that has neither criteria nor instructions (400) — an array would make every owner
+    question bounce as "cannot check", which reads as a gate failure rather than a shape bug.
+    ⛔ The `instructions` assertion is NOT justified by a refusal: measured 2026-10-26, a
+    criteria-bearing question WITHOUT instructions returns 200. We assert it because it carries
+    the instruction text the marks are graded on, and because its absence here is a bug we want
+    to see, not a 4xx we are documenting."""
+    seen = {}
+
+    class _Resp:
+        def __init__(self, payload):
+            self._b = json.dumps(payload).encode()
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["body"] = json.loads(req.data.decode())
+        seen["auth"] = req.get_header("Authorization")
+        return _Resp({"model": "jev-1.13.0",
+                      "answers": {name: {"type": "noul", "noul": 0.9} for name in ao.QUESTIONS},
+                      "usage": {"input_tokens": 100, "output_tokens": 10}})
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    monkeypatch.setattr(ao.urllib.request, "urlopen", fake_urlopen)
+    out = ao.jev("Should we migrate the fleet? Options: A or B. We recommend A.")
+
+    assert seen["url"] == ao.JEV_URL == "https://api.typesafe.ai/v1/systemone", seen["url"]
+    assert seen["body"]["model"] == ao.JEV_MODEL == "jev-1.13.0", seen["body"]
+    assert seen["auth"] == "Bearer k", seen["auth"]
+    qs = seen["body"]["questions"]
+    assert isinstance(qs, dict) and set(qs) == set(ao.QUESTIONS), sorted(qs)
+    for name, q in qs.items():
+        assert q.get("type") in ("noul", "choice", "score"), (name, q)
+        assert isinstance(q.get("instructions"), str) and q["instructions"].strip(), (name, q)
+    assert out and set(out["answers"]) == set(ao.QUESTIONS), out
+    # The real API reports tokens, not money — the print path must not fabricate a cost.
+    assert "cost_usd" not in (out.get("usage") or {})
+
+
+def test_key_falls_back_to_the_0600_store(monkeypatch, tmp_path):
+    """⛔ THE STORE IS THE ONLY KEY SOURCE ON THIS BOX (review 2026-10-26). No plist and no shell
+    profile sets either env name — the live beat works because `_key()` falls back to
+    `~/.pi/agent/jev-config.json`. `turn-classify.py`'s equivalent fallback was pinned and this
+    one was not: deleting it left every ask-owner leg green while the gate silently stopped
+    checking questions ("no TypeSafe key … this is NOT a pass")."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    cfg = tmp_path / ".pi" / "agent" / "jev-config.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"apiKey": "from-the-store", "model": "jev-1.13.0"}))
+    assert ao._key() == "from-the-store"
