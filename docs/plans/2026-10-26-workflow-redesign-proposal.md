@@ -1,4 +1,4 @@
-<!-- research-path: docs/plans/2026-10-26-workflow-redesign-proposal.md#research-provenance -->
+<!-- research-path: docs/plans/2026-10-26-workflow-redesign-proposal.md#2-research-provenance-internal--external-declared -->
 
 # Workflow redesign — proposal (owner rulings 2026-10-26) — Implementation Plan
 
@@ -140,19 +140,18 @@ This is **not** a stage and **not** an extra dispatch: it is question 2 in the P
 
 **Declared in the PLAN artifact, before any review is dispatched** — because the reviewer's remit is the thing being declared, and a remit declared after the review is a description, not a contract.
 
+**One normative template, seven classes.** The block is defined once in `review-discipline` §The Review Scope Contract and that definition wins wherever a consumer restates it (this document, the plan comment, `code-review`). Classes: `code`, `gate-enforcement`, `protocol`, `docs-product`, `docs-marketing`, `ops-infra`, `research-decision`; a gate/enforcement change adds a `Threat classes` sub-block, which is where the pre-#2861 `### Adversarial Threat Surface` now lives. `code-review` reads the `### Review Scope Contract` heading and its `**Class:**` line, so the PLAN stage must emit the contract under that heading — a numbered field with the heading inlined is invisible to the consumer.
+
 ```markdown
 ### Review Scope Contract
-**Class:** code | docs-product | docs-marketing | ops-infra | research-decision
+**Class:** <one of the seven>
 **Risk surface** — what this change can break, each with the check that would catch it:
 - R1 <failure this change can cause> → caught by <test / assertion / gate / measurement>
-- R2 …
-**Out of scope — the reviewer must NOT raise these** (they are notes, filed separately, not chased):
-- pre-existing defects outside the diff
-- style, naming, or prose preference that does not change behaviour
-- alternative architectures the plan did not propose
-- incidental shape of tests/fixtures
+**Threat classes** (gate-enforcement only) — `T1 <bypass class>`, or `(not adversarial)`.
+**Out of scope — must NOT be raised** (note, file, do not chase):
+- pre-existing defects outside the diff · style/prose with no behaviour change
+- architectures the plan did not propose · incidental test/fixture shape
 **Acceptance:** every `R<n>` has its named evidence and no open item on the declared surface.
-Anything else is an `OUT-OF-SCOPE:` note — recorded, filed, not looped on.
 ```
 
 **"What matters" is defined, not felt.** A finding is **in scope** iff one of:
@@ -237,6 +236,7 @@ Seven classes: `code`, `gate-enforcement`, `protocol`, `docs-product`, `docs-mar
 | Removed | Failure it prevented | Caught instead / accepted risk |
 |---|---|---|
 | **SCOPE and PLAN as separate stages** | planning a solution to an unpinned problem | The merged artifact's **fixed field order** (problem definition before plan) plus PLAN-VERIFY Q1. *Accepted risk:* no mechanical check orders the sections before review; the verifier's coverage is the guard. |
+| **The `writing-plans` artifact split** (a `docs/plans/*.md` doc *and* a scoping comment) | the plan living in two places that can disagree — and, after this change, the plan doc disappearing entirely | **The doc is KEPT, the comment is kept, and the doc is their only source of truth**: PLAN saves `docs/plans/<date>-issue-<N>-<slug>.md` with the `<!-- research-path: … -->` header, then posts the marker-first comment that mirrors it. CI check (d) requires the doc; check (b) requires the comment. *Accepted risk:* two artifacts can drift — mitigated by making the comment a mirror and the doc the reviewed one. |
 | **`problem-verify` (§2.5) as its own gate** | a shallow problem-diverge reaching the plan | Merged into the single PLAN-VERIFY round; the **research gate's `FALSIFIER`** field is the cheap, pre-review detector (a plan with no falsifier is a plan with no defined failure). |
 | **`solution-verify` (§5.5) as its own gate** | the same, on the solution side | Same round; `R<n>` risk surface items are the solution-domain questions in falsifiable form. |
 | **`SCOPE-VERIFY` (task-workflow-standard)** | *(nothing — it re-dispatched the same verifier counts over the same artifact as §2.5/§5.5)* | Nothing to catch: this is a duplicate round (§1). Removing it removes a dispatch, not a check. |
@@ -244,7 +244,7 @@ Seven classes: `code`, `gate-enforcement`, `protocol`, `docs-product`, `docs-mar
 | **Per-round "fix → re-dispatch ALL verifiers" loops** | a fix that does not fix | One round per gate: **residuals on the declared surface block**, `OUT-OF-SCOPE:` notes are filed, and a fix is re-checked **against the whole declared surface** by the same verifier in the same round. That re-check is the catcher for a *design* regression — PROVE's tests and the exact-head code review review **code**, so they cannot see a plan/design regression and are not claimed as its substitute. |
 | **The cycle count as an acceptance criterion** | a loop that never terminates | Coverage of the declared surface (§6); the 10-cycle fallback remains as a **runaway guard**, never as acceptance. |
 | *(retained — NOT removed in this PR)* **`adversarial-bound: cap=2`** | an unbounded loop on gate code | **Retained verbatim** (asserted: exactly one occurrence, value 2, in `task-workflow-standard`). Retirement is step 2 (§11) because it is machine-pinned on 8 surfaces and in the harness fence — moving it inside a design PR would be the half-state this proposal forbids. |
-| **`Label Lifecycle` — the section AND all six write sites** (`issue-workflow` ×3, `issue-scoping:551`, `executing-plans` ×2, `writing-plans/05` ×2) | two agents on one issue | `claims.sh` CAS + `claim_lanes.py` + the preflight holder gate (§8.2). *Accepted risk:* loses the one-glance label on the page; `who-is-on.sh` answers better but must be asked. |
+| **`Label Lifecycle` — the section AND all six write sites, plus the `planned` write** (`issue-workflow` ×3, `issue-scoping:551`, `executing-plans` ×2, `writing-plans/05` ×2 including `planned`) | two agents on one issue | `claims.sh` CAS + `claim_lanes.py` + the preflight holder gate (§8.2). *Accepted risk:* loses the one-glance label on the page; `who-is-on.sh` answers better but must be asked. |
 | **`oit_validation` as a step** | an issue with no falsifiable done-state | Body lint at creation (§8.1, this PR) **+ a `pipeline-compliance` check that lands in step 2** (§11) — until then the machine half does not exist, which is stated rather than implied. |
 
 | **The dual-granularity research requirement** (`issue-scoping` Phase 1.5 `### Axis Research` + `writing-plans` Step B `### Pattern Research`, with "the scoping artifact is PRIOR_RESEARCH for planning, **never a substitute**") | research restarted at the wrong granularity: the plan's concrete claims were never tested at plan level | Merged into **one** artifact (§4) whose `Falsifier:`/`Gaps:` are the plan-level restatement, and the plan-level test is **PLAN-VERIFY Q2** (claim ↔ citation, resolved). *Accepted risk:* one block means one pass — a claim introduced by the plan that no query covers is caught only by Q2, not by a second research round. |
@@ -294,7 +294,7 @@ Aimed at the standing goal — deliver every Tortoise P0 and P1 — so the claim
 
 | # | Signal | Read from (instrument) | Wrong if |
 |---|---|---|---|
-| 1 | Blocking pre-code review rounds | the skill text: count the verifier dispatches the lane's own plan comment records | **>1 for a non-adversarial class**, or **>2 for a change declaring `Threat classes`** (until step 2). Rounds are class-scoped because the adversarial ceiling is retained. |
+| 1 | Blocking pre-code review rounds | the `**Rounds:**` line in the plan comment, written at PLAN-VERIFY close (`task-workflow-standard` §2b field 7) — the dispatch record is written down, not inferred from prose | **>1 for a non-adversarial class**, or **>2 for a change declaring `Threat classes`** (until step 2). Rounds are class-scoped because the adversarial ceiling is retained. |
 | 2 | Contract coverage at PROVE | the PROVE close-out: `R<n>: covered` rows + `OUT-OF-SCOPE: <n>` count, pasted in the PR body | any `R<n>` `open` at merge → the contract is not the acceptance criterion in practice. A rising `OUT-OF-SCOPE` count with no filed issues → the labels are being used as a mute button. |
 | 3 | P0/P1 delivery | `gh issue list --repo <o>/<r> --label priority:P0 --label priority:P1 --state closed --search "closed:>=<baseline-date>"` on tortoise | flat or worse over 3 weeks against the baseline → the bottleneck was never review; this proposal costs without paying. |
 
@@ -303,7 +303,7 @@ Aimed at the standing goal — deliver every Tortoise P0 and P1 — so the claim
 - **Research gate (CI half):** count blocked runs of `check-pipeline-compliance.sh` whose named failure is the research locator. **0 across the first 5 lanes** → the CI half is ceremony; demote it to a lint, keeping Q2.
 - **Research gate (Q2 half):** count PLAN-VERIFY rounds returning an uncited/unresolvable claim. This is the half that catches a false premise; a positive reading here **cannot** be credited to the CI check, which is why the two are counted apart.
 
-**The one condition that proves the design wrong:** **≥1 of the first 5 standard lanes reaches BUILD on a problem definition its own research does not support** (the `FALSIFIER` in §2). That restores the second diamond gate and retires decision #1's merge for this tier.
+**The one condition that proves the design wrong:** **≥1 of the first 5 standard lanes reaches BUILD on a problem definition its own research does not support** (the `FALSIFIER` in §2). That restores the second diamond gate and retires decision #1's merge for this tier. It is the `FALSIFIER` written in §4's template and in the #2861 plan comment.
 
 ---
 

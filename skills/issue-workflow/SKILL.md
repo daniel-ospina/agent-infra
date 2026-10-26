@@ -195,7 +195,7 @@ python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_A
 2. The work is to **carry it out** — the issue's ask is "implement this ruling", not "decide how".
 3. Nothing in the change **reverses** the decision. If the implementation would depart from it, that is a **reopen** in the decision's own home, not a lean dispatch.
 
-**What it skips:** the RESEARCH gate, the PLAN-VERIFY round, and the scoping/planning stages — every one of them exists to *make* a decision, and the decision is already made.
+**What it skips:** the RESEARCH gate and PLAN-VERIFY's three questions — they exist to *make* a decision, and the decision is already made. **PLAN is kept** (one paragraph of design + the `### Review Scope Contract`), because the contract is the review's remit and a reviewer must be able to check the work against the ruling; a one-question verifier round (*is the pointed artifact a decision that governs THIS change?*) replaces PLAN-VERIFY.
 
 **What it does not skip:**
 
@@ -204,13 +204,13 @@ python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_A
 - **PROVE** — tests, mutation proof for fail-closed branches, and the exact-head code review + attestation;
 - any `AGENTS.md` hard rule the change touches (surface approval, worktree isolation, never edit a PR body after recording a review).
 
-**The research artifact is satisfied by the decision reference** — checkably, not by self-certification: the `<!-- research: v1 -->` block may carry `**Basis:** <resolvable pointer>` (an `owner/repo#N`, a Tortoise point id, or a `docs/plans/<file>.md#<section>` that **exists**) in place of the citation fields, but `FALSIFIER:` and `Gaps:` stay — carrying out a decision can still be wrong. A `**Basis:**` that does not resolve, or a "decision" that is the lane's own judgement, is **not** this path: run the normal pipeline. Ambiguous → not lean. Step 2 of #2861 makes the merge gate check the pointer resolves.
+**The research artifact is satisfied by the decision reference** — checkably, not by self-certification: the `<!-- research: v1 -->` block may carry `**Basis:** <resolvable pointer>` (an `owner/repo#N`, a `**Decision:**`/`OVERRIDES:` line, a decision comment, a Tortoise point of decision type, or a `docs/plans/<file>.md#<section>` that **exists** — it must resolve *to a decision*, not merely to a document) in place of the citation fields, but `FALSIFIER:` and `Gaps:` stay — carrying out a decision can still be wrong. A `**Basis:**` that does not resolve, or a "decision" that is the lane's own judgement, is **not** this path: run the normal pipeline. Ambiguous → not lean. Step 2 of #2861 makes the merge gate check the pointer resolves.
 
 **Signature in the artifact:** a lane on this path writes `Path: decided-ruling (<decision location>)` in the same comment that carries the Review Scope Contract. A lane that writes it without a resolvable decision location has **not** taken this path — it has skipped the gate.
 
 ## Label Lifecycle — DELETED (agent-infra#2861 §8.2). Do not re-add it.
 
-`implementing` / `scoping` / `planning` had **no reader anywhere in the fleet**: the only occurrences in `agent-infra` or `tortoise` were the writer (this file). Nothing filtered an issue list by them, and no gate read them. Worse, the block's first step removed `implementing` **unconditionally** before checking who held the issue — so lane B stripped lane A's only marker while A was working, i.e. the mechanism could silently delete the one thing it provided.
+`implementing` / `scoping` / `planning` — and `planned`, removed in the same pass — had **no reader anywhere in the fleet**: six write sites, zero reads (no label filter, no gate, no report). Worse, the block's first step removed `implementing` **unconditionally** before checking who held the issue — so lane B stripped lane A's only marker while A was working, i.e. the mechanism could silently delete the one thing it provided.
 
 **Ownership is not a label.** Use the mechanisms that actually decide it. Both the pre-flight and `who-is-on.sh` live in a **tortoise** checkout — resolve that path exactly as the pre-flight block above does (`$TORTOISE`, else the cwd's main-checkout sibling `tortoise`, else `$HOME/Documents/GitHub/tortoise`); a bare `tools/…` is relative and resolves to nothing:
 

@@ -37,14 +37,11 @@ Search for `<!-- plan-review:` in the plan doc. If:
 - `status=clean` → proceed.
 - `status=capped` or `status=stalled` → stop. Surface issues to user.
 
-**Research-evidence pre-check (Standard/Complex only, issue #231 D7):** before Execution Handoff, verify the plan's `### Pattern Research` block carries the `> **Findings date:** YYYY-MM-DD` stamp OR a documented skip justification (`> Gate skipped` / `> Bucket [name] skipped` / `> Research skipped: no demonstrated gap`). Absence of both = the fresh-query evidence gate did not run — stop and run Step B before handoff. (Executing-plans Step 1.5 keys dependency staleness to this stamp; an unstamped block is treated as unfamiliar at execution.)
+**Research-evidence pre-check (Standard/Complex only, issue #231 D7):** before Execution Handoff, verify the plan carries research evidence — **for the task pipeline that is the issue comment marked `<!-- research: v1 -->`** (its `> **Findings date:**` stamp is the datum; `### Pattern Research` is superseded there — see `task-workflow-standard` §1), and for the epic/project pipelines it is the plan's `### Pattern Research` block with the same stamp. Either way the stamp must be present, or a documented skip justification (`> Gate skipped` / `> Bucket [name] skipped` / `> Research skipped: no demonstrated gap`). Absence of both = the fresh-query evidence gate did not run — stop and run Step B before handoff. (Executing-plans Step 1.5 keys dependency staleness to this stamp; an unstamped block is treated as unfamiliar at execution.)
 
 After saving the plan, apply the `planned` label to the GitHub issue (if applicable):
 
-```bash
-# `planned` only — the in-progress labels (planning/scoping/implementing) are deleted (agent-infra#2861 §8.2): no reader, and their self-cleanup could strip a live peer lane's marker.
-gh issue view <number> --json labels --jq '.labels[].name' | grep -q '^planned$' || gh issue edit <number> --add-label planned
-```
+> **Label writes removed (agent-infra#2861 §8.2).** `planning`, `scoping`, `implementing` **and `planned`** are deleted: all four have no reader anywhere in the fleet (six write sites, zero reads), and their self-cleanup could strip a live peer lane's marker. The durable signals are `doc_status` on the plan doc and the issue's open/closed state.
 
 **Status transition:** Plan `doc_status`: draft → live (plan-review passed clean). Issue: scoped → planned.
 

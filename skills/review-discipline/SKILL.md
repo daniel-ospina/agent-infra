@@ -23,7 +23,7 @@ version: 1.0.0
 
 A single universal checklist ("is this correct?") is the mechanism that makes reviews raise **side facts**. A marketing doc has no code to be correct about and no spec to be factually correct against; asked for "correctness" a reviewer invents a standard, finds the artifact fails it, and generates a cycle. The same reviewer, asked "is this claim aligned with the category architecture and the positioning line?", produces a finding the author can act on.
 
-So a review is _discipline-specific_: the artifact's class picks **the canon it answers to**, the canon picks **the questions**. This skill is that routing table — cited by `task-workflow-standard` (declare the class in the Review Scope Contract), `writing-plans`/`issue-scoping` (same declaration), `code-review` (Step 3.6 selects the class; the class picks the question set), and `commit-workflow` (which review a non-code artifact routes to at all).
+So a review is _discipline-specific_: the artifact's class picks **the canon it answers to**, the canon picks **the questions**. This skill is that routing table, and it is cited at every point where a review question is chosen: `task-workflow-standard` (declares the class in the Review Scope Contract), `code-review` (Step 3.6 / 0a resolves `ARTIFACT_CLASS`, and the class picks the question set), and `commit-workflow` (which review a non-code artifact routes to at all). Its §The Review Scope Contract template is **normative**: where a consumer restates it, this skill wins.
 
 ## Canon resolution — a path that does not resolve is a blocker, not a pass
 
