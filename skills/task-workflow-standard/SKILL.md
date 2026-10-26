@@ -53,7 +53,7 @@ Post one comment:
 
 ### 2. PLAN — one artifact, scope and plan merged, contract declared
 
-Read `skills/writing-plans` first: it defines the plan-doc structure this stage saves, and it arms the **C3 `parallel_check_plan`** checkpoint (`gate: checkpoint`, `token_phase: plan` — `skills/enforcement`) that the plan phase owes. Skipping the read is what silently disarms that checkpoint, so it is part of this stage, not an optional reference.
+Read `skills/writing-plans` first: it defines the plan-doc structure this stage saves, and reading it arms **two** sequence-enforcer steps — the **C3 `parallel_check_plan`** checkpoint (`gate: checkpoint`, `token_phase: plan`) **and** the `plan_review` verifier step (`gate: verifier`) that this stage's own PLAN-VERIFY dispatch satisfies (`skills/enforcement`). Both are steps in the sequence, not extra review rounds: PLAN-VERIFY is the one round. Skipping the read disarms the checkpoint silently, so it is part of this stage, not an optional reference.
 
 Answer the problem questions **before** the plan questions. Two outputs: the **plan doc** and the **issue comment**.
 

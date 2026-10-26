@@ -104,7 +104,7 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 
 ## Plan Review Gate — Human Approval
 
-The plan-review gate (`workflow/05-review-handoff.md`) runs the `plan-review` skill loop; its human point fires when the loop exits `capped` or `stalled`. A capped/stalled plan-review result is NOT clean — the plan must not proceed to Execution Handoff until the user fixes the remaining issues or explicitly approves the plan as-is.
+The plan-review gate (`workflow/05-review-handoff.md`) runs the `plan-review` skill loop; its human point fires when the loop exits `capped` or `stalled`. **For `task-workflow-standard` this section does not apply**: that pipeline's PLAN-VERIFY *is* the plan review, writes the `<!-- plan-review: cycles=… -->` signature itself, and does not dispatch `plan-review` (agent-infra#2861). The frontmatter's `plan_review: gate: verifier` step is satisfied by that same verifier dispatch — a step in the sequence, not a second round. A capped/stalled plan-review result is NOT clean — the plan must not proceed to Execution Handoff until the user fixes the remaining issues or explicitly approves the plan as-is.
 
 ### Approval Routing (inlined from human-input-framework v2.1.1)
 
