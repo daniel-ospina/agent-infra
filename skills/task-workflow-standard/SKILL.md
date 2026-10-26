@@ -16,7 +16,7 @@ version: 2.0.0
 
 # Task Workflow (Standard + Complex)
 
-Dispatched by `issue-workflow` for `Level: task` with `complexity:standard|complex` (or missing/unknown complexity — fail-closed). Owner ruling 2026-10-26: merged scope+plan behind a research gate, no stage that exists only to *make* a decision the issue already made.
+Dispatched by `issue-workflow` for `Level: task` with `complexity:standard|complex` (or missing/unknown complexity — fail-closed). Owner ruling 2026-10-26: merged scope+plan behind a research gate, no stage that exists only to *make* a decision the issue already made. **Four stages (RESEARCH, PLAN, BUILD, PROVE) and three gates, of which one is a review round** — the two bracketed names below are gates, not stages.
 
 ## Pipeline
 
@@ -58,7 +58,12 @@ Answer the problem questions **before** the plan questions. Two outputs: the **p
 
 ```markdown
 <!-- research-path: <the issue comment carrying `<!-- research: v1 -->`, or this doc's own §Research> -->
+<!-- plan-review: status=<clean|threat-surface-covered> rounds=<n> -->
 ```
+
+The second line is written **at PLAN-VERIFY close** and is this pipeline's `plan-review`
+signature: `writing-plans/workflow/05-review-handoff.md` stops at Execution Handoff without one,
+and for this pipeline PLAN-VERIFY **is** the plan review (see §3).
 
 CI check (d) requires this file for a `complexity:standard|complex` issue. Without it the PR cannot merge, whatever else is present.
 
@@ -73,8 +78,12 @@ CI check (d) requires this file for a `complexity:standard|complex` issue. Witho
 3. **Complexity + domains** — per `issue-scoping` §Tier Scaling.
 4. **Integration Surface Map** — from `test-design` (surfaces × test layer).
 5. **Research** — the pointer to the `<!-- research: v1 -->` comment, × the decisions it supports.
-6. **Implementation steps** — bite-sized, each with the test that proves it.
-7. **Rounds** — filled at PLAN-VERIFY close: `<n> (verifiers: <n>, class: <class>)`.
+6. **Wiring** — the `### Wiring` table: every call site / importer / consumer of each thing this
+   change touches, and what it does there. **Required**: `commit-workflow`'s pre-PR
+   (`--issue-only`) run of `check-pipeline-compliance.sh` accepts a plan doc only after a PR
+   exists, so this section is the ONE plan evidence visible before it does (check (d)).
+7. **Implementation steps** — bite-sized, each with the test that proves it.
+8. **Rounds** — filled at PLAN-VERIFY close: `**Rounds:** <n> (verifiers: <n>, class: <class>)`.
 
 ### Review Scope Contract
 **Class:** <code | gate-enforcement | protocol | docs-product | docs-marketing | ops-infra | research-decision>
@@ -101,7 +110,7 @@ One dispatch per verifier, one round. The verifier prompt asks exactly three thi
 - **Q2 — research-to-validate:** extract the plan's **load-bearing factual claims** (a claim whose falsity changes the design). For each, open the cited locator **and quote the line**; report every uncited claim, every locator that does not resolve, and every citation that does not bear on the claim it is attached to. *This question exists because planning changes which research was needed* — the research was written before the plan named its claims.
 - **Q3 — contract coverage (plan-side half):** does each `R<n>` name a check that **could exist and be falsified** — specifically, would deleting the branch the check guards make it red? Is anything in the diff's blast radius missing from the surface? (Running it and pasting the red is PROVE's half; Q3 does not run it.)
 
-On close, write the `**Rounds:**` line into the plan comment (field 7).
+On close, write `**Rounds:** <n> (verifiers: <n>, class: <class>)` into the plan comment (field 8) **and** `<!-- plan-review: status=<clean|threat-surface-covered> rounds=<n> -->` into the plan doc. The `Rounds` line is the datum §13 of agent-infra#2861 reads; the signature is what `writing-plans/05` requires before Execution Handoff.
 
 Verdict is `NO ISSUES FOUND`, or issues tagged with the `R<n>` they violate. **Residual rules:** an issue on the declared surface blocks and is fixed; anything outside it is `OUT-OF-SCOPE:` — recorded, filed, **not looped on**. A fix is re-checked **against the whole declared surface, by a FRESH verifier dispatch (a new `task`), inside the same round** — *rounds and contexts are orthogonal*: "one round" bounds the loop, never the reviewer's memory (`AGENTS.md` §Review Loop Protocol forbids a same-context re-review, and that rule is unchanged by this skill).
 
@@ -130,11 +139,13 @@ A lane whose issue says *"implement this ruling"* does not pay for stages that e
 2. The work is to **carry it out**.
 3. Nothing in the change **reverses** it (a departure is a **reopen** in the decision's own home, not a lean dispatch).
 
-**Skips:** stage 1 (RESEARCH) and the full stage 3 (PLAN-VERIFY) — **PLAN is kept**: one paragraph of design plus the `### Review Scope Contract`, posted in the same plan comment.
+**Skips:** the RESEARCH *work* (the queries) and PLAN-VERIFY's three questions. **Kept:** the research *artifact* (as a `**Basis:**` reference, below), **PLAN** (one paragraph of design plus the `### Review Scope Contract`, posted in the same plan comment), the doc's `### Wiring` table, and a **one-question verifier round** in place of PLAN-VERIFY.
+
+Write `**Rounds:** 0 (one-question verifier, class=<class>)` with the plan comment so the round is counted rather than inferred.
 
 **Does not skip:** the contract; **PROVE** (tests, mutation proof, exact-head review + attestation); every `AGENTS.md` hard rule the change touches; and a **one-question verifier round** — *"is the pointed artifact a decision that governs THIS change, or merely an artifact that exists?"* That round replaces PLAN-VERIFY's three questions because this is the path with the least scrutiny: skipping the review *and* the research check is exactly what would make the lean path a bypass.
 
-**The research requirement is satisfied — checkably, not by self-certification.** Post the `<!-- research: v1 -->` comment with `**Basis:** <pointer>` in place of the citation fields, where the pointer resolves **to a decision**: an owner ruling, a `**Decision:**`/`OVERRIDES:` line, a decision comment, or a Tortoise point of decision type — not merely an existing issue or section. Keep `FALSIFIER:` and `Gaps:`: carrying out a decision can still be wrong, and those two lines are the only place that is written down. Also write `Path: decided-ruling (<that same pointer>)` in the plan comment.
+**The research artifact is satisfied — checkably, not by self-certification** (the *work* is not done, and is not faked: the basis is a decision). Post the `<!-- research: v1 -->` comment with `**Basis:** <pointer>` in place of the citation fields, where the pointer resolves **to a decision**: an owner ruling, a `**Decision:**`/`OVERRIDES:` line, a decision comment, or a Tortoise point of decision type — not merely an existing issue or section. Keep `FALSIFIER:` and `Gaps:`: carrying out a decision can still be wrong, and those two lines are the only place that is written down. Also write `Path: decided-ruling (<that same pointer>)` in the plan comment.
 
 **An unresolvable pointer — or an artifact that is not a decision — is the bypass, not the path.** If the location does not resolve, or the "decision" is the lane's own judgement ("the fix is obvious"), this path is **not** available: run the normal pipeline, or reopen/produce the decision first. Ambiguous → **not lean**: ask, and record the answer where the work is gated.
 

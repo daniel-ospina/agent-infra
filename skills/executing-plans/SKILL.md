@@ -168,7 +168,7 @@ Everything else → Agent decides autonomously with a brief note, open to iterat
 
 ### Third-Party Dependency Detection
 
-When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in files the plan will touch, that is NOT covered by the plan's `### Pattern Research` section.
+When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in files the plan will touch, that is NOT covered by the plan's research evidence. **Which artifact that is depends on the pipeline (agent-infra#2861):** for `task-workflow-standard` it is the issue comment marked `<!-- research: v1 -->` whose `### Targeted Research Findings` block lists the dependency — read that; for `epic-workflow`/`project-workflow` it is the plan's `### Pattern Research` section. A task-pipeline lane that reads only the plan doc will find no research and mark every dependency unfamiliar, which is why this is stated here.
 
 **Detection algorithm:**
 
@@ -187,15 +187,15 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
    - Node.js built-ins (`fs`, `path`, `crypto`, `stream`, `http`, `https`, `url`, `os`, `events`, `util`, `buffer`, `child_process`, `tls`, `net`, `dns`, `readline`, `zlib`, `querystring`, `assert`, `cluster`, `dgram`, `domain`, `punycode`, `string_decoder`, `tty`, `vm`, `worker_threads`)
    - Type-only imports (`import type { ... } from '...'`)
 
-3. **Parse Pattern Research:** Read the plan's `### Pattern Research` section using an **anchored, line-level exact heading match** (`^### Pattern Research$`) — a substring match would let epic-brief headings such as `### UX Pattern Research` / `### Tech Stack Research` falsely satisfy coverage. Those epic-brief headings are PRIOR_RESEARCH context and **never** coverage evidence (issue #231 D5). Extract library/SDK/package names that appear in section headings or findings text. Also note `> Gate skipped`, `> Bucket [name] skipped`, and `> Research skipped: no demonstrated gap` justifications.
+3. **Parse the research evidence:** For a `task-workflow-standard` lane, read the `### Targeted Research Findings` block from the issue comment marked `<!-- research: v1 -->`; otherwise read the plan's `### Pattern Research` section. Either way use an **anchored, line-level exact heading match** (`^### Pattern Research$` / `^### Targeted Research Findings$`) — a substring match would let epic-brief headings such as `### UX Pattern Research` / `### Tech Stack Research` falsely satisfy coverage. Those epic-brief headings are PRIOR_RESEARCH context and **never** coverage evidence (issue #231 D5). Extract library/SDK/package names that appear in section headings or findings text. Also note `> Gate skipped`, `> Bucket [name] skipped`, and `> Research skipped: no demonstrated gap` justifications.
 
 4. **Cross-reference:** For each extracted package name, check if it (or its parent scope, e.g. `@supabase/supabase-js` matches `supabase`) is mentioned in Pattern Research. A package is "covered" if:
    - Its name appears in a Pattern Research bucket heading or finding
    - The Pattern Research explicitly mentions skipping it with a valid reason (e.g., "uses in-repo wrapper exclusively") — a **documented skip takes precedence over findings-date absence** (issue #231 H5)
    - The Pattern Research says "plan touches zero third-party deps" AND no third-party imports were found
 
-5. **Determine unfamiliar:** Any package NOT covered by Pattern Research is "unfamiliar". Also treat as unfamiliar if:
-   - Pattern Research is absent from the plan entirely
+5. **Determine unfamiliar:** Any package NOT covered by the research evidence is "unfamiliar". Also treat as unfamiliar if:
+   - the research evidence is absent entirely (neither the `<!-- research: v1 -->` comment nor a `### Pattern Research` section)
    - Pattern Research exists, contains **actual findings**, but carries **no `> **Findings date:** YYYY-MM-DD` stamp** — findings-date ABSENT → unfamiliar directly (fail-safe re-verify; NO plan-date fallback for the coverage question — legacy unstamped plans get re-verified, issue #231 D4). **Carve-out (issue #231 H5): a documented whole-section skip is NOT "findings-date absent" — a block carrying `> Gate skipped: <justification>` / `> Bucket [name] skipped: <justification>` / `> Research skipped: no demonstrated gap` takes precedence over the stamp rule (per Step 4); only blocks containing actual findings are subject to the stamp requirement.**
    - The stamped findings are older than 6 months by **findings date** (staleness threshold unchanged; plan date plays no role in the new algorithm)
    - The plan references a different major version than what's imported (detected via package.json or import style)

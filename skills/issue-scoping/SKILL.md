@@ -953,12 +953,9 @@ PLANEOF
 )"
 ```
 
-### Label Management — Exit
+### Label Management — Exit — removed (agent-infra#2861 §8.2)
 
-```bash
-gh issue edit $ISSUE_NUMBER --remove-label "scoping"
-gh issue edit $ISSUE_NUMBER --add-label "scoped"
-```
+`scoping` and `scoped` are deleted with `planning`/`implementing`/`planned`: none has a reader anywhere in the fleet (eight write sites, zero reads). The durable state is `doc_status` on the plan doc and the issue's open/closed state.
 
 ### Human Gate (conditional)
 

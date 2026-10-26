@@ -33,7 +33,7 @@ See `.pi/APPEND_SYSTEM.md` → Review Loop Protocol for the full protocol.
 **Pre-check (Standard/Complex only):** Before proceeding, verify the plan doc contains a clean review signature:
 
 Search for `<!-- plan-review:` in the plan doc. If:
-- Signature is absent → stop. Run `plan-review` first.
+- Signature is absent → stop. Run `plan-review` first — **except in the `task-workflow-standard` pipeline, where PLAN-VERIFY writes this signature itself** (`task-workflow-standard` §3); dispatching `plan-review` there as well would be the second pre-code round the #2861 redesign removes.
 - `status=clean` → proceed.
 - `status=capped` or `status=stalled` → stop. Surface issues to user.
 

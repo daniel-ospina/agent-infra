@@ -51,6 +51,8 @@ Return: NO ISSUES FOUND | ISSUES: <list>
 
 Fix-loop until clean or convergence (10-cycle cap).
 
+> **The task tier does not dispatch this checklist.** `task-workflow-standard` declares no `steps:` frontmatter, so it is not one of the `gate: verifier` stages above; for that pipeline item 1 (locator resolution) is asked as **PLAN-VERIFY Q2 inside the single round**, and a separate research reviewer plus a fix loop would be the second blocking pre-code round the #2861 redesign removes. "The task tier applies this FIRST" in item 1 means *first in this list*, not *as a separate dispatch*.
+
 ## Output Contract
 
 - **Epics:** the 5-section brief + `## Raw Notes` (canonical headings per epic-research).
