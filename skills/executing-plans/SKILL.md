@@ -406,37 +406,9 @@ After all unfamiliar deps verified, append findings as context for the implement
 
 ### Label Management — Execution Start
 
-Before executing any tasks, manage workflow-state labels:
-
-```bash
-OWN_ING_LABEL="implementing"
-
-**Status check:** Verify issue status is `planned` or `implementing` before starting. Warn if `dropped` or `failed` — do not auto-resume without human confirmation. Document `doc_status` transitions alongside label changes.
-
-# 1. Self-cleanup: remove own stale implementing label from a prior crashed run
-if gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q "^${OWN_ING_LABEL}$"; then
-  echo "🧹 Removing stale '${OWN_ING_LABEL}' label (from a prior incomplete run)"
-  gh issue edit $ISSUE_NUMBER --remove-label "$OWN_ING_LABEL" || {
-    echo "⚠️ Failed to remove stale label — continuing anyway"
-  }
-fi
-
-# 2. Warn-and-confirm: check for OTHER in-progress labels (exclude own)
-OTHER_LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' \
-  | grep -E '^(scoping|planning|implementing)$' \
-  | grep -v "^${OWN_ING_LABEL}$" || true)
-if [ -n "$OTHER_LABELS" ]; then
-  echo "⚠️ Issue #$ISSUE_NUMBER already has in-progress label(s): $OTHER_LABELS"
-  echo "   Another agent may be working on this issue."
-  # Present the warning to the user. Ask: "Continue anyway?"
-fi
-
-# 3. Apply own implementing label (idempotent)
-gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q '^implementing$' \
-  || gh issue edit $ISSUE_NUMBER --add-label implementing
-```
-
-**Known residual race:** Between self-cleanup and label-apply, another agent could apply a conflicting label. This is acceptable — GitHub labels are advisory, not locking primitives.
+> **Removed (agent-infra#2861 §8.2).** The `implementing`/`scoping`/`planning` labels have no reader anywhere in the fleet, and their first step (an unconditional self-cleanup) could strip a live peer lane's marker. Do not re-add them.
+>
+> **Status check:** the durable signals are the issue's open/closed state and, for ownership, `tools/who-is-on.sh <N> --repo .` (resolves through `$TORTOISE`) plus the pre-dispatch pre-flight's holder read — not a label. Document `doc_status` transitions where the plan doc lives.
 
 **Canary-fix detection:** If the issue has the `ci-failure` label and "typecheck-canary" in its title, the fix may only address a type error without fixing the runtime gap. As part of implementation, ensure the fix wires the field through all data-fetching layers — not just the type. Identify every path that constructs or fetches the affected type (`.select()` calls, view queries, mapping functions, API handlers) and verify the plan covers each one. The commit-workflow preflight §Wiring-Gap Check will gate this again before merge.
 
@@ -677,13 +649,7 @@ The `verification-gate` extension (loaded in this session) blocks `git commit`, 
    - If verification fails: fix the issue and re-verify. Do NOT claim "done" with failing checks.
 2. **Verification clean → proceed:**
 
-**Label Transition:**
-```bash
-# Remove implementing, add implemented
-gh issue edit $ISSUE_NUMBER --remove-label implementing || true
-gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q '^implemented$' \
-  || gh issue edit $ISSUE_NUMBER --add-label implemented
-```
+**Label Transition — removed (agent-infra#2861 §8.2).** No `--remove-label implementing` / `--add-label implemented`: the label has no reader, and the durable completion signal is the issue being closed by the merge.
 
 - Announce: "I'm using the commit-workflow skill to land this work."
 
@@ -803,15 +769,9 @@ router (`SWARM_ROOT`) — `approval_feedback` is not importable there (an `from 
 - Stop when blocked or when taxonomy-matching decision arises
 - Never start implementation on main/master — every implementation runs in an isolated worktree (#615/#626); the hub stays main + clean.
 
-## Label Cleanup
+## Label Cleanup — removed (agent-infra#2861 §8.2)
 
-If this skill exits early (error, user abort, or any non-completion path) before Step 6, remove the `implementing` label:
-
-```bash
-gh issue edit <ISSUE_NUMBER> --remove-label implementing || true
-```
-
-Do not leave `implementing` on issues where work is not actively progressing.
+There is nothing to clean up: this skill no longer applies an `implementing` label, so an early exit leaves no orphaned marker. If you are reading an older brief that tells you to remove one, removing it is harmless but unnecessary.
 
 ## Integration
 

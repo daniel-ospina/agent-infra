@@ -532,24 +532,9 @@ Run the clarifying-questions skill with:
 
 Its `### Clarifications` block is embedded in the Phase 8 plan comment; its `### Deferred to Research` queue (Pass B — researchable questions with impact ≥ 6) seeds Phase 1.5 Sub-step B (issue #231 D6).
 
-### Label Management — Entry
+### Label Management — Entry — removed (agent-infra#2861 §8.2)
 
-```bash
-OWN_ING_LABEL="scoping"
-# Self-cleanup stale label
-if gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q "^${OWN_ING_LABEL}$"; then
-  gh issue edit $ISSUE_NUMBER --remove-label "$OWN_ING_LABEL" || true
-fi
-# Warn on OTHER in-progress labels
-OTHER_LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -E '^(scoping|planning|implementing)$' | grep -v "^${OWN_ING_LABEL}$" || true)
-if [ -n "$OTHER_LABELS" ]; then
-  echo "⚠️ Issue #$ISSUE_NUMBER has in-progress label(s): $OTHER_LABELS"
-  # Ask user: "Continue anyway?" If no → abort.
-fi
-# Apply own scoping label
-gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q '^scoping$' \
-  || gh issue edit $ISSUE_NUMBER --add-label scoping
-```
+The `scoping`/`planning`/`implementing` labels have no reader anywhere in the fleet (verified: the only occurrences were the writers), and their self-cleanup step removed the label **unconditionally** before checking who held the issue — i.e. it could strip a live peer lane's marker. Issue-level ownership is read by the pre-dispatch pre-flight from the fleet board's holder (`tools/collision_preflight.py`, #8175) and by `tools/who-is-on.sh <N> --repo .` (resolves through `$TORTOISE`). Do not re-add these labels.
 
 ### Step 1: Read Issue
 - Fetch with `gh issue view`

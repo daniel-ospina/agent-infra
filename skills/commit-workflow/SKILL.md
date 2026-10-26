@@ -54,6 +54,8 @@ steps:
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
+**Which review? Route the artifact class first (agent-infra#2861).** Read the PR's `### Review Scope Contract` `Class:` line and consult `review-discipline`: a `docs-marketing` artifact is reviewed against its marketing canon (category architecture, positioning, SEO target) and **not** for code correctness or absolute factual correctness; `docs-product`, `ops-infra`, `protocol`, `gate-enforcement` and `research-decision` each answer to their own canon. A non-code artifact is **not** routed through the code panel by default — that is what made reviews raise side facts. Acceptance is coverage of the contract's `R<n>` surface, not a cycle count. Missing contract → class `code`, recorded as `class-uncertain`.
+
 **AI review gate (merge):** merge proceeds when the review APPROPRIATE TO THE ISSUE
 CONTENT is clean (**zero blocking findings** — the disposition rule is `code-review` §"Finding
 disposition": a finding blocks only when it is attributable to this change AND names the wrong outcome

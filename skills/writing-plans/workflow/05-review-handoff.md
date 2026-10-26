@@ -42,8 +42,7 @@ Search for `<!-- plan-review:` in the plan doc. If:
 After saving the plan, apply the `planned` label to the GitHub issue (if applicable):
 
 ```bash
-# Remove planning, then apply planned (idempotent)
-gh issue edit <number> --remove-label planning || true
+# `planned` only — the in-progress labels (planning/scoping/implementing) are deleted (agent-infra#2861 §8.2): no reader, and their self-cleanup could strip a live peer lane's marker.
 gh issue view <number> --json labels --jq '.labels[].name' | grep -q '^planned$' || gh issue edit <number> --add-label planned
 ```
 
@@ -75,12 +74,6 @@ Announce the selected mode with a one-line note: "Using [subagent-driven/paralle
 
 If the user prefers the other mode, switch without argument.
 
-## Label Cleanup
+## Label Cleanup — removed (agent-infra#2861 §8.2)
 
-If this skill exits early (error, user abort, or any non-completion path), remove the `planning` label:
-
-```bash
-gh issue edit <ISSUE_NUMBER> --remove-label planning || true
-```
-
-Do not leave `planning` on issues where work is not actively progressing.
+There is nothing to clean up: this skill no longer applies a `planning` label (it never had a reader), so an early exit leaves no orphaned marker.
