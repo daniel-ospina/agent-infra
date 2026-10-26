@@ -23,7 +23,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 > **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
-> **Scope of this skill under `task-workflow-standard` (agent-infra#2861).** That pipeline consumes **§Tier Scaling only** (verifier counts/depth) — its `Phase 2.5 problem-verify`, `Phase 5.5 solution-verify` and every `Gate Loop — MANDATORY` below are **not dispatched** there, because `task-workflow-standard`'s merged PLAN-VERIFY is the one pre-code round. They remain mandatory for `epic-workflow`/`project-workflow`, which consume this skill directly. Read the mandates below with that exception attached — paying them twice is the cost the redesign removed.
+> **Scope of this skill under `task-workflow-standard` (agent-infra#2861).** That pipeline consumes **§Tier Scaling** (verifier counts/depth) **and this skill's diamond outputs as PLAN fields** (confirmed problem, alternatives considered, the falsification check) — but its `Phase 2.5 problem-verify`, `Phase 5.5 solution-verify` and every `Gate Loop — MANDATORY` below are **not dispatched** there, because `task-workflow-standard`'s merged PLAN-VERIFY is the one pre-code round. They remain mandatory for `epic-workflow`/`project-workflow`, which consume this skill directly. Read the mandates below with that exception attached — paying them twice is the cost the redesign removed.
 
 Multi-phase planning for **existing** GitHub issues. Uses the **double diamond** design framework with integrated verification:
 1. **problem-diverge** — explore alternative problem definitions, root causes, dependencies

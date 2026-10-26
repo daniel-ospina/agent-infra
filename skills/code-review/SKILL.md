@@ -800,10 +800,11 @@ echo "[code-review] RISK_CLASS=${RISK_CLASS:-<unset>} REVIEW_CLASS=${REVIEW_CLAS
 ```
 REVIEW_CLASS: <resolved in Step 3.6 / 0a — one value>. Questions your class asks:
   <that class's questions, from `review-discipline`>. Questions it must NOT ask:
-  <same row>. Your remit is the contract's declared risk surface (R1..Rn): a finding
-  outside it is recorded as OUT-OF-SCOPE, never looped on. Acceptance is coverage of
-  that surface, not a cycle count. If no contract reached you, say
-  `class-uncertain: <why>` in your output and review as `code`.
+  <same row>. Your remit is the contract's declared risk surface (R1..Rn) **plus** any
+  finding that is (a) caused by the diff, (b) newly reachable or value-bearing because
+  of it, or (c) purpose-defeating. Anything else is OUT-OF-SCOPE: recorded, never
+  looped on. Acceptance is coverage of that surface, not a cycle count. If no contract
+  reached you, say `class-uncertain: <why>` in your output and review as `code`.
 ISOLATED CHECKOUTS — never copy the repo. If your review needs a checkout other
 than the one you are in (e.g. to run a check or probe the PR branch), get it with
     bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> [--paths <p1,p2> | --full] -- <cmd...>

@@ -2,7 +2,7 @@
 
 ## Plan Review Gate (Standard and Complex Tiers) — Gate Loop — MANDATORY
 
-> **Exception — `task-workflow-standard` (agent-infra#2861).** For that pipeline this gate is **already satisfied when you arrive**: `task-workflow-standard`'s PLAN-VERIFY *is* the plan review, writes the `<!-- plan-review: status=… rounds=… -->` signature, and dispatches `plan-review` again would be the second blocking pre-code round the redesign removed. Two skills saying MANDATORY about the same gate is how a lane pays twice — read this exception as part of the mandate, not as advice.
+> **Exception — `task-workflow-standard` (agent-infra#2861).** For that pipeline this gate is **already satisfied when you arrive**: `task-workflow-standard`'s PLAN-VERIFY *is* the plan review, writes the `<!-- plan-review: cycles=…, status=…, version=… -->` signature, and dispatches `plan-review` again would be the second blocking pre-code round the redesign removed. Two skills saying MANDATORY about the same gate is how a lane pays twice — read this exception as part of the mandate, not as advice.
 
 After saving the plan doc, invoke the `plan-review` skill to validate plan quality:
 
