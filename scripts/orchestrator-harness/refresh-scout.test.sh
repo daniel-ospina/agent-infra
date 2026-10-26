@@ -1393,6 +1393,101 @@ case "$OUT" in
   *) bad "rejected credential: the refusal does not name the 401 — output: $OUT" ;;
 esac
 
+# mk_gh_flaky <case-dir> <issue-number> <fail-first-N> — a gh whose `api rate_limit` PROBE call fails
+# the first <fail-first-N> times and SUCCEEDS afterwards (agent-infra#2830). Everything else is
+# `mk_gh_rest`'s answer, so a pass that gets past the probe really enumerates and queues the row.
+# ⛔ The counter lives in the case dir and NOT in the stub's memory: the probe is a separate process
+# per attempt, so a counter that reset per invocation would make every attempt "the first" and the
+# fix untestable.
+mk_gh_flaky() {
+  local d="$1" nums="${2:-}" fails="${3:-1}" rows='[]' n first=1
+  if [ -n "$nums" ]; then
+    rows='['
+    for n in ${nums//,/ }; do
+      [ "$first" -eq 1 ] || rows="$rows,"
+      first=0
+      rows="$rows{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}"
+    done
+    rows="$rows]"
+  fi
+  cat > "$d/bin/gh.body" <<SH
+#!/bin/bash
+d="\$(cd "\$(dirname "\$0")" && pwd)"
+case "\$1 \$2" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*)
+    c=0; [ -f "\$d/.rl-count" ] && c="\$(cat "\$d/.rl-count")"
+    c=\$(( c + 1 )); printf '%s\\n' "\$c" > "\$d/.rl-count"
+    if [ "\$c" -le $fails ]; then
+      echo 'Get "https://api.github.com/rate_limit": proxyconnect tcp: dial tcp 127.0.0.1:1: connect: connection refused' >&2
+      exit 1
+    fi
+    printf '%s\\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":4321}}}'
+    ;;
+  *"/pulls?"*) printf '%s\\n' '[]' ;;
+  *"labels=P0-blocker"*) printf '%s\\n' '$rows' ;;
+  *"/issues?"*) printf '[]\\n' ;;
+  *) printf '[]\\n' ;;
+esac
+SH
+  chmod +x "$d/bin/gh.body"
+  mk_gh_wrapper "$d"
+}
+
+# ── 1l) ONE FLAKY PROBE CALL MUST NOT BLIND THE CYCLE (agent-infra#2830) ────────────────────────
+# MEASURED: `[refresh]` failed on 39% (305/764) of the local box's cycles and 70% (102/145) of
+# pi-cell-4's, and each of those cycles enumerated NOTHING — no candidates, no per-PR rows, no
+# dispatch — because the precondition probe gave up after a SINGLE attempt. Run by hand seconds
+# later, the same call answered rc=0 in 903-1872 ms on the same box (see the issue's table).
+# So the contract is: a first-attempt failure is RETRIED inside the cycle, and only the LAST
+# attempt's verdict counts — the same messages and the same exit code, so the fail-closed polarity
+# is untouched (the second case below pins that half, and it is the half a false PASS would break).
+mk_case probe-flaky-retry
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_flaky "$D" 42 1          # the probe's FIRST call fails, its SECOND answers
+rf "$D" refresh GH_PROBE_ATTEMPTS=3 GH_PROBE_BUDGET=15
+[ "$RC" -eq 0 ] && ok "flaky probe: rc=0 — one failed probe call no longer costs the whole cycle" \
+                || bad "flaky probe: rc=$RC (want 0 — the retry must absorb one failure) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "flaky probe: the cycle still ENUMERATED #42 into the backlog" ;;
+  *) bad "flaky probe: nothing queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# NON-VACUITY, half 1: the retry really ran. A single attempt would leave the counter at 1 (the
+# failing one) and the pass would have exited TRANSIENT before it ever succeeded.
+rl="$(cat "$D/bin/.rl-count" 2>/dev/null || echo 0)"
+[ "${rl:-0}" -ge 2 ] && ok "flaky probe: the probe was RE-TRIED (rate_limit calls=$rl, want >=2)" \
+                     || bad "flaky probe: the probe was not retried (rate_limit calls=$rl, want >=2)"
+case "$OUT" in
+  *TRANSIENT*) bad "flaky probe: the absorbed failure was still reported TRANSIENT — output: $OUT" ;;
+  *) ok "flaky probe: no TRANSIENT verdict once an attempt succeeded" ;;
+esac
+
+# The other arm — EVERY attempt fails. The polarity is the contract: the cycle must still refuse to
+# dispatch, with the same TRANSIENT verdict and exit code it had on one attempt, and it must have
+# SPENT its attempts before giving up (a probe that gives up early is the defect this pins).
+mk_case probe-dead-probe
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_flaky "$D" 42 99         # no attempt ever answers
+echo 99 > "$D/o/candidates.txt"   # a sentinel: "nothing queued" must be discriminating, not empty
+rf "$D" refresh GH_PROBE_ATTEMPTS=3 GH_PROBE_BUDGET=15
+[ "$RC" -eq 1 ] && ok "dead probe: rc=1 (TRANSIENT, unchanged from one attempt — a retry is not a verdict)" \
+               || bad "dead probe: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *TRANSIENT*) ok "dead probe: still reported TRANSIENT (fail-closed, not a swallowed failure)" ;;
+  *) bad "dead probe: no TRANSIENT verdict — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"did not answer with a 401"*) ok "dead probe: the refusal names the API non-answer (the same message)" ;;
+  *) bad "dead probe: the refusal message changed — output: $OUT" ;;
+esac
+rl="$(cat "$D/bin/.rl-count" 2>/dev/null || echo 0)"
+[ "${rl:-0}" -eq 3 ] && ok "dead probe: all 3 attempts were spent before giving up (rate_limit calls=$rl)" \
+                     || bad "dead probe: gave up after ${rl:-0} attempt(s) (want exactly 3)"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "dead probe: DISPATCHED on a failed probe — the polarity is inverted" ;;
+  *) ok "dead probe: nothing was queued (the sentinel is untouched)" ;;
+esac
+
 # ── 1j) A CLEAN THAT IS DEGRADED IS NOT A VERDICT (agent-infra#1853 review P2) ──────────────────
 # The canonical producer never pairs `ALSO INCOMPLETE` with CLEAN, but `resolve_preflight` prefers
 # the repo's OWN copy — so a VENDORED producer could, and a degraded CLEAN counted as usable would
