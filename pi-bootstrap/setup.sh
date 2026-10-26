@@ -179,6 +179,23 @@ copied=0; kept=0
 for e in "$SRC"/extensions/*; do
   base="$(basename "$e")"
   dest="$DEST/extensions/$base"
+  # ⛔ NEVER copy a test file into the live farm (#1509). pi's extension loader
+  # EXECUTES every `.ts` under $DEST/extensions, so a `*.test.ts` there is not a
+  # test — it is an extension that runs its suite at session start and whose
+  # stdout replaces the session's answer. Measured 2026-10-25: 12 test files were
+  # farmed by this loop, every dispatched child on the box answered with
+  # `auto-sync.test.ts` output instead of a reply, and no log named the cause.
+  # This loop is COPY-ONLY (like the scripts farm), so skipping here is not
+  # enough — a test copied by an earlier run stays until it is removed, and it
+  # stays EXECUTING. Remove both halves.
+  case "$base" in
+    *.test.ts)
+      if [ -e "$dest" ]; then
+        rm -f "$dest" && echo "    removed test file from live farm: $base"
+      fi
+      continue
+      ;;
+  esac
   if [ -L "$dest" ]; then
     dest_resolved="$(resolve_path "$dest")"
     repo_resolved="$(resolve_path "$INFRA_ROOT/extensions/$base")"
@@ -197,6 +214,18 @@ for e in "$SRC"/extensions/*; do
   fi
   copied=$((copied+1))
 done
+# ⛔ RECURSIVE sweep for test files in the live farm (#1509). The `case` in the loop
+# above only guards TOP-LEVEL entries, and two paths escape it: (a) an entry that is a
+# directory is copied with `cp -R`, which brings any `*.test.ts` inside it
+# (`builtin-tools/`, `verification-gate/` both carry one), and (b) this loop is
+# COPY-ONLY, so a test farmed by an earlier run whose source has since left the repo is
+# never visited at all. Both are EXECUTED by pi's extension loader at session start,
+# so the sweep is the half that makes the farm safe, not the `case`.
+while IFS= read -r tf; do
+  [ -n "$tf" ] || continue
+  rm -f "$tf" && echo "    removed test file from live farm: ${tf#"$DEST/extensions/"}"
+done <<< "$(find "$DEST/extensions" -type f -name '*.test.ts' 2>/dev/null)"
+
 echo "    extensions: $copied refreshed, $kept farm symlinks kept"
 
 # Install extension dependencies (needs internet on first run)
