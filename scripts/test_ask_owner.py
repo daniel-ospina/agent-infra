@@ -689,12 +689,14 @@ def test_this_files_copy_of_the_endpoint_and_model_is_the_real_vendor():
 
 
 def test_the_summary_line_reports_the_version_the_api_answered_with():
-    """⛔ THE ECHO IS THE ONLY PLACE THE CONCRETE VERSION APPEARS.
+    """⛔ THE LINE MUST REPORT THE VERSION THE RESPONSE CARRIED, NOT THE ALIAS SENT.
 
     The fleet sends the alias `jev-latest` (owner ruling 2026-10-27), so a line built from
     `JEV_MODEL` would read `model=jev-latest` and look correct while telling a reader nothing
     about which version judged the question. This asserts the line comes from the RESPONSE —
-    and the fixture's answer is deliberately a version, not the alias.
+    and the fixture's answer is deliberately a version, not the alias. (In a token response;
+    when the API reports money instead, `meta_line` prints cost and carries no version, which
+    is why this is a claim about the line and not about "the only place" anything appears.)
     """
     line = ao.meta_line({"model": "jev-1.14.0",
                          "usage": {"input_tokens": 10, "output_tokens": 2}})
