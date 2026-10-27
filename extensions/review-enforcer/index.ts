@@ -3357,10 +3357,19 @@ export function isAdminMergeCommand(command: string): boolean {
     // false block the LITERAL arm still produces (a quoted `--admin`, once this guess has
     // already made the command a candidate); it is deliberate, and
     // `hasLiteralAdminFlag` documents why the caller accepts it.
-    return (
-      /(^|[^\w])gh\b/.test(probe) ||
-      (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
-    );
+    //
+    // ⛔ #3953: THE GUESS IS ABOUT AN OPERATION, NOT ABOUT VOCABULARY. It used to be
+    // "the text contains the word `gh`, or the words `pr` AND `merge`", which made every
+    // read-only command that merely NAMED a merge a merge it had to certify — the mandated
+    // `commits/<sha>/check-runs` read, a `branches/main/protection` projection, a heredoc
+    // body full of `hasAdminMergeFlag` identifiers. `mergeInvocationInText` asks instead
+    // for a merge VERB in argv position, and it keeps the fail-closed halves that matter: a
+    // spliced verb still counts, a verb inside a payload handed to a shell still counts, and
+    // a `gh` whose group slot is unreadable (`V="pr merge"; gh $V 999 --admin`) still
+    // counts. What it no longer counts is a READABLE `gh api`/`gh issue`/`gh pr view` call,
+    // which cannot merge anything — that is the difference between the operation and the
+    // word, and it is the whole of the #3953 class.
+    return mergeInvocationInText(bare);
   }
   // Readable text, so the only way it is still a merge is a quote-split verb
   // behind a BARE `gh` (quotes are deliberately not a construct). Requiring the
@@ -5623,6 +5632,183 @@ export function countMergeVerbs(command: string): number {
 
 export function extractMergePrNumber(command: string): number | null {
   return extractMergeSelector(command).pr;
+}
+
+/** gh flags that take a VALUE and may sit before the group (`pr`): a global flag does
+ * not make the group readable, and its value is not the group. Mirrors the shim's and
+ * `extractMergeSelector`'s value list for the two flags gh accepts BEFORE the group. */
+const GLOBAL_VALUE_FLAGS = new Set(["-R", "--repo", "-A", "--hostname"]);
+
+/** A word with a shell ASSIGNMENT prefix removed (`CMD+=gh` → `gh`, `P=pr` → `pr`).
+ * A verb assembled by appends (`CMD+=gh CMD+=' ' CMD+=pr …`) puts no token that IS the
+ * word in the stream, and bash still runs `gh pr merge` — measured as a real bypass. */
+function withoutAssignmentPrefix(word: string): string {
+  return word.replace(/^[A-Za-z_][A-Za-z0-9_]*\+?=/, "");
+}
+
+/**
+ * Is the GROUP slot of some `gh` command word itself UNREADABLE — a construct, where
+ * `pr` (or the whole verb) would have to be, possibly behind a global flag?
+ *
+ * `V="pr merge"; gh $V 999 --admin` reaches gh as `gh pr merge 999 --admin` while this
+ * scanner can see no verb at all, so this is the fail-closed floor under
+ * `mergeInvocationInText`. It is deliberately slot-SCOPED rather than the old
+ * "a `gh` word appears anywhere" test: a readable group (`gh api …`, `gh issue list …`)
+ * is not a merge and must not be read as one (agent-infra#3953).
+ */
+function ghGroupIsUnreadable(command: string): boolean {
+  const scan = scanTokens(command);
+  for (let i = 0; i < scan.tokens.length; i++) {
+    const w = shellWord(scan.tokens[i]);
+    // The command word: readable as `gh`, or a construct where a command word belongs
+    // (`$'gh' pr merge 999`, `G=gh; $G pr merge 999`) — the same two spellings
+    // `countMergeVerbs` accepts one slot earlier. ⛔ COMMAND POSITION IS REQUIRED: a
+    // construct in an ARGUMENT is not a command word (`echo ${X}` tokenizes to `echo`,
+    // `$`, `X}`, and the bare `$` would otherwise read as a command word followed by a
+    // construct — every `${…}` in every command would be a merge candidate).
+    if (!isCommandPositionAt(scan, i)) continue;
+    if (w !== "gh" && !CONSTRUCT.test(scan.tokens[i])) continue;
+    // A BARE `$` cannot be a command word: `${RAIL}` tokenizes to `$` + `RAIL}`, and
+    // reading the `$` as the command and `RAIL}` as its group made `bash ${RAIL} 999` a
+    // merge candidate (measured — it would have re-created #6395's refusal of the rail).
+    if (w === "") continue;
+    let j = i + 1;
+    while (j < scan.tokens.length && GLOBAL_VALUE_FLAGS.has(shellWord(scan.tokens[j]))) j += 2;
+    if (j >= scan.tokens.length) continue;
+    if (CONSTRUCT.test(scan.tokens[j])) return true;
+  }
+  return false;
+}
+
+/**
+ * Is there a `gh` … `pr` … `merge` WORD SEQUENCE in the token stream, allowing an
+ * ASSIGNMENT prefix on each word?
+ *
+ * The third fail-closed fallback, for the spellings where the verb is present but glued to
+ * an assignment so no token equals `gh`: measured `X='gh pr merge 999 --admin'; sh -c "$X"`
+ * produces the token `X=gh`, and `CMD+=gh CMD+=' ' CMD+=pr … CMD+=merge` produces one
+ * assignment per word — both were ALLOWED by the exact-word walk while the shell would run
+ * a real admin merge (a fail-open; the base refused them).
+ *
+ * The ORDER and the WORD-NESS are what keep it narrow: a `gh` word, then a token that is
+ * `pr`, then one that is `merge`. A jq filter, a `--json` field list or a grep pattern
+ * spells `mergeable`, `.merge_commit_sha`, `mergeStateStatus`, `hasAdminMergeFlag` or
+ * `admin|merge` — none of them is the WORD `merge` — so the read-only commands in this class
+ * (agent-infra#3953) do not match, and the over-block it keeps is at most what the rule it
+ * replaces already had.
+ */
+function mergeVerbSequenceInTokens(command: string): boolean {
+  const scan = scanTokens(command);
+  // 0: looking for the `gh` word, 1: for `pr`, 2: for `merge`.
+  let stage = 0;
+  for (const raw of scan.tokens) {
+    const w = shellWord(raw);
+    const verbWord = withoutAssignmentPrefix(w);
+    if (stage !== 2) {
+      if (/\bgh\b/.test(w)) stage = 1;
+      else if (stage === 1 && verbWord === "pr") stage = 2;
+      continue;
+    }
+    if (verbWord === "merge") return true;
+    // A pure-whitespace assignment (`CMD+=' '`) is a SEPARATOR being assembled, not a
+    // verb slot: skipping it is what lets `CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge`
+    // read as one invocation (measured as a real bypass).
+    if (verbWord.trim() === "") continue;
+    // A word in the verb slot that is not the verb restarts the walk (a `gh` here can
+    // begin a fresh sequence; anything else drops back to looking for `gh`).
+    stage = /\bgh\b/.test(w) ? 1 : 0;
+  }
+  return false;
+}
+
+/**
+ * Could an ANSI-C quote be encoding a SEPARATOR — i.e. is the token structure of this
+ * command not recoverable from the text?
+ *
+ * `sh -c gh$'\x20'pr$'\x20'merge$'\x20'999$'\x20'$V` is ONE whitespace-delimited token to
+ * any reader that does not decode `\x20`, and a real `gh pr merge 999 --admin` to bash. Three
+ * such spellings were measured as live bypasses of both layers when the surrounding rule
+ * narrowed (the `$'\x20'` family, agent-infra#1425/#1776). Where the separators are not
+ * recoverable, `mergeInvocationInText` falls back to the WORDS read — the same
+ * over-approximation the #3953 narrowing removed elsewhere, kept here because here the
+ * alternative is a fail-open, not a false block.
+ */
+function ansiCEncodesSeparator(command: string): boolean {
+  return /\$'[^']*\\(?:x[0-9a-fA-F]{2}|[0-7]{1,3}|u[0-9a-fA-F]{2,4}|U[0-9a-fA-F]{4,8}|[tnrvf])/.test(
+    command,
+  );
+}
+
+/**
+ * Does this command INVOKE a merge — the OPERATION, not the word? (agent-infra#3953)
+ *
+ * This is the candidate rule's argv-position read. The defect it closes is one line of
+ * `isAdminMergeCommand`'s old over-approximation, which answered "is this an admin
+ * merge?" with *"does the text contain the word `gh`, or the words `pr` AND `merge`?"*
+ * once a construct and the word `admin` were present. A read-only command that merely
+ * NAMES a merge therefore became a merge it had to certify:
+ *
+ *   gh api repos/o/r/branches/main/protection --jq '{enforce_admins: .enforce_admins}'
+ *   cat > /tmp/x.mjs <<'EOF' … `gh api "…/check-runs?filter=all"` … probes['hasAdminMergeFlag'] …
+ *
+ * The `{}` / backticks supply the construct and `admin` supplies the word, so both were
+ * refused with "no resolvable PR number" — a block on the very `check-runs` read the
+ * fleet rules MANDATE for answering "is the tree healthy".
+ *
+ * The replacement asks for a merge VERB in argv POSITION, and nothing weaker:
+ *   - the verb spelled (or spliced) in the argument list the shell will run — the token walk
+ *     in `countMergeVerbs`, REUSED rather than re-implemented, because two predicates for
+ *     "is this a merge" is the failure this file keeps re-learning. A payload handed to
+ *     `sh -c`/`eval`/`trap` stays readable through the data mask, so a WRAPPED verb still
+ *     counts; a verb inside plain quoted data (`echo 'gh pr merge 9'`) does not, which is
+ *     the mention/invocation line this file already draws;
+ *   - a `gh` whose GROUP slot is unreadable still counts (`V="pr merge"; gh $V 999 --admin`,
+ *     `gh --hostname … $X 999 --admin`), because there the verb is not in the text at all;
+ *   - a verb ASSEMBLED with assignments still counts (`CMD+=gh CMD+=pr CMD+=merge`,
+ *     `X='gh pr merge 999 --admin'; sh -c "$X"`), where no token IS the word `gh`;
+ *   - where the separators are ANSI-C escapes (`gh$'\x20'pr …`) the token structure is not
+ *     recoverable, so it falls back to the WORDS read — an over-block kept deliberately,
+ *     because the alternative there is a fail-open.
+ *
+ * WHAT IT DELIBERATELY NO LONGER COUNTS, and why that cannot merge anything: a construct
+ * plus the word `admin` in a command whose `gh` calls are all READABLE NON-MERGE calls
+ * (`gh api …`, `gh issue …`, `gh pr view …`). No `gh` subcommand other than `pr merge`
+ * merges a PR, so a command with no merge verb in argv position cannot perform one; the
+ * placeholder that used to stand in for that signal was the word `gh`, which is a
+ * property of the VOCABULARY rather than of the operation.
+ *
+ * NOT NARROWED HERE (declared, not overlooked):
+ *   - the LITERAL `--admin` arm stays exactly as wide as it was — a command carrying the
+ *     flag AND a readable `gh pr merge` keeps the text layer's decision
+ *     (`hasLiteralAdminFlag`);
+ *   - a `--jq`/`--json`/`--search` value that spells a whole `pr`+`merge` word PAIR
+ *     (`.merge`, `--json pr,merge`) is still read as a verb pair, because at that point the
+ *     text is indistinguishable from an invocation without an argv layer. That residual is
+ *     an OVER-BLOCK, the direction this gate is allowed to be wrong in, and it is strictly
+ *     narrower than the "any `gh` word" rule it replaces.
+ */
+export function mergeInvocationInText(command: string): boolean {
+  // Same two normalizations the caller's own reads use: the rail's basename is not a
+  // verb (`admin-merge.sh`), and a repo flag's value is not a verb (`gh -R pr merge 9`).
+  const bare = stripRepoArgs(withoutMandatedRailPath(command));
+  // The DATA-AWARE count, deliberately: an `sh -c`/`eval`/`trap` payload stays readable
+  // through the mask (that is what keeps a wrapped verb an invocation), while a verb inside
+  // plain quoted data is a mention and is not one. A data-insensitive count was measured to
+  // add no coverage — every payload spelling it catches is already readable — and only
+  // widened the rule onto `echo`.
+  if (countMergeVerbs(bare) > 0) return true;
+  if (ghGroupIsUnreadable(bare)) return true;
+  if (mergeVerbSequenceInTokens(bare)) return true;
+  // The separators are not recoverable from the text, so the token arms above are not a
+  // read of this command: refuse on the WORDS read, which is what the pre-#3953 rule did.
+  if (ansiCEncodesSeparator(bare)) {
+    const probe = normalizeForFlagScan(bare);
+    return (
+      /(^|[^\w])gh\b/.test(probe) ||
+      (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
+    );
+  }
+  return false;
 }
 
 /**
