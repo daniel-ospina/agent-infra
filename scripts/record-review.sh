@@ -43,6 +43,12 @@
 #   verdict, and exit code:
 #     head        0  the record is bound to the CURRENT head — nothing is stale
 #     carry       0  the reviewed DIFF is unchanged; the gate carries the record
+#     carry-patch 6  the RENDERED diff moved but the reviewed PATCH is
+#                    byte-identical (a rebase / base-move) — the gate will NOT
+#                    carry the record as-is, so RE-RECORD at the current head
+#                    and do NOT run a review cycle (#1377). Distinct from
+#                    `carry` because the record must be re-minted, and distinct
+#                    from exit 0 because no merge may be assumed.
 #     fresh       1  the DIFF changed; a fresh review is genuinely owed
 #     unreadable  3  the live diff could not be READ — RETRY, do NOT re-review
 #     norecord    4  no record for this PR/repo — there is no verdict to carry
@@ -1614,6 +1620,125 @@ diff_hash_for_pr() { # <pr>
   fi
   rm -f "$tmp" "$norm"
 }
+
+# ══════════════════════════════════════════════════════════════════════════
+# #1377 — THE PATCH IDENTITY: "did the CHANGE move, or only the RENDERING?"
+#
+# The evidence binding above answers "is this the same artifact?" and is
+# deliberately STRICT: its `diff_sha256` keeps hunk CONTEXT, because #1362 D1
+# (owner ruling) refused the whitespace-blind `git patch-id` as a binding. That
+# strictness is correct for a binding and it is what makes a changed diff
+# impossible to carry — but it also means a REBASE onto a moved base is
+# invisible to it: when `main` lands work in the same file, every context line
+# around the reviewed change is rewritten, the normalized digest moves, and the
+# record goes stale with the REVIEWED LINES UNCHANGED. That is #1377: re-record
+# (mechanical), do NOT pay for a second review (the review is a review OF THE
+# DIFF, and the diff is the same change).
+#
+# So there are two questions, answered by two projections of the SAME bytes from
+# the SAME normalizer (scripts/lib/diff-normalize.py):
+#   * the BINDING projection (`diff=`, cross-repo contract) — unchanged here;
+#   * the PATCH projection (`--patch-only`) — drops exactly the three fields a
+#     rebase rewrites (blob ids, hunk line numbers, hunk CONTEXT) and keeps
+#     everything else BYTE-EXACT, including whitespace and the file PATH.
+#
+# ⛔ WHY NOT `git patch-id --stable`, which #1377's own text names: `--stable`
+# "ignores all whitespace within the patch" (git-patch-id(1)), so a
+# whitespace-only edit would match its parent — the exact false ACCEPT #1362 D1
+# ruled out. This projection carries both of D1's objections forward (sha256,
+# whitespace-exact, and paths included, which patch-id does not commit to)
+# instead of reversing the ruling.
+#
+# ⛔ THE ANCHOR IS WHAT MAKES IT SOUND. A patch match ALONE proves nothing: it
+# would let a body-supplied sha pair with any diff. So `patch_dimension_carry`
+# requires the reviewed diff it RECONSTRUCTS to normalize to the marker's own
+# signed `diff=` before it compares a single changed line. The marker is
+# HMAC-verified by the caller (#784) and the reconstruction must reproduce it —
+# so the bytes compared are the bytes that marker was minted over. Any mismatch
+# (a moved merge-base, a divergence between GitHub's renderings, a rewritten
+# reviewed commit) is a REFUSAL, never a guess.
+#
+# ⛔ IT CANNOT WEAKEN HEAD BINDING. Nothing here mints or accepts a marker: the
+# carry RE-RECORDS at the CURRENT head with that head's own `diff=`, exactly as
+# the #2982 arm does, so the gate still sees a marker bound to the revision that
+# would merge (#930 adversarial class 1). A stale marker over a DIFFERENT patch
+# stays refused by both the byte-identity arm and this one.
+diff_identity_pair() { # <diff-file> -> "<binding-digest>\t<patch-digest>" ; rc 1 = uncomputable
+  local f="$1" t="" a="" p=""
+  [ -s "$f" ] || return 1
+  # A body with no entry boundary is NOT a diff. Hashing it would mint an
+  # identity for bytes nobody reviewed — the same rule the API path applies
+  # (#1398). Tested FIRST, so a real diff is never demoted.
+  command grep -qE '^diff --git ' "$f" 2>/dev/null || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  command -v openssl >/dev/null 2>&1 || return 1
+  [ -f "$DIFF_NORMALIZER" ] && [ -s "$DIFF_NORMALIZER" ] || return 1
+  t="$(command mktemp 2>/dev/null)" || return 1
+  # `[ -s ]` on the projection OUTPUT, not just its exit status: a zero-byte
+  # normalizer exits 0 and prints nothing, and sha256("") is a CONSTANT that
+  # would make every diff identical (the #1362 fail-open this file already
+  # guards elsewhere). Empty output ⇒ refuse, never hash it.
+  a="$(command python3 "$DIFF_NORMALIZER" < "$f" 2>/dev/null > "$t" && [ -s "$t" ] \
+        && command openssl dgst -sha256 < "$t" | command awk '{print $NF}')" || a=""
+  p="$(command python3 "$DIFF_NORMALIZER" --patch-only < "$f" 2>/dev/null > "$t" && [ -s "$t" ] \
+        && command openssl dgst -sha256 < "$t" | command awk '{print $NF}')" || p=""
+  command rm -f "$t"
+  case "$a$p" in *[!0-9a-f]*) return 1 ;; esac
+  [ "${#a}" -eq 64 ] && [ "${#p}" -eq 64 ] || return 1
+  printf '%s\t%s\n' "$a" "$p"
+  return 0
+}
+# #1377 — carry across a head move whose PATCH is unchanged even though the
+# BINDING moved. Both sides are READ FRESH from the compare endpoint at the SAME
+# base, so the two renderings are the same generator's and the verdict cannot
+# depend on when the recorded side happened to be fetched (a TOCTOU the byte-
+# identity arm has by construction). This is the arm that carries a REBASE.
+patch_dimension_carry() { # <reviewed-sha> <reviewed-binding-digest> <current-head> -> 0 = patch unchanged
+  local reviewed="$1" anchor="$2" current="$3" base="" tmp="" pair="" on="" op=""
+  [ -n "$reviewed" ] && [ -n "$anchor" ] && [ -n "$current" ] || return 1
+  case "$reviewed$anchor$current" in *[!0-9a-f]*) return 1 ;; esac
+  [ "${#reviewed}" -eq 40 ] && [ "${#anchor}" -eq 64 ] && [ "${#current}" -eq 40 ] || return 1
+  [ -n "$REPO" ] && command -v gh >/dev/null 2>&1 || return 1
+  [ "$reviewed" != "$current" ] || return 1
+  # THE BASE IS THE API'S (as in lane_dimension_carry): a local ref can LIE about
+  # it, and a stale one would make a commit the review never saw look like base
+  # content. Same read, same reason, same authority.
+  base="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
+  case "$base" in *[!0-9a-f]*) return 1 ;; esac
+  [ "${#base}" -eq 40 ] || return 1
+  tmp="$(command mktemp 2>/dev/null)" || return 1
+  # ---- THE REVIEWED SIDE, reconstructed from the marker's own `@ <sha>` ----
+  # Three-dot, so the merge-base with the CURRENT base is what is diffed: for a
+  # head that was never itself rebased this reproduces the diff the review saw
+  # even after the base moved (which is why the ANCHOR below can match).
+  if ! command gh api -H "Accept: application/vnd.github.v3.diff" \
+         "repos/$REPO/compare/${base}...${reviewed}" > "$tmp" 2>/dev/null \
+     || [ ! -s "$tmp" ] \
+     || ! command grep -qE '^diff --git ' "$tmp" 2>/dev/null; then
+    command rm -f "$tmp"; return 1
+  fi
+  pair="$(diff_identity_pair "$tmp")" || { command rm -f "$tmp"; return 1; }
+  on="${pair%%$'\t'*}"
+  op="${pair#*$'\t'}"
+  # ---- THE ANCHOR (load-bearing): these bytes ARE the reviewed artifact ----
+  # A mismatch means the reconstruction is NOT what the marker was minted over
+  # (a moved merge-base, a rewritten reviewed commit, GitHub rendering the two
+  # endpoints differently). Refuse — never compare a patch against bytes of
+  # unknown provenance.
+  if [ "$on" != "$anchor" ]; then command rm -f "$tmp"; return 1; fi
+  # ---- THE LIVE SIDE, same base, same generator ----
+  if ! command gh api -H "Accept: application/vnd.github.v3.diff" \
+         "repos/$REPO/compare/${base}...${current}" > "$tmp" 2>/dev/null \
+     || [ ! -s "$tmp" ] \
+     || ! command grep -qE '^diff --git ' "$tmp" 2>/dev/null; then
+    command rm -f "$tmp"; return 1
+  fi
+  pair="$(diff_identity_pair "$tmp")" || { command rm -f "$tmp"; return 1; }
+  command rm -f "$tmp"
+  # ---- THE DECISION: every reviewed changed line, byte for byte, same paths ----
+  [ "${pair#*$'\t'}" = "$op" ] || return 1
+  return 0
+}
 # Tier selector, read-only seam. Exits BEFORE the diff-hash fetch and every
 # write, so asking "which tier does this diff earn?" costs one compare read and
 # can never mint, mutate or carry a record. `ok` is the only status a caller may
@@ -1865,6 +1990,21 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     printf 'carry\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
     echo "record-review.sh --check-carry: the reviewed DIFF is UNCHANGED (diff_sha256 ${CC_DIFF:0:12}… matches the PR's live diff) — the merge gate CARRIES this record across the head move (${CC_HEAD:0:12}…). Do NOT re-review and do NOT mint a fresh record: land it." >&2
     exit 0
+  fi
+  # ── #1377 — `carry-patch`: the BINDING moved, the PATCH did not ────────────
+  # The arm above is byte-identity of the rendered diff. A REBASE onto a moved
+  # base rewrites hunk context even when no reviewed line changed, so the
+  # binding moves and this mode used to answer `fresh` — the 20-40 minute
+  # re-review #1351 exists to prevent, demanded for work that did not change.
+  # The predicate is the RECORDER's own arm, not a second definition: if it
+  # says so, `record-review.sh <pr> <current head> <same verdict> <repo>`
+  # carries without a review. The token is DISTINCT from `carry` and exit is
+  # NOT 0 because the gate does not carry this one — the record must be
+  # re-minted, and a caller that read exit 0 as "merge it" would be wrong.
+  if patch_dimension_carry "$CC_HEAD" "$CC_DIFF" "$CC_LIVE_HEAD"; then
+    printf 'carry-patch\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
+    echo "record-review.sh --check-carry: the reviewed PATCH is unchanged (the rendered diff moved, so the merge gate will NOT carry this record as-is — but every reviewed line is byte-identical at ${CC_HEAD:0:12}… and ${CC_LIVE_HEAD:0:12}…). This is a rebase/base-move, NOT a changed artifact: re-record at the current head — record-review.sh $PR $CC_LIVE_HEAD <same verdict> ${REPO:-<owner/repo>} — do NOT run a review cycle." >&2
+    exit 6
   fi
   printf 'fresh\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
   echo "record-review.sh --check-carry: the DIFF CHANGED (recorded ${CC_DIFF:0:12}… vs live ${DIFF_HASH:0:12}…) — the record genuinely does not cover what would merge. Run the code-review skill, post its verdict as a PR comment, then record clean with --evidence comment:<id>." >&2
@@ -2707,6 +2847,14 @@ target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red
 # which is precisely what the gate needs — instead of refusing and deadlocking.
 # When no such marker exists the diff is genuinely unreviewed → still refuse.
 if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
+  # #1377 — initialised OUTSIDE the diff-read arm below: `set -u` makes a
+  # reference to an unset name a fatal error, and the patch arm's PREDICATE is
+  # named on the same line as the byte-identity arm, which runs even when the
+  # live diff could not be read (DIFF_HASH empty). Leaving these to be set only
+  # inside that arm aborted the whole record with rc 1 instead of reaching the
+  # guard's refusal.
+  PRIOR_PATCH_SHA=""
+  PRIOR_PATCH_NORM=""
   CURRENT_HEAD="$(command gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
   # gh api prints 4xx error bodies to stdout — only a well-formed 40-hex
   # sha counts as a successful fetch; anything else fails open.
@@ -2777,6 +2925,42 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
           echo "⚠️ #784: found prior evidence in the PR body with the right shape but a BAD SIGNATURE — ignoring it (the PR body is not a trust boundary)" >&2
         fi
       fi
+      # ── #1377 — THE PATCH ARM'S EVIDENCE ────────────────────────────────
+      # The arm above needs the prior marker's `diff=` to equal the LIVE
+      # normalized digest. A REBASE onto a moved base breaks that even when
+      # every reviewed line is identical: `main` landing work in the same file
+      # rewrites the hunk CONTEXT, and the binding keeps context (#1362 D1).
+      # This finds a VERIFIED marker at whatever head it names and hands the
+      # decision to `patch_dimension_carry`, which re-derives BOTH sides.
+      #
+      # ⛔ NOTHING IS TRUSTED FROM THE BODY HERE. The marker must HMAC-verify
+      # with the gate key (#784 — the same rule the arm above applies), and its
+      # `diff=` is then the ANCHOR the reconstructed reviewed diff must
+      # reproduce. So the bytes this arm compares are the bytes that marker was
+      # minted over, never bytes the body merely asserts.
+      if [ -n "$GATE_KEY" ]; then
+        # NEWEST FIRST: a body can carry several markers (each re-record appends
+        # one), and only the most recent describes the artifact up for merge.
+        # `awk` reversal, not `tac` — macOS does not ship `tac`.
+        PRIOR_SCAN="$(printf '%s\n' "$PRIOR_BODY" \
+          | command grep -E "^review recorded: reviews/${PR}\.json verdict=${VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(${REPO}\\) sig=[0-9a-f]{64}$" \
+          | command awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}' || true)"
+        while IFS= read -r PP_LINE; do
+          [ -n "$PP_LINE" ] || continue
+          PP_TEXT="${PP_LINE% sig=*}"
+          PP_SIG="${PP_LINE##* sig=}"
+          PP_EXPECT="$(printf '%s' "$PP_TEXT" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | command awk '{print $NF}' || true)"
+          # A forged or corrupted line is SKIPPED, not fatal: the body may carry
+          # older markers this PR's own re-records produced.
+          [ -n "$PP_EXPECT" ] && [ "$PP_SIG" = "$PP_EXPECT" ] || continue
+          PP_SHA="$(printf '%s' "$PP_TEXT" | command sed -n 's/.* @ \([0-9a-f]\{40\}\) diff=.*/\1/p')"
+          PP_NORM="$(printf '%s' "$PP_TEXT" | command sed -n 's/.* diff=\([0-9a-f]\{64\}\).*/\1/p')"
+          [ "${#PP_SHA}" -eq 40 ] && [ "${#PP_NORM}" -eq 64 ] || continue
+          PRIOR_PATCH_SHA="$PP_SHA"
+          PRIOR_PATCH_NORM="$PP_NORM"
+          break
+        done <<< "$PRIOR_SCAN"
+      fi
     fi
     # Which carry arm applies? Decided FIRST so that clause (E) can veto a carry that
     # neither arm's own conditions can see: both arms prove the LANE's artifact is
@@ -2784,6 +2968,8 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     CARRY_ARM=""
     if [ -n "$PRIOR_DIFF" ]; then
       CARRY_ARM="diff"
+    elif [ "$FORCE_STALE" -ne 1 ] && patch_dimension_carry "$PRIOR_PATCH_SHA" "$PRIOR_PATCH_NORM" "$CURRENT_HEAD"; then
+      CARRY_ARM="patch"
     elif [ "$FORCE_STALE" -ne 1 ] && lane_dimension_carry "$SHA" "$CURRENT_HEAD"; then
       CARRY_ARM="lane"
     fi
@@ -2798,6 +2984,13 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       fi
       if [ "$CARRY_ARM" = "diff" ]; then
         echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2
+      elif [ "$CARRY_ARM" = "patch" ]; then
+        # #1377 — the head moved AND the rendered diff moved, but every reviewed
+        # line is byte-identical: this is a rebase or a base move, not an edit.
+        # The review is a review OF THE DIFF, so the verdict stands and only the
+        # MECHANICAL re-record is owed. The binding is upgraded to the CURRENT
+        # head's own digest by the marker minted below — never inherited.
+        echo "#1377 patch carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff CHANGED (diff=${DIFF_HASH}) but the REVIEWED PATCH is byte-identical at both heads (verified against the prior signed marker's own diff=${PRIOR_PATCH_NORM:0:12}…; the reviewed side was ${PRIOR_PATCH_SHA:0:12}…) — a rebase/base-move, not an edit. Recording against the CURRENT head; NO new review cycle is owed" >&2
       else
         # The rendered patch moved (a base merge), but the LANE's artifact is
         # provably unchanged: the head only moved forward, no lane commit is in

@@ -11,6 +11,26 @@
 #                                    # (fork -> disk -> load), how many lanes and whether they are
 #                                    # advancing, this tree's self-test, and what it would do NEXT —
 #                                    # then ONE verdict. STATUS HEALS by default (see --no-heal).
+#                                    # It also prints the ROLE table: one MEASURED line per role
+#                                    # (controller/apply/watchdog/reminder/doctor) — RUNNING, FAILED,
+#                                    # DEAD, NEVER-INSTALLED or DANGLING, with the artefact's own last
+#                                    # error line. A unit file is never evidence that a role runs.
+#   ./scripts/harness-up roles       # the same role table, read-only (status also heals)
+#   ./scripts/harness-up heal        # RE-DRIVE what is dead: install what is missing, start what is
+#                                    # stopped, and name what it could NOT fix (exit 1 — never a
+#                                    # silent 0). Nothing is re-driven by guesswork: a role that
+#                                    # cannot be read is reported, not repaired, and a DANGLING unit
+#                                    # (its program or cwd no longer exists) is reported with the path.
+#   ./scripts/harness-up logs <role> [n]   # the role's OWN log (n lines, default 40)
+#   ./scripts/harness-up dispatch <role> [pass]  # run ONE role once, in the FOREGROUND: no session,
+#                                    # no scheduler, the role's own argv and its own output. `doctor`
+#                                    # takes a pass name (reap|doctor|merge|hygiene).
+#   The five roles, their units on each platform, and which of them has a unit at all — the table in
+#   `scripts/orchestrator-harness/README.md` §6.1 — is declared in ONE place:
+#   `harness-roles.sh`, sourced by this file. `up` INSTALLS the roles the box is configured for
+#   (`HR_ROLES`, else `$O/harness-roles.conf`, else the platform default) and REFUSES before writing
+#   anything when a role's program or working directory does not exist — the `/tmp`-cwd shape that
+#   killed a unit every ten minutes cannot be installed from here.
 #
 #   Flags: --harness <dir> --repo <agent-infra checkout> --ref <git-ref> --pin <file> --pin-dir <dir> -o <dir>
 #          --no-fetch --skip-selftest --timeout <secs> --plain [--no-heal|--heal]
@@ -113,9 +133,25 @@ usage() { # <exit-code>
 
 VERB="${HARNESS_UP_FORCED_VERB:-}"; PLAIN=0; FETCH=1; SELFTEST=1; HEAL=1
 A_HARNESS=""; A_REPO=""; A_REPO_SEEN=0; A_REF=""; A_PIN=""; A_PINDIR=""; A_O=""
+A_ROLE=""; REST_ARGS=""
 BOUND="${HARNESS_UP_TIMEOUT:-900}"
 while [ $# -gt 0 ]; do
   case "$1" in
+    heal|roles)
+        if [ -n "${HARNESS_UP_FORCED_VERB:-}" ] && [ "${HARNESS_UP_FORCED_VERB}" != "$1" ]; then
+          die "$1 refused: this entry point is $HARNESS_UP_FORCED_VERB" 2
+        fi
+        VERB="$1"; shift ;;
+    dispatch|logs)
+        if [ -n "${HARNESS_UP_FORCED_VERB:-}" ] && [ "${HARNESS_UP_FORCED_VERB}" != "$1" ]; then
+          die "$1 refused: this entry point is $HARNESS_UP_FORCED_VERB" 2
+        fi
+        VERB="$1"; shift
+        # ⛔ THE ROLE OPERAND IS NAMED HERE, NOT DISCOVERED LATER: `dispatch` with no role would
+        # otherwise dispatch nothing and exit 0 — the exact "succeeded while doing nothing" shape.
+        [ $# -ge 1 ] || die "$VERB needs a role (known: controller apply watchdog reminder doctor)" 2
+        A_ROLE="$1"; shift
+        if [ "$VERB" = dispatch ]; then REST_ARGS="$*"; set --; fi ;;
     up|down|status)
         # ⛔ THE WRAPPER'S VERB IS NOT OVERRIDABLE. `scripts/harness-down up` used to REPLACE `down`
         # with `up` — a wrapper that runs the opposite verb of its own name turns a one-keystroke
@@ -2236,6 +2272,14 @@ cmd_up() {
   fi
 
   say ""
+  say "==> roles: preflight + install (refuse before writing; idempotent)"
+  if hr_available; then
+    hr_install_roster || die "REFUSED: a role this box is configured to run could not be installed (named above) — nothing was started" 3
+  else
+    hr_missing_note
+  fi
+
+  say ""
   say "==> 4/4 components, in dependency order: $HU_COMPONENTS"
   for c in $HU_COMPONENTS; do
     # ⛔ `down` must not be undone by a partial `up`: each step is attempted, a failure stops the
@@ -2273,6 +2317,89 @@ cmd_down() {
   [ "$rc" -eq 0 ] || die "stop reported a problem (exit $rc) — read the output above" "$rc"
   say "down: ok"
   return 0
+}
+
+# ══ THE ROLE REGISTRY — installed, measured, healed, dispatched from HERE ═════════════════════════
+# WHY (the owner's night, 2026-10-25): every piece of the harness existed and each looked fine, and
+# three silent failures followed — the merge role was INSTALLED AND NEVER STARTED; a unit pointed at a
+# `/tmp` cwd DIED EVERY TEN MINUTES for as long as a reclaim stood; and `status` read "installed" as
+# if it were "ok" on three components that were dead. The five roles, their units on each platform,
+# and their MEASURED-state readers live in ONE file (`harness-roles.sh`), sourced here, so this stays
+# the entry point and there is still exactly one role registry.
+# ⛔ RESOLUTION ORDER = WHERE THE BOX ACTUALLY RUNS, first: the harness the controller executes
+# (`$HARNESS`), then the checkout beside this launcher, then `$O`. A cell runs the FARMED copy; reading
+# the checkout's instead would measure (and install) a tree the box does not run.
+# ⛔ AN ABSENT MODULE IS REPORTED, NEVER SILENTLY DEGRADED. A pre-registry `$O` (the state every
+# deployed box is in until it is re-seeded) prints one named line telling the operator to re-seed, and
+# nothing else changes — the verbs that need the registry refuse by name rather than pretending.
+HARNESS_UP_OS="${HARNESS_UP_OS:-$(hp_os)}"
+HR_MOD=""
+for _hr_d in "$HARNESS" "$SELF_PATH/orchestrator-harness" "$O"; do
+  [ -n "$_hr_d" ] || continue
+  [ -f "$_hr_d/harness-roles.sh" ] && { HR_MOD="$_hr_d/harness-roles.sh"; break; }
+done
+if [ -n "$HR_MOD" ]; then
+  # shellcheck source=/dev/null
+  . "$HR_MOD"
+fi
+declare -f hr_status >/dev/null 2>&1 || HR_MOD=""
+
+hr_available() { [ -n "${HR_MOD:-}" ]; }
+hr_missing_note() {
+  say "roles: SKIPPED (no harness-roles.sh in \$HARNESS, beside this launcher, or \$O — the ROLE registry is what installs, measures and heals them; re-seed with: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
+}
+hr_need() { # <verb>
+  hr_available && return 0
+  hr_missing_note
+  die "'$1' needs the role registry (harness-roles.sh) and it is not on this box — refusing rather than answering nothing" 2
+}
+
+# _hr_status_verb — the READ-ONLY role table (`roles`). `status` prints the same table and also heals,
+# which is why this verb exists separately: `harness-status` promises a read.
+_hr_status_verb() {
+  hr_need roles
+  say "roles (measured — a unit file is never evidence that a role runs; config: $(hr_roles))"
+  hr_status
+  return $?
+}
+
+_hr_logs_verb() { # <role> [n]
+  hr_need logs
+  hr_role_known "${1:-}" || die "logs: unknown role '${1:-}' (known: $(hr_all_roles))" 2
+  hr_logs "$1" "${2:-40}"
+  return $?
+}
+
+_hr_dispatch_verb() { # <role> [args…]
+  hr_need dispatch
+  hr_dispatch "$@"
+}
+
+# cmd_heal — re-drive what is dead. ⛔ THE EXIT CODE IS THE RE-READ, never the repair's: a start that
+# returned 0 and left the role dead is exactly the class this verb exists to end.
+cmd_heal() {
+  local rrc=0 hr_rc=0
+  hu_collect_rows
+  hu_heal
+  if [ -n "${HU_HEAL_NOTE:-}" ]; then
+    say ""
+    printf '%s\n' "$HU_HEAL_NOTE" | sed 's/^/    /'
+    case "$HU_HEAL_NOTE" in *"HEAL FAILED"*|*"NOT HEALED"*) hr_rc=1 ;; esac
+  fi
+  say ""
+  if hr_available; then
+    say "roles: re-driving what is dead (config: $(hr_roles))"
+    hr_heal || rrc=1
+  else
+    hr_missing_note
+  fi
+  say ""
+  if [ "$rrc" -eq 0 ] && [ "$hr_rc" -eq 0 ]; then
+    say "HEAL: every configured role is running, or is not applicable on this box"
+    return 0
+  fi
+  say "HEAL INCOMPLETE — see NOT HEALED above; this exit is not a pass"
+  return 1
 }
 
 # ONE row pass. ⛔ NOT IN A COMMAND SUBSTITUTION: every `hu_row*` appends to `$HU_ROWS`, so
@@ -2334,6 +2461,21 @@ cmd_status() {
     say ""
     printf '%s\n' "$HU_HEAL_NOTE" | sed 's/^/    /'
   fi
+  # ── THE ROLE TABLE (the roles the box is configured to run), MEASURED ────────────────────────
+  # ⛔ WHY THIS IS A SECOND TABLE AND NOT ONE MORE ROW. The rows above answer "is the harness
+  # dispatching, on which tree, with how much capacity". They cannot answer "would this box ever RUN
+  # the merge/apply/watchdog roles at all": a role with NO unit is invisible to every row, which is how
+  # three components read installed and were dead. This table answers that, from each role's OWN
+  # artefact, and its verdict is folded into the ONE verdict line rather than printed as a second one.
+  # A SKIPPED role (no unit on this platform) is a PASS with a reason — never OK.
+  say ""
+  if hr_available; then
+    say "roles (config: $(hr_roles)):"
+    hr_status; _role_rc=$?
+    _hu_take "$_role_rc"
+  else
+    hr_missing_note
+  fi
   say ""
   case "$ROW_VERDICT" in
     0) say "VERDICT: HEALTHY";  return 0 ;;
@@ -2354,8 +2496,12 @@ if [ -n "$HREPO_BAD" ] && [ "$VERB" != up ]; then
   warn "$HREPO_BAD — continuing, because '$VERB' reads no harness (a box with an unresolvable harness must still be stoppable)"
 fi
 case "$VERB" in
-  up)     cmd_up ;;
-  down)   cmd_down ;;
-  status) cmd_status ;;
-  *)      die "unknown verb '$VERB'" ;;
+  up)       cmd_up ;;
+  down)     cmd_down ;;
+  status)   cmd_status ;;
+  roles)    _hr_status_verb ;;
+  heal)     cmd_heal ;;
+  logs)     _hr_logs_verb "$A_ROLE" ;;
+  dispatch) _hr_dispatch_verb "$A_ROLE" $REST_ARGS ;;
+  *)        die "unknown verb '$VERB'" ;;
 esac

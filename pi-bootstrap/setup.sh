@@ -411,6 +411,13 @@ fi
 # a NEW driver beside an OLD classifier — which refuses loudly — instead of the reverse window (NEW
 # beat, OLD driver), which is SILENT because the assertion lives in the driver. The gate pins the
 # order and the presence of both (mutation-verified: reversing them, or deleting either, fails).
+# ⛔ `pr-doctor-trigger.py` SITS AFTER `pr-repair-loop.sh` FOR THE SAME ARRAY-ORDER REASON (#2700 C5).
+# The trigger is the repair unit's event-driven FRONT END: its pass is
+# `dirname($0)/pr-repair-loop.sh`, which owns every gate, the reap and the status row. An
+# interruption between the two must therefore leave the PASS present without the trigger (the
+# `REPAIR_INTERVAL_S` loop still runs, i.e. the old timer behaviour) rather than a trigger with no
+# pass — which would look like a running repair service and start nothing. Because the array is
+# copied in ORDER and `pr-repair-loop.sh` sits near the end of it, the trigger is appended AFTER it.
 # They farm FLAT for the same reason as the rest of this list (the layer resolves siblings as
 # `$SCRIPTS/<name>` at $DEST/scripts/).
 # `lane-watchdog.py`'s ONLY caller is `heartbeat-loop.sh`, and `heartbeat-loop.sh` is itself withheld
@@ -519,7 +526,7 @@ fi
 # one a cell finds) to converge the per-box review-record registry with the fleet's before lanes
 # are dispatched, and `atomic-land.sh` runs it beside itself. A cell without it boots BLIND —
 # every PR another box reviewed reads as unreviewed — which is the state #2374 measures.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -671,7 +678,12 @@ fi
 # reason fleet-health.py does: it imports that sibling classifier. It is NOT
 # invoked by the launchd job (no network read behind the TCC wall) — the farm is
 # for the operator/agent CLI.
-fleet_tools=(liveness.py lane_liveness.py claim_lanes.py fleet-health.py map-sessions.py)
+# pr_state.py (#2866): the PR STATE ROUTER — the ONE answer to "what does this PR need next, and
+# should anything be running for it right now". Farmed because the harness actors that consume it
+# (`pr-sickness.sh`, `lane-merge.sh`, via `scripts/orchestrator-harness/pr-state.sh`) live in `$O`,
+# which is NOT a checkout of this repo: without the farm the seam resolves nothing there and every
+# actor prints `router unavailable` — the wiring would exist and never run.
+fleet_tools=(liveness.py lane_liveness.py claim_lanes.py fleet-health.py map-sessions.py pr_state.py)
 mkdir -p "$DEST/scripts/fleet"
 tools_copied=0
 for base in "${fleet_tools[@]}"; do
@@ -690,7 +702,7 @@ for base in "${fleet_tools[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   tools_copied=$((tools_copied+1))
 done
-echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions, #1178/#1777)"
+echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions + pr-state, #1178/#1777/#2866)"
 
 # Migration off the deprecated location (#1277). The farm used to write
 # $DEST/tools/fleet/, one of the very paths pi's startup scan rejects — so a

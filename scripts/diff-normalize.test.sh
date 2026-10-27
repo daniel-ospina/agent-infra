@@ -218,6 +218,141 @@ SYM="$T/am-symlink.diff"; printf 'diff --git a/l b/l\nindex 1111111..2222222 120
 assert_eq "$(norm < "$SYM")" "$(printf 'diff --git a/l b/l\n--- a/l\n+++ b/l\n@@ -0,1 +0,1 @@\n-oldlink\n\\ No newline at end of file\n+newlink\n\\ No newline at end of file')" \
     "amendment (h): a symlink (120000) is an ordinary text hunk — index dropped, @@ normalized"
 
+# ══════════════════════════════════════════════════════════════════════
+# #1377 — the PATCH projection (`--patch-only`) and its TWO-DIRECTION pin.
+#
+# The projection exists so a REBASE whose reviewed change is untouched can be
+# re-recorded instead of re-reviewed. It is only sound if it is INVARIANT to
+# every rendering field a rebase rewrites AND SENSITIVE to every field a real
+# edit moves. Both halves are pinned below, and the mutation guard at the end
+# proves the negative assertions are load-bearing rather than decorative.
+# ══════════════════════════════════════════════════════════════════════
+echo "── #1377 patch projection ──────────────────────────────────────────"
+patch() { python3 "$NORM" --patch-only; }          # stdin → patch-identity stdout
+
+# (p1) A REBASE of the same change: blob ids rewritten, hunk start lines moved,
+#      and the CONTEXT around the change replaced by what the base landed.
+P1_OLD='diff --git a/f.txt b/f.txt
+index 1111111..2222222 100644
+--- a/f.txt
++++ b/f.txt
+@@ -3,4 +3,5 @@ def f():
+ context before
+-old line
++new line
+ context after
+ tail' P1_NEW='diff --git a/f.txt b/f.txt
+index 3333333..4444444 100644
+--- a/f.txt
++++ b/f.txt
+@@ -11,4 +11,5 @@ def f():
+ MAIN LANDED A DIFFERENT CONTEXT LINE
+-old line
++new line
+ another context line
+ tail'
+assert_eq "$(printf '%s' "$P1_OLD" | patch)" "$(printf '%s' "$P1_NEW" | patch)" \
+    "(p1) a REBASE (new blob ids, moved line numbers, moved CONTEXT) projects IDENTICALLY"
+assert_ne "$(printf '%s' "$P1_OLD" | norm)" "$(printf '%s' "$P1_NEW" | norm)" \
+    "(p1) …and it is the BINDING projection that moves — so a patch match is the ONLY thing that can carry it"
+
+# (p2) A ONE-LINE CONTENT change: the acceptance path must not swallow it.
+P2_NEW="$(printf '%s' "$P1_NEW" | sed 's/^+new line$/+new line CHANGED/')"
+assert_ne "$(printf '%s' "$P1_OLD" | patch)" "$(printf '%s' "$P2_NEW" | patch)" \
+    "(p2) a ONE-LINE content change projects DIFFERENTLY — it must refuse"
+
+# (p3) THE ANTI-`git patch-id --stable` PIN. `--stable` ignores all whitespace, so
+#      under it this edit would be identical to its parent and carry a verdict it
+#      does not deserve (#1362 D1). The projection is BYTE-EXACT.
+P3_NEW="$(printf '%s' "$P1_NEW" | sed 's/^-old line$/-  old line/')"
+assert_ne "$(printf '%s' "$P1_OLD" | patch)" "$(printf '%s' "$P3_NEW" | patch)" \
+    "(p3) a WHITESPACE-ONLY change projects DIFFERENTLY (the git patch-id --stable hole stays closed)"
+
+# (p4) SAME changed lines, MOVED TO ANOTHER PATH. `git patch-id` does not commit
+#      to the path; the projection does.
+P4_NEW="$(printf '%s' "$P1_NEW" | sed 's#a/f\.txt b/f\.txt#a/other\.txt b/other\.txt#; s#--- a/f\.txt#--- a/other.txt#; s#+++ b/f\.txt#+++ b/other.txt#')"
+assert_ne "$(printf '%s' "$P1_OLD" | patch)" "$(printf '%s' "$P4_NEW" | patch)" \
+    "(p4) the same changed lines at a DIFFERENT PATH project DIFFERENTLY (the path is part of the identity)"
+
+# (p5) A BINARY entry has no hunk, so NOTHING is dropped — its `index` line is the
+#      content, and two different binaries must never collide.
+B1='diff --git a/x.bin b/x.bin
+index da6639b..382c7b7 100644
+Binary files a/x.bin and b/x.bin differ'
+B2='diff --git a/x.bin b/x.bin
+index da6639b..9999999 100644
+Binary files a/x.bin and b/x.bin differ'
+assert_eq "$(printf '%s' "$B1" | patch)" "$(printf '%s' "$B1")" \
+    "(p5) a hunk-less entry is emitted VERBATIM by the projection"
+assert_ne "$(printf '%s' "$B1" | patch)" "$(printf '%s' "$B2" | patch)" \
+    "(p5) two different binaries project DIFFERENTLY (no hunk ⇒ nothing dropped)"
+
+# (p6) A RENAME keeps its similarity/rename lines: they ARE the change.
+R1='diff --git a/a.txt b/a.txt
+similarity index 100%
+rename from a.txt
+rename to a.txt'
+R2='diff --git a/a.txt b/b.txt
+similarity index 100%
+rename from a.txt
+rename to b.txt'
+assert_ne "$(printf '%s' "$R1" | patch)" "$(printf '%s' "$R2" | patch)" \
+    "(p6) a rename target change projects DIFFERENTLY"
+
+# (p7) The unknown-flag arm refuses LOUDLY rather than emitting the wrong
+#      projection: a caller that asked for the patch identity and got the binding
+#      would compare unlike digests and refuse a legitimate carry forever.
+set +e
+P7_OUT="$(printf '%s' "$P1_OLD" | python3 "$NORM" --binding-only 2>/dev/null)"; P7_RC=$?
+set -e
+[ "$P7_RC" -eq 2 ] && ok "(p7) an unknown projection flag exits 2" || bad "(p7) unknown flag exit was $P7_RC, want 2"
+[ -z "$P7_OUT" ] && ok "(p7) …and writes NOTHING to stdout, so no wrong digest can be consumed" || bad "(p7) unknown flag still wrote: $P7_OUT"
+
+# (p8) MUTATION: if the projection stopped dropping CONTEXT (i.e. it degenerated
+#      back to the binding), the acceptance vector (p1) MUST redden. This is the
+#      guard that stops (p1) from passing for the wrong reason.
+MUT="$T/dn-mut-context-kept.py"
+python3 - "$NORM" "$MUT" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+needle = '        if line.startswith(" "):\n'
+assert needle in src, "mutation needle not found — the projection changed shape"
+# Delete the two-line context-dropping branch, keeping the branch body reachable
+# by turning it into a no-op append of the SAME line.
+mutated = src.replace(needle + '            # CONTEXT. The only field here that a BASE MOVE rewrites without the\n            # reviewed change moving — dropped for the patch identity alone.\n            continue\n', '        pass\n', 1)
+assert mutated != src, "mutation did not change the file"
+open(sys.argv[2], "w", encoding="utf-8").write(mutated)
+PY
+if [ -f "$MUT" ]; then
+    M1="$(printf '%s' "$P1_OLD" | python3 "$MUT" --patch-only | sha)"
+    M2="$(printf '%s' "$P1_NEW" | python3 "$MUT" --patch-only | sha)"
+    [ "$M1" != "$M2" ] && ok "(p8) MUTATION: keeping context reddens the acceptance vector — (p1) is load-bearing" \
+        || bad "(p8) MUTATION SURVIVED: the mutant still accepts (p1), so that assertion proves nothing"
+else
+    bad "(p8) could not build the context-keeping mutant"
+fi
+
+# (p9) MUTATION: if the projection stopped keeping the `+`/`-` CHANGED lines, the
+#      refusal vector (p2) MUST redden.
+MUT2="$T/dn-mut-changed-dropped.py"
+python3 - "$NORM" "$MUT2" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+needle = '        out.append(line)\n    return out\n\n\ndef _normalize_entry'
+assert needle in src, "mutation needle not found"
+mutated = src.replace(needle, '        if line[:1] in ("+", "-"):\n            continue\n        out.append(line)\n    return out\n\n\ndef _normalize_entry', 1)
+assert mutated != src, "mutation did not change the file"
+open(sys.argv[2], "w", encoding="utf-8").write(mutated)
+PY
+if [ -f "$MUT2" ]; then
+    M1="$(printf '%s' "$P1_OLD" | python3 "$MUT2" --patch-only | sha)"
+    M2="$(printf '%s' "$P2_NEW" | python3 "$MUT2" --patch-only | sha)"
+    [ "$M1" = "$M2" ] && ok "(p9) MUTATION: dropping the changed lines collapses the refusal — (p2) is load-bearing" \
+        || bad "(p9) mutation did not collapse the pair, so (p2) may pass vacuously"
+else
+    bad "(p9) could not build the changed-lines-dropped mutant"
+fi
+
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

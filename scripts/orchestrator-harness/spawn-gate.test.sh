@@ -56,7 +56,10 @@ done
 # `run_agent` undefined and a 127 at the SPAWN SITE — would ship green. So drive it: copy each caller
 # into a scratch dir with NO helper beside it and require the loud, non-zero refusal.
 NX="$TMP/nogate"; mkdir -p "$NX/O/logs"
-cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$NX/"
+# ⛔ gate-policy.sh IS COPIED DELIBERATELY (agent-infra#2319): fix-one.sh now sources it, and this rig
+# exists to prove a MISSING spawn-gate.sh refuses — not to prove a missing policy refuses. Without it
+# here the rig would pass for the wrong reason (rc=78 from the policy, with the right-looking message).
+cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$HERE/gate-policy.sh" "$NX/"
 out="$( ( cd "$NX" && O="$NX/O" bash "$NX/lane.sh" 9999 work daniel-ospina/agent-infra ) 2>&1 )"; nrc=$?
 # A here-string, NOT `printf | grep -q`: `grep -q` exits on first match, `printf` takes SIGPIPE, and
 # under `pipefail` the pipeline returns 141 — so the idiom reads as "no match" ON A MATCH, which is
@@ -124,11 +127,17 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # assert the opposite of the truth, that a census of launch paths contains a file with none.
   # The exclusion hides nothing: the assertion below the censuses requires that file to carry no
   # spawn primitive at all, so a future launch path added to it comes back into the census.
+  # ⛔ `ai-drainer.sh` IS THE SAME CLASS, AND IT LANDED AFTER THIS CENSUS (#2639/#2799). It launches
+  # nothing itself — it DISPATCHES the gated dispatchers (`nonblocking-dispatch.sh`/`bg-dispatch.sh`,
+  # which route through `run_agent`) — but its prose quotes `pi -p --no-session` when explaining why
+  # `LANE_MEM_MB` is 512, so the token pair matches. That made this shard RED on `main` for every PR
+  # that rebased onto it (found while rebasing #2323: `got_pi` carried `ai-drainer.sh`). Excluded by
+  # name, with its own non-launcher assertion below — the same ruling, not a second exception class.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -187,6 +196,13 @@ ck "lane-exec.sh EXECs pi (no wrapper survives the turn)" $rc
 # the path comes out of the exclusion list above.
 if grep -qE 'subprocess|Popen|os\.system|os\.exec|os\.spawn|os\.fork|popen' "$HERE/pi-done-not-exited.py" 2>/dev/null; then rc=1; else rc=0; fi
 ck "the excluded pi-done-not-exited.py is a NON-launcher (carries no spawn primitive), so its census exclusion hides no launch path" $rc
+# …and the same proof for ai-drainer.sh, stated as the detector's own predicate: strip the `#`-comments
+# and the token PAIR is gone, so what matched was prose. A real launch added to that file (in code)
+# puts the pair back and this arm goes RED — the exclusion cannot swallow one.
+_nl_flag='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
+_nl_code="$(sed 's/#.*//' "$HERE/ai-drainer.sh" 2>/dev/null)"
+if printf '%s' "$_nl_code" | grep -qE -e "$_nl_flag" && printf '%s' "$_nl_code" | grep -qF -- '--no-session'; then rc=1; else rc=0; fi
+ck "the excluded ai-drainer.sh is a NON-launcher in CODE (it only DISPATCHES gated dispatchers; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -628,7 +644,7 @@ ck "fix-one.sh NAMES the load gate on a load refusal — the disk wording is not
 # The fixture is derived FROM THE SHIPPED HELPER (only the constant's definition is removed), so it
 # tracks the file under test instead of re-implementing a pre-fix helper by hand.
 mkdir -p "$RIG/stale"
-cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RIG/stale/"
+cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/gate-policy.sh" "$RIG/stale/"
 # ⛔ THE VALIDATOR TRAVELS WITH THE STALE HELPER, AND THAT IS NOT A WEAKENING (#2258). What is stale
 # here is `spawn-gate.sh`'s refusal CONSTANTS, not the brief rules: a fixture that omitted
 # `brief-gate.sh` would make fix-one.sh exit 78 (cannot verify) and this arm would read "78" as the
@@ -956,7 +972,26 @@ export -f pi
 # ⛔ AND THE IDENTITY MODULE GOES WITH THEM (#2762/#2694): adopt-fix.sh and fix-one.sh source
 # `$SELF/repo-target.sh` (and it sources repo-slug.sh), so a copy without them exits 78 — a
 # half-deployed box — instead of reaching the claim refusal this arm is about.
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RO/"
+# ⛔ AND EVERY MODULE THE FIXER HARD-REQUIRES, NOT JUST THE TWO THE ARM IS ABOUT (review, P1).
+# `fix-one.sh` `exit 78`s without each of spawn-gate.sh (L54), brief-gate.sh (L62, resolved from
+# `$SELF` here, because spawn-gate.sh's `brief_gate_lib` prefers the script's OWN directory),
+# repo-target.sh (L69) and gate-policy.sh (L73). This rig seeded only four of the five, so the arm
+# returned 78 — a HALF-DEPLOYED BOX — and its assertions read as "the cross-box refusal is broken"
+# when the refusal was never reached (measured: `got 78`, on this tree and in CI). The two modules
+# this comment once left to luck are copied explicitly; the fallbacks `brief_gate_lib` also consults
+# (`$AGENT_INFRA_PATH`, `~/.pi/agent/scripts`) are NOT relied on, so the arm cannot pass on a dev box
+# and fail on a runner whose HOME has no harness scripts (same class as round 3's HOME fix).
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/brief-gate.sh" "$HERE/gate-policy.sh" \
+   "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$RO/"
+# …and the arm must not be satisfiable by a rig that never reached the claim block: assert the
+# modules it needs are actually in $RO, so a future edit that drops one fails HERE, naming the
+# missing file, instead of resurfacing as a bogus 78 two assertions later.
+_rigmiss=""
+for _m in fix-one.sh spawn-gate.sh brief-gate.sh gate-policy.sh repo-target.sh repo-slug.sh; do
+  [ -f "$RO/$_m" ] || { echo "❌ the §9 rig is missing $_m in \$RO — the cross-box arm below would exit 78 before its refusal"; _rigmiss="$_m"; }
+done
+[ -z "$_rigmiss" ]; rc=$?
+ck "the §9 rig carries every module fix-one.sh hard-requires (a rig missing one asserts a HALF-DEPLOYED refusal, not the claim refusal)" $rc
 printf '#!/bin/sh\nclaim_acquire() { CLAIM_RESULT="another box owns this head (test stub)"; return 1; }\n' > "$RO/claims.sh"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; rm -f "$RO/state/fixbail-7-"*
 ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
@@ -977,7 +1012,7 @@ unset -f gh; unset 'BASH_FUNC_gh%%'
 # ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$RO/"
 # …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
 # `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
 # of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.

@@ -143,9 +143,14 @@ bash "$bg_lib" --check "$PROMPT" worker || {
 LOG="$D/$NAME.log"; RC="$D/$NAME.rc"; PIDF="$D/$NAME.pid"; STAMP="$D/$NAME.started"
 CAPF="$D/$NAME.cap"   # written by the worker below when the wall-clock cap fired (#2045)
 rm -f "$CAPF"
-# The worker is a fleet lane in every respect except that nobody waits for it: the local review/VGATE
-# gates are bypassed so the PARENT owns the review ceremony, and no MCP servers are started.
-export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
+# The worker is a fleet lane in every respect except that nobody waits for it. ⛔ THE GATE DECISION
+# IS MEASURED (agent-infra#2319) — this used to bypass review + VGATE unconditionally; see lane.sh.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF/gate-policy.sh" 2>/dev/null || { echo "nonblocking-dispatch.sh: FATAL: $SELF/gate-policy.sh missing — refusing to start a worker that cannot say whether its gates are on" >&2; exit 78; }
+apply_gate_policy nonblocking-dispatch
+# ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
+# checkout, not a review bypass, and #2319 does not rule on it.
+export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 \
        SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
@@ -215,6 +220,5 @@ echo "launched $NAME  pid=$PID  branch=$(git branch --show-current 2>/dev/null) 
 echo "  log:     $LOG"
 echo "  status:  bash $0 --status $NAME"
 echo "  worktree: $WT"
-echo "NOTE: nothing reviews this worker's PR — AGENT_SKIP_REVIEW_GATE=1 is exported above, so the"
-echo "      PARENT owns the review gate. Hand the PR to the chain when it appears:"
+echo "NOTE: the review gate for this worker's PR is the PARENT's — gates=$GP_MODE ($([ "$GP_MODE" = enforced ] && echo 'enforced by the lane itself' || echo 'bypassed and audited under #2319')). Hand the PR to the chain when it appears:"
 echo "  chain:   bash $HARNESS/chain-merge.sh <repo-path> <owner/repo> <issue> <branch>"

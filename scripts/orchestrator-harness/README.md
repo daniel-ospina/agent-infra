@@ -211,6 +211,7 @@ means it runs once" is wrong (research: agent-infra#1709).
 | `worker-terminal.sh` | the ONE place a worker is launched, asked whether it is alive, counted and killed (`orch-loop.sh` / `dispatch-merge.sh` both source it). Without it a lane is a tmux window that dies at ~21 log lines (§2.1) |
 | `capacity.sh` | R8's other half: MEASURED cross-box placement — load-per-core, lanes, disk and memory per box on the shared origin, so the next lane goes to the least-loaded ELIGIBLE box instead of to whichever controller asked first (§9) |
 | `claim-reaper.sh` | R4's release half: a claim is released only when its holder is demonstrably GONE — 7 stale refs on a box with 0 live lanes made the fleet originate nothing (§7.2b, measured 2026-10-21) |
+| `lane-container-reap.sh` | the leaked test-DB reaper (#2868): removes a lane's private `fdb-lane-*` / `*-pg` / `*-fdb` / `falkordb-6673-*` / `tortoise-ci-*` container ONLY when the owning lane is provably gone — the slug is absent from `git worktree list` (or the PR has no `refs/claims/` snapshot), no live process holds the name, AND the container is past the age bound. **Dry run by default** (`--apply` arms it); all three proofs must hold, and an unreadable `docker ps`/`ps` aborts the whole pass (exit 3, `CANNOT-VERIFY`) rather than reaping blind. Shared instances (`falkordb`, …) are protected by name and never candidates. Its test suite is a mutation suite: every deletion gate reddens when reverted |
 | `live-ownership.sh` | R2/R3's predicate as a live fact: "owned" means a LIVE PROCESS is working the PR, not that a registry says so; it supplies the sweep order and the un-owned count (§7.2f) |
 | `merged-not-closed.sh` | the question no other tool could answer — which OPEN issues already have a MERGED PR (tortoise#8468). Without it, finished work sits in the priority queue looking untouched |
 | `cycle-record.sh` | the self-dispatch proof: one record per controller cycle, and a verdict that refuses to call an absent or stale record healthy (§9) |
@@ -518,6 +519,7 @@ git command fail on a lock the rescue took), and it calls a backup
 `task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
 PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
 never handed to the chain is unreviewed code by default.
+
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
 (`install.sh:533-541`) and `$O/gh-limit.py` (`:550-558`); everything else is the operator's `cp`, §4 step 1.
@@ -1472,10 +1474,11 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
 This harness passes **attacker-controlled text** to language-model agents with shell access. Be
 clear about what is and is not enforced:
 
-- **Not sandboxed.** The spawned reviewer and fixer run with `AGENT_SKIP_REVIEW_GATE=1`,
-  `ELDATO_SKIP_VGATE=1`, `AGENT_ALLOW_MAIN_EDITS=1`, `SKILL_ENFORCER_DISABLED=1` and
-  `LOOP_ENFORCER_DISABLED=1`, with `bash` and `gh` on `PATH`. "Do NOT merge" and "do not touch the
-  main checkout" are **prompt instructions, not controls**.
+- **Not sandboxed.** The spawned reviewer and fixer run with `AGENT_ALLOW_MAIN_EDITS=1`,
+  `SKILL_ENFORCER_DISABLED=1` and `LOOP_ENFORCER_DISABLED=1`, with `bash` and `gh` on `PATH`.
+  Whether `AGENT_SKIP_REVIEW_GATE`/`ELDATO_SKIP_VGATE` are also set is DECIDED AT STARTUP by
+  `gate-policy.sh` (§5.4) and recorded in `logs/gate-policy.jsonl` — never assumed. "Do NOT merge"
+  and "do not touch the main checkout" are **prompt instructions, not controls**.
 - **Prompt injection is possible.** `fix-one.sh` reads the PR's comments into the fixer prompt as
   the authoritative review, and `merge-one.sh` feeds the reviewer the PR title, body and diff. A
   malicious PR body can therefore attempt to steer an agent that has shell access.
@@ -1495,6 +1498,75 @@ clear about what is and is not enforced:
   merge-scoped token during review, and treating PR content as delimited data rather than
   instructions. Until then, run this on a box whose GitHub token you would accept being used by an
   agent that has read a hostile PR body.
+
+### 5.4 The gate decision is MEASURED: `gate-policy.sh` (agent-infra#2319)
+
+Five carriers (`orch-loop.sh`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`)
+used to `export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` unconditionally. The canon calls both
+flags emergency-only (`skills/commit-workflow/SKILL.md:102,:111`) and a lane collected without review
+is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:150`), so a permanent export was
+a **defect**, and dangerous in one direction only: the permissive side was the machine that lands the
+most work.
+
+It could not be deleted in one line, because a lane **cannot** satisfy the review gate by itself —
+`lane.sh` says so to the lane's face: it has no `task` tool, so the parent/harness must obtain the
+head-bound review. So the decision moved into ONE probe:
+
+| probe | asked | today |
+|---|---|---|
+| review | is there a recorder for the head-bound record **and** a seam a non-interactive lane can call to obtain it? | **satisfiable.** `record-review.sh` yes, `review-pr.sh` (#2288, landed 9b80ee4c) yes — `--probe` on this checkout prints `review_satisfiable=1` (pinned by `gate-policy.test.sh` "live-tree") |
+| VGATE | can a non-interactive session record verification where the gate reads it? | **not satisfiable.** no `record` verb, no lane-satisfiable acceptance (#2313) — so the bypass below is still ACTIVE, on the VGATE half alone |
+
+- **Both satisfiable** → nothing is exported, and any INHERITED skip flag is removed from the carrier's
+  environment (a daemon captures its environment once; that is how a stale hatch outlives its reason).
+- **Either missing** → the two flags ARE exported, and **one** audit line naming #2319, the carrier and
+  the missing component is appended to `logs/gate-policy.jsonl`.
+
+⛔ **The `today` column above is MEASURED, not remembered (review round 6).** It once said `review-pr.sh`
+was missing while the file had already been in this tree for weeks — so a reader diagnosing "why is the
+bypass still on" was pointed at a component that had shipped. `gate-policy.test.sh`'s "live-tree" arm now
+probes THIS checkout and asserts the pair the table states, so the table cannot drift again: **when either
+half flips, that arm goes RED until the doc changes with it.** The bypass today is carried by the VGATE
+half alone — that is the sequencing #2319 asks for, and the reason nothing fleet-stopping follows from the
+review half being satisfied.
+
+⛔ There is no third state: `gate-policy.test.sh` fails if any live carrier exports either flag
+outside the policy, so a silent reintroduction is RED. When the satisfier merges, the probe flips and
+the bypass ends — **no second change and no forgotten flip**. This is the sequencing #2319 asks for:
+the removals are wired, but they take effect when the gate path can satisfy them, because deleting
+them first stops every lane at its first push.
+
+### 5.5 The pin's cleanliness is ONE predicate: `pin_dirty` (agent-infra#2271 review)
+
+Four readers ask "is the pinned harness dir the bytes the commit carries": the runtime resolver
+(`scripts/harness-exec.sh`), the cell supervisor's DRIFT check, its provenance stamp, and the
+installer's. For one review round three of them asked a **weaker** question than the resolver did, so
+`check` reported a pin CLEAN that `harness-exec.sh` refused — and `apply` then took
+`HARNESS_APPLIED=unchanged` over the very tree the controller would not start. An instrument that
+certifies the state it exists to catch is worse than no instrument.
+
+`pin_dirty` in `scripts/lib/box.sh` is the single answer: `0` clean, `1` dirty (entries printed), `2`
+**cannot verify** (`git status` itself failed — never a pass). It reads
+`git status --porcelain --ignored=matching`, because a **gitignored** file cannot be committed and is
+therefore never part of the pin — and `tmp/`, `dist/` and `*.log` are all ignored here, so a local
+hotfix sat inside the pin and `--entry tmp/x.sh` passed every check. It also **tolerates** the
+`.DS_Store` / `._*` REGULAR droppings, reusing the ruling the pin-root guard already made: one Finder
+visit must not brick a cell, and bash cannot execute a `.DS_Store`. Two conditions keep that tolerance
+honest, and both were review findings: entries are resolved against the repository **toplevel**
+(porcelain prints top-relative paths even when the caller passes the harness subdir — the production
+convention — so resolving against `$repo` made the tolerance unreachable exactly where it is needed),
+and only **untracked/ignored** entries are tolerated (a tracked file named `._x` is part of the pin, so
+a modification to it must read DIRTY: the name is not the property).
+
+The supervisor and the installer are deployed standalone and cannot source a sibling library, so they
+carry the body as a **pinned mirror** — compared byte-for-byte, comments excluded, by
+`cloud-cell-supervisor.test.sh` §(p3), which then RUNS the mirror against a clean pin, a gitignored
+hotfix and a `.DS_Store`. **Known residual (P2):** the probe's bars are *shape* checks (executable,
+non-empty, parseable, with a real `record)` dispatch arm), so a satisfier that exists but does nothing
+satisfies them. A capability sentinel (`review-pr.sh --capability`) belongs to #2288/#2313 — the
+scripts that do not exist yet — and inventing its interface here would make the flip unreachable
+rather than safer. Until then the failure direction is **loud**: enforced gates with a broken
+satisfier stop lanes visibly, where a bypass lands unreviewed code silently.
 
 ---
 
@@ -1647,6 +1719,137 @@ ancestor at any depth, or an unresolvable/looping symlink — and when no candid
 all. A path is not failed for being a path main does not carry; it is failed for the bytes in it.
 `harness-status` runs it as its fifth row, so every status call is also a divergence check.
 
+### 6.1 The roles — the component table, and the ONE command that installs them
+
+`harness-up` could START a box and could not SET ONE UP. The install half lived in three other places
+(`cloud-cell-bringup.sh` on a cell, `pi-bootstrap/setup.sh` on a Mac, and a hand-run installer per
+component), so the launcher's own answer to "is this box up?" was only true about a box somebody had
+already installed by hand. Measured on 2026-10-25, in one night, three ways:
+
+* **the merge role was INSTALLED AND NEVER STARTED.** `cloud-cell-doctor.sh` owns the reap / doctor /
+  merge / hygiene passes; `cloud-cell-supervisor.sh start` opens its session. Nothing anywhere said
+  "the merge role has never run", so the box looked installed and the queue did not move.
+* **a unit pointed at a `/tmp` cwd DIED EVERY TEN MINUTES** for as long as a reclaim stood. The
+  installers that remember to check the path (`install-repair-service.sh` refuses the #2697
+  lane-scratch shape) cannot help a unit installed EARLIER, when the path existed — nothing re-read an
+  installed unit's own `ExecStart`/`WorkingDirectory`.
+* **`status` read "installed" as if it were "ok"** on three components that were dead. A unit file, a
+  loaded plist and a session name are all permissions to run, never evidence that anything ran.
+
+So the roles are now declared in **one place**, `scripts/orchestrator-harness/harness-roles.sh`
+(sourced by `scripts/harness-up` — still the only entry point), and `up` installs before it starts.
+
+#### One command, both platforms
+
+```bash
+# from an agent-infra checkout — the SAME command on a cell and on a Mac:
+scripts/harness-up up        # preflight -> install the roles this box is configured for -> start
+scripts/harness-up status    # the component rows + the ROLE rows, ONE verdict (heals by default)
+scripts/harness-up roles     # the role rows only — a pure READ (status also heals)
+scripts/harness-up heal      # re-drive what is dead; NOT HEALED names what it could not fix (exit 1)
+scripts/harness-up logs <role> [n]        # the role's OWN log
+scripts/harness-up dispatch <role> [pass] # run ONE role once, in the FOREGROUND
+```
+
+Linux → **systemd** (system scope via passwordless sudo, else `systemctl --user`); macOS → **launchd**
+(`~/Library/LaunchAgents`). One detection path (`hr_platform`), no GNU-only flags, no `timeout`
+(macOS has none). `up` is idempotent: a role already RUNNING is left alone and its installer is not
+re-run (re-running one can cycle a live unit).
+
+The roster is the box's own configuration — `HR_ROLES`, else `$O/harness-roles.conf` (one role per
+line, `#` comments), else the platform default (`controller apply watchdog reminder`, plus `doctor`
+on a cell). A name outside the registry is an ERROR, not a silent no-op: a typo must not leave a role
+the operator believes is up with nothing watching it.
+
+| verb | what it GUARANTEES | what it will NOT do |
+|---|---|---|
+| `up` | every configured role is preflighted **before anything is written**; each missing unit is installed idempotently; the component stack starts in dependency order; the run ends with the measured state | it will not install a role whose program or working directory is missing (refuses, writes nothing); will not run `cloud-cell-bringup.sh` (provisioning, not convergence); will not run `install-launchd.sh` (it renders EVERY plist); will not re-install a role that is already running |
+| `status` | one line per role with its MEASURED state and the artefact's own last error line, folded into the ONE verdict | it does not believe a unit file, a loaded plist or a session name; it does not heal a DUPLICATE or cycle a live-but-LATE role |
+| `roles` | the same table, read-only | — |
+| `heal` | installs what is missing, starts what is stopped, and the verdict is the **re-read** | it will not restart a DANGLING unit (the target is gone — restarting cannot work), will not repair a role it could not measure, and exits non-zero when anything remains |
+| `logs` | the role's own log, tailed | it reports NO LOG as a state, never as an empty healthy one |
+| `dispatch` | ONE role, once, foreground, the role's own argv and output | no session, no scheduler, no retry |
+
+#### The roles
+
+Declared once, in `harness-roles.sh`. `doctor` is a pass-set, not a unit: it takes a pass name
+(`reap|doctor|merge|hygiene`).
+
+| role | program | Linux unit | macOS unit | the state is read from |
+|---|---|---|---|---|
+| `controller` | `orch-loop.sh` | `eldato-orchestrator.service` (`Restart=always`) | `com.eldato.orchestrator-loop` | the unit's live state + the unit's own journal line, then `$O/heartbeat` age |
+| `apply` | `harness-apply-pass.sh` | `eldato-harness-apply.timer` | `com.eldato.harness-apply` | the timer/job state + `$HARNESS_APPLY_STATE_DIR/harness-apply.status` |
+| `watchdog` | `watchdog-loop.sh` | `eldato-controller-watchdog.timer` | `com.eldato.controller-watchdog` | the timer/job state, and a periodic job's **last exit status** (0 = fine between ticks) |
+| `reminder` | `objective-reminder.sh` | `eldato-objective-reminder.timer` | `com.eldato.objective-reminder` | the same |
+| `doctor` | `cloud-cell-doctor.sh` | a tmux session (no unit of its own) | **none — no macOS unit exists** | `$O/state/roles/*` (`last_pass_epoch` / `last_rc` / `last_result`) + the session → `NEVER-STARTED` when not one pass ever completed |
+
+**Eight states, and they are deliberately not one word:** `RUNNING`; `FAILED` (with the artefact's own
+last error line); `DEAD` (installed and not running); `NEVER-INSTALLED` (nothing on this box would ever
+run it); `NEVER-STARTED` (the doctor's own case — installed, and no pass ever completed); `DANGLING`
+(installed, and the program or directory it execs no longer exists — the `/tmp`-cwd class, whose remedy
+is to re-point rather than to restart); `SKIPPED` (not applicable here, always with a reason, never
+rendered as RUNNING); and `UNKNOWN` (the read could not be taken — never a pass).
+
+#### The components — what each is, and which one is current
+
+Every entry point this directory's consolidation carried, classified against the code at this head.
+"Status" says which one is CURRENT, which is SUPERSEDED, and which was NEVER STARTED anywhere.
+
+| component | purpose | installed / started today | Linux unit | macOS unit | status |
+|---|---|---|---|---|---|
+| `scripts/harness-up` (+ `harness-status`, `harness-down`) | THE entry point: preflight/install the roles, start the stack in dependency order, status/heal/logs/dispatch | run by hand (neither starter calls it) | n/a | n/a | **current** — extended here: `up` installs, and `roles`/`heal`/`logs`/`dispatch` are new |
+| `scripts/orchestrator-bringup.sh` + `scripts/lib/fleet-inventory.sh` | the fleet inventory and the platform START verbs; the `(machine, repo)` duplicate guard | called BY `harness-up` | n/a | n/a | current — owns starting, not installing |
+| `scripts/orchestrator-harness/orch-loop.sh` | the controller | `harness-up up` → bringup → the platform's unit | `eldato-orchestrator.service` | `com.eldato.orchestrator-loop` | current |
+| `scripts/cloud-cell-supervisor.sh` | cell supervisor: pin/seed, controller verb, doctor session, prune/hygiene | its `start` IS the systemd unit's `ExecStart`; `stop` stops the unit | via that unit | **refuses on Darwin** | current, with one SUPERSEDED shape: the controller's **tmux session** is gone by design (#2402 — a tmux session has nothing above it and died with the last one). It still owns the DOCTOR session and is the fallback when no unit is enabled |
+| `scripts/orchestrator-harness/cloud-cell-doctor.sh` | the repair/land/reap/hygiene passes and their own per-role status | `cloud-cell-supervisor.sh start` opens the `cell-doctor` session | no unit of its own (a session) | **NONE — never started on any Mac** | current on a cell; the Mac gap is now REPORTED (`harness-up status` prints its role row) instead of invisible |
+| `scripts/install-cell-timers.sh` | renders + enables the reminder and watchdog timers | `cloud-cell-bringup.sh`; `harness-up up` (roles `watchdog`, `reminder`) | `eldato-objective-reminder.timer`, `eldato-controller-watchdog.timer` | **REFUSES (Darwin)** — the macOS pair is `templates/launchd/` via `install-launchd.sh` | current (Linux) |
+| `scripts/install-controller-service.sh` | the controller's systemd unit | `cloud-cell-bringup.sh`; `harness-up up` (role `controller`) | `eldato-orchestrator.service` | **REFUSES on Darwin** (a Mac's controller is launchd) | current |
+| `scripts/orchestrator-harness/install.sh` | renders/installs/starts the launchd agent (and enforces the pin records) | `harness-up up` (role `controller`, macOS); by hand | **REFUSES off Darwin** | `com.eldato.orchestrator-loop` | current (macOS) |
+| `scripts/install-harness-apply-timer.sh` | the harness-apply clock (converge this box on `origin/main`) | `cloud-cell-bringup.sh` on a cell; **NOTHING on a Mac** — `setup.sh` installs only `install-launchd.sh` | `eldato-harness-apply.timer` | `com.eldato.harness-apply` | current — ONE installer, both platforms; **never installed by the Mac starter**, which is why `apply` reads `NEVER-INSTALLED` on a Mac until `harness-up up` |
+| `scripts/install-launchd.sh` | renders EVERY `templates/launchd/*.plist` | `pi-bootstrap/setup.sh` on every Darwin box | — | ~19 jobs (watchdog, reminder, reapers, drainer, canary…) | current — but it installs the WHOLE set, so it is not a per-role installer and `up` will not run it (it says so) |
+| `scripts/install-repair-service.sh` | the pr-repair loop's unit | by hand / provisioning | `eldato-pr-repair.service` | **REFUSES (Linux only)** | current — and the ONE installer that already refuses the lane-scratch `/tmp` shape (#2697); the launcher now refuses that shape for every role |
+| `scripts/merge-queue.py` | the DRAIN line for the heartbeat (open PRs vs merged-today, and which lane is on it) | runs INSIDE `orchestrator-heartbeat.sh` | no unit of its own | no unit of its own | current — but it is **not a merge-queue runner**, despite the name: landings are performed by `cloud-cell-doctor.sh merge` (cell) and `orch-loop.sh`'s own sweep (Mac) |
+| `scripts/orchestrator-harness/claims.sh` | cross-box claim registry — a **LIBRARY** (sourced by the controller and the lanes) | sourced; the registry itself is DATA on the remote (`refs/claims/*`) | none needed | none needed | current (not a service: `up` never installs it) |
+| `scripts/orchestrator-harness/capacity.sh` | measured placement — a **LIBRARY** plus a `probe` CLI | sourced per dispatch | none needed | none needed | current |
+| `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch and before every push | none needed | none needed | current |
+| `scripts/orchestrator-harness/disk-floor.sh` | the pre-dispatch disk floor — a **LIBRARY** | sourced by the controller | none needed | none needed | current |
+| `scripts/deploy-mac-orchestrator.sh` | copies the harness into `$O` and stamps the commit | by hand (§4 step 1) | — | — | current for the DEPLOY; ACTIVATION is `install.sh --start` / `harness-up up` |
+| `scripts/cloud-cell-bringup.sh` | full cell PROVISIONING (clone, keys, farm, units) | by hand, once per cell | installs several units | — | current — provisioning is not convergence: `up` does not run it |
+| `pi-bootstrap/setup.sh` (+ `SETUP-NEW-MACHINE.md`) | the Mac starter: config farm + `install-launchd.sh` | by hand, once per Mac | — | `install-launchd.sh`'s set | current for CONFIG; **incomplete for the harness** — it installs no controller and no apply timer, and `SETUP-NEW-MACHINE.md` described it only as "the scheduled jobs", which is why this went unnoticed |
+| `pi-bootstrap/cell-install.sh` | the cell starter: farms scripts/keys/shims into the layer | by hand, once per cell | — | — | current |
+
+#### What self-heals, and what does not
+
+`heal` (and `status`, which heals by default) re-drives **two kinds of thing, both of them safe while
+lanes are working**:
+
+1. **A role that is not running** — it installs what is missing, then starts it, then RE-READS the
+   state. The exit code is the re-read, never the installer's, because a start that returns 0 and
+   leaves the role dead is the defect this exists to end.
+2. **A pin that is BEHIND** (`harness-refresh.sh`'s advance kills nothing, #2278).
+
+**It never repairs the following, by design** — each is reported, with whose decision it is:
+
+* a **DANGLING** unit (its program or cwd was reaped). Restarting cannot fix a path that does not
+  exist, and inventing a new path is a decision: `heal` prints the missing path and stops.
+* a **DUPLICATE** (two controllers for one repo/state dir). Which one to stop is a human decision, and
+  a health verb that kills a controller is a lane-killer.
+* a **live-but-LATE** role. Cycling it would drop in-flight lanes.
+* a role the read **could not measure** (`UNKNOWN`). Cannot-verify is never repaired by guessing.
+* **anything the box has no mechanism for** (the `doctor` role on macOS). `SKIPPED` with a reason, never
+  a green line.
+
+#### Two documents this section corrects
+
+* `pi-bootstrap/SETUP-NEW-MACHINE.md` said macOS setup "also installs the scheduled jobs via
+  `scripts/install-launchd.sh`". That is true and it is not the whole harness: a Mac got NO controller
+  and NO apply timer from the starter, and nothing said so. The doc now names `harness-up up` as the
+  second step.
+* `ARCHITECTURE.md` §7 (triage) told the reader to check `launchctl list | grep orchestrator` for a
+  queue that is not moving. That check answers "is a job loaded"; it cannot answer "is the apply clock
+  even installed", which is the state that was measured. It now points at `harness-up status` and its
+  role rows as well.
+
 ### Deliberate stop (handing the laptop to a human)
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
@@ -1733,8 +1936,10 @@ process reaper judges a `pi` process tree (the `pi` and its immediate shell wrap
 `pi`** — or a pipe-fed `tee` beside it — holds a fleet-namespace log open as stdout/stderr, and reaps
 it only when ALL THREE hold: zero CPU delta over a sample window summed over the whole tree; **positive
 fleet ancestry** (a human terminal/ssh ancestor refuses, and so does an ancestry that is neither —
-`unknown` used to permit and TERMed live trees, and it is now inert on a systemd-scoped cell until a
-cell-side evidence source exists); and either the log is untouched past 2h or (the log resolved but is
+`unknown` used to permit and TERMed live trees; on a systemd-scoped cell the supervisor's
+cgroup/environ marker — `cell_fleet_marker`, #2868 — supplies the positive fleet evidence that was
+previously missing, so the armed reaper is no longer inert there); and either the log is untouched
+past 2h or (the log resolved but is
 gone) the process has been up past 12h. It is **dry run by default**; arming is the operator's call,
 like every other deletion tool here. ⛔ Its hardest rule
 is the one a first dry run got wrong: **an unresolvable log is `no-log-evidence` and is NEVER read as
@@ -1892,7 +2097,8 @@ and was never reinstalled**: it survived only as
 (its last run was Sep 16, as of that close). That is the same defect as §6.5.6, stated twice in three
 days: **a fix that exists is not a fix.** So the live trackers are agent-infra#1244 (the lane-level
 rule exists only as prose), #1862/#1863 (restore the orphan reaper **and schedule it**), and #1927 (a
-scheduler the cells run).
+scheduler the cells run). The INSIDE half — a lane ending on its own silence with a reported verdict —
+is §6.5.1c: a different mechanism (a bound in the wrapper), not a third reaper.
 
 ### 6.5.1b The leak a session count cannot see, and the reading that replaces it (#2163)
 
@@ -1955,6 +2161,81 @@ the Linux-cell steady state, `docs/ops/fleet-liveness.md` §11.4) is recorded as
 (`rc=3`) made the operator's health verb exit 1 for ever on a healthy cell, and collapsed a genuine
 controller-restart failure (`rc=1`) into the same number — so `doctor` keeps the supervision verdict
 in its own rc and a failed restart stays `rc=1`.
+
+### 6.5.1c Every lane is bounded from the INSIDE, and the bound is a reported outcome
+
+**MUST.** A lane ends on EITHER of two limits, and the limit that ended it is **reported with the
+measurements behind it**, never inferred from an exit status.
+
+| limit | default | what it is | what it is NOT |
+|---|---|---|---|
+| wall clock | `LANE_TIMEOUT`, 3300 s | a hard ceiling on the lane's total duration | not a progress signal: it cannot tell SLOW from STALLED, so alone it either kills a lane mid-merge or holds a corpse |
+| **silence** | `LANE_BOUND_IDLE_S`, **1200 s** (20 min) | **no output growth AND no CPU delta** (subtree, tolerance 0.10 s), confirmed on **two consecutive samples** | not a byte counter and not a CPU vote: **both** must be quiet, and either one advancing keeps the lane alive however long it runs |
+
+**Why (measured 2026-10-27).** Nine lanes across two cloud cells parked with **0 bytes** of output and
+**`00:00:00` CPU**, the oldest for **3 h 32 m** — every one a `pi` in `ep_poll`, an event-loop wait
+with no bound of any kind. The trigger was transient (`dial tcp … i/o timeout` against api.github.com,
+healthy again 0.26 s later), and a transient becomes a multi-hour corpse only because nothing bounded
+the lane's **silence**. Two further dispatch attempts then sat at 0 bytes for 5–15 minutes and were
+killed by hand. The same asymmetry was already visible in this tree's own instruments: the builtin
+`task` tool bounds a SUB-AGENT on `TASK_STREAM_STALL_MS` (20 min) and `TASK_CPU_STALL_MS` (30 min),
+while a lane — a strictly more expensive process, holding a worktree, a claim and a concurrency slot —
+had one axis, the wall clock. `mac-lane.sh --status` even states the reason a naive detector had been
+deleted: *"bytes is NOT progress for a `-p` lane … reading either — or both — made ten healthy lanes
+look dead"*. A `-p` lane prints nothing until it finishes, so a **silence-only** bound would kill every
+healthy lane; the CPU delta is the second signal that makes the pair safe.
+
+**Status: IMPLEMENTED** — `lane-bound.sh:309` (`supervise`, the one loop both modes run) with the two
+signals at `lane-bound.sh:169` (`pid_alive`, zombie-aware) and `lane-bound.sh:216` (`cpu_cs_of`, the
+subtree sum) and the verdict at `lane-bound.sh:255` (`verdict_line`, written from `lane-bound.sh:271`'s
+`enforce` BEFORE the kill); wired into the ONE agent invocation at `spawn-gate.sh:1531` (`run_agent`
+starts `lane-bound.sh watch`), so it covers every lane, fixer and background worker. Not a rewrite of
+§6.5.1: the OUTSIDE reapers are unchanged and that section's `PARTIAL` still stands (two in-tree
+reapers disagree). This is the other half — the lane can no longer outlive its own progress, so the
+reaper is the backstop for a lane whose wrapper is gone, rather than the only thing standing between a
+stalled fleet and a human reading a report.
+
+**How to see why a lane died** — one line, three surfaces (the lane log, stdout, and
+`<lane log>.lanebound`):
+
+```text
+[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=1204s wall_bound=3300s
+  idle_bound=1200s silent=1204s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
+  cpu_unreadable=0 signal=TERM log=/home/cmux/orchestrator/logs/lane-42.log
+```
+
+Read it left to right: the **verdict** is `stalled` (the silence limit fired), `exceeded-wallclock`
+(the ceiling fired — even on a lane that was still producing) or `finished`; `silent` is how long BOTH
+signals were quiet; `bytes` / `bytes_delta` and `cpu_cs` / `cpu_delta_cs` are the two signals at the
+decision; `cpu_unreadable` counts samples where the CPU could not be read — an `ps` that failed, AND a
+snapshot in which the lane's own pid is absent (a truncated table reads as "0 CPU" if it is trusted,
+which is a healthy lane killed) — and every such sample **stands the idle clause down** rather than
+arming a kill on absent evidence, with the wall clock still bounding the lane; `signal` is what was
+sent (`TERM`, or a following `[lane-bound] KILL` line if the lane ignored the 15 s grace).
+`grep '\[lane-bound\] VERDICT' $O/logs/lane-<N>.log` answers "was this lane wedged or slow?"
+without re-reading a transcript — the question that previously had no answer at all, because the log is
+truncated on rerun and the CPU counter dies with the process.
+
+**Two observations, and when to expect the kill.** A lane is judged on the sample interval
+`--poll`, default `min(60 s, idle/4)` — ~3 `ps` calls a minute per lane, because on this box the FLEET
+is the load. The silence limit needs **two consecutive confirming samples**, so it fires between
+`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (20–22 min at the defaults); the wall ceiling is
+exact to the sample interval it is not allowed to overrun. One sample is never enough: a single reading
+cannot tell a freeze from a missed measurement, which is the same rule §6.5.1 states for the outside
+reapers.
+
+**Operating it.** `LANE_BOUND_IDLE_S=0` disables the silence limit (and `LANE_BOUND_WALL_S=0` the
+ceiling) — an explicit `0` only: a blank or malformed value takes the DEFAULT, because an
+`LANE_BOUND_IDLE_S="${UNSET}"` in a launcher must not disarm the bound, and a typo must never read as
+"off". Both off prints an `UNBOUNDED by construction` WARN. The same contract as `task`'s
+`getCpuStallMs`. Tuning is per dispatch: a lane class that legitimately sits silent for longer (a long
+model call with no tool activity) raises `LANE_BOUND_IDLE_S` rather than removing the limit.
+
+⛔ **STATED RESIDUAL.** A lane whose model call takes longer than the silence limit with no output and
+no tool CPU is killed as `stalled`. That is the same bound `task` applies to a sub-agent
+(`TASK_STREAM_STALL_MS` = 20 min) and the same window a human used by hand (5–15 min) — but it IS a
+bound on a legitimate-but-pathological case, and the verdict line says so instead of hiding it, because
+`silent=1204s bytes=0 cpu_delta_cs=0` is exactly what a 20-minute model call looks like from outside.
 
 ### 6.5.2 The instrument that decides must itself be bounded
 
@@ -4438,6 +4719,48 @@ now requires (a) an ORCHESTRATOR unit name, (b) ACTIVE state, and (c) never trea
 disk as evidence that one is loaded (the macOS arm already refused that inference). A cell whose
 supervisor is the process (tmux + process table, which is how `cloud-cell-supervisor.sh` works) is
 reported as `supervisor process`, with the evidence named.
+
+#### The five primitives that differ — `scripts/lib/box.sh` (agent-infra#2271)
+
+Each of these had already been discovered separately, in a different script, AFTER it failed there:
+
+| primitive | BSD (macOS) | GNU (Linux) | why the wrong spelling is dangerous |
+|---|---|---|---|
+| in-place edit | `sed -i '' -e …` | `sed -i'' -e …` | `sed -i 's/a/b/' f` on BSD treats the SCRIPT as the backup suffix: it edits **nothing** and exits **0** |
+| epoch → date | `date -r <epoch>` | `date -d @<epoch>` | the wrong flag is a usage error, so a "timestamp" is silently empty |
+| CPU count | `sysctl -n hw.ncpu` | `nproc` / `getconf _NPROCESSORS_ONLN` | resolved at SOURCE time, so a wrong PATH pinned `_NCPU=4`/`MAX_LOAD=40` for every cell (#1702) |
+| mtime | `stat -f %m` | `stat -c %Y` | `stat -c` on macOS means filesystem status and prints the WRONG NUMBER |
+| supervisor | launchd | systemd unit or a supervisor process | already in the table above |
+
+**One shim, probed, never assumed from `uname`:** every primitive tries its mechanisms in order and
+records which one answered (`box_provenance`), so a Homebrew GNU-userland on macOS or a BSD-flavoured
+container still gets the right answer. `bash scripts/lib/box.sh --selftest` prints the provenance and
+reproduces the BSD `sed -i` hazard as a live assertion; `scripts/lib/box.test.sh` runs on both
+platforms.
+
+#### `scripts/harness-exec.sh` — the RUNTIME half of "the Mac runs from the pin"
+
+`install.sh` refuses to render a plist whose program is not inside the pin (#2271, install time).
+`harness-exec.sh` is the same refusal on every START, for both platforms: it resolves the two pin
+records (`HARNESS-PIN` = commit, `HARNESS_PIN_FILE` = the harness directory the controller execs),
+requires the recorded directory to BE a clean checkout at that commit inside `<pin root>/<sha12>`,
+requires the entrypoint to exist **and to resolve inside the tree**, and `exec`s it. **There is no
+fallback** — not `$O`, not `~/orchestrator`, not `origin/main` — because running an unpinned copy
+INSTEAD of the pin is exactly how three fixes existed only in a home-directory copy for weeks
+(#2231). Every refusal is a named `rc=78` and is asserted by name in `scripts/harness-exec.test.sh`:
+not-a-checkout, the two records DISAGREE, EMPTY, not a commit id, not a directory (pruned), the pin
+layout (`<root>/<sha12>`, proven from the records when `HARNESS_PIN_DIR` is unset), UNCOMMITTED
+CHANGES in the pinned harness dir, an entrypoint that walks out with `..` or through a symlink, and an
+entrypoint the pin does not carry.
+
+⛔ **IT IS NOT THE START PATH YET, AND THIS FILE WILL NOT PRETEND OTHERWISE.** Nothing renders or
+execs it today (`rg -ln harness-exec` finds only this shim, its suite and the shard list), so the Mac's
+launchd job still execs `~/orchestrator/launchd-controller.sh` — the home-dir copy #2231 names as its
+worst row. The two changes that put this shim on the start path are **#2271** (install resolves the
+pin and parses `ProgramArguments` back out of the rendered plist) and **#2020** (the TCC wrapper's
+content lifted into a commit). Until both land, the shim is inert: on this Mac it REFUSES (there is no
+pin — measured 2026-10-22), and `harness-exec.test.sh` arm 10 asserts exactly that rather than
+pretending the box is fixed.
 
 ### Which instrument answers which question (all three, and they DISAGREE by design)
 
