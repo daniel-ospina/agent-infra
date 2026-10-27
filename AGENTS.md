@@ -381,22 +381,32 @@ steps are run **locally**, and their output is posted as the evidence the merge 
 **OVERRIDES:** the rail's precondition that a merge wait for a run that TESTED the head (`admin-merge.sh`,
 *"no run of the lane actually TESTED head"*) — when the queue is the ONLY reason no such run exists, local
 reproduction of that lane is the substitute, and the PR states it rather than implying it.
-It is bounded hard, and a lane that reads it as a general licence has read it wrong:
+**Name the route, because the rail cannot accept the substitute:** a head with no TESTED run is refused by
+the rail unconditionally, so the landing path is the audited `AGENT_ADMIN_MERGE_OVERRIDE=1`, which logs
+`admin_merge_override` and *bypasses* the certificate instead of faking one. It must be in the AGENT's
+environment before it starts — the gate reads the agent process, not the shell, so exporting it inside a
+tool call does nothing. A session that cannot set it, and reaches the raw client instead, **says so in the
+PR and does not claim an audit it did not get** (tortoise#10184 did exactly that, and corrected itself).
+This is bounded hard, and a lane that reads it as a general licence has read it wrong:
 
 - **Review evidence stays mandatory and HEAD-BOUND.** The substitute replaces a *lane*, never the review
   gate: `record-review.sh` at the final head is what makes such a merge legitimate. A push invalidates it,
   so re-record after every fix.
-- **Reproduce THAT lane's own steps and post their output.** *"It's docs-only"* is not evidence; the four
-  `docs` steps are. A step that cannot be reproduced on this host is **declared, not skipped** — the pinned
-  `lychee` has no arm64 build, so the link check was replaced by the three measurements that decide its
-  verdict (no new links added, the one external URL resolves, the relative targets exist), and the PR says
-  exactly that.
+- **Reproduce THAT lane's own steps and post their output.** *"It's docs-only"* is not evidence; the lane's
+  own steps are — for the `docs` job that is the conflict-marker check, the generated-artifact `--check`s,
+  markdownlint, the link check, **and** the docs-lint baseline that consumes them. A step that cannot be
+  reproduced on this host is **declared, not skipped** — this repo's link-check script pins only the
+  x86_64/aarch64 **Linux** assets, so a macOS `arm64` host has no pinned `lychee` (its
+  `DOCS_LINK_CHECK_LYCHEE=<path>` seam is the supported way to supply one); where a step stands in, say
+  what was measured instead (no new links added, the one external URL resolves, the relative targets exist).
 - **A check the change class CAN fail is not droppable.** The ruling names CI-only jobs of the `legal-e2e`
   class as bureaucracy *for a diff they cannot test*; it does not license skipping a check that could catch
   this change.
-- **Do not make bypassing a local safety gate a habit.** The ruling names the QUEUE as the blocker, never the
-  `#1484` script-backdoor guard or the admin-merge evidence gate. Where those cannot be satisfied inside a
-  session, say so in the PR and record why — do not quietly route around them and report a clean run.
+- **Do not make bypassing a local safety gate a habit.** The ruling names the QUEUE as the blocker; it never
+  authorises routing around the `#1484` script-backdoor guard, and the admin-merge override is a
+  **disclosed** exception whose audit record is the whole point — not a quiet way to skip review.
+
+---
 
 - **⛔ A MEASUREMENT ARTIFACT IS NOT A STATE — never take a destructive action from a FIRST-MATCH
   reading.** This has now happened **three times on healthy systems**, each caught only because the
