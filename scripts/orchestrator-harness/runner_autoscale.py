@@ -1702,6 +1702,16 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
     # `registered` is set BEFORE `enable_unit`, so a unit failure still never writes the stale stash
     # back over the fresh config a successful re-registration just wrote.
     registered = False
+    # ⛔ THE IN-FLIGHT FAILURE IS CAPTURED, NOT JUST CHAINED (review finding P2, round 3). Raising
+    # the restore failure from the `finally` REPLACES the propagating exception, and NOTHING in this
+    # tool ever prints a traceback: `converge` records `f"{c['name']}: {exc}"`, i.e. `str(exc)` alone.
+    # So a comment claiming "the original failure is still chained" was wrong in the only place it
+    # matters — the RECORD. Measured: a `config.sh` exiting 1 with `gh: HTTP 401: Bad credentials`
+    # plus an unrestorable stash produced a problem line that named the restore failure and NOT the
+    # 401, so an operator could no longer tell auth from transport from ENOSPC on the one path this
+    # commit exists to make loud. `failure` carries it into the message below, so the record states
+    # BOTH facts.
+    failure: BaseException | None = None
     try:
         rc, out = _run(
             _config_argv(cfg, repo, registration_token(repo), name, labels, replace), timeout=600
@@ -1725,21 +1735,26 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
         if rc != 0:
             raise ActionFailed(f"config.sh for {name} rc={rc}: {out[-400:]}")
         registered = True
+    except BaseException as exc:  # noqa: BLE001 — recorded, then re-raised: the `finally` needs it
+        failure = exc
+        raise
     finally:
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
         if not registered:
             lost = _restore_local_config(directory, stash)
             if lost:
-                # ⛔ RAISED FROM THE `finally`, ON PURPOSE (review finding P2). The original failure is
-                # still chained into the traceback ("During handling of the above exception …"), and
-                # the restore failure is the fact a reader must not miss: the install has lost the
-                # files that make it discoverable, so the next pass can add a SECOND one over it.
+                # ⛔ RAISED FROM THE `finally`, ON PURPOSE (review finding P2) — and it NAMES the
+                # original failure, because that is the only part of it the RECORD will ever see
+                # (see `failure` above). The restore failure is the fact a reader must not miss: the
+                # install has lost the files that make it discoverable, so the next pass can add a
+                # SECOND one over it. `from failure` keeps the chain for a human reading a traceback.
                 raise ActionFailed(
-                    f"{name} could not be re-registered AND {len(lost)} of {len(stash)} stashed "
-                    f"config file(s) could NOT be put back ({'; '.join(lost)}) — the install may no "
-                    "longer be discoverable, and its slot can read FREE to the provisioner"
-                )
+                    f"{failure if failure is not None else f'{name} could not be re-registered'}"
+                    f" — AND {len(lost)} of {len(stash)} stashed config file(s) could NOT be put "
+                    f"back ({'; '.join(lost)}) — the install may no longer be discoverable, and its "
+                    "slot can read FREE to the provisioner"
+                ) from failure
     # ⛔ A REGISTERED RUNNER WITH NO ENABLED UNIT IS NOT LIVE. Configuring the unit used to be
     # best-effort, so a `svc.sh install` / `systemctl enable` failure still returned "registered",
     # the caller counted it as live and reported `converged` while no listener would ever start —

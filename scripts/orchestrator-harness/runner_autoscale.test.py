@@ -3954,6 +3954,14 @@ def t55_restore_cannot_lose_the_key_quietly():
     stash = {".runner": (0o644, b"R" * 1000), ".credentials_rsaparams": (0o600, key)}
     real_write = os.write
     real_open = os.open
+    # ⛔ BOUND BEFORE THE `try` AND CLEANED UP INDIVIDUALLY (review finding P2, round 3). With the
+    # three names bound inside the `try`, a `check()` that failed before the LAST assignment made the
+    # `finally` build a tuple containing an unbound name: the cleanup raised `UnboundLocalError`,
+    # which SUPERSEDES the real failure — so a red T55 reported a variable-binding bug instead of
+    # "a short write must still land every byte", discarded the `Failure:` text the harness prints
+    # (`exc.__class__.__name__`), and left the fixtures it had already made on disk. That is exactly
+    # the evidence this round's mutations exist to provide.
+    short = stuck = gone = None
     try:
         # (1) A SHORT WRITE IS LOOPED, and every byte lands. `bytes(b)[:16]` makes each call return
         # 16, which is the ENOSPC shape without a real full disk.
@@ -3998,14 +4006,53 @@ def t55_restore_cannot_lose_the_key_quietly():
             len(problems) == len(stash) and all("could NOT be restored" in p for p in problems),
             f"a restore that fails must be REPORTED, never `pass`-ed: {problems}",
         )
+
+        # (4) AND WHEN BOTH FAIL, THE RECORD STATES BOTH FACTS. Raising the restore failure from the
+        # `finally` REPLACES the propagating exception, and `converge` records only `str(exc)` — so
+        # before this, a `config.sh` that refused for a REAL reason (auth, transport) produced a
+        # problem line naming the restore and NOT the cause. Reproduced by driving `register()` with
+        # refusing `config.sh` + an unreservable `os.open`.
+        os.open = real_open  # (the fixture needs a working open before we break it again)
+        with Env():
+            box = Box("restore-and-refuse")
+            try:
+                install = box.install("gh-runner-x64", "r-dead")
+                box.refusals(5)
+                os.open = no_space
+                try:
+                    ra.register(Path(install), "r-dead", "daniel-ospina/tortoise", "self-hosted-x64", True)
+                except ra.ActionFailed as exc:
+                    msg = str(exc)
+                    check("could NOT be put back" in msg, f"the restore failure must be named: {msg}")
+                    check(
+                        "rc=" in msg,
+                        f"…AND the ORIGINAL cause must survive in the same message (the record keeps "
+                        f"`str(exc)` and nothing else, so a chained traceback is invisible to it): {msg}",
+                    )
+                else:
+                    check(False, "a refused registration with an unrestorable stash must RAISE")
+            finally:
+                os.open = real_open
+                box.destroy()
     finally:
         os.write = real_write
         os.open = real_open
         for d in (short, stuck, gone):
-            shutil.rmtree(d, ignore_errors=True)
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
 
 
 MUTATIONS = [
+    # ── review round 3 (this push): the both-facts leg, and the two families of the label strip ──
+    Mutation(
+        "T55",
+        """                    f"{failure if failure is not None else f'{name} could not be re-registered'}""",
+        '                    f"{name} could not be re-registered"  # MUTATION: the original cause is dropped',
+        "the restore failure replaces the propagating exception and `converge` records only "
+        "`str(exc)`, so the ORIGINAL cause (`config.sh rc=1: gh: HTTP 401 …`) disappears from the "
+        "machine-readable record — an operator can no longer tell auth from transport from ENOSPC "
+        "on the one leg where the install may have lost the files that make it discoverable",
+    ),
     # ── review round 12: the 2026-10-27 second-review findings (one mutation per claim) ──
     Mutation(
         "T55",
