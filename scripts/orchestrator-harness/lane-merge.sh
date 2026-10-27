@@ -60,6 +60,13 @@ say_err() { printf '%s\n' "$*" >&2; }
 
 PR=""; ISSUE=""; OR=""; BR=""; WATCH=0; STATUS=0
 CHECKS_TSV=""; PR_TSV=""; MAX_ROUNDS_OVERRIDE=""
+# ── THE ROUTER SEAM (#2866) ───────────────────────────────────────────────────────────────────
+# `pr-state.sh` is the ONE consumer seam for the PR state table; a lane that re-derives "what does
+# this head need next" is the defect #2866 names. Sourced when present, and its absence is PRINTED
+# at the point of use (never silently skipped).
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/pr-state.sh" 2>/dev/null || true
+lrow=""
 while [ $# -gt 0 ]; do
   # ⛔ A VALUE-LESS TRAILING FLAG USED TO SPIN FOREVER (landing-review P2, REPRODUCED). Seven arms ended
   # in `shift 2` while reading "${2:-}": with the flag as the LAST argument `$#` is 1, `shift 2` fails
@@ -1174,6 +1181,33 @@ while :; do
   [ -n "$RED" ] && { printf '%s\n' "$(printf '%s' "$RED" | tr ',' '\n')" > "$LAST_F"
                      printf '%s\n' "${HD:-${HEAD:-}}" > "$LASTHEAD_F" 2>/dev/null || true; }
   if [ -n "${RED:-}" ]; then
+    # ── A FLAKE IS NOT A FIX (#2866) ──────────────────────────────────────────────────────────
+    # Before this round spends a FIX on the red, ask the router whether the red is a red at all.
+    # `RERUN-FLAKE` = the same (app, workflow, job) PASSED on an earlier attempt at THIS SAME head:
+    # editing code here produces a new head for a flake, strands the head-bound review attestation
+    # and buys a full CI pass. The re-run re-executes the SAME sha (a re-run keeps GITHUB_SHA), so
+    # it costs one job and no review.
+    # ⛔ `unavailable` (no router on this box) changes NOTHING: the lane fixes the red as before and
+    # says the router did not run. An unresolved router must never read as "no flake here".
+    if [ -z "${lrow:-}" ] && declare -f prstate_row >/dev/null 2>&1; then
+      lrow="$(prstate_row "$OR" "$PR")" || lrow="$(printf '%s' "${lrow:-unavailable\t-\tno row}")"
+      lsick_action="$(printf '%s' "${lrow:-}" | cut -f1)"
+      lsick_run="$(printf '%s' "${lrow:-}" | cut -f2)"
+      lsick_why="$(printf '%s' "${lrow:-}" | cut -f3-)"
+      case "$lsick_action" in
+        RERUN-FLAKE)
+          say "… this head's red is a FLAKE, not a fix: ${lsick_why:-a job passed at this same head}"
+          say "   re-trigger the FAILED jobs (same sha, no new head, no attestation stranded):"
+          say "     gh run rerun ${lsick_run:-<run>} --failed --repo $OR"
+          disposition WAITING_FLAKE
+          verdict WAITING_FLAKE "flake at ${HD:-${HEAD:-}}: rerun run ${lsick_run:-?} --failed; no fix, no new head"
+          exit 11 ;;
+        unavailable)
+          say "… router unavailable (${lsick_why:-no reason recorded}) — this head's red is treated as fixable"
+          lrow="unavailable" ;;
+      esac
+    fi
+    [ "${lsick_action:-}" = "RERUN-FLAKE" ] && exit 11
     emit_fix FIX_REQUIRED "this head's own checks are RED: $(printf '%s' "$RED" | tr ',' ' ')"
   fi
   [ "${IF:-0}" = "0" ] && break
