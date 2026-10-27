@@ -293,7 +293,7 @@ lane_alive "$LANEPID" && ok "the in-flight lane process was NOT signalled (pid $
 case "$R" in *lanes=1*) ok "the record discloses lanes=1 — the deferred restart is visible, not silent" ;; *) bad "no lane disclosure in the record: $R" ;; esac
 case "$R" in *"IN-FLIGHT at the advance"*) ok "…and the prose says nothing was signalled" ;; *) bad "the in-flight fact is unstated: $R" ;; esac
 case "$(cat "$D/mat.calls" 2>/dev/null)" in *--pin-only*) ok "the advance used --pin-only (a new per-commit tree; \$O untouched)" ;; *) bad "the advance did not use --pin-only: $(cat "$D/mat.calls" 2>/dev/null)" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 # ⛔ A22b: AN AMBIENT `COLUMNS` MUST NOT HIDE A LIVE LANE (#2926). `in_flight_pids` reads `ps … command=`
 # and matches the token `$O/<name>.sh`. `ps(1)` honours `COLUMNS` BEFORE its "not a tty ⇒ unlimited"
@@ -318,7 +318,7 @@ lane_alive "$LANEPID" && ok "the live lane was NOT signalled under a narrow COLU
 case "$R" in *lanes=1*) ok "the lane is still counted with COLUMNS=20 — the table read is width-independent" ;;
              *lanes=0*) bad "COLUMNS truncated the process table and hid a LIVE lane (lanes=0) — the #2926 defect" ;;
              *) bad "no lane count in the record: $R" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 _CASE=$((_CASE+1)); echo "=== A23: the DESTRUCTIVE advance (--re-seed) under a mid-turn lane -> REFUSES 26, names what blocks it ==="
 D="$T/a23"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
@@ -366,7 +366,7 @@ R7="$(O="$D6/O" HARNESS_PIN_FILE="$D6/path-pin" HARNESS_MATERIALISER="$(mk_stub_
 [ "$RC7" = 26 ] && ok "a sha-record-at-tip box refuses 26 like any other live box" || bad "exit $RC7, expected 26 — output: $R7"
 case "$R7" in *"the pin moves to"*) bad "the remedy promises a pin move the sha record already made" ;; *) ok "…and does not promise a pin move the record already made" ;; esac
 case "$R7" in *"deployed tree"*) ok "…it names the deployed tree as what advances" ;; *) bad "the deployed tree is unnamed: $R7" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 _CASE=$((_CASE+1)); echo "=== A24: --re-seed --force -> the deliberate override goes through (the gate is not a wall) ==="
 D="$T/a24"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
@@ -383,7 +383,7 @@ lane_alive "$LANEPID" && ok "even the forced re-seed signalled no lane" || bad "
 # the harness does not ship, so "no lane tree was touched" would be false on THIS arm.
 case "$R" in *"no lane tree was touched"*) bad "the re-seed arm claims no lane tree was touched (it re-seeds \$O)" ;; *) ok "…and does not claim the lane tree was untouched" ;; esac
 case "$R" in *"RE-SEEDED"*) ok "…it discloses that \$O was re-seeded" ;; *) bad "the re-seed is not disclosed on the kept line: $R" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 _CASE=$((_CASE+1)); echo "=== A25: the controller and the launcher's log path are NOT lanes (token match, not substring) ==="
 D="$T/a25"; mkdir -p "$D/pin" "$D/O/logs"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
@@ -492,7 +492,7 @@ R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" 
 lane_alive "$LANEPID" && ok "the in-flight lane is untouched" || bad "a no-op refresh killed a lane"
 case "$R" in *action=none*) ok "record: action=none (nothing was done, and it says so)" ;; *) bad "record wrong: $R" ;; esac
 case "$R" in *lanes=1*) ok "…and it still discloses the lane that was in flight" ;; *) bad "no lane disclosure: $R" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 _CASE=$((_CASE+1)); echo "=== A28: a DIRTY harness surface refuses AND discards nothing (the operator's patch survives) ==="
 D="$T/a28"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
@@ -669,7 +669,7 @@ case "$KEPT" in *"${C1:0:12} -> ${C2:0:12}"*) ok "…and it carries old -> new" 
 case "$KEPT" in *"$MAT"*) ok "…and the materialiser that did it" ;; *) bad "the materialiser is not in the kept line: $KEPT" ;; esac
 case "$KEPT" in *"lane process(es)"*|*lanes=*) ok "…and what was in flight (the disclosure survives the filter)" ;; *) bad "the lane disclosure is not in the kept line: $KEPT" ;; esac
 case "$KEPT" in *'\$O'*) bad "the kept line prints a literal backslash-\$O" ;; *) ok "…with no literal backslash in the operator-facing text" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 # ── the loop's per-cycle block, driven as shipped ────────────────────────────────────────────────
 # Placed INSIDE a scripts/orchestrator-harness/ path in the sandbox so the block's own fallback
@@ -1467,12 +1467,29 @@ case "$R6" in *"running=$(short "$C2")"*) bad "a recycled-pid lock certified the
 # `PS_BIN` seam the three canonical copies already carry, because a bare `ps` left this arm untestable.
 _CASE=$((_CASE+1)); echo "=== A36g: an unreadable age is not ownership — a failing ps leaves RUNNING on the stamp ==="
 mkdir -p "$T/a25/bin"
-printf '#!/bin/sh\nexit 1\n' > "$T/a25/bin/ps-none"
-chmod +x "$T/a25/bin/ps-none"
+# ⛔ THE SHIM FAILS THE AGE READ ONLY. `PS_BIN` feeds BOTH reads in this stage: the age read
+# (`-o etime=`, harness-refresh.sh:299) AND the argv read (`-ww -o command=`, :343). A shim that failed
+# unconditionally therefore emptied `_argv` too, so RUNNING fell to the stamp whether or not the arm
+# under test existed — the first version of this case was VACUOUS, and the body's mutation claim about
+# it was false (MEASURED: flipping BOTH `|| return 1` unreadable-age arms to `|| return 0` left the
+# suite at 225 passed / 0 failed). Passing the argv read through to the real `ps` keeps the plant's
+# tree resolvable, so the ONLY thing between it and a false `current` is the arm this case witnesses.
+REAL_PS_BIN="$(command -v ps)"
+cat > "$T/a25/bin/ps-noage" <<SH
+#!/bin/sh
+case "\$*" in *etime*) exit 1 ;; esac
+exec "$REAL_PS_BIN" "\$@"
+SH
+chmod +x "$T/a25/bin/ps-noage"
+# …and the shim must still ANSWER the argv read, or this case degrades silently back to vacuous and a
+# future reader inherits a green that witnesses nothing.
+case "$("$T/a25/bin/ps-noage" -ww -o command= -p "$$" 2>/dev/null)" in
+  '') bad "the ps-noage shim cannot answer the argv read — the unreadable-age case is vacuous again" ;;
+   *) ok "…and the shim still answers the argv read, so the unreadable-age arm is the only thing under test" ;; esac
 bash "$_O26" & _P29=$!
 sleep 1
 printf '%s\n' "$_P29" > "$T/a25/o/.orch.lock"
-R7="$(O="$T/a25/o" HARNESS_PIN_DIR="$T/a24/pins" PS_BIN="$T/a25/bin/ps-none" bash "$RR" --no-fetch \
+R7="$(O="$T/a25/o" HARNESS_PIN_DIR="$T/a24/pins" PS_BIN="$T/a25/bin/ps-noage" bash "$RR" --no-fetch \
        --repo "$T/src" --ref origin/main --pin "$PIN" --self "$T/a25/o" 2>&1)"
 rm -f "$T/a25/o/.orch.lock"; reap "$_P29"
 case "$R7" in *"running=$(short "$C2")"*) bad "an unreadable age was read as ownership (false current): $R7" ;;
