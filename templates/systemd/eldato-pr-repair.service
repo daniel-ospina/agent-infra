@@ -71,9 +71,28 @@ Environment=REPAIR_DISK_PER_WORKER_MB={{DISK_PER_WORKER_MB}}
 # ruling, and a new repair would compete with whatever is already there. `spawn-gate.sh` applies the
 # same ceiling per spawn; this gate stops the PASS from even planning work.
 Environment=REPAIR_LOAD_CEILING_MULT={{LOAD_MULT}}
+# ── the CLOCK, if this box was installed in `trigger` mode (#2700 C5) ──────────────────────────────
+# ⛔ `--loop` IS A TIMER AND A TIMER IS THE LEAD. A pass that fires every `REPAIR_INTERVAL_S` only sees
+# the fleet at that instant, so a PR that turns red one second after one waits the whole interval with
+# nobody on it — measured on the Mac as a mean 900 s of dead time for a repair that costs one pass.
+# `REPAIR_MODE=trigger` renders the ExecStart below as `pr-repair-loop.sh --trigger`, whose main
+# process is the event-driven front end (`pr-doctor-trigger.py`): ONE `gh pr list` per poll, a pass
+# when the PR surface moves, and the old interval demoted to a BACKSTOP for the work only a clock can
+# see (a check that never reports, a worker that dies silently, a stale claim).
+# ⛔ THESE FOUR LINES ARE INERT UNDER `--loop`, AND THAT IS CORRECT: they configure the front end, and
+# the front end is not the unit's main process in timer mode. The installer validates the mode instead
+# of guessing from these values, so a box cannot end up with a trigger knob rendered over a timer.
+Environment=REPAIR_TRIGGER_POLL_S={{TRIGGER_POLL_S}}
+Environment=REPAIR_TRIGGER_DEBOUNCE_S={{TRIGGER_DEBOUNCE_S}}
+Environment=REPAIR_TRIGGER_BACKSTOP_S={{TRIGGER_BACKSTOP_S}}
+Environment=REPAIR_TRIGGER_RETRY_MIN_S={{TRIGGER_RETRY_MIN_S}}
 # The template is the ONE place the loop is named. The installer refuses an ExecStart that does not
 # resolve to this file at the farmed path, so a unit cannot be pointed at a lane worktree (the #2697
 # defect: an ExecStart baked onto `/tmp/wt-2433-fu`, a lane's unmerged branch, which a reboot erases).
+# ⛔ THE MODE WORD IS RENDERED FROM `REPAIR_MODE` (`--loop` or `--trigger`) — ONE unit, two clocks, and
+# never a second actuator beside this one: `--trigger` execs a front end whose child is this same
+# loop's one-pass mode, so the cap, both machine gates, the reap, the credential source and the status
+# row above still decide every pass.
 ExecStart={{EXEC_START}}
 # ⛔ `always`, NOT `on-failure`. The measured failure is an ORDERLY exit: the loop is killed, or a
 # deploy replaces it, and nothing comes back. `on-failure` reproduces that defect byte for byte.
