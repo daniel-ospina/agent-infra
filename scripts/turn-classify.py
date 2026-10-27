@@ -150,10 +150,11 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # ⚠️ What makes that survivable is the ECHO: the response carries the concrete version that
 # answered, and `jev_choice` returns it as `meta["model"]` — so a verdict that shifted for a
 # reason no diff explains is visible in the log (`model=jev-1.14.0` against bars measured on
-# 1.13) instead of being inferred later from behaviour. It is logged on EVERY path — the acted
-# one, the below-bar SKIP, and the no-action one — because a model-induced confidence drop shows
-# up as a SKIP, and that was the one path carrying no model (review 2026-10-27). Re-derive the
-# bars FIRST when that shows up. Pinning a version again is a one-line change in EACH of the five copies the sweep
+# 1.13) instead of being inferred later from behaviour. Every path that RECORDS the verdict logs
+# it — acted, the below-bar SKIP, no-action, the per-tick CAP, and "already sent recently" —
+# because a model-induced confidence drop shows up as a SKIP, and the below-bar SKIP and the
+# no-action path originally carried no model at all (review 2026-10-27). Re-derive the bars
+# FIRST when that shows up. Pinning a version again is a one-line change in EACH of the five copies the sweep
 # note above lists (these two tracked callers, the two deployed ~/.pi/agent/scripts copies, and
 # the deployed state/lane-verdict.py) — a partial re-pin is the same split-brain this round
 # fixed in the other direction.
@@ -1233,7 +1234,7 @@ def main(argv: list[str]) -> int:
                 f"-- unknown, not acting (not claimed, so this turn stays open)")
             continue
         if kind and sent >= MAX_PER_TICK:
-            log(f"CAP {MAX_PER_TICK}: {lane} deferred")
+            log(f"CAP {MAX_PER_TICK}: {lane} deferred (model={meta.get('model')})")
             break
 
         # Claim the turn in BOTH cases. A "no action" decision must be recorded,
@@ -1252,7 +1253,8 @@ def main(argv: list[str]) -> int:
         now = time.time()
         gap = IDLE_GAP_S if kind == "idle_next_work" else MIN_GAP_S
         if now - (m.get("last") or 0) < gap and m.get("verdict") == choice:
-            log(f"SKIP {lane}: {kind} already sent recently")
+            log(f"SKIP {lane}: {kind} already sent recently "
+                f"(model={meta.get('model')})")
             if not a.dry_run:
                 write_marker(lane, sid=sid, size=size, last=m.get("last", now),
                              verdict=choice, acted=True)

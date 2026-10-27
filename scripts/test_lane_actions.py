@@ -2726,11 +2726,11 @@ def test_jev_step5_posts_the_current_model_to_the_vendor_endpoint(monkeypatch):
         seen["url"] = req.full_url
         seen["body"] = json.loads(req.data.decode())
         seen["auth"] = req.get_header("Authorization")
-        # ⛔ THE ANSWERED VERSION IS DELIBERATELY NOT THE CONSTANT. The stub sends
-        # `jev-latest`; the API answers with the concrete version. If `meta["model"]` ever
-        # regressed to `LV.JEV_MODEL`, both values would be the alias and the assertion
-        # below would pass while the report header read `Jev jev-latest` instead of the
-        # version that actually judged the lanes.
+        # ⛔ THE FIXTURE'S VALUES ARE DELIBERATELY DIFFERENT. The stub SENDS `jev-latest` and
+        # ANSWERS `jev-1.14.0`, precisely so that a `meta["model"]` regressed to
+        # `LV.JEV_MODEL` is caught by the assertion below (measured: that mutation reds it).
+        # Had the fixture ANSWERED the alias, both values would be identical and the assertion
+        # would be a tautology — it is the fixture, not the vest, that would be wrong.
         return _Resp({"model": "jev-1.14.0",
                       "answers": {"lane_00": {"type": "choice", "choice": "DONE_READY",
                                               "confidence": 0.9}},
@@ -2754,6 +2754,28 @@ def test_jev_step5_posts_the_current_model_to_the_vendor_endpoint(monkeypatch):
     # version the fixture ANSWERED with, not the alias — so that removal is a failure.
     assert meta["model"] == "jev-1.14.0" and meta["model"] != "jev-latest", (
         "the report must carry the version the API ANSWERED with, not the alias sent: %r" % (meta,))
+
+
+def test_the_report_header_prints_the_echoed_version_not_the_alias():
+    """⛔ THE HEADER A HUMAN READS, ASSERTED (review 2026-10-27).
+
+    `render_md` builds `READ (Jev <model>: n of m lanes answered)` from `meta["model"]`, and
+    NOTHING asserted that string: the leg above pins `meta["model"]` -- the header's INPUT, not
+    the header -- and the only other mention of `render_md` in this file monkeypatches it away
+    (`:2152`). Measured: hardcoding the header to `jev-latest` left this file's failure set
+    byte-identically green. With a vendor ALIAS, the header is the ONLY place a reader learns
+    which version judged the lanes, so it is asserted here against a version the fixture
+    ANSWERED with, never the alias we send.
+    """
+    res = {
+        "meta": {"source": "JEV", "error": None, "model": "jev-1.14.0",
+                 "answered": 1, "asked": 1},
+        "n_lanes": 1, "procmap": "ok", "sampled": "",
+        "quiet": [], "idle": [], "wip": [], "wedged": [], "report": [],
+    }
+    md = LA.render_md(res, snapshot_age=5, source="test")
+    assert "Jev jev-1.14.0" in md, md
+    assert "Jev jev-latest" not in md, md
 
 
 def _deployed_constants(filename):

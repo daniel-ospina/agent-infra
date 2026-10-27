@@ -75,10 +75,11 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # `main()`; the older leg asserted `meta_line()` in ISOLATION, which left the call site
 # uncovered — measured: rebuilding `print(meta_line(result))` from `JEV_MODEL` stayed green),
 # `turn-classify.py`'s `meta["model"]` (the echo leg in `test_turn_classify_state.py`), and
-# the words layer's report header (`test_lane_actions.py`, against the deployed
-# `lane-verdict.py`). The token branch prints the version; the cost-only branch carries none by
-# design. Read that field first: it is the value the RESPONSE carried, never `JEV_MODEL` — the
-# alias we sent.
+# `lane-actions.py`'s report header, where `render_md` prints `meta["model"]` as
+# `READ (Jev <version>: …)` (its own leg in `test_lane_actions.py` — NOT the deployed
+# `lane-verdict.py`, which a different leg pins for its constant). The token branch prints the
+# version; the cost-only branch carries none by design. Read that field first: it is the value
+# the RESPONSE carried, never `JEV_MODEL` — the alias we sent.
 # Pinning a version again is a one-line change in EACH of these five copies — a partial re-pin
 # is the same split-brain this round fixed in the other direction — and it needs the bars
 # re-derived on that version FIRST, which is why it is a decision and not a default:
