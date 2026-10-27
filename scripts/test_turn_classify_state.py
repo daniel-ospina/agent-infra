@@ -185,11 +185,12 @@ def test_every_published_verdict_is_classified():
 # PRECEDENCE, the REQUEST SHAPE and the META SHAPE — the five things a rotation must not
 # silently break.
 #
-# ⚠️ THE MODEL DOES NOT FOLLOW THE HOST. `jev-1.13.0` is VALID on the real API (measured 200);
-# `/v1/models` lists aliases only, which is a different claim. The vendor's guidance is to send
-# the version ID rather than an alias when thresholds are tuned, and MIN_CONFIDENCE here and
-# every bar in ask-owner.py were measured on 1.13 — so 1.13 is what must vote. Moving to 1.14
-# is a calibration decision, made by re-deriving the bars first.
+# ⚠️ THE MODEL IS THE ALIAS `jev-latest`, BY OWNER RULING (2026-10-27). The bars in this file and
+# in ask-owner.py were measured against `jev-1.13.0`, so the voting model now moves whenever the
+# vendor ships — and a literal assertion against an alias CANNOT notice that (it passes on every
+# future release). What notices it is the ECHO: the response carries the concrete version that
+# answered, `jev_choice` puts it in `meta["model"]`, and the legs below assert that echo is the
+# one recorded. Re-derive the bars when that echo moves past 1.13.
 
 class _Resp:
     """Minimal stand-in for the urlopen context manager the caller uses."""
@@ -220,14 +221,16 @@ def test_the_endpoint_is_the_real_typesafe_api():
     assert "jevtypesafeai" not in tc.JEV_URL
 
 
-def test_the_model_pin_does_not_follow_the_host():
-    """The migration is HOST-ONLY. `jev-1.13.0` is accepted by the real API (measured 200), and
-    the bars in this file were calibrated on it; `jev-latest` would have silently moved the
-    voting model to 1.14 — and would move it again on every future release, with the literal
-    string still passing any assertion written against the alias."""
-    assert tc.JEV_MODEL == "jev-1.13.0", (
-        "the pin is the calibration's own precondition — moving it means re-deriving "
-        "MIN_CONFIDENCE and ask-owner's bars first (got %r)" % (tc.JEV_MODEL,))
+def test_the_model_is_the_vendor_alias_not_a_version_pin():
+    """Owner ruling 2026-10-27: "let's use jev latest".
+
+    This asserts the RULING, so that a re-pin is a visible decision rather than a quiet edit —
+    it does NOT and cannot assert which version votes, because the alias moves. That claim is
+    carried by the echo leg below (`meta["model"]` is the concrete version the API reported),
+    which is the only place the difference is observable."""
+    assert tc.JEV_MODEL == "jev-latest", (
+        "the owner specified the vendor alias; a version pin here is a decision that has to be "
+        "made deliberately and recorded (got %r)" % (tc.JEV_MODEL,))
 
 
 def test_key_precedence_typesafe_name_then_the_legacy_one(monkeypatch, tmp_path):
@@ -283,6 +286,13 @@ def test_call_shape_and_meta_carry_tokens_not_an_invented_cost(monkeypatch, tmp_
     choice, meta = tc.jev_choice("the turn's final message")
 
     assert choice == "finished_the_work", choice
+    # ⛔ THE ALIAS MAKES THE ECHO LOAD-BEARING. The request says `jev-latest`; the response above
+    # says the concrete version that answered. With a pinned model those two were the same fact;
+    # with an alias they are not, and the record must carry the SECOND one — otherwise a verdict
+    # that shifted because the vendor shipped is indistinguishable from a bug in the marks.
+    assert meta["model"] == "jev-1.14.0", meta
+    assert meta["model"] != tc.JEV_MODEL, (
+        "the meta must report the version the API ANSWERED with, not the alias we sent")
     assert seen["url"] == tc.JEV_URL, seen["url"]
     assert seen["body"]["model"] == tc.JEV_MODEL, seen["body"]
     assert seen["body"]["state"] == "the turn's final message"

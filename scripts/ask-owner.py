@@ -55,13 +55,22 @@ os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 #     grep -rn 'api.typesafe.ai' ~/.pi/agent/scripts ~/.pi/agent/state/lane-verdict.py \
 #         ~/Documents/GitHub/agent-infra/scripts
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
-# ⛔ THE PIN SURVIVES THE HOST MIGRATION (review 2026-10-26). `jev-1.13.0` is VALID on the real
-# API — measured 200 — so nothing forces a model change, and the vendor's own guidance is to
-# send the version ID rather than an alias when thresholds are tuned ("an alias moves when a
-# new release ships"). Every bar in the CALIBRATION table below was measured on 1.13, so 1.13
-# keeps voting. Moving to 1.14 means re-deriving these bars FIRST, as its own recorded
-# decision — not as a side effect of a vendor migration.
-JEV_MODEL = "jev-1.13.0"      # pin: thresholds must not shift under us
+# ⛔ THE MODEL IS THE ALIAS, BY OWNER RULING (2026-10-27): "let's use jev latest".
+#
+# What that accepts, stated here so a later lane does not have to rediscover it: every bar in
+# the CALIBRATION table below was measured against `jev-1.13.0`, and `jev-latest` already
+# resolves to `jev-1.14.0` on the live API. So the marks are now scored by a model that moves
+# when the vendor ships, WITHOUT any change to this file — the vendor's own guidance warns
+# exactly about this ("an alias moves when a new release ships ... if you have tuned
+# confidence thresholds against one version, send that version's ID instead of the alias").
+# ⚠️ The consequence is not that the gate stops working; it is that a verdict can shift for a
+# reason no diff explains. `MIN_CONFIDENCE` and the per-mark bars are therefore the FIRST
+# thing to re-derive when a verdict looks wrong, and `turn-classify.py` records the model the
+# API ECHOES (`meta["model"]`, i.e. the concrete version that answered) precisely so that
+# shift is visible in the record instead of being inferred from behaviour.
+# Pinning a version again is a one-line change here plus `scripts/turn-classify.py`; it needs
+# re-deriving the bars on that version first, which is why it is a decision and not a default.
+JEV_MODEL = "jev-latest"      # vendor alias — moves with the vendor, see above
 # ---------------------------------------------------------------------------
 # CALIBRATION — measured, not guessed. One threshold for all seven marks was the
 # first version, and it was wrong for the LANGUAGE marks: they do not have the

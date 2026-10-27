@@ -679,11 +679,12 @@ def test_this_files_copy_of_the_endpoint_and_model_is_the_real_vendor():
     turn-classify's copies. A partial rotation that misses one file is silent, which is the exact
     stale-constant class the migration exists to end.
 
-    The MODEL stays pinned at 1.13 across the host move: that is the version every bar in this
-    file was calibrated on, and the vendor's own guidance is to send the version ID rather than an
-    alias when thresholds are tuned (an alias moves under you on the next release)."""
+    The MODEL is the vendor alias `jev-latest` by owner ruling (2026-10-27), so the bars in this
+    file — measured on `jev-1.13.0` — now score answers a model the vendor can move without a
+    diff on our side. That is the owner's call; what this leg pins is that every COPY of the
+    constant agrees, and `test_turn_classify_state.py` pins the echo that makes a move visible."""
     assert ao.JEV_URL == "https://api.typesafe.ai/v1/systemone", ao.JEV_URL
-    assert ao.JEV_MODEL == "jev-1.13.0", ao.JEV_MODEL
+    assert ao.JEV_MODEL == "jev-latest", ao.JEV_MODEL
 
 
 def test_jev_sends_a_name_keyed_questions_map_with_instructions(monkeypatch):
@@ -723,7 +724,7 @@ def test_jev_sends_a_name_keyed_questions_map_with_instructions(monkeypatch):
     out = ao.jev("Should we migrate the fleet? Options: A or B. We recommend A.")
 
     assert seen["url"] == ao.JEV_URL == "https://api.typesafe.ai/v1/systemone", seen["url"]
-    assert seen["body"]["model"] == ao.JEV_MODEL == "jev-1.13.0", seen["body"]
+    assert seen["body"]["model"] == ao.JEV_MODEL == "jev-latest", seen["body"]
     assert seen["auth"] == "Bearer k", seen["auth"]
     qs = seen["body"]["questions"]
     assert isinstance(qs, dict) and set(qs) == set(ao.QUESTIONS), sorted(qs)

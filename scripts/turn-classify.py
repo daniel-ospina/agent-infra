@@ -137,18 +137,20 @@ REPOS = ("daniel-ospina/tortoise",
 # (scoped to the LIVE files on purpose: `~/.pi/agent/state/*` also holds archived copies and
 # mutation-test fixture trees that legitimately still contain the old host.)
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
-# ⛔ THE MODEL PIN DOES **NOT** MOVE WITH THE HOST, and this is deliberate (review 2026-10-26).
-# `jev-1.13.0` is a VALID model on the real API — measured, `POST /v1/systemone`
-# `model=jev-1.13.0` → 200 `model: jev-1.13.0` (`/v1/models` lists ALIASES only, which is not
-# the same claim as "the version is rejected"; an unknown name 400s, e.g. `jev-9.9.9`).
-# So the migration is HOST-ONLY and the evidence underneath every bar stays valid: the vendor's
-# own guidance is that an alias "moves when a new release ships, so its answers can change
-# without any change to your code — if you have tuned confidence thresholds against one
-# version, send that version's ID instead of the alias". MIN_CONFIDENCE below and every
-# per-mark bar in ask-owner.py were measured on 1.13, so 1.13 is what votes.
-# To move to 1.14: re-derive those bars on 1.14 FIRST, then change this pin — as one recorded
-# decision, not as a side effect of a vendor migration.
-JEV_MODEL = "jev-1.13.0"
+# ⛔ THE MODEL IS THE ALIAS, BY OWNER RULING (2026-10-27): "let's use jev latest".
+#
+# `MIN_CONFIDENCE` below and every per-mark bar in `ask-owner.py` were measured against
+# `jev-1.13.0`, and `jev-latest` already resolves to `jev-1.14.0` on the live API — so the
+# marks are now scored by a model that moves when the vendor ships, with no change to this
+# file. The vendor's own guidance warns about exactly this ("an alias moves when a new release
+# ships ... if you have tuned confidence thresholds against one version, send that version's
+# ID instead of the alias").
+# ⚠️ What makes that survivable is the ECHO: the response carries the concrete version that
+# answered, and `jev_call` returns it as `meta["model"]` — so a verdict that shifted for a
+# reason no diff explains is visible in the record (`model: jev-1.14.0` against bars measured
+# on 1.13) instead of being inferred later from behaviour. Re-derive the bars FIRST when that
+# shows up; pinning a version again is a one-line change here and in `ask-owner.py`.
+JEV_MODEL = "jev-latest"
 
 # The three outcomes Jev chooses between. The FOURTH case the owner named —
 # "a question, protocol used" — is not a Jev question: it is decided by the label.

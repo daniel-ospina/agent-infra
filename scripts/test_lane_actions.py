@@ -2683,9 +2683,10 @@ def test_the_deployed_lane_verdict_constant_points_at_the_real_vendor():
     if lv is None:
         pytest.skip("no deployed ~/.pi/agent/state/lane-verdict.py on this box — nothing measured")
     assert lv.JEV_URL == "https://api.typesafe.ai/v1/systemone", lv.JEV_URL
-    assert lv.JEV_MODEL == "jev-1.13.0", (
-        "the deployed words layer must vote with the model its CRITERIA were calibrated on: %r"
-        % (lv.JEV_MODEL,))
+    assert lv.JEV_MODEL == "jev-latest", (
+        "the deployed words layer must carry the SAME model as the tracked copies (the vendor "
+        "alias, by owner ruling 2026-10-27) — a copy left on the old pin is the partial-rotation "
+        "class this leg exists for: %r" % (lv.JEV_MODEL,))
 
 
 def test_jev_step5_posts_the_pinned_model_to_the_vendor_endpoint(monkeypatch):
