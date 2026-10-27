@@ -70,7 +70,7 @@ quoting any ceiling:
 
 | resource | cost (measured) | note |
 |---|---|---|
-| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–15 lanes, cell-4, 2026-10-27 |
+| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
 | **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | containers 21–149 MB each (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
@@ -195,8 +195,8 @@ Recovery ladder, cheapest first:
 
 A lane's log **mtime** is the strongest *transcript-derived* signal a **harness lane** has — those run `pi -p
 --no-session` (`spawn-gate.sh`, `lane-exec.sh`, `merge-one.sh` all pass it), so a lane leaves no `.jsonl`. Other `pi` on a
-cell (interactive sessions, `task` children) **do** write `~/.pi/agent/sessions/*/*.jsonl` — 19 under `/home/cmux` on cell-4
-(the newest written that hour), while `$CELL_HOME`'s tree held 312 whose newest was two days old — so never conclude "no transcript exists on a cell"; conclude "no
+cell (interactive sessions, `task` children) **do** write `~/.pi/agent/sessions/*/*.jsonl` — and the count depends on WHICH home
+you count (`/home/cmux` and `$CELL_HOME` held very different populations, with very different newest-mtimes, on the same box) — so never conclude "no transcript exists on a cell"; conclude "no
 transcript exists *for this lane*". mtime is **necessary, not sufficient**: pair it with a CPU delta (reaping gate 1) and
 an ancestry check. Size alone is not a signal, and a spinner is not.
 
@@ -298,10 +298,13 @@ bash scripts/admin-merge.sh <pr>                                                
 
 ## 7. Fleet roles and what "full capacity" means
 
-| box | role | shape |
+The shape below is durable; the **numbers are a reading** — re-read `cmux vm stats` (RAM) and the guest's own `df -Pm /` (disk) at
+dispatch time, because both move.
+
+| box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
-| `pi-cell-1` | product work | 16 GB RAM / 128 GB disk — roomiest measured 2026-10-27, but **needs activation (§1)** before it can land |
-| `pi-cell-3` | product work | 8 GB RAM — the real constraint (2 OOM kills measured 2026-10-27); disk **71/128 GB used, 49 GB free** by the guest's own `df -Pm /` |
+| `pi-cell-1` | product work | 16 GB RAM / 128 GB disk — roomiest, but **needs activation (§1)** before it can land |
+| `pi-cell-3` | product work | 8 GB RAM — the real constraint (its `dmesg` shows 2 OOM kills); disk well short of full by the guest's own `df` |
 | `pi-cell-4` | product + CI-cost work | 16 GB, 8 vCPU; the current default dispatch target |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
