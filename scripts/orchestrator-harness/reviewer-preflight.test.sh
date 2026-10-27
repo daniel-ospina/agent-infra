@@ -514,6 +514,11 @@ cp "$LANE" "$STRIP/lane.sh"
 # copy the validator in, so resolution cannot depend on the box. The identity module is copied too.
 cp "$HERE/repo-target.sh" "$STRIP/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP/repo-slug.sh"
 cp "$HERE/brief-gate.sh" "$STRIP/brief-gate.sh"
+# ⛔ AND THE GATE-POLICY MODULE, WHICH IS THE SAME CLASS OF HARD REQUIREMENT (review, P1). `lane.sh`
+# sources it at L134 and `exit 78`s without it, and that source sits BEFORE the brief is composed —
+# so a rig without it composed NOTHING and the two control arms below were green/failing on an empty
+# artifact, the exact vacuity this section exists to forbid (measured in CI: 133 passed, 2 failed).
+cp "$HERE/gate-policy.sh" "$STRIP/gate-policy.sh"
 sed '/^- \*\*\[d\] plan evidence\*\*/,+2d' "$HELPER" > "$STRIP/reviewer-preflight.sh"
 [ -s "$STRIP/reviewer-preflight.sh" ]; ck $? "the stripped helper copy was produced"
 # The cwd is the §C fixture — a checkout of `acme/widget` that this suite already proves works in CI —
@@ -553,6 +558,7 @@ STRIP2="$TMP/strip2"; mkdir -p "$STRIP2"
 cp "$HERE/spawn-gate.sh" "$STRIP2/spawn-gate.sh"; cp "$LANE" "$STRIP2/lane.sh"
 cp "$HERE/repo-target.sh" "$STRIP2/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP2/repo-slug.sh"
 cp "$HERE/brief-gate.sh" "$STRIP2/brief-gate.sh"
+cp "$HERE/gate-policy.sh" "$STRIP2/gate-policy.sh"   # same hard requirement as the first rig (review, P1)
 sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
 [ -s "$STRIP2/reviewer-preflight.sh" ]; ck $? "the head-binding-stripped helper copy was produced"
 mkdir -p "$TMP/o4/logs"

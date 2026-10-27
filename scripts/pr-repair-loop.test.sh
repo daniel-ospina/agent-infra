@@ -613,6 +613,112 @@ farm_declares pr-repair-loop.sh "$TMP/farm-prose.sh" \
     && bad "a PROSE mention outside the array satisfies the declaration check" \
     || ok "a PROSE mention outside the array does not satisfy the declaration check"
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+echo "── the EVENT-DRIVEN front end (--trigger, #2700 C5) ──"
+# ⛔ ONE UNIT, TWO CLOCKS. `--trigger` does not add a second actuator beside `eldato-pr-repair`: it
+# makes the trigger the unit's MAIN PROCESS, and the trigger's child is THIS script's one-pass mode.
+# So the cap, both machine gates, the reap, the credential source and the status row still decide
+# every pass — the property a separate trigger unit could not have (it would dispatch past all five).
+mkdir -p "$TMP/farm-trigger" "$TMP/state-trigger"
+cp "$LOOP" "$TMP/farm-trigger/pr-repair-loop.sh"
+cat >"$TMP/farm-trigger/pr-doctor-trigger.py" <<'PYT'
+import os, sys
+open(os.environ["TRIGGER_ARGV_LOG"], "w").write(" ".join(sys.argv[1:]))
+raise SystemExit(0)
+PYT
+printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP/farm-trigger/pi-reap-worktrees.sh"
+chmod +x "$TMP/farm-trigger/pi-reap-worktrees.sh"
+printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' >"$TMP/farm-trigger/pr-doctor.py"
+TRIGGER_ARGV_LOG="$TMP/trigger-argv.log" O="$TMP/state-trigger" \
+    PR_DOCTOR_REPO=fake/one PR_DOCTOR_REPO_DIR="$TMP/checkout" \
+    PR_REPAIR_SCRIPTS="$TMP/farm-trigger" REPAIR_TRIGGER_POLL_S=11 REPAIR_TRIGGER_BACKSTOP_S=2222 \
+    "$LOOP" --trigger >"$TMP/trigger.out" 2>&1
+check "--trigger runs the front end (§rc)" 0 "$?"
+argv="$(cat "$TMP/trigger-argv.log" 2>/dev/null || true)"
+case "$argv" in
+    *"--repo fake/one"*)         ok "...with the RESOLVED repo (never a default)" ;;
+    *) bad "--trigger did not pass the resolved repo (argv: $argv)" ;;
+esac
+case "$argv" in
+    *"--repo-dir $TMP/checkout"*) ok "...and the checkout the pass may create worktrees in" ;;
+    *) bad "--trigger lost the checkout (argv: $argv)" ;;
+esac
+case "$argv" in
+    *"--poll 11"*)         ok "...and the rendered POLL knob" ;;
+    *) bad "--trigger lost REPAIR_TRIGGER_POLL_S (argv: $argv)" ;;
+esac
+case "$argv" in
+    *"--backstop 2222"*)   ok "...and the rendered backstop (the demoted timer)" ;;
+    *) bad "--trigger lost REPAIR_TRIGGER_BACKSTOP_S (argv: $argv)" ;;
+esac
+case "$argv" in
+    *"--max"*) bad "--trigger hands the front end a CAP — the cap is the machine's (#2409)" ;;
+    *)         ok "...and NO cap of its own (the pass derives it from the box)" ;;
+esac
+
+# a missing front end must be a NAMED refusal with a RECORDED verdict, not a start-limit loop.
+mkdir -p "$TMP/farm-notrigger" "$TMP/state-notrigger"
+cp "$LOOP" "$TMP/farm-notrigger/pr-repair-loop.sh"
+O="$TMP/state-notrigger" PR_DOCTOR_REPO=fake/one PR_DOCTOR_REPO_DIR="$TMP/checkout" \
+    PR_REPAIR_SCRIPTS="$TMP/farm-notrigger" "$LOOP" --trigger >"$TMP/notrigger.out" 2>&1
+check "--trigger with no front end REFUSES (rc 2)" 2 "$?"
+grep -q 'pr-doctor-trigger.py' "$TMP/notrigger.out" \
+    && ok "...and the refusal names the missing artifact" \
+    || bad "...and the refusal does not name the artifact"
+[ -s "$TMP/state-notrigger/state/pr-repair.status.json" ] \
+    && ok "...and the verdict is RECORDED (a reader can tell REFUSED from IDLE)" \
+    || bad "...and nothing was recorded — 'refused' would read as 'nothing to do'"
+
+echo "── REPAIR_MODE: the unit's ONE clock choice ──"
+env "${stub_scope[@]}" REPAIR_MODE=trigger PR_REPAIR_SCRIPTS="$TMP/farm-trigger" \
+    TEMPLATES_DIR="$ROOT/templates/systemd" "$INSTALLER" --dry-run >"$TMP/render-trigger.out" 2>&1
+check "REPAIR_MODE=trigger renders (§rc)" 0 "$?"
+grep -q 'ExecStart=.*pr-repair-loop.sh --trigger' "$TMP/render-trigger.out" \
+    && ok "ExecStart runs the loop in --trigger mode" \
+    || bad "ExecStart is not --trigger in trigger mode"
+grep -q '{{' "$TMP/render-trigger.out" \
+    && bad "the trigger-mode render leaves an unresolved placeholder" \
+    || ok "the trigger-mode render substitutes every placeholder"
+grep -q 'REPAIR_TRIGGER_POLL_S=' "$TMP/render-trigger.out" \
+    && ok "...and carries the front end's knobs as Environment=" \
+    || bad "...and drops the front end's knobs (a rendered poll/backstop must be readable)"
+env "${stub_scope[@]}" PR_REPAIR_SCRIPTS="$TMP/farm-trigger" TEMPLATES_DIR="$ROOT/templates/systemd" \
+    "$INSTALLER" --dry-run >"$TMP/render-default.out" 2>&1
+grep -q 'ExecStart=.*pr-repair-loop.sh --loop' "$TMP/render-default.out" \
+    && ok "the DEFAULT mode is unchanged (--loop: no box changes clock on a plain upgrade)" \
+    || bad "the default render no longer names --loop"
+env "${stub_scope[@]}" REPAIR_MODE=bogus "$INSTALLER" --dry-run >"$TMP/render-bogus.out" 2>&1
+check "an unknown REPAIR_MODE is REFUSED (rc≠0, not rendered as --BOGUS)" 2 "$?"
+# ⛔ THE ARTIFACT THE MODE EXECS IS VERIFIED BEFORE THE UNIT EXISTS. A trigger-mode install whose farm
+# lacks the trigger would start, fail, exhaust StartLimitBurst and read `failed` — loud but late, and
+# it looks like a broken loop rather than a missing farm.
+mkdir -p "$TMP/farm-notrigger2" "$TMP/unit-trigger"
+cp "$LOOP" "$TMP/farm-notrigger2/pr-repair-loop.sh"
+cp "$ROOT/scripts/pr-doctor.py" "$TMP/farm-notrigger2/pr-doctor.py"
+cp "$ROOT/scripts/pi-reap-worktrees.sh" "$TMP/farm-notrigger2/pi-reap-worktrees.sh"
+chmod +x "$TMP/farm-notrigger2/pi-reap-worktrees.sh"
+env UNIT_DIR="$TMP/unit-trigger" SYSTEMCTL=/bin/true REPAIR_MODE=trigger \
+    PR_REPAIR_SCRIPTS="$TMP/farm-notrigger2" TEMPLATES_DIR="$ROOT/templates/systemd" \
+    "$INSTALLER" --install >"$TMP/install-notrigger.out" 2>&1
+check "a trigger-mode install with NO farmed trigger is REFUSED (rc≠0)" 1 "$?"
+grep -q 'pr-doctor-trigger.py' "$TMP/install-notrigger.out" \
+    && ok "...and the refusal names the missing artifact" \
+    || bad "...and the refusal does not name it"
+[ ! -f "$TMP/unit-trigger/eldato-pr-repair.service" ] \
+    && ok "...and NO unit was written (a refused install leaves nothing behind)" \
+    || bad "...and a unit was written anyway"
+# ⛔ `--status` REPORTS THE INSTALLED MODE, NOT THE CALLER'S ENV. The env says what an install WOULD
+# render; the question is what this box RUNS. A status built from `$REPAIR_MODE` prints `trigger` over
+# a unit executing `--loop` — the "read the artifact, not the send" rule this installer is built on.
+mkdir -p "$TMP/unit-mode"
+printf '[Service]\nExecStart=%s/pr-repair-loop.sh --trigger\nKillMode=process\n' "$TMP/farm-trigger" \
+    >"$TMP/unit-mode/eldato-pr-repair.service"
+env UNIT_DIR="$TMP/unit-mode" SYSTEMCTL=/bin/true REPAIR_MODE=loop PR_REPAIR_SCRIPTS="$TMP/farm-trigger" \
+    "$INSTALLER" --status >"$TMP/status-mode.out" 2>&1
+grep -q 'mode=trigger' "$TMP/status-mode.out" \
+    && ok "--status reports mode=trigger from an ExecStart that says --trigger (not from the caller's env)" \
+    || bad "--status reported the caller's REPAIR_MODE instead of the installed ExecStart"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "✅ pr-repair-loop: $PASS assertions passed"

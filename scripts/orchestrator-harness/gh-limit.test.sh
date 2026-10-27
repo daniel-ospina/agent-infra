@@ -1234,6 +1234,52 @@ _nm="$(PATH="$TMP/nomark/gh-rest:$TMP/nomark/gh-limit:$TMP/nomarkreal:$PATH" HOM
 ck "shim identity: with the HELPER ABSENT the two shims still reach the real gh (rc=0, not 127)" \
    "$([ "$_nmrc" -eq 0 ] && has 'REAL-GH' "$_nm" && echo 0 || echo 1)"
 
+# ⛔ K1b. READING A CANDIDATE MUST BE SILENT, BECAUSE THE REAL gh IS A COMPILED BINARY (#10009).
+# The walk reads every candidate that `-f -x` admits, and on a real box that candidate IS the genuine
+# gh — an ELF/Mach-O full of NUL bytes. The form that leaks is the command substitution the helper used
+# to read it (`_head="$(head -c 8192 "$1")"`): bash >= 4.4 then prints
+# `warning: command substitution: ignored null byte in input` on the STDERR of a call that SUCCEEDS, and
+# the adapter's callers merge stderr into the bytes they PARSE (`2>&1`). MEASURED on all three cloud
+# cells: that warning became the reported output of every PR read —
+# `NOCHECKS:READ-FAILED:transport … ignored null byte in input` — so the acting arms found no work
+# while the PR queue sat there. The cell read as IDLE, not broken: the false green.
+# Two assertions, because the fix has two halves: the read is silent, AND it still identifies the
+# candidate correctly (a binary carrying the sentinel must be SKIPPED as a shim, so the walk lands on
+# the real gh further down PATH — resolution must not be sacrificed for quiet).
+# NOTE ON NON-VACUITY: the warning does not exist below bash 4.4, and macOS ships 3.2 (it strips NULs
+# silently), so on that shell this case can only catch a change that BREAKS resolution. On Linux
+# (bash >= 4.4 — CI, and the fleet's cells, where the defect was measured) reverting the helper to the
+# command-substitution form fails the second assertion: rc stays 0 and the merged stream carries the
+# warning (measured: 101 bytes against 8 with the fix — `REAL-GH ` plus a 93-byte warning line).
+reset_env binwalk
+mkdir -p "$TMP/binwalk/gh-rest" "$TMP/binwalk/bin" "$TMP/binwalk/real"
+cp "$SHIM" "$TMP/binwalk/gh-rest/gh"; chmod +x "$TMP/binwalk/gh-rest/gh"
+# A BINARY candidate: a real object header, NUL bytes, and the sentinel after them — so it is
+# unmistakably a shim while still being exactly the shape that used to leak.
+{ printf '\177ELF\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0'
+  printf '# harness-gh-shim-marker\n'; head -c 64 /dev/zero; } > "$TMP/binwalk/bin/gh"
+chmod +x "$TMP/binwalk/bin/gh"
+printf '#!/usr/bin/env bash\necho REAL-GH "$@"\n' > "$TMP/binwalk/real/gh"; chmod +x "$TMP/binwalk/real/gh"
+# No `timeout` bound here (unlike the neighbouring cases): the fixture cannot recurse, so there is
+# nothing to bound. A walk that FAILS to skip it exec's a non-script and exits at once (measured rc=126
+# "cannot execute binary file"), so an unbounded form cannot hang the suite.
+_bw="$(PATH="$TMP/binwalk/gh-rest:$TMP/binwalk/bin:$TMP/binwalk/real:$PATH" HOME="$TMP/home" \
+        GH_LIMIT_REAL_GH= GH_REST_REAL_GH= gh --version 2>&1)"; _bwrc=$?
+ck "binary candidate: a binary shim on PATH is SKIPPED and the walk still lands on the real gh (rc=0)" \
+   "$([ "$_bwrc" -eq 0 ] && has 'REAL-GH' "$_bw" && echo 0 || echo 1)"
+ck "binary candidate: reading it leaves NO 'ignored null byte' on the caller's merged stream" \
+   "$(has 'ignored null byte' "$_bw" && echo 1 || echo 0)"
+
+# The CELL WRAPPER carries the same read on its FAIL-OPEN walk — the state a half-installed box is in
+# (adapter seeded, helper missing), which is exactly the state that path exists for. Same fixture, so
+# the class is pinned at BOTH entry points rather than only where it was measured.
+mkdir -p "$TMP/binwalk/wrap"
+cp "$WRAPPER" "$TMP/binwalk/wrap/gh"; chmod +x "$TMP/binwalk/wrap/gh"
+_ww="$(PATH="$TMP/binwalk/wrap:$TMP/binwalk/bin:$TMP/binwalk/real:$PATH" HOME="$TMP/home" \
+        GH_LIMIT_REAL_GH= gh --version 2>&1)"; _wwrc=$?
+ck "binary candidate: … and the cell wrapper's fail-open walk is silent too (rc=0, real gh reached)" \
+   "$([ "$_wwrc" -eq 0 ] && has 'REAL-GH' "$_ww" && ! has 'ignored null byte' "$_ww" && echo 0 || echo 1)"
+
 # ⛔ K2. THE FLOAT KNOBS ARE BOUNDED TOO. `cfg_int` was bounded in round 1 while the four SECONDS
 # knobs still took `nan`/`inf` verbatim, and each one dies differently: nan → a traceback from
 # `int(nan)` instead of gh's message, inf LOCK_TIMEOUT → a lock wait that never expires, nan MAX_WAIT

@@ -21,10 +21,16 @@ Agents are comfortable saying "Fixed" or "Done" without evidence. This skill mak
 - After writing content (editorial, deal, guide)
 - After making configuration changes
 - After fixing a bug
-- After scoping an issue (confirm verification gates passed)
+- After scoping an issue (confirm verification gates passed - see the `task-workflow-standard` note below)
 - Before telling the user "this is ready" / "done" / "fixed"
 
 ## Scoping Verification
+
+> **`task-workflow-standard` (agent-infra#2861) - this section does not apply, and its failure row is EXPECTED there.**
+>
+> `issue-scoping`'s `problem-verify` and `solution-verify` are **not dispatched** by that pipeline: its merged `PLAN-VERIFY` is the single pre-code round. So the plan comment deliberately carries **no `## Verification Gates` block** (`issue-scoping`'s Phase 8 banner says so), and "No Verification Gates section" is **not** a missing gate, **not** a pre-v5.1.0 skill, and **not** a human gate.
+>
+> The check that replaces it - same question (*did the pre-code review actually run?*), different artifact: the `<!-- plan-review: cycles=<n>, status=<clean|threat-surface-covered>, version=2.3.0 -->` signature in the plan doc, mirrored by `**Rounds:** <rounds> (verifiers: <count>, class: <class>)` in the plan comment. **Absent signature = stop and run PLAN-VERIFY**; present = verified. For the epic/project pipelines, everything below stands unchanged.
 
 **⛔ MANDATORY before claiming scoping is complete.**
 
@@ -56,7 +62,7 @@ Expected output (varies by tier):
 |--------|--------|
 | Both gates clean | ✅ Scoping verified. Proceed to label transition. |
 | Gate shows "N issues remain" | ❌ Do NOT claim scoping done. Re-open the gate and re-verify. |
-| No Verification Gates section | ⚠️ Scoping was run with pre-v5.1.0 skill. Gate missing — escalate to human. |
+| No Verification Gates section | ⚠️ Scoping was run with pre-v5.1.0 skill. Gate missing — escalate to human. **`task-workflow-standard`: this row is EXPECTED — check the `plan-review` signature instead (note above); never escalate to a human on it.** |
 | Micro tier: full-diamond-verify clean | ✅ Scoping verified (same check). |
 
 ### Step 3 — Evidence

@@ -48,9 +48,11 @@ if [ -z "${ALLOWLIST_JSON//[[:space:]]/}" ] || [ "${ALLOWLIST_JSON//[[:space:]]/
   EXIT_REASON="git-error"; SKIP_LOOP=true
 fi
 
-# #838 — adversarial domain: set to 1 iff the scoping comment carries the
-# `### Adversarial Threat Surface` declaration. Drives the 2-cycle bound in L1
-# and the `adversarial-capped` exit. Unset/0 → the class's own cap.
+# #838 — adversarial domain: set to 1 iff the change declares a threat surface —
+# a `**Threat classes**` sub-block of a `### Review Scope Contract` (what
+# task-workflow-standard writes) or a legacy `### Adversarial Threat Surface`
+# scoping declaration. Drives the 2-cycle bound in L1 and the `adversarial-capped`
+# exit. Unset/0 -> the class's own cap.
 ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}
 
 # #1537 — the ceiling is the CHANGE's own, so the loop needs the class Step 3.6

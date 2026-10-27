@@ -96,6 +96,12 @@ git -C "$RUN_REPO" add README
 git -C "$RUN_REPO" -c user.email=t@t -c user.name=t commit -qm fixture
 git -C "$RUN_REPO" checkout -q -b feat/fixture-run
 
+# ⛔ THE ROUTER IS PINNED ABSENT FOR THIS SUITE (agent-infra #2866). `lane-merge.sh` consults the PR
+# state router before it spends a FIX round, and that consult would otherwise resolve the REAL module
+# from this checkout and reach GitHub through the suite's gh shim — a hermetic suite that silently
+# depends on the box's tree. The router's rules are pinned in tools/fleet/pr_state.test.py and the
+# seam's demotions in tests/pr-state-wiring/run.sh; here it must simply not run.
+PR_STATE_BIN="$T/no-router-in-this-suite"; export PR_STATE_BIN
 run() { # run <pr> <args…>  → sets RC, OUT
   OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
         LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT="${WAIT_S:-0}" LANE_MERGE_POLL="${POLL_S:-0}" \

@@ -1,0 +1,7 @@
+  ▸   26s  pi-bootstrap/tests/test-farm-unfarm.sh
+───────────────────────────────────────────────────────────────
+/tmp/tmp.HhUuDM1NrB: line 1: syntax error near unexpected token `then'
+/tmp/tmp.HhUuDM1NrB: line 1: `if then'
+❌ 1 bash shard(s) failed
+❌ failing shard(s): scripts/orchestrator-harness/refresh-spend.test.sh
+##[error]Process completed with exit code 1.
