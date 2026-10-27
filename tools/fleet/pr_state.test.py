@@ -64,6 +64,24 @@ WHAT IS PINNED, AND THE DEFECT EACH RULE PREVENTS
                         claimed this; the code printed 0, which is also `--suppress`'s before= figure).
   action-needs-only     `--action` without `--only` REFUSES (exit 2): the row it would print belongs
                         to whichever PR sorts first in the whole table.
+  empty-body-is-a-read-error
+                        an EMPTY or TRUNCATED API body is a failed READ, never an empty surface (and
+                        never an uncaught JSONDecodeError): `gh` exits 0 with no body when a token or
+                        proxy eats the answer, which used to arrive as `[]` — the same reason a
+                        genuinely check-free PR gets.
+  suppress-unknown-queue
+                        a `--suppress` pass that could enumerate NOTHING exits 2 and says so; it used
+                        to report `cancelled=0` and exit 0 — a success signal for a pass that never
+                        ran.
+  workflow-listing-unreadable
+                        a failed read of the head's RUN LISTING is a failed SURFACE read, never "no
+                        workflow names": `{}` is the "nothing is named" answer, which puts every
+                        attempt in its own `?unknown:<run>` group, so a job whose newest attempt
+                        PASSED is reddened by an older failing one and a fixer is sent at a green head.
+  authority-not-a-list  a branch-protection answer that is not a LIST is an ABSTENTION, never "no
+                        required checks": `null`/a bare string parsed as an empty context list
+                        classifies a review-GATED repo as `rail` and lets an unattested PR land. `[]`
+                        stays `rail` (a legitimate "no required checks").
 """
 
 from __future__ import annotations
@@ -752,6 +770,65 @@ def _(M):
         w.cleanup()
 
 
+@test("workflow-listing-unreadable")
+def _(M):
+    """A failed read of the head's RUN LISTING is a failed surface read, not "no workflow names".
+
+    `resolve_workflows` used to answer `{}` on a read failure. `{}` is the "nothing is named" answer,
+    which puts every ATTEMPT of a job in its own `?unknown:<run>` group — the newest attempt stops
+    winning, so a job whose newest attempt PASSED is reddened by an older failing one and a fixer is
+    dispatched at a green head (FIX-RED, a burned FIX round), while the reason attributes the newest
+    verdict to the older run.
+    """
+    w = World()
+    try:
+        head = "1" * 40
+        w.prs([w.pr(7, head)])
+        green(w, head)
+        w.record(7, head)
+        # the run listing is the ONE read that fails (the stub cannot parse the fixture → rc 1)
+        with open(os.path.join(w.dir, "runs-%s.json" % head), "w") as f:
+            f.write("not json")
+        r = by_pr(rows_of(w))[7]
+        assert r["action"] == "WAIT:no-check-surface", r
+        assert "could not be read" in r["reason"], r
+    finally:
+        w.cleanup()
+
+
+@test("authority-not-a-list")
+def _(M):
+    """A protection answer that is not a LIST is an ABSTENTION, never "no required checks".
+
+    `null`, a bare string, an HTML error page — all answer 200 and none of them is the documented
+    payload. Reading them as an empty context list classifies a review-GATED repo as `rail`, drops
+    `review_required`, and lets an unattested PR report LAND. `[]` is a legitimate "no required
+    checks" and must keep answering `rail`.
+    """
+    for body in (None, "oops", {"unexpected": 1}):
+        w = World()
+        try:
+            head = "1" * 40
+            w.write("contexts.json", body)
+            w.prs([w.pr(7, head)])
+            green(w, head)
+            r = by_pr(rows_of(w))[7]
+            assert r["action"] == "WAIT:authority-unreadable", (body, r)
+        finally:
+            w.cleanup()
+    # CONTROL: an empty LIST is "no required checks" — a rail repo, and no review record is owed.
+    w = World()
+    try:
+        head = "1" * 40
+        w.write("contexts.json", [])
+        w.prs([w.pr(7, head)])
+        green(w, head)
+        r = by_pr(rows_of(w))[7]
+        assert r["action"] == "LAND", r
+    finally:
+        w.cleanup()
+
+
 @test("action-needs-only")
 def _(M):
     """`--action` without `--only` REFUSES: the row it would print is another PR's answer."""
@@ -1056,6 +1133,18 @@ MUTATIONS = [
      '    if rows and not all(r.get("queued_known", True) for r in rows):',
      '    if False:',
      "a suppression pass that could enumerate NOTHING reports success (cancelled=0, exit 0)"),
+    ("workflow-listing-unreadable",
+     '"repos/%s/actions/runs?head_sha=%s&per_page=100" % (repo, sha)])\n    except ReadError:\n        return None',
+     '"repos/%s/actions/runs?head_sha=%s&per_page=100" % (repo, sha)])\n    except ReadError:\n        return {}',
+     "a failed run listing is read as 'nothing is named', so every attempt becomes its own group"),
+    ("authority-not-a-list",
+     '    elif not isinstance(ctx, list):',
+     '    elif False:',
+     "a non-list protection answer is read as 'no required checks', so a gated repo lands unattested"),
+    ("workflow-listing-unreadable",
+     '            if names is None:',
+     '            if False:',
+     "the evidence_for guard lets an unresolved workflow map through to the grouping"),
 ]
 
 

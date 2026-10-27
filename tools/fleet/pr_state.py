@@ -388,7 +388,12 @@ class ReadError(Exception):
 
 
 def gh(args, timeout=60):
-    """One `gh` call. Returns stdout; raises ReadError on a non-zero/empty answer."""
+    """One `gh` call. Returns stdout; raises ReadError on a NON-ZERO answer.
+
+    An EMPTY body is deliberately NOT checked here: `cancel_run`'s `POST …/cancel` answers 202 with no
+    body, so a global emptiness rule would report a successful cancel as failed. The JSON readers
+    (`gh_json`, `gh_stream`) own that check, and both raise ReadError on an empty body.
+    """
     cmd = [gh_bin()] + list(args)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -500,13 +505,18 @@ def resolve_workflows(repo, sha):
     A check-run payload carries no workflow, and `details_url` carries only the run id, so this is
     the resolution step the grouping rule needs. A run the listing does not name stays unnamed and
     becomes its own group — never silently merged with another workflow's same-named job.
+
+    ⛔ A FAILED LISTING IS `None`, NOT `{}` — and that is load-bearing. `{}` is the "nothing is named"
+    answer, which puts EVERY attempt of a job in its own `?unknown:<run>` group; the newest attempt no
+    longer wins, so a job whose newest attempt PASSED is reddened by an older failing one and a fixer
+    is dispatched at a green head. Both callers turn `None` into their own read-failure arm.
     """
     out = {}
     try:
         items = gh_stream(["api", "--paginate",
                            "repos/%s/actions/runs?head_sha=%s&per_page=100" % (repo, sha)])
     except ReadError:
-        return out
+        return None
     for run in items:
         runs = run.get("workflow_runs") if isinstance(run.get("workflow_runs"), list) else [run]
         for r in runs:
@@ -544,6 +554,11 @@ def read_main_reds(repo, base="main"):
             return None
         rows = read_check_rows(repo, sha)
         names = resolve_workflows(repo, sha)
+        if names is None:
+            # Main's workflow names are part of the same read: without them main's own groups are
+            # split the same way, so "is this job red at main?" cannot be answered. Unknown main
+            # keeps this tree's red (the caller's documented fallback), never "main is green".
+            return None
         for r in rows:
             r["workflow"] = names.get(r["run"], "")
         v = verdict(rows)
@@ -566,6 +581,13 @@ def read_authority(repo, base="main"):
         return "unreadable", str(e)
     if isinstance(ctx, dict) and isinstance(ctx.get("contexts"), list):
         ctx = ctx["contexts"]
+    elif not isinstance(ctx, list):
+        # ⛔ A BODY THAT IS NOT A LIST IS AN ABSTENTION, NOT "NO REQUIRED CHECKS". `null`, a bare
+        # string or an HTML error page all parse as JSON-or-not yet answer 200; reading them as an
+        # empty context list classifies a review-GATED repo as `rail`, which drops `review_required`
+        # and lets an unattested PR report LAND — the fail-open this function exists to prevent.
+        # `[]` (a legitimate "no required checks") still answers `rail`.
+        return "unreadable", "the required-status-checks contexts were not a list (%s)" % type(ctx).__name__
     names = [c if isinstance(c, str) else ((c or {}).get("context") or "") for c in (ctx or [])]
     return ("gate" if gate in names else "rail"), "required: %s" % ", ".join(n for n in names if n)
 
@@ -659,8 +681,14 @@ def evidence_for(repo, pr, authority, queued_by_head, main_reds_getter):
         try:
             rows = read_check_rows(repo, head)
             names = resolve_workflows(repo, head)
+            if names is None:
+                # The workflow names are what STOP one workflow's same-named job masking another; a
+                # failed read of them does not degrade to "unnamed", it fails the surface read.
+                raise ReadError("the head's run listing could not be read — the workflow that owns "
+                                "each check cannot be resolved, so the groups cannot be trusted")
         except ReadError as e:
             read_ok = False
+            rows = []                  # a failed surface read keeps NO rows (there is no evidence)
             ev["checks"] = {"verdict": "NOREAD", "groups": 0, "red": [], "in_flight": 0,
                             "reason": "the check surface could not be read: %s" % e}
     for r in rows:
