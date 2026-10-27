@@ -370,6 +370,31 @@ Read the RUNS, on the EXACT sha, newest attempt per check:
 
 A per-name rollup answers *"has main EVER been red?"* — almost always yes — not *"is main green now?"*. **This false red has already produced a wrong "main is red" conclusion that stalled work on a green main** — the defect is `tortoise#4877`, and the instruction-file divergence it exposed is `agent-infra#1399`.
 
+**⛔ WHEN THE QUEUE — NOT THE CODE — IS THE BLOCKER, REPRODUCE THE LANE AND MERGE ON THAT EVIDENCE.**
+Owner ruling, 2026-10-27 (`agent-infra#2936`), first exercised on `tortoise#10184`, whose `docs` lane sat
+`queued` behind 98 other runs while the repo held 6 in progress and `ci-queue-health` was *itself* pending.
+An indefinite wait for a run the queue has not started is not a gate, it is an outage — so the lane's own
+steps are run **locally**, and their output is posted as the evidence the merge rests on.
+**OVERRIDES:** the rail's precondition that a merge wait for a run that TESTED the head (`admin-merge.sh`,
+*"no run of the lane actually TESTED head"*) — when the queue is the ONLY reason no such run exists, local
+reproduction of that lane is the substitute, and the PR states it rather than implying it.
+It is bounded hard, and a lane that reads it as a general licence has read it wrong:
+
+- **Review evidence stays mandatory and HEAD-BOUND.** The substitute replaces a *lane*, never the review
+  gate: `record-review.sh` at the final head is what makes such a merge legitimate. A push invalidates it,
+  so re-record after every fix.
+- **Reproduce THAT lane's own steps and post their output.** *"It's docs-only"* is not evidence; the four
+  `docs` steps are. A step that cannot be reproduced on this host is **declared, not skipped** — the pinned
+  `lychee` has no arm64 build, so the link check was replaced by the three measurements that decide its
+  verdict (no new links added, the one external URL resolves, the relative targets exist), and the PR says
+  exactly that.
+- **A check the change class CAN fail is not droppable.** The ruling names CI-only jobs of the `legal-e2e`
+  class as bureaucracy *for a diff they cannot test*; it does not license skipping a check that could catch
+  this change.
+- **Do not make bypassing a local safety gate a habit.** The ruling names the QUEUE as the blocker, never the
+  `#1484` script-backdoor guard or the admin-merge evidence gate. Where those cannot be satisfied inside a
+  session, say so in the PR and record why — do not quietly route around them and report a clean run.
+
 - **⛔ A MEASUREMENT ARTIFACT IS NOT A STATE — never take a destructive action from a FIRST-MATCH
   reading.** This has now happened **three times on healthy systems**, each caught only because the
   read was re-measured before acting: (1) a compaction **summary** — a cache of a past read, not a
