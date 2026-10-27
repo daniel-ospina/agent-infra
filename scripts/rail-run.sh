@@ -113,11 +113,13 @@ usage: rail-run.sh start  <PR> ARGS...
           0 landed · 10 running · 20 refused · 21 killed · 22 gone-without-verdict
           23 exited-zero · 24 no-run · 25 unknown · 2 usage · 3 a live run holds this PR
 
-  --repo OWNER/REPO  pass it exactly when the rail needs it; it also keys the run state, so
-                     `status` must be given the SAME value. Without it the key is the repository
-                     this script is run from, resolved through the git COMMON dir — one key for
-                     every worktree of that repo. Outside a git checkout there is no repo identity,
-                     so pass --repo.
+  --repo [HOST/]OWNER/REPO  pass it exactly when the rail needs it; it also keys the run state,
+                     so `status` must be given the SAME value. BOTH verbs key the CANONICAL SLUG —
+                     from this value, else from `origin` (`RAIL_RUN_REPO_SLUG` pins it) — and fall
+                     back to the git COMMON-dir name only when no identity resolves at all: one key
+                     for every worktree of that repo. A HOST prefix is stripped for the key and
+                     RECORDED as the run's host, because the artifact check compares the host too.
+                     Outside a git checkout with neither, there is no identity, so pass --repo.
   --run <run-id>     poll a SPECIFIC run instead of the newest one (a poller that started run A
                      must never be shown run B's state).
 EOF
@@ -160,6 +162,13 @@ age_s() { # <path> -> integer seconds since it was last written, or nothing
 # BASE PARENT COULD NOT BE READ` contains it and says the rail could not read — the exact
 # wrong-direction verdict this allow-list exists to prevent. Only phrasings that appear in ONE
 # template, and that state a judgement of the head, are listed.
+# ⛔ EVERY STEM BELOW IS A SINGLE TEMPLATE whose sibling read-failure deliberately avoids the
+# wording — that is the test for adding one (`admin-merge.sh` states it at its `require_draft`:
+# "The refusal deliberately does NOT contain the phrase `is a DRAFT`").
+# KNOWN GAP, stated rather than papered over: `no run of the lane actually TESTED head $head` is
+# ALSO a single template, but it is a precondition about CI having been dispatched, not a judgement
+# about the diff — `refused` would tell a lane to abandon a head nobody has tested yet. It stays
+# `unknown` (25) until there is a state for "dispatch CI", which this script does not have.
 HEAD_VERDICT_STEMS=(
   "tree this pr produces is red"
   "has not measured it"            # THE BASE IS RED AND THIS PR HAS NOT MEASURED IT (a STALE surface)
@@ -167,6 +176,8 @@ HEAD_VERDICT_STEMS=(
   "never tested main"
   "conflicted"
   "--no-rerun"
+  "is a draft"                      # PR #N is a DRAFT (its unreadable sibling carries [draft_unreadable])
+  "survived the re-run"             # $N failure(s) SURVIVED the re-run (the tree is red after a re-run)
 )
 refusal_is_head_verdict() {
   local low
@@ -253,6 +264,23 @@ resolve_host() {
   h="${h##*@}"
   case "$h" in ''|*[!A-Za-z0-9.:-]*) h="github.com" ;; esac
   printf '%s' "$h"
+}
+
+# host_from_slug_arg <value> -> the HOST component when <value> is spelled [HOST/]OWNER/REPO, else
+# nothing. ⛔ THE HOST AND THE SLUG MUST COME FROM THE SAME PLACE. `normalize_slug` reduces
+# `HOST/OWNER/REPO` to its last two components, so a host supplied that way was discarded while
+# `rd/host` was always read from `origin` — leaving a GHE target named by `--repo` from a github.com
+# checkout recorded as github.com/acme/widgets, whose artifact check then demanded a URL that host
+# never serves: `landed` unreachable, the same failure class this file already fixed for
+# `@`-prefixed remotes. Fail-closed, but still a run nobody can land.
+host_from_slug_arg() {
+  local v="${1:-}"
+  [ -n "$v" ] || return 0
+  v="${v#*://}"; v="${v%.git}"
+  case "$v" in */*/*) : ;; *) return 0 ;; esac   # OWNER/REPO names no host
+  v="${v%%/*}"
+  case "$v" in ''|*[!A-Za-z0-9.:-]*) return 0 ;; esac
+  printf '%s' "$v"
 }
 
 resolve_slug() {
@@ -434,8 +462,13 @@ start_rail() {
   # The identity is RECORDED, not assumed at read time: `--repo` overrides, otherwise it comes from
   # `origin`. If neither yields one the run still starts (it can still merge) but its artifact reads
   # abstain, and `status` says which flag supplies it.
+  local raw_slug="$slug"
   if [ -z "$slug" ]; then slug="$(resolve_slug)"; fi
   slug="$(normalize_slug "$slug")"
+  # The HOST is taken from the same value the slug came from when that value names one, and only
+  # otherwise from `origin`: the pair (slug, host) is one identity, and mixing the two sources let a
+  # run record a host that never serves the repo it was pointed at.
+  local host_hint; host_hint="$(host_from_slug_arg "$raw_slug")"
   # ⛔ AN IDENTITY IS REQUIRED TO START. Without one no artifact read can ever be verified, so the run
   # could only ever report `unknown` — and its abstention could name no remedy that works (a `--repo`
   # supplied later moves the state key). Refusing here is the honest answer, and it is reversible.
@@ -458,7 +491,7 @@ start_rail() {
   # pid read and absent) or a claim older than CLAIM_MAX (its launcher lived ~5s, so it is abandoned —
   # this also stops a recycled pid reading off-fence from blocking the PR forever) clears it.
   CLAIM="$dir/.starting"
-  local tries=0 c_pid c_start c_probe c_rc c_age c_stale c_born
+  local tries=0 c_pid c_start c_probe c_rc c_stale
   while :; do
     if mkdir "$CLAIM" 2>/dev/null; then break; fi
     tries=$((tries + 1))
@@ -467,10 +500,16 @@ start_rail() {
       printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
       exit 3
     fi
-    c_born="$(numeric_or_empty "$(file_or_empty "$CLAIM/created")")"
-    if [ -n "$c_born" ]; then c_age=$(( $(date +%s) - c_born )); else c_age="$(numeric_or_empty "$(age_s "$CLAIM")")"; fi
+    # ⛔ STALENESS COMES FROM THE ONE HELPER, NOT AN INLINE COPY OF IT. `younger_than` reads the
+    # `created` epoch with the mtime as a fallback and treats an UNREADABLE age (or a future
+    # `created` from clock skew) as NOT young, so the bound always fires. The inline copy this
+    # replaces set `stale` only when an age was READABLE, so a claim with no pid and an unreadable
+    # mtime refused every later `start` for ever, with no in-band remedy — the stale-flag defect
+    # (#8175) this file closes for the record path, re-opened in the claim path. It is also what
+    # `younger_than`'s own contract states: it is used by BOTH blocking decisions so they cannot
+    # drift apart, and a blocking abstention is bounded or it is a permanent block.
     c_stale=0
-    if [ -n "$c_age" ] && [ "$c_age" -gt "$CLAIM_MAX" ]; then c_stale=1; fi
+    younger_than "$CLAIM" "$CLAIM_MAX" || c_stale=1
     c_pid="$(file_or_empty "$CLAIM/pid")"; c_start="$(file_or_empty "$CLAIM/start")"
     c_probe="a claim older than ${CLAIM_MAX}s (its launcher is gone)"
     if [ -z "$c_pid" ]; then
@@ -511,6 +550,11 @@ start_rail() {
   # one PR is a second merge attempt, and an unread probe is not permission.
   local prev
   prev="$(file_or_empty "$dir/latest")"
+  # ⛔ `latest` IS A PATH COMPONENT HERE TOO. `start` joins it into a directory and probes a pid out
+  # of it, so a hand-edited or half-written value must not aim that probe outside the run root.
+  # `status` validates it identically — the two verbs must agree on what is in flight, or one of
+  # them is reasoning about a directory the other never wrote.
+  case "$prev" in ''|.|..|*/*|*[!A-Za-z0-9._-]*) prev="" ;; esac
   if [ -n "$prev" ] && [ -d "$dir/$prev" ] && prev_in_flight "$dir/$prev"; then
     printf 'rail-run: ✗ a rail run for pr=%s may still be alive (run=%s)\n' "$pr" "$prev" >&2
     printf '  its log:  %s\n' "$dir/$prev/log" >&2
@@ -527,7 +571,7 @@ start_rail() {
   printf '%s\n' "$(date +%s)" > "$rd/created"
   printf '%s\n' "$slug" > "$rd/repo"
   printf '%s\n' "$RAIL" > "$rd/rail"
-  printf '%s\n' "$(resolve_host)" > "$rd/host"
+  printf '%s\n' "${host_hint:-$(resolve_host)}" > "$rd/host"
   # ⛔ THE RECORD AND THE RAIL MUST NAME THE SAME REPO BY CONSTRUCTION. When the identity was NOT
   # taken from argv (`--repo`, or the `=` form) it came from `origin`/`RAIL_RUN_REPO_SLUG` — and a pin
   # that disagrees with the checkout would otherwise leave the rail merging one repo while `status`
@@ -598,6 +642,19 @@ os.execvp(sys.argv[1], sys.argv[1:])'
     done
     if kill -0 "$spawn" 2>/dev/null || { [ -s "$rd/pid" ] && kill -0 "$(file_or_empty "$rd/pid")" 2>/dev/null; }; then
       CLAIM_KEEP=1
+      # ⛔ THE RETAINED CLAIM MUST NAME A PID THAT IS POSITIVELY ALIVE. The claim's `pid` is this
+      # LAUNCHER's `$$`, and this branch exits — so the next start's probe read the launcher as
+      # positively GONE and cleared the claim at once, making "left in place so no second rail can
+      # race it" false: within CLAIM_MAX the only block left was `prev_in_flight`, and a second rail
+      # could start while the spawn was still alive. Record the SURVIVOR instead; a probe that reads
+      # it LIVE is never cleared, whatever the claim's age.
+      local keep_pid=""
+      if kill -0 "$spawn" 2>/dev/null; then keep_pid="$spawn"
+      elif [ -s "$rd/pid" ]; then keep_pid="$(file_or_empty "$rd/pid")"; fi
+      if [ -n "$keep_pid" ]; then
+        printf '%s\n' "$keep_pid" > "$CLAIM/pid"
+        printf '%s\n' "$(numeric_or_empty "$(pid_start_epoch "$keep_pid" 2>/dev/null || true)")" > "$CLAIM/start"
+      fi
       printf 'rail-run: ✗ the launch did not record a pid and its spawn %s is STILL ALIVE after SIGKILL\n' "$spawn" >&2
       printf '  the start claim was LEFT IN PLACE so no second rail can race it; remove %s by hand\n' "$CLAIM" >&2
       printf '  only after checking %s\n' "$rd/log" >&2

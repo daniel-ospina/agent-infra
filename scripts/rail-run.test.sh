@@ -344,18 +344,31 @@ assert_contains "$TXT" "artifact=unread" "IDENTITY: and says the artifact read a
 OUT="$(GH_MODE=merged poll 150)"; assert_rc 0 "${OUT%%|*}" "IDENTITY: the SAME run reads landed when the url names this repo+PR"
 # …and with NO identity ANYWHERE (no pin, no origin, no record) the read abstains: it cannot know
 # which repo the number belongs to, and guessing is what produces a false `landed`.
-mkdir -p "$T/scratch-id"
+# ⛔ THE ARM MUST DISCRIMINATE. Asserting only `no-run` passes for ANY key, including the single
+# constant the old code hashed every non-git cwd to (`nogit`) — so TWO different directories are
+# polled and the KEYS are compared: a per-directory hash gives two different `repo-…` keys.
+mkdir -p "$T/scratch-id" "$T/scratch-id2"
 ID_OUT="$(cd "$T/scratch-id" && RAIL_RUN_REPO_SLUG= "$BASH_BIN" "$RR" status 501 2>&1)"
+ID_OUT2="$(cd "$T/scratch-id2" && RAIL_RUN_REPO_SLUG= "$BASH_BIN" "$RR" status 501 2>&1)"
 assert_contains "$ID_OUT" "no-run" "IDENTITY: with no resolvable identity the key is a per-directory hash"
+ID_KEY1="$(field "$ID_OUT" repo)"; ID_KEY2="$(field "$ID_OUT2" repo)"
+case "$ID_KEY1" in repo-*) ok "IDENTITY: the key is a HASH, not a constant" ;; *) bad "IDENTITY: key='$ID_KEY1' (want repo-<hash>)" ;; esac
+if [ -n "$ID_KEY1" ] && [ "$ID_KEY1" != "$ID_KEY2" ]; then ok "IDENTITY: two directories never share one key"
+else bad "IDENTITY: both directories keyed '$ID_KEY1' — one constant for many repos"; fi
 
 # ── S: a `✗` line can be a READ FAILURE, which is not a verdict about the head ──
-RAIL_RUN_RAIL="$T/bin/rail-unreadable" call start 152 >/dev/null
 cat > "$T/bin/rail-unreadable" <<'UNR'
 #!/usr/bin/env bash
 printf 'admin-merge: ✗ BLOCK [head_unreadable] [rate_limited] — could not READ the head of PR #152\n'
 exit 1
 UNR
 chmod +x "$T/bin/rail-unreadable"
+# ⛔ THE FIXTURE IS WRITTEN BEFORE THE START THAT NEEDS IT. This start used to run against a rail that
+# did not exist yet, so it died "no rail at …" with its output discarded and nothing ever exercised
+# PR 152 — a dead arm that read like coverage.
+START_152="$(RAIL_RUN_RAIL="$T/bin/rail-unreadable" call start 152)"; RC="${START_152%%|*}"
+assert_rc 0 "$RC" "READ-FAILURE: a run starts against a rail whose head read fails"
+assert_contains "${START_152#*|}" "started pr=152" "READ-FAILURE: and it records a run for that PR"
 START_OUT="$(RAIL_RUN_RAIL="$T/bin/rail-unreadable" call start 153)"; RC="${START_OUT%%|*}"
 assert_rc 0 "$RC" "READ-FAILURE: the run starts against a rail that will fail to read"
 # GH_MODE=open: with a MERGED artifact the merge wins over ANY rail failure, so the ✗ line only
@@ -565,6 +578,65 @@ printf 'halfdead\n' > "$RAIL_RUN_DIR/fake-repo/pr-174/latest"
 OUT="$(PATH="$T/bin-nostat:$PATH" FAKE_RAIL_SLEEP=6 call start 174)"; RC="${OUT%%|*}"
 assert_rc 0 "$RC" "AGE2: a no-incarnation record with no readable age does NOT block for ever"
 PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-174/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+
+# ── AE3: the CLAIM path is bounded by the SAME helper, never an inline copy of it ─────────────
+# A claim whose launcher died between `mkdir` and its `pid` write, carrying no `created`, is the one
+# state that can refuse every later start with NOTHING in band to clear it: the claim reads as "just
+# begun" for ever and each `start` exits 3 — #8175 exactly (a stale flag a human had to hand-edit
+# away). `younger_than` treats an UNREADABLE age as NOT young, so the bound still fires.
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-176/.starting"
+OUT="$(PATH="$T/bin-nostat:$PATH" FAKE_RAIL_SLEEP=6 call start 176)"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "AGE3: a pid-less claim with NO readable age does not block the PR for ever"
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-176/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+# …and the discriminating half: a claim that IS young still REFUSES, which is the window the claim
+# exists to close. Without this arm the bound could be deleted and the suite would still be green.
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-177/.starting"
+printf '%s\n' "$(date +%s)" > "$RAIL_RUN_DIR/fake-repo/pr-177/.starting/created"
+OUT="$(call start 177)"; assert_rc 3 "${OUT%%|*}" "AGE3: a YOUNG pid-less claim still refuses a second start"
+
+# ── AF: the recorded HOST comes from the SAME value as the recorded slug ──────────────────────
+# `--repo [HOST/]OWNER/REPO` supplies a host and `normalize_slug` keeps only the last two components.
+# When the host was still read from `origin`, a GHE target named that way was recorded as
+# github.com/<slug> and its artifact check demanded a URL that host never serves — `landed`
+# unreachable (fail-closed, but unleanable). Assert what was RECORDED, not what a poll prints.
+OUT="$(FAKE_RAIL_SLEEP=6 call start 178 --repo ghe.example.com/acme/widgets)"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "HOST: a HOST-prefixed --repo starts"
+HOST_RID="$(printf '%s' "${OUT#*|}" | awk '/^started /{for(i=1;i<=NF;i++){if(index($i,"run=")==1){print substr($i,5)}}}')"
+REC_HOST="$(cat "$RAIL_RUN_DIR/acme-widgets/pr-178/$HOST_RID/host" 2>/dev/null)"
+if [ "$REC_HOST" = "ghe.example.com" ]; then ok "HOST: the run records the host its --repo value named"
+else bad "HOST: recorded host='$REC_HOST' (want ghe.example.com)"; fi
+PIDS+=("$(cat "$RAIL_RUN_DIR/acme-widgets/pr-178/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+# …and a BARE owner/repo still takes the host from `origin`, so the arm above did not replace it.
+OUT="$(FAKE_RAIL_SLEEP=6 RAIL_RUN_GH_HOST=git.example.com call start 179 --repo fake/repo)"; assert_rc 0 "${OUT%%|*}" "HOST: a bare --repo still resolves its host from origin"
+BARE_RID="$(printf '%s' "${OUT#*|}" | awk '/^started /{for(i=1;i<=NF;i++){if(index($i,"run=")==1){print substr($i,5)}}}')"
+BARE_HOST="$(cat "$RAIL_RUN_DIR/fake-repo/pr-179/$BARE_RID/host" 2>/dev/null)"
+if [ "$BARE_HOST" = "git.example.com" ]; then ok "HOST: and records it (origin's host, not a constant)"
+else bad "HOST: recorded host='$BARE_HOST' (want git.example.com)"; fi
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-179/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+
+# ── AG: `start` validates `latest` as a path component, exactly as `status` does ──────────────
+# `start` joins `latest` into a directory and probes a pid out of it, so a hand-edited or half-written
+# value must not aim that probe outside the run root. The escape target here is a directory
+# `prev_in_flight` WOULD judge in flight (no `rc`, no incarnation, young) — so without the guard the
+# start refuses with exit 3 about a directory that is not this PR's, and with it the start proceeds.
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-180" "$RAIL_RUN_DIR/escape"
+printf 'fake/repo\n' > "$RAIL_RUN_DIR/escape/repo"; : > "$RAIL_RUN_DIR/escape/log"
+printf '%s\n' "$(date +%s)" > "$RAIL_RUN_DIR/escape/created"
+printf '../../escape\n' > "$RAIL_RUN_DIR/fake-repo/pr-180/latest"
+OUT="$(FAKE_RAIL_SLEEP=6 call start 180)"; assert_rc 0 "${OUT%%|*}" "LATEST: a traversing latest is ignored by start, not probed"
+if [ ! -f "$RAIL_RUN_DIR/escape/rc" ] && [ ! -f "$RAIL_RUN_DIR/escape/latest" ]; then ok "LATEST: and nothing was written outside the run root"
+else bad "LATEST: the start wrote into the directory the escape named"; fi
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-180/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+
+# ── AH: the two newly-listed stems are head verdicts, and a read failure still abstains ───────
+# Each is a SINGLE template whose unreadable sibling deliberately avoids the wording (see
+# `require_draft`), so `refused` is positive support rather than a phrase that happens to match.
+craft 181 draft rc=1 >/dev/null
+printf 'admin-merge: ✗ BLOCK — PR #181 is a DRAFT, and gh refuses to merge a draft\n' > "$RAIL_RUN_DIR/fake-repo/pr-181/draft/log"
+OUT="$(GH_MODE=open poll 181)"; assert_rc 20 "${OUT%%|*}" "STEM: 'PR #N is a DRAFT' is a refusal of this head"
+craft 182 survived rc=1 >/dev/null
+printf 'admin-merge: ✗ BLOCK — 3 failure(s) SURVIVED the re-run:\n' > "$RAIL_RUN_DIR/fake-repo/pr-182/survived/log"
+OUT="$(GH_MODE=open poll 182)"; assert_rc 20 "${OUT%%|*}" "STEM: 'SURVIVED the re-run' is a refusal of this head"
 
 # ── AD: an unrecognised `✗` line is an ABSTENTION, not a refusal ──────────────────────────────
 # `refused` is a claim about a HEAD, so it needs positive support: the rail's own phrases say whether

@@ -65,7 +65,7 @@ flight, not dead** — reading that window as "no owner" is how a guard deletes 
 |---|---|---|
 | `running` | 10 | no exit status yet, and the **recorder** is alive — or the **rail** is, when the recorder has been SIGKILLed out from under it |
 | `landed` | 0 | the PR is MERGED. `verdict=rail` when the rail exited 0; `verdict=artifact` when the merge is real but the rail wrote **no verdict or a non-zero one** |
-| `refused` | 20 | rc=2 (a **usage/configuration** refusal — about the invocation, not the head; a MERGED artifact still wins over it), or rc≠ 0 whose last `admin-merge: ✗ …` line is one of the **recognised head-verdict wordings** (`THE TREE THIS PR PRODUCES IS RED`, `… HAS NOT MEASURED IT`, `… EVALUATED AGAINST AN OLDER BASE`, `never TESTED main`, `CONFLICTED`, `--no-rerun` — note that the family-wide `THE BASE IS RED` is NOT one of them: one of its three lines says the rail could not read the base parent). Any other `✗` line — the rail has ~117 templates, most of them "could not read", "no classification attempted", or "stopped mid-wait" — is `unknown`: a refusal is a claim about your head and needs positive support |
+| `refused` | 20 | rc=2 (a **usage/configuration** refusal — about the invocation, not the head; a MERGED artifact still wins over it), or rc≠ 0 whose last `admin-merge: ✗ …` line is one of the **recognised head-verdict wordings** (`THE TREE THIS PR PRODUCES IS RED`, `… HAS NOT MEASURED IT`, `… EVALUATED AGAINST AN OLDER BASE`, `never TESTED main`, `CONFLICTED`, `--no-rerun`, `PR #N is a DRAFT`, `… failure(s) SURVIVED the re-run` — note that the family-wide `THE BASE IS RED` is NOT one of them: one of its three lines says the rail could not read the base parent; and neither is `no run of the lane actually TESTED head`, which is a precondition about CI having been dispatched rather than a judgement of the diff, so it stays `unknown`). Any other `✗` line — the rail has ~117 templates, most of them "could not read", "no classification attempted", or "stopped mid-wait" — is `unknown`: a refusal is a claim about your head and needs positive support |
 | `killed` | 21 | the rail died of a signal (rc ≥ 128), named (SIGTERM / SIGKILL / …) |
 | `gone-without-verdict` | 22 | **no exit status, recorder gone, rail not alive, PR not MERGED: this run produced no verdict.** Never reported as a landing |
 | `exited-zero` | 23 | rc=0 and the PR is not merged (a `--dry-run` / `--print-bounds` inspection run) |
@@ -105,6 +105,11 @@ load-bearing distinctions honest:
   report `unknown`. It is recorded in the run, and that record is authoritative: a poll whose
   `--repo` contradicts it abstains, because the state key maps `/` to `-` and is not injective
   (`a/b-c` and `a-b/c` share one).
+  **The host comes from the same value as the slug.** When `--repo` is spelled `[HOST/]OWNER/REPO`
+  the host it names is recorded; only a bare `owner/repo` (or no `--repo` at all) falls back to
+  `origin`. Reading the host from `origin` while the slug came from `--repo` recorded a
+  `github.com/<slug>` pair for a target on another host, so the artifact check demanded a URL that
+  host never serves and `landed` was unreachable — fail-closed, but a run nobody could land.
 
 One live rail per PR: `start` takes an **atomic claim** (`mkdir`) *before* it probes the existing
 run, so two racing starts cannot both launch a rail (two merge attempts on one PR). The state key is
@@ -119,7 +124,12 @@ is the stale-flag defect (#8175) — a PR that can never be started again withou
 A claim is stale after `RAIL_RUN_CLAIM_MAX` (60 s: its launcher's whole life is the 5 s pid wait),
 and a run record whose liveness abstains stops blocking after `RAIL_RUN_RECORD_MAX` (24 h: a real
 rail run is hours). The bound applies only to the *admission* decision — `status` keeps saying
-`unknown` for that record, because "is it alive" genuinely is unknown.
+`unknown` for that record, because "is it alive" genuinely is unknown. **The claim path and the
+record path take that bound from one helper**, so a claim with no pid and an unreadable age is
+stale rather than an eternal refusal — the two must not drift apart, because drift in the
+*blocking* direction is the defect itself. When a launch is reported failed but its spawn is still
+alive, the claim is deliberately **kept and re-pointed at that live spawn**, so the next start is
+refused by a probe that can see it instead of by a launcher pid that has already exited.
 
 ## What is NOT fixed here (the honest half)
 
