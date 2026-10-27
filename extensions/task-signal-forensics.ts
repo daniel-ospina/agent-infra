@@ -1,5 +1,5 @@
 /**
- * task-signal-forensics — name the sender of a SIGTERM, and checkpoint the work
+ * task-signal-forensics — record who signalled a lane, and checkpoint the work
  * before the process dies (#2932).
  *
  * ── The failure this exists for ───────────────────────────────────────────────
@@ -44,9 +44,17 @@
  *     git update-ref refs/lane-checkpoints/<iso>-<pid> "$commit"
  *
  * The branch, HEAD, the real index and the working tree are never touched, so
- * this cannot collide with a `git commit` the lane was running, cannot create a
- * merge conflict, and cannot lose staged-but-uncommitted state. Recovery is
- * `git log refs/lane-checkpoints/*` or `git cherry-pick <ref>`.
+ * this cannot collide with a `git commit` the lane was running and cannot create
+ * a merge conflict. Recovery is `git log refs/lane-checkpoints/*` or
+ * `git cherry-pick <ref>`.
+ *
+ * ⛔ WHAT IT DOES NOT CAPTURE. The snapshot is built from the WORKTREE, so a file
+ * whose staged content differs from its worktree content is captured as the
+ * worktree version — the staged half is not separately preserved. That is a
+ * deliberate trade (the worktree is what a kill actually loses, and the staged
+ * version is recoverable from the real index for as long as the clone lives), but
+ * it means "nothing is ever lost" would be an overstatement. `git add -A` also
+ * follows normal git semantics, so ignored untracked files are not captured.
  *
  * ⛔ WHY NOT "make the lane's first action a commit". An empty first commit does
  * not save anything: the 16 files that died were created AFTER the lane's first
@@ -93,14 +101,29 @@ export const CHECKPOINT_REF_PREFIX = "refs/lane-checkpoints/";
 export const SIGNAL_LOG_MAX_BYTES = 8 * 1024 * 1024;
 export const ARGV_MAX_CHARS = 400;
 export const GIT_CMD_TIMEOUT_MS = 2_000;
-/** Total time the snapshot may spend. ⛔ BOUNDED BY THE PARENT'S ESCALATION, not
- * by taste: the task harness's exit watchdogs run `SIGTERM` → `setTimeout(…,
+/** ⛔ THE WHOLE HANDLER IS BOUNDED BY THE PARENT'S ESCALATION, not just the
+ * snapshot: the task harness's exit watchdogs run `SIGTERM` → `setTimeout(…,
  * 5_000)` → `SIGKILL` (extensions/builtin-tools `armExitWatchdog` /
- * `armCompletionWatchdog`), so a checkpoint that overruns 5 s is killed
- * half-written and the attribution line — the whole point of arm 1 — would be
- * lost with it. 3 s leaves room for the append inside that window; a worktree
- * too large to snapshot in 3 s records `failed/git-timeout` instead, which is
- * honest, and the 16 lost files of #2932 were seconds' worth of `git add`. */
+ * `armCompletionWatchdog`), so ANY handler work still running at 5 s is killed,
+ * and the attribution append is the work that would be lost with it.
+ *
+ * Budgeting only the snapshot was not enough (#2934 review): the handler also
+ * spends up to 2 × `PS_TIMEOUT_MS` probing the parent and one more on its own
+ * pgid, which with a 3 s snapshot is ~7.5 s — so under the load that produced
+ * this incident the slow path lost arm 1 entirely. `fire()` now derives every
+ * step's budget from ONE deadline, so the sum cannot exceed this window. */
+export const SIGNAL_WINDOW_MS = 4_500;
+/** Reserved inside the window for the append itself, which is never optional. */
+export const APPEND_RESERVE_MS = 100;
+/** Per-`ps` timeout. Two are used for the parent and one for the pgid. */
+export const PS_TIMEOUT_MS = 1_500;
+/** Total time the snapshot may spend. ⛔ BOUNDED BY THE PARENT'S ESCALATION, not
+ * by taste: a checkpoint that overruns the window is killed half-written and the
+ * attribution line — the whole point of arm 1 — would be lost with it. 3 s is the
+ * cap; `fire()` lowers it further when the probes have already spent part of the
+ * window. A worktree too large to snapshot records `failed/git-timeout` instead,
+ * which is honest, and the 16 lost files of #2932 were seconds' worth of
+ * `git add`. */
 export const CHECKPOINT_BUDGET_MS = 3_000;
 
 export const HANDLED_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
@@ -238,12 +261,23 @@ export const defaultGitRunner: GitRunner = (args, extraEnv, timeoutMs, cwd) => {
   return { ok: res.status === 0, out, timedOut };
 };
 
-/** Worktree-level git state that makes a HEAD-based snapshot unsafe: a real
- * index or a repository operation in flight. A snapshot built from `HEAD` would
- * silently drop the staged half of a conflicted merge, and presenting that as
- * "your work is saved" is worse than saying it was not. */
+/** Worktree-level git state that makes a HEAD-based snapshot unsafe: a repository
+ * operation in flight. A snapshot built from `HEAD` would silently drop the
+ * staged half of a conflicted merge, and presenting that as "your work is saved"
+ * is worse than saying it was not.
+ *
+ * ⛔ `index.lock` is DELIBERATELY NOT a member (#2934 review P1). It was one, and
+ * that made this arm self-disabling in the exact state it exists for: the
+ * snapshot never reads or writes the lane's real index — every step runs with
+ * `GIT_INDEX_FILE` pointed at a temporary file — so a held index lock cannot make
+ * the snapshot unsafe. Worse, a killed `git` leaves `.git/index.lock` behind, and
+ * a mass kill leaves one in every affected worktree, after which every later
+ * death recorded `skipped/git-op-in-progress:index.lock` and pinned no ref.
+ * Measured: with a stale lock and no git process alive, `checkpointWorktree`
+ * returned `skipped` and saved nothing; with the marker removed it returns
+ * `saved`. The MERGE_HEAD/rebase markers stay, because those DO make a
+ * HEAD-based snapshot incomplete. */
 const IN_PROGRESS_MARKERS = [
-  "index.lock",
   "MERGE_HEAD",
   "CHERRY_PICK_HEAD",
   "REVERT_HEAD",
@@ -405,17 +439,21 @@ export interface SignalForensicsOptions {
 /** Read the parent's argv/comm. `ps` is bounded and the failure modes are
  * distinct: a gone parent is a FACT (`parent_alive: false`) and an empty argv is
  * not the same thing as a dead parent. */
-export function probeSender(ppid: number): SenderFacts {
+export function probeSender(ppid: number, timeoutMs: number = PS_TIMEOUT_MS): SenderFacts {
   let parentAlive = true;
   try {
     process.kill(ppid, 0);
   } catch (err) {
     parentAlive = (err as NodeJS.ErrnoException)?.code !== "ESRCH";
   }
+  // A non-positive budget means the window is already spent: return the facts we
+  // hold (ppid + liveness) rather than blocking on a `ps` that would push the
+  // attribution append past the parent's SIGKILL.
+  if (timeoutMs <= 0) return { ppid, parentArgv: "", parentComm: "", parentAlive };
   const one = (args: string[]): string => {
     const res = spawnSync("ps", args, {
       encoding: "utf8",
-      timeout: 1_500,
+      timeout: timeoutMs,
       killSignal: "SIGKILL",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -433,11 +471,12 @@ export function probeSender(ppid: number): SenderFacts {
  * no portable binding (`process.pid` is the pgid only when the child was
  * spawned detached, which is the case the harness guarantees but not the one we
  * should assume while recording evidence). */
-function ownPgid(pid: number): number | null {
+function ownPgid(pid: number, timeoutMs: number = PS_TIMEOUT_MS): number | null {
+  if (timeoutMs <= 0) return null;
   try {
     const res = spawnSync("ps", ["-o", "pgid=", "-p", String(pid)], {
       encoding: "utf8",
-      timeout: 1_500,
+      timeout: timeoutMs,
       killSignal: "SIGKILL",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -490,20 +529,43 @@ export function installSignalForensics(opts: SignalForensicsOptions = {}): boole
     if (latched) return;
     latched = true;
 
+    // ⛔ ONE deadline for the whole handler. Every step below takes its budget
+    // from what is LEFT of the window, so the sum of the probes, the snapshot and
+    // the append can never exceed it. Without this the probes plus a full
+    // snapshot overran the parent's SIGKILL by ~2.5 s (#2934 review), and the
+    // append — arm 1's entire output — is last, so that is what got lost.
+    const windowStart = now();
+    const remainingWindow = (): number => SIGNAL_WINDOW_MS - (now() - windowStart) - APPEND_RESERVE_MS;
+
     const pid = opts.pid ?? process.pid;
     const ppid = opts.ppid ?? process.ppid;
     const cwd = opts.cwd ?? process.cwd();
 
     let facts: SenderFacts;
     try {
-      facts = (opts.senderProbe ?? probeSender)(ppid);
+      facts = (opts.senderProbe ?? ((parent: number) => probeSender(parent, Math.min(PS_TIMEOUT_MS, remainingWindow()))))(ppid);
     } catch {
       facts = { ppid, parentArgv: "", parentComm: "", parentAlive: false };
     }
 
-    const snapshot = (): CheckpointResult =>
-      opts.checkpoint?.(cwd, now(), pid) ??
-      checkpointWorktree({ cwd, now: now(), pid, env, run: opts.run });
+    // Own pgid is read BEFORE the snapshot, so a slow snapshot cannot starve it
+    // and it cannot starve the append.
+    const pgid = ownPgid(pid, Math.min(PS_TIMEOUT_MS, remainingWindow()));
+
+    const snapshot = (): CheckpointResult => {
+      if (opts.checkpoint) return opts.checkpoint(cwd, now(), pid);
+      const budgetMs = Math.min(CHECKPOINT_BUDGET_MS, remainingWindow());
+      if (budgetMs <= 0) return { status: "skipped", reason: "window-exhausted", elapsedMs: 0 };
+      return checkpointWorktree({
+        cwd,
+        now: now(),
+        pid,
+        env,
+        run: opts.run,
+        budgetMs,
+        gitCmdTimeoutMs: Math.max(1, Math.min(GIT_CMD_TIMEOUT_MS, budgetMs)),
+      });
+    };
 
     let checkpoint: CheckpointResult;
     try {
@@ -512,7 +574,9 @@ export function installSignalForensics(opts: SignalForensicsOptions = {}): boole
       checkpoint = { status: "failed", reason: `exception:${(err as Error)?.message?.slice(0, 80) ?? "unknown"}` };
     }
 
-    const record = buildSignalRecord({ signal, pid, facts, pgid: ownPgid(pid), cwd, checkpoint, now: now() });
+    // ⛔ LAST step, and the only one with a reserved budget: if the window was
+    // exhausted above, the record is still written, saying so.
+    const record = buildSignalRecord({ signal, pid, facts, pgid, cwd, checkpoint, now: now() });
     try {
       append(logPath, record);
     } catch {

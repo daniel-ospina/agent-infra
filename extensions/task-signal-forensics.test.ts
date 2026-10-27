@@ -36,6 +36,7 @@ import { ok, equal, deepEqual } from "node:assert/strict";
 import {
   CHECKPOINT_REF_PREFIX,
   SIGNAL_LOG_MAX_BYTES,
+  SIGNAL_WINDOW_MS,
   appendSignalRecord,
   buildSignalRecord,
   checkpointActive,
@@ -382,6 +383,31 @@ test("arm 2: a repo operation in flight is refused BY NAME, not silently skipped
   fs.rmSync(path.join(gitDir, "MERGE_HEAD"));
 });
 
+test("arm 2: a STALE index.lock does not disable the checkpoint", () => {
+  // A killed `git` leaves `.git/index.lock` behind, so a mass kill leaves one in
+  // every affected worktree — i.e. exactly the worktrees this arm exists to save.
+  // `index.lock` was once an in-progress marker, which made the arm record
+  // `skipped/git-op-in-progress:index.lock` and pin no ref for every later death.
+  // It cannot make the snapshot unsafe: every step runs with `GIT_INDEX_FILE`
+  // pointed at a temporary index, so the lane's real index is never read.
+  const repo = dirtyRepo();
+  const gitDir = git(repo, ["rev-parse", "--absolute-git-dir"]);
+  const lock = path.join(gitDir, "index.lock");
+  fs.writeFileSync(lock, "");
+  equal(gitOpInProgress(gitDir), null, "index.lock is not treated as an in-progress operation");
+  const r = checkpointWorktree({ cwd: repo, now: Date.now(), pid: 100 });
+  equal(r.status, "saved", `a stale lock must still save the work (got ${JSON.stringify(r)})`);
+  equal(
+    git(repo, ["rev-parse", "--verify", "--quiet", (r as { ref: string }).ref]).length > 0,
+    true,
+    "the checkpoint ref resolves",
+  );
+  // The stale lock is the MUTANT's artefact, not ours: the snapshot must not
+  // remove it, because doing so would risk stealing a lock a real git holds.
+  ok(fs.existsSync(lock), "the snapshot leaves the lock alone rather than stealing or clearing it");
+  fs.rmSync(lock);
+});
+
 test("arm 2: a failing git step is reported as failed, never as saved", () => {
   const repo = dirtyRepo();
   // The identity probes answer for real; every mutating step fails. The failure
@@ -492,6 +518,54 @@ test("arm 1: as the SOLE listener it re-raises the same signal", () => {
   equal(raised[0][1], "SIGTERM", "with the same signal, so the exit status is unchanged");
   const rec = readRecords(log)[0];
   equal(rec.parent_alive, false, "a parent that is gone is recorded as gone, not as an empty argv");
+  process.removeAllListeners("SIGTERM");
+  _resetArmedForTests();
+});
+
+test("arm 1: an exhausted window still writes the attribution record", () => {
+  // The probes are the slow step under load. If they consume the whole window, the
+  // snapshot must be skipped BY NAME and the record must STILL be written: the
+  // append is arm 1's only output, and before this budget was derived from one
+  // deadline the probes plus a full snapshot overran the parent's SIGKILL and the
+  // record — the last thing the handler does — was what got lost.
+  _resetArmedForTests();
+  const dir = tmpDir("lane-sig-window-");
+  const log = path.join(dir, "signals.jsonl");
+  let clock = 1_793_133_305_000;
+  let gitCalls = 0;
+  const neverRuns: GitRunner = () => {
+    gitCalls += 1;
+    return { ok: true, out: "", timedOut: false };
+  };
+  ok(
+    installSignalForensics({
+      env: { TASK_HEARTBEAT: "1", PI_MODE: "print" },
+      logPath: log,
+      pid: 5,
+      ppid: 6,
+      cwd: "/x",
+      now: () => clock,
+      senderProbe: () => {
+        clock += SIGNAL_WINDOW_MS + 1_000; // the probe consumed the window and more
+        return { ppid: 6, parentArgv: "pi", parentComm: "pi", parentAlive: true };
+      },
+      run: neverRuns,
+      stderr: () => {},
+      raiseSignal: () => {},
+      exitProcess: () => {},
+    }),
+    "installed",
+  );
+  process.emit("SIGTERM");
+  const recs = readRecords(log);
+  equal(recs.length, 1, "the attribution record is written even when the window is gone");
+  equal(recs[0].checkpoint.status, "skipped", "no snapshot is claimed");
+  equal(
+    recs[0].checkpoint.reason,
+    "window-exhausted",
+    "the reason names the exhausted window, not a git failure",
+  );
+  equal(gitCalls, 0, "git was never spawned: the snapshot could not have fit, so it was not attempted");
   process.removeAllListeners("SIGTERM");
   _resetArmedForTests();
 });

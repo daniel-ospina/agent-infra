@@ -102,7 +102,7 @@ recorded the sender.**
 
 A child-side extension, armed in every dispatched `pi -p` child (`PI_MODE=print` +
 `TASK_HEARTBEAT=1`, the established sub-agent identity pair). On `SIGTERM` / `SIGINT` / `SIGHUP` it
-appends **one JSON line** naming the sender, then re-raises the signal so the exit code the harness
+appends **one JSON line** recording the parent, then re-raises the signal so the exit code the harness
 records is unchanged (still 143 / 130 / 129):
 
 ```json
@@ -119,8 +119,22 @@ records is unchanged (still 143 / 130 / 129):
 That sample is a real capture, not a mock: the lane was this worktree (6 files — 3 modified, 3
 new), it was TERMed 2 s after arming, and 672 ms later the work was pinned by a ref whose tree
 contained every one of the 6 files while `git status` still reported all 6 as uncommitted. The
-`parent_argv` is the whole point: it names the shell that sent the signal, which no post-mortem
+`parent_argv` is the whole point: it records the parent's command line at signal time, which no post-mortem
 reconstruction could have produced.
+
+⛔ **What this can and cannot answer, stated precisely** (the earlier wording here said "names the
+sender", which overstates it). `$PPID` is the **parent**, and the parent is the sender only when the
+parent is the sender. So a record answers one of two things:
+
+- if the parent is the killer, `parent_argv` **names it**;
+- if the parent is alive and innocent — which is this incident's own scenario, where every remaining
+  candidate is external (jetsam, a parent-side sweep, something outside the inventory) — the record
+  **proves the sender was not the parent** and names nobody. It records the parent's `ppid` and argv,
+  so the next investigator can rule the parent in or out, but a row reading `"parent_argv":"pi"` is
+  *not* an accusation against `pi`.
+
+The record shape already carries the distinction (`parent_alive`, `parent_argv`); it is the prose
+that was wrong, not the mechanism.
 
 `parent_argv` is read with `ps -o args= -p $PPID` at signal time — the one fact no post-mortem can
 reconstruct, because the parent may have exited by then or the pid may have been reused.
@@ -132,7 +146,7 @@ touched:
 
 ```
 GIT_INDEX_FILE=<tmp> git read-tree HEAD
-git add -A                     (untracked files included)
+GIT_INDEX_FILE=<tmp> git add -A     (untracked files included)
 GIT_INDEX_FILE=<tmp> git write-tree
 git commit-tree <tree> -p HEAD -m "lane checkpoint: …"
 git update-ref refs/lane-checkpoints/<iso>-<pid> <commit>
@@ -140,16 +154,28 @@ git update-ref refs/lane-checkpoints/<iso>-<pid> <commit>
 
 Recovery: `git log --oneline refs/lane-checkpoints/*`, `git diff HEAD <ref>`, `git cherry-pick <ref>`.
 The record carries the outcome — `saved` / `skipped` (`clean`, `not-a-repo`, `no-head`,
-`git-op-in-progress:<marker>`) / `failed` (`git-timeout`, `read-tree-failed`, …) — so a lane that
-could not be saved says so instead of reading as saved.
+`git-op-in-progress:<marker>`, `window-exhausted`) / `failed` (`git-timeout`, `read-tree-failed`, …)
+— so a lane that could not be saved says so instead of reading as saved.
 
-### Why the checkpoint is bounded at 3 s
+### Why the WHOLE handler is bounded at 4.5 s
 
 The task harness's own watchdogs escalate `SIGTERM` → **5 s** → `SIGKILL`
-(`armExitWatchdog` / `armCompletionWatchdog` in `extensions/builtin-tools`). A checkpoint that
-overran that window would be SIGKILLed half-written and would take the attribution line with it, so
-the snapshot budget is 3 s and one git step is capped at 2 s. A worktree too large to snapshot in
-3 s records `failed/git-timeout`, which is the honest outcome.
+(`armExitWatchdog` / `armCompletionWatchdog` in `extensions/builtin-tools`). A handler still running
+at 5 s is SIGKILLed, and the **append is the last thing it does**, so the attribution line is what
+would be lost.
+
+Bounding only the snapshot is not enough, and that earlier mistake is worth recording: the handler
+also spends up to 2 × 1.5 s probing the parent (`ps -o args=`, `ps -o comm=`) and a third 1.5 s on
+its own pgid, so the worst case was **~7.5 s** — over the window, with arm 1's output last. Under
+the load that produced this incident that slow path is the likely path.
+
+So one deadline governs every step: `SIGNAL_WINDOW_MS` (4.5 s, leaving 0.5 s of margin before the
+SIGKILL) minus `APPEND_RESERVE_MS` for the append. Each step takes its budget from what is left —
+the probes are capped at `PS_TIMEOUT_MS` (1.5 s) or the remainder, the snapshot at
+`CHECKPOINT_BUDGET_MS` (3 s) or the remainder, one git step at `GIT_CMD_TIMEOUT_MS` (2 s). If the
+probes consume the window, the snapshot is **not attempted** and the record says
+`skipped/window-exhausted` — the record is written regardless, which is the property being bought.
+A worktree too large to snapshot in what remains records `failed/git-timeout`, equally honest.
 
 ### Why not "make the lane's first action a commit"
 
@@ -159,7 +185,7 @@ snapshot has to be taken at the end.
 
 ## Verification — the TERM test and its two mutations
 
-`extensions/task-signal-forensics.test.ts` (13 assertion groups, CI-wired) spawns a **real lane**: a
+`extensions/task-signal-forensics.test.ts` (16 assertion groups, CI-wired) spawns a **real lane**: a
 temporary `.mjs` bootstrap that imports the extension source, arms it, announces readiness and
 idles in a deliberately dirty git repo (one modified tracked file, one untracked file). The suite
 sends that process a real `SIGTERM` and asserts, in this order:
@@ -178,10 +204,10 @@ is applied to a temp copy that the suite then imports and spawns:
 
 | mutant | change | result |
 |---|---|---|
-| **A — trap removed** | `process.on(signal, handler)` → a no-op | RED: `10 passed, 3 failed`; the named failure is **`arm 1: the signal log has exactly one record`** |
-| **B — checkpoint arm disabled** | `checkpoint = doCheckpoint ? snapshot() :` → `checkpoint = false ? snapshot() :` | RED: `12 passed, 1 failed`; the named failure is **`arm 2: the checkpoint was SAVED`**, and arm 1 stays green (the two arms are independently load-bearing) |
+| **A — trap removed** | `process.on(signal, handler)` → a no-op | RED: `12 passed, 4 failed`; the named failure is **`arm 1: the signal log has exactly one record`** |
+| **B — checkpoint arm disabled** | `checkpoint = doCheckpoint ? snapshot() :` → `checkpoint = false ? snapshot() :` | RED: `14 passed, 2 failed`; the named failure is **`arm 2: the checkpoint was SAVED`**, and arm 1 stays green (the two arms are independently load-bearing) |
 
-Baseline: `13 passed, 0 failed`. The driver also refuses (a) a mutation whose anchor does not match
+Baseline: `16 passed, 0 failed`. The driver also refuses (a) a mutation whose anchor does not match
 exactly once, (b) a mutant that reddens everything (the suite crashed instead of asserting), and
 (c) any run that leaves the tracked source modified.
 
