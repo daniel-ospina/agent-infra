@@ -8,7 +8,7 @@ status: live
 tags: [fleet, cmux, cells, dispatch, capacity, recovery, harness]
 summary: "How to provision, measure, recover, and dispatch on cmux cloud cells, and how work actually lands from them."
 created: 2026-10-19
-updated: 2026-10-19
+updated: 2026-10-27
 ---
 
 > ⛔ **This skill MUST be read in full — not skimmed.** Every section below is a measurement that cost a lost lane, a
@@ -16,8 +16,8 @@ updated: 2026-10-19
 
 # Operating the cmux cloud cells
 
-The fleet runs on four boxes: the macOS laptop (launchd) plus three Linux cells (cell-1 `pi-lane-1`, cell-2 `pi-cell-2`,
-cell-3 `pi-cell-3`). Cells are Linux, so **any harness change must work on both platforms** — one source of truth with a
+The fleet runs on the macOS laptop (launchd) plus the Linux cells (cell-1 `pi-lane-1`, cell-2 `pi-cell-2`, cell-3
+`pi-cell-3`, cell-4). Cells are Linux, so **any harness change must work on both platforms** — one source of truth with a
 platform branch, never two drifting copies.
 
 Canonical harness home: **`agent-infra/scripts/orchestrator-harness/`**. `tortoise/operations/orchestrator-harness/` and
@@ -43,13 +43,13 @@ writing to `$HOME` dies with `mkdir /home/ubuntu: permission denied`.
 
 | missing | symptom | fix |
 |---|---|---|
-| **`gh` shim** | every lane logs `#984 argv-level gh shim not found — only the string scanner is active`; the merge gate runs degraded and cannot verify the evidence it demands | `mkdir -p $HOME/.pi/agent/shims && ln -sf /tmp/cell-ai/scripts/gh-shim/gh $HOME/.pi/agent/shims/gh`, and put `$HOME/.pi/agent/shims` on PATH in `keys.env` (tracked as agent-infra#2164) |
+| **`gh` shim** | every lane logs `#984 argv-level gh shim not found — only the string scanner is active`; the merge gate runs degraded and cannot verify the evidence it demands | **fixed in `pi-bootstrap/cell-install.sh` (agent-infra#2164, closed 2026-10-24)**: it installs the shim at `$HOME/.pi/agent/scripts/gh-shim/gh` and **fails the install** if it is missing. A manual `ln -sf … $HOME/.pi/agent/shims/gh` is a *legacy* workaround for a box installed before that — do not present it as the plan |
 | **capture extension** | `capture: BLOCKED (N queued, 402 quota)` on stdout blocks turns and corrupts the bringup probe (a healthy box reports `FATAL: provider probe failed`) | move `$HOME/.pi/agent/extensions/tortoise-capture*` aside (agent-infra#2147); `TORTOISE_CAPTURE=0` does **not** disable it |
 
 Verify activation by **artifact**, never by a banner:
 
 ```bash
-for f in .pi/agent/scripts/record-review.sh .pi/agent/shims/gh; do [ -e $HOME/$f ] && echo "ok $f" || echo "MISSING $f"; done
+for f in .pi/agent/scripts/record-review.sh .pi/agent/scripts/gh-shim/gh; do [ -e $HOME/$f ] && echo "ok $f" || echo "MISSING $f"; done
 echo "scripts=$(ls $HOME/.pi/agent/scripts|wc -l) ext=$(ls $HOME/.pi/agent/extensions|wc -l) skills=$(ls $HOME/.pi/agent/skills|wc -l)"
 git -C /tmp/cell-ai rev-parse --short HEAD    # the version, not the claim
 ```
@@ -63,10 +63,10 @@ quoting any ceiling:
 
 | resource | cost (measured) | note |
 |---|---|---|
-| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.19–0.23 GB** whole tree | 4 lanes sampled on cell-4 |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | containers measured 21–149 MB each |
+| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.19–0.23 GB** whole tree | RSS summed over the process tree, 4 lanes, cell-4, 2026-10-27 |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | containers 21–149 MB each (`docker stats --no-stream`, cells 3–4, 2026-10-27) |
 | plan each lane at | **~1 GB** (test) / **~0.3 GB** (analysis) | the PEAK, not the idle |
-| worktree `.venv` | ~1.1 GB per live worktree | `disk_free / 1.1` |
+| worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** for it | re-derived in agent-infra#2721; the old "1.1 GB" figures measured a lane's worktree *before* its venv |
 | CPU | load 4.3 with 23 lanes | **never the limit** |
 
 The old row read "`pi` process ~0.6–1 GB RSS per lane". Measured, that is a **test-running peak**; an idle
@@ -82,27 +82,47 @@ zero. If a box has already OOM-killed (`dmesg | grep -ci 'killed process'`), rai
 box instead of pretending a fleet-wide constant is a measurement.
 
 ```bash
-# a JUDGEMENT AID, not an implementation — see the ⛔ note below
-# PER=1000 for test-running lanes, PER=300 for analysis/doc lanes
-PER=${PER:-1000}; RESERVE=${RESERVE:-1500}
-mem_lanes=$(( ($(free -m | awk 'NR==2{print $7}') - RESERVE) / PER ))
-disk_lanes=$(awk '{printf "%d", ($1-1)/1.1}' <<< "$(df -h /|awk 'NR==2{print $4}'|tr -d G)")
-lanes=$(( mem_lanes < disk_lanes ? mem_lanes : disk_lanes ))
-[ "$lanes" -lt 1 ] && lanes=1   # a zero means "measure, then judge" — never "this box can do no work"
+# a JUDGEMENT AID, not an implementation — the gate below is the authority
+# DISK: the gate admits a spawn iff free_mb >= tree + reserve (exit 77 DISK-NOHEADROOM).
+#       For a worktree containing uv.lock: tree=350, reserve=6144. Otherwise: 64 / 1024.
+free_mb=$(df -Pm / | awk 'NR==2{print $4}')          # MB, no unit parsing
+avail_mb=$(free -m | awk 'NR==2{print $7}')
+TREE_MB=${TREE_MB:-350}; RESERVE_MB=${RESERVE_MB:-6144}; PER_MB=${PER_MB:-500}
+# an unreadable/garbage probe is NOT "zero room" and NOT room — refuse to answer (the gate's own polarity)
+case "$free_mb" in ''|*[!0-9]*) disk_lanes=UNREADABLE
+  ;; *) disk_lanes=$(( (free_mb - RESERVE_MB) / TREE_MB )); [ "$disk_lanes" -lt 0 ] && disk_lanes=0 ;; esac
+case "$avail_mb" in ''|*[!0-9]*) ram_lanes=UNREADABLE
+  ;; *) ram_lanes=$(( (avail_mb - 1500) / PER_MB )); [ "$ram_lanes" -lt 0 ] && ram_lanes=0 ;; esac
+lanes=UNKNOWN
+case "$disk_lanes:$ram_lanes" in *UNREADABLE*) ;; *) lanes=$(( ram_lanes < disk_lanes ? ram_lanes : disk_lanes )) ;; esac
+printf 'lanes=%s (ram=%s disk=%s)\n' "$lanes" "$ram_lanes" "$disk_lanes"
+# 0 means MEASURE BEFORE DISPATCHING. It is never "this box can do no work" — and never a licence to
+# clamp the disk term to 1: a disk-zero is the state that does NOT clear by waiting (see §3).
 ```
 
-⚠️ **`spawn-gate.sh` DOES NOT GATE ON RAM AT ALL** (verified 2026-10-27): its refusals are
-`DISK_MIN_FREE_MB` (default **500**) and the load ceiling (`MAX_LOAD`, default `nproc × 10`). Nothing stops
-you over-filling a box on memory — this arithmetic is the only RAM reasoning in the loop, which is exactly
-why a stale number in it is expensive. Where the gate *does* speak, the gate is right.
+⚠️ **WHAT THE GATE ACTUALLY REFUSES** (read 2026-10-27) — three refusals, and the per-lane one is on DISK:
+
+1. **floor** — `DISK_MIN_FREE_MB`, default **500**;
+2. **headroom** — `DISK-NOHEADROOM` (exit **77**) requires `free_mb ≥ tree + reserve`, where the per-lane costs are
+   **`tree` 350 MB and `reserve` 6144 MB** for any target containing `uv.lock` (**64 / 1024** otherwise). One spawn on a
+   uv worktree therefore needs **6,494 MB** free — the floor is not the binding number, this is (agent-infra#2721);
+3. **load** — `MAX_LOAD`, default `nproc × 10`.
+
+**RAM is different: there is no PER-LANE RAM BUDGET anywhere in the loop.** `orch-loop.sh` has a floor
+(`MIN_MEM_FREE_MB`, default 512) and `capacity.sh` has a placement bound, but nothing accounts for what *this* lane will
+consume. That is why the arithmetic above is worth getting right: it is the only per-lane memory reasoning there is.
+Where the gate speaks, the gate is right — and where it does not, nothing else will.
 
 `MAX_LANES` in `keys.env` is a static number and does not know either constraint — do not trust it as the ceiling.
 
 ⛔ **DO NOT RE-INVENT THE CAPACITY GATE — `scripts/orchestrator-harness/spawn-gate.sh` ALREADY IS IT** (checked
-2026-10-19). It derives `MAX_LOAD` from `nproc × 10` when unset, refuses on a non-empty disk band (`disk_free_mb` vs
-`DISK_MIN_FREE_MB`/`MIN_FREE_MB`, exit 77), validates its own probes against wrap/garbage readings, and carries **129
-capacity assertions** in `spawn-gate.test.sh`. The failure it already names is the one worth reading: the band where
-`cloud-cell-doctor --check` prints `CELL CAN RUN A CONTROLLER` while every lane spawn is refused 77.
+2026-10-27). It derives `MAX_LOAD` from `nproc × 10` when unset, refuses on a non-empty disk band (`disk_free_mb` vs
+`DISK_MIN_FREE_MB`/`MIN_FREE_MB`, exit 77), **refuses again on per-lane headroom** (`DISK-NOHEADROOM`, tree + reserve,
+exit 77 — see above), and validates its own probes against wrap/garbage readings. Its capacity behaviour is asserted in
+`spawn-gate.test.sh` (§§ disk, headroom, load); read that rather than trusting a count quoted in prose. The failure it
+already names is the one worth reading: the band where `scripts/cloud-cell-supervisor.sh --check` prints
+`CELL CAN RUN A CONTROLLER` while every lane spawn is refused 77. (`cloud-cell-doctor.sh` has no `--check` mode — that
+flag belongs to `cloud-cell-bringup.sh`, and the banner is printed by the supervisor's `cmd_check`.)
 
 The formula above is therefore a **diagnostic, not an implementation**: if a number disagrees with the gate, the gate is
 right and the number is a curiosity. Any new refusal belongs inside `spawn-gate.sh` with a test — never in a brief, a
@@ -162,20 +182,28 @@ Also: `ps -eo command | grep -c 'pi --model'` counts **wrapper shells**, not `pi
 
 ## 5. Dispatching a lane
 
+**Dispatch through the gated path — that is the only form of this section to copy:**
+
 ```bash
-# brief on disk, launched detached, log in /tmp/cell-home/L-<slug>.log
+scripts/orchestrator-harness/nonblocking-dispatch.sh <name> <worktree> <prompt-file>
+```
+
+It backgrounds `run_agent()` from `spawn-gate.sh`, so the worker gets the **load gate, the disk headroom gate, the
+wall-clock watchdog and the walltime row**. `lane.sh` and `fix-one.sh` are the same shape.
+
+⛔ **NEVER LAUNCH A RAW `pi`.** The block below is kept only as the shape **NOT** to write — `spawn-gate.test.sh` calls
+it a **"fourth, ungated launch path"** and its invoker census asserts the invoker SET as an equality, so it goes red:
+
+```bash
 tmux new-session -d -s <slug> \
-  "HOME=/tmp/cell-home bash -lc 'cd <worktree-or-checkout>; . /tmp/cell-home/keys.env; \
+  "HOME=/tmp/cell-home bash -lc 'cd <worktree>; . /tmp/cell-home/keys.env; \
    nohup pi --model deepseek/deepseek-v4-flash --provider deepseek -p \"\$(cat <brief>)\" > /tmp/cell-home/L-<slug>.log 2>&1 < /dev/null'"
 ```
 
+Measured 2026-10-19: driving the cells this way is how 23 lanes landed on one box (8 cores, **32 GB**) and the kernel
+killed 37 processes *and the tmux server*, losing every lane. The gate would have refused that spawn.
+
 - Model must be `provider/model` (`deepseek/deepseek-v4-flash`), never bare.
-- ⛔ **LAUNCH THROUGH THE GATED PATH, NEVER A RAW `pi`.** `nonblocking-dispatch.sh <name> <worktree> <prompt-file>`
-  backgrounds `run_agent()` from `spawn-gate.sh`, so a worker gets the **load gate**, the wall-clock watchdog and the
-  walltime row; `lane.sh` and `fix-one.sh` do the same. A hand-rolled `tmux new-session … pi --model …` is what
-  `spawn-gate.test.sh` calls a **"fourth, ungated launch path"** — its invoker census asserts the invoker SET as an
-  equality and goes red. Measured 2026-10-19: driving the cells by raw `tmux` is how 23 lanes landed on one 8 GB box and
-  the kernel killed 37 processes *and the tmux server*, losing every lane. The gate would have refused that spawn.
 - ⛔ **`keys.env` IS NOT GUARANTEED TO CONTAIN AN API KEY.** Measured 2026-10-19: cell-1's file exported only
   `REPO CYC MAX_FIX MIN_SWAP_FREE PATH …` and **no provider key at all** — the lanes that worked had the key in their
   *ambient* environment (inherited from the tmux server), so a lane launched through `keys.env` alone died instantly with
@@ -197,10 +225,11 @@ tmux new-session -d -s <slug> \
   log never shows it and the lane keeps doing what its original brief said. Measured 2026-10-19: 9 lanes ordered to stop
   producing and start landing, `order-seen=0` on every one. To change what a lane is doing you must **kill the session and
   relaunch it with a new brief** — which also means a brief must be right when it is written, because there is no
-  mid-flight correction available. (For a steerable session, launch interactive and dispatch with
-  `tools/cmux_dispatch.py`, which confirms the message became a turn.)
+  mid-flight correction available. (For a steerable session, launch interactive and dispatch with tortoise's
+  `tools/cmux_dispatch.py` — it confirms the message became a turn. That tool is not installed on the cells; there,
+  use `nonblocking-dispatch.sh` and a new brief.)
 
-## 6. Landing work from a lane — the four-step contract
+## 6. Landing work from a lane — the five-step contract
 
 The single biggest waste measured: lanes doing the work and then failing to land it. `record-review.sh` **requires
 `--evidence`**, and that evidence must be a real PR comment that postdates the diff. Five steps, in this order:
@@ -210,7 +239,7 @@ scripts/record-review.sh --print-diff-hash <pr>              # 1. what the gate 
 #                                                            2. ONE fresh-context review of the diff
 # 3. post the review as a comment on the PR, keep its id (REST: POST /repos/<o>/<r>/issues/<n>/comments)
 scripts/record-review.sh <pr> <head_sha> clean <owner/repo> --evidence comment:<id>   # 4. bind to the head
-RAIL="scripts/$(printf 'a%s' 'dmin')-$(printf 'mer%s' 'ge').sh"; bash "$RAIL" <pr>    # 5. land it
+bash scripts/admin-merge.sh <pr>                                                      # 5. land it, via the rail
 ```
 
 - `--evidence` missing ⇒ no `clean` record can be minted. A lane that skips step 3 **loops forever**: the gate says "no
@@ -224,9 +253,14 @@ RAIL="scripts/$(printf 'a%s' 'dmin')-$(printf 'mer%s' 'ge').sh"; bash "$RAIL" <p
 
 | box | role | shape |
 |---|---|---|
-| cell-2 | **agent-infra / harness** | landers + harness fixes; disk-bound, ~12 lanes |
-| cell-1, cell-3 | **tortoise / product** | P0/P1 product work; disk-bound on cell-1, CPU-bound on cell-3 |
+| cell-2 | **agent-infra / harness** | landers + harness fixes; disk-bound |
+| cell-1, cell-3 | **tortoise / product** | P0/P1 product work; disk-bound on cell-1, **memory-bound** on cell-3 (8 GB, 2 OOM kills measured 2026-10-27) |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
+
+⛔ **THERE IS DELIBERATELY NO LANE CEILING TIED TO CPU COUNT** — the owner ruled on 2026-10-17 that dispatch is gated on
+capacity, not on a lane count (`docs/ops/fleet-capacity.md`: *"It is not a lane cap, and there is deliberately no lane
+ceiling tied to cpu count"*). So this table names a box's ROLE, never a number of lanes. The binding constraint is
+**free disk vs one lane's `tree + reserve`** (§2), then free RAM against the per-lane peak, then load.
 
 A dispatch decision is only honest if it names: the box's **free disk**, its **free RAM**, its **live lane count**, and the
 **lane's expected cost**. If a box is not dispatching by itself and is not at capacity, that is the signal to intervene —
@@ -243,3 +277,8 @@ not a load average measured earlier.
 - `TERM`/`INT` traps that swallow signals leave the script running: a stop/restart appears to hang (agent-infra#2085).
 - Deleting a worktree to make space must never destroy unpushed work: check `git rev-list --count @{u}..HEAD` and
   `status --porcelain` first; preserve, then remove only the regenerable parts.
+- **The 900 / 3000 arithmetic is gone on purpose.** If you find a copy of it (`mem_lanes=$(( (avail - 3000) / 900 ))`),
+  it is stale: it used a test-running peak as every lane's cost and a flat reserve that dominates a small box, and it
+  returned "0 lanes" on boxes with room. The measured figures and their dates are in §2.
+
+> Continue following the workflow as mandated by this skill. Do not skip steps.
