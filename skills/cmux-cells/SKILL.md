@@ -250,14 +250,17 @@ none of the reclaim steps below touch it.
    `-shm`; *any* of them pins the inode), so deleting the file frees nothing until those fds close. ⛔ **And stopping it is not a
    small act:** the unit is `KillMode=control-group`, so `sudo systemctl stop cmux-tui-daemon.service` SIGTERMs **every process
    in it** — and it needs `sudo` (an unprivileged `systemctl stop` is "Access denied"). That cgroup holds **45 processes at zero
-   lanes and 124–207 with the box full** (cell-3, 2026-10-27), including live `pi` lanes, a running `pytest` and the terminal
-   hosts — **re-count before you act** with
-   `cat /sys/fs/cgroup/system.slice/cmux-tui-daemon.service/cgroup.procs | wc -l` (or `systemctl show -p Tasks`); they are lanes
-   and they are what you lose. You are also deleting the box's **terminal inventory** — the registry that steps 1-2 and the
-   display are the channel *through* — so afterwards `exec` or the console is the only way back. Run the work-at-risk check below
-   across every worktree on the box first, then: `sudo systemctl stop` the unit, delete `sessions/<id>/workspace-registry.sqlite3`
-   (its ~43 MB `-wal` regenerates), `sudo systemctl start` it, **then** re-read `df` — or recreate the box, which takes
-   `keys.env`, the harness pin and every `L-*.log` with it (copy them off first).
+   lanes and 124–207 with the box full** (cell-3, 2026-10-27) — **re-count before you act** with
+   `cat /sys/fs/cgroup/system.slice/cmux-tui-daemon.service/cgroup.procs | wc -l` (there is no `-p Tasks` property; `TasksCurrent`
+   counts *threads* — 315 vs 35 processes on cell-3 — so do not substitute it). What it holds is not all lanes: on cell-3 about
+   two thirds were orphaned `redislite` sidecars reparented to `ppid 1` from **dead** worktrees, the rest the daemon, one live
+   lane and its `pytest`. So read the number as "open each one before you stop" — the ones you cannot re-create are the lanes.
+   You are also deleting the box's **terminal inventory** — the registry that steps 1-2 are the channel *through* (the display is
+   `cmux-desktop.service`, its own cgroup, and outlives the daemon) — so afterwards `exec` or the console is the only way back.
+   Run the work-at-risk check below across every worktree on the box first, then: `sudo systemctl stop` the unit, delete
+   `sessions/<id>/workspace-registry.sqlite3` (its ~43 MB `-wal` regenerates), `sudo systemctl start` it, **then** re-read `df` —
+   or recreate the box, which takes the whole guest: **every worktree** (the unpushed commits that check exists for), `keys.env`,
+   the harness pin and every `L-*.log`.
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -371,7 +374,7 @@ dispatch time, because both move.
 
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
-| `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, but **needs activation (§1)** before it can land |
+| `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, and **activated in the operative home** (`/tmp/cell-home`: `record-review.sh` + the `gh` shim, merge lanes ran on it 2026-10-27). Its `/home/cmux` home has **no `gh` shim**, so check which `HOME` a lane will get before expecting it to land |
 | `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — the fleet's lowest-core box, but the **same pinned `MAX_LANES=20` as the 16 GB ones** (§7): 20 is twice the core-derived 10, on a box §2's arithmetic puts nearer 6 lanes — and today the aid answers 2. It has OOM-killed too (`dmesg`: 2), so **§2's rule is the same as cell-4's: reserve UP, fewer lanes** |
 | `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target, and **the box with the most OOM kills of the three (5)**: per §2 that means its reserve goes UP, i.e. fewer lanes here, not more |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
@@ -409,14 +412,22 @@ not a load average measured earlier.
 - A stale heartbeat file does not mean the loop is dead (`orch-loop.log` mtime does).
 - Killing a controller is futile when launchd `KeepAlive` + a 20 s watchdog recreate it — and a lane can spawn one.
 - `TERM`/`INT` traps that swallow signals leave the script running: a stop/restart appears to hang (agent-infra#2085).
-- Deleting a worktree to make space must never destroy unpushed work, and the guard has to **fail closed AND read the right
-tree**: `git rev-list --count @{u}..HEAD` **errors and prints nothing** on a branch with no upstream — which is the branch
-  whose every commit is unpushed — so treat that error as UNSAFE, not as clean. Name the population (the repo, plus
-  `$CELL_HOME/wt-*`), then per worktree, always with `-C "$wt"` because every one of these commands is cwd-relative:
-  `git -C "$wt" rev-list --count --not --remotes HEAD` (**the positive reading**: commits reachable from no remote, which
-  answers even where `@{u}` is unset), `git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null || echo NO-UPSTREAM`,
-  `git -C "$wt" stash list`, and `git -C "$wt" status --porcelain`. A bare `status` exits 127 with empty output — which reads
-  exactly like clean, so guard it (`|| echo UNKNOWN`). Preserve, then remove only the regenerable parts.
+- Deleting a worktree to make space must never destroy unpushed work, and the guard has to **read the right tree, in the right
+  population, and fail closed.** Three traps, each measured on a cell:
+  - `git rev-list --count @{u}..HEAD` **errors and prints nothing** on a branch with no upstream — often the branch holding the
+    unpushed work — so treat that error as UNSAFE, not as clean.
+  - **`--not` negates every revision after it**, so `rev-list --count --not --remotes HEAD` counts nothing and prints `0` for a
+    worktree that has unpushed commits (measured: `0` as written, `1` corrected, same tree). Put the positive end first:
+    `git -C "$wt" rev-list --count HEAD --not --remotes`.
+  - **The population is not `$CELL_HOME/wt-*`.** `fix-one.sh` mints `$REPO/.worktrees/fix-<pr>`; on cell-3 that repo held **25**
+    worktrees (11+ with commits reachable from no remote) while `$CELL_HOME/wt-*` held **2**. Derive it:
+    `git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}'`, plus a bounded sweep for unregistered checkouts.
+  Then, per worktree — always `-C "$wt"`, and **assert the path first** (`[ -d "$wt" ] && git -C "$wt" rev-parse --git-dir
+  >/dev/null 2>&1 || { echo "UNKNOWN $wt"; continue; }`), because `git -C ""` silently reads the operator's own cwd:
+  `git -C "$wt" rev-list --count HEAD --not --remotes || echo UNKNOWN`,
+  `git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null || echo NO-UPSTREAM`, `git -C "$wt" stash list || echo UNKNOWN`, and
+  `git -C "$wt" status --porcelain || echo UNKNOWN` (a bare `status` exits 127 with empty output, which reads exactly like
+  clean). Preserve, then remove only the regenerable parts.
 - **Capacity is a MEASUREMENT, not a constant.** Every earlier version of §2 substituted one number for the lane type and one
   for the reserve, and both errors ran in the direction that **refuses** dispatches it should allow. The figures in §2 carry
   their date and method so the next reader can re-derive them instead of inheriting them.
