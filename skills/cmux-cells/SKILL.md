@@ -151,8 +151,8 @@ the install is repaired (78 — which also covers a bad invocation: an `unknown 
 install, so read the emitted line), the repo's open-PR queue actually lands (74). **74 has three arms and they do not share a
 remedy:** the ratio (`land_backlog_verdict` rc=1 — repo-wide, so land the queue and re-dispatching it elsewhere refuses too);
 the slug (`land_backlog_repo` cannot derive one: that worktree's `origin` is not an `owner/name` slug, **or `repo-slug.sh` is
-missing** — per-worktree or an install fault); and **rc=2, a failed `gh` read** (`UNREADABLE open-PR count` / `UNREADABLE
-landing rate`) — box-local, so fixing that box's gh chain clears it and **a re-dispatch to a healthy box does clear it**, even
+missing** — per-worktree or an install fault); and **rc=2, a failed `gh` read** (`UNREADABLE repo …` / `UNREADABLE
+open-PR count` / `UNREADABLE landing rate` / `UNREADABLE landing counts for …`) — box-local, so fixing that box's gh chain clears it and **a re-dispatch to a healthy box does clear it**, even
 though the gate prints the ratio remedy text for it too. A P0-blocker or a base-red repair is **exempt by evidence** and dispatches under the hold — **when the exemption read
 itself succeeds**; on the rc=2 arm it fails with the same gh chain, so a P0 *is* held until the chain is fixed (the
 gate's refusal line says so). **Idling on its own changes none of them**: for 73
@@ -267,8 +267,11 @@ none of the reclaim steps below touch it.
    `cmux-desktop.service`, its own cgroup, and outlives the daemon) — so afterwards `exec` or the console is the only way back.
    Run the work-at-risk check below across every repo on the box first, and list the registries you expect to delete
    (`ls -d /home/cmux/.local/state/cmux-tui/sessions/*/workspace-registry.sqlite3*` — with more than one session dir,
-   deleting one under-reclaims while `df` still shows an improvement). Then: `sudo systemctl stop` the unit, delete every match
-   of that glob — the `-wal` is a separate ~43 MB file and one of the pinned fds, so it goes too and regenerates smaller —
+   deleting one under-reclaims while `df` still shows an improvement). Then: `sudo systemctl stop` the unit and **confirm it actually stopped before deleting
+   anything** — `systemctl is-active cmux-tui-daemon.service` must read `inactive` or `failed`; if it still reads `active`, stop
+   there, because a denied `sudo`, a non-interactive lane, or `Job for … canceled` leaves the daemon holding the very fds this is
+   for: the unlink frees nothing, `df` does not move, and the box loses its terminal inventory anyway. Only then delete every
+   match of that glob — the `-wal` is a separate ~43 MB file and one of the pinned fds, so it goes too and regenerates smaller —
    `sudo systemctl start` it, and check **both** `systemctl is-active --quiet
    cmux-tui-daemon.service` **and** a fresh registry under `sessions/` **and** the `df` you came for — `df` alone cannot
    tell "reclaimed" from "reclaimed and now dead", and a failed start is the moment to escalate, not to recreate. A **recreate**
@@ -438,9 +441,9 @@ not a load average measured earlier.
   - **A pipeline ending in `wc -l` (or `grep -c`) cannot fail**, so `d=$(… | wc -l) || d=UNKNOWN` never fires and a *failed*
     `git status` prints `dirty=0`. Test `git status` itself, then count.
   - **The population depends on the destruction.** Deleting a *worktree* needs its repo's trees; a **recreate** or the
-    `cmux-tui` reset takes the whole guest — on cell-3 that is **five repos** (`$REPO` 27 trees, `/tmp/cell-ai` 44,
-    `$CELL_HOME/agent-infra` 2, `$CELL_HOME/tortoise` 3, and the ai-drainer's **seed repo** holding 14), with unpushed
-    commits in trees outside `$REPO`. ⛔ **The fifth member is the ai-drainer's SEED_REPO, and it is not necessarily where the
+    `cmux-tui` reset takes the whole guest — on cell-3 that was **five repos**, with unpushed commits in trees outside `$REPO`. Count them,
+    never quote a count: the tree total moved 22 -> 29 within a day of readings, so a number written here becomes a wrong
+    number that the next reader plans against. ⛔ **The fifth member is the ai-drainer's SEED_REPO, and it is not necessarily where the
     documentation says.** `ai-drainer.sh` creates `$AI/wt-drainer-<lane>` with `git -C "$SEED_REPO" worktree add` (search
     that phrase; `AI` defaults to `$HOME/orchestrator-ai`), and `install-drainer-timer.sh:72` defaults `SEED_REPO` to
     `$HOME/agent-infra-main` at **install** time. On a real cell that is not the value: measured 2026-10-27 on `pi-cell-4`,
@@ -453,18 +456,25 @@ not a load average measured earlier.
     `_reap_leftovers`), so a path named now is gone later, and a missing path turns that repo into an `AT-RISK-UNKNOWN`
     exit 1 instead of a reading. And `HEAD` is not the box's work: **8** local branches there are no worktree's HEAD and
     die in a recreate too.
-  - **`git status --porcelain` omits ignored state** (`keys.env`, `orchestrator/state/` show as `!!`) — which is *exactly*
-    what a recreate destroys — so the block reports it in a third column. An ignored **count** never moves the exit code (an
-    unreadable one sets `1`, like every other UNKNOWN), so a `0` from this block never means "nothing here matters" for a
-    recreate; read the column.
+  - **`git status --porcelain` omits ignored state**, so the block reports it in a third column: the ignored paths **inside
+    each worktree of `$REPO`** (`.venv/`, `__pycache__/`, `.worktrees/`, caches). An ignored **count** never moves the exit
+    code (an unreadable one sets `1`, like every other UNKNOWN), so a `0` never means "nothing here matters" for a recreate.
+    ⛔ **The two things a recreate actually destroys are in no worktree at all**: `keys.env` and `orchestrator/{state,logs}/`
+    live in `$CELL_HOME`, which is not a git repo (`git check-ignore` in the cell repos returns nothing for `keys.env`), so no
+    `!!` line can ever report them and `ignored=0` says nothing about them. The guest block checks those separately.
   Run it as a loop over the stream, and let the **exit status** carry the verdict (`0` every tree read, no unpushed commits, no
-  dirty tracked files · `1` something could not be read · `2` work at risk). `continue` outside a loop is a no-op, and a block
+  dirty or untracked paths · `1` something could not be read · `2` work at risk). `continue` outside a loop is a no-op, and a block
   whose stdout says "at risk" while it exits 0 teaches the caller to ignore it:
   ```bash
   # EXIT: 0 = read clean · 1 = something could not be read · 2 = work at risk (read the lines)
   if ! { [ -n "${REPO:-}" ] && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; }; then
     echo "AT-RISK-UNKNOWN repo=${REPO:-<unset>}"; exit 1
   fi
+  # BOTH population reads are asserted first: an enumeration that fails must not read as a clean box.
+  WTS=$(git -C "$REPO" worktree list --porcelain 2>/dev/null) || { echo "AT-RISK-UNKNOWN worktree-list $REPO"; exit 1; }
+  [ -n "$WTS" ] || { echo "AT-RISK-UNKNOWN worktree-list-empty $REPO"; exit 1; }
+  BR=$(git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null) \
+    || { echo "AT-RISK-UNKNOWN for-each-ref $REPO"; exit 1; }
   rc=0
   while IFS= read -r wt; do            # sed, not awk: keep paths that contain spaces whole
     if ! { [ -d "$wt" ] && git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; }; then
@@ -481,7 +491,7 @@ not a load average measured earlier.
     case "$d" in UNKNOWN|"") d=UNKNOWN; [ "$rc" = 2 ] || rc=1 ;; 0) ;; *) rc=2 ;; esac
     [ "$ig" = UNKNOWN ] && { [ "$rc" = 2 ] || rc=1; }
     echo "WT $wt unpushed=$n dirty=$d ignored=$ig"
-  done < <(git -C "$REPO" worktree list --porcelain | sed -n 's/^worktree //p')
+  done < <(printf '%s\n' "$WTS" | sed -n 's/^worktree //p')
   if s=$(git -C "$REPO" stash list 2>/dev/null); then        # refs-wide: once per repo, never per tree
     if [ -n "$s" ]; then echo "$s" | sed 's/^/STASH-AT-RISK /'; rc=2; else echo "STASHES 0"; fi
   else echo "STASH-UNKNOWN $REPO"; [ "$rc" = 2 ] || rc=1; fi
@@ -489,13 +499,16 @@ not a load average measured earlier.
     [ -n "$br" ] || continue
     bn=$(git -C "$REPO" rev-list --count "$br" --not --remotes 2>/dev/null) || bn=UNKNOWN
     case "$bn" in UNKNOWN|"") bn=UNKNOWN; echo "BRANCH-UNREADABLE $br"; [ "$rc" = 2 ] || rc=1 ;; 0) ;; *) echo "BRANCH-AT-RISK $br $bn"; rc=2 ;; esac
-  done < <(git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)
+  done < <(printf '%s\n' "$BR")
   echo "VERDICT $rc"; exit "$rc"
   ```
   `UNKNOWN` is an error, not a zero. **For anything that takes the whole guest — a recreate, the `cmux-tui` reset — save the
   block to a file and run it once per repo, keeping the worst status.** Inlining it in a loop cannot work: it ends with
   `exit`, so the first repo would end the loop.
   ```bash
+  W="${W:-/tmp/work-at-risk.sh}"      # the block above, saved; named explicitly so it runs from any cwd
+  [ -f "$W" ] || { echo "AT-RISK-UNKNOWN work-at-risk-missing $W"; exit 1; }
+  [ -d "${CELL_HOME:-}" ] || { echo "AT-RISK-UNKNOWN CELL_HOME=${CELL_HOME:-<unset>}"; exit 1; }
   rc_all=0
   # The seed checkout is whatever repo owns the drainer's trees — DERIVED, never assumed. On pi-cell-4 it is
   # /tmp/cell-ai-main, while install-drainer-timer.sh:72's default ($HOME/agent-infra-main) does not exist and the installed
@@ -510,20 +523,25 @@ not a load average measured earlier.
   # every run, which trains the reader to discount the stop signal; a path that exists and is not a repo still reports
   # AT-RISK-UNKNOWN. Streamed one path per line so a path with a space survives, for the same reason the block above reads
   # the porcelain stream instead of awk fields.
+  POP=$( { printf '%s\n' "$REPO"
+            [ -n "$seed" ] && printf '%s\n' "$seed"
+            for d in /tmp/cell-* "$CELL_HOME"/*; do [ -e "$d/.git" ] && printf '%s\n' "$d"; done
+          } | sort -u )
+  [ -n "$POP" ] || { echo "AT-RISK-UNKNOWN no-repos $CELL_HOME"; exit 1; }   # nothing enumerated is not "clean"
   while IFS= read -r R; do
     [ -n "$R" ] || continue
-    ( REPO=$R bash work-at-risk.sh ) || { s=$?; [ "$s" -gt "$rc_all" ] && rc_all=$s; }
-  done < <(
-    printf '%s\n' "$REPO"
-    [ -n "$seed" ] && printf '%s\n' "$seed"
-    for d in /tmp/cell-* /tmp/cell-home/*; do [ -e "$d/.git" ] && printf '%s\n' "$d"; done
-    exit 0
-  )
+    ( REPO=$R bash "$W" ) || { s=$?; [ "$s" -gt "$rc_all" ] && rc_all=$s; }
+  done <<< "$POP"
+  for f in "$CELL_HOME"/keys.env "$CELL_HOME"/orchestrator/state "$CELL_HOME"/orchestrator/logs; do
+    [ -e "$f" ] && echo "BOX-AT-RISK $f"   # outside every repo: no worktree read can see these
+  done
   echo "GUEST VERDICT $rc_all"; exit "$rc_all"
   ```
-  That list is a **floor taken on 2026-10-27, not a census** — re-derive it per box
-  (`for d in /tmp/cell-* /tmp/cell-home/*; do [ -e "$d/.git" ] && echo "$d"; done`) and expect more. Preserve, then remove only
-  the regenerable parts.
+  **Nothing above is a list you carry**: the seed comes from the trees and the rest from a glob, every run. A transcribed list
+  is the list that omits the repo holding the work — the version of this block that hardcoded four paths printed
+  `GUEST VERDICT 0` on cell-3 while a repo it never opened held `unpushed=8` and `unpushed=2`. So confirm the enumeration before
+  trusting a `0`: it must name a `VERDICT` line per repo, and an empty population is not a clean box — if the glob and `$REPO`
+  yield nothing, treat the run as unreadable, not as permission. Preserve, then remove only the regenerable parts.
 - **Capacity is a MEASUREMENT, not a constant.** Every earlier version of §2 substituted one number for the lane type and one
   for the reserve, and both errors ran in the direction that **refuses** dispatches it should allow. The figures in §2 carry
   their date and method so the next reader can re-derive them instead of inheriting them.
