@@ -74,7 +74,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~5–105 MB in a normal sample** (cells 3–4, 2026-10-27) with **peaks seen at 207.9 MB (cell-3) and 313 MB (cell-1)** — plan on the peak, not on ~150 MB, and re-measure per box. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~5–105 MB in a normal sample**, with **peaks seen at 207.9 MB (cell-3) and 313 MB (cell-1)** — `docker stats --no-stream`, per sidecar container, cells 3–4, 2026-10-27; plan on the peak, not on ~150 MB, and re-measure per box. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -416,7 +416,7 @@ dispatch time, because both move.
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, and **activated in the operative home** (`/tmp/cell-home`: `record-review.sh` + the `gh` shim, merge lanes ran on it 2026-10-27). Its `/home/cmux` home has **no `gh` shim**, so check which `HOME` a lane will get before expecting it to land |
-| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — the fleet's lowest-core box, but the **same pinned `MAX_LANES=20` as the 16 GB ones** (§7): 20 is twice the core-derived 10, on a box §2's arithmetic puts nearer 6 lanes and whose own aid now answers 2–3. It has OOM-killed too (`dmesg`: 2), so **§2's rule is the same as cell-4's: reserve UP, fewer lanes** |
+| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — the fleet's lowest-core box, but the **same pinned `MAX_LANES=20` as the 16 GB ones** (the `keys.env` pin, §7 below): 20 is twice the core-derived 10, on a box §2's arithmetic puts nearer 6 lanes and whose own aid now answers 2–3. It has OOM-killed too (`dmesg`: 2), so **§2's rule is the same as cell-4's: reserve UP, fewer lanes** |
 | `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target, and **the box with the most OOM kills of the three (5)**: per §2 that means its reserve goes UP, i.e. fewer lanes here, not more |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
@@ -483,8 +483,8 @@ not a load average measured earlier.
     `wt-drainer-*` path itself *does* work (`git worktree list` inside a linked checkout lists the whole repository,
     measured) — the reason not to is that `ai-drainer.sh` **reaps** those trees as soon as a lane dies (`_rm_wt`,
     `_reap_leftovers`), so a path named now is gone later, and a missing path turns that repo into an `AT-RISK-UNKNOWN`
-    exit 1 instead of a reading. And `HEAD` is not the box's work: **8** local branches there are no worktree's HEAD and
-    die in a recreate too.
+    exit 1 instead of a reading. And `HEAD` is not the box's work: a local branch that no worktree holds as `HEAD` dies in a
+    recreate too — the block's `BRANCH-AT-RISK` lines are that reading, so count them there, never from a number here.
   - **`git status --porcelain` omits ignored state**, so the block reports it in a third column: the ignored paths **inside
     each worktree of `$REPO`** (`.venv/`, `__pycache__/`, `.worktrees/`, caches). An ignored **count** never moves the exit
     code (an unreadable one sets `1`, like every other UNKNOWN), so a `0` never means "nothing here matters" for a recreate.
