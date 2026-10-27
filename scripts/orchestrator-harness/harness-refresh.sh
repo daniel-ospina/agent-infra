@@ -327,7 +327,16 @@ if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
   # could only ever DOWNGRADE `current`, which is why the same weak evidence was safe there.
   if [ -n "$_ctrl_pid" ] && kill -0 "$_ctrl_pid" 2>/dev/null \
      && _began_before_lock "${O:-}/.orch.lock" "$_ctrl_pid"; then
-    _argv="$("${PS_BIN:-/bin/ps}" -o command= -p "$_ctrl_pid" 2>/dev/null)"
+    # ⛔ `-ww`, BECAUSE `COLUMNS` OVERRIDES THE SAFE DEFAULT (#2926). A command substitution is not a tty,
+    # so this read would normally be width-independent — but `ps(1)` checks `COLUMNS` FIRST (FreeBSD/Apple:
+    # "the default output width is that requested by the COLUMNS environment variable if present, else the
+    # line width of the terminal associated to the ps process, if any"). An exported COLUMNS therefore
+    # TRUNCATES the command column, and the path is the LAST token — so `*/orchestrator-harness/orch-loop.sh`
+    # is cut mid-name, no match exists, the stage gives up SILENTLY and #2641's permanent `restart-pending`
+    # is back with the fix looking present. Measured on the cell: `COLUMNS=40 ps -o command= -p $$` → 41
+    # bytes, the same read with `-ww` → the whole 305-byte line. `-ww` is unlimited on procps and
+    # "at least 131 columns" on BSD ps, and `-w` can only WIDEN a read, never narrow one.
+    _argv="$("${PS_BIN:-/bin/ps}" -ww -o command= -p "$_ctrl_pid" 2>/dev/null)"
     # ⛔ `set -f` AROUND THE TOKEN SPLIT. The split itself is the point (a ps command line is ONE
     # string), but with globbing ON a `*`/`?` token is expanded against the CWD and can INVENT a word
     # that was never in argv — a token that then looks like a controller path. A path containing a SPACE
@@ -475,7 +484,11 @@ fi
 # this script are excluded by name because both live in $O when it is seeded.
 in_flight_pids() {
   local t
-  t="$(ps -eo pid=,ppid=,command= 2>/dev/null)" || return 1
+  # ⛔ `-ww` FOR THE SAME REASON AS THE `_argv` READ ABOVE (#2926): an ambient `COLUMNS` truncates the
+  # command column, and a LANE whose `$O/<name>.sh` token was cut is read as absent — which is `lanes=0`,
+  # which is what lets `--re-seed` swap `$O` under a running lane. That direction is DESTRUCTIVE, so this
+  # read may not depend on an environment variable. Witnessed by A22b.
+  t="$(ps -eww -o pid=,ppid=,command= 2>/dev/null)" || return 1
   case "$t" in *[![:space:]]*) ;; *) return 1 ;; esac
   printf '%s\n' "$t" | awk -v o="$O/" -v me="$$" '
     {

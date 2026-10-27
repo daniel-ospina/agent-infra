@@ -283,6 +283,31 @@ case "$R" in *"IN-FLIGHT at the advance"*) ok "…and the prose says nothing was
 case "$(cat "$D/mat.calls" 2>/dev/null)" in *--pin-only*) ok "the advance used --pin-only (a new per-commit tree; \$O untouched)" ;; *) bad "the advance did not use --pin-only: $(cat "$D/mat.calls" 2>/dev/null)" ;; esac
 kill "$LANEPID" 2>/dev/null || true
 
+# ⛔ A22b: AN AMBIENT `COLUMNS` MUST NOT HIDE A LIVE LANE (#2926). `in_flight_pids` reads `ps … command=`
+# and matches the token `$O/<name>.sh`. `ps(1)` honours `COLUMNS` BEFORE its "not a tty ⇒ unlimited"
+# default (FreeBSD/Apple ps(1): "the default output width is that requested by the COLUMNS environment
+# variable if present"), and the path is the LAST token of the line, so an exported COLUMNS cuts it first.
+# Measured on the cell: `COLUMNS=40 ps -o command= -p $$` → 41 bytes; the same read with `-ww` → the whole
+# 305-byte line. Truncated, this read answers lanes=0 for a LIVE lane — and lanes=0 is exactly what lets
+# `--re-seed` swap `$O` under it, so the direction is DESTRUCTIVE, not cosmetic. The width is 20 on
+# purpose: below any fixture path, so the truncation is certain rather than lucky. Asserting only `lanes=1`
+# would under-test it — the destructive ARMS are asserted too.
+_CASE=$((_CASE+1)); echo "=== A22b: an ambient COLUMNS cannot hide a live lane from the in-flight read (ps -ww) ==="
+D="$T/a38"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+printf '%s\n' "$$" > "$D/O/.orch.lock"     # a live controller, as on a real cell
+LANEPID="$(mk_fake_lane "$D/O")"
+MAT="$(mk_stub_mat "$D")"
+R="$(COLUMNS=20 O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" \
+      --ref origin/main --pin "$PIN" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC=$?
+lane_alive "$LANEPID" && ok "the live lane was NOT signalled under a narrow COLUMNS" \
+                     || bad "a COLUMNS-truncated lane count let the re-seed kill lane $LANEPID"
+[ "$RC" = 26 ] && ok "exit 26 — a lane invisible only because of COLUMNS still refuses the destructive advance" \
+                || bad "exit $RC, expected 26 — a truncated table let --re-seed through: $R"
+case "$R" in *lanes=1*) ok "the lane is still counted with COLUMNS=20 — the table read is width-independent" ;;
+             *lanes=0*) bad "COLUMNS truncated the process table and hid a LIVE lane (lanes=0) — the #2926 defect" ;;
+             *) bad "no lane count in the record: $R" ;; esac
+kill "$LANEPID" 2>/dev/null || true
+
 _CASE=$((_CASE+1)); echo "=== A23: the DESTRUCTIVE advance (--re-seed) under a mid-turn lane -> REFUSES 26, names what blocks it ==="
 D="$T/a23"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 printf '%s\n' "$$" > "$D/O/.orch.lock"
@@ -1147,6 +1172,71 @@ rm -f "$D/o/.orch.lock"; kill "$_R24" 2>/dev/null; wait "$_R24" 2>/dev/null
 case "$R3" in *"running=$(short "$C2")"*) bad "a READER of the tip tree answered for the box (false current): $R3" ;;
                *"running=$(short "$C1")"*) ok "a mention of the path does not resolve RUNNING (the lock named a live reader)" ;;
                *) bad "the record named neither tree — the stage was skipped, not exercised: $R3" ;; esac
+
+# ⛔ A36i: AN AMBIENT `COLUMNS` MUST NOT TRUNCATE THE ARGV READ (#2926), and A36 cannot see this — the
+# fixture runs with COLUMNS unset, so the witness has to SET it rather than hope. Same mechanism as A22b:
+# `ps(1)` honours COLUMNS before its unlimited-width default, and the path is the LAST token, so a narrow
+# COLUMNS cuts `*/orchestrator-harness/orch-loop.sh` mid-name — no match, the stage falls through to the
+# stamp SILENTLY, and #2641's permanent `restart-pending` is back with the fix looking present. Not
+# hypothetical: a real cell controller's invocation on this box measures EXACTLY 80 characters
+# (`bash /home/cmux/harness/04bc1ddefed6/scripts/orchestrator-harness/orch-loop.sh`), one column from
+# "no controller" at the 80-column tmux default. Re-driven on A36's fixture, which keeps a live
+# controller shape and a pin root that already resolves.
+_CASE=$((_CASE+1)); echo "=== A36i: a narrow COLUMNS cannot truncate the controller's argv (ps -ww) ==="
+bash "$_O26" & _P31=$!
+sleep 1
+printf '%s\n' "$_P31" > "$D/o/.orch.lock"
+R9="$(COLUMNS=20 O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"
+rm -f "$D/o/.orch.lock"; kill "$_P31" 2>/dev/null; wait "$_P31" 2>/dev/null
+case "$R9" in *"running=$(short "$C2")"*)
+                ok "the running tree is still resolved with COLUMNS=20 — the argv read is width-independent" ;;
+             *) bad "a narrow COLUMNS truncated the argv read — the stage gave up silently and #2641 returns: $R9" ;; esac
+
+# ⛔ A36j: THE SHELL ALLOW-LIST IS ITS OWN GUARD AND HAD NO WITNESS (review cycle 6, measured: deleting the
+# `case " bash sh dash zsh ksh " in` arm left the suite green at 211/211). A36c cannot be its witness — its
+# reader is `tail -f <path>`, whose argv[1] is `-f`, so the SHAPE test rejects it before the shell test is
+# ever evaluated. The arm is load-bearing: it is what stops a process whose argv[1] IS the path but whose
+# argv[0] is not a shell — a `cat <path> -f`, a `diff`, an editor. Without it that reader's tree resolves
+# `current` for a tree the controller is not executing, and `current` feeds `REL_RUN` (the ahead/diverged
+# refusals). The plant is asserted to be argv-shaped before the outcome is read (the A25 lesson: a dead or
+# unnamed plant makes every assertion below vacuously pass).
+_CASE=$((_CASE+1)); echo "=== A36j: argv[1] IS the path but argv[0] is NOT a shell -> cannot answer (allow-list) ==="
+bash -c 'exec -a cat tail "$1" -f' _ "$_O26R" >/dev/null 2>&1 & _P32=$!
+sleep 1
+case "$(ps -ww -o command= -p "$_P32" 2>/dev/null)" in
+  "cat "*"orch-loop.sh -f"*) ok "the plant's argv really is `cat <path> -f` (argv[1] = the path, argv[0] not a shell)" ;;
+  *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P32" 2>/dev/null)" ;; esac
+printf '%s\n' "$_P32" > "$D/o/.orch.lock"
+RA="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"
+rm -f "$D/o/.orch.lock"; kill "$_P32" 2>/dev/null; wait "$_P32" 2>/dev/null
+case "$RA" in *"running=$(short "$C2")"*)
+                bad "a NON-SHELL argv[1] answered for the box (false current) — the shell allow-list is gone: $RA" ;;
+             *"running=$(short "$C1")"*)
+                ok "a non-shell that names the path as an argument cannot answer — the shell allow-list holds" ;;
+             *) bad "the record named neither tree: $RA" ;; esac
+
+# ⛔ A36k: THE PIN-FILE ARM IS THE ONLY RECORD THAT CAN NAME A READ DIR OUTSIDE THE PIN ROOT (#2216), AND IT
+# HAD NO WITNESS (review cycle 6, measured: deleting the block left the suite green at 211/211 — every A36*
+# invocation passes HARNESS_PIN_DIR and none passes HARNESS_PIN_FILE). Without it every box of that shape
+# falls back to `stamp:*` → `restart-pending`, which is #2641 itself. Driven with HARNESS_PIN_DIR UNSET so
+# the arm is the only thing that can resolve, and the file holds the first line a real one holds
+# (`<tree>/scripts/orchestrator-harness`, written by install.sh).
+_CASE=$((_CASE+1)); echo "=== A36k: with NO pin root, the HARNESS_PIN_FILE tree still resolves RUNNING ==="
+_P33="$T/a24/path-pin"
+printf '%s\n' "$_T24/scripts/orchestrator-harness" > "$_P33"
+bash "$_O26" & _P34=$!
+sleep 1
+printf '%s\n' "$_P34" > "$D/o/.orch.lock"
+RB="$(env -u HARNESS_PIN_DIR O="$D/o" HARNESS_PIN_FILE="$_P33" bash "$RR" --no-fetch --repo "$T/src" \
+       --ref origin/main --pin "$PIN" --self "$D/o" 2>&1)"
+rm -f "$D/o/.orch.lock"; rm -f "$_P33"; kill "$_P34" 2>/dev/null; wait "$_P34" 2>/dev/null
+case "$RB" in *"running=$(short "$C2")"*)
+                ok "the pin-file tree answers with NO pin root — the #2216 shape is not left on the stamp" ;;
+             *"running=$(short "$C1")"*)
+                bad "the HARNESS_PIN_FILE arm did not resolve (dead code in CI): RUNNING fell to the stamp: $RB" ;;
+             *) bad "the record named neither tree: $RB" ;; esac
 
 # ⛔ A36b: A TREE OUTSIDE EVERY RECORDED ROOT CANNOT ANSWER FOR THIS BOX. The harness path is SHARED
 # across repos on one machine, so "a controller is running" and "MY controller is running" are different
