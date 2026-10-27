@@ -1082,6 +1082,31 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run reconci
 assert_eq "$?" "2" "reconcile does not publish a clean summary over part of the box"
 assert_contains "$out" "why=pool-root-incomplete" "naming the same reading"
 
+# ⛔ THE SCAN ARM IS THE ONE VERB PATH WITH NO COMPLETENESS GATE — AND IT IS THE DELETE PATH (#2899
+#   review round 5, P2). With no gate, `registered_dirs` returns an EMPTY (but readable) listing, the
+#   loop never runs — so guard 3's own `outside_listener_dirs` read at `sib` is never reached either —
+#   and the pass printed `reclaim: retired=0 … cannot=0` and exited 0. "The pool is clean" and "I
+#   listed an empty directory" became the same line, over an unread pool, from the verb that DELETES.
+#   The recovery recipe this change documents (§6 step 2 of docs/research/2026-10-27-runner-pool-
+#   self-healing.md) tells the operator to run `reclaim --dry-run` then `reclaim` — on the `pi-cell-4`
+#   shape, where the installs live under `/opt` and the root defaults elsewhere, so the false clean
+#   pass is the FIRST thing that recipe produces on the box it was written for.
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" run reclaim)"
+assert_eq "$?" "2" "reclaim REFUSES a pool it can only partially enumerate (rc 2, never a clean pass)"
+assert_contains "$out" "cannot-measure why=pool-root-incomplete" "naming the reading that failed"
+assert_contains "$out" "reclaim NOT attempted" "and saying the delete verb did nothing"
+assert_eq "$(grep -cF 'reclaim: retired=' <<<"$out")" "0" \
+  "no all-zero summary is published over the pool it never read"
+# The SAME root with no outside listener is a genuine empty pool: rc 0, and the summary names the root
+# it read — so an all-zero line cannot be mistaken for a clean one (control).
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "an EMPTY pool under a complete root is still a clean pass (control)"
+assert_contains "$out" "root=$RUNNER_ROOT" "and the summary names the root it read"
+# `--name` names ONE directory and never reads the pool as a whole, so it is deliberately NOT gated:
+# an incomplete root must not block a single-install verdict (the over-block direction of the same fix).
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="$EXTRA" rc_of reclaim --name pi-runner-nope)" "3" \
+  "a --name call is a single-dir verdict, so an incomplete root does not change it"
+
 # ⛔ A WRAPPED LISTENER IS STILL A LISTENER (#2381 review round 6, P1). A listener started through a
 #   wrapper (`nohup`, `env K=V`, `bash`, `sudo`, a service shim) has `<wrapper> <dir>/bin/…` as its
 #   argv. Taking EVERYTHING before the binary gave `nohup <dir>` — not an absolute path — and the arm
@@ -2093,7 +2118,18 @@ else
   chmod 311 "$RUNNER_ROOT/containerd"
   out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
   assert_eq "$?" "3" "the pool is MEASURABLE over a mixed root (rc 3 = its one DEAD runner, not 2)"
-  assert_absent "$RUNNER_ROOT/containerd/x" "(control: the dir really is unlistable)"
+  # ⛔ THE OLD CONTROL COULD NEVER FAIL (#2899 review round 5, P2): it asserted the ABSENCE of
+  # `containerd/x`, a path the fixture never creates, so it passed whether or not the chmod denied
+  # anything. If the mode ever stopped denying the read (a user namespace, a different owner, a
+  # `chmod` the kernel normalises away), `registered_dirs` would take the READABLE path, skip
+  # `containerd` for carrying no `.runner`, and every other assertion in this arm would be IDENTICAL
+  # in both worlds — so the arm would keep printing ✅ while R4's `has_install_marker` path stopped
+  # being exercised at all. Assert the PREDICATE the arm turns on: not readable, and still searchable.
+  if [ ! -r "$RUNNER_ROOT/containerd" ] && [ -x "$RUNNER_ROOT/containerd" ] && ! ls -A "$RUNNER_ROOT/containerd" >/dev/null 2>&1; then
+    ok "(control: the dir really is unlistable — not readable, still searchable)"
+  else
+    bad "(control: the fixture did not produce an unreadable-but-searchable dir, so this arm proves nothing)"
+  fi
   assert_contains "$out" "slots=1 ceiling=3" "and the non-member is not counted as capacity"
   assert_eq "$(grep -cF 'instance-unreadable' <<<"$out")" "0" "nor reported as an unreadable instance"
   # THE CONTROL: the SAME mode OVER A MEMBER is still counted and still cannot-measure — the guard is

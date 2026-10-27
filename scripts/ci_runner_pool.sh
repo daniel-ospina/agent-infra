@@ -1242,6 +1242,21 @@ cmd_reclaim() {
     dirs="$d"
   else
     dirs="$(registered_dirs)" || return 2
+    # ⛔ THE SCAN ARM IS THE ONE VERB PATH WITH NO COMPLETENESS GATE, AND IT IS THE DELETE PATH
+    # (#2899 review round 5, P2). Without this, `RUNNER_ROOT` naming a directory that is not the box's
+    # pool yields an EMPTY (but readable) listing, the loop below never runs — so guard 3's own
+    # `outside_listener_dirs` read at `sib` is never reached either — and the pass prints
+    # `reclaim: retired=0 preserved=0 revived=0 live=0 …` and exits 0. "The pool is clean" and "I
+    # listed an empty directory" become the same line, over an unread pool, from the verb that
+    # deletes. `status`, `reconcile`, `add` and `restart` all refuse this state (require_pool_complete
+    # / their own outside read), and the recovery recipe this change documents (§6 step 2 of
+    # docs/research/2026-10-27-runner-pool-self-healing.md) tells the operator to run exactly
+    # `reclaim --dry-run` then `reclaim` — on the `pi-cell-4` shape, where the installs live under
+    # `/opt` and the root defaults elsewhere. So the gate that every other verb passes is applied here
+    # too: a listing that is not the box's pool is not a listing to report a clean pass over.
+    # `--name` is deliberately NOT gated: it names one directory explicitly and never reads the pool
+    # as a whole, so an incomplete root cannot make its verdict wrong.
+    require_pool_complete reclaim || return 2
   fi
   while read -r d; do
     [ -n "$d" ] || continue
@@ -1419,8 +1434,12 @@ cmd_reclaim() {
       say "quarantined dir=$q — the registration is OUT of the pool, but its files could not be removed (a root-owned file inside, usually systemd's _diag): run: rm -rf \"$q\" as the account that owns them; this path is excluded from slots and from every later pass, and status keeps naming it until it is gone"
     fi
   done <<<"$dirs"
-  printf 'reclaim: retired=%s preserved=%s revived=%s live=%s quarantined=%s cannot=%s clock_skew=%s bound=%ss dry_run=%s\n' \
-    "$retired" "$preserved" "$revived" "$live" "$qn" "$cannot" "${skew:-unmeasured}" "$MAX_SKEW_S" "$DRY"
+  # ⛔ THE SUMMARY CARRIES ITS DENOMINATOR (#2899 review round 5, P2). An all-zero line with no
+  # `root=` reads as "the pool is clean" when it may be "this root holds nothing"; the refusal above
+  # closes that case, and naming the root makes the remaining one (a correct root with zero
+  # registrations) legible on the line itself rather than inferred from an earlier `status`.
+  printf 'reclaim: retired=%s preserved=%s revived=%s live=%s quarantined=%s cannot=%s clock_skew=%s bound=%ss dry_run=%s root=%s\n' \
+    "$retired" "$preserved" "$revived" "$live" "$qn" "$cannot" "${skew:-unmeasured}" "$MAX_SKEW_S" "$DRY" "$RUNNER_ROOT"
   # ⛔ rc 3 IS REACHABLE ONLY BEFORE THE LOOP (a name with no registration, or a refused clock): the
   # two verdicts inside the loop are cannot-act (2), because they are facts about what could not be
   # read or done, not gate verdicts about the box. There is deliberately no `refused` counter — and no
