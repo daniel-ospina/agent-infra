@@ -176,11 +176,14 @@ flag does either.
    detached and poll instead:
 
    ```bash
-   bash scripts/rail-run.sh start  <PR> [rail args...]   # returns at once, prints the run id + log
-   bash scripts/rail-run.sh status <PR> [--repo owner/repo] --run <run-id>
+   bash scripts/rail-run.sh start  <PR> ARGS...   # returns at once, prints the run id + log
+   bash scripts/rail-run.sh status <PR> (--repo owner/repo) --run <run-id>
    ```
-   `status` exits 10 running · 0 landed · 20 refused · 21 killed · 22 gone-without-verdict — a run
-   that produced NO verdict is never reported as a landing. See `docs/ops/rail-run.md`.
+   `status` exits 10 running · 0 landed · 20 refused · 21 killed · 22 gone-without-verdict · 25 unknown
+   (an evidence read abstained) — a run that produced NO verdict is never reported as a landing, and
+   `landed` requires the PR's url to name THIS repo and THIS PR (a same-numbered PR elsewhere is not
+   yours). `start` records the repo identity from `--repo` or `origin`; poll with the SAME `--repo`
+   if you passed one. See `docs/ops/rail-run.md`.
 
    ⛔ **The ONE-COMMAND alternative to steps 1-3.** If you would otherwise assemble a reviewer prompt
    by hand, do not: `~/.pi/agent/scripts/review-pr.sh <PR>` spawns a genuinely fresh-context
