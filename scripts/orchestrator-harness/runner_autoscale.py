@@ -150,9 +150,11 @@ EXIT  0 converged / nothing to do (a REFUSAL is an answer, not a failure)
       4 STARVATION — `queued>0 ∧ busy==0 ∧ online>0` confirmed (agent-infra#2875). Nothing was
         changed by the alarm: it names the invariant and the three counts. This is the one exit a
         health check should page on, because a starved box otherwise reads perfectly healthy.
-      5 `--check-units` found an installed unit whose WorkingDirectory is unusable (or an audit that
-        read nothing at all). A READ-ONLY finding, deliberately distinct from 3: a consumer keying on
-        "an action failed" must not confuse it with "my units are misconfigured".
+      5 `--check-units` found an installed unit whose WorkingDirectory is unusable, or whose
+        ExecStart names a program/path systemd cannot run (a transient or missing one, a relative
+        path, or more than one ExecStart= on a non-oneshot type) — or an audit that read nothing at
+        all. A READ-ONLY finding, deliberately distinct from 3: a consumer keying on "an action
+        failed" must not confuse it with "my units are misconfigured".
       A pass whose provisioner refuses while THIS tool's disk arm says one more runner fits reports
       the verdict `guard-conflict` (exit 3, both sides' numbers in the notes): the two guards answer
       different questions, and the disagreement is a decision for a human, not an action failure.
@@ -1176,34 +1178,97 @@ def unit_workdir_problem(workdir: str | None) -> str | None:
     return None
 
 
-def unit_exec_problems(unit_name: str, execstart: str) -> list[str]:
-    """Findings for a unit's `ExecStart` — the OTHER way a reclaim takes a scheduled tool down.
+# ⛔ THE EXECUTABLE PREFIXES systemd accepts in front of the program (`@`, `-`, `:`, `+`, `!`, `!!`) —
+# Table 2 of systemd.service(5). They are NOT part of the path, and reading them as one made the
+# audit flag three of this box's own stock units (`@/usr/bin/dbus-daemon`, `-/sbin/agetty`,
+# `!!/usr/lib/systemd/systemd-networkd`) the first time it learned to look at ExecStart.
+EXEC_PREFIX_CHARS = "@-:+!"
 
-    ⛔ THE SAME RECLAIM CLASS AS `WorkingDirectory`, ONE UNIT STATUS LATER (measured, review round 7).
-    `render_unit()` pins `sys.executable` and `Path(__file__).resolve()`, and `__file__` is the file
-    in the CHECKOUT the installer ran from — on a cell that is a lane worktree under `/tmp`
-    (`/tmp/cell-ai/.worktrees/…`), i.e. the exact directory `unit_workdir_problem` refuses to use as
-    a cwd. After a reclaim the unit does not fail at CHDIR (`200/CHDIR`); it fails at EXEC
-    (`203/EXEC`) on EVERY tick — the same silent death, and `--check-units` answered "all usable"
-    for it, because it only ever read `WorkingDirectory`. Absence is never health: a unit whose
-    PROGRAM is gone is not a scheduled converger.
 
-    Quoting is parsed, not trusted: systemd splits on whitespace except inside `"…"`, which is what
-    lets a script path containing a space work at all (both paths are quoted by `render_unit`).
+def _exec_commands(values: list[str]) -> list[str]:
+    """The commands systemd will actually run from every `ExecStart=` in load order.
+
+    ⛔ `ExecStart=` ACCUMULATES; IT DOES NOT OVERRIDE (review round 2, verified against
+    systemd.service(5): *"Commands may be specified by providing multiple command lines in the same
+    directive, or alternatively, this directive may be specified more than once with the same effect.
+    If the empty string is assigned to this option, the list of commands to start is reset"*). Reading
+    only the LAST value — as `WorkingDirectory` is correctly read — reproduced the exact false PASS
+    this check exists to close: a unit whose EARLIER `ExecStart` is transient audited CLEAN because a
+    LATER one was durable, while the transient command still ran and still failed on every tick.
     """
-    tokens = [quoted or bare for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', execstart)]
-    tokens = [t for t in tokens if t]
+    commands: list[str] = []
+    for raw in values:
+        value = raw.strip()
+        if value == "":
+            commands.clear()  # the documented RESET — the one way a later line removes an earlier one
+            continue
+        commands.append(value)
+    return commands
+
+
+def _split_exec_commands(command: str) -> list[str]:
+    """`;`-separated commands inside ONE `ExecStart=` (quotes protect a `;` inside a path)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    for char in command:
+        if char == '"':
+            in_quotes = not in_quotes
+            buf.append(char)
+        elif char == ";" and not in_quotes:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(char)
+    parts.append("".join(buf))
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _strip_exec_prefixes(token: str) -> str:
+    index = 0
+    while index < len(token) and token[index] in EXEC_PREFIX_CHARS:
+        index += 1
+    return token[index:]
+
+
+def _exec_tokens(command: str) -> list[str]:
+    return [quoted or bare for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', command) if (quoted or bare)]
+
+
+def _condition_skip(conditions: list[tuple[str, str]]) -> str | None:
+    """The `Condition…=` line that makes systemd SKIP this unit, or None.
+
+    ⛔ A CONDITIONALLY SKIPPED UNIT NEVER RUNS ITS PROGRAM, so a missing program is not a pending
+    failure there: stock `rc-local.service` carries `ConditionPathExists=/etc/rc.local` and no such
+    file, and reporting it as "fails 203/EXEC every tick" would page a human about a unit systemd
+    deliberately does not start. Negated and specifier-bearing conditions are left alone (this cannot
+    resolve them, and guessing is what this file refuses to do everywhere else).
+    """
+    for key, value in conditions:
+        if value.startswith("!"):
+            continue  # negated: the path's ABSENCE is what ENABLES the unit
+        path = value.lstrip("-").strip()
+        if "%" in path or not path.startswith("/"):
+            continue
+        if not Path(path).exists():
+            return f"{key}={value}"
+    return None
+
+
+def _exec_command_problems(unit_name: str, command: str) -> list[str]:
+    """Findings for ONE command line: the program, then every absolute path it was given."""
+    tokens = _exec_tokens(command)
     if not tokens:
-        return [f"{unit_name}: ExecStart= has no program — systemd fails the unit with 203/EXEC"]
+        return []
     problems: list[str] = []
-    program = tokens[0]
-    if not program.startswith("/"):
+    program = _strip_exec_prefixes(tokens[0])
+    if "%" in program:
         problems.append(
-            f"{unit_name}: ExecStart program {program!r} is not an absolute path — systemd resolves "
-            "it against the unit's own PATH, not the installer's, so it may run a DIFFERENT program "
-            "or none"
+            f"{unit_name}: ExecStart program {program} uses a systemd specifier this check cannot "
+            "resolve — verify it by hand"
         )
-    else:
+        return problems
+    if program.startswith("/"):
         # ⛔ SHAPE FIRST, THEN EXISTENCE — the same order, and for the same reason, as the workdir
         # check: a `/tmp` program that happens to exist today is still a countdown, and reporting
         # only "does not exist" would invite `mkdir`-ing its way to a green audit.
@@ -1218,8 +1283,18 @@ def unit_exec_problems(unit_name: str, execstart: str) -> list[str]:
                 f"{unit_name}: ExecStart program {program} does not exist — systemd fails the unit "
                 "with 203/EXEC before it runs a line"
             )
-    # The script argument carries the same risk as the program (it IS `__file__`), and a unit may
-    # name more than one path. One finding per distinct path is enough to act on.
+    elif "/" in program:
+        problems.append(
+            f"{unit_name}: ExecStart program {program!r} is a RELATIVE path — systemd requires an "
+            "absolute path (or a bare name, which it resolves through its own compile-time search "
+            "path), so this unit cannot load"
+        )
+    # ⛔ A BARE NAME IS LEGITIMATE, never a finding: systemd resolves it through a fixed compile-time
+    # search path, and its own documentation calls that safe for the standard directories. An earlier
+    # version reported every one of them — 39 of the 51 findings on this box were `systemd-tmpfiles`,
+    # `journalctl`, `udevadm` and friends, i.e. an audit nobody could ever clear.
+    # The ARGUMENTS carry the same reclaim risk as the program (the pinned `__file__` is one), so
+    # every absolute path it was given is judged too.
     reported = {program}
     for token in tokens[1:]:
         if not token.startswith("/") or token in reported:
@@ -1234,6 +1309,47 @@ def unit_exec_problems(unit_name: str, execstart: str) -> list[str]:
                 "is the checkout the installer ran from)"
             )
     return problems
+
+
+def unit_exec_problems(
+    unit_name: str,
+    values: list[str],
+    unit_type: str = "simple",
+    conditions: list[tuple[str, str]] | None = None,
+) -> list[str]:
+    """Findings for a unit's `ExecStart` — the OTHER way a reclaim takes a scheduled tool down.
+
+    ⛔ THE SAME RECLAIM CLASS AS `WorkingDirectory`, ONE UNIT STATUS LATER (measured, review round 7).
+    `render_unit()` pins `sys.executable` and `Path(__file__).resolve()`, and `__file__` is the file
+    in the CHECKOUT the installer ran from — on a cell that is a lane worktree under `/tmp`
+    (`/tmp/cell-ai/.worktrees/…`), i.e. the exact directory `unit_workdir_problem` refuses to use as
+    a cwd. After a reclaim the unit does not fail at CHDIR (`200/CHDIR`); it fails at EXEC
+    (`203/EXEC`) on EVERY tick — the same silent death, and `--check-units` answered "all usable"
+    for it, because it only ever read `WorkingDirectory`. Absence is never health: a unit whose
+    PROGRAM is gone is not a scheduled converger.
+
+    The population judged is the one systemd will actually run (see `_exec_commands`): every
+    accumulated command for `Type=oneshot`, the first for any other type — where a SECOND command is
+    itself a finding, because systemd refuses such a unit (`more than one ExecStart= setting is only
+    allowed for Type=oneshot`).
+    """
+    commands = _exec_commands(values)
+    if not commands:
+        return []
+    if _condition_skip(conditions or []):
+        return []  # systemd skips this unit; nothing it would run is pending
+    kind = (unit_type or "simple").strip()
+    problems: list[str] = []
+    if kind != "oneshot" and len(commands) > 1:
+        problems.append(
+            f"{unit_name}: {len(commands)} ExecStart= commands with Type={kind} — systemd refuses the "
+            "unit ('more than one ExecStart= setting is only allowed for Type=oneshot'), so it never "
+            "starts at all"
+        )
+    for command in commands if kind == "oneshot" else commands[:1]:
+        for part in _split_exec_commands(command):
+            problems.extend(_exec_command_problems(unit_name, part))
+    return list(dict.fromkeys(problems))
 
 
 # ⛔ TWO HIERARCHIES, TWO LOAD PATHS. The user manager and the system manager search DISJOINT
@@ -1529,7 +1645,12 @@ def installed_unit_cwd_problems(
             groups.setdefault((hierarchy, owner), []).append(path)
     for (hierarchy, owner), paths in sorted(groups.items()):
         last: tuple[Path, str] | None = None
-        exec_last: tuple[Path, str] | None = None
+        # ⛔ EVERY `ExecStart=` IN LOAD ORDER, plus what decides which of them RUN: the accumulation
+        # rule and `Type=` are both in `unit_exec_problems`, because reading only the last value
+        # reproduced the false PASS this check exists to close.
+        exec_values: list[str] = []
+        unit_type = "simple"
+        conditions: list[tuple[str, str]] = []
         mains = [q for q in paths if not q.name.endswith(".conf")]
         # ⛔ A DROP-IN IS DE-DUPLICATED BY BASENAME, KEEPING THE FIRST — the higher-priority
         # directory's copy. systemd does not merge two files with the same name: it SKIPS the
@@ -1560,14 +1681,18 @@ def installed_unit_cwd_problems(
                 if key.strip() == "WorkingDirectory" and section == "Service":
                     last = (path, value.strip())
                 elif key.strip() == "ExecStart" and section == "Service":
-                    # LAST ASSIGNMENT WINS, exactly as for WorkingDirectory: a drop-in that re-points
-                    # ExecStart is the documented remedy, so only the value systemd ends up with is
-                    # judged — and an overridden bad program must not be reported.
-                    exec_last = (path, value.strip())
+                    # ⛔ APPENDED, NOT OVERWRITTEN — systemd ACCUMULATES ExecStart (only an empty
+                    # `ExecStart=` resets the list), so a drop-in that ADDS a command does not remove
+                    # the one below it. `WorkingDirectory` is the opposite, and it is kept that way.
+                    exec_values.append(value.strip())
+                elif key.strip() == "Type" and section == "Service":
+                    unit_type = value.strip()
+                elif section == "Unit" and key.strip().startswith("Condition"):
+                    conditions.append((key.strip(), value.strip()))
         # ⛔ THIS RUNS BEFORE THE `last is None` EXIT: a unit with an ExecStart and no
         # WorkingDirectory is still a unit whose program a reclaim can take.
-        if exec_last is not None:
-            problems.extend(unit_exec_problems(exec_last[0].name, exec_last[1]))
+        if exec_values:
+            problems.extend(unit_exec_problems(owner, exec_values, unit_type, conditions))
         if last is None:
             continue
         path, value = last
@@ -2316,7 +2441,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--check-units",
         action="store_true",
-        help="audit the INSTALLED units' WorkingDirectory values; exit 5 when one is unusable",
+        help="audit the INSTALLED units: WorkingDirectory, and ExecStart's program and paths "
+        "(an accumulated command for Type=oneshot, the empty-ExecStart= reset, executable prefixes, "
+        "bare names and Condition-skipped units honoured); exit 5 when one is unusable",
     )
     ap.add_argument(
         "--workdir",

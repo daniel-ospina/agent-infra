@@ -55,7 +55,15 @@ below grows with the suite, so this header never claims a case that does not exi
      that verdict, and the refusal keeps its place in `notes`.
      T27 — `--check-units` read only `WorkingDirectory`, so a unit whose `ExecStart` names a file a
      reclaim takes (the checkout `render_unit` pins into `__file__`) audited as "all usable" while it
-     died on every tick. The audit reads `ExecStart` too, with the same drop-in precedence.
+     died on every tick. The audit reads `ExecStart` too — with systemd's OWN semantics, which two
+     review rounds had to correct: `ExecStart` ACCUMULATES for `Type=oneshot` and only an EMPTY
+     `ExecStart=` resets it (so a drop-in that ADDS a command is not the remedy and the finding must
+     survive it), a BARE program name is legitimate (systemd's compile-time search path) and an
+     executable prefix (`@ - : + ! !!`) is not part of the path, and a unit systemd SKIPS by
+     `Condition…=` never runs its program, so its absence is not a pending failure. Getting those
+     wrong is not pedantry: the first version reported 39 of a stock box's own systemd units on
+     every pass — an audit nobody could clear — and the second read only the LAST `ExecStart=`, which
+     reproduced the very false PASS the check exists to close.
      T4b — the retire commit removed the only pin on `register(replace=False)` while the branch had
      changed that arm to clear-and-retry. Clearing and re-running `config.sh` WITHOUT `--replace`
      creates a SECOND registration and leaves a ghost, so the heal is confined to `replace=True` and
@@ -1237,12 +1245,29 @@ def t16_unit_template():
         "WorkingDirectory=%h" in service,
         f"the default WorkingDirectory must be %h, got:\n{service}",
     )
-    check("/tmp" not in service and "/var/tmp" not in service, "no transient path may appear")
+    # ⛔ A BLANKET "/tmp not in service" MEASURED WHERE THE SUITE RUNS, NOT THE TEMPLATE. `render_unit`
+    # pins `Path(__file__).resolve()`, so on a cell — where the checkout IS under /tmp — the template
+    # names a transient path CORRECTLY, and the audit reports it (T27). Asserting its absence made
+    # this case red on every box the tool exists for, which is a false RED about a correct template.
+    # The rule is: the ONLY transient path the template may carry is the one this module actually
+    # lives at, and when that is transient the audit must SAY so.
+    module_path = str(Path(ra.__file__).resolve())
+    check(
+        "/tmp" not in service.replace(module_path, "")
+        and "/var/tmp" not in service.replace(module_path, ""),
+        f"no transient path may appear except this module's own (if it lives in one):\n{service}",
+    )
     exec_line = next(ln for ln in service.splitlines() if ln.startswith("ExecStart="))
     check(
-        exec_line.startswith('ExecStart="') and str(Path(ra.__file__).resolve()) in exec_line,
+        exec_line.startswith('ExecStart="') and module_path in exec_line,
         f"ExecStart must be ABSOLUTE, QUOTED and name THIS script: {exec_line}",
     )
+    if ra.transient_path_problem(str(Path(module_path).parent)):
+        check(
+            ra.unit_exec_problems("x.service", [exec_line[len("ExecStart="):]], "oneshot"),
+            "a transient script path in the template must be REPORTED by the audit, not silently "
+            "rendered — otherwise the schedule dies 203/EXEC with 'all usable' in the audit",
+        )
     check(
         any(ln.startswith("Unit=") and ln.endswith(".service") for ln in timer.splitlines()),
         f"the timer must name the service it drives:\n{timer}",
@@ -2042,27 +2067,43 @@ def t26_refusal_does_not_silence_the_alarm():
             box.destroy()
 
 
-@test("T27 --check-units reports a TRANSIENT ExecStart program, not just the WorkingDirectory")
+@test("T27 --check-units reads ExecStart with systemd's own semantics — accumulate, prefixes, skip")
 def t27_audit_reads_execstart():
-    """MEASURED FALSE PASS (review round 7). `render_unit` pins `__file__`, which on a cell is a lane
-    worktree under /tmp — the exact directory the fix refuses as a cwd. The unit then dies
-    `203/EXEC` on every tick, and the audit answered "all usable" because it only ever read
-    `WorkingDirectory`. A unit whose PROGRAM a reclaim can take is not a scheduled converger."""
+    """MEASURED FALSE PASS (review round 7) and the TWO defects its first fix had (round 2).
+
+    `render_unit` pins `__file__`, which on a cell is a lane worktree under /tmp — the exact directory
+    the fix refuses as a cwd. The unit then dies `203/EXEC` on every tick while the audit answered
+    "all usable", because it only ever read `WorkingDirectory`. A unit whose PROGRAM a reclaim can
+    take is not a scheduled converger.
+
+    The first fix judged only the LAST `ExecStart=` and treated a bare name as a defect. Both are
+    wrong against systemd.service(5), which the round-2 reviewer quoted and this case pins:
+      * `ExecStart=` ACCUMULATES — only an EMPTY `ExecStart=` resets the list — so a later durable
+        line does NOT remove an earlier transient one, and a drop-in that ADDS a command is not the
+        remedy (the empty reset is). Reading only the last value reproduced the very false PASS the
+        check was added to close.
+      * a BARE program name is legitimate (systemd resolves it through its own compile-time search
+        path), and an EXECUTABLE PREFIX (`@ - : + ! !!`) is not part of the path. The first version
+        reported 39 of this box's own stock units (`systemd-tmpfiles`, `journalctl`, `udevadm`,
+        `!!/usr/lib/systemd/systemd-networkd`) — an audit nobody could ever clear, on every pass.
+    """
     with Env():
         box = Box("exec-audit")
         try:
             units = os.path.join(box.dir, "units")
-            # Durable cwd, transient PROGRAM — the only finding must be the ExecStart one.
+            # ⛔ `Type=oneshot`, because that is the type where EVERY ExecStart line runs — and the
+            # type this tool installs. Durable cwd, transient SCRIPT ARGUMENT (the `render_unit`
+            # shape): the only finding must be the ExecStart one.
             Path(units, "bad.service").write_text(
                 "[Service]\n"
+                "Type=oneshot\n"
                 "WorkingDirectory=/\n"
                 'ExecStart="/usr/bin/python3" "/tmp/cell-ai/.worktrees/x/runner_autoscale.py" '
                 '--repo "daniel-ospina/tortoise"\n',
                 encoding="utf-8",
             )
-            # Both durable: this one must stay CLEAN, or the finding is noise. ⛔ NOT `__file__` —
-            # the suite itself is run from a lane worktree under /tmp, so it IS transient here and
-            # would (correctly) be reported, turning the negative control into a second positive.
+            # ⛔ NOT `__file__` for the durable controls — the suite itself runs from a lane worktree
+            # under /tmp, so it IS transient here and would (correctly) turn the control positive.
             Path(units, "good.service").write_text(
                 "[Service]\n"
                 "WorkingDirectory=/\n"
@@ -2073,27 +2114,33 @@ def t27_audit_reads_execstart():
             bad = [f for f in found if "bad.service" in f]
             check(
                 any("ExecStart" in f and "/tmp" in f for f in bad),
-                f"a transient ExecStart program must be NAMED as the reclaim risk it is: {found}",
+                f"a transient ExecStart ARGUMENT must be NAMED as the reclaim risk it is: {found}",
             )
             check(
                 any("fails on what it was told to run" in f for f in bad),
                 f"…and it must say how the unit dies (the script it was told to run is gone): {found}",
             )
-            # ⛔ THE OTHER SHAPE: the PROGRAM itself transient — that one dies 203/EXEC, before any
-            # interpreter runs, which is the status the WorkingDirectory fix was originally about.
+            check(
+                not [f for f in found if "good.service" in f],
+                f"a fully durable unit must stay CLEAN, or the finding is noise: {found}",
+            )
+            # The PROGRAM itself transient — that one dies 203/EXEC before any interpreter runs.
             Path(units, "prog.service").write_text(
                 "[Service]\n"
                 "WorkingDirectory=/\n"
                 'ExecStart="/tmp/cell-wt-x/python3" "--version"\n',
                 encoding="utf-8",
             )
-            prog = [f for f in ra.installed_unit_cwd_problems([units], require_any=True) if "prog.service" in f]
-            check(
-                any("203/EXEC" in f for f in prog),
-                f"a transient PROGRAM must be reported as 203/EXEC: {prog}",
-            )
+            prog = [
+                f
+                for f in ra.installed_unit_cwd_problems([units], require_any=True)
+                if "prog.service" in f
+            ]
+            check(any("203/EXEC" in f for f in prog), f"a transient PROGRAM dies 203/EXEC: {prog}")
             os.unlink(Path(units, "prog.service"))
-            # the DROP-IN precedence applies to ExecStart too: a re-pointed value is the remedy
+
+            # (a) ⛔ AN APPEND IS NOT A REMEDY: systemd accumulates ExecStart, so the transient
+            # command still runs and the finding must SURVIVE the drop-in.
             Path(units, "bad.service.d").mkdir()
             Path(units, "bad.service.d", "20-exec.conf").write_text(
                 '[Service]\nExecStart="/usr/bin/python3" "/usr/bin/python3"\n',
@@ -2101,14 +2148,72 @@ def t27_audit_reads_execstart():
             )
             found = ra.installed_unit_cwd_problems([units], require_any=True)
             check(
+                any("bad.service" in f for f in found),
+                "a drop-in that APPENDS a durable ExecStart does NOT remove the transient one "
+                f"(systemd runs both for Type=oneshot) — the finding must survive: {found}",
+            )
+            # (b) the EMPTY `ExecStart=` IS the reset, and it must clear the finding.
+            Path(units, "bad.service.d", "20-exec.conf").write_text(
+                '[Service]\nExecStart=\nExecStart="/usr/bin/python3" "/usr/bin/python3"\n',
+                encoding="utf-8",
+            )
+            found = ra.installed_unit_cwd_problems([units], require_any=True)
+            check(
                 not [f for f in found if "bad.service" in f],
-                "a drop-in that re-points ExecStart is the documented remedy and must CLEAR the "
+                "an EMPTY ExecStart= is the documented reset and must CLEAR the finding: "
+                f"{found}",
+            )
+            os.unlink(Path(units, "bad.service"))
+            shutil.rmtree(Path(units, "bad.service.d"))
+
+            # (c) ⛔ THE STOCK SHAPES THAT MADE THE FIRST VERSION UNUSABLE: bare names, executable
+            # prefixes, and a unit systemd SKIPS by condition. None of them is a finding.
+            Path(units, "stock.service").write_text(
+                "[Service]\nExecStart=systemd-tmpfiles --clean\n", encoding="utf-8"
+            )
+            Path(units, "prefix.service").write_text(
+                "[Service]\n"
+                "Type=oneshot\n"
+                "ExecStart=!/usr/bin/true\n"
+                "ExecStart=-/usr/bin/true\n"
+                "ExecStart=@/usr/bin/true --version\n"
+                "ExecStart=!!/usr/bin/true\n",
+                encoding="utf-8",
+            )
+            Path(units, "cond.service").write_text(
+                "[Unit]\nConditionPathExists=/nonexistent-for-this-case\n"
+                "[Service]\nExecStart=/tmp/cell-wt-x/gone.sh\n",
+                encoding="utf-8",
+            )
+            # …and the one that IS a defect in the non-oneshot case: systemd refuses the unit.
+            Path(units, "multi.service").write_text(
+                "[Service]\n"
+                "ExecStart=/usr/bin/true\n"
+                "ExecStart=/usr/bin/true\n",
+                encoding="utf-8",
+            )
+            found = ra.installed_unit_cwd_problems([units], require_any=True)
+            for clean in ("stock.service", "prefix.service", "cond.service"):
+                check(
+                    not [f for f in found if clean in f],
+                    f"{clean} is a LEGITIMATE systemd shape and must not be reported: {found}",
+                )
+            check(
+                any("multi.service" in f and "oneshot" in f for f in found),
+                "two ExecStart= lines with Type=simple make systemd REFUSE the unit — that is a "
                 f"finding: {found}",
             )
+            # the CLI: a directory of only legitimate shapes must audit clean, exit 0
+            clean_dir = os.path.join(box.dir, "clean-units")
+            os.makedirs(clean_dir, exist_ok=True)
+            for name in ("good.service", "stock.service", "prefix.service", "cond.service"):
+                shutil.copy(Path(units, name), Path(clean_dir, name))
+            os.environ["RUNNER_AUTOSCALE_UNIT_DIR"] = clean_dir
+            box.env["RUNNER_AUTOSCALE_UNIT_DIR"] = clean_dir  # `cli()` passes box.env, not os.environ
             code, out = cli(box, "--check-units")
             check(
                 code == 0,
-                f"the remedied fixture must audit clean (exit 0), got {code}: {out[-400:]}",
+                f"a stock-shaped population must audit clean (exit 0), got {code}: {out[-500:]}",
             )
         finally:
             box.destroy()
@@ -2182,6 +2287,28 @@ MUTATIONS = [
         '    elif False:  # MUTATION: the alarm loses to the refusal\n        # ⛔ THE ALARM OWNS THE VERDICT',
         "the verdict ORDER is restored to refusal-first: the alarm evaluates, sets the counts, and "
         "then the refusal's exit 0 wins — a page computed and thrown away",
+    ),
+    Mutation(
+        "T27",
+        "        if value == \"\":\n            commands.clear()  # the documented RESET — the one way a later line removes an earlier one\n            continue\n        commands.append(value)",
+        "        commands = [value] if value else []",
+        "ExecStart is read as LAST-ASSIGNMENT-WINS again: a later durable command HIDES an earlier "
+        "transient one, which still runs and still dies on every tick — the false PASS the check "
+        "was added to close",
+    ),
+    Mutation(
+        "T27",
+        "    while index < len(token) and token[index] in EXEC_PREFIX_CHARS:",
+        "    while False:",
+        "the executable prefixes (@ - : + ! !!) are read as part of the path again: every stock unit "
+        "that carries one is reported, and --check-units can never be cleared on a real box",
+    ),
+    Mutation(
+        "T27",
+        "        if not Path(path).exists():",
+        "        if False:",
+        "a conditionally SKIPPED unit is judged as if it would run: a stock rc-local-style unit with no "
+        "rc.local pages a human about a program systemd never starts",
     ),
     Mutation(
         "T27",
@@ -2398,8 +2525,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T4",
-        '    if rc != 0 and _ALREADY_CONFIGURED in out.lower():',
-        '    if False:',
+        '        if rc != 0 and _ALREADY_CONFIGURED in out.lower() and replace:',
+        '        if False:',
         "there is no retry, so 'already configured' still ends the repair (the measured cell-4 state)",
     ),
     Mutation(
@@ -2494,8 +2621,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T13",
-        '    if (\n        not record["problems"]\n        and not record.get("problem_kind")\n        and record.get("unverified_cause") != "pool-read-after-restart"\n    ):',
-        '    if (\n        not record.get("problem_kind")\n        and record.get("unverified_cause") != "pool-read-after-restart"\n    ):',
+        '    if not record["problems"] and record.get("unverified_cause") != "pool-read-after-restart":',
+        '    if record.get("unverified_cause") != "pool-read-after-restart":',
         "the alarm runs on a pass that already FAILED, so a consumer can page on it beside action-failed",
     ),
     Mutation(
@@ -2514,8 +2641,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T12",
-        '    if (\n        not record["problems"]\n        and not record.get("problem_kind")\n        and record.get("unverified_cause") != "pool-read-after-restart"\n    ):',
-        '    if (\n        not record["problems"]\n        and not record.get("problem_kind")\n        and record.get("unverified_cause") != "pool-read-after-restart"\n        and not record["actions"]\n    ):',
+        '    if not record["problems"] and record.get("unverified_cause") != "pool-read-after-restart":',
+        '    if (\n        not record["problems"]\n        and record.get("unverified_cause") != "pool-read-after-restart"\n        and not record["actions"]\n    ):',
         "the alarm is suppressed by ACTIONS, so a repair that never sticks silences it for ever (#2875)",
     ),
 ]
