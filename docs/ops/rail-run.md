@@ -51,7 +51,10 @@ State lives under `${RAIL_RUN_DIR:-${O:-$HOME/orchestrator}/state/rail-run}/<rep
 joined into a
 path; a directory with neither a `log` nor a `repo` — e.g. the `.starting` claim — is not a run). Knobs: `RAIL_RUN_DIR`, `RAIL_RUN_RAIL` (the rail, default `admin-merge.sh` beside
 this script), `RAIL_RUN_REPO_SLUG` (pin the repo identity instead of resolving `origin`),
-`RAIL_RUN_CLAIM_MAX` (60 s) and `RAIL_RUN_RECORD_MAX` (24 h).
+`RAIL_RUN_CLAIM_MAX` (60 s) and `RAIL_RUN_RECORD_MAX` (24 h). **Both must be positive integers**: an
+unreadable value is refused at load (`exit 2`, naming the knob) rather than silently used, because an
+erroring `[ -le ]` answers "not young", which would judge a live claim stale and let a second rail
+start on the same PR.
 
 **One rail per PR.** `start` takes an atomic `mkdir` claim *before* it probes, so two concurrent
 starts for one PR cannot both launch a rail (two merge attempts on one head). The claim is released
@@ -65,7 +68,7 @@ flight, not dead** — reading that window as "no owner" is how a guard deletes 
 |---|---|---|
 | `running` | 10 | no exit status yet, and the **recorder** is alive — or the **rail** is, when the recorder has been SIGKILLed out from under it |
 | `landed` | 0 | the PR is MERGED. `verdict=rail` when the rail exited 0; `verdict=artifact` when the merge is real but the rail wrote **no verdict or a non-zero one** |
-| `refused` | 20 | rc=2 (a **usage/configuration** refusal — about the invocation, not the head; a MERGED artifact still wins over it), or rc≠ 0 whose last `admin-merge: ✗ …` line is one of the **recognised head-verdict wordings** (`THE TREE THIS PR PRODUCES IS RED`, `… HAS NOT MEASURED IT`, `… EVALUATED AGAINST AN OLDER BASE`, `never TESTED main`, `CONFLICTED`, `--no-rerun`, `PR #N is a DRAFT`, `… failure(s) SURVIVED the re-run` — note that the family-wide `THE BASE IS RED` is NOT one of them: one of its three lines says the rail could not read the base parent; and neither is `no run of the lane actually TESTED head`, which is a precondition about CI having been dispatched rather than a judgement of the diff, so it stays `unknown`). Any other `✗` line — the rail has ~117 templates, most of them "could not read", "no classification attempted", or "stopped mid-wait" — is `unknown`: a refusal is a claim about your head and needs positive support |
+| `refused` | 20 | rc=2 (a **usage/configuration** refusal — about the invocation, not the head; a MERGED artifact still wins over it), or rc≠ 0 whose last `admin-merge: ✗ …` line is one of the **recognised head-verdict wordings** — `THE TREE THIS PR PRODUCES IS RED`, `CONFLICTED`, `PR #N is a DRAFT`, `… failure(s) SURVIVED the re-run`. Everything else is `unknown` (25), and the exclusions matter more than the list: the family-wide `THE BASE IS RED` is out (one of its three lines says the rail could not read the base parent); `… HAS NOT MEASURED IT` and `… EVALUATED AGAINST AN OLDER BASE` are out because `admin-merge.sh` calls that family a **re-measurement request, never a verdict on the PR** (its own remedy is "RE-MEASURE against the current base, then re-run the rail"); `never TESTED main` is out because the rail calls it a **misconfiguration** whose remedy is an invocation change (`add --any-workflow`); `--no-rerun` is out because it is the **caller's own flag**; and `no run of the lane actually TESTED head` is out because it is a precondition about CI having been dispatched rather than a judgement of the diff. The rule the list encodes is `scripts/orchestrator-harness/rail-refusal.sh`'s — *the trigger is a RED TREE, not "any refusal"*: a lane told `refused` abandons a PR, and a re-measurement or a config refusal must not do that. Any other `✗` line — the rail has ~117 templates, most of them "could not read", "no classification attempted", or "stopped mid-wait" — is `unknown`: a refusal is a claim about your head and needs positive support |
 | `killed` | 21 | the rail died of a signal (rc ≥ 128), named (SIGTERM / SIGKILL / …) |
 | `gone-without-verdict` | 22 | **no exit status, recorder gone, rail not alive, PR not MERGED: this run produced no verdict.** Never reported as a landing |
 | `exited-zero` | 23 | rc=0 and the PR is not merged (a `--dry-run` / `--print-bounds` inspection run) |
@@ -116,6 +119,11 @@ load-bearing distinctions honest:
   the seam for a checkout whose `origin` does *not* name its repo) recorded a `github.com/<slug>` pair
   for a target on another host, so the artifact check demanded a URL that host never serves and
   `landed` was unreachable — fail-closed, but a run nobody could land.
+  **A transport port is not part of the host.** When the fallback reads `origin`, the `user@` prefix is
+  stripped (validating before stripping degraded `git@host:owner/repo` to `github.com`) and an
+  `ssh://`/`git://` port is dropped — those ports belong to the git transport, and the artifact URL
+  compared is an https URL that never carries them, so recording `host:22` made `landed` unreachable.
+  An `https://host:8443` port is **kept**: a GHE on a custom port really does serve URLs carrying it.
 
 One live rail per PR: `start` takes an **atomic claim** (`mkdir`) *before* it probes the existing
 run, so two racing starts cannot both launch a rail (two merge attempts on one PR). The state key is
@@ -166,8 +174,7 @@ Three stated residuals:
 bash scripts/rail-run.test.sh      # no network, no real gh, no real rail
 ```
 
-**185 passed, 0 failed** (`bash scripts/rail-run.test.sh`, no network; ~30 s on the dev box, and the
-only number asserted anywhere is the pass/fail line). The suite is mostly
+**207 passed, 0 failed** (`bash scripts/rail-run.test.sh`, no network; the only number asserted anywhere is the pass/fail line). The suite is mostly
 negative — `running` must never read as landed or refused, `rc=0` is not a landing when the artifact
 disagrees, `gone-without-verdict` is never a landing *or* claimed over an unread artifact, an
 unreadable liveness or PR read abstains, a live pid with the wrong incarnation is not "running", a

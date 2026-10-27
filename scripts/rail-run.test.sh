@@ -654,22 +654,56 @@ assert_rc 25 "$RC" "HEAD-VERDICT: 'no classification attempted' is NOT a refusal
 assert_state "$TXT" unknown "HEAD-VERDICT: it abstains"
 assert_contains "$TXT" "NOT a refusal" "HEAD-VERDICT: and says plainly that it is not a refusal"
 
-# ── AF: the base-red family — ONE of its three lines is a read failure ───────────────────────
-# `THE BASE IS RED AND THE MERGE REF'S BASE PARENT COULD NOT BE READ` contains "base is red", so a stem
-# that broad admits a READ FAILURE as a refusal. The two positive phrasings are recognised; the unread
-# one abstains. Fixtures are the rail's own terminal lines, verbatim.
+# ── AF: the whole base-red family abstains — the rail calls it a RE-MEASUREMENT, not a verdict ──
+# `admin-merge.sh:8485` says of this family, verbatim: "The refusal is a re-measurement request,
+# never a verdict on the PR", and :8433 names the remedy ("RE-MEASURE against the current base, then
+# re-run the rail"). So no line in it is a judgement of the head. `HAS NOT MEASURED IT` and
+# `EVALUATED AGAINST AN OLDER BASE` were listed as head verdicts, so `refused` told a lane its HEAD was
+# bad while its remedy was to update the branch and re-run — the #2412 cost (a lane abandoning a
+# mergeable PR) re-bought through a stem. `BASE PARENT COULD NOT BE READ` is the read failure that
+# proves the stem "base is red" admits one. All three abstain. Fixtures are the rail's own lines.
 mk_rail() { printf '#!/usr/bin/env bash\nprintf "admin-merge: ✗ BLOCK — %s\\n" %s\nexit 1\n' "$2" "'$3'" > "$T/bin/rail-$1"; chmod +x "$T/bin/rail-$1"; }
 mk_rail basesurface "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT (a STALE surface)." x
 mk_rail baselag "THE BASE IS RED AND THIS PR WAS EVALUATED AGAINST AN OLDER BASE (a LAGGING MERGE REF)." x
 mk_rail baseunread "THE BASE IS RED AND THE MERGE REF'S BASE PARENT COULD NOT BE READ." x
 RAIL_RUN_RAIL="$T/bin/rail-basesurface" call start 160 >/dev/null
-OUT="$(GH_MODE=open wait_state refused 160)"; assert_rc 20 "${OUT%%|*}" "BASE-RED: 'HAS NOT MEASURED IT' is a head verdict (refused)"
+OUT="$(GH_MODE=open wait_state unknown 160)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "BASE-RED: 'HAS NOT MEASURED IT' is a RE-MEASUREMENT request, not a head verdict"
+assert_contains "$TXT" "HAS NOT MEASURED IT" "BASE-RED: the abstention still prints the rail's own line (the reader can act on it)"
 RAIL_RUN_RAIL="$T/bin/rail-baselag" call start 161 >/dev/null
-OUT="$(GH_MODE=open wait_state refused 161)"; assert_rc 20 "${OUT%%|*}" "BASE-RED: 'EVALUATED AGAINST AN OLDER BASE' is a head verdict (refused)"
+OUT="$(GH_MODE=open wait_state unknown 161)"; assert_rc 25 "${OUT%%|*}" "BASE-RED: 'EVALUATED AGAINST AN OLDER BASE' also abstains (re-measure, do not abandon)"
 RAIL_RUN_RAIL="$T/bin/rail-baseunread" call start 162 >/dev/null
 OUT="$(GH_MODE=open wait_state unknown 162)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 25 "$RC" "BASE-RED: 'BASE PARENT COULD NOT BE READ' is NOT a head verdict"
 assert_state "$TXT" unknown "BASE-RED: it abstains"
+
+# ── AF2: a MISCONFIGURATION and a CALLER FLAG are not head verdicts either — and the TREE and the
+# CONFLICT still are. Every kept stem is pinned here, so deleting one reddens this block (the doc
+# claims exactly that, and before this block two of the eight stems had no arm at all).
+mk_rail nevertestedmain "the lane 'ci' never TESTED main, so there is no baseline." x
+RAIL_RUN_RAIL="$T/bin/rail-nevertestedmain" call start 167 >/dev/null
+OUT="$(GH_MODE=open wait_state unknown 167)"; assert_rc 25 "${OUT%%|*}" "STEM: 'never TESTED main' is a MISCONFIGURATION (invocation remedy), so it abstains"
+mk_rail norerun "the base reproduction cleared the residual, but --no-rerun denies the E5 second sample the re-run would take. No merge." x
+RAIL_RUN_RAIL="$T/bin/rail-norerun" call start 168 >/dev/null
+OUT="$(GH_MODE=open wait_state unknown 168)"; assert_rc 25 "${OUT%%|*}" "STEM: '--no-rerun' is the CALLER's flag, so it abstains"
+mk_rail treeisred "THE TREE THIS PR PRODUCES IS RED." x
+RAIL_RUN_RAIL="$T/bin/rail-treeisred" call start 169 >/dev/null
+OUT="$(GH_MODE=open wait_state refused 169)"; assert_rc 20 "${OUT%%|*}" "STEM: 'THE TREE THIS PR PRODUCES IS RED' IS a head verdict (kept)"
+mk_rail conflicted "CONFLICTED — GitHub cannot compute a merge of head into the base (mergeable=false), so refs/pull/170/merge is ABSENT or STALE." x
+RAIL_RUN_RAIL="$T/bin/rail-conflicted" call start 170 >/dev/null
+OUT="$(GH_MODE=open wait_state refused 170)"; assert_rc 20 "${OUT%%|*}" "STEM: 'CONFLICTED' IS a head verdict (kept — no re-measurement clears it)"
+
+# ── AF3: a knob that cannot be read must not DISARM the bound it feeds ─────────────────
+# Both bounds are compared with `[ -le ]`, which ERRORS on a non-numeric operand — and an erroring
+# test is false, so `younger_than` answers "not young", the claim is judged stale, and a SECOND rail
+# starts on the same PR. Refused at load, naming the knob, and no rail is spawned.
+n_before="$(rail_invocations 171)"
+OUT="$(RAIL_RUN_CLAIM_MAX=abc call start 171)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 2 "$RC" "KNOB: an unreadable RAIL_RUN_CLAIM_MAX is refused (it used to disable the one-rail guard)"
+assert_contains "$TXT" "RAIL_RUN_CLAIM_MAX" "KNOB: and the refusal names the knob"
+OUT="$(RAIL_RUN_RECORD_MAX=0 call start 171)"; assert_rc 2 "${OUT%%|*}" "KNOB: a zero bound is refused too (an all-stale bound is the fail-open direction)"
+if [ "$(rail_invocations 171)" = "$n_before" ]; then ok "KNOB: and no rail was spawned for either"
+else bad "KNOB: a rail was spawned despite an unreadable bound"; fi
 
 # ── AG: another HOST holding the same owner/repo/number is not this PR ───────────────────────
 craft 163 otherhost rc=0 >/dev/null
@@ -706,6 +740,22 @@ resolve_host_arm() { # <label> <remote-url> <pr>
 }
 resolve_host_arm "an scp-form ssh remote (git@host:owner/repo)" 'git@ghe.example.com:acme/widgets.git' 164
 resolve_host_arm "an https remote with userinfo (https://user@host/owner/repo)" 'https://user@ghe.example.com/acme/widgets.git' 165
+
+# ── AF4: an ssh TRANSPORT port is not the host ─────────────────────────────────────────
+# `ssh://git@host:22/…` records a port the artifact URL never carries, so `pr_url_names` demanded an
+# https URL with `:22` and `landed` was unreachable. The https-with-port case must KEEP its port: a
+# GHE on :8443 really does serve URLs that carry it.
+resolve_host_arm "an ssh:// remote with its transport port (ssh://git@host:22/owner/repo)" 'ssh://git@ghe.example.com:22/acme/widgets.git' 172
+HOST_PORT_DIR="$T/host-173"; mkdir -p "$HOST_PORT_DIR"
+git -C "$HOST_PORT_DIR" init -q >/dev/null 2>&1
+git -C "$HOST_PORT_DIR" remote add origin 'https://ghe.example.com:8443/acme/widgets.git' >/dev/null 2>&1
+OUT="$(cd "$HOST_PORT_DIR" && RAIL_RUN_REPO_SLUG= RAIL_RUN_GH_HOST= FAKE_RAIL_SLEEP=1 "$BASH_BIN" "$RR" start 173 2>&1)"
+RP_ID="$(run_id_of "$OUT")"
+PIDS+=("$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-173/$RP_ID" pid)")
+RP_HOST="$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-173/$RP_ID" host)"
+if [ "$RP_HOST" = "ghe.example.com:8443" ]; then ok "HOST/RESOLVE: an https remote KEEPS its port (the URL carries it)"
+else bad "HOST/RESOLVE: https-with-port recorded host='$RP_HOST' (want ghe.example.com:8443)"; fi
+
 
 # ── AG3: the PIN's host is the host, exactly as `--repo`'s is ──────────────
 # `RAIL_RUN_REPO_SLUG` is the documented seam for a checkout whose `origin` does not name its repo, and

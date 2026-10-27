@@ -132,6 +132,20 @@ file_or_empty() { [ -f "$1" ] && tr -d '\r\n' < "$1" 2>/dev/null || true; }
 
 numeric_or_empty() { case "${1:-}" in ''|*[!0-9]*) printf '' ;; *) printf '%s' "$1" ;; esac; }
 
+# ⛔ A KNOB THAT CANNOT BE READ MUST NOT DISARM THE BOUND IT FEEDS. Both bounds are compared with `[ -le ]`,
+# which ERRORS on a non-numeric operand — and an erroring test is FALSE, so `younger_than` answers "not
+# young", the claim/record is judged STALE, and a SECOND rail may start on the same PR (two merge attempts
+# on one head — the guard exists to stop exactly that). Measured: `RAIL_RUN_CLAIM_MAX=abc` cleared a live
+# pid-less claim and `start` exited 0. `0` is refused for the same reason: an all-stale bound is the
+# fail-open direction of the same guard. Validated ONCE, at load, so no later path can skip it.
+knob_or_die() { # <value> <name>
+  case "${1:-}" in
+    ''|0|*[!0-9]*) die "${2:-a knob} must be a positive integer number of seconds, got '${1:-}'. It bounds an admission guard, so an unreadable value would disarm it (a second rail on one PR)." ;;
+  esac
+}
+knob_or_die "$CLAIM_MAX" RAIL_RUN_CLAIM_MAX
+knob_or_die "$RECORD_MAX" RAIL_RUN_RECORD_MAX
+
 # mtime_epoch <path> — GNU stat first, BSD second. The reverse order is not safe: GNU `stat -f %m`
 # prints a filesystem block BEFORE it errors, so a BSD-first read yields garbage on Linux.
 mtime_epoch() {
@@ -165,19 +179,32 @@ age_s() { # <path> -> integer seconds since it was last written, or nothing
 # ⛔ EVERY STEM BELOW IS A SINGLE TEMPLATE whose sibling read-failure deliberately avoids the
 # wording — that is the test for adding one (`admin-merge.sh` states it at its `require_draft`:
 # "The refusal deliberately does NOT contain the phrase `is a DRAFT`").
+# ⛔ A *RE-MEASUREMENT* REFUSAL IS NOT A HEAD VERDICT, BY THE RAIL'S OWN WORDS. `admin-merge.sh` says
+# of its base-red family, verbatim: "The refusal is a re-measurement request, never a verdict on the
+# PR" (:8485), and the stale-surface refusal's remedy is "RE-MEASURE against the current base, then
+# re-run the rail" (:8433). `never TESTED main` is called "a MISCONFIGURATION in which none did"
+# (:7748) whose remedy is an INVOCATION change (`add --any-workflow`), and `--no-rerun` is the
+# CALLER's own flag. All four say nothing about the diff: they must stay `unknown` (25), which
+# prints the rail's words and lets the reader re-measure. Listing them as `refused` re-buys the
+# #2412 cost through a stem instead of a read failure — the lane is told its head is bad while its
+# remedy is to update the branch and re-run.
+# ⛔ ONE CLASSIFIER, NOT TWO. `scripts/orchestrator-harness/rail-refusal.sh` already classifies a rail
+# refusal into red-tree | unreadable | conflict | override | other, and states the rule this array
+# must not contradict: "THE TRIGGER IS A *RED TREE*, NOT 'ANY REFUSAL'" — a re-measurement, a
+# configuration refusal and a draft are all `other` there. `conflicted` is kept because it is that
+# file's own `conflict` class and no re-measurement can clear it; `is a draft` because it is a
+# positive, single-template fact about THIS PR whose remedy is on the PR (`gh pr ready`). Everything
+# measurable-or-configurable is excluded — that is the whole difference between this array and the
+# four stems it used to carry.
 # KNOWN GAP, stated rather than papered over: `no run of the lane actually TESTED head $head` is
 # ALSO a single template, but it is a precondition about CI having been dispatched, not a judgement
-# about the diff — `refused` would tell a lane to abandon a head nobody has tested yet. It stays
-# `unknown` (25) until there is a state for "dispatch CI", which this script does not have.
+# about the diff — the SAME exclusion the four above now honour. It stays `unknown` (25) until there
+# is a state for "dispatch CI", which this script does not have.
 HEAD_VERDICT_STEMS=(
-  "tree this pr produces is red"
-  "has not measured it"            # THE BASE IS RED AND THIS PR HAS NOT MEASURED IT (a STALE surface)
-  "evaluated against an older base" # … AND THIS PR WAS EVALUATED AGAINST AN OLDER BASE
-  "never tested main"
-  "conflicted"
-  "--no-rerun"
-  "is a draft"                      # PR #N is a DRAFT (its unreadable sibling carries [draft_unreadable])
-  "survived the re-run"             # $N failure(s) SURVIVED the re-run (the tree is red after a re-run)
+  "tree this pr produces is red"    # THE TREE THIS PR PRODUCES IS RED (single ✗ template, admin-merge.sh:8311)
+  "conflicted"                      # CONFLICTED — … refs/pull/N/merge is ABSENT or STALE (single: :7844)
+  "is a draft"                      # PR #N is a DRAFT … (single: :7217; the unreadable sibling carries [draft_unreadable])
+  "survived the re-run"             # $N failure(s) SURVIVED the re-run (the tree is red after a re-run; single: :8214)
 )
 refusal_is_head_verdict() {
   local low
@@ -249,10 +276,10 @@ repo_key() {
 # check compares a host it can attest instead of accepting any host that happens to hold a matching path.
 resolve_host() {
   if [ -n "${RAIL_RUN_GH_HOST:-}" ]; then printf '%s' "$RAIL_RUN_GH_HOST"; return 0; fi
-  local u h=""
+  local u h="" scheme=""
   u="$(git remote get-url origin 2>/dev/null || true)"
   case "$u" in
-    *://*) h="${u#*://}"; h="${h%%/*}" ;;
+    *://*) scheme="${u%%://*}"; h="${u#*://}"; h="${h%%/*}" ;;
     *@*:*) h="${u%%:*}" ;;                     # git@host:owner/repo
     *:*)   h="${u%%:*}" ;;
   esac
@@ -262,6 +289,13 @@ resolve_host() {
   # `landed` UNREACHABLE there (the artifact check then demanded a github.com URL that never exists
   # for it) while the suite stayed green: every host arm pins the host, so RESOLUTION had no coverage.
   h="${h##*@}"
+  # ⛔ AN SSH TRANSPORT PORT IS NOT PART OF THE HOST. `ssh://git@ghe.example.com:22/owner/repo` carries
+  # the port of the GIT transport, while the artifact URL this check compares is an https URL that never
+  # carries it — so recording `ghe.example.com:22` made `pr_url_names` demand
+  # `https://ghe.example.com:22/…`, and `landed` became UNREACHABLE on that checkout (fail-closed, but a
+  # run nobody can land). Stripped for the ssh/git schemes ONLY: an `https://ghe.example.com:8443` origin
+  # really does serve URLs carrying `:8443`, so there the port is part of the identity and is kept.
+  case "$scheme" in ssh|git) h="${h%%:*}" ;; esac
   case "$h" in ''|*[!A-Za-z0-9.:-]*) h="github.com" ;; esac
   printf '%s' "$h"
 }
