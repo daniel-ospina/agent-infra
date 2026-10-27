@@ -160,12 +160,13 @@ wrapper, or a skill.
 2026-10-19: `cmux vm resize <cell-3> --memory 12` was refused with *"only 4 vCPUs and 8 GiB are free in your plan pool"*
 while three VMs were running. Disk grew twice (+8 GiB each) but **RAM had 8 GiB left in total**. So:
 
-- the fleet's real RAM ceiling is the **plan pool**, and it is nearly allocated — per-cell memory cannot be raised by
-  wanting it;
+- the fleet's real RAM ceiling is the **plan pool**, and it is **fully** allocated (measured 2026-10-27: `usedMemoryMb`
+  40,960 of 40,960, `usedVcpus` 20 of 20) — per-cell memory cannot be raised by wanting it;
 - a cell's lane ceiling must be computed from **its current free RAM**, and never assumed to be expandable;
 - to raise one cell's memory you must first shrink or pause another box — that is an owner-level capacity decision, not a
   dispatch-time workaround;
-- disk is the cheaper lever (separate pool, grew on demand) — prefer reclaiming disk, and only then resize.
+- disk used to be the cheaper lever (separate pool, grew on demand) — but all three boxes are now at the per-VM cap
+  (`maxDiskMb` 131,072 = 128 GB each, measured 2026-10-27), so **reclaim is the only lever left** until the plan changes.
 
 ## 3. "Unreachable" is a claim about the CHANNEL, not the box
 
@@ -173,7 +174,7 @@ while three VMs were running. Disk grew twice (+8 GiB each) but **RAM had 8 GiB 
 |---|---|
 | `cloud exec` timeout / 502 / silent empty | **the channel failed. Not the box.** Retry minutes apart |
 | `cmux vm ls` → `running` | the provider sees the VM alive |
-| **`cmux vm stats <vm>`** | the provider's own liveness read, and the cheapest — `CPU n% · Mem x/y GB · Disk a/b GB`. It cannot see a *full* guest, so pair it with the row above |
+| **`cmux vm stats <vm>`** | the provider's own liveness read, and the cheapest — `CPU n% · Mem x/y GB · Disk a/b GB`. It cannot see a *full* guest, and its disk figure is advisory (measured: 110.5 GB used for a guest whose `df` said 71.3), so pair it with `vm terminal read` — **the row below** |
 | `vm terminal read` → `No space left on device` | the guest is alive and full |
 
 A **disk-full** cell behaves exactly like a dead one: the control agent cannot write its socket, so every `exec` times out
@@ -184,7 +185,7 @@ Recovery ladder, cheapest first:
 
 1. `cmux vm terminal read <vm> <terminal-id>` — get terminal ids from `cmux vm tree <vm>`. The screen tells you the truth.
 2. `cmux vm terminal send <vm> <term-id> '<command>' --keys enter` — runs a command when `exec` cannot (no output rendering if
-   the disk is full, so verify from outside with `vm stats`).
+   the disk is full, so confirm from the guest's own `df -Pm /` — not from `vm stats`, whose disk figure is advisory).
 3. `cmux vm pause <vm>` then `cmux vm resume <vm>` — provider-level reset. Fixes a wedged agent, does **not** fix a full disk.
 4. **`cmux vm resize <vm> --disk <GiB>`** — grows in place, 4 GiB steps, **cannot shrink**. The correct lever for a full guest:
    32 → 40 GiB made a dead-looking box respond immediately.
@@ -194,13 +195,15 @@ Recovery ladder, cheapest first:
 
 A lane's log **mtime** is the strongest *transcript-derived* signal a **harness lane** has — those run `pi -p
 --no-session` (`spawn-gate.sh`, `lane-exec.sh`, `merge-one.sh` all pass it), so a lane leaves no `.jsonl`. Other `pi` on a
-cell (interactive sessions, `task` children) **do** write `~/.pi/agent/sessions/*/*.jsonl` — 19 were present on cell-4 when
-this was measured, the newest written that hour — so never conclude "no transcript exists on a cell"; conclude "no
+cell (interactive sessions, `task` children) **do** write `~/.pi/agent/sessions/*/*.jsonl` — 19 under `/home/cmux` on cell-4
+(the newest written that hour), while `$CELL_HOME`'s tree held 312 whose newest was two days old — so never conclude "no transcript exists on a cell"; conclude "no
 transcript exists *for this lane*". mtime is **necessary, not sufficient**: pair it with a CPU delta (reaping gate 1) and
 an ancestry check. Size alone is not a signal, and a spinner is not.
 
 - **0-byte lane log** = the lane could not start (usually disk full). It reads as "quiet", not broken — always check.
-- A dead lane and a *thinking* lane are indistinguishable **by CPU, log size or a spinner**; only log **mtime** separates *thinking* from dead, and only a **CPU delta** separates *working* from dead.
+- A *thinking* lane and a dead one read identically in **every** instrument: zero CPU delta, frozen mtime, no size change. mtime
+  only tells you **how long nothing was written** — which is why the reaping gate needs a zero-CPU window **and** a 2 h idle
+  bound before it acts, and why no single reading is a verdict.
 
 Reap only when **all three** hold (prose → code: agent-infra#1244, #2163):
 
@@ -211,7 +214,8 @@ Reap only when **all three** hold (prose → code: agent-infra#1244, #2163):
 ⛔ **Never treat "no log found" as "stale."** A first dry run flagged 69 lanes and would have killed a 7-minute-old lane,
 because the worktree slug parsed from shell text (`ciwatch\012[`) matched nothing. An absent artefact fails closed.
 
-Also: `ps -eo args | grep -c '[p]i --model'` returns **0 on a box with 16+ `pi` live** — and not because of flag order. (Unbracketed, that pattern returns **1**: the grep's own argv contains it. This file warns about exactly that three paragraphs below.)
+Also: `ps -eo args | grep -c '[p]i --model'` returns **0 on a box with 16+ `pi` live** — and not because of flag order. (Unbracketed, that pattern returns **1**: the grep's own argv contains it — the self-match trap §5 states as "never
+`pkill -f` / `ps | grep` a pattern that appears in your own command line".)
 `pi` is a Node script that **rewrites its process title**, so every live `pi` shows `args` = `pi` alone (`/proc/<pid>/cmdline`
 is `pi` + NULs). The only rows carrying `--provider … --model …` are the launcher wrappers (10 measured on cell-4, **0 `pi`
 rows**), so "fixing" that pattern's flag order counts **wrapper shells**, not lanes. Enumerate with
@@ -297,7 +301,7 @@ bash scripts/admin-merge.sh <pr>                                                
 | box | role | shape |
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB RAM / 128 GB disk — roomiest measured 2026-10-27, but **needs activation (§1)** before it can land |
-| `pi-cell-3` | product work | 8 GB / 128 GB — tight on **both** (2 OOM kills; disk 112/128 GB, measured 2026-10-27) |
+| `pi-cell-3` | product work | 8 GB RAM — the real constraint (2 OOM kills measured 2026-10-27); disk **71/128 GB used, 49 GB free** by the guest's own `df -Pm /` |
 | `pi-cell-4` | product + CI-cost work | 16 GB, 8 vCPU; the current default dispatch target |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
