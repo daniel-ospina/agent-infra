@@ -21,9 +21,10 @@ The fleet runs on the macOS laptop (launchd) plus the Linux cells the provider c
 labelled `pi-cell-1`** — `vm-efa6cc8f…`; `cloud-cell-bringup.sh:42` pairs them — a relabel, not a lost box. **cell-2** is the
 one that is genuinely absent. `docs/ops/ACTIVATION-MATRIX.md` still speaks in the OLD labels (`pi-lane-1`, `pi-cell-2`), so read
 it with this mapping in hand. Treat any inventory, including this one, as a reading: re-run `cmux vm ls` before acting on
-it.) ⚠️ **`pi-cell-N` is the LABEL column; every `cmux vm <verb>` takes the
-NAME column (`vm-<hex>`)** — `cmux vm stats pi-cell-4` returns a 404 whose own advice is "start a new one", a
-spend-flavoured remedy for a box that is already running. Read the NAME from `cmux vm ls`. Cells are Linux, so **any
+it.) ⚠️ **`pi-cell-N` is the LABEL column; on the Mac every `cmux vm <verb>` that takes a machine takes the
+NAME column (`vm-<hex>`; from inside a cell the peer grammar takes a peer *slug* — see §3)** — `cmux vm stats pi-cell-4`
+returns a 404 whose own advice is "start a new one", a spend-flavoured remedy for a box that is already running. Read the
+NAME from `cmux vm ls`. Cells are Linux, so **any
 harness change must work on both platforms** — one source of truth with a platform branch, never two drifting copies.
 
 Canonical harness home: **`agent-infra/scripts/orchestrator-harness/`**. `tortoise/operations/orchestrator-harness/` and
@@ -151,8 +152,11 @@ the install is repaired (78 — which also covers a bad invocation: an `unknown 
 install, so read the emitted line), the repo's open-PR queue actually lands (74). **74 has three arms and they do not share a
 remedy:** the ratio (`land_backlog_verdict` rc=1 — repo-wide, so land the queue and re-dispatching it elsewhere refuses too);
 the slug (`land_backlog_repo` cannot derive one: that worktree's `origin` is not an `owner/name` slug, **or `repo-slug.sh` is
-missing** — per-worktree or an install fault); and **rc=2, a failed `gh` read** (`UNREADABLE repo …` / `UNREADABLE
-open-PR count` / `UNREADABLE landing rate` / `UNREADABLE landing counts for …`) — box-local, so fixing that box's gh chain clears it and **a re-dispatch to a healthy box does clear it**, even
+missing** — per-worktree or an install fault; `land_backlog_verdict` carries a **second copy** of that message, `UNREADABLE
+repo … (not an owner/name slug)`, emitted by its OWN slug-shape check and **unreachable through `run_agent`** — the slug is
+derived first and refuses there — so it is the test seam's twin of this arm, same remedy, and it is not a `gh` fault); and
+**rc=2, a failed `gh` read** (`UNREADABLE open-PR count` / `UNREADABLE landing rate` / `UNREADABLE landing counts for …` —
+each carries "(the gh read failed)") — box-local, so fixing that box's gh chain clears it and **a re-dispatch to a healthy box does clear it**, even
 though the gate prints the ratio remedy text for it too. A P0-blocker or a base-red repair is **exempt by evidence** and dispatches under the hold — **when the exemption read
 itself succeeds**; on the rc=2 arm it fails with the same gh chain, so a P0 *is* held until the chain is fixed (the
 gate's refusal line says so). **Idling on its own changes none of them**: for 73
@@ -228,9 +232,16 @@ channel verdicts — the first one **is**, and it is listed with them only to sa
   catalog at all on a box whose link is refused) and reports "VM request timed out". That is the channel failing, not the box.
   Only a **connected** link that genuinely enumerates zero terminals justifies creating one
   (`cmux surface new-terminal --machine <vm> --no-open -- <cmd>`).
-- **A usage error is not a channel verdict, and neither is a wrong-but-valid argument.** `cmux vm tree` with **no machine**
-  prints the whole fleet; `terminal read/send` without an id prints the usage block. And because §7's table is keyed by LABEL,
-  `cmux vm tree pi-cell-4` renders **`No cloud machines. Try: cmux vm new`** — a false empty, not a missing box. Use the NAME.
+- **A usage error is not a channel verdict, and neither is a wrong-but-valid argument.** From the Mac, `cmux vm tree` with
+  **no machine** prints the whole fleet; `terminal read/send` without an id prints the usage block. And because §7's table is
+  keyed by LABEL, `cmux vm tree pi-cell-4` renders **`No cloud machines. Try: cmux vm new`** from the Mac — a false empty, not
+  a missing box — so use the NAME. **From inside a cell the grammar is the PEER one and it answers the same arguments
+  differently:** `cmux vm` there carries only the remote verbs (`ls`, `connect`, `exec`, `tree`, `terminal`,
+  `send`/`send-key`/`read-screen`, `workspace`, `push`, `agent`, `layout`, `env`, and the mirrored resources) — `resize`,
+  `pause`, `resume` and `stats` are **`unknown vm subcommand`**, so step 3, step 4 and every `stats` reading in this file have
+  to be run **from the Mac**; a missing argument prints `usage: cmux vm tree <machine> [args…]`; and `<machine>` is resolved
+  against cmux-tui **peer slugs**, so the LABEL *and* the NAME both answer `no link for machine '<arg>': reflection lists no
+  such machine; reachable machines: <slug>, <slug>` — an argument error wearing the shape of an absent box.
 
 And if the volume that is full is the **`cmux-tui` state volume** described under step 5, skip to that owner-level action —
 none of the reclaim steps below touch it.
@@ -519,13 +530,17 @@ not a load average measured earlier.
     seed=$(git -C "$w" rev-parse --git-common-dir 2>/dev/null | sed 's|/\.git$||')
     [ -n "$seed" ] && break
   done
-  # The population is what is ON this box. A path you only BELIEVE is there is not a floor — it is a permanent exit 1 on
-  # every run, which trains the reader to discount the stop signal; a path that exists and is not a repo still reports
-  # AT-RISK-UNKNOWN. Streamed one path per line so a path with a space survives, for the same reason the block above reads
-  # the porcelain stream instead of awk fields.
+  # The population is the roots this block can SEE, one level deep: $REPO, the derived seed, /tmp/cell-*, "$CELL_HOME"/*, and
+  # /home/*/*. That last root is not optional: exec's HOME is /home/cmux while the login shell's is $CELL_HOME, so the two
+  # homes are different trees — measured on pi-cell-4 (2026-10-27), /home/cmux/agent-infra and /home/cmux/tortoise are repos
+  # this root reaches and the $CELL_HOME glob never does. A repo parked anywhere else is INVISIBLE here, and a `0` does not
+  # speak for it, so add its root before trusting the verdict. A path you only BELIEVE is there is not a floor either — it is
+  # a permanent exit 1 on every run, which trains the reader to discount the stop signal; a path that exists and is not a repo
+  # still reports AT-RISK-UNKNOWN. Streamed one path per line so a path with a space survives, for the same reason the block
+  # above reads the porcelain stream instead of awk fields.
   POP=$( { printf '%s\n' "$REPO"
             [ -n "$seed" ] && printf '%s\n' "$seed"
-            for d in /tmp/cell-* "$CELL_HOME"/*; do [ -e "$d/.git" ] && printf '%s\n' "$d"; done
+            for d in /tmp/cell-* "$CELL_HOME"/* /home/*/*; do [ -e "$d/.git" ] && printf '%s\n' "$d"; done
           } | sort -u )
   [ -n "$POP" ] || { echo "AT-RISK-UNKNOWN no-repos $CELL_HOME"; exit 1; }   # nothing enumerated is not "clean"
   while IFS= read -r R; do
