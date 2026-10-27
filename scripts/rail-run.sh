@@ -156,9 +156,14 @@ age_s() { # <path> -> integer seconds since it was last written, or nothing
 # state is an abstention, and the rail's own line is printed so the reader decides. The measured cost
 # of the other direction (#2412): the rail refused with "the FIRST-CHECKS wait expired … no
 # classification attempted" and the PR MERGED four minutes later — a lane told "refused" abandons it.
+# ⛔ NARROW ON PURPOSE. "base is red" was tried and is WRONG: `THE BASE IS RED AND THE MERGE REF'S
+# BASE PARENT COULD NOT BE READ` contains it and says the rail could not read — the exact
+# wrong-direction verdict this allow-list exists to prevent. Only phrasings that appear in ONE
+# template, and that state a judgement of the head, are listed.
 HEAD_VERDICT_STEMS=(
   "tree this pr produces is red"
-  "base is red"
+  "has not measured it"            # THE BASE IS RED AND THIS PR HAS NOT MEASURED IT (a STALE surface)
+  "evaluated against an older base" # … AND THIS PR WAS EVALUATED AGAINST AN OLDER BASE
   "never tested main"
   "conflicted"
   "--no-rerun"
@@ -229,6 +234,27 @@ repo_key() {
 # (no `gh`, no network): a run that never records which repo it is about cannot verify what the API
 # read, and `gh` resolves a bare PR number against ambient GH_REPO or the caller's cwd — which is how
 # a merged PR of the SAME NUMBER IN ANOTHER REPO reads as this one's landing (#2235's measured shape).
+# resolve_host -> the host of `origin` (default github.com). Recorded with the run, so the artifact
+# check compares a host it can attest instead of accepting any host that happens to hold a matching path.
+resolve_host() {
+  if [ -n "${RAIL_RUN_GH_HOST:-}" ]; then printf '%s' "$RAIL_RUN_GH_HOST"; return 0; fi
+  local u h=""
+  u="$(git remote get-url origin 2>/dev/null || true)"
+  case "$u" in
+    *://*) h="${u#*://}"; h="${h%%/*}" ;;
+    *@*:*) h="${u%%:*}" ;;                     # git@host:owner/repo
+    *:*)   h="${u%%:*}" ;;
+  esac
+  # ⛔ THE USERINFO IS NOT THE HOST. `git@host:owner/repo` and `https://user@host/owner/repo` both
+  # carry a prefix that is not part of the host name, and `@` fails the character class below — so
+  # validating BEFORE stripping it degraded every non-github SSH checkout to `github.com`, which made
+  # `landed` UNREACHABLE there (the artifact check then demanded a github.com URL that never exists
+  # for it) while the suite stayed green: every host arm pins the host, so RESOLUTION had no coverage.
+  h="${h##*@}"
+  case "$h" in ''|*[!A-Za-z0-9.:-]*) h="github.com" ;; esac
+  printf '%s' "$h"
+}
+
 resolve_slug() {
   local u
   # RAIL_RUN_REPO_SLUG pins the identity for a checkout whose `origin` does not name its repo (a
@@ -274,25 +300,31 @@ normalize_slug() {
 # pr_url_names <url> <slug> <pr> -> 0 when the URL names EXACTLY this PR in EXACTLY this repo. This is
 # the identity proof a bare `gh pr view <N>` cannot carry: without it, `landed` is a claim about a
 # number rather than about this head, and it is terminal news that stops a lane driving its PR.
+# pr_url_names <url> <slug> <pr> <host> -> 0 when the URL names EXACTLY this PR in EXACTLY this repo
+# on EXACTLY this host.
+# ⛔ A SUFFIX GLOB IS NOT ENOUGH, and this is the rail's own lesson (admin-merge.sh #2235 review):
+# `https://*"/owner/repo/pull/5"` matches `https://evil.example/owner/repo/pull/5` (another host) and
+# `https://host/x/owner/repo/pull/5` (another path). The comparison is segment-exact, and the host is
+# compared too — the run records it (`host`), and a run that cannot attest one gets `github.com`.
 pr_url_names() {
-  local url="${1:-}" slug="${2:-}" pr="${3:-}" want
+  local url="${1:-}" slug="${2:-}" pr="${3:-}" host="${4:-github.com}" rest lurl lslug lhost
   [ -n "$url" ] && [ "$url" != "-" ] && [ -n "$slug" ] && [ -n "$pr" ] || return 1
-  local lurl lslug
   lurl="$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')"
   lslug="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')"
-  want="/${lslug}/pull/${pr}"
+  lhost="$(printf '%s' "${host:-github.com}" | tr '[:upper:]' '[:lower:]')"
   case "$lurl" in
-    https://*"$want") return 0 ;;
-    https://*"$want"/*) return 0 ;;
+    https://"$lhost"/*) rest="${lurl#https://"$lhost"}" ;;
+    *) return 1 ;;
   esac
-  return 1
+  [ "$rest" = "/${lslug}/pull/${pr}" ] || [ "$rest" = "/${lslug}/pull/${pr}/" ]
 }
 
-# pr_state <pr> <slug|""> -> "<STATE> <mergedAt|-> <url>", or nothing when the read ABSTAINED.
-# Nothing is the important answer: a failed artifact read is never a landing, a refusal or a kill
-# claim — callers must fold it into `unknown` for EVERY exit status, which is what derive does.
+# pr_state <pr> <slug|""> <unused> <host-file> -> "<STATE> <mergedAt|-> <url>", or nothing when the
+# read ABSTAINED. Nothing is the important answer: a failed artifact read is never a landing, a
+# refusal or a kill claim — callers must fold it into `unknown` for EVERY exit status, which is what
+# derive does. `$3` is deliberately unused and kept for the existing call sites; the host file is 4th.
 pr_state() {
-  local pr="$1" slug="${2:-}" out url
+  local pr="$1" slug="${2:-}" host_file="${4:-}" out url
   # ⛔ NO SLUG, NO READ. An unqualified `gh pr view <N>` is resolved by `gh` against its own ambient
   # configuration, so an empty slug is an ABSTENTION — the caller folds it into `unknown`.
   [ -n "$slug" ] || return 0
@@ -303,8 +335,9 @@ pr_state() {
     *) return 0 ;;
   esac
   url="${out##* }"
-  # The identity proof. A read that names another repo (or no URL at all) is not a fact about THIS PR.
-  pr_url_names "$url" "$slug" "$pr" || return 0
+  # The identity proof. A read that names another repo, another host (or no URL at all) is not a fact
+  # about THIS PR.
+  pr_url_names "$url" "$slug" "$pr" "$(file_or_empty "$host_file")" || return 0
   printf '%s' "$out"
 }
 
@@ -323,17 +356,19 @@ release_claim() {
   CLAIM=""
 }
 
-# record_young <run-dir> -> 0 when the record is younger than RECORD_MAX (so an abstention still counts)
-# ⛔ AN UNREADABLE AGE IS *NOT* YOUNG HERE. The mtime is the fallback, not the source of truth: the
-# record carries `created` (epoch seconds, written at creation), because an unreadable mtime used to
-# read as "young" and made the abstention unbounded again — the very thing the bound exists to stop.
-record_young() {
-  local d="$1" born age
+# younger_than <new-dir-or-file> <max-seconds> -> 0 when it was created less than <max> ago.
+# ⛔ AN UNREADABLE AGE IS *NOT* YOUNG, and the mtime is only a FALLBACK: the `created` epoch is written
+# at creation (claim and run dir) because an unreadable mtime used to read as "young" and made every
+# bound unbounded again — the very thing the bounds exist to stop. Used by BOTH blocking decisions, so
+# the two cannot drift apart.
+younger_than() {
+  local d="$1" max="$2" born age
   born="$(numeric_or_empty "$(file_or_empty "$d/created")")"
   if [ -n "$born" ]; then age=$(( $(date +%s) - born )); else age="$(numeric_or_empty "$(age_s "$d")")"; fi
   [ -n "$age" ] || return 1
-  [ "$age" -ge 0 ] && [ "$age" -le "$RECORD_MAX" ]
+  [ "$age" -ge 0 ] && [ "$age" -le "$max" ]
 }
+record_young() { younger_than "$1" "$RECORD_MAX"; }
 
 # prev_in_flight <run-dir> -> 0 when the run may still be alive (so a second rail must not start).
 # The same three-outcome rule as the poll, plus ONE extra state the poll cannot see: a launcher that
@@ -341,7 +376,7 @@ record_young() {
 # not yet written its pid). Its record has NO incarnation and NO exit status, so it is in flight while
 # the record is young, and abandoned once it is older than CLAIM_MAX.
 prev_in_flight() {
-  local d="$1" p ps rp rs prc age
+  local d="$1" p ps rp rs prc
   [ -f "$d/rc" ] && return 1                       # it reached its own verdict: not in flight
   p="$(file_or_empty "$d/pid")"; ps="$(file_or_empty "$d/start")"
   if [ -n "$p" ]; then
@@ -363,9 +398,11 @@ prev_in_flight() {
     if [ "$prc" = "0" ]; then return 0; fi
     if [ "$prc" = "2" ] && record_young "$d"; then return 0; fi
   fi
+  # A launch that has recorded NO incarnation yet is in flight only while it is young. This read used
+  # the mtime alone, so an unreadable one made the record block the PR for ever — the same defect the
+  # `created` epoch fixed on the other branch.
   if [ -z "$p" ] && [ -z "$rp" ]; then
-    age="$(numeric_or_empty "$(age_s "$d")")"
-    if [ -z "$age" ] || [ "$age" -le "$CLAIM_MAX" ]; then return 0; fi
+    if younger_than "$d" "$CLAIM_MAX"; then return 0; fi
   fi
   return 1
 }
@@ -490,6 +527,7 @@ start_rail() {
   printf '%s\n' "$(date +%s)" > "$rd/created"
   printf '%s\n' "$slug" > "$rd/repo"
   printf '%s\n' "$RAIL" > "$rd/rail"
+  printf '%s\n' "$(resolve_host)" > "$rd/host"
   # ⛔ THE RECORD AND THE RAIL MUST NAME THE SAME REPO BY CONSTRUCTION. When the identity was NOT
   # taken from argv (`--repo`, or the `=` form) it came from `origin`/`RAIL_RUN_REPO_SLUG` — and a pin
   # that disagrees with the checkout would otherwise leave the rail merging one repo while `status`
@@ -656,7 +694,7 @@ derive() {
       abstain_why="this run records no repo and this poll named none, so WHICH repo PR $pr belongs to is unknown — start or poll with --repo owner/repo"
       prst=""; merged="-"; return 0
     fi
-    out="$(pr_state "$pr" "$slug")"
+    out="$(pr_state "$pr" "$slug" "" "$rd/host")"
     prst="$(printf '%s' "$out" | cut -d' ' -f1)"
     merged="$(printf '%s' "$out" | cut -d' ' -f2)"
     [ -n "$merged" ] || merged="-"
@@ -907,7 +945,9 @@ status_rail() {
     # `latest` is a PATH COMPONENT and a verdict input, so it is validated like `--run`: a hand-edited
     # or half-written value must not point `derive` at another directory.
     case "$latest" in ''|.|..|*/*|*[!A-Za-z0-9._-]*) latest="" ;; esac
-    if [ -z "$latest" ] || [ ! -d "$dir/$latest" ]; then
+    # The same is-a-run test the `--run` path applies: a `latest` naming the claim dir (or any
+    # directory) must not be fed to `derive` and answered about.
+    if [ -z "$latest" ] || [ ! -d "$dir/$latest" ] || { [ ! -f "$dir/$latest/log" ] && [ ! -f "$dir/$latest/repo" ]; }; then
       printf 'no-run pr=%s run=none repo=%s\n' "$pr" "$key"
       printf '  nothing was ever started for this PR under %s\n' "$dir"
       printf '  (the key is the git common-dir name, or the FULL --repo slug: a run started with a\n'

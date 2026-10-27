@@ -46,8 +46,9 @@ prints the run id / log path / exact poll command, and exits. Nothing in this sc
 rail, so no tool call can be capped by it.
 
 State lives under `${RAIL_RUN_DIR:-${O:-$HOME/orchestrator}/state/rail-run}/<repo-key>/pr-<N>/<run-id>/`
-(`pid`, `start`, `railpid`, `railstart`, `rc`, `log`, `repo`, `rail`, `args`, `started`, and a
-`latest` pointer, which is written atomically and validated like `--run` because it is joined into a
+(`pid`, `start`, `created`, `railpid`, `railstart`, `rc`, `log`, `repo`, `host`, `rail`, `args`,
+`started`, and a `latest` pointer, which is written atomically and validated like `--run` because it is
+joined into a
 path; a directory with neither a `log` nor a `repo` — e.g. the `.starting` claim — is not a run). Knobs: `RAIL_RUN_DIR`, `RAIL_RUN_RAIL` (the rail, default `admin-merge.sh` beside
 this script), `RAIL_RUN_REPO_SLUG` (pin the repo identity instead of resolving `origin`),
 `RAIL_RUN_CLAIM_MAX` (60 s) and `RAIL_RUN_RECORD_MAX` (24 h).
@@ -64,7 +65,7 @@ flight, not dead** — reading that window as "no owner" is how a guard deletes 
 |---|---|---|
 | `running` | 10 | no exit status yet, and the **recorder** is alive — or the **rail** is, when the recorder has been SIGKILLed out from under it |
 | `landed` | 0 | the PR is MERGED. `verdict=rail` when the rail exited 0; `verdict=artifact` when the merge is real but the rail wrote **no verdict or a non-zero one** |
-| `refused` | 20 | rc=2 (a **usage/configuration** refusal — about the invocation, not the head; a MERGED artifact still wins over it), or rc≠ 0 whose last `admin-merge: ✗ …` line is one of the **recognised head-verdict wordings** (`THE TREE THIS PR PRODUCES IS RED`, `THE BASE IS RED`, `never TESTED main`, `CONFLICTED`, `--no-rerun`). Any other `✗` line — the rail has ~117 templates, most of them "could not read", "no classification attempted", or "stopped mid-wait" — is `unknown`: a refusal is a claim about your head and needs positive support |
+| `refused` | 20 | rc=2 (a **usage/configuration** refusal — about the invocation, not the head; a MERGED artifact still wins over it), or rc≠ 0 whose last `admin-merge: ✗ …` line is one of the **recognised head-verdict wordings** (`THE TREE THIS PR PRODUCES IS RED`, `… HAS NOT MEASURED IT`, `… EVALUATED AGAINST AN OLDER BASE`, `never TESTED main`, `CONFLICTED`, `--no-rerun` — note that the family-wide `THE BASE IS RED` is NOT one of them: one of its three lines says the rail could not read the base parent). Any other `✗` line — the rail has ~117 templates, most of them "could not read", "no classification attempted", or "stopped mid-wait" — is `unknown`: a refusal is a claim about your head and needs positive support |
 | `killed` | 21 | the rail died of a signal (rc ≥ 128), named (SIGTERM / SIGKILL / …) |
 | `gone-without-verdict` | 22 | **no exit status, recorder gone, rail not alive, PR not MERGED: this run produced no verdict.** Never reported as a landing |
 | `exited-zero` | 23 | rc=0 and the PR is not merged (a `--dry-run` / `--print-bounds` inspection run) |
@@ -93,7 +94,8 @@ load-bearing distinctions honest:
   PR number*, and `gh` resolves a bare number against ambient `GH_REPO` or the poller's cwd — the
   measured #2235 shape, where a cell-wide `GH_REPO` made the rail print `ALREADY MERGED` over an open
   PR. So the read always passes `--repo`, always asks for the PR's `url`, and **the url must name this
-  repo and this PR** or the read abstains.
+  repo, this PR, and the host recorded at `start`** (a path SUFFIX match is not an identity: the rail
+  learned the same lesson in #2235) or the read abstains.
   The identity is **normalised** (`[HOST/]OWNER/REPO` and the `--repo=X` spelling both reduce to
   `owner/repo`, lower-cased because GitHub's names are case-insensitive while a `case` glob is not —
   un-lower-cased, a canonical URL never matched and `landed` was unreachable), it is forwarded to the
@@ -148,7 +150,7 @@ Three stated residuals:
 bash scripts/rail-run.test.sh      # no network, no real gh, no real rail
 ```
 
-**145 passed, 0 failed** (`bash scripts/rail-run.test.sh`, ~62 s, no network). The suite is mostly
+**161 passed, 0 failed** (`bash scripts/rail-run.test.sh`, ~58 s, no network). The suite is mostly
 negative — `running` must never read as landed or refused, `rc=0` is not a landing when the artifact
 disagrees, `gone-without-verdict` is never a landing *or* claimed over an unread artifact, an
 unreadable liveness or PR read abstains, a live pid with the wrong incarnation is not "running", a

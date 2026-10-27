@@ -111,6 +111,7 @@ case "${GH_MODE:-merged}" in
   merged) printf 'MERGED 2026-10-27T03:56:04Z %s\n' "$url" ;;
   open)   printf 'OPEN - %s\n' "$url" ;;
   wrongrepo) printf 'MERGED 2026-10-27T03:56:04Z https://github.com/someone/else/pull/%s\n' "$pr" ;;
+  otherhost) printf 'MERGED 2026-10-27T03:56:04Z https://ghe.example.com/%s/pull/%s\n' "${repo:-x/y}" "$pr" ;;
   fail)   printf 'HTTP 502: bad gateway\n' >&2; exit 1 ;;
 esac
 GHD
@@ -530,7 +531,7 @@ PIDS+=("$(cat "$RAIL_RUN_DIR/acme-widgets/pr-170/"*/pid 2>/dev/null | tr '\n' ' 
 mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-149/.starting"
 printf '%s\n' "$$" > "$RAIL_RUN_DIR/fake-repo/pr-149/.starting/pid"
 OUT="$(poll 149 --run .starting)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
-assert_rc 24 "$RC" "NONRUN: `--run .starting` (the claim dir) is no-run, not gone-without-verdict"
+assert_rc 24 "$RC" "NONRUN: '--run .starting' (the claim dir) is no-run, not gone-without-verdict"
 assert_not_contains "$TXT" "gone-without-verdict" "NONRUN: and never a terminal no-verdict claim"
 
 # ── AE: the bound must not depend on a readable mtime ─────────────────────────────────────────
@@ -550,6 +551,17 @@ OUT="$(PATH="$T/bin-nostat:$PATH" FAKE_RAIL_SLEEP=6 call start 172)"; RC="${OUT%
 assert_rc 0 "$RC" "AGE: an UNREADABLE age is not 'young' — the bound still bounds"
 PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-172/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
 
+# ── AE2: the no-incarnation branch is bounded by the same rule ────────────────────────────────
+# `prev_in_flight` bounds a record that recorded NO incarnation by the age too. With no `created` and
+# an UNREADABLE mtime, "young" would block the PR for ever; it must read as stale instead.
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-174/halfdead"
+printf 'fake/repo\n' > "$RAIL_RUN_DIR/fake-repo/pr-174/halfdead/repo"
+: > "$RAIL_RUN_DIR/fake-repo/pr-174/halfdead/log"
+printf 'halfdead\n' > "$RAIL_RUN_DIR/fake-repo/pr-174/latest"
+OUT="$(PATH="$T/bin-nostat:$PATH" FAKE_RAIL_SLEEP=6 call start 174)"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "AGE2: a no-incarnation record with no readable age does NOT block for ever"
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-174/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+
 # ── AD: an unrecognised `✗` line is an ABSTENTION, not a refusal ──────────────────────────────
 # `refused` is a claim about a HEAD, so it needs positive support: the rail's own phrases say whether
 # it judged the head or merely never got to it. #2412: the rail said "no classification attempted"
@@ -562,9 +574,62 @@ NOC
 chmod +x "$T/bin/rail-noclass"
 RAIL_RUN_RAIL="$T/bin/rail-noclass" call start 171 >/dev/null
 OUT="$(GH_MODE=open wait_state unknown 171)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
-assert_rc 25 "$RC" "HEAD-VERDICT: `no classification attempted` is NOT a refusal of this head"
+assert_rc 25 "$RC" "HEAD-VERDICT: 'no classification attempted' is NOT a refusal of this head"
 assert_state "$TXT" unknown "HEAD-VERDICT: it abstains"
 assert_contains "$TXT" "NOT a refusal" "HEAD-VERDICT: and says plainly that it is not a refusal"
+
+# ── AF: the base-red family — ONE of its three lines is a read failure ───────────────────────
+# `THE BASE IS RED AND THE MERGE REF'S BASE PARENT COULD NOT BE READ` contains "base is red", so a stem
+# that broad admits a READ FAILURE as a refusal. The two positive phrasings are recognised; the unread
+# one abstains. Fixtures are the rail's own terminal lines, verbatim.
+mk_rail() { printf '#!/usr/bin/env bash\nprintf "admin-merge: ✗ BLOCK — %s\\n" %s\nexit 1\n' "$2" "'$3'" > "$T/bin/rail-$1"; chmod +x "$T/bin/rail-$1"; }
+mk_rail basesurface "THE BASE IS RED AND THIS PR HAS NOT MEASURED IT (a STALE surface)." x
+mk_rail baselag "THE BASE IS RED AND THIS PR WAS EVALUATED AGAINST AN OLDER BASE (a LAGGING MERGE REF)." x
+mk_rail baseunread "THE BASE IS RED AND THE MERGE REF'S BASE PARENT COULD NOT BE READ." x
+RAIL_RUN_RAIL="$T/bin/rail-basesurface" call start 160 >/dev/null
+OUT="$(GH_MODE=open wait_state refused 160)"; assert_rc 20 "${OUT%%|*}" "BASE-RED: 'HAS NOT MEASURED IT' is a head verdict (refused)"
+RAIL_RUN_RAIL="$T/bin/rail-baselag" call start 161 >/dev/null
+OUT="$(GH_MODE=open wait_state refused 161)"; assert_rc 20 "${OUT%%|*}" "BASE-RED: 'EVALUATED AGAINST AN OLDER BASE' is a head verdict (refused)"
+RAIL_RUN_RAIL="$T/bin/rail-baseunread" call start 162 >/dev/null
+OUT="$(GH_MODE=open wait_state unknown 162)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "BASE-RED: 'BASE PARENT COULD NOT BE READ' is NOT a head verdict"
+assert_state "$TXT" unknown "BASE-RED: it abstains"
+
+# ── AG: another HOST holding the same owner/repo/number is not this PR ───────────────────────
+craft 163 otherhost rc=0 >/dev/null
+# A suffix test accepts this one: the PATH names this repo and this PR, the HOST does not.
+OUT="$(GH_MODE=otherhost poll 163)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HOST: a MERGED read from another host is NOT a landing"
+assert_state "$TXT" unknown "HOST: it abstains"
+OUT="$(GH_MODE=merged poll 163)"; assert_rc 0 "${OUT%%|*}" "HOST: the same run lands when the host matches"
+
+# ── AG2: the host is RESOLVED from `origin`, not assumed to be github.com ────────────────────
+# Every arm above PINS the host (`RAIL_RUN_GH_HOST` or a hand-built run dir), so `resolve_host` had
+# no coverage at all — and it validated the host BEFORE stripping the `user@` prefix, so an ssh
+# remote degraded to `github.com` and `landed` became UNREACHABLE on any non-github checkout while
+# this suite stayed green. These two arms start a run in a real checkout whose `origin` carries a
+# userinfo prefix and assert what the run RECORDED, which is the only thing the artifact check reads.
+resolve_host_arm() { # <label> <remote-url> <pr>
+  local label="$1" url="$2" pr="$3" dir out rc id got
+  dir="$T/host-$pr"
+  mkdir -p "$dir"; git -C "$dir" init -q >/dev/null 2>&1
+  git -C "$dir" remote add origin "$url" >/dev/null 2>&1
+  out="$(cd "$dir" && RAIL_RUN_REPO_SLUG= RAIL_RUN_GH_HOST= FAKE_RAIL_SLEEP=1 "$BASH_BIN" "$RR" start "$pr" 2>&1)"; rc=$?
+  assert_rc 0 "$rc" "HOST/RESOLVE: start in a checkout whose origin is $label"
+  id="$(run_id_of "$out")"
+  PIDS+=("$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-$pr/$id" pid)")
+  got="$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-$pr/$id" host)"
+  if [ "$got" = "ghe.example.com" ]; then
+    ok "HOST/RESOLVE: $label records host=ghe.example.com (the userinfo prefix is not the host)"
+  else
+    bad "HOST/RESOLVE: $label recorded host='$got' (want ghe.example.com) — a @-prefixed remote must not degrade to github.com"
+  fi
+  got="$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-$pr/$id" repo)"
+  if [ "$got" = "acme/widgets" ]; then ok "HOST/RESOLVE: $label also records the repo identity (acme/widgets)"
+  else bad "HOST/RESOLVE: $label recorded repo='$got' (want acme/widgets)"; fi
+}
+resolve_host_arm "an scp-form ssh remote (git@host:owner/repo)" 'git@ghe.example.com:acme/widgets.git' 164
+resolve_host_arm "an https remote with userinfo (https://user@host/owner/repo)" 'https://user@ghe.example.com/acme/widgets.git' 165
 
 # ── X: the recorder's own liveness blocks a start ─────────────────────────
 # The recorder is the only incarnation for the first instants of every launch, so a record with a
@@ -605,14 +670,24 @@ printf '0\n' > "$RAIL_RUN_DIR/alias/rc"
 mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-147"
 printf '../../alias\n' > "$RAIL_RUN_DIR/fake-repo/pr-147/latest"
 OUT="$(poll 147)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
-assert_rc 24 "$RC" "LATEST: an unusable `latest` is treated as absent, never joined into a path"
+assert_rc 24 "$RC" "LATEST: an unusable 'latest' is treated as absent, never joined into a path"
 assert_not_contains "$TXT" "alias" "LATEST: and is not echoed back as a run"
+
+# ── Y2b: a `latest` that names a NON-RUN directory is no-run, like `--run` ───────────────────
+# The claim dir passes the path-component validation (it is a legal name), so only the is-a-run test
+# stops it from being answered about.
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-173/.starting"
+printf '%s\n' "$$" > "$RAIL_RUN_DIR/fake-repo/pr-173/.starting/pid"
+printf '.starting\n' > "$RAIL_RUN_DIR/fake-repo/pr-173/latest"
+OUT="$(poll 173)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 24 "$RC" "LATEST-NONRUN: a 'latest' naming the claim dir is no-run, not a state about nobody"
+assert_not_contains "$TXT" "gone-without-verdict" "LATEST-NONRUN: never a terminal no-verdict claim"
 
 # ── Y3: rc=2 is a claim about the INVOCATION, so it does not need the artifact ────────────────
 craft 148 usage rc=2 >/dev/null
 printf 'admin-merge: a PR number is required\n' > "$(rundir 148 usage)/log"
 OUT="$(GH_MODE=fail poll 148)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
-assert_rc 20 "$RC" "RC2: a usage refusal is `refused` even when the artifact read abstains"
+assert_rc 20 "$RC" "RC2: a usage refusal is refused (20) even when the artifact read abstains"
 assert_state "$TXT" refused "RC2: it never analysed the head, so the PR read is irrelevant"
 
 # ── Q: path components are validated, not joined ───────────────────────────
