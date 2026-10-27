@@ -467,18 +467,42 @@ def _origin_slug(checkout: str) -> tuple[str, str]:
     return slug, ""
 
 
+def _safe_cwd() -> str:
+    """The process's cwd, or "" when the OS REFUSES to say where the process is.
+
+    ⛔ `os.getcwd()` IS NOT A TOTAL FUNCTION. A launchd job has no Full Disk Access under
+    `~/Documents` (TCC), and the call then raises rather than returning a path -- measured on
+    `com.tortoise.pr-doctor-agent-infra`, whose every run died on
+    `PermissionError: [Errno 1] Operation not permitted` while `REPO`, `OR` and `PR_DOCTOR_REPO`
+    already named the repo. An unreadable cwd is "no cwd candidate", which the resolver already
+    knows how to skip; it is never evidence about a repo, and it must never decide the pass.
+
+    "" is unambiguous: a SUCCESSFUL `getcwd()` never returns an empty path.
+    """
+    try:
+        return os.getcwd()
+    except OSError:                            # PermissionError, ENOENT, ENOENT-after-delete
+        return ""
+
+
 def _checkout_that_proves(slug: str, env: dict) -> tuple[str, str]:
     """The checkout that PROVES it is <slug>, or ("", why none does).
 
     ⛔ A DISAGREEING CHECKOUT IS NOT ADOPTED. `REPO` and the cwd are candidates, and each is used
     ONLY when its own `origin` names the repo already decided -- so a pass launched for repo A from
     repo B's checkout (or with a stale `REPO=B`) can never read B's worktrees, branches or remote.
+
+    ⛔ AND THE SECOND CANDIDATE IS COMPUTED ONLY IF THE FIRST DID NOT ANSWER. "Candidate by
+    candidate" is the design, not an optimisation: resolving the cwd eagerly inside a tuple literal
+    killed the whole pass in the launchd job above, where `REPO` had already proved the repo and the
+    cwd was never needed. An unreadable cwd is reported in the notes, never swallowed.
     """
     notes = []
-    for cand, src in (((env.get("REPO") or "").strip(), "REPO"), (os.getcwd(), "cwd")):
+    for src in ("REPO", "cwd"):
+        cand = (env.get("REPO") or "").strip() if src == "REPO" else _safe_cwd()
         if not cand:
-            if src == "REPO":
-                notes.append("REPO is not set")
+            notes.append("REPO is not set" if src == "REPO" else
+                         "cwd unreadable (OSError): the OS refused to report the process's cwd")
             continue
         got, why = _origin_slug(cand)
         if got and got.lower() == slug.lower():
@@ -609,16 +633,18 @@ def resolve_repo(explicit: str | None = None, env: dict | None = None,
             "grades (set OR=owner/name, or point REPO at a checkout whose origin names it)"
             % (repo_env, why))
 
-    got, why = _origin_slug(os.getcwd())
+    cwd = _safe_cwd()
+    got, why = _origin_slug(cwd) if cwd else (
+        "", "cwd unreadable (OSError): the OS refused to report the process's cwd")
     if got:
-        return got, os.getcwd(), "cwd", ""
+        return got, cwd, "cwd", ""
     raise RepoUnresolved(
         "no repository could be resolved for this pass: --repo was not given, OR is not set, "
         "REPO is not set, and the cwd (%s) is not a checkout with a GitHub 'origin' (%s). "
         "GH_REPO and TORTOISE_REPO are deliberately NOT consulted -- both are global on a fleet "
         "box, so inheriting one grades a repo nobody named (#2235). Fix: pass --repo OWNER/NAME, "
         "or set REPO=<checkout> (its origin proves the repo), or OR=OWNER/NAME"
-        % (os.getcwd(), why))
+        % (cwd or "<unreadable>", why))
 
 
 def split_repo_entry(entry: str) -> tuple[str, str]:

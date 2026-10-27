@@ -100,7 +100,7 @@ TRIAGE="${TRIAGE-}"
 TRIAGE_CMD="${TRIAGE_CMD:-$HOME/.pi/agent/scripts/ai_pr_status.py}"
 
 mkdir -p "$STATE" 2>/dev/null || true
-say() { printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$LOG" 2>/dev/null; }
+log_line() { printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$LOG" 2>/dev/null; }
 bytes() { printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' '; }
 
 if [ "${1:-}" = "--status" ]; then
@@ -116,7 +116,7 @@ resolve_backend() {
   case "$BACKEND" in
     cmux|tmux) printf '%s\n' "$BACKEND"; return 0 ;;
     auto) ;;
-    *) say "SKIP: unknown BACKEND '$BACKEND' (want auto|cmux|tmux)"; return 1 ;;
+    *) log_line "SKIP: unknown BACKEND '$BACKEND' (want auto|cmux|tmux)"; return 1 ;;
   esac
   if [ -x "$CMUX" ]; then printf 'cmux\n'; return 0; fi
   if command -v "$TMUX" >/dev/null 2>&1; then printf 'tmux\n'; return 0; fi
@@ -137,7 +137,7 @@ resolve_tmux_target() {
   printf 'orch\n'
 }
 
-BE="$(resolve_backend)" || { say "SKIP: no delivery backend (cmux not at $CMUX, tmux not on PATH) — nothing was sent"; exit 0; }
+BE="$(resolve_backend)" || { log_line "SKIP: no delivery backend (cmux not at $CMUX, tmux not on PATH) — nothing was sent"; exit 0; }
 [ "$BE" = tmux ] && TMUX_TARGET="$(resolve_tmux_target)"
 # The needle is the payload's own stable prefix (before the first colon), so an operator who changes
 # OBJECTIVE does not silently disable the composer read — a hardcoded string would make the UNSENT arm
@@ -160,12 +160,12 @@ fi
 MSG="$OBJECTIVE$TRIAGE"
 if [ "$(bytes "$MSG")" -gt "$MAX_BYTES" ]; then
   MSG="$OBJECTIVE"
-  say "BUDGET: triage line dropped (composed text over ${MAX_BYTES} B) — sending the objective alone"
+  log_line "BUDGET: triage line dropped (composed text over ${MAX_BYTES} B) — sending the objective alone"
 fi
 if [ "$(bytes "$MSG")" -gt "$MAX_BYTES" ]; then
   # ⛔ THE REFUSAL. Sending this would truncate mid-instruction (or break the socket, measured ~969 B),
   # and a truncated objective is worse than none: it reads as a different, shorter objective.
-  say "REFUSED: objective text alone is $(bytes "$MSG") B (budget ${MAX_BYTES}) — nothing sent; shorten the objective"
+  log_line "REFUSED: objective text alone is $(bytes "$MSG") B (budget ${MAX_BYTES}) — nothing sent; shorten the objective"
   exit 0
 fi
 # ONE line: a multi-line payload can half-enter the composer on a partial write.
@@ -220,7 +220,7 @@ deliver() {
 }
 
 if ! deliver; then
-  say "FAIL: send refused by the $BE backend (payload $(bytes "$MSG") B, budget ${MAX_BYTES}) — nothing confirmed"
+  log_line "FAIL: send refused by the $BE backend (payload $(bytes "$MSG") B, budget ${MAX_BYTES}) — nothing confirmed"
   exit 0
 fi
 sleep "$SETTLE"
@@ -234,9 +234,9 @@ if [ -f "$PENDING" ]; then
     tmux) cur="$("$TMUX" capture-pane -p -t "$TMUX_TARGET" 2>/dev/null | awk 'NF{n++} END{print n+0}')" ;;
   esac
   if [ -n "$prev" ] && [ -n "$cur" ] && [ "$cur" \> "$prev" ]; then
-    say "previous reminder CONFIRMED delivered (turn boundary $prev -> $cur)"
+    log_line "previous reminder CONFIRMED delivered (turn boundary $prev -> $cur)"
   else
-    say "previous reminder STILL-UNCONFIRMED (turn boundary $prev -> ${cur:-?}) — if this repeats, the surface/target is wrong"
+    log_line "previous reminder STILL-UNCONFIRMED (turn boundary $prev -> ${cur:-?}) — if this repeats, the surface/target is wrong"
   fi
 fi
 
@@ -250,13 +250,13 @@ case "$BE" in
   tmux) after="$("$TMUX" capture-pane -p -t "$TMUX_TARGET" 2>/dev/null | awk 'NF{n++} END{print n+0}')" ;;
 esac
 if compose_holds_text; then
-  say "UNSENT: the payload is sitting in the $BE composer (turn boundary did not advance ${BEFORE:+from $BEFORE}) — the submit keystroke was swallowed"
+  log_line "UNSENT: the payload is sitting in the $BE composer (turn boundary did not advance ${BEFORE:+from $BEFORE}) — the submit keystroke was swallowed"
   exit 0
 fi
 if [ -n "$BEFORE" ] && [ -n "$after" ] && [ "$after" \> "$BEFORE" ]; then
-  say "sent: turn boundary advanced $BEFORE -> $after (the $BE backend submitted it)"
+  log_line "sent: turn boundary advanced $BEFORE -> $after (the $BE backend submitted it)"
 else
-  say "sent: backend accepted $(bytes "$MSG") B; turn boundary ${BEFORE:-?} -> ${after:-?} — confirmation deferred to the next pass"
+  log_line "sent: backend accepted $(bytes "$MSG") B; turn boundary ${BEFORE:-?} -> ${after:-?} — confirmation deferred to the next pass"
 fi
-printf '%s' "${after:-$BEFORE}" > "$PENDING" 2>/dev/null || say "WARN: cannot write $PENDING — the next pass will report this send as unconfirmed"
+printf '%s' "${after:-$BEFORE}" > "$PENDING" 2>/dev/null || log_line "WARN: cannot write $PENDING — the next pass will report this send as unconfirmed"
 exit 0

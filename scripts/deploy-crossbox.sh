@@ -25,17 +25,17 @@ OR="${OR:-daniel-ospina/agent-infra}"
 SCOPE="${SCOPE:-broad}"
 MAX_LANES="${MAX_LANES:-3}"
 
-say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
-die() { say "FATAL: $*" >&2; exit 1; }
+log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+die() { log_line "FATAL: $*" >&2; exit 1; }
 
 export HOME="$CELL_HOME"
 cd "$AI" || die "no $AI"
 
-say "repo HEAD=$(git rev-parse --short HEAD)  branch=$(git rev-parse --abbrev-ref HEAD)"
+log_line "repo HEAD=$(git rev-parse --short HEAD)  branch=$(git rev-parse --abbrev-ref HEAD)"
 
 # ── 1. stop the controller before touching the files it is reading ────────────
 if tmux has-session -t orch 2>/dev/null; then
-  say "stopping controller (tmux orch)"
+  log_line "stopping controller (tmux orch)"
   tmux kill-session -t orch 2>/dev/null
   sleep 2
 fi
@@ -44,15 +44,15 @@ fi
 # NOT a path-scoped checkout: for a cell whose REPO is this clone, `git checkout <ref> --
 # <path>` leaves the index dirty, which the controller then sees. Once the registry is on
 # main, a plain fast-forward updates BOTH the harness and the operator's repo, cleanly.
-say "fetching origin/main"
+log_line "fetching origin/main"
 git fetch -q origin main || die "git fetch failed"
 BEFORE="$(git rev-parse --short HEAD)"
 git merge --ff-only origin/main >/dev/null 2>&1 || die "cannot fast-forward to main (local changes in $AI?)"
-say "clone -> $(git rev-parse --short HEAD) (was $BEFORE)"
+log_line "clone -> $(git rev-parse --short HEAD) (was $BEFORE)"
 
 [ -f "$H/claims.sh" ]               || die "claims.sh missing on main — is the registry merged?"
 [ -f "$H/test-claims.sh" ]          || die "test-claims.sh missing on main"
-say "claims.sh present: $(wc -c < "$H/claims.sh" | tr -d ' ') bytes"
+log_line "claims.sh present: $(wc -c < "$H/claims.sh" | tr -d ' ') bytes"
 
 # ── 3. re-seed the runtime dir with EVERY harness script ──────────────────────
 mkdir -p "$O" || die "cannot create $O"
@@ -75,7 +75,7 @@ if [ -f "$H/gh-limit/gh" ] && [ -f "$H/gh-limit.py" ]; then
   }
   _seed_one "$H/gh-limit/gh" "$O/gh-limit/gh"
   _seed_one "$H/gh-limit.py" "$O/gh-limit.py"
-  say "seeded the gh-limit layer (serialised gh; path=$O/gh-limit)"
+  log_line "seeded the gh-limit layer (serialised gh; path=$O/gh-limit)"
 else
   # ⛔ MIRROR, not merely overlay — the same rule the *.sh loop above states. A stale `$O/gh-limit/gh`
   # left by an earlier harness stays on the controller PATH (orch-loop.sh re-asserts it on `[ -d ]`)
@@ -85,11 +85,11 @@ else
   if [ -e "$O/gh-limit/gh" ] || [ -e "$O/gh-limit.py" ]; then
     rm -f "$O/gh-limit/gh" "$O/gh-limit.py" || die "cannot remove the stale gh-limit layer from $O"
     rmdir "$O/gh-limit" 2>/dev/null || true
-    say "seed: removed the stale gh-limit layer — the harness no longer ships it"
+    log_line "seed: removed the stale gh-limit layer — the harness no longer ships it"
   fi
-  say "WARN: this harness ships no gh-limit layer — gh calls on this cell will NOT be serialised (#1988)"
+  log_line "WARN: this harness ships no gh-limit layer — gh calls on this cell will NOT be serialised (#1988)"
 fi
-say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present)"
+log_line "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present)"
 
 # ── 4. restart the controller, cold, with HOME carried into tmux ──────────────
 # ⛔ `unset GH_REPO` AFTER `set +a` (#2235). `keys.env` is re-sourced INSIDE the session, so a
@@ -99,7 +99,7 @@ say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh prese
 # a session (with the supervisor's two and cloud-cell-quiesce.sh's one), so it carries the same
 # strip; `cloud-cell-supervisor.test.sh` sweeps every session creator for it rather than naming
 # files, so a fifth cannot be forgotten.
-say "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
+log_line "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
 tmux new-session -d -s orch -c "$H" \
   "set -a; [ ! -f '$CELL_HOME/keys.env' ] || . '$CELL_HOME/keys.env'; set +a; unset GH_REPO; \
    PATH='$O/gh-limit':\"\$PATH\" \
@@ -107,10 +107,10 @@ tmux new-session -d -s orch -c "$H" \
    bash '$H/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
 sleep 8
 
-tmux has-session -t orch 2>/dev/null && say "controller UP" || die "controller did not start"
+tmux has-session -t orch 2>/dev/null && log_line "controller UP" || die "controller did not start"
 if [ -f "$O/claims.sh" ] && grep -q 'refs/claims' "$O/orch-loop.sh"; then
-  say "VERIFIED: $O/orch-loop.sh references refs/claims and $O/claims.sh is present"
+  log_line "VERIFIED: $O/orch-loop.sh references refs/claims and $O/claims.sh is present"
 else
-  say "WARN: registry wiring not visible in $O — check"
+  log_line "WARN: registry wiring not visible in $O — check"
 fi
-say "DONE"
+log_line "DONE"

@@ -55,13 +55,41 @@ os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 #     grep -rn 'api.typesafe.ai' ~/.pi/agent/scripts ~/.pi/agent/state/lane-verdict.py \
 #         ~/Documents/GitHub/agent-infra/scripts
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
-# ⛔ THE PIN SURVIVES THE HOST MIGRATION (review 2026-10-26). `jev-1.13.0` is VALID on the real
-# API — measured 200 — so nothing forces a model change, and the vendor's own guidance is to
-# send the version ID rather than an alias when thresholds are tuned ("an alias moves when a
-# new release ships"). Every bar in the CALIBRATION table below was measured on 1.13, so 1.13
-# keeps voting. Moving to 1.14 means re-deriving these bars FIRST, as its own recorded
-# decision — not as a side effect of a vendor migration.
-JEV_MODEL = "jev-1.13.0"      # pin: thresholds must not shift under us
+# ⛔ THE MODEL IS THE ALIAS, BY OWNER RULING (2026-10-27): "let's use jev latest".
+#
+# What that accepts, stated here so a later lane does not have to rediscover it: every
+# JEV-SCORED bar in the CALIBRATION table below was calibrated on the LOOKALIKE host's
+# `jev-1.13.0` and not re-measured since the migration (tortoise#7864), so re-deriving it is a
+# FIRST real calibration, not a repeat. `jev-latest` already resolves to `jev-1.14.0` on the live
+# API, so the marks are now scored by a model that moves when the vendor ships, WITHOUT any
+# change to this file — the vendor's own guidance warns
+# exactly about this ("an alias moves when a new release ships ... if you have tuned
+# confidence thresholds against one version, send that version's ID instead of the alias").
+# ⚠️ The consequence is not that the gate stops working; it is that a verdict can shift for a
+# reason no diff explains. The JEV-SCORED bars — `THRESHOLD`, `THRESHOLD_LANGUAGE` and
+# `turn-classify.py`'s `MIN_CONFIDENCE` — are therefore the FIRST thing to re-derive when a
+# verdict looks wrong. ⛔ `THRESHOLD_JARGON` is NOT in that list: it sits over the two MECHANICAL
+# marks (`language_marks()` — no Jev call, see the note at `:132`), so the model cannot move it and
+# re-deriving it after a model-version change measures nothing. Calibration debt for the two
+# Jev-scored bars is recorded on #1476; `MIN_CONFIDENCE` on #2918.
+# ⚠️ Each caller shows the move for ITSELF, and all THREE are asserted — each by a leg that
+# fails when its own site is reverted to the constant: this file's summary line at its PRINT
+# SITE (`test_the_printed_summary_line_reports_the_echoed_version_…`, which drives the real
+# `main()`; the older leg asserted `meta_line()` in ISOLATION, which left the call site
+# uncovered — measured: rebuilding `print(meta_line(result))` from `JEV_MODEL` stayed green),
+# `turn-classify.py`'s `meta["model"]` (the echo leg in `test_turn_classify_state.py`), and
+# `lane-actions.py`'s report header, where `render_md` prints `meta["model"]` as
+# `READ (Jev <version>: …)` (its own leg in `test_lane_actions.py` — NOT the deployed
+# `lane-verdict.py`, which a different leg pins for its constant). The token branch prints the
+# version; the cost-only branch carries none by design. Read that field first: it is the value
+# the RESPONSE carried, never `JEV_MODEL` — the alias we sent.
+# Pinning a version again is a one-line change in EACH of these five copies — a partial re-pin
+# is the same split-brain this round fixed in the other direction — and it needs the bars
+# re-derived on that version FIRST, which is why it is a decision and not a default:
+#   scripts/turn-classify.py · scripts/ask-owner.py ·
+#   ~/.pi/agent/scripts/turn-classify.py · ~/.pi/agent/scripts/ask-owner.py ·
+#   ~/.pi/agent/state/lane-verdict.py
+JEV_MODEL = "jev-latest"      # vendor alias — moves with the vendor, see above
 # ---------------------------------------------------------------------------
 # CALIBRATION — measured, not guessed. One threshold for all seven marks was the
 # first version, and it was wrong for the LANGUAGE marks: they do not have the
@@ -741,6 +769,26 @@ def jev(state):
     except Exception as e:  # noqa: BLE001
         print(f"jev call failed: {e}")
         return None
+
+
+def meta_line(result):
+    """The one summary line: which model judged this question and what it cost in tokens
+    — or just the cost, when the API reports money instead of tokens.
+
+    ⛔ IT EXISTS AS A FUNCTION, AND ITS CALL SITE IS ASSERTED TOO (review 2026-10-27). With the
+    model now a vendor ALIAS, this is where the concrete version is reported — the sent string is
+    always `jev-latest`, and the cost-only branch carries no version at all. The line used to be
+    built inline at its `print`, and the assertion written for it covered only THIS helper in
+    isolation: a regression AT THE CALL SITE — `print(meta_line(result))` rebuilt from
+    `JEV_MODEL` — printed `model=jev-latest`, looked fine, and left the whole suite green
+    (measured). Both halves are pinned now, so neither the helper nor its caller can silently
+    fall back to the alias.
+    """
+    usage = (result or {}).get("usage") or {}
+    if "cost_usd" in usage:
+        return f"cost_usd={usage['cost_usd']}"
+    return (f"model={(result or {}).get('model')} "
+            f"tokens={usage.get('input_tokens')}/{usage.get('output_tokens')}")
 
 
 def verdict(answers):
@@ -1493,12 +1541,7 @@ def main(argv):
     # THE REAL API REPORTS TOKENS, NOT MONEY (`usage` = input_tokens/output_tokens). Print
     # whichever the response actually carried; a missing key is printed as absent rather
     # than as a fabricated 0.
-    usage = result.get("usage") or {}
-    if "cost_usd" in usage:
-        print(f"cost_usd={usage['cost_usd']}")
-    else:
-        print(f"model={result.get('model')} "
-              f"tokens={usage.get('input_tokens')}/{usage.get('output_tokens')}")
+    print(meta_line(result))
     for name, ans in answers.items():
         if ans.get("type") == "noul":
             bar = "" if answers[name].get("noul", 0) >= threshold_for(name) else "  <-- below bar"

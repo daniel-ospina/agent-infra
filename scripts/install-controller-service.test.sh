@@ -119,42 +119,23 @@ arm_root() { # <name> -> echoes the root
 # ── ⛔ NO TEST MAY REACH THE REAL SYSTEM THROUGH AN UNSTUBBED NAME (#2910) ───────────────────────
 # THE DEFECT THIS PRELUDE EXISTS FOR. §B and §F execute a SLICE of `cloud-cell-supervisor.sh` in a
 # fresh `bash -c`, where that script's own helpers do not exist. An unstubbed name then resolves
-# through PATH to a REAL binary: `say` became **/usr/bin/say** (macOS text-to-speech), so the shipped
-# `controller: FOREGROUND — this process is the controller …` banner was READ ALOUD through the
-# speaker — repeatedly, during the owner's live customer call (2026-10-27; `pmset -g assertions`
-# showed `audio-out BuiltInSpeakerDevice` created for the say pid). Nothing failed and nothing was
-# logged: the suite read GREEN while it spoke, so no instrument in CI could ever see it.
+# through PATH to a REAL binary. Measured 2026-10-27 during the owner's live customer call: the
+# supervisor's print helper was called `say`, macOS ships /usr/bin/say (text-to-speech), and the
+# shipped `controller: FOREGROUND — this process is the controller …` banner was READ ALOUD through
+# the speaker (`pmset -g assertions`: `audio-out BuiltInSpeakerDevice` created for the say pid).
+# Nothing failed and nothing was logged: the suite read GREEN while it spoke.
 #
-# Two layers, both asserted (§B/§F assert the first, §O is the contract for both):
-#   1. FRAG_STUBS — ONE shared prelude, prepended to EVERY fragment execution. A per-site hand-written
-#      stub list is how this omission happened: each site stubbed the behaviour helpers it knew about
-#      and none stubbed the output helper, so every helper ADDED to the fragment later starts leaking
-#      to the real system the day it is introduced. Stub the output surface once, here.
-#   2. mk_quiet_bin — a "no side effects" bin dir FIRST on PATH for every fragment run, so even a
-#      helper this prelude does not know about is RECORDED in a file the suite asserts on instead of
-#      being performed.
-# `say` is the only output helper `cloud-cell-supervisor.sh` defines at file scope. `die` is
-# deliberately NOT stubbed: it is behaviour (it exits 1), not output, and stubbing it would change the
-# fragment's real failure paths. `open`/`osascript`/`afplay` are the other macOS binaries that speak
-# or launch, stubbed so no fragment can ever acquire a side effect nobody wrote.
-FRAG_STUBS='say(){ :; }; open(){ :; }; osascript(){ :; }; afplay(){ :; }; '
-
-# mk_quiet_bin <bin dir> <calls file> — the second layer: every system-facing binary a fragment could
-# reach becomes a RECORDER here (appends its argv to <calls file>, exits 0). The fragments put
-# "$<arm>/bin" FIRST on PATH, so this wins over /usr/bin — which is what makes the §B/§F/§O
-# assertions evidence about the real system rather than the absence of a crash.
-mk_quiet_bin() { # <bin dir> <calls file>
-  local bin="$1" calls="$2" n
-  mkdir -p "$bin"; : > "$calls"
-  for n in say open osascript afplay; do
-    cat > "$bin/$n" <<SHIM
-#!/bin/bash
-printf '%s %s\n' "$n" "\$*" >> "$calls"
-exit 0
-SHIM
-    chmod +x "$bin/$n"
-  done
-}
+# ⛔ THE STUBS ARE NOT WRITTEN HERE ANY MORE. #2911 put a stub prelude in THIS file; ~50 minutes after
+# it merged a live lane ran this suite from its own pre-fix worktree and the machine spoke again. A
+# per-file stub list is a CONVENTION, so the next runner forgets it. Both layers now live in ONE file,
+# `scripts/lib/frag-stubs.sh`, and the rename that removes the reason `say` could ever resolve to a
+# binary is in this same change:
+#   1. `FRAG_STUBS` — the names OUR shipped scripts define (now `log_line`). A forgotten definition
+#      fails as `bash: log_line: command not found`: loud, local, silent to the speaker.
+#   2. `mk_quiet_bin` — a RECORDER first on PATH for `say`/`open`/`osascript`/`afplay`, so the real
+#      binary is INTERCEPTED and the calls file is evidence about the real system.
+# §O below is the contract for both halves and is what keeps this file honest about adopting them.
+. "$HERE/lib/frag-stubs.sh" || { printf '❌ cannot source %s/lib/frag-stubs.sh — the fragment prelude is what keeps this suite from SPEAKING (#2910); refusing to run\n' "$HERE" >&2; exit 2; }
 
 # ── the systemd double ──────────────────────────────────────────────────────────────────────────
 # Records EVERY argv (append) so an arm asserts a CALL, and keeps its state in files so an arm can set
@@ -2580,22 +2561,27 @@ grep -qF "$HM/home/o" "$T/hm.out" \
 # §O — a fragment executed in a fresh shell CANNOT reach the real system (#2910)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # THE MEASURED DEFECT. §B and §F execute a SLICE of the shipped supervisor in `bash -c`, where that
-# script's own `say()` does not exist. Nothing stubbed the name, so the shell resolved it through PATH
-# to /usr/bin/say — macOS text-to-speech — and READ `controller: FOREGROUND — this process is the
-# controller …` ALOUD through the speaker, repeatedly, while the owner was on a live customer call
-# (2026-10-27; `pmset -g assertions` showed `audio-out BuiltInSpeakerDevice` created for the say pid).
-# No arm failed and nothing was logged: the suite read GREEN while it spoke, which is why the defect is
-# invisible to CI and to its author and only a human in the room could observe it.
+# script's own helpers do not exist. Nothing stubbed the print helper, and on 2026-10-27 that helper
+# was called `say` — which macOS resolves through PATH to /usr/bin/say, text-to-speech — so the shell
+# READ `controller: FOREGROUND — this process is the controller …` ALOUD through the speaker,
+# repeatedly, while the owner was on a live customer call. `pmset -g assertions` showed `audio-out
+# BuiltInSpeakerDevice` created for the say pid. No arm failed and nothing was logged: the suite read
+# GREEN while it spoke, which is why the defect is invisible to CI and to its author and only a human
+# in the room could observe it.
 #
 # This section is the CONTRACT for the fix, in four parts, and none of them is vacuous:
-#   (1) every file-scope helper the shipped fragment INVOKES is stubbed in the shared prelude — so a
-#       helper ADDED to the fragment later cannot silently start leaking (the "incomplete by
-#       construction" half of the issue: a hand-written per-site list is always one helper behind);
-#   (2) `say` on the fragment PATH is proven to be the RECORDER before any arm runs, so the mutation
-#       arm below can never reach the speaker;
-#   (3) THE MUTATION ARM — with the prelude REMOVED (the state the suite shipped in) the same fragment
-#       must reach `say` and record the banner: that is what makes (4) able to fail;
-#   (4) with the prelude, the same fragment reaches no `say` at all.
+#   (1) every file-scope helper the shipped fragment INVOKES is stubbed in the SHARED prelude
+#       (`scripts/lib/frag-stubs.sh`) — so a helper ADDED to the fragment later cannot silently start
+#       leaking (the "incomplete by construction" half of the issue: a per-site list is always one
+#       helper behind, which is exactly how #2911's in-file prelude was bypassed by its own worktree);
+#   (2) `say` on the fragment PATH is proven to be the RECORDER before any arm runs, and the arms below
+#       are REFUSED rather than run if it is not — the regression test for a test that speaks must
+#       never speak;
+#   (3) THE MUTATION ARM — with the prelude REMOVED (the state the suite shipped in, and the state a
+#       forgotten definition reaches) the SAME fragment now fails LOUDLY and LOCALLY: `log_line:
+#       command not found` on stderr, and NOTHING on the speaker. That inversion is the point of the
+#       rename: an omission used to be inaudible and now it is a red line with a name in it;
+#   (4) with the prelude, the same fragment reaches no `say` at all and prints no such line.
 say_case 'a fragment executed in a fresh shell cannot reach the real system binaries (#2910)'
 O="$(arm_root o)"; mk_quiet_bin "$O/bin" "$O/say.calls"
 mkdir -p "$O/o/roles"
@@ -2626,49 +2612,66 @@ done
 # The behaviour stubs are IDENTICAL in both arms below: the ONLY difference between the mutation arm and
 # the fixed arm is the stub prelude, which is exactly the change under test.
 FRAG_BEHAVIOUR='start_doctor_loop() { :; }; superseded() { return 1; }; '
-# frag_say_calls <prelude> -> the number of times the RECORDER `say` was reached by the shipped fragment
-frag_say_calls() { # <prelude>
+# frag_run <prelude> <tag> -> prints how many times the RECORDER `say` was reached, and leaves the
+# fragment's stdout/stderr in "$O/<tag>.out" / "$O/<tag>.err" so an arm can assert on the loud failure.
+frag_run() { # <prelude> <tag>
   : > "$O/say.calls"
   bnd env ORCH_FOREGROUND=1 CELL_HOME="$O/home" HOME="$O/home" O="$O/o" REPO="$O/repo" \
       OR="daniel-ospina/agent-infra" SCOPE=own ENV_FILE="$O/home/keys.env" ROLES_DIR="$O/o/roles" \
       HARNESS="$O/harness" HARNESS_REPO=daniel-ospina/agent-infra SUP_SELF="$SUP" \
-      PATH="$O/bin:/usr/bin:/bin" bash -c "$1$FRAG_BEHAVIOUR$(cat "$FRAG")" >/dev/null 2>&1 || true
+      PATH="$O/bin:/usr/bin:/bin" bash -c "$1$FRAG_BEHAVIOUR$(cat "$FRAG")" >"$O/$2.out" 2>"$O/$2.err" || true
   wc -l < "$O/say.calls" 2>/dev/null | tr -d ' '
 }
 
 # ⛔ (2) THE PREMISE IS MEASURED, NOT ASSUMED: the name must resolve to the RECORDER. If it ever does
-# not, the mutation arm is REFUSED rather than run — the one failure mode this section must never have
+# not, every arm below is REFUSED rather than run — the one failure mode this section must never have
 # is "the regression test for a test that speaks" speaking.
 O_SAY="$(env PATH="$O/bin:/usr/bin:/bin" bash -c 'command -v say' 2>/dev/null)"
-O_MUT=0
+O_OK=0
 case "$O_SAY" in
-  "$O/bin/say") ok '§O: `say` on the fragment PATH IS the recorder, so the mutation arm below records and never speaks' ;;
-  *) bad "§O: refusing the mutation arm — `say` resolves to '${O_SAY:-<none>}', not the recorder at $O/bin/say" ;;
+  "$O/bin/say") O_OK=1; ok '§O: `say` on the fragment PATH IS the recorder, so the arms below record and never speak' ;;
+  *) bad "§O: refusing the arms below — `say` resolves to '${O_SAY:-<none>}', not the recorder at $O/bin/say" ;;
 esac
+
+# ⛔ (2b) THE RECORDER IS PROVEN LIVE, so "0 calls" below is a MEASUREMENT and not an empty file nobody
+# writes to. This is the arm that makes every "reaches no say" assertion able to fail.
+if [ "$O_OK" = 1 ]; then
+  : > "$O/say.calls"
+  env PATH="$O/bin:/usr/bin:/bin" bash -c 'say "§O liveness probe"' >/dev/null 2>&1 || true
+  [ "$(wc -l < "$O/say.calls" | tr -d ' ')" -ge 1 ] \
+    && ok '§O: the recorder DOES record a `say` call (so an empty calls file below is evidence, not silence)' \
+    || bad '§O: the recorder recorded nothing for a bare `say` — the "no calls" arms below are VACUOUS (#2910)'
+fi
 
 # ⛔ (3) THE MUTATION ARM — THE ASSERTIONS BELOW CAN FAIL, AND THIS PROVES IT. `''` is the prelude
-# REMOVED, i.e. the code the suite shipped: same fragment, same fixture, same PATH. What it must now
-# produce is a RECORD of the banner call instead of a voice.
-if [ "$O_SAY" = "$O/bin/say" ]; then O_MUT="$(frag_say_calls '')"; fi
-[ "${O_MUT:-0}" -ge 1 ] \
-  && ok "§O: MUTATION (stub prelude removed): the shipped fragment DOES reach \`say\` (${O_MUT} call(s)) — the leak is real, so the arm below can fail" \
-  || bad "§O: MUTATION (stub prelude removed) reached \`say\` ${O_MUT:-0} time(s) — the fragment no longer prints or the recorder is not on PATH, which would make the arm below VACUOUS"
-case "$(cat "$O/say.calls" 2>/dev/null)" in
-  *'controller: FOREGROUND'*) ok '§O: …and what it reached is the shipped BANNER (`controller: FOREGROUND`), the exact string the speaker read aloud on the live call' ;;
-  *) bad "§O: the mutation arm did not record the shipped banner — $(head -2 "$O/say.calls" 2>/dev/null) (#2910)" ;;
+# REMOVED, i.e. the state the suite shipped in and the state any runner that forgets a definition
+# reaches. What it must now produce is a LOUD, LOCAL, ATTRIBUTABLE failure on stderr — and NO voice.
+O_MUT=0
+if [ "$O_OK" = 1 ]; then O_MUT="$(frag_run '' mut)"; fi
+case "$(cat "$O/mut.err" 2>/dev/null)" in
+  *'log_line: command not found'*) ok '§O: MUTATION (prelude removed): the fragment fails LOUDLY and LOCALLY — `log_line: command not found` on stderr, with the name in the message' ;;
+  *) bad "§O: MUTATION (prelude removed) did not produce 'log_line: command not found' — got: $(head -2 "$O/mut.err" 2>/dev/null) (#2910)" ;;
 esac
+[ "${O_MUT:-0}" -eq 0 ] \
+  && ok '§O: …and the SAME unstubbed fragment reaches NO say at all — the omission is a red line, not a voice on a live call' \
+  || bad "§O: the unstubbed fragment still reached the real \`say\` ${O_MUT} time(s): $(head -2 "$O/say.calls") (#2910)"
 
-# ⛔ (4) THE CONTRACT: with the shared prelude the SAME fragment reaches NO `say` at all — nothing it
-# prints can become a system call.
-O_FIXED="$(frag_say_calls "$FRAG_STUBS")"
+# ⛔ (4) THE CONTRACT: with the shared prelude the SAME fragment reaches NO `say` at all and prints no
+# missing-command line — nothing it prints can become a system call.
+O_FIXED=0
+if [ "$O_OK" = 1 ]; then O_FIXED="$(frag_run "$FRAG_STUBS" fix)"; fi
 [ "${O_FIXED:-0}" -eq 0 ] \
   && ok '§O: with the shared FRAG_STUBS prelude the same fragment reaches NO say at all — a test cannot speak' \
-  || bad "§O: the shared prelude did NOT silence the fragment — ${O_FIXED} call(s) still reached the recorder: $(head -2 "$O/say.calls") (#2910)"
-# …and the recording layer is not `say`-only, so a future helper that shells out to one of these is
-# caught by the same file rather than by a human in the room.
-case "$FRAG_STUBS" in
-  *'open(){'*'osascript(){'*'afplay(){'*) ok '§O: the recorder covers the other macOS binaries a fragment could reach (open/osascript/afplay), not just `say`' ;;
-  *) bad '§O: a fragment could still reach open/osascript/afplay — the no-side-effects layer is `say`-only' ;;
+  || bad "§O: the shared prelude did NOT silence the fragment — ${O_FIXED} call(s) reached the recorder: $(head -2 "$O/say.calls") (#2910)"
+case "$(cat "$O/fix.err" 2>/dev/null)" in
+  *'command not found'*) bad "§O: with the prelude the fragment still hit a missing command — the prelude does not cover it: $(head -2 "$O/fix.err")" ;;
+  *) ok '§O: and it hit no missing command — the prelude covers every helper the shipped fragment invokes' ;;
+esac
+# …and the SYSTEM-binary layer is not `say`-only, so a fragment that shells out to one of these is caught
+# by the recorder rather than by a human in the room.
+case "$FRAG_SYSTEM_CALLS" in
+  *say*open*osascript*afplay*) ok '§O: the recorder covers the other macOS binaries a fragment could reach (open/osascript/afplay), not just `say`' ;;
+  *) bad "§O: a fragment could still reach a system binary unrecorded — FRAG_SYSTEM_CALLS='$FRAG_SYSTEM_CALLS' (#2910)" ;;
 esac
 
 printf '\n────────────────────────────────────────────\n'

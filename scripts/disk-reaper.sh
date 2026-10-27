@@ -240,7 +240,7 @@ SKIPPED_WT=""; SKIPPED_WT_N=0
 # of #2036 — see the exit-code table above.
 MISCONFIG=""
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 log() { printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true; }
 die() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
 
@@ -382,8 +382,8 @@ kv_field() {
 print_status() {
     local epoch mode ok rc freed iso age status
     if [ ! -f "$STATUS" ]; then
-        say "status=never"
-        say "detail=no pass has been recorded at $STATUS"
+        log_line "status=never"
+        log_line "detail=no pass has been recorded at $STATUS"
         return 3
     fi
     epoch="$(status_field epoch)"; mode="$(status_field mode)"; ok="$(status_field ok)"
@@ -404,48 +404,48 @@ print_status() {
     else
         status=failed
     fi
-    say "status=$status"
-    say "epoch=$epoch"
-    say "iso=$iso"
-    say "age_seconds=$age"
-    say "mode=$mode"
-    say "watchdog=$(status_field watchdog)"
-    say "rc=$rc"
-    say "freed_mb=$freed"
-    say "freed_mb_uv=$(status_field freed_mb_uv)"
-    say "freed_mb_venv=$(status_field freed_mb_venv)"
-    say "freed_mb_worktree=$(status_field freed_mb_worktree)"
-    say "freed_mb_duplicate_install=$(status_field freed_mb_duplicate_install)"
-    say "freed_mb_unmeasured=$(status_field freed_mb_unmeasured)"
-    say "would_free_mb_uv=$(status_field would_free_mb_uv)"
-    say "would_free_mb_venv=$(status_field would_free_mb_venv)"
-    say "would_free_mb_worktree=$(status_field would_free_mb_worktree)"
-    say "would_free_mb_duplicate_install=$(status_field would_free_mb_duplicate_install)"
-    say "candidates_uv=$(status_field candidates_uv)"
-    say "candidates_venv=$(status_field candidates_venv)"
-    say "candidates_worktree=$(status_field candidates_worktree)"
-    say "classified_venv=$(status_field classified_venv)"
-    say "preserved_venv=$(status_field preserved_venv)"
-    say "classified_worktree=$(status_field classified_worktree)"
-    say "preserved_worktree=$(status_field preserved_worktree)"
-    say "preserved_reasons_worktree=$(status_field preserved_reasons_worktree)"
-    say "main_proof=$(status_field main_proof)"
-    say "pr_merged=$(status_field pr_merged)"
-    say "candidates_duplicate_install=$(status_field candidates_duplicate_install)"
-    say "verdict_uv=$(status_field verdict_uv)"
-    say "verdict_venv=$(status_field verdict_venv)"
-    say "verdict_worktree=$(status_field verdict_worktree)"
+    log_line "status=$status"
+    log_line "epoch=$epoch"
+    log_line "iso=$iso"
+    log_line "age_seconds=$age"
+    log_line "mode=$mode"
+    log_line "watchdog=$(status_field watchdog)"
+    log_line "rc=$rc"
+    log_line "freed_mb=$freed"
+    log_line "freed_mb_uv=$(status_field freed_mb_uv)"
+    log_line "freed_mb_venv=$(status_field freed_mb_venv)"
+    log_line "freed_mb_worktree=$(status_field freed_mb_worktree)"
+    log_line "freed_mb_duplicate_install=$(status_field freed_mb_duplicate_install)"
+    log_line "freed_mb_unmeasured=$(status_field freed_mb_unmeasured)"
+    log_line "would_free_mb_uv=$(status_field would_free_mb_uv)"
+    log_line "would_free_mb_venv=$(status_field would_free_mb_venv)"
+    log_line "would_free_mb_worktree=$(status_field would_free_mb_worktree)"
+    log_line "would_free_mb_duplicate_install=$(status_field would_free_mb_duplicate_install)"
+    log_line "candidates_uv=$(status_field candidates_uv)"
+    log_line "candidates_venv=$(status_field candidates_venv)"
+    log_line "candidates_worktree=$(status_field candidates_worktree)"
+    log_line "classified_venv=$(status_field classified_venv)"
+    log_line "preserved_venv=$(status_field preserved_venv)"
+    log_line "classified_worktree=$(status_field classified_worktree)"
+    log_line "preserved_worktree=$(status_field preserved_worktree)"
+    log_line "preserved_reasons_worktree=$(status_field preserved_reasons_worktree)"
+    log_line "main_proof=$(status_field main_proof)"
+    log_line "pr_merged=$(status_field pr_merged)"
+    log_line "candidates_duplicate_install=$(status_field candidates_duplicate_install)"
+    log_line "verdict_uv=$(status_field verdict_uv)"
+    log_line "verdict_venv=$(status_field verdict_venv)"
+    log_line "verdict_worktree=$(status_field verdict_worktree)"
     # ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST. `skipped_worktree=` is the whole point of
     # #2443 (WHICH repo was skipped and WHY); leaving it out of `--print-status` would repeat the
     # `classes=`/`repos=` defect this block already documents — written every pass, read by nobody.
-    say "skipped_worktree=$(status_field skipped_worktree)"
+    log_line "skipped_worktree=$(status_field skipped_worktree)"
     # `classes=` and `repos=` were WRITTEN every pass and read by nobody, so "which sinks and which
     # checkouts did the last pass actually cover" — the first question after a bring-up changes
     # DISK_REAPER_REPOS — had no answer on any surface. The record is this feature's verdict channel,
     # so everything in it must be reachable from the reader.
-    say "classes=$(status_field classes)"
-    say "repos=$(status_field repos)"
-    say "detail=$(status_field detail)"
+    log_line "classes=$(status_field classes)"
+    log_line "repos=$(status_field repos)"
+    log_line "detail=$(status_field detail)"
     # Exit vocabulary matches the pass: 0 ok, 3 failed/stale/never. A `[ ... ]` here would return 1,
     # which no caller's case arm handles and which reads as "usage error" to a human.
     case "$status" in ok) return 0 ;; *) return 3 ;; esac
@@ -886,7 +886,7 @@ acquire_lock() {
     # reason (a full or read-only state dir) there is no token, `file_mtime` on a missing dir is empty so
     # `age=0`, and the contention arm below reported it BENIGN (exit 6, unit GREEN) — a box that can never
     # reap, certified. The lock dir's ABSENCE after a failed mkdir is the discriminator.
-    [ -e "$LOCK_DIR" ] || { say "disk-reaper: cannot create $LOCK_DIR (filesystem problem: full, read-only?) — refusing to run without mutual exclusion"; exit 4; }
+    [ -e "$LOCK_DIR" ] || { log_line "disk-reaper: cannot create $LOCK_DIR (filesystem problem: full, read-only?) — refusing to run without mutual exclusion"; exit 4; }
     owner="$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     owner_started="$(sed -n 's/.*started=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     owner_lstart="$(sed -n 's/.*lstart=//p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
@@ -907,16 +907,16 @@ acquire_lock() {
         # A permanent false block is recoverable (remove the stale lock, name it on the unit); a broken
         # live lock is not. Recorded here because the trade is deliberate, not an oversight.
         if [ -z "$owner_lstart" ] || [ -z "$now_lstart" ] || [ "$owner_lstart" = "$now_lstart" ]; then
-            say "disk-reaper: another pass holds the lock ($LOCK_DIR, pid $owner${owner_started:+, started $owner_started}) — not running (benign: the other pass is doing this hour's work)"
+            log_line "disk-reaper: another pass holds the lock ($LOCK_DIR, pid $owner${owner_started:+, started $owner_started}) — not running (benign: the other pass is doing this hour's work)"
             exit 6
         fi
-        say "disk-reaper: lock owner pid $owner is a RECYCLED pid (start time '$now_lstart' != '$owner_lstart') — the recorded pass is gone"
+        log_line "disk-reaper: lock owner pid $owner is a RECYCLED pid (start time '$now_lstart' != '$owner_lstart') — the recorded pass is gone"
         ABANDONED=1
     fi
     if [ "$age" -gt "$LOCK_STALE_SECONDS" ]; then
-        say "disk-reaper: removing STALE lock ($LOCK_DIR, ${age}s old, pid ${owner:-?} gone)"
+        log_line "disk-reaper: removing STALE lock ($LOCK_DIR, ${age}s old, pid ${owner:-?} gone)"
         rm -rf "$LOCK_DIR" 2>/dev/null || true
-        mkdir "$LOCK_DIR" 2>/dev/null || { say "disk-reaper: cannot take the lock — refusing to run without mutual exclusion"; exit 4; }
+        mkdir "$LOCK_DIR" 2>/dev/null || { log_line "disk-reaper: cannot take the lock — refusing to run without mutual exclusion"; exit 4; }
         printf 'pid=%s started=%s lstart=%s\n' "$$" "$(now)" "$(proc_lstart $$)" >"$LOCK_DIR/token" 2>/dev/null || true
         LOCK_HELD=1
         return 0
@@ -925,9 +925,9 @@ acquire_lock() {
     # owner is GONE, so falling through to "held by pid X" contradicted it in the next line: there is no
     # holder, only a lock too young to break.
     if [ "${ABANDONED:-0}" = 1 ]; then
-        say "disk-reaper: the lock at $LOCK_DIR is ABANDONED (its recorded owner is gone) and is only ${age}s old (< ${LOCK_STALE_SECONDS}s) — this pass skips; it self-heals on the next one past the bound"
+        log_line "disk-reaper: the lock at $LOCK_DIR is ABANDONED (its recorded owner is gone) and is only ${age}s old (< ${LOCK_STALE_SECONDS}s) — this pass skips; it self-heals on the next one past the bound"
     else
-        say "disk-reaper: lock $LOCK_DIR is held by pid ${owner:-?} (${age}s) — not running (benign)"
+        log_line "disk-reaper: lock $LOCK_DIR is held by pid ${owner:-?} (${age}s) — not running (benign)"
     fi
     exit 6
 }
@@ -1065,7 +1065,7 @@ check_peer_locks() {
         same_file "$cand" "$LOCK_DIR" && continue
         peer_lock_live "$cand" || continue
         owner="$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$cand/token" 2>/dev/null | head -1)"
-        say "disk-reaper: another pass holds a lock this pass must not run beside ($cand, pid ${owner:-?}) — refusing to run on $LOCK_DIR: a fallback pass hands the delegates this state dir, so their locks would not exclude two concurrent reaps of the same caches"
+        log_line "disk-reaper: another pass holds a lock this pass must not run beside ($cand, pid ${owner:-?}) — refusing to run on $LOCK_DIR: a fallback pass hands the delegates this state dir, so their locks would not exclude two concurrent reaps of the same caches"
         release_lock
         exit 6
     done <<<"$(peer_lock_dirs)"
@@ -1228,7 +1228,7 @@ to_mb() {
 reap_uv() {
     local before after delta path would count=0 cands="" line size bound
     if [ -z "$CACHE_REAPER_PATH" ]; then
-        say "disk-reaper: ⛔ class=uv FAIL-CLOSED — pi-cache-reap.sh not found (looked at \$CACHE_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
+        log_line "disk-reaper: ⛔ class=uv FAIL-CLOSED — pi-cache-reap.sh not found (looked at \$CACHE_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
         NOTE_UV="pi-cache-reap.sh not found"; RC_UV=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }uv-delegate-missing"
         # It did not RUN: `WANT_*=0` makes the record say `not-run` (not a measured zero), the verdict
         # says `misconfigured` (not `refused` — that word is for a delegate that RAN and said no), and
@@ -1306,15 +1306,15 @@ reap_uv() {
     # A class that did not finish ok must say so in the record's `detail`, or the supervisor prints
     # `ok=0 detail=ok` — a self-contradicting line is worse than no line.
     [ "$RC_UV" = 0 ] || NOTE_UV="${NOTE_UV:-$(note_for pi-cache-reap.sh "$UV_RAW_RC" uv)}"
-    say "$CLASS_OUT"
-    [ -n "$cands" ] && say "$cands"
+    log_line "$CLASS_OUT"
+    [ -n "$cands" ] && log_line "$cands"
     if is_dry; then
-        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$(_tally_num "$HAVE_UV_CAND" "$CAND_UV") would_free_du=${WOULD_UV}MB (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh) freed_df=0MB"
+        log_line "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$(_tally_num "$HAVE_UV_CAND" "$CAND_UV") would_free_du=${WOULD_UV}MB (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh) freed_df=0MB"
     else
         if [ "${DF_UV_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=${FREED_UV}MB df_raw=${RAW_UV}MB (df delta on $path)"
+            log_line "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=${FREED_UV}MB df_raw=${RAW_UV}MB (df delta on $path)"
         else
-            say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
+            log_line "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
         fi
     fi
     return 0
@@ -1343,7 +1343,7 @@ resolve_repos() {
         if ! tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" git -C "$r" rev-parse --git-dir >/dev/null 2>&1; then
             # An explicit --repo is the operator's assertion, so a rejected one must be named (the
             # same rule find_delegate applies to a set-but-missing delegate override).
-            say "disk-reaper: WARNING: ignoring '$r' — not a git checkout, so a class cannot scan it"
+            log_line "disk-reaper: WARNING: ignoring '$r' — not a git checkout, so a class cannot scan it"
             continue
         fi
         REPOS="${REPOS}${REPOS:+
@@ -1367,12 +1367,12 @@ reap_venv() {
     local sum_v_classified=0 sum_v_cand=0 sum_v_pres=0 have_venv_tally=0 _vsum="" _vn2="" _vf="" _vr=""
     local venv_repos=0 venv_tally_repos=0
     if [ -z "$VENV_REAPER_PATH" ]; then
-        say "disk-reaper: ⛔ class=venv FAIL-CLOSED — reap-lane-venvs.sh not found (agent-infra PR #1949 owns this policy)"
+        log_line "disk-reaper: ⛔ class=venv FAIL-CLOSED — reap-lane-venvs.sh not found (agent-infra PR #1949 owns this policy)"
         NOTE_VENV="reap-lane-venvs.sh not found"; RC_VENV=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }venv-delegate-missing"
         WANT_VENV=0; VERDICT_VENV="misconfigured"; DF_VENV_OK=1; return 3
     fi
     if ! resolve_repos; then
-        say "disk-reaper: ⛔ class=venv FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS); a class that scans nothing is NOT a pass"
+        log_line "disk-reaper: ⛔ class=venv FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS); a class that scans nothing is NOT a pass"
         NOTE_VENV="no repo to scan"; RC_VENV=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }venv-no-repo"
         WANT_VENV=0; VERDICT_VENV="misconfigured"; DF_VENV_OK=1; return 3
     fi
@@ -1390,7 +1390,7 @@ reap_venv() {
         else
             MEASURED=0
         fi
-        say "$out"
+        log_line "$out"
         rows="${rows}${rows:+$'\n'}$out"
         # This repo's own tally. A non-numeric or absent field is "no answer", never 0: the caller
         # keeps the fallback and `detail=` still says the class did not finish.
@@ -1502,17 +1502,17 @@ reap_venv() {
         # (which the scan handles). Never the partial sum: it is a lower bound, and printing it here
         # suppressed this fallback and reported a scanned candidate as `0`.
         [ "$VENV_FULL_COVER" = 1 ] || CAND_VENV="$all_c"
-        [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=dry-run candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") would_free_du=${WOULD_VENV}MB (du estimate) freed_df=0MB"
+        [ -n "$cands" ] && log_line "$cands"
+        log_line "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=dry-run candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") would_free_du=${WOULD_VENV}MB (du estimate) freed_df=0MB"
     else
         # ⛔ `candidates=` IS NOT OURS TO ASSUME IN AN ARMED PASS. It is the delegate's own `reapable=`
         # (the armed pass already performed its `REAP` rows, so no row scan exists to fall back on),
         # and a delegate that printed nothing left the initialised 0 to print as a MEASURED zero —
         # beside a record that correctly said `?` (a review cycle caught the two surfaces disagreeing).
         if [ "${DF_VENV_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") freed_df=${FREED_VENV}MB df_raw=${RAW_VENV}MB (df delta)"
+            log_line "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") freed_df=${FREED_VENV}MB df_raw=${RAW_VENV}MB (df delta)"
         else
-            say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
+            log_line "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
         fi
     fi
     return 0
@@ -1541,7 +1541,7 @@ reap_abandoned_arm() {
     local roots root b a d out rc _r _root_rem
     AW_FREED=0; AW_RAW=0; AW_MEASURED=1; AW_OUT=""; AW_NOTE=""; AW_REAPED=0; AW_SETUP_FAIL=0
     if [ -z "$ABANDONED_WT_REAPER_PATH" ]; then
-        say "disk-reaper: ⛔ class=worktree arm=abandoned FAIL-CLOSED — reap-abandoned-worktrees.sh not found (looked at \$ABANDONED_WT_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
+        log_line "disk-reaper: ⛔ class=worktree arm=abandoned FAIL-CLOSED — reap-abandoned-worktrees.sh not found (looked at \$ABANDONED_WT_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
         AW_NOTE="abandoned-worktree owner missing"
         # ⛔ SET, or the `misconfigured` verdict this arm exists for never happens (the guard read a
         # variable nothing assigned and the record still said `fail-closed` — "the delegate RAN").
@@ -1579,7 +1579,7 @@ reap_abandoned_arm() {
         _r="$(sed -n 's/.* reaped=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | head -1)"
         case "${_r:-}" in ''|*[!0-9]*) _r=0 ;; esac
         AW_REAPED=$((AW_REAPED + _r))
-        say "$out"
+        log_line "$out"
         AW_OUT="${AW_OUT}${AW_OUT:+$'\n'}$out"
         RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
         if [ "$rc" -gt 0 ]; then
@@ -1624,11 +1624,11 @@ reap_worktree() {
     # is exactly the shape that reads as "healthy, nothing to do" on a pass that produced no answer.
     local have_tally=0 REASON_ROWS="" wt_repos=0 wt_tally_repos=0 wt_reasons_repos=0 reasons_none_repos=0 sum_deferred_remove=0
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
-        say "disk-reaper: ⛔ class=worktree arm=registered FAIL-CLOSED — pi-reap-worktrees.sh not found (the abandoned arm still runs: it needs no repo)"
+        log_line "disk-reaper: ⛔ class=worktree arm=registered FAIL-CLOSED — pi-reap-worktrees.sh not found (the abandoned arm still runs: it needs no repo)"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
         REPO_ARM_OK=0; REPOS=""
     elif ! resolve_repos; then
-        say "disk-reaper: ⛔ class=worktree arm=registered FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS); the abandoned arm still runs: it needs no repo"
+        log_line "disk-reaper: ⛔ class=worktree arm=registered FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS); the abandoned arm still runs: it needs no repo"
         NOTE_WT="no repo to scan"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-no-repo"
         REPO_ARM_OK=0; REPOS=""
     fi
@@ -1726,7 +1726,7 @@ reap_worktree() {
             _v="$(kv_field "$_sum" pr_merged)"
             if [ -n "$_v" ]; then if [ -z "$prm" ]; then prm="$_v"; elif [ "$prm" != "$_v" ]; then prm="mixed"; fi; fi
         fi
-        say "$out"
+        log_line "$out"
         rows="${rows}${rows:+$'\n'}$out"
         # ⛔ A REPO THE OPEN-PR GATE CANNOT VERIFY IS SKIPPED BY NAME — never the whole class, and never
         # a silent absence. The delegate fails closed for ONE repo (its checkouts untouched, which is
@@ -1743,7 +1743,7 @@ reap_worktree() {
         if [ -n "$_skip" ]; then
             SKIPPED_WT_N=$((SKIPPED_WT_N + 1))
             SKIPPED_WT="${SKIPPED_WT}${SKIPPED_WT:+, }${repo}[${_skip}]"
-            say "disk-reaper: class=worktree skipped=$repo reason=$_skip — this repo's checkouts are UNTOUCHED (fail closed); the class kept going for the other repos"
+            log_line "disk-reaper: class=worktree skipped=$repo reason=$_skip — this repo's checkouts are UNTOUCHED (fail closed); the class kept going for the other repos"
         fi
         RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
         # Same rule as the venv class: one entry per DISTINCT code, appended, delegate code first.
@@ -1924,17 +1924,17 @@ reap_worktree() {
             fi
         done <<<"$rows"
         CAND_WT="$all_c"
-        [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=dry-run candidates=$(_tally_num "$HAVE_WT_CAND" "$CAND_WT") would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+        [ -n "$cands" ] && log_line "$cands"
+        log_line "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=dry-run candidates=$(_tally_num "$HAVE_WT_CAND" "$CAND_WT") would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
     else
         # `candidates_worktree` used to be structurally 0 on an ARMED pass (it was only accumulated in
         # the dry-run branch), so the record answered "no candidates" for a pass that classified fifty.
         # Lift the delegate's `remove=` instead of re-deriving it.
         CAND_WT="$sum_remove"
         if [ "${DF_WT_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+            log_line "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
         else
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+            log_line "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
         fi
     fi
     # An ANSWERED `reasons=none` is normalised ABOVE, before the class line prints it (a fix applied
@@ -1961,7 +1961,7 @@ reap_dup() {
     local _dup_cand=0 _dup_ans=0 _dup_roots=0 _dup_sum_line="" _dup_c="" _dup_census=""
     local sweep_end swept
     if [ -z "$DUP_INSTALL_REAPER_PATH" ]; then
-        say "disk-reaper: ⛔ class=duplicate-install FAIL-CLOSED — reap-duplicate-installs.sh not found (looked at \$DUP_INSTALL_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
+        log_line "disk-reaper: ⛔ class=duplicate-install FAIL-CLOSED — reap-duplicate-installs.sh not found (looked at \$DUP_INSTALL_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
         NOTE_DUP="reap-duplicate-installs.sh not found"; RC_DUP=3
         MISCONFIG="${MISCONFIG}${MISCONFIG:+, }duplicate-install-delegate-missing"
         WANT_DUP=0; VERDICT_DUP="misconfigured"; DF_DUP_OK=1; return 3
@@ -1995,7 +1995,7 @@ reap_dup() {
         _r="$(sed -n 's/.* reaped=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | head -1)"
         case "${_r:-}" in ''|*[!0-9]*) _r=0 ;; esac
         reaped=$((reaped + _r))
-        say "$out"
+        log_line "$out"
         rows="${rows}${rows:+$'\n'}$out"
         # ⛔ THE OWNER'S OWN COUNT, lifted per root and SUMMED (never the first root's, never
         # re-derived from row counts). `reap-duplicate-installs.sh` prints `SUMMARY … candidates=<n>` in
@@ -2078,13 +2078,13 @@ reap_dup() {
         # shape. Evidence is a `remove` row we scanned, or the owner's own `census=ok` tally.
         CAND_DUP="$all_c"
         { [ "$all_c" -gt 0 ] || { [ "$_dup_ans" -gt 0 ] && [ "$_dup_ans" = "$_dup_roots" ]; }; } && HAVE_DUP_CAND=1
-        [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=dry-run candidates=$(_tally_num "$HAVE_DUP_CAND" "$CAND_DUP") would_free_du=${WOULD_DUP}MB (du estimate) freed_df=0MB tally=${DUP_TALLY_COVER}"
+        [ -n "$cands" ] && log_line "$cands"
+        log_line "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=dry-run candidates=$(_tally_num "$HAVE_DUP_CAND" "$CAND_DUP") would_free_du=${WOULD_DUP}MB (du estimate) freed_df=0MB tally=${DUP_TALLY_COVER}"
     else
         if [ "${DF_DUP_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=apply freed_df=${FREED_DUP}MB df_raw=${RAW_DUP}MB (df delta) tally=${DUP_TALLY_COVER}"
+            log_line "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=apply freed_df=${FREED_DUP}MB df_raw=${RAW_DUP}MB (df delta) tally=${DUP_TALLY_COVER}"
         else
-            say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) tally=${DUP_TALLY_COVER}"
+            log_line "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) tally=${DUP_TALLY_COVER}"
         fi
     fi
     return 0
@@ -2101,20 +2101,20 @@ acquire_lock
 # stat, not an enumeration, so no hermeticity cost.
 check_peer_locks
 {
-    say "disk-reaper: pass start mode=$MODE_TEXT only=$ONLY aged=${WT_AGED_DAYS}d venv_min_age=${VENV_MIN_AGE}s pid=$$"
+    log_line "disk-reaper: pass start mode=$MODE_TEXT only=$ONLY aged=${WT_AGED_DAYS}d venv_min_age=${VENV_MIN_AGE}s pid=$$"
     # The bounding MECHANISM is disclosed only when it is not GNU `timeout`: on a host that has it,
     # this pass's report is byte-for-byte what it was before #2046 (and the mechanism is in the pass
     # record either way). On macOS this is the line that says the bound is real rather than a
     # fail-closed no-op — the absence is visible WHERE IT MATTERS, without being fatal.
     if [ "${TB_TIMEOUT_KIND:-}" != "timeout" ]; then
-        say "disk-reaper: watchdog=$TB_TIMEOUT_KIND — $(tb_watchdog_description); a timeout is still reported as rc=124 (fail-closed)"
+        log_line "disk-reaper: watchdog=$TB_TIMEOUT_KIND — $(tb_watchdog_description); a timeout is still reported as rc=124 (fail-closed)"
     fi
     log "==== pass start mode=$MODE_TEXT only=$ONLY repos=${REPOS:-<resolved per class>} ===="
     log "watchdog: ${TB_TIMEOUT_KIND:-unknown} ($(tb_watchdog_description))"
     # The fallback is said in the PASS LOG too, not only on stderr before it: the log is the artifact an
     # operator reads after the fact, and "which filesystem held this pass's lock" decides whether its
     # `df` deltas can be credited to it (agent-infra#2443).
-    [ -n "$STATE_DIR_PRIMARY_NOTE" ] && say "disk-reaper: ⚠ state dir fallback — configured $STATE_DIR_PRIMARY is unusable ($STATE_DIR_PRIMARY_NOTE); lock/log/scratch/record on $STATE_DIR, and the three delegates were given it too"
+    [ -n "$STATE_DIR_PRIMARY_NOTE" ] && log_line "disk-reaper: ⚠ state dir fallback — configured $STATE_DIR_PRIMARY is unusable ($STATE_DIR_PRIMARY_NOTE); lock/log/scratch/record on $STATE_DIR, and the three delegates were given it too"
     log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING} abandoned=${ABANDONED_WT_REAPER_PATH:-MISSING} dup-install=${DUP_INSTALL_REAPER_PATH:-MISSING}"
 } | tee -a "$LOG"
 
@@ -2186,13 +2186,13 @@ for _cv in VENV WT UV DUP; do
     [ "$_ch" = 1 ] || CAND_TOTAL="?"
 done
 if is_dry; then
-    say "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT + WOULD_DUP ))MB candidates=$CAND_TOTAL — NOTHING was removed"
+    log_line "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT + WOULD_DUP ))MB candidates=$CAND_TOTAL — NOTHING was removed"
 else
     # third arg: was the class SELECTED at all? not-run is a third state, distinct from both
     # "measured zero" and "unmeasured".
     _pc() { [ "${3:-1}" = 1 ] || { printf 'not-run'; return 0; }
             [ "${1:-0}" = 1 ] && printf '%sMB' "$2" || printf 'unmeasured'; }
-    say "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$TOTAL" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP"))${UNMEASURED:+ — df could not measure: $UNMEASURED (not a measured zero)}"
+    log_line "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$TOTAL" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP"))${UNMEASURED:+ — df could not measure: $UNMEASURED (not a measured zero)}"
 fi
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────
@@ -2302,11 +2302,11 @@ else
 fi
 write_record "$RECORD_DIR" 2>/dev/null \
     || { if [ "$RECORD_DIR" != "$STATE_DIR" ] && write_record "$STATE_DIR"; then
-             say "disk-reaper: ⚠ cannot write the pass record to $RECORD_DIR — it is at $STATE_DIR/disk-reaper.status instead"
+             log_line "disk-reaper: ⚠ cannot write the pass record to $RECORD_DIR — it is at $STATE_DIR/disk-reaper.status instead"
          else
              RECORD_DIR=""
          fi; }
-[ -z "$RECORD_DIR" ] && { say "disk-reaper: ⛔ cannot write the pass record $STATUS — the PREVIOUS record still stands (readers will keep seeing it until it goes stale); this pass's exit code is the only witness to this run"
+[ -z "$RECORD_DIR" ] && { log_line "disk-reaper: ⛔ cannot write the pass record $STATUS — the PREVIOUS record still stands (readers will keep seeing it until it goes stale); this pass's exit code is the only witness to this run"
              # ⛔ 5 AND 6 ARE GREEN BECAUSE THE RECORD CARRIES THE ALARM. With no record there is no alarm
              # channel left, so any non-3 verdict becomes 4 (a filesystem problem) instead of exiting green
              # over an un-writable state dir.
