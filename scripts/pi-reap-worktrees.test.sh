@@ -307,6 +307,17 @@ cat >"$T/bin/git-fail-list" <<'SHIM'
 for a in "$@"; do [ "$a" = "list" ] && exit 128; done
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
+cat >"$T/bin/git-empty-list" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A11b: `worktree list` SUCCEEDS (exit 0) but prints NOTHING.
+# That is the case A11 cannot reach — A11 is a nonzero exit, this is a zero exit
+# with an empty answer, which used to produce a healthy-looking pass (
+# `examined=0 classified=0 ... reasons=none`). `git worktree list` always
+# records at least the main/bare worktree, so zero records means the enumeration
+# answered nothing and the pass must fail CLOSED, not report an empty success.
+for a in "$@"; do [ "$a" = "list" ] && exit 0; done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
 cat >"$T/bin/git-lock-on-remove" <<'SHIM'
 #!/usr/bin/env bash
 # GIT_BIN shim: locks the target worktree just before the real `worktree
@@ -374,7 +385,7 @@ chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh
          "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
          "$T/bin/git-late-ignored" "$T/bin/git-slow-nth-status" "$T/bin/git-race-delete-a25" \
-         "$T/bin/git-list-fail-after-probes" "$T/bin/comm"
+         "$T/bin/git-list-fail-after-probes" "$T/bin/git-empty-list" "$T/bin/comm"
 
 # ── fixture builders ───────────────────────────────────────────────────
 mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
@@ -1242,6 +1253,20 @@ OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-list" run_reaper $ENV --dry-run --repo 
 assert_eq "$RC" "3" "A11 git worktree list failure => exit 3 (not a healthy empty pass)"
 assert_contains "$OUT" "git worktree list failed" "A11 abort names the failing probe"
 assert_contains "$(cat "$T/$ENV/reap.log")" "git worktree list failed" "A11 abort is logged"
+
+# ── A11b: an EMPTY (rc 0) enumeration is fail-closed too (#4529 review) ─
+# A11 above pins the nonzero-exit arm. This pins the OTHER arm: git answers 0 and
+# simply lists nothing. That used to sail through to a SUMMARY that read
+# `examined=0 classified=0 remove=0 preserved=0 reasons=none` — a no-op pass
+# indistinguishable from a healthy one, which is the shape this PR removes.
+# Real git cannot produce it (the main/bare worktree is always listed), so it can
+# only be reached by a broken/neutered git, which is exactly what must not pass.
+ENV=A11b; REPO="$(mk_repo $ENV)"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-empty-list" run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "A11b an EMPTY worktree list (rc 0, no records) => exit 3, never a healthy empty pass"
+assert_contains "$OUT" "reported no worktrees" "A11b the abort names the empty enumeration"
+assert_absent "$OUT" "examined=0" "A11b no SUMMARY is printed for a pass that enumerated nothing"
+assert_contains "$(cat "$T/$ENV/reap.log")" "reported no worktrees" "A11b the abort is logged too"
 
 # ── A12: a removal refusal is reported, never swallowed ────────────────
 ENV=A12; REPO="$(mk_repo $ENV)"

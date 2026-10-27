@@ -2069,6 +2069,19 @@ run() {
         log "FAIL-CLOSED abort: git worktree list failed (exit 3)"
         exit 3
     fi
+    # ⛔ AN EMPTY LIST IS NOT A HEALTHY PASS (#4529 review). `git worktree list` ALWAYS records at
+    # least the main (or bare) worktree, so ZERO records means the enumeration answered nothing —
+    # and a pass that goes on to publish `examined=0 classified=0 remove=0 preserved=0 reasons=none`
+    # is the "a no-op pass is indistinguishable from a healthy one" shape this PR exists to remove,
+    # now wearing a machine-readable tally that makes it look measured. The sibling delegate refuses
+    # exactly this state (`reap-lane-venvs.sh`: "reports no worktrees at all — that cannot be true of
+    # a checkout (exit 3)"); this arm must not be the weaker one. It is checked BEFORE MAIN_CANON's
+    # fallback (which would silently invent a main) and before `--list` can print an empty success.
+    if [ -z "$WT_LIST" ]; then
+        echo "FAIL-CLOSED abort: git worktree list reported no worktrees — that cannot be true of a checkout (exit 3)" >&2
+        log "FAIL-CLOSED abort: git worktree list reported no worktrees (exit 3)"
+        exit 3
+    fi
     MAIN_CANON="$(printf '%s\n' "$WT_LIST" | head -1 | cut -f1 | while IFS= read -r p; do canonicalize "$p"; done)"
     [ -n "$MAIN_CANON" ] || MAIN_CANON="$REPO_CANON"
     SELF_CWD_CANON="$(canonicalize "$PWD")"
