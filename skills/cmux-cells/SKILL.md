@@ -22,9 +22,9 @@ labelled `pi-cell-1`** — `vm-efa6cc8f…`; `cloud-cell-bringup.sh:42` pairs th
 one that is genuinely absent. `docs/ops/ACTIVATION-MATRIX.md` still speaks in the OLD labels (`pi-lane-1`, `pi-cell-2`), so read
 it with this mapping in hand. Treat any inventory, including this one, as a reading: re-run `cmux vm ls` before acting on
 it.) ⚠️ **`pi-cell-N` is the LABEL column; on the Mac every `cmux vm <verb>` that takes a machine takes the
-NAME column (`vm-<hex>`; from inside a cell the peer grammar takes a peer *slug* — see §3)** — `cmux vm stats pi-cell-4`
-returns a 404 whose own advice is "start a new one", a spend-flavoured remedy for a box that is already running. Read the
-NAME from `cmux vm ls`. Cells are Linux, so **any
+NAME column (`vm-<hex>`; from inside a cell the peer grammar accepts the peer slug, the LABEL and the NAME alike — see §3)**
+— `cmux vm stats pi-cell-4` returns a 404 whose own advice is "start a new one", a spend-flavoured remedy for a box that is
+already running. Read the NAME from `cmux vm ls`. Cells are Linux, so **any
 harness change must work on both platforms** — one source of truth with a platform branch, never two drifting copies.
 
 Canonical harness home: **`agent-infra/scripts/orchestrator-harness/`**. `tortoise/operations/orchestrator-harness/` and
@@ -156,9 +156,9 @@ missing** — per-worktree or an install fault; `land_backlog_verdict` carries a
 repo … (not an owner/name slug)`, emitted by its OWN slug-shape check and **unreachable through `run_agent`** — the slug is
 derived first and refuses there — so it is the test seam's twin of this arm, same remedy, and it is not a `gh` fault); and
 **rc=2, a read that did not resolve** (`UNREADABLE open-PR count` / `UNREADABLE landing rate` — each carries "(the gh read
-failed)"; and `UNREADABLE landing counts for …`, which is **not** a failed read: it fires when the lands read *succeeded* and
-returned counts that did not parse, so its remedy is that output shape, not the chain) — the first two box-local, so fixing
-that box's gh chain clears them and **a re-dispatch to a healthy box does clear them**, even
+failed)"; a third line, `UNREADABLE landing counts for …`, guards counts that do not parse, but `land_backlog_lands` returns
+1 on any read failure and otherwise prints two integers it built itself, so that guard **cannot fire today** — do not
+diagnose a 74 as a parse problem) — box-local, so fixing that box's gh chain clears them and **a re-dispatch to a healthy box does clear them**, even
 though the gate prints the ratio remedy text for it too. A P0-blocker or a base-red repair is **exempt by evidence** and dispatches under the hold — **when the exemption read
 itself succeeds**; on the rc=2 arm it fails with the same gh chain, so a P0 *is* held until the chain is fixed (the
 gate's refusal line says so). **Idling on its own changes none of them**: for 73
@@ -470,11 +470,16 @@ not a load average measured earlier.
     number that the next reader plans against. ⛔ **The fifth member is the ai-drainer's SEED_REPO, and it is not necessarily where the
     documentation says.** `ai-drainer.sh` creates `$AI/wt-drainer-<lane>` with `git -C "$SEED_REPO" worktree add` (search
     that phrase; `AI` defaults to `$HOME/orchestrator-ai`), and `install-drainer-timer.sh:72` defaults `SEED_REPO` to
-    `$HOME/agent-infra-main` at **install** time. On a real cell that is not the value: measured 2026-10-27 on `pi-cell-4`,
-    the installed unit is a wrapper (`ExecStart=/bin/bash $CELL_HOME/run-ai-drainer.sh`) carrying **no**
-    `Environment=SEED_REPO=`, `$CELL_HOME/agent-infra-main` does not exist, and the drainer runs against
-    **`/tmp/cell-ai-main`**, which is where `$CELL_HOME/run-ai-drainer.sh` sets `SEED_REPO`. So **derive the seed checkout
-    from the trees** — `git -C <any $AI/wt-drainer-*> rev-parse --git-common-dir` names the repo that owns them. Naming a
+    `$HOME/agent-infra-main` at **install** time. ⛔ **Do not carry a value from this page: the unit itself moves.** The
+    template always renders the knob (`templates/systemd/eldato-ai-drainer.service:36` → `Environment=SEED_REPO={{SEED_REPO}}`),
+    so the value in force is a `systemctl cat eldato-ai-drainer.service` reading — and on `pi-cell-4` the **same box gave two
+    different answers the same day**: an earlier reading had a wrapper (`ExecStart=/bin/bash $CELL_HOME/run-ai-drainer.sh`,
+    whose own `SEED_REPO=/tmp/cell-ai-main`) with **no** `Environment=SEED_REPO=` at all, while the 2026-10-27 14:08Z reading
+    had `ExecStart=/bin/bash /home/cmux/agent-infra/scripts/orchestrator-harness/ai-drainer.sh` with
+    `Environment=SEED_REPO=/home/cmux/agent-infra` — the unit had been reinstalled between the two, and
+    `$CELL_HOME/agent-infra-main` does not exist in either. So **read it, then derive the seed checkout from the trees** —
+    `git -C <any $AI/wt-drainer-*> rev-parse --git-common-dir` names the repo that owns them (at 14:08Z it answered
+    `/home/cmux/agent-infra/.git`, the unit's value, not the wrapper's). Naming a
     `wt-drainer-*` path itself *does* work (`git worktree list` inside a linked checkout lists the whole repository,
     measured) — the reason not to is that `ai-drainer.sh` **reaps** those trees as soon as a lane dies (`_rm_wt`,
     `_reap_leftovers`), so a path named now is gone later, and a missing path turns that repo into an `AT-RISK-UNKNOWN`
@@ -535,9 +540,10 @@ not a load average measured earlier.
   [ -f "$W" ] || { echo "AT-RISK-UNKNOWN work-at-risk-missing $W"; exit 1; }
   [ -d "${CELL_HOME:-}" ] || { echo "AT-RISK-UNKNOWN CELL_HOME=${CELL_HOME:-<unset>}"; exit 1; }
   rc_all=0
-  # The seed checkout is whatever repo owns the drainer's trees — DERIVED, never assumed. On pi-cell-4 it is
-  # /tmp/cell-ai-main, while install-drainer-timer.sh:72's default ($HOME/agent-infra-main) does not exist and the installed
-  # unit carries no Environment=SEED_REPO= at all.
+  # The seed checkout is whatever repo owns the drainer's trees — DERIVED, never assumed. On pi-cell-4 it was
+  # /tmp/cell-ai-main under one install of the unit and /home/cmux/agent-infra under the next (2026-10-27), while
+  # install-drainer-timer.sh:72's default ($HOME/agent-infra-main) exists in neither — which is why this DERIVES instead of
+  # reading the unit: `systemctl cat` is the value in force, the trees are the value that matters.
   seed=""
   for w in "${AI:-$HOME/orchestrator-ai}"/wt-drainer-*; do
     [ -d "$w" ] || continue
