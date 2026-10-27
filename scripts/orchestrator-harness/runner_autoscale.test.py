@@ -3096,6 +3096,56 @@ def t29_floor_follows_the_gate():
         len(notes) == 1 and "NOT armed" in notes[0],
         f"…and the refusal to arm must be SAID, not silent: {notes}",
     )
+    # ⛔ THE GATE WINS OVER WHAT THE RUNNER ALREADY CARRIES (review finding P1, round 13). The cases
+    # above all start from a pool that does NOT carry the fallback, so the one path that re-opened
+    # the incident — a repair on a runner that still carries `ubuntu-latest` while the gate records
+    # `github` — was never driven, even though the assertion above names the property it broke.
+    carried = {
+        "x86-1": ra.PoolEntry(
+            name="x86-1",
+            status="online",
+            busy=False,
+            labels=["self-hosted", ra.ARM_POOL_LABEL, ra.FALLBACK_LABEL],
+        )
+    }
+    notes = []
+    got = ra.resolve_labels(
+        carried, "x86_64", notes=notes, current=["self-hosted-x64", ra.FALLBACK_LABEL], gate_mode="github"
+    )
+    check(got == "self-hosted-x64", f"github ⇒ a carried fallback is DROPPED, not re-asserted: {got!r}")
+    check(
+        len(notes) == 1 and "REMOVED" in notes[0],
+        f"…and the removal must be SAID, not silent: {notes}",
+    )
+    # …and the same for a HOSTED image name: a self-hosted runner claiming `ubuntu-22.04` makes a
+    # hosted job run here on another OS, which is a false PASS rather than a queue delay.
+    notes = []
+    got = ra.resolve_labels(
+        carried, "x86_64", notes=notes, current=["self-hosted-x64", "ubuntu-22.04"], gate_mode="github"
+    )
+    check(got == "self-hosted-x64", f"github ⇒ a carried ubuntu-<version> is DROPPED too: {got!r}")
+    # `local` and a MISSING record must NOT strip it: the floor owns arming, and `None` is not intent
+    # ("with no state file the pool stays exactly as the gate left it").
+    got = ra.resolve_labels(
+        carried, "x86_64", notes=[], current=["self-hosted-x64", ra.FALLBACK_LABEL], gate_mode="local"
+    )
+    check(
+        ra.FALLBACK_LABEL in got,
+        f"local ⇒ the carried fallback STAYS (the floor must not be stripped by the new term): {got!r}",
+    )
+    got = ra.resolve_labels(
+        carried, "x86_64", notes=[], current=["self-hosted-x64", ra.FALLBACK_LABEL], gate_mode=None
+    )
+    check(
+        ra.FALLBACK_LABEL in got,
+        f"no gate record ⇒ the pool stays as the gate left it, never stripped: {got!r}",
+    )
+    # …and a custom/tier label is never touched by the new term: dropping one would make the
+    # workflows targeting it queue for ever.
+    got = ra.resolve_labels(
+        carried, "x86_64", notes=[], current=["self-hosted-x64", "tier-gold"], gate_mode="github"
+    )
+    check(got == "self-hosted-x64,tier-gold", f"github ⇒ a custom label is still preserved: {got!r}")
     # end to end, with the gate's OWN file in the fixture: the registration must not carry the label
     # ⛔ A RECORD IS NOT A STANDING DECISION (review finding P1): the gate writes its mode only on a
     # TRANSITION, from a launchd job, and nothing schedules it on a cell — so one hand-run during
@@ -4034,6 +4084,21 @@ MUTATIONS = [
         '        if uninspectable:\n            return f"{key}={value}"  # MUTATION: could-not-look read as condition-unmet\n            # ⛔ THE DIRECTION MATTERS: this function\'s answer EXEMPTS a unit from the ExecStart',
         "an uninspectable Condition path is read as an ABSENT one, so a unit systemd may well start "
         "is silently exempted from the ExecStart check — a false PASS inside the audit",
+    ),
+    Mutation(
+        "T29",
+        '    if gate_mode == "github":',
+        '    if False:  # MUTATION: the gate no longer strips what the runner already carries',
+        "preservation re-asserts `ubuntu-latest` against a `github` gate record again, with no note: "
+        "the repair fights the gate's own fallback_off once per cycle, and `runs-on: ubuntu-latest` "
+        "work lands on the box and competes with the agent fleet (ci_runner_gate.sh:12)",
+    ),
+    Mutation(
+        "T29",
+        '    return low == FALLBACK_LABEL or low.startswith("ubuntu-")',
+        "    return low == FALLBACK_LABEL  # MUTATION: a hosted image label is not gate-owned",
+        "a self-hosted runner re-claims `ubuntu-22.04`, so a job asking for that HOSTED image runs "
+        "here on another OS — a false PASS, not a queue delay",
     ),
     Mutation(
         "T29",

@@ -1123,6 +1123,22 @@ def pool_serves_fallback(pool: dict[str, PoolEntry]) -> bool:
     return any(FALLBACK_LABEL in e.labels for e in pool.values())
 
 
+def _gate_owned_label(label: str) -> bool:
+    """TRUE for a label whose presence the GATE decides — never the runner that carries it.
+
+    Two families, and both are labels a self-hosted install must not assert on its own:
+      * the fallback label (`ubuntu-latest`) — armed ONLY by the floor/engagement arms below; and
+      * `ubuntu-<version>` (e.g. `ubuntu-22.04`) — a HOSTED image name, so a self-hosted runner
+        claiming it makes a hosted job run here, on a different OS ("a false PASS, not a delay").
+
+    A label outside both families is a custom/tier tag and is preserved untouched: dropping one
+    would make the workflows that target it queue for ever, which is the failure `_preserve_labels`
+    exists to avoid.
+    """
+    low = label.strip().lower()
+    return low == FALLBACK_LABEL or low.startswith("ubuntu-")
+
+
 def label_floor_binds(pool: dict[str, PoolEntry], gate_mode: str | None) -> bool:
     """TRUE when the GATE wants the fallback, a SCHEDULED gate maintains that record, and NO runner
     in the pool advertises the label.
@@ -1237,9 +1253,43 @@ def resolve_labels(
             print(f"  · {reason}", flush=True)
     # `dict.fromkeys` keeps order and makes a DOUBLE-ADD unrepresentable, whichever arm asked for it:
     # the pre-floor code could write `ubuntu-latest` twice (once preserved, once from the gate), and
-    # a repeated label is a config.sh argument GitHub rejects.
+    # a repeated label is a `config.sh` argument GitHub rejects.
     if floor or engaged:
         labels.append(FALLBACK_LABEL)
+    # ⛔ THE GATE WINS OVER EVERYTHING ABOVE, INCLUDING OVER WHAT THE RUNNER ALREADY CARRIES AND
+    # OVER THE ENGAGEMENT ARM (review finding P1, round 13). Preservation is unconditional, so a
+    # repair in the window between the gate recording `github` and its own `fallback_off` wrote
+    # `ubuntu-latest` STRAIGHT BACK into `config.sh --labels` (measured: gate_mode="github",
+    # current=["self-hosted-x64", "ubuntu-latest"] -> the same set back, and NO note). That is the
+    # defect this floor exists to prevent, reached through the other door: the gate strips the
+    # label, every repair re-adds it, and the two timers fight once per transition — while
+    # `runs-on: ubuntu-latest` work lands on this box and competes with the agent fleet
+    # (`ci_runner_gate.sh:12` records the cost: a local pytest run crashed FalkorDB, 178 restarts).
+    # ⛔ THE `engaged` ARM IS UNDONE HERE TOO, DELIBERATELY: "the pool still advertises it" is the
+    # pre-`fallback_off` window, and `github` is the gate's answer about that window — not a second
+    # opinion about the pool's current contents.
+    # ⛔ `ubuntu-<version>` GOES WITH IT. A self-hosted runner claiming `ubuntu-22.04` makes a job
+    # asking for that HOSTED image run here instead — the "false PASS, not a delay" class the header
+    # names, and neither label is host-derived, so `_preserve_labels` kept them.
+    # ⛔ AND IT IS SCOPED TO A READABLE `github` RECORD. `local` keeps what it has (the floor owns
+    # arming, and a strip there would fight the floor), and `None` is not intent: with no state file
+    # the pool stays exactly as the gate left it (`label_floor_binds`'s own rule).
+    if gate_mode == "github":
+        # Deduped: `labels` can hold the same label twice at this point (preserved AND appended by
+        # the engagement arm), and a note that says `ubuntu-latest, ubuntu-latest` reads as a bug.
+        gate_owned = list(dict.fromkeys(x for x in labels if _gate_owned_label(x)))
+        if gate_owned:
+            labels = [x for x in labels if not _gate_owned_label(x)] or [arch]
+            dropped_reason = (
+                f"the gate records `github`, so {', '.join(gate_owned)} is REMOVED from this "
+                "registration rather than preserved: the pool serves CI only while GitHub-hosted "
+                "is unhealthy (ci_runner_gate.sh:12), and re-writing it here would fight the "
+                "gate's own fallback_off once per repair"
+            )
+            if notes is not None:
+                notes.append(dropped_reason)
+            else:
+                print(f"  · {dropped_reason}", flush=True)
     return ",".join(dict.fromkeys(labels))
 
 
