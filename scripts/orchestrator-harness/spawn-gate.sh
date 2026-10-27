@@ -1012,6 +1012,41 @@ cap_wip_snapshot() {
   return 1
 }
 
+# ── the lane LIFETIME bound (2026-10-27) ────────────────────────────────────────────────────────
+# THE WALL CLOCK WAS THE ONLY AXIS, AND IT CANNOT TELL SLOW FROM STALLED. Measured 2026-10-27: nine
+# lanes across two cloud cells parked with 0 bytes of output and `00:00:00` CPU, the oldest for
+# 3 h 32 m, all of them a `pi` in `ep_poll`; two more dispatch attempts then sat at 0 bytes for 5–15
+# minutes and were killed BY HAND. Nothing bounded a lane's SILENCE — only its total duration — and a
+# total-duration bound is a choice between killing a lane that is mid-merge and holding a lane that is
+# a corpse. `lane-bound.sh` (beside this file) adds the missing axis: NO OUTPUT GROWTH **and** NO CPU
+# DELTA for `LANE_BOUND_IDLE_S` (default 20 min, the same silence bound the `task` tool applies to a
+# sub-agent) ends the lane with a NAMED verdict (`stalled` / `exceeded-wallclock`) carrying the last
+# output size, the CPU delta and the elapsed time. Either signal advancing keeps the lane alive however
+# long it runs, which is what makes a legitimately slow lane (an 11 h test against a 26 m slowest
+# shard) safe.
+#
+# ⛔ RESOLVED, NOT ASSUMED, AND ITS ABSENCE IS LOUD (the `reap_lane_venv_path` pattern below). `$O` is
+# seeded file by file, so a NEW `spawn-gate.sh` can run on a box whose `$O` predates `lane-bound.sh`.
+# The fallback is the PREVIOUS behaviour — the plain `sleep $t` wall-clock watchdog — because a version
+# skew must never halt every lane on the box. It is logged as a WARN with the one-line remedy, so a
+# degraded box is a grep rather than an inference: a bound that silently becomes a weaker bound is the
+# "fix that is not live" shape §6.5.6 records.
+LANE_BOUND_SH=""
+lane_bound_path() {
+  local c here
+  if [ -n "$LANE_BOUND_SH" ]; then printf '%s\n' "$LANE_BOUND_SH"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for c in "${O:-}/lane-bound.sh" "$here/lane-bound.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/lane-bound.sh" \
+           "${HOME:-}/.pi/agent/scripts/lane-bound.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    LANE_BOUND_SH="$c"
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
 # ── the ONE agent invocation ─────────────────────────────────────────────────────
 # run_agent <seconds> <logfile> <promptfile> [label]
 #
@@ -1247,11 +1282,14 @@ brief_gate_run() { # brief_gate_run <brief-file> <role>
   bash "$lib" --check "$f" "$role"
 }
 run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
-  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed was_m jobctl
+  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed was_m jobctl _lb_sh
   AGENT_STARTED=0
   # The cap signal is per-invocation state, like AGENT_STARTED: a caller that reads it after a
   # refusal or a clean run must see 0, never a previous lane's answer.
   AGENT_CAP_HIT=0; WIP_SNAPSHOT_DIR=""; WIP_SNAPSHOT_RESULT=""
+  # The BOUND's verdict is per-invocation for the same reason (see the read-back below): a lane that
+  # reads `stalled` because ANOTHER lane's bound fired is worse than reading nothing at all.
+  AGENT_BOUND_VERDICT=""
   # ── THE BRIEF GATE (agent-infra#2258). FIRST, BEFORE the load and disk readings, and the order is
   # the mirror of the disk-before-load ruling below: a brief refusal is DETERMINISTIC. It cannot clear
   # by waiting and it follows the item to any other box, so reporting a load refusal first would send
@@ -1479,7 +1517,23 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # group that did not exist and its `sleep "$t"` child (up to the lane's 40-minute wall limit) was
   # never reached by the group kill below — a no-op dressed as a reap. Both children are group
   # leaders only if both are started while `set -m` is ON.
-  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  # ── THE LIFETIME BOUND (2026-10-27) ──────────────────────────────────────────────────────────
+  # The watchdog is now `lane-bound.sh watch`: the SAME wall clock (`$t`, unchanged, so `AGENT_CAP_HIT`
+  # and its worktree snapshot keep firing on exactly the same condition), plus the idle axis that did
+  # not exist. It kills the LEADER ONLY, exactly as the subshell it replaces did — this function's own
+  # group reap below is unchanged and still the thing that collects the turn's stragglers.
+  # ⛔ THE VERDICT FILE IS REMOVED FIRST. A leftover from an earlier run of the same log would be read
+  # as THIS run's outcome — the stale-flag class this harness names in its own instructions.
+  AGENT_BOUND_VERDICT=""
+  rm -f "$log.lanebound" 2>/dev/null || true
+  _lb_sh="$(lane_bound_path)"
+  if [ -n "$_lb_sh" ]; then
+    sh "$_lb_sh" watch --pid "$pid" --log "$log" --wall "$t" --tag "$label" \
+       --verdict-file "$log.lanebound" >/dev/null 2>&1 &
+  else
+    echo "[lane-bound] WARN $label: lane-bound.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this lane has the WALL CLOCK only (${t}s) and NO silence bound, so a lane that parks produces nothing until the clock expires. Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
+    ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  fi
   w=$!
   [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
   wait "$pid" 2>/dev/null; rc=$?
@@ -1529,6 +1583,16 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # reviewer/fixer/lane wall-time — the load-bearing number for fleet capacity (it was unmeasured).
   elapsed=$(( $(date +%s) - start ))
   echo "[timeout] agent pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc" >> "$log"
+  # ⛔ THE VERDICT IS READ BACK AS A CALLER SIGNAL, exactly like AGENT_CAP_HIT. Empty means "the agent
+  # finished on its own" (or no bound ran at all, which the WARN above already said out loud);
+  # `stalled` / `exceeded-wallclock` mean A BOUND ENDED THIS LANE, and the sentence beside it carries
+  # the last output size, the CPU delta and the elapsed time. A caller that cannot tell "the lane
+  # finished" from "the bound killed it" reports a wedged lane as a completed one. TOLERANT ON
+  # PURPOSE: a pre-change helper writes no such file and this must not fail under `set -u`.
+  if [ -f "$log.lanebound" ]; then
+    AGENT_BOUND_VERDICT="$(sed -n 's/.*verdict=\([a-z-]*\).*/\1/p' "$log.lanebound" 2>/dev/null | head -1)"
+    [ "$AGENT_BOUND_VERDICT" = "finished" ] && AGENT_BOUND_VERDICT=""
+  fi
   # DURABLE time series (agent-infra#1709 item 3). The per-run log above is TRUNCATED whenever
   # the same PR is re-run (`> "$L.log"`), so a single log line erases its own history: measured,
   # three real reviewer samples (885s/963s/1142s) disappeared within minutes. #1709 needs a DAY
