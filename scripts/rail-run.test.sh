@@ -439,7 +439,11 @@ assert_contains "$TXT" "run=$RID_A" "ATTRIBUTION: and names run A, not the newes
 OUT="$(GH_MODE=open poll 110 --run="$RID_A")"; assert_rc 20 "${OUT%%|*}" "ATTRIBUTION: the --run=<id> spelling works too"
 
 # ── M: session isolation is MEASURED — 'shared' is named, never assumed away ─
-OUT="$(RAIL_RUN_NO_SETSID=1 call start 111)"; TXT="${OUT#*|}"
+# The rail is made to WAIT, exactly as arm A does: the session word is measured from the RECORDER's
+# process group, and a rail that exits instantly takes the recorder with it, so the honest answer is
+# `unknown` (an abstention) rather than the `shared` this arm is about. Keep the recorder alive across
+# the measurement so the arm discriminates the NO_SETSID path instead of racing process exit.
+OUT="$(RAIL_RUN_NO_SETSID=1 FAKE_RAIL_SLEEP=3 call start 111)"; TXT="${OUT#*|}"
 assert_contains "$TXT" "session=shared" "ISOLATION: RAIL_RUN_NO_SETSID=1 reports session=shared"
 assert_contains "$TXT" "WILL reach it" "ISOLATION: the shared-group residual risk is named, not hidden"
 OUT="$(GH_MODE=merged wait_state landed 111)"; assert_rc 0 "${OUT%%|*}" "ISOLATION: a shared-session run is still polled to a verdict"
