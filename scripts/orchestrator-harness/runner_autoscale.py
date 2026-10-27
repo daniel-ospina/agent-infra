@@ -1023,11 +1023,16 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
         rc, out = _run(
             _config_argv(cfg, repo, registration_token(repo), name, labels, replace), timeout=600
         )
-        if rc != 0 and _ALREADY_CONFIGURED in out.lower():
+        if rc != 0 and _ALREADY_CONFIGURED in out.lower() and replace:
+            # ⛔ `and replace` IS LOAD-BEARING (review round 7). Clearing the local config and
+            # re-running `config.sh` WITHOUT `--replace` does not adopt the registration — it creates
+            # a NEW one and leaves the old one a ghost in the pool, which is the state #2892 exists
+            # to clean up. So the heal is confined to the arm that has `--replace` to land it, and the
+            # replace=False arm keeps raising the refusal its caller must resolve (a retired case
+            # pinned exactly that; T4b pins it again on this path).
             # ⛔ The retry's stash is MERGED, not discarded: a refused configure can leave `.runner`
             # behind, and if the retry's clear takes it the restore below must still be able to put
-            # the install back. (Today `register()` is only called with `replace=True`, so the first
-            # stash is always present — this keeps that true if a caller ever passes False.)
+            # the install back.
             for fname, entry in _clear_local_config(directory).items():
                 stash.setdefault(fname, entry)
             rc, out = _run(
@@ -1104,6 +1109,24 @@ TRANSIENT_UNIT_PREFIXES = (
 )
 
 
+def transient_path_problem(path_value: str) -> str | None:
+    """The SHAPE half of `unit_workdir_problem`: is this path inside a tree a reclaim can take?
+
+    ⛔ ONE IMPLEMENTATION, TWO CALLERS (a unit's `WorkingDirectory` and its `ExecStart` program). The
+    prefix list is the whole decision, and two copies of it drift: the second would be the one that
+    stays un-updated when a new transient root is measured.
+    """
+    real = Path(path_value).expanduser().resolve()
+    for prefix in TRANSIENT_UNIT_PREFIXES:
+        if str(real) == prefix or str(real).startswith(prefix + "/"):
+            return (
+                f"is inside {prefix} — a reclaim or a tmp cleaner removes it underneath the unit "
+                "(measured: /tmp/cell-wt-runnerauto2 killed a converger for as long as the reclaim "
+                "stood)"
+            )
+    return None
+
+
 def unit_workdir_problem(workdir: str | None) -> str | None:
     """None when `workdir` may be a unit's WorkingDirectory, else the reason it may not.
 
@@ -1142,20 +1165,75 @@ def unit_workdir_problem(workdir: str | None) -> str | None:
     # exist YET is still a transient path, and reporting only "does not exist" would invite the
     # operator to mkdir it — which is exactly how the measured unit came to point at a directory a
     # reclaim later took. Shape first, then existence.
-    real = path.resolve()
-    for prefix in TRANSIENT_UNIT_PREFIXES:
-        if str(real) == prefix or str(real).startswith(prefix + "/"):
-            return (
-                f"WorkingDirectory={workdir} is inside {prefix} — a reclaim or a tmp cleaner removes "
-                "it underneath the unit (measured: /tmp/cell-wt-runnerauto2 killed a converger for "
-                "as long as the reclaim stood)"
-            )
+    shape = transient_path_problem(workdir)
+    if shape:
+        return f"WorkingDirectory={workdir} {shape}"
     if not path.is_dir():
         return (
             f"WorkingDirectory={workdir} does not exist — systemd fails the unit with "
             "status=200/CHDIR BEFORE it runs a line, so the converger would silently stop"
         )
     return None
+
+
+def unit_exec_problems(unit_name: str, execstart: str) -> list[str]:
+    """Findings for a unit's `ExecStart` — the OTHER way a reclaim takes a scheduled tool down.
+
+    ⛔ THE SAME RECLAIM CLASS AS `WorkingDirectory`, ONE UNIT STATUS LATER (measured, review round 7).
+    `render_unit()` pins `sys.executable` and `Path(__file__).resolve()`, and `__file__` is the file
+    in the CHECKOUT the installer ran from — on a cell that is a lane worktree under `/tmp`
+    (`/tmp/cell-ai/.worktrees/…`), i.e. the exact directory `unit_workdir_problem` refuses to use as
+    a cwd. After a reclaim the unit does not fail at CHDIR (`200/CHDIR`); it fails at EXEC
+    (`203/EXEC`) on EVERY tick — the same silent death, and `--check-units` answered "all usable"
+    for it, because it only ever read `WorkingDirectory`. Absence is never health: a unit whose
+    PROGRAM is gone is not a scheduled converger.
+
+    Quoting is parsed, not trusted: systemd splits on whitespace except inside `"…"`, which is what
+    lets a script path containing a space work at all (both paths are quoted by `render_unit`).
+    """
+    tokens = [quoted or bare for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', execstart)]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return [f"{unit_name}: ExecStart= has no program — systemd fails the unit with 203/EXEC"]
+    problems: list[str] = []
+    program = tokens[0]
+    if not program.startswith("/"):
+        problems.append(
+            f"{unit_name}: ExecStart program {program!r} is not an absolute path — systemd resolves "
+            "it against the unit's own PATH, not the installer's, so it may run a DIFFERENT program "
+            "or none"
+        )
+    else:
+        # ⛔ SHAPE FIRST, THEN EXISTENCE — the same order, and for the same reason, as the workdir
+        # check: a `/tmp` program that happens to exist today is still a countdown, and reporting
+        # only "does not exist" would invite `mkdir`-ing its way to a green audit.
+        shape = transient_path_problem(program)
+        if shape:
+            problems.append(
+                f"{unit_name}: ExecStart program {program} {shape} — after that the unit fails "
+                "203/EXEC on EVERY tick, not 200/CHDIR"
+            )
+        elif not Path(program).exists():
+            problems.append(
+                f"{unit_name}: ExecStart program {program} does not exist — systemd fails the unit "
+                "with 203/EXEC before it runs a line"
+            )
+    # The script argument carries the same risk as the program (it IS `__file__`), and a unit may
+    # name more than one path. One finding per distinct path is enough to act on.
+    reported = {program}
+    for token in tokens[1:]:
+        if not token.startswith("/") or token in reported:
+            continue
+        shape = transient_path_problem(token)
+        if shape:
+            reported.add(token)
+            problems.append(
+                f"{unit_name}: ExecStart names {token}, which {shape} — the unit starts and then "
+                "fails on what it was told to run, which is the same silent stop with a different "
+                "status (this is the shape `render_unit` writes: the program is durable, the SCRIPT "
+                "is the checkout the installer ran from)"
+            )
+    return problems
 
 
 # ⛔ TWO HIERARCHIES, TWO LOAD PATHS. The user manager and the system manager search DISJOINT
@@ -1311,6 +1389,22 @@ def install_unit(
     # the problem it fixed). The two replaces are sequential, so a failure between them can still
     # leave a MIXED pair; the failure says exactly that rather than claiming a clean rollback.
     planned = render_unit(repo, workdir)
+    # ⛔ WARNED, NOT REFUSED — and the difference is deliberate (review round 7). `ExecStart` pins
+    # `Path(__file__).resolve()`, so a unit installed from a lane worktree names a path a reclaim
+    # takes (on every cell the checkout IS under /tmp), and the tool acknowledges that in
+    # `render_unit` itself: "this tool is often run from a working copy". Refusing would make
+    # `--install-unit` unusable ON THE BOXES IT EXISTS FOR — a false block, which is a worse failure
+    # than a documented one. So the operator is told loud at install time, `--check-units` REPORTS
+    # the resulting unit (`unit_exec_problems`), and the scheduled pass never loses the finding.
+    script_dir = os.path.dirname(str(Path(__file__).resolve()))
+    script_shape = transient_path_problem(script_dir)
+    if script_shape:
+        print(
+            f"  · WARNING: installing a unit whose ExecStart names this tool at {script_dir}, which "
+            f"{script_shape}. The schedule will fail 203/EXEC once that path goes; install from a "
+            "durable checkout (a clone outside /tmp) to schedule it permanently.",
+            flush=True,
+        )
     staged: list[tuple[Path, Path]] = []
     replaced: list[Path] = []
     try:
@@ -1435,6 +1529,7 @@ def installed_unit_cwd_problems(
             groups.setdefault((hierarchy, owner), []).append(path)
     for (hierarchy, owner), paths in sorted(groups.items()):
         last: tuple[Path, str] | None = None
+        exec_last: tuple[Path, str] | None = None
         mains = [q for q in paths if not q.name.endswith(".conf")]
         # ⛔ A DROP-IN IS DE-DUPLICATED BY BASENAME, KEEPING THE FIRST — the higher-priority
         # directory's copy. systemd does not merge two files with the same name: it SKIPS the
@@ -1464,6 +1559,15 @@ def installed_unit_cwd_problems(
                 key, _, value = line.partition("=")
                 if key.strip() == "WorkingDirectory" and section == "Service":
                     last = (path, value.strip())
+                elif key.strip() == "ExecStart" and section == "Service":
+                    # LAST ASSIGNMENT WINS, exactly as for WorkingDirectory: a drop-in that re-points
+                    # ExecStart is the documented remedy, so only the value systemd ends up with is
+                    # judged — and an overridden bad program must not be reported.
+                    exec_last = (path, value.strip())
+        # ⛔ THIS RUNS BEFORE THE `last is None` EXIT: a unit with an ExecStart and no
+        # WorkingDirectory is still a unit whose program a reclaim can take.
+        if exec_last is not None:
+            problems.extend(unit_exec_problems(exec_last[0].name, exec_last[1]))
         if last is None:
             continue
         path, value = last
@@ -1943,11 +2047,15 @@ def converge(
     # first step would only repeat that failure (and pay for it again — measured: 7 pool reads where
     # the contract says 1 + 3). Every OTHER unverified cause leaves the pool readable, so the alarm
     # still runs (`disk-unreadable` included).
-    if (
-        not record["problems"]
-        and not record.get("problem_kind")
-        and record.get("unverified_cause") != "pool-read-after-restart"
-    ):
+    # ⛔ AND A PROVISIONER REFUSAL IS NOT IN THIS GATE EITHER (measured, review round 7). It was, on
+    # the reasoning that "a pass with a refusal alarms about THAT" — but the refusal leg is
+    # `provisioner-refused` → **exit 0**, the documented "converged / nothing to do", so the
+    # compensating signal the gate assumed does not exist and a starved box read GREEN: reproduced
+    # through the CLI with 1 runner online and idle, 53 queued, our arm's ceiling 3 and the installer
+    # returning rc=2 — `verdict=provisioner-refused`, no `starvation` key, **rc=0**. That is the same
+    # fail-open as gating on `unverified`: a refusal is a routine, unrelated event (`:1571-1575`) and
+    # the queue is still readable, so the alarm runs and OWNS the verdict (see the verdict block).
+    if not record["problems"] and record.get("unverified_cause") != "pool-read-after-restart":
         confirm_raw = os.environ.get("RUNNER_AUTOSCALE_STARVATION_CONFIRM_S")
         # ⛔ PARSED DEFENSIVELY, AND BOUNDED, because every value of this seam must fail LOUD. Measured
         # in review: `float()` ACCEPTS `nan`, `-5` and `inf` — the first two silently SKIPPED the
@@ -1986,6 +2094,16 @@ def converge(
             )
         starvation = starvation_probe(repo, confirm_s)
         record["starvation"] = starvation.get("state")
+        # ⛔ THE COUNTS ARE PUBLISHED, NOT ONLY SPELLED INTO PROSE (review round 7). `--json` calls
+        # this "one machine-readable record (fleet view)", and the three operands were readable only
+        # by parsing a note string — while `origin/main`'s version published `queued_runs`, so a
+        # consumer of that field got `None` from this one. `queued_runs` keeps main's NAME (it is the
+        # contract a fleet reader already has) and the pair it was always printed beside.
+        if "queued" in starvation:
+            record["queued_runs"] = starvation["queued"]
+            record["starvation_queued"] = starvation["queued"]
+            record["starvation_busy"] = starvation["busy"]
+            record["starvation_online"] = starvation["online"]
         if starvation.get("state") == "starved":
             record["notes"].append(
                 f"STARVATION {starvation['invariant']}: queued={starvation['queued']} "
@@ -2006,11 +2124,13 @@ def converge(
         # code says "a human must look at this" (3 — the same code an action failure gets, because
         # from a monitor's seat the box needed capacity and did not get it).
         record["verdict"] = "guard-conflict"
-    elif record.get("problem_kind") == "refusal":
-        record["verdict"] = "provisioner-refused"
     elif record.get("unverified"):
         # A measurement could not be taken (after a restart). Reported as unmeasurable rather than
         # "converged so nothing to see", because the box's state is genuinely unknown here.
+        # ⛔ THIS STAYS ABOVE THE ALARM, and it is a pinned decision rather than an accident (T24):
+        # a pass whose OWN capacity measurement failed is `unmeasurable` (exit 2) even while a starved
+        # queue is recorded, because exit 2 is already non-green and the unknown reading is the more
+        # specific verdict. What could NOT stay above it is the refusal leg — see below.
         record["verdict"] = "unmeasurable"
         # ⛔ NAME THE MEASUREMENT THAT FAILED. One fixed sentence said "the pool could not be read
         # after a restart" for every unverified pass, including the one where nothing was restarted
@@ -2030,6 +2150,15 @@ def converge(
                 "performed BEFORE that point; nothing further was done."
             )
     elif starvation.get("state") == "starved":
+        # ⛔ THE ALARM OWNS THE VERDICT OVER THE REFUSAL, and that is the one leg it must beat
+        # (review round 7, measured). A routine provisioner refusal is not an error — it returns
+        # **exit 0**, the documented "converged / nothing to do" — so letting it win published a
+        # starved, 53-queued box as GREEN (`verdict=provisioner-refused`, rc=0, no `starvation` key).
+        # The header is explicit that exit 4 "is the one exit a health check should page on, because
+        # a starved box otherwise reads perfectly healthy". `problems`, `guard-conflict` and
+        # `unverified` stay ABOVE this: the first two are already page-worthy and the third is the
+        # more specific verdict for a box whose own capacity measurement failed (T24). The refusal's
+        # own words keep their place in `notes` — losing its VERDICT must not lose its evidence.
         record["verdict"] = "starvation"
         record["error"] = (
             f"STARVATION ({starvation['invariant']}): queued={starvation['queued']} "
@@ -2038,6 +2167,8 @@ def converge(
             "between what the jobs ask for and what the runners advertise (labels/arch/gate), not a "
             "lack of capacity (agent-infra#2875)"
         )
+    elif record.get("problem_kind") == "refusal":
+        record["verdict"] = "provisioner-refused"
     elif live > ceil:
         record["verdict"] = "over-ceiling"
         record["notes"].append(

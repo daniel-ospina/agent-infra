@@ -48,6 +48,20 @@ below grows with the suite, so this header never claims a case that does not exi
      Cases: T9 (it fires: verdict `starvation`, exit 4, the counts and the invariant named, and
      nothing changed), T9b (CONFIRMED across two samples, so a handover blip is not an alarm),
      T10 (the three near-misses stay silent — busy pool, empty queue, ALL-OFFLINE).
+  7. THE FOUR REVIEW-ROUND-7 FINDINGS (measured on the rebased branch, one case each).
+     T26 — the alarm's gate excluded `problem_kind`, so a pass whose PROVISIONER REFUSED never read
+     the queue, and the refusal leg returns **exit 0**: reproduced with 1 runner online and idle and
+     53 queued, `verdict=provisioner-refused`, rc=0, no `starvation` key. The alarm now runs and owns
+     that verdict, and the refusal keeps its place in `notes`.
+     T27 — `--check-units` read only `WorkingDirectory`, so a unit whose `ExecStart` names a file a
+     reclaim takes (the checkout `render_unit` pins into `__file__`) audited as "all usable" while it
+     died on every tick. The audit reads `ExecStart` too, with the same drop-in precedence.
+     T4b — the retire commit removed the only pin on `register(replace=False)` while the branch had
+     changed that arm to clear-and-retry. Clearing and re-running `config.sh` WITHOUT `--replace`
+     creates a SECOND registration and leaves a ghost, so the heal is confined to `replace=True` and
+     this case pins the refusal, the single attempt, and a byte-identical install.
+     The counts are also published machine-readably (`queued_runs`, `starvation_queued/busy/online`) —
+     `queued_runs` is `origin/main`'s own field name, so a fleet reader of that record keeps working.
 
 ⛔ HERMETIC, BY CONSTRUCTION. Every measurement is a fixture: `meminfo` is a file, the installs are
 directories, and `gh` / `systemctl` / `config.sh` / the provisioner are STUBS on the seams the tool
@@ -1956,6 +1970,194 @@ def t25_guard_conflict():
             box.destroy()
 
 
+# ── 7. THE REVIEW-ROUND-7 FINDINGS ────────────────────────────────────────────────────────────
+@test("T26 a PROVISIONER REFUSAL must not silence the starvation alarm — it is the pass that exits 0")
+def t26_refusal_does_not_silence_the_alarm():
+    """MEASURED FAIL-OPEN (review round 7). The alarm's gate excluded `problem_kind`, so a pass whose
+    provisioner refused never even read the queue — and the refusal leg returns **exit 0**, the
+    documented "converged / nothing to do". Reproduced through the shipped CLI against this fixture:
+    1 runner online and idle, 53 queued, and `verdict=provisioner-refused` with **rc=0** — the exact
+    silent-green state the alarm exists to break (#2875).
+
+    A refusal is ROUTINE and UNRELATED to the queue (the module says so itself: a scheduled pass must
+    not cry failure every 10 minutes over a deliberate no), and the queue is still perfectly
+    readable, so the alarm runs and OWNS the verdict. Both sets of numbers survive in the record."""
+    with Env():
+        box = Box("refusal-starved")
+        try:
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            # ONLINE and IDLE while 53 runs wait — the invariant — and NO runner is busy.
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.queued(53)
+            # The AGREEMENT shape (T25's second branch): our disk arm also says one more does not
+            # fit, so the verdict is the routine `refusal`, NOT a guard conflict.
+            box.disk_seq([36_864, 21_000])
+            box.provisioner(rc=2, out="REFUSED: disk headroom: 21G free against 44G needed")
+            record = converge(box, nproc="8", want=3)
+            check(
+                record.get("problem_kind") == "refusal",
+                "this fixture must exercise the REFUSAL leg (not a conflict): "
+                f"{record.get('problem_kind')}",
+            )
+            check(
+                record.get("starvation") == "starved",
+                "the alarm must still be EVALUATED on a refused pass — a routine, unrelated event "
+                f"cannot supply the compensating signal: {record.get('starvation')!r}",
+            )
+            check(
+                record["verdict"] == "starvation",
+                f"the alarm must OWN the verdict over the refusal: {record['verdict']}",
+            )
+            check(
+                record.get("queued_runs") == 53
+                and record.get("starvation_busy") == 0
+                and record.get("starvation_online") == 1,
+                "the counts must be MACHINE-readable, not only spelled into prose: "
+                f"queued_runs={record.get('queued_runs')!r} busy={record.get('starvation_busy')!r} "
+                f"online={record.get('starvation_online')!r}",
+            )
+            # ⛔ THE COMPENSATING SIGNAL MUST NOT BE LOST EITHER: the refusal keeps its own place in
+            # the record (it is why no runner was added), even though it no longer sets the verdict.
+            check(
+                any("provisioner REFUSED" in n for n in record["notes"]),
+                "the refusal must still be recorded (losing its verdict must not lose its "
+                f"evidence): {record['notes']}",
+            )
+            # ⛔ THE `df` SEQUENCE COUNTER IS SHARED WITH THE FIRST PASS, and the CLI below is a
+            # SECOND process: left alone it would read the LAST value (21G) and refuse `--want 3` on
+            # the ceiling before any fill runs, which measures a different path than this case is
+            # about. Resetting replays the shape the case declares: ceiling 3, then the box fills up.
+            counter = os.path.join(box.dir, "df.count")
+            if os.path.exists(counter):
+                os.unlink(counter)
+            code, out = cli(box, "--want", "3")
+            check(
+                code == 4,
+                "a starved box must exit 4 (the one exit a health check pages on) even when the "
+                f"provisioner refused: got {code}: {out[-400:]}",
+            )
+            contains(out, "verdict=starvation", "the human output")
+        finally:
+            box.destroy()
+
+
+@test("T27 --check-units reports a TRANSIENT ExecStart program, not just the WorkingDirectory")
+def t27_audit_reads_execstart():
+    """MEASURED FALSE PASS (review round 7). `render_unit` pins `__file__`, which on a cell is a lane
+    worktree under /tmp — the exact directory the fix refuses as a cwd. The unit then dies
+    `203/EXEC` on every tick, and the audit answered "all usable" because it only ever read
+    `WorkingDirectory`. A unit whose PROGRAM a reclaim can take is not a scheduled converger."""
+    with Env():
+        box = Box("exec-audit")
+        try:
+            units = os.path.join(box.dir, "units")
+            # Durable cwd, transient PROGRAM — the only finding must be the ExecStart one.
+            Path(units, "bad.service").write_text(
+                "[Service]\n"
+                "WorkingDirectory=/\n"
+                'ExecStart="/usr/bin/python3" "/tmp/cell-ai/.worktrees/x/runner_autoscale.py" '
+                '--repo "daniel-ospina/tortoise"\n',
+                encoding="utf-8",
+            )
+            # Both durable: this one must stay CLEAN, or the finding is noise. ⛔ NOT `__file__` —
+            # the suite itself is run from a lane worktree under /tmp, so it IS transient here and
+            # would (correctly) be reported, turning the negative control into a second positive.
+            Path(units, "good.service").write_text(
+                "[Service]\n"
+                "WorkingDirectory=/\n"
+                'ExecStart="/usr/bin/python3" "/usr/bin/python3" --repo "o/r"\n',
+                encoding="utf-8",
+            )
+            found = ra.installed_unit_cwd_problems([units], require_any=True)
+            bad = [f for f in found if "bad.service" in f]
+            check(
+                any("ExecStart" in f and "/tmp" in f for f in bad),
+                f"a transient ExecStart program must be NAMED as the reclaim risk it is: {found}",
+            )
+            check(
+                any("fails on what it was told to run" in f for f in bad),
+                f"…and it must say how the unit dies (the script it was told to run is gone): {found}",
+            )
+            # ⛔ THE OTHER SHAPE: the PROGRAM itself transient — that one dies 203/EXEC, before any
+            # interpreter runs, which is the status the WorkingDirectory fix was originally about.
+            Path(units, "prog.service").write_text(
+                "[Service]\n"
+                "WorkingDirectory=/\n"
+                'ExecStart="/tmp/cell-wt-x/python3" "--version"\n',
+                encoding="utf-8",
+            )
+            prog = [f for f in ra.installed_unit_cwd_problems([units], require_any=True) if "prog.service" in f]
+            check(
+                any("203/EXEC" in f for f in prog),
+                f"a transient PROGRAM must be reported as 203/EXEC: {prog}",
+            )
+            os.unlink(Path(units, "prog.service"))
+            # the DROP-IN precedence applies to ExecStart too: a re-pointed value is the remedy
+            Path(units, "bad.service.d").mkdir()
+            Path(units, "bad.service.d", "20-exec.conf").write_text(
+                '[Service]\nExecStart="/usr/bin/python3" "/usr/bin/python3"\n',
+                encoding="utf-8",
+            )
+            found = ra.installed_unit_cwd_problems([units], require_any=True)
+            check(
+                not [f for f in found if "bad.service" in f],
+                "a drop-in that re-points ExecStart is the documented remedy and must CLEAR the "
+                f"finding: {found}",
+            )
+            code, out = cli(box, "--check-units")
+            check(
+                code == 0,
+                f"the remedied fixture must audit clean (exit 0), got {code}: {out[-400:]}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T4b register(replace=False) still REFUSES — the clear-and-retry is confined to --replace")
+def t4b_retry_is_confined_to_replace():
+    """Review round 7. The retire commit removed the only pin on this arm while the branch changed it:
+    the `already configured` retry cleared the local config EVEN WITHOUT `--replace`, and re-running
+    `config.sh` without `--replace` does not adopt a registration — it CREATES a second one and
+    leaves the old one a ghost in the pool (the state #2892 exists to clean up). So the heal is
+    confined to the arm that has `--replace` to land it, and this case pins the refusal AND that the
+    install was not touched."""
+    with Env():
+        box = Box("replace-false")
+        try:
+            path = box.install("gh-runner-x64", "r-dead")
+            before = {
+                name: Path(path, name).read_bytes()
+                for name in (".runner", ".credentials", ".credentials_rsaparams")
+            }
+            box.apply()
+            box.refusals(1)
+            raised = None
+            try:
+                ra.register(Path(path), "r-dead", "daniel-ospina/tortoise", "self-hosted-x64", False)
+            except ra.ActionFailed as exc:
+                raised = str(exc)
+            check(
+                raised is not None,
+                "replace=False must NOT clear-and-retry: without --replace the retry registers a "
+                "SECOND runner and leaves a ghost. Expected ActionFailed.",
+            )
+            contains(raised, "already configured", "the refusal carries the runner's own words")
+            calls = box.calls("config-calls.log")
+            check(
+                len([c for c in calls if "argv=" in c]) == 1,
+                f"exactly ONE configure attempt (no retry without --replace): {calls}",
+            )
+            check(
+                "call 1 local_runner=present" in calls,
+                f"the local config must not have been cleared on this arm: {calls}",
+            )
+            after = {name: Path(path, name).read_bytes() for name in before}
+            check(after == before, "the install must be byte-identical after the refused call")
+        finally:
+            box.destroy()
+
+
 # ── the mutation map ──────────────────────────────────────────────────────────────────────────
 class Mutation:
     def __init__(self, case_id, old, new, why):
@@ -1966,6 +2168,36 @@ class Mutation:
 
 
 MUTATIONS = [
+    # ── review round 7 ──
+    Mutation(
+        "T26",
+        '    if not record["problems"] and record.get("unverified_cause") != "pool-read-after-restart":',
+        '    if (\n        not record["problems"]\n        and not record.get("problem_kind")\n        and record.get("unverified_cause") != "pool-read-after-restart"\n    ):',
+        "the REFUSAL leg is excluded from the alarm's gate again: the probe never reads the queue "
+        "on the one pass that exits 0, so a starved box reports green (the measured fail-open)",
+    ),
+    Mutation(
+        "T26",
+        '    elif starvation.get("state") == "starved":\n        # ⛔ THE ALARM OWNS THE VERDICT',
+        '    elif False:  # MUTATION: the alarm loses to the refusal\n        # ⛔ THE ALARM OWNS THE VERDICT',
+        "the verdict ORDER is restored to refusal-first: the alarm evaluates, sets the counts, and "
+        "then the refusal's exit 0 wins — a page computed and thrown away",
+    ),
+    Mutation(
+        "T27",
+        "        shape = transient_path_problem(token)\n        if shape:",
+        "        shape = transient_path_problem(token)\n        if False:",
+        "the audit stops judging the paths ExecStart NAMES — which is the shape `render_unit` "
+        "writes (durable interpreter, transient script): a unit whose program a reclaim takes is "
+        "reported 'all usable', the false PASS on 'the converger is scheduled'",
+    ),
+    Mutation(
+        "T4b",
+        'if rc != 0 and _ALREADY_CONFIGURED in out.lower() and replace:',
+        'if rc != 0 and _ALREADY_CONFIGURED in out.lower():',
+        "the clear-and-retry runs on the replace=False arm too: config.sh re-registers WITHOUT "
+        "--replace, creating a SECOND runner and leaving the old one a ghost in the pool",
+    ),
     Mutation(
         "T24",
         'if len(fields) >= 4 and fields[-3].isdigit():\n            return int(fields[-3])',
