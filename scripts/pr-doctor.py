@@ -1051,7 +1051,7 @@ SPAWN_TIMEOUT_S = 2400        # wall-clock cap handed to the background worker
 # on the worker.
 SPAWN_CALL_TIMEOUT_S = 120
 # A gate refusal (AGENT_DISK_REFUSED=77 / AGENT_LOAD_REFUSED=75 / AGENT_LAND_BACKLOG=74 /
-# AGENT_MEM_REFUSED=73) consumed nothing, so it must not
+# AGENT_MEM_REFUSED=81) consumed nothing, so it must not
 # be recorded. `nonblocking-dispatch.sh` backgrounds `run_agent()` and returns 0 the moment the
 # worker is launched, so the refusal code only ever lands in `$O/bg/<name>.rc`; this is the bound
 # dispatch() gives it to appear before concluding that the worker launched.
@@ -1066,7 +1066,7 @@ CONFIRM_WINDOW_S = 1.0
 # `7` is not a refusal code, so dispatch() recorded as launched a spawn the gate had REFUSED.
 # Require the trailing newline, so a partial write is never a verdict.
 _RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
-GATE_REFUSALS = (73, 74, 75, 77)
+GATE_REFUSALS = (73, 74, 75, 77, 81)
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
 # gate refused, nothing consumed" from "a `pi` exited 75 for its own reason" -- the ambiguity
@@ -1075,7 +1075,7 @@ GATE_REFUSALS = (73, 74, 75, 77)
 # `[land-backlog]` is the creation back-pressure gate (agent-infra#2409, exit 74). Without it a
 # refusal read as "launched", so the row burned a 45-min cooldown and a 90-min budget slot for a
 # worker that never started -- the exact accounting failure the 75/77 discrimination exists for.
-# `[mem-gate]` is the available-memory gate (agent-infra#2387, exit 73), and it is the same failure one
+# `[mem-gate]` is the available-memory gate (agent-infra#2387, exit 81), and it is the same failure one
 # class over: a box sitting at its memory floor refuses EVERY pr-doctor spawn, so an unknown code
 # would burn a cooldown and a class slot on each pass for work that cannot start at all.
 REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED", "[land-backlog] REFUSED",
@@ -3314,7 +3314,7 @@ def read_rc(path: str):
 
 
 def gate_refused(name: str, code) -> bool:
-    """True iff a 73/74/75/77 `.rc` was written by the GATE, not by a `pi` that exited 74/75 itself.
+    """True iff a 73/74/75/77/81 `.rc` was written by the GATE, not by a `pi` that exited 74/75 itself.
 
     The codes share the 0-255 exit namespace with `pi`, so the code alone is ambiguous -- and the
     two meanings have OPPOSITE consequences here ("nothing consumed, do not record" vs "an agent
@@ -3601,7 +3601,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     `record` says whether the ATTEMPT belongs in the state file even though nothing was launched.
     Two of the three refusal classes differ in exactly that:
 
-      * a GATE refusal (load 75 / memory 73 / disk 77 / land-backlog 74) consumed nothing and CLEARS
+      * a GATE refusal (load 75 / memory 81 / disk 77 / land-backlog 74) consumed nothing and CLEARS
         BY ITSELF -> not recorded; a row would burn a 45-min cooldown and a 90-min budget slot for
         work that never ran;
       * a WORKTREE refusal that is a verdict about the tree (uncommitted work, commits the PR

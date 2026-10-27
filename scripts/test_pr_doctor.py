@@ -2216,29 +2216,29 @@ def test_a_land_backlog_refusal_VOIDS_the_row(tmp_path, monkeypatch):
 
 
 def test_a_MEMORY_refusal_VOIDS_the_row(tmp_path, monkeypatch):
-    """Exit 73 is a gate refusal, not a launch (agent-infra#2387).
+    """Exit 81 is a gate refusal, not a launch (agent-infra#2387).
 
     Same accounting failure as the 74 arm above, and on a box at its memory floor it is not a rare
     one: EVERY pr-doctor spawn is refused, so an unrecognised 73 records a "launched" row on every
     pass -- a 45-min cooldown and a 90-min budget slot each time, for a worker that never started.
     Both halves again: the code must be in GATE_REFUSALS and the marker must be the gate's own line.
     """
-    assert 73 in pr.GATE_REFUSALS
+    assert 81 in pr.GATE_REFUSALS
     d = tmp_path / "orch"
     (d / "bg").mkdir(parents=True)
-    (d / "bg" / "prd-9.rc").write_text("73\n")
+    (d / "bg" / "prd-9.rc").write_text("81\n")
     (d / "bg" / "prd-9.log").write_text(
         "[mem-gate] REFUSED bg prd-9: LOW MemAvailable=653M < mem_min_avail_mb=2048M "
         "(= mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2) -- no agent was started\n")
     monkeypatch.setattr(pr, "ORCH_DIR", str(d))
-    assert pr.gate_refused("prd-9", 73) is True
+    assert pr.gate_refused("prd-9", 81) is True
     st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
                 "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
     assert pr.void_refused_rows(st) == ["9"]
-    # The cooldown-KEEPING direction: an agent that exits 73 itself is not a gate refusal.
+    # The cooldown-KEEPING direction: an agent that exits 81 itself is not a gate refusal.
     (d / "bg" / "prd-9.log").write_text(
-        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=73\n")
-    assert pr.gate_refused("prd-9", 73) is False
+        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=81\n")
+    assert pr.gate_refused("prd-9", 81) is False
 
 
 def test_the_refusal_markers_are_the_gates_own_lines():

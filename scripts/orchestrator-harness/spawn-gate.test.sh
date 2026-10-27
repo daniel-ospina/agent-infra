@@ -42,7 +42,7 @@ echo "==> spawn-gate self-test ($HERE)"
 # ── the MEMORY gate's neutraliser (agent-infra#2387) ───────────────────────────
 # EVERY arm in this suite except section 12 wants the memory gate out of the way, for exactly the
 # reason the disk arms pin `DISK_MIN_FREE_MB=1` below: a spawn assertion must be decided by its
-# SUBJECT, not by THIS HOST's free RAM. Without this, a memory-tight CI box would answer `73` to a
+# SUBJECT, not by THIS HOST's free RAM. Without this, a memory-tight CI box would answer `81` to a
 # load-gate arm and the suite would report "load-gate regressions" that are not regressions. It is
 # exported once rather than repeated at fourteen call sites, and it is a FLOOR, not a switch: there
 # is still a comparison, still a probe and still a refusal path — section 12 drives all three, and
@@ -694,7 +694,7 @@ ck "fix-one.sh NAMES the disk gate on a disk refusal (not the load gate)" $rc
 { [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $rc
 
-# ... and the MEMORY refusal through the same caller (#2387). 73, refunded the same way, and NAMED as
+# ... and the MEMORY refusal through the same caller (#2387). 81, refunded the same way, and NAMED as
 # memory: the third remedy is neither "wait for load" nor "reclaim disk" (a lane must FINISH), so a
 # caller that folds it into either sends the operator to a reading that will never move.
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
@@ -702,8 +702,8 @@ fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; mrc=$?
 mgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
-{ [ "$mrc" -eq 73 ] && [ "$mgot" = "1" ]; }; rc=$?
-ck "fix-one.sh --argv on a MEMORY refusal exits 73 and REFUNDS the attempt (rc=$mrc, fixcount=${mgot:-<gone>})" $rc
+{ [ "$mrc" -eq 81 ] && [ "$mgot" = "1" ]; }; rc=$?
+ck "fix-one.sh --argv on a MEMORY refusal exits 81 and REFUNDS the attempt (rc=$mrc, fixcount=${mgot:-<gone>})" $rc
 grep -q 'fixer NOT started (memory gate' "$RO/logs/fix-7.log"; rc=$?
 ck "fix-one.sh NAMES the memory gate on a memory refusal (not the load or disk one)" $rc
 { [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
@@ -1146,7 +1146,7 @@ ck "lane.sh NAMES the load gate on a load refusal" $rc
 ck "lane.sh on a DISK refusal exits 77 (got $lrc2) — not reported as a load refusal" $rc
 grep -q 'DISK gate refused' "$RO/logs/lane-9999.log"; rc=$?
 ck "lane.sh NAMES the disk gate on a disk refusal" $rc
-# ... and the MEMORY arm: 73 propagates out of lane.sh, the refusal line NAMES the memory gate, and
+# ... and the MEMORY arm: 81 propagates out of lane.sh, the refusal line NAMES the memory gate, and
 # the capacity record carries `gate=mem`. That last field is not decoration: chain-merge.sh reads it
 # to decide whether a peer box may take the issue, and `mem` is TRANSFERABLE (a peer with free RAM can
 # run this work) while `land` is not — so collapsing it into `load` would be right by luck and
@@ -1155,8 +1155,8 @@ ck "lane.sh NAMES the disk gate on a disk refusal" $rc
 ( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
-[ "$lrc3" -eq 73 ]; rc=$?
-ck "lane.sh on a MEMORY refusal exits 73 (got $lrc3) — not reported as a load or disk refusal" $rc
+[ "$lrc3" -eq 81 ]; rc=$?
+ck "lane.sh on a MEMORY refusal exits 81 (got $lrc3) — not reported as a load or disk refusal" $rc
 grep -q 'MEMORY gate refused' "$RO/logs/lane-9999.log"; rc=$?
 ck "lane.sh NAMES the MEMORY gate on a memory refusal" $rc
 capgate="$(cut -f3 "$RO/state/capacity-refused-9999" 2>/dev/null)"
@@ -2345,8 +2345,8 @@ ck "...and the model really was invoked on that reading (proven live, so the ref
 : > "$LOG"; : > "$PI_LOG"
 rows_w0=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_w0="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
 res="$(drive_mem 653 2048)"
-[ "$res" = "rc=73 started=0" ]; rc=$?
-ck "a FABRICATED low reading (653M) REFUSES: rc=73, AGENT_STARTED=0 ($res)" $rc
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "a FABRICATED low reading (653M) REFUSES: rc=81, AGENT_STARTED=0 ($res)" $rc
 [ ! -s "$PI_LOG" ]; rc=$?
 ck "no model was invoked on a memory refusal (~proven live by the control above)" $rc
 # THE REFUSAL MUST BE AUDITABLE: the reading, the floor, the arithmetic that produced it, and the
@@ -2375,7 +2375,7 @@ ck "a refusal records the MEASURED reading + floor in mem-avail.tsv (nf=$mnf, av
 # reader recompute the floor. Drive a deliberately operator-set floor and require it to SAY so.
 : > "$LOG"; : > "$PI_LOG"
 res="$(drive_mem 653 4096)"
-{ [ "$res" = "rc=73 started=0" ] && grep -q 'mem_min_avail_mb=4096M (SET BY THE OPERATOR' "$LOG" && ! grep -q '4096M (=' "$LOG"; }; rc=$?
+{ [ "$res" = "rc=81 started=0" ] && grep -q 'mem_min_avail_mb=4096M (SET BY THE OPERATOR' "$LOG" && ! grep -q '4096M (=' "$LOG"; }; rc=$?
 ck "an OPERATOR-SET floor says so and does NOT print '4096M (= 1024M x 2)' — a false equation teaches the reader to distrust the line ($res)" $rc
 
 # ── UNREADABLE: FAIL CLOSED, and say the word ─────────────────────────────────────────────────────
@@ -2384,8 +2384,8 @@ ck "an OPERATOR-SET floor says so and does NOT print '4096M (= 1024M x 2)' — a
 # headers exist to prevent.
 : > "$LOG"; : > "$PI_LOG"
 res="$(drive_mem UNREADABLE 2048)"
-[ "$res" = "rc=73 started=0" ]; rc=$?
-ck "an UNREADABLE probe REFUSES (fail-CLOSED, unlike the disk and load probes): rc=73, started=0 ($res)" $rc
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "an UNREADABLE probe REFUSES (fail-CLOSED, unlike the disk and load probes): rc=81, started=0 ($res)" $rc
 [ ! -s "$PI_LOG" ]; rc=$?
 ck "...and no agent was started for a probe that could not answer" $rc
 grep -q '\[mem-gate\] REFUSED .*UNREADABLE' "$LOG"; rc=$?
@@ -2407,7 +2407,7 @@ res="$(drive_mem "$real_avail" 1)"
 ck "the REAL reading ALLOWS at floor 1 ($res)" $rc
 : > "$LOG"; : > "$PI_LOG"
 res="$(drive_mem "$real_avail" 999999999)"
-[ "$res" = "rc=73 started=0" ]; rc=$?
+[ "$res" = "rc=81 started=0" ]; rc=$?
 ck "the SAME REAL reading REFUSES at floor 999999999 ($res) — the verdict follows the reading, not a constant" $rc
 grep -q "MemAvailable=${real_avail}M < mem_min_avail_mb=999999999M" "$LOG"; rc=$?
 ck "...and the refusal quotes the probe's own value (${real_avail}MB), so the log can be checked against the box" $rc
@@ -2424,7 +2424,7 @@ res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=0 DISK_GATE_PA
     LOG="$2"; PROMPT="$3"
     run_agent 1 "$LOG" "$PROMPT" "ordering" >/dev/null 2>&1
     printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
-[ "$res" = "rc=73 started=0" ]; rc=$?
+[ "$res" = "rc=81 started=0" ]; rc=$?
 ck "MEMORY outranks a simultaneous LOAD refusal — the reading whose consequence is a dead lane is reported ($res)" $rc
 grep -q 'load-gate' "$LOG"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
@@ -2440,7 +2440,7 @@ res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=0 DISK_GATE_PA
 [ "$res" = "rc=77 started=0" ]; rc=$?
 ck "a DISK refusal STILL outranks a simultaneous MEMORY refusal — the un-clearable one wins ($res)" $rc
 
-# ── the SPAWN POINT's memory refusal, TRANSLATED (72 -> 73) ─────────────────────────
+# ── the SPAWN POINT's memory refusal, TRANSLATED (72 -> 81) ─────────────────────────
 # Without this arm a shim memory refusal reaches every caller as "the agent ran and failed" or as a
 # LOAD refusal — and a reviewer/ fixer that never ran then spends a MAX_REVIEW_TRIES attempt or, worse,
 # authorises a fixer (the #1716/#1720 class the load translation already exists for).
@@ -2458,17 +2458,18 @@ res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
     LOG="$2"; PROMPT="$3"
     run_agent 1 "$LOG" "$PROMPT" "shim mem" >/dev/null 2>&1
     printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
-[ "$res" = "rc=73 started=0" ]; rc=$?
-ck "a pi spawn point exiting 72 (its MEMORY refusal) is translated to AGENT_MEM_REFUSED 73 ($res)" $rc
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "a pi spawn point exiting 72 (its MEMORY refusal) is translated to AGENT_MEM_REFUSED 81 ($res)" $rc
 grep -q '\[mem-gate\] REFUSED .*pi spawn point refused the launch for MEMORY' "$LOG"; rc=$?
 ck "...and the translation NAMES memory, not load — a load refusal here would point at a fine reading" $rc
 rows_t1=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_t1="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
 [ "$rows_t1" = "$rows_t0" ]; rc=$?
 ck "...and a spawn-point memory refusal appends NO walltime row ($rows_t1 vs $rows_t0)" $rc
-# The two spawn-point codes are DISTINCT — collapsing them is the defect the arm above exists for.
-d="$(bash -c '. "$1"; [ "$PI_GATE_REFUSED" != "$PI_GATE_MEM_REFUSED" ] && [ "$AGENT_MEM_REFUSED" != "$AGENT_LOAD_REFUSED" ] && echo distinct' _ "$GATE")"
+# The spawn-point and agent code sets must be pairwise DISTINCT — collapsing any two is the defect the
+# arm above exists for, and #2552's fork code (73) is the one that actually collided on rebase.
+d="$(bash -c '. "$1"; [ "$PI_GATE_REFUSED" != "$PI_GATE_MEM_REFUSED" ] && [ "$PI_GATE_MEM_REFUSED" != "$PI_FORK_REFUSED" ] && [ "$AGENT_MEM_REFUSED" != "$AGENT_LOAD_REFUSED" ] && [ "$AGENT_MEM_REFUSED" != "$AGENT_FORK_REFUSED" ] && [ "$AGENT_MEM_REFUSED" != "$AGENT_DISK_REFUSED" ] && [ "$AGENT_MEM_REFUSED" != "$AGENT_LAND_BACKLOG" ] && [ "$AGENT_MEM_REFUSED" != "$AGENT_BRIEF_REFUSED" ] && echo distinct' _ "$GATE")"
 [ "$d" = "distinct" ]; rc=$?
-ck "...and the shim's two refusals and the agent's two codes are all DISTINCT integers ($d)" $rc
+ck "...and every shim refusal and every agent code is a DISTINCT integer — no two gates share one ($d)" $rc
 
 # ── 14) a suite nothing RUNS is not a gate ──────────────────────────────
 # ⛔ THIS SUITE IS NOW A REGISTERED CI SHARD (review round 2, P1). It was not, and the block that

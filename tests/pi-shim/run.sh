@@ -423,7 +423,7 @@ res="$(PATH="$TMP/bin72:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 
   run_agent 1 "$2" "$3" "layered mem refusal" >/dev/null 2>&1
   printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
 ' _ "$GATE" "$TMP/agent.log" "$TMP/brief.txt" "$FIXREPO" 2>/dev/null)"
-[ "$res" = "rc=73 started=0" ] \
+[ "$res" = "rc=81 started=0" ] \
   && pass "run_agent turns the spawn point's 72 into AGENT_MEM_REFUSED with AGENT_STARTED=0 ($res)" \
   || fail "a spawn-point MEMORY refusal was not translated for the callers ($res)"
 grep -q '\[mem-gate\] REFUSED .*spawn point refused the launch for MEMORY' "$TMP/agent.log" \

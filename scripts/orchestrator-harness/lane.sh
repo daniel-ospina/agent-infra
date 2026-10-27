@@ -500,7 +500,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     echo "[lane $N] NOT started: FORK gate refused — this box is out of PROCESSES (agent-infra#2293). Waiting cannot clear it and this box cannot start the retry: restart or drain it from OUTSIDE, or let its lanes finish and the issue be re-dispatched elsewhere." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
     echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
-  elif [ "$rc" = "${AGENT_MEM_REFUSED:-73}" ]; then
+  elif [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then
     # ⛔ THE MEMORY GATE'S OWN NAME (#2387), for the disk branch's reason: an operator told "load"
     # watches a 1-min average that is fine while the OOM killer takes their lanes. The reading, the
     # floor and the arithmetic are on the `[mem-gate] REFUSED` line in the same log.

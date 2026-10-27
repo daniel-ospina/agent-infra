@@ -1196,7 +1196,7 @@ cap_wip_snapshot() {
 #
 # Gated: a refusal does not start the agent at all, and run_agent returns THAT gate's code —
 # AGENT_DISK_REFUSED (77, evaluated FIRST: a full filesystem never clears by waiting),
-# AGENT_MEM_REFUSED (73, evaluated SECOND: a box at its memory floor loses lanes to the OOM killer,
+# AGENT_MEM_REFUSED (81, evaluated SECOND: a box at its memory floor loses lanes to the OOM killer,
 # and unlike a load refusal the consequence is not slowness but a dead batch — agent-infra#2387),
 # AGENT_LOAD_REFUSED (75, which clears when the box quietens), or AGENT_LAND_BACKLOG (74, the creation
 # back-pressure gate: the repo's open-PR count is over its own measured landing ceiling, which clears
@@ -1245,10 +1245,13 @@ AGENT_DISK_REFUSED=77
 # memory floor is not (the OOM killer picks a lane, and a lane's death takes its batch). It is a
 # distinct third remedy too, and the mid one: it clears when RESIDENT LANES FINISH, so a caller can
 # wait — unlike the disk (never clears) and the land backlog (waiting is useless, land instead) — but
-# the wait is on capacity being RELEASED, not on load falling. 73 is chosen because 74/75/76/77/78
-# are taken (land/load/the spawn point/disk/refusal-fatal), and this file's codes are read by
-# `lane.sh`, `fix-one.sh` and `chain-merge.sh`.
-AGENT_MEM_REFUSED=73
+# the wait is on capacity being RELEASED, not on load falling. 81 is chosen because every code in the
+# sysexits band this file borrows is now taken — 73 fork, 74 land, 75 load, 76 the spawn point, 77 disk,
+# 78 cannot-verify, 79 adopt-fix, 80 brief — so this one lives outside it, like 80, i.e. a value no
+# third-party process can produce by accident. (It was 73 until main took 73 for the fork gate in
+# #2552; a memory refusal and a fork refusal have OPPOSITE remedies, so they cannot share a code.)
+# This file's codes are read by `lane.sh`, `fix-one.sh` and `chain-merge.sh`.
+AGENT_MEM_REFUSED=81
 # The CREATION back-pressure refusal (agent-infra#2409). A FOURTH code because it has a fourth
 # remedy, and it is the only one whose remedy is not about this box at all: the box is healthy, no
 # filesystem is full, and waiting will not clear it — the REPO has more open PRs than its own
@@ -1908,7 +1911,7 @@ reap_lane_venv() {
 #     own and is not gated on the FLOOR — that disarms the LOW arm only: `mem_gate_verdict` returns
 #     UNREADABLE and refuses BEFORE any comparison, so an unreadable probe stays refused whatever the
 #     floor says. The harness's own suites use it as a NEUTRALISER (`export MEM_MIN_AVAIL_MB=1`) so a
-#     memory-tight box does not answer a load arm with 73; the four values an operator sets
+#     memory-tight box does not answer a load arm with 81; the four values an operator sets
 #     deliberately are stated in README §7 and rendered by install.sh into the plist, so no caller can
 #     claim it did not know.
 #   * INTERACTIVE sessions are gated too, deliberately. "The gate at the spawn point" is not a claim

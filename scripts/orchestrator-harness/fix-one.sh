@@ -691,7 +691,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
   elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
     why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
-  elif [ "$ar" = "${AGENT_MEM_REFUSED:-73}" ]; then
+  elif [ "$ar" = "${AGENT_MEM_REFUSED:-81}" ]; then
     # ⛔ THE MEMORY GATE'S OWN WORDING (agent-infra#2387), for the reason the disk branch exists: the
     # remedies differ and the wrong name sends the operator to the wrong number. "load" would have
     # them watch a 1-min average on a box whose load is fine while the OOM killer takes lanes; the

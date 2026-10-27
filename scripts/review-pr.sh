@@ -853,7 +853,7 @@ fi
 if [ "$AGENT_RC" = "${PI_GATE_MEM_REFUSED:-72}" ]; then
   err "$PROG: the reviewer was NOT STARTED — the spawn-point MEMORY gate refused (rc=$AGENT_RC, PI_GATE_MEM_REFUSED). Nothing was consumed: no review was paid for, no comment posted, NO record written."
   err "  This is a capacity event, not a code verdict and not a crash. Re-run when resident lanes finish and release their working set — this does NOT clear by waiting for load; the [pi-gate] line in the transcript carries the reading and the floor (MEM_MIN_AVAIL_MB)."
-  exit "${AGENT_MEM_REFUSED:-73}"
+  exit "${AGENT_MEM_REFUSED:-81}"
 fi
 # ⛔ THE EXIT STATUS IS THE SIGNAL, NOT A STRING IN THE TRANSCRIPT (P3, fresh review of #2288). This
 # arm used to ALSO match `^\[pi-gate\] REFUSED` anywhere in the log, so a reviewer that QUOTED the

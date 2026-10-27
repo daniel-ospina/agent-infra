@@ -34,15 +34,22 @@ echo "[adopt-fix $PR] worktree=$WT branch=$BR $(date)" >> "$O/logs/adopt-$PR.log
 bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
 rc=$?
 # 75 = the load gate refused to start the fixer (nothing ran, nothing consumed). 77 = the DISK gate
-# refused it (#1765). 73 = the MEMORY gate refused it (#2387). Name ALL THREE here: the fixer's own
+# refused it (#1765). 81 = the MEMORY gate refused it (#2387). 73 = the FORK gate refused it
+# (#2293). Name ALL FOUR here: the fixer's own
 # line is inside fix-$PR.log, and this is the log a manual operator reads (#1720). They are not
 # interchangeable — a load refusal is cleared by the box quietening, a memory refusal by resident
 # lanes FINISHING, and a disk refusal only by reclaiming space — so reporting one as another sends the
 # operator to wait for a remedy that cannot arrive. ⛔ 73 is the one that would silently be reported as
 # a LOAD refusal by omission (it matches neither branch below), which is the exact false-cause class
 # this block exists to fix; the memory branch therefore sits ABOVE the load one.
-if [ "$rc" = "73" ]; then
+# ⛔ 81 IS THE MEMORY CODE, NOT 73 (#2387 x #2293). When this arm was written 73 was free and the
+# memory gate took it; main then took 73 for AGENT_FORK_REFUSED (#2552), which `fix-one.sh` now exits
+# for a box that is out of PROCESSES. Sharing the code would have told an operator to wait for lanes
+# to finish on a box that cannot start the retry — the exact false-cause class this block fixes.
+if [ "$rc" = "81" ]; then
   echo "[adopt-fix $PR] fixer NOT started (MEMORY gate) — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes finish, NOT by waiting for load; the reading and the floor are in fix-$PR.log." >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "73" ]; then
+  echo "[adopt-fix $PR] fixer NOT started (FORK gate) — this box is out of PROCESSES. Restart or drain it from OUTSIDE; waiting for load to fall cannot clear it and the box cannot start the retry. See $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "72" ]; then
