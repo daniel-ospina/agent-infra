@@ -122,8 +122,33 @@ REPOS = ("daniel-ospina/tortoise",
          "daniel-ospina/premise-labs",
          "daniel-ospina/agent-infra")
 
-JEV_URL = "https://jevtypesafeai.com/api/v1/decide"
-JEV_MODEL = "jev-1.13.0"      # pinned, exactly as the gate pins it
+# ⛔ THE VENDOR IS TYPESAFE — AND IT USED TO BE THE WRONG HOST (2026-10-26 owner report).
+# Every caller in the fleet POSTed to `jevtypesafeai.com`, which is NOT TypeSafe's API: it
+# is a lookalike host that billed on its own account (the balance declared in tortoise#7864
+# was paid THERE, not to the vendor whose docs this code cites). The real endpoint is
+# `api.typesafe.ai/v1/systemone`, and the key comes from console.typesafe.ai.
+# The endpoint is duplicated in exactly three places plus their deployed copies —
+# `scripts/ask-owner.py` and this file, and `~/.pi/agent/state/lane-verdict.py` (deployed,
+# untracked; `scripts/lane-actions.py` reads it as `LV.JEV_URL` / `LV.JEV_MODEL` and holds no
+# copy of its own), plus `~/.pi/agent/scripts/{turn-classify,ask-owner}.py`. A rotation is a
+# SWEEP over that list, never a one-line edit:
+#     grep -rn 'api.typesafe.ai' ~/.pi/agent/scripts ~/.pi/agent/state/lane-verdict.py \
+#         ~/Documents/GitHub/agent-infra/scripts
+# (scoped to the LIVE files on purpose: `~/.pi/agent/state/*` also holds archived copies and
+# mutation-test fixture trees that legitimately still contain the old host.)
+JEV_URL = "https://api.typesafe.ai/v1/systemone"
+# ⛔ THE MODEL PIN DOES **NOT** MOVE WITH THE HOST, and this is deliberate (review 2026-10-26).
+# `jev-1.13.0` is a VALID model on the real API — measured, `POST /v1/systemone`
+# `model=jev-1.13.0` → 200 `model: jev-1.13.0` (`/v1/models` lists ALIASES only, which is not
+# the same claim as "the version is rejected"; an unknown name 400s, e.g. `jev-9.9.9`).
+# So the migration is HOST-ONLY and the evidence underneath every bar stays valid: the vendor's
+# own guidance is that an alias "moves when a new release ships, so its answers can change
+# without any change to your code — if you have tuned confidence thresholds against one
+# version, send that version's ID instead of the alias". MIN_CONFIDENCE below and every
+# per-mark bar in ask-owner.py were measured on 1.13, so 1.13 is what votes.
+# To move to 1.14: re-derive those bars on 1.14 FIRST, then change this pin — as one recorded
+# decision, not as a side effect of a vendor migration.
+JEV_MODEL = "jev-1.13.0"
 
 # The three outcomes Jev chooses between. The FOURTH case the owner named —
 # "a question, protocol used" — is not a Jev question: it is decided by the label.
@@ -287,9 +312,17 @@ def last_turn_text(path: str) -> str:
 
 
 def jev_key() -> str | None:
-    k = os.environ.get("JEV_API_KEY")
-    if k:
-        return k
+    """The TypeSafe key. `TYPESAFE_API_KEY` is the vendor's own name for it; `JEV_API_KEY`
+    stays accepted because a plist, shell or cell env may set that older name
+    (agent-infra#2642), and a migration that silently unkeys the fleet is worse than one that
+    reads two names. The file is the same 0600 store it always was — and on this box it is the
+    only source, so the file fallback below is load-bearing, not a courtesy."""
+    for var in ("TYPESAFE_API_KEY", "JEV_API_KEY"):
+        k = os.environ.get(var)
+        # ⛔ `.strip()` FIRST — a whitespace-only value is truthy, so `if k:` let it win over the
+        # populated store and send `Bearer ` (a 401 whose cause looks like a set env var).
+        if k and k.strip():
+            return k.strip()
     try:
         return json.load(open(f"{HOME}/.pi/agent/jev-config.json")).get("apiKey")
     except Exception:                                            # noqa: BLE001
@@ -326,8 +359,19 @@ def jev_choice(state: str) -> tuple[str | None, dict]:
     if choice not in OUTCOMES:
         log(f"ERR jev choice not recognised: {choice!r}")
         return None, {}
-    return choice, {"confidence": ans.get("confidence"),
-                    "cost_usd": (d.get("usage") or {}).get("cost_usd")}
+    # THE REAL API REPORTS TOKENS, NOT MONEY: `usage` is `{input_tokens, output_tokens}`.
+    # The old host also returned `cost_usd`/`credits_remaining_usd`; those keys are read
+    # when present (so a future metered response is not silently dropped) and omitted
+    # rather than faked when absent — an invented 0.0 cost is a false measurement.
+    usage = d.get("usage") or {}
+    meta = {"confidence": ans.get("confidence"),
+            "model": d.get("model"),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens")}
+    for money in ("cost_usd", "credits_remaining_usd"):
+        if money in usage:
+            meta[money] = usage[money]
+    return choice, meta
 
 
 def lanes_with_open_question() -> tuple[set, bool]:
@@ -1209,8 +1253,10 @@ def main(argv: list[str]) -> int:
         if not a.dry_run:
             write_marker(lane, sid=sid, size=after, last=int(now),
                          verdict=choice, acted=True, result=result)
+        spend = (f"cost=${meta['cost_usd']}" if "cost_usd" in meta
+                 else f"tokens={meta.get('input_tokens')}/{meta.get('output_tokens')}")
         log(f"{lane}: {choice} -> {kind} :: {result} "
-            f"(conf={conf}, cost=${meta.get('cost_usd')})")
+            f"(conf={conf}, model={meta.get('model')}, {spend})")
         sent += 1
 
     if sent == 0 and not a.print_turn:
