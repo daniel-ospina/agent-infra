@@ -174,12 +174,42 @@ valid_num() {
   return 0
 }
 
+# ── THE KNOBS ARE VALIDATED WHERE THEY ARE ENFORCED, NOT ONLY WHERE THEY ARE RENDERED ───────────
+# `valid_num()` is this file's rule for every number it COMPARES, and these three knobs are not exempt.
+# Found by review (#2896 round 2) — all three failed OPEN, and none of them is render-only: an operator
+# or a shell profile can set the environment directly, so the fallback has to live at the point of use.
+#   WORKER_SUPPLY_MAX_REFILLS=two  → `[ <n> -ge two ]` does not PARSE (rc 2), the `if` reads FALSE, and
+#                                    the per-order crash-loop bound is INERT: a worker that dies for
+#                                    ever is re-offered for ever, and the record cannot say so.
+#   WORKER_SUPPLY_INTERVAL_S=abc   → `sleep` exits at once and so does `wait`, so `--loop` re-passes
+#                                    with NO interval — a hot loop against the dispatcher.
+#   WORKER_SUPPLY_INTERVAL_S=0     → the same hot loop, from a value `valid_num` accepts.
+# The installer REFUSES these values at render time (install-worker-supply.sh) — refusing is right for
+# an install question, and wrong for an already-running supervisor, which must keep supplying.
+if ! valid_num "$MAX_REFILLS"; then
+  say "knob: WORKER_SUPPLY_MAX_REFILLS='$MAX_REFILLS' is not a non-negative integer — using 2 (an UNREADABLE bound is an inert one: every dead order would be re-offered for ever)"
+  MAX_REFILLS=2
+fi
+if ! valid_num "$INTERVAL_S" || [ "$INTERVAL_S" -eq 0 ]; then
+  say "knob: WORKER_SUPPLY_INTERVAL_S='$INTERVAL_S' is not a positive integer — using 60 (0 or a non-number makes \`sleep\` return at once: a hot loop, not a cadence)"
+  INTERVAL_S=60
+fi
+case "$PREFIX" in
+  ''|*[[:space:]]*)
+    say "knob: WORKER_SUPPLY_PREFIX='$PREFIX' is empty or contains whitespace — using 'prd-' (the order glob would match nothing, and an empty queue reads as a clean pass)"
+    PREFIX="prd-" ;;
+esac
+
 # The plist's EnvironmentVariables, as `KEY=VALUE` lines. Read with python3's plistlib (both platforms
 # have it; `plutil` is macOS-only) and printed only — a malformed or absent plist is EMPTY, never an
 # error: the environment and then the shipped defaults still apply, and every read is total.
 plist_env_dump() { # <plist> <outfile>
   local pl="$1" out="$2"
-  : > "$out" 2>/dev/null || return 0
+  # ⛔ THE REDIRECTION FAILS *BEFORE* `2>/dev/null` IN THE SAME COMMAND TAKES EFFECT, so the shell's own
+  # "No such file or directory" leaked to stderr — `install-worker-supply.sh` folds this into the report
+  # it shows an operator, contradicting the rule stated directly above (an absent plist is EMPTY, never
+  # an error). A compound command applies the redirections to the GROUP, so the failure is silent.
+  { : > "$out"; } 2>/dev/null || return 0
   [ -f "$pl" ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
   bounded 20 python3 - "$pl" > "$out" 2>/dev/null <<'PY' || : > "$out"
@@ -219,13 +249,19 @@ limit_of() {
 lock_take() {
   mkdir -p "$STATE_DIR" 2>/dev/null || { say "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
   if mkdir "$LOCK_DIR" 2>/dev/null; then printf '%s\n' "$$" > "$LOCK_DIR/pid"; return 0; fi
-  local holder age now
+  local holder age now holder_cmd
   holder="$(cat "$LOCK_DIR/pid" 2>/dev/null | tr -d ' \n' || true)"
   if valid_num "$holder" && kill -0 "$holder" 2>/dev/null; then
     # A LIVE PID IS A HOLDER ONLY IF IT IS THIS SCRIPT. A recycled pid would otherwise wedge the
     # supervisor for ever (an inert guard is the failure this file exists to remove); a pid that IS
     # another worker-supply is positive evidence, and is respected.
-    if ps -o command= -p "$holder" 2>/dev/null | grep -q 'worker-supply\.sh'; then
+    # ⛔ NO PIPE INTO `grep -q` (found by review, #2896 round 2 — the shape the repo's own SIGPIPE guard
+    # exists for): under `set -o pipefail` a `grep -q` that exits at the match can make the WRITER die of
+    # SIGPIPE, the pipeline then reports 141, this `if` reads FALSE, and a LIVE holder is classified as a
+    # recycled pid — the one outcome this guard exists to prevent (two supervisors, one worktree).
+    # Capture, then test the string.
+    holder_cmd="$(ps -o command= -p "$holder" 2>/dev/null || true)"
+    if grep -q 'worker-supply\.sh' <<<"$holder_cmd"; then
       say "ALREADY-RUNNING: holder pid=$holder holds $LOCK_DIR — nothing touched"
       return 1
     fi
@@ -585,6 +621,9 @@ show_status() {
   review="$(limit_of MAX_REVIEW "$DEFAULT_MAX_REVIEW" "$plenv")"
   cap=$(( fix + review ))
   echo "now:   orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown (fix=$fix review=$review)"
+  # …and the knobs the process ACTUALLY resolved (post-validation): the unit renders what was asked for,
+  # this line is what is enforced — the two are different facts when an override was rejected.
+  echo "knobs: interval_s=$INTERVAL_S max_refills=$MAX_REFILLS prefix=$PREFIX"
   echo "paths: dispatcher=$DISPATCH bg=$BG_DIR ledger=$LEDGER log=$LOG"
   if [ -d "$LOCK_DIR" ]; then
     echo "lock:  HELD by pid $(cat "$LOCK_DIR/pid" 2>/dev/null || echo '<unknown>') ($LOCK_DIR)"

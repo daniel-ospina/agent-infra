@@ -366,6 +366,39 @@ O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
 grep -q 'spent its 2 refill' "$ST/worker-supply.log" 2>/dev/null && ok "…and the log names the exhausted order" \
                                                                  || bad "the exhausted order was not named"
 
+# ── (d4) THE BOUND MUST NOT GO INERT FROM A TYPO ────────────────────────────────────
+# ⛔ FOUND BY REVIEW (#2896 round 2, P2), and it failed OPEN: `[ "$(refills_of …)" -ge "$MAX_REFILLS" ]`
+# with a non-numeric MAX_REFILLS does not fail the pass — it fails to PARSE, the `if` reads FALSE, and
+# the order is re-offered for ever with nothing in the record saying the bound was never applied.
+# `WORKER_SUPPLY_INTERVAL_S=abc` is the same class one knob over: `sleep` returns at once, so `--loop`
+# re-passes with no cadence. Pinned BEHAVIOURALLY, not by grepping for the guard: `status` reports the
+# knob it actually resolved, and the cap still HOLDS at the fallback.
+reset
+mkdir -p "$BG" 2>/dev/null
+mkwt "$TMP/wt/prd-31" fix/31
+echo brief > "$TMP/briefs/prd-31.txt"
+mkorder prd-31 "$TMP/wt/prd-31" fix/31 "$TMP/briefs/prd-31.txt" 2400 "2026-10-27 01:00:00"
+knob_line="$(O="$O" WORKER_SUPPLY_MAX_REFILLS=two WORKER_SUPPLY_INTERVAL_S=abc WORKER_SUPPLY_PREFIX='prd -' \
+             bash "$SUPPLY" status 2>/dev/null | grep -o 'interval_s=[0-9]* max_refills=[0-9]* prefix=[^ ]*' | head -1)"
+[ "$knob_line" = "interval_s=60 max_refills=2 prefix=prd-" ] \
+  && ok "an UNREADABLE override falls back to the shipped default and SAYS so ($knob_line)" \
+  || bad "the invalid overrides were not normalised: '$knob_line' (expected interval_s=60 max_refills=2 prefix=prd-)"
+O="$O" SPAWNS="$SPAWNS" WORKER_SUPPLY_MAX_REFILLS=two MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
+[ "$(spawns_for prd-31)" = "1" ] && ok "…and a pass still re-offers the dead order (the typo does not disable supply)" \
+                                 || bad "the invalid override stopped the refill: $(spawns_for prd-31) spawns"
+sleep 1.1
+kill "$(cat "$BG/prd-31.pid" 2>/dev/null)" 2>/dev/null
+sleep 0.2
+O="$O" SPAWNS="$SPAWNS" WORKER_SUPPLY_MAX_REFILLS=two MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
+[ "$(spawns_for prd-31)" = "2" ] && ok "…a second death is re-offered (2 of the fallback's 2)" \
+                                 || bad "second death re-offers: $(spawns_for prd-31), expected 2"
+sleep 1.1
+kill "$(cat "$BG/prd-31.pid" 2>/dev/null)" 2>/dev/null
+sleep 0.2
+O="$O" SPAWNS="$SPAWNS" WORKER_SUPPLY_MAX_REFILLS=two MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
+[ "$(spawns_for prd-31)" = "2" ] && ok "…and the cap HOLDS at the fallback: a third death stops the refills (the typo cannot make the bound inert)" \
+                                 || bad "the crash-loop bound was INERT under a non-numeric override: $(spawns_for prd-31) re-offers"
+
 # ── (d2) ONE WORKTREE, TWO NAMES — the guard that stops a second worker into a live tree ────────
 # ⛔ FOUND BY REVIEW (#2896 round 1, P1), and it is the documented #2280 defect one layer down.
 # `pr-doctor.worker_name()` is MODE-QUALIFIED (`prd-<tag>-42` in a multi-repo pass) while the

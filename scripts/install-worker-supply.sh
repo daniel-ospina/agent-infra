@@ -131,9 +131,24 @@ render() { # <dest>
     user="${USER:-$(id -un 2>/dev/null || printf root)}"
     # ⛔ systemd SPLITS an unquoted Environment=/ExecStart= value on whitespace, so a rendered value
     # containing a space would silently start the wrong program. Refuse rather than install that.
-    case "$path$SCRIPT$user$CELL_HOME$O" in
-      *[[:space:]]*) die "REFUSING: a rendered value contains whitespace (PATH='$path' SCRIPT='$SCRIPT') — systemd would split it" ;;
+    # The three knobs are IN this set (#2896 round 2): they are rendered into `Environment=` too, and
+    # `WORKER_SUPPLY_PREFIX='prd -'` widens the order glob into a two-word pattern that matches nothing.
+    case "$path$SCRIPT$user$CELL_HOME$O$INTERVAL_S$PREFIX$MAX_REFILLS" in
+      *[[:space:]]*) die "REFUSING: a rendered value contains whitespace (PATH='$path' SCRIPT='$SCRIPT' PREFIX='$PREFIX') — systemd would split it" ;;
     esac
+    # ⛔ THE TWO NUMBERS ARE RENDERED AND THEN COMPARED BY A `[ ]` TEST, so a typo here is not a cosmetic
+    # unit: `WORKER_SUPPLY_MAX_REFILLS=two` makes the crash-loop bound INERT (`[ <n> -ge two ]` never
+    # parses, the pass reads "not deferred") and `WORKER_SUPPLY_INTERVAL_S=abc` makes `sleep` fail at
+    # once, so `--loop` re-passes with no interval. REFUSE at render time; the supervisor itself falls
+    # back to its shipped default instead (worker-supply.sh), because a running supply path must not
+    # refuse to supply.
+    case "$MAX_REFILLS" in
+      ''|*[!0-9]*) die "REFUSING: WORKER_SUPPLY_MAX_REFILLS='$MAX_REFILLS' is not a non-negative integer — the per-order crash-loop bound would be INERT" ;;
+    esac
+    case "$INTERVAL_S" in
+      ''|*[!0-9]*) die "REFUSING: WORKER_SUPPLY_INTERVAL_S='$INTERVAL_S' is not a positive integer — \`sleep\` would fail and --loop would spin" ;;
+    esac
+    [ "$INTERVAL_S" -gt 0 ] || die "REFUSING: WORKER_SUPPLY_INTERVAL_S=0 makes --loop re-pass with no interval"
     sed -e "s|{{SCRIPT}}|$SCRIPT|g" \
         -e "s|{{USER}}|$user|g" \
         -e "s|{{HOME}}|$CELL_HOME|g" \

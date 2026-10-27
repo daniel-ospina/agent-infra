@@ -2444,6 +2444,19 @@ bash worker-supply.sh --dry-run  # decide and print; spawn nothing, write no led
 bash worker-supply.sh --loop     # what the service runs: pass, sleep INTERVAL, repeat
 ```
 
+⛔ **THE KNOBS ARE VALIDATED WHERE THEY ARE ENFORCED, NOT ONLY WHERE THEY ARE RENDERED.** Both units
+render `WORKER_SUPPLY_INTERVAL_S` / `WORKER_SUPPLY_PREFIX` / `WORKER_SUPPLY_MAX_REFILLS` into `Environment=`,
+but the environment is not the only way in (an operator, a shell profile, or a hand-edited unit can set
+them directly), so `worker-supply.sh` re-validates at startup against `valid_num()` and falls back to the
+shipped default with a `knob:` line — `status` prints the resolved values (`knobs: interval_s=…
+max_refills=… prefix=…`), because what the unit renders and what is enforced are different facts once an
+override is rejected. Both failure modes it closes are FAIL-OPEN and were found by review: a non-numeric
+`MAX_REFILLS` makes the per-order crash-loop bound INERT (`[ <n> -ge two ]` never parses, so every dead
+order is re-offered for ever) and a non-numeric or zero `INTERVAL_S` makes `sleep` return at once, i.e. a
+hot loop against the dispatcher rather than a cadence. The INSTALLER refuses the same values at render
+time instead — refusing is right for an install question and wrong for an already-running supervisor,
+which must keep supplying.
+
 **A worker is ACCEPTED by a FILE, never by a return code.** The dispatcher writes `$O/bg/<name>.pid`
 and `.started`; `--status` then answers `running`, and `pr-doctor.worker_live_for()` — the doctor's own
 accept check — returns `True`, so the order stops being `undeliverable`. The supervisor therefore

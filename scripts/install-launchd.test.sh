@@ -524,7 +524,7 @@ else
     # invariant instead of relying on the exit code alone.
     assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
 fi
-assert_eq "$BOOTSTRAP_COUNT1" "$((13 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (13 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate + the #1862-restored pi-reap-orphans + pr-doctor (#2303) + controller-watchdog (#2303) + worker-supply (#2700), plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
+assert_eq "$BOOTSTRAP_COUNT1" "$((13 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (13 always-installable on a non-swarm host: corruption-canary + provider-latency-tripwire + fleet-cost-weekly + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + objective-reminder + ci-runner-gate + the #1862-restored pi-reap-orphans + controller-watchdog (#2303) + worker-supply (#2700); pr-doctor is one of the FOUR {{TORTOISE_REPO}}-gated templates above, NOT always-installable, so a list that names it here is off by one the moment someone follows it)"
 # #1949 (rebased onto #2006; re-keyed after review): name the two gated JOBS, so an ambient
 # `TORTOISE_REPO` fails with its cause instead of being absorbed by the derived count above.
 # ⛔ The guard must be `GATED_VISIBLE1` (derived from the FILESYSTEM), never `GATED_INSTALLED1`:
