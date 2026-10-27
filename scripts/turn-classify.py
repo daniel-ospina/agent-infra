@@ -146,7 +146,7 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # ships ... if you have tuned confidence thresholds against one version, send that version's
 # ID instead of the alias").
 # ⚠️ What makes that survivable is the ECHO: the response carries the concrete version that
-# answered, and `jev_call` returns it as `meta["model"]` — so a verdict that shifted for a
+# answered, and `jev_choice` returns it as `meta["model"]` — so a verdict that shifted for a
 # reason no diff explains is visible in the record (`model: jev-1.14.0` against bars measured
 # on 1.13) instead of being inferred later from behaviour. Re-derive the bars FIRST when that
 # shows up; pinning a version again is a one-line change here and in `ask-owner.py`.

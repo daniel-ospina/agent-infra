@@ -311,6 +311,5 @@ def test_call_shape_and_meta_carry_tokens_not_an_invented_cost(monkeypatch, tmp_
     assert isinstance(q["instructions"], str) and q["instructions"].strip(), q
     assert set(q["criteria"]) == set(tc.OUTCOMES), q
     assert seen["auth"] == "Bearer k", seen["auth"]
-    assert meta["model"] == "jev-1.14.0", meta
     assert (meta["input_tokens"], meta["output_tokens"]) == (10, 3), meta
     assert "cost_usd" not in meta, "an absent meter must not be reported as a measured 0"

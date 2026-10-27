@@ -2770,7 +2770,7 @@ def _deployed_constants(filename):
 
 
 @pytest.mark.parametrize("filename", ["turn-classify.py", "ask-owner.py"])
-def test_the_deployed_scripts_carry_the_real_vendor_and_the_pin(filename):
+def test_the_deployed_scripts_carry_the_real_vendor_and_the_model(filename):
     """⛔ THE FILES THE BEAT ACTUALLY EXECUTES. The sweep list names
     `~/.pi/agent/scripts/{turn-classify,ask-owner}.py`, and nothing pinned them: a rotation that
     updated the repo and missed the deployed copy would keep the fleet on the lookalike host with
@@ -2783,4 +2783,4 @@ def test_the_deployed_scripts_carry_the_real_vendor_and_the_pin(filename):
     if consts is None:
         pytest.skip("no ~/.pi/agent/scripts/%s on this box — nothing measured" % filename)
     assert consts.get("JEV_URL") == "https://api.typesafe.ai/v1/systemone", (filename, consts)
-    assert consts.get("JEV_MODEL") == "jev-1.13.0", (filename, consts)
+    assert consts.get("JEV_MODEL") == "jev-latest", (filename, consts)

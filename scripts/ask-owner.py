@@ -64,8 +64,9 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # exactly about this ("an alias moves when a new release ships ... if you have tuned
 # confidence thresholds against one version, send that version's ID instead of the alias").
 # ⚠️ The consequence is not that the gate stops working; it is that a verdict can shift for a
-# reason no diff explains. `MIN_CONFIDENCE` and the per-mark bars are therefore the FIRST
-# thing to re-derive when a verdict looks wrong, and `turn-classify.py` records the model the
+# reason no diff explains. THIS file's thresholds (`THRESHOLD`, `THRESHOLD_LANGUAGE`,
+# `THRESHOLD_JARGON`) and `turn-classify.py`'s `MIN_CONFIDENCE` are therefore the FIRST thing to
+# re-derive when a verdict looks wrong, and `turn-classify.py` records the model the
 # API ECHOES (`meta["model"]`, i.e. the concrete version that answered) precisely so that
 # shift is visible in the record instead of being inferred from behaviour.
 # Pinning a version again is a one-line change here plus `scripts/turn-classify.py`; it needs
