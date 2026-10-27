@@ -439,9 +439,15 @@ not a load average measured earlier.
     `git status` prints `dirty=0`. Test `git status` itself, then count.
   - **The population depends on the destruction.** Deleting a *worktree* needs its repo's trees; a **recreate** or the
     `cmux-tui` reset takes the whole guest — on cell-3 that is **five repos** (`$REPO` 27 trees, `/tmp/cell-ai` 44,
-    `$CELL_HOME/agent-infra` 2, `$CELL_HOME/tortoise` 3, `$CELL_HOME/wt-drain*` 2 dirs holding 14), with unpushed commits in
-    trees outside `$REPO`. And `HEAD` is not the box's work: **8** local branches there are no worktree's HEAD and die in a
-    recreate too.
+    `$CELL_HOME/agent-infra` 2, `$CELL_HOME/tortoise` 3, and the ai-drainer's **seed repo** holding 14), with unpushed
+    commits in trees outside `$REPO`. ⛔ **That fifth one is a REPO, not a `wt-drainer-*` path** — a `wt-drainer-*` entry is a
+    `git worktree add` target, not a checkout: `ai-drainer.sh` creates `$AI/wt-drainer-<lane>` with
+    `git -C "$SEED_REPO" worktree add` (search that phrase — `AI` defaults to `$HOME/orchestrator-ai`) from `SEED_REPO`, which
+    `install-drainer-timer.sh:72` defaults to `$HOME/agent-infra-main` and renders into the unit. So point the guard at
+    **that checkout** — re-derive it rather than trusting this line:
+    `systemctl cat eldato-ai-drainer.service | sed -n 's/^Environment=SEED_REPO=//p'` — never at a worktree path, or 14 trees
+    go unread behind a `VERDICT 0`. And `HEAD` is not the box's work: **8** local branches there are no worktree's HEAD and
+    die in a recreate too.
   - **`git status --porcelain` omits ignored state** (`keys.env`, `orchestrator/state/` show as `!!`) — which is *exactly*
     what a recreate destroys — so the block reports it in a third column. That column is **informational: its value does not
     move the exit code**, so a `0` from this block never means "nothing here matters" for a recreate; read the column.
@@ -485,7 +491,10 @@ not a load average measured earlier.
   `exit`, so the first repo would end the loop.
   ```bash
   rc_all=0
-  for R in "$REPO" /tmp/cell-ai /tmp/cell-home/agent-infra /tmp/cell-home/tortoise; do
+  # `agent-infra-main` is the ai-drainer's SEED_REPO (install-drainer-timer.sh:72's default; re-derive from the unit when
+  # AI/SEED_REPO are overridden in keys.env). Its wt-drainer-* trees are worktrees it OWNS, so THIS entry is the one that
+  # reads them — listing a wt-drainer-* path here would enumerate nothing and still print GUEST VERDICT 0.
+  for R in "$REPO" /tmp/cell-ai /tmp/cell-home/agent-infra /tmp/cell-home/agent-infra-main /tmp/cell-home/tortoise; do
     ( REPO=$R bash work-at-risk.sh ) || { s=$?; [ "$s" -gt "$rc_all" ] && rc_all=$s; }
   done
   echo "GUEST VERDICT $rc_all"; exit "$rc_all"
