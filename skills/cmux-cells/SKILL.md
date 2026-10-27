@@ -72,7 +72,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~10–150 MB**, decided by what it is doing (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle to ~150 MB loaded** (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -137,11 +137,13 @@ codes do not: 80 before 73.
    needs **6,494 MB** free, so the floor is not the number that decides (agent-infra#2721);
 4. **load** — `MAX_LOAD`, default `nproc × 10` (exit 75; `PI_GATE_REFUSED` 76 is translated into 75).
 
-The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. **Waiting
-clears exactly one of these ON ITS OWN — `MAX_LOAD` (75)** — and only because the box quietens. The others clear only when
-their cause is removed (disk reclaimed, lanes drained, brief re-authored), never by idling: the gate emits this on its fork
-refusal ("does NOT clear by waiting") and its headroom refusal ("This is NOT a load refusal: waiting does not clear it").
-So diagnosing a 73, 77, 80 or 74 as "the box is busy" and waiting is the trap.
+The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. **Only
+`MAX_LOAD` (75) clears because the box quietens on its own.** The rest clear when their **resource is released** or their
+**input changes** — a lane finishes or drains (73), disk is reclaimed or a lane finishes (77), the brief is re-authored (80),
+the install is repaired (78), the repo's open-PR queue actually lands (74) — and some may never clear at all: the gate emits
+"does NOT clear by waiting" on fork and "This is NOT a load refusal: waiting does not clear it" on headroom. So diagnosing a
+73, 77, 74, 78 or 80 as "the box is busy" and idling is the trap — **and 74 is repo-wide**, so re-dispatching it to another
+box refuses there too.
 
 **RAM is read by two other instruments — `spawn-gate.sh` reads NO memory at all.** The two floors live in `orch-loop.sh`
 (`MIN_MEM_FREE_MB`, default 512) and `capacity.sh` (`CAP_MIN_MEM_MB`, 512). The **scheduler** does budget per lane: `ai-drainer.sh`
@@ -202,9 +204,12 @@ Recovery ladder, cheapest first:
    today this lever refuses: the remedy for a full guest is step 5 (reclaim), and real growth needs a plan change
    (owner-level). When a box *is* below the cap, 32 → 40 GiB has made a dead-looking box respond immediately.
 5. Then, inside: kill stale lanes, `git gc --prune=now` on the clones, clear caches, re-run the update.
-   ⚠️ **`/` is not the only volume that fills.** On a cell also read `df -Pm` for the `cmux-tui` state volume (a small loop
-   mount at `~/.local/state/cmux-tui`): it fills independently of `/`, and it holds the terminal state that the ladder above
-   depends on — measured 927 of 974 MB (97 %) on cell-3 while `/` was 61 % full.
+   ⚠️ **`/` is not the only volume that fills.** On a cell also read `df -Pm` for the `cmux-tui` state volume (a loop mount at
+   `~/.local/state/cmux-tui`, from `cmux-tui-state.ext4`): it fills independently of `/`, and it holds the terminal state the
+   ladder above depends on — measured 927 of 974 MB (97 %) on cell-3 while `/` was 61 % full, the consumer being a
+   `workspace-registry.sqlite3` of ~900 MB in that volume's `sessions/`. None of the reclaim steps above touch it, so if it is
+   the volume at 100 %, this is an **owner-level** action (grow or reset that state volume) — and check whether the
+   terminal channel still answers `vm terminal read` before you rely on steps 1-2.
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -318,7 +323,7 @@ dispatch time, because both move.
 
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
-| `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, idle-most today, but **needs activation (§1)** before it can land |
+| `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, but **needs activation (§1)** before it can land |
 | `pi-cell-3` | product work | 8 GB RAM — the real constraint (its `dmesg` shows 2 OOM kills); disk well short of full by the guest's own `df` |
 | `pi-cell-4` | product + CI-cost work | 16 GB, 8 vCPU; the current default dispatch target |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
