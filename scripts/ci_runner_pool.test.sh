@@ -1174,7 +1174,7 @@ assert_eq "$?" "3" "a FILE squatting on the name is a refusal (rc 3), not a miss
 assert_contains "$out" "is not a searchable directory (a file or a symlink)" "restart names the shape it found"
 assert_contains "$out" "clear it, or pick another name" "and the remedy that clears it"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-file)"
-assert_eq "$?" "4" "and `add` refuses that SAME path — the two verbs agree on the state"
+assert_eq "$?" "4" "and 'add' refuses that SAME path — the two verbs agree on the state"
 ln -s "$T/no-such-target" "$RUNNER_ROOT/pi-runner-dangle"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dangle)"
 assert_eq "$?" "3" "a DANGLING SYMLINK (not a directory) is the same refusal, not 'add it first'"
@@ -2213,7 +2213,7 @@ cp -a "$TEMPLATE/." "$RUNNER_ROOT/nameless/"
 printf '{}\n' >"$RUNNER_ROOT/nameless/.runner"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
 assert_eq "$?" "0" "the pass still retires the orphaned install"
-assert_contains "$out" "the name is UNVERIFIED" "a `.runner` we could not parse still suppresses the re-register advice"
+assert_contains "$out" "the name is UNVERIFIED" "a '.runner' we could not parse still suppresses the re-register advice"
 
 # ── THE REFUSAL NAMES A REMEDY THAT EXISTS (#2892 review round 4, P2) ──────────────────────────
 # `reclaim --name` on a dir that is not a registration used to say "'add --name <name>' is the verb
