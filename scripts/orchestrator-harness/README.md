@@ -2097,7 +2097,8 @@ and was never reinstalled**: it survived only as
 (its last run was Sep 16, as of that close). That is the same defect as §6.5.6, stated twice in three
 days: **a fix that exists is not a fix.** So the live trackers are agent-infra#1244 (the lane-level
 rule exists only as prose), #1862/#1863 (restore the orphan reaper **and schedule it**), and #1927 (a
-scheduler the cells run).
+scheduler the cells run). The INSIDE half — a lane ending on its own silence with a reported verdict —
+is §6.5.1c: a different mechanism (a bound in the wrapper), not a third reaper.
 
 ### 6.5.1b The leak a session count cannot see, and the reading that replaces it (#2163)
 
@@ -2160,6 +2161,81 @@ the Linux-cell steady state, `docs/ops/fleet-liveness.md` §11.4) is recorded as
 (`rc=3`) made the operator's health verb exit 1 for ever on a healthy cell, and collapsed a genuine
 controller-restart failure (`rc=1`) into the same number — so `doctor` keeps the supervision verdict
 in its own rc and a failed restart stays `rc=1`.
+
+### 6.5.1c Every lane is bounded from the INSIDE, and the bound is a reported outcome
+
+**MUST.** A lane ends on EITHER of two limits, and the limit that ended it is **reported with the
+measurements behind it**, never inferred from an exit status.
+
+| limit | default | what it is | what it is NOT |
+|---|---|---|---|
+| wall clock | `LANE_TIMEOUT`, 3300 s | a hard ceiling on the lane's total duration | not a progress signal: it cannot tell SLOW from STALLED, so alone it either kills a lane mid-merge or holds a corpse |
+| **silence** | `LANE_BOUND_IDLE_S`, **1200 s** (20 min) | **no output growth AND no CPU delta** (subtree, tolerance 0.10 s), confirmed on **two consecutive samples** | not a byte counter and not a CPU vote: **both** must be quiet, and either one advancing keeps the lane alive however long it runs |
+
+**Why (measured 2026-10-27).** Nine lanes across two cloud cells parked with **0 bytes** of output and
+**`00:00:00` CPU**, the oldest for **3 h 32 m** — every one a `pi` in `ep_poll`, an event-loop wait
+with no bound of any kind. The trigger was transient (`dial tcp … i/o timeout` against api.github.com,
+healthy again 0.26 s later), and a transient becomes a multi-hour corpse only because nothing bounded
+the lane's **silence**. Two further dispatch attempts then sat at 0 bytes for 5–15 minutes and were
+killed by hand. The same asymmetry was already visible in this tree's own instruments: the builtin
+`task` tool bounds a SUB-AGENT on `TASK_STREAM_STALL_MS` (20 min) and `TASK_CPU_STALL_MS` (30 min),
+while a lane — a strictly more expensive process, holding a worktree, a claim and a concurrency slot —
+had one axis, the wall clock. `mac-lane.sh --status` even states the reason a naive detector had been
+deleted: *"bytes is NOT progress for a `-p` lane … reading either — or both — made ten healthy lanes
+look dead"*. A `-p` lane prints nothing until it finishes, so a **silence-only** bound would kill every
+healthy lane; the CPU delta is the second signal that makes the pair safe.
+
+**Status: IMPLEMENTED** — `lane-bound.sh:309` (`supervise`, the one loop both modes run) with the two
+signals at `lane-bound.sh:169` (`pid_alive`, zombie-aware) and `lane-bound.sh:216` (`cpu_cs_of`, the
+subtree sum) and the verdict at `lane-bound.sh:255` (`verdict_line`, written from `lane-bound.sh:271`'s
+`enforce` BEFORE the kill); wired into the ONE agent invocation at `spawn-gate.sh:1531` (`run_agent`
+starts `lane-bound.sh watch`), so it covers every lane, fixer and background worker. Not a rewrite of
+§6.5.1: the OUTSIDE reapers are unchanged and that section's `PARTIAL` still stands (two in-tree
+reapers disagree). This is the other half — the lane can no longer outlive its own progress, so the
+reaper is the backstop for a lane whose wrapper is gone, rather than the only thing standing between a
+stalled fleet and a human reading a report.
+
+**How to see why a lane died** — one line, three surfaces (the lane log, stdout, and
+`<lane log>.lanebound`):
+
+```text
+[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=1204s wall_bound=3300s
+  idle_bound=1200s silent=1204s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
+  cpu_unreadable=0 signal=TERM log=/home/cmux/orchestrator/logs/lane-42.log
+```
+
+Read it left to right: the **verdict** is `stalled` (the silence limit fired), `exceeded-wallclock`
+(the ceiling fired — even on a lane that was still producing) or `finished`; `silent` is how long BOTH
+signals were quiet; `bytes` / `bytes_delta` and `cpu_cs` / `cpu_delta_cs` are the two signals at the
+decision; `cpu_unreadable` counts samples where the CPU could not be read — an `ps` that failed, AND a
+snapshot in which the lane's own pid is absent (a truncated table reads as "0 CPU" if it is trusted,
+which is a healthy lane killed) — and every such sample **stands the idle clause down** rather than
+arming a kill on absent evidence, with the wall clock still bounding the lane; `signal` is what was
+sent (`TERM`, or a following `[lane-bound] KILL` line if the lane ignored the 15 s grace).
+`grep '\[lane-bound\] VERDICT' $O/logs/lane-<N>.log` answers "was this lane wedged or slow?"
+without re-reading a transcript — the question that previously had no answer at all, because the log is
+truncated on rerun and the CPU counter dies with the process.
+
+**Two observations, and when to expect the kill.** A lane is judged on the sample interval
+`--poll`, default `min(60 s, idle/4)` — ~3 `ps` calls a minute per lane, because on this box the FLEET
+is the load. The silence limit needs **two consecutive confirming samples**, so it fires between
+`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (20–22 min at the defaults); the wall ceiling is
+exact to the sample interval it is not allowed to overrun. One sample is never enough: a single reading
+cannot tell a freeze from a missed measurement, which is the same rule §6.5.1 states for the outside
+reapers.
+
+**Operating it.** `LANE_BOUND_IDLE_S=0` disables the silence limit (and `LANE_BOUND_WALL_S=0` the
+ceiling) — an explicit `0` only: a blank or malformed value takes the DEFAULT, because an
+`LANE_BOUND_IDLE_S="${UNSET}"` in a launcher must not disarm the bound, and a typo must never read as
+"off". Both off prints an `UNBOUNDED by construction` WARN. The same contract as `task`'s
+`getCpuStallMs`. Tuning is per dispatch: a lane class that legitimately sits silent for longer (a long
+model call with no tool activity) raises `LANE_BOUND_IDLE_S` rather than removing the limit.
+
+⛔ **STATED RESIDUAL.** A lane whose model call takes longer than the silence limit with no output and
+no tool CPU is killed as `stalled`. That is the same bound `task` applies to a sub-agent
+(`TASK_STREAM_STALL_MS` = 20 min) and the same window a human used by hand (5–15 min) — but it IS a
+bound on a legitimate-but-pathological case, and the verdict line says so instead of hiding it, because
+`silent=1204s bytes=0 cpu_delta_cs=0` is exactly what a 20-minute model call looks like from outside.
 
 ### 6.5.2 The instrument that decides must itself be bounded
 
