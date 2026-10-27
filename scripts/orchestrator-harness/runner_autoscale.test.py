@@ -81,6 +81,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE_PATH = os.path.normpath(os.path.join(HERE, "runner_autoscale.py"))
@@ -250,6 +251,7 @@ class Box:
         self.installs: dict[str, str] = {}
         os.makedirs(os.path.join(self.dir, "state"), exist_ok=True)
         os.makedirs(os.path.join(self.dir, "bin"), exist_ok=True)
+        os.makedirs(os.path.join(self.dir, "units"), exist_ok=True)
         self._write(os.path.join(self.dir, "gh"), GH_STUB.replace("__FIX__", self.dir), 0o755)
         self._write(
             os.path.join(self.dir, "systemctl"), SYSTEMCTL_STUB.replace("__FIX__", self.dir), 0o755
@@ -275,6 +277,9 @@ class Box:
             "RUNNER_AUTOSCALE_SYSTEMCTL": os.path.join(self.dir, "systemctl"),
             "RUNNER_AUTOSCALE_PROVISIONER": os.path.join(self.dir, "provisioner.sh"),
             "RUNNER_AUTOSCALE_NO_SUDO": "1",
+            # ⛔ the unit audit reads a FIXTURE directory, never the host's ~/.config or /etc: a suite
+            # that reads the machine it runs on reports this box's units as if they were the case's.
+            "RUNNER_AUTOSCALE_UNIT_DIR": os.path.join(self.dir, "units"),
             "RUNNER_AUTOSCALE_ONLINE_WAIT_S": "0",
             "RUNNER_AUTOSCALE_POLL_S": "0",
             "RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS": "3",
@@ -1144,6 +1149,509 @@ def t15_zero_takes_one_sample():
             box.destroy()
 
 
+# ── 5. THE CONVERGER'S OWN UNIT ────────────────────────────────────────────────────────────────
+@test("T16 unit template: a STABLE WorkingDirectory, absolute interpreter and script, a timer that")
+def t16_unit_template():
+    """`WorkingDirectory=/tmp/cell-wt-runnerauto2` was deleted by a cell reclaim and systemd then
+    failed the oneshot with `status=200/CHDIR` BEFORE running a line — every 10 minutes, for as long
+    as the reclaim stood. The template must therefore pin the ONE path a reclaim cannot take (`%h`),
+    and must name an ABSOLUTE interpreter and script: `ExecStart=python3 ...` is not a PATH lookup."""
+    units = ra.render_unit("daniel-ospina/tortoise")
+    service = units[f"{ra.UNIT_BASENAME}.service"]
+    timer = units[f"{ra.UNIT_BASENAME}.timer"]
+    check(
+        "WorkingDirectory=%h" in service,
+        f"the default WorkingDirectory must be %h, got:\n{service}",
+    )
+    check("/tmp" not in service and "/var/tmp" not in service, "no transient path may appear")
+    exec_line = next(ln for ln in service.splitlines() if ln.startswith("ExecStart="))
+    check(
+        exec_line.startswith('ExecStart="') and str(Path(ra.__file__).resolve()) in exec_line,
+        f"ExecStart must be ABSOLUTE, QUOTED and name THIS script: {exec_line}",
+    )
+    check(
+        any(ln.startswith("Unit=") and ln.endswith(".service") for ln in timer.splitlines()),
+        f"the timer must name the service it drives:\n{timer}",
+    )
+    check(
+        any(ln.startswith("OnUnitActiveSec=") for ln in timer.splitlines()),
+        "the timer must be PERIODIC, not only OnBoot",
+    )
+    check(
+        ra.unit_workdir_problem(None) is None,
+        f"the default workdir must be usable: {ra.unit_workdir_problem(None)}",
+    )
+
+
+@test("T17 install REFUSES a missing WorkingDirectory — and writes NOTHING")
+def t17_missing_workdir_refused():
+    with Env():
+        box = Box("unit-missing")
+        try:
+            box.apply()
+            # ⛔ NOT under the fixture's tmpdir: that path is TRANSIENT, so it would be refused for
+            # its SHAPE and this case would never exercise the exists() check it is about. A path
+            # under the (durable) home is refused for exactly one reason: it is not there.
+            gone = os.path.join(str(Path.home()), "runnerauto-definitely-absent-cwd")
+            code, out = cli(box, "--install-unit", "--workdir", gone)
+            check(code == 1, f"a missing cwd must be REFUSED (exit 1, nothing written), got {code}")
+            check("does not exist" in out, f"the refusal must name the reason, got: {out!r}")
+            check(
+                not os.listdir(os.path.join(box.dir, "units")),
+                f"NOTHING may be written on a refusal: {os.listdir(os.path.join(box.dir, 'units'))}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T18 install REFUSES a transient WorkingDirectory — even when it EXISTS today")
+def t18_transient_workdir_refused():
+    """The measured failure mode is subtle: the path existed when the unit was written and was gone
+    later. Refusing only on `is_dir` would let the incident through on day one, so the path's SHAPE
+    is refused — an existing directory under /tmp (or the TMPDIR a harness hands us) is a countdown."""
+    with Env():
+        box = Box("unit-transient")
+        try:
+            box.apply()
+            code, out = cli(box, "--install-unit", "--workdir", box.dir)  # exists, and transient
+            check(code == 1, f"an existing transient cwd must still be REFUSED, got {code}")
+            check(
+                "inside /" in out,
+                f"the refusal must say WHY the path is unusable, got: {out!r}",
+            )
+            check(
+                not os.listdir(os.path.join(box.dir, "units")),
+                "NOTHING may be written on a refusal",
+            )
+            # ⛔ A `%` is expanded at LOAD time, so a directory whose NAME contains one passes an
+            # is_dir check and then resolves to a DIFFERENT path inside systemd — the very
+            # status=200/CHDIR class this fix closes. A newline is a directive injection.
+            specifier = str(Path.home()) + "/ra-%h-literal-dir"
+            newline = str(Path.home()) + "/x\nExecStartPre=/bin/false"
+            for value, needle in ((specifier, "systemd specifier"), (newline, "control character")):
+                code2, out2 = cli(box, "--install-unit", "--workdir", value)
+                check(code2 == 1, f"workdir={value!r} must be REFUSED, got {code2}: {out2}")
+                check(needle in out2, f"the refusal must name the reason: {out2!r}")
+            # ⛔ --repo is interpolated into ExecStart: a newline writes a DIRECTIVE, a quote closes
+            # the quote and re-points --repo, and a `%` becomes a specifier at load time.
+            for bad_repo, needle in (
+                ("o/r\nExecStartPre=/bin/false", "not a plain"),
+                ('o/r" --repo "x', "not a plain"),
+                ("o/r%n", "not a plain"),
+                ("o", "not a plain"),
+            ):
+                code3, out3 = cli(box, "--install-unit", "--repo", bad_repo)
+                check(code3 == 1, f"repo={bad_repo!r} must be REFUSED, got {code3}: {out3}")
+                check(needle in out3, f"the refusal must say why: {out3!r}")
+            check(
+                not os.listdir(os.path.join(box.dir, "units")),
+                "NOTHING may be written on any of those refusals",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T19 install writes the pair and ENABLES the timer — written is not scheduled")
+def t19_install_writes_and_enables():
+    with Env():
+        box = Box("unit-install")
+        try:
+            box.apply()
+            code, out = cli(box, "--install-unit")
+            check(code == 0, f"an installable unit must install, got {code}: {out}")
+            units = os.path.join(box.dir, "units")
+            check(
+                sorted(os.listdir(units))
+                == [f"{ra.UNIT_BASENAME}.service", f"{ra.UNIT_BASENAME}.timer"],
+                f"both files must be written, got {sorted(os.listdir(units))}",
+            )
+            calls = box.calls("systemctl-calls.log")
+            check(
+                any("--user daemon-reload" in c for c in calls),
+                f"the new files must be loaded: {calls}",
+            )
+            check(
+                any(f"--user enable --now {ra.UNIT_BASENAME}.timer" == c.strip() for c in calls),
+                f"the TIMER must be enabled: a written unit with no timer schedules nothing: {calls}",
+            )
+            before = Path(units, f"{ra.UNIT_BASENAME}.service").read_text()
+            code2, out2 = cli(box, "--install-unit", "--workdir", str(Path.home()))
+            check(code2 == 0, f"a re-install must succeed, got {code2}: {out2}")
+            check(
+                f"WorkingDirectory={Path.home()}"
+                in Path(units, f"{ra.UNIT_BASENAME}.service").read_text(),
+                "an EXPLICIT, usable --workdir must be written literally",
+            )
+            check(before.strip() != "", "the first write must not have been empty")
+        finally:
+            box.destroy()
+
+    with Env():
+        box = Box("unit-enable-fail")
+        try:
+            Path(box.dir, "systemctl").write_text(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"" + box.dir
+                + "/systemctl-calls.log\"\nexit 1\n",
+                encoding="utf-8",
+            )
+            os.chmod(Path(box.dir, "systemctl"), 0o755)
+            box.apply()
+            code, out = cli(box, "--install-unit")
+            check(code == 3, f"a written unit with no running timer is an ACTION failure, got {code}")
+            # ⛔ the message must NOT assert a state the code never read (there is no `is-active`
+            # query here): it says the schedule is UNKNOWN, and says which step failed.
+            check(
+                "did not verify whether a timer is scheduled" in out,
+                f"the failure must say the schedule is UNKNOWN, not that it is off: {out!r}",
+            )
+            check(
+                "systemctl --user daemon-reload rc=1" in out,
+                f"and must name the step that failed: {out!r}",
+            )
+            check(
+                sorted(os.listdir(os.path.join(box.dir, "units")))
+                == [f"{ra.UNIT_BASENAME}.service", f"{ra.UNIT_BASENAME}.timer"],
+                "the files ARE written — the failure is reported, not hidden",
+            )
+        finally:
+            box.destroy()
+
+    with Env():
+        box = Box("unit-half-swap")
+        try:
+            box.apply()
+            code, _ = cli(box, "--install-unit")
+            check(code == 0, "the first install must succeed")
+            units = Path(box.dir, "units")
+            installed = (units / f"{ra.UNIT_BASENAME}.service").read_text()
+            # make the SECOND replace fail: a non-empty directory where the timer file must go
+            timer = units / f"{ra.UNIT_BASENAME}.timer"
+            timer.unlink()
+            timer.mkdir()
+            Path(timer, "blocker").write_text("x")
+            code2, out2 = cli(box, "--install-unit", "--workdir", str(Path.home()))
+            check(code2 == 3, f"a failed second replace is an ACTION failure, got {code2}: {out2}")
+            # ⛔ the message must be TRUE: the service half WAS replaced, the timer half was not
+            check(
+                "already replaced" in out2 and f"{ra.UNIT_BASENAME}.service" in out2,
+                f"the failure must name what it already replaced: {out2!r}",
+            )
+            check(
+                "may be MIXED" in out2,
+                f"…and must warn the pair can be MIXED instead of claiming a clean rollback: {out2!r}",
+            )
+            check(
+                (units / f"{ra.UNIT_BASENAME}.service").read_text() != ""
+                and timer.is_dir(),
+                "no installed file is destroyed and the blocked path is untouched",
+            )
+            # and the temp files are cleaned up, so a failed install leaves no droppings
+            leftovers = [p.name for p in units.iterdir() if p.name.endswith(".tmp") and p.is_file()]
+            check(not leftovers, f"no .tmp file may survive a failed install: {leftovers}")
+            check(installed.strip() != "", "the first install wrote real content")
+            # ⛔ THE DOCUMENTED CONTRACT MUST MATCH THE MESSAGE. Exit 3 is three branches, and two of
+            # them leave part of the pair NEW — a header claiming "no file is replaced" told an
+            # operator that exit 3 means the previous install is intact, which is observable false.
+            doc = ra.__doc__ or ""
+            check(
+                "3 is NOT a rollback" in doc and "one NEW file beside one from the previous" in doc,
+                "the EXIT block must state what exit 3 really guarantees (not a clean rollback)",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T20 --check-units finds the shape ALREADY installed — and cannot call an unreadable one clean")
+def t20_check_units_audit():
+    with Env():
+        box = Box("unit-audit")
+        units = os.path.join(box.dir, "units")
+        try:
+            for name, body in (
+                ("a.service", "[Service]\nWorkingDirectory=/tmp/cell-wt-runnerauto2\nExecStart=/bin/true\n"),
+                ("b.service", "[Service]\nWorkingDirectory=/nowhere/at-all\n"),
+                ("c.service", "[Service]\nWorkingDirectory=%h\n"),
+                ("d.service", "[Service]\nWorkingDirectory=-/tmp/also-gone\n"),
+                ("e.service", "[Service]\nWorkingDirectory=%t/thing\n"),
+                ("f.service", "[Service]\nExecStart=/bin/true\n"),
+            ):
+                Path(units, name).write_text(body, encoding="utf-8")
+            # ⛔ the population that DECIDES the value: a DROP-IN overrides a clean main unit, and
+            # `.socket`/`.path`/... give their processes a working directory too.
+            dropin = Path(units, "g.service.d")
+            dropin.mkdir()
+            Path(units, "g.service").write_text("[Service]\nWorkingDirectory=%h\n", encoding="utf-8")
+            Path(dropin, "override.conf").write_text(
+                "[Service]\nWorkingDirectory=/tmp/cell-wt-runnerauto2\n", encoding="utf-8"
+            )
+            Path(units, "h.socket").write_text(
+                "[Socket]\nListenStream=1234\n\n[Service]\nWorkingDirectory=/tmp/also-gone\n",
+                encoding="utf-8",
+            )
+            Path(units, "i.service").write_text(
+                "[Unit]\nWorkingDirectory=/tmp/not-in-service\n", encoding="utf-8"
+            )
+            # systemd applies the LAST [Service] assignment: a fixed unit is FIXED, and a line that
+            # is overridden has no runtime effect — reporting it would refuse something harmless and
+            # would make the documented remedy (a drop-in) unable to ever clear the finding.
+            # a VALUELESS `WorkingDirectory` line is not an assignment: systemd skips it and keeps the
+            # earlier value, so the bad one must still be reported (parsing it as '' resolved to the
+            # home and MASKED the bad line — a fail-open the last-wins rework introduced).
+            Path(units, "k.service").write_text(
+                "[Service]\nWorkingDirectory=/tmp/cell-wt-runnerauto2\nWorkingDirectory\n",
+                encoding="utf-8",
+            )
+            Path(units, "j.service").write_text(
+                "[Service]\nWorkingDirectory=/tmp/then-overridden\n"
+                "WorkingDirectory=%h\n",
+                encoding="utf-8",
+            )
+            box.apply()
+            code, out = cli(box, "--check-units")
+            check(code == 5, f"a read-only audit finding exits 5 (not 3), got {code}: {out}")
+            # named by the FILE the value came from — a drop-in is reported as the override, which is
+            # the file to edit; the clean main unit it overrides must NOT be blamed
+            for name in ("override.conf", "h.socket"):
+                check(f"{name}:" in out, f"{name} must be named in the audit: {out}")
+            check("g.service:" not in out, f"the CLEAN main unit must not be blamed: {out}")
+            check(
+                "k.service:" in out,
+                f"a VALUELESS line must not mask the bad assignment before it: {out}",
+            )
+            check(
+                "j.service:" not in out,
+                f"a value systemd OVERRIDES has no runtime effect and must not be reported: {out}",
+            )
+            check(
+                "i.service" not in out,
+                f"a WorkingDirectory under [Unit] has NO runtime effect and must not be refused: {out}",
+            )
+            # "is inside /" — not "inside /tmp": `resolve()` reports the REAL path, and on macOS
+            # /tmp is /private/tmp. The assertion is about the REASON, not about a spelling.
+            for bad, needle in (
+                ("a.service", "is inside /"),
+                ("b.service", "does not exist"),
+                # `-` only SUPPRESSES the failure: the unit runs, in the wrong directory. The wording
+                # must say that and not "systemd fails this unit", which is false for a tolerated one.
+                ("d.service", "silently start in the WRONG directory"),
+                ("e.service", "cannot resolve"),
+            ):
+                check(f"{bad}:" in out and needle in out, f"{bad} must be named ({needle}): {out}")
+            for good in ("c.service", "f.service"):
+                check(f"{good}:" not in out, f"a healthy unit must NOT be reported: {out}")
+            for name in os.listdir(units):
+                if name not in ("c.service", "f.service", "i.service", "j.service"):
+                    full = os.path.join(units, name)
+                    shutil.rmtree(full) if os.path.isdir(full) else os.unlink(full)
+            code2, out2 = cli(box, "--check-units")
+            check(code2 == 0, f"a clean audit must exit 0, got {code2}: {out2}")
+            # ⛔ AN AUDIT THAT READ NOTHING IS NOT A CLEAN AUDIT — the polarity this tool already
+            # enforces for pool health (`unmeasured` is never `ok`).
+            # ⛔ on box.env, not os.environ: `cli()` re-applies the box's seams, so a bare
+            # os.environ assignment is overwritten and the case silently re-audits the fixture dir.
+            box.env["RUNNER_AUTOSCALE_UNIT_DIR"] = os.path.join(box.dir, "no-such-unit-dir")
+            code3, out3 = cli(box, "--check-units")
+            check(code3 == 5, f"an unreadable/absent unit dir must NOT read as clean, got {code3}")
+            check("nothing was audited" in out3.lower(), f"…and must say so: {out3!r}")
+            check(
+                "no-such-unit-dir" in out3,
+                f"…and must NAME the directory it could not read: {out3!r}",
+            )
+            # an EMPTY but existing directory: only the aggregate guard can catch this one, so it
+            # pins the second half of the polarity rather than re-testing the first
+            empty = os.path.join(box.dir, "empty-unit-dir")
+            os.makedirs(empty, exist_ok=True)
+            box.env["RUNNER_AUTOSCALE_UNIT_DIR"] = empty
+            code4, out4 = cli(box, "--check-units")
+            check(code4 == 5, f"an EMPTY unit dir audited NOTHING and must not read as clean: {code4}")
+            check("nothing was audited" in out4.lower(), f"…and must say so: {out4!r}")
+            box.env["RUNNER_AUTOSCALE_UNIT_DIR"] = units
+        finally:
+            box.destroy()
+
+
+@test("T21 a bad installed unit is a NOTE on the pass — it never changes a converged verdict")
+def t21_pass_note_does_not_change_the_verdict():
+    """`--check-units` is the loud surface (exit 5). The PASS must also NAME what it finds, but it must
+    NOT fold it into `problems`: a stale unit file is not a reason to report an otherwise-converged
+    pool as failed, and a pass that goes red for it would train its reader to ignore red. Both halves
+    are pinned here because a regression in either direction is silent — folding it into `problems`
+    reddens every pass on a cell that has one old unit; dropping the note makes it invisible."""
+    with Env():
+        box = Box("unit-note")
+        try:
+            Path(box.dir, "units", "old.service").write_text(
+                "[Service]\nWorkingDirectory=/tmp/cell-wt-runnerauto2\n", encoding="utf-8"
+            )
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            record = converge(box, nproc="2", want=1)
+            check(
+                record["verdict"] in ("at-ceiling", "converged"),
+                f"the pool IS converged, so the verdict must say so: {record['verdict']}",
+            )
+            check(
+                record.get("unit_cwd_problems"),
+                f"the bad unit must be recorded: {record.get('unit_cwd_problems')}",
+            )
+            check(
+                any(n.startswith("unit cwd: ") for n in record["notes"]),
+                f"…and NAMED in the human notes: {record['notes']}",
+            )
+            check(
+                record["problems"] == [],
+                f"it must NOT become a `problems` entry (that would redden every pass): "
+                f"{record['problems']}",
+            )
+            code, out = cli(box, "--status")
+            check(code == 0, f"and the exit code stays a healthy 0, got {code}: {out}")
+        finally:
+            box.destroy()
+
+
+@test("T22 a unit directory that cannot be READ is not an empty one")
+def t22_unreadable_dir_is_not_empty():
+    """Round 2's P1: `Path.glob` swallows `PermissionError`, so a drop-in directory this account could
+    not read audited as EMPTY — a transient WorkingDirectory inside it reported CLEAN. The fix walks
+    with `iterdir()` and reports the failure; this case pins that branch WITHOUT chmod, because a
+    suite running as root would not be denied and would pass vacuously."""
+    with Env():
+        box = Box("unit-unreadable")
+        units = os.path.join(box.dir, "units")
+        try:
+            Path(units, "ok.service").write_text("[Service]\nWorkingDirectory=%h\n", encoding="utf-8")
+            denied = Path(units, "secret.service.d")
+            denied.mkdir()
+            Path(denied, "override.conf").write_text(
+                "[Service]\nWorkingDirectory=/tmp/cell-wt-runnerauto2\n", encoding="utf-8"
+            )
+            real_iterdir = Path.iterdir
+
+            def guard(self):
+                if str(self).endswith("secret.service.d"):
+                    raise PermissionError(13, "Permission denied", str(self))
+                return real_iterdir(self)
+
+            # the ROOT directory itself unreadable — a different branch from an unreadable `.d`
+            root_denied = os.path.join(box.dir, "root-denied")
+            os.makedirs(root_denied, exist_ok=True)
+            Path(root_denied, "z.service").write_text("[Service]\nWorkingDirectory=%h\n")
+
+            def guard_root(self):
+                if str(self) == root_denied or str(self).endswith("secret.service.d"):
+                    raise PermissionError(13, "Permission denied", str(self))
+                return real_iterdir(self)
+
+            Path.iterdir = guard_root
+            try:
+                found_root = ra.installed_unit_cwd_problems([root_denied], require_any=True)
+            finally:
+                Path.iterdir = real_iterdir
+            check(
+                any("unreadable" in f for f in found_root),
+                f"an unreadable ROOT unit dir must be reported: {found_root}",
+            )
+            Path.iterdir = guard
+            try:
+                # ⛔ IN PROCESS, not through `cli()`: `cli` spawns a fresh interpreter, where a patched
+                # `Path.iterdir` does not exist — measured: the patch was silently ineffective and the
+                # case passed on the finding it was supposed to prevent coming from.
+                found = ra.installed_unit_cwd_problems([units], require_any=True)
+            finally:
+                Path.iterdir = real_iterdir
+            check(
+                any("unreadable" in f for f in found),
+                f"an UNREADABLE unit dir must be reported, never audited as EMPTY: {found}",
+            )
+            check(
+                any("NOTHING was audited there" in f for f in found),
+                f"…and must say nothing was audited in it: {found}",
+            )
+            check(
+                not any("ok.service" in f for f in found),
+                f"the readable unit is still audited normally and must not be blamed: {found}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T23 drop-in PRIORITY and the two MANAGERS: a healthy copy must not mask a broken unit")
+def t23_priority_and_hierarchies():
+    """Two measured fail-opens in the audit's merge, both of the 'reported CLEAN over a broken unit'
+    kind:
+      (a) two drop-ins with the SAME basename in two directories: systemd SKIPS the overridden file
+          (`conf-files.c::files_add`) instead of merging it, so the FIRST (higher-priority) copy is
+          the one that runs. Sorting by name alone left the LAST as `last`, so a clean lower-priority
+          copy masked a broken higher-priority one.
+      (b) the user and system managers search DISJOINT load paths and can never override each other,
+          so `/etc/systemd/system/x.service` must not be able to hide a broken
+          `~/.config/systemd/user/x.service` (nor invent a finding on a healthy one)."""
+    with Env():
+        box = Box("unit-priority")
+        hi = os.path.join(box.dir, "units-hi")
+        lo = os.path.join(box.dir, "units-lo")
+        try:
+            os.makedirs(os.path.join(hi, "z.service.d"))
+            os.makedirs(os.path.join(lo, "z.service.d"))
+            Path(hi, "z.service").write_text("[Service]\nWorkingDirectory=%h\n", encoding="utf-8")
+            # same basename, DIFFERENT values: the higher-priority copy is the one systemd runs
+            Path(hi, "z.service.d", "15-cwd.conf").write_text(
+                "[Service]\nWorkingDirectory=/tmp/cell-wt-runnerauto2\n", encoding="utf-8"
+            )
+            Path(lo, "z.service.d", "15-cwd.conf").write_text(
+                "[Service]\nWorkingDirectory=%h\n", encoding="utf-8"
+            )
+            found = ra.installed_unit_cwd_problems([hi, lo], require_any=True)
+            check(
+                any("15-cwd.conf" in f for f in found),
+                f"the HIGHER-priority drop-in is the effective one and must be reported: {found}",
+            )
+            # …and the mirror image: bad in the LOWER copy must NOT be reported, because it is skipped
+            Path(hi, "z.service.d", "15-cwd.conf").write_text(
+                "[Service]\nWorkingDirectory=%h\n", encoding="utf-8"
+            )
+            Path(lo, "z.service.d", "15-cwd.conf").write_text(
+                "[Service]\nWorkingDirectory=/tmp/cell-wt-runnerauto2\n", encoding="utf-8"
+            )
+            found = ra.installed_unit_cwd_problems([hi, lo], require_any=True)
+            check(
+                not any("15-cwd.conf" in f for f in found),
+                f"an OVERRIDDEN (skipped) drop-in has no runtime effect and must not be reported: "
+                f"{found}",
+            )
+            # the two managers: same unit NAME, disjoint load paths — the user copy is a separate
+            # unit, so a HEALTHY user copy must not hide a BROKEN system copy (and vice versa).
+            user_root = os.path.join(box.dir, "user-units")
+            system_root = os.path.join(box.dir, "etc", "systemd", "system")
+            os.makedirs(user_root)
+            os.makedirs(system_root)
+            Path(user_root, "w.service").write_text("[Service]\nWorkingDirectory=%h\n")
+            Path(system_root, "w.service").write_text(
+                "[Service]\nWorkingDirectory=/tmp/cell-wt-runnerauto2\n"
+            )
+            check(
+                ra.unit_dir_hierarchy(user_root) == "user"
+                and ra.unit_dir_hierarchy(system_root) == "system"
+                and ra.unit_dir_hierarchy("/etc/systemd/system") == "system",
+                "the audit must KNOW which manager's load path each directory belongs to",
+            )
+            found2 = ra.installed_unit_cwd_problems([user_root, system_root], require_any=True)
+            check(
+                any("w.service" in f for f in found2),
+                f"a healthy USER copy must not mask a broken SYSTEM copy of the same name: {found2}",
+            )
+            check(
+                [ra.unit_dir_hierarchy(d) for d in ra.default_unit_dirs()]
+                == ["user"] * len(ra.USER_UNIT_DIRS) + ["system"] * len(ra.SYSTEM_UNIT_DIRS),
+                f"the default population must be the user paths then the system paths: "
+                f"{ra.default_unit_dirs()}",
+            )
+
+        finally:
+            box.destroy()
+
+
 # ── the mutation map ──────────────────────────────────────────────────────────────────────────
 class Mutation:
     def __init__(self, case_id, old, new, why):
@@ -1154,6 +1662,145 @@ class Mutation:
 
 
 MUTATIONS = [
+    Mutation(
+        "T19",
+        "3 is NOT a rollback",
+        "3 IS a rollback",
+        "the documented contract says exit 3 restores the previous install, which the code cannot promise",
+    ),
+    Mutation(
+        "T23",
+        '            if path.name.endswith(".conf"):\n                by_name.setdefault(path.name, path)',
+        '            if path.name.endswith(".conf"):\n                by_name[path.name] = path',
+        "of two same-named drop-ins the LOWER-priority copy wins, so a clean one masks a broken unit",
+    ),
+    Mutation(
+        "T23",
+        '        hierarchy = unit_dir_hierarchy(str(root))',
+        '        hierarchy = "user"',
+        "the two systemd managers are merged, so a healthy copy in one masks a broken copy in the other",
+    ),
+    Mutation(
+        "T22",
+        '    try:\n        entries = sorted(directory.iterdir())\n    except OSError as exc:',
+        '    try:\n        entries = sorted(directory.iterdir())\n    except ZeroDivisionError as exc:',
+        "an unreadable unit dir raises out of the audit, or (with glob) reports CLEAN as an empty one",
+    ),
+    Mutation(
+        "T22",
+        '            try:\n                files.extend(sorted(entry.iterdir()))\n            except OSError as exc:',
+        '            try:\n                files.extend(sorted(entry.iterdir()))\n            except ZeroDivisionError as exc:',
+        "an unreadable drop-in dir raises out of the audit instead of being reported",
+    ),
+    Mutation(
+        "T20",
+        '                if "=" not in line:  # systemd skips a valueless line; so must this\n                    continue',
+        "                if False:\n                    continue",
+        "a valueless WorkingDirectory line MASKES a bad earlier one (systemd keeps the earlier value)",
+    ),
+    Mutation(
+        "T19",
+        '        for tmp, path in staged:\n            os.replace(tmp, path)',
+        '        for tmp, path in staged:\n            os.replace(tmp, path) if tmp.name.endswith("service") else None',
+        "only half the pair is swapped in: a `.timer` with no `.service` schedules nothing",
+    ),
+    Mutation(
+        "T21",
+        '''        record["unit_cwd_problems"] = unit_problems
+        record["notes"].extend(f"unit cwd: {p}" for p in unit_problems)''',
+        """        record["problems"].extend(unit_problems)""",
+        "a stale unit file is folded into `problems`, so every pass on that cell reports failure",
+    ),
+    Mutation(
+        "T21",
+        '''        record["notes"].extend(f"unit cwd: {p}" for p in unit_problems)''',
+        "        pass",
+        "the pass finds a bad unit and says NOTHING about it",
+    ),
+    Mutation(
+        "T18",
+        '    if not REPO_PATTERN.fullmatch(repo or ""):',
+        "    if False:",
+        "--repo is interpolated unvalidated: a newline writes a directive, a quote escapes the quoting",
+    ),
+    Mutation(
+        "T20",
+        '        if tolerant:\n            # `-` only SUPPRESSES the failure',
+        '        if False:\n            # `-` only SUPPRESSES the failure',
+        "a `-`-prefixed value is reported with the failure wording, which is FALSE for a tolerated one",
+    ),
+    Mutation(
+        "T20",
+        '        if entry.is_dir() and name.endswith(".d"):',
+        "        if False:",
+        "a DROP-IN overriding a clean main unit is invisible: the incident shape reports CLEAN",
+    ),
+    Mutation(
+        "T20",
+        'UNIT_FILE_SUFFIXES = ("service", "socket", "path", "mount", "swap")',
+        'UNIT_FILE_SUFFIXES = ("service",)',
+        "only .service is read, so a .socket with a transient WorkingDirectory reports clean",
+    ),
+    Mutation(
+        "T20",
+        '                if key.strip() == "WorkingDirectory" and section == "Service":',
+        '                if key.strip() == "WorkingDirectory":',
+        "a WorkingDirectory under [Unit] is refused although systemd IGNORES it there",
+    ),
+    Mutation(
+        "T18",
+        '        if "%" in workdir:',
+        "        if False:",
+        "an explicit --workdir with a systemd specifier is written, then expands to a path nobody checked",
+    ),
+    Mutation(
+        "T18",
+        '        if any(ch in workdir for ch in ("\\n", "\\r", "\\0")) or any(',
+        "        if False and any(",
+        "a newline in --workdir injects an arbitrary directive into the unit's [Service] section",
+    ),
+    Mutation(
+        "T20",
+        "    if require_any and seen == 0:",
+        "    if False:",
+        "an EXISTING but empty unit dir audits nothing and reports 'all usable'",
+    ),
+    Mutation(
+        "T19",
+        '        rc, out = _run(_systemctl_user(args), timeout=120)\n        if rc != 0:',
+        '        rc, out = _run(_systemctl_user(args), timeout=120)\n        if False:',
+        "the timer enable fails silently: the unit is written and the schedule runs nothing",
+    ),
+    Mutation(
+        "T16",
+        'f"WorkingDirectory={wd}"',
+        '"WorkingDirectory=/tmp/eldato-runner"',
+        "the template pins a TRANSIENT cwd — the exact shape that killed the converger for a day",
+    ),
+    Mutation(
+        "T17",
+        "    if not path.is_dir():",
+        "    if False:",
+        "a missing WorkingDirectory is written anyway, and systemd then fails the unit at CHDIR",
+    ),
+    Mutation(
+        "T18",
+        "    for prefix in TRANSIENT_UNIT_PREFIXES:",
+        "    for prefix in ():",
+        "a path that exists TODAY is accepted although it is under /tmp and will be reclaimed",
+    ),
+    Mutation(
+        "T19",
+        '    for args in (["daemon-reload"], ["enable", "--now", f"{UNIT_BASENAME}.timer"]):',
+        '    for args in (["daemon-reload"],):',
+        "the files are written but the timer is never enabled: written is not scheduled",
+    ),
+    Mutation(
+        "T20",
+        '        if "%" in value and value != "%h":',
+        "        if False:",
+        "a specifier this check cannot resolve is silently counted as CLEAN",
+    ),
     Mutation(
         "T1",
         '    if floor or engaged:\n        labels.append(FALLBACK_LABEL)',
@@ -1322,17 +1969,31 @@ def run_tests(only=None):
     return failed == 0 and passed > 0
 
 
-def _mutated_module(mut):
-    with open(MODULE_PATH, encoding="utf-8") as fh:
-        src = fh.read()
+def _apply_anchor(src: str, mut) -> str:
+    """Replace the mutation's anchor. EXACT only, and LOUD when it does not match.
+
+    ⛔ NO INDENTATION-INSENSITIVE FALLBACK — tried and REVERTED. A fallback that matched stripped
+    lines silently spliced a replacement into the middle of a longer line (an anchor line that was a
+    PREFIX of the module's) and produced a mutant with a SyntaxError, which reads as "the case did not
+    catch it" — a false MISSED pointing at the wrong defect. An anchor that no longer matches must say
+    so: `run_mutations` prints it as MISSED, the summary still prints, and the fix is to update the
+    anchor to the code it means.
+    """
     if src.count(mut.old) != 1:
         raise SystemExit(
             f"mutation anchor not unique in {MODULE_PATH} ({src.count(mut.old)} hits):\n{mut.old}"
         )
+    return src.replace(mut.old, mut.new, 1)
+
+
+def _mutated_module(mut):
+    with open(MODULE_PATH, encoding="utf-8") as fh:
+        src = fh.read()
+    mutated = _apply_anchor(src, mut)
     tmp = tempfile.mkdtemp(prefix="runnerauto-mutant-")
     out = os.path.join(tmp, "runner_autoscale.py")
     with open(out, "w", encoding="utf-8") as fh:
-        fh.write(src.replace(mut.old, mut.new, 1))
+        fh.write(mutated)
     return tmp, out
 
 

@@ -122,6 +122,11 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
     RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS  attempts for ONE pool read while it races our own restart (3),
                                    retrying NETWORK/5xx/RATE-LIMIT errors only — a 404 is answered at once
     RUNNER_AUTOSCALE_RETRY_BACKOFF_S     pause between those attempts (2)
+    RUNNER_AUTOSCALE_UNIT_DIR      the ONE directory `--install-unit` writes to (default
+                                   ~/.config/systemd/user). For the AUDIT it REPLACES the whole
+                                   population; unset, the audit reads the five standard directories
+                                   (~/.config/systemd/user, /etc/systemd/user, /usr/lib/systemd/user,
+                                   /etc/systemd/system, /usr/lib/systemd/system). Also a TEST seam
     RUNNER_AUTOSCALE_STARVATION_CONFIRM_S  seconds between the two samples the starvation alarm takes
                                    before it pages (30). A value that is not a finite number in
                                    (0, 300] is REFUSED with a note rather than disabling the guard
@@ -143,6 +148,15 @@ EXIT  0 converged / nothing to do (a REFUSAL is an answer, not a failure)
       4 STARVATION — `queued>0 ∧ busy==0 ∧ online>0` confirmed (agent-infra#2875). Nothing was
         changed by the alarm: it names the invariant and the three counts. This is the one exit a
         health check should page on, because a starved box otherwise reads perfectly healthy.
+      5 `--check-units` found an installed unit whose WorkingDirectory is unusable (or an audit that
+        read nothing at all). A READ-ONLY finding, deliberately distinct from 3: a consumer keying on
+        "an action failed" must not confuse it with "my units are misconfigured".
+      `--install-unit` exits 0 on success, 1 when REFUSED before writing anything (an unusable
+      WorkingDirectory or repo), and 3 when the pair could not be installed. 3 is NOT a rollback
+      guarantee: nothing installed is ever REMOVED, but the two renames are sequential, so a failure
+      between them can leave one NEW file beside one from the previous install — the message names
+      what was already replaced. When the files are written but `systemctl --user` could not
+      reload/enable the timer, the schedule is UNKNOWN (this tool does not query it).
 """
 
 from __future__ import annotations
@@ -209,6 +223,15 @@ class Unmeasurable(Exception):
 
 class ActionFailed(Exception):
     """An action (restart / registration / provision) failed. Retried on the next pass."""
+
+
+class UnitRefused(Exception):
+    """A unit was REFUSED before anything was written. Not a failure: an answer (exit 1).
+
+    Refused rather than written-and-hoped, because a unit systemd will not start is a false PASS on
+    "the converger is scheduled" — the same shape as the registered-runner-with-no-enabled-unit this
+    file already refuses elsewhere.
+    """
 
 
 class ProvisionerRefused(ActionFailed):
@@ -937,6 +960,426 @@ def enable_unit(directory: Path, name: str, repo: str) -> list[str]:
     return failures
 
 
+# ── THE CONVERGER'S OWN UNIT (fix 5) ─────────────────────────────────────────────────────────────
+# ⛔ A UNIT WHOSE CWD IS TRANSIENT IS A COUNTDOWN, NOT A SCHEDULE. Measured incident: a hand-written
+# unit on a cell carried `WorkingDirectory=/tmp/cell-wt-runnerauto2`; the cell reclaimed that worktree,
+# and systemd failed the oneshot with `status=200/CHDIR` BEFORE it ran a line — every 10 minutes, for
+# as long as the reclaim stood. The converger was dead while its job was to repair exactly that kind
+# of degradation, and the only signal was a red unit nobody read. So the template pins a path that
+# cannot be reclaimed, and an unusable path is REFUSED instead of written.
+UNIT_BASENAME = "eldato-runner-autoscale"
+REPO_PATTERN = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+# ⛔ `/private/...` IS LISTED SEPARATELY, not as a nicety: on macOS `Path.resolve()` turns
+# `/tmp` into `/private/tmp` and `/var/folders/...` into `/private/var/folders/...` (both are symlinks),
+# so a list naming only the friendly spelling reports a temp directory as DURABLE — measured, that is
+# exactly how the first version of this guard passed a `tempfile.mkdtemp()` workdir.
+# Every unit TYPE whose processes systemd gives a working directory. `.service` alone is not the
+# population that can fail at CHDIR.
+UNIT_FILE_SUFFIXES = ("service", "socket", "path", "mount", "swap")
+TRANSIENT_UNIT_PREFIXES = (
+    "/tmp",
+    "/var/tmp",
+    "/run",
+    "/dev/shm",
+    "/var/folders",
+    "/private/tmp",
+    "/private/var/tmp",
+    "/private/var/folders",
+)
+
+
+def unit_workdir_problem(workdir: str | None) -> str | None:
+    """None when `workdir` may be a unit's WorkingDirectory, else the reason it may not.
+
+    `None` means the template's `%h` — the account's home, which systemd resolves per-user. It is
+    checked by RESOLVING it (a container may hand out `HOME=/tmp/something`, and then the stable
+    spelling points at a transient directory).
+    """
+    if workdir in (None, "", "%h"):
+        workdir = str(Path.home())
+    else:
+        # ⛔ AN EXPLICIT VALUE IS ONE ABSOLUTE PATH, ONE LINE — and nothing else:
+        #   * a `%` is a systemd SPECIFIER, expanded at LOAD time. Validated here as a filesystem
+        #     path it can pass (measured: `~/ra-%h-x` exists as a literal directory) and then resolve
+        #     to a DIFFERENT, non-existent path inside systemd — the status=200/CHDIR class this fix
+        #     exists to close, written by the fix itself. Only the `%h` default may carry one.
+        #   * a newline injects an arbitrary systemd DIRECTIVE into a unit that runs as this account
+        #     (measured: `--workdir "$HOME/x\nExecStartPre=/bin/false"` wrote that line into [Service]).
+        #     A control character has no legitimate place in a path, so the whole class is refused.
+        if "%" in workdir:
+            return (
+                f"WorkingDirectory={workdir!r} contains a systemd specifier (%) — it would be "
+                "expanded at load time to a path this check never saw. Use a literal path, or the "
+                "default (%h)"
+            )
+        if any(ch in workdir for ch in ("\n", "\r", "\0")) or any(
+            ord(ch) < 32 for ch in workdir
+        ):
+            return (
+                f"WorkingDirectory={workdir!r} contains a control character — that is a directive "
+                "injection into the unit, not a path"
+            )
+    path = Path(workdir).expanduser()
+    if not path.is_absolute():
+        return f"WorkingDirectory={workdir!r} is not an absolute path"
+    # ⛔ THE SHAPE IS CHECKED FIRST, and the order is load-bearing: a path under /tmp that does not
+    # exist YET is still a transient path, and reporting only "does not exist" would invite the
+    # operator to mkdir it — which is exactly how the measured unit came to point at a directory a
+    # reclaim later took. Shape first, then existence.
+    real = path.resolve()
+    for prefix in TRANSIENT_UNIT_PREFIXES:
+        if str(real) == prefix or str(real).startswith(prefix + "/"):
+            return (
+                f"WorkingDirectory={workdir} is inside {prefix} — a reclaim or a tmp cleaner removes "
+                "it underneath the unit (measured: /tmp/cell-wt-runnerauto2 killed a converger for "
+                "as long as the reclaim stood)"
+            )
+    if not path.is_dir():
+        return (
+            f"WorkingDirectory={workdir} does not exist — systemd fails the unit with "
+            "status=200/CHDIR BEFORE it runs a line, so the converger would silently stop"
+        )
+    return None
+
+
+# ⛔ TWO HIERARCHIES, TWO LOAD PATHS. The user manager and the system manager search DISJOINT
+# directories, so `~/.config/systemd/user/x.service` and `/etc/systemd/system/x.service` are two
+# different units that can never override one another. Merging them by bare name let a healthy copy
+# in one hierarchy mask a broken copy in the other (measured), so the audit partitions by hierarchy.
+USER_UNIT_DIRS = (
+    "~/.config/systemd/user",
+    "/etc/systemd/user",
+    "/usr/lib/systemd/user",
+)
+SYSTEM_UNIT_DIRS = (
+    "/etc/systemd/system",
+    "/usr/lib/systemd/system",
+)
+
+
+def default_unit_dirs() -> list[str]:
+    """Every audited unit directory, in SEARCH-PATH ORDER (highest priority first, per hierarchy).
+
+    The seam replaces the whole population, which is what makes the audit hermetic.
+    """
+    raw = os.environ.get("RUNNER_AUTOSCALE_UNIT_DIR")
+    if raw:
+        return [raw]
+    # EXPANDED, so the default population reads as absolute paths (a `~` in an audit report is a
+    # path the reader has to resolve again, and one this tool already resolved for its own checks)
+    return [str(Path(d).expanduser()) for d in (*USER_UNIT_DIRS, *SYSTEM_UNIT_DIRS)]
+
+
+def unit_dir_hierarchy(directory: str) -> str:
+    """`user` or `system` — which manager's load path `directory` belongs to.
+
+    A seam directory (or anything unrecognised) is treated as `user`: it is a test/fixture root, and
+    the ONLY thing the partition must guarantee is that one hierarchy cannot mask the other.
+    """
+    expanded = str(Path(directory).expanduser())
+    for system_dir in SYSTEM_UNIT_DIRS:
+        # EXACT or under a fixture root: a test cannot write to /etc, so a path that ENDS with one of
+        # the system load paths is treated as the system hierarchy. Over-inclusive in the safe
+        # direction (a misclassified directory can only add findings, never hide one).
+        if expanded == system_dir or expanded.endswith("/" + system_dir.lstrip("/")):
+            return "system"
+    return "user"
+
+
+def render_unit(
+    repo: str,
+    workdir: str | None = None,
+    *,
+    script: str | None = None,
+    python: str | None = None,
+) -> dict[str, str]:
+    """The unit PAIR as text: `<name>.service` + `<name>.timer`.
+
+    ⛔ `%h`, NOT the script's own directory, is the default: this tool is often run from a working
+    copy (a cell worktree, a lane checkout) and THAT is what a reclaim removes. `%h` is the account
+    home — the one path the unit's own account always owns. An operator who wants something else
+    passes `--workdir`, and then it is VALIDATED rather than trusted.
+    ⛔ The interpreter and the script are ABSOLUTE and MEASURED (`sys.executable`, `__file__`), not
+    guessed: `ExecStart=python3 ...` is not a PATH lookup, and a unit naming a different interpreter
+    than the one that rendered it fails on its own version guard.
+    """
+    script = script or str(Path(__file__).resolve())
+    python = python or sys.executable
+    wd = workdir or "%h"
+    service = "\n".join(
+        [
+            "[Unit]",
+            "Description=Converge the self-hosted CI runner pool to this box's measured ceiling",
+            f"Documentation=file:{script}",
+            "After=network-online.target",
+            "",
+            "[Service]",
+            "Type=oneshot",
+            "# %h is the account's home: a reclaimed worktree can never take it away.",
+            f"WorkingDirectory={wd}",
+            # ⛔ QUOTED. systemd splits ExecStart on whitespace, so an unquoted script path or repo
+            # containing a space yields a unit that fails on EVERY tick — a cron-style silent break of
+            # the very schedule being installed (measured: `--repo o/r` + a positional, exit 2).
+            'ExecStart="%s" "%s" --repo "%s"' % (python, script, repo),
+            "Nice=10",
+            "# A pass can legitimately run for many minutes (waits, reads, a provision), and systemd",
+            "# will not start a SECOND instance of an active oneshot service — that is the mutual",
+            "# exclusion this CLI keeps no lock for, so two passes can never repair one runner at once.",
+            "TimeoutStartSec=1800",
+        ]
+    )
+    timer = "\n".join(
+        [
+            "[Unit]",
+            "Description=Run the CI runner converger every ~9 minutes",
+            "",
+            "[Timer]",
+            "OnBootSec=2min",
+            "OnUnitActiveSec=9min",
+            f"Unit={UNIT_BASENAME}.service",
+            "",
+            "[Install]",
+            "WantedBy=timers.target",
+        ]
+    )
+    return {f"{UNIT_BASENAME}.service": service + "\n", f"{UNIT_BASENAME}.timer": timer + "\n"}
+
+
+def _systemctl_user(args: list[str]) -> list[str]:
+    """`systemctl --user …` — NO sudo: `sudo` would target root's manager, not the unit's owner."""
+    binary = os.environ.get("RUNNER_AUTOSCALE_SYSTEMCTL") or (
+        shutil.which("systemctl") or "systemctl"
+    )
+    return [binary, "--user", *args]
+
+
+def repo_problem(repo: str) -> str | None:
+    """None when `repo` is a plain `owner/name`, else the reason it must not reach `ExecStart`.
+
+    ⛔ `--repo` IS INTERPOLATED INTO A UNIT FILE, so it gets the SAME treatment as `--workdir`:
+    unvalidated, a newline writes an arbitrary directive into `[Service]` (a unit that runs as this
+    account, measured), a quote escapes the ExecStart quoting and silently re-points `--repo`, and a
+    `%` becomes a systemd specifier expanded at load time. Quoting is not a substitute for validation
+    — it is the second line, and a value that can close the quote defeats it.
+    """
+    if not REPO_PATTERN.fullmatch(repo or ""):
+        return (
+            f"--repo {repo!r} is not a plain `owner/name` (letters, digits, dot, dash, underscore) — "
+            "it is interpolated into ExecStart, where a newline, a quote or a % becomes a directive "
+            "or a specifier instead of a repository"
+        )
+    return None
+
+
+def install_unit(
+    repo: str, workdir: str | None = None, unit_dir: str | None = None
+) -> list[str]:
+    """Write the unit pair and enable its timer. Returns what was done; raises on refusal/failure.
+
+    ⛔ WRITTEN IS NOT ENABLED. A unit file on disk with no timer running is exactly the false PASS
+    this file refuses for runners ("registered but its service could not be enabled"), so the reload
+    and the enable are steps whose status is checked and reported, never best-effort.
+    """
+    for problem in (repo_problem(repo), unit_workdir_problem(workdir)):
+        if problem:
+            raise UnitRefused(problem)
+    directory = Path(unit_dir or default_unit_dirs()[0]).expanduser()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ActionFailed(f"could not create {directory}: {exc} — NOTHING was written") from exc
+    # ⛔ STAGED, NOT SPLICED, AND NOTHING INSTALLED IS EVER DESTROYED. Both temp files are written
+    # first and only then renamed into place, so a failure before the first replace leaves the
+    # installed pair untouched, and no branch ever unlinks a REAL path (a first version unlinked "what
+    # it wrote", which on a re-install was the previously installed file — measured, and worse than
+    # the problem it fixed). The two replaces are sequential, so a failure between them can still
+    # leave a MIXED pair; the failure says exactly that rather than claiming a clean rollback.
+    planned = render_unit(repo, workdir)
+    staged: list[tuple[Path, Path]] = []
+    replaced: list[Path] = []
+    try:
+        for name, text in planned.items():
+            path = directory / name
+            tmp = directory / f".{name}.tmp"
+            staged.append((tmp, path))  # BEFORE the write: a failed write must still be cleaned up
+            tmp.write_text(text, encoding="utf-8")
+            os.chmod(tmp, 0o644)
+        for tmp, path in staged:
+            os.replace(tmp, path)
+            replaced.append(path)
+    except OSError as exc:
+        for tmp, _ in staged:  # ONLY the temp files: the real paths were never touched
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        when = (
+            "nothing had been replaced yet"
+            if not replaced
+            else "already replaced: " + ", ".join(p.name for p in replaced)
+        )
+        raise ActionFailed(
+            f"could not install the unit pair into {directory}: {exc} — {when}. No installed file "
+            "was DESTROYED, but the pair may be MIXED (one new file, one from the previous install); "
+            "the next successful run repairs it"
+        ) from exc
+    done = [f"wrote {path}" for _, path in staged]
+    for args in (["daemon-reload"], ["enable", "--now", f"{UNIT_BASENAME}.timer"]):
+        rc, out = _run(_systemctl_user(args), timeout=120)
+        if rc != 0:
+            raise ActionFailed(
+                f"systemctl --user {' '.join(args)} rc={rc} {out[:200]} — the unit files are written "
+                "but the install is INCOMPLETE: this tool did not verify whether a timer is "
+                "scheduled now, so treat the schedule as UNKNOWN (a previously enabled timer for "
+                "this unit may still be firing; one that was never enabled will not start)"
+            )
+        done.append(f"systemctl --user {' '.join(args)}")
+    return done
+
+
+def _unit_files(directory: Path, problems: list[str]) -> list[Path]:
+    """Every file in `directory` (and its `*.d/` drop-in dirs) that can carry a WorkingDirectory.
+
+    ⛔ `iterdir()` WITH AN ERROR PATH, not `glob()`. `Path.glob` swallows `PermissionError` and
+    returns `[]`, so a drop-in directory this account cannot read reported as an EMPTY one — measured:
+    a mode-000 `clean.service.d` holding a transient WorkingDirectory audited as CLEAN while the same
+    content under a readable directory was caught. An unreadable directory is not an empty one.
+    """
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError as exc:
+        problems.append(f"{directory}: unreadable ({exc}) — NOTHING was audited there")
+        return []
+    files: list[Path] = []
+    for entry in entries:
+        name = entry.name
+        if entry.is_dir() and name.endswith(".d"):
+            try:
+                files.extend(sorted(entry.iterdir()))
+            except OSError as exc:
+                problems.append(f"{entry}: unreadable ({exc}) — NOTHING was audited there")
+        elif name.rsplit(".", 1)[-1] in UNIT_FILE_SUFFIXES:
+            files.append(entry)
+    return files
+
+
+def installed_unit_cwd_problems(
+    unit_dirs: list[str] | None = None, *, require_any: bool = False
+) -> list[str]:
+    """Audit the INSTALLED units for the shape the template now refuses to create.
+
+    ⛔ THIS IS THE OTHER HALF OF THE FIX. Refusing to WRITE a transient WorkingDirectory does nothing
+    for the units already on the box — including the hand-written one that started this — so the
+    existing population is read and any bad one is NAMED.
+
+    ⛔ AND IT READS THE POPULATION THAT ACTUALLY DECIDES THE VALUE, not the convenient one:
+      * DROP-INS (`<unit>.d/*.conf`) are read, and LAST ASSIGNMENT WINS is honoured — systemd applies
+        the last `WorkingDirectory=` it sees. Reading only the main unit reported the measured
+        incident shape as CLEAN; reporting EVERY assignment made the documented remedy (fix it with a
+        drop-in) unable to ever clear the finding. So the audit keeps the LAST value per unit, in
+        systemd's order: the unit file (the FIRST copy in search-path order wins), then its drop-ins
+        by filename — and of two drop-ins with the SAME name, again the FIRST copy wins, because
+        systemd skips an overridden file instead of merging it.
+      * THE TWO MANAGERS ARE AUDITED SEPARATELY. `~/.config/systemd/user/x.service` and
+        `/etc/systemd/system/x.service` are different units on disjoint load paths; merging them by
+        name let a healthy copy in one hierarchy mask a broken copy in the other.
+      * every unit TYPE whose processes systemd gives a working directory (`service`, `socket`,
+        `path`, `mount`, `swap`) — a `*.service`-only glob reported a transient WorkingDirectory on a
+        `.socket` as clean.
+      * only the `[Service]` SECTION: a `WorkingDirectory=` under `[Unit]` is ignored by systemd, and
+        reporting it would refuse something with no runtime effect.
+      * a directory this cannot read, and (with `require_any`) an audit that finds NO unit files at
+        all, are reported — an audit that read nothing must never print "all usable".
+    ⛔ IT EVALUATES AS THE AUDITING ACCOUNT. `User=` is not resolved: a path this account can see and
+    the unit's own account cannot is EACCES at CHDIR and is NOT reported here. Stated, not hidden.
+    """
+    problems: list[str] = []
+    seen = 0
+    # ⛔ ONE GROUP PER UNIT NAME, ACROSS EVERY AUDITED DIRECTORY — not one per directory. systemd
+    # searches the whole unit load path, so a drop-in in a HIGHER-priority directory overrides a unit
+    # defined in a lower one; grouping per directory meant the documented remedy (fix it with a
+    # drop-in) could never clear a finding for exactly the user-level population this tool installs
+    # into. The order below is systemd's: for a same-named unit file the FIRST directory in the
+    # search path wins, and a unit's drop-ins come after it, by filename.
+    groups: dict[tuple[str, str], list[Path]] = {}
+    for base in unit_dirs or default_unit_dirs():
+        root = Path(base).expanduser()
+        if not root.is_dir():
+            # Not a finding by itself — the aggregate guard below reports an audit that read nothing
+            # (`require_any`), and it NAMES every directory it looked in.
+            continue
+        hierarchy = unit_dir_hierarchy(str(root))
+        for path in _unit_files(root, problems):
+            seen += 1
+            if path.name.endswith(".conf"):
+                # `<name>.service.d/x.conf` → the unit it overrides
+                owner = path.parent.name[: -len(".d")]
+            else:
+                owner = path.name
+            groups.setdefault((hierarchy, owner), []).append(path)
+    for (hierarchy, owner), paths in sorted(groups.items()):
+        last: tuple[Path, str] | None = None
+        mains = [q for q in paths if not q.name.endswith(".conf")]
+        # ⛔ A DROP-IN IS DE-DUPLICATED BY BASENAME, KEEPING THE FIRST — the higher-priority
+        # directory's copy. systemd does not merge two files with the same name: it SKIPS the
+        # lower-priority one (`conf-files.c::files_add`). Sorting by name alone left the LAST
+        # occurrence (the lower-priority copy) as `last`, so a clean copy in a later directory masked
+        # a bad one in an earlier directory — measured, and a failing user unit reported CLEAN.
+        by_name: dict[str, Path] = {}
+        for path in paths:
+            if path.name.endswith(".conf"):
+                by_name.setdefault(path.name, path)
+        drops = sorted(by_name.values(), key=lambda q: q.name)
+        # the FIRST main file in search-path order is the one systemd uses
+        for path in ([mains[0]] if mains else []) + drops:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:  # unreadable is NOT clean
+                problems.append(f"{path.name}: unreadable ({exc})")
+                continue
+            section = ""
+            for line in text.splitlines():
+                bare = line.strip()
+                if bare.startswith("[") and bare.endswith("]"):
+                    section = bare[1:-1].strip()
+                    continue
+                if "=" not in line:  # systemd skips a valueless line; so must this
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip() == "WorkingDirectory" and section == "Service":
+                    last = (path, value.strip())
+        if last is None:
+            continue
+        path, value = last
+        tolerant = value.startswith("-")
+        if tolerant:
+            value = value[1:].strip()
+        if "%" in value and value != "%h":
+            problems.append(
+                f"{path.name}: WorkingDirectory={value} uses a systemd specifier this "
+                "check cannot resolve — verify it by hand"
+            )
+            continue
+        problem = unit_workdir_problem(value)
+        if problem is None:
+            continue
+        if tolerant:
+            # `-` only SUPPRESSES the failure: the unit still starts, from whatever directory the
+            # manager hands it. Saying "systemd fails this unit" would be false.
+            problems.append(
+                f"{path.name}: WorkingDirectory=-{value} — the leading `-` suppresses the "
+                f"failure, so the unit will silently start in the WRONG directory ({problem})"
+            )
+        else:
+            problems.append(f"{path.name}: {problem}")
+    if require_any and seen == 0:
+        problems.append(
+            f"no unit files under {', '.join(unit_dirs or default_unit_dirs())} — that is "
+            "'nothing was audited', NOT 'all usable'"
+        )
+    return problems
+
+
 def _next_free_slot(root: str) -> int:
     """The first free slot in the provisioner's own numbering: base, base-2, base-3, ...
 
@@ -1411,6 +1854,15 @@ def converge(
     else:
         record["verdict"] = "converged" if record["actions"] else "at-ceiling"
     record["live"] = live
+    # ⛔ THE INSTALLED UNITS ARE AUDITED ON EVERY PASS, not only under `--check-units`. Refusing to
+    # write a transient WorkingDirectory does nothing about the units ALREADY on the box — including
+    # the hand-written one that started this — and a broken unit is invisible until someone reads a
+    # red unit. A NOTE, not a `problems` entry: the pool may be perfectly converged, and turning a
+    # healthy pool red for a stale unit file would trade one silent failure for a noisy false one.
+    unit_problems = installed_unit_cwd_problems()
+    if unit_problems:
+        record["unit_cwd_problems"] = unit_problems
+        record["notes"].extend(f"unit cwd: {p}" for p in unit_problems)
     return record
 
 
@@ -1518,11 +1970,56 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--status", action="store_true", help="measure + classify; change nothing")
     ap.add_argument("--dry-run", action="store_true", help="print the plan; change nothing")
     ap.add_argument("--json", action="store_true", help="one machine-readable record")
+    ap.add_argument(
+        "--install-unit",
+        action="store_true",
+        help="write+enable this tool's OWN systemd unit pair (refused if its WorkingDirectory is "
+        "missing or transient); change nothing else and exit",
+    )
+    ap.add_argument(
+        "--check-units",
+        action="store_true",
+        help="audit the INSTALLED units' WorkingDirectory values; exit 5 when one is unusable",
+    )
+    ap.add_argument(
+        "--workdir",
+        default=None,
+        metavar="PATH",
+        help="WorkingDirectory for --install-unit (default %%h, the account home)",
+    )
     opts = ap.parse_args(argv)
 
     if opts.want is not None and opts.want < 0:
         print("usage: --want must be >= 0", file=sys.stderr)
         return 1
+
+    if opts.check_units:
+        problems = installed_unit_cwd_problems(require_any=True)
+        payload = {"checked": default_unit_dirs(), "problems": problems}
+        if opts.json:
+            print(json.dumps(payload))
+        else:
+            for problem in problems:
+                print(problem)
+            print(
+                f"checked {', '.join(default_unit_dirs())} — "
+                + (f"{len(problems)} finding(s)" if problems else "all usable")
+            )
+        return 5 if problems else 0
+
+    if opts.install_unit:
+        try:
+            done = install_unit(opts.repo, opts.workdir)
+        except UnitRefused as exc:
+            print(f"REFUSED (nothing was written): {exc}", file=sys.stderr)
+            return 1
+        except ActionFailed as exc:
+            print(f"ACTION FAILED: {exc}", file=sys.stderr)
+            return 3
+        for line in done:
+            print(line)
+        print(f"verdict={UNIT_BASENAME} installed")
+        return 0
 
     try:
         record = converge(
