@@ -5672,6 +5672,12 @@ PY
     _stallraw="${MERGE_STALL_MIN:-180}"
     _stallmin=180
     case "$_stallraw" in ''|*[!0-9]*) : ;; *) _stallmin=$(( 10#$_stallraw )) ;; esac
+    # ⛔ THE DISPATCH BELOW MUST SEE "DID THIS PASS STALL", NOT "WHAT IS THE COUNTER".
+    # `_dpass` is set only inside the stall arm; read on the drain-alive path it defaults to 0,
+    # and `0 % 3 == 0` dispatched a stall-repair worker on every HEALTHY pass (verifier,
+    # 2026-10-27). Initialised here — at the top of the block, so every pass resets it, which is
+    # also the reset the drain-alive path needs — and set to 1 only inside the stall arm.
+    _stalled=0
     _lm="$(mp_recent_land 2>/dev/null || true)"
     if is_num "${_lm:-}"; then
       _lage=$(( ( $(date +%s) - (10#${_lm}) ) / 60 ))
@@ -5685,6 +5691,7 @@ PY
       if [ "$_lage" -lt 0 ]; then
         echo "[dispatch] DRAIN STALL UNMEASURED — the newest land marker (state/merged-*.done) is stamped ${_lage#-}m in the FUTURE, so the drain's age cannot be read. This is neither a stall nor an all-clear; ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
       elif [ "$_lage" -ge "$_stallmin" ]; then
+        _stalled=1
         # ── THE STALL IS ALSO AN ESCALATION (agent-infra#2590) ───────────────────────────────
         # The stall line alone escalated to nobody: it was printed 8 times on a live box that sat at
         # `lanes=0`, 9 un-owned, nothing landing for 3.4h, and its operator read the log as normal.
@@ -5784,9 +5791,28 @@ PY
         # its own line claimed N — a false statement about consecutiveness and a bound quietly cut to 1.
         [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
       fi
+        # ── THE ESCALATION MUST DISPATCH, NOT ONLY COMPLAIN (owner decision 2026-10-27) ──
+        # Printed 8 times on a live box at lanes=0 for 3.4h; nothing was ever done about the
+        # stall itself. Owner ruling: the issue path MAY open (the #2832 escape), and a stall
+        # must ALSO put a worker on the LAND problem, loudly. Fires on BOTH stall shapes —
+        # "started nothing" (deadlock) and "workers run, nothing lands" (land problem) — since
+        # both leave capacity unused; stall-fix.sh is told which one via PRDISP_SPAWNS.
     elif [ "${_land_any:-0}" = "1" ]; then
+      # ⛔ THIS IS THE ARM THE WORST STALL TAKES (verifier, cycle 3): it fires when NOTHING landed
+      # inside `find -mmin -2x` — the ≥6h class, and the state a long-lived box actually reaches
+      # (measured here: 178 `merged-*.done`, none within 360m). It printed DRAIN STALLED and set no
+      # flag, so the escalation was inert exactly where the stall is worst and the issue path is
+      # closed. Both stall shapes must dispatch.
+      _stalled=1
       echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
     fi
+        if [ "${_stalled:-0}" = "1" ] && [ -x "$O/stall-fix.sh" ]; then
+          O="$O" UPN_WORK="${UPN_WORK:-}" HARNESS_REPO="${HARNESS_REPO:-}" \
+            PRDISP_SPAWNS="${PRDISP_SPAWNS:-}" \
+            bash "$O/stall-fix.sh" "${_dpass:-0}" "${_lage:-?}" 2>&1 || true
+        elif [ "${_stalled:-0}" = "1" ]; then
+          echo "[dispatch] DRAIN STALL -> STALL FIX MISSING ($O/stall-fix.sh absent or not executable)"
+        fi
     # [drain-health:end]
   else
     # [drain-clear:begin] (extracted and DRIVEN by test-gates.sh — keep the marker)
