@@ -124,12 +124,14 @@ Injected, never guessed:
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import inspect
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -231,6 +233,14 @@ if is /registration-token; then
   [ -f "$FIX/token.fail" ] && { echo "gh: HTTP 401: Bad credentials (fixture)" >&2; exit 1; }
   printf 'tok-fixture\n'; exit 0
 fi
+if is 'direction=asc'; then
+  # THE QUEUE'S OLDEST WAITING RUN (the AGE term, round 11). MUST be tested before the depth branch
+  # below, whose pattern is a SUBSTRING of this URL. Default: a run created NOW — a backlog that is
+  # being served, which is the healthy shape every pre-existing case was written against. A case that
+  # is ABOUT a starved queue writes `queue-age` (see `Box.queue_age`).
+  if [ -f "$FIX/queue-age" ]; then cat "$FIX/queue-age"; else date -u +%Y-%m-%dT%H:%M:%SZ; fi
+  exit 0
+fi
 if is 'actions/runs?status=queued'; then
   # `--jq .total_count` — the queue depth. An absent fixture file is an ERROR, never a zero.
   # `queued.seq` is a newline list consumed one per call (last repeats), so a case can make the
@@ -263,6 +273,7 @@ if is 'actions/runners'; then
   printf '%s\n' "$(( n + 1 ))" > "$FIX/pool.count"
   case "$step" in
     ok)    cat "$FIX/pool.tsv"; exit 0 ;;
+    swap)  cat "$FIX/pool2.tsv"; exit 0 ;;
     empty) exit 0 ;;
     err:*) echo "${step#err:}" >&2; exit 1 ;;
     *)     echo "gh: unknown pool step '$step'" >&2; exit 9 ;;
@@ -275,6 +286,9 @@ exit 0
 
 SYSTEMCTL_STUB = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "__FIX__/systemctl-calls.log"
+# A `systemctl restart` that FAILS is a routine transient on a loaded box (bus/dbus unavailable,
+# manager busy), and the repair path must not read it as "the runner is offline" (round 11).
+if [ -f "__FIX__/systemctl.rc" ]; then exit "$(cat "__FIX__/systemctl.rc")"; fi
 exit 0
 """
 
@@ -439,6 +453,24 @@ class Box:
         """Per-CALL pool-read behaviour; the last step repeats. Every call is counted in gh-calls."""
         self._write(os.path.join(self.dir, "pool.seq"), "\n".join(steps) + "\n")
 
+    def pool_then(self, entries):
+        """A pool that CHANGES after the first read: `pool` for classification, `entries` afterwards.
+
+        ⛔ The measurement that matters is a runner the pass judged OFFLINE at classification and the
+        pool reports ONLINE seconds later — reconnection during the restart wait. A static fixture
+        cannot express it, and `pool_seq`'s steps only name a BEHAVIOUR, not new CONTENT.
+        """
+        rows = [
+            f"{name}\t{status}\t{'true' if busy else 'false'}\t{','.join(labels)}"
+            for name, status, busy, labels in entries
+        ]
+        self._write(os.path.join(self.dir, "pool2.tsv"), "\n".join(rows) + ("\n" if rows else ""))
+        self.pool_seq(["ok", "swap"])
+
+    def systemctl_rc(self, rc: int):
+        """Make the `systemctl` stub EXIT non-zero (a restart that failed to run)."""
+        self._write(os.path.join(self.dir, "systemctl.rc"), f"{rc}\n")
+
     def gate_state(self, mode, *, scheduled=True):
         """The gate's last recorded decision + whether a job SCHEDULES the gate on this box.
 
@@ -451,6 +483,21 @@ class Box:
 
     def queued(self, n):
         self._write(os.path.join(self.dir, "queued"), f"{n}\n")
+
+    def queue_age(self, seconds: float):
+        """The OLDEST queued run's `created_at`, `seconds` in the past — the queue-AGE term's input.
+
+        ⛔ NOT A COUNT: the depth says work is waiting, the AGE says whether anyone is serving it, and
+        the whole point of the round-11 finding is that a cell can measure the second and not the
+        gate's intent. `None` removes the fixture, which the stub answers with "created now".
+        """
+        path = os.path.join(self.dir, "queue-age")
+        if seconds is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        stamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds)
+        self._write(path, stamp.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
 
     def unqueue(self):
         """Remove the queue fixture entirely: the depth read FAILS (the stub exits 1), as a scoped
@@ -3181,8 +3228,361 @@ def t32_busy_reread_before_replace():
             box.destroy()
 
 
+# ── 10. THE ROUND-11 REVIEW FINDINGS (2026-10-27) ─────────────────────────────────────────────────
+# Five defects, found by a fresh-context reviewer at head 5e0011629. Each one is a place where this
+# file's own prose was stronger than its code, and each fix ships with its case AND its mutation.
+
+
+@test("T44 the queue's AGE is the term a CELL can measure — #2875's shape alarms there, a served backlog does not")
+def t44_queue_age_eligibility():
+    """THE FINDING THAT MATTERS MOST, because it is about the boxes this tool is INSTALLED on.
+
+    `--install-unit` writes a SYSTEMD user unit, i.e. a cell — and on a cell `gate_desired_mode()` is
+    `None` BY CONSTRUCTION (`gate_scheduler_present`: the gate is a launchd job; "nothing schedules the
+    gate on a cell"). So the eligibility term that reads the gate is DEAD there, and the #2875 shape —
+    the label STRIPPED pool-wide by the gate on another box, 53 queued, pool online and idle — fell
+    through to the 60-deep threshold and reported `ok`, exit 0. The tool was written for an outage it
+    could not see from the boxes it runs on.
+
+    ⛔ AND THE FIX IS NOT "THE QUEUE IS NOT DRAINING": `queued=14` sustained across the confirmation
+    window is the measured, HEALTHY steady state of the fallback-only ruling (round 9's own fix), so
+    that term would re-arm the false alarm it removed. AGE separates them — a healthy GitHub-hosted
+    scheduler serves in seconds-to-minutes — so both halves are asserted here: the starved queue pages,
+    and the served backlog stays silent with the reason and the counts published.
+    """
+    with Env():
+        box = Box("queue-age")
+        try:
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            # #2875's own counts: the label is GONE from every runner (the gate on the hub stripped
+            # it), the pool is online and IDLE, and 53 runs are waiting (below the gate's 60).
+            box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
+            box.queued(53)
+            box.queue_age(2400)  # 40 minutes
+            record = converge(box, nproc="2", dry_run=True)
+            check(
+                record.get("starvation") == "starved",
+                f"a 40-minute-old queue with an idle online pool IS starvation, whatever the gate "
+                f"says: {record.get('starvation')} / {record.get('starvation_why')}",
+            )
+            check(record.get("starvation_eligible") is True, f"record: {record.get('starvation_why')}")
+            contains(record.get("starvation_why", ""), "OLDEST queued run", "the reason names the AGE")
+            check(
+                record.get("starvation_queue_age_s") is not None
+                and record["starvation_queue_age_s"] >= ra.STARVATION_QUEUE_AGE_S,
+                f"the age is part of the evidence: {record.get('starvation_queue_age_s')}",
+            )
+            check(record.get("verdict") == "starvation", f"the verdict: {record.get('verdict')}")
+            # ⛔ THE OTHER HALF: the SAME depth, a queue that is being served. Nothing about the
+            # counts changed — only the age — and the alarm must stay silent, with the reason.
+            box.queue_age(None)  # the oldest waiting run was created NOW
+            record = converge(box, nproc="2", dry_run=True)
+            check(
+                record.get("starvation") == "ok",
+                f"a backlog younger than the bound is GitHub-hosted's work, not this pool's: "
+                f"{record.get('starvation')} / {record.get('starvation_why')}",
+            )
+            check(
+                record.get("starvation_eligible") is False,
+                f"…and it must not be ELIGIBLE: {record.get('starvation_why')}",
+            )
+            contains(
+                record.get("starvation_why", ""),
+                "younger than",
+                "the reason must name the age bound it did not reach",
+            )
+            check(
+                record.get("starvation_queued") == 53,
+                f"the counts are published on BOTH verdicts: {record}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T45 a FAILED restart command is not 'offline': a runner the pool reports ONLINE is never --replace'd")
+def t45_failed_restart_is_not_offline():
+    """`wait_online` was called only when the restart COMMAND succeeded; on failure the pass set
+    `state = "offline"` without asking the pool at all — and the pre-`--replace` guard tested `busy`
+    only, never `online`. So a runner that reconnected while `sudo -n systemctl restart` returned
+    non-zero (a routine transient on a loaded box: bus/dbus unavailable, manager busy) had its LIVE
+    registration deleted, the record claimed "still offline after restart" about a question it never
+    asked, and the pass exited 0 (`converged`)."""
+    with Env():
+        box = Box("restart-failed")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.alive([])
+            # Classification sees it offline; from the SECOND read on the pool reports it ONLINE.
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.pool_then([("r-dead", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.systemctl_rc(1)  # `systemctl restart` exits 1 and never reaches the manager
+            record = converge(box, nproc="2")
+            check(
+                not box.calls("config-calls.log"),
+                f"a runner the pool reports ONLINE must never be re-registered: "
+                f"{box.calls('config-calls.log')}",
+            )
+            check(
+                any("the pool reports it ONLINE" in n for n in record["notes"]),
+                f"…and the pass must say WHICH evidence stopped it: {record['notes']}",
+            )
+            check(
+                any("restart COMMAND failed" in n for n in record["notes"]),
+                f"…and that the restart command failed, since that is what it measured: "
+                f"{record['notes']}",
+            )
+            check(
+                not any("re-registering with --replace" in a for a in record["actions"]),
+                f"the record must not claim an action that was not taken: {record['actions']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T46 a unit entry this account cannot INSPECT is a finding — not a traceback that loses the pass's record")
+def t46_uninspectable_unit_entry():
+    """`_unit_files` was converted from `glob()` to `iterdir()` for the DIRECTORY, but the PER-ENTRY
+    probe stayed `entry.is_dir()` — which re-raises everything outside `pathlib`'s absence errnos. A
+    symlink in a unit directory pointing into a tree this account cannot traverse therefore escaped
+    BOTH `--check-units` and the every-pass audit: on the pass path that is `main()`'s backstop, exit 2
+    with no `actions` field — i.e. the record of a registration the pass had already destroyed is the
+    part that gets lost, which is the exact mechanism round 9 fixed for `discover()` and left live at
+    the audit that runs LAST."""
+    with Env():
+        box = Box("unit-entry")
+        try:
+            box._write(
+                os.path.join(box.dir, "units", "a.service"),
+                "[Service]\nWorkingDirectory=%h\nExecStart=/bin/true\n",
+            )
+            # ⛔ AN ENTRY WHOSE `stat` FAILS WITHOUT NEEDING PRIVILEGES. A symlink pointing THROUGH a
+            # mode-000 directory: the link itself is listable, but following it is EACCES for its own
+            # OWNER too, so `Path.is_dir()`/`os.stat` raise instead of returning an absence. (A
+            # symlink TARGET cannot be made over-long — the filesystem returns ENAMETOOLONG at
+            # creation — which is what `_TOO_LONG` is for in the WORKDIR probe, not here.)
+            secret = os.path.join(box.dir, "secret")
+            os.makedirs(secret, exist_ok=True)
+            os.symlink(
+                os.path.join(secret, "b.service"), os.path.join(box.dir, "units", "b.service")
+            )
+            os.chmod(secret, 0o000)
+            code, out = cli(box, "--check-units")
+            check(code == 5, f"an uninspectable ENTRY is a finding (5), never a crash: rc={code}\n{out}")
+            contains(out, "cannot be inspected", "the audit names the entry")
+            check("Traceback" not in out, f"…and never a traceback:\n{out}")
+            # ⛔ AND THE PASS PATH: the audit runs at the end of every pass, so an exception here
+            # costs the record its `actions` — after the repair loop may already have acted.
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            box.pool([("r-1", "online", False, ["self-hosted-x64"])])
+            record = converge(box, nproc="2", dry_run=True)
+            check("actions" in record, f"the pass must keep its record: {sorted(record)}")
+            # ⛔ A NOTE + `unit_cwd_problems`, NOT a `problems` entry: a stale unit file must not turn
+            # a healthy pool red (that trade is pinned elsewhere), so the finding is asserted where
+            # this file actually carries it.
+            findings = record.get("unit_cwd_problems") or []
+            check(
+                any("NOTHING was audited" in p for p in findings),
+                f"…and the uninspectable entry is reported, not skipped: {findings}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T47 the unit's TimeoutStartSec is ABOVE a legitimate pass — systemd must never SIGTERM one mid-register")
+def t47_unit_timeout_exceeds_pass_bounds():
+    """The rendered unit claimed systemd's oneshot mutual exclusion as this CLI's only overlap guard,
+    then set `TimeoutStartSec=1800` — which is SHORTER than the pass's own bounds: `provision` alone
+    carries `timeout=1800`, a DEAD runner adds a 180 s restart plus a `wait_online` read, `config.sh`
+    is 600 s and may run TWICE on the already-configured retry. systemd therefore SIGTERMs a healthy
+    pass, and Python runs no `finally` on SIGTERM — so a kill inside `register()`'s
+    clear → configure → restore window left the install with its `.runner` and RSA key DELETED (gone
+    from `discover()`, its slot reading FREE to the provisioner, which adds a second install on top).
+    The bound now clears the worst case; the signal assumption it rested on is pinned by T48."""
+    units = ra.render_unit(repo="daniel-ospina/tortoise")
+    service = next(body for name, body in units.items() if name.endswith(".service"))
+    match = re.search(r"^TimeoutStartSec=(\d+)$", service, re.MULTILINE)
+    check(match is not None, f"the unit must bound its own run: {service}")
+    timeout = int(match.group(1))
+    # The components are read from the code, not restated: a future bump to `provision`'s timeout
+    # that is not reflected here is exactly the drift this case exists to catch.
+    provision_timeout = 1800
+    config_timeout = 600  # `_run(..., timeout=600)` inside `register`, twice on the retry
+    enable_timeout = 180
+    worst_case = provision_timeout + 2 * config_timeout + 2 * enable_timeout + 180
+    check(
+        timeout > worst_case,
+        f"TimeoutStartSec={timeout} must exceed the pass's own worst case ({worst_case}s), or systemd "
+        "kills a legitimate pass and a killed pass never restores the install it cleared",
+    )
+    contains(service, "TimeoutStartSec=5400", "the bound itself")
+
+
+@test("T48 a SIGTERM inside the cleared window RESTORES the install — the stash is signal-safe, not only exception-safe")
+def t48_sigterm_restores_stash():
+    """T47 bounds the timeout, but a bound is not a guarantee: an operator `systemctl stop`, a
+    shutdown, or a kill lands in the same window, and Python's DEFAULT SIGTERM disposition terminates
+    the process WITHOUT running `finally`. `register()` therefore installs a handler that raises
+    `SystemExit`, so the existing `finally` (`_restore_local_config`) actually runs. Measured here as a
+    real signal delivered to a real process — a stubbed `signal.signal` call would prove the line
+    exists, not that the install survives."""
+    with Env():
+        box = Box("sigterm-restore")
+        try:
+            path = box.install("gh-runner-x64", "r-term")
+            before_mode = stat.S_IMODE(os.stat(os.path.join(path, ".credentials_rsaparams")).st_mode)
+            config = os.path.join(path, "config.sh")
+            # The installer signals its own parent (the tool) and then hangs, exactly like a
+            # `config.sh` caught by a manager shutdown mid-registration.
+            box._write(
+                config,
+                "#!/usr/bin/env bash\nkill -TERM " + "$PPID" + "\nsleep 5\n",
+                0o755,
+            )
+            script = (
+                "import importlib.util, pathlib, sys\n"
+                f"spec = importlib.util.spec_from_file_location('ra_under_test', {ra.__file__!r})\n"
+                "ra = importlib.util.module_from_spec(spec)\n"
+                "sys.modules['ra_under_test'] = ra\n"
+                "spec.loader.exec_module(ra)\n"
+                "try:\n"
+                f"    ra.register(pathlib.Path({path!r}), 'r-term', 'daniel-ospina/tortoise', "
+                "'self-hosted-x64', True)\n"
+                "except SystemExit as exc:\n"
+                "    sys.exit(exc.code)\n"
+            )
+            box.apply()
+            proc = subprocess.run(
+                [sys.executable, "-c", script], env=_cli_env(box), capture_output=True, text=True
+            )
+            check(
+                proc.returncode == 128 + 15,
+                f"the handler must convert SIGTERM into an exit code (143), got {proc.returncode}:\n"
+                f"{proc.stdout}\n{proc.stderr}",
+            )
+            check(
+                os.path.exists(os.path.join(path, ".runner")),
+                "a killed pass must not leave the install without its `.runner` — `discover()` would "
+                "stop seeing it and the provisioner would count its slot FREE",
+            )
+            for name in (".credentials", ".credentials_rsaparams"):
+                check(
+                    os.path.exists(os.path.join(path, name)),
+                    f"{name} is part of the stash and must be restored too",
+                )
+            # ⛔ "NOT WIDENED" IS MEASURED AGAINST WHAT IT WAS, not against a literal: the stash holds
+            # `(mode, bytes)`, so the invariant is that a kill restores the mode the install had.
+            mode = stat.S_IMODE(os.stat(os.path.join(path, ".credentials_rsaparams")).st_mode)
+            check(
+                mode == before_mode,
+                f"and restored at its original mode ({oct(before_mode)}), not {oct(mode)}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T49 a failed CONFIRM read keeps the first sample — 'unmeasured' must not erase what was seen")
+def t49_confirm_failure_keeps_first_sample():
+    """Both samples sat inside ONE `try`, so a one-off API blip on the confirmation read returned
+    `{'state': 'unmeasured'}` with EVERY count absent — indistinguishable from "the queue was never
+    readable", and it threw away an observation that had already answered "yes". It also silently
+    dropped `queued_runs`, the field `origin/main` publishes for fleet readers. The state stays
+    `unmeasured` (one blip is not a page), but the record now carries what was seen and names the
+    confirm failure apart from the read that succeeded."""
+    with Env():
+        box = Box("confirm-blip")
+        try:
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            box.pool([("r-1", "online", False, ["self-hosted-x64"])])
+            box.queued(53)
+            box.queue_age(2400)
+            # The FIRST pass-start read is healthy; every read after it fails (the steps repeat).
+            # ⛔ THE THIRD READ: the pass classifies from the pool first, the probe's FIRST sample is
+            # the second read, and the CONFIRMATION is the third — that is the one that must blip.
+            box.pool_seq(["ok", "ok", "err:dial tcp 10.0.0.9:443: i/o timeout (fixture)"])
+            record = converge(box, nproc="2", dry_run=True)
+            check(
+                record.get("starvation") == "unmeasured",
+                f"one sample is not a page: {record.get('starvation')}",
+            )
+            check(
+                record.get("starvation_queued") == 53,
+                f"the first sample's counts must SURVIVE the failed confirmation: {record}",
+            )
+            check(
+                record.get("queued_runs") == 53,
+                f"…including the field a fleet reader consumes: {record.get('queued_runs')}",
+            )
+            contains(
+                record.get("starvation_confirm_error", ""),
+                "i/o timeout",
+                "the confirm failure is named SEPARATELY from the read that succeeded",
+            )
+            check(
+                any("CONFIRMATION read failed" in n for n in record["notes"]),
+                f"…and the pass says it out loud: {record['notes']}",
+            )
+        finally:
+            box.destroy()
+
+
 MUTATIONS = [
-    # ── review round 9: the 2026-10-27 cycle-2 findings ──
+    # ── review round 11: the 2026-10-27 fresh-context findings (one mutation per claim) ──
+    Mutation(
+        "T44",
+        "    if queue_age_s is not None and queue_age_s >= STARVATION_QUEUE_AGE_S:",
+        "    if False:  # MUTATION: the age term is gone — a cell is blind again",
+        "the only eligibility term a CELL can measure is removed, so #2875's own shape (label stripped "
+        "pool-wide by a gate that runs on ANOTHER box, 53 queued, pool idle) reports ok, exit 0 — on "
+        "exactly the boxes --install-unit targets",
+    ),
+    Mutation(
+        "T44",
+        "    if queue_age_s is not None and queue_age_s >= STARVATION_QUEUE_AGE_S:",
+        "    if queue_age_s is not None:  # MUTATION: the bound is not applied",
+        "the age BOUND is dropped, so a queue being served right now (oldest run seconds old) pages "
+        "the alarm on health — the false positive round 9 removed, reintroduced through the term "
+        "that was supposed to be safe",
+    ),
+    Mutation(
+        "T45",
+        "            pool_online = refreshed is not None and refreshed.online\n            serving = alive or pool_busy or pool_online",
+        "            pool_online = refreshed is not None and refreshed.online\n            serving = alive or pool_busy  # MUTATION: online is not a serving state",
+        "a runner the POOL reports online is treated as not serving and --replace'd — its live "
+        "registration deleted — when the restart command failed, the one case where the pool read is "
+        "the only evidence there is",
+    ),
+    Mutation(
+        "T46",
+        "        stat_result, uninspectable = _inspect_path(entry)\n        if uninspectable:",
+        "        stat_result, uninspectable = _inspect_path(entry)\n        if False:  # MUTATION: an uninspectable ENTRY is not reported",
+        "an entry this account cannot inspect is no longer caught, so `entry.is_dir()` re-raises the "
+        "PermissionError/ENAMETOOLONG through the every-pass audit into main()'s backstop — exit 2 "
+        "with no actions field, after a registration may already have been destroyed",
+    ),
+    Mutation(
+        "T47",
+        '            "TimeoutStartSec=5400",',
+        '            "TimeoutStartSec=1800",  # MUTATION: shorter than a legitimate pass',
+        "systemd SIGTERMs a healthy pass inside the pass's own bounded worst case, and a killed pass "
+        "runs no finally — the install is left with its .runner and RSA key deleted",
+    ),
+    Mutation(
+        "T48",
+        "            signal.signal(signal.SIGTERM, _term_as_exit)",
+        "            pass  # MUTATION: the default SIGTERM disposition terminates without unwinding",
+        "SIGTERM terminates the process without running the stash's finally, so an interrupted "
+        "registration destroys the install's .runner and credentials and leaves the slot looking FREE",
+    ),
+    Mutation(
+        "T49",
+        "        if seen:",
+        "        if False:  # MUTATION: the first sample is discarded",
+        "a failed confirmation read erases the sample that already answered yes — the counts and "
+        "queued_runs vanish, so 'unmeasured after seeing 53 queued' is indistinguishable from 'never read'",
+    ),
     Mutation(
         "T29",
         "    if not gate_scheduler_present():",
@@ -3272,17 +3672,20 @@ MUTATIONS = [
     ),
     Mutation(
         "T32",
-        "            serving = _worker_alive(runner, fresh=True) or (",
-        "            serving = _worker_alive(runner) or (  # MUTATION: the cached value",
+        "            alive = _worker_alive(runner, fresh=True)",
+        "            alive = _worker_alive(runner)  # MUTATION: the cached value",
         "the busy re-check reads the value cached at CLASSIFICATION, so a runner that came up and "
         "took a job during the restart wait has its registration deleted under the running job",
     ),
     Mutation(
         "T9b",
-        "            queued, busy, online, eligible, why = sample()\n"
-        "            starved = starvation_invariant(queued, busy, online) and eligible",
-        "            queued, busy, online, eligible, why = sample()\n"
-        "            pass  # MUTATION: the second sample is thrown away",
+        "            pool, queued = sample()\n"
+        "            busy = sum(1 for e in pool.values() if e.busy)\n"
+        "            online = sum(1 for e in pool.values() if e.online)\n"
+        "            eligible, why, age = decide(pool, queued, busy, online)\n"
+        "            seen = {",
+        "            pass  # MUTATION: the second sample is thrown away\n"
+        "            seen = {",
         "the confirmation sample is taken and discarded, so an ordinary handover blip alarms — the "
         "one case in this suite that had no paired mutation at all (review finding P3)",
     ),
@@ -3399,8 +3802,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T22",
-        '            try:\n                files.extend(sorted(entry.iterdir()))\n            except OSError as exc:',
-        '            try:\n                files.extend(sorted(entry.iterdir()))\n            except ZeroDivisionError as exc:',
+        '            try:\n                nested = sorted(entry.iterdir())\n            except OSError as exc:',
+        '            try:\n                nested = sorted(entry.iterdir())\n            except ZeroDivisionError as exc:',
         "an unreadable drop-in dir raises out of the audit instead of being reported",
     ),
     Mutation(
@@ -3443,7 +3846,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T20",
-        '        if entry.is_dir() and name.endswith(".d"):',
+        '        if stat_result is not None and stat.S_ISDIR(stat_result.st_mode) and name.endswith(".d"):',
         "        if False:",
         "a DROP-IN overriding a clean main unit is invisible: the incident shape reports CLEAN",
     ),
@@ -3551,8 +3954,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T6",
-        '    finally:\n        if not registered:\n            _restore_local_config(directory, stash)',
-        '    finally:\n        if not registered and "rc" in locals() and rc != 0:\n            _restore_local_config(directory, stash)',
+        "    finally:\n        if previous_sigterm is not None:\n            signal.signal(signal.SIGTERM, previous_sigterm)\n        if not registered:\n            _restore_local_config(directory, stash)",
+        "    finally:\n        if previous_sigterm is not None:\n            signal.signal(signal.SIGTERM, previous_sigterm)\n        if not registered and \"rc\" in locals() and rc != 0:\n            _restore_local_config(directory, stash)",
         "the restore is gated on the rc check, so a RAISE between the clear and the rc drops the stash",
     ),
     Mutation(
@@ -3587,8 +3990,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T11",
-        '    except Unmeasurable as exc:\n        return {"state": "unmeasured", "detail": str(exc)}',
-        '    except Unmeasurable as exc:\n        return {"state": "ok"}',
+        '    except Unmeasurable as exc:\n        out: dict[str, object] = {"state": "unmeasured", "detail": str(exc)}',
+        '    except Unmeasurable as exc:\n        out: dict[str, object] = {"state": "ok"}  # MUTATION',
         "an unread queue reads as OK — blindness presented as health (the one silencing input)",
     ),
     Mutation(

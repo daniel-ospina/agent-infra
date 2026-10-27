@@ -181,7 +181,9 @@ EXIT  0 converged / nothing to do, or a CAPACITY ANSWER that is not a failure (`
       3 an ACTION failed (restart / registration / missing provisioner) — the record says which
       4 STARVATION — `queued>0 ∧ busy==0 ∧ online>0` confirmed AND the queue can reach this pool
         (`starvation_eligible`: the pool advertises the fallback label, OR the gate wants `local`,
-        OR the queue is at/above the gate's own backlog threshold). The second half is not
+        OR the queue is at/above the gate's own backlog threshold, OR the oldest waiting run is older
+        than `STARVATION_QUEUE_AGE_S` — the last one is the only term a cell can measure, where the
+        gate's record does not exist). The second half is not
         decoration: those same counts are the NORMAL state of the fallback-only ruling, and paging
         on health is how the alarm that exists for #2875 gets ignored. Nothing was changed by the
         alarm: it names the invariant, the three counts and `starvation_why`. This is the one exit a
@@ -228,6 +230,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import time
@@ -252,6 +255,25 @@ STARVATION_CONFIRM_MAX_S = 300.0
 # true of a perfectly healthy fallback-only pool, and a deep queue with an idle pool is a mismatch
 # worth paging on whatever the pool advertises (review finding P1).
 GATE_QUEUE_THRESHOLD = 60
+
+# ⛔ AND THE ONE DATUM A CELL *CAN* MEASURE WHEN THE GATE'S INTENT IS UNKNOWABLE: THE AGE OF THE
+# OLDEST WAITING RUN (review finding P1, round 11). The eligibility terms above need something only a
+# gate-managed box has (the record) or a number the incident happened to sit under (53 < 60). On a
+# cell — the platform `--install-unit` targets — `gate_desired_mode()` is `None` BY CONSTRUCTION
+# (`gate_scheduler_present`: the gate is a launchd job, and "nothing schedules the gate on a cell"),
+# so term 2 is dead there and the #2875 shape (label STRIPPED pool-wide by the gate on another box,
+# 53 queued, pool idle) read `ok`, exit 0: the tool was written for an outage it could not see from
+# the boxes it is installed on.
+#
+# ⛔ WHY AGE AND NOT "THE QUEUE IS NOT DRAINING". That was the first candidate and it is WRONG here:
+# `queued=14` sustained across the confirmation window is the measured, HEALTHY steady state of the
+# fallback-only ruling (round 9's own P1) — it would re-arm the exact false alarm that fix removed.
+# Age separates them: a healthy GitHub-hosted scheduler serves in seconds-to-minutes, so a queue whose
+# OLDEST waiting run is half an hour old is not being served by anybody, and with the pool online and
+# idle that is starvation whatever the gate's mode says. Not a second copy of a gate number: the gate
+# has no age threshold, so this is this tool's own measurement, and it only ever ADDS an alarm where
+# nothing previously watched (it cannot disarm `pool_serves_fallback` or the threshold term).
+STARVATION_QUEUE_AGE_S = 1800
 
 # ── the sizing predicate (owner ruling, agent-infra#2344 comment 6347825624) ────────────────────
 MEM_PER_RUNNER_MB = 1500
@@ -726,6 +748,59 @@ def read_queued_runs(repo: str) -> int:
         raise Unmeasurable(f"queue depth is not a number ({raw[:80]!r})") from exc
 
 
+def read_oldest_queued_age_s(repo: str) -> float | None:
+    """How long the OLDEST queued run has been waiting, in seconds; `None` when nothing is queued.
+
+    ⛔ THIS IS THE ONE STARVATION INPUT A CELL CAN MEASURE WITHOUT THE GATE'S INTENT (review finding
+    P1, round 11 — see `STARVATION_QUEUE_AGE_S`). It answers a different question from the depth: a
+    depth says work is waiting, an AGE says whether anybody is serving it.
+
+    ⛔ FAIL-CLOSED IN THE SAME DIRECTION AS EVERY OTHER MEASUREMENT: an unreadable answer RAISES, and
+    an EMPTY queue is the only thing that returns `None`. A failed read must never manufacture "nothing
+    is waiting" — that is the value that silences the alarm — and it must not manufacture an age
+    either, because a fabricated 0 would disarm the term it feeds. `gh` sorts ASCENDING by creation so
+    the first row IS the oldest; the default sort (`created desc`) would report the NEWEST and make a
+    starved queue look young, which is the one direction this bound cannot afford.
+    """
+    gh = gh_bin()
+    if not gh:
+        raise Unmeasurable("gh is not on PATH (set RUNNER_AUTOSCALE_GH)")
+    cmd = [
+        gh,
+        "api",
+        f"repos/{repo}/actions/runs?status=queued&sort=created&direction=asc&per_page=1",
+        "--jq",
+        '.workflow_runs[0].created_at // ""',
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise Unmeasurable(f"queue age read failed to run ({exc})") from exc
+    if proc.returncode != 0:
+        raise Unmeasurable(
+            f"repos/{repo}/actions/runs?status=queued&sort=created exited {proc.returncode}: "
+            f"{(proc.stderr or '').strip()[:300]}"
+        )
+    raw = (proc.stdout or "").strip().strip('"')
+    if not raw:
+        return None
+    try:
+        created = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise Unmeasurable(f"the queue's oldest run has an unreadable created_at ({raw[:80]!r})") from exc
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds()
+    # ⛔ A NEGATIVE AGE IS A CLOCK SKEW, NOT A YOUNG QUEUE. Left alone it would silently satisfy the
+    # bound's opposite and read as "fresh", so it is reported as unmeasurable with the value named.
+    if age < 0:
+        raise Unmeasurable(
+            f"the queue's oldest run is dated {int(-age)}s in the FUTURE ({raw}) — a clock skew, "
+            "not a measurement"
+        )
+    return age
+
+
 def starvation_invariant(queued: int, busy: int, online: int) -> bool:
     """`queued > 0 ∧ busy == 0 ∧ online > 0` — WORK IS WAITING, CAPACITY IS UP AND IDLE.
 
@@ -748,7 +823,10 @@ def starvation_invariant(queued: int, busy: int, online: int) -> bool:
 
 
 def starvation_eligible(
-    pool: dict[str, PoolEntry], queued: int, gate_mode: str | None
+    pool: dict[str, PoolEntry],
+    queued: int,
+    gate_mode: str | None,
+    queue_age_s: float | None = None,
 ) -> tuple[bool, str]:
     """`(eligible, why)` — can the work in this queue REACH this pool at all? (the alarm's second half)
 
@@ -766,7 +844,10 @@ def starvation_eligible(
         the label had been stripped while the gate was asking for the fallback); or
       * the queue is at/above the GATE'S OWN threshold (`GATE_QUEUE_THRESHOLD`, the same 60 the gate
         uses to call a GitHub-hosted backlog unhealthy) — a deep queue with an idle pool is worth a
-        page whatever the labels say, and the pool read is the only other evidence available.
+        page whatever the labels say, and the pool read is the only other evidence available; or
+      * the queue's OLDEST waiting run is older than `STARVATION_QUEUE_AGE_S` — the one term a CELL
+        can measure when the gate's intent is unknowable there (see the constant). It does not
+        replace "the queue is not draining" (which is the healthy steady state): it is AGE.
 
     Everything else is `ok` WITH the counts published, so an operator who expects an alarm can read
     why it did not fire from the record instead of guessing (the same rule as the label floor).
@@ -780,24 +861,36 @@ def starvation_eligible(
             True,
             f"queued={queued} is at/above the gate's own backlog threshold ({GATE_QUEUE_THRESHOLD})",
         )
+    if queue_age_s is not None and queue_age_s >= STARVATION_QUEUE_AGE_S:
+        return (
+            True,
+            f"the OLDEST queued run has waited {int(queue_age_s)}s, at/above the "
+            f"{STARVATION_QUEUE_AGE_S}s bound — a healthy GitHub-hosted scheduler does not hold work "
+            "that long, and this pool is online and idle, so nobody is serving this queue",
+        )
     if gate_mode is None:
         # ⛔ "UNKNOWN" IS NOT "GITHUB" (review finding P1). `gate_desired_mode()` returns `None` in
         # four states (no record, nothing scheduling the gate, an unreadable record, a record holding
         # something that is not a mode), and saying "the gate does not want `local`" of all four
         # asserts a decision nobody made. The verdict is still `ok` — and the residual is stated: on
-        # such a box NOTHING strips the label (this tool preserves it, and no gate runs), so the
-        # stripped shape this alarm exists for cannot arise there; where it CAN arise, the gate is
-        # present and answers. Below the gate's backlog threshold, the queue is GitHub-hosted's.
+        # such a box NOTHING here strips the label (this tool preserves it) — but ⛔ THAT IS NOT THE
+        # CLAIM THE OLD TEXT MADE (review finding P1, round 11). The label is a POOL property and the
+        # gate that strips it runs on ANOTHER box (the hub), so "nothing HERE strips it" does not rule
+        # the stripped shape out on a cell; only the AGE term can, and that is why the sentence now
+        # states what was MEASURED instead of a conclusion this box cannot reach.
         return False, (
             f"the gate's mode could not be determined on this box (see `gate_why`), no runner "
-            f"advertises {FALLBACK_LABEL}, and queued={queued} is below the gate's backlog threshold "
-            f"({GATE_QUEUE_THRESHOLD}) — nothing here can strip the label, so the queue is "
-            "GitHub-hosted's work, not this pool's"
+            f"advertises {FALLBACK_LABEL}, queued={queued} is below the gate's backlog threshold "
+            f"({GATE_QUEUE_THRESHOLD}), and the oldest waiting run is younger than "
+            f"{STARVATION_QUEUE_AGE_S}s (or the queue is empty) — so the waiting work has not been "
+            "waiting long enough to show it cannot reach a runner, and it is treated as "
+            "GitHub-hosted's until it does"
         )
     return False, (
         f"queued={queued} is below the gate's backlog threshold ({GATE_QUEUE_THRESHOLD}), the gate "
-        f"says `{gate_mode}` (so it does not want `local`), and no runner advertises "
-        f"{FALLBACK_LABEL} — this queue is GitHub-hosted's work, not this pool's "
+        f"says `{gate_mode}` (so it does not want `local`), no runner advertises "
+        f"{FALLBACK_LABEL}, and the oldest waiting run is younger than {STARVATION_QUEUE_AGE_S}s — "
+        "this queue is GitHub-hosted's work, not this pool's "
         "(fallback-only, ci_runner_gate.sh:11-13)"
     )
 
@@ -818,36 +911,83 @@ def starvation_probe(
     ⛔ THE INVARIANT IS NECESSARY AND NOT SUFFICIENT: `eligible` (see `starvation_eligible`) turns
     the SAME counts into `ok` when the queue is GitHub-hosted's work, and `why` says so — the counts
     are still published, because an explanation is not a measurement and the evidence must survive.
+    ⛔ A FAILED CONFIRM READ DOES NOT DISCARD THE FIRST SAMPLE (review finding P3, round 11). Both
+    samples used to sit inside ONE `try`, so a one-off API blip on the second read returned
+    `{"state": "unmeasured"}` with EVERY count absent — indistinguishable from "the queue was never
+    readable", and it threw away an observation that had already answered "yes". The state stays
+    `unmeasured` (a blip is not a page), but the record now carries what the first sample SAW and
+    names the confirm failure separately.
     """
 
-    def sample() -> tuple[int, int, int, bool, str]:
-        pool = read_pool_retrying(repo)
-        queued = read_queued_runs(repo)
-        eligible, why = starvation_eligible(pool, queued, gate_mode)
-        return (
-            queued,
-            sum(1 for e in pool.values() if e.busy),
-            sum(1 for e in pool.values() if e.online),
-            eligible,
-            why,
-        )
+    def sample() -> tuple[dict[str, PoolEntry], int]:
+        return read_pool_retrying(repo), read_queued_runs(repo)
 
+    def decide(
+        pool: dict[str, PoolEntry], queued: int, busy: int, online: int
+    ) -> tuple[bool, str, float | None]:
+        """`(eligible, why, queue_age_s)` — the AGE read is taken only where it can change the answer.
+
+        ⛔ ONE EXTRA API CALL, ON THE AMBIGUOUS SHAPE ONLY. A healthy box (a busy pool, or an empty
+        queue) never reaches it: the invariant is false, so nothing could make it eligible. It is
+        asked exactly when the counts say "work is waiting and capacity is idle" and the cheaper
+        terms could not decide — which is the state the round-11 finding was about.
+        """
+        eligible, why = starvation_eligible(pool, queued, gate_mode)
+        age: float | None = None
+        if starvation_invariant(queued, busy, online) and not eligible:
+            age = read_oldest_queued_age_s(repo)
+            eligible, why = starvation_eligible(pool, queued, gate_mode, queue_age_s=age)
+        return eligible, why, age
+
+    seen: dict[str, object] = {}
     try:
-        queued, busy, online, eligible, why = sample()
+        pool, queued = sample()
+        busy = sum(1 for e in pool.values() if e.busy)
+        online = sum(1 for e in pool.values() if e.online)
+        eligible, why, age = decide(pool, queued, busy, online)
+        seen = {
+            "queued": queued,
+            "busy": busy,
+            "online": online,
+            "eligible": eligible,
+            "why": why,
+            # ⛔ THE SAME KEY THE HEALTHY PATH PUBLISHES (`queue_age_s`), so the confirm-failure
+            # record carries the age under the name a reader already knows. A second spelling here
+            # would publish the evidence on one path and drop it on the other.
+            "queue_age_s": age,
+        }
         starved = starvation_invariant(queued, busy, online) and eligible
         if starved and confirm_s > 0:
             time.sleep(confirm_s)
-            queued, busy, online, eligible, why = sample()
+            pool, queued = sample()
+            busy = sum(1 for e in pool.values() if e.busy)
+            online = sum(1 for e in pool.values() if e.online)
+            eligible, why, age = decide(pool, queued, busy, online)
+            seen = {
+                "queued": queued,
+                "busy": busy,
+                "online": online,
+                "eligible": eligible,
+                "why": why,
+                "queue_age_s": age,
+            }
             starved = starvation_invariant(queued, busy, online) and eligible
     except Unmeasurable as exc:
-        return {"state": "unmeasured", "detail": str(exc)}
+        out: dict[str, object] = {"state": "unmeasured", "detail": str(exc)}
+        if seen:
+            # ⛔ THE EVIDENCE OUTLIVES THE FAILED CONFIRMATION — and the `seen` dict is only populated
+            # by a COMPLETE sample, so "partially read" never masquerades as an observation.
+            out.update(seen)
+            out["confirm_error"] = str(exc)
+        return out
     return {
         "state": "starved" if starved else "ok",
-        "queued": queued,
-        "busy": busy,
-        "online": online,
-        "eligible": eligible,
-        "why": why,
+        "queued": seen["queued"],
+        "busy": seen["busy"],
+        "online": seen["online"],
+        "eligible": seen["eligible"],
+        "why": seen["why"],
+        "queue_age_s": seen["queue_age_s"],
         "invariant": "queued>0 AND busy==0 AND online>0",
     }
 
@@ -1401,6 +1541,22 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
     if not cfg.exists():
         raise ActionFailed(f"{cfg} does not exist — {directory} is not a runner install")
     stash = _clear_local_config(directory) if replace else {}
+    # ⛔ A SIGNAL DURING THE CLEARED WINDOW MUST RUN THE `finally` BELOW (review finding P2, round
+    # 11). The stash is exception-safe, but Python runs NO `finally` on SIGTERM by default — the
+    # handler is the OS default and the process dies where it stood. That mattered in practice because
+    # systemd's `TimeoutStartSec` can fire DURING a legitimate pass (see `render_unit`) and SIGTERM the
+    # whole cgroup: an install would be left with `.runner`, `.credentials` and the RSA key deleted —
+    # gone from `discover()`, its slot reading FREE to the provisioner. Raising `SystemExit` from the
+    # handler converts the kill into an ordinary unwind, which is what the existing `finally` needs.
+    # The previous disposition is restored in the same `finally`; a non-main thread (the suite's own
+    # in-process drivers) cannot install a handler, and the stash is still exception-safe there.
+    previous_sigterm = None
+    if stash:
+        try:
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, _term_as_exit)
+        except (ValueError, OSError):  # not the main thread / unsupported — see the note above
+            previous_sigterm = None
     # ⛔ THE CLEARED REGION IS EXCEPTION-SAFE (fix 2, round 2). `registration_token()` is evaluated
     # INSIDE this block, and it raises `ActionFailed` on any gh failure — a routine transient for a
     # tool that runs every few minutes. Restoring only on `rc != 0` left that raise to drop the stash,
@@ -1434,6 +1590,8 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
             raise ActionFailed(f"config.sh for {name} rc={rc}: {out[-400:]}")
         registered = True
     finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         if not registered:
             _restore_local_config(directory, stash)
     # ⛔ A REGISTERED RUNNER WITH NO ENABLED UNIT IS NOT LIVE. Configuring the unit used to be
@@ -1448,6 +1606,18 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
             + "; ".join(failures)
         )
     return f"registered {name} labels={labels}"
+
+
+def _term_as_exit(signum, frame) -> None:
+    """SIGTERM → `SystemExit`, so an interrupted pass still unwinds its `finally` blocks.
+
+    ⛔ WHY A HANDLER AND NOT A `try/except`: SIGTERM's default disposition TERMINATES the process
+    without running `finally`, which is exactly the case `register()`'s stash cannot survive. Raising
+    `SystemExit` turns the signal into an ordinary unwind (exit code 128+n, as a shell reports a
+    signalled child), and the only reason this is installed for the cleared window alone is that a
+    broader handler would change how every OTHER interruption of the pass reports itself.
+    """
+    raise SystemExit(128 + signum)
 
 
 def enable_unit(directory: Path, name: str, repo: str) -> list[str]:
@@ -1914,7 +2084,18 @@ def render_unit(
             "# A pass can legitimately run for many minutes (waits, reads, a provision), and systemd",
             "# will not start a SECOND instance of an active oneshot service — that is the mutual",
             "# exclusion this CLI keeps no lock for, so two passes can never repair one runner at once.",
-            "TimeoutStartSec=1800",
+            # ⛔ THE TIMEOUT MUST NOT BE SHORTER THAN A LEGITIMATE PASS (review finding P2, round 11).
+            # 1800 s was picked to bound a wedged pass, but the pass's OWN bounds sum past it: the
+            # provisioner alone carries `timeout=1800`, a DEAD runner adds up to 180 s of restart plus
+            # a `wait_online` read (3 x 120 s), `config.sh` is 600 s and may run TWICE on the
+            # already-configured retry, and each `svc.sh`/`enable` is 180 s. So systemd could SIGTERM a
+            # healthy pass — and SIGTERM runs no `finally`, so a kill inside `register()`'s
+            # clear → configure → restore window left the install with its `.runner` and RSA key
+            # DELETED: invisible to `discover()`, and its slot reading FREE to the provisioner, which
+            # then adds a second install over the top. 5400 s (90 min) is above that sum and still
+            # bounds a wedge; the timer's 9 min cadence is unchanged, and a second instance still
+            # cannot start while this one is active.
+            "TimeoutStartSec=5400",
         ]
     )
     timer = "\n".join(
@@ -2095,11 +2276,32 @@ def _unit_files(directory: Path, problems: list[str]) -> list[Path]:
     files: list[Path] = []
     for entry in entries:
         name = entry.name
-        if entry.is_dir() and name.endswith(".d"):
+        # ⛔ EVERY ENTRY IS INSPECTED THROUGH `_inspect_path`, NOT ONLY THE DIRECTORY ITSELF (review
+        # finding P2, round 11). `iterdir()` above got the error path; the PER-ENTRY probe did not, and
+        # `Path.is_dir()` re-raises everything outside `pathlib`'s absence errnos — so a symlink into a
+        # tree this account cannot traverse escaped `--check-units` AND the every-pass audit as a
+        # PermissionError. On the pass path that is main()'s backstop: exit 2 with no `actions` field,
+        # i.e. the record of a registration this pass already destroyed is the part that gets lost.
+        stat_result, uninspectable = _inspect_path(entry)
+        if uninspectable:
+            # ⛔ FAIL CLOSED, AND KEEP IT IN THE POPULATION: a unit file we cannot stat is still a unit
+            # someone installed, so it is REPORTED as unaudited and still handed to the audit (which
+            # will say it could not be read) rather than dropped as if it were not there.
+            problems.append(f"{entry}: {uninspectable} — NOTHING was audited there")
+            if name.rsplit(".", 1)[-1] in UNIT_FILE_SUFFIXES:
+                files.append(entry)
+            continue
+        if stat_result is not None and stat.S_ISDIR(stat_result.st_mode) and name.endswith(".d"):
             try:
-                files.extend(sorted(entry.iterdir()))
+                nested = sorted(entry.iterdir())
             except OSError as exc:
                 problems.append(f"{entry}: unreadable ({exc}) — NOTHING was audited there")
+                continue
+            for child in nested:
+                child_stat, child_uninspectable = _inspect_path(child)
+                if child_uninspectable:
+                    problems.append(f"{child}: {child_uninspectable} — NOTHING was audited there")
+                files.append(child)
         elif name.rsplit(".", 1)[-1] in UNIT_FILE_SUFFIXES:
             files.append(entry)
     return files
@@ -2559,6 +2761,11 @@ def converge(
             # `register(..., repo)` would move it here (`--replace` deletes the other repo's
             # registration). It still counts in `live` above — it occupies the box.
             continue
+        # ⛔ THE RESTART COMMAND'S OUTCOME IS ITS OWN FACT, AND IT OUTLIVES THE DEAD-ONLY BRANCH
+        # (review finding P1, round 11). Only a DEAD runner is restarted, but the ACTION LINE far
+        # below has to say what the pool measured — and `None` here means "no restart was attempted",
+        # which is a different claim from "the restart command failed".
+        restart_ok: bool | None = None
         # ⛔ IDENTITY IS THE INSTALL, NOT THE NAME (review finding P2). Two installs can carry the
         # same `agentName` after a `cp -a` (the `.runner` file records ad-hoc installs of exactly
         # that shape), and `next(... name == ...)` then repaired the FIRST one on both iterations —
@@ -2573,6 +2780,7 @@ def converge(
             continue
         if c["state"] == "DEAD":
             ok, detail = restart_runner(runner)
+            restart_ok = ok
             record["actions"].append(f"restart {c['name']}: {detail}")
             # ⛔ "we could not look" is NOT "it is still offline". An unreadable pool after a
             # restart proves nothing about the runner, and acting on it re-registers (with
@@ -2580,8 +2788,20 @@ def converge(
             # destructive action this file promises never to take blindly. Stop the PASS: the box
             # state is unknown from here, so no fill decision may be taken on a stale count.
             state, why = (
-                wait_online(repo, c["name"], wait_s, poll) if ok else ("offline", "")
+                wait_online(repo, c["name"], wait_s, poll) if ok else ("unasked", "")
             )
+            if not ok:
+                # ⛔ A FAILED RESTART COMMAND IS NOT EVIDENCE THE RUNNER IS OFFLINE (review finding
+                # P1, round 11). `sudo -n systemctl restart` fails transiently on exactly the loaded
+                # boxes this runs on (bus/dbus unavailable, manager busy), and the old code turned
+                # that into `("offline", "")` — never asking the pool at all — then re-registered a
+                # runner the pool could still be serving, and printed "still offline after restart"
+                # about a question it never asked. The pool is asked below; this branch only records
+                # that the command failed, so the pass's words match what it measured.
+                record["notes"].append(
+                    f"{c['name']}: the restart COMMAND failed ({detail}) — that is not a measurement "
+                    "of the runner, so the pool is asked before anything destructive"
+                )
             if state == "online":
                 record["actions"].append(f"{c['name']} came back online after restart")
                 continue
@@ -2614,9 +2834,15 @@ def converge(
         # again, now, seconds before the destructive step.
         try:
             refreshed = read_pool_retrying(repo).get(c["name"])
-            serving = _worker_alive(runner, fresh=True) or (
-                refreshed is not None and refreshed.busy
-            )
+            alive = _worker_alive(runner, fresh=True)
+            pool_busy = refreshed is not None and refreshed.busy
+            # ⛔ ONLINE IS A SERVING STATE TOO (review finding P1, round 11). The guard used to ask
+            # only `busy`, so a runner the POOL reports ONLINE — which is what the hub-side view says
+            # about a runner that reconnected, and the ONLY pool-side fact available when the restart
+            # command itself failed — was treated as "not serving" and `--replace`d. The destructive
+            # step deletes a live registration; `online` is exactly what must stop it.
+            pool_online = refreshed is not None and refreshed.online
+            serving = alive or pool_busy or pool_online
         except Unmeasurable as exc:
             record["problems"].append(
                 f"{c['name']}: NOT re-registering — {exc} — a busy state this pass could not read "
@@ -2625,17 +2851,35 @@ def converge(
             stop_pass = True
             break
         if serving:
+            # ⛔ THE REASON IS THE FINDING (a `busy` and an `online` runner are different evidence, and
+            # an operator reading why nothing was re-registered must not be told a job arrived when
+            # what arrived was the runner itself).
+            if alive:
+                evidence = "came up with a JOB during the restart wait"
+            elif pool_busy:
+                evidence = "the pool reports it BUSY after the restart wait"
+            else:
+                evidence = "the pool reports it ONLINE after the restart wait"
             record["notes"].append(
-                f"{c['name']}: came up with a JOB during the restart wait — NOT re-registering "
-                "(a busy runner is never restarted or re-registered); it is re-judged next pass"
+                f"{c['name']}: {evidence} — NOT re-registering "
+                "(a busy or online runner is never re-registered); it is re-judged next pass"
             )
             continue
         # ⛔ THE ACTION LINE GOES AFTER THE CHECKS (review finding P3). It used to be appended before
         # them, so both new exits left `actions` claiming "re-registering with --replace" while
         # `notes` said the opposite — and `actions` is the line a human reads to learn whether a
         # registration was destroyed.
+        # ⛔ AND IT NO LONGER CLAIMS A MEASUREMENT IT DOES NOT HAVE (review finding P1, round 11): when
+        # the restart command FAILED, "still offline after restart" asserts an outcome of a restart
+        # that may never have happened. The pool read is what says offline here, so that is what the
+        # line names.
         record["actions"].append(
-            f"{c['name']} still offline after restart — re-registering with --replace"
+            (
+                f"{c['name']} still offline after restart — re-registering with --replace"
+                if restart_ok
+                else f"{c['name']} the pool reports OFFLINE although the restart command failed — "
+                "re-registering with --replace"
+            )
         )
         try:
             # ⛔ ONE DECISION POINT, TWO INDEPENDENT STEPS. `resolve_labels` keeps the labels the
@@ -2936,6 +3180,17 @@ def converge(
             record["starvation_queued"] = starvation["queued"]
             record["starvation_busy"] = starvation["busy"]
             record["starvation_online"] = starvation["online"]
+            # ⛔ THE AGE IS PART OF THE EVIDENCE, NOT A DEBUG DETAIL (review finding P1, round 11):
+            # it is the datum that decides an alarm the gate's absent record cannot, so an operator
+            # reading why a queue did or did not page needs the number the bound was applied to.
+            if "queue_age_s" in starvation:
+                record["starvation_queue_age_s"] = (
+                    None
+                    if starvation["queue_age_s"] is None
+                    else int(starvation["queue_age_s"])
+                )
+            if "confirm_error" in starvation:
+                record["starvation_confirm_error"] = starvation["confirm_error"]
         if starvation.get("state") == "starved":
             record["notes"].append(
                 f"STARVATION {starvation['invariant']}: queued={starvation['queued']} "
@@ -2965,6 +3220,17 @@ def converge(
                 "starvation invariant NOT evaluated: "
                 f"{starvation.get('detail')} — an unread queue is not an empty one"
             )
+            # ⛔ AND THE FIRST SAMPLE'S OBSERVATION SURVIVES THE FAILED CONFIRMATION (review finding
+            # P3, round 11). `queued_runs`/`starvation_*` were published above from that sample; this
+            # line says the queue WAS seen and the confirmation is what failed, so "unmeasured" here
+            # cannot be read as "there was nothing to see".
+            if "confirm_error" in starvation:
+                record["notes"].append(
+                    f"the starvation CONFIRMATION read failed ({starvation['confirm_error']}) after a "
+                    f"first sample of queued={starvation['queued']} busy={starvation['busy']} "
+                    f"online={starvation['online']} — the observation is kept, the alarm is not "
+                    "raised on one sample"
+                )
 
     if record["problems"]:
         record["verdict"] = "action-failed"
