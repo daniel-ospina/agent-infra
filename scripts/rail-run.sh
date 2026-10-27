@@ -239,6 +239,24 @@ resolve_slug() {
   printf '%s' "$u"
 }
 
+# normalize_slug <value> -> "owner/repo", or nothing when the value cannot name a repo.
+# `admin-merge.sh` accepts `[HOST/]OWNER/REPO`, so a caller may hand us `github.com/o/r`; the artifact
+# verifier compares a literal `/owner/repo/pull/N` path, which that spelling can never satisfy — an
+# un-normalised identity made such a run answer `unknown` FOREVER. The last two components are the
+# repository (the same reduction resolve_slug applies to a remote URL), and an empty or dotted
+# component is refused rather than joined into a path.
+normalize_slug() {
+  local v="${1:-}"
+  [ -n "$v" ] || return 0
+  v="${v#*://}"
+  v="${v%.git}"
+  case "$v" in */*/*) v="$(printf '%s' "$v" | awk -F/ '{print $(NF-1) "/" $NF}')" ;; esac
+  case "$v" in */*) : ;; *) return 0 ;; esac
+  case "${v%%/*}" in ''|.|..) return 0 ;; esac
+  case "${v#*/}" in ''|.|..|*/*) return 0 ;; esac
+  printf '%s' "$v"
+}
+
 # pr_url_names <url> <slug> <pr> -> 0 when the URL names EXACTLY this PR in EXACTLY this repo. This is
 # the identity proof a bare `gh pr view <N>` cannot carry: without it, `landed` is a claim about a
 # number rather than about this head, and it is terminal news that stops a lane driving its PR.
@@ -306,6 +324,10 @@ prev_in_flight() {
   p="$(file_or_empty "$d/pid")"; ps="$(file_or_empty "$d/start")"
   if [ -n "$p" ]; then
     pid_probe "$p" "${ps:-0}" >/dev/null 2>&1; prc=$?
+    # A POSITIVELY LIVE RECORDER BLOCKS. Omitting this outcome let a run that `status` reports as
+    # `running` be started a SECOND time: the recorder is the incarnation that exists for the first
+    # instants of every launch, so this is the common window, not an edge case.
+    if [ "$prc" = "0" ]; then return 0; fi
     # ⛔ AN ABSTENTION IS BOUNDED HERE, unlike in `derive`. `derive` reports a verdict about a head and
     # must keep saying `unknown`; this function only decides whether a start may proceed, and an
     # UNBOUNDED abstention blocked the PR forever (a record whose `start` epoch could not be read
@@ -330,12 +352,22 @@ prev_in_flight() {
 start_rail() {
   local pr="${1:-}"; shift || true
   check_pr "$pr"
-  local slug="" want=0 a
+  # ⛔ `--repo=X` IS REWRITTEN TO `--repo X` BEFORE IT REACHES THE RAIL. `admin-merge.sh` only
+  # recognises the two-token form: given `--repo=X` it passes the token through to `gh pr merge` and
+  # resolves its TARGET from the checkout — so the run would merge the checkout's PR while this record
+  # claims another repo, and `landed` would certify a head this run never touched. Verified against
+  # the rail: `--repo acme/widgets` resolves to acme/widgets, `--repo=acme/widgets` to the checkout.
+  # Scanning also stops at `--`, so a `--repo` meant FOR the rail is not captured as the identity.
+  local slug="" want=0 a seen_dd=0
+  local -a fwd=()
   for a in "$@"; do
-    if [ "$want" = "1" ]; then slug="$a"; want=0; continue; fi
+    if [ "$seen_dd" = "1" ]; then fwd+=("$a"); continue; fi
+    if [ "$want" = "1" ]; then slug="$a"; fwd+=("$a"); want=0; continue; fi
     case "$a" in
-      --repo) want=1 ;;
-      --repo=*) slug="${a#--repo=}" ;;
+      --repo) want=1; fwd+=("$a") ;;
+      --repo=*) slug="${a#--repo=}"; fwd+=(--repo "$slug") ;;
+      --) seen_dd=1; fwd+=("$a") ;;
+      *) fwd+=("$a") ;;
     esac
   done
   [ "$want" = "0" ] || die "--repo needs a value (owner/repo)"
@@ -344,6 +376,11 @@ start_rail() {
   # `origin`. If neither yields one the run still starts (it can still merge) but its artifact reads
   # abstain, and `status` says which flag supplies it.
   if [ -z "$slug" ]; then slug="$(resolve_slug)"; fi
+  slug="$(normalize_slug "$slug")"
+  # ⛔ AN IDENTITY IS REQUIRED TO START. Without one no artifact read can ever be verified, so the run
+  # could only ever report `unknown` — and its abstention could name no remedy that works (a `--repo`
+  # supplied later moves the state key). Refusing here is the honest answer, and it is reversible.
+  [ -n "$slug" ] || die "cannot tell which repository this PR belongs to: pass --repo owner/repo (no resolvable 'origin' here)"
 
   local key dir
   key="$(repo_key "$slug")"
@@ -427,13 +464,14 @@ start_rail() {
   printf '%s\n' "$(date -u +%FT%TZ)" > "$rd/started"
   printf '%s\n' "$slug" > "$rd/repo"
   printf '%s\n' "$RAIL" > "$rd/rail"
+  set -- ${fwd[@]+"${fwd[@]}"}   # the rewritten argv is the one the rail receives AND the one recorded
   { for a in "$@"; do printf '%q ' "$a"; done; printf '\n'; } > "$rd/args" 2>/dev/null
   : > "$rd/log"
   # ⛔ PUBLISHED BEFORE THE SPAWN. `latest` is what `status` follows, so publishing it only after the
   # pid lands made every poll during the launch window answer `no-run` — including the poll command
   # this very verb prints, and including the poll a refused duplicate start points at. A launch in
   # progress now reads `unknown` ("no incarnation recorded", which is what it is), never `no-run`.
-  printf '%s\n' "$rid" > "$dir/latest"
+  printf '%s\n' "$rid" > "$dir/.latest.tmp" && mv -f "$dir/.latest.tmp" "$dir/latest"
 
   # ── THE SPAWN ──
   # The recorder re-execs THIS script as `__exec`, so there is no nested quoting to get wrong.
@@ -543,6 +581,17 @@ derive() {
   age="$(age_s "$log")"
   rc="$(file_or_empty "$rd/rc")"
 
+  # ⛔ THE KEY IS A DISPLAY/NAMESPACE NAME; THE RECORD IS THE IDENTITY. The key maps `/` to `-`,
+  # which is not injective (`a/b-c` and `a-b/c` share one), so a poll naming a DIFFERENT repo than the
+  # run recorded is reading somebody else's state. Abstain rather than answer with their verdict.
+  local rec; rec="$(file_or_empty "$rd/repo")"
+  if [ -n "$cli_slug" ] && [ -n "$rec" ] && [ "$cli_slug" != "$rec" ]; then
+    printf 'unknown pr=%s run=%s repo=%s identity=mismatch\n' "$pr" "$(basename "$rd")" "$rec"
+    printf '  this run recorded repo=%s but this poll named repo=%s. The state key is shared by both\n' "$rec" "$cli_slug"
+    printf '  spellings, so this is NOT this run'"'"'s identity — poll with --repo %s\n' "$rec"
+    return 25
+  fi
+
   # row <state> [extra key=value] — ONE line, every read value on it, nothing inferred.
   row() {
     printf '%s pr=%s run=%s repo=%s pid=%s rail_pid=%s rc=%s pr_state=%s merged=%s started=%s log_bytes=%s log_age_s=%s%s\n' \
@@ -591,6 +640,16 @@ derive() {
       [ "$rc" != "0" ] && printf '  ⚠️  rc=%s is NOT a rail success: the merge is real, and this run did not certify it\n' "$rc"
       return 0
     fi
+    # rc=2 is a USAGE/CONFIGURATION refusal: the rail never analysed (and so never merged) this head,
+    # which is a fact about the INVOCATION and needs no artifact. Deciding it before the abstention is
+    # what keeps a run usable in a checkout whose PR read is unavailable.
+    if [ "$rc" = "2" ]; then
+      why="$(last_refusal_line "$log")"
+      row "refused" "verdict=none"
+      printf '  the rail exited 2 — a USAGE/CONFIGURATION refusal: it never analysed this head\n'
+      [ -n "$why" ] && printf '  rail: %s\n' "$why"
+      return 20
+    fi
     # ⛔ A FAILED ARTIFACT READ IS NOT A VERDICT, FOR **ANY** rc. Folding it into `killed`/`refused`
     # would assert a state the evidence cannot support (the PR may be merged and the API blipped), so
     # the abstention is hoisted above every classification below.
@@ -623,12 +682,6 @@ derive() {
     # it needed (an unreadable head/draft probe, a missing parser, a failed `cd`). A refusal is only
     # claimed when the rail said so in its own words — otherwise this is an ERROR, and a lane told
     # "refused this head" would hunt a code defect that was never analysed.
-    if [ "$rc" = "2" ]; then
-      row "refused" "verdict=none"
-      printf '  the rail exited 2 — a USAGE/CONFIGURATION refusal: it never analysed this head\n'
-      [ -n "$why" ] && printf '  rail: %s\n' "$why"
-      return 20
-    fi
     if [ -n "$why" ] && refusal_is_head_verdict "$why"; then
       row "refused" "verdict=none"
       printf '  the rail exited %s — it refused this head\n' "$rc"
@@ -790,6 +843,7 @@ status_rail() {
   # starts can no longer reach the rail twice by spelling the same repo differently), falling back to
   # the git common-dir name only when no identity can be resolved at all.
   if [ -z "$slug" ]; then slug="$(resolve_slug)"; fi
+  slug="$(normalize_slug "$slug")"
   key="$(repo_key "$slug")"
   dir="$RUN_ROOT/$key/pr-$pr"
   if [ -n "$run_id" ]; then
@@ -800,6 +854,9 @@ status_rail() {
     fi
   else
     latest="$(file_or_empty "$dir/latest")"
+    # `latest` is a PATH COMPONENT and a verdict input, so it is validated like `--run`: a hand-edited
+    # or half-written value must not point `derive` at another directory.
+    case "$latest" in ''|.|..|*/*|*[!A-Za-z0-9._-]*) latest="" ;; esac
     if [ -z "$latest" ] || [ ! -d "$dir/$latest" ]; then
       printf 'no-run pr=%s run=none repo=%s\n' "$pr" "$key"
       printf '  nothing was ever started for this PR under %s\n' "$dir"

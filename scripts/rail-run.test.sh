@@ -450,7 +450,10 @@ OUT="$(poll 114)"; assert_rc 24 "${OUT%%|*}" "LAUNCH: and nothing is left claimi
 OUT="$(FAKE_RAIL_SLEEP=6 call start 115 --no-rerun --repo=acme/widgets)"; TXT="${OUT#*|}"
 assert_contains "$TXT" "repo=acme/widgets" "ARGS: the --repo=<slug> form is honoured and echoed"
 RAIL_ARGV="$(last_argv)"
-if [ "$RAIL_ARGV" = "115 --no-rerun --repo=acme/widgets" ]; then
+# THE RAIL ONLY PARSES THE TWO-TOKEN FORM: given the `=` spelling it forwards the token onward and
+# resolves its TARGET from the checkout (measured against the real script), so the record would claim a
+# repo the run never touched. The rewrite is what keeps the record and the rail's target the same repo.
+if [ "$RAIL_ARGV" = "115 --no-rerun --repo acme/widgets" ]; then
   ok "ARGS: the rail received the PR, its own flags and --repo in order"
 else bad "ARGS: the rail received '$RAIL_ARGV'"; fi
 if [ -d "$RAIL_RUN_DIR/acme-widgets/pr-115" ]; then ok "ARGS: the run key follows the --repo slug"
@@ -490,14 +493,70 @@ assert_contains "$TXT" "may still be alive" "IN-FLIGHT: and says so, rather than
 touch -t 202001010000 "$RAIL_RUN_DIR/fake-repo/pr-142/inflight"
 OUT="$(FAKE_RAIL_SLEEP=6 call start 142)"; assert_rc 0 "${OUT%%|*}" "IN-FLIGHT: an abandoned record older than the bound does not block"
 
+# ── X: the recorder's own liveness blocks a start ─────────────────────────
+# The recorder is the only incarnation for the first instants of every launch, so a record with a
+# LIVE pid, an accurate `start` and NO `railpid` is the COMMON window — and starting a second rail
+# there is exactly the double merge attempt the claim exists to prevent.
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-145/live"
+printf '%s\n' "$$" > "$RAIL_RUN_DIR/fake-repo/pr-145/live/pid"
+printf '%s\n' "$( . "$SCRIPT_DIR/lib/pid-identity.sh"; pid_start_epoch "$$" 2>/dev/null || printf 0 )" \
+  > "$RAIL_RUN_DIR/fake-repo/pr-145/live/start"
+: > "$RAIL_RUN_DIR/fake-repo/pr-145/live/log"
+printf 'fake/repo\n' > "$RAIL_RUN_DIR/fake-repo/pr-145/live/repo"
+printf 'live\n' > "$RAIL_RUN_DIR/fake-repo/pr-145/latest"
+OUT="$(call start 145)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 3 "$RC" "RECORDER-LIVE: a positively live recorder blocks a second start"
+assert_contains "$TXT" "may still be alive" "RECORDER-LIVE: and says so"
+
+# ── Y: the KEY is not the identity — an aliasing key must not answer for another repo ──────────
+# repo_key maps `/` to `-`, which is not injective: a/b-c and a-b/c share one key.
+RD146="$RAIL_RUN_DIR/a-b-c/pr-146/runcraft"
+mkdir -p "$RD146"
+printf 'a/b-c\n' > "$RD146/repo"
+printf '0\n' > "$RD146/rc"
+: > "$RD146/log"
+printf '2026-10-27T07:00:00Z\n' > "$RD146/started"
+printf 'runcraft\n' > "$RAIL_RUN_DIR/a-b-c/pr-146/latest"
+OUT="$(poll 146 --repo a-b/c)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "ALIAS-KEY: a poll naming a repo this run did not record abstains (the key is shared)"
+assert_contains "$TXT" "identity=mismatch" "ALIAS-KEY: and names the mismatch"
+OUT="$(poll 146 --repo a/b-c)"; assert_rc 0 "${OUT%%|*}" "ALIAS-KEY: the recorded identity reads normally"
+
+# ── Y2: `latest` is a path component — a hand-edited one cannot point outside the run root ────
+# The escape target EXISTS and looks like a finished run, so a validator-free join would answer with
+# it (rc=0 + MERGED ⇒ `landed`) instead of `no-run`: the arm can only pass by refusing the join.
+mkdir -p "$RAIL_RUN_DIR/alias"
+printf 'fake/repo\n' > "$RAIL_RUN_DIR/alias/repo"
+printf '0\n' > "$RAIL_RUN_DIR/alias/rc"
+: > "$RAIL_RUN_DIR/alias/log"
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-147"
+printf '../../alias\n' > "$RAIL_RUN_DIR/fake-repo/pr-147/latest"
+OUT="$(poll 147)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 24 "$RC" "LATEST: an unusable `latest` is treated as absent, never joined into a path"
+assert_not_contains "$TXT" "alias" "LATEST: and is not echoed back as a run"
+
+# ── Y3: rc=2 is a claim about the INVOCATION, so it does not need the artifact ────────────────
+craft 148 usage rc=2 >/dev/null
+printf 'admin-merge: a PR number is required\n' > "$(rundir 148 usage)/log"
+OUT="$(GH_MODE=fail poll 148)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 20 "$RC" "RC2: a usage refusal is `refused` even when the artifact read abstains"
+assert_state "$TXT" refused "RC2: it never analysed the head, so the PR read is irrelevant"
+
 # ── Q: path components are validated, not joined ───────────────────────────
-OUT="$(FAKE_RAIL_SLEEP=6 call start 143 --repo ..)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
-assert_rc 0 "$RC" "TRAVERSAL: --repo .. is accepted"
-if [ -d "$RAIL_RUN_DIR/repo-"*"/pr-143" ] 2>/dev/null; then ok "TRAVERSAL: an unusable slug is HASHED into the run root"
-else bad "TRAVERSAL: --repo .. did not land under a hashed key in $RAIL_RUN_DIR"; fi
+# `..` cannot name a repository, so the run refuses to begin at all (exit 2) instead of keying on a
+# hashed spelling of it: an identity is REQUIRED to start, because no artifact read can be verified
+# without one.
+OUT="$(call start 143 --repo ..)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 2 "$RC" "TRAVERSAL: --repo .. cannot name a repository, so the start is refused"
+assert_contains "$TXT" "cannot tell which repository" "TRAVERSAL: and says why"
 if [ -d "$(dirname "$RAIL_RUN_DIR")/pr-143" ]; then bad "TRAVERSAL: run state escaped the run root (~/pr-143)"
 else ok "TRAVERSAL: nothing was written outside the run root"; fi
-PIDS+=("$(cat "$RAIL_RUN_DIR/repo-"*"/pr-143/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+# a [HOST/]OWNER/REPO spelling is NORMALISED, so one repository cannot be reached through two
+# identities (which would be two keys, and two rails)
+OUT="$(FAKE_RAIL_SLEEP=6 call start 144 --repo github.com/acme/widgets)"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "SLUG: a [HOST/]OWNER/REPO spelling is accepted"
+OUT="$(poll 144 --repo acme/widgets)"; assert_rc 10 "${OUT%%|*}" "SLUG: and it is NORMALISED, so the short spelling finds the same run"
+PIDS+=("$(cat "$RAIL_RUN_DIR/acme-widgets/pr-144/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
 OUT="$(poll 5 --run ../../etc)"; assert_rc 2 "${OUT%%|*}" "TRAVERSAL: --run with a path separator is refused"
 OUT="$(poll 5 --run ..)"; assert_rc 2 "${OUT%%|*}" "TRAVERSAL: --run .. is refused"
 OUT="$(call start 5 --repo)"; assert_rc 2 "${OUT%%|*}" "ARGS: a dangling --repo is refused, not reinterpreted"
