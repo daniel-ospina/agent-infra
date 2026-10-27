@@ -245,7 +245,8 @@ STARVATION_CONFIRM_DEFAULT_S = 30.0
 STARVATION_CONFIRM_MAX_S = 300.0
 
 # ⛔ THE GATE'S OWN ENGAGEMENT THRESHOLD, COPIED DELIBERATELY AND PINNED BY THE SUITE
-# (`ci_runner_gate.sh:43` `QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"`). It is the ONE number
+# (`ci_runner_gate.sh:43` `QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"`; T43 reads THAT file and
+# fails if this constant drifts from its default). It is the ONE number
 # the project already uses to say "this queue is a GitHub-hosted backlog that is not draining". The
 # starvation alarm needs it as an ELIGIBILITY term (see `starvation_eligible`): `queued>0` alone is
 # true of a perfectly healthy fallback-only pool, and a deep queue with an idle pool is a mismatch
@@ -585,13 +586,19 @@ def discover(root: str | Path) -> list[LocalRunner]:
         if base_reason is None:
             return []
         raise Unmeasurable(f"the runner root {base} {base_reason} — cannot inventory this box")
+    # ⛔ `Path.glob` CANNOT DETECT AN UNLISTABLE ROOT (review finding P1). 3.12's
+    # `_WildcardSelector._select_from` wraps its `scandir` in `except OSError: pass`, so a directory
+    # this account can stat but cannot LIST returns `[]` — "this box has no runners" — which is the
+    # duplicate-registration hole this comment claims to close. `os.scandir` is used directly so the
+    # failure is raised where it happens.
     try:
-        candidates = sorted(base.glob("gh-runner*"))
+        names = [entry.name for entry in os.scandir(base)]
     except OSError as exc:
         raise Unmeasurable(
-            f"the runner root {base} cannot be enumerated ({exc.strerror or exc}) — cannot "
-            "inventory this box"
+            f"the runner root {base} cannot be listed ({exc.strerror or exc}) — cannot inventory "
+            "this box"
         ) from exc
+    candidates = sorted(base / name for name in names if name.startswith("gh-runner"))
     alive = _listener_dirs()
     found: list[LocalRunner] = []
     for entry in candidates:
@@ -773,10 +780,25 @@ def starvation_eligible(
             True,
             f"queued={queued} is at/above the gate's own backlog threshold ({GATE_QUEUE_THRESHOLD})",
         )
+    if gate_mode is None:
+        # ⛔ "UNKNOWN" IS NOT "GITHUB" (review finding P1). `gate_desired_mode()` returns `None` in
+        # four states (no record, nothing scheduling the gate, an unreadable record, a record holding
+        # something that is not a mode), and saying "the gate does not want `local`" of all four
+        # asserts a decision nobody made. The verdict is still `ok` — and the residual is stated: on
+        # such a box NOTHING strips the label (this tool preserves it, and no gate runs), so the
+        # stripped shape this alarm exists for cannot arise there; where it CAN arise, the gate is
+        # present and answers. Below the gate's backlog threshold, the queue is GitHub-hosted's.
+        return False, (
+            f"the gate's mode could not be determined on this box (see `gate_why`), no runner "
+            f"advertises {FALLBACK_LABEL}, and queued={queued} is below the gate's backlog threshold "
+            f"({GATE_QUEUE_THRESHOLD}) — nothing here can strip the label, so the queue is "
+            "GitHub-hosted's work, not this pool's"
+        )
     return False, (
         f"queued={queued} is below the gate's backlog threshold ({GATE_QUEUE_THRESHOLD}), the gate "
-        f"does not want `local`, and no runner advertises {FALLBACK_LABEL} — this queue is "
-        "GitHub-hosted's work, not this pool's (fallback-only, ci_runner_gate.sh:11-13)"
+        f"says `{gate_mode}` (so it does not want `local`), and no runner advertises "
+        f"{FALLBACK_LABEL} — this queue is GitHub-hosted's work, not this pool's "
+        "(fallback-only, ci_runner_gate.sh:11-13)"
     )
 
 
@@ -851,13 +873,27 @@ def gate_scheduler_present() -> bool:
     So the record is only evidence where the job that maintains it exists. Where it does not, this
     tool has no mandate to arm the fallback: it preserves whatever the gate set pool-wide and says
     that it could not enforce the floor.
+
+    ⛔ THE RESIDUAL THIS FUNCTION CANNOT CLOSE, STATED RATHER THAN IMPLIED. On macOS the evidence is
+    the INSTALLED PLIST (`templates/launchd/com.tortoise.ci-runner-gate.plist`); `launchctl disable`
+    (or `unload -w`) switches that job off and leaves the plist in place, and the override database
+    it writes is not readable without privileges — so a disabled job still answers "installed".
+    What IS closed here is the mask (`ln -s /dev/null …`), which launchd also honours as "do not
+    load". Resolving loadedness would need a probe that is unavailable on exactly the boxes this
+    tool guards, and `docs/ops/controller-service.md`'s rule is that an unavailable probe must not
+    turn a healthy box into a refusal — so the residual is named, and `gate_desired_mode`'s reason
+    says the evidence was the file's presence.
     """
     override = os.environ.get("RUNNER_AUTOSCALE_GATE_SCHEDULER")
     if override is not None:
         return override.strip().lower() not in ("", "0", "false", "no")
     plist = account_home() / "Library" / "LaunchAgents" / f"{GATE_JOB_LABEL}.plist"
-    if _inspect_path(plist)[0] is not None:
-        return True
+    plist_stat, plist_reason = _inspect_path(plist)
+    if plist_reason is None and plist_stat is not None:
+        if not (plist.is_symlink() and os.readlink(plist) == os.devnull):
+            return True
+        # MASKED: launchd refuses to load it (review finding P2 — the same mask rule as systemd).
+    # An uninspectable plist is neither evidence nor its absence: fall through to the other arms.
     # ⛔ A UNIT FILE IS NOT A SCHEDULE EITHER (review finding P1). The first version tested a
     # SUBSTRING of every entry name, so `ci-runner-gate.service.bak` — the ordinary way a unit is
     # disabled by hand — and a MASKED unit (`ln -s /dev/null …`, systemd's own way) both read as
@@ -939,7 +975,7 @@ def gate_desired_mode() -> tuple[str | None, str]:
             "(no launchd job, no systemd user unit, no crontab entry) — a hand-run record is not a "
             "standing decision, so the floor stays disarmed and labels are only PRESERVED"
         )
-    return mode, f"the gate's record {path}"
+    return mode, f"the gate's record {path} (and a job that installs the gate IS present on this box)"
 
 
 def pool_serves_fallback(pool: dict[str, PoolEntry]) -> bool:
@@ -2709,7 +2745,11 @@ def converge(
             # trace and the verdict fell through to `under-target` (exit 0). One measurement
             # failure must not have two record shapes depending on WHEN it happened.
             record["unverified"] = True
-            record["unverified_cause"] = "mid-pass-measurement"
+            # ⛔ ITS OWN CAUSE (review finding P2). The shared `mid-pass-measurement` name rendered
+            # "the box could not be re-measured AFTER AN INSTALL" for a `df` that failed BEFORE the
+            # first slot — the wrong cause for the failure this arm was added for. The cause is what
+            # a fleet reader keys on; it must be the measurement that actually failed.
+            record["unverified_cause"] = "disk-unreadable-midpass"
             record["disk_unverified"] = str(exc)
             record["notes"].append(
                 f"stop: the disk free space could not be re-read mid-pass ({exc}) — nothing further "
@@ -2951,6 +2991,13 @@ def converge(
                 f"{record.get('unverified_detail') or 'no error text was captured'} — the box's "
                 "runner count is UNKNOWN, so the pass stopped there. The actions listed above were "
                 "already performed BEFORE that point; nothing was added or registered after it."
+            )
+        elif record.get("unverified_cause") == "disk-unreadable-midpass":
+            record["error"] = (
+                "the disk free space could not be re-read mid-pass — "
+                f"{record.get('disk_unverified') or 'no error text was captured'} — so the pass "
+                "stopped before adding anything it could not price. The actions listed above were "
+                "already performed BEFORE that point; nothing further was done."
             )
         else:
             record["error"] = (

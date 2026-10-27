@@ -637,12 +637,12 @@ def t1_label_floor():
             # an in-process call cannot see.
             cli = subprocess.run(
                 [sys.executable, MODULE_UNDER_TEST, "--json", "--root", box.root],
-                # ⛔ THE HOST'S CORE COUNT MUST NOT DECIDE THIS CASE. Without the seam the CLI sizes
-                # the ceiling from the machine the suite runs on, and on a >2-core host the fill arm
-                # then runs — a host-dependent outcome in a case that is about the label rule, and
-                # (since the fill arm now reports a provisioner that installs NOTHING as a failure)
-                # a red suite on every box bigger than the fixture. The 2-core ceiling is the case's
-                # own stated premise: one runner, already alive, so the fill loop cannot run.
+                # ⛔ THIS SUBPROCESS MUST USE THE CASE'S OWN 2-CORE PREMISE. `Box` already pins
+                # `RUNNER_AUTOSCALE_NPROC=8` as the fixture default, so the CLI was sizing a ceiling
+                # of 3 (not the host's core count) and the fill arm ran — in a case about the label
+                # rule. Since the fill arm now reports a provisioner that installs NOTHING as a
+                # failure, that leaked into the exit code. Pinning 2 restores the stated premise:
+                # one runner, already alive, so the fill loop cannot run.
                 env={**_cli_env(box), "RUNNER_AUTOSCALE_NPROC": "2"},
                 capture_output=True,
                 text=True,
@@ -2548,6 +2548,33 @@ def t35_disabled_schedule_is_not_scheduled():
                 ra.gate_scheduler_present() is False,
                 "a masked unit alone is not a schedule",
             )
+            # (e) POSITIVE CONTROL FOR THE SYSTEMD ARM (review finding P2): with the mask gone and a
+            # real `.service` installed, the answer must be True — otherwise (a)–(d) could all be
+            # passing because the unit arm never returns True at all.
+            os.unlink(os.path.join(units, "ci-runner-gate.timer"))
+            box._write(os.path.join(units, "ci-runner-gate.service"), "[Service]\n")
+            check(
+                ra.gate_scheduler_present() is True,
+                "an installed .service IS a schedule — the systemd arm must be able to say so",
+            )
+            # (f) the LAUNCHD arm, which is where this gate really runs: a MASKED plist
+            # (`ln -s /dev/null …`, launchd's own way of not loading a job) is not a schedule, and a
+            # real one IS (the positive control).
+            os.unlink(os.path.join(units, "ci-runner-gate.service"))
+            agents = os.path.join(home, "Library", "LaunchAgents")
+            os.makedirs(agents, exist_ok=True)
+            plist = os.path.join(agents, f"{ra.GATE_JOB_LABEL}.plist")
+            os.symlink(os.devnull, plist)
+            check(
+                ra.gate_scheduler_present() is False,
+                "a MASKED launchd plist is not a schedule",
+            )
+            os.unlink(plist)
+            box._write(plist, "<plist/>\n")
+            check(
+                ra.gate_scheduler_present() is True,
+                "an installed plist IS the evidence on a Mac — the launchd arm must say so",
+            )
         finally:
             box.destroy()
 
@@ -2572,6 +2599,27 @@ def t36_discover_uninspectable_is_unmeasurable():
                 raise Failure("an uninspectable runner root must raise Unmeasurable, not read as empty")
             # CONTROL: a readable, empty root is still `[]` — absence and blindness differ.
             check(ra.discover(box.root) == [], "an empty readable root is empty, not unmeasurable")
+            # ⛔ THE SHAPE THAT MATTERS — a root this account can STAT but cannot LIST. `Path.glob`
+            # swallows that EACCES and answers `[]`, i.e. "this box has no runners" (review finding
+            # P1), so the probe is `os.scandir`. Root can read anything, so this arm is stated rather
+            # than silently skipped on such a box.
+            if os.geteuid() != 0:
+                denied = os.path.join(box.dir, "root-denied")
+                os.makedirs(os.path.join(denied, "gh-runner-x64"), exist_ok=True)
+                box._write(os.path.join(denied, "gh-runner-x64", ".runner"), "{}")
+                os.chmod(denied, 0o000)
+                try:
+                    try:
+                        ra.discover(denied)
+                    except ra.Unmeasurable as exc:
+                        contains(str(exc), "cannot be listed", "the Unmeasurable reason")
+                    else:
+                        raise Failure(
+                            "an UNLISTABLE runner root read as an empty one — that is how a pass "
+                            "registers duplicates over installs it could not enumerate"
+                        )
+                finally:
+                    os.chmod(denied, 0o755)
         finally:
             box.destroy()
 
@@ -2647,11 +2695,21 @@ def t38_midpass_disk_unverified():
             record = converge(box, nproc="4", want=2)
             check(record.get("unverified") is True, f"the record must say unverified: {record}")
             check(
-                record.get("unverified_cause") == "mid-pass-measurement",
+                record.get("unverified_cause") == "disk-unreadable-midpass",
                 f"and WHICH measurement: {record}",
             )
             check("disk_unverified" in record, f"the disk cause is named: {record}")
+            # ⛔ THE RENDERED `error` MUST NAME THE DISK (review finding P2): the shared mid-pass
+            # cause rendered "the box could not be re-measured AFTER AN INSTALL" for a `df` that
+            # failed BEFORE the first slot.
+            contains(str(record.get("error")), "disk free space", "the error")
+            # ⛔ AND THE EXIT-CODE CONTRACT IS EXERCISED ON THE MID-PASS SHAPE, not on the pass-start
+            # arm one call earlier (review finding P2): reset the `df` counter so the subprocess
+            # repeats this pass rather than starting at its second call.
+            if os.path.exists(os.path.join(box.dir, "df.count")):
+                os.unlink(os.path.join(box.dir, "df.count"))
             rc, out = cli(box, "--root", box.root, "--want", "2")
+            contains(out, "disk free space", "the CLI output")
             check(rc == 2, f"a pass that could not measure the disk is exit 2, got {rc}: {out[:300]}")
         finally:
             box.destroy()
@@ -2757,6 +2815,53 @@ def t42_absent_gate_record_is_absence():
             check(mode is None, f"no record is no mode: {mode!r}")
             contains(why, "there is no gate record", "the reason")
             check("unreadable" not in why, f"absence must not be reported as a read fault: {why}")
+        finally:
+            box.destroy()
+
+
+@test("T43 the gate's own backlog threshold is the alarm's third term — and the constant is PINNED")
+def t43_deep_queue_threshold():
+    """The third eligibility term exists for a queue nobody's labels explain: a DEEP backlog with an
+    idle pool is worth a page whatever the pool advertises, and the number is the gate's own
+    (`ci_runner_gate.sh:43`, `CI_GATE_QUEUE_THRESHOLD:-60`) rather than a second opinion invented
+    here. Review finding P1: without this case the constant was documented as "PINNED BY THE SUITE"
+    with zero references in it, so a drift from 60 — or the term being dropped — was invisible."""
+    with Env():
+        box = Box("starve-threshold")
+        try:
+            # The gate says `github` and the pool does NOT advertise the label: terms 1 and 2 are
+            # both false, so only the THRESHOLD can make this queue the pool's work.
+            box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64", "Linux"])])
+            box.gate_state("github")
+            box.queued(ra.GATE_QUEUE_THRESHOLD)
+            record = converge(box, want=0)
+            check(record.get("starvation") == "starved", f"a deep backlog must alarm: {record}")
+            check(record["verdict"] == "starvation", f"verdict: {record['verdict']}")
+            check(record.get("starvation_eligible") is True, f"eligible: {record}")
+            contains(
+                str(record.get("starvation_why")),
+                str(ra.GATE_QUEUE_THRESHOLD),
+                "the eligibility reason (it must NAME the number it used)",
+            )
+            # …and it is a THRESHOLD, not a constant fire: one below it is GitHub-hosted's work.
+            box.queued(ra.GATE_QUEUE_THRESHOLD - 1)
+            below = converge(box, want=0)
+            check(
+                below.get("starvation") == "ok",
+                f"one below the gate's threshold must not alarm: {below.get('starvation')}",
+            )
+            # ⛔ THE CONSTANT IS PINNED TO THE GATE'S OWN DEFAULT, read from the gate file itself —
+            # a copy of a number in a second file is how the two drift apart in silence.
+            gate_src = (Path(__file__).resolve().parents[2] / "scripts" / "ci_runner_gate.sh").read_text(
+                encoding="utf-8"
+            )
+            m = re.search(r'CI_GATE_QUEUE_THRESHOLD:-([0-9]+)', gate_src)
+            check(m is not None, "the gate must still declare CI_GATE_QUEUE_THRESHOLD's default")
+            check(
+                int(m.group(1)) == ra.GATE_QUEUE_THRESHOLD,
+                f"GATE_QUEUE_THRESHOLD ({ra.GATE_QUEUE_THRESHOLD}) must equal the gate's own "
+                f"default ({m.group(1)}) — the alarm and the gate must agree on what 'a backlog' is",
+            )
         finally:
             box.destroy()
 
@@ -3088,7 +3193,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T29",
-        "    return mode, f\"the gate's record {path}\"",
+        "    return mode, f\"the gate's record {path} (and a job that installs the gate IS present on this box)\"",
         "    return None, f\"the gate's record {path}\"  # MUTATION: the mode is read and discarded",
         "the gate's own mode is read and thrown away, so the floor can never repair the incident it "
         "exists for while the record still looks consulted",
@@ -3599,10 +3704,11 @@ MUTATIONS = [
     ),
     Mutation(
         "T38",
-        '            record["unverified_cause"] = "mid-pass-measurement"\n'
-        '            record["disk_unverified"] = str(exc)',
-        '            record["unverified_cause"] = "mid-pass-measurement"',
-        "the mid-pass disk failure loses its machine-readable cause, so a fleet reader sees a HEALTHY pass",
+        '            record["unverified"] = True\n'
+        '            # ⛔ ITS OWN CAUSE (review finding P2). The shared `mid-pass-measurement` name rendered',
+        '            # MUTATION: the mid-pass disk failure sets no `unverified` bit at all\n'
+        '            # (review finding P2). The shared `mid-pass-measurement` name rendered',
+        "the mid-pass disk failure is not recorded as unverified, so a fleet reader sees a HEALTHY pass",
     ),
     Mutation(
         "T39",
@@ -3639,6 +3745,41 @@ MUTATIONS = [
         "        fallback_engaged=fallback_engaged(pool),",
         "        fallback_engaged=None,",
         "the published `fallback_engaged` fact becomes None and nothing reddens",
+    ),    Mutation(
+        "T43",
+        "    if queued >= GATE_QUEUE_THRESHOLD:",
+        "    if False:  # MUTATION: a deep backlog explains itself",
+        "the threshold term is dropped, so a deep backlog no label explains never pages",
+    ),
+    Mutation(
+        "T43",
+        "GATE_QUEUE_THRESHOLD = 60",
+        "GATE_QUEUE_THRESHOLD = 55",
+        "the alarm's copy of the gate's threshold drifts away from the gate's own default",
+    ),
+    Mutation(
+        "T35",
+        '            if entry.is_symlink() and os.readlink(entry) == os.devnull:\n                continue  # MASKED: systemd refuses to load it, so it cannot maintain the record\n            return True',
+        '            if entry.is_symlink() and os.readlink(entry) == os.devnull:\n                continue  # MASKED: systemd refuses to load it, so it cannot maintain the record\n            return False',
+        "an installed .service stops counting as a schedule, so a box that runs the gate loses its floor",
+    ),
+    Mutation(
+        "T35",
+        "        if not (plist.is_symlink() and os.readlink(plist) == os.devnull):",
+        "        if True:",
+        "a MASKED launchd plist counts as a schedule on the one platform this gate really runs on",
+    ),
+    Mutation(
+        "T36",
+        '        names = [entry.name for entry in os.scandir(base)]',
+        '        names = [entry.name for entry in os.scandir(base)] if False else []',
+        "an UNLISTABLE runner root reads as EMPTY again — duplicates registered over invisible installs",
+    ),
+    Mutation(
+        "T38",
+        '            record["unverified_cause"] = "disk-unreadable-midpass"',
+        '            record["unverified_cause"] = "mid-pass-measurement"',
+        "the mid-pass disk failure loses its own cause, so the rendered error blames an install",
     ),
 ]
 
@@ -3738,7 +3879,6 @@ def run_mutations():
         controls[case_id] = ok
         print(f"   {'✅' if ok else '❌'} control {case_id}: {'GREEN' if ok else 'RED'}")
         if not ok:
-            bad += 1
             for line in body.splitlines():
                 print(f"   | {line}")
     print()
@@ -3750,8 +3890,12 @@ def run_mutations():
         # built is a mutation that verified NOTHING: count it MISSED and say why.
         print(f"── {mut.case_id} mutation → {mut.why}")
         if not controls.get(mut.case_id, False):
-            # ⛔ NOT COUNTED AS CAUGHT. A red control means this mutation cannot verify anything, and
+            # ⛔ NOT COUNTED AS CAUGHT — and counted as MISSED PER MUTATION, not once per control
+            # (review finding P2): charging a whole case's mutants to a single increment printed
+            # `CAUGHT=86` for a run in which 84 mutants were verified, which is the number a reviewer
+            # quotes as evidence. A red control means this mutation cannot verify anything, and
             # scoring it CAUGHT would be the very false PASS this harness exists to prevent.
+            bad += 1
             print("   ❌ CONTROL RED — the paired case fails on the SHIPPED module; NOTHING verified\n")
             continue
         try:
