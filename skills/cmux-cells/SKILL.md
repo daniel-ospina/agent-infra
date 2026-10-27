@@ -64,7 +64,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.19–0.23 GB** whole tree | RSS summed over the process tree, 4 lanes, cell-4, 2026-10-27 |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | containers 21–149 MB each (`docker stats --no-stream`, cells 3–4, 2026-10-27) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | containers 21–149 MB each (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.3 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** for it | re-derived in agent-infra#2721; the old "1.1 GB" figures measured a lane's worktree *before* its venv |
 | CPU | load 4.3 with 23 lanes | **never the limit** |
@@ -82,47 +82,64 @@ zero. If a box has already OOM-killed (`dmesg | grep -ci 'killed process'`), rai
 box instead of pretending a fleet-wide constant is a measurement.
 
 ```bash
-# a JUDGEMENT AID, not an implementation — the gate below is the authority
-# DISK: the gate admits a spawn iff free_mb >= tree + reserve (exit 77 DISK-NOHEADROOM).
-#       For a worktree containing uv.lock: tree=350, reserve=6144. Otherwise: 64 / 1024.
-free_mb=$(df -Pm / | awk 'NR==2{print $4}')          # MB, no unit parsing
-avail_mb=$(free -m | awk 'NR==2{print $7}')
-TREE_MB=${TREE_MB:-350}; RESERVE_MB=${RESERVE_MB:-6144}; PER_MB=${PER_MB:-500}
-# an unreadable/garbage probe is NOT "zero room" and NOT room — refuse to answer (the gate's own polarity)
-case "$free_mb" in ''|*[!0-9]*) disk_lanes=UNREADABLE
-  ;; *) disk_lanes=$(( (free_mb - RESERVE_MB) / TREE_MB )); [ "$disk_lanes" -lt 0 ] && disk_lanes=0 ;; esac
-case "$avail_mb" in ''|*[!0-9]*) ram_lanes=UNREADABLE
-  ;; *) ram_lanes=$(( (avail_mb - 1500) / PER_MB )); [ "$ram_lanes" -lt 0 ] && ram_lanes=0 ;; esac
-lanes=UNKNOWN
-case "$disk_lanes:$ram_lanes" in *UNREADABLE*) ;; *) lanes=$(( ram_lanes < disk_lanes ? ram_lanes : disk_lanes )) ;; esac
-printf 'lanes=%s (ram=%s disk=%s)\n' "$lanes" "$ram_lanes" "$disk_lanes"
+# a JUDGEMENT AID — the gate below is the authority. The answer is HEADROOM ("more lanes"), not a ceiling:
+# add it to the LIVE lane count, never read it as "this box holds N".
+# bash-3.2 clean (no `case` inside $( ) — macOS /bin/bash): runnable as a script OR pasted into $().
+TARGET=${TARGET:-.}                       # the worktree you are dispatching into, not /
+if [ -f "$TARGET/uv.lock" ]; then TREE_MB=${TREE_MB:-350}; RESERVE_MB=${RESERVE_MB:-6144}
+else TREE_MB=${TREE_MB:-64}; RESERVE_MB=${RESERVE_MB:-1024}; fi   # agent-infra lane: 48 MB tree
+PER_MB=${PER_MB:-1000}                    # plan on the PEAK below; the scheduler budgets 512 (ai-drainer)
+for v in "$TREE_MB" "$RESERVE_MB" "$PER_MB"; do
+  [ "$v" -ge 0 ] 2>/dev/null || { printf 'seeds: non-numeric (%s) — refusing\n' "$v"; exit 0; }
+done
+if [ "$TREE_MB" -le 0 ] || [ "$PER_MB" -le 0 ]; then printf 'seeds: zero tree/PER — refusing\n'; exit 0; fi
+free_mb=$(df -Pm "$TARGET" 2>/dev/null | awk 'NR==2{print $4}')                  # MB, no unit parsing
+avail_mb=$(command -v free >/dev/null 2>&1 && free -m | awk 'NR==2{print $7}') || true   # Linux only
+# an unreadable/garbage probe is NOT "zero room" and NOT room — refuse to answer (the gate's polarity)
+if [ "$free_mb" -ge 0 ] 2>/dev/null; then disk_more=$(( (free_mb - RESERVE_MB) / TREE_MB ))
+  [ "$disk_more" -lt 0 ] && disk_more=0 || true; else disk_more=UNREADABLE; fi
+if [ "$avail_mb" -ge 0 ] 2>/dev/null; then ram_more=$(( (avail_mb - 1500) / PER_MB ))
+  [ "$ram_more" -lt 0 ] && ram_more=0 || true; else ram_more=UNREADABLE; fi
+more=UNKNOWN
+if [ "$disk_more" != UNREADABLE ] && [ "$ram_more" != UNREADABLE ]; then
+  more=$(( ram_more < disk_more ? ram_more : disk_more )); fi
+printf 'more_lanes=%s (ram=%s disk=%s, target=%s)\n' "$more" "$ram_more" "$disk_more" "$TARGET"
 # 0 means MEASURE BEFORE DISPATCHING. It is never "this box can do no work" — and never a licence to
 # clamp the disk term to 1: a disk-zero is the state that does NOT clear by waiting (see §3).
+# `free` is Linux-only; on the macOS laptop this prints ram=UNREADABLE by design — use `vm_stat` there.
 ```
 
-⚠️ **WHAT THE GATE ACTUALLY REFUSES** (read 2026-10-27) — three refusals, and the per-lane one is on DISK:
+⚠️ **WHAT THE GATE ACTUALLY REFUSES** (read 2026-10-27) — FOUR refusals, in the gate's own order (fork → disk → load):
 
-1. **floor** — `DISK_MIN_FREE_MB`, default **500**;
-2. **headroom** — `DISK-NOHEADROOM` (exit **77**) requires `free_mb ≥ tree + reserve`, where the per-lane costs are
-   **`tree` 350 MB and `reserve` 6144 MB** for any target containing `uv.lock` (**64 / 1024** otherwise). One spawn on a
-   uv worktree therefore needs **6,494 MB** free — the floor is not the binding number, this is (agent-infra#2721);
-3. **load** — `MAX_LOAD`, default `nproc × 10`.
+1. **fork** — `AGENT_FORK_REFUSED`, exit **73**, and it runs **first**. A process-bound box refuses a spawn that would
+   fork-bomb it; the remedy is a restart/drain, **not** waiting;
+2. **disk floor** — `DISK_MIN_FREE_MB`, default **500**, exit 77;
+3. **disk headroom** — `DISK-NOHEADROOM`, **the binding one**, exit 77: requires `free_mb ≥ tree + reserve`, with per-lane
+   costs **350 + 6144 MB** for a target containing `uv.lock` and **64 + 1024 MB** otherwise. One spawn on a uv worktree
+   needs **6,494 MB** free, so the floor is not the number that decides (agent-infra#2721);
+4. **load** — `MAX_LOAD`, default `nproc × 10` (exit 75; `PI_GATE_REFUSED` 76 is translated into 75).
 
-**RAM is different: there is no PER-LANE RAM BUDGET anywhere in the loop.** `orch-loop.sh` has a floor
-(`MIN_MEM_FREE_MB`, default 512) and `capacity.sh` has a placement bound, but nothing accounts for what *this* lane will
-consume. That is why the arithmetic above is worth getting right: it is the only per-lane memory reasoning there is.
-Where the gate speaks, the gate is right — and where it does not, nothing else will.
+The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. Diagnosing a
+73 as "disk or load" and waiting is the trap: it is the one refusal waiting does not clear.
 
-`MAX_LANES` in `keys.env` is a static number and does not know either constraint — do not trust it as the ceiling.
+**RAM is split across two instruments and neither is `spawn-gate.sh`**, which has floors only (`MIN_MEM_FREE_MB`,
+default 512, in `orch-loop.sh`; `CAP_MIN_MEM_MB` in `capacity.sh`). The **scheduler** does budget per lane: `ai-drainer.sh`
+uses `LANE_MEM_MB` (default **512**) against `MEM_BUDGET_PCT` (default **75**) of the pool. So there are two numbers —
+scheduler 512, planning ~1000 for a test-running lane (the table above) — and this file deliberately uses the larger.
+Reconcile against `docs/ops/ai-drainer.md` before raising either. Where the gate speaks, the gate is right.
+
+`MAX_LANES` is **derived** (`2.5 × cores`) and enforced by the controller — but it knows neither disk nor RAM, so it is an
+upper bound, never the answer (§7).
 
 ⛔ **DO NOT RE-INVENT THE CAPACITY GATE — `scripts/orchestrator-harness/spawn-gate.sh` ALREADY IS IT** (checked
 2026-10-27). It derives `MAX_LOAD` from `nproc × 10` when unset, refuses on a non-empty disk band (`disk_free_mb` vs
 `DISK_MIN_FREE_MB`/`MIN_FREE_MB`, exit 77), **refuses again on per-lane headroom** (`DISK-NOHEADROOM`, tree + reserve,
 exit 77 — see above), and validates its own probes against wrap/garbage readings. Its capacity behaviour is asserted in
-`spawn-gate.test.sh` (§§ disk, headroom, load); read that rather than trusting a count quoted in prose. The failure it
-already names is the one worth reading: the band where `scripts/cloud-cell-supervisor.sh --check` prints
-`CELL CAN RUN A CONTROLLER` while every lane spawn is refused 77. (`cloud-cell-doctor.sh` has no `--check` mode — that
-flag belongs to `cloud-cell-bringup.sh`, and the banner is printed by the supervisor's `cmd_check`.)
+`spawn-gate.test.sh` (its disk, headroom and load sections); read that rather than trusting a count quoted in prose. The
+failure it already names is the one worth reading: the band where `scripts/cloud-cell-supervisor.sh --check` prints
+`CELL CAN RUN A CONTROLLER` while every lane spawn is refused 77. (`scripts/orchestrator-harness/cloud-cell-doctor.sh` has
+no `--check` mode — that flag belongs to `scripts/cloud-cell-bringup.sh`, and the banner is printed by the supervisor's
+`cmd_check`.)
 
 The formula above is therefore a **diagnostic, not an implementation**: if a number disagrees with the gate, the gate is
 right and the number is a curiosity. Any new refusal belongs inside `spawn-gate.sh` with a test — never in a brief, a
@@ -257,10 +274,14 @@ bash scripts/admin-merge.sh <pr>                                                
 | cell-1, cell-3 | **tortoise / product** | P0/P1 product work; disk-bound on cell-1, **memory-bound** on cell-3 (8 GB, 2 OOM kills measured 2026-10-27) |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
-⛔ **THERE IS DELIBERATELY NO LANE CEILING TIED TO CPU COUNT** — the owner ruled on 2026-10-17 that dispatch is gated on
-capacity, not on a lane count (`docs/ops/fleet-capacity.md`: *"It is not a lane cap, and there is deliberately no lane
-ceiling tied to cpu count"*). So this table names a box's ROLE, never a number of lanes. The binding constraint is
-**free disk vs one lane's `tree + reserve`** (§2), then free RAM against the per-lane peak, then load.
+⛔ **TWO DIFFERENT CEILINGS — DO NOT CONFUSE THEM, AND DO NOT TREAT EITHER AS THE WHOLE ANSWER.** The owner ruled on
+2026-10-17 (`docs/ops/fleet-capacity.md`) that **between boxes** dispatch is gated on capacity, not a lane count — that is
+`cap_place`, and the objection is to a count standing in for capacity **across a fleet**. **Inside one box there IS a real
+ceiling**: `MAX_LANES`, derived as **2.5 × cores** (`orch-loop.sh`: `10#$_NCPU * 5 / 2`, rendered into the launchd plist),
+and the controller refuses at `lanes >= MAX_LANES` (`GATE_WHY=lanes=N>=max_lanes=M`). It is real — and it knows **neither
+disk nor RAM**, so it is an upper bound, never the answer. The binding constraint is **free disk vs one lane's
+`tree + reserve`** (§2), then free RAM against the per-lane peak, then load. So this table names a box's ROLE, never a
+number of lanes.
 
 A dispatch decision is only honest if it names: the box's **free disk**, its **free RAM**, its **live lane count**, and the
 **lane's expected cost**. If a box is not dispatching by itself and is not at capacity, that is the signal to intervene —
@@ -277,8 +298,8 @@ not a load average measured earlier.
 - `TERM`/`INT` traps that swallow signals leave the script running: a stop/restart appears to hang (agent-infra#2085).
 - Deleting a worktree to make space must never destroy unpushed work: check `git rev-list --count @{u}..HEAD` and
   `status --porcelain` first; preserve, then remove only the regenerable parts.
-- **The 900 / 3000 arithmetic is gone on purpose.** If you find a copy of it (`mem_lanes=$(( (avail - 3000) / 900 ))`),
-  it is stale: it used a test-running peak as every lane's cost and a flat reserve that dominates a small box, and it
-  returned "0 lanes" on boxes with room. The measured figures and their dates are in §2.
+- **The 900 / 3000 arithmetic is gone on purpose.** If you meet it anywhere, it is stale: it used a test-running peak as
+  every lane's cost and a flat reserve that dominates a small box, and it returned "no lanes" on boxes with room. §2
+  carries the measured figures, their dates, and the method.
 
 > Continue following the workflow as mandated by this skill. Do not skip steps.
