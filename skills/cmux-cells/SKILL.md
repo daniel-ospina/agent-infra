@@ -74,7 +74,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~5–105 MB in a normal sample**, with **peaks seen at 207.9 MB (cell-3) and 313 MB (cell-1)** — `docker stats --no-stream`, per sidecar container, cells 3–4, 2026-10-27; plan on the peak, not on ~150 MB, and re-measure per box. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~5–105 MB in a normal sample**, with **peaks seen at 207.9 MB (cell-3) and 313 MB (cell-1)** — `docker stats --no-stream`, per sidecar container, cells **1, 3 and 4**, 2026-10-27 (the 313 MB peak is **cell-1's**, so a cells-3–4 re-sample will not reproduce it); plan on the peak, not on ~150 MB, and re-measure per box. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -239,10 +239,17 @@ channel verdicts — the first one **is**, and it is listed with them only to sa
   `surface` scope at all (`cmux surface ls` → `cmux: unknown resource scope "surface"`), and the guest-side equivalent is
   `cmux layout apply` with a one-surface layout, which produces the same artifact — a shell in the cwd plus a command typed
   into it. `scripts/orchestrator-harness/worker-terminal.sh:30-32` carries that correction with its own measurement).
+  ⛔ **The guest-CLI advice here and in the next bullet assumes the guest CLI RUNS AT ALL, and on a measured cell shape it does
+  not:** `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui` — the `cmux-tui` symlink dangling and no daemon
+  process (agent-infra#2368; the same measurement as `worker-terminal.sh:168-171` and `scripts/orchestrator-harness/README.md:568`).
+  On such a box every guest verb below is unavailable, and that error reads as a broken box rather than the known install shape
+  it is — the surface that still works is **`tmux`**, started with an EXPLICIT environment (`HOME` pointing at the HOME that
+  holds the credential, that HOME's `keys.env` sourced when present, `O` exported — `wt_launcher`'s `tmux` arm is the
+  reference); README:568 records it as the ONLY surface that can start a worker there.
 - **A usage error is not a channel verdict, and neither is a wrong-but-valid argument.** From the Mac, `cmux vm tree` with
   **no machine** prints the whole fleet; `terminal read/send` without an id prints the usage block. And because §7's table is
   keyed by LABEL, `cmux vm tree pi-cell-4` renders **`No cloud machines. Try: cmux vm new`** from the Mac — a false empty, not
-  a missing box — so use the NAME. **From inside a cell the grammar is the PEER one and it answers the same arguments
+  a missing box — so use the NAME. **From inside a cell — when the guest CLI runs at all; see the #2368 ⛔ above — the grammar is the PEER one and it answers the same arguments
   differently:** `cmux vm` there carries only the remote verbs (`ls`, `connect`, `exec`, `tree`, `terminal`,
   `send`/`send-key`/`read-screen`, `workspace`, `push`, `agent`, `layout`, `env`, and the mirrored resources) — `resize`,
   `pause`, `resume` and `stats` are **`unknown vm subcommand`**, so step 3, step 4 and every `stats` reading in this file have
