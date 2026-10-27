@@ -139,10 +139,12 @@ REPOS = ("daniel-ospina/tortoise",
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # ⛔ THE MODEL IS THE ALIAS, BY OWNER RULING (2026-10-27): "let's use jev latest".
 #
-# `MIN_CONFIDENCE` above and every per-mark bar in `ask-owner.py` were measured against
-# `jev-1.13.0`, and `jev-latest` already resolves to `jev-1.14.0` on the live API — so the
-# marks are now scored by a model that moves when the vendor ships, with no change to this
-# file. The vendor's own guidance warns about exactly this ("an alias moves when a new release
+# `MIN_CONFIDENCE` above and every per-mark bar in `ask-owner.py` were calibrated on the
+# LOOKALIKE host's `jev-1.13.0` and not re-measured since the migration (tortoise#7864), so
+# re-deriving them is a FIRST real calibration, not a repeat. `jev-latest` already resolves to
+# `jev-1.14.0` on the live API — so the marks are now scored by a model that moves when the
+# vendor ships, with no change to this file. The vendor's own guidance warns about exactly
+# this ("an alias moves when a new release
 # ships ... if you have tuned confidence thresholds against one version, send that version's
 # ID instead of the alias").
 # ⚠️ What makes that survivable is the ECHO: the response carries the concrete version that

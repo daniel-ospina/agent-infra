@@ -186,7 +186,8 @@ def test_every_published_verdict_is_classified():
 # silently break.
 #
 # ⚠️ THE MODEL IS THE ALIAS `jev-latest`, BY OWNER RULING (2026-10-27). The bars in this file and
-# in ask-owner.py were measured against `jev-1.13.0`, so the voting model now moves whenever the
+# in ask-owner.py were calibrated on the LOOKALIKE host's `jev-1.13.0` and not re-measured since
+# the migration (tortoise#7864). So the voting model now moves whenever the
 # vendor ships — and a literal assertion against an alias CANNOT notice that (it passes on every
 # future release). What notices it is the ECHO: the response carries the concrete version that
 # answered, `jev_choice` puts it in `meta["model"]`, and the legs below assert that echo is the

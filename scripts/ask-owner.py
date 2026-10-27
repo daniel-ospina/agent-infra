@@ -58,9 +58,11 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # ⛔ THE MODEL IS THE ALIAS, BY OWNER RULING (2026-10-27): "let's use jev latest".
 #
 # What that accepts, stated here so a later lane does not have to rediscover it: every bar in
-# the CALIBRATION table below was measured against `jev-1.13.0`, and `jev-latest` already
-# resolves to `jev-1.14.0` on the live API. So the marks are now scored by a model that moves
-# when the vendor ships, WITHOUT any change to this file — the vendor's own guidance warns
+# the CALIBRATION table below was calibrated on the LOOKALIKE host's `jev-1.13.0` and not
+# re-measured since the migration (tortoise#7864), so re-deriving it is a FIRST real
+# calibration, not a repeat. `jev-latest` already resolves to `jev-1.14.0` on the live API,
+# so the marks are now scored by a model that moves when the vendor ships, WITHOUT any
+# change to this file — the vendor's own guidance warns
 # exactly about this ("an alias moves when a new release ships ... if you have tuned
 # confidence thresholds against one version, send that version's ID instead of the alias").
 # ⚠️ The consequence is not that the gate stops working; it is that a verdict can shift for a
@@ -760,7 +762,8 @@ def jev(state):
 
 
 def meta_line(result):
-    """The one line that says WHICH model judged this question, and what it cost in tokens.
+    """The one summary line: which model judged this question and what it cost in tokens
+    — or just the cost, when the API reports money instead of tokens.
 
     ⛔ IT EXISTS AS A FUNCTION SO IT CAN BE ASSERTED (review 2026-10-27). With the model now a
     vendor ALIAS, this echo is the only place the concrete version appears — the sent string is
