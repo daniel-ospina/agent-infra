@@ -54,6 +54,7 @@ before any parent-side decision.
 | **The child-side orphan watchdog (#385)** | `~/.pi/agent/orphan-watchdog.log` mtime **01:48**, no entry in the window; it requires `ppid == 1` and exits **137**, not 143. |
 | **An agent's shell** | `~/.pi/agent/audit/audit.jsonl` for 19:30–19:40Z contains no `pkill`/`killall`/`kill -…` tool call, and no tool call anywhere references any victim pid in a signalling context. |
 | **A human's shell** | `~/.zsh_history` mtime **15:17** — no shell command at 15:35. |
+| **A re-run of a stray `*.test.ts` through an extension reload** (`#2841`: the farm carries 10 test suites pi would EXECUTE) | Two independent refutations. (1) The word `reload` appears **0 times** in all five victim logs — no `ctx.reload()` happened, so nothing was re-imported at 15:35. (2) The farm's test files contain no signal primitives at all: `process.kill` / `SIGTERM` / `SIGKILL` appear **zero** times across all ten. |
 
 ### What the logs physically cannot answer
 
