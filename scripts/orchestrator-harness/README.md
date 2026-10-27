@@ -520,6 +520,7 @@ git command fail on a lock the rescue took), and it calls a backup
 PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
 never handed to the chain is unreviewed code by default.
 
+
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
 (`install.sh:533-541`) and `$O/gh-limit.py` (`:550-558`); everything else is the operator's `cp`, §4 step 1.
 Its `DRIFTED` warning iterates an explicit `for f in …` list of twenty-two `*.sh` plus `gh-rest/gh`
@@ -1473,10 +1474,11 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
 This harness passes **attacker-controlled text** to language-model agents with shell access. Be
 clear about what is and is not enforced:
 
-- **Not sandboxed.** The spawned reviewer and fixer run with `AGENT_SKIP_REVIEW_GATE=1`,
-  `ELDATO_SKIP_VGATE=1`, `AGENT_ALLOW_MAIN_EDITS=1`, `SKILL_ENFORCER_DISABLED=1` and
-  `LOOP_ENFORCER_DISABLED=1`, with `bash` and `gh` on `PATH`. "Do NOT merge" and "do not touch the
-  main checkout" are **prompt instructions, not controls**.
+- **Not sandboxed.** The spawned reviewer and fixer run with `AGENT_ALLOW_MAIN_EDITS=1`,
+  `SKILL_ENFORCER_DISABLED=1` and `LOOP_ENFORCER_DISABLED=1`, with `bash` and `gh` on `PATH`.
+  Whether `AGENT_SKIP_REVIEW_GATE`/`ELDATO_SKIP_VGATE` are also set is DECIDED AT STARTUP by
+  `gate-policy.sh` (§5.4) and recorded in `logs/gate-policy.jsonl` — never assumed. "Do NOT merge"
+  and "do not touch the main checkout" are **prompt instructions, not controls**.
 - **Prompt injection is possible.** `fix-one.sh` reads the PR's comments into the fixer prompt as
   the authoritative review, and `merge-one.sh` feeds the reviewer the PR title, body and diff. A
   malicious PR body can therefore attempt to steer an agent that has shell access.
@@ -1496,6 +1498,75 @@ clear about what is and is not enforced:
   merge-scoped token during review, and treating PR content as delimited data rather than
   instructions. Until then, run this on a box whose GitHub token you would accept being used by an
   agent that has read a hostile PR body.
+
+### 5.4 The gate decision is MEASURED: `gate-policy.sh` (agent-infra#2319)
+
+Five carriers (`orch-loop.sh`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`)
+used to `export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` unconditionally. The canon calls both
+flags emergency-only (`skills/commit-workflow/SKILL.md:102,:111`) and a lane collected without review
+is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:150`), so a permanent export was
+a **defect**, and dangerous in one direction only: the permissive side was the machine that lands the
+most work.
+
+It could not be deleted in one line, because a lane **cannot** satisfy the review gate by itself —
+`lane.sh` says so to the lane's face: it has no `task` tool, so the parent/harness must obtain the
+head-bound review. So the decision moved into ONE probe:
+
+| probe | asked | today |
+|---|---|---|
+| review | is there a recorder for the head-bound record **and** a seam a non-interactive lane can call to obtain it? | **satisfiable.** `record-review.sh` yes, `review-pr.sh` (#2288, landed 9b80ee4c) yes — `--probe` on this checkout prints `review_satisfiable=1` (pinned by `gate-policy.test.sh` "live-tree") |
+| VGATE | can a non-interactive session record verification where the gate reads it? | **not satisfiable.** no `record` verb, no lane-satisfiable acceptance (#2313) — so the bypass below is still ACTIVE, on the VGATE half alone |
+
+- **Both satisfiable** → nothing is exported, and any INHERITED skip flag is removed from the carrier's
+  environment (a daemon captures its environment once; that is how a stale hatch outlives its reason).
+- **Either missing** → the two flags ARE exported, and **one** audit line naming #2319, the carrier and
+  the missing component is appended to `logs/gate-policy.jsonl`.
+
+⛔ **The `today` column above is MEASURED, not remembered (review round 6).** It once said `review-pr.sh`
+was missing while the file had already been in this tree for weeks — so a reader diagnosing "why is the
+bypass still on" was pointed at a component that had shipped. `gate-policy.test.sh`'s "live-tree" arm now
+probes THIS checkout and asserts the pair the table states, so the table cannot drift again: **when either
+half flips, that arm goes RED until the doc changes with it.** The bypass today is carried by the VGATE
+half alone — that is the sequencing #2319 asks for, and the reason nothing fleet-stopping follows from the
+review half being satisfied.
+
+⛔ There is no third state: `gate-policy.test.sh` fails if any live carrier exports either flag
+outside the policy, so a silent reintroduction is RED. When the satisfier merges, the probe flips and
+the bypass ends — **no second change and no forgotten flip**. This is the sequencing #2319 asks for:
+the removals are wired, but they take effect when the gate path can satisfy them, because deleting
+them first stops every lane at its first push.
+
+### 5.5 The pin's cleanliness is ONE predicate: `pin_dirty` (agent-infra#2271 review)
+
+Four readers ask "is the pinned harness dir the bytes the commit carries": the runtime resolver
+(`scripts/harness-exec.sh`), the cell supervisor's DRIFT check, its provenance stamp, and the
+installer's. For one review round three of them asked a **weaker** question than the resolver did, so
+`check` reported a pin CLEAN that `harness-exec.sh` refused — and `apply` then took
+`HARNESS_APPLIED=unchanged` over the very tree the controller would not start. An instrument that
+certifies the state it exists to catch is worse than no instrument.
+
+`pin_dirty` in `scripts/lib/box.sh` is the single answer: `0` clean, `1` dirty (entries printed), `2`
+**cannot verify** (`git status` itself failed — never a pass). It reads
+`git status --porcelain --ignored=matching`, because a **gitignored** file cannot be committed and is
+therefore never part of the pin — and `tmp/`, `dist/` and `*.log` are all ignored here, so a local
+hotfix sat inside the pin and `--entry tmp/x.sh` passed every check. It also **tolerates** the
+`.DS_Store` / `._*` REGULAR droppings, reusing the ruling the pin-root guard already made: one Finder
+visit must not brick a cell, and bash cannot execute a `.DS_Store`. Two conditions keep that tolerance
+honest, and both were review findings: entries are resolved against the repository **toplevel**
+(porcelain prints top-relative paths even when the caller passes the harness subdir — the production
+convention — so resolving against `$repo` made the tolerance unreachable exactly where it is needed),
+and only **untracked/ignored** entries are tolerated (a tracked file named `._x` is part of the pin, so
+a modification to it must read DIRTY: the name is not the property).
+
+The supervisor and the installer are deployed standalone and cannot source a sibling library, so they
+carry the body as a **pinned mirror** — compared byte-for-byte, comments excluded, by
+`cloud-cell-supervisor.test.sh` §(p3), which then RUNS the mirror against a clean pin, a gitignored
+hotfix and a `.DS_Store`. **Known residual (P2):** the probe's bars are *shape* checks (executable,
+non-empty, parseable, with a real `record)` dispatch arm), so a satisfier that exists but does nothing
+satisfies them. A capability sentinel (`review-pr.sh --capability`) belongs to #2288/#2313 — the
+scripts that do not exist yet — and inventing its interface here would make the flip unreachable
+rather than safer. Until then the failure direction is **loud**: enforced gates with a broken
+satisfier stop lanes visibly, where a bypass lands unreviewed code silently.
 
 ---
 
@@ -4441,6 +4512,48 @@ now requires (a) an ORCHESTRATOR unit name, (b) ACTIVE state, and (c) never trea
 disk as evidence that one is loaded (the macOS arm already refused that inference). A cell whose
 supervisor is the process (tmux + process table, which is how `cloud-cell-supervisor.sh` works) is
 reported as `supervisor process`, with the evidence named.
+
+#### The five primitives that differ — `scripts/lib/box.sh` (agent-infra#2271)
+
+Each of these had already been discovered separately, in a different script, AFTER it failed there:
+
+| primitive | BSD (macOS) | GNU (Linux) | why the wrong spelling is dangerous |
+|---|---|---|---|
+| in-place edit | `sed -i '' -e …` | `sed -i'' -e …` | `sed -i 's/a/b/' f` on BSD treats the SCRIPT as the backup suffix: it edits **nothing** and exits **0** |
+| epoch → date | `date -r <epoch>` | `date -d @<epoch>` | the wrong flag is a usage error, so a "timestamp" is silently empty |
+| CPU count | `sysctl -n hw.ncpu` | `nproc` / `getconf _NPROCESSORS_ONLN` | resolved at SOURCE time, so a wrong PATH pinned `_NCPU=4`/`MAX_LOAD=40` for every cell (#1702) |
+| mtime | `stat -f %m` | `stat -c %Y` | `stat -c` on macOS means filesystem status and prints the WRONG NUMBER |
+| supervisor | launchd | systemd unit or a supervisor process | already in the table above |
+
+**One shim, probed, never assumed from `uname`:** every primitive tries its mechanisms in order and
+records which one answered (`box_provenance`), so a Homebrew GNU-userland on macOS or a BSD-flavoured
+container still gets the right answer. `bash scripts/lib/box.sh --selftest` prints the provenance and
+reproduces the BSD `sed -i` hazard as a live assertion; `scripts/lib/box.test.sh` runs on both
+platforms.
+
+#### `scripts/harness-exec.sh` — the RUNTIME half of "the Mac runs from the pin"
+
+`install.sh` refuses to render a plist whose program is not inside the pin (#2271, install time).
+`harness-exec.sh` is the same refusal on every START, for both platforms: it resolves the two pin
+records (`HARNESS-PIN` = commit, `HARNESS_PIN_FILE` = the harness directory the controller execs),
+requires the recorded directory to BE a clean checkout at that commit inside `<pin root>/<sha12>`,
+requires the entrypoint to exist **and to resolve inside the tree**, and `exec`s it. **There is no
+fallback** — not `$O`, not `~/orchestrator`, not `origin/main` — because running an unpinned copy
+INSTEAD of the pin is exactly how three fixes existed only in a home-directory copy for weeks
+(#2231). Every refusal is a named `rc=78` and is asserted by name in `scripts/harness-exec.test.sh`:
+not-a-checkout, the two records DISAGREE, EMPTY, not a commit id, not a directory (pruned), the pin
+layout (`<root>/<sha12>`, proven from the records when `HARNESS_PIN_DIR` is unset), UNCOMMITTED
+CHANGES in the pinned harness dir, an entrypoint that walks out with `..` or through a symlink, and an
+entrypoint the pin does not carry.
+
+⛔ **IT IS NOT THE START PATH YET, AND THIS FILE WILL NOT PRETEND OTHERWISE.** Nothing renders or
+execs it today (`rg -ln harness-exec` finds only this shim, its suite and the shard list), so the Mac's
+launchd job still execs `~/orchestrator/launchd-controller.sh` — the home-dir copy #2231 names as its
+worst row. The two changes that put this shim on the start path are **#2271** (install resolves the
+pin and parses `ProgramArguments` back out of the rendered plist) and **#2020** (the TCC wrapper's
+content lifted into a commit). Until both land, the shim is inert: on this Mac it REFUSES (there is no
+pin — measured 2026-10-22), and `harness-exec.test.sh` arm 10 asserts exactly that rather than
+pretending the box is fixed.
 
 ### Which instrument answers which question (all three, and they DISAGREE by design)
 
