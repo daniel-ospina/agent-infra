@@ -2639,7 +2639,8 @@ rb_clear
 export STUB_BODY="$(rb_marker 424928 "review recorded: reviews/424928.json verdict=clean-low @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
 run_recover 424928 "$RB_REPO"
 assert_eq "$RB_RC" "3" "11.14q a clean-low marker is refused (exit 3)"
-assert_contains "$(cat "$T/rb-err")" "CARRY, not a review" "11.14q …and names the remedy that IS available (re-record at the head)"
+assert_contains "$(cat "$T/rb-err")" "FRESH mint (not a carry" "11.14q …and names the remedy that IS available, correctly labelled (a fresh mint, not a carry)"
+assert_contains "$(cat "$T/rb-err")" "record-review.sh 424928" "11.14q …with the exact command to run"
 if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424928.json" ]; then bad "11.14q a clean-low record was minted without merge_base_sha"; else ok "11.14q …and nothing is written"; fi
 
 # (r) ONE VERB PER INVOCATION. `--recover-body --check-carry` would print a
@@ -2698,6 +2699,43 @@ for _combo in --print-diff-hash --print-tier; do
     if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424932.json" ]; then bad "11.14u $_combo: the combined form wrote a record"; else ok "11.14u $_combo …and nothing is written"; fi
 done
 unset STUB_BODY RB_OUT RB_RC RB_RACE RB_RACE_JSON _combo
+
+# (v) THE OTHER HALF OF THE WRITE-TIME RE-CHECK: a FOREIGN identical-slug record
+#     landing during the recovery. `rb_existing_record` answers only for THIS repo,
+#     so without the second arm the `mv` would destroy another repo's verdict —
+#     the same class as 11.14t, which is why it is checked at the write too.
+rb_clear
+RB_FOREIGN_JSON='{"pr":424933,"head_sha":"dddddddddddddddddddddddddddddddddddddddd","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-12-01T00:00:00Z"}'
+export STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+export STUB_RACE_PATH="$RB_RDIR/daniel-ospina-agent-infra-424933.json" STUB_RACE_RECORD="$RB_FOREIGN_JSON"
+run_recover 424933 "$RB_REPO"
+unset STUB_RACE_PATH STUB_RACE_RECORD
+export STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+assert_eq "$RB_RC" "5" "11.14v a FOREIGN record appearing mid-recovery is not destroyed (exit 5)"
+assert_eq "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424933.json" 2>/dev/null)" "$RB_FOREIGN_JSON" "11.14v …the other repo's verdict survives byte-identical"
+
+# (w) A CORRUPT RECORD IS NOT "NOTHING TO REPAIR". A truncated file parses to no
+#     `repo`, which the ownership test reads as unowned — so the plain refusal
+#     would assert there is nothing to fix about a file the GATE calls corrupt.
+rb_clear
+printf '%s' '{"pr":424934,"head_sha":"abc' > "$RB_RDIR/daniel-ospina-agent-infra-424934.json"
+export STUB_BODY="$(rb_marker 424934 "review recorded: reviews/424934.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424934 "$RB_REPO"
+assert_eq "$RB_RC" "5" "11.14w a corrupt record is refused (exit 5)"
+assert_contains "$(cat "$T/rb-err")" "NOT a usable record" "11.14w …and it is named as unusable, not as 'nothing to repair'"
+assert_contains "$(cat "$T/rb-err")" "Move it aside" "11.14w …with a way out"
+
+# (x) NO SILENT POSITIONAL DROP. `--recover-body 42 o/r clean-low <sha>` used to
+#     take $2 as the repo and DISCARD the verdict and head, minting the marker's
+#     verdict with exit 0 while the caller believed it had chosen one.
+rb_clear
+export STUB_BODY="$(rb_marker 424935 "review recorded: reviews/424935.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+RB_RC=0
+RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    bash "$RECORD" --recover-body 424935 "$RB_REPO" clean-low "$RB_HEAD" 2>"$T/rb-err")" || RB_RC=$?
+assert_eq "$RB_RC" "2" "11.14x extra positionals with --recover-body are refused (exit 2)"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424935.json" ]; then bad "11.14x the positional form minted a record"; else ok "11.14x …and nothing is written"; fi
+unset STUB_BODY RB_OUT RB_RC RB_FOREIGN_JSON
 
 
 # ─────────────────────────────────────────────────────────────────────────

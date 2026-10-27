@@ -78,7 +78,10 @@
 #   ⛔ A `clean-low` MARKER IS REFUSED (exit 3): that tier certifies the merge
 #   BASE, `merge_base_sha` is not in the marker, and a recovered clean-low would
 #   make the rail skip its base guard while the gate blocks the same record.
-#   Re-record at the current head instead — a CARRY, not a review.
+#   Mint it again at the current head instead — a FRESH mint, not a carry (there
+#   is no prior record to carry from, and the clean-low content-shape guard still
+#   has to pass). Calling it a "carry" would name a `mint` state that will not
+#   appear in the record.
 #   It does NOT review and does NOT authorize a merge: the normal carry arms
 #   still decide whether the recovered digest covers what would merge.
 #     exit 0  minted (stdout: `recovered\t<head>\t<digest|->`)
@@ -1044,6 +1047,15 @@ if [ "${#POSITIONAL[@]}" -gt 4 ]; then
   echo "record-review.sh: too many arguments (${#POSITIONAL[@]}) — usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--evidence <review-artifact>] [--force-stale]" >&2
   exit 2
 fi
+# ⛔ THE ONE-VERB RULE COVERS POSITIONALS TOO (round 2, P2). `--recover-body 42 o/r
+# clean-low <sha>` passed the bound above, took REPO from $2, and silently DROPPED
+# the requested verdict and head — minting the MARKER's verdict with exit 0. The
+# read-only modes can ignore extra positionals harmlessly (they mint nothing); a
+# MINTING mode must not.
+if [ "$RECOVER_BODY" -eq 1 ] && [ "${#POSITIONAL[@]}" -gt 2 ]; then
+  echo "record-review.sh: --recover-body takes <pr> [owner/repo] and nothing else (got ${#POSITIONAL[@]} positional arguments) — a head/verdict here would be silently IGNORED, and this verb would mint the marker's verdict while you believed you had chosen one. Recover, then record a fresh verdict as a separate command if one is owed." >&2
+  exit 2
+fi
 if [ "${#POSITIONAL[@]}" -gt 0 ]; then
   set -- "${POSITIONAL[@]}"
 else
@@ -1931,14 +1943,31 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     [ -f "$RB_LEGACY" ] && rb_names_this_repo "$RB_LEGACY" && return 0
     return 1
   }
-  if [ -f "$RB_FILE" ] && ! rb_names_this_repo "$RB_FILE"; then
-    # ⛔ ANOTHER REPO'S VERDICT IS NOT OURS TO DESTROY, AND THE ADVICE MUST NOT
-    # LOOP. The gate reads this file as ABSENT (its embedded `repo` differs), so
-    # the rail says NO-RECORD — but overwriting it would erase a verdict another
-    # repo may hold nowhere else, so this refuses like every other absence-fill
-    # and names a way out that does not come back here.
-    echo "record-review.sh --recover-body: ${RB_FILE/#$HOME/~} already exists but embeds repo $(command sed -n 's/.*\"repo\":\"\([^\"]*\)\".*/\1/p' "$RB_FILE" 2>/dev/null | command head -1) — the identical-slug overwrite state, which the merge gate reads as ABSENT. Refusing to overwrite another repo's verdict. Move that file aside (it lives outside any checkout: mv it, or let its owning repo's registry-sync restore it) and re-run this command; nothing was written." >&2
+  # ⛔ "NOTHING TO REPAIR" IS A CLAIM ABOUT A PARSEABLE RECORD (round 2, P2). A
+  # TRUNCATED/corrupt file parses to no `repo` string, which rb_names_this_repo
+  # reads as "unowned" — so the refusal below would assert there is nothing to
+  # repair about a file the GATE calls `corrupt`/NO-RECORD (and whose own message
+  # now points here). That is the round-1 loop shape in a different state.
+  rb_record_usable() { # <file> -> 0 when it carries the fields a record is read by
+    grep -q '"head_sha":"' "$1" 2>/dev/null && grep -q '"verdict":"' "$1" 2>/dev/null
+  }
+  rb_foreign_repo_of() { # <file> -> the embedded repo, or empty
+    command sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | command head -1
+  }
+  rb_refuse_foreign() { # <file> — exit 5, naming the file and a NON-LOOPING remedy
+    echo "record-review.sh --recover-body: ${1/#$HOME/~} already exists but embeds repo $(rb_foreign_repo_of "$1") — the identical-slug overwrite state, which the merge gate reads as ABSENT. Refusing to overwrite another repo's verdict. Move that file aside (it lives outside any checkout: mv it, or let its owning repo's registry-sync restore it) and re-run this command; nothing was written." >&2
     exit 5
+  }
+  rb_refuse_unusable() { # <file> — exit 5, naming it as not-a-record and a way out
+    echo "record-review.sh --recover-body: ${1/#$HOME/~} exists but is NOT a usable record — it carries no readable head_sha/verdict (a truncated or hand-edited file), so the merge gate treats it as ABSENT and 'there is nothing to repair here' would be false. Move it aside and re-run this command; nothing was written." >&2
+    exit 5
+  }
+  if [ -f "$RB_FILE" ]; then
+    if ! rb_names_this_repo "$RB_FILE"; then rb_refuse_foreign "$RB_FILE"; fi
+    if ! rb_record_usable "$RB_FILE"; then rb_refuse_unusable "$RB_FILE"; fi
+  fi
+  if [ -f "$RB_LEGACY" ] && rb_names_this_repo "$RB_LEGACY" && ! rb_record_usable "$RB_LEGACY"; then
+    rb_refuse_unusable "$RB_LEGACY"
   fi
   if rb_existing_record; then
     echo "record-review.sh --recover-body: a record for $REPO#$PR already exists ($( [ -f "$RB_FILE" ] && echo "${RB_FILE/#$HOME/~}" || echo "${RB_LEGACY/#$HOME/~}" )) — recovery fills an ABSENCE and will not replace it. There is nothing to repair here; land it, or if the diff has moved since, ask what the gate thinks: record-review.sh --check-carry $PR $REPO" >&2
@@ -2012,10 +2041,12 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   # (atomic-land.sh — the #1348 hazard: `gh pr edit --base` after the review
   # moves what merges while the head sha still matches), while the
   # review-enforcer gate hard-blocks the same record with `base_unverifiable`.
-  # One record, two verdicts. Refuse, and name the remedy that IS available: a
-  # re-record at the current head is a CARRY, not a review.
+  # One record, two verdicts. Refuse, and name the remedy that IS available: mint
+  # it again at the current head — a FRESH mint, NOT a carry (this script's
+  # `carry` is a specific mint state, with `carried_from`/`carried_at` and an
+  # inherited reviewed_at, and there is no prior record here to carry from).
   if [ "$RB_VERDICT" = "clean-low" ]; then
-    echo "record-review.sh --recover-body: $REPO#$PR's marker is a \`clean-low\` attestation, which certifies the MERGE BASE of the diff — and the signed marker does not carry \`merge_base_sha\`. A recovered clean-low would be a record of a shape that tier never has: the rail would skip its base-repointing guard while the gate refuses the same record as \`base_unverifiable\`. Nothing written. Re-record it at the current head instead — that is a CARRY, not a review: record-review.sh $PR <current head> clean-low $REPO" >&2
+    echo "record-review.sh --recover-body: $REPO#$PR's marker is a \`clean-low\` attestation, which certifies the MERGE BASE of the diff — and the signed marker does not carry \`merge_base_sha\`. A recovered clean-low would be a record of a shape that tier never has: the rail would skip its base-repointing guard while the gate refuses the same record as \`base_unverifiable\`. Nothing written. Mint it again at the current head instead — a FRESH mint (not a carry: nothing is stale), and the clean-low content-shape guard still has to pass: record-review.sh $PR <current head> clean-low $REPO" >&2
     exit 3
   fi
   RB_DIFF=""
@@ -2040,12 +2071,19 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   esac
   mkdir -p "$HOME/.pi/agent/reviews"
   RB_TMP="$RB_FILE.tmp.$$"
-  # ⛔ RE-CHECK IMMEDIATELY BEFORE THE WRITE (review, #2872 P1). The absence test
-  # above runs BEFORE two network round trips (the PR body and the head commit),
-  # so a concurrent recorder can mint a fresh record inside that window; the `mv`
-  # would then replace a NEWER verdict with an older recovered one — exactly the
-  # "walk the gate backwards" failure the check exists to prevent. The window can
-  # be narrowed to nothing only by testing here, at the write.
+  # ⛔ RE-CHECK IMMEDIATELY BEFORE THE WRITE (review, #2872 P1), AND RE-CHECK THE
+  # WHOLE RULE, NOT HALF OF IT (round 2, P2). `rb_existing_record` answers only
+  # for THIS repo, so a FOREIGN identical-slug record landing in the same window
+  # would still be destroyed by the `mv` below. Both arms are tested here, at the
+  # write, where no further network read follows.
+  if [ -f "$RB_FILE" ]; then
+    if ! rb_names_this_repo "$RB_FILE"; then
+      echo "record-review.sh --recover-body: a FOREIGN-repo record for $REPO#$PR appeared WHILE this recovery was reading the PR — refusing to destroy another repo's verdict. Nothing was written." >&2
+      exit 5
+    fi
+    echo "record-review.sh --recover-body: a record for $REPO#$PR appeared WHILE this recovery was reading the PR (a concurrent recorder?) — refusing to replace it with an older verdict. Nothing was written; re-run --check-carry to see which verdict now stands." >&2
+    exit 5
+  fi
   if rb_existing_record; then
     echo "record-review.sh --recover-body: a record for $REPO#$PR appeared WHILE this recovery was reading the PR (a concurrent recorder?) — refusing to replace it with an older verdict. Nothing was written; re-run --check-carry to see which verdict now stands." >&2
     exit 5
