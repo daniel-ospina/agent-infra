@@ -140,7 +140,7 @@ codes do not: 80 before 73.
 The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. **Only
 `MAX_LOAD` (75) clears because the box quietens on its own.** The rest clear when their **resource is released** or their
 **input changes** — a lane finishes or drains (73), disk is reclaimed or a lane finishes (77), the brief is re-authored (80),
-the install is repaired (78), the repo's open-PR queue actually lands (74) — and some may never clear at all: the gate emits
+the install is repaired (78), the repo's open-PR queue actually lands (74) — and **none of them clears by waiting**: the gate emits
 "does NOT clear by waiting" on fork and "This is NOT a load refusal: waiting does not clear it" on headroom. So diagnosing a
 73, 77, 74, 78 or 80 as "the box is busy" and idling is the trap — **and 74 is repo-wide**, so re-dispatching it to another
 box refuses there too.
@@ -206,7 +206,8 @@ Recovery ladder, cheapest first:
 5. Then, inside: kill stale lanes, `git gc --prune=now` on the clones, clear caches, re-run the update.
    ⚠️ **`/` is not the only volume that fills.** On a cell also read `df -Pm` for the `cmux-tui` state volume (a loop mount at
    `~/.local/state/cmux-tui`, from `cmux-tui-state.ext4`): it fills independently of `/`, and it holds the terminal state the
-   ladder above depends on — measured 927 of 974 MB (97 %) on cell-3 while `/` was 61 % full, the consumer being a
+   ladder above depends on — `df` reported **97 % capacity, 927 MB of 974 MB used, 31 MiB free** on cell-3 (measured 2026-10-27,
+   while `/` was at 61 %), the consumer being a
    `workspace-registry.sqlite3` of ~900 MB in that volume's `sessions/`. None of the reclaim steps above touch it, so if it is
    the volume at 100 %, this is an **owner-level** action (grow or reset that state volume) — and check whether the
    terminal channel still answers `vm terminal read` before you rely on steps 1-2.
@@ -324,7 +325,7 @@ dispatch time, because both move.
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, but **needs activation (§1)** before it can land |
-| `pi-cell-3` | product work | 8 GB RAM — the real constraint (its `dmesg` shows 2 OOM kills); disk well short of full by the guest's own `df` |
+| `pi-cell-3` | product work | 8 GB RAM / 128 GB — the real constraint is memory (its `dmesg` has OOM kills in it); re-read both at dispatch |
 | `pi-cell-4` | product + CI-cost work | 16 GB, 8 vCPU; the current default dispatch target |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
