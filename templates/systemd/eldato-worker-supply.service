@@ -1,0 +1,77 @@
+[Unit]
+# eldato worker-supply — KEEP THE REPAIR WORKER POOL SUPPLIED (agent-infra#2700's missing half).
+#
+# ⛔ WHY THIS UNIT EXISTS, AND WHY IT IS NOT `eldato-pr-repair`. `eldato-pr-repair` runs the doctor,
+# which CLASSIFIES the open-PR queue and places at most one pass worth of orders; it is a producer, and
+# it is bounded by its own cadence and by whatever the pass could place that minute. Measured
+# 2026-10-27T03:30Z-03:45Z on the operator's Mac: three consecutive passes printed
+# `REFUSING: 16 order(s) no worker accepted and nothing was dispatched` with
+# `capacity fix=16 review=12, inflight=0 (alive=0 unknown=0)` — capacity configured, orders graded,
+# workers zero — and nothing in the fleet refilled the pool, because dispatch was the ONLY thing that
+# had ever created a repair worker. A worker that dies MID-ORDER (a machine sleep, a cap kill, an OOM)
+# leaves its order recorded in `$O/bg/<name>.started` with no process behind it, and that order then
+# waits for the doctor's own cooldown and a later pass that can still place work.
+#
+# ⛔ IT IS NOT A SECOND DISPATCHER AND NOT A MERGE AUTHORITY. The supervisor spawns `pi` never: it
+# re-offers the DEAD order through the ONE dispatcher (`$O/nonblocking-dispatch.sh`) with the argv that
+# dispatcher itself recorded, so the load/disk/brief gates are the same gates. It never calls `gh`,
+# never calls `admin-merge.sh`, never records a review — it supplies workers, it never lands a PR.
+#
+# ⛔ THE BOUNDS ARE IN THE UNIT, NOT INHERITED. A systemd unit gets no rc files, so an unset variable
+# silently keeps the script's default — and for this job the defaults ARE the contract. They are
+# written out so an operator reads them here:
+#   WORKER_SUPPLY_INTERVAL_S=60     the refill interval. The pass is a handful of `--status` probes
+#                                   over `$O/bg/*.started`, so 60 s is a liveness choice, not a load one.
+#   WORKER_SUPPLY_PREFIX=prd-       the worker NAMESPACE this unit supplies (pr-doctor's repair pool).
+#   WORKER_SUPPLY_MAX_REFILLS=2     re-offers per ORDER. A worker that keeps dying is a DIAGNOSIS; after
+#                                   two refills the pass DEFERS and names it instead of spinning.
+# ⛔ `MAX_FIX` / `MAX_REVIEW` ARE DELIBERATELY NOT SET HERE. They are the machine's budget and they have
+# ONE home: the orchestrator's EnvironmentVariables (the launchd plist `pr-doctor.capacity()` reads, or
+# a cell's `keys.env`). Rendering them into this unit would be a second copy that drifts — the
+# supervisor reads the same source the dispatcher does, and its `status` verb prints what it read.
+Description=eldato worker-supply — refill the dead repair workers of the open-PR queue
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/scripts/orchestrator-harness/README.md
+After=network-online.target
+# ⛔ NAMED EXPLICITLY, because systemd's default start limit (5 in 10 s) CANNOT FIRE with RestartSec=15.
+# A box that cannot start this supervisor for a CONFIGURATION reason would otherwise restart it every
+# 15 s for ever with the failure living only in a journal. 3 failures in 5 minutes is a configuration
+# fault, not a transient, and it must converge to `failed` — the state an operator can act on.
+# ⛔ AND THEY BELONG IN [Unit], NOT [Service] — `StartLimitIntervalSec` is a [Unit] directive
+# (systemd.service(5) lists only `StartLimitBurst` in [Service], as its legacy spelling). In
+# [Service] systemd answers `Unknown key name 'StartLimitIntervalSec' in section 'Service',
+# ignoring.` (measured with `systemd-analyze verify`), so the window falls back to
+# `DefaultStartLimitIntervalSec` (10 s while this file sets RestartSec=15): the burst can never be
+# reached, the unit restarts for ever, and `is-active` reads `activating`/`active` between restarts
+# so both the installer's read-back and any monitor call it healthy — the exact state the comment
+# above says must converge to `failed`. The sibling units put these two here for the same reason
+# (`eldato-pr-repair.service`, `eldato-orchestrator.service`); `worker-supply.test.sh` case (g)
+# asserts the SECTION, so a whole-file grep cannot pass a unit that has them in the wrong one.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+Environment=WORKER_SUPPLY_INTERVAL_S={{INTERVAL_S}}
+Environment=WORKER_SUPPLY_PREFIX={{PREFIX}}
+Environment=WORKER_SUPPLY_MAX_REFILLS={{MAX_REFILLS}}
+ExecStart=/bin/bash {{SCRIPT}} --loop
+# ⛔ `always`, NOT `on-failure`. The measured failure shape is an ORDERLY exit (a deploy replaces it, an
+# operator stops it) with nothing coming back; `on-failure` reproduces that defect byte for byte.
+Restart=always
+RestartSec=15
+# ⛔ `process`, NOT the default `control-group`. The supervisor re-offers orders through
+# `nonblocking-dispatch.sh`, which BACKGROUNDS a worker and returns at once — under a cgroup teardown
+# the end of a pass SIGTERMs the worker it just started. That is the measured #2716 defect (two workers
+# "launched, running", 0-byte logs, `is-active=active`). `process` signals this unit's main process and
+# nothing else. `worker-supply.test.sh` pins this property for every shipped unit whose ExecStart
+# reaches the dispatcher.
+KillMode=process
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1505,10 +1505,50 @@ STAMPEOF
 # ⛔ A caller MUST NOT read 2 as clean — cannot-verify is never a pass in this file, and the likeliest
 # trigger is the full disk this change exists for (git status refreshing the index fails, rev-parse
 # still succeeds).
+#
+# ⛔ THE PREDICATE IS `pin_dirty` BELOW, A PINNED MIRROR of `pin_dirty` in scripts/lib/box.sh (this file is
+# deployed STANDALONE, so it cannot source a sibling library — the same constraint the pid-identity mirror
+# at `_proc_start_epoch` documents). It is not re-typed by hand: the body is copied byte-for-byte and a
+# drift arm (cloud-cell-supervisor.test.sh §(p3)) reddens CI if the two ever diverge. Round 4 found the
+# divergence this prevents: the resolver refused a pin on an IGNORED file while THIS function read the
+# weaker `--porcelain`, so `check` reported the pin CLEAN and `apply` took HARNESS_APPLIED=unchanged over
+# a tree the controller would not start — an instrument that certified the state it existed to catch.
 harness_dirty() {
-  local out
-  out="$(git -C "$HARNESS" status --porcelain -- . 2>/dev/null)" || return 2
-  [ -n "$out" ]
+  local out rc
+  out="$(pin_dirty "$HARNESS" .)"; rc=$?
+  [ "$rc" -eq 2 ] && return 2
+  [ "$rc" -eq 1 ] && return 0
+  return 1
+}
+
+pin_dirty() {
+  local repo="$1" scoped="$2" top out line path keep=""
+  # ⛔ THE TOPLEVEL, because porcelain prints paths relative to the REPOSITORY ROOT even when `repo` is a
+  # subdirectory — and two of the three callers pass the harness SUBDIR (the production convention). A
+  # first version resolved entries against `$repo`, so its tolerance was unreachable there and a
+  # `.DS_Store` read DIRTY to the instruments while the runtime read CLEAN: the round-4 divergence again,
+  # with the fail direction inverted (found by review, round 5).
+  top="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 2
+  out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
+    # ⛔ TOLERATE ONLY **UNTRACKED/IGNORED** DROPPINGS. A TRACKED file named `._x` is part of the pin, so a
+    # MODIFICATION to it must read DIRTY — the name is not the property (found by review, round 5: a
+    # rewritten tracked `._x` read CLEAN). `!!` = ignored, `??` = untracked.
+    case "$line" in
+      '!!'*|'??'*) case "${path##*/}" in
+        .DS_Store|._*) [ -f "$top/$path" ] && [ ! -L "$top/$path" ] && continue ;;
+      esac ;;
+    esac
+    keep="$keep$line
+"
+  done <<<"$out"
+  [ -n "$keep" ] || return 0
+  printf '%s' "$keep"
+  return 1
 }
 
 # Is <path> a LINKED worktree of <repo> — i.e. may this script `rm -rf` it? The MAIN working tree is
@@ -2156,7 +2196,14 @@ cmd_check() {
   # repo-target.sh (#2724/#2694) is SOURCED by lane.sh, dispatch-merge.sh, fix-one.sh and adopt-fix.sh;
   # all four `exit 78` without it, so its absence would make every dispatch refuse at startup while
   # `check` still certified the cell — the same false PASS one layer down.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
+  # gate-policy.sh (#2319) is SOURCED by every pi-spawning carrier on this box, which `exit 78`s without
+  # it — the same class: a $O missing it is a cell whose every lane dies at startup while `check` says
+  # "CELL CAN RUN A CONTROLLER".
+  # ⛔ spawn-gate.sh is the SAME class and was MISSING (review round 5): lane.sh:29 and fix-one.sh:54 both
+  # `. "$SELF/spawn-gate.sh" || exit 78`, and dispatch-merge.sh runs `bash '$O/lane.sh'`, so `$SELF` is
+  # `$O` — a cell without it has its every lane die at startup while `check` printed the green banner.
+  # install.sh:812 already required it; this list did not.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
@@ -2318,6 +2365,42 @@ cmd_check() {
   say "      branches/worktrees (#4256), invisible across machines, so two OWN-pinned cells can still"
   say "      race the same PR."
   say "CELL CAN RUN A CONTROLLER"
+}
+
+# ── the scheduled layer (agent-infra#1864) ──────────────────────────────────────────────────────
+# A cell has no launchd, no crontab binary and no systemd user bus, so the repo's recurring jobs
+# (declared once, as templates/launchd/*.plist) run from a supervised loop: scripts/fleet-schedule.py.
+# `cloud-cell-bringup.sh --check` installs and proves it; THIS is where it is brought back up
+# whenever the cell is started again — `start` is the cell's own "the cell is now alive" signal, so
+# a loop that died while the controller kept running must not need a whole bring-up to recover.
+#
+# ⛔ IDEMPOTENT AND ON THE ALREADY-RUNNING PATH, both deliberately: the early return below is hit
+# by the common `start`-after-`stop`, and placing this after it is how the loop would stay dead.
+# ⛔ A MISSING SCRIPT IS A WARN, NOT A DIE: a cell whose layer predates this line must still be
+# startable (that cell's gap is what bring-up reports). A script that EXISTS and refuses to start
+# IS fatal — a cell running lanes with no reaping and no liveness detection is the defect.
+scheduler_ensure() {
+  local sched="$CELL_HOME/.pi/agent/scripts/fleet-schedule.py" out rc=0
+  if [ ! -f "$sched" ]; then
+    say "warn: no scheduled layer on this cell ($sched is absent) — no reap/liveness/canary job will run; re-run cloud-cell-bringup.sh --check"
+    return 0
+  fi
+  out="$(HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" python3 "$sched" --start 2>&1)" || rc=$?
+  # rc=3 is the scheduler's own "no job declarations found" (its documented contract): the layer's
+  # script is present but nothing tells it WHERE the declarations are, i.e. this cell was never
+  # installed by the current bring-up. That must NOT brick the controller — bring-up is the gate
+  # that installs and proves the layer — but it must never pass quietly either.
+  if [ "$rc" -eq 3 ]; then
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    say "warn: the scheduled layer has no job declarations on this cell — no reap/liveness/canary job will run; re-run cloud-cell-bringup.sh --check"
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    die "the scheduled layer would not start (rc=$rc) — this cell would run with no reaping, no liveness detection and no canary (#1864)"
+  fi
+  # One line, so `start` never becomes the place a scheduler is assumed rather than seen.
+  say "scheduled layer: $(printf '%s\n' "$out" | head -1)"
 }
 
 # Does the `cell-doctor` session belong to THIS state dir? Its command string embeds this cell's log
@@ -2512,6 +2595,13 @@ cmd_start() {
   # and it must refuse START (not merely be stripped) so the misconfiguration is surfaced rather than
   # silently absorbed. The session commands below strip it either way.
   assert_gh_repo_conformance
+  # BEFORE the already-running early return: see scheduler_ensure's header.
+  # ⛔ AND AFTER assert_queue_target, deliberately: --start CLEARS the OFF switch, so running this
+  # earlier meant a `start` that then REFUSED its queue target had already cleared an operator's
+  # deliberate --stop — un-stopping a schedule on a start that never started anything.
+  # ⛔ ALSO AFTER #2235'S GH_REPO REFUSAL, the same rule one refusal later: a start that refuses must
+  # not have cleared the OFF switch on its way to refusing.
+  scheduler_ensure
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.

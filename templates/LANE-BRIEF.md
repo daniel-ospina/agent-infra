@@ -90,7 +90,8 @@ it). Four of them are only producible while you work, so produce them as you go.
   `Refs #<ISSUE>` when something genuinely stays open). A mid-sentence `(fixes #N)` does NOT
   count, and an unintended closing keyword can auto-close an issue on merge.
 - **[b] the scoping comment, whose FIRST CONTENT LINE is the marker — `<!-- issue-scoping: … -->`
-  (the producer, `skills/issue-scoping`, writes `<!-- issue-scoping: v5.1 double diamond + verify -->`;
+  (the producer is `skills/issue-scoping` for the epic/project tiers, or `skills/task-workflow-standard`
+  for the task tier — the version varies (`v5.1 double diamond + verify`, `merged scope+plan`);
   only the `<!-- issue-scoping:` prefix is examined). Then the scoping content: boundaries,
   alternatives considered, the wiring table. POSITION is the contract — the check matches at column
   0, so ANY leading whitespace fails (at four columns it is also rendered as a CODE BLOCK, i.e. a
@@ -168,6 +169,18 @@ flag does either.
    ```
    scripts/admin-merge.sh <PR>
    ```
+
+   ⛔ **NOT INSIDE A BLOCKING TOOL CALL.** Your tool call is capped at 1800s while the rail's own
+   wait ceiling is 18064s, so a HEALTHY rail still waiting on CI gets SIGTERMed mid-wait and reports
+   NO verdict (agent-infra#2885: PR #2873 was cut off at 23:10:47Z and merged 4h45m later). Start it
+   detached and poll instead:
+
+   ```bash
+   bash scripts/rail-run.sh start  <PR> [rail args...]   # returns at once, prints the run id + log
+   bash scripts/rail-run.sh status <PR> [--repo owner/repo] --run <run-id>
+   ```
+   `status` exits 10 running · 0 landed · 20 refused · 21 killed · 22 gone-without-verdict — a run
+   that produced NO verdict is never reported as a landing. See `docs/ops/rail-run.md`.
 
    ⛔ **The ONE-COMMAND alternative to steps 1-3.** If you would otherwise assemble a reviewer prompt
    by hand, do not: `~/.pi/agent/scripts/review-pr.sh <PR>` spawns a genuinely fresh-context

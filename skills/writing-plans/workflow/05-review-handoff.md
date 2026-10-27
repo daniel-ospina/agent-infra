@@ -2,6 +2,8 @@
 
 ## Plan Review Gate (Standard and Complex Tiers) — Gate Loop — MANDATORY
 
+> **Exception — `task-workflow-standard` (agent-infra#2861).** For that pipeline this gate is **already satisfied when you arrive**: `task-workflow-standard`'s PLAN-VERIFY *is* the plan review, writes the `<!-- plan-review: cycles=…, status=…, version=… -->` signature, and dispatches `plan-review` again would be the second blocking pre-code round the redesign removed. Two skills saying MANDATORY about the same gate is how a lane pays twice — read this exception as part of the mandate, not as advice.
+
 After saving the plan doc, invoke the `plan-review` skill to validate plan quality:
 
 ```
@@ -15,6 +17,7 @@ reviewers have no memory of prior cycles, preventing confirmation bias.
 See `.pi/APPEND_SYSTEM.md` → Review Loop Protocol for the full protocol.
 
 - **If `status=clean`:** proceed to Execution Handoff
+- **If `status=threat-surface-covered`:** proceed, and record the `[ADVERSARIAL-BOUND] …` disclosure in the PR body (the declared-surface clean exit).
 - **If `status=capped` or `status=stalled`:** surface the remaining issues to the user. Do NOT proceed to Execution Handoff until the user either fixes the issues or explicitly approves the plan as-is.
 
 **FORBIDDEN — these bypass the quality gate entirely:**
@@ -33,21 +36,16 @@ See `.pi/APPEND_SYSTEM.md` → Review Loop Protocol for the full protocol.
 **Pre-check (Standard/Complex only):** Before proceeding, verify the plan doc contains a clean review signature:
 
 Search for `<!-- plan-review:` in the plan doc. If:
-- Signature is absent → stop. Run `plan-review` first.
+- Signature is absent → stop. Run `plan-review` first — **except in the `task-workflow-standard` pipeline, where PLAN-VERIFY writes this signature itself** (`task-workflow-standard` §3); dispatching `plan-review` there as well would be the second pre-code round the #2861 redesign removes.
 - `status=clean` → proceed.
+- `status=threat-surface-covered` → proceed, and record the `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=…` disclosure from the plan doc in the PR body (that is the declared-surface clean exit, `AGENTS.md` §Hard Cap).
 - `status=capped` or `status=stalled` → stop. Surface issues to user.
 
-**Research-evidence pre-check (Standard/Complex only, issue #231 D7):** before Execution Handoff, verify the plan's `### Pattern Research` block carries the `> **Findings date:** YYYY-MM-DD` stamp OR a documented skip justification (`> Gate skipped` / `> Bucket [name] skipped` / `> Research skipped: no demonstrated gap`). Absence of both = the fresh-query evidence gate did not run — stop and run Step B before handoff. (Executing-plans Step 1.5 keys dependency staleness to this stamp; an unstamped block is treated as unfamiliar at execution.)
+**Research-evidence pre-check (Standard/Complex only, issue #231 D7):** before Execution Handoff, verify the plan carries research evidence — **for the task pipeline that is the issue comment marked `<!-- research: v1 -->`** (its `> **Findings date:**` stamp is the datum; `### Pattern Research` is superseded there — see `task-workflow-standard` §1), and for the epic/project pipelines it is the plan's `### Pattern Research` block with the same stamp. Either way the stamp must be present, or a documented skip justification (`> Gate skipped` / `> Bucket [name] skipped` / `> Research skipped: no demonstrated gap`). Absence of both = the fresh-query evidence gate did not run — stop and run Step B before handoff. (Executing-plans Step 1.5 keys dependency staleness to this stamp; an unstamped block is treated as unfamiliar at execution.)
 
-After saving the plan, apply the `planned` label to the GitHub issue (if applicable):
+> **No workflow-state label changes (agent-infra#2861 §8.2).** `planning`, `scoping`, `implementing` **and `planned`** are deleted: all four have no reader anywhere in the fleet (16 write commands across 4 skills, zero reads), and their self-cleanup could strip a live peer lane's marker. The durable signals are `doc_status` on the plan doc and the issue's open/closed state.
 
-```bash
-# Remove planning, then apply planned (idempotent)
-gh issue edit <number> --remove-label planning || true
-gh issue view <number> --json labels --jq '.labels[].name' | grep -q '^planned$' || gh issue edit <number> --add-label planned
-```
-
-**Status transition:** Plan `doc_status`: draft → live (plan-review passed clean). Issue: scoped → planned.
+**Status transition:** Plan `doc_status`: draft → live (plan-review passed clean). The issue needs no label change — its own state and the plan doc's `doc_status` are the durable signals.
 
 Then select execution mode automatically:
 
@@ -75,12 +73,6 @@ Announce the selected mode with a one-line note: "Using [subagent-driven/paralle
 
 If the user prefers the other mode, switch without argument.
 
-## Label Cleanup
+## Label Cleanup — removed (agent-infra#2861 §8.2)
 
-If this skill exits early (error, user abort, or any non-completion path), remove the `planning` label:
-
-```bash
-gh issue edit <ISSUE_NUMBER> --remove-label planning || true
-```
-
-Do not leave `planning` on issues where work is not actively progressing.
+There is nothing to clean up: this skill no longer applies a `planning` label (it never had a reader), so an early exit leaves no orphaned marker.

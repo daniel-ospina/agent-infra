@@ -44,6 +44,7 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 # ⛔ EXPORTED for the same reason as lane.sh: the SPAWN POINT is a child process (#1884).
 KIND=reviewer; TAG="$PR"; export KIND TAG
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
@@ -54,7 +55,15 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
 if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
 if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
-export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
+# ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
+# ⛔ A REVIEWER STILL NEEDS THE GATES OFF? No: the reviewer is the thing that SATISFIES them. It
+# commits nothing and merges through `admin-merge.sh` (a shell rail that reads the head-bound record),
+# so it does not need — and must not silently inherit — a permanent bypass.
+. "$SELF/gate-policy.sh" 2>/dev/null || { echo "[merge $PR] FATAL: $SELF/gate-policy.sh missing — refusing to run a lander that cannot say whether its gates are on" >&2; exit 78; }
+apply_gate_policy merge-one
+# ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
+# checkout, not a review bypass, and #2319 does not rule on it.
+export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless reviewer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
@@ -584,7 +593,22 @@ rail_attempt() {
   # this one's.
   _rf_off="$(wc -c < "$L.log" 2>/dev/null | tr -d ' ')"
   is_num "${_rf_off:-}" || _rf_off=0
-  if ( cd "$REPO" && bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
+  # ── THE HOLD-PROOF AT THE ACTION SITE (agent-infra#2867) ──
+  # The claim registry fences dispatch, not action: the rail (`admin-merge.sh`) merges with
+  # `--admin`, and nothing at the merge site verified that the lane that reached it still holds
+  # the claim for this PR at this head. So a dead harness whose claim was pruned — or a stale
+  # actor whose token a peer superseded — would still run the merge. The claim commit this worker
+  # pushed (CROSS_OWN, the fencing token) and the harness's claims.sh travel into the rail's
+  # environment; the rail refuses the merge unless `claim_action_proof` holds. An EMPTY token is
+  # deliberate: a lane that reached the rail without a head claim cannot prove ownership, and the
+  # rail refuses it (the merge is the one operation that cannot tolerate at-least-once, #1908).
+  # ⛔ The token is the HEAD claim's commit, not the landing claim's: the head key is the one that
+  # binds evidence to the sha being merged (the landing `pr-<N>` key carries no head).
+  if ( cd "$REPO" && \
+       CLAIM_ACTION_HEAD_TOKEN="${CROSS_OWN:-}" \
+       CLAIM_ACTION_CLAIMS_SH="$O/claims.sh" \
+       CLAIM_ACTION_REPO="$REPO" \
+       bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
     echo "[merge $PR] MERGED via the rail (attempt $RC_N) $(date)" >> "$L.log"
     touch "$O/state/merged-$PR.done"
     # A refusal for an older head must not outlive the merge that superseded it.

@@ -156,6 +156,23 @@ if [ "$1" = "api" ]; then
     # #2982: the reviewed-diff fetch. Placed FIRST — the request carries no
     # --jq, so it would otherwise fall through to the generic body answer.
     if grep -qF -- "application/vnd.github.v3.diff" <<<"$*"; then
+        # #1377: the COMPARE diff read, which the patch carry uses for BOTH
+        # sides. Keyed by sha so one test can serve a REVIEWED diff and a
+        # DIFFERENT rendered diff for the same base in one invocation — the
+        # fixture shape a rebase has and the only way to tell "the patch is the
+        # same" apart from "the diff is the same". Gated on the accept header
+        # too, so the pre-existing `/compare/` SURFACE arm (which answers the
+        # json/meta reads) is untouched.
+        if grep -qF -- "/compare/" <<<"$*"; then
+            cmp_sha="$(printf '%s' "$*" | sed -n 's#.*/compare/[0-9a-f]*\.\.\.\([0-9a-f]*\).*#\1#p')"
+            if [ -n "${STUB_COMPARE_DIFF_DIR:-}" ] && [ -n "$cmp_sha" ] \
+               && [ -f "${STUB_COMPARE_DIFF_DIR}/$cmp_sha" ]; then
+                cat "${STUB_COMPARE_DIFF_DIR}/$cmp_sha"
+                exit 0
+            fi
+            # No per-sha fixture: fall through to the plain diff arm below, so
+            # every test that existed before this arm keeps its behaviour.
+        fi
         # #1577: a STATEFUL transient failure — fail the first N calls, then serve
         # the body, so a RETRY can be shown to RECOVER. A one-shot STUB_DIFF_FAIL
         # proves only that the loop iterates; it cannot separate "retried" from
@@ -212,6 +229,14 @@ if [ "$1" = "api" ]; then
     # tortoise#9492 — the pinned-head guard's wedge diagnosis: which branch does
     # the PR track, and what does THAT ref point at? Empty STUB_BRANCH_SHA models
     # "could not read it" (the non-wedge arm).
+    # #1377: the AUTHORITATIVE base the patch carry diffs against. INERT unless a
+    # test sets STUB_BASE_SHA — an armed-always arm would replace whatever the
+    # generic tail answers for `.base.sha` today, silently changing the lane-arm
+    # vectors that rely on it being unusable.
+    if grep -qF -- "--jq .base.sha" <<<"$*" && [ -n "${STUB_BASE_SHA:-}" ]; then
+        printf '%s\n' "$STUB_BASE_SHA"
+        exit 0
+    fi
     if grep -qF -- "--jq .head.ref" <<<"$*"; then
         printf '%s' "${STUB_HEAD_REF:-fix/stub-branch}"
         echo; exit 0
@@ -221,11 +246,23 @@ if [ "$1" = "api" ]; then
         printf '%s\n' "$STUB_BRANCH_SHA"
         exit 0
     fi
+    # #2872 --recover-body: the repo auto-detection read. The knob is SET-BUT-EMPTY
+    # MEANINGFUL (`${STUB_REPO_NAME+x}`), so every pre-existing vector keeps the
+    # stub's untouched fall-through: absent = not modelled, empty = "nothing
+    # detectable", which is the only way to reach the no-repo refusal.
+    if [ -n "${STUB_REPO_NAME+x}" ] && grep -qF -- "nameWithOwner" <<<"$*"; then
+        printf '%s' "$STUB_REPO_NAME"
+        exit 0
+    fi
     if grep -qF -- "--jq .body" <<<"$*"; then
         # Faithful to `--jq .body`: the RAW body text. Real gh applies the jq
         # filter and prints the string bare — it does not emit a JSON wrapper.
         # #2982's carry-forward check greps the body for a marker LINE, so it
         # needs real newlines rather than "\n" escapes.
+        # #2872: STUB_BODY_FAIL models a transient read FAILURE, which the
+        # recovery verb must report as "could not read" — never as "no marker"
+        # ("we could not look" is not "it is not there").
+        [ "${STUB_BODY_FAIL:-0}" = "1" ] && { printf '%s' "${STUB_BODY_FAIL_TEXT:-}"; exit 1; }
         printf '%s' "${STUB_BODY:-PR body}"
         exit 0
     fi
@@ -340,6 +377,11 @@ if [ "$1" = "api" ]; then
     fi
     if grep -qF -- "commits/" <<<"$*"; then
         [ "${STUB_COMMIT_FAIL:-0}" = "1" ] && exit 1
+        # #2872: a SIDE EFFECT on this read models the only admissible way a record
+        # can appear after the pre-read absence check — a concurrent recorder. The
+        # late re-check before `mv` exists for exactly this window, and without
+        # this knob it could be deleted with the suite green.
+        [ -n "${STUB_RACE_PATH:-}" ] && printf '%s\n' "${STUB_RACE_RECORD:-}" > "$STUB_RACE_PATH"
         printf '%s\n' "${STUB_COMMIT_DATE:-2026-01-01T00:00:00Z}"
         exit 0
     fi
@@ -478,6 +520,11 @@ run_record_diff_with() { # <record-script> <pr> <sha> <body> [diff-file] [diff-f
         export GH_STUB_LOG="$LOG"
         export STUB_BODY="$body" STUB_DIFF_FILE="$dfile" STUB_DIFF_FAIL="$dfail" STUB_CAPTURE="$cap"
         export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        # #1377: the patch-carry knobs, exported EXPLICITLY (with empty defaults)
+        # so an ambient value cannot leak into another vector — the scrub the
+        # STUB_CHECKS_ROWS note above records as a known limitation here does
+        # not exist. A per-invocation prefix still reaches them.
+        export STUB_COMPARE_DIFF_DIR="${STUB_COMPARE_DIFF_DIR:-}" STUB_BASE_SHA="${STUB_BASE_SHA:-}"
         # #1577: the suite must never SLEEP. The retry contract pinned below is the
         # ATTEMPT COUNT (the stub log), not the backoff duration — the backoff is a
         # production politeness knob with no assertion that could tell 1s from 30s
@@ -2365,6 +2412,411 @@ unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 11.14 #2872 — `--recover-body`: rebuild a MISSING record from the PR body's
+#       SIGNED marker.
+# ─────────────────────────────────────────────────────────────────────────
+# WHY THIS EXISTS. The record file is PER BOX; the signed marker in the PR body
+# is the only copy of the verdict that TRAVELS with the PR. Measured 2026-10-26:
+# of 45 open PRs, 12 carried a marker whose `diff=` equalled the PR's live diff
+# with no record file on the merging box, and the registry covered 2 of them —
+# so 10 lanes were being told to run a second 20-40 minute review for a verdict
+# the fleet already held, with the proof sitting in the body.
+#
+# ⛔ THE NEGATIVES CARRY THE DESIGN. A body is attacker-writable, so the ONLY
+# thing that makes a marker evidence is its HMAC. Each refusal below is a
+# different way to present a marker that is not evidence (forged, tampered,
+# unsigned, foreign repo, unreadable, an existing record that must not be
+# replaced), because each has a different remedy and none of them may mint.
+# §11.14k is the mutation pin: with the HMAC comparison removed, the forged
+# vector must SUCCEED — which is what proves the vector above tests the check
+# rather than the shape.
+echo "── 11.14 #2872: --recover-body (rebuild a record from the signed marker) ────────"
+RB_REPO="daniel-ospina/agent-infra"
+RB_RDIR="$F_HOME/.pi/agent/reviews"
+mkdir -p "$RB_RDIR"
+RB_TAB="$(printf '\t')"
+RB_HEAD="$(printf 'c%.0s' $(seq 1 40))"
+RB_DIFF="$(printf '9%.0s' $(seq 1 64))"
+RB_MINT_AT="2026-01-01T00:00:00Z"   # the STUB's commits/ answer (STUB_COMMIT_DATE)
+rb_marker() { # <pr> <text-without-sig>
+    printf '%s sig=%s' "$2" "$(printf '%s' "$2" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+}
+rb_clear() { rm -f "$RB_RDIR"/*.json; }
+run_recover() { # <pr> <repo> [script] -> RB_OUT / RB_RC
+    local sh="${3:-$RECORD}"
+    RB_RC=0
+    RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        bash "$sh" --recover-body "$1" "$2" 2>"$T/rb-err")" || RB_RC=$?
+}
+
+# (a) THE RECOVERY: a record file is absent, the body carries a valid signed
+#     marker → the record is rebuilt, with the marker's own head/diff/verdict.
+rb_clear
+export STUB_BODY="Some PR description.
+
+$(rb_marker 424911 "review recorded: reviews/424911.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424911 "$RB_REPO"
+assert_eq "$RB_RC" "0" "11.14a a verified marker rebuilds the missing record (exit 0)"
+assert_eq "$RB_OUT" "recovered${RB_TAB}${RB_HEAD}${RB_TAB}${RB_DIFF}" "11.14a …and prints the restored head + digest, so the claim is checkable"
+RB_REC="$RB_RDIR/daniel-ospina-agent-infra-424911.json"
+if [ -f "$RB_REC" ]; then ok "11.14a the record file is written at the repo-qualified path"; else bad "11.14a no record file at daniel-ospina-agent-infra-424911.json"; fi
+assert_contains "$(cat "$RB_REC" 2>/dev/null)" "\"head_sha\":\"$RB_HEAD\"" "11.14a …bound to the marker's head"
+assert_contains "$(cat "$RB_REC" 2>/dev/null)" "\"diff_sha256\":\"$RB_DIFF\"" "11.14a …carrying the marker's reviewed diff"
+assert_contains "$(cat "$RB_REC" 2>/dev/null)" '"mint":"recovered-body"' "11.14a …marking PROVENANCE: it is recovered, not a fresh mint"
+assert_contains "$(cat "$RB_REC" 2>/dev/null)" '"repo":"daniel-ospina/agent-infra"' "11.14a …namespaced to the repo it was verified for"
+# ⛔ reviewed_at is a LOWER BOUND, not the mint time: this box never observed the
+# mint, so the record carries the head commit's committer date and says so
+# (`mint=recovered-body`, `recovered_at`). What must never happen is stamping a
+# time the review did not happen — `now` is tortoise#7391.
+assert_contains "$(cat "$RB_REC" 2>/dev/null)" "\"reviewed_at\":\"$RB_MINT_AT\"" "11.14a reviewed_at is the head COMMIT's date, a LOWER BOUND, not the recovery time"
+assert_contains "$(cat "$T/rb-err")" "LOWER BOUND" "11.14a …and the report says so, rather than implying it is the mint time"
+assert_contains "$(cat "$T/rb-err")" "did not observe the mint" "11.14a …naming what this box could not observe"
+assert_contains "$(cat "$RB_REC" 2>/dev/null)" '"recovered_at":"' "11.14a …and the restoration time is recorded separately"
+assert_contains "$(cat "$T/rb-err")" "does not certify" "11.14a …and says it restores a verdict without certifying one"
+
+# (b) A FORGED signature is not evidence. `sig=<64 zeros>` satisfies the SHAPE
+#     the old carry-forward arm accepted; it must not survive the HMAC check.
+rb_clear
+RB_TEXT_B="review recorded: reviews/424912.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)"
+export STUB_BODY="$RB_TEXT_B sig=$(printf '0%.0s' $(seq 1 64))"
+run_recover 424912 "$RB_REPO"
+assert_eq "$RB_RC" "3" "11.14b a forged sig=<64 zeros> is REFUSED (exit 3)"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424912.json" ]; then bad "11.14b a forged marker minted a record"; else ok "11.14b …and nothing is written"; fi
+assert_contains "$(cat "$T/rb-err")" "does not verify" "11.14b …and names the signature as the reason"
+
+# (c) TAMPERED TEXT: a genuine signature over a DIFFERENT head. The sig is well
+#     formed and 64-hex; only the HMAC over THIS text exposes it.
+rb_clear
+RB_OTHER_HEAD="$(printf 'e%.0s' $(seq 1 40))"
+RB_GENUINE="$(rb_marker 424913 "review recorded: reviews/424913.json verdict=clean @ $RB_OTHER_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# re-present that GENUINE signature over text that names a DIFFERENT head
+export STUB_BODY="review recorded: reviews/424913.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO) sig=${RB_GENUINE##* sig=}"
+run_recover 424913 "$RB_REPO"
+assert_eq "$RB_RC" "3" "11.14c a marker whose sig covers DIFFERENT text is refused (exit 3)"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424913.json" ]; then bad "11.14c a tampered marker minted a record"; else ok "11.14c …and nothing is written"; fi
+
+# (d) UNSIGNED: the poster warns and posts unsigned when the key is missing. An
+#     unsigned marker is a body edit by definition — there is nothing to verify.
+rb_clear
+export STUB_BODY="review recorded: reviews/424914.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)"
+run_recover 424914 "$RB_REPO"
+assert_eq "$RB_RC" "3" "11.14d an UNSIGNED marker is refused (exit 3)"
+assert_contains "$(cat "$T/rb-err")" "body EDIT" "11.14d …and says why an unverified marker is not evidence"
+
+# (e) FOREIGN REPO: PR numbers collide across repos, which is why the record is
+#     repo-qualified. A signed marker naming another repo must not be adopted.
+rb_clear
+export STUB_BODY="$(rb_marker 424915 "review recorded: reviews/424915.json verdict=clean @ $RB_HEAD diff=$RB_DIFF (daniel-ospina/tortoise)")"
+run_recover 424915 "$RB_REPO"
+assert_eq "$RB_RC" "3" "11.14e a marker signed for ANOTHER repo is refused (exit 3)"
+assert_contains "$(cat "$T/rb-err")" "DIFFERENT repo" "11.14e …and names the collision, not a signature failure"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424915.json" ]; then bad "11.14e a foreign marker minted a record"; else ok "11.14e …and nothing is written"; fi
+
+# (f) NO MARKER AT ALL: distinct from every refusal above, because the remedy is
+#     genuinely "run the review" — there is no verdict anywhere.
+rb_clear
+export STUB_BODY="A PR body with no marker in it."
+run_recover 424916 "$RB_REPO"
+assert_eq "$RB_RC" "3" "11.14f a body with no marker is refused (exit 3)"
+# ⛔ The message must NOT claim no review happened anywhere: the evidence post is
+# best-effort and a body edit removes a marker, so absence HERE is all it knows.
+assert_contains "$(cat "$T/rb-err")" "not proof no review happened" "11.14f …and refuses to turn absence-in-this-body into a verdict about the review"
+assert_contains "$(cat "$T/rb-err")" "registry-sync.sh pull" "11.14f …and names where a peer-box verdict may live"
+
+# (g) AN UNREADABLE BODY IS NOT "NO MARKER". A transient API failure must RETRY,
+#     and must never be reported as "the marker is absent".
+rb_clear
+export STUB_BODY_FAIL=1
+run_recover 424917 "$RB_REPO"
+unset STUB_BODY_FAIL
+assert_eq "$RB_RC" "3" "11.14g an unreadable body is refused (exit 3)"
+assert_contains "$(cat "$T/rb-err")" "could not READ" "11.14g …and reports the READ failure, never 'no marker'"
+
+# (h) RECOVERY FILLS AN ABSENCE; IT NEVER REPLACES. An existing record may be
+#     NEWER than the marker (a later review, an already-re-bound carry), so
+#     overwriting it would walk the gate BACKWARDS.
+rb_clear
+RB_EXIST="$RB_RDIR/daniel-ospina-agent-infra-424918.json"
+printf '%s\n' '{"pr":424918,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_EXIST"
+RB_BEFORE="$(cat "$RB_EXIST")"
+export STUB_BODY="$(rb_marker 424918 "review recorded: reviews/424918.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424918 "$RB_REPO"
+assert_eq "$RB_RC" "5" "11.14h an existing record is not replaced (exit 5)"
+assert_eq "$(cat "$RB_EXIST")" "$RB_BEFORE" "11.14h …byte-identical afterwards"
+
+# (i) AN HONEST reviewed_at IS NOT NEGOTIABLE. If the head commit's date cannot
+#     be read, refuse — stamping `now` as a mint time is the tortoise#7391 defect.
+rb_clear
+export STUB_BODY="$(rb_marker 424919 "review recorded: reviews/424919.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+export STUB_COMMIT_FAIL=1
+run_recover 424919 "$RB_REPO"
+unset STUB_COMMIT_FAIL
+assert_eq "$RB_RC" "3" "11.14i an unreadable commit date is refused (exit 3)"
+assert_contains "$(cat "$T/rb-err")" "will not stamp a time the review did not happen" "11.14i …and names the mint-time rule it will not break"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424919.json" ]; then bad "11.14i a record was minted without an honest reviewed_at"; else ok "11.14i …and nothing is written"; fi
+
+# (j) `--recover-body` takes no --evidence: it restores a verdict a reviewer
+#     already produced, so accepting an evidence ref would let a RECOVERED
+#     record claim evidence nobody read.
+rb_clear
+RB_RC=0
+RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    bash "$RECORD" --recover-body 424920 "$RB_REPO" --evidence comment:1 2>"$T/rb-err")" || RB_RC=$?
+assert_eq "$RB_RC" "2" "11.14j --evidence is refused in --recover-body (exit 2)"
+assert_contains "$(cat "$T/rb-err")" "ALREADY recorded" "11.14j …and says the verdict was already recorded"
+
+# (k) THE MUTATION PIN. Remove the HMAC comparison and the forged vector must
+#     SUCCEED — proving 11.14b tests the CHECK, not the marker's shape.
+RB_MUT="$T/rb-mut.sh"
+sed 's@if \[ -z "$_expect" \] || \[ "$_expect" != "$_sig" \]; then@if false; then@' "$RECORD" > "$RB_MUT"
+if grep -q 'if false; then' "$RB_MUT"; then
+    rb_clear
+    RB_TEXT_M="review recorded: reviews/424921.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)"
+    export STUB_BODY="$RB_TEXT_M sig=$(printf '0%.0s' $(seq 1 64))"
+    run_recover 424921 "$RB_REPO" "$RB_MUT"
+    assert_eq "$RB_RC" "0" "11.14k WITHOUT the HMAC check the forged marker mints (the pin has teeth)"
+else
+    bad "11.14k the mutation anchor is gone — re-anchor the mutant rather than dropping the pin"
+fi
+unset STUB_BODY STUB_BODY_FAIL STUB_COMMIT_FAIL RB_OUT RB_RC RB_REC RB_EXIST RB_BEFORE RB_MUT
+
+# (l) NO REPO RESOLVED: a record is identified by PR *and* repo (numbers collide
+#     across repos), so an unresolvable repo is a USAGE error, not a guess.
+rb_clear
+export STUB_REPO_NAME=""
+export STUB_BODY="$(rb_marker 424922 "review recorded: reviews/424922.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+RB_RC=0
+RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    bash "$RECORD" --recover-body 424922 2>"$T/rb-err")" || RB_RC=$?
+unset STUB_REPO_NAME
+assert_eq "$RB_RC" "2" "11.14l with no resolvable repo the verb refuses (exit 2)"
+assert_contains "$(cat "$T/rb-err")" "no repo resolved" "11.14l …and names the missing argument instead of filing under a guess"
+
+# (m) NO GATE KEY: the signature cannot be VERIFIED, and an unverified marker is a
+#     body edit by definition. Minting on trust would make the whole check
+#     decorative, so this is a REFUSAL even when a valid-looking marker exists.
+rb_clear
+export STUB_BODY="$(rb_marker 424923 "review recorded: reviews/424923.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+RB_RC=0
+RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" AI_REVIEW_GATE_KEY="" \
+    bash "$RECORD" --recover-body 424923 "$RB_REPO" 2>"$T/rb-err")" || RB_RC=$?
+assert_eq "$RB_RC" "3" "11.14m with no gate key nothing is minted (exit 3)"
+assert_contains "$(cat "$T/rb-err")" "not configured" "11.14m …and says the signature could not be verified"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424923.json" ]; then bad "11.14m a record was minted with no key to verify against"; else ok "11.14m …and nothing is written"; fi
+
+# (n) THE LEGACY repo-less file is a collision ONLY when it EMBEDS this repo —
+#     the same rule the recorder already applies. This repo's own legacy record
+#     must refuse (5); a FOREIGN one must be left BYTE-IDENTICAL and not block
+#     this repo's recovery (0). Deleting another repo's record is never an option.
+rb_clear
+RB_LEG="$RB_RDIR/424924.json"
+printf '%s\n' '{"pr":424924,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_LEG"
+export STUB_BODY="$(rb_marker 424924 "review recorded: reviews/424924.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424924 "$RB_REPO"
+assert_eq "$RB_RC" "5" "11.14n a legacy record naming THIS repo is not replaced (exit 5)"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424924.json" ]; then bad "11.14n a qualified record was minted beside an existing legacy one"; else ok "11.14n …and no qualified record is minted beside it"; fi
+rb_clear
+printf '%s\n' '{"pr":424925,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/424925.json"
+RB_FOREIGN_BEFORE="$(cat "$RB_RDIR/424925.json")"
+export STUB_BODY="$(rb_marker 424925 "review recorded: reviews/424925.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424925 "$RB_REPO"
+assert_eq "$RB_RC" "0" "11.14n a FOREIGN legacy record does not block this repo's recovery (exit 0)"
+assert_eq "$(cat "$RB_RDIR/424925.json")" "$RB_FOREIGN_BEFORE" "11.14n …and the other repo's record is left byte-identical, never deleted"
+unset STUB_BODY RB_OUT RB_RC RB_LEG RB_FOREIGN_BEFORE
+
+# (o) LAST VERIFYING MARKER WINS. The poster APPENDS, so a second verdict for the
+#     same PR replaces the first; recovering the FIRST would resurrect a verdict
+#     the review itself superseded. Nothing else in §11.14 pins this choice.
+rb_clear
+RB_OLD_HEAD="$(printf '7%.0s' $(seq 1 40))"
+RB_OLD_DIFF="$(printf '8%.0s' $(seq 1 64))"
+export STUB_BODY="$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean @ $RB_OLD_HEAD diff=$RB_OLD_DIFF ($RB_REPO)")
+$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean-micro @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424926 "$RB_REPO"
+assert_eq "$RB_RC" "0" "11.14o two markers for one PR: recovery succeeds (exit 0)"
+assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424926.json" 2>/dev/null)" "\"head_sha\":\"$RB_HEAD\"" "11.14o …restoring the LAST marker's head, not the first"
+assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424926.json" 2>/dev/null)" '"verdict":"clean-micro"' "11.14o …and its verdict, not the superseded one"
+
+# (p) THE LEGACY DIFF-LESS MARKER: a marker minted before #2982 has no `diff=`.
+#     The recovered record then carries NO digest — honestly, rather than a guess —
+#     and `--check-carry` answers `nodigest` (5), not `fresh` (1): "no digest to
+#     compare" and "the diff changed" are different facts with different remedies.
+rb_clear
+export STUB_BODY="$(rb_marker 424927 "review recorded: reviews/424927.json verdict=clean @ $RB_HEAD ($RB_REPO)")"
+run_recover 424927 "$RB_REPO"
+assert_eq "$RB_RC" "0" "11.14p a diff-less (pre-#2982) marker still recovers (exit 0)"
+assert_eq "$RB_OUT" "recovered${RB_TAB}${RB_HEAD}${RB_TAB}-" "11.14p …and prints '-' for the digest it does not have"
+if grep -q 'diff_sha256' "$RB_RDIR/daniel-ospina-agent-infra-424927.json" 2>/dev/null; then bad "11.14p the record invented a diff digest"; else ok "11.14p …and the record carries NO diff_sha256 rather than a guess"; fi
+# ⛔ NOT run_check_carry: §11.13's teardown UNSETS CC_DIFF, so the helper's
+# `${STUB_DIFF_FILE:-$CC_DIFF}` makes the subshell die under `set -u` and the
+# recorded rc becomes 1 ("fresh") for a reason that has nothing to do with the
+# verb. Every input is given explicitly instead.
+RB_LIVE_DIFF="$T/rb-live.diff"
+printf 'diff --git a/docs/rb.md b/docs/rb.md\nindex 1111111..2222222 100644\n--- a/docs/rb.md\n+++ b/docs/rb.md\n@@ -1,3 +1,4 @@\n a\n+b\n c\n d\n' > "$RB_LIVE_DIFF"
+RB_CC_RC=0
+RB_CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    STUB_DIFF_FILE="$RB_LIVE_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$(printf 'a%.0s' $(seq 1 40))" \
+    RECORD_REVIEW_LOCAL_REPO="$T/no-local-checkout-2872" \
+    bash "$RECORD" --check-carry 424927 "$RB_REPO" 2>"$T/rb-err")" || RB_CC_RC=$?
+assert_eq "$RB_CC_RC" "5" "11.14p …so --check-carry answers nodigest (5), never 'fresh' (1)"
+assert_eq "${RB_CC_OUT%%"$RB_TAB"*}" "nodigest" "11.14p …and the verdict WORD says nodigest, so a caller branches on the right remedy"
+
+# (q) A `clean-low` MARKER IS REFUSED. That tier certifies the MERGE BASE, the
+#     marker does not carry `merge_base_sha`, and a recovered record of that tier
+#     would make the rail skip its base guard while the gate blocks the same
+#     record as `base_unverifiable` — one record, two verdicts.
+rb_clear
+export STUB_BODY="$(rb_marker 424928 "review recorded: reviews/424928.json verdict=clean-low @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424928 "$RB_REPO"
+assert_eq "$RB_RC" "3" "11.14q a clean-low marker is refused (exit 3)"
+assert_contains "$(cat "$T/rb-err")" "FRESH mint (not a carry" "11.14q …and names the remedy that IS available, correctly labelled (a fresh mint, not a carry)"
+assert_contains "$(cat "$T/rb-err")" "record-review.sh 424928" "11.14q …with the exact command to run"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424928.json" ]; then bad "11.14q a clean-low record was minted without merge_base_sha"; else ok "11.14q …and nothing is written"; fi
+
+# (r) ONE VERB PER INVOCATION. `--recover-body --check-carry` would print a
+#     read-only answer and exit 0 having written NOTHING — a successful-looking
+#     recovery that did not happen.
+rb_clear
+export STUB_BODY="$(rb_marker 424929 "review recorded: reviews/424929.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+RB_RC=0
+RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    bash "$RECORD" --recover-body 424929 "$RB_REPO" --check-carry 2>"$T/rb-err")" || RB_RC=$?
+assert_eq "$RB_RC" "2" "11.14r --recover-body combined with --check-carry is refused (exit 2)"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424929.json" ]; then bad "11.14r the combined form wrote a record anyway"; else ok "11.14r …and the refusal explains that nothing would have been written"; fi
+
+# (s) A QUALIFIED FILE NAMING ANOTHER REPO is the identical-slug overwrite state.
+#     The gate reads it as ABSENT, but it is still another repo's verdict: this
+#     verb refuses rather than destroy it, and the refusal names a way out that
+#     does not come back here (the loop the P2 review found was advice pointing at
+#     a verb that answers `norecord` and points back).
+rb_clear
+printf '%s\n' '{"pr":424930,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/daniel-ospina-agent-infra-424930.json"
+RB_OTHER_BEFORE="$(cat "$RB_RDIR/daniel-ospina-agent-infra-424930.json")"
+export STUB_BODY="$(rb_marker 424930 "review recorded: reviews/424930.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424930 "$RB_REPO"
+assert_eq "$RB_RC" "5" "11.14s a qualified file embedding ANOTHER repo is not overwritten (exit 5)"
+assert_contains "$(cat "$T/rb-err")" "daniel-ospina/tortoise" "11.14s …and the refusal names the repo whose verdict is at stake"
+assert_contains "$(cat "$T/rb-err")" "Move that file aside" "11.14s …and names a remedy that does not loop back to --check-carry"
+assert_eq "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424930.json")" "$RB_OTHER_BEFORE" "11.14s …and the file is byte-identical afterwards"
+unset STUB_BODY RB_OUT RB_RC RB_OLD_HEAD RB_OLD_DIFF RB_OTHER_BEFORE
+
+# (t) THE RACE. The absence check runs BEFORE two network reads, so a concurrent
+#     recorder can mint a fresh record inside that window. Without the re-check
+#     immediately before `mv`, the older recovered verdict would SILENTLY replace
+#     it — the "walk the gate backwards" failure the whole rule exists to prevent.
+#     The stub performs the concurrent mint as a side effect of the LAST read.
+rb_clear
+export STUB_BODY="$(rb_marker 424931 "review recorded: reviews/424931.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+RB_RACE="$RB_RDIR/daniel-ospina-agent-infra-424931.json"
+RB_RACE_JSON='{"pr":424931,"head_sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","diff_sha256":"1111111111111111111111111111111111111111111111111111111111111111","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-12-01T00:00:00Z"}'
+export STUB_RACE_PATH="$RB_RACE" STUB_RACE_RECORD="$RB_RACE_JSON"
+run_recover 424931 "$RB_REPO"
+unset STUB_RACE_PATH STUB_RACE_RECORD
+assert_eq "$RB_RC" "5" "11.14t a record minted DURING the recovery is not replaced (exit 5)"
+assert_eq "$(cat "$RB_RACE" 2>/dev/null)" "$RB_RACE_JSON" "11.14t …the concurrent (newer) record survives byte-identical"
+assert_contains "$(cat "$T/rb-err")" "appeared WHILE" "11.14t …and the refusal names the race rather than a plain existing record"
+
+# (u) THE OTHER TWO VERB COMBINATIONS are refused by the same condition, above the
+#     read-only dispatch (where `--print-diff-hash` would otherwise take the branch
+#     first and answer for a PR whose recovery never ran).
+for _combo in --print-diff-hash --print-tier; do
+    rb_clear
+    export STUB_BODY="$(rb_marker 424932 "review recorded: reviews/424932.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+    RB_RC=0
+    RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        bash "$RECORD" --recover-body 424932 "$RB_REPO" "$_combo" 2>"$T/rb-err")" || RB_RC=$?
+    assert_eq "$RB_RC" "2" "11.14u --recover-body with $_combo is refused (exit 2)"
+    if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424932.json" ]; then bad "11.14u $_combo: the combined form wrote a record"; else ok "11.14u $_combo …and nothing is written"; fi
+done
+unset STUB_BODY RB_OUT RB_RC RB_RACE RB_RACE_JSON _combo
+
+# (v) THE OTHER HALF OF THE WRITE-TIME RE-CHECK: a FOREIGN identical-slug record
+#     landing during the recovery. `rb_existing_record` answers only for THIS repo,
+#     so without the second arm the `mv` would destroy another repo's verdict —
+#     the same class as 11.14t, which is why it is checked at the write too.
+rb_clear
+RB_FOREIGN_JSON='{"pr":424933,"head_sha":"dddddddddddddddddddddddddddddddddddddddd","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-12-01T00:00:00Z"}'
+export STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+export STUB_RACE_PATH="$RB_RDIR/daniel-ospina-agent-infra-424933.json" STUB_RACE_RECORD="$RB_FOREIGN_JSON"
+run_recover 424933 "$RB_REPO"
+unset STUB_RACE_PATH STUB_RACE_RECORD
+export STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+assert_eq "$RB_RC" "5" "11.14v a FOREIGN record appearing mid-recovery is not destroyed (exit 5)"
+assert_eq "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424933.json" 2>/dev/null)" "$RB_FOREIGN_JSON" "11.14v …the other repo's verdict survives byte-identical"
+
+# (w) A CORRUPT RECORD IS NOT "NOTHING TO REPAIR". A truncated file parses to no
+#     `repo`, which the ownership test reads as unowned — so the plain refusal
+#     would assert there is nothing to fix about a file the GATE calls corrupt.
+rb_clear
+printf '%s' '{"pr":424934,"head_sha":"abc' > "$RB_RDIR/daniel-ospina-agent-infra-424934.json"
+export STUB_BODY="$(rb_marker 424934 "review recorded: reviews/424934.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424934 "$RB_REPO"
+assert_eq "$RB_RC" "5" "11.14w a corrupt record is refused (exit 5)"
+assert_contains "$(cat "$T/rb-err")" "NOT a usable record" "11.14w …and it is named as unusable, not as 'nothing to repair'"
+assert_contains "$(cat "$T/rb-err")" "move it aside" "11.14w …with a way out"
+
+# (x) NO SILENT POSITIONAL DROP. `--recover-body 42 o/r clean-low <sha>` used to
+#     take $2 as the repo and DISCARD the verdict and head, minting the marker's
+#     verdict with exit 0 while the caller believed it had chosen one.
+rb_clear
+export STUB_BODY="$(rb_marker 424935 "review recorded: reviews/424935.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+RB_RC=0
+RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    bash "$RECORD" --recover-body 424935 "$RB_REPO" clean-low "$RB_HEAD" 2>"$T/rb-err")" || RB_RC=$?
+assert_eq "$RB_RC" "2" "11.14x extra positionals with --recover-body are refused (exit 2)"
+if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424935.json" ]; then bad "11.14x the positional form minted a record"; else ok "11.14x …and nothing is written"; fi
+unset STUB_BODY RB_OUT RB_RC RB_FOREIGN_JSON
+
+# (y) A RECORD IS WHAT THE GATE CAN READ, NOT WHAT THIS RECORDER WROTE. A
+#     pretty-printed record (a `jq .` round-trip) parses fine for the gate, so
+#     calling it "NOT a usable record" and telling an operator to move it aside
+#     would walk the gate BACKWARDS. It must be treated as an existing record.
+rb_clear
+printf '%s\n' '{' '  "pr": 424936,' '  "head_sha": "ffffffffffffffffffffffffffffffffffffffff",' '  "verdict": "clean",' '  "repo": "daniel-ospina/agent-infra",' '  "reviewed_at": "2026-02-02T00:00:00Z"' '}' > "$RB_RDIR/daniel-ospina-agent-infra-424936.json"
+export STUB_BODY="$(rb_marker 424936 "review recorded: reviews/424936.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424936 "$RB_REPO"
+assert_eq "$RB_RC" "5" "11.14y a pretty-printed (jq round-trip) record counts as existing (exit 5)"
+assert_contains "$(cat "$T/rb-err")" "already exists" "11.14y …and is NOT called unusable, because the gate reads it fine"
+
+# (y2) PRESENT BUT UNTYPED IS NOT A RECORD. The gate requires STRINGS, so
+#      `"head_sha": null` is ABSENT to it. Treating that as an existing record
+#      here would answer "nothing to repair" for a file the rail says NO-RECORD
+#      about — the round-2 loop, narrowed to a present-but-untyped key.
+rb_clear
+printf '%s\n' '{"pr":424938,"head_sha":null,"verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/daniel-ospina-agent-infra-424938.json"
+export STUB_BODY="$(rb_marker 424938 "review recorded: reviews/424938.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424938 "$RB_REPO"
+assert_eq "$RB_RC" "5" "11.14y2 a record with an untyped head_sha is refused (exit 5)"
+assert_contains "$(cat "$T/rb-err")" "NOT a usable record" "11.14y2 …as an unusable record, matching what the gate sees (absent)"
+
+# (z) A PERMANENT ERROR IS NOT A TRANSIENT ONE. A 404 on the PR read used to say
+#     "RETRY", which a lane can obey forever.
+rb_clear
+export STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)'
+run_recover 424937 "$RB_REPO"
+unset STUB_BODY_FAIL STUB_BODY_FAIL_TEXT
+assert_eq "$RB_RC" "3" "11.14z a 404 on the PR read is refused (exit 3)"
+assert_contains "$(cat "$T/rb-err")" "retrying will NOT help" "11.14z …and does not tell the lane to RETRY a permanent failure"
+assert_contains "$(cat "$T/rb-err")" "Not Found" "11.14z …quoting what gh actually said"
+
+# (aa) SHAPE PIN: the final write is a NO-CLOBBER create, not a rename. A
+#      check-then-`mv` leaves a window in which a concurrent recorder's verdict is
+#      replaced; `ln` fails with EEXIST instead. (A shape pin, not a race: the
+#      window cannot be opened from a test.)
+if grep -qF 'ln "$RB_TMP" "$RB_FILE" 2>/dev/null' "$RECORD"; then
+    ok "11.14aa the write uses a no-clobber atomic create (ln), not check-then-mv"
+else
+    bad "11.14aa the write is not a no-clobber create — a concurrent record can still be replaced"
+fi
+if grep -qF 'mv "$RB_TMP" "$RB_FILE"' "$RECORD"; then
+    bad "11.14aa a plain mv to the record path is still present"
+else
+    ok "11.14aa …and no plain mv to the record path remains"
+fi
+unset STUB_BODY RB_OUT RB_RC
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 12. #1362 D1 — the review-evidence digest is computed over the NORMALIZED
 #     diff (owner ruling 2026-09-23), with a raw-hash backward-compat arm.
 # ─────────────────────────────────────────────────────────────────────────
@@ -2972,6 +3424,225 @@ run_record_ev() { # <pr> [VAR=VAL…]; ref via $EV_REF (empty ⇒ omit --evidenc
     RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
 }
 
+# ─────────────────────────────────────────────────────────────────────────
+# 12g #1377 — THE PATCH CARRY: a REBASE whose reviewed change is untouched is
+# re-recorded, NOT re-reviewed; a changed patch is still refused.
+#
+# This is the end-to-end pin. §12a-pin territory above is BYTE-identity of the
+# normalized diff; the vectors here are the case that one cannot see: the
+# rendered diff MOVES (hunk context rewritten by what `main` landed) while every
+# reviewed line is byte-identical. Both directions are mandatory — an acceptance
+# vector alone would let a fail-open (carry anything) land green, and a refusal
+# vector alone would let the arm be dead code.
+#
+# The fixture is three diff renderings of ONE change against three bases:
+#   PFX_REVIEWED — what the review approved
+#   PFX_REBASE   — the same change rebased onto a moved base: new blob ids, moved
+#                  hunk line numbers, DIFFERENT CONTEXT (this is why the
+#                  binding moves and #1377 exists)
+#   PFX_EDIT     — the same shape with ONE changed line altered  → must REFUSE
+#   PFX_WS       — whitespace only                               → must REFUSE
+#   PFX_MOVED    — the same lines at a different PATH             → must REFUSE
+# ─────────────────────────────────────────────────────────────────────────
+PBASE="$(printf 'c%.0s' $(seq 1 40))"
+POLD="$(printf 'd%.0s' $(seq 1 40))"          # the head the MARKER names
+# §12's tail UNSETS its knobs (NORM_PY among them), so a section that runs after
+# it must re-establish what it uses — the same self-containment §11.12 is written
+# for. `norm_sha` below resolves this global at CALL time, so the re-assignment
+# is what makes the helper usable here at all.
+NORM_PY="$SCRIPT_DIR/lib/diff-normalize.py"
+PCD="$T/pcompare"; mkdir -p "$PCD"
+PFX_REVIEWED="$T/p-reviewed.diff"; printf 'diff --git a/fix.txt b/fix.txt\nindex 1111111..2222222 100644\n--- a/fix.txt\n+++ b/fix.txt\n@@ -3,4 +3,5 @@ def f():\n context before\n-old line\n+new line\n context after\n tail\n' > "$PFX_REVIEWED"
+PFX_REBASE="$T/p-rebase.diff";   printf 'diff --git a/fix.txt b/fix.txt\nindex 7777777..8888888 100644\n--- a/fix.txt\n+++ b/fix.txt\n@@ -40,4 +41,5 @@ def f():\n MAIN landed a different context line\n-old line\n+new line\n another context line\n tail\n' > "$PFX_REBASE"
+PFX_EDIT="$T/p-edit.diff";       printf 'diff --git a/fix.txt b/fix.txt\nindex 7777777..8888888 100644\n--- a/fix.txt\n+++ b/fix.txt\n@@ -40,4 +41,5 @@ def f():\n MAIN landed a different context line\n-old line\n+new line CHANGED\n another context line\n tail\n' > "$PFX_EDIT"
+PFX_WS="$T/p-ws.diff";           printf 'diff --git a/fix.txt b/fix.txt\nindex 7777777..8888888 100644\n--- a/fix.txt\n+++ b/fix.txt\n@@ -40,4 +41,5 @@ def f():\n MAIN landed a different context line\n- old line\n+new line\n another context line\n tail\n' > "$PFX_WS"
+PFX_MOVED="$T/p-moved.diff";      printf 'diff --git a/other.txt b/other.txt\nindex 7777777..8888888 100644\n--- a/other.txt\n+++ b/other.txt\n@@ -40,4 +41,5 @@ def f():\n MAIN landed a different context line\n-old line\n+new line\n another context line\n tail\n' > "$PFX_MOVED"
+
+# The advertised premise of every vector below, stated as an assertion so it can
+# never rot into a fixture that no longer tests what its caption claims.
+PNORM_REVIEWED="$(norm_sha "$PFX_REVIEWED")"
+assert_ne "$PNORM_REVIEWED" "$(norm_sha "$PFX_REBASE")" \
+  "12g fixture: the rebase MOVES the binding (else the patch arm is never reached)"
+assert_ne "$(norm_sha "$PFX_EDIT")" "$(norm_sha "$PFX_REBASE")" \
+  "12g fixture: the one-line edit really is a different artifact"
+assert_ne "$(norm_sha "$PFX_WS")" "$(norm_sha "$PFX_REBASE")" \
+  "12g fixture: the whitespace-only edit really is a different artifact"
+
+pcarry() { # <pr> <new-diff-file> [marker-diff] -> sets RECORD_RC/ERR/CAP £RECORD_ERR £RECORD_CAP
+    local pr="$1" newf="$2" marker_diff="${3:-$PNORM_REVIEWED}"
+    rm -f "$PCD/$POLD" "$PCD/$SHA"
+    cp "$PFX_REVIEWED" "$PCD/$POLD"; cp "$newf" "$PCD/$SHA"
+    STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+      run_record_diff "$pr" "$POLD" "body
+
+$(signed_marker "$pr" "$POLD" "$marker_diff")" "$newf"
+}
+
+# (g1) THE ACCEPTANCE: a pure rebase is re-recorded, with NO fresh review owed.
+PRG=424740; rm -f "$(Q2 $PRG)"
+pcarry "$PRG" "$PFX_REBASE"
+[ "$RECORD_RC" = "0" ] && ok "12g1 a REBASE with an unchanged patch is carried (rc 0)" \
+    || bad "12g1 pure rebase refused (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "#1377 patch carry" "12g1 the carry names itself (#1377)"
+assert_contains "$(cat "$(Q2 $PRG)" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "12g1 re-records against the CURRENT head"
+# The minted marker must bind the CURRENT head AND the LIVE digest — never the
+# old pair. Inheriting either would be the head-binding hole #930 class 1.
+assert_contains "$RECORD_CAP" "@ $SHA diff=$(norm_sha "$PFX_REBASE")" "12g1 the marker binds the current head to the LIVE digest"
+# The posting path APPENDS (idempotent, #163), so the body keeps the old marker
+# above the new one. What the merge gate must read is therefore the GOVERNING
+# (last) marker — assert on that, not on the absence of the stale line, which
+# would be false by construction and would look like a head-binding failure.
+# The captured PATCH is the JSON envelope, so the body's newlines are the
+# two-character `\n` escape — match the marker TEXT, not a line start.
+PLAST="$(grep -o 'review recorded: [^"\\]*' <<<"$RECORD_CAP" | tail -1 || true)"
+if grep -qF "@ $SHA diff=$(norm_sha "$PFX_REBASE")" <<<"$PLAST"; then
+    ok "12g1 the GOVERNING (last) marker names the current head"
+else
+    bad "12g1 the governing marker does not name the current head: $PLAST"
+fi
+if grep -qF "@ $POLD " <<<"$PLAST"; then bad "12g1 the governing marker still names the STALE head"; else ok "12g1 the governing marker does not name the stale head"; fi
+
+# (g2) THE REFUSAL THAT MAKES IT SOUND: one changed line ⇒ no carry.
+PRG2=424741; rm -f "$(Q2 $PRG2)"
+pcarry "$PRG2" "$PFX_EDIT"
+[ "$RECORD_RC" = "3" ] && ok "12g2 a ONE-LINE change is NOT carried (rc 3)" \
+    || bad "12g2 carried a genuinely changed patch (rc=$RECORD_RC) — FAIL-OPEN"
+[ ! -f "$(Q2 $PRG2)" ] && ok "12g2 no record written for the changed patch" || bad "12g2 wrote a record for a changed patch"
+if grep -qF "#1377 patch carry" <<<"$RECORD_ERR"; then bad "12g2 the carry success line was printed on a refusal"; else ok "12g2 the carry success line is not printed"; fi
+
+# (g3) WHITESPACE-ONLY — the exact hole `git patch-id --stable` has, pinned HERE
+# so a future "just use patch-id" simplification reddens instead of shipping.
+PRG3=424742; rm -f "$(Q2 $PRG3)"
+pcarry "$PRG3" "$PFX_WS"
+[ "$RECORD_RC" = "3" ] && ok "12g3 a WHITESPACE-ONLY change is NOT carried (rc 3)" \
+    || bad "12g3 carried a whitespace-only change (the patch-id --stable hole)"
+
+# (g4) THE SAME LINES AT A DIFFERENT PATH — patch identity includes the path.
+PRG4=424743; rm -f "$(Q2 $PRG4)"
+pcarry "$PRG4" "$PFX_MOVED"
+[ "$RECORD_RC" = "3" ] && ok "12g4 the same lines at a DIFFERENT PATH are NOT carried (rc 3)" \
+    || bad "12g4 carried a change whose path moved"
+
+# (g5) A FORGED marker (right shape, wrong signature) at a different head must
+# not carry — the body is not a trust boundary (#784).
+PRG5=424744; rm -f "$(Q2 $PRG5)"
+cp "$PFX_REVIEWED" "$PCD/$POLD"; cp "$PFX_REBASE" "$PCD/$SHA"
+FORGED="review recorded: reviews/$PRG5.json verdict=clean @ $POLD diff=$PNORM_REVIEWED (daniel-ospina/agent-infra) sig=$(printf '%064d' 0)"
+STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+  run_record_diff "$PRG5" "$POLD" "body
+
+$FORGED" "$PFX_REBASE"
+[ "$RECORD_RC" = "3" ] && ok "12g5 a FORGED prior marker does NOT patch-carry (rc 3)" \
+    || bad "12g5 forged marker carried (rc=$RECORD_RC) — the body became a trust boundary"
+
+# (g6) THE ANCHOR: a well-formed marker whose `diff=` is NOT what the reviewed
+# head actually normalizes to must refuse. Without the anchor, an attacker-chosen
+# sha would pair with any diff and the patch comparison would be meaningless.
+PRG6=424745; rm -f "$(Q2 $PRG6)"
+pcarry "$PRG6" "$PFX_REBASE" "$(printf 'e%.0s' $(seq 1 64))"
+[ "$RECORD_RC" = "3" ] && ok "12g6 an unanchored marker (diff= that the reviewed head does not reproduce) refuses (rc 3)" \
+    || bad "12g6 carried without the anchor — the reconstruction is not the reviewed artifact"
+
+# ── 12h MUTATION PINS for the patch arm ───────────────────────────────────
+# Each mutant is a real copy of record-review.sh with ONE line of the arm's
+# logic changed, and each must redden the vector above that depends on it.
+# `mut_dir` copies ONLY the script; each mutant here keeps the REAL normalizer,
+# because the mechanism under mutation is the ARM's logic, not the projection.
+pmut() { mut_dir "$1"; cp "$SCRIPT_DIR/lib/diff-normalize.py" "$1/lib/diff-normalize.py"; }
+PMUT="$T/mut-patch"
+pmut "$PMUT"
+# M_NOANCHOR — delete the anchor comparison (the `on != anchor` refusal).
+python3 - "$PMUT/record-review.sh" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+needle = '  if [ "$on" != "$anchor" ]; then command rm -f "$tmp"; return 1; fi\n'
+assert needle in src, "anchor mutation needle not found — the arm changed shape"
+open(p, "w", encoding="utf-8").write(src.replace(needle, '', 1))
+PY
+PRGm=424746; rm -f "$(Q2 $PRGm)"
+cp "$PFX_REVIEWED" "$PCD/$POLD"; cp "$PFX_REBASE" "$PCD/$SHA"
+STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+  run_record_diff_with "$PMUT/record-review.sh" "$PRGm" "$POLD" "body
+
+$(signed_marker "$PRGm" "$POLD" "$(printf 'e%.0s' $(seq 1 64))")" "$PFX_REBASE"
+[ "$RECORD_RC" = "0" ] && ok "12h mutation(a): with the ANCHOR removed an unanchored marker WOULD carry (rc 0) — 12g6 is load-bearing" \
+    || bad "12h mutation(a): expected a false carry without the anchor (rc=$RECORD_RC)"
+
+# M_ALWAYS — the patch comparison always succeeds (a fail-open predicate).
+PMUT2="$T/mut-patch-always"
+pmut "$PMUT2"
+python3 - "$PMUT2/record-review.sh" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+cand = [l for l in src.split('\n') if l.startswith('  [ "${pair#*$')]
+assert len(cand) == 1, cand          # exactly ONE decision line, or the mutant is ambiguous
+needle = cand[0] + '\n'
+assert needle in src, "decision mutation needle not found"
+open(p, "w", encoding="utf-8").write(src.replace(needle, '  :\n', 1))
+PY
+PRGm2=424747; rm -f "$(Q2 $PRGm2)"
+STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+  run_record_diff_with "$PMUT2/record-review.sh" "$PRGm2" "$POLD" "body
+
+$(signed_marker "$PRGm2" "$POLD" "$PNORM_REVIEWED")" "$PFX_EDIT"
+[ "$RECORD_RC" = "0" ] && ok "12h mutation(b): a comparison that always matches carries the ONE-LINE change (rc 0) — 12g2 is load-bearing" \
+    || bad "12h mutation(b): expected a false carry under the always-match mutant (rc=$RECORD_RC)"
+
+# M_NEVER — the arm can never fire (a no-op predicate): the acceptance reddens.
+PMUT3="$T/mut-patch-never"
+pmut "$PMUT3"
+python3 - "$PMUT3/record-review.sh" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+needle = 'patch_dimension_carry() { # <reviewed-sha> <reviewed-binding-digest> <current-head> -> 0 = patch unchanged\n'
+assert needle in src, "function header not found"
+open(p, "w", encoding="utf-8").write(src.replace(needle, needle + '  return 1\n', 1))
+PY
+PRGm3=424748; rm -f "$(Q2 $PRGm3)"
+STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+  run_record_diff_with "$PMUT3/record-review.sh" "$PRGm3" "$POLD" "body
+
+$(signed_marker "$PRGm3" "$POLD" "$PNORM_REVIEWED")" "$PFX_REBASE"
+[ "$RECORD_RC" = "3" ] && ok "12h mutation(c): a patch arm that can never fire refuses the pure rebase (rc 3) — 12g1 is load-bearing" \
+    || bad "12h mutation(c): the dead arm still carried (rc=$RECORD_RC)"
+
+# ── 12i #1377 — `--check-carry` answers `carry-patch`, not `fresh` ────────
+# The lane's ONE way to ask "is my stale record still good?" must not answer
+# "run the review" for an unchanged PATCH — that is the 20-40 minute cost this
+# issue exists to remove. The token is DELIBERATELY not `carry`: the merge gate
+# does NOT carry a record whose binding moved, so a caller must re-record; and
+# the exit code is not 0 for the same reason.
+run_pcarry_check() { # <pr> -> CC_OUT / CC_RC (self-contained: §11.13's knobs are not reused)
+    local out rc
+    rc=0
+    out="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="$PFX_REBASE" STUB_HEAD_SHA="$SHA" \
+        STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" STUB_COMPARE_DIFF_DIR="$PCD" \
+        STUB_DIFF_FAIL=0 STUB_LOCAL_BASE="" STUB_LOCAL_HEAD="" RECORD_REVIEW_LOCAL_REPO=. \
+        bash "$RECORD" --check-carry "$1" "daniel-ospina/agent-infra" 2>"$T/pcc-err")" || rc=$?
+    CC_OUT="$out"; CC_RC="$rc"
+}
+prec() { # <pr> — a local record bound to the REVIEWED head with the REVIEWED digest
+    printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+        "$1" "$POLD" "$PNORM_REVIEWED" > "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-$1.json"
+}
+PTAB="$(printf '\t')"
+PCHK=424749; prec "$PCHK"
+cp "$PFX_REVIEWED" "$PCD/$POLD"; cp "$PFX_REBASE" "$PCD/$SHA"
+run_pcarry_check "$PCHK"
+assert_eq "${CC_OUT%%"$PTAB"*}" "carry-patch" "12i1 a rebase reports 'carry-patch' (not 'fresh', not 'carry')"
+assert_eq "$CC_RC" "6" "12i1 …with its own exit code, because the gate does NOT carry it"
+if [ "${CC_OUT%%"$PTAB"*}" = "carry" ]; then bad "12i1 the token is DISTINCT from 'carry'"; else ok "12i1 the token is distinct from 'carry' (the gate will not carry it as-is)"; fi
+assert_contains "$(cat "$T/pcc-err" 2>/dev/null)" "do NOT run a review cycle" "12i1 the answer says what to do instead of reviewing"
+# The SAME record against a changed patch must still be `fresh`.
+cp "$PFX_EDIT" "$PCD/$SHA"
+run_pcarry_check "$PCHK"
+assert_eq "${CC_OUT%%"$PTAB"*}" "fresh" "12i2 a changed patch still reports 'fresh'"
+assert_eq "$CC_RC" "1" "12i2 …exit 1 (a review really is owed)"
+
 echo "── 13. tortoise#7391: fresh clean requires VERIFIED review evidence ─────"
 
 # 13a — the mandated NEGATIVE half: no --evidence at the current head →
@@ -3132,6 +3803,30 @@ $(signed_marker $PRV2 "$STALE" "$EV13_H")" "$EV13_D"
 assert_eq "$RECORD_RC" "0" "13i a carry with NO prior record still records (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tail -2 | tr '\n' ' ')]"
 assert_contains "$RECORD_ERR" "not recoverable" "13i the unrecoverable mint time is announced on stderr"
 assert_contains "$(cat "$(Q2 $PRV2)")" '"mint":"carried"' "13i the record is still marked carried"
+
+# 13h2 — A RECOVERED PREDECESSOR IS NOT A MINT TIME (#2872, round 4). A record
+# minted by `--recover-body` carries reviewed_at = the head commit's date, which is
+# a LOWER BOUND. Inheriting it on the next carry and printing "preserved as the
+# ORIGINAL mint time" would launder a commit date into a mint time and drop the
+# recovery label in the same step — the tortoise#7391 corruption this arm exists to
+# prevent, with nothing else standing in the way. Both branches of the warning are
+# otherwise indistinguishable to this suite.
+PRV3=424744
+rm -f "$(Q2 $PRV3)"
+printf '%s\n' "{\"pr\":$PRV3,\"head_sha\":\"$STALE\",\"diff_sha256\":\"$EV13_H\",\"mint\":\"recovered-body\",\"recovered_at\":\"2026-01-01T00:00:00Z\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T00:00:00Z\"}" > "$(Q2 $PRV3)"
+EV13_BODY3="body
+
+$(signed_marker $PRV3 "$STALE" "$EV13_H")"
+run_record_diff $PRV3 "$STALE" "$EV13_BODY3" "$EV13_D"
+assert_eq "$RECORD_RC" "0" "13h2 a carry over a RECOVERED predecessor still records (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tail -2 | tr '\n' ' ')]"
+R13H2="$(cat "$(Q2 $PRV3)" 2>/dev/null || true)"
+assert_contains "$R13H2" '"mint":"carried"' "13h2 it is still a carry"
+if grep -q '"reviewed_at":"2026-01-01T00:00:00Z"' <<<"$R13H2"; then
+  bad "13h2 the carry INHERITED the recovered record's LOWER BOUND as a mint time"
+else
+  ok "13h2 the recovered lower bound is NOT inherited as a mint time"
+fi
+assert_contains "$RECORD_ERR" "NOT inherited" "13h2 …and the warning says so, rather than 'preserved as the original mint time'"
 
 # 13j/13k — the arms that are NOT carries must not become evidence-free side
 # doors. The gate is skipped only when CARRY_ARM set (a verified carry, whose

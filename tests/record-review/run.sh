@@ -2016,6 +2016,157 @@ rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t\ncopied\tdocs/copy.md\td
   && pass "(30xv) a rail diff carrying an EXOTIC-status row is still refused (exit 4, no record) — an unusual row is positive evidence, never a transport failure" \
   || fail "(30xv) a rail diff with a copied row was NOT refused (rc=$REC_RC) — the cap fails open on framing"
 
+echo "── 31. #1377: the PATCH identity against REAL git output ─────────"
+# The lane-dimension carry above is proven on fixture commits; this section proves
+# the PATCH predicate (`diff_identity_pair`) on what `git` itself renders. That
+# matters because the projection's whole claim — "a base move rewrites exactly the
+# blob ids, the hunk line numbers and the hunk CONTEXT, and nothing else" — is a
+# claim about GIT, not about our fixtures. A hand-written diff pair can agree with
+# a wrong projection; real `git diff` output after a real base move cannot.
+#
+# The fixture builds the shape #1377 names, using the operation the fleet actually
+# performs (`gh pr update-branch` merges the moved base into the PR branch):
+#   * the PR changes one line;
+#   * `main` lands a different change INSIDE the PR's hunk context;
+#   * the merge is clean (the two changes are on different lines), so the PR's
+#     contribution is untouched while the RENDERED context around it moves.
+# That is the case the byte-identity arm cannot see and #1377 exists for.
+awk '/^diff_identity_pair\(\) \{/,/^\}$/' "$SRC" > "$TMP/patchfn.sh"
+if grep -q 'diff_identity_pair()' "$TMP/patchfn.sh"; then
+  pass "(31) diff_identity_pair extracted from record-review.sh"
+else
+  fail "(31) could not extract diff_identity_pair from $SRC"
+fi
+export DIFF_NORMALIZER="$ROOT/scripts/lib/diff-normalize.py"
+pair_of() { # <diff-file> [normalizer] -> "<binding> <patch>" on one line (empty on failure)
+  local f="$1" norm="${2:-$DIFF_NORMALIZER}"
+  ( DIFF_NORMALIZER="$norm"; source "$TMP/patchfn.sh"; diff_identity_pair "$f" ) 2>/dev/null | tr '\t' ' '
+}
+P="$TMP/patchid"; rm -rf "$P"; mkdir -p "$P"
+Q="$TMP/patchdiffs"; rm -rf "$Q"; mkdir -p "$Q"
+( cd "$P" || exit 9
+  git init -q .; git config user.email t@t; git config user.name t
+  printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+  printf 'untouched\n' > other.txt
+  git add -A; git commit -qm base; git branch -M main
+  git checkout -qb pr
+  printf 'l1\nl2\nl3\nl4\nl5\nl6-PR\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+  git add -A; git commit -qm "the reviewed change" ) >/dev/null 2>&1 || true
+( cd "$P" && git rev-parse --verify -q HEAD >/dev/null 2>&1 ) \
+  && pass "(31) fixture repo built" || fail "(31) could not build the fixture repo"
+cd "$P" || exit 2
+REVIEWED31="$(git rev-parse HEAD)"
+# main lands a change INSIDE the PR's hunk context (3 lines around l6 → l4 is one
+# of them), on a DIFFERENT line, so the merge is clean and the PR's own change is
+# untouched.
+git checkout -q main
+printf 'l1\nl2\nl3\nMAIN-4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+git add -A; git commit -qm "main lands nearby work"
+git checkout -q pr
+git merge -q --no-edit main >/dev/null 2>&1 || true
+CURRENT31="$(git rev-parse HEAD)"
+[ "$REVIEWED31" != "$CURRENT31" ] \
+  && pass "(31) the base move really moved the head" || fail "(31) fixture is wrong: the head did not move"
+git diff --no-color --full-index "main...$REVIEWED31" > "$Q/a.diff"
+git diff --no-color --full-index "main...$CURRENT31"  > "$Q/b.diff"
+# PREMISE 1: the REVIEWED change is identical on both sides (context aside).
+REV_LINES="$(grep -E '^[+-]' "$Q/a.diff" | grep -vE '^(\+\+\+|---)' | LC_ALL=C sort)"
+CUR_LINES="$(grep -E '^[+-]' "$Q/b.diff" | grep -vE '^(\+\+\+|---)' | LC_ALL=C sort)"
+[ -n "$REV_LINES" ] && [ "$REV_LINES" = "$CUR_LINES" ] \
+  && pass "(31) the fixture's CHANGED LINES really are identical on both heads — the acceptance claim is not vacuous" \
+  || fail "(31) fixture is wrong: the base move changed the changed lines"
+# PREMISE 2: the CONTEXT really did move, or the pair would be byte-identical and
+# the acceptance would be testing the OLD arm, not this one.
+if grep -q 'MAIN-4' "$Q/b.diff" && ! grep -q 'MAIN-4' "$Q/a.diff"; then
+  pass "(31) the rendered CONTEXT really moved (b carries main's new line, a does not) — the pair is not byte-identical"
+else
+  fail "(31) fixture is wrong: the context did not move, so this pair tests nothing new"
+fi
+PA="$(pair_of "$Q/a.diff")"; PB="$(pair_of "$Q/b.diff")"
+[ -n "$PA" ] && [ -n "$PB" ] && pass "(31) the predicate read both real diffs" \
+  || fail "(31) the predicate could not read the real diffs"
+[ "${PA%% *}" != "${PB%% *}" ] \
+  && pass "(31) BINDING: a real base move MOVES the evidence digest (#1377's premise, measured on git output)" \
+  || fail "(31) the binding did not move — the premise is not exercised"
+[ "${PA##* }" = "${PB##* }" ] \
+  && pass "(31) PATCH: the same base move leaves the patch digest IDENTICAL — this is what the carry accepts" \
+  || fail "(31) the patch digest moved on an unchanged change — the arm would refuse a legitimate carry"
+
+# One changed LINE is not carried.
+printf 'l1\nl2\nl3\nl4\nl5\nl6-PR-CHANGED\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+git add -A; git commit -qm "an edit"
+EDIT31="$(git rev-parse HEAD)"
+git diff --no-color --full-index "main...$EDIT31" > "$Q/c.diff"
+PC="$(pair_of "$Q/c.diff")"
+[ "${PB##* }" != "${PC##* }" ] \
+  && pass "(31) a ONE-LINE change moves the patch digest — it must refuse (the refusal direction)" \
+  || fail "(31) a one-line change kept the same patch digest — FAIL-OPEN"
+
+# Whitespace only: the exact hole `git patch-id --stable` has.
+printf 'l1\nl2\nl3\nl4\nl5\nl6-PR\t\nl7\nl8\nl9\nl10\nl11\nl12\n' > f.txt
+git add -A; git commit -qm "whitespace only"
+WS31="$(git rev-parse HEAD)"
+git diff --no-color --full-index "main...$WS31" > "$Q/d.diff"
+PD="$(pair_of "$Q/d.diff")"
+[ "${PC##* }" != "${PD##* }" ] \
+  && pass "(31) a WHITESPACE-ONLY change moves the patch digest (patch-id --stable would not)" \
+  || fail "(31) a whitespace-only change kept the patch digest — the patch-id --stable hole is open"
+
+# Same lines at a different path.
+git checkout -q "$CURRENT31" 2>/dev/null || true
+printf 'l1\nl2\nl3\nl4\nl5\nl6-PR\nl7\nl8\nl9\nl10\nl11\nl12\n' > moved.txt
+git rm -q f.txt >/dev/null 2>&1 || true
+git add -A; git commit -qm "move the change"
+MOVED31="$(git rev-parse HEAD)"
+git diff --no-color --full-index "main...$MOVED31" > "$Q/e.diff"
+PE="$(pair_of "$Q/e.diff")"
+[ "${PB##* }" != "${PE##* }" ] \
+  && pass "(31) the same lines at a DIFFERENT PATH move the patch digest (the path is part of the identity)" \
+  || fail "(31) a path move kept the patch digest — the identity ignores paths"
+
+# ── MUTATION PINS on real output ──────────────────────────────────────────
+# A mutant projection that KEEPS context must make the acceptance assertion
+# redden: otherwise the acceptance would pass for a projection that never
+# dropped anything.
+mkdir -p "$TMP/pmut-ctx"
+python3 - "$ROOT/scripts/lib/diff-normalize.py" "$TMP/pmut-ctx/diff-normalize.py" <<'INNERPY' || true
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+needle = '        if line.startswith(" "):\n'
+assert needle in src, "context-drop needle not found"
+i = src.index(needle)
+j = src.index("            continue\n", i) + len("            continue\n")
+open(sys.argv[2], "w", encoding="utf-8").write(src[:i] + src[j:])
+INNERPY
+if [ -s "$TMP/pmut-ctx/diff-normalize.py" ]; then
+  MA="$(pair_of "$Q/a.diff" "$TMP/pmut-ctx/diff-normalize.py")"
+  MB="$(pair_of "$Q/b.diff" "$TMP/pmut-ctx/diff-normalize.py")"
+  [ -n "$MA" ] && [ "${MA##* }" != "${MB##* }" ] \
+    && pass "(31) MUTATION: with context KEPT the real base move no longer matches — the acceptance assertion is load-bearing" \
+    || fail "(31) MUTATION SURVIVED: a context-keeping projection still matched the base move"
+else
+  fail "(31) could not build the context-keeping mutant"
+fi
+# A mutant that DROPS the +/- lines must make the refusal assertion redden.
+mkdir -p "$TMP/pmut-none"
+python3 - "$ROOT/scripts/lib/diff-normalize.py" "$TMP/pmut-none/diff-normalize.py" <<'INNERPY' || true
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+needle = '        out.append(line)\n    return out\n\n\ndef _normalize_entry'
+assert needle in src, "changed-lines needle not found"
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(
+    needle, '        if line[:1] in ("+", "-"):\n            continue\n        out.append(line)\n    return out\n\n\ndef _normalize_entry', 1))
+INNERPY
+if [ -s "$TMP/pmut-none/diff-normalize.py" ]; then
+  MB2="$(pair_of "$Q/b.diff" "$TMP/pmut-none/diff-normalize.py")"
+  MC2="$(pair_of "$Q/c.diff" "$TMP/pmut-none/diff-normalize.py")"
+  [ -n "$MB2" ] && [ "${MB2##* }" = "${MC2##* }" ] \
+    && pass "(31) MUTATION: with the changed lines DROPPED the one-line edit matches — the refusal assertion is load-bearing" \
+    || fail "(31) mutation did not collapse the pair, so the refusal may pass vacuously"
+else
+  fail "(31) could not build the changed-lines-dropped mutant"
+fi
+cd "$TMP" || true
 # 138 -> 137 (round 36) -> 133 (round 37, PR #1554). The retired-mutant tails printed the SAME
 # "RETIRED" note from more than one place: the mutant BUILDER line itself carried a
 # `|| pass "NOTE ..."` (sections 24, 25 and 26) and section 26 had a bare
@@ -2030,7 +2181,7 @@ rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t\ncopied\tdocs/copy.md\td
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
 # the builder arms, so this pin is EXACT: 133, not a floor.
-MIN_ASSERTIONS=170
+MIN_ASSERTIONS=183
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

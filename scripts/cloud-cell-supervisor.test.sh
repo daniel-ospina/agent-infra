@@ -66,6 +66,42 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 
+# ⛔ EVERY MODULE A CARRIER HARD-REQUIRES MUST BE IN THE SUPERVISOR'S REQUIRED-WORKER LIST (review
+# round 6, P1 — the defect was live and the comment claiming it fixed was not). `lane.sh:75/79/97/134`,
+# `fix-one.sh:54/69/73`, `merge-one.sh`, `adopt-fix.sh` and `dispatch-merge.sh` each `. "$SELF/<mod>"`
+# and `exit 78` when it is missing — so a deployment WITHOUT that module dies at the first lane start.
+# `cmd_check` is the box's own answer to "can this cell run a controller", and a module missing from
+# its list made it answer YES about a box where every lane refuses: a FALSE PASS of exactly the kind
+# this file exists to prevent. The list had `gate-policy.sh` added while `spawn-gate.sh` — same class,
+# added by the same change — was left out, and no arm connected the two, so the comment above the
+# loop asserted a requirement the loop did not carry.
+# ⛔ THE EXPECTED SIDE IS DERIVED, BOTH WAYS: the carriers are read for what they source (never
+# re-typed here), and the shipped list is parsed out of $SUP — so neither copy can drift silently.
+# It is an INCLUSION, not an equality: a worker that no carrier sources (a controller-owned script)
+# belongs in the list and must not be reddened by this arm.
+# NB: the carriers live one directory down from $SUP, so the two sides are read from DIFFERENT paths on
+# purpose — `$SUP` is the script under test (overridable), the carriers are always this tree's.
+_CARRIERS="$HERE/orchestrator-harness"
+_REQ=""
+for _c in lane fix-one merge-one adopt-fix dispatch-merge nonblocking-dispatch; do
+  [ -f "$_CARRIERS/$_c.sh" ] || continue
+  while IFS= read -r _m; do
+    [ -n "$_m" ] || continue
+    case " $_REQ " in *" $_m "*) ;; *) _REQ="$_REQ $_m" ;; esac
+  done < <(sed -n 's/^\. "\$SELF\/\([A-Za-z0-9._-]*\.sh\)".*/\1/p' "$_CARRIERS/$_c.sh")
+done
+_REQ="${_REQ# }"
+_REQMISS=""
+for _m in $_REQ; do
+  case " $SEED_WORKERS " in *" $_m "*) ;; *) _REQMISS="$_REQMISS $_m" ;; esac
+done
+[ -n "$_REQ" ]; rc=$?
+[ "$rc" -eq 0 ] && ok "the carriers' hard-required modules were read from lane/fix-one/merge-one/adopt-fix/dispatch-merge ($_REQ) — the parity arm below is not vacuous" \
+  || bad "could not read ANY \`. \$SELF/<mod>\` source from the carriers — the parity arm below would pass on nothing"
+[ -z "$_REQMISS" ]; rc=$?
+[ "$rc" -eq 0 ] && ok "every module a carrier HARD-REQUIRES is in cmd_check's required-worker list (${_REQ// /, }) — a box missing one cannot read as 'CELL CAN RUN A CONTROLLER'" \
+  || bad "cmd_check's required-worker list is MISSING a module a carrier exits 78 without:${_REQMISS} — the box would pass check and every lane would refuse at startup"
+
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-test.XXXXXX")"
 SEED_LOG="$T/seed-sites"; : > "$SEED_LOG"
 # ⛔ HERMETIC means the CALLER's environment must not decide a fixture. agent-infra#1901 makes `OR`
@@ -2779,6 +2815,72 @@ else
 fi
 
 
+# ── §(p3) THE PIN-CLEANLINESS PREDICATE MUST NOT DRIFT (#2319 review, round 4) ────────────────────
+# `pin_dirty` answers "is the pinned harness dir the bytes the commit carries". THREE files read it: the
+# runtime resolver (scripts/harness-exec.sh, which sources scripts/lib/box.sh), this supervisor's DRIFT
+# check + provenance stamp, and the installer's provenance stamp. Round 4 found the supervisor and the
+# installer still asking the WEAKER question (`git status --porcelain`), so an IGNORED file inside the
+# pin made `check` report no drift and `apply` take "unchanged" over a tree `harness-exec.sh` refuses to
+# start — an instrument certifying the exact state it exists to catch. The bodies are compared with
+# comments excluded (the duplication IS text), and the semantics are then RUN, not assumed.
+say_case "the pin-cleanliness predicate is ONE body in three files, and it still answers the same way (§p3)"
+PINLIB="$(dirname "$SUP")/lib/box.sh"
+PINSH="$(dirname "$SUP")/orchestrator-harness/install.sh"
+extract_pin() { awk 'index($0, "pin_dirty() {")==1 {p=1} p{print} p && /^}$/{exit}' "$1"; }
+strip_c() { sed -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d'; }
+if [ -f "$PINLIB" ] && [ -f "$PINSH" ]; then
+  LP="$(extract_pin "$PINLIB" | strip_c)"
+  SP="$(extract_pin "$SUP" | strip_c)"
+  IP="$(extract_pin "$PINSH" | strip_c)"
+  if [ -n "$LP" ] && [ -n "$SP" ] && [ -n "$IP" ] && [ "$LP" = "$SP" ] && [ "$LP" = "$IP" ]; then
+    ok "pin_dirty: the supervisor's and the installer's mirrors are IDENTICAL to scripts/lib/box.sh"
+  else
+    bad "pin_dirty has DRIFTED between lib/box.sh, cloud-cell-supervisor.sh and install.sh"
+    diff <(printf '%s\n' "$LP") <(printf '%s\n' "$SP") | sed 's/^/      sup: /' | head -10
+    diff <(printf '%s\n' "$LP") <(printf '%s\n' "$IP") | sed 's/^/      ins: /' | head -10
+  fi
+  # BEHAVIOUR, not just text. The SUPERVISOR's copy is written to a file and sourced in a subshell —
+  # never by sourcing the supervisor itself, which would run its entry point inside this arm.
+  if [ -n "$SP" ]; then
+    PD="$T/pin-dirty-mirror.sh"; printf '%s\n' "$SP" > "$PD"
+    PD_TREE="$T/pdtree"; ai_init_repo "$PD_TREE"
+    printf 'tmp/\n' > "$PD_TREE/.gitignore"
+    printf 'keep\n' > "$PD_TREE/tracked.sh"
+    git -C "$PD_TREE" add .gitignore tracked.sh >/dev/null 2>&1
+    git -C "$PD_TREE" commit -q -m pinned >/dev/null 2>&1
+    pd_run() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD"; }
+    pd_run_c() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD" "$PD_TREE" .; }
+    pd_run_c >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a clean pin is CLEAN" ;; *) bad "pin_dirty (supervisor copy): a clean pin was not CLEAN" ;; esac
+    mkdir -p "$PD_TREE/tmp"; printf 'hotfix\n' > "$PD_TREE/tmp/x.sh"
+    pd_run_c >/dev/null 2>&1; case $? in 1) ok "pin_dirty (supervisor copy): a GITIGNORED hotfix is DIRTY (the state `apply` used to call unchanged)" ;; *) bad "pin_dirty (supervisor copy): a gitignored hotfix did not read as DIRTY" ;; esac
+    rm -rf "$PD_TREE/tmp"; printf 'x\n' > "$PD_TREE/.DS_Store"
+    pd_run_c >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a .DS_Store dropping is TOLERATED (one Finder visit must not brick a cell)" ;; *) bad "pin_dirty (supervisor copy): a .DS_Store refused the pin" ;; esac
+    rm -f "$PD_TREE/.DS_Store"
+    # ⛔ THE PRODUCTION CONVENTION: both instruments pass the harness SUBDIR, not the toplevel, and
+    # porcelain prints TOP-relative paths — so the tolerance must be tested through a subdir call too,
+    # or it can be dead in the instruments while alive in the runtime (review round 5: it WAS).
+    mkdir -p "$PD_TREE/scripts/orchestrator-harness"
+    : > "$PD_TREE/scripts/orchestrator-harness/.gitkeep"
+    git -C "$PD_TREE" add scripts/orchestrator-harness/.gitkeep >/dev/null 2>&1
+    git -C "$PD_TREE" commit -q -m subdir >/dev/null 2>&1
+    printf 'x\n' > "$PD_TREE/scripts/orchestrator-harness/.DS_Store"
+    pd_run_sub() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD" "$PD_TREE/scripts/orchestrator-harness" .; }
+    pd_run_sub >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a .DS_Store in the HARNESS SUBDIR is tolerated — the callers' real convention" ;; *) bad "pin_dirty (supervisor copy): a .DS_Store in the harness subdir refused the pin — the tolerance is dead where it is needed" ;; esac
+    rm -f "$PD_TREE/scripts/orchestrator-harness/.DS_Store"
+    # ⛔ A TRACKED file named like a dropping IS part of the pin: modifying it must read DIRTY. Tolerating
+    # by NAME alone made a rewritten tracked `._x` read CLEAN (review round 5).
+    printf 'tracked\n' > "$PD_TREE/scripts/orchestrator-harness/._x"
+    git -C "$PD_TREE" add scripts/orchestrator-harness/._x >/dev/null 2>&1
+    git -C "$PD_TREE" commit -q -m dropping-name >/dev/null 2>&1
+    printf 'MUTATED\n' > "$PD_TREE/scripts/orchestrator-harness/._x"
+    pd_run_sub >/dev/null 2>&1; case $? in 1) ok "pin_dirty (supervisor copy): a MODIFIED tracked '._x' is DIRTY (the name is not the property)" ;; *) bad "pin_dirty (supervisor copy): a modified tracked '._x' read CLEAN" ;; esac
+    git -C "$PD_TREE" checkout -- scripts/orchestrator-harness/._x >/dev/null 2>&1 || true
+  fi
+else
+  bad "§(p3): $PINLIB or $PINSH is missing, so the pin_dirty mirrors cannot be compared"
+fi
+
+
 # ── §(p2) AN OCTAL-LOOKING AGE AND A SECOND OWNERSHIP PREDICATE (#1856 review) ────────────────────
 # (a) etime ZERO-PADS, and `$((08 * 3600))` is a bash ERROR — "value too great for base". A live
 #     controller's age hits an 08/09 field a few percent of the time, and a failed age used to read as
@@ -4193,6 +4295,44 @@ _ar_bad="$(awk '
 [ -z "$_ar_bad" ] \
   && ok 'service mode: no "already running" answer is reachable after a completed handover' \
   || bad "service mode: an \"already running\" answer sits on the handover path (lines: $_ar_bad) — after the handover the controller is GONE, so this reports a dead pid and exits 0 without launching"
+
+# ── the scheduled layer's PLACEMENT (agent-infra#1864) ───────────────────────────────────────
+# ⛔ POSITION, NOT PRESENCE. `scheduler_ensure` must run inside cmd_start and BEFORE the
+# already-running early return: `start` is the cell's own "the cell is now alive" signal, and the
+# common start-after-stop path hits that return — so a loop that died while the controller lived is
+# revived ONLY because this call sits above it. Putting the call back below the return (the shape
+# this PR's own header warns about) would leave every assertion above green, which is why the
+# invariant is pinned here by line position rather than left to the reader of a comment.
+# It must also come AFTER assert_queue_target: --start clears the OFF switch, so running it before
+# the queue-target gate meant a start that then REFUSED had already un-stopped a deliberate --stop.
+say_case "start revives the scheduled layer, from the right place in cmd_start (#1864)"
+START_BODY="$(sed -n '/^cmd_start()/,/^}/p' "$SUP")"
+[ -n "$START_BODY" ] && ok "cmd_start was found in the supervisor" \
+  || bad "could not locate cmd_start in $SUP — this case would otherwise pass vacuously"
+# Line numbers WITHIN cmd_start's own body, so nothing outside the function can satisfy them.
+sched_ln="$(printf '%s\n' "$START_BODY" | grep -n '^  scheduler_ensure$' | head -1 | cut -d: -f1)"
+return_ln="$(printf '%s\n' "$START_BODY" | grep -n 'if tmux has-session -t "\$SESSION"' | head -1 | cut -d: -f1)"
+queue_ln="$(printf '%s\n' "$START_BODY" | grep -n '^  assert_queue_target$' | head -1 | cut -d: -f1)"
+[ -n "$sched_ln" ] && ok "start calls scheduler_ensure" \
+  || bad "cmd_start never calls scheduler_ensure — nothing revives the schedule on a running cell"
+[ -n "$return_ln" ] && ok "the already-running early return is still in cmd_start" \
+  || bad "the early return this case is about is gone from cmd_start — re-derive this assertion"
+# ⛔ ITS OWN PRESENCE GUARD, like the other two. Without it a cmd_start that no longer contains
+# `assert_queue_target` made the ordering block below skip BOTH its ok and its bad — no assertion
+# ran, and the case still reported success. A gate whose anchor can vanish silently is not a gate.
+[ -n "$queue_ln" ] && ok "cmd_start still gates on the queue target before it starts anything" \
+  || bad "assert_queue_target is gone from cmd_start — the ordering assertion below would skip vacuously"
+if [ -n "$sched_ln" ] && [ -n "$return_ln" ]; then
+  [ "$sched_ln" -lt "$return_ln" ] \
+    && ok "scheduler_ensure runs BEFORE the already-running early return (a dead loop is revived by start)" \
+    || bad "scheduler_ensure is BELOW the already-running early return (line $sched_ln vs $return_ln) — a cell whose loop died while the controller lived would stay dead"
+fi
+if [ -n "$sched_ln" ] && [ -n "$queue_ln" ]; then
+  [ "$queue_ln" -lt "$sched_ln" ] \
+    && ok "scheduler_ensure runs AFTER assert_queue_target (a refused start cannot un-stop the schedule)" \
+    || bad "scheduler_ensure runs BEFORE assert_queue_target (line $sched_ln vs $queue_ln) — a start that then refuses would already have cleared a deliberate --stop"
+fi
+
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

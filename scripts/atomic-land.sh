@@ -1947,7 +1947,7 @@ fi
 # the record is missing would leave every freshly minted record local forever.
 sync_review_registry
 if ! read_record; then
-  stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record. If the review ran on ANOTHER box, \`scripts/registry-sync.sh status\` names what this box is missing and \`scripts/registry-sync.sh pull\` MAY make it reachable once that box has LANDED or booted (#2374)."
+  stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record. Before paying for that second review: if it ran on ANOTHER box, \`scripts/registry-sync.sh status\` names what this box is missing and \`scripts/registry-sync.sh pull\` MAY make it reachable once that box has LANDED or booted (#2374); and if the PR body carries a SIGNED marker, \`scripts/record-review.sh --recover-body $PR $REPO\` rebuilds this box's record from it, verifying the HMAC first so a body edit cannot mint one (#2872)."
 fi
 # ── DOES THE QUEUE PARTICIPATE AT ALL? (decided BEFORE anything is skipped) ──
 # This probe is what makes "fall back to the existing path" true rather than nominal.
