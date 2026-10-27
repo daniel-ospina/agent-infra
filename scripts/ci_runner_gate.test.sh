@@ -472,6 +472,47 @@ assert_eq "$RC" "2" "an unreadable queue stuck-after floor → exit 2 (the compa
 assert_contains "$OUT" "queue stuck-after floor UNREADABLE" "an unreadable queue stuck-after floor names the read failure"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an unreadable queue stuck-after floor relabelled no runner"
 
+# ⛔ review P2 — A QUEUE DEEPER THAN THE READ PAGE IS UNMEASURABLE, NOT HEALTHY. The page is
+# newest-first, so its `min(created_at)` is only a LOWER BOUND on the head's age; the length leg
+# normally decides first (a queue past QUEUE_THRESHOLD returns unhealthy before the age matters),
+# but an operator who RAISES the threshold above the page size left the leg deciding on a lower
+# bound and certifying a 150-deep stalled queue as healthy. Could-not-measure (2) is this script's
+# answer for every other unread operand, so it is the answer here, and it names both values.
+echo "── #2904 (P2): a queue deeper than the read page refuses the pass, it does not read healthy ──"
+run_gate page-saturated GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 \
+  CI_GATE_QUEUE_THRESHOLD=200 --
+assert_eq "$RC" "2" "a queue deeper than the page (threshold above the page size) → exit 2"
+assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the saturation, not just a count"
+assert_contains "$OUT" "lower bound" "the refusal says WHY the head age is unusable"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated queue read advanced no state file"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated queue read relabelled no runner"
+# …and the saturation is NOT a new way to red the normal path: with the SHIPPED threshold the length
+# leg decides a 150-deep queue first (unhealthy -> fallback), which is the state it always was.
+run_gate page-saturated-shipped GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 --
+assert_eq "$RC" "0" "a 150-deep queue at the shipped threshold still ACTS (rc 0), it does not fail"
+assert_contains "$OUT" "queue/component/incident leg" "the LENGTH leg is the one that decides it"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a 150-deep queue engages the pool"
+
+# ⛔ review P1 — THE ABSORPTION FIGURES ARE NOT A HOSTED READING WHILE THE POOL IS ENGAGED. In
+# fallback mode the pool the gate itself engaged is what holds `in_progress` above zero, so counting
+# it as "hosted is absorbing" is a claim the script cannot support. The DENY direction still holds
+# in both modes (`in_progress == 0` with a stuck head ⇒ stay on the pool); only the CERTIFY wording
+# is suppressed. The strip back to `github` on the drained queue below is the PRE-EXISTING
+# drain-then-restore cycle (#2327: the pool serves only while hosted is unhealthy, and health is
+# re-tested every tick by the legs that existed before this one) — it is pinned here so nobody
+# reads it as this leg's verdict.
+echo "── #2904 (P1): while the pool is engaged, the reason never claims hosted is absorbing ──"
+run_gate fallback-attribution GH_QUEUED=16 GH_INPROGRESS=2 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
+assert_eq "$RC" "0" "a drained queue with the pool serving exits 0"
+assert_contains "$OUT" "absorption NOT attributable in mode=local" "the reason says the reading cannot be attributed to hosted"
+assert_contains "$OUT" "in_progress=2" "the reason still QUOTES the figures it read"
+assert_not_contains "$OUT" "queue absorbing" "the reason never claims hosted absorption while the pool is executing"
+# The deny direction is unchanged in fallback mode: pool engaged, nothing executing, stuck head ⇒ stay.
+run_gate fallback-deny GH_QUEUED=16 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
+assert_eq "$RC" "0" "a stuck queue with nothing executing exits 0 in fallback mode too"
+assert_contains "$OUT" "not absorbing" "and it is still named as not absorbing (the deny holds in both modes)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a stuck queue with nothing executing keeps the pool engaged"
+
 # ⛔ MUTATION: each half of the conjunction must be load-bearing. Weakening the leg to EITHER half
 # alone must redden an arm above — otherwise the arms would pass for a leg that is one of the two
 # signals it is supposed to combine, and the measured false positive (age alone) or the measured

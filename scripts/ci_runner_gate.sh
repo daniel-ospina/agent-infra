@@ -41,6 +41,10 @@ STATE_DIR="${CI_GATE_STATE_DIR:-$HOME/.pi/agent/state}"
 STATE_FILE="$STATE_DIR/ci-runner-gate.state"
 LOG_FILE="$STATE_DIR/ci-runner-gate.log"
 QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"   # queued runs = GitHub-hosted backlog
+# The runs endpoint's maximum page size, and therefore the deepest queue one read can measure. The
+# throughput leg's age is only the HEAD's age when the page held the WHOLE queue; a saturated page
+# turns it into a lower bound (review P2 — see the saturated-page refusal inside `evaluate`).
+QUEUE_PAGE=100
 # ── the THROUGHPUT (absorption) leg — agent-infra#2904 ─────────────────────────────────────────
 # ⛔ LENGTH IS NOT ABSORPTION. `queued < 60` says "not a stampede"; it cannot say "work is moving".
 # Measured 2026-10-27, daniel-ospina/tortoise: a run sat QUEUED from 10:26Z to 13:28Z — 3 h — while
@@ -61,10 +65,18 @@ QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"   # queued runs = GitHub-hosted
 # ⛔ IN mode=github THIS IS A HOSTED READING. The pool's custom labels are `self-hosted-*`, so it
 # never advertises `ubuntu-latest` in that mode, and no workflow in the repo asks for a
 # `self-hosted` label (measured 2026-10-27: 0 of 39 files in .github/workflows name `self-hosted`
-# in a `runs-on:`). So `in_progress > 0` in mode=github means hosted is executing. In FALLBACK mode
-# pool jobs can hold `in_progress` above zero — the gate then reads absorption and returns to
-# github, which is the SAME drain-then-restore cycle the existing queue leg already has by
-# construction (an engaged fallback drains the queue below `queued >= 60`).
+# in a `runs-on:`). So `in_progress > 0` in mode=github means hosted is executing.
+#
+# ⛔ IN FALLBACK MODE `in_progress > 0` IS NOT A HOSTED READING (review P1). The pool the gate has
+# just engaged is the thing executing, and its jobs hold `in_progress` above zero, so counting them
+# as "hosted is absorbing" is a claim this script cannot support. Two consequences, and the code
+# only ever asserts what it can prove:
+#   * the DENY direction stays valid in BOTH modes: `in_progress == 0` with a stuck head means
+#     NOTHING at all is executing — hosted or pool — so the gate stays on the pool;
+#   * the CERTIFY direction is suppressed in fallback mode: the reason line reports the absorption
+#     numbers but says they are NOT ATTRIBUTABLE, and the healthy verdict is the pre-existing legs'
+#     (the pool is re-tested every tick by design — #2327's fallback-only decision — and the length
+#     leg, not this one, is what restores `github` once the queue has drained below QUEUE_THRESHOLD).
 #
 # THE FLOOR, AND THE CLOCK IT IS MEASURED ON — because queue time is not run time, and this repo
 # has already burned that distinction (#3239). The number below is the age of a QUEUED run, i.e.
@@ -190,13 +202,17 @@ print(comp, len(inc))
   esac
   case "$incident" in '' | *[!0-9]*) log "incident count UNREADABLE ('${incident}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
   # ⛔ ONE READ CARRIES BOTH QUEUE FACTS (agent-infra#2904): the count the existing leg already
-  # used, and the `created_at` of the OLDEST queued run the throughput leg needs. `per_page=100`
+  # used, and the `created_at` of the OLDEST queued run the throughput leg needs. `per_page=$QUEUE_PAGE`
   # rather than 1 so the page holds the whole queue and `min(created_at)` is the true head of it.
-  # The page cap cannot hide the oldest run where it matters: the runs endpoint is newest-first, so
-  # a queue LARGER than 100 under-reports the age — but such a queue is already >= QUEUE_THRESHOLD
-  # (60), which the leg below returns unhealthy on first. So whenever the throughput leg's verdict
-  # can decide anything, it is reading every queued run.
-  queue_row="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=100" \
+  # ⛔ THE PAGE CAP CAN HIDE THE OLDEST RUN (review P2 — this used to be asserted in prose only).
+  # The runs endpoint is newest-first, so a queue LARGER than the page yields the newest page's min,
+  # i.e. a LOWER BOUND on the head age. That was previously claimed to be harmless because "such a
+  # queue is already >= QUEUE_THRESHOLD" — true at the shipped 60, FALSE whenever an operator raises
+  # QUEUE_THRESHOLD above the page size, and the operator-invisible result was a gate that read a
+  # 150-deep queue as healthy on a 60 s head. The length leg still decides first (it returns 1 on
+  # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
+  # that case is now refused by name, before the throughput leg, further down.
+  queue_row="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE" \
       --jq '[.total_count, (([.workflow_runs[].created_at]|min)//"")]|@tsv' 2>/dev/null)" \
     || { log "queue probe FAILED (gh api)"; return 2; }
   queued="${queue_row%%$'\t'*}"; oldest_created="${queue_row#*$'\t'}"
@@ -296,6 +312,19 @@ print(age)
     UNHEALTHY_LEG="queue/component/incident leg: queued=$queued (threshold $QUEUE_THRESHOLD), component=$comp, incidents=$incident"
     return 1   # unhealthy -> prefer local
   fi
+  # ⛔ A SATURATED PAGE LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather than certified
+  # (review P2). Reaching here means the length leg did NOT fire (`queued < QUEUE_THRESHOLD`), yet the
+  # queue is deeper than one page — which can only happen when an operator has raised
+  # QUEUE_THRESHOLD above the page size. In that state `oldest_queued_s` is a LOWER BOUND on the
+  # head's age (newest-first page), so a stalled queue can read young and the gate would certify
+  # healthy and strip the pool during a full stop. Could-not-measure (2) is this script's answer for
+  # every other unread operand; it is the answer here too, and the message names BOTH values so the
+  # misconfiguration is visible instead of silent.
+  if [ "$queued" -gt "$QUEUE_PAGE" ]; then
+    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing"
+    return 2
+  fi
+
   # ⛔ THE THROUGHPUT LEG (agent-infra#2904). Work is queued, the oldest queued run has waited past
   # the floor, AND nothing is executing. The conjunction is the point: measured on this repo, a
   # queue head 12,583 s (3 h 29 m) old coexists with 14 runs executing (hosted serving normally), so
@@ -303,6 +332,10 @@ print(age)
   # for the few seconds between a push and its first dispatch, so it needs the age floor. Fail ⇒
   # "hosted is not absorbing", which is precisely the state whose sanctioned exit is this script's
   # own fallback path — NOT a change to when the pool is offered (see the header's decision).
+  # ⛔ IT IS A DENY-ONLY LEG, and the deny holds in BOTH modes: `in_progress == 0` with a stuck head
+  # says nothing at all is executing (hosted or pool), so the pool stays engaged. It never CERTIFIES
+  # absorption — falling through to `return 0` is the other legs' verdict, and the reason line says
+  # the absorption figures are not attributable while the pool is the thing executing (review P1).
   if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then
     UNHEALTHY_LEG="throughput leg: queued=$queued and NO run executing while the oldest queued run has waited ${oldest_queued_s}s > ${QUEUE_STUCK_AFTER_S}s — GitHub-hosted is not absorbing the queue"
     return 1   # not absorbing -> prefer local
@@ -503,7 +536,16 @@ fi
 
 if [ "$healthy" = 0 ]; then
   want="github"
-  reason="GitHub Actions healthy (component operational, no Actions incident, queue < $QUEUE_THRESHOLD, queue absorbing: oldest_queued_s=$ABSORPTION_OLDEST_S in_progress=$ABSORPTION_IN_PROGRESS)"
+  # ⛔ THE ABSORPTION FIGURES ARE QUOTED, THE CLAIM IS NOT (review P1). In fallback mode the
+  # `in_progress` count includes the pool's own runs, so the reading cannot certify that HOSTED is
+  # absorbing — the pre-existing legs are what decided, and the reason says so instead of borrowing
+  # the absorption leg's authority for a verdict it did not reach.
+  if [ "$mode" = github ]; then
+    absorption="queue absorbing: oldest_queued_s=$ABSORPTION_OLDEST_S in_progress=$ABSORPTION_IN_PROGRESS"
+  else
+    absorption="absorption NOT attributable in mode=$mode (in_progress includes pool runs): oldest_queued_s=$ABSORPTION_OLDEST_S in_progress=$ABSORPTION_IN_PROGRESS"
+  fi
+  reason="GitHub Actions healthy (component operational, no Actions incident, queue < $QUEUE_THRESHOLD, $absorption)"
 else
   want="local"
   reason="GitHub-hosted UNHEALTHY — ${UNHEALTHY_LEG:-unknown leg}; routed CI to the local pool"
