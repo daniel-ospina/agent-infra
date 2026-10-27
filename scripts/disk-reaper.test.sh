@@ -2533,7 +2533,7 @@ assert_dir "$WT_SP" "T55c and its checkout was still left alone"
 # The token is SPACE-FREE BY CONTRACT: a reason that interpolated a path containing a space
 # (`scratch-unwritable(TMPDIR=/My Temp)`) would split at the space, parse to nothing, and turn this
 # repo's skip back into an anonymous class-wide `verdict=fail-closed` (#2443 review P1).
-OUT="$(GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
+OUT="$(REAP_WT_MAIN_PROOF=local GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "T55c the delegate itself exits 3 for a repo under a spaced path"
 assert_eq "$(printf '%s\n' "$OUT" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1)" \
     "gh-not-authenticated(rc=4)" "T55c the reason token is exact and space-free (a spaced repo path cannot split it)"
@@ -2823,10 +2823,11 @@ assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "can
     "T60 ... and the record agrees with the line (never an invented 0)"
 assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "verdict_uv=misconfigured" \
     "T60 the uv record names the state that made the total unanswerable"
-# ⛔ THE THIRD CLASS WITH NO TALLY SENTINEL. `uv` and `duplicate-install` are the two classes whose
-# fail-closed arms publish no tally and leave their counter at the initialised 0, so neither can be
-# caught by a `HAVE_*_CAND` guard the way venv/worktree are. Fixing one and not the other is how the
-# same invented zero survives a fix that claims to remove it (`candidates_uv=?` beside
+# ⛔ THE THIRD CLASS TO GET A SENTINEL. `uv` and `duplicate-install` publish no TALLY of their own, so
+# both are guarded by an explicit `HAVE_*_CAND` (set only where a measurement actually happened) rather
+# than by overloading their VERDICT — `fail-closed` means the delegate RAN, which is not a measurement,
+# and an armed uv pass has no rows to count at all. Fixing one and not the other is how the same
+# invented zero survives a fix that claims to remove it (`candidates_uv=?` beside
 # `candidates_duplicate_install=0` on ONE record), so both are pinned here, on ONE fixture.
 OUT="$(DUP_INSTALL_REAPER=/nonexistent/reap-duplicate-installs.sh run_reaper --dry-run --only duplicate-install 2>&1)"; RC=$?
 assert_eq "$RC" "3" "T60 a duplicate-install class that could not be SET UP exits fail-closed (3)"
@@ -2852,6 +2853,15 @@ ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
 assert_contains "$ST60" "verdict_uv=fail-closed" "T60 ... the verdict keeps 'ran and failed' distinct from 'could not be set up'"
 assert_contains "$ST60" "candidates_uv=?" "T60 ... and a class that MEASURED nothing claims no count"
 assert_absent "$ST60" "candidates_uv=0" "T60 ... never an invented zero for a class that ran"
+# ⛔ AND THE OPERATOR-FACING LINE MUST AGREE WITH THE RECORD. The uv class line printed the RAW counter
+# (`candidates=$count`) while every sibling printed `$(_tally_num …)`, so a refusal said `candidates=0`
+# on the line and `candidates_uv=?` in the record — the two-surfaces-disagree defect this PR exists to
+# remove, on the one class that had just been given a sentinel. Asserting only the RECORD (as the
+# earlier cut did) left that fully green: this assertion is the one that can fail on it.
+assert_contains "$(grep -F 'class=uv rc=3 verdict=fail-closed mode=dry-run' <<<"$OUT")" "candidates=?" \
+    "T60 ... and the class LINE says ? too, not a raw counter"
+assert_absent "$(grep -F 'class=uv rc=3 verdict=fail-closed mode=dry-run' <<<"$OUT")" "candidates=0" \
+    "T60 ... the raw initialised counter never reaches the operator line"
 # ⛔ AND THE ARMED PASS, WHERE THE uv OWNER PUBLISHES NO TALLY. The candidate count in a dry pass comes
 # from our scan of `DRY-RUN uv …` rows; an armed pass has none and pi-cache-reap reports no total, so
 # the answer is `?` — the counter is only assigned in the dry branch, which made every armed pass record
@@ -2881,6 +2891,23 @@ ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
 assert_contains "$ST60" "candidates_duplicate_install=3" \
     "T60 an ARMED duplicate-install pass lifts the owner's own candidate count"
 assert_absent "$ST60" "candidates_duplicate_install=0" "T60 ... instead of the structural 0 it used to record"
+# ⛔ A REFUSED CENSUS STILL PRINTS A SUMMARY — with `candidates=0` in it. Lifting that number recorded an
+# invented zero for a class that never scanned, and setting the dry sentinel unconditionally did the
+# same on the dry arm, so the dup class asserted a measurement on BOTH arms while its two siblings said
+# `?` for the same shape. `census=ok` is the evidence that makes the owner's number its own measurement.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "roots='"$T"'/t60/dup-root"; exit 0 ;; esac' \
+    'echo "SUMMARY class=duplicate-install mode=dry-run families=0 candidates=0 reaped=0 kept=0 failed=0 census=unreadable"' \
+    'exit 3' >"$T/t60-dup-refuse.sh"
+chmod +x "$T/t60-dup-refuse.sh"
+OUT="$(DUP_INSTALL_REAPER="$T/t60-dup-refuse.sh" run_reaper --dry-run --only duplicate-install 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a duplicate-install delegate that RAN and refused its census is RED (3)"
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "candidates_duplicate_install=?" \
+    "T60 a REFUSED census is not a measured 0 (its SUMMARY prints one)"
+assert_absent "$ST60" "candidates_duplicate_install=0" "T60 ... the placeholder count never reaches the record"
+assert_contains "$(grep -F 'class=duplicate-install rc=3 verdict=fail-closed mode=dry-run' <<<"$OUT")" "candidates=?" \
+    "T60 ... and the class LINE says ? too"
 # ⛔ A HALF-ANSWERED TALLY IS NOT AN ANSWER, and the venv arm let one suppress its own fallback.
 # `have_venv_tally` was set on `venvs_found=` ALONE while `reapable=` — the field the candidate count
 # actually comes from — was parsed opportunistically. So a line TRUNCATED after `venvs_found=` (a
@@ -2910,6 +2937,31 @@ assert_contains "$ST60" "classified_venv=?" \
 # A sentinel that always fires carries no information, so this pins the polarity rather than the value.
 assert_contains "$(grep -F 'pass end' <<<"$OUT")" "candidates=1" \
     "T60 a class that was never SELECTED does not taint the pass-end total"
+# ⛔ FULL COVERAGE IS WHAT MAKES A SUM AN ANSWER, and the previous cut fixed coverage per REPO while
+# leaving it per CLASS. Two repos, one answering `reapable=0` and one truncated after a single `REAP`
+# row: `have_venv_tally` was set by the FIRST repo, so the class published the partial sum —
+# `candidates=0` on the line beside `would_free_du=12MB` and the named candidate, and
+# `candidates_venv=0 tally_venv=1/2` in the record. A candidate the pass SCANNED, reported as a
+# measured zero. The count must be the row we scanned and the sum must not be published at all.
+REPO_PA="$(mk_repo t60-partial-a)"
+REPO_PB="$(mk_repo t60-partial-b)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do case "$a" in */t60-partial-a) echo "venvs_found=3 reapable=0 reaped=0 kept=3 recheck_kept=0 failed=0"; exit 0 ;; esac; done' \
+    'echo "venvs_found=1"' \
+    "echo \"REAP dead-lane 12MB $T/t60/partial-b/.venv\"" \
+    'exit 0' >"$T/t60-venv-partial.sh"
+chmod +x "$T/t60-venv-partial.sh"
+OUT="$(VENV_REAPER="$T/t60-venv-partial.sh" run_reaper --dry-run --repo "$REPO_PA" --repo "$REPO_PB" --only venv 2>&1)"; RC=$?
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "tally_venv=1/2" "T60 a PARTIAL answer is disclosed as 1/2 coverage"
+assert_contains "$ST60" "candidates_venv=1" \
+    "T60 a partial sum does not suppress the candidate the pass SCANNED"
+assert_absent "$ST60" "candidates_venv=0" \
+    "T60 ... never a measured 0 beside the candidate it just named"
+assert_contains "$ST60" "classified_venv=?" \
+    "T60 ... and the partial sum is not published as the class's classified count"
+assert_contains "$(grep -F 'class=venv' <<<"$OUT")" "candidates=1" \
+    "T60 the class LINE agrees with the record about the candidate count"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

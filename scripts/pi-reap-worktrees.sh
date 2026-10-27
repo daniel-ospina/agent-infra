@@ -1702,7 +1702,7 @@ classify_one() {
             # `rule=3` makes `grep 'rule=3'` report preserves as removals — the mirror of the defect the
             # rule-6 preserve row already carries a ⛔ for (#2756 review, P2). The suppressed rule is
             # named in words so the row still says which decision it aborted.
-            printf 'preserve\tmain-proof-vanished\t\trule=P would-be-rule=3 the ancestry proof that put this row in the removal path does NOT reproduce now (tried %s then %s) — a proof that cannot be retaken removes nothing\n' \
+            printf 'preserve\tmain-proof-vanished\t\trule=P would-remove=3 the ancestry proof that put this row in the removal path does NOT reproduce now (tried %s then %s) — a proof that cannot be retaken removes nothing\n' \
                 "${RESOLVED_MAIN:-<no-resolved-main>}" "${MAIN_REF:-<no-main-ref>}"
             return 0
         fi

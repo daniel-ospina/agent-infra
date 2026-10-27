@@ -199,6 +199,11 @@ HAVE_WT_CAND=0
 DEFERRED_REMOVE_WT=0
 HAVE_VENV_TALLY=0
 HAVE_VENV_CAND=0
+# 1 = every repo the venv class SCANNED answered its tally, so the summed counts are an answer for the
+# CLASS. 0 = at least one repo did not, and the sum is only a lower bound (`?`, or the row count in a
+# dry pass). Initialised here because the venv arm's fail-closed arms `return 3` BEFORE the loop — with
+# `set -u`, an unset read there would abort the pass instead of recording the failure.
+VENV_FULL_COVER=0
 # ⛔ THE OTHER TWO CLASSES GET REAL SENTINELS TOO. `uv` and `duplicate-install` publish no tally of
 # their own, and overloading the VERDICT for the purpose was wrong twice: `fail-closed` (the delegate
 # RAN and could not measure) is not a measurement either, and an ARMED pass has no `DRY-RUN` rows to
@@ -1304,7 +1309,7 @@ reap_uv() {
     say "$CLASS_OUT"
     [ -n "$cands" ] && say "$cands"
     if is_dry; then
-        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh) freed_df=0MB"
+        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$(_tally_num "$HAVE_UV_CAND" "$CAND_UV") would_free_du=${WOULD_UV}MB (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh) freed_df=0MB"
     else
         if [ "${DF_UV_OK:-0}" = 1 ]; then
             say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=${FREED_UV}MB df_raw=${RAW_UV}MB (df delta on $path)"
@@ -1436,22 +1441,30 @@ reap_venv() {
     # `REAP`-row scan below can only run in a dry pass (an armed pass's rows already happened), so
     # `candidates_venv` used to be a structural 0 on every armed pass — the same defect the worktree
     # arm's SUMMARY lift fixes, in the sibling class (#4529).
-    if [ "$have_venv_tally" = 1 ]; then
+    if [ "$have_venv_tally" = 1 ] && { [ "$venv_repos" -gt 0 ] && [ "$venv_tally_repos" = "$venv_repos" ]; }; then
         CLASSIFIED_VENV="$sum_v_classified"
         CAND_VENV="$sum_v_cand"
         PRESERVED_VENV="$sum_v_pres"
+        VENV_FULL_COVER=1
     fi
     # Published for the pass record, which cannot see this function is locals — the record used to
     # print these three raw, so `--only uv` wrote `verdict_venv=not-run` beside `classified_venv=0`
     # (a self-contradicting record) and a delegate that answered nothing wrote three measured zeros.
-    HAVE_VENV_TALLY="$have_venv_tally"
+    HAVE_VENV_TALLY="$VENV_FULL_COVER"
     # ⛔ A HALF-ANSWERED CLASS IS NOT AN ANSWERED ONE: with N repos, `have_*_tally` is set by ANY repo,
     # so one delegate dying after printing made the class total an undercount that looked complete.
     # The coverage is published so the record can say `tally_venv=<answered>/<scanned>`.
+    # ⛔ AND A PARTIAL SUM IS A LOWER BOUND, NOT A MEASUREMENT OF THE CLASS — `have_venv_tally` is a
+    # CLASS-level "SOME repo answered" flag while the three counts above are class TOTALS. Measured on a
+    # two-repo dry pass where repo A answered `reapable=0` and repo B's line was truncated after one
+    # `REAP` row: the class line printed `candidates=0` beside `would_free_du=12MB` and the named
+    # candidate, and the record said `candidates_venv=0 tally_venv=1/2` — a candidate the pass SCANNED,
+    # reported as a measured zero. (The previous round fixed this per REPO and left it broken per
+    # CLASS.) FULL coverage — every scanned repo answered — is what makes the sum an answer.
     VENV_TALLY_COVER="${venv_tally_repos}/${venv_repos}"
     # Same rule as the worktree arm: in a DRY pass the candidate count is OUR scan of the delegate
     # REAP rows, so classification output makes it answerable even without a tally; a refusal does not.
-    HAVE_VENV_CAND="$have_venv_tally"
+    HAVE_VENV_CAND="$VENV_FULL_COVER"
     if is_dry && grep -qE '^(REAP|KEEP|SUMMARY) ' <<<"$rows"; then HAVE_VENV_CAND=1; fi
     # Candidate rows are the owner's `REAP <reason> <N>MB <path>` lines; they carry the SIZE, which the
     # tally does not, so the row scan still runs in a dry pass for the byte estimate and the detail list.
@@ -1484,9 +1497,11 @@ reap_venv() {
                     ;;
             esac
         done <<<"$rows"
-        # The owner's `reapable=` wins when it answered; the row count is the fallback for an owner too
-        # old to print a tally (it also counts a row the owner sized as `?`, which the scan handles).
-        [ "$have_venv_tally" = 1 ] || CAND_VENV="$all_c"
+        # The owner's `reapable=` wins when it ANSWERED EVERY REPO; the row count is the fallback for an
+        # owner too old to print a tally, for a PARTIAL answer, and for a row the owner sized as `?`
+        # (which the scan handles). Never the partial sum: it is a lower bound, and printing it here
+        # suppressed this fallback and reported a scanned candidate as `0`.
+        [ "$VENV_FULL_COVER" = 1 ] || CAND_VENV="$all_c"
         [ -n "$cands" ] && say "$cands"
         say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=dry-run candidates=$(_tally_num "$HAVE_VENV_CAND" "$CAND_VENV") would_free_du=${WOULD_VENV}MB (du estimate) freed_df=0MB"
     else
@@ -1908,7 +1923,7 @@ reap_worktree() {
 # entry point adds nothing to that: it accounts, per root, with a `df` delta.
 reap_dup() {
     local roots root b a d out rc freed=0 raw=0 MEASURED=1 rows="" cands="" all_c=0 line path size why _dn reaped=0 _r _root_rem
-    local _dup_cand=0 _dup_ans=0 _dup_sum_line="" _dup_c=""
+    local _dup_cand=0 _dup_ans=0 _dup_sum_line="" _dup_c="" _dup_census=""
     local sweep_end swept
     if [ -z "$DUP_INSTALL_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=duplicate-install FAIL-CLOSED — reap-duplicate-installs.sh not found (looked at \$DUP_INSTALL_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
@@ -1950,9 +1965,18 @@ reap_dup() {
         # recorded `candidates_duplicate_install=0` and the test below caught it.
         _dup_sum_line="$(grep -F 'SUMMARY ' <<<"$out" | tail -1)"
         _dup_c="$(kv_field "$_dup_sum_line" candidates)"
-        case "${_dup_c:-}" in
-            ''|*[!0-9]*) : ;;
-            *) _dup_cand=$((_dup_cand + _dup_c)); _dup_ans=$((_dup_ans + 1)) ;;
+        _dup_census="$(kv_field "$_dup_sum_line" census)"
+        # ⛔ ONLY A `census=ok` SUMMARY IS A MEASUREMENT. A refused census still PRINTS the line —
+        # `reap-duplicate-installs.sh` emits `SUMMARY … families=0 candidates=0 … census=unreadable` —
+        # so lifting its `candidates=0` recorded an invented zero for a class that never scanned, which
+        # is the same defect as uv one arm over (the previous reviewer's P1 shape, in the sibling).
+        case "${_dup_census:-}" in
+            ok)
+                case "${_dup_c:-}" in
+                    ''|*[!0-9]*) : ;;
+                    *) _dup_cand=$((_dup_cand + _dup_c)); _dup_ans=$((_dup_ans + 1)) ;;
+                esac ;;
+            *) : ;;
         esac
         RC_DUP="$(worst_rc "$RC_DUP" "$(delegate_rc worktree "$rc")")"
         if [ "$rc" -gt 0 ]; then
@@ -2001,9 +2025,14 @@ reap_dup() {
 }disk-reaper: WOULD-REMOVE class=duplicate-install ${size}MB ${path} (du estimate — never a saving)" ;;
             esac
         done <<<"$rows"
-        CAND_DUP="$all_c"; HAVE_DUP_CAND=1
+        # ⛔ `0` IS A MEASUREMENT ONLY IF THE DELEGATE ACTUALLY CLASSIFIED. Setting the sentinel
+        # unconditionally made a REFUSED dry pass record `candidates_duplicate_install=0` beside
+        # `verdict_duplicate_install=fail-closed` — while its two siblings recorded `?` for the same
+        # shape. Evidence is a `remove` row we scanned, or the owner's own `census=ok` tally.
+        CAND_DUP="$all_c"
+        { [ "$all_c" -gt 0 ] || [ "$_dup_ans" -gt 0 ]; } && HAVE_DUP_CAND=1
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=dry-run candidates=$all_c would_free_du=${WOULD_DUP}MB (du estimate) freed_df=0MB"
+        say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=dry-run candidates=$(_tally_num "$HAVE_DUP_CAND" "$CAND_DUP") would_free_du=${WOULD_DUP}MB (du estimate) freed_df=0MB"
     else
         if [ "${DF_DUP_OK:-0}" = 1 ]; then
             say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=apply freed_df=${FREED_DUP}MB df_raw=${RAW_DUP}MB (df delta)"

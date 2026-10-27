@@ -291,10 +291,13 @@ cannot name its evidence is visibly a bug rather than a verdict:
 ⚠️ **A KEEP row never wears a REMOVE rule's number.** `rule=3` and `rule=4` both mean "remove" in the
 table below, so a preserve printed as `rule=3` was counted as a removal by anything grepping
 `rule=3` — the mirror of the rule-6 defect above. Rows that abort a removal arm therefore carry the
-pre-existing `rule=P` label and name the suppressed rule in words (`rule=P would-be-rule=3 …`), so the
-KEEP/REMOVE partition stays readable from the log alone. `main-proof-vanished` is the reason such a
-row carries: the ancestry proof that put the checkout in the removal path **did not reproduce** on the
-re-take, and a proof that cannot be retaken removes nothing.
+pre-existing `rule=P` label and name the suppressed rule in a token that **cannot collide**
+(`rule=P would-remove=3 …`): the row's only `rule=` token is `rule=P`, so `grep ' rule=3'` — the
+command that reads this table — cannot classify a preserve as a removal. (`would-be-rule=3`, the first
+cut, still matched that grep; the token is spelled to make the property true, not merely to look like
+it.) `main-proof-vanished` is the reason such a row carries: the ancestry proof that put the checkout
+in the removal path **did not reproduce** on the re-take, and a proof that cannot be retaken removes
+nothing.
 
 | # | condition (all previously applicable rules still hold) | verdict |
 |---|---|---|
