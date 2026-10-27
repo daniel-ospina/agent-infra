@@ -465,6 +465,16 @@ start_rail() {
     esac
   done
   [ "$want" = "0" ] || die "--repo needs a value (owner/repo)"
+  # ⛔ AN EMPTY `--repo` IS NOT "NO `--repo`". `start 7 --repo "$REPO"` with `REPO` unset (or `--repo=`)
+  # passes the flag checks above, sets `id_from_argv=1`, and then the identity falls back to the pin/origin
+  # BELOW — while the forward step (which is skipped precisely because `id_from_argv=1`) hands the rail an
+  # EMPTY `--repo`, which `admin-merge.sh` reads as "not explicit" and resolves from the CHECKOUT. The
+  # record then grades one repo while the rail merges another: the #2235/`--repo=X` class again, reached
+  # through the one value shape that is neither a flag nor a slug. Refuse it: a caller who passed the flag
+  # gets told it was empty, instead of a run whose identity is a guess.
+  if [ "$id_from_argv" = "1" ] && [ -z "$slug" ]; then
+    die "--repo needs a value (owner/repo) — it was given an EMPTY one, which names no repository"
+  fi
   [ -f "$RAIL" ] || die "no rail at $RAIL — set RAIL_RUN_RAIL, or run this beside admin-merge.sh"
   # The identity is RECORDED, not assumed at read time: `--repo` overrides, otherwise it comes from
   # `origin`. If neither yields one the run still starts (it can still merge) but its artifact reads
@@ -976,17 +986,17 @@ derive() {
 }
 
 status_rail() {
-  local pr="" slug="" want="" run_id="" a
+  local pr="" slug="" want="" run_id="" run_given="" repo_given="" a
   for a in "$@"; do
     case "$a" in
       # ⛔ A FLAG IS NOT A VALUE, HERE EITHER. `status 7 --run --repo fake/repo` let `--repo` overwrite
       # the still-pending `want=run`, so the poll silently answered about the NEWEST run (or about
       # another repo) instead of the one the caller pinned — against this file's own guarantee that "a
       # poller that started run A must never be shown run B's state". Refuse, naming the loser.
-      --repo) [ -z "$want" ] || die "--$want needs a value"; want=repo ;;
-      --repo=*) slug="${a#--repo=}" ;;
-      --run) [ -z "$want" ] || die "--$want needs a value"; want=run ;;
-      --run=*) run_id="${a#--run=}" ;;
+      --repo) [ -z "$want" ] || die "--$want needs a value"; want=repo; repo_given=1 ;;
+      --repo=*) slug="${a#--repo=}"; repo_given=1 ;;
+      --run) [ -z "$want" ] || die "--$want needs a value"; want=run; run_given=1 ;;
+      --run=*) run_id="${a#--run=}"; run_given=1 ;;
       *)
         if [ "$want" = "repo" ]; then slug="$a"; want=""
         elif [ "$want" = "run" ]; then run_id="$a"; want=""
@@ -995,6 +1005,16 @@ status_rail() {
     esac
   done
   [ -z "$want" ] || die "--$want needs a value"
+  # ⛔ AN EMPTY `--run` IS NOT "NO `--run`". `--run=` (or `--run "$RID"` with `RID` unset) yields `""`,
+  # and the `[ -n "$run_id" ]` test below then reads it as ABSENT and follows `latest` — so a poller that
+  # pinned run A is silently shown the NEWEST run's verdict, `landed` included. That is the exact guarantee
+  # the flag-in-value-slot guard above exists to keep, reached through a value shape it does not cover;
+  # and it made the `''` arm of the run-id validation unreachable. Same for `--repo` empty: refuse it
+  # rather than polling whatever the pin/origin happens to name.
+  if [ -n "$run_given" ] && [ -z "$run_id" ]; then die "--run needs a value"; fi
+  if [ -n "$repo_given" ] && [ -z "$slug" ]; then
+    die "--repo needs a value (owner/repo) — it was given an EMPTY one, which names no repository"
+  fi
   check_pr "$pr"
   # ⛔ `--run` IS A PATH COMPONENT. `..` or a `/` would resolve to another PR's run dir and then be
   # labelled with THIS pr, so only a plain run id is accepted.

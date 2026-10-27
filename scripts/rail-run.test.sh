@@ -820,6 +820,26 @@ OUT="$(poll 7 --run --repo fake/repo)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 2 "$RC" "ARGS: a FLAG in --run's value slot is refused by status"
 assert_contains "$TXT" "--run needs a value" "ARGS: and status names --run (the pin that would have been lost)"
 OUT="$(poll 7 --repo --run runA)"; assert_rc 2 "${OUT%%|*}" "ARGS: a FLAG in --repo's value slot is refused by status too"
+# …and an EMPTY value is neither a flag nor an identity. `--repo "$REPO"` with `REPO` unset (or
+# `--repo=`) used to pass both checks above, set `id_from_argv=1`, fall back to the pin/`origin` for the
+# SLUG — and then SKIP the forward step because argv had "supplied" the identity, handing the rail an
+# EMPTY `--repo` that `admin-merge.sh` reads as "not explicit" and resolves from the CHECKOUT. The run
+# graded one repo while the rail merged another (the #2235/`--repo=X` class, through a third shape).
+OUT="$(call start 5 --repo "")"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 2 "$RC" "ARGS: an EMPTY --repo value is refused by start (not silently re-resolved)"
+assert_contains "$TXT" "names no repository" "ARGS: and the refusal says the value named no repository"
+n_before="$(rail_invocations 5)"
+OUT="$(call start 5 --repo=)"; assert_rc 2 "${OUT%%|*}" 'ARGS: the EMPTY `--repo=` spelling is refused too'
+if [ "$(rail_invocations 5)" = "$n_before" ]; then ok "ARGS: and no rail was spawned for either empty --repo"
+else bad "ARGS: an empty --repo reached the rail (a run graded a repo it did not target)"; fi
+# The same shape on the other side: `--run=` (or `--run "$RID"` with `RID` unset) was read as ABSENT, so a
+# poller that pinned run A was silently shown the NEWEST run — `landed` included.
+OUT="$(poll 5 --run=)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 2 "$RC" 'ARGS: an EMPTY --run value is refused (it used to follow `latest`)'
+assert_contains "$TXT" "--run needs a value" "ARGS: and names --run"
+OUT="$(poll 5 --run "")"; assert_rc 2 "${OUT%%|*}" "ARGS: the two-token EMPTY --run is refused too"
+OUT="$(poll 5 --repo=)"; assert_rc 2 "${OUT%%|*}" "ARGS: an EMPTY --repo value is refused by status"
+OUT="$(poll 5 --repo "")"; assert_rc 2 "${OUT%%|*}" "ARGS: the two-token EMPTY --repo is refused by status too"
 
 # ── Z: a stale TERMINAL run does not block a new start ─────────────────────
 OUT="$(GH_MODE=open call start 105)"; RC="${OUT%%|*}"

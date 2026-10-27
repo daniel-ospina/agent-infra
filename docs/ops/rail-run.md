@@ -88,8 +88,12 @@ load-bearing distinctions honest:
   (recorder or rail); `gone-without-verdict` (22) needs positive evidence that neither is; anything
   else — including an absent or unreadable record — is `unknown` (25).
 - **"a verdict" vs "a merge"**: `landed` needs the MERGED artifact; `rc=0` alone is `exited-zero`
-  (23) unless the PR says MERGED, and a failed artifact read is `unknown` for **every** exit status,
-  so `killed`/`refused` can never be printed over a merge the API failed to report.
+  (23) unless the PR says MERGED, and a failed artifact read is `unknown` for every exit status **that
+  classifies the head** — so `killed`/`refused` can never be printed over a merge the API failed to
+  report. The one exception is `rc=2`, decided *before* that abstention by design: a usage/configuration
+  refusal is a fact about the **invocation** (the rail never analysed this head, so there is no head
+  verdict to protect), which is what keeps a run usable in a checkout whose PR read is unavailable —
+  the `refused` row above states the same exception, and a MERGED artifact still wins over it.
 - **"a merged PR" vs "a merged PR of the same number somewhere else"**: the artifact read is *about a
   PR number*, and `gh` resolves a bare number against ambient `GH_REPO` or the poller's cwd — the
   measured #2235 shape, where a cell-wide `GH_REPO` made the rail print `ALREADY MERGED` over an open
