@@ -19,9 +19,19 @@
 #                to (rows 6/7), and must not act: asserted from the emitted line plus a tmux stub log
 #                that must stay EMPTY.
 #
-# ⚠️ `CELL_VOLATILE_ROOTS` is set for the GREEN arms only: a hermetic fixture's home is under the
-# host's temp dir, exactly like `SYSTEMD_UNIT_DIR`/`SWAP_SUDO` in cloud-cell-bringup.test.sh. Every
-# RED arm runs with the SHIPPED default, so the fixture's own dirt cannot be what reddens them.
+# ⚠️ `CELL_VOLATILE_ROOTS` is set on every PASS-EXPECTATION arm — the green arms AND the mutation
+# arms (a mutation arm asserts its mutated copy now PASSES, so it is a pass-expectation arm too). A
+# hermetic fixture's home is under the host's temp dir, exactly like `SYSTEMD_UNIT_DIR`/`SWAP_SUDO`
+# in cloud-cell-bringup.test.sh. Every RED arm runs with the SHIPPED default, so the fixture's own
+# dirt cannot be what reddens them.
+#
+# ⛔ ONE PREDICATE IN PLAY PER ARM. A mutation arm that leaves a SECOND refusal live cannot go green
+# whatever the mutation does, so its "the red arm went green" claim is never exercised and the proof
+# is vacuous. Measured 2026-10-27 (this suite at 30/31): the equality mutation ran with the shipped
+# `CELL_VOLATILE_ROOTS=/tmp:/var/tmp` while its own `ENV_FILE`/`WORKDIR` sat under the host temp dir,
+# so the volatile-path predicate refused them independently — the arm read "not keyed on the
+# equality" when the equality was in fact correct. Each mutation arm below therefore pins every
+# OTHER seam the fixture would otherwise trip, and carries an UNMUTATED control on the same env.
 #
 # Run:  bash scripts/cloud-cell-bringup.verify.test.sh
 
@@ -92,11 +102,17 @@ CELL_HOME="$H" ENV_FILE="$H/keys.env" WORKDIR="$H/tortoise" \
                || bad "green: a correct cell was REFUSED (rc=$RC) — always-red gate: $OUT"
 
 # mutation: the equality made vacuous (the form that CANNOT fail, since setup_home exports
-# HOME=$CELL_HOME — this is the arm that proves the predicate is the account home, not HOME)
+# HOME=$CELL_HOME — this is the arm that proves the predicate is the account home, not HOME).
+# CELL_VOLATILE_ROOTS is pinned on BOTH halves so the volatile-path predicate is out of play and the
+# equality is the ONLY thing that can move rc — see "ONE PREDICATE IN PLAY PER ARM" in the header.
+LIB_RUN="$LIB" CELL_HOME="$T/cell-home" ENV_FILE="$H/keys.env" WORKDIR="$H/tortoise" \
+  CELL_VOLATILE_ROOTS=/nonexistent-fixture-root br check_one_home env
+[ "$RC" -ne 0 ] && ok "mutation(eq) control: unmutated, the SAME fixture is REFUSED (rc=$RC)" \
+               || bad "mutation(eq) control: unmutated accepted a second home (rc=$RC) — the mutated arm below would prove nothing"
 mutate 'if [ -z "${CELL_HOME:-}" ] || [ "$got" != "$want" ]; then' 'if false; then' "$T/mut-eq.sh" \
   || bad "mutation(eq): edit did not apply"
 LIB_RUN="$T/mut-eq.sh" CELL_HOME="$T/cell-home" ENV_FILE="$H/keys.env" WORKDIR="$H/tortoise" \
-  br check_one_home env
+  CELL_VOLATILE_ROOTS=/nonexistent-fixture-root br check_one_home env
 [ "$RC" -eq 0 ] && ok "mutation(eq): with the equality made vacuous the red arm goes GREEN (arm keys on it)" \
                || bad "mutation(eq): red arm still refuses (rc=$RC) — the arm is not keyed on the equality"
 LIB_RUN="$LIB"
