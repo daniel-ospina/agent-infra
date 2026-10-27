@@ -2251,6 +2251,13 @@ function hasBareGhWord(command: string): boolean {
  * this gate never saw.
  */
 const CONSTRUCT = /[$`{}<>]/;
+/**
+ * The WORD `merge` — not `admin-merge`, not `mergeStateStatus`, not `hasAdminMergeFlag`. A
+ * hyphen or a word character on either side means the text is naming a hyphenated identifier
+ * rather than spelling a verb, and that distinction is measured: `<!-- admin-merge-safety: … -->`
+ * must not read as a merge verb.
+ */
+const MERGE_WORD = /(^|[^\w-])merge([^\w-]|$)/;
 
 /**
  * A word as bash would resolve it: quotes stripped (`dequote`) and an ANSI-C LEADING `$`
@@ -3357,10 +3364,19 @@ export function isAdminMergeCommand(command: string): boolean {
     // false block the LITERAL arm still produces (a quoted `--admin`, once this guess has
     // already made the command a candidate); it is deliberate, and
     // `hasLiteralAdminFlag` documents why the caller accepts it.
-    return (
-      /(^|[^\w])gh\b/.test(probe) ||
-      (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
-    );
+    //
+    // ⛔ #3953: THE GUESS IS ABOUT AN OPERATION, NOT ABOUT VOCABULARY. It used to be
+    // "the text contains the word `gh`, or the words `pr` AND `merge`", which made every
+    // read-only command that merely NAMED a merge a merge it had to certify — the mandated
+    // `commits/<sha>/check-runs` read, a `branches/main/protection` projection, a heredoc
+    // body full of `hasAdminMergeFlag` identifiers. `mergeInvocationInText` asks instead
+    // for a merge VERB in argv position, and it keeps the fail-closed halves that matter: a
+    // spliced verb still counts, a verb inside a payload handed to a shell still counts, and
+    // a `gh` whose group slot is unreadable (`V="pr merge"; gh $V 999 --admin`) still
+    // counts. What it no longer counts is a READABLE `gh api`/`gh issue`/`gh pr view` call,
+    // which cannot merge anything — that is the difference between the operation and the
+    // word, and it is the whole of the #3953 class.
+    return mergeInvocationInText(bare);
   }
   // Readable text, so the only way it is still a merge is a quote-split verb
   // behind a BARE `gh` (quotes are deliberately not a construct). Requiring the
@@ -5623,6 +5639,356 @@ export function countMergeVerbs(command: string): number {
 
 export function extractMergePrNumber(command: string): number | null {
   return extractMergeSelector(command).pr;
+}
+
+/** gh flags that take a VALUE and may sit before the group (`pr`): a global flag does
+ * not make the group readable, and its value is not the group. Mirrors the shim's and
+ * `extractMergeSelector`'s value list for the two flags gh accepts BEFORE the group. */
+const GLOBAL_VALUE_FLAGS = new Set(["-R", "--repo", "-A", "--hostname"]);
+
+/** A word with a shell ASSIGNMENT prefix removed (`CMD+=gh` → `gh`, `P=pr` → `pr`).
+ * A verb assembled by appends (`CMD+=gh CMD+=' ' CMD+=pr …`) puts no token that IS the
+ * word in the stream, and bash still runs `gh pr merge` — measured as a real bypass. */
+function withoutAssignmentPrefix(word: string): string {
+  return word.replace(/^[A-Za-z_][A-Za-z0-9_]*\+?=/, "");
+}
+
+/**
+ * Is `scan.tokens[i]` a word that can BE the `gh` command word — readable (`gh`, `"gh"`), or a
+ * construct where a command word belongs (`g$'h'`, `$GH`, `$'gh'`, `${GH}`)?
+ *
+ * ⛔ THE HARD PART IS WHAT IS *NOT* A WORD. `CONSTRUCT` is a character class (`[$`{}<>]`), so it
+ * accepts RESIDUE: a heredoc's `<<'EOF'`, the `<` that `<!--` splits into, the `head}` tail of
+ * `${head}`, the `-->` that closes an HTML marker. Reading those as the `gh` command word made a
+ * heredoc that WRITES this gate's own evidence marker (`cat > f <<'EOF' … <!-- admin-merge-
+ * safety: ${head} --> … EOF`) a REFUSED read-only command — measured in review cycle 4;
+ * `origin/main` admits it. So a construct is accepted only when it CARRIES ITS INTRODUCER
+ * (`$…`, a backtick, `{…}`), and the one residue that IS a word — the tail of a split `${X}`,
+ * i.e. the tokens `$` + `X}` — is accepted only where the `${` itself begins a simple command.
+ *
+ * ⛔ NOT POSITION-GATED otherwise, deliberately: a wrapper's arguments put the command word out
+ * of the position model's reach, and requiring command position lost 168 real admin merges
+ * (`timeout 5 g$'h' $'pr' "merge" 999 --admin`) that `origin/main` refuses.
+ */
+function isGhCommandWordAt(scan: ScanTokens, i: number): boolean {
+  const raw = scan.tokens[i];
+  const w = shellWord(raw);
+  // A BARE `$` is never a command word: `${RAIL}` tokenizes to `$` + `RAIL}`, and reading the `$`
+  // as the command and `RAIL}` as its group made `bash ${RAIL} 999` a merge candidate — it would
+  // have re-created #6395's refusal of the mandated rail.
+  if (w === "") return false;
+  if (w === "gh") return true;
+  // A construct that CARRIES ITS INTRODUCER: `$GH`, `$'gh'`, `g$'h'`, `x${X}`, or a backtick.
+  // Position does not matter — a wrapper's arguments put the command word out of the position
+  // model's reach (`timeout 5 g$'h' $'pr' "merge" 999 --admin`, measured: position-gating this
+  // lost 168 real admin merges that `origin/main` refuses).
+  if (/[$`]/.test(raw)) return true;
+  // A BRACE-EXPANSION word (`{pr,merge}`) is a construct too.
+  if (/^\w*\{/.test(raw)) return true;
+  // The ONE residue that IS a word: the TAIL of a split `${X}` (tokens `$` + `X}`), and only when
+  // the `${` ITSELF begins a simple command — `GH=gh; ${GH} ${P} merge 999 --admin` is a real
+  // merge `origin/main` refuses. Command position read at the TAIL is not usable: it is true for
+  // a same-shaped `${head}` mid-line in a heredoc body, because the `{` of `${` reads as a group
+  // separator to the gap test. The `${` token is where the word starts, so that is the token the
+  // position is read at.
+  if (!/^\w*\}$/.test(raw)) return false;
+  if (i === 0 || scan.tokens[i - 1] !== "$") return false;
+  return isCommandPositionAt(scan, i - 1);
+}
+
+/**
+ * Does the command carry a `gh` command word — readable, or constructed (`g$'h'`, `$GH`)?
+ *
+ * NOT position-gated: this question is only ever asked TOGETHER with something else that is
+ * already narrow (a merge-verb window, or a top-level `ghGroupIsUnreadable` that does its own
+ * position test), and a wrapper's arguments put the command word out of the position model's
+ * reach — position-gating it lost 168 real admin merges (`timeout 5 g$'h' $'pr' "merge" 999
+ * --admin`) that `origin/main` refuses.
+ */
+export function hasGhCommandWord(command: string): boolean {
+  const scan = scanTokens(command);
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (isGhCommandWordAt(scan, i)) return true;
+  }
+  return false;
+}
+
+/**
+ * Is the GROUP slot of some `gh` command word itself UNREADABLE — a construct, where `pr` (or the
+ * whole verb) would have to be, possibly behind a global flag?
+ *
+ * `V="pr merge"; gh $V 999 --admin` reaches gh as `gh pr merge 999 --admin` while this scanner
+ * can see no verb at all, so this is the fail-closed floor under `mergeInvocationInText`. It is
+ * deliberately slot-SCOPED rather than the old "a `gh` word appears anywhere" test: a readable
+ * group (`gh api …`, `gh issue list …`) is not a merge and must not be read as one
+ * (agent-infra#3953).
+ */
+function ghGroupIsUnreadable(command: string): boolean {
+  const scan = scanTokens(command);
+  for (let i = 0; i < scan.tokens.length; i++) {
+    const w = shellWord(scan.tokens[i]);
+    if (!isCommandPositionAt(scan, i)) continue;
+    if (!isGhCommandWordAt(scan, i)) continue;
+    let j = i + 1;
+    while (j < scan.tokens.length && GLOBAL_VALUE_FLAGS.has(shellWord(scan.tokens[j]))) j += 2;
+    if (j >= scan.tokens.length) continue;
+    if (CONSTRUCT.test(scan.tokens[j])) {
+      // ⛔ A construct in the GROUP slot only pays for itself behind a READABLE `gh`. Behind a
+      // construct COMMAND word it degenerates into "two constructs and the word `admin`", the
+      // vocabulary guess this predicate replaces: `bash $AIR/scripts/verify-admin-merge-
+      // evidence.sh "$PR"`, `$PY $SCRIPT --check-admin-policy`, `$JQ "$F" --arg admin x` are
+      // read-only and were refused as unevidenced admin merges (cycle-3 review, P1, measured).
+      // The one thing that makes a construct-construct command a REAL merge is the verb: bash
+      // hands gh `<group> merge <n> <flag>`, so require the merged word after the group slot.
+      // Measured payload: `GH=gh; g$'h' $P "merge" 999 --admin`, `GH=gh; $GH $P 'merge' 999
+      // --admin` (the `GH=gh` assignment is what makes origin/main read them, and a narrowing
+      // that dropped them would be a fail-open against the base).
+      if (w === "gh") return true;
+      const verb = j + 1 < scan.tokens.length ? shellWord(scan.tokens[j + 1]) : "";
+      if (verb === "merge") return true;
+      continue;
+    }
+  }
+  return false;
+}
+
+/**
+ * Is there a `gh` … `pr` … `merge` WORD SEQUENCE in the token stream, allowing an ASSIGNMENT
+ * prefix on each word?
+ *
+ * The third fail-closed fallback, for the spellings where the verb is present but glued to an
+ * assignment so no token equals `gh`: measured `X='gh pr merge 999 --admin'; sh -c "$X"` produces
+ * the token `X=gh`, and `CMD+=gh CMD+=' ' CMD+=pr … CMD+=merge` produces one assignment per word
+ * — both were ALLOWED by the exact-word walk while the shell would run a real admin merge (a
+ * fail-open; the base refused them).
+ *
+ * Two orderings are OR-ed, and the reason is measured. At the group stage a CONSTRUCT is
+ * ambiguous: it can be the GROUP slot of an all-assembled invocation (`GH=gh; ${GH} ${P} $M 999
+ * --admin`) or a fresh COMMAND word (`GH=gh; g$'h' "pr" merge 999 --admin`, where the `GH=gh`
+ * assignment already opened the group stage). A single ordering loses one of the two — measured:
+ * group-first lost 88 real admin merges that `origin/main` refuses, command-first lost 128. Both
+ * orderings only ADD candidates, so OR-ing cannot widen the rule in a direction the other does
+ * not already reach.
+ */
+function mergeVerbSequenceInTokens(command: string): boolean {
+  return mergeVerbWalk(command, true) || mergeVerbWalk(command, false);
+}
+
+/**
+ * The walk. `groupFirst` decides which reading wins for a construct at the group stage.
+ *
+ * ⛔ THE WORD TESTS ARE WHAT BOUND IT, NOT DISTANCE. A construct only counts as a word if it is
+ * not a REDIRECTION (`2>/dev/null`, `> file`, `2>&1`, `<<<`), not a `-`-leading flag (read from the
+ * DEQUOTED word, so `$'--dry-run'` is a flag), and not shell punctuation. A heredoc writing
+ * `<!-- admin-merge-safety: ${head} -->` therefore has no reachable `gh`→group→verb triple: its
+ * `<`, `<<'EOF'` and `-->` tokens are all excluded, and what remains (`head}`) cannot complete a
+ * sequence — `origin/main` admits that heredoc, and the arms that refused it are the ones this PR
+ * narrows (measured, review cycles 4 and 5). An intermediate ADJACENCY bound was removed once
+ * these tests were in place: measured redundant on the whole corpus.
+ */
+function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
+  const scan = scanTokens(command);
+  // 0: looking for the command word, 1: for `pr`, 2: for `merge`.
+  let stage = 0;
+  for (let i = 0; i < scan.tokens.length; i++) {
+    const raw = scan.tokens[i];
+    const w = shellWord(raw);
+    const verbWord = withoutAssignmentPrefix(w);
+    // The command word is `gh`, OR a construct where a command word belongs (`g$'h'`, `$GH`,
+    // `X='gh pr merge 9'`, `CMD+=gh`). ⛔ OMITTING THE CONSTRUCT CASE WAS THE CYCLE-2 P0: bash
+    // resolves `g$'h' "pr" merge 999 --admin` to `gh pr merge 999 --admin`, and with only a
+    // literal `gh` accepted NO arm matched — the quoted `"pr"` is DATA to the data-aware count
+    // whenever the simple command's first word is not literally `gh`, the group-slot arm wants a
+    // construct in the GROUP, and this walk wanted the word `gh` in the COMMAND slot. Measured
+    // across 1 500 generated inputs: 244 real admin merges fell through that one combination.
+    // NOT position-gated, deliberately: `timeout 5 g$'h' "pr" merge …` and `sudo $GH "pr" merge
+    // …` put the command word behind a WRAPPER's arguments, which the position model does not
+    // resolve, and requiring command position there re-opened the same hole one wrapper deeper
+    // (measured). A bare `$` is excluded, so `${RAIL}` (which tokenizes to `$` + `RAIL}`) cannot
+    // be read as a command word.
+    // A LEADING DASH MEANS A FLAG, NOT A WORD -- and it has to be read from the DEQUOTED word:
+    // `$'--dry-run'` does not start with `-` as a RAW token, but bash hands gh a flag, so reading
+    // the raw text only made `$PYTHON $SCRIPT $'--dry-run'` a three-construct "merge" (measured).
+    // ⛔ A REDIRECTION IS NOT A VERB EITHER (review cycle 5, P1). `CONSTRUCT` lists `<`/`>` among
+    // the shell metacharacters, so `2>/dev/null`, `>/tmp/out`, `2>&1` and `<<<` all qualified as
+    // construct words -- and an adjacent construct at the verb stage returned true, so appending
+    // ONE redirect to a read-only command made it a candidate:
+    // `bash $AIR/scripts/verify-admin-merge-evidence.sh "$PR" 2>/dev/null` and
+    // `jq --arg admin "$X" "$F" > /tmp/out` are refused at the cycle-4 head and admitted at
+    // origin/main (measured) -- the cycle-3 over-block, re-opened one token over.
+    const isConstructWord =
+      CONSTRUCT.test(raw) &&
+      w !== "" &&
+      !w.startsWith("-") &&
+      !raw.startsWith("-") &&
+      !/^\d*[<>]/.test(raw) &&
+      !/^&>>?/.test(raw) &&
+      !/^[|&;()]+$/.test(raw);
+    const isCommandWord = /\bgh\b/.test(w) || isConstructWord;
+    if (stage === 2) {
+      if (verbWord === "merge") return true;
+      if (isConstructWord) return true;
+      // A pure-whitespace assignment (`CMD+=' '`) is a SEPARATOR being assembled, not a verb
+      // slot: skipping it is what lets `CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge` read as
+      // one invocation (measured as a real bypass).
+      if (verbWord.trim() === "") continue;
+      // A word in the verb slot that is not the verb restarts the walk (a command word here can
+      // begin a fresh sequence; anything else drops back to looking for one).
+      stage = isCommandWord ? 1 : 0;
+      continue;
+    }
+    if (stage === 1) {
+      if (verbWord === "pr" || (groupFirst && isConstructWord)) {
+        stage = 2;
+        continue;
+      }
+    }
+    if (isCommandWord) stage = 1;
+  }
+  return false;
+}
+
+/**
+ * Could an ANSI-C quote be encoding a SEPARATOR — i.e. is the token structure of this
+ * command not recoverable from the text?
+ *
+ * `sh -c gh$'\x20'pr$'\x20'merge$'\x20'999$'\x20'$V` is ONE whitespace-delimited token to
+ * any reader that does not decode `\x20`, and a real `gh pr merge 999 --admin` to bash. Three
+ * such spellings were measured as live bypasses of both layers when the surrounding rule
+ * narrowed (the `$'\x20'` family, agent-infra#1425/#1776). Where the separators are not
+ * recoverable, `mergeInvocationInText` falls back to the WORDS read — the same
+ * over-approximation the #3953 narrowing removed elsewhere, kept here because here the
+ * alternative is a fail-open, not a false block.
+ */
+function ansiCEncodesSeparator(command: string): boolean {
+  return /\$'[^']*\\(?:x[0-9a-fA-F]{2}|[0-7]{1,3}|u[0-9a-fA-F]{2,4}|U[0-9a-fA-F]{4,8}|[tnrvf])/.test(
+    command,
+  );
+}
+
+/**
+ * Does this command INVOKE a merge — the OPERATION, not the word? (agent-infra#3953)
+ *
+ * This is the candidate rule's argv-position read. The defect it closes is one line of
+ * `isAdminMergeCommand`'s old over-approximation, which answered "is this an admin
+ * merge?" with *"does the text contain the word `gh`, or the words `pr` AND `merge`?"*
+ * once a construct and the word `admin` were present. A read-only command that merely
+ * NAMES a merge therefore became a merge it had to certify:
+ *
+ *   gh api repos/o/r/branches/main/protection --jq '{enforce_admins: .enforce_admins}'
+ *   cat > /tmp/x.mjs <<'EOF' … `gh api "…/check-runs?filter=all"` … probes['hasAdminMergeFlag'] …
+ *
+ * The `{}` / backticks supply the construct and `admin` supplies the word, so both were
+ * refused with "no resolvable PR number" — a block on the very `check-runs` read the
+ * fleet rules MANDATE for answering "is the tree healthy".
+ *
+ * The replacement asks for a merge VERB in argv POSITION, and nothing weaker:
+ *   - the verb spelled (or spliced) in the argument list the shell will run — the token walk
+ *     in `countMergeVerbs`, REUSED rather than re-implemented, because two predicates for
+ *     "is this a merge" is the failure this file keeps re-learning. That walk is DATA-AWARE,
+ *     so a verb inside plain quoted data (`echo 'gh pr merge 9'`) is not an invocation —
+ *     while a payload handed to `sh -c`/`eval`/`trap` stays readable and still counts;
+ *   - a `gh` whose GROUP slot is unreadable still counts (`V="pr merge"; gh $V 999 --admin`,
+ *     `gh --hostname … $X 999 --admin`), because there the verb is not in the text at all;
+ *   - a verb ASSEMBLED with assignments still counts (`CMD+=gh CMD+=pr CMD+=merge`,
+ *     `X='gh pr merge 999 --admin'; sh -c "$X"`), where no token IS the word `gh`, and so
+ *     does an assembled COMMAND word (`g$'h' "pr" merge 999 --admin`, `$GH "pr" merge …`);
+ *   - ANYTHING `mergeVerbInText` names is a merge here too. That read is the caller's own,
+ *     and it is quote-blind where this walk is data-aware, so it catches the construct in a
+ *     VERB position behind a merely-quoted group word — a measured fail-open for the arms
+ *     above (`M=merge; gh "pr" $M 999 --admin`, and the same inside `if`/`while`/`timeout`).
+ *     The invariant is one-directional and pinned: `mergeVerbInText(c)` ⇒ this is true;
+ *   - where the separators are ANSI-C escapes (`gh$'\x20'pr …`) the token structure is not
+ *     recoverable, so it falls back to the WORDS read — an over-block kept deliberately,
+ *     because the alternative there is a fail-open.
+ *
+ * WHAT IT DELIBERATELY NO LONGER COUNTS, and why that cannot merge anything: a construct
+ * plus the word `admin` in a command whose `gh` calls are all READABLE NON-MERGE calls
+ * (`gh api …`, `gh issue …`, `gh pr view …`). No `gh` subcommand other than `pr merge`
+ * merges a PR, so a command with no merge verb in argv position cannot perform one; the
+ * placeholder that used to stand in for that signal was the word `gh`, which is a
+ * property of the VOCABULARY rather than of the operation.
+ *
+ * NOT NARROWED HERE (declared, not overlooked):
+ *   - the LITERAL `--admin` arm stays exactly as wide as it was — a command carrying the
+ *     flag AND a readable `gh pr merge` keeps the text layer's decision
+ *     (`hasLiteralAdminFlag`);
+ *   - a `--json`/`--search` value that spells a WHITESPACE-SEPARATED, UNQUOTED `pr` then
+ *     `merge` word pair (`gh pr view 1 --json pr merge`, `gh issue list --search pr merge`)
+ *     is still read as a verb pair, because at that point the text is indistinguishable from
+ *     an invocation without an argv layer. That residual is an OVER-BLOCK — the direction this
+ *     gate is allowed to be wrong in — and it is strictly narrower than the "any `gh` word"
+ *     rule it replaces. ⛔ The QUOTED spelling is NOT affected and must not be cited as the
+ *     example: `gh pr view 1 --jq 'pr merge'` is DATA (measured — `--jq` is a value-position
+ *     flag, so the mask covers both words and this function answers false; review cycle 5, P2).
+ *     A single token that merely contains both words (`--jq .merge`, `--json pr,merge`,
+ *     `mergeStateStatus`, `hasAdminMergeFlag`) is likewise not a word pair and is admitted.
+ */
+export function mergeInvocationInText(command: string): boolean {
+  // Same two normalizations the caller's own reads use: the rail's basename is not a
+  // verb (`admin-merge.sh`), and a repo flag's value is not a verb (`gh -R pr merge 9`).
+  const bare = stripRepoArgs(withoutMandatedRailPath(command));
+  // The DATA-AWARE count, deliberately: an `sh -c`/`eval`/`trap` payload stays readable
+  // through the mask (that is what keeps a wrapped verb an invocation), while a verb inside
+  // plain quoted data is not COUNTED here. A data-insensitive count was measured to add no
+  // coverage — every payload spelling it catches is already readable — and only widened the
+  // rule onto `echo`.
+  // ⛔ One arm below is DELIBERATELY quote-blind, so this FUNCTION can still answer true for
+  // quoted data: `echo 'gh pr merge 9'` is not counted here (the count masks quoted data) but
+  // the SEQUENCE WALK (arm 3) reads the words anyway, so this function answers true. That is
+  // the fail-closed direction and it is accepted, not overlooked — a quoted MENTION of a merge
+  // costs, at most, a resolvable PR number, while a missed INVOCATION costs the bypass. It is
+  // NOT simply "a candidate at origin/main": with no CONSTRUCT in the text the caller takes its
+  // readable-text branch, which requires a BARE `gh` word (`hasBareGhWord`) and a quoted mention
+  // supplies none — so the end-to-end predicate stays false for a quote-only spelling (measured:
+  // `echo 'gh pr merge 9 --admin'` has `hasAdminMergeFlag` true and is still false at
+  // origin/main AND false here, while this function is true).
+  // What must never vary is the ARM you are reading: the count is data-aware, the sequence
+  // walk is quote-blind.
+  // The shared count, tied to two other reads. On its own it is too blunt to be the candidate
+  // rule: it walks constructs ANYWHERE, so a heredoc that WRITES this gate's own evidence marker
+  // (`cat > f <<'EOF'` ... `<!-- admin-merge-safety: ${head} -->` ... `EOF`) counts as one merge
+  // there (`countMergeVerbs` is 1, unchanged by this PR) while `origin/main` admits it. So the
+  // window only counts when the command ALSO carries a `gh` command word (`hasGhCommandWord`,
+  // NOT position-gated: a wrapper's arguments hide the position) AND the word `merge`
+  // (`MERGE_WORD`, so a hyphenated identifier does not count). Measured with this gate removed:
+  // that heredoc and the bare marker fragment became REFUSED read-only commands -- the exact
+  // class #3953 is about.
+  if (countMergeVerbs(bare) > 0 && hasGhCommandWord(bare) && MERGE_WORD.test(bare)) return true;
+  if (ghGroupIsUnreadable(bare)) return true;
+  if (mergeVerbSequenceInTokens(bare)) return true;
+  // ⛔ NO DIVERGENCE FROM THE OTHER MERGE-READ (review cycle 1, P0). `mergeVerbInText` is
+  // the read the CALLER's own condition uses (`hasLiteralAdminFlag || mergeVerbInText ||
+  // !readsNonMergeGhCall`), and it is quote-BLIND where this walk is data-aware: it
+  // recognises a construct sitting in a VERB position right after a bare `gh` or `pr` word.
+  // Measured fail-open without this arm — bash hands gh `pr merge 999 --admin`, the base
+  // refused it, and every arm above missed it because the GROUP word was merely QUOTED
+  // (`"pr"` is not a CONSTRUCT) and the verb was a variable:
+  //
+  //   M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin
+  //   if true; then gh "pr" m$'e'rge 99900010 --admin; fi
+  //   timeout 5 gh "pr" m$'e'rge 99900010 --admin
+  //
+  // `countMergeVerbs` skips the quoted `"pr"` as DATA whenever the simple command's first
+  // word is not `gh` (an assignment prefix, a reserved word, a wrapper), so the verb window
+  // never closes — while `mergeVerbInText` DOES name a merge for all of them. Two predicates
+  // for "is this a merge" disagreeing is the failure this file keeps re-learning, so the
+  // candidate rule is made a SUPERSET of that read rather than a second opinion beside it.
+  // SCOPED PRECISELY: the pinned invariant is `mergeVerbInText(c) ⇒ mergeInvocationInText(c)`.
+  // `isAdminMergeCommand` is a DIFFERENT (narrower) question — it also requires
+  // `hasAdminMergeFlag`, so `gh pr merge 999` (no flag anywhere) is a merge this rule sees and
+  // the ADMIN-merge gate does not, which is correct and is how the registry gate gets it.
+  if (mergeVerbInText(bare)) return true;
+  // The separators are not recoverable from the text, so the token arms above are not a
+  // read of this command: refuse on the WORDS read, which is what the pre-#3953 rule did.
+  if (ansiCEncodesSeparator(bare)) {
+    const probe = normalizeForFlagScan(bare);
+    return (
+      /(^|[^\w])gh\b/.test(probe) ||
+      (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
+    );
+  }
+  return false;
 }
 
 /**
