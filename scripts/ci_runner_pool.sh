@@ -378,50 +378,75 @@ ORPHAN_SIG="registration has been deleted from the server"
 # then RE-REGISTERED in place (`config.sh remove` + `add` under a fresh token) keeps every old log —
 # and reading those would retire a HEALTHY registration on the strength of a failure that its current
 # `.runner` already superseded. The marker's mtime is the registration's birth, so the evidence must be
-# at least that new. (A fresh start's evidence needs no such rule: `skip_bytes` already scopes it.)
+# at least that new.
+#
+# ⛔ THE NEWEST LOG DECIDES, AND EVERY SOURCE IS BOUNDED THE SAME WAY (#2892 review, P1/P2). Three
+# defects lived in the previous shape, all of them the same mistake — one SOURCE treated as the
+# verdict, and the other sources read only as a fallback:
+#   (a) `listener.log` was consulted FIRST and returned on a match, so a NEWER `_diag` log showing a
+#       later, SUCCESSFUL start could not veto it. A log accumulates across every start in one
+#       registration's life, so one deletion line written earlier (under a skewed clock, which prints
+#       the SAME line — actions/runner#4648) authorised a retire after the clock was corrected and
+#       the install was revivable again. Now the newest log is the one that speaks: if the newest
+#       file does not carry the line, there is no evidence.
+#   (b) the `_diag` arm ignored `skip_bytes`, so on a FRESH attempt (`skip>0`) a previous attempt's
+#       diag could lend its evidence to a start that died for an unrelated reason — and rc 6 routes
+#       straight into `reclaim`, which deletes the install. A fresh attempt now bounds `_diag` by the
+#       attempt's own start time (`started`), the same way it bounds `listener.log` by byte offset.
+#   (c) a tie at the newest mtime is REFUSED rather than resolved by source order: two equally-new
+#       logs that disagree mean the pass cannot prove which attempt is the last one.
+# Candidates are deduplicated by (device, inode) first: in a real install `listener.log` is often the
+# same file as a `_diag/Runner_*.log`, and counting one file twice would manufacture the (c) conflict.
 orphan_evidence_file() {
-  local d="$1" skip="${2:-0}" f nt t=0 newest="" born=0 lmt=0 added=""
+  local d="$1" skip="${2:-0}" started="${3:-0}" f c nat mt born=0 added="" has=0
+  local best_mt=-1 best_f="" best_ok=0 conflict=0 seen=" " ident=""
   if [ -e "$d/.runner" ]; then
     born="$(stat -c %Y "$d/.runner" 2>/dev/null || stat -f %m "$d/.runner" 2>/dev/null)" || born=0
     case "$born" in ''|*[!0-9]*) born=0 ;; esac
   fi
-  # ⛔ WHICH BYTES OF `listener.log` MAY BE READ (#2892 review, P0). `skip>0` means WE started this
-  # listener and only what that start appended may speak for it. `skip=0` means the whole file is
-  # being asked — and then the same rule as `_diag` applies: an install repaired IN PLACE
-  # (`config.sh remove` + a fresh `add`, or `--replace`) keeps the old log, and its own `.runner`
-  # supersedes every line above it. Without this, a HEALTHY re-registered runner is retired on
-  # evidence from a previous life — measured by the reviewer on a fixture with a three-line change,
-  # which is why the arm looked green.
-  if [ -f "$d/listener.log" ]; then
-    if [ "$skip" -gt 0 ]; then
-      # ⛔ NO `| grep -q` (#2892 review, P1). `grep -q` exits at the first match, `tail` then dies of
-      # SIGPIPE, and under this file's `set -o pipefail` the PIPELINE returns 141 — so the `if` was
-      # FALSE with the evidence sitting in the file. Measured by the reviewer: identical 230 KB log,
-      # signature at byte 0 => `preserve why=no-orphan-evidence`, rc 0, while a <64 KB copy of the same
-      # file retired correctly. Size-dependent, so the defect appears and disappears between passes.
-      # Capturing first has no pipeline to break; `case` does the match with no external process at all.
-      added="$(tail -c "+$((skip + 1))" "$d/listener.log" 2>/dev/null)" || added=""
-      case "$added" in *"$ORPHAN_SIG"*) printf '%s' "$d/listener.log"; return 0 ;; esac
-    else
-      lmt="$(stat -c %Y "$d/listener.log" 2>/dev/null || stat -f %m "$d/listener.log" 2>/dev/null)" || lmt=0
-      case "$lmt" in ''|*[!0-9]*) lmt=0 ;; esac
-      if [ "$lmt" -ge "$born" ]; then
-        added="$(cat "$d/listener.log" 2>/dev/null)" || added=""
-        case "$added" in *"$ORPHAN_SIG"*) printf '%s' "$d/listener.log"; return 0 ;; esac
-      fi
-    fi
-  fi
+  nat=""
+  [ -f "$d/listener.log" ] && nat="$d/listener.log"$'\n'
   for f in "$d"/_diag/Runner_*.log; do
     [ -f "$f" ] || continue
-    nt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)" || continue
-    case "$nt" in ''|*[!0-9]*) continue ;; esac
-    [ "$nt" -ge "$born" ] || continue
-    if [ "$nt" -ge "$t" ]; then t="$nt"; newest="$f"; fi
+    nat="$nat$f"$'\n'
   done
-  [ -n "$newest" ] || return 1
-  added="$(cat "$newest" 2>/dev/null)" || return 1
-  case "$added" in *"$ORPHAN_SIG"*) printf '%s' "$newest"; return 0 ;; esac
-  return 1
+  [ -n "$nat" ] || return 1
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    # One physical file, one candidate — `listener.log` is frequently a link to the `_diag` log.
+    ident="$(stat -c '%d:%i' "$c" 2>/dev/null || stat -f '%d:%i' "$c" 2>/dev/null)" || ident=""
+    if [ -n "$ident" ]; then
+      case "$seen" in *" $ident "*) continue ;; esac
+      seen="$seen$ident "
+    fi
+    mt="$(stat -c %Y "$c" 2>/dev/null || stat -f %m "$c" 2>/dev/null)" || continue
+    case "$mt" in ''|*[!0-9]*) continue ;; esac
+    # A line older than the registration is not evidence about it (in-place re-registration).
+    [ "$mt" -ge "$born" ] || continue
+    # A FRESH attempt may only read what its own attempt produced — on EVERY source (review finding a).
+    if [ "$skip" -gt 0 ] && [ "$started" -gt 0 ] && [ "$mt" -lt "$started" ]; then continue; fi
+    if [ "$skip" -gt 0 ] && [ "$c" = "$d/listener.log" ]; then
+      # ⛔ NO `| grep -q` (#2892 review, P1). `grep -q` exits at the first match, `tail` then dies of
+      # SIGPIPE, and under this file's `set -o pipefail` the PIPELINE returns 141 — so the `if` was
+      # FALSE with the evidence sitting in the file. Measured: identical 230 KB log, signature at byte
+      # 0 => `preserve why=no-orphan-evidence`, rc 0, while a <64 KB copy of the same file retired
+      # correctly. Size-dependent, so the defect appeared and disappeared between passes.
+      # Capturing first has no pipeline to break; `case` matches with no external process at all.
+      added="$(tail -c "+$((skip + 1))" "$c" 2>/dev/null)" || added=""
+    else
+      added="$(cat "$c" 2>/dev/null)" || added=""
+    fi
+    case "$added" in *"$ORPHAN_SIG"*) has=1 ;; *) has=0 ;; esac
+    if [ "$mt" -gt "$best_mt" ]; then
+      best_mt="$mt"; best_f="$c"; best_ok="$has"; conflict=0
+    elif [ "$mt" -eq "$best_mt" ] && [ "$has" != "$best_ok" ]; then
+      conflict=1
+    fi
+  done <<<"$nat"
+  [ "$best_ok" = 1 ] || return 1
+  [ "$conflict" = 0 ] || return 1
+  printf '%s' "$best_f"
+  return 0
 }
 
 # clock_skew_s — |local − remote| in seconds from GitHub's OWN Date header. rc 1 = cannot measure.
@@ -519,7 +544,16 @@ slots() {
 # an escaped registration would sit outside the ceiling that is supposed to bound it. A leading `-` is
 # refused because `--name -x` would be read as a FLAG by config.sh (and `--name --dry-run` would
 # otherwise register a runner named `--dry-run` while leaving DRY at 0 — a preview that installs).
-valid_name() { case "${1:-}" in ''|.*|-*|*/*|*[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
+# ⛔ AND THE QUARANTINE SUFFIX IS RESERVED (#2892 review round 2, P2). `reclaim` renames an install to
+# `<name>.retired-<stamp>` and `registered_dirs` excludes that BY NAME (deliberately: a retired runner
+# must never re-enter capacity, and the name needs no permission to read). Nothing stopped `add --name
+# live.retired-20260101T000000Z` from minting a LIVE registration under that suffix — which then left
+# the ceiling silently and was reported by `status` as a retired leftover whose remedy is `rm -rf`.
+# Refusing the suffix here closes the only door that can create one.
+valid_name() {
+  case "${1:-}" in ''|.*|-*|*/*|*[!A-Za-z0-9._-]*) return 1 ;; *.retired-*) return 1 ;; esac
+  return 0
+}
 
 # take_name_value <verb> <argc> <value> — the `--name` arm's own contract.
 # ⛔ `shift 2` with ONE argument left FAILS WITHOUT DECREMENTING `$#`, and under `set -uo pipefail`
@@ -725,12 +759,18 @@ probe_listener() {
 # still alive → success; gone with GitHub's `registration has been deleted` line in the log → rc 6;
 # gone for any other reason → cannot-act (2), naming the log the operator has to read.
 start_listener() {
-  local d="$1" i=0 rc log before="0" ev=""
+  local d="$1" i=0 rc log before="0" started=0 ev=""
   [ -x "$d/run.sh" ] || { err "cannot-act why=runner-not-installed path=$d/run.sh"; return 2; }
   log="$d/listener.log"
   # The pre-start length, so "this attempt's" evidence can be told apart from a previous one's.
   if [ -f "$log" ]; then before="$(wc -c <"$log" 2>/dev/null | tr -d ' ')" || before=0; fi
   case "$before" in ''|*[!0-9]*) before=0 ;; esac
+  # ⛔ THE ATTEMPT'S OWN START TIME, not just the byte offset (#2892 review, P1). `skip_bytes` only
+  # scopes `listener.log`; `_diag/Runner_*.log` is a SEPARATE file per attempt, so a previous attempt's
+  # diag could still supply the deletion line for a start that died for an unrelated reason — and rc 6
+  # is routed straight to `reclaim`, which deletes the install. Both bounds are therefore passed.
+  started="$(date -u +%s 2>/dev/null)" || started=0
+  case "$started" in ''|*[!0-9]*) started=0 ;; esac
   ( cd "$d" && exec "$d/run.sh" ) >>"$log" 2>&1 &
   while [ "$i" -lt $((SETTLE_S * 2)) ]; do
     rc=0; probe_listener "$d" || rc=$?
@@ -751,7 +791,7 @@ start_listener() {
     0) say "listener_pid=$LISTENER_PID"; return 0 ;;
     2) return 2 ;;
   esac
-  if ev="$(orphan_evidence_file "$d" "$before")"; then
+  if ev="$(orphan_evidence_file "$d" "$before" "$started")"; then
     err "orphaned name=$(basename "$d") dir=$d evidence=$ev — the listener started, GitHub refused the session because THIS registration no longer exists, and the process exited; nothing about the install can bring it back: run: $SELF reclaim --name $(basename "$d")"
     return 6
   fi
@@ -817,7 +857,17 @@ cmd_status() {
   qdirs="$(for qd in "$RUNNER_ROOT"/*.retired-* "$RUNNER_ROOT"/.[!.]*.retired-*; do [ -d "$qd" ] || [ -L "$qd" ] || continue; printf '%s\n' "$qd"; done)"
   while IFS= read -r qd; do
     [ -n "$qd" ] || continue
-    printf '%-32s %-9s %-9s %s\n' "$(basename "$qd")" "-" "QUARANTINE" "retired install — rm -rf as its owner"
+    # ⛔ A QUARANTINE NAME DOES NOT PROVE ITS LISTENER IS GONE (#2892 review round 2, P2). The suffix is
+    # now reserved in `valid_name`, but a dir created by hand or by an older version can still hold a
+    # RUNNING registration. Excluding it from `slots` stays deliberate; printing `rm -rf as its owner`
+    # over a live runner is the one instruction that would delete a working registration, so a listener
+    # changes the row instead of the count. An unreadable dir keeps the plain row: its bytes must still
+    # be removable by their owner, and no probe could say otherwise.
+    if [ -r "$qd" ] && [ -x "$qd" ] && probe_listener "$qd" >/dev/null 2>&1; then
+      printf '%-32s %-9s %-9s %s\n' "$(basename "$qd")" "${LISTENER_PID:-?}" "LIVE-QUAR" "a listener is RUNNING on a retired-named install — do NOT rm -rf; stop it and retire it with reclaim"
+    else
+      printf '%-32s %-9s %-9s %s\n' "$(basename "$qd")" "-" "QUARANTINE" "retired install — rm -rf as its owner"
+    fi
     qn=$((qn + 1))
   done <<<"$qdirs"
   # ⛔ THE SUMMARY NAMES THE READING IT IS (#2381 review round 6, P1). The rows come from the PROCESS
@@ -1137,7 +1187,7 @@ cmd_restart() {
 #      precise bug that created this orphan. The stale install is removed; the name is left alone.
 #   4. IT NEVER TOUCHES A LIVE LISTENER, and `--dry-run` deletes nothing.
 cmd_reclaim() {
-  local name="" only=0 dirs="" d nm aid rc ev retired=0 preserved=0 live=0 cannot=0 refused=0 skew="" clock_checked=0 sib q="" quarantined="" removed=1 qn=0
+  local name="" only=0 dirs="" d nm aid rc ev retired=0 preserved=0 live=0 cannot=0 skew="" clock_checked=0 sib="" sib_unknown=0 q="" removed=1 qn=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) take_name_value reclaim "$#" "${2:-}" || return 1; name="${2:-}"; only=1; shift 2 ;;
@@ -1208,9 +1258,16 @@ cmd_reclaim() {
     # which makes the message tell the operator to `add --name <name>` — the one action that DELETES
     # whichever registration still holds it. Same for a live holder OUTSIDE `RUNNER_ROOT`: the pool is
     # every runner on the box, so the outside read counts too. Both are refusals, never a guess.
-    sib=""
+    # ⛔ AND A POOL ENTRY WE COULD NOT READ IS NOT "NO SIBLING EITHER" (#2892 review round 2, P2).
+    # `registration_name` returns EMPTY on an unreadable `.runner`, and the old `[ "$(…)" = "$nm" ]
+    # || continue` therefore DROPPED that entry before liveness was asked — so an unreadable holder
+    # vanished from the check, `sib` stayed empty, and the pass printed "the name is free again; run:
+    # add". An unreadable probe (rc 2) was read the same way. Both now mark the name UNVERIFIED, which
+    # suppresses the re-register advice: the retire itself is still guarded by evidence + the clock, but
+    # the one instruction that can delete a working runner is never printed on a guess.
+    sib=""; sib_unknown=0
     if [ "$nm" != "?" ]; then
-      local e plist
+      local e plist en prc
       if ! plist="$(registered_dirs)"; then
         err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT (the LIVE-holder check could not list the pool, so this pass cannot tell whether re-registering $nm would delete a working runner; nothing was retired)"
         cannot=$((cannot + 1)); continue
@@ -1218,8 +1275,12 @@ cmd_reclaim() {
       while read -r e; do
         [ -n "$e" ] || continue
         [ "$e" = "$d" ] && continue
-        [ "$(registration_name "$e")" = "$nm" ] || continue
-        if probe_listener "$e" >/dev/null 2>&1; then sib="$e"; break; fi
+        en="$(registration_name "$e")"
+        if [ -z "$en" ]; then sib_unknown=1; continue; fi
+        [ "$en" = "$nm" ] || continue
+        prc=0; probe_listener "$e" >/dev/null 2>&1 || prc=$?
+        if [ "$prc" -eq 0 ]; then sib="$e"; break; fi
+        [ "$prc" -eq 2 ] && sib_unknown=1
       done <<<"$plist"
       if [ -z "$sib" ] && ! outside="$(outside_listener_dirs)"; then
         err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT (the LIVE-holder check could not enumerate listeners outside the root; nothing was retired)"
@@ -1229,7 +1290,9 @@ cmd_reclaim() {
       if [ -z "$sib" ] && [ -n "${outside:-}" ]; then
         while read -r e; do
           [ -n "$e" ] || continue
-          [ "$(registration_name "$e")" = "$nm" ] || continue
+          en="$(registration_name "$e")"
+          if [ -z "$en" ]; then sib_unknown=1; continue; fi
+          [ "$en" = "$nm" ] || continue
           sib="$e"; break
         done <<<"$outside"
       fi
@@ -1254,9 +1317,11 @@ cmd_reclaim() {
     fi
     retired=$((retired + 1))
     removed=1
-    if ! rm -rf "$q" 2>/dev/null || [ -e "$q" ] || [ -L "$q" ]; then removed=0; qn=$((qn + 1)); quarantined="$quarantined$( [ -n "$quarantined" ] && printf ',' )$q"; fi
+    if ! rm -rf "$q" 2>/dev/null || [ -e "$q" ] || [ -L "$q" ]; then removed=0; qn=$((qn + 1)); fi
     if [ -n "$sib" ]; then
       say "retired name=$nm agent_id=$aid dir=$d evidence=$ev kept=$sib — a LIVE registration still holds this name, so nothing was re-registered (re-registering here would have deleted it)"
+    elif [ "$sib_unknown" = 1 ]; then
+      say "retired name=$nm agent_id=$aid dir=$d evidence=$ev — the name is UNVERIFIED: at least one pool entry could not be read, so this pass cannot prove no live runner holds it; do NOT run '$SELF add --name $next' until the pool is readable — re-registering a name a live runner holds DELETES that runner"
     else
       say "retired name=$nm agent_id=$aid dir=$d evidence=$ev — the name is free again; run: $SELF add --name $next"
     fi
@@ -1268,9 +1333,9 @@ cmd_reclaim() {
     "$retired" "$preserved" "$live" "$qn" "$cannot" "${skew:-unmeasured}" "$MAX_SKEW_S" "$DRY"
   # ⛔ rc 3 IS REACHABLE ONLY BEFORE THE LOOP (a name with no registration, or a refused clock): the
   # two verdicts inside the loop are cannot-act (2), because they are facts about what could not be
-  # read or done, not gate verdicts about the box. There is deliberately no `refused` counter — the
-  # first version declared one, never incremented it, and tested it, which is a gate that can never
-  # fire (the class this file's header calls out for an errored `[ ]`).
+  # read or done, not gate verdicts about the box. There is deliberately no `refused` counter — and no
+  # `refused` LOCAL either (#2892 review round 2, P2): one was declared here and never read while this
+  # comment claimed it had been removed, which is a comment asserting a fix the code did not finish.
   [ "$cannot" -eq 0 ] || return 2
   return 0
 }
@@ -1478,8 +1543,11 @@ cmd_reconcile() {
   # errored test is FALSE — so the "provisioned nothing" guard was SILENTLY DISABLED and the pass
   # exited 0 over a pool it could not list. Exactly the class the header names for every other
   # operand; the summary read must fail closed like them. `SLOTS` is CLEARED first so a failed read
-  # cannot leave the loop's earlier count in place and be printed as if it had just been measured.
-  SLOTS=""
+  # cannot leave the loop's earlier count in place and be printed as if it had just been measured —
+  # and `SLOT_REGS`/`SLOT_ORPHANED` are cleared WITH IT (#2892 review round 2, P2): they are refreshed
+  # by the same `slots` call, so clearing only `SLOTS` printed the pass's earlier registrations= /
+  # orphaned= beside `slots=unmeasured` as if that half had just been measured.
+  SLOTS=""; SLOT_REGS=""; SLOT_ORPHANED=""
   if ! slots; then
     cannot=$((cannot + 1))
   fi

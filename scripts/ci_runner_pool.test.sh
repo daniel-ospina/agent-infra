@@ -1653,6 +1653,108 @@ assert_absent "$RUNNER_ROOT/pi-runner-stale" "the stale install is gone"
 assert_file "$RUNNER_ROOT/pi-runner-live/.runner" "the live registration is untouched"
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-live")" "1" "and still serving"
 
+# ── AN UNREADABLE SIBLING NAME IS NOT "NO SIBLING" ──────────────────────────────────────────
+# Guard 3 exists so the pass never tells the operator to re-register a name a working runner holds
+# (re-registering DELETES the holder). `registration_name` returns EMPTY when a sibling's `.runner`
+# cannot be read, and the old membership test therefore dropped that sibling entirely — so the pass
+# printed "the name is free again; run: add", the one instruction that can delete a live runner.
+# Measured shape: a sibling whose `.runner` carries no readable `agentName` (here: no agentName at
+# all, which needs no permissions and so does not degrade to a root-only skip).
+# ⛔ The retire itself is still evidence+clock guarded; it is the ADVICE that must never be a guess.
+echo "── reclaim: an unreadable sibling name makes the name UNVERIFIED, never 'free again' ──"
+fresh_pool sibunknown; reset_logs
+register pi-runner-uu
+register pi-runner-us
+printf '{}\n' >"$RUNNER_ROOT/pi-runner-uu/.runner"
+printf '{\n  "agentId": 9,\n  "agentName": "shared-nm"\n}\n' >"$RUNNER_ROOT/pi-runner-us/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-us/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_contains "$out" "the name is UNVERIFIED" "the pass says it could not prove the name is free"
+case "$out" in
+  *"the name is free again"*) bad "it still printed the re-register advice over an unreadable sibling";;
+  *) ok "and it does NOT say 'the name is free again; run: add' (that is the instruction that deletes a live runner)";;
+esac
+assert_absent "$RUNNER_ROOT/pi-runner-us" "the retire still happened (evidence + clock are its guards, not this one)"
+
+# ── THE NEWEST LOG DECIDES ──────────────────────────────────────────────────────────────────
+# A log accumulates across every start in ONE registration's life, so "some line in some file" is not
+# evidence about the CURRENT state. GitHub prints the identical deletion line when session creation
+# fails on a SKEWED clock (actions/runner#4648), so an install whose clock was once wrong keeps that
+# line forever: after NTP corrected it, the install is revivable, and retiring it deletes a working
+# runner. A NEWER log that does not carry the line therefore vetoes the older one — the previous code
+# read `listener.log` first and returned on the first match, so the newer `_diag` was never consulted.
+echo "── reclaim: a NEWER log showing a later start VETOES older evidence ──"
+fresh_pool newest; reset_logs
+register pi-runner-veto
+printf '{\n  "agentId": 77,\n  "agentName": "pi-runner-veto"\n}\n' >"$RUNNER_ROOT/pi-runner-veto/.runner"
+touch -t 202601010000 "$RUNNER_ROOT/pi-runner-veto/.runner" 2>/dev/null || true
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-veto/listener.log"
+touch -t 202601010100 "$RUNNER_ROOT/pi-runner-veto/listener.log" 2>/dev/null || true
+mkdir -p "$RUNNER_ROOT/pi-runner-veto/_diag"
+printf 'Listening for Jobs\n' >"$RUNNER_ROOT/pi-runner-veto/_diag/Runner_20260101-020000-utc.log"
+touch -t 202601010200 "$RUNNER_ROOT/pi-runner-veto/_diag/Runner_20260101-020000-utc.log" 2>/dev/null || true
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "a pass with nothing retirable exits 0"
+assert_contains "$out" "preserve name=pi-runner-veto" "the registration is PRESERVED: its newest log shows a later, successful start"
+assert_file "$RUNNER_ROOT/pi-runner-veto/.runner" "and its marker is still there"
+# CONTROL: with the later log gone, the same line IS the newest evidence — so the veto above is
+# load-bearing rather than an arm that can never retire anything.
+rm -f "$RUNNER_ROOT/pi-runner-veto/_diag/Runner_20260101-020000-utc.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "control: the pass still exits 0"
+assert_contains "$out" "retired name=pi-runner-veto" "control: with no newer log, the line IS evidence and the install retires"
+assert_absent "$RUNNER_ROOT/pi-runner-veto" "control: the install is gone"
+# ── A FRESH ATTEMPT READS ONLY ITS OWN EVIDENCE, ON EVERY SOURCE ───────────────────────────
+# `skip_bytes` scoped `listener.log` only. `_diag/Runner_*.log` is a SEPARATE file per attempt, so a
+# PREVIOUS attempt's diag could supply the deletion line for a start that died for an unrelated reason
+# — and rc 6 is routed straight into `reclaim`, which deletes the install. Both sources are now
+# bounded by the attempt's own start time.
+echo "── restart: a PREVIOUS attempt's _diag is not evidence about a FRESH start ──"
+fresh_pool attempt; reset_logs
+register pi-runner-att
+touch -t 202601010000 "$RUNNER_ROOT/pi-runner-att/.runner" 2>/dev/null || true
+mkdir -p "$RUNNER_ROOT/pi-runner-att/_diag"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-att/_diag/Runner_20260101-010000-utc.log"
+touch -t 202601010100 "$RUNNER_ROOT/pi-runner-att/_diag/Runner_20260101-010000-utc.log" 2>/dev/null || true
+# This attempt's listener APPEARS (so the start is not "never appeared") and then dies without
+# printing anything: a death that is not evidence of anything.
+printf '#!/usr/bin/env bash\nsleep 1.5\nexit 1\n' >"$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener"
+chmod +x "$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener"
+out="$(RUNNER_START_SETTLE_S=3 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-att)"
+assert_eq "$?" "2" "a fresh death with no evidence from THIS attempt is cannot-act (rc 2), never rc 6"
+assert_contains "$out" "why=listener-exited" "naming the reason instead of asserting an orphan"
+assert_file "$RUNNER_ROOT/pi-runner-att/.runner" "and the install is STILL a registration (rc 6 would have retired it)"
+# CONTROL: the same line written by THIS attempt is evidence, so the scoping above is not a mute test.
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-att/_diag/Runner_20260101-030000-utc.log"
+printf '#!/usr/bin/env bash\nsleep 1.5\nexit 1\n' >"$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener"
+out="$(RUNNER_START_SETTLE_S=3 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-att)"
+assert_eq "$?" "6" "control: a line written DURING this attempt IS evidence (rc 6)"
+assert_contains "$out" "orphaned name=pi-runner-att" "control: and it names the orphan"
+
+# ── THE QUARANTINE NAMESPACE IS RESERVED, AND A LIVE INSTALL IN IT IS NEVER "rm -rf" ───────
+# `registered_dirs` excludes `*.retired-*` BY NAME (correctly: a retired runner must never re-enter
+# capacity) and `status` reports such a dir as a leftover whose remedy is `rm -rf`. Nothing stopped
+# `add --name` from MINTING a live registration under that suffix, which then left the ceiling
+# silently and was reported as deletable. The suffix is now refused; a dir that carries it anyway
+# (hand-made, or from an older version) is reported as LIVE when a listener is running on it.
+echo "── add: the quarantine SUFFIX is reserved ──"
+fresh_pool suffix; reset_logs
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-x.retired-20260101T000000Z)"
+assert_ne "$?" "0" "a name carrying the quarantine suffix is REFUSED"
+assert_absent "$RUNNER_ROOT/pi-runner-x.retired-20260101T000000Z" "and nothing was provisioned"
+echo "── status: a RUNNING listener under a retired name is never reported as deletable ──"
+fresh_pool livequar; reset_logs
+register pi-runner-lq
+mv "$RUNNER_ROOT/pi-runner-lq" "$RUNNER_ROOT/pi-runner-lq.retired-20260101T000000Z"
+QZ="$RUNNER_ROOT/pi-runner-lq.retired-20260101T000000Z"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_EXTRA="424242 $QZ/bin/Runner.Listener run" run status --all)"
+assert_contains "$out" "LIVE-QUAR" "the row says LIVE, not QUARANTINE"
+assert_contains "$out" "do NOT rm -rf" "and the remedy is the opposite of deleting a working runner"
+
 # ── THE PASS THAT MAKES IT SELF-HEALING: restart → retire → add, then idempotent ────────────
 echo "── reconcile: revives, retires, provisions — and changes nothing on a second pass ──"
 fresh_pool reheal; reset_logs
@@ -1738,7 +1840,17 @@ printf '{\n  "agentId": 55,\n  "agentName": "pi-runner-biglog"\n}\n' >"$RUNNER_R
 { printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n'
   i=0; while [ "$i" -lt 3000 ]; do printf 'INFO ordinary runner chatter line %s padding padding padding\n' "$i"; i=$((i + 1)); done
 } >"$RUNNER_ROOT/pi-runner-biglog/listener.log"
-assert_eq "$(wc -c <"$RUNNER_ROOT/pi-runner-biglog/listener.log" | tr -d ' ')" "$(wc -c <"$RUNNER_ROOT/pi-runner-biglog/listener.log" | tr -d ' ')" "fixture log built"
+# ⛔ THE PREMISE OF THIS ARM IS THE FILE'S SIZE, SO THE SIZE IS ASSERTED (#2892 review round 2, P2).
+# It used to compare the file to ITSELF, which pinned nothing: a shrunken fixture (the 64 KiB pipe
+# buffer is the whole reason the SIGPIPE defect appears only on long-lived installs, #841/#864) would
+# have silently retired this regression while the arm still printed ✅.
+bigbytes="$(wc -c <"$RUNNER_ROOT/pi-runner-biglog/listener.log" | tr -d ' ')"
+case "$bigbytes" in ''|*[!0-9]*) bigbytes=0 ;; esac
+if [ "$bigbytes" -gt 65536 ]; then
+  ok "fixture log is ${bigbytes} bytes — past the 64 KiB pipe buffer the SIGPIPE defect needs"
+else
+  bad "fixture log is ${bigbytes} bytes, which is NOT past the 64 KiB pipe buffer — this arm would prove nothing"
+fi
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
 assert_eq "$?" "0" "the pass retires it"
 assert_contains "$out" "retired name=pi-runner-biglog" "a >64 KiB log is still READ (no SIGPIPE under pipefail)"
