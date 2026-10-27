@@ -593,7 +593,22 @@ rail_attempt() {
   # this one's.
   _rf_off="$(wc -c < "$L.log" 2>/dev/null | tr -d ' ')"
   is_num "${_rf_off:-}" || _rf_off=0
-  if ( cd "$REPO" && bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
+  # ── THE HOLD-PROOF AT THE ACTION SITE (agent-infra#2867) ──
+  # The claim registry fences dispatch, not action: the rail (`admin-merge.sh`) merges with
+  # `--admin`, and nothing at the merge site verified that the lane that reached it still holds
+  # the claim for this PR at this head. So a dead harness whose claim was pruned — or a stale
+  # actor whose token a peer superseded — would still run the merge. The claim commit this worker
+  # pushed (CROSS_OWN, the fencing token) and the harness's claims.sh travel into the rail's
+  # environment; the rail refuses the merge unless `claim_action_proof` holds. An EMPTY token is
+  # deliberate: a lane that reached the rail without a head claim cannot prove ownership, and the
+  # rail refuses it (the merge is the one operation that cannot tolerate at-least-once, #1908).
+  # ⛔ The token is the HEAD claim's commit, not the landing claim's: the head key is the one that
+  # binds evidence to the sha being merged (the landing `pr-<N>` key carries no head).
+  if ( cd "$REPO" && \
+       CLAIM_ACTION_HEAD_TOKEN="${CROSS_OWN:-}" \
+       CLAIM_ACTION_CLAIMS_SH="$O/claims.sh" \
+       CLAIM_ACTION_REPO="$REPO" \
+       bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
     echo "[merge $PR] MERGED via the rail (attempt $RC_N) $(date)" >> "$L.log"
     touch "$O/state/merged-$PR.done"
     # A refusal for an older head must not outlive the merge that superseded it.
