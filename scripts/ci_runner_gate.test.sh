@@ -59,7 +59,14 @@ CMUX_LOG="$T/cmux.log"
 # the gate: the queue probe, the per-page fallback count (current_mode), the id enumeration
 # (runner_ids), and the label PUT.
 #   GH_QUEUED      queue probe .total_count (default 5)
-#   GH_MODE        queued-null | queued-empty | enum-fail | enum-garbage | ok
+#   GH_QUEUE_OLDEST_AGE  how many seconds ago the oldest QUEUED run was created (default 30 — a
+#                  queue that is about to be served). The stub renders it to a timestamp AT CALL
+#                  TIME, because the gate computes a real age from it and a fixture written once
+#                  would age out of (or into) the threshold as the suite runs. GH_QUEUE_OLDEST_AT
+#                  overrides it with a literal timestamp, which is how the unparseable case is built.
+#   GH_INPROGRESS  the in_progress count the absorption leg reads (default 2 — a repo being served)
+#   GH_MODE        queued-null | queued-empty | inprog-null | inprog-fail | oldest-junk |
+#                  enum-fail | enum-garbage | enum-badtab | ok
 #   GH_FALLBACK_N  per-page count of fallback-labelled runners (current_mode → github|local)
 #   GH_POOL_IDS    the ids the enumeration returns (default ARM64 pool members, see below)
 #   GH_RUNNER_ROWS_FILE  a file of `<id>TAB<label>` rows — the REAL enumeration shape, used by the
@@ -68,6 +75,16 @@ CMUX_LOG="$T/cmux.log"
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${GH_LOG:?}"
+# The age fixture is rendered HERE, at call time: the gate turns it into a real age, so a timestamp
+# minted when the suite starts would drift across (or into) the threshold while the suite runs.
+queue_oldest_at() {
+  if [ -n "${GH_QUEUE_OLDEST_AT:-}" ]; then printf '%s' "$GH_QUEUE_OLDEST_AT"; return; fi
+  python3 -c '
+import datetime, sys
+now = datetime.datetime.now(datetime.timezone.utc)
+print((now - datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))
+' "${GH_QUEUE_OLDEST_AGE:-30}"
+}
 # ⛔ CONSUME `--input -` (the label PUT body), because the REAL gh does. The gate calls
 # `printf '%s' "$body" | gh api -X PUT … --input -` under `set -o pipefail`, so a double that
 # exits without reading stdin lets the writer take SIGPIPE the moment this process wins the race
@@ -92,11 +109,29 @@ case "$*" in
     # GH_PUT_FAIL_ID lets a case fail ONE runner's PUT, which is how a PARTIAL relabel is built.
     case "$*" in *"/runners/${GH_PUT_FAIL_ID:-none}/labels"*) exit 1 ;; esac
     exit 0 ;;
-  *"--jq .total_count"*)
+  # ⛔ THE TWO READS OF THE #2904 THROUGHPUT LEG ARE DISTINGUISHED BY URL, not by the jq flag:
+  # the queue read carries `[.total_count, oldest created_at]` and the absorption read carries a
+  # bare `.total_count`, and a double keyed on the FLAG would answer both with one shape.
+  *"status=in_progress"*)
     case "${GH_MODE:-ok}" in
-      queued-null)  printf 'null\n' ;;
+      inprog-fail) printf 'HTTP 500: upstream error\n' >&2; exit 1 ;;
+      inprog-null) printf 'null\n' ;;
+      *)           printf '%s\n' "${GH_INPROGRESS:-2}" ;;
+    esac
+    exit 0 ;;
+  *"status=queued"*)
+    # The stub speaks the REAL jq shape: `<count> TAB <oldest created_at>` (`@tsv`), with an empty
+    # second field when nothing is queued.
+    case "${GH_MODE:-ok}" in
+      queued-null)  printf 'null\t\n' ;;
       queued-empty) printf '\n' ;;
-      *)            printf '%s\n' "${GH_QUEUED:-5}" ;;
+      oldest-junk)  printf '%s\tWed Oct 27 13:00:00 2026\n' "${GH_QUEUED:-5}" ;;
+      *)
+        if [ "${GH_QUEUED:-5}" = 0 ]; then
+          printf '0\t\n'
+        else
+          printf '%s\t%s\n' "${GH_QUEUED:-5}" "$(queue_oldest_at)"
+        fi ;;
     esac
     exit 0 ;;
   *"--paginate"*)
@@ -352,6 +387,180 @@ run_gate incident-real CURL_BODY='{"components":[{"name":"Actions","status":"ope
   GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
 assert_eq "$RC" "0" "a live Actions incident still exits 0 (the fix is not 'always fail')"
 assert_contains "$OUT" "TRANSITION unknown -> local" "a live Actions incident routes CI to the local pool"
+
+# ⛔ agent-infra#2904 — THE THROUGHPUT (ABSORPTION) LEG. The measured defect: a run sat QUEUED for 3 h
+# while the component was operational, there was no Actions incident, and the queue was under the
+# length threshold — so every leg the gate had read HEALTHY while nothing could take the work. The
+# leg is a CONJUNCTION (work queued + queue head past the stuck-after floor + NOTHING executing) and
+# these arms pin all three halves, plus the measured false-positive guard that motivated the conjunction:
+# on 2026-10-27 the live repo held a queue HEAD 3,943-12,583 s old while hosted was serving 2..14 runs, so
+# an age-only leg would have fired continuously on a healthy repo.
+echo "── #2904: a STALLED queue (healthy component, nothing executing) takes the fallback path ──"
+run_gate stall GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 --
+assert_eq "$RC" "0" "a stalled queue with a healthy component still exits 0 (it ACTS, it does not fail)"
+assert_contains "$OUT" "oldest_queued_s=36" "the probe reports the queue-wait age in SECONDS"
+assert_contains "$OUT" "in_progress=0" "the probe reports the absorption field it branched on"
+assert_contains "$OUT" "queue_stuck_after_s=1800" "the probe reports the floor it compared against"
+assert_contains "$OUT" "not absorbing" "the run NAMES the leg that failed, not just that something did"
+assert_contains "$OUT" "TRANSITION unknown -> local" "a stalled queue engages the script's OWN fallback path"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a stalled queue records mode=local"
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "a stalled queue actually relabels the pool onto ubuntu-latest"
+
+# The measured FALSE-POSITIVE GUARD, and the reason the leg is not an age test: 54 queued with a queue
+# head 12,583 s (3 h 29 m) old is what the live repo looked like while 13 runs were executing. Hosted was
+# absorbing; the gate must stay on github.
+echo "── #2904: a DEEP BUT SERVING queue (old head, runs executing) leaves mode=github ──"
+run_gate serving GH_QUEUED=54 GH_INPROGRESS=13 GH_QUEUE_OLDEST_AGE=12400 GH_FALLBACK_N=0 --
+assert_eq "$RC" "0" "a deep but serving queue exits 0"
+assert_contains "$OUT" "in_progress=13" "the probe reports the runs that ARE executing"
+assert_not_contains "$OUT" "not absorbing" "a deep but serving queue is NOT read as a stall"
+assert_contains "$OUT" "TRANSITION unknown -> github" "a deep but serving queue keeps the gate on GitHub-hosted"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "a deep but serving queue records mode=github"
+
+# …and the age floor is load-bearing for the OTHER direction: a push creates runs a few seconds before
+# the scheduler dispatches them, so `in_progress == 0` on its own is a normal transient, not a stall.
+echo "── #2904: a queue younger than the floor (nothing executing yet) is NOT a stall ──"
+run_gate young GH_QUEUED=5 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=30 GH_FALLBACK_N=0 --
+assert_eq "$RC" "0" "a young queue with nothing executing yet exits 0"
+assert_contains "$OUT" "oldest_queued_s=3" "the young queue's age is a real measurement, in seconds"
+assert_not_contains "$OUT" "not absorbing" "a young queue is not a stall (the age floor is load-bearing)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "a young queue records mode=github"
+
+# The negative control for the whole leg: an EMPTY queue with nothing executing is a readable state
+# (the repo is idle), not a stall and not a failed read. Conflating "no queue" with "stalled queue"
+# would route CI to the pool on an idle repo.
+echo "── #2904: an EMPTY queue with nothing executing is a readable zero, not a stall ──"
+run_gate idle GH_QUEUED=0 GH_INPROGRESS=0 GH_FALLBACK_N=0 --
+assert_eq "$RC" "0" "an idle repo exits 0"
+assert_contains "$OUT" "queued=0" "an idle repo reports the zero it read"
+assert_not_contains "$OUT" "UNREADABLE" "an empty queue is a readable zero, not an unreadable one"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "an idle repo records mode=github"
+
+# ⛔ A LEG THAT ERRORS is neither healthy NOR unhealthy-but-act (#2904): every unreadable input below
+# must exit 2, leave the mode alone, notify nothing and relabel nothing.
+echo "── #2904: an unreadable absorption read must FAIL CLOSED (no action either way) ──"
+run_gate stalled-inprog-fail GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
+  GH_MODE=inprog-fail --
+assert_eq "$RC" "2" "a failed in-progress read → exit 2 (could-not-measure)"
+assert_contains "$OUT" "in-progress probe FAILED" "the failure NAMES the read that failed"
+assert_contains "$OUT" "HTTP 500" "the failure carries gh's reason (not swallowed)"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a failed in-progress read advanced no state file"
+assert_not_contains "$OUT" "TRANSITION" "a failed in-progress read sent no transition notification"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a failed in-progress read relabelled no runner"
+
+run_gate inprog-null GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
+  GH_MODE=inprog-null --
+assert_eq "$RC" "2" "a null in-progress count → exit 2 (never 'nothing executing')"
+assert_contains "$OUT" "in_progress count UNREADABLE" "a null in-progress count names the read failure"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a null in-progress count advanced no state file"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a null in-progress count relabelled no runner"
+
+# A queue head whose timestamp cannot be parsed (a schema change, a truncated body) is a FAILED read of
+# the queue, never "a young queue": reading it as young would silently disarm the leg.
+run_gate oldest-junk GH_MODE=oldest-junk GH_QUEUED=18 GH_INPROGRESS=0 GH_FALLBACK_N=0 --
+assert_eq "$RC" "2" "an unparseable queue-head timestamp → exit 2 (never 'young queue')"
+assert_contains "$OUT" "oldest queued timestamp UNREADABLE" "an unparseable queue head names the read failure"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "an unparseable queue head advanced no state file"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an unparseable queue head relabelled no runner"
+
+# The stuck-after floor is the other operand of the same numeric test, so it gets the same guard the
+# queue threshold got in #1704 — a non-numeric floor would error the comparison, which reads as
+# HEALTHY.
+run_gate stall-junk-threshold GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
+  CI_GATE_QUEUE_STUCK_AFTER_S=abc --
+assert_eq "$RC" "2" "an unreadable queue stuck-after floor → exit 2 (the comparison cannot run)"
+assert_contains "$OUT" "queue stuck-after floor UNREADABLE" "an unreadable queue stuck-after floor names the read failure"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an unreadable queue stuck-after floor relabelled no runner"
+
+# ⛔ review P2 — A QUEUE DEEPER THAN THE READ PAGE IS UNMEASURABLE, NOT HEALTHY. The page is
+# newest-first, so its `min(created_at)` is only a LOWER BOUND on the head's age; the length leg
+# normally decides first (a queue past QUEUE_THRESHOLD returns unhealthy before the age matters),
+# but an operator who RAISES the threshold above the page size left the leg deciding on a lower
+# bound and certifying a 150-deep stalled queue as healthy. Could-not-measure (2) is this script's
+# answer for every other unread operand, so it is the answer here, and it names both values.
+echo "── #2904 (P2): a queue deeper than the read page refuses the pass, it does not read healthy ──"
+run_gate page-saturated GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 \
+  CI_GATE_QUEUE_THRESHOLD=200 --
+assert_eq "$RC" "2" "a queue deeper than the page (threshold above the page size) → exit 2"
+assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the saturation, not just a count"
+assert_contains "$OUT" "lower bound" "the refusal says WHY the head age is unusable"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated queue read advanced no state file"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated queue read relabelled no runner"
+# …and the saturation is NOT a new way to red the normal path: with the SHIPPED threshold the length
+# leg decides a 150-deep queue first (unhealthy -> fallback), which is the state it always was.
+run_gate page-saturated-shipped GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 --
+assert_eq "$RC" "0" "a 150-deep queue at the shipped threshold still ACTS (rc 0), it does not fail"
+assert_contains "$OUT" "queue/component/incident leg" "the LENGTH leg is the one that decides it"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a 150-deep queue engages the pool"
+
+# ⛔ review P1 — THE ABSORPTION FIGURES ARE NOT A HOSTED READING WHILE THE POOL IS ENGAGED. In
+# fallback mode the pool the gate itself engaged is what holds `in_progress` above zero, so counting
+# it as "hosted is absorbing" is a claim the script cannot support. The DENY direction still holds
+# in both modes (`in_progress == 0` with a stuck head ⇒ stay on the pool); only the CERTIFY wording
+# is suppressed. The strip back to `github` on the drained queue below is the PRE-EXISTING
+# drain-then-restore cycle (#2327: the pool serves only while hosted is unhealthy, and health is
+# re-tested every tick by the legs that existed before this one) — it is pinned here so nobody
+# reads it as this leg's verdict.
+echo "── #2904 (P1): while the pool is engaged, the reason never claims hosted is absorbing ──"
+run_gate fallback-attribution GH_QUEUED=16 GH_INPROGRESS=2 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
+assert_eq "$RC" "0" "a drained queue with the pool serving exits 0"
+assert_contains "$OUT" "absorption NOT attributable in mode=local" "the reason says the reading cannot be attributed to hosted"
+assert_contains "$OUT" "in_progress=2" "the reason still QUOTES the figures it read"
+assert_not_contains "$OUT" "queue absorbing" "the reason never claims hosted absorption while the pool is executing"
+# The deny direction is unchanged in fallback mode: pool engaged, nothing executing, stuck head ⇒ stay.
+run_gate fallback-deny GH_QUEUED=16 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
+assert_eq "$RC" "0" "a stuck queue with nothing executing exits 0 in fallback mode too"
+assert_contains "$OUT" "not absorbing" "and it is still named as not absorbing (the deny holds in both modes)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a stuck queue with nothing executing keeps the pool engaged"
+
+# ⛔ MUTATION: each half of the conjunction must be load-bearing. Weakening the leg to EITHER half
+# alone must redden an arm above — otherwise the arms would pass for a leg that is one of the two
+# signals it is supposed to combine, and the measured false positive (age alone) or the measured
+# transient (in_progress alone) would come back with a green suite.
+echo "── #2904: MUTATIONS — both halves of the leg are load-bearing ──"
+MUT_ANCHOR='  if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then'
+mutant_gate() { # <out> <replacement if-line>
+  python3 - "$GATE" "$1" "$MUT_ANCHOR" "$2" <<'PY'
+import sys
+src, dst, anchor, repl = sys.argv[1:5]
+text = open(src, encoding="utf-8").read()
+if anchor not in text:
+    sys.exit("mutation anchor not found — the throughput leg moved, so this mutation is stale")
+open(dst, "w", encoding="utf-8").write(text.replace(anchor, repl, 1))
+PY
+}
+
+MUT1="$T/ci_runner_gate.mutant-ageonly.sh"
+if mutant_gate "$MUT1" '  if [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then'; then
+  ok "(m1) the age-only mutant was generated from the SHIPPED gate (anchor present)"
+  GATE_UNDER_TEST="$MUT1"
+  run_gate mutant-ageonly GH_QUEUED=54 GH_INPROGRESS=13 GH_QUEUE_OLDEST_AGE=12400 GH_FALLBACK_N=0 --
+  GATE_UNDER_TEST=""
+  assert_eq "$RC" "0" "(m1) the mutant still RUNS (rc=0) — so the red below is the property, not a crash"
+  if [ "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" = "github" ]; then
+    bad "(m1) MUTATION SURVIVED: with the absorption conjunct gone, a SERVING queue still reads healthy — the 'deep but serving' arm is not load-bearing"
+  else
+    ok "(m1) mutation killed: a serving queue (in_progress=13) is now read as a stall and routed to the pool"
+  fi
+else
+  bad "(m1) the mutant gate could not be generated (the mutation anchor moved) — the conjunction is unproven"
+fi
+
+MUT2="$T/ci_runner_gate.mutant-nofoor.sh"
+if mutant_gate "$MUT2" '  if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ]; then'; then
+  ok "(m2) the no-age-floor mutant was generated from the SHIPPED gate (anchor present)"
+  GATE_UNDER_TEST="$MUT2"
+  run_gate mutant-nofoor GH_QUEUED=5 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=5 GH_FALLBACK_N=0 --
+  GATE_UNDER_TEST=""
+  assert_eq "$RC" "0" "(m2) the mutant still RUNS (rc=0) — so the red below is the property, not a crash"
+  if [ "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" = "github" ]; then
+    bad "(m2) MUTATION SURVIVED: with the age floor gone, a 5-second-old queue still reads healthy — the 'young queue' arm is not load-bearing"
+  else
+    ok "(m2) mutation killed: a queue that is 5 s old (a push ahead of its dispatch) is now read as a stall"
+  fi
+else
+  bad "(m2) the mutant gate could not be generated (the mutation anchor moved) — the age floor is unproven"
+fi
 
 echo "── #1704(2): a failed runner enumeration must FAIL CLOSED ──"
 # threshold 1 + queued 5 + a readable pool reading `github` ⇒ want=local, so the gate DOES attempt a

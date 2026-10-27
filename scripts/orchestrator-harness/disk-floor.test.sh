@@ -10,6 +10,9 @@
 #   (a) BELOW the floor with a reclaimable uv cache  -> reclaims, RE-MEASURES, and DISPATCHES
 #   (b) BELOW the floor with nothing reclaimable     -> SKIPS, names free MB + floor, does NOT dispatch
 #   (c) ABOVE the floor                              -> UNCHANGED: no reclaim, dispatch proceeds
+#   (e) the two AGE-FLOOR env seams                  -> unset / empty / unusable / literal 0 /
+#                                                       leading-zero all resolve to 86400; a usable
+#                                                       value moves the floor. Sourced, not driven.
 #
 # ⛔ NON-VACUITY (case d). (b) passing is only meaningful if it FAILS when the gate is reverted. The
 # suite therefore reverts the gate IN A COPY of disk-floor.sh — the shipped file is never edited — and
@@ -158,6 +161,45 @@ else
   run_gate "$FLOOR_D" 1
   ck "(d) the SHIPPED gate on the same fixture still returns 1 (the difference is the gate)" '[ "$RC" = 1 ]'
 fi
+
+# ── the two AGE-FLOOR env seams ───────────────────────────────────────────────────────────────────
+# The declarations registry (`extensions/shared/heartbeat-progress-edges.ts`,
+# STALL_TERM_REGISTRY) registers DISK_FLOOR_COPY_MIN_AGE_S and DISK_FLOOR_SCRATCH_MIN_AGE_S, and its
+# reverse scan went RED on main for the weeks they were unregistered. Registering a term that nothing
+# asserts would be a claim nobody checks, so the polarities live here, against the SHIPPED script
+# (sourced, exactly as cases (a)-(d) above source it).
+#
+# HONEST SCOPE — what this pins and what it does not. `disk_floor_num()`'s documented contract is
+# "an unusable value is the DEFAULT, never 0", and the direction that matters is the LOW end: a 0 age
+# floor makes every stale copy and every scratch directory instantly eligible, i.e. a deletion rather
+# than a floor. So "" and a literal 0 must BOTH resolve to 86400, only a genuinely usable value may
+# move the floor, and a leading-zero value (the `08`-is-invalid-octal hazard the shipped comment
+# cites from #2293) must fall back too. These assertions pin the RESOLUTION of the seam. They do NOT
+# pin that the sweeps USE the resolved value, and they do NOT pin an upper bound — `disk_floor_num`
+# has none (unlike DISK_FLOOR_MB, which clamps at 249999999), so a 20-digit typo overflows `find`'s
+# minute arithmetic into a ~1-minute floor. Both gaps are follow-ups, not claims made here.
+age_seam() { # <VAR> <value> -> the value the shipped script resolves when VAR is SET to <value>
+  # 2>&1 rather than 2>/dev/null and NO `| tail -1`: both existed to hide noise, which would also
+  # hide a sourcing error. The comparison is an exact `=`, so any stray byte is a loud failure.
+  env "$1=$2" bash -c '. "$1"; printf %s "${!2-}"' _ "$GATE" "$1" 2>&1
+}
+age_seam_unset() { # <VAR> -> the value when VAR is genuinely ABSENT from the environment
+  env -u "$1" bash -c '. "$1"; printf %s "${!2-}"' _ "$GATE" "$1" 2>&1
+}
+for AGE_SEAM in DISK_FLOOR_COPY_MIN_AGE_S DISK_FLOOR_SCRATCH_MIN_AGE_S; do
+  ck "$AGE_SEAM defaults to 86400 (one day) when genuinely UNSET" \
+     '[ "$(age_seam_unset "$AGE_SEAM")" = 86400 ]'
+  ck "$AGE_SEAM: set-but-EMPTY also resolves to 86400" \
+     '[ "$(age_seam "$AGE_SEAM" "")" = 86400 ]'
+  ck "$AGE_SEAM: an unusable value falls back to 86400, never 0" \
+     '[ "$(age_seam "$AGE_SEAM" abc)" = 86400 ]'
+  ck "$AGE_SEAM: a literal 0 falls back to 86400 (a zero age floor is a deletion, not a floor)" \
+     '[ "$(age_seam "$AGE_SEAM" 0)" = 86400 ]'
+  ck "$AGE_SEAM: a leading-zero value falls back to 86400 (the 08-octal hazard, #2293)" \
+     '[ "$(age_seam "$AGE_SEAM" 0400)" = 86400 ]'
+  ck "$AGE_SEAM: a usable override is honoured (the seam is real, not decorative)" \
+     '[ "$(age_seam "$AGE_SEAM" 120)" = 120 ]'
+done
 
 printf '\n== %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

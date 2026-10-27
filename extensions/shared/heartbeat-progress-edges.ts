@@ -673,6 +673,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "the merge gate's derivation FAIL-SAFE (#1167): the bound used when the per-shard derivation is unavailable. The shipped default (3900 s) is deliberately well above RERUN_FLOOR's 1200, because a derivation that failed must never produce a SMALL bound. Env seam ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK; behaviour pinned by tests/admin-merge/run.sh §41.",
   },
+  {
+    name: "QUEUE_STUCK_AFTER_S",
+    owners: ["scripts/ci_runner_gate.sh"],
+    value: "${CI_GATE_QUEUE_STUCK_AFTER_S:-1800}",
+    axis: "gate",
+    guardedBy:
+      "scripts/ci_runner_gate.test.sh (#2904: a stalled queue takes the fallback path, a deep-but-serving queue and a young queue take NO action, an unreadable floor exits 2, plus the age-only mutant that proves the conjunction is load-bearing) + this registry's forward check pins the shipped default",
+    note: "the CI runner gate's ABSORPTION floor (agent-infra#2904): how long a QUEUED run may wait while NOTHING is executing before GitHub-hosted is called unhealthy and the gate takes its own existing fallback path. The clock is QUEUE WAIT — `now - created_at` of a still-queued run — NOT run duration: `run_started_at` is not a dispatch marker for a queued run (measured, run 40508520800: created 13:01:55Z, run_started_at 13:01:55Z, first job dispatched 13:23:59Z). Shipped default 1800 s, drawn from the same repo's own measurements: 12,624 of 13,000 sampled runs waited 0 s, and the longest gap between run starts while runs were still being created was 920 s. ⛔ IT IS DELIBERATELY NOT NAMED `*_STALL_THRESHOLD`: that phrase is #847's single authority, and the boundary test above refuses a term carrying `/stall_?threshold/i` WHILE holding a value here — this bound is owned HERE, so the honest option is a name the reverse scan can still see (`STUCK` is a declared family token, `_S` a declared bound suffix) and a registered value, not a `value: null` pointer that would falsely claim #847 owns it.",
+  },
   // — reap axis (interactive session reaper) —
   {
     name: "REAP_IDLE_HOURS",
@@ -1292,6 +1301,54 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "FUNCTION, not a const: the EFFECTIVE `no-progress` bound (X) — max(reporting-cadence floor, TASK_PROGRESS_AGE_MS) when the override is a positive finite number; the VALUE 0 disables the clause outright; blank/whitespace/negative/non-finite fall back to DEFAULT_PROGRESS_AGE_MS, so a launcher typo cannot silently disarm the one clause that bounds the content-free-loop class. The floor is the REPORTING CADENCE — `max(60 s, 3 x the effective heartbeat interval)` — NOT a bare 60 s: the parent can only see progress when the child reports it, so a bound below the cadence fires before the evidence it waits for and would cut a genuinely progressing content-only child (TASK_PROGRESS_AGE_MS=60000 with a 300 s interval is the worked case; caught in review). Registered separately from the literal for the same reason as its siblings: otherwise the env path, its floor and its off switch are invisible to the registry.",
+  },
+  // — reap axis: the cloud cell's reclaim AGE FLOORS —
+  // #2850 landed the pre-dispatch disk floor, #2756 the worktree reaper decision and #2868/#2870 the
+  // lane test-DB container reaper. All three introduced age floors the reverse scan reads and none
+  // registered them, so `reverseViolations` went RED on main and stayed red for every PR whose base
+  // carried them (measured 2026-10-27: identical FOUR violations on #2751 and #2851, two unrelated
+  // diffs — three before #2870 landed, four after).
+  // Registered here rather than exempted: these ARE stall/reclaim bounds and a value change must be
+  // visible. Note HOW the scan reaches them: none carries a SCAN_NAME_FAMILIES token, so they are
+  // caught by their AGE SHAPE (`_AGE_S`/`_AGE` suffix) through `inFamily`'s first branch — which is
+  // why they were invisible to a reader looking for a family token and can never be invisible to the
+  // scan.
+  // ⚠️ THE `value` FRAGMENT PINS ONLY THE DEFAULT LITERAL. It does not model the env seam or the
+  // coercion: `="$(echo 86400)"` or `="$(disk_floor_num "" 86400)"` would still carry it while
+  // destroying the override. Those two properties are pinned by the `guardedBy` polarities below,
+  // not here — the split is deliberate, and each half is claimed only where it is enforced.
+  {
+    name: "DISK_FLOOR_COPY_MIN_AGE_S",
+    owners: ["scripts/orchestrator-harness/disk-floor.sh"],
+    value: "86400",
+    axis: "reap",
+    guardedBy: "scripts/orchestrator-harness/disk-floor.test.sh — the age-seam polarities (genuinely unset, set-but-empty, unusable, literal 0, leading-zero 0400, valid override)",
+    note: "age floor for the STALE-COPY class inside disk_floor_num(): the 86400 in the declaration line IS the default, and it is what makes a copy eligible for reclaim. `value` here is a bare fragment because a syntax-bearing one (`86400)`) false-alarms on a pure reformat — the registry's contract is that formatting stays free while the bound does not. Env-overridable; a non-numeric or leading-zero value falls back to the default rather than to 0, because a 0 age floor would make every copy instantly reclaimable.",
+  },
+  {
+    name: "DISK_FLOOR_SCRATCH_MIN_AGE_S",
+    owners: ["scripts/orchestrator-harness/disk-floor.sh"],
+    value: "86400",
+    axis: "reap",
+    guardedBy: "scripts/orchestrator-harness/disk-floor.test.sh — the age-seam polarities (genuinely unset, set-but-empty, unusable, literal 0, leading-zero 0400, valid override)",
+    note: "age floor for the LANE-SCRATCH class, resolved by the same disk_floor_num() coercion and therefore with the same never-0 contract. Kept a separate term from the stale-copy floor above because the two classes are reclaimed by different sweeps (`disk_floor_reclaim_copies` vs `disk_floor_reclaim_scratch`) and one can move without the other.",
+  },
+  {
+    name: "REAP_WT_MIN_AGE_MINUTES",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_MIN_AGE_MINUTES:-45}",
+    axis: "reap",
+    guardedBy: "scripts/pi-reap-worktrees.test.sh G6e + G6f (rule 7, too-young)",
+    note: "the reaper's too-young rule: NOTHING younger than this is removable, whatever else the rules say. It is the one clause that protects work a lane is actively writing, so it outranks the merged/aged/classification rules rather than being weighed beside them (#2756). NOTE the citation is deliberately only pi-reap-worktrees.test.sh: scripts/disk-reaper.test.sh:170 sets REAP_WT_MIN_AGE_MINUTES=0 in its own wrapper, i.e. it DISABLES rule 7 so its fixtures are not gated by it — it neither pins the 45 nor the behaviour, and citing it here would be a guard claim that reads backwards.",
+  },
+  {
+    name: "MIN_AGE",
+    owners: ["scripts/orchestrator-harness/lane-container-reap.sh"],
+    value: "${LANE_CONTAINER_MIN_AGE:-14400}",
+    overrides: ['--min-age) MIN_AGE="${2:-$MIN_AGE}"'],
+    axis: "reap",
+    guardedBy: "scripts/orchestrator-harness/lane-container-reap.test.sh — case B keeps a container YOUNGER than the floor and case A reaps one past it (the too-young rule, not the default value; the default is pinned by `value` above)",
+    note: "#2868/#2870 lane test-DB containers: a container younger than four hours is never reaped, which is what stops the sweep from killing a test database a lane is still using. The bare name `MIN_AGE` is in-family by SHAPE, and registering it makes the gate STRICTER, not blind: `reverseViolations` matches name AND owner, so a future script reusing the bare name fails the reverse scan by design — the correct fix then is to rename that declaration (`X_MIN_AGE`, as `CR_MIN_AGE`/`VENV_MIN_AGE` already do), NOT to add the new file to this term's owners, which would demand it carry this exact default and declaration count.",
   },
 ];
 
