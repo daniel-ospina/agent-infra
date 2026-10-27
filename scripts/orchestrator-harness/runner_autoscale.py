@@ -25,6 +25,17 @@ THE AUTHORITY IT ENCODES — owner ruling, agent-infra#2344 comment 6347825624
   LABEL stays gate-following (see `resolve_labels`), and nothing here relabels, removes, or
   re-ranks an existing runner.
 
+  ⛔ AND "GATE-FOLLOWING" IS ENFORCED, NOT ASSERTED (review finding P1). The label floor used to be
+  "does ANY runner carry `ubuntu-latest`", which is TRUE in the gate's NORMAL state — the gate
+  STRIPS the label whenever GitHub-hosted is healthy (`ci_runner_gate.sh:290` `fallback_off`, called
+  at `:381`), so "missing" is what a healthy box looks like. A registration that armed it there
+  re-opened the incident that gate exists for (jobs landing here compete with the agent fleet; its
+  own header records a local pytest run that crashed FalkorDB, 178 restarts), and the two timers then
+  fought forever: the gate stripping what every repair re-added, one transition notification per
+  cycle. So the floor now asks the question the paragraph above promises — does the GATE want the
+  fallback, and is it missing — by reading the gate's own recorded mode (`gate_desired_mode`). With
+  no such record this tool does not invent the gate's intent.
+
 THE CEILING IS A PREDICATE, NOT A NUMBER
     ceiling = min(core_ceiling, runners_live + headroom_by_memory)
 
@@ -186,11 +197,13 @@ if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
 
 import argparse
 import datetime
+import errno
 import json
 import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -682,14 +695,58 @@ def starvation_probe(repo: str, confirm_s: float = STARVATION_CONFIRM_DEFAULT_S)
     }
 
 
-def label_floor_binds(pool: dict[str, PoolEntry]) -> bool:
-    """TRUE when no runner in the pool advertises the fallback label at all.
+# The gate records its decision as ONE BARE WORD in this file (`ci_runner_gate.sh:40` STATE_DIR,
+# `:395` the write). Reading it is the only way to be gate-following without being a second gate.
+GATE_STATE_RELPATH = ("ci-runner-gate.state",)
+
+
+def gate_desired_mode() -> str | None:
+    """The mode `scripts/ci_runner_gate.sh` last WROTE for this repo: `local`, `github`, or None.
+
+    ⛔ WHY THIS IS READ AND NOT DERIVED. Deriving the same answer here from the Actions status and
+    the queue length would be a SECOND implementation of the gate's decision — the very thing
+    `resolve_labels` refuses everywhere else ("one decision point") — and it would drift the first
+    time the gate's threshold changed. The gate already states its will; this reads it.
+
+    `None` is the honest answer when the file is absent or unreadable (a cell that does not run the
+    gate has no such file), and it is NOT evidence of intent: see `label_floor_binds`.
+    """
+    override = os.environ.get("RUNNER_AUTOSCALE_GATE_STATE")
+    path = (
+        Path(override)
+        if override
+        else Path.home() / ".pi" / "agent" / "state" / GATE_STATE_RELPATH[0]
+    )
+    try:
+        mode = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return mode if mode in ("local", "github") else None
+
+
+def pool_serves_fallback(pool: dict[str, PoolEntry]) -> bool:
+    """Does ANY runner in the pool advertise the fallback label right now? (a POOL-WIDE reading)"""
+    return any(FALLBACK_LABEL in e.labels for e in pool.values())
+
+
+def label_floor_binds(pool: dict[str, PoolEntry], gate_mode: str | None) -> bool:
+    """TRUE when the GATE wants the fallback and NO runner in the pool advertises the label.
 
     ⛔ This is a POOL-WIDE reading, not a per-runner one: the question is what the repo can serve,
     and `runs-on: ubuntu-latest` is matched against the pool, so one runner carrying the label is
     enough for the repo and zero is a total stop.
+
+    ⛔ AND IT IS A REPAIR OF THE GATE'S INTENT, NEVER A SECOND OPINION (review finding P1). "No
+    runner carries the label" alone is the gate's NORMAL, HEALTHY state — `fallback_off` removes it
+    whenever GitHub-hosted is healthy — so a floor keyed on absence alone arms the label on a
+    healthy box, on every repair, forever. The measured incident this floor exists for is the OTHER
+    case: the gate WANTED `local` and no runner carried it (9 runners / 8 online / `busy=0` / 53
+    queued), which is why the gate's mode is the first term.
+
+    A `None` gate mode is not intent: with no state file (a cell that does not run the gate) the
+    pool stays exactly as the gate left it, and `resolve_labels` says so in its note.
     """
-    return not any(FALLBACK_LABEL in e.labels for e in pool.values())
+    return gate_mode == "local" and not pool_serves_fallback(pool)
 
 
 def resolve_labels(
@@ -698,6 +755,7 @@ def resolve_labels(
     *,
     notes: list[str] | None = None,
     current: list[str] | None = None,
+    gate_mode: str | None = None,
 ) -> str:
     """The ONE place a label set is decided: what the runner already carries, then the floor.
 
@@ -728,14 +786,13 @@ def resolve_labels(
     set with NO `ubuntu-latest` — the pool-wide-strip case the floor exists for, on the one path that
     runs after every restart. Keeping and flooring are two independent steps, and both always run.
 
-    ⛔ WHICH RULE WINS WHEN THEY DISAGREE — THE FLOOR, ALWAYS. The gate (`fallback_engaged`) can
-    only ADD the label; the floor is a MINIMUM on every set this function returns. They disagree
-    exactly when the gate says "no" and no runner holds the label, and resolving THAT toward the
-    gate is what took the pool to zero. The prices are not symmetric: a floor-granted label makes
-    `ci_runner_gate.sh`'s `current_mode` read `local` (a mode that misdescribes the box, is
-    visible in the gate's own reading, and is recoverable by any later pass or operator), while a
-    zero-label pool runs NO workflow at all — including the one that would restore the label. **The
-    cheaper failure wins the tie, and that is the floor.**
+    ⛔ WHICH RULE WINS WHEN THEY DISAGREE — THE GATE, ALWAYS, AND THE FLOOR ONLY REPAIRS IT. An
+    earlier version of this docstring argued the opposite ("the floor always") on the grounds that
+    a zero-label pool runs no workflow at all. That reasoning named a real incident but drew the
+    wrong conclusion from it: it is TRUE in the gate's healthy state, which is exactly when arming
+    the label re-opens the incident `ci_runner_gate.sh:12` records. The floor's real job is the
+    measured case where the gate ALREADY wanted `local` and the label was gone, so `gate_mode` is
+    its first term and "no runner carries it" its second.
 
     `notes` is where the one-line reason goes. It is a parameter, not a `print`, because
     `--json` prints the record as a single object on stdout: a bare `print` from here corrupted the
@@ -750,14 +807,27 @@ def resolve_labels(
         )
     kept = _preserve_labels(list(current or ()), machine)
     labels = [x for x in kept.split(",") if x] or [arch]
-    floor = label_floor_binds(pool)
+    floor = label_floor_binds(pool, gate_mode)
     engaged = fallback_engaged(pool)
+    lacks = not pool_serves_fallback(pool)
+    reason: str | None = None
     if floor and not engaged and FALLBACK_LABEL not in labels:
         reason = (
-            f"label floor: no runner in the pool ({len(pool)} registered) advertises "
-            f"{FALLBACK_LABEL} — this registration takes it, otherwise nothing can serve "
-            f"`runs-on: {FALLBACK_LABEL}`"
+            f"label floor: the gate wants `{gate_mode}` and no runner in the pool "
+            f"({len(pool)} registered) advertises {FALLBACK_LABEL} — this registration repairs "
+            f"that, otherwise nothing can serve `runs-on: {FALLBACK_LABEL}` while GitHub-hosted is "
+            f"unhealthy"
         )
+    elif lacks and not engaged and gate_mode != "local":
+        # ⛔ SAID OUT LOUD, not silently skipped: an operator who expected the floor to arm it must
+        # be able to read WHY it did not, from the record, on the pass where it mattered.
+        reason = (
+            f"label floor NOT armed: no runner in the pool ({len(pool)} registered) advertises "
+            f"{FALLBACK_LABEL}, and the gate's desired mode is "
+            f"{gate_mode or 'unreadable (no state file)'} — the pool serves CI only while "
+            "GitHub-hosted is unhealthy (ci_runner_gate.sh:12)"
+        )
+    if reason:
         if notes is not None:
             notes.append(reason)
         else:
@@ -835,6 +905,41 @@ def pool_error_is_transient(message: str) -> bool:
     return any(marker in low for marker in TRANSIENT_POOL_MARKERS)
 
 
+def _env_int(name: str, default: int) -> int:
+    """`RUNNER_AUTOSCALE_*` as an int, or `Unmeasurable` NAMING the seam (review finding P1).
+
+    ⛔ A SEAM THAT COULD NOT BE PARSED USED TO KILL THE PASS WITH A TRACEBACK. `int(os.environ…["…"]
+    or 3)` raises ValueError, `main()` caught only `Unmeasurable`, so the process exited 1 with a
+    stack trace and `_log()` was never called: a scheduled pass that may ALREADY have restarted and
+    re-registered runners left NO record of what it did — the exact "a scheduled pass that dies with
+    no cause" this file's fix 3 was written to end. Two of these four seams were first parsed inside
+    the starvation probe, i.e. AFTER the repair and fill steps. `Unmeasurable` is the file's own
+    "could not measure, changed nothing" verdict; a bad seam is that, not a crash.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise Unmeasurable(
+            f"{name}={raw!r} is not an integer — refusing to run with an unreadable seam"
+        ) from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    """The float sibling of `_env_int`, for the same reason."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError as exc:
+        raise Unmeasurable(
+            f"{name}={raw!r} is not a number — refusing to run with an unreadable seam"
+        ) from exc
+
+
 def read_pool_retrying(repo: str, *, attempts: int | None = None) -> dict[str, PoolEntry]:
     """`read_pool` with a BOUNDED retry for TRANSIENT failures, keeping the LAST error's own words.
 
@@ -844,10 +949,12 @@ def read_pool_retrying(repo: str, *, attempts: int | None = None) -> dict[str, P
     ⛔ BOUNDED, and the bound is short: this runs INSIDE a restart-recovery window, so an unbounded
     wait would outlive the very poll it is serving.
     """
-    tries = attempts if attempts is not None else int(
-        os.environ.get("RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS") or 3
+    tries = (
+        attempts
+        if attempts is not None
+        else _env_int("RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS", 3)
     )
-    backoff = float(os.environ.get("RUNNER_AUTOSCALE_RETRY_BACKOFF_S") or 2)
+    backoff = _env_float("RUNNER_AUTOSCALE_RETRY_BACKOFF_S", 2.0)
     seen: list[str] = []
     for attempt in range(1, max(1, tries) + 1):
         try:
@@ -1111,6 +1218,24 @@ TRANSIENT_UNIT_PREFIXES = (
 )
 
 
+def account_home() -> Path:
+    """The home `%h` resolves to for THIS pass.
+
+    ⛔ A SEAM, NOT `Path.home()` ALONE (review finding P2, measured). `render_unit` writes `%h` and
+    the audit must decide whether that path is USABLE — which depends on the account's home, i.e. on
+    the box. Without a seam the acceptance suite could only measure the HOME it happened to run
+    under: on a cell (`HOME=/tmp/cell-home`) six cases went red about a CORRECT template — measured
+    `PASS=23 FAIL=6` — and a red plain suite stops `--mutations` before it runs, so the suite's
+    non-vacuity evidence was unavailable on exactly the boxes this tool exists for. This is the same
+    treatment every other host fact here gets (`RUNNER_AUTOSCALE_MEMINFO`, `_PS`, `_DF`, `_SYSTEMCTL`).
+
+    ⛔ IT DOES NOT CHANGE WHAT THE UNIT SAYS: `render_unit` still writes the literal `%h`, and
+    systemd still expands it per-user. Only the CHECK follows the seam.
+    """
+    raw = os.environ.get("RUNNER_AUTOSCALE_HOME")
+    return Path(raw).expanduser() if raw else Path.home()
+
+
 def transient_path_problem(path_value: str) -> str | None:
     """The SHAPE half of `unit_workdir_problem`: is this path inside a tree a reclaim can take?
 
@@ -1129,6 +1254,37 @@ def transient_path_problem(path_value: str) -> str | None:
     return None
 
 
+# ⛔ "COULD NOT LOOK" IS NOT "ABSENT", AND `pathlib` WILL NOT TELL YOU THE DIFFERENCE
+# (review finding P1, measured). `Path.exists()` and `Path.is_dir()` return False only for the errnos
+# `pathlib` names as absence (`_IGNORED_ERRNOS` = ENOENT, ENOTDIR, EBADF, ELOOP — read from the 3.12
+# stdlib source); EVERY other OSError is RE-RAISED. Measured 2026-10-27: `--check-units` over ONE
+# installed unit whose `WorkingDirectory` sat under a directory the auditing account cannot traverse
+# (`/root/…` audited by a non-root account) exited 1 printing a PermissionError traceback and NO
+# verdict — and this audit runs on EVERY pass (see `installed_unit_cwd_problems`), so a single such
+# unit cost the pass its verdict, in silence. A path longer than PATH_MAX does the same
+# (`OSError(ENAMETOOLONG)`), which is what the acceptance case uses because it needs no privileges.
+#
+# So the probe is `os.stat`, and the ABSENT arm is DELIBERATELY the same errno set `pathlib` ignores:
+# nothing that used to read as absence changes meaning here, and only the previously-unhandled case
+# becomes a NAMED problem. `(None, None)` = absent; `(None, reason)` = could not be inspected.
+_ABSENT_ERRNOS = (errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP)
+
+
+def _inspect_path(path: Path) -> tuple[os.stat_result | None, str | None]:
+    """`(stat, None)` when the path WAS inspected, `(None, reason)` when it could NOT be.
+
+    Three answers, never two: present, absent, and "this check could not look" — the third is what
+    `pathlib`'s boolean helpers silently lose by raising, and what every caller below must state in
+    its own words instead of mistaking it for either neighbour.
+    """
+    try:
+        return os.stat(path), None
+    except OSError as exc:
+        if exc.errno in _ABSENT_ERRNOS:
+            return None, None
+        return None, f"cannot be inspected ({exc.strerror or exc})"
+
+
 def unit_workdir_problem(workdir: str | None) -> str | None:
     """None when `workdir` may be a unit's WorkingDirectory, else the reason it may not.
 
@@ -1137,7 +1293,7 @@ def unit_workdir_problem(workdir: str | None) -> str | None:
     spelling points at a transient directory).
     """
     if workdir in (None, "", "%h"):
-        workdir = str(Path.home())
+        workdir = str(account_home())
     else:
         # ⛔ AN EXPLICIT VALUE IS ONE ABSOLUTE PATH, ONE LINE — and nothing else:
         #   * a `%` is a systemd SPECIFIER, expanded at LOAD time. Validated here as a filesystem
@@ -1170,7 +1326,19 @@ def unit_workdir_problem(workdir: str | None) -> str | None:
     shape = transient_path_problem(workdir)
     if shape:
         return f"WorkingDirectory={workdir} {shape}"
-    if not path.is_dir():
+    probe, uninspectable = _inspect_path(path)
+    if uninspectable:
+        # ⛔ NEITHER "does not exist" (a claim about the world this check could not make) NOR
+        # "usable" (the false PASS the audit exists to refuse): the named answer is that the path
+        # could not be LOOKED AT. `install_unit` REFUSES on it — a unit whose cwd cannot be
+        # confirmed is the 200/CHDIR stop with no verdict behind it.
+        return (
+            f"WorkingDirectory={workdir} {uninspectable} — this check cannot tell a usable "
+            "directory from a missing one, so it will not certify it: systemd fails the unit with "
+            "status=200/CHDIR before it runs a line, and 'I could not look' is not evidence that "
+            "it will not"
+        )
+    if probe is None or not stat.S_ISDIR(probe.st_mode):
         return (
             f"WorkingDirectory={workdir} does not exist — systemd fails the unit with "
             "status=200/CHDIR BEFORE it runs a line, so the converger would silently stop"
@@ -1250,7 +1418,14 @@ def _condition_skip(conditions: list[tuple[str, str]]) -> str | None:
         path = value.lstrip("-").strip()
         if "%" in path or not path.startswith("/"):
             continue
-        if not Path(path).exists():
+        probe, uninspectable = _inspect_path(Path(path))
+        if uninspectable:
+            # ⛔ THE DIRECTION MATTERS: this function's answer EXEMPTS a unit from the ExecStart
+            # check, so reading "I could not look" as "the condition is unmet" would declare a unit
+            # systemd may well start to be SKIPPED — a false PASS inside the audit itself. The
+            # finding stays; a noisy finding beats a silent exemption.
+            continue
+        if probe is None:
             return f"{key}={value}"
     return None
 
@@ -1278,11 +1453,19 @@ def _exec_command_problems(unit_name: str, command: str) -> list[str]:
                 f"{unit_name}: ExecStart program {program} {shape} — after that the unit fails "
                 "203/EXEC on EVERY tick, not 200/CHDIR"
             )
-        elif not Path(program).exists():
-            problems.append(
-                f"{unit_name}: ExecStart program {program} does not exist — systemd fails the unit "
-                "with 203/EXEC before it runs a line"
-            )
+        else:
+            probe, uninspectable = _inspect_path(Path(program))
+            if uninspectable:
+                problems.append(
+                    f"{unit_name}: ExecStart program {program} {uninspectable} — this check "
+                    "cannot tell a runnable program from a missing one, so it will not call the "
+                    "unit usable"
+                )
+            elif probe is None:
+                problems.append(
+                    f"{unit_name}: ExecStart program {program} does not exist — systemd fails the "
+                    "unit with 203/EXEC before it runs a line"
+                )
     elif "/" in program:
         problems.append(
             f"{unit_name}: ExecStart program {program!r} is a RELATIVE path — systemd requires an "
@@ -1402,6 +1585,7 @@ def render_unit(
     *,
     script: str | None = None,
     python: str | None = None,
+    provisioner: str | None = None,
 ) -> dict[str, str]:
     """The unit PAIR as text: `<name>.service` + `<name>.timer`.
 
@@ -1427,6 +1611,16 @@ def render_unit(
             "Type=oneshot",
             "# %h is the account's home: a reclaimed worktree can never take it away.",
             f"WorkingDirectory={wd}",
+            # ⛔ THE PROVISIONER IS PINNED, not re-resolved by the schedule (review finding P1).
+            # `%h` as the cwd kills the `$PWD/tools/…` candidate, so a scheduled pass resolved
+            # nothing and the FILL half could never fire — see `resolve_provisioner`. The path is
+            # the one the INSTALL measured; a later move of the installer shows up in
+            # `--check-units`' ExecStart audit rather than as a silent inability to grow.
+            *(
+                [f"Environment=RUNNER_AUTOSCALE_PROVISIONER={provisioner}"]
+                if provisioner
+                else []
+            ),
             # ⛔ QUOTED. systemd splits ExecStart on whitespace, so an unquoted script path or repo
             # containing a space yields a unit that fails on EVERY tick — a cron-style silent break of
             # the very schedule being installed (measured: `--repo o/r` + a positional, exit 2).
@@ -1493,6 +1687,20 @@ def install_unit(
     for problem in (repo_problem(repo), unit_workdir_problem(workdir)):
         if problem:
             raise UnitRefused(problem)
+    # ⛔ RESOLVED AT INSTALL TIME AND PINNED INTO THE UNIT (review finding P1). Nothing is
+    # downloaded here; this only decides whether the unit being written can GROW a box. Told loud
+    # and NOT refused, for the same measured reason the transient-script warning below is not a
+    # refusal: repair-only is still a useful schedule, and refusing would make `--install-unit`
+    # unusable on a box that simply has no installer checkout.
+    provisioner = resolve_provisioner()
+    if not provisioner:
+        print(
+            "  · WARNING: no install-ci-runner-x64.sh resolved, so this unit can REPAIR and "
+            "RE-REGISTER but can never ADD a runner (every pass with live < target will record "
+            "`no provisioner` → action-failed). Set RUNNER_AUTOSCALE_PROVISIONER, or install from "
+            "a checkout that carries tools/install-ci-runner-x64.sh, to schedule a box that grows.",
+            flush=True,
+        )
     directory = Path(unit_dir or default_unit_dirs()[0]).expanduser()
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -1504,7 +1712,7 @@ def install_unit(
     # it wrote", which on a re-install was the previously installed file — measured, and worse than
     # the problem it fixed). The two replaces are sequential, so a failure between them can still
     # leave a MIXED pair; the failure says exactly that rather than claiming a clean rollback.
-    planned = render_unit(repo, workdir)
+    planned = render_unit(repo, workdir, provisioner=provisioner)
     # ⛔ WARNED, NOT REFUSED — and the difference is deliberate (review round 7). `ExecStart` pins
     # `Path(__file__).resolve()`, so a unit installed from a lane worktree names a path a reclaim
     # takes (on every cell the checkout IS under /tmp), and the tool acknowledges that in
@@ -1750,20 +1958,26 @@ def _next_free_slot(root: str) -> int:
         index += 1
 
 
-def provision(target_count: int) -> str:
-    """Create/extend the install so that runners 1..target_count exist — via the ONE installer.
+def resolve_provisioner() -> str | None:
+    """The installer's absolute path, or None when this box has none.
 
-    ⛔ This file never downloads a runner binary and never builds a `config.sh` argv for a NEW
-    install: download + sha256 verification + the headroom/arch guards are
-    `tools/install-ci-runner-x64.sh`'s job (it is the only registration path). Absent, this
-    REFUSES — improvising a provisioner here is how a second, divergent registration path is
-    born (#9639 exists precisely because there was one).
+    The installer is resolved, never assumed, and the candidate list spans the installed copy's
+    neighbours, the working directory (the cell's checkout), and `~/.pi/agent/scripts`.
+
+    ⛔ BUT THE SECOND CANDIDATE IS DEAD IN THE MODE THIS FILE SCHEDULES (review finding P1).
+    `render_unit` writes `WorkingDirectory=%h`, so a scheduled pass runs with cwd = `$HOME` —
+    `$HOME/tools/…` is not a checkout. Candidate 1 is a sibling of the module, and NO deployment
+    puts the installer there (`pi-bootstrap/setup.sh`'s `fleet_srcs` is a flat list of script names
+    in `~/.pi/agent/scripts`, and this installer is not one of them). So a scheduled box resolved
+    nothing, recorded `no provisioner` → `action-failed` on every pass with `live < target`, and
+    the FILL half — the half that makes a box grow — could never fire: an enforcer that can never
+    fire, which is the exact failure this candidate list was written to avoid.
+
+    The seed is what fixes it: `install_unit` resolves this ONCE, while the operator is standing in
+    a checkout that does have `tools/install-ci-runner-x64.sh`, and PINS the absolute path into the
+    unit's `Environment=` — so the schedule runs with the answer the install measured.
     """
     raw = os.environ.get("RUNNER_AUTOSCALE_PROVISIONER")
-    # The installer is resolved, never assumed: the RUNNING copy of this tool lives in
-    # ~/.pi/agent/scripts (a stable path), so a sibling lookup alone would find nothing there and
-    # every add would refuse — an enforcer that can never fire. The candidate list spans the
-    # installed copy's neighbours, the working directory (the cell's checkout), and $REPO/tools.
     candidates = (
         [raw]
         if raw
@@ -1773,7 +1987,19 @@ def provision(target_count: int) -> str:
             str(Path.home() / ".pi" / "agent" / "scripts" / "install-ci-runner-x64.sh"),
         ]
     )
-    provisioner = next((c for c in candidates if c and Path(c).exists()), None)
+    return next((c for c in candidates if c and Path(c).exists()), None)
+
+
+def provision(target_count: int) -> str:
+    """Create/extend the install so that runners 1..target_count exist — via the ONE installer.
+
+    ⛔ This file never downloads a runner binary and never builds a `config.sh` argv for a NEW
+    install: download + sha256 verification + the headroom/arch guards are
+    `tools/install-ci-runner-x64.sh`'s job (it is the only registration path). Absent, this
+    REFUSES — improvising a provisioner here is how a second, divergent registration path is
+    born (#9639 exists precisely because there was one).
+    """
+    provisioner = resolve_provisioner()
     if not provisioner:
         raise ActionFailed(
             "no provisioner: tools/install-ci-runner-x64.sh is absent, so a NEW runner cannot be "
@@ -1822,12 +2048,14 @@ def converge(
     local = discover(root)
     pool = read_pool(repo)
     machine = machine or os.environ.get("RUNNER_AUTOSCALE_MACHINE") or os.uname().machine
-    wait_s = int(
-        os.environ.get(
-            "RUNNER_AUTOSCALE_ONLINE_WAIT_S", online_wait_s if online_wait_s is not None else 60
-        )
+    # ⛔ READ ONCE PER PASS, not once per runner: it is one file, and a pass that read it twice
+    # could see the gate turn over between two repairs and arm the label on one runner but not the
+    # next — a pool in two states, decided by iteration order.
+    gate_mode = gate_desired_mode()
+    wait_s = _env_int(
+        "RUNNER_AUTOSCALE_ONLINE_WAIT_S", online_wait_s if online_wait_s is not None else 60
     )
-    poll = int(os.environ.get("RUNNER_AUTOSCALE_POLL_S", poll_s if poll_s is not None else 5))
+    poll = _env_int("RUNNER_AUTOSCALE_POLL_S", poll_s if poll_s is not None else 5)
 
     # 4. CLASSIFY ------------------------------------------------------------------------------
     classified: list[dict] = []
@@ -1899,12 +2127,14 @@ def converge(
         pool_total=len(pool),
         pool_online=sum(1 for e in pool.values() if e.online),
         pool_busy=sum(1 for e in pool.values() if e.busy),
-        # ⛔ BOTH LABEL FACTS ARE PUBLISHED, because they answer different questions and only one of
-        # them is a policy preference: `fallback_engaged` is the gate's state, `label_floor_binds`
-        # is "this repo can serve NO `runs-on: ubuntu-latest` job at all". A fleet consumer that
-        # sees the second one true is looking at (or one pass away from) a total CI stop.
+        # ⛔ BOTH LABEL FACTS ARE PUBLISHED, and they answer DIFFERENT questions: `fallback_engaged`
+        # is "the pool carries the fallback RIGHT NOW" (a reading), `label_floor_binds` is "the GATE
+        # wants it and the pool does not carry it" (a repair owed on the next registration). A fleet
+        # consumer that sees the second one true is looking at a pool that cannot serve
+        # `runs-on: ubuntu-latest` while GitHub-hosted is unhealthy.
         fallback_engaged=fallback_engaged(pool),
-        label_floor_binds=label_floor_binds(pool),
+        label_floor_binds=label_floor_binds(pool, gate_mode),
+        gate_mode=gate_mode,
     )
 
     if want is not None and want > ceil:
@@ -1968,6 +2198,29 @@ def converge(
             record["actions"].append(
                 f"{c['name']} still offline after restart — re-registering with --replace"
             )
+        # ⛔ A FRESH READ IMMEDIATELY BEFORE THE DESTRUCTIVE STEP (review finding P2). Everything
+        # above judged this runner as of CLASSIFICATION; the act below deletes its registration, and
+        # a whole `wait_online` timeout has passed since. `wait_online` re-reads the POOL only, and
+        # the pool is the view that already called this runner offline — while the local listener
+        # signal exists precisely because the API can say idle/offline about a box that is serving a
+        # job. So the two facts are asked again, now, and `fresh=True` bypasses the classification
+        # cache (a cached `False` would certify exactly what this refuses).
+        fresh = pool.get(c["name"])
+        try:
+            serving = _worker_alive(runner, fresh=True) or (fresh is not None and fresh.busy)
+        except Unmeasurable as exc:
+            record["problems"].append(
+                f"{c['name']}: NOT re-registering — {exc} — a busy state this pass could not read "
+                "is not a busy state it may overwrite"
+            )
+            stop_pass = True
+            break
+        if serving:
+            record["notes"].append(
+                f"{c['name']}: came up with a JOB during the restart wait — NOT re-registering "
+                "(a busy runner is never restarted or re-registered); it is re-judged next pass"
+            )
+            continue
         try:
             # ⛔ ONE DECISION POINT, TWO INDEPENDENT STEPS. `resolve_labels` keeps the labels the
             # runner already carries AND applies the floor (see its docstring for why an "either/or"
@@ -1976,7 +2229,11 @@ def converge(
             # from the previous iteration: that leaked one runner's set (including an other-arch
             # marker) onto every later repair in the same pass (round 2, finding 3).
             labels = resolve_labels(
-                pool, machine, notes=record["notes"], current=c["labels"]
+                pool,
+                machine,
+                notes=record["notes"],
+                current=c["labels"],
+                gate_mode=gate_mode,
             )
             record["actions"].append(
                 register(runner.directory, c["name"], repo, labels, replace=True)
@@ -2324,7 +2581,15 @@ def converge(
     unit_problems = installed_unit_cwd_problems()
     if unit_problems:
         record["unit_cwd_problems"] = unit_problems
-        record["notes"].extend(f"unit cwd: {p}" for p in unit_problems)
+        # ⛔ ONE SUMMARY NOTE, NOT ONE PER FINDING (review finding P2). Every pass re-audits every
+        # installed unit, so `extend()`-ing each finding made the notes a standing wall — measured: a
+        # cell at 10 standing findings appended 10 identical lines every ~9 minutes, into a log with
+        # no size bound, and a NEW finding was indistinguishable from the nine old ones (the same "an
+        # audit nobody could clear" failure the audit was fixed to avoid). The findings themselves
+        # are kept, verbatim, in `unit_cwd_problems`; the count is what a reader needs here.
+        record["notes"].append(
+            f"unit audit: {len(unit_problems)} installed-unit finding(s) — see unit_cwd_problems"
+        )
     return record
 
 
@@ -2355,7 +2620,7 @@ def _preserve_labels(current: list[str], machine: str) -> str:
 _WORKER_CACHE: dict[str, bool] = {}
 
 
-def _worker_alive(runner: LocalRunner) -> bool:
+def _worker_alive(runner: LocalRunner, *, fresh: bool = False) -> bool:
     """A live `Runner.Worker` under this install ⇒ a job is being served (belt and braces).
 
     The AUTHORITATIVE busy flag is the pool's own `busy`; this exists because `busy` is a
@@ -2375,7 +2640,11 @@ def _worker_alive(runner: LocalRunner) -> bool:
             raise Unmeasurable(f"busy-dirs seam unreadable ({seam}: {exc})") from exc
         return str(runner.directory) in busy
     key = str(runner.directory)
-    if key not in _WORKER_CACHE:
+    # ⛔ `fresh` RE-READS, because the cache is what makes a stale answer possible: the value is
+    # written during CLASSIFICATION, and the destructive step it guards happens a whole
+    # wait-online timeout later (`--replace`). A re-check that read the cache would return the
+    # pre-wait `False` and certify exactly what it was added to refuse.
+    if fresh or key not in _WORKER_CACHE:
         try:
             proc = subprocess.run(
                 [os.environ.get("RUNNER_AUTOSCALE_PS") or "ps", "-eo", "args"],
@@ -2493,6 +2762,26 @@ def main(argv: list[str] | None = None) -> int:
         payload = {"repo": opts.repo, "verdict": "unmeasurable", "error": str(exc)}
         print(
             json.dumps(payload) if opts.json else f"UNMEASURABLE (nothing changed): {exc}",
+            file=sys.stderr,
+        )
+        _log(payload)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — a pass that dies must still leave a RECORD
+        # ⛔ THE BACKSTOP, and its whole purpose is the LOG (review finding P1). `converge` runs
+        # after the repair and fill steps, so an exception from here can mean real changes were
+        # already made — restarts, re-registrations, a provision — and exiting with a bare traceback
+        # left NO record of them (measured: `RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS=abc` exited 1 with a
+        # stack trace and the log file untouched). One line here converts "the tool crashed" into
+        # "this pass could not complete, and here is the error", which is what a 9-minute timer needs
+        # in order to be diagnosable at all. The specific seams are parsed through `_env_int`/
+        # `_env_float` so this arm should stay unreachable; it is the guard that makes that claim
+        # checkable instead of a hope.
+        detail = f"{type(exc).__name__}: {exc}"
+        payload = {"repo": opts.repo, "verdict": "unmeasurable", "error": detail}
+        print(
+            json.dumps(payload)
+            if opts.json
+            else f"UNMEASURABLE (pass did not complete): {detail} — recorded, not lost",
             file=sys.stderr,
         )
         _log(payload)

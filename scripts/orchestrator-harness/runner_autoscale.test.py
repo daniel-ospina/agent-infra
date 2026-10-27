@@ -135,6 +135,27 @@ def _load_module():
 
 ra = _load_module()
 
+# ⛔ THE ACCOUNT HOME IS A FIXTURE, PINNED BEFORE ANY CASE RUNS (review finding P2, measured).
+# `unit_workdir_problem(None)` and `render_unit` resolve the home, and the suite's own tempdirs live
+# under `/tmp` — a TRANSIENT root the tool correctly refuses. So a case that used the ambient HOME
+# measured the box, not the template: measured on a cell (`HOME=/tmp/cell-home`) six cases went red
+# about a CORRECT template, and a red plain suite stops `--mutations` before it runs, i.e. the
+# non-vacuity evidence was unavailable exactly where the tool runs. The seam is pinned at import so
+# the cases that drive the audit WITHOUT a Box (T22/T23) get the same answer as the rest.
+def durable_home() -> str:
+    """A path that is NOT under a transient root. The suite cannot create one portably (`tempfile`
+    lives under /tmp), so it uses a stable system directory that exists on both the Mac and the
+    ubuntu runner. Nothing is written to it — the tool only STATs it."""
+    for cand in ("/usr/local", "/usr", "/opt", "/var"):
+        if os.path.isdir(cand) and not ra.transient_path_problem(cand):
+            return cand
+    raise Failure("no durable directory to use as a fixture home on this box")
+
+
+os.environ["RUNNER_AUTOSCALE_HOME"] = os.environ.get(
+    "RUNNER_AUTOSCALE_TEST_HOME"
+) or durable_home()
+
 # ── tiny test runner (a script, not a pytest module: the repo's zero-dep suites look like this) ──
 TESTS = []
 
@@ -274,6 +295,7 @@ class Box:
         os.makedirs(os.path.join(self.dir, "state"), exist_ok=True)
         os.makedirs(os.path.join(self.dir, "bin"), exist_ok=True)
         os.makedirs(os.path.join(self.dir, "units"), exist_ok=True)
+        os.makedirs(os.path.join(self.dir, "home"), exist_ok=True)
         self.disk(500_000)
         self.footprint({})
         self._write(os.path.join(self.dir, "gh"), GH_STUB.replace("__FIX__", self.dir), 0o755)
@@ -304,6 +326,21 @@ class Box:
             # ⛔ the unit audit reads a FIXTURE directory, never the host's ~/.config or /etc: a suite
             # that reads the machine it runs on reports this box's units as if they were the case's.
             "RUNNER_AUTOSCALE_UNIT_DIR": os.path.join(self.dir, "units"),
+            # ⛔ HOME IS A FIXTURE TOO (review finding P2, measured). `unit_workdir_problem(None)`
+            # and `render_unit` resolve `ra.account_home()`, so six cases measured THE HOST'S HOME rather
+            # than the template: on a cell (`HOME=/tmp/cell-home`) every one of them reported
+            # "WorkingDirectory=… is inside /tmp" and the shard went RED — measured `PASS=23 FAIL=6`
+            # — and because a red plain suite stops `--mutations` before it runs, the suite's
+            # non-vacuity evidence was unavailable on exactly the boxes the tool exists for. CI's
+            # `/home/runner` hid that, which made it worse: a real regression in those assertions
+            # could be dismissed as "the known six". A stable, existing, non-transient fixture home
+            # is what makes the HERMETIC claim in the header true.
+            "HOME": os.path.join(self.dir, "home"),
+            "RUNNER_AUTOSCALE_HOME": os.environ["RUNNER_AUTOSCALE_HOME"],
+            # The gate's own recorded desired mode (`ci_runner_gate.sh:40`/`:395`). NOT created by
+            # default: a box that does not run the gate has no such file, and the floor must not
+            # invent one — `gate_state()` writes it in the cases that are ABOUT the handover.
+            "RUNNER_AUTOSCALE_GATE_STATE": os.path.join(self.dir, "gate.state"),
             # ⛔ df/du are SEAMS, not the host: a case that read this machine's disk would size its
             # ceiling from whatever the developer's laptop has free. The default is a big, quiet disk
             # so the disk arm binds only in the cases that are ABOUT it.
@@ -370,6 +407,10 @@ class Box:
     def pool_seq(self, steps):
         """Per-CALL pool-read behaviour; the last step repeats. Every call is counted in gh-calls."""
         self._write(os.path.join(self.dir, "pool.seq"), "\n".join(steps) + "\n")
+
+    def gate_state(self, mode):
+        """The gate's last recorded decision, exactly as `ci_runner_gate.sh:395` writes it."""
+        self._write(os.path.join(self.dir, "gate.state"), f"{mode}\n")
 
     def queued(self, n):
         self._write(os.path.join(self.dir, "queued"), f"{n}\n")
@@ -522,6 +563,9 @@ def t1_label_floor():
             box.install("gh-runner-x64", "r-orphan")
             box.pool([("r-other", "online", False, ["self-hosted", "self-hosted-x64", "Linux"])])
             box.alive([box.installs["gh-runner-x64"]])
+            # The GATE wants the fallback: that is what makes this a floor rather than a second
+            # opinion (`ci_runner_gate.sh` records it at `~/.pi/agent/state/ci-runner-gate.state`).
+            box.gate_state("local")
             # 2 cores ⇒ the owner's table says ONE runner, and one is already alive: the fill loop
             # cannot run, so this case measures the label rule and nothing else.
             record = converge(box, nproc="2")
@@ -579,11 +623,14 @@ def t2_label_handover():
             ),
         }
         notes: list[str] = []
-        got = ra.resolve_labels(pool, "x86_64", notes=notes)
+        got = ra.resolve_labels(pool, "x86_64", notes=notes, gate_mode="local")
         check(got == "self-hosted-x64,ubuntu-latest", f"gate-engaged set was {got!r}")
         check(got.count(ra.FALLBACK_LABEL) == 1, f"{ra.FALLBACK_LABEL} written twice: {got!r}")
         check(notes == [], f"the gate path must not claim the floor, notes={notes}")
-        check(ra.label_floor_binds(pool) is False, "a pool WITH the label does not bind the floor")
+        check(
+            ra.label_floor_binds(pool, "local") is False,
+            "a pool WITH the label does not bind the floor",
+        )
 
         # The other half: the floor is SATISFIED by a non-arm runner, the gate is NOT engaged, and
         # the arch runner must therefore stay arch-only — the pre-floor behaviour, unchanged.
@@ -594,7 +641,7 @@ def t2_label_handover():
             )
         }
         notes = []
-        got = ra.resolve_labels(satisfied, "x86_64", notes=notes)
+        got = ra.resolve_labels(satisfied, "x86_64", notes=notes, gate_mode="github")
         check(got == "self-hosted-x64", f"a satisfied floor must add nothing, got {got!r}")
         check(notes == [], f"no floor note when the floor is satisfied, notes={notes}")
 
@@ -623,6 +670,7 @@ def t3_floor_unions_over_preserved():
                 ]
             )
             box.alive([])
+            box.gate_state("local")
             record = converge(box, want=0)
             argv = [c for c in box.calls("config-calls.log") if "argv=" in c]
             check(len(argv) == 1, f"expected exactly one re-registration, got {argv}")
@@ -1280,6 +1328,22 @@ def t16_unit_template():
         ra.unit_workdir_problem(None) is None,
         f"the default workdir must be usable: {ra.unit_workdir_problem(None)}",
     )
+    # ⛔ THE PROVISIONER IS PINNED INTO THE UNIT (review finding P1), because `%h` as the cwd kills
+    # the `$PWD/tools/…` candidate and no deployment puts the installer in `~/.pi/agent/scripts` —
+    # a scheduled pass then resolved nothing and the FILL half could never fire.
+    pinned = ra.render_unit("daniel-ospina/tortoise", provisioner="/opt/harness/install-x64.sh")
+    pinned_service = pinned[f"{ra.UNIT_BASENAME}.service"]
+    check(
+        "Environment=RUNNER_AUTOSCALE_PROVISIONER=/opt/harness/install-x64.sh" in pinned_service,
+        f"a resolved provisioner must be PINNED into the unit, got:\n{pinned_service}",
+    )
+    unpinned = ra.render_unit("daniel-ospina/tortoise", provisioner=None)
+    check(
+        "RUNNER_AUTOSCALE_PROVISIONER"
+        not in unpinned[f"{ra.UNIT_BASENAME}.service"].split("ExecStart=")[0],
+        "no unresolvable provisioner may be written into the unit (an empty value would be read "
+        "as a path by the fill arm)",
+    )
 
 
 @test("T17 install REFUSES a missing WorkingDirectory — and writes NOTHING")
@@ -1291,7 +1355,7 @@ def t17_missing_workdir_refused():
             # ⛔ NOT under the fixture's tmpdir: that path is TRANSIENT, so it would be refused for
             # its SHAPE and this case would never exercise the exists() check it is about. A path
             # under the (durable) home is refused for exactly one reason: it is not there.
-            gone = os.path.join(str(Path.home()), "runnerauto-definitely-absent-cwd")
+            gone = os.path.join(str(ra.account_home()), "runnerauto-definitely-absent-cwd")
             code, out = cli(box, "--install-unit", "--workdir", gone)
             check(code == 1, f"a missing cwd must be REFUSED (exit 1, nothing written), got {code}")
             check("does not exist" in out, f"the refusal must name the reason, got: {out!r}")
@@ -1325,8 +1389,8 @@ def t18_transient_workdir_refused():
             # ⛔ A `%` is expanded at LOAD time, so a directory whose NAME contains one passes an
             # is_dir check and then resolves to a DIFFERENT path inside systemd — the very
             # status=200/CHDIR class this fix closes. A newline is a directive injection.
-            specifier = str(Path.home()) + "/ra-%h-literal-dir"
-            newline = str(Path.home()) + "/x\nExecStartPre=/bin/false"
+            specifier = str(ra.account_home()) + "/ra-%h-literal-dir"
+            newline = str(ra.account_home()) + "/x\nExecStartPre=/bin/false"
             for value, needle in ((specifier, "systemd specifier"), (newline, "control character")):
                 code2, out2 = cli(box, "--install-unit", "--workdir", value)
                 check(code2 == 1, f"workdir={value!r} must be REFUSED, got {code2}: {out2}")
@@ -1374,10 +1438,10 @@ def t19_install_writes_and_enables():
                 f"the TIMER must be enabled: a written unit with no timer schedules nothing: {calls}",
             )
             before = Path(units, f"{ra.UNIT_BASENAME}.service").read_text()
-            code2, out2 = cli(box, "--install-unit", "--workdir", str(Path.home()))
+            code2, out2 = cli(box, "--install-unit", "--workdir", str(ra.account_home()))
             check(code2 == 0, f"a re-install must succeed, got {code2}: {out2}")
             check(
-                f"WorkingDirectory={Path.home()}"
+                f"WorkingDirectory={ra.account_home()}"
                 in Path(units, f"{ra.UNIT_BASENAME}.service").read_text(),
                 "an EXPLICIT, usable --workdir must be written literally",
             )
@@ -1428,7 +1492,7 @@ def t19_install_writes_and_enables():
             timer.unlink()
             timer.mkdir()
             Path(timer, "blocker").write_text("x")
-            code2, out2 = cli(box, "--install-unit", "--workdir", str(Path.home()))
+            code2, out2 = cli(box, "--install-unit", "--workdir", str(ra.account_home()))
             check(code2 == 3, f"a failed second replace is an ACTION failure, got {code2}: {out2}")
             # ⛔ the message must be TRUE: the service half WAS replaced, the timer half was not
             check(
@@ -1595,8 +1659,13 @@ def t21_pass_note_does_not_change_the_verdict():
                 f"the bad unit must be recorded: {record.get('unit_cwd_problems')}",
             )
             check(
-                any(n.startswith("unit cwd: ") for n in record["notes"]),
-                f"…and NAMED in the human notes: {record['notes']}",
+                any(n.startswith("unit audit: ") for n in record["notes"]),
+                f"…and NAMED in the human notes as ONE summary line: {record['notes']}",
+            )
+            check(
+                len([n for n in record["notes"] if n.startswith("unit audit: ")]) == 1,
+                "one summary note per pass, not one per finding (a standing wall of identical "
+                f"lines made a NEW finding indistinguishable): {record['notes']}",
             )
             check(
                 record["problems"] == [],
@@ -2272,7 +2341,297 @@ class Mutation:
         self.why = why
 
 
+# ── 8. THE REVIEW-FINDING CASES (2026-10-27) ────────────────────────────────────────────────────
+# A path longer than PATH_MAX, rooted OUTSIDE every transient prefix, so the SHAPE check cannot be
+# what fires: the only thing left for the tool to hit is `os.stat`'s ENAMETOOLONG.
+_TOO_LONG = "/" + "a" * 300 + "/" + "/".join(["b" * 250] * 30)
+
+
+@test("T28 a path this check CANNOT INSPECT is a finding — never a traceback, never an exemption")
+def t28_uninspectable_path():
+    """THE MEASURED DEFECT. `Path.is_dir()`/`Path.exists()` return False only for the errnos `pathlib`
+    lists as absence (ENOENT, ENOTDIR, EBADF, ELOOP) and RE-RAISE everything else, so an unreadable
+    path escaped as a traceback: `--check-units` over one unit whose `WorkingDirectory` sat under
+    `/root` (audited by a non-root account) exited 1 with a PermissionError stack and NO verdict —
+    and the audit runs on EVERY pass. A path over PATH_MAX does the same without needing privileges,
+    which is why it is the fixture here."""
+    check(len(_TOO_LONG) > 4096, "the fixture must exceed PATH_MAX")
+    problem = ra.unit_workdir_problem(_TOO_LONG)
+    check(problem is not None, "an uninspectable WorkingDirectory must be REFUSED")
+    contains(problem, "cannot be inspected", "the workdir refusal")
+    check(
+        "does not exist" not in problem,
+        f"it must not claim an absence it could not observe: {problem}",
+    )
+    exec_problems = ra.unit_exec_problems("x.service", [_TOO_LONG], "oneshot")
+    check(
+        any("cannot be inspected" in p for p in exec_problems),
+        f"the ExecStart program arm must report it too: {exec_problems}",
+    )
+    # ⛔ THE EXEMPTION DIRECTION IS THE DANGEROUS ONE. `_condition_absent` exempts a unit from the
+    # ExecStart check when a `Condition*=` path is missing — so reading "I could not look" as "the
+    # condition is unmet" would declare a unit systemd may well start to be SKIPPED: a false PASS
+    # inside the audit. The finding must survive.
+    guarded = ra.unit_exec_problems(
+        "x.service",
+        ["/nonexistent-program-xyz/run"],
+        "simple",
+        [("ConditionPathExists", _TOO_LONG)],
+    )
+    check(
+        any("does not exist" in p for p in guarded),
+        f"an uninspectable condition must NOT exempt the unit: {guarded}",
+    )
+    with Env():
+        box = Box("uninspectable")
+        try:
+            Path(box.dir, "units", "a.service").write_text(
+                f"[Service]\nWorkingDirectory={_TOO_LONG}\nExecStart=/bin/true\n", encoding="utf-8"
+            )
+            code, out = cli(box, "--check-units")
+            check(
+                code == 5,
+                f"--check-units must answer with a VERDICT (5 = findings), never a traceback (1): "
+                f"rc={code}\n{out}",
+            )
+            contains(out, "cannot be inspected", "the audit's report")
+            check("Traceback" not in out, f"…and never a traceback:\n{out}")
+        finally:
+            box.destroy()
+
+
+@test("T29 the floor follows the GATE: `github` or no state file ⇒ NOT armed, and the record says why")
+def t29_floor_follows_the_gate():
+    """THE REVIEW'S P1, AND A RECORDED DECISION. `ci_runner_gate.sh:12` rules that this box serves CI
+    as a FALLBACK only, and its header records the cost of ignoring that (jobs here compete with the
+    agent fleet; a local pytest run crashed FalkorDB, 178 restarts). "No runner carries
+    `ubuntu-latest`" is what a HEALTHY box looks like, because the gate strips the label whenever
+    GitHub-hosted is fine — so a floor keyed on absence alone armed the label on every repair, and
+    the gate stripped it again, forever."""
+    arch_only = {
+        "x86-1": ra.PoolEntry(
+            name="x86-1", status="online", busy=False, labels=["self-hosted", ra.ARM_POOL_LABEL]
+        )
+    }
+    check(ra.label_floor_binds(arch_only, "local") is True, "a gate that says local IS missing it")
+    check(
+        ra.label_floor_binds(arch_only, "github") is False,
+        "a gate that says github must NOT arm it — that is the healthy state, not an outage",
+    )
+    check(ra.label_floor_binds(arch_only, None) is False, "no recorded mode is not a reason to arm")
+    notes: list[str] = []
+    got = ra.resolve_labels(arch_only, "x86_64", notes=notes, gate_mode="local")
+    check(got == "self-hosted-x64,ubuntu-latest", f"local ⇒ armed: {got!r}")
+    notes = []
+    got = ra.resolve_labels(arch_only, "x86_64", notes=notes, gate_mode="github")
+    check(got == "self-hosted-x64", f"github ⇒ NOT armed: {got!r}")
+    check(
+        len(notes) == 1 and "NOT armed" in notes[0],
+        f"…and the refusal to arm must be SAID, not silent: {notes}",
+    )
+    # end to end, with the gate's OWN file in the fixture: the registration must not carry the label
+    with Env():
+        box = Box("gate-github")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted", "self-hosted-x64"])])
+            box.alive([])
+            box.gate_state("github")
+            record = converge(box, want=0)
+            check(record.get("gate_mode") == "github", f"the record must publish the mode: {record}")
+            argv = [c for c in box.calls("config-calls.log") if "argv=" in c]
+            check(len(argv) == 1, f"expected one re-registration, got {argv}")
+            check(
+                ra.FALLBACK_LABEL not in argv[0],
+                f"a healthy gate must not be overwritten by a repair: {argv[0]}",
+            )
+            check(record.get("label_floor_binds") is False, f"record: {record}")
+        finally:
+            box.destroy()
+
+
+@test("T30 a seam that cannot be parsed is UNMEASURABLE naming it — and the pass still leaves a RECORD")
+def t30_bad_seam_leaves_a_record():
+    """TWO HALVES OF ONE MEASURED DEFECT. `int(os.environ[…])` on a seam raised ValueError, and
+    `main()` caught only `Unmeasurable` — so a pass that may already have restarted and re-registered
+    runners died with a traceback, exit 1, and `_log()` never called: no record of what it did. The
+    seam is now a named `Unmeasurable`, and the backstop turns any other exception into a recorded
+    verdict instead of silence."""
+    with Env():
+        box = Box("bad-seam")
+        try:
+            box.apply()
+            os.environ["RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS"] = "abc"
+            try:
+                ra.read_pool_retrying("daniel-ospina/tortoise")
+            except ra.Unmeasurable as exc:
+                contains(str(exc), "RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS", "the seam is NAMED")
+            else:
+                raise Failure("an unparsable seam must raise Unmeasurable, not crash")
+            del os.environ["RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS"]
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            original = ra.installed_unit_cwd_problems
+
+            def boom(*_a, **_k):
+                raise RuntimeError("the unit audit exploded")
+
+            ra.installed_unit_cwd_problems = boom
+            try:
+                code = ra.main(["--root", box.root, "--want", "1"])
+            finally:
+                ra.installed_unit_cwd_problems = original
+            check(code == 2, f"a pass that could not complete exits 2 (unmeasurable), got {code}")
+            log = os.path.join(box.dir, "state", "runner-autoscale.log")
+            check(
+                os.path.exists(log),
+                "the pass MUST leave a record — a timer that dies silently is the failure this "
+                f"whole file refuses. looked for {log}",
+            )
+            with open(log, encoding="utf-8") as fh:
+                body = fh.read()
+            contains(body, "the unit audit exploded", "the record carries the cause")
+            contains(body, "unmeasurable", "the record carries a VERDICT")
+        finally:
+            box.destroy()
+
+
+@test("T31 FILL success: ONE addition, at the NEXT FREE SLOT — the tool's primary action, measured")
+def t31_fill_adds_one_runner():
+    """THE ONE BRANCH WITH NO ACCEPTANCE TEST (review finding P2): every other provisioner call in
+    this suite is the `rc=2` REFUSAL. So the action the tool exists for — growing a box — was
+    unproven, including `_next_free_slot` (two measured over-fill incidents) and the argv the
+    installer is actually given."""
+    with Env():
+        box = Box("fill")
+        try:
+            first = box.install("gh-runner-x64", "r-1")
+            box.install("gh-runner-cell4-x64", "r-foreign")  # ad-hoc, NOT in the numbering
+            box.alive([first])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.disk(500_000)
+            slot = os.path.join(box.root, "gh-runner-x64-2")
+            box._write(
+                os.path.join(box.dir, "provisioner.sh"),
+                "#!/usr/bin/env bash\n"
+                f'printf "%s\\n" "$*" >> "{box.dir}/provisioner-calls.log"\n'
+                f'mkdir -p "{slot}"\n'
+                f'printf \'{{"agentName":"r-2"}}\' > "{slot}/.runner"\n'
+                f'printf "%s\\n" "{slot}" >> "{box.dir}/alive.txt"\n'
+                "exit 0\n",
+                0o755,
+            )
+            record = converge(box, nproc="4", want=2)  # 4 cores ⇒ ceiling 2, one live ⇒ add ONE
+            calls = box.calls("provisioner-calls.log")
+            check(len(calls) == 1, f"one addition is ONE provisioner call, got {calls}")
+            contains(calls[0], "--count 2", "the argv (the NEXT FREE SLOT, not the install count)")
+            check(not record["problems"], f"a successful fill must not report a problem: {record}")
+            check(
+                any(a.startswith("installs ") or "provision" in a.lower() for a in record["actions"]),
+                f"the record must say what was added: {record['actions']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T32 a runner that came up with a JOB during the restart wait is NOT re-registered")
+def t32_busy_reread_before_replace():
+    """`wait_online` re-reads the POOL only — the view that already called the runner offline — and
+    `--replace` DELETES a registration. A runner that comes up at the last second and takes a job
+    would therefore lose it, against this file's own invariant ("a BUSY, SERVING or OTHER-REPO runner
+    is never restarted"). The re-check has to be FRESH, too: the classification value is cached, and
+    a cached `False` would certify exactly what the re-check exists to refuse."""
+    with Env():
+        box = Box("busy-reread")
+        try:
+            path = box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            # ⛔ NO busy-dirs seam here: that path is UNCACHED, so it could not show the stale cache
+            # this case is about. A stateful `ps` answers "no worker" while the runner is judged and
+            # "a worker" from then on — exactly a job starting during the wait.
+            del box.env["RUNNER_AUTOSCALE_BUSY_DIRS"]
+            counter = os.path.join(box.dir, "ps-count")
+            box._write(
+                os.path.join(box.dir, "ps"),
+                "#!/usr/bin/env bash\n"
+                f'n=$(cat "{counter}" 2>/dev/null || echo 0)\n'
+                f'echo $((n+1)) > "{counter}"\n'
+                f'if [ "$n" -ge 1 ]; then echo "Runner.Worker {path}/bin/Runner.Listener"; fi\n',
+                0o755,
+            )
+            box.env["RUNNER_AUTOSCALE_PS"] = os.path.join(box.dir, "ps")
+            record = converge(box, want=0)
+            argv = [c for c in box.calls("config-calls.log") if "argv=" in c]
+            check(argv == [], f"a runner serving a job must NOT be re-registered: {argv}")
+            check(
+                any("came up with a JOB" in n for n in record["notes"]),
+                f"…and the pass must say so: {record['notes']}",
+            )
+        finally:
+            box.destroy()
+
+
 MUTATIONS = [
+    # ── review round 8: the 2026-10-27 findings (P1–P3) ──
+    Mutation(
+        "T28",
+        "        if exc.errno in _ABSENT_ERRNOS:\n            return None, None",
+        "        if True:  # MUTATION: every unreadable path is filed as ABSENT\n            return None, None",
+        "an uninspectable path is filed as ABSENT again: the audit claims 'does not exist' about a "
+        "directory it never looked at, and the install refuses for the wrong reason",
+    ),
+    Mutation(
+        "T28",
+        '        if uninspectable:\n            # ⛔ THE DIRECTION MATTERS: this function\'s answer EXEMPTS a unit from the ExecStart',
+        '        if uninspectable:\n            return f"{key}={value}"  # MUTATION: could-not-look read as condition-unmet\n            # ⛔ THE DIRECTION MATTERS: this function\'s answer EXEMPTS a unit from the ExecStart',
+        "an uninspectable Condition path is read as an ABSENT one, so a unit systemd may well start "
+        "is silently exempted from the ExecStart check — a false PASS inside the audit",
+    ),
+    Mutation(
+        "T29",
+        '    return gate_mode == "local" and not pool_serves_fallback(pool)',
+        "    return not pool_serves_fallback(pool)  # MUTATION: the pre-fix rule",
+        "the floor stops consulting the gate: 'no runner carries the label' is the gate's NORMAL "
+        "state, so every repair re-arms ubuntu-latest on a healthy box and the gate strips it again "
+        "— the recorded fallback-only decision is reversed and the two timers fight forever",
+    ),
+    Mutation(
+        "T30",
+        '    try:\n        return int(raw.strip())\n    except ValueError as exc:\n        raise Unmeasurable(\n            f"{name}={raw!r} is not an integer — refusing to run with an unreadable seam"\n        ) from exc',
+        '    return int(raw.strip())  # MUTATION: a bad seam escapes as ValueError',
+        "an unparsable seam crashes the pass again with a traceback and no record — on a pass that "
+        "may already have restarted and re-registered runners",
+    ),
+    Mutation(
+        "T30",
+        "    except Exception as exc:  # noqa: BLE001 — a pass that dies must still leave a RECORD",
+        "    except ZeroDivisionError as exc:  # MUTATION: the backstop no longer catches",
+        "the backstop is removed: an unexpected error exits with a bare traceback and `_log()` is "
+        "never called, so the record of a pass that DID change the box is lost",
+    ),
+    Mutation(
+        "T31",
+        '        if not (slot / ".runner").exists():\n            return index\n        index += 1',
+        "        return index  # MUTATION: the base slot, never the next FREE one",
+        "the slot is not walked for the first FREE one, so an occupied base makes the installer fill "
+        "several slots in one call — the measured over-fill the ceiling forbids",
+    ),
+    Mutation(
+        "T32",
+        "            serving = _worker_alive(runner, fresh=True) or (fresh is not None and fresh.busy)",
+        "            serving = _worker_alive(runner) or (fresh is not None and fresh.busy)  # MUTATION: the cached value",
+        "the busy re-check reads the value cached at CLASSIFICATION, so a runner that came up and "
+        "took a job during the restart wait has its registration deleted under the running job",
+    ),
+    Mutation(
+        "T9b",
+        "            queued, busy, online = sample()\n            starved = starvation_invariant(queued, busy, online)",
+        "            queued, busy, online = sample()\n            pass  # MUTATION: the second sample is thrown away",
+        "the confirmation sample is taken and discarded, so an ordinary handover blip alarms — the "
+        "one case in this suite that had no paired mutation at all (review finding P3)",
+    ),
     # ── review round 7 ──
     Mutation(
         "T26",
@@ -2305,8 +2664,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T27",
-        "        if not Path(path).exists():",
-        "        if False:",
+        '        if probe is None:\n            return f"{key}={value}"',
+        '        if False:\n            return f"{key}={value}"',
         "a conditionally SKIPPED unit is judged as if it would run: a stock rc-local-style unit with no "
         "rc.local pages a human about a program systemd never starts",
     ),
@@ -2404,14 +2763,15 @@ MUTATIONS = [
     ),
     Mutation(
         "T21",
-        '''        record["unit_cwd_problems"] = unit_problems
-        record["notes"].extend(f"unit cwd: {p}" for p in unit_problems)''',
+        '''        record["unit_cwd_problems"] = unit_problems''',
         """        record["problems"].extend(unit_problems)""",
         "a stale unit file is folded into `problems`, so every pass on that cell reports failure",
     ),
     Mutation(
         "T21",
-        '''        record["notes"].extend(f"unit cwd: {p}" for p in unit_problems)''',
+        '''        record["notes"].append(
+            f"unit audit: {len(unit_problems)} installed-unit finding(s) — see unit_cwd_problems"
+        )''',
         "        pass",
         "the pass finds a bad unit and says NOTHING about it",
     ),
@@ -2477,7 +2837,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T17",
-        "    if not path.is_dir():",
+        "    if probe is None or not stat.S_ISDIR(probe.st_mode):",
         "    if False:",
         "a missing WorkingDirectory is written anyway, and systemd then fails the unit at CHDIR",
     ),
@@ -2513,7 +2873,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T3",
-        '            labels = resolve_labels(\n                pool, machine, notes=record["notes"], current=c["labels"]\n            )',
+        '            labels = resolve_labels(\n                pool,\n                machine,\n                notes=record["notes"],\n                current=c["labels"],\n                gate_mode=gate_mode,\n            )',
         '            labels = resolve_labels(\n                pool, machine, notes=record["notes"]\n            ) if not c["labels"] else _preserve_labels(c["labels"], machine)',
         "the PRE-FIX either/or: a DEAD runner preserves its labels and the floor is never reached",
     ),
