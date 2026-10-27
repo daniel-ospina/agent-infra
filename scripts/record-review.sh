@@ -95,9 +95,13 @@
 #               · a `clean-low` marker (see above)
 #               · no AI_REVIEW_GATE_KEY, so a marker's signature cannot be
 #                 VERIFIED (and an unverified marker is a body edit)
-#               · the PR body could not be READ (transient — RETRY)
+#               · the PR body could not be READ — TRANSIENT (RETRY) or PERMANENT
+#                 (a 404/422: the PR does not exist or is not visible to this
+#                 token — retrying cannot help), branched on gh's own message
 #               · the head commit's committer date could not be read, so even a
-#                 lower bound for `reviewed_at` cannot be stated
+#                 lower bound for `reviewed_at` cannot be stated — likewise
+#                 branched transient vs permanent (`No commit found` = a
+#                 force-pushed marker head, or a commit only on a fork)
 #     exit 5  recovery fills an ABSENCE and never replaces one: a record for this
 #             PR/repo already exists (including one that appeared WHILE this verb
 #             was reading the PR), the qualified file embeds ANOTHER repo — the
@@ -1957,7 +1961,12 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     # unusable would then tell an operator to move aside a record the gate is
     # honouring — and recovery would mint an OLDER verdict over it.
     if command -v jq >/dev/null 2>&1; then
-      command jq -e 'has("head_sha") and has("verdict")' "$1" >/dev/null 2>&1 && return 0
+      # ⛔ THE GATE REQUIRES STRINGS, NOT MERE PRESENCE (round 4, P3):
+      # `readRecordFile` tests `typeof === "string"`, so `"head_sha": null` is
+      # ABSENT to the gate. A bare `has()` would call that file a record here and
+      # answer "already exists, nothing to repair" for one the rail says NO-RECORD
+      # about — the round-2 loop, narrowed to a present-but-untyped key.
+      command jq -e '(.head_sha|type)=="string" and (.verdict|type)=="string"' "$1" >/dev/null 2>&1 && return 0
       return 1
     fi
     grep -q '"head_sha"' "$1" 2>/dev/null && grep -q '"verdict"' "$1" 2>/dev/null

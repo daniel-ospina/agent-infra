@@ -2748,6 +2748,17 @@ run_recover 424936 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14y a pretty-printed (jq round-trip) record counts as existing (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "already exists" "11.14y …and is NOT called unusable, because the gate reads it fine"
 
+# (y2) PRESENT BUT UNTYPED IS NOT A RECORD. The gate requires STRINGS, so
+#      `"head_sha": null` is ABSENT to it. Treating that as an existing record
+#      here would answer "nothing to repair" for a file the rail says NO-RECORD
+#      about — the round-2 loop, narrowed to a present-but-untyped key.
+rb_clear
+printf '%s\n' '{"pr":424938,"head_sha":null,"verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/daniel-ospina-agent-infra-424938.json"
+export STUB_BODY="$(rb_marker 424938 "review recorded: reviews/424938.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424938 "$RB_REPO"
+assert_eq "$RB_RC" "5" "11.14y2 a record with an untyped head_sha is refused (exit 5)"
+assert_contains "$(cat "$T/rb-err")" "NOT a usable record" "11.14y2 …as an unusable record, matching what the gate sees (absent)"
+
 # (z) A PERMANENT ERROR IS NOT A TRANSIENT ONE. A 404 on the PR read used to say
 #     "RETRY", which a lane can obey forever.
 rb_clear
@@ -3543,6 +3554,30 @@ $(signed_marker $PRV2 "$STALE" "$EV13_H")" "$EV13_D"
 assert_eq "$RECORD_RC" "0" "13i a carry with NO prior record still records (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tail -2 | tr '\n' ' ')]"
 assert_contains "$RECORD_ERR" "not recoverable" "13i the unrecoverable mint time is announced on stderr"
 assert_contains "$(cat "$(Q2 $PRV2)")" '"mint":"carried"' "13i the record is still marked carried"
+
+# 13h2 — A RECOVERED PREDECESSOR IS NOT A MINT TIME (#2872, round 4). A record
+# minted by `--recover-body` carries reviewed_at = the head commit's date, which is
+# a LOWER BOUND. Inheriting it on the next carry and printing "preserved as the
+# ORIGINAL mint time" would launder a commit date into a mint time and drop the
+# recovery label in the same step — the tortoise#7391 corruption this arm exists to
+# prevent, with nothing else standing in the way. Both branches of the warning are
+# otherwise indistinguishable to this suite.
+PRV3=424744
+rm -f "$(Q2 $PRV3)"
+printf '%s\n' "{\"pr\":$PRV3,\"head_sha\":\"$STALE\",\"diff_sha256\":\"$EV13_H\",\"mint\":\"recovered-body\",\"recovered_at\":\"2026-01-01T00:00:00Z\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-01-01T00:00:00Z\"}" > "$(Q2 $PRV3)"
+EV13_BODY3="body
+
+$(signed_marker $PRV3 "$STALE" "$EV13_H")"
+run_record_diff $PRV3 "$STALE" "$EV13_BODY3" "$EV13_D"
+assert_eq "$RECORD_RC" "0" "13h2 a carry over a RECOVERED predecessor still records (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tail -2 | tr '\n' ' ')]"
+R13H2="$(cat "$(Q2 $PRV3)" 2>/dev/null || true)"
+assert_contains "$R13H2" '"mint":"carried"' "13h2 it is still a carry"
+if grep -q '"reviewed_at":"2026-01-01T00:00:00Z"' <<<"$R13H2"; then
+  bad "13h2 the carry INHERITED the recovered record's LOWER BOUND as a mint time"
+else
+  ok "13h2 the recovered lower bound is NOT inherited as a mint time"
+fi
+assert_contains "$RECORD_ERR" "NOT inherited" "13h2 …and the warning says so, rather than 'preserved as the original mint time'"
 
 # 13j/13k — the arms that are NOT carries must not become evidence-free side
 # doors. The gate is skipped only when CARRY_ARM set (a verified carry, whose
