@@ -307,6 +307,17 @@ cat >"$T/bin/git-fail-list" <<'SHIM'
 for a in "$@"; do [ "$a" = "list" ] && exit 128; done
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
+cat >"$T/bin/git-empty-list" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A11b: `worktree list` SUCCEEDS (exit 0) but prints NOTHING.
+# That is the case A11 cannot reach — A11 is a nonzero exit, this is a zero exit
+# with an empty answer, which used to produce a healthy-looking pass (
+# `examined=0 classified=0 ... reasons=none`). `git worktree list` always
+# records at least the main/bare worktree, so zero records means the enumeration
+# answered nothing and the pass must fail CLOSED, not report an empty success.
+for a in "$@"; do [ "$a" = "list" ] && exit 0; done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
 cat >"$T/bin/git-lock-on-remove" <<'SHIM'
 #!/usr/bin/env bash
 # GIT_BIN shim: locks the target worktree just before the real `worktree
@@ -374,7 +385,7 @@ chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh
          "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
          "$T/bin/git-late-ignored" "$T/bin/git-slow-nth-status" "$T/bin/git-race-delete-a25" \
-         "$T/bin/git-list-fail-after-probes" "$T/bin/comm"
+         "$T/bin/git-list-fail-after-probes" "$T/bin/git-empty-list" "$T/bin/comm"
 
 # ── fixture builders ───────────────────────────────────────────────────
 mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
@@ -414,6 +425,11 @@ commit_in_wt() { # <dir> <date> <label> — a commit with a chosen committer dat
 run_reaper() {
     local envname="$1"; shift
     local nowval="${REAP_WT_NOW_EPOCH_OVERRIDE-$NOW}"
+    # ⛔ EVERY FIXTURE IS OFFLINE: REAP_WT_MAIN_PROOF is pinned to `local` in the env list below.
+    # `auto` (the production default) asks the remote that pushes which branch it calls HEAD — a
+    # network round trip that would make a fixture's verdict depend on the host's connectivity and the
+    # remote's state. `local` is the documented test seam; the `auto` path has its own coverage in the
+    # disk-reaper suite (T3), against a LOCAL bare origin.
     HOME="$T/$envname/home" \
     PATH="$T/bin:$PATH" \
     REAP_WT_STATE_DIR="$T/$envname/state" \
@@ -451,6 +467,7 @@ run_reaper() {
     FAKE_LSOF_CWD_PID="${FAKE_LSOF_CWD_PID:-}" \
     FAKE_GH_REFS="${FAKE_GH_REFS:-}" \
     FAKE_GH_PRS="${FAKE_GH_PRS:-}" \
+    REAP_WT_MAIN_PROOF="local" \
     REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES_OVERRIDE:-45}" \
     REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-}" \
     FAKE_GH_FAIL="${FAKE_GH_FAIL:-}" \
@@ -1164,6 +1181,20 @@ OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" REAP_WT_TREE_TS=1 REAP_WT_MIN_AGE_MINUTES_O
 # worktree is deferred is not fixed — assert the ROW SHAPE, not a path.
 assert_eq "$(grep -cF 'reason=deferred' <<<"$OUT")" "1" "A7 budget exhausted => exactly one deferred row"
 assert_contains "$(footer $ENV)" "DEFERRED=1" "A7 footer DEFERRED=1"
+# ⛔ THE IDENTITIES MUST BE CHECKED ON A PASS THAT ACTUALLY HAS A DEFERRAL. On a clean pass
+# `deferred=0`, so `examined = classified + deferred` degenerates to `examined = classified` and
+# `classified = remove + preserved` to `classified = preserved`: the three-term variant
+# (`classified = remove + preserved + deferred`) that the VGATE reviewer caught would satisfy BOTH and
+# the identity assertions would be vacuous. This is the pass where a deferral exists, so the split
+# (`deferred` vs `deferred_remove`) and the two identities are load-bearing here.
+SUM7="$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)"
+_a7i() { sed -n "s/.* $1=\([0-9][0-9]*\).*/\1/p" <<<"$SUM7" | head -1; }
+assert_contains "$SUM7" "SUMMARY examined=" "A7 the deferred pass prints its SUMMARY line"
+assert_eq "$(_a7i deferred)" "1" "A7 the SUMMARY carries the deferral (otherwise the identities below are vacuous)"
+assert_eq "$(_a7i examined)" "$(( $(_a7i classified) + $(_a7i deferred) ))" \
+    "A7 examined = classified + deferred WITH a deferral in play"
+assert_eq "$(_a7i classified)" "$(( $(_a7i remove) + $(_a7i preserved) ))" \
+    "A7 classified = remove + preserved WITH a deferral in play (a deferred record is NOT classified)"
 OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" REAP_WT_TREE_TS=1 REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     GIT_BIN_OVERRIDE="$T/bin/git-veryslow-status" REAP_WT_STATUS_TIMEOUT=30 \
     REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --apply --repo "$REPO")"
@@ -1223,6 +1254,20 @@ assert_eq "$RC" "3" "A11 git worktree list failure => exit 3 (not a healthy empt
 assert_contains "$OUT" "git worktree list failed" "A11 abort names the failing probe"
 assert_contains "$(cat "$T/$ENV/reap.log")" "git worktree list failed" "A11 abort is logged"
 
+# ── A11b: an EMPTY (rc 0) enumeration is fail-closed too (#4529 review) ─
+# A11 above pins the nonzero-exit arm. This pins the OTHER arm: git answers 0 and
+# simply lists nothing. That used to sail through to a SUMMARY that read
+# `examined=0 classified=0 remove=0 preserved=0 reasons=none` — a no-op pass
+# indistinguishable from a healthy one, which is the shape this PR removes.
+# Real git cannot produce it (the main/bare worktree is always listed), so it can
+# only be reached by a broken/neutered git, which is exactly what must not pass.
+ENV=A11b; REPO="$(mk_repo $ENV)"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-empty-list" run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "A11b an EMPTY worktree list (rc 0, no records) => exit 3, never a healthy empty pass"
+assert_contains "$OUT" "reported no worktrees" "A11b the abort names the empty enumeration"
+assert_absent "$OUT" "examined=0" "A11b no SUMMARY is printed for a pass that enumerated nothing"
+assert_contains "$(cat "$T/$ENV/reap.log")" "reported no worktrees" "A11b the abort is logged too"
+
 # ── A12: a removal refusal is reported, never swallowed ────────────────
 ENV=A12; REPO="$(mk_repo $ENV)"
 WT_REFUSE="$(add_named_wt "$REPO" "$ENV-refuse" feat/a12-refuse)"
@@ -1265,6 +1310,24 @@ OUT="$(REAP_WT_STATUS_TIMEOUT=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)
 assert_eq "$RC" "2" "A14f non-numeric timeout => exit 2 (never a watchdog-less probe)"
 OUT="$(run_reaper $ENV --dry-run --repo "$T/$ENV/does-not-exist" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "A14g --repo that is not a directory => exit 2"
+# A14h — the MERGED floor is validated like the aged floor. It governs the common arm now (every
+# squash-landed head), so a numeric-but-out-of-range value must fail LOUDLY rather than silently
+# change every verdict in the pass. Unpinned before this, which is how it was noticed.
+OUT="$(REAP_WT_MERGED_AGE_DAYS_OVERRIDE=99999999 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14h a merged floor above REAP_WT_MAX_DAYS => exit 2 (never a silently different pass)"
+assert_contains "$OUT" "bad REAP_WT_MERGED_AGE_DAYS" "A14h ... and the refusal names the seam, not a generic usage error"
+# A14i — the pass's SUMMARY must satisfy ITS OWN identities on a REAL pass: `examined = classified +
+# deferred` and `classified = remove + preserved`. Two identities over four counters is where a
+# deferral double-count (or a missing one) becomes readable instead of inferred; the doc states them,
+# so something must check them against the delegate's own arithmetic rather than a stub.
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+SUM="$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)"
+_a14i() { sed -n "s/.* $1=\([0-9][0-9]*\).*/\1/p" <<<"$SUM" | head -1; }
+assert_contains "$SUM" "SUMMARY examined=" "A14i the pass ends with ONE machine-readable summary line"
+assert_eq "$(_a14i examined)" "$(( $(_a14i classified) + $(_a14i deferred) ))" \
+    "A14i examined = classified + deferred on a real pass"
+assert_eq "$(_a14i classified)" "$(( $(_a14i remove) + $(_a14i preserved) ))" \
+    "A14i classified = remove + preserved on a real pass"
 
 # ── A15: a DEFERRED record must block the global prune (P0 pin) ───────
 # A budget-deferred record is UNCLASSIFIED, so the pass cannot know whether it is
@@ -1999,17 +2062,18 @@ FAKE_LSOF_CWD=""; FAKE_LSOF_CWD_PID=""; FAKE_PS_ANCESTOR_PID=""
 # ── MUTATIONS: the new legs must be able to FAIL ────────────────────────
 # Each mutant is the reviewed script with ONE gate removed, in a temp copy. A leg
 # that stays green under the mutation is not pinning the gate it claims to pin.
-mutate_reaper() { # <sed-expr> -> path of the mutant
+mutate_reaper() { # <sed-expr> [<extra sed args>] -> path of the mutant
     # The mutant must sit beside a `lib/` or the script fails closed at startup
     # (the bounded-execution library is resolved relative to the script), which
     # would make EVERY leg pass for the wrong reason. So: one mutant dir, with
     # `lib` symlinked to the reviewed one.
     local expr="$1" dir="$T/mutants" dest
+    shift
     mkdir -p "$dir"
     [ -e "$dir/lib" ] || ln -s "$SCRIPT_DIR/lib" "$dir/lib"
     dest="$dir/mutant-$$.sh"
     cp "$REAPER" "$dest"
-    sed -i -e "$expr" "$dest"
+    sed -i -e "$expr" "$@" "$dest"
     cmp -s "$REAPER" "$dest" && { echo "MUTATION-NOOP: $expr" >&2; return 1; }
     printf '%s\n' "$dest"
 }
@@ -2024,8 +2088,14 @@ assert_contains "$(row_for "$OUT" "$WT_M")" "reason=reclaimable" \
 
 # M2: drop the ANCESTRY/PATCH check (every head is "merged") => N4's unmerged,
 # young row escapes the age floor, so N4(d) fails.
+# ⛔ TWO call sites make the ancestry decision now: `is_ancestor_of_main` (the survival channel,
+# via `commits_survive`) and `ancestry_proof_text` (the proof the REMOVAL row must cite, re-taken
+# so a stale local ref can never be cited for a proof it did not take). Neutering only the first
+# leaves the second refusing to remove, and this mutation would then measure the citation guard,
+# not the gate.
 ENV=N4
-MUT2="$(mutate_reaper 's#\[ "\$rc" = 0 \] && merged=1#merged=1#')" || exit 1
+MUT2="$(mutate_reaper 's#if is_ancestor_of_main "\$sha"; then merged=1; fi#merged=1#' \
+    -e 's#^        \[ "\$?" = 0 \] && { printf#        { printf#')" || exit 1
 OUT="$(REAPER="$MUT2" run_reaper $ENV --dry-run --repo "$T/$ENV/repo")"
 assert_contains "$(row_for "$OUT" "$WT_U")" "refs=merged" "M2 mutation really removed the ancestry test"
 assert_contains "$(row_for "$OUT" "$WT_U")" "reason=reclaimable" \
