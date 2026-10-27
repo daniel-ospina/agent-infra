@@ -1394,3 +1394,132 @@ claim_prune() {
     fi
   done
 }
+
+# ── THE HOLD-PROOF AT THE ACTION SITE (agent-infra#2867) ─────────────────────────────
+# The claim registry fences DISPATCH (the pre-flight read and the acquire CAS). It does NOT
+# fence ACTION: a dead or duplicated harness that still holds a stale claim commit — or that
+# never took one — reaches the acting tool (`gh pr merge`) with nothing refusing it. This
+# function is the fence AT the action site. The acting tool calls it with the PR, the head it
+# is about to act on, and the claim commit it believes it holds, and it REFUSES unless ALL of
+# these hold:
+#
+#   (i)   a claim ref `refs/claims/<pr>-<sha12>` EXISTS on the remote;
+#   (ii)  the ref's tip IS the actor's own commit — the FENCING TOKEN. A peer that reclaimed
+#         the claim moved the ref, so a stale actor's token no longer matches and its action
+#         is refused (Kleppmann's fencing token, enforced by the registry's own CAS);
+#   (iii) the claim's owner names THIS box (the running host or one of its former names) — a
+#         claim minted by another box is not this actor's;
+#   (iv)  the holder is not ORPHANED — for a local PR claim, the pid that took it must still
+#         be alive (claim_orphan_reason's local rule). A dead holder's claim is expired by
+#         code, so its actor is refused.
+#
+# ⛔ NEVER GUESSES, NEVER FALLS OPEN. An unreadable registry, an absent ref, a mismatched tip,
+# an unparseable owner, or a dead holder all REFUSE (rc != 0). rc 0 is returned ONLY when the
+# proof positively holds. rc 1 (refused) and rc 2 (unreadable) are BOTH refusals — the rc
+# distinguishes "I read it and you are not the holder" from "I could not read it", and neither
+# is ever a pass.
+#
+# ⛔ LEASE-AS-DATA, NOT LIVENESS, IS UNCHANGED (#1709 rec 3). This proof does NOT re-derive,
+# renew, or re-key the lease: it reads the claim's owner (for the actor check) and the holder's
+# pid (for the orphan check), exactly as claim_acquire / claim_prune already do. The wall-clock
+# lease's EXPIRY is decided by claim_prune ("released by code"), which deletes the ref — so a
+# dead harness whose claim was pruned fails check (i). Session liveness (transcript growth) is
+# the ORPHAN REPORT's question (scripts/orchestrator-harness/orphaned-harness.sh), answered by
+# tools/fleet/liveness.py — the single verdict function — never by a second opinion here.
+#
+# claim_action_proof <pr> <head-sha> <own-commit>
+#   Sets CLAIM_ACTION_RESULT to a machine-readable one-line reason and echoes it (so a caller
+#   in a command substitution still sees the reason). Returns 0 (held) / 1 (refused) / 2
+#   (unreadable — also a refusal).
+claim_action_proof() {
+  local pr="${1:-}" head="${2:-}" own="${3:-}"
+  local ref cur tmp lease owner until now orph host held_owner
+  # ⛔ VALIDATE AT THE DOOR — an unreadable input is a REFUSAL (rc 2), never a pass.
+  case "$pr" in ''|*[!0-9]*)
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=<unreadable> reason=non-numeric-pr"
+    echo "$CLAIM_ACTION_RESULT"; return 2 ;; esac
+  case "$head" in ''|*[!0-9a-fA-F]*)
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=<unreadable> reason=non-hex-head"
+    echo "$CLAIM_ACTION_RESULT"; return 2 ;; esac
+  if [ "${#head}" -ne 40 ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} reason=head-not-40-hex"
+    echo "$CLAIM_ACTION_RESULT"; return 2
+  fi
+  case "$own" in ''|*[!0-9a-f]*)
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} reason=non-hex-token"
+    echo "$CLAIM_ACTION_RESULT"; return 2 ;; esac
+  if [ "${#own}" -ne 40 ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} reason=token-not-40-hex"
+    echo "$CLAIM_ACTION_RESULT"; return 2
+  fi
+
+  ref="$(claim_ref "$pr" "$head")"
+  # (i) the claim must EXIST. An absent ref (released, pruned, or never taken) is a refusal —
+  #     an actor that cannot show a claim does not hold this PR/head. ⛔ THE EXIT STATUS IS THE
+  #     DISTINCTION: `git ls-remote <ref>` exits 0 with EMPTY output when the ref simply does not
+  #     exist, and NON-ZERO only when the remote itself could not be consulted (the same split
+  #     `_claim_preflight_at` makes). Collapsing the two reads an outage as "no claim", which is
+  #     the one direction this gate must never fail in.
+  local lrc=0 lout
+  lout="$(_git ls-remote origin "$ref" 2>/dev/null)"; lrc=$?
+  if [ "$lrc" -ne 0 ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=<unreadable> reason=registry-unreadable"
+    echo "$CLAIM_ACTION_RESULT"; return 2
+  fi
+  cur="$(printf '%s\n' "$lout" | awk '{print $1}')"
+  if [ -z "$cur" ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=<none> reason=no-claim"
+    echo "$CLAIM_ACTION_RESULT"; return 1
+  fi
+  # (ii) FENCING — the tip must be the actor's own commit. A peer that reclaimed the claim
+  #      moved the ref, so a stale token belongs to a DIFFERENT holder's claim.
+  if [ "$cur" != "$own" ]; then
+    held_owner="?"
+    tmp="$CLAIM_TMP_NS/proof-$RANDOM$$"
+    if _git fetch -q origin "+$ref:$tmp" 2>/dev/null; then
+      lease="$(_lease_of "$tmp")"; held_owner="${lease%%$'\t'*}"
+      _git update-ref -d "$tmp" 2>/dev/null
+    fi
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=$held_owner reason=fence-mismatch"
+    echo "$CLAIM_ACTION_RESULT"; return 1
+  fi
+  # Read the lease/owner of the ACTOR'S OWN claim (the tip IS the actor's commit).
+  tmp="$CLAIM_TMP_NS/proof-$RANDOM$$"
+  if ! _git fetch -q origin "+$ref:$tmp" 2>/dev/null; then
+    _git update-ref -d "$tmp" 2>/dev/null
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=<unreadable> reason=claim-unreadable"
+    echo "$CLAIM_ACTION_RESULT"; return 2
+  fi
+  lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
+  owner="${lease%%$'\t'*}"; until="${lease##*$'\t'}"
+  host="${owner%%:*}"
+  # (iii) the claim must name THIS box (the running host or a former name).
+  if ! claim_host_is_local "$host"; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=${owner:-?} reason=foreign-holder"
+    echo "$CLAIM_ACTION_RESULT"; return 1
+  fi
+  # (iv) the holder must not be ORPHANED — a dead pid on this box cannot be the acting lane.
+  orph="$(claim_orphan_reason "$owner" "$ref")" || orph=""
+  if [ -n "$orph" ]; then
+    CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=$pr head=${head:0:12} holder=${owner:-?} reason=orphaned-holder detail=$(printf '%s' "$orph" | tr ' ' '_')"
+    echo "$CLAIM_ACTION_RESULT"; return 1
+  fi
+  CLAIM_ACTION_RESULT="claim-action-proof: HELD pr=$pr head=${head:0:12} holder=${owner:-?}"
+  echo "$CLAIM_ACTION_RESULT"; return 0
+}
+
+# claim_host_is_local <host> -> 0 when the host IS this box (running host or a former name),
+# 1 otherwise. The same "local" computation claim_orphan_reason uses for its pid rule, factored
+# out for the hold-proof's "names this actor" check (agent-infra#2867). A probe that cannot
+# answer (empty or the fleet-wide `box` sentinel) ABSTAINS — it is not local.
+claim_host_is_local() {
+  local h="${1:-}" me real
+  [ -n "$h" ] || return 1
+  [ "$h" = "box" ] && return 1
+  me="$(claim_host)"
+  real="$(hostname -s 2>/dev/null)" || real=""
+  if [ -n "$me" ] && [ "$h" = "$me" ]; then return 0; fi
+  if [ -n "$real" ] && [ "$h" = "$real" ]; then return 0; fi
+  case " $(claim_former_hosts) " in *" $h "*) return 0 ;; esac
+  return 1
+}

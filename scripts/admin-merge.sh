@@ -8776,6 +8776,41 @@ ${parity_forgiven_note}"
     exit 0
   fi
 
+  # ── THE HOLD-PROOF AT THE ACTION SITE (agent-infra#2867) ──
+  # The claim registry fences DISPATCH, not ACTION. This merge is the action whose wrongness
+  # costs most (an `--admin` merge lands a head into main irreversibly, with the evidence bound
+  # to a head the actor may not have reviewed), so it is the ONE action fenced here — and the
+  # gate runs BEFORE the evidence comment is posted, so a dead lane neither merges nor mints an
+  # attestation. When the harness invoked this rail it passes CLAIM_ACTION_CLAIMS_SH +
+  # CLAIM_ACTION_HEAD_TOKEN (the claim commit merge-one.sh pushed); the rail then REFUSES unless
+  # `claim_action_proof` holds — a claim exists, its tip is this actor's own commit (the fencing
+  # token), it names this box, and its holder is not dead. A manual invocation (no
+  # CLAIM_ACTION_CLAIMS_SH) is outside the harness's ownership model and stays covered by the
+  # review-enforcer's head-bound evidence gate and the post-merge detector (the "caller
+  # deliberately removes the guard" class).
+  # ⛔ NEVER FALLS OPEN: an unset/empty token under a harness invocation, a missing claims.sh,
+  # or ANY non-zero proof result all refuse the merge — an unknown verdict is a refusal.
+  if [ -n "${CLAIM_ACTION_CLAIMS_SH:-}" ]; then
+    local proof_rc=0 proof_out=""
+    if [ -z "${CLAIM_ACTION_HEAD_TOKEN:-}" ]; then
+      say_err "⛔ admin-merge: REFUSED [hold-proof] — the harness invoked the rail with no claim token for PR #$PR at head ${head:0:12} (claim-action-proof: REFUSED pr=$PR head=${head:0:12} holder=<none> reason=no-token). An action without a claim proof is refused; never falls open."
+      exit 1
+    fi
+    if [ ! -f "$CLAIM_ACTION_CLAIMS_SH" ]; then
+      say_err "⛔ admin-merge: REFUSED [hold-proof] — the claim registry ($CLAIM_ACTION_CLAIMS_SH) is missing/unreadable, so the hold-proof cannot run for PR #$PR at head ${head:0:12}. Refusing; never falls open."
+      exit 1
+    fi
+    proof_out="$( CLAIM_REPO="${CLAIM_ACTION_REPO:-$REPO}" bash -c '
+      . "$1" || exit 2
+      claim_action_proof "$2" "$3" "$4"
+    ' _ "$CLAIM_ACTION_CLAIMS_SH" "$PR" "$head" "$CLAIM_ACTION_HEAD_TOKEN" 2>&1 )" || proof_rc=$?
+    if [ "$proof_rc" -ne 0 ]; then
+      say_err "⛔ admin-merge: REFUSED [hold-proof] — $proof_out"
+      exit 1
+    fi
+    info "admin-merge: hold-proof held: $proof_out"
+  fi
+
   # shellcheck disable=SC2086
   if ! $GH pr comment "$PR" ${repo_args[@]+"${repo_args[@]}"} --body-file "$TMP/evidence.md" >/dev/null; then
     say_err "admin-merge: ✗ could not post the evidence comment — refusing to merge without it"
