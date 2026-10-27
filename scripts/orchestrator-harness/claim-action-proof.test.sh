@@ -241,7 +241,7 @@ PY
     fi
     bash -n "$mut_dir/claims.sh" 2>/dev/null || { bad "MUTATION $name: temp claims.sh no longer parses"; return; }
     out="$( CLAIMS_SH="$mut_dir/claims.sh" bash "$HERE/claim-action-proof.test.sh" 2>&1 )" || true
-    if printf '%s' "$out" | grep -qF "$needle"; then
+    if grep -qF "$needle" <<< "$out"; then
       ok "MUTATION $name: the guard is load-bearing — reverted, the paired case went RED"
     else
       bad "MUTATION $name: the guard is INERT — reverted, the paired case still passed"

@@ -102,9 +102,9 @@ write_scen \
   "100 bash 0\n200 bash 0\n201 pi 200\n" \
   "" ""
 OH12="$(run_report)"
-printf '%s' "$OH12" | grep -q 'orphan:kind=tmux name=merge-10090 prs=10090 .*reason=no-live-agent-child'
+grep -q 'orphan:kind=tmux name=merge-10090 prs=10090 .*reason=no-live-agent-child' <<< "$OH12"
 ck "OH1 a dead harness lane (no live pi descendant, old) is named with its PR" $?
-if printf '%s' "$OH12" | grep -q 'name=merge-10091'; then
+if grep -q 'name=merge-10091' <<< "$OH12"; then
   bad "OH2 a live harness lane (live pi descendant) is NOT named"
 else
   ok "OH2 a live harness lane (live pi descendant) is NOT named"
@@ -119,16 +119,16 @@ write_scen \
   "eldato-dead.service { path=/bin/bash ; argv[]=/bin/bash $T/gone/script.sh ; }\ncell-stale.service { path=/bin/bash ; argv[]=/bin/bash $T/wt-2433-fu/run.sh ; }\neldato-ok.service { path=/bin/bash ; argv[]=/bin/bash $T/usr/local/bin/ok.sh ; }\n"
 # dbus has NO execstart line (direct-binary ExecStart) -> execstart_path "" -> never judged.
 OH3456="$(run_report)"
-printf '%s' "$OH3456" | grep -q 'orphan:kind=unit name=eldato-dead.service .*reason=missing'
+grep -q 'orphan:kind=unit name=eldato-dead.service .*reason=missing' <<< "$OH3456"
 ck "OH3 a harness unit pinned to a MISSING path is named" $?
-printf '%s' "$OH3456" | grep -q 'orphan:kind=unit name=cell-stale.service .*reason=scratch-pinned'
+grep -q 'orphan:kind=unit name=cell-stale.service .*reason=scratch-pinned' <<< "$OH3456"
 ck "OH4 a harness unit pinned to a SCRATCH worktree path is named" $?
-if printf '%s' "$OH3456" | grep -q 'name=dbus'; then
+if grep -q 'name=dbus' <<< "$OH3456"; then
   bad "OH5 a stock OS unit (dbus) is never read as an orphan"
 else
   ok "OH5 a stock OS unit (dbus) is never read as an orphan"
 fi
-if printf '%s' "$OH3456" | grep -q 'name=eldato-ok'; then
+if grep -q 'name=eldato-ok' <<< "$OH3456"; then
   bad "OH6 a harness unit on an existing durable path is NOT named"
 else
   ok "OH6 a harness unit on an existing durable path is NOT named"
@@ -166,7 +166,7 @@ PY
       "eldato-dead.service { path=/bin/bash ; argv[]=/bin/bash $T/gone/script.sh ; }\n"
     out="$( SCEN="$T/scen" TMUX_BIN="$T/bin/tmux" SYSTEMCTL_BIN="$T/bin/systemctl" \
             PS_BIN="$T/bin/ps" SCRATCH_ROOTS="$T/wt-" bash "$mut_dir/report.sh" 2>&1 )"
-    if printf '%s' "$out" | grep -qF "$needle"; then
+    if grep -qF "$needle" <<< "$out"; then
       bad "MUTATION $name: INERT (reverted, the paired case is STILL reported)"
     else
       ok "MUTATION $name: load-bearing (reverted, the paired case went RED — no longer reported)"
