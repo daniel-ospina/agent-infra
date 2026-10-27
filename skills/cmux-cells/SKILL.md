@@ -16,9 +16,13 @@ updated: 2026-10-27
 
 # Operating the cmux cloud cells
 
-The fleet runs on the macOS laptop (launchd) plus the Linux cells (cell-1 `pi-lane-1`, cell-2 `pi-cell-2`, cell-3
-`pi-cell-3`, cell-4). Cells are Linux, so **any harness change must work on both platforms** — one source of truth with a
-platform branch, never two drifting copies.
+The fleet runs on the macOS laptop (launchd) plus the Linux cells the provider currently allocates — `cmux vm ls` on
+2026-10-27 showed **three**: `pi-cell-1`, `pi-cell-3`, `pi-cell-4`. (An older `pi-lane-1` label survives in
+`docs/ops/ACTIVATION-MATRIX.md` and there is **no cell-2 today**, so treat any inventory — including this one — as a
+reading: re-run `cmux vm ls` before acting on it.) ⚠️ **`pi-cell-N` is the LABEL column; every `cmux vm <verb>` takes the
+NAME column (`vm-<hex>`)** — `cmux vm stats pi-cell-4` returns a 404 whose own advice is "start a new one", a
+spend-flavoured remedy for a box that is already running. Read the NAME from `cmux vm ls`. Cells are Linux, so **any
+harness change must work on both platforms** — one source of truth with a platform branch, never two drifting copies.
 
 Canonical harness home: **`agent-infra/scripts/orchestrator-harness/`**. `tortoise/operations/orchestrator-harness/` and
 `~/orchestrator/` are historic forks; treat agent-infra as the authority.
@@ -59,18 +63,18 @@ git -C /tmp/cell-ai rev-parse --short HEAD    # the version, not the claim
 
 A cell is "on main" only if `git -C /tmp/cell-ai rev-list --count HEAD..origin/main` is **0**.
 
-## 2. Capacity is RAM and DISK, never CPU
+## 2. Capacity is RAM and DISK — load is a distant third
 
 ⛔ **Corrected 2026-10-27 — the numbers below used to REFUSE healthy dispatches.** Read them before
 quoting any ceiling:
 
 | resource | cost (measured) | note |
 |---|---|---|
-| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.2–0.5 GB** whole tree — a bare `pi` alone reaches ~0.28 GB | RSS summed over each process tree, 15 lanes, cell-4, 2026-10-27 |
+| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
 | **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | containers 21–149 MB each (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
-| worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | re-derived in agent-infra#2721. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — both figures are right about different quantities |
-| CPU | load 4.3 with 23 lanes | **never the limit** |
+| worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
+| CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
 
 The old row read "`pi` process ~0.6–1 GB RSS per lane". Measured, that is a **test-running peak**; an idle
 lane's whole tree is ~0.2 GB. The old arithmetic applied that peak to EVERY lane and then stacked a flat
@@ -116,10 +120,16 @@ printf 'more_lanes=%s (ram=%s disk=%s, target=%s)\n' "$more" "$ram_more" "$disk_
 # `free` is Linux-only; on the macOS laptop this prints ram=UNREADABLE by design — use `vm_stat` there.
 ```
 
-⚠️ **WHAT THE GATE ACTUALLY REFUSES** (read 2026-10-27) — FOUR refusals, in the gate's own order (fork → disk → load):
+⚠️ **WHAT THE GATE ACTUALLY REFUSES** (read 2026-10-27) — **brief admission answers first**, then the capacity refusals in
+this order (fork → disk → load). The brief gate (`AGENT_BRIEF_REFUSED`, exit **80**) fires **before fork** and before any
+disk or load reading (agent-infra#2258), and a **brief refusal is deterministic**: it cannot clear by waiting, and
+re-dispatching the same brief on another box refuses there too — re-author the brief, do not retry. (A missing or
+incomplete validator returns **78** instead — `CANNOT VERIFY`; that one *is* repairable, by fixing the install rather than
+the brief.) The gate carries two ordering comments that disagree — "brief gate … FIRST" and "fork → disk → load"; the exit
+codes do not: 80 before 73.
 
-1. **fork** — `AGENT_FORK_REFUSED`, exit **73**, and it runs **first**. A process-bound box refuses a spawn that would
-   fork-bomb it; the remedy is a restart/drain, **not** waiting;
+1. **fork** — `AGENT_FORK_REFUSED`, exit **73**. A process-bound box refuses a spawn that would fork-bomb it; the remedy is
+   a restart/drain, **not** waiting;
 2. **disk floor** — `DISK_MIN_FREE_MB`, default **500**, exit 77;
 3. **disk headroom** — `DISK-NOHEADROOM`, **the binding one**, exit 77: requires `free_mb ≥ tree + reserve`, with per-lane
    costs **350 + 6144 MB** for a target containing `uv.lock` and **64 + 1024 MB** otherwise. One spawn on a uv worktree
@@ -135,8 +145,8 @@ uses `LANE_MEM_MB` (default **512**) against `MEM_BUDGET_PCT` (default **75**) o
 scheduler 512, planning ~1000 for a test-running lane (the table above) — and this file deliberately uses the larger.
 Reconcile against `docs/ops/ai-drainer.md` before raising either. Where the gate speaks, the gate is right.
 
-`MAX_LANES` is **derived** (`2.5 × cores`) and enforced by the controller — but it knows neither disk nor RAM, so it is an
-upper bound, never the answer (§7).
+`MAX_LANES` is **derived** (`2.5 × cores`) and enforced by the controller — but it is an integer: it knows neither disk nor
+RAM, so it is an upper bound, never the answer (§7).
 
 ⛔ **DO NOT RE-INVENT THE CAPACITY GATE — `scripts/orchestrator-harness/spawn-gate.sh` ALREADY IS IT** (checked
 2026-10-27). It derives `MAX_LOAD` from `nproc × 10` when unset, refuses on a non-empty disk band (`disk_free_mb` vs
@@ -156,12 +166,13 @@ wrapper, or a skill.
 2026-10-19: `cmux vm resize <cell-3> --memory 12` was refused with *"only 4 vCPUs and 8 GiB are free in your plan pool"*
 while three VMs were running. Disk grew twice (+8 GiB each) but **RAM had 8 GiB left in total**. So:
 
-- the fleet's real RAM ceiling is the **plan pool**, and it is nearly allocated — per-cell memory cannot be raised by
-  wanting it;
+- the fleet's real RAM ceiling is the **plan pool**, and it is **fully** allocated (measured 2026-10-27: `usedMemoryMb`
+  40,960 of 40,960, `usedVcpus` 20 of 20) — per-cell memory cannot be raised by wanting it;
 - a cell's lane ceiling must be computed from **its current free RAM**, and never assumed to be expandable;
 - to raise one cell's memory you must first shrink or pause another box — that is an owner-level capacity decision, not a
   dispatch-time workaround;
-- disk is the cheaper lever (separate pool, grew on demand) — prefer reclaiming disk, and only then resize.
+- disk used to be the cheaper lever (separate pool, grew on demand) — but all three boxes are now at the per-VM cap
+  (`maxDiskMb` 131,072 = 128 GB each, measured 2026-10-27), so **reclaim is the only lever left** until the plan changes.
 
 ## 3. "Unreachable" is a claim about the CHANNEL, not the box
 
@@ -169,7 +180,7 @@ while three VMs were running. Disk grew twice (+8 GiB each) but **RAM had 8 GiB 
 |---|---|
 | `cloud exec` timeout / 502 / silent empty | **the channel failed. Not the box.** Retry minutes apart |
 | `cmux vm ls` → `running` | the provider sees the VM alive |
-| **`cmux vm stats <vm>`** | **the only liveness truth**: `CPU n% · Mem x/y GB · Disk a/b GB` |
+| **`cmux vm stats <vm>`** | the provider's own liveness read, and the cheapest — `CPU n% · Mem x/y GB · Disk a/b GB`. Two caveats that matter: it cannot tell you the guest is **unusable** (a full guest still reads `awake` while every `exec` times out), and its `Disk a` term is the guest's `df` **used**, in GiB — `df -Pm` reports MiB, so divide by 1024 to compare — while `/b` is the **provisioned** size, not `df`'s total. Compare `used`; take headroom from `df`'s `Available`. The provider side can also lag **high** after a reclaim, so if the two disagree, trust `df -Pm /`. Pair it with `vm terminal read` — **the row below** |
 | `vm terminal read` → `No space left on device` | the guest is alive and full |
 
 A **disk-full** cell behaves exactly like a dead one: the control agent cannot write its socket, so every `exec` times out
@@ -179,8 +190,8 @@ having submitted nothing for 141–226 minutes.
 Recovery ladder, cheapest first:
 
 1. `cmux vm terminal read <vm> <terminal-id>` — get terminal ids from `cmux vm tree <vm>`. The screen tells you the truth.
-2. `cmux vm terminal send <vm> <term-id> '<command>' --keys enter` — runs a command when `exec` cannot (no output rendering if
-   the disk is full, so verify from outside with `vm stats`).
+2. `cmux vm terminal send <vm> <term-id> '<command>' --keys enter` — runs a command when `exec` cannot. The **send** verb
+   prints nothing back; read the result with `vm terminal read` (step 1).
 3. `cmux vm pause <vm>` then `cmux vm resume <vm>` — provider-level reset. Fixes a wedged agent, does **not** fix a full disk.
 4. **`cmux vm resize <vm> --disk <GiB>`** — grows in place, 4 GiB steps, **cannot shrink**. The correct lever for a full guest:
    32 → 40 GiB made a dead-looking box respond immediately.
@@ -188,10 +199,17 @@ Recovery ladder, cheapest first:
 
 ## 4. Liveness of a LANE, and the reaping rule
 
-A lane's log **mtime** is the only reliable activity signal. Size alone is not, and a spinner is not.
+A lane's log **mtime** is the strongest *transcript-derived* signal a **harness lane** has — those run `pi -p
+--no-session` (`spawn-gate.sh`, `lane-exec.sh`, `merge-one.sh` all pass it), so a lane leaves no `.jsonl`. Other `pi` on a
+cell (interactive sessions, `task` children) **do** write `~/.pi/agent/sessions/*/*.jsonl` — and the count depends on WHICH home
+you count (`/home/cmux` and `$CELL_HOME` held very different populations, with very different newest-mtimes, on the same box) — so never conclude "no transcript exists on a cell"; conclude "no
+transcript exists *for this lane*". mtime is **necessary, not sufficient**: pair it with a CPU delta (reaping gate 1) and
+an ancestry check. Size alone is not a signal, and a spinner is not.
 
 - **0-byte lane log** = the lane could not start (usually disk full). It reads as "quiet", not broken — always check.
-- A dead lane and a thinking lane are indistinguishable in every instrument except log mtime.
+- A *thinking* lane and a dead one are indistinguishable **by activity readings** — zero CPU delta, frozen mtime, no size
+  change. Only the **length** of the quiet window separates them, which is why the reaping gate needs a zero-CPU window
+  **and** a 2 h idle bound before it acts. A live `pi` row proves **existence**, never progress.
 
 Reap only when **all three** hold (prose → code: agent-infra#1244, #2163):
 
@@ -202,7 +220,14 @@ Reap only when **all three** hold (prose → code: agent-infra#1244, #2163):
 ⛔ **Never treat "no log found" as "stale."** A first dry run flagged 69 lanes and would have killed a 7-minute-old lane,
 because the worktree slug parsed from shell text (`ciwatch\012[`) matched nothing. An absent artefact fails closed.
 
-Also: `ps -eo command | grep -c 'pi --model'` counts **wrapper shells**, not `pi`. 76 counted, 14 actually working.
+Also: `ps -eo args | grep -c '[p]i --model'` returns **0 on a box with `pi` live** — and not because of flag order. (Unbracketed, that pattern returns **1**: the grep's own argv contains it — the self-match trap §5 states as "never
+`pkill -f` / `ps | grep` a pattern that appears in your own command line".)
+`pi` is a Node script that **rewrites its process title**, so every live `pi` shows `args` = `pi` alone (`/proc/<pid>/cmdline`
+is `pi` + NULs). The only rows carrying `--provider … --model …` are the launcher wrappers — **never a `pi` row** — so
+"fixing" that pattern's flag order counts **wrapper shells**, not lanes. Enumerate with
+`ps -eo comm= | grep -c '^pi$'` (or `lane-reap.sh`'s census): a low count is not a quiet box, and a high one is not lanes.
+A box's `dmesg | grep -ci 'killed process'` is worth reading beside that — as context, never as a gate: the reaping gate
+below decides on a CPU delta, ancestry and log staleness, and reads no OOM count at all.
 
 ## 5. Dispatching a lane
 
@@ -223,7 +248,7 @@ brief cannot either; only a `.sh` under `scripts/` can. The hazard is copy-paste
 ```bash
 tmux new-session -d -s <slug> \
   "HOME=/tmp/cell-home bash -lc 'cd <worktree>; . /tmp/cell-home/keys.env; \
-   nohup pi --model deepseek/deepseek-v4-flash --provider deepseek -p \"\$(cat <brief>)\" > /tmp/cell-home/L-<slug>.log 2>&1 < /dev/null'"
+   nohup pi --provider deepseek --model deepseek-flash -p \"\$(cat <brief>)\" > /tmp/cell-home/L-<slug>.log 2>&1 < /dev/null'"
 ```
 
 Measured 2026-10-19: driving the cells this way is how 23 lanes landed on one box (8 cores, **32 GB**) and the kernel
@@ -279,23 +304,29 @@ bash scripts/admin-merge.sh <pr>                                                
 
 ## 7. Fleet roles and what "full capacity" means
 
-| box | role | shape |
+The shape below is durable; the **numbers are a reading** — re-read `cmux vm stats` (RAM) and the guest's own `df -Pm /` (disk) at
+dispatch time, because both move.
+
+| box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
-| cell-2 | **agent-infra / harness** | landers + harness fixes; disk-bound |
-| cell-1, cell-3 | **tortoise / product** | P0/P1 product work; disk-bound on cell-1, **memory-bound** on cell-3 (8 GB, 2 OOM kills measured 2026-10-27) |
+| `pi-cell-1` | product work | 16 GB RAM / 128 GB disk — roomiest, but **needs activation (§1)** before it can land |
+| `pi-cell-3` | product work | 8 GB RAM — the real constraint (its `dmesg` shows 2 OOM kills); disk well short of full by the guest's own `df` |
+| `pi-cell-4` | product + CI-cost work | 16 GB, 8 vCPU; the current default dispatch target |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
 ⛔ **TWO DIFFERENT CEILINGS — DO NOT CONFUSE THEM, AND DO NOT TREAT EITHER AS THE WHOLE ANSWER.** The owner ruled on
 2026-10-17 (`docs/ops/fleet-capacity.md`) that **between boxes** dispatch is gated on capacity, not a lane count — that is
 `cap_place`, and the objection is to a count standing in for capacity **across a fleet**. **Inside one box there IS a real
 ceiling**: `MAX_LANES`, derived as **2.5 × cores** (`orch-loop.sh`: `10#$_NCPU * 5 / 2`, rendered into the launchd plist),
-and the controller refuses at `lanes >= MAX_LANES` (`GATE_WHY=lanes=N>=max_lanes=M`). It is real — and it knows **neither
-disk nor RAM**, so it is an upper bound, never the answer. The binding constraint is **free disk vs one lane's
+and the controller refuses at `lanes >= MAX_LANES` (`GATE_WHY=lanes=N>=max_lanes=M`). It is real — and the *number* knows
+**neither disk nor RAM**. The controller's own refusals (`mem_avail <= MIN_MEM_FREE_MB`, default 512; the swap gate, which
+arms only when RAM is tight; and the load gate) sit in the same `GATE_WHY` chain — but they are floors and gates, **not a
+per-lane budget**, so `MAX_LANES` remains an upper bound rather than the answer. The binding constraint is **free disk vs one lane's
 `tree + reserve`** (§2), then free RAM against the per-lane peak, then load. So this table names a box's ROLE, never a
 number of lanes.
 
-⚠️ **`docs/ops/fleet-capacity.md` states the contrary twice** (`:157` and `:283`: *"there is deliberately no lane ceiling
-tied to cpu count"*), while the code has the 2.5× rule. **Two recorded positions, unresolved** — this skill reports what
+⚠️ **`docs/ops/fleet-capacity.md` states the contrary twice** — `:157` *"there is deliberately no lane ceiling
+tied to cpu count"*, and `:283` restating it as "§4's ruling" — while the code has the 2.5× rule. **Two recorded positions, unresolved** — this skill reports what
 the code does and does not claim the doc is wrong. Whoever settles it should mark the resolution `OVERRIDES:` in the doc:
 silently letting a reader pick one is how a ruling gets tidied away.
 
