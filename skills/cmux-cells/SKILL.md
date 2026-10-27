@@ -72,7 +72,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle to ~150 MB loaded** (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle to ~150 MB loaded** — idle floor re-measured on 34 containers, cells 3–4, 2026-10-27 (5.5–105.6 MB); loaded ceiling 149 MB. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -140,10 +140,11 @@ codes do not: 80 before 73.
 The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. **Only
 `MAX_LOAD` (75) clears because the box quietens on its own.** The rest clear when their **resource is released** or their
 **input changes** — a lane finishes or drains (73), disk is reclaimed or a lane finishes (77), the brief is re-authored (80),
-the install is repaired (78), the repo's open-PR queue actually lands (74) — and **none of them clears by waiting**: the gate emits
-"does NOT clear by waiting" on fork and "This is NOT a load refusal: waiting does not clear it" on headroom. So diagnosing a
-73, 77, 74, 78 or 80 as "the box is busy" and idling is the trap — **and 74 is repo-wide**, so re-dispatching it to another
-box refuses there too.
+the install is repaired (78), the repo's open-PR queue actually lands (74). **Idling on its own changes none of them**: for 73
+and 77 the release *is* a lane draining, so the drain has to actually complete rather than just pass time — which is why the
+gate's own two messages read "does NOT clear by waiting" (fork) and "This is NOT a load refusal: waiting does not clear it"
+(headroom) while both still offer "or let its lanes drain" / "or let a lane finish". So diagnosing a 73, 77, 74, 78 or 80 as
+"the box is busy" and idling is the trap — **and 74 is repo-wide**, so re-dispatching it to another box refuses there too.
 
 **RAM is read by two other instruments — `spawn-gate.sh` reads NO memory at all.** The two floors live in `orch-loop.sh`
 (`MIN_MEM_FREE_MB`, default 512) and `capacity.sh` (`CAP_MIN_MEM_MB`, 512). The **scheduler** does budget per lane: `ai-drainer.sh`
@@ -193,7 +194,9 @@ A **disk-full** cell behaves exactly like a dead one: the control agent cannot w
 while the provider insists `running`. Measured 2026-10-19: cell-3 sat at 29.9/32 GB, CPU 77%, exec failing for an hour,
 having submitted nothing for 141–226 minutes.
 
-Recovery ladder, cheapest first:
+Recovery ladder, cheapest first. **Establish a channel before anything else:** steps 1-2 need the terminal channel, so run
+`cmux vm terminal read <vm> <terminal-id>` once and check it answers. If it refuses *and* the `cmux-tui` state volume below is
+full, steps 1-2 cannot run — go to step 5 and then the owner-level action.
 
 1. `cmux vm terminal read <vm> <terminal-id>` — get terminal ids from `cmux vm tree <vm>`. The screen tells you the truth.
 2. `cmux vm terminal send <vm> <term-id> '<command>' --keys enter` — runs a command when `exec` cannot. The **send** verb
@@ -204,13 +207,15 @@ Recovery ladder, cheapest first:
    today this lever refuses: the remedy for a full guest is step 5 (reclaim), and real growth needs a plan change
    (owner-level). When a box *is* below the cap, 32 → 40 GiB has made a dead-looking box respond immediately.
 5. Then, inside: kill stale lanes, `git gc --prune=now` on the clones, clear caches, re-run the update.
-   ⚠️ **`/` is not the only volume that fills.** On a cell also read `df -Pm` for the `cmux-tui` state volume (a loop mount at
-   `~/.local/state/cmux-tui`, from `cmux-tui-state.ext4`): it fills independently of `/`, and it holds the terminal state the
-   ladder above depends on — `df` reported **97 % capacity, 927 MB of 974 MB used, 31 MiB free** on cell-3 (measured 2026-10-27,
-   while `/` was at 61 %), the consumer being a
-   `workspace-registry.sqlite3` of ~900 MB in that volume's `sessions/`. None of the reclaim steps above touch it, so if it is
-   the volume at 100 %, this is an **owner-level** action (grow or reset that state volume) — and check whether the
-   terminal channel still answers `vm terminal read` before you rely on steps 1-2.
+   ⚠️ **`/` is not the only volume that fills.** On a cell also read the **`cmux-tui` state volume** — a loop mount of
+   `cmux-tui-state.ext4` on **`/home/cmux/.local/state/cmux-tui`**. Use that **absolute** path: a cell's login shell may have
+   `HOME=/tmp/cell-home`, where a plain *directory* of the same name exists, so `df -Pm ~/.local/state/cmux-tui` answers about
+   **`/`** and reports a healthy percentage — a false PASS on exactly the box you are checking. If the path moves, derive it:
+   `df -Pm "$(mount | awk '/cmux-tui-state/{print $3}')"`. It fills independently of `/` and holds the terminal state the
+   ladder depends on — `df` reported **97 % capacity, 927 MB of 974 MB used, 31 MiB free** on cell-3 (measured 2026-10-27,
+   while `/` was at 61 %), the consumer being a `workspace-registry.sqlite3` of ~900 MB in that volume's `sessions/`. None of
+   the reclaim steps above touch it, so if it is the volume at 100 %, that is an **owner-level** action (grow or reset that
+   state volume).
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -326,7 +331,7 @@ dispatch time, because both move.
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, but **needs activation (§1)** before it can land |
 | `pi-cell-3` | product work | 8 GB RAM / 128 GB — the real constraint is memory (its `dmesg` has OOM kills in it); re-read both at dispatch |
-| `pi-cell-4` | product + CI-cost work | 16 GB, 8 vCPU; the current default dispatch target |
+| `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
 ⛔ **TWO DIFFERENT CEILINGS — DO NOT CONFUSE THEM, AND DO NOT TREAT EITHER AS THE WHOLE ANSWER.** The owner ruled on
