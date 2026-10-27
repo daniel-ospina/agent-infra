@@ -120,10 +120,14 @@ printf 'more_lanes=%s (ram=%s disk=%s, target=%s)\n' "$more" "$ram_more" "$disk_
 # `free` is Linux-only; on the macOS laptop this prints ram=UNREADABLE by design — use `vm_stat` there.
 ```
 
-⚠️ **WHAT THE GATE ACTUALLY REFUSES** (read 2026-10-27) — FOUR refusals, in the gate's own order (fork → disk → load):
+⚠️ **WHAT THE GATE ACTUALLY REFUSES** (read 2026-10-27) — **brief admission answers first**, then the capacity refusals in
+this order (fork → disk → load). The brief gate (`AGENT_BRIEF_REFUSED`, exit **80**) fires **before fork** and before any
+disk or load reading (agent-infra#2258), and it is **deterministic**: it cannot clear by waiting, and re-dispatching the same
+brief on another box refuses there too — re-author the brief, do not retry. (The gate carries two ordering comments that
+disagree — "brief gate … FIRST" and "fork → disk → load"; the exit codes do not: 80 before 73.)
 
-1. **fork** — `AGENT_FORK_REFUSED`, exit **73**, and it runs **first**. A process-bound box refuses a spawn that would
-   fork-bomb it; the remedy is a restart/drain, **not** waiting;
+1. **fork** — `AGENT_FORK_REFUSED`, exit **73**. A process-bound box refuses a spawn that would fork-bomb it; the remedy is
+   a restart/drain, **not** waiting;
 2. **disk floor** — `DISK_MIN_FREE_MB`, default **500**, exit 77;
 3. **disk headroom** — `DISK-NOHEADROOM`, **the binding one**, exit 77: requires `free_mb ≥ tree + reserve`, with per-lane
    costs **350 + 6144 MB** for a target containing `uv.lock` and **64 + 1024 MB** otherwise. One spawn on a uv worktree
@@ -174,7 +178,7 @@ while three VMs were running. Disk grew twice (+8 GiB each) but **RAM had 8 GiB 
 |---|---|
 | `cloud exec` timeout / 502 / silent empty | **the channel failed. Not the box.** Retry minutes apart |
 | `cmux vm ls` → `running` | the provider sees the VM alive |
-| **`cmux vm stats <vm>`** | the provider's own liveness read, and the cheapest — `CPU n% · Mem x/y GB · Disk a/b GB`. It cannot see a *full* guest, and its disk figure is advisory (measured: 110.5 GB used for a guest whose `df` said 71.3), so pair it with `vm terminal read` — **the row below** |
+| **`cmux vm stats <vm>`** | the provider's own liveness read, and the cheapest — `CPU n% · Mem x/y GB · Disk a/b GB`. It cannot tell you the guest is **unusable** (a full guest still reads `awake` while every `exec` times out), and its disk figure is really the guest's own `df` — they agree to 0.1 GB — except that after a reclaim the provider side can lag **high**; if the two disagree, trust `df -Pm /` in the guest. Pair it with `vm terminal read` — **the row below** |
 | `vm terminal read` → `No space left on device` | the guest is alive and full |
 
 A **disk-full** cell behaves exactly like a dead one: the control agent cannot write its socket, so every `exec` times out
