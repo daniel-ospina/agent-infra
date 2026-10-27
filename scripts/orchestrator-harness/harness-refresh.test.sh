@@ -1276,6 +1276,58 @@ case "$RL" in *relation=current*) ok "…and a correctly-activated flat-pin cell
               *) bad "a flat-pin cell still cannot say it is current: $RL" ;; esac
 [ "$RCL" = 0 ] || bad "exit $RCL on the flat-pin read: $RL"
 
+# ⛔ A36m: A NON-REGULAR `HARNESS_PIN_FILE` MUST NOT HANG THE REFRESH (review cycle 8, P3). The block that
+# reads the pin guards the LOCK against a FIFO fourteen lines earlier for exactly this reason — `head`
+# BLOCKS ON OPEN on a non-regular file — and then read the PIN with `-r`, which is TRUE for a FIFO. On a
+# cell that is a hang with no output, EVERY cycle, silently: the refresh is a synchronous child of
+# `orch-loop.sh`, so the whole controller cycle stops. `-f` is the gate this same file already uses for
+# this same path at the `DEPLOYED` read, and the one `launchd-cycle.sh`/`install.sh` use.
+#
+# ⛔ THE PLANT AND THE LOCK ARE LOAD-BEARING, NOT DECORATION. The pin-file read sits inside
+# `if [ -n "$_ctrl_tree" ]`, and `_ctrl_tree` is resolved from the LOCKED process's argv — so a fixture
+# with no live controller never reaches line 403 at all and the case passes without touching the gate
+# (MEASURED: the first draft of this case had no plant and stayed GREEN with the gate mutated back to
+# `-r` — vacuous, the exact A36h/A36l defect). So the shape is A36k's: a real `orch-loop.sh`-argv sleeper
+# at C2, the lock naming it, `HARNESS_PIN_DIR` UNSET so the pin-file arm is the only accept-root entry.
+# With `-f` the FIFO contributes nothing, `_ok` stays 0 and RUNNING falls to the seed stamp's C1 — the
+# SAFE direction, asserted below. With `-r` this case HANGS instead (verified by mutating the gate).
+_CASE=$((_CASE+1)); echo "=== A36m: a FIFO HARNESS_PIN_FILE does not hang the refresh (the gate is -f, not -r) ==="
+_F26="$T/a24/path-fifo"
+rm -f "$_F26"; mkfifo "$_F26" 2>/dev/null
+if [ ! -p "$_F26" ]; then
+  ok "mkfifo is unavailable on this host — nothing to hang on (A36k still pins the -f read on a regular file)"
+else
+  rm -f "$D/o/fifo.out"
+  bash "$_O26" & _P36=$!
+  sleep 1
+  printf '%s\n' "$_P36" > "$D/o/.orch.lock"
+  env -u HARNESS_PIN_DIR O="$D/o" HARNESS_PIN_FILE="$_F26" bash "$RR" --no-fetch --repo "$T/src" \
+      --ref origin/main --pin "$PIN" --self "$D/o" >"$D/o/fifo.out" 2>&1 & _R36=$!
+  _i26=0
+  while kill -0 "$_R36" 2>/dev/null && [ "$_i26" -lt 60 ]; do sleep 0.25; _i26=$((_i26+1)); done
+  if kill -0 "$_R36" 2>/dev/null; then
+    # Regression branch: clean up BOTH the refresh and any `head` blocked on the FIFO, by the FIFO's own
+    # unique path so nothing else on the host can be signalled, and never let a red test leak a hang.
+    kill -9 "$_R36" 2>/dev/null; pkill -9 -f "$_F26" 2>/dev/null; wait "$_R36" 2>/dev/null
+    bad "the refresh was still blocked after 15s on a FIFO pin file — head blocks on open; the gate must be -f, not -r"
+  else
+    wait "$_R36" 2>/dev/null
+    ok "the refresh returned instead of blocking on the FIFO — the -f gate rejected a non-regular pin"
+    case "$(cat "$D/o/fifo.out")" in
+      *"running=$(short "$C1")"*)
+        ok "…and RUNNING fell to the seed stamp (the safe direction) — the FIFO was not accepted as a root" ;;
+      *"running=$(short "$C2")"*)
+        bad "the FIFO was accepted as a recorded root — the gate is not filtering non-regular files" ;;
+      *relation=*)
+        bad "the refresh wrote a record but named neither tree — the pin stage was skipped, not exercised: $(cat "$D/o/fifo.out")" ;;
+      *)
+        bad "the refresh returned but produced no record: $(cat "$D/o/fifo.out")" ;;
+    esac
+  fi
+  rm -f "$D/o/.orch.lock"; kill "$_P36" 2>/dev/null; wait "$_P36" 2>/dev/null
+  rm -f "$_F26" "$D/o/fifo.out"
+fi
+
 # ⛔ A36b: A TREE OUTSIDE EVERY RECORDED ROOT CANNOT ANSWER FOR THIS BOX. The harness path is SHARED
 # across repos on one machine, so "a controller is running" and "MY controller is running" are different
 # questions (the #1856 shape the supervisor answers with its ownership read). A peer repo's controller

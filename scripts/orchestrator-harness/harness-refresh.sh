@@ -393,7 +393,14 @@ if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
     _nl=$'\n'
     _acc="${_nl}"
     [ -n "${HARNESS_PIN_DIR:-}" ] && _acc="${_acc}${HARNESS_PIN_DIR%/}/scripts/orchestrator-harness/orch-loop.sh${_nl}"
-    if [ -n "${HARNESS_PIN_FILE:-}" ] && [ -r "$HARNESS_PIN_FILE" ]; then
+    # ⛔ `-f`, NOT `-r` — THE SAME GATE THE SIBLING READS USE (review cycle 8, P3). `-r` is TRUE for a
+    # FIFO or a character device, and `head` BLOCKS ON OPEN for those: a FIFO left by a crashed writer on
+    # a wedged mount would hang this refresh, and therefore the controller's WHOLE CYCLE, silently every
+    # cycle. This file already reads this exact path with `-f` at the `DEPLOYED` read below (and
+    # `launchd-cycle.sh`/`install.sh` do the same for the same class of file), so `-r` here re-introduced
+    # on the pin file precisely the hang the lock guard above documents. A regular-but-unreadable file
+    # still yields an empty `_pinh` and falls through to the stamp — the safe direction is unchanged.
+    if [ -n "${HARNESS_PIN_FILE:-}" ] && [ -f "$HARNESS_PIN_FILE" ]; then
       _pinh="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
       case "$_pinh" in
         */scripts/orchestrator-harness) _acc="${_acc}${_pinh}/orch-loop.sh${_nl}" ;;
