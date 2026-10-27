@@ -52,9 +52,24 @@
 # Usage:
 #   pr-repair-loop.sh                 # one pass (the default)
 #   pr-repair-loop.sh --loop          # the service's main process: pass, sleep, repeat
+#   pr-repair-loop.sh --trigger       # the service's EVENT-DRIVEN main process: run a pass when the
+#                                     # PR surface moves (pr-doctor-trigger.py), with --loop's
+#                                     # interval demoted to a backstop. See TRIGGER below
 #   pr-repair-loop.sh --dry-run       # measure, derive the cap, dispatch nothing
 #   pr-repair-loop.sh --print-capacity  # the derived numbers only (pure; what the test asserts)
 #   pr-repair-loop.sh --status        # the last recorded pass, verbatim
+#
+# TRIGGER — THE EVENT-DRIVEN FRONT END (#2700 C5). `--loop` is a TIMER: a pass, then `sleep
+# $REPAIR_INTERVAL_S`. A scheduled pass only sees the fleet at the instant it fires, so a PR that
+# turns red one second after one waited out the whole interval with nobody on it — measured on the
+# Mac as `StartInterval 1800`, i.e. a mean 900 s of dead time for a repair whose own cost is one
+# pass. `--trigger` replaces the timer with a front end that reads the PR surface (ONE `gh pr list`
+# per poll) and runs a pass only when the fingerprint changes, keeping the interval as a BACKSTOP
+# for the work only a clock can see (a check that never reports, a worker that dies silently).
+# ⛔ THE TRIGGER IS A FRONT END AND NOTHING ELSE: its child is THIS script's one-pass mode, so every
+# gate below (disk floor, load ceiling, derived cap, reap, credential source, status row) still
+# decides what happens. A front end that ran `pr-doctor.py` directly would dispatch credential-less
+# workers past the #2721 wedge guard while reading healthy — the #2700 §1.2 shape, one level up.
 #
 # Environment (all optional; the service renders them):
 #   CELL_HOME              default /tmp/cell-home
@@ -67,6 +82,10 @@
 #   PR_DOCTOR_REPO / GH_REPO        the repo slug to repair, default daniel-ospina/tortoise
 #   PR_DOCTOR_REPO_DIR     the checkout, default /tmp/cell-t3
 #   REPAIR_INTERVAL_S      seconds between passes in --loop, default 900
+#   REPAIR_TRIGGER_POLL_S      --trigger: the lead, in seconds (default 60)
+#   REPAIR_TRIGGER_DEBOUNCE_S  --trigger: the coalescing window, in seconds (default 90)
+#   REPAIR_TRIGGER_BACKSTOP_S  --trigger: the demoted timer, in seconds (default 1800)
+#   REPAIR_TRIGGER_RETRY_MIN_S --trigger: floor between retries of a FAILED pass (default 300)
 #   REPAIR_DISK_FLOOR_MB   headroom below which a pass DEFERS, default 4096
 #   REPAIR_DISK_PER_WORKER_MB  what one repair worker costs on disk, default 1024
 #   REPAIR_LOAD_CEILING_MULT   the owner's ceiling on load1/nproc, default 8
@@ -96,6 +115,14 @@ MAX_WORKERS="${REPAIR_MAX_WORKERS:-6}"
 # file. Only the supplied case can refuse, so the distinction is captured before the default applies.
 ENV_FILE_SUPPLIED="${ENV_FILE:+1}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
+# The `--trigger` front end's knobs. `POLL` is the lead (a change is noticed within one poll),
+# `DEBOUNCE` is the coalescing window (a push fires several `updatedAt` moves; they must produce ONE
+# pass), `BACKSTOP` is the demoted timer, and `RETRY_MIN` bounds the retries of a FAILED pass so a
+# box that cannot deliver does not re-read the whole PR surface every poll.
+TRIGGER_POLL_S="${REPAIR_TRIGGER_POLL_S:-60}"
+TRIGGER_DEBOUNCE_S="${REPAIR_TRIGGER_DEBOUNCE_S:-90}"
+TRIGGER_BACKSTOP_S="${REPAIR_TRIGGER_BACKSTOP_S:-1800}"
+TRIGGER_RETRY_MIN_S="${REPAIR_TRIGGER_RETRY_MIN_S:-300}"
 STATE_DIR="$O/state"
 STATUS="$STATE_DIR/pr-repair.status.json"
 
@@ -476,11 +503,12 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --once) MODE=once ;;
         --loop) MODE=loop ;;
+        --trigger) MODE=trigger ;;
         --dry-run) DRY=1 ;;
         --print-capacity) MODE=capacity ;;
         --status) MODE=status ;;
         -h|--help) awk 'NR>1 && /^set -uo pipefail/ {exit} NR>1 {sub(/^# ?/,""); print}' "$0"; exit 0 ;;
-        *) echo "usage: $0 [--once|--loop|--dry-run|--print-capacity|--status]" >&2; exit "$EXIT_REFUSING" ;;
+        *) echo "usage: $0 [--once|--loop|--trigger|--dry-run|--print-capacity|--status]" >&2; exit "$EXIT_REFUSING" ;;
     esac
     shift
 done
@@ -507,5 +535,35 @@ case "$MODE" in
             ( one_pass "$DRY" ) || true
             sleep "$INTERVAL_S"
         done
+        ;;
+    trigger)
+        # ── the event-driven front end (#2700 C5) ─────────────────────────────────────────────
+        # ⛔ ONE ACTUATOR, TWO CLOCKS. This arm does not repair anything itself: it `exec`s the
+        # trigger, whose child is THIS script in its one-pass mode. So there is one unit, one
+        # installer, one queue — and every gate above still decides every pass.
+        TRIGGER="$SCRIPTS/pr-doctor-trigger.py"
+        if [ ! -f "$TRIGGER" ]; then
+            err "REFUSING: $TRIGGER is absent — the trigger is this unit's front end, and a unit whose ExecStart cannot resolve its own front end is not activation."
+            write_status refusing 0 - - - - "trigger-missing:$TRIGGER"
+            exit "$EXIT_REFUSING"
+        fi
+        # ⛔ A MISSING INTERPRETER IS A REFUSAL, NOT A CRASH LOOP (the `flock` rule one seam over):
+        # systemd would restart an exec that cannot start, for ever, with the reason only in a journal.
+        PYTHON="${PYTHON_BIN:-$(command -v python3 2>/dev/null || true)}"
+        if [ -z "$PYTHON" ]; then
+            err "REFUSING: no python3 on PATH — the trigger cannot be exec'd, so this box cannot run its repair front end."
+            write_status refusing 0 - - - - "python3-missing"
+            exit "$EXIT_REFUSING"
+        fi
+        validate_knobs || { write_status refusing 0 - - - - "invalid-knob"; exit "$EXIT_REFUSING"; }
+        say "trigger: ${REPO_SLUG} at ${REPO_PATH}; poll ${TRIGGER_POLL_S}s debounce ${TRIGGER_DEBOUNCE_S}s backstop ${TRIGGER_BACKSTOP_S}s retry_min ${TRIGGER_RETRY_MIN_S}s"
+        # ⛔ `exec`, not a subprocess: the trigger must BE the unit's main process, so `Restart=always`
+        # and `KillMode=process` describe the thing that decides WHEN a pass runs. The repo/dir pair is
+        # passed explicitly (the loop's own resolution, not a second default), and `--state-dir` keeps
+        # the lock and the remembered fingerprint beside this unit's status row.
+        exec "$PYTHON" "$TRIGGER" --repo "$REPO_SLUG" --repo-dir "$REPO_PATH" \
+            --poll "$TRIGGER_POLL_S" --debounce "$TRIGGER_DEBOUNCE_S" \
+            --backstop "$TRIGGER_BACKSTOP_S" --retry-min "$TRIGGER_RETRY_MIN_S" \
+            --state-dir "$STATE_DIR"
         ;;
 esac

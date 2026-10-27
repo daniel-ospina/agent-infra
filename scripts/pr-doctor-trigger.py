@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
-"""pr-doctor-trigger — event-driven front end for pr-doctor.
+"""pr-doctor-trigger — the EVENT-DRIVEN FRONT END for the cell's repair pass.
 
 WHY THIS EXISTS
 ---------------
-`pr-doctor` was scheduled. A scheduled doctor only sees the fleet at the moment the timer
+The repair pass was scheduled. A scheduled pass only sees the fleet at the moment the timer
 fires, so a PR that turns red ten seconds after a pass waits up to a full interval with no
 worker on it. The lead was therefore not the repair — it was the timer. Measured on the Mac:
 `com.tortoise.pr-doctor` ran `StartInterval` **1800 s**, so the expected wait for a worker was
-900 s and the worst case 1800 s, for a repair whose own cost is one pass.
+900 s and the worst case 1800 s, for a repair whose own cost is one pass. The same arithmetic
+applies to `pr-repair-loop.sh --loop` (default `REPAIR_INTERVAL_S=900`).
 
-This is the trigger, not a second doctor. It does the cheapest possible read of the PR
-surface (one `gh pr list`, no per-PR calls), derives a fingerprint, and runs the EXISTING
-`pr-doctor.py` only when that fingerprint changes:
+This is the front end, not a second actuator. It does the cheapest possible read of the PR
+surface (one `gh pr list`, no per-PR calls), derives a fingerprint, and runs ONE PASS of the
+EXISTING `pr-repair-loop.sh` — its sibling — only when that fingerprint changes:
 
   * a PR appears / disappears            (opened, merged, closed)
   * a PR's `mergeStateStatus` changes    (CONFLICTING -> MERGEABLE, BEHIND, BLOCKED ...)
   * a PR is updated                      (push, review, label — `updatedAt` moves)
   * a PR is marked ready / drafted       (`isDraft`)
+
+⛔ THE CHILD IS THE PASS, NOT `pr-doctor.py` (review finding, verified against `origin/main`).
+Calling the doctor directly would skip everything the pass owns: the derived cap, the disk floor
+and load ceiling (`#2721`'s wedge driver), the worktree reap, the `keys.env` credential source
+(`#1852`/`#2716`: a unit does not inherit the tmux server's environment, so every worker would
+spawn credential-less and die while the pass read healthy), and the status row. A front end that
+bypasses its own gate is the `#2700` §1.2 shape — deployed, logging, and unable to do the job.
+
+The pass lock inside `pr-repair-loop.sh` is what makes the two clocks safe: a backstop pass and an
+event pass can never run concurrently, so there is one pass at a time on one queue. This trigger's
+own lock covers the *scheduler* (two triggers), the pass lock covers the *work*.
 
 A timer is still kept, deliberately: some work is only visible on a clock (a check that
 never reports, a worker that dies silently, a stale claim). But the timer is now the
@@ -24,19 +36,19 @@ BACKSTOP, not the front end — `--backstop 1800` runs a pass even when nothing 
 
 PROPERTIES THIS DELIBERATELY HAS
 --------------------------------
-* **One doctor at a time.** A lock file; a second instance exits 0 rather than piling up
+* **One trigger at a time.** A lock file; a second instance exits 0 rather than piling up
   (the fleet has had three `auto-rail` instances and a `max=2` in the plist that the log
   never showed — concurrency must be visible and exclusive, not inferred).
 * **Every decision is logged**, including `no change` and `throttled`, with the reason.
   A trigger that is silent when it does nothing is indistinguishable from a dead one.
-* **It never invents work.** It runs the doctor; the doctor owns every repair decision.
+* **It never invents work.** It runs a pass; the pass owns every repair, refusal and budget.
 * **Coalescing.** Rapid changes are debounced (`--debounce`) so a push that fires five
   events, or a wave of check completions, produces ONE pass.
-* **Fail visible.** A doctor exit that is neither 0 nor 2 (2 = "refused with a reason")
-  is logged as `DOCTOR-FAILED` and does not consume the backstop window, so a later tick
-  retries instead of waiting half an hour on a crash. A doctor that is not there at all is
-  `DOCTOR-MISSING` — never a clean window (CPython exits 2 for "can't open file", and 2 is
-  the code this file treats as clean).
+* **Fail visible.** A pass exit that is not one of the pass's own VERDICTS (0 completed,
+  2 refused-with-a-reason, 6 deferred-by-measurement) is logged as `PASS-FAILED` and does not
+  consume the backstop window, so a later tick retries instead of waiting half an hour on a
+  crash. A pass that is not there at all is `PASS-MISSING` — never a clean window (CPython
+  exits 2 for "can't open file", and 2 is the code this file treats as a verdict).
 * **AN UNREADABLE SURFACE IS NOT A QUIET ONE.** A failed `gh pr list` is never folded into
   "no PRs need work" (#2271: an empty check surface read as green). It is logged as
   `PR-SURFACE-UNREADABLE`, the previous fingerprint is KEPT (so the surface cannot read as
@@ -52,23 +64,26 @@ PROPERTIES THIS DELIBERATELY HAS
 WHY A RETRY FLOOR AND NOT "RETRY NEXT TICK"
 -------------------------------------------
 The spec shape is `last_pass = 0` on a failed pass, so the next tick retries — right, because a
-crash must not buy 30 minutes of silence. But `pr-doctor` has a THIRD non-clean exit that is not
-a crash: `EXIT_UNDELIVERED = 3` ("I read the world, I placed the work, no worker took it") — that
-is the live verdict on this box right now (`pr-doctor.status.json`: `rc: 3`,
+crash must not buy 30 minutes of silence. But the pass has a non-clean exit that is NOT a crash
+and NOT a verdict: `EXIT_UNDELIVERED = 3` ("I read the world, I placed the work, no worker took
+it") — the live verdict on this box at measurement time (`pr-doctor.status.json`: `rc: 3`,
 `reason: "live-unreadable=3; 3 order(s) no worker accepted"`). Treating 3 like a crash retries a
-FULL pass — every open PR read, up to `--max` load-gated spawns — every `--poll` (60 s) for as
-long as the condition lasts. That is not "retrying soon", it is a hot loop of the most expensive
-read the fleet has. `--retry-min` (default 300 s) keeps the intent ("retry, do not wait for the
-backstop") while bounding the spend. A crashed pass is still retried within five minutes instead
-of half an hour, which is the whole point of not consuming the backstop window.
+FULL pass — every open PR read, up to the derived cap of load-gated spawns, a reap, and a
+credential source — every `--poll` (60 s) for as long as the condition lasts. That is not
+"retrying soon", it is a hot loop of the most expensive read the fleet has. `--retry-min`
+(default 300 s) keeps the intent ("retry, do not wait for the backstop") while bounding the
+spend. A crashed pass is still retried within five minutes instead of half an hour, which is the
+whole point of not consuming the backstop window.
 
 USAGE
     pr-doctor-trigger.py --repo daniel-ospina/agent-infra --repo-dir ~/src/agent-infra
-    (defaults: --poll 60 --debounce 90 --backstop 1800 --max 8 --retry-min 300)
+    (defaults: --poll 60 --debounce 90 --backstop 1800 --retry-min 300)
+    ⛔ there is NO `--max`: the pass derives its cap from the machine, and a scheduler may not
+    raise it (half the cores, the disk floor and the owner's load ceiling decide — #2409).
 
     --once           one poll, one decision, exit — what a `Restart=always` unit's ExecStart
                      wants when the supervisor restarts the process, and what a test drives
-    --dry-run-print  print the fingerprint and exit 0 (debugging; no doctor, no lock)
+    --dry-run-print  print the fingerprint and exit 0 (debugging; no pass, no lock)
 """
 from __future__ import annotations
 
@@ -81,7 +96,11 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DOCTOR = os.path.join(HERE, "pr-doctor.py")
+# The PASS this trigger schedules — `pr-repair-loop.sh`, the repair unit's own entry point, resolved
+# as a SIBLING (the farmed layer is flat, so `$DEST/scripts/` holds both). ⛔ Not `pr-doctor.py`: the
+# pass owns the cap, the two machine gates, the reap, the credential source and the status row, and a
+# front end that called the doctor directly would bypass all five (see THE CHILD IS THE PASS above).
+PASS = os.path.join(HERE, "pr-repair-loop.sh")
 
 
 def log(msg: str) -> None:
@@ -142,36 +161,50 @@ def fingerprint(repo: str) -> tuple[str, int] | None:
     return ("|".join("%s:%s:%s:%s" % t for t in rows), len(rows))
 
 
-# `run_doctor` returns this when there is no doctor to run. It is deliberately NOT 2: `pr-doctor`
-# reserves 2 for "I could not read the world, or could not deliver" and the pass DID NOT RUN here,
-# so the two must not share a code path. Distinct value + its own log line = a distinguishable
-# verdict rather than a second meaning for an existing one.
-DOCTOR_MISSING = 127
+# `run_pass` returns this when there is no pass to run. It is deliberately NOT 2 — the pass reserves
+# 2 for "a read I needed could not be taken", and the pass DID NOT RUN here — nor 6, which is the
+# pass's own DEFERRED verdict. Distinct value + its own log line = a distinguishable verdict rather
+# than a second meaning for an existing one.
+PASS_MISSING = 127
+
+# The pass's own terminal VERDICTS, taken from `pr-repair-loop.sh`'s documented exit vocabulary:
+#   0 a pass completed (it dispatched, or there was genuinely nothing to do)
+#   2 REFUSING — a read the pass needs could not be taken (a miss is never "nothing to do")
+#   6 DEFERRED — the MACHINE said not now (below the disk floor / above the load ceiling / cap 0)
+# ⛔ 6 IS A VERDICT AND MUST CONSUME THE BACKSTOP WINDOW. Retrying a deferral every poll would
+# re-measure a box that just said no, 30 times per backstop — the opposite of the #2721 discipline the
+# deferral exists to enforce. 3 (UNDELIVERED) is intentionally NOT here: it is a live condition the
+# retry floor bounds (see WHY A RETRY FLOOR), and 1/4/124/etc are failures.
+PASS_VERDICTS = (0, 2, 6)
 
 
-def run_doctor(repo: str, repo_dir: str, max_n: int) -> int:
-    # ⛔ THE DOCTOR MUST EXIST BEFORE IT IS COUNTED AS A PASS (review cycle 1, reproducced). CPython
-    # exits **2** for "can't open file", and 2 is the code this trigger treats as a CLEAN window —
-    # so a trigger whose doctor was never farmed (or was deleted) reported `DOCTOR-END rc=2`, saved
+def run_pass(repo: str, repo_dir: str) -> int:
+    # ⛔ THE PASS MUST EXIST BEFORE IT IS COUNTED AS A PASS (review cycle 1, reproduced). CPython
+    # exits **2** for "can't open file", and 2 is a code this trigger treats as a verdict —
+    # so a trigger whose pass was never farmed (or was deleted) reported `PASS-END rc=2`, saved
     # `last_pass = now`, consumed the whole 1800 s backstop window and exited 0 under `--once`.
     # That is byte for byte the state `pi-bootstrap/setup.sh`'s farm order exists to prevent ("a
-    # trigger with no doctor ... would look like a running repair service and start nothing"), and
+    # trigger with no pass ... would look like a running repair service and start nothing"), and
     # the farm order cannot prevent it outside the farm (a hand copy, a deleted file).
-    if not os.path.isfile(DOCTOR):
-        log("DOCTOR-MISSING %s -- nothing was attempted; NOT a clean window" % DOCTOR)
-        return DOCTOR_MISSING
+    if not os.path.isfile(PASS):
+        log("PASS-MISSING %s -- nothing was attempted; NOT a clean window" % PASS)
+        return PASS_MISSING
     env = dict(os.environ)
     env["GH_REPO"] = repo
     env["PR_DOCTOR_REPO"] = repo
     env["PR_DOCTOR_REPO_DIR"] = repo_dir
     env["OBJECTIVE_REPO"] = repo          # the classifier defaults to tortoise; a worker must never be
-    log("DOCTOR-START repo=%s dir=%s max=%d" % (repo, repo_dir, max_n))
+    # ⛔ THE PASS IS RUN THROUGH `bash`, not exec'd from its shebang: the farm copies files, not
+    # permissions, so an installed unit must not depend on the sibling's mode bit (the same reason
+    # the unit's ExecStart names the farmed path explicitly). No arguments = the pass's default
+    # one-pass mode; the CAP IS THE PASS'S, derived from the machine — a scheduler may not set it.
+    log("PASS-START repo=%s dir=%s" % (repo, repo_dir))
     try:
-        r = subprocess.run([sys.executable, DOCTOR, "--max", str(max_n)], env=env, timeout=3600)
+        r = subprocess.run(["bash", PASS], env=env, timeout=3600)
     except subprocess.TimeoutExpired:
-        log("DOCTOR-FAILED timeout=3600 -- the pass did not finish; not counting it as a clean window")
+        log("PASS-FAILED timeout=3600 -- the pass did not finish; not counting it as a clean window")
         return 124
-    log("DOCTOR-END rc=%d" % r.returncode)
+    log("PASS-END rc=%d" % r.returncode)
     return r.returncode
 
 
@@ -205,7 +238,6 @@ def main() -> int:
     ap.add_argument("--poll", type=int, default=60)
     ap.add_argument("--debounce", type=int, default=90)
     ap.add_argument("--backstop", type=int, default=1800)
-    ap.add_argument("--max", type=int, default=8, dest="max_n")
     ap.add_argument("--retry-min", type=int, default=300, dest="retry_min",
                     help="floor between retries of a FAILED pass (see WHY A RETRY FLOOR)")
     ap.add_argument("--state-dir", default="/tmp",
@@ -214,7 +246,7 @@ def main() -> int:
     ap.add_argument("--once", action="store_true",
                     help="one poll, one decision, exit — a supervisor's ExecStart")
     ap.add_argument("--dry-run-print", action="store_true",
-                    help="print the fingerprint and exit; no lock, no doctor")
+                    help="print the fingerprint and exit; no lock, no pass")
     a = ap.parse_args()
 
     if a.dry_run_print:
@@ -238,8 +270,8 @@ def main() -> int:
         return 0
 
     st = load_state(state_path)
-    log("START repo=%s poll=%ds debounce=%ds backstop=%ds max=%d retry_min=%ds once=%s state=%s"
-        % (a.repo, a.poll, a.debounce, a.backstop, a.max_n, a.retry_min, a.once, state_path))
+    log("START repo=%s poll=%ds debounce=%ds backstop=%ds retry_min=%ds once=%s state=%s"
+        % (a.repo, a.poll, a.debounce, a.backstop, a.retry_min, a.once, state_path))
 
     # In LOOP mode a change must SURVIVE `--debounce` before it runs: a push fires several
     # `updatedAt` moves and a wave of check completions fires several more, and each is a real
@@ -331,22 +363,22 @@ def main() -> int:
             time.sleep(a.poll)
             continue
 
-        # ── 3. ACT — the doctor owns every repair decision; this only starts it ─────────────
+        # ── 3. ACT — the pass owns every repair decision; this only starts ONE pass ──────────
         log("PASS-BEGIN reason=%s prs=%d" % (why, count))
-        rc = run_doctor(a.repo, a.repo_dir, a.max_n)
+        rc = run_pass(a.repo, a.repo_dir)
         now = time.time()
         st["last_attempt"] = now
         changed_at = None
         st.pop("pending_since", None)      # the change has been ACTED on; nothing is pending
-        if rc in (0, 2):
+        if rc in PASS_VERDICTS:
             st["last_pass"] = now
         else:
-            log("DOCTOR-FAILED rc=%d -- backstop window NOT consumed, next attempt after %ds"
+            log("PASS-FAILED rc=%d -- backstop window NOT consumed, next attempt after %ds"
                 % (rc, a.retry_min))
             st["last_pass"] = 0.0
         save_state(state_path, st)
         if a.once:
-            return 0 if rc in (0, 2) else 1
+            return 0 if rc in PASS_VERDICTS else 1
         continue
 
 

@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# tests/pr-doctor-trigger/run.sh — the EVENT-DRIVEN front end for `pr-doctor`.
+# tests/pr-doctor-trigger/run.sh — the EVENT-DRIVEN front end for the repair PASS.
 #
 # THE DEFECT THIS SUITE PINS. The fleet's repair actuator was TIMER-driven: `com.tortoise.pr-doctor`
 # ran `StartInterval 1800`, so a PR that turned red one second after a pass waited up to 1800 s
 # (mean 900 s) before any worker existed on it. The lead was not the repair — it was the timer.
-# `scripts/pr-doctor-trigger.py` watches the PR surface with ONE `gh pr list` per poll and runs the
-# EXISTING doctor when the fingerprint changes; the 1800 s timer survives as `--backstop`.
+# `scripts/pr-doctor-trigger.py` watches the PR surface with ONE `gh pr list` per poll and runs ONE
+# PASS of `scripts/pr-repair-loop.sh` when the fingerprint changes; the timer survives as `--backstop`.
+#
+# ⛔ THE CHILD IS THE PASS, NOT `pr-doctor.py`, AND THAT IS THE POINT OF THIS SUITE. Calling the doctor
+# directly would skip the derived cap, the disk floor and the load ceiling (#2721), the reap, the
+# `keys.env` credential source (#1852/#2716) and the status row — a front end that bypasses its own
+# gate. The stub below is therefore named `pr-repair-loop.sh`, so EVERY count in this file would go to
+# zero if the trigger went back to calling `pr-doctor.py`.
 #
 # WHAT IS ASSERTED, and why each one can FAIL:
 #
@@ -14,22 +20,26 @@
 #      proves it: a mutant whose `fingerprint()` returns a constant makes B's "changed surface runs
 #      a pass" arm produce ZERO passes, i.e. the suite is falsifiable.
 #   B. COLD START runs exactly one pass, and an IDENTICAL second read runs NONE — counted by
-#      DOCTOR INVOCATIONS, not by stdout text. A constant fingerprint would still print
+#      PASS INVOCATIONS, not by stdout text. A constant fingerprint would still print
 #      "no change" and still satisfy a text-only assertion; it cannot fake the counter.
 #   C. a CHANGED surface runs ONE pass after the debounce — five rapid `updatedAt`/
-#      `mergeStateStatus` moves coalesce into a single pass, not five.
+#      `mergeStateStatus` moves coalesce into a single pass, not five. C5 pins that a DEFERRED pass
+#      (rc 6 — the MACHINE saying not-now) is a VERDICT like 0/2, not a failure that would re-measure
+#      a box that just said no on every poll.
 #   D. an UNREADABLE surface is NOT QUIET (#2271: an empty/failed check surface must never read as
-#      green). The doctor is not invoked, `PR-SURFACE-UNREADABLE` is logged on EVERY tick (so the
+#      green). The pass is not invoked, `PR-SURFACE-UNREADABLE` is logged on EVERY tick (so the
 #      next tick retried), the previous fingerprint is KEPT (a surface that comes back unchanged
 #      owes no pass), and the word "no change" never appears — those are different states.
-#   E. the LOCK: a second instance exits 0 with `ALREADY-RUNNING` and runs no doctor. Concurrency
+#   E. the LOCK: a second instance exits 0 with `ALREADY-RUNNING` and runs no pass. Concurrency
 #      must be visible and exclusive rather than inferred from a plist nobody read.
 #   F. `--once` (a supervisor's ExecStart) runs one pass and exits; a no-change `--once` runs none.
+#   G. THE WIRING: `pr-repair-loop.sh --trigger` execs this trigger (one entry point for the unit),
+#      and the pass is invoked with NO arguments — the cap is the machine's, never a scheduler's.
 #
-# HERMETIC: a throwaway HOME-free temp dir, a fake `gh` FIRST on PATH, and a fake `pr-doctor.py`
-# BESIDE a copy of the trigger (the trigger resolves its doctor as `dirname($0)/pr-doctor.py`, so
-# the copy's sibling IS the stub). It never reads the live account, never runs the real doctor, and
-# never touches the real `/tmp/pr-doctor-trigger-*.lock`.
+# HERMETIC: a throwaway HOME-free temp dir, a fake `gh` FIRST on PATH, and a fake `pr-repair-loop.sh`
+# BESIDE a copy of the trigger (the trigger resolves its pass as `dirname($0)/pr-repair-loop.sh`, so
+# the copy's sibling IS the stub). It never reads the live account, never runs the real pass, and
+# never touches the real `$STATE_DIR/pr-doctor-trigger-*.lock`.
 #
 # Run: bash tests/pr-doctor-trigger/run.sh
 set -uo pipefail
@@ -61,16 +71,22 @@ APP="$TMP/app"; mkdir -p "$APP" "$TMP/bin" "$TMP/state"
 cp "$SRC" "$APP/pr-doctor-trigger.py"
 GH_STATE="$TMP/gh-surface.json"
 GH_MODE="$TMP/gh-mode"
-DOCTOR_LOG="$TMP/doctor-invocations.log"
-: >"$DOCTOR_LOG"; echo ok >"$GH_MODE"
+PASS_LOG="$TMP/pass-invocations.log"
+: >"$PASS_LOG"; echo ok >"$GH_MODE"
 
-# ── the fake doctor: the ONLY thing that can prove "a pass ran" ────────────────────────────────
-cat >"$APP/pr-doctor.py" <<'PY'
-import os, sys
-with open(os.environ["FAKE_DOCTOR_LOG"], "a") as fh:
-    fh.write(" ".join(sys.argv[1:]) + "\n")
-sys.exit(int(os.environ.get("FAKE_DOCTOR_RC", "0")))
-PY
+# ── the fake PASS (`pr-repair-loop.sh`): the ONLY thing that can prove "a pass ran" ─────────────
+# ⛔ THE STUB IS THE LOOP, NOT THE DOCTOR. The trigger's child is `dirname($0)/pr-repair-loop.sh`, and
+# this stub occupies that exact path — so every invocation count below is evidence that the front end
+# drives the PASS (with its cap, gates, reap, credential source and status row) instead of reaching
+# past it into `pr-doctor.py`.
+cat >"$APP/pr-repair-loop.sh" <<'SH'
+#!/usr/bin/env bash
+# argv is recorded so the suite can assert the scheduler supplies NOTHING (no `--max`: the cap is the
+# machine's — half the cores, the disk floor and the owner's load ceiling decide it).
+printf '%s\n' "$*" >>"$FAKE_PASS_LOG"
+exit "${FAKE_PASS_RC:-0}"
+SH
+chmod +x "$APP/pr-repair-loop.sh"
 
 # ── the fake gh: one call shape only (`pr list --json …`), plus the two failure shapes ─────────
 cat >"$TMP/bin/gh" <<'SH'
@@ -95,7 +111,7 @@ esac
 SH
 chmod +x "$TMP/bin/gh"
 export PATH="$TMP/bin:$PATH"
-export FAKE_GH_STATE="$GH_STATE" FAKE_GH_MODE="$GH_MODE" FAKE_DOCTOR_LOG="$DOCTOR_LOG"
+export FAKE_GH_STATE="$GH_STATE" FAKE_GH_MODE="$GH_MODE" FAKE_PASS_LOG="$PASS_LOG"
 GH_LOG="$TMP/gh-calls.log"; : >"$GH_LOG"; export FAKE_GH_LOG="$GH_LOG"
 
 surface() { # <mergeStateStatus> <updatedAt>  — one open PR; the whole observable surface
@@ -104,8 +120,8 @@ surface() { # <mergeStateStatus> <updatedAt>  — one open PR; the whole observa
 surface3() { # three PRs — the shape that catches a PER-PR `gh` call
   printf '[{"number":101,"mergeStateStatus":"CONFLICTING","updatedAt":"2026-10-24T18:00:00Z","isDraft":false},{"number":102,"mergeStateStatus":"BEHIND","updatedAt":"2026-10-24T18:01:00Z","isDraft":false},{"number":103,"mergeStateStatus":"BLOCKED","updatedAt":"2026-10-24T18:02:00Z","isDraft":true}]\n' >"$GH_STATE"
 }
-n_doctor() { [ -f "$DOCTOR_LOG" ] && wc -l <"$DOCTOR_LOG" | tr -d ' ' || printf '0'; }
-reset_doctor() { : >"$DOCTOR_LOG"; }
+n_pass() { [ -f "$PASS_LOG" ] && wc -l <"$PASS_LOG" | tr -d ' ' || printf '0'; }
+reset_pass() { : >"$PASS_LOG"; }
 
 start_loop() { # <state-dir> <repo> <debounce> <logfile> → pid
   python3 "$APP/pr-doctor-trigger.py" --repo "$2" --repo-dir "$APP" \
@@ -124,13 +140,13 @@ wait_for() { # <file> <fixed-string> <tenths>
 }
 stop_loop() { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }
 # ⛔ POLL FOR AN ARRIVAL, SLEEP ONLY FOR AN ABSENCE (review cycle 1). `wait_for PASS-BEGIN` returns
-# before the doctor is spawned (the trigger logs it first), so `sleep 1; assert count==1` asked a
+# before the pass is spawned (the trigger logs it first), so `sleep 1; assert count==1` asked a
 # saturated runner to fork python inside one second. Every other sleep in this file asserts that
 # something did NOT happen, which cannot flake. This helper is the arrival half.
 wait_dir() { # <want-count> <tenths>
   local i=0
   while [ "$i" -lt "$2" ]; do
-    [ "$(n_doctor)" -ge "$1" ] && return 0
+    [ "$(n_pass)" -ge "$1" ] && return 0
     sleep 0.1; i=$((i + 1))
   done
   return 1
@@ -184,7 +200,7 @@ echo "── A4. ONE gh call per read — the cost claim, counted"
 # pin it. Three PRs, one read: exactly one `gh` invocation, or the arm fails.
 : >"$GH_LOG"
 surface3
-reset_doctor
+reset_pass
 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-a4 --repo-dir "$APP" \
   --once --dry-run-print --state-dir "$TMP/state/a4" >"$TMP/a4.log" 2>&1
 assert_eq "$(wc -l <"$GH_LOG" | tr -d ' ')" "1" "three PRs cost exactly ONE gh call (not one per PR)"
@@ -194,16 +210,16 @@ surface CONFLICTING "2026-10-24T18:00:00Z"
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── B. cold start runs ONE pass; an identical read runs NONE (counted, not read off stdout)"
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor
+reset_pass
 S="$TMP/state/b"; mkdir -p "$S"; LOG="$TMP/b.log"
 pid="$(start_loop "$S" fake-owner/suite-b 2 "$LOG")"
 if wait_for "$LOG" "PASS-BEGIN" 100; then pass "the first read of a cold trigger runs a pass"
 else fail "cold start ran no pass"; fi
 wait_dir 1 100 || true
-assert_eq "$(n_doctor)" "1" "exactly one doctor invocation on the cold pass"
-reset_doctor
+assert_eq "$(n_pass)" "1" "exactly one pass invocation on the cold pass"
+reset_pass
 sleep 4                       # ≥4 poll ticks with a byte-identical surface
-assert_eq "$(n_doctor)" "0" "an identical surface invokes the doctor ZERO times"
+assert_eq "$(n_pass)" "0" "an identical surface invokes the pass ZERO times"
 body="$(cat "$LOG")"
 assert_contains "$body" "no change" "it says so (a silent trigger is indistinguishable from a dead one)"
 n_cold="$(grep -cF 'COLD' "$LOG")"
@@ -212,27 +228,27 @@ stop_loop "$pid"
 
 echo "── B2. --once: one pass and exit, then nothing (a supervisor's ExecStart)"
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor
+reset_pass
 S2="$TMP/state/b2"; mkdir -p "$S2"
 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-b2 --repo-dir "$APP" --once \
   --poll 1 --backstop 1000000 --state-dir "$S2" >"$TMP/b2.log" 2>&1; rc=$?
 assert_eq "$rc" "0" "--once on a cold start exits 0"
-assert_eq "$(n_doctor)" "1" "--once ran exactly one pass"
-reset_doctor
+assert_eq "$(n_pass)" "1" "--once ran exactly one pass"
+reset_pass
 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-b2 --repo-dir "$APP" --once \
   --poll 1 --backstop 1000000 --state-dir "$S2" >"$TMP/b2b.log" 2>&1
-assert_eq "$(n_doctor)" "0" "a second --once with an unchanged surface runs NO pass"
+assert_eq "$(n_pass)" "0" "a second --once with an unchanged surface runs NO pass"
 assert_contains "$(cat "$TMP/b2b.log")" "no change" "and it says 'no change'"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── C. a CHANGED surface: one pass after the debounce; five rapid moves → ONE pass"
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor
+reset_pass
 S="$TMP/state/c"; mkdir -p "$S"; LOG="$TMP/c.log"
 pid="$(start_loop "$S" fake-owner/suite-c 3 "$LOG")"
 wait_for "$LOG" "PASS-BEGIN" 100 || fail "cold pass never ran (case C cannot start)"
 wait_dir 1 100 || true
-reset_doctor
+reset_pass
 i=0
 while [ "$i" -lt 5 ]; do                       # five RAPID changes, well inside the 3 s debounce
   if [ $((i % 2)) -eq 0 ]; then st=BEHIND; else st=CONFLICTING; fi
@@ -240,18 +256,18 @@ while [ "$i" -lt 5 ]; do                       # five RAPID changes, well inside
   sleep 0.4; i=$((i + 1))
 done
 sleep 9                                        # 3 s debounce + pass + several no-change ticks
-assert_eq "$(n_doctor)" "1" "five rapid changes produced exactly ONE pass (coalesced)"
+assert_eq "$(n_pass)" "1" "five rapid changes produced exactly ONE pass (coalesced)"
 assert_contains "$(cat "$LOG")" "CHANGE" "the change was observed"
 stop_loop "$pid"
 
 echo "── C2. a pass that FAILED does not buy a backstop window (retry floor, not a 1800 s wait)"
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor
+reset_pass
 S="$TMP/state/c2"; mkdir -p "$S"; LOG="$TMP/c2.log"
-FAKE_DOCTOR_RC=3 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-c2 --repo-dir "$APP" \
+FAKE_PASS_RC=3 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-c2 --repo-dir "$APP" \
   --once --backstop 1000000 --retry-min 0 --state-dir "$S" >"$LOG" 2>&1; rc=$?
 assert_eq "$rc" "1" "a non-{0,2} doctor exit makes --once exit non-zero"
-assert_contains "$(cat "$LOG")" "DOCTOR-FAILED rc=3" "it is named DOCTOR-FAILED, not a clean window"
+assert_contains "$(cat "$LOG")" "PASS-FAILED rc=3" "it is named PASS-FAILED, not a clean window"
 python3 - "$S/pr-doctor-trigger-suite-c2.state.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -269,15 +285,15 @@ echo "── C3. --retry-min BOUNDS a repeated failure (one pass per floor, not 
 # suite green. Here the backstop is always due (`--backstop 0`) and the pass keeps failing: with the
 # floor there is ONE attempt in four polls without it there are four.
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor; S="$TMP/state/c3"; mkdir -p "$S"; LOG="$TMP/c3.log"
-FAKE_DOCTOR_RC=3 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-c3 --repo-dir "$APP" \
+reset_pass; S="$TMP/state/c3"; mkdir -p "$S"; LOG="$TMP/c3.log"
+FAKE_PASS_RC=3 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-c3 --repo-dir "$APP" \
   --poll 1 --debounce 0 --backstop 0 --retry-min 600 --state-dir "$S" >"$LOG" 2>&1 &
 c3pid=$!
 wait_dir 1 100
 sleep 4
 stop_loop "$c3pid"
-assert_eq "$(n_doctor)" "1" "a failing pass is retried ONCE per --retry-min, not once per poll"
-assert_contains "$(cat "$LOG")" "DOCTOR-FAILED rc=3" "and the failure is named"
+assert_eq "$(n_pass)" "1" "a failing pass is retried ONCE per --retry-min, not once per poll"
+assert_contains "$(cat "$LOG")" "PASS-FAILED rc=3" "and the failure is named"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── C4. the debounce is a DEADLINE: the pass lands at it, not at the next poll tick"
@@ -288,18 +304,18 @@ echo "── C4. the debounce is a DEADLINE: the pass lands at it, not at the ne
 # sleep left the suite green. `--poll 6 --debounce 7` separates them: the deadline sleep wakes at
 # ~7 s, a per-tick sleep at 12 s (6, then 6 more for the last 1 s).
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor; S="$TMP/state/c4"; mkdir -p "$S"; LOG="$TMP/c4.log"; : >"$LOG"
+reset_pass; S="$TMP/state/c4"; mkdir -p "$S"; LOG="$TMP/c4.log"; : >"$LOG"
 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-c4 --repo-dir "$APP" \
   --poll 6 --debounce 7 --backstop 1000000 --state-dir "$S" >"$LOG" 2>&1 &
 c4pid=$!
 if wait_dir 1 200; then pass "cold pass first (poll=6)"; else fail "no cold pass at poll=6"; fi
-reset_doctor
+reset_pass
 surface BEHIND "2026-10-24T18:30:00Z"
 t_det=""
 wait_for "$LOG" "CHANGE settling" 200 && t_det="$(date +%s)"
 wait_dir 1 200; t_run="$(date +%s)"
 stop_loop "$c4pid"
-assert_eq "$(n_doctor)" "1" "poll=6 debounce=7 runs exactly one pass"
+assert_eq "$(n_pass)" "1" "poll=6 debounce=7 runs exactly one pass"
 if [ -n "$t_det" ]; then
   el=$(( t_run - t_det ))
   # shipped: ~7 s after the change is observed. A per-tick sleep: 12 s. The threshold sits between
@@ -313,12 +329,12 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── D. an UNREADABLE surface is not QUIET (#2271)"
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor
+reset_pass
 S="$TMP/state/d"; mkdir -p "$S"; LOG="$TMP/d.log"
 pid="$(start_loop "$S" fake-owner/suite-d 1 "$LOG")"
 wait_for "$LOG" "PASS-BEGIN" 100 || fail "cold pass never ran (case D cannot start)"
 wait_dir 1 100 || true
-reset_doctor
+reset_pass
 # ⛔ THE BASELINE IS TAKEN **AFTER** THE FLIP HAS PRODUCED ≥2 UNREADABLE TICKS, not before it.
 # Taking it before made this assertion RACY and it flaked: the trigger can be mid-tick when the mode
 # flips, so a tick that read the surface while it was still readable logs its legitimate "no change"
@@ -341,17 +357,17 @@ unread_after="$(grep -cF 'PR-SURFACE-UNREADABLE' "$LOG")"
 assert_eq "$quiet_after" "$quiet_before" "no unreadable tick ever logged 'no change' (the #2271 failure)"
 [ "$unread_after" -gt "$unread_before" ] && pass "and it kept retrying ($((unread_after - unread_before)) more attempt(s))" \
   || fail "retrying stopped after the first two attempts"
-assert_eq "$(n_doctor)" "0" "an unreadable surface invoked the doctor ZERO times"
+assert_eq "$(n_pass)" "0" "an unreadable surface invoked the pass ZERO times"
 # the surface comes back byte-identical: still no pass (the fingerprint was KEPT, not forgotten)
 echo ok >"$GH_MODE"
 sleep 3
-assert_eq "$(n_doctor)" "0" "the surface returning UNCHANGED owes no pass"
+assert_eq "$(n_pass)" "0" "the surface returning UNCHANGED owes no pass"
 assert_contains "$(cat "$LOG")" "keeping the last fingerprint" "going blind was not treated as a change"
 stop_loop "$pid"
 
 echo "── D2. --once over an UNREADABLE surface exits non-zero and never says 'no change'"
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor
+reset_pass
 S="$TMP/state/d2"; mkdir -p "$S"
 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-d2 --repo-dir "$APP" --once \
   --poll 1 --backstop 1000000 --state-dir "$S" >"$TMP/d2a.log" 2>&1   # seed a fingerprint
@@ -364,9 +380,9 @@ assert_contains "$(cat "$TMP/d2.log")" "SURFACE-DEGRADED" "it names the degraded
 assert_not_contains "$(cat "$TMP/d2.log")" "no change" "and never reports the unreadable surface as quiet"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
-echo "── E. the LOCK: a second instance exits 0 and runs no second doctor"
+echo "── E. the LOCK: a second instance exits 0 and runs no second pass"
 S="$TMP/state/e"; mkdir -p "$S"; LOG="$TMP/e.log"
-reset_doctor
+reset_pass
 pid="$(start_loop "$S" fake-owner/suite-e 1 "$LOG")"
 wait_for "$LOG" "PASS-BEGIN" 100 || fail "the holding instance never started"
 wait_dir 1 100 || true
@@ -374,13 +390,13 @@ python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-e --repo-dir "$APP" 
   --poll 1 --backstop 1000000 --state-dir "$S" >"$TMP/e2.log" 2>&1; rc=$?
 assert_eq "$rc" "0" "the second instance exits 0 (not an error, not a crash loop)"
 assert_contains "$(cat "$TMP/e2.log")" "ALREADY-RUNNING" "it SAYS another instance holds the lock"
-assert_eq "$(n_doctor)" "1" "no second doctor was started"
+assert_eq "$(n_pass)" "1" "no second pass was started"
 stop_loop "$pid"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 echo "── F. MUTATION: a constant fingerprint() must turn case C RED (the anti-vacuity arm)"
 MUT="$TMP/mutant"; mkdir -p "$MUT"
-cp "$APP/pr-doctor.py" "$MUT/pr-doctor.py"
+cp "$APP/pr-repair-loop.sh" "$MUT/pr-repair-loop.sh"
 python3 - "$APP/pr-doctor-trigger.py" "$MUT/pr-doctor-trigger.py" <<'PY'
 import sys
 src = open(sys.argv[1]).read()
@@ -390,206 +406,140 @@ open(sys.argv[2], "w").write(src.replace(needle, '    return ("CONSTANT", len(ro
 PY
 assert_eq "$?" "0" "the mutant was built from the real fingerprint() return"
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor
+reset_pass
 MS="$TMP/state/f"; mkdir -p "$MS"; MLOG="$TMP/f.log"
 python3 "$MUT/pr-doctor-trigger.py" --repo fake-owner/suite-f --repo-dir "$MUT" \
   --poll 1 --debounce 1 --backstop 1000000 --state-dir "$MS" >"$MLOG" 2>&1 &
 mpid=$!
 wait_for "$MLOG" "PASS-BEGIN" 100 || fail "the mutant never ran its cold pass"
 wait_dir 1 100 || true                       # an ARRIVAL: poll, never sleep (review cycle 2, F3)
-reset_doctor
+reset_pass
 surface BEHIND "2026-10-24T18:59:00Z"          # a REAL change the mutant cannot see
 sleep 4
-assert_eq "$(n_doctor)" "0" "the mutant MISSES the change — i.e. case C's assertion is load-bearing"
+assert_eq "$(n_pass)" "0" "the mutant MISSES the change — i.e. case C's assertion is load-bearing"
 assert_contains "$(cat "$MLOG")" "no change" "the mutant reports 'no change' over a changed surface"
 stop_loop "$mpid"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
-echo "── G. the SERVICE wiring: ExecStart runs the TRIGGER, Restart=always, backstop 1800"
-INSTALLER="$ROOT/scripts/orchestrator-harness/install-repair-service.sh"
-[ -f "$INSTALLER" ] && pass "the repair-service installer ships" || fail "no $INSTALLER"
-unit="$(PR_DOCTOR_REPO_DIR="$TMP/no-such-checkout" ELDATO_PLATFORM=Linux \
-        PR_DOCTOR_TRIGGER="$APP/pr-doctor-trigger.py" \
-        TEMPLATES_DIR="$ROOT/templates/systemd" \
-        bash "$INSTALLER" --dry-run 2>"$TMP/dryrun.err")"; irc=$?
-assert_eq "$irc" "0" "--dry-run renders without touching the service manager"
-# ⛔ STDOUT IS THE UNIT AND NOTHING ELSE (review cycle 4). `--dry-run > x.service` is how the verb is
-# used, and an advisory printed with `say` put three bare lines above `[Unit]`, which systemd cannot
-# parse. The advisory is made to fire DETERMINISTICALLY here (a path that cannot exist), so the arm
-# cannot pass by this box happening not to have the checkout.
-assert_eq "$(head -1 <<<"$unit")" "[Unit]" "--dry-run's FIRST stdout line is [Unit] (installs cleanly)"
-assert_not_contains "$unit" "does not exist on this box" "no advisory leaks into the rendered unit"
-assert_contains "$(cat "$TMP/dryrun.err")" "PR_DOCTOR_REPO_DIR" \
-  "and the advisory still fires — on stderr, where it cannot corrupt the unit"
-exec_line="$(grep -m1 '^ExecStart=' <<<"$unit")"
-assert_contains "$exec_line" "pr-doctor-trigger.py" "ExecStart runs the TRIGGER"
-assert_not_contains "$exec_line" "pr-doctor-loop.sh" "ExecStart is not a shell loop"
-assert_contains "$exec_line" "--backstop 1800" "the timer survives ONLY as --backstop 1800"
-assert_contains "$unit" "Restart=always" "Restart=always (an ORDERLY exit must come back, #2402)"
-assert_not_contains "$unit" "Restart=on-failure" "not on-failure — the measured case is an exit 0"
-assert_not_contains "$unit" "{{TRIGGER}}" "the render substitutes every placeholder"
-# ⛔ A REPO MISMATCH IS REFUSED, NOT RENDERED (review cycle 2, F1). The doctor's PR LIST is hardcoded
-# while its classifier READS OBJECTIVE_REPO, so a unit pointed at any other repo lists one repo's PRs
-# and asks the other for their check-runs: every PR unreadable, pass refused (rc 2), which the
-# trigger reads as a CLEAN 1800 s window. Rendering it would ship a service whose only output is a
-# refusal.
-split="$(ELDATO_PLATFORM=Linux PR_DOCTOR_TRIGGER="$APP/pr-doctor-trigger.py" \
-          REPAIR_REPO=fake-owner/other TEMPLATES_DIR="$ROOT/templates/systemd" \
-          bash "$INSTALLER" --dry-run 2>&1)"; src=$?
-[ "$src" -ne 0 ] && pass "a non-tortoise REPAIR_REPO is REFUSED (rc=$src), not rendered" \
-  || fail "the installer rendered a unit whose every pass would be refused"
-assert_contains "$split" "OBJECTIVE_REPO" "and the refusal names the seam that makes it real"
-darwin="$(ELDATO_PLATFORM=Darwin bash "$INSTALLER" --dry-run 2>&1)"; drc=$?
-[ "$drc" -ne 0 ] && pass "the installer REFUSES a non-systemd platform (rc=$drc)" \
-  || fail "the installer 'succeeded' on Darwin — an artifact nothing reads"
-assert_contains "$darwin" "install-launchd.sh" "and it names the installer that owns that platform"
-
-# ── G2. the INSTALL path, driven through a fake systemctl (review cycle 2, F2/F5) ─────────────
-FAKE_UNIT_DIR="$TMP/units"; mkdir -p "$FAKE_UNIT_DIR"
-SC_LOG="$TMP/systemctl.log"; : >"$SC_LOG"
-SC_STATE="$TMP/sc-state"; printf 'inactive\n' >"$SC_STATE"   # a down box: the install must START it
-cat >"$TMP/bin/systemctl" <<'SH'
-#!/usr/bin/env bash
-# a systemctl that logs every verb and tracks an ACTIVE state the suite can seed and read back.
-# ⛔ TWO KNOBS EXIST SO THE INSTALLER'S READ-BACK GATES CAN FAIL (review cycle 5). Without them the
-# fake answered `enabled` unconditionally and flipped to `active` on any start, so DELETING either
-# gate left the suite green — an assertion that cannot fail is not a test of the gate.
-#   SYSTEMCTL_ENABLED_FILE - what `is-enabled` answers (default `enabled`)
-#   SYSTEMCTL_STICKY_FILE  - when it holds `1`, start/restart does NOT activate (a unit that dies)
-echo "$*" >>"$SYSTEMCTL_LOG"
-st="$(cat "$SYSTEMCTL_STATE" 2>/dev/null || echo inactive)"
-case "$1" in
-  is-enabled) printf '%s\n' "$(cat "$SYSTEMCTL_ENABLED_FILE" 2>/dev/null || echo enabled)" ;;
-  is-active)  printf '%s\n' "$st" ;;
-  start|restart|enable)
-    case "$1" in
-      start|restart)
-        [ "$(cat "$SYSTEMCTL_STICKY_FILE" 2>/dev/null || echo 0)" = 1 ] || printf 'active\n' >"$SYSTEMCTL_STATE"
-        ;;
-    esac ;;
-  stop) printf 'inactive\n' >"$SYSTEMCTL_STATE" ;;
-  *) : ;;
-esac
-exit 0
-SH
-chmod +x "$TMP/bin/systemctl"
-SC_ENABLED_FILE="$TMP/sc-enabled"; printf 'enabled\n' >"$SC_ENABLED_FILE"
-SC_STICKY_FILE="$TMP/sc-sticky"; printf '0\n' >"$SC_STICKY_FILE"
-export SYSTEMCTL_LOG="$SC_LOG" SYSTEMCTL_STATE="$SC_STATE"
-export SYSTEMCTL_ENABLED_FILE="$SC_ENABLED_FILE" SYSTEMCTL_STICKY_FILE="$SC_STICKY_FILE"
-inst() { # <restart-sec>
-  ELDATO_PLATFORM=Linux PR_DOCTOR_TRIGGER="$APP/pr-doctor-trigger.py" \
-  SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl TEMPLATES_DIR="$ROOT/templates/systemd" \
-  REPAIR_RESTART_SEC="$1" REPAIR_STATE_DIR="$TMP/state" \
-  bash "$INSTALLER" --install 2>&1
-}
-inst 15 >"$TMP/g-install.log" 2>&1
-assert_eq "$?" "0" "--install succeeds against a service manager (fake systemctl)"
-[ -f "$FAKE_UNIT_DIR/eldato-pr-doctor-trigger.service" ] \
-  && pass "the unit file is written to the resolved unit dir" || fail "no unit file after --install"
-# ⛔ THE POSITIVE CONTROL FOR THE NEXT ASSERTION (review cycle 3, F4). Without it the arm was vacuous
-# in the direction that matters: with the `restart` deleted from the installer entirely, the counter
-# was 0 before and 0 after and the suite still reported ALL PASSED. A CHANGED install MUST restart.
-assert_eq "$(grep -c '^restart' "$SC_LOG")" "1" "a CHANGED install restarts the unit exactly once"
-n_before="$(grep -c '^restart' "$SC_LOG")"
-printf 'active\n' >"$SC_STATE"
-inst 15 >"$TMP/g-reinstall.log" 2>&1
-assert_eq "$?" "0" "a second --install over identical bytes exits 0"
-assert_eq "$(grep -c '^restart' "$SC_LOG")" "$n_before" \
-  "and an UNCHANGED one does NOT restart it (a gratuitous restart orphans the doctor)"
-assert_eq "$n_before" "1" "(the unchanged arm compares against a real restart, not against zero)"
-# ⛔ THE REGRESSION THIS ARM EXISTS FOR (review cycle 2, F2): a re-install is the operator's natural
-# recovery action for a trigger that is DOWN, and "unchanged bytes" must not mean "nothing to do".
-printf 'inactive\n' >"$SC_STATE"
-: >"$SC_LOG"
-inst 15 >"$TMP/g-recover.log" 2>&1; rrc=$?
-assert_eq "$rrc" "0" "--install over an unchanged but STOPPED unit exits 0"
-assert_eq "$(grep -c '^start' "$SC_LOG")" "1" "and it STARTED it (recovery must not be a silent no-op)"
-# ⛔ A RENDER CONSTRAINT MUST NOT GATE THE READING VERB (review cycle 2, F5).
-REPAIR_RESTART_SEC=100 ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl \
-  bash "$INSTALLER" --install >"$TMP/g-badrestart.log" 2>&1; brc=$?
-[ "$brc" -ne 0 ] && pass "REPAIR_RESTART_SEC=100 is REFUSED at --install (StartLimit could never fire)" \
-  || fail "an unfireable StartLimit was installed"
-assert_contains "$(cat "$TMP/g-badrestart.log")" "StartLimitBurst" "and the refusal shows the arithmetic"
-REPAIR_RESTART_SEC=100 ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl \
-  bash "$INSTALLER" --status >"$TMP/g-status.log" 2>&1; strc=$?
-assert_eq "$strc" "0" "--status still answers with the same bad render value (reading verbs are not gated)"
-# ⛔ THE READING/REMOVAL VERBS MUST NOT NEED THE TEMPLATE (review cycle 3). The copy that lands on a
-# box is the farmed `scripts/orchestrator-harness/*` into $O, where `ROOT/templates/systemd` does NOT
-# exist (templates are deliberately not farmed) — so a preflight that lived above the action switch
-# made `--status` and `--uninstall` impossible from the only place the installer is deployed.
-noT="$TMP/notemplates"
-st2="$(ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" SYSTEMCTL=systemctl \
-        TEMPLATES_DIR="$noT" bash "$INSTALLER" --status 2>&1)"; st2rc=$?
-assert_eq "$st2rc" "0" "--status works with NO template dir (the farmed layout)"
-printf 'ExecStart=/bin/false\n# pr-doctor-trigger.py --backstop 1800 (prose in a comment)\n' >"$TMP/units/bogus.service"
-bogus="$(REPAIR_UNIT_NAME=bogus.service ELDATO_PLATFORM=Linux SYSTEMD_UNIT_DIR="$FAKE_UNIT_DIR" \
-          SYSTEMCTL=systemctl TEMPLATES_DIR="$noT" bash "$INSTALLER" --status 2>&1)"; brc2=$?
-# ⛔ A FALSE PASS, CAUGHT (review cycle 3): the check used to grep the whole FILE, so the
-# `Documentation=` URL and the template's own prose satisfied it and an ExecStart of `/bin/false`
-# reported ✅ with rc 0.
-[ "$brc2" -ne 0 ] && pass "--status REFUSES a unit whose ExecStart is not the trigger (rc=$brc2)" \
-  || fail "--status reported ✅ over ExecStart=/bin/false — a false PASS"
-assert_contains "$bogus" "ExecStart: ExecStart=/bin/false" "and it prints the ExecStart it actually read"
-# ⛔ THE READ-BACK GATES MUST BE ABLE TO FAIL (review cycle 5). The body claims `is-enabled` must say
-# `enabled` and `is-active` GATES the verdict — "a unit that is enabled but not running is the #2700
-# shape one layer down". Deleting either gate used to leave the suite at ALL PASSED: the fake answered
-# `enabled` unconditionally and activated on any start. Both arms now drive the failure.
-printf 'disabled\n' >"$SC_ENABLED_FILE"
-printf 'active\n' >"$SC_STATE"
-inst 15 >"$TMP/g-notenabled.log" 2>&1; ne_rc=$?
-printf 'enabled\n' >"$SC_ENABLED_FILE"
-[ "$ne_rc" -ne 0 ] && pass "an install whose unit is NOT enabled fails (rc=$ne_rc)" \
-  || fail "an enabled-but-refused unit was reported as a successful install"
-assert_contains "$(cat "$TMP/g-notenabled.log")" "NOT enabled" "and it names the disabled unit"
-printf '1\n' >"$SC_STICKY_FILE"; printf 'inactive\n' >"$SC_STATE"
-inst 20 >"$TMP/g-notactive.log" 2>&1; na_rc=$?
-printf '0\n' >"$SC_STICKY_FILE"; printf 'active\n' >"$SC_STATE"
-# ⚠️ this arm pays the installer's real 10 s activation budget on purpose: the failure it proves IS
-# the wait expiring, and a shortened wait would not be the shipped code path.
-[ "$na_rc" -ne 0 ] && pass "an install whose unit never becomes ACTIVE fails (rc=$na_rc)" \
-  || fail "an enabled-but-DEAD unit was reported as a successful install — the #2700 shape"
-assert_contains "$(cat "$TMP/g-notactive.log")" "NOT ACTIVE" "and it says the unit is enabled but not running"
+echo "── G. the WIRING: the unit's ONE entry point execs this trigger, and the pass gets no arguments"
+# ⛔ THE MODE IS THE UNIT'S CLOCK CHOICE, NOT A SECOND UNIT: `pr-repair-loop.sh --trigger` execs the
+# trigger, whose child is the SAME loop's one-pass mode. So a box has ONE repair unit, ONE installer
+# and ONE queue, and the front end cannot bypass the cap, the two machine gates, the reap, the
+# credential source or the status row.
+LOOP="$ROOT/scripts/pr-repair-loop.sh"
+[ -f "$LOOP" ] && pass "the repair loop ships (the trigger's child)" || fail "no $LOOP"
+WIRE="$TMP/wire"; mkdir -p "$WIRE" "$TMP/state/g"
+cp "$LOOP" "$WIRE/pr-repair-loop.sh"
+EVID="$TMP/wire-trigger-argv.log"
+# a stub FRONT END beside the real loop: it records the argv the loop hands it and exits 0.
+cat >"$WIRE/pr-doctor-trigger.py" <<'PY'
+import os, sys
+open(os.environ["WIRE_EVID"], "w").write(" ".join(sys.argv[1:]))
+raise SystemExit(0)
+PY
+# ⛔ `PR_REPAIR_SCRIPTS` IS THE LOOP'S OWN SEAM FOR ITS SIBLINGS (it execs the FARMED copy's neighbours
+# — `pr-doctor.py`, `pi-reap-worktrees.sh` — by the same variable), so the stub directory is pointed at
+# the same way the farm would be. Passing it here is the shipped path, not a test-only shortcut.
+WIRE_EVID="$EVID" REPAIR_TRIGGER_BACKSTOP_S=4242 PR_DOCTOR_REPO=fake-repo/one \
+  PR_DOCTOR_REPO_DIR=/tmp PR_REPAIR_SCRIPTS="$WIRE" \
+  bash "$WIRE/pr-repair-loop.sh" --trigger >"$TMP/g-trigger.out" 2>&1; wrc=$?
+[ "$wrc" = 0 ] || sed 's/^/      /' "$TMP/g-trigger.out"
+assert_eq "$wrc" "0" "--trigger execs the front end and exits with its status"
+if [ -f "$EVID" ]; then
+  wire_argv="$(cat "$EVID")"
+  assert_contains "$wire_argv" "--repo fake-repo/one" "--trigger passes the RESOLVED repo (not a default)"
+  assert_contains "$wire_argv" "--repo-dir /tmp" "and the checkout the pass may create worktrees in"
+  assert_contains "$wire_argv" "--backstop 4242" "and the demoted timer, from the loop's own env seam"
+  assert_not_contains "$wire_argv" "--max" "the scheduler never sets the cap (it is the machine's)"
+else
+  fail "--trigger never reached the front end (no argv recorded)"
+fi
+# ⛔ A MISSING FRONT END IS A NAMED REFUSAL, NOT A START-LIMIT LOOP. A unit whose ExecStart cannot
+# resolve its own front end fails every start, systemd exhausts StartLimitBurst, and the only trace is
+# a journal — so `--trigger` refuses with a diagnosis AND records the verdict where a reader looks.
+NOPASS="$TMP/nopass"; mkdir -p "$NOPASS" "$TMP/state/g2"
+cp "$LOOP" "$NOPASS/pr-repair-loop.sh"
+# `PR_REPAIR_SCRIPTS` points at the stub dir, which holds ONLY the loop — so this arm is hermetic
+# against whatever happens to be farmed on the box running the suite.
+O="$TMP/state/g2" PR_DOCTOR_REPO=fake-repo/one PR_DOCTOR_REPO_DIR="$TMP" \
+  PR_REPAIR_SCRIPTS="$NOPASS" bash "$NOPASS/pr-repair-loop.sh" --trigger >"$TMP/g-missing.out" 2>&1; mrc=$?
+assert_eq "$mrc" "2" "--trigger with NO front-end artifact REFUSES (rc 2, the loop's refusing code)"
+assert_contains "$(cat "$TMP/g-missing.out")" "pr-doctor-trigger.py" "and the refusal names the missing file"
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
-echo "── H. a trigger with NO doctor is DOCTOR-MISSING, never a clean pass"
+echo "── H. a trigger with NO pass is PASS-MISSING, never a clean pass"
 NODOC="$TMP/nodoctor"; mkdir -p "$NODOC" "$TMP/state/h"
-cp "$SRC" "$NODOC/pr-doctor-trigger.py"          # the trigger WITHOUT its sibling pr-doctor.py
+cp "$SRC" "$NODOC/pr-doctor-trigger.py"          # the trigger WITHOUT its sibling pr-repair-loop.sh
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor
+reset_pass
 python3 "$NODOC/pr-doctor-trigger.py" --repo fake-owner/suite-h --repo-dir "$NODOC" --once \
   --poll 1 --backstop 1000000 --state-dir "$TMP/state/h" >"$TMP/h.log" 2>&1; rc=$?
-# ⛔ CPython exits 2 for "can't open file", and 2 is the code this trigger treats as a CLEAN window —
-# so without this arm a trigger whose doctor was never farmed reported a clean pass, consumed the
-# whole backstop window and exited 0 under the unit's ExecStart. That is the exact state the farm
-# ORDER in pi-bootstrap/setup.sh exists to prevent, and the farm cannot prevent it off-farm.
-assert_eq "$rc" "1" "--once with no doctor exits non-zero (not a clean 0)"
-assert_contains "$(cat "$TMP/h.log")" "DOCTOR-MISSING" "it is named DOCTOR-MISSING"
+# ⛔ CPython exits 2 for "can't open file", and 2 is a code this trigger treats as a VERDICT — so
+# without this arm a trigger whose PASS was never farmed reported a clean window, consumed the whole
+# backstop and exited 0 under the unit's ExecStart. That is the exact state the farm ORDER in
+# pi-bootstrap/setup.sh exists to prevent, and the farm cannot prevent it off-farm.
+assert_eq "$rc" "1" "--once with no pass exits non-zero (not a clean 0)"
+assert_contains "$(cat "$TMP/h.log")" "PASS-MISSING" "it is named PASS-MISSING"
+assert_not_contains "$(cat "$TMP/h.log")" "PASS-END rc=2" "a missing pass never reports a pass's rc"
 python3 - "$TMP/state/h/pr-doctor-trigger-suite-h.state.json" <<'PYH'
 import json, sys
 d = json.load(open(sys.argv[1]))
-assert d.get("last_pass") == 0, "a missing doctor must NOT consume the backstop window: %r" % d
+assert d.get("last_pass") == 0, "a missing pass must NOT consume the backstop window: %r" % d
 PYH
-assert_eq "$?" "0" "the backstop window is NOT consumed by a missing doctor"
+assert_eq "$?" "0" "the backstop window is NOT consumed by a missing pass"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+echo "── H2. the pass is invoked with NO arguments — the cap is the machine's, never the scheduler's"
+# ⛔ THE STUB LOGS ITS ARGV, SO THIS IS A COUNTED CLAIM. The pass derives its cap from `nproc`, the
+# disk floor and the load ceiling (#2409); a scheduler that could pass `--max` would be the "16 workers
+# on a box at load 57" defect. An EMPTY line in the log is the evidence of no argv.
+surface CONFLICTING "2026-10-24T18:00:00Z"
+reset_pass
+S="$TMP/state/h2"; mkdir -p "$S"
+python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-h2 --repo-dir "$APP" --once \
+  --poll 1 --backstop 1000000 --state-dir "$S" >"$TMP/h2.log" 2>&1
+assert_eq "$(n_pass)" "1" "one pass was invoked"
+assert_eq "$(tr -d '[:space:]' <"$PASS_LOG")" "" "and its argv was EMPTY (no --max, no knobs)"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+echo "── C5. rc=6 (DEFERRED) is a VERDICT like 0/2: the backstop window IS consumed"
+# ⛔ 6 IS THE PASS SAYING "THE MACHINE SAID NOT NOW" (below the disk floor / above the load ceiling /
+# cap 0 — #2721). Treating it as a failure would re-measure a box that just refused on EVERY poll,
+# which is the opposite of the discipline the deferral exists to enforce. This arm separates 6 from 3
+# (C2/C3), where the retry floor deliberately DOES retry.
+surface CONFLICTING "2026-10-24T18:00:00Z"
+reset_pass
+S="$TMP/state/c5"; mkdir -p "$S"
+FAKE_PASS_RC=6 python3 "$APP/pr-doctor-trigger.py" --repo fake-owner/suite-c5 --repo-dir "$APP" \
+  --once --backstop 1000000 --retry-min 0 --state-dir "$S" >"$TMP/c5.log" 2>&1; rc=$?
+assert_eq "$rc" "0" "a DEFERRED pass makes --once exit 0 (a verdict, not a failure)"
+assert_contains "$(cat "$TMP/c5.log")" "PASS-END rc=6" "it is logged as the pass's own rc"
+assert_not_contains "$(cat "$TMP/c5.log")" "PASS-FAILED" "and NOT as a failure"
+python3 - "$S/pr-doctor-trigger-suite-c5.state.json" <<'PYH5'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d.get("last_pass", 0) > 0, "a DEFERRED pass must consume the backstop window: %r" % d
+PYH5
+assert_eq "$?" "0" "the state records last_pass (the window was consumed by the deferral)"
 
 echo "── I. a PENDING change survives a RESTART inside the debounce window"
 surface CONFLICTING "2026-10-24T18:00:00Z"
-reset_doctor
+reset_pass
 S="$TMP/state/i"; mkdir -p "$S"; LOG="$TMP/i.log"
 pid="$(start_loop "$S" fake-owner/suite-i 20 "$LOG")"   # a long debounce: the window is wide on purpose
 wait_for "$LOG" "PASS-BEGIN" 100 || fail "cold pass never ran (case I cannot start)"
 wait_dir 1 100 || true
-reset_doctor
+reset_pass
 surface BEHIND "2026-10-24T19:00:00Z"                    # a REAL change, then kill inside the window
 wait_for "$LOG" "CHANGE" 100 || fail "the change was never observed"
 stop_loop "$pid"                                        # killed BEFORE the 20 s debounce elapses
-assert_eq "$(n_doctor)" "0" "nothing ran yet (the change is still in its coalescing window)"
+assert_eq "$(n_pass)" "0" "nothing ran yet (the change is still in its coalescing window)"
 assert_contains "$(cat "$S"/pr-doctor-trigger-suite-i.state.json)" '"pending_since"' \
   "the pending change was PERSISTED, not just remembered"
 LOG="$TMP/i2.log"
 pid="$(start_loop "$S" fake-owner/suite-i 20 "$LOG")"
 wait_dir 1 300 || true
-assert_eq "$(n_doctor)" "1" "after the restart the change still runs exactly ONE pass (not lost, not doubled)"
+assert_eq "$(n_pass)" "1" "after the restart the change still runs exactly ONE pass (not lost, not doubled)"
 assert_contains "$(cat "$LOG")" "RESUMING a pending change" "and the restart says it is resuming one"
 stop_loop "$pid"
 
@@ -600,7 +550,7 @@ stop_loop "$pid"
 # (section A3 alone is 12), so any one case could be deleted while the floor printed `ok` — a
 # tripwire blind to the exact event it names. Deleting the smallest arm now trips it. Bump it when
 # you add arms; never lower it to make a failing run pass.
-assert_eq "$([ "$PASS" -ge 99 ] && echo ok || echo short)" "ok" "assertion floor (≥99 fired, got $PASS)"
+assert_eq "$([ "$PASS" -ge 81 ] && echo ok || echo short)" "ok" "assertion floor (≥81 fired, got $PASS)"
 
 echo
 if [ "$FAIL" -eq 0 ]; then
