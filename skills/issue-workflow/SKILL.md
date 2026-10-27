@@ -7,9 +7,9 @@ type: Workflow
 status: live
 tags: [pipeline, issue, routing, fractal, orchestrator, entry-point]
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
-summary: "Fractal entry-point router — detects Level + complexity and dispatches to epic-workflow, project-workflow, task-workflow (micro), or task-workflow-standard (gated)."
+summary: "Fractal entry-point router — detects Level + complexity and dispatches to epic-workflow, project-workflow, task-workflow (micro), or task-workflow-standard (4 stages, research gate), or takes the decided-ruling path."
 created: 2026-07-07
-updated: 2026-09-15
+updated: 2026-10-26
 steps:
   - name: classify_ask
     type: skill
@@ -24,18 +24,15 @@ steps:
     type: skill
     gate: auto
     requires: [detect_level]
-  - name: oit_validation
+  - name: decided_ruling_check
     type: skill
     gate: auto
     requires: [detect_level]
-  - name: label_lifecycle
-    type: skill
-    gate: auto
-    requires: [detect_level]
+    produces: [lean_path]
   - name: dispatch
     type: skill
     gate: auto
-    requires: [align_inheritance_check, oit_validation, label_lifecycle]
+    requires: [align_inheritance_check, decided_ruling_check]
     produces: [routed_to_workflow]
 ---
 
@@ -79,9 +76,12 @@ issue-workflow (entry-point router)
       │
       ├── Level: epic  ──────────────▶ epic-workflow (6 stages, full depth)
       ├── Level: project ────────────▶ project-workflow (6 stages, proportional)
-      └── Level: task ────────────────▶ complexity:micro ───────────▶ task-workflow (6 stages, inline)
-                                     └── complexity:standard/complex ─▶ task-workflow-standard
-                                         (or unknown — fail-closed)      (gated: verifier gates at scope + plan)
+      └── Level: task ──┬── decided ruling (recorded) ────────────────▶ task-workflow-standard
+                        │                                              §decided-ruling path — no SCOPE stage; PLAN kept (one paragraph + contract)
+                        ├── complexity:micro ───────────▶ task-workflow (6 stages, inline)
+                        └── complexity:standard/complex ─▶ task-workflow-standard (4 stages, one
+                            (or unknown — fail-closed)      blocking pre-code round: RESEARCH →
+                                                            PLAN → PLAN-VERIFY → BUILD → PROVE)
 ```
 
 ## Level Detection
@@ -104,7 +104,9 @@ fi
 
 **Align Inheritance:** If the issue has a parent Epic (`**Epic:** docs/epics/...`), the parent's Align Decision covers this issue. Check before dispatching.
 
-**O/I/T Validation:** Verify the issue has Objective/Indicator/Target fields. If missing and no parent to inherit from, warn — consider running `issue-creation` first.
+**O/I/T — a body lint, not a stage (agent-infra#2861 §8.1).** Objective / **Indicators** (≥2) / **Targets** is a property of the issue *body*, authored by `issue-creation` §1. It is *not* a routing step: a stage that changes no state is ceremony, and the check is mechanically decidable, so the lint belongs where the body is written (creation) and where a merge is gated (`check-pipeline-compliance.sh`, step 2 of #2861). If the fields are missing and there is no parent to inherit from: **do not warn and proceed** — file/fix it via `issue-creation` or state the objective inline in the dispatch's record. A warn is the worst of the three options: it costs the read and enforces nothing.
+
+The fields are consumed downstream: **Indicators become the `R<n>` evidence** of the Review Scope Contract and **Targets become its acceptance** — which is why they are worth having, and why losing them is not a stage's job to catch.
 
 ## Dispatch
 
@@ -174,46 +176,52 @@ python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_A
 | `epic` | any | `epic-workflow` | Full: 6 stages, all review gates, 3 human gates |
 | `project` | any | `project-workflow` | Proportional: shared sub-skills, reduced depth |
 | `task` | `micro` (or all-low) | `task-workflow` | Inline: all 6 stages, no sub-skill dispatch |
-| `task` | `standard` \| `complex` (or missing/unknown) | `task-workflow-standard` | Gated: scope verifiers per `issue-scoping` §Tier Scaling, plan reviewers per `proportional-gates` §Review Cycles — before implementation |
+| `task` | `standard` \| `complex` (or missing/unknown) | `task-workflow-standard` | 4 stages: RESEARCH (checked artifact) → PLAN (scope+plan merged, declares the Review Scope Contract) → **one** PLAN-VERIFY round → BUILD → PROVE |
+| `task` | any, **decision already recorded** | `task-workflow-standard` §decided-ruling | Lean: the research *work* is skipped (the artifact is kept as `**Basis:**`), PLAN is kept (one paragraph + contract), PLAN-VERIFY → one question (see below) |
 
 **Task complexity routing rules:**
 
 - `Level: task` + `complexity:micro` → `task-workflow` (the micro pipeline).
 - `Level: task` + `complexity:standard` or `complexity:complex` → `task-workflow-standard` — **never** the micro pipeline. This is the fix for #97: all task-level issues used to run micro, skipping the verifier gates standard/complex tasks need.
-- `Level: task` with **missing/unknown complexity** → fail-closed to `task-workflow-standard` (gated is safer than skipping gates). The agent validates complexity during Scope — `issue-scoping` may downgrade to micro if the work is trivial.
+- `Level: task` with **missing/unknown complexity** → fail-closed to `task-workflow-standard` (gated is safer than skipping gates). The agent validates complexity during **PLAN** — `issue-scoping` §Tier Scaling may downgrade to micro if the work is trivial.
 
 **Reconciliation with project-workflow:** a standard/complex issue that is `Level: task` stays in `task-workflow-standard` while it remains a single atomic deliverable (no decomposition). If Scope reveals the task needs **MECE decomposition into child issues, wiring, or E2E** → escalate to `project-workflow` instead. Conversely, issues declared `Level: project` always go to `project-workflow`. The Level-detection fallback below (standard/complex → project) is a heuristic for issues missing fractal fields — an explicit `Level:` field always wins.
 
-## Label Lifecycle
+## Decided-ruling path (owner ruling 2026-10-26 #3)
 
-Prevent concurrent agent collisions on the same issue.
+**When it applies — all three must hold:**
 
-**Before dispatch:**
-```bash
-# 1. Self-cleanup stale label from crashed prior run
-gh issue view $ISSUE --json labels -q '.labels[].name' | grep -q '^implementing$' \
-  && gh issue edit $ISSUE --remove-label implementing
+1. A **recorded decision** exists in its own home: an owner ruling, a decision section of a plan doc, a decision comment on an issue, or a Tortoise point carrying one (the same definition `AGENTS.md` uses for the contradiction test).
+2. The work is to **carry it out** — the issue's ask is "implement this ruling", not "decide how".
+3. Nothing in the change **reverses** the decision. If the implementation would depart from it, that is a **reopen** in the decision's own home, not a lean dispatch.
 
-# 2. Warn if other agent has in-progress label
-OTHER=$(gh issue view $ISSUE --json labels -q '.labels[].name' \
-  | grep -E '^(scoping|planning|implementing)$' | grep -v '^implementing$' || true)
-[ -n "$OTHER" ] && echo "⚠️ Issue #$ISSUE has in-progress label(s): $OTHER — another agent may be working on it."
+**What it skips:** the RESEARCH gate and PLAN-VERIFY's three questions — they exist to *make* a decision, and the decision is already made. **PLAN is kept** (one paragraph of design + the `### Review Scope Contract`), because the contract is the review's remit and a reviewer must be able to check the work against the ruling; a one-question verifier round (*is the pointed artifact a decision that governs THIS change?*) replaces PLAN-VERIFY.
 
-# 3. Apply implementing label
-gh issue view $ISSUE --json labels -q '.labels[].name' | grep -q '^implementing$' \
-  || gh issue edit $ISSUE --add-label implementing
-```
+**What it does not skip:**
 
-**After completion** (in the workflow skill that finishes the work):
-```bash
-gh issue edit $ISSUE --remove-label implementing
-gh issue edit $ISSUE --add-label implemented
-```
+- **One paragraph of design** in the artifact, naming the decision and the file it lives in (so a reviewer can check the work against the ruling rather than against taste);
+- the `### Review Scope Contract` (`review-discipline`) — the risk surface of *carrying out* a decision is still real;
+- **PROVE** — tests, mutation proof for fail-closed branches, and the exact-head code review + attestation;
+- any `AGENTS.md` hard rule the change touches (surface approval, worktree isolation, never edit a PR body after recording a review).
 
-**On early exit:** Remove `implementing` — don't leave orphaned in-progress labels.
-```bash
-gh issue edit $ISSUE --remove-label implementing || true
-```
+**The research artifact is satisfied by the decision reference** — checkably, not by self-certification: the `<!-- research: v1 -->` block may carry `**Basis:** <resolvable pointer>` (an `owner/repo#N`, a `**Decision:**`/`OVERRIDES:` line, a decision comment, a Tortoise point of decision type, or a `docs/plans/<file>.md#<section>` that **exists** — it must resolve *to a decision*, not merely to a document) in place of the citation fields, but `FALSIFIER:` and `Gaps:` stay — carrying out a decision can still be wrong. A `**Basis:**` that does not resolve, or a "decision" that is the lane's own judgement, is **not** this path: run the normal pipeline. Ambiguous → not lean. Step 2 of #2861 makes the merge gate check the pointer resolves.
+
+**Signature in the artifact:** a lane on this path writes `Path: decided-ruling (<decision location>)` in the same comment that carries the Review Scope Contract. A lane that writes it without a resolvable decision location has **not** taken this path — it has skipped the gate.
+
+## Label Lifecycle — DELETED (agent-infra#2861 §8.2). Do not re-add it.
+
+`implementing` / `scoping` / `planning` — and `planned`, removed in the same pass — had **no reader anywhere in the fleet**: 16 write commands across 4 skills, zero reads (no label filter, no gate, no report). Worse, the block's first step removed `implementing` **unconditionally** before checking who held the issue — so lane B stripped lane A's only marker while A was working, i.e. the mechanism could silently delete the one thing it provided.
+
+**Ownership is not a label.** Use the mechanisms that actually decide it. Both the pre-flight and `who-is-on.sh` live in a **tortoise** checkout — resolve that path exactly as the pre-flight block above does (`$TORTOISE`, else the cwd's main-checkout sibling `tortoise`, else `$HOME/Documents/GitHub/tortoise`); a bare `tools/…` is relative and resolves to nothing:
+
+| Question | Mechanism |
+|---|---|
+| May I dispatch on #N at all? | `"$TORTOISE"/tools/collision_preflight.py <N> --repo <owner/name>` — exit 0 is the only dispatch authorisation (below); its claim gate reads the **holder**, not labels and not comment prose (#8175) |
+| Who is on #N right now? | `bash "$TORTOISE"/tools/who-is-on.sh <N> --repo <owner/name>` — sees local-only branches and worktrees a label never could |
+| Cross-box claim on a PR head | `refs/claims/<pr>-<sha12>` via `agent-infra:scripts/orchestrator-harness/claims.sh`, read by `agent-infra:tools/fleet/claim_lanes.py` — both live in **agent-infra**, not the tortoise checkout |
+| Stranded local work | `bash "$TORTOISE"/tools/who-is-on.sh --inventory` |
+
+**Accepted risk:** a human loses the one-glance "someone is on this" marker *on the issue page*; the verb above answers the same question better but must be asked. Tracked in agent-infra#2861 §8.2 — reopen there if the glance matters more than the coordination.
 
 ## Branch + Worktree Isolation
 
@@ -314,6 +322,9 @@ After dispatching, the workflow skill handles all phase transitions. Do NOT paus
 | "Level: task always means the micro pipeline" | Task dispatch depends on complexity: `micro` → task-workflow, `standard/complex` → task-workflow-standard (gated). |
 | "complexity:micro means I can skip the pipeline" | Task-workflow still runs all 6 stages inline. |
 | "This issue has no fractal fields — I'll just start coding" | No fields → run issue-creation first, then route. |
+| "The decision is obvious, so I'll skip scoping and planning" | Then it is a **decided-ruling** — take that path, which still costs a Review Scope Contract and PROVE. "Obvious" without a recorded decision is not the path; it is the bypass. |
+| "A label says someone else is working on it, so I'm blocked" / "No label, so it's free" | Labels carry no ownership (deleted, #2861 §8.2). Ownership is the pre-flight's holder and `who-is-on.sh`. |
+| "Research is in the brief, so the research gate is satisfied" | The gate reads an artifact **you** post with citations and a falsifier. A brief is context, never a substitute. |
 
 ## Red Flags
 
@@ -327,6 +338,7 @@ After dispatching, the workflow skill handles all phase transitions. Do NOT paus
 - `../project-workflow/SKILL.md`
 - `../task-workflow/SKILL.md`
 - `../task-workflow-standard/SKILL.md`
+- `../review-discipline/SKILL.md` — artifact class → canon → the questions its reviewer asks (declares the Review Scope Contract)
 - `../issue-creation/SKILL.md`
 - `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d`
 
