@@ -226,7 +226,8 @@ channel verdicts — the first one **is**, and it is listed with them only to sa
   **both** of those gone, the surface left is the **display** the same render prints (`cmux surface open
   <vm>/display/display:1` — a noVNC console that was live on cell-4 while its `cmux-tui` port was refused; that is **Mac-CLI
   syntax**, and from inside a cell `cmux surface …` is `unknown resource scope "surface"` — the guest-side equivalent is the
-  `cmux layout apply` noted below). Beyond that the
+  `cmux layout apply` noted below — **and only where the guest CLI runs at all: on the shape described two bullets down,
+  where it does not, `tmux` is what starts a worker, not any guest `cmux` verb**). Beyond that the
   levers are provider-level (step 3) and owner-level (a plan change or a **recreate** — and a recreate is the one step here
   that can destroy unpushed work, so run the work-at-risk check below first).
 - **`cmux vm tree` printing `(no terminals)` is not a reading of the box** when the same render shows a link error or a null
@@ -239,7 +240,7 @@ channel verdicts — the first one **is**, and it is listed with them only to sa
   `surface` scope at all (`cmux surface ls` → `cmux: unknown resource scope "surface"`), and the guest-side equivalent is
   `cmux layout apply` with a one-surface layout, which produces the same artifact — a shell in the cwd plus a command typed
   into it. `scripts/orchestrator-harness/worker-terminal.sh:30-32` carries that correction with its own measurement).
-  ⛔ **The guest-CLI advice here and in the next bullet assumes the guest CLI RUNS AT ALL, and on a measured cell shape it does
+  ⛔ **The guest-CLI advice in this bullet and every bullet above assumes the guest CLI RUNS AT ALL, and on a measured cell shape it does
   not:** `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui` — the `cmux-tui` symlink dangling and no daemon
   process (agent-infra#2368; the same measurement as `worker-terminal.sh:168-171` and `scripts/orchestrator-harness/README.md:568`).
   On such a box every guest verb below is unavailable, and that error reads as a broken box rather than the known install shape
@@ -307,8 +308,11 @@ none of the reclaim steps below touch it.
    cmux-tui-daemon.service` **and** a fresh registry under `sessions/` **and** the `df` you came for — `df` alone cannot
    tell "reclaimed" from "reclaimed and now dead", and a failed start is the moment to escalate, not to recreate. A **recreate**
    is the bigger hammer and takes the whole guest: every worktree (the unpushed commits that check exists for), `keys.env`, the
-   harness pin, and `orchestrator/logs` + `orchestrator/state` (the `merge-*.log`, `orch-loop.log`, `landed.txt`,
-   `dispatched.txt` — the evidence §4/§5 use to say what happened).
+   harness pin, `orchestrator/logs` + `orchestrator/state` (`merge-*.log`, `orch-loop.log`, the `state/` series), **the
+   `orchestrator/*.txt` ledgers that sit directly under it** — `dispatched.txt`, `landed.txt`, `checked.txt`,
+   `candidates.txt`: `install.sh:649-650` creates them BESIDE `logs/` and `state/` and `wip/`, not inside them, so a check that
+   reads only `state/` and `logs/` misses the evidence §4/§5 use to say what happened — and **`orchestrator/wip/`**, the
+   cap-killed lanes' dirty-work captures.
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -574,10 +578,16 @@ not a load average measured earlier.
     [ -n "$R" ] || continue
     ( REPO=$R bash "$W" ) || { s=$?; [ "$s" -gt "$rc_all" ] && rc_all=$s; }
   done <<< "$POP"
-  for f in "$CELL_HOME"/keys.env "$CELL_HOME"/orchestrator/state "$CELL_HOME"/orchestrator/logs; do
+  # ⛔ `orchestrator/wip/` and the `orchestrator/*.txt` ledgers are NOT optional extras on this list. `install.sh:649-650`
+  # creates `logs/ state/ wip/` plus `candidates.txt dispatched.txt checked.txt` SIDE BY SIDE under `$O`, and `wip/` holds the
+  # only copy of a cap-killed lane's dirty work (`spawn-gate.sh:843` writes `wip/capwip-<stamp>-<pid>/`; the README's state
+  # table documents it). A list of three named paths was the list that lost them.
+  for f in "$CELL_HOME"/keys.env "$CELL_HOME"/orchestrator/state "$CELL_HOME"/orchestrator/logs \
+           "$CELL_HOME"/orchestrator/wip "$CELL_HOME"/orchestrator/*.txt; do
     # outside every repo, so no worktree read can see these. Their PRESENCE is work at risk and must move the CODE: printed
-    # alone with rc=0 the caller proceeds with the recreate and destroys exactly the three paths this line names — which is
-    # the "stdout says at risk while it exits 0" failure stated three paragraphs up.
+    # alone with rc=0 the caller proceeds with the recreate and destroys exactly the paths this line names — which is
+    # the "stdout says at risk while it exits 0" failure stated three paragraphs up. The `*.txt` arm is a GLOB on purpose:
+    # the next ledger the harness adds is then covered without an edit here, and a transcribed list is how one goes missing.
     [ -e "$f" ] && { echo "BOX-AT-RISK $f"; rc_all=2; }
   done
   echo "GUEST VERDICT $rc_all"; exit "$rc_all"
