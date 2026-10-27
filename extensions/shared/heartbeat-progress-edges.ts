@@ -673,6 +673,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "the merge gate's derivation FAIL-SAFE (#1167): the bound used when the per-shard derivation is unavailable. The shipped default (3900 s) is deliberately well above RERUN_FLOOR's 1200, because a derivation that failed must never produce a SMALL bound. Env seam ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK; behaviour pinned by tests/admin-merge/run.sh §41.",
   },
+  {
+    name: "QUEUE_STUCK_AFTER_S",
+    owners: ["scripts/ci_runner_gate.sh"],
+    value: "${CI_GATE_QUEUE_STUCK_AFTER_S:-1800}",
+    axis: "gate",
+    guardedBy:
+      "scripts/ci_runner_gate.test.sh (#2904: a stalled queue takes the fallback path, a deep-but-serving queue and a young queue take NO action, an unreadable floor exits 2, plus the age-only mutant that proves the conjunction is load-bearing) + this registry's forward check pins the shipped default",
+    note: "the CI runner gate's ABSORPTION floor (agent-infra#2904): how long a QUEUED run may wait while NOTHING is executing before GitHub-hosted is called unhealthy and the gate takes its own existing fallback path. The clock is QUEUE WAIT — `now - created_at` of a still-queued run — NOT run duration: `run_started_at` is not a dispatch marker for a queued run (measured, run 40508520800: created 13:01:55Z, run_started_at 13:01:55Z, first job dispatched 13:23:59Z). Shipped default 1800 s, drawn from the same repo's own measurements: 12,624 of 13,000 sampled runs waited 0 s, and the longest gap between run starts while runs were still being created was 920 s. ⛔ IT IS DELIBERATELY NOT NAMED `*_STALL_THRESHOLD`: that phrase is #847's single authority, and the boundary test above refuses a term carrying `/stall_?threshold/i` WHILE holding a value here — this bound is owned HERE, so the honest option is a name the reverse scan can still see (`STUCK` is a declared family token, `_S` a declared bound suffix) and a registered value, not a `value: null` pointer that would falsely claim #847 owns it.",
+  },
   // — reap axis (interactive session reaper) —
   {
     name: "REAP_IDLE_HOURS",
