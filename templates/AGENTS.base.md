@@ -391,8 +391,9 @@ This is bounded hard, and a lane that reads it as a general licence has read it 
   so re-record after every fix.
 - **Reproduce THAT lane's own steps and post their output.** *"It's docs-only"* is not evidence; the lane's
   own steps are — for tortoise's `docs` job, the conflict-marker check, the generated-artifact `--check`s,
-  markdownlint, the link check, **and** the docs-lint baseline that consumes them (read the job in the repo
-  you are in — `docs` is not the same job everywhere; agent-infra's is a `lychee-action` call with no pin).
+  markdownlint, the link check, **and** the docs-lint baseline that consumes them. That list is tortoise's
+  as of this writing, not a spec: read the job in the repo you are in, because `docs` is not the same job
+  everywhere (agent-infra runs no docs lane of its own — it ships `docs-ci.yml` to consumers).
   A step that cannot be reproduced on this host is **declared, not skipped** — tortoise's
   `.github/scripts/docs-link-check.sh` pins only the x86_64/aarch64 **Linux** assets, so a macOS `arm64`
   host has no pinned `lychee` (its `DOCS_LINK_CHECK_LYCHEE=<path>` seam is the supported way to supply
@@ -402,7 +403,7 @@ This is bounded hard, and a lane that reads it as a general licence has read it 
   class as bureaucracy *for a diff they cannot test*; it does not license skipping a check that could catch
   this change.
 - **Do not make bypassing a local safety gate a habit.** The ruling names the QUEUE as the blocker; it never
-  authorises routing around the `#1484` script-backdoor guard, and the admin-merge override is a
+  authorises routing around the `tortoise#1484` script-backdoor guard, and the admin-merge override is a
   **disclosed** exception whose audit record is the whole point — not a quiet way to skip review.
 
 ---
