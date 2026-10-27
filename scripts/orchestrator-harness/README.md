@@ -213,6 +213,7 @@ means it runs once" is wrong (research: agent-infra#1709).
 | `claim-reaper.sh` | R4's release half: a claim is released only when its holder is demonstrably GONE — 7 stale refs on a box with 0 live lanes made the fleet originate nothing (§7.2b, measured 2026-10-21) |
 | `lane-container-reap.sh` | the leaked test-DB reaper (#2868): removes a lane's private `fdb-lane-*` / `*-pg` / `*-fdb` / `falkordb-6673-*` / `tortoise-ci-*` container ONLY when the owning lane is provably gone — the slug is absent from `git worktree list` (or the PR has no `refs/claims/` snapshot), no live process holds the name, AND the container is past the age bound. **Dry run by default** (`--apply` arms it); all three proofs must hold, and an unreadable `docker ps`/`ps` aborts the whole pass (exit 3, `CANNOT-VERIFY`) rather than reaping blind. Shared instances (`falkordb`, …) are protected by name and never candidates. Its test suite is a mutation suite: every deletion gate reddens when reverted |
 | `live-ownership.sh` | R2/R3's predicate as a live fact: "owned" means a LIVE PROCESS is working the PR, not that a registry says so; it supplies the sweep order and the un-owned count (§7.2f) |
+| `worker-supply.sh` + `install-worker-supply.sh` | the SUPPLY half of the repair pool (agent-infra#2700): the doctor CLASSIFIES orders and places at most one pass worth; without a supplier the pool empties and every later pass prints `undeliverable` with `inflight=0`. This re-offers the DEAD orders through the one dispatcher, on a 60 s clock, under the machine's own `fix + review` budget |
 | `merged-not-closed.sh` | the question no other tool could answer — which OPEN issues already have a MERGED PR (tortoise#8468). Without it, finished work sits in the priority queue looking untouched |
 | `cycle-record.sh` | the self-dispatch proof: one record per controller cycle, and a verdict that refuses to call an absent or stale record healthy (§9) |
 | `repo-slug.sh` | the one `owner/name` resolver the controller and the candidate pool read; its one deliberate exception (`cloud-cell-supervisor.sh`'s own copy) is held in lockstep by `test-gates.sh`, not by prose |
@@ -2399,6 +2400,125 @@ finite `K` and by `spawn-gate.sh`'s own load and disk gates (every spawn still p
 `nonblocking-dispatch.sh` → `run_agent`), and one pass per repo is **#2281**'s subject, not this
 mode's. Said here because this section is where the next reader of the mode looks.
 
+### The SUPPLY half — a pool that refills itself (`worker-supply.sh`)
+
+`pr-doctor` CLASSIFIES the open-PR queue and places at most one pass worth of orders. **Nothing
+supplied the workers those orders needed**, and the measured shape is a pass that grades work and can
+place none of it (2026-10-27T03:30Z–03:45Z, three consecutive passes on the operator's Mac):
+
+```
+pass: 22 open PRs :: rerun-checks=6 resolve-conflict=10 skipped-running=6
+      (capacity fix=16 review=12, inflight=0 (alive=0 unknown=0), budget fix=16 review=12 total=28)
+REFUSING: 16 order(s) no worker accepted and nothing was dispatched -- not a clean pass
+EXIT rc=3
+```
+
+Capacity was configured, orders were graded, workers were zero — and five hours earlier the same daemon
+logged `dispatched 3 of 4 queued — ok`, so the pool EXISTED and EMPTIED. Dispatch was the only thing
+that had ever created a repair worker: supply existed exactly as often as a pass found actionable PRs
+*and* could place them. A worker killed mid-order (a machine sleep, a cap kill, an OOM) leaves
+`$O/bg/<name>.started` behind with no process, and its PR then waits for the doctor's own 45-minute
+cooldown and for a later pass that can still place work.
+
+`worker-supply.sh` is that supply half and nothing else. It walks the ORDER POPULATION
+(`$O/bg/prd-*.started`, the dispatcher's own acceptance record), asks the HARNESS for each order's
+liveness (`nonblocking-dispatch.sh --status <name>` — the same reader `pr-doctor.worker_live()` asks, so
+the two cannot disagree), and re-offers the DEAD ones **through the one dispatcher, with the argv that
+dispatcher itself recorded** (`name worktree prompt cap kind`).
+
+⛔ **AND THE LIVENESS QUESTION IS ASKED OF THE WORKTREE, NOT OF ONE NAME.** `pr-doctor.worker_name()`
+is MODE-QUALIFIED (`prd-<tag>-42` in a multi-repo pass) while the worktree is `prd-42` in **both**
+modes, so two orders can name one directory — the #2280 defect, which `worker_live_for()`
+(`pr-doctor.py:3526`) fixes on the doctor's side and which this supervisor must not reintroduce one
+layer down (`nonblocking-dispatch.sh` performs **no** liveness check of its own, so this is the only
+guard there is). Before every re-offer it asks `--status` for **every order that records the same
+worktree**, plus the doctor's own alias `prd-<n>` when that differs from the order's name: a `running`
+holder refuses the re-offer (`live`, the slot is held), and an unanswerable holder refuses it too
+(`unknown`) — an unreadable other name is never a licence to spawn blind. `worker-supply.test.sh`
+case (d2) pins all three arms and reddens when the guard is removed.
+
+```bash
+bash worker-supply.sh status     # the last pass record + a FRESH live count — the record is not the reading
+bash worker-supply.sh heal       # one pass, now (`refill` / `--once` are the same verb)
+bash worker-supply.sh --dry-run  # decide and print; spawn nothing, write no ledger row
+bash worker-supply.sh --loop     # what the service runs: pass, sleep INTERVAL, repeat
+```
+
+⛔ **THE KNOBS ARE VALIDATED WHERE THEY ARE ENFORCED, NOT ONLY WHERE THEY ARE RENDERED.** Both units
+render `WORKER_SUPPLY_INTERVAL_S` / `WORKER_SUPPLY_PREFIX` / `WORKER_SUPPLY_MAX_REFILLS` into `Environment=`,
+but the environment is not the only way in (an operator, a shell profile, or a hand-edited unit can set
+them directly), so `worker-supply.sh` re-validates **every numeric knob** at startup against `valid_num()`
+and falls back to the shipped default with a `knob:` line — `status` prints the resolved values
+(`knobs: interval_s=… max_refills=… prefix=…`), because what the unit renders and what is enforced are
+different facts once an override is rejected. Every one of these failure modes is FAIL-OPEN and was
+found by review: a non-numeric `MAX_REFILLS` makes the per-order crash-loop bound INERT (`[ <n> -ge two
+]` never parses, so every dead order is re-offered for ever); a non-numeric or zero `INTERVAL_S` makes
+`sleep` return at once, i.e. a hot loop rather than a cadence; a non-numeric `LOCK_MAX_S` makes the lock
+age test fail to parse, so a **pid-less lock is taken over while its holder is alive** — the double
+supervisor the guard exists to refuse; a non-numeric `STALE_SLACK_S` names a variable under `set -u` and
+kills the probe; and `SPAWN_TIMEOUT_S` / `PROBE_TIMEOUT_S` / `LOG_MAX_BYTES` lose their bound silently.
+The INSTALLER refuses the same values at render time instead — refusing is right for an install question
+and wrong for an already-running supervisor, which must keep supplying.
+
+⛔ **AND A PASS THAT COULD NOT READ THE POOL DOES NOT CALL ITSELF CLEAN.** `live=0 dead=0 unknown>0` with
+nothing refilled is `decision=unreadable`, rc=2 ("a read a pass needs could not be taken") — the same law
+as the doctor's `REFUSING` line, not a green tick over a pool nobody could read. A worktree holder whose
+liveness is unreadable keeps its order counted as dead; it is not quietly subtracted from the census.
+
+**A worker is ACCEPTED by a FILE, never by a return code.** The dispatcher writes `$O/bg/<name>.pid`
+and `.started`; `--status` then answers `running`, and `pr-doctor.worker_live_for()` — the doctor's own
+accept check — returns `True`, so the order stops being `undeliverable`. The supervisor therefore
+re-asks `--status` after every re-offer and records nothing on an unconfirmed one: `running` is LIVE
+(holds a slot, never re-offered), `done` is COMPLETE (the brief RAN — the doctor's next pass re-grades
+that PR against its new head, checks and cooldown, and replaying a finished order would bypass that),
+`failed|lost` is DEAD (re-offerable, bounded by `MAX_REFILLS`), and **anything unreadable is
+UNKNOWN and spawns nothing** — a second worker into one deterministic worktree destroys the first one's
+log/.rc/.pid, which is the doctor's own measurement, not a style preference. A `running` past the
+order's cap+slack is reported as `stale-claim` and acted on by nothing, because a late refill costs an
+interval while a double spawn destroys a live worker.
+
+| self-heals | does NOT self-heal |
+|---|---|
+| a DEAD order (the worker crashed `failed`, or died `lost`) — re-offered within one interval | an order that COMPLETED (`done`): the doctor re-grades that PR on its next pass, and a replay would re-execute a finished brief |
+| a supervisor that crashed, was killed, or exited 0 (both units `Restart=always` / `KeepAlive`) | a `contract_note()` refusal (#2518): the repo's required-check/human-gated declaration is a HUMAN's to supply |
+| a stale lock whose holder is gone (CAS takeover, bounded by `LOCK_MAX_S`) | a checkout it cannot read (`has no readable 'origin' remote`) — no worktree can be materialised |
+| a loop that stops on SIGTERM (the trap EXITS; the interval is `wait`ed, not `sleep`t through) | an order whose recorded worktree is gone or now on ANOTHER branch — the PR must be re-classified, not replayed |
+| an unchanged unit re-installed (byte-identical ⇒ no reload, no restart of a healthy supervisor) | an order that spent `MAX_REFILLS` (2): a worker that keeps dying is a DIAGNOSIS, and the pass names it |
+
+Anti-goals, stated so they are not "fixed" later: it spawns `pi` never, calls `gh` never, records no
+review and lands no PR. It pre-empts nothing — when the pool is full it DEFERS and says so. And
+`fix + review` is the machine's ONE budget (`MAX_FIX`/`MAX_REVIEW`, read from the orchestrator plist, the
+same source `pr-doctor.capacity()` reads) — neither shipped unit sets it, so there is no second copy to
+drift.
+
+**Install — one command per platform, and it converges (re-run it after a merge, it is idempotent):**
+
+```bash
+# Linux (systemd) — renders the unit from machine state and enables it; `--status` reports installed/enabled/active
+bash scripts/install-worker-supply.sh --install
+
+# macOS (launchd) — the ONE launchd installer; it renders templates/launchd/*.plist, including
+# com.eldato.worker-supply.plist, and reloads only on change (scripts/install-worker-supply.sh REFUSES on
+# Darwin and names this command rather than shipping a second launchd path)
+bash scripts/install-launchd.sh
+```
+
+⛔ **`KillMode=process` in the systemd unit is load-bearing, not tidiness.** A pass re-offers an order by
+BACKGROUNDING a worker and returning; under the default cgroup teardown the end of that pass SIGTERMs
+the worker it just started — the measured #2716 shape (two workers "launched, running", 0-byte logs,
+`is-active=active`). `worker-supply.test.sh` pins it, along with `Restart=always` (the measured failure
+is an ORDERLY exit with nothing coming back, which `on-failure` reproduces byte for byte) and the
+absence of a rendered `MAX_FIX`/`MAX_REVIEW`.
+
+```bash
+bash scripts/orchestrator-harness/worker-supply.test.sh   # hermetic; asserts its own wall-clock bound
+```
+
+The suite grades the shipped supervisor against a stub dispatcher that mirrors the real one's grammar
+AND its file-descriptor discipline (`exec >/dev/null 2>&1` in the worker), asserts the doctor's OWN
+reader flips `absent → live`, and carries two mutations — neuter the refill step and the refill case
+reddens; delete the single-instance guard and the two-supervisor case reddens.
+
 ### WHICH CONTRACT A PASS JUDGES BY — resolved, or refused (agent-infra#2518)
 
 Resolving the repo is not the whole decision: `objective.py` also holds the **contract** a PR is
@@ -4400,6 +4520,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `merge-reminder.py` | the fleet's **10-minute merge reminder, with a narrow evidence-gated ACTUATOR arm** (#2603, §6.5.9). Answers three questions — closest to landing, merged-but-not-LIVE, and one red shared across PRs — and on a complete-evidence GO dispatches `scripts/admin-merge.sh <PR> --repo …` (never a merge of its own, never an override). Its emitted line carries the MEASURED readings (`reds=0 in-flight=21 attested@head=no claim=none rail=idle`); an unread value is `UNREADABLE` and dispatches nothing. Cost-bounded: `rate_limit` FIRST, ≤9 metered REST calls (the 9th is the per-candidate mergeability read, which the LIST endpoint does not compute), a thin budget SKIPS the cycle by name. Runs from launchd (macOS) or a systemd-user/cron timer (Linux): `--install-timer` / `--uninstall-timer`. Not part of the loop |
 | `box-status.sh` | ONE box's harness identity (`harness: <sha> [current|behind|ahead|diverged|unknown] source=<pin|stamp|none>`), the stamp and pin beside it, `controller: RUNNING(pid …)|STOPPED`, **`running: <sha12>|NONE|UNREADABLE|MIXED`** — the commit the RUNNING controller's own argv resolves to, which is what "activated" means (`harness-refresh.sh` calls the pin-ahead-of-process state `restart-pending`; the pin alone certified a box as `deployed AND activated` while it executed pre-fix code, #2680) — the repo it compares against is resolved `HARNESS_REPO`-first / the payload's own checkout / this script's own checkout / the conventional `$HOME/orchestrator` — and every candidate must CARRY the harness — `scripts/orchestrator-harness/box-status.sh` **tracked as a regular file at exactly that path by the candidate's own repo** (`git ls-files -s`: index mode `100644`/`100755` **and** the recorded path equal to the marker, so a prefix match is not the file), which skips a checkout that is merely *some* repo, one that only reaches the harness through the gitignored `scripts -> $AGENT_INFRA_PATH/scripts` pointer every tortoise/eldato checkout carries (#9475), one that tracks a SYMLINK (mode `120000`) or a GITLINK (`160000`) at the marker path and so ships no harness bytes, and one whose marker path is a DIRECTORY (the index records a nested file) — none of them can be read as the harness repo (#2679); a subdirectory candidate is ACCEPTED, the same as `harness_repo_of()` (a literal-path test refused what `harness-refresh.sh` and `check-deployed-drift.sh` accept), and a refused candidate is NAMED on `ref:` (`ref: UNRESOLVED (--repo: … has NO INDEX ENTRY for …)` / `(… not a TRACKED REGULAR FILE there (mode …))` / `(… records … instead …)`) instead of leaving the line out, because an absent line reads as "no opinion" when the answer is "compared against nothing" — and `roles: idle|busy:<role>(pid=…,age=…)` from the doctor's own role locks. Exit 2 = CANNOT VERIFY — an unanswered identity is never `current`. This is the deploy arm's evidence, so it refuses to answer from an unread process table — and it reads the controller's argv as NUL-separated fields (`/proc/<pid>/cmdline`, `mapfile -d ''`), not a whitespace split, because a harness path may contain a space and a split one answered `running: UNREADABLE` for an ACTIVATED box; the `ps` fallback has no NUL-preserving form, so a space there yields UNREADABLE rather than a wrong tree, never a guess. `MIXED` is driven directly by two real trees in the suite, not only reached through a stub |
 | `merge-reminder.test.sh` | #2603: drives the shipped reminder through EVERY gate with a fixture reviews dir, a stub `gh`/`ps`/rail and a REAL `refs/claims/*` ref — attested+quiet dispatches; `attested=stale`, `in-flight=3`, `reds=1`, a held claim, a live rail and a `mergeable=null` each refuse BY NAME and dispatch nothing; `rate_limit` is the FIRST call and a thin budget spends nothing else; the grouping rule is pinned both ways (a re-run to success is not red; a same-named job in another workflow cannot mask a red); the deploy arm refuses a mid-flight role pass and otherwise dispatches the box's own verb and VERIFIES it by artifact; two MUTANTS prove the gates are live. A CI shard |
+| `worker-supply.sh` | **the SUPPLY half of the repair pool** (agent-infra#2700, §"The SUPPLY half"): walks the ORDER POPULATION (`$O/bg/prd-*.started`, the dispatcher's own acceptance record), asks the HARNESS for each order's liveness (`nonblocking-dispatch.sh --status` — the reader `pr-doctor.worker_live()` asks, so the two cannot disagree), and re-offers the DEAD ones **through that same dispatcher with the argv it recorded** (`name worktree prompt cap kind`), never spawning `pi` and never calling `gh`. Polarity: `running` LIVE · `done` COMPLETE (the brief ran; the doctor re-grades the PR — supply never replays finished work) · `failed|lost` DEAD · unreadable UNKNOWN (spawns nothing — a second worker in one deterministic worktree destroys the first's log/.rc/.pid) · `running` past cap+slack is a REPORT (`stale-claim`), never an action. ⛔ The liveness question is asked of the **WORKTREE, not of one name** (#2280): `pr-doctor.worker_name()` is mode-qualified while the worktree is `prd-<n>` in both modes, so before re-offering an order the supervisor asks `--status` for every order recording the same worktree PLUS the doctor's alias `prd-<n>` — a `running` holder refuses (`live`, slot held) and an unanswerable holder refuses too (`unknown`). A re-offer ACCEPTED but already ENDED (a fast-failing worker that left a `.rc`) is written to the ledger and is **not** counted as a live slot. One pass = `refill`/`heal`; `--loop` is the service, `status` prints the last record PLUS a fresh count, `--dry-run` writes NOTHING (no ledger row and no pass record — the record is the last REAL pass's evidence). Single-instance guard is an atomic `mkdir` + pid + CAS takeover, and SIGTERM EXITS (a trap that only released the lock left the loop running without its guard). Budget = `fix + review` from the orchestrator plist — the ONE source `pr-doctor.capacity()` reads, never rendered into a unit. Exit `0` pass · `2` refusing · `3` undelivered · `4` already-running · `6` deferred (dead orders remain — a pass that re-offered SOME is still a `6`, because a bounded pass is not a clean one). Installed by `scripts/install-worker-supply.sh` (Linux/systemd) or `scripts/install-launchd.sh` (macOS) |
+| `worker-supply.test.sh` | the #2700 contract, DRIVEN (not grepped): a stub dispatcher that shares the REAL one's grammar **and its fd discipline** (`exec >/dev/null 2>&1` in the worker — without it the supervisor's captured call blocks for the worker's whole life, which is how the first attempt at this fix died inside its own suite at 45+ minutes), the doctor's OWN `worker_live_for()` imported from the shipped `pr-doctor.py` and asked before/after as the accept check (`absent → live`), the single-instance guard BOTH ways (a second supervisor exits 4 and touches no worker; a stale lock is taken over), the bounded SIGTERM stop, the budget (2 spawns for `1+1` against 4 dead orders, `rc=6` and the bound named), mid-order death re-offered EXACTLY once (then twice, then stopped at `MAX_REFILLS`), the plist/env precedence pinned against `pr-doctor.capacity()`, the unit/plist properties (`--loop`, `KillMode=process`, `Restart=always`, no rendered `MAX_FIX`), the installer's one-command render + its Darwin refusal, **two MUTATIONS** (neuter the refill → the refill case reddens; delete the lock → the two-supervisor case reddens) and **its own wall-clock bound** (asserted ≤60 s, measured ~27 s). Hermetic, a CI shard |
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;
