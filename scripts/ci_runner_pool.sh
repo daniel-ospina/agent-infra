@@ -87,7 +87,10 @@
 #                                                  duplicate.)
 #   ci_runner_pool.sh add      --name <name> [--dry-run]
 #   ci_runner_pool.sh restart  --name <name> [--dry-run]
-#   ci_runner_pool.sh reconcile [--dry-run]        # the pass: restart dead listeners, add to ceiling
+#   ci_runner_pool.sh reclaim  [--name <name>] [--dry-run]
+#                                                 # RETIRE a registration GitHub deleted (see R1)
+#   ci_runner_pool.sh reconcile [--dry-run]        # the pass: restart dead listeners, RETIRE what
+#                                                 # cannot be revived, then add to the ceiling
 #
 # ENV: RUNNER_ROOT (the directory that CONTAINS the instance dirs, one level above them; default
 #        /tmp/actions-runner, where this tool puts what it creates — a root that excludes a LIVE
@@ -100,6 +103,7 @@
 #        first name and failing the rest)
 #      RUNNER_LABELS (overrides the derived self-hosted-<arch> marker; must still contain it)
 #      POOL_PREFIX (default pi-runner-<host>) · RUNNER_START_SETTLE_S (5)
+#      RUNNER_MAX_SKEW_S (120) — the clock-skew bound a retirement is gated on (see `reclaim`)
 #
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act — nothing changed, EXCEPT a registration
 #       the message names explicitly (a `.runner` written before its listener failed) · 3 REFUSED,
@@ -111,6 +115,10 @@
 #       it left no `.runner`): a per-name failure, so the pass tries the next name rather than ending
 #       ⛔ 4 IS CHECKED BEFORE 3: a name that is already taken reports 4 even on a box that is also
 #       at/below a gate, because the name condition is a fact about the request, not the box.
+#       · 6 PROVABLY ORPHANED — the listener started and GitHub refused the session because the
+#       registration no longer exists server-side (`restart`, `reconcile`). It is NOT 2 (nothing was
+#       measured wrongly: this IS the measurement) and NOT 3 (no gate refused it): a scheduler must be
+#       able to branch on "recover with `reclaim`". `reclaim` is the only verb that repairs it.
 #
 # `status` exits 3 when it produced a report in which at least one listener is DEAD — a report is
 # still a report, but a dead listener is a fact a caller must be able to branch on without parsing
@@ -132,13 +140,20 @@ RUNNER_TEMPLATE="${RUNNER_TEMPLATE:-$RUNNER_ROOT/_template}"
 MEM_FLOOR_MB="${RUNNER_MEM_FLOOR_MB:-3584}"   # 3.5 GB, the floor the gate refused at (#2373)
 CORES_PER_SLOT="${RUNNER_CORES_PER_SLOT:-3}"  # 8 cores -> 3 slots, 4 cores -> 2 (owner sizing)
 SETTLE_S="${RUNNER_START_SETTLE_S:-5}"        # how long a just-started listener gets to appear
+# The largest clock skew a RETIREMENT may be taken under. GitHub refuses a session on a skewed clock
+# and the listener prints the SAME "registration has been deleted" line it prints for a genuinely
+# deleted registration (actions/runner#4648, #1798) — so the evidence `reclaim` acts on is only as
+# good as the clock that produced it. 120 s is wide enough for any unsynchronised-but-working box and
+# far below the interval at which a session is refused for skew.
+MAX_SKEW_S="${RUNNER_MAX_SKEW_S:-120}"
+CLOCK_PROBE_TIMEOUT_S="${RUNNER_CLOCK_PROBE_TIMEOUT_S:-10}"
 POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"
 GH_CMD="${RUNNER_POOL_GH:-gh}"
 POOL_LABEL_X64="self-hosted-x64"
 POOL_LABEL_ARM64="self-hosted-arm64"
 
 DRY=0
-MEM_MB=""; NCPU=""; CEILING=""; LISTENER_PID=""; SLOTS=""
+MEM_MB=""; NCPU=""; CEILING=""; LISTENER_PID=""; SLOTS=""; SLOT_REGS=""; SLOT_ORPHANED=""
 
 say() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
@@ -177,6 +192,12 @@ is_uint() {
 validate_operands() {
   if ! is_uint "$SETTLE_S"; then
     err "cannot-measure why=settle-unreadable value=${SETTLE_S:-<empty>} (RUNNER_START_SETTLE_S must be a positive integer of seconds)"; return 2
+  fi
+  # The skew bound is compared against a measured number, so an unreadable one is the same class as
+  # the settle operand: a typo must not silently widen (or disable) the guard that stands between a
+  # bad clock and an irreversible deletion.
+  if ! is_uint "$MAX_SKEW_S"; then
+    err "cannot-measure why=skew-bound-unreadable value=${MAX_SKEW_S:-<empty>} (RUNNER_MAX_SKEW_S must be a positive integer of seconds)"; return 2
   fi
   # ⛔ THE REPO IS AN OPERAND TOO, and it now has TWO consumers: the `gh` token path
   # (`repos/$POOL_REPO/...`) and the registration URL (`https://github.com/$POOL_REPO`). A URL-form or
@@ -276,7 +297,26 @@ registered_dirs() {
     # ⛔ READ **AND** SEARCH: a dir with `r` but not `x` (mode 444) passes `-r` and then fails every
     # `-d`/`-e` on its contents, so it was DROPPED from the listing — the box looked emptier than it is
     # and the ceiling under-counted, which is the OVER-add direction this arm exists to prevent.
-    if [ ! -r "$d" ] || [ ! -x "$d" ]; then printf '%s\n' "$d"; continue; fi
+    # ⛔ EXCEPT WHEN ITS NON-MEMBERSHIP IS PROVABLE (agent-infra#2620). "Cannot inspect" was rendered as
+    # one condition, but it is two: WITHOUT SEARCH (`x`) nothing inside can be tested at all, so the dir
+    # must be counted; WITH SEARCH BUT WITHOUT READ the four install markers are still testable BY
+    # DIRECT PATH (`-e` needs traversal only, never a readdir), and a dir that carries none of them is
+    # measurably NOT a registration. Measured on `pi-cell-4`: `RUNNER_ROOT=/opt` is where all four
+    # installs live, `/opt/containerd` is `drwx--x--x root`, and counting it made EVERY pass exit 2
+    # (`cannot-measure why=instance-unreadable path=/opt/containerd`) — a legitimately mixed root became
+    # permanently unmeasurable, so the repair pass could never act on the box that needed it.
+    # A QUARANTINED install is out of the pool (`reclaim` renames the dir before deleting it, so the
+    # bytes it could not remove are still NAMED). It keeps its `.runner` inside, so without this arm it
+    # would come straight back as a registration the ceiling counts — a retired runner that never left.
+    # ⛔ AND THIS TEST COMES BEFORE THE UNREADABLE ARM (#2892 review, P2): placed after it, a quarantine
+    # dir that is unreadable-but-searchable re-entered as a slot, made `status` exit 2 with
+    # `instance-unreadable`, and poisoned the ceiling forever — the opposite of what the retire message
+    # promises. A quarantine is excluded by its NAME, which needs no permission at all.
+    case "${d##*/}" in *.retired-*) continue ;; esac
+    if [ ! -r "$d" ] || [ ! -x "$d" ]; then
+      if [ -x "$d" ] && [ ! -r "$d" ] && ! has_install_marker "$d"; then continue; fi
+      printf '%s\n' "$d"; continue
+    fi
     [ -e "$d/.runner" ] || [ -L "$d/.runner" ] || continue
     # The pristine template is never a runner, even if something wrote a `.runner` into it.
     [ "$d" != "${RUNNER_ROOT%/}/_template" ] || continue
@@ -288,14 +328,190 @@ registered_dirs() {
 # count_dirs <listing> — 0 for an EMPTY listing (`wc -l` over an empty string is 1, not 0).
 count_dirs() { local s="${1:-}"; [ -n "$s" ] || { printf '0'; return 0; }; printf '%s\n' "$s" | wc -l | tr -d ' '; }
 
-# slots — refresh $SLOTS from the pool listing. rc 2 = CANNOT MEASURE, and EVERY consumer must refuse:
+# has_install_marker <dir> — ANY of the markers GitHub's own scripts resolve from an install: the
+# registration (`.runner`, written by config.sh), the configurator, the launcher, the listener binary.
+# ⛔ PROBED BY DIRECT PATH ONLY: `-e`/`-L` need traversal, never iterating the directory, so this
+# answers for a `0711` root-owned directory the caller cannot list. That distinction is the whole point
+# (see the arm in `registered_dirs`): "I cannot list it" and "I cannot learn anything about it" are
+# different readings, and only the second one is a reason to count a directory as capacity.
+has_install_marker() {
+  local d="$1" m
+  for m in .runner config.sh run.sh bin/Runner.Listener; do
+    if [ -e "$d/$m" ] || [ -L "$d/$m" ]; then return 0; fi
+  done
+  return 1
+}
+
+# registration_name <dir> — the name GITHUB knows this registration by, read from `.runner`.
+# ⛔ THE DIRECTORY BASENAME IS NOT THE IDENTITY (#2620). Measured on `pi-cell-4`: two installs
+# (`/opt/gh-runner-x64-1` and `/opt/gh-runner-cell4-x64`) both carry
+# `"agentName": "pi-runner-cell4-x64-1"` — one GitHub registration, two local directories, because
+# `--replace`/a second config re-uses the NAME while a fresh `add` mints a fresh DIRECTORY. Counting
+# directories against a ceiling that bounds RUNNERS over-counts, and re-registering such a name
+# deletes whichever live registration holds it. Empty output = the name could not be read (an
+# unreadable instance), which the callers treat as its own slot rather than as a duplicate.
+registration_name() {
+  sed -n 's/.*"agentName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/.runner" 2>/dev/null | head -1
+}
+registration_agent_id() {
+  sed -n 's/.*"agentId"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9][0-9]*\)"\{0,1\}.*/\1/p' "$1/.runner" 2>/dev/null | head -1
+}
+
+# ⛔ THE ORPHAN SIGNATURE IS TEXT, NEVER AN EXIT CODE OR A MISSING PROCESS (#2620). Measured on
+# `pi-cell-4`, `2026-10-27T04:19Z`, on an install whose registration GitHub had deleted:
+#   ( cd /opt/gh-runner-cell4-x64 && exec ./run.sh )  →  DIED rc=0 after 4s
+#   listener.log: Failed to create a session. The runner registration has been deleted from the
+#                 server, please re-configure. …
+# The process APPEARS, then exits ZERO — so neither `kill -0` at start time nor the exit status
+# classifies this state, and a pass that reads either reports the slot restarted forever. The message
+# is the only evidence, and it is also the reason a retirement is gated on a sane clock: GitHub emits
+# the SAME line when session creation fails on a skewed clock (actions/runner#4648, #1798).
+ORPHAN_SIG="registration has been deleted from the server"
+
+# orphan_evidence_file <dir> [skip_bytes] — print the file that proves GitHub deleted this
+# registration, rc 1 when nothing proves it. `skip_bytes` restricts the search in OUR OWN
+# `listener.log` to what a start appended (so a listener that was already dead before we tried cannot
+# lend its evidence to a fresh attempt). Our own log is checked FIRST because a start this tool
+# performed writes there; `_diag` is the fallback because a start SYSTEMD performed writes only there
+# (measured: the `pi-cell-4` orphan's diag had the message and its `listener.log` did not exist).
+# ⛔ A `_diag` LINE OLDER THAN THE REGISTRATION IS NOT EVIDENCE ABOUT IT. An install that was orphaned,
+# then RE-REGISTERED in place (`config.sh remove` + `add` under a fresh token) keeps every old log —
+# and reading those would retire a HEALTHY registration on the strength of a failure that its current
+# `.runner` already superseded. The marker's mtime is the registration's birth, so the evidence must be
+# at least that new. (A fresh start's evidence needs no such rule: `skip_bytes` already scopes it.)
+orphan_evidence_file() {
+  local d="$1" skip="${2:-0}" f nt t=0 newest="" born=0 lmt=0 added=""
+  if [ -e "$d/.runner" ]; then
+    born="$(stat -c %Y "$d/.runner" 2>/dev/null || stat -f %m "$d/.runner" 2>/dev/null)" || born=0
+    case "$born" in ''|*[!0-9]*) born=0 ;; esac
+  fi
+  # ⛔ WHICH BYTES OF `listener.log` MAY BE READ (#2892 review, P0). `skip>0` means WE started this
+  # listener and only what that start appended may speak for it. `skip=0` means the whole file is
+  # being asked — and then the same rule as `_diag` applies: an install repaired IN PLACE
+  # (`config.sh remove` + a fresh `add`, or `--replace`) keeps the old log, and its own `.runner`
+  # supersedes every line above it. Without this, a HEALTHY re-registered runner is retired on
+  # evidence from a previous life — measured by the reviewer on a fixture with a three-line change,
+  # which is why the arm looked green.
+  if [ -f "$d/listener.log" ]; then
+    if [ "$skip" -gt 0 ]; then
+      # ⛔ NO `| grep -q` (#2892 review, P1). `grep -q` exits at the first match, `tail` then dies of
+      # SIGPIPE, and under this file's `set -o pipefail` the PIPELINE returns 141 — so the `if` was
+      # FALSE with the evidence sitting in the file. Measured by the reviewer: identical 230 KB log,
+      # signature at byte 0 => `preserve why=no-orphan-evidence`, rc 0, while a <64 KB copy of the same
+      # file retired correctly. Size-dependent, so the defect appears and disappears between passes.
+      # Capturing first has no pipeline to break; `case` does the match with no external process at all.
+      added="$(tail -c "+$((skip + 1))" "$d/listener.log" 2>/dev/null)" || added=""
+      case "$added" in *"$ORPHAN_SIG"*) printf '%s' "$d/listener.log"; return 0 ;; esac
+    else
+      lmt="$(stat -c %Y "$d/listener.log" 2>/dev/null || stat -f %m "$d/listener.log" 2>/dev/null)" || lmt=0
+      case "$lmt" in ''|*[!0-9]*) lmt=0 ;; esac
+      if [ "$lmt" -ge "$born" ]; then
+        added="$(cat "$d/listener.log" 2>/dev/null)" || added=""
+        case "$added" in *"$ORPHAN_SIG"*) printf '%s' "$d/listener.log"; return 0 ;; esac
+      fi
+    fi
+  fi
+  for f in "$d"/_diag/Runner_*.log; do
+    [ -f "$f" ] || continue
+    nt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)" || continue
+    case "$nt" in ''|*[!0-9]*) continue ;; esac
+    [ "$nt" -ge "$born" ] || continue
+    if [ "$nt" -ge "$t" ]; then t="$nt"; newest="$f"; fi
+  done
+  [ -n "$newest" ] || return 1
+  added="$(cat "$newest" 2>/dev/null)" || return 1
+  case "$added" in *"$ORPHAN_SIG"*) printf '%s' "$newest"; return 0 ;; esac
+  return 1
+}
+
+# clock_skew_s — |local − remote| in seconds from GitHub's OWN Date header. rc 1 = cannot measure.
+# ⛔ THIS IS THE GUARD ON AN IRREVERSIBLE ACTION. Retiring a registration deletes an install; doing it
+# on a box whose clock is wrong destroys a HEALTHY runner (the skew fakes the very evidence the
+# retirement is based on) and the only remedy left is a re-registration token. So an unmeasurable
+# clock is a REFUSAL here, not a shrug: the cost of declining is one idle slot, the cost of guessing
+# is a deleted runner. The HTTP Date header is used rather than an NTP query so no extra service is
+# required; a multi-second skew is normal for a single request, which is why the bound is minutes.
+clock_skew_s() {
+  local hdr remote remote_s local_s skew
+  command -v curl >/dev/null 2>&1 || return 1
+  # ⛔ NO `-f`: a Date header is present on every HTTP response, and GitHub answers HEAD probes with
+  # 403/429 often enough that `-f` turned a perfectly datable answer into `cannot-measure` (measured on
+  # `pi-cell-4`: `reclaim` read skew=1s while `reconcile`'s child, seconds later, reported
+  # `clock-unverified` and refused the preview). The status code is not what this function needs.
+  hdr="$(curl -sSI --max-time "$CLOCK_PROBE_TIMEOUT_S" https://api.github.com 2>/dev/null)" || return 1
+  remote="$(printf '%s' "$hdr" | sed -n 's/^[Dd]ate:[[:space:]]*//p' | head -1 | tr -d '\r')"
+  [ -n "$remote" ] || return 1
+  remote_s="$(date -u -d "$remote" +%s 2>/dev/null)" || remote_s=""
+  if [ -z "$remote_s" ]; then   # BSD/macOS date
+    remote_s="$(date -u -j -f '%a, %d %b %Y %H:%M:%S %Z' "$remote" +%s 2>/dev/null)" || return 1
+  fi
+  is_uint "$remote_s" || return 1
+  local_s="$(date -u +%s 2>/dev/null)" || return 1
+  is_uint "$local_s" || return 1
+  skew=$((local_s - remote_s))
+  [ "$skew" -lt 0 ] && skew=$((-skew))
+  printf '%s' "$skew"
+  return 0
+}
+
+# capacity_class <dir> — SILENT per-install classifier behind the ceiling count. One token on stdout:
+#   live | revivable | orphaned | uninspectable
+# rc 2 = the PROCESS TABLE could not be read, so the count would be a guess (propagated, never 0).
+# ⛔ AN ORPHANED REGISTRATION IS NOT CAPACITY AND NOT A SLOT (#2620): it has no listener, it can never
+# get one (GitHub refuses the session), and counting it against the core-aware ceiling is what made
+# `pi-cell-4` unable to add a runner to a box whose real capacity was one short — `slots=5` against
+# `ceiling=3`, three of those five being a deleted registration, a directory with no registration in
+# it, and `/opt/containerd`. It becomes `reclaim`'s work, not the ceiling's arithmetic.
+capacity_class() {
+  local d="$1" p
+  if [ ! -r "$d" ] || [ ! -x "$d" ]; then printf 'uninspectable'; return 0; fi
+  p="$(listener_pid "$d")" || return 2
+  if [ -n "$p" ]; then printf 'live'; return 0; fi
+  if orphan_evidence_file "$d" >/dev/null 2>&1; then printf 'orphaned'; return 0; fi
+  printf 'revivable'
+  return 0
+}
+
+# capacity_from_listing <listing> — the ceiling's operand, computed from ONE already-taken listing.
+# Sets SLOTS (capacity), SLOT_REGS (directory count), SLOT_ORPHANED.
+# ⛔ `slots` IS CAPACITY, NOT A DIRECTORY COUNT (#2620), and the two are no longer the same number:
+#   SLOT_REGS   every registration directory the listing returned (the report's own field)
+#   SLOT_ORPHANED those whose registration GitHub deleted (retirable, not capacity)
+#   SLOTS       live + revivable, DEDUPED BY agentName + uninspectable — what the ceiling bounds
+# The dedupe is not tidiness: two directories carrying one `agentName` are ONE registration on GitHub,
+# so starting both is not twice the capacity and the second session is refused. Uninspectable installs
+# are counted, keeping the OVER-add direction conservative where nothing can be proven.
+# An ORPHANED registration is neither capacity nor a slot: it has no listener, it can never get one
+# (GitHub refuses the session), and counting it against the core-aware ceiling is what made
+# `pi-cell-4` unable to add a runner to a box whose real capacity was one short — `slots=5` against
+# `ceiling=3`, three of those five being a deleted registration, a directory with no registration in
+# it, and `/opt/containerd`. It is `reclaim`'s work, not the ceiling's arithmetic.
+capacity_from_listing() {
+  local out="${1:-}" d kind nm seen="|" cap=0 orph=0
+  while read -r d; do
+    [ -n "$d" ] || continue
+    kind="$(capacity_class "$d")" || return 2
+    case "$kind" in
+      orphaned) orph=$((orph + 1)); continue ;;
+      uninspectable) cap=$((cap + 1)); continue ;;
+    esac
+    nm="$(registration_name "$d")"
+    [ -n "$nm" ] || nm="dir:$d"
+    case "$seen" in *"|$nm|"*) continue ;; esac
+    seen="$seen$nm|"
+    cap=$((cap + 1))
+  done <<<"$out"
+  SLOTS="$cap"; SLOT_REGS="$(count_dirs "$out")"; SLOT_ORPHANED="$orph"
+  return 0
+}
+
+# slots — refresh the capacity count. rc 2 = CANNOT MEASURE, and EVERY consumer must refuse:
 # `n="$(registered_dirs | wc -l)"` (the old shape) turned "could not read the pool" into the integer 0,
 # which is the unsafe direction on both gates (0 never reaches the ceiling).
 slots() {
   local out
   out="$(registered_dirs)" || return 2   # pipefail is set; the listing error is not swallowed
-  SLOTS="$(count_dirs "$out")"
-  return 0
+  capacity_from_listing "$out"
 }
 
 # valid_name <name> — a runner name is a path component AND goes to `config.sh --name`.
@@ -495,28 +711,57 @@ probe_listener() {
   return 0
 }
 
-# start_listener <dir> — start run.sh from the instance dir, then PROVE a listener appeared.
+# start_listener <dir> — start run.sh from the instance dir, PROVE a listener appeared, and then
+# PROVE IT SURVIVED. rc 0 = listening · 2 = cannot-measure / cannot-act · 6 = PROVABLY ORPHANED.
 # A pid we just forked exists for one instant; a registration whose listener dies on connect (GitHub
-# refusing a duplicate, a revoked token) would otherwise be reported "restarted" every pass, forever.
+# refusing a duplicate, a revoked token, a registration deleted server-side) would otherwise be
+# reported "restarted" every pass, forever.
+# ⛔ APPEARANCE IS NOT A SESSION — the two-read probe (#2620). Before this, `start_listener` returned
+# on the first 0.5 s poll that saw the process, which is ~3.5 s BEFORE an orphan dies: measured on
+# `pi-cell-4` (2026-10-27T04:19Z) the listener for a deleted registration appeared immediately and
+# then exited at +4 s with rc 0. So the old probe reported `listener_pid=…` success for a slot that
+# could never serve a job, `reconcile` counted it `restarted=`, and the fleet's "self-healing" pass was
+# green over a dead runner. The second read holds the full settle window and decides on what it sees:
+# still alive → success; gone with GitHub's `registration has been deleted` line in the log → rc 6;
+# gone for any other reason → cannot-act (2), naming the log the operator has to read.
 start_listener() {
-  local d="$1" i=0 rc
+  local d="$1" i=0 rc log before="0" ev=""
   [ -x "$d/run.sh" ] || { err "cannot-act why=runner-not-installed path=$d/run.sh"; return 2; }
-  ( cd "$d" && exec "$d/run.sh" ) >>"$d/listener.log" 2>&1 &
+  log="$d/listener.log"
+  # The pre-start length, so "this attempt's" evidence can be told apart from a previous one's.
+  if [ -f "$log" ]; then before="$(wc -c <"$log" 2>/dev/null | tr -d ' ')" || before=0; fi
+  case "$before" in ''|*[!0-9]*) before=0 ;; esac
+  ( cd "$d" && exec "$d/run.sh" ) >>"$log" 2>&1 &
   while [ "$i" -lt $((SETTLE_S * 2)) ]; do
     rc=0; probe_listener "$d" || rc=$?
     case "$rc" in
-      0) say "listener_pid=$LISTENER_PID"; return 0 ;;
+      0) break ;;
       2) return 2 ;;   # cannot measure: never claim a start, never wait blind
     esac
     sleep 0.5; i=$((i + 1))
   done
-  err "cannot-act why=listener-never-appeared waited=${SETTLE_S}s see=$d/listener.log"
+  if [ "$i" -ge $((SETTLE_S * 2)) ]; then
+    err "cannot-act why=listener-never-appeared waited=${SETTLE_S}s see=$log"
+    return 2
+  fi
+  # Hold the settle window: a process that appears and dies is the shape this verb kept calling a win.
+  sleep "$SETTLE_S"
+  rc=0; probe_listener "$d" || rc=$?
+  case "$rc" in
+    0) say "listener_pid=$LISTENER_PID"; return 0 ;;
+    2) return 2 ;;
+  esac
+  if ev="$(orphan_evidence_file "$d" "$before")"; then
+    err "orphaned name=$(basename "$d") dir=$d evidence=$ev — the listener started, GitHub refused the session because THIS registration no longer exists, and the process exited; nothing about the install can bring it back: run: $SELF reclaim --name $(basename "$d")"
+    return 6
+  fi
+  err "cannot-act why=listener-exited waited=${SETTLE_S}s see=$log (the process appeared, then went away with no orphaned-registration evidence — read the log before starting it again)"
   return 2
 }
 
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
-  local dead=0 live=0 d rc dirs outside
+  local dead=0 live=0 orph=0 qn=0 d rc dirs outside
   # `--all` is ACCEPTED AND CHANGES NOTHING, DELIBERATELY: #2373 names a `status --all`, and the
   # default view already IS every runner on this box, so there is no narrower form for the flag to
   # widen. It is documented as such (USAGE) rather than left as a flag a reader assumes reveals more
@@ -532,35 +777,61 @@ cmd_status() {
   # registrations appeared, and the report then printed more DEAD rows than `slots=` (measured:
   # `live=0 dead=30 slots=17`). The rows and the count now come from the SAME read.
   dirs="$(registered_dirs)" || return 2
-  SLOTS="$(count_dirs "$dirs")"
+  capacity_from_listing "$dirs" || return 2
   printf 'host=%s ncpu=%s ceiling=%s slots=%s mem_available=%s MB (%s GB) floor=%s MB (%s GB)\n' \
     "$(cap_host 2>/dev/null || hostname 2>/dev/null || printf box)" \
     "$NCPU" "$CEILING" "$SLOTS" "$MEM_MB" "$(mb_as_gb "$MEM_MB")" \
     "$MEM_FLOOR_MB" "$(mb_as_gb "$MEM_FLOOR_MB")"
-  printf '%-32s %-9s %s\n' NAME LISTENER STATE
+  printf '%-32s %-9s %-9s %s\n' NAME LISTENER STATE GITHUB_NAME
   while read -r d; do
     [ -n "$d" ] || continue
     rc=0; probe_listener "$d" || rc=$?
     case "$rc" in
-      0) printf '%-32s %-9s %s\n' "$(basename "$d")" "$LISTENER_PID" "live"; live=$((live + 1)) ;;
-      1) printf '%-32s %-9s %s\n' "$(basename "$d")" "-" "DEAD"; dead=$((dead + 1)) ;;
+      0) printf '%-32s %-9s %-9s %s\n' "$(basename "$d")" "$LISTENER_PID" "live" "$(registration_name "$d")"; live=$((live + 1)) ;;
+      1)
+        # ⛔ DEAD AND ORPHANED ARE DIFFERENT ROWS (#2620). A dead listener is capacity waiting for a
+        # start; an orphaned registration is capacity that a start can NEVER recover, and its GITHUB
+        # name is taken until `reclaim` retires it. Rendering both as DEAD is how a fleet reads
+        # "someone will restart it" over a slot that needs a different verb.
+        if orphan_evidence_file "$d" >/dev/null 2>&1; then
+          printf '%-32s %-9s %-9s %s\n' "$(basename "$d")" "-" "ORPHANED" "$(registration_name "$d")"
+          orph=$((orph + 1))
+        else
+          printf '%-32s %-9s %-9s %s\n' "$(basename "$d")" "-" "DEAD" "$(registration_name "$d")"
+          dead=$((dead + 1))
+        fi ;;
       # An unreadable probe is NOT a dead listener: a report that says DEAD here would be a false
       # verdict a caller acts on, and rc 3 would claim it measured something.
       *) return 2 ;;
     esac
   done <<<"$dirs"
+  # ⛔ QUARANTINED INSTALLS ARE NAMED, EVERY TIME, UNTIL THEY ARE GONE (#2620). A `reclaim` whose
+  # files could not be all removed renames the install to `*.retired-<stamp>`; those bytes are outside
+  # the pool but still on the disk, and the ONE measured failure mode this repo keeps re-learning is
+  # space that nothing accounts for. They are reported here and counted in the summary, and they are
+  # NOT capacity (excluded by `registered_dirs`).
+  local qdirs
+  # ⛔ DOT-NAMED INSTALLS TOO (#2892 review, P2): `registered_dirs` enumerates `.foo` registrations, so
+  # `reclaim` can quarantine one as `.foo.retired-<stamp>`, and a `*` glob does not match a leading dot —
+  # the leftover's bytes would then be named by nothing, which is the one outcome this row exists for.
+  qdirs="$(for qd in "$RUNNER_ROOT"/*.retired-* "$RUNNER_ROOT"/.[!.]*.retired-*; do [ -d "$qd" ] || [ -L "$qd" ] || continue; printf '%s\n' "$qd"; done)"
+  while IFS= read -r qd; do
+    [ -n "$qd" ] || continue
+    printf '%-32s %-9s %-9s %s\n' "$(basename "$qd")" "-" "QUARANTINE" "retired install — rm -rf as its owner"
+    qn=$((qn + 1))
+  done <<<"$qdirs"
   # ⛔ THE SUMMARY NAMES THE READING IT IS (#2381 review round 6, P1). The rows come from the PROCESS
   # TABLE, which only holds LIVE listeners: an instance dir outside RUNNER_ROOT whose listener is DEAD
   # is invisible here, and a bare `slots=N` over it read as "the box's pool" in exactly the incident
   # `restart` exists for (two runners GitHub showed OFFLINE). The caveat travels WITH the count.
-  printf 'summary live=%s dead=%s slots=%s ceiling=%s pool_read=process-table-live-only\n' "$live" "$dead" "$SLOTS" "$CEILING"
+  printf 'summary live=%s dead=%s slots=%s ceiling=%s pool_read=process-table-live-only orphaned=%s registrations=%s quarantine=%s\n' "$live" "$dead" "$SLOTS" "$CEILING" "$orph" "$SLOT_REGS" "$qn"
   # After the measured rows, so the report is visible — but the count it publishes is NOT this box's
   # pool, so the rc must not claim a complete measurement.
   if [ -n "$outside" ]; then
     err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(join_lines "$outside") — a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT, so slots=$SLOTS counts a PARTIAL pool; set RUNNER_ROOT to the directory that CONTAINS every instance dir (one level above them) and re-read — ⚠️ this reading is the process table, so consolidating the parents is what makes it complete; an instance dir outside RUNNER_ROOT whose listener is DEAD is not enumerable at all"
     return 2
   fi
-  [ "$dead" -eq 0 ] || return 3
+  [ "$dead" -eq 0 ] && [ "$orph" -eq 0 ] || return 3
   return 0
 }
 
@@ -825,13 +1096,187 @@ cmd_restart() {
   # only lives downstream of the `--dry-run` return is a preview that lies.
   [ -x "$dir/run.sh" ] || { err "cannot-act why=runner-not-installed path=$dir/run.sh"; return 2; }
   if [ "$DRY" = 1 ]; then say "dry-run: would start the listener for name=$name"; return 0; fi
-  start_listener "$dir" || return 2
-  say "restarted name=$name pid=$(listener_pid "$dir")"
+  rc=0; start_listener "$dir" || rc=$?
+  case "$rc" in
+    0) say "restarted name=$name pid=$(listener_pid "$dir")"; return 0 ;;
+    # ⛔ 6 IS PASSED THROUGH, NOT FOLDED INTO 2 (#2620). "I could not act" and "this registration is
+    # GONE server-side" lead an operator to opposite next steps — re-run versus `reclaim` — and the
+    # caller that matters here is `reconcile`, which routes 6 to the retire arm and counts 2 as
+    # cannot-measure. Folding them is how the orphan kept being counted `restarted`.
+    6) return 6 ;;
+    *) return 2 ;;
+  esac
+}
+
+# ── reclaim: RETIRE a registration GitHub has deleted (agent-infra#2620) ─────────────────────────
+# WHAT THIS FIXES. Every other verb treats `.runner` as proof that a registration exists, so an
+# install whose registration GitHub deleted is stuck in a state no verb can leave: `add` refuses the
+# name (rc 4 "already registered"), `restart` starts a listener that dies at +4 s (rc 6), and
+# `reconcile` counts it against the ceiling forever. Measured on `pi-cell-4` 2026-10-27: TWO such
+# states (`--replace` on a name whose old registration is deleted server-side), and a `config.sh`
+# that answers: "Cannot configure the runner because it is already configured. To reconfigure the
+# runner, run 'config.cmd remove' or './config.sh remove' first". `--replace` cannot help: that refusal
+# is the LOCAL precondition, raised before the flag is read (actions/runner#1021, #3238, #756).
+#
+# WHAT IT DOES INSTEAD. GitHub's own documented local cleanup for a registration that no longer
+# exists is removing the install, and `config.sh remove` needs a REMOVE TOKEN this box may not be able
+# to mint (the runner-scope API also rate-limits — measured: `gh api .../actions/runners` answered with
+# a rate-limit body on the same box that was busy renewing jobs). So: delete the install, and say so.
+#
+# ⛔ FOUR GUARDS, EACH ONE MEASURED, EACH ONE BEFORE THE DELETE:
+#   1. EVIDENCE, NOT AN INFERENCE. The newest log this registration's own listener wrote must carry
+#      GitHub's "registration has been deleted from the server" line, dated no earlier than the
+#      `.runner` marker itself (an install re-registered in place keeps old logs; they are not evidence
+#      about its CURRENT registration).
+#   2. THE CLOCK MUST BE SANE. GitHub emits that same line when session creation fails on a skewed
+#      clock (actions/runner#4648, #1798), so on a box whose clock cannot be shown to be within
+#      RUNNER_MAX_SKEW_S the pass REFUSES rather than deleting a healthy runner. Declining costs one
+#      idle slot; guessing costs a runner and a re-registration token.
+#   3. A NAME A LIVE SIBLING HOLDS IS NOT RE-REGISTERED. Two directories can carry one `agentName`
+#      (measured here), and registering that name again DELETES whichever registration holds it — the
+#      precise bug that created this orphan. The stale install is removed; the name is left alone.
+#   4. IT NEVER TOUCHES A LIVE LISTENER, and `--dry-run` deletes nothing.
+cmd_reclaim() {
+  local name="" only=0 dirs="" d nm aid rc ev retired=0 preserved=0 live=0 cannot=0 refused=0 skew="" clock_checked=0 sib q="" quarantined="" removed=1 qn=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) take_name_value reclaim "$#" "${2:-}" || return 1; name="${2:-}"; only=1; shift 2 ;;
+      --dry-run) DRY=1; shift ;;
+      *) err "usage: reclaim [--name <name>] [--dry-run]"; return 1 ;;
+    esac
+  done
+  if [ "$only" = 1 ]; then
+    case "$name" in ''|.|..|-*|*/*) err "usage: reclaim --name <name> — a name must not be empty, start with '-', be '.'/'..', or contain '/'"; return 1 ;; esac
+    d="$RUNNER_ROOT/$name"
+    if [ ! -e "$d" ] && [ ! -L "$d" ]; then
+      err "REFUSED reclaim name=$name path=$d — no such directory under $RUNNER_ROOT; nothing changed"; return 3
+    fi
+    if [ ! -e "$d/.runner" ] && [ ! -L "$d/.runner" ]; then
+      err "REFUSED reclaim name=$name path=$d — no .runner registration to retire (that dir is already not a registration; 'add --name $name' is the verb that provisions it); nothing changed"; return 3
+    fi
+    dirs="$d"
+  else
+    dirs="$(registered_dirs)" || return 2
+  fi
+  while read -r d; do
+    [ -n "$d" ] || continue
+    if [ ! -e "$d/.runner" ] && [ ! -L "$d/.runner" ]; then
+      [ "$only" = 1 ] && { err "REFUSED reclaim name=$name path=$d — no .runner registration to retire; nothing changed"; return 3; }
+      continue
+    fi
+    rc=0; probe_listener "$d" || rc=$?
+    case "$rc" in
+      0) live=$((live + 1)); say "live name=$(basename "$d") pid=$LISTENER_PID — not touched"; continue ;;
+      2) cannot=$((cannot + 1)); continue ;;   # unreadable: cannot prove anything about it
+    esac
+    # ⛔ A SYMLINKED INSTANCE IS NOT RETIRABLE BY THIS VERB (#2892 review, P1). `registered_dirs`
+    # deliberately counts a symlink-to-install as in-pool, but `mv` would rename the LINK and `rm -rf`
+    # would remove only the link: the pass would print `retired … the name is free again` and its own
+    # `[ -e "$q" ]` read-back would confirm it, while the real install — its `.runner` and its GB —
+    # survives, unnamed and outside every verb. That is the exact failure the rename-first design
+    # exists to prevent, reported as a clean success. Retiring through a link would also be a guess
+    # about which of the two paths the operator meant, so it refuses and names the path.
+    if [ -L "$d" ]; then
+      err "cannot-act why=instance-is-symlink dir=$d target=$(readlink "$d" 2>/dev/null || printf '?') — the pool entry is a LINK, so renaming it would move the link and leave the install behind; retire the resolved path instead (move it under a name this tool owns, then re-run), nothing changed"
+      cannot=$((cannot + 1)); continue
+    fi
+    if ! ev="$(orphan_evidence_file "$d")"; then
+      preserved=$((preserved + 1))
+      say "preserve name=$(basename "$d") dir=$d why=no-orphan-evidence (no listener and no 'registration has been deleted' line in listener.log/_diag — retirable with 'config.sh remove', but not by this verb: use: $SELF restart --name $(basename "$d"))"
+      continue
+    fi
+    if [ "$clock_checked" = 0 ]; then
+      clock_checked=1
+      if ! skew="$(clock_skew_s)"; then
+        err "cannot-measure why=clock-unverified — the offset of this box's clock from GitHub's could not be read, and that same GitHub message is ALSO what a skewed clock produces (actions/runner#4648): this pass deletes nothing it cannot date. Retire by hand after checking the clock, or re-run with network access to https://api.github.com"
+        return 2
+      fi
+      if [ "$skew" -gt "$MAX_SKEW_S" ]; then
+        err "REFUSED reclaim skew=${skew}s bound=${MAX_SKEW_S}s — this box's clock is ${skew}s off GitHub's, and a skewed clock makes a HEALTHY registration print the same 'registration has been deleted' line this verb retires on: fix the clock first (timedatectl status / NTP), then re-run; nothing changed"
+        return 3
+      fi
+    fi
+    nm="$(registration_name "$d")"; [ -n "$nm" ] || nm="?"
+    aid="$(registration_agent_id "$d")"; [ -n "$aid" ] || aid="?"
+    # The name to provision again is the GITHUB name when it was readable (that is what GitHub holds),
+    # and this directory's own name otherwise — `add --name '?'` is not a usable instruction.
+    local next="$nm"; valid_name "$next" || next="$(basename "$d")"
+    # Guard 3: a LIVE sibling holding this name must not have its registration re-created (a fresh
+    # register with the same name DELETES it — the exact event that orphans the install being retired).
+    # ⛔ GUARD 3 MUST NOT DEGRADE TO "NO SIBLING" WHEN THE POOL CANNOT BE READ (#2892 review, P1).
+    # `2>/dev/null` turned an unreadable listing into an empty one, and an empty one makes `sib=""`,
+    # which makes the message tell the operator to `add --name <name>` — the one action that DELETES
+    # whichever registration still holds it. Same for a live holder OUTSIDE `RUNNER_ROOT`: the pool is
+    # every runner on the box, so the outside read counts too. Both are refusals, never a guess.
+    sib=""
+    if [ "$nm" != "?" ]; then
+      local e plist
+      if ! plist="$(registered_dirs)"; then
+        err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT (the LIVE-holder check could not list the pool, so this pass cannot tell whether re-registering $nm would delete a working runner; nothing was retired)"
+        cannot=$((cannot + 1)); continue
+      fi
+      while read -r e; do
+        [ -n "$e" ] || continue
+        [ "$e" = "$d" ] && continue
+        [ "$(registration_name "$e")" = "$nm" ] || continue
+        if probe_listener "$e" >/dev/null 2>&1; then sib="$e"; break; fi
+      done <<<"$plist"
+      if [ -z "$sib" ] && ! outside="$(outside_listener_dirs)"; then
+        err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT (the LIVE-holder check could not enumerate listeners outside the root; nothing was retired)"
+        cannot=$((cannot + 1)); continue
+      fi
+      # A live listener outside the root holding this name counts exactly like an in-pool sibling.
+      if [ -z "$sib" ] && [ -n "${outside:-}" ]; then
+        while read -r e; do
+          [ -n "$e" ] || continue
+          [ "$(registration_name "$e")" = "$nm" ] || continue
+          sib="$e"; break
+        done <<<"$outside"
+      fi
+    fi
+    if [ "$DRY" = 1 ]; then
+      say "dry-run: would retire name=$nm agent_id=$aid dir=$d evidence=$ev$([ -n "$sib" ] && printf ' (name kept: LIVE at %s)' "$sib")"
+      retired=$((retired + 1))
+      continue
+    fi
+    # ⛔ RENAME FIRST, DELETE SECOND — MEASURED, AND THE REASON THIS IS NOT ONE `rm -rf` (#2620).
+    # On `pi-cell-4` the real retirement failed halfway: systemd had written `_diag` as root, so
+    # `rm -rf` hit EACCES AFTER it had already unlinked `.runner`. The pass correctly reported
+    # `cannot-act why=retire-failed`, and the result was still the worst of both worlds — 6.9 GB of
+    # bytes NAMED BY NOTHING, invisible to `status`, to `slots` and to every later pass, because every
+    # verb identifies a registration by `.runner`. A single untracked `rm -rf` cannot be made atomic,
+    # but a RENAME can: after it, the registration is out of the pool in one step whatever the bytes do
+    # next, and the leftover is a `*.retired-<stamp>` directory whose name says exactly what it is.
+    q="$d.retired-$(date -u +%Y%m%dT%H%M%SZ)"
+    if ! mv "$d" "$q" 2>/dev/null; then
+      err "cannot-act why=retire-failed dir=$d (the install could not be moved aside — it is still a registration and nothing about the name changed; check ownership of $RUNNER_ROOT)"
+      cannot=$((cannot + 1)); continue
+    fi
+    retired=$((retired + 1))
+    removed=1
+    if ! rm -rf "$q" 2>/dev/null || [ -e "$q" ] || [ -L "$q" ]; then removed=0; qn=$((qn + 1)); quarantined="$quarantined$( [ -n "$quarantined" ] && printf ',' )$q"; fi
+    if [ -n "$sib" ]; then
+      say "retired name=$nm agent_id=$aid dir=$d evidence=$ev kept=$sib — a LIVE registration still holds this name, so nothing was re-registered (re-registering here would have deleted it)"
+    else
+      say "retired name=$nm agent_id=$aid dir=$d evidence=$ev — the name is free again; run: $SELF add --name $next"
+    fi
+    if [ "$removed" = 0 ]; then
+      say "quarantined dir=$q — the registration is OUT of the pool, but its files could not be removed (a root-owned file inside, usually systemd's _diag): run: rm -rf \"$q\" as the account that owns them; this path is excluded from slots and from every later pass, and status keeps naming it until it is gone"
+    fi
+  done <<<"$dirs"
+  printf 'reclaim: retired=%s preserved=%s live=%s quarantined=%s cannot=%s clock_skew=%s bound=%ss dry_run=%s\n' \
+    "$retired" "$preserved" "$live" "$qn" "$cannot" "${skew:-unmeasured}" "$MAX_SKEW_S" "$DRY"
+  # ⛔ rc 3 IS REACHABLE ONLY BEFORE THE LOOP (a name with no registration, or a refused clock): the
+  # two verdicts inside the loop are cannot-act (2), because they are facts about what could not be
+  # read or done, not gate verdicts about the box. There is deliberately no `refused` counter — the
+  # first version declared one, never incremented it, and tested it, which is a gate that can never
+  # fire (the class this file's header calls out for an errored `[ ]`).
+  [ "$cannot" -eq 0 ] || return 2
   return 0
 }
 
 cmd_reconcile() {
-  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 failed=0 n=1 rc budget scan=0 dry_adds=0 outside
+  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 failed=0 n=1 rc budget scan=0 dry_adds=0 outside reclaimed=0 rcout=""
   while [ $# -gt 0 ]; do
     case "$1" in --dry-run) DRY=1; shift ;; *) err "usage: reconcile [--dry-run]"; return 1 ;; esac
   done
@@ -863,6 +1308,14 @@ cmd_reconcile() {
     esac
     dead=$((dead + 1))
     if [ "$DRY" = 1 ]; then
+      # ⛔ A PREVIEW THAT ANNOUNCES A START FOR AN ORPHAN IS THE SAME LIE THE REAL PASS USED TO TELL
+      # (#2620). This pass has already read the evidence (`capacity_class`), so the honest preview is
+      # "this cannot be started" here, with the retire preview printed by the arm below — not "would
+      # start" followed by a retirement of the very same directory.
+      if [ "$(capacity_class "$d" 2>/dev/null)" = "orphaned" ]; then
+        say "dry-run: the listener for name=$(basename "$d") cannot be started — its registration no longer exists server-side (see the retire preview below)"
+        continue
+      fi
       # ⛔ THE PREVIEW ASKS, IT DOES NOT RESTATE. `restart --dry-run` re-runs the same liveness probe
       # and the same cannot-measure arm, so a preview can never announce a start the real pass would
       # refuse (an unreadable process table, a missing `run.sh`).
@@ -879,6 +1332,12 @@ cmd_reconcile() {
     "$SELF" restart --name "$(basename "$d")" || rc=$?
     case "$rc" in
       0) restarted=$((restarted + 1)) ;;
+      # ⛔ 6 = THIS REGISTRATION IS GONE SERVER-SIDE, so the restart arm must not count it as a
+      # cannot-act and must not keep retrying it: the pass RETIRES it (below) and the slot comes back as
+      # real capacity. Before #2620 this code did not exist, so an orphan was either reported
+      # `restarted` (when the process appeared first) or `cannot` — and either way the pass never fixed
+      # it, which is why `pi-cell-4` sat at 2 live runners with 2 dead installs for days.
+      6) : ;;   # the retire arm below repairs it; counting it here too would double-report the slot
       # ⛔ A RESTART REFUSAL IS NOT A PASS (#2381 review, P2). `refused` is the ADD arm's
       # floor/ceiling refusal — a legitimate outcome that must not fail the pass — and it NEVER
       # reaches the exit decision, so counting a `restart` rc 3 here printed `dead=1 refused=1` and
@@ -904,6 +1363,27 @@ cmd_reconcile() {
   elif [ -n "$outside" ]; then
     cannot=$((cannot + 1))
     err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(join_lines "$outside") — a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT: this pass could not enumerate it (the restart arm covers RUNNER_ROOT alone) and the ADD arm refuses on the same reading; set RUNNER_ROOT to the directory that CONTAINS every instance dir"
+  fi
+
+  # (a2) RETIRE WHAT A START CAN NEVER REVIVE (agent-infra#2620). A registration GitHub deleted cannot
+  #      be restarted, added over, or healed by anything but removing the local install; the restart arm
+  #      above now reports rc 6 for it instead of a false success. This arm runs ONLY when the evidence
+  #      says there is something to retire (`capacity_class` = orphaned), so a healthy box never pays for
+  #      `reclaim`'s clock probe and never sees a refusal it did not need. In a dry run the same
+  #      evidence drives a preview: `restart --dry-run` starts nothing, so it cannot observe the orphan.
+  local cand="" e
+  while read -r e; do
+    [ -n "$e" ] || continue
+    [ "$(capacity_class "$e" 2>/dev/null)" = "orphaned" ] || continue
+    cand="$cand$( [ -n "$cand" ] && printf '\n' )$e"
+  done <<<"$dirs"
+  if [ -n "$cand" ]; then
+    rc=0
+    if [ "$DRY" = 1 ]; then rcout="$("$SELF" reclaim --dry-run 2>&1)" || rc=$?; else rcout="$("$SELF" reclaim 2>&1)" || rc=$?; fi
+    [ -n "$rcout" ] && say "$rcout"
+    reclaimed="$(printf '%s\n' "$rcout" | sed -n 's/^reclaim: retired=\([0-9][0-9]*\) .*/\1/p' | head -1)"
+    case "${reclaimed:-}" in ''|*[!0-9]*) reclaimed=0 ;; esac
+    case "$rc" in 0) : ;; *) cannot=$((cannot + 1)) ;; esac
   fi
 
   # ⛔ THE TWO HALVES OF THE PASS DO NOT NEED THE SAME INPUTS. Restarting a dead listener needs no
@@ -1003,8 +1483,8 @@ cmd_reconcile() {
   if ! slots; then
     cannot=$((cannot + 1))
   fi
-  printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=%s mem_available=%s MB floor=%s MB dry_run=%s\n' \
-    "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${SLOTS:-unmeasured}" "$CEILING" "$MEM_MB" "$MEM_FLOOR_MB" "$DRY"
+  printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=%s ceiling=%s mem_available=%s MB floor=%s MB dry_run=%s reclaimed=%s registrations=%s orphaned=%s\n' \
+    "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${SLOTS:-unmeasured}" "$CEILING" "$MEM_MB" "$MEM_FLOOR_MB" "$DRY" "$reclaimed" "${SLOT_REGS:-unmeasured}" "${SLOT_ORPHANED:-unmeasured}"
   # ⛔ A PASS THAT PROVISIONED NOTHING IS NOT A SUCCESS. Exit 5 is per-NAME (that is the whole point:
   # one taken name must not end the pass), so on its own it cannot report a box that could not register
   # ANYTHING — a GitHub 5xx, an expired runner scope, a full disk all arrive as the same code. When the
@@ -1040,7 +1520,8 @@ main() {
     add)       cmd_add "$@" ;;
     restart)   cmd_restart "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
-    *) err "ci_runner_pool: unknown command '$verb' (try: status|add|restart|reconcile)"; return 1 ;;
+    reclaim)   cmd_reclaim "$@" ;;
+    *) err "ci_runner_pool: unknown command '$verb' (try: status|add|restart|reclaim|reconcile)"; return 1 ;;
   esac
 }
 

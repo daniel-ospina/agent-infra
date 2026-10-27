@@ -33,6 +33,16 @@
 #     name is `cannot-measure` rather than a jobless runner.
 #   * the RECONCILIATION pass: idempotent, restarts dead listeners, adds to the ceiling, stops on a
 #     gate verdict, and a `cannot-act` is rc 2 — never a pass reported as success.
+#   * AN ORPHANED REGISTRATION (#2620) — one GitHub deleted server-side. Measured on `pi-cell-4`
+#     2026-10-27: the listener appears and then exits **rc 0** at +4 s with
+#     "The runner registration has been deleted from the server", `config.sh --replace` refuses
+#     ("already configured"), and NOTHING could retire it. So: `restart` must report rc 6 (not a false
+#     `restarted`), `status` must show ORPHANED (not DEAD) and refuse to count it as capacity, and
+#     `reclaim` must retire the install — gated on the clock, on evidence newer than the marker, and
+#     on a live sibling that holds the name (re-registering there would delete a WORKING runner).
+#   * CAPACITY, NOT DIRECTORIES: two installs carrying one `agentName` are one slot (measured: 47 and
+#     35, both `pi-runner-cell4-x64-1`), and a box whose root is a MIXED directory (`/opt` with
+#     `/opt/containerd` in it) must still be measurable when a non-member is provably not an install.
 #   * FAIL-CLOSED: every unreadable reading is `cannot-measure` (rc 2) and changes nothing.
 #   * the MUTATION case at the end proves the floor assertion is LIVE: a copy with the floor
 #     comparison removed must stop refusing. A suite that passes against the mutant pins nothing.
@@ -208,6 +218,23 @@ done
 if [ -x /bin/ls ]; then exec /bin/ls "$@"; fi
 exec /usr/bin/ls "$@"
 STUB
+# `curl` is the retirement CLOCK GUARD's probe (`reclaim` compares this against the local clock). A
+# fixture that answered "network error" to every probe would make every shrink case cannot-measure,
+# so the healthy path must be a working probe — and FIXTURE_TIME_SKEW_S / FIXTURE_CURL_FAIL are the
+# two real shapes it has to tell apart: a box whose clock is wrong, and a box that cannot be dated.
+cat >"$BIN/curl" <<'STUB'
+#!/usr/bin/env bash
+[ "${FIXTURE_CURL_FAIL:-0}" = 1 ] && exit 6
+skew="${FIXTURE_TIME_SKEW_S:-0}"
+now="$(date -u +%s)"
+epoch=$((now - skew))
+if date -u -d "@$epoch" +%s >/dev/null 2>&1; then
+  stamp="$(date -u -d "@$epoch" '+%a, %d %b %Y %H:%M:%S')"
+else
+  stamp="$(date -u -r "$epoch" '+%a, %d %b %Y %H:%M:%S')"
+fi
+printf 'HTTP/2 200\r\ndate: %s GMT\r\n\r\n' "$stamp"
+STUB
 chmod +x "$BIN"/*
 
 # ── the runner release, stubbed to GitHub's real shape ──────────────────────────────────────
@@ -253,6 +280,17 @@ cat >"$TEMPLATE/bin/Runner.Listener" <<'STUB'
 #!/usr/bin/env bash
 # ⛔ argv must STAY "<dir>/bin/Runner.Listener run" — the real binary never execs anything else, so a
 # stub that did would let a broken argv matcher pass. Hence a CHILD sleep, killed on TERM/EXIT.
+# ⛔ THE `.orphan` MARKER MODELS A REGISTRATION GITHUB DELETED (#2620), and it must reproduce BOTH
+# halves of the measured shape: the process APPEARS (so a start reads as successful) and then goes
+# away ~0.6 s later, AFTER printing GitHub's own line — with **rc 0**, which is exactly what the box
+# did (`DIED rc=0 after 4s`, pi-cell-4 2026-10-27T04:19Z). A stub that exited non-zero would let an
+# exit-status classifier pass, and the shipped code must classify by the message instead.
+INST="$( cd -P "$( dirname "$( dirname "${BASH_SOURCE[0]}" )" )" && pwd )"
+if [ -e "$INST/.orphan" ]; then
+  sleep 0.6
+  printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n'
+  exit 0
+fi
 sleep 600 &
 child=$!
 trap 'kill "$child" 2>/dev/null' EXIT TERM INT
@@ -1497,6 +1535,346 @@ RUNNER_ROOT=/: out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 env RUNNER_ROOT=/ bash
 assert_eq "$(grep -cF 'pool-root-incomplete' <<<"$out")" "0" "RUNNER_ROOT=/ does not report a listener outside itself"
 # (rc is NOT asserted here: a listener whose instance dir was deleted under it is legitimately
 #  `instance-dir-unresolvable`, and earlier cases leave such fixtures behind.)
+
+# ══ (#2620) ORPHANED REGISTRATIONS — the state no verb could leave ═════════════════════════
+# Every arm below is a measured fact from `pi-cell-4` (2026-10-27T03:30–04:20Z), where two installs
+# whose registrations GitHub had deleted sat unusable while the "self-healing" pass reported them
+# restarted, and the one slot that COULD be revived stayed dead for lack of a scheduled pass.
+
+# ── CAPACITY IS NAMES, NOT DIRECTORIES ───────────────────────────────────────────────────────
+# Measured: `/opt/gh-runner-x64-1` and `/opt/gh-runner-cell4-x64` both carry
+# `"agentName": "pi-runner-cell4-x64-1"` (agentIds 47 and 35) — one GitHub registration, two local
+# directories. Counting directories let the box read `slots=5` against `ceiling=3`.
+echo "── capacity: two directories carrying ONE GitHub name ──"
+fresh_pool dupname; reset_logs
+register pi-runner-d1
+register pi-runner-d2
+printf '{\n  "agentId": 47,\n  "agentName": "pi-runner-shared"\n}\n' >"$RUNNER_ROOT/pi-runner-d1/.runner"
+printf '{\n  "agentId": 35,\n  "agentName": "pi-runner-shared"\n}\n' >"$RUNNER_ROOT/pi-runner-d2/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_contains "$out" "slots=1 ceiling=3" "two dirs carrying one agentName are ONE slot of capacity"
+assert_contains "$out" "registrations=2" "and the directory count is still published, as its own field"
+
+# ── AN ORPHANED REGISTRATION IS NOT DEAD, AND NOT CAPACITY ──────────────────────────────────
+echo "── an orphaned registration: its own state, and zero capacity ──"
+fresh_pool orphan; reset_logs
+register pi-runner-orph
+: >"$RUNNER_ROOT/pi-runner-orph/.orphan"
+printf '{\n  "agentId": 35,\n  "agentName": "pi-runner-cell4-x64-1"\n}\n' >"$RUNNER_ROOT/pi-runner-orph/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-orph/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "3" "an ORPHANED registration fails the report (rc 3), like a DEAD one"
+assert_contains "$out" "ORPHANED" "and it is its OWN state — a restart can never recover it"
+assert_contains "$out" "slots=0 ceiling=3" "an orphaned registration is NOT capacity"
+assert_contains "$out" "orphaned=1" "and the summary counts it"
+
+# ── restart MUST NOT CALL AN ORPHAN RESTARTED (the lie that hid this for days) ───────────────
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-orph)"
+assert_eq "$?" "6" "restart on an orphaned registration is rc 6 (provably orphaned), not 0 and not 2"
+assert_contains "$out" "orphaned name=pi-runner-orph" "naming what it found"
+assert_contains "$out" "evidence=$RUNNER_ROOT/pi-runner-orph/listener.log" "and the file that proves it"
+assert_contains "$out" "reclaim --name pi-runner-orph" "and the verb that repairs it"
+assert_eq "$(grep -cF 'restarted name=' <<<"$out")" "0" "it does NOT report a restart it did not achieve"
+
+# ── reclaim: PREVIEW, then RETIRE ────────────────────────────────────────────────────────────
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim --dry-run)"
+assert_eq "$?" "0" "a dry-run retire pass exits 0"
+assert_contains "$out" "dry-run: would retire name=pi-runner-cell4-x64-1 agent_id=35" "it announces what it would retire"
+assert_file "$RUNNER_ROOT/pi-runner-orph/.runner" "and a preview deleted NOTHING"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "reclaim exits 0 when it retired what it found"
+assert_contains "$out" "retired name=pi-runner-cell4-x64-1 agent_id=35" "it names the GITHUB identity, not the directory"
+assert_contains "$out" "reclaim: retired=1 preserved=0" "and the pass summarises itself"
+assert_absent "$RUNNER_ROOT/pi-runner-orph" "the install is gone — the name is free again"
+assert_contains "$out" "run: " "and it names the next verb for the freed name"
+
+# ── the CLOCK GUARD: this evidence is ALSO what a skewed clock produces ─────────────────────
+# actions/runner#4648/#1798: a wrong clock makes GitHub refuse the session and the listener print the
+# SAME line. Retiring is irreversible, so an unproven clock must refuse — never guess.
+echo "── reclaim: a skewed clock REFUSES, and an unmeasurable one too ──"
+fresh_pool skew; reset_logs
+register pi-runner-skew
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-skew/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TIME_SKEW_S=600 run reclaim)"
+assert_eq "$?" "3" "a clock 600 s off GitHub's REFUSES the retirement (rc 3)"
+assert_contains "$out" "skew=600s bound=120s" "printing the offset and the bound it broke"
+assert_file "$RUNNER_ROOT/pi-runner-skew/.runner" "and NOTHING was deleted"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CURL_FAIL=1 run reclaim)"
+assert_eq "$?" "2" "an UNMEASURABLE clock is cannot-measure (rc 2), never a delete"
+assert_contains "$out" "why=clock-unverified" "naming the reading it could not take"
+assert_file "$RUNNER_ROOT/pi-runner-skew/.runner" "and it still deleted nothing"
+
+# ── NO EVIDENCE = PRESERVE. A dead-but-registered listener is `restart`'s, not this verb's ───
+echo "── reclaim: a revivable registration is PRESERVED, never retired ──"
+fresh_pool preserve; reset_logs
+register pi-runner-plain
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "a pass with nothing retirable exits 0"
+assert_contains "$out" "preserve name=pi-runner-plain" "it names the registration it declined to retire"
+assert_contains "$out" "why=no-orphan-evidence" "and the reason"
+assert_file "$RUNNER_ROOT/pi-runner-plain/.runner" "the install is untouched"
+
+# ── EVIDENCE OLDER THAN THE CURRENT REGISTRATION IS NOT EVIDENCE ABOUT IT ──────────────────
+# An install repaired IN PLACE (`remove` + a fresh `add`) keeps every old log. Reading those would
+# retire a registration that its own `.runner` already superseded.
+echo "── reclaim: a _diag line older than the marker is stale evidence ──"
+fresh_pool staleproof; reset_logs
+register pi-runner-fresh
+mkdir -p "$RUNNER_ROOT/pi-runner-fresh/_diag"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-fresh/_diag/Runner_20260101-000000-utc.log"
+touch -t 202601010000 "$RUNNER_ROOT/pi-runner-fresh/_diag/Runner_20260101-000000-utc.log" 2>/dev/null || true
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "nothing is retired on stale evidence"
+assert_contains "$out" "preserve name=pi-runner-fresh" "the registration is preserved"
+assert_file "$RUNNER_ROOT/pi-runner-fresh/.runner" "and its marker is still there"
+
+# ── A NAME A LIVE SIBLING HOLDS IS NOT RE-REGISTERED ───────────────────────────────────────
+# The measured trap: two installs share `pi-runner-cell4-x64-1`, and registering that name again
+# DELETES whichever registration holds it — the exact event that orphaned the install being retired.
+echo "── reclaim: retire the stale install, never the live holder of its name ──"
+fresh_pool sibling; reset_logs
+register pi-runner-live
+register pi-runner-stale
+for d in pi-runner-live pi-runner-stale; do
+  printf '{\n  "agentId": 47,\n  "agentName": "pi-runner-sibname"\n}\n' >"$RUNNER_ROOT/$d/.runner"
+done
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-stale/listener.log"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-live)" "0" \
+  "baseline: the sibling's listener comes up"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass retires the stale install and leaves the live one alone"
+assert_contains "$out" "kept=$RUNNER_ROOT/pi-runner-live" "naming the LIVE holder of the name"
+assert_contains "$out" "nothing was re-registered" "and why it did not re-register that name"
+assert_absent "$RUNNER_ROOT/pi-runner-stale" "the stale install is gone"
+assert_file "$RUNNER_ROOT/pi-runner-live/.runner" "the live registration is untouched"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-live")" "1" "and still serving"
+
+# ── THE PASS THAT MAKES IT SELF-HEALING: restart → retire → add, then idempotent ────────────
+echo "── reconcile: revives, retires, provisions — and changes nothing on a second pass ──"
+fresh_pool reheal; reset_logs
+register pi-runner-rd
+register pi-runner-ro
+: >"$RUNNER_ROOT/pi-runner-ro/.orphan"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-ro/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "0" "reconcile exits 0 when it could measure and act"
+assert_contains "$out" "restarted name=pi-runner-rd" "the revivable slot is revived"
+assert_contains "$out" "dir=$RUNNER_ROOT/pi-runner-ro evidence=" "the orphan is retired"
+assert_contains "$out" "added name=pi-runner-fixturebox-1" "and the freed capacity is provisioned"
+assert_contains "$out" "reclaimed=1" "the summary counts the retirement"
+assert_contains "$out" "orphaned=0" "and reports the pool after the pass, not before it"
+assert_absent "$RUNNER_ROOT/pi-runner-ro" "the orphan's install is gone"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "0" "a second reconcile exits 0"
+assert_contains "$out" "reconcile: dead=0 restarted=0 added=0" "and is IDEMPOTENT: nothing left to revive or add"
+assert_contains "$out" "reclaimed=0" "and nothing left to retire"
+
+# ── A RETIREMENT WHOSE FILES CANNOT ALL BE REMOVED IS QUARANTINED, NEVER PART-DELETED ───────────
+# MEASURED ON `pi-cell-4` (2026-10-27T06:2xZ), with the first version of this verb: systemd had written
+# `_diag` as root, so `rm -rf` failed AFTER unlinking `.runner` — the pass honestly reported
+# `cannot-act why=retire-failed`, and left 6.9 GB that NO verb could see (every verb identifies a
+# registration by `.runner`). So the retire is a RENAME first: the pool loses the registration in one
+# atomic step, and the bytes that survive are a `*.retired-<stamp>` directory that `status` keeps
+# naming until somebody removes them.
+echo "── reclaim: a partial removal is QUARANTINED and stays visible ──"
+fresh_pool quarantine; reset_logs
+register pi-runner-q
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-q/listener.log"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "a quarantined retirement (a root shell can remove anything)"
+else
+  mkdir -p "$RUNNER_ROOT/pi-runner-q/_diag/locked"; : >"$RUNNER_ROOT/pi-runner-q/_diag/locked/root-owned.log"
+  chmod 500 "$RUNNER_ROOT/pi-runner-q/_diag/locked"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+  assert_eq "$?" "0" "the pass exits 0: the registration WAS retired, which is what it promised"
+  assert_contains "$out" "quarantined dir=$RUNNER_ROOT/pi-runner-q.retired-" "naming the bytes it could not remove"
+  assert_contains "$out" "reclaim: retired=1 preserved=0 live=0 quarantined=1" "and counting the quarantine"
+  assert_absent "$RUNNER_ROOT/pi-runner-q" "the pool no longer has the install at its registered path"
+  assert_eq "$(ls -d "$RUNNER_ROOT"/pi-runner-q.retired-* 2>/dev/null | wc -l)" "1" "the leftovers are named on disk"
+  # THE POINT OF THE RENAME: those bytes are invisible to nothing. `status` names them, and they are NOT
+  # a registration — a `.runner` inside a quarantine dir must never come back as capacity.
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_contains "$out" "QUARANTINE" "status keeps naming a quarantined install"
+  assert_contains "$out" "quarantine=1" "and the summary counts it"
+  assert_contains "$out" "slots=0 ceiling=3" "while it stays OUT of the ceiling (it is not a runner any more)"
+  assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of reclaim)" "0" "a second pass has nothing left to retire"
+  for q in "$RUNNER_ROOT"/pi-runner-q.retired-*; do chmod -R u+rwX "$q" 2>/dev/null || true; done
+fi
+
+
+# ── REVIEW-ROUND REGRESSIONS (#2892): four ways this verb could lie or delete the wrong thing ────
+# Each fixture below was written AFTER a reviewer reproduced the defect; every one of them passes
+# against the pre-review code in a way the suite could not see.
+
+# (1) A re-registered install keeps its OLD `listener.log`. Retiring on that line deletes a HEALTHY
+#     runner — the P0 the `_diag` staleness rule already covered for one of the two sources only.
+echo "── reclaim: a listener.log OLDER than the marker is stale evidence too ──"
+fresh_pool stalelog; reset_logs
+register pi-runner-relogged
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-relogged/listener.log"
+touch -t 202601010000 "$RUNNER_ROOT/pi-runner-relogged/listener.log" 2>/dev/null || true
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "nothing is retired on a pre-registration listener.log"
+assert_contains "$out" "preserve name=pi-runner-relogged" "the healthy install is PRESERVED"
+assert_file "$RUNNER_ROOT/pi-runner-relogged/.runner" "and it still exists"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_eq "$?" "3" "and status reads it as DEAD (revivable), never ORPHANED"
+assert_eq "$(grep -cF 'ORPHANED' <<<"$out")" "0" "no ORPHANED row for it"
+
+# (2) `tail | grep -q` returns 141 under pipefail once the log passes the pipe buffer, so the evidence
+#     is silently MISSED on exactly the long-lived installs that have one. The signature here is at
+#     byte 0 of a 200 KB log.
+echo "── reclaim: the evidence survives a log far larger than the pipe buffer ──"
+fresh_pool biglog; reset_logs
+register pi-runner-biglog
+printf '{\n  "agentId": 55,\n  "agentName": "pi-runner-biglog"\n}\n' >"$RUNNER_ROOT/pi-runner-biglog/.runner"
+{ printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n'
+  i=0; while [ "$i" -lt 3000 ]; do printf 'INFO ordinary runner chatter line %s padding padding padding\n' "$i"; i=$((i + 1)); done
+} >"$RUNNER_ROOT/pi-runner-biglog/listener.log"
+assert_eq "$(wc -c <"$RUNNER_ROOT/pi-runner-biglog/listener.log" | tr -d ' ')" "$(wc -c <"$RUNNER_ROOT/pi-runner-biglog/listener.log" | tr -d ' ')" "fixture log built"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass retires it"
+assert_contains "$out" "retired name=pi-runner-biglog" "a >64 KiB log is still READ (no SIGPIPE under pipefail)"
+assert_absent "$RUNNER_ROOT/pi-runner-biglog" "and the install is gone"
+
+# (3) A SYMLINKED instance: renaming the link and `rm -rf`ing it leaves the real install behind while
+#     the pass reports success. It must refuse and stay out of the way.
+echo "── reclaim: a symlinked instance is REFUSED, not retired through the link ──"
+fresh_pool syminst; reset_logs
+mkdir -p "$T/symreal/pi-runner-symreal"
+cp -a "$TEMPLATE/." "$T/symreal/pi-runner-symreal/"
+printf '{\n  "agentId": 99,\n  "agentName": "pi-runner-symname"\n}\n' >"$T/symreal/pi-runner-symreal/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$T/symreal/pi-runner-symreal/listener.log"
+ln -s "$T/symreal/pi-runner-symreal" "$RUNNER_ROOT/pi-runner-symlink"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "2" "the pass refuses (rc 2), because a retire through a link is not what the operator meant"
+assert_contains "$out" "why=instance-is-symlink" "naming the reason"
+assert_file "$T/symreal/pi-runner-symreal/.runner" "the REAL install survives, untouched"
+assert_absent "$T/symreal/pi-runner-symreal.retired-" "no quarry was made of it"
+rm -f "$RUNNER_ROOT/pi-runner-symlink"
+
+# (4) A quarantine directory keeps its `.runner`. Unreadable-but-searchable it re-entered `slots` and
+#     made every pass `cannot-measure` — the opposite of what the retire message promises.
+echo "── a quarantined install never re-enters the pool, readable or not ──"
+fresh_pool ghostq; reset_logs
+register pi-runner-live-q
+mkdir -p "$RUNNER_ROOT/ghost.retired-20260101T000000Z"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/ghost.retired-20260101T000000Z/"
+: >"$RUNNER_ROOT/ghost.retired-20260101T000000Z/.runner"
+mkdir -p "$RUNNER_ROOT/.dot.retired-20260101T000000Z"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/.dot.retired-20260101T000000Z/"
+: >"$RUNNER_ROOT/.dot.retired-20260101T000000Z/.runner"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an unreadable quarantine directory (a root shell bypasses directory permissions)"
+else
+  chmod 311 "$RUNNER_ROOT/ghost.retired-20260101T000000Z"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "3" "the pool is still measurable over unreadable quarantines (rc 3 = the one DEAD runner)"
+  assert_contains "$out" "slots=1 ceiling=3" "neither quarantine is capacity, readable or not"
+  assert_eq "$(grep -cF 'instance-unreadable' <<<"$out")" "0" "and neither is reported as an unreadable instance"
+  assert_contains "$out" "quarantine=2" "BOTH are named — including the dot-named one"
+  chmod 700 "$RUNNER_ROOT/ghost.retired-20260101T000000Z"
+fi
+
+# (5) The reconcile preview counted every orphan TWICE in `dead=`, the one field a scheduler compares
+#     against `slots` to decide whether to act.
+echo "── reconcile --dry-run: an orphan is counted as dead ONCE ──"
+fresh_pool dryorphan; reset_logs
+register pi-runner-dryorph
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-dryorph/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile --dry-run)"
+assert_eq "$?" "0" "the preview exits 0"
+assert_contains "$out" "reconcile: dead=1 restarted=0" "the orphan counts as ONE dead slot in the preview"
+assert_contains "$out" "reclaimed=1" "and the preview announces the retirement"
+
+# (6) A refusal must never be printed as a message containing a COMMAND the shell executes: the
+#     preserve message carried `config.sh remove` in backticks inside a double-quoted string.
+echo "── the retire messages contain no executable substitutions ──"
+fresh_pool nocmd; reset_logs
+register pi-runner-nocmd
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim 2>&1)"
+assert_eq "$(grep -cF 'command not found' <<<"$out")" "0" "no backtick in a message ran a command"
+assert_eq "$(grep -cF 'config.sh: command not found' <<<"$out")" "0" "specifically not config.sh"
+
+
+# (7) Guard 3 (the LIVE holder of the name) must not degrade to "no sibling" when the pool listing
+#     fails on the SECOND read: an empty sibling set makes the pass advise re-registering a name that
+#     a working runner may hold, which DELETES that runner's registration.
+echo "── reclaim: an unreadable sibling listing is a refusal, not 'no sibling' ──"
+fresh_pool siblfail; reset_logs
+register pi-runner-sibl
+printf '{\n  "agentId": 56,\n  "agentName": "pi-runner-sibl"\n}\n' >"$RUNNER_ROOT/pi-runner-sibl/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-sibl/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_LS_FAIL_AFTER=1 run reclaim)"
+assert_eq "$?" "2" "the pass cannot-act (rc 2) instead of guessing"
+assert_contains "$out" "why=runner-root-unreadable" "naming the read it could not take"
+assert_file "$RUNNER_ROOT/pi-runner-sibl/.runner" "and NOTHING was retired"
+assert_eq "$(grep -cF 'add --name' <<<"$out")" "0" "it never advises re-registering the name"
+
+# ── MUTATION: the orphan SIGNATURE is load-bearing ──────────────────────────────────────────
+# If a copy whose signature no longer matches still retired the orphan, every arm above would be
+# passing on something other than the evidence.
+echo "── mutation: the orphan evidence is what authorises the delete ──"
+fresh_pool mutretire; reset_logs
+register pi-runner-mut-orph
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-mut-orph/listener.log"
+MUT_R="$T/mutant-retire-ci_runner_pool.sh"
+python3 - "$POOL" "$MUT_R" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read()
+needle = 'ORPHAN_SIG="registration has been deleted from the server"'
+assert text.count(needle) == 1, "the orphan signature moved: update the mutation target"
+open(dst, "w", encoding="utf-8").write(
+    text.replace(needle, 'ORPHAN_SIG="a line this script will never match"'))
+PY
+assert_file "$MUT_R" "the mutation copy was produced"
+mut_out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 bash "$MUT_R" reclaim 2>&1)"
+assert_eq "$?" "0" "the MUTANT cannot see the orphan, so it retires nothing"
+assert_file "$RUNNER_ROOT/pi-runner-mut-orph/.runner" "the mutant left the install in place (so the arms above pin the evidence)"
+assert_contains "$mut_out" "preserve name=pi-runner-mut-orph" "the mutant calls it unprovable"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of reclaim)" "0" "the SHIPPED script retires it"
+assert_absent "$RUNNER_ROOT/pi-runner-mut-orph" "and the fixture the mutant preserved is gone"
+
+# ══ (#2620) A MIXED RUNNER ROOT: a non-member that is PROVABLY not an install ─════════════════
+# Measured on `pi-cell-4`: every install lives under `/opt`, and `/opt/containerd` is
+# `drwx--x--x root` — unreadable to the runner user, searchable. "Cannot inspect" was one condition
+# and turned the only usable root on the box into a permanent `cannot-measure` (rc 2), so the repair
+# pass could never act on the box that needed it. Searchability is what separates the two readings.
+echo "── a searchable-but-unreadable NON-member of a mixed root ──"
+fresh_pool mixed; reset_logs
+register pi-runner-real-m
+mkdir -p "$RUNNER_ROOT/containerd" "$RUNNER_ROOT/containerd/data"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "a searchable-but-unreadable non-member (a root shell bypasses directory permissions)"
+else
+  chmod 311 "$RUNNER_ROOT/containerd"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "3" "the pool is MEASURABLE over a mixed root (rc 3 = its one DEAD runner, not 2)"
+  assert_absent "$RUNNER_ROOT/containerd/x" "(control: the dir really is unlistable)"
+  assert_contains "$out" "slots=1 ceiling=3" "and the non-member is not counted as capacity"
+  assert_eq "$(grep -cF 'instance-unreadable' <<<"$out")" "0" "nor reported as an unreadable instance"
+  # THE CONTROL: the SAME mode OVER A MEMBER is still counted and still cannot-measure — the guard is
+  # searchability, not "skip whatever I cannot read".
+  register pi-runner-member-m
+  chmod 311 "$RUNNER_ROOT/pi-runner-member-m"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+  assert_eq "$?" "2" "a searchable-but-unreadable MEMBER is still cannot-measure (rc 2)"
+  assert_contains "$out" "cannot-measure why=instance-unreadable" "naming it"
+  chmod 700 "$RUNNER_ROOT/pi-runner-member-m"
+  chmod 700 "$RUNNER_ROOT/containerd"
+fi
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then
