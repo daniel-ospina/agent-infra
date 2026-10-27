@@ -1647,6 +1647,137 @@ ancestor at any depth, or an unresolvable/looping symlink — and when no candid
 all. A path is not failed for being a path main does not carry; it is failed for the bytes in it.
 `harness-status` runs it as its fifth row, so every status call is also a divergence check.
 
+### 6.1 The roles — the component table, and the ONE command that installs them
+
+`harness-up` could START a box and could not SET ONE UP. The install half lived in three other places
+(`cloud-cell-bringup.sh` on a cell, `pi-bootstrap/setup.sh` on a Mac, and a hand-run installer per
+component), so the launcher's own answer to "is this box up?" was only true about a box somebody had
+already installed by hand. Measured on 2026-10-25, in one night, three ways:
+
+* **the merge role was INSTALLED AND NEVER STARTED.** `cloud-cell-doctor.sh` owns the reap / doctor /
+  merge / hygiene passes; `cloud-cell-supervisor.sh start` opens its session. Nothing anywhere said
+  "the merge role has never run", so the box looked installed and the queue did not move.
+* **a unit pointed at a `/tmp` cwd DIED EVERY TEN MINUTES** for as long as a reclaim stood. The
+  installers that remember to check the path (`install-repair-service.sh` refuses the #2697
+  lane-scratch shape) cannot help a unit installed EARLIER, when the path existed — nothing re-read an
+  installed unit's own `ExecStart`/`WorkingDirectory`.
+* **`status` read "installed" as if it were "ok"** on three components that were dead. A unit file, a
+  loaded plist and a session name are all permissions to run, never evidence that anything ran.
+
+So the roles are now declared in **one place**, `scripts/orchestrator-harness/harness-roles.sh`
+(sourced by `scripts/harness-up` — still the only entry point), and `up` installs before it starts.
+
+#### One command, both platforms
+
+```bash
+# from an agent-infra checkout — the SAME command on a cell and on a Mac:
+scripts/harness-up up        # preflight -> install the roles this box is configured for -> start
+scripts/harness-up status    # the component rows + the ROLE rows, ONE verdict (heals by default)
+scripts/harness-up roles     # the role rows only — a pure READ (status also heals)
+scripts/harness-up heal      # re-drive what is dead; NOT HEALED names what it could not fix (exit 1)
+scripts/harness-up logs <role> [n]        # the role's OWN log
+scripts/harness-up dispatch <role> [pass] # run ONE role once, in the FOREGROUND
+```
+
+Linux → **systemd** (system scope via passwordless sudo, else `systemctl --user`); macOS → **launchd**
+(`~/Library/LaunchAgents`). One detection path (`hr_platform`), no GNU-only flags, no `timeout`
+(macOS has none). `up` is idempotent: a role already RUNNING is left alone and its installer is not
+re-run (re-running one can cycle a live unit).
+
+The roster is the box's own configuration — `HR_ROLES`, else `$O/harness-roles.conf` (one role per
+line, `#` comments), else the platform default (`controller apply watchdog reminder`, plus `doctor`
+on a cell). A name outside the registry is an ERROR, not a silent no-op: a typo must not leave a role
+the operator believes is up with nothing watching it.
+
+| verb | what it GUARANTEES | what it will NOT do |
+|---|---|---|
+| `up` | every configured role is preflighted **before anything is written**; each missing unit is installed idempotently; the component stack starts in dependency order; the run ends with the measured state | it will not install a role whose program or working directory is missing (refuses, writes nothing); will not run `cloud-cell-bringup.sh` (provisioning, not convergence); will not run `install-launchd.sh` (it renders EVERY plist); will not re-install a role that is already running |
+| `status` | one line per role with its MEASURED state and the artefact's own last error line, folded into the ONE verdict | it does not believe a unit file, a loaded plist or a session name; it does not heal a DUPLICATE or cycle a live-but-LATE role |
+| `roles` | the same table, read-only | — |
+| `heal` | installs what is missing, starts what is stopped, and the verdict is the **re-read** | it will not restart a DANGLING unit (the target is gone — restarting cannot work), will not repair a role it could not measure, and exits non-zero when anything remains |
+| `logs` | the role's own log, tailed | it reports NO LOG as a state, never as an empty healthy one |
+| `dispatch` | ONE role, once, foreground, the role's own argv and output | no session, no scheduler, no retry |
+
+#### The roles
+
+Declared once, in `harness-roles.sh`. `doctor` is a pass-set, not a unit: it takes a pass name
+(`reap|doctor|merge|hygiene`).
+
+| role | program | Linux unit | macOS unit | the state is read from |
+|---|---|---|---|---|
+| `controller` | `orch-loop.sh` | `eldato-orchestrator.service` (`Restart=always`) | `com.eldato.orchestrator-loop` | the unit's live state + the unit's own journal line, then `$O/heartbeat` age |
+| `apply` | `harness-apply-pass.sh` | `eldato-harness-apply.timer` | `com.eldato.harness-apply` | the timer/job state + `$HARNESS_APPLY_STATE_DIR/harness-apply.status` |
+| `watchdog` | `watchdog-loop.sh` | `eldato-controller-watchdog.timer` | `com.eldato.controller-watchdog` | the timer/job state, and a periodic job's **last exit status** (0 = fine between ticks) |
+| `reminder` | `objective-reminder.sh` | `eldato-objective-reminder.timer` | `com.eldato.objective-reminder` | the same |
+| `doctor` | `cloud-cell-doctor.sh` | a tmux session (no unit of its own) | **none — no macOS unit exists** | `$O/state/roles/*` (`last_pass_epoch` / `last_rc` / `last_result`) + the session → `NEVER-STARTED` when not one pass ever completed |
+
+**Eight states, and they are deliberately not one word:** `RUNNING`; `FAILED` (with the artefact's own
+last error line); `DEAD` (installed and not running); `NEVER-INSTALLED` (nothing on this box would ever
+run it); `NEVER-STARTED` (the doctor's own case — installed, and no pass ever completed); `DANGLING`
+(installed, and the program or directory it execs no longer exists — the `/tmp`-cwd class, whose remedy
+is to re-point rather than to restart); `SKIPPED` (not applicable here, always with a reason, never
+rendered as RUNNING); and `UNKNOWN` (the read could not be taken — never a pass).
+
+#### The components — what each is, and which one is current
+
+Every entry point this directory's consolidation carried, classified against the code at this head.
+"Status" says which one is CURRENT, which is SUPERSEDED, and which was NEVER STARTED anywhere.
+
+| component | purpose | installed / started today | Linux unit | macOS unit | status |
+|---|---|---|---|---|---|
+| `scripts/harness-up` (+ `harness-status`, `harness-down`) | THE entry point: preflight/install the roles, start the stack in dependency order, status/heal/logs/dispatch | run by hand (neither starter calls it) | n/a | n/a | **current** — extended here: `up` installs, and `roles`/`heal`/`logs`/`dispatch` are new |
+| `scripts/orchestrator-bringup.sh` + `scripts/lib/fleet-inventory.sh` | the fleet inventory and the platform START verbs; the `(machine, repo)` duplicate guard | called BY `harness-up` | n/a | n/a | current — owns starting, not installing |
+| `scripts/orchestrator-harness/orch-loop.sh` | the controller | `harness-up up` → bringup → the platform's unit | `eldato-orchestrator.service` | `com.eldato.orchestrator-loop` | current |
+| `scripts/cloud-cell-supervisor.sh` | cell supervisor: pin/seed, controller verb, doctor session, prune/hygiene | its `start` IS the systemd unit's `ExecStart`; `stop` stops the unit | via that unit | **refuses on Darwin** | current, with one SUPERSEDED shape: the controller's **tmux session** is gone by design (#2402 — a tmux session has nothing above it and died with the last one). It still owns the DOCTOR session and is the fallback when no unit is enabled |
+| `scripts/orchestrator-harness/cloud-cell-doctor.sh` | the repair/land/reap/hygiene passes and their own per-role status | `cloud-cell-supervisor.sh start` opens the `cell-doctor` session | no unit of its own (a session) | **NONE — never started on any Mac** | current on a cell; the Mac gap is now REPORTED (`harness-up status` prints its role row) instead of invisible |
+| `scripts/install-cell-timers.sh` | renders + enables the reminder and watchdog timers | `cloud-cell-bringup.sh`; `harness-up up` (roles `watchdog`, `reminder`) | `eldato-objective-reminder.timer`, `eldato-controller-watchdog.timer` | **REFUSES (Darwin)** — the macOS pair is `templates/launchd/` via `install-launchd.sh` | current (Linux) |
+| `scripts/install-controller-service.sh` | the controller's systemd unit | `cloud-cell-bringup.sh`; `harness-up up` (role `controller`) | `eldato-orchestrator.service` | **REFUSES on Darwin** (a Mac's controller is launchd) | current |
+| `scripts/orchestrator-harness/install.sh` | renders/installs/starts the launchd agent (and enforces the pin records) | `harness-up up` (role `controller`, macOS); by hand | **REFUSES off Darwin** | `com.eldato.orchestrator-loop` | current (macOS) |
+| `scripts/install-harness-apply-timer.sh` | the harness-apply clock (converge this box on `origin/main`) | `cloud-cell-bringup.sh` on a cell; **NOTHING on a Mac** — `setup.sh` installs only `install-launchd.sh` | `eldato-harness-apply.timer` | `com.eldato.harness-apply` | current — ONE installer, both platforms; **never installed by the Mac starter**, which is why `apply` reads `NEVER-INSTALLED` on a Mac until `harness-up up` |
+| `scripts/install-launchd.sh` | renders EVERY `templates/launchd/*.plist` | `pi-bootstrap/setup.sh` on every Darwin box | — | ~19 jobs (watchdog, reminder, reapers, drainer, canary…) | current — but it installs the WHOLE set, so it is not a per-role installer and `up` will not run it (it says so) |
+| `scripts/install-repair-service.sh` | the pr-repair loop's unit | by hand / provisioning | `eldato-pr-repair.service` | **REFUSES (Linux only)** | current — and the ONE installer that already refuses the lane-scratch `/tmp` shape (#2697); the launcher now refuses that shape for every role |
+| `scripts/merge-queue.py` | the DRAIN line for the heartbeat (open PRs vs merged-today, and which lane is on it) | runs INSIDE `orchestrator-heartbeat.sh` | no unit of its own | no unit of its own | current — but it is **not a merge-queue runner**, despite the name: landings are performed by `cloud-cell-doctor.sh merge` (cell) and `orch-loop.sh`'s own sweep (Mac) |
+| `scripts/orchestrator-harness/claims.sh` | cross-box claim registry — a **LIBRARY** (sourced by the controller and the lanes) | sourced; the registry itself is DATA on the remote (`refs/claims/*`) | none needed | none needed | current (not a service: `up` never installs it) |
+| `scripts/orchestrator-harness/capacity.sh` | measured placement — a **LIBRARY** plus a `probe` CLI | sourced per dispatch | none needed | none needed | current |
+| `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch and before every push | none needed | none needed | current |
+| `scripts/orchestrator-harness/disk-floor.sh` | the pre-dispatch disk floor — a **LIBRARY** | sourced by the controller | none needed | none needed | current |
+| `scripts/deploy-mac-orchestrator.sh` | copies the harness into `$O` and stamps the commit | by hand (§4 step 1) | — | — | current for the DEPLOY; ACTIVATION is `install.sh --start` / `harness-up up` |
+| `scripts/cloud-cell-bringup.sh` | full cell PROVISIONING (clone, keys, farm, units) | by hand, once per cell | installs several units | — | current — provisioning is not convergence: `up` does not run it |
+| `pi-bootstrap/setup.sh` (+ `SETUP-NEW-MACHINE.md`) | the Mac starter: config farm + `install-launchd.sh` | by hand, once per Mac | — | `install-launchd.sh`'s set | current for CONFIG; **incomplete for the harness** — it installs no controller and no apply timer, and `SETUP-NEW-MACHINE.md` described it only as "the scheduled jobs", which is why this went unnoticed |
+| `pi-bootstrap/cell-install.sh` | the cell starter: farms scripts/keys/shims into the layer | by hand, once per cell | — | — | current |
+
+#### What self-heals, and what does not
+
+`heal` (and `status`, which heals by default) re-drives **two kinds of thing, both of them safe while
+lanes are working**:
+
+1. **A role that is not running** — it installs what is missing, then starts it, then RE-READS the
+   state. The exit code is the re-read, never the installer's, because a start that returns 0 and
+   leaves the role dead is the defect this exists to end.
+2. **A pin that is BEHIND** (`harness-refresh.sh`'s advance kills nothing, #2278).
+
+**It never repairs the following, by design** — each is reported, with whose decision it is:
+
+* a **DANGLING** unit (its program or cwd was reaped). Restarting cannot fix a path that does not
+  exist, and inventing a new path is a decision: `heal` prints the missing path and stops.
+* a **DUPLICATE** (two controllers for one repo/state dir). Which one to stop is a human decision, and
+  a health verb that kills a controller is a lane-killer.
+* a **live-but-LATE** role. Cycling it would drop in-flight lanes.
+* a role the read **could not measure** (`UNKNOWN`). Cannot-verify is never repaired by guessing.
+* **anything the box has no mechanism for** (the `doctor` role on macOS). `SKIPPED` with a reason, never
+  a green line.
+
+#### Two documents this section corrects
+
+* `pi-bootstrap/SETUP-NEW-MACHINE.md` said macOS setup "also installs the scheduled jobs via
+  `scripts/install-launchd.sh`". That is true and it is not the whole harness: a Mac got NO controller
+  and NO apply timer from the starter, and nothing said so. The doc now names `harness-up up` as the
+  second step.
+* `ARCHITECTURE.md` §7 (triage) told the reader to check `launchctl list | grep orchestrator` for a
+  queue that is not moving. That check answers "is a job loaded"; it cannot answer "is the apply clock
+  even installed", which is the state that was measured. It now points at `harness-up status` and its
+  role rows as well.
+
 ### Deliberate stop (handing the laptop to a human)
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
