@@ -237,7 +237,7 @@ if [ "$1" = "api" ]; then
         # #2872: STUB_BODY_FAIL models a transient read FAILURE, which the
         # recovery verb must report as "could not read" — never as "no marker"
         # ("we could not look" is not "it is not there").
-        [ "${STUB_BODY_FAIL:-0}" = "1" ] && exit 1
+        [ "${STUB_BODY_FAIL:-0}" = "1" ] && { printf '%s' "${STUB_BODY_FAIL_TEXT:-}"; exit 1; }
         printf '%s' "${STUB_BODY:-PR body}"
         exit 0
     fi
@@ -2723,7 +2723,7 @@ export STUB_BODY="$(rb_marker 424934 "review recorded: reviews/424934.json verdi
 run_recover 424934 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14w a corrupt record is refused (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "NOT a usable record" "11.14w …and it is named as unusable, not as 'nothing to repair'"
-assert_contains "$(cat "$T/rb-err")" "Move it aside" "11.14w …with a way out"
+assert_contains "$(cat "$T/rb-err")" "move it aside" "11.14w …with a way out"
 
 # (x) NO SILENT POSITIONAL DROP. `--recover-body 42 o/r clean-low <sha>` used to
 #     take $2 as the repo and DISCARD the verdict and head, minting the marker's
@@ -2736,6 +2736,43 @@ RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
 assert_eq "$RB_RC" "2" "11.14x extra positionals with --recover-body are refused (exit 2)"
 if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424935.json" ]; then bad "11.14x the positional form minted a record"; else ok "11.14x …and nothing is written"; fi
 unset STUB_BODY RB_OUT RB_RC RB_FOREIGN_JSON
+
+# (y) A RECORD IS WHAT THE GATE CAN READ, NOT WHAT THIS RECORDER WROTE. A
+#     pretty-printed record (a `jq .` round-trip) parses fine for the gate, so
+#     calling it "NOT a usable record" and telling an operator to move it aside
+#     would walk the gate BACKWARDS. It must be treated as an existing record.
+rb_clear
+printf '%s\n' '{' '  "pr": 424936,' '  "head_sha": "ffffffffffffffffffffffffffffffffffffffff",' '  "verdict": "clean",' '  "repo": "daniel-ospina/agent-infra",' '  "reviewed_at": "2026-02-02T00:00:00Z"' '}' > "$RB_RDIR/daniel-ospina-agent-infra-424936.json"
+export STUB_BODY="$(rb_marker 424936 "review recorded: reviews/424936.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+run_recover 424936 "$RB_REPO"
+assert_eq "$RB_RC" "5" "11.14y a pretty-printed (jq round-trip) record counts as existing (exit 5)"
+assert_contains "$(cat "$T/rb-err")" "already exists" "11.14y …and is NOT called unusable, because the gate reads it fine"
+
+# (z) A PERMANENT ERROR IS NOT A TRANSIENT ONE. A 404 on the PR read used to say
+#     "RETRY", which a lane can obey forever.
+rb_clear
+export STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)'
+run_recover 424937 "$RB_REPO"
+unset STUB_BODY_FAIL STUB_BODY_FAIL_TEXT
+assert_eq "$RB_RC" "3" "11.14z a 404 on the PR read is refused (exit 3)"
+assert_contains "$(cat "$T/rb-err")" "retrying will NOT help" "11.14z …and does not tell the lane to RETRY a permanent failure"
+assert_contains "$(cat "$T/rb-err")" "Not Found" "11.14z …quoting what gh actually said"
+
+# (aa) SHAPE PIN: the final write is a NO-CLOBBER create, not a rename. A
+#      check-then-`mv` leaves a window in which a concurrent recorder's verdict is
+#      replaced; `ln` fails with EEXIST instead. (A shape pin, not a race: the
+#      window cannot be opened from a test.)
+if grep -qF 'ln "$RB_TMP" "$RB_FILE" 2>/dev/null' "$RECORD"; then
+    ok "11.14aa the write uses a no-clobber atomic create (ln), not check-then-mv"
+else
+    bad "11.14aa the write is not a no-clobber create — a concurrent record can still be replaced"
+fi
+if grep -qF 'mv "$RB_TMP" "$RB_FILE"' "$RECORD"; then
+    bad "11.14aa a plain mv to the record path is still present"
+else
+    ok "11.14aa …and no plain mv to the record path remains"
+fi
+unset STUB_BODY RB_OUT RB_RC
 
 
 # ─────────────────────────────────────────────────────────────────────────

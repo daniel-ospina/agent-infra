@@ -91,7 +91,7 @@
 #             `--recover-body` would look like a successful recovery)
 #     exit 3  NOTHING WRITTEN, and each cause is named on stderr:
 #               · no USABLE marker — absent, unsigned, bad signature, or one
-#                 signed for a DIFFERENT repo
+#                 naming a DIFFERENT repo
 #               · a `clean-low` marker (see above)
 #               · no AI_REVIEW_GATE_KEY, so a marker's signature cannot be
 #                 VERIFIED (and an unverified marker is a body edit)
@@ -100,9 +100,11 @@
 #                 lower bound for `reviewed_at` cannot be stated
 #     exit 5  recovery fills an ABSENCE and never replaces one: a record for this
 #             PR/repo already exists (including one that appeared WHILE this verb
-#             was reading the PR), or the qualified file embeds ANOTHER repo — the
+#             was reading the PR), the qualified file embeds ANOTHER repo — the
 #             identical-slug overwrite state, which the gate reads as absent but
-#             which this verb will not destroy.
+#             which this verb will not destroy — or an existing record is NOT
+#             usable (truncated/hand-edited), which is named with a move-aside
+#             remedy (do NOT read that as "a verdict already exists, do nothing")
 #
 # Records a code-review verdict for a PR into ~/.pi/agent/reviews/<PR>.json,
 # consumed by the review-enforcer merge registry gate
@@ -1949,7 +1951,16 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   # repair about a file the GATE calls `corrupt`/NO-RECORD (and whose own message
   # now points here). That is the round-1 loop shape in a different state.
   rb_record_usable() { # <file> -> 0 when it carries the fields a record is read by
-    grep -q '"head_sha":"' "$1" 2>/dev/null && grep -q '"verdict":"' "$1" 2>/dev/null
+    # ⛔ FORMAT-AGNOSTIC, LIKE THE GATE (round 3, P2). This greps the COMPACT form
+    # the recorder writes; the gate JSON-parses the file, so a `jq .` round-trip
+    # (the literal "hand-edited file") is a VALID record to the gate. Reading it as
+    # unusable would then tell an operator to move aside a record the gate is
+    # honouring — and recovery would mint an OLDER verdict over it.
+    if command -v jq >/dev/null 2>&1; then
+      command jq -e 'has("head_sha") and has("verdict")' "$1" >/dev/null 2>&1 && return 0
+      return 1
+    fi
+    grep -q '"head_sha"' "$1" 2>/dev/null && grep -q '"verdict"' "$1" 2>/dev/null
   }
   rb_foreign_repo_of() { # <file> -> the embedded repo, or empty
     command sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | command head -1
@@ -1959,7 +1970,7 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     exit 5
   }
   rb_refuse_unusable() { # <file> — exit 5, naming it as not-a-record and a way out
-    echo "record-review.sh --recover-body: ${1/#$HOME/~} exists but is NOT a usable record — it carries no readable head_sha/verdict (a truncated or hand-edited file), so the merge gate treats it as ABSENT and 'there is nothing to repair here' would be false. Move it aside and re-run this command; nothing was written." >&2
+    echo "record-review.sh --recover-body: ${1/#$HOME/~} exists but is NOT a usable record — it carries no readable head_sha/verdict (a truncated or malformed file), so the merge gate treats it as ABSENT and 'there is nothing to repair here' would be false. If the gate CAN read it (a valid record some other writer formatted differently), LEAVE IT — this verb will not overwrite one; otherwise move it aside and re-run. Nothing was written." >&2
     exit 5
   }
   if [ -f "$RB_FILE" ]; then
@@ -1973,8 +1984,23 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     echo "record-review.sh --recover-body: a record for $REPO#$PR already exists ($( [ -f "$RB_FILE" ] && echo "${RB_FILE/#$HOME/~}" || echo "${RB_LEGACY/#$HOME/~}" )) — recovery fills an ABSENCE and will not replace it. There is nothing to repair here; land it, or if the diff has moved since, ask what the gate thinks: record-review.sh --check-carry $PR $REPO" >&2
     exit 5
   fi
-  if ! RB_BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null)"; then
-    echo "record-review.sh --recover-body: could not READ the PR body (transient API failure?) — that is not 'no marker'. RETRY; nothing was written." >&2
+  # ⛔ A PERMANENT FAILURE IS NOT A TRANSIENT ONE (round 3, P2). Both reads below
+  # used to say "RETRY" for every non-zero exit — so a 404 (wrong PR number, or a
+  # repo this token cannot see) sent a lane round a loop that can never converge.
+  # The rest of this file is careful about exactly this (#1398: an operator sent
+  # chasing a phantom auth problem), so the error TEXT is captured and branched on.
+  rb_is_permanent_gh_error() { # <captured stderr/stdout> -> 0 when retrying cannot help
+    case "$1" in
+      *"Not Found"*|*"HTTP 404"*|*"status 404"*|*"HTTP 422"*|*"status 422"*|*"No commit found"*) return 0 ;;
+    esac
+    return 1
+  }
+  if ! RB_BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>&1)"; then
+    if rb_is_permanent_gh_error "$RB_BODY"; then
+      echo "record-review.sh --recover-body: the PR could not be read and retrying will NOT help — gh said: $(printf '%s' "$RB_BODY" | command head -1 | cut -c1-160). Check the owner/repo argument and the PR number (a PR this token cannot see reads exactly like a missing one). Nothing was written." >&2
+    else
+      echo "record-review.sh --recover-body: could not READ the PR body (transient API failure?) — that is not 'no marker'. RETRY; nothing was written." >&2
+    fi
     exit 3
   fi
   [ "$RB_BODY" = "null" ] && RB_BODY=""
@@ -2006,6 +2032,8 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     RB_RE="^review recorded: reviews/${PR}\.json verdict=(clean|clean-micro|clean-low) @ [0-9a-f]{40}( diff=[0-9a-f]{64})? \(([^)]+)\)$"
     [[ "$_text" =~ $RB_RE ]] || { RB_NBAD=$((RB_NBAD + 1)); continue; }
     [ "${BASH_REMATCH[3]}" = "$REPO" ] || { RB_NFOREIGN=$((RB_NFOREIGN + 1)); continue; }
+    # (the HMAC is verified below for THIS repo's marker only, so the foreign-arm
+    # message must not claim a signature was checked — see the wording there.)
     _expect="$(printf '%s' "$_text" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
     if [ -z "$_expect" ] || [ "$_expect" != "$_sig" ]; then
       RB_NBAD=$((RB_NBAD + 1)); continue
@@ -2019,7 +2047,7 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     if [ "$RB_NBAD" -gt 0 ]; then
       echo "record-review.sh --recover-body: $REPO#$PR has $RB_NBAD marker line(s) for this PR but NONE whose signature verifies with this box's gate key — a marker whose HMAC does not verify is a body EDIT, not evidence, so nothing was written. (A wrong AI_REVIEW_GATE_KEY, a marker from a differently-keyed repo, or a forged line all present this way.)" >&2
     elif [ "$RB_NFOREIGN" -gt 0 ]; then
-      echo "record-review.sh --recover-body: $REPO#$PR has a signed marker for a DIFFERENT repo ($RB_NFOREIGN line(s)) and none for $REPO — PR numbers collide across repos, so this is refused rather than adopted. Check the owner/repo argument." >&2
+      echo "record-review.sh --recover-body: $REPO#$PR has a marker naming a DIFFERENT repo ($RB_NFOREIGN line(s)) and none for $REPO — PR numbers collide across repos, so this is refused rather than adopted. Check the owner/repo argument. (Its signature was NOT checked: this verb only verifies a marker that names the repo it was asked about.)" >&2
     else
       # ⛔ AN ABSENCE OF EVIDENCE IN THIS BODY IS NOT A VERDICT ABOUT THE REVIEW
       # (review, #2872 P2). The evidence post is BEST-EFFORT — the recorder saves
@@ -2062,11 +2090,21 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   # recovered record loses to any peer record with a later stamp — which is the
   # safe direction (the peer keeps its verdict), and is why this field must never
   # be inflated. `mint=recovered-body` + `recovered_at` say what it really is.
-  RB_AT="$(command gh api "repos/$REPO/commits/$RB_HEAD" --jq .commit.committer.date 2>/dev/null || true)"
+  # `|| RB_AT_RC=$?` is load-bearing: this script runs under `set -e`, so a bare
+  # `VAR="$(cmd)"` whose command fails ABORTS the whole verb with the command's
+  # status (measured: exit 1 where this mode documents 3), skipping every branch
+  # below. The capture is what makes the permanent-vs-transient split reachable.
+  RB_AT_RC=0
+  RB_AT_RAW="$(command gh api "repos/$REPO/commits/$RB_HEAD" --jq .commit.committer.date 2>&1)" || RB_AT_RC=$?
+  RB_AT="$RB_AT_RAW"
   case "$RB_AT" in
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) ;;
     *)
-      echo "record-review.sh --recover-body: could not read the committer date of ${RB_HEAD:0:12}… (got '${RB_AT:0:40}'), so even a LOWER BOUND for reviewed_at cannot be stated — and this verb will not stamp a time the review did not happen (tortoise#7391). RETRY; nothing was written." >&2
+      if [ "$RB_AT_RC" -ne 0 ] && rb_is_permanent_gh_error "$RB_AT_RAW"; then
+        echo "record-review.sh --recover-body: the marker names head ${RB_HEAD:0:12}… but this repo has no such commit and retrying will NOT help — gh said: $(printf '%s' "$RB_AT_RAW" | command head -1 | cut -c1-160). A force-pushed marker head, or a commit that only exists on a fork, reads this way: re-record at the current head instead. Nothing was written." >&2
+      else
+        echo "record-review.sh --recover-body: could not read the committer date of ${RB_HEAD:0:12}… (got '${RB_AT:0:40}'), so even a LOWER BOUND for reviewed_at cannot be stated — and this verb will not stamp a time the review did not happen (tortoise#7391). RETRY; nothing was written." >&2
+      fi
       exit 3 ;;
   esac
   mkdir -p "$HOME/.pi/agent/reviews"
@@ -2092,7 +2130,21 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   [ -n "$RB_DIFF" ] && RB_DIFF_FIELD="\"diff_sha256\":\"$RB_DIFF\","
   printf '{"pr":%d,"head_sha":"%s",%s"mint":"recovered-body","recovered_at":"%s","marker_sig":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
     "$PR" "$RB_HEAD" "$RB_DIFF_FIELD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RB_SIG" "$RB_VERDICT" "$REPO" "$RB_AT" > "$RB_TMP"
-  mv "$RB_TMP" "$RB_FILE"
+  # ⛔ THE LAST STEP IS ATOMIC, NOT CHECK-THEN-RENAME (round 3, P2). The re-check
+  # above narrows the window to a couple of subprocesses; only a NO-CLOBBER CREATE
+  # closes it. `ln` in the SAME directory is the portable compare-and-swap: it
+  # fails with EEXIST rather than replacing, so a record that appears in the last
+  # instant is reported instead of silently destroyed.
+  if ! ln "$RB_TMP" "$RB_FILE" 2>/dev/null; then
+    rm -f "$RB_TMP"
+    if [ -f "$RB_FILE" ] && ! rb_names_this_repo "$RB_FILE"; then
+      echo "record-review.sh --recover-body: a FOREIGN-repo record for $REPO#$PR took the path in the last instant — refusing to destroy another repo's verdict. Nothing was written." >&2
+    else
+      echo "record-review.sh --recover-body: a record for $REPO#$PR appeared in the LAST INSTANT (the atomic create refused: it already exists) — refusing to replace it with an older verdict. Nothing was written; re-run --check-carry to see which verdict now stands." >&2
+    fi
+    exit 5
+  fi
+  rm -f "$RB_TMP"
   printf 'recovered\t%s\t%s\n' "$RB_HEAD" "${RB_DIFF:--}"
   echo "record-review.sh --recover-body: restored ${REPO}#$PR from the SIGNED marker in the PR body → ${RB_FILE/#$HOME/~} (verdict=${RB_VERDICT}, head=${RB_HEAD:0:12}…, mint=recovered-body). ⛔ reviewed_at is a LOWER BOUND, not the mint time: the review happened at or after the head commit's committer date ($RB_AT) — this box did not observe the mint, and recovered_at says when the restoration happened. This restores a verdict, it does not certify one: ask the gate whether it still covers what would merge — record-review.sh --check-carry $PR $REPO" >&2
   exit 0
@@ -3119,11 +3171,23 @@ if [ -n "$CARRY_ARM" ]; then
     PRIOR_HEAD="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
     PRIOR_AT="$(sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
   fi
-  if [ -n "$PRIOR_AT" ] && [ "$PRIOR_HEAD" = "$ORIG_SHA" ]; then
+  # ⛔ A RECOVERED reviewed_at IS A LOWER BOUND, NOT A MINT TIME (#2872 review,
+  # round 3). Carrying it forward verbatim and printing "preserved as the ORIGINAL
+  # mint time" would launder a commit date into a mint time and drop the
+  # `recovered-body` label at the same moment — the tortoise#7391 corruption this
+  # whole arm exists to prevent. So a recovered predecessor falls into the honest
+  # branch below, which says the mint time is NOT recoverable.
+  PRIOR_RECOVERED=0
+  if [ -f "$FILE" ] && grep -q '"mint":"recovered-body"' "$FILE"; then PRIOR_RECOVERED=1; fi
+  if [ "$PRIOR_RECOVERED" -eq 0 ] && [ -n "$PRIOR_AT" ] && [ "$PRIOR_HEAD" = "$ORIG_SHA" ]; then
     REVIEWED_AT="$PRIOR_AT"
     echo "tortoise#7391 carry provenance: reviewed_at preserved as the original mint time $PRIOR_AT (mint=carried, carried_from=${ORIG_SHA:0:12}…)" >&2
   else
-    echo "⚠️ tortoise#7391: CARRIED record for ${REPO:-<no-repo>}#$PR and the ORIGINAL mint time is not recoverable (no record on disk names ${ORIG_SHA:0:12}… with a reviewed_at) — reviewed_at is the CARRY time, not the mint time; \`mint\`/\`carried_at\` say so." >&2
+    if [ "$PRIOR_RECOVERED" -eq 1 ]; then
+      echo "⚠️ tortoise#7391 / #2872: CARRIED record for ${REPO:-<no-repo>}#$PR whose predecessor was RECOVERED from a marker — that record's reviewed_at was a LOWER BOUND (the head commit's date), not a mint time, so it is NOT inherited. reviewed_at is the CARRY time; \`mint\`/\`carried_at\` say so." >&2
+    else
+      echo "⚠️ tortoise#7391: CARRIED record for ${REPO:-<no-repo>}#$PR and the ORIGINAL mint time is not recoverable (no record on disk names ${ORIG_SHA:0:12}… with a reviewed_at) — reviewed_at is the CARRY time, not the mint time; \`mint\`/\`carried_at\` say so." >&2
+    fi
   fi
 fi
 if [ -n "$REPO" ]; then
