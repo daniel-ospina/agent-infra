@@ -69,10 +69,11 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # reason no diff explains. THIS file's thresholds (`THRESHOLD`, `THRESHOLD_LANGUAGE`,
 # `THRESHOLD_JARGON`) and `turn-classify.py`'s `MIN_CONFIDENCE` are therefore the FIRST thing to
 # re-derive when a verdict looks wrong.
-# ⚠️ Each caller shows the move for ITSELF, and both are asserted: this file prints the answer's
-# version on its summary line (`model=<echo>` beside the token counts below) and
-# `turn-classify.py` puts the same echo in `meta["model"]`. Read that field first: it is the
-# value the RESPONSE carried, never `JEV_MODEL` — which is the alias we sent.
+# ⚠️ Each caller shows the move for ITSELF, and all THREE are asserted: this file prints the
+# answer's version on its summary line (`model=<echo>` beside the token counts below — the
+# token branch; the cost-only branch carries no version), `turn-classify.py` puts the same
+# echo in `meta["model"]`, and the words layer keeps it for its report header. Read that
+# field first: it is the value the RESPONSE carried, never `JEV_MODEL` — the alias we sent.
 # Pinning a version again is a one-line change in EACH of these five copies — a partial re-pin
 # is the same split-brain this round fixed in the other direction — and it needs the bars
 # re-derived on that version FIRST, which is why it is a decision and not a default:

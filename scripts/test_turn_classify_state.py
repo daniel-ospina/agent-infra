@@ -191,7 +191,8 @@ def test_every_published_verdict_is_classified():
 # vendor ships — and a literal assertion against an alias CANNOT notice that (it passes on every
 # future release). What notices it is the ECHO: the response carries the concrete version that
 # answered, `jev_choice` puts it in `meta["model"]`, and the legs below assert that echo is the
-# one recorded. Re-derive the bars when that echo moves past 1.13.
+# one recorded. That echo ALREADY reads `jev-1.14.0`, so the bars are owed a first real
+# calibration against the vendor (#2918) — not a future trigger, a current one.
 
 class _Resp:
     """Minimal stand-in for the urlopen context manager the caller uses."""
