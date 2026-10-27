@@ -57,18 +57,21 @@ os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # ⛔ THE MODEL IS THE ALIAS, BY OWNER RULING (2026-10-27): "let's use jev latest".
 #
-# What that accepts, stated here so a later lane does not have to rediscover it: every bar in
-# the CALIBRATION table below was calibrated on the LOOKALIKE host's `jev-1.13.0` and not
-# re-measured since the migration (tortoise#7864), so re-deriving it is a FIRST real
-# calibration, not a repeat. `jev-latest` already resolves to `jev-1.14.0` on the live API,
-# so the marks are now scored by a model that moves when the vendor ships, WITHOUT any
+# What that accepts, stated here so a later lane does not have to rediscover it: every
+# JEV-SCORED bar in the CALIBRATION table below was calibrated on the LOOKALIKE host's
+# `jev-1.13.0` and not re-measured since the migration (tortoise#7864), so re-deriving it is a
+# FIRST real calibration, not a repeat. `jev-latest` already resolves to `jev-1.14.0` on the live
+# API, so the marks are now scored by a model that moves when the vendor ships, WITHOUT any
 # change to this file — the vendor's own guidance warns
 # exactly about this ("an alias moves when a new release ships ... if you have tuned
 # confidence thresholds against one version, send that version's ID instead of the alias").
 # ⚠️ The consequence is not that the gate stops working; it is that a verdict can shift for a
-# reason no diff explains. THIS file's thresholds (`THRESHOLD`, `THRESHOLD_LANGUAGE`,
-# `THRESHOLD_JARGON`) and `turn-classify.py`'s `MIN_CONFIDENCE` are therefore the FIRST thing to
-# re-derive when a verdict looks wrong.
+# reason no diff explains. The JEV-SCORED bars — `THRESHOLD`, `THRESHOLD_LANGUAGE` and
+# `turn-classify.py`'s `MIN_CONFIDENCE` — are therefore the FIRST thing to re-derive when a
+# verdict looks wrong. ⛔ `THRESHOLD_JARGON` is NOT in that list: it sits over the two MECHANICAL
+# marks (`language_marks()` — no Jev call, see the note at `:132`), so the model cannot move it and
+# re-deriving it after a model-version change measures nothing. Calibration debt for the two
+# Jev-scored bars is recorded on #1476; `MIN_CONFIDENCE` on #2918.
 # ⚠️ Each caller shows the move for ITSELF, and all THREE are asserted — each by a leg that
 # fails when its own site is reverted to the constant: this file's summary line at its PRINT
 # SITE (`test_the_printed_summary_line_reports_the_echoed_version_…`, which drives the real

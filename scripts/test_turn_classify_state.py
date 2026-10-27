@@ -190,9 +190,12 @@ def test_every_published_verdict_is_classified():
 # the migration (tortoise#7864). So the voting model now moves whenever the
 # vendor ships — and a literal assertion against an alias CANNOT notice that (it passes on every
 # future release). What notices it is the ECHO: the response carries the concrete version that
-# answered, `jev_choice` puts it in `meta["model"]`, and the legs below assert that echo is the
-# one recorded. That echo ALREADY reads `jev-1.14.0`, so the bars are owed a first real
-# calibration against the vendor (#2918) — not a future trigger, a current one.
+# answered, `jev_choice` puts it in `meta["model"]`, and the leg below
+# (`test_call_shape_and_meta_carry_tokens_not_an_invented_cost`) asserts that echo is the one
+# recorded. That echo ALREADY reads `jev-1.14.0`, so the Jev-scored bars are owed a first real
+# calibration against the vendor — a current debt, not a future trigger: `MIN_CONFIDENCE` is
+# tracked on #2918, and `ask-owner.py`'s `THRESHOLD` / `THRESHOLD_LANGUAGE` on #1476 (its
+# `THRESHOLD_JARGON` is NOT owed one: it sits over the mechanical marks, which make no Jev call).
 
 class _Resp:
     """Minimal stand-in for the urlopen context manager the caller uses."""
