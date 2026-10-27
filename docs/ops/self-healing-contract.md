@@ -564,12 +564,20 @@ the caller sees a `RATE-LIMITED` verdict rather than an in-call sleep that outli
 
 **What it may and may not gate (measured 2026-10-27, cell 4).** Only work that ADDS a new CI run: the
 issue→PR path, batch dispatch, and a rerun. **Repair is never queue-gated** — a red-check fixer, a
-review-findings fixer, a conflict fixer and the PR-sickness queue all act on a PR whose head already
-exists and whose CI pass is already spent, so its bound is this box's lane slots and load gate instead.
-Gating repair on the queue skipped **41 consecutive dispatches in one window** while 8 self-hosted
-runners and ~11 lane slots sat idle: the queue being read belonged to GitHub-HOSTED concurrency. The
-ceiling's `runners` term is the fleet's registered/online size — never the count of in-progress JOBS,
-which is demand and reads smallest exactly when the box is idle.
+review-findings fixer, a conflict fixer and the PR-sickness queue all act on a PR that already exists,
+so their bound is this box's lane slots and load gate instead. The basis is a decision plus a
+measurement, **not** a cost claim: a repair push *does* start a fresh run (it also supersedes that PR's
+own run — `ci.yml` pins `concurrency: cancel-in-progress` — so it does not stack depth onto the queue),
+and what the measurement showed is that the number being gated on was the wrong quantity. Gating repair
+on the queue skipped **41 consecutive dispatches in one window** while 8 self-hosted
+runners and ~11 lane slots sat idle: the queue being read belonged to GitHub-HOSTED concurrency.
+The ceiling's `runners` term is the fleet's registered/online size, or the account's hosted allowance
+when the endpoint answers a parsed `total_count: 0`. ⛔ It is **never the in-progress job count when
+nothing could be read** (branch (c)): there the term is the module's own one-runner floor and the token
+names the reading that failed (`fleet=unreadable(…)`). The one branch that keeps the in-progress count
+is the measured-poor one — the endpoint answered with a DECLARED fleet and nothing online — where
+executing jobs are a genuine supply lower bound, and dropping it there was measured to pin the ceiling
+at 2 (arm (b12)).
 IDLE = the queue is below the bound; REFUSING = at/over it, with the version string naming why.
 
 **What repairs it.** Nothing on the box — this is a *wait* state, and the remedy is fewer lanes, which

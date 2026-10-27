@@ -3156,9 +3156,10 @@ fi
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
 # ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY, AND IN BOTH DIRECTIONS.
 # ⛔ THE FIXER DEFER COUNT IS NOW ZERO ON PURPOSE (#2927). The three fixer spawn sites used to nest a
-# `ciq_push_ok` deferral inside their own eligibility. They no longer do: a fixer is REPAIR — the PR
-# and its head already exist and its CI pass is already spent — so the class rule in ci-queue.sh's
-# header excludes it from queue gating. Measured 2026-10-27 on cell 4, that gate skipped 41
+# `ciq_push_ok` deferral inside their own eligibility. They no longer do: a fixer is REPAIR — it acts
+# on a PR that already exists — so the class rule in ci-queue.sh's header excludes it from queue
+# gating. ⛔ NOT because "its pass is already spent" (a repair push DOES start a fresh run): the basis
+# is #2927's decision plus the measurement that the NUMBER was demand read as supply. Measured 2026-10-27 on cell 4, that gate skipped 41
 # consecutive repair dispatches while 8 self-hosted runners and ~11 lane slots sat idle, against a
 # queue depth that belonged to GitHub-HOSTED concurrency and to NEW-PR work.
 # So `fixer_defer_sites`/`fixer_defer_shared` are pinned at 0: a gate RE-ADDED to any fixer arm
@@ -3174,11 +3175,11 @@ review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
 [ "$fixer_defer_sites" = "0" ] && rc=0 || rc=1
-ck "NO fixer spawn arm is CI-queue-gated (#2927 — repair adds no new CI run; found $fixer_defer_sites, expected 0)" $rc
+ck "NO fixer spawn arm is CI-queue-gated (#2927 — a fixer is REPAIR; found $fixer_defer_sites, expected 0)" $rc
 [ "$fixer_defer_shared" = "0" ] && rc=0 || rc=1
 ck "…and the review-gate fixer's eligibility no longer shares a queue gate either (found $fixer_defer_shared, expected 0)" $rc
 [ "$rerun_gate" = "1" ] && rc=0 || rc=1
-ck "…while the one act that DOES add a run to the queue — the CI rerun — is still gated (found $rerun_gate, expected 1)" $rc
+ck "…while the one act that ADDS a run to the queue — the CI rerun — is still gated (found $rerun_gate, expected 1)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
 ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1

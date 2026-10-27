@@ -95,8 +95,9 @@ EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-ga
 # arm — the same "no record of the file that is gone" shape check-deployed-drift.sh's shipped-surface
 # half exists to close, reproduced one instrument over. Presence is about EXECUTION, so the test is
 # "does the daemon source/run it", not "did anyone think of it".
-# `ci-queue.sh` (#2296) is here on exactly that test: orch-loop.sh, fix-one.sh AND dispatch-merge.sh all
-# source `$O/ci-queue.sh`, so a box without it loses the CI-queue gate on all three surfaces at once —
+# `ci-queue.sh` (#2296) is here on exactly that test: orch-loop.sh AND dispatch-merge.sh source
+# `$O/ci-queue.sh` (#2927 removed `fix-one.sh`'s — repair does not read the queue), so a box without it
+# loses the CI-queue gate on both remaining surfaces at once —
 # and every one of their interface guards would treat the missing module as "inert" rather than broken.
 # ⛔ `lane-bound.sh` IS HERE ON THE SAME TEST, AND ITS ABSENCE IS THE DEGRADED-BUT-SILENT CASE (2026-10-27).
 # `run_agent` executes `$O/lane-bound.sh` for EVERY lane's lifetime bound; a `$O` without it does not

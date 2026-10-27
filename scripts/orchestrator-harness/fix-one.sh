@@ -202,9 +202,11 @@ fi
 # fixer and a reviewer never race each other for the same content version.
 # ── NO CI-QUEUE GATE IN THE FIXER: A FIXER IS REPAIR (#2927) ─────────────────────
 # This block used to read the repo's CI queue and EXIT the fixer on a deep one, on the argument that a
-# fixer's product is a new head and so a full CI pass. Measured against the queue that argument is
-# wrong: the head already exists and its pass has already been paid for, and the queue depth the block
-# read was GitHub-HOSTED concurrency belonging to NEW-PR work. On 2026-10-27 it deferred 41
+# fixer's product is a new head and so a full CI pass. ⛔ THAT ARGUMENT IS TRUE AND STILL NOT A REASON TO
+# GATE: a repair push does start a fresh run. What was wrong is the NUMBER — the queue depth the block
+# read was GitHub-HOSTED concurrency belonging to NEW-PR work, and it was DERIVED from the in-progress
+# job count, so it read smallest when the box was idle (#2927). Repair's bound is a lane slot, not a
+# queue depth, and #2927 records that as a decision rather than as a cost claim. On 2026-10-27 it deferred 41
 # consecutive repair dispatches on cell 4 verbatim (`skip #<n>: backpressure(q=27..33, r=~2)`, with 8
 # idle self-hosted runners and ~11 free lane slots), and this file was the last-line half of that
 # gate: a lane the controller had already decided to start could still refuse itself.

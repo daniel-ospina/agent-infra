@@ -885,9 +885,10 @@ fi
 # reporting a healthy controller.
 if [ "${CIQ:-0}" = "1" ]; then
   # ⛔ ONE CONSUMER LEFT, AND THAT IS THE POINT (#2927). `ciq_push_ok` gates the CI-RERUN site only.
-  # The three FIXER spawn arms no longer call it: they are REPAIR (an existing PR whose CI pass is
-  # already spent), and the class rule in `ci-queue.sh`'s header says only work that ADDS a new CI run
-  # is queue-gated. A rerun is exactly that — it queues a fresh run for the same head — so it keeps
+  # The three FIXER spawn arms no longer call it: they are REPAIR (an existing PR), and the class rule
+  # in `ci-queue.sh`'s header says only work that ADDS a new CI run is queue-gated. ⛔ The old gloss here
+  # — "whose CI pass is already spent" — was wrong (a repair push DOES start a fresh run); the basis is
+  # #2927's decision plus the measurement that the number was demand read as supply. A rerun is exactly that — it queues a fresh run for the same head — so it keeps
   # the gate. Measured 2026-10-27: the fixer arms' call to this predicate was the last-line half of a
   # gate that skipped 41 consecutive repair dispatches with 8 idle runners and ~11 free lane slots.
   # The predicate itself is unchanged (capture + memo); if a future arm needs it, it must be a
@@ -4556,8 +4557,9 @@ while true; do
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
             # ⛔ NO CI-QUEUE GATE ON THIS SPAWN, AND THIS IS THE ARM THAT PROVES THE RULE (#2927).
-            # A CONFLICTED fixer is REPAIR: the PR and its head already exist and its CI pass has
-            # already been paid for. Measured 2026-10-27 on cell 4, the queue gate that used to wrap
+            # A CONFLICTED fixer is REPAIR: the PR and its head already exist. ⛔ Not "and its CI pass
+            # has already been paid for" — a repair push DOES start a fresh run; the basis is #2927's
+            # decision plus the measurement below. Measured 2026-10-27 on cell 4, the queue gate that used to wrap
             # this spawn deferred 41 consecutive repair dispatches against a queue that belonged to
             # GitHub-HOSTED concurrency, while 8 self-hosted runners and ~11 lane slots sat idle —
             # and it reported `ci-queue(deep(…))` as the binding reason for a box whose lanes were
@@ -4736,9 +4738,10 @@ while true; do
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
             # ⛔ NO CI-QUEUE GATE ON THIS SPAWN EITHER (#2927): a review-findings fixer is REPAIR (its
-            # head already exists and its CI pass is already spent), so the class rule in
-            # `ci-queue.sh`'s header excludes it — same measurement, same 41 skips, same idle fleet as
-            # the CONFLICTED arm above. What stays: the eligibility predicate is still HOISTED into
+            # head already exists), so the class rule in `ci-queue.sh`'s header excludes it — same
+            # measurement, same 41 skips, same idle fleet as the CONFLICTED arm above. ⛔ Not because its
+            # "pass is already spent" (a repair push does start a run): the basis is the decision plus
+            # the wrong-number measurement. What stays: the eligibility predicate is still HOISTED into
             # `_fix_eligible`, because the arms BELOW it (the attempt cap / park arm and the re-record
             # chain) must ask exactly the question the spawn arm asks — capacity, findings and the
             # attempt budget — and must not drift from it.
@@ -5164,7 +5167,7 @@ while true; do
     # ⛔ A FAILED PASS IS ITS OWN LINE, never an empty one. `ps_select` already names the cause (its
     # ENUMERATION FAILED / NOREAD lines land in $LOG above); this records that the QUEUE was not
     # evaluated, so "no [prsick] decisions" can never be read as "no sick PRs".
-    [ "$_ps_rc" -ne 0 ] && echo "[prsick] pass did not complete (rc=$_ps_rc) — the PR sickness queue was NOT evaluated this cycle; see the ENUMERATION/backpressure line above" >> "$LOG"
+    [ "$_ps_rc" -ne 0 ] && echo "[prsick] pass did not complete (rc=$_ps_rc) — the PR sickness queue was NOT evaluated this cycle; see the ENUMERATION FAILED / NOREAD line above" >> "$LOG"
   fi
   # [prsick-pass:end]
 

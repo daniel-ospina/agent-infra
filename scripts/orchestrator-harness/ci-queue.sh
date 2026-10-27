@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 # ci-queue.sh — CI BACK-PRESSURE: how deep is the repo's CI queue, and may this box send it more
-# work yet? Sourced by `orch-loop.sh` (the cycle's read, before dispatch), by `fix-one.sh` (the
-# lane whose whole job is to PUSH a new head), and by `dispatch-merge.sh` (the batch dispatcher),
-# and runnable STANDALONE (`bash ci-queue.sh status --repo owner/name`), because the same bytes must
-# answer the question on whichever surface asks it. It never calls `set` — a sourced library must
+# work yet? Sourced by `orch-loop.sh` (the cycle's read, before the ISSUE dispatch, plus the CI rerun
+# site) and by `dispatch-merge.sh` (the batch dispatcher) — and NOT by `fix-one.sh`, which stopped
+# reading it in #2927 because a fixer is REPAIR — and runnable STANDALONE
+# (`bash ci-queue.sh status --repo owner/name`), because the same bytes must answer the question on
+# whichever surface asks it. It never calls `set` — a sourced library must
 # not mutate its caller's shell options.
 #
-# ── COVERAGE, AND THE ONE DELIBERATE EXCLUSION (#2296 review cycle 4) ───────────────────────────
-# Gated: the controller's read before dispatch, the THREE fixer spawn arms whose product is a pushed
-# head (the CONFLICTED, the CI-red and the review-gate ones), every pre-push check in `fix-one.sh`,
-# the batch dispatcher, and the CI RERUN.
-# ⛔ AND ONE FIXER ARM IS NOT GATED YET, DISCLOSED RATHER THAN IMPLIED: the RED-TREE fixer
-# (`orch-loop.sh`'s `MAX_RED_FIX` spawn) books its attempt and spawns BEFORE any `ciq_push_ok` call,
-# so on a deep queue that lane still starts, is deferred by `fix-one.sh` on its first push, and hands
-# the attempt back through `fixbail` on a later cycle. The cost is CHURN — a fixer spawned to do work
-# it then declines to push — not added CI; the refund line names BOTH causes (`another box holds the
-# claim, or the CI-queue gate deferred the push`), so it does not misdirect anyone to a lease that
-# never existed. It is the fourth fixer spawn arm; home agent-infra #2408.
+# ── COVERAGE (#2296 review cycle 4, revised by #2927) ───────────────────────────────────────────
+# Gated, because each one ADDS a run to the queue: the ISSUE path (`orch-loop.sh`'s dispatch block,
+# which reads before dispatch), the CI RERUN, and the batch dispatcher `dispatch-merge.sh`.
+# ⛔ AND EVERY FIXER SURFACE IS *NOT* GATED, BY DESIGN — A FIXER IS REPAIR (#2927). This block used to
+# list the THREE fixer spawn arms (CONFLICTED, CI-red, review-gate) and every pre-push check in
+# `fix-one.sh` as GATED; that census outlived the gate. It is the class of coverage claim a reader
+# trusts and then stops checking (#2540) — read from the other side, an operator would have believed
+# the repair path was protected when this module no longer sees it at all. Repair acts on a PR that
+# already exists, so its bound is this box's lane slots (`MAX_LANES` vs lanes alive) and the
+# load/disk/headroom gate, which is what a lane actually consumes; the depth this gate prices is
+# CI concurrency belonging to NEW-PR work. See the class rule below for the basis, and #2927 for the
+# measurement (41 consecutive repair dispatches skipped while 8 runners and ~11 lane slots sat idle).
+# ⛔ THE FOURTH-ARM CHURN IS GONE WITH IT (#2408's disclosure, superseded). `orch-loop.sh`'s RED-TREE
+# fixer used to book its attempt, spawn, and then be turned away at `fix-one.sh`'s first push, so the
+# cost was CHURN. Nothing on the repair path reads this module now, so that refusal — and the refund
+# line that had to name both causes (`another box holds the claim, or the CI-queue gate deferred the
+# push`) — cannot happen. A lane that is started will push.
 # ⛔ AND IT IS NOT THE ONLY UNGATED PUSHER — this paragraph used to claim it was, which is the class
 # of coverage claim a reader trusts and then stops checking (#2540). `pr-doctor`'s `prfix` workers
 # are the other one, and they are not an orch-loop arm at all: `pr-doctor.py` spawns up to `MAX_FIX`
@@ -131,9 +138,21 @@
 #     steps. REPAIR — acting on a PR that already exists (a red-check fixer, a review-findings fixer,
 #     a conflict/rebase fixer, the PR-sickness queue) — is NOT queue-gated by this module and must
 #     not become so again: its real bounds are the lane slots (`MAX_LANES` vs lanes alive) and the
-#     load/headroom gate, and its head already owns the CI pass it is repairing. Gating repair on this
-#     number is what produced 41 skips while 11 lane slots and 8 runners sat idle. If a future change
-#     wants to defer a repair dispatch, it is not a tuning change — it re-opens #2927.
+#     load/headroom gate.
+#     ⛔ THE BASIS IS A DECISION PLUS A MEASUREMENT, NOT A COST CLAIM — and it used to be stated as a
+#     cost claim, which is what made it refutable. "Its pass is already spent" is NOT true: a repair
+#     push does start a fresh CI run. Two things are true, and they are what carry the exclusion:
+#       (i) the NUMBER was the wrong quantity — `queued=33 running=2` derived `ceiling=4` and read
+#           DEEP off demand-as-supply, so the gate was refusing repair on a reading of the box's own
+#           load rather than of the world's capacity; and
+#       (ii) on this repo a repair push SUPERSEDES rather than stacks — `ci.yml` pins
+#           `concurrency: {group: ci-${{ github.ref }}, cancel-in-progress: true}`, so the run it
+#           replaces leaves the queue with it.
+#     What does NOT change, and a fixer must still expect: the push voids that PR's head-bound review
+#     attestation (#2148), so the review chain re-runs.
+#     Gating repair on this number is what produced 41 skips while 11 lane slots and 8 runners sat
+#     idle. If a future change wants to defer a repair dispatch, it is not a tuning change — it
+#     re-opens #2927.
 #   * TWO DECLARED RESIDUALS ON THE MEASUREMENT ITSELF — both stated, neither closed by reading
 #     harder:
 #     (i) ONLY `status=queued` IS COUNTED (#2333 review, P2). A run parked behind an environment
@@ -254,6 +273,11 @@ ciq_record_usable() {
 #   CIQ_RUNNING runs executing now
 #   CIQ_RUNNERS runners that can execute them (measured; `~` lower bound when inferred)
 #   CIQ_BUSY    runners currently busy (blank when the endpoint did not answer)
+#   CIQ_FLEET   the fleet read's OWN disclosure — set ONLY on branch (c), where nothing was measured
+#               (`fleet=unreadable(<the endpoint's words>) fallback=…`). Empty when a count WAS
+#               measured. It is persisted in the record and restored by both cache arms, because a
+#               disclosure that survives only in memory is absent on exactly the path (cache) an
+#               operator reads it from (#2927).
 #   CIQ_CEILING the derived ceiling for CIQ_RUNNERS
 #   CIQ_STATE   fresh | cache | unknown
 #   CIQ_AGE     seconds the record has been standing (0 for a fresh read)
@@ -266,8 +290,8 @@ ciq_record_usable() {
 ciq_read() {
   # ⛔ EVERY NAME THIS FUNCTION ASSIGNS IS `local` (#2333 review, P2). `_errf` and `_sf` were the two
   # that were not, so a sourced `ciq_read` leaked them into the CALLER's shell — and this module is
-  # sourced into `orch-loop.sh`'s single 4,600-line cycle body plus `fix-one.sh` and
-  # `dispatch-merge.sh`. Nothing collides today; the module's own contract ("a sourced library must
+  # sourced into `orch-loop.sh`'s single 4,600-line cycle body and `dispatch-merge.sh` (it was sourced
+  # into `fix-one.sh` too until #2927 removed the repair path's last read). Nothing collides today; the module's own contract ("a sourced library must
   # not mutate its caller's shell") is what this list exists to honour, and a future local in the
   # caller would be silently clobbered mid-cycle.
   local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor="" _errf="" _rerrf="" _sf="" _fleetwhy=""
@@ -297,6 +321,13 @@ ciq_read() {
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
         CIQ_BUSY="$(printf '%s\n' "$cached" | sed -n 's/^busy=//p' | head -1)"
+        # ⛔ THE FLEET DISCLOSURE RIDES THE RECORD TOO (#2927). `CIQ_FLEET` is the ONE place branch (c)
+        # says WHICH reading failed (`fleet=unreadable(...)`), and both cache arms reset it — so on a
+        # TTL or staleness hit the token used to drop the disclosure and keep only `runners=~1`, i.e.
+        # exactly the "inference presented as a measurement" the field exists to prevent, on the path
+        # cache exists for. `busy=` is the precedent: a disclosure field carried through the record.
+        # An older record has no `fleet=` line, which reads as empty — no behaviour change.
+        CIQ_FLEET="$(printf '%s\n' "$cached" | sed -n 's/^fleet=//p' | head -1)"
         if ciq_is_count "${CIQ_QUEUED:-}" && ciq_is_count "${CIQ_RUNNERS#\~}"; then
           # ⛔ `cache`, NOT `fresh` (#2333 review P1). A TTL hit is a RECORD — up to `ttl` seconds
           # old — and calling it fresh is the exact claim this module exists to refuse: the token
@@ -373,6 +404,7 @@ ciq_read() {
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
         CIQ_BUSY="$(printf '%s\n' "$cached" | sed -n 's/^busy=//p' | head -1)"
+        CIQ_FLEET="$(printf '%s\n' "$cached" | sed -n 's/^fleet=//p' | head -1)"
         if ciq_is_count "${CIQ_QUEUED:-}" && ciq_is_count "${CIQ_RUNNERS#\~}"; then
           CIQ_STATE=cache; CIQ_AGE="$age"
           CIQ_CEILING="$(ciq_ceiling "${CIQ_RUNNERS#\~}")" || CIQ_CEILING=""
@@ -491,8 +523,10 @@ ciq_read() {
   rm -f "$dir/ciq-unknown-$(ciq_slug "$repo")" 2>/dev/null || true
   CIQ_CEILING="$(ciq_ceiling "${CIQ_RUNNERS#\~}")" || CIQ_CEILING=""
   mkdir -p "$dir" 2>/dev/null || true
-  { printf 'repo=%s\nqueued=%s\nrunning=%s\nrunners=%s\nbusy=%s\nat=%s\n' \
-      "$repo" "$CIQ_QUEUED" "$CIQ_RUNNING" "$CIQ_RUNNERS" "${CIQ_BUSY:-}" "$now"; } > "$f" 2>/dev/null || true
+  # `fleet=` is written even when empty: the cache arms restore whatever is here, and an EMPTY field
+  # is the honest value for every branch that DID measure (only branch (c) has something to disclose).
+  { printf 'repo=%s\nqueued=%s\nrunning=%s\nrunners=%s\nbusy=%s\nfleet=%s\nat=%s\n' \
+      "$repo" "$CIQ_QUEUED" "$CIQ_RUNNING" "$CIQ_RUNNERS" "${CIQ_BUSY:-}" "${CIQ_FLEET:-}" "$now"; } > "$f" 2>/dev/null || true
   return 0
 }
 

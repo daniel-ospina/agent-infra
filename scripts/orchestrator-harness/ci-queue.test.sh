@@ -395,6 +395,36 @@ ciq_read "$OR" >/dev/null 2>&1; rc=$?
 ck "(c6) an unreadable queue INSIDE the window falls back to the record and SAYS so (state=cache)" \
    "$( { [ "$rc" -eq 0 ] && [ "${CIQ_STATE:-}" = cache ]; } ; echo $? )"
 
+printf '\n── (c6b) the FLEET disclosure survives the cache ─────────────────────────\n'
+# ⛔ A DISCLOSURE THAT LIVES ONLY IN MEMORY IS ABSENT ON THE PATH OPERATORS READ IT FROM (#2927 review,
+# P3). `fleet=unreadable(...)` is the ONE place branch (c) says WHICH reading failed. It was printed
+# from `CIQ_FLEET` and nothing else, while the record carried only repo/queued/running/runners/busy/at
+# and both cache arms reset the field — so a TTL or staleness hit rendered `runners=~1 ceiling=2
+# state=cache` with the *why* silently dropped, i.e. exactly the inference-presented-as-a-measurement
+# the field exists to prevent, on the path (cache) the token exists for. `busy=` is the precedent: a
+# disclosure field carried through the record. Pinned in three parts — the WRITER persists it, the
+# READER restores it, and an OLDER record (no `fleet=` line) neither breaks nor invents one.
+feed 33 2 -
+ciq_read "$OR" >/dev/null 2>&1
+ck "(c6b) a branch-(c) read PERSISTS the fleet disclosure in the record" \
+   "$(grep -q '^fleet=fleet=unreadable(' "$REC"; echo $?)"
+qenv /nonexistent-gh 0 900
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+v="$(ciq_eval)"
+ck "(c6c) …and the record is served as CACHE when the live read fails (rc=$rc state=${CIQ_STATE:-?})" \
+   "$( { [ "$rc" -eq 0 ] && [ "${CIQ_STATE:-}" = cache ]; } ; echo $? )"
+has "$v" 'fleet=unreadable(the actions/runners endpoint refused'
+ck "(c6d) …and the CACHED token still NAMES the reading that failed (got: ${v})" "$?"
+# An older record has no `fleet=` line at all: it must restore as EMPTY (no behaviour change), never
+# as a disclosure the writer did not put there.
+printf 'repo=%s\nqueued=4\nrunning=2\nrunners=~1\nbusy=\nat=%s\n' "$OR" "$(date +%s)" > "$REC"
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+v="$(ciq_eval)"
+ck "(c6e) a record with NO fleet= line (an older record) still serves (rc=$rc)" \
+   "$( [ "$rc" -eq 0 ]; echo $? )"
+has "$v" 'fleet='
+ck "(c6f) …and it INVENTS no disclosure (got: ${v})" "$( [ $? -ne 0 ]; echo $? )"
+
 printf '\n── (c7) UNKNOWN defers (fail closed), and says which it was ───────────────\n'
 state
 qenv /nonexistent-gh 0 0
@@ -524,9 +554,10 @@ ck "(e2) orch-loop.sh reads the queue IN THIS SHELL (not a subshell), once per P
 grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
 n="$(grep -cF 'if ciq_push_ok; then' "$LOOP")"
-# ⛔ THE THREE FIXER SPAWN ARMS NO LONGER CONSULT THE QUEUE AT ALL (#2927). They are REPAIR — the PR
-# and its head already exist and its CI pass is already spent — and the class rule in ci-queue.sh's
-# header says only work that ADDS a new CI run is queue-gated. Measured 2026-10-27: those calls were
+# ⛔ THE THREE FIXER SPAWN ARMS NO LONGER CONSULT THE QUEUE AT ALL (#2927). They are REPAIR — they act
+# on a PR that already exists — and the class rule in ci-queue.sh's header says only work that ADDS a
+# new CI run is queue-gated. ⛔ NOT because the pass is "already spent": a repair push DOES start a
+# fresh run. The basis is #2927's decision plus the measurement below. Measured 2026-10-27: those calls were
 # the last-line half of a gate that skipped 41 consecutive repair dispatches while 8 self-hosted
 # runners and ~11 lane slots sat idle. This is a COUNT OF ZERO on purpose: a reintroduced gate on any
 # fixer arm reddens here.
