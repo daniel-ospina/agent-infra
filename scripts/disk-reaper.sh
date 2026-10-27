@@ -1788,6 +1788,21 @@ reap_worktree() {
     fi
     DF_WT_OK="$MEASURED"; RAW_WT="$raw"
     WT_TALLY_COVER="${wt_tally_repos}/${wt_repos}"
+    # ⛔ A HALF-ANSWERED CLASS IS NOT AN ANSWERED ONE — AND THAT RULE IS ABOUT THE CLASS TOTALS, NOT
+    # ONLY THE PER-REPO ROWS (#4529; the mirror of the venv arm's full-coverage gate). `have_tally` is
+    # set by ANY repo that answered, while `sum_classified`/`sum_preserved`/`sum_remove`/`sum_deferred*
+    # and the histogram below are class TOTALS accumulated over ONLY the repos that answered. Measured
+    # on a two-repo pass where repo A answered `classified=5` and repo B's SUMMARY was truncated: the
+    # record published `classified_worktree=5 preserved_worktree=4 preserved_reasons_worktree=too-recent:4`
+    # as the class's measured counts, with the sole disclosure a `tally_worktree=1/2` field the design
+    # doc never mentions — so a repo that produced NO ANSWER AT ALL was silently absent from the four
+    # fields this arm exists to publish. FULL COVERAGE — every scanned repo answered — is what makes a
+    # sum an answer; a partial class publishes `?` for every count instead, exactly as the venv arm
+    # does. Demoting `have_tally` here also makes the `reasons=none` normalisation below coverage-aware,
+    # and reaches `HAVE_WT_CAND` and `HAVE_WT_TALLY` because both are assigned FROM this variable.
+    if [ "$have_tally" = 1 ] && ! { [ "$wt_repos" -gt 0 ] && [ "$wt_tally_repos" = "$wt_repos" ]; }; then
+        have_tally=0
+    fi
     # Fold `reason count` rows into one histogram, descending by count — the delegate's own shape.
     sum_reasons="$(printf '%s\n' "$REASON_ROWS" | awk 'NF==2 { c[$1] += $2 }
         END { for (k in c) printf "%d\t%s\n", c[k], k }' | sort -rn -k1,1 \
@@ -1802,6 +1817,11 @@ reap_worktree() {
     # are the TAIL fields. Without this a line cut after `failed=0` printed `preserved_worktree=2`
     # beside `preserved_reasons_worktree=none`: "two checkouts kept, and none of them for any reason".
     [ "$have_tally" = 1 ] && [ "$wt_reasons_repos" = "$wt_tally_repos" ] && [ -z "$sum_reasons" ] && sum_reasons="none"
+    # ⛔ The histogram is a class TOTAL like the counters above, so a PARTIAL class must not publish it
+    # either: `reasons=too-recent:4` beside `classified=?` reads as a reason breakdown for a count that
+    # was never measured. Placed AFTER the `none` normalisation (which already requires `have_tally=1`)
+    # so the two rules cannot disagree about what a partial class says.
+    [ "$have_tally" = 1 ] || sum_reasons="?"
 
     # The skip ledger rides on the class line AND the pass record: a class that skipped a repo did LESS
     # than a clean class, so its verdict stays fail-closed (3) — skipping is not a pass — but the line

@@ -2377,6 +2377,38 @@ assert_absent "$ST" "classified_worktree=0" "T59 and NEVER a 0 it did not measur
 # `classified_worktree=?`, which is exactly the shape this test exists to forbid.
 assert_contains "$ST" "candidates_worktree=?" "T59 candidates in an APPLY pass with no tally is '?', not a 0"
 assert_absent "$ST" "candidates_worktree=0" "T59 ... and never an invented 0"
+# (b1b) ⛔ THE SAME RULE PER **CLASS**, NOT ONLY PER REPO — THE WORKTREE ARM'S OWN CASE (#4529).
+# `have_tally` is set by ANY repo that answered, while the published counts are class TOTALS over only
+# the repos that answered, so a two-repo pass where ONE repo answered published its partial sum as the
+# class's measured counts: `classified_worktree=5 preserved_worktree=4` beside `tally_worktree=1/2`,
+# with the repo that produced NO ANSWER silently absent from the four fields this arm exists to
+# publish. Two repos, the first answering a full SUMMARY, the second truncated mid-line (a delegate
+# dying mid-write — the likeliest truncation, since the tail fields are the ones cut). Full coverage
+# is what makes the sum an answer; short of it every count is `?`.
+REPO_PA="$(mk_repo d59-partial-a)"
+REPO_PB="$(mk_repo d59-partial-b)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do case "$a" in */d59-partial-a) echo "SUMMARY examined=2 classified=2 remove=0 preserved=2 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:2 main_proof=local pr_merged=na"; exit 0 ;; esac; done' \
+    'echo "SUMMARY examined=1 classified=1 rem"' \
+    'exit 0' >"$T/t59-wt-partial.sh"
+chmod +x "$T/t59-wt-partial.sh"
+OUT="$(WORKTREE_REAPER="$T/t59-wt-partial.sh" run_reaper --apply --repo "$REPO_PA" --repo "$REPO_PB" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "tally_worktree=1/2" "T59 a PARTIAL worktree class discloses its coverage as 1/2"
+assert_contains "$ST" "classified_worktree=?" "T59 ... and does NOT publish the partial sum as the class's classified count"
+assert_absent   "$ST" "classified_worktree=2" "T59 ... never a class total that only one repo measured"
+assert_contains "$ST" "preserved_worktree=?" "T59 ... the preserved count is unmeasured too"
+assert_contains "$ST" "preserved_reasons_worktree=?" "T59 ... and so is the histogram (a class TOTAL, not a per-repo row)"
+assert_contains "$OUT" "classified=?" "T59 the class LINE agrees with the record about the partial class"
+# ...and the full-coverage control: the SAME stub, both repos answering, publishes the sum. Without
+# this pair the assertion above is satisfied by an arm that can never publish anything.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=2 classified=2 remove=0 preserved=2 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:2 main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t59-wt-full.sh"
+chmod +x "$T/t59-wt-full.sh"
+STF="$(WORKTREE_REAPER="$T/t59-wt-full.sh" run_reaper --apply --repo "$REPO_PA" --repo "$REPO_PB" --only worktree >/dev/null 2>&1; cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$STF" "tally_worktree=2/2" "T59 control: full coverage is disclosed as 2/2"
+assert_contains "$STF" "classified_worktree=4" "T59 control: with every repo answered the class sum IS published"
 # (b2) THE SIBLING CLASS HAS THE SAME CONTRACT. `reap-lane-venvs.sh` prints one tally line per repo
 # too, and the lift used to read only the FIRST — so on a two-repo cell `classified_venv` reported one
 # repo's number beside the other repo's venvs (and a clean first repo restored the structural 0 the
