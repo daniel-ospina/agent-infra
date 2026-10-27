@@ -216,12 +216,12 @@ class _Recorder:
         return [c for c in self.calls if all(n in c for n in needles)]
 
 
-def _run_gate(monkeypatch, text, dry=False):
+def _run_gate(monkeypatch, text, dry=False, jev_result=None):
     rec = _Recorder()
     monkeypatch.setattr(ao, "sh", rec)
     monkeypatch.setattr(ao, "sh_status", lambda args, timeout=None: (0, "", ""))
     monkeypatch.setattr(ao, "fetch_question", lambda repo, n: text)
-    monkeypatch.setattr(ao, "jev", lambda state: {
+    monkeypatch.setattr(ao, "jev", lambda state: jev_result or {
         "answers": {m: {"type": "noul", "noul": 0.99} for m in ao.QUESTIONS},
         "usage": {"cost_usd": 0.0},
     })
@@ -703,6 +703,31 @@ def test_the_summary_line_reports_the_version_the_api_answered_with():
     assert line == "model=jev-1.14.0 tokens=10/2", line
     assert "jev-latest" not in line, (
         "the summary reported the alias we sent instead of the version that answered")
+
+
+def test_the_printed_summary_line_reports_the_echoed_version(monkeypatch):
+    """⛔ THE CALL SITE, NOT JUST THE HELPER (review 2026-10-27).
+
+    The leg above asserts `meta_line()` IN ISOLATION. That left the place the fleet actually
+    reads — `print(meta_line(result))` in `main()` — uncovered: measured, rebuilding that print
+    from `JEV_MODEL` (`%s ... % JEV_MODEL`) printed `model=jev-latest`, looked correct, and left
+    this whole file GREEN. So the regression the module comment claims is caught was not caught.
+
+    This drives the REAL `main()` through the `_run_gate` harness with a TOKEN-shaped response
+    (the branch that prints a version at all — the cost-only branch carries none by design).
+    After this leg the claim "the summary line is asserted" is true of the site that prints it
+    and not merely of the helper it calls.
+    """
+    rc, _rec, out = _run_gate(monkeypatch, V9, jev_result={
+        "model": "jev-1.14.0",
+        "answers": {m: {"type": "noul", "noul": 0.99} for m in ao.QUESTIONS},
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+    })
+    assert rc == 0, out
+    assert "model=jev-1.14.0" in out, out
+    assert "model=jev-latest" not in out, (
+        "the PRINTED line reported the alias we sent instead of the version that answered: %r"
+        % (out,))
 
 
 def test_jev_sends_a_name_keyed_questions_map_with_instructions(monkeypatch):

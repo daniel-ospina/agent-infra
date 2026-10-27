@@ -69,11 +69,16 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # reason no diff explains. THIS file's thresholds (`THRESHOLD`, `THRESHOLD_LANGUAGE`,
 # `THRESHOLD_JARGON`) and `turn-classify.py`'s `MIN_CONFIDENCE` are therefore the FIRST thing to
 # re-derive when a verdict looks wrong.
-# ⚠️ Each caller shows the move for ITSELF, and all THREE are asserted: this file prints the
-# answer's version on its summary line (`model=<echo>` beside the token counts below — the
-# token branch; the cost-only branch carries no version), `turn-classify.py` puts the same
-# echo in `meta["model"]`, and the words layer keeps it for its report header. Read that
-# field first: it is the value the RESPONSE carried, never `JEV_MODEL` — the alias we sent.
+# ⚠️ Each caller shows the move for ITSELF, and all THREE are asserted — each by a leg that
+# fails when its own site is reverted to the constant: this file's summary line at its PRINT
+# SITE (`test_the_printed_summary_line_reports_the_echoed_version_…`, which drives the real
+# `main()`; the older leg asserted `meta_line()` in ISOLATION, which left the call site
+# uncovered — measured: rebuilding `print(meta_line(result))` from `JEV_MODEL` stayed green),
+# `turn-classify.py`'s `meta["model"]` (the echo leg in `test_turn_classify_state.py`), and
+# the words layer's report header (`test_lane_actions.py`, against the deployed
+# `lane-verdict.py`). The token branch prints the version; the cost-only branch carries none by
+# design. Read that field first: it is the value the RESPONSE carried, never `JEV_MODEL` — the
+# alias we sent.
 # Pinning a version again is a one-line change in EACH of these five copies — a partial re-pin
 # is the same split-brain this round fixed in the other direction — and it needs the bars
 # re-derived on that version FIRST, which is why it is a decision and not a default:
@@ -766,11 +771,14 @@ def meta_line(result):
     """The one summary line: which model judged this question and what it cost in tokens
     — or just the cost, when the API reports money instead of tokens.
 
-    ⛔ IT EXISTS AS A FUNCTION SO IT CAN BE ASSERTED (review 2026-10-27). With the model now a
-    vendor ALIAS, this is where the concrete version is reported — the sent string is always
-    `jev-latest`, and the cost-only branch carries no version at all. While the line was built
-    inline at its `print`, nothing could test it,
-    so a regression to the constant would have printed `model=jev-latest` and looked fine.
+    ⛔ IT EXISTS AS A FUNCTION, AND ITS CALL SITE IS ASSERTED TOO (review 2026-10-27). With the
+    model now a vendor ALIAS, this is where the concrete version is reported — the sent string is
+    always `jev-latest`, and the cost-only branch carries no version at all. The line used to be
+    built inline at its `print`, and the assertion written for it covered only THIS helper in
+    isolation: a regression AT THE CALL SITE — `print(meta_line(result))` rebuilt from
+    `JEV_MODEL` — printed `model=jev-latest`, looked fine, and left the whole suite green
+    (measured). Both halves are pinned now, so neither the helper nor its caller can silently
+    fall back to the alias.
     """
     usage = (result or {}).get("usage") or {}
     if "cost_usd" in usage:
