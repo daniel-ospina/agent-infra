@@ -211,6 +211,7 @@ means it runs once" is wrong (research: agent-infra#1709).
 | `worker-terminal.sh` | the ONE place a worker is launched, asked whether it is alive, counted and killed (`orch-loop.sh` / `dispatch-merge.sh` both source it). Without it a lane is a tmux window that dies at ~21 log lines (§2.1) |
 | `capacity.sh` | R8's other half: MEASURED cross-box placement — load-per-core, lanes, disk and memory per box on the shared origin, so the next lane goes to the least-loaded ELIGIBLE box instead of to whichever controller asked first (§9) |
 | `claim-reaper.sh` | R4's release half: a claim is released only when its holder is demonstrably GONE — 7 stale refs on a box with 0 live lanes made the fleet originate nothing (§7.2b, measured 2026-10-21) |
+| `lane-container-reap.sh` | the leaked test-DB reaper (#2868): removes a lane's private `fdb-lane-*` / `*-pg` / `*-fdb` / `falkordb-6673-*` / `tortoise-ci-*` container ONLY when the owning lane is provably gone — the slug is absent from `git worktree list` (or the PR has no `refs/claims/` snapshot), no live process holds the name, AND the container is past the age bound. **Dry run by default** (`--apply` arms it); all three proofs must hold, and an unreadable `docker ps`/`ps` aborts the whole pass (exit 3, `CANNOT-VERIFY`) rather than reaping blind. Shared instances (`falkordb`, …) are protected by name and never candidates. Its test suite is a mutation suite: every deletion gate reddens when reverted |
 | `live-ownership.sh` | R2/R3's predicate as a live fact: "owned" means a LIVE PROCESS is working the PR, not that a registry says so; it supplies the sweep order and the un-owned count (§7.2f) |
 | `merged-not-closed.sh` | the question no other tool could answer — which OPEN issues already have a MERGED PR (tortoise#8468). Without it, finished work sits in the priority queue looking untouched |
 | `cycle-record.sh` | the self-dispatch proof: one record per controller cycle, and a verdict that refuses to call an absent or stale record healthy (§9) |
@@ -1733,8 +1734,10 @@ process reaper judges a `pi` process tree (the `pi` and its immediate shell wrap
 `pi`** — or a pipe-fed `tee` beside it — holds a fleet-namespace log open as stdout/stderr, and reaps
 it only when ALL THREE hold: zero CPU delta over a sample window summed over the whole tree; **positive
 fleet ancestry** (a human terminal/ssh ancestor refuses, and so does an ancestry that is neither —
-`unknown` used to permit and TERMed live trees, and it is now inert on a systemd-scoped cell until a
-cell-side evidence source exists); and either the log is untouched past 2h or (the log resolved but is
+`unknown` used to permit and TERMed live trees; on a systemd-scoped cell the supervisor's
+cgroup/environ marker — `cell_fleet_marker`, #2868 — supplies the positive fleet evidence that was
+previously missing, so the armed reaper is no longer inert there); and either the log is untouched
+past 2h or (the log resolved but is
 gone) the process has been up past 12h. It is **dry run by default**; arming is the operator's call,
 like every other deletion tool here. ⛔ Its hardest rule
 is the one a first dry run got wrong: **an unresolvable log is `no-log-evidence` and is NEVER read as

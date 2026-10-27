@@ -37,11 +37,9 @@
 #      lane is `pi → -zsh → login → cmux.app`, so treating them as human would make the reaper inert.
 #      ⛔ `unknown` REFUSES (#2163 review, P1). It used to PERMIT, and every host app missing from the
 #      list above — plus a truncated process table, whose empty command read as "no marker" — then
-#      TERMed a live tree. A lane is judged only on POSITIVE fleet evidence (`cmux.app` on the Mac,
-#      which is the only host this gate recognises today). ⚠️ PRODUCT DECISION, NOT A SILENT
-#      BEHAVIOUR: on a Linux cell the supervisor is systemd, so every lane's ancestry is `unknown`
-#      and the ARMED reaper refuses everything (see §11.4 of docs/ops/fleet-liveness.md for the
-#      evidence source a cell would have to supply). The census and `--dry-run` are unaffected.
+#      TERMed a live tree. A lane is judged only on POSITIVE fleet evidence: `cmux.app` on the Mac,
+#      and — since #2868 — the cell supervisor's environ/cgroup marker on a Linux cell
+#      (`cell_fleet_marker`, below). The census and `--dry-run` are unaffected.
 #   3. A STALENESS CLASSIFICATION, from a file THIS LANE'S OWN `pi` (or its `tee` writer) holds open:
 #        (a) log present, untouched >= LANE_REAP_IDLE_MIN (default 2h); or
 #        (b) log absent/deleted AND the process has been up >= LANE_REAP_NO_LOG_H (default 12h).
@@ -98,14 +96,16 @@
 #     VERDICT (`reap` exits 4 for it, never 3): a completed pass that judged nothing by policy is not
 #     a failed read, and a consumer that treated it as one would show a permanent red on a surface
 #     where the policy below is working exactly as recorded. Gate 2 now
-#     requires POSITIVE fleet evidence, and the ONLY host app this tool recognises as the fleet is
-#     `cmux.app` — a Mac application. A Linux cell's supervisor is systemd / a container, so a cell
-#     lane's ancestry is `pi → bash → systemd → init`: `unknown`, refused. `--apply` on a cell is
-#     therefore INERT today, and the fix is an evidence source a cell can actually supply: the
-#     supervisor's unit/cgroup (`/proc/<pid>/cgroup` naming e.g. `cloud-cell-supervisor.service`) or
-#     a marker in `/proc/<pid>/environ` written by the supervisor at spawn. That is a design change
-#     with a cell-side component and is NOT made here; until it is, the census and the dry run are
-#     the cell's instruments, and the refusal is named per tree (`ancestry-unknown`).
+#     requires POSITIVE fleet evidence. The fleet hosts this tool recognises are `cmux.app` — a Mac
+#     application — and, since #2868, the Linux-cell supervisor: its unit cgroup
+#     (`/proc/<pid>/cgroup` naming e.g. `eldato-orchestrator.service` / `cloud-cell-supervisor.service`)
+#     or a marker in `/proc/<pid>/environ` written by the supervisor at spawn (`CONTROLLER_UNIT=…`,
+#     `HARNESS_MATERIALISER=…`). `cell_fleet_marker` reads both, configurable via
+#     `LANE_REAP_CELL_UNITS` / `LANE_REAP_CELL_ENV_MARKERS`. A lane whose ancestry carries NEITHER
+#     (`pi → bash → systemd → init` on a cell without those markers, or an orphan reparented to init)
+#     is still `unknown` and refused — the ORPHAN-PARENTLESS boundary is unchanged and still pinned
+#     by its test leg. The CELL-TMUX leg pins the new behaviour: a cell's own tmux launcher, whose
+#     ancestry would otherwise read `unknown`, is POSITIVE fleet evidence once the marker is read.
 #   * `--apply` is DRY RUN by default. Arming is a deliberate operator action, same as every other
 #     deletion tool in this tree.
 #   * a leaked lane whose stdout is a PTY/PIPE and whose log name is outside the fleet namespace has
@@ -151,6 +151,16 @@ LSOF_BIN="${LANE_REAP_LSOF_BIN:-lsof}"
 # seam the test suite drives the lsof branch with). `:-` silently rewrote it back to /proc, which made
 # that seam inert — and a seam that cannot express "no /proc" hides the whole lsof path from CI.
 PROC_ROOT="${LANE_REAP_PROC_ROOT-/proc}"
+# ⛔ THE CELL-SUPERVISOR EVIDENCE SOURCE (#2868). On a Linux cell the fleet's launch surface is a
+# systemd unit, not `cmux.app`, and gate 2 (host_verdict) therefore read every cell lane as
+# `unknown` and refused it — the CELL-INERT note in this file's header. The supervisor writes TWO
+# positive markers into every process it spawns: an environ variable name (CONTROLLER_UNIT=…) and
+# the unit's cgroup (`/system.slice/<unit>.service`). Recognising either as fleet makes the armed
+# reaper live on a cell. Both lists are configurable so a cell under any unit name supplies its own
+# evidence, and NEITHER is matched on argv — a prompt/path that merely mentions the name cannot
+# spoof a marker read from /proc.
+CELL_ENV_MARKERS="${LANE_REAP_CELL_ENV_MARKERS:-CONTROLLER_UNIT HARNESS_MATERIALISER}"
+CELL_UNITS="${LANE_REAP_CELL_UNITS:-eldato-orchestrator.service cloud-cell-supervisor.service cloud-cell-controller.service}"
 WINDOW="${LANE_REAP_WINDOW:-30}"
 CPU_TOL_CS="${LANE_REAP_CPU_TOL_CS:-10}"
 # NOT `IDLE_MIN`: that name is a REGISTERED term owned by `scripts/orchestrator-heartbeat.sh`
@@ -717,8 +727,9 @@ mtime_epoch() { # prints epoch seconds, or nothing when unreadable
 # the kill, so every host app missing from the marker set (xterm, wezterm, gnome-terminal, a cloud web
 # console with no sshd, a tmux daemonised from init) and every truncated table read as permission.
 # Only `fleet` licenses judging a tree: a lane is judged on POSITIVE fleet evidence.
-# ⚠️ On a Linux cell every lane is `unknown`, so the ARMED reaper is inert there — see the PRODUCT
-# DECISION note in this file's header.
+# ⚠️ On a Linux cell every lane used to be `unknown`, so the ARMED reaper was inert there — the CELL
+# evidence source below (`cell_fleet_marker`) closes that, reading the supervisor's environ/cgroup
+# marker from /proc. See the PRODUCT DECISION note in this file's header.
 #
 # ⛔ THE WALK STARTS AT THE FIRST ANCESTOR, NOT AT THE ROOT (#2163 review, P1). The root's OWN argv
 # is the launcher's: it carries the brief path, a `PATH=/Applications/cmux.app/...` export, even the
@@ -726,6 +737,34 @@ mtime_epoch() { # prints epoch seconds, or nothing when unreadable
 # BEFORE the real `Terminal.app` ancestor was ever examined — the verdict decided by prompt text, the
 # exact "never parse a command line for a name" trap this file exists to close. Gate 2 is about
 # ANCESTORS, so `tail -n +2` drops the root and the walk starts where the host app actually lives.
+# cell_fleet_marker <pid> — the Linux-cell fleet evidence source (#2868). On a cell the fleet's
+# launch surface is a systemd unit, not `cmux.app`. The supervisor writes TWO positive markers into
+# every process it spawns, and either one read from /proc is fleet evidence:
+#   1. an environ variable name in CELL_ENV_MARKERS (CONTROLLER_UNIT=…, HARNESS_MATERIALISER=…);
+#   2. the unit's cgroup (`/system.slice/<unit>.service`) in CELL_UNITS.
+# rc 0 = fleet (echoes the evidence kind), rc 1 = no marker (the walk continues). An unreadable
+# /proc for a pid answers NOTHING (rc 1), so a blind read can never become fleet — fail-closed.
+cell_fleet_marker() { # <pid> -> prints cell-env|cell-unit; rc 0 fleet, 1 no-marker
+  local pid="$1" cg env mk u
+  [ -n "$pid" ] && is_num "$pid" || return 1
+  [ -n "$PROC_ROOT" ] && [ -d "$PROC_ROOT/$pid" ] || return 1
+  if [ -r "$PROC_ROOT/$pid/environ" ]; then
+    env="$(tr '\0' '\n' < "$PROC_ROOT/$pid/environ" 2>/dev/null)"
+    for mk in $CELL_ENV_MARKERS; do
+      [ -n "$mk" ] || continue
+      case "$env" in *"$mk="*) printf 'cell-env\n'; return 0 ;; esac
+    done
+  fi
+  if [ -r "$PROC_ROOT/$pid/cgroup" ]; then
+    cg="$(cat "$PROC_ROOT/$pid/cgroup" 2>/dev/null)"
+    for u in $CELL_UNITS; do
+      [ -n "$u" ] || continue
+      case "$cg" in *"/$u") printf 'cell-unit\n'; return 0 ;; esac
+    done
+  fi
+  return 1
+}
+
 host_verdict() { # <tablefile> <pid> -> human | fleet | unknown | incomplete
   local apid acmd low exe base complete=0
   while IFS=$'\t' read -r apid acmd; do
@@ -782,6 +821,12 @@ host_verdict() { # <tablefile> <pid> -> human | fleet | unknown | incomplete
     case "$exe" in
       */cmux.app/*|cmuxterm|*/cmuxterm|cmux) printf 'fleet\n'; return 0 ;;
     esac
+    # CELL: the Linux-cell supervisor's marker, read from /proc (cgroup + environ), is POSITIVE
+    # fleet evidence (#2868). It runs AFTER the human checks above (an sshd/Terminal ancestor still
+    # refuses first) and AFTER the cmux check (so cmux keeps its macOS precedence). On macOS there
+    # is no cgroup and no supervisor environ, so this branch is inert there. An unreadable /proc for
+    # this pid answers NOTHING (rc 1) and the walk continues — a blind read never becomes fleet.
+    if cell_fleet_marker "$apid" >/dev/null 2>&1; then printf 'fleet\n'; return 0; fi
   done < <(ancestry "$1" "$2" | tail -n +2)
   [ "$complete" = "1" ] || { printf 'incomplete\n'; return 0; }
   printf 'unknown\n'
