@@ -88,12 +88,19 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
     x86 box serve an arm64 job — a false PASS, not a delay).
 
 USAGE
-  tools/runner_autoscale.py                     # converge this box to its measured ceiling
-  tools/runner_autoscale.py --status            # measure + classify, change nothing
-  tools/runner_autoscale.py --dry-run           # print the plan, change nothing
-  tools/runner_autoscale.py --want 3            # explicit request; REFUSED above the ceiling
-  tools/runner_autoscale.py --json              # one machine-readable record (fleet view)
-  tools/runner_autoscale.py --repo owner/name   # pool to serve (default daniel-ospina/tortoise)
+USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is told so by the
+  guard below instead of silently running the wrong one; on a cell `python3` IS >=3.12 and the
+  executable form works too — the file is mode 0755 with a `#!/usr/bin/env python3` shebang)
+  python3.12 scripts/orchestrator-harness/runner_autoscale.py            # converge to the ceiling
+  python3.12 scripts/orchestrator-harness/runner_autoscale.py --status   # measure+classify, 0 changes
+  python3.12 scripts/orchestrator-harness/runner_autoscale.py --dry-run  # print the plan, change 0
+  python3.12 scripts/orchestrator-harness/runner_autoscale.py --want 3   # REFUSED above the ceiling
+  python3.12 scripts/orchestrator-harness/runner_autoscale.py --json     # one record (fleet view)
+  python3.12 scripts/orchestrator-harness/runner_autoscale.py --repo owner/name
+  (on a cell this is the FARMED copy at `~/.pi/agent/scripts/runner_autoscale.py` — one file,
+   one source: this one. Until 2026-10-27 it existed ONLY as a live copy on cell-4, so it could not
+   be reviewed, tested or redeployed — the live-only class agent-infra#1552 tracks, where 26 of 35
+   lane-orchestration scripts live in only `~/.pi/agent/scripts`.)
 
   Seams (all optional; the suite drives every one, and each defaults fail-closed):
     RUNNER_AUTOSCALE_RUNNER_ROOT   default /opt   (installs are `<root>/gh-runner*`)
@@ -121,23 +128,21 @@ EXIT  0 converged / nothing to do (a REFUSAL is an answer, not a failure)
       1 usage, or `--want N` refused (N above the measured ceiling — nothing was changed)
       2 a measurement or pool read was UNREADABLE — fail-closed, nothing was changed
       3 an ACTION failed (restart / registration / missing provisioner) — the record says which
-      6 the STARVATION invariant held (queued_runs>0 ∧ busy_runners==0 ∧ ≥1 online runner) — CI
-        is starved, not busy (see #2875). The pass names the invariant and the count.
 """
 
 from __future__ import annotations
 
 import sys
 
-# #5128 shape: refuse a <3.12 interpreter BEFORE the imports below. A module-level 3.12-only name
-# would otherwise fail first, with an unattributed traceback instead of this message — and a lane
-# reading "the tool is broken" eschews the guard and hand-rolls a runner count. The gate that
-# enforces this shape is tests/test_entry_point_python_guard.py, not a style rule.
+# Refuse a <3.12 interpreter BEFORE the imports below. A module-level 3.12-only name would
+# otherwise fail first, with an unattributed traceback instead of this message — and a lane reading
+# "the tool is broken" eschews the guard and hand-rolls a runner count. The habit travels with the
+# file (it is the same `sys.version_info` probe `scripts/admin-merge.sh` makes before it runs any
+# python), so a caller's probe and this one cannot disagree about which interpreter ran.
 if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
     print(
-        f"tools/runner_autoscale.py requires Python >= 3.12 (got "
-        f"{sys.version_info[0]}.{sys.version_info[1]}) — run it as "
-        f"uv run python tools/runner_autoscale.py",
+        f"runner_autoscale.py requires Python >= 3.12 (got "
+        f"{sys.version_info[0]}.{sys.version_info[1]}) — run it with python3.12",
         file=sys.stderr,
     )
     raise SystemExit(2)
@@ -418,45 +423,6 @@ def read_pool(repo: str) -> dict[str, PoolEntry]:
     return pool
 
 
-def read_queued(repo: str) -> int:
-    """The repo's QUEUED workflow-run count — the demand side of the starvation invariant.
-
-    `queued_runs > 0 AND busy_runners == 0 AND >= 1 online runner` is a STARVED queue, not a busy
-    one — the shape that stopped the whole repo on 2026-10-27 while every runner read `online`
-    (46 runs queued, busy=0, ~40 minutes, because no runner advertised `ubuntu-latest`). A busy
-    queue (`busy>0`) is demand and is answered with capacity, never with this alarm. Unreadable
-    raises `Unmeasurable`; the caller treats that as "cannot verify the invariant", never as 0
-    (0 would silence the alarm on exactly the box that needs it).
-    """
-    gh = gh_bin()
-    if not gh:
-        raise Unmeasurable("gh is not on PATH (set RUNNER_AUTOSCALE_GH)")
-    cmd = [
-        gh,
-        "api",
-        "--paginate",
-        f"repos/{repo}/actions/runs?status=queued",
-        "--jq",
-        ".total_count",
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise Unmeasurable(f"gh api failed to run ({exc})") from exc
-    if proc.returncode != 0:
-        raise Unmeasurable(
-            f"gh api repos/{repo}/actions/runs?status=queued exited {proc.returncode}: "
-            f"{(proc.stderr or '').strip()[:300]}"
-        )
-    lines = (proc.stdout or "").strip().splitlines()
-    if not lines:
-        raise Unmeasurable("queued-run count unreadable (empty gh output)")
-    try:
-        return int(lines[-1].strip())
-    except ValueError as exc:
-        raise Unmeasurable(f"queued-run count unreadable ({lines[-1]!r})") from exc
-
-
 def fallback_engaged(pool: dict[str, PoolEntry]) -> bool:
     """Is the ARM64 pool carrying the fallback label RIGHT NOW (the gate's own condition)?"""
     return any(ARM_POOL_LABEL in e.labels and FALLBACK_LABEL in e.labels for e in pool.values())
@@ -471,15 +437,6 @@ def resolve_labels(pool: dict[str, PoolEntry], machine: str) -> str:
     truth, so a runner never acquires a permanent claim on the pool. An unknown architecture
     RAISES — `self-hosted`/`Linux`/`<ARCH>` are host-derived and may not be set, so there is no
     safe default to fall back to.
-
-    ⛔ WHICH RULE WINS WHEN THEY DISAGREE (2026-10-27): the floor wins. `fallback_engaged` says
-    "the ARM pool carries the label, so keep it"; the floor says "NO runner advertises
-    `ubuntu-latest`, so this registration MUST take it or the repo can never serve
-    `runs-on: ubuntu-latest` again". They disagree exactly at the pool-wide restart that stripped
-    the label everywhere — the gate then reads "not engaged" while the floor reads "violated" —
-    and granting the label on that registration is what restores the pool. The handover
-    (gate-following) is preserved whenever the gate is engaged; the floor only adds the label
-    where the gate would otherwise leave zero runners able to serve it.
     """
     arch = ARCH_LABEL.get(machine.lower())
     if not arch:
@@ -525,54 +482,23 @@ def restart_runner(runner: LocalRunner) -> tuple[bool, str]:
     return rc == 0, f"systemctl restart {runner.unit} rc={rc} {out[:200]}"
 
 
-def _is_transient_gh_error(text: str) -> bool:
-    """Is a failed `gh api` read TRANSIENT (network / 5xx / rate-limit) rather than permanent?
-
-    A transient failure is one a re-read can outlive; a permanent one (bad credentials, a bad
-    repo, `gh` absent, garbled output) cannot. The post-restart pool read retries the first and
-    concludes `unverified` immediately on the second — retrying an auth failure until the 60s
-    deadline is how an operator waits a minute for a refusal that cannot change.
-    """
-    low = text.lower()
-    return any(m in low for m in (
-        "502", "503", "504", "bad gateway", "gateway timeout",
-        "connection", "network", "timeout", "timed out",
-        "rate limit", "temporarily unavailable", "could not resolve",
-        "connection reset", "tls", "eof", "unexpected eof",
-    ))
-
-
-def wait_online(repo: str, name: str, timeout_s: int, poll_s: int) -> tuple[str, str]:
-    """Poll the pool for `name`. Returns `(state, error)`.
-
-    `state` is `online` | `offline` | `unverified`; `error` is the gh failure text that made the
-    read unverifiable (empty otherwise).
+def wait_online(repo: str, name: str, timeout_s: int, poll_s: int) -> str:
+    """Poll the pool for `name`. Returns `online` | `offline` | `unverified`.
 
     ⛔ THREE STATES, NOT A BOOL. A failed pool read is not evidence that the runner did not come
     back: folding it into `False` made the caller say "still offline" about something it never
     looked at, and act on that (re-register with `--replace`). `unverified` is a measurement
     failure and the caller must NOT act on it.
-    ⛔ A TRANSIENT FAILURE IS RETRIED, BOUNDED BY `timeout_s` — a network/5xx/rate-limit blip
-    right after the restart this pass just issued must not be read as `unverified` on the first
-    attempt; that hid the reason for a 40-minute outage behind one generic sentence (2026-10-27).
-    A PERMANENT failure returns `unverified` immediately, carrying the gh error text.
     """
     deadline = time.monotonic() + max(0, timeout_s)
-    last_error = ""
     while True:
         try:
             if read_pool(repo).get(name, PoolEntry(name, "offline", False)).online:
-                return "online", ""
-        except Unmeasurable as exc:
-            if _is_transient_gh_error(str(exc)):
-                last_error = str(exc)
-                if time.monotonic() >= deadline:
-                    return "unverified", last_error
-                time.sleep(max(1, poll_s))
-                continue
-            return "unverified", str(exc)
+                return "online"
+        except Unmeasurable:
+            return "unverified"
         if time.monotonic() >= deadline:
-            return "offline", ""
+            return "offline"
         time.sleep(max(1, poll_s))
 
 
@@ -598,25 +524,6 @@ def registration_token(repo: str) -> str:
     return token
 
 
-def _clear_local_config(directory: Path) -> None:
-    """Remove the LOCAL registration state before a `--replace` re-registration.
-
-    `config.sh` refuses to configure a runner whose `.runner`/`.credentials` still exist — even
-    WITH `--replace` — with "Cannot configure the runner because it is already configured. To
-    reconfigure the runner, run './config.sh remove' first." That is the one case this tool's
-    `--replace` exists to recover: the server-side registration was DELETED (so there is nothing
-    to `config.sh remove`), while the local files survive and block the re-registration. Clearing
-    them first is what makes the repair path repair (2026-10-27: `pi-runner-cell4-x64-1` could not
-    be brought back for exactly this reason).
-    """
-    for name in (".runner", ".credentials", ".credentials_rsaparams"):
-        p = directory / name
-        try:
-            p.unlink(missing_ok=True)
-        except OSError as exc:
-            raise ActionFailed(f"cannot clear {p} before --replace ({exc})") from exc
-
-
 def register(directory: Path, name: str, repo: str, labels: str, replace: bool) -> str:
     """Register or RE-register an EXISTING install (`<dir>/config.sh`) and enable its unit.
 
@@ -626,12 +533,6 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
     cfg = Path(os.environ.get("RUNNER_AUTOSCALE_CONFIG_SH") or (directory / "config.sh"))
     if not cfg.exists():
         raise ActionFailed(f"{cfg} does not exist — {directory} is not a runner install")
-    if replace:
-        # ⛔ CLEAR FIRST, or config.sh refuses with "already configured" (Finding 6). The local
-        # `.runner`/`.credentials` are STALE whenever `--replace` is needed — the server-side
-        # registration was deleted (ORPHANED) or the listener is gone — and leaving them makes the
-        # one repair `--replace` exists for impossible.
-        _clear_local_config(directory)
     token = registration_token(repo)
     rc, out = _run(
         [
@@ -785,14 +686,6 @@ def converge(
     mem_mb = mem_available_mb(meminfo)
     local = discover(root)
     pool = read_pool(repo)
-    try:
-        queued = read_queued(repo)
-    except Unmeasurable as exc:
-        queued = None
-        record["notes"].append(
-            f"queued-run count unreadable ({exc}) — the starvation alarm is skipped this pass "
-            "(a busy queue and a starved queue cannot be told apart without it)"
-        )
     machine = machine or os.environ.get("RUNNER_AUTOSCALE_MACHINE") or os.uname().machine
     wait_s = int(
         os.environ.get(
@@ -851,19 +744,6 @@ def converge(
         pool_total=len(pool),
         pool_online=sum(1 for e in pool.values() if e.online),
         pool_busy=sum(1 for e in pool.values() if e.busy),
-        queued_runs=queued,
-    )
-
-    # 4b. STARVATION INVARIANT (#2875) — the shape that stops a healthy-looking repo. -----------
-    # `queued>0 ∧ busy==0 ∧ ≥1 online` is a supply/assignment failure (online runners idle while a
-    # queue grows), NOT demand (that is `queued>0 ∧ busy>0`) and NOT "runners down" (that is
-    # `pool_online==0`, an already-visible signal). The converger already holds both numbers in one
-    # pass; this is where the invariant is WATCHED, so no second detector is re-derived anywhere.
-    starved = bool(
-        queued is not None
-        and queued > 0
-        and record["pool_busy"] == 0
-        and record["pool_online"] > 0
     )
 
     if want is not None and want > ceil:
@@ -903,19 +783,17 @@ def converge(
             # --replace) a registration that may be reconnecting and picking up a job — the one
             # destructive action this file promises never to take blindly. Stop the PASS: the box
             # state is unknown from here, so no fill decision may be taken on a stale count.
-            state, wait_err = wait_online(repo, c["name"], wait_s, poll) if ok else ("offline", "")
+            state = wait_online(repo, c["name"], wait_s, poll) if ok else "offline"
             if state == "online":
                 record["actions"].append(f"{c['name']} came back online after restart")
                 continue
             if state == "unverified":
                 record["unverified"] = True
                 record["unverified_cause"] = "pool-read-after-restart"
-                record["unverified_error"] = wait_err
                 record["notes"].append(
-                    f"{c['name']}: restart succeeded but the pool could not be READ"
-                    + (f" — {wait_err}" if wait_err else "")
-                    + " — refusing to re-register on an unread pool, and stopping this pass (no "
-                    "fill decision can be taken on an unknown count)"
+                    f"{c['name']}: restart succeeded but the pool could not be READ — refusing to "
+                    "re-register on an unread pool, and stopping this pass (no fill decision can "
+                    "be taken on an unknown count)"
                 )
                 stop_pass = True
                 break
@@ -1015,12 +893,7 @@ def converge(
             record["notes"].append(
                 f"provisioner REFUSED slot #{index}: {exc} — its own headroom guard is stricter "
                 "than this tool's measured ceiling, so nothing was added (a refusal is an answer, "
-                "not a failure). Measured on cell-4 (2026-10-27): a runner's real DISK footprint "
-                "is ~0.7 G fresh (bin+externals) growing to ~7–9 G with _work, so the guard's "
-                "DISK_PER_RUNNER_GB=8 is correct — its 44 G demand for 3 runners is "
-                "COUNT×8+20 reserve counted in FULL, not the ~8 G MARGINAL cost of one more "
-                "runner on a box that already holds two. The two predicates disagree; #9672 owns "
-                "the decision."
+                "not a failure; the two predicates must be reconciled — see #9672)"
             )
             break
         except ActionFailed as exc:
@@ -1059,18 +932,7 @@ def converge(
             break
 
     # 7. VERDICT --------------------------------------------------------------------------------
-    if starved:
-        # ⛔ THE ALARM THE INVARIANT OWNS (see #2875). This verdict exits NON-ZERO and names the
-        # shape and the count, so a fleet timer cannot read a stopped CI as green. It is an ALARM,
-        # not a heal: the repair ladder (#2875's relabel/restart) is deliberately NOT re-derived
-        # here — the label floor above and the repair loop are the only fixes this file performs.
-        record["verdict"] = "starved"
-        record["error"] = (
-            f"STARVED: queued_runs={queued} and busy_runners=0 while "
-            f"{record['pool_online']} runner(s) are online — CI is starved, not busy "
-            "(online runners idle while a queue grows; see #2875)"
-        )
-    elif record["problems"]:
+    if record["problems"]:
         record["verdict"] = "action-failed"
     elif record.get("problem_kind") == "refusal":
         record["verdict"] = "provisioner-refused"
@@ -1083,13 +945,10 @@ def converge(
         # and the MEMORY read failed after an install — a `--json` consumer read the wrong cause
         # (round 6, finding 3). The actions above stay in the record either way.
         if record.get("unverified_cause") == "pool-read-after-restart":
-            gh_err = record.get("unverified_error", "")
             record["error"] = (
-                "the pool could not be read after a restart"
-                + (f": {gh_err}" if gh_err else "")
-                + " — the box's runner count is UNKNOWN, so the pass stopped there. The actions "
-                "listed above were already performed BEFORE that point; nothing was added or "
-                "registered after it."
+                "the pool could not be read after a restart — the box's runner count is UNKNOWN, "
+                "so the pass stopped there. The actions listed above were already performed BEFORE "
+                "that point; nothing was added or registered after it."
             )
         else:
             record["error"] = (
@@ -1265,8 +1124,6 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     if record["verdict"] == "unmeasurable":
         return 2
-    if record["verdict"] == "starved":
-        return 6
     return 0
 
 
