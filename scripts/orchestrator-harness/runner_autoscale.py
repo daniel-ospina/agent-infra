@@ -1244,12 +1244,27 @@ def resolve_labels(
 
 
 # ── actions ───────────────────────────────────────────────────────────────────────────────────
-def _run(cmd: list[str], timeout: int = 300) -> tuple[int, str]:
+def _run_split(cmd: list[str], timeout: int = 300) -> tuple[int, str, str]:
+    """ONE spawn, TWO streams KEPT APART.
+
+    ⛔ A MERGED STREAM CANNOT ANSWER "WHICH LINE IS THE VALUE" (review finding P2, round 12). `_run`
+    concatenates stdout THEN stderr, so the LAST line of the merged text is stderr's whenever stderr
+    is non-empty — and `registration_token()` read exactly that line as the token. One advisory line
+    on stderr (`gh: warning: this token expires in 1 hour`) turned a SUCCESSFUL mint into a token
+    `config.sh` rejects, so the repair path raised `ActionFailed` on every pass and blamed the
+    runner's own tooling. The caller that has a VALUE to read must get the stream it is on.
+    """
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
-        return 127, str(exc)
-    return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+        return 127, "", str(exc)
+    return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+
+
+def _run(cmd: list[str], timeout: int = 300) -> tuple[int, str]:
+    """The merged-stream form, for the callers whose ONLY question is the exit status."""
+    rc, out, err = _run_split(cmd, timeout)
+    return rc, ((out or "") + (err or "")).strip()
 
 
 def _sudo_prefix() -> list[str]:
@@ -1422,7 +1437,7 @@ def registration_token(repo: str) -> str:
     gh = gh_bin()
     if not gh:
         raise ActionFailed("gh is not on PATH (set RUNNER_AUTOSCALE_GH)")
-    rc, out = _run(
+    rc, out, err = _run_split(
         [
             gh,
             "api",
@@ -1433,9 +1448,17 @@ def registration_token(repo: str) -> str:
             ".token",
         ]
     )
-    token = out.splitlines()[-1].strip() if out else ""
-    if rc != 0 or not token:
-        raise ActionFailed(f"registration token mint failed rc={rc}: {out[:300]}")
+    # ⛔ THE TOKEN IS THE LAST LINE OF **STDOUT** — never of stderr, and never a line that carries
+    # whitespace inside it (`--jq .token` prints the value and nothing else). Reading the merged
+    # stream meant any advisory `gh` wrote to stderr on an otherwise-good mint became the token, and
+    # a token with a space in it is a `gh:` line, not a value. Both are refused here, naming what
+    # was actually printed, so the failure is attributable to this call rather than to `config.sh`.
+    token = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    if rc != 0 or not token or any(ch.isspace() for ch in token):
+        raise ActionFailed(
+            f"registration token mint failed rc={rc}: "
+            f"stdout={out.strip()[:200]!r} stderr={err.strip()[:200]!r}"
+        )
     return token
 
 
@@ -1768,7 +1791,21 @@ def unit_workdir_problem(workdir: str | None) -> str | None:
                 f"WorkingDirectory={workdir!r} contains a control character — that is a directive "
                 "injection into the unit, not a path"
             )
-    path = Path(workdir).expanduser()
+    # ⛔ `Path.expanduser()` RAISES on a `~user` this account cannot resolve — `RuntimeError: Could
+    # not determine home directory.` — while `os.path.expanduser` returns the argument unchanged
+    # (review finding P1, round 12). `WorkingDirectory=~someone/x` is legal systemd syntax, and the
+    # audit exists precisely to READ FOREIGN/HAND-WRITTEN units, so this is a reachable input: it
+    # escaped the audit, landed in `main()`'s backstop AFTER the repair loop had acted, and exited 2
+    # — "nothing was changed" — over a pass that had just destroyed and recreated a registration,
+    # with the record losing `actions`. A path that cannot be resolved is a FINDING, not a crash.
+    try:
+        path = Path(workdir).expanduser()
+    except RuntimeError as exc:
+        return (
+            f"WorkingDirectory={workdir!r} names a home directory this account cannot resolve "
+            f"({exc}) — the unit's cwd is unmeasurable from here, which systemd answers with "
+            "status=200/CHDIR before the unit runs a line"
+        )
     if not path.is_absolute():
         return f"WorkingDirectory={workdir!r} is not an absolute path"
     # ⛔ THE SHAPE IS CHECKED FIRST, and the order is load-bearing: a path under /tmp that does not
@@ -2627,6 +2664,16 @@ def converge(
         "repo": repo,
         "dry_run": dry_run,
         "actions": [],
+        # ⛔ A HYPOTHETICAL IS NOT AN ACTION (review finding P1, round 12). `actions` is the record of
+        # what this pass DID — the line a human reads to learn whether a registration was destroyed —
+        # and a dry run used to append `would repair …` into it. That made `actions` non-empty on a
+        # read-only pass, and the verdict chain below reads `actions` to distinguish `converged`
+        # ("we acted and are at the target") from `at-ceiling` ("nothing to do"), so `--status` on a
+        # box whose own classification said DEAD reported `verdict=converged`, exit 0 — while
+        # printing `DEAD r-3` two lines above it. Two fields, two claims: what was done, and what a
+        # real pass would do.
+        "would_repair": [],
+        "plan": [],
         "notes": [],
         "verdict": "",
         "problems": [],
@@ -2755,6 +2802,20 @@ def converge(
     # listener was actually gone, which is why only that case increments.
     live = sum(1 for c in classified if c["alive"])
     stop_pass = False
+    # ⛔ ONE REGISTRATION PER NAME, PER PASS — AND THE SAME ONE ON EVERY PASS (review finding P2,
+    # round 12). Two installs can share an `agentName` after a `cp -a` (the shape `discover()` is
+    # written for), and the server holds ONE registration per name: two `--replace` calls in one pass
+    # mean the second deletes the registration the first created seconds earlier, while the record
+    # appends `registered r-dup` twice and `live` counts two listeners — two restored runners claimed
+    # for one registration. Picking a different install each pass is no better: the pass that repairs
+    # the other one destroys the working registration every 9 minutes. So the OWNER of a duplicated
+    # name is the FIRST install in the order `discover()` returns (sorted, stable), it is repaired
+    # normally, and every other install carrying that name is a REPORTED duplicate, never a repair
+    # target. `name_owner` is derived from `local`, which is that same sorted list.
+    by_name: dict[str, list[str]] = {}
+    for r in local:
+        by_name.setdefault(r.name, []).append(str(r.directory))
+    duplicates = {name: dirs for name, dirs in by_name.items() if len(dirs) > 1}
     for c in classified:
         if c["state"] in ("SERVING", "BUSY", "OTHER-REPO"):
             # OTHER-REPO is reported and never repaired: it is not this repo's runner, so
@@ -2776,7 +2837,7 @@ def converge(
         if runner is None:  # a classified entry always came FROM `local`; this cannot drift silently
             runner = next(r for r in local if r.name == c["name"])
         if dry_run:
-            record["actions"].append(f"would repair {c['name']} ({c['state']})")
+            record["would_repair"].append(f"would repair {c['name']} ({c['state']})")
             continue
         if c["state"] == "DEAD":
             ok, detail = restart_runner(runner)
@@ -2863,6 +2924,18 @@ def converge(
             record["notes"].append(
                 f"{c['name']}: {evidence} — NOT re-registering "
                 "(a busy or online runner is never re-registered); it is re-judged next pass"
+            )
+            continue
+        # ⛔ A DUPLICATE IS NOT A REPAIR TARGET (review finding P2, round 12) — see `duplicates`
+        # above. Checked HERE, immediately before the destructive step and AFTER the serving checks,
+        # so a duplicate the pool reports online still keeps its registration and still says why.
+        if c["name"] in duplicates and c["dir"] != duplicates[c["name"]][0]:
+            record["problems"].append(
+                f"{c['name']}: NOT re-registering {c['dir']} — {len(duplicates[c['name']])} installs "
+                f"carry this agentName ({', '.join(duplicates[c['name']])}) and the server holds ONE "
+                "registration per name, so the second --replace would delete the registration the "
+                f"first just created; {duplicates[c['name']][0]} is the install this tool repairs. "
+                "Remove the duplicate install — until then this box cannot be converged"
             )
             continue
         # ⛔ THE ACTION LINE GOES AFTER THE CHECKS (review finding P3). It used to be appended before
@@ -3006,7 +3079,7 @@ def converge(
             # call and printed N steps ending `converged`, while the real pass on the same box
             # issued ONE call and ended under-target (round 4, finding 4). Say what a plan knows:
             # the call it WOULD make, and that the result is measured by the real pass.
-            record["actions"].append(
+            record["plan"].append(
                 f"would ask the provisioner for install slot #{index} (mem_available_mb={before}); "
                 "how many listeners that yields is MEASURED by a real pass, not predicted here"
             )
@@ -3299,6 +3372,19 @@ def converge(
         )
     elif live >= target and record["actions"]:
         record["verdict"] = "converged"
+    elif live >= target and record["would_repair"]:
+        # ⛔ CAPACITY AT THE CEILING IS NOT A HEALTHY BOX (review finding P1, round 12). A runner the
+        # pass's OWN classification called DEAD/ORPHANED is an outstanding repair: on a full box a
+        # real pass would restart/re-register it, so a read-only pass must not answer `converged` —
+        # that is the word a monitor keys on, and `--status` printed it two lines under `DEAD r-3`.
+        # The verdict is what the measurement supports (`at-ceiling`: no fill is needed) and the
+        # outstanding work is named, in `would_repair` for a machine and in this note for a human.
+        record["verdict"] = "at-ceiling"
+        record["notes"].append(
+            f"at-ceiling: {live}/{ceil} — {reading} — {len(record['would_repair'])} degraded "
+            f"install(s) a real pass would repair ({'; '.join(record['would_repair'])}); this pass "
+            "was read-only, so nothing was done and the box is NOT converged"
+        )
     elif live >= target:
         record["verdict"] = "at-ceiling"
         record["notes"].append(f"at-ceiling: {live}/{ceil} — {reading}")
@@ -3318,7 +3404,20 @@ def converge(
     # the hand-written one that started this — and a broken unit is invisible until someone reads a
     # red unit. A NOTE, not a `problems` entry: the pool may be perfectly converged, and turning a
     # healthy pool red for a stale unit file would trade one silent failure for a noisy false one.
-    unit_problems = installed_unit_cwd_problems()
+    # ⛔ AN AUDIT MAY NOT LOSE THE RECORD — this commit's own title, and the reason the wrap exists
+    # (review finding P1, round 12). This audit runs AFTER the repair and fill steps, so ANY exception
+    # escaping it (measured reachable: `Path.expanduser()` on `WorkingDirectory=~nosuchuser/x`, and a
+    # per-entry `stat` outside pathlib's absence errnos) reaches `main()`'s backstop with the pass's
+    # destructive actions already performed — and the backstop's payload carries no `actions`, so the
+    # record of a registration that was destroyed and recreated is exactly what gets lost. A finding
+    # here is a FINDING; the audit never propagates.
+    try:
+        unit_problems = installed_unit_cwd_problems()
+    except Exception as exc:  # noqa: BLE001 — the audit is a reporter, never a reason to lose a record
+        unit_problems = [
+            f"the installed-unit audit ITSELF failed ({type(exc).__name__}: {exc}) — the units on "
+            "this box were NOT audited; the actions in this record were performed before this point"
+        ]
     if unit_problems:
         record["unit_cwd_problems"] = unit_problems
         # ⛔ ONE SUMMARY NOTE, NOT ONE PER FINDING (review finding P2). Every pass re-audits every
@@ -3558,6 +3657,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {c['state']:<9} {c['name']} dir={c['dir']}")
         for a in record["actions"]:
             print(f"  - {a}")
+        for a in record.get("would_repair", []):
+            print(f"  - {a}")
+        for p in record.get("plan", []):
+            print(f"  · {p}")
         for n in record.get("notes", []):
             print(f"  · {n}")
         if record.get("starvation"):

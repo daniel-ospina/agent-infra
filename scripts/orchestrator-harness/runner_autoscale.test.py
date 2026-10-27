@@ -210,6 +210,29 @@ def check(cond, msg):
         raise Failure(msg)
 
 
+def _force_rmtree(path: str) -> None:
+    """Remove a tree, REPAIRING permissions as it goes — never a silent false success.
+
+    `shutil.rmtree(..., ignore_errors=True)` reported success while leaving the tree (see
+    `Box.destroy`), and a retry hook cannot be written against `rmtree`'s own callbacks: `os.open`,
+    `os.scandir`, `os.unlink` and `os.rmdir` all arrive at the SAME `onexc`, so `func(path)` is not
+    even callable for two of them (measured: `TypeError: open() missing required argument 'flags'`).
+    So the tree is made reachable FIRST — directories TOP-DOWN, which is what lets the walk descend
+    into a mode-000 parent — and then removed with `rmtree`'s errors LEFT ON, so a second failure is
+    loud rather than absorbed.
+    """
+    for base, dirs, _files in os.walk(path, topdown=True, onerror=lambda _exc: None):
+        for name in dirs:
+            try:
+                os.chmod(os.path.join(base, name), 0o700)
+            except OSError:
+                pass
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        print(f"   ! could not remove fixture path {path}: {exc}", file=sys.stderr)
+
+
 def contains(haystack, needle, what):
     if needle not in haystack:
         raise Failure(f"{what} does not contain {needle!r}\n--- got ---\n{haystack}")
@@ -230,8 +253,15 @@ is() { case "$args" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 if is /registration-token; then
   # A mint that FAILS is the routine transient the repair path must survive: `registration_token()`
   # raises, and it does so AFTER the local config has been cleared.
+  #
+  # ⛔ `token.advisory` makes a SUCCESSFUL mint write an advisory to STDERR while the token still
+  # goes to STDOUT — the `gh` shape that turned the token into `gh: warning: …` when the two streams
+  # were merged (review finding P2, round 12). `token.stdout` replaces stdout entirely, so a case can
+  # print a token AND a second line and require the guard to refuse it.
+  [ -f "$FIX/token.advisory" ] && echo "gh: warning: this token expires in 1 hour" >&2
   [ -f "$FIX/token.fail" ] && { echo "gh: HTTP 401: Bad credentials (fixture)" >&2; exit 1; }
-  printf 'tok-fixture\n'; exit 0
+  if [ -f "$FIX/token.stdout" ]; then cat "$FIX/token.stdout"; else printf 'tok-fixture\n'; fi
+  exit 0
 fi
 if is 'direction=asc'; then
   # THE QUEUE'S OLDEST WAITING RUN (the AGE term, round 11). MUST be tested before the depth branch
@@ -595,7 +625,18 @@ class Box:
         os.environ.update(self.env)
 
     def destroy(self):
-        shutil.rmtree(self.dir, ignore_errors=True)
+        """Remove the fixture — INCLUDING trees a case left unreadable.
+
+        ⛔ `shutil.rmtree(..., ignore_errors=True)` REPORTED SUCCESS WHILE LEAVING THE TREE (review
+        finding P2, round 12). A case that makes a directory mode-000 and does not restore it (T46)
+        cannot be removed by an unprivileged `rmtree`, and `ignore_errors` turned that into a silent
+        "cleaned up": one leaked `$TMPDIR/runnerauto-*` per run, each holding a `d---------`
+        directory that an unprivileged `rm -rf` cannot remove either. That is a permanent disk leak
+        on exactly the boxes whose disk budget this whole change exists to respect, and it also
+        meant "`Box.destroy()` cleans up" was not verified by any case. The mode is repaired and the
+        removal RETRIED, and a second failure is PRINTED rather than swallowed.
+        """
+        _force_rmtree(self.dir)
 
 
 class Env:
@@ -618,8 +659,17 @@ def _cli_env(box: Box) -> dict:
 
     `dict(os.environ, **box.env)` cannot be narrowed afterwards — a seam the box already sets is a
     DUPLICATE keyword — so a case that must pin one seam differently (T1 pins nproc) builds on this.
+
+    ⛔ `PYTHONDONTWRITEBYTECODE` IS PART OF THE CONTRACT, not a convenience (review finding P1, round
+    12). `sys.dont_write_bytecode = True` at the top of this file is a PER-PROCESS flag, and T48's
+    child runs a FRESH interpreter that imports the module under test by path: it wrote
+    `scripts/orchestrator-harness/__pycache__/runner_autoscale.cpython-312.pyc` INTO THE CHECKOUT.
+    `pin_dirty` does not tolerate that (only `.DS_Store`/`._*` are excused), so a GREEN suite run made
+    `harness-exec.sh` refuse ("the pinned tree has UNCOMMITTED CHANGES") and `cloud-cell-supervisor
+    check` die DRIFT on the cell that had just validated the tool — and the remedy both messages
+    offer (commit or discard) cannot be applied to a gitignored file. The child inherits the flag.
     """
-    return {**os.environ, **box.env}
+    return {**os.environ, **box.env, "PYTHONDONTWRITEBYTECODE": "1"}
 
 
 def cli(box: Box, *args) -> tuple[int, str]:
@@ -2671,12 +2721,20 @@ def t36_discover_uninspectable_is_unmeasurable():
             box.destroy()
 
 
-@test("T37 two installs that share an agent NAME are repaired BY DIRECTORY, not by name")
+@test("T37 two installs that share an agent NAME: ONE registration, owned by a STABLE install")
 def t37_repair_identity_is_the_directory():
     """A `cp -a` of an install keeps the same `agentName` in `.runner`, and `next(... name == ...)`
     then repaired the FIRST install on both iterations — the second `--replace` deleting the
     registration the first had just created — while the install that needed the repair was never
-    touched, with the record attributing the action to it. Identity is the INSTALL."""
+    touched, with the record attributing the action to it.
+
+    ⛔ AND THE SERVER HOLDS ONE REGISTRATION PER NAME, SO "REPAIR BOTH" IS NOT THE FIX (review
+    finding P2, round 12). Driving both installs with `--replace` in one pass still ends with the
+    second call deleting the first's registration, and the record still claims two successes. Making
+    the choice per-pass is no better: the pass that repairs the other install destroys the working
+    registration, so the two flip every 9 minutes. The OWNER is the first install in the sorted order
+    `discover()` returns — stable across passes — and every other install carrying that name is a
+    REPORTED duplicate that a human must remove, never a repair target."""
     with Env():
         box = Box("dup-names")
         try:
@@ -2685,30 +2743,39 @@ def t37_repair_identity_is_the_directory():
             box.pool([])  # neither is in the pool: both ORPHANED
             box.alive([])
 
-            def stamps() -> dict:
-                # Only `.runner`: a SUCCESSFUL registration deliberately DISCARDS the stash (the
-                # fresh config is the newer truth), and the stub writes no `.credentials`.
-                return {
-                    os.path.join(path, ".runner"): os.stat(
-                        os.path.join(path, ".runner")
-                    ).st_mtime_ns
-                    for path in (a, b)
-                }
-
-            before = stamps()
             record = converge(box, want=0)
-            after = stamps()
-            for path in (a, b):
-                key = os.path.join(path, ".runner")
-                check(
-                    after[key] != before[key],
-                    f"{path} was never cleared-and-restored, so the repair skipped it: "
-                    f"{record['actions']}",
-                )
             registrations = [c for c in box.calls("config-calls.log") if "argv=" in c]
             check(
-                len(registrations) == 2,
-                f"one registration per INSTALL, got {registrations}",
+                len(registrations) == 1,
+                f"ONE registration per NAME — a second --replace deletes the first: {registrations}",
+            )
+            check(
+                os.stat(os.path.join(a, ".runner")).st_mtime_ns != 0
+                and any("registered r-dup" in act for act in record["actions"]),
+                f"the OWNER (first in sorted order) is the install repaired: {record['actions']}",
+            )
+            # ⛔ THE DUPLICATE IS REPORTED — as a `problems` entry, because the box cannot be
+            # converged until a human removes it, and silence is how a phantom install survives.
+            dup = [p for p in record["problems"] if "agentName" in p]
+            check(len(dup) == 1, f"the duplicate is NAMED, once: {record['problems']}")
+            contains(dup[0], b, "the finding names the install that was NOT registered")
+            contains(dup[0], "Remove the duplicate install", "…and what to do about it")
+            check(
+                b not in "".join(record["actions"]),
+                f"…and no action claims it was registered: {record['actions']}",
+            )
+            check(record["verdict"] == "action-failed", f"the verdict: {record.get('verdict')}")
+            # ⛔ AND THE CHOICE IS STABLE: a second pass repairs the SAME install, so the duplicate
+            # cannot oscillate the registration between the two directories.
+            record = converge(box, want=0)
+            check(
+                any("registered r-dup" in act for act in record["actions"]),
+                f"the same owner is repaired again, never the duplicate: {record['actions']}",
+            )
+            check(
+                sum(1 for c in box.calls("config-calls.log") if "argv=" in c) <= 3,
+                "at most one registration per pass: "
+                + str(box.calls("config-calls.log")),
             )
         finally:
             box.destroy()
@@ -3119,7 +3186,10 @@ def t30_bad_seam_leaves_a_record():
             os.environ.pop("RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS", None)
             box.install("gh-runner-x64", "r-1")
             box.alive([box.installs["gh-runner-x64"]])
-            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            # ⛔ THE INSTALL IS ALIVE AND THE POOL DOES NOT HAVE IT (ORPHANED): the pass therefore
+            # performs its ONE DESTRUCTIVE ACTION — clear the local config and re-register with
+            # `--replace` — which is the thing whose record the audit used to cost.
+            box.pool([])
             original = ra.installed_unit_cwd_problems
 
             def boom(*_a, **_k):
@@ -3130,7 +3200,16 @@ def t30_bad_seam_leaves_a_record():
                 code = ra.main(["--root", box.root, "--want", "1"])
             finally:
                 ra.installed_unit_cwd_problems = original
-            check(code == 2, f"a pass that could not complete exits 2 (unmeasurable), got {code}")
+            # ⛔ ROUND 12: THE AUDIT IS A REPORTER, AND IT CAN NO LONGER COST THE PASS ITS RECORD.
+            # The exception used to reach `main()`'s backstop, whose payload carries NO `actions` —
+            # so exit 2 ("nothing was changed") was published over a pass that had just destroyed
+            # and recreated a registration, which is the one claim that payload must never make. The
+            # pass now COMPLETES (the box did converge; the audit could not run) and says so.
+            check(
+                code == 0,
+                f"an audit failure is a FINDING, not the pass's verdict — a completed pass exits 0, "
+                f"got {code}",
+            )
             log = os.path.join(box.dir, "state", "runner-autoscale.log")
             check(
                 os.path.exists(log),
@@ -3140,6 +3219,28 @@ def t30_bad_seam_leaves_a_record():
             with open(log, encoding="utf-8") as fh:
                 body = fh.read()
             contains(body, "the unit audit exploded", "the record carries the cause")
+            contains(body, "registered r-1", "…and the DESTRUCTIVE ACTION it performed")
+            contains(body, "converged", "the record carries a VERDICT")
+            # ⛔ AND THE BACKSTOP ITSELF IS STILL THE LAST RESORT (round 12 keeps BOTH halves). The
+            # audit can no longer reach it, so the arm that must still be pinned is an unexpected
+            # exception from `converge` ITSELF: `main()` must record a verdict instead of dying with
+            # a bare traceback and an untouched log — the pass may already have acted.
+            os.unlink(log)
+            original_converge = ra.converge
+
+            def explode(*_a, **_k):
+                raise RuntimeError("the pass exploded unexpectedly")
+
+            ra.converge = explode
+            try:
+                code = ra.main(["--root", box.root, "--want", "1"])
+            finally:
+                ra.converge = original_converge
+            check(code == 2, f"an unrecorded crash is exit 2 (unmeasurable), got {code}")
+            check(os.path.exists(log), f"…and it is RECORDED, not lost. looked for {log}")
+            with open(log, encoding="utf-8") as fh:
+                body = fh.read()
+            contains(body, "the pass exploded unexpectedly", "the record carries the cause")
             contains(body, "unmeasurable", "the record carries a VERDICT")
         finally:
             box.destroy()
@@ -3367,8 +3468,16 @@ def t46_uninspectable_unit_entry():
                 os.path.join(secret, "b.service"), os.path.join(box.dir, "units", "b.service")
             )
             os.chmod(secret, 0o000)
+            # ⛔ THE MODE STAYS 000 FOR THE WHOLE CASE (review finding P2, round 12): it is the
+            # FIXTURE, and the two halves below both need it. It is restored in the case's own
+            # `finally` instead — restoring it here made the symlink resolve to a MISSING file
+            # (`unreadable: No such file`) rather than to an INSPECTABLE one (`cannot be inspected`),
+            # which silently measured a different defect.
             code, out = cli(box, "--check-units")
-            check(code == 5, f"an uninspectable ENTRY is a finding (5), never a crash: rc={code}\n{out}")
+            check(
+                code == 5,
+                f"an uninspectable ENTRY is a finding (5), never a crash: rc={code}\n{out}",
+            )
             contains(out, "cannot be inspected", "the audit names the entry")
             check("Traceback" not in out, f"…and never a traceback:\n{out}")
             # ⛔ AND THE PASS PATH: the audit runs at the end of every pass, so an exception here
@@ -3387,6 +3496,14 @@ def t46_uninspectable_unit_entry():
                 f"…and the uninspectable entry is reported, not skipped: {findings}",
             )
         finally:
+            # ⛔ RESTORE THE MODE BEFORE THE FIXTURE IS REMOVED, LIKE T36 DOES (review finding P2,
+            # round 12). Without it the tree is unremovable by an unprivileged `rmtree`, so every run
+            # leaked a `d---------` directory on the boxes whose disk budget this change exists to
+            # respect. `Box.destroy()` now repairs such a tree as well (T54 pins that half).
+            try:
+                os.chmod(secret, 0o755)
+            except OSError:
+                pass
             box.destroy()
 
 
@@ -3528,7 +3645,284 @@ def t49_confirm_failure_keeps_first_sample():
             box.destroy()
 
 
+@test("T50 a `~user` WorkingDirectory this account cannot resolve is a FINDING — never a traceback")
+def t50_unresolvable_home_workdir():
+    """`pathlib.Path.expanduser()` RAISES (`RuntimeError: Could not determine home directory.`)
+    for a `~user` the account cannot resolve, while `os.path.expanduser` returns the argument
+    unchanged. `WorkingDirectory=~someone/x` is legal systemd syntax and the audit exists precisely
+    to read FOREIGN/hand-written units, so this input is reachable by design — and the audit runs
+    AFTER the repair loop, so the raise landed in `main()`'s backstop, whose payload carries no
+    `actions`: exit 2, "nothing was changed", over a pass that had just destroyed and recreated a
+    registration. A path that cannot be resolved is a finding, not a crash."""
+    with Env():
+        box = Box("workdir-home")
+        try:
+            box.apply()
+            problem = ra.unit_workdir_problem("~nosuchuser9/x")
+            check(isinstance(problem, str) and problem, f"a finding, not a crash: {problem!r}")
+            contains(problem, "cannot resolve", "the finding names the cause")
+            # ⛔ THE CONTROL: the tool's OWN template (`%h`) and a resolvable `~/x` must not be
+            # reported as unresolvable — a guard that refused every `~` would refuse the default.
+            check(
+                "cannot resolve" not in (ra.unit_workdir_problem("%h") or ""),
+                "`%h` is the template's own shape, not a resolution failure",
+            )
+            check(
+                "cannot resolve" not in (ra.unit_workdir_problem("~/x") or ""),
+                "a resolvable home is resolved, not reported as unresolvable",
+            )
+            # THE AUDIT — which runs at the end of EVERY pass — reports it instead of raising.
+            box._write(
+                os.path.join(box.dir, "units", "ghost.service"),
+                "[Service]\nWorkingDirectory=~nosuchuser9/x\nExecStart=/bin/true\n",
+            )
+            findings = ra.installed_unit_cwd_problems()
+            check(
+                any("cannot resolve" in f for f in findings),
+                f"the audit reports the unresolved home instead of raising: {findings}",
+            )
+            # ⛔ THE PASS: a DEAD runner is repaired, and the record KEEPS the action in the same
+            # record that carries the unit finding — "an audit may not lose the record".
+            box.install("gh-runner-x64", "r-1")
+            box.alive([])  # no listener ⇒ DEAD once the pool reports it offline
+            box.pool([("r-1", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            record = converge(box, nproc="2")
+            check(record.get("actions"), f"the repair is in the record: {record}")
+            check(
+                any("cannot resolve" in p for p in (record.get("unit_cwd_problems") or [])),
+                f"…and the unit finding is in the SAME record: {record.get('unit_cwd_problems')}",
+            )
+            check(
+                record.get("verdict") != "unmeasurable",
+                f"a unit finding is not the pass's verdict: {record.get('verdict')}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T51 --status on a box whose OWN classification says DEAD is not `converged`")
+def t51_status_does_not_launder_a_dead_runner():
+    """`actions` is the record of what the pass DID, and the verdict chain reads it to tell
+    `converged` ("we acted and are at the target") from `at-ceiling` ("nothing to do"). A dry run
+    appended `would repair …` INTO `actions`, so a read-only `--status` on a box whose own printout
+    says `DEAD r-3` reported `verdict=converged`, exit 0 — the exact word a monitor keys on, for a
+    degraded pool a real pass would repair. Hypotheticals now live in `would_repair`, and a box with
+    an outstanding repair cannot be `converged`."""
+    with Env():
+        box = Box("status-dead")
+        try:
+            up = [box.install("gh-runner-x64", "r-1"), box.install("gh-runner-x64-2", "r-2")]
+            degraded = box.install("gh-runner-x64-3", "r-3")
+            box.alive(up)  # r-3's listener is GONE and the pool says offline ⇒ DEAD
+            box.pool(
+                [
+                    ("r-1", "online", False, ["self-hosted-x64"]),
+                    ("r-2", "online", False, ["self-hosted-x64"]),
+                    ("r-3", "offline", False, ["self-hosted-x64"]),
+                ]
+            )
+            record = converge(box, nproc="8", want=2, dry_run=True)
+            check(record["actions"] == [], f"a read-only pass performs NOTHING: {record['actions']}")
+            check(
+                any("would repair r-3" in w for w in record["would_repair"]),
+                f"the outstanding repair is named: {record.get('would_repair')}",
+            )
+            check(
+                record["verdict"] != "converged",
+                f"a box with a DEAD runner is NOT converged: {record['verdict']}",
+            )
+            check(record["verdict"] == "at-ceiling", f"the verdict: {record['verdict']}")
+            contains(
+                " ".join(record["notes"]),
+                "NOT converged",
+                "the note says the box is not converged, out loud",
+            )
+            # ⛔ AND THROUGH THE CLI, where a health check actually reads it.
+            rc, out = cli(box, "--status", "--want", "2", "--root", box.root)
+            contains(out, "would repair r-3", "the read-only plan names the degraded install")
+            check("verdict=converged" not in out, f"…and never claims convergence:\n{out}")
+            check(rc == 0, f"--status is read-only and exits 0, got {rc}")
+            # ⛔ THE CONTROL: the same box with that runner HEALTHY has NOTHING outstanding, so this
+            # is not a case that reds every read-only pass.
+            box.alive([*up, degraded])
+            box.pool(
+                [
+                    ("r-1", "online", False, ["self-hosted-x64"]),
+                    ("r-2", "online", False, ["self-hosted-x64"]),
+                    ("r-3", "online", False, ["self-hosted-x64"]),
+                ]
+            )
+            record = converge(box, nproc="8", want=2, dry_run=True)
+            check(record["would_repair"] == [], f"a healthy box plans no repair: {record}")
+            check(
+                all(r["state"] != "DEAD" for r in record["runners"]),
+                f"…because nothing is degraded: {[r['state'] for r in record['runners']]}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T52 the registration token is the LAST LINE OF STDOUT — a stderr advisory is not a token")
+def t52_token_comes_from_stdout():
+    """`_run` concatenates stdout THEN stderr, and `registration_token()` read the last line of that
+    merged text. Any advisory `gh` writes to stderr on an otherwise-successful mint therefore BECAME
+    the token (`gh: warning: this token expires in 1 hour`), so `config.sh` rejected it, `register()`
+    raised `ActionFailed` on every pass, and the record blamed the runner's own tooling — the repair
+    path silently dead on exactly the boxes it exists for."""
+    with Env():
+        box = Box("token-stream")
+        try:
+            box.apply()
+            # A SUCCESSFUL mint whose stderr carries an advisory: stdout still holds the token.
+            box._write(os.path.join(box.dir, "token.advisory"), "1\n")
+            check(
+                ra.registration_token("daniel-ospina/tortoise") == "tok-fixture",
+                "the token is the STDOUT value, not the stderr advisory",
+            )
+            # ⛔ AND A STDOUT LINE THAT IS NOT A TOKEN IS REFUSED, never passed on: the same guard,
+            # on the stream that does carry the value (a token has no whitespace in it).
+            box._write(os.path.join(box.dir, "token.stdout"), "tok-fixture\ngh: warning: rotated\n")
+            try:
+                ra.registration_token("daniel-ospina/tortoise")
+            except ra.ActionFailed as exc:
+                contains(str(exc), "stdout=", "the refusal shows what was actually printed")
+            else:
+                raise Failure("a second stdout line was accepted as part of the token")
+            # ⛔ AND THE REPAIR IT BLOCKED: with the advisory present a DEAD runner IS repaired.
+            os.unlink(os.path.join(box.dir, "token.stdout"))
+            box.install("gh-runner-x64", "r-1")
+            box.alive([])
+            box.pool([("r-1", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            record = converge(box, nproc="2")
+            check(
+                any("registered r-1" in a for a in record["actions"]),
+                f"a repr with an advisory mint still registers: {record['actions']} / "
+                f"{record['problems']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T53 a suite run writes NO bytecode into the checkout — a green run must not dirt the pin")
+def t53_no_bytecode_in_the_checkout():
+    """`sys.dont_write_bytecode = True` at the top of this file is a PER-PROCESS flag, so it does
+    nothing for a CHILD interpreter — and T48's child imports the module under test by path. The
+    child wrote `__pycache__/runner_autoscale.cpython-312.pyc` INTO THE CHECKOUT, which `pin_dirty`
+    does not tolerate (only `.DS_Store`/`._*` are excused): a GREEN suite run made `harness-exec.sh`
+    refuse ("the pinned tree has UNCOMMITTED CHANGES") and `cloud-cell-supervisor check` die DRIFT,
+    and the remedy both messages offer — commit or discard — cannot be applied to a gitignored file.
+
+    ⛔ NO PRODUCTION MUTANT CAN EXIST FOR THIS CASE: the guarantee lives in this harness (`_cli_env`
+    puts `PYTHONDONTWRITEBYTECODE=1` into every child), not in the module under test. It is stated
+    here so a reader does not count it as verified-by-mutation."""
+    with Env():
+        box = Box("bytecode")
+        try:
+            check(
+                _cli_env(box).get("PYTHONDONTWRITEBYTECODE") == "1",
+                "every child this suite spawns must inherit PYTHONDONTWRITEBYTECODE=1",
+            )
+            script = (
+                "import importlib.util, sys\n"
+                f"spec = importlib.util.spec_from_file_location('ra_under_test', {ra.__file__!r})\n"
+                "m = importlib.util.module_from_spec(spec)\n"
+                # Registered BEFORE exec: `@dataclass` resolves annotations through
+                # `sys.modules[cls.__module__]` (the same reason `_load_module` does it).
+                "sys.modules['ra_under_test'] = m\n"
+                "spec.loader.exec_module(m)\n"
+            )
+            # ⛔ THE MODULE'S OWN DIRECTORY, which under `--mutations` is the mutant's temp dir and in
+            # a plain run IS the checkout — the same code path, measured where the child would write.
+            pycache = os.path.join(os.path.dirname(os.path.abspath(ra.__file__)), "__pycache__")
+            before = set(os.listdir(pycache)) if os.path.isdir(pycache) else set()
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                env=_cli_env(box),
+                capture_output=True,
+                text=True,
+            )
+            check(proc.returncode == 0, f"the child ran ({proc.returncode}): {proc.stderr[:300]}")
+            after = set(os.listdir(pycache)) if os.path.isdir(pycache) else set()
+            check(
+                after == before,
+                f"a child wrote {sorted(after - before)} into {pycache} — a green run would leave "
+                "the pinned harness dir DIRTY and block the cell's own harness-exec",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T54 Box.destroy() removes a fixture that still carries a mode-000 directory")
+def t54_destroy_removes_unreadable_tree():
+    """`shutil.rmtree(..., ignore_errors=True)` REPORTED SUCCESS while leaving the tree: a case that
+    makes a directory mode-000 and does not restore it (T46 did exactly that) leaked one
+    `$TMPDIR/runnerauto-*` per run, each holding a `d---------` directory an unprivileged `rm -rf`
+    cannot remove either — a permanent disk leak on exactly the boxes whose disk budget this change
+    exists to respect, and "`Box.destroy()` cleans up" was verified by no case at all.
+
+    ⛔ NO PRODUCTION MUTANT CAN EXIST FOR THIS CASE either: `destroy()` is harness code."""
+    box = Box("destroy-unreadable")
+    secret = os.path.join(box.dir, "secret")
+    os.makedirs(secret, exist_ok=True)
+    box._write(os.path.join(secret, "b.service"), "[Service]\nWorkingDirectory=%h\n")
+    os.chmod(secret, 0o000)
+    path = box.dir
+    try:
+        box.destroy()
+    finally:
+        if os.path.exists(path):  # do not leak the leak
+            os.chmod(secret, 0o755)
+            shutil.rmtree(path, ignore_errors=True)
+    check(not os.path.exists(path), f"{path} survived destroy() — a green run would leak it")
+
+
 MUTATIONS = [
+    # ── review round 12: the 2026-10-27 second-review findings (one mutation per claim) ──
+    Mutation(
+        "T50",
+        "    except RuntimeError as exc:",
+        "    except ZeroDivisionError as exc:  # MUTATION: the unresolvable home escapes the audit",
+        "`Path.expanduser()` raises on a `~user` this account cannot resolve, so the audit throws "
+        "after the repair loop has already destroyed and recreated a registration — exit 2, "
+        "'nothing was changed', with the record losing `actions`",
+    ),
+    Mutation(
+        "T30",
+        "    except Exception as exc:  # noqa: BLE001 — the audit is a reporter, never a reason to lose a record",
+        "    except ZeroDivisionError as exc:  # MUTATION: the audit's failure escapes the pass",
+        "an exception inside the every-pass unit audit reaches `main()`'s backstop again, whose "
+        "payload carries no `actions` — so the record of an action already performed is lost",
+    ),
+    # ⛔ A MUTATION REMOVED, ON PURPOSE (round 12). "repair identity falls back to the NAME, so two
+    # installs sharing an agentName act on the same one twice" is no longer a defect this file can
+    # exhibit: two `--replace` calls for one name are now REFUSED outright (the mutation below), so
+    # the second install never reaches the register call at all and the name lookup and the
+    # directory lookup resolve to the same install in every reachable pass. The `c["dir"]` lookup
+    # stays as the precise expression of "identity is the install"; the GUARANTEE that used to ride
+    # on it is now pinned by the duplicate rule, and re-adding this mutation would only score a
+    # CAUGHT against a code path the case cannot reach.
+    Mutation(
+        "T37",
+        '        if c["name"] in duplicates and c["dir"] != duplicates[c["name"]][0]:',
+        "        if False:  # MUTATION: every duplicate install is registered",
+        "two `--replace` calls for one agentName in one pass: the second deletes the registration "
+        "the first created seconds earlier, the record claims two registrations, and the pair "
+        "oscillates every pass",
+    ),
+    Mutation(
+        "T51",
+        '    elif live >= target and record["would_repair"]:',
+        "    elif False:  # MUTATION: an outstanding repair is laundered into `converged`",
+        "a read-only `--status` on a box whose own classification says DEAD reports "
+        "`verdict=converged`, exit 0 — the false PASS a health check reads as healthy",
+    ),
+    Mutation(
+        "T52",
+        '    token = out.strip().splitlines()[-1].strip() if out.strip() else ""',
+        '    token = (out + err).strip().splitlines()[-1].strip() if (out + err).strip() else ""  # MUTATION: merged streams',
+        "a `gh` advisory on stderr on a SUCCESSFUL mint becomes the token, so `config.sh` rejects "
+        "it and the repair path raises on every pass while blaming the runner's own tooling",
+    ),
     # ── review round 11: the 2026-10-27 fresh-context findings (one mutation per claim) ──
     Mutation(
         "T44",
@@ -4098,12 +4492,6 @@ MUTATIONS = [
         '        raise Unmeasurable(f"the runner root {base} {base_reason} — cannot inventory this box")',
         "        return []",
         "an unreadable runner root reads as EMPTY: the pass registers duplicates over installs it could not see",
-    ),
-    Mutation(
-        "T37",
-        '        runner = next((r for r in local if str(r.directory) == c["dir"]), None)',
-        '        runner = next((r for r in local if r.name == c["name"]), None)',
-        "repair identity falls back to the NAME, so two installs sharing an agentName act on the same one twice",
     ),
     Mutation(
         "T38",
