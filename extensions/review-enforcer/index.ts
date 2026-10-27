@@ -5758,14 +5758,18 @@ function ansiCEncodesSeparator(command: string): boolean {
  * The replacement asks for a merge VERB in argv POSITION, and nothing weaker:
  *   - the verb spelled (or spliced) in the argument list the shell will run — the token walk
  *     in `countMergeVerbs`, REUSED rather than re-implemented, because two predicates for
- *     "is this a merge" is the failure this file keeps re-learning. A payload handed to
- *     `sh -c`/`eval`/`trap` stays readable through the data mask, so a WRAPPED verb still
- *     counts; a verb inside plain quoted data (`echo 'gh pr merge 9'`) does not, which is
- *     the mention/invocation line this file already draws;
+ *     "is this a merge" is the failure this file keeps re-learning. That walk is DATA-AWARE,
+ *     so a verb inside plain quoted data (`echo 'gh pr merge 9'`) is not an invocation —
+ *     while a payload handed to `sh -c`/`eval`/`trap` stays readable and still counts;
  *   - a `gh` whose GROUP slot is unreadable still counts (`V="pr merge"; gh $V 999 --admin`,
  *     `gh --hostname … $X 999 --admin`), because there the verb is not in the text at all;
  *   - a verb ASSEMBLED with assignments still counts (`CMD+=gh CMD+=pr CMD+=merge`,
  *     `X='gh pr merge 999 --admin'; sh -c "$X"`), where no token IS the word `gh`;
+ *   - ANYTHING `mergeVerbInText` names is a merge here too. That read is the caller's own,
+ *     and it is quote-blind where this walk is data-aware, so it catches the construct in a
+ *     VERB position behind a merely-quoted group word — a measured fail-open for the arms
+ *     above (`M=merge; gh "pr" $M 999 --admin`, and the same inside `if`/`while`/`timeout`).
+ *     The invariant is one-directional and pinned: `mergeVerbInText(c)` ⇒ this is true;
  *   - where the separators are ANSI-C escapes (`gh$'\x20'pr …`) the token structure is not
  *     recoverable, so it falls back to the WORDS read — an over-block kept deliberately,
  *     because the alternative there is a fail-open.
@@ -5781,11 +5785,13 @@ function ansiCEncodesSeparator(command: string): boolean {
  *   - the LITERAL `--admin` arm stays exactly as wide as it was — a command carrying the
  *     flag AND a readable `gh pr merge` keeps the text layer's decision
  *     (`hasLiteralAdminFlag`);
- *   - a `--jq`/`--json`/`--search` value that spells a whole `pr`+`merge` word PAIR
- *     (`.merge`, `--json pr,merge`) is still read as a verb pair, because at that point the
- *     text is indistinguishable from an invocation without an argv layer. That residual is
- *     an OVER-BLOCK, the direction this gate is allowed to be wrong in, and it is strictly
- *     narrower than the "any `gh` word" rule it replaces.
+ *   - a `--jq`/`--json`/`--search` value that spells a WHITESPACE-SEPARATED `pr` then
+ *     `merge` word pair (`--jq 'pr merge'`) is still read as a verb pair, because at that
+ *     point the text is indistinguishable from an invocation without an argv layer. That
+ *     residual is an OVER-BLOCK — the direction this gate is allowed to be wrong in — and it
+ *     is strictly narrower than the "any `gh` word" rule it replaces. It does NOT fire on a
+ *     single token that merely contains both words (`--jq .merge`, `--json pr,merge`,
+ *     `mergeStateStatus`, `hasAdminMergeFlag`): those are not word pairs and are admitted.
  */
 export function mergeInvocationInText(command: string): boolean {
   // Same two normalizations the caller's own reads use: the rail's basename is not a
@@ -5799,6 +5805,25 @@ export function mergeInvocationInText(command: string): boolean {
   if (countMergeVerbs(bare) > 0) return true;
   if (ghGroupIsUnreadable(bare)) return true;
   if (mergeVerbSequenceInTokens(bare)) return true;
+  // ⛔ NO DIVERGENCE FROM THE OTHER MERGE-READ (review cycle 1, P0). `mergeVerbInText` is
+  // the read the CALLER's own condition uses (`hasLiteralAdminFlag || mergeVerbInText ||
+  // !readsNonMergeGhCall`), and it is quote-BLIND where this walk is data-aware: it
+  // recognises a construct sitting in a VERB position right after a bare `gh` or `pr` word.
+  // Measured fail-open without this arm — bash hands gh `pr merge 999 --admin`, the base
+  // refused it, and every arm above missed it because the GROUP word was merely QUOTED
+  // (`"pr"` is not a CONSTRUCT) and the verb was a variable:
+  //
+  //   M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin
+  //   if true; then gh "pr" m$'e'rge 99900010 --admin; fi
+  //   timeout 5 gh "pr" m$'e'rge 99900010 --admin
+  //
+  // `countMergeVerbs` skips the quoted `"pr"` as DATA whenever the simple command's first
+  // word is not `gh` (an assignment prefix, a reserved word, a wrapper), so the verb window
+  // never closes — while `mergeVerbInText` DOES name a merge for all of them. Two predicates
+  // for "is this a merge" disagreeing is the failure this file keeps re-learning, so the
+  // candidate rule is made a SUPERSET of that read rather than a second opinion beside it:
+  // INVARIANT, pinned in the suite — `mergeVerbInText(c) ⇒ isAdminMergeCommand(c)`.
+  if (mergeVerbInText(bare)) return true;
   // The separators are not recoverable from the text, so the token arms above are not a
   // read of this command: refuse on the WORDS read, which is what the pre-#3953 rule did.
   if (ansiCEncodesSeparator(bare)) {

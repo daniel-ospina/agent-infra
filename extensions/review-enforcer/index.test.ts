@@ -5276,6 +5276,18 @@ test("mergeInvocationInText: every FAIL-CLOSED arm is load-bearing", () => {
       "arm 4 — the separators are ANSI-C escapes, so the token structure is unrecoverable",
       `V=--admin; sh -c gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V`,
     ],
+    [
+      "arm 5 — a QUOTED group word plus a construct in the verb slot (review cycle 1, P0)",
+      `M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin`,
+    ],
+    [
+      "arm 5 — the same shape inside a reserved-word body, and behind a wrapper",
+      `if true; then gh "pr" m$'e'rge 99900010 --admin; fi`,
+    ],
+    [
+      "arm 5 — …and behind a wrapper",
+      `timeout 5 gh "pr" m$'e'rge 99900010 --admin`,
+    ],
   ];
   for (const [why, cmd] of shapes) {
     ok(mergeInvocationInText(cmd), `a merge invocation is still read (fail-closed): ${why}`);
@@ -5285,6 +5297,57 @@ test("mergeInvocationInText: every FAIL-CLOSED arm is load-bearing", () => {
   ok(!mergeInvocationInText("echo ${X}"), "a bare `$` in an argument is not a command word");
   ok(!mergeInvocationInText("bash ${RAIL} 999 --admin"),
      "…so a rail path held in a variable does not become a merge candidate (#6395)");
+});
+
+test("mergeInvocationInText: the candidate rule is a SUPERSET of mergeVerbInText — no two disagreeing merge-reads", () => {
+  // ⛔ THE INVARIANT, not a case list. `mergeVerbInText` is the read the CALLER's own
+  // condition uses; if the candidate rule can be FALSE while that read is TRUE, the gate
+  // silently stops deciding a command its own caller names — measured in review cycle 1 as
+  // a live fail-open for `M=merge; GH_TOKEN=abc gh "pr" $M 999 --admin` (the quoted group
+  // word is DATA to the counting walk; the construct in the verb slot is the merge).
+  const corpus = [
+    // The shapes each arm is for:
+    "gh pr merge 999 --admin",
+    "sh -c 'gh pr merge 999 --admin'",
+    "eval 'gh pr merge 999 --admin'",
+    "trap 'gh pr merge 999 --admin' EXIT",
+    'V="pr merge"; gh $V 999 --admin',
+    `gh --hostname github.com $X 999 $'--admin'`,
+    "CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge CMD+=' ' CMD+=999 CMD+=' ' V+=--admin CMD+=$V;A+=ok $CMD",
+    `V=--admin; sh -c gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V`,
+    `M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin`,
+    `M=merge; GH_TOKEN=abc gh 'pr' $M 99900010 --admin=`,
+    `if true; then gh "pr" m$'e'rge 99900010 --admin; fi`,
+    `while true; do gh "pr" m$'e'rge 99900010 --admin; done`,
+    `timeout 5 gh "pr" m$'e'rge 99900010 --admin`,
+    `stdbuf -oL gh "pr" $M 999 --admin`,
+    "gh p$'r' merge 999 --admin",
+    `gh pr m\`printf erge\` 999 --admin`,
+    `$'gh' pr merge 999 --admin`,
+    `g$'h' pr merge 999 --admin`,
+    "gh pr --repo o/r merge 999 --admin",
+    // …and the read-only commands, which must satisfy the implication vacuously:
+    `gh api "repos/o/r/commits/abc/check-runs?per_page=100&filter=all" --paginate`,
+    `gh api repos/o/r/branches/main/protection --jq '{enforce_admins: .enforce_admins}'`,
+    `gh issue list --search "review-enforcer admin-merge gate"`,
+    `gh run view 1 2>&1 | grep -viE "^\\s*$"`,
+    `git merge-base --is-ancestor abc origin/main`,
+    `echo 'gh pr merge 9 --admin'`,
+    `bash $AGENT_INFRA_PATH/scripts/admin-merge.sh 123 --admin`,
+  ];
+  for (const command of corpus) {
+    if (!mergeVerbInText(command)) continue;
+    ok(
+      isAdminMergeCommand(command),
+      `mergeVerbInText reads a merge, so the candidate rule must too: ${command}`,
+    );
+    ok(mergeInvocationInText(command), `…and the argv-position read agrees: ${command}`);
+  }
+  // The implication has to be non-vacuous on the shapes it exists for, or this test would
+  // pass on a corpus where NOTHING is a merge:
+  ok(mergeVerbInText(`M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin`),
+     "the read this invariant leans on does fire on the quoted-group shape");
+  ok(mergeVerbInText("sh -c 'gh pr merge 999 --admin'"), "…and on a wrapped verb");
 });
 
 testAsync("#3953 handler: the mandated tree-health reads are ADMITTED, and no admin-merge gate runs", async () => {
