@@ -542,23 +542,95 @@ def restart_runner(runner: LocalRunner) -> tuple[bool, str]:
     return rc == 0, f"systemctl restart {runner.unit} rc={rc} {out[:200]}"
 
 
-def wait_online(repo: str, name: str, timeout_s: int, poll_s: int) -> str:
-    """Poll the pool for `name`. Returns `online` | `offline` | `unverified`.
+# ── the pool read that races our own restart (fix 3, measured on cell 4) ─────────────────────────
+# THE MEASURED VERDICT: `action-failed` / `unverified_cause=pool-read-after-restart`, with the log line
+# "restart succeeded but the pool could not be READ" — and no reason. Failing closed is right; aborting
+# the pass on ONE transient read, and not saying WHY, is not: the read races a restart THIS PASS issued
+# (the runner is reconnecting, the API is briefly unhappy), so a single blip was enough to end the pass
+# with the box's state unknown.
+# ⛔ AND THE FIX IS NOT "RETRY EVERYTHING". A 404 is DETERMINISTIC — one real cause measured tonight
+# was a unit with no repo, so the call was `gh api repos//actions/runners` → 404, and retrying that is
+# three times the latency for the same answer. Only NETWORK/5xx/RATE-LIMIT markers are retried;
+# everything else is raised at once, carrying gh's own words.
+TRANSIENT_POOL_MARKERS = (
+    "i/o timeout",
+    "dial tcp",
+    "connection reset",
+    "connection refused",
+    "tls handshake timeout",
+    "server misbehaving",
+    "unexpected eof",
+    "eof",
+    "temporary failure in name resolution",
+    "no such host",
+    "context deadline exceeded",
+    "broken pipe",
+    "rate limit",
+    "secondary rate limit",
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+)
+
+
+def pool_error_is_transient(message: str) -> bool:
+    """Is this pool-read failure worth ONE more attempt? A deterministic error is not."""
+    low = (message or "").lower()
+    return any(marker in low for marker in TRANSIENT_POOL_MARKERS)
+
+
+def read_pool_retrying(repo: str, *, attempts: int | None = None) -> dict[str, PoolEntry]:
+    """`read_pool` with a BOUNDED retry for TRANSIENT failures, keeping the LAST error's own words.
+
+    ⛔ The final message CONTAINS the gh error text. A verdict of `unmeasurable` that hides the cause
+    is indistinguishable from "the tool is broken", which is how a lane ends up hand-rolling a runner
+    count instead of fixing the unit's missing `--repo`.
+    ⛔ BOUNDED, and the bound is short: this runs INSIDE a restart-recovery window, so an unbounded
+    wait would outlive the very poll it is serving.
+    """
+    tries = attempts if attempts is not None else int(
+        os.environ.get("RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS") or 3
+    )
+    backoff = float(os.environ.get("RUNNER_AUTOSCALE_RETRY_BACKOFF_S") or 2)
+    seen: list[str] = []
+    for attempt in range(1, max(1, tries) + 1):
+        try:
+            return read_pool(repo)
+        except Unmeasurable as exc:
+            seen.append(str(exc))
+            if not pool_error_is_transient(str(exc)):
+                # Deterministic: DONE. Surfaced as-is, so `repos//actions/runners → 404` reads as what
+                # it is — a broken unit invocation — instead of as a flaky network.
+                raise
+            if attempt < max(1, tries):
+                time.sleep(max(0.0, backoff))
+    raise Unmeasurable(
+        f"pool unreadable after {max(1, tries)} attempt(s) — every one was transient: " + " | ".join(seen)
+    )
+
+
+def wait_online(repo: str, name: str, timeout_s: int, poll_s: int) -> tuple[str, str]:
+    """Poll the pool for `name`. Returns (`online` | `offline` | `unverified`, detail).
 
     ⛔ THREE STATES, NOT A BOOL. A failed pool read is not evidence that the runner did not come
     back: folding it into `False` made the caller say "still offline" about something it never
     looked at, and act on that (re-register with `--replace`). `unverified` is a measurement
     failure and the caller must NOT act on it.
+    ⛔ AND `unverified` CARRIES WHY. The detail is the last gh error text, retried the bounded way
+    above, so the record says *404 repos//actions/runners* or *dial tcp …: i/o timeout* instead of
+    the reasonless sentence that cost a whole merge window.
     """
     deadline = time.monotonic() + max(0, timeout_s)
     while True:
         try:
-            if read_pool(repo).get(name, PoolEntry(name, "offline", False)).online:
-                return "online"
-        except Unmeasurable:
-            return "unverified"
+            if read_pool_retrying(repo).get(name, PoolEntry(name, "offline", False)).online:
+                return "online", ""
+        except Unmeasurable as exc:
+            return "unverified", str(exc)
         if time.monotonic() >= deadline:
-            return "offline"
+            return "offline", ""
         time.sleep(max(1, poll_s))
 
 
@@ -951,17 +1023,24 @@ def converge(
             # --replace) a registration that may be reconnecting and picking up a job — the one
             # destructive action this file promises never to take blindly. Stop the PASS: the box
             # state is unknown from here, so no fill decision may be taken on a stale count.
-            state = wait_online(repo, c["name"], wait_s, poll) if ok else "offline"
+            state, why = (
+                wait_online(repo, c["name"], wait_s, poll) if ok else ("offline", "")
+            )
             if state == "online":
                 record["actions"].append(f"{c['name']} came back online after restart")
                 continue
             if state == "unverified":
                 record["unverified"] = True
                 record["unverified_cause"] = "pool-read-after-restart"
+                # ⛔ THE CAUSE IS THE VERDICT'S CONTENT. The retry already absorbed the transient
+                # failures; what is left is either a DETERMINISTIC error (a unit with no `--repo`
+                # calling `repos//actions/runners` → 404) or a persistent one (i/o timeout), and
+                # only gh's own words distinguish them.
+                record["unverified_detail"] = why
                 record["notes"].append(
-                    f"{c['name']}: restart succeeded but the pool could not be READ — refusing to "
-                    "re-register on an unread pool, and stopping this pass (no fill decision can "
-                    "be taken on an unknown count)"
+                    f"{c['name']}: restart succeeded but the pool could not be READ — {why} — "
+                    "refusing to re-register on an unread pool, and stopping this pass (no fill "
+                    "decision can be taken on an unknown count)"
                 )
                 stop_pass = True
                 break
@@ -1113,9 +1192,10 @@ def converge(
         # (round 6, finding 3). The actions above stay in the record either way.
         if record.get("unverified_cause") == "pool-read-after-restart":
             record["error"] = (
-                "the pool could not be read after a restart — the box's runner count is UNKNOWN, "
-                "so the pass stopped there. The actions listed above were already performed BEFORE "
-                "that point; nothing was added or registered after it."
+                "the pool could not be read after a restart — "
+                f"{record.get('unverified_detail') or 'no error text was captured'} — the box's "
+                "runner count is UNKNOWN, so the pass stopped there. The actions listed above were "
+                "already performed BEFORE that point; nothing was added or registered after it."
             )
         else:
             record["error"] = (

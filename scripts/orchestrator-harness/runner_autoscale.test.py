@@ -34,6 +34,13 @@ below grows with the suite, so this header never claims a case that does not exi
      PARTWAY restoring what it already took), T6 (a RAISE between the clear and the rc check, i.e. a
      failed token mint, must restore too: two review rounds found that hole and its two
      privilege-widening companions, and every one of them is a mutation here).
+  3. AN UNREADABLE POOL AFTER A RESTART THE PASS ISSUED (measured on cell 4). Verdict
+     `action-failed` / `unverified_cause=pool-read-after-restart`, log line "restart succeeded but the
+     pool could not be READ" — and no reason. Failing closed is right; concluding `Unmeasurable` from
+     ONE transient read, and not saying WHY, is not — the read races a restart this pass just issued.
+     Cases: T7 (a transient failure is retried a BOUNDED number of times, then `unmeasurable`, and the
+     message CONTAINS gh's own words), T8 (a DETERMINISTIC 404 — the unit had no `--repo`, so the call
+     was `repos//actions/runners` — is NOT retried and its text survives).
 
 ⛔ HERMETIC, BY CONSTRUCTION. Every measurement is a fixture: `meminfo` is a file, the installs are
 directories, and `gh` / `systemctl` / `config.sh` / the provisioner are STUBS on the seams the tool
@@ -246,6 +253,8 @@ class Box:
             "RUNNER_AUTOSCALE_NO_SUDO": "1",
             "RUNNER_AUTOSCALE_ONLINE_WAIT_S": "0",
             "RUNNER_AUTOSCALE_POLL_S": "0",
+            "RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS": "3",
+            "RUNNER_AUTOSCALE_RETRY_BACKOFF_S": "0",
         }
 
     # ── writing the fixture ──
@@ -349,6 +358,19 @@ class Env:
         os.environ.clear()
         os.environ.update(self.saved)
         return False
+
+
+def cli(box: Box, *args) -> tuple[int, str]:
+    """Run the SHIPPED entry point with the fixture's seams — exit codes are a contract, and a
+    verdict is not a substitute for one (`--want` refused, starvation alarm, unmeasurable)."""
+    box.apply()
+    proc = subprocess.run(
+        [sys.executable, MODULE_UNDER_TEST, *args],
+        env=dict(os.environ, **box.env),
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
 def converge(box: Box, **kw) -> dict:
@@ -647,6 +669,76 @@ def t6_repair_is_exception_safe():
             box.destroy()
 
 
+@test("T7 unread pool after OUR OWN restart: bounded retry, then the verdict CARRIES gh's words")
+def t7_unread_pool_after_restart():
+    """THE MEASURED FAILURE (cell 4): verdict `action-failed` / `unverified_cause=pool-read-after-restart`
+    and the log line "restart succeeded but the pool could not be READ" — with no reason. The read
+    races a restart THIS PASS issued, so ONE transient blip ended the pass with the box's state
+    unknown and nothing an operator could act on. Pinned here: a transient failure is retried a
+    BOUNDED number of times, then `unmeasurable`, and the message must CONTAIN the gh error text (a
+    message that hides the reason is a test failure)."""
+    with Env():
+        box = Box("pool-unread")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            box.pool_seq(
+                [
+                    "ok",  # the pass's FIRST read: offline, so a restart is due
+                    "err:dial tcp 10.0.0.1:443: i/o timeout",  # …and every later read fails this way
+                ]
+            )
+            record = converge(box, want=0)
+
+            check(record["verdict"] == "unmeasurable", f"verdict must be unmeasurable: {record}")
+            check(
+                record.get("unverified_cause") == "pool-read-after-restart",
+                f"the cause must name the racing read: {record}",
+            )
+            check(
+                box.pool_reads() == 4,
+                f"expected 1 initial read + 3 bounded attempts, got {box.pool_reads()} pool reads",
+            )
+            blob = " ".join(record["notes"]) + " " + str(record.get("error"))
+            contains(blob, "i/o timeout", "the record")
+            contains(blob, "dial tcp 10.0.0.1:443", "the record")
+            check(
+                not [c for c in box.calls("config-calls.log") if "argv=" in c],
+                "an UNREAD pool must never re-register — that is the destructive action",
+            )
+            rc, out = cli(box, "--json", "--root", box.root, "--want", "0")
+            check(rc == 2, f"unmeasurable must exit 2 (fail-closed), got {rc}: {out[:300]}")
+        finally:
+            box.destroy()
+
+
+@test("T8 a DETERMINISTIC pool error is NOT retried, and its own words survive")
+def t8_deterministic_pool_error_is_not_retried():
+    """The other real cause measured that night: the unit had no repo, so the call was
+    `gh api repos//actions/runners` → 404. Retrying a 404 is more latency for the same answer, and
+    "transient" would then mean "anything" — so the retry is gated on NETWORK/5xx/RATE-LIMIT markers
+    and a deterministic error is surfaced at once, verbatim."""
+    with Env():
+        box = Box("pool-404")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            box.pool_seq(["ok", "err:gh: Not Found (HTTP 404) — repos//actions/runners"])
+            record = converge(box, want=0)
+            check(record["verdict"] == "unmeasurable", f"verdict must be unmeasurable: {record}")
+            check(
+                box.pool_reads() == 2,
+                f"a 404 must NOT be retried (1 initial + 1 attempt), got {box.pool_reads()} reads",
+            )
+            blob = " ".join(record["notes"]) + " " + str(record.get("error"))
+            contains(blob, "repos//actions/runners", "the record")
+            contains(blob, "404", "the record")
+        finally:
+            box.destroy()
+
+
 # ── the mutation map ──────────────────────────────────────────────────────────────────────────
 class Mutation:
     def __init__(self, case_id, old, new, why):
@@ -704,6 +796,18 @@ MUTATIONS = [
         '            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)\n            try:\n                os.fchmod(fd, mode)',
         '            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)\n            try:\n                pass',
         "the restore is written the NAIVE way (create 0644, no fchmod): the RSA key widens to 0644",
+    ),
+    Mutation(
+        "T7",
+        '            if read_pool_retrying(repo).get(name, PoolEntry(name, "offline", False)).online:',
+        '            if read_pool(repo).get(name, PoolEntry(name, "offline", False)).online:',
+        "the measured pre-fix read: ONE transient failure ends the pass (there is no retry at all)",
+    ),
+    Mutation(
+        "T8",
+        '            if not pool_error_is_transient(str(exc)):',
+        '            if False:',
+        "every error is treated as transient, so a deterministic 404 is retried ('transient' = anything)",
     ),
 ]
 
