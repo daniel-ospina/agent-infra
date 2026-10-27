@@ -408,9 +408,15 @@ class Box:
         """Per-CALL pool-read behaviour; the last step repeats. Every call is counted in gh-calls."""
         self._write(os.path.join(self.dir, "pool.seq"), "\n".join(steps) + "\n")
 
-    def gate_state(self, mode):
-        """The gate's last recorded decision, exactly as `ci_runner_gate.sh:395` writes it."""
+    def gate_state(self, mode, *, scheduled=True):
+        """The gate's last recorded decision + whether a job SCHEDULES the gate on this box.
+
+        ⛔ BOTH, because a record alone is not a standing decision (review finding P1): the gate writes
+        its mode only on TRANSITION, from a launchd job, and nothing schedules it on a cell — so a
+        hand-run record must not arm the fallback for ever. `scheduled=False` is the fixture for that.
+        """
         self._write(os.path.join(self.dir, "gate.state"), f"{mode}\n")
+        self.env["RUNNER_AUTOSCALE_GATE_SCHEDULER"] = "1" if scheduled else "0"
 
     def queued(self, n):
         self._write(os.path.join(self.dir, "queued"), f"{n}\n")
@@ -1334,9 +1340,21 @@ def t16_unit_template():
     pinned = ra.render_unit("daniel-ospina/tortoise", provisioner="/opt/harness/install-x64.sh")
     pinned_service = pinned[f"{ra.UNIT_BASENAME}.service"]
     check(
-        "Environment=RUNNER_AUTOSCALE_PROVISIONER=/opt/harness/install-x64.sh" in pinned_service,
-        f"a resolved provisioner must be PINNED into the unit, got:\n{pinned_service}",
+        'Environment="RUNNER_AUTOSCALE_PROVISIONER=/opt/harness/install-x64.sh"' in pinned_service,
+        f"a resolved provisioner must be PINNED into the unit, and QUOTED: systemd.exec(5) says "
+        f"`Environment=` performs specifier expansion and splits an unquoted assignment on "
+        f"whitespace, so an unquoted path with a space is truncated. got:\n{pinned_service}",
     )
+    # …and the path is VALIDATED before it reaches the file: the same rejections `--repo` gets.
+    for bad, needle in (
+        ("/opt/harness/install-%h.sh", "systemd specifier"),
+        ('/opt/it"s.sh', "double quote"),
+        ("/opt/two words.sh\nExecStartPre=/bin/false", "control character"),
+        ("relative/install.sh", "not absolute"),
+    ):
+        problem = ra.provisioner_problem(bad)
+        check(problem is not None, f"a provisioner path must be refused: {bad!r}")
+        contains(problem, needle, f"the refusal for {bad!r}")
     unpinned = ra.render_unit("daniel-ospina/tortoise", provisioner=None)
     check(
         "RUNNER_AUTOSCALE_PROVISIONER"
@@ -2396,6 +2414,25 @@ def t28_uninspectable_path():
             )
             contains(out, "cannot be inspected", "the audit's report")
             check("Traceback" not in out, f"…and never a traceback:\n{out}")
+            # ⛔ AND THE BASE DIRECTORY ITSELF (review finding P2): an uninspectable
+            # `RUNNER_AUTOSCALE_UNIT_DIR` used to raise out of `root.is_dir()` and exit 1, which is
+            # the SAME code as "the audit found something" — a monitor could not tell them apart.
+            box.env["RUNNER_AUTOSCALE_UNIT_DIR"] = _TOO_LONG
+            code, out = cli(box, "--check-units")
+            check(code == 5, f"an uninspectable unit dir is a FINDING, not a crash: rc={code}\n{out}")
+            contains(out, "NOTHING was audited", "the aggregate finding")
+            check("Traceback" not in out, f"…and never a traceback:\n{out}")
+            # ⛔ AND `--install-unit`, which sits outside `main()`'s converge try. A provisioner seam
+            # this account cannot inspect used to escape `Path(c).exists()` as a traceback and exit 1
+            # — the SAME code as a deliberate refusal. It is now SKIPPED as a candidate (a path that
+            # cannot be looked at is not a usable installer) and the run says so and installs a
+            # repair-only unit, which is the honest outcome.
+            box.env["RUNNER_AUTOSCALE_UNIT_DIR"] = os.path.join(box.dir, "units")
+            box.env["RUNNER_AUTOSCALE_PROVISIONER"] = _TOO_LONG
+            code, out = cli(box, "--install-unit")
+            check("Traceback" not in out, f"an uninspectable seam must never traceback:\n{out}")
+            check(code == 0, f"an uninspectable candidate is skipped, not fatal: rc={code}\n{out}")
+            contains(out, "no install-ci-runner-x64.sh resolved", "the operator is told")
         finally:
             box.destroy()
 
@@ -2430,6 +2467,31 @@ def t29_floor_follows_the_gate():
         f"…and the refusal to arm must be SAID, not silent: {notes}",
     )
     # end to end, with the gate's OWN file in the fixture: the registration must not carry the label
+    # ⛔ A RECORD IS NOT A STANDING DECISION (review finding P1): the gate writes its mode only on a
+    # TRANSITION, from a launchd job, and nothing schedules it on a cell — so one hand-run during
+    # incident triage must not arm `ubuntu-latest` on every later repair for ever.
+    with Env():
+        box = Box("gate-unscheduled")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted", "self-hosted-x64"])])
+            box.alive([])
+            box.gate_state("local", scheduled=False)
+            record = converge(box, want=0)
+            check(record.get("gate_mode") is None, f"an unscheduled record is not a mode: {record}")
+            contains(
+                str(record.get("gate_why")),
+                "NOTHING SCHEDULES THE GATE",
+                "the record must say WHY it refused to arm",
+            )
+            argv = [c for c in box.calls("config-calls.log") if "argv=" in c]
+            check(argv, f"the repair still happens (preserving labels): {argv}")
+            check(
+                ra.FALLBACK_LABEL not in argv[0],
+                f"a hand-run record must not arm the fallback: {argv[0]}",
+            )
+        finally:
+            box.destroy()
     with Env():
         box = Box("gate-github")
         try:
@@ -2468,7 +2530,30 @@ def t30_bad_seam_leaves_a_record():
                 contains(str(exc), "RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS", "the seam is NAMED")
             else:
                 raise Failure("an unparsable seam must raise Unmeasurable, not crash")
-            del os.environ["RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS"]
+            # ⛔ AND THE RANGE, not only the syntax (review finding P2): `-1` parses, and then
+            # `max(1, tries)` silently reduces the bounded retry this pass is built on.
+            for seam, bad in (
+                ("RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS", "-1"),
+                ("RUNNER_AUTOSCALE_ONLINE_WAIT_S", "-1"),
+                ("RUNNER_AUTOSCALE_POLL_S", "-1"),
+                ("RUNNER_AUTOSCALE_RETRY_BACKOFF_S", "-5"),
+            ):
+                os.environ[seam] = bad
+                try:
+                    if seam.endswith("BACKOFF_S"):
+                        ra._env_float(seam, 2.0, minimum=0.0)
+                    else:
+                        ra._env_int(seam, 3, minimum=0)
+                except ra.Unmeasurable as exc:
+                    contains(str(exc), seam, "the seam is NAMED")
+                    check(
+                        "below" in str(exc) or "at or above" in str(exc),
+                        f"…and the reason is the RANGE, not the syntax: {exc}",
+                    )
+                else:
+                    raise Failure(f"{seam}={bad} must be REFUSED, not quietly applied")
+                os.environ.pop(seam, None)
+            os.environ.pop("RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS", None)
             box.install("gh-runner-x64", "r-1")
             box.alive([box.installs["gh-runner-x64"]])
             box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
@@ -2569,11 +2654,62 @@ def t32_busy_reread_before_replace():
                 any("came up with a JOB" in n for n in record["notes"]),
                 f"…and the pass must say so: {record['notes']}",
             )
+            # ⛔ AND `actions` MUST NOT CLAIM IT (review finding P3): the line was appended before the
+            # checks, so the record said "re-registering with --replace" while `notes` said the
+            # opposite — and `actions` is what a human reads to learn if a registration was destroyed.
+            check(
+                not any("re-registering with --replace" in a for a in record["actions"]),
+                f"the record must not assert an action that was not taken: {record['actions']}",
+            )
         finally:
             box.destroy()
 
 
 MUTATIONS = [
+    # ── review round 9: the 2026-10-27 cycle-2 findings ──
+    Mutation(
+        "T29",
+        "    if not gate_scheduler_present():",
+        "    if False:  # MUTATION: a hand-run record is trusted as a standing decision",
+        "a record written by a hand-run of the gate on a cell — where nothing schedules it — is "
+        "trusted for ever, so every later repair arms ubuntu-latest on a healthy box: the "
+        "fallback-only incident, made permanent and made to look deliberate",
+    ),
+    Mutation(
+        "T29",
+        "    return mode, f\"the gate's record {path}\"",
+        "    return None, f\"the gate's record {path}\"  # MUTATION: the mode is read and discarded",
+        "the gate's own mode is read and thrown away, so the floor can never repair the incident it "
+        "exists for while the record still looks consulted",
+    ),
+    Mutation(
+        "T16",
+        "    if \"%\" in value:",
+        "    if False:  # MUTATION: an unvalidated provisioner path",
+        "a provisioner path containing a systemd specifier reaches `Environment=`, where it is "
+        "expanded at load time — the schedule then runs an installer path nobody chose",
+    ),
+    Mutation(
+        "T16",
+        "    if '\"' in value:",
+        "    if False:  # MUTATION: a quote is allowed into the quoted assignment",
+        "a double quote in the pinned path escapes its `Environment=` assignment, so the variable "
+        "is not what the fill arm reads",
+    ),
+    Mutation(
+        "T30",
+        "    if minimum is not None and value < minimum:",
+        "    if False:  # MUTATION: the range is not checked",
+        "a negative seam is accepted: `max(1, tries)` silently drops the bounded retry, and "
+        "`max(0, timeout_s)` sends a reconnecting runner straight to `--replace`",
+    ),
+    Mutation(
+        "T28",
+        '        if uninspectable:\n            problems.append(f"{root}: {uninspectable} — NOTHING was audited there")\n            continue',
+        "        if uninspectable:\n            continue  # MUTATION: an unreadable base is skipped silently",
+        "a unit directory this account cannot read is skipped as if it were not there, so the audit "
+        "reports 'all usable' over a population it never read",
+    ),
     # ── review round 8: the 2026-10-27 findings (P1–P3) ──
     Mutation(
         "T28",
@@ -2599,8 +2735,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T30",
-        '    try:\n        return int(raw.strip())\n    except ValueError as exc:\n        raise Unmeasurable(\n            f"{name}={raw!r} is not an integer — refusing to run with an unreadable seam"\n        ) from exc',
-        '    return int(raw.strip())  # MUTATION: a bad seam escapes as ValueError',
+        '        try:\n            value = int(raw.strip())\n        except ValueError as exc:\n            raise Unmeasurable(\n                f"{name}={raw!r} is not an integer — refusing to run with an unreadable seam"\n            ) from exc',
+        '        value = int(raw.strip())  # MUTATION: a bad seam escapes as ValueError',
         "an unparsable seam crashes the pass again with a traceback and no record — on a pass that "
         "may already have restarted and re-registered runners",
     ),
@@ -2620,8 +2756,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T32",
-        "            serving = _worker_alive(runner, fresh=True) or (fresh is not None and fresh.busy)",
-        "            serving = _worker_alive(runner) or (fresh is not None and fresh.busy)  # MUTATION: the cached value",
+        "            serving = _worker_alive(runner, fresh=True) or (",
+        "            serving = _worker_alive(runner) or (  # MUTATION: the cached value",
         "the busy re-check reads the value cached at CLASSIFICATION, so a runner that came up and "
         "took a job during the restart wait has its registration deleted under the running job",
     ),
@@ -2873,7 +3009,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T3",
-        '            labels = resolve_labels(\n                pool,\n                machine,\n                notes=record["notes"],\n                current=c["labels"],\n                gate_mode=gate_mode,\n            )',
+        '            labels = resolve_labels(\n                pool,\n                machine,\n                notes=record["notes"],\n                current=c["labels"],\n                gate_mode=gate_mode,\n                gate_why=gate_why,\n            )',
         '            labels = resolve_labels(\n                pool, machine, notes=record["notes"]\n            ) if not c["labels"] else _preserve_labels(c["labels"], machine)',
         "the PRE-FIX either/or: a DEAD runner preserves its labels and the floor is never reached",
     ),
