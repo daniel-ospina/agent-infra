@@ -264,8 +264,9 @@ channel verdicts — the first one **is**, and it is listed with them only to sa
   list)` while `terminal send` with no payload prints `give text and/or --keys (e.g. --keys enter)` — one render per verb, not
   a usage block.
 
-And if the volume that is full is the **`cmux-tui` state volume** described under step 5, skip to that owner-level action —
-none of the reclaim steps below touch it.
+And if the volume that is full is the **`cmux-tui` state volume** described under step 5, read that paragraph before the steps
+below — **grow the loop file first** (cheapest, destroys nothing); the reset there is the owner-level fallback. None of the
+reclaim steps below touch it.
 
 1. `cmux vm terminal read <vm> <terminal-id>` — get terminal ids from `cmux vm tree <vm>`. The screen tells you the truth.
 2. `cmux vm terminal send <vm> <term-id> '<command>' --keys enter` — runs a command when `exec` cannot. The **send** verb
@@ -290,9 +291,13 @@ none of the reclaim steps below touch it.
    runs **online**, so the daemon keeps running and the box keeps its terminal inventory:
    `sudo truncate -s +2G /var/lib/cmux/cmux-tui-state.ext4` → `LD=$(sudo losetup -j /var/lib/cmux/cmux-tui-state.ext4 | cut
    -d: -f1) && sudo losetup -c "$LD"` → `sudo resize2fs "$LD"` → re-read `df -Pm /home/cmux/.local/state/cmux-tui`.
-   The mechanism is the kernel's on-line ext3/ext4 resize, and `losetup -c` is the step that makes the loop device's new size
-   visible to it (`man 8 resize2fs`); verified on pi-cell-4 (2026-10-27) on a scratch 64 → 96 MB loop file, which `df` read as
-   56 → 88 MB **while mounted** — ⚠️ **not yet run against this volume itself**, so if the resize refuses or the daemon stops
+   The mechanism is the kernel's on-line ext3/ext4 resize (`man 8 resize2fs`), and `losetup -c` is the separate step that makes
+   the loop device's new size visible to it (`man 8 losetup`: `-c, --set-capacity`); verified on pi-cell-4 (2026-10-27) on a
+   scratch 64 → 96 MB loop file, which `df` read as 56 → 88 MB **while mounted**. ⚠️ **Not yet run against this volume
+   itself** — and the failure this recipe can silently have is NOT a refusal: with the backing file grown but `losetup -c`
+   skipped, `resize2fs` **exits 0** and prints **“Nothing to do!”** while the device is still the old size. So re-read
+   `df -Pm /home/cmux/.local/state/cmux-tui` and require it to MOVE: an unchanged figure means the device size was not
+   refreshed, so re-run `losetup -c` and then `resize2fs` — and only if it still will not grow, or the daemon stops
    answering, stop there and fall back to the reset. A **reset** is the owner-level action, and it is
    not just an unlink: the `cmux-tui` daemon holds that registry **open** (6 fds on cell-3 — 4 read-write, one of them the
    `-shm`, and 2 read-only; *any* of them pins the inode), so deleting the file frees nothing until those fds close. ⛔ **And stopping it is not a
