@@ -71,6 +71,36 @@ below grows with the suite, so this header never claims a case that does not exi
      The counts are also published machine-readably (`queued_runs`, `starvation_queued/busy/online`) —
      `queued_runs` is `origin/main`'s own field name, so a fleet reader of that record keeps working.
 
+  9. THE LANE'S OWN REVIEW CYCLE (2026-10-27, second round). Nine defects, each measured before it
+     was fixed, each with a case AND a paired mutation here.
+     T33/T34 — the starvation alarm's SECOND HALF. The invariant alone is the NORMAL state of the
+     fallback-only ruling (measured: `queued=14` sustained while the pool was idle), so the alarm
+     also requires ELIGIBILITY: the pool advertises the fallback, or the gate wants `local` (the
+     #2875 stripped-label shape), or the queue is at/above the gate's own threshold. The counts and
+     `starvation_why` are published on BOTH verdicts, so the evidence outlives the alarm.
+     T35 — a DISABLED schedule is not a schedule: a commented-out cron line, a `.disabled`/`.bak`
+     unit file and a MASKED unit all read as "the gate runs here", which turns a stale hand-run
+     `local` record into a standing decision that arms the fallback for ever.
+     T36 — `discover()` used `Path.exists()`, so one uninspectable install raised through the pass
+     AFTER a repair may have acted (exit 2, no `actions`), and `glob` read an unreadable root as
+     EMPTY (which registers duplicates). Both now go through `_inspect_path`.
+     T37 — repair identity is the INSTALL, not the agent NAME: two installs sharing a name (a
+     `cp -a`) had the first repaired twice, the second never, and a self-deleting registration.
+     T38 — a `df` failure MID-PASS now records `unverified`/`unverified_cause`, like the same
+     failure at pass start, instead of falling through to `under-target` (exit 0).
+     T39 — a provisioner that reports success and installs NOTHING is `action-failed` (exit 3), not
+     `under-target` (exit 0): an enforcer that failed to grow must not exit green.
+     T40 — the moved-pin diagnostic NAMES the pinned value (and the seam) instead of a literal
+     filename plus advice to set a variable that is already set.
+     T41 — a PARTIAL `du` (rc≠0, totals printed) is still a measurement, so it can only TIGHTEN the
+     budget; discarding it fell back to an allowance LOOSER than a >8 GB install.
+     T42 — an ABSENT gate record is absence ("nothing writes one here — a cell"), not a read fault.
+
+⛔ EVERY MUTATION HAS A CONTROL. `--mutations` first runs each paired case against the SHIPPED module
+and requires it GREEN; a case that is red on its own (order dependence, a host fact) makes its
+mutants report `CONTROL RED` and fails the run, because a red case scores CAUGHT for every mutant
+while proving nothing.
+
 ⛔ HERMETIC, BY CONSTRUCTION. Every measurement is a fixture: `meminfo` is a file, the installs are
 directories, and `gh` / `systemctl` / `config.sh` / the provisioner are STUBS on the seams the tool
 already declares. No network, no root, no live cell, no real runner, no `ps`, no `du`, no `df`. A
@@ -95,6 +125,7 @@ Injected, never guessed:
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -535,13 +566,22 @@ class Env:
         return False
 
 
+def _cli_env(box: Box) -> dict:
+    """The seams a SHIPPED subprocess needs, as an OVERRIDABLE mapping.
+
+    `dict(os.environ, **box.env)` cannot be narrowed afterwards — a seam the box already sets is a
+    DUPLICATE keyword — so a case that must pin one seam differently (T1 pins nproc) builds on this.
+    """
+    return {**os.environ, **box.env}
+
+
 def cli(box: Box, *args) -> tuple[int, str]:
     """Run the SHIPPED entry point with the fixture's seams — exit codes are a contract, and a
     verdict is not a substitute for one (`--want` refused, starvation alarm, unmeasurable)."""
     box.apply()
     proc = subprocess.run(
         [sys.executable, MODULE_UNDER_TEST, *args],
-        env=dict(os.environ, **box.env),
+        env=_cli_env(box),
         capture_output=True,
         text=True,
     )
@@ -597,7 +637,13 @@ def t1_label_floor():
             # an in-process call cannot see.
             cli = subprocess.run(
                 [sys.executable, MODULE_UNDER_TEST, "--json", "--root", box.root],
-                env=dict(os.environ, **box.env),
+                # ⛔ THE HOST'S CORE COUNT MUST NOT DECIDE THIS CASE. Without the seam the CLI sizes
+                # the ceiling from the machine the suite runs on, and on a >2-core host the fill arm
+                # then runs — a host-dependent outcome in a case that is about the label rule, and
+                # (since the fill arm now reports a provisioner that installs NOTHING as a failure)
+                # a red suite on every box bigger than the fixture. The 2-core ceiling is the case's
+                # own stated premise: one runner, already alive, so the fill loop cannot run.
+                env={**_cli_env(box), "RUNNER_AUTOSCALE_NPROC": "2"},
                 capture_output=True,
                 text=True,
             )
@@ -650,6 +696,17 @@ def t2_label_handover():
         got = ra.resolve_labels(satisfied, "x86_64", notes=notes, gate_mode="github")
         check(got == "self-hosted-x64", f"a satisfied floor must add nothing, got {got!r}")
         check(notes == [], f"no floor note when the floor is satisfied, notes={notes}")
+        # ⛔ THE PUBLISHED BOOLEAN IS PINNED, not just the label string (review finding P2). The
+        # description of `fallback_engaged` was already widened once and nothing reddened; a fleet
+        # reader keyed on it must be able to trust the definition the record documents.
+        check(
+            ra.fallback_engaged(pool) is True,
+            "an ARM pool entry carrying the fallback IS engaged (the record publishes this)",
+        )
+        check(
+            ra.fallback_engaged(satisfied) is False,
+            "an x64 pool carrying the label is NOT 'engaged' — the key means an ARM marker too",
+        )
 
 
 @test("T3 label floor unions: a DEAD runner's re-registration keeps its custom label AND gains")
@@ -690,6 +747,13 @@ def t3_floor_unions_over_preserved():
                 f"the DEAD path must say the floor bound: {record['notes']}",
             )
             check(record.get("label_floor_binds") is True, f"record: {record}")
+            # ⛔ THE OTHER PUBLISHED POOL FACT IS PINNED TOO (review finding P2). Its description
+            # already widened once, and the field could be replaced with `None` while 43 cases
+            # stayed green: an x64 pool carrying the label is NOT "engaged".
+            check(
+                record.get("fallback_engaged") is False,
+                f"the record publishes the pool fact: {record.get('fallback_engaged')!r}",
+            )
         finally:
             box.destroy()
 
@@ -944,6 +1008,14 @@ def t9_starvation_fires():
             contains(blob, "queued=53", "the record")
             contains(blob, "busy=0", "the record")
             contains(blob, "online=1", "the record")
+            # ⛔ THE MACHINE-READABLE COUNTS ARE PINNED, not only the prose (review finding P2). The
+            # header claims `queued_runs`/`starvation_queued` are published for fleet readers; a
+            # deleted assignment kept the whole suite green, so the contract had no artifact.
+            check(record.get("queued_runs") == 53, f"queued_runs must be published: {record}")
+            check(record.get("starvation_queued") == 53, f"starvation_queued: {record}")
+            check(record.get("starvation_busy") == 0, f"starvation_busy: {record}")
+            check(record.get("starvation_online") == 1, f"starvation_online: {record}")
+            check(record.get("starvation_eligible") is True, f"starvation_eligible: {record}")
             check(
                 record["actions"] == [],
                 f"the alarm must CHANGE NOTHING (it is not a healer): {record['actions']}",
@@ -1247,9 +1319,9 @@ def t14_unset_seam_takes_the_documented_default():
             ):
                 check(needle in (ra.__doc__ or ""), f"the module header must document {what}")
             check(
-                ra.starvation_probe.__defaults__ == (30.0,),
+                inspect.signature(ra.starvation_probe).parameters["confirm_s"].default == 30.0,
                 "the probe's SIGNATURE default is the documented 30s, not a stale copy: "
-                f"{ra.starvation_probe.__defaults__}",
+                f"{inspect.signature(ra.starvation_probe).parameters['confirm_s'].default}",
             )
         finally:
             ra.time = real_time
@@ -2350,6 +2422,345 @@ def t4b_retry_is_confined_to_replace():
             box.destroy()
 
 
+# ── 9. REVIEW CYCLE OF THIS LANE (2026-10-27) — ELIGIBILITY, SCHEDULING, IDENTITY, RECORDS ──────
+@test("T33 a fallback-only queue is NOT starvation: the counts hold, the work is GitHub-hosted's")
+def t33_starvation_eligibility_healthy():
+    """MEASURED ON agent-infra 2026-10-27: `queued=14` sustained across the confirmation window while
+    the pool was idle. That is the DESIGNED steady state of the fallback-only ruling — while the gate
+    says `github`, `ubuntu-latest` belongs to GitHub-hosted, our pool deliberately does not advertise
+    it, and every online runner is idle BY DESIGN. The old invariant (`queued>0 ∧ busy==0 ∧
+    online>0`) paged exit 4 on that every ~9 minutes for ever, and noise is how the incident the
+    alarm exists for (#2875) becomes invisible.
+
+    The alarm's second half is ELIGIBILITY (`starvation_eligible`): the pool advertises the fallback,
+    OR the gate wants `local`, OR the queue is at/above the gate's own backlog threshold."""
+    with Env():
+        box = Box("starve-ineligible")
+        try:
+            # The pool is up and idle; NOTHING advertises ubuntu-latest, and the gate says github.
+            box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64", "Linux"])])
+            box.queued(14)
+            box.gate_state("github")
+            record = converge(box, want=0)
+            check(
+                record.get("starvation") == "ok",
+                f"a GitHub-hosted backlog is not this pool's starvation: {record.get('starvation')}",
+            )
+            check(
+                record.get("starvation_eligible") is False,
+                f"the record must publish WHY it did not arm: {record}",
+            )
+            check(record["verdict"] != "starvation", f"verdict: {record['verdict']}")
+            # ⛔ THE EVIDENCE SURVIVES THE VERDICT: the counts and the reason are still published.
+            check(record.get("queued_runs") == 14, f"the counts must stay published: {record}")
+            blob = " ".join(record["notes"])
+            contains(blob, "starvation NOT armed", "the record")
+            contains(blob, "GitHub-hosted", "the record")
+            rc, out = cli(box, "--root", box.root, "--want", "0")
+            check(rc == 0, f"a healthy fallback-only box must exit 0, got {rc}: {out[:300]}")
+        finally:
+            box.destroy()
+
+
+@test("T34 the alarm STILL fires when the gate wants `local` and the label was stripped (#2875)")
+def t34_starvation_gate_wants_local():
+    """THE INCIDENT SHAPE, and the reason eligibility is not simply "does the pool carry the label":
+    the pool had been STRIPPED while the gate was asking for the fallback (9 runners / 8 online /
+    `busy=0` / 53 queued). A test keyed on the pool's own labels would have been silent on exactly the
+    box the alarm exists for, so the gate's recorded intent is a term of its own."""
+    with Env():
+        box = Box("starve-stripped")
+        try:
+            box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64", "Linux"])])
+            box.queued(53)
+            box.gate_state("local")
+            record = converge(box, want=0)
+            check(record.get("starvation") == "starved", f"the alarm must fire: {record}")
+            check(record["verdict"] == "starvation", f"verdict: {record['verdict']}")
+            check(
+                record.get("starvation_eligible") is True,
+                f"the gate's `local` makes the queue this pool's work: {record}",
+            )
+            contains(str(record.get("starvation_why")), "local", "the eligibility reason")
+            rc, out = cli(box, "--root", box.root, "--want", "0")
+            check(rc == 4, f"the alarm exits 4, got {rc}: {out[:300]}")
+        finally:
+            box.destroy()
+
+
+@test("T35 a DISABLED schedule is not a schedule: commented cron, .disabled unit, masked unit")
+def t35_disabled_schedule_is_not_scheduled():
+    """`gate_scheduler_present()` turns a stale hand-run `local` record into a STANDING DECISION, so
+    its evidence has to be a schedule systemd/cron will actually RUN. The first version matched a
+    substring: a commented-out cron line (the standard disable), a `ci-runner-gate.service.bak`, and a
+    MASKED unit (`ln -s /dev/null …`) all read as "scheduled", and every later repair then armed
+    `ubuntu-latest` on a box with no gate left to strip it — the fallback-only incident made permanent
+    and made to look deliberate. A LIVE cron line is the control that proves detection works."""
+    with Env():
+        box = Box("gate-schedule")
+        try:
+            home = os.path.join(box.dir, "gatehome")
+            units = os.path.join(home, ".config", "systemd", "user")
+            os.makedirs(units, exist_ok=True)
+            box.env["RUNNER_AUTOSCALE_HOME"] = home
+            cron = os.path.join(box.dir, "crontab")
+            cron_body = os.path.join(box.dir, "crontab.txt")
+            box._write(cron, f'#!/usr/bin/env bash\ncat "{cron_body}"\n', 0o755)
+            box.env["RUNNER_AUTOSCALE_CRONTAB"] = cron
+            box.gate_state("local")
+            # Detection, not the override: the seam would mask the code under test.
+            box.env.pop("RUNNER_AUTOSCALE_GATE_SCHEDULER", None)
+            box.apply()
+
+            # (a) the only cron line is COMMENTED OUT — the ordinary way a job is disabled.
+            box._write(
+                cron_body,
+                "# disabled 2026-10-20: 0 * * * * /usr/local/bin/ci_runner_gate.sh\n",
+            )
+            check(
+                ra.gate_scheduler_present() is False,
+                "a commented-out cron line is not a schedule",
+            )
+            # (b) a unit file systemd would never load, and a MASK.
+            box._write(os.path.join(units, "ci-runner-gate.service.disabled"), "[Service]\n")
+            os.symlink(os.devnull, os.path.join(units, "ci-runner-gate.timer"))
+            check(
+                ra.gate_scheduler_present() is False,
+                "a .disabled unit file and a masked unit are not schedules",
+            )
+            mode, why = ra.gate_desired_mode()
+            check(mode is None, f"a record with no live scheduler is NOT intent: {(mode, why)}")
+            contains(why, "NOTHING SCHEDULES", "the reason")
+            check(
+                ra.label_floor_binds({"r": ra.PoolEntry("r", "online", False, ["x"])}, mode)
+                is False,
+                "and the floor stays disarmed",
+            )
+            # (c) CONTROL: a live line IS a schedule, so (a) is not passing because detection is dead.
+            box._write(cron_body, "0 * * * * /usr/local/bin/ci_runner_gate.sh\n")
+            check(
+                ra.gate_scheduler_present() is True,
+                "a live cron line must be seen — otherwise the disables above prove nothing",
+            )
+            # (d) and a masked unit ALONE (no cron, no plist) is still not a schedule.
+            box._write(cron_body, "")
+            check(
+                ra.gate_scheduler_present() is False,
+                "a masked unit alone is not a schedule",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T36 an install this account cannot INSPECT is UNMEASURABLE — never a traceback")
+def t36_discover_uninspectable_is_unmeasurable():
+    """`discover()` runs FIRST and its OSError used to escape to `main()`'s backstop AFTER the repair
+    loop may have acted — so a pass that had already restarted a runner exited 2 with NO `actions`
+    field, losing the record of what it did. It also read an unreadable install as ABSENT (`glob`
+    answers `[]` for a directory it cannot list), which registers a duplicate. `_inspect_path` gives
+    the third answer, and the base probe is where a too-long root lands (ENAMETOOLONG needs no
+    privileges, which is why it is the acceptance probe rather than a chmod)."""
+    with Env():
+        box = Box("discover-uninspectable")
+        try:
+            box.apply()
+            try:
+                ra.discover(_TOO_LONG)
+            except ra.Unmeasurable as exc:
+                contains(str(exc), "cannot", "the Unmeasurable reason")
+            else:
+                raise Failure("an uninspectable runner root must raise Unmeasurable, not read as empty")
+            # CONTROL: a readable, empty root is still `[]` — absence and blindness differ.
+            check(ra.discover(box.root) == [], "an empty readable root is empty, not unmeasurable")
+        finally:
+            box.destroy()
+
+
+@test("T37 two installs that share an agent NAME are repaired BY DIRECTORY, not by name")
+def t37_repair_identity_is_the_directory():
+    """A `cp -a` of an install keeps the same `agentName` in `.runner`, and `next(... name == ...)`
+    then repaired the FIRST install on both iterations — the second `--replace` deleting the
+    registration the first had just created — while the install that needed the repair was never
+    touched, with the record attributing the action to it. Identity is the INSTALL."""
+    with Env():
+        box = Box("dup-names")
+        try:
+            a = box.install("gh-runner-x64", "r-dup")
+            b = box.install("gh-runner-x64-2", "r-dup")  # a cp -a: same agentName, own directory
+            box.pool([])  # neither is in the pool: both ORPHANED
+            box.alive([])
+
+            def stamps() -> dict:
+                # Only `.runner`: a SUCCESSFUL registration deliberately DISCARDS the stash (the
+                # fresh config is the newer truth), and the stub writes no `.credentials`.
+                return {
+                    os.path.join(path, ".runner"): os.stat(
+                        os.path.join(path, ".runner")
+                    ).st_mtime_ns
+                    for path in (a, b)
+                }
+
+            before = stamps()
+            record = converge(box, want=0)
+            after = stamps()
+            for path in (a, b):
+                key = os.path.join(path, ".runner")
+                check(
+                    after[key] != before[key],
+                    f"{path} was never cleared-and-restored, so the repair skipped it: "
+                    f"{record['actions']}",
+                )
+            registrations = [c for c in box.calls("config-calls.log") if "argv=" in c]
+            check(
+                len(registrations) == 2,
+                f"one registration per INSTALL, got {registrations}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T38 a disk read that fails MID-PASS is recorded as UNVERIFIED, like the same at pass start")
+def t38_midpass_disk_unverified():
+    """One measurement failure had two record shapes depending on WHEN it happened: at pass start
+    `unverified` + `unverified_cause` + exit 2; mid-pass only a prose note, falling through to
+    `under-target` (exit 0). A fleet reader keyed on `unverified` saw nothing on the pass that
+    STOPPED FILLING — the one that runs on a box whose disk is filling up."""
+    with Env():
+        box = Box("midpass-disk")
+        try:
+            first = box.install("gh-runner-x64", "r-1")
+            box.alive([first])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            # `df` answers once (pass start) and FAILS from the second call (the fill re-read).
+            counter = os.path.join(box.dir, "df.count")
+            box._write(
+                os.path.join(box.dir, "df"),
+                "#!/usr/bin/env bash\n"
+                f'C="{counter}"\n'
+                'n=0; [ -f "$C" ] && n="$(cat "$C")"\n'
+                'n=$(( n + 1 )); printf \'%s\\n\' "$n" > "$C"\n'
+                '[ "$n" -ge 2 ] && { echo "df: cannot read table" >&2; exit 1; }\n'
+                "printf 'Filesystem 1048576-blocks Used Available Capacity Mounted on\\n'\n"
+                "printf '/dev/fixture 999999 1 500000 1%% /\\n'\n",
+                0o755,
+            )
+            record = converge(box, nproc="4", want=2)
+            check(record.get("unverified") is True, f"the record must say unverified: {record}")
+            check(
+                record.get("unverified_cause") == "mid-pass-measurement",
+                f"and WHICH measurement: {record}",
+            )
+            check("disk_unverified" in record, f"the disk cause is named: {record}")
+            rc, out = cli(box, "--root", box.root, "--want", "2")
+            check(rc == 2, f"a pass that could not measure the disk is exit 2, got {rc}: {out[:300]}")
+        finally:
+            box.destroy()
+
+
+@test("T39 a provisioner that reports success and installs NOTHING is an ACTION FAILURE")
+def t39_provisioner_success_without_install():
+    """`rc=0` with no new install is not a capacity answer and not a timing state: the one action the
+    tool took did not do what it reported. The old code left the verdict at `under-target` → exit 0 —
+    the documented "converged / nothing to do" — so an enforcer that failed to grow exited GREEN and
+    only a `--json` reader could tell."""
+    with Env():
+        box = Box("fill-nothing")
+        try:
+            first = box.install("gh-runner-x64", "r-1")
+            box.alive([first])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.provisioner(rc=0, out="nothing installed")
+            record = converge(box, nproc="4", want=2)
+            check(record["problems"], f"a provisioner that installed nothing is a problem: {record}")
+            contains(" ".join(record["problems"]), "NO install appeared", "the problem")
+            check(record["verdict"] == "action-failed", f"verdict: {record['verdict']}")
+            rc, out = cli(box, "--root", box.root, "--want", "2")
+            check(rc == 3, f"an action that did nothing is exit 3, got {rc}: {out[:300]}")
+        finally:
+            box.destroy()
+
+
+@test("T40 a provisioner that MOVED is NAMED — the operator is not told to set a set seam")
+def t40_moved_provisioner_names_the_value():
+    """The pinned path is the most likely failure of the pin (a cell install from `/tmp`), and the old
+    message printed a literal filename and advised setting `RUNNER_AUTOSCALE_PROVISIONER` — advice to
+    set a variable that IS set, pointing at a value nobody named. `resolve_provisioner` now returns
+    `(path, why)` and the caller prints it."""
+    with Env():
+        box = Box("provisioner-moved")
+        try:
+            gone = os.path.join(box.dir, "moved", "install-ci-runner-x64.sh")
+            box.env["RUNNER_AUTOSCALE_PROVISIONER"] = gone
+            box.apply()
+            path, why = ra.resolve_provisioner()
+            check(path is None, f"an absent pinned path resolves to nothing: {path!r}")
+            contains(why, gone, "the reason")
+            contains(why, "RUNNER_AUTOSCALE_PROVISIONER", "the reason")
+            try:
+                ra.provision(2)
+            except ra.ActionFailed as exc:
+                contains(str(exc), gone, "the ActionFailed message")
+            else:
+                raise Failure("an absent provisioner must raise ActionFailed")
+        finally:
+            box.destroy()
+
+
+@test("T41 a PARTIAL `du` is still a measurement — it can only TIGHTEN the budget")
+def t41_partial_du_tightens():
+    """`du` prints a total for every argument it could read and exits 1 when any subdirectory was
+    unreadable — measured: a root-owned file in a runner's `_work` produced both sizes AND rc=1. The
+    old `rc != 0` arm threw the numbers away and fell back to the installer's 8 GB allowance, which is
+    LOOSER than the truth whenever an install is bigger than 8 GB: the over-add the docstring says
+    this arm can never allow."""
+    with Env():
+        box = Box("du-partial")
+        try:
+            path = box.install("gh-runner-x64", "r-1")
+            box._write(
+                os.path.join(box.dir, "du"),
+                "#!/usr/bin/env bash\n"
+                f"printf '20480\\t{path}\\n'\n"
+                "echo 'du: cannot read directory: Permission denied' >&2\n"
+                "exit 1\n",
+                0o755,
+            )
+            box.apply()
+            budget, basis = ra.disk_footprint_mb(box.root)
+            check(budget == 20480, f"a partial measurement must TIGHTEN the budget, got {budget}")
+            contains(basis, "PARTIAL", "the basis")
+            contains(basis, "20480", "the basis")
+            # CONTROL: NO number at all is still the allowance, and says so.
+            box._write(
+                os.path.join(box.dir, "du"),
+                "#!/usr/bin/env bash\necho 'du: cannot read' >&2\nexit 1\n",
+                0o755,
+            )
+            budget, basis = ra.disk_footprint_mb(box.root)
+            check(budget == ra.FOOTPRINT_MB_DEFAULT, f"nothing measured ⇒ the allowance: {budget}")
+            contains(basis, "NOT measured", "the basis")
+        finally:
+            box.destroy()
+
+
+@test("T42 an ABSENT gate record is absence — not a read fault the operator must chase")
+def t42_absent_gate_record_is_absence():
+    """A cell's normal state is that NOTHING ever writes the record. Calling that "unreadable (No such
+    file or directory)" sent an operator hunting permissions on a box where no file was ever meant to
+    exist, while the docstring promised the two situations were told apart in the words."""
+    with Env():
+        box = Box("gate-absent")
+        try:
+            box.env["RUNNER_AUTOSCALE_GATE_STATE"] = os.path.join(box.dir, "never-written.state")
+            box.apply()
+            mode, why = ra.gate_desired_mode()
+            check(mode is None, f"no record is no mode: {mode!r}")
+            contains(why, "there is no gate record", "the reason")
+            check("unreadable" not in why, f"absence must not be reported as a read fault: {why}")
+        finally:
+            box.destroy()
+
+
 # ── the mutation map ──────────────────────────────────────────────────────────────────────────
 class Mutation:
     def __init__(self, case_id, old, new, why):
@@ -2763,8 +3174,10 @@ MUTATIONS = [
     ),
     Mutation(
         "T9b",
-        "            queued, busy, online = sample()\n            starved = starvation_invariant(queued, busy, online)",
-        "            queued, busy, online = sample()\n            pass  # MUTATION: the second sample is thrown away",
+        "            queued, busy, online, eligible, why = sample()\n"
+        "            starved = starvation_invariant(queued, busy, online) and eligible",
+        "            queued, busy, online, eligible, why = sample()\n"
+        "            pass  # MUTATION: the second sample is thrown away",
         "the confirmation sample is taken and discarded, so an ordinary handover blip alarms — the "
         "one case in this suite that had no paired mutation at all (review finding P3)",
     ),
@@ -3141,6 +3554,92 @@ MUTATIONS = [
         '    if (\n        not record["problems"]\n        and record.get("unverified_cause") != "pool-read-after-restart"\n        and not record["actions"]\n    ):',
         "the alarm is suppressed by ACTIONS, so a repair that never sticks silences it for ever (#2875)",
     ),
+    # ── review cycle of this lane (2026-10-27): one mutation per new case ───────────────────────
+    Mutation(
+        "T33",
+        '    if pool_serves_fallback(pool):',
+        '    if True:  # MUTATION: eligibility is not consulted',
+        "the eligibility term is neutered, so a fallback-only repo's own backlog pages exit 4 for ever",
+    ),
+    Mutation(
+        "T34",
+        '    if gate_mode == "local":',
+        '    if False:  # the gate\'s recorded intent is ignored',
+        "the gate's `local` no longer makes the queue this pool's work: #2875's stripped-label shape goes silent",
+    ),
+    Mutation(
+        "T35",
+        '        if not stripped or stripped.startswith("#"):',
+        '        if not stripped:',
+        "a COMMENTED-OUT cron line counts as a schedule, so a stale `local` record arms the fallback for ever",
+    ),
+    Mutation(
+        "T35",
+        '            if not name.endswith((".service", ".timer")):',
+        '            if False:',
+        "a `.disabled`/`.bak` unit file counts as a schedule — the ordinary hand-disable reads as intended",
+    ),
+    Mutation(
+        "T35",
+        "            if entry.is_symlink() and os.readlink(entry) == os.devnull:",
+        "            if False:",
+        "a MASKED unit counts as a schedule, so a deliberately disabled gate keeps arming the fallback",
+    ),
+    Mutation(
+        "T36",
+        '        raise Unmeasurable(f"the runner root {base} {base_reason} — cannot inventory this box")',
+        "        return []",
+        "an unreadable runner root reads as EMPTY: the pass registers duplicates over installs it could not see",
+    ),
+    Mutation(
+        "T37",
+        '        runner = next((r for r in local if str(r.directory) == c["dir"]), None)',
+        '        runner = next((r for r in local if r.name == c["name"]), None)',
+        "repair identity falls back to the NAME, so two installs sharing an agentName act on the same one twice",
+    ),
+    Mutation(
+        "T38",
+        '            record["unverified_cause"] = "mid-pass-measurement"\n'
+        '            record["disk_unverified"] = str(exc)',
+        '            record["unverified_cause"] = "mid-pass-measurement"',
+        "the mid-pass disk failure loses its machine-readable cause, so a fleet reader sees a HEALTHY pass",
+    ),
+    Mutation(
+        "T39",
+        "            if len(measured) <= installs_seen:",
+        "            if False:",
+        "a provisioner that installs NOTHING exits 0 as `under-target`: an enforcer that failed to grow reads green",
+    ),
+    Mutation(
+        "T40",
+        '            f"no provisioner: {why} — a NEW runner cannot be created on this box (this script "',
+        '            "no provisioner: tools/install-ci-runner-x64.sh is absent, so a NEW runner cannot be "',
+        "the moved-pin diagnostic names a literal filename, not the value the operator must fix",
+    ),
+    Mutation(
+        "T41",
+        "    if not sizes:",
+        "    if rc != 0 or not sizes:",
+        "a PARTIAL du is thrown away, so a >8 GB install budgets the 8 GB allowance: the over-add the arm forbids",
+    ),
+    Mutation(
+        "T42",
+        "    except FileNotFoundError:",
+        "    except ZeroDivisionError:",
+        "an ABSENT gate record is reported as unreadable, sending an operator after permissions on a cell",
+    ),
+    Mutation(
+        "T9",
+        '            record["starvation_queued"] = starvation["queued"]',
+        '            record["starvation_queued"] = None',
+        "the published starvation count is deleted while every gate stays green (a contract with no artifact)",
+    ),
+    Mutation(
+        "T3",
+        "        fallback_engaged=fallback_engaged(pool),",
+        "        fallback_engaged=None,",
+        "the published `fallback_engaged` fact becomes None and nothing reddens",
+    ),
 ]
 
 
@@ -3207,10 +3706,42 @@ def _mutation_verdict(returncode: int, body: str) -> bool:
     return False
 
 
+def _case_passes_alone(case_id: str) -> tuple[bool, str]:
+    """Run ONE case against the SHIPPED module — the CONTROL its mutations are scored against.
+
+    ⛔ A MUTATION IS CAUGHT ONLY IF ITS CASE IS GREEN BEFORE THE MUTATION IS APPLIED (review finding
+    P3). `_mutation_verdict` scores CAUGHT on `FAIL>0`, so a case that is red for ANY reason — an
+    order-dependent fixture, a host fact leaking in — makes all of its mutants report `✅ CAUGHT`
+    while proving nothing. The guard is one run per case, cached, and it runs with NO
+    `RUNNER_AUTOSCALE_MODULE` so it measures the file that ships.
+    """
+    env = dict(os.environ, RUNNER_AUTOSCALE_TEST_ONLY=case_id)
+    env.pop("RUNNER_AUTOSCALE_MODULE", None)
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    body = proc.stdout.decode("utf-8", "replace")
+    return proc.returncode == 0 and "PASS=1 FAIL=0" in body, body
+
+
 def run_mutations():
     print("── MUTATION EVIDENCE — each mutation must make its paired case RED ──")
     print("   (the mutated module is written to a temp dir; the shipped file is never touched)\n")
+    print("── CONTROLS — every paired case must be GREEN on the SHIPPED module first ──")
+    controls: dict[str, bool] = {}
     bad = 0
+    for case_id in dict.fromkeys(m.case_id for m in MUTATIONS):
+        ok, body = _case_passes_alone(case_id)
+        controls[case_id] = ok
+        print(f"   {'✅' if ok else '❌'} control {case_id}: {'GREEN' if ok else 'RED'}")
+        if not ok:
+            bad += 1
+            for line in body.splitlines():
+                print(f"   | {line}")
+    print()
     for mut in MUTATIONS:
         # ⛔ A STALE OR DUPLICATE ANCHOR MUST NOT TRUNCATE THE REPORT. `_mutated_module` raises when an
         # anchor no longer matches the module (measured: this suite shipped a `<= 600` anchor after the
@@ -3218,6 +3749,11 @@ def run_mutations():
         # mutations — silently vanished while the plain suite stayed green). A mutation that cannot be
         # built is a mutation that verified NOTHING: count it MISSED and say why.
         print(f"── {mut.case_id} mutation → {mut.why}")
+        if not controls.get(mut.case_id, False):
+            # ⛔ NOT COUNTED AS CAUGHT. A red control means this mutation cannot verify anything, and
+            # scoring it CAUGHT would be the very false PASS this harness exists to prevent.
+            print("   ❌ CONTROL RED — the paired case fails on the SHIPPED module; NOTHING verified\n")
+            continue
         try:
             tmp, out = _mutated_module(mut)
         except SystemExit as exc:
