@@ -330,6 +330,15 @@ _tally_rec() {
     [ -n "$3" ] && printf '%s' "$3" || printf '?'
 }
 
+# _uv_rec <value> — the uv class keeps NO `HAVE_UV_CAND`/`HAVE_UV_TALLY` sentinel of its own (its
+# fail-closed arms publish no tally and leave the counters at their initialised 0), so its "could not
+# be SET UP" state reaches the record through `VERDICT_UV` instead of through a sentinel. Same
+# polarity as `_tally_rec`'s unanswerable arm: a class that never ran has no measured value, and a
+# `0` there is an INVENTED zero. Without this the pass-end line said `candidates=?` (the guard in
+# `main`) while the record of the SAME pass said `candidates_uv=0` — the two-surfaces-disagree
+# defect this pass exists to remove, one surface over.
+_uv_rec() { [ "${VERDICT_UV:-}" = misconfigured ] && printf '?' || printf '%s' "${1:-?}"; }
+
 # kv_field <line> <key> — one `k=v` token out of a delegate's machine-readable line.
 # The delegate's `SUMMARY` is the ONLY tally a pass produces; the entry point lifts it instead of
 # re-deriving it, because a second implementation of "how many were preserved" is a second answer.
@@ -2074,7 +2083,7 @@ record_body() {
     printf 'would_free_mb_venv=%s\n' "$WOULD_VENV"
     printf 'would_free_mb_worktree=%s\n' "$WOULD_WT"
     printf 'would_free_mb_duplicate_install=%s\n' "$WOULD_DUP"
-    printf 'candidates_uv=%s\n' "$CAND_UV"
+    printf 'candidates_uv=%s\n' "$(_uv_rec "$CAND_UV")"
     printf 'classified_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${CLASSIFIED_VENV:-}")"
     printf 'preserved_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${PRESERVED_VENV:-}")"
     printf 'candidates_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_CAND:-0}" "${CAND_VENV:-}")"

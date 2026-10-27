@@ -2746,6 +2746,49 @@ assert_eq "$RC" "6" "T57f6 the canonical lock is uid-independent — a live hold
 assert_contains "$OUT" "pi-disk-reaper/disk-reaper.lock" "T57f6 ... naming that lock"
 assert_absent "$OUT" "class=uv" "T57f6 ... and no class runs beside it"
 rm -rf "$CANON"
+# ⛔ T60 — A CLASS THAT COULD NOT BE SET UP MUST NOT REPORT A VERDICT OR A COUNT IT NEVER COMPUTED.
+# TWO surfaces report a class's verdict: the operator-facing `class=` line, and the
+# `verdict_<class>` field of the pass record. They must carry the SAME value, and they did not: the
+# class lines re-derived `$(class_verdict "$RC_WT")`, whose `*` arm yields `fail-closed`, while
+# `VERDICT_WT` is `misconfigured` on the setup-failure arms. So the line said `verdict=fail-closed`
+# beside the record's `verdict_worktree=misconfigured` for the SAME pass — erasing #2036's "could not
+# be SET UP at all" distinction from the line an operator actually reads. The bug arrived through a
+# merge-conflict resolution, which is exactly what a pinned assertion is for: `class_verdict` cannot
+# return `misconfigured` at all, so the re-derivation was ALWAYS wrong on that path.
+# ⛔ AND THE COUNT HAS THE SAME SHAPE. `misconfigured` measured NOTHING, so a confident
+# `candidates=0` beside `verdict_uv=misconfigured` is an invented zero — the "reads as a passing pass"
+# failure this report exists to remove. The uv class keeps no `HAVE_UV_CAND` sentinel, so its
+# unanswerable state reaches the record through `VERDICT_UV`; the LINE said `?` and the RECORD said
+# `0`, which is the same disagreement one field over.
+# Without this case the suite stays GREEN with either half reverted — no other assertion in this
+# file reads a class line's `verdict=`.
+ENVNAME=t60
+REPO60="$(mk_repo t60)"
+OUT="$(WORKTREE_REAPER=/nonexistent/pi-reap-worktrees.sh \
+    ABANDONED_WT_REAPER=/nonexistent/reap-abandoned-worktrees.sh \
+    run_reaper --dry-run --repo "$REPO60" --only worktree 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a worktree class that could not be SET UP exits fail-closed (3)"
+assert_contains "$OUT" "class=worktree rc=3 verdict=misconfigured" \
+    "T60 the class line reports the verdict the RECORD reports (misconfigured)"
+assert_absent "$OUT" "class=worktree rc=3 verdict=fail-closed" \
+    "T60 ... and never the re-derived fail-closed ('the delegate RAN' — a different remedy)"
+assert_contains "$OUT" "candidates=?" \
+    "T60 a class that measured nothing does not claim a candidate total"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "verdict_worktree=misconfigured" \
+    "T60 the RECORD agrees with the line about the verdict of the same pass"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_worktree=?" \
+    "T60 ... and about the candidate total (unanswerable, never an invented 0)"
+# The uv half: the class that could not run must not contribute a measured 0 to the pass totals
+# on EITHER surface, and its record field must not contradict the line that just printed `?`.
+OUT="$(CACHE_REAPER=/nonexistent/pi-cache-reap.sh run_reaper --dry-run --only uv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a uv class that could not be SET UP exits fail-closed (3)"
+assert_contains "$OUT" "candidates=?" \
+    "T60 the pass-end line reports the candidate total as unanswerable, not 0"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_uv=?" \
+    "T60 ... and the record agrees with the line (never an invented 0)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "verdict_uv=misconfigured" \
+    "T60 the uv record names the state that made the total unanswerable"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then
