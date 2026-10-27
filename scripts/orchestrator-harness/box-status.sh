@@ -49,7 +49,7 @@ O="${O:-$HOME/orchestrator}"
 REPO="${REPO:-}"
 REF="origin/main"
 PROG="$(basename "$0")"
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 die2() { printf '%s\n' "$*" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
@@ -317,25 +317,25 @@ done
 
 # ── the three lines (plus the identity detail line) ───────────────────────────────────────────
 if [ -z "$id" ]; then
-  say "harness: <none> [unknown] source=none"
+  log_line "harness: <none> [unknown] source=none"
 else
-  say "harness: $(sha12 "$id") [$relation] source=$src"
+  log_line "harness: $(sha12 "$id") [$relation] source=$src"
 fi
-say "stamp: $( [ -n "$stamp_commit" ] && sha12 "$stamp_commit" || printf 'UNRECORDED' )    pin: $( [ -n "$pin_commit" ] && sha12 "$pin_commit" || printf 'EMPTY' )"
+log_line "stamp: $( [ -n "$stamp_commit" ] && sha12 "$stamp_commit" || printf 'UNRECORDED' )    pin: $( [ -n "$pin_commit" ] && sha12 "$pin_commit" || printf 'EMPTY' )"
 if [ -n "$ref_sha" ]; then
-  say "ref: $REF=$(sha12 "$ref_sha")"
+  log_line "ref: $REF=$(sha12 "$ref_sha")"
 elif [ -n "$REF_WHY" ]; then
   # A REFUSED repo is not an absent answer: the sha on `harness:` was compared against nothing, and a
   # reader that cannot see why would take the missing line for "no opinion".
-  say "ref: UNRESOLVED ($REF_WHY)"
+  log_line "ref: UNRESOLVED ($REF_WHY)"
 fi
 if [ -n "$ctrl" ]; then
-  say "controller: RUNNING(pid $(printf '%s' "$ctrl" | tr ' ' ','))"
+  log_line "controller: RUNNING(pid $(printf '%s' "$ctrl" | tr ' ' ','))"
 else
-  say "controller: STOPPED"
+  log_line "controller: STOPPED"
 fi
-if is_sha "${running_state:-}"; then say "running: $(sha12 "$running_state")"; else say "running: ${running_state:-UNREADABLE}"; fi
-say "roles: $( [ -n "$busy" ] && printf 'busy%s' "$busy" || printf 'idle' )"
+if is_sha "${running_state:-}"; then log_line "running: $(sha12 "$running_state")"; else log_line "running: ${running_state:-UNREADABLE}"; fi
+log_line "roles: $( [ -n "$busy" ] && printf 'busy%s' "$busy" || printf 'idle' )"
 
 # An unreadable identity, or no local ref to compare against, is CANNOT-VERIFY — not "current".
 if [ -z "$id" ] || [ -z "$ref_sha" ]; then exit 2; fi

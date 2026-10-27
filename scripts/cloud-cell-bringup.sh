@@ -102,10 +102,10 @@ SWAP_SWAPPINESS="${SWAP_SWAPPINESS:-30}"
 # (the suite's seam); `false` is how a case reproduces a cell that cannot escalate.
 SWAP_SUDO="${SWAP_SUDO-sudo -n}"
 
-say()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
-die()  { say "FATAL: $*" >&2; exit 1; }
-ok()   { say "ok: $*"; }
-warn() { say "warn: $*"; }
+log_line()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+die()  { log_line "FATAL: $*" >&2; exit 1; }
+ok()   { log_line "ok: $*"; }
+warn() { log_line "warn: $*"; }
 
 # ── SECRET LIFETIME — a secret file must not outlive the bring-up (agent-infra#1718) ────────────
 # The gh token is PUSHED to the cell as a FILE by the operator, and the pre-fix cleanup sat AFTER
@@ -185,7 +185,7 @@ report_survivor() {
   # a denied parent also hides the file from the stat above, so the honest claim is that we could
   # neither remove nor verify — not that a credential is definitely on disk. The direction is
   # deliberately fail-closed, and the operator is told to verify by hand.
-  say "SECURITY: $f could not be removed (or even inspected); delete it by hand before handing this VM on" >&2
+  log_line "SECURITY: $f could not be removed (or even inspected); delete it by hand before handing this VM on" >&2
 }
 
 # remove_secrets — remove every registered secret. Non-zero if ANY survived.
@@ -627,7 +627,7 @@ check_operational_layer() {
       *) [ -O "$cand" ] || trusted=0 ;;
     esac
     if [ "$trusted" -eq 1 ]; then root="$cand"; break; fi
-    say "  refusing $cand: checkout-shaped but not owned by $(id -un) — pass INFRA_ROOT=<checkout> to use it deliberately"
+    log_line "  refusing $cand: checkout-shaped but not owned by $(id -un) — pass INFRA_ROOT=<checkout> to use it deliberately"
   done
   if [ -z "$root" ]; then
     die "no agent-infra checkout on this cell (looked at \$INFRA_ROOT, $self_root, \$AGENT_INFRA_PATH, \${HARNESS}/.., $CELL_HOME/agent-infra).
@@ -654,7 +654,7 @@ check_operational_layer() {
     # re-installed the extension, so the reason the box kept re-breaking itself appeared nowhere
     # in the log. The installer's named line ("capture extension present on a cell: …") is the
     # evidence; print it, indented like the rest of the layer output.
-    say "  the cell does not carry a current layer (verify rc=$rc) — installing it from $root. The read-back's own reasons:"
+    log_line "  the cell does not carry a current layer (verify rc=$rc) — installing it from $root. The read-back's own reasons:"
     printf '%s\n' "$out" | sed 's/^/    /'
     rc=0
     out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --install 2>&1)" || rc=$?
@@ -1518,7 +1518,7 @@ check_schedule() {
 
 main() {
   export HOME_ORIG="${HOME:-}"
-  say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
+  log_line "cloud-cell bringup — mode=$MODE uid=$(id -u)"
   setup_home
   # ⛔ UNCONDITIONALLY, BEFORE ANY CHECK READS A REPO — not only after `$ENV_FILE` is sourced. A
   # MISSING keys.env is a supported, non-fatal path (`check_provider` only warns), and every check
@@ -1568,10 +1568,10 @@ main() {
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, scheduled layer, caches reported, swap active, harness activation scheduled)"
+      log_line "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, scheduled layer, caches reported, swap active, harness activation scheduled)"
       ;;
     *)
-      say "unknown mode: $MODE (use --check)"; exit 2 ;;
+      log_line "unknown mode: $MODE (use --check)"; exit 2 ;;
   esac
 }
 main "$@"
