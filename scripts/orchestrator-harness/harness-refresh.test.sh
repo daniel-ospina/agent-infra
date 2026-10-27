@@ -1238,6 +1238,44 @@ case "$RB" in *"running=$(short "$C2")"*)
                 bad "the HARNESS_PIN_FILE arm did not resolve (dead code in CI): RUNNING fell to the stamp: $RB" ;;
              *) bad "the record named neither tree: $RB" ;; esac
 
+# ⛔ A36l: THE LEGACY FLAT-PIN ARM HAS ITS OWN WITNESS (review cycle 7, measured: deleting the arm's one
+# line at `_acc` left the suite green at 218/218). A flat pin is a DIFFERENT recorded root shape from the
+# per-commit child `apply` creates: there the pin root IS the worktree, so the controller tree is
+# `<HARNESS_PIN_DIR>/scripts` with NO sha12 component. Every other A36* case drives either a child
+# (`$D/pins/<sha12>/scripts`), the pin-file tree (A36k), or nothing, and the generic
+# `<pin-root>/<one component>/scripts` fallback CANNOT serve this shape — `_rest` is then the literal
+# `scripts`, which does not match its `*/scripts` prefix test (verified: `case scripts in */scripts)` is
+# no match). So this arm is the ONLY thing that resolves a box on a flat pin, and without it that box
+# keeps the permanent `restart-pending` this whole change exists to remove. Driven on its own seed (its
+# own stale stamp at C1) so no earlier case can supply the answer.
+_CASE=$((_CASE+1)); echo "=== A36l: a LEGACY FLAT pin (the pin root IS the worktree) still resolves RUNNING ==="
+D="$T/a24"; _T25="$D/flatpin"
+git -C "$T/src" worktree add --detach "$_T25" "$C2" >/dev/null 2>&1
+printf '#!/bin/bash\nsleep 120\n' > "$_T25/scripts/orchestrator-harness/orch-loop.sh"
+_O27="$_T25/scripts/orchestrator-harness/orch-loop.sh"
+mkdir -p "$D/o2/state"
+printf '{"commit": "%s"}\n' "$C1" > "$D/o2/.agent-infra-stamp.json"
+bash "$_O27" & _P35=$!
+sleep 1
+# The plant is asserted to be argv-shaped BEFORE the outcome is read (the A25 lesson: a dead or unnamed
+# plant makes every assertion below vacuously pass).
+case "$(ps -ww -o command= -p "$_P35" 2>/dev/null)" in
+  *"$_O27"*) ok "the plant really executes <flat-pin-root>/scripts/orchestrator-harness/orch-loop.sh" ;;
+  *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P35" 2>/dev/null)" ;;
+esac
+printf '%s\n' "$_P35" > "$D/o2/.orch.lock"
+RL="$(O="$D/o2" HARNESS_PIN_DIR="$_T25" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o2" 2>&1)"; RCL=$?
+rm -f "$D/o2/.orch.lock"; kill "$_P35" 2>/dev/null; wait "$_P35" 2>/dev/null
+case "$RL" in *"running=$(short "$C2")"*)
+                ok "the flat-pin tree answers — <pin-root>/scripts passes the recorded-root bound" ;;
+             *"running=$(short "$C1")"*)
+                bad "the flat-pin arm did not resolve (dead code): RUNNING fell to the seed stamp: $RL" ;;
+             *) bad "the record named neither tree — the stage was skipped, not exercised: $RL" ;; esac
+case "$RL" in *relation=current*) ok "…and a correctly-activated flat-pin cell reports current, not restart-pending forever" ;;
+              *) bad "a flat-pin cell still cannot say it is current: $RL" ;; esac
+[ "$RCL" = 0 ] || bad "exit $RCL on the flat-pin read: $RL"
+
 # ⛔ A36b: A TREE OUTSIDE EVERY RECORDED ROOT CANNOT ANSWER FOR THIS BOX. The harness path is SHARED
 # across repos on one machine, so "a controller is running" and "MY controller is running" are different
 # questions (the #1856 shape the supervisor answers with its ownership read). A peer repo's controller

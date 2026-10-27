@@ -314,7 +314,11 @@ _began_before_lock() { # <lock-file> <pid>
 }
 if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
   _ctrl_pid=""
-  [ -n "${O:-}" ] && _ctrl_pid="$(head -1 "$O/.orch.lock" 2>/dev/null)"
+  # ⛔ `-f` FIRST, LIKE THE SIBLING READ AT `CONTROLLER_LIVE` BELOW. `head` on a NON-REGULAR lock — a
+  # FIFO left by a crashed writer, a wedged network mount — BLOCKS ON OPEN, so on a cell (the only shape
+  # this block runs) the refresh and therefore the controller's whole cycle would hang every cycle with
+  # no output. `launchd-cycle.sh` records the same finding for the same read.
+  [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ] && _ctrl_pid="$(head -1 "$O/.orch.lock" 2>/dev/null)"
   _ctrl_pid="${_ctrl_pid//[!0-9]/}"
   _ctrl_tree=""
   # ⛔ SHAPE IS NOT OWNERSHIP — THE AGE IS, and the failure this closes is the false-PASS direction.
@@ -381,7 +385,12 @@ if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
   fi
   if [ -n "$_ctrl_tree" ]; then
     _ok=0
-    _nl="$(printf '\n')"
+    # ⛔ `_nl=$'\n'`, NOT `_nl="$(printf '\n')"`: a command substitution STRIPS trailing newlines, so that
+    # form yields the EMPTY string, `_acc` becomes one run-on entry list and the membership test below
+    # degrades from whole-path equality into a SUBSTRING match — a `_ctrl_tree` that is only a textual
+    # suffix of a recorded path would then answer for this box, which is exactly the recorded-root bound
+    # this block exists to enforce (review cycle 7, measured: `_nl` length 0).
+    _nl=$'\n'
     _acc="${_nl}"
     [ -n "${HARNESS_PIN_DIR:-}" ] && _acc="${_acc}${HARNESS_PIN_DIR%/}/scripts/orchestrator-harness/orch-loop.sh${_nl}"
     if [ -n "${HARNESS_PIN_FILE:-}" ] && [ -r "$HARNESS_PIN_FILE" ]; then
