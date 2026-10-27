@@ -27,6 +27,18 @@ DM="$HERE/dispatch-merge.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
+# ⛔ REAP A PLANT AND ITS CHILDREN. Every plant in this suite is `bash <script>` where the script's last
+# command is `sleep 120`, so the process the case holds the pid of is the WRAPPER and the sleeper is its
+# CHILD. `kill "$_Pxx"` alone therefore kills the wrapper and orphans a two-minute sleeper at ppid 1 on
+# every run (MEASURED: 9 survivors after one suite run). `-P` targets exactly that wrapper's children, so
+# no other fixture's plant — and nothing else on the host — can be signalled. Falls back to the old
+# behaviour (a leak) if `pkill` is absent, so a box without it still runs the suite.
+reap() {
+  command -v pkill >/dev/null 2>&1 && pkill -9 -P "$1" 2>/dev/null
+  kill "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+  return 0
+}
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-refresh.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 echo "==> harness-refresh contract ($HERE)"
@@ -1161,7 +1173,7 @@ case "$R" in *"running=$(short "$C2")"*) ok "…and running= names the tree the 
 # the LOCK names the reader, so a mention-based read answers C2 (tip) while the invocation rule must
 # leave RUNNING on the stamp (C1).
 _CASE=$((_CASE+1)); echo "=== A36c: a process that only MENTIONS the harness path (a reader) is not the controller ==="
-kill "$_P24" 2>/dev/null; wait "$_P24" 2>/dev/null
+reap "$_P24"
 _O26R="$_T24/scripts/orchestrator-harness/orch-loop.sh"
 tail -f "$_O26R" >/dev/null 2>&1 & _R24=$!
 sleep 1
@@ -1188,7 +1200,7 @@ sleep 1
 printf '%s\n' "$_P31" > "$D/o/.orch.lock"
 R9="$(COLUMNS=20 O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$D/o" 2>&1)"
-rm -f "$D/o/.orch.lock"; kill "$_P31" 2>/dev/null; wait "$_P31" 2>/dev/null
+rm -f "$D/o/.orch.lock"; reap "$_P31"
 case "$R9" in *"running=$(short "$C2")"*)
                 ok "the running tree is still resolved with COLUMNS=20 — the argv read is width-independent" ;;
              *) bad "a narrow COLUMNS truncated the argv read — the stage gave up silently and #2641 returns: $R9" ;; esac
@@ -1210,7 +1222,7 @@ case "$(ps -ww -o command= -p "$_P32" 2>/dev/null)" in
 printf '%s\n' "$_P32" > "$D/o/.orch.lock"
 RA="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$D/o" 2>&1)"
-rm -f "$D/o/.orch.lock"; kill "$_P32" 2>/dev/null; wait "$_P32" 2>/dev/null
+rm -f "$D/o/.orch.lock"; reap "$_P32"
 case "$RA" in *"running=$(short "$C2")"*)
                 bad "a NON-SHELL argv[1] answered for the box (false current) — the shell allow-list is gone: $RA" ;;
              *"running=$(short "$C1")"*)
@@ -1231,7 +1243,7 @@ sleep 1
 printf '%s\n' "$_P34" > "$D/o/.orch.lock"
 RB="$(env -u HARNESS_PIN_DIR O="$D/o" HARNESS_PIN_FILE="$_P33" bash "$RR" --no-fetch --repo "$T/src" \
        --ref origin/main --pin "$PIN" --self "$D/o" 2>&1)"
-rm -f "$D/o/.orch.lock"; rm -f "$_P33"; kill "$_P34" 2>/dev/null; wait "$_P34" 2>/dev/null
+rm -f "$D/o/.orch.lock"; rm -f "$_P33"; reap "$_P34"
 case "$RB" in *"running=$(short "$C2")"*)
                 ok "the pin-file tree answers with NO pin root — the #2216 shape is not left on the stamp" ;;
              *"running=$(short "$C1")"*)
@@ -1266,7 +1278,7 @@ esac
 printf '%s\n' "$_P35" > "$D/o2/.orch.lock"
 RL="$(O="$D/o2" HARNESS_PIN_DIR="$_T25" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$D/o2" 2>&1)"; RCL=$?
-rm -f "$D/o2/.orch.lock"; kill "$_P35" 2>/dev/null; wait "$_P35" 2>/dev/null
+rm -f "$D/o2/.orch.lock"; reap "$_P35"
 case "$RL" in *"running=$(short "$C2")"*)
                 ok "the flat-pin tree answers — <pin-root>/scripts passes the recorded-root bound" ;;
              *"running=$(short "$C1")"*)
@@ -1277,9 +1289,9 @@ case "$RL" in *relation=current*) ok "…and a correctly-activated flat-pin cell
 [ "$RCL" = 0 ] || bad "exit $RCL on the flat-pin read: $RL"
 
 # ⛔ A36m: A NON-REGULAR `HARNESS_PIN_FILE` MUST NOT HANG THE REFRESH (review cycle 8, P3). The block that
-# reads the pin guards the LOCK against a FIFO fourteen lines earlier for exactly this reason — `head`
-# BLOCKS ON OPEN on a non-regular file — and then read the PIN with `-r`, which is TRUE for a FIFO. On a
-# cell that is a hang with no output, EVERY cycle, silently: the refresh is a synchronous child of
+# reads the pin guards the LOCK against a FIFO eighty lines earlier (`:321`) for exactly this reason —
+# `head` BLOCKS ON OPEN on a non-regular file — and then read the PIN with `-r`, which is TRUE for a FIFO.
+# On a cell that is a hang with no output, EVERY cycle, silently: the refresh is a synchronous child of
 # `orch-loop.sh`, so the whole controller cycle stops. `-f` is the gate this same file already uses for
 # this same path at the `DEPLOYED` read, and the one `launchd-cycle.sh`/`install.sh` use.
 #
@@ -1289,8 +1301,13 @@ case "$RL" in *relation=current*) ok "…and a correctly-activated flat-pin cell
 # (MEASURED: the first draft of this case had no plant and stayed GREEN with the gate mutated back to
 # `-r` — vacuous, the exact A36h/A36l defect). So the shape is A36k's: a real `orch-loop.sh`-argv sleeper
 # at C2, the lock naming it, `HARNESS_PIN_DIR` UNSET so the pin-file arm is the only accept-root entry.
-# With `-f` the FIFO contributes nothing, `_ok` stays 0 and RUNNING falls to the seed stamp's C1 — the
-# SAFE direction, asserted below. With `-r` this case HANGS instead (verified by mutating the gate).
+#
+# ⛔ BOTH ARMS ARE ASSERTED, AND THAT IS WHAT MAKES THE FIXTURE SELF-PROVING (review cycle 9, P3). `-f`
+# makes the FIFO contribute nothing, `_ok` stays 0 and RUNNING falls to the seed stamp's C1 — but C1 is
+# ALSO what a fixture whose plant died or whose lock was never written prints, so an arm asserting only
+# C1 would read `ok` on a rotted fixture and the vacuity above could silently return. So the SAME fixture
+# is driven first with a REGULAR pin file (which must resolve C2 — proving the stage is reached and the
+# plant is live) and only then with the FIFO (which must fall to C1). Neither arm alone is evidence.
 _CASE=$((_CASE+1)); echo "=== A36m: a FIFO HARNESS_PIN_FILE does not hang the refresh (the gate is -f, not -r) ==="
 _F26="$T/a24/path-fifo"
 rm -f "$_F26"; mkfifo "$_F26" 2>/dev/null
@@ -1301,6 +1318,22 @@ else
   bash "$_O26" & _P36=$!
   sleep 1
   printf '%s\n' "$_P36" > "$D/o/.orch.lock"
+  # The plant is asserted to be argv-shaped BEFORE either outcome is read (the A25/A36l lesson).
+  case "$(ps -ww -o command= -p "$_P36" 2>/dev/null)" in
+    *"$_O26"*) ok "the plant really executes <pin-tree>/scripts/orchestrator-harness/orch-loop.sh" ;;
+    *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P36" 2>/dev/null)" ;;
+  esac
+  # CONTROL ARM — a REGULAR pin file on this same fixture must resolve C2. This is what proves the stage
+  # is reached, so the FIFO arm's C1 below cannot be a skip wearing an ok.
+  _K26="$T/a24/path-ctrl"
+  printf '%s\n' "$_T24/scripts/orchestrator-harness" > "$_K26"
+  _KC26="$(env -u HARNESS_PIN_DIR O="$D/o" HARNESS_PIN_FILE="$_K26" bash "$RR" --no-fetch --repo "$T/src" \
+            --ref origin/main --pin "$PIN" --self "$D/o" 2>&1)"
+  case "$_KC26" in
+    *"running=$(short "$C2")"*) ok "control: the same fixture with a REGULAR pin file resolves C2 — the stage is reached" ;;
+    *) bad "control: a REGULAR pin file did not resolve C2, so this case proves nothing about the FIFO: $_KC26" ;;
+  esac
+  rm -f "$_K26"
   env -u HARNESS_PIN_DIR O="$D/o" HARNESS_PIN_FILE="$_F26" bash "$RR" --no-fetch --repo "$T/src" \
       --ref origin/main --pin "$PIN" --self "$D/o" >"$D/o/fifo.out" 2>&1 & _R36=$!
   _i26=0
@@ -1324,8 +1357,10 @@ else
         bad "the refresh returned but produced no record: $(cat "$D/o/fifo.out")" ;;
     esac
   fi
-  rm -f "$D/o/.orch.lock"; kill "$_P36" 2>/dev/null; wait "$_P36" 2>/dev/null
-  rm -f "$_F26" "$D/o/fifo.out"
+  # ⛔ `reap`, not `kill`: `$_O26` is `#!/bin/bash` + `sleep 120`, so the pid this case holds is the
+  # WRAPPER and the sleeper is its CHILD — a bare `kill` orphans a 2-minute sleeper at ppid 1.
+  reap "$_P36"
+  rm -f "$D/o/.orch.lock" "$_F26" "$D/o/fifo.out"
 fi
 
 # ⛔ A36b: A TREE OUTSIDE EVERY RECORDED ROOT CANNOT ANSWER FOR THIS BOX. The harness path is SHARED
@@ -1345,7 +1380,7 @@ sleep 1
 printf '%s\n' "$_P24C" > "$D/o/.orch.lock"
 R2="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$D/o" 2>&1)"; RC2=$?
-rm -f "$D/o/.orch.lock"; kill "$_P24C" 2>/dev/null; wait "$_P24C" 2>/dev/null
+rm -f "$D/o/.orch.lock"; reap "$_P24C"
 case "$R2" in *relation=current*) bad "a foreign controller's tree bought a current verdict: $R2" ;;
                *relation=restart-pending*) ok "a foreign controller's tree does not buy a current verdict" ;;
                *) bad "unexpected record: $R2" ;; esac
@@ -1374,7 +1409,7 @@ sleep 1
 printf '%s\n' "$_P26" > "$D/o/.orch.lock"
 R4="$(O="$D/o" HARNESS_PIN_DIR="$_P25" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$D/o" 2>&1)"; RC4=$?
-rm -f "$D/o/.orch.lock"; kill "$_P26" 2>/dev/null; wait "$_P26" 2>/dev/null
+rm -f "$D/o/.orch.lock"; reap "$_P26"
 case "$R4" in *"running=$(short "$C2")"*) bad "a stale copy without .git ascended into the enclosing worktree (false current): $R4" ;;
                *"running=$(short "$C1")"*) ok "a tree that is not its own toplevel cannot answer — the stamp stands" ;;
                *) bad "the record named neither tree — the stage was skipped, not exercised: $R4" ;; esac
@@ -1398,7 +1433,7 @@ sleep 1
 printf '%s\n' "$_P27" > "$D/o/.orch.lock"
 R5="$(O="$D/o" HARNESS_PIN_DIR="$D/link2" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$D/o" 2>&1)"; RC5=$?
-rm -f "$D/o/.orch.lock"; kill "$_P27" 2>/dev/null; wait "$_P27" 2>/dev/null
+rm -f "$D/o/.orch.lock"; reap "$_P27"
 case "$R5" in *relation=current*) ok "a symlinked pin root still resolves the running tree — not a silent give-up" ;;
                *restart-pending*) bad "a symlinked pin root silently gave up (logical vs physical compare): $R5" ;;
                *) bad "unexpected record: $R5" ;; esac
@@ -1421,7 +1456,7 @@ printf '%s\n' "$_P28" > "$D/o/.orch.lock"
 touch -t 202001010000 "$D/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00' "$D/o/.orch.lock" 2>/dev/null || true
 R6="$(O="$D/o" HARNESS_PIN_DIR="$T/a24/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$D/o" 2>&1)"; RC6=$?
-rm -f "$D/o/.orch.lock"; kill "$_P28" 2>/dev/null; wait "$_P28" 2>/dev/null
+rm -f "$D/o/.orch.lock"; reap "$_P28"
 case "$R6" in *"running=$(short "$C2")"*) bad "a recycled-pid lock certified the tree it names (no age test): $R6" ;;
                *"running=$(short "$C1")"*) ok "a process that began after the lock was written is not its owner" ;;
                *) bad "the record named neither tree — the age path was skipped, not exercised: $R6" ;; esac
@@ -1439,7 +1474,7 @@ sleep 1
 printf '%s\n' "$_P29" > "$T/a25/o/.orch.lock"
 R7="$(O="$T/a25/o" HARNESS_PIN_DIR="$T/a24/pins" PS_BIN="$T/a25/bin/ps-none" bash "$RR" --no-fetch \
        --repo "$T/src" --ref origin/main --pin "$PIN" --self "$T/a25/o" 2>&1)"
-rm -f "$T/a25/o/.orch.lock"; kill "$_P29" 2>/dev/null; wait "$_P29" 2>/dev/null
+rm -f "$T/a25/o/.orch.lock"; reap "$_P29"
 case "$R7" in *"running=$(short "$C2")"*) bad "an unreadable age was read as ownership (false current): $R7" ;;
                *"running=$(short "$C1")"*) ok "an age that cannot be read is not ownership — the stamp stands" ;;
                *) bad "the record named neither tree: $R7" ;; esac
@@ -1456,7 +1491,7 @@ sleep 1
 printf '%s\n' "$_P30" > "$T/a25/o/.orch.lock"
 R8="$(O="$T/a25/o" HARNESS_PIN_DIR="$T/a24/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$T/a25/o" 2>&1)"
-rm -f "$T/a25/o/.orch.lock"; kill "$_P30" 2>/dev/null; wait "$_P30" 2>/dev/null
+rm -f "$T/a25/o/.orch.lock"; reap "$_P30"
 case "$R8" in *"running=$(short "$C2")"*) bad "a wrapper's ARGUMENT list resolved RUNNING (not argv[1] of the shell): $R8" ;;
                *"running=$(short "$C1")"*) ok "the pair is read positionally — an argument-list mention is not the invocation" ;;
                *) bad "the record named neither tree: $R8" ;; esac
