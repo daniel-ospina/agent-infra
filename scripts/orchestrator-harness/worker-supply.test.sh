@@ -463,6 +463,44 @@ O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
 [ "$(spawns_for prd-45)" = "1" ] && ok "a worktree nobody holds is still refilled (the guard is not a blanket refusal)" \
                                  || bad "the guard blocked an unheld worktree ($(spawns_for prd-45) spawns)"
 
+# ── (d5) A POOL THE PASS COULD NOT READ IS NOT A CLEAN PASS ───────────────────────────────────━
+# ⛔ FOUND BY REVIEW (#2896 round 3, P2). Every UNKNOWN path fell through to the verdict's `clean`
+# arm, so a pass whose only order was a stale claim printed `pass: clean — live=0/7 unknown=1` and
+# exited 0: the doctor's `capacity … inflight=0` health theatre reproduced one layer down, and a direct
+# contradiction of exit code 2 ("a read a pass needs could not be taken"). It also LOST the dead order
+# from the census when a worktree holder was unreadable, which is why the assertion below is on the
+# census too and not only on rc.
+reset
+mkwt "$TMP/wt/prd-46" fix/46
+echo brief > "$TMP/briefs/prd-46.txt"
+mkorder prd-46 "$TMP/wt/prd-46" fix/46 "$TMP/briefs/prd-46.txt" 60 "2026-10-27 01:00:00"
+touch -d '3 hours ago' "$BG/prd-46.started" 2>/dev/null || touch -t 202601010101 "$BG/prd-46.started"
+live_worker prd-46                                    # answers `running`, past its own cap+slack
+O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/d5.out" 2>&1; rc5=$?
+[ "$rc5" = "2" ] && ok "a pass that supplied nothing because it could NOT READ the pool exits 2 (REFUSING), not 0" \
+                 || bad "an unreadable pool reported rc=$rc5, expected 2 (a clean pass over a pool nobody could read)"
+[ "$(record_field decision)" = "unreadable" ] && ok "…and the record says so (decision=unreadable), instead of `clean`" \
+                                             || bad "record decision='$(record_field decision)', expected unreadable"
+[ "$(record_field unknown)" -ge 1 ] 2>/dev/null && ok "…with the unreadable order counted (unknown=$(record_field unknown))" \
+                                               || bad "the census lost the unknown: '$(record_field unknown)'"
+[ "$(spawn_count)" = "0" ] && ok "…and nothing was spawned (an unreadable order is never read as free)" \
+                          || bad "an unreadable order was spawned into ($(spawn_count) spawns)"
+
+# ── (d6) A TYPO IN THE LOCK BOUND MUST NOT TURN A YOUNG LOCK INTO A STALE ONE ─────────────────━
+# ⛔ FOUND BY REVIEW (#2896 round 3, P2) — the worst of the knob class, because its fail-open is the
+# DOUBLE SUPERVISOR: `[ $((now - age)) -lt "$LOCK_MAX_S" ]` with a non-numeric bound does not parse,
+# the `if` reads false, and a pid-less lock is TAKEN OVER while its holder is alive and between `mkdir`
+# and its pid write. Round 2 guarded the render-time knobs only; the lock bound is the same rule.
+reset
+mkdir -p "$ST/worker-supply.lock" 2>/dev/null   # held, no pid yet, freshly created => YOUNG
+O="$O" SPAWNS="$SPAWNS" WORKER_SUPPLY_LOCK_MAX_S=abc MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/lockknob.out" 2>&1; rcl=$?
+[ "$rcl" = "4" ] && ok "a non-numeric LOCK_MAX_S still refuses as ALREADY-RUNNING (rc=4) — the lock is not taken over" \
+                 || bad "rc=$rcl with LOCK_MAX_S=abc: a young lock with no pid was taken over (fail-open, two supervisors)"
+[ -d "$ST/worker-supply.lock" ] && ok "…and the lock directory is untouched (no takeover happened)" \
+                                 || bad "the young lock was removed by an unreadable bound"
+grep -q 'ALREADY-RUNNING' "$TMP/lockknob.out" 2>/dev/null && ok "…and it SAYS the lock is held (ALREADY-RUNNING), rather than classifying it stale" \
+                                                           || bad "the refusal did not name the lock: $(head -2 "$TMP/lockknob.out")"
+
 # ── (d3) an accepted re-offer that ENDS AT ONCE holds no slot ───────────────────────────────━━
 # ⛔ FOUND BY REVIEW (#2896 round 1, P2): the confirmation step treated "the worker already left a
 # .rc" as ACCEPTANCE *and* as a LIVE slot, so a fast-failing worker (bad credentials, missing
@@ -671,6 +709,21 @@ EOS
     || bad "a first --install never restarted the unit (calls: $(tr '\n' ' ' < "$SC_CALLS"))"
   [ "${second_restarts:-1}" = "0" ] && ok "a re-install of the BYTE-IDENTICAL unit restarts NOTHING — a no-op stays a no-op" \
     || bad "an unchanged re-install restarted the supervisor ($second_restarts restart call(s)) — it costs an interval of supply for nothing"
+  # ⛔ THE EXIT CODE MUST CARRY THE VERDICT (review #2896 round 3). `--status` printed `❌ enabled: no` /
+  # `❌ active: no` and still exited 0 whenever the unit FILE existed, so any caller that reads the code
+  # was told `healthy` about a unit that is not running — while this installer's own header promises
+  # `0 installed/healthy`. Both directions are pinned, so the assertion cannot be satisfied by a
+  # hard-coded 1.
+  SC_DEAD="$TMP/systemctl-dead"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$SC_DEAD"; chmod +x "$SC_DEAD"
+  O="$O" SUDO=false ELDATO_PLATFORM=Linux UNIT_DIR="$TMP/units2" SYSTEMCTL="$SC_DEAD" \
+    WORKER_SUPPLY_SCRIPT="$SUPPLY" bash "$INSTALLER" --status >"$TMP/status-dead.out" 2>&1; rcs_dead=$?
+  [ "$rcs_dead" = "1" ] && ok "--status exits 1 for a unit the manager reports enabled=no / active=no (the CODE carries the verdict, not the file's existence)" \
+    || bad "--status exited $rcs_dead for a disabled, inactive unit — a false PASS from a status verb"
+  O="$O" SUDO=false ELDATO_PLATFORM=Linux UNIT_DIR="$TMP/units2" SYSTEMCTL="$SC" \
+    WORKER_SUPPLY_SCRIPT="$SUPPLY" bash "$INSTALLER" --status >"$TMP/status-ok.out" 2>&1; rcs_ok=$?
+  [ "$rcs_ok" = "0" ] && ok "…and 0 when it is installed, enabled and active (the assertion is not vacuous)" \
+    || bad "--status exited $rcs_ok for a healthy unit: $(tail -2 "$TMP/status-ok.out")"
 else
   bad "missing $INSTALLER"
 fi

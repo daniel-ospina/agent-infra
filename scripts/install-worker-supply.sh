@@ -144,9 +144,11 @@ render() { # <dest>
     # refuse to supply.
     case "$MAX_REFILLS" in
       ''|*[!0-9]*) die "REFUSING: WORKER_SUPPLY_MAX_REFILLS='$MAX_REFILLS' is not a non-negative integer — the per-order crash-loop bound would be INERT" ;;
+      0?*) die "REFUSING: WORKER_SUPPLY_MAX_REFILLS='$MAX_REFILLS' has a leading zero — the supervisor's own rule (`valid_num`) rejects it, so the rendered bound would be silently replaced by the default" ;;
     esac
     case "$INTERVAL_S" in
       ''|*[!0-9]*) die "REFUSING: WORKER_SUPPLY_INTERVAL_S='$INTERVAL_S' is not a positive integer — \`sleep\` would fail and --loop would spin" ;;
+      0?*) die "REFUSING: WORKER_SUPPLY_INTERVAL_S='$INTERVAL_S' has a leading zero — the supervisor's own rule (`valid_num`) rejects it, so the rendered cadence would be silently replaced by the default" ;;
     esac
     [ "$INTERVAL_S" -gt 0 ] || die "REFUSING: WORKER_SUPPLY_INTERVAL_S=0 makes --loop re-pass with no interval"
     sed -e "s|{{SCRIPT}}|$SCRIPT|g" \
@@ -226,13 +228,18 @@ do_install() {
 do_status() {
     resolve_script || warn "no worker-supply.sh resolved — the unit cannot be exec'ing one"
     resolve_scope || exit 1
-    local dest="$UNIT_DIR/$UNIT_NAME"
-    if [ -f "$dest" ]; then ok "installed: $dest"; else err "not installed: $dest"; fi
-    if $SYSTEMCTL is-enabled --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "enabled: yes"; else err "enabled: no"; fi
-    if $SYSTEMCTL is-active --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "active: yes"; else err "active: no"; fi
+    local dest="$UNIT_DIR/$UNIT_NAME" rc=0
+    if [ -f "$dest" ]; then ok "installed: $dest"; else err "not installed: $dest"; rc=1; fi
+    if $SYSTEMCTL is-enabled --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "enabled: yes"; else err "enabled: no"; rc=1; fi
+    if $SYSTEMCTL is-active --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "active: yes"; else err "active: no"; rc=1; fi
     [ -n "$SCRIPT" ] && { say "supervisor status:"; "$SCRIPT" status 2>&1 | sed 's/^/    /'; }
-    [ -f "$dest" ] || return 1
-    return 0
+    # ⛔ THE EXIT CODE MUST CARRY THE VERDICT, NOT JUST THE LAST TEST (review #2896 round 3). `--status`
+    # printed `❌ not installed` / `❌ enabled: no` / `❌ active: no` and still exited 0 whenever the unit
+    # FILE existed — so a caller that reads the code (a lane, a supervisor, `set -e`) was told "healthy"
+    # about a unit that is not running, which is the false PASS this installer exists to remove; the
+    # contract three lines into this file says `0 installed/healthy`. `install-controller-service.sh`
+    # fixed the same defect on its own `--status` (#2402).
+    return "$rc"
 }
 
 do_uninstall() {

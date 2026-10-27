@@ -2447,15 +2447,23 @@ bash worker-supply.sh --loop     # what the service runs: pass, sleep INTERVAL, 
 ⛔ **THE KNOBS ARE VALIDATED WHERE THEY ARE ENFORCED, NOT ONLY WHERE THEY ARE RENDERED.** Both units
 render `WORKER_SUPPLY_INTERVAL_S` / `WORKER_SUPPLY_PREFIX` / `WORKER_SUPPLY_MAX_REFILLS` into `Environment=`,
 but the environment is not the only way in (an operator, a shell profile, or a hand-edited unit can set
-them directly), so `worker-supply.sh` re-validates at startup against `valid_num()` and falls back to the
-shipped default with a `knob:` line — `status` prints the resolved values (`knobs: interval_s=…
-max_refills=… prefix=…`), because what the unit renders and what is enforced are different facts once an
-override is rejected. Both failure modes it closes are FAIL-OPEN and were found by review: a non-numeric
-`MAX_REFILLS` makes the per-order crash-loop bound INERT (`[ <n> -ge two ]` never parses, so every dead
-order is re-offered for ever) and a non-numeric or zero `INTERVAL_S` makes `sleep` return at once, i.e. a
-hot loop against the dispatcher rather than a cadence. The INSTALLER refuses the same values at render
-time instead — refusing is right for an install question and wrong for an already-running supervisor,
-which must keep supplying.
+them directly), so `worker-supply.sh` re-validates **every numeric knob** at startup against `valid_num()`
+and falls back to the shipped default with a `knob:` line — `status` prints the resolved values
+(`knobs: interval_s=… max_refills=… prefix=…`), because what the unit renders and what is enforced are
+different facts once an override is rejected. Every one of these failure modes is FAIL-OPEN and was
+found by review: a non-numeric `MAX_REFILLS` makes the per-order crash-loop bound INERT (`[ <n> -ge two
+]` never parses, so every dead order is re-offered for ever); a non-numeric or zero `INTERVAL_S` makes
+`sleep` return at once, i.e. a hot loop rather than a cadence; a non-numeric `LOCK_MAX_S` makes the lock
+age test fail to parse, so a **pid-less lock is taken over while its holder is alive** — the double
+supervisor the guard exists to refuse; a non-numeric `STALE_SLACK_S` names a variable under `set -u` and
+kills the probe; and `SPAWN_TIMEOUT_S` / `PROBE_TIMEOUT_S` / `LOG_MAX_BYTES` lose their bound silently.
+The INSTALLER refuses the same values at render time instead — refusing is right for an install question
+and wrong for an already-running supervisor, which must keep supplying.
+
+⛔ **AND A PASS THAT COULD NOT READ THE POOL DOES NOT CALL ITSELF CLEAN.** `live=0 dead=0 unknown>0` with
+nothing refilled is `decision=unreadable`, rc=2 ("a read a pass needs could not be taken") — the same law
+as the doctor's `REFUSING` line, not a green tick over a pool nobody could read. A worktree holder whose
+liveness is unreadable keeps its order counted as dead; it is not quietly subtracted from the census.
 
 **A worker is ACCEPTED by a FILE, never by a return code.** The dispatcher writes `$O/bg/<name>.pid`
 and `.started`; `--status` then answers `running`, and `pr-doctor.worker_live_for()` — the doctor's own

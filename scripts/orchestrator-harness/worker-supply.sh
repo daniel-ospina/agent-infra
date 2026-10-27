@@ -95,7 +95,8 @@
 #
 # Exit codes (the fleet vocabulary, kept identical on purpose):
 #   0  a pass completed — it refilled, or there was genuinely nothing to refill
-#   2  REFUSING — a read a pass needs could not be taken (no dispatcher, an unwritable state dir)
+#   2  REFUSING — a read a pass needs could not be taken (no dispatcher, an unwritable state dir), or
+#      the pool itself could not be read: nothing was supplied and `unknown > 0` with nothing dead
 #   3  UNDELIVERED — a refill was ATTEMPTED and no worker took it (the dispatcher refused)
 #   4  ALREADY-RUNNING — the single-instance guard holds; nothing was touched
 #   6  DEFERRED — dead orders are still dead after the pass: the budget is full, the order has spent
@@ -175,25 +176,42 @@ valid_num() {
 }
 
 # ── THE KNOBS ARE VALIDATED WHERE THEY ARE ENFORCED, NOT ONLY WHERE THEY ARE RENDERED ───────────
-# `valid_num()` is this file's rule for every number it COMPARES, and these three knobs are not exempt.
-# Found by review (#2896 round 2) — all three failed OPEN, and none of them is render-only: an operator
-# or a shell profile can set the environment directly, so the fallback has to live at the point of use.
-#   WORKER_SUPPLY_MAX_REFILLS=two  → `[ <n> -ge two ]` does not PARSE (rc 2), the `if` reads FALSE, and
-#                                    the per-order crash-loop bound is INERT: a worker that dies for
-#                                    ever is re-offered for ever, and the record cannot say so.
-#   WORKER_SUPPLY_INTERVAL_S=abc   → `sleep` exits at once and so does `wait`, so `--loop` re-passes
-#                                    with NO interval — a hot loop against the dispatcher.
-#   WORKER_SUPPLY_INTERVAL_S=0     → the same hot loop, from a value `valid_num` accepts.
+# `valid_num()` is this file's rule for every number it COMPARES, so EVERY numeric knob goes through it
+# here, at startup. Found by review (#2896 rounds 2 and 3) — every one of these failed OPEN, and none is
+# render-only: an operator, a shell profile or a hand-edited unit can set the environment directly, so
+# the fallback has to live at the point of use.
+#   WORKER_SUPPLY_MAX_REFILLS=two   → `[ <n> -ge two ]` does not PARSE (rc 2), the `if` reads FALSE and
+#                                     the per-order crash-loop bound is INERT: a worker that dies for
+#                                     ever is re-offered for ever, and the record cannot say so.
+#   WORKER_SUPPLY_INTERVAL_S=abc|0  → `sleep` returns at once and so does `wait`, so `--loop` re-passes
+#                                     with NO cadence — a hot loop against the dispatcher.
+#   WORKER_SUPPLY_LOCK_MAX_S=abc    → the ARITHMETIC test fails, falls to the takeover arm, and a
+#                                     pid-less lock is taken over while the holder is alive: the exact
+#                                     double-supervisor this file's lock exists to refuse. (Round 2
+#                                     guarded the render-time knobs only; the lock bound is the same
+#                                     class and the worst of them.)
+#   WORKER_SUPPLY_STALE_SLACK_S=abc → `$(( cap + STALE_SLACK_S ))` names a variable under `set -u`: the
+#                                     supervisor dies on the probe instead of reporting a stale claim.
+#   WORKER_SUPPLY_SPAWN_TIMEOUT_S / _PROBE_TIMEOUT_S / _LOG_MAX_BYTES → the bound silently disappears
+#                                     (`alarm`/`timeout` refuse the argument) and log rotation stops.
 # The installer REFUSES these values at render time (install-worker-supply.sh) — refusing is right for
 # an install question, and wrong for an already-running supervisor, which must keep supplying.
-if ! valid_num "$MAX_REFILLS"; then
-  say "knob: WORKER_SUPPLY_MAX_REFILLS='$MAX_REFILLS' is not a non-negative integer — using 2 (an UNREADABLE bound is an inert one: every dead order would be re-offered for ever)"
-  MAX_REFILLS=2
-fi
-if ! valid_num "$INTERVAL_S" || [ "$INTERVAL_S" -eq 0 ]; then
-  say "knob: WORKER_SUPPLY_INTERVAL_S='$INTERVAL_S' is not a positive integer — using 60 (0 or a non-number makes \`sleep\` return at once: a hot loop, not a cadence)"
-  INTERVAL_S=60
-fi
+knob_num() { # <VARNAME> <value> <default> <pos|any> — the fallback says what it did, never silently
+  local name="$1" v="$2" d="$3" mode="$4" kind="non-negative integer"
+  [ "$mode" = pos ] && kind="positive integer"
+  if ! valid_num "$v" || { [ "$mode" = pos ] && [ "$v" -eq 0 ]; }; then
+    say "knob: $name='$v' is not a $kind — using $d (an unreadable bound is an inert one)"
+    return 1
+  fi
+  return 0
+}
+knob_num WORKER_SUPPLY_MAX_REFILLS       "$MAX_REFILLS"        2       any || MAX_REFILLS=2
+knob_num WORKER_SUPPLY_INTERVAL_S        "$INTERVAL_S"         60      pos || INTERVAL_S=60
+knob_num WORKER_SUPPLY_SPAWN_TIMEOUT_S   "$SPAWN_CALL_TIMEOUT" 120     pos || SPAWN_CALL_TIMEOUT=120
+knob_num WORKER_SUPPLY_PROBE_TIMEOUT_S   "$PROBE_TIMEOUT"      60      pos || PROBE_TIMEOUT=60
+knob_num WORKER_SUPPLY_STALE_SLACK_S     "$STALE_SLACK_S"      300     any || STALE_SLACK_S=300
+knob_num WORKER_SUPPLY_LOCK_MAX_S        "$LOCK_MAX_S"         900     pos || LOCK_MAX_S=900
+knob_num WORKER_SUPPLY_LOG_MAX_BYTES     "$LOG_MAX_BYTES"      262144  pos || LOG_MAX_BYTES=262144
 case "$PREFIX" in
   ''|*[[:space:]]*)
     say "knob: WORKER_SUPPLY_PREFIX='$PREFIX' is empty or contains whitespace — using 'prd-' (the order glob would match nothing, and an empty queue reads as a clean pass)"
@@ -499,10 +517,16 @@ pass() {
     # unanswerable read is UNKNOWN — never a licence to spawn blind.
     hold="$(worktree_holder "$name" "$wt")"
     if [ -n "$hold" ]; then
-      dead=$(( dead - 1 ))
       case "${hold%%:*}" in
-        live)    live=$(( live + 1 ))
+        live)    dead=$(( dead - 1 ))
+                 live=$(( live + 1 ))
                  say "$name: not re-offered — another order holds its worktree $wt and is RUNNING (${hold#*:}); a second worker there would destroy the live one's log/.rc/.pid" ;;
+        # ⛔ A HOLDER WE COULD NOT READ IS *NOT* A HELD SLOT (review #2896 round 3). The old arm
+        # decremented `dead` here too, so the one order the pass could not decide about VANISHED from
+        # the census — `live=0 dead=0 unknown=2` then reached the verdict's `else`, printed `clean` and
+        # returned rc=0 over a pool with a dead order in it. The order stays dead (nothing was
+        # established about it) and the unknown is counted beside it; the pass is then DEFERRED, which
+        # is what "there is still a dead order" means.
         *)       unknown=$(( unknown + 1 ))
                  say "$name: not re-offered — another order holds its worktree $wt and its liveness could not be read (${hold#*:}); spawning blind would risk a live worker" ;;
       esac
@@ -566,6 +590,15 @@ pass() {
     why="$refilled of $n_dead_total re-offered; $dead still dead${held}"
   elif [ "$refilled" -gt 0 ]; then
     decision=refilled; why="$refilled of $n_dead_total dead order(s) re-offered"
+  elif [ "$live" -eq 0 ] && [ "$unknown" -gt 0 ]; then
+    # ⛔ A PASS THAT SUPPLIED NOTHING BECAUSE IT COULD NOT READ THE POOL IS NOT A CLEAN PASS (review
+    # #2896 round 3). Every UNKNOWN path used to fall through to the `clean` arm below, so a pass whose
+    # every `--status` was unreadable printed `pass: clean — live=0/7 unknown=2` and exited 0 — the
+    # doctor's own `capacity … inflight=0` health theatre, and a direct contradiction of this file's
+    # exit code 2 ("a read a pass needs could not be taken"). `dead > 0` already wins above (a dead
+    # order is a fact even when another read failed); this arm is the remaining case: nothing supplied,
+    # nothing established dead, and at least one read we could not take.
+    decision=unreadable; why="no order could be supplied and $unknown read(s) could not be taken ($live/$cap live, $complete complete)"
   else
     decision=clean; why="no dead order to refill ($live/$cap live, $complete complete, $unknown unknown)"
   fi
@@ -589,6 +622,10 @@ pass() {
 
   case "$decision" in
     refused) return 3 ;;
+    # ⛔ REFUSING IS NOT RESERVED FOR AN INSTALL FAULT: a pass that could not READ the pool supplied
+    # nothing and knows it (see the verdict block). rc=2 already means exactly that in this file's
+    # vocabulary, so the /loop retries on the next interval and `systemctl status` is not silent.
+    unreadable) return 2 ;;
     # ⛔ DEFERRED IS NOT A CLEAN EXIT EVEN WHEN SOMETHING WAS REFILLED (see the verdict block): dead
     # orders remain, so the pass reports 6 and its record names the bound. `[ "$refilled" = 0 ] && 6 ||
     # 0` turned a bounded pass into rc=0 — the same defect class the verdict block was fixed for, one
