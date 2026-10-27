@@ -150,11 +150,12 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # ⚠️ What makes that survivable is the ECHO: the response carries the concrete version that
 # answered, and `jev_choice` returns it as `meta["model"]` — so a verdict that shifted for a
 # reason no diff explains is visible in the log (`model=jev-1.14.0` against bars measured on
-# 1.13) instead of being inferred later from behaviour. Every path that RECORDS the verdict logs
-# it — acted, the below-bar SKIP, no-action, the per-tick CAP, and "already sent recently" —
-# because a model-induced confidence drop shows up as a SKIP, and the below-bar SKIP and the
-# no-action path originally carried no model at all (review 2026-10-27). Re-derive the bars
-# FIRST when that shows up. Pinning a version again is a one-line change in EACH of the five copies the sweep
+# 1.13) instead of being inferred later from behaviour. Every path that records a JEV-DERIVED
+# verdict logs it — acted, the below-bar SKIP, no-action, and "already sent recently" — because a
+# model-induced confidence drop shows up as a SKIP, and the below-bar SKIP and the no-action path
+# originally carried no model at all (review 2026-10-27). The per-tick CAP logs it too, though it
+# records nothing; the structural idle path makes no Jev call, so it carries no model by design.
+# Re-derive the bars FIRST when a `model=` moves. Pinning a version again is a one-line change in EACH of the five copies the sweep
 # note above lists (these two tracked callers, the two deployed ~/.pi/agent/scripts copies, and
 # the deployed state/lane-verdict.py) — a partial re-pin is the same split-brain this round
 # fixed in the other direction.

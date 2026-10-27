@@ -682,8 +682,9 @@ def test_this_files_copy_of_the_endpoint_and_model_is_the_real_vendor():
     The MODEL is the vendor alias `jev-latest` by owner ruling (2026-10-27), so the bars in this
     file — calibrated on the lookalike host's `jev-1.13.0`, never re-measured against the
     vendor (tortoise#7864) — now score answers a model the vendor can move without a
-    diff on our side. That is the owner's call; what this leg pins is that every COPY of the
-    constant agrees, and `test_turn_classify_state.py` pins the echo that makes a move visible."""
+    diff on our side. That is the owner's call; what this leg pins is THIS file's copy — every
+    copy carries its own leg, per the paragraph above, and a green run here says nothing about
+    `turn-classify.py` — and `test_turn_classify_state.py` pins the echo that makes a move visible."""
     assert ao.JEV_URL == "https://api.typesafe.ai/v1/systemone", ao.JEV_URL
     assert ao.JEV_MODEL == "jev-latest", ao.JEV_MODEL
 
