@@ -194,13 +194,23 @@ A **disk-full** cell behaves exactly like a dead one: the control agent cannot w
 while the provider insists `running`. Measured 2026-10-19: cell-3 sat at 29.9/32 GB, CPU 77%, exec failing for an hour,
 having submitted nothing for 141–226 minutes.
 
-Recovery ladder, cheapest first. **Establish a channel before anything else.** Steps 1-2 need the terminal channel: run
-`cmux vm terminal read <vm> <terminal-id>` once and see whether it answers. If it refuses, steps 1-2 cannot run **at all**,
-whatever the cause — and the channel that still answers is `cmux vm exec <vm> -- <cmd>`, which needs no `cmux-tui` daemon.
-Two things that are *not* a channel verdict: `cmux vm tree` printing `(no terminals)` (create one with
-`cmux surface new-terminal --machine <vm> --no-open -- <cmd>`) and a usage error from omitting the id. And if the volume that
-is full is the **`cmux-tui` state volume** described under step 5, skip to that owner-level action — none of the reclaim steps
-below touch it.
+Recovery ladder, cheapest first. **Establish a channel before anything else** — and read it carefully, because three readings
+that look like channel verdicts are not:
+
+- **A real refusal kills steps 1-2 outright**, whatever its cause. The channel that then answers is
+  `cmux vm exec <vm> -- <cmd>` (it needs no `cmux-tui` daemon) — **unless `/` is full**, which breaks `exec` too, since the
+  control agent cannot write its socket (that is the disk-full symptom above). With both channels gone there is no in-guest
+  lever left: the remaining ones are provider-level (step 3) and owner-level (a plan change or a recreate), and reclaim has to
+  wait for a channel.
+- **`cmux vm tree` printing `(no terminals)` is not a reading of the box** when the same render shows a link error or a null
+  workspace list — cell-4 today reports `link_error: connection refused` and `remote_workspaces: null` while its own registry
+  holds **945** terminals. `null` means *unknown*, not *zero*: retry with `--refresh`, then fall back to `exec`. Only a
+  **connected** link that genuinely enumerates zero terminals justifies creating one
+  (`cmux surface new-terminal --machine <vm> --no-open -- <cmd>`).
+- **A usage error from omitting the id is not a channel verdict** either.
+
+And if the volume that is full is the **`cmux-tui` state volume** described under step 5, skip to that owner-level action —
+none of the reclaim steps below touch it.
 
 1. `cmux vm terminal read <vm> <terminal-id>` — get terminal ids from `cmux vm tree <vm>`. The screen tells you the truth.
 2. `cmux vm terminal send <vm> <term-id> '<command>' --keys enter` — runs a command when `exec` cannot. The **send** verb
@@ -336,7 +346,7 @@ dispatch time, because both move.
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, but **needs activation (§1)** before it can land |
-| `pi-cell-3` | product work | 8 GB RAM / 128 GB — the real constraint is memory (its `dmesg` has OOM kills in it); re-read both at dispatch |
+| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — half the cores of the other two, so its in-box lane ceiling is half (§7). The real constraint is memory (its `dmesg` has OOM kills in it); re-read at dispatch |
 | `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
