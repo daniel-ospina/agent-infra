@@ -259,6 +259,10 @@ def test_key_falls_back_to_the_config_store(monkeypatch, tmp_path):
     cfg.parent.mkdir(parents=True)
     cfg.write_text(json.dumps({"apiKey": "from-the-store", "model": "jev-latest"}))
     assert tc.jev_key() == "from-the-store"
+    # ⛔ the STORE is stripped too: `echo "$KEY" > jev-config.json` leaves a trailing newline,
+    # and the unpadded value above passes with or without the strip -- this one does not.
+    cfg.write_text(json.dumps({"apiKey": "from-the-store\n"}))
+    assert tc.jev_key() == "from-the-store"
 
 
 def test_call_shape_and_meta_carry_tokens_not_an_invented_cost(monkeypatch, tmp_path):

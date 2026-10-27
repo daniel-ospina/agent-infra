@@ -777,6 +777,12 @@ def test_key_falls_back_to_the_0600_store(monkeypatch, tmp_path):
     cfg.parent.mkdir(parents=True)
     cfg.write_text(json.dumps({"apiKey": "from-the-store", "model": "jev-1.13.0"}))
     assert ao._key() == "from-the-store"
+    # ⛔ THE STORE IS STRIPPED TOO, and this is what pins it. `echo "$KEY" > jev-config.json`
+    # leaves a trailing newline; `Bearer <key>\n` is the same 401 as a whitespace-only env var.
+    # The value above has no padding, so the assertion above passes with OR without the strip --
+    # it is this one that fails if the store branch stops stripping.
+    cfg.write_text(json.dumps({"apiKey": "from-the-store\n"}))
+    assert ao._key() == "from-the-store"
     # ⛔ WHITESPACE IS NOT A KEY. `if k:` is truthy for "   ", so a space-valued env var used to
     # beat the populated store above and go out as `Bearer ` — a 401 whose cause looks like a set
     # key. The loader must fall THROUGH to the store, and strip what it does return.
