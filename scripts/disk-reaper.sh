@@ -1622,7 +1622,7 @@ reap_worktree() {
     # (`not-run`), or it ran and its delegate printed no SUMMARY (`?`). Both are recorded, neither is
     # reported as 0 — a `classified=0` beside `verdict=not-run` is a self-contradicting record, and it
     # is exactly the shape that reads as "healthy, nothing to do" on a pass that produced no answer.
-    local have_tally=0 REASON_ROWS="" wt_repos=0 wt_tally_repos=0 wt_reasons_repos=0 sum_deferred_remove=0
+    local have_tally=0 REASON_ROWS="" wt_repos=0 wt_tally_repos=0 wt_reasons_repos=0 reasons_none_repos=0 sum_deferred_remove=0
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree arm=registered FAIL-CLOSED — pi-reap-worktrees.sh not found (the abandoned arm still runs: it needs no repo)"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
@@ -1666,6 +1666,14 @@ reap_worktree() {
             # below, because an ABSENT field and a real `reasons=none` both leave the histogram empty —
             # and only the latter is an answer. See the `none` normalisation at the end of this arm.
             [ -n "$f_reasons" ] && wt_reasons_repos=$((wt_reasons_repos + 1))
+            # ⛔ AND DID IT SAY `none`, OR DID WE MERELY SEE A FIELD? `wt_reasons_repos` above counts a
+            # PRESENT field; only `reasons=none` is an ANSWER. The two differ on a malformed histogram
+            # (`reasons=too-recent:x`, or a future reason spelling whose count is not a number): the
+            # merge loop drops every row, so the histogram is EMPTY, and normalising that empty to
+            # `none` published `preserved=4 reasons=none` — "four kept, and none of them for any
+            # reason" — the exact self-contradiction the `none` rule below exists to forbid. Counted
+            # here, required below, so an unparseable histogram ends as `?`, never as `none`.
+            [ "$f_reasons" = "none" ] && reasons_none_repos=$((reasons_none_repos + 1))
             # ⛔ ANSWERED ONLY IF THE CORE COUNTERS ALL PARSE. `have_tally=1` was set on the mere
             # PRESENCE of a SUMMARY, so a truncated line (a delegate dying mid-write) left the sums at 0
             # and the coverage at `1/1` — `classified=0` reported as a measured zero under full coverage.
@@ -1803,6 +1811,13 @@ reap_worktree() {
     if [ "$have_tally" = 1 ] && ! { [ "$wt_repos" -gt 0 ] && [ "$wt_tally_repos" = "$wt_repos" ]; }; then
         have_tally=0
     fi
+    # ⛔ THE PROOF MODES ARE CLASS TOTALS TOO, and they are accumulated exactly like the counters above
+    # (`proof`/`prm` are `mixed` when the answering repos disagree). Printed from the RAW variables, the
+    # class line published `main_proof=local pr_merged=na` for the partial pass above while the RECORD
+    # — which routes them through `_tally_rec`/`HAVE_WT_TALLY` — printed `main_proof=?`: two surfaces of
+    # ONE pass contradicting each other, which is the defect this arm exists to remove, on the fields
+    # that answer "how was the merge proved". Decided ONCE here so both surfaces read the same value.
+    [ "$have_tally" = 1 ] || { proof="?"; prm="?"; }
     # Fold `reason count` rows into one histogram, descending by count — the delegate's own shape.
     sum_reasons="$(printf '%s\n' "$REASON_ROWS" | awk 'NF==2 { c[$1] += $2 }
         END { for (k in c) printf "%d\t%s\n", c[k], k }' | sort -rn -k1,1 \
@@ -1816,7 +1831,7 @@ reap_worktree() {
     # `none` when the delegate SAID `none`, and `?` when the field was never reached — the likeliest truncation, since `reasons=`/`main_proof=`/`pr_merged=`
     # are the TAIL fields. Without this a line cut after `failed=0` printed `preserved_worktree=2`
     # beside `preserved_reasons_worktree=none`: "two checkouts kept, and none of them for any reason".
-    [ "$have_tally" = 1 ] && [ "$wt_reasons_repos" = "$wt_tally_repos" ] && [ -z "$sum_reasons" ] && sum_reasons="none"
+    [ "$have_tally" = 1 ] && [ "$wt_reasons_repos" = "$wt_tally_repos" ] && [ "$reasons_none_repos" = "$wt_tally_repos" ] && [ -z "$sum_reasons" ] && sum_reasons="none"
     # ⛔ The histogram is a class TOTAL like the counters above, so a PARTIAL class must not publish it
     # either: `reasons=too-recent:4` beside `classified=?` reads as a reason breakdown for a count that
     # was never measured. Placed AFTER the `none` normalisation (which already requires `have_tally=1`)
@@ -1943,7 +1958,7 @@ reap_worktree() {
 # entry point adds nothing to that: it accounts, per root, with a `df` delta.
 reap_dup() {
     local roots root b a d out rc freed=0 raw=0 MEASURED=1 rows="" cands="" all_c=0 line path size why _dn reaped=0 _r _root_rem
-    local _dup_cand=0 _dup_ans=0 _dup_sum_line="" _dup_c="" _dup_census=""
+    local _dup_cand=0 _dup_ans=0 _dup_roots=0 _dup_sum_line="" _dup_c="" _dup_census=""
     local sweep_end swept
     if [ -z "$DUP_INSTALL_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=duplicate-install FAIL-CLOSED — reap-duplicate-installs.sh not found (looked at \$DUP_INSTALL_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
@@ -1953,6 +1968,14 @@ reap_dup() {
     fi
     roots="$(tb_timeout 60 bash "$DUP_INSTALL_REAPER_PATH" --print-config 2>/dev/null | sed -n 's/^roots=//p' | head -1)"
     [ -n "$roots" ] || roots="${REAP_DI_ROOTS:-/tmp}"
+    # ⛔ HOW MANY ROOTS THIS PASS WILL ACTUALLY VISIT, so a partial answer is detectable. `_dup_ans`
+    # counts the roots that answered; the published count is the SUM over them, so `_dup_ans > 0` is
+    # "ANY root answered" — the same half-answered-class defect this PR removes from the worktree and
+    # venv arms, left in the third class. With `roots=A:B`, A `census=ok candidates=3` and B unreadable,
+    # the record published `candidates_duplicate_install=3` as the class's count with NO field anywhere
+    # disclosing that B answered nothing. Counted with the loop's OWN filter (`[ -n "$root" ]` skips an
+    # empty entry), so this is the number of visits, not the number of colon-separated tokens.
+    _dup_roots="$(printf '%s\n' "$roots" | tr ':' '\n' | awk 'NF { n++ } END { print n + 0 }')"
     while IFS= read -r root; do
         [ -n "$root" ] || continue
         b="$(free_kb_for_path "$root")"
@@ -2018,7 +2041,11 @@ reap_dup() {
     if is_dry; then FREED_DUP=0; else FREED_DUP="$freed"; fi
     # The DRY count comes from our own sweep below (every `remove` row is a candidate we scanned); an
     # ARMED pass has no rows, so it answers from the owner's SUMMARY tally lifted above.
-    if ! is_dry && [ "$_dup_ans" -gt 0 ]; then CAND_DUP="$_dup_cand"; HAVE_DUP_CAND=1; fi
+    # A FULLY-ANSWERED CLASS IS WHAT MAKES THE SUM AN ANSWER: `_dup_ans = _dup_roots` is the same rule
+    # the worktree arm applies with `wt_tally_repos = wt_repos`. Short of it the count is `?`, and the
+    # class line carries `tally=` so the operator can see WHY (a bare `?` names no cause).
+    DUP_TALLY_COVER="${_dup_ans}/${_dup_roots}"
+    if ! is_dry && [ "$_dup_ans" -gt 0 ] && [ "$_dup_ans" = "$_dup_roots" ]; then CAND_DUP="$_dup_cand"; HAVE_DUP_CAND=1; fi
     if is_dry; then
         sweep_end=$(( $(now) + DU_BUDGET )); swept=0
         while IFS= read -r line; do
@@ -2050,14 +2077,14 @@ reap_dup() {
         # `verdict_duplicate_install=fail-closed` — while its two siblings recorded `?` for the same
         # shape. Evidence is a `remove` row we scanned, or the owner's own `census=ok` tally.
         CAND_DUP="$all_c"
-        { [ "$all_c" -gt 0 ] || [ "$_dup_ans" -gt 0 ]; } && HAVE_DUP_CAND=1
+        { [ "$all_c" -gt 0 ] || { [ "$_dup_ans" -gt 0 ] && [ "$_dup_ans" = "$_dup_roots" ]; }; } && HAVE_DUP_CAND=1
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=dry-run candidates=$(_tally_num "$HAVE_DUP_CAND" "$CAND_DUP") would_free_du=${WOULD_DUP}MB (du estimate) freed_df=0MB"
+        say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=dry-run candidates=$(_tally_num "$HAVE_DUP_CAND" "$CAND_DUP") would_free_du=${WOULD_DUP}MB (du estimate) freed_df=0MB tally=${DUP_TALLY_COVER}"
     else
         if [ "${DF_DUP_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=apply freed_df=${FREED_DUP}MB df_raw=${RAW_DUP}MB (df delta)"
+            say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=apply freed_df=${FREED_DUP}MB df_raw=${RAW_DUP}MB (df delta) tally=${DUP_TALLY_COVER}"
         else
-            say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
+            say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) tally=${DUP_TALLY_COVER}"
         fi
     fi
     return 0

@@ -2409,6 +2409,42 @@ chmod +x "$T/t59-wt-full.sh"
 STF="$(WORKTREE_REAPER="$T/t59-wt-full.sh" run_reaper --apply --repo "$REPO_PA" --repo "$REPO_PB" --only worktree >/dev/null 2>&1; cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
 assert_contains "$STF" "tally_worktree=2/2" "T59 control: full coverage is disclosed as 2/2"
 assert_contains "$STF" "classified_worktree=4" "T59 control: with every repo answered the class sum IS published"
+# ⛔ THE PROOF MODES FOLLOW THE SAME COVERAGE RULE. `proof`/`prm` are accumulated over the answering
+# repos exactly like the counters, but the class LINE printed the raw variables while the RECORD routes
+# them through `HAVE_WT_TALLY` — so on the partial pass above the line published `main_proof=local
+# pr_merged=na` (one repo's proof mode) while the record said `main_proof=?`: two surfaces of ONE pass
+# contradicting each other, on the field that answers "how was this merge proved". Decided once, at
+# the coverage test, so both read one value. Paired with the control below (full coverage DOES publish
+# it), so neither assertion can be satisfied by an arm that always says `?`.
+assert_contains "$(grep -F 'class=worktree' <<<"$OUT" | grep -F 'mode=apply')" "main_proof=?" "T59 the PARTIAL class LINE does not publish one repo's proof mode"
+assert_absent   "$(grep -F 'class=worktree' <<<"$OUT" | grep -F 'mode=apply')" "main_proof=local" "T59 ... never a proof mode only one of the two repos used"
+assert_contains "$ST"  "main_proof=?" "T59 ... and the RECORD agrees with the line (both '?')"
+assert_contains "$ST"  "pr_merged=?" "T59 ... pr_merged too"
+assert_contains "$STF" "main_proof=local" "T59 control: full coverage DOES publish the measured proof mode"
+# (b1c) ⛔ AN UNPARSEABLE HISTOGRAM IS NOT `none`. The `none` normalisation ran on "the `reasons=` field
+# was PRESENT" plus "the folded histogram is empty" — but an empty histogram is also what an
+# UNPARSEABLE one folds to (`reasons=too-recent:x`: the reason NAME is a word, the COUNT must be a
+# number, so the row is dropped). A farmed or version-skewed delegate therefore produced
+# `preserved=4 preserved_reasons=none` — "four checkout(s) kept, and none of them for any reason",
+# verbatim the record the normalisation exists to forbid — with no way to tell it from a genuinely
+# reason-less pass. Only a repo that SAID `none` answers; anything else ends as `?`.
+REPO_PC="$(mk_repo d59-badreasons)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=4 classified=4 remove=0 preserved=4 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:x main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t59-wt-badreasons.sh"
+chmod +x "$T/t59-wt-badreasons.sh"
+STB="$(WORKTREE_REAPER="$T/t59-wt-badreasons.sh" run_reaper --apply --repo "$REPO_PC" --only worktree >/dev/null 2>&1; cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$STB" "preserved_worktree=4" "T59 an UNPARSEABLE histogram still publishes the count it did measure"
+assert_contains "$STB" "preserved_reasons_worktree=?" "T59 ... and says ? for the histogram it could not parse"
+assert_absent   "$STB" "preserved_reasons_worktree=none" "T59 ... never 'none', which reads as four checkouts kept for no reason at all"
+# ...and the control: a repo that really SAID `none`, on full coverage, still normalises to `none` —
+# without it the assertion above is satisfied by deleting the normalisation outright.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=4 classified=4 remove=0 preserved=4 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=none main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t59-wt-none.sh"
+chmod +x "$T/t59-wt-none.sh"
+STN="$(WORKTREE_REAPER="$T/t59-wt-none.sh" run_reaper --apply --repo "$REPO_PC" --only worktree >/dev/null 2>&1; cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$STN" "preserved_reasons_worktree=none" "T59 control: an ANSWERED reasons=none is still \`none\`, not \`?\`"
 # (b2) THE SIBLING CLASS HAS THE SAME CONTRACT. `reap-lane-venvs.sh` prints one tally line per repo
 # too, and the lift used to read only the FIRST — so on a two-repo cell `classified_venv` reported one
 # repo's number beside the other repo's venvs (and a clean first repo restored the structural 0 the
@@ -2537,7 +2573,7 @@ assert_eq "$RC" "3" "T55 --print-status still answers 3 for a fail-closed pass"
 assert_contains "$OUT" "skipped_worktree=$REPO_BAD[gh-not-authenticated(rc=4)]" \
     "T55 --print-status carries the skipped repo and its reason"
 assert_absent "$ST_T55" "cannot run: " \
-    "T55 the class RAN, so it is never reported as `cannot run` (that field means could-not-be-set-up)"
+    "T55 the class RAN, so it is never reported as \`cannot run\` (that field means could-not-be-set-up)"
 # and the reason survives a repo path that CONTAINS A SPACE: the skip line carries the path, so a
 # parser anchored on `skipped=<first token>` would silently anonymise exactly the repos most likely to
 # live under a hand-made directory — turning a named skip back into the class-wide verdict.
@@ -2940,6 +2976,38 @@ assert_contains "$ST60" "candidates_duplicate_install=?" \
 assert_absent "$ST60" "candidates_duplicate_install=0" "T60 ... the placeholder count never reaches the record"
 assert_contains "$(grep -F 'class=duplicate-install rc=3 verdict=fail-closed mode=dry-run' <<<"$OUT")" "candidates=?" \
     "T60 ... and the class LINE says ? too"
+# ⛔ A HALF-ANSWERED CLASS IS NOT AN ANSWER — THE THIRD CLASS, AND THE ONE THIS PR GAVE THE SUMMING TO.
+# `reap_dup` walks `roots=` and SUMS `candidates=` over the roots that answered (`census=ok`), but the
+# guard was `_dup_ans > 0` — ANY root answered — with no coverage field anywhere: `roots=A:B`, A
+# answering `candidates=3` and B's census unreadable, published `candidates_duplicate_install=3` as the
+# class's count while B had produced NO ANSWER AT ALL. The worktree arm gates on
+# `wt_tally_repos = wt_repos` and the venv arm on `have_venv_tally`; the third class now applies the
+# same rule, and its class line carries `tally=<answered>/<roots>` so a bare `?` names its cause.
+mkdir -p "$T/t60/dup-ra" "$T/t60/dup-rb"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "roots='"$T"'/t60/dup-ra:'"$T"'/t60/dup-rb"; exit 0 ;; esac' \
+    'for a in "$@"; do case "$a" in */dup-ra) echo "SUMMARY class=duplicate-install mode=apply families=1 candidates=3 reaped=1 kept=2 failed=0 census=ok rows=1 pids=0 aged=60m"; exit 0 ;; esac; done' \
+    'echo "SUMMARY class=duplicate-install mode=apply families=0 candidates=0 reaped=0 kept=0 failed=0 census=unreadable"' \
+    'exit 0' >"$T/t60-dup-partial.sh"
+chmod +x "$T/t60-dup-partial.sh"
+OUT="$(DUP_INSTALL_REAPER="$T/t60-dup-partial.sh" run_reaper --apply --only duplicate-install 2>&1)"
+STP="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$STP" "candidates_duplicate_install=?" "T60 one answering root of two does NOT publish its sum as the class count"
+assert_absent   "$STP" "candidates_duplicate_install=3" "T60 ... never the partial sum, which is a lower bound the record would call measured"
+assert_contains "$(grep -F 'class=duplicate-install' <<<"$OUT")" "tally=1/2" \
+    "T60 ... and the class LINE discloses the coverage that made the count unanswerable"
+# ...and the full-coverage control: the SAME stub with BOTH roots answering publishes the sum. Without
+# it the assertion above passes on an arm that can never publish a duplicate-install count at all.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "roots='"$T"'/t60/dup-ra:'"$T"'/t60/dup-rb"; exit 0 ;; esac' \
+    'echo "SUMMARY class=duplicate-install mode=apply families=1 candidates=3 reaped=1 kept=2 failed=0 census=ok rows=1 pids=0 aged=60m"' \
+    'exit 0' >"$T/t60-dup-full2.sh"
+chmod +x "$T/t60-dup-full2.sh"
+OUTF="$(DUP_INSTALL_REAPER="$T/t60-dup-full2.sh" run_reaper --apply --only duplicate-install 2>&1)"
+STPF="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$STPF" "candidates_duplicate_install=6" \
+    "T60 control: with BOTH roots answering the class SUM is published (2 x 3)"
+assert_contains "$(grep -F 'class=duplicate-install' <<<"$OUTF")" "tally=2/2" "T60 control: full coverage is disclosed as 2/2"
 # ⛔ A HALF-ANSWERED TALLY IS NOT AN ANSWER, and the venv arm let one suppress its own fallback.
 # `have_venv_tally` was set on `venvs_found=` ALONE while `reapable=` — the field the candidate count
 # actually comes from — was parsed opportunistically. So a line TRUNCATED after `venvs_found=` (a

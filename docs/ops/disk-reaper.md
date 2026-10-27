@@ -226,6 +226,15 @@ costs **work** — a runner killed mid-job is a lost job and the run goes unserv
 mid-`packaging-smoke` on ENOSPC). Every uncertain case therefore takes the keep arm, and every keep is
 named with its reason.
 
+⛔ **The candidate count obeys the same coverage rule as every other class total.** `reap_dup` walks
+`roots=` and SUMS the delegate's own `candidates=` over the roots whose `SUMMARY` carried
+`census=ok`; the record publishes that sum only when EVERY visited root answered. One answering root
+of two is a lower bound, not a measurement, so the record reads `candidates_duplicate_install=?` and
+the class line carries `tally=<answered>/<visited>` — without which the `?` would name no cause and
+the partial sum would be indistinguishable from a fully-measured one (the same defect the worktree
+arm's `tally_worktree=` and the venv arm's `tally_venv=` exist to remove). A `census=ok` root still
+has to publish a numeric `candidates=`; anything else is not an answer from that root.
+
 Both owners need no `--repo`: they run on a cell whose repo list is empty, which is the #2443 failure
 mode (the repo-scoped classes fail closed there while the disk keeps filling).
 
@@ -578,7 +587,13 @@ printed in `main_ref=`, so a guessed default is visible; `local` = the local ref
 `auto` claimed no evidence, `unavailable`/`ambiguous`/`auto-unfetched` = no evidence claimed), and
 `pr_merged=` says whether the pass's batched
 `gh pr list` read was answerable at all (`ok` / `na` no GitHub origin / `unavailable`; the
-record reports `mixed` when two repos in one pass disagree). ⛔ **Every one of these fields
+record reports `mixed` when two repos in one pass disagree). ⛔ **`main_proof=` and `pr_merged=`
+obey the SAME coverage rule as the counters**, because they are accumulated the same way (over the
+repos that answered, with `mixed` as the disagreement sentinel): on a pass where only SOME of the
+scanned repos produced a `SUMMARY`, all of them read `?` — including on the class line, which used
+to print the raw last-answering value while the record printed `?`, so one pass published two
+contradictory answers about how its merges were proved. The class line carries `tally=<answered>/<scanned>`,
+which is what makes a `?` here diagnosable rather than mysterious. ⛔ **Every one of these fields
 reads `?` — never `0` — when the class was SELECTED but produced no measurement**, and `not-run`
 when the class was **not selected at all**. "Selected, no measurement" covers both a delegate that
 ran without printing a tally and a class that could not be SET UP (a missing delegate, no repo to
@@ -742,7 +757,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
 (it did once, on this box, before the scoping was added).
-`scripts/disk-reaper.test.sh` — 645 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 659 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
