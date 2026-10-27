@@ -1031,7 +1031,7 @@ if [ -s "$TMP/sum.sh" ] && grep -q 'PR path:' "$TMP/sum.sh"; then
     SEL_N=24; SWEEP_ROWS_PER_CYCLE=6; summarise "$_wled" 1 open-rows 12 )
   _wl="$(grep '^\[pr\] PR path' "$TMP/s.log" 2>/dev/null)"
   case "$_wl" in
-    *"examined 6 (window 11-16 of 24 (K=6/cycle, rotating))"*"18 deferred to later cycles"*)
+    *"examined 6 (window 11-16 of 24 (K=6/cycle, rotating))"*"18 deferred or scope-excluded this cycle"*)
       ok "a bounded sweep: the EXAMINED count and the deferred count are separate clauses (#2933)" ;;
     *) bad "the summary did not separate the examined sample from the deferred rows: $_wl" ;;
   esac

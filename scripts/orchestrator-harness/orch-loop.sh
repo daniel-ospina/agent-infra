@@ -5385,7 +5385,7 @@ while true; do
     if [ "${SWEEP_WINDOW_PR:-}" != "" ]; then
       _prwinwhat="${SWEEP_WIN_NOTE#window=}"
       [ -n "$_prwinwhat" ] || _prwinwhat="${SWEEP_ROWS_PER_CYCLE:-?} row(s)/cycle, rotating"
-      echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason; examined ${PRDISP_WIN_N} (window ${_prwinwhat}); ${PRDISP_DEFER_N} deferred to later cycles, so their reason is the deferral and not a refusal; examined reasons: ${PRDISP_WIN_REASONS:-(none recorded)}; spawned=${PRDISP_SPAWNS:-UNMEASURED} worker(s) this pass (see the [spawn] line)${_refsuf:-}" >>"$LOG"
+      echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason; examined ${PRDISP_WIN_N} (window ${_prwinwhat}); ${PRDISP_DEFER_N} deferred or scope-excluded this cycle (their reasons are not on this line); examined reasons: ${PRDISP_WIN_REASONS:-(none recorded)}; spawned=${PRDISP_SPAWNS:-UNMEASURED} worker(s) this pass (see the [spawn] line)${_refsuf:-}" >>"$LOG"
     else
       # NO WINDOW IS NOT "ZERO EXAMINED": nothing was selected to read at all (a deferral, a failed
       # listing, a cache-less 304), so the only honest population IS every row — and saying "examined
