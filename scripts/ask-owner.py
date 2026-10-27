@@ -702,8 +702,12 @@ def _key():
     """
     for var in ("TYPESAFE_API_KEY", "JEV_API_KEY"):
         k = os.environ.get(var)
-        if k:
-            return k
+        # ⛔ `.strip()` FIRST. `if k:` accepts a WHITESPACE-ONLY value, which then wins over the
+        # populated 0600 store and is sent as `Bearer ` — a 401 whose cause is an env var that
+        # looks set (`export TYPESAFE_API_KEY=" "`). An empty string is falsy and was already
+        # skipped; whitespace was not.
+        if k and k.strip():
+            return k.strip()
     try:
         p = os.path.expanduser("~/.pi/agent/jev-config.json")
         return json.load(open(p)).get("apiKey")

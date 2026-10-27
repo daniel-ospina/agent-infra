@@ -242,6 +242,13 @@ def test_key_precedence_typesafe_name_then_the_legacy_one(monkeypatch, tmp_path)
     assert tc.jev_key() == "legacy-name-key"
     monkeypatch.setenv("TYPESAFE_API_KEY", "vendor-name-key")
     assert tc.jev_key() == "vendor-name-key"
+    # ⛔ A WHITESPACE-ONLY value is truthy, so it used to win over the populated 0600 store and
+    # go out as `Bearer ` — a 401 whose cause looks like "the key is set". Empty was already
+    # skipped; whitespace was not. Falls THROUGH to the legacy name, and is stripped.
+    monkeypatch.setenv("TYPESAFE_API_KEY", "   ")
+    assert tc.jev_key() == "legacy-name-key"
+    monkeypatch.setenv("JEV_API_KEY", "  padded-key\n")
+    assert tc.jev_key() == "padded-key"
 
 
 def test_key_falls_back_to_the_config_store(monkeypatch, tmp_path):

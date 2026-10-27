@@ -731,8 +731,10 @@ def test_jev_sends_a_name_keyed_questions_map_with_instructions(monkeypatch):
         assert q.get("type") in ("noul", "choice", "score"), (name, q)
         assert isinstance(q.get("instructions"), str) and q["instructions"].strip(), (name, q)
     assert out and set(out["answers"]) == set(ao.QUESTIONS), out
-    # The real API reports tokens, not money — the print path must not fabricate a cost.
-    assert "cost_usd" not in (out.get("usage") or {})
+    # The real API reports tokens, not money. Assert the TOKEN shape is what the caller keeps —
+    # the earlier form (`"cost_usd" not in out["usage"]`) was a tautology: `out` is the fixture
+    # from `fake_urlopen`, built without that key, so it passed no matter what the real path did.
+    assert out.get("usage") == {"input_tokens": 100, "output_tokens": 10}, out.get("usage")
 
 
 def test_key_falls_back_to_the_0600_store(monkeypatch, tmp_path):
@@ -748,3 +750,10 @@ def test_key_falls_back_to_the_0600_store(monkeypatch, tmp_path):
     cfg.parent.mkdir(parents=True)
     cfg.write_text(json.dumps({"apiKey": "from-the-store", "model": "jev-1.13.0"}))
     assert ao._key() == "from-the-store"
+    # ⛔ WHITESPACE IS NOT A KEY. `if k:` is truthy for "   ", so a space-valued env var used to
+    # beat the populated store above and go out as `Bearer ` — a 401 whose cause looks like a set
+    # key. The loader must fall THROUGH to the store, and strip what it does return.
+    monkeypatch.setenv("TYPESAFE_API_KEY", "   ")
+    assert ao._key() == "from-the-store"
+    monkeypatch.setenv("JEV_API_KEY", "  padded-key\n")
+    assert ao._key() == "padded-key"

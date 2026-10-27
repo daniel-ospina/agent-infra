@@ -1321,7 +1321,7 @@ def jev_step5(rows, LV, enabled=True):
         # The key lives in the 0600 config file or the TYPESAFE_API_KEY / JEV_API_KEY
         # env names (lane-verdict.py's loader decides). Never printed, never logged.
         return {}, dict(meta, source="RULE", error="no TypeSafe key "
-                        "(env TYPESAFE_API_KEY / JEV_API_KEY, or state/jev-config.json)")
+                        "(env TYPESAFE_API_KEY / JEV_API_KEY, or ~/.pi/agent/jev-config.json)")
 
     base = dict(getattr(LV, "CRITERIA", None) or {})
     criteria = {}

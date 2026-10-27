@@ -319,8 +319,10 @@ def jev_key() -> str | None:
     only source, so the file fallback below is load-bearing, not a courtesy."""
     for var in ("TYPESAFE_API_KEY", "JEV_API_KEY"):
         k = os.environ.get(var)
-        if k:
-            return k
+        # ⛔ `.strip()` FIRST — a whitespace-only value is truthy, so `if k:` let it win over the
+        # populated store and send `Bearer ` (a 401 whose cause looks like a set env var).
+        if k and k.strip():
+            return k.strip()
     try:
         return json.load(open(f"{HOME}/.pi/agent/jev-config.json")).get("apiKey")
     except Exception:                                            # noqa: BLE001

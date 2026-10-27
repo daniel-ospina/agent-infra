@@ -8,7 +8,10 @@ produces those directions has to be pinned by a test rather than by a comment. T
 the two constants it posts with are pinned at the END of this file (their fail-closed arms — no key,
 HTTP error — are NOT yet pinned; that gap is agent-infra#2860).
 
-Run: /usr/bin/python3 scripts/test_lane_actions.py
+Run: /usr/bin/python3 scripts/test_lane_actions.py      (requires pytest — the module-level
+     `import pytest` and the `@pytest.mark.parametrize` leg below are the house convention, as in
+     the other scripts/test_*.py files; with pytest absent run `python3 -m pytest <this file>`
+     from an environment that has it, never a bare interpreter.)
 """
 import importlib.util
 import atexit
