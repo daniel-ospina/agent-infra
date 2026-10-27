@@ -2689,6 +2689,267 @@ def test_bash_shard_bold_rendering_matches_its_sibling_parser():
     )[0] == ["runner::test-discard-gate"]
 
 
+# ── THE RECAP SHAPE (#2700) — `❌ failing shard(s): <a>, <b>` ─────────────
+#
+# A second, independent spelling of the SAME failure set, measured on agent-infra run 40122825361
+# (PR #2534, job `bash-suites (6)`) and kept as `tests/fixtures/rail/bash-suites-shard-recap.txt`.
+# `ci_exemption.py ids` reads that EXCERPT as `ids=0` on `main` because the tail carries neither the
+# per-shard line nor the step-prefixed `##[error]bash shard failed:` annotation — the generic
+# `##[error]Process completed with exit code 1.` it DOES carry (its last line) is deliberately never
+# an identity. That is an artifact of the excerpt, not of the run: the run's own annotation
+# attributes this shard on `main` (guard-step pass, predates #2648), and #2648's per-shard
+# `bash-shard::` family — the base of this commit — is a second read of it. The recap arm is
+# therefore REDUNDANCY, as the module's `#: THE RUNNER'S RECAP LINE` note states.
+
+_RECAP_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "rail" / "bash-suites-shard-recap.txt"
+)
+
+
+def test_bash_shard_recap_fixture_yields_the_named_shard():
+    """THE MEASURED CAPTURE: the recap line alone must produce the shard's identity.
+
+    MUTATION: drop `_BASH_SHARD_RECAP_RE` (keep only the per-shard pattern) → `ids=[]` and
+    `ok is False` → RED, and admin-merge.sh is back to "yielded NO parseable failure identity"
+    for a log that names its shard in plain text.
+    """
+    parsed = parse_failed_ids(_RECAP_FIXTURE.read_text(), raw_log=True)
+
+    assert parsed.ids == [
+        "bash-shard::scripts/orchestrator-harness/refresh-spend.test.sh"
+    ]
+    assert parsed.bash_shard == parsed.ids
+    assert parsed.ok is True, "a capture that names its shard is not an unreadable one"
+    # …and the SIBLING door agrees about the id AND its signature, or §4.6's subset rule
+    # fails closed and the identity would BLOCK instead of compare.
+    signatures = parse_pr_failure_text(_RECAP_FIXTURE.read_text())
+    assert signatures.ids == parsed.ids
+    assert signatures.signatures[parsed.ids[0]] == frozenset(
+        {ci_exemption._BASH_SHARD_SIG}
+    )
+
+
+def test_bash_shard_recap_lists_every_failing_shard():
+    """"If several shards fail, all of them are identities" — not only the first.
+
+    MUTATION: take `group('names')` as one label → a single key encoding BOTH paths, which can
+    never match either shard on main; every multi-shard failure blocks forever.
+    """
+    ids, sigs = ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): scripts/orchestrator-harness/refresh-quota.test.sh, "
+        "scripts/orchestrator-harness/refresh-spend.test.sh"
+    )
+    assert ids == [
+        "bash-shard::scripts/orchestrator-harness/refresh-quota.test.sh",
+        "bash-shard::scripts/orchestrator-harness/refresh-spend.test.sh",
+    ]
+    assert all(sigs[i] == frozenset({ci_exemption._BASH_SHARD_SIG}) for i in ids)
+
+
+def test_bash_shard_recap_and_per_shard_line_are_one_identity():
+    """The two shapes name the SAME failure, so a capture carrying both yields ONE id each.
+
+    They are printed from the same accumulator (`shard_failed_list`) at different points of the
+    step, so both appear in an untruncated log. The cost of NOT collapsing them is a second
+    identity for one shard — and an identity main's baseline may carry under only one spelling,
+    which is a permanent false BLOCK (the id is absent from main, so it can never be exempted).
+    (It is not a `failures > runs` risk: `parse_failed_ids` returns `sorted(set(...))`, so one
+    run emits each id at most once, and two DISTINCT ids are two rows at 1/k.)
+    """
+    log = "\n".join([
+        "❌ failed shard: scripts/orchestrator-harness/refresh-spend.test.sh",
+        "❌ 1 bash shard(s) failed",
+        "❌ failing shard(s): scripts/orchestrator-harness/refresh-spend.test.sh",
+    ])
+    assert ci_exemption.bash_shard_failures(log)[0] == [
+        "bash-shard::scripts/orchestrator-harness/refresh-spend.test.sh"
+    ]
+    assert parse_failed_ids(log, raw_log=True).ids == [
+        "bash-shard::scripts/orchestrator-harness/refresh-spend.test.sh"
+    ]
+
+
+def test_bash_shard_recap_splits_on_comma_space_only():
+    """The separator is the emitter's `", "` — so a comma INSIDE a path survives as one id.
+
+    `_shard_token` percent-encodes a comma (`%2C`), which is what keeps the path injective. A
+    bare-`,` split would cut every comma-bearing path whether or not a space follows; pinning
+    this with a no-space comma is the only form that is unambiguous for both shapes.
+
+    DECLARED RESIDUAL (not pinned as desirable): a path containing `", "` IS ambiguous in the
+    recap and yields two phantom ids — a false block on that shard, never a fail-open — which is
+    documented at `_BASH_SHARD_RECAP_RE`. The per-shard line is separator-free and authoritative.
+
+    MUTATION: `.split(", ")` → `.split(",")` → this REDs.
+    """
+    ids, _ = ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): scripts/a,b.test.sh, scripts/c.test.sh"
+    )
+    assert ids == [
+        "bash-shard::scripts/a%2Cb.test.sh",
+        "bash-shard::scripts/c.test.sh",
+    ]
+
+
+def test_bash_shard_recap_pattern_requires_at_least_one_name():
+    r"""Pin the PATTERN, not only the resulting id set — the accumulator form must match NOTHING.
+
+    `❌ failing shard(s):` with an empty accumulator is NOT something this runner prints — the echo
+    is gated on a non-empty list (`run-bash-shards.sh`'s `[ -n "$shard_failed_list" ]`) — but a
+    partial capture or a future emitter could carry it. A pattern that accepts it turns "no
+    failing shard" into a candidate whose names list is empty; today the label filter drops it, but
+    a later refactor of that filter must not be able to mint an identity from an empty list.
+    Asserting the regex closes the gap the id-set assertion cannot see.
+
+    MUTATION: `(?P<names>\S.*?)` → `(?P<names>.*?)` → REDs here (and would RED the id-set
+    assertion only if the label filter were also removed).
+    """
+    assert ci_exemption._BASH_SHARD_RECAP_RE.match("❌ failing shard(s):") is None
+    assert ci_exemption._BASH_SHARD_RECAP_RE.match("❌ failing shard(s):   ") is None
+    assert ci_exemption.bash_shard_failures("❌ failing shard(s):") == ([], {})
+
+
+def test_a_label_that_encodes_to_nothing_is_not_an_identity():
+    """⛔ THE PRODUCED-BUT-REJECTED FAIL-OPEN (#2648 review, cycle 1).
+
+    `bash-shard::` (empty token) is admitted by NEITHER door. Emitting it would make the `ids`
+    door report an id — so the rail's per-run `examined > extracted` refusal does NOT fire —
+    while `parse_failure_rows` drops the row, leaving `decide` an EMPTY failure set and so a
+    `CLEAN blocked=0` verdict on a red PR. The emitter is checked for every label it can produce.
+
+    MUTATION: drop the `if not token: continue` (and let `_shard_token` strip `./` unguarded) →
+    the `ids` list becomes `['bash-shard::']`, which the ROW door rejects → RED.
+    """
+    for log in (
+        "❌ failing shard(s): ./",
+        "❌ FAILED SHARD: .//",
+        "❌ failing shard(s): ./ , ./.",
+        "❌ failing shard(s): ./, ./scripts/x.sh",
+    ):
+        ids, _ = ci_exemption.bash_shard_failures(log)
+        assert "bash-shard::" not in ids, ids
+        # THE PROPERTY THAT MATTERS: every id the producer emits is one the ROW door accepts,
+        # so `decide` cannot be handed an empty set by a rejected row.
+        for key in ids:
+            assert ci_exemption.is_failure_key_loose(key), key
+            assert parse_failure_rows(f"{key}\t1\t1\tbash-shard\n").rejected == [], key
+
+
+def test_shard_token_never_collides_a_relative_path_with_an_absolute_one():
+    r"""`.//x` (relative `x`) and `/x` (absolute) are DIFFERENT paths — one token would merge them.
+
+    The leading-`./` strip is lookahead-guarded so it cannot rewrite `.//x` into the absolute
+    form. A collision here is the #2648 injectivity class: one identity, two files, so a shard
+    that never ran could inherit another's baseline.
+
+    MUTATION: `^(?:\./)+(?=[^/])` → `^(?:\./)+` → the two tokens become equal → RED.
+    """
+    rel = ci_exemption._shard_token(".//scripts/x.test.sh")
+    absolute = ci_exemption._shard_token("/scripts/x.test.sh")
+    assert rel != absolute, f"relative {rel!r} collided with absolute {absolute!r}"
+
+
+def test_bash_shard_recap_is_normalised_to_the_repo_relative_path():
+    r"""`./scripts/x.sh` and `scripts/x.sh` are ONE shard, hence ONE identity.
+
+    Both spellings come from the same shell variable but from different capture sources; left
+    un-normalised the second can never match the baseline the first measured, which is a
+    permanent false block. It cannot merge two DIFFERENT files: they name the same path.
+
+    MUTATION: drop the `^(?:\./)+` strip in `_shard_token` → two ids → RED.
+    """
+    bare, _ = ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): scripts/x/y.test.sh"
+    )
+    dotted, _ = ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): ./scripts/x/y.test.sh"
+    )
+    assert bare == dotted == ["bash-shard::scripts/x/y.test.sh"]
+
+
+def test_bash_shard_recap_is_not_credited_with_a_count_or_prose():
+    """⛔ THE FALSE-ATTRIBUTION DIRECTION for the new shape.
+
+    A red slice prints several `❌` lines and only some name a shard: `❌ FAILED SHARD: <path>`
+    names ONE, the recap names EVERY failing shard at once, and `❌ N bash shard(s) failed` is a
+    COUNT while `❌ every failure above is a syntax-sweep failure…` and `❌ no shard is named,
+    and …` are prose. Keying on any of the latter would make a count or a sentence a failure
+    identity — an id that matches nothing on main, i.e. a permanent false block.
+
+    The bare `❌ failing shard(s):` (no names, the empty-accumulator form) must match NOTHING,
+    or a capture with no failing shard would mint an identity.
+    """
+    log = "\n".join([
+        "❌ 1 bash shard(s) failed",
+        "❌ failing shard(s):",
+        "❌ every failure above is a syntax-sweep failure, named at its own 'bash -n' line",
+        "❌ no shard is named, and 1 of the 1 failure(s) is/are NOT a syntax sweep — the",
+        "   naming arm is not wired for them. This is a defect in scripts/run-bash-shards.sh,",
+    ])
+    assert ci_exemption.bash_shard_failures(log) == ([], {})
+    assert parse_failed_ids(log, raw_log=True).bash_shard == []
+
+
+def test_the_runner_exit_annotation_alone_still_refuses():
+    """THE NEGATIVE CASE: no identity line still refuses — the new pass widens NOTHING.
+
+    `##[error]Process completed with exit code 1.` is the runner's own wrapper: it names no
+    failure, so it is never an identity (#4469). A capture carrying only it must yield an EMPTY
+    id set that READS as empty (`ok is False`) — the rail's step-1c `examined > extracted` gate
+    is what turns that into the refusal, and an empty-but-OK set would be the vacuous pass.
+
+    MUTATION: make the recap pattern optional / fall back to "unknown" for an unnamed failure
+    → `ids` gains a key and the refusal disappears → RED.
+    """
+    log = (
+        "bash-suites (6)\tBash shards — the ONE list both lanes run (#1369)\t"
+        "2026-10-24T19:22:55.0894601Z ##[error]Process completed with exit code 1.\n"
+    )
+    parsed = parse_failed_ids(log, raw_log=True)
+
+    assert parsed.ids == [], "the runner's exit annotation is NOT an identity"
+    assert parsed.bash_shard == []
+    assert parsed.ok is False, "an unreadable failure set must still read as such"
+    assert parse_failed_ids(log, raw_log=True).ok is False
+
+
+def test_bash_shard_recap_identity_is_compared_not_dropped():
+    """END TO END: a recap identity reaches the DECISION and is graded on main's evidence.
+
+    This is the whole point of the shape: a shard that ALSO fails on main at a measured rate is
+    EXEMPT (visible), and a shard main never failed still BLOCKS. The failure mode this pins is
+    the #6798/#2193 one — an id PRODUCED by a parser and REJECTED by the row/rate door, so
+    `decide` sees no failure and reports `CLEAN blocked=0` on a red PR.
+    """
+    key = ci_exemption.bash_shard_failures(_RECAP_FIXTURE.read_text())[0][0]
+    sig = ci_exemption._BASH_SHARD_SIG
+
+    # The producer's own wire row, through the door the rail actually reads it by.
+    rows = parse_failure_rows(f"{key}\t1\t1\t{sig}\n")
+    assert rows.rejected == [], "a produced id must not be rejected by the row door"
+    assert key in rows.failures
+
+    main_rates = parse_rates(f"{key}\t3\t8\n")
+    assert main_rates.rejected == []
+    assert main_rates.rates[key] == Rate(3, 8)
+
+    decision = decide(
+        rows.failures,
+        main_rates.rates,
+        main_signatures={key: frozenset({sig})},
+        k_pr=1,
+    )
+    assert not decision.any_blocked
+    assert decision.visible_exemptions(), "a shard exemption must be RECORDED, never silent"
+    assert key in decision.visible_exemptions()[0]
+
+    # …and the other direction: a shard main never failed is NOT exempt.
+    blocked = decide(
+        rows.failures, {}, main_signatures={}, k_pr=1
+    )
+    assert blocked.blocked and blocked.blocked[0].nodeid == key
+
+
 # ── THE ROW DOOR, DERIVED FROM THE PRODUCERS (#6798, raised in #2648 review) ─
 #
 # `_NON_NODEID_KEY_RE` is hand-enumerated, and that enumeration went stale TWICE in the
@@ -3315,3 +3576,49 @@ def test_9331_a_masked_token_closing_angle_is_not_a_bound_operator():
         ), f"a mask-closing '>' freed the measurement: {left!r} vs {right!r}"
     # …while a real operator is still a bound, and still raw.
     assert ci_exemption.normalize_signature("≤1.5s") != ci_exemption.normalize_signature("≤9.5s")
+
+
+def test_a_shard_label_is_never_DROPPED_even_when_it_looks_like_source():
+    """⛔ THE DIRECTION THAT MUST NEVER INVERT: this pass only ADDS identities (#2700, cycle 3 P1).
+
+    A filter dropping labels containing `$`/backtick/`<`/`>` was written and REVERTED: those are
+    legal POSIX filename characters, so the filter also dropped the per-shard arm's REAL identity
+    (`❌ FAILED SHARD: scripts/evil$a.sh` — attributed by the parent commit), and `sweep_file()`
+    reaches `shard_named_failure` without the listed-shard gate. With any other id present the run
+    still advances `extracted`, so `admin-merge.sh`'s `examined > extracted` refusal never fires
+    and `decide` then certifies a red PR with `blocked=[]` — the #6798/#2193 fail-open.
+
+    So a label that merely LOOKS unexpanded is an identity like any other: it encodes to a token
+    that cannot be in main's rate table, which BLOCKS (over-block, the safe direction). The
+    residual — a capture carrying this file's own source verbatim would block forever on
+    `bash-shard::%24shard_failed_list` — is declared in the module; the runner prints the expanded
+    value, and the per-shard arm has had the same property on `main`.
+
+    MUTATION: reintroduce any label filter over `labels` → the kept-identity assertions RED.
+    """
+    # The real-path case that the reverted filter broke, on BOTH shapes.
+    real = ["❌ FAILED SHARD: scripts/evil$a.sh", "❌ failing shard(s): scripts/evil$a.sh"]
+    for log in real:
+        assert ci_exemption.bash_shard_failures(log)[0] == [
+            "bash-shard::scripts/evil%24a.sh"
+        ], log
+        assert parse_failed_ids(log, raw_log=True).ok is True, log
+    # …and it survives both doors, so it reaches `decide` and BLOCKS instead of vanishing.
+    key = "bash-shard::scripts/evil%24a.sh"
+    assert ci_exemption.is_failure_key_loose(key)
+    assert ci_exemption.is_failure_key(key)
+    # Echoed-source / placeholder labels are ALSO kept — over-blocking is the safe direction — and
+    # they can never be exempted, because no rate row can carry them.
+    for log in (
+        "❌ failing shard(s): $shard_failed_list",
+        "❌ FAILED SHARD: <path>",
+        "❌ failing shard(s): $(pwd)/x.test.sh",
+        "❌ FAILED SHARD: `echo x`.test.sh",
+    ):
+        ids = ci_exemption.bash_shard_failures(log)[0]
+        assert len(ids) == 1 and ids[0].startswith("bash-shard::"), log
+        assert parse_failed_ids(log, raw_log=True).ok is True, log
+    # …and a normal multi-shard recap is unchanged.
+    assert ci_exemption.bash_shard_failures(
+        "❌ failing shard(s): scripts/x.test.sh, ./scripts/y.test.sh"
+    )[0] == ["bash-shard::scripts/x.test.sh", "bash-shard::scripts/y.test.sh"]

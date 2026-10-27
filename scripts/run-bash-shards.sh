@@ -231,7 +231,6 @@ shard_slowest=""
 #
 # It records only LISTED shards (`shard_is_listed`) — the same rule `shard_note` uses — so the
 # self-check sentinels below, which deliberately fail, cannot print a bogus name.
-shard_err_before=0
 
 # THE LIST, derived ONCE. The count, the target-containment check, the execution loop and the
 # slice-coverage comparison below all read this variable, so the four cannot disagree about what
@@ -298,14 +297,18 @@ trap 'rm -f "$shard_ran_log"' EXIT
 # for hours, `bash-suites` red on every PR head, and every lane re-derived those four from CI logs by
 # hand, over a 5-minute fix. The names were in the log all along; they were just not in the answer.
 #
-# ⛔ TWO READERS, TWO MECHANISMS — and the rail is served by the OTHER one. `run_shard` emits
+# ⛔ THREE READERS, AND THE RAIL NOW KNOWS ALL THREE (#2700). `run_shard` emits
 # `::error::bash shard failed: <path>`, a GitHub annotation, and `scripts/ci_exemption.py ids`
 # recognises it as a guard-step identity that CARRIES the shard path — measured on a log with two of
-# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. That is what
-# makes a red `bash-suites` step comparable to main's baseline PER SHARD, and it is NOT this block:
-# measured against the prose lines printed here, the same parser returns `ids=0` — they neither help
-# nor hurt it. Do not "fix" the rail here, and never delete the annotation while keeping these lines:
-# that would leave every lane unattributable again.
+# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. Since
+# #2648/#2700 the parser ALSO reads the two prose lines below as `bash-shard::<path>` family
+# identities: the per-shard `❌ FAILED SHARD: <path>` and the recap `❌ failing shard(s): <paths>`. The
+# earlier revision of this paragraph said "measured against the prose lines printed here, the same
+# parser returns `ids=0` — they neither help nor hurt it"; that was true before #2648 and is false
+# now, and a stale claim about the parser is exactly what a future lane reads before deciding whether
+# to touch the rail. **Do not "fix" the rail here, and never delete the annotation while keeping
+# these lines** — the annotation is the only one of the three that survives being taken out of the
+# step's own prose, and it is what keeps every lane attributable.
 #
 # Two prints, on purpose — and the REASON is the early exits: the recap below is reached only at the
 # END of a run, while this file has several `exit 1` paths ABOVE it (`shard target resolves outside
@@ -693,6 +696,15 @@ if [ "$shard_errors" -gt 0 ]; then
   # `could NOT be named` rather than blame a subsystem it never looked at.
   if [ -n "$shard_failed_list" ]; then
     echo "❌ failing shard(s): $shard_failed_list"
+    # ⛔ A PARTIAL RECAP IS A FALSE PASS (review cycle 2, P2). The list can name SOME of the counted
+    # failures, and "2 failed" beside one name reads as a COMPLETE recap to the rail, which then
+    # compares a 1-identity certificate and admits the un-named half — the incomplete-set direction
+    # this runner exists to close. Completeness is compared from what was COUNTED (`shard_errors`)
+    # against what was NAMED, never inferred from the list being non-empty.
+    recap_named=$(printf '%s' "$shard_failed_list" | awk -F', ' '{print NF}')
+    if [ "$recap_named" -lt "$shard_errors" ]; then
+      echo "❌ …and $((shard_errors - recap_named)) of the counted failure(s) could NOT be named — the naming arm did not run for them. This is a defect in scripts/run-bash-shards.sh, not in the failing file."
+    fi
     # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT. `shard_errors` counts BOTH failing shards and failing
     # syntax sweeps; the list above names them together. Printing "2 failed" beside one name reads as a
     # missing name — and the missing half is exactly what the recap exists to stop hunting for.
