@@ -685,6 +685,73 @@ def _(M):
         w.cleanup()
 
 
+@test("empty-body-is-a-read-error")
+def _(M):
+    """An EMPTY or TRUNCATED body is a FAILED READ — never "this surface is empty".
+
+    `gh` exits 0 with no body when a token/proxy layer eats the answer, and a body cut mid-object is a
+    truncated read. Both used to arrive as `[]` (the same `empty surface` reason a genuinely
+    check-free PR gets — a failed read dressed as "no checks configured") or as an uncaught
+    `JSONDecodeError` (a traceback and exit 1 instead of the documented exit 2 + named reason).
+    """
+    d = tempfile.mkdtemp(prefix="prstate-body-")
+    try:
+        gh = os.path.join(d, "gh")
+        body = os.path.join(d, "body")
+        with open(gh, "w") as f:
+            f.write('#!/usr/bin/env bash\ncat "$(dirname "$0")/body"\nexit 0\n')
+        os.chmod(gh, 0o755)
+        prev = os.environ.get("PR_STATE_GH")
+        os.environ["PR_STATE_GH"] = gh
+        try:
+            for content, why in (("", "an EMPTY body"),
+                                 ('{"total_count": 1, "check_runs": [{"id": 5', "a TRUNCATED body")):
+                with open(body, "w") as f:
+                    f.write(content)
+                try:
+                    got = M.gh_stream(["api", "repos/o/r/commits/abc/check-runs"])
+                except M.ReadError as e:
+                    assert "not JSON" in str(e) or "EMPTY" in str(e), e
+                else:
+                    raise AssertionError("%s was read as %r — a failed read must not look like an "
+                                         "empty surface" % (why, got))
+            # CONTROL: a readable page still returns its object (the arm is not "always raise").
+            with open(body, "w") as f:
+                f.write('{"total_count": 0, "check_runs": []}')
+            assert M.gh_stream(["api", "repos/o/r/commits/abc/check-runs"]) == [
+                {"total_count": 0, "check_runs": []}], "a readable page must still be read"
+        finally:
+            if prev is None:
+                os.environ.pop("PR_STATE_GH", None)
+            else:
+                os.environ["PR_STATE_GH"] = prev
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("suppress-unknown-queue")
+def _(M):
+    """`--suppress` over an unreadable queue cancels nothing and SAYS SO (exit 2) — never `cancelled=0`, exit 0."""
+    w = World()
+    try:
+        head = "1" * 40
+        w.prs([w.pr(7, head)])
+        w.checks(head, [("github-actions", "unit", "completed", "failure", 11, "900")])
+        w.workflows(head, {"900": "CI"})
+        os.remove(os.path.join(w.dir, "queued-1.json"))      # the inventory cannot be read
+        rc, out, err = w.cli("--repo", REPO, "--suppress")
+        assert rc == 2, (rc, out, err)
+        assert "NOTHING was cancelled" in err, err
+        assert w.cancelled_ids() == [], w.cancelled_ids()
+        # CONTROL: with a readable inventory the pass still runs and still exits 0.
+        w.queued([(head, 4242, "CI")])
+        rc, out, err = w.cli("--repo", REPO, "--suppress", "--dry-run")
+        assert rc == 0, (rc, out, err)
+        assert "suppress (dry-run): PR #7" in out, out
+    finally:
+        w.cleanup()
+
+
 @test("action-needs-only")
 def _(M):
     """`--action` without `--only` REFUSES: the row it would print is another PR's answer."""
@@ -977,6 +1044,18 @@ MUTATIONS = [
      '("%d" % len(with_q)) if queued_known else "?"',
      '("%d" % len(with_q))',
      "an unreadable inventory renders the PR count as a definite 0"),
+    ("empty-body-is-a-read-error",
+     '    if not (out or "").strip():\n        raise ReadError(',
+     '    if False:\n        raise ReadError(',
+     "an empty body is read as an empty surface (a failed read dressed as 'no checks configured')"),
+    ("empty-body-is-a-read-error",
+     '        except ValueError as e:',
+     '        except ZeroDivisionError as e:',
+     "a truncated body escapes as a JSONDecodeError traceback instead of a named ReadError"),
+    ("suppress-unknown-queue",
+     '    if rows and not all(r.get("queued_known", True) for r in rows):',
+     '    if False:',
+     "a suppression pass that could enumerate NOTHING reports success (cancelled=0, exit 0)"),
 ]
 
 

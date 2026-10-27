@@ -78,7 +78,15 @@ a real red from repair.
 are reported differently), and a queued-run inventory that could not be read renders the `Q` column
 as `?` with a header note, never `0` (its count is also `--suppress`'s `before=` figure). Only
 `--action` + `--only <pr>` produces a row: a bare `--action` would answer with whichever PR sorts
-first in the whole table.
+first in the whole table. An **empty or truncated API body is a failed read**, not an empty surface:
+`gh` exits 0 with no body when a token or a proxy eats the answer, and that used to arrive as `[]` —
+indistinguishable from "this PR has no checks", which is the one reading the NOREAD arm exists to
+prevent.
+
+⛔ **A suppression pass that could enumerate nothing is not a pass that found nothing.** If the
+queued-run inventory could not be read, no run id exists to cancel, so `--suppress` cancels nothing and
+**exits 2** with that reason — never `cancelled=0` and exit 0, which is a success signal for a pass
+that never ran.
 
 **Suppression.** A row in `REVIEW`, `REPAIR-CONFLICT` or `FIX-RED` has a head that is *about to
 change*, so `--suppress` cancels its **queued** runs before they are spent. A run is re-read

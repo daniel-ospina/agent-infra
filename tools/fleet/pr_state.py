@@ -409,15 +409,28 @@ def gh_json(args, timeout=60):
 
 
 def gh_stream(args, timeout=180):
-    """`gh api --paginate` emits ONE JSON OBJECT PER PAGE. Walk the stream, never just the first."""
+    """`gh api --paginate` emits ONE JSON OBJECT PER PAGE. Walk the stream, never just the first.
+
+    ⛔ AN EMPTY OR TRUNCATED BODY IS A FAILED READ, NOT AN EMPTY SURFACE. `gh` exits 0 with no body
+    when a token/proxy layer eats the answer, and a body cut mid-object is a truncated read — both
+    used to arrive as `[]` (indistinguishable from "this PR has no checks", the exact confusion the
+    NOREAD arm exists to prevent) or as an uncaught `JSONDecodeError` (a traceback and exit 1 instead
+    of the documented `exit 2` with a named reason). The guard lives HERE and not in `gh()` because
+    `cancel_run`'s `POST …/cancel` legitimately answers with an empty 202 body.
+    """
     out = gh(args, timeout=timeout)
+    if not (out or "").strip():
+        raise ReadError("%s returned an EMPTY body — a failed read, not an empty surface" % " ".join(args[:3]))
     dec, i, items = json.JSONDecoder(), 0, []
     while i < len(out):
         while i < len(out) and out[i] in " \n\r\t":
             i += 1
         if i >= len(out):
             break
-        obj, i = dec.raw_decode(out, i)
+        try:
+            obj, i = dec.raw_decode(out, i)
+        except ValueError as e:
+            raise ReadError("%s returned a body that is not JSON (%d bytes, %s)" % (" ".join(args[:3]), len(out), e))
         if isinstance(obj, list):
             items.extend(obj)
         elif isinstance(obj, dict) and isinstance(obj.get("items"), list):
@@ -690,7 +703,8 @@ def build_rows(repo, limit=100, only=None, threads=6):
         # ⛔ AN UNREADABLE QUEUE IS NOT AN EMPTY QUEUE. `None` (not `{}`) is what carries that
         # difference to the renderer, which prints `?` — a `0` here would be indistinguishable from
         # a genuinely empty queue and would silently understate the operator's only queue reading
-        # (and `--suppress`'s `before=` figure). It only disables suppression, which re-reads anyway.
+        # (and `--suppress`'s `before=` figure). It also disables suppression, which CANCELS NOTHING
+        # in that state — and says so with exit 2 rather than reporting an empty pass as success.
         queued_by_head = None
     cache = {}
     lock = threading.Lock()
@@ -748,7 +762,16 @@ def cancel_run(repo, run_id):
 
 
 def suppress(repo, rows, dry_run=False):
-    """Cancel queued runs for rows whose head is about to change. Returns (cancelled, skipped, error)."""
+    """Cancel queued runs for rows whose head is about to change. Returns (cancelled, skipped, error).
+
+    ⛔ A PASS THAT COULD NOT ENUMERATE ANYTHING IS NOT A PASS THAT FOUND NOTHING. With an unreadable
+    queued-run inventory every row's `queued_runs` is empty, so the loop below would cancel nothing,
+    report `cancelled=0` and exit 0 — a success signal for a pass that never ran, against this
+    module's own contract ("`--suppress` returns 2 when the cancel pass could not be completed").
+    """
+    if rows and not all(r.get("queued_known", True) for r in rows):
+        return [], [], ("the queued-run inventory could not be read, so no queued run could be "
+                        "enumerated and NOTHING was cancelled — re-run --suppress when the read succeeds")
     todo = [r for r in rows if r["action"] in SUPPRESS_ACTIONS]
     cancelled, skipped, error = [], [], None
     if not todo:
@@ -841,7 +864,8 @@ def render_table(rows, repo):
         ("%d" % len(with_q)) if queued_known else "?"))
     if not queued_known:
         out.append("# the queued-run inventory could not be read — Q is UNKNOWN on every row, not 0 "
-                   "(an unreadable queue is not an empty queue); suppression re-reads anyway")
+                   "(an unreadable queue is not an empty queue); no queued run can be enumerated, so "
+                   "a --suppress pass cancels nothing and says so (exit 2)")
     out.append("# actions: " + " ".join("%s=%d" % (k, hist[k]) for k in sorted(hist)))
     out.append("")
     out.append("\t".join(TABLE_COLS))
