@@ -163,13 +163,17 @@ FLEET_START_SETTLE_S="${FLEET_START_SETTLE_S:-3}"
 FLEET_JOB_SLACK_S="${FLEET_JOB_SLACK_S:-300}"
 
 fleet_say() { printf '%s\n' "$*"; }
-# `say` is the ENTRY POINT's reporter; the library's verbs call it. Defaulted here so the verbs can
-# be driven from a test (or another caller) without re-declaring it — a verb that can only run under
-# one caller is a verb whose mutating paths are asserted nowhere.
-# ⛔ `type -t`, NOT `command -v`: macOS SHIPS `/usr/bin/say` (text-to-speech), so `command -v say`
-# succeeds and the fallback is never defined — every line this library printed was SPOKEN instead,
-# and `status` looked silent. Only a FUNCTION counts as an existing `say`.
-[ "$(type -t say 2>/dev/null)" = "function" ] || say() { printf '%s\n' "$*"; }
+# `log_line` is the ENTRY POINT's reporter; the library's verbs call it. Defaulted here so the verbs
+# can be driven from a test (or another caller) without re-declaring it — a verb that can only run
+# under one caller is a verb whose mutating paths are asserted nowhere.
+# ⛔ THIS HELPER USED TO BE CALLED `say`, AND THAT NAME WAS THE DEFECT (#2910). macOS ships
+# `/usr/bin/say` (text-to-speech), so `command -v say` succeeded and this fallback was never
+# defined: every line the library printed when no caller had defined `say` was SPOKEN through the
+# speaker instead of printed, and `status` looked silent. The `type -t` test below was the earlier
+# workaround for that; the rename removed the reason for it. `type -t` is kept because it is the
+# precisely right question — only a FUNCTION counts as an existing `log_line` — not as a guard
+# against a binary that no longer shares the name.
+[ "$(type -t log_line 2>/dev/null)" = "function" ] || log_line() { printf '%s\n' "$*"; }
 
 # ── the process table: ONE read, argv-shape matching, self-match-safe ──────────────────────────
 # The awk program is a QUOTED heredoc, not a variable: it contains `$1`, `""` and brackets, and
@@ -1389,7 +1393,7 @@ fleet_start_component() { # <name>
       live_now="$(fleet_pids_for "$script")" || return 1
       if [ -n "$(printf '%s' "$live_now" | tr -d '[:space:]')" ]; then
         FLEET_START_ACTION="already running — the FAILING state is its stale pidfile, not an absent process; left alone (its row names the pidfile defect)"
-        say "$name: $FLEET_START_ACTION"
+        log_line "$name: $FLEET_START_ACTION"
         return 0
       fi
       # ⛔ THE STALE RECORD IS THIS VERB'S TO CLEAR, and it has already been PROVEN stale by the same
@@ -1408,10 +1412,10 @@ fleet_start_component() { # <name>
             # started a second copy and then reported OK over two loops — a false pass, and the
             # duplicate that `DUPLICATE` exists to catch (cycle-4 review, measured).
             FLEET_START_ACTION="not started — $pf names pid $pf_pid, which is running $pf_base from another path, so that copy owns the record; two copies would both run"
-            say "$name: $FLEET_START_ACTION"
+            log_line "$name: $FLEET_START_ACTION"
             return 0
           fi
-          rm -f "$pf" && say "$name: removed $pf — it named pid $pf_pid, which is alive but is not $name (a recycled pid)"
+          rm -f "$pf" && log_line "$name: removed $pf — it named pid $pf_pid, which is alive but is not $name (a recycled pid)"
         fi
       fi
       # ⛔ DETACHED, then READ BACK — never in the foreground. The launcher's own self-detach is a
@@ -1581,7 +1585,7 @@ fleet_ensure_components() { # <harness-path>
   # LATE/DUPLICATE → reported, never auto-resolved (both are about a LIVE process: one is alive but
   # stale, the other is duplicated, and a health check that kills either is a lane-killer).
   tostart="$(printf '%s\n' "$out" | awk -F'\t' '$4=="MISSING" || $4=="FAILING" || $4=="LATE" || $4=="DUPLICATE" {print $1"\t"$4}')"
-  [ -n "$tostart" ] || { say "every component is already OK (or not applicable)"; return 0; }
+  [ -n "$tostart" ] || { log_line "every component is already OK (or not applicable)"; return 0; }
   while IFS=$'\t' read -r name state; do
     [ -n "$name" ] || continue
     case "$name" in
@@ -1592,15 +1596,15 @@ fleet_ensure_components() { # <harness-path>
         # means this read could not ATTRIBUTE the owner, not that nothing is running. Asserting a
         # start failure from it would be reading a scope gap as a verdict, and two answers to one
         # question is the defect this entry point exists to remove (#1745/#1856).
-        say "controller: $state in this read's scope — start already proved a live owner through the platform verb. Reported, not fatal."
+        log_line "controller: $state in this read's scope — start already proved a live owner through the platform verb. Reported, not fatal."
         continue ;;
     esac
     if [ "$state" = "DUPLICATE" ]; then
-      say "$name: DUPLICATE — not touched; two live instances must be reconciled by hand"
+      log_line "$name: DUPLICATE — not touched; two live instances must be reconciled by hand"
       worst=1; continue
     fi
     if [ "$state" = "LATE" ]; then
-      say "$name: LATE — left running; cycle it with: bash scripts/orchestrator-bringup.sh restart"
+      log_line "$name: LATE — left running; cycle it with: bash scripts/orchestrator-bringup.sh restart"
       worst=1; continue
     fi
     if ! fleet_component_has_start "$name"; then
@@ -1608,16 +1612,16 @@ fleet_ensure_components() { # <harness-path>
       # was attempted. `status` still reports it as not-OK — the health verb and the start verb
       # answer different questions, and this is the one place they must differ.
       case "$name" in
-        cell-supervisor) say "$name: $state — not startable from here; a cell is provisioned by cloud-cell-bringup.sh" ;;
-        *)               say "$name: $state — not installed on this box (no start mechanism), so nothing was started" ;;
+        cell-supervisor) log_line "$name: $state — not startable from here; a cell is provisioned by cloud-cell-bringup.sh" ;;
+        *) log_line "$name: $state — not installed on this box (no start mechanism), so nothing was started" ;;
       esac
       continue
     fi
     FLEET_START_ACTION=""
     if fleet_start_component "$name"; then
-      say "$name: ${FLEET_START_ACTION:-started} (was $state)"
+      log_line "$name: ${FLEET_START_ACTION:-started} (was $state)"
     else
-      say "FAILED to start $name (was $state) — its start mechanism exists on this box and did not work"
+      log_line "FAILED to start $name (was $state) — its start mechanism exists on this box and did not work"
       worst=1
     fi
   done <<<"$tostart"
@@ -1632,8 +1636,8 @@ fleet_ensure_components() { # <harness-path>
   # supervisor's absence. `status` remains the verb whose exit code is the FLEET's verdict.
   if [ "$worst" -ne 0 ]; then return 1; fi
   if [ "$table_rc" -ne 0 ]; then
-    say ""
-    say "NOTE: the table above is not all-OK; every non-OK row needed no action from this verb (see above). Run: bash scripts/orchestrator-bringup.sh status  — its exit code is the fleet verdict."
+    log_line ""
+    log_line "NOTE: the table above is not all-OK; every non-OK row needed no action from this verb (see above). Run: bash scripts/orchestrator-bringup.sh status  — its exit code is the fleet verdict."
   fi
   return 0
 }
@@ -1651,23 +1655,23 @@ fleet_stop_all() { # <harness-path>
         # Counting it here would print "stopped controller" for a no-op.
         continue ;;
       landers)
-        say "landers: left running — a lander is in-flight work for one change; its claim expires on its own"; continue ;;
+        log_line "landers: left running — a lander is in-flight work for one change; its claim expires on its own"; continue ;;
       cell-supervisor)
-        say "cell-supervisor: left running — it owns the controller session; stop it with cloud-cell-supervisor.sh stop"; continue ;;
+        log_line "cell-supervisor: left running — it owns the controller session; stop it with cloud-cell-supervisor.sh stop"; continue ;;
     esac
     case "$state" in
       SKIPPED|MISSING) continue ;;
     esac
     if ! fleet_component_has_stop "$name"; then
-      say "$name: left running (no stop mechanism on this box)"; continue
+      log_line "$name: left running (no stop mechanism on this box)"; continue
     fi
     if fleet_stop_component "$name"; then
-      say "stopped $name (was $state)"; stopped=$(( stopped + 1 ))
+      log_line "stopped $name (was $state)"; stopped=$(( stopped + 1 ))
     else
-      say "could not stop $name (was $state) — it may still be running"; failed=$(( failed + 1 ))
+      log_line "could not stop $name (was $state) — it may still be running"; failed=$(( failed + 1 ))
     fi
   done <<<"$(printf '%s\n' "$out" | awk -F'\t' '{print $1"\t"$4}')"
-  [ "$stopped" -gt 0 ] || say "no other fleet component was running"
+  [ "$stopped" -gt 0 ] || log_line "no other fleet component was running"
   [ "$failed" -eq 0 ] || return 1
   return 0
 }

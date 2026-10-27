@@ -122,7 +122,7 @@ set -uo pipefail
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SELF_PATH/$(basename "${BASH_SOURCE[0]}")"
 
-say()  { printf '%s\n' "$*"; }
+log_line()  { printf '%s\n' "$*"; }
 warn() { printf 'harness-up: %s\n' "$*" >&2; }
 die()  { local m="$1" rc="${2:-3}"; printf 'harness-up: %s\n' "$m" >&2; exit "$rc"; }
 
@@ -798,7 +798,7 @@ hu_run_selftests() { # rc=0 all passed · 1 a test failed (named on stdout/stder
   for t in $SELFTESTS; do
     [ -f "$HARNESS/$t" ] || { warn "SELFTEST MISSING: $HARNESS/$t — cannot verify this tree, so nothing starts (fail closed)"; failed=1; continue; }
     args="$(selftest_args "$t")"
-    say "selftest: $t${args:+ $args}"
+    log_line "selftest: $t${args:+ $args}"
     # The extra argv is a WORD SPLIT on purpose: it is a literal list above, never caller input.
     # shellcheck disable=SC2086
     hu_run "$BOUND" bash "$HARNESS/$t" $args >"$HU_TMP/selftest.log" 2>&1
@@ -815,10 +815,10 @@ hu_run_selftests() { # rc=0 all passed · 1 a test failed (named on stdout/stder
     fi
     if [ "$rc" -ne 0 ]; then
       failed=1
-      say "selftest FAILED: $t — $(hu_bound_explain "$rc" "$BOUND")"
+      log_line "selftest FAILED: $t — $(hu_bound_explain "$rc" "$BOUND")"
       tail -n 12 "$HU_TMP/selftest.log" 2>/dev/null | sed 's/^/    /'
     else
-      say "selftest ok: $t"
+      log_line "selftest ok: $t"
     fi
   done
   return "$failed"
@@ -888,14 +888,14 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
   local strict="${1:-0}" sha want got real_want real_got got_head got_root
   HU_PIN_PENDING=0
   if [ "$PIN_PRESENT" -eq 0 ]; then
-    say "pin: SKIPPED (no pin machinery on this box — HARNESS_PIN_DIR/HARNESS_PIN_FILE are unset and $PIN_FILE does not exist; the controller runs from $HARNESS)"
+    log_line "pin: SKIPPED (no pin machinery on this box — HARNESS_PIN_DIR/HARNESS_PIN_FILE are unset and $PIN_FILE does not exist; the controller runs from $HARNESS)"
     return 4
   fi
   # ⛔ AN EMPTY HARNESS IS NOT A BYPASS. `git -C ""` addresses the PROCESS CWD's repo (verified on git
   # 2.43), so a box with no resolvable harness would otherwise answer this row from whatever checkout the
   # operator happens to stand in — `pin: OK` for a repo the launcher never identified, feeding the single
   # verdict. The row is UNRESOLVED (cannot-verify), never a pass.
-  [ -n "$HREPO" ] || { say "pin: UNRESOLVED — no harness repo resolved (see the harness-up warning above), so the pin cannot be resolved in one"; return 2; }
+  [ -n "$HREPO" ] || { log_line "pin: UNRESOLVED — no harness repo resolved (see the harness-up warning above), so the pin cannot be resolved in one"; return 2; }
   # ⛔ AN UNREADABLE RECORD IS NOT AN ABSENT ONE. `head` on a mode-000 file, or on a path behind an
   # unsearchable ancestor, prints nothing — exactly like a record that was never written — so the pin
   # "resolved" from $REF, the read dir was never compared to the pin's tree, and the controller start
@@ -903,11 +903,11 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
   # cannot see it must not return a weaker verdict than the one that can.
   case "$(hu_path_state "$PIN_SHA_FILE")" in
     unexaminable)
-      say "pin: UNEXAMINABLE — $PIN_SHA_FILE cannot be examined (an unsearchable ancestor or an unresolvable link), so the harness this box is pinned to cannot be resolved"
+      log_line "pin: UNEXAMINABLE — $PIN_SHA_FILE cannot be examined (an unsearchable ancestor or an unresolvable link), so the harness this box is pinned to cannot be resolved"
       return 2 ;;
     path)
       if [ ! -r "$PIN_SHA_FILE" ]; then
-        say "pin: UNREADABLE — $PIN_SHA_FILE exists but cannot be read, so the harness this box is pinned to cannot be resolved"
+        log_line "pin: UNREADABLE — $PIN_SHA_FILE exists but cannot be read, so the harness this box is pinned to cannot be resolved"
         return 2
       fi
       # ⛔ `-e` IS TRUE FOR A DIRECTORY, and `head -1 <dir>` yields nothing — which this function then
@@ -915,7 +915,7 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
       # record whose commit cannot be read. Same rule install.sh states: an unreadable record is never an
       # absent one.
       if [ ! -f "$PIN_SHA_FILE" ]; then
-        say "pin: NOT A REGULAR FILE — $PIN_SHA_FILE exists but is not a regular file, so the harness this box is pinned to cannot be read (cannot-verify is never an absent pin)"
+        log_line "pin: NOT A REGULAR FILE — $PIN_SHA_FILE exists but is not a regular file, so the harness this box is pinned to cannot be read (cannot-verify is never an absent pin)"
         return 2
       fi ;;
   esac
@@ -928,32 +928,32 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
     local tipsha
     tipsha="$(git -C "$HREPO" rev-parse --verify --quiet "$REF^{commit}" 2>/dev/null)" || tipsha=""
     if [ -z "$tipsha" ]; then
-      say "pin: UNRESOLVABLE — nothing is recorded in $PIN_SHA_FILE and $REF does not resolve in $HREPO"
+      log_line "pin: UNRESOLVABLE — nothing is recorded in $PIN_SHA_FILE and $REF does not resolve in $HREPO"
       return 2
     fi
-    say "pin: ABSENT — nothing is recorded in $PIN_SHA_FILE; resolved ${tipsha:0:12} from $REF (the first start records it)"
+    log_line "pin: ABSENT — nothing is recorded in $PIN_SHA_FILE; resolved ${tipsha:0:12} from $REF (the first start records it)"
     return 0
   fi
   sha="$(git -C "$HREPO" rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null)" || sha=""
   if [ -z "$sha" ]; then
-    say "pin: UNRESOLVABLE — the commit in $PIN_SHA_FILE is not an object in the harness repo $HREPO"
+    log_line "pin: UNRESOLVABLE — the commit in $PIN_SHA_FILE is not an object in the harness repo $HREPO"
     return 2
   fi
   want="$PIN_ROOT/${sha:0:12}/scripts/orchestrator-harness"
   got="$HARNESS"
   real_want="$(hu_real "$want")"
   real_got="$(hu_real "$got")"
-  say "pin: commit ${sha:0:12} (from $PIN_SHA_FILE), pin root $PIN_ROOT"
+  log_line "pin: commit ${sha:0:12} (from $PIN_SHA_FILE), pin root $PIN_ROOT"
   if [ -z "$real_got" ]; then
-    say "pin: UNREADABLE — the harness dir ($got, from $HARNESS_SRC) does not exist or cannot be entered"
+    log_line "pin: UNREADABLE — the harness dir ($got, from $HARNESS_SRC) does not exist or cannot be entered"
     return 2
   fi
   if [ ! -r "$real_got/orch-loop.sh" ]; then
-    say "pin: UNREADABLE — $real_got/orch-loop.sh cannot be read (it is the file the controller execs)"
+    log_line "pin: UNREADABLE — $real_got/orch-loop.sh cannot be read (it is the file the controller execs)"
     return 2
   fi
   if [ -n "$real_want" ] && [ "$real_want" = "$real_got" ]; then
-    say "pin: OK — the pin, the pin root, and the dir the controller reads are the same tree ($real_got)"
+    log_line "pin: OK — the pin, the pin root, and the dir the controller reads are the same tree ($real_got)"
     return 0
   fi
   # ⛔ THE PIN-ROOT SHAPE IS A CONVENTION, NOT THE PROPERTY THAT MATTERS, AND DEMANDING IT FALSE-BLOCKS THE
@@ -967,7 +967,7 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
   local got_head
   got_head="$(git -C "$real_got" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || got_head=""
   if [ -n "$got_head" ] && [ "$got_head" = "$sha" ]; then
-    say "pin: OK — the dir the controller reads ($real_got) is a worktree at the pinned commit ${sha:0:12} (it is not under $PIN_ROOT: the materialiser leaves a checkout that already IS the ref where it is)"
+    log_line "pin: OK — the dir the controller reads ($real_got) is a worktree at the pinned commit ${sha:0:12} (it is not under $PIN_ROOT: the materialiser leaves a checkout that already IS the ref where it is)"
     return 0
   fi
   if [ -z "$real_want" ]; then
@@ -979,10 +979,10 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
     #      tree to compare against, and refusing would block the very start that has to create it.
     #      Accepted, and SAID, because it is a weaker claim than "the pin and the read dir agree".
     if [ ! -d "$PIN_ROOT" ]; then
-      say "pin: RECORDED-NOT-MATERIALISED — $PIN_SHA_FILE names ${sha:0:12} but the pin root $PIN_ROOT does not exist on this box, so nothing is pinned to a tree here; starting from $real_got ($HARNESS_SRC)"
+      log_line "pin: RECORDED-NOT-MATERIALISED — $PIN_SHA_FILE names ${sha:0:12} but the pin root $PIN_ROOT does not exist on this box, so nothing is pinned to a tree here; starting from $real_got ($HARNESS_SRC)"
       return 0
     fi
-    say "pin: NOT MATERIALISED — the pin names $want, which does not exist, so a start from $real_got would run code the pin does not name. Remedy: materialise the pin (cloud-cell-supervisor.sh apply)."
+    log_line "pin: NOT MATERIALISED — the pin names $want, which does not exist, so a start from $real_got would run code the pin does not name. Remedy: materialise the pin (cloud-cell-supervisor.sh apply)."
     return 1
   fi
   # The dir the controller reads is a PINNED WORKTREE (root = the repo at that commit). Its commit is
@@ -994,15 +994,15 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
      && git -C "$HREPO" merge-base --is-ancestor "$got_head" "$sha" 2>/dev/null; then
     HU_PIN_PENDING=1
     if [ "$strict" = 1 ]; then
-      say "pin: STALE AFTER START — the box still reads ${got_head:0:12} while the pin names ${sha:0:12}; the start did not move it onto the pin"
+      log_line "pin: STALE AFTER START — the box still reads ${got_head:0:12} while the pin names ${sha:0:12}; the start did not move it onto the pin"
       return 1
     fi
-    say "pin: restart-pending — the box reads ${got_head:0:12}, the pin names ${sha:0:12} (an ancestor). This start must materialise the pin; it is re-checked after the components come up."
+    log_line "pin: restart-pending — the box reads ${got_head:0:12}, the pin names ${sha:0:12} (an ancestor). This start must materialise the pin; it is re-checked after the components come up."
     return 0
   fi
   # ⛔ THE MEASURED #2216 SHAPE, said with BOTH paths: "they disagree" without them is unactionable.
-  say "pin: MISMATCH — the pin resolves to $real_want but the controller READS $real_got ($HARNESS_SRC)."
-  say "      A re-pin would create a worktree nobody reads; refusing rather than starting a tree the pin does not name."
+  log_line "pin: MISMATCH — the pin resolves to $real_want but the controller READS $real_got ($HARNESS_SRC)."
+  log_line "      A re-pin would create a worktree nobody reads; refusing rather than starting a tree the pin does not name."
   return 1
 }
 
@@ -1928,7 +1928,7 @@ NOT HEALED: $st, but a controller process is live that this box's records do not
 NOT HEALED: $st, and whether another controller is live could not be read (the process table was unreadable) — starting on cannot-tell risks duplicating one; run 'harness-up' if you know the box is clear"
         return 0
       fi
-      say "heal: the controller is NOT running — starting it (nothing live is interrupted; lanes are separate workers)"
+      log_line "heal: the controller is NOT running — starting it (nothing live is interrupted; lanes are separate workers)"
       if hu_start_loop; then HU_HEAL_NOTE="$HU_HEAL_NOTE
 HEAL: started a controller that was not running"; started=1
       else HU_HEAL_NOTE="$HU_HEAL_NOTE
@@ -1955,7 +1955,7 @@ NOT HEALED: $st — a live-but-quiet controller is never cycled by status (that 
 NOT HEALED: the refresh record says relation=behind but it is ${rel_age:+older than ${HU_REFRESH_STALE}s}${rel_age:-unreadable} — a recorded relation is not a live state, so no pin advance was run on it; re-read with 'harness status' after the controller refreshes"
         return 0
       fi
-      say "heal: the pin is BEHIND $REF — re-pinning (harness-refresh advances the pin and kills nothing, #2278)"
+      log_line "heal: the pin is BEHIND $REF — re-pinning (harness-refresh advances the pin and kills nothing, #2278)"
       if hu_start_refresh; then HU_HEAL_NOTE="$HU_HEAL_NOTE
 HEAL: re-pinned a stale harness (relation was behind)"
       else HU_HEAL_NOTE="$HU_HEAL_NOTE
@@ -2058,7 +2058,7 @@ hu_start_refresh() {
       # The row reads THIS record, and until now only `orch-loop.sh` wrote it — so a box whose controller
       # had not completed a cycle yet reported "refresh: never ran" seconds after `up` had run it.
       hu_write_refresh_record "$rc" "$rel" "$log"
-      say "refresh: ok (relation=${rel:-current})"; return 0 ;;
+      log_line "refresh: ok (relation=${rel:-current})"; return 0 ;;
     # ⛔ 25 IS TRUTH, NOT A FAILURE — but it must be SAID, not swallowed: this box is on the ref's
     # line and OLDER, and has no materialiser, so the pin did not advance. Starting is still allowed
     # (the deployed $O may be legitimately operator-synced) and the verdict carries it.
@@ -2105,7 +2105,7 @@ hu_start_claims() {
   printf 'claims=%s repo=%s origin=%s at=%s\n' "$verdict" "$REPO" "$(hu_origin "$REPO")" "$(date +%s)" \
     > "$O/state/harness-claims" 2>/dev/null \
     || { warn "claims: $O/state is not writable — the probe cannot be recorded"; return 1; }
-  say "claims: ok (refs/claims $verdict)"
+  log_line "claims: ok (refs/claims $verdict)"
   return 0
 }
 
@@ -2148,7 +2148,7 @@ hu_start_loop() {
       # paths for the SAME deployment. Comparing against `$HARNESS` alone reported a healthy Mac's
       # second `up` as a failed start — the exact defect this arm removes (measured in review).
       if [ -n "$path" ] && { [ "$(hu_real "$(dirname "$path")")" = "$(hu_real "$HARNESS")" ] || [ "$(hu_real "$(dirname "$path")")" = "$(hu_real "$O")" ]; }; then
-        say "loop: ALREADY UP (pid $pid executing $path) — left alone: one controller per state dir, and a healthy one is never cycled (that would drop in-flight lanes)"
+        log_line "loop: ALREADY UP (pid $pid executing $path) — left alone: one controller per state dir, and a healthy one is never cycled (that would drop in-flight lanes)"
         return 0
       fi
       # ⛔ AN UNREADABLE PATH IS NOT A FOREIGN ONE (review round 5). `[ -n "$path" ]` being false is
@@ -2188,7 +2188,7 @@ hu_start_loop() {
   # CALLER, so the caller pins it.
   ORCH_FOREGROUND=0 hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" start >"$HU_TMP/loop.log" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/loop.log" | tail -n 40
-  if [ "$rc" -eq 0 ]; then say "loop: ok"; return 0; fi
+  if [ "$rc" -eq 0 ]; then log_line "loop: ok"; return 0; fi
   warn "loop: start failed ($(hu_bound_explain "$rc" "$BOUND")) — see the output above"
   return 1
 }
@@ -2197,15 +2197,15 @@ hu_start_loop() {
 # only calls the supervisor directly when the session is genuinely absent.
 hu_start_supervisor() {
   local sess="${SESSION:-orch}" rc
-  if [ "$PLATFORM" != "cell" ]; then say "supervisor: SKIPPED (no cell supervisor on macOS; launchd owns the controller)"; return 0; fi
-  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$sess" 2>/dev/null; then say "supervisor: ok (session '$sess' is up)"; return 0; fi
+  if [ "$PLATFORM" != "cell" ]; then log_line "supervisor: SKIPPED (no cell supervisor on macOS; launchd owns the controller)"; return 0; fi
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$sess" 2>/dev/null; then log_line "supervisor: ok (session '$sess' is up)"; return 0; fi
   [ -f "$SELF_PATH/cloud-cell-supervisor.sh" ] || { warn "supervisor: no cloud-cell-supervisor.sh beside $SELF, and no session '$sess'"; return 1; }
   # ⛔ same inheritance fence as the loop arm above (review P2 round 17, #2402): inside a service-managed
   # controller's tree, an inherited `ORCH_FOREGROUND=1` would re-parent the controller into THIS shell.
   ORCH_FOREGROUND=0 hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" start >"$HU_TMP/sup.log" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/sup.log" | tail -n 30
   [ "$rc" -eq 0 ] || { warn "supervisor: start failed ($(hu_bound_explain "$rc" "$BOUND"))"; return 1; }
-  say "supervisor: ok"; return 0
+  log_line "supervisor: ok"; return 0
 }
 
 hu_start_component() { # <name>
@@ -2229,32 +2229,32 @@ cmd_up() {
   # work repo are INHERITED ones (a shell export, the config file) — and an inherited value that is
   # valid-but-unintended is accepted silently. Naming its source is what makes that visible on the
   # screen instead of implied by a path the reader must recognise.
-  say "==> harness-up ($PLATFORM) — repo $REPO (${REPO_SRC:-fallback: the harness checkout}), harness repo $HREPO, ref $REF"
-  say "    state dir : $O"
-  say "    harness   : $HARNESS (from $HARNESS_SRC)"
+  log_line "==> harness-up ($PLATFORM) — repo $REPO (${REPO_SRC:-fallback: the harness checkout}), harness repo $HREPO, ref $REF"
+  log_line "    state dir : $O"
+  log_line "    harness   : $HARNESS (from $HARNESS_SRC)"
 
-  say ""
-  say "==> 1/4 the pin, and whether it is the dir the controller READS"
+  log_line ""
+  log_line "==> 1/4 the pin, and whether it is the dir the controller READS"
   hu_verify_pin; pin_rc=$?
   case "$pin_rc" in
     0|4) : ;;
     *) die "REFUSED: the resolved pin is not the tree the controller would read (see pin: above). Nothing was started." 3 ;;
   esac
 
-  say ""
-  say "==> 2/4 capacity: what THIS box may carry, measured now (never a fixed cap)"
+  log_line ""
+  log_line "==> 2/4 capacity: what THIS box may carry, measured now (never a fixed cap)"
   cap="$(hu_capacity 2>&1)"; cap_rc=$?
   if [ "$cap_rc" -ne 0 ]; then
     # ⛔ A FIXED CAP IS NOT A FALLBACK. When the box cannot be MEASURED the decision refuses, and so
     # does the start: launching a controller whose capacity nobody could read is the "looks up" state
     # this whole surface exists against (cannot-verify is never a pass).
-    say "    $(printf '%s' "$cap" | head -1)"
+    log_line "    $(printf '%s' "$cap" | head -1)"
     die "REFUSED: this box's capacity could not be MEASURED (above), and a fixed lane cap is not a measurement. Nothing was started." 3
   fi
-  say "    $(printf '%s' "$cap" | sed -n 's/^capacity //p')"
+  log_line "    $(printf '%s' "$cap" | sed -n 's/^capacity //p')"
   cap_lanes="$(printf '%s' "$cap" | sed -n 's/.*[[:space:]]lanes=\([0-9]*\).*/\1/p' | head -1)"
   cap_fixed="$(printf '%s' "$cap" | sed -n 's/.*[[:space:]]fixed_ignored=\([^ ]*\).*/\1/p' | head -1)"
-  say "    this box may carry ${cap_lanes:-?} lane(s) at the load and disk it just reported"
+  log_line "    this box may carry ${cap_lanes:-?} lane(s) at the load and disk it just reported"
   # ⛔ REPORTED, NEVER USED. An operator (or a plist) may still carry a fixed `max_lanes`; saying so is
   # the difference between "the number I read" and "the number I was told", and only the first may
   # decide placement.
@@ -2262,8 +2262,8 @@ cmd_up() {
     warn "capacity: a FIXED lane cap is configured ($cap_fixed) — IGNORED as a ceiling: the ceiling here is load and disk, measured, and a constant cannot be a measurement"
   fi
 
-  say ""
-  say "==> 3/4 self-tests (a failure here refuses the start)"
+  log_line ""
+  log_line "==> 3/4 self-tests (a failure here refuses the start)"
   if [ "$SELFTEST" -eq 1 ]; then
     hu_run_selftests || die "REFUSED: a self-test failed (named above). Nothing was started — a red tree must not be started by the thing that is supposed to notice." 3
   else
@@ -2271,30 +2271,30 @@ cmd_up() {
     warn "⛔ SELFTESTS SKIPPED BY REQUEST (--skip-selftest) — nothing verified this tree before the start"
   fi
 
-  say ""
-  say "==> roles: preflight + install (refuse before writing; idempotent)"
+  log_line ""
+  log_line "==> roles: preflight + install (refuse before writing; idempotent)"
   if hr_available; then
     hr_install_roster || die "REFUSED: a role this box is configured to run could not be installed (named above) — nothing was started" 3
   else
     hr_missing_note
   fi
 
-  say ""
-  say "==> 4/4 components, in dependency order: $HU_COMPONENTS"
+  log_line ""
+  log_line "==> 4/4 components, in dependency order: $HU_COMPONENTS"
   for c in $HU_COMPONENTS; do
     # ⛔ `down` must not be undone by a partial `up`: each step is attempted, a failure stops the
     # walk (a later component depends on the earlier one), and everything already up is left up.
-    if ! hu_start_component "$c"; then bad=1; say "    $c: FAILED — stopping the walk here (later components depend on it)"; break; fi
+    if ! hu_start_component "$c"; then bad=1; log_line "    $c: FAILED — stopping the walk here (later components depend on it)"; break; fi
   done
 
-  say ""
+  log_line ""
   [ "$bad" -eq 0 ] || die "started with failures — see the component lines above; nothing already up was stopped" 1
   # ⛔ RE-VERIFY THE PIN AFTER the components are up. A `restart-pending` above is closed by the start
   # materialising the pin; if it did not, the box is running code the pin does not name and saying
   # "up" would be the false success this whole check exists against.
   if [ "${HU_PIN_PENDING:-0}" = 1 ]; then
-    say ""
-    say "==> post-start pin check (the pin advanced before this launch)"
+    log_line ""
+    log_line "==> post-start pin check (the pin advanced before this launch)"
     hu_verify_pin 1 || die "DEGRADED: the pin still does not name the tree this box reads after the start — re-run after '$0 up', or check the materialiser" 1
   fi
   # ⛔ NO HEAL HERE: this start just brought every component up, so a heal pass could only re-invoke the
@@ -2307,7 +2307,7 @@ cmd_up() {
 
 cmd_down() {
   local rc=0
-  say "==> harness-down ($PLATFORM) — stopping via the platform authority"
+  log_line "==> harness-down ($PLATFORM) — stopping via the platform authority"
   if [ -f "$SELF_PATH/orchestrator-bringup.sh" ]; then
     hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" stop || rc=$?
   else
@@ -2315,7 +2315,7 @@ cmd_down() {
     [ "$PLATFORM" = cell ] && [ -f "$SELF_PATH/cloud-cell-supervisor.sh" ] && { hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" stop || rc=$?; } || rc=1
   fi
   [ "$rc" -eq 0 ] || die "stop reported a problem (exit $rc) — read the output above" "$rc"
-  say "down: ok"
+  log_line "down: ok"
   return 0
 }
 
@@ -2346,7 +2346,7 @@ declare -f hr_status >/dev/null 2>&1 || HR_MOD=""
 
 hr_available() { [ -n "${HR_MOD:-}" ]; }
 hr_missing_note() {
-  say "roles: SKIPPED (no harness-roles.sh in \$HARNESS, beside this launcher, or \$O — the ROLE registry is what installs, measures and heals them; re-seed with: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
+  log_line "roles: SKIPPED (no harness-roles.sh in \$HARNESS, beside this launcher, or \$O — the ROLE registry is what installs, measures and heals them; re-seed with: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
 }
 hr_need() { # <verb>
   hr_available && return 0
@@ -2358,7 +2358,7 @@ hr_need() { # <verb>
 # which is why this verb exists separately: `harness-status` promises a read.
 _hr_status_verb() {
   hr_need roles
-  say "roles (measured — a unit file is never evidence that a role runs; config: $(hr_roles))"
+  log_line "roles (measured — a unit file is never evidence that a role runs; config: $(hr_roles))"
   hr_status
   return $?
 }
@@ -2382,23 +2382,23 @@ cmd_heal() {
   hu_collect_rows
   hu_heal
   if [ -n "${HU_HEAL_NOTE:-}" ]; then
-    say ""
+    log_line ""
     printf '%s\n' "$HU_HEAL_NOTE" | sed 's/^/    /'
     case "$HU_HEAL_NOTE" in *"HEAL FAILED"*|*"NOT HEALED"*) hr_rc=1 ;; esac
   fi
-  say ""
+  log_line ""
   if hr_available; then
-    say "roles: re-driving what is dead (config: $(hr_roles))"
+    log_line "roles: re-driving what is dead (config: $(hr_roles))"
     hr_heal || rrc=1
   else
     hr_missing_note
   fi
-  say ""
+  log_line ""
   if [ "$rrc" -eq 0 ] && [ "$hr_rc" -eq 0 ]; then
-    say "HEAL: every configured role is running, or is not applicable on this box"
+    log_line "HEAL: every configured role is running, or is not applicable on this box"
     return 0
   fi
-  say "HEAL INCOMPLETE — see NOT HEALED above; this exit is not a pass"
+  log_line "HEAL INCOMPLETE — see NOT HEALED above; this exit is not a pass"
   return 1
 }
 
@@ -2451,14 +2451,14 @@ cmd_status() {
     if [ -n "$HU_HEAL_NOTE" ]; then healed=1; hu_collect_rows; fi
   fi
   sed 's/^/    /' "$HU_TMP/pin.txt"
-  say ""
+  log_line ""
   if [ "$PLAIN" -eq 0 ]; then printf '%-12s %-10s %-6s %s\n' COMPONENT PID AGE STATE; fi
   printf '%s' "$HU_ROWS" | while IFS='|' read -r name pid age state; do
     [ -n "$name" ] || continue
     printf '%-12s %-10s %-6s %s\n' "$name" "${pid:--}" "${age:--}" "$state"
   done
   if [ "$healed" -eq 1 ]; then
-    say ""
+    log_line ""
     printf '%s\n' "$HU_HEAL_NOTE" | sed 's/^/    /'
   fi
   # ── THE ROLE TABLE (the roles the box is configured to run), MEASURED ────────────────────────
@@ -2468,19 +2468,19 @@ cmd_status() {
   # three components read installed and were dead. This table answers that, from each role's OWN
   # artefact, and its verdict is folded into the ONE verdict line rather than printed as a second one.
   # A SKIPPED role (no unit on this platform) is a PASS with a reason — never OK.
-  say ""
+  log_line ""
   if hr_available; then
-    say "roles (config: $(hr_roles)):"
+    log_line "roles (config: $(hr_roles)):"
     hr_status; _role_rc=$?
     _hu_take "$_role_rc"
   else
     hr_missing_note
   fi
-  say ""
+  log_line ""
   case "$ROW_VERDICT" in
-    0) say "VERDICT: HEALTHY";  return 0 ;;
-    1) say "VERDICT: DEGRADED — a component is late/absent or the deployed tree has diverged; see the rows above"; return 1 ;;
-    *) say "VERDICT: BROKEN — something could not be verified, and cannot-verify is never a pass; see the rows above"; return 2 ;;
+    0) log_line "VERDICT: HEALTHY";  return 0 ;;
+    1) log_line "VERDICT: DEGRADED — a component is late/absent or the deployed tree has diverged; see the rows above"; return 1 ;;
+    *) log_line "VERDICT: BROKEN — something could not be verified, and cannot-verify is never a pass; see the rows above"; return 2 ;;
   esac
 }
 

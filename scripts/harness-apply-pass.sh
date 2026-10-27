@@ -130,7 +130,7 @@ set -uo pipefail
 # sibling artifact this launcher already runs carries the same note (scripts/disk-reaper.sh).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
-say()  { printf '%s\n' "$*"; }
+log_line()  { printf '%s\n' "$*"; }
 err()  { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 
 help_text() {
@@ -267,7 +267,7 @@ short() { [ -n "${1:-}" ] && printf '%s' "$1" | cut -c1-12; }
 # stop, and only the AGE can say so. Same rule (and the same reason) as disk-reaper.sh's
 # `--print-status`.
 print_status() {
-    [ -f "$RECORD" ] || { say "status=never pin=none — no pass has ever completed on this box ($RECORD)"; return 3; }
+    [ -f "$RECORD" ] || { log_line "status=never pin=none — no pass has ever completed on this box ($RECORD)"; return 3; }
     local body epoch rc age
     body="$(cat "$RECORD" 2>/dev/null)"
     epoch="$(printf '%s\n' "$body" | sed -n 's/^epoch=\([0-9]*\)$/\1/p' | head -1)"
@@ -276,7 +276,7 @@ print_status() {
     fetchs="$(printf '%s\n' "$body" | sed -n 's/^fetch=//p' | head -1)"
     case "${epoch:-}" in
         ''|*[!0-9]*)
-            say "status=unreadable rc=${rc:-?} — the record carries no usable epoch, so its age cannot be judged (cannot-verify is not fresh)"
+            log_line "status=unreadable rc=${rc:-?} — the record carries no usable epoch, so its age cannot be judged (cannot-verify is not fresh)"
             return 3 ;;
     esac
     age=$(( $(date +%s) - epoch ))
@@ -286,9 +286,9 @@ print_status() {
     # disagreeing about one record with the READINESS GATE being the lenient one (measured in review).
     if [ "$age" -lt 0 ] || [ "$age" -gt "$STALE_SECONDS" ]; then
         if [ "$age" -lt 0 ]; then
-            say "status=stale rc=${rc:-?} age=${age}s — the record is dated in the FUTURE, so its age proves nothing"
+            log_line "status=stale rc=${rc:-?} age=${age}s — the record is dated in the FUTURE, so its age proves nothing"
         else
-            say "status=stale rc=${rc:-?} age=${age}s — the timer is not firing (bound ${STALE_SECONDS}s)"
+            log_line "status=stale rc=${rc:-?} age=${age}s — the timer is not firing (bound ${STALE_SECONDS}s)"
         fi
         printf '%s\n' "$body" | sed 's/^/  /'
         return 3
@@ -301,14 +301,14 @@ print_status() {
         0|10|11)
             case "${behind:-unknown}" in
                 0) ;;
-                *) say "status=behind rc=$rc behind=${behind:-unknown} age=${age}s — the pass exited cleanly but the box is NOT on $REF"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
+                *) log_line "status=behind rc=$rc behind=${behind:-unknown} age=${age}s — the pass exited cleanly but the box is NOT on $REF"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
             esac
             case "${fetchs:-}" in
                 ok|'') ;;
-                *) say "status=cannot-verify rc=$rc fetch=$fetchs age=${age}s — the comparison was not fresh"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
+                *) log_line "status=cannot-verify rc=$rc fetch=$fetchs age=${age}s — the comparison was not fresh"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
             esac
-            say "status=ok rc=$rc age=${age}s"; printf '%s\n' "$body" | sed 's/^/  /'; return 0 ;;
-        *)       say "status=failed rc=${rc:-?} age=${age}s — a human must look"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
+            log_line "status=ok rc=$rc age=${age}s"; printf '%s\n' "$body" | sed 's/^/  /'; return 0 ;;
+        *) log_line "status=failed rc=${rc:-?} age=${age}s — a human must look"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
     esac
 }
 
@@ -526,9 +526,9 @@ recompute_deployed() {
 # measured from the DEPLOYED commit. Printing only the checkout's made the log say `behind=1` on a box
 # whose record (correctly) said `behind=0` — two numbers for one box in one pass, and the log's was the
 # one an operator is told to trust.
-say "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") checkout_relation=$RELATION checkout_behind=$BEHIND ref_sha=$(short "$REF_SHA") dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE"
+log_line "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") checkout_relation=$RELATION checkout_behind=$BEHIND ref_sha=$(short "$REF_SHA") dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE"
 [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && \
-    say "harness: deployed=$REC_PIN_TREE (the tree the pin names — this is what the box RUNS; the checkout above is not moved by a pin advance)"
+    log_line "harness: deployed=$REC_PIN_TREE (the tree the pin names — this is what the box RUNS; the checkout above is not moved by a pin advance)"
 
 # finish — record the pass and ANSWER IT. The detail is printed in BOTH directions: a silent success
 # (`exit 0` with no line saying what it decided) is the shape that let a no-op and a refusal look
@@ -543,7 +543,7 @@ finish() { # <ok> <rc> <verdict-phrase>
     recompute_deployed
     REC_DETAIL="$3 — head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE${PRESERVED_DIR:+ preserved=$PRESERVED_DIR}"
     write_record "$1" "$2" || exit 23
-    if [ "$1" = 1 ]; then say "$REC_DETAIL"; else err "$REC_DETAIL"; fi
+    if [ "$1" = 1 ]; then log_line "$REC_DETAIL"; else err "$REC_DETAIL"; fi
     exit "$2"
 }
 
@@ -602,7 +602,7 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
         # `%q` so a path with a space, quote or newline is still recoverable FROM the manifest; the
         # destination of a rename is what is listed, because that is what the tree now holds.
         printf '%q\n' "$p" >>"$dest/MANIFEST" || return 1
-        say "preserved: $p -> $dest/changes.patch (+ changes.index.patch for the staged snapshot)"
+        log_line "preserved: $p -> $dest/changes.patch (+ changes.index.patch for the staged snapshot)"
         n=$((n + 1))
     done < <(list_dirty_paths)
     # ⛔ UNTRACKED FILES ARE COPIED, not just named: a patch cannot carry them, and they are the
@@ -617,7 +617,7 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
         # on a state that is trivially preservable. It also recorded the TARGET's bytes instead of the
         # link, so the recovery copy was not a faithful record of the tree.
         cp -a "$REPO/$p" "$dest/untracked/$p" 2>/dev/null || { err "cannot preserve untracked $p — refusing to touch the tree"; return 1; }
-        say "preserved: $p -> $dest/untracked/$p"
+        log_line "preserved: $p -> $dest/untracked/$p"
     done < <(list_untracked_paths)
     # ── bring the tracked paths back to HEAD so a fast-forward is possible ──────────────────────
     # ⛔ THE TWO OBVIOUS WAYS ARE BOTH WRONG HERE, for different reasons. A branch switch is what this
@@ -735,22 +735,22 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
     # whenever a path was skipped: a skipped staged addition (or a gitlink) is STILL IN THE WORKTREE and
     # keeps the tree dirty, which the record then reports — two contradictory statements about the same
     # edit, in the message an operator reads when recovering work.
-    say "restored: $n_restored tracked path(s) brought back to HEAD (mode and content); their hand edits exist only in the preserved copies"
+    log_line "restored: $n_restored tracked path(s) brought back to HEAD (mode and content); their hand edits exist only in the preserved copies"
     # ⛔ TWO COUNTERS, because the two outcomes are opposite. A move destination is REMOVED from the
     # worktree (its bytes are preserved, and the tree then converges); a staged addition or a gitlink is
     # SKIPPED and STAYS. Folding them into one count made the sentence claim that removed paths "remain
     # in the worktree — they are what keeps the tree dirty" while the record in the same pass said
     # `dirty=0` — the two-readers contradiction this line exists to avoid, reintroduced by the fix that
     # added the move case.
-    [ "$n_removed" -gt 0 ] && say "restored: $n_removed move destination(s) removed from the worktree after preservation (a same-content copy of a deleted tracked path)"
-    [ "$n_skipped" -gt 0 ] && say "restored: $n_skipped path(s) SKIPPED (not in HEAD, or a gitlink) and still in the worktree — they are what keeps the tree dirty"
-    say "preserved: $n path(s) saved under $dest (names in $dest/MANIFEST)"
+    [ "$n_removed" -gt 0 ] && log_line "restored: $n_removed move destination(s) removed from the worktree after preservation (a same-content copy of a deleted tracked path)"
+    [ "$n_skipped" -gt 0 ] && log_line "restored: $n_skipped path(s) SKIPPED (not in HEAD, or a gitlink) and still in the worktree — they are what keeps the tree dirty"
+    log_line "preserved: $n path(s) saved under $dest (names in $dest/MANIFEST)"
     return 0
 }
 
 if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unknown" ] && [ "$DIRTY_N" -gt 0 ]; then
     if [ "$DRY_RUN" = 1 ]; then
-        say "dry-run: would preserve $DIRTY_N dirty path(s) by name and then fast-forward"
+        log_line "dry-run: would preserve $DIRTY_N dirty path(s) by name and then fast-forward"
     else
         # ⛔ PER-SECOND IS NOT PER-PASS. Two passes in the same second shared one directory, and the
         # SECOND truncated the first's `changes.patch` and `MANIFEST` — which for restored tracked paths
@@ -777,7 +777,7 @@ if [ "$DRY_RUN" = 1 ]; then
     # then read `status=ok age=0s` in `--print-status`, in the installer's `--status` and in
     # fleet-health — the false PASS this whole feature exists to delete, produced by its preview verb.
     [ "$PASS_MODE" = pin ] && read_pin
-    say "dry-run: relation=$RELATION behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N mode=$PASS_MODE — nothing was changed and no pass record was written"
+    log_line "dry-run: relation=$RELATION behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N mode=$PASS_MODE — nothing was changed and no pass record was written"
     exit 0
 fi
 
@@ -792,7 +792,7 @@ if [ "$PASS_MODE" = pin ]; then
     if [ -n "$PIN_TREE_SHA" ] && [ "$PIN_TREE_SHA" = "$REF_SHA" ]; then
         # Converged. The pin RECORD may still disagree with that tree — c1's state — and it is repaired
         # below.
-        say "advance: the pin already names $REF ($(short "$REF_SHA")) — no-op"
+        log_line "advance: the pin already names $REF ($(short "$REF_SHA")) — no-op"
         REC_ACTION=none
     elif [ -z "$PIN_TREE_SHA" ] && [ "$RELATION" = current ]; then
         # No pin tree materialised (first run on a box that has a pin record, or a checkout whose pin
@@ -902,21 +902,21 @@ if [ "$PASS_MODE" = pin ]; then
             printf '%s\n' "$TREE_SHA" >"$PIN_SHA_FILE.tmp-$$" 2>/dev/null \
                 && mv -f "$PIN_SHA_FILE.tmp-$$" "$PIN_SHA_FILE" 2>/dev/null \
                 || { REC_ACTION=pin-unwritable; finish 0 23 "cannot record the pin at $PIN_SHA_FILE (the tree runs $(short "$TREE_SHA"))"; }
-            say "pin: MENDED (was absent) -> $(short "$TREE_SHA")"
+            log_line "pin: MENDED (was absent) -> $(short "$TREE_SHA")"
             REC_ACTION=mended
         elif [ "$(short "$TREE_SHA")" != "$REC_PIN" ]; then
             OLD_PIN="$REC_PIN"
             printf '%s\n' "$TREE_SHA" >"$PIN_SHA_FILE.tmp-$$" 2>/dev/null \
                 && mv -f "$PIN_SHA_FILE.tmp-$$" "$PIN_SHA_FILE" 2>/dev/null \
                 || { REC_ACTION=pin-unwritable; finish 0 23 "the pin ($OLD_PIN) disagrees with the tree ($(short "$TREE_SHA")) and $PIN_SHA_FILE could not be rewritten — the pin still lies"; }
-            say "pin: REPAIRED $OLD_PIN -> $(short "$TREE_SHA") (the pin now names the tree this box actually runs)"
+            log_line "pin: REPAIRED $OLD_PIN -> $(short "$TREE_SHA") (the pin now names the tree this box actually runs)"
             REC_ACTION=pin-repaired
         fi
     else
         # A pin record that names a tree which is not there, or a box with no PATH record at all:
         # reported, never invented. The sha record may legitimately be the only one on a box whose
         # controller was never started from a pin.
-        say "pin: no tree at $PIN_PATH_FILE — the sha record ${REC_PIN} cannot be checked against a checkout"
+        log_line "pin: no tree at $PIN_PATH_FILE — the sha record ${REC_PIN} cannot be checked against a checkout"
     fi
 fi
 
@@ -967,7 +967,7 @@ case "$REC_ACTION" in
             if [ -z "$REC_PIN" ] || [ "$REC_PIN" = "none" ]; then
                 if printf '%s\n' "$HEAD_SHA" >"$PIN_SHA_FILE.tmp-$$" 2>/dev/null \
                    && mv -f "$PIN_SHA_FILE.tmp-$$" "$PIN_SHA_FILE" 2>/dev/null; then
-                    say "pin: MENDED (was absent) -> $(short "$HEAD_SHA") (no pin tree; the checkout is the deployment)"
+                    log_line "pin: MENDED (was absent) -> $(short "$HEAD_SHA") (no pin tree; the checkout is the deployment)"
                     REC_ACTION=mended
                     finish 1 11 "mended: the pin was missing and now names the checkout this box runs"
                 fi

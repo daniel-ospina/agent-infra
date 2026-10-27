@@ -131,8 +131,8 @@ EXIT_REFUSING=2
 EXIT_UNDELIVERED=3   # placed, and no worker took it -- pr-doctor's own 3, kept verbatim
 EXIT_DEFERRED=6
 
-say() { printf '[%s] pr-repair: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
-err() { say "⛔ $*" >&2; }
+log_line() { printf '[%s] pr-repair: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+err() { log_line "⛔ $*" >&2; }
 
 # ── measurement ──────────────────────────────────────────────────────────────────────────────────
 # ⛔ `df` ON THE CHECKOUT, NOT ON `/`. A cell's checkout can be on a different filesystem (a bind
@@ -270,7 +270,7 @@ one_pass() { # <dry-run:0|1>
         # ⛔ A SKIP IS RECORDED IN ITS OWN FILE (round-3 review). Writing it into the shared status row
         # would let a skipping pass replace the LOCK HOLDER's verdict — and the holder is the only actor
         # that did any work. `--status` prints both, so nothing is hidden and nothing is overwritten.
-        say "SKIPPED — another repair pass holds $STATE_DIR/pr-repair.lock; not starting a second one."
+        log_line "SKIPPED — another repair pass holds $STATE_DIR/pr-repair.lock; not starting a second one."
         write_skip_row "lock-held:$STATE_DIR/pr-repair.lock"
         return "$EXIT_OK"
     fi
@@ -307,20 +307,20 @@ one_pass() { # <dry-run:0|1>
     # why the box did or did not repair anything this pass, and it is the number #2721 turns on.
     local wt_count
     wt_count="$(find "$REPO_PATH/.worktrees" -maxdepth 1 -name 'prd-*' 2>/dev/null | wc -l | tr -d ' ')"
-    say "disk: ${free_mb}MB free (${used_pct}% used) worktrees: ${wt_count} prd-*  load1: ${load1}/${ceiling} (nproc=${nproc_})  cap: ${cap}"
+    log_line "disk: ${free_mb}MB free (${used_pct}% used) worktrees: ${wt_count} prd-*  load1: ${load1}/${ceiling} (nproc=${nproc_})  cap: ${cap}"
 
     if [ "$free_mb" -lt "$DISK_FLOOR_MB" ]; then
-        say "DEFERRED — ${free_mb}MB free is below the ${DISK_FLOOR_MB}MB floor; a repair worker materialises a worktree WITH its dependency tree (#2721), so a pass here would wedge the box instead of repairing it."
+        log_line "DEFERRED — ${free_mb}MB free is below the ${DISK_FLOOR_MB}MB floor; a repair worker materialises a worktree WITH its dependency tree (#2721), so a pass here would wedge the box instead of repairing it."
         write_status deferred "$cap" "$free_mb" "$load1" - - "disk-floor:${free_mb}<${DISK_FLOOR_MB}"
         return "$EXIT_DEFERRED"
     fi
     if awk -v l="$load1" -v c="$ceiling" 'BEGIN { exit !(l + 0 >= c + 0) }'; then
-        say "DEFERRED — load1 ${load1} is at or above the ${ceiling} ceiling (${LOAD_MULT}x nproc=${nproc_}); the box is busy by the owner's own ruling and a new repair would compete with it."
+        log_line "DEFERRED — load1 ${load1} is at or above the ${ceiling} ceiling (${LOAD_MULT}x nproc=${nproc_}); the box is busy by the owner's own ruling and a new repair would compete with it."
         write_status deferred "$cap" "$free_mb" "$load1" - - "load-ceiling:${load1}>=${ceiling}"
         return "$EXIT_DEFERRED"
     fi
     if [ "$cap" -lt 1 ]; then
-        say "DEFERRED — the derived cap is 0 (${free_mb}MB free, ${DISK_FLOOR_MB}MB floor, ${PER_WORKER_MB}MB per worker): there is no room for even one repair worker."
+        log_line "DEFERRED — the derived cap is 0 (${free_mb}MB free, ${DISK_FLOOR_MB}MB floor, ${PER_WORKER_MB}MB per worker): there is no room for even one repair worker."
         write_status deferred 0 "$free_mb" "$load1" - - "cap-zero"
         return "$EXIT_DEFERRED"
     fi
@@ -328,15 +328,15 @@ one_pass() { # <dry-run:0|1>
     # ── REAP (the shipped reaper; its rows are the evidence) ────────────────────────────────────
     if [ -x "$SCRIPTS/pi-reap-worktrees.sh" ]; then
         if [ "$dry" = 1 ]; then
-            say "reap: DRY-RUN (would run $SCRIPTS/pi-reap-worktrees.sh --apply --repo $REPO_PATH)"
+            log_line "reap: DRY-RUN (would run $SCRIPTS/pi-reap-worktrees.sh --apply --repo $REPO_PATH)"
         else
-            say "reap: pass over $REPO_PATH/.worktrees via the shipped reaper"
+            log_line "reap: pass over $REPO_PATH/.worktrees via the shipped reaper"
             REAP_WT_GH_TIMEOUT="${REAP_WT_GH_TIMEOUT:-120}" \
                 timeout "${REPAIR_REAP_TIMEOUT_S:-600}" \
                 "$SCRIPTS/pi-reap-worktrees.sh" --apply --repo "$REPO_PATH"
             rc_reap=$?
             case "$rc_reap" in
-                0) say "reap: pass completed (rc=0)" ;;
+                0) log_line "reap: pass completed (rc=0)" ;;
                 3) err "reap: FAILED CLOSED (rc=3) — a read the reaper needs could not be taken; it removed nothing it could not prove. Repair continues." ;;
                 4) err "reap: completed with at least one FAILED removal (rc=4). Repair continues." ;;
                 *) err "reap: unexpected rc=$rc_reap from the reaper. Repair continues." ;;
@@ -355,11 +355,11 @@ one_pass() { # <dry-run:0|1>
         return "$EXIT_REFUSING"
     fi
     if [ "$dry" = 1 ]; then
-        say "dispatch: DRY-RUN (would run pr-doctor.py --max $cap for $REPO_SLUG at $REPO_PATH)"
+        log_line "dispatch: DRY-RUN (would run pr-doctor.py --max $cap for $REPO_SLUG at $REPO_PATH)"
         write_status idle "$cap" "$free_mb" "$load1" "${rc_reap:--}" dry-run "dry-run"
         return "$EXIT_OK"
     fi
-    say "dispatch: pr-doctor --max ${cap} for ${REPO_SLUG} at ${REPO_PATH}"
+    log_line "dispatch: pr-doctor --max ${cap} for ${REPO_SLUG} at ${REPO_PATH}"
     PR_DOCTOR_REPO="$REPO_SLUG" \
     PR_DOCTOR_REPO_DIR="$REPO_PATH" \
     OBJECTIVE_REPO="$REPO_SLUG" \
@@ -369,7 +369,7 @@ one_pass() { # <dry-run:0|1>
         timeout "${REPAIR_DOCTOR_TIMEOUT_S:-1800}" python3 "$doctor" --max "$cap"
     rc_dispatch=$?
     case "$rc_dispatch" in
-        0) say "dispatch: pass completed (rc=0)" ;;
+        0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
         3) err "dispatch: UNDELIVERED (rc=3) — the work was placed and no worker took it." ;;
         *) err "dispatch: unexpected rc=$rc_dispatch from pr-doctor." ;;
@@ -399,18 +399,18 @@ print_capacity() {
 
 show_status() {
     if [ ! -f "$STATUS" ]; then
-        say "no pass has been recorded yet ($STATUS absent) — NOT INSTALLED or never run, which is a different verdict from idle."
+        log_line "no pass has been recorded yet ($STATUS absent) — NOT INSTALLED or never run, which is a different verdict from idle."
         # ⛔ A SKIP RECORD IS THE ONLY EXPLANATION OF THIS STATE (round-4 review): returning here hid
         # `pr-repair.skip.json` exactly when it was the one artifact that said why nothing was recorded.
         if [ -f "$SKIP_STATUS" ]; then
-            say "a skip WAS recorded (another pass holds the lock; no pass has completed since):"
+            log_line "a skip WAS recorded (another pass holds the lock; no pass has completed since):"
             sed 's/^/  /' "$SKIP_STATUS"
         fi
         return "$EXIT_REFUSING"
     fi
     cat "$STATUS"
     if [ -f "$SKIP_STATUS" ]; then
-        say "last skip (another pass held the lock; no work attempted):"
+        log_line "last skip (another pass held the lock; no work attempted):"
         sed 's/^/  /' "$SKIP_STATUS"
     fi
 }
@@ -522,7 +522,7 @@ case "$MODE" in
         ;;
     loop)
         validate_knobs || { write_status refusing 0 - - - - "invalid-knob"; exit "$EXIT_REFUSING"; }
-        say "loop: interval ${INTERVAL_S}s, repo ${REPO_SLUG} at ${REPO_PATH}, checkout ${CELL_HOME}"
+        log_line "loop: interval ${INTERVAL_S}s, repo ${REPO_SLUG} at ${REPO_PATH}, checkout ${CELL_HOME}"
         # ⛔ THE LOOP NEVER DIES ON A BAD PASS. A deferred or refusing pass is a VERDICT, and the next
         # pass may be the one that works (the disk is reclaimed, the load falls). Exiting would make
         # systemd's Restart=always a crash-loop that repairs nothing — the #2700 §1.2 shape. The PASS
@@ -556,7 +556,7 @@ case "$MODE" in
             exit "$EXIT_REFUSING"
         fi
         validate_knobs || { write_status refusing 0 - - - - "invalid-knob"; exit "$EXIT_REFUSING"; }
-        say "trigger: ${REPO_SLUG} at ${REPO_PATH}; poll ${TRIGGER_POLL_S}s debounce ${TRIGGER_DEBOUNCE_S}s backstop ${TRIGGER_BACKSTOP_S}s retry_min ${TRIGGER_RETRY_MIN_S}s"
+        log_line "trigger: ${REPO_SLUG} at ${REPO_PATH}; poll ${TRIGGER_POLL_S}s debounce ${TRIGGER_DEBOUNCE_S}s backstop ${TRIGGER_BACKSTOP_S}s retry_min ${TRIGGER_RETRY_MIN_S}s"
         # ⛔ `exec`, not a subprocess: the trigger must BE the unit's main process, so `Restart=always`
         # and `KillMode=process` describe the thing that decides WHEN a pass runs. The repo/dir pair is
         # passed explicitly (the loop's own resolution, not a second default), and `--state-dir` keeps

@@ -79,7 +79,7 @@ LIST_ONLY=0
 PRINT_CONFIG=0
 ROOTS_GIVEN=0
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
 die() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
 num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
@@ -167,18 +167,18 @@ acquire_lock() {
     # reports a removal failure for something already gone. Capture the FIELDS, not the tail.
     owner="$(sed -n 's/^.*pid=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     started="$(sed -n 's/.*started=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
-    if num "$owner" && kill -0 "$owner" 2>/dev/null; then say "SKIP reason=lock-held pid=$owner"; return 3; fi
+    if num "$owner" && kill -0 "$owner" 2>/dev/null; then log_line "SKIP reason=lock-held pid=$owner"; return 3; fi
     # See the abandoned-worktree owner: only an UNATTRIBUTABLE lock is tokenless, and only while young.
     if ! num "$owner"; then
         if [ -f "$LOCK_DIR/token" ]; then _lmt="$(file_mtime "$LOCK_DIR/token")"; else _lmt="$(file_mtime "$LOCK_DIR")"; fi
         if num "$_lmt"; then
             _lage=$(( $(now) - _lmt ))
-            if [ "$_lage" -ge 0 ] && [ "$_lage" -le "$LOCK_STALE_SECONDS" ]; then say "SKIP reason=lock-tokenless age=${_lage}s"; return 3; fi
+            if [ "$_lage" -ge 0 ] && [ "$_lage" -le "$LOCK_STALE_SECONDS" ]; then log_line "SKIP reason=lock-tokenless age=${_lage}s"; return 3; fi
         fi
     fi
-    say "note: reclaiming a STALE lock ($LOCK_DIR, pid ${owner:-?} is gone)"
+    log_line "note: reclaiming a STALE lock ($LOCK_DIR, pid ${owner:-?} is gone)"
     rm -rf "$LOCK_DIR" 2>/dev/null
-    mkdir "$LOCK_DIR" 2>/dev/null || { say "SKIP reason=lock-uncreatable path=$LOCK_DIR"; return 3; }
+    mkdir "$LOCK_DIR" 2>/dev/null || { log_line "SKIP reason=lock-uncreatable path=$LOCK_DIR"; return 3; }
     printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
     LOCK_HELD=1; return 0
 }
@@ -251,7 +251,7 @@ family() { # <parent-dir> <marker-rel>
         [ -n "$c" ] || continue
         mt="$(file_mtime "$c/$marker")"
         if ! num "$mt"; then
-            say "KEPT   $c reason=newest-unprovable (cannot read $marker's mtime, so which copy is newest — and therefore which one must survive — is not provable; family untouched)"
+            log_line "KEPT   $c reason=newest-unprovable (cannot read $marker's mtime, so which copy is newest — and therefore which one must survive — is not provable; family untouched)"
             KEPT=$((KEPT + 1))
             return 0
         fi
@@ -265,50 +265,50 @@ family() { # <parent-dir> <marker-rel>
         if [ "$mt" -gt "$newest_mt" ]; then newest_mt="$mt"; newest="$c"; newest_tie=0; fi
     done <<<"$copies"
     if [ "$newest_tie" = 1 ]; then
-        say "KEPT   $parent reason=newest-tied (two or more copies carry the SAME install-marker mtime, so which one must survive is not provable — the family is untouched; this is the shape of a release unpacked several times)"
+        log_line "KEPT   $parent reason=newest-tied (two or more copies carry the SAME install-marker mtime, so which one must survive is not provable — the family is untouched; this is the shape of a release unpacked several times)"
         KEPT=$((KEPT + 1)); return 0
     fi
     if [ "$cp_count" -lt 2 ] || [ -z "$newest" ]; then
-        say "KEPT   $parent reason=count-unprovable (copies=$cp_count, newest=${newest:-none}; family untouched)"
+        log_line "KEPT   $parent reason=count-unprovable (copies=$cp_count, newest=${newest:-none}; family untouched)"
         KEPT=$((KEPT + 1)); return 0
     fi
     age=$(( ( $(now) - newest_mt ) / 60 ))
-    say "note: family $parent marker=$marker copies=$cp_count keep-newest=$newest ($([ "$age" -ge 0 ] && printf '%s' "$age" || printf 0)m old)"
+    log_line "note: family $parent marker=$marker copies=$cp_count keep-newest=$newest ($([ "$age" -ge 0 ] && printf '%s' "$age" || printf 0)m old)"
 
     while IFS= read -r c; do
         [ -n "$c" ] || continue
-        [ "$c" = "$newest" ] && { KEPT=$((KEPT + 1)); say "KEPT   $c reason=newest (the newest surviving copy is never removed)"; continue; }
+        [ "$c" = "$newest" ] && { KEPT=$((KEPT + 1)); log_line "KEPT   $c reason=newest (the newest surviving copy is never removed)"; continue; }
         # ⛔ AN UNRESOLVABLE PATH IS NOT AN IDLE ONE. `lp_path_held` treats an empty path as "not held",
         # so a copy whose physical path cannot be computed (a dangling link, a directory we cannot
         # enter) used to sail through both liveness guards and be removed. Keep it and say why.
         canon="$(lp_canon "$c")" || canon=""
         if [ -z "$canon" ]; then
-            KEPT=$((KEPT + 1)); say "KEPT   $c reason=unresolvable (its physical path cannot be computed, so no liveness proof is possible)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $c reason=unresolvable (its physical path cannot be computed, so no liveness proof is possible)"; continue
         fi
         if lp_path_held "$CENSUS" "$canon"; then
-            KEPT=$((KEPT + 1)); say "KEPT   $c reason=live-listener ($LP_HOLD_WHY — a runner killed mid-job is a lost job)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $c reason=live-listener ($LP_HOLD_WHY — a runner killed mid-job is a lost job)"; continue
         fi
         if lp_path_named "$CENSUS" "$canon"; then
-            KEPT=$((KEPT + 1)); say "KEPT   $c reason=argv-named ($LP_NAME_WHY — a live process was started from this copy)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $c reason=argv-named ($LP_NAME_WHY — a live process was started from this copy)"; continue
         fi
         if out="$(unit_reference "$c")"; then
-            KEPT=$((KEPT + 1)); say "KEPT   $c reason=unit-referenced ($out starts this copy)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $c reason=unit-referenced ($out starts this copy)"; continue
         fi
         mt="$(file_mtime "$c/$marker")"
         num "$mt" && age=$(( ( $(now) - mt ) / 60 ))
         if num "$mt" && [ "$age" -lt "$AGED_MINUTES" ]; then
-            KEPT=$((KEPT + 1)); say "KEPT   $c reason=young (age=${age}m < ${AGED_MINUTES}m — a fresh install may be mid-configuration)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $c reason=young (age=${age}m < ${AGED_MINUTES}m — a fresh install may be mid-configuration)"; continue
         fi
         CAND=$((CAND + 1))
         if [ "$DRY_RUN" = 1 ]; then
             # Path alone on its line; the reason beneath it — the family's own convention
             # (`pi-reap-worktrees.sh`: `preserve <path>` then `reason=…`).
-            say "remove $c"
-            say "         duplicate of $marker; the newest copy kept is $newest"
+            log_line "remove $c"
+            log_line "         duplicate of $marker; the newest copy kept is $newest"
             continue
         fi
         if [ "$(now)" -ge "$DEADLINE" ]; then
-            say "KEPT   $c reason=budget (the ${BUDGET}s budget is spent; unprocessed copies are PRESERVED)"
+            log_line "KEPT   $c reason=budget (the ${BUDGET}s budget is spent; unprocessed copies are PRESERVED)"
             KEPT=$((KEPT + 1)); continue
         fi
         # ⛔ NEVER THE LAST COPY. The newest is already excluded above, so this can only fire if the
@@ -323,7 +323,7 @@ family() { # <parent-dir> <marker-rel>
             [ -d "$other" ] && [ "$other" != "$c" ] && [ -f "$other/$marker" ] && left=$((left + 1))
         done
         if [ "$left" -lt 1 ]; then
-            KEPT=$((KEPT + 1)); say "KEPT   $c reason=last-copy (no other copy of $marker survives — refusing to empty the family)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $c reason=last-copy (no other copy of $marker survives — refusing to empty the family)"; continue
         fi
         # ⛔ RE-PROBE IMMEDIATELY BEFORE THE DESTRUCTIVE CALL (#2676 review, cycle 1, P1). The liveness
         # tests above read a census taken ONCE at pass start, and a pass may run for the whole BUDGET,
@@ -335,13 +335,13 @@ family() { # <parent-dir> <marker-rel>
         # pass start. An unreadable fresh census is a PRESERVE, never a pass — the same polarity as
         # every other unreadable read in this file.
         if ! toctou_preserve "$canon" "$c"; then
-            KEPT=$((KEPT + 1)); say "KEPT   $c reason=toctou ($TOCTOU_WHY — the pass-start snapshot was stale; re-probed immediately before removal)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $c reason=toctou ($TOCTOU_WHY — the pass-start snapshot was stale; re-probed immediately before removal)"; continue
         fi
         if rm -rf "$c" 2>/dev/null && [ ! -d "$c" ]; then
-            REAPED=$((REAPED + 1)); say "REAPED $c how=rm (duplicate $marker copy; newest kept is $newest)"
+            REAPED=$((REAPED + 1)); log_line "REAPED $c how=rm (duplicate $marker copy; newest kept is $newest)"
             log "reaped $c marker=$marker newest=$newest"
         else
-            FAILED=$((FAILED + 1)); say "ERR    $c reason=remove-failed"; log "REMOVAL FAILED $c"
+            FAILED=$((FAILED + 1)); log_line "ERR    $c reason=remove-failed"; log "REMOVAL FAILED $c"
         fi
     done <<<"$copies"
     return 0
@@ -350,13 +350,13 @@ family() { # <parent-dir> <marker-rel>
 if ! acquire_lock; then exit 3; fi
 
 CENSUSDIR="$(mktemp -d "${TMPDIR:-/tmp}/reap-di-census.XXXXXX" 2>/dev/null)" || CENSUSDIR=""
-if [ -z "$CENSUSDIR" ]; then say "SKIP reason=census-dir-uncreatable"; release_lock; exit 3; fi
+if [ -z "$CENSUSDIR" ]; then log_line "SKIP reason=census-dir-uncreatable"; release_lock; exit 3; fi
 trap 'release_lock; rm -rf "$CENSUSDIR" 2>/dev/null' EXIT
 CENSUS="$CENSUSDIR/live-paths.tsv"
 
 MODE_TEXT=dry-run; [ "$DRY_RUN" = 1 ] || MODE_TEXT=apply
 DEADLINE=$(( $(now) + BUDGET ))
-say "reap-duplicate-installs: pass start mode=$MODE_TEXT roots=$(printf '%s' "$ROOTS" | tr ':' ',') markers=$(printf '%s' "$MARKERS" | tr ':' ',') aged=${AGED_MINUTES}m pid=$$"
+log_line "reap-duplicate-installs: pass start mode=$MODE_TEXT roots=$(printf '%s' "$ROOTS" | tr ':' ',') markers=$(printf '%s' "$MARKERS" | tr ':' ',') aged=${AGED_MINUTES}m pid=$$"
 # An EXPLICIT seam that does not name a readable process table forces the fail-closed arm: the seam
 # says WHICH table to read, so falling through to `lsof` would silently read a different one and
 # report green — the exact "the documented way to test the refusal cannot reach it" defect.
@@ -364,21 +364,21 @@ say "reap-duplicate-installs: pass start mode=$MODE_TEXT roots=$(printf '%s' "$R
 # EMPTY directory — the natural spelling of a test seam (`mktemp -d`) — passed an existence check and
 # fell through to `lsof`, reading a different table and reporting green.
 if [ -n "${REAP_DI_PROC_ROOT:-}" ] && [ ! -e "${REAP_DI_PROC_ROOT}/self/cwd" ] && ! ls "${REAP_DI_PROC_ROOT}"/[0-9]*/cwd >/dev/null 2>&1; then
-    say "note: REAP_DI_PROC_ROOT=$REAP_DI_PROC_ROOT is not a process table — forcing the fail-closed arm rather than reading a different one"
+    log_line "note: REAP_DI_PROC_ROOT=$REAP_DI_PROC_ROOT is not a process table — forcing the fail-closed arm rather than reading a different one"
     LP_CENSUS_UNAVAILABLE=1
 fi
 export LP_PROC_ROOT="${LP_PROC_ROOT:-${REAP_DI_PROC_ROOT:-/proc}}"
 if ! lp_census "$CENSUSDIR"; then
-    say "SKIP reason=census-unreadable mechanism=${LP_CENSUS_MECH:-none} — the process list could not be read, so NO copy can be proven idle; nothing was reaped (fail closed)"
-    say "SUMMARY class=duplicate-install mode=$MODE_TEXT families=0 candidates=0 reaped=0 kept=0 failed=0 census=unreadable"
+    log_line "SKIP reason=census-unreadable mechanism=${LP_CENSUS_MECH:-none} — the process list could not be read, so NO copy can be proven idle; nothing was reaped (fail closed)"
+    log_line "SUMMARY class=duplicate-install mode=$MODE_TEXT families=0 candidates=0 reaped=0 kept=0 failed=0 census=unreadable"
     log "SKIP census-unreadable mechanism=${LP_CENSUS_MECH:-none}"
     exit 3
 fi
-say "reap-duplicate-installs: $(lp_description)"
+log_line "reap-duplicate-installs: $(lp_description)"
 
 while IFS= read -r root; do
     [ -n "$root" ] || continue
-    [ -d "$root" ] || { say "note: root $root does not exist — nothing to scan there"; continue; }
+    [ -d "$root" ] || { log_line "note: root $root does not exist — nothing to scan there"; continue; }
     for parent in "$root"/*/; do
         parent="${parent%/}"
         [ -d "$parent" ] && [ ! -L "$parent" ] || continue
@@ -390,7 +390,7 @@ while IFS= read -r root; do
     done
 done <<<"$(printf '%s\n' "$ROOTS" | tr ':' '\n')"
 
-say "SUMMARY class=duplicate-install mode=$MODE_TEXT families=$FAMILIES candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED census=ok rows=$LP_CENSUS_ROWS pids=$LP_CENSUS_PIDS aged=${AGED_MINUTES}m"
+log_line "SUMMARY class=duplicate-install mode=$MODE_TEXT families=$FAMILIES candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED census=ok rows=$LP_CENSUS_ROWS pids=$LP_CENSUS_PIDS aged=${AGED_MINUTES}m"
 log "SUMMARY mode=$MODE_TEXT families=$FAMILIES candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED"
 
 [ "$FAILED" -gt 0 ] && exit 4

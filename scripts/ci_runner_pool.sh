@@ -140,7 +140,7 @@ POOL_LABEL_ARM64="self-hosted-arm64"
 DRY=0
 MEM_MB=""; NCPU=""; CEILING=""; LISTENER_PID=""; SLOTS=""
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
 
 # mb_as_gb <mb> — the human form the owner reads ("2.21 GB"), never the only form printed.
@@ -505,7 +505,7 @@ start_listener() {
   while [ "$i" -lt $((SETTLE_S * 2)) ]; do
     rc=0; probe_listener "$d" || rc=$?
     case "$rc" in
-      0) say "listener_pid=$LISTENER_PID"; return 0 ;;
+      0) log_line "listener_pid=$LISTENER_PID"; return 0 ;;
       2) return 2 ;;   # cannot measure: never claim a start, never wait blind
     esac
     sleep 0.5; i=$((i + 1))
@@ -624,7 +624,7 @@ cmd_add() {
     *",$POOL_LABEL_X64,"*|*",$POOL_LABEL_ARM64,"*) ;;
     *) err "cannot-measure why=label-unknown value=$label — a runner without $POOL_LABEL_X64/$POOL_LABEL_ARM64 matches no job and is invisible to ci_runner_gate.sh"; return 2 ;;
   esac
-  say "reading: MemAvailable=$(mb_as_gb "$MEM_MB") GB (${MEM_MB} MB) floor=$(mb_as_gb "$MEM_FLOOR_MB") GB ncpu=$NCPU ceiling=$CEILING slots=$SLOTS labels=$label"
+  log_line "reading: MemAvailable=$(mb_as_gb "$MEM_MB") GB (${MEM_MB} MB) floor=$(mb_as_gb "$MEM_FLOOR_MB") GB ncpu=$NCPU ceiling=$CEILING slots=$SLOTS labels=$label"
 
   [ -x "$RUNNER_TEMPLATE/config.sh" ] || {
     err "cannot-act why=runner-template-absent path=$RUNNER_TEMPLATE/config.sh (one complete runner install to copy)"; return 2
@@ -637,7 +637,7 @@ cmd_add() {
     if [ -z "${RUNNER_TOKEN:-}" ] && ! command -v "$GH_CMD" >/dev/null 2>&1; then
       err "cannot-act why=no-registration-token repo=$POOL_REPO (set RUNNER_TOKEN, or put $GH_CMD on PATH) — a preview cannot mint one"; return 2
     fi
-    say "dry-run: would copy $RUNNER_TEMPLATE to $dir, register name=$name and start its listener"; return 0
+    log_line "dry-run: would copy $RUNNER_TEMPLATE to $dir, register name=$name and start its listener"; return 0
   fi
 
   token="${RUNNER_TOKEN:-}"
@@ -733,7 +733,7 @@ cmd_add() {
     err "registered=1 listener=dead name=$name dir=$dir — the registration is in place; run: $SELF restart --name $name"
     return 2
   fi
-  say "added name=$name dir=$dir listener_pid=$(listener_pid "$dir")"
+  log_line "added name=$name dir=$dir listener_pid=$(listener_pid "$dir")"
   return 0
 }
 
@@ -817,16 +817,16 @@ cmd_restart() {
   # idle — the worst of the three states. The owner's floor sentence names ADDING, not restarting.
   rc=0; probe_listener "$dir" || rc=$?
   case "$rc" in
-    0) say "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
+    0) log_line "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
     2) return 2 ;;   # cannot measure: START NOTHING (a blind start is how a listener is doubled)
   esac
   # ⛔ THE START'S OWN PRECONDITION IS CHECKED BEFORE THE DRY RETURN, so a preview cannot announce a
   # start the real pass refuses. `start_listener` re-checks it (defence in depth), but a check that
   # only lives downstream of the `--dry-run` return is a preview that lies.
   [ -x "$dir/run.sh" ] || { err "cannot-act why=runner-not-installed path=$dir/run.sh"; return 2; }
-  if [ "$DRY" = 1 ]; then say "dry-run: would start the listener for name=$name"; return 0; fi
+  if [ "$DRY" = 1 ]; then log_line "dry-run: would start the listener for name=$name"; return 0; fi
   start_listener "$dir" || return 2
-  say "restarted name=$name pid=$(listener_pid "$dir")"
+  log_line "restarted name=$name pid=$(listener_pid "$dir")"
   return 0
 }
 
@@ -955,9 +955,9 @@ cmd_reconcile() {
     # slots + what the preview has already announced.
     if [ "$DRY" = 1 ]; then
       [ $(( SLOTS + dry_adds )) -lt "$CEILING" ] || {
-        say "dry-run: ceiling would be reached slots=$SLOTS+$dry_adds ceiling=$CEILING ncpu=$NCPU"; break; }
+        log_line "dry-run: ceiling would be reached slots=$SLOTS+$dry_adds ceiling=$CEILING ncpu=$NCPU"; break; }
     else
-      [ "$SLOTS" -lt "$CEILING" ] || { say "ceiling reached slots=$SLOTS ceiling=$CEILING ncpu=$NCPU"; break; }
+      [ "$SLOTS" -lt "$CEILING" ] || { log_line "ceiling reached slots=$SLOTS ceiling=$CEILING ncpu=$NCPU"; break; }
     fi
     scan=0
     while [ -e "$RUNNER_ROOT/$POOL_PREFIX-$n" ]; do

@@ -55,7 +55,7 @@
 # there, including that the cap is REACHED and that a lane can never merge without the chain.
 
 set -u
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 say_err() { printf '%s\n' "$*" >&2; }
 
 PR=""; ISSUE=""; OR=""; BR=""; WATCH=0; STATUS=0
@@ -208,7 +208,7 @@ round_of() { local r=0; [ -f "$ROUND_F" ] && r="$(cat "$ROUND_F" 2>/dev/null || 
 
 # ── --status: no network, no writes. chain-merge.sh and an operator both read this. ──────────────
 if [ "$STATUS" -eq 1 ]; then
-  if [ -f "$VERDICT_F" ]; then cat "$VERDICT_F"; else say "NONE round=$(round_of)/$MAX_ROUNDS"; fi
+  if [ -f "$VERDICT_F" ]; then cat "$VERDICT_F"; else log_line "NONE round=$(round_of)/$MAX_ROUNDS"; fi
   exit 0
 fi
 
@@ -461,14 +461,14 @@ fi
         # on the first pass for ever (round-4 reviewer).
         rm -f "$O/state/lanemerge-$PR.headmoved" "$O/state/lanemerge-$PR.apiretry" \
               "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true
-        say "lane-merge: pid $opid already owns PR #$PR — supervising it at the recorded head $(chain_head) (log $(chain_log))"
+        log_line "lane-merge: pid $opid already owns PR #$PR — supervising it at the recorded head $(chain_head) (log $(chain_log))"
       else
         printf '%s %s %s\n' "$opid" "${head:-}" "$O/logs/merge-$PR.log" > "$CHAIN_F"
-        say "lane-merge: pid $opid already owns PR #$PR — supervising it (log $O/logs/merge-$PR.log)"
+        log_line "lane-merge: pid $opid already owns PR #$PR — supervising it (log $O/logs/merge-$PR.log)"
       fi
       return 0
     fi
-    say "lane-merge: a STALE merge lock (pid ${opid:-?} is not alive) — clearing it and taking the PR"
+    log_line "lane-merge: a STALE merge lock (pid ${opid:-?} is not alive) — clearing it and taking the PR"
     rm -f "$O/state/mergeclaim-$PR.lock"
   fi
   # ⛔ THE OUTCOME MUST OUTLIVE THE LANE (E6). This chain is launched DETACHED precisely so it keeps
@@ -508,7 +508,7 @@ fi
   printf '%s %s %s\n' "$!" "${head:-}" "$CHAIN_LOG" > "$CHAIN_F"
   rm -f "$O/state/lanemerge-$PR.headmoved" "$O/state/lanemerge-$PR.lastdisp" \
         "$O/state/lanemerge-$PR.apiretry" 2>/dev/null || true
-  say "lane-merge: launched the merge chain (pid $!, log $CHAIN_LOG)"
+  log_line "lane-merge: launched the merge chain (pid $!, log $CHAIN_LOG)"
   return 0
 }
 
@@ -656,7 +656,7 @@ post_handoff() { # post_handoff <verdict-token> <reason>
   # comments an existing marker was never in the page and every invocation re-posted the handoff — a
   # write on a rate-limited account shared by 22 landers (reviewer finding).
   if gh api "repos/$OR/issues/$PR/comments?per_page=100&sort=created&direction=desc" --jq '.[].body' 2>/dev/null | grep -qF "lane-merge-handoff: ${HEAD:-unknown}"; then
-    say "lane-merge: a handoff comment for this head already exists — not repeating it"
+    log_line "lane-merge: a handoff comment for this head already exists — not repeating it"
     return 0
   fi
   body="$(mktemp "${TMPDIR:-/tmp}/lane-merge-handoff.XXXXXX")"
@@ -741,7 +741,7 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     esac
   } > "$body"
   if gh api -X POST "repos/$OR/issues/$PR/comments" -F "body=@$body" >/dev/null 2>&1; then
-    say "lane-merge: handoff comment posted on PR #$PR (the next holder inherits a diagnosis)"
+    log_line "lane-merge: handoff comment posted on PR #$PR (the next holder inherits a diagnosis)"
   else
     say_err "lane-merge: ⚠️ could not post the handoff comment (rate limit or auth) — the reason is in"
     say_err "            $VERDICT_F and must be relayed in the lane's final message"
@@ -771,12 +771,12 @@ emit_fix() { # emit_fix <TOKEN> <reason…>
     # what the lane spent — but the comment renders the GRANTED count (clamped at the cap).
     HANDOFF_NEXT=cap post_handoff BLOCKED_ATTEMPTS "round cap reached (${MAX_ROUNDS}/${MAX_ROUNDS}): $*"
     verdict BLOCKED_ATTEMPTS "round cap ${MAX_ROUNDS} reached: $*"
-    say "⛔ BLOCKED_ATTEMPTS — round cap ${MAX_ROUNDS} reached. $*"
-    say "   Hand off. The exact reason is on PR #$PR as a comment."
+    log_line "⛔ BLOCKED_ATTEMPTS — round cap ${MAX_ROUNDS} reached. $*"
+    log_line "   Hand off. The exact reason is on PR #$PR as a comment."
     exit 13
   fi
   verdict "$tok" "$*"
-  say "→ $tok (round ${r}/${MAX_ROUNDS}): $*"
+  log_line "→ $tok (round ${r}/${MAX_ROUNDS}): $*"
   case "$tok" in
     FIX_CONFLICT) exit 15 ;;
     *)            exit 10 ;;
@@ -803,7 +803,7 @@ review_record_at_head() {
 emit_attestation() { # emit_attestation <reason…>
   verdict BLOCKED_ATTESTATION "$*"
   post_handoff BLOCKED_ATTESTATION "$*"
-  say "⛔ BLOCKED_ATTESTATION — $*"
+  log_line "⛔ BLOCKED_ATTESTATION — $*"
   exit 12
 }
 
@@ -811,7 +811,7 @@ emit_blocked() { # emit_blocked <TOKEN> <reason…>
   local tok="$1"; shift
   verdict "$tok" "$*"
   post_handoff "$tok" "$*"
-  say "⛔ $tok — $*"
+  log_line "⛔ $tok — $*"
   exit 14
 }
 
@@ -883,7 +883,7 @@ if [ "$WATCH" -eq 1 ]; then
   # anything. The plain (non---watch) path already had this order; only the supervised path inverted it.
   if [ "${ST:-}" = closed ] && [ -n "${MT:-}" ]; then
     verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${MT:-${HD:-}}")"
-    say "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
+    log_line "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
   fi
   if [ "$w" -gt "$MAX_WATCH" ]; then
     # ⛔ A CHUNK THAT ESTABLISHED NOTHING MUST NOT BE REPORTED AS "UNRESOLVED" (reviewer finding, P2,
@@ -928,7 +928,7 @@ if [ "$WATCH" -eq 1 ]; then
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks): the merge chain has not resolved this PR"
         verdict BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} chunks)" ;;
     esac
-    say "⛔ BLOCKED_ATTEMPTS — ${MAX_WATCH} --watch chunks spent and the chain is still unresolved."
+    log_line "⛔ BLOCKED_ATTEMPTS — ${MAX_WATCH} --watch chunks spent and the chain is still unresolved."
     exit 13
   fi
     # ⛔ A READ THAT PARSED TO NOTHING IS NOT "CLOSED AND NOT MERGED" (reviewer finding, P2, REPRODUCED).
@@ -945,7 +945,7 @@ if [ "$WATCH" -eq 1 ]; then
                 # this record back as "the merge sha" — a path-dependent payload makes that a trap. MT
                 # is the fallback when the follow-up read cannot answer.
                 verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${MT:-${HD:-}}")"
-                say "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
+                log_line "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
               else
                 emit_blocked BLOCKED_CLOSED "PR #$PR is closed and was not merged by this chain"
               fi ;;
@@ -958,8 +958,8 @@ if [ "$WATCH" -eq 1 ]; then
     # hand-off about a chain that was never launched, reachable because WAITING and WAITING_CHECKS share
     # exit 11 and the brief maps 11 → "call --watch". Say what is true and say nothing on the PR.
     if ! chain_alive && [ ! -s "$CHAIN_F" ] && [ ! -f "$O/state/mergeclaim-$PR.lock" ]; then
-      say "⚠️ there is NO chain record for PR #$PR and no claim lock — nothing is being supervised."
-      say "   Launch one: lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
+      log_line "⚠️ there is NO chain record for PR #$PR and no claim lock — nothing is being supervised."
+      log_line "   Launch one: lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
       disposition WAITING_CHAIN_ABSENT
       verdict WAITING_CHAIN_ABSENT "no merge chain is recorded or owned for this PR; launch one (nothing was decided)"
       exit 11
@@ -972,8 +972,8 @@ if [ "$WATCH" -eq 1 ]; then
       # finishes the old head); a SECOND is a stuck chain, and that is a hand-off with a name.
       _hm=$(( $(cat "$O/state/lanemerge-$PR.headmoved" 2>/dev/null || echo 0) + 1 ))
       printf '%s\n' "$_hm" > "$O/state/lanemerge-$PR.headmoved" 2>/dev/null || true
-      say "… the PR head moved past the chain's head ($(chain_head) → ${HD}) — the chain is working"
-      say "   a head that is no longer the tip (pass $_hm of 2)."
+      log_line "… the PR head moved past the chain's head ($(chain_head) → ${HD}) — the chain is working"
+      log_line "   a head that is no longer the tip (pass $_hm of 2)."
       if [ "$_hm" -ge 2 ]; then
         emit_blocked BLOCKED "the merge chain (pid $(chain_pid)) is still bound to head $(chain_head) after 2 passes while the PR is at ${HD} — wait for it to exit, or kill pid $(chain_pid) and re-run"
       fi
@@ -1000,12 +1000,12 @@ if [ "$WATCH" -eq 1 ]; then
         # pass even if the guard it names were deleted. `read_up` is assigned unconditionally at the top
         # of this tick, so the plain `-n "$read_up"` form is set -u safe and leaves ONE grep site.
         if [ -n "$read_up" ]; then
-          say "… the PR read came back INCOMPLETE this chunk (state '${ST:-}' head '${HD:-}' from '${read_up}')"
-          say "   — a truncated or partial response is not a fact about the PR, so nothing is decided:"
+          log_line "… the PR read came back INCOMPLETE this chunk (state '${ST:-}' head '${HD:-}' from '${read_up}')"
+          log_line "   — a truncated or partial response is not a fact about the PR, so nothing is decided:"
         else
-          say "… the PR could not be READ this chunk (rate limit / auth / DNS) — nothing about it is decided:"
+          log_line "… the PR could not be READ this chunk (rate limit / auth / DNS) — nothing about it is decided:"
         fi
-        say "   no attestation, no hand-off comment, no fix round. Re-run when gh answers."
+        log_line "   no attestation, no hand-off comment, no fix round. Re-run when gh answers."
         disposition WAITING_API
         verdict WAITING_API "the PR read failed this chunk; no judgement about the PR was made"
         exit 11
@@ -1016,7 +1016,7 @@ if [ "$WATCH" -eq 1 ]; then
           # The classifier already confirmed with one API read; the payload is the merge commit.
           msha="$(merged_confirmed 2>/dev/null)"
           verdict MERGED "${msha:-${HD:-}}"
-          say "✅ MERGED — PR #$PR, merge commit ${msha:-?} (was head ${HD:-?})"; exit 0 ;;
+          log_line "✅ MERGED — PR #$PR, merge commit ${msha:-?} (was head ${HD:-?})"; exit 0 ;;
         API_UNREADABLE)
           # The evidence we need could not be read. That is a WAIT, not a verdict: no comment, no round,
           # and the next invocation asks again (the counter is untouched).
@@ -1036,12 +1036,12 @@ if [ "$WATCH" -eq 1 ]; then
             _n_ar=$(( _n_ar + 1 )); printf '%s\n' "$_n_ar" > "$_ar" 2>/dev/null || true
             w="$(cat "$WATCH_F" 2>/dev/null || echo 0)"; is_limit "$w" || w=0
             [ "$w" -gt 0 ] && printf '%s\n' "$(( w - 1 ))" > "$WATCH_F" 2>/dev/null
-            say "… the API could not be read (retry $_n_ar/$MAX_WATCH this cycle) — no round and no chunk is spent"
+            log_line "… the API could not be read (retry $_n_ar/$MAX_WATCH this cycle) — no round and no chunk is spent"
           else
-            say "… the API STILL cannot be read after $MAX_WATCH retries this cycle — the chunk is charged"
+            log_line "… the API STILL cannot be read after $MAX_WATCH retries this cycle — the chunk is charged"
           fi
           disposition WAITING_API
-          say "… the API could not be read while confirming the merge — re-run the loop (no round and no chunk is spent)"
+          log_line "… the API could not be read while confirming the merge — re-run the loop (no round and no chunk is spent)"
           verdict WAITING_API "the merge confirmation read failed; not a statement about the PR"
           exit 11 ;;
         UNCONFIRMED_MERGE)
@@ -1057,13 +1057,13 @@ if [ "$WATCH" -eq 1 ]; then
           # tool failed, so there IS no review comment — telling the lane to read one is a hand-off to
           # nowhere, and charging it a fix round spends the lane's budget on nothing. It is re-runnable
           # like the load gate, and it is bounded by the watch counter (it does NOT refund).
-          say "… the reviewer produced NO verdict at head ${HD:-} (cap hit or tool failure) — there is no"
-          say "   review comment to read; re-run the chain: lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
+          log_line "… the reviewer produced NO verdict at head ${HD:-} (cap hit or tool failure) — there is no"
+          log_line "   review comment to read; re-run the chain: lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
           disposition WAITING_NO_VERDICT
           verdict WAITING_NO_VERDICT "the reviewer produced no verdict (no comment to read); re-run the chain"
           exit 11 ;;
-        LOAD)    say "… the reviewer was refused by the load gate; this is not a lane failure — re-run:"
-                 say "   lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
+        LOAD) log_line "… the reviewer was refused by the load gate; this is not a lane failure — re-run:"
+                 log_line "   lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
                  disposition WAITING_LOAD
                  verdict WAITING_LOAD "reviewer refused by the load gate; re-dispatch when the box quietens"
                  exit 11 ;;
@@ -1081,12 +1081,12 @@ if [ "$WATCH" -eq 1 ]; then
                  if ! review_record_at_head; then
                    emit_attestation "green and mergeable, but no signed review record exists for head ${HEAD:-?} and the chain did not merge; a lane cannot mint one for itself"
                  fi
-                 say "… the chain exited without merging and its log names no cause — see $(chain_log)"
+                 log_line "… the chain exited without merging and its log names no cause — see $(chain_log)"
                  emit_blocked BLOCKED "the merge chain exited without a merge or a named cause (log: $(chain_log))" ;;
       esac
     fi
     now="$(date +%s)"
-    [ "$now" -ge "$deadline" ] && { disposition WAITING_CHAIN_RUNNING; say "… WAITING — the chain is still running (pid $(chain_pid)); call --watch again"; exit 11; }
+    [ "$now" -ge "$deadline" ] && { disposition WAITING_CHAIN_RUNNING; log_line "… WAITING — the chain is still running (pid $(chain_pid)); call --watch again"; exit 11; }
     sleep "$INTERVAL"
   done
 fi
@@ -1120,7 +1120,7 @@ case "$ST" in
       # re-runs after the chain already merged, i.e. the common post-change case. Same fallback order as
       # the watch arm: merge_commit_sha, then merged_at, then the head only if neither could be read.
       verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${MT:-$HEAD}")"
-      say "✅ MERGED — PR #$PR at head $HEAD"; exit 0
+      log_line "✅ MERGED — PR #$PR at head $HEAD"; exit 0
     fi
     emit_blocked BLOCKED_CLOSED "PR #$PR is closed and was NOT merged" ;;
 esac
@@ -1157,7 +1157,7 @@ while :; do
   if [ -z "${rows:-}" ]; then
     # An EMPTY check-run set is not a green set: nothing has been measured. Keep polling (this is
     # the "a queued run is not a green run" rule at its surface), and the bound below reports it.
-    say "… no check-runs reported for head ${HEAD:0:12} yet — a queued run is not a green run"
+    log_line "… no check-runs reported for head ${HEAD:0:12} yet — a queued run is not a green run"
     IF=1; RED=""
   else
     printf '%s\n' "$rows" > "$CHECK_TMP"
@@ -1196,14 +1196,14 @@ while :; do
       lsick_why="$(printf '%s' "${lrow:-}" | cut -f3-)"
       case "$lsick_action" in
         RERUN-FLAKE)
-          say "… this head's red is a FLAKE, not a fix: ${lsick_why:-a job passed at this same head}"
-          say "   re-trigger the FAILED jobs (same sha, no new head, no attestation stranded):"
-          say "     gh run rerun ${lsick_run:-<run>} --failed --repo $OR"
+          log_line "… this head's red is a FLAKE, not a fix: ${lsick_why:-a job passed at this same head}"
+          log_line "   re-trigger the FAILED jobs (same sha, no new head, no attestation stranded):"
+          log_line "     gh run rerun ${lsick_run:-<run>} --failed --repo $OR"
           disposition WAITING_FLAKE
           verdict WAITING_FLAKE "flake at ${HD:-${HEAD:-}}: rerun run ${lsick_run:-?} --failed; no fix, no new head"
           exit 11 ;;
         unavailable)
-          say "… router unavailable (${lsick_why:-no reason recorded}) — this head's red is treated as fixable"
+          log_line "… router unavailable (${lsick_why:-no reason recorded}) — this head's red is treated as fixable"
           lrow="unavailable" ;;
       esac
     fi
@@ -1218,13 +1218,13 @@ while :; do
   # not spam 45 identical lines) and at least once a minute otherwise.
   now="$(date +%s)"
   if [ "${IF:-}" != "${_last_if:-}" ] || [ $(( now - ${_last_say:-0} )) -ge 60 ]; then
-    say "… ${IF} check(s) in flight at head ${HEAD:0:12} — waiting ($(( deadline - now ))s left in this bound)"
+    log_line "… ${IF} check(s) in flight at head ${HEAD:0:12} — waiting ($(( deadline - now ))s left in this bound)"
     _last_if="$IF"; _last_say="$now"
   fi
   if [ "$now" -ge "$deadline" ]; then
     # In flight at the bound is NOT a failure of the lane and NOT a green: it is an unexplained
     # wait. Say so and let the caller re-run (a re-run costs one PR read).
-    say "… checks still IN FLIGHT (${IF}) after ${WAIT_S}s — re-run this script; nothing was merged"
+    log_line "… checks still IN FLIGHT (${IF}) after ${WAIT_S}s — re-run this script; nothing was merged"
     disposition WAITING_CHECKS
     verdict WAITING_CHECKS "checks still in flight after ${WAIT_S}s"
     exit 11
@@ -1239,5 +1239,5 @@ done
 # Green + mergeable → launch the harness chain (fresh reviewer where the repo needs one, the repo's
 # own rail where it does not) and hand control to --watch.
 launch_chain "$HEAD" || exit 2
-say "… the merge chain owns PR #$PR now. Next: lane-merge.sh $PR --watch (bounded chunk; repeat)"
+log_line "… the merge chain owns PR #$PR now. Next: lane-merge.sh $PR --watch (bounded chunk; repeat)"
 exit 11

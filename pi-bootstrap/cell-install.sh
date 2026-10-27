@@ -195,7 +195,7 @@ MODE="${1:---install}"
 FAILURES=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
 die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
-say()  { printf '  %s\n' "$*"; }
+log_line()  { printf '  %s\n' "$*"; }
 
 # ── the deny list: what must not run ON A CELL ──────────────────────────────
 # Kept as data so the deny is readable and testable, and so the DEFAULT for a new
@@ -470,12 +470,12 @@ install_farms() {
   if [ "$n" -lt "$MIN_FARM_FILES" ]; then
     die "the declared farm set parsed to only $n file(s) (floor: $MIN_FARM_FILES) — setup.sh's shape changed and this parse would install a PARTIAL layer, then verify clean against its own truncated reading. Nothing was certified."
   fi
-  say "scripts farm: $n file(s) installed (declared by pi-bootstrap/setup.sh)"
+  log_line "scripts farm: $n file(s) installed (declared by pi-bootstrap/setup.sh)"
   # Observability for the layer that decides whether a landing is evidence-bound (#984). `--verify`
   # is the authority (`guard_gh_shim`), but an INSTALL log should say out loud whether the cell now
   # carries an argv layer at all — install silence is how a cell ran degraded while looking green.
   if [ -x "$DEST/scripts/gh-shim/gh" ]; then
-    say "argv-level gh shim: $DEST/scripts/gh-shim/gh (merge gate not degraded — #984)"
+    log_line "argv-level gh shim: $DEST/scripts/gh-shim/gh (merge gate not degraded — #984)"
   else
     fail "the argv-level gh shim did not land at $DEST/scripts/gh-shim/gh — this cell's merge gate would run DEGRADED (#984)"
   fi
@@ -612,10 +612,10 @@ install_extensions() {
     # `--install` and would still refuse the cell, so this is not a false PASS — but a log that
     # contradicts itself two lines later is exactly what sends an operator down the wrong path.
     rm -rf "$DEST/extensions/$dbase" || die "could not remove the denied extension at $DEST/extensions/$dbase — the cell would keep running it"
-    say "removed denied extension: $dbase ($(denied_extension_note "$dbase"))"
+    log_line "removed denied extension: $dbase ($(denied_extension_note "$dbase"))"
     removed=$((removed + 1))
   done
-  say "extensions: $n installed from manifest.json (ship-list: $total), $((${#DENY_EXTENSIONS[@]})) denied on a cell, $removed removed"
+  log_line "extensions: $n installed from manifest.json (ship-list: $total), $((${#DENY_EXTENSIONS[@]})) denied on a cell, $removed removed"
 }
 
 # Extension runtime dependencies. Four shipped extensions import bare packages
@@ -661,7 +661,7 @@ install_extension_deps() {
     if (cd "$d" && env -i PATH="$PATH" HOME="$npm_home" TMPDIR="${TMPDIR:-/tmp}" \
           ${npm_env[@]+"${npm_env[@]}"} \
           npm install --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null 2>&1); then
-      say "deps installed: $base"
+      log_line "deps installed: $base"
     else
       fail "npm install failed for $base — that extension will not load (re-run with network, or: cd '$d' && npm install --omit=dev)"
     fi
@@ -674,7 +674,7 @@ install_skills() {
   [ -d "$INFRA_ROOT/skills" ] || die "no skills/ directory in $INFRA_ROOT"
   mkdir -p "$DEST/skills" && cp -R "$INFRA_ROOT/skills/." "$DEST/skills/" \
     || die "could not install skills"
-  say "skills: $(find "$DEST/skills" -name SKILL.md 2>/dev/null | wc -l | tr -d ' ') SKILL.md file(s) installed"
+  log_line "skills: $(find "$DEST/skills" -name SKILL.md 2>/dev/null | wc -l | tr -d ' ') SKILL.md file(s) installed"
 }
 
 # copy_repo_path <rel> — install a repo file or directory at its basename under $DEST.
@@ -722,7 +722,7 @@ install_config() {
   done
   # The step's own narrative may not contradict its FAIL line: an unconditional `say` here
   # used to print 'installed' straight after a recorded failure.
-  [ "$cfg_fail" -eq 0 ] && say "agents + behavior-control + small config files installed" || true
+  [ "$cfg_fail" -eq 0 ] && log_line "agents + behavior-control + small config files installed" || true
 
   # settings.json — MERGED, never clobbered (same contract as setup.sh: source wins per
   # key, local extras survive, `retry` deep-merged per key so a local
@@ -745,12 +745,12 @@ if isinstance(src.get("retry"), dict) and isinstance(dst.get("retry"), dict):
     merged["retry"] = retry
 json.dump(merged, open(sys.argv[2], "w"), indent=2)
 PY
-      say "settings.json merged (local extras preserved)"
+      log_line "settings.json merged (local extras preserved)"
     elif [ -f "$DEST/settings.json" ]; then
       fail "python3 is missing and settings.json already exists — refusing to clobber it; merge by hand or install python3"
     else
       install_file "$src" "$DEST/settings.json" || fail "could not install settings.json"
-      say "settings.json copied (python3 not found — plain copy)"
+      log_line "settings.json copied (python3 not found — plain copy)"
     fi
   fi
 
@@ -759,11 +759,11 @@ PY
   if [ -f "$base_agents" ]; then
     if [ ! -e "$DEST/AGENTS.md" ]; then
       install_file "$base_agents" "$DEST/AGENTS.md" || fail "could not install AGENTS.md"
-      say "AGENTS.md installed from templates/AGENTS.base.md"
+      log_line "AGENTS.md installed from templates/AGENTS.base.md"
     elif ! cmp -s "$base_agents" "$DEST/AGENTS.md"; then
-      say "AGENTS.md already present and DIFFERS from templates/AGENTS.base.md — left alone (a global rules file is hand-edited state). Reconcile by hand."
+      log_line "AGENTS.md already present and DIFFERS from templates/AGENTS.base.md — left alone (a global rules file is hand-edited state). Reconcile by hand."
     else
-      say "AGENTS.md already matches templates/AGENTS.base.md"
+      log_line "AGENTS.md already matches templates/AGENTS.base.md"
     fi
   else
     fail "templates/AGENTS.base.md is missing from $INFRA_ROOT — a cell would get no global rules"
@@ -778,7 +778,7 @@ PY
 migrate_legacy_tools_farm() {
   if [ -d "$DEST/tools/fleet" ]; then
     rm -rf "$DEST/tools/fleet"
-    say "migrated the legacy tools/fleet/ out of pi's boot-blocking namespace (#1277)"
+    log_line "migrated the legacy tools/fleet/ out of pi's boot-blocking namespace (#1277)"
   fi
   # A tools/ left empty by the removal above is not a boot-blocker (pi's scan ignores an
   # empty dir) but it is noise, and setup.sh removes it too — same surface, same output.
@@ -812,7 +812,7 @@ install_spawn_gate() {
     die "$src is missing from the checkout — the pi spawn-point gate (#1884) cannot be installed, so a hand-written runner's \`pi\` would be ungated and silent"
   fi
   install_file "$src" "$dst" || die "could not install $dst"
-  say "pi spawn-point gate installed at $dst (#1884)"
+  log_line "pi spawn-point gate installed at $dst (#1884)"
 }
 
 # Check (both modes; READ-ONLY). Byte-compared, not `[ -e ]`: a stale or hand-edited copy of a GATE
@@ -1122,7 +1122,7 @@ verify_layer() {
   # A success line must not appear in a log whose own verdict is FAIL: a reader who greps for
   # "verified N farm file(s)" would otherwise take a failed leg as clean.
   if [ "$farm_bad" -eq 0 ]; then
-    say "verified $farm_n declared farm file(s) against the checkout"
+    log_line "verified $farm_n declared farm file(s) against the checkout"
   fi
 
   # ── the UNFARM leg (#1924) ────────────────────────────────────────────────
@@ -1170,7 +1170,7 @@ verify_layer() {
       # still-farmed retired name is invisible), so its clean answer proves nothing — and
       # `retired_n` would count entries read from a list the run could not fully build from.
       if [ "$retired_present" -eq 0 ] && [ "$conflict_rc" -eq 0 ] && [ "$declared_ok" = 1 ]; then
-        say "verified $retired_n declared retirement(s) absent from the cell"
+        log_line "verified $retired_n declared retirement(s) absent from the cell"
       fi
 
       # ...and that the leg RAN against THIS declaration. With an empty retirement list the
@@ -1224,7 +1224,7 @@ verify_layer() {
           done <<<"$snap_sorted"
         fi
         if [ "$snap_ok" = 1 ] && [ "$declared_ok" = 1 ] && [ -z "$uninstalled" ] && [ -z "$gone" ]; then
-          say "verified the farm declaration snapshot against the checkout's declared set"
+          log_line "verified the farm declaration snapshot against the checkout's declared set"
         elif [ "$snap_ok" = 1 ] && [ "$declared_ok" = 1 ]; then
           msg="the farm declaration snapshot ($snap_rel) is not this checkout's declared set — re-run --install."
           if [ -n "$uninstalled" ]; then
@@ -1288,15 +1288,15 @@ verify_layer() {
     # `ghShimWillEnforce` requires the same variable not to be 0, so a box with an executable shim
     # and this kill switch in its env injects nothing and enforces nothing. Reporting "armed" there
     # would invert the purpose of this block (a green line a reader trusts more than `LAYER VERIFIED`).
-    say "activation: gh shim PRESENT at $shim_at but DISARMED — AGENT_GH_SHIM=0, so the review-enforcer injects nothing and the string scanner is the only layer the GATE itself has (#984). A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2."
+    log_line "activation: gh shim PRESENT at $shim_at but DISARMED — AGENT_GH_SHIM=0, so the review-enforcer injects nothing and the string scanner is the only layer the GATE itself has (#984). A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2."
   elif [ "$shim_state" = present ]; then
-    say "activation: gh shim PRESENT at $shim_at (argv-level admin-merge guard armed)"
+    log_line "activation: gh shim PRESENT at $shim_at (argv-level admin-merge guard armed)"
   else
     local stale=""
     if [ -e "$DEST/shims/gh" ] || [ -L "$DEST/shims/gh" ]; then
       stale=" ⛔ $DEST/shims/gh exists but it is never a resolution CANDIDATE: it is a mirror the extension writes from a RESOLVED source and then injects (materializeGhShim → withGhShim), so with no resolvable source it is never armed — do not read it as armed."
     fi
-    say "activation: gh shim ABSENT — looked at \${AGENT_GH_SHIM_DIR:-} and $shim_installed; the review-enforcer then runs the string scanner only (#984), which is all the GATE itself has. A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2.$stale"
+    log_line "activation: gh shim ABSENT — looked at \${AGENT_GH_SHIM_DIR:-} and $shim_installed; the review-enforcer then runs the string scanner only (#984), which is all the GATE itself has. A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2.$stale"
   fi
 
   local entries
@@ -1384,7 +1384,7 @@ verify_layer() {
   if [ "$seen_dep" -eq 0 ]; then
     fail "no extension in $DEST/extensions declared any dependencies — the dependency check proved nothing (a truncated or hand-made extensions/ tree)"
   else
-    say "verified $seen_dep extension(s) that declare runtime deps"
+    log_line "verified $seen_dep extension(s) that declare runtime deps"
   fi
 
   # skills/. The install is a `cp -R` of the WHOLE tree, so the read-back compares the whole tree.
@@ -1402,7 +1402,7 @@ verify_layer() {
   else
     shipped_content_matches "$INFRA_ROOT/skills" "$DEST/skills"
     case $? in
-      0) say "verified the skills tree against the checkout" ;;
+      0) log_line "verified the skills tree against the checkout" ;;
       2) fail "skills/ ships NO files in the checkout ($INFRA_ROOT/skills) — verify cannot vouch for an empty tree" ;;
       3) fail "skills/ could not be compared IN FULL ($INFRA_ROOT/skills) — refusing to certify a subset: an unreadable tree, a non-regular entry, or a name the file list cannot represent" ;;
       *) fail "SKILLS CONTENT DIFFERS from the checkout: skills/ (a stale, truncated or hand-edited copy)" ;;
@@ -1481,7 +1481,7 @@ PY
   guard_gh_shim
 
   if [ "$FAILURES" -eq 0 ]; then
-    say "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"
+    log_line "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"
   fi
 }
 

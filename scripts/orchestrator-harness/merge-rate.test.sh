@@ -15,7 +15,9 @@ ck()  { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 [ -s "$SCRIPT" ] || { bad "merge-rate.sh is missing or empty"; exit 1; }
 mkdir -p "$T/o/logs" "$T/o/state"
-say() { O="$T/o" bash "$SCRIPT" "$@"; }
+# NB: this was named `say()` until #2910. It is NOT the print helper — it invokes the script under
+# test — so it gets a name that says so instead of inheriting the rename for a role it never had.
+merge_rate() { O="$T/o" bash "$SCRIPT" "$@"; }
 field() { # field <json> <key>
   printf '%s' "$1" | sed -nE "s/.*\"$2\":(\"[^\"]*\"|null|[0-9]+).*/\1/p" | tr -d '"'
 }
@@ -80,7 +82,7 @@ printf 'cafe01\n' > "$T/o/state/merged-77.done"
 printf 'cafe02\n' > "$T/o/state/merged-78.done"
 
 echo "==> merge-rate.sh offline suite"
-J="$(say --json)"
+J="$(merge_rate --json)"
 ck "lanes read = 11 (every lane log on disk is in the population)" \
    $([ "$(field "$J" lanes)" = 11 ] && echo 0 || echo 1)
 ck "PR_OPENED = 3 (lanes 101 + 108 — prose after the deliverable does NOT promote it — and 111, whose mid-log mention of ANOTHER lane's PR does not make it merged)" \
@@ -129,7 +131,7 @@ ck "an EMPTY population prints n/a (a rate over nothing is not a number, least o
 
 # ── the window filter, driven by real mtimes ────────────────────────────────────────────────────
 if touch -t 202001010000 "$T/o/logs/lane-101.log" 2>/dev/null; then
-  JW="$(say --hours 2 --json)"
+  JW="$(merge_rate --hours 2 --json)"
   ck "--hours excludes an old lane log from the population (and from every count)" \
      $([ "$(field "$JW" lanes)" = 10 ] && [ "$(field "$JW" pr_opened)" = 2 ] && echo 0 || echo 1)
 else
@@ -147,10 +149,10 @@ ck "an out-of-range --hours is refused with exit 2 (no silently-overflowed all-t
    $([ $? = 2 ] && echo 0 || echo 1)
 
 # ── the report is a REPORT: it must not fail the build on a real population ─────────────────────
-say >/dev/null 2>&1
+merge_rate >/dev/null 2>&1
 ck "the text report exits 0 (a measurement is not a gate)" $([ $? = 0 ] && echo 0 || echo 1)
 ck "the text report states the defect line and the n/a-safe rate field" \
-   $(rep="$(say)"; grep -q "ended at PR_OPENED" <<<"$rep" && grep -q "MERGE RATE" <<<"$rep" && echo 0 || echo 1)
+   $(rep="$(merge_rate)"; grep -q "ended at PR_OPENED" <<<"$rep" && grep -q "MERGE RATE" <<<"$rep" && echo 0 || echo 1)
 
 echo
 if [ "$fail" -eq 0 ]; then

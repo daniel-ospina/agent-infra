@@ -137,7 +137,7 @@ resolve_pass_repo() {
 }
 PASS_REPO=""
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 
 help_text() {
@@ -278,7 +278,7 @@ refuse_transient_target() {
         if [ -e "$STATE_DIR" ] && [ ! -w "$STATE_DIR" ]; then
             err "REFUSING: state dir '$STATE_DIR' exists and is not writable by $(id -un) — every pass would fail to record"; return 1
         fi
-        [ -e "$STATE_DIR" ] || say "dry-run: would create the state dir $STATE_DIR"
+        [ -e "$STATE_DIR" ] || log_line "dry-run: would create the state dir $STATE_DIR"
     elif ! mkdir -p "$STATE_DIR" 2>/dev/null || [ ! -w "$STATE_DIR" ]; then
         err "REFUSING: state dir '$STATE_DIR' is not writable by $(id -un) — every pass would fail to record"; return 1
     fi
@@ -437,9 +437,9 @@ do_install_systemd() {
     fi
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
-        say "dry-run: would install to $UNIT_DIR (target=$TARGET) and enable $UNIT_NAME.timer"
-        say "--- $UNIT_NAME.service ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.service"
-        say "--- $UNIT_NAME.timer ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.timer"
+        log_line "dry-run: would install to $UNIT_DIR (target=$TARGET) and enable $UNIT_NAME.timer"
+        log_line "--- $UNIT_NAME.service ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.service"
+        log_line "--- $UNIT_NAME.timer ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.timer"
         rm -rf "$tmpd"
         return 0
     fi
@@ -483,16 +483,16 @@ do_install_systemd() {
             err "Enable it, then re-run:  sudo loginctl enable-linger $(id -un)"
             return 1
         fi
-        say "  linger: enabled (the user timer survives logout)"
+        log_line "  linger: enabled (the user timer survives logout)"
     fi
 
-    say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
-    say "  pass:   $PASS"
-    say "  repo:   $PASS_REPO  (ref $PASS_REF${PASS_MODE:+, mode $PASS_MODE})"
-    say "  every:  ${INTERVAL_MIN}m"
-    say "  record: $STATE_DIR/harness-apply.status"
+    log_line "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
+    log_line "  pass:   $PASS"
+    log_line "  repo:   $PASS_REPO  (ref $PASS_REF${PASS_MODE:+, mode $PASS_MODE})"
+    log_line "  every:  ${INTERVAL_MIN}m"
+    log_line "  record: $STATE_DIR/harness-apply.status"
     if $SC is-enabled "$UNIT_NAME.timer" >/dev/null 2>&1; then
-        say "  timer:  enabled"
+        log_line "  timer:  enabled"
     else
         err "timer is NOT enabled after install — the harness will not be applied unattended"; return 1
     fi
@@ -531,8 +531,8 @@ except ET.ParseError as e:
     }
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
-        say "dry-run: would install to $UNIT_DIR (target=$TARGET) and bootstrap $LABEL"
-        say "--- $LABEL.plist ---"; sed 's/^/  /' "$tmpd/$LABEL.plist"
+        log_line "dry-run: would install to $UNIT_DIR (target=$TARGET) and bootstrap $LABEL"
+        log_line "--- $LABEL.plist ---"; sed 's/^/  /' "$tmpd/$LABEL.plist"
         rm -rf "$tmpd"
         return 0
     fi
@@ -552,13 +552,13 @@ except ET.ParseError as e:
             || { err "could not bootstrap $LABEL from $UNIT_DIR/$LABEL.plist — the harness will NOT be applied unattended"; return 1; }
     fi
 
-    say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
-    say "  launch: $PY_BIN $LAUNCHER --script $PASS"
-    say "  repo:   $PASS_REPO  (ref $PASS_REF${PASS_MODE:+, mode $PASS_MODE})"
-    say "  every:  ${INTERVAL_MIN}m"
-    say "  record: $STATE_DIR/harness-apply.status"
+    log_line "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
+    log_line "  launch: $PY_BIN $LAUNCHER --script $PASS"
+    log_line "  repo:   $PASS_REPO  (ref $PASS_REF${PASS_MODE:+, mode $PASS_MODE})"
+    log_line "  every:  ${INTERVAL_MIN}m"
+    log_line "  record: $STATE_DIR/harness-apply.status"
     if $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
-        say "  agent:  loaded"
+        log_line "  agent:  loaded"
     else
         err "agent $LABEL is NOT loaded after install — the harness will not be applied unattended"; return 1
     fi
@@ -568,11 +568,11 @@ except ET.ParseError as e:
 do_status() {
     local ACTIVE REC="" REC_RC=0 LAST_RUN=""
     choose_target || { err "no scheduler available"; return 1; }
-    say "target=$TARGET dir=$UNIT_DIR"
+    log_line "target=$TARGET dir=$UNIT_DIR"
     if [ "$TARGET" = "launchd" ]; then
         if ! $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
-            say "installed=no"
-            [ -f "$UNIT_DIR/$LABEL.plist" ] && say "note=plist present at $UNIT_DIR/$LABEL.plist but the agent is NOT loaded"
+            log_line "installed=no"
+            [ -f "$UNIT_DIR/$LABEL.plist" ] && log_line "note=plist present at $UNIT_DIR/$LABEL.plist but the agent is NOT loaded"
             return 1
         fi
         # ⛔ A LOADED JOB IS NOT AN INSTALLED ONE. launchd keeps a job loaded after its plist is deleted,
@@ -580,14 +580,14 @@ do_status() {
         # alone certified a box that stops being advanced at the next logout (the mirror of the systemd
         # `is-enabled` gate).
         if [ ! -f "$UNIT_DIR/$LABEL.plist" ]; then
-            say "installed=no"
-            say "note=the job IS loaded but $UNIT_DIR/$LABEL.plist is missing — it will not come back at the next login; re-run --install"
+            log_line "installed=no"
+            log_line "note=the job IS loaded but $UNIT_DIR/$LABEL.plist is missing — it will not come back at the next login; re-run --install"
             return 1
         fi
-        say "installed=yes"
-        say "loaded=yes"
+        log_line "installed=yes"
+        log_line "loaded=yes"
         LAST_RUN="$($SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {print $2; exit}')"
-        say "last_exit=${LAST_RUN:-unknown}"
+        log_line "last_exit=${LAST_RUN:-unknown}"
         # ALLOW-LIST, not a blacklist: a loaded agent exiting 1/2/127 is a box whose harness is not
         # being advanced, and 127 is the inert-enforcer shape this installer exists to prevent.
         # ⛔ THE PASS'S OWN SUCCESS CODES, NOT THE DISK REAPER'S. 0 is `current`, 10 is `advanced` and
@@ -599,15 +599,15 @@ do_status() {
             ''|-|0|10|11) ;;
             *) err "the last pass exited ${LAST_RUN} — the harness is not being applied; see $STATE_DIR/harness-apply.log"; return 1 ;;
         esac
-        say "cadence=StartInterval=${INTERVAL_MIN}m"
+        log_line "cadence=StartInterval=${INTERVAL_MIN}m"
     else
         if ! $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
-            say "installed=no"
+            log_line "installed=no"
             return 1
         fi
-        say "installed=yes"
+        log_line "installed=yes"
         ENABLED="$($SC is-enabled "$UNIT_NAME.timer" 2>/dev/null || echo no)"
-        say "enabled=$ENABLED"
+        log_line "enabled=$ENABLED"
         # ⛔ ENABLED IS GATED, NOT JUST PRINTED. A timer that is active now but NOT enabled does not
         # come back at the next reboot, so the box stops being advanced at the first restart — and the
         # install path checks this while the STATUS path did not (measured in review).
@@ -620,8 +620,8 @@ do_status() {
             *) err "the timer is '${ENABLED:-no}', not enabled — it will not survive a reboot, so the harness stops being applied"; return 1 ;;
         esac
         ACTIVE="$($SC is-active "$UNIT_NAME.timer" 2>/dev/null || echo no)"
-        say "timer_active=$ACTIVE"
-        say "next_run=$($SC list-timers --all --no-pager 2>/dev/null | awk -v u="$UNIT_NAME.timer" '$0 ~ u {print $1" "$2" "$3; exit}')"
+        log_line "timer_active=$ACTIVE"
+        log_line "next_run=$($SC list-timers --all --no-pager 2>/dev/null | awk -v u="$UNIT_NAME.timer" '$0 ~ u {print $1" "$2" "$3; exit}')"
         # ⛔ AN ENABLED-BUT-INACTIVE TIMER IS NOT A SCHEDULE. Returning 0 there would certify a box
         # whose harness is never applied — the inert-enforcer shape, in the verb meant to detect it.
         case "${ACTIVE:-}" in
@@ -634,14 +634,14 @@ do_status() {
         # second as healthy, while `fleet-health.py` alarmed on the same state: two readers disagreeing
         # about one record with the readiness gate the lenient one.
         LAST_RUN="$($SC show -p LastTriggerUSec --value "$UNIT_NAME.timer" 2>/dev/null)"
-        say "last_trigger=${LAST_RUN:-unknown}"
+        log_line "last_trigger=${LAST_RUN:-unknown}"
         # ⛔ "THE TIMER HAS FIRED" IS NOT "A PASS HAS COMPLETED", AND ONLY THE LATTER CAN BE JUDGED.
         # A timer enabled on a box that has been up longer than `OnBootSec` (i.e. every box) elapses
         # IMMEDIATELY, so on a fresh install the trigger exists while the first pass is still running —
         # and gating on the trigger alone made the installer's own success path FAIL its readiness gate
         # (measured in review). `ExecMainExitTimestamp` is the witness that a pass finished at all.
         EXEC_TS="$($SC show -p ExecMainExitTimestamp --value "$UNIT_NAME.service" 2>/dev/null)"
-        say "last_service_run=${EXEC_TS:-unknown}"
+        log_line "last_service_run=${EXEC_TS:-unknown}"
         # ⛔ THE SERVICE'S OWN LAST EXIT, WHICH IS THE ONLY WITNESS FOR A PASS THAT REFUSES AT STARTUP.
         # A pass that cannot run (a missing ExecStart after a worktree reap, an unwritable state dir, an
         # unresolvable repo) writes NO record, so the previous `ok=1` record stays fresh for up to
@@ -651,11 +651,11 @@ do_status() {
         # the install path checked (lingering can be cleared later by an operator or an image rebuild).
         if [ "$TARGET" = "user" ]; then
             linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
-            say "linger=${linger:-unknown}"
+            log_line "linger=${linger:-unknown}"
             [ "$linger" = "yes" ] || { err "the user timer will NOT fire after this session ends (linger=${linger:-unknown}) — enable it: sudo loginctl enable-linger $(id -un)"; return 1; }
         fi
         EXEC_MAIN="$($SC show -p ExecMainStatus --value "$UNIT_NAME.service" 2>/dev/null | tr -d '[:space:]')"
-        say "last_service_exit=${EXEC_MAIN:-unknown}"
+        log_line "last_service_exit=${EXEC_MAIN:-unknown}"
         case "${EXEC_MAIN:-unknown}" in
             0|10|11) ;;
             unknown|'') err "cannot read the pass service's last exit (systemctl show refused) — cannot determine whether the pass is completing"; return 1 ;;
@@ -678,12 +678,12 @@ do_status() {
                 ''|*[!0-9]*) : ;;
                 *) _armed_age=$(( $(date +%s) - _mt ))
                    if [ "$_armed_age" -gt $(( INTERVAL_MIN * 60 * 2 )) ] && [ ! -s "$STATE_DIR/harness-apply.status" ]; then
-                       say "armed_for=${_armed_age}s"
+                       log_line "armed_for=${_armed_age}s"
                    fi ;;
             esac
         fi
     fi
-    say "--- pass record ---"
+    log_line "--- pass record ---"
     # ⛔ NOT `REC="$(cond && bash … || printf …)"`. The `||` arm fires on a NON-ZERO rc — which is
     # exactly the answer this leg exists to read — so it replaced a `status=failed rc=21` line with
     # "no pass script" and reset REC_RC to the printf's 0: the gate then certified an armed scheduler
@@ -719,8 +719,8 @@ do_status() {
                                 err "the agent has been armed for ${_armed_age}s (two intervals) and has NEVER run a pass, and no pass record exists — the job is inert, not fresh"
                                 return 1
                             fi
-                            say "  note=no pass has completed yet (the agent runs one at load, then on its interval)" ;;
-                        0) say "  note=a pass completed with 0 but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
+                            log_line "  note=no pass has completed yet (the agent runs one at load, then on its interval)" ;;
+                        0) log_line "  note=a pass completed with 0 but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
                         *) err "the job last exited ${LAST_RUN} and no pass record exists — the pass is refusing before it can record anything"; return 1 ;;
                     esac ;;
                 *)
@@ -735,11 +735,11 @@ do_status() {
                                 err "the timer has been armed for ${_armed_age}s (two intervals) and has NEVER fired, and no pass record exists — the job is inert, not fresh"
                                 return 1
                             fi
-                            say "  note=no pass has completed yet (the timer has not fired)" ;;
+                            log_line "  note=no pass has completed yet (the timer has not fired)" ;;
                         *) case "$(printf '%s' "${EXEC_TS:-}" | tr -d '[:space:]')" in
-                               ''|n/a|unknown|0|0s|-*) say "  note=the timer has fired and no pass has COMPLETED yet (its first tick is running)" ;;
+                               ''|n/a|unknown|0|0s|-*) log_line "  note=the timer has fired and no pass has COMPLETED yet (its first tick is running)" ;;
                                *) case "$(printf '%s' "${EXEC_MAIN:-}" | tr -d '[:space:]')" in
-                                      0|10|11) say "  note=a pass completed with ${EXEC_MAIN} but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
+                                      0|10|11) log_line "  note=a pass completed with ${EXEC_MAIN} but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
                                       *) err "the pass has completed and its last exit was ${EXEC_MAIN}, with no record — it is refusing before it can record anything"; return 1 ;;
                                   esac ;;
                            esac ;;
@@ -752,7 +752,7 @@ do_status() {
 
 do_uninstall() {
     if [ "${DRY_RUN:-0}" = "1" ]; then
-        say "dry-run: would disable and remove the installed schedule (nothing was changed)"
+        log_line "dry-run: would disable and remove the installed schedule (nothing was changed)"
         return 0
     fi
     choose_target || { err "no scheduler available"; return 1; }
@@ -765,7 +765,7 @@ do_uninstall() {
             err "$LABEL is STILL LOADED after bootout — it will keep firing; log out or reboot, or bootout gui/$(id -u)/$LABEL by hand"
             return 1
         fi
-        say "uninstalled $LABEL from $UNIT_DIR (not loaded)"
+        log_line "uninstalled $LABEL from $UNIT_DIR (not loaded)"
         return 0
     fi
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
@@ -792,7 +792,7 @@ do_uninstall() {
             err "      an enabled timer THERE still fires the pass; uninstall it from that scope"
         fi
     done
-    say "uninstalled $UNIT_NAME from $UNIT_DIR (target=$TARGET)"
+    log_line "uninstalled $UNIT_NAME from $UNIT_DIR (target=$TARGET)"
     return 0
 }
 
