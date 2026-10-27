@@ -1166,11 +1166,85 @@ printf '%s\n' "$_P24C" > "$D/o/.orch.lock"
 R2="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$D/o" 2>&1)"; RC2=$?
 rm -f "$D/o/.orch.lock"; kill "$_P24C" 2>/dev/null; wait "$_P24C" 2>/dev/null
-case "$R2" in *relation=current*) ok "a foreign controller's tree does not buy a current verdict" ;;
+case "$R2" in *relation=current*) bad "a foreign controller's tree bought a current verdict: $R2" ;;
                *relation=restart-pending*) ok "a foreign controller's tree does not buy a current verdict" ;;
                *) bad "unexpected record: $R2" ;; esac
 case "$R2" in *"running=$(short "$C1")"*) ok "…and RUNNING stayed on the stamp, not on the foreign tree" ;;
                *) bad "the fallback did not name the stamp's commit: $R2" ;; esac
+
+# ⛔ A36d: THE OWN-TOPLEVEL GUARD HAS A WITNESS. Cycle-3 review found the guard at `_want_root` had NO
+# case that could distinguish its removal: delete it and the suite stayed green while `git -C` on a
+# stale child that LOST its `.git` ASCENDED into the enclosing worktree and reported ITS head — a
+# `current` for a tree the controller is not executing, i.e. the false-PASS defence deletable in
+# silence. The pin root here IS a worktree at the TIP; inside it sits a stale `<sha12>/` copy without a
+# `.git`, which is exactly what a killed `apply` leaves behind. RUNNING must stay on the stamp (C1).
+_CASE=$((_CASE+1)); echo "=== A36d: a stale copy that lost its own .git cannot ascend into an enclosing worktree ==="
+D="$T/a25"; mkdir -p "$D/o/state" "$D/pin" "$D/pin2"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C2" > "$PIN"
+printf '{"commit": "%s"}\n' "$C1" > "$D/o/.agent-infra-stamp.json"
+_P25="$D/pin2"
+git -C "$T/src" worktree add --detach "$_P25" "$C2" >/dev/null 2>&1
+mkdir -p "$_P25/$(short "$C1")/scripts/orchestrator-harness"
+printf '#!/bin/bash\nsleep 120\n' > "$_P25/$(short "$C1")/scripts/orchestrator-harness/orch-loop.sh"
+_O27="$_P25/$(short "$C1")/scripts/orchestrator-harness/orch-loop.sh"
+# The lock is written AFTER the process starts, as `orch-loop.sh` does: the age half must ACCEPT this
+# owner (shape+age), so the case exercises the TOPLEVEL guard and nothing else.
+bash "$_O27" & _P26=$!
+sleep 1
+printf '%s\n' "$_P26" > "$D/o/.orch.lock"
+R4="$(O="$D/o" HARNESS_PIN_DIR="$_P25" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC4=$?
+rm -f "$D/o/.orch.lock"; kill "$_P26" 2>/dev/null; wait "$_P26" 2>/dev/null
+case "$R4" in *"running=$(short "$C2")"*) bad "a stale copy without .git ascended into the enclosing worktree (false current): $R4" ;;
+               *"running=$(short "$C1")"*) ok "a tree that is not its own toplevel cannot answer — the stamp stands" ;;
+               *) bad "the record named neither tree — the stage was skipped, not exercised: $R4" ;; esac
+
+# ⛔ A36e: PATHS ARE COMPARED PHYSICALLY — the witness for the `pwd -P` normalisation that cycle-4 review
+# found MISSING (it was measured on a Mac: the fixture root is `TMPDIR`, and `/var` is a symlink into
+# `/private/var`, so A36 redded there while CI — Linux-only — went green). A symlinked pin root makes
+# the same defect reproducible on Linux: the argv token carries the LOGICAL path the launcher wrote,
+# `git rev-parse --show-toplevel` answers PHYSICAL, and compared raw they never match — the stage then
+# gives up silently and #2641's permanent `restart-pending` is back. This case MUST report `current`
+# from the controller's tree.
+_CASE=$((_CASE+1)); echo "=== A36e: a pin root reached through a SYMLINK still resolves RUNNING (physical compare) ==="
+mkdir -p "$D/link-target"
+git -C "$T/src" worktree add --detach "$D/link-target/$(short "$C2")" "$C2" >/dev/null 2>&1
+ln -s "$D/link-target" "$D/link2"
+printf '#!/bin/bash\nsleep 120\n' > "$D/link-target/$(short "$C2")/scripts/orchestrator-harness/orch-loop.sh"
+# The controller is launched through the SYMLINKED path — the shape a symlinked cell home produces.
+_O28="$D/link2/$(short "$C2")/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_O28" & _P27=$!
+sleep 1
+printf '%s\n' "$_P27" > "$D/o/.orch.lock"
+R5="$(O="$D/o" HARNESS_PIN_DIR="$D/link2" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC5=$?
+rm -f "$D/o/.orch.lock"; kill "$_P27" 2>/dev/null; wait "$_P27" 2>/dev/null
+case "$R5" in *relation=current*) ok "a symlinked pin root still resolves the running tree — not a silent give-up" ;;
+               *restart-pending*) bad "a symlinked pin root silently gave up (logical vs physical compare): $R5" ;;
+               *) bad "unexpected record: $R5" ;; esac
+case "$R5" in *"running=$(short "$C2")"*) ok "…and running= names the controller's tree, not the seed stamp" ;;
+               *) bad "running= did not come from the controller's tree: $R5" ;; esac
+
+# ⛔ A36f: A RECYCLED-PID LOCK IS NOT AN OWNER (the age half, review P1 twice). `$O/.orch.lock` is data on
+# disk and outlives a `kill -9`/OOM/reboot; the OS can RECYCLE the pid onto a peer lane's controller,
+# which on a cell is the SAME basename from the SAME shared harness path — so the argv SHAPE matches
+# perfectly and a shape-only read reports `current` for a tree this box is not executing. A controller
+# writes `$LOCK` AFTER it starts, so a process that BEGAN after the lock was written cannot be its
+# owner. Driven by backdating the LOCK: the live controller began long after it, so the stage must
+# refuse it and leave RUNNING on the stamp (C1) instead of certifying C2.
+_CASE=$((_CASE+1)); echo "=== A36f: a lock whose pid began AFTER the lock was written is not the controller (age) ==="
+printf '#!/bin/bash\nsleep 120\n' > "$_T24/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_O26" & _P28=$!
+printf '%s\n' "$_P28" > "$D/o/.orch.lock"
+# BACKDATE the lock by an hour: this process provably began after the lock was written, which is the
+# recycled-pid shape the age rule exists for (the pid is alive and its argv matches).
+touch -t 202001010000 "$D/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00' "$D/o/.orch.lock" 2>/dev/null || true
+R6="$(O="$D/o" HARNESS_PIN_DIR="$T/a24/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC6=$?
+rm -f "$D/o/.orch.lock"; kill "$_P28" 2>/dev/null; wait "$_P28" 2>/dev/null
+case "$R6" in *"running=$(short "$C2")"*) bad "a recycled-pid lock certified the tree it names (no age test): $R6" ;;
+               *"running=$(short "$C1")"*) ok "a process that began after the lock was written is not its owner" ;;
+               *) bad "the record named neither tree — the age path was skipped, not exercised: $R6" ;; esac
 
 # ⛔ A20: THE BOUND MUST EXIST ON macOS, WHERE `timeout` DOES NOT. A bare `timeout` call is rc=127 on the
 # Mac half of the fleet, and `if !` reads 127 as a FAILED FETCH — so the box would never fetch and would
