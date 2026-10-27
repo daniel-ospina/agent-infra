@@ -113,7 +113,7 @@ MODE_FLAG="--apply"
 # is what let a "succeeding" hourly reaper sit on cells at 94-96% used (see the unit template).
 MODE_SUCCESS_EXIT="0 6"
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 
 # help_text — print the header comments. The range is DERIVED from the `set -uo pipefail` line, never a
@@ -321,7 +321,7 @@ refuse_transient_target() {
             err "REFUSING: state dir '$STATE_DIR' exists and is not writable by $(id -un) — the unit runs as this user and every pass would fail closed (exit 3)"
             return 1
         fi
-        [ -e "$STATE_DIR" ] || say "dry-run: would create the state dir $STATE_DIR"
+        [ -e "$STATE_DIR" ] || log_line "dry-run: would create the state dir $STATE_DIR"
     elif ! mkdir -p "$STATE_DIR" 2>/dev/null || [ ! -w "$STATE_DIR" ]; then
         err "REFUSING: state dir '$STATE_DIR' is not writable by $(id -un) — the unit runs as this user and every pass would fail closed (exit 3)"
         return 1
@@ -1002,7 +1002,7 @@ verify_installed_unit() {
         [ -f "$v" ] || miss="${miss}${miss:+, }$d($v)"
     done
     [ -n "$miss" ] && err "WARNING: pinned delegate(s) missing after install: $miss — that class will FAIL CLOSED (exit 3, red) every pass"
-    say "  verify: ExecStart + HOME read back from the installed artifact (target=$TARGET)"
+    log_line "  verify: ExecStart + HOME read back from the installed artifact (target=$TARGET)"
     return 0
 }
 
@@ -1060,7 +1060,7 @@ verify_installed_artifact_plist() {
             err "REFUSING: the installed plist's EnvironmentVariables.HOME ($ph) is not the home this install rendered ($HOME)"
             return 1
         fi
-        say "  verify: ProgramArguments + mode flag read back from the installed plist (target=$TARGET)"
+        log_line "  verify: ProgramArguments + mode flag read back from the installed plist (target=$TARGET)"
     else
         # ⛔ THE FALLBACK MUST NOT QUIETLY VERIFY LESS THAN THE PARSED ARM. A textual "the path appears
         # somewhere in the file" passes a stale plist (a `--dry-run` argument, or the path inside an
@@ -1095,8 +1095,8 @@ verify_installed_artifact_plist() {
             err "WARNING: the plist parser FAILED on $f — the text below is the PARSER's own error, and only"
             err "  the TEXTUAL checks (executable + $MODE_FLAG) verified this artifact: $(printf '%s' "$perr" | tr '\n' ' ')"
         fi
-        say "  verify: plist checked textually — $MODE_FLAG present in ProgramArguments, the reaper is in"
-        say "    program position; EnvironmentVariables.HOME NOT verified (no usable plist parser)"
+        log_line "  verify: plist checked textually — $MODE_FLAG present in ProgramArguments, the reaper is in"
+        log_line "    program position; EnvironmentVariables.HOME NOT verified (no usable plist parser)"
     fi
     return 0
 }
@@ -1109,7 +1109,7 @@ report_gh_resolvable() {
     local p=""
     p="$(PATH="$PATH" HOME="$HOME" command -v gh 2>/dev/null || true)"
     if [ -n "$p" ]; then
-        say "  gh:     $p"
+        log_line "  gh:     $p"
     else
         err "WARNING: no \`gh\` on the PATH this unit renders — the worktree class will FAIL CLOSED (exit 3, red) every pass until it is resolvable. Install/auth gh for the service user."
     fi
@@ -1157,8 +1157,8 @@ except ET.ParseError as e:
     }
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
-        say "dry-run: would install to $UNIT_DIR (target=$TARGET) and bootstrap $LABEL"
-        say "--- $LABEL.plist ---"; sed 's/^/  /' "$tmpd/$LABEL.plist"
+        log_line "dry-run: would install to $UNIT_DIR (target=$TARGET) and bootstrap $LABEL"
+        log_line "--- $LABEL.plist ---"; sed 's/^/  /' "$tmpd/$LABEL.plist"
         rm -rf "$tmpd"
         return 0
     fi
@@ -1190,15 +1190,15 @@ except ET.ParseError as e:
             || { err "could not bootstrap $LABEL from $UNIT_DIR/$LABEL.plist — the reaper will NOT run unattended"; return 1; }
     fi
 
-    say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
-    say "  reaper: $REAPER"
-    say "  launch: $PY_BIN $LAUNCHER --script $REAPER -- $MODE_FLAG"
-    say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
-    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
-    say "  state:  $STATE_DIR/disk-reaper.status"
+    log_line "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
+    log_line "  reaper: $REAPER"
+    log_line "  launch: $PY_BIN $LAUNCHER --script $REAPER -- $MODE_FLAG"
+    log_line "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
+    log_line "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
+    log_line "  state:  $STATE_DIR/disk-reaper.status"
     report_gh_resolvable
     if $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
-        say "  agent:  loaded"
+        log_line "  agent:  loaded"
     else
         err "agent $LABEL is NOT loaded after install — the reaper will not run unattended"; return 1
     fi
@@ -1246,9 +1246,9 @@ do_install_systemd() {
     fi
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
-        say "dry-run: would install to $UNIT_DIR (target=$TARGET) and enable $UNIT_NAME.timer"
-        say "--- $UNIT_NAME.service ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.service"
-        say "--- $UNIT_NAME.timer ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.timer"
+        log_line "dry-run: would install to $UNIT_DIR (target=$TARGET) and enable $UNIT_NAME.timer"
+        log_line "--- $UNIT_NAME.service ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.service"
+        log_line "--- $UNIT_NAME.timer ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME.timer"
         rm -rf "$tmpd"
         return 0
     fi
@@ -1304,18 +1304,18 @@ do_install_systemd() {
             err " this box exists for that would silently do nothing.)"
             return 1
         fi
-        say "  linger: enabled (the user timer survives logout)"
+        log_line "  linger: enabled (the user timer survives logout)"
     fi
 
-    say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
-    say "  reaper: $REAPER"
-    say "  mode:   $MODE_FLAG"
-    say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
-    say "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
-    say "  state:  $STATE_DIR/disk-reaper.status"
+    log_line "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
+    log_line "  reaper: $REAPER"
+    log_line "  mode:   $MODE_FLAG"
+    log_line "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
+    log_line "  gh:     ${GH_PREFLIGHT:+$GH_PREFLIGHT — the worktree class will skip every repo (see the WARNING above)}${GH_PREFLIGHT:-authenticated for HOME=$HOME — the PR-state gate can run}"
+    log_line "  state:  $STATE_DIR/disk-reaper.status"
     report_gh_resolvable
     if $SC is-enabled "$UNIT_NAME.timer" >/dev/null 2>&1; then
-        say "  timer:  enabled"
+        log_line "  timer:  enabled"
     else
         err "timer is NOT enabled after install — the reaper will not run unattended"; return 1
     fi
@@ -1325,23 +1325,23 @@ do_install_systemd() {
 do_status() {
     local next last ACTIVE REC="" REC_RC=0 LAST_RUN=""
     choose_target || { err "no scheduler available"; return 1; }
-    say "target=$TARGET dir=$UNIT_DIR"
+    log_line "target=$TARGET dir=$UNIT_DIR"
     if [ "$TARGET" = "launchd" ]; then
         # `launchctl list` prints `<pid>\t<last exit>\t<label>` for every loaded job on the machine.
         # Match the WHOLE label (grep -x on the third field), or `com.eldato.disk-reaper` also matches
         # a job whose label merely starts with it and the status answers for the wrong one.
         if ! $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
-            say "installed=no"
-            [ -f "$UNIT_DIR/$LABEL.plist" ] && say "note=plist present at $UNIT_DIR/$LABEL.plist but the agent is NOT loaded"
+            log_line "installed=no"
+            [ -f "$UNIT_DIR/$LABEL.plist" ] && log_line "note=plist present at $UNIT_DIR/$LABEL.plist but the agent is NOT loaded"
             # ⛔ rc 1, MATCHING THE SYSTEMD BRANCH BELOW. `cloud-cell-bringup.sh --check` gates CELL
             # READY on this exit code; returning 0 for "not installed" would answer "scheduled?" with a
             # success — the false PASS this installer exists to remove.
             return 1
         else
-            say "installed=yes"
-            say "loaded=yes"
+            log_line "installed=yes"
+            log_line "loaded=yes"
             last="$($SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {print $2; exit}')"
-            say "last_exit=${last:-unknown}"
+            log_line "last_exit=${last:-unknown}"
             # ⛔ ALLOW-LIST, THE SAME ONE THE SYSTEMD ARM USES. A blacklist of 3|4 returned 0 for a
             # loaded agent exiting 1/2/127/203 — and 127/203 is the inert-enforcer shape this installer
             # exists to prevent, while `cloud-cell-bringup.sh --check` gates CELL READY on this rc. A
@@ -1355,9 +1355,9 @@ do_status() {
             # `launchctl list`'s first column is the running PID, not a cadence: calling it `interval=`
             # put a process id where a schedule belongs — and cloud-cell-bringup prints `next=` from
             # this block, so every Mac check reported `next=?`.
-            say "pid=$($SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {print $1; exit}' | sed 's/^-$/not-running/')"
-            say "cadence=StartInterval=3600"
-            say "next_run=not reported by launchd (fires every 3600s from load)"
+            log_line "pid=$($SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {print $1; exit}' | sed 's/^-$/not-running/')"
+            log_line "cadence=StartInterval=3600"
+            log_line "next_run=not reported by launchd (fires every 3600s from load)"
         fi
         if [ -z "$REAPER" ] || [ ! -f "$REAPER" ]; then
             # ⛔ "NO REAPER FILE" IS NOT "NO NEWS". The systemd arm reports this state as unjudgeable and
@@ -1366,7 +1366,7 @@ do_status() {
             return 1
         fi
         if [ -n "$REAPER" ] && [ -f "$REAPER" ]; then
-            say "--- pass record ---"
+            log_line "--- pass record ---"
             REC="$(bash "$REAPER" --print-status 2>&1)"; REC_RC=$?
             printf '%s\n' "$REC" | sed 's/^/  /'
             # ⛔ GATE THE RECORD'S RC, NOT `ok`. `ok=0` is TRUE for a delegate refusal (rc 6) and for an
@@ -1385,7 +1385,7 @@ do_status() {
                     # 203 the inert-enforcer signal) is also a box that is not being reaped. The same
                     # polarity the merge rail uses — an unnamed value must never fall through green.
                     case "${last:-}" in
-                        ''|-|0|5|6|unknown) say "note=no pass has completed yet (the agent runs one at load, then hourly)" ;;
+                        ''|-|0|5|6|unknown) log_line "note=no pass has completed yet (the agent runs one at load, then hourly)" ;;
                         *) err "the job last exited $last and no pass record exists — the pass is refusing before it can record anything"; return 1 ;;
                     esac ;;
                 stale) err "the last pass is STALE — the job is loaded but it is not running"; return 1 ;;
@@ -1399,20 +1399,20 @@ do_status() {
         return 0
     fi
     if ! $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
-        say "installed=no"
+        log_line "installed=no"
         return 1
     fi
-    say "installed=yes"
-    say "enabled=$($SC is-enabled "$UNIT_NAME.timer" 2>/dev/null || echo no)"
+    log_line "installed=yes"
+    log_line "enabled=$($SC is-enabled "$UNIT_NAME.timer" 2>/dev/null || echo no)"
     ACTIVE="$($SC is-active "$UNIT_NAME.timer" 2>/dev/null || echo no)"
-    say "timer_active=$ACTIVE"
+    log_line "timer_active=$ACTIVE"
     next="$($SC list-timers --all --no-pager 2>/dev/null | awk -v u="$UNIT_NAME.timer" '$0 ~ u {print $1" "$2" "$3; exit}')"
-    say "next_run=${next:-unknown}"
+    log_line "next_run=${next:-unknown}"
     LAST_RUN="$($SC show -p ExecMainStatus --value "$UNIT_NAME.service" 2>/dev/null || echo unknown)"
-    say "last_run=$LAST_RUN"
+    log_line "last_run=$LAST_RUN"
     REC=""; REC_RC=0
     if [ -n "$REAPER" ] && [ -f "$REAPER" ]; then
-        say "--- pass record ---"
+        log_line "--- pass record ---"
         REC="$(bash "$REAPER" --print-status 2>&1)"; REC_RC=$?
         printf '%s\n' "$REC" | sed 's/^/  /'
     fi
@@ -1450,7 +1450,7 @@ do_status() {
                 # 5/6 are the pass's own success codes: a first tick that lost the lock (5, and it writes
                 # NO record) is documented-benign, so it must not fail readiness on a healthy cell — the
                 # launchd arm allows exactly the same set.
-                ''|-|0|5|6|unknown) say "note=no pass has completed yet (the timer's first tick has not run)" ;;
+                ''|-|0|5|6|unknown) log_line "note=no pass has completed yet (the timer's first tick has not run)" ;;
                 *) err "the timer's last run exited $LAST_RUN and no pass record exists — the pass is refusing before it can record anything"; return 1 ;;
             esac ;;
         stale) err "the last pass is STALE — the timer is enabled but the pass is not running: $(printf '%s\n' "$REC" | sed -n 's/^detail=//p' | head -1)"; return 1 ;;
@@ -1465,7 +1465,7 @@ do_status() {
 
 do_uninstall() {
     if [ "${DRY_RUN:-0}" = "1" ]; then
-        say "dry-run: would disable and remove the installed schedule (nothing was changed)"
+        log_line "dry-run: would disable and remove the installed schedule (nothing was changed)"
         return 0
     fi
     choose_target || { err "no scheduler available"; return 1; }
@@ -1479,7 +1479,7 @@ do_uninstall() {
             err "$LABEL is STILL LOADED after bootout — it will keep firing hourly; log out or reboot, or bootout gui/$(id -u)/$LABEL by hand"
             return 1
         fi
-        say "uninstalled $LABEL from $UNIT_DIR (not loaded)"
+        log_line "uninstalled $LABEL from $UNIT_DIR (not loaded)"
         return 0
     fi
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
@@ -1525,7 +1525,7 @@ do_uninstall() {
             err "      an enabled timer THERE still fires the armed pass; uninstall it from that scope"
         fi
     done
-    say "uninstalled $UNIT_NAME from $UNIT_DIR (target=$TARGET)"
+    log_line "uninstalled $UNIT_NAME from $UNIT_DIR (target=$TARGET)"
     return 0
 }
 

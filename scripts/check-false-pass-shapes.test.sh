@@ -1745,7 +1745,7 @@ D="$(fixture h5)"
 cat > "$D/scripts/h5.sh" <<'EOS'
 #!/bin/bash
 seed() {
-  say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts"
+  log_line "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts"
 }
 EOS
 out="$(run_check "$D")"; rc=$?
@@ -2109,7 +2109,7 @@ D="$(fixture h21)"
 cat > "$D/scripts/h21.sh" <<'EOS'
 #!/bin/bash
 hint() {
-  say 'note: \' # verified: the split declaration below is the documented fix, not a masked status
+  log_line 'note: \' # verified: the split declaration below is the documented fix, not a masked status
   local cfg=$(read_config)
   echo "$cfg"
 }
@@ -2122,7 +2122,7 @@ D="$(fixture h21b)"
 cat > "$D/scripts/h21b.sh" <<'EOS'
 #!/bin/bash
 hint() {
-  say $'a marker: # verified: it is fine'
+  log_line $'a marker: # verified: it is fine'
   local cfg=$(read_config)
   echo "$cfg"
 }

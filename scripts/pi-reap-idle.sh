@@ -179,7 +179,7 @@ EOF
 }
 
 # ── helpers ────────────────────────────────────────────────────────────
-say() { printf '%s\n' "$*"; log "$*"; }
+log_line() { printf '%s\n' "$*"; log "$*"; }
 log() { printf '%s\n' "$*" >>"$REAP_LOG"; }
 
 now_epoch() {
@@ -788,21 +788,21 @@ classify_candidates() {
         GATE3_REFUSED_TOTAL=0; GATE3_REFUSED_HUMAN=0; GATE3_REFUSED_CMUX=0
         GATE3_REFUSED_UNKNOWN=0; GATE3_ALLOWED=0; GATE3_SUPPRESSED=0; fi
     if [ -z "$CANDIDATES" ]; then
-        [ "$emit" = 1 ] && say "(no tty'd pi candidates)"
+        [ "$emit" = 1 ] && log_line "(no tty'd pi candidates)"
         return 0
     fi
     for pid in $CANDIDATES; do
         [ -n "$pid" ] || continue
         tty="$(awk -v p="$pid" '$1==p {print $4}' "$PS_TABLE" | head -1)"
         if is_self_like "$pid"; then
-            [ "$emit" = 1 ] && say "$pid tty=$tty SKIP self-tty/ancestor (never reap the running session)"
+            [ "$emit" = 1 ] && log_line "$pid tty=$tty SKIP self-tty/ancestor (never reap the running session)"
             continue
         fi
         if has_live_pi_descendant "$pid"; then
-            [ "$emit" = 1 ] && say "$pid tty=$tty SKIP orchestrating (live non-zombie pi descendant)"
+            [ "$emit" = 1 ] && log_line "$pid tty=$tty SKIP orchestrating (live non-zombie pi descendant)"
             continue
         fi
-        detail="$(candidate_detail "$pid")" || { [ "$emit" = 1 ] && say "$pid tty=$tty SKIP gone (no fresh ps row)"; continue; }
+        detail="$(candidate_detail "$pid")" || { [ "$emit" = 1 ] && log_line "$pid tty=$tty SKIP gone (no fresh ps row)"; continue; }
         epoch="$(printf '%s' "$detail" | awk '{print $1}')"
         pgid="$(printf '%s' "$detail" | awk '{print $2}')"
         stat="$(printf '%s' "$detail" | awk '{print $3}')"
@@ -832,7 +832,7 @@ classify_candidates() {
         # own-session veto (PI_SESSION_ID hard gate)
         if [ -n "${PI_SESSION_ID:-}" ]; then
             if grep -qE "	${PI_SESSION_ID}(	|$)" <<<"$(store_records_for_pid "$pid")"; then
-                [ "$emit" = 1 ] && say "$pid tty=$tty SKIP own-session (PI_SESSION_ID match)"
+                [ "$emit" = 1 ] && log_line "$pid tty=$tty SKIP own-session (PI_SESSION_ID match)"
                 continue
             fi
         fi
@@ -857,7 +857,7 @@ classify_candidates() {
             fi
         done <<<"$(store_records_for_pid "$pid")"
         if [ "$matched_cnt" -eq 0 ]; then
-            [ "$emit" = 1 ] && say "$pid tty=$tty SKIP incarnation-unmatched (fence ±${FENCE_TOLERANCE_SECONDS}s; ${abstain} no-pidStartSeconds abstain(s))"
+            [ "$emit" = 1 ] && log_line "$pid tty=$tty SKIP incarnation-unmatched (fence ±${FENCE_TOLERANCE_SECONDS}s; ${abstain} no-pidStartSeconds abstain(s))"
             continue
         fi
         # JSONL idle proof FIRST (#947): the ground-truth age must be measured
@@ -936,7 +936,7 @@ classify_candidates() {
             # no JSONL proof => the veto still reports first (the reason
             # vocabulary the suite pins) and nothing is ever signaled.
             if [ "$vote" -eq 0 ]; then
-                [ "$emit" = 1 ] && say "$pid tty=$tty SKIP $veto (any non-idle twin vetoes)"
+                [ "$emit" = 1 ] && log_line "$pid tty=$tty SKIP $veto (any non-idle twin vetoes)"
                 continue
             fi
             idle_age_h="$(awk -v n="$now" -v y="$youngest" 'BEGIN{printf "%.1f", (n-y)/3600}')"
@@ -964,7 +964,7 @@ classify_candidates() {
                     # names it as report-only).
                     if [ "$gate3_ok" != 1 ]; then
                         [ "$emit" = 1 ] && GATE3_SUPPRESSED=$((GATE3_SUPPRESSED+1))
-                        [ "$emit" = 1 ] && say "$pid tty=$tty REPORT-ONLY gate3=$GATE3_CLASS (STUCK arm refused; candidate-ancestry gate — never signalled)"
+                        [ "$emit" = 1 ] && log_line "$pid tty=$tty REPORT-ONLY gate3=$GATE3_CLASS (STUCK arm refused; candidate-ancestry gate — never signalled)"
                         continue
                     fi
                     # a stuck row re-probes the UNION of every matched
@@ -973,17 +973,17 @@ classify_candidates() {
                     # $youngest is >= the stuck bound old, so a genuine advance
                     # (~now) always exceeds it. (#947 review P1)
                     REAP_CANDIDATES="$(printf '%s\n%s' "$REAP_CANDIDATES" "$pid|$pgid|${rss:-0}|$sid|$sfiles_all|$idle_age_h|$youngest|$epoch|1" | sed '/^$/d')"
-                    [ "$emit" = 1 ] && say "$pid tty=$tty REAP-ELIGIBLE(STUCK) rss=${rss:-0} idle_h=${idle_age_h}h record_age_h=${rec_age_min}h session=$sid jsonl=$sfile"
+                    [ "$emit" = 1 ] && log_line "$pid tty=$tty REAP-ELIGIBLE(STUCK) rss=${rss:-0} idle_h=${idle_age_h}h record_age_h=${rec_age_min}h session=$sid jsonl=$sfile"
                 else
-                    [ "$emit" = 1 ] && say "$pid tty=$tty STUCK-ESCALATE rss=${rss:-0} idle_h=${idle_age_h}h record_age_h=${rec_age_min}h session=$sid ($veto, record stale past ${REAP_STUCK_HOURS}h) — report-only"
+                    [ "$emit" = 1 ] && log_line "$pid tty=$tty STUCK-ESCALATE rss=${rss:-0} idle_h=${idle_age_h}h record_age_h=${rec_age_min}h session=$sid ($veto, record stale past ${REAP_STUCK_HOURS}h) — report-only"
                 fi
                 continue
             fi
-            [ "$emit" = 1 ] && say "$pid tty=$tty SKIP $veto (any non-idle twin vetoes; jsonl idle ${idle_age_h}h, record age ${rec_age_min:-?}h)"
+            [ "$emit" = 1 ] && log_line "$pid tty=$tty SKIP $veto (any non-idle twin vetoes; jsonl idle ${idle_age_h}h, record age ${rec_age_min:-?}h)"
             continue
         fi
         if [ "$vote" -eq 0 ]; then
-            [ "$emit" = 1 ] && say "$pid tty=$tty SKIP no-jsonl-proof (${abstain} abstain(s) — fail-closed)"
+            [ "$emit" = 1 ] && log_line "$pid tty=$tty SKIP no-jsonl-proof (${abstain} abstain(s) — fail-closed)"
             continue
         fi
         idle_age_h="$(awk -v n="$now" -v y="$youngest" 'BEGIN{printf "%.1f", (n-y)/3600}')"
@@ -993,7 +993,7 @@ classify_candidates() {
             # authorizes — under option A, none. Reported, never signalled.
             if [ "$gate3_ok" != 1 ]; then
                 [ "$emit" = 1 ] && GATE3_SUPPRESSED=$((GATE3_SUPPRESSED+1))
-                [ "$emit" = 1 ] && say "$pid tty=$tty REPORT-ONLY gate3=$GATE3_CLASS (candidate-ancestry gate — never signalled) idle_h=${idle_age_h}h session=$sid jsonl=$sfile"
+                [ "$emit" = 1 ] && log_line "$pid tty=$tty REPORT-ONLY gate3=$GATE3_CLASS (candidate-ancestry gate — never signalled) idle_h=${idle_age_h}h session=$sid jsonl=$sfile"
                 continue
             fi
             # Field 5 (the settle probe set) carries the UNION of every matched
@@ -1002,9 +1002,9 @@ classify_candidates() {
             # suppress, exactly as for a stuck row. Probing the union only ever
             # narrows the kill set. (#947 review P2)
             REAP_CANDIDATES="$(printf '%s\n%s' "$REAP_CANDIDATES" "$pid|$pgid|${rss:-0}|$sid|$sfiles_all|$idle_age_h|$youngest|$epoch|0" | sed '/^$/d')"
-            [ "$emit" = 1 ] && say "$pid tty=$tty REAP-ELIGIBLE rss=${rss:-0} idle_h=${idle_age_h}h session=$sid jsonl=$sfile"
+            [ "$emit" = 1 ] && log_line "$pid tty=$tty REAP-ELIGIBLE rss=${rss:-0} idle_h=${idle_age_h}h session=$sid jsonl=$sfile"
         else
-            [ "$emit" = 1 ] && say "$pid tty=$tty SKIP active (idle_h=${idle_age_h}h ≤ threshold ${REAP_IDLE_HOURS}h)"
+            [ "$emit" = 1 ] && log_line "$pid tty=$tty SKIP active (idle_h=${idle_age_h}h ≤ threshold ${REAP_IDLE_HOURS}h)"
         fi
     done
     REAP_COUNT=0
@@ -1392,7 +1392,7 @@ run() {
     # caused by a broken map must not read as the intended zero harvest, so it
     # is said out loud rather than left to the footer counters.
     if [ "$pre_count" -gt 0 ] && [ "$host_map_ok" = 0 ]; then
-        say "⚠️ GATE 3: candidate-ancestry map unavailable — every candidate is fail-closed report-only (unknown); NOTHING can be signalled this pass."
+        log_line "⚠️ GATE 3: candidate-ancestry map unavailable — every candidate is fail-closed report-only (unknown); NOTHING can be signalled this pass."
         log "GATE3 host-class map unavailable — every candidate fail-closed report-only (unknown)"
     fi
 
@@ -1411,7 +1411,7 @@ run() {
         fi
         classify_candidates "$now" 1
     else
-        say "(no tty'd pi candidates — store read skipped)"
+        log_line "(no tty'd pi candidates — store read skipped)"
     fi
 
     # ── STUCK audit block (#947): the population the cmux veto holds forever.
@@ -1419,8 +1419,8 @@ run() {
     # it. Surfacing this is the point: exit 0 with a ~2%-of-target reap must
     # not read as health while a large provably-frozen set sits vetoed.
     if [ "$STUCK_COUNT" -gt 0 ]; then
-        say ""
-        say "⚠️ STUCK: ${STUCK_COUNT} provably-frozen session(s), ~$((STUCK_RSS / 1024))MB — non-idle cmux record with its OWN updatedAt older than ${REAP_STUCK_HOURS}h:"
+        log_line ""
+        log_line "⚠️ STUCK: ${STUCK_COUNT} provably-frozen session(s), ~$((STUCK_RSS / 1024))MB — non-idle cmux record with its OWN updatedAt older than ${REAP_STUCK_HOURS}h:"
         local srow spid stty srss sidle srec ssid sveto
         while IFS= read -r srow; do
             [ -n "$srow" ] || continue
@@ -1431,12 +1431,12 @@ run() {
             srec="$(printf '%s' "$srow" | cut -d'|' -f5)"
             ssid="$(printf '%s' "$srow" | cut -d'|' -f6)"
             sveto="$(printf '%s' "$srow" | cut -d'|' -f7)"
-            say "   pid=$spid tty=$stty rss=${srss}KB jsonl_idle=${sidle}h record_age=${srec}h session=$ssid ($sveto)"
+            log_line "   pid=$spid tty=$stty rss=${srss}KB jsonl_idle=${sidle}h record_age=${srec}h session=$ssid ($sveto)"
         done <<<"$STUCK_CANDIDATES"
         if [ "$REAP_REAP_STUCK" = 1 ]; then
-            say "   → ARMED (REAP_REAP_STUCK=1): the arm is on; any row candidate-ancestry gate 3 refuses is still report-only (see the GATE 3 line below)."
+            log_line "   → ARMED (REAP_REAP_STUCK=1): the arm is on; any row candidate-ancestry gate 3 refuses is still report-only (see the GATE 3 line below)."
         else
-            say "   → NOT reaped (fail-closed). Re-run with --reap-stuck / REAP_REAP_STUCK=1 to reap this set."
+            log_line "   → NOT reaped (fail-closed). Re-run with --reap-stuck / REAP_REAP_STUCK=1 to reap this set."
         fi
         log "STUCK count=$STUCK_COUNT rss=$STUCK_RSS hours=$REAP_STUCK_HOURS armed=$REAP_REAP_STUCK"
     fi
@@ -1454,11 +1454,11 @@ run() {
     # candidate but refused none at an eligibility site is a zero ANOTHER gate
     # produced — neither may be attributed to gate 3.
     if [ "$pre_count" -gt 0 ]; then
-        say ""
-        say "GATE 3 (candidate-ancestry): classified $((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) live candidate(s) — human-terminal=${GATE3_REFUSED_HUMAN}, cmux-rooted=${GATE3_REFUSED_CMUX}, unknown/unresolvable=${GATE3_REFUSED_UNKNOWN}, allowed=${GATE3_ALLOWED}."
-        say "   → suppressed at an eligibility site: ${GATE3_SUPPRESSED} (0 means every candidate was already excluded by another gate; a refusal recorded here is one that changed the pass's outcome)."
+        log_line ""
+        log_line "GATE 3 (candidate-ancestry): classified $((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) live candidate(s) — human-terminal=${GATE3_REFUSED_HUMAN}, cmux-rooted=${GATE3_REFUSED_CMUX}, unknown/unresolvable=${GATE3_REFUSED_UNKNOWN}, allowed=${GATE3_ALLOWED}."
+        log_line "   → suppressed at an eligibility site: ${GATE3_SUPPRESSED} (0 means every candidate was already excluded by another gate; a refusal recorded here is one that changed the pass's outcome)."
         if [ "$GATE3_ALLOWED" -eq 0 ] && [ "$GATE3_REFUSED_TOTAL" -gt 0 ] && [ "$GATE3_SUPPRESSED" -gt 0 ]; then
-            say "   → no chain class is authorized, so the harvest for this population is ZERO BY DECISION, not by fault: the recorded rule keeps every class report-only because cmux is the fleet's own workspace host and nothing on this box records who spawned a pane, so the owner's own interactive pane is indistinguishable from a fleet lane. Gate 3 can only refuse — it never authorizes a signal."
+            log_line "   → no chain class is authorized, so the harvest for this population is ZERO BY DECISION, not by fault: the recorded rule keeps every class report-only because cmux is the fleet's own workspace host and nothing on this box records who spawned a pane, so the owner's own interactive pane is indistinguishable from a fleet lane. Gate 3 can only refuse — it never authorizes a signal."
         fi
         log "GATE3 classified=$((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) human=$GATE3_REFUSED_HUMAN cmux=$GATE3_REFUSED_CMUX unknown=$GATE3_REFUSED_UNKNOWN allowed=$GATE3_ALLOWED suppressed=$GATE3_SUPPRESSED"
     fi
@@ -1512,7 +1512,7 @@ run() {
     fi
 
     if [ "$MODE" = dry-run ]; then
-        say "DRY-RUN — no signals sent"
+        log_line "DRY-RUN — no signals sent"
     fi
     log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS STUCK_HOURS=$REAP_STUCK_HOURS STUCK=$STUCK_COUNT STUCK_RSS=$STUCK_RSS STUCK_ARMED=$REAP_REAP_STUCK CANDIDATES=$pre_count PRE=$pre_count POST=$post_count RESIDUAL=$residual_count KILLED=$KILLED YIELD=$YIELD_RSS GATE3_CLASSED=$((GATE3_REFUSED_TOTAL + GATE3_ALLOWED)) GATE3_HUMAN=$GATE3_REFUSED_HUMAN GATE3_CMUX=$GATE3_REFUSED_CMUX GATE3_UNKNOWN=$GATE3_REFUSED_UNKNOWN GATE3_ALLOWED=$GATE3_ALLOWED GATE3_SUPPRESSED=$GATE3_SUPPRESSED"
     if [ "$MODE" = apply ]; then

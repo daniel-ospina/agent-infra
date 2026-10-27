@@ -110,7 +110,7 @@ notify() { # notify <title> <message> <priority>
   fi
 }
 
-say() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+log_line() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
 fatal() { echo "$PROG: FATAL: $*" >&2; }
 
 # ⛔ THE NOTIFIER DEFAULT IS RESOLVED *BEFORE* THE PREFLIGHT, and that ordering is the whole point:
@@ -330,7 +330,7 @@ fi
 # The ledger lives in the runtime, beside the bytes it describes, unless the caller names a path.
 [ -n "$LEDGER" ] || LEDGER="$O/.deploy-ledger.tsv"
 
-say "$PROG: $N file(s) from $SRC -> $O"
+log_line "$PROG: $N file(s) from $SRC -> $O"
 
 # ── 1. COPY — per file, staged then renamed, with the status of EVERY file kept ──────────────────
 # ⛔ STAGE-THEN-RENAME, not `cp` over the target: bash reads a script incrementally, so an in-place
@@ -599,10 +599,10 @@ if [ "$N" -lt 1 ] || [ "$COPIED" -ne "$N" ] || [ "$VERIFIED" -ne "$N" ]; then
   exit 1
 fi
 
-say "$PROG: VERIFIED — $VERIFIED/$N file(s) written by this run and byte-identical to $SRC"
+log_line "$PROG: VERIFIED — $VERIFIED/$N file(s) written by this run and byte-identical to $SRC"
 if [ "$MODE_UNSET" -gt 0 ]; then
   # The bytes are verified; the MODE is not. Said here because the line above is what an operator quotes.
-  say "$PROG: ⚠️  mode NOT set from the source for $MODE_UNSET file(s) (no usable 'stat' on this host) — only the executable bit was restored; do not read this verdict as 'the mode is the source's'"
+  log_line "$PROG: ⚠️  mode NOT set from the source for $MODE_UNSET file(s) (no usable 'stat' on this host) — only the executable bit was restored; do not read this verdict as 'the mode is the source's'"
 fi
 
 # ── 3b. THE IDENTITY RECORD — the bytes are right, but is the box's OWN record still about them? ─
@@ -621,8 +621,8 @@ if [ -f "$STAMP" ]; then
   # and the run said nothing — silently deleting the one check whose contract (above) is that "cannot
   # check" is ALWAYS said out loud. An absent stamp is legitimately silent; an unreadable one is not.
   if [ ! -r "$STAMP" ]; then
-    say "  ⚠ identity record NOT CHECKED: $STAMP exists but is UNREADABLE, so the record was not compared."
-    say "    The bytes above are still verified. Fix its permissions, then re-run install.sh."
+    log_line "  ⚠ identity record NOT CHECKED: $STAMP exists but is UNREADABLE, so the record was not compared."
+    log_line "    The bytes above are still verified. Fix its permissions, then re-run install.sh."
     detail+=("STAMP-UNCHECKED	.agent-infra-stamp.json	(the stamp exists but is UNREADABLE)")
   fi
   REC="$(sed -n 's/.*"payloadSha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STAMP" 2>/dev/null | head -1)"
@@ -647,13 +647,13 @@ if [ -f "$STAMP" ]; then
       LIVE=""
     fi
     if [ -z "$LIVE" ]; then
-      say "  ⚠ identity record NOT CHECKED: the payload fold could not complete over $O/*.sh (an unreadable file, or no sha256 tool)."
-      say "    The bytes above are still verified; the stamp at $STAMP was NOT compared. Fix the unreadable file, then re-run install.sh."
+      log_line "  ⚠ identity record NOT CHECKED: the payload fold could not complete over $O/*.sh (an unreadable file, or no sha256 tool)."
+      log_line "    The bytes above are still verified; the stamp at $STAMP was NOT compared. Fix the unreadable file, then re-run install.sh."
       detail+=("STAMP-UNCHECKED	.agent-infra-stamp.json	(cannot hash the deployed *.sh — unreadable file, or no sha256 tool)")
     elif [ "$REC" != "$LIVE" ]; then
       STAMP_NOTE="; identity record STALE — run install.sh to re-stamp"
-      say "  ⚠ identity record STALE: $STAMP no longer describes these bytes (payloadSha256 ${REC:0:12}… vs live ${LIVE:0:12}…)."
-      say "    Re-run install.sh to re-record it; check-deployed-drift.sh will otherwise call this deploy a hand edit."
+      log_line "  ⚠ identity record STALE: $STAMP no longer describes these bytes (payloadSha256 ${REC:0:12}… vs live ${LIVE:0:12}…)."
+      log_line "    Re-run install.sh to re-record it; check-deployed-drift.sh will otherwise call this deploy a hand edit."
       detail+=("STALE-STAMP	.agent-infra-stamp.json	(payloadSha256 ${REC:0:12} vs live ${LIVE:0:12})")
     fi
   fi
@@ -663,7 +663,7 @@ if ! write_ledger "VERIFIED: $VERIFIED/$N copied and identical${STAMP_NOTE:+, id
   # ⛔ A success verdict whose evidence file could not be written must SAY SO in the verdict — the
   # notification points the operator at the ledger, and pointing at a file that does not exist is the
   # same defect one line over. The bytes are still verified; the reporting gap is named, not hidden.
-  say "  ⚠ the ledger could NOT be written at $LEDGER — the verdict above rests on this run's counts, not on a file"
+  log_line "  ⚠ the ledger could NOT be written at $LEDGER — the verdict above rests on this run's counts, not on a file"
   # ⛔ AND THE *NOTIFICATION* MUST AGREE (review P2, cycle 3). The `say` line above is stdout; a caller
   # reads the notification. It kept asserting "this deploy's own ledger" while no ledger existed — the
   # invariant this block states, broken one line over, and NEW at the symlink path (before the

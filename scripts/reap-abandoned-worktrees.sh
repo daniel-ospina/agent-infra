@@ -124,7 +124,7 @@ LIST_ONLY=0
 PRINT_CONFIG=0
 ROOTS_GIVEN=0
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
 die() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
 num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
@@ -226,7 +226,7 @@ acquire_lock() {
     owner="$(sed -n 's/^.*pid=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     started="$(sed -n 's/.*started=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     if num "$owner" && kill -0 "$owner" 2>/dev/null; then
-        say "SKIP reason=lock-held pid=$owner"
+        log_line "SKIP reason=lock-held pid=$owner"
         return 3
     fi
     # ⛔ ONLY AN UNATTRIBUTABLE LOCK IS "TOKENLESS", AND ONLY WHILE IT IS YOUNG. The old test fired on a
@@ -241,14 +241,14 @@ acquire_lock() {
         if num "$_lmt"; then
             _lage=$(( $(now) - _lmt ))
             if [ "$_lage" -ge 0 ] && [ "$_lage" -le "$LOCK_STALE_SECONDS" ]; then
-                say "SKIP reason=lock-tokenless age=${_lage}s"
+                log_line "SKIP reason=lock-tokenless age=${_lage}s"
                 return 3
             fi
         fi
     fi
-    say "note: reclaiming a STALE lock ($LOCK_DIR, pid ${owner:-?} is gone)"
+    log_line "note: reclaiming a STALE lock ($LOCK_DIR, pid ${owner:-?} is gone)"
     rm -rf "$LOCK_DIR" 2>/dev/null
-    mkdir "$LOCK_DIR" 2>/dev/null || { say "SKIP reason=lock-uncreatable path=$LOCK_DIR"; return 3; }
+    mkdir "$LOCK_DIR" 2>/dev/null || { log_line "SKIP reason=lock-uncreatable path=$LOCK_DIR"; return 3; }
     printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
     LOCK_HELD=1; return 0
 }
@@ -267,7 +267,7 @@ load_pin() {
     local f="" cand _pc _pr _pcan
     if [ -n "${REAP_AW_STAMP:-}" ]; then
         f="$REAP_AW_STAMP"
-        [ -r "$f" ] || { say "SKIP reason=stamp-unreadable path=$f"; return 3; }
+        [ -r "$f" ] || { log_line "SKIP reason=stamp-unreadable path=$f"; return 3; }
     else
         for cand in "${CELL_HOME:-}/orchestrator/.agent-infra-stamp.json" \
                     "${HOME:-}/.pi/orchestrator/.agent-infra-stamp.json"; do
@@ -297,7 +297,7 @@ load_pin() {
         PIN_PATHS="$_pc"
     fi
     PIN_SHAS="$(sed -n 's/.*"commit": *"\([0-9a-f]\{7,40\}\)".*/\1/p' "$f" 2>/dev/null)"
-    [ -n "$PIN_PATHS$PIN_SHAS" ] || { say "SKIP reason=stamp-unparseable path=$f"; return 3; }
+    [ -n "$PIN_PATHS$PIN_SHAS" ] || { log_line "SKIP reason=stamp-unparseable path=$f"; return 3; }
     return 0
 }
 
@@ -447,12 +447,12 @@ CAND=0; REAPED=0; KEPT=0; FAILED=0; REMOVE_HOW=""
 sweep_root() { # <root>
     local root="$1" d canon base mt age repo out deadline dirty_n root_canon
     deadline=$(( $(now) + BUDGET ))
-    [ -d "$root" ] || { say "note: scratch root $root does not exist — nothing to sweep there"; return 0; }
+    [ -d "$root" ] || { log_line "note: scratch root $root does not exist — nothing to sweep there"; return 0; }
     root_canon="$(lp_canon "$root")" || root_canon=""
     if [ -z "$root_canon" ]; then
         # The sweep's authority IS the root it was given. If the root cannot be resolved physically we
         # cannot prove that anything we would classify is inside it, so nothing is classified.
-        say "SKIP reason=root-unresolvable root=$root — cannot prove that a candidate is inside the scratch root; nothing was classified"
+        log_line "SKIP reason=root-unresolvable root=$root — cannot prove that a candidate is inside the scratch root; nothing was classified"
         return 3
     fi
     for d in "$root"/*/; do
@@ -464,7 +464,7 @@ sweep_root() { # <root>
         # link cannot be an abandoned checkout either: a real one is a directory whose `.git` is a
         # file, and a link to one is somebody's alias, not debris.
         if [ -L "$d" ]; then
-            KEPT=$((KEPT + 1)); say "KEPT   $d reason=symlink (never followed: resolving it would leave the scratch root)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=symlink (never followed: resolving it would leave the scratch root)"; continue
         fi
         # ONLY a linked worktree. A primary checkout's `.git` is a DIRECTORY and is NEVER a candidate
         # (this is the test that keeps the hub and the cell's own repo out of reach, by construction).
@@ -472,43 +472,43 @@ sweep_root() { # <root>
         canon="$(lp_canon "$d")" || canon=""
         base="$(basename "$d")"
         if [ -z "$canon" ] || [ "$canon" = "$root_canon" ]; then
-            KEPT=$((KEPT + 1)); say "KEPT   $d reason=unresolvable"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=unresolvable"; continue
         fi
         # ⛔ AND THE CONTAINMENT RE-CHECK. `-L` is not the only way out — a bind mount, or a `pwd -P`
         # that reports an ancestor, would leave the canonical path outside the root this sweep was
         # told to cover. The canonical path (not the given one) is what gets classified and removed,
         # so the canonical path is what must be proven inside.
         if ! _lp_rel "$canon" "$root_canon"; then
-            KEPT=$((KEPT + 1)); say "KEPT   $d reason=outside-root ($canon is not inside $root_canon — this sweep has no authority there)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=outside-root ($canon is not inside $root_canon — this sweep has no authority there)"; continue
         fi
         mt="$(file_mtime "$d")"
         if ! num "$mt"; then
-            KEPT=$((KEPT + 1)); say "KEPT   $canon reason=no-mtime (cannot prove its age)"; continue
+            KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=no-mtime (cannot prove its age)"; continue
         fi
         age=$(( ( $(now) - mt ) / 60 ))
         [ "$age" -lt 0 ] && age=0
         # ── the guards, in order, each of them NAMED ──────────────────────────────────────────
         if pinned "$canon" "$base"; then
-            KEPT=$((KEPT + 1)); say "KEPT   $canon reason=pinned (the .agent-infra-stamp.json pin protects it; age=${age}m)"
+            KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=pinned (the .agent-infra-stamp.json pin protects it; age=${age}m)"
             continue
         fi
         if lp_path_named "$CENSUS" "$canon"; then
-            KEPT=$((KEPT + 1)); say "KEPT   $canon reason=argv-named ($LP_NAME_WHY; age=${age}m)"
+            KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=argv-named ($LP_NAME_WHY; age=${age}m)"
             continue
         fi
         if lp_path_held "$CENSUS" "$canon"; then
-            KEPT=$((KEPT + 1)); say "KEPT   $canon reason=live-cwd ($LP_HOLD_WHY; age=${age}m)"
+            KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=live-cwd ($LP_HOLD_WHY; age=${age}m)"
             continue
         fi
         if [ "$age" -lt "$AGED_MINUTES" ]; then
-            KEPT=$((KEPT + 1)); say "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
+            KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
             continue
         fi
         repo="$(repo_root_of "$d")" || repo=""
         if [ "$(now)" -ge "$deadline" ]; then
             # ⛔ THE BUDGET BOUNDS THE CLASSIFICATION TOO. `git status` per candidate is exactly the
             # unbounded per-record fork the budget exists for; an unprocessed candidate is PRESERVED.
-            say "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
+            log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
             KEPT=$((KEPT + 1)); continue
         fi
         out="$(head_state "$d")"
@@ -517,11 +517,11 @@ sweep_root() { # <root>
             case "$dirty_n" in
                 '') # git did not answer: `--dirty keep` cannot PROVE the tree is clean, so it keeps it.
                     KEPT=$((KEPT + 1))
-                    say "KEPT   $canon reason=clean-unknown (git could not report the tree state, so the --dirty keep dial cannot prove it clean; age=${age}m)"
+                    log_line "KEPT   $canon reason=clean-unknown (git could not report the tree state, so the --dirty keep dial cannot prove it clean; age=${age}m)"
                     continue ;;
                 0) ;;
                 *)  KEPT=$((KEPT + 1))
-                    say "KEPT   $canon reason=dirty($dirty_n) (uncommitted work is the one thing removal cannot give back; --dirty reap restores the measured predicate; age=${age}m)"
+                    log_line "KEPT   $canon reason=dirty($dirty_n) (uncommitted work is the one thing removal cannot give back; --dirty reap restores the measured predicate; age=${age}m)"
                     continue ;;
             esac
         fi
@@ -531,18 +531,18 @@ sweep_root() { # <root>
             # SAME shape `pi-reap-worktrees.sh` uses (`preserve <path>` + `reason=…`). The entry point
             # sizes a dry-run candidate with `du` on THE REST OF THE LINE, so a `(age=…)` suffix made
             # every candidate measure as `? bytes unmeasured` (measured: 17 of 17 on this box).
-            say "remove $canon"
-            say "         age=${age}m $out"
+            log_line "remove $canon"
+            log_line "         age=${age}m $out"
             continue
         fi
         if [ "$(now)" -ge "$deadline" ]; then
-            say "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
+            log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
             KEPT=$((KEPT + 1)); continue
         fi
         # ⛔ RE-PROVE IMMEDIATELY BEFORE THE DESTRUCTIVE CALL. Everything above ran against ONE snapshot.
         if ! toctou_preserve "$canon"; then
             KEPT=$((KEPT + 1))
-            say "KEPT   $canon reason=toctou ($TOCTOU_WHY; the pass-start snapshot was up to ${BUDGET}s stale, and a live holder is never a guess; age=${age}m)"
+            log_line "KEPT   $canon reason=toctou ($TOCTOU_WHY; the pass-start snapshot was up to ${BUDGET}s stale, and a live holder is never a guess; age=${age}m)"
             log "PRESERVE-TOCTOU $canon $TOCTOU_WHY"
             continue
         fi
@@ -550,11 +550,11 @@ sweep_root() { # <root>
             # `how=` comes from the ARM THAT RAN, never from "a repo was found": an unregistered
             # (moved) worktree is removed with `rm`, and calling that `git-worktree-remove` told a
             # reader its branch had been preserved by git when it had not.
-            REAPED=$((REAPED + 1)); say "REAPED $canon how=${REMOVE_HOW:-rm} age=${age}m $out"
+            REAPED=$((REAPED + 1)); log_line "REAPED $canon how=${REMOVE_HOW:-rm} age=${age}m $out"
             log "reaped $canon age=${age}m $out repo=${repo:-none}"
         else
             FAILED=$((FAILED + 1))
-            say "ERR    $canon reason=remove-failed (a live holder would fail exactly this way; look before retrying)"
+            log_line "ERR    $canon reason=remove-failed (a live holder would fail exactly this way; look before retrying)"
             log "REMOVAL FAILED $canon age=${age}m repo=${repo:-none}"
         fi
     done
@@ -565,12 +565,12 @@ if ! acquire_lock; then exit 3; fi
 if ! load_pin; then exit 3; fi
 
 CENSUSDIR="$(mktemp -d "${TMPDIR:-/tmp}/reap-aw-census.XXXXXX" 2>/dev/null)" || CENSUSDIR=""
-if [ -z "$CENSUSDIR" ]; then say "SKIP reason=census-dir-uncreatable"; exit 3; fi
+if [ -z "$CENSUSDIR" ]; then log_line "SKIP reason=census-dir-uncreatable"; exit 3; fi
 trap 'release_lock; rm -rf "$CENSUSDIR" 2>/dev/null' EXIT
 CENSUS="$CENSUSDIR/live-paths.tsv"
 
 MODE_TEXT=dry-run; [ "$DRY_RUN" = 1 ] || MODE_TEXT=apply
-say "reap-abandoned-worktrees: pass start mode=$MODE_TEXT roots=$(printf '%s' "$ROOTS" | tr ':' ',') aged=${AGED_MINUTES}m pid=$$"
+log_line "reap-abandoned-worktrees: pass start mode=$MODE_TEXT roots=$(printf '%s' "$ROOTS" | tr ':' ',') aged=${AGED_MINUTES}m pid=$$"
 # ⛔ THE DOCUMENTED SEAM MUST REACH THE LIBRARY. `REAP_AW_PROC_ROOT` drives the fail-closed arm in the
 # docs and in this suite, but the census reads `LP_PROC_ROOT`; unmapped, the documented way to simulate
 # an unreadable table silently read the REAL one and reported green (`census=ok`).
@@ -581,19 +581,19 @@ say "reap-abandoned-worktrees: pass start mode=$MODE_TEXT roots=$(printf '%s' "$
 # EMPTY directory — the natural spelling of a test seam (`mktemp -d`) — passed an existence check and
 # fell through to `lsof`, reading a different table and reporting green.
 if [ -n "${REAP_AW_PROC_ROOT:-}" ] && [ ! -e "${REAP_AW_PROC_ROOT}/self/cwd" ] && ! ls "${REAP_AW_PROC_ROOT}"/[0-9]*/cwd >/dev/null 2>&1; then
-    say "note: REAP_AW_PROC_ROOT=$REAP_AW_PROC_ROOT is not a process table — forcing the fail-closed arm rather than reading a different one"
+    log_line "note: REAP_AW_PROC_ROOT=$REAP_AW_PROC_ROOT is not a process table — forcing the fail-closed arm rather than reading a different one"
     LP_CENSUS_UNAVAILABLE=1
 fi
 export LP_PROC_ROOT="${LP_PROC_ROOT:-${REAP_AW_PROC_ROOT:-/proc}}"
 if ! lp_census "$CENSUSDIR"; then
     # ⛔ THE FAIL-CLOSED ARM, SAID OUT LOUD. Nothing is reaped, and the reason names the probe. The
     # caller turns this into a red class: a reaper that cannot prove idleness must never read green.
-    say "SKIP reason=census-unreadable mechanism=${LP_CENSUS_MECH:-none} — the process list could not be read, so NO directory can be proven free; nothing was reaped (fail closed)"
-    say "SUMMARY class=abandoned-worktree mode=$MODE_TEXT candidates=0 reaped=0 kept=0 failed=0 census=unreadable"
+    log_line "SKIP reason=census-unreadable mechanism=${LP_CENSUS_MECH:-none} — the process list could not be read, so NO directory can be proven free; nothing was reaped (fail closed)"
+    log_line "SUMMARY class=abandoned-worktree mode=$MODE_TEXT candidates=0 reaped=0 kept=0 failed=0 census=unreadable"
     log "SKIP census-unreadable mechanism=${LP_CENSUS_MECH:-none}"
     exit 3
 fi
-say "reap-abandoned-worktrees: $(lp_description); pin=$([ -n "$PIN_SHAS" ] && printf '%s' "$(printf '%s' "$PIN_SHAS" | head -1)" || printf none)"
+log_line "reap-abandoned-worktrees: $(lp_description); pin=$([ -n "$PIN_SHAS" ] && printf '%s' "$(printf '%s' "$PIN_SHAS" | head -1)" || printf none)"
 
 SWEEP_RC=0
 while IFS= read -r r; do
@@ -603,7 +603,7 @@ while IFS= read -r r; do
     sweep_root "$r" || SWEEP_RC=3
 done <<<"$(printf '%s\n' "$ROOTS" | tr ':' '\n')"
 
-say "SUMMARY class=abandoned-worktree mode=$MODE_TEXT candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED census=ok rows=$LP_CENSUS_ROWS pids=$LP_CENSUS_PIDS aged=${AGED_MINUTES}m dirty=$DIRTY_MODE"
+log_line "SUMMARY class=abandoned-worktree mode=$MODE_TEXT candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED census=ok rows=$LP_CENSUS_ROWS pids=$LP_CENSUS_PIDS aged=${AGED_MINUTES}m dirty=$DIRTY_MODE"
 log "SUMMARY mode=$MODE_TEXT candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED"
 
 [ "$FAILED" -gt 0 ] && exit 4

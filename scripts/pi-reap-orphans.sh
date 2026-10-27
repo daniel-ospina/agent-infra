@@ -321,7 +321,7 @@ EOF
 }
 
 # ── helpers ────────────────────────────────────────────────────────────
-say() { printf '%s\n' "$*"; log "REAP $*"; }
+log_line() { printf '%s\n' "$*"; log "REAP $*"; }
 # `--list` is a read-only diagnostic: no lock, no log, no signal. The ps/lsof
 # loaders below log on their failure paths, so the guard lives HERE rather than
 # at each call site.
@@ -1047,8 +1047,8 @@ report_row() { # <verdict> <pid> <reason> <detail>
     log "CLASSIFY $1 $2 reason=$3 $4"
     [ -n "$REASON_TMP" ] && printf '%s\n' "$3" >>"$REASON_TMP" 2>/dev/null
     if [ "$1" = "reap" ]; then
-        say "reap     pid=$2"
-        say "         reason=$3 $4"
+        log_line "reap     pid=$2"
+        log_line "         reason=$3 $4"
         return 0
     fi
     if [ "$VERBOSE" = 1 ] || is_near_miss "$3"; then
@@ -1250,10 +1250,10 @@ run() {
         pid="$ppid"; depth=$((depth + 1))
     done
 
-    say "$SCRIPT_NAME — reaping ppid=1 children with a DELETED cwd ($ISSUE_REF)"
-    say "   mode=$MODE  sample=${REAP_ORPHAN_SAMPLE_SECONDS}s  min-cpu=+${REAP_ORPHAN_MIN_CPU_CENTISECONDS}cs  uid=$MY_UID"
-    say "   SIGTERM first, SIGKILL only after ${REAP_ORPHAN_TERM_GRACE_SECONDS}s. A failed probe aborts the pass."
-    say ""
+    log_line "$SCRIPT_NAME — reaping ppid=1 children with a DELETED cwd ($ISSUE_REF)"
+    log_line "   mode=$MODE  sample=${REAP_ORPHAN_SAMPLE_SECONDS}s  min-cpu=+${REAP_ORPHAN_MIN_CPU_CENTISECONDS}cs  uid=$MY_UID"
+    log_line "   SIGTERM first, SIGKILL only after ${REAP_ORPHAN_TERM_GRACE_SECONDS}s. A failed probe aborts the pass."
+    log_line ""
 
     START_EPOCH="$(now_epoch)"
     local row ca cb elapsed cmd crumb verdict reason detail term_rc alive ident
@@ -1321,14 +1321,14 @@ run() {
         REAP_C=$((REAP_C + 1))
         if [ "$MODE" != apply ]; then
             report_row reap "$pid" "$reason" "$detail"
-            say "         DRY-RUN — would SIGTERM (nothing signalled)"
+            log_line "         DRY-RUN — would SIGTERM (nothing signalled)"
             continue
         fi
         "$KILL_BIN" -TERM "$pid" 2>/dev/null
         term_rc=$?
         if [ "$term_rc" != 0 ]; then
             report_row reap "$pid" "$reason" "$detail"
-            say "         TERM-FAILED (rc=$term_rc) — no signal delivered"
+            log_line "         TERM-FAILED (rc=$term_rc) — no signal delivered"
             log "TERM-FAILED pid=$pid rc=$term_rc"
             FAILED=$((FAILED + 1))
             continue
@@ -1344,7 +1344,7 @@ run() {
         fi
         if [ "$alive" = 0 ]; then
             report_row reap "$pid" "$reason" "$detail"
-            say "         REAPED — exited on SIGTERM"
+            log_line "         REAPED — exited on SIGTERM"
             log "REAPED pid=$pid signal=SIGTERM"
             REAPED=$((REAPED + 1))
             continue
@@ -1365,12 +1365,12 @@ run() {
         sleep 1
         if ps_load "$PS_PROBE" 2>/dev/null && ! pid_alive "$PS_PROBE" "$pid"; then
             report_row reap "$pid" "$reason" "$detail"
-            say "         REAPED — required SIGKILL (ignored SIGTERM)"
+            log_line "         REAPED — required SIGKILL (ignored SIGTERM)"
             log "REAPED pid=$pid signal=SIGKILL"
             REAPED=$((REAPED + 1))
         else
             report_row reap "$pid" "$reason" "$detail"
-            say "         KILL-FAILED — pid $pid is still alive (or its death could not be proven)"
+            log_line "         KILL-FAILED — pid $pid is still alive (or its death could not be proven)"
             log "KILL-FAILED pid=$pid"
             FAILED=$((FAILED + 1))
         fi

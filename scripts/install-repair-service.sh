@@ -113,7 +113,7 @@ TRIGGER_BACKSTOP_S="${REPAIR_TRIGGER_BACKSTOP_S:-1800}"
 TRIGGER_RETRY_MIN_S="${REPAIR_TRIGGER_RETRY_MIN_S:-300}"
 SCRIPTS_DIR="${PR_REPAIR_SCRIPTS:-$CELL_HOME/.pi/agent/scripts}"
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 ok()  { printf '  ✅ %s\n' "$*"; }
 warn() { printf '  ⚠️  %s\n' "$*" >&2; }
 err() { printf '  ❌ %s\n' "$*" >&2; }
@@ -229,8 +229,8 @@ readback() {
     e="$($SYSTEMCTL is-enabled "$UNIT_NAME" 2>/dev/null)" || true
     k="$($SYSTEMCTL show -p KillMode --value "$UNIT_NAME" 2>/dev/null)" || true
     x="$($SYSTEMCTL show -p ExecStart --value "$UNIT_NAME" 2>/dev/null)" || true
-    say "  is-active=$a  is-enabled=$e  KillMode=$k"
-    say "  ExecStart=$(printf '%s' "$x" | tr -s ' ' | cut -c1-160)"
+    log_line "  is-active=$a  is-enabled=$e  KillMode=$k"
+    log_line "  ExecStart=$(printf '%s' "$x" | tr -s ' ' | cut -c1-160)"
     [ "$a" = "active" ] || { err "is-active=$a, expected active"; rc=1; }
     [ "$e" = "enabled" ] || { err "is-enabled=$e, expected enabled (a unit that does not survive a reboot is not activation)"; rc=1; }
     [ "$k" = "process" ] || { err "KillMode=$k, expected process (#2716)"; rc=1; }
@@ -287,7 +287,7 @@ EOF
 # ── verbs ──────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
     resolve_scope
-    say "eldato-pr-repair ($SCOPE scope, unit dir $UNIT_DIR)"
+    log_line "eldato-pr-repair ($SCOPE scope, unit dir $UNIT_DIR)"
     local rc=0
     # ⛔ THE MODE IS READ FROM THE INSTALLED ARTIFACT, NOT FROM THIS SHELL'S `REPAIR_MODE`. The
     # operator's env describes what an install WOULD render; the question `--status` answers is what
@@ -299,10 +299,10 @@ cmd_status() {
         *--trigger*) installed_mode=trigger ;;
         *--loop*)    installed_mode=loop ;;
     esac
-    say "  mode=$installed_mode  (from the installed ExecStart)"
+    log_line "  mode=$installed_mode  (from the installed ExecStart)"
     readback || rc=1
-    say ""
-    say "  last pass (the artifact that answers 'did it DO anything' — is-active does not):"
+    log_line ""
+    log_line "  last pass (the artifact that answers 'did it DO anything' — is-active does not):"
     if [ -x "$SCRIPTS_DIR/pr-repair-loop.sh" ]; then
         "$SCRIPTS_DIR/pr-repair-loop.sh" --status 2>&1 | sed 's/^/    /' || rc=1
     else
@@ -314,19 +314,19 @@ cmd_status() {
 
 cmd_dry_run() {
     resolve_scope
-    say "eldato-pr-repair (dry run, $SCOPE scope)"
+    log_line "eldato-pr-repair (dry run, $SCOPE scope)"
     local tmp; tmp="$(mktemp)" || die "REFUSING: mktemp failed"
     render "$TEMPLATES_DIR/$UNIT_NAME" "$tmp"
-    say "  ── rendered unit ──"
+    log_line "  ── rendered unit ──"
     sed 's/^/    /' "$tmp"
     rm -f "$tmp"
-    say ""
-    say "  would install: $UNIT_DIR/$UNIT_NAME  (enable --now, then read back is-active/is-enabled/KillMode)"
+    log_line ""
+    log_line "  would install: $UNIT_DIR/$UNIT_NAME  (enable --now, then read back is-active/is-enabled/KillMode)"
 }
 
 cmd_install() {
     resolve_scope
-    say "eldato-pr-repair (install, $SCOPE scope)"
+    log_line "eldato-pr-repair (install, $SCOPE scope)"
 
     # The artifacts the unit will exec, verified BEFORE the unit exists: a unit whose ExecStart cannot
     # resolve starts, fails, restarts, exhausts its start limit and reads `failed` — a loud but
@@ -419,21 +419,21 @@ cmd_install() {
         [ "$($SYSTEMCTL is-active "$UNIT_NAME" 2>/dev/null)" = "active" ] && break
         sleep 1
     done
-    say ""
+    log_line ""
     if ! readback; then
         err "REFUSING: the unit did not read back healthy (above). Nothing here is claimed as installed-and-working."
         err "  journal: journalctl -u $UNIT_NAME -n 40 --no-pager"
         exit 1
     fi
-    say ""
-    say "  first journal lines (proof the loop is taking decisions, not just alive):"
+    log_line ""
+    log_line "  first journal lines (proof the loop is taking decisions, not just alive):"
     $SYSTEMCTL status "$UNIT_NAME" --no-pager -n 6 2>/dev/null | sed 's/^/    /' || true
     exit 0
 }
 
 cmd_uninstall() {
     resolve_scope
-    say "eldato-pr-repair (uninstall, $SCOPE scope)"
+    log_line "eldato-pr-repair (uninstall, $SCOPE scope)"
     $SYSTEMCTL stop "$UNIT_NAME" 2>/dev/null || true
     $SYSTEMCTL disable "$UNIT_NAME" 2>/dev/null || true
     if [ "$SCOPE" = "system" ]; then
@@ -445,7 +445,7 @@ cmd_uninstall() {
     local a e
     a="$($SYSTEMCTL is-active "$UNIT_NAME" 2>/dev/null)" || true
     e="$($SYSTEMCTL is-enabled "$UNIT_NAME" 2>/dev/null)" || true
-    say "  is-active=$a  is-enabled=$e"
+    log_line "  is-active=$a  is-enabled=$e"
     [ "$a" = "inactive" ] && [ "$e" = "not-found" ] && { ok "removed"; exit 0; }
     err "the unit is still present after uninstall (is-active=$a is-enabled=$e)"
     exit 1

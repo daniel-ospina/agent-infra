@@ -209,7 +209,7 @@ usage() {
 }
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-say() { printf '%s\n' "$*"; plog "$*"; }
+log_line() { printf '%s\n' "$*"; plog "$*"; }
 plog() {
     [ -n "$LOG" ] || return 0
     printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true
@@ -220,7 +220,7 @@ plog() {
 # of four caches is not a pass.
 fail_closed() {
     FAILS=$((FAILS + 1))
-    say "pi-cache-reap: FAIL-CLOSED — $*"
+    log_line "pi-cache-reap: FAIL-CLOSED — $*"
 }
 
 # ⛔ A DEFERRAL IS NOT A FAILURE, AND IT IS NOT A PASS EITHER (#2036). The one benign non-zero
@@ -241,7 +241,7 @@ ACTED=0
 PRUNED_MB=0
 deferred() {
     DEFERRED=$((DEFERRED + 1))
-    say "pi-cache-reap: DEFERRED — $*"
+    log_line "pi-cache-reap: DEFERRED — $*"
 }
 
 now_epoch() { date +%s 2>/dev/null; }
@@ -728,7 +728,7 @@ reap_target() {
             fail_closed "$class: $dir cannot be seen (the parent $parent is not searchable) — an unreadable cache is NOT an absent one"
             return 0
         fi
-        say "pi-cache-reap: $class $dir absent (nothing to bound)"
+        log_line "pi-cache-reap: $class $dir absent (nothing to bound)"
         return 0
     fi
     [ -d "$dir" ] || { fail_closed "$class: $dir exists but is not a directory"; return 0; }
@@ -753,13 +753,13 @@ reap_target() {
     # Read free space only when the cache is OVER its bound: an under-bound pass is then one
     # `du` per cache and nothing else, which is what makes an hourly clock cheap.
     if [ "$before_kb" -le "$MAX_KB" ]; then
-        say "pi-cache-reap: $class $dir $(mb_str "$before_kb") <= ${MAX_MB}MB bound — no action"
+        log_line "pi-cache-reap: $class $dir $(mb_str "$before_kb") <= ${MAX_MB}MB bound — no action"
         return 0
     fi
 
     if [ "$MODE" != "apply" ]; then
         OVER_ONLY=$((OVER_ONLY + 1))
-        say "pi-cache-reap: DRY-RUN $class $dir $(mb_str "$before_kb") > ${MAX_MB}MB bound — would prune, then evict the largest entries while no $class process holds the cache (re-run with --apply)"
+        log_line "pi-cache-reap: DRY-RUN $class $dir $(mb_str "$before_kb") > ${MAX_MB}MB bound — would prune, then evict the largest entries while no $class process holds the cache (re-run with --apply)"
         return 0
     fi
 
@@ -984,7 +984,7 @@ reap_target() {
         # with no such sample the reclaim is UNVERIFIED and the pass fails closed, exactly as
         # ruling 4 requires, rather than certifying a shrink it cannot attribute.
         if [ "$any_gain" -eq 1 ]; then
-            say "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB — UNDER its bound; the net free-space delta is UNATTRIBUTABLE ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb"): another process wrote during the pass), but at least one eviction of this pass WAS followed by a gain, so the pass did reclaim (the net figure is masked by another writer)${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
+            log_line "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB — UNDER its bound; the net free-space delta is UNATTRIBUTABLE ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb"): another process wrote during the pass), but at least one eviction of this pass WAS followed by a gain, so the pass did reclaim (the net figure is masked by another writer)${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
             return 0
         fi
         fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) while free space FELL ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb")) and NOT ONE eviction of this pass was followed by a gain — the reclaim is NOT verified (another writer is masking it, or the bytes are still pinned by an open descriptor); re-verification belongs to the next pass${stop_note}"
@@ -1013,7 +1013,7 @@ reap_target() {
         return 0
     fi
 
-    say "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB; free $(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb") (+$(mb_str "$credited_kb") verified reclaim$([ "$gained_kb" -gt "$claimed_kb" ] && printf '; df gained %s more, NOT attributable to this pass' "$(mb_str "$(( gained_kb - claimed_kb ))")")) VERIFIED${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
+    log_line "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB; free $(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb") (+$(mb_str "$credited_kb") verified reclaim$([ "$gained_kb" -gt "$claimed_kb" ] && printf '; df gained %s more, NOT attributable to this pass' "$(mb_str "$(( gained_kb - claimed_kb ))")")) VERIFIED${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
     return 0
 }
 
@@ -1096,12 +1096,12 @@ lock_acquire() {
                [ "$(canon_lstart "$held_lstart")" != "$(canon_lstart "$now_lstart")" ]; then
                 plog "pi-cache-reap: lock owner pid $owner is a RECYCLED pid (start time '$now_lstart' != '$held_lstart') — treating the lock as stale"
             else
-                say "pi-cache-reap: another pass is running (pid $owner, ${age}s) — this one does not run ($ISSUE_REF)"
+                log_line "pi-cache-reap: another pass is running (pid $owner, ${age}s) — this one does not run ($ISSUE_REF)"
                 return 1
             fi
         fi
         if [ "$age" -lt "$LOCK_STALE_SECONDS" ]; then
-            say "pi-cache-reap: lock held (owner=${owner:-?} age ${age}s, owner unverifiable) — this pass does not run"
+            log_line "pi-cache-reap: lock held (owner=${owner:-?} age ${age}s, owner unverifiable) — this pass does not run"
             return 1
         fi
         # ⛔ A DIRECTORY AT $LOCK_DIR IS NOT NECESSARILY A LOCK. Breaking one is `rm -rf`, and the
@@ -1119,7 +1119,7 @@ lock_acquire() {
             # `say`, not stderr: the launchd job deliberately captures no stderr, so a refusal
             # written only there is dropped on the one platform where this runs unattended — the
             # job then refuses silently, every hour, with nothing in its log.
-            say "pi-cache-reap: $LOCK_DIR exists, is older than ${LOCK_STALE_SECONDS}s, and is not a lock this reaper made (kind/owner/started do not match) — it will not be removed (exit 3)"
+            log_line "pi-cache-reap: $LOCK_DIR exists, is older than ${LOCK_STALE_SECONDS}s, and is not a lock this reaper made (kind/owner/started do not match) — it will not be removed (exit 3)"
             return 3
         fi
         plog "pi-cache-reap: breaking a stale lock (owner=${owner:-?} age=${age}s)"
@@ -1139,7 +1139,7 @@ lock_acquire() {
                 rmdir "$LOCK_DIR.break" 2>/dev/null || true
             fi
             if ! mkdir "$LOCK_DIR.break" 2>/dev/null; then
-                say "pi-cache-reap: another pass is already clearing a stale lock — this one does not run"
+                log_line "pi-cache-reap: another pass is already clearing a stale lock — this one does not run"
                 return 1
             fi
         fi
@@ -1156,7 +1156,7 @@ lock_acquire() {
             printf '%s\n' "pi-cache-reap: cannot create the lock at $LOCK_DIR — refusing to run without mutual exclusion (exit 3)" >&2
             return 3
         fi
-        say "pi-cache-reap: lock raced with another pass — this one does not run"
+        log_line "pi-cache-reap: lock raced with another pass — this one does not run"
         return 1
     fi
     printf '%s\n' "$$" >"$LOCK_DIR/owner" 2>/dev/null || true
@@ -1290,7 +1290,7 @@ case "$LOCK_RC" in
 esac
 trap 'cleanup; lock_release' EXIT
 
-say "pi-cache-reap: pass start mode=$MODE max=${MAX_MB}MB per cache ($ISSUE_REF)"
+log_line "pi-cache-reap: pass start mode=$MODE max=${MAX_MB}MB per cache ($ISSUE_REF)"
 reap_target uv "$UVD"
 reap_target npm "$NPMD"
 reap_target pip "$PIPD"
@@ -1300,7 +1300,7 @@ reap_target pip "$PIPD"
 cap_log
 
 if [ "$FAILS" -gt 0 ]; then
-    say "pi-cache-reap: FAILED — $FAILS cache(s) could not be bounded or verified this pass (exit 3)"
+    log_line "pi-cache-reap: FAILED — $FAILS cache(s) could not be bounded or verified this pass (exit 3)"
     exit 3
 fi
 # ORDER IS LOAD-BEARING: a real breakage (3) outranks a deferral (7), and a deferral outranks the
@@ -1311,9 +1311,9 @@ if [ "$DEFERRED" -gt 0 ]; then
     # make — and must not claim "nothing was acted on" either. On a deletion tool the summary is the
     # line a postmortem greps; a per-cache line is not a substitute for an accurate total.
     if [ "$ACTED" -gt 0 ]; then
-        say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED because a live tool held them; this pass DID act (${PRUNED_MB}MB pruned by the safe half, and/or escalation evictions) and the BOUND IS NOT CLAIMED (exit 7: a deferral, not a failure)"
+        log_line "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED because a live tool held them; this pass DID act (${PRUNED_MB}MB pruned by the safe half, and/or escalation evictions) and the BOUND IS NOT CLAIMED (exit 7: a deferral, not a failure)"
     else
-        say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED to a later pass because a live tool held them; nothing was acted on and NOTHING IS CLAIMED (exit 7: a deferral, not a failure)"
+        log_line "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED to a later pass because a live tool held them; nothing was acted on and NOTHING IS CLAIMED (exit 7: a deferral, not a failure)"
     fi
     exit 7
 fi
@@ -1322,8 +1322,8 @@ fi
 # — and the cell's clock reads 0 as "the bound was cleared", so the incident state (cache over
 # bound, reaper unarmed) was indistinguishable from a healthy one on every surface.
 if [ "$OVER_ONLY" -gt 0 ]; then
-    say "pi-cache-reap: pass end mode=$MODE — $OVER_ONLY cache(s) are OVER the ${MAX_MB}MB bound and were NOT acted on (dry-run: arming is an owner step, agent-infra#1678)"
+    log_line "pi-cache-reap: pass end mode=$MODE — $OVER_ONLY cache(s) are OVER the ${MAX_MB}MB bound and were NOT acted on (dry-run: arming is an owner step, agent-infra#1678)"
     exit 5
 fi
-say "pi-cache-reap: pass end mode=$MODE — every present cache is under the ${MAX_MB}MB bound"
+log_line "pi-cache-reap: pass end mode=$MODE — every present cache is under the ${MAX_MB}MB bound"
 exit 0
