@@ -5288,6 +5288,18 @@ test("mergeInvocationInText: every FAIL-CLOSED arm is load-bearing", () => {
       "arm 5 — …and behind a wrapper",
       `timeout 5 gh "pr" m$'e'rge 99900010 --admin`,
     ],
+    [
+      "arm 3 — a SPLICED command word plus a quoted group word (review cycle 2, P0)",
+      `g$'h' "pr" merge 999 --admin`,
+    ],
+    [
+      "arm 3 — …behind a wrapper's arguments, where the position model stops",
+      `timeout 5 g$'h' "pr" merge 999 --admin`,
+    ],
+    [
+      "arm 3 — …and with the command word supplied entirely by the environment",
+      `$GH "pr" merge 999 --admin`,
+    ],
   ];
   for (const [why, cmd] of shapes) {
     ok(mergeInvocationInText(cmd), `a merge invocation is still read (fail-closed): ${why}`);
@@ -5305,6 +5317,13 @@ test("mergeInvocationInText: the candidate rule is a SUPERSET of mergeVerbInText
   // silently stops deciding a command its own caller names — measured in review cycle 1 as
   // a live fail-open for `M=merge; GH_TOKEN=abc gh "pr" $M 999 --admin` (the quoted group
   // word is DATA to the counting walk; the construct in the verb slot is the merge).
+  //
+  // SCOPED EXACTLY, because the unscoped form is FALSE and was caught in review cycle 2:
+  //   pinned here      — `mergeVerbInText(c)` ⇒ `mergeInvocationInText(c)`   (the argv read)
+  //   NOT an invariant — `mergeVerbInText(c)` ⇒ `isAdminMergeCommand(c)`, since that
+  //                      predicate ALSO requires `hasAdminMergeFlag`. `gh pr merge 999` (no
+  //                      flag) is a merge both reads see and the ADMIN-merge gate does not;
+  //                      the registry gate is what decides it.
   const corpus = [
     // The shapes each arm is for:
     "gh pr merge 999 --admin",
@@ -5321,11 +5340,18 @@ test("mergeInvocationInText: the candidate rule is a SUPERSET of mergeVerbInText
     `while true; do gh "pr" m$'e'rge 99900010 --admin; done`,
     `timeout 5 gh "pr" m$'e'rge 99900010 --admin`,
     `stdbuf -oL gh "pr" $M 999 --admin`,
+    `g$'h' "pr" merge 999 --admin`,
+    `g$"h" "pr" "merge" 999 --admin`,
+    `$GH "pr" merge 999 --admin`,
+    `timeout 5 g$'h' "pr" merge 999 --admin`,
     "gh p$'r' merge 999 --admin",
     `gh pr m\`printf erge\` 999 --admin`,
     `$'gh' pr merge 999 --admin`,
     `g$'h' pr merge 999 --admin`,
     "gh pr --repo o/r merge 999 --admin",
+    // …a merge with NO admin signal, where the two functions legitimately differ (the scope
+    // note above — this entry is what would go red on a naive "isAdminMergeCommand" form):
+    "gh pr merge 999",
     // …and the read-only commands, which must satisfy the implication vacuously:
     `gh api "repos/o/r/commits/abc/check-runs?per_page=100&filter=all" --paginate`,
     `gh api repos/o/r/branches/main/protection --jq '{enforce_admins: .enforce_admins}'`,
@@ -5338,16 +5364,31 @@ test("mergeInvocationInText: the candidate rule is a SUPERSET of mergeVerbInText
   for (const command of corpus) {
     if (!mergeVerbInText(command)) continue;
     ok(
-      isAdminMergeCommand(command),
-      `mergeVerbInText reads a merge, so the candidate rule must too: ${command}`,
+      mergeInvocationInText(command),
+      `mergeVerbInText reads a merge, so the argv-position read must too: ${command}`,
     );
-    ok(mergeInvocationInText(command), `…and the argv-position read agrees: ${command}`);
   }
   // The implication has to be non-vacuous on the shapes it exists for, or this test would
   // pass on a corpus where NOTHING is a merge:
   ok(mergeVerbInText(`M=merge; GH_TOKEN=abc gh "pr" $M 99900010 --admin`),
      "the read this invariant leans on does fire on the quoted-group shape");
   ok(mergeVerbInText("sh -c 'gh pr merge 999 --admin'"), "…and on a wrapped verb");
+  // NOTE the division of labour, measured: `g$'h' "pr" merge 999 --admin` is a real admin
+  // merge that `mergeVerbInText` does NOT name (its quote-blind arm wants the construct in a
+  // VERB position, and here the construct is the COMMAND word) — it is caught by the
+  // sequence arm's construct command word instead. That arm is therefore a GAIN over both
+  // this invariant and `origin/main`, not a restatement of either.
+  ok(!mergeVerbInText(`g$'h' "pr" merge 999 --admin`),
+     "the spliced-command-word family is the sequence arm's, not mergeVerbInText's");
+  ok(isAdminMergeCommand(`g$'h' "pr" merge 999 --admin`),
+     "…and it is still a candidate, which is what review cycle 2 was about");
+  // …and the CALLER's predicate agrees wherever its own flag conjunct holds:
+  for (const command of corpus) {
+    if (!(mergeVerbInText(command) && hasAdminMergeFlag(command))) continue;
+    ok(isAdminMergeCommand(command), `…and the admin-merge gate decides it: ${command}`);
+  }
+  ok(!(mergeVerbInText("gh pr merge 999") && hasAdminMergeFlag("gh pr merge 999")),
+     "…while a merge with no admin signal is left to the registry gate (the scope note)");
 });
 
 testAsync("#3953 handler: the mandated tree-health reads are ADMITTED, and no admin-merge gate runs", async () => {

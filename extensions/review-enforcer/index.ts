@@ -5699,13 +5699,31 @@ function ghGroupIsUnreadable(command: string): boolean {
  */
 function mergeVerbSequenceInTokens(command: string): boolean {
   const scan = scanTokens(command);
-  // 0: looking for the `gh` word, 1: for `pr`, 2: for `merge`.
+  // 0: looking for the command word, 1: for `pr`, 2: for `merge`.
   let stage = 0;
-  for (const raw of scan.tokens) {
+  for (let i = 0; i < scan.tokens.length; i++) {
+    const raw = scan.tokens[i];
     const w = shellWord(raw);
     const verbWord = withoutAssignmentPrefix(w);
+    // The command word is `gh`, OR a construct where a command word belongs (`g$'h'`,
+    // `$GH`, `X='gh pr merge 9'`, `CMD+=gh`). ⛔ OMITTING THE CONSTRUCT CASE WAS THE CYCLE-2
+    // P0: bash resolves `g$'h' "pr" merge 999 --admin` to `gh pr merge 999 --admin`, and
+    // with only a literal `gh` accepted, NO arm matched — the quoted `"pr"` is DATA to the
+    // data-aware count whenever the simple command's first word is not literally `gh`, the
+    // group-slot arm wants a construct in the GROUP, and this walk wanted the word `gh` in
+    // the COMMAND slot. Measured across 1500 generated inputs: 244 real admin merges fell
+    // through that one combination.
+    // NOT position-gated, deliberately: `timeout 5 g$'h' "pr" merge …` and
+    // `sudo $GH "pr" merge …` put the command word behind a WRAPPER's arguments, which the
+    // position model does not resolve, and requiring command position there re-opened the
+    // same hole one wrapper deeper (measured). What keeps it from firing on an ARGUMENT is
+    // the SEQUENCE (a `pr` word then a `merge` word immediately after the construct) plus
+    // the caller's own `hasAdminMergeFlag` conjunct — and a bare `$` is excluded, so
+    // `${RAIL}` (which tokenizes to `$` + `RAIL}`) cannot be read as a command word.
+    const isCommandWord =
+      /\bgh\b/.test(w) || (CONSTRUCT.test(raw) && w !== "" && !raw.startsWith("-"));
     if (stage !== 2) {
-      if (/\bgh\b/.test(w)) stage = 1;
+      if (isCommandWord) stage = 1;
       else if (stage === 1 && verbWord === "pr") stage = 2;
       continue;
     }
@@ -5714,9 +5732,9 @@ function mergeVerbSequenceInTokens(command: string): boolean {
     // verb slot: skipping it is what lets `CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge`
     // read as one invocation (measured as a real bypass).
     if (verbWord.trim() === "") continue;
-    // A word in the verb slot that is not the verb restarts the walk (a `gh` here can
-    // begin a fresh sequence; anything else drops back to looking for `gh`).
-    stage = /\bgh\b/.test(w) ? 1 : 0;
+    // A word in the verb slot that is not the verb restarts the walk (a command word here
+    // can begin a fresh sequence; anything else drops back to looking for one).
+    stage = isCommandWord ? 1 : 0;
   }
   return false;
 }
@@ -5764,7 +5782,8 @@ function ansiCEncodesSeparator(command: string): boolean {
  *   - a `gh` whose GROUP slot is unreadable still counts (`V="pr merge"; gh $V 999 --admin`,
  *     `gh --hostname … $X 999 --admin`), because there the verb is not in the text at all;
  *   - a verb ASSEMBLED with assignments still counts (`CMD+=gh CMD+=pr CMD+=merge`,
- *     `X='gh pr merge 999 --admin'; sh -c "$X"`), where no token IS the word `gh`;
+ *     `X='gh pr merge 999 --admin'; sh -c "$X"`), where no token IS the word `gh`, and so
+ *     does an assembled COMMAND word (`g$'h' "pr" merge 999 --admin`, `$GH "pr" merge …`);
  *   - ANYTHING `mergeVerbInText` names is a merge here too. That read is the caller's own,
  *     and it is quote-blind where this walk is data-aware, so it catches the construct in a
  *     VERB position behind a merely-quoted group word — a measured fail-open for the arms
@@ -5821,8 +5840,11 @@ export function mergeInvocationInText(command: string): boolean {
   // word is not `gh` (an assignment prefix, a reserved word, a wrapper), so the verb window
   // never closes — while `mergeVerbInText` DOES name a merge for all of them. Two predicates
   // for "is this a merge" disagreeing is the failure this file keeps re-learning, so the
-  // candidate rule is made a SUPERSET of that read rather than a second opinion beside it:
-  // INVARIANT, pinned in the suite — `mergeVerbInText(c) ⇒ isAdminMergeCommand(c)`.
+  // candidate rule is made a SUPERSET of that read rather than a second opinion beside it.
+  // SCOPED PRECISELY: the pinned invariant is `mergeVerbInText(c) ⇒ mergeInvocationInText(c)`.
+  // `isAdminMergeCommand` is a DIFFERENT (narrower) question — it also requires
+  // `hasAdminMergeFlag`, so `gh pr merge 999` (no flag anywhere) is a merge this rule sees and
+  // the ADMIN-merge gate does not, which is correct and is how the registry gate gets it.
   if (mergeVerbInText(bare)) return true;
   // The separators are not recoverable from the text, so the token arms above are not a
   // read of this command: refuse on the WORDS read, which is what the pre-#3953 rule did.
