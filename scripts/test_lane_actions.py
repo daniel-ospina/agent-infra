@@ -2689,7 +2689,7 @@ def test_the_deployed_lane_verdict_constant_points_at_the_real_vendor():
         "class this leg exists for: %r" % (lv.JEV_MODEL,))
 
 
-def test_jev_step5_posts_the_pinned_model_to_the_vendor_endpoint(monkeypatch):
+def test_jev_step5_posts_the_current_model_to_the_vendor_endpoint(monkeypatch):
     """The request `lane-actions.py` actually builds: `LV.JEV_URL` + `LV.JEV_MODEL` from the
     loaded module, a name-keyed `questions` map (one per lane, each with `instructions`), and a
     `choice` answer read back per lane.
@@ -2743,6 +2743,11 @@ def test_jev_step5_posts_the_pinned_model_to_the_vendor_endpoint(monkeypatch):
     assert q["type"] == "choice" and isinstance(q["instructions"], str) and q["instructions"], q
     assert answers == {"demo": ("DONE_READY", 0.9)}, answers
     assert meta["source"] == "JEV" and meta["error"] is None, meta
+    # ⛔ THE ECHO, FOR THIS LAYER TOO. The alias makes the reported version the only evidence of
+    # what answered: delete `meta["model"] = d.get("model")` in `lane-actions.py` and the daily
+    # report header silently reads `Jev ?`, with nothing red. It is asserted here — against the
+    # version the fixture ANSWERED with, not the alias — so that removal is a failure.
+    assert meta["model"] == "jev-1.13.0", meta
 
 
 def _deployed_constants(filename):

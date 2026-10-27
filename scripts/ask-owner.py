@@ -69,8 +69,11 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # re-derive when a verdict looks wrong, and `turn-classify.py` records the model the
 # API ECHOES (`meta["model"]`, i.e. the concrete version that answered) precisely so that
 # shift is visible in the record instead of being inferred from behaviour.
-# Pinning a version again is a one-line change here plus `scripts/turn-classify.py`; it needs
-# re-deriving the bars on that version first, which is why it is a decision and not a default.
+# Pinning a version again is a one-line change in EACH of the five copies listed in the sweep
+# note at the top of this block (the two tracked callers, the two deployed ~/.pi/agent/scripts
+# copies, and the deployed state/lane-verdict.py) — a partial re-pin is the same split-brain
+# this round fixed in the other direction — and it needs the bars re-derived on that version
+# FIRST, which is why it is a decision and not a default.
 JEV_MODEL = "jev-latest"      # vendor alias — moves with the vendor, see above
 # ---------------------------------------------------------------------------
 # CALIBRATION — measured, not guessed. One threshold for all seven marks was the

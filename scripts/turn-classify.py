@@ -149,7 +149,10 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # answered, and `jev_choice` returns it as `meta["model"]` — so a verdict that shifted for a
 # reason no diff explains is visible in the record (`model: jev-1.14.0` against bars measured
 # on 1.13) instead of being inferred later from behaviour. Re-derive the bars FIRST when that
-# shows up; pinning a version again is a one-line change here and in `ask-owner.py`.
+# shows up. Pinning a version again is a one-line change in EACH of the five copies the sweep
+# note above lists (these two tracked callers, the two deployed ~/.pi/agent/scripts copies, and
+# the deployed state/lane-verdict.py) — a partial re-pin is the same split-brain this round
+# fixed in the other direction.
 JEV_MODEL = "jev-latest"
 
 # The three outcomes Jev chooses between. The FOURTH case the owner named —

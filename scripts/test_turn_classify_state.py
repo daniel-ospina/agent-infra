@@ -176,12 +176,12 @@ def test_every_published_verdict_is_classified():
     assert not stale, "classified here but never published by lane-status: %s" % sorted(stale)
 
 
-# ── THE VENDOR IS TYPESAFE — HOST MOVED, MODEL PIN DID NOT (2026-10-26) ──────────────────────
+# ── THE VENDOR IS TYPESAFE — HOST MOVED, AND THE MODEL FOLLOWED ON 2026-10-27 ──────────────
 # ⛔ THE DEFECT THEY EXIST FOR. Every caller in the fleet POSTed to `jevtypesafeai.com`, a
 # lookalike host that billed on its own account, for as long as the constants said so. Nothing
 # failed and no test noticed: the code was INTERNALLY consistent, so the only thing that could
 # have caught it was an assertion on the endpoint itself. The owner's money went to that host
-# (tortoise#7864, paid off there). These legs assert the ENDPOINT, the MODEL PIN, the KEY
+# (tortoise#7864, paid off there). These legs assert the ENDPOINT, the MODEL, the KEY
 # PRECEDENCE, the REQUEST SHAPE and the META SHAPE — the five things a rotation must not
 # silently break.
 #
@@ -291,7 +291,7 @@ def test_call_shape_and_meta_carry_tokens_not_an_invented_cost(monkeypatch, tmp_
     # with an alias they are not, and the record must carry the SECOND one — otherwise a verdict
     # that shifted because the vendor shipped is indistinguishable from a bug in the marks.
     assert meta["model"] == "jev-1.14.0", meta
-    assert meta["model"] != tc.JEV_MODEL, (
+    assert meta["model"] != "jev-latest", (
         "the meta must report the version the API ANSWERED with, not the alias we sent")
     assert seen["url"] == tc.JEV_URL, seen["url"]
     assert seen["body"]["model"] == tc.JEV_MODEL, seen["body"]
