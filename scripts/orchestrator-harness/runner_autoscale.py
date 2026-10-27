@@ -119,6 +119,18 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
     RUNNER_AUTOSCALE_NO_SUDO        "1" → do not prefix with sudo (tests, rootless)
     RUNNER_AUTOSCALE_ONLINE_WAIT_S  seconds to wait for a restarted runner to report online (60)
     RUNNER_AUTOSCALE_POLL_S         poll interval while waiting (5)
+    RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS  attempts for ONE pool read while it races our own restart (3),
+                                   retrying NETWORK/5xx/RATE-LIMIT errors only — a 404 is answered at once
+    RUNNER_AUTOSCALE_RETRY_BACKOFF_S     pause between those attempts (2)
+    RUNNER_AUTOSCALE_STARVATION_CONFIRM_S  seconds between the two samples the starvation alarm takes
+                                   before it pages (30). A value that is not a finite number in
+                                   (0, 300] is REFUSED with a note rather than disabling the guard
+
+  ⛔ `--json` CONSUMERS: `starvation` is THREE-VALUED and the healthy value is `"ok"`. `"starved"` is
+  the alarm; `"unmeasured"` means the queue could not be read and the invariant was NOT evaluated —
+  never read that as healthy (a monitor whose test is `starvation != "starved"` treats blindness as
+  health, which is the failure this field exists to prevent). The key is absent when the pass was not
+  healthy enough to evaluate it, so absence is also not health.
 
   ⛔ THE SEAMS ARE MEASUREMENT INPUTS, NOT CEILING OVERRIDES. There is deliberately no
   `--ceiling` / `--max-runners` flag: a box that can be told to exceed its own measurement is a
@@ -128,6 +140,9 @@ EXIT  0 converged / nothing to do (a REFUSAL is an answer, not a failure)
       1 usage, or `--want N` refused (N above the measured ceiling — nothing was changed)
       2 a measurement or pool read was UNREADABLE — fail-closed, nothing was changed
       3 an ACTION failed (restart / registration / missing provisioner) — the record says which
+      4 STARVATION — `queued>0 ∧ busy==0 ∧ online>0` confirmed (agent-infra#2875). Nothing was
+        changed by the alarm: it names the invariant and the three counts. This is the one exit a
+        health check should page on, because a starved box otherwise reads perfectly healthy.
 """
 
 from __future__ import annotations
@@ -150,6 +165,7 @@ if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
 import argparse
 import datetime
 import json
+import math
 import os
 import re
 import shutil
@@ -157,6 +173,16 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# ── the starvation alarm's numbers, in ONE place ─────────────────────────────────────────────────
+# ⛔ WHY CONSTANTS: these two values are QUOTED IN OPERATOR-FACING TEXT (the refusal note says which
+# range it refused and which default it used), and a hand-written second copy of a number is how a
+# note comes to lie about what the code did. Measured in review: the note could say "<= 900" while
+# the bound was 300, or "using 60s" while the fallback was 30, and NOTHING reddened — the note is
+# prose, and prose is the copy no compiler checks. The text below is DERIVED from these constants, so
+# changing a value changes the message, and the suite pins each one to the constant it came from.
+STARVATION_CONFIRM_DEFAULT_S = 30.0
+STARVATION_CONFIRM_MAX_S = 300.0
 
 # ── the sizing predicate (owner ruling, agent-infra#2344 comment 6347825624) ────────────────────
 MEM_PER_RUNNER_MB = 1500
@@ -426,6 +452,93 @@ def read_pool(repo: str) -> dict[str, PoolEntry]:
 def fallback_engaged(pool: dict[str, PoolEntry]) -> bool:
     """Is the ARM64 pool carrying the fallback label RIGHT NOW (the gate's own condition)?"""
     return any(ARM_POOL_LABEL in e.labels and FALLBACK_LABEL in e.labels for e in pool.values())
+
+
+# ── the starvation invariant (agent-infra#2875) ─────────────────────────────────────────────────
+def read_queued_runs(repo: str) -> int:
+    """How many workflow runs are QUEUED for this repo. Unreadable raises — never reads as 0.
+
+    ⛔ An absent queue reading is not "no queue". `0` is the value that silences the alarm, so a
+    failed read must never produce it (the same fail-closed rule every measurement here follows).
+    """
+    gh = gh_bin()
+    if not gh:
+        raise Unmeasurable("gh is not on PATH (set RUNNER_AUTOSCALE_GH)")
+    cmd = [
+        gh,
+        "api",
+        f"repos/{repo}/actions/runs?status=queued&per_page=1",
+        "--jq",
+        ".total_count",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise Unmeasurable(f"queue depth read failed to run ({exc})") from exc
+    if proc.returncode != 0:
+        raise Unmeasurable(
+            f"repos/{repo}/actions/runs?status=queued exited {proc.returncode}: "
+            f"{(proc.stderr or '').strip()[:300]}"
+        )
+    raw = (proc.stdout or "").strip()
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise Unmeasurable(f"queue depth is not a number ({raw[:80]!r})") from exc
+
+
+def starvation_invariant(queued: int, busy: int, online: int) -> bool:
+    """`queued > 0 ∧ busy == 0 ∧ online > 0` — WORK IS WAITING, CAPACITY IS UP AND IDLE.
+
+    ⛔ THIS IS STARVATION, NOT DEMAND. Work queued with every runner BUSY is a busy pool; work queued
+    with NO runner online is a repair problem (this tool's own DEAD/ORPHANED path); work queued with a
+    runner ONLINE and NONE busy means the queue and the runners are not meeting — the labels, the
+    arch, or the gate. Nothing watched that: measured 2026-10-27 it was misread twice in one night,
+    first as "capacity" and then as "review cost", and the merge window was gone (agent-infra#2875).
+    ⛔ THE `online > 0` OPERAND IS NOT DECORATION: without it an all-offline pool (nothing can take
+    work) reads as starvation and pages a human for a state the repair path already owns.
+    """
+    return queued > 0 and busy == 0 and online > 0
+
+
+def starvation_probe(repo: str, confirm_s: float = STARVATION_CONFIRM_DEFAULT_S) -> dict:
+    """Sample the invariant, CONFIRM it across a short interval, and report the counts.
+
+    A dict, not a bool, so a `--json` consumer reads one record instead of parsing prose.
+
+    ⛔ CONFIRMED, because the invariant also holds for a few seconds of ordinary handover (a queue
+    drains, the next job has not been assigned yet). The second sample is only taken when the FIRST
+    one already looks starved, so a healthy box pays nothing for the confirmation.
+    ⛔ AN UNREAD QUEUE IS `unmeasured`, NOT OK. Turning it into exit 2 would let a permission-scoped
+    token silence the capacity work this tool exists for; turning it into `ok` would hide the one
+    state the alarm exists to surface. So it is named, in the record and in the human line.
+    """
+
+    def sample() -> tuple[int, int, int]:
+        pool = read_pool_retrying(repo)
+        queued = read_queued_runs(repo)
+        return (
+            queued,
+            sum(1 for e in pool.values() if e.busy),
+            sum(1 for e in pool.values() if e.online),
+        )
+
+    try:
+        queued, busy, online = sample()
+        starved = starvation_invariant(queued, busy, online)
+        if starved and confirm_s > 0:
+            time.sleep(confirm_s)
+            queued, busy, online = sample()
+            starved = starvation_invariant(queued, busy, online)
+    except Unmeasurable as exc:
+        return {"state": "unmeasured", "detail": str(exc)}
+    return {
+        "state": "starved" if starved else "ok",
+        "queued": queued,
+        "busy": busy,
+        "online": online,
+        "invariant": "queued>0 AND busy==0 AND online>0",
+    }
 
 
 def label_floor_binds(pool: dict[str, PoolEntry]) -> bool:
@@ -1178,6 +1291,70 @@ def converge(
             break
 
     # 7. VERDICT --------------------------------------------------------------------------------
+    # ⛔ THE STARVATION ALARM (agent-infra#2875) IS EVALUATED HERE, ONCE, AND ON EVERY PASS THAT IS
+    # OTHERWISE HEALTHY — including a pass that ACTED. The gate is about the pass's own
+    # trustworthiness, NOT about whether it did something: a pass with a problem, an unverified
+    # measurement or a provisioner refusal alarms about THAT, and this must never mask it.
+    # ⛔ AND IT IS NOT SUPPRESSED BY ACTIONS, DELIBERATELY — measured in review round 2. Gating on
+    # `not record["actions"]` silences the alarm for ever on exactly the box that needs it: a runner
+    # whose repair never sticks is restarted and re-registered on EVERY pass, so an acting gate would
+    # report `converged`/exit 0 with the queue still stuck — #2875's own signature, hidden inside the
+    # state the tool keeps repairing. The cost of not gating is a bounded false page in the few
+    # seconds between a repair and the repaired runner picking work up (the confirmation sample
+    # absorbs most of it); the cost of gating is a permanently silent alarm. NOISE LOSES.
+    starvation: dict = {}
+    if not record["problems"] and not record.get("unverified") and not record.get("problem_kind"):
+        confirm_raw = os.environ.get("RUNNER_AUTOSCALE_STARVATION_CONFIRM_S")
+        # ⛔ PARSED DEFENSIVELY, AND BOUNDED, because every value of this seam must fail LOUD. Measured
+        # in review: `float()` ACCEPTS `nan`, `-5` and `inf` — the first two silently SKIPPED the
+        # confirmation sample (sleep(0) and sleep(negative) both return at once), and `inf` raised
+        # `OverflowError` OUT of the pass (only `Unmeasurable` is caught in `main()`), killing it with
+        # a traceback and no record. A seam that can disable or crash a guard is a seam that will.
+        try:
+            confirm_s = (
+                float(confirm_raw)
+                if confirm_raw not in (None, "")
+                else STARVATION_CONFIRM_DEFAULT_S
+            )
+            # ⛔ THE BOUND CAPS THE CONFIRM TERM ALONE — it does NOT make a pass fit the cadence, and
+            # must not be read as doing so. Measured against this file's own bounds, the worst pass is
+            # longer than the cadence regardless: `read_pool` and `read_queued_runs` each carry
+            # `timeout=120` (a retried pool read is up to 3x120+2x2), the confirming path takes TWO
+            # samples, `wait_online` tests its 60 s deadline only AFTER a read returns, and `provision`
+            # is `timeout=1800`. 300 s is chosen so the confirm cannot DOMINATE a pass (it is still 10x
+            # the 30 s default, so it stays usable for a slow box); 600 s would. Overlap between two
+            # concurrent passes is closed by NEITHER this bound nor any lock — this tool takes none —
+            # and that residual is reported, not papered over here.
+            if not (
+                math.isfinite(confirm_s) and 0 < confirm_s <= STARVATION_CONFIRM_MAX_S
+            ):
+                raise ValueError(confirm_raw)
+        except (TypeError, ValueError):
+            # 0 IS REFUSED, deliberately: `starvation_probe` only takes its second sample when
+            # `confirm_s > 0`, so accepting 0 would silently disable the confirmation — a guard that
+            # a "why forbid zero?" tidy could switch off. A caller who wants a single sample is asking
+            # for a DIFFERENT guard, not for this one with its teeth removed.
+            confirm_s = STARVATION_CONFIRM_DEFAULT_S
+            record["notes"].append(
+                f"starvation confirm interval {confirm_raw!r} is not a usable number of seconds "
+                f"(finite, 0 < s <= {STARVATION_CONFIRM_MAX_S:.0f}) — "
+                f"using {STARVATION_CONFIRM_DEFAULT_S:.0f}s"
+            )
+        starvation = starvation_probe(repo, confirm_s)
+        record["starvation"] = starvation.get("state")
+        if starvation.get("state") == "starved":
+            record["notes"].append(
+                f"STARVATION {starvation['invariant']}: queued={starvation['queued']} "
+                f"busy={starvation['busy']} online={starvation['online']} — work is waiting and the "
+                "capacity that is up is idle; this is not demand, it is a queue that cannot reach "
+                "the runners (labels/arch/gate). Nothing else watches this (agent-infra#2875)"
+            )
+        elif starvation.get("state") == "unmeasured":
+            record["notes"].append(
+                "starvation invariant NOT evaluated: "
+                f"{starvation.get('detail')} — an unread queue is not an empty one"
+            )
+
     if record["problems"]:
         record["verdict"] = "action-failed"
     elif record.get("problem_kind") == "refusal":
@@ -1203,6 +1380,15 @@ def converge(
                 "an install) — the pass stopped there. The actions listed above were already "
                 "performed BEFORE that point; nothing further was done."
             )
+    elif starvation.get("state") == "starved":
+        record["verdict"] = "starvation"
+        record["error"] = (
+            f"STARVATION ({starvation['invariant']}): queued={starvation['queued']} "
+            f"busy={starvation['busy']} online={starvation['online']} — the queue has work and every "
+            "online runner is idle. Nothing was changed by this alarm; the cause is a mismatch "
+            "between what the jobs ask for and what the runners advertise (labels/arch/gate), not a "
+            "lack of capacity (agent-infra#2875)"
+        )
     elif live > ceil:
         record["verdict"] = "over-ceiling"
         record["notes"].append(
@@ -1362,8 +1548,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {a}")
         for n in record.get("notes", []):
             print(f"  · {n}")
+        if record.get("starvation"):
+            print(f"starvation={record['starvation']}")
         if record.get("refusal"):
             print(record["refusal"], file=sys.stderr)
+        if record["verdict"] == "starvation":
+            print(record.get("error", ""), file=sys.stderr)
         print(f"verdict={record['verdict']}")
     if record["verdict"] == "refused":
         return 1
@@ -1371,6 +1561,8 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     if record["verdict"] == "unmeasurable":
         return 2
+    if record["verdict"] == "starvation":
+        return 4
     return 0
 
 

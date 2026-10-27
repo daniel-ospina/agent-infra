@@ -41,6 +41,13 @@ below grows with the suite, so this header never claims a case that does not exi
      Cases: T7 (a transient failure is retried a BOUNDED number of times, then `unmeasurable`, and the
      message CONTAINS gh's own words), T8 (a DETERMINISTIC 404 — the unit had no `--repo`, so the call
      was `repos//actions/runners` — is NOT retried and its text survives).
+  4. THE STARVATION INVARIANT (agent-infra#2875). `queued_runs > 0 ∧ busy_runners == 0 ∧
+     online_runners > 0` is starvation, not demand, and nothing watched it; measured 2026-10-27 it was
+     misread twice in one night, first as "capacity" and then as "review cost", costing the merge
+     window. Implemented HERE, as the issue asks, instead of as a separate healer.
+     Cases: T9 (it fires: verdict `starvation`, exit 4, the counts and the invariant named, and
+     nothing changed), T9b (CONFIRMED across two samples, so a handover blip is not an alarm),
+     T10 (the three near-misses stay silent — busy pool, empty queue, ALL-OFFLINE).
 
 ⛔ HERMETIC, BY CONSTRUCTION. Every measurement is a fixture: `meminfo` is a file, the installs are
 directories, and `gh` / `systemctl` / `config.sh` / the provisioner are STUBS on the seams the tool
@@ -73,6 +80,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE_PATH = os.path.normpath(os.path.join(HERE, "runner_autoscale.py"))
@@ -84,6 +92,11 @@ MODULE_UNDER_TEST = os.environ.get("RUNNER_AUTOSCALE_MODULE") or MODULE_PATH
 # 3.9-compatible script and pretend otherwise.
 if sys.version_info < (3, 12):
     sys.exit(f"runner_autoscale.test.py requires Python >= 3.12 (got {sys.version.split()[0]})")
+
+# ⛔ NO __pycache__ IN THE CHECKOUT. Loading the module under test by path would write one next to
+# the shipped file, and a suite that dirties the tree it is checking is a suite that reddens a
+# clean-tree gate — measured in review round 2.
+sys.dont_write_bytecode = True
 
 
 def _load_module():
@@ -145,8 +158,19 @@ if is /registration-token; then
 fi
 if is 'actions/runs?status=queued'; then
   # `--jq .total_count` — the queue depth. An absent fixture file is an ERROR, never a zero.
-  [ -f "$FIX/queued" ] || { echo "gh: no queued fixture" >&2; exit 1; }
-  cat "$FIX/queued"; exit 0
+  # `queued.seq` is a newline list consumed one per call (last repeats), so a case can make the
+  # SECOND sample of the same pass disagree with the first — which is what CONFIRMATION means.
+  [ -f "$FIX/queued" ] || [ -f "$FIX/queued.seq" ] || { echo "gh: no queued fixture" >&2; exit 1; }
+  if [ -f "$FIX/queued.seq" ]; then
+    qn=0; [ -f "$FIX/queued.count" ] && qn="$(cat "$FIX/queued.count")"
+    total=$(wc -l < "$FIX/queued.seq" | tr -d ' ')
+    pick=$(( qn + 1 )); [ "$pick" -gt "$total" ] && pick="$total"
+    printf '%s\n' "$(( qn + 1 ))" > "$FIX/queued.count"
+    sed -n "${pick}p" "$FIX/queued.seq"
+  else
+    cat "$FIX/queued"
+  fi
+  exit 0
 fi
 if is 'actions/runners'; then
   # POOL READ. `pool.seq` is a newline list of steps consumed one per call (last step repeats):
@@ -255,7 +279,12 @@ class Box:
             "RUNNER_AUTOSCALE_POLL_S": "0",
             "RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS": "3",
             "RUNNER_AUTOSCALE_RETRY_BACKOFF_S": "0",
+            # 1 ms: a positive value inside the seam's accepted range (0 is REFUSED — it would mean
+            # "no confirmation"), so every case pays a millisecond instead of the production 30 s and
+            # no case silently runs without a confirmation sample.
+            "RUNNER_AUTOSCALE_STARVATION_CONFIRM_S": "0.001",
         }
+        self.queued(0)  # a healthy box: the queue is readable and empty unless a case says otherwise
 
     # ── writing the fixture ──
     @staticmethod
@@ -310,6 +339,18 @@ class Box:
 
     def queued(self, n):
         self._write(os.path.join(self.dir, "queued"), f"{n}\n")
+
+    def unqueue(self):
+        """Remove the queue fixture entirely: the depth read FAILS (the stub exits 1), as a scoped
+        token or a broken unit would. An unreadable queue is the one input that can silence the
+        alarm, so it gets its own case."""
+        path = os.path.join(self.dir, "queued")
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def queued_seq(self, steps):
+        """Per-CALL queue depth (the last step repeats) — the confirmation sample, driven."""
+        self._write(os.path.join(self.dir, "queued.seq"), "\n".join(str(s) for s in steps) + "\n")
 
     def provisioner(self, rc=0, out=""):
         self._write(os.path.join(self.dir, "provisioner.rc"), f"{rc}\n")
@@ -739,6 +780,370 @@ def t8_deterministic_pool_error_is_not_retried():
             box.destroy()
 
 
+@test("T9 starvation FIRES: queued>0 ∧ busy==0 ∧ online>0 ⇒ verdict + non-zero exit, counts named")
+def t9_starvation_fires():
+    """agent-infra#2875. WORK IS WAITING, CAPACITY IS UP, NONE OF IT IS BUSY — and nothing watched
+    it. Measured 2026-10-27 it was misread twice in one night, first as "capacity" and then as
+    "review cost", costing the merge window. The converger already reads both numbers, so it alarms:
+    a verdict naming the invariant and the three counts, and a NON-ZERO exit.
+
+    The pre-fix shape read exactly this box as healthy: 1 runner online, not busy, 0 problems ⇒
+    `at-ceiling` and exit 0."""
+    with Env():
+        box = Box("starved")
+        try:
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.queued(53)
+            record = converge(box, want=0)
+            check(record["verdict"] == "starvation", f"verdict must be starvation: {record}")
+            check(record.get("starvation") == "starved", f"starvation state: {record.get('starvation')}")
+            blob = " ".join(record["notes"]) + " " + str(record.get("error"))
+            contains(blob, "STARVATION", "the record")
+            contains(blob, "queued>0 AND busy==0 AND online>0", "the record")
+            contains(blob, "queued=53", "the record")
+            contains(blob, "busy=0", "the record")
+            contains(blob, "online=1", "the record")
+            check(
+                record["actions"] == [],
+                f"the alarm must CHANGE NOTHING (it is not a healer): {record['actions']}",
+            )
+            rc, out = cli(box, "--root", box.root, "--want", "0")
+            check(rc == 4, f"a starvation alarm must exit non-zero (4), got {rc}: {out[:400]}")
+            contains(out, "starvation", "the human output")
+        finally:
+            box.destroy()
+
+
+@test("T9b confirmation: the second sample must ALSO be starved, so a handover blip is not an alarm")
+def t9b_starvation_is_confirmed():
+    """The invariant also holds for a few seconds of ordinary handover (a queue drains, the next job
+    has not been assigned yet). So the probe samples again before alarming — and ONLY when the first
+    sample already looks starved, so a healthy box pays nothing."""
+    with Env():
+        box = Box("starved-blink")
+        try:
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.queued_seq([53, 0])  # starved on the first sample, drained by the second
+            box.env["RUNNER_AUTOSCALE_STARVATION_CONFIRM_S"] = "0.01"
+            record = converge(box, want=0)
+            check(
+                record["verdict"] != "starvation",
+                f"a blip must NOT alarm (the second sample was queued=0): {record['verdict']}",
+            )
+            check(
+                record.get("starvation") == "ok",
+                f"the probe must report ok after the second sample: {record.get('starvation')}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T10 the three NEAR-MISSES must not fire: busy pool, empty queue, all-offline")
+def t10_starvation_near_misses():
+    """Each of these was a way to misread the same night, and each must stay silent:
+      (a) queued>0 ∧ busy>0 — a BUSY pool is demand being served, not starvation;
+      (b) queued==0 — nothing is waiting;
+      (c) all runners OFFLINE — nothing can take work, which is the DEAD/ORPHANED repair path's job.
+    Firing on (c) would page a human for a state this tool already owns, which is why `online > 0`
+    is an operand of the invariant rather than a comment."""
+    cases = [
+        ("busy-pool", [("r-1", "online", True, ["self-hosted-x64", ra.FALLBACK_LABEL])], 53),
+        ("empty-queue", [("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])], 0),
+        ("all-offline", [("r-1", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])], 53),
+    ]
+    with Env():
+        for label, pool, queued in cases:
+            box = Box(f"near-{label}")
+            try:
+                box.pool(pool)
+                box.queued(queued)
+                record = converge(box, want=0)
+                check(
+                    record.get("starvation") != "starved",
+                    f"[{label}] must NOT read as starved: {record.get('starvation')} ({record['verdict']})",
+                )
+                check(
+                    record["verdict"] != "starvation",
+                    f"[{label}] verdict must not be starvation: {record['verdict']}",
+                )
+                check(
+                    not any("STARVATION " in n for n in record["notes"]),
+                    f"[{label}] no starvation line may be emitted: {record['notes']}",
+                )
+            finally:
+                box.destroy()
+
+
+@test("T11 an UNREADABLE queue is 'unmeasured', never 'ok' — blindness must not read as health")
+def t11_unreadable_queue_is_unmeasured():
+    """The one input that can silence the alarm. `read_queued_runs` raises instead of returning 0, and
+    the probe reports `unmeasured` with gh's own words — because turning a failed read into `ok` is
+    how a starved box keeps reading healthy, and turning it into exit 2 would let a permission-scoped
+    token redden the capacity tool for ever. The residual is a CONSUMER duty, stated here: the green
+    test is `starvation == "ok"`, never `starvation != "starved"`."""
+    with Env():
+        box = Box("queue-unread")
+        try:
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.unqueue()
+            record = converge(box, want=0)
+            check(
+                record.get("starvation") == "unmeasured",
+                f"an unread queue must be 'unmeasured', got {record.get('starvation')!r}",
+            )
+            check(record["verdict"] != "starvation", f"it must not alarm either: {record['verdict']}")
+            blob = " ".join(record["notes"])
+            contains(blob, "NOT evaluated", "the record")
+            contains(blob, "actions/runs?status=queued", "the record")
+            rc, out = cli(box, "--root", box.root, "--want", "0")
+            check(rc == 0, f"the pass itself is healthy, so exit 0 — but the state is NAMED: {out[:200]}")
+            contains(out, "starvation=unmeasured", "the human output")
+        finally:
+            box.destroy()
+
+
+@test("T12 a pass that ACTED still ALARMS — the alarm is never suppressed by actions")
+def t12_acting_pass_still_alarms():
+    """MEASURED IN REVIEW ROUND 2, and it inverted the first version of this gate. Gating the alarm
+    on "this pass did nothing" silences it FOR EVER on exactly the box that needs it: a runner whose
+    repair never sticks is restarted and re-registered on every pass, so the acting gate reported
+    `converged` / exit 0 with 53 runs still queued — #2875's own signature, hidden inside the state
+    the tool keeps repairing. A bounded false page right after a repair is the cheaper failure, so
+    the alarm fires on an acting pass too."""
+    with Env():
+        box = Box("acted-starved")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool(
+                [
+                    ("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL]),
+                    ("r-other", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL]),
+                ]
+            )
+            box.alive([])
+            box.queued(53)
+            record = converge(box, want=0)
+            check(record["actions"], f"this case needs a pass that ACTED: {record}")
+            check(
+                record.get("starvation") == "starved",
+                f"an acting pass must STILL evaluate the invariant: {record.get('starvation')!r}",
+            )
+            check(
+                record["verdict"] == "starvation",
+                f"…and must still alarm: {record['verdict']}",
+            )
+        finally:
+            box.destroy()
+
+
+class _WaitRecorder:
+    """A stand-in for the module's `time` BINDING (never the stdlib module) that records what it is
+    asked to sleep.
+
+    ⛔ WHY A PROXY AND NOT `ra.time.sleep = ...`: `ra.time` IS the stdlib module, so patching its
+    attribute rewrites `time.sleep` PROCESS-WIDE — including CPython's own
+    `subprocess.Popen._wait` poll loop (`sleep(min(delay*2, remaining, .05))`), which fires whenever a
+    stub child outlives the first `waitpid`. That leaked `0.001…0.05` entries into the recorder and
+    made the T13 assertion FLAKE (measured: 1 red in 3 runs, the failing input varying — timing, not
+    input). Rebinding the MODULE's reference keeps the recorder to this module's own sleeps, and
+    `__getattr__` still delegates every other clock read (`monotonic`, `time`) to the real module —
+    which `wait_online` needs and which one assertion below pins.
+    """
+
+    def __init__(self):
+        self.sleeps: list[float] = []
+        self.delegated: list[str] = []
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+
+    def __getattr__(self, name):
+        self.delegated.append(name)
+        return getattr(time, name)
+
+
+@test("T13 the alarm never masks a real failure — and a bad confirm interval cannot disable it")
+def t13_gate_and_confirm_interval():
+    """Two guards the review found were unpinned, both about a guard that quietly stops guarding:
+      (a) THE GATE. A starved queue on a pass that ALSO failed must not publish a starvation state:
+          the verdict is `action-failed` and the invariant was never evaluated (the key is ABSENT —
+          "not evaluated" must not read as "healthy"), so no consumer can page on the alarm while the
+          real failure is the repair.
+      (b) THE CONFIRM INTERVAL seam accepts `nan`, `-5` and `inf` under a plain `float()`. The first
+          two SILENTLY SKIPPED the confirmation sample and `inf` raised `OverflowError` OUT of the
+          pass (only `Unmeasurable` is caught), killing it with no record. Each must fall back to the
+          default AND say so."""
+    with Env():
+        box = Box("gate-failed")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            box.queued(53)
+            box.token_fails()  # the repair fails ⇒ a real failure on a starved queue
+            record = converge(box, want=0)
+            check(record["verdict"] == "action-failed", f"verdict must be the REAL failure: {record}")
+            check(
+                record.get("starvation") is None,
+                "the invariant must NOT be evaluated on a failed pass (absent key, never 'ok'): "
+                f"{record.get('starvation')!r}",
+            )
+            check(
+                not any(n.startswith("STARVATION ") for n in record["notes"]),
+                f"…and no alarm line: {record['notes']}",
+            )
+            check(
+                not [c for c in box.calls("gh-calls.log") if "status=queued" in c],
+                "an unhealthy pass must not even pay for the queue read",
+            )
+        finally:
+            box.destroy()
+
+        # (b) every value a plain float() would accept but that disables or crashes the guard, PLUS
+        # the two edges of the cadence-derived bound. `400` is the value that distinguishes the shipped
+        # `<= 300` from a widened `<= 900`: without it, WIDENING the bound survives every other input.
+        # ⛔ The recorder is scoped to the MODULE's `time` binding, never to the stdlib module (see
+        # _WaitRecorder), and the assertions are on the CONFIRM sleep rather than the whole list,
+        # because a pool retry inside the same pass legitimately sleeps here too.
+        real_time = ra.time
+        for value, expect_sleep in (
+            ("nan", 30.0), ("-5", 30.0), ("inf", 30.0), ("30s", 30.0),  # unusable → default
+            # ⛔ THE BOUND IS PINNED TO A POINT, NOT TO A WINDOW: `301` is what reddens ANY widening
+            # into 301..399 (measured round 6: `<= 350` survived when only 400/900 probed it, so a
+            # plausible "6 minutes for a slow box" edit was a FALSE PASS of the finding it came from).
+            ("0", 30.0),                                   # ⛔ 0 would SILENTLY disable the second
+            #                                                          sample; refused on purpose
+            ("301", 30.0), ("400", 30.0), ("900", 30.0),   # above the bound → refused, default 30 s
+            ("300", 300.0), ("299", 299.0),                # the bound itself and below → ACCEPTED
+        ):
+            box = Box("confirm-seam")
+            recorder = _WaitRecorder()
+            try:
+                box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+                box.queued(53)
+                box.env["RUNNER_AUTOSCALE_STARVATION_CONFIRM_S"] = value
+                ra.time = recorder
+                record = converge(box, want=0)
+                check(
+                    record["verdict"] == "starvation",
+                    f"confirm={value!r}: the alarm must still FIRE, got {record['verdict']}",
+                )
+                check(
+                    recorder.sleeps and recorder.sleeps[-1] == expect_sleep,
+                    f"confirm={value!r}: the confirm must sleep {expect_sleep}s, got {recorder.sleeps}",
+                )
+                # …and the refusal must quote the SHIPPED bound AND the SHIPPED default, derived from
+                # the module's own constants rather than retyped here. Both are operator-facing prose
+                # that nothing else checks: measured, the note could say "<= 900" while the bound was
+                # 300, or "using 60s" while the fallback was 30, and the suite stayed green. The digit
+                # boundary matters — a bare `"<= 300" in note` is satisfied by `"<= 3000"`, i.e. by the
+                # commonest typo, which is the confusion the note exists to prevent.
+                note = next(
+                    (n for n in record["notes"] if "not a usable number of seconds" in n), ""
+                )
+                # ⛔ LITERALS, on purpose: this assertion IS the pin. Deriving the expectation from
+                # the same constant the code prints makes it self-referential — measured, a mutant that
+                # moved the default 30→45 stayed GREEN. The module derives its prose from the
+                # constant (so a change moves the text); the test holds the number the operator was
+                # promised (so a change reddens here). That asymmetry is the whole mechanism.
+                refused = bool(
+                    re.search(r"0 < s <= 300(?![0-9])", note) and "using 30s" in note
+                )
+                check(
+                    refused is (expect_sleep == 30.0),
+                    f"confirm={value!r}: the refusal must be NAMED iff the value was refused "
+                    f"(refused={refused}, notes={record['notes']})",
+                )
+                try:
+                    delegated = recorder.monotonic()
+                except AttributeError:
+                    delegated = None
+                check(
+                    isinstance(delegated, float),
+                    "the recorder must DELEGATE every other clock read the module makes — "
+                    "`wait_online` calls monotonic() through this same binding",
+                )
+            finally:
+                ra.time = real_time
+                box.destroy()
+
+@test("T14 the documented DEFAULT is what an UNSET seam gets — no value is injected")
+def t14_unset_seam_takes_the_documented_default():
+    """The suite injects the seam everywhere else (1 ms, so cases are fast), which left the UNSET
+    branch dead as far as the suite was concerned: measured, changing that `30.0` to `45.0` kept the
+    suite green while the module header still advertised `(30)` and the note still said "using 30s" —
+    three hand-written copies of one number drifting apart in silence. Here the variable is ABSENT."""
+    with Env():
+        box = Box("confirm-unset")
+        recorder = _WaitRecorder()
+        real_time = ra.time
+        try:
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.queued(53)
+            box.env.pop("RUNNER_AUTOSCALE_STARVATION_CONFIRM_S")
+            ra.time = recorder
+            record = converge(box, want=0)
+            check(record["verdict"] == "starvation", f"the alarm must fire: {record['verdict']}")
+            check(
+                recorder.sleeps == [30.0],
+                f"an unset seam must sleep the DOCUMENTED default (30s), got {recorder.sleeps}",
+            )
+            check(
+                not any("not a usable number" in n for n in record["notes"]),
+                f"an unset seam is not a REFUSAL and must not be reported as one: {record['notes']}",
+            )
+            # ⛔ EVERY HAND-WRITTEN NUMBER IN THE OPERATOR-FACING HEADER AND SIGNATURE IS PINNED HERE,
+            # as LITERALS, in one place. These are prose copies that no compiler checks, and each one
+            # was measured lying in a previous round: the range said `(0, 900]` while the bound was
+            # 300, the default said `(45)` while the code used 30, the exit block said `5 STARVATION`
+            # while the code returned 4, and the signature advertised a default nothing else pinned.
+            # The module DERIVES its messages from the constants; this test holds the numbers an
+            # operator was promised. Change a value and you must change this list — deliberately.
+            for needle, what in (
+                ("(0, 300]", "the accepted range in the seam table"),
+                ("before it pages (30)", "the default in the seam table"),
+                ("4 STARVATION", "the exit code in the header's EXIT block"),
+            ):
+                check(needle in (ra.__doc__ or ""), f"the module header must document {what}")
+            check(
+                ra.starvation_probe.__defaults__ == (30.0,),
+                "the probe's SIGNATURE default is the documented 30s, not a stale copy: "
+                f"{ra.starvation_probe.__defaults__}",
+            )
+        finally:
+            ra.time = real_time
+            box.destroy()
+
+
+@test("T15 a DIRECT call with confirm_s=0 takes ONE sample — the > that refusing 0 relies on")
+def t15_zero_takes_one_sample():
+    """`starvation_probe` takes its second sample only when `confirm_s > 0`, and the seam's refusal of
+    0 exists BECAUSE that is what keeps 0 from silently disabling the confirmation. Nothing pinned the
+    operator itself: `>` → `>=` was green, so a direct caller (or a future seam change) could reach a
+    zero-length confirmation that still LOOKS like one. Zero sleeps is the signal."""
+    with Env():
+        box = Box("probe-zero")
+        recorder = _WaitRecorder()
+        real_time = ra.time
+        try:
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.queued(53)
+            box.apply()  # ⛔ the SEAMS, not just the fixture files: without this the direct call
+            #               reads the real `gh` and the real repo — measured, it returned a live
+            #               queued=94/busy=9/online=9 from the network. A hermetic suite must never
+            #               take that path, even accidentally.
+            ra.time = recorder
+            result = ra.starvation_probe(ra.DEFAULT_REPO, 0.0)
+            check(result["state"] == "starved", f"one sample of a starved pool is still starved: {result}")
+            check(
+                recorder.sleeps == [],
+                f"confirm_s=0 must take NO second sample, so no sleep at all: {recorder.sleeps}",
+            )
+        finally:
+            ra.time = real_time
+            box.destroy()
+
+
 # ── the mutation map ──────────────────────────────────────────────────────────────────────────
 class Mutation:
     def __init__(self, case_id, old, new, why):
@@ -809,6 +1214,92 @@ MUTATIONS = [
         '            if False:',
         "every error is treated as transient, so a deterministic 404 is retried ('transient' = anything)",
     ),
+    Mutation(
+        "T9",
+        '        "state": "starved" if starved else "ok",',
+        '        "state": "ok",',
+        "there is NO starvation alarm: a starved box reads healthy and exits 0 (the measured night)",
+    ),
+    Mutation(
+        "T10",
+        "    return queued > 0 and busy == 0 and online > 0",
+        "    return queued > 0 and busy == 0",
+        "the online operand is gone, so an ALL-OFFLINE pool (nothing can take work) alarms as starvation",
+    ),
+    Mutation(
+        "T11",
+        '    except Unmeasurable as exc:\n        return {"state": "unmeasured", "detail": str(exc)}',
+        '    except Unmeasurable as exc:\n        return {"state": "ok"}',
+        "an unread queue reads as OK — blindness presented as health (the one silencing input)",
+    ),
+    Mutation(
+        "T13",
+        "0 < confirm_s <= STARVATION_CONFIRM_MAX_S",
+        "0 <= confirm_s <= STARVATION_CONFIRM_MAX_S",
+        "0 is accepted again — and 0 is the value that SILENTLY disables the confirmation sample",
+    ),
+    Mutation(
+        "T13",
+        'f"(finite, 0 < s <= {STARVATION_CONFIRM_MAX_S:.0f}) — "',
+        'f"(finite, 0 < s <= 900) — "',
+        "the note lies about the bound it refused (a hand-written copy, which no compiler checks)",
+    ),
+    Mutation(
+        "T13",
+        'f"using {STARVATION_CONFIRM_DEFAULT_S:.0f}s"',
+        'f"using 60s"',
+        "the note lies about the default it fell back to — the operator then tunes the wrong number",
+    ),
+    Mutation(
+        "T14",
+        "before it pages (30)",
+        "before it pages (45)",
+        "the header's seam table lies about the default an operator should tune",
+    ),
+    Mutation(
+        "T14",
+        "4 STARVATION",
+        "5 STARVATION",
+        "the header's EXIT block points a monitor at the wrong exit code",
+    ),
+    Mutation(
+        "T15",
+        "if starved and confirm_s > 0:",
+        "if starved and confirm_s >= 0:",
+        "a zero-length confirmation sample counts as a confirmation — the guard with its teeth out",
+    ),
+    Mutation(
+        "T14",
+        "STARVATION_CONFIRM_DEFAULT_S = 30.0",
+        "STARVATION_CONFIRM_DEFAULT_S = 45.0",
+        "the DOCUMENTED default drifts away from the value an unset seam actually gets",
+    ),
+    Mutation(
+        "T13",
+        'if not record["problems"] and not record.get("unverified") and not record.get("problem_kind"):',
+        'if not record.get("unverified") and not record.get("problem_kind"):',
+        "the alarm runs on a pass that already FAILED, so a consumer can page on it beside action-failed",
+    ),
+    Mutation(
+        "T13",
+        'if not (\n                math.isfinite(confirm_s) and 0 < confirm_s <= STARVATION_CONFIRM_MAX_S\n            ):',
+        'if False:',
+        "the seam accepts nan/-5/inf again: the confirmation is silently skipped, or the pass crashes",
+    ),
+    # F2: WIDENING the bound, not deleting the branch — the exact regression review round 5 raised.
+    # A `<= 900` mutant survives every input in the fallback list, so it needs its own probe value.
+    Mutation(
+        "T13",
+        "0 < confirm_s <= STARVATION_CONFIRM_MAX_S",
+        "0 < confirm_s <= 900",
+        "the cadence-derived bound is widened back out, so a pass can outlive the next timer",
+    ),
+    Mutation(
+        "T12",
+        'if not record["problems"] and not record.get("unverified") and not record.get("problem_kind"):',
+        'if not record["problems"] and not record.get("unverified") and not record.get("problem_kind") and not record["actions"]:',
+        "the alarm is suppressed by ACTIONS, so a repair that never sticks silences it for ever (#2875)",
+    ),
 ]
 
 
@@ -866,7 +1357,19 @@ def run_mutations():
     print("   (the mutated module is written to a temp dir; the shipped file is never touched)\n")
     bad = 0
     for mut in MUTATIONS:
-        tmp, out = _mutated_module(mut)
+        # ⛔ A STALE OR DUPLICATE ANCHOR MUST NOT TRUNCATE THE REPORT. `_mutated_module` raises when an
+        # anchor no longer matches the module (measured: this suite shipped a `<= 600` anchor after the
+        # module moved to `<= 300`, so the run died at 14/16 and the summary line — and two declared
+        # mutations — silently vanished while the plain suite stayed green). A mutation that cannot be
+        # built is a mutation that verified NOTHING: count it MISSED and say why.
+        print(f"── {mut.case_id} mutation → {mut.why}")
+        try:
+            tmp, out = _mutated_module(mut)
+        except SystemExit as exc:
+            bad += 1
+            print(f"   | {exc}\n")
+            print("   ❌ NOT RED — the anchor did not match the module, so NOTHING was verified\n")
+            continue
         try:
             proc = subprocess.run(
                 [sys.executable, os.path.abspath(__file__)],
@@ -881,7 +1384,6 @@ def run_mutations():
             body = proc.stdout.decode("utf-8", "replace")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        print(f"── {mut.case_id} mutation → {mut.why}")
         for line in body.splitlines():
             print(f"   | {line}")
         if _mutation_verdict(proc.returncode, body):
