@@ -57,6 +57,10 @@ export HOME="$T/home"; mkdir -p "$HOME"
 export RAIL_RUN_DIR="$T/state"
 export RAIL_RUN_RAIL="$T/bin/rail"
 export RAIL_RUN_GH="$T/bin/gh"
+# The repo identity is PINNED, so the suite does not depend on this checkout's `origin`: it is a
+# canonical part of the key (`start 5` and `start 5 --repo fake/repo` converge), and the gh double
+# echoes it back as the URL that pr_state verifies.
+export RAIL_RUN_REPO_SLUG="fake/repo"
 export FAKE_RAIL_COUNT="$T/rail-count.txt"
 export FAKE_RAIL_LOG="$T/rail-was-called.log"
 mkdir -p "$T/bin"
@@ -86,12 +90,27 @@ FAKE
 chmod +x "$T/bin/rail"
 
 # ── the `gh` double ───────────────────────────────────────────────────────────
-# GH_MODE: merged (default) | open | fail
+# GH_MODE: merged (default) | open | fail | wrongrepo
+# It answers with the SAME shape the real `gh pr view --json state,mergedAt,url --jq` produces, and
+# the URL names the (repo, PR) it was ASKED for — so the identity check in pr_state is exercised
+# rather than bypassed. `wrongrepo` answers MERGED for a DIFFERENT repository: the case that must
+# never read as this PR's landing (#2235).
 cat > "$T/bin/gh" <<'GHD'
 #!/usr/bin/env bash
+repo=""; pr=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo="$2"; shift 2 ;;
+    --json|--jq) shift 2 ;;
+    pr|view) shift ;;
+    *) [ -z "$pr" ] && pr="$1"; shift ;;
+  esac
+done
+url="https://github.com/${repo:-ambient/ambient}/pull/${pr:-0}"
 case "${GH_MODE:-merged}" in
-  merged) printf 'MERGED 2026-10-27T03:56:04Z\n' ;;
-  open)   printf 'OPEN -\n' ;;
+  merged) printf 'MERGED 2026-10-27T03:56:04Z %s\n' "$url" ;;
+  open)   printf 'OPEN - %s\n' "$url" ;;
+  wrongrepo) printf 'MERGED 2026-10-27T03:56:04Z https://github.com/someone/else/pull/%s\n' "$pr" ;;
   fail)   printf 'HTTP 502: bad gateway\n' >&2; exit 1 ;;
 esac
 GHD
@@ -115,15 +134,15 @@ wait_state() { # <want-state> <pr> (--run id) — poll until the state word matc
   printf '%s' "$out"; return 1
 }
 run_id_of() { field "${1#*|}" run; }
-rundir() { printf '%s/agent-infra/pr-%s/%s' "$RAIL_RUN_DIR" "$1" "$2"; }
+rundir() { printf '%s/fake-repo/pr-%s/%s' "$RAIL_RUN_DIR" "$1" "$2"; }
 last_argv() { awk 'END{print}' "$FAKE_RAIL_LOG" 2>/dev/null; }
 rail_invocations() { awk -v p="$1" 'index($0, p " ") == 1 || $0 == p {n++} END{print n+0}' "$FAKE_RAIL_LOG" 2>/dev/null; }
 craft() { # <pr> <run-name> [k=v ...] — a hand-built run dir, for states no launch can reach
   local pr="$1" name="$2"; shift 2
-  local rd="$RAIL_RUN_DIR/agent-infra/pr-$pr/$name"
-  mkdir -p "$rd"; printf '\n' > "$rd/repo"
+  local rd="$RAIL_RUN_DIR/fake-repo/pr-$pr/$name"
+  mkdir -p "$rd"; printf 'fake/repo\n' > "$rd/repo"
   printf 'admin-merge: … hand-built fixture\n' > "$rd/log"
-  printf '%s\n' "$name" > "$RAIL_RUN_DIR/agent-infra/pr-$pr/latest"
+  printf '%s\n' "$name" > "$RAIL_RUN_DIR/fake-repo/pr-$pr/latest"
   local kv k v
   for kv in "$@"; do k="${kv%%=*}"; v="${kv#*=}"; printf '%s\n' "$v" > "$rd/$k"; done
   printf '%s' "$rd"
@@ -196,7 +215,7 @@ C1="$(cat "$T/c1.rc" 2>/dev/null || echo x)"; C2="$(cat "$T/c2.rc" 2>/dev/null |
 if { [ "$C1" = 0 ] && [ "$C2" = 3 ]; } || { [ "$C1" = 3 ] && [ "$C2" = 0 ]; }; then
   ok "CONCURRENT: exactly one start won (rc=0) and the other refused (rc=3)"
 else bad "CONCURRENT: want one rc=0 and one rc=3, got rc=$C1 and rc=$C2"; fi
-RD301="$(rundir 301 "$(cat "$RAIL_RUN_DIR/agent-infra/pr-301/latest")")"
+RD301="$(rundir 301 "$(cat "$RAIL_RUN_DIR/fake-repo/pr-301/latest")")"
 PIDS+=("$(cat "$RD301/pid" 2>/dev/null || true)" "$(cat "$RD301/railpid" 2>/dev/null || true)")
 
 # ── C: refused — the rail's own words and its own exit status ────────────────
@@ -220,7 +239,7 @@ assert_not_contains "$TXT" "it refused this head" "ERROR-RC: never claims a refu
 
 # ── D: killed — the rail died of a SIGNAL, which is neither a refusal nor a landing
 FAKE_RAIL_PIDFILE="$T/rail-pid.txt" FAKE_RAIL_SLEEP=30 call start 103 >/dev/null
-RD103="$(rundir 103 "$(cat "$RAIL_RUN_DIR/agent-infra/pr-103/latest")")"
+RD103="$(rundir 103 "$(cat "$RAIL_RUN_DIR/fake-repo/pr-103/latest")")"
 PIDS+=("$(cat "$RD103/pid" 2>/dev/null || true)")
 i=0; while [ ! -s "$T/rail-pid.txt" ] && [ "$i" -lt 80 ]; do sleep 0.1; i=$((i + 1)); done
 RAILPID="$(cat "$T/rail-pid.txt" 2>/dev/null || true)"
@@ -275,7 +294,7 @@ assert_not_contains "$TXT" "it refused this head" "UNKNOWN: an unread artifact i
 # #2885's inversion: a SIGKILLed recorder writes nothing while the rail keeps running AND can still
 # merge. "The recorder is gone" must never be read as "nothing is running".
 FAKE_RAIL_PIDFILE="$T/rail-pid2.txt" FAKE_RAIL_SLEEP=30 call start 107 >/dev/null
-RD107="$(rundir 107 "$(cat "$RAIL_RUN_DIR/agent-infra/pr-107/latest")")"
+RD107="$(rundir 107 "$(cat "$RAIL_RUN_DIR/fake-repo/pr-107/latest")")"
 REC="$(cat "$RD107/pid" 2>/dev/null || true)"
 PIDS+=("$REC" "$(cat "$T/rail-pid2.txt" 2>/dev/null || true)")
 if [ -n "$REC" ]; then kill -9 "$REC" 2>/dev/null; fi
@@ -305,6 +324,72 @@ OUT="$(GH_MODE=merged poll 107)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 0 "$RC" "GONE+MERGED: exit code 0"
 assert_contains "$TXT" "verdict=artifact" "GONE+MERGED: attributed to the ARTIFACT, not to this run"
 assert_contains "$TXT" "no rail verdict" "GONE+MERGED: still says this run produced no rail verdict"
+
+# ── R: THE IDENTITY OF THE ARTIFACT READ ──────────────────────────────────
+# `gh pr view <N>` resolves a bare number against ambient GH_REPO or the caller's cwd, so a merged PR
+# with the SAME NUMBER in ANOTHER repo can read as this one's landing. That is terminal news: it stops
+# a lane driving a PR that is not merged. The read must name the repo AND the PR.
+craft 150 wrongid rc=0 >/dev/null
+OUT="$(GH_MODE=wrongrepo poll 150)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "IDENTITY: a MERGED read whose url names ANOTHER repo is not a landing"
+assert_state "$TXT" unknown "IDENTITY: it abstains instead"
+assert_contains "$TXT" "artifact=unread" "IDENTITY: and says the artifact read abstained"
+# and the same run reads `landed` once the URL names this PR — the check discriminates, not the mode
+OUT="$(GH_MODE=merged poll 150)"; assert_rc 0 "${OUT%%|*}" "IDENTITY: the SAME run reads landed when the url names this repo+PR"
+# …and with NO identity ANYWHERE (no pin, no origin, no record) the read abstains: it cannot know
+# which repo the number belongs to, and guessing is what produces a false `landed`.
+mkdir -p "$T/scratch-id"
+ID_OUT="$(cd "$T/scratch-id" && RAIL_RUN_REPO_SLUG= "$BASH_BIN" "$RR" status 501 2>&1)"
+assert_contains "$ID_OUT" "no-run" "IDENTITY: with no resolvable identity the key is a per-directory hash"
+
+# ── S: a `✗` line can be a READ FAILURE, which is not a verdict about the head ──
+RAIL_RUN_RAIL="$T/bin/rail-unreadable" call start 152 >/dev/null
+cat > "$T/bin/rail-unreadable" <<'UNR'
+#!/usr/bin/env bash
+printf 'admin-merge: ✗ BLOCK [head_unreadable] [rate_limited] — could not READ the head of PR #152\n'
+exit 1
+UNR
+chmod +x "$T/bin/rail-unreadable"
+START_OUT="$(RAIL_RUN_RAIL="$T/bin/rail-unreadable" call start 153)"; RC="${START_OUT%%|*}"
+assert_rc 0 "$RC" "READ-FAILURE: the run starts against a rail that will fail to read"
+# GH_MODE=open: with a MERGED artifact the merge wins over ANY rail failure, so the ✗ line only
+# decides when the artifact is not already a landing.
+OUT="$(GH_MODE=open wait_state unknown 153)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "READ-FAILURE: a ✗ BLOCK [head_unreadable] is NOT a refusal of this head"
+assert_state "$TXT" unknown "READ-FAILURE: it abstains"
+assert_contains "$TXT" "did not judge your change" "READ-FAILURE: and says the run never judged the change"
+assert_not_contains "$TXT" "refused this head" "READ-FAILURE: never claims a refusal"
+
+# ── T: the run-record bound — an abstaining record cannot block the PR forever ──
+craft 154 oldfence pid=$$ start=0 >/dev/null
+OUT="$(call start 154)"; assert_rc 3 "${OUT%%|*}" "RECORD: an abstaining (off-fence) record blocks a young start"
+touch -t 202001010000 "$(rundir 154 oldfence)"
+OUT="$(FAKE_RAIL_SLEEP=6 call start 154)"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "RECORD: the same record past RAIL_RUN_RECORD_MAX does NOT block — no PR is un-startable forever"
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-154/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+
+# ── U: a recorder that abstains, with a RAIL that is provably alive → running ──
+FAKE_RAIL_PIDFILE="$T/rail-pid3.txt" FAKE_RAIL_SLEEP=20 call start 155 >/dev/null
+RD155="$(rundir 155 "$(cat "$RAIL_RUN_DIR/fake-repo/pr-155/latest")")"
+printf '%s\n' "$$" > "$RD155/pid"; printf '0\n' > "$RD155/start"     # recorder fence unusable
+PIDS+=("$(cat "$T/rail-pid3.txt" 2>/dev/null || true)")
+OUT="$(wait_state running 155)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 10 "$RC" "RAIL-ALIVE: the recorder abstains but the RAIL is alive → running (10)"
+assert_contains "$TXT" "recorder=abstained" "RAIL-ALIVE: says which incarnation carried the evidence"
+
+# ── V: one PR, one key — the two documented spellings converge ───────────────
+FAKE_RAIL_SLEEP=8 call start 156 --repo fake/repo >/dev/null
+OUT="$(poll 156)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 10 "$RC" "CONVERGE: a poll WITHOUT --repo finds the run started WITH it (one key per repo)"
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-156/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+
+# ── W: no git, no pin — the fallback key is per-DIRECTORY, not one constant ──
+mkdir -p "$T/scratch-a" "$T/scratch-b"
+KEY_A="$(cd "$T/scratch-a" && RAIL_RUN_REPO_SLUG= "$BASH_BIN" "$RR" status 500 2>&1 | sed -n 's/.*repo=\([^ ]*\).*/\1/p')"
+KEY_B="$(cd "$T/scratch-b" && RAIL_RUN_REPO_SLUG= "$BASH_BIN" "$RR" status 500 2>&1 | sed -n 's/.*repo=\([^ ]*\).*/\1/p')"
+if [ -n "$KEY_A" ] && [ "$KEY_A" != "$KEY_B" ]; then
+  ok "NOGIT: two non-git directories get DIFFERENT keys ($KEY_A vs $KEY_B)"
+else bad "NOGIT: the fallback key is shared ($KEY_A vs $KEY_B) — one scratch run could be read as another's"; fi
 
 # ── I: the incarnation fence — a LIVE pid alone is not "running" ────────────
 # A reused pid (or a record with no usable start) must never read as running: 'running' is a claim
@@ -338,7 +423,7 @@ OUT="$(poll 999 --run nope)"; assert_rc 24 "${OUT%%|*}" "NO-RUN: an unknown --ru
 
 # ── L: --run pins ATTRIBUTION — an old run id never reports the newest run ──
 GH_MODE=open FAKE_RAIL_RC=1 FAKE_RAIL_REFUSAL='run A refused' call start 110 >/dev/null
-RID_A="$(cat "$RAIL_RUN_DIR/agent-infra/pr-110/latest")"
+RID_A="$(cat "$RAIL_RUN_DIR/fake-repo/pr-110/latest")"
 OUT="$(GH_MODE=open wait_state refused 110 --run "$RID_A")"; assert_rc 20 "${OUT%%|*}" "ATTRIBUTION: run A refuses"
 GH_MODE=merged FAKE_RAIL_RC=0 call start 110 >/dev/null
 OUT="$(GH_MODE=merged wait_state landed 110)"; assert_rc 0 "${OUT%%|*}" "ATTRIBUTION: run B (the newest) lands"
@@ -377,7 +462,7 @@ OUT="$(poll 115)"; assert_rc 24 "${OUT%%|*}" "ARGS: without --repo it is a DIFFE
 # The claim dir exists for a few instructions before its `pid` is written. Reading that window as
 # "no owner" let a second start DELETE a live claim and launch a second rail — the race the claim
 # exists to close, re-opened inside the guard.
-CLAIMDIR="$RAIL_RUN_DIR/agent-infra/pr-140/.starting"
+CLAIMDIR="$RAIL_RUN_DIR/fake-repo/pr-140/.starting"
 mkdir -p "$CLAIMDIR"
 OUT="$(call start 140)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 3 "$RC" "CLAIM-WINDOW: a claim with no pid YET refuses the start (in flight)"
@@ -385,24 +470,24 @@ assert_contains "$TXT" "has just begun" "CLAIM-WINDOW: says the other start has 
 touch -t 202001010000 "$CLAIMDIR"
 OUT="$(FAKE_RAIL_SLEEP=6 call start 140)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 0 "$RC" "CLAIM-STALE: a claim older than the bound is cleared and the start proceeds"
-PIDS+=("$(cat "$RAIL_RUN_DIR/agent-infra/pr-140/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-140/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
 # a claim whose recorded pid is ALIVE and off-fence (rc 2) blocks while young, clears when old
-CLAIMDIR="$RAIL_RUN_DIR/agent-infra/pr-141/.starting"
+CLAIMDIR="$RAIL_RUN_DIR/fake-repo/pr-141/.starting"
 mkdir -p "$CLAIMDIR"; printf '%s\n' "$$" > "$CLAIMDIR/pid"; printf '0\n' > "$CLAIMDIR/start"
 OUT="$(call start 141)"; assert_rc 3 "${OUT%%|*}" "CLAIM-FENCE: an UNVERIFIABLE young claim blocks"
 touch -t 202001010000 "$CLAIMDIR"
 OUT="$(FAKE_RAIL_SLEEP=6 call start 141)"; RC="${OUT%%|*}"
 assert_rc 0 "$RC" "CLAIM-FENCE: an old unverifiable claim cannot block this PR forever"
-PIDS+=("$(cat "$RAIL_RUN_DIR/agent-infra/pr-141/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-141/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
 # a run record that is LIVE but has recorded NO incarnation yet (launch in progress) blocks too
-mkdir -p "$RAIL_RUN_DIR/agent-infra/pr-142/inflight"
-printf '\n' > "$RAIL_RUN_DIR/agent-infra/pr-142/inflight/repo"
-: > "$RAIL_RUN_DIR/agent-infra/pr-142/inflight/log"
-printf 'inflight\n' > "$RAIL_RUN_DIR/agent-infra/pr-142/latest"
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-142/inflight"
+printf '\n' > "$RAIL_RUN_DIR/fake-repo/pr-142/inflight/repo"
+: > "$RAIL_RUN_DIR/fake-repo/pr-142/inflight/log"
+printf 'inflight\n' > "$RAIL_RUN_DIR/fake-repo/pr-142/latest"
 OUT="$(call start 142)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 3 "$RC" "IN-FLIGHT: a run whose launch has not recorded an incarnation yet blocks a second rail"
 assert_contains "$TXT" "may still be alive" "IN-FLIGHT: and says so, rather than reporting no-run"
-touch -t 202001010000 "$RAIL_RUN_DIR/agent-infra/pr-142/inflight"
+touch -t 202001010000 "$RAIL_RUN_DIR/fake-repo/pr-142/inflight"
 OUT="$(FAKE_RAIL_SLEEP=6 call start 142)"; assert_rc 0 "${OUT%%|*}" "IN-FLIGHT: an abandoned record older than the bound does not block"
 
 # ── Q: path components are validated, not joined ───────────────────────────
