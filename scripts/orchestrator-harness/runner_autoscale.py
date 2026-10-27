@@ -428,15 +428,65 @@ def fallback_engaged(pool: dict[str, PoolEntry]) -> bool:
     return any(ARM_POOL_LABEL in e.labels and FALLBACK_LABEL in e.labels for e in pool.values())
 
 
-def resolve_labels(pool: dict[str, PoolEntry], machine: str) -> str:
-    """The label set a re-registered runner gets — arch marker, plus the fallback label only if
-    the fallback is engaged right now.
+def label_floor_binds(pool: dict[str, PoolEntry]) -> bool:
+    """TRUE when no runner in the pool advertises the fallback label at all.
+
+    ⛔ This is a POOL-WIDE reading, not a per-runner one: the question is what the repo can serve,
+    and `runs-on: ubuntu-latest` is matched against the pool, so one runner carrying the label is
+    enough for the repo and zero is a total stop.
+    """
+    return not any(FALLBACK_LABEL in e.labels for e in pool.values())
+
+
+def resolve_labels(
+    pool: dict[str, PoolEntry],
+    machine: str,
+    *,
+    notes: list[str] | None = None,
+    current: list[str] | None = None,
+) -> str:
+    """The ONE place a label set is decided: what the runner already carries, then the floor.
 
     This mirrors `tools/install-ci-runner-x64.sh::resolve_labels` (the one registration path)
     instead of inventing a second rule, and it is `auto`: the gate's state is the source of
     truth, so a runner never acquires a permanent claim on the pool. An unknown architecture
     RAISES — `self-hosted`/`Linux`/`<ARCH>` are host-derived and may not be set, so there is no
     safe default to fall back to.
+
+    `current` is the label set the runner carries in the pool RIGHT NOW (empty for a runner the
+    pool does not list, i.e. ORPHANED). Preserving it is not a convenience: deriving a fresh set
+    drops any custom/tier label, so the workflows that target it queue forever — a "repair" that
+    removes capacity. The arch marker is re-derived from THIS box, never preserved (a mis-registered
+    runner can carry the other arch's marker, and passing it back is a false PASS).
+
+    ⛔ THE FLOOR (measured 2026-10-27, twice in one night; agent-infra#2589). The fallback label used
+    to be granted only when some runner ALREADY advertised it — a condition it would itself create.
+    A pool-wide restart therefore strips it everywhere (each registration reads a pool that no longer
+    has it), CI stops assigning any job that says `runs-on: ubuntu-latest`, and the queue grows while
+    every runner reads `online`. Measured: 9 runners / 8 online / `busy=0` / **53 runs queued**;
+    adding the label through the API took the pool to `busy 8/8` in 20 s, and it EVAPORATED AGAIN
+    (8/8 → 0/9) in ~20 min with no restart we issued. The API add is a bandage; REGISTRATION is the
+    only durable path, so the label set written at registration must never leave the repo at zero.
+
+    ⛔ AND THE FLOOR IS A UNION OVER `current`, NOT AN ALTERNATIVE TO IT. The first version of this
+    function was only reached when there was nothing to preserve; a DEAD runner that is still IN the
+    pool has labels to keep, so a re-registration could preserve `self-hosted-x64` alone and write a
+    set with NO `ubuntu-latest` — the pool-wide-strip case the floor exists for, on the one path that
+    runs after every restart. Keeping and flooring are two independent steps, and both always run.
+
+    ⛔ WHICH RULE WINS WHEN THEY DISAGREE — THE FLOOR, ALWAYS. The gate (`fallback_engaged`) can
+    only ADD the label; the floor is a MINIMUM on every set this function returns. They disagree
+    exactly when the gate says "no" and no runner holds the label, and resolving THAT toward the
+    gate is what took the pool to zero. The prices are not symmetric: a floor-granted label makes
+    `ci_runner_gate.sh`'s `current_mode` read `local` (a mode that misdescribes the box, is
+    visible in the gate's own reading, and is recoverable by any later pass or operator), while a
+    zero-label pool runs NO workflow at all — including the one that would restore the label. **The
+    cheaper failure wins the tie, and that is the floor.**
+
+    `notes` is where the one-line reason goes. It is a parameter, not a `print`, because
+    `--json` prints the record as a single object on stdout: a bare `print` from here corrupted the
+    machine-readable record for every fleet consumer (measured by driving `--json` through a
+    floor-binding registration).
     """
     arch = ARCH_LABEL.get(machine.lower())
     if not arch:
@@ -444,16 +494,26 @@ def resolve_labels(pool: dict[str, PoolEntry], machine: str) -> str:
             f"unknown architecture {machine!r}: cannot derive a label set "
             "(self-hosted/Linux/<ARCH> are host-derived and may not be set)"
         )
-    # ⛔ THE FLOOR (2026-10-27). The fallback label is granted only when it is already present on
-    # SOME runner — a condition it would itself create. A pool-wide restart therefore strips it
-    # everywhere (each registration reads a pool that no longer has it), CI stops assigning jobs
-    # to `runs-on: ubuntu-latest`, and the queue grows with every runner reading `online`. So a
-    # label set is never written that would leave ZERO runners advertising it.
-    floor = not any(FALLBACK_LABEL in e.labels for e in pool.values())
-    if floor and not fallback_engaged(pool):
-        print(f"  · label floor: no runner advertises {FALLBACK_LABEL} — {machine} takes it, "
-              f"otherwise nothing can run `runs-on: {FALLBACK_LABEL}`", flush=True)
-    return f"{arch},{FALLBACK_LABEL}" if (fallback_engaged(pool) or floor) else arch
+    kept = _preserve_labels(list(current or ()), machine)
+    labels = [x for x in kept.split(",") if x] or [arch]
+    floor = label_floor_binds(pool)
+    engaged = fallback_engaged(pool)
+    if floor and not engaged and FALLBACK_LABEL not in labels:
+        reason = (
+            f"label floor: no runner in the pool ({len(pool)} registered) advertises "
+            f"{FALLBACK_LABEL} — this registration takes it, otherwise nothing can serve "
+            f"`runs-on: {FALLBACK_LABEL}`"
+        )
+        if notes is not None:
+            notes.append(reason)
+        else:
+            print(f"  · {reason}", flush=True)
+    # `dict.fromkeys` keeps order and makes a DOUBLE-ADD unrepresentable, whichever arm asked for it:
+    # the pre-floor code could write `ubuntu-latest` twice (once preserved, once from the gate), and
+    # a repeated label is a config.sh argument GitHub rejects.
+    if floor or engaged:
+        labels.append(FALLBACK_LABEL)
+    return ",".join(dict.fromkeys(labels))
 
 
 # ── actions ───────────────────────────────────────────────────────────────────────────────────
@@ -744,6 +804,12 @@ def converge(
         pool_total=len(pool),
         pool_online=sum(1 for e in pool.values() if e.online),
         pool_busy=sum(1 for e in pool.values() if e.busy),
+        # ⛔ BOTH LABEL FACTS ARE PUBLISHED, because they answer different questions and only one of
+        # them is a policy preference: `fallback_engaged` is the gate's state, `label_floor_binds`
+        # is "this repo can serve NO `runs-on: ubuntu-latest` job at all". A fleet consumer that
+        # sees the second one true is looking at (or one pass away from) a total CI stop.
+        fallback_engaged=fallback_engaged(pool),
+        label_floor_binds=label_floor_binds(pool),
     )
 
     if want is not None and want > ceil:
@@ -801,16 +867,15 @@ def converge(
                 f"{c['name']} still offline after restart — re-registering with --replace"
             )
         try:
-            # ⛔ Re-registering KEEPS the labels the runner already carries. Deriving a fresh set
-            # drops any custom/tier label (and the fallback label, when it is engaged), so the
-            # workflows that target it queue forever — a "repair" that removes capacity. Only a
-            # runner absent from the pool (ORPHANED) has no labels to keep, and only that case
-            # derives them. ⛔ PER RUNNER, never a value cached from the previous iteration: that
-            # leaked one runner's set (including an other-arch marker) onto every later repair in
-            # the same pass (round 2, finding 3). Host-derived labels (self-hosted/Linux/X64/ARM64)
-            # cannot be set by hand and are filtered out of what is preserved.
-            preserved = _preserve_labels(c["labels"], machine) if c["labels"] else ""
-            labels = preserved or resolve_labels(pool, machine)
+            # ⛔ ONE DECISION POINT, TWO INDEPENDENT STEPS. `resolve_labels` keeps the labels the
+            # runner already carries AND applies the floor (see its docstring for why an "either/or"
+            # was a defect: a DEAD runner in the pool has labels to keep, so the floor was never
+            # reached on the path that runs after every restart). ⛔ PER RUNNER, never a value cached
+            # from the previous iteration: that leaked one runner's set (including an other-arch
+            # marker) onto every later repair in the same pass (round 2, finding 3).
+            labels = resolve_labels(
+                pool, machine, notes=record["notes"], current=c["labels"]
+            )
             record["actions"].append(
                 register(runner.directory, c["name"], repo, labels, replace=True)
             )
