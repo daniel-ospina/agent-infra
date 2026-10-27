@@ -310,6 +310,56 @@ ask_status() { # <name> <started-file>
   return 0
 }
 
+# ⛔ ONE WORKTREE, TWO NAMES (#2280). `pr-doctor.worker_name()` is MODE-QUALIFIED (`prd-<tag>-42`
+# in a multi-repo pass) while the WORKTREE is `prd-42` in BOTH modes, so two orders can name one
+# directory -- and this script is the ONLY liveness guard `nonblocking-dispatch.sh` has (it performs
+# none itself). Asking only the order's OWN name is the exact defect `worker_live_for`
+# (pr-doctor.py:3526) was written to remove: the pass reads the other order's LIVE worker as absent,
+# re-offers, and a second agent is spawned into one git index, one branch and one log/.rc/.pid —
+# destroying the live worker's evidence.
+#
+# So the question asked here is the DOCTOR's question — is ANY worker alive on this WORKTREE? —
+# answered from the order population (every `$O/bg/<name>.started` recording that worktree) PLUS the
+# doctor's own alias (`prd-<n>`, the single-repo pass's name for the SAME tree) when it differs from
+# ours. An UNANSWERABLE read wins over a later negative: the safe direction is not to spawn.
+# Prints `live:<name>` | `unknown:<name>` | nothing. Runs in its own subshell at the call site, so
+# `ask_status`'s globals (STATUS_KIND/STATUS_WHY) do not leak into the caller's walk.
+worktree_holder() { # <own-name> <worktree>
+  local own="$1" wt="$2" f gname gwt alias nn unk=""
+  [ -n "$wt" ] || return 0
+  for f in "$BG_DIR/$PREFIX"*.started; do
+    [ -f "$f" ] || continue
+    gname="$(field "$f" name)"; [ -n "$gname" ] || gname="$(basename "$f" .started)"
+    [ "$gname" = "$own" ] && continue
+    gwt="$(field "$f" worktree)"; [ -n "$gwt" ] || continue
+    [ "${gwt%/}" = "${wt%/}" ] || continue
+    ask_status "$gname" "$f"
+    case "$STATUS_KIND" in
+      LIVE)    printf 'live:%s\n' "$gname"; return 0 ;;
+      UNKNOWN) unk="$gname" ;;
+    esac
+  done
+  # The alias arm: `prd-<n>` may be live with no `.started` of its own (the earlier single-repo
+  # order's record was superseded). Its stamp is passed as the path it would have, so a MISSING
+  # stamp cannot manufacture a stale-claim downgrade — an absent stamp leaves `running` as LIVE.
+  case "$own" in
+    *-*) nn="${own##*-}" ;;
+    *)   nn="" ;;
+  esac
+  if [ -n "$nn" ] && [ "$nn" != "$own" ]; then
+    alias="prd-$nn"
+    if [ "$alias" != "$own" ]; then
+      ask_status "$alias" "$BG_DIR/$alias.started"
+      case "$STATUS_KIND" in
+        LIVE)    printf 'live:%s\n' "$alias"; return 0 ;;
+        UNKNOWN) unk="$alias" ;;
+      esac
+    fi
+  fi
+  [ -n "$unk" ] && printf 'unknown:%s\n' "$unk"
+  return 0
+}
+
 refills_of() { # <name>
   [ -f "$LEDGER" ] || { printf '0\n'; return 0; }
   awk -F'\t' -v n="$1" '$2==n { c++ } END { printf "%d\n", c+0 }' "$LEDGER" 2>/dev/null || printf '0\n'
@@ -346,7 +396,7 @@ pass() {
   local plenv orders=0 live=0 dead=0 unknown=0 cap fix review refilled=0 why="" decision=clean prev=""
   local complete=0
   local n_offered=0 n_dead_total=0 refused=0 budget_full=0 exhausted=0 no_record=0
-  local f name wt prompt kind stamp wt_branch rec_branch capr sig
+  local f name wt prompt kind stamp wt_branch rec_branch capr sig hold
 
   mkdir -p "$STATE_DIR" 2>/dev/null || { say "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
   plenv="$STATE_DIR/.worker-supply.plistenv"
@@ -408,6 +458,20 @@ pass() {
       say "$name: not re-offered — worktree $wt is on '$wt_branch' but the order was for '$rec_branch' (the tree was reused; the PR must be re-classified, not replayed)"
       continue
     fi
+    # ⛔ ANOTHER ORDER MAY HOLD THIS WORKTREE UNDER A DIFFERENT NAME (see worktree_holder). Refuse,
+    # and move the pool census with it: a worktree with a live worker on it IS a held slot, and an
+    # unanswerable read is UNKNOWN — never a licence to spawn blind.
+    hold="$(worktree_holder "$name" "$wt")"
+    if [ -n "$hold" ]; then
+      dead=$(( dead - 1 ))
+      case "${hold%%:*}" in
+        live)    live=$(( live + 1 ))
+                 say "$name: not re-offered — another order holds its worktree $wt and is RUNNING (${hold#*:}); a second worker there would destroy the live one's log/.rc/.pid" ;;
+        *)       unknown=$(( unknown + 1 ))
+                 say "$name: not re-offered — another order holds its worktree $wt and its liveness could not be read (${hold#*:}); spawning blind would risk a live worker" ;;
+      esac
+      continue
+    fi
     if offer_recorded "$name" "$sig"; then
       say "$name: not re-offered — this exact spawn instance (started=$sig) was already re-offered once"
       continue
@@ -426,10 +490,20 @@ pass() {
     fi
     # ACCEPTED IS A RECORD, NOT A RETURN CODE (pr-doctor's own rule): ask the harness again.
     ask_status "$name" "$f"
-    if [ "$STATUS_KIND" = LIVE ] || [ -f "$BG_DIR/$name.rc" ]; then
+    if [ "$STATUS_KIND" = LIVE ]; then
       offer_append "$name" "$sig" accepted
       refilled=$(( refilled + 1 )); n_offered=$(( n_offered + 1 )); live=$(( live + 1 )); dead=$(( dead - 1 ))
       say "$name: RE-OFFERED in $wt (kind=$kind cap=${capr}s) — the order's dead worker was replaced ($live/$cap live)"
+    elif [ -f "$BG_DIR/$name.rc" ]; then
+      # ⛔ ACCEPTED, AND ALREADY OVER. The dispatcher took the order and the worker has ENDED (a
+      # fast failure: bad credentials, a missing interpreter). The ledger row is still written --
+      # the same spawn instance must never be re-offered twice (`offer_recorded`) -- but this is
+      # NOT a live slot and the order is NOT un-dead: counting it live is the "bookkeeping is not
+      # the worker" class one layer down (pr-doctor #2700 C5), and it holds the budget against
+      # workers that do not exist, so the pass under-supplies and reports a `live=` that is false.
+      offer_append "$name" "$sig" accepted
+      refilled=$(( refilled + 1 )); n_offered=$(( n_offered + 1 ))
+      say "$name: RE-OFFERED but the worker ENDED at once ($STATUS_WHY) — no slot is held, the order is still dead"
     else
       refused=$(( refused + 1 ))
       say "$name: re-offer UNCONFIRMED ($STATUS_WHY) — no ledger row; liveness is re-read next pass"

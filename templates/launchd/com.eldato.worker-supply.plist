@@ -55,8 +55,12 @@
          15 s instead of launchd's respawn storm.
 
          NO StandardOutPath for the decision stream: the supervisor appends its own bounded log
-         (~/.pi/agent/state/worker-supply.log, rotated) and its last-pass record
-         (~/.pi/agent/state/worker-supply.state) — the surfaces `worker-supply.sh status` reprints.
+         (~/orchestrator/state/worker-supply.log, rotated) and its last-pass record
+         (~/orchestrator/state/worker-supply.state) — the surfaces `worker-supply.sh status`
+         reprints. Those paths are `$O/state`, with `O` defaulting to `$HOME/orchestrator`
+         (worker-supply.sh:110-111,129) and NOT overridden by this plist; a comment naming
+         ~/.pi/agent/state/ pointed an operator at a file that is never written, so an incident
+         looked like "the supervisor never ran" beside an equally empty launchd.err.
          The stderr capture below exists ONLY for a death before the script can log anything (a bash
          syntax error, a missing interpreter), which is the class that leaves no other trace.
          Rendered by scripts/install-launchd.sh (#304) — placeholders only. -->
