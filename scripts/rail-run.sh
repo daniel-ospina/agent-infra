@@ -19,26 +19,28 @@
 # session with its own log and its own recorded exit status; the caller keeps working and polls.
 #
 # ── THE STATE IS DERIVED, NEVER GUESSED ────────────────────────────────────────
-# Every poll reads four pieces of evidence: the recorded exit status, the recorder's OWN incarnation
-# (through `scripts/lib/pid-identity.sh`, the fleet's one process-identity rule — whose `unknown`
-# verdict is an ABSTENTION and never a death witness), the log, and the PR's own state. Never %CPU;
-# never a single first-match process read.
+# Every poll reads five pieces of evidence: the recorded exit status, the RECORDER's incarnation, the
+# RAIL's incarnation, the log, and the PR's own state. Identity comes from
+# `scripts/lib/pid-identity.sh` — the fleet's one process-identity rule — whose `unknown` verdict is
+# an ABSTENTION and never a death witness. Never %CPU; never a single first-match process read.
 #
-#   running               the recorder is alive and has written no exit status yet
+#   running               no exit status yet, and the RECORDER (or the RAIL, if the recorder is gone)
+#                         is positively alive
 #   landed                the PR is MERGED. `verdict=rail` when the rail itself exited 0;
-#                         `verdict=artifact` when the merge is real but the rail wrote NO verdict —
-#                         the artifact outranks the exit status (admin-merge.sh's own rule, #1359).
-#   refused               the rail exited non-zero; its own last `admin-merge: ✗` line is printed
+#                         `verdict=artifact` when the merge is real but the rail wrote NO verdict or a
+#                         NON-ZERO one — the artifact outranks the exit status (admin-merge.sh's own
+#                         rule, #1359)
+#   refused               rc=2 (the rail refused the INVOCATION), or rc≠0 with the rail's own
+#                         `admin-merge: ✗ …` line in the log: it refused this head
 #   killed                the rail died of a SIGNAL (rc ≥ 128) — 15 = SIGTERM, 9 = SIGKILL
-#   gone-without-verdict  no exit status AND the recorder is gone. THIS RUN PRODUCED NO VERDICT.
-#                         It is never reported as a landing. (This is the state the defect lacked:
-#                         a killed-at-the-cap run and a still-waiting run were indistinguishable.)
-#   exited-zero           rc=0 and the PR is NOT merged: a `--dry-run`/`--print-bounds` inspection
-#                         run, or a merge the API does not report. NOT a landing.
-#   unknown               an evidence read ABSTAINED (`ps` unreadable, or rc=0 with an unreadable PR
-#                         state). A read that failed is not a verdict: it never says landed and
-#                         never says gone.
-#   no-run                nothing was ever started for this PR.
+#   gone-without-verdict  no exit status, the recorder is gone, the rail is not alive, and the PR is
+#                         not MERGED: THIS RUN PRODUCED NO VERDICT. It is never reported as a landing
+#   exited-zero           rc=0 and the PR is NOT merged (a `--dry-run`/`--print-bounds` inspection)
+#   unknown               an evidence read ABSTAINED: `ps` unreadable, no recorded incarnation, an
+#                         unusable recorded start, a corrupt status file, an unreadable PR state, or a
+#                         non-zero exit with no `admin-merge: ✗` line (an ERROR, not a verdict about
+#                         this head). A read that failed is not a verdict in either direction
+#   no-run                nothing was ever started for this PR
 #
 # Exit codes, so a poller can branch without parsing the words:
 #   0 landed · 10 running · 20 refused · 21 killed · 22 gone-without-verdict · 23 exited-zero
@@ -46,16 +48,18 @@
 #   5 the launch did not start · 78 the identity library is missing (it refuses to guess liveness)
 #
 # ── WHAT A POLL PRINTS ────────────────────────────────────────────────────────
-#   <state> pr=<N> run=<id> repo=<slug|?> pid=<pid|none> rc=<N|none> pr_state=<S> merged=<iso|->
-#           started=<iso> log_bytes=<N> log_age_s=<N|-> [verdict=rail|artifact|none]
-# followed by one or more reason lines. `status` never mutates anything.
+#   <state> pr=<N> run=<id> repo=<slug|?> pid=<pid|none> rail_pid=<pid|none> rc=<N|none>
+#           pr_state=<S> merged=<iso|-> started=<iso> log_bytes=<N> log_age_s=<N|->
+#           [verdict=rail|artifact|none]
+# followed by one or more reason lines. `status` never mutates anything and makes no `gh` call while
+# a run is simply alive.
 #
 # ── EXITING EARLY IS THE POINT ────────────────────────────────────────────────
 # `start` prints the run id, the log path and the exact `status` command to poll with, then
 # returns. Nothing in this script waits on the rail, so no tool call can be capped by it:
 #
 #   bash scripts/rail-run.sh start 42 --repo owner/repo
-#   bash scripts/rail-run.sh status 42 --repo owner/repo     # …repeat; exit 10 = still running
+#   bash scripts/rail-run.sh status 42 --repo owner/repo --run <run-id>   # 10 = still running
 #
 # Env seams:
 #   RAIL_RUN_DIR         run-state root (default ${O:-$HOME/orchestrator}/state/rail-run)
@@ -66,12 +70,14 @@
 #
 # SESSION ISOLATION: the recorder is started with `setsid` (or `python3 os.setsid()`), else plain
 # `nohup`. Which one happened is not asserted — it is MEASURED after the spawn (the recorder's
-# pgid against the caller's) and printed as `session=own|shared`, because a caller-side
-# process-group kill reaches the rail in the `shared` case and the operator must be told.
+# pgid against the caller's) and printed as `session=own|shared|unknown`, because a caller-side
+# process-group kill reaches the rail in the `shared` case and an unreadable pgid is not evidence
+# either way.
 #
 # The recorder IGNORES HUP/TERM/INT: it is the process that owns the verdict, so a kill aimed at the
-# caller (or at it) must not produce a verdict-less run. A kill aimed at the RAIL is recorded as
-# `killed`, which is why that state is real rather than theoretical.
+# caller (or at it) must not produce a verdict-less run. The rail does NOT inherit that ignore, so a
+# kill aimed at the RAIL is recorded as `killed` — which is why that state is real rather than
+# theoretical.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,6 +87,7 @@ RUN_ROOT="${RAIL_RUN_DIR:-${O:-$HOME/orchestrator}/state/rail-run}"
 RAIL="${RAIL_RUN_RAIL:-$SELF_DIR/admin-merge.sh}"
 GH="${RAIL_RUN_GH:-gh}"
 PS="${PS_BIN:-/bin/ps}"
+CLAIM=""
 
 usage() {
   cat >&2 <<'EOF'
@@ -97,7 +104,8 @@ usage: rail-run.sh start  <PR> [rail args...]
   --repo OWNER/REPO  pass it exactly when the rail needs it; it also keys the run state, so
                      `status` must be given the SAME value. Without it the key is the repository
                      this script is run from, resolved through the git COMMON dir — one key for
-                     every worktree of that repo.
+                     every worktree of that repo. Outside a git checkout there is no repo identity,
+                     so pass --repo.
   --run <run-id>     poll a SPECIFIC run instead of the newest one (a poller that started run A
                      must never be shown run B's state).
 EOF
@@ -133,6 +141,12 @@ last_refusal_line() {
   awk 'index($0, "admin-merge: ✗") { l = $0 } END { if (l != "") print l }' "$1" 2>/dev/null
 }
 
+# last_log_line <logfile> -> the last non-blank line, so an ERROR can be reported with its own words
+# instead of a state name. Truncated: a row is not a transcript.
+last_log_line() {
+  awk 'NF { l = $0 } END { if (l != "") printf "%.300s", l }' "$1" 2>/dev/null
+}
+
 # check_pr <value> — a PR number is a positive decimal. `$(( ))` and `[ -ge ]` re-parse their
 # operand, so anything else is refused before it reaches a path or an arithmetic context.
 check_pr() {
@@ -143,21 +157,27 @@ check_pr() {
 # lane on another box/checkout can poll the same key. Without one it is the repository's directory
 # name resolved through the git COMMON dir — deliberately not `--show-toplevel`, which in a linked
 # worktree names the WORKTREE, giving every worktree a different key for the same repo + PR.
+# An unusable directory name (a space is enough) falls back to a CHECKSUM of the resolved path, never
+# to one constant: a constant would make every such repo share a key, and `status` could then report
+# another repo's run — including `landed` — as this one's.
 repo_key() {
   if [ -n "${1:-}" ]; then printf '%s' "${1//\//-}"; return 0; fi
-  local common d b=""
+  local common d full="" b=""
   common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
   if [ -n "$common" ]; then
     d="$(dirname "$common")"
-    b="$(cd "$d" 2>/dev/null && pwd -P)" || b=""
-    b="${b##*/}"
+    full="$(cd "$d" 2>/dev/null && pwd -P)" || full=""
+    b="${full##*/}"
   fi
-  case "$b" in ''|.|/|*[!A-Za-z0-9._-]*) b="unknown-repo" ;; esac
+  case "$b" in
+    ''|.|/|*[!A-Za-z0-9._-]*) b="repo-$(printf '%s' "${full:-nogit}" | cksum | cut -d' ' -f1)" ;;
+  esac
   printf '%s' "$b"
 }
 
 # pr_state <pr> <slug|""> -> "<STATE> <mergedAt|->", or nothing when the read ABSTAINED.
-# Nothing is the important answer: `rc=0` plus an unreadable PR state is `unknown`, never a landing.
+# Nothing is the important answer: a failed artifact read is never a landing, a refusal or a kill
+# claim — callers must fold it into `unknown` for EVERY exit status, which is what derive does.
 pr_state() {
   local pr="$1" slug="${2:-}" out
   local -a a=(pr view "$pr")
@@ -176,6 +196,13 @@ sig_name() { # <signal-number> -> its name when it is one this box meets daily
   esac
 }
 
+# release_claim — drop the start claim IF it is still ours. Runs from the EXIT trap, so a refusal, a
+# failed launch or an interrupt cannot leave a claim behind to block the next start forever.
+release_claim() {
+  if [ -n "$CLAIM" ] && [ "$(file_or_empty "$CLAIM/pid")" = "$$" ]; then rm -rf "$CLAIM" 2>/dev/null; fi
+  CLAIM=""
+}
+
 # ── start ──────────────────────────────────────────────────────────────────────
 start_rail() {
   local pr="${1:-}"; shift || true
@@ -190,16 +217,48 @@ start_rail() {
   done
   [ -f "$RAIL" ] || die "no rail at $RAIL — set RAIL_RUN_RAIL, or run this beside admin-merge.sh"
 
-  local key dir prev
+  local key dir
   key="$(repo_key "$slug")"
   dir="$RUN_ROOT/$key/pr-$pr"
   mkdir -p "$dir" || die "cannot create the run-state dir $dir"
 
-  # ── ONE LIVE RUN PER PR, decided on EVIDENCE ──
-  # The existing run's own INCARNATION is probed, never its directory: a stale dir left by a run
-  # that ended (or by a reused pid) must not block a new start — that is the stale-flag defect the
-  # fleet has already paid for. An ABSTENTION (`unknown`) blocks, because a second rail on one PR is
-  # a second merge attempt, and an unread probe is not permission.
+  # ── ONE LIVE RUN PER PR — A CLAIM TAKEN BEFORE THE PROBE ──
+  # Probing alone is check-then-act: two `start`s racing both see no live run and both launch a rail,
+  # which is two merge attempts on one PR. The claim is an ATOMIC `mkdir`, taken BEFORE the probe and
+  # released only after the new run id has been published to `latest`.
+  #   * a claim that probes LIVE or UNVERIFIABLE is another start in flight → refuse;
+  #   * a claim whose own launcher is positively gone is STALE → remove it and retry ONCE (the same
+  #     three-outcome rule the run probe uses: an abstention blocks, only positive evidence clears).
+  CLAIM="$dir/.starting"
+  local tries=0 c_pid c_start c_probe c_rc
+  while :; do
+    if mkdir "$CLAIM" 2>/dev/null; then break; fi
+    tries=$((tries + 1))
+    if [ "$tries" -gt 1 ]; then
+      printf 'rail-run: ✗ a start for pr=%s could not take the claim %s (held by another start)\n' "$pr" "$CLAIM" >&2
+      printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
+      exit 3
+    fi
+    c_pid="$(file_or_empty "$CLAIM/pid")"; c_start="$(file_or_empty "$CLAIM/start")"
+    c_probe="$(pid_probe "${c_pid:-0}" "${c_start:-0}" 2>/dev/null)"; c_rc=$?
+    if [ "$c_rc" = "0" ] || [ "$c_rc" = "2" ]; then
+      if [ "$c_rc" = "0" ]; then c_probe="LIVE"; else c_probe="UNVERIFIABLE"; fi
+      printf 'rail-run: ✗ a start for pr=%s is already in flight (%s)\n' "$pr" "$c_probe" >&2
+      printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
+      exit 3
+    fi
+    rm -rf "$CLAIM" 2>/dev/null || true
+  done
+  # From here the claim is OURS, and every exit path releases it.
+  printf '%s\n' "$$" > "$CLAIM/pid"
+  printf '%s\n' "$(numeric_or_empty "$(pid_start_epoch "$$" 2>/dev/null || true)")" > "$CLAIM/start"
+  trap release_claim EXIT
+
+  # ── AN EXISTING RUN'S INCARNATION IS PROBED, never its directory ──
+  # A stale dir left by a run that ended (or by a reused pid) must not block a start — that is the
+  # stale-flag defect the fleet has already paid for. An ABSTENTION blocks, because a second rail on
+  # one PR is a second merge attempt, and an unread probe is not permission.
+  local prev
   prev="$(file_or_empty "$dir/latest")"
   if [ -n "$prev" ] && [ -d "$dir/$prev" ]; then
     local prev_pid prev_start probe probe_rc what
@@ -212,7 +271,7 @@ start_rail() {
         printf 'rail-run: ✗ a rail run for pr=%s is already %s (run=%s, probe=%s)\n' \
           "$pr" "$what" "$prev" "${probe:-?}" >&2
         printf '  its log:  %s\n' "$dir/$prev/log" >&2
-        printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
+        printf '  poll it:  bash %s status %s --run %s%s\n' "$SELF" "$pr" "$prev" "${slug:+ --repo $slug}" >&2
         printf '  or wait:  it writes its own exit status; poll again rather than starting a second rail\n' >&2
         exit 3
       fi
@@ -225,7 +284,6 @@ start_rail() {
   mkdir -p "$rd" || die "cannot create the run dir $rd"
   printf '%s\n' "$(date -u +%FT%TZ)" > "$rd/started"
   printf '%s\n' "$slug" > "$rd/repo"
-  printf '%s\n' "$PWD" > "$rd/cwd"
   printf '%s\n' "$RAIL" > "$rd/rail"
   { for a in "$@"; do printf '%q ' "$a"; done; printf '\n'; } > "$rd/args" 2>/dev/null
   : > "$rd/log"
@@ -264,24 +322,35 @@ os.execvp(sys.argv[1], sys.argv[1:])'
     exit 5
   fi
 
-  # ── SESSION ISOLATION IS MEASURED, NOT CLAIMED ──
+  # ── SESSION ISOLATION IS MEASURED, NOT CLAIMED (three outcomes) ──
   local cpid cpgid mpgid sess
   cpid="$(file_or_empty "$rd/pid")"
   cpgid="$(numeric_or_empty "$("$PS" -o pgid= -p "$cpid" 2>/dev/null | tr -d '[:space:]')")"
   mpgid="$(numeric_or_empty "$("$PS" -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')")"
-  if [ -n "$cpgid" ] && [ -n "$mpgid" ] && [ "$cpgid" != "$mpgid" ]; then sess="own"; else sess="shared"; fi
+  if [ -z "$cpgid" ] || [ -z "$mpgid" ]; then sess="unknown"
+  elif [ "$cpgid" != "$mpgid" ]; then sess="own"
+  else sess="shared"; fi
 
   printf '%s\n' "$rid" > "$dir/latest"
+  release_claim
   printf 'started pr=%s run=%s pid=%s session=%s%s\n' \
     "$pr" "$rid" "$cpid" "$sess" "${slug:+ repo=$slug}"
   printf '  log:    %s\n' "$rd/log"
-  printf '  poll:   bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}"
+  printf '  poll:   bash %s status %s --run %s%s\n' "$SELF" "$pr" "$rid" "${slug:+ --repo $slug}"
   printf '  state:  %s\n' "$rd"
-  if [ "$sess" = "shared" ]; then
-    printf '⛔ session=shared — no `setsid` and no usable python3 were found, so the rail shares the\n' >&2
-    printf '   caller'"'"'s process group: a process-GROUP kill aimed at the caller WILL reach it.\n' >&2
-    printf '   The tool-cap collision is still removed (this call has already returned); only that\n' >&2
-    printf '   residual isolation is missing. Install util-linux (Linux) / coreutils (macOS).\n' >&2
+  if [ "$sess" != "own" ]; then
+    if [ "$sess" = "unknown" ]; then
+      printf '⛔ session=unknown — the recorder'"'"'s process group could not be read, so whether it is\n' >&2
+      printf '   isolated from the caller is NOT known. Nothing is claimed here: re-run `status`, and\n' >&2
+      printf '   treat a process-GROUP kill of this caller as possibly reaching the rail.\n' >&2
+    else
+      printf '⛔ session=shared — the rail shares the caller'"'"'s process group: a process-GROUP kill\n' >&2
+      printf '   aimed at the caller WILL reach it. The tool-cap collision is still removed (this call\n' >&2
+      printf '   has already returned); only that residual isolation is missing.\n' >&2
+      if ! command -v setsid >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+        printf '   Install util-linux (Linux) / coreutils (macOS) to close it.\n' >&2
+      fi
+    fi
   fi
   printf 'NOTE: do NOT wait on the rail in a tool call. Poll `status`; exit 10 = still running.\n'
 }
@@ -290,9 +359,11 @@ os.execvp(sys.argv[1], sys.argv[1:])'
 # derive <run-dir> <pr> — prints the state row + reasons; returns the state's exit code.
 derive() {
   local rd="$1" pr="$2"
-  local pid start started rc slug log bytes age probe prst merged verdict_kv=""
+  local pid railpid start railstart started rc slug log bytes age prst merged verdict_kv="" why
   pid="$(file_or_empty "$rd/pid")"
+  railpid="$(file_or_empty "$rd/railpid")"
   start="$(file_or_empty "$rd/start")"
+  railstart="$(file_or_empty "$rd/railstart")"
   started="$(file_or_empty "$rd/started")"
   slug="$(file_or_empty "$rd/repo")"
   log="$rd/log"
@@ -302,17 +373,25 @@ derive() {
 
   # row <state> [extra key=value] — ONE line, every read value on it, nothing inferred.
   row() {
-    printf '%s pr=%s run=%s repo=%s pid=%s rc=%s pr_state=%s merged=%s started=%s log_bytes=%s log_age_s=%s%s\n' \
-      "$1" "$pr" "$(basename "$rd")" "${slug:-?}" "${pid:-none}" "${rc:-none}" \
+    printf '%s pr=%s run=%s repo=%s pid=%s rail_pid=%s rc=%s pr_state=%s merged=%s started=%s log_bytes=%s log_age_s=%s%s\n' \
+      "$1" "$pr" "$(basename "$rd")" "${slug:-?}" "${pid:-none}" "${railpid:-none}" "${rc:-none}" \
       "${prst:-not-read}" "$merged" "${started:--}" "${bytes:-0}" "${age:--}" \
       "${2:+ $2}"
+  }
+  # read_artifact — ONE gh read, setting prst+merged. An empty prst means the read ABSTAINED, and
+  # every branch below must treat that as `unknown`, never as a landing/refusal/kill claim: a merge
+  # the API could not report is exactly what a wrong-direction signal here would hide.
+  read_artifact() {
+    local out
+    out="$(pr_state "$pr" "$slug")"
+    prst="$(printf '%s' "$out" | cut -d' ' -f1)"
+    merged="$(printf '%s' "$out" | cut -d' ' -f2)"
+    [ -n "$merged" ] || merged="-"
+    return 0
   }
   merged="-"
 
   # ── THE EXIT STATUS EXISTS: the run reached a verdict of its own ──
-  # The ARTIFACT is read even here, and it OUTRANKS the status: a rail that merged and then died of
-  # a signal still produced a MERGED PR, and reporting `killed` over a real merge is the same
-  # wrong-direction signal this script exists to remove.
   if [ -n "$rc" ]; then
     case "$rc" in *[!0-9]*)
       # A corrupt status file is not a verdict. Do not guess, and do not read it as 0.
@@ -320,17 +399,29 @@ derive() {
       printf '  the exit-status file %s/rc is not a number, so this run has no readable verdict\n' "$rd"
       return 25 ;;
     esac
-    local ps_out
-    ps_out="$(pr_state "$pr" "$slug")"
-    prst="$(printf '%s' "$ps_out" | cut -d' ' -f1)"
-    if [ -n "$ps_out" ]; then merged="$(printf '%s' "$ps_out" | cut -d' ' -f2)"; fi
-    [ -n "$merged" ] || merged="-"
+    read_artifact
+    # The ARTIFACT outranks the status: a rail that merged and then died of a signal still produced a
+    # MERGED PR, so `killed` must never be printed over a real merge.
     if [ "$prst" = "MERGED" ]; then
       if [ "$rc" = "0" ]; then verdict_kv="verdict=rail"; else verdict_kv="verdict=artifact"; fi
       row "landed" "$verdict_kv"
-      printf '  the PR is MERGED (merged=%s); the rail exited rc=%s\n' "${merged:--}" "$rc"
+      printf '  the PR is MERGED (merged=%s); the rail exited rc=%s\n' "$merged" "$rc"
       [ "$rc" != "0" ] && printf '  ⚠️  rc=%s is NOT a rail success: the merge is real, and this run did not certify it\n' "$rc"
       return 0
+    fi
+    # ⛔ A FAILED ARTIFACT READ IS NOT A VERDICT, FOR **ANY** rc. Folding it into `killed`/`refused`
+    # would assert a state the evidence cannot support (the PR may be merged and the API blipped), so
+    # the abstention is hoisted above every classification below.
+    if [ -z "$prst" ]; then
+      row "unknown" "verdict=none artifact=unread"
+      if [ "$rc" -ge 128 ]; then
+        printf '  the rail was terminated by %s (rc=%s) and the PR state could NOT be read, so\n' "$(sig_name "$((rc - 128))")" "$rc"
+        printf '  whether this run landed the PR is UNKNOWN — re-poll rather than concluding either way\n'
+      else
+        printf '  the rail exited %s and the PR state could NOT be read, so whether this run landed\n' "$rc"
+        printf '  the PR is UNKNOWN — an unread artifact is not a merge and not a refusal\n'
+      fi
+      return 25
     fi
     if [ "$rc" -ge 128 ]; then
       row "killed" "verdict=none signal=$(sig_name "$((rc - 128))")"
@@ -339,32 +430,43 @@ derive() {
       return 21
     fi
     if [ "$rc" = "0" ]; then
-      if [ -z "$prst" ]; then
-        row "unknown" "verdict=none"
-        printf '  the rail exited 0 but the PR state could not be read, so this is NOT reported as a\n'
-        printf '  landing: an unread artifact is not a merge, and it is not a refusal either\n'
-        return 25
-      fi
       row "exited-zero" "verdict=none"
       printf '  the rail exited 0 and the PR is %s — exit 0 alone is not a landing (a --dry-run or\n' "$prst"
       printf '  --print-bounds inspection run looks exactly like this)\n'
       return 23
     fi
-    local why
     why="$(last_refusal_line "$log")"
-    row "refused" "verdict=none"
+    # ⛔ rc=1 IS NOT ALWAYS A REFUSAL OF THIS HEAD: the rail also exits 1 when it could not READ what
+    # it needed (an unreadable head/draft probe, a missing parser, a failed `cd`). A refusal is only
+    # claimed when the rail said so in its own words — otherwise this is an ERROR, and a lane told
+    # "refused this head" would hunt a code defect that was never analysed.
     if [ "$rc" = "2" ]; then
+      row "refused" "verdict=none"
       printf '  the rail exited 2 — a USAGE/CONFIGURATION refusal: it never analysed this head\n'
-    else
-      printf '  the rail exited %s — it refused this head\n' "$rc"
+      [ -n "$why" ] && printf '  rail: %s\n' "$why"
+      return 20
     fi
-    if [ -n "$why" ]; then printf '  rail: %s\n' "$why"; else printf '  (no `admin-merge: ✗` line in %s)\n' "$log"; fi
-    return 20
+    if [ -n "$why" ]; then
+      row "refused" "verdict=none"
+      printf '  the rail exited %s — it refused this head\n' "$rc"
+      printf '  rail: %s\n' "$why"
+      return 20
+    fi
+    row "unknown" "verdict=none"
+    printf '  the rail exited %s with NO `admin-merge: ✗` line — that is an ERROR, not a verdict about\n' "$rc"
+    printf '  this head (an unreadable input, a missing helper, a failed cd). Its last words:\n'
+    printf '  %s\n' "$(last_log_line "$log")"
+    return 25
   fi
 
   # ── NO EXIT STATUS: liveness decides, and it has THREE outcomes, not two ──
-  local live
-  probe="$(pid_probe "${pid:-0}" "${start:-0}" 2>/dev/null)"; live=$?
+  local live probe
+  if [ -n "$pid" ] || [ -n "$railpid" ]; then
+    probe="$(pid_probe "${pid:-0}" "${start:-0}" 2>/dev/null)"; live=$?
+    if [ -z "$pid" ]; then live=3; probe="no recorder incarnation recorded"; fi
+  else
+    live=3; probe="no incarnation recorded"
+  fi
   case "$live" in
     0)
       row "running" "verdict=none"
@@ -374,31 +476,63 @@ derive() {
     2)
       # An ABSTENTION. Never read as gone, never read as running. A MERGED artifact still wins:
       # that is a fact about the PR, not about the process.
-      local ps2 st2 mg2
-      ps2="$(pr_state "$pr" "$slug")"
-      st2="$(printf '%s' "$ps2" | cut -d' ' -f1)"
-      mg2="$(printf '%s' "$ps2" | cut -d' ' -f2)"
-      if [ "$st2" = "MERGED" ]; then
-        [ -n "$mg2" ] || mg2="-"
+      read_artifact
+      if [ "$prst" = "MERGED" ]; then
         row "landed" "verdict=artifact liveness=unknown"
-        printf '  the PR is MERGED (merged=%s), but whether this run is still alive could not be\n' "$mg2"
-        printf '  read (probe: %s), so the merge is reported as the ARTIFACT and not as this run'"'"'s\n' "$probe"
-        printf '  verdict\n'
+        printf '  the PR is MERGED (merged=%s), but whether this run is still alive could not be read\n' "$merged"
+        printf '  (probe: %s), so the merge is reported as the ARTIFACT and not as this run'"'"'s verdict\n' "$probe"
         return 0
       fi
       row "unknown" "verdict=none liveness=unknown"
-      printf '  liveness could not be read (probe: %s) — this is an ABSTENTION, not a death and not a\n' "$probe"
-      printf '  success: the run may still be alive, so read %s and re-poll\n' "$log"
+      printf '  liveness could not be read (probe: %s) — an ABSTENTION, not a death and not a success:\n' "$probe"
+      printf '  the run may still be alive, so read %s and re-poll\n' "$log"
+      return 25 ;;
+    3)
+      # NO incarnation at all: an absent record is not a death witness (a half-written run dir must
+      # not read as `gone`).
+      read_artifact
+      if [ "$prst" = "MERGED" ]; then
+        row "landed" "verdict=artifact liveness=unknown"
+        printf '  the PR is MERGED (merged=%s); this run recorded no incarnation, so the merge is\n' "$merged"
+        printf '  reported as the ARTIFACT and not as this run'"'"'s verdict\n'
+        return 0
+      fi
+      row "unknown" "verdict=none liveness=unknown"
+      printf '  %s — with no exit status this is an ABSTENTION: neither a death nor a success.\n' "$probe"
+      printf '  read %s and re-poll\n' "$log"
       return 25 ;;
   esac
 
-  # probe 1 — positively not this run's pid any more: absent, a zombie, or the incarnation fence
+  # probe 1 — positively not this run's recorder any more: absent, a zombie, or the incarnation fence
   # says this pid is a DIFFERENT process than the one we started.
-  local ps3
-  ps3="$(pr_state "$pr" "$slug")"
-  prst="$(printf '%s' "$ps3" | cut -d' ' -f1)"
-  if [ -n "$ps3" ]; then merged="$(printf '%s' "$ps3" | cut -d' ' -f2)"; fi
-  [ -n "$merged" ] || merged="-"
+  # ⛔ THE RAIL IS PROBED TOO. The recorder can be SIGKILLed while the rail keeps running and still
+  # merges (the #2873 inversion), so "the recorder is gone" must never be read as "nothing is
+  # running" — and never as "nothing landed".
+  if [ -n "$railpid" ]; then
+    local rprobe rlive
+    rprobe="$(pid_probe "$railpid" "${railstart:-0}" 2>/dev/null)"; rlive=$?
+    case "$rlive" in
+      0)
+        row "running" "verdict=none recorder=gone"
+        printf '  the RECORDER is gone (%s) but the RAIL is still running (%s) — no verdict yet;\n' "$probe" "$rprobe"
+        printf '  poll again. The rail can still merge, and its words are in %s\n' "$log"
+        return 10 ;;
+      2)
+        read_artifact
+        if [ "$prst" = "MERGED" ]; then
+          row "landed" "verdict=artifact rail_liveness=unknown"
+          printf '  the PR is MERGED (merged=%s); the recorder wrote no exit status and the RAIL'"'"'s\n' "$merged"
+          printf '  liveness could not be read (%s), so the merge is the ARTIFACT'"'"'s, not a rail verdict\n' "$rprobe"
+          return 0
+        fi
+        row "unknown" "verdict=none rail_liveness=unknown"
+        printf '  the recorder is gone and the RAIL'"'"'s liveness could not be read (%s) — an\n' "$rprobe"
+        printf '  ABSTENTION: it may still be running and may still merge. Re-poll; do not re-run\n'
+        return 25 ;;
+    esac
+  fi
+
+  read_artifact
   if [ "$prst" = "MERGED" ]; then
     row "landed" "verdict=artifact"
     printf '  the PR is MERGED (merged=%s). The recorder is gone and wrote NO exit status, so the\n' "$merged"
@@ -406,14 +540,15 @@ derive() {
     return 0
   fi
   row "gone-without-verdict" "verdict=none"
-  printf '  the recorder is GONE (%s) and wrote no exit status — this run produced NO VERDICT\n' "${probe:-probe unavailable}"
+  printf '  the recorder is GONE (%s), the rail is not alive, and no exit status was written —\n' "${probe:-probe unavailable}"
+  printf '  this run produced NO VERDICT\n'
   if [ -z "$prst" ]; then
     printf '  the PR state could not be read either, so whether this run merged anything is UNKNOWN:\n'
     printf '  this is neither a landing claim nor a refusal claim\n'
   else
-    printf '  the PR is %s, so this run ended without landing it\n' "$prst"
+    printf '  the PR is %s. Nothing is running for this run, so a merge from it is no longer possible;\n' "$prst"
+    printf '  re-run only after reading %s\n' "$log"
   fi
-  printf '  look at %s for its last words; re-run only if that is what you decide\n' "$log"
   return 22
 }
 
@@ -474,12 +609,16 @@ exec_rail() {
   local rail
   rail="$(file_or_empty "$rd/rail")"
   [ -f "$rail" ] || printf 'rail-run: ✗ the rail vanished: %s\n' "$rail" >> "$rd/log"
-  # ⛔ THE IGNORED SIGNALS MUST NOT BE INHERITED BY THE RAIL (review of this script: an inherited
-  # SIG_IGN cannot be un-ignored by the child, so a `kill -TERM` aimed at the rail would be swallowed
-  # and `killed` would become an unreachable state — the same silent-absence defect, one level down).
-  # `trap -` in the SUBSHELL restores the default dispositions for the rail only; the recorder above
-  # keeps ignoring them, which is what makes a verdict-less run impossible.
-  ( trap - HUP TERM INT; exec bash "$rail" "$@" ) >> "$rd/log" 2>&1 < /dev/null
+  # ⛔ THE IGNORED SIGNALS MUST NOT BE INHERITED BY THE RAIL: an inherited SIG_IGN cannot be
+  # un-ignored by the child, so a `kill -TERM` aimed at the rail would be swallowed and `killed`
+  # would become unreachable — the same silent-absence defect, one level down. `trap -` in the
+  # SUBSHELL restores the default dispositions for the rail only.
+  # ⛔ AND THE RAIL'S OWN PID IS RECORDED: the recorder can be SIGKILLed while the rail lives on.
+  ( trap - HUP TERM INT; exec bash "$rail" "$@" ) >> "$rd/log" 2>&1 < /dev/null &
+  local railpid=$!
+  printf '%s\n' "$railpid" > "$rd/railpid"
+  printf '%s\n' "$(numeric_or_empty "$(pid_start_epoch "$railpid" 2>/dev/null || true)")" > "$rd/railstart"
+  wait "$railpid"
   local rc=$?
   # Written to a temp then renamed: a reader must never see a partial status and take it for one.
   printf '%s\n' "$rc" > "$rd/.rc.tmp" 2>/dev/null && mv -f "$rd/.rc.tmp" "$rd/rc" 2>/dev/null

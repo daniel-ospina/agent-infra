@@ -177,10 +177,10 @@ flag does either.
 
    ```bash
    bash scripts/rail-run.sh start  <PR> [rail args...]   # returns at once, prints the run id + log
-   bash scripts/rail-run.sh status <PR>                   # 10 running · 0 landed · 20 refused
+   bash scripts/rail-run.sh status <PR> [--repo owner/repo] --run <run-id>
    ```
-   `status` also distinguishes `killed` (21) from `gone-without-verdict` (22) — never read a
-   no-verdict run as a landing. See `docs/ops/rail-run.md`.
+   `status` exits 10 running · 0 landed · 20 refused · 21 killed · 22 gone-without-verdict — a run
+   that produced NO verdict is never reported as a landing. See `docs/ops/rail-run.md`.
 
    ⛔ **The ONE-COMMAND alternative to steps 1-3.** If you would otherwise assemble a reviewer prompt
    by hand, do not: `~/.pi/agent/scripts/review-pr.sh <PR>` spawns a genuinely fresh-context

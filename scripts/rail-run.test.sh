@@ -18,6 +18,9 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RR="$SCRIPT_DIR/rail-run.sh"
+# The interpreter is resolved ONCE and called by absolute path: one arm puts a `bash` stub first on
+# PATH to make the launcher's own spawn fail, and that stub must not replace the test's interpreter.
+BASH_BIN="${BASH:-$(command -v bash)}"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
@@ -57,13 +60,13 @@ export RAIL_RUN_GH="$T/bin/gh"
 export FAKE_RAIL_COUNT="$T/rail-count.txt"
 export FAKE_RAIL_LOG="$T/rail-was-called.log"
 mkdir -p "$T/bin"
-: > "$FAKE_RAIL_COUNT"
+: > "$FAKE_RAIL_COUNT"; : > "$FAKE_RAIL_LOG"
 
 # ── the fake rail ─────────────────────────────────────────────────────────────
 # FAKE_RAIL_SLEEP      seconds to spend "waiting on CI" (one log line per second: log GROWTH)
 # FAKE_RAIL_RC         the exit status it finally returns (default 0)
 # FAKE_RAIL_REFUSAL    when set, it prints the rail's own red-tree refusal sentence
-# FAKE_RAIL_PIDFILE    where it records its own pid (so a test can signal the RAIL, not the wrapper)
+# FAKE_RAIL_PIDFILE    where it records its own pid (so a test can signal the RAIL, not the recorder)
 cat > "$T/bin/rail" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_RAIL_LOG"
@@ -97,7 +100,7 @@ chmod +x "$T/bin/gh"
 # ── helpers ───────────────────────────────────────────────────────────────────
 call() { # <verb> [args...] -> "<rc>|<output>"
   local out rc=0
-  out="$(bash "$RR" "$@" 2>&1)" || rc=$?
+  out="$("$BASH_BIN" "$RR" "$@" 2>&1)" || rc=$?
   printf '%s|%s' "$rc" "$out"
 }
 poll() { call status "$@"; }
@@ -112,8 +115,18 @@ wait_state() { # <want-state> <pr> [--run id] — poll until the state word matc
   printf '%s' "$out"; return 1
 }
 run_id_of() { field "${1#*|}" run; }
-rundir() { # <pr> <run-id> -> the run dir
-  printf '%s/agent-infra/pr-%s/%s' "$RAIL_RUN_DIR" "$1" "$2"
+rundir() { printf '%s/agent-infra/pr-%s/%s' "$RAIL_RUN_DIR" "$1" "$2"; }
+last_argv() { awk 'END{print}' "$FAKE_RAIL_LOG" 2>/dev/null; }
+rail_invocations() { awk -v p="$1" 'index($0, p " ") == 1 || $0 == p {n++} END{print n+0}' "$FAKE_RAIL_LOG" 2>/dev/null; }
+craft() { # <pr> <run-name> [k=v ...] — a hand-built run dir, for states no launch can reach
+  local pr="$1" name="$2"; shift 2
+  local rd="$RAIL_RUN_DIR/agent-infra/pr-$pr/$name"
+  mkdir -p "$rd"; printf '\n' > "$rd/repo"
+  printf 'admin-merge: … hand-built fixture\n' > "$rd/log"
+  printf '%s\n' "$name" > "$RAIL_RUN_DIR/agent-infra/pr-$pr/latest"
+  local kv k v
+  for kv in "$@"; do k="${kv%%=*}"; v="${kv#*=}"; printf '%s\n' "$v" > "$rd/$k"; done
+  printf '%s' "$rd"
 }
 
 printf '=== rail-run.sh — start/poll, first-class states (#2885) ===\n'
@@ -122,6 +135,8 @@ printf '=== rail-run.sh — start/poll, first-class states (#2885) ===\n'
 OUT="$(call)"; assert_rc 2 "${OUT%%|*}" "USAGE: no verb exits 2"
 OUT="$(poll abc)"; assert_rc 2 "${OUT%%|*}" "USAGE: a non-numeric PR is refused before it reaches a path"
 OUT="$(call start 0)"; assert_rc 2 "${OUT%%|*}" "USAGE: PR 0 is refused"
+OUT="$(poll 5 --bogus)"; assert_rc 2 "${OUT%%|*}" "USAGE: an unexpected status argument is refused, not ignored"
+OUT="$(RAIL_RUN_RAIL=/nonexistent/rail call start 5)"; assert_rc 2 "${OUT%%|*}" "USAGE: a missing rail is refused before any state is written"
 
 # ── A: start RETURNS IMMEDIATELY, and the run reads `running` ────────────────
 SECONDS=0
@@ -132,19 +147,19 @@ if [ "$ELAPSED" -lt 3 ]; then ok "START: returns at once while the rail waits 8s
 else bad "START: blocked for ${ELAPSED}s — it must not wait on the rail"; fi
 assert_contains "$TXT" "session=own" "START: the recorder is in its OWN session (measured, not claimed)"
 assert_contains "$TXT" "poll:" "START: prints the exact poll command"
+assert_contains "$TXT" "--run" "START: the printed poll command pins the RUN ID (not merely the newest run)"
 RUN1="$(run_id_of "$OUT")"
 if [ -n "$RUN1" ] && [ -d "$(rundir 101 "$RUN1")" ]; then
   ok "START: records a run dir (run=$RUN1)"
 else bad "START: no run dir for run='$RUN1'"; fi
-for f in pid start rail repo started args log; do
+for f in pid start rail railpid railstart repo started args log; do
   [ -s "$(rundir 101 "$RUN1")/$f" ] || bad "START: $f was not recorded"
 done
 # ⛔ THE RAIL'S OWN ARGV IS ASSERTED, not assumed. `start_rail` shifts the PR off `$@` before it
-# spawns, and a spawn that forwards only the REMAINDER reaches `admin-merge.sh` PR-less — it then
-# logs "a PR number is required" and exits 2, so every run would analyse nothing while the state
-# machine reported a clean refusal. Found by a real-rail smoke run; this arm is why it cannot
-# come back.
-RAIL_ARGV="$(awk 'NR==1' "$FAKE_RAIL_LOG" 2>/dev/null)"
+# spawns, and a spawn that forwards only the REMAINDER reaches the rail PR-less — it then logs
+# "a PR number is required" and exits 2, so every run would analyse nothing while the state machine
+# reported a clean refusal. Found by a real-rail smoke run; this arm is why it cannot come back.
+RAIL_ARGV="$(last_argv)"
 if [ "$RAIL_ARGV" = "101" ]; then ok "ARGV: the rail received the PR as its first argument"
 else bad "ARGV: the rail received '$RAIL_ARGV' (want '101')"; fi
 PIDS+=("$(cat "$(rundir 101 "$RUN1")/pid" 2>/dev/null || true)")
@@ -169,6 +184,21 @@ assert_contains "$TXT" "already LIVE" "DUPLICATE: names the live run"
 N="$(wc -l < "$FAKE_RAIL_COUNT" | tr -d '[:space:]')"
 assert_rc 1 "$N" "DUPLICATE: exactly ONE rail invocation ever reached the rail"
 
+# ── B2: two CONCURRENT starts still produce ONE rail (the claim is atomic) ───
+# Without an atomic claim this is check-then-act: both probe, both see nothing, both launch, and the
+# PR gets TWO merge attempts. Sequential arms cannot see that, so this one races the two starts.
+( RAIL_RUN_RAIL="$T/bin/rail" "$BASH_BIN" "$RR" start 301 > "$T/c1.out" 2>&1; echo $? > "$T/c1.rc" ) &
+( RAIL_RUN_RAIL="$T/bin/rail" "$BASH_BIN" "$RR" start 301 > "$T/c2.out" 2>&1; echo $? > "$T/c2.rc" ) &
+wait
+CONC="$(rail_invocations 301)"
+assert_rc 1 "$CONC" "CONCURRENT: two racing starts reach the rail exactly ONCE"
+C1="$(cat "$T/c1.rc" 2>/dev/null || echo x)"; C2="$(cat "$T/c2.rc" 2>/dev/null || echo x)"
+if { [ "$C1" = 0 ] && [ "$C2" = 3 ]; } || { [ "$C1" = 3 ] && [ "$C2" = 0 ]; }; then
+  ok "CONCURRENT: exactly one start won (rc=0) and the other refused (rc=3)"
+else bad "CONCURRENT: want one rc=0 and one rc=3, got rc=$C1 and rc=$C2"; fi
+RD301="$(rundir 301 "$(cat "$RAIL_RUN_DIR/agent-infra/pr-301/latest")")"
+PIDS+=("$(cat "$RD301/pid" 2>/dev/null || true)" "$(cat "$RD301/railpid" 2>/dev/null || true)")
+
 # ── C: refused — the rail's own words and its own exit status ────────────────
 OUT="$(FAKE_RAIL_REFUSAL='python shards 3 of 8 failed' FAKE_RAIL_RC=1 call start 102)"; RC="${OUT%%|*}"
 assert_rc 0 "$RC" "REFUSED: start exits 0 (the launch started; the verdict comes from status)"
@@ -178,9 +208,20 @@ assert_state "$TXT" refused "REFUSED: the state word is 'refused'"
 assert_contains "$TXT" "python shards 3 of 8 failed" "REFUSED: quotes the rail's own refusal line"
 assert_not_contains "$TXT" "landed" "REFUSED: never reported as landed"
 
+# ── C2: rc=1 with NO refusal line is an ERROR, not a verdict about the head ──
+# admin-merge.sh also exits 1 when it could not READ what it needed (an unreadable head/draft probe, a
+# missing parser, a failed cd). Claiming "refused this head" there sends a lane hunting a code defect
+# that was never analysed.
+FAKE_RAIL_RC=1 call start 121 >/dev/null
+OUT="$(GH_MODE=open wait_state unknown 121)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" 'ERROR-RC: rc=1 with no `admin-merge: ✗` line ABSTAINS (25)'
+assert_state "$TXT" unknown "ERROR-RC: the state word is 'unknown', not 'refused'"
+assert_not_contains "$TXT" "it refused this head" "ERROR-RC: never claims a refusal it cannot show"
+
 # ── D: killed — the rail died of a SIGNAL, which is neither a refusal nor a landing
 FAKE_RAIL_PIDFILE="$T/rail-pid.txt" FAKE_RAIL_SLEEP=30 call start 103 >/dev/null
-PIDS+=("$(cat "$(rundir 103 "$(cat "$RAIL_RUN_DIR/agent-infra/pr-103/latest")")/pid" 2>/dev/null || true)")
+RD103="$(rundir 103 "$(cat "$RAIL_RUN_DIR/agent-infra/pr-103/latest")")"
+PIDS+=("$(cat "$RD103/pid" 2>/dev/null || true)")
 i=0; while [ ! -s "$T/rail-pid.txt" ] && [ "$i" -lt 80 ]; do sleep 0.1; i=$((i + 1)); done
 RAILPID="$(cat "$T/rail-pid.txt" 2>/dev/null || true)"
 PIDS+=("$RAILPID")
@@ -190,10 +231,28 @@ assert_rc 21 "$RC" "KILLED: exit code 21"
 assert_contains "$TXT" "SIGTERM" "KILLED: names the signal that ended it"
 assert_not_contains "$TXT" "landed" "KILLED: never reported as landed"
 
+# ── D2/D3: a SIGNAL DEATH with an unreadable PR state is NOT a verdict ───────
+# `killed` is a claim about the rail; landing is a claim about the PR. If the artifact cannot be read
+# the second is unknown, and asserting `killed` over a possibly-merged PR is the wrong direction.
+OUT="$(craft 131 dead-rail rc=143)"; RAILDIR="$OUT"
+OUT="$(GH_MODE=fail poll 131)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "KILL+UNREAD: rc=143 with an unreadable PR state ABSTAINS (25)"
+assert_not_contains "$TXT" "killed" "KILL+UNREAD: never claims a kill verdict over an unread artifact"
+OUT="$(craft 132 dead-err rc=1)"; 
+OUT="$(GH_MODE=fail poll 132)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "REFUSE+UNREAD: rc=1 with an unreadable PR state ABSTAINS (25)"
+assert_not_contains "$TXT" "refused" "REFUSE+UNREAD: never claims a refusal over an unread artifact"
+
+# ── D4: rc≠0 + MERGED — the artifact outranks a written non-zero status ─────
+craft 133 merged-nonzero rc=1 >/dev/null
+OUT="$(GH_MODE=merged poll 133)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 0 "$RC" "NONZERO+MERGED: exit code 0 (the PR is merged)"
+assert_contains "$TXT" "verdict=artifact" "NONZERO+MERGED: attributed to the artifact, not to a rail success"
+
 # ── E: landed — the rail's OWN verdict (rc=0 AND the artifact agree) ─────────
 OUT="$(GH_MODE=merged call start 104)"; RC="${OUT%%|*}"
 assert_rc 0 "$RC" "LANDED: start exits 0"
-OUT="$(wait_state landed 104)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+OUT="$(GH_MODE=merged wait_state landed 104)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 0 "$RC" "LANDED: exit code 0"
 assert_contains "$TXT" "verdict=rail" "LANDED: counted as the RAIL's verdict (rc=0 and the artifact agree)"
 
@@ -208,23 +267,31 @@ assert_not_contains "$TXT" "landed" "EXITED-ZERO: never reported as landed"
 GH_MODE=fail call start 106 >/dev/null
 OUT="$(GH_MODE=fail wait_state unknown 106)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 25 "$RC" "UNKNOWN: exit code 25"
-assert_not_contains "$TXT" "landed" "UNKNOWN: an unread artifact is NOT a landing"
-assert_not_contains "$TXT" "refused" "UNKNOWN: an unread artifact is NOT a refusal"
+assert_not_contains "$TXT" "verdict=rail" "UNKNOWN: an unread artifact is NOT a rail verdict"
+assert_not_contains "$TXT" "verdict=artifact" "UNKNOWN: an unread artifact is NOT an artifact verdict"
+assert_not_contains "$TXT" "it refused this head" "UNKNOWN: an unread artifact is NOT a refusal"
 
-# ── H: gone-without-verdict — the recorder died with no exit status ─────────
-# #2885's missing state: a SIGKILLed recorder writes nothing, so the poll must SAY so.
+# ── H: the RECORDER dies, the RAIL lives → still `running` ──────────────────
+# #2885's inversion: a SIGKILLed recorder writes nothing while the rail keeps running AND can still
+# merge. "The recorder is gone" must never be read as "nothing is running".
 FAKE_RAIL_PIDFILE="$T/rail-pid2.txt" FAKE_RAIL_SLEEP=30 call start 107 >/dev/null
-RUNDIR107="$(rundir 107 "$(cat "$RAIL_RUN_DIR/agent-infra/pr-107/latest")")"
-REC="$(cat "$RUNDIR107/pid" 2>/dev/null || true)"
+RD107="$(rundir 107 "$(cat "$RAIL_RUN_DIR/agent-infra/pr-107/latest")")"
+REC="$(cat "$RD107/pid" 2>/dev/null || true)"
 PIDS+=("$REC" "$(cat "$T/rail-pid2.txt" 2>/dev/null || true)")
 if [ -n "$REC" ]; then kill -9 "$REC" 2>/dev/null; fi
+OUT="$(GH_MODE=open wait_state running 107)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 10 "$RC" "RECORDER-GONE: the RAIL is still alive, so the run is STILL RUNNING (10)"
+assert_contains "$TXT" "RAIL is still running" "RECORDER-GONE: says the RAIL is what is still alive"
+
+# ── H2: BOTH gone, no exit status → gone-without-verdict (the missing state) ─
+if [ -s "$T/rail-pid2.txt" ]; then kill -9 "$(cat "$T/rail-pid2.txt")" 2>/dev/null; fi
 OUT="$(GH_MODE=open wait_state gone-without-verdict 107)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 22 "$RC" "GONE: exit code 22"
-assert_state "$TXT" gone-without-verdict "GONE: no exit status + recorder gone is its OWN state"
+assert_state "$TXT" gone-without-verdict "GONE: no exit status + recorder and rail gone is its OWN state"
 assert_not_contains "$TXT" "landed" "GONE: never reported as landed"
 assert_contains "$TXT" "NO VERDICT" "GONE: says plainly that this run produced no verdict"
 
-# ── H2: the same gone run, PR MERGED → landed=artifact ──────────────────────
+# ── H3: the same gone run, PR MERGED → landed=artifact ─────────────────────
 # The artifact outranks the exit status: reporting 'gone' over a real merge is the wrong direction.
 OUT="$(GH_MODE=merged poll 107)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 0 "$RC" "GONE+MERGED: exit code 0"
@@ -233,19 +300,24 @@ assert_contains "$TXT" "no rail verdict" "GONE+MERGED: still says this run produ
 
 # ── I: the incarnation fence — a LIVE pid alone is not "running" ────────────
 # A reused pid (or a record with no usable start) must never read as running: 'running' is a claim
-# about THIS run, not about a number.
-RD="$RAIL_RUN_DIR/agent-infra/pr-108/$(date -u +%Y%m%dT%H%M%SZ)-fence"
-mkdir -p "$RD"; printf '%s\n' "$$" > "$RD/pid"; printf '%s\n' "0" > "$RD/start"
-printf '\n' > "$RD/repo"; : > "$RD/log"
-printf '%s\n' "$(basename "$RD")" > "$RAIL_RUN_DIR/agent-infra/pr-108/latest"
+# about THIS run, not about a number. A MERGED artifact still wins over the abstention.
+craft 108 fence pid="$$" start=0 >/dev/null
 OUT="$(GH_MODE=open poll 108)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 25 "$RC" "FENCE: a live pid with an unusable incarnation ABSTAINS (25)"
 assert_not_contains "$TXT" "running" "FENCE: a live pid alone never reads as running"
+craft 118 fence-merged pid="$$" start=0 >/dev/null
+OUT="$(GH_MODE=merged poll 118)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 0 "$RC" "FENCE+MERGED: the ARTIFACT wins over the liveness abstention (0)"
+assert_contains "$TXT" "verdict=artifact" "FENCE+MERGED: attributed to the artifact"
+
+# ── I2: no incarnation recorded at all → abstention, NOT a death witness ────
+craft 119 empty-dir >/dev/null
+OUT="$(GH_MODE=open poll 119)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "NO-INCARNATION: an absent record ABSTAINS instead of reading as gone (25)"
+assert_not_contains "$TXT" "gone-without-verdict" "NO-INCARNATION: never a death witness"
 
 # ── J: a corrupt exit-status file is not a verdict ──────────────────────────
-RD="$RAIL_RUN_DIR/agent-infra/pr-109/$(date -u +%Y%m%dT%H%M%SZ)-corrupt"
-mkdir -p "$RD"; printf '\n' > "$RD/repo"; : > "$RD/log"; printf 'not-a-number\n' > "$RD/rc"
-printf '%s\n' "$(basename "$RD")" > "$RAIL_RUN_DIR/agent-infra/pr-109/latest"
+craft 109 corrupt rc=not-a-number >/dev/null
 OUT="$(GH_MODE=open poll 109)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 25 "$RC" "CORRUPT-RC: exit code 25"
 assert_not_contains "$TXT" "landed" "CORRUPT-RC: never read as a landing"
@@ -257,7 +329,7 @@ assert_state "$TXT" no-run "NO-RUN: nothing was ever started for this PR"
 OUT="$(poll 999 --run nope)"; assert_rc 24 "${OUT%%|*}" "NO-RUN: an unknown --run id is no-run, not the newest run"
 
 # ── L: --run pins ATTRIBUTION — an old run id never reports the newest run ──
-GH_MODE=open FAKE_RAIL_RC=1 call start 110 >/dev/null
+GH_MODE=open FAKE_RAIL_RC=1 FAKE_RAIL_REFUSAL='run A refused' call start 110 >/dev/null
 RID_A="$(cat "$RAIL_RUN_DIR/agent-infra/pr-110/latest")"
 OUT="$(GH_MODE=open wait_state refused 110 --run "$RID_A")"; assert_rc 20 "${OUT%%|*}" "ATTRIBUTION: run A refuses"
 GH_MODE=merged FAKE_RAIL_RC=0 call start 110 >/dev/null
@@ -265,6 +337,7 @@ OUT="$(GH_MODE=merged wait_state landed 110)"; assert_rc 0 "${OUT%%|*}" "ATTRIBU
 OUT="$(GH_MODE=open poll 110 --run "$RID_A")"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 20 "$RC" "ATTRIBUTION: polling run A still reports A's refusal"
 assert_contains "$TXT" "run=$RID_A" "ATTRIBUTION: and names run A, not the newest run"
+OUT="$(GH_MODE=open poll 110 --run="$RID_A")"; assert_rc 20 "${OUT%%|*}" "ATTRIBUTION: the --run=<id> spelling works too"
 
 # ── M: session isolation is MEASURED — 'shared' is named, never assumed away ─
 OUT="$(RAIL_RUN_NO_SETSID=1 call start 111)"; TXT="${OUT#*|}"
@@ -272,24 +345,29 @@ assert_contains "$TXT" "session=shared" "ISOLATION: RAIL_RUN_NO_SETSID=1 reports
 assert_contains "$TXT" "WILL reach it" "ISOLATION: the shared-group residual risk is named, not hidden"
 OUT="$(GH_MODE=merged wait_state landed 111)"; assert_rc 0 "${OUT%%|*}" "ISOLATION: a shared-session run is still polled to a verdict"
 
+# ── N: exit 5 — a spawn that dies without recording a pid is SAID, not reported as a run
+mkdir -p "$T/badbash"
+printf '#!/bin/sh\nexit 3\n' > "$T/badbash/bash"; chmod +x "$T/badbash/bash"
+OUT="$(PATH="$T/badbash:$PATH" call start 114)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 5 "$RC" "LAUNCH: a spawn that records no pid exits 5"
+assert_contains "$TXT" "the launch did not start" "LAUNCH: says the launch failed instead of reporting a run"
+OUT="$(poll 114)"; assert_rc 24 "${OUT%%|*}" "LAUNCH: and nothing is left claiming a live run (the claim was released)"
+
+# ── O: --repo=<slug> inline form keys the state and reaches the rail ────────
+OUT="$(FAKE_RAIL_SLEEP=6 call start 115 --no-rerun --repo=acme/widgets)"; TXT="${OUT#*|}"
+assert_contains "$TXT" "repo=acme/widgets" "ARGS: the --repo=<slug> form is honoured and echoed"
+RAIL_ARGV="$(last_argv)"
+if [ "$RAIL_ARGV" = "115 --no-rerun --repo=acme/widgets" ]; then
+  ok "ARGS: the rail received the PR, its own flags and --repo in order"
+else bad "ARGS: the rail received '$RAIL_ARGV'"; fi
+if [ -d "$RAIL_RUN_DIR/acme-widgets/pr-115" ]; then ok "ARGS: the run key follows the --repo slug"
+else bad "ARGS: no run state under acme-widgets/pr-115"; fi
+OUT="$(poll 115 --repo acme/widgets)"; assert_rc 10 "${OUT%%|*}" "ARGS: status finds the run by the SAME slug"
+OUT="$(poll 115)"; assert_rc 24 "${OUT%%|*}" "ARGS: without --repo it is a DIFFERENT key (no silent cross-repo read)"
+
 # ── Z: a stale TERMINAL run does not block a new start ─────────────────────
 OUT="$(GH_MODE=open call start 105)"; RC="${OUT%%|*}"
 assert_rc 0 "$RC" "STALE: a finished earlier run does not block a new start (its dir is evidence, not a lock)"
-
-# ── Y: PASS-THROUGH and --repo reach the rail verbatim, and --repo keys the state ───────────────
-# The rail needs its args intact (`--repo owner/repo` is how a lane merges another repo), and the
-# run key must follow that same slug so `status` from another checkout finds this run.
-OUT="$(FAKE_RAIL_SLEEP=6 call start 112 --no-rerun --repo acme/widgets)"; TXT="${OUT#*|}"
-assert_contains "$TXT" "repo=acme/widgets" "ARGS: --repo is honoured and echoed"
-# END, not NR==1: the fake rail's log accumulates across arms, so only the LAST line is this run's.
-RAIL_ARGV="$(awk 'END{print}' "$FAKE_RAIL_LOG" 2>/dev/null)"
-if [ "$RAIL_ARGV" = "112 --no-rerun --repo acme/widgets" ]; then
-  ok "ARGS: the rail received the PR, its own flags and --repo in order"
-else bad "ARGS: the rail received '$RAIL_ARGV'"; fi
-if [ -d "$RAIL_RUN_DIR/acme-widgets/pr-112" ]; then ok "ARGS: the run key follows the --repo slug"
-else bad "ARGS: no run state under acme-widgets/pr-112"; fi
-OUT="$(poll 112 --repo acme/widgets)"; assert_rc 10 "${OUT%%|*}" "ARGS: status finds the run by the SAME slug"
-OUT="$(poll 112)"; assert_rc 24 "${OUT%%|*}" "ARGS: without --repo it is a DIFFERENT key (no silent cross-repo read)"
 
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
