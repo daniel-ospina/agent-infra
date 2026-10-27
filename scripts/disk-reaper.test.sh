@@ -52,6 +52,10 @@
 #       (#4529); T58b pins the plist TEXTUAL fallback (no parser) against the same stale arming.
 #   T59 an UNANSWERABLE tally is recorded as such (`?`), never as a measured 0, and per-repo
 #       tallies are SUMMED with a `tally=<n>/<repos>` coverage figure (#4529).
+#   T60 a class that could not be SET UP reports neither a verdict NOR a count it never computed —
+#       on EITHER surface (the operator-facing class line and the pass record), for the classes that
+#       keep no tally sentinel (`worktree`, `uv`, `duplicate-install`), and `not-run` for a class that
+#       was not selected at all (#4529).
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -245,6 +249,24 @@ assert_contains "$OUT" "remove   $WT_M" "T3 a MERGED, clean, holder-free checkou
 ORIGIN_T3="$T/t3/origin.git"; "$REAL_GIT" init -q --bare "$ORIGIN_T3"
 "$REAL_GIT" -C "$REPO" remote add origin "$ORIGIN_T3"
 "$REAL_GIT" -C "$REPO" push -q origin main
+# ⛔ THE ROW MUST CITE THE PROOF IT TOOK, not the local cache it did not use. `is_ancestor_of_main`
+# tries the RESOLVED remote oid FIRST and the local chain SECOND — so on the cell this resolution
+# exists for (a stale tracking ref) the row printed `merge-base --is-ancestor <sha> <local-ref>=0`
+# for a command that returns 1. Reproduce it exactly: point the LOCAL chain behind the head, so only
+# the remote oid can prove it, then read the row's evidence.
+ORIGIN_T3_TIP="$("$REAL_GIT" -C "$ORIGIN_T3" rev-parse refs/heads/main)"
+WT_M_SHA="$("$REAL_GIT" -C "$WT_M" rev-parse HEAD)"
+INIT_T3="$("$REAL_GIT" -C "$REPO" rev-list --max-parents=0 refs/heads/main | head -1)"
+"$REAL_GIT" -C "$REPO" update-ref refs/remotes/origin/main "$INIT_T3"
+"$REAL_GIT" -C "$REPO" merge-base --is-ancestor "$WT_M_SHA" refs/remotes/origin/main >/dev/null 2>&1; RC=$?
+assert_eq "$RC" "1" "T3 precondition: the LOCAL main ref does NOT contain this head (a local citation would be false)"
+OUT="$(run_reaper --dry-run --repo "$REPO" --aged-days 7 --only worktree 2>&1)"
+ROW_T3="$(grep -A1 -F "remove   $WT_M" <<<"$OUT")"
+assert_contains "$ROW_T3" "refs=merged" "T3 the head is still proved landed — by the REMOTE's tip"
+assert_contains "$ROW_T3" "proof=merge-base --is-ancestor $WT_M_SHA $ORIGIN_T3_TIP=0" \
+    "T3 the row cites the command that ANSWERED (the resolved remote oid)"
+assert_absent "$ROW_T3" "$WT_M_SHA refs/remotes/origin/main=0" \
+    "T3 ... never the stale local ref, whose cited command returns 1"
 OUT="$(run_reaper --apply --repo "$REPO" --aged-days 7 --only worktree 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T3 the apply pass exits 0"
 assert_nodir "$WT_M" "T3 --apply removed the merged checkout (pass said: $(printf '%s' "$OUT" | grep -E 'remove |REMOVED|FAILED' | tr '\n' ' '))"
@@ -2772,8 +2794,8 @@ assert_contains "$OUT" "class=worktree rc=3 verdict=misconfigured" \
     "T60 the class line reports the verdict the RECORD reports (misconfigured)"
 assert_absent "$OUT" "class=worktree rc=3 verdict=fail-closed" \
     "T60 ... and never the re-derived fail-closed ('the delegate RAN' — a different remedy)"
-assert_contains "$OUT" "candidates=?" \
-    "T60 a class that measured nothing does not claim a candidate total"
+assert_contains "$(grep -F 'pass end' <<<"$OUT")" "candidates=?" \
+    "T60 the pass-end line does not claim a candidate total it never measured"
 assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "verdict_worktree=misconfigured" \
     "T60 the RECORD agrees with the line about the verdict of the same pass"
 assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_worktree=?" \
@@ -2788,6 +2810,21 @@ assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "can
     "T60 ... and the record agrees with the line (never an invented 0)"
 assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "verdict_uv=misconfigured" \
     "T60 the uv record names the state that made the total unanswerable"
+# ⛔ THE THIRD CLASS WITH NO TALLY SENTINEL. `uv` and `duplicate-install` are the two classes whose
+# fail-closed arms publish no tally and leave their counter at the initialised 0, so neither can be
+# caught by a `HAVE_*_CAND` guard the way venv/worktree are. Fixing one and not the other is how the
+# same invented zero survives a fix that claims to remove it (`candidates_uv=?` beside
+# `candidates_duplicate_install=0` on ONE record), so both are pinned here, on ONE fixture.
+OUT="$(DUP_INSTALL_REAPER=/nonexistent/reap-duplicate-installs.sh run_reaper --dry-run --only duplicate-install 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a duplicate-install class that could not be SET UP exits fail-closed (3)"
+assert_contains "$(grep -F 'pass end' <<<"$OUT")" "candidates=?" \
+    "T60 ... contributes no measured 0 to the pass-end total either"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_duplicate_install=?" \
+    "T60 ... and its RECORD says ?, not an invented 0 (the same class of defect as uv)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "verdict_duplicate_install=misconfigured" \
+    "T60 ... beside the verdict that explains why"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_uv=not-run" \
+    "T60 a class that was NOT SELECTED says not-run, not ? and not 0"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

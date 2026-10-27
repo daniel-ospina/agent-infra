@@ -174,8 +174,8 @@ rule 4 + `patch_equivalent` (§2.1, §6.1):
 | T5 | stale / narrowed local `origin/main` | remote main resolved via push-url `ls-remote --symref`; local only as fallback, and recorded (`main_proof=`). **Test: G6f** |
 | T6 | origin has no push url / >1 push url / ls-remote fails | fall back to local ref, recorded. No removal decision depends on it alone |
 | T7 | merged proof shadowing the open-PR veto | the open-PR veto is checked **before** rule 3/4 and returns. **Test: G5a** |
-| T8 | installed unit masked by a drop-in (the 127 unit) | read-back parses the *artifact systemd loads*. **Test: T55** |
-| T9 | partial write / truncation of the installed unit | read-back requires a non-empty effective `ExecStart` list containing our target. **T55 covers the drop-in MASK; the no-`ExecStart`-at-all branch is refused by the same function but has no dedicated test** (see §6.2) |
+| T8 | installed unit masked by a drop-in (the 127 unit) | read-back parses the *artifact systemd loads*. **Test: T58** |
+| T9 | partial write / truncation of the installed unit | read-back requires a non-empty effective `ExecStart` list containing our target. **T58 covers the drop-in MASK; the no-`ExecStart`-at-all branch is refused by the same function but has no dedicated test** (see §6.2) |
 
 Declared **out of scope**, recorded so the next lane does not re-derive them: content-equality proof
 (a merge reverted later still reads merged — removal never deletes the branch, so nothing is orphaned);
@@ -214,7 +214,7 @@ named reason, no green) unless:
 
 ⛔ Rule 2 is "ours is AMONG the effective commands", **not** "there is exactly one": `Type=oneshot`
 may legally carry several, and a drop-in that ADDS a pre-flight line is a healthy unit — refusing it
-would be a false block on a working cell (T55 asserts it is accepted AND still verified). On macOS
+would be a false block on a working cell (T58 asserts it is accepted AND still verified). On macOS
 the same facts are `ProgramArguments` (the executable **and** the mode flag) plus
 `EnvironmentVariables.HOME`.
 
@@ -237,9 +237,9 @@ a box with no GitHub remote does not need it.
 | **G6e** rule 7 gates rule 4 | 60s-old checkout with a MERGED PR (`REAP_WT_TREE_TS`) | the merged floor must not short-circuit the 45-minute minimum |
 | **G6f** stale local `refs/remotes/origin/main` + the real clock | stale-but-existing tracking ref; and a seconds-old checkout whose HEAD is 76d old | a missing/stale tracking ref falls through to local `main`; the floor must still hold |
 | **G6d** merged exemption | MERGED head 2d old, floor pinned to 7d as a control | the exemption is unrecorded / the floor is bypassed silently |
-| **G6j (SUMMARY tally) → SHIPPED AS T56** in `disk-reaper.test.sh` | any fixture with mixed verdicts | no SUMMARY line exists — the tally contract lives in the entry-point suite (§1.3/§2.3) |
-| **T55** installed-artifact read-back | override unit dir + a `*.service.d/` drop-in masking `ExecStart` to a `mktemp` path | install exits 0 and reports "installed" over a unit that would 127 |
-| ~~T53~~ (not written — folded into T55: the drop-in mask and the moved `HOME` are the two shapes an operator actually hits. **T56 is now used** for the tally contract: per-repo sums, the merged `reasons=` histogram, and the `?`/`not-run` sentinels) | — | — |
+| **T59** (SUMMARY tally) in `disk-reaper.test.sh`, **A14i** in `pi-reap-worktrees.test.sh` | a stub delegate printing the real SUMMARY shape; and a REAL pass for the identities | no SUMMARY line exists — the tally contract lives in the entry-point suite (§1.3/§2.3), and nothing checks the delegate's own arithmetic |
+| **T58** installed-artifact read-back | override unit dir + a `*.service.d/` drop-in masking `ExecStart` to a `mktemp` path | install exits 0 and reports "installed" over a unit that would 127 |
+| ~~T53~~ (not written — folded into **T58**: the drop-in mask and the moved `HOME` are the two shapes an operator actually hits. **T59** carries the tally contract: per-repo sums, the merged `reasons=` histogram, and the `?`/`not-run` sentinels; **T60** carries a class that could not be SET UP) | — | — |
 | A8 | one batched gh call (`--state all`, explicit limit) carrying `state` + `headRefOid` | — (contract change, asserted) |
 
 ⛔ **The tests DROPPED with the arm:** `G6h` (a merged PR whose `mergeCommit.oid` is not on main),
@@ -280,22 +280,22 @@ Verifier: P0=0, **P1=4**, P2=4, P3=1.
 | P2 "a stale local main can only under-report" — false: `resolve_main_ref` falls back to `refs/heads/main`, which can be AHEAD | **Fixed** — §2.2 T5 corrected |
 | P2 a 127 unit is caught by the *next* `--status` (`ExecMainStatus`); the gap is an unattended box that never runs it again | **Fixed** — §1.1 row B reworded to the real window |
 | P2 the in-repo precedent already solved squash-awareness and was cited only for F26/F29 | **Fixed** — §6 cites it as the predecessor; tip identity is adopted *from* it |
-| P3 test IDs T52/T53 collide with the suite's existing T52/T53 | **Fixed** — new tests are **T55** (install read-back) and **T56** (tally contract: per-repo sums, merged histogram, `?`/`not-run` sentinels) |
-| **Code-review cycle 1 (reviewer B, adversarial)** P0: the `Environment=` read-back was a line match, so `Environment=PATH=… HOME=/dead` and `Environment="HOME=/dead"` both passed as "verified" | **Fixed** — `effective_env()` parses every `Environment=` line the way systemd does (list, quotes, last-wins, bare-reset); HOME and the delegate pins are read from that map. 8 new T55 assertions |
+| P3 test IDs T52/T53 collide with the suite's existing T52/T53 | **Fixed** — new tests are **T58** (install read-back) and **T59** (tally contract: per-repo sums, merged histogram, `?`/`not-run` sentinels), later joined by **T60** (a class that could not be SET UP reports neither a verdict nor a count it never computed) |
+| **Code-review cycle 1 (reviewer B, adversarial)** P0: the `Environment=` read-back was a line match, so `Environment=PATH=… HOME=/dead` and `Environment="HOME=/dead"` both passed as "verified" | **Fixed** — `effective_env()` parses every `Environment=` line the way systemd does (list, quotes, last-wins, bare-reset); HOME and the delegate pins are read from that map. 8 new T58 assertions |
 | Reviewer B P1: the launchd arm verified only the executable, so a stale plist carrying `--dry-run` reported "installed" | **Fixed** — the plist arm asserts the mode flag and `EnvironmentVariables.HOME`, and names the fact it could not verify; T20 pins the positive control |
-| Reviewer B P2: the venv tally was read from the FIRST repo only (`grep -m1` outside the loop) | **Fixed** — lifted inside the repo loop and summed, like the worktree arm; 3 new T56 assertions |
-| Reviewer B P2: an unanswerable tally was recorded as a measured `0`/`none` (the `${x:-?}` default could never fire) | **Fixed** — `_tally_num`/`_tally_rec` carry `?` (ran, no tally) and `not-run` (class not selected) into the class line and the record; T7/T56 pin both |
-| Reviewer B P2: per-repo `reasons=` histograms were concatenated, not merged | **Fixed** — accumulated as `reason count` rows and folded into one descending histogram; T56 pins the sum |
+| Reviewer B P2: the venv tally was read from the FIRST repo only (`grep -m1` outside the loop) | **Fixed** — lifted inside the repo loop and summed, like the worktree arm; 3 new T59 assertions |
+| Reviewer B P2: an unanswerable tally was recorded as a measured `0`/`none` (the `${x:-?}` default could never fire) | **Fixed** — `_tally_num`/`_tally_rec` carry `?` (ran, no tally) and `not-run` (class not selected) into the class line and the record; T7/T59 pin both |
+| Reviewer B P2: per-repo `reasons=` histograms were concatenated, not merged | **Fixed** — accumulated as `reason count` rows and folded into one descending histogram; T59 pins the sum |
 | Reviewer B P2 (informational): `candidates_*` are now populated on armed passes — no verdict depends on them | **Recorded** — verified inert: `CAND_WT` feeds only the dry-run over-bound verdict |
 | Reviewer B P3: two `say` calls had been joined on one line in the installer | **Fixed** |
 | Reviewer B P3: `REAP_WT_MERGED_AGE_DAYS` was missing from the numeric-seam validation (a non-numeric value aborted `classify_one`'s subshell, printing a reason-less preserve row) | **Fixed** — validated with a range check up front; A14h pins it |
-| **Code-review cycle 2** P2: `effective_env` accepted an `Environment=` word with an UNTERMINATED QUOTE, which systemd rejects and abandons — so the install certified a HOME the unit would never get (a fail-open the pre-fix line match did not have) | **Fixed** — an unbalanced quote discards that line AND is reported; the install refuses naming it. **T55 pins the refusal** |
-| Cycle 2 P2: the plist TEXTUAL fallback (no usable parser) required only that the reaper path appear somewhere, so a stale `--dry-run` artifact read as installed — and the message claimed the parser was absent even when present-but-failing | **Fixed** — the fallback requires the mode flag too and names `EnvironmentVariables.HOME` as NOT verified; parser stderr is kept and shown to the operator when the parser FAILED (on the acceptance AND the refusal branch). **T55b pins all five halves, and asserts the parenthetical EXACTLY (a substring match was green over a doubled message — `${perr:-…}` is not an else)** (function driven from the live script, so no drift) |
-| Cycle 2 P2: the venv counters were still printed raw (`0` beside `verdict_venv=not-run`) | **Fixed** — the venv arm publishes `HAVE_VENV_TALLY`/`HAVE_VENV_CAND` and uses the same `_tally_rec` sentinels; **T56 pins not-run / `?` / answered** |
-| Cycle 2 P2: a DRY pass whose delegate only REFUSED recorded `candidates_worktree=0` | **Fixed** — candidates are answerable only from classification rows (`remove`/`preserve`/`SUMMARY`) or a tally; **T56 pins the refusal → `?`** |
-| Cycle 2 P2: a half-answered class (only some repos printed a tally) looked complete | **Fixed** — `tally_worktree=`/`tally_venv=` record `<answered>/<scanned>`; T56 pins `tally_venv=2/2` and `tally_worktree=not-run` |
+| **Code-review cycle 2** P2: `effective_env` accepted an `Environment=` word with an UNTERMINATED QUOTE, which systemd rejects and abandons — so the install certified a HOME the unit would never get (a fail-open the pre-fix line match did not have) | **Fixed** — an unbalanced quote discards that line AND is reported; the install refuses naming it. **T58 pins the refusal** |
+| Cycle 2 P2: the plist TEXTUAL fallback (no usable parser) required only that the reaper path appear somewhere, so a stale `--dry-run` artifact read as installed — and the message claimed the parser was absent even when present-but-failing | **Fixed** — the fallback requires the mode flag too and names `EnvironmentVariables.HOME` as NOT verified; parser stderr is kept and shown to the operator when the parser FAILED (on the acceptance AND the refusal branch). **T58b pins all five halves, and asserts the parenthetical EXACTLY (a substring match was green over a doubled message — `${perr:-…}` is not an else)** (function driven from the live script, so no drift) |
+| Cycle 2 P2: the venv counters were still printed raw (`0` beside `verdict_venv=not-run`) | **Fixed** — the venv arm publishes `HAVE_VENV_TALLY`/`HAVE_VENV_CAND` and uses the same `_tally_rec` sentinels; **T59 pins not-run / `?` / answered** |
+| Cycle 2 P2: a DRY pass whose delegate only REFUSED recorded `candidates_worktree=0` | **Fixed** — candidates are answerable only from classification rows (`remove`/`preserve`/`SUMMARY`) or a tally; **T59 pins the refusal → `?`** |
+| Cycle 2 P2: a half-answered class (only some repos printed a tally) looked complete | **Fixed** — `tally_worktree=`/`tally_venv=` record `<answered>/<scanned>`; T59 pins `tally_venv=2/2` and `tally_worktree=not-run` |
 | Cycle 2 P3: the histogram merge glob-expanded the delegate's reason tokens (unquoted `$(…)`), so a `*` became file names from the pass CWD | **Fixed** — the loop splits with `set -f`; the counts can no longer come from the filesystem |
-| Cycle 2 P3: an ANSWERED `reasons=none` degraded to `?` | **Fixed** — no reasons is a result; **T56 pins `preserved_reasons_worktree=none`** |
+| Cycle 2 P3: an ANSWERED `reasons=none` degraded to `?` | **Fixed** — no reasons is a result; **T59 pins `preserved_reasons_worktree=none`** |
 | — | External research: **justified skip** (local git safety predicate; the precedents are in-repo and were then read). |
 
 ### 5.2 solution-verify — cycle 1 (1 fresh-context adversarial verifier)
@@ -313,7 +313,7 @@ Verifier: **P0=2**, P1=6, P2=5, P3=4.
 | **P1** the new network probe needs an explicit seam or three existing fixtures become host-dependent | **Fixed** — `REAP_WT_MAIN_PROOF=auto|local`, `REAP_WT_MAIN_PUSH_URL`, `GIT_TERMINAL_PROMPT=0`, and `run_reaper` pins every fixture to `local` |
 | **P1** G6f would be vacuous (a missing `refs/remotes/origin/main` falls through to `refs/heads/main`) | **Fixed** — G6f requires a stale-but-EXISTING tracking ref with local `main` reset *behind* it, plus a `REAP_WT_MAIN_PROOF=local` control on the same fixture |
 | **P1** the gh shim is argument-blind; a SEPARATE call per state feeds open-list payloads into the merged loader, and `FAKE_GH_FAIL` fails both calls so the merged-evidence arm cannot observe anything | **Fixed at the time, then MOOT at the merged head** — the read is now ONE `gh pr list --state all` call carrying `state` + `headRefOid` (`pr_state_load`, `:1165`), so there is no second loader to confuse; A8 pins that the single call carries both fields |
-| P2 the SUMMARY must reconcile (`PRESERVE_C` already includes `DEFERRED`; `REMOVE_C` counts rows later preserved/failed) | **Fixed, then corrected again by the VGATE reviewer** — a single `classified = remove + preserved + deferred` claimed a decision for records the budget never classified and did not reconcile on a deferral (measured `classified=2 … deferred=15` on 16 records). The line now carries `examined=` and TWO identities: `classified = remove + preserved` and `examined = classified + deferred`; `preserved` EXCLUDES deferrals; apply-only `removed/failed/late_preserved/prune_blocked`. Asserted by **G6j** (clean), **A7** (dry budget-deferred) and **A7 armed** (remove-time deferral, which has its own `deferred_remove=` counter) |
+| P2 the SUMMARY must reconcile (`PRESERVE_C` already includes `DEFERRED`; `REMOVE_C` counts rows later preserved/failed) | **Fixed, then corrected again by the VGATE reviewer** — a single `classified = remove + preserved + deferred` claimed a decision for records the budget never classified and did not reconcile on a deferral (measured `classified=2 … deferred=15` on 16 records). The line now carries `examined=` and TWO identities: `classified = remove + preserved` and `examined = classified + deferred`; `preserved` EXCLUDES deferrals; apply-only `removed/failed/late_preserved/prune_blocked`. Asserted by **A14i** (both identities on a REAL pass), **A7** (dry budget-deferred) and **A7 armed** (remove-time deferral, which has its own `deferred_remove=` counter) |
 | P2 `main_proof`/`pr_merged` are per-repo but the class line is one line | **Fixed** — counts summed; a differing proof across repos reports `mixed` |
 | P2 `auto` can report a main SHA that is not in the local object DB (the stale cell case) | **Fixed** — `git cat-file -e <sha>^{commit}` first; `auto-unfetched` + no waiver |
 | P2 `get-url` (singular) cannot detect multiple push urls | **Fixed** — `git remote get-url --push --all`; ≠1 ⇒ `ambiguous` |
@@ -374,7 +374,7 @@ pass as `main_proof=<auto|auto-unfetched|ambiguous|unavailable|local>` in the SU
 - A worktree belonging to a repo that is not in `DISK_REAPER_REPOS` is not enumerated. Coverage is
   the union of the configured repos, not the filesystem. (A second scan root is exactly the stale
   cache the issue's fix #1 rejects.)
-- **A truncated install** (no `ExecStart=`) is refused by the read-back, but T55 only drives the
+- **A truncated install** (no `ExecStart=`) is refused by the read-back, but T58 only drives the
   drop-in *mask* — the mask resets the list, so the "no ExecStart at all" branch is exercised as a
   side effect rather than by a test that writes the shape deliberately.
 - **A stale launchd plist** is refused on the same facts as the systemd unit (executable, mode flag,

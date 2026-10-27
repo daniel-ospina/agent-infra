@@ -330,14 +330,32 @@ _tally_rec() {
     [ -n "$3" ] && printf '%s' "$3" || printf '?'
 }
 
-# _uv_rec <value> — the uv class keeps NO `HAVE_UV_CAND`/`HAVE_UV_TALLY` sentinel of its own (its
-# fail-closed arms publish no tally and leave the counters at their initialised 0), so its "could not
-# be SET UP" state reaches the record through `VERDICT_UV` instead of through a sentinel. Same
-# polarity as `_tally_rec`'s unanswerable arm: a class that never ran has no measured value, and a
-# `0` there is an INVENTED zero. Without this the pass-end line said `candidates=?` (the guard in
-# `main`) while the record of the SAME pass said `candidates_uv=0` — the two-surfaces-disagree
-# defect this pass exists to remove, one surface over.
-_uv_rec() { [ "${VERDICT_UV:-}" = misconfigured ] && printf '?' || printf '%s' "${1:-?}"; }
+# _class_rec <verdict> <want> <value> — the pass-record form for a class that publishes NO tally
+# sentinel of its own. `uv` keeps no `HAVE_UV_CAND`/`HAVE_UV_TALLY`, and `duplicate-install` keeps no
+# `HAVE_DUP_CAND`: their fail-closed arms publish no tally and leave the counter at its initialised 0,
+# so "could not be SET UP" and "not selected" both look like a measured `0` to `_tally_rec`. For these
+# two classes the VERDICT *is* the sentinel, and it discriminates all three states:
+#
+#     misconfigured -> `?`         (selected, could not be set up: NOTHING was measured)
+#     not-run      -> `not-run`    (not selected: nothing to measure)
+#     otherwise    -> the value, or `?` if it is empty
+#
+# ⛔ The ORDER is the whole point: `misconfigured` is tested FIRST because those arms also reset
+# `WANT_*` to 0, and asking `want` first would report `not-run` for a class that WAS selected and
+# failed to run — erasing the distinction #2036 exists to keep. Same polarity as `_tally_rec`'s
+# unanswerable arm: a class that never ran has no measured value, and a `0` there is an INVENTED zero.
+# Without this the pass-end line said `candidates=?` (the guard in `main`) while the record of the
+# SAME pass said `candidates_uv=0` — the two-surfaces-disagree defect this pass exists to remove, one
+# surface over — and `duplicate-install` still carried it beside `candidates_venv=not-run`.
+# ⛔ A class that DOES publish a sentinel keeps `_tally_rec`: that is the stronger evidence, and a
+# second definition of "measured" is how the two surfaces drift apart again.
+_class_rec() {
+    case "${1:-not-run}" in
+        misconfigured) printf '?' ;;
+        not-run)       printf 'not-run' ;;
+        *)             if [ "${2:-0}" = 1 ]; then [ -n "$3" ] && printf '%s' "$3" || printf '?'; else printf 'not-run'; fi ;;
+    esac
+}
 
 # kv_field <line> <key> — one `k=v` token out of a delegate's machine-readable line.
 # The delegate's `SUMMARY` is the ONLY tally a pass produces; the entry point lifts it instead of
@@ -2021,11 +2039,16 @@ CAND_TOTAL="$(( CAND_UV + CAND_VENV + CAND_WT + CAND_DUP ))"
 { [ "${WANT_VENV:-0}" != 1 ] || [ "${HAVE_VENV_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
 { [ "${WANT_WT:-0}" != 1 ] || [ "${HAVE_WT_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
 # ⛔ A CLASS THAT COULD NOT BE SET UP MEASURED NOTHING, so it cannot contribute a confident `0`.
-# The uv class keeps no candidate sentinel of its own (its fail-closed arms publish no tally and
-# leave `CAND_UV=0`), so it is caught by its VERDICT instead — `misconfigured` is exactly "could not
-# run at all", and a `candidates=0` on the pass-end line beside `verdict_uv=misconfigured` is the
-# same invented zero the sentinels above exist to prevent.
-[ "${VERDICT_UV:-}" != "misconfigured" ] || CAND_TOTAL="?"
+# `venv` and `worktree` are caught by their sentinels above (a misconfigured venv arm deselects the
+# class; the worktree arm never publishes a candidate tally). `uv` and `duplicate-install` keep NO
+# candidate sentinel — their fail-closed arms publish no tally and leave the counter at its
+# initialised 0 — so they are caught by their VERDICT instead: `misconfigured` is exactly "could not
+# run at all", and a `candidates=0` on the pass-end line beside `verdict_uv=misconfigured` (or
+# `verdict_duplicate_install=misconfigured`) is the same invented zero the sentinels exist to
+# prevent. One loop, so a third such class cannot be added and then forgotten here.
+for _cv in "${VERDICT_UV:-}" "${VERDICT_DUP:-}"; do
+    [ "$_cv" != "misconfigured" ] || CAND_TOTAL="?"
+done
 if is_dry; then
     say "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT + WOULD_DUP ))MB candidates=$CAND_TOTAL — NOTHING was removed"
 else
@@ -2083,7 +2106,7 @@ record_body() {
     printf 'would_free_mb_venv=%s\n' "$WOULD_VENV"
     printf 'would_free_mb_worktree=%s\n' "$WOULD_WT"
     printf 'would_free_mb_duplicate_install=%s\n' "$WOULD_DUP"
-    printf 'candidates_uv=%s\n' "$(_uv_rec "$CAND_UV")"
+    printf 'candidates_uv=%s\n' "$(_class_rec "${VERDICT_UV:-not-run}" "${WANT_UV:-0}" "$CAND_UV")"
     printf 'classified_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${CLASSIFIED_VENV:-}")"
     printf 'preserved_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${PRESERVED_VENV:-}")"
     printf 'candidates_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_CAND:-0}" "${CAND_VENV:-}")"
@@ -2104,7 +2127,7 @@ record_body() {
     printf 'deferred_remove_worktree=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${DEFERRED_REMOVE_WT:-}")"
     printf 'main_proof=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PROOF_WT:-}")"
     printf 'pr_merged=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PRM_WT:-}")"
-    printf 'candidates_duplicate_install=%s\n' "$CAND_DUP"
+    printf 'candidates_duplicate_install=%s\n' "$(_class_rec "${VERDICT_DUP:-not-run}" "${WANT_DUP:-0}" "$CAND_DUP")"
     printf 'verdict_uv=%s\n' "$VERDICT_UV"
     printf 'verdict_venv=%s\n' "$VERDICT_VENV"
     printf 'verdict_worktree=%s\n' "$VERDICT_WT"

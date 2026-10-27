@@ -559,17 +559,23 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferr
 `pr_merged=`. `examined = classified + deferred` and `classified = remove + preserved` are the two
 identities, and a deferred REMOVAL is its own counter: an armed overrun defers a record whose verdict
 was already `remove`, so folding it into `deferred` would deflate `preserved` and make the line
-contradict itself. `main_proof=` names which source proved "merged into main" (`auto` = the remote's
-own advertised default branch, `local` = the local ref chain, `unavailable`/`ambiguous`/
-`auto-unfetched` = no evidence claimed), and `pr_merged=` says whether the pass's batched
+contradict itself. `main_proof=` names which source proved "merged into main" (`auto` = the remote
+ANSWERED — its advertised default branch, or, when `--symref` itself did not answer, the first of
+`refs/heads/main`/`refs/heads/master` that exists there; the branch that actually resolved is
+printed in `main_ref=`, so a guessed default is visible; `local` = the local ref chain, used when
+`auto` claimed no evidence, `unavailable`/`ambiguous`/`auto-unfetched` = no evidence claimed), and
+`pr_merged=` says whether the pass's batched
 `gh pr list` read was answerable at all (`ok` / `na` no GitHub origin / `unavailable`; the
 record reports `mixed` when two repos in one pass disagree). ⛔ **Every one of these fields
-reads `?` — never `0` — when the delegate ran but produced no tally**, and `not-run` when
-the class was not selected **or was selected but could not run at all** (a missing delegate
-or no repo to scan — `want_class` was true and the record says
-`verdict_<class>=misconfigured`, so `not-run` here means "no measurement", not "no
-candidates"): a refusal (`FAIL-CLOSED gh unavailable`) is not a measurement, and a measured
-zero beside an unknown classification is the false PASS this record exists to remove.
+reads `?` — never `0` — when the class was SELECTED but produced no measurement**, and `not-run`
+when the class was **not selected at all**. "Selected, no measurement" covers both a delegate that
+ran without printing a tally and a class that could not be SET UP (a missing delegate, no repo to
+scan: `want_class` was true and the record says `verdict_<class>=misconfigured` —
+`candidates_worktree=?` on that path, pinned by T60). The one exception is the **venv** class: its
+setup-failure arms deselect it (`WANT_VENV=0`, because there is nothing left for it to measure), so
+its counters read `not-run` there. Neither token is a count — a refusal (`FAIL-CLOSED gh
+unavailable`) is not a measurement, and a measured zero beside an unknown classification is the
+false PASS this record exists to remove.
 
 `watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
 `internal`, see **Bounded execution** above), so "the bound was real" is answerable
@@ -720,7 +726,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
 (it did once, on this box, before the scoping was added).
-`scripts/disk-reaper.test.sh` — 593 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 612 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |

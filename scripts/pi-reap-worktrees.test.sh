@@ -1271,6 +1271,24 @@ OUT="$(REAP_WT_STATUS_TIMEOUT=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)
 assert_eq "$RC" "2" "A14f non-numeric timeout => exit 2 (never a watchdog-less probe)"
 OUT="$(run_reaper $ENV --dry-run --repo "$T/$ENV/does-not-exist" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "A14g --repo that is not a directory => exit 2"
+# A14h — the MERGED floor is validated like the aged floor. It governs the common arm now (every
+# squash-landed head), so a numeric-but-out-of-range value must fail LOUDLY rather than silently
+# change every verdict in the pass. Unpinned before this, which is how it was noticed.
+OUT="$(REAP_WT_MERGED_AGE_DAYS_OVERRIDE=99999999 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14h a merged floor above REAP_WT_MAX_DAYS => exit 2 (never a silently different pass)"
+assert_contains "$OUT" "bad REAP_WT_MERGED_AGE_DAYS" "A14h ... and the refusal names the seam, not a generic usage error"
+# A14i — the pass's SUMMARY must satisfy ITS OWN identities on a REAL pass: `examined = classified +
+# deferred` and `classified = remove + preserved`. Two identities over four counters is where a
+# deferral double-count (or a missing one) becomes readable instead of inferred; the doc states them,
+# so something must check them against the delegate's own arithmetic rather than a stub.
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+SUM="$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)"
+_a14i() { sed -n "s/.* $1=\([0-9][0-9]*\).*/\1/p" <<<"$SUM" | head -1; }
+assert_contains "$SUM" "SUMMARY examined=" "A14i the pass ends with ONE machine-readable summary line"
+assert_eq "$(_a14i examined)" "$(( $(_a14i classified) + $(_a14i deferred) ))" \
+    "A14i examined = classified + deferred on a real pass"
+assert_eq "$(_a14i classified)" "$(( $(_a14i remove) + $(_a14i preserved) ))" \
+    "A14i classified = remove + preserved on a real pass"
 
 # ── A15: a DEFERRED record must block the global prune (P0 pin) ───────
 # A budget-deferred record is UNCLASSIFIED, so the pass cannot know whether it is
@@ -2005,17 +2023,18 @@ FAKE_LSOF_CWD=""; FAKE_LSOF_CWD_PID=""; FAKE_PS_ANCESTOR_PID=""
 # ── MUTATIONS: the new legs must be able to FAIL ────────────────────────
 # Each mutant is the reviewed script with ONE gate removed, in a temp copy. A leg
 # that stays green under the mutation is not pinning the gate it claims to pin.
-mutate_reaper() { # <sed-expr> -> path of the mutant
+mutate_reaper() { # <sed-expr> [<extra sed args>] -> path of the mutant
     # The mutant must sit beside a `lib/` or the script fails closed at startup
     # (the bounded-execution library is resolved relative to the script), which
     # would make EVERY leg pass for the wrong reason. So: one mutant dir, with
     # `lib` symlinked to the reviewed one.
     local expr="$1" dir="$T/mutants" dest
+    shift
     mkdir -p "$dir"
     [ -e "$dir/lib" ] || ln -s "$SCRIPT_DIR/lib" "$dir/lib"
     dest="$dir/mutant-$$.sh"
     cp "$REAPER" "$dest"
-    sed -i -e "$expr" "$dest"
+    sed -i -e "$expr" "$@" "$dest"
     cmp -s "$REAPER" "$dest" && { echo "MUTATION-NOOP: $expr" >&2; return 1; }
     printf '%s\n' "$dest"
 }
@@ -2030,8 +2049,14 @@ assert_contains "$(row_for "$OUT" "$WT_M")" "reason=reclaimable" \
 
 # M2: drop the ANCESTRY/PATCH check (every head is "merged") => N4's unmerged,
 # young row escapes the age floor, so N4(d) fails.
+# ⛔ TWO call sites make the ancestry decision now: `is_ancestor_of_main` (the survival channel,
+# via `commits_survive`) and `ancestry_proof_text` (the proof the REMOVAL row must cite, re-taken
+# so a stale local ref can never be cited for a proof it did not take). Neutering only the first
+# leaves the second refusing to remove, and this mutation would then measure the citation guard,
+# not the gate.
 ENV=N4
-MUT2="$(mutate_reaper 's#if is_ancestor_of_main "\$sha"; then merged=1; fi#merged=1#')" || exit 1
+MUT2="$(mutate_reaper 's#if is_ancestor_of_main "\$sha"; then merged=1; fi#merged=1#' \
+    -e 's#^        \[ "\$?" = 0 \] && { printf#        { printf#')" || exit 1
 OUT="$(REAPER="$MUT2" run_reaper $ENV --dry-run --repo "$T/$ENV/repo")"
 assert_contains "$(row_for "$OUT" "$WT_U")" "refs=merged" "M2 mutation really removed the ancestry test"
 assert_contains "$(row_for "$OUT" "$WT_U")" "reason=reclaimable" \

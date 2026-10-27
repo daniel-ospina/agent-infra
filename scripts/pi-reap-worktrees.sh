@@ -813,6 +813,35 @@ EOF
     return 1
 }
 
+# ancestry_proof_text <sha> — the command that ACTUALLY proved the merge, for the row.
+#
+# ⛔ A ROW MUST CITE THE PROOF IT TOOK, and `is_ancestor_of_main` takes whichever of the two
+# candidates answers first: the RESOLVED REMOTE oid, then the local ref chain. Printing
+# `merge-base --is-ancestor <sha> ${MAIN_REF:-<no-main-ref>}=0` unconditionally is therefore a
+# citation that can be FALSE — on exactly the cell this resolution was written for (a stale local
+# tracking ref, where the remote oid is the one that answered, and the local ref returns 1), and with
+# no local ref at all the row even read `<no-main-ref>=0`. A removal row whose stated proof cannot be
+# reproduced is the "cite a proof it did not take" class, in the destructive path.
+#
+# So the proof is RE-TAKEN here, in the same order, and the ref that answered is the one printed.
+# Prints NOTHING when no candidate answers: the caller must then PRESERVE — a proof that cannot be
+# retaken removes nothing. (Rule 3 only fires after `commits_survive` saw it succeed, so that arm is
+# a guard against the repository changing under the pass, not a normal path.)
+ancestry_proof_text() {
+    local sha="$1" t
+    [ -n "$sha" ] || return 0
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+            "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$t"
+        [ "$?" = 0 ] && { printf 'merge-base --is-ancestor %s %s=0' "$sha" "$t"; return 0; }
+    done <<EOF
+${RESOLVED_MAIN}
+${MAIN_REF}
+EOF
+    return 0
+}
+
 # ── probes ─────────────────────────────────────────────────────────────
 # canonical_token_match <line> <canon> — true when a token of <line> resolves
 # into <canon>. Needed because git records the RESOLVED path while argv keeps
@@ -1433,7 +1462,7 @@ patch_equivalent() { # <sha> -> 0 when every commit it adds has a patch-id twin 
 # absorbed by cut -f4-).
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
-    local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf
+    local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf proof_txt=""
     local head_ts tree_ts witness wname age_s young age_floor aged_note
     local pr pr_state pr_num pr_oid pr_key pr_other subj prnum_note pr_floor no_pr_proof
     case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trule=P proof=worktree-list --porcelain record had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
@@ -1648,21 +1677,30 @@ classify_one() {
     # whatever else the checkout holds. Fired 31 times on cell-1 (511 MB ->
     # 8.6 GB) against trees logged `no upstream` for most of a day.
     if [ "$refs" = "merged" ]; then
+        # ⛔ THE PROOF IS RETAKEN, not re-derived from the inputs: with a resolved remote main the
+        # ancestry was proved against THAT oid, and `${MAIN_REF}` (the local cache) can be stale — so a
+        # row printing `... ${MAIN_REF}=0` would cite a command that returns 1. See ancestry_proof_text.
+        proof_txt="$(ancestry_proof_text "$sha")"
+        if [ -z "$proof_txt" ]; then
+            printf 'preserve\tmain-proof-vanished\t\trule=3 the ancestry proof that put this row in the removal path does NOT reproduce now (tried %s then %s) — a proof that cannot be retaken removes nothing\n' \
+                "${RESOLVED_MAIN:-<no-resolved-main>}" "${MAIN_REF:-<no-main-ref>}"
+            return 0
+        fi
         # `age_floor` already carries the merged floor (computed above).
         # A floor of 0 means "no floor", not "younger than one second": with the
         # ctime witness a checkout can be 0 seconds old, and `age <= 0` would
         # then report the degenerate floor instead of rule 7.
         if [ "$age_floor" -gt 0 ] && [ "$age_s" -le "$((age_floor * 86400))" ]; then
-            printf 'preserve\ttoo-recent\t\trule=P age %sd ≤ %sd (merged floor) proof=merge-base --is-ancestor %s %s=0\n' "$((age_s / 86400))" "$age_floor" "${sha:-?}" "${MAIN_REF:-<no-main-ref>}"
+            printf 'preserve\ttoo-recent\t\trule=P age %sd ≤ %sd (merged floor) proof=%s\n' "$((age_s / 86400))" "$age_floor" "$proof_txt"
             return 0
         fi
         if [ "$young" = 1 ]; then
-            printf 'preserve\ttoo-young\t\trule=7 age=%sm < %sm (witness=%s) proof=merge-base --is-ancestor %s %s=0\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname" "${sha:-?}" "${MAIN_REF:-<no-main-ref>}"
+            printf 'preserve\ttoo-young\t\trule=7 age=%sm < %sm (witness=%s) proof=%s\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname" "$proof_txt"
             return 0
         fi
         log "CLASSIFY merged-age-floor $path head_age=$((age_s / 86400))d merged_floor=${age_floor}d"
-        printf 'remove\treclaimable\t%s\trule=3 refs=merged proof=merge-base --is-ancestor %s %s=0 age=%sm clean=disposable-only unref=%s,no-open-pr\n' \
-            "$eph" "${sha:-?}" "${MAIN_REF:-<no-main-ref>}" "$((age_s / 60))" "${stale_txt:-no-proc}"
+        printf 'remove\treclaimable\t%s\trule=3 refs=merged proof=%s age=%sm clean=disposable-only unref=%s,no-open-pr\n' \
+            "$eph" "$proof_txt" "$((age_s / 60))" "${stale_txt:-no-proc}"
         return 0
     fi
 
