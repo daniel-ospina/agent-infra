@@ -440,17 +440,23 @@ not a load average measured earlier.
   - **The population depends on the destruction.** Deleting a *worktree* needs its repo's trees; a **recreate** or the
     `cmux-tui` reset takes the whole guest — on cell-3 that is **five repos** (`$REPO` 27 trees, `/tmp/cell-ai` 44,
     `$CELL_HOME/agent-infra` 2, `$CELL_HOME/tortoise` 3, and the ai-drainer's **seed repo** holding 14), with unpushed
-    commits in trees outside `$REPO`. ⛔ **That fifth one is a REPO, not a `wt-drainer-*` path** — a `wt-drainer-*` entry is a
-    `git worktree add` target, not a checkout: `ai-drainer.sh` creates `$AI/wt-drainer-<lane>` with
-    `git -C "$SEED_REPO" worktree add` (search that phrase — `AI` defaults to `$HOME/orchestrator-ai`) from `SEED_REPO`, which
-    `install-drainer-timer.sh:72` defaults to `$HOME/agent-infra-main` and renders into the unit. So point the guard at
-    **that checkout** — re-derive it rather than trusting this line:
-    `systemctl cat eldato-ai-drainer.service | sed -n 's/^Environment=SEED_REPO=//p'` — never at a worktree path, or 14 trees
-    go unread behind a `VERDICT 0`. And `HEAD` is not the box's work: **8** local branches there are no worktree's HEAD and
+    commits in trees outside `$REPO`. ⛔ **The fifth member is the ai-drainer's SEED_REPO, and it is not necessarily where the
+    documentation says.** `ai-drainer.sh` creates `$AI/wt-drainer-<lane>` with `git -C "$SEED_REPO" worktree add` (search
+    that phrase; `AI` defaults to `$HOME/orchestrator-ai`), and `install-drainer-timer.sh:72` defaults `SEED_REPO` to
+    `$HOME/agent-infra-main` at **install** time. On a real cell that is not the value: measured 2026-10-27 on `pi-cell-4`,
+    the installed unit is a wrapper (`ExecStart=/bin/bash $CELL_HOME/run-ai-drainer.sh`) carrying **no**
+    `Environment=SEED_REPO=`, `$CELL_HOME/agent-infra-main` does not exist, and the drainer runs against
+    **`/tmp/cell-ai-main`**, which is where `$CELL_HOME/run-ai-drainer.sh` sets `SEED_REPO`. So **derive the seed checkout
+    from the trees** — `git -C <any $AI/wt-drainer-*> rev-parse --git-common-dir` names the repo that owns them. Naming a
+    `wt-drainer-*` path itself *does* work (`git worktree list` inside a linked checkout lists the whole repository,
+    measured) — the reason not to is that `ai-drainer.sh` **reaps** those trees as soon as a lane dies (`_rm_wt`,
+    `_reap_leftovers`), so a path named now is gone later, and a missing path turns that repo into an `AT-RISK-UNKNOWN`
+    exit 1 instead of a reading. And `HEAD` is not the box's work: **8** local branches there are no worktree's HEAD and
     die in a recreate too.
   - **`git status --porcelain` omits ignored state** (`keys.env`, `orchestrator/state/` show as `!!`) — which is *exactly*
-    what a recreate destroys — so the block reports it in a third column. That column is **informational: its value does not
-    move the exit code**, so a `0` from this block never means "nothing here matters" for a recreate; read the column.
+    what a recreate destroys — so the block reports it in a third column. An ignored **count** never moves the exit code (an
+    unreadable one sets `1`, like every other UNKNOWN), so a `0` from this block never means "nothing here matters" for a
+    recreate; read the column.
   Run it as a loop over the stream, and let the **exit status** carry the verdict (`0` every tree read, no unpushed commits, no
   dirty tracked files · `1` something could not be read · `2` work at risk). `continue` outside a loop is a no-op, and a block
   whose stdout says "at risk" while it exits 0 teaches the caller to ignore it:
@@ -482,7 +488,7 @@ not a load average measured earlier.
   while IFS= read -r br; do                                  # a recreate also loses local branches
     [ -n "$br" ] || continue
     bn=$(git -C "$REPO" rev-list --count "$br" --not --remotes 2>/dev/null) || bn=UNKNOWN
-    [ "$bn" = 0 ] || { echo "BRANCH-AT-RISK $br $bn"; rc=2; }
+    case "$bn" in UNKNOWN|"") bn=UNKNOWN; echo "BRANCH-UNREADABLE $br"; [ "$rc" = 2 ] || rc=1 ;; 0) ;; *) echo "BRANCH-AT-RISK $br $bn"; rc=2 ;; esac
   done < <(git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)
   echo "VERDICT $rc"; exit "$rc"
   ```
@@ -491,12 +497,28 @@ not a load average measured earlier.
   `exit`, so the first repo would end the loop.
   ```bash
   rc_all=0
-  # `agent-infra-main` is the ai-drainer's SEED_REPO (install-drainer-timer.sh:72's default; re-derive from the unit when
-  # AI/SEED_REPO are overridden in keys.env). Its wt-drainer-* trees are worktrees it OWNS, so THIS entry is the one that
-  # reads them — listing a wt-drainer-* path here would enumerate nothing and still print GUEST VERDICT 0.
-  for R in "$REPO" /tmp/cell-ai /tmp/cell-home/agent-infra /tmp/cell-home/agent-infra-main /tmp/cell-home/tortoise; do
-    ( REPO=$R bash work-at-risk.sh ) || { s=$?; [ "$s" -gt "$rc_all" ] && rc_all=$s; }
+  # The seed checkout is whatever repo owns the drainer's trees — DERIVED, never assumed. On pi-cell-4 it is
+  # /tmp/cell-ai-main, while install-drainer-timer.sh:72's default ($HOME/agent-infra-main) does not exist and the installed
+  # unit carries no Environment=SEED_REPO= at all.
+  seed=""
+  for w in "${AI:-$HOME/orchestrator-ai}"/wt-drainer-*; do
+    [ -d "$w" ] || continue
+    seed=$(git -C "$w" rev-parse --git-common-dir 2>/dev/null | sed 's|/\.git$||')
+    [ -n "$seed" ] && break
   done
+  # The population is what is ON this box. A path you only BELIEVE is there is not a floor — it is a permanent exit 1 on
+  # every run, which trains the reader to discount the stop signal; a path that exists and is not a repo still reports
+  # AT-RISK-UNKNOWN. Streamed one path per line so a path with a space survives, for the same reason the block above reads
+  # the porcelain stream instead of awk fields.
+  while IFS= read -r R; do
+    [ -n "$R" ] || continue
+    ( REPO=$R bash work-at-risk.sh ) || { s=$?; [ "$s" -gt "$rc_all" ] && rc_all=$s; }
+  done < <(
+    printf '%s\n' "$REPO"
+    [ -n "$seed" ] && printf '%s\n' "$seed"
+    for d in /tmp/cell-* /tmp/cell-home/*; do [ -e "$d/.git" ] && printf '%s\n' "$d"; done
+    exit 0
+  )
   echo "GUEST VERDICT $rc_all"; exit "$rc_all"
   ```
   That list is a **floor taken on 2026-10-27, not a census** — re-derive it per box
