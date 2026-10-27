@@ -73,7 +73,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle to a ~150 MB ceiling** — the idle FLOOR re-measured on cells 3–4, 2026-10-27 (5.5 MB minimum); the 149 MB ceiling is the earlier 21–149 MB sample's maximum, **not** re-measured (today's max: 105 MB). The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle to a ~150 MB ceiling** — the idle FLOOR re-measured on cells 3–4, 2026-10-27 (5.5 MB minimum); the 149 MB ceiling is the earlier 21–149 MB sample's maximum, **not** re-measured (same-day maxima: 105 MB on cell-3, 147 MB on cell-4 — re-measure per box). The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -127,8 +127,8 @@ this order (fork → disk → load). The brief gate (`AGENT_BRIEF_REFUSED`, exit
 disk or load reading (agent-infra#2258), and a **brief refusal is deterministic**: it cannot clear by waiting, and
 re-dispatching the same brief on another box refuses there too — re-author the brief, do not retry. (A missing or
 incomplete validator returns **78** instead — `CANNOT VERIFY`; that one *is* repairable, by fixing the install rather than
-the brief.) The gate carries two ordering comments that disagree — "brief gate … FIRST" and "fork → disk → load"; the exit
-codes do not: 80 before 73.
+the brief.) The gate's own comments disagree about the order — `:1034` calls the disk refusal "evaluated FIRST" while `:1299`
+says "fork -> disk -> load"; the exit codes do not, and neither does the code: 80 before 73 before 77.
 
 1. **fork** — `AGENT_FORK_REFUSED`, exit **73**. A process-bound box refuses a spawn that would fork-bomb it; the remedy is
    a restart/drain, **not** waiting;
@@ -142,15 +142,17 @@ The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, a
 `MAX_LOAD` (75) clears because the box quietens on its own.** The rest clear when their **resource is released** or their
 **input changes** — a lane finishes or drains (73), disk is reclaimed or a lane finishes (77), the brief is re-authored (80),
 the install is repaired (78 — which also covers a bad invocation: an `unknown role` is a typo in the call, not a broken
-install, so read the emitted line), the repo's open-PR queue actually lands (74 — or, on its **other arm**, that worktree's origin
-is made a readable `owner/name` slug again, since 74 also fires when `land_backlog_repo` cannot derive one and landing does not
-fix that; a P0-blocker or a base-red repair is **exempt by evidence** and dispatches anyway). **Idling on its own changes none
-of them**: for 73
+install, so read the emitted line), the repo's open-PR queue actually lands (74). **74 has three arms and they do not share a
+remedy:** the ratio (`land_backlog_verdict` rc=1 — repo-wide, so land the queue and re-dispatching it elsewhere refuses too);
+the slug (`land_backlog_repo` cannot derive one: that worktree's `origin` is not an `owner/name` slug, **or `repo-slug.sh` is
+missing** — per-worktree or an install fault); and **rc=2, a failed `gh` read** (`UNREADABLE open-PR count` / `UNREADABLE
+landing rate`) — box-local, so fixing that box's gh chain clears it and **a re-dispatch to a healthy box does clear it**, even
+though the gate prints the ratio remedy text for it too. A P0-blocker or a base-red repair is **exempt by evidence** and
+dispatches under the hold. **Idling on its own changes none of them**: for 73
 and 77 the release *is* a lane draining, so the drain has to actually complete rather than just pass time — which is why the
 gate's own two messages read "does NOT clear by waiting" (fork) and "This is NOT a load refusal: waiting does not clear it"
 (headroom) while both still offer "or let its lanes drain" / "or let a lane finish". So diagnosing a 73, 77, 74, 78 or 80 as
-"the box is busy" and idling is the trap — **and on the ratio arm 74 is repo-wide**, so re-dispatching it to another box
-refuses there too (the slug arm is per-worktree, so a healthy clone elsewhere is unaffected).
+"the box is busy" and idling is the trap.
 
 **RAM is read by two other instruments — `spawn-gate.sh` reads NO memory at all.** The two floors live in `orch-loop.sh`
 (`MIN_MEM_FREE_MB`, default 512) and `capacity.sh` (`CAP_MIN_MEM_MB`, 512). The **scheduler** does budget per lane: `ai-drainer.sh`
@@ -201,9 +203,8 @@ A **disk-full** cell behaves exactly like a dead one: the control agent cannot w
 while the provider insists `running`. Measured 2026-10-19: cell-3 sat at 29.9/32 GB, CPU 77%, exec failing for an hour,
 having submitted nothing for 141–226 minutes.
 
-Recovery ladder, cheapest first. **Establish a channel before anything else.** Three of the readings below are *not* channel
-verdicts — classify them before acting, because the first one, which **is** a verdict, is listed with them only to say what it
-settles:
+Recovery ladder, cheapest first. **Establish a channel before anything else.** Two of the three readings below are *not*
+channel verdicts — the first one **is**, and it is listed with them only to say what it settles:
 
 - **A real refusal kills steps 1-2 outright**, whatever its cause — that one *is* a verdict. The channel that then answers is
   `cmux vm exec <vm> -- <cmd>` (it needs no `cmux-tui` daemon) — **unless `/` is nearly full**: a guest at 93 % has already
@@ -250,9 +251,13 @@ none of the reclaim steps below touch it.
    small act:** the unit is `KillMode=control-group`, so `sudo systemctl stop cmux-tui-daemon.service` SIGTERMs **every process
    in it** — and it needs `sudo` (an unprivileged `systemctl stop` is "Access denied"). That cgroup holds **45 processes at zero
    lanes and 124–207 with the box full** (cell-3, 2026-10-27), including live `pi` lanes, a running `pytest` and the terminal
-   hosts — re-count before you act, because they are lanes and they are what you lose. Run the work-at-risk check below across
-   every worktree on the box first, then: `sudo systemctl stop` the unit, delete `sessions/<id>/workspace-registry.sqlite3` (its
-   ~43 MB `-wal` regenerates), `sudo systemctl start` it, **then** re-read `df` — or recreate the box (also destructive).
+   hosts — **re-count before you act** with
+   `cat /sys/fs/cgroup/system.slice/cmux-tui-daemon.service/cgroup.procs | wc -l` (or `systemctl show -p Tasks`); they are lanes
+   and they are what you lose. You are also deleting the box's **terminal inventory** — the registry that steps 1-2 and the
+   display are the channel *through* — so afterwards `exec` or the console is the only way back. Run the work-at-risk check below
+   across every worktree on the box first, then: `sudo systemctl stop` the unit, delete `sessions/<id>/workspace-registry.sqlite3`
+   (its ~43 MB `-wal` regenerates), `sudo systemctl start` it, **then** re-read `df` — or recreate the box, which takes
+   `keys.env`, the harness pin and every `L-*.log` with it (copy them off first).
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -367,15 +372,16 @@ dispatch time, because both move.
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, but **needs activation (§1)** before it can land |
-| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — part of the fleet's lowest-core box, but the **same pinned `MAX_LANES=20` as the 16 GB ones** (§7): 20 is twice the core-derived 10, on a box §2's arithmetic puts nearer 6 lanes — and today the aid answers 2. Memory is what it runs out of (`dmesg`: 2 OOM kills) — re-read at dispatch |
+| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — the fleet's lowest-core box, but the **same pinned `MAX_LANES=20` as the 16 GB ones** (§7): 20 is twice the core-derived 10, on a box §2's arithmetic puts nearer 6 lanes — and today the aid answers 2. It has OOM-killed too (`dmesg`: 2), so **§2's rule is the same as cell-4's: reserve UP, fewer lanes** |
 | `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target, and **the box with the most OOM kills of the three (5)**: per §2 that means its reserve goes UP, i.e. fewer lanes here, not more |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
 ⛔ **TWO DIFFERENT CEILINGS — DO NOT CONFUSE THEM, AND DO NOT TREAT EITHER AS THE WHOLE ANSWER.** The owner ruled on
 2026-10-17 (`docs/ops/fleet-capacity.md`) that **between boxes** dispatch is gated on capacity, not a lane count — that is
 `cap_place`, and the objection is to a count standing in for capacity **across a fleet**. **Inside one box there IS a real
-ceiling**: `MAX_LANES` — `2.5 × cores` when unset (`orch-loop.sh`: `10#$_NCPU * 5 / 2`), **but the cells pin it**
-(`keys.env`: `export MAX_LANES=20`, and an explicit value wins), so **all three boxes enforce 20 regardless of core count**:
+ceiling**: `MAX_LANES` — `2.5 × cores` when unset (`orch-loop.sh`: `10#$_NCPU * 5 / 2`; **on the laptop it is rendered into the
+launchd plist** by `install.sh` from `launchd.plist.template`'s `__MAX_LANES__`), **but the cells pin it** (`keys.env`:
+`export MAX_LANES=20` — operator-pushed, so re-read it), and all three enforce 20 today regardless of core count:
 cell-3 (8 GB, 4 vCPU) and cell-4 (16 GB, 8 vCPU) both refuse at `lanes >= 20` (`GATE_WHY=lanes=N>=max_lanes=M`). That is
 exactly why the number cannot be trusted as capacity — on cell-3 it admits 20 lanes into 8 GB. It is real — and the *number* knows
 **neither disk nor RAM**. The controller's own refusals (`mem_avail <= MIN_MEM_FREE_MB`, default 512; the swap gate, which
@@ -403,11 +409,14 @@ not a load average measured earlier.
 - A stale heartbeat file does not mean the loop is dead (`orch-loop.log` mtime does).
 - Killing a controller is futile when launchd `KeepAlive` + a 20 s watchdog recreate it — and a lane can spawn one.
 - `TERM`/`INT` traps that swallow signals leave the script running: a stop/restart appears to hang (agent-infra#2085).
-- Deleting a worktree to make space must never destroy unpushed work, and the guard has to **fail closed**: `git rev-list
-  --count @{u}..HEAD` **errors and prints nothing** on a branch with no upstream — which is the branch whose every commit is
-  unpushed. Treat that error as UNSAFE, not as clean. On a cell, enumerate first — `git worktree list --porcelain` in every
-  repo on the box (22 trees on cell-3) — then per worktree: `git rev-list --count @{u}..HEAD 2>/dev/null || echo NO-UPSTREAM`,
-  `git stash list`, and `status --porcelain`. Preserve, then remove only the regenerable parts.
+- Deleting a worktree to make space must never destroy unpushed work, and the guard has to **fail closed AND read the right
+tree**: `git rev-list --count @{u}..HEAD` **errors and prints nothing** on a branch with no upstream — which is the branch
+  whose every commit is unpushed — so treat that error as UNSAFE, not as clean. Name the population (the repo, plus
+  `$CELL_HOME/wt-*`), then per worktree, always with `-C "$wt"` because every one of these commands is cwd-relative:
+  `git -C "$wt" rev-list --count --not --remotes HEAD` (**the positive reading**: commits reachable from no remote, which
+  answers even where `@{u}` is unset), `git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null || echo NO-UPSTREAM`,
+  `git -C "$wt" stash list`, and `git -C "$wt" status --porcelain`. A bare `status` exits 127 with empty output — which reads
+  exactly like clean, so guard it (`|| echo UNKNOWN`). Preserve, then remove only the regenerable parts.
 - **Capacity is a MEASUREMENT, not a constant.** Every earlier version of §2 substituted one number for the lane type and one
   for the reserve, and both errors ran in the direction that **refuses** dispatches it should allow. The figures in §2 carry
   their date and method so the next reader can re-derive them instead of inheriting them.
