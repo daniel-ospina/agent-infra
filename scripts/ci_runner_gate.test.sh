@@ -391,8 +391,8 @@ assert_contains "$OUT" "TRANSITION unknown -> local" "a live Actions incident ro
 # ⛔ agent-infra#2904 — THE THROUGHPUT (ABSORPTION) LEG. The measured defect: a run sat QUEUED for 3 h
 # while the component was operational, there was no Actions incident, and the queue was under the
 # length threshold — so every leg the gate had read HEALTHY while nothing could take the work. The
-# leg is a CONJUNCTION (work queued + queue head past the stall floor + NOTHING executing) and these
-# arms pin all three halves, plus the measured false-positive guard that motivated the conjunction:
+# leg is a CONJUNCTION (work queued + queue head past the stuck-after floor + NOTHING executing) and
+# these arms pin all three halves, plus the measured false-positive guard that motivated the conjunction:
 # on 2026-10-27 the live repo held a queue HEAD 3,943-12,583 s old while hosted was serving 2..14 runs, so
 # an age-only leg would have fired continuously on a healthy repo.
 echo "── #2904: a STALLED queue (healthy component, nothing executing) takes the fallback path ──"
@@ -400,7 +400,7 @@ run_gate stall GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK
 assert_eq "$RC" "0" "a stalled queue with a healthy component still exits 0 (it ACTS, it does not fail)"
 assert_contains "$OUT" "oldest_queued_s=36" "the probe reports the queue-wait age in SECONDS"
 assert_contains "$OUT" "in_progress=0" "the probe reports the absorption field it branched on"
-assert_contains "$OUT" "stall_threshold=1800" "the probe reports the floor it compared against"
+assert_contains "$OUT" "queue_stuck_after_s=1800" "the probe reports the floor it compared against"
 assert_contains "$OUT" "not absorbing" "the run NAMES the leg that failed, not just that something did"
 assert_contains "$OUT" "TRANSITION unknown -> local" "a stalled queue engages the script's OWN fallback path"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a stalled queue records mode=local"
@@ -463,20 +463,21 @@ assert_contains "$OUT" "oldest queued timestamp UNREADABLE" "an unparseable queu
 assert_absent "$STATE_DIR/ci-runner-gate.state" "an unparseable queue head advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an unparseable queue head relabelled no runner"
 
-# The stall floor is the other operand of the same numeric test, so it gets the same guard the queue
-# threshold got in #1704 — a non-numeric floor would error the comparison, which reads as HEALTHY.
+# The stuck-after floor is the other operand of the same numeric test, so it gets the same guard the
+# queue threshold got in #1704 — a non-numeric floor would error the comparison, which reads as
+# HEALTHY.
 run_gate stall-junk-threshold GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
-  CI_GATE_QUEUE_STALL_THRESHOLD=abc --
-assert_eq "$RC" "2" "an unreadable stall threshold → exit 2 (the comparison cannot run)"
-assert_contains "$OUT" "stall threshold UNREADABLE" "an unreadable stall threshold names the read failure"
-assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an unreadable stall threshold relabelled no runner"
+  CI_GATE_QUEUE_STUCK_AFTER_S=abc --
+assert_eq "$RC" "2" "an unreadable queue stuck-after floor → exit 2 (the comparison cannot run)"
+assert_contains "$OUT" "queue stuck-after floor UNREADABLE" "an unreadable queue stuck-after floor names the read failure"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an unreadable queue stuck-after floor relabelled no runner"
 
 # ⛔ MUTATION: each half of the conjunction must be load-bearing. Weakening the leg to EITHER half
 # alone must redden an arm above — otherwise the arms would pass for a leg that is one of the two
 # signals it is supposed to combine, and the measured false positive (age alone) or the measured
 # transient (in_progress alone) would come back with a green suite.
 echo "── #2904: MUTATIONS — both halves of the leg are load-bearing ──"
-MUT_ANCHOR='  if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STALL_THRESHOLD" ]; then'
+MUT_ANCHOR='  if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then'
 mutant_gate() { # <out> <replacement if-line>
   python3 - "$GATE" "$1" "$MUT_ANCHOR" "$2" <<'PY'
 import sys
@@ -489,7 +490,7 @@ PY
 }
 
 MUT1="$T/ci_runner_gate.mutant-ageonly.sh"
-if mutant_gate "$MUT1" '  if [ "$oldest_queued_s" -gt "$QUEUE_STALL_THRESHOLD" ]; then'; then
+if mutant_gate "$MUT1" '  if [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then'; then
   ok "(m1) the age-only mutant was generated from the SHIPPED gate (anchor present)"
   GATE_UNDER_TEST="$MUT1"
   run_gate mutant-ageonly GH_QUEUED=54 GH_INPROGRESS=13 GH_QUEUE_OLDEST_AGE=12400 GH_FALLBACK_N=0 --

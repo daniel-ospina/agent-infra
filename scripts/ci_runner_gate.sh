@@ -88,7 +88,16 @@ QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"   # queued runs = GitHub-hosted
 # 1800 s is above every measured healthy gap and detects the recorded stall ~1/6th of the way
 # through it. It is a health floor, not a target: a deep-but-serving queue (the 2..14 in_progress
 # samples above) never trips it, because the leg requires NOTHING to be executing.
-QUEUE_STALL_THRESHOLD="${CI_GATE_QUEUE_STALL_THRESHOLD:-1800}"   # seconds of queue wait, see above
+# ⛔ THE NAME IS DELIBERATE — do NOT rename it to `*_STALL_THRESHOLD` (agent-infra#2904, review).
+# #847/#1068 make `stall_threshold` a SINGLE authority: the tier-config vocabulary owns that name,
+# and `extensions/shared/heartbeat-progress-edges.ts`'s registry refuses a second term carrying
+# `/stall_?threshold/i` AND a value (`extensions/shared/heartbeat-progress-edges.test.ts` §4). A
+# queue-wait floor for CI health is a different bound from the agent stall threshold, so naming it
+# `QUEUE_STALL_THRESHOLD` would either claim a `value: null` pointer to #847 (false — this value is
+# owned here) or collide with that boundary. `STUCK` is a declared family token and `_S` a declared
+# bound suffix, so the #1068 reverse scan SEES this declaration and its registry row is enforced
+# (see `QUEUE_STUCK_AFTER_S` there) rather than escaping both scan directions.
+QUEUE_STUCK_AFTER_S="${CI_GATE_QUEUE_STUCK_AFTER_S:-1800}"   # seconds of queue wait, see above
 # The custom label that makes a job land on the LOCAL pool.
 FALLBACK_LABEL="ubuntu-latest"
 # ⛔ THERE IS NO LONGER A SINGLE "pool label" (agent-infra#2327). The pool holds two
@@ -227,7 +236,7 @@ print(age)
   # it cannot run before `queued` has been shape-checked as a number.
   if [ "$queued" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
 
-  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress stall_threshold=$QUEUE_STALL_THRESHOLD"
+  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
   ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"
 
   # ⛔ SHAPE-CHECK THE COUNT TOO (agent-infra#1704). `comp` was shape-checked; `queued` was not, so
@@ -278,9 +287,9 @@ print(age)
     '' | *[!0-9]*) log "oldest queued age UNREADABLE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
     ??????????*)  log "oldest queued age OUT OF RANGE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
-  case "$QUEUE_STALL_THRESHOLD" in
-    '' | *[!0-9]*) log "stall threshold UNREADABLE ('${QUEUE_STALL_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
-    ??????????*)  log "stall threshold OUT OF RANGE ('${QUEUE_STALL_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  case "$QUEUE_STUCK_AFTER_S" in
+    '' | *[!0-9]*) log "queue stuck-after floor UNREADABLE ('${QUEUE_STUCK_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "queue stuck-after floor OUT OF RANGE ('${QUEUE_STUCK_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
   if [ "$comp" != "operational" ] || [ "$incident" != "0" ] || [ "$queued" -ge "$QUEUE_THRESHOLD" ]; then
@@ -294,8 +303,8 @@ print(age)
   # for the few seconds between a push and its first dispatch, so it needs the age floor. Fail ⇒
   # "hosted is not absorbing", which is precisely the state whose sanctioned exit is this script's
   # own fallback path — NOT a change to when the pool is offered (see the header's decision).
-  if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STALL_THRESHOLD" ]; then
-    UNHEALTHY_LEG="throughput leg: queued=$queued and NO run executing while the oldest queued run has waited ${oldest_queued_s}s > ${QUEUE_STALL_THRESHOLD}s — GitHub-hosted is not absorbing the queue"
+  if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then
+    UNHEALTHY_LEG="throughput leg: queued=$queued and NO run executing while the oldest queued run has waited ${oldest_queued_s}s > ${QUEUE_STUCK_AFTER_S}s — GitHub-hosted is not absorbing the queue"
     return 1   # not absorbing -> prefer local
   fi
   return 0     # healthy   -> prefer GitHub
