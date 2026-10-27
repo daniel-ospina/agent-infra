@@ -73,7 +73,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle to a ~150 MB ceiling** — the idle FLOOR re-measured on cells 3–4, 2026-10-27 (5.5 MB minimum); the 149 MB ceiling is the earlier 21–149 MB sample's maximum, **not** re-measured (same-day maxima: 105 MB on cell-3, 147 MB on cell-4 — re-measure per box). The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle, typically 8–105 MB** — measured across cells 3–4, 2026-10-27 — but **seen at 313 MB on cell-1**, so do not treat ~150 MB as a ceiling (the earlier 21–149 MB sample covered only cells 3–4). Re-measure per box. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -120,6 +120,9 @@ printf 'more_lanes=%s (ram=%s disk=%s, target=%s)\n' "$more" "$ram_more" "$disk_
 # 0 means MEASURE BEFORE DISPATCHING. It is never "this box can do no work" — and never a licence to
 # clamp the disk term to 1: a disk-zero is the state that does NOT clear by waiting (see §3).
 # `free` is Linux-only; on the macOS laptop this prints ram=UNREADABLE by design — use `vm_stat` there.
+# EXIT STATUS: every path exits 0, including the two `seeds:` refusals and the UNKNOWN/UNREADABLE abstentions.
+# The ANSWER is the printed `more_lanes=` value — read stdout, never the exit code (a caller that tests `$?`
+# sees a refusal as success).
 ```
 
 ⚠️ **WHAT THE GATE ACTUALLY REFUSES** (read 2026-10-27) — **brief admission answers first**, then the capacity refusals in
@@ -127,8 +130,10 @@ this order (fork → disk → load). The brief gate (`AGENT_BRIEF_REFUSED`, exit
 disk or load reading (agent-infra#2258), and a **brief refusal is deterministic**: it cannot clear by waiting, and
 re-dispatching the same brief on another box refuses there too — re-author the brief, do not retry. (A missing or
 incomplete validator returns **78** instead — `CANNOT VERIFY`; that one *is* repairable, by fixing the install rather than
-the brief.) The gate's own comments disagree about the order — `:1034` calls the disk refusal "evaluated FIRST" while `:1299`
-says "fork -> disk -> load"; the exit codes do not, and neither does the code: 80 before 73 before 77.
+the brief.) The gate's own comments disagree about the order — the comment above `AGENT_DISK_REFUSED` calls the disk refusal
+"evaluated FIRST" (search that phrase) while the fork-gate block says "fork -> disk -> load"; cite the phrase, not a line
+number, because these anchors moved within hours of being written. The exit codes and the code agree with the second: 80 before
+73 before 77.
 
 1. **fork** — `AGENT_FORK_REFUSED`, exit **73**. A process-bound box refuses a spawn that would fork-bomb it; the remedy is
    a restart/drain, **not** waiting;
@@ -260,7 +265,8 @@ none of the reclaim steps below touch it.
    Run the work-at-risk check below across every worktree on the box first, then: `sudo systemctl stop` the unit, delete
    `sessions/<id>/workspace-registry.sqlite3` (its ~43 MB `-wal` regenerates), `sudo systemctl start` it, **then** re-read `df` —
    or recreate the box, which takes the whole guest: **every worktree** (the unpushed commits that check exists for), `keys.env`,
-   the harness pin and every `L-*.log`.
+   the harness pin and `orchestrator/logs` + `orchestrator/state` (the `merge-*.log`, `orch-loop.log`, `landed.txt`,
+   `dispatched.txt` — the evidence §4/§5 use to say what happened).
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -375,7 +381,7 @@ dispatch time, because both move.
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, and **activated in the operative home** (`/tmp/cell-home`: `record-review.sh` + the `gh` shim, merge lanes ran on it 2026-10-27). Its `/home/cmux` home has **no `gh` shim**, so check which `HOME` a lane will get before expecting it to land |
-| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — the fleet's lowest-core box, but the **same pinned `MAX_LANES=20` as the 16 GB ones** (§7): 20 is twice the core-derived 10, on a box §2's arithmetic puts nearer 6 lanes — and today the aid answers 2. It has OOM-killed too (`dmesg`: 2), so **§2's rule is the same as cell-4's: reserve UP, fewer lanes** |
+| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — the fleet's lowest-core box, but the **same pinned `MAX_LANES=20` as the 16 GB ones** (§7): 20 is twice the core-derived 10, on a box §2's arithmetic puts nearer 6 lanes and whose own aid now answers 2–3. It has OOM-killed too (`dmesg`: 2), so **§2's rule is the same as cell-4's: reserve UP, fewer lanes** |
 | `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target, and **the box with the most OOM kills of the three (5)**: per §2 that means its reserve goes UP, i.e. fewer lanes here, not more |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
@@ -412,22 +418,43 @@ not a load average measured earlier.
 - A stale heartbeat file does not mean the loop is dead (`orch-loop.log` mtime does).
 - Killing a controller is futile when launchd `KeepAlive` + a 20 s watchdog recreate it — and a lane can spawn one.
 - `TERM`/`INT` traps that swallow signals leave the script running: a stop/restart appears to hang (agent-infra#2085).
-- Deleting a worktree to make space must never destroy unpushed work, and the guard has to **read the right tree, in the right
-  population, and fail closed.** Three traps, each measured on a cell:
-  - `git rev-list --count @{u}..HEAD` **errors and prints nothing** on a branch with no upstream — often the branch holding the
-    unpushed work — so treat that error as UNSAFE, not as clean.
+- Deleting a worktree to make space must never destroy unpushed work, and the guard has to **read the right trees, in a
+  population sized to what you are destroying, and fail closed.** Four traps, each measured on a cell:
+  - `git rev-list --count '@{u}..HEAD'` **exits 128 with empty stdout** on a branch with no upstream — often the branch
+    holding the unpushed work — so an error is UNSAFE, never clean.
   - **`--not` negates every revision after it**, so `rev-list --count --not --remotes HEAD` counts nothing and prints `0` for a
-    worktree that has unpushed commits (measured: `0` as written, `1` corrected, same tree). Put the positive end first:
-    `git -C "$wt" rev-list --count HEAD --not --remotes`.
-  - **The population is not `$CELL_HOME/wt-*`.** `fix-one.sh` mints `$REPO/.worktrees/fix-<pr>`; on cell-3 that repo held **25**
-    worktrees (11+ with commits reachable from no remote) while `$CELL_HOME/wt-*` held **2**. Derive it:
-    `git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}'`, plus a bounded sweep for unregistered checkouts.
-  Then, per worktree — always `-C "$wt"`, and **assert the path first** (`[ -d "$wt" ] && git -C "$wt" rev-parse --git-dir
-  >/dev/null 2>&1 || { echo "UNKNOWN $wt"; continue; }`), because `git -C ""` silently reads the operator's own cwd:
-  `git -C "$wt" rev-list --count HEAD --not --remotes || echo UNKNOWN`,
-  `git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null || echo NO-UPSTREAM`, `git -C "$wt" stash list || echo UNKNOWN`, and
-  `git -C "$wt" status --porcelain || echo UNKNOWN` (a bare `status` exits 127 with empty output, which reads exactly like
-  clean). Preserve, then remove only the regenerable parts.
+    worktree that has unpushed commits (measured `0` as written, `1` corrected, same tree). Positive end first.
+  - **The population depends on the destruction.** Deleting a *worktree* needs its repo's trees; a **recreate** takes the whole
+    guest, and on cell-3 the repo the guard was pointed at held 25 trees while the box held **75 across three repos, 9 of the
+    other 50 with commits reachable from no remote**. `$CELL_HOME/wt-*` held **2** — it is not the population.
+  - **`HEAD` is not the box's work.** Local branches that are no worktree's HEAD still die on a recreate (8 on cell-3), so a
+    recreate also needs a branch sweep. And `$REPO` is only defined if you sourced `keys.env` — unset, `git -C ""` silently
+    enumerates *your* checkout, so the block asserts `$REPO` itself before enumerating (a bad `$REPO` would otherwise print
+    nothing and exit 0).
+  Run it as a loop, never as loose lines: `continue` outside a loop is a no-op, so a missing path would fall through and every
+  arm would read the caller's own cwd — printing `0`, which reads exactly like clean.
+  ```bash
+  if ! { [ -n "${REPO:-}" ] && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; }; then
+    echo "AT-RISK-UNKNOWN repo=${REPO:-<unset>}"; exit 1
+  fi
+  for wt in $(git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}'); do
+    if ! { [ -d "$wt" ] && git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; }; then
+      echo "AT-RISK-UNKNOWN $wt"; continue
+    fi
+    n=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null) || n=UNKNOWN
+    d=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d " ") || d=UNKNOWN
+    echo "WT $wt unpushed=$n dirty=$d"
+  done
+  git -C "$REPO" stash list          # refs-wide: once per repo, never once per tree
+  # a RECREATE additionally loses local branches that are no worktree's HEAD
+  git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads |
+    while read -r b; do
+      n=$(git -C "$REPO" rev-list --count "$b" --not --remotes 2>/dev/null) || n=UNKNOWN
+      [ "$n" = 0 ] || echo "BRANCH-AT-RISK $b $n"
+    done
+  ```
+  A `WT`/`BRANCH-AT-RISK` line with `UNKNOWN` is an error, not a zero — and for a recreate, repeat the whole block for **every
+  repo on the box**, not just `$REPO`. Preserve, then remove only the regenerable parts.
 - **Capacity is a MEASUREMENT, not a constant.** Every earlier version of §2 substituted one number for the lane type and one
   for the reserve, and both errors ran in the direction that **refuses** dispatches it should allow. The figures in §2 carry
   their date and method so the next reader can re-derive them instead of inheriting them.
