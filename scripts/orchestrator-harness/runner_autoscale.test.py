@@ -3117,13 +3117,23 @@ def t29_floor_follows_the_gate():
         len(notes) == 1 and "REMOVED" in notes[0],
         f"…and the removal must be SAID, not silent: {notes}",
     )
-    # …and the same for a HOSTED image name: a self-hosted runner claiming `ubuntu-22.04` makes a
-    # hosted job run here on another OS, which is a false PASS rather than a queue delay.
-    notes = []
-    got = ra.resolve_labels(
-        carried, "x86_64", notes=notes, current=["self-hosted-x64", "ubuntu-22.04"], gate_mode="github"
-    )
-    check(got == "self-hosted-x64", f"github ⇒ a carried ubuntu-<version> is DROPPED too: {got!r}")
+    # …and the same for a HOSTED image name — and this family is stripped in EVERY mode, because
+    # `ci_runner_gate.sh` owns only `ubuntu-latest` (`:205`) and its `labels_for()` preserves every
+    # other label, so NOTHING else would ever remove a mis-set `ubuntu-22.04`. A self-hosted runner
+    # claiming it makes a hosted job run here on another OS: a false PASS, not a queue delay.
+    for gate in ("github", "local", None):
+        notes = []
+        got = ra.resolve_labels(
+            carried, "x86_64", notes=notes, current=["self-hosted-x64", "ubuntu-22.04"], gate_mode=gate
+        )
+        check(
+            "ubuntu-22.04" not in got,
+            f"{gate} ⇒ a carried ubuntu-<version> is DROPPED in every mode: {got!r}",
+        )
+        check(
+            any("REMOVED" in x for x in notes),
+            f"{gate} ⇒ …and the removal must be SAID, not silent: {notes}",
+        )
     # `local` and a MISSING record must NOT strip it: the floor owns arming, and `None` is not intent
     # ("with no state file the pool stays exactly as the gate left it").
     got = ra.resolve_labels(
@@ -3926,8 +3936,94 @@ def t54_destroy_removes_unreadable_tree():
     check(not os.path.exists(path), f"{path} survived destroy() — a green run would leak it")
 
 
+@test("T55 a credential RESTORE that writes SHORT, or fails, is reported — never silent")
+def t55_restore_cannot_lose_the_key_quietly():
+    """THE OTHER HALF OF FIX 2's FAILURE LEG (review finding P2, reproduced at the reviewed head).
+    `_restore_local_config` stashes `(mode, bytes)` and puts them back — but it called `os.write`
+    ONCE and IGNORED the return, and its `except OSError` was `pass`.
+
+    Both are silent, and both land on the box that is out of space, which is exactly the state the
+    disk arm exists for: `os.write` returns a SHORT COUNT under ENOSPC and raises NOTHING, so
+    `.credentials_rsaparams` — the runner's RSA PRIVATE KEY — was left TRUNCATED with no exception
+    (measured: 16 of 1,263 bytes). And a restore that failed outright returned `None`, so the caller
+    could not tell it from success and the record named only the ORIGINAL failure while the install
+    had lost `.runner` too — `discover()` stops seeing it, its slot reads FREE, and the next pass
+    adds a SECOND install over the top.
+    """
+    key = b"K" * 1263
+    stash = {".runner": (0o644, b"R" * 1000), ".credentials_rsaparams": (0o600, key)}
+    real_write = os.write
+    real_open = os.open
+    try:
+        # (1) A SHORT WRITE IS LOOPED, and every byte lands. `bytes(b)[:16]` makes each call return
+        # 16, which is the ENOSPC shape without a real full disk.
+        short = tempfile.mkdtemp(prefix="restore-short-")
+
+        def short_write(fd, buf):
+            return real_write(fd, bytes(buf)[:16])
+
+        os.write = short_write
+        problems = ra._restore_local_config(short, stash)
+        check(problems == [], f"a short write must be LOOPED, not reported: {problems}")
+        sizes = {n: os.stat(os.path.join(short, n)).st_size for n in stash}
+        check(
+            sizes == {n: len(d) for n, (_, d) in stash.items()},
+            f"a short write must still land every byte — a truncated RSA key is silent corruption: "
+            f"{sizes}",
+        )
+        modes = {n: oct(os.stat(os.path.join(short, n)).st_mode & 0o777) for n in stash}
+        check(
+            modes == {".runner": "0o644", ".credentials_rsaparams": "0o600"},
+            f"the loop must not lose the stashed mode either: {modes}",
+        )
+
+        # (2) NO PROGRESS is a failure, not an infinite loop and not success.
+        stuck = tempfile.mkdtemp(prefix="restore-stuck-")
+        os.write = lambda fd, buf: 0
+        problems = ra._restore_local_config(stuck, stash)
+        check(
+            len(problems) == len(stash) and all("short write" in p for p in problems),
+            f"a write that makes NO progress must be reported, not looped on: {problems}",
+        )
+
+        # (3) AN OUTRIGHT FAILURE is returned, so the caller's `ActionFailed` can state BOTH facts.
+        gone = tempfile.mkdtemp(prefix="restore-gone-")
+
+        def no_space(*a, **k):
+            raise OSError(28, "No space left on device")
+
+        os.open = no_space
+        problems = ra._restore_local_config(gone, stash)
+        check(
+            len(problems) == len(stash) and all("could NOT be restored" in p for p in problems),
+            f"a restore that fails must be REPORTED, never `pass`-ed: {problems}",
+        )
+    finally:
+        os.write = real_write
+        os.open = real_open
+        for d in (short, stuck, gone):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 MUTATIONS = [
     # ── review round 12: the 2026-10-27 second-review findings (one mutation per claim) ──
+    Mutation(
+        "T55",
+        '                view = memoryview(data)\n                while view:\n                    written = os.write(fd, view)\n                    if written <= 0:\n                        raise OSError(\n                            f"short write: {len(view)} of {len(data)} byte(s) left unwritten"\n                        )\n                    view = view[written:]',
+        '                os.write(fd, data)  # MUTATION: the return is ignored, so a short write truncates the key',
+        "a disk that fills mid-file makes `os.write` return a SHORT COUNT and raise nothing, so the "
+        "runner's RSA private key (`.credentials_rsaparams`) is restored TRUNCATED — silently, on "
+        "exactly the box the disk arm exists for",
+    ),
+    Mutation(
+        "T55",
+        '            problems.append(f"{name} could NOT be restored ({exc})")',
+        "            pass  # MUTATION: a failed restore is silent again",
+        "a restore that fails OUTRIGHT returns no problems, so the caller cannot tell it from "
+        "success: the record names only the original failure while the install has lost `.runner` "
+        "and its key — `discover()` stops seeing it, its slot reads FREE, and the next pass adds a "
+        "SECOND install over the top",
+    ),
     Mutation(
         "T50",
         "    except RuntimeError as exc:",
@@ -4095,10 +4191,19 @@ MUTATIONS = [
     ),
     Mutation(
         "T29",
-        '    return low == FALLBACK_LABEL or low.startswith("ubuntu-")',
-        "    return low == FALLBACK_LABEL  # MUTATION: a hosted image label is not gate-owned",
+        '    return label.strip().lower().startswith("ubuntu-")',
+        '    return False  # MUTATION: a hosted image label is not recognised as one',
         "a self-hosted runner re-claims `ubuntu-22.04`, so a job asking for that HOSTED image runs "
-        "here on another OS — a false PASS, not a queue delay",
+        "here on another OS — a false PASS, not a queue delay — and no gate owns that label, so "
+        "nothing else ever removes it",
+    ),
+    Mutation(
+        "T29",
+        "    hosted = list(",
+        "    hosted = [] if gate_mode != \"github\" else list(  # MUTATION: the hosted-image strip is gated",
+        "a mis-set `ubuntu-22.04` survives under `local` (a box ACTIVELY serving CI) and under `None` "
+        "(a cell, where no gate runs at all): the same hosted-image false PASS is left open in the "
+        "two modes nothing else cleans up",
     ),
     Mutation(
         "T29",
@@ -4407,14 +4512,14 @@ MUTATIONS = [
     ),
     Mutation(
         "T5",
-        '    except OSError as exc:\n        _restore_local_config(directory, stash)',
+        '    except OSError as exc:\n        lost = _restore_local_config(directory, stash)',
         '    except OSError as exc:\n        pass',
         "a clear that fails partway leaves the install half-cleared (no .runner: invisible, slot FREE)",
     ),
     Mutation(
         "T6",
-        "    finally:\n        if previous_sigterm is not None:\n            signal.signal(signal.SIGTERM, previous_sigterm)\n        if not registered:\n            _restore_local_config(directory, stash)",
-        "    finally:\n        if previous_sigterm is not None:\n            signal.signal(signal.SIGTERM, previous_sigterm)\n        if not registered and \"rc\" in locals() and rc != 0:\n            _restore_local_config(directory, stash)",
+        "    finally:\n        if previous_sigterm is not None:\n            signal.signal(signal.SIGTERM, previous_sigterm)\n        if not registered:\n            lost = _restore_local_config(directory, stash)",
+        "    finally:\n        if previous_sigterm is not None:\n            signal.signal(signal.SIGTERM, previous_sigterm)\n        if not registered and \"rc\" in locals() and rc != 0:\n            lost = _restore_local_config(directory, stash)",
         "the restore is gated on the rc check, so a RAISE between the clear and the rc drops the stash",
     ),
     Mutation(

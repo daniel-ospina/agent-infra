@@ -1123,20 +1123,25 @@ def pool_serves_fallback(pool: dict[str, PoolEntry]) -> bool:
     return any(FALLBACK_LABEL in e.labels for e in pool.values())
 
 
-def _gate_owned_label(label: str) -> bool:
-    """TRUE for a label whose presence the GATE decides — never the runner that carries it.
+def _hosted_image_label(label: str) -> bool:
+    """TRUE for a HOSTED image name (`ubuntu-latest`, `ubuntu-22.04`, …).
 
-    Two families, and both are labels a self-hosted install must not assert on its own:
-      * the fallback label (`ubuntu-latest`) — armed ONLY by the floor/engagement arms below; and
-      * `ubuntu-<version>` (e.g. `ubuntu-22.04`) — a HOSTED image name, so a self-hosted runner
-        claiming it makes a hosted job run here, on a different OS ("a false PASS, not a delay").
+    ⛔ THIS FAMILY IS NOT THE GATE'S, SO ITS STRIP IS NOT GATED. `ci_runner_gate.sh:205` — "The one
+    label this gate owns is `ubuntu-latest`" — and its `labels_for()` preserves every OTHER label as
+    `extra` (`:220-224`), so nothing ever removes a mis-set `ubuntu-22.04` from the pool. It is THIS
+    file's own invariant (see the header) that such a label must stay claimed by NO self-hosted
+    runner: a runner claiming `ubuntu-22.04` makes a job asking for that HOSTED image run here instead,
+    on a different OS — the "false PASS, not a delay" class.
 
-    A label outside both families is a custom/tier tag and is preserved untouched: dropping one
-    would make the workflows that target it queue for ever, which is the failure `_preserve_labels`
-    exists to avoid.
+    A label outside both families (`tier-gold`, a pool tag) is a custom label and is preserved
+    untouched: dropping it would make the workflows that target it queue for ever.
     """
-    low = label.strip().lower()
-    return low == FALLBACK_LABEL or low.startswith("ubuntu-")
+    return label.strip().lower().startswith("ubuntu-")
+
+
+def _is_fallback_label(label: str) -> bool:
+    """TRUE for the one label the GATE owns and arms — see `resolve_labels` for its shape."""
+    return label.strip().lower() == FALLBACK_LABEL
 
 
 def label_floor_binds(pool: dict[str, PoolEntry], gate_mode: str | None) -> bool:
@@ -1256,6 +1261,37 @@ def resolve_labels(
     # a repeated label is a `config.sh` argument GitHub rejects.
     if floor or engaged:
         labels.append(FALLBACK_LABEL)
+    # ⛔ TWO FAMILIES, TWO SCOPES — THEY MUST NOT SHARE ONE `if` (review finding P1, round 14).
+    #
+    # (1) `ubuntu-<version>` other than the fallback is NOT a label the gate owns: `ci_runner_gate.sh`
+    #     says so itself (`:205` "The one label this gate owns is `ubuntu-latest`") and its
+    #     `labels_for()` preserves every other label as `extra`, so NOTHING ever removes a mis-set
+    #     `ubuntu-22.04` — not the gate, and (before this term) not this tool either. So it is stripped
+    #     in EVERY mode, because this file's own invariant (see the header) is that a hosted image name
+    #     stays claimed by NO self-hosted runner: under `local` the box is ACTIVELY serving, so a job
+    #     for that hosted image would run here on another OS, and under `None` (a cell — no gate runs
+    #     there at all) nothing else will ever clean it up.
+    #     ⛔ It cannot fight the floor: the floor only ever ADDS the fallback label.
+    # (2) The FALLBACK label is the gate's, so its strip is scoped to a READABLE, SCHEDULED `github`
+    #     record — the long note below has the measurement and the reasoning. `local` keeps what it has
+    #     (the floor owns arming there) and `None` is not intent (the pool stays as the gate left it).
+    hosted = list(
+        dict.fromkeys(
+            x for x in labels if _hosted_image_label(x) and not _is_fallback_label(x)
+        )
+    )
+    if hosted:
+        labels = [x for x in labels if x not in hosted] or [arch]
+        hosted_reason = (
+            f"{', '.join(hosted)} is REMOVED from this registration rather than preserved: a "
+            "self-hosted runner claiming a HOSTED image name makes a job that asked for that image "
+            "run here instead, on a different OS — and no gate owns this label, so nothing else "
+            "would ever remove it"
+        )
+        if notes is not None:
+            notes.append(hosted_reason)
+        else:
+            print(f"  · {hosted_reason}", flush=True)
     # ⛔ THE GATE WINS OVER EVERYTHING ABOVE, INCLUDING OVER WHAT THE RUNNER ALREADY CARRIES AND
     # OVER THE ENGAGEMENT ARM (review finding P1, round 13). Preservation is unconditional, so a
     # repair in the window between the gate recording `github` and its own `fallback_off` wrote
@@ -1268,18 +1304,12 @@ def resolve_labels(
     # ⛔ THE `engaged` ARM IS UNDONE HERE TOO, DELIBERATELY: "the pool still advertises it" is the
     # pre-`fallback_off` window, and `github` is the gate's answer about that window — not a second
     # opinion about the pool's current contents.
-    # ⛔ `ubuntu-<version>` GOES WITH IT. A self-hosted runner claiming `ubuntu-22.04` makes a job
-    # asking for that HOSTED image run here instead — the "false PASS, not a delay" class the header
-    # names, and neither label is host-derived, so `_preserve_labels` kept them.
-    # ⛔ AND IT IS SCOPED TO A READABLE `github` RECORD. `local` keeps what it has (the floor owns
-    # arming, and a strip there would fight the floor), and `None` is not intent: with no state file
-    # the pool stays exactly as the gate left it (`label_floor_binds`'s own rule).
     if gate_mode == "github":
         # Deduped: `labels` can hold the same label twice at this point (preserved AND appended by
         # the engagement arm), and a note that says `ubuntu-latest, ubuntu-latest` reads as a bug.
-        gate_owned = list(dict.fromkeys(x for x in labels if _gate_owned_label(x)))
+        gate_owned = list(dict.fromkeys(x for x in labels if _is_fallback_label(x)))
         if gate_owned:
-            labels = [x for x in labels if not _gate_owned_label(x)] or [arch]
+            labels = [x for x in labels if not _is_fallback_label(x)] or [arch]
             dropped_reason = (
                 f"the gate records `github`, so {', '.join(gate_owned)} is REMOVED from this "
                 "registration rather than preserved: the pool serves CI only while GitHub-hosted "
@@ -1550,13 +1580,22 @@ def _clear_local_config(directory: Path) -> dict[str, tuple[int, bytes]]:
                 stash[name] = (path.stat().st_mode & 0o777, path.read_bytes())
                 path.unlink()
     except OSError as exc:
-        _restore_local_config(directory, stash)
-        raise ActionFailed(f"cannot clear {directory}/{name} for re-registration ({exc})") from exc
+        lost = _restore_local_config(directory, stash)
+        raise ActionFailed(
+            f"cannot clear {directory}/{name} for re-registration ({exc})"
+            + (
+                f" — and {len(lost)} of {len(stash)} stashed config file(s) could NOT be put back "
+                f"({'; '.join(lost)}), so this install may no longer be discoverable: check it "
+                f"before the next pass adds a second one over the top"
+                if lost
+                else ""
+            )
+        ) from exc
     return stash
 
 
-def _restore_local_config(directory: Path, stash: dict[str, tuple[int, bytes]]) -> None:
-    """Put the stashed local config back, AT ITS ORIGINAL MODE, in one atomic creation.
+def _restore_local_config(directory: Path, stash: dict[str, tuple[int, bytes]]) -> list[str]:
+    """Put the stashed local config back, AT ITS ORIGINAL MODE, and RETURN what could not go back.
 
     ⛔ `os.open(..., mode)` RATHER THAN `write_bytes` + `chmod`. Written the naive way the file is
     created 0644 under the usual umask and only then narrowed, so (a) `.credentials_rsaparams` — the
@@ -1564,18 +1603,42 @@ def _restore_local_config(directory: Path, stash: dict[str, tuple[int, bytes]]) 
     foreign-owned mount) the swallowed error leaves it 0644 FOR EVER, silently. Creating it with the
     mode means there is no window and no second failure mode; `os.fchmod` keeps ANY stashed mode
     exact rather than trusting the umask.
+
+    ⛔ AND A SHORT WRITE IS NOT A SUCCESS — the same argument, one level down (review finding P2,
+    reproduced: a patched `os.write` returning 16 of 1,263 bytes left a TRUNCATED
+    `.credentials_rsaparams` and raised nothing). A disk that fills mid-file makes `os.write` return
+    FEWER bytes than asked and raise NOTHING, so the naive one-shot call silently truncates the RSA
+    private key on exactly the box that is out of space — which is the state the disk arm exists for.
+    The loop below writes until the whole buffer is out, and treats a zero/negative return as the
+    failure it is.
+
+    ⛔ AND A RESTORE THAT FAILS IS REPORTED, NOT `pass`-ED. Returning the problems (rather than
+    swallowing them) lets the caller put "N of M config files could NOT be restored" into the
+    `ActionFailed` it was already raising, so the record states BOTH facts. A silent failure here is
+    the worst state this file knows: the install has lost `.runner` and its key, `discover()` stops
+    seeing it, its slot reads FREE to the provisioner, and the same pass adds a SECOND install over
+    the top.
     """
+    problems: list[str] = []
     for name, (mode, data) in stash.items():
         path = Path(directory) / name
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
             try:
                 os.fchmod(fd, mode)
-                os.write(fd, data)
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError(
+                            f"short write: {len(view)} of {len(data)} byte(s) left unwritten"
+                        )
+                    view = view[written:]
             finally:
                 os.close(fd)
-        except OSError:
-            pass  # best effort: the raise that follows already names the real failure
+        except OSError as exc:
+            problems.append(f"{name} could NOT be restored ({exc})")
+    return problems
 
 
 def _config_argv(cfg: Path, repo: str, token: str, name: str, labels: str, replace: bool):
@@ -1666,7 +1729,17 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
         if not registered:
-            _restore_local_config(directory, stash)
+            lost = _restore_local_config(directory, stash)
+            if lost:
+                # ⛔ RAISED FROM THE `finally`, ON PURPOSE (review finding P2). The original failure is
+                # still chained into the traceback ("During handling of the above exception …"), and
+                # the restore failure is the fact a reader must not miss: the install has lost the
+                # files that make it discoverable, so the next pass can add a SECOND one over it.
+                raise ActionFailed(
+                    f"{name} could not be re-registered AND {len(lost)} of {len(stash)} stashed "
+                    f"config file(s) could NOT be put back ({'; '.join(lost)}) — the install may no "
+                    "longer be discoverable, and its slot can read FREE to the provisioner"
+                )
     # ⛔ A REGISTERED RUNNER WITH NO ENABLED UNIT IS NOT LIVE. Configuring the unit used to be
     # best-effort, so a `svc.sh install` / `systemctl enable` failure still returned "registered",
     # the caller counted it as live and reported `converged` while no listener would ever start —
