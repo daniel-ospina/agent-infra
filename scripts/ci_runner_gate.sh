@@ -41,6 +41,54 @@ STATE_DIR="${CI_GATE_STATE_DIR:-$HOME/.pi/agent/state}"
 STATE_FILE="$STATE_DIR/ci-runner-gate.state"
 LOG_FILE="$STATE_DIR/ci-runner-gate.log"
 QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"   # queued runs = GitHub-hosted backlog
+# ── the THROUGHPUT (absorption) leg — agent-infra#2904 ─────────────────────────────────────────
+# ⛔ LENGTH IS NOT ABSORPTION. `queued < 60` says "not a stampede"; it cannot say "work is moving".
+# Measured 2026-10-27, daniel-ospina/tortoise: a run sat QUEUED from 10:26Z to 13:28Z — 3 h — while
+# all three existing legs read healthy (component operational, no incident, queue < 60), and every
+# `runs-on: ubuntu-latest` job in the repo had no runner that could accept it. A CI stop the gate
+# itself certifies as healthy is worse than a red check: nothing pages, nothing reddens.
+#
+# What the leg measures, and WHY IT IS NOT "oldest queued run age" ALONE. Measured on this repo,
+# a long wait is NORMAL: over 13 sampled days (1,000 runs per day, 2026-10-14…27) the longest
+# run-level queue wait was 388,923 s on 2026-10-15, 63,052 s on 2026-10-24 and 40,687 s on 2026-10-23,
+# and a live sample of 21 consecutive readings (13:56-14:12Z on 2026-10-27) found the queue HEAD
+# 3,943-12,583 s old WHILE HOSTED WAS SERVING (in_progress 2..14, queue draining 86 -> 25). A stale
+# entry sits at the head while newer runs are dispatched, so a leg keyed on that age would have fired
+# CONTINUOUSLY through a period in which hosted was demonstrably absorbing. So the leg is a
+# CONJUNCTION: work is queued, the oldest queued run has waited past the floor, AND nothing at all
+# is executing.
+#
+# ⛔ IN mode=github THIS IS A HOSTED READING. The pool's custom labels are `self-hosted-*`, so it
+# never advertises `ubuntu-latest` in that mode, and no workflow in the repo asks for a
+# `self-hosted` label (measured 2026-10-27: 0 of 39 files in .github/workflows name `self-hosted`
+# in a `runs-on:`). So `in_progress > 0` in mode=github means hosted is executing. In FALLBACK mode
+# pool jobs can hold `in_progress` above zero — the gate then reads absorption and returns to
+# github, which is the SAME drain-then-restore cycle the existing queue leg already has by
+# construction (an engaged fallback drains the queue below `queued >= 60`).
+#
+# THE FLOOR, AND THE CLOCK IT IS MEASURED ON — because queue time is not run time, and this repo
+# has already burned that distinction (#3239). The number below is the age of a QUEUED run, i.e.
+# `now - created_at` of a run that has never been assigned a runner: the queue-wait clock. It is
+# NOT wall-clock duration of a run, and `run_started_at` is NOT usable as a dispatch marker — for a
+# queued run GitHub sets it equal to `created_at` at queue entry (measured: run 40508520800 created
+# 2026-10-27T13:01:55Z, `run_started_at` 13:01:55Z, first job dispatched 13:23:59Z on
+# `GitHub Actions 1000636018`), so a run-level "wait" of hours reads identically to a run that
+# started instantly.
+#
+# 1800 s = 2x the largest measured healthy silence. Measured across 13 days / 1,000 runs per day:
+#   * dispatch is normally INSTANT: 12,624 of the 13,000 sampled runs had a zero-second queue wait
+#     (only 376, 2.9%, waited at all) — a repo with work queued and NOTHING executing is nothing
+#     like its own normal state, however old its queue head happens to be;
+#   * the longest gap between consecutive run starts WHILE runs were still being created (so a
+#     queue existed) was 920 s (2026-10-15), 830 s (2026-10-16), 598 s (2026-10-25), 492 s
+#     (2026-10-14), 407 s (2026-10-27);
+#   * the incident itself: the run created 2026-10-27T10:26:21Z was still queued 10,899 s later at
+#     the issue's 13:28Z reading (and 12,583 s at a 13:56Z reading taken for this change), with
+#     in_progress = 0.
+# 1800 s is above every measured healthy gap and detects the recorded stall ~1/6th of the way
+# through it. It is a health floor, not a target: a deep-but-serving queue (the 2..14 in_progress
+# samples above) never trips it, because the leg requires NOTHING to be executing.
+QUEUE_STALL_THRESHOLD="${CI_GATE_QUEUE_STALL_THRESHOLD:-1800}"   # seconds of queue wait, see above
 # The custom label that makes a job land on the LOCAL pool.
 FALLBACK_LABEL="ubuntu-latest"
 # ⛔ THERE IS NO LONGER A SINGLE "pool label" (agent-infra#2327). The pool holds two
@@ -57,6 +105,11 @@ HOST_LABEL_ARM64="ARM64"
 HOST_LABEL_X64="X64"
 # Never managed here: the scheduler's own automatic labels, and the one label this gate owns.
 AUTO_LABELS=" self-hosted Linux $FALLBACK_LABEL "
+
+# Set by `evaluate` for the reason line (a leg that fails must be NAMED, not just counted).
+UNHEALTHY_LEG=""
+ABSORPTION_OLDEST_S=""
+ABSORPTION_IN_PROGRESS=""
 
 DRY=0; STATUS_ONLY=0
 for a in "$@"; do
@@ -75,9 +128,12 @@ need gh; need curl; need python3
 
 # ── health probe ────────────────────────────────────────────────────────────────
 # Unhealthy if: the Actions component is not operational, OR an incident mentions
-# Actions, OR the queued backlog exceeds the threshold. The component alone is NOT
-# sufficient — a live Actions incident has been observed with the component still
-# reading "operational".
+# Actions, OR the queued backlog exceeds the threshold, OR the queue is NOT BEING
+# ABSORBED (agent-infra#2904 — work queued past the stall floor while nothing at all
+# is executing). The component alone is NOT sufficient — a live Actions incident has
+# been observed with the component still reading "operational" — and neither are
+# length-and-status alone: a run sat queued 3 h against an operational component, no
+# incident and a queue under the length threshold, with no runner able to take it.
 probe_status() {
   curl -fsS --max-time 20 https://www.githubstatus.com/api/v2/summary.json 2>/dev/null || return 1
 }
@@ -124,10 +180,55 @@ print(comp, len(inc))
     *) log "actions component UNREADABLE ('${comp}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
   case "$incident" in '' | *[!0-9]*) log "incident count UNREADABLE ('${incident}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
-  queued="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=1" --jq '.total_count' 2>/dev/null)" \
+  # ⛔ ONE READ CARRIES BOTH QUEUE FACTS (agent-infra#2904): the count the existing leg already
+  # used, and the `created_at` of the OLDEST queued run the throughput leg needs. `per_page=100`
+  # rather than 1 so the page holds the whole queue and `min(created_at)` is the true head of it.
+  # The page cap cannot hide the oldest run where it matters: the runs endpoint is newest-first, so
+  # a queue LARGER than 100 under-reports the age — but such a queue is already >= QUEUE_THRESHOLD
+  # (60), which the leg below returns unhealthy on first. So whenever the throughput leg's verdict
+  # can decide anything, it is reading every queued run.
+  queue_row="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=100" \
+      --jq '[.total_count, (([.workflow_runs[].created_at]|min)//"")]|@tsv' 2>/dev/null)" \
     || { log "queue probe FAILED (gh api)"; return 2; }
+  queued="${queue_row%%$'\t'*}"; oldest_created="${queue_row#*$'\t'}"
+  # ⛔ THE SECOND READ IS THE ABSORPTION FIELD, and it is the ONLY input the throughput leg adds
+  # (#2904). `in_progress` is the count of runs GitHub is currently executing for this repo; in
+  # mode=github that is hosted executing, because the pool does not advertise `ubuntu-latest` and no
+  # workflow asks for a `self-hosted` label. One extra API call per scheduled pass. gh's stderr is
+  # captured so a failed read CARRIES ITS REASON (the #1704 enumeration lesson: a failure reported
+  # without what the API said is a failure nobody can act on).
+  in_progress_raw="$(gh api "repos/$REPO/actions/runs?status=in_progress&per_page=1" --jq '.total_count' 2>&1)" \
+    || { log "in-progress probe FAILED (gh api) — FAIL-CLOSED, changing nothing; ${in_progress_raw:0:300}"; return 2; }
+  in_progress="${in_progress_raw%%$'\n'*}"
+  # THE QUEUE-WAIT CLOCK, computed here so the log line can carry seconds rather than a timestamp.
+  # Empty when there is no queued run to age (a readable zero, not a failed read); a timestamp that
+  # cannot be parsed, or one in the FUTURE (a clock skew no reading can resolve), leaves it empty and
+  # the shape check below refuses the whole pass — it is never rounded down to "recently queued" and
+  # never rounded up to "stalled".
+  oldest_queued_s=""
+  case "$oldest_created" in
+    '') : ;;
+    *)  oldest_queued_s="$(python3 -c '
+import datetime, sys
+t = sys.argv[1]
+try:
+    d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+except ValueError:
+    sys.exit(1)
+age = int(datetime.datetime.now(datetime.timezone.utc).timestamp() - d.timestamp())
+if age < 0:
+    sys.exit(1)
+print(age)
+' "$oldest_created" 2>/dev/null)" || oldest_queued_s="" ;;
+  esac
 
-  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued threshold=$QUEUE_THRESHOLD"
+  # A queue with NOTHING in it has no head to age. That is a readable zero (an idle repo), not a
+  # failed read: it leaves the leg inert instead of refusing the pass. Guarded as a STRING compare so
+  # it cannot run before `queued` has been shape-checked as a number.
+  if [ "$queued" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
+
+  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress stall_threshold=$QUEUE_STALL_THRESHOLD"
+  ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"
 
   # ⛔ SHAPE-CHECK THE COUNT TOO (agent-infra#1704). `comp` was shape-checked; `queued` was not, so
   # a successful probe that yielded `null`/empty (a schema change, a proxy body, a truncated read)
@@ -158,8 +259,44 @@ print(comp, len(inc))
     ??????????*) log "queue threshold OUT OF RANGE ('${QUEUE_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
+  # ⛔ THE THROUGHPUT LEG'S OPERANDS ARE SHAPE-CHECKED EXACTLY AS THE EXISTING ONES ARE, for the
+  # same reason (agent-infra#1704): an unreadable number makes `[ … -gt … ]` ERROR, and the `||`
+  # chain reads a failed test as FALSE — i.e. HEALTHY — which RELABELS the pool off `ubuntu-latest`
+  # on a value that was never read. A leg that errors is could-not-measure (2): here that means the
+  # gate takes NO action at all, neither "healthy" nor "unhealthy-but-act" (#2904's fail-closed
+  # requirement).
+  case "$in_progress" in
+    '' | *[!0-9]*) log "in_progress count UNREADABLE ('${in_progress}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "in_progress count OUT OF RANGE ('${in_progress}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+  # A queued run exists, so its age MUST be a measurement: empty here means the timestamp did not
+  # parse (or was in the future), which is a failed read of the queue head, not "young queue".
+  if [ "$queued" -gt 0 ] && [ -z "$oldest_queued_s" ]; then
+    log "oldest queued timestamp UNREADABLE ('${oldest_created}') — FAIL-CLOSED, changing nothing"; return 2
+  fi
+  case "$oldest_queued_s" in
+    '' | *[!0-9]*) log "oldest queued age UNREADABLE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "oldest queued age OUT OF RANGE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+  case "$QUEUE_STALL_THRESHOLD" in
+    '' | *[!0-9]*) log "stall threshold UNREADABLE ('${QUEUE_STALL_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "stall threshold OUT OF RANGE ('${QUEUE_STALL_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+
   if [ "$comp" != "operational" ] || [ "$incident" != "0" ] || [ "$queued" -ge "$QUEUE_THRESHOLD" ]; then
+    UNHEALTHY_LEG="queue/component/incident leg: queued=$queued (threshold $QUEUE_THRESHOLD), component=$comp, incidents=$incident"
     return 1   # unhealthy -> prefer local
+  fi
+  # ⛔ THE THROUGHPUT LEG (agent-infra#2904). Work is queued, the oldest queued run has waited past
+  # the floor, AND nothing is executing. The conjunction is the point: measured on this repo, a
+  # queue head 12,583 s (3 h 29 m) old coexists with 14 runs executing (hosted serving normally), so
+  # an age clause alone would fire continuously on a healthy repo; and `in_progress == 0` alone fires
+  # for the few seconds between a push and its first dispatch, so it needs the age floor. Fail ⇒
+  # "hosted is not absorbing", which is precisely the state whose sanctioned exit is this script's
+  # own fallback path — NOT a change to when the pool is offered (see the header's decision).
+  if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STALL_THRESHOLD" ]; then
+    UNHEALTHY_LEG="throughput leg: queued=$queued and NO run executing while the oldest queued run has waited ${oldest_queued_s}s > ${QUEUE_STALL_THRESHOLD}s — GitHub-hosted is not absorbing the queue"
+    return 1   # not absorbing -> prefer local
   fi
   return 0     # healthy   -> prefer GitHub
 }
@@ -357,13 +494,19 @@ fi
 
 if [ "$healthy" = 0 ]; then
   want="github"
-  reason="GitHub Actions healthy (component operational, no Actions incident, queue < $QUEUE_THRESHOLD)"
+  reason="GitHub Actions healthy (component operational, no Actions incident, queue < $QUEUE_THRESHOLD, queue absorbing: oldest_queued_s=$ABSORPTION_OLDEST_S in_progress=$ABSORPTION_IN_PROGRESS)"
 else
   want="local"
-  reason="GitHub-hosted UNHEALTHY — routed CI to the local pool"
+  reason="GitHub-hosted UNHEALTHY — ${UNHEALTHY_LEG:-unknown leg}; routed CI to the local pool"
 fi
 
 prev="$(cat "$STATE_FILE" 2>/dev/null || echo unknown)"
+
+# ⛔ LOG THE REASON ON THE PATH THAT ACTS, not only in --dry-run (#2904). The reason names the LEG
+# that decided — "not absorbing" vs "queue over threshold" — and without it the durable log records
+# what the gate did while the reader has to reconstruct why. The transition notification carries the
+# same text; this is the copy that survives when the notification's transport does not.
+log "reason=$reason"
 
 if [ "$DRY" = 1 ]; then
   echo "dry-run: mode=$mode want=$want prev=$prev reason=$reason"
