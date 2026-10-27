@@ -288,6 +288,14 @@ Every row now prints the rule that decided it and the proof it used
 (`rule=4 … proof=pr-merged head-ref fix/x state=MERGED (#9862)`), so a KEEP that
 cannot name its evidence is visibly a bug rather than a verdict:
 
+⚠️ **A KEEP row never wears a REMOVE rule's number.** `rule=3` and `rule=4` both mean "remove" in the
+table below, so a preserve printed as `rule=3` was counted as a removal by anything grepping
+`rule=3` — the mirror of the rule-6 defect above. Rows that abort a removal arm therefore carry the
+pre-existing `rule=P` label and name the suppressed rule in words (`rule=P would-be-rule=3 …`), so the
+KEEP/REMOVE partition stays readable from the log alone. `main-proof-vanished` is the reason such a
+row carries: the ancestry proof that put the checkout in the removal path **did not reproduce** on the
+re-take, and a proof that cannot be retaken removes nothing.
+
 | # | condition (all previously applicable rules still hold) | verdict |
 |---|---|---|
 | 1 | a process has the tree, or **any path inside it**, as cwd, or names it in argv | KEEP |
@@ -551,7 +559,8 @@ ONE machine-readable line —
 ```
 SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferred_remove=<n>
         removed=<n> failed=<n> late_preserved=<n> prune_blocked=<0|1> reasons=<reason>:<n>,…
-        main_proof=<auto|local|unavailable|auto-unfetched|ambiguous> pr_merged=<ok|na|unavailable>
+        main_proof=<auto|local|unavailable|auto-unfetched|ambiguous>
+        main_ref=<refs/heads/…|refs/remotes/…|?> pr_merged=<ok|na|unavailable>
 ```
 
 — and the record lifts it into `candidates_worktree=` (the delegate's own `remove=`),
@@ -575,7 +584,11 @@ scan: `want_class` was true and the record says `verdict_<class>=misconfigured` 
 setup-failure arms deselect it (`WANT_VENV=0`, because there is nothing left for it to measure), so
 its counters read `not-run` there. Neither token is a count — a refusal (`FAIL-CLOSED gh
 unavailable`) is not a measurement, and a measured zero beside an unknown classification is the
-false PASS this record exists to remove.
+false PASS this record exists to remove. Two of the five classes cannot answer the CANDIDATE count on
+every pass and say so rather than guessing `0`: `uv` (its owner publishes no tally, so an ARMED pass —
+which has no `DRY-RUN` rows to count — records `candidates_uv=?`), and `duplicate-install` only when its
+own `SUMMARY … candidates=<n>` did not answer (that delegate prints it in BOTH modes, so an armed pass
+normally CAN answer).
 
 `watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
 `internal`, see **Bounded execution** above), so "the bound was real" is answerable
@@ -881,8 +894,8 @@ A shell at its prompt answers "yes, someone is here" for ever, and that single f
 checkouts accumulated on cell-4 while the logs said `KEEP … (a live process has it as cwd)`. A lane
 between turns still holds its `pi`/test **child**, so it is not demoted; a lane that finished and left
 its pane or its `cd` behind is. Every other gate is untouched (`dirty`, `ignored-artifact`, `open-pr`,
-`too-recent`, `detached-unreachable`, `remote-only-ref`), so the blast radius of a wrong reading is a
-re-created env or checkout — never uncommitted or unpushed work. Every unprovable input (pid not in the
+`too-recent`, `detached-unreachable`, `remote-only-ref`, `main-proof-vanished`), so the blast radius
+of a wrong reading is a re-created env or checkout — never uncommitted or unpushed work. Every unprovable input (pid not in the
 `ps` table, unreadable start time, undatable HEAD, failed probe) leaves the holder **live**, and each
 demotion is named in the pass log (`stale-shell:` / `STALE-SHELL`) and in the row
 (`unref=stale-shell:<pids>`). `REAP_VENV_IDLE_SHELL=0` / `REAP_WT_IDLE_SHELL=0` restore the strict

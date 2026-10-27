@@ -842,6 +842,22 @@ EOF
     return 0
 }
 
+# ancestry_candidates_text — the refs the ancestry test actually TRIED, for a row that says "not in main".
+# A row that names only the LOCAL ref is wrong on the cell the remote resolution exists for: with
+# `main_proof=auto` and no usable local tracking ref it read `<no-main-ref>` for a non-ancestry that was
+# established against the resolved remote oid. Same list, same order, as the test itself.
+ancestry_candidates_text() {
+    local out="" t
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        out="${out}${out:+,}${t}"
+    done <<EOF
+${RESOLVED_MAIN}
+${MAIN_REF}
+EOF
+    printf '%s' "${out:-?}"
+}
+
 # ── probes ─────────────────────────────────────────────────────────────
 # canonical_token_match <line> <canon> — true when a token of <line> resolves
 # into <canon>. Needed because git records the RESOLVED path while argv keeps
@@ -1682,7 +1698,11 @@ classify_one() {
         # row printing `... ${MAIN_REF}=0` would cite a command that returns 1. See ancestry_proof_text.
         proof_txt="$(ancestry_proof_text "$sha")"
         if [ -z "$proof_txt" ]; then
-            printf 'preserve\tmain-proof-vanished\t\trule=3 the ancestry proof that put this row in the removal path does NOT reproduce now (tried %s then %s) — a proof that cannot be retaken removes nothing\n' \
+            # ⛔ `rule=P`, NOT `rule=3`: rule 3 is a REMOVE in the table, and printing a KEEP row as
+            # `rule=3` makes `grep 'rule=3'` report preserves as removals — the mirror of the defect the
+            # rule-6 preserve row already carries a ⛔ for (#2756 review, P2). The suppressed rule is
+            # named in words so the row still says which decision it aborted.
+            printf 'preserve\tmain-proof-vanished\t\trule=P would-be-rule=3 the ancestry proof that put this row in the removal path does NOT reproduce now (tried %s then %s) — a proof that cannot be retaken removes nothing\n' \
                 "${RESOLVED_MAIN:-<no-resolved-main>}" "${MAIN_REF:-<no-main-ref>}"
             return 0
         fi
@@ -1735,7 +1755,7 @@ classify_one() {
     # ── RULE 5: closed without a merge, head not an ancestor — a human's call
     if [ "$pr_state" = "CLOSED" ]; then
         printf 'preserve\tpr-closed-unmerged\t\trule=5 proof=pr-closed %s state=CLOSED%s head-not-in=%s — the work was never merged; branch/refs survive and NOTHING was removed\n' \
-            "$pr_key" "$prnum_note" "${MAIN_REF:-<no-main-ref>}"
+            "$pr_key" "$prnum_note" "$(ancestry_candidates_text)"
         return 0
     fi
 

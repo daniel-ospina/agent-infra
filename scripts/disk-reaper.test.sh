@@ -162,6 +162,16 @@ ENVNAME=""
 # INSIDE a `\`-continued list ends the command word, so every assignment before
 # it stops being part of the invocation's environment and the pass silently runs
 # against the REAL $HOME — 79 unrelated assertions went red that way once.
+# ⛔ HERMETIC, LIKE THE SIBLING SUITE. `REAP_WT_MAIN_PROOF` defaults to `auto`, which issues a real
+# `git ls-remote` against whatever origin a fixture carries — and T55's fixtures carry REAL github
+# origins, so the entry-point suite's outcome depended on host connectivity and an offline runner paid
+# `REAP_WT_GIT_TIMEOUT` per call. `pi-reap-worktrees.test.sh:459` already pins this; the `${…:-local}`
+# form keeps every case that deliberately exercises `auto` able to override it (T3 does: it proves the
+# remote-oid path against a LOCAL BARE origin, which is offline already).
+# ⚠️ THIS BLOCK SITS ABOVE THE ASSIGNMENT CHAIN ON PURPOSE — see the RULE 7 note: a comment line put
+# INSIDE a `\`-continued list ends the command word, and the pass then silently runs against the REAL
+# $HOME. It cost 79 unrelated red assertions the first time this file learned it (and it happened
+# again, to 124, when this note first landed in the wrong place).
 run_reaper() { # run_reaper <args...>
     HOME="$T/home" \
     DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" \
@@ -177,6 +187,7 @@ run_reaper() { # run_reaper <args...>
     REAP_VENV_LOG="$T/$ENVNAME/state/reap-lane-venvs.log" \
     REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}" \
     REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES:-0}" \
+    REAP_WT_MAIN_PROOF="${REAP_WT_MAIN_PROOF:-local}" \
     REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-1}" \
     VENV_REAPER="${VENV_REAPER:-}" \
     WORKTREE_REAPER="${WORKTREE_REAPER:-}" \
@@ -260,14 +271,14 @@ INIT_T3="$("$REAL_GIT" -C "$REPO" rev-list --max-parents=0 refs/heads/main | hea
 "$REAL_GIT" -C "$REPO" update-ref refs/remotes/origin/main "$INIT_T3"
 "$REAL_GIT" -C "$REPO" merge-base --is-ancestor "$WT_M_SHA" refs/remotes/origin/main >/dev/null 2>&1; RC=$?
 assert_eq "$RC" "1" "T3 precondition: the LOCAL main ref does NOT contain this head (a local citation would be false)"
-OUT="$(run_reaper --dry-run --repo "$REPO" --aged-days 7 --only worktree 2>&1)"
+OUT="$(REAP_WT_MAIN_PROOF=auto run_reaper --dry-run --repo "$REPO" --aged-days 7 --only worktree 2>&1)"
 ROW_T3="$(grep -A1 -F "remove   $WT_M" <<<"$OUT")"
 assert_contains "$ROW_T3" "refs=merged" "T3 the head is still proved landed — by the REMOTE's tip"
 assert_contains "$ROW_T3" "proof=merge-base --is-ancestor $WT_M_SHA $ORIGIN_T3_TIP=0" \
     "T3 the row cites the command that ANSWERED (the resolved remote oid)"
 assert_absent "$ROW_T3" "$WT_M_SHA refs/remotes/origin/main=0" \
     "T3 ... never the stale local ref, whose cited command returns 1"
-OUT="$(run_reaper --apply --repo "$REPO" --aged-days 7 --only worktree 2>&1)"; RC=$?
+OUT="$(REAP_WT_MAIN_PROOF=auto run_reaper --apply --repo "$REPO" --aged-days 7 --only worktree 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T3 the apply pass exits 0"
 assert_nodir "$WT_M" "T3 --apply removed the merged checkout (pass said: $(printf '%s' "$OUT" | grep -E 'remove |REMOVED|FAILED' | tr '\n' ' '))"
 # ⛔ THE PASS'S TALLY, LIFTED INTO THE RECORD. `freed_df=1MB` on its own reads as success; these
@@ -2779,9 +2790,11 @@ rm -rf "$CANON"
 # return `misconfigured` at all, so the re-derivation was ALWAYS wrong on that path.
 # ⛔ AND THE COUNT HAS THE SAME SHAPE. `misconfigured` measured NOTHING, so a confident
 # `candidates=0` beside `verdict_uv=misconfigured` is an invented zero — the "reads as a passing pass"
-# failure this report exists to remove. The uv class keeps no `HAVE_UV_CAND` sentinel, so its
-# unanswerable state reaches the record through `VERDICT_UV`; the LINE said `?` and the RECORD said
-# `0`, which is the same disagreement one field over.
+# failure this report exists to remove. The uv class now carries its OWN `HAVE_UV_CAND` sentinel (the
+# first cut keyed the verdict instead, which conflated "could not be SET UP" with "RAN and failed
+# closed" and still reported `0` for an armed pass that has no rows to count), so the unanswerable
+# state reaches the record through that sentinel; the LINE said `?` and the RECORD said `0`, which is
+# the same disagreement one field over.
 # Without this case the suite stays GREEN with either half reverted — no other assertion in this
 # file reads a class line's `verdict=`.
 ENVNAME=t60
@@ -2825,6 +2838,78 @@ assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "ver
     "T60 ... beside the verdict that explains why"
 assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "candidates_uv=not-run" \
     "T60 a class that was NOT SELECTED says not-run, not ? and not 0"
+# ⛔ THE FOURTH STATE: the delegate RAN and could not measure. `fail-closed` is NOT `misconfigured`
+# (a different remedy), and it is not a measurement either — so the record must claim no count. The
+# first cut of this fix keyed only `misconfigured` and reported `candidates_uv=0` beside
+# `verdict_uv=fail-closed`, which is the same invented zero one state over.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "pi-cache-reap: FAIL-CLOSED — census unreadable"' \
+    'exit 3' >"$T/t60-uv3.sh"
+chmod +x "$T/t60-uv3.sh"
+OUT="$(CACHE_REAPER="$T/t60-uv3.sh" run_reaper --dry-run --only uv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T60 a uv delegate that RAN and failed closed is RED (3)"
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "verdict_uv=fail-closed" "T60 ... the verdict keeps 'ran and failed' distinct from 'could not be set up'"
+assert_contains "$ST60" "candidates_uv=?" "T60 ... and a class that MEASURED nothing claims no count"
+assert_absent "$ST60" "candidates_uv=0" "T60 ... never an invented zero for a class that ran"
+# ⛔ AND THE ARMED PASS, WHERE THE uv OWNER PUBLISHES NO TALLY. The candidate count in a dry pass comes
+# from our scan of `DRY-RUN uv …` rows; an armed pass has none and pi-cache-reap reports no total, so
+# the answer is `?` — the counter is only assigned in the dry branch, which made every armed pass record
+# `candidates_uv=0` (a measured-looking zero beside work that really happened).
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "cache=uv:/tmp/t60-no-such-cache"; exit 0 ;; esac' \
+    'echo "pi-cache-reap: uv /tmp/t60-no-such-cache -> 0KB (prune=0 evicted=0) max=1MB — UNDER its bound"' \
+    'exit 0' >"$T/t60-uv-apply.sh"
+chmod +x "$T/t60-uv-apply.sh"
+OUT="$(CACHE_REAPER="$T/t60-uv-apply.sh" run_reaper --apply --only uv 2>&1)"; RC=$?
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "verdict_uv=ok" "T60 the armed uv class succeeds"
+assert_contains "$ST60" "candidates_uv=?" "T60 an ARMED uv pass does not invent a count either (no tally exists)"
+assert_absent "$ST60" "candidates_uv=0" "T60 ... the initialised 0 never reaches the record"
+# ⛔ THE SIBLING *CAN* ANSWER ON AN ARMED PASS, and did not: `reap-duplicate-installs.sh` prints
+# `SUMMARY … candidates=<n>` in BOTH modes, but the entry point assigned the counter only in the dry
+# branch, so an armed pass recorded a structural 0 beside `reaped=` work it had just done. Lift the
+# owner's own number — never re-derive it from row counts.
+mkdir -p "$T/t60/dup-root/fam-a"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *--print-config*) echo "roots='"$T"'/t60/dup-root"; exit 0 ;; esac' \
+    'echo "SUMMARY class=duplicate-install mode=apply families=1 candidates=3 reaped=1 kept=2 failed=0 census=ok rows=1 pids=0 aged=60m"' \
+    'exit 0' >"$T/t60-dup-apply.sh"
+chmod +x "$T/t60-dup-apply.sh"
+OUT="$(DUP_INSTALL_REAPER="$T/t60-dup-apply.sh" run_reaper --apply --only duplicate-install 2>&1)"; RC=$?
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "candidates_duplicate_install=3" \
+    "T60 an ARMED duplicate-install pass lifts the owner's own candidate count"
+assert_absent "$ST60" "candidates_duplicate_install=0" "T60 ... instead of the structural 0 it used to record"
+# ⛔ A HALF-ANSWERED TALLY IS NOT AN ANSWER, and the venv arm let one suppress its own fallback.
+# `have_venv_tally` was set on `venvs_found=` ALONE while `reapable=` — the field the candidate count
+# actually comes from — was parsed opportunistically. So a line TRUNCATED after `venvs_found=` (a
+# delegate dying mid-write) claimed an answer with `sum_v_cand=0`, and that same flag then suppressed
+# the row-count fallback, so the `REAP` rows the pass had just scanned were DISCARDED: the record read
+# `classified_venv=3 candidates_venv=0 tally_venv=1/1` — "three classified, nothing to do, fully
+# covered" — which is the false PASS this report exists to remove, one field over. The count must come
+# from the row we scanned and the coverage must say the repo did NOT answer.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "[stub] venvs_found=3"' \
+    "echo \"REAP dead-lane 12MB $T/t60/venv-root/.venv\"" \
+    'exit 0' >"$T/t60-venv-trunc.sh"
+chmod +x "$T/t60-venv-trunc.sh"
+OUT="$(VENV_REAPER="$T/t60-venv-trunc.sh" run_reaper --dry-run --repo "$REPO60" --only venv 2>&1)"; RC=$?
+ST60="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST60" "candidates_venv=1" \
+    "T60 a half-answered venv tally does not suppress the row-count fallback"
+assert_absent "$ST60" "candidates_venv=0" \
+    "T60 ... so the REAP row the pass scanned is never reported as a measured 0"
+assert_contains "$ST60" "tally_venv=0/1" \
+    "T60 ... and its coverage says the repo did NOT answer"
+assert_contains "$ST60" "classified_venv=?" \
+    "T60 ... nor is a classified count invented out of the half-tally"
+# ⛔ AND A DESELECTED CLASS IS NOT AN UNMEASURED ONE. `--only venv` leaves the other four classes
+# `not-run`, which is a third state and NOT a hole in the total — requiring `want && have` for every
+# class printed `candidates=?` on every single-class pass, including this one whose venv arm answered.
+# A sentinel that always fires carries no information, so this pins the polarity rather than the value.
+assert_contains "$(grep -F 'pass end' <<<"$OUT")" "candidates=1" \
+    "T60 a class that was never SELECTED does not taint the pass-end total"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

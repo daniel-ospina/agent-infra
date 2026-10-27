@@ -1170,6 +1170,20 @@ OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" REAP_WT_TREE_TS=1 REAP_WT_MIN_AGE_MINUTES_O
 # worktree is deferred is not fixed — assert the ROW SHAPE, not a path.
 assert_eq "$(grep -cF 'reason=deferred' <<<"$OUT")" "1" "A7 budget exhausted => exactly one deferred row"
 assert_contains "$(footer $ENV)" "DEFERRED=1" "A7 footer DEFERRED=1"
+# ⛔ THE IDENTITIES MUST BE CHECKED ON A PASS THAT ACTUALLY HAS A DEFERRAL. On a clean pass
+# `deferred=0`, so `examined = classified + deferred` degenerates to `examined = classified` and
+# `classified = remove + preserved` to `classified = preserved`: the three-term variant
+# (`classified = remove + preserved + deferred`) that the VGATE reviewer caught would satisfy BOTH and
+# the identity assertions would be vacuous. This is the pass where a deferral exists, so the split
+# (`deferred` vs `deferred_remove`) and the two identities are load-bearing here.
+SUM7="$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)"
+_a7i() { sed -n "s/.* $1=\([0-9][0-9]*\).*/\1/p" <<<"$SUM7" | head -1; }
+assert_contains "$SUM7" "SUMMARY examined=" "A7 the deferred pass prints its SUMMARY line"
+assert_eq "$(_a7i deferred)" "1" "A7 the SUMMARY carries the deferral (otherwise the identities below are vacuous)"
+assert_eq "$(_a7i examined)" "$(( $(_a7i classified) + $(_a7i deferred) ))" \
+    "A7 examined = classified + deferred WITH a deferral in play"
+assert_eq "$(_a7i classified)" "$(( $(_a7i remove) + $(_a7i preserved) ))" \
+    "A7 classified = remove + preserved WITH a deferral in play (a deferred record is NOT classified)"
 OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" REAP_WT_TREE_TS=1 REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     GIT_BIN_OVERRIDE="$T/bin/git-veryslow-status" REAP_WT_STATUS_TIMEOUT=30 \
     REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --apply --repo "$REPO")"

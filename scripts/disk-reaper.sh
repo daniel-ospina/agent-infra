@@ -199,6 +199,14 @@ HAVE_WT_CAND=0
 DEFERRED_REMOVE_WT=0
 HAVE_VENV_TALLY=0
 HAVE_VENV_CAND=0
+# ⛔ THE OTHER TWO CLASSES GET REAL SENTINELS TOO. `uv` and `duplicate-install` publish no tally of
+# their own, and overloading the VERDICT for the purpose was wrong twice: `fail-closed` (the delegate
+# RAN and could not measure) is not a measurement either, and an ARMED pass has no `DRY-RUN` rows to
+# count for uv at all. So `HAVE_*_CAND` says "this pass MEASURED the count", set only where a
+# measurement actually happened: uv's dry-run row scan, and dup's dry sweep or its owner's own
+# `SUMMARY candidates=` (which the dup delegate prints in BOTH modes).
+HAVE_UV_CAND=0
+HAVE_DUP_CAND=0
 VENV_TALLY_COVER=0/0
 WT_TALLY_COVER=0/0
 RC_UV=0; RC_VENV=0; RC_WT=0; RC_DUP=0
@@ -330,31 +338,33 @@ _tally_rec() {
     [ -n "$3" ] && printf '%s' "$3" || printf '?'
 }
 
-# _class_rec <verdict> <want> <value> — the pass-record form for a class that publishes NO tally
-# sentinel of its own. `uv` keeps no `HAVE_UV_CAND`/`HAVE_UV_TALLY`, and `duplicate-install` keeps no
-# `HAVE_DUP_CAND`: their fail-closed arms publish no tally and leave the counter at its initialised 0,
-# so "could not be SET UP" and "not selected" both look like a measured `0` to `_tally_rec`. For these
-# two classes the VERDICT *is* the sentinel, and it discriminates all three states:
+# _class_rec <verdict> <want> <have> <value> — the pass-record form for a class that publishes no
+# TALLY of its own (`uv`, `duplicate-install`). Four states, and the ORDER is the whole point:
 #
-#     misconfigured -> `?`         (selected, could not be set up: NOTHING was measured)
-#     not-run      -> `not-run`    (not selected: nothing to measure)
+#     misconfigured -> `?`         (selected, could not be SET UP: NOTHING was measured)
+#     not-run      -> `not-run`    (the class was not selected: nothing to measure)
+#     want != 1    -> `not-run`    (deselected by a setup-failure arm that also resets WANT_*)
+#     have != 1    -> `?`          (selected, but THIS PASS measured no count: a refusal, or an armed
+#                                   pass with no tally to lift — a `0` here is an INVENTED zero)
 #     otherwise    -> the value, or `?` if it is empty
 #
-# ⛔ The ORDER is the whole point: `misconfigured` is tested FIRST because those arms also reset
-# `WANT_*` to 0, and asking `want` first would report `not-run` for a class that WAS selected and
-# failed to run — erasing the distinction #2036 exists to keep. Same polarity as `_tally_rec`'s
-# unanswerable arm: a class that never ran has no measured value, and a `0` there is an INVENTED zero.
-# Without this the pass-end line said `candidates=?` (the guard in `main`) while the record of the
-# SAME pass said `candidates_uv=0` — the two-surfaces-disagree defect this pass exists to remove, one
-# surface over — and `duplicate-install` still carried it beside `candidates_venv=not-run`.
-# ⛔ A class that DOES publish a sentinel keeps `_tally_rec`: that is the stronger evidence, and a
-# second definition of "measured" is how the two surfaces drift apart again.
+# ⛔ `misconfigured` is tested FIRST because those arms also reset `WANT_*` to 0, and asking `want`
+# first would report `not-run` for a class that WAS selected and failed to run — erasing the
+# distinction #2036 exists to keep.
+# ⛔ `have` is NOT redundant with the verdict: `fail-closed` means the delegate RAN and could not do the
+# work, which is also not a measurement, and an armed uv pass has no rows to count at all. Overloading
+# the verdict for this (the first cut of this fix) left `candidates_uv=0` beside `verdict_uv=fail-closed`,
+# and recorded `0` on every armed pass — the same invented zero, one state over.
+# ⛔ A class that DOES publish a tally keeps `_tally_rec`: that is the stronger evidence, and a second
+# definition of "measured" is how the two surfaces drift apart again.
 _class_rec() {
     case "${1:-not-run}" in
-        misconfigured) printf '?' ;;
-        not-run)       printf 'not-run' ;;
-        *)             if [ "${2:-0}" = 1 ]; then [ -n "$3" ] && printf '%s' "$3" || printf '?'; else printf 'not-run'; fi ;;
+        misconfigured) printf '?'; return 0 ;;
+        not-run)       printf 'not-run'; return 0 ;;
     esac
+    [ "${2:-0}" = 1 ] || { printf 'not-run'; return 0; }
+    [ "${3:-0}" = 1 ] || { printf '?'; return 0; }
+    [ -n "$4" ] && printf '%s' "$4" || printf '?'
 }
 
 # kv_field <line> <key> — one `k=v` token out of a delegate's machine-readable line.
@@ -1283,6 +1293,11 @@ reap_uv() {
     fi
     CAND_UV="$count"
     VERDICT_UV="$(class_verdict "$RC_UV")"
+    # ⛔ A COUNT IS OUR MEASUREMENT ONLY WHERE WE MADE ONE. In a DRY pass it is the number of
+    # `DRY-RUN uv <path> <size> > <bound>` rows the owner printed, and any of its own per-cache lines
+    # (over-bound, under-bound or absent) proves it ENUMERATED. A refusal prints none, and an APPLY
+    # pass has no rows to count and no tally to lift — both are `?`, never the initialised 0.
+    if is_dry && grep -qE '^pi-cache-reap: (DRY-RUN )?uv ' <<<"$CLASS_OUT"; then HAVE_UV_CAND=1; fi
     # A class that did not finish ok must say so in the record's `detail`, or the supervisor prints
     # `ok=0 detail=ok` — a self-contradicting line is worse than no line.
     [ "$RC_UV" = 0 ] || NOTE_UV="${NOTE_UV:-$(note_for pi-cache-reap.sh "$UV_RAW_RC" uv)}"
@@ -1344,7 +1359,7 @@ reap_venv() {
     # class's — on a two-repo cell with `found=1` and `found=5` the record said `classified_venv=1`
     # beside five more venvs, and `candidates_venv=0` stayed reachable whenever the first repo was
     # clean (the structural zero this lift exists to remove, one configuration away).
-    local sum_v_classified=0 sum_v_cand=0 sum_v_pres=0 have_venv_tally=0 _vsum="" _vn2
+    local sum_v_classified=0 sum_v_cand=0 sum_v_pres=0 have_venv_tally=0 _vsum="" _vn2="" _vf="" _vr=""
     local venv_repos=0 venv_tally_repos=0
     if [ -z "$VENV_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=venv FAIL-CLOSED — reap-lane-venvs.sh not found (agent-infra PR #1949 owns this policy)"
@@ -1380,14 +1395,25 @@ reap_venv() {
             # "answered" before any field was read, so a TRUNCATED delegate stdout (a process dying
             # mid-line) left every sum at 0 while coverage claimed the repo had answered — an invented
             # `classified=0` presented as full coverage, which is the class this PR exists to remove.
-            _vn2="$(kv_field "$_vsum" venvs_found)"
-            case "${_vn2:-x}" in
+            _vf="$(kv_field "$_vsum" venvs_found)"
+            _vr="$(kv_field "$_vsum" reapable)"
+            # ⛔ ANSWERED ONLY IF **BOTH** CORE COUNTERS PARSE — `venvs_found` AND `reapable`. The flag
+            # was set on `venvs_found=` alone and `reapable` (the field the CANDIDATE count comes from)
+            # was parsed opportunistically, so a line truncated after `venvs_found=`, or one with
+            # `reapable=` absent/malformed, claimed an answer while `sum_v_cand` stayed 0. That ALSO
+            # suppressed the row-count fallback below (`[ "$have_venv_tally" = 1 ] || CAND_VENV="$all_c"`),
+            # so the REAP rows the pass had just scanned were discarded and the record read
+            # `classified=3 candidates=0 tally=1/1` — "three classified, nothing to do, fully covered".
+            # Same predicate, same reason, as the worktree arm's `case "${f_classified:-x}…"`.
+            # ⛔ `${_vf:-x}` per field, not a bare concatenation: an EMPTY field concatenates away, so
+            # `venvs_found=3` with `reapable` ABSENT would read as "all digits".
+            case "${_vf:-x}${_vr:-x}" in
                 ''|*[!0-9]*) : ;;
                 *) have_venv_tally=1
                    venv_tally_repos=$((venv_tally_repos + 1))
-                   sum_v_classified=$((sum_v_classified + _vn2)) ;;
+                   sum_v_classified=$((sum_v_classified + _vf))
+                   sum_v_cand=$((sum_v_cand + _vr)) ;;
             esac
-            _vn2="$(kv_field "$_vsum" reapable)";      case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_cand=$((sum_v_cand + _vn2)) ;; esac
             _vn2="$(kv_field "$_vsum" kept)";          case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_pres=$((sum_v_pres + _vn2)) ;; esac
             _vn2="$(kv_field "$_vsum" recheck_kept)";  case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_pres=$((sum_v_pres + _vn2)) ;; esac
         fi
@@ -1581,7 +1607,7 @@ reap_worktree() {
     # (`not-run`), or it ran and its delegate printed no SUMMARY (`?`). Both are recorded, neither is
     # reported as 0 — a `classified=0` beside `verdict=not-run` is a self-contradicting record, and it
     # is exactly the shape that reads as "healthy, nothing to do" on a pass that produced no answer.
-    local have_tally=0 REASON_ROWS="" wt_repos=0 wt_tally_repos=0 sum_deferred_remove=0
+    local have_tally=0 REASON_ROWS="" wt_repos=0 wt_tally_repos=0 wt_reasons_repos=0 sum_deferred_remove=0
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree arm=registered FAIL-CLOSED — pi-reap-worktrees.sh not found (the abandoned arm still runs: it needs no repo)"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
@@ -1621,6 +1647,10 @@ reap_worktree() {
             f_preserved="$(kv_field "$_sum" preserved)"
             f_remove="$(kv_field "$_sum" remove)"
             f_reasons="$(kv_field "$_sum" reasons)"
+            # ⛔ DID THIS SUMMARY ACTUALLY CARRY `reasons=`? Counted separately from the histogram
+            # below, because an ABSENT field and a real `reasons=none` both leave the histogram empty —
+            # and only the latter is an answer. See the `none` normalisation at the end of this arm.
+            [ -n "$f_reasons" ] && wt_reasons_repos=$((wt_reasons_repos + 1))
             # ⛔ ANSWERED ONLY IF THE CORE COUNTERS ALL PARSE. `have_tally=1` was set on the mere
             # PRESENCE of a SUMMARY, so a truncated line (a delegate dying mid-write) left the sums at 0
             # and the coverage at `1/1` — `classified=0` reported as a measured zero under full coverage.
@@ -1752,7 +1782,11 @@ reap_worktree() {
     # done after the `say`, it repaired the RECORD only, so every clean armed pass still printed
     # `reasons=?` on its class line — the sentinel losing its meaning on the one pass it must not
     # (a review cycle found the two surfaces disagreeing).
-    [ "$have_tally" = 1 ] && [ -z "$sum_reasons" ] && sum_reasons="none"
+    # ⛔ AND ONLY WHEN `reasons=` WAS REALLY READ FROM EVERY SUMMARY WE ACCEPTED: an empty histogram is
+    # `none` when the delegate SAID `none`, and `?` when the field was never reached — the likeliest truncation, since `reasons=`/`main_proof=`/`pr_merged=`
+    # are the TAIL fields. Without this a line cut after `failed=0` printed `preserved_worktree=2`
+    # beside `preserved_reasons_worktree=none`: "two checkouts kept, and none of them for any reason".
+    [ "$have_tally" = 1 ] && [ "$wt_reasons_repos" = "$wt_tally_repos" ] && [ -z "$sum_reasons" ] && sum_reasons="none"
 
     # The skip ledger rides on the class line AND the pass record: a class that skipped a repo did LESS
     # than a clean class, so its verdict stays fail-closed (3) — skipping is not a pass — but the line
@@ -1874,6 +1908,7 @@ reap_worktree() {
 # entry point adds nothing to that: it accounts, per root, with a `df` delta.
 reap_dup() {
     local roots root b a d out rc freed=0 raw=0 MEASURED=1 rows="" cands="" all_c=0 line path size why _dn reaped=0 _r _root_rem
+    local _dup_cand=0 _dup_ans=0 _dup_sum_line="" _dup_c=""
     local sweep_end swept
     if [ -z "$DUP_INSTALL_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=duplicate-install FAIL-CLOSED — reap-duplicate-installs.sh not found (looked at \$DUP_INSTALL_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
@@ -1904,6 +1939,21 @@ reap_dup() {
         reaped=$((reaped + _r))
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
+        # ⛔ THE OWNER'S OWN COUNT, lifted per root and SUMMED (never the first root's, never
+        # re-derived from row counts). `reap-duplicate-installs.sh` prints `SUMMARY … candidates=<n>` in
+        # BOTH modes, so unlike uv this class CAN answer on an ARMED pass — which is what
+        # `candidates_duplicate_install` silently reported as a structural 0 before (the counter was
+        # only ever assigned in the dry branch).
+        # ⛔ IT BELONGS HERE, IN `reap_dup`'s ROOT LOOP — the block was first pasted at the FIRST
+        # `rows="${rows}…"` line in the file, which is `reap_venv`'s: there it incremented a pair of
+        # GLOBALS nothing promoted, while `reap_dup` read its OWN `local …=0`, so the armed pass still
+        # recorded `candidates_duplicate_install=0` and the test below caught it.
+        _dup_sum_line="$(grep -F 'SUMMARY ' <<<"$out" | tail -1)"
+        _dup_c="$(kv_field "$_dup_sum_line" candidates)"
+        case "${_dup_c:-}" in
+            ''|*[!0-9]*) : ;;
+            *) _dup_cand=$((_dup_cand + _dup_c)); _dup_ans=$((_dup_ans + 1)) ;;
+        esac
         RC_DUP="$(worst_rc "$RC_DUP" "$(delegate_rc worktree "$rc")")"
         if [ "$rc" -gt 0 ]; then
             _dn="$(note_for reap-duplicate-installs.sh "$rc" worktree)"
@@ -1922,6 +1972,9 @@ reap_dup() {
     VERDICT_DUP="$(class_verdict "$RC_DUP")"
     DF_DUP_OK="$MEASURED"; RAW_DUP="$raw"
     if is_dry; then FREED_DUP=0; else FREED_DUP="$freed"; fi
+    # The DRY count comes from our own sweep below (every `remove` row is a candidate we scanned); an
+    # ARMED pass has no rows, so it answers from the owner's SUMMARY tally lifted above.
+    if ! is_dry && [ "$_dup_ans" -gt 0 ]; then CAND_DUP="$_dup_cand"; HAVE_DUP_CAND=1; fi
     if is_dry; then
         sweep_end=$(( $(now) + DU_BUDGET )); swept=0
         while IFS= read -r line; do
@@ -1948,7 +2001,7 @@ reap_dup() {
 }disk-reaper: WOULD-REMOVE class=duplicate-install ${size}MB ${path} (du estimate — never a saving)" ;;
             esac
         done <<<"$rows"
-        CAND_DUP="$all_c"
+        CAND_DUP="$all_c"; HAVE_DUP_CAND=1
         [ -n "$cands" ] && say "$cands"
         say "disk-reaper: class=duplicate-install rc=$RC_DUP verdict=$(class_verdict "$RC_DUP") mode=dry-run candidates=$all_c would_free_du=${WOULD_DUP}MB (du estimate) freed_df=0MB"
     else
@@ -2038,16 +2091,23 @@ UNMEASURED=""
 CAND_TOTAL="$(( CAND_UV + CAND_VENV + CAND_WT + CAND_DUP ))"
 { [ "${WANT_VENV:-0}" != 1 ] || [ "${HAVE_VENV_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
 { [ "${WANT_WT:-0}" != 1 ] || [ "${HAVE_WT_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
-# ⛔ A CLASS THAT COULD NOT BE SET UP MEASURED NOTHING, so it cannot contribute a confident `0`.
-# `venv` and `worktree` are caught by their sentinels above (a misconfigured venv arm deselects the
-# class; the worktree arm never publishes a candidate tally). `uv` and `duplicate-install` keep NO
-# candidate sentinel — their fail-closed arms publish no tally and leave the counter at its
-# initialised 0 — so they are caught by their VERDICT instead: `misconfigured` is exactly "could not
-# run at all", and a `candidates=0` on the pass-end line beside `verdict_uv=misconfigured` (or
-# `verdict_duplicate_install=misconfigured`) is the same invented zero the sentinels exist to
-# prevent. One loop, so a third such class cannot be added and then forgotten here.
-for _cv in "${VERDICT_UV:-}" "${VERDICT_DUP:-}"; do
-    [ "$_cv" != "misconfigured" ] || CAND_TOTAL="?"
+# ⛔ A CLASS THAT MEASURED NOTHING CANNOT CONTRIBUTE A CONFIDENT `0` TO THE TOTAL — for ANY reason:
+# could not be SET UP (`misconfigured`), the delegate RAN and failed closed, or an armed pass with no
+# tally to lift. One rule over all five classes, so a sixth cannot be added and then forgotten here.
+# ⛔ TWO OPPOSITE WAYS FOR A CLASS TO LOOK "NOT SELECTED", and only ONE of them is harmless:
+#   · `--only venv` leaves the others `WANT_*=0` because they never RAN — the `not-run` state, which is
+#     not a hole in the total. Requiring `want && have` on every class made the total `?` on EVERY
+#     single-class pass (`--only venv` printing `candidates=?` on a pass whose venv arm answered), so
+#     the sentinel cried wolf on the one surface that must stay trustworthy.
+#   · a SETUP-FAILURE arm ALSO resets `WANT_*=0` (`VERDICT_*=misconfigured`), and that class measured
+#     nothing. Reading `WANT` alone therefore reports it as "never selected" and lets an invented `0`
+#     back into the total — the very defect this loop exists to stop, one state over.
+# So "was selected" is `WANT=1` **or** `VERDICT=misconfigured`, and a selected class with no measurement
+# taints the sum. Polarity: deselected is silent, selected-but-unmeasured is `?`.
+for _cv in VENV WT UV DUP; do
+    eval "_cw=\${WANT_$_cv:-0}; _ch=\${HAVE_${_cv}_CAND:-0}; _cv_verdict=\${VERDICT_$_cv:-not-run}"
+    { [ "$_cw" = 1 ] || [ "$_cv_verdict" = misconfigured ]; } || continue
+    [ "$_ch" = 1 ] || CAND_TOTAL="?"
 done
 if is_dry; then
     say "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT + WOULD_DUP ))MB candidates=$CAND_TOTAL — NOTHING was removed"
@@ -2106,7 +2166,7 @@ record_body() {
     printf 'would_free_mb_venv=%s\n' "$WOULD_VENV"
     printf 'would_free_mb_worktree=%s\n' "$WOULD_WT"
     printf 'would_free_mb_duplicate_install=%s\n' "$WOULD_DUP"
-    printf 'candidates_uv=%s\n' "$(_class_rec "${VERDICT_UV:-not-run}" "${WANT_UV:-0}" "$CAND_UV")"
+    printf 'candidates_uv=%s\n' "$(_class_rec "${VERDICT_UV:-not-run}" "${WANT_UV:-0}" "${HAVE_UV_CAND:-0}" "$CAND_UV")"
     printf 'classified_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${CLASSIFIED_VENV:-}")"
     printf 'preserved_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${PRESERVED_VENV:-}")"
     printf 'candidates_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_CAND:-0}" "${CAND_VENV:-}")"
@@ -2127,7 +2187,7 @@ record_body() {
     printf 'deferred_remove_worktree=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${DEFERRED_REMOVE_WT:-}")"
     printf 'main_proof=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PROOF_WT:-}")"
     printf 'pr_merged=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PRM_WT:-}")"
-    printf 'candidates_duplicate_install=%s\n' "$(_class_rec "${VERDICT_DUP:-not-run}" "${WANT_DUP:-0}" "$CAND_DUP")"
+    printf 'candidates_duplicate_install=%s\n' "$(_class_rec "${VERDICT_DUP:-not-run}" "${WANT_DUP:-0}" "${HAVE_DUP_CAND:-0}" "$CAND_DUP")"
     printf 'verdict_uv=%s\n' "$VERDICT_UV"
     printf 'verdict_venv=%s\n' "$VERDICT_VENV"
     printf 'verdict_worktree=%s\n' "$VERDICT_WT"
