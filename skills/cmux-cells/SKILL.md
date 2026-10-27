@@ -140,13 +140,14 @@ codes do not: 80 before 73.
 The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. **Only
 `MAX_LOAD` (75) clears because the box quietens on its own.** The rest clear when their **resource is released** or their
 **input changes** — a lane finishes or drains (73), disk is reclaimed or a lane finishes (77), the brief is re-authored (80),
-the install is repaired (78), the repo's open-PR queue actually lands (74 — or, on its other arm, the worktree's origin is
-made a readable `owner/name` slug again, since 74 also fires when the repo cannot be derived at all and landing does not fix
-that). **Idling on its own changes none of them**: for 73
+the install is repaired (78), the repo's open-PR queue actually lands (74 — or, on its **other arm**, that worktree's origin
+is made a readable `owner/name` slug again, since 74 also fires when `land_backlog_repo` cannot derive one and landing does not
+fix that). **Idling on its own changes none of them**: for 73
 and 77 the release *is* a lane draining, so the drain has to actually complete rather than just pass time — which is why the
 gate's own two messages read "does NOT clear by waiting" (fork) and "This is NOT a load refusal: waiting does not clear it"
 (headroom) while both still offer "or let its lanes drain" / "or let a lane finish". So diagnosing a 73, 77, 74, 78 or 80 as
-"the box is busy" and idling is the trap — **and 74 is repo-wide**, so re-dispatching it to another box refuses there too.
+"the box is busy" and idling is the trap — **and on the ratio arm 74 is repo-wide**, so re-dispatching it to another box
+refuses there too (the slug arm is per-worktree, so a healthy clone elsewhere is unaffected).
 
 **RAM is read by two other instruments — `spawn-gate.sh` reads NO memory at all.** The two floors live in `orch-loop.sh`
 (`MIN_MEM_FREE_MB`, default 512) and `capacity.sh` (`CAP_MIN_MEM_MB`, 512). The **scheduler** does budget per lane: `ai-drainer.sh`
@@ -196,21 +197,26 @@ A **disk-full** cell behaves exactly like a dead one: the control agent cannot w
 while the provider insists `running`. Measured 2026-10-19: cell-3 sat at 29.9/32 GB, CPU 77%, exec failing for an hour,
 having submitted nothing for 141–226 minutes.
 
-Recovery ladder, cheapest first. **Establish a channel before anything else** — and read it carefully, because three readings
+Recovery ladder, cheapest first. **Establish a channel before anything else** — and read it carefully, because four readings
 that look like channel verdicts are not:
 
 - **A real refusal kills steps 1-2 outright**, whatever its cause. The channel that then answers is
-  `cmux vm exec <vm> -- <cmd>` (it needs no `cmux-tui` daemon) — **unless `/` is full**, which breaks `exec` too, since the
-  control agent cannot write its socket (that is the disk-full symptom above). With both channels gone there is no in-guest
-  lever left: the remaining ones are provider-level (step 3) and owner-level (a plan change or a recreate), and reclaim has to
-  wait for a channel.
+  `cmux vm exec <vm> -- <cmd>` (it needs no `cmux-tui` daemon) — **unless `/` is nearly full**: a guest at 93 % has already
+  been measured with `exec` failing for an hour (above), so treat a nearly-full box as no-channel, not only a 100 % one. With
+  **both** of those gone, the in-guest surface left is the **display** the same render prints (`cmux surface open
+  <vm>/display/display:1` — a noVNC console that was live on cell-4 while its `cmux-tui` port was refused). Beyond that the
+  levers are provider-level (step 3) and owner-level (a plan change or a **recreate** — and a recreate is the one step here
+  that can destroy unpushed work, so run the `@{u}..HEAD` / `status --porcelain` checks below first).
 - **`cmux vm tree` printing `(no terminals)` is not a reading of the box** when the same render shows a link error or a null
-  workspace list — cell-4 today reports `link_error: connection refused` and `remote_workspaces: null` while its own registry
-  holds **945** terminals. `null` means *unknown*, not *zero*: fall back to `exec` — and note that `--refresh`, which the tool's
-  own render suggests, **can itself time out** (measured: 120 s, exit 1, no catalog at all on a box whose link is refused) and
-  reports "VM request timed out". That is the channel failing, not the box. Only a **connected** link that genuinely enumerates
-  zero terminals justifies creating one (`cmux surface new-terminal --machine <vm> --no-open -- <cmd>`).
-- **A usage error from omitting the id is not a channel verdict** either.
+  workspace list — cell-4 today reports `link_error: "The Cloud hub could not reach the VM port: connection refused."` and
+  `remote_workspaces: null` while its own registry holds **945** terminals. `null` means *unknown*, not *zero*: fall back to
+  `exec` — and note that `--refresh`, which the tool's own render suggests, **can itself time out** (measured: 120 s, exit 1, no
+  catalog at all on a box whose link is refused) and reports "VM request timed out". That is the channel failing, not the box.
+  Only a **connected** link that genuinely enumerates zero terminals justifies creating one
+  (`cmux surface new-terminal --machine <vm> --no-open -- <cmd>`).
+- **A usage error is not a channel verdict, and neither is a wrong-but-valid argument.** `cmux vm tree` with **no machine**
+  prints the whole fleet; `terminal read/send` without an id prints the usage block. And because §7's table is keyed by LABEL,
+  `cmux vm tree pi-cell-4` renders **`No cloud machines. Try: cmux vm new`** — a false empty, not a missing box. Use the NAME.
 
 And if the volume that is full is the **`cmux-tui` state volume** described under step 5, skip to that owner-level action —
 none of the reclaim steps below touch it.
@@ -231,11 +237,13 @@ none of the reclaim steps below touch it.
    `df -Pm "$(mount | awk '/cmux-tui-state/{print $3}')"`. It fills independently of `/` and holds the terminal state the
    ladder depends on — `df` reported **99 % capacity, 947 MB of 974 MB used, 11 MiB free** on cell-3 (measured 2026-10-27,
    while `/` was at 60 %), the consumer being a `workspace-registry.sqlite3` of ~900 MB in that volume's `sessions/`. This
-   volume moves by tens of MB per hour — **re-read it**, do not trust the figure above. None of
+   volume moves — observed 31 → 11 MiB free within a single day — so **re-read it**; do not trust the figure above. None of
    the reclaim steps above touch it, so if it is the volume that is full, that is an **owner-level** action: it is a per-box
-   loop file (`cmux-tui-state.ext4` — 974 MB on cell-3, 3,996 MB on cell-4) and **no `cmux vm` verb resizes it**, so the
-   actionable half is a reset (delete that box's `sessions/<id>/workspace-registry.sqlite3` with its terminals closed),
-   or recreating the box.
+   loop file (`cmux-tui-state.ext4` — 974 MB on cell-3, 3,996 MB on cell-4) and **no `cmux vm` verb resizes it**. A reset is
+   not just an unlink: the `cmux-tui` daemon holds that registry **open read-write** (6 fds on cell-3), so deleting the file
+   frees nothing until those fds close — stop `cmux-tui-daemon.service` (or kill the `cmux-tui server` process), delete
+   `sessions/<id>/workspace-registry.sqlite3` (its ~43 MB `-wal` regenerates), restart the daemon, **then** re-read `df` — or
+   recreate the box.
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -350,8 +358,8 @@ dispatch time, because both move.
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, but **needs activation (§1)** before it can land |
-| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — half the cores of the other two, so its in-box lane ceiling is half (§7). The real constraint is memory (its `dmesg` has OOM kills in it); re-read at dispatch |
-| `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target |
+| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — half the cores of the other two, so its in-box lane ceiling is half (§7). Memory is what it runs out of: its `dmesg` has 2 OOM kills — re-read at dispatch |
+| `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target, and **the box with the most OOM kills of the three (5)** — raise its reserve per §2 |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
 ⛔ **TWO DIFFERENT CEILINGS — DO NOT CONFUSE THEM, AND DO NOT TREAT EITHER AS THE WHOLE ANSWER.** The owner ruled on
