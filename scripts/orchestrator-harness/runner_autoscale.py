@@ -119,6 +119,8 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
     RUNNER_AUTOSCALE_NO_SUDO        "1" → do not prefix with sudo (tests, rootless)
     RUNNER_AUTOSCALE_ONLINE_WAIT_S  seconds to wait for a restarted runner to report online (60)
     RUNNER_AUTOSCALE_POLL_S         poll interval while waiting (5)
+    RUNNER_AUTOSCALE_DF           `df` for the DISK arm (default: the system one; a TEST seam)
+    RUNNER_AUTOSCALE_DU           `du` for the measured per-runner footprint (same)
     RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS  attempts for ONE pool read while it races our own restart (3),
                                    retrying NETWORK/5xx/RATE-LIMIT errors only — a 404 is answered at once
     RUNNER_AUTOSCALE_RETRY_BACKOFF_S     pause between those attempts (2)
@@ -151,6 +153,10 @@ EXIT  0 converged / nothing to do (a REFUSAL is an answer, not a failure)
       5 `--check-units` found an installed unit whose WorkingDirectory is unusable (or an audit that
         read nothing at all). A READ-ONLY finding, deliberately distinct from 3: a consumer keying on
         "an action failed" must not confuse it with "my units are misconfigured".
+      A pass whose provisioner refuses while THIS tool's disk arm says one more runner fits reports
+      the verdict `guard-conflict` (exit 3, both sides' numbers in the notes): the two guards answer
+      different questions, and the disagreement is a decision for a human, not an action failure.
+
       `--install-unit` exits 0 on success, 1 when REFUSED before writing anything (an unusable
       WorkingDirectory or repo), and 3 when the pair could not be installed. 3 is NOT a rollback
       guarantee: nothing installed is ever REMOVED, but the two renames are sequential, so a failure
@@ -201,6 +207,23 @@ STARVATION_CONFIRM_MAX_S = 300.0
 # ── the sizing predicate (owner ruling, agent-infra#2344 comment 6347825624) ────────────────────
 MEM_PER_RUNNER_MB = 1500
 MEM_RESERVE_MB = 2048
+
+# ⛔ THE DISK ARM EXISTS BECAUSE THE TOOL HAD NONE. Measured incident: the provisioner refused a
+# third runner with `REFUSED: disk headroom: 9G free against 44G needed for 3 runners (+20G reserve)`
+# on an 8-core box whose ceiling said 3 — so this tool ASKED for a runner the disk could not hold,
+# and the disagreement resolved to "add nothing" with the reason buried in a refusal note. Its cost
+# model reads 3 x 8G + 20G = 44G, which is where these two constants come from.
+# The per-runner number is an ALLOWANCE, not a footprint: a runner install is ~2 GB, and the 8 GB
+# budgets growth of `_work` and docker images. So the allowance is used when nothing is installed
+# yet (a first runner has no measurement), and the MEASURED footprint is reported beside it, so an
+# operator can see which number set the ceiling instead of inferring it.
+DISK_RESERVE_MB = 20480
+FOOTPRINT_MB_DEFAULT = 8192
+# ⛔ `_work` GROWTH IS COUNTED, AND IT ONLY EVER LOWERS THE CEILING: the measurement is the largest
+# install's current size, so a runner whose workspace grew to 20 GB raises the per-runner budget to
+# 20 GB and the ceiling drops with it — permanently, until that directory is trimmed. That is the
+# fail-closed direction (it never over-adds) and the reading names `measured_largest=… budget=…`, so
+# an operator can see it; trimming `<root>/gh-runner*/_work` restores the capacity.
 CORE_TABLE = ((8, 3), (4, 2), (1, 1))
 
 # The pool's own labels. `FALLBACK_LABEL` is attached only while the fallback is engaged —
@@ -276,17 +299,110 @@ def core_ceiling(ncpu: int) -> int:
     return 1
 
 
-def ceiling(ncpu: int, mem_mb: int, running: int) -> tuple[int, str, str]:
+def df_free_mb(root: str) -> int:
+    """Free MB at `root`, from `df -Pm`. Raises `Unmeasurable` — a disk read is a measurement.
+
+    ⛔ POSITIONAL FROM THE END, not from the start: `df -P` guarantees the tail fields, but the
+    SOURCE field can contain a space ("my big disk"), which shifts every later field right. Reading
+    `fields[3]` then returns the filesystem TOTAL — measured: a 25000 MB free disk read as 999999,
+    i.e. the arm that exists to stop over-adding would have over-added by 40x.
+
+    RESIDUALS, measured and accepted (both fail CLOSED, i.e. they never over-add): a MOUNT POINT
+    containing a space (`/Volumes/My Disk`) shifts the tail so `fields[-3]` is `1%` and the read is
+    `Unmeasurable` — the pass then reports `disk_UNVERIFIED` and withholds the fill for ever on that
+    path, which is visible but permanent; and a mount point whose own words are numeric (`/mnt/a 12
+    34 56`) can parse a WRONG number. Neither is reachable for a normal `/opt` runner root, and no
+    positional parse can fix them — `-P` guarantees the tail's SHAPE, not that a path is one field.
+    """
+    df_bin = os.environ.get("RUNNER_AUTOSCALE_DF") or shutil.which("df") or "df"
+    rc, out = _run([df_bin, "-Pm", root], timeout=60)
+    if rc != 0:
+        raise Unmeasurable(f"disk free space at {root}: `df -Pm` rc={rc} {out[:200]}")
+    for line in reversed(out.splitlines()):
+        fields = line.split()
+        if len(fields) >= 4 and fields[-3].isdigit():
+            return int(fields[-3])
+    raise Unmeasurable(f"disk free space at {root}: cannot parse `df -Pm` output {out[-200:]!r}")
+
+
+def disk_footprint_mb(root: str) -> tuple[int, str]:
+    """(per_runner_mb, basis) — the cost budgeted per runner, and HOW it was decided.
+
+    ⛔ THE MEASUREMENT CAN ONLY TIGHTEN THE BUDGET, NEVER LOOSEN IT. 8 GB is the installer's
+    allowance (it budgets growth of `_work` and docker images); a real install is ~2 GB. Taking
+    `min(measured, allowance)` made this arm LOOSER than the guard it is supposed to agree with for
+    every measurement below 8 GB — i.e. always — so a box with a 20 GB install and 30 GB free would
+    have been told "one more fits". `max()` keeps the arm at least as strict as the installer.
+    A failed `du` is NOT fatal (the allowance still bounds it) but the basis SAYS it was not
+    measured, because a number that set a ceiling must never be presented as a measurement.
+    """
+    installs = sorted(Path(root).glob("gh-runner*"))
+    if not installs:
+        return FOOTPRINT_MB_DEFAULT, f"allowance={FOOTPRINT_MB_DEFAULT} (nothing installed yet)"
+    du_bin = os.environ.get("RUNNER_AUTOSCALE_DU") or shutil.which("du") or "du"
+    rc, out = _run([du_bin, "-sm", *[str(p) for p in installs]], timeout=120)
+    sizes = []
+    for line in out.splitlines():
+        fields = line.split()
+        if fields and fields[0].isdigit():
+            sizes.append(int(fields[0]))
+    if rc != 0 or not sizes:
+        return FOOTPRINT_MB_DEFAULT, (
+            f"allowance={FOOTPRINT_MB_DEFAULT} (footprint NOT measured: `du -sm` rc={rc} "
+            f"{out[-120:]!r} — the ceiling uses the installer's number, not a measurement)"
+        )
+    measured = max(sizes)
+    return max(measured, FOOTPRINT_MB_DEFAULT), (
+        f"measured_largest={measured} of {len(sizes)} installs, "
+        f"allowance={FOOTPRINT_MB_DEFAULT}, budget={max(measured, FOOTPRINT_MB_DEFAULT)} "
+        "(the stricter of the two)"
+    )
+
+
+def measure_disk(root: str) -> tuple[int, int, str]:
+    """(free_mb, per_runner_mb, reading). Free space RAISES; the footprint never does."""
+    free_mb = df_free_mb(root)
+    per_runner, basis = disk_footprint_mb(root)
+    return free_mb, per_runner, f"disk_free_mb={free_mb} per_runner_disk_mb={per_runner} {basis}"
+
+
+def disk_allows_one_more(free_mb: int, per_runner_mb: int) -> bool:
+    """Does ONE more runner fit under the installer's own reserve?
+
+    ⛔ THE INCREMENT, NOT THE WHOLE BOX. The installer asks "is there room for ALL N runners plus the
+    reserve"; this tool asks "is there room for the ONE runner it is about to add". Those are
+    different questions, and when the first says no and the second says yes the box is in the state
+    that produced the measured refusal — which must be REPORTED as a conflict, not averaged away.
+    """
+    return (free_mb - DISK_RESERVE_MB) >= per_runner_mb
+
+
+def ceiling(
+    ncpu: int, mem_mb: int, running: int, free_mb: int | None, per_runner_mb: int
+) -> tuple[int, str, str]:
     """(ceiling, bound, reading). `running` = listeners ALREADY alive on this box."""
     by_core = core_ceiling(ncpu)
     headroom = max(0, (mem_mb - MEM_RESERVE_MB) // MEM_PER_RUNNER_MB)
     by_mem = max(0, running) + headroom
-    value = min(by_core, by_mem)
-    bound = "cores" if by_core <= by_mem else "memory"
+    # ⛔ THE DISK ARM COUNTS RUNNERS ALREADY ON DISK, like the memory arm counts the ones already in
+    # RAM: `running` is included because their bytes are already paid for.
+    # ⛔ AND AN UNREAD DISK BOUNDS NOTHING — it does not silently become "no arm". The caller that
+    # gets `None` here REFUSES TO FILL (see converge): an unknown disk is not permission to add.
+    if free_mb is None:
+        by_disk: int | None = None
+        value = min(by_core, by_mem)
+        bound = "cores" if by_core <= by_mem else "memory"
+        disk_part = "by_disk=UNKNOWN"
+    else:
+        disk_headroom = max(0, (free_mb - DISK_RESERVE_MB) // max(per_runner_mb, 1))
+        by_disk = max(0, running) + disk_headroom
+        value = min(by_core, by_mem, by_disk)
+        bound = min((by_core, "cores"), (by_mem, "memory"), (by_disk, "disk"))[1]
+        disk_part = f"by_disk={by_disk}"
     reading = (
         f"ncpu={ncpu} mem_available_mb={mem_mb} running={max(0, running)} "
         f"per_runner_mb={MEM_PER_RUNNER_MB} reserve_mb={MEM_RESERVE_MB} "
-        f"by_cores={by_core} by_memory={by_mem} bound={bound} ceiling={value}"
+        f"by_cores={by_core} by_memory={by_mem} {disk_part} bound={bound} ceiling={value}"
     )
     return value, bound, reading
 
@@ -1522,10 +1638,30 @@ def converge(
         )
 
     running = sum(1 for c in classified if c["alive"])
-    ceil, bound, reading = ceiling(ncpu, mem_mb, running)
+    # ⛔ AN UNREADABLE DISK IS NOT AN UNRUNNABLE PASS. Disk space is needed for ONE decision — whether
+    # to ADD a runner — and the measured version of this file made it a precondition for the whole
+    # pass: a failing `df` (or a `df` missing from a unit's PATH) exited 2 before the repair loop, so
+    # a box with a DEAD runner was left unrepaired AND the starvation alarm (#2875) never ran, for as
+    # long as the disk could not be read. Repair needs no disk figure. So: record it, refuse to FILL,
+    # and carry on.
+    try:
+        disk_free_mb, per_runner_disk_mb, disk_reading = measure_disk(root)
+    except Unmeasurable as exc:
+        disk_free_mb = None
+        per_runner_disk_mb, _basis = disk_footprint_mb(root)
+        disk_reading = f"disk_UNVERIFIED ({exc})"
+        record["disk_unverified"] = str(exc)
+        record["notes"].append(
+            f"disk NOT measured: {exc} — nothing will be ADDED this pass (an unmeasured disk is not "
+            "permission to add), and repair/orphan handling and the starvation alarm still run"
+        )
+    ceil, bound, reading = ceiling(ncpu, mem_mb, running, disk_free_mb, per_runner_disk_mb)
+    reading = f"{reading} {disk_reading}"
     record.update(
         ncpu=ncpu,
         mem_available_mb=mem_mb,
+        disk_free_mb=disk_free_mb,
+        per_runner_disk_mb=per_runner_disk_mb,
         bound=bound,
         ceiling=ceil,
         reading=reading,
@@ -1657,8 +1793,23 @@ def converge(
         )
         stop_pass = True
 
+    if disk_free_mb is None and live < target:
+        # ⛔ AN UNMEASURED DISK IS NOT PERMISSION TO ADD — AND IT IS NOT HEALTH EITHER. Repair,
+        # orphan handling and the starvation alarm already ran; only the decision that NEEDS the disk
+        # figure is withheld. Because that decision was withheld, the pass cannot claim `at-ceiling`
+        # or `converged` for a target it never tested: it records the same `unverified` bit a
+        # mid-pass measurement failure does, so the verdict is `unmeasurable` and the exit code 2.
+        # Otherwise a consumer keying on the verdict would read "all good" from a box whose only
+        # capacity question was never asked.
+        record["unverified"] = True
+        record["unverified_cause"] = "disk-unreadable"
+        record["notes"].append(
+            f"not filling: the disk free space is UNKNOWN ({record.get('disk_unverified', '?')}) — "
+            f"{live} live against a target of {target}; nothing was added, and this pass therefore "
+            "cannot report the box as converged"
+        )
     for _step in range(max(1, target)):
-        if stop_pass or live >= target:
+        if stop_pass or live >= target or disk_free_mb is None:
             break
         try:
             before = mem_available_mb(meminfo)
@@ -1677,6 +1828,18 @@ def converge(
                 f"< reserve_mb={MEM_RESERVE_MB} — one more would starve a shard"
             )
             break
+        # ⛔ THE DISK IS RE-MEASURED EVERY STEP, like the memory above. The pass bounds its ceiling
+        # ONCE, so a fill that installs two runners would otherwise budget both against the space it
+        # saw before the first byte landed — and the conflict note would quote a stale figure, turning
+        # a correct installer refusal into a false conflict page.
+        try:
+            disk_free_mb = df_free_mb(root)
+        except Unmeasurable as exc:
+            record["notes"].append(
+                f"stop: the disk free space could not be re-read mid-pass ({exc}) — nothing further "
+                "was added"
+            )
+            break
         index = _next_free_slot(root)
         if dry_run:
             # A DRY RUN CANNOT MODEL A CONVERGENCE IT CANNOT MEASURE. The old plan assumed +1 per
@@ -1691,11 +1854,36 @@ def converge(
         try:
             note = provision(index)
         except ProvisionerRefused as exc:
+            # ⛔ TWO ANSWERS TO TWO DIFFERENT QUESTIONS. The installer budgets space for the WHOLE
+            # target plus its reserve; this pass adds ONE runner. So when its guard refuses while
+            # THIS tool's arm says the increment fits, the box needed capacity and got none — the
+            # state that produced the measured `9G free against 44G needed for 3 runners` refusal on
+            # a box whose ceiling said 3 — and it is reported as its OWN verdict, with both sides'
+            # numbers, instead of an `action-failed` note or a silent refusal.
+            # ⛔ THE DECISION USES OUR OWN MEASUREMENT AND THEIR QUOTED WORDS, never a substring of
+            # their prose. An earlier version tested `"disk" in refusal.lower()` over `out[-300:]`,
+            # which dressed a MEMORY refusal up as a disk conflict and MISSED a disk refusal whose
+            # wording this file did not anticipate (both measured).
+            fits = disk_allows_one_more(disk_free_mb, per_runner_disk_mb)
+            if fits:
+                record["problem_kind"] = "guard-conflict"
+                record["notes"].append(
+                    f"GUARD CONFLICT at slot #{index}: the provisioner refused in its own words "
+                    f"({exc}), while THIS tool's arm says ONE MORE fits: free={disk_free_mb}MB - "
+                    f"reserve={DISK_RESERVE_MB}MB >= per_runner={per_runner_disk_mb}MB — both read at "
+                    "the moment of this step. Nothing was added. The refusal may be about disk, memory or "
+                    "arch — this tool does not interpret its prose — but the two guards DISAGREE "
+                    "about whether capacity can be added here, and a human must decide which number "
+                    "is wrong (#9672)"
+                )
+                break
             record["problem_kind"] = "refusal"
             record["notes"].append(
-                f"provisioner REFUSED slot #{index}: {exc} — its own headroom guard is stricter "
-                "than this tool's measured ceiling, so nothing was added (a refusal is an answer, "
-                "not a failure; the two predicates must be reconciled — see #9672)"
+                f"provisioner REFUSED slot #{index}: {exc} — nothing was added. This tool's DISK "
+                f"arm also says the increment does not fit (free={disk_free_mb}MB - "
+                f"reserve={DISK_RESERVE_MB}MB < per_runner={per_runner_disk_mb}MB), so no disk space "
+                "was left on the table HERE; the refusal's own reason is whatever it quoted, which "
+                "this tool does not interpret. Reported as an answer, not a failure (#9672)"
             )
             break
         except ActionFailed as exc:
@@ -1746,7 +1934,20 @@ def converge(
     # seconds between a repair and the repaired runner picking work up (the confirmation sample
     # absorbs most of it); the cost of gating is a permanently silent alarm. NOISE LOSES.
     starvation: dict = {}
-    if not record["problems"] and not record.get("unverified") and not record.get("problem_kind"):
+    # ⛔ `unverified` IS NOT IN THIS GATE, deliberately (measured): a pass that could not read the
+    # DISK is still perfectly able to read the queue, and gating the alarm on it meant a starved box
+    # with a failing `df` reported `unmeasurable` and NEVER paged — the alarm silenced by an
+    # unrelated measurement failure, which is the same trap as suppressing it on actions. The probe's
+    # own inputs fail closed (an unread pool or queue is `unmeasured`), so it needs no help here.
+    # ⛔ THE ONE EXCEPTION IS THE POOL ITSELF: when the pool read is what failed, the probe's own
+    # first step would only repeat that failure (and pay for it again — measured: 7 pool reads where
+    # the contract says 1 + 3). Every OTHER unverified cause leaves the pool readable, so the alarm
+    # still runs (`disk-unreadable` included).
+    if (
+        not record["problems"]
+        and not record.get("problem_kind")
+        and record.get("unverified_cause") != "pool-read-after-restart"
+    ):
         confirm_raw = os.environ.get("RUNNER_AUTOSCALE_STARVATION_CONFIRM_S")
         # ⛔ PARSED DEFENSIVELY, AND BOUNDED, because every value of this seam must fail LOUD. Measured
         # in review: `float()` ACCEPTS `nan`, `-5` and `inf` — the first two silently SKIPPED the
@@ -1800,6 +2001,11 @@ def converge(
 
     if record["problems"]:
         record["verdict"] = "action-failed"
+    elif record.get("problem_kind") == "guard-conflict":
+        # A CONFLICT, not a failure: nothing was added, both numbers are in the notes, and the exit
+        # code says "a human must look at this" (3 — the same code an action failure gets, because
+        # from a monitor's seat the box needed capacity and did not get it).
+        record["verdict"] = "guard-conflict"
     elif record.get("problem_kind") == "refusal":
         record["verdict"] = "provisioner-refused"
     elif record.get("unverified"):
@@ -2054,7 +2260,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"verdict={record['verdict']}")
     if record["verdict"] == "refused":
         return 1
-    if record["verdict"] == "action-failed":
+    if record["verdict"] in ("action-failed", "guard-conflict"):
         return 3
     if record["verdict"] == "unmeasurable":
         return 2

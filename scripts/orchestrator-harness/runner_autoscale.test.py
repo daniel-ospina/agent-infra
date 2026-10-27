@@ -252,6 +252,8 @@ class Box:
         os.makedirs(os.path.join(self.dir, "state"), exist_ok=True)
         os.makedirs(os.path.join(self.dir, "bin"), exist_ok=True)
         os.makedirs(os.path.join(self.dir, "units"), exist_ok=True)
+        self.disk(500_000)
+        self.footprint({})
         self._write(os.path.join(self.dir, "gh"), GH_STUB.replace("__FIX__", self.dir), 0o755)
         self._write(
             os.path.join(self.dir, "systemctl"), SYSTEMCTL_STUB.replace("__FIX__", self.dir), 0o755
@@ -280,6 +282,11 @@ class Box:
             # ⛔ the unit audit reads a FIXTURE directory, never the host's ~/.config or /etc: a suite
             # that reads the machine it runs on reports this box's units as if they were the case's.
             "RUNNER_AUTOSCALE_UNIT_DIR": os.path.join(self.dir, "units"),
+            # ⛔ df/du are SEAMS, not the host: a case that read this machine's disk would size its
+            # ceiling from whatever the developer's laptop has free. The default is a big, quiet disk
+            # so the disk arm binds only in the cases that are ABOUT it.
+            "RUNNER_AUTOSCALE_DF": os.path.join(self.dir, "df"),
+            "RUNNER_AUTOSCALE_DU": os.path.join(self.dir, "du"),
             "RUNNER_AUTOSCALE_ONLINE_WAIT_S": "0",
             "RUNNER_AUTOSCALE_POLL_S": "0",
             "RUNNER_AUTOSCALE_POOL_READ_ATTEMPTS": "3",
@@ -356,6 +363,59 @@ class Box:
     def queued_seq(self, steps):
         """Per-CALL queue depth (the last step repeats) — the confirmation sample, driven."""
         self._write(os.path.join(self.dir, "queued.seq"), "\n".join(str(s) for s in steps) + "\n")
+
+    def disk(self, free_mb: int):
+        """The `df -Pm` the disk arm reads. Field 4 is Available, as `df -Pm` prints it."""
+        self._write(
+            os.path.join(self.dir, "df"),
+            "#!/usr/bin/env bash\n"
+            "printf 'Filesystem 1048576-blocks Used Available Capacity Mounted on\\n'\n"
+            f"printf '/dev/fixture 999999 1 {free_mb} 1%% /\\n'\n",
+            0o755,
+        )
+
+    def disk_seq(self, values: list[int]):
+        """A `df` whose free space CHANGES between calls — the fill re-measures every step, so a box
+        that fills up between the ceiling and the provision is a reachable state, not a fiction."""
+        log = os.path.join(self.dir, "df.seq")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(str(v) for v in values) + "\n")
+        counter = os.path.join(self.dir, "df.count")
+        self._write(
+            os.path.join(self.dir, "df"),
+            "#!/usr/bin/env bash\n"
+            f"C={counter}\n"
+            "n=0; [ -f \"$C\" ] && n=\"$(cat \"$C\")\"\n"
+            "n=$(( n + 1 )); printf '%s\\n' \"$n\" > \"$C\"\n"
+            f"v=$(sed -n \"${{n}}p\" {log})\n"
+            f"[ -z \"$v\" ] && v=$(tail -1 {log})\n"
+            "printf 'Filesystem 1048576-blocks Used Available Capacity Mounted on\\n'\n"
+            "printf '/dev/fixture 999999 1 %s 1%% /\\n' \"$v\"\n",
+            0o755,
+        )
+
+    def disk_spaced_source(self, free_mb: int, total_mb: int = 999_999):
+        """A real `df -Pm` line whose SOURCE contains a space ("my big disk"), which shifts every
+        later field right. `-P` guarantees the TAIL, not the head — this is the shape that made a
+        25000 MB disk read as its 999999 MB total, i.e. the arm over-adding by 40x."""
+        self._write(
+            os.path.join(self.dir, "df"),
+            "#!/usr/bin/env bash\n"
+            "printf 'Filesystem 1048576-blocks Used Available Capacity Mounted on\\n'\n"
+            f"printf 'my big disk {total_mb} 1 {free_mb} 1%% /\\n'\n",
+            0o755,
+        )
+
+    def footprint(self, sizes: dict):
+        """`du -sm` over the installs. `sizes` maps a directory NAME to its MB; anything unlisted
+        reports the empty output a du that could not read the path would produce."""
+        lines = "\n".join(f"{mb}\t__ROOT__/{name}" for name, mb in sizes.items())
+        self._write(
+            os.path.join(self.dir, "du"),
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' '{lines}' | sed \"s|__ROOT__|{self.root}|g\"\n",
+            0o755,
+        )
 
     def provisioner(self, rc=0, out=""):
         self._write(os.path.join(self.dir, "provisioner.rc"), f"{rc}\n")
@@ -1652,6 +1712,250 @@ def t23_priority_and_hierarchies():
             box.destroy()
 
 
+# ── 6. THE DISK ARM, AND THE CONFLICT WITH THE PROVISIONER'S GUARD ─────────────────────────────
+@test("T24 the disk arm binds the ceiling from MEASURED footprint, and names which number did")
+def t24_disk_arm():
+    """Measured incident: the provisioner refused `9G free against 44G needed for 3 runners (+20G
+    reserve)` on an 8-core box whose ceiling said 3. This tool had NO disk term at all, so it asked
+    for a runner the disk could not hold. The arm now measures: free space from `df`, and the
+    per-runner cost from `du` over the installs — because 8 GB is an ALLOWANCE, not a footprint, and
+    the reading has to say which one set the ceiling."""
+    with Env():
+        box = Box("disk-arm")
+        try:
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            # 30 GB free, 2 GB measured footprint, 20 GB reserve ⇒ one more fits
+            box.disk(30_000)
+            box.footprint({"gh-runner-x64": 2000})
+            record = converge(box, nproc="8", want=1)
+            check(
+                record["per_runner_disk_mb"] == ra.FOOTPRINT_MB_DEFAULT,
+                f"a 2G measurement BELOW the 8G allowance must not loosen the budget: "
+                f"{record['per_runner_disk_mb']}",
+            )
+            check(
+                "measured_largest=2000" in record["reading"]
+                and "allowance=8192" in record["reading"]
+                and "the stricter of the two" in record["reading"],
+                f"the reading must name the measurement, the allowance AND which won: "
+                f"{record['reading']}",
+            )
+            # ⛔ …and a measurement ABOVE the allowance must TIGHTEN it: 20G installs against a 30G
+            # disk leave 9520MB, which is less than the 20G a runner now costs ⇒ does NOT fit.
+            box.footprint({"gh-runner-x64": 20_000})
+            record = converge(box, nproc="8", want=1)
+            check(
+                record["per_runner_disk_mb"] == 20_000,
+                f"a measurement ABOVE the allowance must win (stricter): "
+                f"{record['per_runner_disk_mb']}",
+            )
+            check(
+                ra.disk_allows_one_more(30_000, 20_000) is False,
+                "30G free with a 20G runner under a 20G reserve does NOT fit",
+            )
+            box.footprint({"gh-runner-x64": 2000})
+            # the arm must BIND: 5 GB free cannot hold a 2 GB runner under a 20 GB reserve
+            box.disk(5000)
+            record = converge(box, nproc="8", want=0)
+            check(
+                record["bound"] == "disk",
+                f"with 5GB free the DISK must be the binding constraint: {record['reading']}",
+            )
+            check(
+                record["ceiling"] == 1,
+                f"1 running + 0 disk headroom ⇒ ceiling 1, got {record['ceiling']}",
+            )
+            # ⛔ THE PARSE ITSELF: a `df -Pm` line whose SOURCE has a space shifts every later field.
+            # `fields[3]` (the pre-fix code) then reads the filesystem TOTAL — here 999999 MB instead
+            # of 5000 — turning a 5 GB disk into a 1 TB one and adding a runner it cannot hold.
+            box.disk_spaced_source(5000)
+            record_sp = converge(box, nproc="8", want=1)
+            check(
+                record_sp["disk_free_mb"] == 5000,
+                f"the free field must be the AVAILABLE column, not the total: "
+                f"{record_sp['disk_free_mb']}",
+            )
+            check(
+                record_sp["bound"] == "disk" and record_sp["ceiling"] == 1,
+                f"and a 5 GB disk with a 1 MB running set cannot hold another runner: "
+                f"{record_sp['reading']}",
+            )
+            check(
+                ra.df_free_mb(box.root) == 5000,
+                f"df_free_mb must read the same column: {ra.df_free_mb(box.root)}",
+            )
+            box.disk(30_000)
+            # ⛔ AN UNREADABLE DISK MUST NOT DISABLE THE PASS. Disk space decides ONE thing — whether
+            # to ADD — so an unreadable `df` records `disk_unverified`, prints `by_disk=UNKNOWN`, adds
+            # nothing, and still repairs and still evaluates the starvation invariant. Making it fatal
+            # (this fix's first version) exited 2 BEFORE the repair loop: a box with a DEAD runner
+            # stayed unrepaired and the queue alarm (#2875) never ran, for as long as `df` failed.
+            Path(box.dir, "df").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+            os.chmod(Path(box.dir, "df"), 0o755)
+            code, out = cli(box, "--status", "--json")
+            check(
+                code == 2,
+                f"an unreadable `df` leaves the box's capacity UNKNOWN (unmeasurable, exit 2) — not "
+                f"healthy and not fatal: got {code}",
+            )
+            check("by_disk=UNKNOWN" in out, f"…the reading must say the arm is unknown: {out!r}")
+            check("disk free space" in out, f"…naming the failed read: {out!r}")
+            # …and the SAME polarity when `df` succeeds but its output cannot be parsed
+            Path(box.dir, "df").write_text(
+                "#!/usr/bin/env bash\necho 'no numbers here'\n", encoding="utf-8"
+            )
+            os.chmod(Path(box.dir, "df"), 0o755)
+            code, out = cli(box, "--status", "--json")
+            check(code == 2, f"unparseable `df` output is UNMEASURABLE too, got {code}")
+            check("cannot parse" in out, f"…and must say which read failed: {out!r}")
+            box.disk(30_000)
+
+            # ⛔ AND THE HALF THAT MUST STILL RUN: a DEAD runner is repaired, the queue alarm is
+            # evaluated, and NO runner is added on an unmeasured disk.
+            box_repair = Box("disk-unverified-repair")
+            try:
+                box_repair.install("gh-runner-x64", "r-dead")
+                box_repair.pool(
+                    [
+                        ("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL]),
+                        ("r-other", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL]),
+                    ]
+                )
+                box_repair.alive([])
+                box_repair.queued(53)
+                Path(box_repair.dir, "df").write_text(
+                    "#!/usr/bin/env bash\nexit 1\n", encoding="utf-8"
+                )
+                os.chmod(Path(box_repair.dir, "df"), 0o755)
+                # `want=3` on purpose: the CEILING (cores/memory) allows three, so only the
+                # unknown disk stands between this pass and an addition — which is exactly the guard
+                # under test. `want=0` would never reach the fill loop at all.
+                record3 = converge(box_repair, nproc="8", want=3)
+                check(
+                    any(n.startswith("not filling") for n in record3["notes"]),
+                    f"the pass must SAY it withheld the fill: {record3['notes']}",
+                )
+                check(
+                    any(a.startswith("restart r-dead") for a in record3["actions"]),
+                    f"a DEAD runner must still be repaired with an unread disk: {record3['actions']}",
+                )
+                check(
+                    record3.get("disk_unverified"),
+                    f"…and the unknown disk must be recorded: {record3.get('disk_unverified')}",
+                )
+                check(
+                    record3.get("starvation") == "starved",
+                    f"…and the queue alarm must still be evaluated: {record3.get('starvation')}",
+                )
+                check(
+                    not box_repair.calls("provisioner-calls.log"),
+                    "an unmeasured disk is NOT permission to add a runner",
+                )
+                check(
+                    record3["verdict"] == "unmeasurable",
+                    f"a pass that never asked its only capacity question is NOT converged: "
+                    f"{record3['verdict']}",
+                )
+                check(
+                    record3.get("unverified_cause") == "disk-unreadable",
+                    f"…and the cause must be named: {record3.get('unverified_cause')}",
+                )
+            finally:
+                box_repair.destroy()
+            # and with nothing installed there is nothing to measure, so the allowance is used
+            box2 = Box("disk-allowance")
+            try:
+                box2.disk(30_000)
+                record2 = converge(box2, nproc="8", want=0)
+                check(
+                    record2["per_runner_disk_mb"] == ra.FOOTPRINT_MB_DEFAULT,
+                    f"no installs ⇒ the installer's allowance: {record2['per_runner_disk_mb']}",
+                )
+                check(
+                    "nothing installed yet" in record2["reading"],
+                    f"and the reading must SAY so: {record2['reading']}",
+                )
+            finally:
+                box2.destroy()
+        finally:
+            box.destroy()
+
+
+@test("T25 the provisioner's refusal is a CONFLICT when this tool's arm says one more fits")
+def t25_guard_conflict():
+    """The two guards answer DIFFERENT questions — the installer provisions space for the WHOLE
+    target plus its reserve, this pass adds ONE runner. When they disagree, the box needed capacity
+    and got none, and the reason must be a verdict with both numbers, not an `action-failed` note
+    (a scheduled pass would cry failure every 10 minutes) and not a silent refusal either."""
+    with Env():
+        box = Box("guard-conflict")
+        try:
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.disk(9000)  # the measured 9G of the incident
+            box.footprint({"gh-runner-x64": 2000})  # a real install is ~2G, not 8G
+            check(ra.disk_allows_one_more(30_000, 2000) is True, "30G free holds a 2G runner")
+            check(
+                ra.disk_allows_one_more(21_000, 2000) is False,
+                "21G free does NOT: the 20G reserve is the installer's, and it is respected",
+            )
+            # ⛔ THE REACHABLE CONFLICT: the box has room for the ONE runner this pass adds
+            # (free 25G - 20G reserve >= 2G measured), and the installer still refuses because it
+            # asks about the WHOLE target at its own 8G-per-runner allowance.
+            # 36864MB free = 20480 reserve + TWO 8192 runners ⇒ ceiling 3 with 1 running
+            box.disk(36_864)
+            box.footprint({"gh-runner-x64": 2000})
+            box.provisioner(
+                rc=2,
+                out="REFUSED: disk headroom: 25G free against 44G needed for 3 runners (+20G reserve)",
+            )
+            record = converge(box, nproc="8", want=3)
+            check(
+                record["verdict"] == "guard-conflict",
+                f"a disagreement between the guards is its own verdict: {record['verdict']}",
+            )
+            conflict = next(n for n in record["notes"] if "GUARD CONFLICT" in n)
+            check(
+                "44G needed for 3 runners" in conflict and "free=36864MB" in conflict,
+                f"both sides' numbers must be in the note: {conflict}",
+            )
+            check(
+                "DISAGREE" in conflict and "does not interpret its prose" in conflict,
+                f"…and it must not claim to know WHY the installer refused: {conflict}",
+            )
+            # a REAL pass (no --status): a dry run never calls the provisioner, so it cannot
+            # discover a conflict at all — and the exit code is what a monitor reads
+            code, out = cli(box, "--want", "3")
+            check(code == 3, f"a conflict exits 3 (capacity was needed and not added), got {code}: {out}")
+            check("verdict=guard-conflict" in out, f"and the verdict is printed: {out}")
+
+            # ⛔ THE AGREEMENT BRANCH IS REACHABLE, and this is what makes it so: the ceiling is
+            # computed ONCE but the fill RE-MEASURES the disk, so a box that filled up between the
+            # two gets a refusal this tool's own arm AGREES with. The verdict must then be a plain
+            # refusal (an answer), not a conflict page.
+            box.disk_seq([36_864, 21_000])
+            box.provisioner(rc=2, out="REFUSED: disk headroom: 21G free against 44G needed")
+            record2 = converge(box, nproc="8", want=3)
+            check(
+                record2["verdict"] == "provisioner-refused",
+                f"when the arm AGREES, a refusal is an answer, not a conflict: {record2['verdict']}",
+            )
+            check(
+                "DISK arm also says the increment does not fit"
+                in next(n for n in record2["notes"] if "REFUSED" in n),
+                f"…and the note must say so: {record2['notes']}",
+            )
+            check(
+                "blocked" not in record2["verdict"],
+                "a refusal must never read as a failure",
+            )
+        finally:
+            box.destroy()
+
+
 # ── the mutation map ──────────────────────────────────────────────────────────────────────────
 class Mutation:
     def __init__(self, case_id, old, new, why):
@@ -1662,6 +1966,41 @@ class Mutation:
 
 
 MUTATIONS = [
+    Mutation(
+        "T24",
+        'if len(fields) >= 4 and fields[-3].isdigit():\n            return int(fields[-3])',
+        'if len(fields) >= 4 and fields[3].isdigit():\n            return int(fields[3])',
+        "a `df` source with a space shifts the fields: the TOTAL is read as free space (over-add)",
+    ),
+    Mutation(
+        "T24",
+        "    value = min(by_core, by_mem, by_disk)",
+        "    value = min(by_core, by_mem)",
+        "the disk arm is computed and then ignored — the ceiling asks for a runner the disk cannot hold",
+    ),
+    Mutation(
+        "T24",
+        '    return max(measured, FOOTPRINT_MB_DEFAULT), (',
+        "    return FOOTPRINT_MB_DEFAULT, (",
+        "the MEASURED footprint is replaced by the installer's allowance, so the reading lies",
+    ),
+    Mutation(
+        "T25",
+        "            if fits:",
+        "            if False:",
+        "a guard disagreement is reported as an ordinary refusal: the capacity gap loses its name",
+    ),
+    # ⛔ NO MUTATION FOR THE FILL'S `disk_free_mb is None` CLAUSE, DELIBERATELY: removing it changes
+    # nothing observable, because the SAME unmeasured disk is re-read at the top of every step and
+    # that guard stops the fill anyway (measured: the mutant reports every T24 assertion green). Two
+    # independent guards for one condition is defence in depth, not dead code — but a mutation that
+    # cannot be distinguished is not evidence, so it is not listed.
+    Mutation(
+        "T24",
+        '        disk_part = "by_disk=UNKNOWN"',
+        '        disk_part = "by_disk=0"',
+        "an unknown disk is reported as ZERO, which is an answer this tool does not have",
+    ),
     Mutation(
         "T19",
         "3 is NOT a rollback",
@@ -1923,8 +2262,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T13",
-        'if not record["problems"] and not record.get("unverified") and not record.get("problem_kind"):',
-        'if not record.get("unverified") and not record.get("problem_kind"):',
+        '    if (\n        not record["problems"]\n        and not record.get("problem_kind")\n        and record.get("unverified_cause") != "pool-read-after-restart"\n    ):',
+        '    if (\n        not record.get("problem_kind")\n        and record.get("unverified_cause") != "pool-read-after-restart"\n    ):',
         "the alarm runs on a pass that already FAILED, so a consumer can page on it beside action-failed",
     ),
     Mutation(
@@ -1943,8 +2282,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T12",
-        'if not record["problems"] and not record.get("unverified") and not record.get("problem_kind"):',
-        'if not record["problems"] and not record.get("unverified") and not record.get("problem_kind") and not record["actions"]:',
+        '    if (\n        not record["problems"]\n        and not record.get("problem_kind")\n        and record.get("unverified_cause") != "pool-read-after-restart"\n    ):',
+        '    if (\n        not record["problems"]\n        and not record.get("problem_kind")\n        and record.get("unverified_cause") != "pool-read-after-restart"\n        and not record["actions"]\n    ):',
         "the alarm is suppressed by ACTIONS, so a repair that never sticks silences it for ever (#2875)",
     ),
 ]
