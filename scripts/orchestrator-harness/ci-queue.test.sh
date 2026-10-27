@@ -184,26 +184,54 @@ ciq_read "$OR" >/dev/null 2>&1
 feed 31 5 -
 ciq_read "$OR" >/dev/null 2>&1
 v="$(ciq_eval)"
-ck "(b6b) a refused runner read falls back to the measured floor, never the allowance (got: ${v})" \
-   "$( case "$v" in *'ceiling=10'*) echo 0 ;; *) echo 1 ;; esac )"
+has "$v" 'ceiling=40'
+ck "(b6b) a refused runner read never takes the hosted ALLOWANCE (the permissive direction)" "$( [ $? -ne 0 ]; echo $? )"
+has "$v" 'runners=~1'
+ck "(b6b2) …it takes the documented 1-runner floor (got: ${v})" "$?"
 # A garbled `running` must not become a ceiling the gate can never reach: 9 digits pass
-# `ciq_is_count` and would yield ceiling ~2e9, switching back-pressure off silently. Driven on the
-# UNMEASURED path (refused endpoint), where the floor is the only runner source.
+# `ciq_is_count` and would yield ceiling ~2e9, switching back-pressure off silently.
+# ⛔ AND IT MUST NOT BECOME THE FLEET SIZE AT ALL (#2917). This arm replaces the old "clamped by the
+# allowance" shape: with NOTHING measured, the in-progress count is DEMAND answering a SUPPLY
+# question, so a garbled `running` now lands on the same 1-runner floor as any other number.
 feed 5 499999999 -
 ciq_read "$OR" >/dev/null 2>&1
 v="$(ciq_eval)"
-ck "(b6c) an absurd \`running\` is CLAMPED by the allowance, never made the ceiling (got: ${v})" \
-   "$( case "$v" in *'runners=~20'*'ceiling=40'*) echo 0 ;; *) echo 1 ;; esac )"
+has "$v" 'ceiling=2'
+ck "(b6c) an absurd \`running\` is never made the ceiling (got: ${v})" "$?"
+has "$v" 'runners=~1'
+ck "(b6c2) …and it is never made the FLEET either" "$?"
+# ⛔ THE MEASURED DEFECT, ARMS (b6d)/(b6e) — 2026-10-27, cell 4 (#2917). The live line was
+# `runners=~2 => ceiling=4 => DEEP` with `queued=33 running=2` on a repo whose 8-registered fleet was
+# all online and idle: the ceiling was derived from the jobs EXECUTING, so the gate read the box's own
+# load as the world's capacity, and 41 consecutive PR-REPAIR dispatches were skipped by it.
+# (b6d) is that exact reading: the fleet size was not read, so `running=2` must not become `~2`.
+feed 33 2 -
+v="$(ciq_read "$OR" >/dev/null 2>&1; ciq_eval)"
+has "$v" 'runners=~2'
+ck "(b6d) the measured 2026-10-27 shape: an unreadable fleet size is NOT reported as the in-progress count (got: ${v})" "$( [ $? -ne 0 ]; echo $? )"
+has "$v" 'runners=~1'
+ck "(b6d2) …it is reported as the documented floor, and the ceiling from it" "$?"
+has "$v" 'fleet=unreadable(the actions/runners endpoint refused'
+ck "(b6d3) …and the line NAMES the reading that failed, in the endpoint's own words" "$?"
+# (b6e) the same queue numbers with a FLEET that can be read: the 8 online runners must decide, and
+# the queue must then be deep. This is the arm that makes (b6d) a measurement of the FLEET and not a
+# blanket "always small".
+feed 33 2 8
+v="$(ciq_read "$OR" >/dev/null 2>&1; ciq_eval)"
+has "$v" 'runners=8'
+ck "(b6e) a READABLE fleet is what the ceiling is derived from (got: ${v})" "$?"
+has "$v" 'ceiling=16'
+ck "(b6e2) …ceiling=ceil(8*20/10)=16, and 33 queued is over it (so new work still defers)" "$?"
 feed 97 7 0
 ciq_ci_allowed "$OR"; d0=$?
 ck "(b7) hosted CI, zero repo runners: the MEASURED incident (97) is DEFERRED" "$( [ "$d0" -eq 1 ]; echo $? )"
 feed 4 1 0
 ciq_read "$OR" >/dev/null 2>&1
-ck "(b8) an unmeasured runner count is DECLARED inferred in the record (runners=${CIQ_RUNNERS:-?})" \
-   "$( case "${CIQ_RUNNERS:-}" in '~'*) echo 0 ;; *) echo 1 ;; esac )"
+has "${CIQ_RUNNERS:-?}" '~'
+ck "(b8) an unmeasured runner count is DECLARED inferred in the record (runners=${CIQ_RUNNERS:-?})" "$?"
 v="$(ciq_eval)"
-ck "(b9) the ceiling comes from the allowance, not from \`running\` (ceiling=40, got: ${v})" \
-   "$( case "$v" in *'ceiling=40'*) echo 0 ;; *) echo 1 ;; esac )"
+has "$v" 'ceiling=40'
+ck "(b9) the ceiling comes from the allowance, not from \`running\` (ceiling=40, got: ${v})" "$?"
 # ⛔ A DECLARED FLEET THAT IS ENTIRELY OFFLINE IS NOT THE HOSTED ZERO (#2333 review P1). Collapsing
 # `total_count>=1 with nothing online` into "no fleet" claims the allowance and ALLOWS the incident's
 # own 31-deep queue with nothing able to drain it. Fail CLOSED: ceiling floors at 1 runner = 2.
@@ -228,12 +256,15 @@ ck "(b12) declared-but-offline still honours \`running\` (4 queued, 7 running =>
 # incident's own queue. Both arms below are red on the pre-fix tree (ceiling 40 => allowed).
 feed 31 5 0 true 0 1
 ciq_ci_allowed "$OR"; d0=$?
-ck "(b13) an answered-but-UNPARSEABLE runners body fails CLOSED (31 queued, 5 running => ceiling 10 => DEFERRED)" \
+ck "(b13) an answered-but-UNPARSEABLE runners body fails CLOSED (31 queued => 1-runner floor => DEFERRED)" \
    "$( [ "$d0" -eq 1 ]; echo $? )"
 feed 31 5 0 true 0 1
 ciq_read "$OR" >/dev/null 2>&1
-ck "(b14) …and the record carries the measured floor, never the allowance (runners=${CIQ_RUNNERS:-?})" \
-   "$( [ "${CIQ_RUNNERS:-}" = '~5' ]; echo $? )"
+ck "(b14) …and the record carries the documented floor, never the allowance (runners=${CIQ_RUNNERS:-?})" \
+   "$( [ "${CIQ_RUNNERS:-}" = '~1' ]; echo $? )"
+v="$(ciq_eval)"
+has "$v" 'fleet=unreadable(the actions/runners page carried no parseable total_count)'
+ck "(b14b) …and the line says WHAT it could not read (got: ${v})" "$?"
 
 printf '\n── (c) NOT STICKY: a fresh read decides, not a memory of the last one ──────\n'
 feed 31 5 5

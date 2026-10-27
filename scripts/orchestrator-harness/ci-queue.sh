@@ -102,15 +102,38 @@
 #     tokens are `deep(… state=cache age=Ns)` and `ok(… state=cache age=Ns)`, and the CLI line is
 #     `state=cache source=record(cache) age=Ns` — a grep for `cache(` matched only this comment.
 #     #2333 review, P2.) Past that window the record is dropped and the verdict is UNKNOWN again.
-#   * `runners` is MEASURED when the repo endpoint answers with an online runner count. When no count
-#     is measured there are THREE cases and they do not share one answer (#2333 review cycles 9-11):
-#     the endpoint ANSWERING `total_count: 0` is the hosted-CI shape (GitHub-hosted runners never
-#     appear in that list — it is agent-infra's measured shape) and derives from the account's
-#     concurrent-job allowance; the endpoint answering with a DECLARED fleet nothing online, and the
-#     endpoint REFUSING outright, both mean no parallelism was measured and fail CLOSED to the
-#     measured floor (`max(1, in_progress)` — a runner is running, so a runner exists). The record
-#     says `runners=<n>(busy)` when the endpoint answered with an online count, `runners=~<n>` when
-#     it did not.
+#   * `runners` is the FLEET SIZE — the supply side of the derivation, never the demand side. It is
+#     MEASURED when the repo endpoint answers with an online runner count.
+#     ⛔ NEVER THE IN-PROGRESS COUNT (#2917). `running` is how many JOBS are executing; deriving the
+#     ceiling's runner term from it made the gate read the box's own load as the world's capacity and
+#     printed it in the same `runners=` field a real measurement uses — measured 2026-10-27 on cell 4:
+#     `queued=33 running=2 runners=~2 => ceiling=4 => DEEP`, on an agent-infra whose jobs run on
+#     GitHub-HOSTED runners while its own 8-runner self-hosted fleet sat all-online and all-idle, and
+#     41 consecutive PR-repair dispatches were skipped by that one number. When no count is measured
+#     there are THREE cases and they do not share one answer (#2333 review cycles 9-11, revised by
+#     #2917):
+#       (a) the endpoint ANSWERING `total_count: 0` is the hosted-CI shape (GitHub-hosted runners
+#           never appear in that list — agent-infra's measured shape) and derives from the account's
+#           concurrent-job allowance;
+#       (b) the endpoint answering with a DECLARED fleet and nothing online means the hosted jobs ARE
+#           the running parallelism, so `running` is a legitimate SUPPLY LOWER BOUND (and dropping it
+#           was measured to pin the ceiling at 2 on a repo that runs on hosted capacity — arm (b12));
+#       (c) the endpoint REFUSING outright or answering with no parseable `total_count` means NOTHING
+#           was measured, so the count falls to the module's own documented floor of ONE runner (the
+#           same value `ciq_ceiling` floors at — a 0 ceiling would defer every push for ever) and the
+#           token NAMES the reading that failed (`fleet=unreadable(<the endpoint's words>)`), because
+#           an inference presented as a measurement is the defect this gate exists to avoid.
+#     The record says `runners=<n>(busy)` when the endpoint answered with an online count,
+#     `runners=~<n>` when it did not.
+#   * ⛔ WHAT THIS GATE IS ALLOWED TO GATE IS TWO CLASSES, AND THE LINE IS THE ACTION'S COST (#2917).
+#     ONLY work that ADDS A NEW CI RUN is queue-gated: opening a PR from an issue (agent-infra's
+#     `dispatch-merge.sh`, and `orch-loop.sh`'s ISSUE path) and the merge rail's own CI-spending
+#     steps. REPAIR — acting on a PR that already exists (a red-check fixer, a review-findings fixer,
+#     a conflict/rebase fixer, the PR-sickness queue) — is NOT queue-gated by this module and must
+#     not become so again: its real bounds are the lane slots (`MAX_LANES` vs lanes alive) and the
+#     load/headroom gate, and its head already owns the CI pass it is repairing. Gating repair on this
+#     number is what produced 41 skips while 11 lane slots and 8 runners sat idle. If a future change
+#     wants to defer a repair dispatch, it is not a tuning change — it re-opens #2917.
 #   * TWO DECLARED RESIDUALS ON THE MEASUREMENT ITSELF — both stated, neither closed by reading
 #     harder:
 #     (i) ONLY `status=queued` IS COUNTED (#2333 review, P2). A run parked behind an environment
@@ -247,9 +270,9 @@ ciq_read() {
   # `dispatch-merge.sh`. Nothing collides today; the module's own contract ("a sourced library must
   # not mutate its caller's shell") is what this list exists to honour, and a future local in the
   # caller would be silently clobbered mid-cycle.
-  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor="" _errf="" _sf=""
+  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn declared="" rn_answered="" floor="" _errf="" _rerrf="" _sf="" _fleetwhy=""
   CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""; CIQ_BUSY=""; CIQ_CEILING=""; CIQ_STATE=unknown; CIQ_AGE=""; CIQ_REPO="$repo"
-  CIQ_STREAK=""; CIQ_CAUSE=""
+  CIQ_STREAK=""; CIQ_CAUSE=""; CIQ_FLEET=""
   [ -n "$repo" ] || return 2
   dir="${dir:-$(ciq_state_dir)}"
   f="$dir/ci-queue-$(ciq_slug "$repo")"
@@ -294,6 +317,11 @@ ciq_read() {
   # endpoint actually returned together with the length of the streak.
   mkdir -p "$dir" 2>/dev/null || true
   _errf="$dir/ciq-err"; : > "$_errf" 2>/dev/null || true
+  # ⛔ THE FLEET READ GETS ITS OWN SCRATCH FILE (#2917). The queue reads and the runner read shared
+  # one, so the `unknown(...)` cause named the first HTTP status in the file — which is the QUEUED
+  # read's, not the runner read's. Branch (c) below has to say WHICH reading failed, so it needs the
+  # runner call's own words.
+  _rerrf="$dir/ciq-rerr"; : > "$_rerrf" 2>/dev/null || true
   queued="$(ciq_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>>"$_errf" \
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || queued=""
   running="$(ciq_gh "repos/$repo/actions/runs?status=in_progress&per_page=1" 2>>"$_errf" \
@@ -307,7 +335,7 @@ ciq_read() {
   # flag shifts the URL into `$3`, every stub takes its `*) exit 1` arm, and the count would silently
   # go unmeasured — with the suite red for a reason that hides the parse it exists to cover.
   # Concatenated pages still count correctly: the OBJECTS are counted, never `total_count`.
-  if _rn="$(ciq_gh "repos/$repo/actions/runners" --paginate 2>>"$_errf")"; then
+  if _rn="$(ciq_gh "repos/$repo/actions/runners" --paginate 2>>"$_rerrf")"; then
     # ANSWERED. `rn_answered` is what separates a measured hosted zero from an unreadable endpoint
     # (see the three-branch decision below); without it both collapse into the permissive arm.
     rn_answered=1
@@ -392,46 +420,69 @@ ciq_read() {
     #     NOT the hosted shape: claiming the allowance here quadruples the ceiling and ALLOWS the
     #     incident's own 31-deep queue with nothing able to drain it (measured on
     #     `{"total_count":5,"runners":[{"status":"offline"}]}`). Fail CLOSED to the measured floor.
-    # (c) REFUSED / unparseable — nothing was measured at all, so the allowance is a GUESS in the
-    #     permissive direction: measured, one refused `actions/runners` call turned `queued=31`
-    #     running=5 (a 5-runner fleet) into `~20`/ceiling 40 => ALLOWED, and OVERWROTE a good record
-    #     with the poisoned one for TTL+STALE_MAX (~16 min) — the one shape where the gate reports
-    #     `fresh` while permitting 4x its true ceiling. Fail CLOSED to the measured floor too.
+    # (c) REFUSED / unparseable — NOTHING was measured. The allowance is a GUESS in the permissive
+    #     direction: measured, one refused `actions/runners` call turned `queued=31` running=5 (a
+    #     5-runner fleet) into `~20`/ceiling 40 => ALLOWED, and OVERWROTE a good record with the
+    #     poisoned one for TTL+STALE_MAX (~16 min) — the shape where the gate reports `fresh` while
+    #     permitting 4x its true ceiling. Fail CLOSED.
     #
-    # The measured floor applies to EVERY branch: every executing run occupies a runner, so `running`
-    # is parallelism that demonstrably exists — bounded by the allowance, because a garbled count must
-    # not become a ceiling the gate can never reach (9 digits pass `ciq_is_count` and would yield
-    # ceiling 999999998, switching back-pressure off while the token still reads like a measurement).
-    # ⛔ CLAMPED, NEVER DISCARDED (#2333 review, P2). This test used to DISCARD a measured count that
-    # exceeded the allowance, which is not what the sentence above asks for and carried a 20x CLIFF with
-    # no disclosure: on the unmeasured branches ((b) declared-but-offline, (c) refused) a repo running 19
-    # or 20 concurrent jobs derived ceiling 38/40 and ALLOWED, while 21 — ONE MORE executing job — fell to
-    # `runners=~1`/ceiling 2 and DEFERRED every CI-spending act on the box, still printing `state=fresh` as
-    # though 1 runner were the measurement. That is the fleet-wide stop this module's header names as
-    # unacceptable, reached by a change of one digit, and arm (b6c) encoded it while its own label said
-    # "bounded by the allowance". Clamping keeps the garble bound and bounds it at the module's OWN
-    # accepted maximum ceiling (2x the hosted allowance — the same width the allowance path already
-    # yields), so `running=21` derives 40 — the CLAMP, not the allowance, is what bounds it — and
-    # a 9-digit garble derives 40 too, never 999999998.
+    # ⛔ AND IT MUST NOT BE CLOSED WITH THE IN-PROGRESS COUNT — THAT IS THE DEFECT THIS ARM EXISTS
+    # FOR NOW (#2917, measured 2026-10-27 on cell 4). This branch used to take `floor="$running"`:
+    # with nothing measured, the number of jobs EXECUTING stood in for the size of the FLEET. That is
+    # DEMAND answering a SUPPLY question, and the two are not even correlated in the direction the
+    # gate needs — a box measured `queued=33 running=2 runners=~2 => ceiling 4 => DEFERRED` while its
+    # repo's 8-registered, all-online, all-idle fleet could not appear in the number at all (the
+    # queue it was gating belonged to GitHub-HOSTED concurrency), and 41 consecutive PR-repair
+    # dispatches were skipped by it with 11 lane slots idle. So this branch now uses the module's OWN
+    # documented floor — ONE runner, the same value `ciq_ceiling` floors at, because a ceiling of 0
+    # would defer every push for ever — and it NAMES the reading it could not take, in the token
+    # (`CIQ_FLEET`), so an operator sees an inference and not a measurement.
+    #
+    # The in-progress count is still a legitimate SUPPLY LOWER BOUND on the two ANSWERED branches,
+    # where it is bounded by the allowance so a garbled count cannot become a ceiling the gate can
+    # never reach (9 digits pass `ciq_is_count` and would yield ceiling 999999998, switching
+    # back-pressure off while the token still reads like a measurement). ⛔ IT IS CLAMPED, NEVER
+    # DISCARDED (#2333 review, P2): DISCARDING a count that exceeded the allowance carried a 20x CLIFF
+    # with no disclosure — a repo running 19 or 20 concurrent jobs derived ceiling 38/40 and ALLOWED,
+    # while 21 — ONE MORE executing job — fell to `runners=~1`/ceiling 2 and DEFERRED every
+    # CI-spending act on the box, still printing `state=fresh` as though 1 runner were the
+    # measurement. That is the fleet-wide stop this module's header names as unacceptable, reached by
+    # a change of one digit. The clamp keeps the garble bound at the module's OWN accepted maximum
+    # ceiling (2x the hosted allowance — the same width the allowance path already yields).
     floor=1
-    if ciq_is_count "${running:-}" && [ "${running:-0}" -ge 1 ]; then
-      floor="$running"
-      if [ "$floor" -gt "$(ciq_hosted_concurrency)" ]; then floor="$(ciq_hosted_concurrency)"; fi
-    fi
     # ⛔ THE ALLOWANCE DEMANDS POSITIVE EVIDENCE: A **PARSED** `total_count == 0` (#2333 review
-    # cycle 12, P1). Until this cycle the test was `[ -z "$declared" ] || [ "$declared" -eq 0 ]`, and
+    # cycle 12, P1). Until that cycle the test was `[ -z "$declared" ] || [ "$declared" -eq 0 ]`, and
     # `declared` is EMPTY exactly when the answered page carried no parseable `total_count` — i.e.
     # branch (c), unparseable — so an ANSWERED-but-unusable body took the hosted ALLOWANCE, and the
     # shape the (c) comment above records as measured-dangerous came back through the front door:
     # `queued=31` on a repo with nothing online became `~20`/ceiling 40 => ALLOWED, the gate
-    # reporting a measurement it never made. Only a parsed zero selects the allowance; anything else
-    # unmeasured fails CLOSED to the floor, which is what (b) and (c) both say.
+    # reporting a measurement it never made. Only a parsed zero selects the allowance.
     if [ "${rn_answered:-0}" = 1 ] && [ "${declared:-x}" = "0" ]; then
       runners="$(ciq_hosted_concurrency)"
-    else
+    elif [ "${rn_answered:-0}" = 1 ] && [ -n "${declared:-}" ]; then
+      # (b) AN ANSWERED READ: the fleet is declared and nothing of it is online. `running` is a
+      # genuine SUPPLY LOWER BOUND here — jobs are executing, so that much capacity exists somewhere
+      # — and dropping it was MEASURED to be worse than keeping it (arm (b12): a stale/decommissioned
+      # self-hosted entry on a repo that actually runs on hosted capacity pinned the ceiling at 2, so
+      # a 4-deep queue deferred for ever).
+      if ciq_is_count "${running:-}" && [ "${running:-0}" -ge 1 ]; then
+        floor="$running"
+        if [ "$floor" -gt "$(ciq_hosted_concurrency)" ]; then floor="$(ciq_hosted_concurrency)"; fi
+      fi
       runners="$floor"
+    else
+      # (c) NOTHING was measured — see the ⛔ above. Name the reading that failed, in the endpoint's
+      # own words, so `fleet=unreadable(HTTP 404)` is not confused with a fleet of one runner.
+      runners="$floor"
+      if [ "${rn_answered:-0}" != 1 ]; then
+        _fleetwhy="$(grep -o 'HTTP [0-9][0-9][0-9]' "$_rerrf" 2>/dev/null | head -1)"
+        [ -n "${_fleetwhy:-}" ] || _fleetwhy="$(sed -n '1s/[[:space:]]*//p' "$_rerrf" 2>/dev/null | cut -c1-60)"
+        [ -n "${_fleetwhy:-}" ] || _fleetwhy="no answer"
+        CIQ_FLEET="fleet=unreadable(the actions/runners endpoint refused: ${_fleetwhy}) fallback=runners=~${runners} (the 1-runner floor, NOT the in-progress count)"
+      else
+        CIQ_FLEET="fleet=unreadable(the actions/runners page carried no parseable total_count) fallback=runners=~${runners} (the 1-runner floor, NOT the in-progress count)"
+      fi
     fi
-    if [ "$floor" -gt "$runners" ]; then runners="$floor"; fi
     runners="~$runners"
   fi
   CIQ_QUEUED="$queued"; CIQ_RUNNING="${running:-0}"; CIQ_RUNNERS="$runners"; CIQ_BUSY="$busy"
@@ -490,14 +541,16 @@ ciq_eval() {
     # ⛔ STATE AND AGE RIDE THE `deep` TOKEN TOO (#2333 review P1). The cached record is the ONE
     # fail-open here, and a `deep(...)` that said neither `state=cache` nor `age=<n>s` presented a
     # minutes-old reading exactly as it presents a fresh one — on the branch that then DEFERS.
-    printf 'deep(queued=%s running=%s runners=%s%s ceiling=%s derived=ceil(%s*%s/%s) state=%s%s)' \
+    printf 'deep(queued=%s running=%s runners=%s%s ceiling=%s derived=ceil(%s*%s/%s) state=%s%s%s)' \
       "$q" "$r" "${CIQ_RUNNERS}" "$( { [ "${CIQ_RUNNERS#\~}" = "$CIQ_RUNNERS" ] && [ -n "${CIQ_BUSY:-}" ]; } && printf ' busy=%s' "$CIQ_BUSY" )" \
       "$c" "$n" "$(ciq_horizon_min)" "$(ciq_job_p90_min)" "${CIQ_STATE}" \
-      "$( [ "${CIQ_STATE}" = cache ] && printf ' age=%ss' "${CIQ_AGE}" )"
+      "$( [ "${CIQ_STATE}" = cache ] && printf ' age=%ss' "${CIQ_AGE}" )" \
+      "$( [ -n "${CIQ_FLEET:-}" ] && printf ' %s' "$CIQ_FLEET" )"
     return 0
   fi
-  printf 'ok(queued=%s running=%s runners=%s ceiling=%s state=%s%s)' \
-    "$q" "$r" "${CIQ_RUNNERS}" "$c" "${CIQ_STATE}" "$( [ "${CIQ_STATE}" = cache ] && printf ' age=%ss' "${CIQ_AGE}" )"
+  printf 'ok(queued=%s running=%s runners=%s ceiling=%s state=%s%s%s)' \
+    "$q" "$r" "${CIQ_RUNNERS}" "$c" "${CIQ_STATE}" "$( [ "${CIQ_STATE}" = cache ] && printf ' age=%ss' "${CIQ_AGE}" )" \
+    "$( [ -n "${CIQ_FLEET:-}" ] && printf ' %s' "$CIQ_FLEET" )"
   return 1
 }
 
