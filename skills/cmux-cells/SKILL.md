@@ -19,7 +19,8 @@ updated: 2026-10-27
 The fleet runs on the macOS laptop (launchd) plus the Linux cells the provider currently allocates — `cmux vm ls` on
 2026-10-27 showed **three**: `pi-cell-1`, `pi-cell-3`, `pi-cell-4`. (`pi-lane-1` is an **earlier label of the same VM now
 labelled `pi-cell-1`** — `vm-efa6cc8f…`; `cloud-cell-bringup.sh:42` pairs them — a relabel, not a lost box. **cell-2** is the
-one that is genuinely absent. Treat any inventory, including this one, as a reading: re-run `cmux vm ls` before acting on
+one that is genuinely absent. `docs/ops/ACTIVATION-MATRIX.md` still speaks in the OLD labels (`pi-lane-1`, `pi-cell-2`), so read
+it with this mapping in hand. Treat any inventory, including this one, as a reading: re-run `cmux vm ls` before acting on
 it.) ⚠️ **`pi-cell-N` is the LABEL column; every `cmux vm <verb>` takes the
 NAME column (`vm-<hex>`)** — `cmux vm stats pi-cell-4` returns a 404 whose own advice is "start a new one", a
 spend-flavoured remedy for a box that is already running. Read the NAME from `cmux vm ls`. Cells are Linux, so **any
@@ -142,7 +143,8 @@ The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, a
 **input changes** — a lane finishes or drains (73), disk is reclaimed or a lane finishes (77), the brief is re-authored (80),
 the install is repaired (78), the repo's open-PR queue actually lands (74 — or, on its **other arm**, that worktree's origin
 is made a readable `owner/name` slug again, since 74 also fires when `land_backlog_repo` cannot derive one and landing does not
-fix that). **Idling on its own changes none of them**: for 73
+fix that; a P0-blocker or a base-red repair is **exempt by evidence** and dispatches anyway). **Idling on its own changes none
+of them**: for 73
 and 77 the release *is* a lane draining, so the drain has to actually complete rather than just pass time — which is why the
 gate's own two messages read "does NOT clear by waiting" (fork) and "This is NOT a load refusal: waiting does not clear it"
 (headroom) while both still offer "or let its lanes drain" / "or let a lane finish". So diagnosing a 73, 77, 74, 78 or 80 as
@@ -155,8 +157,9 @@ uses `LANE_MEM_MB` (default **512**) against `MEM_BUDGET_PCT` (default **75**) o
 scheduler 512, planning ~1000 for a test-running lane (the table above) — and this file deliberately uses the larger.
 Reconcile against `docs/ops/ai-drainer.md` before raising either. Where the gate speaks, the gate is right.
 
-`MAX_LANES` is **derived** (`2.5 × cores`) and enforced by the controller — but it is an integer: it knows neither disk nor
-RAM, so it is an upper bound, never the answer (§7).
+`MAX_LANES` is **derived** (`2.5 × cores`) **only when nothing sets it** — and on every cell something does: `keys.env` pins
+`export MAX_LANES=20`, and an explicit value wins over the derivation. The controller still enforces it, but the number knows
+neither disk nor RAM, so it is an upper bound, never the answer (§7).
 
 ⛔ **DO NOT RE-INVENT THE CAPACITY GATE — `scripts/orchestrator-harness/spawn-gate.sh` ALREADY IS IT** (checked
 2026-10-27). It derives `MAX_LOAD` from `nproc × 10` when unset, refuses on a non-empty disk band (`disk_free_mb` vs
@@ -197,10 +200,10 @@ A **disk-full** cell behaves exactly like a dead one: the control agent cannot w
 while the provider insists `running`. Measured 2026-10-19: cell-3 sat at 29.9/32 GB, CPU 77%, exec failing for an hour,
 having submitted nothing for 141–226 minutes.
 
-Recovery ladder, cheapest first. **Establish a channel before anything else** — and read it carefully, because four readings
+Recovery ladder, cheapest first. **Establish a channel before anything else** — and read it carefully, because three readings
 that look like channel verdicts are not:
 
-- **A real refusal kills steps 1-2 outright**, whatever its cause. The channel that then answers is
+- **A real refusal kills steps 1-2 outright**, whatever its cause — that one *is* a verdict. The channel that then answers is
   `cmux vm exec <vm> -- <cmd>` (it needs no `cmux-tui` daemon) — **unless `/` is nearly full**: a guest at 93 % has already
   been measured with `exec` failing for an hour (above), so treat a nearly-full box as no-channel, not only a 100 % one. With
   **both** of those gone, the in-guest surface left is the **display** the same render prints (`cmux surface open
@@ -241,9 +244,11 @@ none of the reclaim steps below touch it.
    the reclaim steps above touch it, so if it is the volume that is full, that is an **owner-level** action: it is a per-box
    loop file (`cmux-tui-state.ext4` — 974 MB on cell-3, 3,996 MB on cell-4) and **no `cmux vm` verb resizes it**. A reset is
    not just an unlink: the `cmux-tui` daemon holds that registry **open read-write** (6 fds on cell-3), so deleting the file
-   frees nothing until those fds close — stop `cmux-tui-daemon.service` (or kill the `cmux-tui server` process), delete
-   `sessions/<id>/workspace-registry.sqlite3` (its ~43 MB `-wal` regenerates), restart the daemon, **then** re-read `df` — or
-   recreate the box.
+   frees nothing until those fds close. ⛔ **And stopping it is not a small act:** the unit is `KillMode=control-group`, so
+   `systemctl stop cmux-tui-daemon.service` SIGTERMs **every process in it** — on cell-3 that cgroup held 124–207 processes,
+   including live `pi` lanes, a running `pytest`, and the terminal hosts. Run the `@{u}..HEAD` / `status --porcelain` checks
+   below in those sessions first, then: stop the unit, delete `sessions/<id>/workspace-registry.sqlite3` (its ~43 MB `-wal`
+   regenerates), restart it, **then** re-read `df` — or recreate the box (also destructive, see the display note above).
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -358,15 +363,17 @@ dispatch time, because both move.
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, but **needs activation (§1)** before it can land |
-| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — half the cores of the other two, so its in-box lane ceiling is half (§7). Memory is what it runs out of: its `dmesg` has 2 OOM kills — re-read at dispatch |
-| `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target, and **the box with the most OOM kills of the three (5)** — raise its reserve per §2 |
+| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — **half the cores of the other two, but the same pinned `MAX_LANES=20`** (§7), i.e. the controller will admit twice the lanes this box's RAM supports. Memory is what it runs out of: its `dmesg` has 2 OOM kills — re-read at dispatch |
+| `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target, and **the box with the most OOM kills of the three (5)** — give it the larger share of the free pool |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
 ⛔ **TWO DIFFERENT CEILINGS — DO NOT CONFUSE THEM, AND DO NOT TREAT EITHER AS THE WHOLE ANSWER.** The owner ruled on
 2026-10-17 (`docs/ops/fleet-capacity.md`) that **between boxes** dispatch is gated on capacity, not a lane count — that is
 `cap_place`, and the objection is to a count standing in for capacity **across a fleet**. **Inside one box there IS a real
-ceiling**: `MAX_LANES`, derived as **2.5 × cores** (`orch-loop.sh`: `10#$_NCPU * 5 / 2`, rendered into the launchd plist),
-and the controller refuses at `lanes >= MAX_LANES` (`GATE_WHY=lanes=N>=max_lanes=M`). It is real — and the *number* knows
+ceiling**: `MAX_LANES` — `2.5 × cores` when unset (`orch-loop.sh`: `10#$_NCPU * 5 / 2`), **but the cells pin it**
+(`keys.env`: `export MAX_LANES=20`, and an explicit value wins), so **all three boxes enforce 20 regardless of core count**:
+cell-3 (8 GB, 4 vCPU) and cell-4 (16 GB, 8 vCPU) both refuse at `lanes >= 20` (`GATE_WHY=lanes=N>=max_lanes=M`). That is
+exactly why the number cannot be trusted as capacity — on cell-3 it admits 20 lanes into 8 GB. It is real — and the *number* knows
 **neither disk nor RAM**. The controller's own refusals (`mem_avail <= MIN_MEM_FREE_MB`, default 512; the swap gate, which
 arms only when RAM is tight; and the load gate) sit in the same `GATE_WHY` chain — but they are floors and gates, **not a
 per-lane budget**, so `MAX_LANES` remains an upper bound rather than the answer. The binding constraint is **free disk vs one lane's
