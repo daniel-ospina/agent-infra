@@ -72,7 +72,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle to ~150 MB loaded** — the idle FLOOR re-measured on cells 3–4, 2026-10-27 (5.5 MB minimum); the earlier sample spanned 21–149 MB and is where the 149 MB ceiling comes from, **not** re-measured. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle to a ~150 MB ceiling** — the idle FLOOR re-measured on cells 3–4, 2026-10-27 (5.5 MB minimum); the 149 MB ceiling is the earlier 21–149 MB sample's maximum, **not** re-measured (today's max: 105 MB). The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -140,7 +140,9 @@ codes do not: 80 before 73.
 The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. **Only
 `MAX_LOAD` (75) clears because the box quietens on its own.** The rest clear when their **resource is released** or their
 **input changes** — a lane finishes or drains (73), disk is reclaimed or a lane finishes (77), the brief is re-authored (80),
-the install is repaired (78), the repo's open-PR queue actually lands (74). **Idling on its own changes none of them**: for 73
+the install is repaired (78), the repo's open-PR queue actually lands (74 — or, on its other arm, the worktree's origin is
+made a readable `owner/name` slug again, since 74 also fires when the repo cannot be derived at all and landing does not fix
+that). **Idling on its own changes none of them**: for 73
 and 77 the release *is* a lane draining, so the drain has to actually complete rather than just pass time — which is why the
 gate's own two messages read "does NOT clear by waiting" (fork) and "This is NOT a load refusal: waiting does not clear it"
 (headroom) while both still offer "or let its lanes drain" / "or let a lane finish". So diagnosing a 73, 77, 74, 78 or 80 as
@@ -204,9 +206,10 @@ that look like channel verdicts are not:
   wait for a channel.
 - **`cmux vm tree` printing `(no terminals)` is not a reading of the box** when the same render shows a link error or a null
   workspace list — cell-4 today reports `link_error: connection refused` and `remote_workspaces: null` while its own registry
-  holds **945** terminals. `null` means *unknown*, not *zero*: retry with `--refresh`, then fall back to `exec`. Only a
-  **connected** link that genuinely enumerates zero terminals justifies creating one
-  (`cmux surface new-terminal --machine <vm> --no-open -- <cmd>`).
+  holds **945** terminals. `null` means *unknown*, not *zero*: fall back to `exec` — and note that `--refresh`, which the tool's
+  own render suggests, **can itself time out** (measured: 120 s, exit 1, no catalog at all on a box whose link is refused) and
+  reports "VM request timed out". That is the channel failing, not the box. Only a **connected** link that genuinely enumerates
+  zero terminals justifies creating one (`cmux surface new-terminal --machine <vm> --no-open -- <cmd>`).
 - **A usage error from omitting the id is not a channel verdict** either.
 
 And if the volume that is full is the **`cmux-tui` state volume** described under step 5, skip to that owner-level action —
@@ -226,8 +229,9 @@ none of the reclaim steps below touch it.
    `HOME=/tmp/cell-home`, where a plain *directory* of the same name exists, so `df -Pm ~/.local/state/cmux-tui` answers about
    **`/`** and reports a healthy percentage — a false PASS on exactly the box you are checking. If the path moves, derive it:
    `df -Pm "$(mount | awk '/cmux-tui-state/{print $3}')"`. It fills independently of `/` and holds the terminal state the
-   ladder depends on — `df` reported **97 % capacity, 927 MB of 974 MB used, 31 MiB free** on cell-3 (measured 2026-10-27,
-   while `/` was at 61 %), the consumer being a `workspace-registry.sqlite3` of ~900 MB in that volume's `sessions/`. None of
+   ladder depends on — `df` reported **99 % capacity, 947 MB of 974 MB used, 11 MiB free** on cell-3 (measured 2026-10-27,
+   while `/` was at 60 %), the consumer being a `workspace-registry.sqlite3` of ~900 MB in that volume's `sessions/`. This
+   volume moves by tens of MB per hour — **re-read it**, do not trust the figure above. None of
    the reclaim steps above touch it, so if it is the volume that is full, that is an **owner-level** action: it is a per-box
    loop file (`cmux-tui-state.ext4` — 974 MB on cell-3, 3,996 MB on cell-4) and **no `cmux vm` verb resizes it**, so the
    actionable half is a reset (delete that box's `sessions/<id>/workspace-registry.sqlite3` with its terminals closed),
