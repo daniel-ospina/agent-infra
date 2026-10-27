@@ -17,9 +17,10 @@ updated: 2026-10-27
 # Operating the cmux cloud cells
 
 The fleet runs on the macOS laptop (launchd) plus the Linux cells the provider currently allocates — `cmux vm ls` on
-2026-10-27 showed **three**: `pi-cell-1`, `pi-cell-3`, `pi-cell-4`. (An older `pi-lane-1` label survives in
-`docs/ops/ACTIVATION-MATRIX.md` and there is **no cell-2 today**, so treat any inventory — including this one — as a
-reading: re-run `cmux vm ls` before acting on it.) ⚠️ **`pi-cell-N` is the LABEL column; every `cmux vm <verb>` takes the
+2026-10-27 showed **three**: `pi-cell-1`, `pi-cell-3`, `pi-cell-4`. (`pi-lane-1` is an **earlier label of the same VM now
+labelled `pi-cell-1`** — `vm-efa6cc8f…`; `cloud-cell-bringup.sh:42` pairs them — a relabel, not a lost box. **cell-2** is the
+one that is genuinely absent. Treat any inventory, including this one, as a reading: re-run `cmux vm ls` before acting on
+it.) ⚠️ **`pi-cell-N` is the LABEL column; every `cmux vm <verb>` takes the
 NAME column (`vm-<hex>`)** — `cmux vm stats pi-cell-4` returns a 404 whose own advice is "start a new one", a
 spend-flavoured remedy for a box that is already running. Read the NAME from `cmux vm ls`. Cells are Linux, so **any
 harness change must work on both platforms** — one source of truth with a platform branch, never two drifting copies.
@@ -71,7 +72,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | containers 21–149 MB each (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~10–150 MB**, decided by what it is doing (`docker stats --no-stream`, cells 3–4); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -136,8 +137,10 @@ codes do not: 80 before 73.
    needs **6,494 MB** free, so the floor is not the number that decides (agent-infra#2721);
 4. **load** — `MAX_LOAD`, default `nproc × 10` (exit 75; `PI_GATE_REFUSED` 76 is translated into 75).
 
-The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. Diagnosing a
-73 as "disk or load" and waiting is the trap: it is the one refusal waiting does not clear.
+The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. **Waiting
+clears exactly one of these — `MAX_LOAD` (75).** Diagnosing a 73, 77, 80 or 74 as "the box is busy" and waiting is the trap:
+the gate's own refusal texts say so ("This is NOT a load refusal: waiting does not clear it"; "a disk refusal will NEVER
+clear on its own"), and only 75 goes away when the box quietens.
 
 **RAM is read by two other instruments — `spawn-gate.sh` reads NO memory at all.** The two floors live in `orch-loop.sh`
 (`MIN_MEM_FREE_MB`, default 512) and `capacity.sh` (`CAP_MIN_MEM_MB`, 512). The **scheduler** does budget per lane: `ai-drainer.sh`
@@ -193,9 +196,14 @@ Recovery ladder, cheapest first:
 2. `cmux vm terminal send <vm> <term-id> '<command>' --keys enter` — runs a command when `exec` cannot. The **send** verb
    prints nothing back; read the result with `vm terminal read` (step 1).
 3. `cmux vm pause <vm>` then `cmux vm resume <vm>` — provider-level reset. Fixes a wedged agent, does **not** fix a full disk.
-4. **`cmux vm resize <vm> --disk <GiB>`** — grows in place, 4 GiB steps, **cannot shrink**. The correct lever for a full guest:
-   32 → 40 GiB made a dead-looking box respond immediately.
+4. **`cmux vm resize <vm> --disk <GiB>`** — grows in place, 4 GiB steps, **cannot shrink**, and only helps while the VM is
+   **below `maxDiskMb`**. Measured 2026-10-27, all three boxes are AT the per-VM cap (128 GB of a 131,072 MB ceiling), so
+   today this lever refuses: the remedy for a full guest is step 5 (reclaim), and real growth needs a plan change
+   (owner-level). When a box *is* below the cap, 32 → 40 GiB has made a dead-looking box respond immediately.
 5. Then, inside: kill stale lanes, `git gc --prune=now` on the clones, clear caches, re-run the update.
+   ⚠️ **`/` is not the only volume that fills.** On a cell also read `df -Pm` for the `cmux-tui` state volume (a small loop
+   mount at `~/.local/state/cmux-tui`): it fills independently of `/`, and it holds the terminal state that the ladder above
+   depends on — measured 927 of 974 MB (97 %) on cell-3 while `/` was 61 % full.
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -309,7 +317,7 @@ dispatch time, because both move.
 
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
-| `pi-cell-1` | product work | 16 GB RAM / 128 GB disk — roomiest, but **needs activation (§1)** before it can land |
+| `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, idle-most today, but **needs activation (§1)** before it can land |
 | `pi-cell-3` | product work | 8 GB RAM — the real constraint (its `dmesg` shows 2 OOM kills); disk well short of full by the guest's own `df` |
 | `pi-cell-4` | product + CI-cost work | 16 GB, 8 vCPU; the current default dispatch target |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
@@ -326,7 +334,8 @@ per-lane budget**, so `MAX_LANES` remains an upper bound rather than the answer.
 number of lanes.
 
 ⚠️ **`docs/ops/fleet-capacity.md` states the contrary twice** — `:157` *"there is deliberately no lane ceiling
-tied to cpu count"*, and `:283` restating it as "§4's ruling" — while the code has the 2.5× rule. **Two recorded positions, unresolved** — this skill reports what
+tied to cpu count"*, and `:283` restating it as "§4's ruling" (the doc's own cross-reference is stale: that text sits at
+`:157`, inside §5) — while the code has the 2.5× rule. **Two recorded positions, unresolved** — this skill reports what
 the code does and does not claim the doc is wrong. Whoever settles it should mark the resolution `OVERRIDES:` in the doc:
 silently letting a reader pick one is how a ruling gets tidied away.
 
