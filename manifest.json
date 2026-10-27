@@ -22,6 +22,7 @@
         "auto-sync.ts",
         "repo-freshness.ts",
         "task-heartbeat.ts",
+        "task-signal-forensics.ts",
         "session-checks.ts",
         "compaction-watchdog.ts",
         "clamp-output-floor.ts",

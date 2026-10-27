@@ -1,6 +1,8 @@
 # Lane signal forensics — who killed the child, and did the work survive?
 
-**Status:** instrument shipped; the 2026-10-27 mass kill is **unattributable from logs** (proof below).
+**Status:** evidence recorded + instrument shipped (`extensions/task-signal-forensics.ts`); the
+2026-10-27 mass kill itself remains **unattributable from logs** (proof below), which is exactly why
+the instrument exists.
 **Issue:** agent-infra#2932.
 
 ## The question this file answers
@@ -18,7 +20,7 @@ out and why, and what the harness now records so the next one names its sender.
 |---|---|---|---|---|
 | **17** | 15:35:02.0 → 15:35:05.8 | 143 | `non-zero-exit` (17/17) | 15 m – 279 m |
 
-Three repositories (agent-infra, tortoise, DMeer, premise-labs) and two `/tmp` fixtures. The issue's
+Four repositories (agent-infra, tortoise, DMeer, premise-labs) and two `/tmp` fixtures. The issue's
 five are a subset; twelve more died in the same 3 s.
 
 ### Why `reason` is the discriminator
@@ -97,17 +99,103 @@ recorded the sender.**
 
 ## The instrument
 
-`extensions/task-signal-forensics.ts` — child-side, armed in every dispatched `pi -p` child
-(`PI_MODE=print` + `TASK_HEARTBEAT=1`, the established sub-agent identity pair). On `SIGTERM` /
-`SIGINT` / `SIGHUP` it appends **one JSON line** naming the sender:
+A child-side extension, armed in every dispatched `pi -p` child (`PI_MODE=print` +
+`TASK_HEARTBEAT=1`, the established sub-agent identity pair). On `SIGTERM` / `SIGINT` / `SIGHUP` it
+appends **one JSON line** naming the sender, then re-raises the signal so the exit code the harness
+records is unchanged (still 143 / 130 / 129):
 
 ```json
-{"event":"lane-signalled","signal":"SIGTERM","pid":63127,"ppid":1920,
- "parent_argv":"pi","parent_comm":"pi","parent_alive":true,
- "cwd":"/…/.worktrees/w-drainer-fix","pgid":63127,"ts":"2026-10-27T19:35:02.914Z"}
+{"event":"lane-signalled","signal":"SIGTERM","pid":7180,"ppid":7112,
+ "parent_argv":"/bin/bash -c export PATH=\"…\" … git status --porcelain | head -3 …",
+ "parent_comm":"/bin/bash","parent_alive":true,"pgid":7107,
+ "cwd":"/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fix-2932",
+ "checkpoint":{"status":"saved","reason":"uncommitted-work",
+   "ref":"refs/lane-checkpoints/2026-10-27T211405712Z-7180",
+   "commit":"1db689d847ec115ba36a84c346e1a46297960f44","files":6,"elapsedMs":672},
+ "ts":"2026-10-27T21:14:06.404Z"}
 ```
 
-`parent_argv` is read with `ps -o args= -p $PPID` at signal time — the one fact no post-mortem can
-reconstruct, because the parent may have exited or the pid may have been reused.
+That sample is a real capture, not a mock: the lane was this worktree (6 files — 3 modified, 3
+new), it was TERMed 2 s after arming, and 672 ms later the work was pinned by a ref whose tree
+contained every one of the 6 files while `git status` still reported all 6 as uncommitted. The
+`parent_argv` is the whole point: it names the shell that sent the signal, which no post-mortem
+reconstruction could have produced.
 
-See `docs/ops/lane-signal-forensics.md` §verify-run for the TERM test and its mutations.
+`parent_argv` is read with `ps -o args= -p $PPID` at signal time — the one fact no post-mortem can
+reconstruct, because the parent may have exited by then or the pid may have been reused.
+
+A second arm checkpoints uncommitted work before the process dies, so a killed lane's tree is
+recoverable even when the lane never committed. It is a **snapshot commit pinned by a ref**, built
+against a temporary index, so the branch, `HEAD`, the real index and the working tree are never
+touched:
+
+```
+GIT_INDEX_FILE=<tmp> git read-tree HEAD
+git add -A                     (untracked files included)
+GIT_INDEX_FILE=<tmp> git write-tree
+git commit-tree <tree> -p HEAD -m "lane checkpoint: …"
+git update-ref refs/lane-checkpoints/<iso>-<pid> <commit>
+```
+
+Recovery: `git log --oneline refs/lane-checkpoints/*`, `git diff HEAD <ref>`, `git cherry-pick <ref>`.
+The record carries the outcome — `saved` / `skipped` (`clean`, `not-a-repo`, `no-head`,
+`git-op-in-progress:<marker>`) / `failed` (`git-timeout`, `read-tree-failed`, …) — so a lane that
+could not be saved says so instead of reading as saved.
+
+### Why the checkpoint is bounded at 3 s
+
+The task harness's own watchdogs escalate `SIGTERM` → **5 s** → `SIGKILL`
+(`armExitWatchdog` / `armCompletionWatchdog` in `extensions/builtin-tools`). A checkpoint that
+overran that window would be SIGKILLed half-written and would take the attribution line with it, so
+the snapshot budget is 3 s and one git step is capped at 2 s. A worktree too large to snapshot in
+3 s records `failed/git-timeout`, which is the honest outcome.
+
+### Why not "make the lane's first action a commit"
+
+An empty checkpoint commit at minute 0 does not save anything: the 16 files that died were created
+*after* the lane's first action, and only the signal knows what the lane had accumulated. The
+snapshot has to be taken at the end.
+
+## Verification — the TERM test and its two mutations
+
+`extensions/task-signal-forensics.test.ts` (13 assertion groups, CI-wired) spawns a **real lane**: a
+temporary `.mjs` bootstrap that imports the extension source, arms it, announces readiness and
+idles in a deliberately dirty git repo (one modified tracked file, one untracked file). The suite
+sends that process a real `SIGTERM` and asserts, in this order:
+
+1. the process died by `SIGTERM` (or exit 143) — an instrument must not make a child unkillable;
+2. **arm 1** — exactly one record, naming the victim `pid`, the real `ppid`, the parent's command
+   line read at signal time, the cwd and an ISO timestamp;
+3. **arm 2** — `checkpoint.status == saved`, the ref resolves to the recorded commit, the snapshot
+   contains the modified file **and** the untracked file;
+4. controls — `HEAD` did not move and `git status --porcelain` is byte-identical before/after, so
+   "the work survived" cannot be satisfied by writing it into the branch or by stashing it away.
+
+`tests/lane-signal-forensics/run.sh` (a bash shard, discovered by `scripts/run-bash-shards.sh`) runs
+the suite **twice more against a mutated copy** — the tracked source is never modified; the mutant
+is applied to a temp copy that the suite then imports and spawns:
+
+| mutant | change | result |
+|---|---|---|
+| **A — trap removed** | `process.on(signal, handler)` → a no-op | RED: `10 passed, 3 failed`; the named failure is **`arm 1: the signal log has exactly one record`** |
+| **B — checkpoint arm disabled** | `checkpoint = doCheckpoint ? snapshot() :` → `checkpoint = false ? snapshot() :` | RED: `12 passed, 1 failed`; the named failure is **`arm 2: the checkpoint was SAVED`**, and arm 1 stays green (the two arms are independently load-bearing) |
+
+Baseline: `13 passed, 0 failed`. The driver also refuses (a) a mutation whose anchor does not match
+exactly once, (b) a mutant that reddens everything (the suite crashed instead of asserting), and
+(c) any run that leaves the tracked source modified.
+
+## What this does NOT do, deliberately
+
+- **It does not identify the 2026-10-27 sender.** Attribution needs a victim that survives long
+  enough to write, and every one of the 17 died to a signal it did not record. The instrument is
+  retroactive-free by construction: it can only answer the NEXT one.
+- **It does not touch `lane.sh` / `fix-one.sh` / `merge-one.sh`.** They are a different population
+  (tmux lanes that commit through their own wrapper) and this incident's victims were not among
+  them. Nothing here replaces `lane-merge.sh`'s round cap or its own kill path.
+- **It does not add a reaper, a watchdog, or a timer.** A mass kill has just been shown to be
+  unattributable; adding another killer-shaped instrument before the recorder exists would make the
+  next incident worse, not better.
+- **It does not repoint the harness's `sessionEnded` latch.** That `session_end` is written on every
+  shutdown is a real defect in the parent's completion signal (#191's latch reads a teardown as a
+  completion), but changing a latch that the whole settle path depends on is a separate change with
+  its own blast radius; it is recorded here so the next lane inherits the finding.

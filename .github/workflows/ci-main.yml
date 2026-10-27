@@ -134,6 +134,17 @@ jobs:
         npx tsx extensions/auto-sync.test.ts || failures=$((failures+1))
         mark "extensions/session-checks.test.ts"
         npx tsx extensions/session-checks.test.ts || failures=$((failures+1))
+        # #2932 — task-signal-forensics: when 17 dispatched children were SIGTERM'd
+        # inside 3 s, nothing on the box recorded a sender and three worktrees lost
+        # 16 uncommitted files. This suite spawns a REAL lane, sends it a REAL
+        # SIGTERM, and asserts both arms (the sender is named; the work is pinned by
+        # a checkpoint ref) plus the non-behaviour-change control (still exits by
+        # SIGTERM/143). Zero-dep: node stdlib + git only; needs Node >= 22.18 for
+        # `--experimental-strip-types`, which the fixture uses to import the`.ts`
+        # source from a plain `.mjs` bootstrap. Its mutation driver is a bash shard
+        # (`tests/lane-signal-forensics/run.sh`, discovered by run-bash-shards.sh).
+        mark "extensions/task-signal-forensics.test.ts"
+        npx tsx extensions/task-signal-forensics.test.ts || failures=$((failures+1))
         # #611 — reflect-hook capture attribution: first reflect-hook tests.
         # Zero-dep: stdlib-only; uses dynamic require for env ordering.
         mark "extensions/reflect-hook.test.ts"
