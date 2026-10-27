@@ -109,8 +109,9 @@
 #       the message names explicitly (a `.runner` written before its listener failed) · 3 REFUSED,
 #       nothing changed — `add`: a gate verdict (a floor/ceiling refusal); `restart`: that name has no
 #       registration under $RUNNER_ROOT, or its dir exists without a `.runner` (NOT a capacity verdict —
-#       the message names the state and the action that clears it); `status`: the report
-#       it produced contains a DEAD listener (see below) · 4 name not available (that name is taken;
+#       the message names the state and the action that clears it); `status`: the report it produced
+#       contains a DEAD listener or an ORPHANED registration, or a quarantine whose liveness could not
+#       be measured (see below) · 4 name not available (that name is taken;
 #       nothing changed, try another name) · 5 this name could not be REGISTERED (config.sh failed, or
 #       it left no `.runner`): a per-name failure, so the pass tries the next name rather than ending
 #       ⛔ 4 IS CHECKED BEFORE 3: a name that is already taken reports 4 even on a box that is also
@@ -120,11 +121,14 @@
 #       measured wrongly: this IS the measurement) and NOT 3 (no gate refused it): a scheduler must be
 #       able to branch on "recover with `reclaim`". `reclaim` is the only verb that repairs it.
 #
-# `status` exits 3 when it produced a report in which at least one listener is DEAD — a report is
-# still a report, but a dead listener is a fact a caller must be able to branch on without parsing
-# the table. It exits 2 (never 0, never 3) when it could not measure — including a pool it can only
-# PARTLY see (a live listener outside `RUNNER_ROOT`, `why=pool-root-incomplete`), because the rows and
-# the slot count it prints would then describe part of the box as if it were all of it.
+# `status` exits 3 when it produced a report in which at least one listener is DEAD **or at least one
+# registration is ORPHANED** — a report is still a report, but either state is a fact a caller must be
+# able to branch on without parsing the table, and they are NOT interchangeable: an orphaned
+# registration is a state `restart` can never leave (`restart` → rc 6), and `reclaim` is the verb that
+# repairs it. It exits 2 (never 0, never 3) when it could not measure — including a pool it can only
+# PARTLY see (a live listener outside `RUNNER_ROOT`, `why=pool-root-incomplete`), and including a
+# quarantined install whose listener could not be probed (`UNPROBED`), because the rows and the slot
+# count it prints would then describe part of the box as if it were all of it.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -371,9 +375,11 @@ ORPHAN_SIG="registration has been deleted from the server"
 # orphan_evidence_file <dir> [skip_bytes] — print the file that proves GitHub deleted this
 # registration, rc 1 when nothing proves it. `skip_bytes` restricts the search in OUR OWN
 # `listener.log` to what a start appended (so a listener that was already dead before we tried cannot
-# lend its evidence to a fresh attempt). Our own log is checked FIRST because a start this tool
-# performed writes there; `_diag` is the fallback because a start SYSTEMD performed writes only there
-# (measured: the `pi-cell-4` orphan's diag had the message and its `listener.log` did not exist).
+# lend its evidence to a fresh attempt). BOTH sources are candidates for EVERY attempt: our own log
+# because a start this tool performed writes there, `_diag` because a start SYSTEMD performed writes
+# ONLY there (measured: the `pi-cell-4` orphan's diag had the message and its `listener.log` did not
+# exist) — and the NEWEST candidate decides (see the (a)/(b)/(c) list below; the older "check our own
+# log first, fall back to _diag" order was defect (a) and is gone).
 # ⛔ A `_diag` LINE OLDER THAN THE REGISTRATION IS NOT EVIDENCE ABOUT IT. An install that was orphaned,
 # then RE-REGISTERED in place (`config.sh remove` + `add` under a fresh token) keeps every old log —
 # and reading those would retire a HEALTHY registration on the strength of a failure that its current
@@ -808,7 +814,7 @@ start_listener() {
 
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
-  local dead=0 live=0 orph=0 qn=0 d rc dirs outside
+  local dead=0 live=0 orph=0 qn=0 qunprobed=0 d rc qrc dirs outside qdirs
   # `--all` is ACCEPTED AND CHANGES NOTHING, DELIBERATELY: #2373 names a `status --all`, and the
   # default view already IS every runner on this box, so there is no narrower form for the flag to
   # widen. It is documented as such (USAGE) rather than left as a flag a reader assumes reveals more
@@ -857,7 +863,6 @@ cmd_status() {
   # the pool but still on the disk, and the ONE measured failure mode this repo keeps re-learning is
   # space that nothing accounts for. They are reported here and counted in the summary, and they are
   # NOT capacity (excluded by `registered_dirs`).
-  local qdirs
   # ⛔ DOT-NAMED INSTALLS TOO (#2892 review, P2): `registered_dirs` enumerates `.foo` registrations, so
   # `reclaim` can quarantine one as `.foo.retired-<stamp>`, and a `*` glob does not match a leading dot —
   # the leftover's bytes would then be named by nothing, which is the one outcome this row exists for.
@@ -870,8 +875,22 @@ cmd_status() {
     # over a live runner is the one instruction that would delete a working registration, so a listener
     # changes the row instead of the count. An unreadable dir keeps the plain row: its bytes must still
     # be removable by their owner, and no probe could say otherwise.
-    if [ -r "$qd" ] && [ -x "$qd" ] && probe_listener "$qd" >/dev/null 2>&1; then
-      printf '%-32s %-9s %-9s %s\n' "$(basename "$qd")" "${LISTENER_PID:-?}" "LIVE-QUAR" "a listener is RUNNING on a retired-named install — do NOT rm -rf; stop it and retire it with reclaim"
+    # ⛔ A PROBE THAT COULD NOT RUN IS NOT A DEAD LISTENER (#2892 review round 4, P1). `probe_listener`
+    # has THREE outcomes (0 live · 1 dead · 2 cannot-measure) and the old `&& probe …` folded ALL
+    # non-zero into the else, so rc 2 — a `ps` that failed or listed nothing (`process-table-unreadable`
+    # / `process-table-empty`) — printed `rm -rf as its owner` over a listener that may be RUNNING. That
+    # is the one instruction that deletes a working registration, printed on a read the pass never
+    # completed, and the `[ -r ] && [ -x ]` guard below only covers the OTHER cause of rc 2 (an
+    # unreadable dir), not this one. The unmeasurable case gets its own row and holds the rc at
+    # cannot-measure, because a report that cannot see one row cannot certify the rest.
+    if [ -r "$qd" ] && [ -x "$qd" ]; then
+      qrc=0; probe_listener "$qd" >/dev/null 2>&1 || qrc=$?
+      case "$qrc" in
+        0) printf '%-32s %-9s %-9s %s\n' "$(basename "$qd")" "${LISTENER_PID:-?}" "LIVE-QUAR" "a listener is RUNNING on a retired-named install — do NOT rm -rf; stop it and retire it with reclaim" ;;
+        1) printf '%-32s %-9s %-9s %s\n' "$(basename "$qd")" "-" "QUARANTINE" "retired install — rm -rf as its owner" ;;
+        *) printf '%-32s %-9s %-9s %s\n' "$(basename "$qd")" "?" "UNPROBED" "could not measure whether a listener runs here (the process table was unreadable) — do NOT rm -rf until it can be read"
+           qunprobed=$((qunprobed + 1)) ;;
+      esac
     else
       printf '%-32s %-9s %-9s %s\n' "$(basename "$qd")" "-" "QUARANTINE" "retired install — rm -rf as its owner"
     fi
@@ -888,6 +907,10 @@ cmd_status() {
     err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(join_lines "$outside") — a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT, so slots=$SLOTS counts a PARTIAL pool; set RUNNER_ROOT to the directory that CONTAINS every instance dir (one level above them) and re-read — ⚠️ this reading is the process table, so consolidating the parents is what makes it complete; an instance dir outside RUNNER_ROOT whose listener is DEAD is not enumerable at all"
     return 2
   fi
+  # ⛔ AN UNPROBED QUARANTINE IS A PARTIAL MEASUREMENT, NOT A CLEAN ONE (#2892 review round 4, P1).
+  # The rows are printed either way — an operator must see WHICH directory could not be probed — but the
+  # rc must not claim the box was measured.
+  [ "$qunprobed" -eq 0 ] || return 2
   [ "$dead" -eq 0 ] && [ "$orph" -eq 0 ] || return 3
   return 0
 }
@@ -1209,7 +1232,12 @@ cmd_reclaim() {
       err "REFUSED reclaim name=$name path=$d — no such directory under $RUNNER_ROOT; nothing changed"; return 3
     fi
     if [ ! -e "$d/.runner" ] && [ ! -L "$d/.runner" ]; then
-      err "REFUSED reclaim name=$name path=$d — no .runner registration to retire (that dir is already not a registration; 'add --name $name' is the verb that provisions it); nothing changed"; return 3
+      # ⛔ NOT `add --name` (#2892 review round 4, P2). `add` refuses an existing path with rc 4
+      # (`name-unavailable … already exists (a file, a symlink, or a directory without a .runner
+      # registration)`), so naming it here sends the operator into the two-verb bounce this file
+      # resolves for `restart` above. The remedy is to clear the path, or to complete the install in
+      # place — neither of which this verb can do.
+      err "REFUSED reclaim name=$name path=$d — no .runner registration to retire (that dir is not a registration; 'add' refuses an existing path, so the remedy is: remove $d, or complete the install inside it before reclaiming); nothing changed"; return 3
     fi
     dirs="$d"
   else
@@ -1303,6 +1331,15 @@ cmd_reclaim() {
       while read -r e; do
         [ -n "$e" ] || continue
         [ "$e" = "$d" ] && continue
+        # ⛔ "NO `.runner`" IS NOT "UNREADABLE" (#2892 review round 4, P2). The scan set now includes
+        # `*.retired-*` quarantine dirs, and a quarantine normally HAS no `.runner` — rename-then-delete
+        # unlinks it first, which is the measured `pi-cell-4` failure this design exists for. Reading
+        # that as "a pool entry could not be read" marked the NAME unverified on every later pass, so
+        # the recovery this verb documents (`reclaim` → `add --name …`) never printed again on a box
+        # with one leftover. A readable dir carrying no `.runner` provably holds no registration, so it
+        # cannot hold the name either: only "unreadable dir" or "a `.runner` whose agentName cannot be
+        # parsed" leaves the name UNVERIFIED.
+        if [ ! -e "$e/.runner" ] && [ ! -L "$e/.runner" ] && [ -r "$e" ] && [ -x "$e" ]; then continue; fi
         en="$(registration_name "$e")"
         if [ -z "$en" ]; then sib_unknown=1; continue; fi
         [ "$en" = "$nm" ] || continue

@@ -143,6 +143,21 @@ cat >"$BIN/ps" <<'STUB'
 # `cannot-measure` — never "no listeners", which would double-start a listener.
 [ "${FIXTURE_PS_FAIL:-0}" = 1 ] && { echo "ps: cannot read /proc" >&2; exit 1; }
 [ "${FIXTURE_PS_EMPTY:-0}" = 1 ] && exit 0
+# ⛔ THE CALL COUNTER IS READ BEFORE THE TABLE IS PRINTED, so a seam can refuse THIS read (#2892
+# review round 4, P1). It used to be incremented at the bottom of the stub, which made every
+# "fail from the n-th read on" seam either impossible or silently off by one.
+f="${FIXTURE_T:?}/.ps-count"
+c=0; [ -f "$f" ] && c="$(cat "$f" 2>/dev/null || printf 0)"
+case "$c" in ''|*[!0-9]*) c=0 ;; esac
+c=$((c + 1)); printf '%s' "$c" >"$f" 2>/dev/null || true
+# ⛔ FIXTURE_PS_FAIL_AFTER=<n> lets the FIRST n reads through and fails every read after that — the
+# only way to reach a probe that runs LATER than the pool rows (a quarantine row in `status`), which
+# is exactly where a failed read was being READ AS A DEAD LISTENER and printed as "rm -rf as its
+# owner" over a runner that might be live.
+case "${FIXTURE_PS_FAIL_AFTER:-}" in
+  ''|*[!0-9]*) ;;
+  *) [ "$c" -gt "$FIXTURE_PS_FAIL_AFTER" ] && { echo "ps: cannot read /proc" >&2; exit 1; } ;;
+esac
 # ⛔ THE FIXTURE TABLE IS THE SUITE'S OWN PROCESSES ONLY (#2381 review, P1). The suite models a
 # listener with a real process under $T, but the HOST also runs runners (measured: three live
 # listeners under /opt/gh-runner-* on the boxes this suite runs on). Reading the whole host table
@@ -171,11 +186,7 @@ printf '    %s /sbin/init\n' 1
 # ⛔ FIXTURE_PS_OUTSIDE_AFTER=<n> plants the extra line only from the (n+1)-th ps call on — the seam
 # that reaches a guard on a LATER read, the same way FIXTURE_LS_FAIL_AFTER does for the listing. It is
 # the ONLY way to pin `add`'s POST-claim completeness re-check: an outside listener that appears
-# during the token mint (#2381 review round 6, P2).
-f="${FIXTURE_T:?}/.ps-count"
-c=0; [ -f "$f" ] && c="$(cat "$f" 2>/dev/null || printf 0)"
-case "$c" in ''|*[!0-9]*) c=0 ;; esac
-c=$((c + 1)); printf '%s' "$c" >"$f" 2>/dev/null || true
+# during the token mint (#2381 review round 6, P2). (The counter itself is read at the top of the stub.)
 if [ -n "${FIXTURE_PS_EXTRA:-}" ]; then
   if [ -n "${FIXTURE_PS_OUTSIDE_AFTER:-}" ]; then
     [ "$c" -gt "$FIXTURE_PS_OUTSIDE_AFTER" ] && printf '%s\n' "$FIXTURE_PS_EXTRA"
@@ -1971,7 +1982,13 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
 assert_eq "$?" "2" "the pass refuses (rc 2), because a retire through a link is not what the operator meant"
 assert_contains "$out" "why=instance-is-symlink" "naming the reason"
 assert_file "$T/symreal/pi-runner-symreal/.runner" "the REAL install survives, untouched"
-assert_absent "$T/symreal/pi-runner-symreal.retired-" "no quarry was made of it"
+# ⛔ THE OLD ASSERTION COULD NEVER FAIL (#2892 review round 4, P2): `assert_absent` tests ONE literal
+# path, and `reclaim` always appends a stamp (`<dir>.retired-<UTC stamp>`), so a literal
+# `…pi-runner-symreal.retired-` — no stamp — was absent whether or not a quarantine had been made of
+# the real install. Enumerate the glob instead, so the arm proves what its label claims.
+qsym=0
+for qsymd in "$T/symreal"/pi-runner-symreal.retired-*; do [ -e "$qsymd" ] && qsym=$((qsym + 1)); done
+assert_eq "$qsym" "0" "no quarantine was made of it"
 rm -f "$RUNNER_ROOT/pi-runner-symlink"
 
 # (4) A quarantine directory keeps its `.runner`. Unreadable-but-searchable it re-entered `slots` and
@@ -2089,6 +2106,98 @@ else
   chmod 700 "$RUNNER_ROOT/pi-runner-member-m"
   chmod 700 "$RUNNER_ROOT/containerd"
 fi
+
+# ── A PROBE THAT COULD NOT RUN IS NOT A DEAD LISTENER (#2892 review round 4, P1) ────────────────
+# `probe_listener` has three outcomes (0 live · 1 dead · 2 cannot-measure). The quarantine row folded
+# all non-zero into its else, so an UNREADABLE PROCESS TABLE printed "retired install — rm -rf as its
+# owner" — the one instruction that deletes a working registration — over a listener nobody had
+# measured. The fixture: one measurable registration (so every EARLIER read is real) plus a quarantine
+# with no `.runner` (exactly what rename-then-delete leaves behind), and a ps shim that fails only on
+# the LAST read, which is the quarantine row's.
+echo "── status: a quarantine whose liveness could NOT be read is never called deletable ──"
+fresh_pool qunprobed; reset_logs
+register pi-runner-qup
+mkdir -p "$RUNNER_ROOT/old.retired-20260101T000000Z"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/old.retired-20260101T000000Z/"
+rm -f "$RUNNER_ROOT/old.retired-20260101T000000Z/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+rcount="$(cat "$T/.ps-count" 2>/dev/null || printf 0)"
+case "$rcount" in ''|*[!0-9]*) rcount=0 ;; esac
+if [ "$rcount" -ge 2 ]; then
+  ok "the counting run read the process table ${rcount} time(s), so the LAST read can be isolated"
+else
+  bad "the counting run made only ${rcount} process-table read(s) — the seam below cannot isolate the quarantine row"
+fi
+rm -f "$T/.ps-count"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_FAIL_AFTER=$((rcount - 1)) run status)"
+assert_eq "$?" "2" "an unmeasurable quarantine row makes the report cannot-measure (rc 2), not rc 3"
+assert_contains "$out" "UNPROBED" "the row says the liveness was not measured"
+assert_contains "$out" "do NOT rm -rf" "and its remedy is the opposite of deleting a possibly-live runner"
+case "$out" in
+  *"rm -rf as its owner"*) bad "it printed the DELETE advice over a listener it could not probe" ;;
+  *) ok "the delete advice is NOT printed over an unmeasured quarantine" ;;
+esac
+rm -f "$T/.ps-count"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
+assert_contains "$out" "QUARANTINE" "(control: with the process table readable the same dir IS deletable, rc 3 = its DEAD registration)"
+assert_contains "$out" "rm -rf as its owner" "and only then does the delete advice appear"
+
+# ── A QUARANTINE LEFTOVER WITH NO `.runner` IS NOT AN UNREADABLE POOL ENTRY (#2892 round 4, P2) ──
+# The holder scan now includes `*.retired-*`, and a quarantine normally has NO `.runner` — rename-then-
+# delete unlinks it first, which is the measured `pi-cell-4` failure. Reading that as "a pool entry
+# could not be read" marked the NAME unverified on every later pass, so the documented recovery
+# (`reclaim` then `add --name …`) never printed again on a box with one leftover.
+echo "── reclaim: a quarantine leftover with no .runner does not make the NAME unverified ──"
+fresh_pool qleft; reset_logs
+register pi-runner-qleft
+printf '{\n  "agentId": 73,\n  "agentName": "pi-runner-qleft"\n}\n' >"$RUNNER_ROOT/pi-runner-qleft/.runner"
+orphanize pi-runner-qleft
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-qleft/listener.log"
+mkdir -p "$RUNNER_ROOT/old.retired-20260101T000000Z"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/old.retired-20260101T000000Z/"
+rm -f "$RUNNER_ROOT/old.retired-20260101T000000Z/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass retires the orphaned install"
+assert_contains "$out" "retired name=pi-runner-qleft" "naming what it retired"
+assert_contains "$out" "the name is free again" "and the documented recovery IS printed (nothing in the pool was unreadable)"
+case "$out" in
+  *UNVERIFIED*) bad "a quarantine with no .runner was read as an unreadable pool entry" ;;
+  *) ok "the name was not declared UNVERIFIED by a non-registration" ;;
+esac
+# THE CONTROL: a `.runner` that EXISTS but whose agentName cannot be parsed still makes it UNVERIFIED.
+fresh_pool qleft2; reset_logs
+register pi-runner-qleft2
+printf '{\n  "agentId": 74,\n  "agentName": "pi-runner-qleft2"\n}\n' >"$RUNNER_ROOT/pi-runner-qleft2/.runner"
+orphanize pi-runner-qleft2
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-qleft2/listener.log"
+mkdir -p "$RUNNER_ROOT/nameless"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/nameless/"
+printf '{}\n' >"$RUNNER_ROOT/nameless/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass still retires the orphaned install"
+assert_contains "$out" "the name is UNVERIFIED" "a `.runner` we could not parse still suppresses the re-register advice"
+
+# ── THE REFUSAL NAMES A REMEDY THAT EXISTS (#2892 review round 4, P2) ──────────────────────────
+# `reclaim --name` on a dir that is not a registration used to say "'add --name <name>' is the verb
+# that provisions it" — but `add` refuses an existing path with rc 4 (`name-unavailable … already
+# exists`), so the advice bounced the operator between two verbs that both refuse.
+echo "── reclaim: a dir that is not a registration names a remedy that EXISTS ──"
+fresh_pool noregr; reset_logs
+mkdir -p "$RUNNER_ROOT/pi-runner-noregr"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/pi-runner-noregr/"
+rm -f "$RUNNER_ROOT/pi-runner-noregr/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim --name pi-runner-noregr)"
+assert_eq "$?" "3" "a path that is not a registration is REFUSED (rc 3)"
+assert_contains "$out" "no .runner registration to retire" "naming the state"
+assert_contains "$out" "remove $RUNNER_ROOT/pi-runner-noregr" "and naming the action that clears it"
+addrc="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of add --name pi-runner-noregr)"
+assert_eq "$addrc" "4" "(control: the ADVICE it used to give returns rc 4 on this very path)"
+case "$out" in
+  *"add --name pi-runner-noregr"*) bad "the refusal still advises 'add --name', which refuses the same path with rc 4" ;;
+  *) ok "the refusal does not send the operator to a verb that refuses the same path" ;;
+esac
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then
