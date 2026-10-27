@@ -5251,6 +5251,55 @@ while true; do
     is_num "${PRDISP_WAITS:-}" || PRDISP_WAITS=0
     PRDISP_TOP="$(awk -F'\t' '$4=="wait"{print $5}' "$PRDISP" 2>/dev/null | sort | uniq -c | sort -rn | head -1 | sed 's/^ *//')"
   fi
+  # ── THE EXAMINED WINDOW'S OWN REASONS (agent-infra#2933) ──────────────────────────────────────
+  # ⛔ THE MEASURED DEFECT THIS REPLACES (2026-10-27, tortoise target): 26 PRs open, K=8 examined per
+  # cycle, and the line printed `most common: 15 outside this cycle's sweep window …` — computed across
+  # ALL rows, so a fact about the 15 rows the sweep did NOT look at answered for the 8 it did. The
+  # deferred majority always outnumbers the sample, so the modal reason was ALWAYS the deferral and the
+  # examined rows' own reasons were never printed. An operator could not tell "everything examined is
+  # legitimately waiting" from "the rows the sweep read are being refused by something broken" — the
+  # "tool that cannot answer its own question" class (#2590, #2640).
+  # ⛔ REPORT THE SAMPLE, NEVER THE POPULATION — AND NEVER ENLARGE IT. K rows/cycle with a rotating
+  # cursor is a recorded design decision (#2640, `[sweep-window]` above): the bounded read is what makes
+  # a pass COMPLETE, and the arms are at the END of the loop. This block only reports WHICH rows the
+  # sweep actually read this cycle and why those did not act. It changes no dispatch decision, no gate
+  # and no budget: widening K would reverse that decision.
+  # ⛔ THE LABELS ARE THE LEDGER'S OWN STRINGS, GROUPED — never a parallel vocabulary. Each label is
+  # derived from field 5 by cutting at its first detail separator (` (`, ` — `, `;`) and collapsing digit
+  # runs to `N`, so `capacity: fix-lane ceiling 2 reached` and `… ceiling 4 reached` are ONE class (only
+  # the parameter differs) while the words stay exactly the words the per-row record carries. A summary
+  # that invented `owned-by-live-worker` would drift from the records it summarises.
+  # ⛔ NO CLASS CAP. The examined window is bounded by K (8 by default), so every class in it fits on
+  # the line and a cap would re-create the defect one level down: an operator reading "+2 more" still
+  # cannot tell whether those two rows are waiting or refused. A test that demands EVERY examined
+  # reason be printed cannot be satisfied by a capped summary, and the issue asks for exactly that.
+  # The population is the EXAMINED WINDOW when there is one (rows whose PR is in `SWEEP_WINDOW_PR`);
+  # with no window at all (nothing was selected to read) it is every row, which is then the same thing.
+  PRDISP_WIN_N=0; PRDISP_DEFER_N=0; PRDISP_WIN_REASONS=""
+  if [ "$PRDISP_ROWS" -gt 0 ]; then
+    PRDISP_WIN_N="$(awk -F'\t' -v win="${SWEEP_WINDOW_PR:-}" '
+      BEGIN { _n=split(win, _w, " "); for (_i=1; _i<=_n; _i++) if (_w[_i] ~ /^[0-9]+$/) inwin[_w[_i]]=1 }
+      length(win) > 0 && ($1 in inwin) { n++ }
+      END { print n+0 }' "$PRDISP" 2>/dev/null)"
+    is_num "${PRDISP_WIN_N:-}" || PRDISP_WIN_N=0
+    [ "$PRDISP_WIN_N" -gt "$PRDISP_ROWS" ] && PRDISP_WIN_N=$PRDISP_ROWS
+    PRDISP_DEFER_N=$(( PRDISP_ROWS - PRDISP_WIN_N ))
+    PRDISP_WIN_REASONS="$(awk -F'\t' -v win="${SWEEP_WINDOW_PR:-}" '
+      BEGIN { _n=split(win, _w, " "); for (_i=1; _i<=_n; _i++) if (_w[_i] ~ /^[0-9]+$/) inwin[_w[_i]]=1 }
+      length(win) > 0 && !($1 in inwin) { next }
+      $4 != "wait" { next }
+      { r=$5
+        sub(/ \[harness=[^]]*\]$/, "", r)
+        _c=index(r, " (");  if (_c) r=substr(r, 1, _c-1)
+        _c=index(r, " — "); if (_c) r=substr(r, 1, _c-1)
+        _c=index(r, ";");   if (_c) r=substr(r, 1, _c-1)
+        gsub(/[0-9]+/, "N", r); gsub(/[ \t]+/, " ", r); sub(/^ /, "", r); sub(/ $/, "", r)
+        if (r == "") r="(unnamed reason)"
+        cnt[r]++ }
+      END { for (k in cnt) printf "%d\t%s\n", cnt[k], k }' "$PRDISP" 2>/dev/null \
+      | sort -rn \
+      | awk -F'\t' '{ printf "%s%d %s", (n++ ? " · " : ""), $1, $2 }')"
+  fi
   # ── THE TERMINAL OUTCOME OF THIS PASS'S PR WORK (agent-infra#2590) ─────────────────────────────
   # Exactly ONE of these three lines is printed, and it answers "what did this pass START?" from the
   # worker records `wt_spawn` wrote — never from a count of dispositions, which an arm or a rerun
@@ -5300,10 +5349,25 @@ while true; do
     [ -n "${PRDISP_FIRST:-}" ] || PR_FIRST_TOK="none named"
   else
     # NOTHING WAS ACTED ON. This is the line that makes a stalled drain distinguishable from an idle
-    # one: no unit ran, and the dominant reason is named rather than inferred. It does NOT claim what
-    # the issue path will do — the gate is decided further down, and a forward claim here would be the
-    # same defect sign-reversed (all counted PRs parked is a state where the gate legitimately opens).
-    echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason${PRDISP_TOP:+ (most common: ${PRDISP_TOP})}; spawned=${PRDISP_SPAWNS:-UNMEASURED} worker(s) this pass (see the [spawn] line)${_refsuf:-}" >>"$LOG"
+    # one: no unit ran, and the reason is named rather than inferred. It does NOT claim what the issue
+    # path will do — the gate is decided further down, and a forward claim here would be the same
+    # defect sign-reversed (all counted PRs parked is a state where the gate legitimately opens).
+    # ⛔ THE REASONS ARE THE EXAMINED ROWS' (agent-infra#2933). Printing the modal reason across ALL
+    # rows made the deferred majority answer for the sample — measured: `most common: 15 outside this
+    # cycle's sweep window` for 26 rows with 8 examined, so the line named a fact about the rows it did
+    # NOT look at and never said why the 8 it did look at produced nothing. The examined sample and the
+    # deferred count are now separate clauses, and the reasons come from the window's own ledger rows.
+    # The contract is unchanged: ONE line, `spawned=N` still named, never silent.
+    if [ "${SWEEP_WINDOW_PR:-}" != "" ]; then
+      _prwinwhat="${SWEEP_WIN_NOTE#window=}"
+      [ -n "$_prwinwhat" ] || _prwinwhat="${SWEEP_ROWS_PER_CYCLE:-?} row(s)/cycle, rotating"
+      echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason; examined ${PRDISP_WIN_N} (window ${_prwinwhat}); ${PRDISP_DEFER_N} deferred or scope-excluded this cycle (their reasons are not on this line); examined reasons: ${PRDISP_WIN_REASONS:-(none recorded)}; spawned=${PRDISP_SPAWNS:-UNMEASURED} worker(s) this pass (see the [spawn] line)${_refsuf:-}" >>"$LOG"
+    else
+      # NO WINDOW IS NOT "ZERO EXAMINED": nothing was selected to read at all (a deferral, a failed
+      # listing, a cache-less 304), so the only honest population IS every row — and saying "examined
+      # 0" here would hide the very reasons this line exists to print.
+      echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason; NO SWEEP WINDOW this cycle (nothing was selected to read, so there is no examined sample), so the reasons below are for ALL ${PRDISP_ROWS} row(s): ${PRDISP_WIN_REASONS:-(none recorded)}; spawned=${PRDISP_SPAWNS:-UNMEASURED} worker(s) this pass (see the [spawn] line)${_refsuf:-}" >>"$LOG"
+    fi
     PR_FIRST_TOK="none acted — see the [pr] line"
   fi
   # ⛔ THE FUNNEL TAKES THE SAME THREE FACTS, INCLUDING WHETHER THEY WERE MEASURED AT ALL: 0 acts with a
@@ -5662,7 +5726,16 @@ PY
         # reason, and it is already computed above (`PRDISP_TOP`). A datum the line holds and does not
         # read is the "tool that cannot answer its own question" class.
         _whysrc=" (land markers are THIS box's own merge-one successes only — a peer box landing these is invisible here"
-        [ -n "${PRDISP_TOP:-}" ] && _whysrc="$_whysrc; dominant named wait: \"${PRDISP_TOP:0:140}\""
+        # ⛔ THE EXAMINED ROWS' REASONS COME FIRST (agent-infra#2933). This line used the modal wait across
+        # ALL rows, which is the deferred-majority masking defect again on the escalation line — the
+        # escalation would have named "outside this cycle's sweep window" as the reason the box is stuck.
+        # The window's grouped reasons are already computed above; `PRDISP_TOP` survives only as the
+        # fallback for a cycle with no window (where every row IS the population).
+        if [ -n "${PRDISP_WIN_REASONS:-}" ]; then
+          _whysrc="$_whysrc; examined-row reasons: \"${PRDISP_WIN_REASONS:0:140}\""
+        elif [ -n "${PRDISP_TOP:-}" ]; then
+          _whysrc="$_whysrc; dominant named wait: \"${PRDISP_TOP:0:140}\""
+        fi
         _whysrc="$_whysrc)"
         if [ "${_spk:-}" = "0" ]; then
           echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}.${_refsuf:-}" >> "$LOG"

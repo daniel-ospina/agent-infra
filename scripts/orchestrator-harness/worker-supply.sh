@@ -150,7 +150,7 @@ mtime_of() {
 }
 
 # ── the log: bounded, because a supervisor on a 60 s clock writes for ever ─────────────────────
-say() {
+log_line() {
   local msg line
   msg="$(date '+%Y-%m-%dT%H:%M:%SZ') worker-supply: $*"
   printf '%s\n' "$msg"
@@ -200,7 +200,7 @@ knob_num() { # <VARNAME> <value> <default> <pos|any> — the fallback says what 
   local name="$1" v="$2" d="$3" mode="$4" kind="non-negative integer"
   [ "$mode" = pos ] && kind="positive integer"
   if ! valid_num "$v" || { [ "$mode" = pos ] && [ "$v" -eq 0 ]; }; then
-    say "knob: $name='$v' is not a $kind — using $d (an unreadable bound is an inert one)"
+    log_line "knob: $name='$v' is not a $kind — using $d (an unreadable bound is an inert one)"
     return 1
   fi
   return 0
@@ -214,7 +214,7 @@ knob_num WORKER_SUPPLY_LOCK_MAX_S        "$LOCK_MAX_S"         900     pos || LO
 knob_num WORKER_SUPPLY_LOG_MAX_BYTES     "$LOG_MAX_BYTES"      262144  pos || LOG_MAX_BYTES=262144
 case "$PREFIX" in
   ''|*[[:space:]]*)
-    say "knob: WORKER_SUPPLY_PREFIX='$PREFIX' is empty or contains whitespace — using 'prd-' (the order glob would match nothing, and an empty queue reads as a clean pass)"
+    log_line "knob: WORKER_SUPPLY_PREFIX='$PREFIX' is empty or contains whitespace — using 'prd-' (the order glob would match nothing, and an empty queue reads as a clean pass)"
     PREFIX="prd-" ;;
 esac
 
@@ -265,7 +265,7 @@ limit_of() {
 # ⛔ THE TAKEOVER IS A RENAME, NOT A `rm -rf` + `mkdir`: two supervisors waking in the same second must
 # not both decide a stale lock is stale. `mv` of a given directory succeeds for exactly one of them.
 lock_take() {
-  mkdir -p "$STATE_DIR" 2>/dev/null || { say "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
+  mkdir -p "$STATE_DIR" 2>/dev/null || { log_line "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
   if mkdir "$LOCK_DIR" 2>/dev/null; then printf '%s\n' "$$" > "$LOCK_DIR/pid"; return 0; fi
   local holder age now holder_cmd
   holder="$(cat "$LOCK_DIR/pid" 2>/dev/null | tr -d ' \n' || true)"
@@ -280,28 +280,28 @@ lock_take() {
     # Capture, then test the string.
     holder_cmd="$(ps -o command= -p "$holder" 2>/dev/null || true)"
     if grep -q 'worker-supply\.sh' <<<"$holder_cmd"; then
-      say "ALREADY-RUNNING: holder pid=$holder holds $LOCK_DIR — nothing touched"
+      log_line "ALREADY-RUNNING: holder pid=$holder holds $LOCK_DIR — nothing touched"
       return 1
     fi
-    say "stale lock: pid $holder is alive but is NOT worker-supply.sh (recycled pid) — taking over"
+    log_line "stale lock: pid $holder is alive but is NOT worker-supply.sh (recycled pid) — taking over"
   else
     now="$(date +%s)"; age="$(mtime_of "$LOCK_DIR")"
     case "${age:-}" in ''|*[!0-9]*) age=0 ;; esac
     if [ "$age" -gt 0 ] && [ $((now - age)) -lt "$LOCK_MAX_S" ] && [ -z "$holder" ]; then
       # No pid AND young: the holder may be between `mkdir` and its pid write. Wait for the interval.
-      say "ALREADY-RUNNING: lock $LOCK_DIR is held with no pid and is only $((now - age))s old"
+      log_line "ALREADY-RUNNING: lock $LOCK_DIR is held with no pid and is only $((now - age))s old"
       return 1
     fi
-    say "stale lock: holder '${holder:-<none>}' is gone — taking over"
+    log_line "stale lock: holder '${holder:-<none>}' is gone — taking over"
   fi
   local grave="$LOCK_DIR.stale.$$"
   if ! mv "$LOCK_DIR" "$grave" 2>/dev/null; then
-    say "ALREADY-RUNNING: another instance took over $LOCK_DIR first — nothing touched"
+    log_line "ALREADY-RUNNING: another instance took over $LOCK_DIR first — nothing touched"
     return 1
   fi
   rm -rf "$grave" 2>/dev/null || true
   if mkdir "$LOCK_DIR" 2>/dev/null; then printf '%s\n' "$$" > "$LOCK_DIR/pid"; return 0; fi
-  say "ALREADY-RUNNING: lost the race for $LOCK_DIR after the takeover"
+  log_line "ALREADY-RUNNING: lost the race for $LOCK_DIR after the takeover"
   return 1
 }
 
@@ -452,7 +452,7 @@ pass() {
   local n_offered=0 n_dead_total=0 refused=0 budget_full=0 exhausted=0 no_record=0
   local f name wt prompt kind stamp wt_branch rec_branch capr sig hold
 
-  mkdir -p "$STATE_DIR" 2>/dev/null || { say "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
+  mkdir -p "$STATE_DIR" 2>/dev/null || { log_line "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
   plenv="$STATE_DIR/.worker-supply.plistenv"
   plist_env_dump "$ORCH_PLIST" "$plenv"
   fix="$(limit_of MAX_FIX "$DEFAULT_MAX_FIX" "$plenv")"
@@ -460,7 +460,7 @@ pass() {
   cap=$(( fix + review ))
 
   if [ ! -f "$DISPATCH" ]; then
-    say "REFUSING: no dispatcher at $DISPATCH — the pool cannot be supplied (this is an INSTALL fault, not a worker fault)"
+    log_line "REFUSING: no dispatcher at $DISPATCH — the pool cannot be supplied (this is an INSTALL fault, not a worker fault)"
     write_record refusing 0 0 0 0 "$cap" "$fix" "$review" 0 "no dispatcher at $DISPATCH"
     return 2
   fi
@@ -489,7 +489,7 @@ pass() {
     if [ "$live" -ge "$cap" ]; then budget_full=$(( budget_full + 1 )); continue; fi
     if [ "$(refills_of "$name")" -ge "$MAX_REFILLS" ]; then
       exhausted=$(( exhausted + 1 ))
-      say "$name: DEFERRED — this order has spent its $MAX_REFILLS refill(s); a worker that keeps dying is a diagnosis, not a supply problem"
+      log_line "$name: DEFERRED — this order has spent its $MAX_REFILLS refill(s); a worker that keeps dying is a diagnosis, not a supply problem"
       continue
     fi
     wt="$(field "$f" worktree)"; prompt="$(field "$f" prompt)"
@@ -500,16 +500,16 @@ pass() {
     # later heads; a re-offer into a tree that now belongs to another branch would hand a worker the
     # wrong PR. Refuse (and SAY so) rather than spawn into a tree the record does not describe.
     if [ -z "$wt" ] || [ ! -d "$wt" ]; then
-      no_record=$(( no_record + 1 )); say "$name: not re-offered — the worktree recorded for the order is gone (${wt:-<unrecorded>})"; continue
+      no_record=$(( no_record + 1 )); log_line "$name: not re-offered — the worktree recorded for the order is gone (${wt:-<unrecorded>})"; continue
     fi
     if [ -z "$prompt" ] || [ ! -f "$prompt" ]; then
-      no_record=$(( no_record + 1 )); say "$name: not re-offered — the brief recorded for the order is gone (${prompt:-<unrecorded>})"; continue
+      no_record=$(( no_record + 1 )); log_line "$name: not re-offered — the brief recorded for the order is gone (${prompt:-<unrecorded>})"; continue
     fi
     rec_branch="$(field "$f" branch)"
     wt_branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     if [ -n "$rec_branch" ] && [ -n "$wt_branch" ] && [ "$wt_branch" != "$rec_branch" ]; then
       no_record=$(( no_record + 1 ))
-      say "$name: not re-offered — worktree $wt is on '$wt_branch' but the order was for '$rec_branch' (the tree was reused; the PR must be re-classified, not replayed)"
+      log_line "$name: not re-offered — worktree $wt is on '$wt_branch' but the order was for '$rec_branch' (the tree was reused; the PR must be re-classified, not replayed)"
       continue
     fi
     # ⛔ ANOTHER ORDER MAY HOLD THIS WORKTREE UNDER A DIFFERENT NAME (see worktree_holder). Refuse,
@@ -520,7 +520,7 @@ pass() {
       case "${hold%%:*}" in
         live)    dead=$(( dead - 1 ))
                  live=$(( live + 1 ))
-                 say "$name: not re-offered — another order holds its worktree $wt and is RUNNING (${hold#*:}); a second worker there would destroy the live one's log/.rc/.pid" ;;
+                 log_line "$name: not re-offered — another order holds its worktree $wt and is RUNNING (${hold#*:}); a second worker there would destroy the live one's log/.rc/.pid" ;;
         # ⛔ A HOLDER WE COULD NOT READ IS *NOT* A HELD SLOT (review #2896 round 3). The old arm
         # decremented `dead` here too, so the one order the pass could not decide about VANISHED from
         # the census — `live=0 dead=0 unknown=2` then reached the verdict's `else`, printed `clean` and
@@ -528,16 +528,16 @@ pass() {
         # established about it) and the unknown is counted beside it; the pass is then DEFERRED, which
         # is what "there is still a dead order" means.
         *)       unknown=$(( unknown + 1 ))
-                 say "$name: not re-offered — another order holds its worktree $wt and its liveness could not be read (${hold#*:}); spawning blind would risk a live worker" ;;
+                 log_line "$name: not re-offered — another order holds its worktree $wt and its liveness could not be read (${hold#*:}); spawning blind would risk a live worker" ;;
       esac
       continue
     fi
     if offer_recorded "$name" "$sig"; then
-      say "$name: not re-offered — this exact spawn instance (started=$sig) was already re-offered once"
+      log_line "$name: not re-offered — this exact spawn instance (started=$sig) was already re-offered once"
       continue
     fi
     if [ "$DRY" = 1 ]; then
-      say "DRY-RUN would re-offer $name in $wt (kind=$kind cap=${capr}s) — the order's worker is dead"
+      log_line "DRY-RUN would re-offer $name in $wt (kind=$kind cap=${capr}s) — the order's worker is dead"
       n_offered=$(( n_offered + 1 )); refilled=$(( refilled + 1 ))
       continue
     fi
@@ -545,7 +545,7 @@ pass() {
     out="$(bounded "$SPAWN_CALL_TIMEOUT" bash "$DISPATCH" "$name" "$wt" "$prompt" "$capr" "$kind" 2>&1)"; rc=$?
     if [ "$rc" -ne 0 ]; then
       refused=$(( refused + 1 ))
-      say "$name: REFUSED by the dispatcher (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+      log_line "$name: REFUSED by the dispatcher (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
       continue
     fi
     # ACCEPTED IS A RECORD, NOT A RETURN CODE (pr-doctor's own rule): ask the harness again.
@@ -553,7 +553,7 @@ pass() {
     if [ "$STATUS_KIND" = LIVE ]; then
       offer_append "$name" "$sig" accepted
       refilled=$(( refilled + 1 )); n_offered=$(( n_offered + 1 )); live=$(( live + 1 )); dead=$(( dead - 1 ))
-      say "$name: RE-OFFERED in $wt (kind=$kind cap=${capr}s) — the order's dead worker was replaced ($live/$cap live)"
+      log_line "$name: RE-OFFERED in $wt (kind=$kind cap=${capr}s) — the order's dead worker was replaced ($live/$cap live)"
     elif [ -f "$BG_DIR/$name.rc" ]; then
       # ⛔ ACCEPTED, AND ALREADY OVER. The dispatcher took the order and the worker has ENDED (a
       # fast failure: bad credentials, a missing interpreter). The ledger row is still written --
@@ -563,10 +563,10 @@ pass() {
       # workers that do not exist, so the pass under-supplies and reports a `live=` that is false.
       offer_append "$name" "$sig" accepted
       refilled=$(( refilled + 1 )); n_offered=$(( n_offered + 1 ))
-      say "$name: RE-OFFERED but the worker ENDED at once ($STATUS_WHY) — no slot is held, the order is still dead"
+      log_line "$name: RE-OFFERED but the worker ENDED at once ($STATUS_WHY) — no slot is held, the order is still dead"
     else
       refused=$(( refused + 1 ))
-      say "$name: re-offer UNCONFIRMED ($STATUS_WHY) — no ledger row; liveness is re-read next pass"
+      log_line "$name: re-offer UNCONFIRMED ($STATUS_WHY) — no ledger row; liveness is re-read next pass"
     fi
   done
 
@@ -607,7 +607,7 @@ pass() {
   # overwrote it (its `refilled=` counting would-is, its `ts=` claiming a pass that never happened)
   # destroys exactly that. The dry run's verdict goes to stdout and nowhere else.
   if [ "$DRY" = 1 ]; then
-    say "DRY-RUN pass: decision=$decision orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown would-refill=$refilled — $why (no record, no ledger row, nothing spawned)"
+    log_line "DRY-RUN pass: decision=$decision orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown would-refill=$refilled — $why (no record, no ledger row, nothing spawned)"
     return 0
   fi
   prev="$(awk -F= '$1=="decision"{ print $2; exit }' "$RECORD" 2>/dev/null || true)"
@@ -617,7 +617,7 @@ pass() {
   # and the last-pass record (`$RECORD`, with its own `ts=`) is the heartbeat a reader checks instead.
   # A refill and every refusal always log.
   if [ "$decision" != "$prev" ] || [ "$refilled" -gt 0 ] || [ "$refused" -gt 0 ]; then
-    say "pass: $decision — orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown refilled=$refilled — $why"
+    log_line "pass: $decision — orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown refilled=$refilled — $why"
   fi
 
   case "$decision" in
@@ -706,7 +706,7 @@ case "$MODE" in
     trap 'on_signal 143' INT TERM
     while :; do
       pass; rc=$?
-      [ "$rc" = 2 ] && say "loop: REFUSING (install fault) — retrying in ${INTERVAL_S}s"
+      [ "$rc" = 2 ] && log_line "loop: REFUSING (install fault) — retrying in ${INTERVAL_S}s"
       # An INTERRUPTIBLE interval: `wait` returns the moment a trapped signal arrives, so a stop is
       # immediate and the EXIT/INT/TERM traps above run. A bare `sleep "$INTERVAL_S"` defers the
       # signal for the whole interval (measured by the test's own bounded-stop assertion).
