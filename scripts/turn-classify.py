@@ -137,18 +137,31 @@ REPOS = ("daniel-ospina/tortoise",
 # (scoped to the LIVE files on purpose: `~/.pi/agent/state/*` also holds archived copies and
 # mutation-test fixture trees that legitimately still contain the old host.)
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
-# ⛔ THE MODEL PIN DOES **NOT** MOVE WITH THE HOST, and this is deliberate (review 2026-10-26).
-# `jev-1.13.0` is a VALID model on the real API — measured, `POST /v1/systemone`
-# `model=jev-1.13.0` → 200 `model: jev-1.13.0` (`/v1/models` lists ALIASES only, which is not
-# the same claim as "the version is rejected"; an unknown name 400s, e.g. `jev-9.9.9`).
-# So the migration is HOST-ONLY and the evidence underneath every bar stays valid: the vendor's
-# own guidance is that an alias "moves when a new release ships, so its answers can change
-# without any change to your code — if you have tuned confidence thresholds against one
-# version, send that version's ID instead of the alias". MIN_CONFIDENCE below and every
-# per-mark bar in ask-owner.py were measured on 1.13, so 1.13 is what votes.
-# To move to 1.14: re-derive those bars on 1.14 FIRST, then change this pin — as one recorded
-# decision, not as a side effect of a vendor migration.
-JEV_MODEL = "jev-1.13.0"
+# ⛔ THE MODEL IS THE ALIAS, BY OWNER RULING (2026-10-27): "let's use jev latest".
+#
+# `MIN_CONFIDENCE` above and every JEV-SCORED per-mark bar in `ask-owner.py` (`THRESHOLD`,
+# `THRESHOLD_LANGUAGE` — NOT `THRESHOLD_JARGON`, which sits over the mechanical marks and cannot
+# move with the model) were calibrated on the LOOKALIKE host's `jev-1.13.0` and not re-measured
+# since the migration (tortoise#7864), so re-deriving them is a FIRST real calibration, not a
+# repeat. `jev-latest` already resolves to
+# `jev-1.14.0` on the live API — so the marks are now scored by a model that moves when the
+# vendor ships, with no change to this file. The vendor's own guidance warns about exactly
+# this ("an alias moves when a new release
+# ships ... if you have tuned confidence thresholds against one version, send that version's
+# ID instead of the alias").
+# ⚠️ What makes that survivable is the ECHO: the response carries the concrete version that
+# answered, and `jev_choice` returns it as `meta["model"]` — so a verdict that shifted for a
+# reason no diff explains is visible in the log (`model=jev-1.14.0` against bars measured on
+# 1.13) instead of being inferred later from behaviour. Every path that records a JEV-DERIVED
+# verdict logs it — acted, the below-bar SKIP, no-action, and "already sent recently" — because a
+# model-induced confidence drop shows up as a SKIP, and the below-bar SKIP and the no-action path
+# originally carried no model at all (review 2026-10-27). The per-tick CAP logs it too, though it
+# records nothing; the structural idle path makes no Jev call, so it carries no model by design.
+# Re-derive the bars FIRST when a `model=` moves. Pinning a version again is a one-line change in EACH of the five copies the sweep
+# note above lists (these two tracked callers, the two deployed ~/.pi/agent/scripts copies, and
+# the deployed state/lane-verdict.py) — a partial re-pin is the same split-brain this round
+# fixed in the other direction.
+JEV_MODEL = "jev-latest"
 
 # The three outcomes Jev chooses between. The FOURTH case the owner named —
 # "a question, protocol used" — is not a Jev question: it is decided by the label.
@@ -1220,10 +1233,11 @@ def main(argv: list[str]) -> int:
         conf = meta.get("confidence")
         if kind and conf is not None and conf < MIN_CONFIDENCE:
             log(f"SKIP {lane}: {choice} at confidence {conf} < {MIN_CONFIDENCE} "
+                f"(model={meta.get('model')}) "
                 f"-- unknown, not acting (not claimed, so this turn stays open)")
             continue
         if kind and sent >= MAX_PER_TICK:
-            log(f"CAP {MAX_PER_TICK}: {lane} deferred")
+            log(f"CAP {MAX_PER_TICK}: {lane} deferred (model={meta.get('model')})")
             break
 
         # Claim the turn in BOTH cases. A "no action" decision must be recorded,
@@ -1235,13 +1249,15 @@ def main(argv: list[str]) -> int:
                 write_marker(lane, sid=sid, size=size, last=int(time.time()),
                              verdict=choice, acted=False)
             log(f"{lane}: {choice} -> no action "
-                f"(protocol={'yes' if used_protocol else 'no'}, conf={conf})")
+                f"(protocol={'yes' if used_protocol else 'no'}, conf={conf}, "
+                f"model={meta.get('model')})")
             continue
 
         now = time.time()
         gap = IDLE_GAP_S if kind == "idle_next_work" else MIN_GAP_S
         if now - (m.get("last") or 0) < gap and m.get("verdict") == choice:
-            log(f"SKIP {lane}: {kind} already sent recently")
+            log(f"SKIP {lane}: {kind} already sent recently "
+                f"(model={meta.get('model')})")
             if not a.dry_run:
                 write_marker(lane, sid=sid, size=size, last=m.get("last", now),
                              verdict=choice, acted=True)
