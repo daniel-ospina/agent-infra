@@ -505,7 +505,7 @@ start_listener() {
   while [ "$i" -lt $((SETTLE_S * 2)) ]; do
     rc=0; probe_listener "$d" || rc=$?
     case "$rc" in
-      0) say "listener_pid=$LISTENER_PID"; return 0 ;;
+      0) log_line "listener_pid=$LISTENER_PID"; return 0 ;;
       2) return 2 ;;   # cannot measure: never claim a start, never wait blind
     esac
     sleep 0.5; i=$((i + 1))
@@ -817,7 +817,7 @@ cmd_restart() {
   # idle — the worst of the three states. The owner's floor sentence names ADDING, not restarting.
   rc=0; probe_listener "$dir" || rc=$?
   case "$rc" in
-    0) say "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
+    0) log_line "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
     2) return 2 ;;   # cannot measure: START NOTHING (a blind start is how a listener is doubled)
   esac
   # ⛔ THE START'S OWN PRECONDITION IS CHECKED BEFORE THE DRY RETURN, so a preview cannot announce a

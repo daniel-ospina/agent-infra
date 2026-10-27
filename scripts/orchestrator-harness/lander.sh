@@ -264,9 +264,9 @@ lander_detect_queue() {
   local n
   n="$(gh api "repos/$OR/rules/branches/main" --jq '[.[]|select(.type=="merge_queue")]|length' 2>/dev/null)"
   case "${n:-}" in
-    ''|*[!0-9]*) say "merge queue: UNKNOWN (the branch-rules read failed or answered something that is not a count) — merging with squash, which GitHub refuses if a queue is required"; HAS_QUEUE=0 ;;
-    0)           say "merge queue: none on main — merging with squash" ;;
-    *)           say "merge queue: PRESENT ($n rule) — handing ready PRs to the queue with --auto"; HAS_QUEUE=1 ;;
+    ''|*[!0-9]*) log_line "merge queue: UNKNOWN (the branch-rules read failed or answered something that is not a count) — merging with squash, which GitHub refuses if a queue is required"; HAS_QUEUE=0 ;;
+    0) log_line "merge queue: none on main — merging with squash" ;;
+    *) log_line "merge queue: PRESENT ($n rule) — handing ready PRs to the queue with --auto"; HAS_QUEUE=1 ;;
   esac
 }
 
@@ -698,10 +698,10 @@ print((((d.get("data") or {}).get("repository") or {}).get("defaultBranchRef") o
   fi
   while IFS="$US" read -r kind a b c d e f; do
     case "$kind" in
-      FATAL)    say "stale-rerun: $a"; rm -rf "$tmp"; return 0 ;;
-      STATEERR) say "stale-rerun: THE STATE FILE COULD NOT BE WRITTEN ($a) — the outcome of every re-run this run is UNRECORDED, so it will be re-reported (and, for an unresolved re-run, re-measured) next pass. This is a degraded run, not a clean one" ;;
-      UNDATED) say "stale-rerun: #$a $b is RED but carries no started_at — NOT selected (a check that cannot be dated cannot be called stale; it stays red and visible)" ;;
-      SKIPWIN) say "stale-rerun: #$a $c skipped — run $b was already re-run inside the ${STALE_RERUN_WINDOW}s window (the state file is what stops a re-run loop)" ;;
+      FATAL) log_line "stale-rerun: $a"; rm -rf "$tmp"; return 0 ;;
+      STATEERR) log_line "stale-rerun: THE STATE FILE COULD NOT BE WRITTEN ($a) — the outcome of every re-run this run is UNRECORDED, so it will be re-reported (and, for an unresolved re-run, re-measured) next pass. This is a degraded run, not a clean one" ;;
+      UNDATED) log_line "stale-rerun: #$a $b is RED but carries no started_at — NOT selected (a check that cannot be dated cannot be called stale; it stays red and visible)" ;;
+      SKIPWIN) log_line "stale-rerun: #$a $c skipped — run $b was already re-run inside the ${STALE_RERUN_WINDOW}s window (the state file is what stops a re-run loop)" ;;
     esac
   done <"$tmp/plan.us"
 
@@ -896,9 +896,9 @@ lander_one() { # <pr>
       if [ -n "$MERGE_SHA" ]; then log_line "#$pr MERGED sha=$MERGE_SHA (head=$head, $green green, mergeStateStatus=$mstate)"
       else log_line "#$pr MERGED (head=$head, $green green) — merge commit sha unreadable"; fi
       MERGED=$((MERGED+1)) ;;
-    enqueued) say "#$pr ENQUEUED on the merge queue (head=$head, $green green) — the queue lands it"; ENQUEUED=$((ENQUEUED+1)) ;;
-    dry-run)  say "#$pr WOULD MERGE (dry-run; head=$head, $green green, mergeStateStatus=$mstate)"; WOULD=$((WOULD+1)) ;;
-    *)        say "#$pr ERROR: the merge command failed (head=$head) — see $LOG"; ERRORS=$((ERRORS+1)) ;;
+    enqueued) log_line "#$pr ENQUEUED on the merge queue (head=$head, $green green) — the queue lands it"; ENQUEUED=$((ENQUEUED+1)) ;;
+    dry-run) log_line "#$pr WOULD MERGE (dry-run; head=$head, $green green, mergeStateStatus=$mstate)"; WOULD=$((WOULD+1)) ;;
+    *) log_line "#$pr ERROR: the merge command failed (head=$head) — see $LOG"; ERRORS=$((ERRORS+1)) ;;
   esac
 }
 

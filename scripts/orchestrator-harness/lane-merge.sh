@@ -1062,7 +1062,7 @@ if [ "$WATCH" -eq 1 ]; then
           disposition WAITING_NO_VERDICT
           verdict WAITING_NO_VERDICT "the reviewer produced no verdict (no comment to read); re-run the chain"
           exit 11 ;;
-        LOAD)    say "… the reviewer was refused by the load gate; this is not a lane failure — re-run:"
+        LOAD) log_line "… the reviewer was refused by the load gate; this is not a lane failure — re-run:"
                  log_line "   lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
                  disposition WAITING_LOAD
                  verdict WAITING_LOAD "reviewer refused by the load gate; re-dispatch when the box quietens"

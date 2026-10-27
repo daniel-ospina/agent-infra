@@ -1612,8 +1612,8 @@ fleet_ensure_components() { # <harness-path>
       # was attempted. `status` still reports it as not-OK — the health verb and the start verb
       # answer different questions, and this is the one place they must differ.
       case "$name" in
-        cell-supervisor) say "$name: $state — not startable from here; a cell is provisioned by cloud-cell-bringup.sh" ;;
-        *)               say "$name: $state — not installed on this box (no start mechanism), so nothing was started" ;;
+        cell-supervisor) log_line "$name: $state — not startable from here; a cell is provisioned by cloud-cell-bringup.sh" ;;
+        *) log_line "$name: $state — not installed on this box (no start mechanism), so nothing was started" ;;
       esac
       continue
     fi

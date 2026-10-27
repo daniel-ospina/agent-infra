@@ -178,7 +178,7 @@ _num() { # <name> <value> <default>
     # ⛔ `say … && printf` LOST THE DEFAULT when the log was unwritable (a full disk, a read-only
     # remount, `LOG` pointed at a directory): `say` returns its redirect's status, so the `&&`
     # short-circuits and the caller got `""` — which defeats the very fence this function is.
-    *[!0-9]*) say "WARN: ${1}='${2}' is not a whole number — using ${3}"; printf '%s' "$3" ;;
+    *[!0-9]*) log_line "WARN: ${1}='${2}' is not a whole number — using ${3}"; printf '%s' "$3" ;;
     *) printf '%s' "$((10#$2))" ;;
   esac
 }
@@ -226,7 +226,7 @@ MAX_LANES="$(_num MAX_LANES "$MAX_LANES" "$MAX_LANES_DERIVED")"
 TARGET_PIN=""
 case "${TARGET_LANES:-}" in
   '') : ;;
-  *[!0-9]*) say "WARN: TARGET_LANES='${TARGET_LANES}' is not a whole number — deriving the target instead" ;;
+  *[!0-9]*) log_line "WARN: TARGET_LANES='${TARGET_LANES}' is not a whole number — deriving the target instead" ;;
   *) TARGET_PIN="$((10#$TARGET_LANES))" ;;
 esac
 
@@ -374,12 +374,12 @@ _swap_pair_mb() { # prints "<total_mb> <free_mb>"
 lo100="${LOAD1_100:-}"
 [ -n "$lo100" ] || lo100="$(_load1_100)"
 case "$lo100" in
-  ''|*[!0-9]*) say "FAIL: the 1-minute load average could not be read (no /proc/loadavg, no sysctl vm.loadavg) and LOAD1_100 was not set — the load arm cannot be evaluated"; exit 1 ;;
+  ''|*[!0-9]*) log_line "FAIL: the 1-minute load average could not be read (no /proc/loadavg, no sysctl vm.loadavg) and LOAD1_100 was not set — the load arm cannot be evaluated"; exit 1 ;;
 esac
 mem_avail="${MEM_AVAIL_MB:-}"
 [ -n "$mem_avail" ] || mem_avail="$(_mem_avail_mb)"
 case "$mem_avail" in
-  ''|*[!0-9]*) say "FAIL: available memory could not be read (no /proc/meminfo MemAvailable, no vm_stat) and MEM_AVAIL_MB was not set — the memory ceiling cannot be evaluated"; exit 1 ;;
+  ''|*[!0-9]*) log_line "FAIL: available memory could not be read (no /proc/meminfo MemAvailable, no vm_stat) and MEM_AVAIL_MB was not set — the memory ceiling cannot be evaluated"; exit 1 ;;
   # `unreadable` lands here (a non-numeric seam), which is the arm that proves the fail-closed path.
 esac
 sw_pair=""
@@ -394,7 +394,7 @@ else
   sw_pair="$(_swap_pair_mb)"
 fi
 case "$sw_pair" in
-  ''|*[!0-9\ ]*) say "FAIL: swap could not be read (no /proc/meminfo SwapTotal/SwapFree, no sysctl vm.swapusage) and SWAP_TOTAL_MB/SWAP_FREE_MB were not set — the capacity floor cannot be evaluated"; exit 1 ;;
+  ''|*[!0-9\ ]*) log_line "FAIL: swap could not be read (no /proc/meminfo SwapTotal/SwapFree, no sysctl vm.swapusage) and SWAP_TOTAL_MB/SWAP_FREE_MB were not set — the capacity floor cannot be evaluated"; exit 1 ;;
 esac
 swap_total="${sw_pair% *}"
 swap_free="${sw_pair#* }"

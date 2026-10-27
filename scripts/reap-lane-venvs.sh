@@ -1191,8 +1191,8 @@ main() {
 
     log_line "[$SCRIPT_NAME] mode=$mode_label apply=$APPLY repo=${REPO:-$PWD} worktree=${WORKTREE:--}"
     case "$TMUX_STATE" in
-        ok)     say "[$SCRIPT_NAME] witnesses: tmux panes + process cwd + process argv" ;;
-        absent) say "[$SCRIPT_NAME] witnesses: process cwd + process argv (no tmux server on this host)" ;;
+        ok) log_line "[$SCRIPT_NAME] witnesses: tmux panes + process cwd + process argv" ;;
+        absent) log_line "[$SCRIPT_NAME] witnesses: process cwd + process argv (no tmux server on this host)" ;;
     esac
     [ "$CWD_STATE" = "ok" ] || log_line "[$SCRIPT_NAME] warn: cwd witness DEGRADED (see above)"
 

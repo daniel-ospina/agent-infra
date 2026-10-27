@@ -720,7 +720,7 @@ do_status() {
                                 return 1
                             fi
                             log_line "  note=no pass has completed yet (the agent runs one at load, then on its interval)" ;;
-                        0) say "  note=a pass completed with 0 but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
+                        0) log_line "  note=a pass completed with 0 but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
                         *) err "the job last exited ${LAST_RUN} and no pass record exists — the pass is refusing before it can record anything"; return 1 ;;
                     esac ;;
                 *)
@@ -737,9 +737,9 @@ do_status() {
                             fi
                             log_line "  note=no pass has completed yet (the timer has not fired)" ;;
                         *) case "$(printf '%s' "${EXEC_TS:-}" | tr -d '[:space:]')" in
-                               ''|n/a|unknown|0|0s|-*) say "  note=the timer has fired and no pass has COMPLETED yet (its first tick is running)" ;;
+                               ''|n/a|unknown|0|0s|-*) log_line "  note=the timer has fired and no pass has COMPLETED yet (its first tick is running)" ;;
                                *) case "$(printf '%s' "${EXEC_MAIN:-}" | tr -d '[:space:]')" in
-                                      0|10|11) say "  note=a pass completed with ${EXEC_MAIN} but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
+                                      0|10|11) log_line "  note=a pass completed with ${EXEC_MAIN} but wrote no record where this box looks ($STATE_DIR) — check HARNESS_APPLY_STATE_DIR" ;;
                                       *) err "the pass has completed and its last exit was ${EXEC_MAIN}, with no record — it is refusing before it can record anything"; return 1 ;;
                                   esac ;;
                            esac ;;
