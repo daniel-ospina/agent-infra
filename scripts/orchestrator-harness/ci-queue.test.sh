@@ -190,7 +190,7 @@ has "$v" 'runners=~1'
 ck "(b6b2) …it takes the documented 1-runner floor (got: ${v})" "$?"
 # A garbled `running` must not become a ceiling the gate can never reach: 9 digits pass
 # `ciq_is_count` and would yield ceiling ~2e9, switching back-pressure off silently.
-# ⛔ AND IT MUST NOT BECOME THE FLEET SIZE AT ALL (#2917). This arm replaces the old "clamped by the
+# ⛔ AND IT MUST NOT BECOME THE FLEET SIZE AT ALL (#2927). This arm replaces the old "clamped by the
 # allowance" shape: with NOTHING measured, the in-progress count is DEMAND answering a SUPPLY
 # question, so a garbled `running` now lands on the same 1-runner floor as any other number.
 feed 5 499999999 -
@@ -200,7 +200,7 @@ has "$v" 'ceiling=2'
 ck "(b6c) an absurd \`running\` is never made the ceiling (got: ${v})" "$?"
 has "$v" 'runners=~1'
 ck "(b6c2) …and it is never made the FLEET either" "$?"
-# ⛔ THE MEASURED DEFECT, ARMS (b6d)/(b6e) — 2026-10-27, cell 4 (#2917). The live line was
+# ⛔ THE MEASURED DEFECT, ARMS (b6d)/(b6e) — 2026-10-27, cell 4 (#2927). The live line was
 # `runners=~2 => ceiling=4 => DEEP` with `queued=33 running=2` on a repo whose 8-registered fleet was
 # all online and idle: the ceiling was derived from the jobs EXECUTING, so the gate read the box's own
 # load as the world's capacity, and 41 consecutive PR-REPAIR dispatches were skipped by it.
@@ -524,7 +524,7 @@ ck "(e2) orch-loop.sh reads the queue IN THIS SHELL (not a subshell), once per P
 grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
 n="$(grep -cF 'if ciq_push_ok; then' "$LOOP")"
-# ⛔ THE THREE FIXER SPAWN ARMS NO LONGER CONSULT THE QUEUE AT ALL (#2917). They are REPAIR — the PR
+# ⛔ THE THREE FIXER SPAWN ARMS NO LONGER CONSULT THE QUEUE AT ALL (#2927). They are REPAIR — the PR
 # and its head already exist and its CI pass is already spent — and the class rule in ci-queue.sh's
 # header says only work that ADDS a new CI run is queue-gated. Measured 2026-10-27: those calls were
 # the last-line half of a gate that skipped 41 consecutive repair dispatches while 8 self-hosted
@@ -608,7 +608,7 @@ ck "(e10c) the module contains no lane-cap COMPARISON in executable lines (got '
 # calls per deferred PR. Every wiring site uses the in-shell entry point; this arm is what stops a
 # future edit reverting one of them.
 n="$(grep -c 'ciq_defer_note_here "' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "' "$FIX")"; p="$(grep -c 'ciq_defer_note_here "' "$DISPATCH")"
-# ⛔ THE COUNTS ARE 2 AND 0, NOT 4 AND 1, AND THAT IS #2917: `orch-loop.sh` keeps the IN-SHELL note at
+# ⛔ THE COUNTS ARE 2 AND 0, NOT 4 AND 1, AND THAT IS #2927: `orch-loop.sh` keeps the IN-SHELL note at
 # the ONE arm still queue-gated (the CI rerun) and `fix-one.sh` has none because a fixer is repair.
 # `dispatch-merge.sh` is unchanged (new-PR production). The invariant this arm exists for is unchanged
 # too — every deferral that still exists uses the IN-SHELL entry point, and the sum is pinned so a
@@ -1027,7 +1027,7 @@ fi
 # run-bash-shards.sh by design (spawn-gate.test.sh pins the excluded set), so NO CI LANE ran it.
 # Measured before this arm: the `exit 0` → `:` mutant left this file 83 passed, 0 failed, CLEAN.
 # The shipped block is EXTRACTED (not restated) and driven under a stub module in both polarities.
-printf '\n── (j) fix-one.sh does NOT gate a repair on the queue (#2917) ────────────────\n'
+printf '\n── (j) fix-one.sh does NOT gate a repair on the queue (#2927) ────────────────\n'
 # ⛔ THIS SECTION USED TO DRIVE THE DELETED GATE. It extracted `if [ -f "$SELF/ci-queue.sh" ] … fi`
 # from fix-one.sh and proved that a DEEP queue EXITED the fixer before any work — with its own
 # `exit 0`-deleted mutant. That block no longer exists: a fixer is REPAIR, so there is no block to

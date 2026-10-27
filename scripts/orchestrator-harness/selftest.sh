@@ -3155,7 +3155,7 @@ fi
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
 # ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY, AND IN BOTH DIRECTIONS.
-# ⛔ THE FIXER DEFER COUNT IS NOW ZERO ON PURPOSE (#2917). The three fixer spawn sites used to nest a
+# ⛔ THE FIXER DEFER COUNT IS NOW ZERO ON PURPOSE (#2927). The three fixer spawn sites used to nest a
 # `ciq_push_ok` deferral inside their own eligibility. They no longer do: a fixer is REPAIR — the PR
 # and its head already exist and its CI pass is already spent — so the class rule in ci-queue.sh's
 # header excludes it from queue gating. Measured 2026-10-27 on cell 4, that gate skipped 41
@@ -3174,7 +3174,7 @@ review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
 [ "$fixer_defer_sites" = "0" ] && rc=0 || rc=1
-ck "NO fixer spawn arm is CI-queue-gated (#2917 — repair adds no new CI run; found $fixer_defer_sites, expected 0)" $rc
+ck "NO fixer spawn arm is CI-queue-gated (#2927 — repair adds no new CI run; found $fixer_defer_sites, expected 0)" $rc
 [ "$fixer_defer_shared" = "0" ] && rc=0 || rc=1
 ck "…and the review-gate fixer's eligibility no longer shares a queue gate either (found $fixer_defer_shared, expected 0)" $rc
 [ "$rerun_gate" = "1" ] && rc=0 || rc=1

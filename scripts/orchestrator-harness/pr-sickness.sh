@@ -22,7 +22,7 @@
 # adds no lane ceiling of its own — the `fix-<PR>` workers it spawns are the SAME `fix-` sessions the
 # existing fixer arms spawn, so every existing census/reaper/cap counts them unchanged.
 #
-# ── NOT GATED ON THE CI QUEUE, AND THAT IS THE POINT (#2917) ────────────────────────────────
+# ── NOT GATED ON THE CI QUEUE, AND THAT IS THE POINT (#2927) ────────────────────────────────
 # Everything this file dispatches acts on a PR THAT ALREADY EXISTS: its head is red, conflicted or
 # under review, and its CI pass has already been spent on it. Repair adds no new CI run, so the CI
 # queue says nothing about whether these dispatches may proceed — and gating them on it was MEASURED
@@ -38,7 +38,7 @@
 # The queue gate itself is unchanged and still applied where it belongs — to work that ADDS a new CI
 # run (`dispatch-merge.sh`'s issue→PR batches and `orch-loop.sh`'s ISSUE path) and to the merge rail's
 # own CI-spending steps. See `ci-queue.sh`'s header for the class rule; do NOT reintroduce the gate
-# here on a tuning pretext — that re-opens #2917.
+# here on a tuning pretext — that re-opens #2927.
 #
 # ── POLARITY, ON THE NEWEST ATTEMPT PER (app, name) ─────────────────────────────────────────────
 # One surface read per PR, from the CHECK-RUNS API (`commits/<sha>/check-runs?filter=all`), which —
@@ -430,10 +430,10 @@ ps_held() {
 # derived `ceiling = ceil(runners*horizon/job_p90)` — plus `ps_load_ci_queue`, which sourced
 # `ci-queue.sh` for it, plus a fallback arm that re-derived the same arithmetic when the module was
 # absent. Every dispatch this file makes acts on an EXISTING PR, so that number could only ever
-# withhold work that spent no CI — and it did: 41 consecutive skips in one measured window (#2917),
+# withhold work that spent no CI — and it did: 41 consecutive skips in one measured window (#2927),
 # while the runners it was priced against sat idle.
 # ⛔ IF A FUTURE CHANGE WANTS A QUEUE-DEPTH GATE HERE, the queue is not the thing that changed. Argue
-# it against #2917 in the open, not by re-adding a predicate to this file line by line.
+# it against #2927 in the open, not by re-adding a predicate to this file line by line.
 
 # ── 6. THE DEFERRAL QUEUE (a deferred item is NOT dropped) ────────────────────────────────────
 # One row per (repo, PR, head, check). `ps_select` drains this FIRST, so an item deferred by
@@ -498,7 +498,7 @@ psick_refund_head() {
 
 # ps_decide <or> <pr> <sha> <branch> [fork] -> prints ONE decision line; rc 0 = dispatched.
 # The three shapes (the operator's grep) — `backpressure(q=…,r=…)` used to be a fourth and was
-# removed with the queue gate itself (#2917):
+# removed with the queue gate itself (#2927):
 #   RED #<pr> <check> -> dispatch <tag>
 #   skip #<pr>: in flight
 #   skip #<pr>: held by <lane>
@@ -674,7 +674,7 @@ ps_select() {
   # would silently disable the whole queue on a caller that forgot the flag.
   if [ -n "$maxspawn" ] && ! ps_is_num "$maxspawn"; then maxspawn=""; fi
 
-  # ── NO QUEUE GATE ON THIS PASS (#2917) ──────────────────────────────────────────────
+  # ── NO QUEUE GATE ON THIS PASS (#2927) ──────────────────────────────────────────────
   # This pass dispatches PR-REPAIR work only (fixers for EXISTING heads), which adds no new CI run, so
   # it reads no queue depth. The former arm here read the queue once per pass, printed
   # `[prsick] DEFERRED (backpressure)`, and — worse than the skip lines — GATED THE LEDGER DRAIN on

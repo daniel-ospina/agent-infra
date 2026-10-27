@@ -275,7 +275,7 @@ PY
     # UNDEFINED command returns 127 — `! 127` is TRUE, so every arm here would take the DEFERRAL path
     # and the driver could never reach a spawn it is supposed to prove. That is the same `! 127`
     # polarity trap the loop's own top-level definition carries a ⛔ comment about, reproduced one
-    # layer down. ⛔ AND IT RECORDS THAT IT RAN (#2917): the three FIXER arms must no longer consult
+    # layer down. ⛔ AND IT RECORDS THAT IT RAN (#2927): the three FIXER arms must no longer consult
     # it at all, and a stub that refuses silently would make "not called" and "called and ignored"
     # indistinguishable. `CIQ_PUSH_RC=1` is how an arm asks for the refused world.
     ciq_push_ok() { printf 'CALLED\n' >> "$TMP/ciqspy"; return "${CIQ_PUSH_RC:-0}"; }
@@ -350,7 +350,7 @@ PY
     # …and the CI-queue predicate for the same reason as `drive()` above: the CONFLICTING arm now
     # calls `ciq_push_ok`, and an undefined command is `! 127` = TRUE = DEFER, which would make this
     # rig unable to prove the conflict path ever dispatches. It records its calls for the same reason
-    # as `drive()` above (#2917): the conflict arm must not consult it any more.
+    # as `drive()` above (#2927): the conflict arm must not consult it any more.
     ciq_push_ok() { printf 'CALLED\n' >> "$TMP/ciqspy"; return "${CIQ_PUSH_RC:-0}"; }
     ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
     . "$TMP/shq.sh"
@@ -587,7 +587,7 @@ t5_clear() {
   return 0
 }
 
-# ⛔ THE CI-QUEUE GATE IS GONE FROM ALL THREE FIXER ARMS, AND THESE DRIVE THAT (#2917). Until this
+# ⛔ THE CI-QUEUE GATE IS GONE FROM ALL THREE FIXER ARMS, AND THESE DRIVE THAT (#2927). Until this
 # change each of them deferred on `ciq_push_ok`, so a deep queue stopped PR-REPAIR work: measured
 # 2026-10-27 on cell 4, 41 consecutive repair dispatches were skipped while 8 self-hosted runners and
 # ~11 lane slots sat idle. The predicate is stubbed to REFUSE (`CIQ_PUSH_RC=1`) *and* to record being
@@ -627,7 +627,7 @@ clear_revdisp() { mv "$REV_DISP" "$TMP/revdisp.spent.$RANDOM" 2>/dev/null || tru
 clear_store()   { mv "$STORE" "$TMP/store.spent.$RANDOM" 2>/dev/null || true; }
 seed_revdisp()  { printf '%s %s\n' "$1" "$2" > "$REV_DISP"; }
 # ⛔ THE REVIEW-GATE ARM IS ONLY REACHED FOR A HEAD WITH NO FINDINGS (#2132). The T5 drives above may
-# leave a `needsfix-4242-abc1234` marker behind (the review-gate arm there supplies one; since #2917 it
+# leave a `needsfix-4242-abc1234` marker behind (the review-gate arm there supplies one; since #2927 it
 # CONSUMES it by spawning rather than deferring, but the clearing must not depend on which branch T5
 # took), and every drive here shares ONE `$O/state`. Leaving it in place routes these drives into the
 # FIXER arm and the whole section would then grade a path it never reached — measured: (a) reported

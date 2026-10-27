@@ -38,7 +38,7 @@ cat > "$TMP/bin/gh" <<'GH'
 F="${PS_FIX:?}"
 case "${1:-}" in
   api)
-    # ⛔ EVERY PATH THIS STUB IS ASKED FOR IS RECORDED (#2917). The repair pass must not read the CI
+    # ⛔ EVERY PATH THIS STUB IS ASKED FOR IS RECORDED (#2927). The repair pass must not read the CI
     # queue at all, and "no skip line was printed" is not evidence of that — a gate that reads and then
     # ignores the answer looks identical in the output. This file is the measurement.
     printf '%s\n' "$*" >> "$F/gh-calls" 2>/dev/null
@@ -62,7 +62,7 @@ case "${1:-}" in
         [ -f "$FIX/joblog-$jid.txt" ] && { cat "$FIX/joblog-$jid.txt"; exit 0; }
         exit 1 ;;
       *"/actions/runs?status=in_progress"*)
-        # Answered for the arm that drives the SHIPPED `ci-queue.sh` (#2917): a queue whose in-progress
+        # Answered for the arm that drives the SHIPPED `ci-queue.sh` (#2927): a queue whose in-progress
         # count is unanswerable reads as an unreadable queue, which would make that arm pass for the
         # wrong reason.
         printf '{"total_count": %s, "workflow_runs": []}\n' "$(cat "$F/running" 2>/dev/null || echo 0)"
@@ -256,7 +256,7 @@ out="$(run_pass "$MOD")"; rc=$?
 has "$out" "[prsick] ENUMERATION FAILED" "a failed LISTING is named"
 eq "$rc" "2" "and the pass reports rc=2 (not a silent success)"
 
-echo "══ (e) REPAIR is never deferred on CI queue depth — the MEASURED 2026-10-27 fixture (#2917)"
+echo "══ (e) REPAIR is never deferred on CI queue depth — the MEASURED 2026-10-27 fixture (#2927)"
 # ⛔ THE LIVE NUMBERS, AND BOTH ARMS USE THEM. Measured on cell 4: `queued=33 running=2`, an 8-runner
 # self-hosted fleet all online and idle, 3 of `MAX_LANES=20` lanes in use, and one RED PR needing a
 # fixer. The pass printed `skip #77: backpressure(q=33,r=2)` and dispatched nothing — 41 times in one
@@ -324,13 +324,13 @@ tok="$(pol_of "$TMP/mut-nopolarity.sh" "$TMP/rows-empty" 2>/dev/null)"
                       || ok "(d) FAILS on the mutant: the classifier is gone (got '${tok:-<empty>}')"
 
 
-# ⛔ THE #2917 MUTANT: THE OLD PREDICATE, PUT BACK. `ceiling = ceil(in_progress*20/10)` — derived from
+# ⛔ THE #2927 MUTANT: THE OLD PREDICATE, PUT BACK. `ceiling = ceil(in_progress*20/10)` — derived from
 # the jobs EXECUTING, i.e. demand standing in for supply — applied to a REPAIR dispatch. It is
 # self-contained (it reads the two counts and applies the old arithmetic) because the deleted
 # `ps_queue_verdict` no longer exists to call. On the arm-(e1) feed (queued=33, running=2, fleet=8) it
 # derives ceiling 4 and defers — which is exactly what the live cell did 41 times.
 cat > "$TMP/oldpred.inc" <<'INC'
-  # MUTATED (#2917 review): the OLD predicate — a ceiling derived from the IN-PROGRESS JOB COUNT,
+  # MUTATED (#2927 review): the OLD predicate — a ceiling derived from the IN-PROGRESS JOB COUNT,
   # applied to REPAIR work. Restored deliberately, to prove arm (e1) is not always-green.
   local _mq _mr
   _mq="$(ps_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
@@ -426,7 +426,7 @@ out="$(run_pass)"
 has "$out" "skip #77: budget exhausted" "(control) with no refusal marker the budget binds and nothing is spawned"
 eq "$(spawns)" "0" "(control) no spawn"
 
-# ⛔ THE (i) ARM IS GONE WITH THE FUNCTION IT PINNED (#2917). It stubbed `ciq_verdict` and asserted
+# ⛔ THE (i) ARM IS GONE WITH THE FUNCTION IT PINNED (#2927). It stubbed `ciq_verdict` and asserted
 # `ps_queue_verdict`'s rc mapping (0=deep, 1=ok, 2=unknown). `ps_queue_verdict` no longer exists — this
 # file reads no queue. The mapping is now driven against the SHIPPED `ci-queue.sh` by (e5)-(e8) above,
 # where a stub cannot drift from the module; the module's own rc contract is covered by
@@ -457,7 +457,7 @@ eq "$(printf '%s\n' "$out" | grep -c 'RED #77 github-actions/docs-lint -> dispat
   "exactly ONE dispatch for the duplicated PR (the drain has the same one-decision-per-PR guard)"
 eq "$(spawns)" "1" "and exactly one spawn — not one per ledger row"
 # and a re-deferral REPLACES the row instead of appending a second one. The deferral is driven by the
-# LANE allowance (#2917): the queue is no longer a reason to defer a repair, and a fixture that used
+# LANE allowance (#2927): the queue is no longer a reason to defer a repair, and a fixture that used
 # it would now dispatch instead of re-deferring.
 reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
 run_pass --max-spawn 0 >/dev/null; run_pass --max-spawn 0 >/dev/null
@@ -509,7 +509,7 @@ has "$(cat "$STATE/sickbrief-77.md")" "head12: $sha12b" "the brief records the 1
 reset_all
 
 
-# ⛔ (p) IS GONE WITH THE PREDICATE IT TESTED (#2917). It drove the queue read's ONE corroborating
+# ⛔ (p) IS GONE WITH THE PREDICATE IT TESTED (#2927). It drove the queue read's ONE corroborating
 # re-read: measured 2026-10-22 the queued endpoint answered a valid 36-byte `{"total_count":0}` while
 # ~70 runs were queued (six samples: 70,70,0,70,70,70), and a zero is the one reading that OPENS a
 # gate. That arm lived in the `ps_queue_verdict` fallback, which this file no longer has; the repo's
@@ -557,7 +557,7 @@ no "$out" "was not an attempt" "(control) with no counter at this head, this rol
 [ -f "$STATE/fixbail-77-$sha_red" ] && ok "(control) and does not delete it" || bad "(control) a marker it never booked was deleted"
 eq "$(spawns)" "1" "(control) and the PR is still dispatched normally"
 
-# ⛔ (t) IS GONE WITH `ps_queue_verdict` (#2917). It proved that a delegated verdict answering rc=1
+# ⛔ (t) IS GONE WITH `ps_queue_verdict` (#2927). It proved that a delegated verdict answering rc=1
 # with NO measured numbers is UNKNOWN rather than a dispatch — the arm that is now `ci-queue.sh`'s
 # `ciq_ci_allowed` (it refuses anything but a measured ok), covered there as (c9)/(c10).
 

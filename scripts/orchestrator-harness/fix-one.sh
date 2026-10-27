@@ -200,7 +200,7 @@ fi
 # merge-one.sh (the sole claim_acquire caller), so two boxes could each spawn a fixer for the same
 # PR/head. Same key and lease shape as merge-one.sh's — the claim is on the PR's CURRENT head, so a
 # fixer and a reviewer never race each other for the same content version.
-# ── NO CI-QUEUE GATE IN THE FIXER: A FIXER IS REPAIR (#2917) ─────────────────────
+# ── NO CI-QUEUE GATE IN THE FIXER: A FIXER IS REPAIR (#2927) ─────────────────────
 # This block used to read the repo's CI queue and EXIT the fixer on a deep one, on the argument that a
 # fixer's product is a new head and so a full CI pass. Measured against the queue that argument is
 # wrong: the head already exists and its pass has already been paid for, and the queue depth the block
@@ -212,7 +212,7 @@ fi
 # (`spawn-gate.sh`, below and in the caller) — those are about whether THIS BOX can run the agent,
 # which is what the fixer actually consumes. The CI queue is not consulted here and must not become
 # so again: see `ci-queue.sh`'s header for the class rule (only work that ADDS a new CI run is
-# queue-gated) and #2917 for the measurement. The cross-box claim below is unchanged and still runs
+# queue-gated) and #2927 for the measurement. The cross-box claim below is unchanged and still runs
 # before any work: a fixer that will not push must not hold a claim.
 # ── THE LANDER'S LOCK: a fixer must not be in flight on a PR a lander owns ─────────
 # ⛔ THE HOLE THIS CLOSES (measured 2026-10-23). `merge-one.sh` (the reviewer/lander chain) and the

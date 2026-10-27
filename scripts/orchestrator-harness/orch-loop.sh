@@ -884,7 +884,7 @@ fi
 # is `! 127` = TRUE, i.e. a box that shipped no module would defer every fixer forever while
 # reporting a healthy controller.
 if [ "${CIQ:-0}" = "1" ]; then
-  # ⛔ ONE CONSUMER LEFT, AND THAT IS THE POINT (#2917). `ciq_push_ok` gates the CI-RERUN site only.
+  # ⛔ ONE CONSUMER LEFT, AND THAT IS THE POINT (#2927). `ciq_push_ok` gates the CI-RERUN site only.
   # The three FIXER spawn arms no longer call it: they are REPAIR (an existing PR whose CI pass is
   # already spent), and the class rule in `ci-queue.sh`'s header says only work that ADDS a new CI run
   # is queue-gated. A rerun is exactly that — it queues a fresh run for the same head — so it keeps
@@ -958,7 +958,7 @@ if [ -n "$_pss_mod" ]; then
 fi
 if declare -f ps_select ps_decide ps_polarity ps_verdict ps_held >/dev/null 2>&1; then
   PRSICK=1
-  # ⛔ NO QUEUE MODULE IS LOADED FOR THE PR-SICKNESS QUEUE (#2917): every dispatch it makes is
+  # ⛔ NO QUEUE MODULE IS LOADED FOR THE PR-SICKNESS QUEUE (#2927): every dispatch it makes is
   # REPAIR, which adds no new CI run, so it reads no queue depth. Its bound is `--max-spawn` (the
   # fix-lane headroom `fix_slots` computes) exactly as before. The CI-queue read this loop still
   # needs is the dispatch block's own, below.
@@ -4555,7 +4555,7 @@ while true; do
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            # ⛔ NO CI-QUEUE GATE ON THIS SPAWN, AND THIS IS THE ARM THAT PROVES THE RULE (#2917).
+            # ⛔ NO CI-QUEUE GATE ON THIS SPAWN, AND THIS IS THE ARM THAT PROVES THE RULE (#2927).
             # A CONFLICTED fixer is REPAIR: the PR and its head already exist and its CI pass has
             # already been paid for. Measured 2026-10-27 on cell 4, the queue gate that used to wrap
             # this spawn deferred 41 consecutive repair dispatches against a queue that belonged to
@@ -4735,7 +4735,7 @@ while true; do
             is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
-            # ⛔ NO CI-QUEUE GATE ON THIS SPAWN EITHER (#2917): a review-findings fixer is REPAIR (its
+            # ⛔ NO CI-QUEUE GATE ON THIS SPAWN EITHER (#2927): a review-findings fixer is REPAIR (its
             # head already exists and its CI pass is already spent), so the class rule in
             # `ci-queue.sh`'s header excludes it — same measurement, same 41 skips, same idle fleet as
             # the CONFLICTED arm above. What stays: the eligibility predicate is still HOISTED into
@@ -4930,7 +4930,7 @@ while true; do
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
             # NO CI-QUEUE GATE — see the CONFLICTED arm above for the rule and the measurement
-            # (#2917): a CI-red fixer is REPAIR, and the bounds on it are this `$MF` fix-lane ceiling,
+            # (#2927): a CI-red fixer is REPAIR, and the bounds on it are this `$MF` fix-lane ceiling,
             # `can_spawn`'s load/disk/memory gate and the cross-box claim.
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
             if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then

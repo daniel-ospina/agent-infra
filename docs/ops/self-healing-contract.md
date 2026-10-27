@@ -557,9 +557,19 @@ prove it was safe" — which it must say.
 **Promises.** (a) Do not send more CI than the queue can absorb; (b) serialise `gh` so four boxes do
 not act as one rate-limited account.
 
-**ALIVE vs REFUSING vs IDLE.** `ci-queue.sh` produces the verdict; the **consumer** is `orch-loop.sh`, which
-turns it into the named gate line `GATE_WHY="ci-queue($CIQ_VER)"`; `gh-limit` **records the limit and returns at once** (`NO_WAIT`), so
+**ALIVE vs REFUSING vs IDLE.** `ci-queue.sh` produces the verdict; the **consumers** are `orch-loop.sh` — which
+turns it into the named gate line `GATE_WHY="ci-queue($CIQ_VER)"` for the ISSUE path and withholds the CI
+RERUN — and `dispatch-merge.sh`, which defers an issue→PR batch. `gh-limit` **records the limit and returns at once** (`NO_WAIT`), so
 the caller sees a `RATE-LIMITED` verdict rather than an in-call sleep that outlives it.
+
+**What it may and may not gate (measured 2026-10-27, cell 4).** Only work that ADDS a new CI run: the
+issue→PR path, batch dispatch, and a rerun. **Repair is never queue-gated** — a red-check fixer, a
+review-findings fixer, a conflict fixer and the PR-sickness queue all act on a PR whose head already
+exists and whose CI pass is already spent, so its bound is this box's lane slots and load gate instead.
+Gating repair on the queue skipped **41 consecutive dispatches in one window** while 8 self-hosted
+runners and ~11 lane slots sat idle: the queue being read belonged to GitHub-HOSTED concurrency. The
+ceiling's `runners` term is the fleet's registered/online size — never the count of in-progress JOBS,
+which is demand and reads smallest exactly when the box is idle.
 IDLE = the queue is below the bound; REFUSING = at/over it, with the version string naming why.
 
 **What repairs it.** Nothing on the box — this is a *wait* state, and the remedy is fewer lanes, which

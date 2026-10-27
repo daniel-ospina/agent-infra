@@ -104,14 +104,14 @@
 #     #2333 review, P2.) Past that window the record is dropped and the verdict is UNKNOWN again.
 #   * `runners` is the FLEET SIZE — the supply side of the derivation, never the demand side. It is
 #     MEASURED when the repo endpoint answers with an online runner count.
-#     ⛔ NEVER THE IN-PROGRESS COUNT (#2917). `running` is how many JOBS are executing; deriving the
+#     ⛔ NEVER THE IN-PROGRESS COUNT (#2927). `running` is how many JOBS are executing; deriving the
 #     ceiling's runner term from it made the gate read the box's own load as the world's capacity and
 #     printed it in the same `runners=` field a real measurement uses — measured 2026-10-27 on cell 4:
 #     `queued=33 running=2 runners=~2 => ceiling=4 => DEEP`, on an agent-infra whose jobs run on
 #     GitHub-HOSTED runners while its own 8-runner self-hosted fleet sat all-online and all-idle, and
 #     41 consecutive PR-repair dispatches were skipped by that one number. When no count is measured
 #     there are THREE cases and they do not share one answer (#2333 review cycles 9-11, revised by
-#     #2917):
+#     #2927):
 #       (a) the endpoint ANSWERING `total_count: 0` is the hosted-CI shape (GitHub-hosted runners
 #           never appear in that list — agent-infra's measured shape) and derives from the account's
 #           concurrent-job allowance;
@@ -125,7 +125,7 @@
 #           an inference presented as a measurement is the defect this gate exists to avoid.
 #     The record says `runners=<n>(busy)` when the endpoint answered with an online count,
 #     `runners=~<n>` when it did not.
-#   * ⛔ WHAT THIS GATE IS ALLOWED TO GATE IS TWO CLASSES, AND THE LINE IS THE ACTION'S COST (#2917).
+#   * ⛔ WHAT THIS GATE IS ALLOWED TO GATE IS TWO CLASSES, AND THE LINE IS THE ACTION'S COST (#2927).
 #     ONLY work that ADDS A NEW CI RUN is queue-gated: opening a PR from an issue (agent-infra's
 #     `dispatch-merge.sh`, and `orch-loop.sh`'s ISSUE path) and the merge rail's own CI-spending
 #     steps. REPAIR — acting on a PR that already exists (a red-check fixer, a review-findings fixer,
@@ -133,7 +133,7 @@
 #     not become so again: its real bounds are the lane slots (`MAX_LANES` vs lanes alive) and the
 #     load/headroom gate, and its head already owns the CI pass it is repairing. Gating repair on this
 #     number is what produced 41 skips while 11 lane slots and 8 runners sat idle. If a future change
-#     wants to defer a repair dispatch, it is not a tuning change — it re-opens #2917.
+#     wants to defer a repair dispatch, it is not a tuning change — it re-opens #2927.
 #   * TWO DECLARED RESIDUALS ON THE MEASUREMENT ITSELF — both stated, neither closed by reading
 #     harder:
 #     (i) ONLY `status=queued` IS COUNTED (#2333 review, P2). A run parked behind an environment
@@ -317,7 +317,7 @@ ciq_read() {
   # endpoint actually returned together with the length of the streak.
   mkdir -p "$dir" 2>/dev/null || true
   _errf="$dir/ciq-err"; : > "$_errf" 2>/dev/null || true
-  # ⛔ THE FLEET READ GETS ITS OWN SCRATCH FILE (#2917). The queue reads and the runner read shared
+  # ⛔ THE FLEET READ GETS ITS OWN SCRATCH FILE (#2927). The queue reads and the runner read shared
   # one, so the `unknown(...)` cause named the first HTTP status in the file — which is the QUEUED
   # read's, not the runner read's. Branch (c) below has to say WHICH reading failed, so it needs the
   # runner call's own words.
@@ -427,7 +427,7 @@ ciq_read() {
     #     permitting 4x its true ceiling. Fail CLOSED.
     #
     # ⛔ AND IT MUST NOT BE CLOSED WITH THE IN-PROGRESS COUNT — THAT IS THE DEFECT THIS ARM EXISTS
-    # FOR NOW (#2917, measured 2026-10-27 on cell 4). This branch used to take `floor="$running"`:
+    # FOR NOW (#2927, measured 2026-10-27 on cell 4). This branch used to take `floor="$running"`:
     # with nothing measured, the number of jobs EXECUTING stood in for the size of the FLEET. That is
     # DEMAND answering a SUPPLY question, and the two are not even correlated in the direction the
     # gate needs — a box measured `queued=33 running=2 runners=~2 => ceiling 4 => DEFERRED` while its
