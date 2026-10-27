@@ -231,7 +231,6 @@ shard_slowest=""
 #
 # It records only LISTED shards (`shard_is_listed`) — the same rule `shard_note` uses — so the
 # self-check sentinels below, which deliberately fail, cannot print a bogus name.
-shard_err_before=0
 
 # THE LIST, derived ONCE. The count, the target-containment check, the execution loop and the
 # slice-coverage comparison below all read this variable, so the four cannot disagree about what
@@ -298,14 +297,18 @@ trap 'rm -f "$shard_ran_log"' EXIT
 # for hours, `bash-suites` red on every PR head, and every lane re-derived those four from CI logs by
 # hand, over a 5-minute fix. The names were in the log all along; they were just not in the answer.
 #
-# ⛔ TWO READERS, TWO MECHANISMS — and the rail is served by the OTHER one. `run_shard` emits
+# ⛔ THREE READERS, AND THE RAIL NOW KNOWS ALL THREE (#2700). `run_shard` emits
 # `::error::bash shard failed: <path>`, a GitHub annotation, and `scripts/ci_exemption.py ids`
 # recognises it as a guard-step identity that CARRIES the shard path — measured on a log with two of
-# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. That is what
-# makes a red `bash-suites` step comparable to main's baseline PER SHARD, and it is NOT this block:
-# measured against the prose lines printed here, the same parser returns `ids=0` — they neither help
-# nor hurt it. Do not "fix" the rail here, and never delete the annotation while keeping these lines:
-# that would leave every lane unattributable again.
+# them: `guard-step::bash-suites-2::bash-shard-failed-tests-atomic-land-run.sh`, `ids=2`. Since
+# #2648/#2700 the parser ALSO reads the two prose lines below as `bash-shard::<path>` family
+# identities: the per-shard `❌ FAILED SHARD: <path>` and the recap `❌ failing shard(s): <paths>`. The
+# earlier revision of this paragraph said "measured against the prose lines printed here, the same
+# parser returns `ids=0` — they neither help nor hurt it"; that was true before #2648 and is false
+# now, and a stale claim about the parser is exactly what a future lane reads before deciding whether
+# to touch the rail. **Do not "fix" the rail here, and never delete the annotation while keeping
+# these lines** — the annotation is the only one of the three that survives being taken out of the
+# step's own prose, and it is what keeps every lane attributable.
 #
 # Two prints, on purpose — and the REASON is the early exits: the recap below is reached only at the
 # END of a run, while this file has several `exit 1` paths ABOVE it (`shard target resolves outside
@@ -503,7 +506,12 @@ run_shard scripts/orchestrator-bringup.test.sh                               # #
 run_shard scripts/fleet-inventory.test.sh                                   # #2026 THE FLEET INVENTORY: status prints COMPONENT|EXPECTED|ACTUAL|STATE for every declared component and exits with the worst row — DUPLICATE on two live instances (a lock is not proof), MISSING when one is absent, a matcher that cannot match itself, SKIPPED distinct from OK, and an unreadable ps as UNKNOWN/2 rather than green
 run_shard scripts/orchestrator-harness/lander.test.sh                     # the versioned drain loop: a MERGEABLE+all-green PR is merged head-pinned, a PENDING one is NOT merged and NOT called failed (the measured case: 127 runs queued vs 5 in progress), a failing check is skipped and NAMED, a draft and a BLOCKED PR are reported with their reason, the CI queue depth is printed once per run even when nothing merges, and an unreadable board merges nothing — plus --nonvacuity, which deletes the pending arm and requires the PENDING assertion to break by name
 run_shard scripts/orchestrator-harness/ai-drainer.test.sh                  # the SCHEDULED dispatcher's guards, each driven against the mutation that would defeat it: two concurrent invocations start ONE lane AND three ticks racing over one STALE lock still start ONE (the reclaim is an atomic `mv`, not `rm -rf` + `mkdir`, which let two contenders both "reclaim" it), the same arm against a lock-stripped copy starts TWO (so it measures the lock, not the harness), the lock is HELD while the lane pid lives — with a fresh beat while it waits — and released only when that pid dies, a lane that was SIGNALLED is reported as having no exit status (never `DONE`), while a lane that finishes rc=0 is DONE and one that refused rc=3 FAILS the tick, a dispatcher that returns with no pidfile FAILS the tick instead of releasing the lock on a zero-length wait, a pass below the swap floor or at the lane cap SKIPS with exit 0 and dispatches nothing (the cap counts a lane shaped like the real dispatcher — a backgrounded subshell whose argv names it, NOT a command line starting with `pi`, which counted zero), an unreadable swap read FAILS rather than reading as an idle box, a non-numeric LANE_TIMEOUT cannot disable the held lock, the slice cursor advances 0 → 10 and WRAPS, the tick removes its own worktree, and the multi-repo launcher refuses an unset OR, a missing state dir (without creating it), a state dir that IS the primary's, the primary's pin OR a non-canonical path to it, and an empty pin. Hermetic: fixture seed repo, fake dispatcher, no network, no gh, no tmux
-run_shard scripts/orchestrator-harness/cloud-cell-doctor.test.sh            # #1989 the cell's reap/doctor/merge/hygiene roles: a lane whose child is still writing is NOT reaped, a human-attached/terminal lane is NOT touched, the rail is gated on a clean attestation at the head with no blind retry, an unreadable read is cannot-verify, and `status` FAILS a started cell whose roles never ran
+# ⛔ ONE ENTRY PER SUITE. This suite was listed TWICE (line 1 added by #1989, the second copy by #2597,
+# which should have EDITED the #1989 comment instead of appending a row): the tree ran the same suite
+# twice and `test_bash_shard_identity_is_injective_over_the_listed_shards` (tests/test_ci_exemption.py)
+# went red on main, which reds the `test` job for every PR whose base includes it — a fleet-wide merge
+# block caused by a list, not by code. Rows are additive; a suite that gains a claim gets its comment
+# amended here, never a second row.
 run_shard scripts/orchestrator-harness/cloud-cell-doctor.test.sh            # #1989 the cell's reap/doctor/merge/hygiene roles: a lane whose child is still writing is NOT reaped, a human-attached/terminal lane is NOT touched, the rail is gated on a clean attestation at the head with no blind retry, an unreadable read is cannot-verify, and `status` FAILS a started cell whose roles never ran. #2577: a review record that exists only on a PEER box becomes visible to the merge role in ONE hygiene pass (real local bare-store/ref fixture), and a failed or hanging sync LOGS + leaves the pass successful
 run_shard scripts/orchestrator-harness/cloud-cell-doctor.hardening.test.sh  # #1989 the CLASSIFICATION invariant: every read a pass acts on answers 0/1/3, so a failed read never arrives as evidence (a kill is verified before it is counted, an unparseable process table or a DECREASING cpu reading is cannot-verify, an unreadable attestation never reads as "nothing to land", a bound-killed rail is not a refusal, a failed hygiene action is not a clean row, `--dry-run` keeps the WORSE verdict, and a role row's recorded rc reaches `status`'s exit status)
 run_shard scripts/orchestrator-harness/cloud-cell-doctor.hygiene.test.sh    # #2573 the DISK-RECLAIM contract, in BOTH directions in one fixture: a stale `cloud-cell-<pid>.<rand>` dir (dead pid + past the idle floor) is reaped and a LIVE one, a no-pid one and a fresh one are LEFT with their reasons; `docker image prune -af`/`volume prune -f` run and `system prune` never does; an abandoned checkout is reclaimed while an unpushed commit and a dirty tree are preserved (driven through the SHIPPED reaper on real git); the cache sweep excludes the root a live cwd census HOLDS and still sweeps the idle ones (a live worker no longer suppresses every root), an unreadable census is cannot-verify/3, and every pass reports a signed `df` BEFORE → AFTER delta instead of a `du` sum
@@ -688,6 +696,15 @@ if [ "$shard_errors" -gt 0 ]; then
   # `could NOT be named` rather than blame a subsystem it never looked at.
   if [ -n "$shard_failed_list" ]; then
     echo "❌ failing shard(s): $shard_failed_list"
+    # ⛔ A PARTIAL RECAP IS A FALSE PASS (review cycle 2, P2). The list can name SOME of the counted
+    # failures, and "2 failed" beside one name reads as a COMPLETE recap to the rail, which then
+    # compares a 1-identity certificate and admits the un-named half — the incomplete-set direction
+    # this runner exists to close. Completeness is compared from what was COUNTED (`shard_errors`)
+    # against what was NAMED, never inferred from the list being non-empty.
+    recap_named=$(printf '%s' "$shard_failed_list" | awk -F', ' '{print NF}')
+    if [ "$recap_named" -lt "$shard_errors" ]; then
+      echo "❌ …and $((shard_errors - recap_named)) of the counted failure(s) could NOT be named — the naming arm did not run for them. This is a defect in scripts/run-bash-shards.sh, not in the failing file."
+    fi
     # ⚠️ A MIXED RUN MUST ACCOUNT FOR ITS COUNT. `shard_errors` counts BOTH failing shards and failing
     # syntax sweeps; the list above names them together. Printing "2 failed" beside one name reads as a
     # missing name — and the missing half is exactly what the recap exists to stop hunting for.

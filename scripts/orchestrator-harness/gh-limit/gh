@@ -79,8 +79,13 @@ if [ ! -f "$HELPER" ]; then
     [ "$_d/gh" -ef "$SELF_REAL" ] && continue
     # Skip EVERY harness shim by its OWN sentinel line, not by a sibling that may be the missing file.
     # No pipe: `head | grep -q` can report failure through SIGPIPE under `pipefail` (the #841 class).
-    _head="$(head -c 8192 "$_d/gh" 2>/dev/null)" || _head=""
-    grep -q 'harness-gh-shim-marker' <<<"$_head" && continue
+    # ⛔ AND NO COMMAND SUBSTITUTION: the candidate IS the real gh, a compiled binary, and reading it
+    # into a variable makes bash >= 4.4 print `warning: command substitution: ignored null byte in
+    # input` on the STDERR of a call that SUCCEEDS — which any caller merging stderr (`2>&1`) captures
+    # as DATA (#2184, the same root the sibling `gh-rest/gh` walk carried). `grep -a` matches a binary
+    # candidate instead of skipping it as "binary file matches" (a skip here would exec a shim as the
+    # real gh); `-q` is one process, so the #841 SIGPIPE race cannot arise.
+    grep -qa 'harness-gh-shim-marker' "$_d/gh" 2>/dev/null && continue
     IFS="$_IFS_save"
     _run_plain "$_d/gh" "$@"
     exit $?
