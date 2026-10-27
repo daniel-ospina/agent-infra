@@ -116,6 +116,46 @@ arm_root() { # <name> -> echoes the root
   printf '%s\n' "$r"
 }
 
+# ── ⛔ NO TEST MAY REACH THE REAL SYSTEM THROUGH AN UNSTUBBED NAME (#2910) ───────────────────────
+# THE DEFECT THIS PRELUDE EXISTS FOR. §B and §F execute a SLICE of `cloud-cell-supervisor.sh` in a
+# fresh `bash -c`, where that script's own helpers do not exist. An unstubbed name then resolves
+# through PATH to a REAL binary: `say` became **/usr/bin/say** (macOS text-to-speech), so the shipped
+# `controller: FOREGROUND — this process is the controller …` banner was READ ALOUD through the
+# speaker — repeatedly, during the owner's live customer call (2026-10-27; `pmset -g assertions`
+# showed `audio-out BuiltInSpeakerDevice` created for the say pid). Nothing failed and nothing was
+# logged: the suite read GREEN while it spoke, so no instrument in CI could ever see it.
+#
+# Two layers, both asserted (§B/§F assert the first, §O is the contract for both):
+#   1. FRAG_STUBS — ONE shared prelude, prepended to EVERY fragment execution. A per-site hand-written
+#      stub list is how this omission happened: each site stubbed the behaviour helpers it knew about
+#      and none stubbed the output helper, so every helper ADDED to the fragment later starts leaking
+#      to the real system the day it is introduced. Stub the output surface once, here.
+#   2. mk_quiet_bin — a "no side effects" bin dir FIRST on PATH for every fragment run, so even a
+#      helper this prelude does not know about is RECORDED in a file the suite asserts on instead of
+#      being performed.
+# `say` is the only output helper `cloud-cell-supervisor.sh` defines at file scope. `die` is
+# deliberately NOT stubbed: it is behaviour (it exits 1), not output, and stubbing it would change the
+# fragment's real failure paths. `open`/`osascript`/`afplay` are the other macOS binaries that speak
+# or launch, stubbed so no fragment can ever acquire a side effect nobody wrote.
+FRAG_STUBS='say(){ :; }; open(){ :; }; osascript(){ :; }; afplay(){ :; }; '
+
+# mk_quiet_bin <bin dir> <calls file> — the second layer: every system-facing binary a fragment could
+# reach becomes a RECORDER here (appends its argv to <calls file>, exits 0). The fragments put
+# "$<arm>/bin" FIRST on PATH, so this wins over /usr/bin — which is what makes the §B/§F/§O
+# assertions evidence about the real system rather than the absence of a crash.
+mk_quiet_bin() { # <bin dir> <calls file>
+  local bin="$1" calls="$2" n
+  mkdir -p "$bin"; : > "$calls"
+  for n in say open osascript afplay; do
+    cat > "$bin/$n" <<SHIM
+#!/bin/bash
+printf '%s %s\n' "$n" "\$*" >> "$calls"
+exit 0
+SHIM
+    chmod +x "$bin/$n"
+  done
+}
+
 # ── the systemd double ──────────────────────────────────────────────────────────────────────────
 # Records EVERY argv (append) so an arm asserts a CALL, and keeps its state in files so an arm can set
 # "enabled but not active". `SC_HOOK` runs on `start` — that is how §C models the unit's ExecStart: the
@@ -423,6 +463,7 @@ awk '/SERVICE MODE: this process IS the controller/{on=1}
 
 # The fixture controller records the environment it was given, then exits; §F replaces it per mode.
 B="$(arm_root b)"; mk_systemctl "$B/bin" "$B/state" "$B/sc.log"; mk_tmux "$B/bin" "$B/tmux.log"
+mk_quiet_bin "$B/bin" "$B/say.calls"   # ⛔ layer 2: `say` here RECORDS its argv, it never speaks (#2910)
 mkdir -p "$B/o/gh-limit"
 cat > "$B/harness/orch-loop.sh" <<STUB
 #!/bin/bash
@@ -440,7 +481,7 @@ B_OUT="$(bnd env ORCH_FOREGROUND=1 CELL_HOME="$B/home" HOME="$B/home" O="$B/o" R
          GH_REPO=daniel-ospina/tortoise \
          HARNESS="$B/harness" HARNESS_REPO=daniel-ospina/agent-infra SUP_SELF="$SUP" \
          PATH="$B/bin:/usr/bin:/bin" \
-         bash -c "start_doctor_loop() { : > '$B/doctor.called'; }; superseded() { return 1; }; $(cat "$FRAG"); printf 'NOT-EXECED\n'" 2>&1)"; B_RC=$?
+         bash -c "${FRAG_STUBS}start_doctor_loop() { : > '$B/doctor.called'; }; superseded() { return 1; }; $(cat "$FRAG"); printf 'NOT-EXECED\n'" 2>&1)"; B_RC=$?
 [ "$B_RC" -eq 0 ] && ok '§B: the fragment exits cleanly' || bad "§B: fragment rc=$B_RC — $B_OUT"
 [ -f "$B/loop.ran" ] && ok '§B: the controller RAN (the fragment exec\x27d it)' \
   || bad "§B: the controller never ran — $B_OUT"
@@ -458,6 +499,12 @@ case "$B_OUT" in
 esac
 [ -f "$B/tmux.log" ] && bad "§B: FOREGROUND mode created a tmux session: $(cat "$B/tmux.log")" \
                     || ok '§B: no tmux session was created'
+# ⛔ THE FRAGMENT MUST NOT SPEAK (#2910). This arm executes the shipped banner call; with no stub and
+# /usr/bin on PATH the shell resolved `say` to macOS text-to-speech and READ IT ALOUD into a live
+# customer call. $B/bin is first on this PATH and its `say` appends to $B/say.calls, so this assertion
+# is evidence about the real system: an empty file means the real binary was never reached.
+[ -s "$B/say.calls" ] && bad "§B: the fragment REACHED a real say binary — $(cat "$B/say.calls") (#2910: a test must never speak)" \
+                      || ok '§B: the fragment never reached the real say binary (its banner is stubbed, #2910)'
 # ⛔ `exec` REPLACES the process, so anything placed after it never runs. The tmux path launches the doctor
 # loop just above the branch this fragment replaces; a service-mode cell that skipped it would dispatch but
 # never reap, land, repair or prune (#1989). The arm supplies the function (the real script defines it) and
@@ -474,9 +521,13 @@ case "$(cat "$B/loop.env" 2>/dev/null)" in
 esac
 # ...and a cell that legitimately ships no gh-limit layer must NOT gain a PATH entry that does not exist.
 rmdir "$B/o/gh-limit"
+# its own verdict: the second fragment RUN is a separate site (#2910), so it starts from an empty record
+: > "$B/say.calls"
 B2_OUT="$(bnd env ORCH_FOREGROUND=1 CELL_HOME="$B/home" HOME="$B/home" O="$B/o" REPO="$B/repo" \
           SCOPE=own ENV_FILE="$B/home/keys.env" HARNESS="$B/harness" SUP_SELF="$SUP" \
-          PATH="$B/bin:/usr/bin:/bin" bash -c "$(cat "$FRAG")" 2>&1)"
+          PATH="$B/bin:/usr/bin:/bin" bash -c "${FRAG_STUBS}$(cat "$FRAG")" 2>&1)"
+[ -s "$B/say.calls" ] && bad "§B: the second fragment run REACHED a real say binary — $(cat "$B/say.calls") (#2910)" \
+                      || ok '§B: and neither did the second fixture-less fragment run (#2910)'
 case "$(cat "$B/loop.env" 2>/dev/null)" in
   *"|$B/bin:/usr/bin:/bin") ok '§B: no gh-limit layer, no PATH entry invented (the warning path stays honest)' ;;
   *) bad "§B: PATH was rewritten for a layer that does not exist — $(cat "$B/loop.env" 2>/dev/null) — $B2_OUT" ;;
@@ -853,6 +904,7 @@ chmod +x "$DOUBLE"
 # Render §F's unit with a ONE-SECOND RestartSec: the POLICY is what is under test, not the interval
 # (which §A pins as the 15 s default). ORCH_RESTART_SEC accepts any whole second >= 1.
 F="$(arm_root f)"; mk_systemctl "$F/bin" "$F/state" "$F/sc.log"; mk_tmux "$F/bin" "$F/tmux.log"
+mk_quiet_bin "$F/bin" "$F/say.calls"   # ⛔ layer 2: `say` here RECORDS its argv, it never speaks (#2910)
 
 # drive_f <case> <mode> [policy override]
 #   mode: kill (SIGKILLs itself — the issue's bullet 3), exit0 (orderly exit — bullet 5), exit1 (always)
@@ -869,7 +921,7 @@ case "$mode" in
 esac
 STUB
   chmod +x "$r/harness/orch-loop.sh"
-  bnd env UNIT_FILE="$F/units/eldato-orchestrator.service" EXEC="start_doctor_loop() { :; }; superseded() { return 1; }
+  bnd env UNIT_FILE="$F/units/eldato-orchestrator.service" EXEC="${FRAG_STUBS}start_doctor_loop() { :; }; superseded() { return 1; }
 $(cat "$FRAG")
 bash \"$r/harness/orch-loop.sh\"" \
       STARTS_FILE="$r/starts" STATE_FILE="$r/state.out" POLICY_OVERRIDE="$override" \
@@ -903,6 +955,13 @@ grep -qxF 'failed' "$F/fail/state.out.state" 2>/dev/null \
 # `burst` attempts and is refused on the NEXT one: 4 starts at the artifact's StartLimitBurst=3.
 [ "${N_FAIL:-0}" -eq 4 ] && ok "§F: the start limit fired on the start AFTER the declared burst (${N_FAIL} starts, burst=3) — systemd refuses the (burst+1)-th, not the burst-th" \
                         || bad "§F: ${N_FAIL} starts before the start limit fired (burst=3, expected 4 starts) — the limit is not the one the unit states"
+# ⛔ AND NOT ONE OF THOSE RESTARTS MAY SPEAK (#2910). The double runs the SHIPPED fragment as its
+# ExecStart, so every restart re-executes the banner call — with `say` unstubbed that was one /usr/bin/say
+# per start, over all four arms, on an interval. $F/bin (first on PATH) records instead, so an empty file
+# is the assertion that the real binary was never reached on ANY restart. Asserted over all four because
+# an arm that leaked only under `fail` would otherwise read green.
+[ -s "$F/say.calls" ] && bad "§F: a restarted fragment REACHED a real say binary ($(wc -l < "$F/say.calls" | tr -d ' ') time(s)) — $(head -2 "$F/say.calls") (#2910: a test must never speak)" \
+                      || ok '§F: none of the restarted runs reached the real say binary (stubbed, #2910)'
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # §G — the installer refuses rather than half-installs, and is idempotent
@@ -2516,6 +2575,101 @@ grep -qF "$HM/uh/o" "$T/hm.out" \
 grep -qF "$HM/home/o" "$T/hm.out" \
   && bad "home: the resolution used the CALLER's HOME — one unit file, two owners, depending on who asks: $(cat "$T/hm.out")" \
   || ok 'home: and it does NOT use the caller’s HOME'
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# §O — a fragment executed in a fresh shell CANNOT reach the real system (#2910)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# THE MEASURED DEFECT. §B and §F execute a SLICE of the shipped supervisor in `bash -c`, where that
+# script's own `say()` does not exist. Nothing stubbed the name, so the shell resolved it through PATH
+# to /usr/bin/say — macOS text-to-speech — and READ `controller: FOREGROUND — this process is the
+# controller …` ALOUD through the speaker, repeatedly, while the owner was on a live customer call
+# (2026-10-27; `pmset -g assertions` showed `audio-out BuiltInSpeakerDevice` created for the say pid).
+# No arm failed and nothing was logged: the suite read GREEN while it spoke, which is why the defect is
+# invisible to CI and to its author and only a human in the room could observe it.
+#
+# This section is the CONTRACT for the fix, in four parts, and none of them is vacuous:
+#   (1) every file-scope helper the shipped fragment INVOKES is stubbed in the shared prelude — so a
+#       helper ADDED to the fragment later cannot silently start leaking (the "incomplete by
+#       construction" half of the issue: a hand-written per-site list is always one helper behind);
+#   (2) `say` on the fragment PATH is proven to be the RECORDER before any arm runs, so the mutation
+#       arm below can never reach the speaker;
+#   (3) THE MUTATION ARM — with the prelude REMOVED (the state the suite shipped in) the same fragment
+#       must reach `say` and record the banner: that is what makes (4) able to fail;
+#   (4) with the prelude, the same fragment reaches no `say` at all.
+say_case 'a fragment executed in a fresh shell cannot reach the real system binaries (#2910)'
+O="$(arm_root o)"; mk_quiet_bin "$O/bin" "$O/say.calls"
+mkdir -p "$O/o/roles"
+cat > "$O/harness/orch-loop.sh" <<STUB
+#!/bin/bash
+: > "$O/o/loop.ran"
+STUB
+chmod +x "$O/harness/orch-loop.sh"
+
+# ⛔ THE PRELUDE MUST TRACK THE SUPERVISOR, NOT A MEMORY OF IT. Enumerate the file-scope functions the
+# SHIPPED script defines, keep those the FRAGMENT actually invokes (comments stripped first, so a name
+# merely mentioned in prose is not counted), and require each to be stubbed here — the behaviour
+# helpers the arms stub per-site are the only exemptions. A new print helper added to the supervisor is
+# therefore RED on the next run instead of becoming a voice on the next call.
+FRAG_CODE="$T/frag.code.sh"; sed 's/#.*//' "$FRAG" > "$FRAG_CODE"
+FRAG_LEAKY=""
+for _f in $(sed -n 's/^\([a-z_][a-z0-9_]*\)() *{.*/\1/p' "$SUP" | sort -u); do
+  grep -qE "(^|[ ;|&(])$_f( |$|;|\))" "$FRAG_CODE" || continue
+  case "$_f" in
+    start_doctor_loop|superseded) continue ;;   # behaviour, stubbed inline by each arm (not output)
+  esac
+  case "$FRAG_STUBS" in *"$_f(){"*) ;; *) FRAG_LEAKY="$FRAG_LEAKY $_f" ;; esac
+done
+[ -z "$FRAG_LEAKY" ] \
+  && ok '§O: every supervisor helper the shipped fragment invokes is stubbed in ONE shared prelude (a new one cannot leak silently)' \
+  || bad "§O: the shared prelude does not stub:$FRAG_LEAKY — each can resolve through PATH to a REAL binary (#2910)"
+
+# The behaviour stubs are IDENTICAL in both arms below: the ONLY difference between the mutation arm and
+# the fixed arm is the stub prelude, which is exactly the change under test.
+FRAG_BEHAVIOUR='start_doctor_loop() { :; }; superseded() { return 1; }; '
+# frag_say_calls <prelude> -> the number of times the RECORDER `say` was reached by the shipped fragment
+frag_say_calls() { # <prelude>
+  : > "$O/say.calls"
+  bnd env ORCH_FOREGROUND=1 CELL_HOME="$O/home" HOME="$O/home" O="$O/o" REPO="$O/repo" \
+      OR="daniel-ospina/agent-infra" SCOPE=own ENV_FILE="$O/home/keys.env" ROLES_DIR="$O/o/roles" \
+      HARNESS="$O/harness" HARNESS_REPO=daniel-ospina/agent-infra SUP_SELF="$SUP" \
+      PATH="$O/bin:/usr/bin:/bin" bash -c "$1$FRAG_BEHAVIOUR$(cat "$FRAG")" >/dev/null 2>&1 || true
+  wc -l < "$O/say.calls" 2>/dev/null | tr -d ' '
+}
+
+# ⛔ (2) THE PREMISE IS MEASURED, NOT ASSUMED: the name must resolve to the RECORDER. If it ever does
+# not, the mutation arm is REFUSED rather than run — the one failure mode this section must never have
+# is "the regression test for a test that speaks" speaking.
+O_SAY="$(env PATH="$O/bin:/usr/bin:/bin" bash -c 'command -v say' 2>/dev/null)"
+O_MUT=0
+case "$O_SAY" in
+  "$O/bin/say") ok '§O: `say` on the fragment PATH IS the recorder, so the mutation arm below records and never speaks' ;;
+  *) bad "§O: refusing the mutation arm — `say` resolves to '${O_SAY:-<none>}', not the recorder at $O/bin/say" ;;
+esac
+
+# ⛔ (3) THE MUTATION ARM — THE ASSERTIONS BELOW CAN FAIL, AND THIS PROVES IT. `''` is the prelude
+# REMOVED, i.e. the code the suite shipped: same fragment, same fixture, same PATH. What it must now
+# produce is a RECORD of the banner call instead of a voice.
+if [ "$O_SAY" = "$O/bin/say" ]; then O_MUT="$(frag_say_calls '')"; fi
+[ "${O_MUT:-0}" -ge 1 ] \
+  && ok "§O: MUTATION (stub prelude removed): the shipped fragment DOES reach \`say\` (${O_MUT} call(s)) — the leak is real, so the arm below can fail" \
+  || bad "§O: MUTATION (stub prelude removed) reached \`say\` ${O_MUT:-0} time(s) — the fragment no longer prints or the recorder is not on PATH, which would make the arm below VACUOUS"
+case "$(cat "$O/say.calls" 2>/dev/null)" in
+  *'controller: FOREGROUND'*) ok '§O: …and what it reached is the shipped BANNER (`controller: FOREGROUND`), the exact string the speaker read aloud on the live call' ;;
+  *) bad "§O: the mutation arm did not record the shipped banner — $(head -2 "$O/say.calls" 2>/dev/null) (#2910)" ;;
+esac
+
+# ⛔ (4) THE CONTRACT: with the shared prelude the SAME fragment reaches NO `say` at all — nothing it
+# prints can become a system call.
+O_FIXED="$(frag_say_calls "$FRAG_STUBS")"
+[ "${O_FIXED:-0}" -eq 0 ] \
+  && ok '§O: with the shared FRAG_STUBS prelude the same fragment reaches NO say at all — a test cannot speak' \
+  || bad "§O: the shared prelude did NOT silence the fragment — ${O_FIXED} call(s) still reached the recorder: $(head -2 "$O/say.calls") (#2910)"
+# …and the recording layer is not `say`-only, so a future helper that shells out to one of these is
+# caught by the same file rather than by a human in the room.
+case "$FRAG_STUBS" in
+  *'open(){'*'osascript(){'*'afplay(){'*) ok '§O: the recorder covers the other macOS binaries a fragment could reach (open/osascript/afplay), not just `say`' ;;
+  *) bad '§O: a fragment could still reach open/osascript/afplay — the no-side-effects layer is `say`-only' ;;
+esac
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"
