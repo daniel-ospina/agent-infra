@@ -393,12 +393,14 @@ This is bounded hard, and a lane that reads it as a general licence has read it 
   gate: `record-review.sh` at the final head is what makes such a merge legitimate. A push invalidates it,
   so re-record after every fix.
 - **Reproduce THAT lane's own steps and post their output.** *"It's docs-only"* is not evidence; the lane's
-  own steps are — for the `docs` job that is the conflict-marker check, the generated-artifact `--check`s,
-  markdownlint, the link check, **and** the docs-lint baseline that consumes them. A step that cannot be
-  reproduced on this host is **declared, not skipped** — this repo's link-check script pins only the
-  x86_64/aarch64 **Linux** assets, so a macOS `arm64` host has no pinned `lychee` (its
-  `DOCS_LINK_CHECK_LYCHEE=<path>` seam is the supported way to supply one); where a step stands in, say
-  what was measured instead (no new links added, the one external URL resolves, the relative targets exist).
+  own steps are — for tortoise's `docs` job, the conflict-marker check, the generated-artifact `--check`s,
+  markdownlint, the link check, **and** the docs-lint baseline that consumes them (read the job in the repo
+  you are in — `docs` is not the same job everywhere; agent-infra's is a `lychee-action` call with no pin).
+  A step that cannot be reproduced on this host is **declared, not skipped** — tortoise's
+  `.github/scripts/docs-link-check.sh` pins only the x86_64/aarch64 **Linux** assets, so a macOS `arm64`
+  host has no pinned `lychee` (its `DOCS_LINK_CHECK_LYCHEE=<path>` seam is the supported way to supply
+  one); where a step stands in, say what was measured instead (no new links added, the one external URL
+  resolves, the relative targets exist).
 - **A check the change class CAN fail is not droppable.** The ruling names CI-only jobs of the `legal-e2e`
   class as bureaucracy *for a diff they cannot test*; it does not license skipping a check that could catch
   this change.
