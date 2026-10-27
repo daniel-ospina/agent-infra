@@ -36,10 +36,13 @@ bash pi-bootstrap/cell-install.sh            # the operational layer: scripts fa
 HOME=/tmp/cell-home bash scripts/cloud-cell-bringup.sh --check   # → should end: CELL READY
 ```
 
-`HOME=/tmp/cell-home` is mandatory. `cmux vm exec` runs as `cmux` with `HOME=/home/ubuntu`, which does not exist — anything
-writing to `$HOME` dies with `mkdir /home/ubuntu: permission denied`.
+`HOME=/tmp/cell-home` is mandatory — not because exec's own home is broken (measured 2026-10-27: exec runs as `cmux` with a
+writable `HOME=/home/cmux`), but because **the operational layer is installed under `$CELL_HOME=/tmp/cell-home`**:
+`record-review.sh`, the `gh` shim and the extensions all live under `/tmp/cell-home/.pi/agent`, so a lane launched without it
+reads an empty home and silently loses the merge path. (`scripts/cloud-cell-bringup.sh` still carries an older
+`/home/ubuntu` explanation — that part is stale.)
 
-**⚠️ `CELL READY` is not "activated". Two things are still missing after a verified install:**
+**⚠️ One thing is still missing after a verified install — plus a trap for boxes installed before the fix:**
 
 | missing | symptom | fix |
 |---|---|---|
@@ -63,10 +66,10 @@ quoting any ceiling:
 
 | resource | cost (measured) | note |
 |---|---|---|
-| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.19–0.23 GB** whole tree | RSS summed over the process tree, 4 lanes, cell-4, 2026-10-27 |
+| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.2–0.5 GB** whole tree — a bare `pi` alone reaches ~0.28 GB | RSS summed over each process tree, 15 lanes, cell-4, 2026-10-27 |
 | **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | containers 21–149 MB each (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
-| plan each lane at | **~1 GB** (test) / **~0.3 GB** (analysis) | the PEAK, not the idle |
-| worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** for it | re-derived in agent-infra#2721; the old "1.1 GB" figures measured a lane's worktree *before* its venv |
+| plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
+| worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | re-derived in agent-infra#2721. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — both figures are right about different quantities |
 | CPU | load 4.3 with 23 lanes | **never the limit** |
 
 The old row read "`pi` process ~0.6–1 GB RSS per lane". Measured, that is a **test-running peak**; an idle
@@ -86,6 +89,8 @@ box instead of pretending a fleet-wide constant is a measurement.
 # add it to the LIVE lane count, never read it as "this box holds N".
 # bash-3.2 clean (no `case` inside $( ) — macOS /bin/bash): runnable as a script OR pasted into $().
 TARGET=${TARGET:-.}                       # the worktree you are dispatching into, not /
+# the gate's own override names are DISK_LANE_TREE_MB / DISK_LANE_RESERVE_MB — if you set those on a cell,
+# set these to the same pair, or the aid and the gate disagree by construction
 if [ -f "$TARGET/uv.lock" ]; then TREE_MB=${TREE_MB:-350}; RESERVE_MB=${RESERVE_MB:-6144}
 else TREE_MB=${TREE_MB:-64}; RESERVE_MB=${RESERVE_MB:-1024}; fi   # agent-infra lane: 48 MB tree
 PER_MB=${PER_MB:-1000}                    # plan on the PEAK below; the scheduler budgets 512 (ai-drainer)
@@ -95,7 +100,9 @@ done
 if [ "$TREE_MB" -le 0 ] || [ "$PER_MB" -le 0 ]; then printf 'seeds: zero tree/PER — refusing\n'; exit 0; fi
 free_mb=$(df -Pm "$TARGET" 2>/dev/null | awk 'NR==2{print $4}')                  # MB, no unit parsing
 avail_mb=$(command -v free >/dev/null 2>&1 && free -m | awk 'NR==2{print $7}') || true   # Linux only
-# an unreadable/garbage probe is NOT "zero room" and NOT room — refuse to answer (the gate's polarity)
+# an unreadable/garbage probe is NOT "zero room" and NOT room — this aid ABSTAINS. That is a DELIBERATE
+# DEPARTURE from the gate, which fails OPEN on an unreadable probe (it admits and WARNs): an aid with no reading
+# should not answer at all.
 if [ "$free_mb" -ge 0 ] 2>/dev/null; then disk_more=$(( (free_mb - RESERVE_MB) / TREE_MB ))
   [ "$disk_more" -lt 0 ] && disk_more=0 || true; else disk_more=UNREADABLE; fi
 if [ "$avail_mb" -ge 0 ] 2>/dev/null; then ram_more=$(( (avail_mb - 1500) / PER_MB ))
@@ -122,8 +129,8 @@ printf 'more_lanes=%s (ram=%s disk=%s, target=%s)\n' "$more" "$ram_more" "$disk_
 The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. Diagnosing a
 73 as "disk or load" and waiting is the trap: it is the one refusal waiting does not clear.
 
-**RAM is split across two instruments and neither is `spawn-gate.sh`**, which has floors only (`MIN_MEM_FREE_MB`,
-default 512, in `orch-loop.sh`; `CAP_MIN_MEM_MB` in `capacity.sh`). The **scheduler** does budget per lane: `ai-drainer.sh`
+**RAM is read by two other instruments — `spawn-gate.sh` reads NO memory at all.** The two floors live in `orch-loop.sh`
+(`MIN_MEM_FREE_MB`, default 512) and `capacity.sh` (`CAP_MIN_MEM_MB`, 512). The **scheduler** does budget per lane: `ai-drainer.sh`
 uses `LANE_MEM_MB` (default **512**) against `MEM_BUDGET_PCT` (default **75**) of the pool. So there are two numbers —
 scheduler 512, planning ~1000 for a test-running lane (the table above) — and this file deliberately uses the larger.
 Reconcile against `docs/ops/ai-drainer.md` before raising either. Where the gate speaks, the gate is right.
@@ -136,10 +143,10 @@ upper bound, never the answer (§7).
 `DISK_MIN_FREE_MB`/`MIN_FREE_MB`, exit 77), **refuses again on per-lane headroom** (`DISK-NOHEADROOM`, tree + reserve,
 exit 77 — see above), and validates its own probes against wrap/garbage readings. Its capacity behaviour is asserted in
 `spawn-gate.test.sh` (its disk, headroom and load sections); read that rather than trusting a count quoted in prose. The
-failure it already names is the one worth reading: the band where `scripts/cloud-cell-supervisor.sh --check` prints
+failure it already names is the one worth reading: the band where `scripts/cloud-cell-supervisor.sh check` prints
 `CELL CAN RUN A CONTROLLER` while every lane spawn is refused 77. (`scripts/orchestrator-harness/cloud-cell-doctor.sh` has
-no `--check` mode — that flag belongs to `scripts/cloud-cell-bringup.sh`, and the banner is printed by the supervisor's
-`cmd_check`.)
+no `--check` mode; `--check` is `scripts/cloud-cell-bringup.sh`'s flag, while the banner is the supervisor's `check`
+subcommand.)
 
 The formula above is therefore a **diagnostic, not an implementation**: if a number disagrees with the gate, the gate is
 right and the number is a curiosity. Any new refusal belongs inside `spawn-gate.sh` with a test — never in a brief, a
@@ -209,7 +216,9 @@ It backgrounds `run_agent()` from `spawn-gate.sh`, so the worker gets the **load
 wall-clock watchdog and the walltime row**. `lane.sh` and `fix-one.sh` are the same shape.
 
 ⛔ **NEVER LAUNCH A RAW `pi`.** The block below is kept only as the shape **NOT** to write — `spawn-gate.test.sh` calls
-it a **"fourth, ungated launch path"** and its invoker census asserts the invoker SET as an equality, so it goes red:
+"a fourth launch path nobody routed", and its invoker census asserts the invoker SET as an equality. Note the guard's
+population: it scans `git ls-files 'scripts/*'` and **skips `*.md`** — so this block cannot red it from here, and a lane
+brief cannot either; only a `.sh` under `scripts/` can. The hazard is copy-paste, not CI:
 
 ```bash
 tmux new-session -d -s <slug> \
@@ -220,7 +229,9 @@ tmux new-session -d -s <slug> \
 Measured 2026-10-19: driving the cells this way is how 23 lanes landed on one box (8 cores, **32 GB**) and the kernel
 killed 37 processes *and the tmux server*, losing every lane. The gate would have refused that spawn.
 
-- Model must be `provider/model` (`deepseek/deepseek-v4-flash`), never bare.
+- Model form is split: a launch with no `--provider` needs `provider/model` (`deepseek/deepseek-v4-flash`), while the
+  harness passes `--provider` and a bare `--model` (`deepseek-flash`) as two separate halves. A bare `--model` with no
+  provider falls back to the wrong provider.
 - ⛔ **`keys.env` IS NOT GUARANTEED TO CONTAIN AN API KEY.** Measured 2026-10-19: cell-1's file exported only
   `REPO CYC MAX_FIX MIN_SWAP_FREE PATH …` and **no provider key at all** — the lanes that worked had the key in their
   *ambient* environment (inherited from the tmux server), so a lane launched through `keys.env` alone died instantly with
@@ -283,6 +294,11 @@ disk nor RAM**, so it is an upper bound, never the answer. The binding constrain
 `tree + reserve`** (§2), then free RAM against the per-lane peak, then load. So this table names a box's ROLE, never a
 number of lanes.
 
+⚠️ **`docs/ops/fleet-capacity.md` states the contrary twice** (`:157` and `:283`: *"there is deliberately no lane ceiling
+tied to cpu count"*), while the code has the 2.5× rule. **Two recorded positions, unresolved** — this skill reports what
+the code does and does not claim the doc is wrong. Whoever settles it should mark the resolution `OVERRIDES:` in the doc:
+silently letting a reader pick one is how a ruling gets tidied away.
+
 A dispatch decision is only honest if it names: the box's **free disk**, its **free RAM**, its **live lane count**, and the
 **lane's expected cost**. If a box is not dispatching by itself and is not at capacity, that is the signal to intervene —
 not a load average measured earlier.
@@ -298,8 +314,8 @@ not a load average measured earlier.
 - `TERM`/`INT` traps that swallow signals leave the script running: a stop/restart appears to hang (agent-infra#2085).
 - Deleting a worktree to make space must never destroy unpushed work: check `git rev-list --count @{u}..HEAD` and
   `status --porcelain` first; preserve, then remove only the regenerable parts.
-- **The 900 / 3000 arithmetic is gone on purpose.** If you meet it anywhere, it is stale: it used a test-running peak as
-  every lane's cost and a flat reserve that dominates a small box, and it returned "no lanes" on boxes with room. §2
-  carries the measured figures, their dates, and the method.
+- **Capacity is a MEASUREMENT, not a constant.** Every earlier version of §2 substituted one number for the lane type and one
+  for the reserve, and both errors ran in the direction that **refuses** dispatches it should allow. The figures in §2 carry
+  their date and method so the next reader can re-derive them instead of inheriting them.
 
 > Continue following the workflow as mandated by this skill. Do not skip steps.
