@@ -36,11 +36,13 @@
 # ⛔ IT ALSO DOES NOT DETECT EVERY WAY TO EXECUTE A FRAGMENT, AND THE POPULATION IS STATED HERE SO THE
 # GAP IS NOT MISTAKEN FOR A PASS. The adoption predicate below matches ONE shape — a slice cat'd in as a
 # variable (`cat "$FRAG"` into a child shell). MEASURED on 2026-10-27 against this tree: exactly ONE
-# suite uses that shape (install-controller-service.test.sh). FOURTEEN further in-tree suites execute
-# shipped FUNCTIONS another way — `awk '/^fn(){/,/^}/'` into a file, then `bash -c` — and THIRTEEN of
-# those fourteen source no prelude, so the adoption arm does not see them at all. Those thirteen are a
-# KNOWN GAP. An earlier version of this comment called the predicate "the shape this repo uses"; that
-# was false, and a guard that overstates its reach is worse than one that names it.
+# suite uses that shape (install-controller-service.test.sh). NINE suites execute shipped FUNCTIONS
+# another way — `awk '/^fn(){/,/^}/'` into a file, then `bash -c` — and NONE of them sources the prelude,
+# so the adoption arm does not see them at all. (THE COUNT DEPENDS ON THE PREDICATE, THE GAP DOES NOT:
+# nine when the `awk` program must actually select a function definition, fifteen on a looser "any awk
+# plus any `bash -c`", and #2925's reviewer counted fourteen. Every version of the count is uncovered.)
+# An earlier version of this comment called the predicate "the shape this repo uses"; that was false,
+# and a guard that overstates its reach is worse than one that names it.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
