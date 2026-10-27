@@ -136,6 +136,7 @@ wait_state() { # <want-state> <pr> (--run id) — poll until the state word matc
 run_id_of() { field "${1#*|}" run; }
 rundir() { printf '%s/fake-repo/pr-%s/%s' "$RAIL_RUN_DIR" "$1" "$2"; }
 last_argv() { awk 'END{print}' "$FAKE_RAIL_LOG" 2>/dev/null; }
+rd_field() { cat "$1/$2" 2>/dev/null | tr -d '\n'; }   # a run-dir field, empty when absent
 rail_invocations() { awk -v p="$1" 'index($0, p " ") == 1 || $0 == p {n++} END{print n+0}' "$FAKE_RAIL_LOG" 2>/dev/null; }
 craft() { # <pr> <run-name> [k=v ...] — a hand-built run dir, for states no launch can reach
   local pr="$1" name="$2"; shift 2
@@ -179,8 +180,12 @@ done
 # "a PR number is required" and exits 2, so every run would analyse nothing while the state machine
 # reported a clean refusal. Found by a real-rail smoke run; this arm is why it cannot come back.
 RAIL_ARGV="$(last_argv)"
-if [ "$RAIL_ARGV" = "101" ]; then ok "ARGV: the rail received the PR as its first argument"
-else bad "ARGV: the rail received '$RAIL_ARGV' (want '101')"; fi
+# The PR is the FIRST argument (it was shifted off `$@`, and forwarding only the remainder made the
+# rail log `a PR number is required`), and the resolved identity rides along so the rail's TARGET and
+# the run's RECORD are one value by construction.
+if [ "$RAIL_ARGV" = "101 --repo fake/repo" ]; then
+  ok "ARGV: the rail received the PR first AND the resolved identity"
+else bad "ARGV: the rail received '$RAIL_ARGV' (want '101 --repo fake/repo')"; fi
 PIDS+=("$(cat "$(rundir 101 "$RUN1")/pid" 2>/dev/null || true)")
 
 OUT="$(poll 101)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
@@ -492,6 +497,74 @@ assert_rc 3 "$RC" "IN-FLIGHT: a run whose launch has not recorded an incarnation
 assert_contains "$TXT" "may still be alive" "IN-FLIGHT: and says so, rather than reporting no-run"
 touch -t 202001010000 "$RAIL_RUN_DIR/fake-repo/pr-142/inflight"
 OUT="$(FAKE_RAIL_SLEEP=6 call start 142)"; assert_rc 0 "${OUT%%|*}" "IN-FLIGHT: an abandoned record older than the bound does not block"
+
+# ── AA: `--` stops identity capture, and the identity still reaches the rail exactly once ──────
+OUT="$(FAKE_RAIL_SLEEP=6 call start 149 -- --repo=other/thing)"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "DD: a --repo= AFTER -- is left for the rail, not taken as the identity"
+RD149="$(rundir 149 "$(cat "$RAIL_RUN_DIR/fake-repo/pr-149/latest")")"
+if [ "$(rd_field "$RD149" repo)" = "fake/repo" ]; then
+  ok "DD: the identity stayed the pinned one (fake/repo), not other/thing"
+else bad "DD: the identity became '$(rd_field "$RD149" repo)' — a rail-side --repo leaked into it"; fi
+RAIL_ARGV="$(last_argv)"
+# The identity is placed BEFORE any `--` (past it the rail refuses `--repo` by name), and the
+# rail-side `--repo=other/thing` after it stays untouched.
+if [ "$RAIL_ARGV" = "149 --repo fake/repo -- --repo=other/thing" ]; then
+  ok "DD: the identity is forwarded BEFORE -- and the rail-side --repo is left alone"
+else bad "DD: unexpected rail argv '$RAIL_ARGV' (want '149 --repo fake/repo -- --repo=other/thing')"; fi
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-149/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+
+# ── AB: the identity is CASE-insensitive, like GitHub's own repo names ─────────────────────────
+# `ACME/Widgets` (what a clone URL may spell) must be the SAME run as `acme/widgets`, or `landed` is
+# unreachable for ever and a case-sensitive filesystem gets two keys (two rails) for one PR.
+OUT="$(FAKE_RAIL_SLEEP=6 call start 170 --repo ACME/Widgets)"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "CASE: a mixed-case slug is accepted"
+OUT="$(poll 170 --repo acme/widgets)"; RC="${OUT%%|*}"
+assert_rc 10 "$RC" "CASE: and the canonical lower-case spelling finds the SAME run"
+RD170="$RAIL_RUN_DIR/acme-widgets/pr-170/$(cat "$RAIL_RUN_DIR/acme-widgets/pr-170/latest" 2>/dev/null)"
+if [ "$(rd_field "$RD170" repo)" = "acme/widgets" ]; then ok "CASE: the record is lower-cased"
+else bad "CASE: the record kept its case ('$(rd_field "$RD170" repo)') — a canonical URL would never match it"; fi
+OUT="$(poll 170 --repo ACME/Widgets)"; assert_rc 10 "${OUT%%|*}" "CASE: the mixed-case spelling also finds it (one key)"
+PIDS+=("$(cat "$RAIL_RUN_DIR/acme-widgets/pr-170/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+
+# ── AC: a `--run` that names the CLAIM dir is `no-run`, not a terminal no-verdict ─────────────
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-149/.starting"
+printf '%s\n' "$$" > "$RAIL_RUN_DIR/fake-repo/pr-149/.starting/pid"
+OUT="$(poll 149 --run .starting)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 24 "$RC" "NONRUN: `--run .starting` (the claim dir) is no-run, not gone-without-verdict"
+assert_not_contains "$TXT" "gone-without-verdict" "NONRUN: and never a terminal no-verdict claim"
+
+# ── AE: the bound must not depend on a readable mtime ─────────────────────────────────────────
+# `record_young` falls back to the record's mtime. If an unreadable age reads as "young", an
+# abstaining record blocks the PR for ever again — the exact defect the bound exists to close. So the
+# fallback is exercised with a `stat` that fails: the record must be judged STALE, not young.
+mkdir -p "$T/bin-nostat"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$T/bin-nostat/stat"
+chmod +x "$T/bin-nostat/stat"
+mkdir -p "$RAIL_RUN_DIR/fake-repo/pr-172/oldabstain"
+printf '%s\n' "$$" > "$RAIL_RUN_DIR/fake-repo/pr-172/oldabstain/pid"
+printf '0\n' > "$RAIL_RUN_DIR/fake-repo/pr-172/oldabstain/start"
+printf 'fake/repo\n' > "$RAIL_RUN_DIR/fake-repo/pr-172/oldabstain/repo"
+: > "$RAIL_RUN_DIR/fake-repo/pr-172/oldabstain/log"
+printf 'oldabstain\n' > "$RAIL_RUN_DIR/fake-repo/pr-172/latest"
+OUT="$(PATH="$T/bin-nostat:$PATH" FAKE_RAIL_SLEEP=6 call start 172)"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "AGE: an UNREADABLE age is not 'young' — the bound still bounds"
+PIDS+=("$(cat "$RAIL_RUN_DIR/fake-repo/pr-172/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+
+# ── AD: an unrecognised `✗` line is an ABSTENTION, not a refusal ──────────────────────────────
+# `refused` is a claim about a HEAD, so it needs positive support: the rail's own phrases say whether
+# it judged the head or merely never got to it. #2412: the rail said "no classification attempted"
+# and the PR merged four minutes later.
+cat > "$T/bin/rail-noclass" <<'NOC'
+#!/usr/bin/env bash
+printf 'admin-merge: ✗ BLOCK — precondition unmet: run still in_progress — no classification attempted.\n'
+exit 1
+NOC
+chmod +x "$T/bin/rail-noclass"
+RAIL_RUN_RAIL="$T/bin/rail-noclass" call start 171 >/dev/null
+OUT="$(GH_MODE=open wait_state unknown 171)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HEAD-VERDICT: `no classification attempted` is NOT a refusal of this head"
+assert_state "$TXT" unknown "HEAD-VERDICT: it abstains"
+assert_contains "$TXT" "NOT a refusal" "HEAD-VERDICT: and says plainly that it is not a refusal"
 
 # ── X: the recorder's own liveness blocks a start ─────────────────────────
 # The recorder is the only incarnation for the first instants of every launch, so a record with a

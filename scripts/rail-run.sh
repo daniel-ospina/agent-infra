@@ -146,22 +146,32 @@ age_s() { # <path> -> integer seconds since it was last written, or nothing
   [ "$now" -ge "$m" ] && printf '%s' "$((now - m))" || printf '0'
 }
 
-# refusal_is_head_verdict <line> -> 0 when the rail's `✗` line is a VERDICT about this head, 1 when
-# it is a statement that the rail could not READ something it needed. The rail prefixes EVERY terminal
-# error with `✗`, including `[head_unreadable]`, `[draft_unreadable]`, `rate_limited`,
-# `UNOBSERVABLE: gh could not be read` — so the glyph alone cannot tell a refusal from a read failure,
-# and calling a transient GitHub blip "refused this head" is the wrong verdict in the dangerous
-# direction (a lane hunts a code defect that was never analysed). Unlisted wordings err towards
-# `refused`, and the rail's own words are printed either way.
+# refusal_is_head_verdict <line> -> 0 when the rail's `✗` line is a VERDICT ABOUT THIS HEAD.
+#
+# ⛔ AN ALLOW-LIST, DELIBERATELY. The rail prefixes EVERY terminal error with `✗` — 117 distinct
+# templates, most of which say it could not READ something, never classified the head, or was stopped
+# mid-wait. A deny-list of "looks like a read failure" stems was tried and is unwinnable: it missed
+# `no classification attempted`. `landed` and `refused` are both claims about a HEAD, so a claim needs
+# POSITIVE support. Unrecognised wording therefore errs to `unknown` (25) — the run is over, the
+# state is an abstention, and the rail's own line is printed so the reader decides. The measured cost
+# of the other direction (#2412): the rail refused with "the FIRST-CHECKS wait expired … no
+# classification attempted" and the PR MERGED four minutes later — a lane told "refused" abandons it.
+HEAD_VERDICT_STEMS=(
+  "tree this pr produces is red"
+  "base is red"
+  "never tested main"
+  "conflicted"
+  "--no-rerun"
+)
 refusal_is_head_verdict() {
   local low
   low="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
-  case "$low" in
-    *unreadable*|*unobservable*|*unverifiable*|*"could not be read"*|*"unrecognised state"*|\
-    *"unrecognized state"*|*rate_limited*|*"could not run"*|*"produced no verdict"*)
-      return 1 ;;
-  esac
-  return 0
+  [ -n "$low" ] || return 1
+  local stem
+  for stem in "${HEAD_VERDICT_STEMS[@]}"; do
+    case "$low" in *"$stem"*) return 0 ;; esac
+  done
+  return 1
 }
 
 # last_refusal_line <logfile> -> the rail's own last `admin-merge: ✗ …` line, else nothing.
@@ -254,7 +264,11 @@ normalize_slug() {
   case "$v" in */*) : ;; *) return 0 ;; esac
   case "${v%%/*}" in ''|.|..) return 0 ;; esac
   case "${v#*/}" in ''|.|..|*/*) return 0 ;; esac
-  printf '%s' "$v"
+  # ⛔ LOWERCASE. GitHub's repository names are case-insensitive, but the identity proof below is a
+  # `case` glob and the state key is a directory name — so `ACME/Widgets` (what a clone URL happens to
+  # spell) would never match the canonical URL GitHub returns, making `landed` UNREACHABLE and the run
+  # `unknown` for ever; and on a case-sensitive filesystem it would also be a second key (two rails).
+  printf '%s' "$v" | tr '[:upper:]' '[:lower:]' 
 }
 
 # pr_url_names <url> <slug> <pr> -> 0 when the URL names EXACTLY this PR in EXACTLY this repo. This is
@@ -263,8 +277,11 @@ normalize_slug() {
 pr_url_names() {
   local url="${1:-}" slug="${2:-}" pr="${3:-}" want
   [ -n "$url" ] && [ "$url" != "-" ] && [ -n "$slug" ] && [ -n "$pr" ] || return 1
-  want="/${slug}/pull/${pr}"
-  case "$url" in
+  local lurl lslug
+  lurl="$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')"
+  lslug="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')"
+  want="/${lslug}/pull/${pr}"
+  case "$lurl" in
     https://*"$want") return 0 ;;
     https://*"$want"/*) return 0 ;;
   esac
@@ -307,10 +324,15 @@ release_claim() {
 }
 
 # record_young <run-dir> -> 0 when the record is younger than RECORD_MAX (so an abstention still counts)
+# ⛔ AN UNREADABLE AGE IS *NOT* YOUNG HERE. The mtime is the fallback, not the source of truth: the
+# record carries `created` (epoch seconds, written at creation), because an unreadable mtime used to
+# read as "young" and made the abstention unbounded again — the very thing the bound exists to stop.
 record_young() {
-  local age
-  age="$(numeric_or_empty "$(age_s "$1")")"
-  [ -z "$age" ] || [ "$age" -le "$RECORD_MAX" ]
+  local d="$1" born age
+  born="$(numeric_or_empty "$(file_or_empty "$d/created")")"
+  if [ -n "$born" ]; then age=$(( $(date +%s) - born )); else age="$(numeric_or_empty "$(age_s "$d")")"; fi
+  [ -n "$age" ] || return 1
+  [ "$age" -ge 0 ] && [ "$age" -le "$RECORD_MAX" ]
 }
 
 # prev_in_flight <run-dir> -> 0 when the run may still be alive (so a second rail must not start).
@@ -358,15 +380,15 @@ start_rail() {
   # claims another repo, and `landed` would certify a head this run never touched. Verified against
   # the rail: `--repo acme/widgets` resolves to acme/widgets, `--repo=acme/widgets` to the checkout.
   # Scanning also stops at `--`, so a `--repo` meant FOR the rail is not captured as the identity.
-  local slug="" want=0 a seen_dd=0
+  local slug="" want=0 a seen_dd=0 id_from_argv=0 dd_index=""
   local -a fwd=()
   for a in "$@"; do
     if [ "$seen_dd" = "1" ]; then fwd+=("$a"); continue; fi
-    if [ "$want" = "1" ]; then slug="$a"; fwd+=("$a"); want=0; continue; fi
+    if [ "$want" = "1" ]; then slug="$a"; fwd+=("$a"); want=0; id_from_argv=1; continue; fi
     case "$a" in
       --repo) want=1; fwd+=("$a") ;;
-      --repo=*) slug="${a#--repo=}"; fwd+=(--repo "$slug") ;;
-      --) seen_dd=1; fwd+=("$a") ;;
+      --repo=*) slug="${a#--repo=}"; fwd+=(--repo "$slug"); id_from_argv=1 ;;
+      --) seen_dd=1; dd_index="${#fwd[@]}"; fwd+=("$a") ;;
       *) fwd+=("$a") ;;
     esac
   done
@@ -399,7 +421,7 @@ start_rail() {
   # pid read and absent) or a claim older than CLAIM_MAX (its launcher lived ~5s, so it is abandoned —
   # this also stops a recycled pid reading off-fence from blocking the PR forever) clears it.
   CLAIM="$dir/.starting"
-  local tries=0 c_pid c_start c_probe c_rc c_age c_stale
+  local tries=0 c_pid c_start c_probe c_rc c_age c_stale c_born
   while :; do
     if mkdir "$CLAIM" 2>/dev/null; then break; fi
     tries=$((tries + 1))
@@ -408,7 +430,8 @@ start_rail() {
       printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
       exit 3
     fi
-    c_age="$(numeric_or_empty "$(age_s "$CLAIM")")"
+    c_born="$(numeric_or_empty "$(file_or_empty "$CLAIM/created")")"
+    if [ -n "$c_born" ]; then c_age=$(( $(date +%s) - c_born )); else c_age="$(numeric_or_empty "$(age_s "$CLAIM")")"; fi
     c_stale=0
     if [ -n "$c_age" ] && [ "$c_age" -gt "$CLAIM_MAX" ]; then c_stale=1; fi
     c_pid="$(file_or_empty "$CLAIM/pid")"; c_start="$(file_or_empty "$CLAIM/start")"
@@ -438,7 +461,9 @@ start_rail() {
     fi
     rm -rf "$CLAIM" 2>/dev/null || true
   done
-  # From here the claim is OURS, and every exit path releases it.
+  # From here the claim is OURS, and every exit path releases it. `created` is written FIRST: it is
+  # the bound a racing start reads, and it must survive a launcher killed before its pid lands.
+  printf '%s\n' "$(date +%s)" > "$CLAIM/created"
   printf '%s\n' "$$" > "$CLAIM/pid"
   printf '%s\n' "$(numeric_or_empty "$(pid_start_epoch "$$" 2>/dev/null || true)")" > "$CLAIM/start"
   trap release_claim EXIT
@@ -462,8 +487,27 @@ start_rail() {
   rd="$dir/$rid"
   mkdir -p "$rd" || die "cannot create the run dir $rd"
   printf '%s\n' "$(date -u +%FT%TZ)" > "$rd/started"
+  printf '%s\n' "$(date +%s)" > "$rd/created"
   printf '%s\n' "$slug" > "$rd/repo"
   printf '%s\n' "$RAIL" > "$rd/rail"
+  # ⛔ THE RECORD AND THE RAIL MUST NAME THE SAME REPO BY CONSTRUCTION. When the identity was NOT
+  # taken from argv (`--repo`, or the `=` form) it came from `origin`/`RAIL_RUN_REPO_SLUG` — and a pin
+  # that disagrees with the checkout would otherwise leave the rail merging one repo while `status`
+  # grades another (the #2235 shape again). It is placed BEFORE any `--` separator, because past that
+  # the rail refuses `--repo` by name.
+  if [ "$id_from_argv" = "0" ]; then
+    if [ -n "${dd_index:-}" ]; then
+      local -a pre=() post=()
+      local ai=0
+      for a in ${fwd[@]+"${fwd[@]}"}; do
+        if [ "$ai" -lt "$dd_index" ]; then pre+=("$a"); else post+=("$a"); fi
+        ai=$((ai + 1))
+      done
+      fwd=(${pre[@]+"${pre[@]}"} --repo "$slug" ${post[@]+"${post[@]}"})
+    else
+      fwd+=(--repo "$slug")
+    fi
+  fi
   set -- ${fwd[@]+"${fwd[@]}"}   # the rewritten argv is the one the rail receives AND the one recorded
   { for a in "$@"; do printf '%q ' "$a"; done; printf '\n'; } > "$rd/args" 2>/dev/null
   : > "$rd/log"
@@ -577,7 +621,10 @@ derive() {
   # be trusted — the read would be about a bare number (see pr_state).
   [ -n "$slug" ] || slug="$cli_slug"
   log="$rd/log"
-  bytes="$(numeric_or_empty "$(wc -c < "$log" 2>/dev/null | tr -d '[:space:]')")"
+  # A run dir with no log at all (a claim dir named by `--run`, a half-created record) is not a run.
+  if [ ! -f "$log" ]; then bytes=0; else
+    bytes="$(numeric_or_empty "$(wc -c < "$log" 2>/dev/null | tr -d '[:space:]')")"
+  fi
   age="$(age_s "$log")"
   rc="$(file_or_empty "$rd/rc")"
 
@@ -689,9 +736,10 @@ derive() {
       return 20
     fi
     if [ -n "$why" ]; then
-      row "unknown" "verdict=none rail=read-failure"
-      printf '  the rail exited %s WITHOUT a verdict about this head: its own words say it could not\n' "$rc"
-      printf '  READ something it needed. This run is over, and it did not judge your change:\n'
+      row "unknown" "verdict=none rail=not-a-head-verdict"
+      printf '  the rail exited %s with a `✗` line that is NOT a verdict about your head (it could not\n' "$rc"
+      printf '  read something, never classified the head, or was stopped mid-wait). This run is OVER\n'
+      printf '  and it did not judge your change — it is NOT a refusal of it:\n'
       printf '  rail: %s\n' "$why"
       return 25
     fi
@@ -848,7 +896,9 @@ status_rail() {
   dir="$RUN_ROOT/$key/pr-$pr"
   if [ -n "$run_id" ]; then
     rd="$dir/$run_id"
-    if [ ! -d "$rd" ]; then
+    # ⛔ A DIRECTORY NAMED BY `--run` IS NOT NECESSARILY A RUN. `.starting` is the claim, and reading it
+    # as a run reported a TERMINAL `gone-without-verdict` about a head nobody launched.
+    if [ ! -d "$rd" ] || { [ ! -f "$rd/log" ] && [ ! -f "$rd/repo" ]; }; then
       printf 'no-run pr=%s run=%s repo=%s\n  no such run under %s\n' "$pr" "$run_id" "$key" "$dir"
       return 24
     fi

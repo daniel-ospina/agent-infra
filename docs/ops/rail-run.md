@@ -48,7 +48,7 @@ rail, so no tool call can be capped by it.
 State lives under `${RAIL_RUN_DIR:-${O:-$HOME/orchestrator}/state/rail-run}/<repo-key>/pr-<N>/<run-id>/`
 (`pid`, `start`, `railpid`, `railstart`, `rc`, `log`, `repo`, `rail`, `args`, `started`, and a
 `latest` pointer, which is written atomically and validated like `--run` because it is joined into a
-path). Knobs: `RAIL_RUN_DIR`, `RAIL_RUN_RAIL` (the rail, default `admin-merge.sh` beside
+path; a directory with neither a `log` nor a `repo` — e.g. the `.starting` claim — is not a run). Knobs: `RAIL_RUN_DIR`, `RAIL_RUN_RAIL` (the rail, default `admin-merge.sh` beside
 this script), `RAIL_RUN_REPO_SLUG` (pin the repo identity instead of resolving `origin`),
 `RAIL_RUN_CLAIM_MAX` (60 s) and `RAIL_RUN_RECORD_MAX` (24 h).
 
@@ -64,11 +64,11 @@ flight, not dead** — reading that window as "no owner" is how a guard deletes 
 |---|---|---|
 | `running` | 10 | no exit status yet, and the **recorder** is alive — or the **rail** is, when the recorder has been SIGKILLed out from under it |
 | `landed` | 0 | the PR is MERGED. `verdict=rail` when the rail exited 0; `verdict=artifact` when the merge is real but the rail wrote **no verdict or a non-zero one** |
-| `refused` | 20 | rc=2 (it refused the **invocation** — a claim about the invocation, so it is decided without the artifact read at all), or rc≠0 **with the rail's own `admin-merge: ✗ …` line** in the log **that is a verdict about this head** — a line whose own words say it could not READ something (`[head_unreadable]`, `[draft_unreadable]`, `rate_limited`, `UNOBSERVABLE`, `unrecognised state`, `produced no verdict`, …) is an abstention, not a refusal |
+| `refused` | 20 | rc=2 (a **usage/configuration** refusal — about the invocation, not the head; a MERGED artifact still wins over it), or rc≠ 0 whose last `admin-merge: ✗ …` line is one of the **recognised head-verdict wordings** (`THE TREE THIS PR PRODUCES IS RED`, `THE BASE IS RED`, `never TESTED main`, `CONFLICTED`, `--no-rerun`). Any other `✗` line — the rail has ~117 templates, most of them "could not read", "no classification attempted", or "stopped mid-wait" — is `unknown`: a refusal is a claim about your head and needs positive support |
 | `killed` | 21 | the rail died of a signal (rc ≥ 128), named (SIGTERM / SIGKILL / …) |
 | `gone-without-verdict` | 22 | **no exit status, recorder gone, rail not alive, PR not MERGED: this run produced no verdict.** Never reported as a landing |
 | `exited-zero` | 23 | rc=0 and the PR is not merged (a `--dry-run` / `--print-bounds` inspection run) |
-| `unknown` | 25 | an evidence read abstained: `ps` unreadable, no recorded incarnation, an unusable recorded start, a corrupt status file, an **unreadable or unverified** PR state, a non-zero exit with no `admin-merge: ✗` line, or a `✗` line that says the rail could not read what it needed (an ERROR, never a verdict about this head) |
+| `unknown` | 25 | an evidence read abstained: `ps` unreadable, no recorded incarnation, an unusable recorded start, a corrupt status file, an **unreadable or unverified** PR state, a non-zero exit with no `admin-merge: ✗` line, or a `✗` line that is not a **recognised head verdict** (an ERROR / a no-verdict run — the rail's own words are always printed) |
 | `no-run` | 24 | nothing was ever started for this PR |
 
 Other codes: `2` usage, `3` a live (or unverifiable) run already holds this PR, `5` the launch did
@@ -94,8 +94,11 @@ load-bearing distinctions honest:
   measured #2235 shape, where a cell-wide `GH_REPO` made the rail print `ALREADY MERGED` over an open
   PR. So the read always passes `--repo`, always asks for the PR's `url`, and **the url must name this
   repo and this PR** or the read abstains.
-  The identity is **normalised** (`[HOST/]OWNER/REPO` and the `--repo=X` spelling all reduce to
-  `owner/repo`) and **required to start**: `start` refuses (exit 2) when neither `--repo` nor
+  The identity is **normalised** (`[HOST/]OWNER/REPO` and the `--repo=X` spelling both reduce to
+  `owner/repo`, lower-cased because GitHub's names are case-insensitive while a `case` glob is not —
+  un-lower-cased, a canonical URL never matched and `landed` was unreachable), it is forwarded to the
+  rail as `--repo` when it did not come from argv (so the record and the rail's target are one value
+  by construction), and it is **required to start**: `start` refuses (exit 2) when neither `--repo` nor
   `origin` names a repository, because a run that can never verify its own artifact could only ever
   report `unknown`. It is recorded in the run, and that record is authoritative: a poll whose
   `--repo` contradicts it abstains, because the state key maps `/` to `-` and is not injective
@@ -108,7 +111,8 @@ documented spellings cannot reach the rail twice either. The probe itself is on 
 incarnation, so a stale run directory never blocks a start — only positive evidence of a live one
 does.
 
-⛔ **Every abstention that can block a start is BOUNDED**, because an unbounded "may still be alive"
+⛔ **Every abstention that can block a start is BOUNDED**, on a `created` epoch written at
+creation (not on an mtime, which can be unreadable — and an unreadable age is *not* "young"), because an unbounded "may still be alive"
 is the stale-flag defect (#8175) — a PR that can never be started again without hand-editing state.
 A claim is stale after `RAIL_RUN_CLAIM_MAX` (60 s: its launcher's whole life is the 5 s pid wait),
 and a run record whose liveness abstains stops blocking after `RAIL_RUN_RECORD_MAX` (24 h: a real
@@ -144,13 +148,14 @@ Three stated residuals:
 bash scripts/rail-run.test.sh      # no network, no real gh, no real rail
 ```
 
-**132 passed, 0 failed** (`bash scripts/rail-run.test.sh`, ~58 s, no network). The suite is mostly
+**145 passed, 0 failed** (`bash scripts/rail-run.test.sh`, ~62 s, no network). The suite is mostly
 negative — `running` must never read as landed or refused, `rc=0` is not a landing when the artifact
 disagrees, `gone-without-verdict` is never a landing *or* claimed over an unread artifact, an
 unreadable liveness or PR read abstains, a live pid with the wrong incarnation is not "running", a
 claim in its `mkdir`→`pid` window is in flight rather than dead, `--repo`/`--run` cannot escape the
 run root, an artifact read whose url names another repo is not a landing, a poll that contradicts
-the run's recorded repo abstains instead of answering with it, a `✗` line that could not
+the run's recorded repo abstains instead of answering with it, a mixed-case slug is one key and one
+identity, the identity reaches the rail exactly once even with a `--`, a `✗` line that could not
 read something is not a refusal, an abstaining run record cannot block a PR forever, and two racing
 starts reach the rail exactly once (the recorder's own liveness blocks too, so the window before
 the rail's pid exists is covered). Every arm names the guard it discriminates; removing that guard
