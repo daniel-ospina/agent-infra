@@ -284,8 +284,16 @@ none of the reclaim steps below touch it.
    ladder depends on — `df` reported **99 % capacity, 947 MB of 974 MB used, 11 MiB free** on cell-3 (measured 2026-10-27,
    while `/` was at 60 %), the consumer being a `workspace-registry.sqlite3` of ~900 MB in that volume's `sessions/`. This
    volume moves — observed 31 → 11 MiB free within a single day — so **re-read it**; do not trust the figure above. None of
-   the reclaim steps above touch it, so if it is the volume that is full, that is an **owner-level** action: it is a per-box
-   loop file (`cmux-tui-state.ext4` — 974 MB on cell-3, 3,996 MB on cell-4) and **no `cmux vm` verb resizes it**. A reset is
+   the reclaim steps above touch it, and **no `cmux vm` verb resizes it** — it is a per-box loop file (`cmux-tui-state.ext4` —
+   974 MB on cell-3, 3,996 MB on cell-4). **Two levers exist, and growing the file comes first because it destroys nothing.**
+   It costs space from `/` (read `df -Pm /` first — cell-4 had 41 GB free at 66 % when this was measured, cell-3 60 %), and it
+   runs **online**, so the daemon keeps running and the box keeps its terminal inventory:
+   `sudo truncate -s +2G /var/lib/cmux/cmux-tui-state.ext4` → `LD=$(sudo losetup -j /var/lib/cmux/cmux-tui-state.ext4 | cut
+   -d: -f1) && sudo losetup -c "$LD"` → `sudo resize2fs "$LD"` → re-read `df -Pm /home/cmux/.local/state/cmux-tui`.
+   The mechanism is the kernel's on-line ext3/ext4 resize, and `losetup -c` is the step that makes the loop device's new size
+   visible to it (`man 8 resize2fs`); verified on pi-cell-4 (2026-10-27) on a scratch 64 → 96 MB loop file, which `df` read as
+   56 → 88 MB **while mounted** — ⚠️ **not yet run against this volume itself**, so if the resize refuses or the daemon stops
+   answering, stop there and fall back to the reset. A **reset** is the owner-level action, and it is
    not just an unlink: the `cmux-tui` daemon holds that registry **open** (6 fds on cell-3 — 4 read-write, one of them the
    `-shm`, and 2 read-only; *any* of them pins the inode), so deleting the file frees nothing until those fds close. ⛔ **And stopping it is not a
    small act:** the unit is `KillMode=control-group`, so `sudo systemctl stop cmux-tui-daemon.service` SIGTERMs **every process
@@ -435,7 +443,7 @@ dispatch time, because both move.
 2026-10-17 (`docs/ops/fleet-capacity.md`) that **between boxes** dispatch is gated on capacity, not a lane count — that is
 `cap_place`, and the objection is to a count standing in for capacity **across a fleet**. **Inside one box there IS a real
 ceiling**: `MAX_LANES` — `2.5 × cores` when unset (`orch-loop.sh`: `10#$_NCPU * 5 / 2`; **on the laptop it is rendered into the
-launchd plist** by `install.sh` from `launchd.plist.template`'s `__MAX_LANES__`), **but the cells pin it** (`keys.env`:
+launchd plist** by `install.sh` from `scripts/orchestrator-harness/launchd.plist.template`'s `__MAX_LANES__`), **but the cells pin it** (`keys.env`:
 `export MAX_LANES=20` — operator-pushed, so re-read it), and all three enforce 20 today regardless of core count:
 cell-3 (8 GB, 4 vCPU) and cell-4 (16 GB, 8 vCPU) both refuse at `lanes >= 20` (`GATE_WHY=lanes=N>=max_lanes=M`). That is
 exactly why the number cannot be trusted as capacity — on cell-3 it admits 20 lanes into 8 GB. It is real — and the *number* knows
@@ -480,8 +488,9 @@ not a load average measured earlier.
     never quote a count: the tree total moved 22 -> 29 within a day of readings, so a number written here becomes a wrong
     number that the next reader plans against. ⛔ **The fifth member is the ai-drainer's SEED_REPO, and it is not necessarily where the
     documentation says.** `ai-drainer.sh` creates `$AI/wt-drainer-<lane>` with `git -C "$SEED_REPO" worktree add` (search
-    that phrase; `AI` defaults to `$HOME/orchestrator-ai`), and `install-drainer-timer.sh:72` defaults `SEED_REPO` to
-    `$HOME/agent-infra-main` at **install** time. ⛔ **Do not carry a value from this page: the unit itself moves.** The
+    that phrase; `AI` defaults to `$HOME/orchestrator-ai`), and `install-drainer-timer.sh:72` defaults
+    **`DRAINER_SEED_REPO`** to `$HOME/agent-infra-main` at **install** time — the unit-side name `SEED_REPO` is only what the
+    template renders that value into (`:129`), so exporting `SEED_REPO` yourself and re-running the installer changes nothing. ⛔ **Do not carry a value from this page: the unit itself moves.** The
     template always renders the knob (`templates/systemd/eldato-ai-drainer.service:36` → `Environment=SEED_REPO={{SEED_REPO}}`),
     so the value in force is a `systemctl cat eldato-ai-drainer.service` reading — and on `pi-cell-4` the **same box gave two
     different answers the same day**: an earlier reading had a wrapper (`ExecStart=/bin/bash $CELL_HOME/run-ai-drainer.sh`,
@@ -553,7 +562,7 @@ not a load average measured earlier.
   rc_all=0
   # The seed checkout is whatever repo owns the drainer's trees — DERIVED, never assumed. On pi-cell-4 it was
   # /tmp/cell-ai-main under one install of the unit and /home/cmux/agent-infra under the next (2026-10-27), while
-  # install-drainer-timer.sh:72's default ($HOME/agent-infra-main) exists in neither — which is why this DERIVES instead of
+  # install-drainer-timer.sh:72's DRAINER_SEED_REPO default ($HOME/agent-infra-main) exists in neither — which is why this DERIVES instead of
   # reading the unit: `systemctl cat` is the value in force, the trees are the value that matters.
   seed=""
   for w in "${AI:-$HOME/orchestrator-ai}"/wt-drainer-*; do
@@ -569,6 +578,10 @@ not a load average measured earlier.
   # a permanent exit 1 on every run, which trains the reader to discount the stop signal; a path that exists and is not a repo
   # still reports AT-RISK-UNKNOWN. Streamed one path per line so a path with a space survives, for the same reason the block
   # above reads the porcelain stream instead of awk fields.
+  # `$REPO` is asserted HERE, not left to the glob below: an unset one emits an EMPTY line, `sort -u` keeps it, the
+  # `[ -n "$POP" ]` floor passes on any other root that matched, and the loop's `[ -n "$R" ] || continue` drops it — so the
+  # one repo the caller named is the one never read. Block 1 fails closed on exactly this input; this half must not be weaker.
+  [ -n "${REPO:-}" ] || { echo "AT-RISK-UNKNOWN REPO=<unset>"; exit 1; }
   POP=$( { printf '%s\n' "$REPO"
             [ -n "$seed" ] && printf '%s\n' "$seed"
             for d in /tmp/cell-* "$CELL_HOME"/* /home/*/*; do [ -e "$d/.git" ] && printf '%s\n' "$d"; done
@@ -580,7 +593,7 @@ not a load average measured earlier.
   done <<< "$POP"
   # ⛔ `orchestrator/wip/` and the `orchestrator/*.txt` ledgers are NOT optional extras on this list. `install.sh:649-650`
   # creates `logs/ state/ wip/` plus `candidates.txt dispatched.txt checked.txt` SIDE BY SIDE under `$O`, and `wip/` holds the
-  # only copy of a cap-killed lane's dirty work (`spawn-gate.sh:843` writes `wip/capwip-<stamp>-<pid>/`; the README's state
+  # only copy of a cap-killed lane's dirty work (`spawn-gate.sh:844` writes `wip/capwip-<stamp>-<pid>/`; the README's state
   # table documents it). A list of three named paths was the list that lost them.
   for f in "$CELL_HOME"/keys.env "$CELL_HOME"/orchestrator/state "$CELL_HOME"/orchestrator/logs \
            "$CELL_HOME"/orchestrator/wip "$CELL_HOME"/orchestrator/*.txt; do
