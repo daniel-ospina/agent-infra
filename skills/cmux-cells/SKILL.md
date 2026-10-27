@@ -122,9 +122,11 @@ printf 'more_lanes=%s (ram=%s disk=%s, target=%s)\n' "$more" "$ram_more" "$disk_
 
 ⚠️ **WHAT THE GATE ACTUALLY REFUSES** (read 2026-10-27) — **brief admission answers first**, then the capacity refusals in
 this order (fork → disk → load). The brief gate (`AGENT_BRIEF_REFUSED`, exit **80**) fires **before fork** and before any
-disk or load reading (agent-infra#2258), and it is **deterministic**: it cannot clear by waiting, and re-dispatching the same
-brief on another box refuses there too — re-author the brief, do not retry. (The gate carries two ordering comments that
-disagree — "brief gate … FIRST" and "fork → disk → load"; the exit codes do not: 80 before 73.)
+disk or load reading (agent-infra#2258), and a **brief refusal is deterministic**: it cannot clear by waiting, and
+re-dispatching the same brief on another box refuses there too — re-author the brief, do not retry. (A missing or
+incomplete validator returns **78** instead — `CANNOT VERIFY`; that one *is* repairable, by fixing the install rather than
+the brief.) The gate carries two ordering comments that disagree — "brief gate … FIRST" and "fork → disk → load"; the exit
+codes do not: 80 before 73.
 
 1. **fork** — `AGENT_FORK_REFUSED`, exit **73**. A process-bound box refuses a spawn that would fork-bomb it; the remedy is
    a restart/drain, **not** waiting;
@@ -178,7 +180,7 @@ while three VMs were running. Disk grew twice (+8 GiB each) but **RAM had 8 GiB 
 |---|---|
 | `cloud exec` timeout / 502 / silent empty | **the channel failed. Not the box.** Retry minutes apart |
 | `cmux vm ls` → `running` | the provider sees the VM alive |
-| **`cmux vm stats <vm>`** | the provider's own liveness read, and the cheapest — `CPU n% · Mem x/y GB · Disk a/b GB`. It cannot tell you the guest is **unusable** (a full guest still reads `awake` while every `exec` times out), and its disk figure is really the guest's own `df` — they agree to 0.1 GB — except that after a reclaim the provider side can lag **high**; if the two disagree, trust `df -Pm /` in the guest. Pair it with `vm terminal read` — **the row below** |
+| **`cmux vm stats <vm>`** | the provider's own liveness read, and the cheapest — `CPU n% · Mem x/y GB · Disk a/b GB`. Two caveats that matter: it cannot tell you the guest is **unusable** (a full guest still reads `awake` while every `exec` times out), and its `Disk a` term is the guest's `df` **used**, in GiB — `df -Pm` reports MiB, so divide by 1024 to compare — while `/b` is the **provisioned** size, not `df`'s total. Compare `used`; take headroom from `df`'s `Available`. The provider side can also lag **high** after a reclaim, so if the two disagree, trust `df -Pm /`. Pair it with `vm terminal read` — **the row below** |
 | `vm terminal read` → `No space left on device` | the guest is alive and full |
 
 A **disk-full** cell behaves exactly like a dead one: the control agent cannot write its socket, so every `exec` times out
@@ -188,8 +190,8 @@ having submitted nothing for 141–226 minutes.
 Recovery ladder, cheapest first:
 
 1. `cmux vm terminal read <vm> <terminal-id>` — get terminal ids from `cmux vm tree <vm>`. The screen tells you the truth.
-2. `cmux vm terminal send <vm> <term-id> '<command>' --keys enter` — runs a command when `exec` cannot (no output rendering if
-   the disk is full, so confirm from the guest's own `df -Pm /` — not from `vm stats`, whose disk figure is advisory).
+2. `cmux vm terminal send <vm> <term-id> '<command>' --keys enter` — runs a command when `exec` cannot. The **send** verb
+   prints nothing back; read the result with `vm terminal read` (step 1).
 3. `cmux vm pause <vm>` then `cmux vm resume <vm>` — provider-level reset. Fixes a wedged agent, does **not** fix a full disk.
 4. **`cmux vm resize <vm> --disk <GiB>`** — grows in place, 4 GiB steps, **cannot shrink**. The correct lever for a full guest:
    32 → 40 GiB made a dead-looking box respond immediately.
@@ -205,9 +207,9 @@ transcript exists *for this lane*". mtime is **necessary, not sufficient**: pair
 an ancestry check. Size alone is not a signal, and a spinner is not.
 
 - **0-byte lane log** = the lane could not start (usually disk full). It reads as "quiet", not broken — always check.
-- A *thinking* lane and a dead one read identically in **every** instrument: zero CPU delta, frozen mtime, no size change. mtime
-  only tells you **how long nothing was written** — which is why the reaping gate needs a zero-CPU window **and** a 2 h idle
-  bound before it acts, and why no single reading is a verdict.
+- A *thinking* lane and a dead one are indistinguishable **by activity readings** — zero CPU delta, frozen mtime, no size
+  change. Only the **length** of the quiet window separates them, which is why the reaping gate needs a zero-CPU window
+  **and** a 2 h idle bound before it acts. A live `pi` row proves **existence**, never progress.
 
 Reap only when **all three** hold (prose → code: agent-infra#1244, #2163):
 
@@ -218,11 +220,11 @@ Reap only when **all three** hold (prose → code: agent-infra#1244, #2163):
 ⛔ **Never treat "no log found" as "stale."** A first dry run flagged 69 lanes and would have killed a 7-minute-old lane,
 because the worktree slug parsed from shell text (`ciwatch\012[`) matched nothing. An absent artefact fails closed.
 
-Also: `ps -eo args | grep -c '[p]i --model'` returns **0 on a box with 16+ `pi` live** — and not because of flag order. (Unbracketed, that pattern returns **1**: the grep's own argv contains it — the self-match trap §5 states as "never
+Also: `ps -eo args | grep -c '[p]i --model'` returns **0 on a box with `pi` live** — and not because of flag order. (Unbracketed, that pattern returns **1**: the grep's own argv contains it — the self-match trap §5 states as "never
 `pkill -f` / `ps | grep` a pattern that appears in your own command line".)
 `pi` is a Node script that **rewrites its process title**, so every live `pi` shows `args` = `pi` alone (`/proc/<pid>/cmdline`
-is `pi` + NULs). The only rows carrying `--provider … --model …` are the launcher wrappers (10 measured on cell-4, **0 `pi`
-rows**), so "fixing" that pattern's flag order counts **wrapper shells**, not lanes. Enumerate with
+is `pi` + NULs). The only rows carrying `--provider … --model …` are the launcher wrappers — **never a `pi` row** — so
+"fixing" that pattern's flag order counts **wrapper shells**, not lanes. Enumerate with
 `ps -eo comm= | grep -c '^pi$'` (or `lane-reap.sh`'s census): a low count is not a quiet box, and a high one is not lanes.
 A box's `dmesg | grep -ci 'killed process'` is worth reading beside that — as context, never as a gate: the reaping gate
 below decides on a CPU delta, ancestry and log staleness, and reads no OOM count at all.
