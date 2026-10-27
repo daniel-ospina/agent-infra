@@ -73,7 +73,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **single-digit MB idle and ~10–210 MB loaded** (207.9 MB observed on cell-3, 2026-10-27) — with **313 MB seen on cell-1**, so do not treat ~150 MB as a ceiling. Re-measure per box. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~5–105 MB in a normal sample** (cells 3–4, 2026-10-27) with **peaks seen at 207.9 MB (cell-3) and 313 MB (cell-1)** — plan on the peak, not on ~150 MB, and re-measure per box. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -153,8 +153,9 @@ remedy:** the ratio (`land_backlog_verdict` rc=1 — repo-wide, so land the queu
 the slug (`land_backlog_repo` cannot derive one: that worktree's `origin` is not an `owner/name` slug, **or `repo-slug.sh` is
 missing** — per-worktree or an install fault); and **rc=2, a failed `gh` read** (`UNREADABLE open-PR count` / `UNREADABLE
 landing rate`) — box-local, so fixing that box's gh chain clears it and **a re-dispatch to a healthy box does clear it**, even
-though the gate prints the ratio remedy text for it too. A P0-blocker or a base-red repair is **exempt by evidence** and
-dispatches under the hold. **Idling on its own changes none of them**: for 73
+though the gate prints the ratio remedy text for it too. A P0-blocker or a base-red repair is **exempt by evidence** and dispatches under the hold — **when the exemption read
+itself succeeds**; on the rc=2 arm it fails with the same gh chain, so a P0 *is* held until the chain is fixed (the
+gate's refusal line says so). **Idling on its own changes none of them**: for 73
 and 77 the release *is* a lane draining, so the drain has to actually complete rather than just pass time — which is why the
 gate's own two messages read "does NOT clear by waiting" (fork) and "This is NOT a load refusal: waiting does not clear it"
 (headroom) while both still offer "or let its lanes drain" / "or let a lane finish". So diagnosing a 73, 77, 74, 78 or 80 as
@@ -265,9 +266,10 @@ none of the reclaim steps below touch it.
    You are also deleting the box's **terminal inventory** — the registry that steps 1-2 are the channel *through* (the display is
    `cmux-desktop.service`, its own cgroup, and outlives the daemon) — so afterwards `exec` or the console is the only way back.
    Run the work-at-risk check below across every repo on the box first, and list the registries you expect to delete
-   (`ls -d /home/cmux/.local/state/cmux-tui/sessions/*/workspace-registry.sqlite3` — with more than one session dir, deleting
-   one under-reclaims while `df` still shows an improvement). Then: `sudo systemctl stop` the unit, delete **all** of them
-   (each ~43 MB `-wal` regenerates), `sudo systemctl start` it, and check **both** `systemctl is-active --quiet
+   (`ls -d /home/cmux/.local/state/cmux-tui/sessions/*/workspace-registry.sqlite3*` — with more than one session dir,
+   deleting one under-reclaims while `df` still shows an improvement). Then: `sudo systemctl stop` the unit, delete every match
+   of that glob — the `-wal` is a separate ~43 MB file and one of the pinned fds, so it goes too and regenerates smaller —
+   `sudo systemctl start` it, and check **both** `systemctl is-active --quiet
    cmux-tui-daemon.service` **and** a fresh registry under `sessions/` **and** the `df` you came for — `df` alone cannot
    tell "reclaimed" from "reclaimed and now dead", and a failed start is the moment to escalate, not to recreate. A **recreate**
    is the bigger hammer and takes the whole guest: every worktree (the unpushed commits that check exists for), `keys.env`, the
@@ -425,7 +427,7 @@ not a load average measured earlier.
 - Killing a controller is futile when launchd `KeepAlive` + a 20 s watchdog recreate it — and a lane can spawn one.
 - `TERM`/`INT` traps that swallow signals leave the script running: a stop/restart appears to hang (agent-infra#2085).
 - Deleting a worktree to make space must never destroy unpushed work, and the guard has to **read the right trees, in a
-  population sized to what you are destroying, and fail closed.** Five traps, each measured on a cell:
+  population sized to what you are destroying, and fail closed.** Six traps, each measured on a cell:
   - `git -C "$wt" rev-list --count '@{u}..HEAD'` **exits 128 with empty stdout** on a branch with no upstream — often the
     branch holding the unpushed work — so an error is UNSAFE, never clean.
   - **`--not` negates every revision after it**, so `rev-list --count --not --remotes HEAD` counts nothing and prints `0` for a
@@ -433,47 +435,64 @@ not a load average measured earlier.
   - **`awk '{print $2}'` truncates a path containing a space** — and if another worktree exists at the truncated path the guard
     measures *that* tree and prints a clean line **twice**, saying nothing about the real one. Read the porcelain stream
     (`sed -n 's/^worktree //p'`, then `while IFS= read -r`), never a field.
+  - **A pipeline ending in `wc -l` (or `grep -c`) cannot fail**, so `d=$(… | wc -l) || d=UNKNOWN` never fires and a *failed*
+    `git status` prints `dirty=0`. Test `git status` itself, then count.
   - **The population depends on the destruction.** Deleting a *worktree* needs its repo's trees; a **recreate** or the
-    `cmux-tui` reset takes the whole guest — on cell-3 that is **75 trees across three repos** (`$REPO` 26, `/tmp/cell-ai` 44,
-    `$CELL_HOME/wt-drain*` 5), **9** of them outside `$REPO` with commits reachable from no remote. `$CELL_HOME/wt-*` alone is
-    **2**. And `HEAD` is not the box's work: **15** local branches on cell-3 are no worktree's HEAD and die in a recreate too.
-  - **`git status --porcelain` omits ignored state** (`keys.env`, `orchestrator/state/` show as `!!`), so `dirty=0` does not
-    mean "nothing here matters" — the third field below makes that visible.
-  Run it as a loop over the stream, and let the **exit status** carry the verdict (`0` clean · `1` nothing readable · `2` work
-  at risk) — `continue` outside a loop is a no-op, and a block whose stdout says "at risk" while it exits 0 teaches the caller
-  to ignore it:
+    `cmux-tui` reset takes the whole guest — on cell-3 that is **five repos** (`$REPO` 27 trees, `/tmp/cell-ai` 44,
+    `$CELL_HOME/agent-infra` 2, `$CELL_HOME/tortoise` 3, `$CELL_HOME/wt-drain*` 2 dirs holding 14), with unpushed commits in
+    trees outside `$REPO`. And `HEAD` is not the box's work: **8** local branches there are no worktree's HEAD and die in a
+    recreate too.
+  - **`git status --porcelain` omits ignored state** (`keys.env`, `orchestrator/state/` show as `!!`) — which is *exactly*
+    what a recreate destroys — so the block reports it in a third column. That column is **informational: its value does not
+    move the exit code**, so a `0` from this block never means "nothing here matters" for a recreate; read the column.
+  Run it as a loop over the stream, and let the **exit status** carry the verdict (`0` every tree read, no unpushed commits, no
+  dirty tracked files · `1` something could not be read · `2` work at risk). `continue` outside a loop is a no-op, and a block
+  whose stdout says "at risk" while it exits 0 teaches the caller to ignore it:
   ```bash
-  # EXIT: 0 = every tree read and clean · 1 = nothing could be read · 2 = work at risk (read the lines)
+  # EXIT: 0 = read clean · 1 = something could not be read · 2 = work at risk (read the lines)
   if ! { [ -n "${REPO:-}" ] && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; }; then
     echo "AT-RISK-UNKNOWN repo=${REPO:-<unset>}"; exit 1
   fi
   rc=0
   while IFS= read -r wt; do            # sed, not awk: keep paths that contain spaces whole
     if ! { [ -d "$wt" ] && git -C "$wt" rev-parse --git-dir >/dev/null 2>&1; }; then
-      echo "AT-RISK-UNKNOWN $wt"; rc=2; continue
+      echo "AT-RISK-UNKNOWN $wt"; [ "$rc" = 0 ] && rc=1; continue
     fi
     n=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null) || n=UNKNOWN
     if d=$(git -C "$wt" status --porcelain 2>/dev/null); then
-      d=$(printf '%s\n' "$d" | grep -c . || true)   # wc -l always exits 0; grep -c . does not lie about an empty stream
+      d=$(printf '%s' "$d" | grep -c '^' || true)
     else d=UNKNOWN; fi
-    ig=$(git -C "$wt" status --porcelain --ignored 2>/dev/null | grep -c '^!!' || true)
-    case "$n" in UNKNOWN|"") n=UNKNOWN; rc=2 ;; 0) ;; *) rc=2 ;; esac
-    case "$d" in UNKNOWN|"") d=UNKNOWN; rc=2 ;; 0) ;; *) rc=2 ;; esac
+    if o=$(git -C "$wt" status --porcelain --ignored 2>/dev/null); then
+      ig=$(printf '%s' "$o" | grep -c '^!!' || true)
+    else ig=UNKNOWN; fi
+    case "$n" in UNKNOWN|"") n=UNKNOWN; [ "$rc" = 2 ] || rc=1 ;; 0) ;; *) rc=2 ;; esac
+    case "$d" in UNKNOWN|"") d=UNKNOWN; [ "$rc" = 2 ] || rc=1 ;; 0) ;; *) rc=2 ;; esac
+    [ "$ig" = UNKNOWN ] && { [ "$rc" = 2 ] || rc=1; }
     echo "WT $wt unpushed=$n dirty=$d ignored=$ig"
   done < <(git -C "$REPO" worktree list --porcelain | sed -n 's/^worktree //p')
   if s=$(git -C "$REPO" stash list 2>/dev/null); then        # refs-wide: once per repo, never per tree
-    if [ -n "$s" ]; then printf '%s\n' "$s" | sed 's/^/STASH-AT-RISK /'; rc=2; else echo "STASHES 0"; fi
-  else echo "STASH-UNKNOWN $REPO"; rc=2; fi
+    if [ -n "$s" ]; then echo "$s" | sed 's/^/STASH-AT-RISK /'; rc=2; else echo "STASHES 0"; fi
+  else echo "STASH-UNKNOWN $REPO"; [ "$rc" = 2 ] || rc=1; fi
   while IFS= read -r br; do                                  # a recreate also loses local branches
     [ -n "$br" ] || continue
     bn=$(git -C "$REPO" rev-list --count "$br" --not --remotes 2>/dev/null) || bn=UNKNOWN
     [ "$bn" = 0 ] || { echo "BRANCH-AT-RISK $br $bn"; rc=2; }
   done < <(git -C "$REPO" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)
-  exit "$rc"
+  echo "VERDICT $rc"; exit "$rc"
   ```
-  `UNKNOWN` is an error, not a zero. For anything that takes the **whole guest** — a recreate, the `cmux-tui` reset — run it
-  once per repo, enumerating them explicitly (`for R in "$REPO" /tmp/cell-ai /tmp/cell-home/wt-drain*; do REPO=$R ...; done`);
-  a bounded `find` is not enough on a box with 20+ scratch repos. Preserve, then remove only the regenerable parts.
+  `UNKNOWN` is an error, not a zero. **For anything that takes the whole guest — a recreate, the `cmux-tui` reset — save the
+  block to a file and run it once per repo, keeping the worst status.** Inlining it in a loop cannot work: it ends with
+  `exit`, so the first repo would end the loop.
+  ```bash
+  rc_all=0
+  for R in "$REPO" /tmp/cell-ai /tmp/cell-home/agent-infra /tmp/cell-home/tortoise; do
+    ( REPO=$R bash work-at-risk.sh ) || { s=$?; [ "$s" -gt "$rc_all" ] && rc_all=$s; }
+  done
+  echo "GUEST VERDICT $rc_all"; exit "$rc_all"
+  ```
+  That list is a **floor taken on 2026-10-27, not a census** — re-derive it per box
+  (`for d in /tmp/cell-* /tmp/cell-home/*; do [ -e "$d/.git" ] && echo "$d"; done`) and expect more. Preserve, then remove only
+  the regenerable parts.
 - **Capacity is a MEASUREMENT, not a constant.** Every earlier version of §2 substituted one number for the lane type and one
   for the reserve, and both errors ran in the direction that **refuses** dispatches it should allow. The figures in §2 carry
   their date and method so the next reader can re-derive them instead of inheriting them.
