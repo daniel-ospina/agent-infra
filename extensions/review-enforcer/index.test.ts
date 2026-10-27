@@ -5316,12 +5316,14 @@ test("mergeInvocationInText: a construct on BOTH sides is not an invocation (rev
   // ⛔ THE OVER-BLOCK the cycle-2 fix introduced, and the reason arm 2 requires a READABLE
   // `gh`: accepting a construct as the command word there turned "construct command + construct
   // group" into the same vocabulary guess the predicate exists to replace. Every command below
-  // is READ-ONLY, is refused at `origin/main` as well (so this is not a regression fence — it
-  // is the class the whole change is about), and was measured to be BLOCKED by the interim
-  // head: `evaluateAdminMergeGate(null, null, null, false)` → `status: "block"`,
-  // `reasonTag: "admin_no_pr"`, with `countMergeVerbs` 0 and `readsNonMergeGhCall` false, so
-  // the shim stand-down could not rescue them either. The first row is the script that
-  // verifies the evidence for THIS gate.
+  // is READ-ONLY.
+  // ⛔ DECLARED AS REGRESSION FENCES, NOT GUARDS (measured in review cycle 5): `origin/main`
+  // ADMITS every row below (`isAdminMergeCommand` false, `isGitOp` false), so `!isAdminMergeCommand`
+  // holds there too and only the END-TO-END refusal differs. They are here because the INTERIM
+  // head (cycle 2's) refused them — that is the regression they fence — and NOT because the base
+  // did. Do not cite `evaluateAdminMergeGate(null, …)` as evidence for a row: with `pr === null` it
+  // returns `block`/`admin_no_pr` for ANY command, so it says nothing about these shapes (review
+  // cycle 5, P2). The first row is the script that verifies the evidence for THIS gate.
   const overBlocks = [
     `bash $AIR/scripts/verify-admin-merge-evidence.sh "$PR"`,
     `$PY $SCRIPT --check-admin-policy`,
@@ -5359,11 +5361,19 @@ test("mergeInvocationInText: a construct on BOTH sides is not an invocation (rev
 test("mergeInvocationInText: TEXT is not an invocation, and an all-assembled command is (review cycle 4)", () => {
   // ⛔ THE BOUND ON THE FAIL-CLOSED ARMS. Every arm in the candidate rule may only answer true
   // for something bash would HAND to gh; where the tokens are prose, a marker or a heredoc body,
-  // the answer must be false. `origin/main` admits all of these, and the fail-closed arms made
-  // them REFUSED read-only commands — the class #3953 is about, reintroduced one layer down.
+  // the answer must be false. The fail-closed arms made them REFUSED read-only commands — the
+  // class #3953 is about, reintroduced one layer down.
   //
-  // The four tokens that made it happen are all RESIDUE that `CONSTRUCT`'s character class
-  // (`[$`{}<>]`) accepts: the `<<'EOF'` of a heredoc, the `<` that `<!--` splits into, the
+  // ⛔ WHICH ROWS ARE GUARDS AND WHICH ARE FENCES IS MEASURED, NOT ASSUMED (review cycle 5).
+  // `origin/main` does NOT admit every row here: it REFUSES the quoted `--body` marker
+  // (`isAdminMergeCommand` true, `isGitOp` true), so that row is a GUARD against the base — the
+  // over-block #3953 reports. The heredoc rows and the construct-construct path row are
+  // base-ADMITTED, so they FENCE the interim cycle-2 head, which refused them. The four redirect
+  // rows below are base-admitted and refused by the cycle-4 head (1d63117e4), so they are GUARDS
+  // for the redirection bound.
+  //
+  // The four tokens that made the heredoc case happen are all RESIDUE that `CONSTRUCT`'s character
+  // class (`[$`{}<>]`) accepts: the `<<'EOF'` of a heredoc, the `<` that `<!--` splits into, the
   // `head}` tail of a `${head}`, and the `-->` that closes an HTML comment.
   const notInvocations = [
     // A heredoc that WRITES this gate's own evidence marker: an everyday fleet operation.
@@ -5371,11 +5381,23 @@ test("mergeInvocationInText: TEXT is not an invocation, and an all-assembled com
     `cat > /tmp/attribution.md <<EOF\n<!-- admin-merge-safety: ${"$"}{head} -->\nEOF`,
     // …the whole attribution body, which is what is actually posted as evidence.
     `cat > /tmp/attribution.md <<'EOF'\n<!-- admin-merge-safety: ${"$"}{sha} -->\nPR head: ${"$"}{sha}\nmain compared (union of 10 runs): s1:1,s2:2\nEOF`,
-    // …and the marker as a --body value, quoted.
+    // …and the marker as a --body value, quoted. ⛔ THIS ROW IS A GUARD AGAINST THE BASE, not a
+    // fence: `origin/main` REFUSES it (`isAdminMergeCommand` and `isGitOp` both true there),
+    // which is exactly the over-block #3953 reports — a read-only comment whose body names the
+    // marker.
     `gh pr comment 999 --body "<!-- admin-merge-safety: ${"$"}{head} -->"`,
     // The path form of the same refusal: a construct command word with a construct group and
     // NO merge verb is not an invocation (the construct-construct arm must ask for the verb).
     `bash ${"$"}AIR/scripts/verify-admin-merge-evidence.sh "${"$"}PR"`,
+    // ⛔ AND WITH A REDIRECTION APPENDED (review cycle 5, P1). `CONSTRUCT` lists `<`/`>`, so
+    // `2>/dev/null` / `> /tmp/out` / `2>&1` read as construct words — and an adjacent construct
+    // at the verb stage returned true, so ONE redirect turned a read-only command into a refused
+    // "admin merge". These ARE guards: `origin/main` admits all four and the cycle-4 head
+    // (1d63117e4) refused all four — measured — so the redirection bound is what decides them.
+    `bash ${"$"}AIR/scripts/verify-admin-merge-evidence.sh "${"$"}PR" 2>/dev/null`,
+    `bash ${"$"}AIR/scripts/verify-admin-merge-evidence.sh "${"$"}PR" 2>&1`,
+    `jq --arg admin "${"$"}X" "${"$"}F" > /tmp/out`,
+    `jq --arg admin "${"$"}X" "${"$"}F" 2>&1 | tail -5`,
   ];
   for (const cmd of notInvocations) {
     ok(!mergeInvocationInText(cmd), `prose/heredoc is not a merge invocation: ${cmd.slice(0, 70)}`);

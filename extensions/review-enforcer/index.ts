@@ -5777,25 +5777,23 @@ function mergeVerbSequenceInTokens(command: string): boolean {
 /**
  * The walk. `groupFirst` decides which reading wins for a construct at the group stage.
  *
- * ⛔ A CONSTRUCT MUST BE ADJACENT to the word before it, and that bound is what stops the walk
- * from reading TEXT as an invocation: `<!-- admin-merge-safety: ${head} -->` has a construct
- * (`<`) where a command word belongs, another (`head}`) far across a sentence, and a third
- * (`>`) where the verb belongs — loose skipping made it a refused read-only command, and a
- * heredoc WRITING that marker was refused with it (measured, review cycle 4; `origin/main`
- * admits both). "Adjacent" tolerates the `$` of a split `${X}` (`g$'h' $P $M` is `g$'h'`, `$`,
- * `P}`, `$`, `M}`), because the introducer is the same word's first token.
+ * ⛔ THE WORD TESTS ARE WHAT BOUND IT, NOT DISTANCE. A construct only counts as a word if it is
+ * not a REDIRECTION (`2>/dev/null`, `> file`, `2>&1`, `<<<`), not a `-`-leading flag (read from the
+ * DEQUOTED word, so `$'--dry-run'` is a flag), and not shell punctuation. A heredoc writing
+ * `<!-- admin-merge-safety: ${head} -->` therefore has no reachable `gh`→group→verb triple: its
+ * `<`, `<<'EOF'` and `-->` tokens are all excluded, and what remains (`head}`) cannot complete a
+ * sequence — `origin/main` admits that heredoc, and the arms that refused it are the ones this PR
+ * narrows (measured, review cycles 4 and 5). An intermediate ADJACENCY bound was removed once
+ * these tests were in place: measured redundant on the whole corpus.
  */
 function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
   const scan = scanTokens(command);
   // 0: looking for the command word, 1: for `pr`, 2: for `merge`.
   let stage = 0;
-  // Every token since the last accepted one was a bare `$` (the introducer of the next word).
-  let adjacent = true;
   for (let i = 0; i < scan.tokens.length; i++) {
     const raw = scan.tokens[i];
     const w = shellWord(raw);
     const verbWord = withoutAssignmentPrefix(w);
-    const bareDollar = raw === "$";
     // The command word is `gh`, OR a construct where a command word belongs (`g$'h'`, `$GH`,
     // `X='gh pr merge 9'`, `CMD+=gh`). ⛔ OMITTING THE CONSTRUCT CASE WAS THE CYCLE-2 P0: bash
     // resolves `g$'h' "pr" merge 999 --admin` to `gh pr merge 999 --admin`, and with only a
@@ -5810,47 +5808,42 @@ function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
     // be read as a command word.
     // A LEADING DASH MEANS A FLAG, NOT A WORD -- and it has to be read from the DEQUOTED word:
     // `$'--dry-run'` does not start with `-` as a RAW token, but bash hands gh a flag, so reading
-    // the raw text only made `$PYTHON $SCRIPT $'--dry-run'` a three-construct "merge" (measured:
-    // that over-block survived adjacency alone).
+    // the raw text only made `$PYTHON $SCRIPT $'--dry-run'` a three-construct "merge" (measured).
+    // ⛔ A REDIRECTION IS NOT A VERB EITHER (review cycle 5, P1). `CONSTRUCT` lists `<`/`>` among
+    // the shell metacharacters, so `2>/dev/null`, `>/tmp/out`, `2>&1` and `<<<` all qualified as
+    // construct words -- and an adjacent construct at the verb stage returned true, so appending
+    // ONE redirect to a read-only command made it a candidate:
+    // `bash $AIR/scripts/verify-admin-merge-evidence.sh "$PR" 2>/dev/null` and
+    // `jq --arg admin "$X" "$F" > /tmp/out` are refused at the cycle-4 head and admitted at
+    // origin/main (measured) -- the cycle-3 over-block, re-opened one token over.
     const isConstructWord =
-      CONSTRUCT.test(raw) && w !== "" && !w.startsWith("-") && !raw.startsWith("-");
+      CONSTRUCT.test(raw) &&
+      w !== "" &&
+      !w.startsWith("-") &&
+      !raw.startsWith("-") &&
+      !/^\d*[<>]/.test(raw) &&
+      !/^&>>?/.test(raw) &&
+      !/^[|&;()]+$/.test(raw);
     const isCommandWord = /\bgh\b/.test(w) || isConstructWord;
     if (stage === 2) {
       if (verbWord === "merge") return true;
-      if (isConstructWord && adjacent) return true;
+      if (isConstructWord) return true;
       // A pure-whitespace assignment (`CMD+=' '`) is a SEPARATOR being assembled, not a verb
       // slot: skipping it is what lets `CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge` read as
       // one invocation (measured as a real bypass).
-      if (verbWord.trim() === "") {
-        adjacent = adjacent && bareDollar;
-        continue;
-      }
+      if (verbWord.trim() === "") continue;
       // A word in the verb slot that is not the verb restarts the walk (a command word here can
       // begin a fresh sequence; anything else drops back to looking for one).
       stage = isCommandWord ? 1 : 0;
-      adjacent = true;
       continue;
     }
     if (stage === 1) {
-      if (verbWord === "pr" || (groupFirst && isConstructWord && adjacent)) {
+      if (verbWord === "pr" || (groupFirst && isConstructWord)) {
         stage = 2;
-        adjacent = true;
         continue;
       }
-      if (isCommandWord) {
-        stage = 1;
-        adjacent = true;
-        continue;
-      }
-      adjacent = adjacent && bareDollar;
-      continue;
     }
-    if (isCommandWord) {
-      stage = 1;
-      adjacent = true;
-      continue;
-    }
-    adjacent = adjacent && bareDollar;
+    if (isCommandWord) stage = 1;
   }
   return false;
 }
@@ -5920,13 +5913,16 @@ function ansiCEncodesSeparator(command: string): boolean {
  *   - the LITERAL `--admin` arm stays exactly as wide as it was — a command carrying the
  *     flag AND a readable `gh pr merge` keeps the text layer's decision
  *     (`hasLiteralAdminFlag`);
- *   - a `--jq`/`--json`/`--search` value that spells a WHITESPACE-SEPARATED `pr` then
- *     `merge` word pair (`--jq 'pr merge'`) is still read as a verb pair, because at that
- *     point the text is indistinguishable from an invocation without an argv layer. That
- *     residual is an OVER-BLOCK — the direction this gate is allowed to be wrong in — and it
- *     is strictly narrower than the "any `gh` word" rule it replaces. It does NOT fire on a
- *     single token that merely contains both words (`--jq .merge`, `--json pr,merge`,
- *     `mergeStateStatus`, `hasAdminMergeFlag`): those are not word pairs and are admitted.
+ *   - a `--json`/`--search` value that spells a WHITESPACE-SEPARATED, UNQUOTED `pr` then
+ *     `merge` word pair (`gh pr view 1 --json pr merge`, `gh issue list --search pr merge`)
+ *     is still read as a verb pair, because at that point the text is indistinguishable from
+ *     an invocation without an argv layer. That residual is an OVER-BLOCK — the direction this
+ *     gate is allowed to be wrong in — and it is strictly narrower than the "any `gh` word"
+ *     rule it replaces. ⛔ The QUOTED spelling is NOT affected and must not be cited as the
+ *     example: `gh pr view 1 --jq 'pr merge'` is DATA (measured — `--jq` is a value-position
+ *     flag, so the mask covers both words and this function answers false; review cycle 5, P2).
+ *     A single token that merely contains both words (`--jq .merge`, `--json pr,merge`,
+ *     `mergeStateStatus`, `hasAdminMergeFlag`) is likewise not a word pair and is admitted.
  */
 export function mergeInvocationInText(command: string): boolean {
   // Same two normalizations the caller's own reads use: the rail's basename is not a
