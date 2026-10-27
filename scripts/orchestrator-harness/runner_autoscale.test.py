@@ -277,8 +277,17 @@ if is 'per_page=100'; then
   # `.workflow_runs[0]` query gets `queue-age-newest` (the newest, which is what row 0 really is), and
   # the two are separate fixtures — so reading row 0 as "the oldest" is falsifiable, and T44 is the
   # case that falsifies it.
-  oldest="$(cat "$FIX/queue-age" 2>/dev/null)"
-  [ -n "$oldest" ] || oldest="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # `queue-age-empty` makes the page carry NO readable `created_at` while `total_count` says work is
+  # queued (a run whose `created_at` is null); `queue-age-raw` makes it UNPARSABLE. Both are refusals
+  # the reader must produce, not answers it may rescue.
+  if [ -f "$FIX/queue-age-empty" ]; then
+    oldest=""
+  elif [ -f "$FIX/queue-age-raw" ]; then
+    oldest="$(cat "$FIX/queue-age-raw")"
+  else
+    oldest="$(cat "$FIX/queue-age" 2>/dev/null)"
+    [ -n "$oldest" ] || oldest="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
   newest="$(cat "$FIX/queue-age-newest" 2>/dev/null)"
   [ -n "$newest" ] || newest="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   # `queue-age-total` overrides `.total_count`: a queue DEEPER than the read page, whose min is only
@@ -573,7 +582,31 @@ class Box:
         `min()` over a saturated page is only a LOWER BOUND on the queue head, so it must be REFUSED
         rather than certified — the same rule `ci_runner_gate.sh:319-324` applies to the same read.
         """
-        self._write(os.path.join(self.dir, "queue-age-total"), f"{total}\n")
+        path = os.path.join(self.dir, "queue-age-total")
+        if total is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        self._write(path, f"{total}\n")
+
+    def queue_age_empty(self, on: bool = True):
+        """Make the age read answer with an EMPTY `created_at` while `total_count` still says work is
+        queued — a run whose `created_at` is null, which is what makes `None` ("nothing is waiting")
+        the WRONG answer. `on=False` removes the marker."""
+        path = os.path.join(self.dir, "queue-age-empty")
+        if on:
+            self._write(path, "1\n")
+        elif os.path.exists(path):
+            os.unlink(path)
+
+    def queue_age_raw(self, text):
+        """The age read's `created_at` verbatim, so a case can make it UNPARSABLE. `None` removes it."""
+        path = os.path.join(self.dir, "queue-age-raw")
+        if text is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        self._write(path, f"{text}\n")
 
     def unqueue(self):
         """Remove the queue fixture entirely: the depth read FAILS (the stub exits 1), as a scoped
@@ -3513,45 +3546,104 @@ def t44_queue_age_eligibility():
             box.destroy()
 
 
-@test("T56 a queue DEEPER than the age page is UNMEASURABLE with its reason — a lower bound is never certified")
-def t56_queue_age_page_saturation():
-    """THE SAME FAIL-OPEN ONE LAYER OUT (round-13 review finding P1, second half).
+@test("T56 the queue-head reader REFUSES every reading it cannot take — a lower bound and an empty page are not answers")
+def t56_queue_age_reader_refusals():
+    """THREE REFUSALS, AND WHY EACH EXISTS (round-13 review, both rounds).
 
-    `min(created_at)` over a page IS the queue head only while the page holds the whole queue. Once the
-    queue is deeper, that minimum is a LOWER BOUND on the head's age — it can only UNDERSTATE it,
-    which is the one direction that silences a starved-queue alarm. `ci_runner_gate.sh:319-324` refuses
-    exactly this state for exactly this read; a converger that certified it would report a healthy
-    queue during a full stop, which is the incident the whole term exists for.
+    (a) A SATURATED PAGE. `min(created_at)` over a page IS the queue head only while the page holds
+        the whole queue; beyond that it is a LOWER BOUND, which can only UNDERSTATE the age — the one
+        direction that silences a starved-queue alarm. `ci_runner_gate.sh:315-324` refuses exactly this
+        state for exactly this read.
+        ⛔ PINNED AT THE UNIT BOUNDARY ON PURPOSE. In *this* tool the state is unreachable end to end:
+        the age read is taken only after the depth term declines, i.e. at `queued <
+        GATE_QUEUE_THRESHOLD` (60), and `QUEUE_AGE_PAGE` is 100. A case that faked `total_count=150`
+        while the depth read reported 53 would assert an API response that cannot exist (both reads
+        are the same endpoint) and would claim a false-open this tool cannot produce. The guard is
+        kept for when the two numbers cross — the gate's threshold is operator-settable, its
+        counterpart here is a constant — so it is tested where it is reachable: the reader itself.
+        The mutation beside this case is what proves the test has teeth.
 
-    ⛔ AND THE REFUSAL MUST CARRY ITS REASON. `unmeasured` alone is a state a reader cannot act on; the
-    observation that the page was saturated, and by how much, is the part that tells an operator
-    whether to raise the page or look at the queue.
+    (b) AN EMPTY PAGE ON A NON-EMPTY QUEUE. `None` means "nothing is waiting", and it DISARMS the age
+        term; returning it because a `created_at` did not parse would report a backlog as an idle
+        queue. `ci_runner_gate.sh:299` refuses the same combination by name.
+
+    (c) AND THE REASON SURVIVES TO THE RECORD. A refusal that reaches a reader as a bare
+        `unmeasured` with no cause cannot be acted on, and this path is REACHABLE — an unparsable
+        timestamp on a shallow queue is exactly it. The counts the sample already measured must
+        survive it too: `--json` reporting the depth as absent is the round-7 defect.
     """
     with Env():
-        box = Box("queue-age-page")
+        box = Box("queue-age-refusals")
         try:
+            # (a) the saturated page — the reader, driven directly.
+            box.apply()
+            box.queue_age(60)
+            box.queue_age_overflow(150)
+            try:
+                ra.read_oldest_queued_age_s("daniel-ospina/tortoise")
+            except ra.Unmeasurable as exc:
+                contains(str(exc), "LOWER BOUND", "the refusal must name WHY the min is not the head")
+                contains(str(exc), "150", "…and the depth it could not measure")
+            else:
+                raise Failure(
+                    "a saturated page must be REFUSED, not read as an age — the minimum of a page "
+                    "that cannot hold the queue is only a lower bound on the head"
+                )
+
+            # (b) a page with no readable `created_at` on a queue that HAS runs.
+            box.queue_age(None)
+            box.queue_age_empty()
+            box.queue_age_overflow(53)
+            try:
+                age = ra.read_oldest_queued_age_s("daniel-ospina/tortoise")
+            except ra.Unmeasurable as exc:
+                contains(str(exc), "53", "the refusal names how many runs are waiting")
+                contains(
+                    str(exc),
+                    "not an empty queue",
+                    "…and states that this is NOT the empty-queue answer, which is what `None` means",
+                )
+            else:
+                raise Failure(
+                    f"an unreadable created_at on a queue with 53 runs must not read as an empty "
+                    f"queue (returned {age!r}) — `None` DISARMS the age term"
+                )
+            # …and the genuine empty queue still answers None, or the guard would break the healthy
+            # case: no runs at all is `total_count=0` with an empty page, which IS "nothing waiting".
+            box.queue_age_empty()
+            box.queue_age_overflow(0)
+            check(
+                ra.read_oldest_queued_age_s("daniel-ospina/tortoise") is None,
+                "an EMPTY queue is still `None` — the refusal must not swallow the one true answer",
+            )
+
+            # (c) the refusal reaches the RECORD with its cause and the counts it did measure.
+            box.queue_age_empty(None)
+            box.queue_age_overflow(None)
+            box.queue_age_raw("not-a-timestamp")
             box.install("gh-runner-x64", "r-1")
             box.alive([box.installs["gh-runner-x64"]])
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
             box.queued(53)
-            # The page's minimum is ONE MINUTE old — young enough to read as a served backlog — while
-            # the queue is 150 deep against a 100-run page. Certifying that reading is the fail-open.
-            box.queue_age(60)
-            box.queue_age_overflow(150)
             record = converge(box, nproc="2", dry_run=True)
             check(
                 record.get("starvation") == "unmeasured",
-                f"a saturated page cannot measure the head, so it must not certify `ok`: "
-                f"{record.get('starvation')} / {record.get('starvation_why')}",
+                f"an unreadable queue head cannot certify `ok`: {record.get('starvation')}",
             )
             check(
                 record.get("starvation_eligible") is None,
-                f"…and it must not be ELIGIBLE either way on an unread operand: "
-                f"{record.get('starvation_eligible')}",
+                f"…nor may it claim eligibility either way: {record.get('starvation_eligible')}",
             )
-            why = record.get("starvation_why") or ""
-            contains(why, "LOWER BOUND", "the refusal must name WHY the page's min is not the head")
-            contains(why, "150", "…and the depth it could not measure, so the operator can act")
+            contains(
+                record.get("starvation_why") or "",
+                "created_at",
+                "the refusal must carry its cause to the record, not a bare `unmeasured`",
+            )
+            check(
+                record.get("queued_runs") == 53,
+                f"and the depth the sample DID measure must survive the failed read — `--json` "
+                f"reporting it as absent is the round-7 defect: {record.get('queued_runs')}",
+            )
         finally:
             box.destroy()
 
@@ -4247,8 +4339,9 @@ MUTATIONS = [
         "    if total > QUEUE_AGE_PAGE:",
         "    if False:  # MUTATION: a saturated page is certified",
         "`min()` over a page that cannot hold the whole queue is only a LOWER BOUND on the head's "
-        "age, so a deep stalled queue certifies healthy and the pool is stripped during a full stop "
-        "— the state `ci_runner_gate.sh:319-324` refuses by name for this same read",
+        "age, which can only UNDERSTATE it — the direction that silences a starved-queue alarm. "
+        "`ci_runner_gate.sh:319-324` refuses this state by name for this same read; the two cross "
+        "when the gate's operator-settable threshold rises above this tool's page size",
     ),
     Mutation(
         "T56",
@@ -4256,6 +4349,29 @@ MUTATIONS = [
         "        elif False:  # MUTATION: an unmeasured starvation term carries no reason",
         "a refused age read reaches a reader as a bare `starvation=unmeasured` with no reason, so an "
         "operator cannot tell a saturated page from an unparsable timestamp from a failed `gh`",
+    ),
+    Mutation(
+        "T56",
+        "        if total == 0:\n            return None\n        raise Unmeasurable(",
+        "        return None  # MUTATION: an empty page is read as an empty queue\n        raise Unmeasurable(",
+        "a queue whose head has no readable `created_at` answers `None`, i.e. \"nothing is "
+        "waiting\" — which DISARMS the age term entirely, so a backlog reports an idle queue. "
+        "The shared gate refuses the same combination by name (`ci_runner_gate.sh:299`)",
+    ),
+    Mutation(
+        "T56",
+        "        if measured:\n            out.update(measured)\n        if seen:",
+        "        if seen:",
+        "a refused AGE read erases the counts the sample already measured, so `--json` reports the "
+        "depth as absent on exactly the passes an operator needs to explain — the round-7 "
+        "defect, where the field `origin/main` publishes went missing",
+    ),
+    Mutation(
+        "T48",
+        "        lost = _restore_local_config(directory, stash)\n        if lost:\n            raise ActionFailed(\n                f\"{exc} — AND ",
+        "        lost: list[str] = []  # MUTATION: a failed restore during a signal goes unreported\n        if lost:\n            raise ActionFailed(\n                f\"{exc} — AND ",
+        "the stash is never put back on the signal path at all, and a restore that fails is silent: "
+        "the install loses `.runner`/credentials while the process exits 143 as if they came back",
     ),
     Mutation(
         "T48",
@@ -4484,6 +4600,7 @@ MUTATIONS = [
         "            pool, queued = sample()\n"
         "            busy = sum(1 for e in pool.values() if e.busy)\n"
         "            online = sum(1 for e in pool.values() if e.online)\n"
+        "            measured = {\"queued\": queued, \"busy\": busy, \"online\": online}\n"
         "            eligible, why, age = decide(pool, queued, busy, online)\n"
         "            seen = {",
         "            pass  # MUTATION: the second sample is thrown away\n"

@@ -787,6 +787,17 @@ def read_oldest_queued_age_s(repo: str) -> float | None:
     take `min(created_at)`. A page that cannot hold the whole queue yields only a LOWER BOUND on the
     head age, so it is REFUSED by name rather than certified — same verdict, `Unmeasurable`, as every
     other operand that could not be read.
+
+    ⛔ THAT REFUSAL IS DEFENSIVE, AND ITS RATIONALE IS STATED RATHER THAN IMPLIED (round-13 review,
+    2nd round). The age read is only taken when the DEPTH term has not already decided, i.e. when
+    `queued < GATE_QUEUE_THRESHOLD` (60) — and `QUEUE_AGE_PAGE` is 100. So at the shipped constants a
+    saturated page cannot arise here, and the `total` this read sees always equals the `queued` the
+    depth term already declined to alarm on. It is kept because the two numbers are INDEPENDENT (the
+    gate's threshold is operator-settable while its counterpart here is a module constant), and
+    because certifying a lower bound is the one error this function must not make in either
+    direction: if the two ever cross, the refusal is what stands between a full stop and a healthy
+    reading. Its case pins the guard at the unit boundary rather than through an end-to-end state
+    this tool cannot produce — see T56.
     """
     gh = gh_bin()
     if not gh:
@@ -820,7 +831,18 @@ def read_oldest_queued_age_s(repo: str) -> float | None:
             "be measured"
         )
     if not raw:
-        return None
+        # ⛔ AN EMPTY PAGE IS NOT AN EMPTY QUEUE (round-13 review, 2nd round). The docstring above
+        # promises that `None` means "nothing is waiting"; returning it on `total > 0` would be
+        # exactly the disarmed term that paragraph forbids — the age is only consulted when
+        # `queue_age_s is not None`, so a null/absent `created_at` on a queue that HAS work would
+        # report "nothing is waiting". `ci_runner_gate.sh:299` refuses this same combination BY NAME
+        # ("A queued run exists, so its age MUST be a measurement").
+        if total == 0:
+            return None
+        raise Unmeasurable(
+            f"{total} queued run(s) but the page carries no readable created_at — the queue head "
+            "cannot be measured, and that is not an empty queue"
+        )
     try:
         created = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -977,10 +999,18 @@ def starvation_probe(
         return eligible, why, age
 
     seen: dict[str, object] = {}
+    # ⛔ THE COUNTS ARE AN OBSERVATION OF A COMPLETE SAMPLE, SO THEY OUTLIVE A LATER READ'S FAILURE
+    # (round-13 review, 2nd round). `seen` cannot carry them on that path because it is built from
+    # `decide()`'s RETURN VALUE, and the AGE read happens INSIDE `decide()` — so a refused age erased
+    # counts that had already been measured, and `converge`'s `if "queued" in starvation:` then
+    # published no `queued_runs` at all, i.e. the round-7 contract (`--json` must not report the
+    # depth as absent) broke on exactly the passes an operator needs to explain.
+    measured: dict[str, object] = {}
     try:
         pool, queued = sample()
         busy = sum(1 for e in pool.values() if e.busy)
         online = sum(1 for e in pool.values() if e.online)
+        measured = {"queued": queued, "busy": busy, "online": online}
         eligible, why, age = decide(pool, queued, busy, online)
         seen = {
             "queued": queued,
@@ -999,6 +1029,7 @@ def starvation_probe(
             pool, queued = sample()
             busy = sum(1 for e in pool.values() if e.busy)
             online = sum(1 for e in pool.values() if e.online)
+            measured = {"queued": queued, "busy": busy, "online": online}
             eligible, why, age = decide(pool, queued, busy, online)
             seen = {
                 "queued": queued,
@@ -1011,9 +1042,12 @@ def starvation_probe(
             starved = starvation_invariant(queued, busy, online) and eligible
     except Unmeasurable as exc:
         out: dict[str, object] = {"state": "unmeasured", "detail": str(exc)}
+        # ⛔ `seen` IS THE COMPLETE PICTURE (counts AND the eligibility answer); `measured` is the
+        # subset that survives when the AGE read inside `decide()` refused. Publishing the latter is
+        # what keeps `--json` honest on that path — `seen` alone was the reason the depth went absent.
+        if measured:
+            out.update(measured)
         if seen:
-            # ⛔ THE EVIDENCE OUTLIVES THE FAILED CONFIRMATION — and the `seen` dict is only populated
-            # by a COMPLETE sample, so "partially read" never masquerades as an observation.
             out.update(seen)
             out["confirm_error"] = str(exc)
         return out
@@ -1628,14 +1662,26 @@ def _clear_local_config(directory: Path) -> dict[str, tuple[int, bytes]]:
                 else ""
             )
         ) from exc
-    except BaseException:
+    except BaseException as exc:
         # ⛔ A SIGNAL IS THE OTHER WAY THIS LOOP ENDS HALFWAY, AND IT IS NOT AN `OSError` (round-13
         # review finding P2). `_term_as_exit` raises `SystemExit`, which the `OSError` arm above does
         # not catch, so a SIGTERM landing between two `unlink()` calls would unwind PAST this function
         # and drop the stash it is holding — the install left with `.runner`/`.credentials` deleted, no
         # record of what they were, and no restore. Restore here and re-raise: the caller's own
         # `finally` still gets its unwind, and the files this loop already took go back first.
-        _restore_local_config(directory, stash)
+        # ⛔ AND A RESTORE THAT FAILS ON THIS PATH IS REPORTED, LIKE THE `OSError` ARM ABOVE
+        # (round-13 review, 2nd round). `_restore_local_config` RETURNS its failures rather than
+        # raising, so discarding the value would leave the install without `.runner`/credentials and
+        # say nothing, while the process exits 143 as if the stash came back. The signal's exit code
+        # is worth less than the record: an ENOSPC during a kill is exactly when an operator must be
+        # told the install may no longer be discoverable.
+        lost = _restore_local_config(directory, stash)
+        if lost:
+            raise ActionFailed(
+                f"{exc} — AND {len(lost)} of {len(stash)} stashed config file(s) could NOT be put "
+                f"back ({'; '.join(lost)}), so this install may no longer be discoverable: check it "
+                "before the next pass adds a second one over the top"
+            ) from exc
         raise
     return stash
 
