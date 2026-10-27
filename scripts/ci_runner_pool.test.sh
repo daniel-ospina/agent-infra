@@ -311,6 +311,12 @@ fresh_pool() { RUNNER_ROOT="$T/root-$1"; export RUNNER_ROOT; rm -rf "$RUNNER_ROO
 # register <name> — what a hand-provisioned runner looks like: a complete install with `.runner` and
 # NO pid file of ours. This is the migration population (two such runners were the incident).
 register() { cp -a "$TEMPLATE" "$RUNNER_ROOT/$1"; : >"$RUNNER_ROOT/$1/.runner"; }
+# orphanize <name> — model a registration GITHUB DELETED: its start IS refused (the stub prints
+# GitHub's own line and exits 0, the measured shape). ⛔ A FIXTURE THAT EXPECTS A RETIREMENT MUST
+# CALL THIS (#2892 review round 3, P1): a log line on its own is no longer proof — `reclaim` starts
+# the listener and believes only a refusal it dated ITSELF, because a skew-era line survives a clock
+# that was later corrected (actions/runner#4648).
+orphanize() { : >"$RUNNER_ROOT/$1/.orphan"; }
 
 # ══ 1. ADD above the floor: a complete install per instance, configured THERE ════════════════
 echo "── add: above the floor ──"
@@ -1580,7 +1586,8 @@ assert_eq "$(grep -cF 'restarted name=' <<<"$out")" "0" "it does NOT report a re
 # ── reclaim: PREVIEW, then RETIRE ────────────────────────────────────────────────────────────
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim --dry-run)"
 assert_eq "$?" "0" "a dry-run retire pass exits 0"
-assert_contains "$out" "dry-run: would retire name=pi-runner-cell4-x64-1 agent_id=35" "it announces what it would retire"
+assert_contains "$out" "dry-run: would START name=pi-runner-cell4-x64-1 agent_id=35" \
+  "it announces the VERIFICATION it would run (a dry run cannot prove a retire, so it does not promise one)"
 assert_file "$RUNNER_ROOT/pi-runner-orph/.runner" "and a preview deleted NOTHING"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
 assert_eq "$?" "0" "reclaim exits 0 when it retired what it found"
@@ -1638,6 +1645,7 @@ echo "── reclaim: retire the stale install, never the live holder of its nam
 fresh_pool sibling; reset_logs
 register pi-runner-live
 register pi-runner-stale
+orphanize pi-runner-stale
 for d in pi-runner-live pi-runner-stale; do
   printf '{\n  "agentId": 47,\n  "agentName": "pi-runner-sibname"\n}\n' >"$RUNNER_ROOT/$d/.runner"
 done
@@ -1665,6 +1673,7 @@ echo "── reclaim: an unreadable sibling name makes the name UNVERIFIED, neve
 fresh_pool sibunknown; reset_logs
 register pi-runner-uu
 register pi-runner-us
+orphanize pi-runner-us
 printf '{}\n' >"$RUNNER_ROOT/pi-runner-uu/.runner"
 printf '{\n  "agentId": 9,\n  "agentName": "shared-nm"\n}\n' >"$RUNNER_ROOT/pi-runner-us/.runner"
 printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
@@ -1677,6 +1686,82 @@ case "$out" in
 esac
 assert_absent "$RUNNER_ROOT/pi-runner-us" "the retire still happened (evidence + clock are its guards, not this one)"
 
+# ── AN UNREADABLE *OWN* NAME IS UNVERIFIED TOO (round 3, P1) ────────────────────────────────
+# Guard 3 compares the retiring install's name against the pool. An unreadable OWN name used to SKIP
+# the guard entirely and leave `sib_unknown=0`, so the pass printed "the name is free again; run: add
+# --name <basename>" — the exact instruction that DELETES whichever live runner holds that basename.
+# Reachable with no exotic permissions: `add` accepts an EMPTY `.runner` as proof of registration, so
+# a `{}` marker sends a real install down this path.
+echo "── reclaim: an UNREADABLE own name never prints the re-register advice ──"
+fresh_pool ownunknown; reset_logs
+register pi-runner-own
+register pi-runner-ownholder
+printf '{}\n' >"$RUNNER_ROOT/pi-runner-own/.runner"
+printf '{\n  "agentId": 42,\n  "agentName": "pi-runner-own"\n}\n' >"$RUNNER_ROOT/pi-runner-ownholder/.runner"
+orphanize pi-runner-own
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-own/listener.log"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-ownholder)" "0" \
+  "baseline: the runner holding the BASENAME name is LIVE"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_contains "$out" "the name is UNVERIFIED" \
+  "an unreadable OWN name proves as little as an unreadable sibling's, so the name is UNVERIFIED"
+case "$out" in
+  *"the name is free again"*) bad "it still printed 'the name is free again' over an unreadable OWN name";;
+  *) ok "and the pass never prints 'run: add --name <basename>' on an unproven own name";;
+esac
+assert_absent "$RUNNER_ROOT/pi-runner-own" "the retire itself still happened (a fresh refusal + the clock are its guards)"
+pkill -f -- "$RUNNER_ROOT/pi-runner-ownholder/bin/Runner.Listener" 2>/dev/null || true
+
+# ── A LIVE HOLDER IN A QUARANTINE DIR IS STILL A HOLDER (round 3, P2) ───────────────────────
+# `registered_dirs` excludes `*.retired-*` BY NAME (correct: a retired runner must never re-enter
+# capacity), so a listener still RUNNING on a quarantined install was invisible to guard 3 — while this
+# file gives that state its own `status` row (LIVE-QUAR). Guard 3 enumerates quarantine names for the
+# HOLDER SCAN ONLY; capacity is never counted from them.
+echo "── reclaim: a LIVE listener in a QUARANTINE dir still holds its name ──"
+fresh_pool quarholder; reset_logs
+register pi-runner-hq
+register pi-runner-hshared
+for d in pi-runner-hq pi-runner-hshared; do
+  printf '{\n  "agentId": 71,\n  "agentName": "qname"\n}\n' >"$RUNNER_ROOT/$d/.runner"
+done
+mv "$RUNNER_ROOT/pi-runner-hshared" "$RUNNER_ROOT/pi-runner-hshared.retired-20260101T000000Z"
+qdir="$RUNNER_ROOT/pi-runner-hshared.retired-20260101T000000Z"
+assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of restart --name pi-runner-hshared.retired-20260101T000000Z)" "0" \
+  "baseline: a listener IS running on the quarantined install"
+orphanize pi-runner-hq
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-hq/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass retires the orphaned install"
+assert_contains "$out" "kept=$qdir" \
+  "guard 3 sees the LIVE holder inside the quarantine dir (it is a holder, not capacity)"
+assert_contains "$out" "nothing was re-registered" "so it never advises re-registering that name"
+assert_file "$qdir/.runner" "the quarantined install is untouched"
+pkill -f -- "$qdir/bin/Runner.Listener" 2>/dev/null || true
+
+# ── A STALE DELETION LINE DOES NOT AUTHORISE A DELETE IF THE REGISTRATION ANSWERS (round 3, P1) ──
+# actions/runner#4648, measured: a box with an unsynchronised clock starts its runner, GitHub refuses
+# the session, the runner prints the SAME "registration has been deleted" line and EXITS PERMANENTLY.
+# NTP then corrects the clock. The newest log is still the skew-era line, so a log-only retire deletes a
+# HEALTHY registration (its GitHub registration survives holding the name, and the re-register advice
+# then DELETES it). `reclaim` therefore STARTS the listener and retires only on a refusal it dated
+# ITSELF — the only evidence a clock that was wrong yesterday cannot have written.
+echo "── reclaim: a skew-era line over a registration that STILL ANSWERS is a revival, not a retire ──"
+fresh_pool skewline; reset_logs
+register pi-runner-skewline
+printf '{\n  "agentId": 61,\n  "agentName": "pi-runner-skewline"\n}\n' >"$RUNNER_ROOT/pi-runner-skewline/.runner"
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-skewline/listener.log"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
+assert_eq "$?" "0" "the pass exits 0"
+assert_contains "$out" "revived name=pi-runner-skewline" \
+  "the listener STARTED and SURVIVED, so the old line was a skew artifact and nothing was deleted"
+assert_contains "$out" "reclaim: retired=0 preserved=0 revived=1" "the summary counts a REVIVAL, not a retire"
+assert_file "$RUNNER_ROOT/pi-runner-skewline/.runner" "the healthy registration is untouched"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-skewline")" "1" "and it is serving jobs again"
+pkill -f -- "$RUNNER_ROOT/pi-runner-skewline/bin/Runner.Listener" 2>/dev/null || true
+
 # ── THE NEWEST LOG DECIDES ──────────────────────────────────────────────────────────────────
 # A log accumulates across every start in ONE registration's life, so "some line in some file" is not
 # evidence about the CURRENT state. GitHub prints the identical deletion line when session creation
@@ -1687,6 +1772,7 @@ assert_absent "$RUNNER_ROOT/pi-runner-us" "the retire still happened (evidence +
 echo "── reclaim: a NEWER log showing a later start VETOES older evidence ──"
 fresh_pool newest; reset_logs
 register pi-runner-veto
+orphanize pi-runner-veto
 printf '{\n  "agentId": 77,\n  "agentName": "pi-runner-veto"\n}\n' >"$RUNNER_ROOT/pi-runner-veto/.runner"
 touch -t 202601010000 "$RUNNER_ROOT/pi-runner-veto/.runner" 2>/dev/null || true
 printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
@@ -1727,10 +1813,23 @@ out="$(RUNNER_START_SETTLE_S=3 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart -
 assert_eq "$?" "2" "a fresh death with no evidence from THIS attempt is cannot-act (rc 2), never rc 6"
 assert_contains "$out" "why=listener-exited" "naming the reason instead of asserting an orphan"
 assert_file "$RUNNER_ROOT/pi-runner-att/.runner" "and the install is STILL a registration (rc 6 would have retired it)"
-# CONTROL: the same line written by THIS attempt is evidence, so the scoping above is not a mute test.
-printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
-  >"$RUNNER_ROOT/pi-runner-att/_diag/Runner_20260101-030000-utc.log"
-printf '#!/usr/bin/env bash\nsleep 1.5\nexit 1\n' >"$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener"
+# CONTROL: the same line, this time written BY THIS ATTEMPT (its own listener prints it, as the real one
+# does — into `listener.log` past the pre-start byte offset), IS evidence. ⛔ The control must produce the
+# line DURING the attempt: a `_diag` file written just before the start is `mt < started` and is excluded
+# by the start-time bound, which is the whole point of that bound (#2892 review round 3, P2 — this control
+# used to write it before the start and passed only because the bound was inert on `skip=0`).
+# ⛔ WHAT MAKES THE ARM ABOVE HOLD is the NEWEST-LOG rule, and this fixture says so rather than claiming
+# the start-time bound is what does it: the attempt's own (empty) `listener.log` is newer than the stale
+# `_diag`, so it vetoes. The start-time bound is DEFENCE IN DEPTH for the sources a byte offset cannot
+# scope (`_diag/Runner_*.log` is a separate file per attempt) — it is kept because it is correct, not
+# because this fixture can show it is load-bearing.
+cat >"$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener" <<'STUB'
+#!/usr/bin/env bash
+sleep 1
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n'
+exit 0
+STUB
+chmod +x "$RUNNER_ROOT/pi-runner-att/bin/Runner.Listener"
 out="$(RUNNER_START_SETTLE_S=3 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-att)"
 assert_eq "$?" "6" "control: a line written DURING this attempt IS evidence (rc 6)"
 assert_contains "$out" "orphaned name=pi-runner-att" "control: and it names the orphan"
@@ -1786,6 +1885,7 @@ assert_contains "$out" "reclaimed=0" "and nothing left to retire"
 echo "── reclaim: a partial removal is QUARANTINED and stays visible ──"
 fresh_pool quarantine; reset_logs
 register pi-runner-q
+orphanize pi-runner-q
 printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
   >"$RUNNER_ROOT/pi-runner-q/listener.log"
 if [ "$(id -u)" -eq 0 ]; then
@@ -1796,7 +1896,7 @@ else
   out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
   assert_eq "$?" "0" "the pass exits 0: the registration WAS retired, which is what it promised"
   assert_contains "$out" "quarantined dir=$RUNNER_ROOT/pi-runner-q.retired-" "naming the bytes it could not remove"
-  assert_contains "$out" "reclaim: retired=1 preserved=0 live=0 quarantined=1" "and counting the quarantine"
+  assert_contains "$out" "reclaim: retired=1 preserved=0 revived=0 live=0 quarantined=1" "and counting the quarantine"
   assert_absent "$RUNNER_ROOT/pi-runner-q" "the pool no longer has the install at its registered path"
   assert_eq "$(ls -d "$RUNNER_ROOT"/pi-runner-q.retired-* 2>/dev/null | wc -l)" "1" "the leftovers are named on disk"
   # THE POINT OF THE RENAME: those bytes are invisible to nothing. `status` names them, and they are NOT
@@ -1836,6 +1936,7 @@ assert_eq "$(grep -cF 'ORPHANED' <<<"$out")" "0" "no ORPHANED row for it"
 echo "── reclaim: the evidence survives a log far larger than the pipe buffer ──"
 fresh_pool biglog; reset_logs
 register pi-runner-biglog
+orphanize pi-runner-biglog
 printf '{\n  "agentId": 55,\n  "agentName": "pi-runner-biglog"\n}\n' >"$RUNNER_ROOT/pi-runner-biglog/.runner"
 { printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n'
   i=0; while [ "$i" -lt 3000 ]; do printf 'INFO ordinary runner chatter line %s padding padding padding\n' "$i"; i=$((i + 1)); done
@@ -1939,6 +2040,7 @@ assert_eq "$(grep -cF 'add --name' <<<"$out")" "0" "it never advises re-register
 echo "── mutation: the orphan evidence is what authorises the delete ──"
 fresh_pool mutretire; reset_logs
 register pi-runner-mut-orph
+orphanize pi-runner-mut-orph
 printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
   >"$RUNNER_ROOT/pi-runner-mut-orph/listener.log"
 MUT_R="$T/mutant-retire-ci_runner_pool.sh"

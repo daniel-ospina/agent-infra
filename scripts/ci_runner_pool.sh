@@ -424,7 +424,14 @@ orphan_evidence_file() {
     # A line older than the registration is not evidence about it (in-place re-registration).
     [ "$mt" -ge "$born" ] || continue
     # A FRESH attempt may only read what its own attempt produced — on EVERY source (review finding a).
-    if [ "$skip" -gt 0 ] && [ "$started" -gt 0 ] && [ "$mt" -lt "$started" ]; then continue; fi
+    # ⛔ THE START-TIME BOUND IS GATED ON `started` ALONE, NEVER ON `skip` (#2892 review round 2, P2).
+    # `skip` is the pre-start BYTE LENGTH OF `listener.log`, so on any install where that file did not
+    # exist before the start — every systemd install, whose log lives only in `_diag`, and every fixture
+    # that registers its own log — `skip` is 0 and the bound was INERT exactly where it was needed: the
+    # `_diag` source is a SEPARATE file per attempt, so it is not scoped by a byte offset at all. The two
+    # sources need two different bounds, and each is applied to its own source: byte offset to
+    # `listener.log`, start time to every other file.
+    if [ "$started" -gt 0 ] && [ "$c" != "$d/listener.log" ] && [ "$mt" -lt "$started" ]; then continue; fi
     if [ "$skip" -gt 0 ] && [ "$c" = "$d/listener.log" ]; then
       # ⛔ NO `| grep -q` (#2892 review, P1). `grep -q` exits at the first match, `tail` then dies of
       # SIGPIPE, and under this file's `set -o pipefail` the PIPELINE returns 141 — so the `if` was
@@ -1187,7 +1194,7 @@ cmd_restart() {
 #      precise bug that created this orphan. The stale install is removed; the name is left alone.
 #   4. IT NEVER TOUCHES A LIVE LISTENER, and `--dry-run` deletes nothing.
 cmd_reclaim() {
-  local name="" only=0 dirs="" d nm aid rc ev retired=0 preserved=0 live=0 cannot=0 skew="" clock_checked=0 sib="" sib_unknown=0 q="" removed=1 qn=0
+  local name="" only=0 dirs="" d nm aid rc ev retired=0 preserved=0 live=0 cannot=0 skew="" clock_checked=0 sib="" sib_unknown=0 q="" removed=1 qn=0 revived=0 vrc=0 verout="" sib_scan=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) take_name_value reclaim "$#" "${2:-}" || return 1; name="${2:-}"; only=1; shift 2 ;;
@@ -1246,8 +1253,17 @@ cmd_reclaim() {
         return 3
       fi
     fi
-    nm="$(registration_name "$d")"; [ -n "$nm" ] || nm="?"
+    nm="$(registration_name "$d")"
     aid="$(registration_agent_id "$d")"; [ -n "$aid" ] || aid="?"
+    sib=""; sib_unknown=0
+    # ⛔ AN UNPROVEN *OWN* NAME IS "UNVERIFIED" TOO — NOT "NOTHING HOLDS IT" (#2892 review round 3, P1).
+    # Guard 3 compares the retiring install's name against the pool, so an unreadable OWN name used to
+    # skip the whole guard (`if [ "$nm" != "?" ]`) and leave `sib_unknown=0` — which printed "the name
+    # is free again; run: add --name <basename>", the exact instruction that DELETES whichever live
+    # runner holds that name. Reachable without exotic permissions: `add` accepts an EMPTY `.runner` as
+    # proof of registration (`-f` only), so a `{}` marker sends a real install down this path. An
+    # unknown own name proves as little as an unknown sibling's, so it takes the same verdict.
+    if [ -z "$nm" ]; then nm="?"; sib_unknown=1; fi
     # The name to provision again is the GITHUB name when it was readable (that is what GitHub holds),
     # and this directory's own name otherwise — `add --name '?'` is not a usable instruction.
     local next="$nm"; valid_name "$next" || next="$(basename "$d")"
@@ -1263,15 +1279,27 @@ cmd_reclaim() {
     # || continue` therefore DROPPED that entry before liveness was asked — so an unreadable holder
     # vanished from the check, `sib` stayed empty, and the pass printed "the name is free again; run:
     # add". An unreadable probe (rc 2) was read the same way. Both now mark the name UNVERIFIED, which
-    # suppresses the re-register advice: the retire itself is still guarded by evidence + the clock, but
-    # the one instruction that can delete a working runner is never printed on a guess.
-    sib=""; sib_unknown=0
+    # suppresses the re-register advice: the retire itself is still guarded by a fresh refusal + the
+    # clock, but the one instruction that can delete a working runner is never printed on a guess.
+    # ⛔ AND THE HOLDER MAY BE SITTING IN A QUARANTINE DIRECTORY (#2892 review round 3, P2). `registered_dirs`
+    # excludes `*.retired-*` BY NAME (correct — a retired runner must never re-enter capacity), so a
+    # listener still RUNNING on a quarantined install was invisible to guard 3 — while this very file
+    # gives that state its own `status` row (LIVE-QUAR) and `valid_name`'s comment concedes such a dir
+    # "can still hold a RUNNING registration". It is enumerated here for the HOLDER SCAN ONLY, by the
+    # same globs `status` uses; capacity is never counted from it.
+    sib_scan=""
     if [ "$nm" != "?" ]; then
-      local e plist en prc
+      local e plist en prc qd qlist
       if ! plist="$(registered_dirs)"; then
         err "cannot-measure why=runner-root-unreadable path=$RUNNER_ROOT (the LIVE-holder check could not list the pool, so this pass cannot tell whether re-registering $nm would delete a working runner; nothing was retired)"
         cannot=$((cannot + 1)); continue
       fi
+      qlist=""
+      for qd in "$RUNNER_ROOT"/*.retired-* "$RUNNER_ROOT"/.[!.]*.retired-*; do
+        [ -d "$qd" ] || [ -L "$qd" ] || continue
+        qlist="$qlist$( [ -n "$qlist" ] && printf '\n' )$qd"
+      done
+      sib_scan="$(printf '%s\n%s' "$plist" "$qlist")"
       while read -r e; do
         [ -n "$e" ] || continue
         [ "$e" = "$d" ] && continue
@@ -1281,7 +1309,7 @@ cmd_reclaim() {
         prc=0; probe_listener "$e" >/dev/null 2>&1 || prc=$?
         if [ "$prc" -eq 0 ]; then sib="$e"; break; fi
         [ "$prc" -eq 2 ] && sib_unknown=1
-      done <<<"$plist"
+      done <<<"$sib_scan"
       if [ -z "$sib" ] && ! outside="$(outside_listener_dirs)"; then
         err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT (the LIVE-holder check could not enumerate listeners outside the root; nothing was retired)"
         cannot=$((cannot + 1)); continue
@@ -1297,11 +1325,36 @@ cmd_reclaim() {
         done <<<"$outside"
       fi
     fi
+    # ⛔ THE RETIREMENT NEEDS A REFUSAL PRODUCED UNDER THE CLOCK WE JUST VERIFIED — NOT AN OLD LINE
+    # (#2892 review round 3, P1). The check above proves this box's clock is sane NOW; the deletion line
+    # in the log was written EARLIER, by a clock nobody verified and cannot now be dated. On
+    # actions/runner#4648's measured shape the runner prints that line, EXITS PERMANENTLY and is never
+    # restarted — so after NTP corrects the clock the newest log is STILL the skew-era line, the install
+    # is DEAD and the registration is HEALTHY at the same time, and retiring on that line deletes a
+    # working runner (its registration survives on GitHub holding the name, and the re-register advice
+    # then DELETES it). `reconcile` already refuses to trust the log — it starts the listener and believes
+    # rc 6 — and the verb that DELETES must hold itself to the same standard. It is also the only standard
+    # that works: the refusal is dated to THIS pass, so the skew cannot have written it.
+    # A start that comes up and SURVIVES is a REPAIR, not a retire: the registration answers GitHub, and
+    # the old line was a skew artifact. Anything that cannot be proven either way is cannot-act.
     if [ "$DRY" = 1 ]; then
-      say "dry-run: would retire name=$nm agent_id=$aid dir=$d evidence=$ev$([ -n "$sib" ] && printf ' (name kept: LIVE at %s)' "$sib")"
+      say "dry-run: would START name=$nm agent_id=$aid dir=$d evidence=$ev and retire it only if GitHub refuses the session — a dry run starts nothing and deletes nothing, so it cannot prove either outcome"
       retired=$((retired + 1))
       continue
     fi
+    vrc=0; verout="$(start_listener "$d" 2>&1)" || vrc=$?
+    case "$vrc" in
+      0)
+        revived=$((revived + 1))
+        say "revived name=$nm agent_id=$aid dir=$d — the listener started and SURVIVED the settle window, so this registration still answers GitHub: the 'deleted' line in its log is NOT evidence (a skewed clock prints the same line — actions/runner#4648) and nothing was deleted"
+        continue ;;
+      6)
+        say "verified name=$nm agent_id=$aid dir=$d — GitHub refused a session started in THIS pass, under the clock measured here (skew=${skew}s bound=${MAX_SKEW_S}s): the retirement rests on a refusal it dated itself, not on an old log line" ;;
+      *)
+        cannot=$((cannot + 1))
+        say "$verout"
+        continue ;;
+    esac
     # ⛔ RENAME FIRST, DELETE SECOND — MEASURED, AND THE REASON THIS IS NOT ONE `rm -rf` (#2620).
     # On `pi-cell-4` the real retirement failed halfway: systemd had written `_diag` as root, so
     # `rm -rf` hit EACCES AFTER it had already unlinked `.runner`. The pass correctly reported
@@ -1329,8 +1382,8 @@ cmd_reclaim() {
       say "quarantined dir=$q — the registration is OUT of the pool, but its files could not be removed (a root-owned file inside, usually systemd's _diag): run: rm -rf \"$q\" as the account that owns them; this path is excluded from slots and from every later pass, and status keeps naming it until it is gone"
     fi
   done <<<"$dirs"
-  printf 'reclaim: retired=%s preserved=%s live=%s quarantined=%s cannot=%s clock_skew=%s bound=%ss dry_run=%s\n' \
-    "$retired" "$preserved" "$live" "$qn" "$cannot" "${skew:-unmeasured}" "$MAX_SKEW_S" "$DRY"
+  printf 'reclaim: retired=%s preserved=%s revived=%s live=%s quarantined=%s cannot=%s clock_skew=%s bound=%ss dry_run=%s\n' \
+    "$retired" "$preserved" "$revived" "$live" "$qn" "$cannot" "${skew:-unmeasured}" "$MAX_SKEW_S" "$DRY"
   # ⛔ rc 3 IS REACHABLE ONLY BEFORE THE LOOP (a name with no registration, or a refused clock): the
   # two verdicts inside the loop are cannot-act (2), because they are facts about what could not be
   # read or done, not gate verdicts about the box. There is deliberately no `refused` counter — and no
