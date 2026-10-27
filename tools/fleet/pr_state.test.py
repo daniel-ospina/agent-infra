@@ -40,8 +40,11 @@ WHAT IS PINNED, AND THE DEFECT EACH RULE PREVENTS
   short-sha             a short/partial recorded sha never binds a full head.
   marker-only           an attestation on the PR body but not in this box's store is NOT ready: the
                         rail's gate reads the store, so LAND here would be a false ready.
-  flake-evidence        RERUN-FLAKE only on positive evidence — the same group passing on an earlier
-                        attempt at the SAME head.
+  flake-evidence        RERUN-FLAKE only on positive evidence — the same group PASSING on an earlier
+                        attempt at the SAME head. `cancelled`/`stale` are non-red for the verdict but
+                        are not passes, so they are not evidence (a "passed on an earlier attempt"
+                        claim withholds a real red from repair: the fixer declines, the lander
+                        waits). This arm used to accept them.
   flake-bound           a group that has already been retried is a defect, not another re-run.
   inherited-red         a red that main's head also carries is not this tree's to fix.
   suppress-in-flight    ONLY `queued` runs are cancelled; a run re-read as in_progress is never
@@ -51,6 +54,16 @@ WHAT IS PINNED, AND THE DEFECT EACH RULE PREVENTS
   unreadable-board      an unreadable listing exits 2 — an unreadable board is never "no open PRs".
   pagination            `--paginate` emits one JSON object per PAGE; a two-page answer must not be
                         read as half a surface.
+  no-check-surface      an empty (but READ) check surface is WAIT:no-check-surface and never LAND — and
+                        it carries the empty surface's own reason, not "could not be read".
+  in-flight             a surface with anything still running is WAIT:in-flight, never LAND. Together
+                        with the arm above this is the last thing between "nothing read yet" and a
+                        merge; neither was pinned when the reviewer found them.
+  mergeable-unknown     a mergeability GitHub has not computed is a WAIT, never a guessed MERGEABLE.
+  queued-unreadable     an unreadable queued-run inventory renders `?`, never `0` (the code's comment
+                        claimed this; the code printed 0, which is also `--suppress`'s before= figure).
+  action-needs-only     `--action` without `--only` REFUSES (exit 2): the row it would print belongs
+                        to whichever PR sorts first in the whole table.
 """
 
 from __future__ import annotations
@@ -550,6 +563,128 @@ def _(M):
                         ("github-actions", "unit", "completed", "failure", 11, "900")])
         r = by_pr(rows_of(w))[7]
         assert r["action"] == "FIX-RED", r
+        # ⛔ A CANCELLED EARLIER ATTEMPT IS NOT A PASS. `cancelled`/`stale` are non-red for the
+        # VERDICT — that rule is untouched — but the claim RERUN-FLAKE prints is "PASSED on an
+        # earlier attempt at this same head", and a group whose only other attempt was cancelled has
+        # never been shown to work. Spending a re-run on it is a guess dressed as evidence, and both
+        # consumers act on the answer: the fixer declines the head (pr-sickness.sh) and the lander
+        # exits 11 WAITING instead of spending a FIX — a real red withheld from repair.
+        w.checks(head, [("github-actions", "unit", "completed", "failure", 22, "900"),
+                        ("github-actions", "unit", "completed", "cancelled", 11, "900")])
+        r = by_pr(rows_of(w))[7]
+        assert r["action"] == "FIX-RED", r
+        assert "passed on an earlier attempt" not in r["reason"], r
+        w.checks(head, [("github-actions", "unit", "completed", "failure", 22, "900"),
+                        ("github-actions", "unit", "completed", "stale", 11, "900")])
+        r = by_pr(rows_of(w))[7]
+        assert r["action"] == "FIX-RED", r
+    finally:
+        w.cleanup()
+
+
+@test("no-check-surface")
+def _(M):
+    """An empty — but successfully READ — check surface is WAIT:no-check-surface, never LAND.
+
+    ⛔ This arm and `in-flight` are the two answers that stand between "nothing was read yet" and
+    LAND. Deleting either used to leave the suite 26/26 green, so the PR's own claim ("every rule,
+    reverted, must redden") did not cover them.
+    """
+    w = World()
+    try:
+        head = "1" * 40
+        w.prs([w.pr(7, head)])
+        w.record(7, head)
+        w.checks(head, [])
+        w.workflows(head, {})
+        r = by_pr(rows_of(w))[7]
+        assert r["action"] == "WAIT:no-check-surface", r
+        # …and the reason is the EMPTY SURFACE's own, not the "could not be read" one: a surface that
+        # was read and is empty must not be reported as unread (the reader would go looking for a
+        # permissions problem that does not exist).
+        assert "empty surface" in r["reason"], r
+    finally:
+        w.cleanup()
+
+
+@test("in-flight")
+def _(M):
+    """A check surface with something still running is WAIT:in-flight, never LAND."""
+    w = World()
+    try:
+        head = "1" * 40
+        w.prs([w.pr(7, head)])
+        w.record(7, head)
+        w.checks(head, [("github-actions", "unit", "in_progress", "", 11, "900")])
+        w.workflows(head, {"900": "CI"})
+        r = by_pr(rows_of(w))[7]
+        assert r["action"] == "WAIT:in-flight", r
+        assert "in flight" in r["reason"], r
+    finally:
+        w.cleanup()
+
+
+@test("mergeable-unknown")
+def _(M):
+    """A mergeability GitHub has not computed yet is a WAIT, never a guessed MERGEABLE."""
+    ev = {"changed_files": 3, "is_draft": False, "mergeable": "UNKNOWN",
+          "checks": {"verdict": "GREEN", "groups": 1, "red": [], "in_flight": 0, "reason": ""},
+          "authority": "gate", "review_required": True, "attest": None,
+          "fidelity": {"state": "absent", "detail": ""}}
+    assert M.action_for(ev)[0] == "WAIT:mergeable-unknown", M.action_for(ev)
+    # `null` is the same answer — the endpoint has not computed it, which is not "mergeable".
+    ev["mergeable"] = None
+    assert M.action_for(ev)[0] == "WAIT:mergeable-unknown", M.action_for(ev)
+
+
+@test("queued-unreadable")
+def _(M):
+    """An UNREADABLE queue renders `?`, never `0` — the difference the code's own comment claims.
+
+    The `0` is indistinguishable from a genuinely empty queue, and this table is the operator's only
+    queue reading (its count is also `--suppress`'s `before=` figure).
+    """
+    w = World()
+    try:
+        head = "1" * 40
+        w.prs([w.pr(7, head)])
+        green(w, head)
+        w.record(7, head)
+        os.remove(os.path.join(w.dir, "queued-1.json"))     # the inventory read now fails
+        rows = rows_of(w)
+        assert rows and rows[0]["queued_known"] is False, rows
+        table = M.render_table(rows, REPO)
+        assert "? queued runs on 0 PRs" in table, table
+        assert "Q is UNKNOWN on every row, not 0" in table, table
+        assert "\t0\t" not in table.splitlines()[-1], table
+        # CONTROL: a queue that was READ and is empty still renders 0 (the arm is not "never count").
+        w.queued([])
+        rows = rows_of(w)
+        assert rows[0]["queued_known"] is True, rows
+        assert " 0 queued runs on 0 PRs" in M.render_table(rows, REPO), M.render_table(rows, REPO)
+    finally:
+        w.cleanup()
+
+
+@test("action-needs-only")
+def _(M):
+    """`--action` without `--only` REFUSES: the row it would print is another PR's answer."""
+    w = World()
+    try:
+        head = "1" * 40
+        w.prs([w.pr(7, head)])
+        green(w, head)
+        w.record(7, head)
+        rc, out, err = w.cli("--repo", REPO, "--action")
+        assert rc == 2, (rc, out, err)
+        assert "--only" in err, err
+        assert out.strip() == "", out
+        # CONTROL: with `--only` the seam still answers its one TSV row on exit 0. (`--only` reads the
+        # PR with `gh pr view`, so that is the fixture this arm needs.)
+        w.view(w.pr(7, head))
+        rc, out, err = w.cli("--repo", REPO, "--action", "--only", "7")
+        assert rc == 0, (rc, out, err)
+        assert out.split("\t")[0] in ("LAND", "REVIEW"), out
     finally:
         w.cleanup()
 
@@ -783,6 +918,34 @@ MUTATIONS = [
      'obj, i = dec.raw_decode(out, i)',
      'obj, i = dec.raw_decode(out, i); items = [] if not items else items; break',
      "only the first page of a paginated read is used"),
+    ("flake-evidence",
+     '            if concl in GREEN:\n                g["passing_attempt"] = True',
+     '            if concl in NONRED:\n                g["passing_attempt"] = True',
+     "a CANCELLED earlier attempt counts as a pass, so a never-passing red is called a flake"),
+    ("no-check-surface",
+     '    if checks["verdict"] == "NOREAD":\n        return "WAIT:no-check-surface", checks["reason"]',
+     '    if False:\n        return "WAIT:no-check-surface", checks["reason"]',
+     "an empty check surface falls through to LAND (a missing check read as green)"),
+    ("in-flight",
+     '    if checks["verdict"] == "WAIT":',
+     '    if False:',
+     "a still-running check surface falls through to LAND"),
+    ("mergeable-unknown",
+     '    if ev.get("mergeable") in (None, "", "UNKNOWN"):',
+     '    if False:',
+     "an uncomputed mergeability is guessed into the merge path"),
+    ("queued-unreadable",
+     '        queued_by_head = None',
+     '        queued_by_head = {}',
+     "an unreadable queue renders as 0 queued runs (indistinguishable from an empty one)"),
+    ("action-needs-only",
+     '        if only is None:',
+     '        if False:',
+     "`--action` without `--only` answers with another PR's row"),
+    ("no-check-surface",
+     '    if read_ok:\n        # ⛔ A SURFACE THAT WAS READ AND IS EMPTY IS STILL `verdict([])`',
+     '    if rows:\n        # ⛔ A SURFACE THAT WAS READ AND IS EMPTY IS STILL `verdict([])`',
+     "an empty surface is reported as unread, so the reader chases a permissions problem"),
 ]
 
 

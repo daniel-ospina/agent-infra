@@ -174,12 +174,18 @@ def verdict(rows):
             groups[key] = {"key": key, "id": cid, "status": (r.get("status") or "").strip().lower(),
                            "conclusion": (r.get("conclusion") or "").strip().lower(),
                            "run": run, "attempts": 1,
-                           "passing_attempt": (r.get("conclusion") or "").strip().lower() in NONRED,
+                           "passing_attempt": (r.get("conclusion") or "").strip().lower() in GREEN,
                            "passing_status": (r.get("status") or "").strip().lower() in IN_FLIGHT}
         else:
             g["attempts"] += 1
             concl = (r.get("conclusion") or "").strip().lower()
-            if concl in NONRED:
+            # ⛔ GREEN, NOT NONRED. `passing_attempt` is the evidence RERUN-FLAKE spends CI on, and
+            # the claim it prints is "PASSED on an earlier attempt at this same head". A cancelled or
+            # stale attempt is non-red for the VERDICT (it must never count as a failure) but it is
+            # not a pass: a group whose only other attempt was cancelled has never been shown to
+            # work, so re-running it is a guess dressed as evidence — and both consumers act on that
+            # answer (the fixer declines the head, the lander exits 11 instead of spending a FIX).
+            if concl in GREEN:
                 g["passing_attempt"] = True
             if cid >= g["id"]:
                 g.update({"id": cid, "status": (r.get("status") or "").strip().lower(),
@@ -318,8 +324,10 @@ def action_for(ev):
             r = inherited[0]
             return "WAIT:inherited-red", "%s is also red at main's head — not this tree's to fix" % r["group"]
         # RERUN-FLAKE needs POSITIVE evidence that this exact tree passed this exact job: an earlier
-        # attempt of the SAME group, at THIS head, whose conclusion is non-red. A red with only a
-        # green at an OLDER head is not that evidence (the tree changed), and "it looks flaky" is not
+        # attempt of the SAME group, at THIS head, whose conclusion is a PASS (GREEN — `cancelled` and
+        # `stale` are non-red for the verdict but are not passes, so they are not evidence). A red with
+        # only a green at an OLDER head is not that evidence (the tree changed), and "it looks flaky"
+        # is not
         # evidence at all. The bound is GitHub's own arithmetic: a re-run re-executes the SAME sha, so
         # the loop is finite only because we stop recommending it.
         flaked = [r for r in reds if r["passing_attempt"] and r["attempts"] < 3]
@@ -624,7 +632,8 @@ def evidence_for(repo, pr, authority, queued_by_head, main_reds_getter):
         "authority_reason": (authority or (None, ""))[1],
         "review_required": (authority or (None, ""))[0] == "gate",
         "attest": None, "fidelity": {"state": "absent", "detail": "no attestation record"},
-        "main_reds": set(), "queued": [], "store": env("PR_STATE_REVIEWS") or os.path.expanduser("~/.pi/agent/reviews"),
+        "main_reds": set(), "queued": [], "queued_known": queued_by_head is not None,
+        "store": env("PR_STATE_REVIEWS") or os.path.expanduser("~/.pi/agent/reviews"),
         "checks": {"verdict": "NOREAD", "groups": 0, "red": [], "in_flight": 0, "reason": "not read"},
     }
     if ev["mergeable"] in (None, "", "UNKNOWN"):
@@ -632,20 +641,25 @@ def evidence_for(repo, pr, authority, queued_by_head, main_reds_getter):
         if got:
             ev["mergeable"] = got
 
-    rows, names = [], {}
+    rows, names, read_ok = [], {}, True
     if head:
         try:
             rows = read_check_rows(repo, head)
             names = resolve_workflows(repo, head)
         except ReadError as e:
+            read_ok = False
             ev["checks"] = {"verdict": "NOREAD", "groups": 0, "red": [], "in_flight": 0,
                             "reason": "the check surface could not be read: %s" % e}
     for r in rows:
         r["workflow"] = names.get(r["run"], "")
-    if rows:
+    if read_ok:
+        # ⛔ A SURFACE THAT WAS READ AND IS EMPTY IS STILL `verdict([])` — NOREAD with its own
+        # reason ("empty surface (no check groups) — a missing check is not green"). Gating this on
+        # `rows` reported an empty surface as "not read" and left the NOREAD arm's own reason
+        # unreachable, so the one row a reader sees was wrong about WHY it was waiting.
         ev["checks"] = verdict(rows)
 
-    ev["queued"] = [q for q in (queued_by_head.get(head) or [])]
+    ev["queued"] = [q for q in ((queued_by_head or {}).get(head) or [])]
 
     rec = read_local_record(repo, number)
     if isinstance(rec, dict) and rec.get("error"):
@@ -673,9 +687,11 @@ def build_rows(repo, limit=100, only=None, threads=6):
     try:
         queued_by_head = read_queued(repo)
     except ReadError:
-        queued_by_head = {}
-    # A queued-run inventory that could not be read is not "nothing is queued": it is reported as
-    # unknown on every row that has one, and it only disables suppression (which re-reads anyway).
+        # ⛔ AN UNREADABLE QUEUE IS NOT AN EMPTY QUEUE. `None` (not `{}`) is what carries that
+        # difference to the renderer, which prints `?` — a `0` here would be indistinguishable from
+        # a genuinely empty queue and would silently understate the operator's only queue reading
+        # (and `--suppress`'s `before=` figure). It only disables suppression, which re-reads anyway.
+        queued_by_head = None
     cache = {}
     lock = threading.Lock()
 
@@ -701,6 +717,7 @@ def build_rows(repo, limit=100, only=None, threads=6):
             "red_groups": [r["group"] for r in ev["checks"]["red"]],
             "in_flight": ev["checks"]["in_flight"], "groups": ev["checks"]["groups"],
             "queued_runs": [q["id"] for q in ev["queued"]],
+            "queued_known": ev["queued_known"],
             "rerun_run": ev.get("_rerun_run") or "",
             "action": action, "reason": reason,
         })
@@ -806,16 +823,25 @@ TABLE_COLS = ("PR", "HEAD", "ATTESTED", "FIDELITY", "MERGEABLE", "CHECKS", "Q", 
 def render_table(rows, repo):
     out = []
     with_q = [r for r in rows if r["queued_runs"]]
+    # ⛔ A QUEUE READ THAT FAILED RENDERS AS `?`, NEVER `0`. Every row carries the same flag (it is a
+    # property of the one inventory read), so it is stated once in the header and once in the Q
+    # column; `0` is reserved for a queue that was actually READ and is empty.
+    queued_known = all(r.get("queued_known", True) for r in rows)
     green = sum(1 for r in rows if r["checks_verdict"] == "GREEN")
     red = sum(1 for r in rows if r["checks_verdict"] == "RED")
     hist = {}
     for r in rows:
         hist[r["action"]] = hist.get(r["action"], 0) + 1
-    out.append("# pr-state %s — %d open PRs: %d MERGEABLE, %d CONFLICTING, %d checks GREEN, %d RED, %d queued runs on %d PRs" % (
+    out.append("# pr-state %s — %d open PRs: %d MERGEABLE, %d CONFLICTING, %d checks GREEN, %d RED, %s queued runs on %d PRs" % (
         repo, len(rows),
         sum(1 for r in rows if r["mergeable"] == "MERGEABLE"),
         sum(1 for r in rows if r["mergeable"] == "CONFLICTING"),
-        green, red, sum(len(r["queued_runs"]) for r in rows), len(with_q)))
+        green, red,
+        ("%d" % sum(len(r["queued_runs"]) for r in rows)) if queued_known else "?",
+        len(with_q)))
+    if not queued_known:
+        out.append("# the queued-run inventory could not be read — Q is UNKNOWN on every row, not 0 "
+                   "(an unreadable queue is not an empty queue); suppression re-reads anyway")
     out.append("# actions: " + " ".join("%s=%d" % (k, hist[k]) for k in sorted(hist)))
     out.append("")
     out.append("\t".join(TABLE_COLS))
@@ -827,7 +853,7 @@ def render_table(rows, repo):
             r["fidelity"],
             str(r["mergeable"] or "null"),
             r["checks_verdict"] + ("" if r["checks_verdict"] != "RED" else "(%d)" % len(r["red_groups"])),
-            str(len(r["queued_runs"])),
+            str(len(r["queued_runs"])) if r.get("queued_known", True) else "?",
             r["action"],
             r["reason"],
         ]))
@@ -897,6 +923,12 @@ def main(argv):
         return 2
 
     if action_only:
+        if only is None:
+            # ⛔ `--action` ANSWERS FOR ONE PR. Without `--only` the row printed would be whichever
+            # sorts first in the whole table — another PR's action, with exit 0, in the shape an
+            # actor cannot tell apart from the one it asked about.
+            print("pr-state: --action needs --only <pr> (one row, one PR)", file=sys.stderr)
+            return 2
         if not rows:
             print("pr-state: no row for that PR (it is not in the open set) — nothing to act on",
                   file=sys.stderr)
@@ -922,8 +954,9 @@ def main(argv):
             except ReadError as e:
                 after = None
                 print("suppress: the queue could not be re-read after the pass (%s)" % e, file=sys.stderr)
-            before = sum(len(r["queued_runs"]) for r in rows)
-            print("suppress: queued runs before=%d after=%s (cancelled=%d, not_cancelled=%d)" % (
+            before = ("%d" % sum(len(r["queued_runs"]) for r in rows)) \
+                if all(r.get("queued_known", True) for r in rows) else "?"
+            print("suppress: queued runs before=%s after=%s (cancelled=%d, not_cancelled=%d)" % (
                 before, "?" if after is None else after, len(cancelled), len(skipped)))
         if err:
             print("suppress: %s" % err, file=sys.stderr)

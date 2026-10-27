@@ -39,7 +39,7 @@ python3 tools/fleet/pr_state.py --repo owner/name --cancelled            # what 
 | `WAIT:draft` | draft | a draft cannot merge, so nothing it runs can make it mergeable |
 | `REPAIR-CONFLICT` | `mergeable == CONFLICTING` | no CI result can matter until the branch has main |
 | `FIX-RED` | a real red caused by this tree | run the **failing job**, not the suite |
-| `RERUN-FLAKE` | the same group passed on an **earlier attempt at this same head** | `gh run rerun <id> --failed` once |
+| `RERUN-FLAKE` | the same group **passed** (`success`/`neutral`/`skipped`) on an **earlier attempt at this same head** | `gh run rerun <id> --failed` once |
 | `WAIT:inherited-red` | the same `(app, workflow, job)` is red at main's head | a fixer cannot fix main |
 | `REVIEW` | nothing attested at this head (review-requiring repo) | dispatch a reviewer, cancel its queued CI |
 | `WAIT:attested-elsewhere` | attested on the PR body, not in this box's store | the rail's gate reads the store |
@@ -65,6 +65,20 @@ never mask one another. Newest attempt wins by check-run **id** (GitHub keeps ev
 * **non-red — `cancelled` / `stale`** ⛔ most "red PRs" measured on 2026-10-26 were cancelled runs
 * in flight — `queued` / `in_progress` / `waiting` / `requested` / `pending`
 * **RED — everything else, including a conclusion GitHub has not documented and a null one**
+
+⛔ **`cancelled`/`stale` are non-red for the VERDICT, and are NOT a pass for `RERUN-FLAKE`.** The two
+uses are different questions: "may this attempt redden the PR?" (no) and "has this tree ever been
+shown to pass this job?" (a cancelled attempt shows nothing). Only a green attempt is evidence for a
+re-run, because the claim printed is "passed on an earlier attempt" — and both consumers act on it
+(the fixer declines the head, the lander exits 11 WAITING), so a guess dressed as evidence withholds
+a real red from repair.
+
+**An unreadable read is never a zero.** A check surface that could not be read is
+`WAIT:no-check-surface` with *that* reason (an empty-but-read surface keeps its own reason — the two
+are reported differently), and a queued-run inventory that could not be read renders the `Q` column
+as `?` with a header note, never `0` (its count is also `--suppress`'s `before=` figure). Only
+`--action` + `--only <pr>` produces a row: a bare `--action` would answer with whichever PR sorts
+first in the whole table.
 
 **Suppression.** A row in `REVIEW`, `REPAIR-CONFLICT` or `FIX-RED` has a head that is *about to
 change*, so `--suppress` cancels its **queued** runs before they are spent. A run is re-read
