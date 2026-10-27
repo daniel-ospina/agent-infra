@@ -108,10 +108,20 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
   python3.12 scripts/orchestrator-harness/runner_autoscale.py --want 3   # REFUSED above the ceiling
   python3.12 scripts/orchestrator-harness/runner_autoscale.py --json     # one record (fleet view)
   python3.12 scripts/orchestrator-harness/runner_autoscale.py --repo owner/name
-  (on a cell this is the FARMED copy at `~/.pi/agent/scripts/runner_autoscale.py` — one file,
-   one source: this one. Until 2026-10-27 it existed ONLY as a live copy on cell-4, so it could not
-   be reviewed, tested or redeployed — the live-only class agent-infra#1552 tracks, where 26 of 35
-   lane-orchestration scripts live in only `~/.pi/agent/scripts`.)
+  (on a cell the converger currently runs from a LIVE-ONLY copy at
+   `~/.pi/agent/scripts/runner_autoscale.py`. Until 2026-10-27 this file existed ONLY as that live
+   copy on cell-4, so it could not be reviewed, tested or redeployed — the live-only class
+   agent-infra#1552 tracks, where 26 of 35 lane-orchestration scripts live in only
+   `~/.pi/agent/scripts`.)
+
+  ⛔ LANDING THIS FILE DOES NOT DEPLOY IT, AND THE FARM IS NOT THE DELIVERY PATH FOR IT YET. It is
+  NOT in `pi-bootstrap/setup.sh`'s `fleet_srcs`, so no `farm` install copies it to a cell: those
+  entries are bare basenames copied from `$INFRA_ROOT/scripts/<base>`, a shape that cannot even name
+  a file under `scripts/orchestrator-harness/`. The copy in `~/.pi/agent/scripts` on each cell keeps
+  running whatever it was last hand-placed with, unmodified by this change. What this change buys is
+  reviewability, a test suite and a source of truth — REDEPLOYING THE CELLS IS STILL OUTSTANDING, and
+  until it is done the six defect fixes below are reachable only by running this path directly. Do
+  not read this file's presence here as evidence that a cell is running it.
 
   Seams (all optional; the suite drives every one, and each defaults fail-closed):
     RUNNER_AUTOSCALE_RUNNER_ROOT   default /opt   (installs are `<root>/gh-runner*`)
@@ -716,6 +726,13 @@ def fallback_engaged(pool: dict[str, PoolEntry]) -> bool:
 
 
 # ── the starvation invariant (agent-infra#2875) ─────────────────────────────────────────────────
+# The runs endpoint is NEWEST-FIRST and ignores `sort`/`direction` (they are not parameters of it, so
+# they are silently dropped rather than refused). `min(created_at)` over a page is therefore the only
+# way to reach the queue's head, and the page must hold the whole queue or that min is merely a LOWER
+# BOUND. `scripts/ci_runner_gate.sh` encodes both facts for the same endpoint (#2904).
+QUEUE_AGE_PAGE = 100
+
+
 def read_queued_runs(repo: str) -> int:
     """How many workflow runs are QUEUED for this repo. Unreadable raises — never reads as 0.
 
@@ -758,9 +775,18 @@ def read_oldest_queued_age_s(repo: str) -> float | None:
     ⛔ FAIL-CLOSED IN THE SAME DIRECTION AS EVERY OTHER MEASUREMENT: an unreadable answer RAISES, and
     an EMPTY queue is the only thing that returns `None`. A failed read must never manufacture "nothing
     is waiting" — that is the value that silences the alarm — and it must not manufacture an age
-    either, because a fabricated 0 would disarm the term it feeds. `gh` sorts ASCENDING by creation so
-    the first row IS the oldest; the default sort (`created desc`) would report the NEWEST and make a
-    starved queue look young, which is the one direction this bound cannot afford.
+    either, because a fabricated 0 would disarm the term it feeds.
+
+    ⛔ THE RUNS ENDPOINT IS NEWEST-FIRST AND DOES NOT TAKE `sort`/`direction` (round-13 review P1,
+    verified against the live API: `?sort=created&direction=asc` returns the SAME newest-first page as
+    no parameters at all, because unknown query parameters are ignored rather than refused). This
+    function used to send that pair and read row 0 as "the oldest" — which was the NEWEST run on a
+    queue still receiving work, i.e. an age near 0 on exactly the starved shape #2875 reported, and
+    therefore `starvation="ok"` and exit 0. That is the one direction this bound cannot afford, so
+    the head is derived the way `scripts/ci_runner_gate.sh` derives it (#2904): read a FULL page and
+    take `min(created_at)`. A page that cannot hold the whole queue yields only a LOWER BOUND on the
+    head age, so it is REFUSED by name rather than certified — same verdict, `Unmeasurable`, as every
+    other operand that could not be read.
     """
     gh = gh_bin()
     if not gh:
@@ -768,9 +794,9 @@ def read_oldest_queued_age_s(repo: str) -> float | None:
     cmd = [
         gh,
         "api",
-        f"repos/{repo}/actions/runs?status=queued&sort=created&direction=asc&per_page=1",
+        f"repos/{repo}/actions/runs?status=queued&per_page={QUEUE_AGE_PAGE}",
         "--jq",
-        '.workflow_runs[0].created_at // ""',
+        '[.total_count, (([.workflow_runs[].created_at]|min)//"")]|@tsv',
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -778,10 +804,21 @@ def read_oldest_queued_age_s(repo: str) -> float | None:
         raise Unmeasurable(f"queue age read failed to run ({exc})") from exc
     if proc.returncode != 0:
         raise Unmeasurable(
-            f"repos/{repo}/actions/runs?status=queued&sort=created exited {proc.returncode}: "
-            f"{(proc.stderr or '').strip()[:300]}"
+            f"repos/{repo}/actions/runs?status=queued&per_page={QUEUE_AGE_PAGE} exited "
+            f"{proc.returncode}: {(proc.stderr or '').strip()[:300]}"
         )
-    raw = (proc.stdout or "").strip().strip('"')
+    total_raw, _, raw = (proc.stdout or "").strip().partition("\t")
+    raw = raw.strip().strip('"')
+    try:
+        total = int(total_raw)
+    except (TypeError, ValueError) as exc:
+        raise Unmeasurable(f"queue age read has no readable total_count ({total_raw[:80]!r})") from exc
+    if total > QUEUE_AGE_PAGE:
+        raise Unmeasurable(
+            f"queue ({total}) is DEEPER than the age read page ({QUEUE_AGE_PAGE}) — the page is "
+            "newest-first, so its min is only a LOWER BOUND on the queue head's age; the head cannot "
+            "be measured"
+        )
     if not raw:
         return None
     try:
@@ -1591,6 +1628,15 @@ def _clear_local_config(directory: Path) -> dict[str, tuple[int, bytes]]:
                 else ""
             )
         ) from exc
+    except BaseException:
+        # ⛔ A SIGNAL IS THE OTHER WAY THIS LOOP ENDS HALFWAY, AND IT IS NOT AN `OSError` (round-13
+        # review finding P2). `_term_as_exit` raises `SystemExit`, which the `OSError` arm above does
+        # not catch, so a SIGTERM landing between two `unlink()` calls would unwind PAST this function
+        # and drop the stash it is holding — the install left with `.runner`/`.credentials` deleted, no
+        # record of what they were, and no restore. Restore here and re-raise: the caller's own
+        # `finally` still gets its unwind, and the files this loop already took go back first.
+        _restore_local_config(directory, stash)
+        raise
     return stash
 
 
@@ -1676,23 +1722,20 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
     cfg = Path(os.environ.get("RUNNER_AUTOSCALE_CONFIG_SH") or (directory / "config.sh"))
     if not cfg.exists():
         raise ActionFailed(f"{cfg} does not exist — {directory} is not a runner install")
-    stash = _clear_local_config(directory) if replace else {}
-    # ⛔ A SIGNAL DURING THE CLEARED WINDOW MUST RUN THE `finally` BELOW (review finding P2, round
-    # 11). The stash is exception-safe, but Python runs NO `finally` on SIGTERM by default — the
-    # handler is the OS default and the process dies where it stood. That mattered in practice because
-    # systemd's `TimeoutStartSec` can fire DURING a legitimate pass (see `render_unit`) and SIGTERM the
-    # whole cgroup: an install would be left with `.runner`, `.credentials` and the RSA key deleted —
-    # gone from `discover()`, its slot reading FREE to the provisioner. Raising `SystemExit` from the
-    # handler converts the kill into an ordinary unwind, which is what the existing `finally` needs.
-    # The previous disposition is restored in the same `finally`; a non-main thread (the suite's own
-    # in-process drivers) cannot install a handler, and the stash is still exception-safe there.
+    # ⛔ THE HANDLER IS INSTALLED BEFORE THE DESTRUCTIVE STEP, NOT AFTER IT (round-13 review finding
+    # P2). It used to be installed only once `_clear_local_config` had RETURNED, which left the
+    # destructive step it exists to protect running under the OS DEFAULT disposition: a SIGTERM
+    # landing during the unlink loop (systemd's `TimeoutStartSec` firing on a legitimate pass — see
+    # `render_unit`) terminated the process where it stood, so no `finally` ran and the stash was
+    # dropped mid-unlink. The install was left with `.runner`, `.credentials` and the RSA key
+    # deleted, gone from `discover()`, its slot reading FREE to the provisioner — the exact state the
+    # paragraph below says is prevented. The comment was right about the WINDOW and wrong about the
+    # ORDER; the clear now runs INSIDE the guarded region below, so the `finally` covers it.
+    # Restoring the previous disposition from that same `finally` is why this is safe to leave open
+    # on every path; a non-main thread (the suite's in-process drivers) cannot install a handler, and
+    # `_clear_local_config` is itself unwind-safe there.
     previous_sigterm = None
-    if stash:
-        try:
-            previous_sigterm = signal.getsignal(signal.SIGTERM)
-            signal.signal(signal.SIGTERM, _term_as_exit)
-        except (ValueError, OSError):  # not the main thread / unsupported — see the note above
-            previous_sigterm = None
+    stash: dict[str, tuple[int, bytes]] = {}
     # ⛔ THE CLEARED REGION IS EXCEPTION-SAFE (fix 2, round 2). `registration_token()` is evaluated
     # INSIDE this block, and it raises `ActionFailed` on any gh failure — a routine transient for a
     # tool that runs every few minutes. Restoring only on `rc != 0` left that raise to drop the stash,
@@ -1713,6 +1756,13 @@ def register(directory: Path, name: str, repo: str, labels: str, replace: bool) 
     # BOTH facts.
     failure: BaseException | None = None
     try:
+        if replace:
+            try:
+                previous_sigterm = signal.getsignal(signal.SIGTERM)
+                signal.signal(signal.SIGTERM, _term_as_exit)
+            except (ValueError, OSError):  # not the main thread / unsupported — see the note above
+                previous_sigterm = None
+            stash = _clear_local_config(directory)
         rc, out = _run(
             _config_argv(cfg, repo, registration_token(repo), name, labels, replace), timeout=600
         )
@@ -3381,6 +3431,14 @@ def converge(
         if "eligible" in starvation:
             record["starvation_eligible"] = starvation["eligible"]
             record["starvation_why"] = starvation["why"]
+        elif starvation.get("detail"):
+            # ⛔ AN UNMEASURED TERM STILL HAS TO SAY WHY (round-13 review finding P1). The probe
+            # returns `detail` for that state, and nothing copied it, so a REFUSED age read — the
+            # saturated page, the unparsable timestamp, the failed `gh` — arrived at a reader as a
+            # bare `starvation=unmeasured` with no reason at all, which is the same "silent operand"
+            # this file refuses everywhere else. The bound is published under the SAME key the measured
+            # paths use, so a reader parses one name rather than discovering a second spelling.
+            record["starvation_why"] = starvation["detail"]
         # ⛔ THE COUNTS ARE PUBLISHED, NOT ONLY SPELLED INTO PROSE (review round 7). `--json` calls
         # this "one machine-readable record (fleet view)", and the three operands were readable only
         # by parsing a note string — while `origin/main`'s version published `queued_runs`, so a

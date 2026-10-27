@@ -263,12 +263,32 @@ if is /registration-token; then
   if [ -f "$FIX/token.stdout" ]; then cat "$FIX/token.stdout"; else printf 'tok-fixture\n'; fi
   exit 0
 fi
-if is 'direction=asc'; then
+if is 'per_page=100'; then
   # THE QUEUE'S OLDEST WAITING RUN (the AGE term, round 11). MUST be tested before the depth branch
-  # below, whose pattern is a SUBSTRING of this URL. Default: a run created NOW — a backlog that is
-  # being served, which is the healthy shape every pre-existing case was written against. A case that
-  # is ABOUT a starved queue writes `queue-age` (see `Box.queue_age`).
-  if [ -f "$FIX/queue-age" ]; then cat "$FIX/queue-age"; else date -u +%Y-%m-%dT%H:%M:%SZ; fi
+  # below, whose pattern is a SUBSTRING of this URL.
+  #
+  # ⛔ THE STUB IS AN ORACLE ON THE API, NOT ON THE CODE'S QUERY STRING (round-13 review finding P1).
+  # It used to branch on `direction=asc` and answer with the oldest row — a spelling the endpoint
+  # IGNORES (unknown query parameters are dropped, not refused), so the real API stayed NEWEST-FIRST
+  # and the stub certified the shape the CODE assumed instead of the answer the API gives. T44 passed
+  # over a reader that reported the NEWEST run's age, which is ~0 on a queue that is still receiving
+  # work — the one direction this bound cannot afford, on the very shape #2875 measured.
+  # It now answers the PAGE honestly: a `min(...)` query gets `queue-age` (the oldest row), a
+  # `.workflow_runs[0]` query gets `queue-age-newest` (the newest, which is what row 0 really is), and
+  # the two are separate fixtures — so reading row 0 as "the oldest" is falsifiable, and T44 is the
+  # case that falsifies it.
+  oldest="$(cat "$FIX/queue-age" 2>/dev/null)"
+  [ -n "$oldest" ] || oldest="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  newest="$(cat "$FIX/queue-age-newest" 2>/dev/null)"
+  [ -n "$newest" ] || newest="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # `queue-age-total` overrides `.total_count`: a queue DEEPER than the read page, whose min is only
+  # a LOWER BOUND on the head and must be REFUSED rather than certified (see `Box.queue_age_overflow`).
+  age_total="$(cat "$FIX/queue-age-total" 2>/dev/null)"
+  [ -n "$age_total" ] || age_total=1
+  case "$args" in
+    *min*) printf '%s\t%s\n' "$age_total" "$oldest" ;;
+    *)     printf '%s\t%s\n' "$age_total" "$newest" ;;
+  esac
   exit 0
 fi
 if is 'actions/runs?status=queued'; then
@@ -528,6 +548,32 @@ class Box:
             return
         stamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds)
         self._write(path, stamp.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+
+    def queue_age_newest(self, seconds: float):
+        """The NEWEST queued run's `created_at` — what row 0 of the page ACTUALLY holds.
+
+        ⛔ THIS FIXTURE EXISTS TO MAKE THE ORIGINAL DEFECT REPRODUCIBLE (round-13 review finding P1).
+        The runs endpoint is newest-first and ignores `sort`/`direction`, so a reader of
+        `workflow_runs[0]` gets the NEWEST run — ~0 s old on a queue that is still receiving work,
+        which is precisely the starved shape #2875 measured. Left at its default, row 0 and `min()`
+        agree, and a row-0 reader would look correct; a case sets this together with `queue_age()` to
+        make the two readings DISAGREE, which is what falsifies the row-0 reading.
+        """
+        path = os.path.join(self.dir, "queue-age-newest")
+        if seconds is None:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        stamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds)
+        self._write(path, stamp.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+
+    def queue_age_overflow(self, total: int):
+        """Make the AGE read's page SATURATE: `total` queued runs against a `QUEUE_AGE_PAGE` page.
+
+        `min()` over a saturated page is only a LOWER BOUND on the queue head, so it must be REFUSED
+        rather than certified — the same rule `ci_runner_gate.sh:319-324` applies to the same read.
+        """
+        self._write(os.path.join(self.dir, "queue-age-total"), f"{total}\n")
 
     def unqueue(self):
         """Remove the queue fixture entirely: the depth read FAILS (the stub exits 1), as a scoped
@@ -3420,7 +3466,13 @@ def t44_queue_age_eligibility():
             # it), the pool is online and IDLE, and 53 runs are waiting (below the gate's 60).
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
             box.queued(53)
-            box.queue_age(2400)  # 40 minutes
+            # ⛔ ROW 0 IS NOT THE OLDEST (round-13 review finding P1). The runs endpoint is
+            # newest-first and ignores `sort`/`direction`, so the page's first row is the run that
+            # arrived a moment ago — and a queue STILL RECEIVING WORK is exactly #2875's shape. Pin
+            # the newest row separately, or a reader of row 0 looks correct here and this case
+            # certifies the very defect it exists to catch.
+            box.queue_age(2400)  # 40 minutes — the OLDEST waiting run
+            box.queue_age_newest(0)  # …while the NEWEST arrived just now
             record = converge(box, nproc="2", dry_run=True)
             check(
                 record.get("starvation") == "starved",
@@ -3457,6 +3509,49 @@ def t44_queue_age_eligibility():
                 record.get("starvation_queued") == 53,
                 f"the counts are published on BOTH verdicts: {record}",
             )
+        finally:
+            box.destroy()
+
+
+@test("T56 a queue DEEPER than the age page is UNMEASURABLE with its reason — a lower bound is never certified")
+def t56_queue_age_page_saturation():
+    """THE SAME FAIL-OPEN ONE LAYER OUT (round-13 review finding P1, second half).
+
+    `min(created_at)` over a page IS the queue head only while the page holds the whole queue. Once the
+    queue is deeper, that minimum is a LOWER BOUND on the head's age — it can only UNDERSTATE it,
+    which is the one direction that silences a starved-queue alarm. `ci_runner_gate.sh:319-324` refuses
+    exactly this state for exactly this read; a converger that certified it would report a healthy
+    queue during a full stop, which is the incident the whole term exists for.
+
+    ⛔ AND THE REFUSAL MUST CARRY ITS REASON. `unmeasured` alone is a state a reader cannot act on; the
+    observation that the page was saturated, and by how much, is the part that tells an operator
+    whether to raise the page or look at the queue.
+    """
+    with Env():
+        box = Box("queue-age-page")
+        try:
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
+            box.queued(53)
+            # The page's minimum is ONE MINUTE old — young enough to read as a served backlog — while
+            # the queue is 150 deep against a 100-run page. Certifying that reading is the fail-open.
+            box.queue_age(60)
+            box.queue_age_overflow(150)
+            record = converge(box, nproc="2", dry_run=True)
+            check(
+                record.get("starvation") == "unmeasured",
+                f"a saturated page cannot measure the head, so it must not certify `ok`: "
+                f"{record.get('starvation')} / {record.get('starvation_why')}",
+            )
+            check(
+                record.get("starvation_eligible") is None,
+                f"…and it must not be ELIGIBLE either way on an unread operand: "
+                f"{record.get('starvation_eligible')}",
+            )
+            why = record.get("starvation_why") or ""
+            contains(why, "LOWER BOUND", "the refusal must name WHY the page's min is not the head")
+            contains(why, "150", "…and the depth it could not measure, so the operator can act")
         finally:
             box.destroy()
 
@@ -3655,6 +3750,58 @@ def t48_sigterm_restores_stash():
                 mode == before_mode,
                 f"and restored at its original mode ({oct(before_mode)}), not {oct(mode)}",
             )
+
+            # ⛔ AND THE WINDOW THIS CASE COULD NOT SEE (round-13 review finding P2). T48's signal
+            # arrives from `config.sh`, i.e. AFTER the handler is installed, so it passes over the
+            # window the handler was installed too late for: the CLEAR itself. The handler used to be
+            # installed only once `_clear_local_config` had RETURNED, so a SIGTERM inside the unlink
+            # loop still ran under the default disposition and terminated without unwinding — the
+            # stash dropped mid-unlink and the install left without `.runner`. Delivered here the way
+            # it actually happens (a manager SIGTERM racing a legitimate pass), from inside the loop.
+            inclear = Box("sigterm-in-clear")
+            try:
+                path2 = inclear.install("gh-runner-x64", "r-inclear")
+                script2 = (
+                    "import importlib.util, pathlib, signal, sys\n"
+                    f"spec = importlib.util.spec_from_file_location('ra_in_clear', {ra.__file__!r})\n"
+                    "ra = importlib.util.module_from_spec(spec)\n"
+                    "sys.modules['ra_in_clear'] = ra\n"
+                    "spec.loader.exec_module(ra)\n"
+                    "real = pathlib.Path.unlink\n"
+                    "fired = []\n"
+                    "def boom(self, *a, **k):\n"
+                    "    real(self, *a, **k)\n"
+                    "    if not fired:\n"
+                    "        fired.append(1)\n"
+                    "        signal.raise_signal(signal.SIGTERM)\n"
+                    "pathlib.Path.unlink = boom\n"
+                    "try:\n"
+                    f"    ra.register(pathlib.Path({path2!r}), 'r-inclear', "
+                    "'daniel-ospina/tortoise', 'self-hosted-x64', True)\n"
+                    "except SystemExit as exc:\n"
+                    "    sys.exit(exc.code)\n"
+                    "sys.exit(0)\n"
+                )
+                inclear.apply()
+                proc2 = subprocess.run(
+                    [sys.executable, "-c", script2],
+                    env=_cli_env(inclear),
+                    capture_output=True,
+                    text=True,
+                )
+                check(
+                    proc2.returncode == 128 + 15,
+                    f"a signal INSIDE the clear must unwind as 143, not kill the process outright "
+                    f"(got {proc2.returncode}):\n{proc2.stdout}\n{proc2.stderr}",
+                )
+                for name in (".runner", ".credentials", ".credentials_rsaparams"):
+                    check(
+                        os.path.exists(os.path.join(path2, name)),
+                        f"a signal inside the CLEAR must still restore {name} — the handler has to be "
+                        "installed BEFORE the destructive step, not after it returns",
+                    )
+            finally:
+                inclear.destroy()
         finally:
             box.destroy()
 
@@ -4085,6 +4232,50 @@ MUTATIONS = [
         "    except ZeroDivisionError as exc:  # MUTATION: the audit's failure escapes the pass",
         "an exception inside the every-pass unit audit reaches `main()`'s backstop again, whose "
         "payload carries no `actions` — so the record of an action already performed is lost",
+    ),
+    # ── review round 13: the 2026-10-27 third-review findings (one mutation per claim) ──
+    Mutation(
+        "T44",
+        "        '[.total_count, (([.workflow_runs[].created_at]|min)//\"\")]|@tsv',",
+        "        '[.total_count, (.workflow_runs[0].created_at // \"\")]|@tsv',",
+        "row 0 is read as `the oldest` on an endpoint that is NEWEST-FIRST and IGNORES `sort`/"
+        "`direction` — so the age is ~0 on a queue that is merely still receiving work, and #2875's "
+        "starved shape (53 queued, pool online and idle) reports `ok` and exits 0",
+    ),
+    Mutation(
+        "T56",
+        "    if total > QUEUE_AGE_PAGE:",
+        "    if False:  # MUTATION: a saturated page is certified",
+        "`min()` over a page that cannot hold the whole queue is only a LOWER BOUND on the head's "
+        "age, so a deep stalled queue certifies healthy and the pool is stripped during a full stop "
+        "— the state `ci_runner_gate.sh:319-324` refuses by name for this same read",
+    ),
+    Mutation(
+        "T56",
+        "        elif starvation.get(\"detail\"):",
+        "        elif False:  # MUTATION: an unmeasured starvation term carries no reason",
+        "a refused age read reaches a reader as a bare `starvation=unmeasured` with no reason, so an "
+        "operator cannot tell a saturated page from an unparsable timestamp from a failed `gh`",
+    ),
+    Mutation(
+        "T48",
+        "        if replace:\n"
+        "            try:\n"
+        "                previous_sigterm = signal.getsignal(signal.SIGTERM)\n"
+        "                signal.signal(signal.SIGTERM, _term_as_exit)\n"
+        "            except (ValueError, OSError):  # not the main thread / unsupported — see the note above\n"
+        "                previous_sigterm = None\n"
+        "            stash = _clear_local_config(directory)",
+        "        if replace:\n"
+        "            stash = _clear_local_config(directory)  # MUTATION: handler installed too late\n"
+        "            try:\n"
+        "                previous_sigterm = signal.getsignal(signal.SIGTERM)\n"
+        "                signal.signal(signal.SIGTERM, _term_as_exit)\n"
+        "            except (ValueError, OSError):\n"
+        "                previous_sigterm = None",
+        "the handler is installed AFTER the clear returns, so a SIGTERM inside the unlink loop runs "
+        "under the DEFAULT disposition: the process dies where it stood, no `finally` runs, the stash "
+        "is dropped mid-unlink and the install loses `.runner`, its credentials and the RSA key",
     ),
     # ⛔ A MUTATION REMOVED, ON PURPOSE (round 12). "repair identity falls back to the NAME, so two
     # installs sharing an agentName act on the same one twice" is no longer a defect this file can
@@ -4547,8 +4738,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T4",
-        '    stash = _clear_local_config(directory) if replace else {}',
-        '    stash: dict[str, bytes] = {}',
+        '            stash = _clear_local_config(directory)',
+        '            stash: dict[str, tuple[int, bytes]] = {}',
         "the local config is never cleared before configuring (the refusal the repair cannot pass)",
     ),
     Mutation(
