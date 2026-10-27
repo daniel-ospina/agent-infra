@@ -514,6 +514,33 @@ def test_score_file_exits_one_for_a_draft_the_gate_would_bounce(monkeypatch, tmp
     assert "would BOUNCE" in out.getvalue(), out.getvalue()
 
 
+def test_gate_prints_tokens_and_never_an_invented_cost(monkeypatch):
+    """⛔ THE TOKEN ARM IS THE ONE THE REAL API ALWAYS TAKES, AND IT WAS UNREACHED.
+    Every other gate test feeds `usage: {cost_usd: 0.0}` — the shape the LOOKALIKE host returned —
+    so replacing the token branch's body in `main()` left the whole file green (measured in review
+    cycle 2). The real API answers `{input_tokens, output_tokens}` with no money field, so this
+    drives that arm through the real gate path and asserts what is actually PRINTED: the tokens,
+    and no fabricated `cost_usd=`.
+    """
+    rec = _Recorder()
+    monkeypatch.setattr(ao, "sh", rec)
+    monkeypatch.setattr(ao, "sh_status", lambda args, timeout=None: (0, "", ""))
+    monkeypatch.setattr(ao, "fetch_question", lambda repo, n: V9)
+    monkeypatch.setattr(ao, "jev", lambda state: {
+        "model": "jev-1.13.0",
+        "answers": {m: {"type": "noul", "noul": 0.99} for m in ao.QUESTIONS},
+        "usage": {"input_tokens": 100, "output_tokens": 10},
+    })
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["daniel-ospina/agent-infra", "1903", "--dry-run"])
+    printed = out.getvalue()
+    assert rc == 0, printed
+    assert "tokens=100/10" in printed, printed
+    assert "model=jev-1.13.0" in printed, printed
+    assert "cost_usd" not in printed, printed
+
+
 def test_score_file_exits_two_when_it_cannot_check(monkeypatch, tmp_path):
     """No Jev key = NOT a pass (exit 2), even when the mechanical marks clear.
 

@@ -1323,6 +1323,17 @@ def jev_step5(rows, LV, enabled=True):
         return {}, dict(meta, source="RULE", error="no TypeSafe key "
                         "(env TYPESAFE_API_KEY / JEV_API_KEY, or ~/.pi/agent/jev-config.json)")
 
+    # ⛔ THE ENDPOINT IS CHECKED AT RUNTIME, NOT ONLY BY A TEST. This file IS the scheduled beat,
+    # and the beat never runs pytest: a stale deployed lane-verdict.py would otherwise post the
+    # whole fleet's last words (and the key) to whatever `LV.JEV_URL` names, silently. The
+    # constant still lives in LV — this only refuses to post when it is not the vendor.
+    _url = str(getattr(LV, "JEV_URL", "") or "")
+    if not _url.startswith("https://api.typesafe.ai/"):
+        return {}, dict(meta, source="RULE", error=(
+            "lane-verdict.py JEV_URL %r is not the vendor endpoint — refusing to post "
+            "(a stale deployed copy would bill the lookalike host)" % (_url or None,)))
+    _model = getattr(LV, "JEV_MODEL", None)
+
     base = dict(getattr(LV, "CRITERIA", None) or {})
     criteria = {}
     for k in STEP5_OUTCOMES:
@@ -1349,8 +1360,8 @@ def jev_step5(rows, LV, enabled=True):
             "criteria": criteria,
         }
     req = urllib.request.Request(
-        LV.JEV_URL,
-        data=json.dumps({"model": LV.JEV_MODEL, "state": "\n".join(state),
+        _url,
+        data=json.dumps({"model": _model, "state": "\n".join(state),
                          "questions": questions}).encode(),
         headers={"Authorization": "Bearer %s" % key, "Content-Type": "application/json"},
     )

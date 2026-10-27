@@ -196,7 +196,8 @@ QUESTIONS = {
 # simplification moved a lane BACKWARDS.
 #
 # ⛔ THE NULL PAIR WAS NOT RUNNABLE HERE, AND THAT IS WHY THIS IS THE MECHANICAL
-# PATH. Running it needs a JEV_API_KEY (paid calls) and a live `jev()`; the
+# PATH. Running it needs a TypeSafe key (paid calls) — `TYPESAFE_API_KEY`, the legacy
+# `JEV_API_KEY`, or the 0600 store at ~/.pi/agent/jev-config.json — and a live `jev()`; the
 # replacement below needs neither — which is the point. A mark computed from the
 # text by plain code has EXACTLY ZERO run-to-run variance by construction, so the
 # null pair is not a sample to be drawn, it is a property to be asserted:
@@ -710,7 +711,12 @@ def _key():
             return k.strip()
     try:
         p = os.path.expanduser("~/.pi/agent/jev-config.json")
-        return json.load(open(p)).get("apiKey")
+        k = json.load(open(p)).get("apiKey")
+        # ⛔ THE STORE IS STRIPPED TOO. Stripping only the env sources closes half the hole:
+        # a store written by `echo "$KEY" > …` carries a trailing newline, and `Bearer <key>\n`
+        # is the same 401 as a whitespace-only env var. This is the source the docstring above
+        # calls the only one on this box, so it is the one that matters.
+        return k.strip() if isinstance(k, str) else k
     except Exception:  # noqa: BLE001
         return None
 
@@ -736,7 +742,15 @@ def jev(state):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        print(f"jev http {e.code}: {e.read().decode()[:300]}")
+        # NAME THE HOST AND THE LIKELIEST CAUSE. A 401 from the vendor and a 401 caused by a
+        # STALE DEPLOYED COPY posting to the lookalike host print the same thing otherwise, so
+        # the one message that could answer the question asks the wrong one.
+        host = req.full_url.split("/")[2] if "//" in req.full_url else req.full_url
+        hint = ""
+        if e.code in (401, 403):
+            hint = (" -- the key is not this host's: rotate ~/.pi/agent/jev-config.json "
+                    "(the lookalike host's jv_live_... key 401s here)")
+        print(f"jev http {e.code} from {host}: {e.read().decode()[:300]}{hint}")
         return None
     except Exception as e:  # noqa: BLE001
         print(f"jev call failed: {e}")

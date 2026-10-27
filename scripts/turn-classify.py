@@ -324,7 +324,10 @@ def jev_key() -> str | None:
         if k and k.strip():
             return k.strip()
     try:
-        return json.load(open(f"{HOME}/.pi/agent/jev-config.json")).get("apiKey")
+        k = json.load(open(f"{HOME}/.pi/agent/jev-config.json")).get("apiKey")
+        # ⛔ the STORE is stripped too: `echo "$KEY" > file` leaves a trailing newline, and
+        # `Bearer <key>\n` is the same 401 as a whitespace-only env var.
+        return k.strip() if isinstance(k, str) else k
     except Exception:                                            # noqa: BLE001
         return None
 
@@ -346,7 +349,15 @@ def jev_choice(state: str) -> tuple[str | None, dict]:
         with urllib.request.urlopen(req, timeout=60) as r:
             d = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        log(f"ERR jev http {e.code}: {e.read().decode()[:200]}")
+        # NAME THE HOST: a 401 from the vendor and a 401 from a STALE DEPLOYED COPY posting to
+        # the lookalike host are otherwise the same line, so the one message that could tell them
+        # apart asks the wrong question.
+        host = req.full_url.split("/")[2] if "//" in req.full_url else req.full_url
+        hint = ""
+        if e.code in (401, 403):
+            hint = (" -- the key is not this host's: rotate ~/.pi/agent/jev-config.json "
+                    "(the lookalike host's jv_live_... key 401s here)")
+        log(f"ERR jev http {e.code} from {host}: {e.read().decode()[:200]}{hint}")
         return None, {}
     except Exception as e:                                       # noqa: BLE001
         log(f"ERR jev call failed: {e}")

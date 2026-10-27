@@ -8,10 +8,8 @@ produces those directions has to be pinned by a test rather than by a comment. T
 the two constants it posts with are pinned at the END of this file (their fail-closed arms — no key,
 HTTP error — are NOT yet pinned; that gap is agent-infra#2860).
 
-Run: /usr/bin/python3 scripts/test_lane_actions.py      (requires pytest — the module-level
-     `import pytest` and the `@pytest.mark.parametrize` leg below are the house convention, as in
-     the other scripts/test_*.py files; with pytest absent run `python3 -m pytest <this file>`
-     from an environment that has it, never a bare interpreter.)
+Run: python3 -m pytest scripts/test_lane_actions.py      (pytest required: module-level import +
+     @pytest.mark.parametrize; there is no bare-interpreter path in this file anymore)
 """
 import importlib.util
 import atexit
@@ -2742,6 +2740,42 @@ def test_jev_step5_posts_the_pinned_model_to_the_vendor_endpoint(monkeypatch):
     assert q["type"] == "choice" and isinstance(q["instructions"], str) and q["instructions"], q
     assert answers == {"demo": ("DONE_READY", 0.9)}, answers
     assert meta["source"] == "JEV" and meta["error"] is None, meta
+
+
+def test_step5_refuses_to_post_when_the_deployed_url_is_not_the_vendor(monkeypatch):
+    """⛔ THE BEAT NEVER RUNS PYTEST. `lane-actions.py` IS the scheduled job, so a stale deployed
+    `lane-verdict.py` whose `JEV_URL` still names the lookalike host would post the fleet's last
+    words AND the key there on every tick, silently — a green suite measured nothing about the
+    process that actually runs. The endpoint is therefore validated at runtime: not the vendor,
+    no request. This is the fail-closed arm the pytest-only guard
+    (`test_the_deployed_lane_verdict_constant_points_at_the_real_vendor`) cannot cover.
+
+    Non-vacuous by construction: it fails if the guard is removed, because `urlopen` is stubbed
+    to record and the assertion is that it was never called.
+    """
+    import types
+
+    posted = []
+
+    def fake_urlopen(req, timeout=None):
+        posted.append(req.full_url)
+        raise AssertionError("must not post at all")
+
+    monkeypatch.setattr(LA.urllib.request, "urlopen", fake_urlopen)
+    LV = types.SimpleNamespace(
+        JEV_URL="https://jevtypesafeai.com/api/v1/decide",
+        JEV_MODEL="jev-1.13.0",
+        jev_key=lambda: "test-key",
+        CRITERIA={},
+    )
+    rows = [{"lane": "demo", "last_message": "done", "said_age": 300,
+             "stale": 300, "spinner": None, "tool_desc": None}]
+    answers, meta = LA.jev_step5(rows, LV)
+
+    assert posted == [], posted
+    assert answers == {}, answers
+    assert meta["source"] == "RULE", meta
+    assert "not the vendor endpoint" in (meta.get("error") or ""), meta
 
 
 def _deployed_constants(filename):
