@@ -323,9 +323,10 @@ reclaim steps below touch it.
    is the bigger hammer and takes the whole guest: every worktree (the unpushed commits that check exists for), `keys.env`, the
    harness pin, `orchestrator/logs` + `orchestrator/state` (`merge-*.log`, `orch-loop.log`, the `state/` series), **the
    `orchestrator/*.txt` ledgers that sit directly under it** — `dispatched.txt`, `landed.txt`, `checked.txt`,
-   `candidates.txt`: `install.sh:649-650` creates them BESIDE `logs/` and `state/` and `wip/`, not inside them, so a check that
-   reads only `state/` and `logs/` misses the evidence §4/§5 use to say what happened — and **`orchestrator/wip/`**, the
-   cap-killed lanes' dirty-work captures.
+   `candidates.txt`: `install.sh:649-650` puts them BESIDE `logs/` and `state/` and `wip/`, not inside them — `:650`
+   creates `candidates.txt`, `dispatched.txt` and `checked.txt`, and `landed.txt` arrives with the first
+   `refresh-candidates.sh` pass (`:2951`) — so a check that reads only `state/` and `logs/` misses the queue and landing
+   ledgers — and **`orchestrator/wip/`**, the cap-killed lanes' dirty-work captures.
 
 ## 4. Liveness of a LANE, and the reaping rule
 
