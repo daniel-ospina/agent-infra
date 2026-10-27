@@ -884,7 +884,14 @@ fi
 # is `! 127` = TRUE, i.e. a box that shipped no module would defer every fixer forever while
 # reporting a healthy controller.
 if [ "${CIQ:-0}" = "1" ]; then
-  # ⛔ THE PREDICATE CAPTURES THE VERDICT **AND** MEMOIZES IT FOR THE CYCLE.
+  # ⛔ ONE CONSUMER LEFT, AND THAT IS THE POINT (#2917). `ciq_push_ok` gates the CI-RERUN site only.
+  # The three FIXER spawn arms no longer call it: they are REPAIR (an existing PR whose CI pass is
+  # already spent), and the class rule in `ci-queue.sh`'s header says only work that ADDS a new CI run
+  # is queue-gated. A rerun is exactly that — it queues a fresh run for the same head — so it keeps
+  # the gate. Measured 2026-10-27: the fixer arms' call to this predicate was the last-line half of a
+  # gate that skipped 41 consecutive repair dispatches with 8 idle runners and ~11 free lane slots.
+  # The predicate itself is unchanged (capture + memo); if a future arm needs it, it must be a
+  # CI-SPENDING one, and the wiring arms in ci-queue.test.sh count the call sites.
   #   * CAPTURES (#2296 cycle 4, P2): `ciq_ci_allowed` reads in the CALLER's shell, so after it runs
   #     the CIQ_* record IS this decision's reading. The deferral rows below print `${CIQ_VER:-…}`,
   #     and `CIQ_VER` is otherwise assigned only later, in the dispatch block — so they used to render
@@ -951,7 +958,10 @@ if [ -n "$_pss_mod" ]; then
 fi
 if declare -f ps_select ps_decide ps_polarity ps_verdict ps_held >/dev/null 2>&1; then
   PRSICK=1
-  ps_load_ci_queue >/dev/null 2>&1 || true
+  # ⛔ NO QUEUE MODULE IS LOADED FOR THE PR-SICKNESS QUEUE (#2917): every dispatch it makes is
+  # REPAIR, which adds no new CI run, so it reads no queue depth. Its bound is `--max-spawn` (the
+  # fix-lane headroom `fix_slots` computes) exactly as before. The CI-queue read this loop still
+  # needs is the dispatch block's own, below.
 else
   PRSICK=0
   # ⛔ A MISSING SELECTOR IS NAMED, NOT ASSUMED. Without this line a box that was never re-seeded
@@ -4545,48 +4555,24 @@ while true; do
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            # ⛔ ONE PREDICATE, ONE SITE: THE QUEUE GATE NESTS INSIDE THE ELIGIBILITY IT QUALIFIES
-            # (#2333 cycle 7 P2, kept through the merge with main). Evaluated as a separate `elif`
-            # the predicate would be duplicated — and a duplicated predicate is what lets the DEFER
-            # arm drift from the SPAWN arm it is supposed to mirror: evaluated in the other order, a
-            # box with every fix lane busy AND a deep queue reported `ci-queue(deep(…))` as the
-            # binding reason and never printed its own `NO fixer slot` diagnosis, a disposition the
-            # capacity gate — not the queue — was binding. Nested, the deferral is reachable ONLY
-            # through the spawn's own predicate, so a non-eligible PR can never be reported as
-            # deferred, and no second copy can drift. (The review-gate fixer arm below cannot nest —
-            # it is a two-arm `if`/`elif` chain — so it hoists `_fix_eligible` for the same reason;
-            # see its own ⛔.) It also keeps ONE comparison against the drain-aware `$MF` per spawn
-            # site, which is the count `test-gates.sh` asserts as "every fixer spawn site uses the
-            # drain-aware budget" — a second copy of the comparison is not a second spawn site.
-            if ciq_push_ok; then
-              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
-                echo $((NFC + 1)) > "$CF"
-                echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
-              else
-                echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
-              fi
+            # ⛔ NO CI-QUEUE GATE ON THIS SPAWN, AND THIS IS THE ARM THAT PROVES THE RULE (#2917).
+            # A CONFLICTED fixer is REPAIR: the PR and its head already exist and its CI pass has
+            # already been paid for. Measured 2026-10-27 on cell 4, the queue gate that used to wrap
+            # this spawn deferred 41 consecutive repair dispatches against a queue that belonged to
+            # GitHub-HOSTED concurrency, while 8 self-hosted runners and ~11 lane slots sat idle —
+            # and it reported `ci-queue(deep(…))` as the binding reason for a box whose lanes were
+            # free. The REAL bounds on this spawn are the two conditions above it (the `$MF` fix-lane
+            # ceiling, the cross-box claim and `can_spawn`'s load/disk/memory gate) plus
+            # `fix-one.sh`'s own spawn gate. `ci-queue.sh`'s header states the class rule: only work
+            # that ADDS a new CI run is queue-gated. Do not re-nest it here.
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+              echo $((NFC + 1)) > "$CF"
+              echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
             else
-              # ⛔ THE PUSH ARM (the rule this change exists for). A CONFLICTED fixer's entire purpose
-              # is to PUSH A NEW HEAD, and a push now would (a) queue behind a backlog it cannot
-              # finish inside its own lease and (b) invalidate this PR's head-bound review record —
-              # the attestation is bound to a SHA, so the push destroys the artifact it exists to
-              # produce. Deferred, not dropped: NO attempt is consumed (the counter is incremented
-              # only after a spawn), the PR keeps its place in the sweep, and the next cycle's FRESH
-              # read decides again — that is what makes the deferral non-sticky.
-              # ⛔ THE MEMOIZED VERDICT, WHICH THIS CYCLE DID MEASURE (#2333 review P2). `ciq_push_ok`
-              # reads on the COLD path (`orch-loop.sh`'s predicate), and this arm is only reached
-              # *through* it — so `CIQ_VER` is SET here and `${…:-unmeasured}` never fires. The old
-              # comment claimed the opposite ("the cycle's own read has not run yet"), i.e. it
-              # documented the cycle-6 P0 it was written to fix; an editor trusting it would
-              # "restore" a cold-path-less predicate and refuse every fixer for ever. The
-              # `unmeasured` default is kept as a defensive floor for the arm that cannot reach the
-              # read — precisely because the exact verdict also rides the `[ci-queue] DEFERRED …`
-              # line above, verbatim.
-              ciq_defer_note_here "CONFLICTED fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
-              disp "$PR" "${HEAD_N:-}" CONFLICTED wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
+              echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
             fi
           else
             # ⛔ THE SILENT REFUSAL (#2126 T5). Five capacity sites used to test their ceiling in an
@@ -4749,13 +4735,13 @@ while true; do
             is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
-            # ⛔ THE QUEUE GATE APPLIES TO THIS ARM TOO (#2333 cycle 3, P2). This spawn is a PUSHER as
-            # well — `fix-one.sh`'s product is a new head — so it obeys the same rule the other two
-            # fixer arms do: on a deep or unreadable queue the push would void this PR's head-bound
-            # review record and queue behind a backlog it cannot outlast. (The README and the suite
-            # both said "both fixer spawn arms"; there are three, and the suite pinned the gap.)
-            # The eligibility predicate is hoisted so the DEFER arm below can share it verbatim rather
-            # than duplicating the guard, and so a non-eligible PR can never be reported as deferred.
+            # ⛔ NO CI-QUEUE GATE ON THIS SPAWN EITHER (#2917): a review-findings fixer is REPAIR (its
+            # head already exists and its CI pass is already spent), so the class rule in
+            # `ci-queue.sh`'s header excludes it — same measurement, same 41 skips, same idle fleet as
+            # the CONFLICTED arm above. What stays: the eligibility predicate is still HOISTED into
+            # `_fix_eligible`, because the arms BELOW it (the attempt cap / park arm and the re-record
+            # chain) must ask exactly the question the spawn arm asks — capacity, findings and the
+            # attempt budget — and must not drift from it.
             _fix_eligible=0
             if [ -n "${HEAD_N:-}" ] && [ "$_rgs" = "NEEDS-FIX" ] \
                && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
@@ -4763,7 +4749,7 @@ while true; do
                && [ "$(wt_count fix-)" -lt "$MF" ]; then
               _fix_eligible=1
             fi
-            if [ "$_fix_eligible" = "1" ] && ciq_push_ok; then
+            if [ "$_fix_eligible" = "1" ]; then
               # Spawn FIRST, bookkeep only on success: recording the attempt before the spawn
               # means a killed/failed spawn consumes one of MAX_FIX_TRIES and deletes the
               # findings marker, so no fixer ever runs and the findings are lost.
@@ -4789,9 +4775,6 @@ while true; do
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "review-gate fixer spawn FAILED (attempt not consumed)"
               fi
-            elif [ "$_fix_eligible" = "1" ]; then
-              ciq_defer_note_here "review-gate fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
-              disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
             elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ "$_rgs" = "NEEDS-FIX" ]; then
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
@@ -4946,27 +4929,17 @@ while true; do
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            # ONE PREDICATE, ONE SITE — the CONFLICTED arm above carries the full reasoning (#2333
-            # cycle 7 P2): the queue decision nests inside the eligibility it qualifies, so a deep
-            # queue is the BINDING reason only for a PR that could otherwise have spawned, and there
-            # is no second copy of the `$MF` comparison to drift from this one.
-            if ciq_push_ok; then
-              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
-                echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
-                echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
-              else
-                echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
-              fi
+            # NO CI-QUEUE GATE — see the CONFLICTED arm above for the rule and the measurement
+            # (#2917): a CI-red fixer is REPAIR, and the bounds on it are this `$MF` fix-lane ceiling,
+            # `can_spawn`'s load/disk/memory gate and the cross-box claim.
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+              echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
+              echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
             else
-              # Same push arm as the CONFLICTED site above, for the other lane whose whole job is a
-              # new head: a CI-red fixer pushes a fix commit. Deferred with no attempt consumed --
-              # `fixcount-<PR>` is written only after a spawn, so the PR is not one attempt poorer
-              # for a cycle in which nothing was even started.
-              ciq_defer_note_here "CI-red fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
-              disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
+              echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
             fi
           else
             echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, $(spawn_gate_tok))" >>"$LOG"
