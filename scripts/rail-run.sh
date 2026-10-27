@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # rail-run.sh — run the merge rail DETACHED and poll it for a first-class verdict (agent-infra#2885).
 #
-#   rail-run.sh start  <PR> [rail args...]                        → returns IMMEDIATELY
-#   rail-run.sh status <PR> [--repo owner/repo] [--run <run-id>]  → one state word + its evidence
+#   rail-run.sh start  <PR> ARGS...                        → returns IMMEDIATELY
+#   rail-run.sh status <PR> (--repo owner/repo) (--run <run-id>)  → one state word + its evidence
 #   rail-run.sh --help
 #
 # ── WHY THIS EXISTS ─────────────────────────────────────────────────────────────
@@ -88,14 +88,19 @@ RAIL="${RAIL_RUN_RAIL:-$SELF_DIR/admin-merge.sh}"
 GH="${RAIL_RUN_GH:-gh}"
 PS="${PS_BIN:-/bin/ps}"
 CLAIM=""
+# How long a start claim may sit before it is STALE. A launcher's whole life is the 5s pid wait, so a
+# claim older than this was left by a launcher that died — including one that died between `mkdir` and
+# writing its pid. Without the bound that window would block the PR forever (and a recycled pid
+# reading off-fence would too).
+CLAIM_MAX="${RAIL_RUN_CLAIM_MAX:-60}"
 
 usage() {
   cat >&2 <<'EOF'
-usage: rail-run.sh start  <PR> [rail args...]
-       rail-run.sh status <PR> [--repo owner/repo] [--run <run-id>]
+usage: rail-run.sh start  <PR> ARGS...
+       rail-run.sh status <PR> (--repo owner/repo) (--run <run-id>)
        rail-run.sh --help
 
-  start   launches the rail as `<rail> <PR> [rail args...]` in a detached session and RETURNS
+  start   launches the rail as `<rail> <PR> ARGS...` in a detached session and RETURNS
           IMMEDIATELY. Prints the run id, the log path and the status command. Exit 0 = started.
   status  prints "<state> key=value …" and exits with that state's code:
           0 landed · 10 running · 20 refused · 21 killed · 22 gone-without-verdict
@@ -127,7 +132,7 @@ mtime_epoch() {
   printf '%s' "$m"
 }
 
-log_age_s() { # <logfile> -> integer seconds since the log was last written, or nothing
+age_s() { # <path> -> integer seconds since it was last written, or nothing
   local m now
   m="$(mtime_epoch "$1")"; [ -n "$m" ] || return 0
   now="$(numeric_or_empty "$(date +%s 2>/dev/null || true)")"; [ -n "$now" ] || return 0
@@ -161,7 +166,14 @@ check_pr() {
 # to one constant: a constant would make every such repo share a key, and `status` could then report
 # another repo's run — including `landed` — as this one's.
 repo_key() {
-  if [ -n "${1:-}" ]; then printf '%s' "${1//\//-}"; return 0; fi
+  local s="${1:-}"
+  if [ -n "$s" ]; then
+    s="${s//\//-}"
+    case "$s" in
+      ''|.|..|*[!A-Za-z0-9._-]*) s="repo-$(printf '%s' "$1" | cksum | cut -d' ' -f1)" ;;
+    esac
+    printf '%s' "$s"; return 0
+  fi
   local common d full="" b=""
   common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
   if [ -n "$common" ]; then
@@ -203,6 +215,31 @@ release_claim() {
   CLAIM=""
 }
 
+# prev_in_flight <run-dir> -> 0 when the run may still be alive (so a second rail must not start).
+# The same three-outcome rule as the poll, plus ONE extra state the poll cannot see: a launcher that
+# has created its run dir and published it to `latest` but has not yet spawned (or whose recorder has
+# not yet written its pid). Its record has NO incarnation and NO exit status, so it is in flight while
+# the record is young, and abandoned once it is older than CLAIM_MAX.
+prev_in_flight() {
+  local d="$1" p ps rp rs prc age
+  [ -f "$d/rc" ] && return 1                       # it reached its own verdict: not in flight
+  p="$(file_or_empty "$d/pid")"; ps="$(file_or_empty "$d/start")"
+  if [ -n "$p" ]; then
+    pid_probe "$p" "${ps:-0}" >/dev/null 2>&1; prc=$?
+    if [ "$prc" = "0" ] || [ "$prc" = "2" ]; then return 0; fi
+  fi
+  rp="$(file_or_empty "$d/railpid")"; rs="$(file_or_empty "$d/railstart")"
+  if [ -n "$rp" ]; then
+    pid_probe "$rp" "${rs:-0}" >/dev/null 2>&1; prc=$?
+    if [ "$prc" = "0" ] || [ "$prc" = "2" ]; then return 0; fi
+  fi
+  if [ -z "$p" ] && [ -z "$rp" ]; then
+    age="$(numeric_or_empty "$(age_s "$d")")"
+    if [ -z "$age" ] || [ "$age" -le "$CLAIM_MAX" ]; then return 0; fi
+  fi
+  return 1
+}
+
 # ── start ──────────────────────────────────────────────────────────────────────
 start_rail() {
   local pr="${1:-}"; shift || true
@@ -215,6 +252,7 @@ start_rail() {
       --repo=*) slug="${a#--repo=}" ;;
     esac
   done
+  [ "$want" = "0" ] || die "--repo needs a value (owner/repo)"
   [ -f "$RAIL" ] || die "no rail at $RAIL — set RAIL_RUN_RAIL, or run this beside admin-merge.sh"
 
   local key dir
@@ -222,15 +260,19 @@ start_rail() {
   dir="$RUN_ROOT/$key/pr-$pr"
   mkdir -p "$dir" || die "cannot create the run-state dir $dir"
 
-  # ── ONE LIVE RUN PER PR — A CLAIM TAKEN BEFORE THE PROBE ──
+  # ⛔ ONE LIVE RUN PER PR — A CLAIM TAKEN BEFORE THE PROBE ──
   # Probing alone is check-then-act: two `start`s racing both see no live run and both launch a rail,
   # which is two merge attempts on one PR. The claim is an ATOMIC `mkdir`, taken BEFORE the probe and
-  # released only after the new run id has been published to `latest`.
-  #   * a claim that probes LIVE or UNVERIFIABLE is another start in flight → refuse;
-  #   * a claim whose own launcher is positively gone is STALE → remove it and retry ONCE (the same
-  #     three-outcome rule the run probe uses: an abstention blocks, only positive evidence clears).
+  # released once the new run id is published to `latest`.
+  #
+  # ⛔ THE mkdir→pid WINDOW IS **IN FLIGHT**, NOT DEAD. The claim dir exists for a few instructions
+  # before its `pid` is written, and reading that window as "no owner" let a second start DELETE a live
+  # claim and launch a second rail — the race the claim exists to close, re-opened inside the guard.
+  # So: an absent pid REFUSES while the claim is young; only POSITIVE evidence of a dead launcher (its
+  # pid read and absent) or a claim older than CLAIM_MAX (its launcher lived ~5s, so it is abandoned —
+  # this also stops a recycled pid reading off-fence from blocking the PR forever) clears it.
   CLAIM="$dir/.starting"
-  local tries=0 c_pid c_start c_probe c_rc
+  local tries=0 c_pid c_start c_probe c_rc c_age c_stale
   while :; do
     if mkdir "$CLAIM" 2>/dev/null; then break; fi
     tries=$((tries + 1))
@@ -239,13 +281,33 @@ start_rail() {
       printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
       exit 3
     fi
+    c_age="$(numeric_or_empty "$(age_s "$CLAIM")")"
+    c_stale=0
+    if [ -n "$c_age" ] && [ "$c_age" -gt "$CLAIM_MAX" ]; then c_stale=1; fi
     c_pid="$(file_or_empty "$CLAIM/pid")"; c_start="$(file_or_empty "$CLAIM/start")"
-    c_probe="$(pid_probe "${c_pid:-0}" "${c_start:-0}" 2>/dev/null)"; c_rc=$?
-    if [ "$c_rc" = "0" ] || [ "$c_rc" = "2" ]; then
-      if [ "$c_rc" = "0" ]; then c_probe="LIVE"; else c_probe="UNVERIFIABLE"; fi
-      printf 'rail-run: ✗ a start for pr=%s is already in flight (%s)\n' "$pr" "$c_probe" >&2
-      printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
-      exit 3
+    c_probe="a claim older than ${CLAIM_MAX}s (its launcher is gone)"
+    if [ -z "$c_pid" ]; then
+      if [ "$c_stale" != "1" ]; then
+        printf 'rail-run: ✗ a start for pr=%s has just begun (its claim %s has no pid yet)\n' "$pr" "$CLAIM" >&2
+        printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
+        exit 3
+      fi
+    else
+      c_probe="$(pid_probe "$c_pid" "${c_start:-0}" 2>/dev/null)"; c_rc=$?
+      case "$c_rc" in
+        0)
+          # Positively alive. Never cleared, whatever its age.
+          printf 'rail-run: ✗ a start for pr=%s is already in flight (probe: %s)\n' "$pr" "$c_probe" >&2
+          printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
+          exit 3 ;;
+        2)
+          # An abstention blocks — unless the claim is old enough that its launcher cannot be it.
+          if [ "$c_stale" != "1" ]; then
+            printf 'rail-run: ✗ a start for pr=%s is already in flight (UNVERIFIABLE: %s)\n' "$pr" "$c_probe" >&2
+            printf '  poll it:  bash %s status %s%s\n' "$SELF" "$pr" "${slug:+ --repo $slug}" >&2
+            exit 3
+          fi ;;
+      esac
     fi
     rm -rf "$CLAIM" 2>/dev/null || true
   done
@@ -254,28 +316,18 @@ start_rail() {
   printf '%s\n' "$(numeric_or_empty "$(pid_start_epoch "$$" 2>/dev/null || true)")" > "$CLAIM/start"
   trap release_claim EXIT
 
-  # ── AN EXISTING RUN'S INCARNATION IS PROBED, never its directory ──
+  # ── AN EXISTING RUN IS JUDGED ON ITS INCARNATION, NEVER ON ITS DIRECTORY ──
   # A stale dir left by a run that ended (or by a reused pid) must not block a start — that is the
   # stale-flag defect the fleet has already paid for. An ABSTENTION blocks, because a second rail on
   # one PR is a second merge attempt, and an unread probe is not permission.
   local prev
   prev="$(file_or_empty "$dir/latest")"
-  if [ -n "$prev" ] && [ -d "$dir/$prev" ]; then
-    local prev_pid prev_start probe probe_rc what
-    prev_pid="$(file_or_empty "$dir/$prev/pid")"
-    prev_start="$(file_or_empty "$dir/$prev/start")"
-    if [ -n "$prev_pid" ]; then
-      probe="$(pid_probe "$prev_pid" "${prev_start:-0}" 2>/dev/null)"; probe_rc=$?
-      if [ "$probe_rc" = "0" ] || [ "$probe_rc" = "2" ]; then
-        if [ "$probe_rc" = "0" ]; then what="LIVE"; else what="UNVERIFIABLE"; fi
-        printf 'rail-run: ✗ a rail run for pr=%s is already %s (run=%s, probe=%s)\n' \
-          "$pr" "$what" "$prev" "${probe:-?}" >&2
-        printf '  its log:  %s\n' "$dir/$prev/log" >&2
-        printf '  poll it:  bash %s status %s --run %s%s\n' "$SELF" "$pr" "$prev" "${slug:+ --repo $slug}" >&2
-        printf '  or wait:  it writes its own exit status; poll again rather than starting a second rail\n' >&2
-        exit 3
-      fi
-    fi
+  if [ -n "$prev" ] && [ -d "$dir/$prev" ] && prev_in_flight "$dir/$prev"; then
+    printf 'rail-run: ✗ a rail run for pr=%s may still be alive (run=%s)\n' "$pr" "$prev" >&2
+    printf '  its log:  %s\n' "$dir/$prev/log" >&2
+    printf '  poll it:  bash %s status %s --run %s%s\n' "$SELF" "$pr" "$prev" "${slug:+ --repo $slug}" >&2
+    printf '  or wait:  it writes its own exit status; poll again rather than starting a second rail\n' >&2
+    exit 3
   fi
 
   local rid rd
@@ -287,6 +339,11 @@ start_rail() {
   printf '%s\n' "$RAIL" > "$rd/rail"
   { for a in "$@"; do printf '%q ' "$a"; done; printf '\n'; } > "$rd/args" 2>/dev/null
   : > "$rd/log"
+  # ⛔ PUBLISHED BEFORE THE SPAWN. `latest` is what `status` follows, so publishing it only after the
+  # pid lands made every poll during the launch window answer `no-run` — including the poll command
+  # this very verb prints, and including the poll a refused duplicate start points at. A launch in
+  # progress now reads `unknown` ("no incarnation recorded", which is what it is), never `no-run`.
+  printf '%s\n' "$rid" > "$dir/latest"
 
   # ── THE SPAWN ──
   # The recorder re-execs THIS script as `__exec`, so there is no nested quoting to get wrong.
@@ -317,7 +374,14 @@ os.execvp(sys.argv[1], sys.argv[1:])'
   local i=0
   while [ "$i" -lt 100 ] && [ ! -s "$rd/pid" ]; do sleep 0.05; i=$((i + 1)); done
   if [ ! -s "$rd/pid" ]; then
-    printf 'rail-run: ✗ the launch did not start: no pid was recorded in %s (spawn pid %s)\n' "$rd" "$spawn" >&2
+    # ⛔ THIS IS A TIMEOUT, NOT A MEASUREMENT OF NON-START. The spawn is killed and the run retired
+    # from `latest` (its dir stays as evidence), because a `latest` pointing at a run with no
+    # incarnation would make the NEXT start's guard treat a corpse as in flight, and a live-but-slow
+    # recorder would otherwise spawn a rail that neither `latest` nor the claim covers.
+    kill -9 "$spawn" 2>/dev/null
+    if [ -n "$prev" ]; then printf '%s\n' "$prev" > "$dir/latest"; else rm -f "$dir/latest"; fi
+    printf 'rail-run: ✗ no pid was recorded within 5s, so this launch is treated as FAILED\n' >&2
+    printf '  (a timeout is not a measurement that nothing started — the spawn pid %s was killed).\n' "$spawn" >&2
     printf '  the recorder output is in %s\n' "$rd/log" >&2
     exit 5
   fi
@@ -331,7 +395,6 @@ os.execvp(sys.argv[1], sys.argv[1:])'
   elif [ "$cpgid" != "$mpgid" ]; then sess="own"
   else sess="shared"; fi
 
-  printf '%s\n' "$rid" > "$dir/latest"
   release_claim
   printf 'started pr=%s run=%s pid=%s session=%s%s\n' \
     "$pr" "$rid" "$cpid" "$sess" "${slug:+ repo=$slug}"
@@ -368,7 +431,7 @@ derive() {
   slug="$(file_or_empty "$rd/repo")"
   log="$rd/log"
   bytes="$(numeric_or_empty "$(wc -c < "$log" 2>/dev/null | tr -d '[:space:]')")"
-  age="$(log_age_s "$log")"
+  age="$(age_s "$log")"
   rc="$(file_or_empty "$rd/rc")"
 
   # row <state> [extra key=value] — ONE line, every read value on it, nothing inferred.
@@ -539,16 +602,20 @@ derive() {
     printf '  merge is certified by the ARTIFACT alone: this run produced no rail verdict\n'
     return 0
   fi
+  # ⛔ `gone-without-verdict` IS A TERMINAL CLAIM ABOUT THE RUN, so it needs the artifact read to have
+  # SUCCEEDED: an unreadable PR state is `unknown` (25) here as everywhere else, because a poller that
+  # branched on 22 would otherwise record a terminal no-verdict for a head it could not read.
+  if [ -z "$prst" ]; then
+    row "unknown" "verdict=none artifact=unread"
+    printf '  the recorder is GONE (%s) and the rail is not alive, with no exit status written — but\n' "${probe:-probe unavailable}"
+    printf '  the PR state could not be read, so whether this run merged anything is UNKNOWN\n'
+    printf '  re-poll rather than concluding either way\n'
+    return 25
+  fi
   row "gone-without-verdict" "verdict=none"
   printf '  the recorder is GONE (%s), the rail is not alive, and no exit status was written —\n' "${probe:-probe unavailable}"
-  printf '  this run produced NO VERDICT\n'
-  if [ -z "$prst" ]; then
-    printf '  the PR state could not be read either, so whether this run merged anything is UNKNOWN:\n'
-    printf '  this is neither a landing claim nor a refusal claim\n'
-  else
-    printf '  the PR is %s. Nothing is running for this run, so a merge from it is no longer possible;\n' "$prst"
-    printf '  re-run only after reading %s\n' "$log"
-  fi
+  printf '  this run produced NO VERDICT. The PR is %s and nothing is running for this run, so a\n' "$prst"
+  printf '  merge from it is no longer possible; re-run only after reading %s\n' "$log"
   return 22
 }
 
@@ -567,7 +634,13 @@ status_rail() {
         else die "status: unexpected argument '$a'"; fi ;;
     esac
   done
+  [ -z "$want" ] || die "--$want needs a value"
   check_pr "$pr"
+  # ⛔ `--run` IS A PATH COMPONENT. `..` or a `/` would resolve to another PR's run dir and then be
+  # labelled with THIS pr, so only a plain run id is accepted.
+  if [ -n "$run_id" ]; then
+    case "$run_id" in ''|.|..|*/*|*[!A-Za-z0-9._-]*) die "status: --run must be a plain run id (got '$run_id')" ;; esac
+  fi
   local key dir rd latest
   key="$(repo_key "$slug")"
   dir="$RUN_ROOT/$key/pr-$pr"

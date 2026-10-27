@@ -104,7 +104,7 @@ call() { # <verb> [args...] -> "<rc>|<output>"
   printf '%s|%s' "$rc" "$out"
 }
 poll() { call status "$@"; }
-wait_state() { # <want-state> <pr> [--run id] — poll until the state word matches (bounded)
+wait_state() { # <want-state> <pr> (--run id) — poll until the state word matches (bounded)
   local want="$1"; shift
   local i=0 out
   while [ "$i" -lt 150 ]; do
@@ -180,7 +180,7 @@ assert_state "$TXT" running "RUNNING: still 'running' after the log grew"
 # ── B: a LIVE run blocks a second start (one rail per PR), decided on evidence
 OUT="$(call start 101)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 3 "$RC" "DUPLICATE: a second start while one is live exits 3"
-assert_contains "$TXT" "already LIVE" "DUPLICATE: names the live run"
+assert_contains "$TXT" "may still be alive" "DUPLICATE: says the existing run may still be alive"
 N="$(wc -l < "$FAKE_RAIL_COUNT" | tr -d '[:space:]')"
 assert_rc 1 "$N" "DUPLICATE: exactly ONE rail invocation ever reached the rail"
 
@@ -291,6 +291,14 @@ assert_state "$TXT" gone-without-verdict "GONE: no exit status + recorder and ra
 assert_not_contains "$TXT" "landed" "GONE: never reported as landed"
 assert_contains "$TXT" "NO VERDICT" "GONE: says plainly that this run produced no verdict"
 
+# ── H1b: BOTH gone but the artifact UNREADABLE → unknown, never a terminal no-verdict ─
+# `gone-without-verdict` is a terminal claim about the run, so it needs the artifact read to have
+# succeeded. A poller branching on 22 must not record "no verdict" for a head it could not read.
+OUT="$(GH_MODE=fail wait_state unknown 107)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "GONE+UNREAD: no exit status, nothing alive, artifact unread → unknown (25)"
+assert_contains "$TXT" "artifact=unread" "GONE+UNREAD: says the artifact read abstained"
+assert_not_contains "$TXT" "gone-without-verdict" "GONE+UNREAD: never a terminal no-verdict claim"
+
 # ── H3: the same gone run, PR MERGED → landed=artifact ─────────────────────
 # The artifact outranks the exit status: reporting 'gone' over a real merge is the wrong direction.
 OUT="$(GH_MODE=merged poll 107)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
@@ -350,7 +358,7 @@ mkdir -p "$T/badbash"
 printf '#!/bin/sh\nexit 3\n' > "$T/badbash/bash"; chmod +x "$T/badbash/bash"
 OUT="$(PATH="$T/badbash:$PATH" call start 114)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
 assert_rc 5 "$RC" "LAUNCH: a spawn that records no pid exits 5"
-assert_contains "$TXT" "the launch did not start" "LAUNCH: says the launch failed instead of reporting a run"
+assert_contains "$TXT" "no pid was recorded within 5s" "LAUNCH: says the launch FAILED (and calls it a timeout)"
 OUT="$(poll 114)"; assert_rc 24 "${OUT%%|*}" "LAUNCH: and nothing is left claiming a live run (the claim was released)"
 
 # ── O: --repo=<slug> inline form keys the state and reaches the rail ────────
@@ -364,6 +372,51 @@ if [ -d "$RAIL_RUN_DIR/acme-widgets/pr-115" ]; then ok "ARGS: the run key follow
 else bad "ARGS: no run state under acme-widgets/pr-115"; fi
 OUT="$(poll 115 --repo acme/widgets)"; assert_rc 10 "${OUT%%|*}" "ARGS: status finds the run by the SAME slug"
 OUT="$(poll 115)"; assert_rc 24 "${OUT%%|*}" "ARGS: without --repo it is a DIFFERENT key (no silent cross-repo read)"
+
+# ── P: the CLAIM window is in flight, not dead ─────────────────────────────
+# The claim dir exists for a few instructions before its `pid` is written. Reading that window as
+# "no owner" let a second start DELETE a live claim and launch a second rail — the race the claim
+# exists to close, re-opened inside the guard.
+CLAIMDIR="$RAIL_RUN_DIR/agent-infra/pr-140/.starting"
+mkdir -p "$CLAIMDIR"
+OUT="$(call start 140)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 3 "$RC" "CLAIM-WINDOW: a claim with no pid YET refuses the start (in flight)"
+assert_contains "$TXT" "has just begun" "CLAIM-WINDOW: says the other start has just begun"
+touch -t 202001010000 "$CLAIMDIR"
+OUT="$(FAKE_RAIL_SLEEP=6 call start 140)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 0 "$RC" "CLAIM-STALE: a claim older than the bound is cleared and the start proceeds"
+PIDS+=("$(cat "$RAIL_RUN_DIR/agent-infra/pr-140/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+# a claim whose recorded pid is ALIVE and off-fence (rc 2) blocks while young, clears when old
+CLAIMDIR="$RAIL_RUN_DIR/agent-infra/pr-141/.starting"
+mkdir -p "$CLAIMDIR"; printf '%s\n' "$$" > "$CLAIMDIR/pid"; printf '0\n' > "$CLAIMDIR/start"
+OUT="$(call start 141)"; assert_rc 3 "${OUT%%|*}" "CLAIM-FENCE: an UNVERIFIABLE young claim blocks"
+touch -t 202001010000 "$CLAIMDIR"
+OUT="$(FAKE_RAIL_SLEEP=6 call start 141)"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "CLAIM-FENCE: an old unverifiable claim cannot block this PR forever"
+PIDS+=("$(cat "$RAIL_RUN_DIR/agent-infra/pr-141/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+# a run record that is LIVE but has recorded NO incarnation yet (launch in progress) blocks too
+mkdir -p "$RAIL_RUN_DIR/agent-infra/pr-142/inflight"
+printf '\n' > "$RAIL_RUN_DIR/agent-infra/pr-142/inflight/repo"
+: > "$RAIL_RUN_DIR/agent-infra/pr-142/inflight/log"
+printf 'inflight\n' > "$RAIL_RUN_DIR/agent-infra/pr-142/latest"
+OUT="$(call start 142)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 3 "$RC" "IN-FLIGHT: a run whose launch has not recorded an incarnation yet blocks a second rail"
+assert_contains "$TXT" "may still be alive" "IN-FLIGHT: and says so, rather than reporting no-run"
+touch -t 202001010000 "$RAIL_RUN_DIR/agent-infra/pr-142/inflight"
+OUT="$(FAKE_RAIL_SLEEP=6 call start 142)"; assert_rc 0 "${OUT%%|*}" "IN-FLIGHT: an abandoned record older than the bound does not block"
+
+# ── Q: path components are validated, not joined ───────────────────────────
+OUT="$(FAKE_RAIL_SLEEP=6 call start 143 --repo ..)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 0 "$RC" "TRAVERSAL: --repo .. is accepted"
+if [ -d "$RAIL_RUN_DIR/repo-"*"/pr-143" ] 2>/dev/null; then ok "TRAVERSAL: an unusable slug is HASHED into the run root"
+else bad "TRAVERSAL: --repo .. did not land under a hashed key in $RAIL_RUN_DIR"; fi
+if [ -d "$(dirname "$RAIL_RUN_DIR")/pr-143" ]; then bad "TRAVERSAL: run state escaped the run root (~/pr-143)"
+else ok "TRAVERSAL: nothing was written outside the run root"; fi
+PIDS+=("$(cat "$RAIL_RUN_DIR/repo-"*"/pr-143/"*/pid 2>/dev/null | tr '\n' ' ' | awk '{print $1}')")
+OUT="$(poll 5 --run ../../etc)"; assert_rc 2 "${OUT%%|*}" "TRAVERSAL: --run with a path separator is refused"
+OUT="$(poll 5 --run ..)"; assert_rc 2 "${OUT%%|*}" "TRAVERSAL: --run .. is refused"
+OUT="$(call start 5 --repo)"; assert_rc 2 "${OUT%%|*}" "ARGS: a dangling --repo is refused, not reinterpreted"
+OUT="$(poll 5 --run)"; assert_rc 2 "${OUT%%|*}" "ARGS: a dangling --run is refused"
 
 # ── Z: a stale TERMINAL run does not block a new start ─────────────────────
 OUT="$(GH_MODE=open call start 105)"; RC="${OUT%%|*}"

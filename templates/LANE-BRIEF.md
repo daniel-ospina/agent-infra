@@ -176,8 +176,8 @@ flag does either.
    detached and poll instead:
 
    ```bash
-   bash scripts/rail-run.sh start  <PR> [rail args...]   # returns at once, prints the run id + log
-   bash scripts/rail-run.sh status <PR> [--repo owner/repo] --run <run-id>
+   bash scripts/rail-run.sh start  <PR> ARGS...   # returns at once, prints the run id + log
+   bash scripts/rail-run.sh status <PR> (--repo owner/repo) --run <run-id>
    ```
    `status` exits 10 running · 0 landed · 20 refused · 21 killed · 22 gone-without-verdict — a run
    that produced NO verdict is never reported as a landing. See `docs/ops/rail-run.md`.

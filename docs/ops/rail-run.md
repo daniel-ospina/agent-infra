@@ -37,13 +37,24 @@ lane could not tell "still running" from "refused" from "killed".
 ## Use
 
 ```bash
-bash scripts/rail-run.sh start  <PR> [rail args...]                              # returns at once
-bash scripts/rail-run.sh status <PR> [--repo owner/repo] [--run <run-id>]        # poll
+bash scripts/rail-run.sh start  <PR> ARGS...                              # returns at once
+bash scripts/rail-run.sh status <PR> (--repo owner/repo) (--run <run-id>)        # poll
 ```
 
 `start` launches the rail in its own session with its own log and its own recorded exit status,
 prints the run id / log path / exact poll command, and exits. Nothing in this script waits on the
 rail, so no tool call can be capped by it.
+
+State lives under `${RAIL_RUN_DIR:-${O:-$HOME/orchestrator}/state/rail-run}/<repo-key>/pr-<N>/<run-id>/`
+(`pid`, `start`, `railpid`, `railstart`, `rc`, `log`, `repo`, `rail`, `args`, `started`, and a
+`latest` pointer). Three knobs: `RAIL_RUN_DIR`, `RAIL_RUN_RAIL` (the rail, default `admin-merge.sh`
+beside this script), and `RAIL_RUN_CLAIM_MAX` (default 60 s).
+
+**One rail per PR.** `start` takes an atomic `mkdir` claim *before* it probes, so two concurrent
+starts for one PR cannot both launch a rail (two merge attempts on one head). The claim is released
+only once `latest` is published; a claim whose launcher is positively gone, or one older than
+`RAIL_RUN_CLAIM_MAX`, is cleared and retried once. A claim that has not written its pid yet is **in
+flight, not dead** — reading that window as "no owner" is how a guard deletes a live claim.
 
 ## States (each one derived, never guessed)
 
@@ -111,8 +122,10 @@ Three stated residuals:
 bash scripts/rail-run.test.sh      # no network, no real gh, no real rail
 ```
 
-The suite is mostly negative — `running` must never read as landed or refused, `rc=0` is not a
-landing when the artifact disagrees, `gone-without-verdict` is never a landing, an unreadable
-liveness or PR read abstains, a live pid with the wrong incarnation is not "running", and two racing
-starts reach the rail exactly once. Every arm names the guard it discriminates; removing that guard
+**105 passed, 0 failed** (`bash scripts/rail-run.test.sh`, ~47 s, no network). The suite is mostly
+negative — `running` must never read as landed or refused, `rc=0` is not a landing when the artifact
+disagrees, `gone-without-verdict` is never a landing *or* claimed over an unread artifact, an
+unreadable liveness or PR read abstains, a live pid with the wrong incarnation is not "running", a
+claim in its `mkdir`→`pid` window is in flight rather than dead, `--repo`/`--run` cannot escape the
+run root, and two racing starts reach the rail exactly once. Every arm names the guard it discriminates; removing that guard
 fails the arm (mutation-checked while writing it).
