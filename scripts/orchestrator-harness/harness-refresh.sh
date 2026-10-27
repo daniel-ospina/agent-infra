@@ -281,12 +281,22 @@ RUNNING_FROM="self:$SELF"
 # `08`/`09` read as "cannot tell" (#1856 review).
 # ⛔ UNPROVABLE IS NOT OWNED. Here the failing direction is a false `current`, so an age that cannot
 # be read returns 1 and the stage falls through to the stamp path.
+# ⛔ THE SLACK IS THE FLEET'S ONE VALUE, NOT A LITERAL IN THIS FILE (#1856: "one predicate, three
+# answers"). Same value as `scripts/lib/pid-identity.sh`'s `PID_START_SLACK_SECONDS` and
+# `scripts/cloud-cell-supervisor.sh`'s `LOCK_START_SLACK_SECONDS`; `harness-refresh.test.sh`'s A37 pins
+# this copy to the canonical declaration, because a slack only REMEMBERED here goes stale the day the
+# shared default moves — and then accepts a pid that began after the lock as its owner.
+HARNESS_LOCK_START_SLACK_SECONDS="${HARNESS_LOCK_START_SLACK_SECONDS:-5}"
 _began_before_lock() { # <lock-file> <pid>
   local lf="${1:-}" p="${2:-}" lt se r d h m s
   [ -n "$lf" ] && [ -n "$p" ] || return 1
   lt="$(date -r "$lf" +%s 2>/dev/null)" || return 1
   case "$lt" in ''|*[!0-9]*) return 1 ;; esac
-  se="$(ps -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  # ⛔ THE `PS_BIN` SEAM IS WHAT MAKES "THE AGE CANNOT BE READ" DRIVABLE. Every other copy of this rule
+  # carries it (`scripts/lib/pid-identity.sh`, `cloud-cell-supervisor.sh`, `cloud-cell-doctor.sh`) and
+  # their suites drive the unreadable-age arm with a shim; a bare `ps` here left the arm that stops a
+  # stale lock from buying `current` DELETABLE with the suite still green (review P1, cycle 5).
+  se="$("${PS_BIN:-/bin/ps}" -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
   [ -n "$se" ] || return 1
   d=0
   case "$se" in *-*) d="${se%%-*}"; r="${se#*-}" ;; *) r="$se" ;; esac
@@ -300,7 +310,7 @@ _began_before_lock() { # <lock-file> <pid>
   case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
   se=$(( $(date +%s) - ( $((10#${d:-0})) * 86400 + $((10#${h:-0})) * 3600 \
                        + $((10#${m:-0})) * 60 + $((10#${s:-0})) ) ))
-  [ "$se" -le "$(( lt + 5 ))" ]
+  [ "$se" -le "$(( lt + HARNESS_LOCK_START_SLACK_SECONDS ))" ]
 }
 if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
   _ctrl_pid=""
@@ -317,8 +327,7 @@ if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
   # could only ever DOWNGRADE `current`, which is why the same weak evidence was safe there.
   if [ -n "$_ctrl_pid" ] && kill -0 "$_ctrl_pid" 2>/dev/null \
      && _began_before_lock "${O:-}/.orch.lock" "$_ctrl_pid"; then
-    _argv="$(ps -o command= -p "$_ctrl_pid" 2>/dev/null)"
-    _prev=""
+    _argv="$("${PS_BIN:-/bin/ps}" -o command= -p "$_ctrl_pid" 2>/dev/null)"
     # ⛔ `set -f` AROUND THE TOKEN SPLIT. The split itself is the point (a ps command line is ONE
     # string), but with globbing ON a `*`/`?` token is expanded against the CWD and can INVENT a word
     # that was never in argv — a token that then looks like a controller path. A path containing a SPACE
@@ -329,21 +338,37 @@ if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
     # quote characters live in variables, not as `\'` escapes: this file is read by a gate that
     # dequotes it statically (see #2175), and a backslash-quote in the body changes what that read sees.
     _sq="'"; _dq='"'
+    # ⛔ POSITIONAL, NEVER "A PATH NEXT TO A SHELL". The rule this block implements — and the one all
+    # three precedents implement — is *the path is the SCRIPT OPERAND of the shell*: argv[0] is the shell
+    # and argv[1] the script it executes (`_controller_ps_awk` compares `tok[1]`/`tok[2]`,
+    # `lock_controller_pid` compares `${1##*/}`/`${2##*/}`, `check-deployed-drift.sh` `t[1]`/`t[2]`).
+    # A predecessor-token test is WEAKER than all three: a wrapper whose ARGUMENTS happen to contain the
+    # words `bash <path>` (`perl -e 'sleep 120' bash <path>`) resolved RUNNING (measured, review cycle
+    # 5) — a `current` for a tree the controller is not executing. So the pair is read at positions 0
+    # and 1 and nowhere else. A controller launched with an interpreter FLAG (`bash -x <path>`) then does
+    # not resolve: cannot-verify, which falls to the stamp — the safe direction. `orch-loop.sh` takes no
+    # arguments, so `<shell> <path>` IS the whole invocation.
+    _pos=0
+    _sh_tok=""
+    _path_tok=""
     for _w in $_argv; do
       _w="${_w#$_sq}"; _w="${_w%$_sq}"; _w="${_w#$_dq}"; _w="${_w%$_dq}"
-      case "$_w" in
-        */orchestrator-harness/orch-loop.sh)
-          # A shell, named without a `case` alternation: the same static read treats `|` as a pipeline.
-          _base="${_prev##*/}"
-          if [ -n "$_base" ]; then
-            case " bash sh dash zsh ksh " in
-              *" $_base "*) _ctrl_tree="${_w%/orchestrator-harness/orch-loop.sh}" ;;
-            esac
-          fi ;;
+      case "$_pos" in
+        0) _sh_tok="$_w" ;;
+        1) _path_tok="$_w" ;;
       esac
-      _prev="$_w"
+      _pos=$((_pos+1))
     done
     if [ "$_glob_had" = 1 ]; then set +f; fi
+    _sh_base="${_sh_tok##*/}"
+    if [ -n "$_sh_base" ] && [ -n "$_path_tok" ]; then
+      case "$_path_tok" in */orchestrator-harness/orch-loop.sh)
+        # A shell, named without a `case` alternation: the same static read treats `|` as a pipeline.
+        case " bash sh dash zsh ksh " in
+          *" $_sh_base "*) _ctrl_tree="${_path_tok%/orchestrator-harness/orch-loop.sh}" ;;
+        esac ;;
+      esac
+    fi
   fi
   if [ -n "$_ctrl_tree" ]; then
     _ok=0

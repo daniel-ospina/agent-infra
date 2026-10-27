@@ -1246,6 +1246,57 @@ case "$R6" in *"running=$(short "$C2")"*) bad "a recycled-pid lock certified the
                *"running=$(short "$C1")"*) ok "a process that began after the lock was written is not its owner" ;;
                *) bad "the record named neither tree — the age path was skipped, not exercised: $R6" ;; esac
 
+# ⛔ A36g: AN AGE THAT CANNOT BE READ IS NOT OWNERSHIP (review P1, cycle 5). The `|| return 1` arm this
+# case drives is the one that stops a stale lock buying `current` when `ps` is broken — and it had NO
+# witness, so it could be flipped to "unreadable ⇒ I own it" with the suite green. Driven through the
+# `PS_BIN` seam the three canonical copies already carry, because a bare `ps` left this arm untestable.
+_CASE=$((_CASE+1)); echo "=== A36g: an unreadable age is not ownership — a failing ps leaves RUNNING on the stamp ==="
+mkdir -p "$T/a25/bin"
+printf '#!/bin/sh\nexit 1\n' > "$T/a25/bin/ps-none"
+chmod +x "$T/a25/bin/ps-none"
+bash "$_O26" & _P29=$!
+sleep 1
+printf '%s\n' "$_P29" > "$T/a25/o/.orch.lock"
+R7="$(O="$T/a25/o" HARNESS_PIN_DIR="$T/a24/pins" PS_BIN="$T/a25/bin/ps-none" bash "$RR" --no-fetch \
+       --repo "$T/src" --ref origin/main --pin "$PIN" --self "$T/a25/o" 2>&1)"
+rm -f "$T/a25/o/.orch.lock"; kill "$_P29" 2>/dev/null; wait "$_P29" 2>/dev/null
+case "$R7" in *"running=$(short "$C2")"*) bad "an unreadable age was read as ownership (false current): $R7" ;;
+               *"running=$(short "$C1")"*) ok "an age that cannot be read is not ownership — the stamp stands" ;;
+               *) bad "the record named neither tree: $R7" ;; esac
+
+# ⛔ A36h: THE PATH MUST BE THE SHELL'S SCRIPT OPERAND (argv[1]), NOT A WORD ANYWHERE IN THE ARGUMENTS.
+# Cycle-5 review measured this through the shipped script: `perl -e 'sleep 120' bash <path>` resolved
+# `relation=current` under a predecessor-token rule, although every precedent (`_controller_ps_awk`
+# `tok[2]`, `lock_controller_pid` `${2##*/}`, `check-deployed-drift.sh` `t[2]`) reads POSITIONALLY. Here
+# the wrapper is `bash -c 'sleep 120' bash <path>`: the same two words in the same order, one wrapper
+# deep, with the path as ARGUMENT rather than as the script being executed.
+_CASE=$((_CASE+1)); echo "=== A36h: a wrapper that only PASSES the path as an argument is not the controller ==="
+bash -c 'sleep 120' bash "$_O26" & _P30=$!
+sleep 1
+printf '%s\n' "$_P30" > "$T/a25/o/.orch.lock"
+R8="$(O="$T/a25/o" HARNESS_PIN_DIR="$T/a24/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$T/a25/o" 2>&1)"
+rm -f "$T/a25/o/.orch.lock"; kill "$_P30" 2>/dev/null; wait "$_P30" 2>/dev/null
+case "$R8" in *"running=$(short "$C2")"*) bad "a wrapper's ARGUMENT list resolved RUNNING (not argv[1] of the shell): $R8" ;;
+               *"running=$(short "$C1")"*) ok "the pair is read positionally — an argument-list mention is not the invocation" ;;
+               *) bad "the record named neither tree: $R8" ;; esac
+
+# ⛔ A37: THE SLACK IS THE FLEET'S ONE VALUE, NOT THIS FILE'S (#1856: "one predicate, three answers").
+# This script is a FOURTH standalone copy of the ownership rule (it is farmed into a flat `$O` and
+# cannot source `scripts/lib/`), so its slack must be PUSHED from the canonical declaration instead of
+# remembered. Without this arm, moving the shared default leaves this reader at the old value — and a
+# pid that began after the lock is then accepted as its owner.
+_CASE=$((_CASE+1)); echo "=== A37: the lock-age slack is the same value as scripts/lib/pid-identity.sh ==="
+_ROOT="$(cd "$HERE/../.." && pwd)"
+_canon="$(grep -oE 'PID_START_SLACK_SECONDS(:-|=)[0-9]+' "$_ROOT/scripts/lib/pid-identity.sh" 2>/dev/null | head -1 | sed -E 's/.*(:-|=)//')"
+_here="$(grep -oE 'HARNESS_LOCK_START_SLACK_SECONDS(:-|=)[0-9]+' "$RR" 2>/dev/null | head -1 | sed -E 's/.*(:-|=)//')"
+[ -n "$_canon" ] && [ -n "$_here" ] \
+  && ok "both copies declare a numeric default (pid-identity=$_canon harness-refresh=$_here)" \
+  || bad "a copy no longer declares its slack (pid-identity=[$_canon] harness-refresh=[$_here]) — the drift arm cannot compare"
+[ "$_canon" = "$_here" ] \
+  && ok "the lock-age slack is the canonical value ($_canon s), not a stale literal" \
+  || bad "lock-age slack DIVERGED — pid-identity=$_canon harness-refresh=$_here (a pid that began after the lock would be accepted)"
+
 # ⛔ A20: THE BOUND MUST EXIST ON macOS, WHERE `timeout` DOES NOT. A bare `timeout` call is rc=127 on the
 # Mac half of the fleet, and `if !` reads 127 as a FAILED FETCH — so the box would never fetch and would
 # warn on every cycle: the defect this script removes, re-created by its own bound. Driven through the
