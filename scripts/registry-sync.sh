@@ -439,10 +439,10 @@ push_one() { # <key> <source-file>
     attempt=$((attempt + 1))
     push_decision "$key" "$f"
     case "$DEC" in
-      skip)   say "  · keep $key — $DEC_MSG; a record is never overwritten with an older one (#2374 rule 1)"
+      skip) log_line "  · keep $key — $DEC_MSG; a record is never overwritten with an older one (#2374 rule 1)"
               SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); return 0 ;;
       same)   [ -n "$DEC_MSG" ] && log_line "  · $key — $DEC_MSG"; SAME=$((SAME + 1)); return 0 ;;
-      supersede) say "  · $key — $DEC_MSG; publishing it (a carry is a supersession, not a disagreement)" ;;
+      supersede) log_line "  · $key — $DEC_MSG; publishing it (a carry is a supersession, not a disagreement)" ;;
       unreadable) warn "  ⚠️ skip $key — $DEC_MSG; refusing to overwrite it (#2374 rule 1)."
               UNREADABLE=$((UNREADABLE + 1)); return 0 ;;
       conflict) conflict "$key" "$lat" "$DEC_PEER_AT" "$f"; return 0 ;;
@@ -557,9 +557,9 @@ pull_one() { # <key>
         # two boxes make onto one head); a different verdict is the real disagreement.
         case "$(same_stamp_relation "$tmp" "$lf")" in
           a) pull_reason="same mint time, same head, and the peer's record is the carried one; taking it as a supersession" ;;
-          b) say "  · keep $key — same mint time and THIS box's record is the carried one (same head, same verdict)"
+          b) log_line "  · keep $key — same mint time and THIS box's record is the carried one (same head, same verdict)"
              SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0 ;;
-          same) say "  · keep $key — same mint time, verdict, head and merge base; the records differ only in carry provenance"
+          same) log_line "  · keep $key — same mint time, verdict, head and merge base; the records differ only in carry provenance"
              SAME=$((SAME + 1)); rm -f "$tmp"; return 0 ;;
           *) conflict "$key" "$lat" "$rat" "$lf"; rm -f "$tmp"; return 0 ;;
         esac

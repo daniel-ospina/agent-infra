@@ -902,7 +902,7 @@ sync_review_registry() {
   fi
   out="$(bash "$sync" union 2>&1)" || rc=$?
   case "$rc" in
-    0) say "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
+    0) log_line "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
        # A converged run can still carry per-record notices, and this arm used to drop every one of
        # them: a store holding a record this box could not use printed `ok … synced` with the warning
        # discarded, which is the SILENCE the #2349 ruling forbids. Say what the run flagged.
@@ -1965,8 +1965,8 @@ fi
 if [ "$QUEUE_MODE" -eq 1 ]; then
   queue_declared; qd=$?
   case "$qd" in
-    0) say "atomic-land: --queue — $REPO declares a merge queue; the queue will own the merge" ;;
-    1) say "atomic-land: QUEUE-NOT-ARMED — $REPO declares NO merge queue in .mergify.yml"
+    0) log_line "atomic-land: --queue — $REPO declares a merge queue; the queue will own the merge" ;;
+    1) log_line "atomic-land: QUEUE-NOT-ARMED — $REPO declares NO merge queue in .mergify.yml"
        log_line "atomic-land: falling back to the EXISTING land path (update → verify → record → the mandatory rail), unchanged; the queue does not participate"
        QUEUE_MODE=0 ;;
     *) stop "could not read $REPO's .mergify.yml, so whether a merge queue is armed is UNKNOWN — refusing to choose a land path on an unreadable instrument" ;;

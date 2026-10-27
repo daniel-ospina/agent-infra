@@ -336,7 +336,7 @@ one_pass() { # <dry-run:0|1>
                 "$SCRIPTS/pi-reap-worktrees.sh" --apply --repo "$REPO_PATH"
             rc_reap=$?
             case "$rc_reap" in
-                0) say "reap: pass completed (rc=0)" ;;
+                0) log_line "reap: pass completed (rc=0)" ;;
                 3) err "reap: FAILED CLOSED (rc=3) — a read the reaper needs could not be taken; it removed nothing it could not prove. Repair continues." ;;
                 4) err "reap: completed with at least one FAILED removal (rc=4). Repair continues." ;;
                 *) err "reap: unexpected rc=$rc_reap from the reaper. Repair continues." ;;
@@ -369,7 +369,7 @@ one_pass() { # <dry-run:0|1>
         timeout "${REPAIR_DOCTOR_TIMEOUT_S:-1800}" python3 "$doctor" --max "$cap"
     rc_dispatch=$?
     case "$rc_dispatch" in
-        0) say "dispatch: pass completed (rc=0)" ;;
+        0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
         3) err "dispatch: UNDELIVERED (rc=3) — the work was placed and no worker took it." ;;
         *) err "dispatch: unexpected rc=$rc_dispatch from pr-doctor." ;;

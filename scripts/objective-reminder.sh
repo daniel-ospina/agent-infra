@@ -116,7 +116,7 @@ resolve_backend() {
   case "$BACKEND" in
     cmux|tmux) printf '%s\n' "$BACKEND"; return 0 ;;
     auto) ;;
-    *) say "SKIP: unknown BACKEND '$BACKEND' (want auto|cmux|tmux)"; return 1 ;;
+    *) log_line "SKIP: unknown BACKEND '$BACKEND' (want auto|cmux|tmux)"; return 1 ;;
   esac
   if [ -x "$CMUX" ]; then printf 'cmux\n'; return 0; fi
   if command -v "$TMUX" >/dev/null 2>&1; then printf 'tmux\n'; return 0; fi

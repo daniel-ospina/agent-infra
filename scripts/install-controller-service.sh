@@ -855,7 +855,7 @@ do_install() {
             _proc_began_after "$_pre_pid" "$_pre_hb"; _pre_rc=$?
             case "$_pre_rc" in
                 1) pre_active=1 ;;
-                2) say "warning: cannot date MainPID $_pre_pid - NOT treating $UNIT_NAME as pre-active; a heartbeat predating this start will not certify it" ;;
+                2) log_line "warning: cannot date MainPID $_pre_pid - NOT treating $UNIT_NAME as pre-active; a heartbeat predating this start will not certify it" ;;
                 *) : ;;
             esac
         fi
@@ -1089,7 +1089,7 @@ do_status() {
     fi
     # NRestarts is the direct evidence for the issue's bullet 3/5 ("it comes back on its own"): a unit
     # that has restarted had a controller that died and was brought back without a human.
-    local nr; nr="$(sc_run show -p NRestarts "$UNIT_NAME" 2>/dev/null)"; case "$nr" in NRestarts=*) say "restarts=${nr#NRestarts=}" ;; *) say "restarts=unreadable" ;; esac
+    local nr; nr="$(sc_run show -p NRestarts "$UNIT_NAME" 2>/dev/null)"; case "$nr" in NRestarts=*) log_line "restarts=${nr#NRestarts=}" ;; *) log_line "restarts=unreadable" ;; esac
     if age="$(heartbeat_age "${_st_o:-$O}")"; then
         log_line "heartbeat_age_s=$age"
         # Two cycles + 300s is the same staleness bound install.sh uses for launchd: a quiet cell is not a

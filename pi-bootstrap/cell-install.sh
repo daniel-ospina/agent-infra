@@ -1402,7 +1402,7 @@ verify_layer() {
   else
     shipped_content_matches "$INFRA_ROOT/skills" "$DEST/skills"
     case $? in
-      0) say "verified the skills tree against the checkout" ;;
+      0) log_line "verified the skills tree against the checkout" ;;
       2) fail "skills/ ships NO files in the checkout ($INFRA_ROOT/skills) — verify cannot vouch for an empty tree" ;;
       3) fail "skills/ could not be compared IN FULL ($INFRA_ROOT/skills) — refusing to certify a subset: an unreadable tree, a non-regular entry, or a name the file list cannot represent" ;;
       *) fail "SKILLS CONTENT DIFFERS from the checkout: skills/ (a stale, truncated or hand-edited copy)" ;;

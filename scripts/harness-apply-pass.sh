@@ -301,14 +301,14 @@ print_status() {
         0|10|11)
             case "${behind:-unknown}" in
                 0) ;;
-                *) say "status=behind rc=$rc behind=${behind:-unknown} age=${age}s — the pass exited cleanly but the box is NOT on $REF"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
+                *) log_line "status=behind rc=$rc behind=${behind:-unknown} age=${age}s — the pass exited cleanly but the box is NOT on $REF"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
             esac
             case "${fetchs:-}" in
                 ok|'') ;;
-                *) say "status=cannot-verify rc=$rc fetch=$fetchs age=${age}s — the comparison was not fresh"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
+                *) log_line "status=cannot-verify rc=$rc fetch=$fetchs age=${age}s — the comparison was not fresh"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
             esac
             log_line "status=ok rc=$rc age=${age}s"; printf '%s\n' "$body" | sed 's/^/  /'; return 0 ;;
-        *)       say "status=failed rc=${rc:-?} age=${age}s — a human must look"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
+        *) log_line "status=failed rc=${rc:-?} age=${age}s — a human must look"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
     esac
 }
 

@@ -2128,9 +2128,9 @@ cmd_check() {
             | if ($ids | index($m)) != null or ($ovr | index($m)) != null then "listed" else "absent" end
           end' "$models_json" 2>/dev/null)" || lane_state="unreadable"
     case "$lane_state" in
-      listed) say "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json; channel: $lane_chan)" ;;
-      absent) say "      lane model: $lane_provider/$lane_model — NOT RESOLVABLE FROM $models_json, and this id has no pi BUILT-IN: providers.$lane_provider there does not list it, and pi's built-in catalog carries only deepseek-v4-flash / deepseek-v4-flash-vision-exp / deepseek-v4-pro. pi MERGES the built-in catalog, so a PI_LANE_MODEL that IS built in still resolves from here — the SHIPPED DEFAULT ('deepseek-flash') is not, and on this box every harness lane would start on pi's 'Using custom model id' fallback: it runs, spends tokens, and degrades silently, which is the defect #2208 exists to remove. Remedy: add providers.$lane_provider.models.$lane_model to $models_json (pi-bootstrap/pi-config/models.json ships it, so a provisioned box is not affected — this fires on a box whose models.json was trimmed), or set PI_LANE_MODEL to a built-in id. Verify with the unfiltered: pi --list-models   [channel: $lane_chan]" ;;
-      *) say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (providers.$lane_provider unreadable/absent in $models_json; channel: $lane_chan)" ;;
+      listed) log_line "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json; channel: $lane_chan)" ;;
+      absent) log_line "      lane model: $lane_provider/$lane_model — NOT RESOLVABLE FROM $models_json, and this id has no pi BUILT-IN: providers.$lane_provider there does not list it, and pi's built-in catalog carries only deepseek-v4-flash / deepseek-v4-flash-vision-exp / deepseek-v4-pro. pi MERGES the built-in catalog, so a PI_LANE_MODEL that IS built in still resolves from here — the SHIPPED DEFAULT ('deepseek-flash') is not, and on this box every harness lane would start on pi's 'Using custom model id' fallback: it runs, spends tokens, and degrades silently, which is the defect #2208 exists to remove. Remedy: add providers.$lane_provider.models.$lane_model to $models_json (pi-bootstrap/pi-config/models.json ships it, so a provisioned box is not affected — this fires on a box whose models.json was trimmed), or set PI_LANE_MODEL to a built-in id. Verify with the unfiltered: pi --list-models   [channel: $lane_chan]" ;;
+      *) log_line "      lane model: $lane_provider/$lane_model — NOT VERIFIED (providers.$lane_provider unreadable/absent in $models_json; channel: $lane_chan)" ;;
     esac
   fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
@@ -3375,9 +3375,9 @@ cmd_status() {
     local _ast
     controller_unit_active_state; _ast=$?
     case "$_ast" in
-      0) say "supervision: $CONTROLLER_UNIT ACTIVE ($(basename "$(dirname "$_svc")") scope) — Restart=always; a dead controller comes back without a human" ;;
-      1) say "supervision: ⛔ $CONTROLLER_UNIT installed but NOT ACTIVE — nothing will restart a dead controller: systemctl start $CONTROLLER_UNIT" ;;
-      *) say "supervision: ⚠ $CONTROLLER_UNIT is installed but its STATE COULD NOT BE READ ($(sup_systemctl is-active "$CONTROLLER_UNIT" 2>&1 | head -1)) — whether anything restarts a dead controller is UNKNOWN, not 'no'" ;;
+      0) log_line "supervision: $CONTROLLER_UNIT ACTIVE ($(basename "$(dirname "$_svc")") scope) — Restart=always; a dead controller comes back without a human" ;;
+      1) log_line "supervision: ⛔ $CONTROLLER_UNIT installed but NOT ACTIVE — nothing will restart a dead controller: systemctl start $CONTROLLER_UNIT" ;;
+      *) log_line "supervision: ⚠ $CONTROLLER_UNIT is installed but its STATE COULD NOT BE READ ($(sup_systemctl is-active "$CONTROLLER_UNIT" 2>&1 | head -1)) — whether anything restarts a dead controller is UNKNOWN, not 'no'" ;;
     esac
     # ⛔ AND THE ROW SAYS WHETHER OWNERSHIP WAS PROVEN (review P1, #2402): a unit of ANOTHER state dir's
     # must never be reported as this cell's supervision, and a unit that declares no owner at all is
@@ -3436,7 +3436,7 @@ cmd_status() {
     # `status` prints it, or the operator reads `current` and stops there.
     case "${_fet:-ok}" in
       ok) : ;;
-      *) say "⛔ self-refresh comparison was NOT fresh (fetch=$_fet) — a 'current' above means 'current against the ref as of the last successful fetch', not against origin now" ;;
+      *) log_line "⛔ self-refresh comparison was NOT fresh (fetch=$_fet) — a 'current' above means 'current against the ref as of the last successful fetch', not against origin now" ;;
     esac
     # A verdict older than two cycles is not this cycle's answer: the controller has stopped
     # refreshing, so the pin above is a fact about the PAST. Same age-bound rule as the funnel, and the
@@ -3811,9 +3811,9 @@ reclaim_lane_venvs() {
     # KEPT. Naming only the first told an operator the env "was proven dead" and to hunt a REMOVE-FAILED
     # line that does not exist on the second path; naming only the second (the previous wording) was the
     # same error inverted. The arm states both, because `4` carries both.
-    4) say "prune: warn: a lane-venv removal did not complete (rc=4) — either it was proven dead and the delete FAILED (see the reaper's REMOVE-FAILED lines), or a removal-time re-probe failed closed and the env was KEPT (see FAIL-CLOSED); the reaper's own log says which" ;;
-    5) say "prune: warn: free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass — the reap completed, but a lane starting now can fill the disk (rc=5; see the reaper's capacity line)" ;;
-    *) say "prune: warn: the lane-venv reaper exited $rc — any env it could not prove dead was kept (it fails closed)" ;;
+    4) log_line "prune: warn: a lane-venv removal did not complete (rc=4) — either it was proven dead and the delete FAILED (see the reaper's REMOVE-FAILED lines), or a removal-time re-probe failed closed and the env was KEPT (see FAIL-CLOSED); the reaper's own log says which" ;;
+    5) log_line "prune: warn: free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass — the reap completed, but a lane starting now can fill the disk (rc=5; see the reaper's capacity line)" ;;
+    *) log_line "prune: warn: the lane-venv reaper exited $rc — any env it could not prove dead was kept (it fails closed)" ;;
   esac
   mb_after="$(free_mb "$CELL_HOME")"
   [ -n "$mb_before" ] && [ -n "$mb_after" ] && log_line "prune: lane venvs: free ${mb_before}MB → ${mb_after}MB"
@@ -4027,9 +4027,9 @@ cmd_prune() {
         # not be consulted at all is this file's own "instrument that cannot answer its own question".
         case "$?" in
           0) ;;
-          2) say "prune: NOT reclaiming $d — cannot VERIFY it is a pin: ${PIN_OWNED_ERR:-HARNESS_REPO is unresolved or not a git checkout}. Fix HARNESS_REPO (or the object store), then re-run '$0 prune'"
+          2) log_line "prune: NOT reclaiming $d — cannot VERIFY it is a pin: ${PIN_OWNED_ERR:-HARNESS_REPO is unresolved or not a git checkout}. Fix HARNESS_REPO (or the object store), then re-run '$0 prune'"
              continue ;;
-          *) say "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
+          *) log_line "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
              continue ;;
         esac
         log_line "prune: reclaiming superseded harness pin $d"
@@ -4123,5 +4123,5 @@ case "${1:-status}" in
   merge)   shift; cmd_merge "$@" ;;
   reap)    shift; cmd_reap "$@" ;;
   hygiene) shift; cmd_hygiene "$@" ;;
-  *)       say "usage: $0 check|start|stop|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
+  *) log_line "usage: $0 check|start|stop|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
 esac
