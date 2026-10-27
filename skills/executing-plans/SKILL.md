@@ -168,7 +168,7 @@ Everything else → Agent decides autonomously with a brief note, open to iterat
 
 ### Third-Party Dependency Detection
 
-When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in files the plan will touch, that is NOT covered by the plan's `### Pattern Research` section.
+When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in files the plan will touch, that is NOT covered by the plan's research evidence. **Which artifact that is depends on the pipeline (agent-infra#2861):** for `task-workflow-standard` it is the issue comment marked `<!-- research: v1 -->` whose `### Targeted Research Findings` block lists the dependency — read that; for `epic-workflow`/`project-workflow` it is the plan's `### Pattern Research` section. A task-pipeline lane that reads only the plan doc will find no research and mark every dependency unfamiliar, which is why this is stated here.
 
 **Detection algorithm:**
 
@@ -187,16 +187,16 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
    - Node.js built-ins (`fs`, `path`, `crypto`, `stream`, `http`, `https`, `url`, `os`, `events`, `util`, `buffer`, `child_process`, `tls`, `net`, `dns`, `readline`, `zlib`, `querystring`, `assert`, `cluster`, `dgram`, `domain`, `punycode`, `string_decoder`, `tty`, `vm`, `worker_threads`)
    - Type-only imports (`import type { ... } from '...'`)
 
-3. **Parse Pattern Research:** Read the plan's `### Pattern Research` section using an **anchored, line-level exact heading match** (`^### Pattern Research$`) — a substring match would let epic-brief headings such as `### UX Pattern Research` / `### Tech Stack Research` falsely satisfy coverage. Those epic-brief headings are PRIOR_RESEARCH context and **never** coverage evidence (issue #231 D5). Extract library/SDK/package names that appear in section headings or findings text. Also note `> Gate skipped`, `> Bucket [name] skipped`, and `> Research skipped: no demonstrated gap` justifications.
+3. **Parse the research evidence:** For a `task-workflow-standard` lane, read the `### Targeted Research Findings` block from the issue comment marked `<!-- research: v1 -->`; otherwise read the plan's `### Pattern Research` section. Either way use an **anchored, line-level exact heading match** (`^### Pattern Research$` / `^### Targeted Research Findings$`) — a substring match would let epic-brief headings such as `### UX Pattern Research` / `### Tech Stack Research` falsely satisfy coverage. Those epic-brief headings are PRIOR_RESEARCH context and **never** coverage evidence (issue #231 D5). Extract library/SDK/package names that appear in section headings or findings text. Also note `> Gate skipped`, `> Bucket [name] skipped`, and `> Research skipped: no demonstrated gap` justifications.
 
-4. **Cross-reference:** For each extracted package name, check if it (or its parent scope, e.g. `@supabase/supabase-js` matches `supabase`) is mentioned in Pattern Research. A package is "covered" if:
-   - Its name appears in a Pattern Research bucket heading or finding
-   - The Pattern Research explicitly mentions skipping it with a valid reason (e.g., "uses in-repo wrapper exclusively") — a **documented skip takes precedence over findings-date absence** (issue #231 H5)
-   - The Pattern Research says "plan touches zero third-party deps" AND no third-party imports were found
+4. **Cross-reference:** For each extracted package name, check if it (or its parent scope, e.g. `@supabase/supabase-js` matches `supabase`) is mentioned in the **research evidence read in step 3** (`### Pattern Research`, or `### Targeted Research Findings` from the `<!-- research: v1 -->` comment for a `task-workflow-standard` lane). A package is "covered" if:
+   - Its name appears in a research bucket heading or finding
+   - The research evidence explicitly mentions skipping it with a valid reason (e.g., "uses in-repo wrapper exclusively") — a **documented skip takes precedence over findings-date absence** (issue #231 H5)
+   - The research evidence says "plan touches zero third-party deps" AND no third-party imports were found
 
-5. **Determine unfamiliar:** Any package NOT covered by Pattern Research is "unfamiliar". Also treat as unfamiliar if:
-   - Pattern Research is absent from the plan entirely
-   - Pattern Research exists, contains **actual findings**, but carries **no `> **Findings date:** YYYY-MM-DD` stamp** — findings-date ABSENT → unfamiliar directly (fail-safe re-verify; NO plan-date fallback for the coverage question — legacy unstamped plans get re-verified, issue #231 D4). **Carve-out (issue #231 H5): a documented whole-section skip is NOT "findings-date absent" — a block carrying `> Gate skipped: <justification>` / `> Bucket [name] skipped: <justification>` / `> Research skipped: no demonstrated gap` takes precedence over the stamp rule (per Step 4); only blocks containing actual findings are subject to the stamp requirement.**
+5. **Determine unfamiliar:** Any package NOT covered by the research evidence is "unfamiliar". Also treat as unfamiliar if:
+   - the research evidence is absent entirely (neither the `<!-- research: v1 -->` comment nor a `### Pattern Research` section)
+   - the research evidence (either form — `### Pattern Research`, or `### Targeted Research Findings` for `task-workflow-standard`) exists, contains **actual findings**, but carries **no `> **Findings date:** YYYY-MM-DD` stamp** — findings-date ABSENT → unfamiliar directly (fail-safe re-verify; NO plan-date fallback for the coverage question — legacy unstamped plans get re-verified, issue #231 D4). **Carve-out (issue #231 H5): a documented whole-section skip is NOT "findings-date absent" — a block carrying `> Gate skipped: <justification>` / `> Bucket [name] skipped: <justification>` / `> Research skipped: no demonstrated gap` takes precedence over the stamp rule (per Step 4); only blocks containing actual findings are subject to the stamp requirement.**
    - The stamped findings are older than 6 months by **findings date** (staleness threshold unchanged; plan date plays no role in the new algorithm)
    - The plan references a different major version than what's imported (detected via package.json or import style)
 
@@ -355,8 +355,8 @@ Pass ratings to Step 3 verifier as context. When all ratings are empty, verifier
 |-----------|--------|
 | Dep already used elsewhere in codebase | Skip verification — pattern is known |
 | Dep is well-known stdlib-adjacent | Skip — common knowledge |
-| Dep is new to codebase AND not in plan Pattern Research | Verify: 1-2 Perplexity calls |
-| Dep is novel, unfamiliar, AND no Pattern Research | Verify: 2-3 calls. Pause if unavailable. |
+| Dep is new to codebase AND not in the plan's research evidence | Verify: 1-2 Perplexity calls |
+| Dep is novel, unfamiliar, AND no research evidence | Verify: 2-3 calls. Pause if unavailable. |
 
 **Perplexity unavailable:** If dep is well-known, proceed with note. Only pause for genuinely novel deps.
 
@@ -406,37 +406,9 @@ After all unfamiliar deps verified, append findings as context for the implement
 
 ### Label Management — Execution Start
 
-Before executing any tasks, manage workflow-state labels:
-
-```bash
-OWN_ING_LABEL="implementing"
-
-**Status check:** Verify issue status is `planned` or `implementing` before starting. Warn if `dropped` or `failed` — do not auto-resume without human confirmation. Document `doc_status` transitions alongside label changes.
-
-# 1. Self-cleanup: remove own stale implementing label from a prior crashed run
-if gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q "^${OWN_ING_LABEL}$"; then
-  echo "🧹 Removing stale '${OWN_ING_LABEL}' label (from a prior incomplete run)"
-  gh issue edit $ISSUE_NUMBER --remove-label "$OWN_ING_LABEL" || {
-    echo "⚠️ Failed to remove stale label — continuing anyway"
-  }
-fi
-
-# 2. Warn-and-confirm: check for OTHER in-progress labels (exclude own)
-OTHER_LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' \
-  | grep -E '^(scoping|planning|implementing)$' \
-  | grep -v "^${OWN_ING_LABEL}$" || true)
-if [ -n "$OTHER_LABELS" ]; then
-  echo "⚠️ Issue #$ISSUE_NUMBER already has in-progress label(s): $OTHER_LABELS"
-  echo "   Another agent may be working on this issue."
-  # Present the warning to the user. Ask: "Continue anyway?"
-fi
-
-# 3. Apply own implementing label (idempotent)
-gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q '^implementing$' \
-  || gh issue edit $ISSUE_NUMBER --add-label implementing
-```
-
-**Known residual race:** Between self-cleanup and label-apply, another agent could apply a conflicting label. This is acceptable — GitHub labels are advisory, not locking primitives.
+> **Removed (agent-infra#2861 §8.2).** The `implementing`/`scoping`/`planning` labels have no reader anywhere in the fleet, and their first step (an unconditional self-cleanup) could strip a live peer lane's marker. Do not re-add them.
+>
+> **Status check:** the durable signals are the issue's open/closed state and, for ownership, `tools/who-is-on.sh <N> --repo .` (resolves through `$TORTOISE`) plus the pre-dispatch pre-flight's holder read — not a label. Document `doc_status` transitions where the plan doc lives.
 
 **Canary-fix detection:** If the issue has the `ci-failure` label and "typecheck-canary" in its title, the fix may only address a type error without fixing the runtime gap. As part of implementation, ensure the fix wires the field through all data-fetching layers — not just the type. Identify every path that constructs or fetches the affected type (`.select()` calls, view queries, mapping functions, API handlers) and verify the plan covers each one. The commit-workflow preflight §Wiring-Gap Check will gate this again before merge.
 
@@ -677,13 +649,7 @@ The `verification-gate` extension (loaded in this session) blocks `git commit`, 
    - If verification fails: fix the issue and re-verify. Do NOT claim "done" with failing checks.
 2. **Verification clean → proceed:**
 
-**Label Transition:**
-```bash
-# Remove implementing, add implemented
-gh issue edit $ISSUE_NUMBER --remove-label implementing || true
-gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q '^implemented$' \
-  || gh issue edit $ISSUE_NUMBER --add-label implemented
-```
+**Label Transition — removed (agent-infra#2861 §8.2).** This step writes **no workflow-state label**: `implementing` / `implemented` had no reader, so the durable completion signal is the issue being closed by the merge.
 
 - Announce: "I'm using the commit-workflow skill to land this work."
 
@@ -803,15 +769,9 @@ router (`SWARM_ROOT`) — `approval_feedback` is not importable there (an `from 
 - Stop when blocked or when taxonomy-matching decision arises
 - Never start implementation on main/master — every implementation runs in an isolated worktree (#615/#626); the hub stays main + clean.
 
-## Label Cleanup
+## Label Cleanup — removed (agent-infra#2861 §8.2)
 
-If this skill exits early (error, user abort, or any non-completion path) before Step 6, remove the `implementing` label:
-
-```bash
-gh issue edit <ISSUE_NUMBER> --remove-label implementing || true
-```
-
-Do not leave `implementing` on issues where work is not actively progressing.
+There is nothing to clean up: this skill no longer applies an `implementing` label, so an early exit leaves no orphaned marker. If you are reading an older brief that tells you to remove one, removing it is harmless but unnecessary.
 
 ## Integration
 

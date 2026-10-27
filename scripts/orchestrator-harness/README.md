@@ -211,6 +211,7 @@ means it runs once" is wrong (research: agent-infra#1709).
 | `worker-terminal.sh` | the ONE place a worker is launched, asked whether it is alive, counted and killed (`orch-loop.sh` / `dispatch-merge.sh` both source it). Without it a lane is a tmux window that dies at ~21 log lines (§2.1) |
 | `capacity.sh` | R8's other half: MEASURED cross-box placement — load-per-core, lanes, disk and memory per box on the shared origin, so the next lane goes to the least-loaded ELIGIBLE box instead of to whichever controller asked first (§9) |
 | `claim-reaper.sh` | R4's release half: a claim is released only when its holder is demonstrably GONE — 7 stale refs on a box with 0 live lanes made the fleet originate nothing (§7.2b, measured 2026-10-21) |
+| `lane-container-reap.sh` | the leaked test-DB reaper (#2868): removes a lane's private `fdb-lane-*` / `*-pg` / `*-fdb` / `falkordb-6673-*` / `tortoise-ci-*` container ONLY when the owning lane is provably gone — the slug is absent from `git worktree list` (or the PR has no `refs/claims/` snapshot), no live process holds the name, AND the container is past the age bound. **Dry run by default** (`--apply` arms it); all three proofs must hold, and an unreadable `docker ps`/`ps` aborts the whole pass (exit 3, `CANNOT-VERIFY`) rather than reaping blind. Shared instances (`falkordb`, …) are protected by name and never candidates. Its test suite is a mutation suite: every deletion gate reddens when reverted |
 | `live-ownership.sh` | R2/R3's predicate as a live fact: "owned" means a LIVE PROCESS is working the PR, not that a registry says so; it supplies the sweep order and the un-owned count (§7.2f) |
 | `merged-not-closed.sh` | the question no other tool could answer — which OPEN issues already have a MERGED PR (tortoise#8468). Without it, finished work sits in the priority queue looking untouched |
 | `cycle-record.sh` | the self-dispatch proof: one record per controller cycle, and a verdict that refuses to call an absent or stale record healthy (§9) |
@@ -421,7 +422,7 @@ a killed worker cannot take the controller down with it.
 | `chain-<N>` | `chain-merge.sh` | — | wait for the PR **and for the lane's merge-phase verdict**, then delegate to `merge-one.sh` if the lane did not merge it |
 | `merge-<PR>` | `merge-one.sh` | — | **repo-authority-dependent**: gate mode = fresh review → signed record → wait green → squash-merge; rail mode = (a head-bound record already at the head, else the same fresh review → signed record first) → the repo's own `scripts/admin-merge.sh` (#1825) |
 | `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings, **a failing required check**, or **a rail refusal that names a red tree** (agent-infra#2223 — the RED-FIXER role in the sweep), push, re-run the merge chain. ONE fixer per PR by construction: all three reasons spawn under this session name, so a second reason while a fixer lives finds the session and spawns nothing |
-| `cell-doctor` | `cloud-cell-doctor.sh loop` | `state/roles/`, `logs/doctor.log` | the cell's **own** scheduled roles — `doctor` (reap + restart a missing controller), `merge` (land attested PRs on the standard rail), `hygiene` (caches/worktrees). Started by `cloud-cell-supervisor.sh start`; see §6.5.7 |
+| `cell-doctor` | `cloud-cell-doctor.sh loop` | `state/roles/`, `logs/doctor.log` | the cell's **own** scheduled roles — `doctor` (reap + restart a missing controller), `merge` (land attested PRs on the standard rail), `hygiene` (caches/worktrees **+ the cross-box review-record registry**: `registry-sync.sh union`, hourly, from a dedicated throwaway worktree of the agent-infra checkout, and **best-effort** — a failed sync logs the box/store/exit code and the pass continues, so a dark or rate-limited store can never fail a hygiene pass or block a merge decision; agent-infra#2577). Started by `cloud-cell-supervisor.sh start`; see §6.5.7 |
 
 ### State files (`$O/`)
 
@@ -518,6 +519,7 @@ git command fail on a lock the rescue took), and it calls a backup
 `task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
 PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
 never handed to the chain is unreviewed code by default.
+
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
 (`install.sh:533-541`) and `$O/gh-limit.py` (`:550-558`); everything else is the operator's `cp`, §4 step 1.
@@ -1472,10 +1474,11 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
 This harness passes **attacker-controlled text** to language-model agents with shell access. Be
 clear about what is and is not enforced:
 
-- **Not sandboxed.** The spawned reviewer and fixer run with `AGENT_SKIP_REVIEW_GATE=1`,
-  `ELDATO_SKIP_VGATE=1`, `AGENT_ALLOW_MAIN_EDITS=1`, `SKILL_ENFORCER_DISABLED=1` and
-  `LOOP_ENFORCER_DISABLED=1`, with `bash` and `gh` on `PATH`. "Do NOT merge" and "do not touch the
-  main checkout" are **prompt instructions, not controls**.
+- **Not sandboxed.** The spawned reviewer and fixer run with `AGENT_ALLOW_MAIN_EDITS=1`,
+  `SKILL_ENFORCER_DISABLED=1` and `LOOP_ENFORCER_DISABLED=1`, with `bash` and `gh` on `PATH`.
+  Whether `AGENT_SKIP_REVIEW_GATE`/`ELDATO_SKIP_VGATE` are also set is DECIDED AT STARTUP by
+  `gate-policy.sh` (§5.4) and recorded in `logs/gate-policy.jsonl` — never assumed. "Do NOT merge"
+  and "do not touch the main checkout" are **prompt instructions, not controls**.
 - **Prompt injection is possible.** `fix-one.sh` reads the PR's comments into the fixer prompt as
   the authoritative review, and `merge-one.sh` feeds the reviewer the PR title, body and diff. A
   malicious PR body can therefore attempt to steer an agent that has shell access.
@@ -1495,6 +1498,75 @@ clear about what is and is not enforced:
   merge-scoped token during review, and treating PR content as delimited data rather than
   instructions. Until then, run this on a box whose GitHub token you would accept being used by an
   agent that has read a hostile PR body.
+
+### 5.4 The gate decision is MEASURED: `gate-policy.sh` (agent-infra#2319)
+
+Five carriers (`orch-loop.sh`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`)
+used to `export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` unconditionally. The canon calls both
+flags emergency-only (`skills/commit-workflow/SKILL.md:102,:111`) and a lane collected without review
+is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:150`), so a permanent export was
+a **defect**, and dangerous in one direction only: the permissive side was the machine that lands the
+most work.
+
+It could not be deleted in one line, because a lane **cannot** satisfy the review gate by itself —
+`lane.sh` says so to the lane's face: it has no `task` tool, so the parent/harness must obtain the
+head-bound review. So the decision moved into ONE probe:
+
+| probe | asked | today |
+|---|---|---|
+| review | is there a recorder for the head-bound record **and** a seam a non-interactive lane can call to obtain it? | **satisfiable.** `record-review.sh` yes, `review-pr.sh` (#2288, landed 9b80ee4c) yes — `--probe` on this checkout prints `review_satisfiable=1` (pinned by `gate-policy.test.sh` "live-tree") |
+| VGATE | can a non-interactive session record verification where the gate reads it? | **not satisfiable.** no `record` verb, no lane-satisfiable acceptance (#2313) — so the bypass below is still ACTIVE, on the VGATE half alone |
+
+- **Both satisfiable** → nothing is exported, and any INHERITED skip flag is removed from the carrier's
+  environment (a daemon captures its environment once; that is how a stale hatch outlives its reason).
+- **Either missing** → the two flags ARE exported, and **one** audit line naming #2319, the carrier and
+  the missing component is appended to `logs/gate-policy.jsonl`.
+
+⛔ **The `today` column above is MEASURED, not remembered (review round 6).** It once said `review-pr.sh`
+was missing while the file had already been in this tree for weeks — so a reader diagnosing "why is the
+bypass still on" was pointed at a component that had shipped. `gate-policy.test.sh`'s "live-tree" arm now
+probes THIS checkout and asserts the pair the table states, so the table cannot drift again: **when either
+half flips, that arm goes RED until the doc changes with it.** The bypass today is carried by the VGATE
+half alone — that is the sequencing #2319 asks for, and the reason nothing fleet-stopping follows from the
+review half being satisfied.
+
+⛔ There is no third state: `gate-policy.test.sh` fails if any live carrier exports either flag
+outside the policy, so a silent reintroduction is RED. When the satisfier merges, the probe flips and
+the bypass ends — **no second change and no forgotten flip**. This is the sequencing #2319 asks for:
+the removals are wired, but they take effect when the gate path can satisfy them, because deleting
+them first stops every lane at its first push.
+
+### 5.5 The pin's cleanliness is ONE predicate: `pin_dirty` (agent-infra#2271 review)
+
+Four readers ask "is the pinned harness dir the bytes the commit carries": the runtime resolver
+(`scripts/harness-exec.sh`), the cell supervisor's DRIFT check, its provenance stamp, and the
+installer's. For one review round three of them asked a **weaker** question than the resolver did, so
+`check` reported a pin CLEAN that `harness-exec.sh` refused — and `apply` then took
+`HARNESS_APPLIED=unchanged` over the very tree the controller would not start. An instrument that
+certifies the state it exists to catch is worse than no instrument.
+
+`pin_dirty` in `scripts/lib/box.sh` is the single answer: `0` clean, `1` dirty (entries printed), `2`
+**cannot verify** (`git status` itself failed — never a pass). It reads
+`git status --porcelain --ignored=matching`, because a **gitignored** file cannot be committed and is
+therefore never part of the pin — and `tmp/`, `dist/` and `*.log` are all ignored here, so a local
+hotfix sat inside the pin and `--entry tmp/x.sh` passed every check. It also **tolerates** the
+`.DS_Store` / `._*` REGULAR droppings, reusing the ruling the pin-root guard already made: one Finder
+visit must not brick a cell, and bash cannot execute a `.DS_Store`. Two conditions keep that tolerance
+honest, and both were review findings: entries are resolved against the repository **toplevel**
+(porcelain prints top-relative paths even when the caller passes the harness subdir — the production
+convention — so resolving against `$repo` made the tolerance unreachable exactly where it is needed),
+and only **untracked/ignored** entries are tolerated (a tracked file named `._x` is part of the pin, so
+a modification to it must read DIRTY: the name is not the property).
+
+The supervisor and the installer are deployed standalone and cannot source a sibling library, so they
+carry the body as a **pinned mirror** — compared byte-for-byte, comments excluded, by
+`cloud-cell-supervisor.test.sh` §(p3), which then RUNS the mirror against a clean pin, a gitignored
+hotfix and a `.DS_Store`. **Known residual (P2):** the probe's bars are *shape* checks (executable,
+non-empty, parseable, with a real `record)` dispatch arm), so a satisfier that exists but does nothing
+satisfies them. A capability sentinel (`review-pr.sh --capability`) belongs to #2288/#2313 — the
+scripts that do not exist yet — and inventing its interface here would make the flip unreachable
+rather than safer. Until then the failure direction is **loud**: enforced gates with a broken
+satisfier stop lanes visibly, where a bypass lands unreviewed code silently.
 
 ---
 
@@ -1647,6 +1719,137 @@ ancestor at any depth, or an unresolvable/looping symlink — and when no candid
 all. A path is not failed for being a path main does not carry; it is failed for the bytes in it.
 `harness-status` runs it as its fifth row, so every status call is also a divergence check.
 
+### 6.1 The roles — the component table, and the ONE command that installs them
+
+`harness-up` could START a box and could not SET ONE UP. The install half lived in three other places
+(`cloud-cell-bringup.sh` on a cell, `pi-bootstrap/setup.sh` on a Mac, and a hand-run installer per
+component), so the launcher's own answer to "is this box up?" was only true about a box somebody had
+already installed by hand. Measured on 2026-10-25, in one night, three ways:
+
+* **the merge role was INSTALLED AND NEVER STARTED.** `cloud-cell-doctor.sh` owns the reap / doctor /
+  merge / hygiene passes; `cloud-cell-supervisor.sh start` opens its session. Nothing anywhere said
+  "the merge role has never run", so the box looked installed and the queue did not move.
+* **a unit pointed at a `/tmp` cwd DIED EVERY TEN MINUTES** for as long as a reclaim stood. The
+  installers that remember to check the path (`install-repair-service.sh` refuses the #2697
+  lane-scratch shape) cannot help a unit installed EARLIER, when the path existed — nothing re-read an
+  installed unit's own `ExecStart`/`WorkingDirectory`.
+* **`status` read "installed" as if it were "ok"** on three components that were dead. A unit file, a
+  loaded plist and a session name are all permissions to run, never evidence that anything ran.
+
+So the roles are now declared in **one place**, `scripts/orchestrator-harness/harness-roles.sh`
+(sourced by `scripts/harness-up` — still the only entry point), and `up` installs before it starts.
+
+#### One command, both platforms
+
+```bash
+# from an agent-infra checkout — the SAME command on a cell and on a Mac:
+scripts/harness-up up        # preflight -> install the roles this box is configured for -> start
+scripts/harness-up status    # the component rows + the ROLE rows, ONE verdict (heals by default)
+scripts/harness-up roles     # the role rows only — a pure READ (status also heals)
+scripts/harness-up heal      # re-drive what is dead; NOT HEALED names what it could not fix (exit 1)
+scripts/harness-up logs <role> [n]        # the role's OWN log
+scripts/harness-up dispatch <role> [pass] # run ONE role once, in the FOREGROUND
+```
+
+Linux → **systemd** (system scope via passwordless sudo, else `systemctl --user`); macOS → **launchd**
+(`~/Library/LaunchAgents`). One detection path (`hr_platform`), no GNU-only flags, no `timeout`
+(macOS has none). `up` is idempotent: a role already RUNNING is left alone and its installer is not
+re-run (re-running one can cycle a live unit).
+
+The roster is the box's own configuration — `HR_ROLES`, else `$O/harness-roles.conf` (one role per
+line, `#` comments), else the platform default (`controller apply watchdog reminder`, plus `doctor`
+on a cell). A name outside the registry is an ERROR, not a silent no-op: a typo must not leave a role
+the operator believes is up with nothing watching it.
+
+| verb | what it GUARANTEES | what it will NOT do |
+|---|---|---|
+| `up` | every configured role is preflighted **before anything is written**; each missing unit is installed idempotently; the component stack starts in dependency order; the run ends with the measured state | it will not install a role whose program or working directory is missing (refuses, writes nothing); will not run `cloud-cell-bringup.sh` (provisioning, not convergence); will not run `install-launchd.sh` (it renders EVERY plist); will not re-install a role that is already running |
+| `status` | one line per role with its MEASURED state and the artefact's own last error line, folded into the ONE verdict | it does not believe a unit file, a loaded plist or a session name; it does not heal a DUPLICATE or cycle a live-but-LATE role |
+| `roles` | the same table, read-only | — |
+| `heal` | installs what is missing, starts what is stopped, and the verdict is the **re-read** | it will not restart a DANGLING unit (the target is gone — restarting cannot work), will not repair a role it could not measure, and exits non-zero when anything remains |
+| `logs` | the role's own log, tailed | it reports NO LOG as a state, never as an empty healthy one |
+| `dispatch` | ONE role, once, foreground, the role's own argv and output | no session, no scheduler, no retry |
+
+#### The roles
+
+Declared once, in `harness-roles.sh`. `doctor` is a pass-set, not a unit: it takes a pass name
+(`reap|doctor|merge|hygiene`).
+
+| role | program | Linux unit | macOS unit | the state is read from |
+|---|---|---|---|---|
+| `controller` | `orch-loop.sh` | `eldato-orchestrator.service` (`Restart=always`) | `com.eldato.orchestrator-loop` | the unit's live state + the unit's own journal line, then `$O/heartbeat` age |
+| `apply` | `harness-apply-pass.sh` | `eldato-harness-apply.timer` | `com.eldato.harness-apply` | the timer/job state + `$HARNESS_APPLY_STATE_DIR/harness-apply.status` |
+| `watchdog` | `watchdog-loop.sh` | `eldato-controller-watchdog.timer` | `com.eldato.controller-watchdog` | the timer/job state, and a periodic job's **last exit status** (0 = fine between ticks) |
+| `reminder` | `objective-reminder.sh` | `eldato-objective-reminder.timer` | `com.eldato.objective-reminder` | the same |
+| `doctor` | `cloud-cell-doctor.sh` | a tmux session (no unit of its own) | **none — no macOS unit exists** | `$O/state/roles/*` (`last_pass_epoch` / `last_rc` / `last_result`) + the session → `NEVER-STARTED` when not one pass ever completed |
+
+**Eight states, and they are deliberately not one word:** `RUNNING`; `FAILED` (with the artefact's own
+last error line); `DEAD` (installed and not running); `NEVER-INSTALLED` (nothing on this box would ever
+run it); `NEVER-STARTED` (the doctor's own case — installed, and no pass ever completed); `DANGLING`
+(installed, and the program or directory it execs no longer exists — the `/tmp`-cwd class, whose remedy
+is to re-point rather than to restart); `SKIPPED` (not applicable here, always with a reason, never
+rendered as RUNNING); and `UNKNOWN` (the read could not be taken — never a pass).
+
+#### The components — what each is, and which one is current
+
+Every entry point this directory's consolidation carried, classified against the code at this head.
+"Status" says which one is CURRENT, which is SUPERSEDED, and which was NEVER STARTED anywhere.
+
+| component | purpose | installed / started today | Linux unit | macOS unit | status |
+|---|---|---|---|---|---|
+| `scripts/harness-up` (+ `harness-status`, `harness-down`) | THE entry point: preflight/install the roles, start the stack in dependency order, status/heal/logs/dispatch | run by hand (neither starter calls it) | n/a | n/a | **current** — extended here: `up` installs, and `roles`/`heal`/`logs`/`dispatch` are new |
+| `scripts/orchestrator-bringup.sh` + `scripts/lib/fleet-inventory.sh` | the fleet inventory and the platform START verbs; the `(machine, repo)` duplicate guard | called BY `harness-up` | n/a | n/a | current — owns starting, not installing |
+| `scripts/orchestrator-harness/orch-loop.sh` | the controller | `harness-up up` → bringup → the platform's unit | `eldato-orchestrator.service` | `com.eldato.orchestrator-loop` | current |
+| `scripts/cloud-cell-supervisor.sh` | cell supervisor: pin/seed, controller verb, doctor session, prune/hygiene | its `start` IS the systemd unit's `ExecStart`; `stop` stops the unit | via that unit | **refuses on Darwin** | current, with one SUPERSEDED shape: the controller's **tmux session** is gone by design (#2402 — a tmux session has nothing above it and died with the last one). It still owns the DOCTOR session and is the fallback when no unit is enabled |
+| `scripts/orchestrator-harness/cloud-cell-doctor.sh` | the repair/land/reap/hygiene passes and their own per-role status | `cloud-cell-supervisor.sh start` opens the `cell-doctor` session | no unit of its own (a session) | **NONE — never started on any Mac** | current on a cell; the Mac gap is now REPORTED (`harness-up status` prints its role row) instead of invisible |
+| `scripts/install-cell-timers.sh` | renders + enables the reminder and watchdog timers | `cloud-cell-bringup.sh`; `harness-up up` (roles `watchdog`, `reminder`) | `eldato-objective-reminder.timer`, `eldato-controller-watchdog.timer` | **REFUSES (Darwin)** — the macOS pair is `templates/launchd/` via `install-launchd.sh` | current (Linux) |
+| `scripts/install-controller-service.sh` | the controller's systemd unit | `cloud-cell-bringup.sh`; `harness-up up` (role `controller`) | `eldato-orchestrator.service` | **REFUSES on Darwin** (a Mac's controller is launchd) | current |
+| `scripts/orchestrator-harness/install.sh` | renders/installs/starts the launchd agent (and enforces the pin records) | `harness-up up` (role `controller`, macOS); by hand | **REFUSES off Darwin** | `com.eldato.orchestrator-loop` | current (macOS) |
+| `scripts/install-harness-apply-timer.sh` | the harness-apply clock (converge this box on `origin/main`) | `cloud-cell-bringup.sh` on a cell; **NOTHING on a Mac** — `setup.sh` installs only `install-launchd.sh` | `eldato-harness-apply.timer` | `com.eldato.harness-apply` | current — ONE installer, both platforms; **never installed by the Mac starter**, which is why `apply` reads `NEVER-INSTALLED` on a Mac until `harness-up up` |
+| `scripts/install-launchd.sh` | renders EVERY `templates/launchd/*.plist` | `pi-bootstrap/setup.sh` on every Darwin box | — | ~19 jobs (watchdog, reminder, reapers, drainer, canary…) | current — but it installs the WHOLE set, so it is not a per-role installer and `up` will not run it (it says so) |
+| `scripts/install-repair-service.sh` | the pr-repair loop's unit | by hand / provisioning | `eldato-pr-repair.service` | **REFUSES (Linux only)** | current — and the ONE installer that already refuses the lane-scratch `/tmp` shape (#2697); the launcher now refuses that shape for every role |
+| `scripts/merge-queue.py` | the DRAIN line for the heartbeat (open PRs vs merged-today, and which lane is on it) | runs INSIDE `orchestrator-heartbeat.sh` | no unit of its own | no unit of its own | current — but it is **not a merge-queue runner**, despite the name: landings are performed by `cloud-cell-doctor.sh merge` (cell) and `orch-loop.sh`'s own sweep (Mac) |
+| `scripts/orchestrator-harness/claims.sh` | cross-box claim registry — a **LIBRARY** (sourced by the controller and the lanes) | sourced; the registry itself is DATA on the remote (`refs/claims/*`) | none needed | none needed | current (not a service: `up` never installs it) |
+| `scripts/orchestrator-harness/capacity.sh` | measured placement — a **LIBRARY** plus a `probe` CLI | sourced per dispatch | none needed | none needed | current |
+| `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch and before every push | none needed | none needed | current |
+| `scripts/orchestrator-harness/disk-floor.sh` | the pre-dispatch disk floor — a **LIBRARY** | sourced by the controller | none needed | none needed | current |
+| `scripts/deploy-mac-orchestrator.sh` | copies the harness into `$O` and stamps the commit | by hand (§4 step 1) | — | — | current for the DEPLOY; ACTIVATION is `install.sh --start` / `harness-up up` |
+| `scripts/cloud-cell-bringup.sh` | full cell PROVISIONING (clone, keys, farm, units) | by hand, once per cell | installs several units | — | current — provisioning is not convergence: `up` does not run it |
+| `pi-bootstrap/setup.sh` (+ `SETUP-NEW-MACHINE.md`) | the Mac starter: config farm + `install-launchd.sh` | by hand, once per Mac | — | `install-launchd.sh`'s set | current for CONFIG; **incomplete for the harness** — it installs no controller and no apply timer, and `SETUP-NEW-MACHINE.md` described it only as "the scheduled jobs", which is why this went unnoticed |
+| `pi-bootstrap/cell-install.sh` | the cell starter: farms scripts/keys/shims into the layer | by hand, once per cell | — | — | current |
+
+#### What self-heals, and what does not
+
+`heal` (and `status`, which heals by default) re-drives **two kinds of thing, both of them safe while
+lanes are working**:
+
+1. **A role that is not running** — it installs what is missing, then starts it, then RE-READS the
+   state. The exit code is the re-read, never the installer's, because a start that returns 0 and
+   leaves the role dead is the defect this exists to end.
+2. **A pin that is BEHIND** (`harness-refresh.sh`'s advance kills nothing, #2278).
+
+**It never repairs the following, by design** — each is reported, with whose decision it is:
+
+* a **DANGLING** unit (its program or cwd was reaped). Restarting cannot fix a path that does not
+  exist, and inventing a new path is a decision: `heal` prints the missing path and stops.
+* a **DUPLICATE** (two controllers for one repo/state dir). Which one to stop is a human decision, and
+  a health verb that kills a controller is a lane-killer.
+* a **live-but-LATE** role. Cycling it would drop in-flight lanes.
+* a role the read **could not measure** (`UNKNOWN`). Cannot-verify is never repaired by guessing.
+* **anything the box has no mechanism for** (the `doctor` role on macOS). `SKIPPED` with a reason, never
+  a green line.
+
+#### Two documents this section corrects
+
+* `pi-bootstrap/SETUP-NEW-MACHINE.md` said macOS setup "also installs the scheduled jobs via
+  `scripts/install-launchd.sh`". That is true and it is not the whole harness: a Mac got NO controller
+  and NO apply timer from the starter, and nothing said so. The doc now names `harness-up up` as the
+  second step.
+* `ARCHITECTURE.md` §7 (triage) told the reader to check `launchctl list | grep orchestrator` for a
+  queue that is not moving. That check answers "is a job loaded"; it cannot answer "is the apply clock
+  even installed", which is the state that was measured. It now points at `harness-up status` and its
+  role rows as well.
+
 ### Deliberate stop (handing the laptop to a human)
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
@@ -1733,8 +1936,10 @@ process reaper judges a `pi` process tree (the `pi` and its immediate shell wrap
 `pi`** — or a pipe-fed `tee` beside it — holds a fleet-namespace log open as stdout/stderr, and reaps
 it only when ALL THREE hold: zero CPU delta over a sample window summed over the whole tree; **positive
 fleet ancestry** (a human terminal/ssh ancestor refuses, and so does an ancestry that is neither —
-`unknown` used to permit and TERMed live trees, and it is now inert on a systemd-scoped cell until a
-cell-side evidence source exists); and either the log is untouched past 2h or (the log resolved but is
+`unknown` used to permit and TERMed live trees; on a systemd-scoped cell the supervisor's
+cgroup/environ marker — `cell_fleet_marker`, #2868 — supplies the positive fleet evidence that was
+previously missing, so the armed reaper is no longer inert there); and either the log is untouched
+past 2h or (the log resolved but is
 gone) the process has been up past 12h. It is **dry run by default**; arming is the operator's call,
 like every other deletion tool here. ⛔ Its hardest rule
 is the one a first dry run got wrong: **an unresolvable log is `no-log-evidence` and is NEVER read as
@@ -2038,7 +2243,115 @@ agent-infra#2129 and called from `orch-loop.sh` by that same commit (NOT by #189
 either, which is what makes the field PUBLISHED AND UNREAD rather than merely re-homed. The orphan is
 disclosed in `scripts/heartbeat-loop.sh` and in the retirement note at the foot of this file.
 
-agent-infra#1774, #1788.
+### WHICH REPO A PASS GRADES — evidence, never a default (2026-10-21)
+
+`pr-doctor.py` used to carry `REPO = "daniel-ospina/tortoise"` and `REPO_DIR =
+$HOME/Documents/GitHub/tortoise` as module constants, so every pass spoke for ONE repo whichever
+repo it had been started for. MEASURED: the installed `com.tortoise.pr-doctor` printed a clean
+`nothing to do` while `daniel-ospina/agent-infra` held 52 open PRs (the 9 tortoise PRs were all in
+cooldown). The verdict was true about tortoise and false about the machine, and nothing in the line
+said which repo it was about.
+
+`resolve_repo()` now decides the target from evidence, highest first, and REFUSES (exit 2) rather
+than defaulting:
+
+| rank | source | why it ranks there |
+|---|---|---|
+| 1 | `--repo OWNER/NAME` | the operator's explicit word for THIS invocation |
+| 2 | `PR_DOCTOR_REPO` (+ `PR_DOCTOR_REPO_DIR` as its checkout) | the JOB's seam — what `pr-repair-loop.sh`, `install-repair-service.sh` and `repo-target.sh` set for this invocation. Honoured as EVIDENCE, never as a default: an empty seam answers nothing (#2716, reconciled) |
+| 3 | `OR` | the slug the LAUNCHER resolved and passed — `orch-loop.sh`, the cell session strings and `install.sh`'s rendered plist all carry `OR` + `REPO` + `O` as per-invocation state |
+| 4 | `REPO`'s `origin` remote | the checkout the launcher named, read for what it PROVES it is |
+| 5 | the cwd's `origin` remote | the weakest evidence: whatever checkout the process happens to be in |
+| 6 | REFUSE | exit 2, naming every source it looked at |
+
+⛔ THE macOS LITERALS ARE GONE, and that is the deliberate part: `daniel-ospina/tortoise` and
+`$HOME/Documents/GitHub/tortoise` were the fallback when no seam was set, so a pass that named no
+repo graded tortoise and reported `nothing to do` while another repo's queue sat open (#2235). A
+cell sets the seam pair (rank 2); a caller that sets NOTHING gets a refusal, not a default.
+`pr-repair-loop.sh` and `install-repair-service.sh` therefore refuse too when they cannot compute
+the pair — a seam with no value is a launcher bug to be seen.
+
+`GH_REPO` and `TORTOISE_REPO` are deliberately NOT sources: both are global on a fleet box (a
+pushed `keys.env` exported `GH_REPO=daniel-ospina/tortoise` and `gh` honoured it for every command
+— #2235; an ambient `TORTOISE_REPO` outranked a launchd entry point's own directory — #9388), so
+inheriting one grades a repo nobody named. Once the target is resolved, `GH_REPO` is PINNED to it,
+so a worker this pass spawns cannot have its own rail answer about another repo.
+
+The checkout is used only when its `origin` proves the resolved repo: a pass launched for A from
+B's checkout grades A, reads B's checkout only for the identity probe, and cannot `git -C` B, add
+B's worktrees, or read B's branches. A launcher that names two repos (`OR=A` with a `REPO` checkout
+of B) is refused, naming both. With no checkout the queue is still graded and the pass says
+`checkout: NONE … NOTHING will be spawned` — deliberately, because a 52-PR queue must not go
+unreported just because this box has no worktree for it.
+
+`--all-repos` (set from `PR_DOCTOR_REPOS='owner/name[=checkout],…'` or repeated `--repo`) grades
+the whole set and prints ONE ROW PER REPO:
+
+```text
+repo=daniel-ospina/agent-infra          open_prs=52    unplaced=52    dispatched=0     verdict=REFUSING rc=2
+repo=daniel-ospina/tortoise             open_prs=0     unplaced=0     dispatched=0     verdict=clean rc=0
+```
+
+The verdict words are the exit codes' own vocabulary and stay distinct: `clean` (`0`), `REFUSING`
+(`2` — I could not READ the queue), `UNPLACED` (`3` — I read it, placed the work, no worker took it),
+`CRASH` (`4`). Each entry is `owner/name`, or `owner/name=<checkout>` when the checkout is not the one
+`REPO` names; `?` in a column means the pass never got far enough to count it. Repeated `--repo`
+flags REPLACE the `PR_DOCTOR_REPOS` default rather than joining it (a named list is the narrower
+instruction), and a checkout is only used when its `origin` proves the resolved repo — a remote on
+another host, a local path or a `file://` URL proves nothing.
+
+The aggregate exit is non-clean when ANY repo is (precedence `4` crash > `2` could-not-read > `3`
+nobody-took-it), the canonical `pr-doctor.status.json` names every repo and carries a `repos` list,
+and each repo also writes its own `pr-doctor-<owner>-<name>.json` register (plus
+`pr-doctor.<owner>-<name>.{status.json,log}` in `--all-repos` mode) — so the beat's single line can
+no longer launder a stuck repo behind a quiet one. ⛔ THE REGISTER IS REPO-SCOPED FOR A SINGLE-REPO
+PASS TOO (#2700: one shared `pr-doctor.json` let one repo's in-flight rows consume another's budget,
+reporting `budget fix=0` for hours), and `_state_file()` is its ONE naming authority — the writer and
+`--status` both call it, so the file a pass writes is the file an operator reads. There is
+deliberately no default set: `--all-repos` with no `PR_DOCTOR_REPOS` refuses, because a filesystem
+scan would answer with whatever checkouts happen to exist, which is a default by another name.
+
+Two repo slugs may also collide on the tag that names their state: `acme/tools-api` and
+`acme-tools/api` both derive `acme-tools-api`, which would make one repo's cooldown rows decide
+the other's budget slots — a set with a colliding tag is refused before anything is read, and
+`repo_tag()` is the one spelling both the register name and that guard agree on.
+
+⚠️ **Declared residual — the dispatch ceiling is per REPO, not per pass.** `capacity()` and
+`pass_budgets()` are computed from the state of the repo being graded, so a `K`-repo set may place up
+to `K × (MAX_FIX + MAX_REVIEW)` in one invocation, and `--max N` means `N` per repo. It is bounded by
+finite `K` and by `spawn-gate.sh`'s own load and disk gates (every spawn still passes through
+`nonblocking-dispatch.sh` → `run_agent`), and one pass per repo is **#2281**'s subject, not this
+mode's. Said here because this section is where the next reader of the mode looks.
+
+### WHICH CONTRACT A PASS JUDGES BY — resolved, or refused (agent-infra#2518)
+
+Resolving the repo is not the whole decision: `objective.py` also holds the **contract** a PR is
+judged by — the REQUIRED check contexts (minus `ai-review-gate` for the gated set) and the
+human-gated SURFACE paths. Those are `objective.py`'s built-ins, and they describe exactly one repo.
+A pass for any other repo reads ITS queue and would judge it by a declaration nobody wrote for it:
+**measured** on `daniel-ospina/agent-infra` with an all-green, clean-attested check list, that
+classifies `rerun-checks` (every green PR re-triggered, its attestation staled) and
+`touches_surface()` is always `False` (a surface-touching diff handed to the automated lander).
+
+So the contract's scope is decided per pass and **fails closed**:
+
+* The contract is the repo's own when the operator supplied it through `objective.py`'s existing
+  seams — `OBJECTIVE_REQUIRED='<ctx>,<ctx>'` and `OBJECTIVE_SURFACE='<path>,<path>'`. Both must be
+  non-empty: an empty value is "not supplied", never "this repo requires nothing".
+* It is also the repo's own for the **one** repo the built-ins describe (`REQUIRED_DEFAULT`) —
+  refusing that one would kill the shipped single-repo doctor.
+* Otherwise the pass **refuses to dispatch** and says so in its log. It still grades the queue and
+  prints the row — `open_prs`/`unplaced` are the measurement the fleet keeps losing — but an
+  unplaceable queue reports `UNPLACED` (`3`), not a confident order derived from another repo.
+
+⛔ The refusal is DERIVED from the resolved slug on every call, never stored: a module flag left over
+from the previous repo in an `--all-repos` set would refuse (or, worse, allow) the next one's
+dispatch for a reason about a different repo. ⚠️ **Declared residual:** the seams are machine-wide,
+so one `--all-repos` set cannot describe two repos at once — a set grading a repo whose contract was
+not supplied is read-only by design. Per-repo contract wiring is **agent-infra#2518**, and one doctor
+instance per repo is **#2281**.
+
+agent-infra#1774, #1788, #2281, #2518.
 
 ### 6.5.3 Ancestry is the safety rail
 
@@ -2415,7 +2728,59 @@ PRs and forgot what the PRs are for. Drift is a LOCAL artifact read (no REST) an
 SEARCH quota, so this order cannot starve the landing arm.
 
 ⛔ **A count that does not come back is `NOT-MEASURED`, never `0`** — zero is the claim that the goal
-is met. ⛔ The cycle's main is read ONCE, with a REAL backoff retry (`MAIN_READ_ATTEMPTS` / `MAIN_READ_BACKOFF_S` — two calls issued back to back fail together, and a later read gave the header a sha the goals had never compared against), and every consumer uses that one value. ⛔ THE BOX INVENTORY HAS FOUR STATES and each is reported as itself: `absent` (a probed LOCAL-ONLY row, announced in the goal-2 READINGS by a `⚠️` line and a `⛔ LOCAL ONLY` line — never in the action, and never in a report whose inventory file exists), `unread` (the file exists and could not be read — including a non-UTF-8 file), `empty` (it exists and lists NO boxes) and `noprobe` (no file and no `box-status.sh`, so nothing could be probed). None of the last three is a box: no fraction, no marker word, no deploy instruction, and the standing is `NOT-MEASURED`. The local-only fallback otherwise printed a fleet marker over a one-box read. And the label filter must run SERVER-SIDE: `gh issue list --label P0 --json number` returns
+is met.
+
+⛔ **GOAL 2 HAS TWO MAINS AND TWO HALVES, AND BOTH WERE MEASURED WRONG ON THE LIVE FLEET (#2679, #2680).**
+
+- **The harness main.** A box's harness sha is an *agent-infra* commit, so "the same version
+  everywhere" can only be judged against **the harness repo's** `origin/main` — not the `origin/main`
+  of the repo this cycle SWEEPS (the value the PR and claim gates correctly use, because those refs
+  live there). The harness repo is resolved in four steps, because the FIRST TWO are absent in the
+  configuration this file installs: `HARNESS_REPO`, then the checkout containing `$O`, then **the
+  checkout containing this script** (in a repo checkout that is the repo root; a FLAT deploy —
+  `deploy-harness.sh`/an operator's `cp`, not `install.sh`, puts `merge-reminder.py` straight into `$O`
+  — makes `parents[2]` the payload's grandparent, which is NOT the payload, so a flat deploy depends on
+  `HARNESS_REPO`/`$O`), then
+  `$HOME/orchestrator`. Every candidate must CARRY the
+  harness — `scripts/orchestrator-harness/box-status.sh` **tracked as a regular file by that candidate's
+  own repo**, as an index ENTRY rather than a path (`git ls-files -s`: mode `100644`/`100755` **and** the
+  recorded path equal to `scripts/orchestrator-harness/box-status.sh`, so a prefix match is not the file) —
+  so a checkout that is merely *some* repo, one that only *reaches* the harness through the gitignored
+  `scripts -> $AGENT_INFRA_PATH/scripts` pointer (#9475, the canonical tortoise/eldato shape), one that
+  tracks a SYMLINK (mode `120000`) or a GITLINK (`160000`) at the marker path, and one whose marker path is
+  a DIRECTORY (the index records a nested file) are all skipped rather than taken for the harness repo. Measured (PR #2683 round 1): the
+  timer exports only `O`/`HOME`/`PATH`, `--o` defaults to `$HOME/orchestrator`, and on the hub that path
+  is not a checkout — so a two-candidate resolution returned None, the caller fell back to the swept
+  repo's main, and the header printed `**harness main:** 5f40d832c254`, a tortoise sha, under a
+  `harness main` label. That is why an UNRESOLVED harness repo is `""` and prints `UNRESOLVED` — never
+  the swept repo's main, which is a value no harness comparison may use. Measured 2026-10-24 with the sweep repo on a tortoise checkout (`REPO=/tmp/cell-t3`, the
+  fleet's shape for two of its cells): goal 2 read `local=f9381dae2ee5 [unknown] — a different commit
+  from this cycle's main (0/1 …)` and ordered a deploy against `main=5f40d832c254`, a **tortoise** sha
+  — an instruction to deploy the harness at a commit that does not exist in agent-infra. The harness
+  repo is resolved from `HARNESS_REPO` / the payload's own checkout (`$O`), the read is REUSED when it
+  is the same repo as the sweep (so the one-read rule is untouched), and the resolved repo is exported
+  as `REPO=` **into each status command** — a status command otherwise inherits the swept repo and
+  compares against the wrong main by itself, which is what produced the `[unknown]`. `--json` publishes
+  both as `main` and `harness_main`; the header names the harness main whenever they differ.
+- **Activated.** The pin names what the **next** launch runs (`harness-refresh.sh` says so in its own
+  verdict: an advance is `restart-pending` until the controller restarts). So `controller: RUNNING` read
+  off the pin is **not** activation: measured on the hub, the pin and payload named `f9381dae2ee5`
+  while the live controller still exec'd `harness/f6a1a01772bd/orch-loop.sh`, and the goal certified
+  `1/1 box(es) … deployed AND activated`. `box-status.sh` now also answers `running: <sha12>` — the
+  commit the controller's **own argv** resolves to — and the marker requires it to EQUAL the box's
+  harness sha. A mismatch is `restart-pending(running=<sha>)`, which counts for nothing; a status
+  command that does not answer at all is `running=NOT-REPORTED` (silence is not activation); a
+  controller mid-restart on two trees is `running=MIXED`; no controller is `running=NONE`. The deploy
+  table calls the same state `deployed-but-NOT-activated` and does **not** restart it (the pin already
+  names the target; a restart there would kill whatever the live controller is mid-flight on to gain a
+  deploy the next launch gets anyway). ⛔ THE VERIFY LOOP USES THE SAME PREDICATE. Its `VERIFIED` used
+  to check main + relation + controller + a NEW pid and never the executed tree, so a controller that
+  survived a failed `stop` (old tree) plus a started replacement (new pid) satisfied every term while
+  `box-status.sh` reported `running: MIXED` — a false `VERIFIED` written into the deploy LEDGER and later
+  quoted back as *"our activation at this pin VERIFIED"*, the sentence that stops the arm repairing a box
+  it itself broke. `activation_gap()` is now a conjunct there too, and an `UNVERIFIED` names the gap.
+
+⛔ The cycle's `origin/main` is read ONCE, with a REAL backoff retry (`MAIN_READ_ATTEMPTS` / `MAIN_READ_BACKOFF_S` — two calls issued back to back fail together, and a later read gave the header a sha the goals had never compared against), and every consumer uses that one value. ⛔ THE BOX INVENTORY HAS FOUR STATES and each is reported as itself: `absent` (a probed LOCAL-ONLY row, announced in the goal-2 READINGS by a `⚠️` line and a `⛔ LOCAL ONLY` line — never in the action, and never in a report whose inventory file exists), `unread` (the file exists and could not be read — including a non-UTF-8 file), `empty` (it exists and lists NO boxes) and `noprobe` (no file and no `box-status.sh`, so nothing could be probed). None of the last three is a box: no fraction, no marker word, no deploy instruction, and the standing is `NOT-MEASURED`. The local-only fallback otherwise printed a fleet marker over a one-box read. And the label filter must run SERVER-SIDE: `gh issue list --label P0 --json number` returns
 ONE PAGE, so a local `len()` counts the page and not the population. Measured on tortoise: a slice
 said `P0=4 · P1=5` while the label query answered **7 and 20** (>300 open issues). `_count` therefore
 asks `search/issues` for `total_count`, with the filter already applied by the server.
@@ -2558,7 +2923,7 @@ is still matched by its script path, and that legacy fallback is the only place 
 abstention (exit 3) that rewrites nothing, rather than an empty crontab it would overwrite.
 
 **Status: IMPLEMENTED and TESTED.** `merge-reminder.test.sh` is a shard in both lanes (§1–§28,
-277 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
+337 assertions) and drives ALL THREE timer arms end-to-end with stubbed schedulers — systemd (the
 unit is rendered and its `ExecStart` is asserted to start with the interpreter exactly once, which is
 how the duplicated-`argv[0]` defect was caught), crontab (quoted, `%`-escaped, verified by `crontab
 -l`, and removable without deleting an operator line that merely mentions the tag), and launchd (the
@@ -3953,7 +4318,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
 | `merge-reminder.py` | the fleet's **10-minute merge reminder, with a narrow evidence-gated ACTUATOR arm** (#2603, §6.5.9). Answers three questions — closest to landing, merged-but-not-LIVE, and one red shared across PRs — and on a complete-evidence GO dispatches `scripts/admin-merge.sh <PR> --repo …` (never a merge of its own, never an override). Its emitted line carries the MEASURED readings (`reds=0 in-flight=21 attested@head=no claim=none rail=idle`); an unread value is `UNREADABLE` and dispatches nothing. Cost-bounded: `rate_limit` FIRST, ≤9 metered REST calls (the 9th is the per-candidate mergeability read, which the LIST endpoint does not compute), a thin budget SKIPS the cycle by name. Runs from launchd (macOS) or a systemd-user/cron timer (Linux): `--install-timer` / `--uninstall-timer`. Not part of the loop |
-| `box-status.sh` | ONE box's harness identity (`harness: <sha> [current|behind|ahead|diverged|unknown] source=<pin|stamp|none>`), the stamp and pin beside it, `controller: RUNNING(pid …)|STOPPED`, and `roles: idle|busy:<role>(pid=…,age=…)` from the doctor's own role locks. Exit 2 = CANNOT VERIFY — an unanswered identity is never `current`. This is the deploy arm's evidence, so it refuses to answer from an unread process table |
+| `box-status.sh` | ONE box's harness identity (`harness: <sha> [current|behind|ahead|diverged|unknown] source=<pin|stamp|none>`), the stamp and pin beside it, `controller: RUNNING(pid …)|STOPPED`, **`running: <sha12>|NONE|UNREADABLE|MIXED`** — the commit the RUNNING controller's own argv resolves to, which is what "activated" means (`harness-refresh.sh` calls the pin-ahead-of-process state `restart-pending`; the pin alone certified a box as `deployed AND activated` while it executed pre-fix code, #2680) — the repo it compares against is resolved `HARNESS_REPO`-first / the payload's own checkout / this script's own checkout / the conventional `$HOME/orchestrator` — and every candidate must CARRY the harness — `scripts/orchestrator-harness/box-status.sh` **tracked as a regular file at exactly that path by the candidate's own repo** (`git ls-files -s`: index mode `100644`/`100755` **and** the recorded path equal to the marker, so a prefix match is not the file), which skips a checkout that is merely *some* repo, one that only reaches the harness through the gitignored `scripts -> $AGENT_INFRA_PATH/scripts` pointer every tortoise/eldato checkout carries (#9475), one that tracks a SYMLINK (mode `120000`) or a GITLINK (`160000`) at the marker path and so ships no harness bytes, and one whose marker path is a DIRECTORY (the index records a nested file) — none of them can be read as the harness repo (#2679); a subdirectory candidate is ACCEPTED, the same as `harness_repo_of()` (a literal-path test refused what `harness-refresh.sh` and `check-deployed-drift.sh` accept), and a refused candidate is NAMED on `ref:` (`ref: UNRESOLVED (--repo: … has NO INDEX ENTRY for …)` / `(… not a TRACKED REGULAR FILE there (mode …))` / `(… records … instead …)`) instead of leaving the line out, because an absent line reads as "no opinion" when the answer is "compared against nothing" — and `roles: idle|busy:<role>(pid=…,age=…)` from the doctor's own role locks. Exit 2 = CANNOT VERIFY — an unanswered identity is never `current`. This is the deploy arm's evidence, so it refuses to answer from an unread process table — and it reads the controller's argv as NUL-separated fields (`/proc/<pid>/cmdline`, `mapfile -d ''`), not a whitespace split, because a harness path may contain a space and a split one answered `running: UNREADABLE` for an ACTIVATED box; the `ps` fallback has no NUL-preserving form, so a space there yields UNREADABLE rather than a wrong tree, never a guess. `MIXED` is driven directly by two real trees in the suite, not only reached through a stub |
 | `merge-reminder.test.sh` | #2603: drives the shipped reminder through EVERY gate with a fixture reviews dir, a stub `gh`/`ps`/rail and a REAL `refs/claims/*` ref — attested+quiet dispatches; `attested=stale`, `in-flight=3`, `reds=1`, a held claim, a live rail and a `mergeable=null` each refuse BY NAME and dispatch nothing; `rate_limit` is the FIRST call and a thin budget spends nothing else; the grouping rule is pinned both ways (a re-run to success is not red; a same-named job in another workflow cannot mask a red); the deploy arm refuses a mid-flight role pass and otherwise dispatches the box's own verb and VERIFIES it by artifact; two MUTANTS prove the gates are live. A CI shard |
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
 
@@ -4278,6 +4643,48 @@ now requires (a) an ORCHESTRATOR unit name, (b) ACTIVE state, and (c) never trea
 disk as evidence that one is loaded (the macOS arm already refused that inference). A cell whose
 supervisor is the process (tmux + process table, which is how `cloud-cell-supervisor.sh` works) is
 reported as `supervisor process`, with the evidence named.
+
+#### The five primitives that differ — `scripts/lib/box.sh` (agent-infra#2271)
+
+Each of these had already been discovered separately, in a different script, AFTER it failed there:
+
+| primitive | BSD (macOS) | GNU (Linux) | why the wrong spelling is dangerous |
+|---|---|---|---|
+| in-place edit | `sed -i '' -e …` | `sed -i'' -e …` | `sed -i 's/a/b/' f` on BSD treats the SCRIPT as the backup suffix: it edits **nothing** and exits **0** |
+| epoch → date | `date -r <epoch>` | `date -d @<epoch>` | the wrong flag is a usage error, so a "timestamp" is silently empty |
+| CPU count | `sysctl -n hw.ncpu` | `nproc` / `getconf _NPROCESSORS_ONLN` | resolved at SOURCE time, so a wrong PATH pinned `_NCPU=4`/`MAX_LOAD=40` for every cell (#1702) |
+| mtime | `stat -f %m` | `stat -c %Y` | `stat -c` on macOS means filesystem status and prints the WRONG NUMBER |
+| supervisor | launchd | systemd unit or a supervisor process | already in the table above |
+
+**One shim, probed, never assumed from `uname`:** every primitive tries its mechanisms in order and
+records which one answered (`box_provenance`), so a Homebrew GNU-userland on macOS or a BSD-flavoured
+container still gets the right answer. `bash scripts/lib/box.sh --selftest` prints the provenance and
+reproduces the BSD `sed -i` hazard as a live assertion; `scripts/lib/box.test.sh` runs on both
+platforms.
+
+#### `scripts/harness-exec.sh` — the RUNTIME half of "the Mac runs from the pin"
+
+`install.sh` refuses to render a plist whose program is not inside the pin (#2271, install time).
+`harness-exec.sh` is the same refusal on every START, for both platforms: it resolves the two pin
+records (`HARNESS-PIN` = commit, `HARNESS_PIN_FILE` = the harness directory the controller execs),
+requires the recorded directory to BE a clean checkout at that commit inside `<pin root>/<sha12>`,
+requires the entrypoint to exist **and to resolve inside the tree**, and `exec`s it. **There is no
+fallback** — not `$O`, not `~/orchestrator`, not `origin/main` — because running an unpinned copy
+INSTEAD of the pin is exactly how three fixes existed only in a home-directory copy for weeks
+(#2231). Every refusal is a named `rc=78` and is asserted by name in `scripts/harness-exec.test.sh`:
+not-a-checkout, the two records DISAGREE, EMPTY, not a commit id, not a directory (pruned), the pin
+layout (`<root>/<sha12>`, proven from the records when `HARNESS_PIN_DIR` is unset), UNCOMMITTED
+CHANGES in the pinned harness dir, an entrypoint that walks out with `..` or through a symlink, and an
+entrypoint the pin does not carry.
+
+⛔ **IT IS NOT THE START PATH YET, AND THIS FILE WILL NOT PRETEND OTHERWISE.** Nothing renders or
+execs it today (`rg -ln harness-exec` finds only this shim, its suite and the shard list), so the Mac's
+launchd job still execs `~/orchestrator/launchd-controller.sh` — the home-dir copy #2231 names as its
+worst row. The two changes that put this shim on the start path are **#2271** (install resolves the
+pin and parses `ProgramArguments` back out of the rendered plist) and **#2020** (the TCC wrapper's
+content lifted into a commit). Until both land, the shim is inert: on this Mac it REFUSES (there is no
+pin — measured 2026-10-22), and `harness-exec.test.sh` arm 10 asserts exactly that rather than
+pretending the box is fixed.
 
 ### Which instrument answers which question (all three, and they DISAGREE by design)
 

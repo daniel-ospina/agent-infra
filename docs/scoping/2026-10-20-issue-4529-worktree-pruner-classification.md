@@ -61,6 +61,30 @@ Second, independent defect in the same proof: `resolve_main_ref()` reads the **l
 `git ls-remote` instead. A stale local main can only ever *under*-report merges, which is why it
 compounds the squash blindness rather than causing removals by itself.
 
+#### 1.2.1 The premise as it stands at the MERGED head (read this before §2.1/§6.1)
+
+The measurement above is the pre-merge state and it is what made the issue real. It is **no longer
+true of the code that ships here**: while this branch was in review, `main` landed #2721's
+**RULE 4** in the delegate itself — `classify_one` now removes a checkout when "a PR for this head is
+MERGED", decided two rules before the age floor is even computed:
+
+```
+scripts/pi-reap-worktrees.sh:1669  # ── RULE 4: a MERGED PR for this head, whatever the merge strategy
+                                   #    if [ "$pr_state" = "MERGED" ] && [ "$pr_oid" = "$sha" ]
+```
+
+So on a squash-merge repo `refs=merged` (rule 3) is still unreachable, but the class is no longer
+*stuck in the age floor*: rule 4 fires on the PR state with the sha identity gate (`pr_oid = $sha`),
+which is the same "the evidence is about THIS commit" warrant §6.1 asked for, and rule 7's minimum
+age still gates it (`G6e`). #2354's `patch_equivalent()` (`:1419`) remains as a **second, independent**
+squash signal that lifts the *floor* only, never reachability.
+
+Consequence for this document: the second ancestry arm this PR carried (`merged_pr_ev` /
+`is-ancestor(pr.mergeCommit.oid, RESOLVED_MAIN)`) was **dropped in the merge**, because rule 4
+decides the same class with a stronger proof. §2.1, §3, §5.2 and §6.1 below carry that correction
+inline; the parts of this PR that ship unchanged are the reporting half (§1.3, §2.3), the remote-main
+resolution (§6.1), and the installed-unit read-back (§2.4).
+
 ### 1.3 The third defect: a pass that removes nothing is indistinguishable from a healthy one
 
 Measured on this cell (real dry run, full output captured):
@@ -105,9 +129,9 @@ read as success.
 
 | # | Approach | Verdict |
 |---|---|---|
-| **S1** | **Commit-level merged proof with a second arm**: keep `is-ancestor(tip, main)`; when it fails and the branch's PR is `MERGED`, require `is-ancestor(pr.mergeCommit.oid, resolved_main)`. Resolve `main` from the push url via `ls-remote` (`REAP_WT_MAIN_PROOF=auto`), falling back to the local tracking ref. Waive the age floor on *either* proof. | **CHOSEN** |
-| S2 | Trust the PR state alone (`gh pr view` → `MERGED` ⇒ merged) | **rejected** — that is "verify by name": it holds when the PR merged into a *different base*, or when a force-push after the merge rewrote the content. The ancestor test on the PR's own merge commit is the commit-level fact that closes both. |
-| S3 | `git cherry` / patch-id equivalence to detect squash merges | **rejected** — O(commits) per record (the tool is explicitly bounded: no `find`, no `du`, one batched `gh` call), needs the same main resolution anyway, and reports "equivalent" for content that was later reverted, which is a *worse* answer to "may this still be under review?" than the PR state. |
+| **S1** | **Commit-level merged proof with a second arm**: keep `is-ancestor(tip, main)`; when it fails and the branch's PR is `MERGED`, require `is-ancestor(pr.mergeCommit.oid, resolved_main)`. Resolve `main` from the push url via `ls-remote` (`REAP_WT_MAIN_PROOF=auto`), falling back to the local tracking ref. Waive the age floor on *either* proof. | **SUPERSEDED at the merged head** — the `is-ancestor(mergeCommit, main)` arm was dropped: `main` shipped #2721's **RULE 4** (`pi-reap-worktrees.sh:1669`, PR state + `pr_oid == HEAD`) which decides the same class two rules earlier with a stronger warrant. The **main resolution half ships** (`resolve_remote_main`, `:744`). |
+| S2 | Trust the PR state alone (`gh pr view` → `MERGED` ⇒ merged) | **REJECTED as stated, ADOPTED as RULE 4 above** — "merged PR ⇒ merged" alone is verify-by-name; the shipped rule adds `pr_oid == this checkout's HEAD`, which is exactly the commit-level fact S2 lacked (name reuse, post-merge commits, force-push-after-merge all fail it — `G14f`). |
+| S3 | `git cherry` / patch-id equivalence to detect squash merges | **ADOPTED NARROWLY** — #2354's `patch_equivalent()` (`:1419`) ships as a **second squash signal that lifts the AGE FLOOR only**, never a survival proof (`:96-107` states the ⛔). The original rejection was right about the survival channel and wrong about the floor: there, "equivalent content, maybe reverted" is an acceptable input to *when may this be reaped*, and it is defended by the branch ref still existing. |
 | S4 | Delete the age floor / lower it by default | **rejected** — destroys unlanded work. |
 | S5 | Add a second scan root for `/tmp/cell-home/wt-*` | **rejected** — the registry already covers it (measured); a directory is a stale cache of `git worktree list`. |
 | S6 | Have the delegate report bytes reclaimed | **rejected** — the tool's measured honesty rule (per-worktree `.venv`s are hardlinked to the uv cache: 84 GB `du` delta vs 22 GB actual). The **entry point** measures with `df`; the delegate reports *counts and reasons*. |
@@ -123,27 +147,33 @@ live-process > live-cwd > dirty|ignored-artifact|status-* >
 detached-unreachable > open-pr > too-recent > reclaimable
 ```
 
-`refs=` (the reachability / merge evidence) gains one value:
+`refs=` (the reachability evidence) is **UNCHANGED at the merged head** — the second arm that would
+have added a `merged-pr:<oid7>` value was dropped (§2.1 S1):
 
-- `merged`                     tip is an ancestor of the resolved main (unchanged)
-- `merged-pr:<oid7>`           **new** — the branch's PR is MERGED and its `mergeCommit.oid` is an
-                               ancestor of the resolved main (covers squash AND rebase-with-commit)
+- `merged`                     tip is an ancestor of the resolved main (rule 3)
 - `branch-retained:<b>`        unchanged (removal never deletes the branch)
 
-Age floor: `REAP_WT_MERGED_AGE_DAYS` (0) when `refs` is **any merge proof**; `REAP_WT_AGED_DAYS` (7)
-otherwise. Everything else — clean/dirty, live holder, open PR — is untouched and keeps its order.
+A squash-merged head therefore leaves `refs=branch-retained:<b>` and is removed by **rule 4**, whose
+row names the proof it used: `proof=pr-merged <owner/repo#n> state=MERGED head=<sha12>`.
 
-**Declared threat surface** (adversarial bound, 2 cycles; out-of-scope classes named below):
+Age floor: `REAP_WT_MERGED_AGE_DAYS` (0) when `refs=merged`, when `patch_equivalent` holds (#2354),
+or on rule 4's own merged floor; `REAP_WT_AGED_DAYS` (7) otherwise, and rule 7's
+`REAP_WT_MIN_AGE_MINUTES` minimum applies on top of every one of them. Everything else — clean/dirty,
+live holder, open PR — is untouched and keeps its order.
+
+**Declared threat surface** (adversarial bound, 2 cycles; out-of-scope classes named below).
+⚠️ Rows T1/T2/T4 were written for the DROPPED ancestry arm and are restated against the **shipped**
+rule 4 + `patch_equivalent` (§2.1, §6.1):
 
 | # | Threat | Covered by |
 |---|---|---|
-| T1 | merged PR whose `mergeCommit.oid` is *not* on main (wrong base, rewritten main) | `is-ancestor` on the oid ⇒ no waiver. **Test: G6h** |
-| T2 | merged-PR list truncated (`--limit`) | can only MISS evidence ⇒ preserve. Recorded as `pr_merged=ok` with `rows=<n>` in the log (a truncated list loses rows, so the evidence simply never matches) |
-| T3 | merged-PR list unavailable / gh down | no waiver ⇒ preserve; recorded `pr_merged=unavailable`; the open-PR gate still exit-3s. **Test: G6i** |
-| T4 | `mergeCommit.oid` unknown locally (unfetched) | `is-ancestor` rc 128 ⇒ no waiver |
-| T5 | stale / narrowed local `origin/main` | remote main resolved via push-url `ls-remote`; local only as fallback, and recorded (`main_proof=`). **Test: G6f** |
+| T1 | a MERGED PR found by BRANCH NAME that is not about this commit (name reuse, post-merge commits, force-push-after-merge) | the sha identity gate `pr_oid == $sha` ⇒ no evidence, and the row says so (`pr-merged-other-head=`). **Test: G14f** (mutation: dropping the equality turns it red) |
+| T2 | merged-PR list truncated (`--limit`) | **A row count AT the bound is a REFUSAL** (`pr_state_load`, exit 3, nothing removed) — an absent row is not "no PR". Test: **G5c**-adjacent shard (`A8` pins the call shape); truncation is exercised by the `GH_STATE=truncated` seam |
+| T3 | merged-PR list unavailable / gh down / gh unauthenticated | no evidence ⇒ preserve; recorded `pr_merged=unavailable`; the PR gate exits 3 (skipped repo, `pr_merged=` + `detail=` naming it). **Test: G5c** |
+| T4 | a rebase-with-commit (or any strategy) merge | rule 4 reads PR STATE, so strategy cannot matter — it is strictly stronger than the dropped `mergeCommit`-ancestry arm. **Test: G14** (squash, head not an ancestor), **G14b** (detached head matched by sha) |
+| T5 | stale / narrowed local `origin/main` | remote main resolved via push-url `ls-remote --symref`; local only as fallback, and recorded (`main_proof=`). **Test: G6f** |
 | T6 | origin has no push url / >1 push url / ls-remote fails | fall back to local ref, recorded. No removal decision depends on it alone |
-| T7 | merged proof shadowing the open-PR veto | order: `commits_survive` runs first but does not return; the open-PR veto is checked after and still wins. **Test: existing G5a** |
+| T7 | merged proof shadowing the open-PR veto | the open-PR veto is checked **before** rule 3/4 and returns. **Test: G5a** |
 | T8 | installed unit masked by a drop-in (the 127 unit) | read-back parses the *artifact systemd loads*. **Test: T55** |
 | T9 | partial write / truncation of the installed unit | read-back requires a non-empty effective `ExecStart` list containing our target. **T55 covers the drop-in MASK; the no-`ExecStart`-at-all branch is refused by the same function but has no dedicated test** (see §6.2) |
 
@@ -200,21 +230,32 @@ a box with no GitHub remote does not need it.
 
 | Test | Fixture | Fails before because |
 |---|---|---|
-| **G6e** squash-merged worktree, **outside** the repo root, merged-PR evidence present | bare `origin` + worktree at `$T/G6e-ext/wt-9307` (the 5.7 GB shape: outside the repo dir), PR says MERGED with `mergeCommit == main` | tip is not an ancestor ⇒ `branch-retained` ⇒ `too-recent` ⇒ preserved |
-| **G6f** stale local `refs/remotes/origin/main` | squash pushed to the bare origin, never fetched into the fixture repo | mergeCommit is only an ancestor of the *remote* main ⇒ no waiver |
-| **G6h** (mutation guard) merged PR whose `mergeCommit.oid` is **not** on main | gh reports MERGED + an unrelated oid | must still preserve — fails if the ancestor arm is dropped |
-| **G6i** merged evidence unavailable | `gh --state merged` fails | must preserve, and say `pr_merged=unavailable` |
-| **G6j** SUMMARY tally | any fixture with mixed verdicts | no SUMMARY line exists |
+| **G14** squash-merged worktree, **outside** the repo root, merged-PR evidence present | bare `origin` + a worktree whose HEAD is NOT an ancestor of main, PR says MERGED for that sha | rule 3 cannot see a squash ⇒ `branch-retained` ⇒ `too-recent` ⇒ preserved |
+| **G14b** detached head matched by head sha | `worktree add --detach` at the squash sha, PR row keyed by `headRefOid` | a detached head has no branch name ⇒ rule 4 could not name it |
+| **G14f** (mutation guard) MERGED PR for a REUSED branch name, HEAD ahead of it | gh reports MERGED for the OLD sha, the checkout holds new work | must still preserve, and NAME the other-head PR — fails if the `pr_oid == HEAD` gate is dropped |
+| **G14c/G14d** CLOSED-unmerged / no PR | — | must preserve (rules 5/6), named |
+| **G6e** rule 7 gates rule 4 | 60s-old checkout with a MERGED PR (`REAP_WT_TREE_TS`) | the merged floor must not short-circuit the 45-minute minimum |
+| **G6f** stale local `refs/remotes/origin/main` + the real clock | stale-but-existing tracking ref; and a seconds-old checkout whose HEAD is 76d old | a missing/stale tracking ref falls through to local `main`; the floor must still hold |
+| **G6d** merged exemption | MERGED head 2d old, floor pinned to 7d as a control | the exemption is unrecorded / the floor is bypassed silently |
+| **G6j (SUMMARY tally) → SHIPPED AS T56** in `disk-reaper.test.sh` | any fixture with mixed verdicts | no SUMMARY line exists — the tally contract lives in the entry-point suite (§1.3/§2.3) |
 | **T55** installed-artifact read-back | override unit dir + a `*.service.d/` drop-in masking `ExecStart` to a `mktemp` path | install exits 0 and reports "installed" over a unit that would 127 |
 | ~~T53~~ (not written — folded into T55: the drop-in mask and the moved `HOME` are the two shapes an operator actually hits. **T56 is now used** for the tally contract: per-repo sums, the merged `reasons=` histogram, and the `?`/`not-run` sentinels) | — | — |
-| A8 | updated: **two** batched gh calls, both with an explicit limit | — (contract change, asserted) |
+| A8 | one batched gh call (`--state all`, explicit limit) carrying `state` + `headRefOid` | — (contract change, asserted) |
+
+⛔ **The tests DROPPED with the arm:** `G6h` (a merged PR whose `mergeCommit.oid` is not on main),
+`G6i` (merged-evidence read fails), `G6k` (gone-dir + a merged PR ⇒ still `detached-unreachable`).
+They tested the ancestry arm that rule 4 replaced. What they protected is now structural: rule 4
+fires only in the REMOVAL path and still runs after `commits_survive`, so merge evidence can never
+reach the reachability decision the way the lost P0 did — pinned by **G3a** (`detached-unreachable`
+preserved), **A24** (gone-dir record held only by a revocable ref blocks the prune) and **G10**
+(gone dir + unreachable sha).
 
 ---
 
 ## 4. Wiring check
 
 - entry: `disk-reaper.sh` (delegate call, class line, status fields) → `pi-reap-worktrees.sh`
-  (`resolve_remote_main` → `pr_merged_refs_load` → `commits_survive` → `classify_one` → SUMMARY)
+  (`resolve_remote_main` → `pr_state_load` → `commits_survive` → `classify_one` → SUMMARY)
 - schedule: `install-disk-reaper-timer.sh` → `templates/systemd/eldato-disk-reaper.service` (read-back)
 - tests: `scripts/pi-reap-worktrees.test.sh`, `scripts/disk-reaper.test.sh` — both in
   `scripts/run-bash-shards.sh` (CI `ci-main.yml`).
@@ -263,15 +304,15 @@ Verifier: **P0=2**, P1=6, P2=5, P3=4.
 
 | Finding | Action |
 |---|---|
-| **P0** `refs=merged-pr` put the merge proof in the **survival** channel (`commits_survive` returns early) ⇒ on the gone-directory/`prunable` path it would waive the reachability gate and the global prune would deregister the admin HEAD — the last durable handle of a detached commit | **Fixed** — merge-PR evidence never enters `commits_survive`. It is a separate `merged_pr_ev` computed in `classify_one`, and it keys **only** the age floor. The reachability gate is untouched. New test **G6k** (gone-dir fixture + a merged PR by that head name ⇒ still `detached-unreachable`, still not pruned) |
-| **P0** the waiver keyed on the branch NAME: name reuse, HEAD ahead of the PR head, and force-push-after-merge all waive a live checkout | **Fixed** — the evidence is `pr.headRefOid == this checkout's HEAD` (plus `mergeCommit` ancestry). Name reuse ⇒ different tip ⇒ no evidence; post-merge commits ⇒ no evidence (§6.1) |
+| **P0** `refs=merged-pr` put the merge proof in the **survival** channel (`commits_survive` returns early) ⇒ on the gone-directory/`prunable` path it would waive the reachability gate and the global prune would deregister the admin HEAD — the last durable handle of a detached commit | **Fixed** — merge evidence never enters `commits_survive`; the arm was confined to the age floor. ⚠️ **At the merged head the arm itself is gone** (§2.1 S1, §6.1): `main` shipped RULE 4, which decides the same class in the REMOVAL path, after `commits_survive` has already decided reachability — so the channel separation the P0 asked for holds structurally. The dedicated test **G6k** was dropped with the arm; the reachability gate it guarded is pinned by **G3a**, **A24** and **G10** |
+| **P0** the waiver keyed on the branch NAME: name reuse, HEAD ahead of the PR head, and force-push-after-merge all waive a live checkout | **Fixed, and now by RULE 4** — the shipped evidence is `pr_state = MERGED && pr_oid == this checkout's HEAD` (`pi-reap-worktrees.sh:1669-1698`). Name reuse ⇒ different tip ⇒ no evidence; post-merge commits ⇒ no evidence. **Test: G14f** (plus its control: the same fixture IS rule-4 reclaimable when the oid matches) (§6.1) |
 | **P1** a shared read-back would false-block macOS (launchd has no `ExecStart`) | **Fixed** — target-dispatched: `verify_installed_unit()` (systemd) / launchd arm checks `ProgramArguments` identity |
 | **P1** "installed file as fallback" *is* the fail-open: `/run/systemd/system/*.d` drop-ins are invisible to a file read | **Fixed** — for `system`/`user`, `$SC cat` must answer or the install REFUSES; the file path (plus merged `<unit>.d/*.conf`) is used only for `TARGET=override`, and it merges drop-ins itself. The t8 shim gains `cat` |
 | **P1** `EnvironmentFile=keys.env` is arbitrary shell; systemd applies it *after* `Environment=`, so a `HOME=` line silently overrides the HOME the read-back certifies | **Dropped** — no `EnvironmentFile`. The installer instead **resolves `gh` in the rendered environment and reports it** (`gh=<path|MISSING>`); the class already fails closed (exit 3, red) when gh is unavailable |
 | **P1** appending `$HOME/.pi/agent/shims` to PATH contradicts a recorded decision (install-launchd.sh **excludes** `/shims` — macOS TCC EPERM) and is inert (appending cannot outrank the real gh) | **Dropped** — not reopening a recorded decision; gh resolvability is reported instead |
 | **P1** the new network probe needs an explicit seam or three existing fixtures become host-dependent | **Fixed** — `REAP_WT_MAIN_PROOF=auto|local`, `REAP_WT_MAIN_PUSH_URL`, `GIT_TERMINAL_PROMPT=0`, and `run_reaper` pins every fixture to `local` |
 | **P1** G6f would be vacuous (a missing `refs/remotes/origin/main` falls through to `refs/heads/main`) | **Fixed** — G6f requires a stale-but-EXISTING tracking ref with local `main` reset *behind* it, plus a `REAP_WT_MAIN_PROOF=local` control on the same fixture |
-| **P1** the gh shim is argument-blind; a second call feeds open-list payloads into the merged loader, and `FAKE_GH_FAIL` fails both calls so G6i cannot observe anything | **Fixed** — the shim dispatches on `--state open` vs `--state merged`, with separate payload and failure seams; A8 asserts two distinct calls |
+| **P1** the gh shim is argument-blind; a SEPARATE call per state feeds open-list payloads into the merged loader, and `FAKE_GH_FAIL` fails both calls so the merged-evidence arm cannot observe anything | **Fixed at the time, then MOOT at the merged head** — the read is now ONE `gh pr list --state all` call carrying `state` + `headRefOid` (`pr_state_load`, `:1165`), so there is no second loader to confuse; A8 pins that the single call carries both fields |
 | P2 the SUMMARY must reconcile (`PRESERVE_C` already includes `DEFERRED`; `REMOVE_C` counts rows later preserved/failed) | **Fixed, then corrected again by the VGATE reviewer** — a single `classified = remove + preserved + deferred` claimed a decision for records the budget never classified and did not reconcile on a deferral (measured `classified=2 … deferred=15` on 16 records). The line now carries `examined=` and TWO identities: `classified = remove + preserved` and `examined = classified + deferred`; `preserved` EXCLUDES deferrals; apply-only `removed/failed/late_preserved/prune_blocked`. Asserted by **G6j** (clean), **A7** (dry budget-deferred) and **A7 armed** (remove-time deferral, which has its own `deferred_remove=` counter) |
 | P2 `main_proof`/`pr_merged` are per-repo but the class line is one line | **Fixed** — counts summed; a differing proof across repos reports `mixed` |
 | P2 `auto` can report a main SHA that is not in the local object DB (the stale cell case) | **Fixed** — `git cat-file -e <sha>^{commit}` first; `auto-unfetched` + no waiver |
@@ -281,7 +322,7 @@ Verifier: **P0=2**, P1=6, P2=5, P3=4.
 | P3 multiple `ExecStart=` is legal for `Type=oneshot` | **Fixed** — the check is "the rendered ExecStart is present among the effective ones" |
 | P3 S3's rejection reason mis-states the decisive fact (patch-id cannot detect a squash at all) | **Fixed** — §2.1 S3 |
 | P3 "falsified" is repo-relative; a worktree of a repo absent from `DISK_REAPER_REPOS` is still invisible | **Recorded as a residual** in §6.2 |
-| P3 "covers rebase-with-commit" unverified | **Scoped** — the claim is the measured class (squash); a rebase merge with a null `mergeCommit` yields no evidence |
+| P3 "covers rebase-with-commit" unverified | **RESOLVED by the merged head** — rule 4 keys on PR state, not on a `mergeCommit` oid, so a rebase merge (and a null `mergeCommit`) is decided identically; the question no longer has a code path to be wrong about |
 | P3 G5a is not a test of "merged proof does not shadow the open-PR veto" | **Fixed** — the name-reuse fixture (old merged PR + new OPEN PR, same head ref, different tip) is its own test, asserting `reason=open-pr` |
 
 Both P0s were safety findings in destructive code; nothing was dismissed. No re-dispatch was needed
@@ -291,23 +332,37 @@ for ignored findings (none were ignored); cycle 2 is the code-review gate (§7).
 
 ## 6. Final contract
 
-### 6.1 Merge evidence (the only thing the waiver rests on)
+### 6.1 Merge evidence (the only thing the waiver rests on) — **AS SHIPPED**
+
+⚠️ This section was rewritten at the merge: the second arm it originally specified
+(`merged_pr_ev` = `is-ancestor(pr.mergeCommit.oid, RESOLVED_MAIN)`) **is not in the code**, because
+`main` landed #2721's RULE 4 while this branch was in review and rule 4 decides the same class with a
+stronger, strategy-independent proof. Shipped predicate:
 
 ```
-merged_pr_ev = "merged-pr:<mergeCommit-short>"  iff ALL of:
-  branch != "-"                                    # a named branch (a PR has a head ref)
-  PR(branch) is MERGED
-  pr.headRefOid == <this checkout's HEAD sha>      # the evidence is about THIS commit
-  is-ancestor(pr.mergeCommit.oid, RESOLVED_MAIN)   # …and its merge commit is on main
+scripts/pi-reap-worktrees.sh:1669-1698   RULE 4 — a MERGED PR for this head, whatever the strategy
+  pr_state == MERGED                          # from ONE `gh pr list --state all` read
+  pr_oid    == <this checkout's HEAD sha>     # the evidence is about THIS commit (G14f)
+  ⇒ remove, at REAP_WT_MERGED_AGE_DAYS (0), still gated by rule 7's minimum age (G6e)
+     row: remove\treclaimable\t…\trule=4 refs=<refs> proof=pr-merged <slug>#<n> state=MERGED head=<sha12>
 ```
+
+`refs=` is untouched by it: a squash-merged head is still `refs=branch-retained:<b>`, and rule 4
+never touches `commits_survive` (the reachability gate) nor the `refs=merged` ancestor test of rule 3.
+
+`REAP_WT_MERGED_AGE_DAYS` is lifted by three inputs, in this order (`:1605-1622`):
+
+1. `refs=merged` (rule 3, ancestry) — the strongest proof;
+2. `patch_equivalent()` (`:1419`, `git cherry`) — the #2354 squash signal, **age floor only**
+   (`:96-107` carries the ⛔: it is neither reachability nor present state, and a squash later
+   reverted still reads equivalent, which is why it can never appear in `refs=`);
+3. rule 4's own merged floor, which applies even when `git cherry` cannot see a multi-commit squash.
 
 `RESOLVED_MAIN` = `ls-remote --symref <push_url> HEAD` → `refs/heads/<n>` → its oid, when
 `REAP_WT_MAIN_PROOF=auto` (default) and the oid is present locally; otherwise the existing local
-`MAIN_REF` chain. The age floor is `REAP_WT_MERGED_AGE_DAYS` when `refs = merged` **or**
-`merged_pr_ev` is non-empty; otherwise `REAP_WT_AGED_DAYS`.
-
-⛔ `merged_pr_ev` may never satisfy, replace or short-circuit `commits_survive` (the reachability
-gate). It keys the age floor and nothing else.
+`MAIN_REF` chain. This half **ships unchanged** (`resolve_remote_main`, `:744`) and is reported per
+pass as `main_proof=<auto|auto-unfetched|ambiguous|unavailable|local>` in the SUMMARY line, alongside
+`pr_merged=<ok|na|unavailable>` (whether the PR read was answerable at all — not a waiver).
 
 ### 6.2 Residuals (named, not fixed here)
 
@@ -325,9 +380,8 @@ gate). It keys the age floor and nothing else.
 - **A stale launchd plist** is refused on the same facts as the systemd unit (executable, mode flag,
   `EnvironmentVariables.HOME`), but launchd has no drop-in equivalent, so no seam produces
   "written but stale": T20 is a positive control for the checks, not a negative one.
-- **Two `gh` calls per repo per pass** (open veto + merged evidence) instead of one. The merged call
-  is soft-fail by design, so a pacing/rate-limit refusal there costs only the waiver; the open call
-  failing closed is pre-existing behaviour.
+- **One `gh` call per repo per pass** (`pr list --state all`), plus the origin-remote probe for the
+  slug. Its soft-fail behaviour is a KEEP (rules 5/6 + `pr_merged=unavailable`), never a removal.
 - Windows/no-`timeout` hosts: unchanged (`lib/bounded.sh` fallback). The new probe is bounded by
   `REAP_WT_GIT_TIMEOUT`.
 - The dirty gate precedes the merge evidence, so a merged checkout that is dirty is never a

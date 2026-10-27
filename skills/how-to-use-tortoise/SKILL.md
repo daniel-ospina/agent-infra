@@ -45,10 +45,18 @@ The write operations appear once in this skill (by operation name). Invoke them 
 | Delete point | `tortoise_delete_point` | `sdk.delete_point(id)` |
 | Update point | `tortoise_update_point` | `sdk.update_point(id, **props)` |
 | **Edit an operator edge** (relabel) | `tortoise_update` | `sdk.update(<operator_id>, label=…)` |
-| **Remove an operator edge** | `tortoise_delete` | `sdk.delete(<operator_id>)` |
+| **Delete any entity or edge** | `tortoise_delete` (preview, then confirm) | `sdk.delete(<operator_id>)` |
 | Compute confidence | `tortoise_compute_confidence` | `sdk.compute_confidence(anchors=…)` |
 | Check structure | `tortoise_check_structure` | `sdk.check_structure()` |
 
+> **`tortoise_delete` is two calls.** Call it with the id alone and **nothing is deleted**: you get a
+> preview of what that id is and what else would go with it, plus a short-lived `confirmation` token bound
+> to that id. Call it again with `confirmation=<token>` to delete. The token expires in ten minutes and is
+> bound to the id, so a stale one is refused rather than acting on the wrong thing. It is one tool for every
+> kind — sources, points, objects, subjects, events and operators are all ids. `tortoise_delete_point` and
+> `tortoise_delete_entity` still exist and are proposed for merge into this one. Whole graphs are not
+> deletable through it; that stays a dashboard action.
+>
 > **An operator IS a Point.** Operators carry `is_operator=true` on a `:Point` node, so they take
 > the *generic* verbs above — `sdk.update(<operator_id>, label=…)` relabels an operator edge in
 > place and `sdk.delete(<operator_id>)` removes it. `operator_action`'s refusal (`"must be

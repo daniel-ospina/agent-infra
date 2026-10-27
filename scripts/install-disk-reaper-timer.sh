@@ -294,8 +294,13 @@ refuse_transient_target() {
     fi
     # The unit PINS the three delegates beside $REAPER, so a missing one is a class that fails
     # closed (exit 3, red) on every pass — name it at install time rather than after the fact.
-    for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh; do
-        [ -f "${REAPER%/*}/$d" ] || err "WARNING: ${REAPER%/*}/$d is missing — the unit pins it, so that class will fail closed (exit 3, red) every pass"
+    for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh \
+             reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/live-paths.sh; do
+        # #2542 adds the two new owners AND the census library they share. The library is in this list
+        # rather than in the REFUSING arm below because a missing library breaks TWO classes, not the
+        # pass: a red unit that names them is a worse failure than a refusal, but a silent one is worse
+        # again — so it is named at install time, exactly like a missing delegate.
+        [ -f "${REAPER%/*}/$d" ] || err "WARNING: ${REAPER%/*}/$d is missing — the unit pins it, so $([ "${d%%/*}" = lib ] && printf 'the abandoned-worktree arm and the duplicate-install class' || printf 'that class') will fail closed (exit 3, red) every pass"
     done
     # ⛔ AND THE BOUNDED-EXECUTION LIBRARY, WHICH IS WORSE THAN A CLASS: both artifacts pin it, and
     # without it the WHOLE pass refuses at startup (exit 3, every hour) — no class runs at all. That is

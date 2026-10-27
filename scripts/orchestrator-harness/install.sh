@@ -1340,7 +1340,9 @@ DRIFTED=""
 # `$O/nochk-resolve.py`. A `$O` with the new `orch-loop.sh` and an OLD file set classifies EVERY PR as
 # `V=""` — no merge arm, no fixer, the controller silently stops working — and the only trace is one
 # startup warning. That is exactly the partial-reseed drift this list exists to catch.
-for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
+# gate-policy.sh (#2319) is the same class and is REQUIRED now: every pi-spawning carrier sources it
+# and `exit 78`s without it, so a $O copy predating it stops every lane and every merge on the box.
+for f in orch-loop.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -1356,6 +1358,10 @@ if [ -n "$DRIFTED" ]; then
   warn "  bash '$HERE'/deploy-harness.sh --src '$SHIPPED' --o '$O'   # every shipped file, byte-verified (#2041)";
 fi
 
+# pr-owner-liveness.sh (#2831) is the SAME class and it now owns TWO live decisions: whether a PR
+# reads owned (proof-of-life, with a RELEASE side effect on the worker's lock) and whether a stalled
+# drain opens the issue path. A `$O` copy predating it silently restores the phantom-ownership defect
+# — PRs owned by dead workers, which is the one failure that leaves the box unable to do either job.
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────
 # "Which commit is this box running?" had no answer on the deployed laptop. The daemon executes
 # `$O/<script>`, and `$O` (=~/orchestrator) is not a git checkout at all:
@@ -1453,10 +1459,45 @@ prov_classify() {
 }
 
 # 0 = DIRTY, 1 = CLEAN, 2 = CANNOT VERIFY. A `git status` that cannot run is never read as clean.
+# ⛔ PINNED MIRROR of `pin_dirty` in scripts/lib/box.sh (byte-for-byte; drift arm in
+# cloud-cell-supervisor.test.sh §(p3)). Read the ROOT's version for why the predicate is not written
+# twice: a weaker copy here stamped `dirty: false` over a pin the runtime REFUSES.
 prov_dirty() {
-  local out
-  out="$(git -C "$PROV_TREE" status --porcelain -- . 2>/dev/null)" || return 2
-  [ -n "$out" ]
+  local out rc
+  out="$(pin_dirty "$PROV_TREE" .)"; rc=$?
+  [ "$rc" -eq 2 ] && return 2
+  [ "$rc" -eq 1 ] && return 0
+  return 1
+}
+
+pin_dirty() {
+  local repo="$1" scoped="$2" top out line path keep=""
+  # ⛔ THE TOPLEVEL, because porcelain prints paths relative to the REPOSITORY ROOT even when `repo` is a
+  # subdirectory — and two of the three callers pass the harness SUBDIR (the production convention). A
+  # first version resolved entries against `$repo`, so its tolerance was unreachable there and a
+  # `.DS_Store` read DIRTY to the instruments while the runtime read CLEAN: the round-4 divergence again,
+  # with the fail direction inverted (found by review, round 5).
+  top="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 2
+  out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
+    # ⛔ TOLERATE ONLY **UNTRACKED/IGNORED** DROPPINGS. A TRACKED file named `._x` is part of the pin, so a
+    # MODIFICATION to it must read DIRTY — the name is not the property (found by review, round 5: a
+    # rewritten tracked `._x` read CLEAN). `!!` = ignored, `??` = untracked.
+    case "$line" in
+      '!!'*|'??'*) case "${path##*/}" in
+        .DS_Store|._*) [ -f "$top/$path" ] && [ ! -L "$top/$path" ] && continue ;;
+      esac ;;
+    esac
+    keep="$keep$line
+"
+  done <<<"$out"
+  [ -n "$keep" ] || return 0
+  printf '%s' "$keep"
+  return 1
 }
 
 write_provenance() {
@@ -1583,7 +1624,7 @@ LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
 # the command reports success. It is one `-f` test away from being knowable, so it is refused here.
 case "$ACTION" in
   start|restart)
-    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'"; ;;
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash $(shq "$HERE/deploy-harness.sh") --src $(shq "$HERE") --o $(shq "$O")"; ;;
 esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;

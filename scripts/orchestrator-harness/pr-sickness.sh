@@ -106,6 +106,23 @@ ps_maxtries() { local v="${1:-}"; ps_is_num "$v" && [ "$v" -ge 0 ] && [ "$v" -le
 PS_HORIZON_MIN="${PS_HORIZON_MIN:-20}"   # only used by the measured fallback (ci-queue.sh owns its own)
 PS_JOB_P90_MIN="${PS_JOB_P90_MIN:-10}"
 
+# ── THE ROUTER SEAM (#2866) ───────────────────────────────────────────────────────────────────
+# `scripts/orchestrator-harness/pr-state.sh` is the ONE consumer seam for the PR state table. It is
+# sourced when present; when it is not, the seam prints `unavailable` and ps_router_row says so in
+# the pass output — never silently.
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/pr-state.sh" 2>/dev/null || true
+ps_router_row() {  # <repo> <pr> → "ACTION<TAB>run<TAB>reason"; NEVER empty (rc 2 = it did not run)
+  if declare -f prstate_row >/dev/null 2>&1; then
+    # The router reads GitHub through the SAME gh this module does, so a suite that stubs PS_GH
+    # keeps the router on the stub instead of reaching the network.
+    PR_STATE_GH="${PR_STATE_GH:-${PS_GH:-gh}}" prstate_row "${1:-}" "${2:-}"
+    return $?
+  fi
+  printf 'unavailable\t-\tpr-state.sh was not found beside pr-sickness.sh — the router did not run'
+  return 2
+}
+
 # ── 1. ENUMERATE ───────────────────────────────────────────────────────────────────────────────
 # ps_open_prs <owner/repo> -> TSV "number<TAB>sha<TAB>branch<TAB>draft(0|1)"; rc 2 = UNREADABLE.
 # ⛔ `--paginate` emits one JSON object PER PAGE, so the parse must consume a STREAM of arrays, not
@@ -645,6 +662,35 @@ ps_decide() {
     ps_defer_append "$repo" "$pr" "$sha" "$group"
     return 1
   fi
+
+  # ── THE ROUTER'S ROW: IS A FIXER WHAT THIS HEAD NEEDS? (#2866) ──────────────────────────────
+  # Two reds are NOT fixer work, and this module cannot tell them apart alone:
+  #   WAIT:inherited-red  the same (app, workflow, job) is red at MAIN's head. A fixer sent here
+  #                       spends a lane trying to fix a tree it does not own; measured 2026-10-22,
+  #                       25 tortoise PRs sat blocked on ONE systemic assertion main already had.
+  #   RERUN-FLAKE         the same group PASSED on an earlier attempt at this SAME head. A fixer
+  #                       here edits code that is fine, pushes a new head, strands the head-bound
+  #                       review attestation and buys a full CI pass — for a flake.
+  # `unavailable` is printed and the module's own gates decide: a router that did not run is not a
+  # reason to stop repairing reds.
+  local prow prc paction prun preason
+  prow="$(ps_router_row "$repo" "$pr")"; prc=$?
+  paction="$(printf '%s' "${prow:-}" | cut -f1)"
+  prun="$(printf '%s' "${prow:-}" | cut -f2)"
+  preason="$(printf '%s' "${prow:-}" | cut -f3-)"
+  case "$paction" in
+    WAIT:inherited-red)
+      printf 'skip #%s: %s (router: %s)\n' "$pr" "${preason:-inherited red}" "$paction"
+      return 1 ;;
+    RERUN-FLAKE)
+      printf 'skip #%s: flake, not a fix — %s\n' "$pr" "${preason:-a job passed at this same head}"
+      printf '         re-trigger: gh run rerun %s --failed (same sha; no new head, no attestation stranded)\n' "${prun:-<run>}"
+      return 1 ;;
+    unavailable)
+      printf '[prsick] router UNAVAILABLE for #%s (%s) — this module'"'"'s own gates decide\n' "$pr" "${preason:-no reason recorded}"
+      [ "$prc" -eq 2 ] || true ;;
+    "") printf '[prsick] router returned no action for #%s — this module'"'"'s own gates decide\n' "$pr" ;;
+  esac
 
   # ── EMIT THE WORK ITEM, THEN DISPATCH ─────────────────────────────────────────────────────
   brief="$(ps_brief "$repo" "$pr" "$sha" "$group" "$rid" "$jid" "$cc" "$reds")" || {

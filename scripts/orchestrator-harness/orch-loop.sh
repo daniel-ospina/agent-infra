@@ -62,6 +62,30 @@ command -v derive_or >/dev/null 2>&1 \
     [ -d "$O" ] && { mkdir -p "$O/logs" 2>/dev/null; echo "$(date) [startup] $_fatal_rs" >> "$O/logs/orch-loop.log" 2>/dev/null; }
     exit 78
   }
+# ── THE PRE-DISPATCH DISK FLOOR (agent-infra — two cells stopped dispatching on bytes, one night) ──
+# A cell whose filesystem fills stops dispatching ENTIRELY and presents as something else: a controller
+# that stopped beating with its unit still `active`, or a refresh that failed at
+# `stage=provision sub-step=scout-venv` because `uv sync` could not write a torch library. Both were
+# BYTES; freeing them fixed both instantly (864MB -> 9378MB). The floor lives in disk-floor.sh, SHARED
+# with refresh-candidates.sh for the same reason repo-slug.sh is shared: the loop's cycle and the
+# refresh's provision stage must answer this question ONE way, or a box can hold one and provision the
+# other. Resolved like repo-slug.sh ($O first, then beside the loop) so a re-seed and a checkout agree.
+# ⛔ A MISSING/STALE COPY IS NOT FATAL HERE, AND THAT IS DELIBERATE. `derive_or` above is fatal because
+# a wrong guess grades the WRONG REPO — a silent wrong answer. A missing floor is a DEPLOY SKEW, and
+# refusing to start the controller over it would take a healthy box down to fix a log line. The cycle
+# says CANNOT-VERIFY, once per cycle, and proceeds unguarded for that cycle only: the disclosure is
+# what keeps it out of the silent class, and the next re-seed restores the gate.
+DISK_FLOOR_STATE=absent    # absent | ok  (decided at load; the CYCLE reads it)
+for _dfc in "${O:-}/disk-floor.sh" "${_HERE_RS:-}/disk-floor.sh"; do
+  [ -n "$_dfc" ] && [ -f "$_dfc" ] || continue
+  # shellcheck disable=SC1090
+  . "$_dfc" 2>/dev/null || continue
+  # ⛔ THE FILE IS NOT THE FUNCTION (repo-slug.sh's rule, same reason): a stale copy sources cleanly and
+  # defines nothing, and a gate that silently does not exist reads exactly like a floor that is met.
+  command -v disk_floor_gate >/dev/null 2>&1 || { unset -f disk_floor_gate disk_floor_free_mb 2>/dev/null; continue; }
+  DISK_FLOOR_STATE=ok; DISK_FLOOR_SRC="$_dfc"; break
+done
+[ "$DISK_FLOOR_STATE" = "ok" ] || DISK_FLOOR_STATE=absent
 OR_EXPLICIT="${OR:-}"
 # ⛔ WHETHER THE OPERATOR NAMED OR, TOLD TO THE CHILD EXPLICITLY (#1977 review, P1). The export
 # below is UNCONDITIONAL (#2040), so the child cannot tell an operator's `OR=…` from the default this
@@ -123,7 +147,11 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
 if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
 if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
-export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1
+# ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
+# The controller is a shell, but every child it spawns INHERITS its environment, so this export used to
+# be the fleet-wide permanent bypass even on carriers that also set it themselves.
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/gate-policy.sh" 2>/dev/null || { echo "orch-loop: FATAL: gate-policy.sh missing — refusing to run a controller that cannot say whether its gates are on" >&2; exit 78; }
+apply_gate_policy orch-loop
 
 MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
@@ -626,6 +654,28 @@ if declare -f lo_scan lo_order lo_select_rows lo_select lo_class_compact >/dev/n
   LO_SCAN=1
 elif [ -n "$_lo_mod" ]; then
   printf '[select] live-ownership.sh is present but INCOMPLETE (needs lo_scan/lo_order/lo_select_rows/lo_select/lo_class_compact) — ownership stays registry-only this cycle\n' >> "$LOG" 2>/dev/null || true
+fi
+
+# ── OWNERSHIP PROOF-OF-LIFE AND THE DRAIN ESCAPE (agent-infra#2831) ──────────────────────────────
+# `pr-owner-liveness.sh` answers two questions the loop could not answer about itself: "is the thing
+# that claims this PR still ALIVE?" and "when the PR path has started nothing for N stalled passes,
+# does the box ever get to do its other job?". Sourced from the SAME two homes as every module here,
+# and gated on the INTERFACE (`declare -f`), not on the file — a present-but-stale `$O` copy must
+# degrade to the pre-#2831 behaviour (the loose lock guard, and no escape) and SAY so, never enable
+# half of it. A silent absence would read exactly like a working proof.
+PL_MOD=0
+_pl_mod=""
+if [ -f "$O/pr-owner-liveness.sh" ]; then _pl_mod="$O/pr-owner-liveness.sh"
+elif [ -f "$(dirname "$0")/pr-owner-liveness.sh" ]; then _pl_mod="$(dirname "$0")/pr-owner-liveness.sh"
+fi
+if [ -n "$_pl_mod" ]; then
+  # shellcheck source=/dev/null
+  . "$_pl_mod"
+fi
+if declare -f pl_verdict pl_escape_open pl_escape_line pl_escape_record pl_note_pass pl_idle_streak pl_streak_reset pl_escape_bound >/dev/null 2>&1; then
+  PL_MOD=1
+elif [ -n "$_pl_mod" ]; then
+  printf '[select] pr-owner-liveness.sh is present but INCOMPLETE (needs pl_verdict/pl_escape_open/pl_escape_line/pl_escape_record/pl_note_pass/pl_idle_streak/pl_streak_reset/pl_escape_bound) — PR ownership keeps the loose lock guard and DRAIN STALLED keeps its old no-action verdict this cycle\n' >> "$LOG" 2>/dev/null || true
 fi
 
 # ── the record a RAIL REFUSAL leaves behind (the red-fixer role reads it) ────────
@@ -2995,6 +3045,50 @@ pr_owned() { # <pr> <head-sha> [<head-ref>] -> 0 when something is currently wor
   return 1
 }
 
+# ── OWNERSHIP IN THE SPAWN ARMS: PROVEN, OR RELEASED (agent-infra#2831) ─────────────────────────
+# ⛔ THE MEASURED DEFECT: `[pr] PR path: NO UNIT SPAWNED this cycle — 8 row(s) with a named reason
+# (most common: 5 a worker already owns this PR)` while `lanes=0/0` and NO such workers existed. The
+# arms below tested `claim_live` — the SPAWN GUARD, whose first arm is a deliberately-loose "any live
+# pid holds the lock" test — so a `mergeclaim-<PR>.lock` whose writer had died (and whose pid was
+# recycled by any unrelated process) kept its PR owned for ever: not spawnable (owned), not in the
+# un-owned queue (owned), and never released (nothing reaps it). `claim_live`'s looseness is CORRECT
+# for its own question ("may I work this?" — one lost merge is cheaper than a second worker); it is
+# WRONG for the question these arms are asked, which is "is someone ALREADY working it?". Two
+# questions, two predicates — the same split `pr_owned`/`claim_live` already documents above.
+# So ownership here is `pr_owned` (a live process's cwd, a cmdline-BOUND lock, or a live foreign lease)
+# plus the live worker record, and when NOT ONE of them holds while a lock exists, that lock is
+# RELEASED with its reason in the log. That is the same proof-of-life `[reap]` applies to checked.txt
+# entries: "no proven fact -> release". The over-release direction is bounded by the arms: a released
+# PR simply re-enters the un-owned queue, where the rail and the cross-box CAS still refuse a second
+# worker — while staying "owned" is unbounded and is what stopped the box doing either job.
+pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (reaps a stale lock)
+  local pr="${1:-}" sha="${2:-}" br="${3:-}" _v _lk
+  case "$pr" in ''|*[!0-9]*) return 1 ;; esac
+  # 1. the live facts `pr_owned` already proves (cwd scan, cmdline-bound lock, foreign lease).
+  if pr_owned "$pr" "$sha" "$br"; then return 0; fi
+  # 2. the worker RECORD (census: a `dead` row is excluded there, `unknown` counts live).
+  if sess "fix-$pr" || sess "merge-$pr"; then return 0; fi
+  # 3. NOTHING PROVEN. With the proof module available the verdict is a RELEASE — and it removes the
+  #    record, because a verdict of "not owned" that leaves the un-spawnable record on disk would
+  #    leave the PR exactly as stuck as before (that is the defect, not the fix). Without the module
+  #    the pre-#2831 loose guard stands, unchanged and named, rather than being silently dropped.
+  if [ "${PL_MOD:-0}" = "1" ]; then
+    _lk="$O/state/mergeclaim-$pr.lock"
+    [ -f "$_lk" ] || return 1
+    # ⛔ THE VERDICT'S EXIT STATUS IS THE ANSWER (review P1, 2026-10-25). An earlier draft discarded
+    # it and returned 1 unconditionally — so when the probe said OWNED (a lock that appeared between the
+    # `pr_owned` call and this one, or a claim caught mid-creation) the arms SPAWNED A SECOND WORKER on
+    # a live claim and logged it as a release. Only rc=1 is a release.
+    if _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)"; then return 0; fi
+    # Strip the verdict label with a REAL TAB: `${_v#RELEASED\t}` never matched (bash reads `\t` in a
+    # pattern as an escaped `t`), so every reap line printed a duplicated label and a raw tab — review P2.
+    _tab="$(printf '\t')"
+    echo "[reap] #$pr released — ${_v#*"$_tab"}" >> "$LOG" 2>/dev/null || true
+    return 1
+  fi
+  claim_live "$pr" "$sha"
+}
+
 # claim_foreign_live <pr> <head-sha> -> 0 when a LIVE claim on that head is held by ANOTHER BOX.
 # ⛔ A claim held by THIS box is NOT covered here: its liveness must be proven by a live process
 # (arms 1-2 above), never by the lease it wrote. `claim_live` remains the SPAWN guard — it answers
@@ -3202,6 +3296,50 @@ while true; do
   K=0; Y=0
   heartbeat
   res_line   # MEASURE every resource; decide nothing from it
+  # ── 0b) THE PRE-DISPATCH DISK FLOOR (agent-infra — the night two cells stopped on bytes) ──────
+  # ⛔ IT RUNS BEFORE `harness_refresh_cycle`, `reap_stale_workers` and EVERY provisioning path, and
+  # that placement IS the fix. Measured twice in one night: a cell at 872MB free failed
+  # `stage=provision sub-step=scout-venv` (`uv sync` could not write a torch library) and a cell at 0
+  # avail died with its unit still `active` — both discovered from the SYMPTOM, never from the cause,
+  # because nothing measured the floor before paying for the work. `eldato-disk-reaper.timer` cannot
+  # close this: it is hourly, it is not on this path, and the failure it must prevent is what stops it
+  # from running.
+  # ⛔ IT RUNS AFTER `heartbeat` ON PURPOSE. A held cycle still stamps liveness, because the supervisor
+  # treats a missing heartbeat as a DEAD controller and relaunches it into the same wall (the fork arm
+  # above documents the same lesson). A hold is a decision, and a decision must not look like a crash.
+  # rc 1 = HOLD (below the floor after the reclaim pass): no refresh, no dispatch, no PR sweep this
+  # cycle, ONE line naming free/floor/reclaimed, and the box naps like any other held cycle. rc 2 =
+  # CANNOT-VERIFY: proceed unguarded, but SAY so — an unseen reading is not a healthy one, and the
+  # disk-floor.sh header carries the measured reason that reading must not stop the box.
+  if [ "${DISK_FLOOR_STATE:-absent}" = "ok" ]; then
+    _df_line="$(disk_floor_gate "$O")"; _df_rc=$?
+  else
+    _df_line="[disk] CANNOT-VERIFY: no disk-floor.sh in $O or beside the loop (DISK_FLOOR_SRC='${DISK_FLOOR_SRC:-none}') — the pre-dispatch floor did NOT run this cycle, so a full disk will surface again as a provision failure, a stalled controller, or a silent 100%. Fix: re-seed \$O (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)"
+    _df_rc=2
+  fi
+  # Best-effort on BOTH streams: at a full disk the log write is itself the thing that fails, and the
+  # line is worthless if it only exists where nobody is reading. `|| true` is not swallowing an error
+  # here — the disk is already the error, and this line is the report of it.
+  [ -n "${_df_line:-}" ] && { printf '%s\n' "$_df_line" >> "$LOG"; } 2>/dev/null || true
+  if [ "${_df_rc:-0}" = "1" ]; then
+    # ── THE HELD CYCLE: NAMED, RECORDED, AND STILL ALIVE ────────────────────────────────────────
+    # Modelled on the fork-starved arm above rather than invented: same shape (one line, a cycle
+    # record with `nothing=`, a nap, a `continue`) so `bin/harness status` and `cycle-record.sh`
+    # answer "why did this box dispatch nothing" from the record instead of from a grep.
+    printf '%s\n' "$_df_line" >&2 2>/dev/null || true
+    if [ "${CYCREC:-0}" = "1" ]; then
+      cycle_record_write "$O" \
+        start="${CYCLE_T0:-0}" end="$(date +%s 2>/dev/null || echo 0)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
+        selected="none" selected_n=0 dispatched=0 ids=- \
+        nothing="disk_floor" placement="disk_held" placed_on=none bound="disk_floor" disk="${_df_line:-}" \
+        || printf '[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable) — a disk-held box with no record is SILENT, which is the failure this block exists to end\n' >> "$LOG" 2>/dev/null || true
+    else
+      printf '[cycle] disk_held (cycle-record.sh absent — this state is NOT recorded anywhere)\n' >> "$LOG" 2>/dev/null || true
+    fi
+    _nap="$(( 10#${CYC:-240} + (10#${CYC:-240} / 5) ))"
+    fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
+    continue
+  fi
   reap_stale_workers
   # ⛔ THE LATCH IS RELEASED HERE, ONCE PER ITERATION — NOT AT LOAD. `_HR_DONE` starts at 0 and the
   # function sets it on entry, so a per-PROCESS latch would refresh once in the controller's whole
@@ -4222,7 +4360,7 @@ while true; do
             fi
             park_ctrl "$PR" "$HEAD_N" "rail refused a RED TREE and $RF_N red-fixer attempt(s) at this head did not clear it (MAX_RED_FIX_TRIES=${MAX_RED_FIX_TRIES:-2}). REFUSAL (verbatim): ${RF_REASON:-<none recorded>} -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/railrefusal-$PR' '$O/state/redfix-$PR' '$O/state/fixcount-$PR'"
             disp "$PR" "$HEAD_N" "RED-TREE" wait "parked: the rail still refuses a RED TREE after $RF_N fixer attempt(s) at this head"
-          elif sess "fix-$PR" || sess "merge-$PR" || claim_live "$PR" "$HEAD_N"; then
+          elif pr_owner_live "$PR" "$HEAD_N" "${BR:-}"; then
             # (2) EXACTLY ONE LIVE FIXER PER PR. The key is the PR number in the session/lock name, so a
             # second refusal while a fixer works spawns NOTHING (a second lane is how two workers push
             # to one branch).
@@ -4403,7 +4541,7 @@ while true; do
             fi
             park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC fixes (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "parked: still conflicted after $NFC fixes — needs a human"
-          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
@@ -4492,7 +4630,7 @@ while true; do
           # minutes of a BLOCKED controller cycle with dispatch halted — the very starvation this
           # issue is about. The worker is single-owner (merge-one.sh's local lock + cross-box claim)
           # and slot- and load-gated like every other spawn.
-          if sess "merge-$PR" || claim_live "$PR" "${HEAD_N:-}"; then
+          if pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a rail worker already owns this PR
             disp "$PR" "${HEAD_N:-}" GREEN wait "a rail worker already owns this PR"
           elif [ "$(wt_count merge-)" -lt "$MR" ] && can_spawn; then
@@ -4603,7 +4741,7 @@ while true; do
           fi
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
-          if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
+          if pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # this PR already has a worker in flight
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           else
@@ -4804,7 +4942,7 @@ while true; do
             fi
             park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
             disp "$PR" "${HEAD_N:-}" "$V" wait "parked: CI still red after $NFC2 fixes — needs a human"
-          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif pr_owner_live "$PR" "${HEAD_N:-}" "${BR:-}"; then
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
@@ -5513,6 +5651,26 @@ PY
           # only: a failed write must keep the COULD-NOT-RECORD message, not an ESCALATED one.
           _escl="$(drain_stall_label)"; [ -n "${_escl:-}" ] || _escl="UNMEASURED"
           _esc="ESCALATED -> state/drain-stall (pass ${_dpass}); the cycle status line now carries drain=${_escl} until a PR lands"
+          # ── THE INERT-PATH COUNTER (#2831) ────────────────────────────────────────────────────
+          # ⛔ WHAT MAKES THIS AN ACTION INSTEAD OF A LOG LINE. The stall has always been able to
+          # say "nothing landed"; it could not say whether ANYONE STARTED ANYTHING, so a box whose
+          # PR path was spawn-dead and a box whose workers were running but blocked read the same and
+          # both idled. The counter advances ONLY on a MEASURED zero spawns (`_spk` empty =
+          # UNMEASURED, which neither advances nor resets — inventing progress from a directory the
+          # cycle could not read is the exact defect this file keeps deleting). Any spawn resets it,
+          # so the owner's 2026-10-18 ruling keeps applying unchanged to every real land/capacity
+          # stall; only the "started nothing" degenerate state is escaped from, and the escape is
+          # bounded because it resets the counter after firing.
+          # ⛔ THE GLUE IS GATED TOO (review P2): the module may be ABSENT on a box whose `$O` is
+          # stale, and an unguarded call would print `pl_escape_bound: command not found` on launchd's
+          # stderr (not `$LOG`) every cycle — invisible exactly where the operator reads.
+          _escbound=${DRAIN_ESCAPE_PASSES:-3}
+          if [ "${PL_MOD:-0}" = "1" ]; then
+            _escbound="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}" 2>/dev/null)" || _escbound=3
+            _streak="$(pl_note_pass "$O/state" "${_spk:-}" "${UPN_WORK:-}")"
+            is_num "${_streak:-}" || _streak=0
+            _esc="$_esc; the PR path has STARTED NOTHING for ${_streak}/${_escbound} consecutive stalled pass(es) — at ${_escbound} the issue path opens (state/pr-path-idle)"
+          fi
         else
           _esc="ESCALATION COULD NOT BE RECORDED (state/ is unwritable) — this line is the only trace"
         fi
@@ -5547,6 +5705,11 @@ PY
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
         # A land clears the escalation: a marker that outlives its condition is a stale flag.
         rm -f "$O/state/drain-stall" 2>/dev/null || true
+        # ⛔ A LAND ALSO CLEARS THE INERT STREAK (review P2). Without this the counter described "stalled
+        # passes since the last escape" rather than "CONSECUTIVE stalled passes": a box that stalled
+        # N-1 times, landed for hours, then stalled once opened the issue path on its FIRST stall while
+        # its own line claimed N — a false statement about consecutiveness and a bound quietly cut to 1.
+        [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
       fi
     elif [ "${_land_any:-0}" = "1" ]; then
       echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
@@ -5568,6 +5731,45 @@ PY
     fi
     # [drain-clear:end]
   fi
+  # [drain-escape:begin] (DRIVEN by pr-owner-liveness.test.sh through the module; the WIRING here is
+  # reviewed, not extracted — keep the markers)
+  # ⛔ THE DETECTOR NOW ACTS (agent-infra#2831 ask 2). Measured on the live box: `DRAIN STALLED — no PR
+  # merged within the last 360m while 3 un-owned remain. The issue path stays CLOSED` printed pass
+  # after pass while the PR path had spawned nothing in 93 cycles. The box could neither land nor open
+  # work — a detector that cannot act is a log line, not a control.
+  # ⛔ THE RULING IS KEPT WHERE IT APPLIES. "No new work while un-owned PRs remain" exists so a
+  # stalled drain cannot be hidden behind fresh activity. That reasoning holds while the PR path is
+  # WORKING; it does not hold when the PR path has started nothing for N consecutive stalled passes,
+  # because then nothing is being hidden and nothing is being drained. Any spawn resets the streak, so
+  # a land/capacity stall (workers running, nothing landing) still never opens the issue path —
+  # unchanged. OVERRIDES: the 2026-10-18 "never a release valve" ruling, for the "started nothing"
+  # state only, bounded and logged here with the counts the decision was taken from.
+  # ⛔ ONE ESCAPE PER N INERT PASSES, NOT ONE PER PASS: `pl_escape_record` resets the streak on a
+  # successful write, so the loop cannot spin, and it reports when the record could NOT be written.
+  _eb=${DRAIN_ESCAPE_PASSES:-3}
+  if [ "${PL_MOD:-0}" = "1" ]; then _eb="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}" 2>/dev/null)" || _eb=3; fi
+  if [ "${LO_CHOICE:-none}" != "pr" ]; then
+    # Not blocked by un-owned PRs: a streak from an earlier stall is a stale flag and is cleared.
+    [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
+  elif [ "${PL_MOD:-0}" = "1" ] && pl_escape_open "$O/state" "${UPN_WORK:-}" "$_eb"; then
+    printf '%s\n' "$(pl_escape_line "$O/state" "${UPN_WORK:-}" "$_eb")" >> "$LOG"
+    if PL_ESCAPE_BOUND="$_eb" pl_escape_record "$O/state" "${UPN_WORK:-}" "${PRDISP_SPAWNS:-}"; then
+      echo "[dispatch] DRAIN ESCAPE RECORDED -> state/drain-escape (issue path OPEN this cycle; the inert-path counter reset to 0, so the next escape needs $_eb more stalled pass(es))" >> "$LOG"
+    else
+      echo "[dispatch] DRAIN ESCAPE RECORD COULD NOT BE WRITTEN (state/ is unwritable) — the issue path still OPENS this cycle (an unpersisted action must not be withheld), but the counter could not be reset and the bound cannot be proven" >> "$LOG"
+    fi
+    # ⛔ `GATE_WHY` MUST BE CLEARED, OR THE ESCAPE IS A LOG LINE THAT CANNOT ACT (review P0, 2026-10-25).
+    # It was set from the SAME un-owned count earlier in this pass (`GATE_WHY="$(mp_reason ...)"`, which
+    # echoes a reason whenever un-owned > 0), and the ONE line that opens the dispatch block is
+    # `if [ -z "$GATE_WHY" ]`. Setting LO_CHOICE alone therefore printed "OPENING the issue path",
+    # recorded the escape, reset the counter — and dispatched NOTHING, for ever. The gate is precisely
+    # what the escape exists to lift, so the lift is named in the log.
+    _lifted="${GATE_WHY:-<none>}"
+    GATE_WHY=""
+    echo "[dispatch] DRAIN ESCAPE lifted the issue-path gate (was: ${_lifted}) — the merge-priority gate is what this escape overrides for one cycle" >> "$LOG"
+    LO_CHOICE=issue
+  fi
+  # [drain-escape:end]
   # The printed decision is AUTHORITATIVE over the issue path: if the funnel did not choose issue
   # work, nothing opens a lane for an issue, even if every capacity gate below happens to pass.
   # ⛔ FAIL-CLOSED DEFAULT, AND IT IS LOAD-BEARING (#2126). `LO_CHOICE` is set by `lo_select`, but the

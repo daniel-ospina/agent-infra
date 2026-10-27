@@ -98,6 +98,12 @@ chmod +x "$TMP/bin/gh"
 
 # ── the stubs the module falls back to (no wt_*, no claim registry in a unit test) ──────────────
 cat > "$TMP/stubs.sh" <<'ST'
+# ⛔ THE ROUTER IS PINNED ABSENT FOR THIS SUITE (agent-infra #2866). `ps_decide` consults the PR state
+# router before it spends a fixer, and that consult would otherwise resolve the REAL module from this
+# checkout and reach GitHub through the suite's stub gh — a hermetic suite that silently depends on
+# the box's tree. The router's own behaviour is pinned in tools/fleet/pr_state.test.py, and the
+# seam's demotions in tests/pr-state-wiring/run.sh; here it must simply not run.
+PR_STATE_BIN="$TMP/no-router-in-this-suite"; export PR_STATE_BIN
 ps_spawn_stub() { printf '%s\n' "$1" >> "$TMP/spawns.log"; return 0; }
 ps_alive_stub() { [ -f "$FLAGS/alive-$1" ]; }
 ps_claim_stub() {
