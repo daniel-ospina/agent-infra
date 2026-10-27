@@ -84,6 +84,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
+import { redactCommand } from "./shared/redact-command.js";
 
 // ── constants ───────────────────────────────────────────────────────────────
 
@@ -168,7 +169,13 @@ export function buildSignalRecord(input: {
     signal: input.signal,
     pid: input.pid,
     ppid: input.facts.ppid,
-    parent_argv: clampArgv(input.facts.parentArgv),
+    // Redaction at the point the value ENTERS the record, never at the sink: this
+    // is a shell command line, the exact shape the shared seam exists for
+    // (inline `GH_TOKEN=…` / `ghp_…`), and the log outlives the process that wrote
+    // it. `redactCommand` is imported rather than re-implemented so the two other
+    // command-recording sinks (verification-gate, review-enforcer) and this one
+    // cannot drift (#966, #1492).
+    parent_argv: redactCommand(clampArgv(input.facts.parentArgv)),
     parent_comm: input.facts.parentComm.trim(),
     parent_alive: input.facts.parentAlive,
     pgid: input.pgid ?? null,

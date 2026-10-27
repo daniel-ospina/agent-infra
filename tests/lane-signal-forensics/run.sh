@@ -38,6 +38,18 @@ mkdir -p "$FIX/ext"
 cp "$SRC_EXT" "$FIX/ext/task-signal-forensics.ts"
 cp "$SRC_TEST" "$FIX/ext/task-signal-forensics.test.ts"
 
+# The extension imports the repo's SHARED redaction seam (`./shared/redact-command.js`)
+# so that its parent-argv record cannot drift from the two other command-recording
+# sinks (#966). The fixture must reproduce that import graph: a copy containing only
+# the extension would make the BASELINE fail to resolve a module, and a mutation
+# driver whose baseline is red proves nothing. Only the ONE shared module the
+# extension actually imports is copied — a blanket copy of `extensions/shared/`
+# would drag in ~20 unrelated modules and their own suites.
+SHARED_REDACT="$ROOT/extensions/shared/redact-command.ts"
+[ -f "$SHARED_REDACT" ] || { echo "   ❌ missing $SHARED_REDACT (the extension imports it)"; exit 1; }
+mkdir -p "$FIX/ext/shared"
+cp "$SHARED_REDACT" "$FIX/ext/shared/redact-command.ts"
+
 run_suite() { # run_suite <label> -> writes $FIX/<label>.out, echoes the exit status
   local label="$1" rc
   ( cd "$ROOT" && $TSX "$FIX/ext/task-signal-forensics.test.ts" ) >"$FIX/$label.out" 2>&1

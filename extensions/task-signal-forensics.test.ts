@@ -53,6 +53,11 @@ import {
 } from "./task-signal-forensics.js";
 
 const EXTENSION_SOURCE = path.resolve(path.dirname(new URL(import.meta.url).pathname), "task-signal-forensics.ts");
+/** The one shared module the extension imports (see `spawnLane`'s bridge below). */
+const SHARED_REDACT_SOURCE = path.resolve(
+  path.dirname(new URL(import.meta.url).pathname),
+  "shared/redact-command.ts",
+);
 
 // ── suite harness ───────────────────────────────────────────────────────────
 
@@ -133,6 +138,26 @@ function spawnLane(repoDir: string, logPath: string): Promise<{
     fs.writeFileSync(fixture, LANE_FIXTURE_SOURCE);
     const extensionCopy = path.join(work, "task-signal-forensics.mts");
     fs.copyFileSync(EXTENSION_SOURCE, extensionCopy);
+    // ── the `.js`→`.ts` bridge, for RAW node only ────────────────────────────
+    // The extension imports the repo's shared redaction seam as
+    // `./shared/redact-command.js` (the repo's convention — pi's loader and tsx
+    // both resolve that specifier to the `.ts` source), but this fixture spawns
+    // the lane under bare `node --experimental-strip-types`, which does NOT
+    // rewrite a `.js` specifier to `.ts` (measured). So the fixture reproduces
+    // the import graph itself: the REAL module is copied next to the lane, and a
+    // two-line plain-JS shim gives bare node the name its resolver insists on.
+    //
+    // ⛔ The shim RE-EXPORTS the real module; it must never carry a copy of the
+    // redaction rules. A second redactor is the exact drift the shared seam exists
+    // to prevent (#966), and a fixture that graded a copy would prove nothing
+    // about the module production loads.
+    const sharedDir = path.join(work, "shared");
+    fs.mkdirSync(sharedDir, { recursive: true });
+    fs.copyFileSync(SHARED_REDACT_SOURCE, path.join(sharedDir, "redact-command.ts"));
+    fs.writeFileSync(
+      path.join(sharedDir, "redact-command.js"),
+      'export { redactCommand } from "./redact-command.ts";\n',
+    );
     const child = spawn(process.execPath, ["--experimental-strip-types", fixture], {
       cwd: fs.realpathSync(repoDir),
       env: {
@@ -270,6 +295,39 @@ test("arm 1: the record shape is bounded and typed", () => {
   equal(rec.pgid, 42, "pgid");
   equal(rec.ts, new Date(1793133305000).toISOString(), "ts is the ISO form of the injected clock");
   ok(JSON.stringify(rec).includes('"reason":"clean"'), "the checkpoint reason travels inside the record");
+});
+
+test("arm 1: a credential on the parent's command line never reaches the log", () => {
+  // The recorded value is a shell command line, the exact shape that carries an
+  // inline `GH_TOKEN=…` / `ghp_…`. Both classes are asserted, because the shared
+  // seam has one pattern per class and a test on only one would let the other
+  // regress silently.
+  const build = (parentArgv: string) =>
+    buildSignalRecord({
+      signal: "SIGTERM",
+      pid: 43,
+      facts: { ppid: 7, parentArgv, parentComm: "/bin/bash", parentAlive: true },
+      cwd: "/x",
+      checkpoint: { status: "skipped", reason: "clean" },
+      now: 1_793_133_305_000,
+    });
+
+  const inlineEnv = build("/bin/bash -c export GH_TOKEN=ghp_liveSecretValue123 && pi -p").parent_argv;
+  ok(
+    !/ghp_liveSecretValue123/.test(inlineEnv),
+    `arm 1: an inline GH_TOKEN=… is redacted before it is persisted (got ${JSON.stringify(inlineEnv)})`,
+  );
+
+  const bareToken = build("pi -p --flag ghp_bareTokenValue456");
+  ok(
+    !/ghp_bareTokenValue456/.test(bareToken.parent_argv),
+    `arm 1: a bare token body is redacted whole, not up to the underscore (got ${JSON.stringify(bareToken.parent_argv)})`,
+  );
+  equal(
+    bareToken.parent_argv,
+    "pi -p --flag ghp_***",
+    "arm 1: the redaction is the shared seam's own rule, not a second copy",
+  );
 });
 
 test("arm 1: the log is append-only and rotates at the ceiling", () => {
