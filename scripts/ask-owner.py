@@ -71,8 +71,8 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # re-derive when a verdict looks wrong.
 # ⚠️ Each caller shows the move for ITSELF, and both are asserted: this file prints the answer's
 # version on its summary line (`model=<echo>` beside the token counts below) and
-# `turn-classify.py` puts the same echo in `meta["model"]`. Read that field first; it is the
-# only place the concrete version appears.
+# `turn-classify.py` puts the same echo in `meta["model"]`. Read that field first: it is the
+# value the RESPONSE carried, never `JEV_MODEL` — which is the alias we sent.
 # Pinning a version again is a one-line change in EACH of these five copies — a partial re-pin
 # is the same split-brain this round fixed in the other direction — and it needs the bars
 # re-derived on that version FIRST, which is why it is a decision and not a default:
@@ -766,8 +766,9 @@ def meta_line(result):
     — or just the cost, when the API reports money instead of tokens.
 
     ⛔ IT EXISTS AS A FUNCTION SO IT CAN BE ASSERTED (review 2026-10-27). With the model now a
-    vendor ALIAS, this echo is the only place the concrete version appears — the sent string is
-    always `jev-latest`. While the line was built inline at its `print`, nothing could test it,
+    vendor ALIAS, this is where the concrete version is reported — the sent string is always
+    `jev-latest`, and the cost-only branch carries no version at all. While the line was built
+    inline at its `print`, nothing could test it,
     so a regression to the constant would have printed `model=jev-latest` and looked fine.
     """
     usage = (result or {}).get("usage") or {}
