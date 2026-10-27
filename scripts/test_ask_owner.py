@@ -687,6 +687,21 @@ def test_this_files_copy_of_the_endpoint_and_model_is_the_real_vendor():
     assert ao.JEV_MODEL == "jev-latest", ao.JEV_MODEL
 
 
+def test_the_summary_line_reports_the_version_the_api_answered_with():
+    """⛔ THE ECHO IS THE ONLY PLACE THE CONCRETE VERSION APPEARS.
+
+    The fleet sends the alias `jev-latest` (owner ruling 2026-10-27), so a line built from
+    `JEV_MODEL` would read `model=jev-latest` and look correct while telling a reader nothing
+    about which version judged the question. This asserts the line comes from the RESPONSE —
+    and the fixture's answer is deliberately a version, not the alias.
+    """
+    line = ao.meta_line({"model": "jev-1.14.0",
+                         "usage": {"input_tokens": 10, "output_tokens": 2}})
+    assert line == "model=jev-1.14.0 tokens=10/2", line
+    assert "jev-latest" not in line, (
+        "the summary reported the alias we sent instead of the version that answered")
+
+
 def test_jev_sends_a_name_keyed_questions_map_with_instructions(monkeypatch):
     """THE PAYLOAD, ASSERTED. `ao.jev()` is stubbed by nine other legs in this file, so its real
     request was exercised by nothing. The API rejects an ARRAY of questions (422) and rejects a

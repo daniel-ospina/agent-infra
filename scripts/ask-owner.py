@@ -66,14 +66,17 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # ⚠️ The consequence is not that the gate stops working; it is that a verdict can shift for a
 # reason no diff explains. THIS file's thresholds (`THRESHOLD`, `THRESHOLD_LANGUAGE`,
 # `THRESHOLD_JARGON`) and `turn-classify.py`'s `MIN_CONFIDENCE` are therefore the FIRST thing to
-# re-derive when a verdict looks wrong, and `turn-classify.py` records the model the
-# API ECHOES (`meta["model"]`, i.e. the concrete version that answered) precisely so that
-# shift is visible in the record instead of being inferred from behaviour.
-# Pinning a version again is a one-line change in EACH of the five copies listed in the sweep
-# note at the top of this block (the two tracked callers, the two deployed ~/.pi/agent/scripts
-# copies, and the deployed state/lane-verdict.py) — a partial re-pin is the same split-brain
-# this round fixed in the other direction — and it needs the bars re-derived on that version
-# FIRST, which is why it is a decision and not a default.
+# re-derive when a verdict looks wrong.
+# ⚠️ Each caller shows the move for ITSELF, and both are asserted: this file prints the answer's
+# version on its summary line (`model=<echo>` beside the token counts below) and
+# `turn-classify.py` puts the same echo in `meta["model"]`. Read that field first; it is the
+# only place the concrete version appears.
+# Pinning a version again is a one-line change in EACH of these five copies — a partial re-pin
+# is the same split-brain this round fixed in the other direction — and it needs the bars
+# re-derived on that version FIRST, which is why it is a decision and not a default:
+#   scripts/turn-classify.py · scripts/ask-owner.py ·
+#   ~/.pi/agent/scripts/turn-classify.py · ~/.pi/agent/scripts/ask-owner.py ·
+#   ~/.pi/agent/state/lane-verdict.py
 JEV_MODEL = "jev-latest"      # vendor alias — moves with the vendor, see above
 # ---------------------------------------------------------------------------
 # CALIBRATION — measured, not guessed. One threshold for all seven marks was the
@@ -754,6 +757,21 @@ def jev(state):
     except Exception as e:  # noqa: BLE001
         print(f"jev call failed: {e}")
         return None
+
+
+def meta_line(result):
+    """The one line that says WHICH model judged this question, and what it cost in tokens.
+
+    ⛔ IT EXISTS AS A FUNCTION SO IT CAN BE ASSERTED (review 2026-10-27). With the model now a
+    vendor ALIAS, this echo is the only place the concrete version appears — the sent string is
+    always `jev-latest`. While the line was built inline at its `print`, nothing could test it,
+    so a regression to the constant would have printed `model=jev-latest` and looked fine.
+    """
+    usage = (result or {}).get("usage") or {}
+    if "cost_usd" in usage:
+        return f"cost_usd={usage['cost_usd']}"
+    return (f"model={(result or {}).get('model')} "
+            f"tokens={usage.get('input_tokens')}/{usage.get('output_tokens')}")
 
 
 def verdict(answers):
@@ -1506,12 +1524,7 @@ def main(argv):
     # THE REAL API REPORTS TOKENS, NOT MONEY (`usage` = input_tokens/output_tokens). Print
     # whichever the response actually carried; a missing key is printed as absent rather
     # than as a fabricated 0.
-    usage = result.get("usage") or {}
-    if "cost_usd" in usage:
-        print(f"cost_usd={usage['cost_usd']}")
-    else:
-        print(f"model={result.get('model')} "
-              f"tokens={usage.get('input_tokens')}/{usage.get('output_tokens')}")
+    print(meta_line(result))
     for name, ans in answers.items():
         if ans.get("type") == "noul":
             bar = "" if answers[name].get("noul", 0) >= threshold_for(name) else "  <-- below bar"

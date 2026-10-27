@@ -2703,7 +2703,7 @@ def test_jev_step5_posts_the_current_model_to_the_vendor_endpoint(monkeypatch):
 
     LV = types.SimpleNamespace(
         JEV_URL="https://api.typesafe.ai/v1/systemone",
-        JEV_MODEL="jev-1.13.0",
+        JEV_MODEL="jev-latest",
         jev_key=lambda: "test-key",
         CRITERIA={"WORKING": "it is producing output right now"},
     )
@@ -2726,7 +2726,12 @@ def test_jev_step5_posts_the_current_model_to_the_vendor_endpoint(monkeypatch):
         seen["url"] = req.full_url
         seen["body"] = json.loads(req.data.decode())
         seen["auth"] = req.get_header("Authorization")
-        return _Resp({"model": "jev-1.13.0",
+        # ⛔ THE ANSWERED VERSION IS DELIBERATELY NOT THE CONSTANT. The stub sends
+        # `jev-latest`; the API answers with the concrete version. If `meta["model"]` ever
+        # regressed to `LV.JEV_MODEL`, both values would be the alias and the assertion
+        # below would pass while the report header read `Jev jev-latest` instead of the
+        # version that actually judged the lanes.
+        return _Resp({"model": "jev-1.14.0",
                       "answers": {"lane_00": {"type": "choice", "choice": "DONE_READY",
                                               "confidence": 0.9}},
                       "usage": {"input_tokens": 10, "output_tokens": 2}})
@@ -2737,7 +2742,7 @@ def test_jev_step5_posts_the_current_model_to_the_vendor_endpoint(monkeypatch):
     answers, meta = LA.jev_step5(rows, LV)
 
     assert seen["url"] == "https://api.typesafe.ai/v1/systemone", seen["url"]
-    assert seen["body"]["model"] == "jev-1.13.0", seen["body"]
+    assert seen["body"]["model"] == "jev-latest", seen["body"]
     assert seen["auth"] == "Bearer test-key", seen["auth"]
     q = seen["body"]["questions"]["lane_00"]
     assert q["type"] == "choice" and isinstance(q["instructions"], str) and q["instructions"], q
@@ -2747,7 +2752,8 @@ def test_jev_step5_posts_the_current_model_to_the_vendor_endpoint(monkeypatch):
     # what answered: delete `meta["model"] = d.get("model")` in `lane-actions.py` and the daily
     # report header silently reads `Jev ?`, with nothing red. It is asserted here — against the
     # version the fixture ANSWERED with, not the alias — so that removal is a failure.
-    assert meta["model"] == "jev-1.13.0", meta
+    assert meta["model"] == "jev-1.14.0" and meta["model"] != "jev-latest", (
+        "the report must carry the version the API ANSWERED with, not the alias sent: %r" % (meta,))
 
 
 def _deployed_constants(filename):

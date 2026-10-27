@@ -139,7 +139,7 @@ REPOS = ("daniel-ospina/tortoise",
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 # ⛔ THE MODEL IS THE ALIAS, BY OWNER RULING (2026-10-27): "let's use jev latest".
 #
-# `MIN_CONFIDENCE` below and every per-mark bar in `ask-owner.py` were measured against
+# `MIN_CONFIDENCE` above and every per-mark bar in `ask-owner.py` were measured against
 # `jev-1.13.0`, and `jev-latest` already resolves to `jev-1.14.0` on the live API — so the
 # marks are now scored by a model that moves when the vendor ships, with no change to this
 # file. The vendor's own guidance warns about exactly this ("an alias moves when a new release
