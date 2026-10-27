@@ -53,6 +53,36 @@
 #   A usage/argument error is exit 2. ⛔ It is a PREDICTION, not an authorization:
 #   the merge gate re-decides on the live diff, and it never writes a record.
 #
+# record-review.sh --recover-body <pr> [owner/repo]
+#   REBUILD a MISSING record from the PR body's own SIGNED marker (#2872).
+#   The marker the recorder posts is signed (HMAC-SHA256 over the marker text,
+#   $AI_REVIEW_GATE_KEY, #2055), and it is the only copy of the verdict that
+#   TRAVELS with the PR — the record file is per-box. So a review minted on a
+#   cell, or on a box since recycled, leaves the rail saying NO-RECORD while the
+#   proof sits in the body, verifiable with a key this box already holds.
+#   Measured 2026-10-26: of 45 open PRs, 12 had a marker whose `diff=` equals the
+#   PR's live diff and no record file here; the registry covered 2 of them.
+#   It verifies the HMAC before minting (a body is attacker-writable, so a
+#   shape-only `sig=[0-9a-f]{64}` check would let `sig=<64 zeros>` be adopted and
+#   then RE-SIGNED by a later carry — the failure #784/#2055 closed), refuses to
+#   overwrite a record that exists, and stamps `"mint":"recovered-body"` plus
+#   the marker's `sig` so the provenance is readable. `reviewed_at` is the HEAD
+#   COMMIT's committer date — never `now`, which would repeat tortoise#7391.
+#   It does NOT review and does NOT authorize a merge: the normal carry arms
+#   still decide whether the recovered digest covers what would merge.
+#     exit 0  minted (stdout: `recovered\t<head>\t<digest|->`)
+#     exit 2  usage — an unresolvable repo (a record is identified by PR *and*
+#             repo), or a minting flag it must not take
+#     exit 3  NOTHING WRITTEN, and each cause is named on stderr:
+#               · no USABLE marker — absent, unsigned, bad signature, or one
+#                 signed for a DIFFERENT repo
+#               · no AI_REVIEW_GATE_KEY, so a marker's signature cannot be
+#                 VERIFIED (and an unverified marker is a body edit)
+#               · the PR body could not be READ (transient — RETRY)
+#               · the head commit's committer date could not be read, so an
+#                 honest `reviewed_at` cannot be stated
+#     exit 5  a record for this PR/repo already exists — recovery fills an absence
+#
 # Records a code-review verdict for a PR into ~/.pi/agent/reviews/<PR>.json,
 # consumed by the review-enforcer merge registry gate
 # (extensions/review-enforcer/index.ts, issue #138).
@@ -944,6 +974,9 @@ PRINT_DIFF_HASH=0
 CHECK_CARRY=0
 # Set by --print-tier: the READ-ONLY surface-cap selector (see the header).
 PRINT_TIER=0
+# #2872 — rebuild a missing record from the PR body's SIGNED marker. Mints, so it
+# is its own verb: `--check-carry` answers, `--recover-body` writes.
+RECOVER_BODY=0
 EVIDENCE=""
 # tortoise#7391: what the record carries. Set ONLY by the verification gate below, so a
 # record claims `evidence` only when this run actually read and accepted that
@@ -959,6 +992,7 @@ while [ "$_i" -lt "${#_argv[@]}" ]; do
     --print-diff-hash) PRINT_DIFF_HASH=1 ;;
     --check-carry) CHECK_CARRY=1 ;;
     --print-tier) PRINT_TIER=1 ;;
+    --recover-body) RECOVER_BODY=1 ;;
     --force-stale) FORCE_STALE=1 ;;
     --expect-head)
       _i=$((_i + 1))
@@ -1005,9 +1039,10 @@ if [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; then
   SHA=""
   VERDICT=""
   REPO="${2:-}"
-elif [ "$CHECK_CARRY" -eq 1 ]; then
+elif [ "$CHECK_CARRY" -eq 1 ] || [ "$RECOVER_BODY" -eq 1 ]; then
   # Same shape, same reason. --check-carry answers the lane's question with the
-  # merge gate's own predicate instead of leaving it to inference.
+  # merge gate's own predicate instead of leaving it to inference; --recover-body
+  # takes <pr> [owner/repo] because a record is identified by BOTH.
   SHA=""
   VERDICT=""
   REPO="${2:-}"
@@ -1017,7 +1052,11 @@ elif [ "$CHECK_CARRY" -eq 1 ]; then
   # recorded (or pinned) something it did not. Same posture as the removed
   # --second-model flag above.
   if [ -n "$EVIDENCE" ] || [ "$FORCE_STALE" -eq 1 ] || [ -n "$EXPECT_HEAD" ]; then
-    echo "record-review.sh: --check-carry is READ-ONLY (it answers 'would this record carry?' and writes nothing), so it takes no --evidence/--force-stale/--expect-head — those describe a record to mint. Run the mode without them, then record separately if the answer is 'fresh'." >&2
+    if [ "$RECOVER_BODY" -eq 1 ]; then
+      echo "record-review.sh: --recover-body restores a verdict that was ALREADY recorded, so it takes no --evidence/--force-stale/--expect-head — those describe a review to mint, and accepting them here would let a recovered record claim evidence no reviewer produced. Recover first, then record a fresh verdict separately if one is owed." >&2
+    else
+      echo "record-review.sh: --check-carry is READ-ONLY (it answers 'would this record carry?' and writes nothing), so it takes no --evidence/--force-stale/--expect-head — those describe a record to mint. Run the mode without them, then record separately if the answer is 'fresh'." >&2
+    fi
     exit 2
   fi
 else
@@ -1032,7 +1071,9 @@ case "$VERDICT" in
     # record path is refused here. The arm is expressed this way — rather than
     # folding the case into the else above — so the mutation harness's
     # `sed 's#^  clean|clean-micro|clean-low) ;;#…#'` anchor keeps matching.
-    if [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne 1 ] && [ "$PRINT_TIER" -ne 1 ]; then
+    # --recover-body is here for the same reason (#2872): it takes its verdict
+    # from the SIGNED marker it verifies, never from the command line.
+    if [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne 1 ] && [ "$PRINT_TIER" -ne 1 ] && [ "$RECOVER_BODY" -ne 1 ]; then
       echo "verdict must be 'clean', 'clean-micro' or 'clean-low'; refusing to record '$VERDICT'" >&2; exit 2
     fi ;;
 esac
@@ -1053,7 +1094,7 @@ fi
 if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
   echo "PR number must be numeric; refusing to record '$PR'" >&2; exit 2
 fi
-if [ "$PRINT_DIFF_HASH" -eq 0 ] && [ "$CHECK_CARRY" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+if [ "$PRINT_DIFF_HASH" -eq 0 ] && [ "$CHECK_CARRY" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && [ "$RECOVER_BODY" -eq 0 ] && ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "head_sha must be a full 40-char hex sha (got '${SHA:0:12}…'); refusing to record" >&2; exit 2
 fi
 # tortoise#7391: the sha the CALLER named, kept before any carry re-binds $SHA to the
@@ -1574,7 +1615,11 @@ if [ "$PRINT_TIER" -eq 1 ]; then
   exit 0
 fi
 
-if [ -n "$REPO" ]; then
+if [ -n "$REPO" ] && [ "$RECOVER_BODY" -eq 0 ]; then
+  # --recover-body (#2872) takes its diff digest from the SIGNED MARKER it
+  # verifies, so fetching the PR's live diff here would be a network call whose
+  # answer nothing reads — and a failed fetch would print a "could not compute"
+  # warning about a mode that does not compute it.
   diff_hash_for_pr "$PR"
   [[ "$DIFF_HASH" =~ ^[0-9a-f]{64}$ ]] || DIFF_HASH=""
   [[ "$LEGACY_DIFF_HASH" =~ ^[0-9a-f]{64}$ ]] || LEGACY_DIFF_HASH=""
@@ -1672,7 +1717,12 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     [ -z "$r" ] || [ "$r" = "$REPO" ]
   }
   CC_REC=""
-  CC_LOOKUP_HINT="Run the review, then record it."
+  # #2872: the remedy for an ABSENCE is no longer only "review it again". A box
+  # that lacks the file may still have the verdict in the registry (minted on a
+  # peer box) or in the PR body's SIGNED marker (minted anywhere, and the only
+  # copy that travels). Naming only the re-review made every cross-box review
+  # cost twice — a lane paying again for evidence the fleet already holds.
+  CC_LOOKUP_HINT="Run the review, then record it. Before paying for that: if it ran on ANOTHER box, scripts/registry-sync.sh pull may already hold it; and if the PR body carries a SIGNED marker, record-review.sh --recover-body $PR ${REPO:-owner/repo} rebuilds this box's record from it (it verifies the HMAC first, so a body edit cannot mint one)."
   if [ -n "$REPO" ]; then
     if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then
       if cc_names_this_repo "$CC_FILE"; then CC_REC="$CC_FILE"; fi
@@ -1797,6 +1847,138 @@ fi
 # Normalize the key exactly like the workflow does (secrets arrive clean, but a
 # file/env key may carry stray whitespace).
 GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
+
+# ── --recover-body (#2872): rebuild a MISSING record from the SIGNED marker ──
+# The record file is per-box; the signed marker in the PR body is the only copy
+# of the verdict that travels. So an absence on THIS box is not evidence that no
+# review happened — and the rail's only named remedy ("run the review") makes a
+# lane pay a second time for a verdict the fleet already holds (#2872: 12 of 45
+# open PRs, of which the registry covered 2).
+#
+# ⛔ THE HMAC IS THE WHOLE SAFETY ARGUMENT. A PR body is attacker-writable, so a
+# marker is EVIDENCE only when its `sig=` verifies over its own text with the
+# gate key — the same check the carry-forward arm makes (#784/#2055) and for the
+# same reason: a shape-only `[0-9a-f]{64}` match accepts `sig=<64 zeros>`, which
+# a later carry would then RE-SIGN with the real key, minting a genuine
+# attestation for a diff nobody reviewed. Unsigned, forged, or foreign-repo
+# markers are REFUSED and named; nothing is written.
+#
+# This verb cannot loosen the gate. What it restores is (pr, head_sha,
+# diff_sha256, verdict) — the SAME fields a normal record holds — and every
+# downstream decision (`--check-carry`, the merge rail, the GitHub gate) re-reads
+# them the same way. A recovered record whose digest no longer matches the PR's
+# live diff still answers `fresh`, so a moved diff still owes a review.
+if [ "$RECOVER_BODY" -eq 1 ]; then
+  # REPO was auto-detected above (the recorder's ONE resolution path), so this
+  # mode never re-derives it: a second detector would be a second answer.
+  if [ -z "$REPO" ]; then
+    echo "record-review.sh --recover-body: no repo resolved. A record is identified by PR *and* repo (PR numbers collide across repos), so pass it: record-review.sh --recover-body $PR owner/repo" >&2
+    exit 2
+  fi
+  if [ -z "$GATE_KEY" ]; then
+    echo "record-review.sh --recover-body: AI_REVIEW_GATE_KEY is not configured (env or ~/.pi/agent/.ai-review-gate-key), so a marker's signature cannot be VERIFIED — and an unverified marker is a body edit, not evidence. Refusing rather than minting on trust." >&2
+    exit 3
+  fi
+  RB_FILE="$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$PR.json"
+  RB_LEGACY="$HOME/.pi/agent/reviews/$PR.json"
+  # ⛔ RECOVERY FILLS AN ABSENCE; IT NEVER REPLACES. An existing record may be
+  # NEWER than the marker (a later review, a carry already re-bound), and
+  # overwriting it with an older verdict would silently walk the gate backwards.
+  # The legacy repo-less file is only a collision when it EMBEDS this repo: an
+  # unqualified record from another repo's PR of the same number is LEFT ALONE
+  # (never deleted — the recorder's own rule).
+  if [ -f "$RB_FILE" ]; then
+    echo "record-review.sh --recover-body: a record already exists at ${RB_FILE/#$HOME/~} — recovery fills an ABSENCE and will not replace it. Ask the gate what it thinks instead: record-review.sh --check-carry $PR $REPO" >&2
+    exit 5
+  fi
+  if [ -f "$RB_LEGACY" ]; then
+    RB_LEGACY_REPO="$(command sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$RB_LEGACY" 2>/dev/null | command head -1)"
+    if [ "$RB_LEGACY_REPO" = "$REPO" ]; then
+      echo "record-review.sh --recover-body: a record already exists at ${RB_LEGACY/#$HOME/~} (repo $REPO) — recovery fills an ABSENCE and will not replace it. Ask the gate: record-review.sh --check-carry $PR $REPO" >&2
+      exit 5
+    fi
+  fi
+  if ! RB_BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null)"; then
+    echo "record-review.sh --recover-body: could not READ the PR body (transient API failure?) — that is not 'no marker'. RETRY; nothing was written." >&2
+    exit 3
+  fi
+  [ "$RB_BODY" = "null" ] && RB_BODY=""
+  # The marker contract is fixed by the poster and read by the upstream required
+  # check (tortoise .github/workflows/ai-review-gate.yml): keep it EXACT — the
+  # verdict is one of the three record tiers, the head is a full 40-hex, and the
+  # optional `diff=` is a full 64-hex digest.
+  RB_LINE=""; RB_SIG=""; RB_TEXT=""; RB_NBAD=0; RB_NFOREIGN=0
+  while IFS= read -r _line; do
+    case "$_line" in
+      "review recorded: reviews/$PR.json verdict="*) ;;
+      *) continue ;;
+    esac
+    # `(<repo>) sig=<64hex>` — the sig covers EVERYTHING before ' sig=', which is
+    # why the split is on that exact token rather than on whitespace.
+    case "$_line" in
+      *" sig="*) ;;
+      *) RB_NBAD=$((RB_NBAD + 1)); continue ;;
+    esac
+    _text="${_line% sig=*}"
+    _sig="${_line##* sig=}"
+    [[ "$_sig" =~ ^[0-9a-f]{64}$ ]] || { RB_NBAD=$((RB_NBAD + 1)); continue; }
+    # ⛔ THE REGEX IS HELD IN A VARIABLE, NOT WRITTEN INLINE. Inside `[[ … ]]` a
+    # bare `(` starts a grouping expression, so an inline ERE with groups is a
+    # PARSE error the shell raises when it reaches the enclosing block — even on
+    # a run where RECOVER_BODY is 0 (measured: 214 assertions in the suite went
+    # red on one unescaped paren, because bash parses the whole `if … fi` when it
+    # reaches it). Expanded from a variable, the regex is an ordinary operand.
+    RB_RE="^review recorded: reviews/${PR}\.json verdict=(clean|clean-micro|clean-low) @ [0-9a-f]{40}( diff=[0-9a-f]{64})? \(([^)]+)\)$"
+    [[ "$_text" =~ $RB_RE ]] || { RB_NBAD=$((RB_NBAD + 1)); continue; }
+    [ "${BASH_REMATCH[3]}" = "$REPO" ] || { RB_NFOREIGN=$((RB_NFOREIGN + 1)); continue; }
+    _expect="$(printf '%s' "$_text" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+    if [ -z "$_expect" ] || [ "$_expect" != "$_sig" ]; then
+      RB_NBAD=$((RB_NBAD + 1)); continue
+    fi
+    # Keep the LAST verifying marker: the poster APPENDS, so the newest verdict
+    # is the final line appended for this repo ("keep the first" would resurrect
+    # a verdict the review itself superseded).
+    RB_LINE="$_line"; RB_SIG="$_sig"; RB_TEXT="$_text"
+  done <<<"$RB_BODY"
+  if [ -z "$RB_LINE" ]; then
+    if [ "$RB_NBAD" -gt 0 ]; then
+      echo "record-review.sh --recover-body: $REPO#$PR has $RB_NBAD marker line(s) for this PR but NONE whose signature verifies with this box's gate key — a marker whose HMAC does not verify is a body EDIT, not evidence, so nothing was written. (A wrong AI_REVIEW_GATE_KEY, a marker from a differently-keyed repo, or a forged line all present this way.)" >&2
+    elif [ "$RB_NFOREIGN" -gt 0 ]; then
+      echo "record-review.sh --recover-body: $REPO#$PR has a signed marker for a DIFFERENT repo ($RB_NFOREIGN line(s)) and none for $REPO — PR numbers collide across repos, so this is refused rather than adopted. Check the owner/repo argument." >&2
+    else
+      echo "record-review.sh --recover-body: no 'review recorded:' marker for $REPO#$PR in the PR body, so there is nothing to recover — no review was ever recorded for this PR on any box. Run the review, then record it." >&2
+    fi
+    exit 3
+  fi
+  RB_VERDICT="${RB_TEXT#*verdict=}"; RB_VERDICT="${RB_VERDICT%% *}"
+  RB_HEAD="$(printf '%s' "$RB_TEXT" | command sed -n 's/.* @ \([0-9a-f]\{40\}\).*/\1/p')"
+  RB_DIFF=""
+  case "$RB_TEXT" in
+    *" diff="*) RB_DIFF="${RB_TEXT#* diff=}"; RB_DIFF="${RB_DIFF%% *}" ;;
+  esac
+  # reviewed_at is the MINT time, and this verb did not observe the mint. Using
+  # `now` is the exact defect tortoise#7391 fixed (a carry time masquerading as
+  # the review time), so the head commit's committer date is used and the record
+  # carries `recovered_at` for when the restoration happened. If the date cannot
+  # be read, REFUSE — an invented mint time is worse than no record.
+  RB_AT="$(command gh api "repos/$REPO/commits/$RB_HEAD" --jq .commit.committer.date 2>/dev/null || true)"
+  case "$RB_AT" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) ;;
+    *)
+      echo "record-review.sh --recover-body: could not read the committer date of ${RB_HEAD:0:12}… (got '${RB_AT:0:40}'), so the record's reviewed_at cannot be stated honestly — and this verb must not stamp 'now' as a mint time (tortoise#7391). RETRY; nothing was written." >&2
+      exit 3 ;;
+  esac
+  mkdir -p "$HOME/.pi/agent/reviews"
+  RB_TMP="$RB_FILE.tmp.$$"
+  RB_DIFF_FIELD=""
+  [ -n "$RB_DIFF" ] && RB_DIFF_FIELD="\"diff_sha256\":\"$RB_DIFF\","
+  printf '{"pr":%d,"head_sha":"%s",%s"mint":"recovered-body","recovered_at":"%s","marker_sig":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$RB_HEAD" "$RB_DIFF_FIELD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RB_SIG" "$RB_VERDICT" "$REPO" "$RB_AT" > "$RB_TMP"
+  mv "$RB_TMP" "$RB_FILE"
+  printf 'recovered\t%s\t%s\n' "$RB_HEAD" "${RB_DIFF:--}"
+  echo "record-review.sh --recover-body: restored ${REPO}#$PR from the SIGNED marker in the PR body → ${RB_FILE/#$HOME/~} (verdict=${RB_VERDICT}, head=${RB_HEAD:0:12}…, mint=recovered-body). reviewed_at is the HEAD COMMIT's committer date ($RB_AT), not a mint time this box observed; recovered_at says when the restoration happened. This restores a verdict, it does not certify one: ask the gate whether it still covers what would merge — record-review.sh --check-carry $PR $REPO" >&2
+  exit 0
+fi
 
 # ── LANE-DIMENSION CARRY (#6072/#6213/#4823) ─────────────────────────────
 # The #2982 arm below asks whether the RENDERED patch is byte-identical. A base
