@@ -724,7 +724,7 @@ grep -q 'reap_global_caches()' "$H/fn.sh" || bad "could not extract reap_global_
 for want in 0 4 5 7 3; do
     printf '#!/bin/sh\nexit %s\n' "$want" >"$H/pi-cache-reap.sh"
     chmod +x "$H/pi-cache-reap.sh"
-    out="$(env HOME="$H" bash -c 'say() { printf "%s\n" "$*"; }; . "$1"; reap_global_caches' _ "$H/fn.sh" 2>&1)"
+    out="$(env HOME="$H" bash -c 'log_line() { printf "%s\n" "$*"; }; . "$1"; reap_global_caches' _ "$H/fn.sh" 2>&1)"
     case "$want" in
         0|4|5|7) assert_not_contains "$out" "warn:" "exit $want is NOT a failure: no warning is raised (4 = did not run, 5 = over bound and not acted on, 7 = DEFERRED)" ;;
         3)     assert_contains "$out" "warn: the cache reaper exited 3" "a fail-closed pass (exit 3) DOES warn, naming the status and the log" ;;
