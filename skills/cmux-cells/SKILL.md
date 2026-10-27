@@ -72,7 +72,7 @@ quoting any ceiling:
 | resource | cost (measured) | note |
 |---|---|---|
 | **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–22 sampled, cell-4, 2026-10-27 — a planning BAND, not a fixed cost |
-| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~10–150 MB**, decided by what it is doing (`docker stats --no-stream`, cells 3–4); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
+| **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~10–150 MB**, decided by what it is doing (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
 | CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
@@ -138,9 +138,10 @@ codes do not: 80 before 73.
 4. **load** — `MAX_LOAD`, default `nproc × 10` (exit 75; `PI_GATE_REFUSED` 76 is translated into 75).
 
 The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. **Waiting
-clears exactly one of these — `MAX_LOAD` (75).** Diagnosing a 73, 77, 80 or 74 as "the box is busy" and waiting is the trap:
-the gate's own refusal texts say so ("This is NOT a load refusal: waiting does not clear it"; "a disk refusal will NEVER
-clear on its own"), and only 75 goes away when the box quietens.
+clears exactly one of these ON ITS OWN — `MAX_LOAD` (75)** — and only because the box quietens. The others clear only when
+their cause is removed (disk reclaimed, lanes drained, brief re-authored), never by idling: the gate emits this on its fork
+refusal ("does NOT clear by waiting") and its headroom refusal ("This is NOT a load refusal: waiting does not clear it").
+So diagnosing a 73, 77, 80 or 74 as "the box is busy" and waiting is the trap.
 
 **RAM is read by two other instruments — `spawn-gate.sh` reads NO memory at all.** The two floors live in `orch-loop.sh`
 (`MIN_MEM_FREE_MB`, default 512) and `capacity.sh` (`CAP_MIN_MEM_MB`, 512). The **scheduler** does budget per lane: `ai-drainer.sh`
