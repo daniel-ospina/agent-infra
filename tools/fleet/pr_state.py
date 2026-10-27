@@ -832,13 +832,13 @@ def render_table(rows, repo):
     hist = {}
     for r in rows:
         hist[r["action"]] = hist.get(r["action"], 0) + 1
-    out.append("# pr-state %s — %d open PRs: %d MERGEABLE, %d CONFLICTING, %d checks GREEN, %d RED, %s queued runs on %d PRs" % (
+    out.append("# pr-state %s — %d open PRs: %d MERGEABLE, %d CONFLICTING, %d checks GREEN, %d RED, %s queued runs on %s PRs" % (
         repo, len(rows),
         sum(1 for r in rows if r["mergeable"] == "MERGEABLE"),
         sum(1 for r in rows if r["mergeable"] == "CONFLICTING"),
         green, red,
         ("%d" % sum(len(r["queued_runs"]) for r in rows)) if queued_known else "?",
-        len(with_q)))
+        ("%d" % len(with_q)) if queued_known else "?"))
     if not queued_known:
         out.append("# the queued-run inventory could not be read — Q is UNKNOWN on every row, not 0 "
                    "(an unreadable queue is not an empty queue); suppression re-reads anyway")

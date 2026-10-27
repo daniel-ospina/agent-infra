@@ -578,6 +578,16 @@ def _(M):
                         ("github-actions", "unit", "completed", "stale", 11, "900")])
         r = by_pr(rows_of(w))[7]
         assert r["action"] == "FIX-RED", r
+        # ⛔ BOTH DIRECTIONS OF THE PAIR. `passing_attempt` is computed twice — on the row that opens
+        # the group and on every later attempt — and `read_check_rows` preserves stream order, so an
+        # earlier CANCELLED row can arrive FIRST. Pinning only the red-first order left the opening
+        # arm unpinned (revert it alone and the suite stayed green while the action flipped to
+        # RERUN-FLAKE), which is the same defect wearing the other row order.
+        w.checks(head, [("github-actions", "unit", "completed", "cancelled", 11, "900"),
+                        ("github-actions", "unit", "completed", "failure", 22, "900")])
+        r = by_pr(rows_of(w))[7]
+        assert r["action"] == "FIX-RED", r
+        assert "passed on an earlier attempt" not in r["reason"], r
     finally:
         w.cleanup()
 
@@ -603,6 +613,15 @@ def _(M):
         # was read and is empty must not be reported as unread (the reader would go looking for a
         # permissions problem that does not exist).
         assert "empty surface" in r["reason"], r
+        # ⛔ THE OTHER DIRECTION, which is the one that costs a diagnosis: a surface that could NOT be
+        # read must never borrow the empty-surface reason. Deleting `read_ok = False` used to leave
+        # the suite green while the failed read was relabelled "empty surface" — a permissions/token
+        # problem hidden behind "there is nothing there".
+        os.remove(os.path.join(w.dir, "checks-%s.1.json" % head))
+        r = by_pr(rows_of(w))[7]
+        assert r["action"] == "WAIT:no-check-surface", r
+        assert "could not be read" in r["reason"], r
+        assert "empty surface" not in r["reason"], r
     finally:
         w.cleanup()
 
@@ -654,7 +673,7 @@ def _(M):
         rows = rows_of(w)
         assert rows and rows[0]["queued_known"] is False, rows
         table = M.render_table(rows, REPO)
-        assert "? queued runs on 0 PRs" in table, table
+        assert "? queued runs on ? PRs" in table, table
         assert "Q is UNKNOWN on every row, not 0" in table, table
         assert "\t0\t" not in table.splitlines()[-1], table
         # CONTROL: a queue that was READ and is empty still renders 0 (the arm is not "never count").
@@ -946,6 +965,18 @@ MUTATIONS = [
      '    if read_ok:\n        # ⛔ A SURFACE THAT WAS READ AND IS EMPTY IS STILL `verdict([])`',
      '    if rows:\n        # ⛔ A SURFACE THAT WAS READ AND IS EMPTY IS STILL `verdict([])`',
      "an empty surface is reported as unread, so the reader chases a permissions problem"),
+    ("flake-evidence",
+     '"passing_attempt": (r.get("conclusion") or "").strip().lower() in GREEN,',
+     '"passing_attempt": (r.get("conclusion") or "").strip().lower() in NONRED,',
+     "the row that OPENS a group counts a cancelled attempt as a pass (same defect, other row order)"),
+    ("no-check-surface",
+     '            read_ok = False',
+     '            read_ok = True',
+     "a surface that could not be read is relabelled 'empty surface'"),
+    ("queued-unreadable",
+     '("%d" % len(with_q)) if queued_known else "?"',
+     '("%d" % len(with_q))',
+     "an unreadable inventory renders the PR count as a definite 0"),
 ]
 
 
