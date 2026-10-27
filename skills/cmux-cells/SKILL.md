@@ -141,7 +141,8 @@ codes do not: 80 before 73.
 The creation back-pressure gate (`AGENT_LAND_BACKLOG`, exit **74**) runs last, and only for creation workers. **Only
 `MAX_LOAD` (75) clears because the box quietens on its own.** The rest clear when their **resource is released** or their
 **input changes** — a lane finishes or drains (73), disk is reclaimed or a lane finishes (77), the brief is re-authored (80),
-the install is repaired (78), the repo's open-PR queue actually lands (74 — or, on its **other arm**, that worktree's origin
+the install is repaired (78 — which also covers a bad invocation: an `unknown role` is a typo in the call, not a broken
+install, so read the emitted line), the repo's open-PR queue actually lands (74 — or, on its **other arm**, that worktree's origin
 is made a readable `owner/name` slug again, since 74 also fires when `land_backlog_repo` cannot derive one and landing does not
 fix that; a P0-blocker or a base-red repair is **exempt by evidence** and dispatches anyway). **Idling on its own changes none
 of them**: for 73
@@ -200,8 +201,9 @@ A **disk-full** cell behaves exactly like a dead one: the control agent cannot w
 while the provider insists `running`. Measured 2026-10-19: cell-3 sat at 29.9/32 GB, CPU 77%, exec failing for an hour,
 having submitted nothing for 141–226 minutes.
 
-Recovery ladder, cheapest first. **Establish a channel before anything else** — and read it carefully, because three readings
-that look like channel verdicts are not:
+Recovery ladder, cheapest first. **Establish a channel before anything else.** Three of the readings below are *not* channel
+verdicts — classify them before acting, because the first one, which **is** a verdict, is listed with them only to say what it
+settles:
 
 - **A real refusal kills steps 1-2 outright**, whatever its cause — that one *is* a verdict. The channel that then answers is
   `cmux vm exec <vm> -- <cmd>` (it needs no `cmux-tui` daemon) — **unless `/` is nearly full**: a guest at 93 % has already
@@ -209,7 +211,7 @@ that look like channel verdicts are not:
   **both** of those gone, the in-guest surface left is the **display** the same render prints (`cmux surface open
   <vm>/display/display:1` — a noVNC console that was live on cell-4 while its `cmux-tui` port was refused). Beyond that the
   levers are provider-level (step 3) and owner-level (a plan change or a **recreate** — and a recreate is the one step here
-  that can destroy unpushed work, so run the `@{u}..HEAD` / `status --porcelain` checks below first).
+  that can destroy unpushed work, so run the work-at-risk check below first).
 - **`cmux vm tree` printing `(no terminals)` is not a reading of the box** when the same render shows a link error or a null
   workspace list — cell-4 today reports `link_error: "The Cloud hub could not reach the VM port: connection refused."` and
   `remote_workspaces: null` while its own registry holds **945** terminals. `null` means *unknown*, not *zero*: fall back to
@@ -243,12 +245,14 @@ none of the reclaim steps below touch it.
    volume moves — observed 31 → 11 MiB free within a single day — so **re-read it**; do not trust the figure above. None of
    the reclaim steps above touch it, so if it is the volume that is full, that is an **owner-level** action: it is a per-box
    loop file (`cmux-tui-state.ext4` — 974 MB on cell-3, 3,996 MB on cell-4) and **no `cmux vm` verb resizes it**. A reset is
-   not just an unlink: the `cmux-tui` daemon holds that registry **open read-write** (6 fds on cell-3), so deleting the file
-   frees nothing until those fds close. ⛔ **And stopping it is not a small act:** the unit is `KillMode=control-group`, so
-   `systemctl stop cmux-tui-daemon.service` SIGTERMs **every process in it** — on cell-3 that cgroup held 124–207 processes,
-   including live `pi` lanes, a running `pytest`, and the terminal hosts. Run the `@{u}..HEAD` / `status --porcelain` checks
-   below in those sessions first, then: stop the unit, delete `sessions/<id>/workspace-registry.sqlite3` (its ~43 MB `-wal`
-   regenerates), restart it, **then** re-read `df` — or recreate the box (also destructive, see the display note above).
+   not just an unlink: the `cmux-tui` daemon holds that registry **open** (6 fds on cell-3 — 3 read-write, 2 read-only, 1
+   `-shm`; *any* of them pins the inode), so deleting the file frees nothing until those fds close. ⛔ **And stopping it is not a
+   small act:** the unit is `KillMode=control-group`, so `sudo systemctl stop cmux-tui-daemon.service` SIGTERMs **every process
+   in it** — and it needs `sudo` (an unprivileged `systemctl stop` is "Access denied"). That cgroup holds **45 processes at zero
+   lanes and 124–207 with the box full** (cell-3, 2026-10-27), including live `pi` lanes, a running `pytest` and the terminal
+   hosts — re-count before you act, because they are lanes and they are what you lose. Run the work-at-risk check below across
+   every worktree on the box first, then: `sudo systemctl stop` the unit, delete `sessions/<id>/workspace-registry.sqlite3` (its
+   ~43 MB `-wal` regenerates), `sudo systemctl start` it, **then** re-read `df` — or recreate the box (also destructive).
 
 ## 4. Liveness of a LANE, and the reaping rule
 
@@ -363,8 +367,8 @@ dispatch time, because both move.
 | box | role | shape (measured 2026-10-27; re-read it) |
 |---|---|---|
 | `pi-cell-1` | product work | 16 GB / 8 vCPU / 128 GB — the **same shape as cell-4**, but **needs activation (§1)** before it can land |
-| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — **half the cores of the other two, but the same pinned `MAX_LANES=20`** (§7), i.e. the controller will admit twice the lanes this box's RAM supports. Memory is what it runs out of: its `dmesg` has 2 OOM kills — re-read at dispatch |
-| `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target, and **the box with the most OOM kills of the three (5)** — give it the larger share of the free pool |
+| `pi-cell-3` | product work | 8 GB RAM / **4 vCPU** / 128 GB — part of the fleet's lowest-core box, but the **same pinned `MAX_LANES=20` as the 16 GB ones** (§7): 20 is twice the core-derived 10, on a box §2's arithmetic puts nearer 6 lanes — and today the aid answers 2. Memory is what it runs out of (`dmesg`: 2 OOM kills) — re-read at dispatch |
+| `pi-cell-4` | product + CI-cost work | 16 GB / 8 vCPU / 128 GB — the current default dispatch target, and **the box with the most OOM kills of the three (5)**: per §2 that means its reserve goes UP, i.e. fewer lanes here, not more |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
 ⛔ **TWO DIFFERENT CEILINGS — DO NOT CONFUSE THEM, AND DO NOT TREAT EITHER AS THE WHOLE ANSWER.** The owner ruled on
@@ -399,8 +403,11 @@ not a load average measured earlier.
 - A stale heartbeat file does not mean the loop is dead (`orch-loop.log` mtime does).
 - Killing a controller is futile when launchd `KeepAlive` + a 20 s watchdog recreate it — and a lane can spawn one.
 - `TERM`/`INT` traps that swallow signals leave the script running: a stop/restart appears to hang (agent-infra#2085).
-- Deleting a worktree to make space must never destroy unpushed work: check `git rev-list --count @{u}..HEAD` and
-  `status --porcelain` first; preserve, then remove only the regenerable parts.
+- Deleting a worktree to make space must never destroy unpushed work, and the guard has to **fail closed**: `git rev-list
+  --count @{u}..HEAD` **errors and prints nothing** on a branch with no upstream — which is the branch whose every commit is
+  unpushed. Treat that error as UNSAFE, not as clean. On a cell, enumerate first — `git worktree list --porcelain` in every
+  repo on the box (22 trees on cell-3) — then per worktree: `git rev-list --count @{u}..HEAD 2>/dev/null || echo NO-UPSTREAM`,
+  `git stash list`, and `status --porcelain`. Preserve, then remove only the regenerable parts.
 - **Capacity is a MEASUREMENT, not a constant.** Every earlier version of §2 substituted one number for the lane type and one
   for the reserve, and both errors ran in the direction that **refuses** dispatches it should allow. The figures in §2 carry
   their date and method so the next reader can re-derive them instead of inheriting them.
