@@ -707,6 +707,30 @@ resolve_host_arm() { # <label> <remote-url> <pr>
 resolve_host_arm "an scp-form ssh remote (git@host:owner/repo)" 'git@ghe.example.com:acme/widgets.git' 164
 resolve_host_arm "an https remote with userinfo (https://user@host/owner/repo)" 'https://user@ghe.example.com/acme/widgets.git' 165
 
+# ── AG3: the PIN's host is the host, exactly as `--repo`'s is ──────────────
+# `RAIL_RUN_REPO_SLUG` is the documented seam for a checkout whose `origin` does not name its repo, and
+# it is spelled `[HOST/]OWNER/REPO` exactly as `--repo` is — but `raw_slug` was captured from ARGV
+# alone, so the pin's host was discarded and `origin` (the one source a pinned identity says nothing
+# about) was asked instead. A GHE pin in a remote-less checkout therefore recorded `github.com/<slug>`,
+# whose artifact check demanded a URL that host never serves: fail-closed, but `landed` unreachable —
+# the same unleanable run the `@`-prefix and `--repo` arms above exist to prevent. Assert what was
+# RECORDED, then that the landing actually becomes reachable.
+PIN_DIR="$T/host-pin"; mkdir -p "$PIN_DIR"
+OUT="$(cd "$PIN_DIR" && RAIL_RUN_REPO_SLUG=ghe.example.com/acme/widgets RAIL_RUN_GH_HOST= FAKE_RAIL_SLEEP=1 "$BASH_BIN" "$RR" start 166 2>&1)"; RC=$?
+assert_rc 0 "$RC" "HOST/PIN: a HOST-prefixed RAIL_RUN_REPO_SLUG starts"
+PIN_RID="$(run_id_of "$RC|$OUT")"
+PIDS+=("$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-166/$PIN_RID" pid)")
+PIN_HOST="$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-166/$PIN_RID" host)"
+if [ "$PIN_HOST" = "ghe.example.com" ]; then ok "HOST/PIN: the run records the host its pin named"
+else bad "HOST/PIN: recorded host='$PIN_HOST' (want ghe.example.com) — the pin's host must not be re-read from origin"; fi
+PIN_REPO="$(rd_field "$RAIL_RUN_DIR/acme-widgets/pr-166/$PIN_RID" repo)"
+if [ "$PIN_REPO" = "acme/widgets" ]; then ok "HOST/PIN: and the normalised repo identity (acme/widgets)"
+else bad "HOST/PIN: recorded repo='$PIN_REPO' (want acme/widgets)"; fi
+OUT="$(GH_MODE=otherhost wait_state landed 166 --repo acme/widgets --run "$PIN_RID")"; RC="${OUT%%|*}"
+assert_rc 0 "$RC" "HOST/PIN: a MERGED read ON THE PINNED HOST is a landing (the payoff: the run can be landed)"
+OUT="$(GH_MODE=merged poll 166 --repo acme/widgets --run "$PIN_RID")"; RC="${OUT%%|*}"
+assert_rc 25 "$RC" "HOST/PIN: the same path on github.com is NOT this run's landing"
+
 # ── X: the recorder's own liveness blocks a start ─────────────────────────
 # The recorder is the only incarnation for the first instants of every launch, so a record with a
 # LIVE pid, an accurate `start` and NO `railpid` is the COMMON window — and starting a second rail
@@ -785,6 +809,17 @@ OUT="$(poll 5 --run ../../etc)"; assert_rc 2 "${OUT%%|*}" "TRAVERSAL: --run with
 OUT="$(poll 5 --run ..)"; assert_rc 2 "${OUT%%|*}" "TRAVERSAL: --run .. is refused"
 OUT="$(call start 5 --repo)"; assert_rc 2 "${OUT%%|*}" "ARGS: a dangling --repo is refused, not reinterpreted"
 OUT="$(poll 5 --run)"; assert_rc 2 "${OUT%%|*}" "ARGS: a dangling --run is refused"
+# …and so is a flag where a VALUE belongs. A repo slug cannot begin with `-`, so this shape is always a
+# caller mistake — but it used to be SILENT: `start` took `--run` as the repo name (then fell back to
+# `origin` for the identity, forwarding the mangled pair to the rail), and `status` let the second flag
+# overwrite the still-pending `want`, answering about the NEWEST run for a caller who pinned run A.
+OUT="$(call start 5 --repo --run --repo acme/widgets)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 2 "$RC" "ARGS: a FLAG in --repo's value slot is refused by start (even when a later --repo would supply one)"
+assert_contains "$TXT" "needs a value" "ARGS: and start names the flag that lost its value"
+OUT="$(poll 7 --run --repo fake/repo)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 2 "$RC" "ARGS: a FLAG in --run's value slot is refused by status"
+assert_contains "$TXT" "--run needs a value" "ARGS: and status names --run (the pin that would have been lost)"
+OUT="$(poll 7 --repo --run runA)"; assert_rc 2 "${OUT%%|*}" "ARGS: a FLAG in --repo's value slot is refused by status too"
 
 # ── Z: a stale TERMINAL run does not block a new start ─────────────────────
 OUT="$(GH_MODE=open call start 105)"; RC="${OUT%%|*}"

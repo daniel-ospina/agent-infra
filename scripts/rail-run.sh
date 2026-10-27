@@ -449,7 +449,14 @@ start_rail() {
   local -a fwd=()
   for a in "$@"; do
     if [ "$seen_dd" = "1" ]; then fwd+=("$a"); continue; fi
-    if [ "$want" = "1" ]; then slug="$a"; fwd+=("$a"); want=0; id_from_argv=1; continue; fi
+    if [ "$want" = "1" ]; then
+      # ⛔ A FLAG IS NOT A VALUE. `start 7 --repo --run` used to take `--run` as the repo name, then
+      # fall back to `origin` for the identity while FORWARDING the mangled pair to the rail — the
+      # caller's own flag silently consumed. A repo slug cannot begin with `-`, so this is always a
+      # usage error; refuse before a rail is spawned (the same shape `status` refuses below).
+      case "$a" in -*) die "--repo needs a value (got the flag '$a')" ;; esac
+      slug="$a"; fwd+=("$a"); want=0; id_from_argv=1; continue
+    fi
     case "$a" in
       --repo) want=1; fwd+=("$a") ;;
       --repo=*) slug="${a#--repo=}"; fwd+=(--repo "$slug"); id_from_argv=1 ;;
@@ -463,7 +470,17 @@ start_rail() {
   # `origin`. If neither yields one the run still starts (it can still merge) but its artifact reads
   # abstain, and `status` says which flag supplies it.
   local raw_slug="$slug"
-  if [ -z "$slug" ]; then slug="$(resolve_slug)"; fi
+  if [ -z "$slug" ]; then
+    # ⛔ THE PIN NAMES THE HOST TOO. `resolve_slug` returns `RAIL_RUN_REPO_SLUG` verbatim — the seam for
+    # a checkout whose `origin` does not name its repo — and that pin is spelled `[HOST/]OWNER/REPO`
+    # exactly as `--repo` is. Capturing `raw_slug` from ARGV ALONE threw the pin's host away and then
+    # asked `origin`, the one source a pinned identity says nothing about: a GHE pin in a remote-less
+    # (or github.com) checkout recorded `github.com/<slug>`, whose artifact check demanded a URL that
+    # host never serves — fail-closed, but a run nobody can land (the same class as the `@`-prefix and
+    # `--repo` arms). The host is taken from whichever value the slug actually came from.
+    raw_slug="$(resolve_slug)"
+    slug="$raw_slug"
+  fi
   slug="$(normalize_slug "$slug")"
   # The HOST is taken from the same value the slug came from when that value names one, and only
   # otherwise from `origin`: the pair (slug, host) is one identity, and mixing the two sources let a
@@ -962,9 +979,13 @@ status_rail() {
   local pr="" slug="" want="" run_id="" a
   for a in "$@"; do
     case "$a" in
-      --repo) want=repo ;;
+      # ⛔ A FLAG IS NOT A VALUE, HERE EITHER. `status 7 --run --repo fake/repo` let `--repo` overwrite
+      # the still-pending `want=run`, so the poll silently answered about the NEWEST run (or about
+      # another repo) instead of the one the caller pinned — against this file's own guarantee that "a
+      # poller that started run A must never be shown run B's state". Refuse, naming the loser.
+      --repo) [ -z "$want" ] || die "--$want needs a value"; want=repo ;;
       --repo=*) slug="${a#--repo=}" ;;
-      --run) want=run ;;
+      --run) [ -z "$want" ] || die "--$want needs a value"; want=run ;;
       --run=*) run_id="${a#--run=}" ;;
       *)
         if [ "$want" = "repo" ]; then slug="$a"; want=""

@@ -105,11 +105,13 @@ load-bearing distinctions honest:
   report `unknown`. It is recorded in the run, and that record is authoritative: a poll whose
   `--repo` contradicts it abstains, because the state key maps `/` to `-` and is not injective
   (`a/b-c` and `a-b/c` share one).
-  **The host comes from the same value as the slug.** When `--repo` is spelled `[HOST/]OWNER/REPO`
-  the host it names is recorded; only a bare `owner/repo` (or no `--repo` at all) falls back to
-  `origin`. Reading the host from `origin` while the slug came from `--repo` recorded a
-  `github.com/<slug>` pair for a target on another host, so the artifact check demanded a URL that
-  host never serves and `landed` was unreachable — fail-closed, but a run nobody could land.
+  **The host comes from the same value as the slug.** When `--repo` — or the checkout-wide
+  `RAIL_RUN_REPO_SLUG` pin, which is spelled the same way — is given as `[HOST/]OWNER/REPO`, the host
+  it names is recorded; only a bare `owner/repo` (or no identity argument at all) falls back to
+  `origin`. Reading the host from `origin` while the slug came from `--repo` (or from the pin, which is
+  the seam for a checkout whose `origin` does *not* name its repo) recorded a `github.com/<slug>` pair
+  for a target on another host, so the artifact check demanded a URL that host never serves and
+  `landed` was unreachable — fail-closed, but a run nobody could land.
 
 One live rail per PR: `start` takes an **atomic claim** (`mkdir`) *before* it probes the existing
 run, so two racing starts cannot both launch a rail (two merge attempts on one PR). The state key is
@@ -160,14 +162,17 @@ Three stated residuals:
 bash scripts/rail-run.test.sh      # no network, no real gh, no real rail
 ```
 
-**161 passed, 0 failed** (`bash scripts/rail-run.test.sh`, ~58 s, no network). The suite is mostly
+**185 passed, 0 failed** (`bash scripts/rail-run.test.sh`, no network; ~30 s on the dev box, and the
+only number asserted anywhere is the pass/fail line). The suite is mostly
 negative — `running` must never read as landed or refused, `rc=0` is not a landing when the artifact
 disagrees, `gone-without-verdict` is never a landing *or* claimed over an unread artifact, an
 unreadable liveness or PR read abstains, a live pid with the wrong incarnation is not "running", a
 claim in its `mkdir`→`pid` window is in flight rather than dead, `--repo`/`--run` cannot escape the
 run root, an artifact read whose url names another repo is not a landing, a poll that contradicts
 the run's recorded repo abstains instead of answering with it, a mixed-case slug is one key and one
-identity, the identity reaches the rail exactly once even with a `--`, a `✗` line that could not
+identity, the identity reaches the rail exactly once even with a `--`, a flag in a flag's value slot is
+refused by both verbs instead of silently dropping the pin (and the identity pin's host is recorded, so
+a GHE pin can actually land), a `✗` line that could not
 read something is not a refusal, an abstaining run record cannot block a PR forever, and two racing
 starts reach the rail exactly once (the recorder's own liveness blocks too, so the window before
 the rail's pid exists is covered). Every arm names the guard it discriminates; removing that guard
