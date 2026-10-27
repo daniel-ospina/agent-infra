@@ -69,14 +69,14 @@ true of the code that ships here**: while this branch was in review, `main` land
 MERGED", decided two rules before the age floor is even computed:
 
 ```
-scripts/pi-reap-worktrees.sh:1669  # ── RULE 4: a MERGED PR for this head, whatever the merge strategy
+scripts/pi-reap-worktrees.sh:1727  # ── RULE 4: a MERGED PR for this head, whatever the merge strategy
                                    #    if [ "$pr_state" = "MERGED" ] && [ "$pr_oid" = "$sha" ]
 ```
 
 So on a squash-merge repo `refs=merged` (rule 3) is still unreachable, but the class is no longer
 *stuck in the age floor*: rule 4 fires on the PR state with the sha identity gate (`pr_oid = $sha`),
 which is the same "the evidence is about THIS commit" warrant §6.1 asked for, and rule 7's minimum
-age still gates it (`G6e`). #2354's `patch_equivalent()` (`:1419`) remains as a **second, independent**
+age still gates it (`G6e`). #2354's `patch_equivalent()` (`:1464`) remains as a **second, independent**
 squash signal that lifts the *floor* only, never reachability.
 
 Consequence for this document: the second ancestry arm this PR carried (`merged_pr_ev` /
@@ -316,7 +316,7 @@ Verifier: **P0=2**, P1=6, P2=5, P3=4.
 | Finding | Action |
 |---|---|
 | **P0** `refs=merged-pr` put the merge proof in the **survival** channel (`commits_survive` returns early) ⇒ on the gone-directory/`prunable` path it would waive the reachability gate and the global prune would deregister the admin HEAD — the last durable handle of a detached commit | **Fixed** — merge evidence never enters `commits_survive`; the arm was confined to the age floor. ⚠️ **At the merged head the arm itself is gone** (§2.1 S1, §6.1): `main` shipped RULE 4, which decides the same class in the REMOVAL path, after `commits_survive` has already decided reachability — so the channel separation the P0 asked for holds structurally. The dedicated test **G6k** was dropped with the arm; the reachability gate it guarded is pinned by **G3a**, **A24** and **G10** |
-| **P0** the waiver keyed on the branch NAME: name reuse, HEAD ahead of the PR head, and force-push-after-merge all waive a live checkout | **Fixed, and now by RULE 4** — the shipped evidence is `pr_state = MERGED && pr_oid == this checkout's HEAD` (`pi-reap-worktrees.sh:1669-1698`). Name reuse ⇒ different tip ⇒ no evidence; post-merge commits ⇒ no evidence. **Test: G14f** (plus its control: the same fixture IS rule-4 reclaimable when the oid matches) (§6.1) |
+| **P0** the waiver keyed on the branch NAME: name reuse, HEAD ahead of the PR head, and force-push-after-merge all waive a live checkout | **Fixed, and now by RULE 4** — the shipped evidence is `pr_state = MERGED && pr_oid == this checkout's HEAD` (`pi-reap-worktrees.sh:1727-1753`). Name reuse ⇒ different tip ⇒ no evidence; post-merge commits ⇒ no evidence. **Test: G14f** (plus its control: the same fixture IS rule-4 reclaimable when the oid matches) (§6.1) |
 | **P1** a shared read-back would false-block macOS (launchd has no `ExecStart`) | **Fixed** — target-dispatched: `verify_installed_unit()` (systemd) / launchd arm checks `ProgramArguments` identity |
 | **P1** "installed file as fallback" *is* the fail-open: `/run/systemd/system/*.d` drop-ins are invisible to a file read | **Fixed** — for `system`/`user`, `$SC cat` must answer or the install REFUSES; the file path (plus merged `<unit>.d/*.conf`) is used only for `TARGET=override`, and it merges drop-ins itself. The t8 shim gains `cat` |
 | **P1** `EnvironmentFile=keys.env` is arbitrary shell; systemd applies it *after* `Environment=`, so a `HOME=` line silently overrides the HOME the read-back certifies | **Dropped** — no `EnvironmentFile`. The installer instead **resolves `gh` in the rendered environment and reports it** (`gh=<path|MISSING>`); the class already fails closed (exit 3, red) when gh is unavailable |
@@ -351,7 +351,7 @@ for ignored findings (none were ignored); cycle 2 is the code-review gate (§7).
 stronger, strategy-independent proof. Shipped predicate:
 
 ```
-scripts/pi-reap-worktrees.sh:1669-1698   RULE 4 — a MERGED PR for this head, whatever the strategy
+scripts/pi-reap-worktrees.sh:1727-1753   RULE 4 — a MERGED PR for this head, whatever the strategy
   pr_state == MERGED                          # from ONE `gh pr list --state all` read
   pr_oid    == <this checkout's HEAD sha>     # the evidence is about THIS commit (G14f)
   ⇒ remove, at REAP_WT_MERGED_AGE_DAYS (0), still gated by rule 7's minimum age (G6e)
@@ -364,7 +364,7 @@ never touches `commits_survive` (the reachability gate) nor the `refs=merged` an
 `REAP_WT_MERGED_AGE_DAYS` is lifted by three inputs, in this order (`:1605-1622`):
 
 1. `refs=merged` (rule 3, ancestry) — the strongest proof;
-2. `patch_equivalent()` (`:1419`, `git cherry`) — the #2354 squash signal, **age floor only**
+2. `patch_equivalent()` (`:1464`, `git cherry`) — the #2354 squash signal, **age floor only**
    (`:96-107` carries the ⛔: it is neither reachability nor present state, and a squash later
    reverted still reads equivalent, which is why it can never appear in `refs=`);
 3. rule 4's own merged floor, which applies even when `git cherry` cannot see a multi-commit squash.
