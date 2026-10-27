@@ -2082,6 +2082,10 @@ Goal: ${m.goal}` }] };
 
   // ── session_shutdown: release loops + defensive cleanup ──────
   pi.on("session_shutdown", async (_event, ctx) => {
+    // Stop the cron tick as the session tears down: a tick that fires now would inject a
+    // user message into a closing session. (`scheduler.unref()` in scheduler.ts is what
+    // keeps the tick from holding the process open; this is the teardown half.)
+    if (cronTimer) { clearInterval(cronTimer); cronTimer = null; }
     // ponytail: #5830 — release session-owned loops to role-level before abort
     const currentSessionId = getSessionId(ctx);
     if (currentSessionId && existsSync(LOOPS_DIR)) {

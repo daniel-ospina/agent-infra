@@ -21,22 +21,37 @@
 #   2. THE CAPABILITY — a recorder named `say` first on PATH, proven LIVE on every run: it must record a
 #      speaking fixture (red) and record nothing for a quiet one (green). A guard whose failing path is
 #      never exercised is a guard that cannot fail.
-# The third part — the NAME itself — is checked by the rename this shard ships with: no shipped script
-# defines or calls a helper called `say`, so a forgotten definition is `command not found` on stderr
-# (loud, local, attributable) instead of a voice on the speaker.
+#   3. THE NAME — no shipped script may DEFINE a helper called `say`, so a forgotten definition is
+#      `command not found` on stderr (loud, local, attributable) instead of a voice on the speaker.
+#      This arm is the one the rename itself needed and did not have: the rename was counted against a
+#      stale base, and two files that landed afterwards still defined `say` for as long as it took a
+#      reviewer to find them. A line-start scan cannot see a file that arrives after the scan; this
+#      arm reads the tree on every run.
 #
 # ⛔ DECLARED LIMIT — this shard does NOT re-run the fragment suites under the recorder. They assert the
 # recorder themselves on every fragment arm (§B, its second run, §F and §O of install-controller-service
 # .test.sh), which is the strong check and costs ~7 minutes; this shard covers the cheap half that those
-# arms structurally cannot: a NEW runner's adoption, and the recorder's own liveness. It also does not
-# detect every conceivable way to execute a fragment — the predicate below is the shape this repo uses
-# (`$(cat "$FRAG")` into a child shell), stated so a runner that extracts a fragment differently is a
-# KNOWN gap rather than an assumed pass.
+# arms structurally cannot: a NEW runner's adoption, and the recorder's own liveness.
+#
+# ⛔ IT ALSO DOES NOT DETECT EVERY WAY TO EXECUTE A FRAGMENT, AND THE POPULATION IS STATED HERE SO THE
+# GAP IS NOT MISTAKEN FOR A PASS. The adoption predicate below matches ONE shape — a slice cat'd in as a
+# variable (`cat "$FRAG"` into a child shell). MEASURED on 2026-10-27 against this tree: exactly ONE
+# suite uses that shape (install-controller-service.test.sh). NINE suites execute shipped FUNCTIONS
+# another way — `awk '/^fn(){/,/^}/'` into a file, then `bash -c` — and NONE of them sources the prelude,
+# so the adoption arm does not see them at all. (THE COUNT DEPENDS ON THE PREDICATE, THE GAP DOES NOT:
+# nine when the `awk` program must actually select a function definition, fifteen on a looser "any awk
+# plus any `bash -c`", and #2925's reviewer counted fourteen. Every version of the count is uncovered.)
+# An earlier version of this comment called the predicate "the shape this repo uses"; that was false,
+# and a guard that overstates its reach is worse than one that names it.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 LIB="$ROOT/scripts/lib/frag-stubs.sh"
+# This shard's own repo-relative path, so the census can exclude it. Its fixtures EMBED the fragment
+# shape inside quoted strings, so a text predicate matches it — but it executes no shipped fragment, and
+# reporting it as a "fragment runner" would inflate the population it is measuring.
+SELF_REL="${BASH_SOURCE[0]#"$ROOT"/}"; SELF_REL="${SELF_REL#./}"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$*"; }
@@ -49,13 +64,20 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$*"; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/no-tts.XXXXXX")" || { echo "❌ cannot mktemp" >&2; exit 1; }
 trap 'rm -rf "$T"' EXIT
 
+# ── code, not prose ─────────────────────────────────────────────────────────────────────────────
+# A text predicate that reads whole-line COMMENTS reports prose as an offender, and the first census
+# did exactly that: of 3 files it called "fragment runners", ONE was a fragment runner — the shared
+# prelude matched its own usage example, and this shard matched its own fixture strings. A guard that
+# reports prose teaches its reader to ignore it, so every predicate below reads code lines only.
+code() { grep -v -E '^[[:space:]]*#' -- "$@" 2>/dev/null; }
+
 # ── the census: which files EXECUTE a shipped fragment? ─────────────────────────────────────────
 # stdin: repo-relative paths. A fragment runner is a file that cats a shell slice into a child shell.
 frag_runners() { # <paths on stdin>
   local f
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    grep -qF 'cat "$FRAG"' "$f" 2>/dev/null && printf '%s\n' "$f"
+    code "$f" | grep -qF 'cat "$FRAG"' && printf '%s\n' "$f"
   done
 }
 # stdin: repo-relative paths. Offenders are fragment runners that do NOT source the one shared prelude —
@@ -64,12 +86,23 @@ frag_unadopted() { # <paths on stdin>
   local f
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    grep -qF 'cat "$FRAG"' "$f" 2>/dev/null || continue
-    grep -qF 'frag-stubs.sh' "$f" 2>/dev/null || printf '%s\n' "$f"
+    code "$f" | grep -qF 'cat "$FRAG"' || continue
+    code "$f" | grep -qF 'frag-stubs.sh' || printf '%s\n' "$f"
+  done
+}
+# stdin: repo-relative paths. A shipped script that DEFINES a helper called `say` — the name layer. This
+# covers DEFINITIONS only; a stub inside a quoted `bash -c` payload is not a line-start token at all and
+# is a different blind spot (the census in pi-cache-reap.test.sh 10b is what finds that shape).
+say_defs() { # <paths on stdin>
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    code "$f" | grep -qE '^[[:space:]]*say[[:space:]]*\(\)' && printf '%s\n' "$f"
   done
 }
 
 CENSUS="$(cd "$ROOT" && git ls-files -- '*.test.sh' 'scripts/*.sh' 'tests/*/run.sh' 'pi-bootstrap/tests/*.sh' 2>/dev/null \
+          | grep -vxF "$SELF_REL" \
           | sed "s|^|$ROOT/|" | frag_runners)"
 if [ -n "$CENSUS" ]; then
   ok "the census found $(printf '%s\n' "$CENSUS" | wc -l | tr -d ' ') suite(s) that execute a shipped fragment: $(printf '%s' "$CENSUS" | sed "s|^$ROOT/||" | tr '\n' ' ')"
@@ -100,6 +133,28 @@ case "$MUT_OFF" in
   "$T/fx/bad.test.sh") ok 'MUTATION: the adoption predicate NAMES the inline-stub fixture and not the adopted one — so the arm above can fail' ;;
   '') bad 'MUTATION: the predicate found no offender in a fixture that keeps an inline stub list — the adoption check above is INERT (#2910)' ;;
   *) bad "MUTATION: the predicate misidentified the fixtures — it reported: $(printf '%s' "$MUT_OFF" | tr '\n' ' ')" ;;
+esac
+
+# ── the NAME: no shipped script may define a helper called `say` ───────────────────────────────
+# This is the arm the rename itself needed. The rename was counted against a stale base, so two files
+# that landed on main afterwards still defined `say` — 2 definitions and 29 call sites were sitting in
+# the tree while the change read as complete. A line-start scan cannot see a file that arrives after
+# the scan; this arm re-reads the tree on every run, so the NEXT such file is red here instead.
+SAY_DEFS="$(cd "$ROOT" && git ls-files -- '*.sh' '*.bash' 2>/dev/null | say_defs)"
+[ -z "$SAY_DEFS" ] \
+  && ok 'no shipped shell script DEFINES a helper called `say` — the name that resolves to /usr/bin/say on macOS is gone from the tree, not just from the files the rename happened to visit' \
+  || bad "shipped script(s) still defining \`say\`: $(printf '%s' "$SAY_DEFS" | tr '\n' ' ') — on macOS this name is /usr/bin/say, so a missed definition is a voice on the speaker, not a log line (#2910)"
+
+# ── that arm's own mutation: it must NAME a defining fixture, and pass the renamed one ──────────
+mkdir -p "$T/fxn"
+printf '%s\n' '#!/usr/bin/env bash' 'say() { printf "%s\n" "$*"; }' > "$T/fxn/bad.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'log_line() { printf "%s\n" "$*"; }' > "$T/fxn/good.sh"
+printf '%s\n' '#!/usr/bin/env bash' '# say() in a comment is prose, never a definition' > "$T/fxn/prose.sh"
+MUT_SAY="$(printf '%s\n' "$T/fxn/bad.sh" "$T/fxn/good.sh" "$T/fxn/prose.sh" | say_defs)"
+case "$MUT_SAY" in
+  "$T/fxn/bad.sh") ok 'MUTATION: the name arm NAMES the fixture that defines `say`, and not the renamed one or the one that only mentions it in a comment — so the arm above can fail, and prose cannot make it fail' ;;
+  '') bad 'MUTATION: the name arm found no definition in a fixture that defines `say` — the check above is INERT (#2910)' ;;
+  *) bad "MUTATION: the name arm misidentified the fixtures — it reported: $(printf '%s' "$MUT_SAY" | tr '\n' ' ')" ;;
 esac
 
 # ── the capability: the recorder is LIVE, and it reddens a speaking suite and stays green on a quiet one ──

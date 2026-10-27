@@ -201,5 +201,12 @@ export function startScheduler(
       // Lock is NOT released here — agent_end releases it after the cycle
     }
   }, 60_000);
+  // ⛔ A cron tick must never hold the host's event loop open. An interval is a REF'd
+  // handle by default, so it keeps a Node process alive until it is cleared — and
+  // `pi -p` never clears it (index.ts assigns the timer and never touches it again),
+  // so a finished session prints its answer and then hangs forever instead of exiting.
+  // Measured on a cell 2026-10-27 (agent-infra#2935): loop-enforcer alone reproduced
+  // the hang, unref alone cleared it (3x: 6s/5s/6s, rc=0).
+  scheduler.unref?.();
   return scheduler;
 }

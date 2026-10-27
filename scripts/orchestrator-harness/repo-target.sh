@@ -126,17 +126,24 @@ repo_target_valid_slug() {
 
 # repo_target_assert <label> <worktree> <target-slug> <target-dir>
 #   Prints EXACTLY ONE line — the per-dispatch record an operator greps:
-#     [repo-target] <label> result=OK|REFUSED repo=<slug> worktree=<dir> target=<slug> \
+#     [repo-target] <label> check=ok|result=REFUSED repo=<slug> worktree=<dir> target=<slug> \
 #                   target_dir=<dir> reason=<token> — <human sentence when REFUSED>
+#   ⛔ The PASS arm says `check=ok`, NOT `result=OK` (agent-infra#2935). This assertion runs
+#   BEFORE the lane does any work, so `result=OK` on this line is a success signal that cannot
+#   fail: a dispatcher greps it, reads "the lane is OK", and never learns the lane hung. A
+#   pre-flight line must claim only what it measured — that the identity CHECK passed. `result=`
+#   is reserved for lines emitted once an outcome is known, so a dispatch with no `result=` line
+#   anywhere reads as "no outcome yet", which is the truth. A test reddens if `result=` returns
+#   to this arm (repo-target.test.sh, "a pre-flight line must not claim a result").
 #   rc 0 = the worktree IS the target; REPO_TARGET_REFUSED (72) = refuse to start anything.
 # Either <target-slug> or <target-dir> (or both) must be named. <target-slug> wins when both are
 # given; <target-dir> then supplies the identity comparison as well.
 #   `reason=` tokens: no-target, target-invalid, target-unreadable, target-dir-unreadable, target-self,
 #   worktree-missing, worktree-not-a-repo, worktree-origin-unreadable, slug-mismatch, dir-mismatch.
-#   A lane can emit the identity line `result=OK` and then a `result=REFUSED reason=target-underivable`
+#   A passing lane emits the identity line and may then emit a `result=REFUSED reason=target-underivable`
 #   line (the `--repo-dir`-only path had no slug to record yet): operators read the LAST `result=`
 #   line for a dispatch, never `head -1` — see `repo_target_refuse` below, the one producer of that
-#   second line.
+#   second line. A lane that emits NO `result=` line did not report an outcome.
 repo_target_assert() {
   local label="${1:-dispatch}" wt="${2:-}" want="${3:-}" wantdir="${4:-}"
   local slug="" wdir="" cw="" cwant="" wreal="" wantreal="" want_derived=0 reason="" human="" result="REFUSED"
@@ -217,7 +224,7 @@ repo_target_assert() {
 
   [ -z "$reason" ] && result="OK"
   if [ "$result" = "OK" ]; then
-    printf '[repo-target] %s result=OK repo=%s worktree=%s target=%s target_dir=%s\n' \
+    printf '[repo-target] %s check=ok repo=%s worktree=%s target=%s target_dir=%s\n' \
       "$label" "$slug" "${wdir:-$wt}" "$want" "${wantdir:-}"
     return 0
   fi
@@ -266,7 +273,7 @@ repo_target_branch_assert() {
   fi
 
   if [ -z "$reason" ]; then
-    printf '[repo-target] %s branch=%s result=OK repo=%s worktree=%s\n' "$label" "$br" "${slug:-UNREADABLE}" "$wt"
+    printf '[repo-target] %s branch=%s check=ok repo=%s worktree=%s\n' "$label" "$br" "${slug:-UNREADABLE}" "$wt"
     return 0
   fi
   printf '[repo-target] %s branch=%s result=REFUSED repo=%s worktree=%s reason=%s — REFUSED: %s\n' \

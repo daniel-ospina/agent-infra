@@ -1007,6 +1007,63 @@ if [ -s "$TMP/sum.sh" ] && grep -q 'PR path:' "$TMP/sum.sh"; then
   grep -q 'NO UNIT SPAWNED this cycle — 1 row(s) with a named reason' "$TMP/s.log" \
     && ok "an idle cycle: NO UNIT SPAWNED, with the wait count and the dominant reason" \
     || bad "the idle summary does not name the state: $(cat "$TMP/s.log")"
+  # ⛔ THE DEFERRED MAJORITY MUST NOT ANSWER FOR THE SAMPLE (agent-infra#2933). MEASURED 2026-10-27 on
+  # the tortoise target: 26 PRs open, K=8 examined per cycle, and the line printed `most common: 15
+  # outside this cycle's sweep window`. That "reason" is computed across ALL rows, so it names a fact
+  # about the rows the sweep did NOT read — the deferred rows always outnumber the window, so the modal
+  # reason was always the deferral and the examined rows' own reasons were NEVER printed. An operator
+  # could not tell "everything examined is legitimately waiting" from "the rows the sweep read are being
+  # refused by something broken". Below, every examined row waits for a DIFFERENT reason: each of them
+  # must be printed, the deferred reason must appear nowhere as a reason, and the two counts must be
+  # separate clauses. The window is the shipped `SWEEP_WINDOW_PR`/`SWEEP_WIN_NOTE` shape, so this drives
+  # the SAME predicate the sweep uses to decide what it read (never a second, drifting definition).
+  _wdef="outside this cycle's sweep window (window=11-16 of 24 (K=6/cycle, rotating)); it is read within 4 cycles"
+  _wled="$(printf '11\tabc\tGREEN\twait\tcapacity: fix-lane ceiling 2 reached or the spawn gate refused\n12\tabc\tGREEN\twait\tcapacity: fix-lane ceiling 4 reached or the spawn gate refused\n13\tabc\tGREEN\twait\ta worker already owns this PR\n14\tabc\tGREEN\twait\tcheck surface in flight — nothing spawned\n15\tabc\tGREEN\twait\tcheck surface READ-FAILED:NOCHECKS — nothing spawned\n16\tabc\tGREEN\twait\tparked at this head — needs a human')"$'\n'
+  # ⛔ `$(printf …)` STRIPS THE TRAILING NEWLINE, so appending substitutions row by row would FUSE the
+  # deferred rows into a narrower ledger (measured while writing this: 24 rows became 6) and the test
+  # would then "prove" the sample/deferral split on a population that has no deferred rows at all.
+  for _i in 1 2 3 4 5 6 7 8 9 10 17 18 19 20 21 22 23 24; do
+    _wled="$_wled$(printf '%s\tabc\t-\twait\t%s' "$_i" "$_wdef")"$'\n'
+  done
+  # A SUBSHELL, so the window cannot leak into the cases above or below (they must keep driving the
+  # no-window and unwritable paths).
+  ( SWEEP_WINDOW_PR=" 11  12  13  14  15  16 "; SWEEP_WIN_NOTE="window=11-16 of 24 (K=6/cycle, rotating)"; \
+    SEL_N=24; SWEEP_ROWS_PER_CYCLE=6; summarise "$_wled" 1 open-rows 12 )
+  _wl="$(grep '^\[pr\] PR path' "$TMP/s.log" 2>/dev/null)"
+  case "$_wl" in
+    *"examined 6 (window 11-16 of 24 (K=6/cycle, rotating))"*"18 deferred or scope-excluded this cycle"*)
+      ok "a bounded sweep: the EXAMINED count and the deferred count are separate clauses (#2933)" ;;
+    *) bad "the summary did not separate the examined sample from the deferred rows: $_wl" ;;
+  esac
+  _wmiss=""
+  for _wlbl in "2 capacity: fix-lane ceiling N reached or the spawn gate refused" \
+               "1 a worker already owns this PR" "1 check surface in flight" \
+               "1 check surface READ-FAILED:NOCHECKS" "1 parked at this head"; do
+    case "$_wl" in *"$_wlbl"*) ;; *) _wmiss="$_wmiss [$_wlbl]" ;; esac
+  done
+  [ -z "$_wmiss" ] && ok "…EVERY examined row's own reason is printed, not the modal deferred one" \
+                   || bad "the summary hid examined reason(s):$_wmiss"
+  case "$_wl" in
+    *"most common"*|*"outside this cycle's sweep window"*)
+      bad "…the deferred rows' reason is still being reported as THE reason (#2933)" ;;
+    *) ok "…and no deferred row's reason is printed as a reason" ;;
+  esac
+  # ⛔ ONE LINE, AND `spawned=N` STILL NAMED — the contract the old line had, kept.
+  if [ "$(grep -c '^\[pr\] PR path' "$TMP/s.log" 2>/dev/null)" = "1" ]; then
+    case "$_wl" in *"spawned="*) ok "…still exactly ONE \[pr\] line per cycle, still naming spawned=N" ;;
+      *) bad "the [pr] line lost its spawned= clause: $_wl" ;; esac
+  else
+    bad "an idle cycle printed $(grep -c '^\[pr\] PR path' "$TMP/s.log" 2>/dev/null) [pr] lines, not one"
+  fi
+  # ⛔ AND A CYCLE WITH NO WINDOW AT ALL IS NOT "EXAMINED 0". When nothing was selected to read (a
+  # deferral, a failed listing, a cache-less 304) the only honest population IS every row — reporting
+  # "examined 0" there would hide the very reasons the line exists to print, and going silent is the
+  # defect this line already fixed once.
+  summarise "$(printf '11\tabc\t-\twait\tno per-PR read this cycle (the open-PR listing was unchanged — 304 — or unreadable)\n12\tabc\t-\twait\tno per-PR read this cycle (the open-PR listing was unchanged — 304 — or unreadable)\n')" 1 open-rows 23
+  grep -q 'NO SWEEP WINDOW this cycle' "$TMP/s.log" \
+    && grep -q '2 no per-PR read this cycle' "$TMP/s.log" \
+    && ok "no window at all: the reasons are for every row, never 'examined 0' and never silent" \
+    || bad "a window-less cycle did not report its rows' reasons: $(cat "$TMP/s.log")"
   # ⛔ THE FORWARD CLAIM (review P2): the old wording asserted "issues stay CLOSED" from a block that
   # cannot know — all-counted-parked legitimately opens the gate. It must not come back.
   grep -qi 'issues stay CLOSED' "$TMP/s.log" \
