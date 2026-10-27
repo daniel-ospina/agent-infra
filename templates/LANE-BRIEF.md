@@ -170,6 +170,18 @@ flag does either.
    scripts/admin-merge.sh <PR>
    ```
 
+   ⛔ **NOT INSIDE A BLOCKING TOOL CALL.** Your tool call is capped at 1800s while the rail's own
+   wait ceiling is 18064s, so a HEALTHY rail still waiting on CI gets SIGTERMed mid-wait and reports
+   NO verdict (agent-infra#2885: PR #2873 was cut off at 23:10:47Z and merged 4h45m later). Start it
+   detached and poll instead:
+
+   ```bash
+   bash scripts/rail-run.sh start  <PR> [rail args...]   # returns at once, prints the run id + log
+   bash scripts/rail-run.sh status <PR> [--repo owner/repo] --run <run-id>
+   ```
+   `status` exits 10 running · 0 landed · 20 refused · 21 killed · 22 gone-without-verdict — a run
+   that produced NO verdict is never reported as a landing. See `docs/ops/rail-run.md`.
+
    ⛔ **The ONE-COMMAND alternative to steps 1-3.** If you would otherwise assemble a reviewer prompt
    by hand, do not: `~/.pi/agent/scripts/review-pr.sh <PR>` spawns a genuinely fresh-context
    reviewer over the PR's CURRENT head, posts its findings as the PR comment step 3 names, and —
