@@ -324,9 +324,9 @@ reclaim steps below touch it.
    harness pin, `orchestrator/logs` + `orchestrator/state` (`merge-*.log`, `orch-loop.log`, the `state/` series), **the
    `orchestrator/*.txt` ledgers that sit directly under it** — `dispatched.txt`, `landed.txt`, `checked.txt`,
    `candidates.txt`: `install.sh:649-650` puts them BESIDE `logs/` and `state/` and `wip/`, not inside them — `:650`
-   creates `candidates.txt`, `dispatched.txt` and `checked.txt`, and `landed.txt` arrives with the first
-   `refresh-candidates.sh` pass (`:2951`) — so a check that reads only `state/` and `logs/` misses the queue and landing
-   ledgers — and **`orchestrator/wip/`**, the cap-killed lanes' dirty-work captures.
+   creates `candidates.txt`, `dispatched.txt` and `checked.txt`, and `install.sh` never creates `landed.txt`: that one
+   arrives from `refresh-candidates.sh` (`:2951`), on any pass that gets that far — so a check that reads only `state/`
+   and `logs/` misses the queue and landing ledgers — and **`orchestrator/wip/`**, the cap-killed lanes' dirty-work captures.
 
 ## 4. Liveness of a LANE, and the reaping rule
 
