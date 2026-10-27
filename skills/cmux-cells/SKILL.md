@@ -16,9 +16,11 @@ updated: 2026-10-27
 
 # Operating the cmux cloud cells
 
-The fleet runs on the macOS laptop (launchd) plus the Linux cells (cell-1 `pi-lane-1`, cell-2 `pi-cell-2`, cell-3
-`pi-cell-3`, cell-4). Cells are Linux, so **any harness change must work on both platforms** — one source of truth with a
-platform branch, never two drifting copies.
+The fleet runs on the macOS laptop (launchd) plus the Linux cells the provider currently allocates — `cmux vm ls` on
+2026-10-27 showed **three**: `pi-cell-1`, `pi-cell-3`, `pi-cell-4`. (An older `pi-lane-1` label survives in
+`docs/ops/ACTIVATION-MATRIX.md` and there is **no cell-2 today**, so treat any inventory — including this one — as a
+reading: re-run `cmux vm ls` before acting on it.) Cells are Linux, so **any harness change must work on both platforms** —
+one source of truth with a platform branch, never two drifting copies.
 
 Canonical harness home: **`agent-infra/scripts/orchestrator-harness/`**. `tortoise/operations/orchestrator-harness/` and
 `~/orchestrator/` are historic forks; treat agent-infra as the authority.
@@ -59,18 +61,18 @@ git -C /tmp/cell-ai rev-parse --short HEAD    # the version, not the claim
 
 A cell is "on main" only if `git -C /tmp/cell-ai rev-list --count HEAD..origin/main` is **0**.
 
-## 2. Capacity is RAM and DISK, never CPU
+## 2. Capacity is RAM and DISK — load is a distant third
 
 ⛔ **Corrected 2026-10-27 — the numbers below used to REFUSE healthy dispatches.** Read them before
 quoting any ceiling:
 
 | resource | cost (measured) | note |
 |---|---|---|
-| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.2–0.5 GB** whole tree — a bare `pi` alone reaches ~0.28 GB | RSS summed over each process tree, 15 lanes, cell-4, 2026-10-27 |
+| **analysis / doc lane** (`pi` tree: wrapper + pi + bash) | **0.06–0.5 GB** whole tree (a bare `pi` alone reaches ~0.28 GB) | RSS summed over each process tree, 14–15 lanes, cell-4, 2026-10-27 |
 | **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | containers 21–149 MB each (`docker stats --no-stream`, cells 3–4, 2026-10-27); the scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
-| worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | re-derived in agent-infra#2721. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — both figures are right about different quantities |
-| CPU | load 4.3 with 23 lanes | **never the limit** |
+| worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
+| CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
 
 The old row read "`pi` process ~0.6–1 GB RSS per lane". Measured, that is a **test-running peak**; an idle
 lane's whole tree is ~0.2 GB. The old arithmetic applied that peak to EVERY lane and then stacked a flat
@@ -135,8 +137,8 @@ uses `LANE_MEM_MB` (default **512**) against `MEM_BUDGET_PCT` (default **75**) o
 scheduler 512, planning ~1000 for a test-running lane (the table above) — and this file deliberately uses the larger.
 Reconcile against `docs/ops/ai-drainer.md` before raising either. Where the gate speaks, the gate is right.
 
-`MAX_LANES` is **derived** (`2.5 × cores`) and enforced by the controller — but it knows neither disk nor RAM, so it is an
-upper bound, never the answer (§7).
+`MAX_LANES` is **derived** (`2.5 × cores`) and enforced by the controller — but it is an integer: it knows neither disk nor
+RAM, so it is an upper bound, never the answer (§7).
 
 ⛔ **DO NOT RE-INVENT THE CAPACITY GATE — `scripts/orchestrator-harness/spawn-gate.sh` ALREADY IS IT** (checked
 2026-10-27). It derives `MAX_LOAD` from `nproc × 10` when unset, refuses on a non-empty disk band (`disk_free_mb` vs
@@ -188,7 +190,9 @@ Recovery ladder, cheapest first:
 
 ## 4. Liveness of a LANE, and the reaping rule
 
-A lane's log **mtime** is the only reliable activity signal. Size alone is not, and a spinner is not.
+A lane's log **mtime** is the strongest *transcript-derived* signal a cell lane has — cells run `pi -p --no-session`, so
+there is no `.jsonl` to read. It is **necessary, not sufficient**: pair it with the box's OOM count and a CPU delta (the
+reaping gate below uses both). Size alone is not a signal, and a spinner is not.
 
 - **0-byte lane log** = the lane could not start (usually disk full). It reads as "quiet", not broken — always check.
 - A dead lane and a thinking lane are indistinguishable in every instrument except log mtime.
@@ -202,7 +206,8 @@ Reap only when **all three** hold (prose → code: agent-infra#1244, #2163):
 ⛔ **Never treat "no log found" as "stale."** A first dry run flagged 69 lanes and would have killed a 7-minute-old lane,
 because the worktree slug parsed from shell text (`ciwatch\012[`) matched nothing. An absent artefact fails closed.
 
-Also: `ps -eo command | grep -c 'pi --model'` counts **wrapper shells**, not `pi`. 76 counted, 14 actually working.
+Also: `ps -eo command | grep -c 'pi --model'` misses the harness's own launch form entirely (`--provider … --model …`):
+measured on cell-4, **0 hits while 16 `pi` were live**. A low count is not a quiet box, and a high one is not lanes.
 
 ## 5. Dispatching a lane
 
@@ -223,7 +228,7 @@ brief cannot either; only a `.sh` under `scripts/` can. The hazard is copy-paste
 ```bash
 tmux new-session -d -s <slug> \
   "HOME=/tmp/cell-home bash -lc 'cd <worktree>; . /tmp/cell-home/keys.env; \
-   nohup pi --model deepseek/deepseek-v4-flash --provider deepseek -p \"\$(cat <brief>)\" > /tmp/cell-home/L-<slug>.log 2>&1 < /dev/null'"
+   nohup pi --provider deepseek --model deepseek-flash -p \"\$(cat <brief>)\" > /tmp/cell-home/L-<slug>.log 2>&1 < /dev/null'"
 ```
 
 Measured 2026-10-19: driving the cells this way is how 23 lanes landed on one box (8 cores, **32 GB**) and the kernel
@@ -281,16 +286,19 @@ bash scripts/admin-merge.sh <pr>                                                
 
 | box | role | shape |
 |---|---|---|
-| cell-2 | **agent-infra / harness** | landers + harness fixes; disk-bound |
-| cell-1, cell-3 | **tortoise / product** | P0/P1 product work; disk-bound on cell-1, **memory-bound** on cell-3 (8 GB, 2 OOM kills measured 2026-10-27) |
+| `pi-cell-1` | product work | 16 GB RAM / 128 GB disk — roomiest measured 2026-10-27, but **needs activation (§1)** before it can land |
+| `pi-cell-3` | product work | 8 GB / 128 GB — tight on **both** (2 OOM kills; disk 112/128 GB, measured 2026-10-27) |
+| `pi-cell-4` | product + CI-cost work | 16 GB, 8 vCPU; the current default dispatch target |
 | laptop | product + orchestration | the only box that can reach every channel; do not overfill it |
 
 ⛔ **TWO DIFFERENT CEILINGS — DO NOT CONFUSE THEM, AND DO NOT TREAT EITHER AS THE WHOLE ANSWER.** The owner ruled on
 2026-10-17 (`docs/ops/fleet-capacity.md`) that **between boxes** dispatch is gated on capacity, not a lane count — that is
 `cap_place`, and the objection is to a count standing in for capacity **across a fleet**. **Inside one box there IS a real
 ceiling**: `MAX_LANES`, derived as **2.5 × cores** (`orch-loop.sh`: `10#$_NCPU * 5 / 2`, rendered into the launchd plist),
-and the controller refuses at `lanes >= MAX_LANES` (`GATE_WHY=lanes=N>=max_lanes=M`). It is real — and it knows **neither
-disk nor RAM**, so it is an upper bound, never the answer. The binding constraint is **free disk vs one lane's
+and the controller refuses at `lanes >= MAX_LANES` (`GATE_WHY=lanes=N>=max_lanes=M`). It is real — and the *number* knows
+**neither disk nor RAM**. The controller's own refusals (`mem_avail <= MIN_MEM_FREE_MB`, default 512; the swap gate, which
+arms only when RAM is tight; and the load gate) sit in the same `GATE_WHY` chain — but they are floors and gates, **not a
+per-lane budget**, so `MAX_LANES` remains an upper bound rather than the answer. The binding constraint is **free disk vs one lane's
 `tree + reserve`** (§2), then free RAM against the per-lane peak, then load. So this table names a box's ROLE, never a
 number of lanes.
 
