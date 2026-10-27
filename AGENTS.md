@@ -386,7 +386,10 @@ the rail unconditionally, so the landing path is the audited `AGENT_ADMIN_MERGE_
 `admin_merge_override` and *bypasses* the certificate instead of faking one. It must be in the AGENT's
 environment before it starts — the gate reads the agent process, not the shell, so exporting it inside a
 tool call does nothing. A session that cannot set it, and reaches the raw client instead, **says so in the
-PR and does not claim an audit it did not get** (tortoise#10184 did exactly that, and corrected itself).
+PR and does not claim an audit it did not get**. tortoise#10184's first record of its own merge *did* claim
+the audited override it never got, so the sentence is written from the failure: a fresh reviewer falsified
+it, and the correction is on the PR (comment `6456167700`) — the disclosure is owed *before* someone else
+finds it, which is the only version of this rule worth having.
 This is bounded hard, and a lane that reads it as a general licence has read it wrong:
 
 - **Review evidence stays mandatory and HEAD-BOUND.** The substitute replaces a *lane*, never the review
