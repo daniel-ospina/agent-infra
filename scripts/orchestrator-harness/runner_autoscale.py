@@ -584,36 +584,138 @@ def registration_token(repo: str) -> str:
     return token
 
 
+# ⛔ THE LOCAL STATE THAT MAKES `--replace` IMPOSSIBLE (fix 2, measured on cell 4). `config.sh`
+# decides `--replace` is meaningless when its OWN config files are still on disk, and answers
+# "Cannot configure the runner because it is already configured. To reconfigure the runner, run
+# './config.sh remove' first." — so a runner whose registration was deleted SERVER-SIDE (the exact
+# case `--replace` exists for: "Failed to create a session. The runner registration has been deleted
+# from the server") could never be repaired by this tool. These are the three files `config.sh`
+# honours; clearing them is the LOCAL half of a re-registration and needs no server authority.
+_LOCAL_CONFIG_FILES = (".runner", ".credentials", ".credentials_rsaparams")
+_ALREADY_CONFIGURED = "already configured"
+
+
+def _clear_local_config(directory: Path) -> dict[str, tuple[int, bytes]]:
+    """Remove the runner's local config, returning (MODE, bytes) so a FAILED re-registration can put
+    it back exactly as it was.
+
+    ⛔ Safe only where it is called from: `register()` is reached for DEAD and ORPHANED installs
+    only — the classifier never repairs a BUSY, SERVING or OTHER-REPO runner — so nothing that may
+    be serving a job loses its credentials.
+    ⛔ And it is STASHED, not just deleted: if the re-registration then fails (no network, a spent
+    token), the install would otherwise lose its `.runner`, become invisible to `discover()` — which
+    requires it — and look FREE to the provisioner, which sends the next pass down the "fresh
+    install" path instead of retrying the same repair.
+    ⛔ THE MODE IS STASHED TOO. `.credentials_rsaparams` is the runner's RSA PRIVATE key and
+    `config.sh` writes both credential files 0600; restoring with a plain `write_bytes` would
+    recreate them 0644 (world-readable) on a shared cell — a silent privilege widening on exactly
+    the failure leg this function exists to make safe. Measured by the suite (T5).
+    ⛔ A CLEAR THAT FAILS PARTWAY RESTORES WHAT IT ALREADY TOOK. Unlinking is sequential, so an
+    `OSError` on a later file (EACCES on a 000 `.credentials`, say) must not leave the install
+    half-cleared — that is the same "install vanishes" state, reached from inside the guard.
+    """
+    stash: dict[str, tuple[int, bytes]] = {}
+    try:
+        for name in _LOCAL_CONFIG_FILES:
+            path = Path(directory) / name
+            if path.exists():
+                stash[name] = (path.stat().st_mode & 0o777, path.read_bytes())
+                path.unlink()
+    except OSError as exc:
+        _restore_local_config(directory, stash)
+        raise ActionFailed(f"cannot clear {directory}/{name} for re-registration ({exc})") from exc
+    return stash
+
+
+def _restore_local_config(directory: Path, stash: dict[str, tuple[int, bytes]]) -> None:
+    """Put the stashed local config back, AT ITS ORIGINAL MODE, in one atomic creation.
+
+    ⛔ `os.open(..., mode)` RATHER THAN `write_bytes` + `chmod`. Written the naive way the file is
+    created 0644 under the usual umask and only then narrowed, so (a) `.credentials_rsaparams` — the
+    runner's RSA PRIVATE KEY — is world-readable for a window, and (b) if the `chmod` fails (EROFS, a
+    foreign-owned mount) the swallowed error leaves it 0644 FOR EVER, silently. Creating it with the
+    mode means there is no window and no second failure mode; `os.fchmod` keeps ANY stashed mode
+    exact rather than trusting the umask.
+    """
+    for name, (mode, data) in stash.items():
+        path = Path(directory) / name
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            try:
+                os.fchmod(fd, mode)
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass  # best effort: the raise that follows already names the real failure
+
+
+def _config_argv(cfg: Path, repo: str, token: str, name: str, labels: str, replace: bool):
+    return [
+        str(cfg),
+        "--unattended",
+        "--url",
+        f"https://github.com/{repo}",
+        "--token",
+        token,
+        "--name",
+        name,
+        "--labels",
+        labels,
+        "--work",
+        "_work",
+        *(["--replace"] if replace else []),
+    ]
+
+
 def register(directory: Path, name: str, repo: str, labels: str, replace: bool) -> str:
     """Register or RE-register an EXISTING install (`<dir>/config.sh`) and enable its unit.
 
     `--replace` is what makes an orphaned name reusable: the stale registration is adopted
     instead of a duplicate being created. `--unattended` is what makes it safe from a timer.
+
+    ⛔ THE REPAIR PATH MUST BE ABLE TO REPAIR (measured on cell 4). With a registration deleted
+    server-side, `--replace` was refused by the runner's own `config.sh` — "already configured" —
+    because THIS TOOL never cleared the local `.runner`/`.credentials`. So the one case the repair
+    exists for was the one it could not recover, on every pass, for ever. Two steps close it:
+    clear the local config BEFORE configuring, and if a `config.sh` still refuses that way, clear
+    again and retry ONCE with a fresh token (a refusal can leave `.runner` behind, and the first
+    token may be spent by the attempt).
     """
     cfg = Path(os.environ.get("RUNNER_AUTOSCALE_CONFIG_SH") or (directory / "config.sh"))
     if not cfg.exists():
         raise ActionFailed(f"{cfg} does not exist — {directory} is not a runner install")
-    token = registration_token(repo)
-    rc, out = _run(
-        [
-            str(cfg),
-            "--unattended",
-            "--url",
-            f"https://github.com/{repo}",
-            "--token",
-            token,
-            "--name",
-            name,
-            "--labels",
-            labels,
-            "--work",
-            "_work",
-            *(["--replace"] if replace else []),
-        ],
-        timeout=600,
-    )
-    if rc != 0:
-        raise ActionFailed(f"config.sh for {name} rc={rc}: {out[-400:]}")
+    stash = _clear_local_config(directory) if replace else {}
+    # ⛔ THE CLEARED REGION IS EXCEPTION-SAFE (fix 2, round 2). `registration_token()` is evaluated
+    # INSIDE this block, and it raises `ActionFailed` on any gh failure — a routine transient for a
+    # tool that runs every few minutes. Restoring only on `rc != 0` left that raise to drop the stash,
+    # so a failed token mint DESTROYED the install's `.runner` and its RSA key, `discover()` stopped
+    # seeing it, its slot read FREE to the provisioner, and the same pass added a SECOND install over
+    # the top (measured on the fixture: the directory kept `config.sh` alone and `--count 1` ran).
+    # `registered` is set BEFORE `enable_unit`, so a unit failure still never writes the stale stash
+    # back over the fresh config a successful re-registration just wrote.
+    registered = False
+    try:
+        rc, out = _run(
+            _config_argv(cfg, repo, registration_token(repo), name, labels, replace), timeout=600
+        )
+        if rc != 0 and _ALREADY_CONFIGURED in out.lower():
+            # ⛔ The retry's stash is MERGED, not discarded: a refused configure can leave `.runner`
+            # behind, and if the retry's clear takes it the restore below must still be able to put
+            # the install back. (Today `register()` is only called with `replace=True`, so the first
+            # stash is always present — this keeps that true if a caller ever passes False.)
+            for fname, entry in _clear_local_config(directory).items():
+                stash.setdefault(fname, entry)
+            rc, out = _run(
+                _config_argv(cfg, repo, registration_token(repo), name, labels, replace),
+                timeout=600,
+            )
+        if rc != 0:
+            raise ActionFailed(f"config.sh for {name} rc={rc}: {out[-400:]}")
+        registered = True
+    finally:
+        if not registered:
+            _restore_local_config(directory, stash)
     # ⛔ A REGISTERED RUNNER WITH NO ENABLED UNIT IS NOT LIVE. Configuring the unit used to be
     # best-effort, so a `svc.sh install` / `systemctl enable` failure still returned "registered",
     # the caller counted it as live and reported `converged` while no listener would ever start —

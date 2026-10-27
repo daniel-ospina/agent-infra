@@ -21,6 +21,20 @@ below grows with the suite, so this header never claims a case that does not exi
      never written twice, and NOT baked in when the floor is satisfiable), T3 (DEAD re-registration
      ⇒ floor unions over the preserved custom label).
 
+  2. THE REPAIR PATH THAT COULD NOT REPAIR (measured on cell 4). A runner whose registration was
+     deleted server-side ("Failed to create a session. The runner registration has been deleted from
+     the server") gets `--replace`, and `config.sh` answers "Cannot configure the runner because it
+     is already configured. To reconfigure the runner, run './config.sh remove' first." — because the
+     tool never cleared the LOCAL `.runner`/`.credentials`. The one case the repair exists for was
+     the one it could not recover, on every pass, for ever.
+     Cases: T4 (a `config.sh` that refuses "already configured" once then succeeds ⇒ the local config
+     was CLEARED before the first attempt and the runner ends REGISTERED), T5 (a repair that FAILS
+     restores the install — `.runner` back so `discover()` still finds it, and the credential pair
+     still 0600, because `.credentials_rsaparams` is the RSA private key — plus a clear that fails
+     PARTWAY restoring what it already took), T6 (a RAISE between the clear and the rc check, i.e. a
+     failed token mint, must restore too: two review rounds found that hole and its two
+     privilege-widening companions, and every one of them is a mutation here).
+
 ⛔ HERMETIC, BY CONSTRUCTION. Every measurement is a fixture: `meminfo` is a file, the installs are
 directories, and `gh` / `systemctl` / `config.sh` / the provisioner are STUBS on the seams the tool
 already declares. No network, no root, no live cell, no real runner, no `ps`, no `du`, no `df`. A
@@ -117,6 +131,9 @@ args="$*"
 is() { case "$args" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 
 if is /registration-token; then
+  # A mint that FAILS is the routine transient the repair path must survive: `registration_token()`
+  # raises, and it does so AFTER the local config has been cleared.
+  [ -f "$FIX/token.fail" ] && { echo "gh: HTTP 401: Bad credentials (fixture)" >&2; exit 1; }
   printf 'tok-fixture\n'; exit 0
 fi
 if is 'actions/runs?status=queued'; then
@@ -293,6 +310,14 @@ class Box:
         """config.sh answers the MEASURED 'already configured' refusal for its first N calls."""
         self._write(os.path.join(self.dir, "config.refusals"), f"{n}\n")
 
+    def token_fails(self, yes=True):
+        """Make the registration-token mint fail (a 401): the raise lands AFTER the local clear."""
+        path = os.path.join(self.dir, "token.fail")
+        if yes:
+            self._write(path, "1\n")
+        elif os.path.exists(path):
+            os.unlink(path)
+
     # ── reading the fixture ──
     def calls(self, log) -> list[str]:
         path = os.path.join(self.dir, log)
@@ -465,6 +490,163 @@ def t3_floor_unions_over_preserved():
             box.destroy()
 
 
+@test("T4 repair: 'already configured' is cleared before the attempt, and the runner ends REGISTERED")
+def t4_repair_recovers_from_already_configured():
+    """THE MEASURED CELL-4 DEFECT. A registration deleted server-side gets `--replace`, and the
+    runner's own `config.sh` refuses: "Cannot configure the runner because it is already configured.
+    To reconfigure the runner, run './config.sh remove' first." With the local config never cleared,
+    the repair could not repair — so BOTH halves are pinned here: the local config is gone BEFORE the
+    first attempt (`local_runner=absent`), and a `config.sh` that still refuses is retried once and
+    the runner ends registered."""
+    with Env():
+        box = Box("repair")
+        try:
+            box.install("gh-runner-x64", "r-dead")
+            # In the pool, offline, carrying the fallback label so THIS case measures the repair
+            # path alone (the floor is satisfied and cannot be what did the work).
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            box.refusals(1)  # the FIRST configure answers the measured refusal, the second works
+            record = converge(box, want=0)
+
+            calls = box.calls("config-calls.log")
+            argv_calls = [c for c in calls if "argv=" in c]
+            check(len(argv_calls) == 2, f"expected a refusal then a retry, got {argv_calls}")
+            check(
+                "call 1 local_runner=absent" in calls,
+                "the local config must be CLEARED before the first attempt — with it present the "
+                f"real config.sh refuses exactly as measured. calls={calls}",
+            )
+            runner_cfg = os.path.join(box.installs["gh-runner-x64"], ".runner")
+            check(os.path.exists(runner_cfg), "the retry must leave the install REGISTERED (.runner)")
+            with open(runner_cfg, encoding="utf-8") as fh:
+                check(json.load(fh).get("agentName") == "r-dead", "the retry must rewrite .runner")
+            check(not record["problems"], f"the repair must not report a failure: {record['problems']}")
+            check(
+                any(a.startswith("registered r-dead") for a in record["actions"]),
+                f"the record must say the runner was re-registered: {record['actions']}",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T5 repair fails closed: a failed re-registration RESTORES the install, at its original mode")
+def t5_failed_repair_restores_the_install():
+    """The failure leg of fix 2, which the first version of the fix got WRONG in two ways, both
+    measured on the fixture before they were fixed:
+      * it restored `.credentials`/`.credentials_rsaparams` with a plain write, i.e. 0644 — and
+        `.credentials_rsaparams` is the runner's RSA PRIVATE KEY, which `config.sh` writes 0600. A
+        shared cell would have been left with a world-readable runner identity;
+      * a clear that failed PARTWAY (EACCES on `.credentials`) left the install without `.runner`,
+        so `discover()` no longer saw it and its slot read FREE to the provisioner — the very
+        "install vanishes" state the stash exists to prevent.
+    Both are pinned here, because both are silent."""
+    with Env():
+        box = Box("repair-fail")
+        try:
+            path = box.install("gh-runner-x64", "r-dead")
+            for name in (".credentials", ".credentials_rsaparams"):
+                os.chmod(os.path.join(path, name), 0o600)
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            box.refusals(5)  # EVERY attempt refuses: the failure leg
+            record = converge(box, want=0)
+
+            check(record["problems"], f"a failed repair must be recorded: {record}")
+            check(
+                any("already configured" in p.lower() for p in record["problems"]),
+                f"the record must quote config.sh's own words: {record['problems']}",
+            )
+            check(
+                os.path.exists(os.path.join(path, ".runner")),
+                "the failed repair must put `.runner` BACK — without it the install is invisible to "
+                "discover() and its slot reads FREE to the provisioner",
+            )
+            modes = {n: oct(os.stat(os.path.join(path, n)).st_mode & 0o777)
+                     for n in (".credentials", ".credentials_rsaparams")}
+            check(
+                modes == {".credentials": "0o600", ".credentials_rsaparams": "0o600"},
+                f"the restore must preserve 0600 on the credential pair (RSA key), got {modes}",
+            )
+            check(
+                [r.name for r in ra.discover(box.root)] == ["r-dead"],
+                "the install must still be DISCOVERED after a failed repair",
+            )
+
+            # …and a clear that fails PARTWAY restores what it already took.
+            box2 = Box("repair-eacces")
+            try:
+                path2 = box2.install("gh-runner-x64", "r-dead")
+                box2.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+                box2.alive([])
+                # `.runner` is cleared FIRST, then this file is unreadable: exactly the partial state.
+                os.chmod(os.path.join(path2, ".credentials"), 0o000)
+                record2 = converge(box2, want=0)
+                check(record2["problems"], f"an unreadable local config must be recorded: {record2}")
+                check(
+                    any("cannot clear" in p for p in record2["problems"]),
+                    f"the record must name the clear that failed: {record2['problems']}",
+                )
+                check(
+                    os.path.exists(os.path.join(path2, ".runner")),
+                    "a PARTIAL clear must restore what it already removed, not leave a half-install",
+                )
+            finally:
+                os.chmod(os.path.join(path2, ".credentials"), 0o600)
+                box2.destroy()
+        finally:
+            box.destroy()
+
+
+@test("T6 repair raises safe: a FAILED token mint cannot destroy the install it just cleared")
+def t6_repair_is_exception_safe():
+    """THE HOLE ROUND 2 FOUND IN FIX 2. `registration_token()` is evaluated AFTER the local config was
+    cleared, and it raises on any gh failure — a routine transient for a pass that runs every few
+    minutes. Restoring only on `rc != 0` meant a failed mint left the install with NO `.runner` and NO
+    RSA key: `discover()` stopped seeing it, its slot read FREE to the provisioner (`[ ! -f .runner ]`
+    is the installer's own occupancy test) and the SAME pass installed a second runner over the top.
+    Measured on the fixture before the fix: the directory kept `config.sh` alone. This case pins the
+    restore for a RAISE, not just for a non-zero exit."""
+    with Env():
+        box = Box("repair-raise")
+        try:
+            path = box.install("gh-runner-x64", "r-dead")
+            for name in (".credentials", ".credentials_rsaparams"):
+                os.chmod(os.path.join(path, name), 0o600)
+            box.pool([("r-dead", "offline", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.alive([])
+            box.token_fails()
+            record = converge(box, want=0)
+
+            check(record["problems"], f"the failed mint must be recorded: {record}")
+            check(
+                any("registration token" in p for p in record["problems"]),
+                f"the record must name the token failure: {record['problems']}",
+            )
+            present = sorted(os.listdir(path))
+            for name in (".runner", ".credentials", ".credentials_rsaparams"):
+                check(name in present, f"{name} must be RESTORED after a raise; dir={present}")
+            modes = {
+                n: oct(os.stat(os.path.join(path, n)).st_mode & 0o777)
+                for n in (".credentials", ".credentials_rsaparams")
+            }
+            check(
+                set(modes.values()) == {"0o600"},
+                f"the restored credential pair must stay 0600 (RSA key), got {modes}",
+            )
+            check(
+                [r.name for r in ra.discover(box.root)] == ["r-dead"],
+                "the install must still be DISCOVERED — otherwise nothing retries the same repair",
+            )
+            check(
+                ra._next_free_slot(box.root) > 1,
+                "the install's slot must NOT read free to the provisioner: `[ ! -f .runner ]` is the "
+                "installer's own occupancy test, so a missing `.runner` invites a SECOND install",
+            )
+        finally:
+            box.destroy()
+
+
 # ── the mutation map ──────────────────────────────────────────────────────────────────────────
 class Mutation:
     def __init__(self, case_id, old, new, why):
@@ -492,6 +674,36 @@ MUTATIONS = [
         '            labels = resolve_labels(\n                pool, machine, notes=record["notes"], current=c["labels"]\n            )',
         '            labels = resolve_labels(\n                pool, machine, notes=record["notes"]\n            ) if not c["labels"] else _preserve_labels(c["labels"], machine)',
         "the PRE-FIX either/or: a DEAD runner preserves its labels and the floor is never reached",
+    ),
+    Mutation(
+        "T4",
+        '    stash = _clear_local_config(directory) if replace else {}',
+        '    stash: dict[str, bytes] = {}',
+        "the local config is never cleared before configuring (the refusal the repair cannot pass)",
+    ),
+    Mutation(
+        "T4",
+        '    if rc != 0 and _ALREADY_CONFIGURED in out.lower():',
+        '    if False:',
+        "there is no retry, so 'already configured' still ends the repair (the measured cell-4 state)",
+    ),
+    Mutation(
+        "T5",
+        '    except OSError as exc:\n        _restore_local_config(directory, stash)',
+        '    except OSError as exc:\n        pass',
+        "a clear that fails partway leaves the install half-cleared (no .runner: invisible, slot FREE)",
+    ),
+    Mutation(
+        "T6",
+        '    finally:\n        if not registered:\n            _restore_local_config(directory, stash)',
+        '    finally:\n        if not registered and "rc" in locals() and rc != 0:\n            _restore_local_config(directory, stash)',
+        "the restore is gated on the rc check, so a RAISE between the clear and the rc drops the stash",
+    ),
+    Mutation(
+        "T5",
+        '            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)\n            try:\n                os.fchmod(fd, mode)',
+        '            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)\n            try:\n                pass',
+        "the restore is written the NAIVE way (create 0644, no fchmod): the RSA key widens to 0644",
     ),
 ]
 
