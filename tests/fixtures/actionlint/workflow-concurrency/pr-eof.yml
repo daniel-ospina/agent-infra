@@ -1,0 +1,15 @@
+# A correct group whose value is a plain continuation as the LAST LINES OF THE FILE — `cancel-in-progress`
+# comes first, so `group:` is the final key and only the record flush can resolve it. Fixing the
+# fail-open direction must not turn this into a false red quoting `('')` (#2660 round 5).
+name: PR eof
+on:
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+concurrency:
+  cancel-in-progress: true
+  group:
+    pr-eof-${{ github.ref }}

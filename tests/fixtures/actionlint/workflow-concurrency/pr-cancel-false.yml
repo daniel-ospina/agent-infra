@@ -1,0 +1,13 @@
+# FAILURE-CLASS FIXTURE (R1): the right group, but cancellation off — the wasted work is exactly
+# the superseded head this is supposed to remove.
+name: pr-cancel-false
+on:
+  pull_request:
+concurrency:
+  group: pr-cancel-false-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

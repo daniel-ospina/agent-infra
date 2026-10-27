@@ -1,0 +1,9 @@
+# FAILURE-CLASS FIXTURE (R1, readability): the trigger is a flow MAPPING (`on: {pull_request: {}}`).
+# Also valid, also read by GitHub — the reader must resolve it rather than skip the file.
+name: pr-on-flow-map
+on: {pull_request: {}}
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

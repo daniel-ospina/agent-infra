@@ -1,0 +1,17 @@
+# A flow mapping written on the NEXT line under `concurrency:` matched neither the same-line flow
+# parser nor the block child reader, so the block read as "declared, no values" — and R2's absent-key
+# arm reads that as the non-cancelling default. A cancelling push workflow read GREEN (#2660 round 7).
+# NOTE on what pins the parse: removing the indented-flow parse arm does NOT silence this file (the
+# declared-but-unreadable guard then refuses it as R0); the GREEN-direction pin is
+# pr-concurrency-flow-child.yml, and the safe-direction pin is push-concurrency-flow-child-ok.yml.
+name: Push concurrency flow child
+on:
+  push:
+    branches: [main]
+concurrency:
+  {group: push-concurrency-flow-child, cancel-in-progress: true}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

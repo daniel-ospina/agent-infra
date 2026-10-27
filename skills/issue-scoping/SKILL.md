@@ -23,6 +23,8 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 > **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
+> **Scope of this skill under `task-workflow-standard` (agent-infra#2861).** That pipeline consumes **§Tier Scaling** (verifier counts/depth) **and this skill's diamond outputs as PLAN fields** (confirmed problem, alternatives considered, the falsification check) — but its `Phase 2.5 problem-verify`, `Phase 5.5 solution-verify` and every `Gate Loop — MANDATORY` below are **not dispatched** there, because `task-workflow-standard`'s merged PLAN-VERIFY is the one pre-code round. They remain mandatory for `epic-workflow`/`project-workflow`, which consume this skill directly. Read the mandates below with that exception attached — paying them twice is the cost the redesign removed.
+
 Multi-phase planning for **existing** GitHub issues. Uses the **double diamond** design framework with integrated verification:
 1. **problem-diverge** — explore alternative problem definitions, root causes, dependencies
 2. **problem-converge** — evaluate framings, pick best, confirm with evidence
@@ -532,24 +534,9 @@ Run the clarifying-questions skill with:
 
 Its `### Clarifications` block is embedded in the Phase 8 plan comment; its `### Deferred to Research` queue (Pass B — researchable questions with impact ≥ 6) seeds Phase 1.5 Sub-step B (issue #231 D6).
 
-### Label Management — Entry
+### Label Management — Entry — removed (agent-infra#2861 §8.2)
 
-```bash
-OWN_ING_LABEL="scoping"
-# Self-cleanup stale label
-if gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q "^${OWN_ING_LABEL}$"; then
-  gh issue edit $ISSUE_NUMBER --remove-label "$OWN_ING_LABEL" || true
-fi
-# Warn on OTHER in-progress labels
-OTHER_LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -E '^(scoping|planning|implementing)$' | grep -v "^${OWN_ING_LABEL}$" || true)
-if [ -n "$OTHER_LABELS" ]; then
-  echo "⚠️ Issue #$ISSUE_NUMBER has in-progress label(s): $OTHER_LABELS"
-  # Ask user: "Continue anyway?" If no → abort.
-fi
-# Apply own scoping label
-gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q '^scoping$' \
-  || gh issue edit $ISSUE_NUMBER --add-label scoping
-```
+The `scoping`/`planning`/`implementing` labels have no reader anywhere in the fleet (verified: the only occurrences were the writers), and their self-cleanup step removed the label **unconditionally** before checking who held the issue — i.e. it could strip a live peer lane's marker. Issue-level ownership is read by the pre-dispatch pre-flight from the fleet board's holder (`tools/collision_preflight.py`, #8175) and by `tools/who-is-on.sh <N> --repo .` (resolves through `$TORTOISE`). Do not re-add these labels.
 
 ### Step 1: Read Issue
 - Fetch with `gh issue view`
@@ -719,7 +706,7 @@ Consume the `### Deferred to Research` queue from `clarifying-questions` (Phase 
 ### Sub-step C — Persist
 
 1. Append timestamped, source-tagged findings to the research brief via `bash scripts/_research_append.sh --issue-body "$ISSUE_BODY" --issue-number $ISSUE_NUMBER --append "<text>" --source-tag <canonical|competitor|precedent|pitfalls|adversarial|question> --create` (create-if-missing; `**Research:**` backfill is best-effort).
-2. Stage `### Axis Research` (from Sub-steps A/B findings) for the Phase 8 post comment. `### Integration Docs` (deps + versions + API-surface findings) is **drafted at solution-converge (Phase 4/5)** from Codebase Explorer DEPENDENCIES (Phase 3) + Phase 1.5 findings; solution-verify (Phase 5.5) checks the draft; Phase 8 posts it. *(Disambiguation: `### Integration Docs` is distinct from the plan doc's `### Integration Surface Map` — different documents, different consumers; never merge or relocate.)*
+2. Stage `### Axis Research` (from Sub-steps A/B findings) for the Phase 8 post comment — **epic/project pipelines only**: under `task-workflow-standard` this is merged into the single `<!-- research: v1 -->` block and Phase 8 is not dispatched (agent-infra#2861). `### Integration Docs` (deps + versions + API-surface findings) is **drafted at solution-converge (Phase 4/5)** from Codebase Explorer DEPENDENCIES (Phase 3) + Phase 1.5 findings; solution-verify (Phase 5.5) checks the draft; Phase 8 posts it. *(Disambiguation: `### Integration Docs` is distinct from the plan doc's `### Integration Surface Map` — different documents, different consumers; never merge or relocate.)*
 
 ### Activation Rule (necessary-not-sufficient)
 
@@ -896,6 +883,8 @@ All agents run **in parallel** via `task`. Skip for Micro.
 
 ### Gate Loop — MANDATORY
 
+> **Not dispatched by `task-workflow-standard`** (see the banner at the top of this file).
+
 #### Merge-Dedup
 
 After parallel agents return: group by similarity, keep highest severity.
@@ -922,6 +911,8 @@ Each review cycle dispatches FRESH `task` sub-agents.
 ---
 
 ## Phase 8 — Finalize
+
+> **Not dispatched by `task-workflow-standard` (agent-infra#2861).** That pipeline posts **its own** plan comment from `task-workflow-standard` §2b — marker `<!-- issue-scoping: merged scope+plan -->`, no `## Verification Gates` block (those gates are not dispatched there), no `### Adversarial Threat Surface`, and no `### Axis Research` (merged into the one `<!-- research: v1 -->` block). Posting this one as well creates a second scoping artifact and a cycle attestation for gates that did not run.
 
 ### Post Plan Comment
 
@@ -968,12 +959,9 @@ PLANEOF
 )"
 ```
 
-### Label Management — Exit
+### Label Management — Exit — removed (agent-infra#2861 §8.2)
 
-```bash
-gh issue edit $ISSUE_NUMBER --remove-label "scoping"
-gh issue edit $ISSUE_NUMBER --add-label "scoped"
-```
+`scoping` and `scoped` are deleted with `planning`/`implementing`/`planned`: none has a reader anywhere in the fleet (16 write commands across 4 skills, zero reads). The durable state is `doc_status` on the plan doc and the issue's open/closed state.
 
 ### Human Gate (conditional)
 

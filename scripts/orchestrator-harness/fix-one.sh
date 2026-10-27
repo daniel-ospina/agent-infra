@@ -52,20 +52,118 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # under the pre-export PATH pins _NCPU=4 / MAX_LOAD=40 for every cell (the #1702 failure).
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[fix $PR] FATAL: $SELF/spawn-gate.sh missing — refusing to run an ungated fixer" >&2; exit 78; }
+# ── the RESEARCH contract is part of the fixer's brief too (#2258) ──────────────────────────────────
+# A fixer acts on a reviewer's findings, and the measured duplicate-PR incident (#2247 vs #2250) was
+# two lanes fixing the same three things from two briefs that never forced either to look first. The
+# block is the ONE canonical text (`brief-gate.sh --section fixer`), and the brief is CHECKED after it
+# is written — a heredoc regression refuses here (78) instead of dispatching a fixer nobody asked to
+# look first. Same shape as lane.sh's reviewer section (#2148).
+brief_gate_sh="$(brief_gate_lib)" || {
+  echo "[fix $PR] FATAL: brief-gate.sh not found — refusing to run a fixer whose brief nothing validated (#2258)" >&2; exit 78; }
+FIX_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section fixer)" || {
+  echo "[fix $PR] FATAL: brief-gate.sh --section failed — refusing to run a fixer whose brief omits the research contract (#2258)" >&2; exit 78; }
+# ⛔ THE REPO-IDENTITY GATE (agent-infra#2694/#2724). This is the PR-lane half: a fixer given a
+# checkout and a DIFFERENT target repo used to materialise a worktree in the checkout and run there,
+# reporting failures about branches instead of about the repo. Missing = FATAL, because a silently
+# skipped assertion is the defect. `REPO_TARGET_REFUSED` (72) is distinct from every gate code.
+. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
+command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
+  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless fixer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
+# ⛔ PHYSICAL PATH: every assertion below names the checkout, and a RELATIVE $REPO resolved from
+# inside itself names `$REPO/$REPO` (the C6 shape claim-cwd.test.sh pins for claims.sh).
+REPO_ABS="$(pwd -P)"
+
+# ── "THIS REFUSAL DID NOT COST AN ATTEMPT", IN ONE PLACE (#2762 review, 2nd cycle, P2) ─────────
+# ⛔ A FUNCTION, NOT STRAIGHT-LINE, BECAUSE TWO PATHS NEED IT: the gate refusals inside `run_agent`
+# (the marked block below, at the end) AND the repo-identity refusals further down, which exit BEFORE
+# any agent could be booked. Both must refund: a wrong-repo pair is a permanent configuration error,
+# and charging it to `fixcount` parks the PR as "attempts exhausted" having never run a fixer — the
+# misdiagnosis class (#1720) this file's refund exists to prevent. It is defined HERE because the
+# identity refusals run before the old block's position.
+# [fixgate-refund:begin] (extracted and DRIVEN by red-fixer.test.sh — keep the markers)
+# ⛔ THE MARKERS WRAP THE `CTRL` GUARD ITSELF, not just the body: the extracted function is driven
+# with CTRL=1 AND CTRL=0, and a body without the guard made a MANUAL run refund an attempt the
+# controller never booked (the test caught exactly that).
+refund_gate_attempt() {
+  [ "${CTRL:-0}" = "1" ] || return 0
+  # ⛔ REFUND, AND ONLY ON THE CONTROLLER PATH. orch-loop.sh books the attempt (fixcount+1) when it
+  # CREATES the session, which is UPSTREAM of every gate; this worker is the only party that knows no
+  # agent ran. Without the refund, three refusals reach MAX_FIX_TRIES and the PR is PARKED "needs a
+  # human" having never had a single fixer run (agent-infra#1720). A manual (positional) run booked
+  # nothing, so it must refund nothing.
+  local _cf="$O/state/fixcount-$PR" _nf
+  if [ -f "$_cf" ]; then
+    _nf="$(cat "$_cf" 2>/dev/null || echo 0)"
+    # `is_num`, not a hand-rolled `case`: the predicate is already in scope (spawn-gate.sh defines it,
+    # and this script uses it for its own tunables), and a second, weaker copy is exactly how `08` grew
+    # an octal read in the first place.
+    is_num "$_nf" || _nf=0
+    if [ "$_nf" -gt 0 ]; then
+      echo $((_nf - 1)) > "$_cf"
+      echo "[fix $PR] a gate refusal is not an attempt — fixcount refunded $_nf -> $((_nf - 1))" >> "$L.log"
+    fi
+  fi
+  # ⛔ THE SAME FACT FOR THE PER-HEAD BUDGET (agent-infra#2223, review P1 cycle 3). The controller's
+  # red-fixer role keeps a HEAD-KEYED counter (`redfix-<PR>` = "<head> <n>", capped at 2) because a
+  # refusal describes one tree. It books that counter at spawn, exactly as it books `fixcount` — and
+  # this function is the only party that knows the agent never started. Without this marker two gate
+  # refusals (a DISK refusal never clears by waiting, so this is deterministic) reach the cap and PARK
+  # a red PR with the reason "2 fixer attempt(s) did not clear it" — a sentence that is false, since no
+  # fixer ever ran. That is the stall this role exists to end, re-created by its own counter. The
+  # marker is consumed (and the attempt refunded) by the controller; it names the head because a
+  # refund for a superseded head would credit the wrong budget.
+  if [ -n "${HEAD:-}" ]; then
+    : > "$O/state/fixgate-$PR-$HEAD" 2>/dev/null || true
+    echo "[fix $PR] a gate refusal is not an attempt — fixgate-$PR-$HEAD recorded for the controller's per-head refund" >> "$L.log"
+  fi
+  return 0
+}
+# [fixgate-refund:end]
 
 # locate the branch's worktree
 WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
 echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
+
+# ⛔ THE HEAD IS READ BEFORE THE REFUSALS, NOT AFTER (#2762 review, 3rd cycle, P1).
+# The refund for a pre-agent refusal names the head (`fixgate-<PR>-<HEAD>`), and the identity
+# assertions below exit long before the old position of this line — so a repo-identity refusal
+# refunded `fixcount` but could NOT refund the per-head budget, and after two such cycles the PR
+# parked as "2 red-fixer attempt(s) at this head did not clear it" having never run a fixer.
+HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+# ── THE TARGET ASSERTION, BEFORE ANY WORK (agent-infra#2694) ──────────────────────────────────
+# A fixer is handed BOTH a checkout ($1) and the repo it is fixing for ($2). If those disagree, every
+# git and gh call below would act on one while reporting about the other — the measured wrong-repo
+# lane. Refuse by name, before materialising anything. ⛔ AFTER the `start` truncation above, so this
+# per-dispatch line survives in the log it is written to (A-verify finding, #2694).
+REPO_ASSERT_LINE="$(repo_target_assert "fixer #$PR target" "$REPO_ABS" "$OR" "")"; REPO_ASSERT_RC=$?
+printf '%s\n' "$REPO_ASSERT_LINE" >> "$L.log"
+if [ "$REPO_ASSERT_RC" -ne 0 ]; then
+  echo "[fix $PR] REFUSED: the checkout $REPO_ABS and the target repo $OR disagree (exit $REPO_ASSERT_RC) — no fixer started, no branch touched" >> "$L.log"
+  refund_gate_attempt
+  exit "$REPO_ASSERT_RC"
+fi
+
 [ -z "$WT" ] && {
   # Foreign (other-machine) branch: materialise a local worktree so the fixer has somewhere to work.
   if git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
     git worktree add ".worktrees/fix-$PR" "$BR" >> "$L.log" 2>&1
   else
     git fetch origin "$BR" --quiet >> "$L.log" 2>&1
+    # ⛔ NAME THE REPO, NOT A MATERIALISATION FAILURE (#2694). The measured message a human read
+    # first was `cannot materialise <branch>`, which says nothing about the repo the branch is
+    # missing FROM. If the branch is not in THIS repo, say so — with the branch and the slug — and
+    # stop. A fetch that failed for network reasons is covered too: the branch is unproven here, and
+    # the refusal names both possibilities rather than blaming worktree creation.
+    if ! git rev-parse --verify -q "refs/remotes/origin/$BR" >/dev/null 2>&1; then
+      repo_target_branch_assert "fixer #$PR" "$REPO_ABS" "$BR" "$OR" >> "$L.log"
+      echo "[fix $PR] REFUSED: branch '$BR' is not in $OR (checkout $REPO_ABS) — it could not be read after fetching origin. This is a BRANCH/REPO mismatch, not a worktree-materialisation failure; refusing before any fixer starts" >> "$L.log"
+      refund_gate_attempt
+      exit "$REPO_TARGET_REFUSED"
+    fi
     git worktree add ".worktrees/fix-$PR" -b "$BR" "origin/$BR" >> "$L.log" 2>&1
   fi
   WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
@@ -73,12 +171,30 @@ echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
   echo "[fix $PR] materialised worktree=$WT" >> "$L.log"
 }
 
+# ── THE POST-BUILD ASSERTION (agent-infra#2694/#2724) ──────────────────────────────────────────
+# The worktree now EXISTS. Read what it actually is and refuse to run the fixer when it is not the
+# target repo. A pre-build check proves what we asked for; this proves what we got. The branch half
+# distinguishes the right repo from a worktree checked out on another repo's branch.
+WT_REPO_LINE="$(repo_target_assert "fixer #$PR" "$WT" "$OR" "$REPO_ABS")"; WT_REPO_RC=$?
+printf '%s\n' "$WT_REPO_LINE" >> "$L.log"
+if [ "$WT_REPO_RC" -ne 0 ]; then
+  echo "[fix $PR] REFUSED: the materialised worktree is not $OR (exit $WT_REPO_RC) — no fixer started" >> "$L.log"
+  refund_gate_attempt
+  exit "$WT_REPO_RC"
+fi
+WT_BRANCH_LINE="$(repo_target_branch_assert "fixer #$PR" "$WT" "$BR" "$OR")"; WT_BRANCH_RC=$?
+printf '%s\n' "$WT_BRANCH_LINE" >> "$L.log"
+if [ "$WT_BRANCH_RC" -ne 0 ]; then
+  echo "[fix $PR] REFUSED: branch/checkout assertion failed (exit $WT_BRANCH_RC) — no fixer started" >> "$L.log"
+  refund_gate_attempt
+  exit "$WT_BRANCH_RC"
+fi
+
 # ── cross-box claim for the FIXER (P3.3, 2026-10-14 adversarial review) ───────
 # merge-one.sh claims before reviewing, but fix-one.sh ran the fixer FIRST and only then called
 # merge-one.sh (the sole claim_acquire caller), so two boxes could each spawn a fixer for the same
 # PR/head. Same key and lease shape as merge-one.sh's — the claim is on the PR's CURRENT head, so a
 # fixer and a reviewer never race each other for the same content version.
-HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
 # ── CI BACK-PRESSURE: the lane that PUSHES reads the CI queue first ──────────────
 # A fixer's product is a NEW HEAD, and a new head is a full CI pass plus (because the review
 # attestation is SHA-bound) the destruction of the artifact this lane's review chain just produced.
@@ -479,6 +595,8 @@ gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 # an interpreter across the filesystem — a `find` over $HOME blocks for minutes and has consumed whole
 # agent budgets with nothing produced. Point it at `uv sync` instead. Do NOT drop it in a re-port.
 cat > "$L-fixer.txt" <<EOF
+$FIX_RESEARCH_BRIEF
+
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
 If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (`head12: <12 chars>`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
@@ -501,6 +619,15 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
 EOF
+# ── THE GENERATED FIXER BRIEF IS CHECKED AT BUILD TIME (#2258) ─────────────────────────────────────
+# The fixer's brief is written HERE, so a failure is a harness defect (78, cannot run) and never a
+# brief-authoring refusal (80). Checking it before the spawn means a heredoc regression is caught with
+# the reason, instead of arriving as an empty fixer run that the caller reads as "the fix did not work".
+bash "$brief_gate_sh" --check "$L-fixer.txt" fixer 2>>"$L.log" || {
+  echo "[fix $PR] FATAL: the GENERATED fixer brief fails brief-gate.sh — refusing to run a fixer whose brief lost its research contract (a harness defect in the heredoc above) (#2258)" >> "$L.log"
+  echo "[fix $PR] FATAL: generated fixer brief refused by brief-gate.sh (harness defect, see $L.log)" >&2
+  exit 78
+}
 # ⛔ THE VOLUME IS THE WORKTREE, AND IT MUST BE PASSED EXPLICITLY (review round 2, P2). This script
 # does `cd "$REPO"` (above) and only NAMES the worktree inside the agent's prompt, so `$PWD` here is
 # the MAIN CHECKOUT — the gate's `DISK_GATE_PATH:-$PWD` default would measure a directory the agent
@@ -540,14 +667,22 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # agent-infra#1720 failure the refund exists to prevent. The default is CORRECT, not merely safe: a
   # pre-#1765 helper can never return 77, so 77 falls through to the load branch on the tree it came
   # from. install.sh's DRIFTED list now carries spawn-gate.sh, so the skew is DETECTED as well as
-  # survived. The same tolerant default (73) covers AGENT_FORK_REFUSED: a pre-#2293 helper cannot
-  # return it, so the fork arm is inert on that tree and the code falls through exactly as before.
+  # survived.
+  # ⛔ FORK FIRST AMONG THE CAPACITY CODES, AND IT IS THE P1 THE REVIEW FOUND: `run_agent` returns
+  # AGENT_FORK_REFUSED (73) for a box that is out of PROCESSES, and before this arm both that code and
+  # 75 reported "load gate: re-dispatched when 1-min load falls below MAX_LOAD" — a remedy for a box
+  # that cannot spawn the retry, and one that says nothing about the external restart that is the only
+  # thing that helps. The same tolerant default (73) covers AGENT_FORK_REFUSED: a pre-#2293 helper
+  # cannot return it, so the fork arm is inert on that tree and the code falls through as before.
   #
-  # ⛔ FORK FIRST, AND IT IS THE P1 THE REVIEW FOUND: `run_agent` returns AGENT_FORK_REFUSED (73) for a
-  # box that is out of PROCESSES, and before this arm both that code and 75 reported "load gate:
-  # re-dispatched when 1-min load falls below MAX_LOAD" — a remedy for a box that cannot spawn the
-  # retry, and one that says nothing about the external restart that is the only thing that helps.
-  if [ "$ar" = "${AGENT_FORK_REFUSED:-73}" ]; then
+  # ⛔ A BRIEF REFUSAL IS A THIRD REMEDY, AND NOT ONE OF THE CAPACITY ONES (#2258). The brief is
+  # GENERATED here (`brief-gate.sh --section fixer`), so it can only be refused if the heredoc lost the
+  # block or the helper drifted — a HARNESS defect. Naming it "load" or "disk" would send the operator
+  # to wait for a box or a filesystem that is fine, and the refund below still applies: nothing ran, so
+  # no attempt was consumed. Tolerant reference for the same $O-skew reason as the disk code.
+  if [ "$ar" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
+    why="BRIEF gate: the generated fixer brief failed brief-gate.sh (a HARNESS defect, not a capacity refusal and not a finding about this PR) — read the [brief-gate] block in the log; the fix is in the brief's own build, not in the box"
+  elif [ "$ar" = "${AGENT_FORK_REFUSED:-73}" ]; then
     why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
   elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
     why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
@@ -555,43 +690,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi
   echo "[fix $PR] fixer NOT started ($why) — merge chain NOT re-run" >> "$L.log"
-  # [fixgate-refund:begin] (extracted and DRIVEN by red-fixer.test.sh — keep the markers)
-  # ⛔ THE MARKERS WRAP THE `CTRL` GUARD ITSELF, not just its body: the extracted fragment is driven
-  # with CTRL=1 AND CTRL=0, and a fragment without the guard made a MANUAL run refund an attempt the
-  # controller never booked (the test caught exactly that).
-  if [ "${CTRL:-0}" = "1" ]; then
-    # ⛔ REFUND, AND ONLY ON THE CONTROLLER PATH. orch-loop.sh books the attempt (fixcount+1) when
-    # it CREATES the session, which is UPSTREAM of the gate inside run_agent(); this worker is the
-    # only party that knows no agent ran. Without the refund, three refusals reach MAX_FIX_TRIES and
-    # the PR is PARKED "needs a human" having never had a single fixer run (agent-infra#1720). A
-    # manual (positional) run booked nothing, so it must refund nothing.
-    CF="$O/state/fixcount-$PR"
-    if [ -f "$CF" ]; then
-      NF="$(cat "$CF" 2>/dev/null || echo 0)"
-      # `is_num`, not a hand-rolled `case`: the predicate is already in scope (spawn-gate.sh defines
-      # it, and this script uses it for its own tunables), and a second, weaker copy is exactly how
-      # `08` grew an octal read in the first place.
-      is_num "$NF" || NF=0
-      if [ "$NF" -gt 0 ]; then
-        echo $((NF - 1)) > "$CF"
-        echo "[fix $PR] a gate refusal is not an attempt — fixcount refunded $NF -> $((NF - 1))" >> "$L.log"
-      fi
-    fi
-    # ⛔ THE SAME FACT FOR THE PER-HEAD BUDGET (agent-infra#2223, review P1 cycle 3). The controller's
-    # red-fixer role keeps a HEAD-KEYED counter (`redfix-<PR>` = "<head> <n>", capped at 2) because a
-    # refusal describes one tree. It books that counter at spawn, exactly as it books `fixcount` —
-    # and this branch is the only party that knows the agent never started. Without this marker two
-    # gate refusals (a DISK refusal never clears by waiting, so this is deterministic) reach the cap
-    # and PARK a red PR with the reason "2 fixer attempt(s) did not clear it" — a sentence that is
-    # false, since no fixer ever ran. That is the stall this role exists to end, re-created by its own
-    # counter. The marker is consumed (and the attempt refunded) by the controller; it names the head
-    # because a refund for a superseded head would credit the wrong budget.
-    if [ -n "${HEAD:-}" ]; then
-      : > "$O/state/fixgate-$PR-$HEAD" 2>/dev/null || true
-      echo "[fix $PR] a gate refusal is not an attempt — fixgate-$PR-$HEAD recorded for the controller's per-head refund" >> "$L.log"
-    fi
-  fi
-  # [fixgate-refund:end]
+  refund_gate_attempt
   # Exit with the gate's OWN code, not a normalised 75: the caller (adopt-fix.sh, an operator) reads
   # it to choose the remedy, and 77 is the only thing that says "this one will not clear by waiting".
   exit "$ar"

@@ -29,6 +29,37 @@ gh issue view <ISSUE> --repo <OWNER/REPO> --comments --json comments --jq '.comm
 The comment thread supersedes the body where they disagree. Re-measure anything labelled
 provenance-stale before trusting the body.
 
+## Your research contract — this section is REQUIRED, and the dispatch is REFUSED without it
+(agent-infra#2258)
+
+The block below is the canonical text `scripts/orchestrator-harness/brief-gate.sh --section lane`
+renders, and it is the SAME text every generated brief carries. Copy it, fill the `<…>` slots with
+YOUR pass, and keep the four labels: `nonblocking-dispatch.sh`, `orch-send.sh`, `safe-send.sh` and the
+lane/fixer/bg launch seams refuse a brief without them (exit 80), naming what is missing. Do not
+delete the labels to save space — a brief that carries the heading but no `RUNG:`/`CONTRADICTION TEST:`
+is refused too.
+
+## RESEARCH FIRST — before you decide anything (agent-infra#2258)
+
+⛔ This is not a formality and it is not deep research. Do this pass BEFORE you write code, file an
+issue, or open a PR, and state its outcome in your final message. It exists because two lanes in one
+day acted on a false premise: one re-derived a root the tracker already held, one opened a duplicate
+PR. Both were brief defects — the lane was never asked to look first.
+
+INTERNAL: read what this repo and its tracker ALREADY hold, before you decide anything: the issue AND every comment (root-cause corrections live there), `git log --all --grep` for a prior attempt, the open PRs touching the same files, the architecture doc for the seam you are about to change. Quote file:line, issue and PR numbers. If the work is ALREADY DONE, already decided, or already decomposed into other issues, STOP and report that with evidence instead of re-deriving it.
+EXTERNAL: look OUTSIDE this repo for how comparable systems solve this — vendor docs, specs, the
+    `research` skill (state the rung in the RUNG line below). Say what you looked up and what you
+    took from it. Skipping the rung is not allowed; `web_fetch` on a primary source always exists.
+RUNG: 2 — web_search model="sonar"   ⛔ REPLACE with the rung you will actually use, naming the tool:
+    1 = perplexity MCP (`mcp__seo-intelligence__perplexity_search`) · 2 = `web_search` with the model
+    passed explicitly (`sonar`) · 3 = `web_fetch` / exa (`mcp_load exa`). If the rung you wanted does
+    not load, name the rung you took AND the error you saw — a silent fallback erases the config gap.
+CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling, a decision section in
+    a plan doc, a decision comment on an issue, a Tortoise point carrying one? Quote it, and say
+    `no recorded decision reaches this work` if none does. If a finding contradicts a recorded
+    decision, it is NOT a candidate for adoption: reopen the decision and argue it in its own home;
+    never adopt over it.
+
 ## Setup
 
 You are ALREADY inside your own worktree (that is your cwd, on branch `<BRANCH>`). Do NOT create,
@@ -59,7 +90,8 @@ it). Four of them are only producible while you work, so produce them as you go.
   `Refs #<ISSUE>` when something genuinely stays open). A mid-sentence `(fixes #N)` does NOT
   count, and an unintended closing keyword can auto-close an issue on merge.
 - **[b] the scoping comment, whose FIRST CONTENT LINE is the marker — `<!-- issue-scoping: … -->`
-  (the producer, `skills/issue-scoping`, writes `<!-- issue-scoping: v5.1 double diamond + verify -->`;
+  (the producer is `skills/issue-scoping` for the epic/project tiers, or `skills/task-workflow-standard`
+  for the task tier — the version varies (`v5.1 double diamond + verify`, `merged scope+plan`);
   only the `<!-- issue-scoping:` prefix is examined). Then the scoping content: boundaries,
   alternatives considered, the wiring table. POSITION is the contract — the check matches at column
   0, so ANY leading whitespace fails (at four columns it is also rendered as a CODE BLOCK, i.e. a

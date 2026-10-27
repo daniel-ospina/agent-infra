@@ -1,0 +1,15 @@
+# Both `workflow_call` and `pull_request`, WITH a cancelling block: R1 wants it and, in the callee's
+# context, that block groups two callers on one ref together — R3's hazard. One block cannot serve
+# both, so the combination is refused rather than half-satisfied in silence (#2660 round 5).
+name: Reusable and pr
+on:
+  workflow_call:
+  pull_request:
+concurrency:
+  group: reusable-and-pr-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
