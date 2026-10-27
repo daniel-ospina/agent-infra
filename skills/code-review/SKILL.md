@@ -1692,7 +1692,8 @@ fi
 - If the PR head moves AFTER recording (fix commits, merge of main), the gate
   turns red again: re-review the new head and re-record — UNLESS a carry arm
   proves the reviewed artifact is unchanged (the same three-dot DIGEST, or a
-  base-only move — the base advanced, YOUR OWN commits did not), AND the target
+  base-only move — the base advanced, YOUR OWN commits did not, or #1377: the
+  rendered diff moved but the reviewed PATCH is byte-identical), AND the target
   head is not measurably red (#1575 clause E refuses the carry; re-run the
   failing checks and re-record instead), in which case nothing is owed: pass
   the recorded head and the recorded verdict to `record-review.sh` and it
@@ -1700,6 +1701,28 @@ fi
   `commit-workflow/workflow/04-merge-deploy.md` condition 6. NEVER re-record a
   moved head with a CHANGED artifact without a fresh review — the gate binds the
   full head sha.
+- **A HEAD MOVE WITH AN UNCHANGED PATCH OWES A RE-RECORD, NOT A REVIEW (#1377).**
+  The review is a review OF THE DIFF. When `main` lands work that rewrites the
+  hunk CONTEXT around your change, the rendered diff moves even though every
+  line you submitted is byte-identical; asking a reviewer to look again can only
+  re-earn a verdict the diff already has. Ask first:
+
+  ```bash
+  ~/.pi/agent/scripts/record-review.sh --check-carry <pr> <owner/repo>
+  #   carry        0  the gate carries the record as-is → land it
+  #   carry-patch  6  the RENDERED diff moved, the PATCH did not → RE-RECORD, do not review
+  #   fresh        1  the patch changed → a review really is owed
+  ```
+
+  `carry-patch` is verified by `patch_dimension_carry`: the reviewed diff is
+  RECONSTRUCTED from the prior signed marker's own `@ <sha>` and must reproduce
+  that marker's `diff=` (the anchor), then both sides are projected onto their
+  PATCH identity (blob ids, hunk line numbers and hunk CONTEXT dropped; paths
+  and every `+`/`-` line kept BYTE-EXACT) and compared. Do NOT "just use
+  `git patch-id --stable`": it ignores whitespace, so a whitespace-only edit
+  would carry a verdict it does not deserve (#1362 D1). The token is not
+  `carry` and the exit is not 0 because the merge gate does NOT carry a record
+  whose binding moved — the mechanical re-record is still owed.
 - A saved record with a FAILED evidence post (transient API error) leaves the
   gate red: re-run `record-review.sh` to retry the post (the script warns and
   exits 0 on transient failures).

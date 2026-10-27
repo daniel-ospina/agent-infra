@@ -156,6 +156,23 @@ if [ "$1" = "api" ]; then
     # #2982: the reviewed-diff fetch. Placed FIRST — the request carries no
     # --jq, so it would otherwise fall through to the generic body answer.
     if grep -qF -- "application/vnd.github.v3.diff" <<<"$*"; then
+        # #1377: the COMPARE diff read, which the patch carry uses for BOTH
+        # sides. Keyed by sha so one test can serve a REVIEWED diff and a
+        # DIFFERENT rendered diff for the same base in one invocation — the
+        # fixture shape a rebase has and the only way to tell "the patch is the
+        # same" apart from "the diff is the same". Gated on the accept header
+        # too, so the pre-existing `/compare/` SURFACE arm (which answers the
+        # json/meta reads) is untouched.
+        if grep -qF -- "/compare/" <<<"$*"; then
+            cmp_sha="$(printf '%s' "$*" | sed -n 's#.*/compare/[0-9a-f]*\.\.\.\([0-9a-f]*\).*#\1#p')"
+            if [ -n "${STUB_COMPARE_DIFF_DIR:-}" ] && [ -n "$cmp_sha" ] \
+               && [ -f "${STUB_COMPARE_DIFF_DIR}/$cmp_sha" ]; then
+                cat "${STUB_COMPARE_DIFF_DIR}/$cmp_sha"
+                exit 0
+            fi
+            # No per-sha fixture: fall through to the plain diff arm below, so
+            # every test that existed before this arm keeps its behaviour.
+        fi
         # #1577: a STATEFUL transient failure — fail the first N calls, then serve
         # the body, so a RETRY can be shown to RECOVER. A one-shot STUB_DIFF_FAIL
         # proves only that the loop iterates; it cannot separate "retried" from
@@ -212,6 +229,14 @@ if [ "$1" = "api" ]; then
     # tortoise#9492 — the pinned-head guard's wedge diagnosis: which branch does
     # the PR track, and what does THAT ref point at? Empty STUB_BRANCH_SHA models
     # "could not read it" (the non-wedge arm).
+    # #1377: the AUTHORITATIVE base the patch carry diffs against. INERT unless a
+    # test sets STUB_BASE_SHA — an armed-always arm would replace whatever the
+    # generic tail answers for `.base.sha` today, silently changing the lane-arm
+    # vectors that rely on it being unusable.
+    if grep -qF -- "--jq .base.sha" <<<"$*" && [ -n "${STUB_BASE_SHA:-}" ]; then
+        printf '%s\n' "$STUB_BASE_SHA"
+        exit 0
+    fi
     if grep -qF -- "--jq .head.ref" <<<"$*"; then
         printf '%s' "${STUB_HEAD_REF:-fix/stub-branch}"
         echo; exit 0
@@ -478,6 +503,11 @@ run_record_diff_with() { # <record-script> <pr> <sha> <body> [diff-file] [diff-f
         export GH_STUB_LOG="$LOG"
         export STUB_BODY="$body" STUB_DIFF_FILE="$dfile" STUB_DIFF_FAIL="$dfail" STUB_CAPTURE="$cap"
         export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        # #1377: the patch-carry knobs, exported EXPLICITLY (with empty defaults)
+        # so an ambient value cannot leak into another vector — the scrub the
+        # STUB_CHECKS_ROWS note above records as a known limitation here does
+        # not exist. A per-invocation prefix still reaches them.
+        export STUB_COMPARE_DIFF_DIR="${STUB_COMPARE_DIFF_DIR:-}" STUB_BASE_SHA="${STUB_BASE_SHA:-}"
         # #1577: the suite must never SLEEP. The retry contract pinned below is the
         # ATTEMPT COUNT (the stub log), not the backoff duration — the backoff is a
         # production politeness knob with no assertion that could tell 1s from 30s
@@ -2971,6 +3001,225 @@ run_record_ev() { # <pr> [VAR=VAL…]; ref via $EV_REF (empty ⇒ omit --evidenc
     RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
     RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
 }
+
+# ─────────────────────────────────────────────────────────────────────────
+# 12g #1377 — THE PATCH CARRY: a REBASE whose reviewed change is untouched is
+# re-recorded, NOT re-reviewed; a changed patch is still refused.
+#
+# This is the end-to-end pin. §12a-pin territory above is BYTE-identity of the
+# normalized diff; the vectors here are the case that one cannot see: the
+# rendered diff MOVES (hunk context rewritten by what `main` landed) while every
+# reviewed line is byte-identical. Both directions are mandatory — an acceptance
+# vector alone would let a fail-open (carry anything) land green, and a refusal
+# vector alone would let the arm be dead code.
+#
+# The fixture is three diff renderings of ONE change against three bases:
+#   PFX_REVIEWED — what the review approved
+#   PFX_REBASE   — the same change rebased onto a moved base: new blob ids, moved
+#                  hunk line numbers, DIFFERENT CONTEXT (this is why the
+#                  binding moves and #1377 exists)
+#   PFX_EDIT     — the same shape with ONE changed line altered  → must REFUSE
+#   PFX_WS       — whitespace only                               → must REFUSE
+#   PFX_MOVED    — the same lines at a different PATH             → must REFUSE
+# ─────────────────────────────────────────────────────────────────────────
+PBASE="$(printf 'c%.0s' $(seq 1 40))"
+POLD="$(printf 'd%.0s' $(seq 1 40))"          # the head the MARKER names
+# §12's tail UNSETS its knobs (NORM_PY among them), so a section that runs after
+# it must re-establish what it uses — the same self-containment §11.12 is written
+# for. `norm_sha` below resolves this global at CALL time, so the re-assignment
+# is what makes the helper usable here at all.
+NORM_PY="$SCRIPT_DIR/lib/diff-normalize.py"
+PCD="$T/pcompare"; mkdir -p "$PCD"
+PFX_REVIEWED="$T/p-reviewed.diff"; printf 'diff --git a/fix.txt b/fix.txt\nindex 1111111..2222222 100644\n--- a/fix.txt\n+++ b/fix.txt\n@@ -3,4 +3,5 @@ def f():\n context before\n-old line\n+new line\n context after\n tail\n' > "$PFX_REVIEWED"
+PFX_REBASE="$T/p-rebase.diff";   printf 'diff --git a/fix.txt b/fix.txt\nindex 7777777..8888888 100644\n--- a/fix.txt\n+++ b/fix.txt\n@@ -40,4 +41,5 @@ def f():\n MAIN landed a different context line\n-old line\n+new line\n another context line\n tail\n' > "$PFX_REBASE"
+PFX_EDIT="$T/p-edit.diff";       printf 'diff --git a/fix.txt b/fix.txt\nindex 7777777..8888888 100644\n--- a/fix.txt\n+++ b/fix.txt\n@@ -40,4 +41,5 @@ def f():\n MAIN landed a different context line\n-old line\n+new line CHANGED\n another context line\n tail\n' > "$PFX_EDIT"
+PFX_WS="$T/p-ws.diff";           printf 'diff --git a/fix.txt b/fix.txt\nindex 7777777..8888888 100644\n--- a/fix.txt\n+++ b/fix.txt\n@@ -40,4 +41,5 @@ def f():\n MAIN landed a different context line\n- old line\n+new line\n another context line\n tail\n' > "$PFX_WS"
+PFX_MOVED="$T/p-moved.diff";      printf 'diff --git a/other.txt b/other.txt\nindex 7777777..8888888 100644\n--- a/other.txt\n+++ b/other.txt\n@@ -40,4 +41,5 @@ def f():\n MAIN landed a different context line\n-old line\n+new line\n another context line\n tail\n' > "$PFX_MOVED"
+
+# The advertised premise of every vector below, stated as an assertion so it can
+# never rot into a fixture that no longer tests what its caption claims.
+PNORM_REVIEWED="$(norm_sha "$PFX_REVIEWED")"
+assert_ne "$PNORM_REVIEWED" "$(norm_sha "$PFX_REBASE")" \
+  "12g fixture: the rebase MOVES the binding (else the patch arm is never reached)"
+assert_ne "$(norm_sha "$PFX_EDIT")" "$(norm_sha "$PFX_REBASE")" \
+  "12g fixture: the one-line edit really is a different artifact"
+assert_ne "$(norm_sha "$PFX_WS")" "$(norm_sha "$PFX_REBASE")" \
+  "12g fixture: the whitespace-only edit really is a different artifact"
+
+pcarry() { # <pr> <new-diff-file> [marker-diff] -> sets RECORD_RC/ERR/CAP £RECORD_ERR £RECORD_CAP
+    local pr="$1" newf="$2" marker_diff="${3:-$PNORM_REVIEWED}"
+    rm -f "$PCD/$POLD" "$PCD/$SHA"
+    cp "$PFX_REVIEWED" "$PCD/$POLD"; cp "$newf" "$PCD/$SHA"
+    STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+      run_record_diff "$pr" "$POLD" "body
+
+$(signed_marker "$pr" "$POLD" "$marker_diff")" "$newf"
+}
+
+# (g1) THE ACCEPTANCE: a pure rebase is re-recorded, with NO fresh review owed.
+PRG=424740; rm -f "$(Q2 $PRG)"
+pcarry "$PRG" "$PFX_REBASE"
+[ "$RECORD_RC" = "0" ] && ok "12g1 a REBASE with an unchanged patch is carried (rc 0)" \
+    || bad "12g1 pure rebase refused (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "#1377 patch carry" "12g1 the carry names itself (#1377)"
+assert_contains "$(cat "$(Q2 $PRG)" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "12g1 re-records against the CURRENT head"
+# The minted marker must bind the CURRENT head AND the LIVE digest — never the
+# old pair. Inheriting either would be the head-binding hole #930 class 1.
+assert_contains "$RECORD_CAP" "@ $SHA diff=$(norm_sha "$PFX_REBASE")" "12g1 the marker binds the current head to the LIVE digest"
+# The posting path APPENDS (idempotent, #163), so the body keeps the old marker
+# above the new one. What the merge gate must read is therefore the GOVERNING
+# (last) marker — assert on that, not on the absence of the stale line, which
+# would be false by construction and would look like a head-binding failure.
+# The captured PATCH is the JSON envelope, so the body's newlines are the
+# two-character `\n` escape — match the marker TEXT, not a line start.
+PLAST="$(grep -o 'review recorded: [^"\\]*' <<<"$RECORD_CAP" | tail -1 || true)"
+if grep -qF "@ $SHA diff=$(norm_sha "$PFX_REBASE")" <<<"$PLAST"; then
+    ok "12g1 the GOVERNING (last) marker names the current head"
+else
+    bad "12g1 the governing marker does not name the current head: $PLAST"
+fi
+if grep -qF "@ $POLD " <<<"$PLAST"; then bad "12g1 the governing marker still names the STALE head"; else ok "12g1 the governing marker does not name the stale head"; fi
+
+# (g2) THE REFUSAL THAT MAKES IT SOUND: one changed line ⇒ no carry.
+PRG2=424741; rm -f "$(Q2 $PRG2)"
+pcarry "$PRG2" "$PFX_EDIT"
+[ "$RECORD_RC" = "3" ] && ok "12g2 a ONE-LINE change is NOT carried (rc 3)" \
+    || bad "12g2 carried a genuinely changed patch (rc=$RECORD_RC) — FAIL-OPEN"
+[ ! -f "$(Q2 $PRG2)" ] && ok "12g2 no record written for the changed patch" || bad "12g2 wrote a record for a changed patch"
+if grep -qF "#1377 patch carry" <<<"$RECORD_ERR"; then bad "12g2 the carry success line was printed on a refusal"; else ok "12g2 the carry success line is not printed"; fi
+
+# (g3) WHITESPACE-ONLY — the exact hole `git patch-id --stable` has, pinned HERE
+# so a future "just use patch-id" simplification reddens instead of shipping.
+PRG3=424742; rm -f "$(Q2 $PRG3)"
+pcarry "$PRG3" "$PFX_WS"
+[ "$RECORD_RC" = "3" ] && ok "12g3 a WHITESPACE-ONLY change is NOT carried (rc 3)" \
+    || bad "12g3 carried a whitespace-only change (the patch-id --stable hole)"
+
+# (g4) THE SAME LINES AT A DIFFERENT PATH — patch identity includes the path.
+PRG4=424743; rm -f "$(Q2 $PRG4)"
+pcarry "$PRG4" "$PFX_MOVED"
+[ "$RECORD_RC" = "3" ] && ok "12g4 the same lines at a DIFFERENT PATH are NOT carried (rc 3)" \
+    || bad "12g4 carried a change whose path moved"
+
+# (g5) A FORGED marker (right shape, wrong signature) at a different head must
+# not carry — the body is not a trust boundary (#784).
+PRG5=424744; rm -f "$(Q2 $PRG5)"
+cp "$PFX_REVIEWED" "$PCD/$POLD"; cp "$PFX_REBASE" "$PCD/$SHA"
+FORGED="review recorded: reviews/$PRG5.json verdict=clean @ $POLD diff=$PNORM_REVIEWED (daniel-ospina/agent-infra) sig=$(printf '%064d' 0)"
+STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+  run_record_diff "$PRG5" "$POLD" "body
+
+$FORGED" "$PFX_REBASE"
+[ "$RECORD_RC" = "3" ] && ok "12g5 a FORGED prior marker does NOT patch-carry (rc 3)" \
+    || bad "12g5 forged marker carried (rc=$RECORD_RC) — the body became a trust boundary"
+
+# (g6) THE ANCHOR: a well-formed marker whose `diff=` is NOT what the reviewed
+# head actually normalizes to must refuse. Without the anchor, an attacker-chosen
+# sha would pair with any diff and the patch comparison would be meaningless.
+PRG6=424745; rm -f "$(Q2 $PRG6)"
+pcarry "$PRG6" "$PFX_REBASE" "$(printf 'e%.0s' $(seq 1 64))"
+[ "$RECORD_RC" = "3" ] && ok "12g6 an unanchored marker (diff= that the reviewed head does not reproduce) refuses (rc 3)" \
+    || bad "12g6 carried without the anchor — the reconstruction is not the reviewed artifact"
+
+# ── 12h MUTATION PINS for the patch arm ───────────────────────────────────
+# Each mutant is a real copy of record-review.sh with ONE line of the arm's
+# logic changed, and each must redden the vector above that depends on it.
+# `mut_dir` copies ONLY the script; each mutant here keeps the REAL normalizer,
+# because the mechanism under mutation is the ARM's logic, not the projection.
+pmut() { mut_dir "$1"; cp "$SCRIPT_DIR/lib/diff-normalize.py" "$1/lib/diff-normalize.py"; }
+PMUT="$T/mut-patch"
+pmut "$PMUT"
+# M_NOANCHOR — delete the anchor comparison (the `on != anchor` refusal).
+python3 - "$PMUT/record-review.sh" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+needle = '  if [ "$on" != "$anchor" ]; then command rm -f "$tmp"; return 1; fi\n'
+assert needle in src, "anchor mutation needle not found — the arm changed shape"
+open(p, "w", encoding="utf-8").write(src.replace(needle, '', 1))
+PY
+PRGm=424746; rm -f "$(Q2 $PRGm)"
+cp "$PFX_REVIEWED" "$PCD/$POLD"; cp "$PFX_REBASE" "$PCD/$SHA"
+STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+  run_record_diff_with "$PMUT/record-review.sh" "$PRGm" "$POLD" "body
+
+$(signed_marker "$PRGm" "$POLD" "$(printf 'e%.0s' $(seq 1 64))")" "$PFX_REBASE"
+[ "$RECORD_RC" = "0" ] && ok "12h mutation(a): with the ANCHOR removed an unanchored marker WOULD carry (rc 0) — 12g6 is load-bearing" \
+    || bad "12h mutation(a): expected a false carry without the anchor (rc=$RECORD_RC)"
+
+# M_ALWAYS — the patch comparison always succeeds (a fail-open predicate).
+PMUT2="$T/mut-patch-always"
+pmut "$PMUT2"
+python3 - "$PMUT2/record-review.sh" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+cand = [l for l in src.split('\n') if l.startswith('  [ "${pair#*$')]
+assert len(cand) == 1, cand          # exactly ONE decision line, or the mutant is ambiguous
+needle = cand[0] + '\n'
+assert needle in src, "decision mutation needle not found"
+open(p, "w", encoding="utf-8").write(src.replace(needle, '  :\n', 1))
+PY
+PRGm2=424747; rm -f "$(Q2 $PRGm2)"
+STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+  run_record_diff_with "$PMUT2/record-review.sh" "$PRGm2" "$POLD" "body
+
+$(signed_marker "$PRGm2" "$POLD" "$PNORM_REVIEWED")" "$PFX_EDIT"
+[ "$RECORD_RC" = "0" ] && ok "12h mutation(b): a comparison that always matches carries the ONE-LINE change (rc 0) — 12g2 is load-bearing" \
+    || bad "12h mutation(b): expected a false carry under the always-match mutant (rc=$RECORD_RC)"
+
+# M_NEVER — the arm can never fire (a no-op predicate): the acceptance reddens.
+PMUT3="$T/mut-patch-never"
+pmut "$PMUT3"
+python3 - "$PMUT3/record-review.sh" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+needle = 'patch_dimension_carry() { # <reviewed-sha> <reviewed-binding-digest> <current-head> -> 0 = patch unchanged\n'
+assert needle in src, "function header not found"
+open(p, "w", encoding="utf-8").write(src.replace(needle, needle + '  return 1\n', 1))
+PY
+PRGm3=424748; rm -f "$(Q2 $PRGm3)"
+STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" \
+  run_record_diff_with "$PMUT3/record-review.sh" "$PRGm3" "$POLD" "body
+
+$(signed_marker "$PRGm3" "$POLD" "$PNORM_REVIEWED")" "$PFX_REBASE"
+[ "$RECORD_RC" = "3" ] && ok "12h mutation(c): a patch arm that can never fire refuses the pure rebase (rc 3) — 12g1 is load-bearing" \
+    || bad "12h mutation(c): the dead arm still carried (rc=$RECORD_RC)"
+
+# ── 12i #1377 — `--check-carry` answers `carry-patch`, not `fresh` ────────
+# The lane's ONE way to ask "is my stale record still good?" must not answer
+# "run the review" for an unchanged PATCH — that is the 20-40 minute cost this
+# issue exists to remove. The token is DELIBERATELY not `carry`: the merge gate
+# does NOT carry a record whose binding moved, so a caller must re-record; and
+# the exit code is not 0 for the same reason.
+run_pcarry_check() { # <pr> -> CC_OUT / CC_RC (self-contained: §11.13's knobs are not reused)
+    local out rc
+    rc=0
+    out="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="$PFX_REBASE" STUB_HEAD_SHA="$SHA" \
+        STUB_COMPARE_DIFF_DIR="$PCD" STUB_BASE_SHA="$PBASE" STUB_COMPARE_DIFF_DIR="$PCD" \
+        STUB_DIFF_FAIL=0 STUB_LOCAL_BASE="" STUB_LOCAL_HEAD="" RECORD_REVIEW_LOCAL_REPO=. \
+        bash "$RECORD" --check-carry "$1" "daniel-ospina/agent-infra" 2>"$T/pcc-err")" || rc=$?
+    CC_OUT="$out"; CC_RC="$rc"
+}
+prec() { # <pr> — a local record bound to the REVIEWED head with the REVIEWED digest
+    printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+        "$1" "$POLD" "$PNORM_REVIEWED" > "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-$1.json"
+}
+PTAB="$(printf '\t')"
+PCHK=424749; prec "$PCHK"
+cp "$PFX_REVIEWED" "$PCD/$POLD"; cp "$PFX_REBASE" "$PCD/$SHA"
+run_pcarry_check "$PCHK"
+assert_eq "${CC_OUT%%"$PTAB"*}" "carry-patch" "12i1 a rebase reports 'carry-patch' (not 'fresh', not 'carry')"
+assert_eq "$CC_RC" "6" "12i1 …with its own exit code, because the gate does NOT carry it"
+if [ "${CC_OUT%%"$PTAB"*}" = "carry" ]; then bad "12i1 the token is DISTINCT from 'carry'"; else ok "12i1 the token is distinct from 'carry' (the gate will not carry it as-is)"; fi
+assert_contains "$(cat "$T/pcc-err" 2>/dev/null)" "do NOT run a review cycle" "12i1 the answer says what to do instead of reviewing"
+# The SAME record against a changed patch must still be `fresh`.
+cp "$PFX_EDIT" "$PCD/$SHA"
+run_pcarry_check "$PCHK"
+assert_eq "${CC_OUT%%"$PTAB"*}" "fresh" "12i2 a changed patch still reports 'fresh'"
+assert_eq "$CC_RC" "1" "12i2 …exit 1 (a review really is owed)"
 
 echo "── 13. tortoise#7391: fresh clean requires VERIFIED review evidence ─────"
 

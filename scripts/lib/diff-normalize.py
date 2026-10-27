@@ -69,6 +69,46 @@ does not deserve), and a SHA-1 sum is weaker than a sha256. `--verbatim` closes
 the whitespace hole but not the primitive's weakness. Normalizing keeps sha256,
 keeps whitespace-sensitivity, and adds no dependency.
 
+=== `--patch-only`: THE PATCH PROJECTION (agent-infra #1377) ===
+
+The DEFAULT mode above is the EVIDENCE BINDING: its sha256 is what a signed
+marker carries as `diff=`, and the cross-repo consumer (tortoise's
+`.github/workflows/ai-review-gate.yml`) verifies it. Do not change what it
+emits.
+
+`--patch-only` is a SECOND PROJECTION of the same bytes, used for a different
+question: *is the change a reviewer approved still the change in this branch?*
+It drops exactly three fields, all of which a REBASE rewrites even when the
+reviewed change is untouched — and keeps everything else verbatim:
+
+  * `index <old>..<new>` lines (blob ids are rewritten by every rebase);
+  * `@@ … @@` hunk headers (line numbers move);
+  * hunk CONTEXT lines (a leading single space) — the lines AROUND the change,
+    which move whenever the base lands work in the same file. This is the field
+    the default mode deliberately keeps, and the one that made a rebase onto a
+    moved base look like a changed artifact (agent-infra #1377).
+
+KEPT, verbatim and in order: the `diff --git` / `---` / `+++` lines (so the PATCH
+IDENTITY includes the PATH, which `git patch-id` does not commit to), every
+mode / rename / copy / similarity line, every `+`/`-` line (BYTE-EXACT,
+including whitespace), and `\\ No newline at end of file` markers. An entry with
+NO hunk is emitted whole — for a binary or hunk-less entry the `index` line is
+the content (the 2026-09-23 amendment), so dropping anything there would make
+two different binaries project identically.
+
+WHY A PROJECTION AND NOT `git patch-id --stable`: `--stable` "ignores all
+whitespace within the patch" (git-patch-id(1)), which is the false-ACCEPT
+#1362's decision (D1) rejected — a whitespace-only edit would project
+identically to its parent and carry a verdict it does not deserve. `--verbatim`
+closes that hole but stays SHA-1 and ignores paths. This projection keeps
+sha256, keeps whitespace byte-exact, keeps paths, and adds no dependency — so it
+carries BOTH objections of #1362 D1 forward rather than reversing them.
+
+It is NOT a second definition of "the reviewed artifact": a patch-match is only
+ever consulted AFTER the evidence binding has been reconstructed and verified
+against the marker's own `diff=` (see `patch_dimension_carry` in
+record-review.sh). A patch match can never mint a marker on its own.
+
 WHY THIS IS A CROSS-REPO CONTRACT: the consumer (`tortoise`
 `.github/workflows/ai-review-gate.yml`) verifies the same digest. If the two
 sides normalize differently, one produces a digest the other cannot verify and
@@ -90,6 +130,28 @@ import sys
 _ENTRY_RE = re.compile(r"^diff --git ")
 _INDEX_RE = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+( [0-7]{6})?$")
 _HUNK_RE = re.compile(r"^@@ -([0-9]+)(,([0-9]+))? \+([0-9]+)(,([0-9]+))? @@(.*)$")
+
+
+def _patch_only_entry(entry: list[str]) -> list[str]:
+    """Project ONE diff entry onto its PATCH identity (`--patch-only`)."""
+    # Same predicate shape as the binding: hunk PRESENCE decides. With no hunk
+    # the entry is all content (binary / empty-file add-delete), so it is
+    # emitted whole — including its `index` line, which is then the only thing
+    # that distinguishes two different binaries.
+    if not any(line.startswith("@@ ") for line in entry):
+        return list(entry)
+    out = []
+    for line in entry:
+        if _INDEX_RE.match(line):
+            continue              # blob ids are rewritten by every rebase
+        if _HUNK_RE.match(line):
+            continue              # line numbers move; the counts derive from content
+        if line.startswith(" "):
+            # CONTEXT. The only field here that a BASE MOVE rewrites without the
+            # reviewed change moving — dropped for the patch identity alone.
+            continue
+        out.append(line)
+    return out
 
 
 def _normalize_entry(entry: list[str]) -> list[str]:
@@ -120,8 +182,8 @@ def _normalize_entry(entry: list[str]) -> list[str]:
     return out
 
 
-def normalize_diff(raw: bytes) -> bytes:
-    """Return the normalized rendering of a raw unified-diff byte stream."""
+def _project(raw: bytes, entry_projector) -> bytes:
+    """Split on entry boundaries and project each entry with `entry_projector`."""
     lines = raw.decode("latin-1").split("\n")
     # Entry boundaries at every `^diff --git ` line; `len(lines)` terminates the
     # LAST entry. Lines before the first boundary form a leading segment (a real
@@ -132,16 +194,42 @@ def normalize_diff(raw: bytes) -> bytes:
     out: list[str] = []
     start = 0
     for end in bounds:
-        out.extend(_normalize_entry(lines[start:end]))
+        out.extend(entry_projector(lines[start:end]))
         start = end
     return "\n".join(out).encode("latin-1")
 
 
-def main() -> int:
-    sys.stdout.buffer.write(normalize_diff(sys.stdin.buffer.read()))
+def normalize_diff(raw: bytes) -> bytes:
+    """Return the normalized rendering of a raw unified-diff byte stream."""
+    return _project(raw, _normalize_entry)
+
+
+def patch_only_diff(raw: bytes) -> bytes:
+    """Return the PATCH-identity projection of a raw unified-diff byte stream."""
+    return _project(raw, _patch_only_entry)
+
+
+def main(argv: list[str]) -> int:
+    # Default (no flag) is the BINDING projection — the cross-repo contract. The
+    # flag is additive and never changes the default output.
+    if argv:
+        if argv == ["--patch-only"]:
+            out = patch_only_diff(sys.stdin.buffer.read())
+        else:
+            sys.stderr.write(
+                "diff-normalize.py: unknown argument(s) %r — the only accepted form "
+                "is no argument (the evidence BINDING projection) or --patch-only "
+                "(the PATCH identity projection). Refusing rather than silently "
+                "emitting the wrong projection: a caller that asked for one and got "
+                "the other would compare unlike digests.\n" % (argv,)
+            )
+            return 2
+    else:
+        out = normalize_diff(sys.stdin.buffer.read())
+    sys.stdout.buffer.write(out)
     sys.stdout.buffer.flush()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
