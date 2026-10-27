@@ -2224,7 +2224,7 @@ function isGhWordAt(scan: ScanTokens, i: number): boolean {
   return isCommandPositionAt(scan, i);
 }
 
-function hasBareGhWord(command: string): boolean {
+export function hasBareGhWord(command: string): boolean {
   const scan = scanTokens(command);
   return scan.tokens.some((_, i) => isGhWordAt(scan, i));
 }
@@ -5662,7 +5662,7 @@ function withoutAssignmentPrefix(word: string): string {
  * `${head}`, the `-->` that closes an HTML marker. Reading those as the `gh` command word made a
  * heredoc that WRITES this gate's own evidence marker (`cat > f <<'EOF' … <!-- admin-merge-
  * safety: ${head} --> … EOF`) a REFUSED read-only command — measured in review cycle 4;
- * `origin/main` admits it. So a construct is accepted only when it CARRIES ITS INTRODUCER
+ * `04bc1dde` (the pre-#3953 base) admits it. So a construct is accepted only when it CARRIES ITS INTRODUCER
  * (`$…`, a backtick, `{…}`), and the one residue that IS a word — the tail of a split `${X}`,
  * i.e. the tokens `$` + `X}` — is accepted only where the `${` itself begins a simple command.
  *
@@ -5774,6 +5774,14 @@ function mergeVerbSequenceInTokens(command: string): boolean {
   return mergeVerbWalk(command, true) || mergeVerbWalk(command, false);
 }
 
+/** Is there a bare NUMBER (a PR position) in the tokens after index `i`? */
+function bareNumberAfter(scan: ScanTokens, i: number): boolean {
+  for (let k = i + 1; k < scan.tokens.length; k++) {
+    if (/^\d+$/.test(shellWord(scan.tokens[k]))) return true;
+  }
+  return false;
+}
+
 /**
  * The walk. `groupFirst` decides which reading wins for a construct at the group stage.
  *
@@ -5782,7 +5790,7 @@ function mergeVerbSequenceInTokens(command: string): boolean {
  * DEQUOTED word, so `$'--dry-run'` is a flag), and not shell punctuation. A heredoc writing
  * `<!-- admin-merge-safety: ${head} -->` therefore has no reachable `gh`→group→verb triple: its
  * `<`, `<<'EOF'` and `-->` tokens are all excluded, and what remains (`head}`) cannot complete a
- * sequence — `origin/main` admits that heredoc, and the arms that refused it are the ones this PR
+ * sequence — `04bc1dde` (measured there) admits that heredoc, and the arms that refused it are the ones this PR
  * narrows (measured, review cycles 4 and 5). An intermediate ADJACENCY bound was removed once
  * these tests were in place: measured redundant on the whole corpus.
  */
@@ -5827,7 +5835,16 @@ function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
     const isCommandWord = /\bgh\b/.test(w) || isConstructWord;
     if (stage === 2) {
       if (verbWord === "merge") return true;
-      if (isConstructWord) return true;
+      // ⛔ A CONSTRUCT IN THE VERB SLOT NEEDS A PR NUMBER AFTER IT (review cycle 6, P1 over-block).
+      // Without that bound three CONSECUTIVE variable words read as `gh`→`pr`→`merge`, so
+      // `node $A $B $C admin`, `git log $A $B $C --author=admin`, `echo $A $B $C admin` and
+      // `bash "$AIR/…/verify-admin-merge-evidence.sh" "$PR" "$HEAD"` were refused at the merged
+      // #2907 head `78d897fa1` — the base before it, `04bc1dde`, admits every one (both measured) —
+      // while the assembled merges this arm exists for all carry
+      // `999` (`GH=gh; ${GH} ${P} $M 999 --admin`, `g$'h' $P $M 999 --admin`). A merge cannot be
+      // certified without a PR number anyway; when it is a VARIABLE the base did not read the
+      // command either (declared residual).
+      if (isConstructWord && bareNumberAfter(scan, i)) return true;
       // A pure-whitespace assignment (`CMD+=' '`) is a SEPARATOR being assembled, not a verb
       // slot: skipping it is what lets `CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge` read as
       // one invocation (measured as a real bypass).
@@ -5948,7 +5965,7 @@ export function mergeInvocationInText(command: string): boolean {
   // The shared count, tied to two other reads. On its own it is too blunt to be the candidate
   // rule: it walks constructs ANYWHERE, so a heredoc that WRITES this gate's own evidence marker
   // (`cat > f <<'EOF'` ... `<!-- admin-merge-safety: ${head} -->` ... `EOF`) counts as one merge
-  // there (`countMergeVerbs` is 1, unchanged by this PR) while `origin/main` admits it. So the
+  // there (`countMergeVerbs` is 1, unchanged by this PR) while the pre-#3953 base `04bc1dde` admits it (measured). So the
   // window only counts when the command ALSO carries a `gh` command word (`hasGhCommandWord`,
   // NOT position-gated: a wrapper's arguments hide the position) AND the word `merge`
   // (`MERGE_WORD`, so a hyphenated identifier does not count). Measured with this gate removed:
@@ -5974,11 +5991,28 @@ export function mergeInvocationInText(command: string): boolean {
   // never closes — while `mergeVerbInText` DOES name a merge for all of them. Two predicates
   // for "is this a merge" disagreeing is the failure this file keeps re-learning, so the
   // candidate rule is made a SUPERSET of that read rather than a second opinion beside it.
-  // SCOPED PRECISELY: the pinned invariant is `mergeVerbInText(c) ⇒ mergeInvocationInText(c)`.
+  // SCOPED PRECISELY: the pinned invariant is `(hasBareGhWord ∨ MERGE_WORD) ∧ mergeVerbInText(c)
+  // ⇒ mergeInvocationInText(c)` — the two merges-reads may not disagree ABOUT A MERGE INVOCATION.
+  // ⛔ `hasBareGhWord`, NOT `hasGhCommandWord`: a CONSTRUCT counts as a gh command word
+  // (`$PR` — see `hasGhCommandWord`), so the wider conjunct would re-state as an invariant the
+  // very over-block this arm's bound exists to remove (`echo pr $PR admin`: `hasGhCommandWord`
+  // true, candidate false, measured — 202 violations of the wider form over a 580-input corpus,
+  // 0 of this one).
+  // The unconditional form is FALSE and was measured so (review cycle 6): `mergeVerbInText` also
+  // names a bare `pr` mention with no `gh` in the command, which is not an invocation.
   // `isAdminMergeCommand` is a DIFFERENT (narrower) question — it also requires
   // `hasAdminMergeFlag`, so `gh pr merge 999` (no flag anywhere) is a merge this rule sees and
   // the ADMIN-merge gate does not, which is correct and is how the registry gate gets it.
-  if (mergeVerbInText(bare)) return true;
+  // ⛔ BUT NOT ON A BARE `pr` MENTION (review cycle 6, P1 over-block). That read is quote-blind
+  // for a construct after a bare `pr` WORD, so on its own it refused `echo pr $PR admin` and
+  // `echo "pr $PR admin"` — commands the pre-#3953 base `04bc1dde` ADMITS and the merged head
+  // `78d897fa1` refuses (both measured), containing no `gh` at all. The bound is
+  // that the command must still look like a merge INVOCATION: a BARE `gh` word somewhere
+  // (`hasBareGhWord` — a CONSTRUCT such as `$PR` is not enough, or every `$`-bearing command with
+  // the word `pr` in it would qualify) or the WORD `merge` (`MERGE_WORD`). Measured: every cycle-1
+  // shape this arm exists for has the literal `gh` word, and the `pr merge <n> --admin` fragment
+  // has the verb word — both survive; the `echo pr $PR` class does not.
+  if ((hasBareGhWord(bare) || MERGE_WORD.test(bare)) && mergeVerbInText(bare)) return true;
   // The separators are not recoverable from the text, so the token arms above are not a
   // read of this command: refuse on the WORDS read, which is what the pre-#3953 rule did.
   if (ansiCEncodesSeparator(bare)) {
