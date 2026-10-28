@@ -174,3 +174,147 @@ def test_every_published_verdict_is_classified():
         "UNATTRIBUTED-WORKING became messageable" % sorted(unclassified))
     stale = (busy | proceeds) - set(lane_status.PUBLISHED_VERDICTS)
     assert not stale, "classified here but never published by lane-status: %s" % sorted(stale)
+
+
+# ── THE VENDOR IS TYPESAFE — HOST MOVED, AND THE MODEL FOLLOWED ON 2026-10-27 ──────────────
+# ⛔ THE DEFECT THEY EXIST FOR. Every caller in the fleet POSTed to `jevtypesafeai.com`, a
+# lookalike host that billed on its own account, for as long as the constants said so. Nothing
+# failed and no test noticed: the code was INTERNALLY consistent, so the only thing that could
+# have caught it was an assertion on the endpoint itself. The owner's money went to that host
+# (tortoise#7864, paid off there). These legs assert the ENDPOINT, the MODEL, the KEY
+# PRECEDENCE, the REQUEST SHAPE and the META SHAPE — the five things a rotation must not
+# silently break.
+#
+# ⚠️ THE MODEL IS THE ALIAS `jev-latest`, BY OWNER RULING (2026-10-27). The bars in this file and
+# in ask-owner.py were calibrated on the LOOKALIKE host's `jev-1.13.0` and not re-measured since
+# the migration (tortoise#7864). So the voting model now moves whenever the
+# vendor ships — and a literal assertion against an alias CANNOT notice that (it passes on every
+# future release). What notices it is the ECHO: the response carries the concrete version that
+# answered, `jev_choice` puts it in `meta["model"]`, and the leg below
+# (`test_call_shape_and_meta_carry_tokens_not_an_invented_cost`) asserts that echo is the one
+# recorded. That echo ALREADY reads `jev-1.14.0`, so the Jev-scored bars are owed a first real
+# calibration against the vendor — a current debt, not a future trigger: `MIN_CONFIDENCE` is
+# tracked on #2918, and `ask-owner.py`'s `THRESHOLD` / `THRESHOLD_LANGUAGE` on #1476 (its
+# `THRESHOLD_JARGON` is NOT owed one: it sits over the mechanical marks, which make no Jev call).
+
+class _Resp:
+    """Minimal stand-in for the urlopen context manager the caller uses."""
+
+    def __init__(self, payload):
+        self._b = json.dumps(payload).encode()
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _no_log(monkeypatch, tmp_path):
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(tc, "HOME", str(tmp_path))
+    monkeypatch.setattr(tc, "STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(tc, "LOG", str(tmp_path / "state" / "turn-classify.log"))
+
+
+def test_the_endpoint_is_the_real_typesafe_api():
+    """A lookalike host is indistinguishable from the real one by usage: only the URL differs."""
+    assert tc.JEV_URL == "https://api.typesafe.ai/v1/systemone", tc.JEV_URL
+    assert "jevtypesafeai" not in tc.JEV_URL
+
+
+def test_the_model_is_the_vendor_alias_not_a_version_pin():
+    """Owner ruling 2026-10-27: "let's use jev latest".
+
+    This asserts the RULING, so that a re-pin is a visible decision rather than a quiet edit —
+    it does NOT and cannot assert which version votes, because the alias moves. That claim is
+    carried by the echo leg below (`meta["model"]` is the concrete version the API reported),
+    which is the only place the difference is observable."""
+    assert tc.JEV_MODEL == "jev-latest", (
+        "the owner specified the vendor alias; a version pin here is a decision that has to be "
+        "made deliberately and recorded (got %r)" % (tc.JEV_MODEL,))
+
+
+def test_key_precedence_typesafe_name_then_the_legacy_one(monkeypatch, tmp_path):
+    """`TYPESAFE_API_KEY` is the vendor's own name; `JEV_API_KEY` stays accepted because every
+    plist, shell and cell env already sets THAT one (agent-infra#2642). The 0600 config file is
+    the last resort, and its absence must read as None (never as a fake pass)."""
+    _no_log(monkeypatch, tmp_path)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    assert tc.jev_key() is None
+    monkeypatch.setenv("JEV_API_KEY", "legacy-name-key")
+    assert tc.jev_key() == "legacy-name-key"
+    monkeypatch.setenv("TYPESAFE_API_KEY", "vendor-name-key")
+    assert tc.jev_key() == "vendor-name-key"
+    # ⛔ A WHITESPACE-ONLY value is truthy, so it used to win over the populated 0600 store and
+    # go out as `Bearer ` — a 401 whose cause looks like "the key is set". Empty was already
+    # skipped; whitespace was not. Falls THROUGH to the legacy name, and is stripped.
+    monkeypatch.setenv("TYPESAFE_API_KEY", "   ")
+    assert tc.jev_key() == "legacy-name-key"
+    monkeypatch.setenv("JEV_API_KEY", "  padded-key\n")
+    assert tc.jev_key() == "padded-key"
+
+
+def test_key_falls_back_to_the_config_store(monkeypatch, tmp_path):
+    _no_log(monkeypatch, tmp_path)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    cfg = tmp_path / ".pi" / "agent" / "jev-config.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"apiKey": "from-the-store", "model": "jev-latest"}))
+    assert tc.jev_key() == "from-the-store"
+
+
+def test_call_shape_and_meta_carry_tokens_not_an_invented_cost(monkeypatch, tmp_path):
+    """The real API answers `usage: {input_tokens, output_tokens}` — there is no `cost_usd`.
+    Reporting an absent meter as a measured `0` is the false-measurement class this pins
+    against: the meta must OMIT it, and the decision must still be read from the typed answer."""
+    _no_log(monkeypatch, tmp_path)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["body"] = json.loads(req.data.decode())
+        seen["auth"] = req.get_header("Authorization")
+        return _Resp({"model": "jev-1.14.0",
+                      "answers": {"outcome": {"type": "choice",
+                                              "choice": "finished_the_work",
+                                              "confidence": 0.91}},
+                      "usage": {"input_tokens": 10, "output_tokens": 3}})
+
+    monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+    choice, meta = tc.jev_choice("the turn's final message")
+
+    assert choice == "finished_the_work", choice
+    # ⛔ THE ALIAS MAKES THE ECHO LOAD-BEARING. The request says `jev-latest`; the response above
+    # says the concrete version that answered. With a pinned model those two were the same fact;
+    # with an alias they are not, and the record must carry the SECOND one — otherwise a verdict
+    # that shifted because the vendor shipped is indistinguishable from a bug in the marks.
+    assert meta["model"] == "jev-1.14.0", meta
+    assert meta["model"] != "jev-latest", (
+        "the meta must report the version the API ANSWERED with, not the alias we sent")
+    assert seen["url"] == tc.JEV_URL, seen["url"]
+    assert seen["body"]["model"] == tc.JEV_MODEL, seen["body"]
+    assert seen["body"]["state"] == "the turn's final message"
+    # THE PAYLOAD SHAPE, asserted rather than assumed: `questions` must be a name-keyed MAP, and
+    # each question must carry `instructions` so the judgement is the one this file intends.
+    # ⛔ THE STATED RULE IS MEASURED, NOT ASSUMED (review 2026-10-26): an ARRAY of questions is a
+    # 422; a question with NEITHER criteria NOR instructions is a 400; a question with criteria
+    # and no instructions is a 200 — so "the API requires instructions" is false for a
+    # criteria-bearing question. We assert it because it carries the instruction text, not
+    # because the endpoint refuses without it. Mutation: flattening TURN_QUESTION into a
+    # positional list used to leave EVERY leg green and only failed at runtime as a 422 — every
+    # lane then read UNCLASSIFIED.
+    q = seen["body"]["questions"]["outcome"]
+    assert seen["body"]["questions"].keys() == {"outcome"}, seen["body"]["questions"]
+    assert q["type"] == "choice", q
+    assert isinstance(q["instructions"], str) and q["instructions"].strip(), q
+    assert set(q["criteria"]) == set(tc.OUTCOMES), q
+    assert seen["auth"] == "Bearer k", seen["auth"]
+    assert (meta["input_tokens"], meta["output_tokens"]) == (10, 3), meta
+    assert "cost_usd" not in meta, "an absent meter must not be reported as a measured 0"

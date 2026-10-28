@@ -1,0 +1,12 @@
+# The safe direction of the same shape: the apostrophe must not turn a compliant push workflow RED
+# (#2660 round 13).
+name: push flow apostrophe plain false
+on:
+  push:
+    branches: [main]
+concurrency: {group: shell 'em out, cancel-in-progress: false}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
