@@ -1,0 +1,16 @@
+# `merge_commit_sha` is recomputed per head, so a group keyed on it is per-head and the block cancels
+# nothing — the inert gate the per-commit rule names. Round 12 fixed one spelling and round 15 found the
+# family still open: the test is now scoped to EXPRESSION SPANS and matches `_sha` there, which covers
+# merge_commit_sha / head_sha / check_suite sha without refusing a literal prefix that merely contains
+# the letters (#2660 round 15).
+name: pr group merge commit sha
+on:
+  pull_request:
+concurrency:
+  group: pr-group-merge-commit-sha-${{ github.event.pull_request.merge_commit_sha }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

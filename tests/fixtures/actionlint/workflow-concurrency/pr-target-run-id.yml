@@ -1,0 +1,13 @@
+# A `pull_request_target` group that carries the PR number AND a per-commit variable. The PR-number
+# check alone accepts it, but `github.run_id` makes every retry its own group — the block cancels
+# nothing. The per-commit refusal must apply on BOTH PR paths, not only `pull_request` (#2660 round 4).
+name: PR target run id
+on: pull_request_target
+concurrency:
+  group: pr-target-run-id-${{ github.event.pull_request.number }}-${{ github.run_id }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

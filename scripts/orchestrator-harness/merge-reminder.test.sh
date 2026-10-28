@@ -116,7 +116,14 @@ git init --quiet -b main "$REPO_SRC" 2>/dev/null
 git -C "$REPO_SRC" config user.email t@example.invalid
 git -C "$REPO_SRC" config user.name t
 : > "$REPO_SRC/README"
-git -C "$REPO_SRC" add README
+# ⛔ THE FIXTURE REPO CARRIES THE HARNESS MARKER (#2683 round 2). `harness_repo_of` accepts a checkout
+# only if it carries `scripts/orchestrator-harness/box-status.sh`, which is what stops a tortoise
+# checkout being taken for the harness repo. The fixture models the NORMAL case — a box whose harness
+# repo IS the repo it sweeps — so it needs the marker; a case that needs a repo WITHOUT it builds its
+# own (`$FX/plainrepo`).
+mkdir -p "$REPO_SRC/scripts/orchestrator-harness"
+: > "$REPO_SRC/scripts/orchestrator-harness/box-status.sh"
+git -C "$REPO_SRC" add README scripts/orchestrator-harness/box-status.sh
 git -C "$REPO_SRC" commit --quiet -m "fixture base"
 git -C "$REPO_SRC" remote add origin "$TMP/origin.git"
 git -C "$REPO_SRC" push --quiet origin main
@@ -184,8 +191,11 @@ STUB
 # ⛔ The stub must not expand $MAIN12 at RUN time: it runs in the REMINDER's environment, where that
 # variable does not exist (a stub that did would write an empty sha and the artifact check would pass
 # against nothing). The "after" artifact is written HERE, with the value already baked in.
-printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
-  "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.current.txt"
+# ⛔ AND THE TREE IT EXECUTES. `controller: RUNNING` is not activation: the pin names what the NEXT
+# launch runs, so a box whose controller still execs an older tree is `restart-pending` and counts for
+# nothing (#2680). `running:` is the only line that answers it.
+printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$MAIN12" "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.current.txt"
 cat > "$TMP/box-activate.sh" <<'STUB'
 #!/usr/bin/env bash
 echo "activate-ran" >> "$FIXTURE/activate.txt"
@@ -233,9 +243,12 @@ write_baseline() {
   # a record AT the live head, in the shape record-review.sh writes
   printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-10-23T04:10:00Z"}\n' \
     "$HEAD" "$SLUG" > "$REV/${SLUG//\//-}-42.json"
-  # deploy: the box is CURRENT, so the deploy arm is a no-op in every landing case
-  printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 1)\nroles: idle\n' \
-    "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.txt"
+  # deploy: the box is CURRENT and ACTIVATED, so the deploy arm is a no-op in every landing case.
+  # ⛔ `running:` IS PART OF "CURRENT" (#2680): the pin names the version the NEXT launch runs, so a
+  # controller that execs an older tree is `restart-pending` — deployed, not activated, and it may not
+  # count. A baseline without this line would make every landing case look healthy on a stale process.
+  printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 1)\nrunning: %s\nroles: idle\n' \
+    "$MAIN12" "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.txt"
   printf 'local\tbash %s --o %s\tbash %s\n' "$TMP/box-status-stub.sh" "$O" "$TMP/box-activate.sh" > "$O/state/boxes.tsv"
 }
 run_sut() { # extra args…
@@ -244,7 +257,15 @@ run_sut() { # extra args…
   # left ambient, the same suite passed on a box that HAS a pin and went red on a clean machine (and
   # leaked the developer's sha into the report).
   mkdir -p "$TMP/home"
+  # ⛔ HARNESS_REPO IS PINNED TO THE FIXTURE REPO. The SUT resolves the harness checkout from
+  # `HARNESS_REPO`, `$O`, its own location and `$HOME/orchestrator`; left ambient, the third candidate
+  # is THIS worktree (a real agent-infra checkout), so the harness main would be the real repo's and
+  # every goal-2 assertion would compare against a sha the fixtures never heard of. Pinning it to the
+  # fixture repo models the real relationship — a box whose harness repo IS the repo it sweeps — and it
+  # exercises the same-repo path (ONE read, reused). A case that needs the two repos to DIFFER passes
+  # `HARNESS_REPO=<other repo> run_sut`, which this default does not override.
   env -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN HOME="$TMP/home" \
+    HARNESS_REPO="${HARNESS_REPO:-$REPO_SRC}" \
     FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
     python3 "$SUT" --o "$O" --reviews "$REV" --repo "$SLUG" --rail "$TMP/rail.sh" \
       --rail-wait-s 5 --verify-deploy-s 3 --retry-s 900 "$@"
@@ -529,8 +550,11 @@ spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 o = Path(sys.argv[2])
 got = m.deploy_arm(o, "", False, 1, False, True)
-ok = (len(got) == 1 and got[0]["box"] == "<origin/main>"
-      and "UNREADABLE origin/main" in got[0]["verdict"])
+# ⛔ THE ROW NAMES THE **HARNESS** MAIN (PR #2683): that is the value this arm compares a box with, and
+# a refusal that says "origin/main" leaves the reader unsure WHICH main could not be read — the same
+# ambiguity the #2679 defect grew out of.
+ok = (len(got) == 1 and got[0]["box"] == "<harness origin/main>"
+      and "UNREADABLE harness origin/main" in got[0]["verdict"])
 print(0 if ok else 1)
 PYMOD
 )"
@@ -1898,8 +1922,11 @@ ck "§27 an INCOMPLETE search answer is not a count (never P0=0 / DONE)" \
 
 # GOAL 2's markers: every box on the pin, else the marker is BROKEN and the drifted box is NAMED.
 write_no_landing; reset_o
-printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
-  "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.current.txt"
+# ⛔ AND THE TREE IT EXECUTES. `controller: RUNNING` is not activation: the pin names what the NEXT
+# launch runs, so a box whose controller still execs an older tree is `restart-pending` and counts for
+# nothing (#2680). `running:` is the only line that answers it.
+printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$MAIN12" "$MAIN12" "$MAIN12" "$MAIN12" > "$FX/box.current.txt"
 printf 'harness: %s [behind] source=pin\ncontroller: RUNNING(pid 4243)\nroles: idle\n' \
   "${OTHER:0:12}" > "$FX/box.behind.txt"
 cat > "$TMP/box-cur.sh" <<'STUB'
@@ -2057,7 +2084,7 @@ printf 'cell-1	bash %s
 out="$(run_sut)"; rc=$?
 MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 an unreadable origin/main states NO comparison (\`not compared\`), never 0/N" \
-   "$(qF 'not compared — `origin/main` was unreadable' "$MDF" && nq 'on this cycle' "$MDF" && echo 0 || echo 1)"
+   "$(qF "not compared — the harness repo's \`origin/main\` was unreadable" "$MDF" && nq 'on this cycle' "$MDF" && echo 0 || echo 1)"
 ck "§27 ...and its action says so IN FULL and still NAMES the boxes" \
    "$(qF 'repair that read first.' "$MDF" && qF 'cell-1 (main=UNREADABLE' "$MDF" \
       && nq 'boxes run this cycle' "$MDF" && echo 0 || echo 1)"
@@ -2371,6 +2398,767 @@ MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
 ck "§27 a box that did not ANSWER states no fraction (1/2 is a claim about both)" \
    "$(nq 'on this cycle' "$MDF" && qF 'gave no answer' "$MDF" && echo 0 || echo 1)"
 rm -f "$O/state/boxes.tsv"
+
+# ═══ §27b GOAL 2 IS THE **HARNESS** REPO'S MAIN, AND "ACTIVATED" IS THE RUNNING TREE ═════════════
+# Two measured false readings on the owner's goal 2 (agent-infra#2679, #2680). Both were found on the
+# live fleet minutes after #2611 merged, and both are the class this file exists to refuse: a goal
+# word derived from something other than the fact it claims.
+#
+# ⛔ #2679 — TWO MAINS, AND THEY ARE NOT INTERCHANGEABLE. The cycle's `origin/main` belongs to the repo
+# it SWEEPS (right for the PR/claim gates) and a harness sha is an AGENT-INFRA commit. Measured with
+# the sweep repo set to a tortoise checkout (the fleet's default shape for two of its cells): goal 2
+# read `0/1 boxes ... deploy/activate it` against `main=5f40d832c254` — a TORTOISE sha — for a box
+# sitting exactly on the harness pin. The harness repo is resolved from the payload (`$O`) or
+# `HARNESS_REPO`, and the box's own status command is told so in its ENVIRONMENT (`REPO=`), because a
+# status command inherits the sweep repo and would compare against the wrong main by itself.
+write_no_landing; reset_o
+HREPO="$FX/hrepo"
+rm -rf "$HREPO" "$FX/hrepo-origin.git"
+git init --quiet -b main "$HREPO" 2>/dev/null
+git -C "$HREPO" config user.email t@example.invalid
+git -C "$HREPO" config user.name t
+: > "$HREPO/README"
+mkdir -p "$HREPO/scripts/orchestrator-harness"
+: > "$HREPO/scripts/orchestrator-harness/box-status.sh"
+git -C "$HREPO" add README scripts/orchestrator-harness/box-status.sh
+git -C "$HREPO" commit --quiet -m "harness fixture base"
+git init --quiet --bare "$FX/hrepo-origin.git"
+git -C "$HREPO" remote add origin "$FX/hrepo-origin.git"
+git -C "$HREPO" push --quiet origin main
+HMAIN40="$(git -C "$HREPO" rev-parse origin/main)"
+HMAIN12="$(printf '%s' "$HMAIN40" | cut -c1-12)"
+ck "§27b the harness fixture's main really differs from the swept repo's (the case under test)" \
+   "$([ "$HMAIN40" != "$MAIN40" ] && echo 0 || echo 1)"
+# A box that IS on the harness main, activated at it.
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$HMAIN12" "$HMAIN12" > "$FX/box.hmain.txt"
+cat > "$TMP/box-hmain.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.hmain.txt"
+STUB
+chmod +x "$TMP/box-hmain.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-hmain.sh" > "$O/state/boxes.tsv"
+out="$(HARNESS_REPO="$HREPO" run_sut --json)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27b --json publishes BOTH mains, and they are different reads" \
+   "$(printf '%s' "$out" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+m, h = d.get("main") or "", d.get("harness_main") or ""
+print(0 if m and h and m != h else 1)' 2>/dev/null || echo 1)"
+ck "§27b goal 2 judges the box against the HARNESS main (#2679)" \
+   "$(qF "cell-1=$HMAIN12 [current]" "$MDF" && echo 0 || echo 1)"
+ck "§27b ...so the goal HOLDS on a box that is on the harness main, whatever the swept repo's main is" \
+   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && echo 0 || echo 1)"
+ck "§27b ...and the header names the harness main BESIDE the swept one" \
+   "$(qF "**harness main:** \`$HMAIN12\`" "$MDF" && echo 0 || echo 1)"
+# The status command is TOLD which repo the comparison is about — it inherits the sweep repo otherwise,
+# and the measured failure was a box answering `[unknown]` against a tortoise main for an agent-infra pin.
+cat > "$TMP/box-env.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$HMAIN12" "$HMAIN12"
+# The observation goes to a FILE: the SUT's stdout is one line by design, so a probe's own output
+# cannot be read back from it.
+printf '%s\n' "${REPO:-<unset>}" > "$FIXTURE/saw-repo.txt"
+STUB
+chmod +x "$TMP/box-env.sh"
+rm -f "$FX/saw-repo.txt"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-env.sh" > "$O/state/boxes.tsv"
+out="$(HARNESS_REPO="$HREPO" run_sut)"; rc=$?
+ck "§27b the box's status command is given REPO=<the harness repo>, not the swept repo (#2679)" \
+   "$([ "$(cat "$FX/saw-repo.txt" 2>/dev/null)" = "$HREPO" ] && echo 0 || echo 1)"
+
+# ⛔ #2680 — "ACTIVATED" IS THE TREE THE CONTROLLER EXECUTES. A pin is advanced for the NEXT launch
+# (`harness-refresh.sh` names that `restart-pending`), so `controller: RUNNING` off the pin certified a
+# box as deployed-AND-activated while the process executed pre-fix code. Measured on the hub: pin and
+# payload at `f9381dae2ee5`, controller exec'ing `harness/f6a1a01772bd/orch-loop.sh`, goal reading
+# `1/1 ... deployed AND activated`.
+write_no_landing; reset_o
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$MAIN12" "${OTHER:0:12}" > "$FX/box.restartpending.txt"
+cat > "$TMP/box-rp.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.restartpending.txt"
+STUB
+chmod +x "$TMP/box-rp.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-rp.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27b a box whose controller still execs ANOTHER tree is restart-pending, named with that tree" \
+   "$(qF "restart-pending(running=${OTHER:0:12})" "$MDF" && echo 0 || echo 1)"
+ck "§27b ...and it does NOT count as deployed-and-activated (0/1)" \
+   "$(qF '0/1 box(es) on this cycle' "$MDF" && qF 'STANDING=MARKERS-BROKEN' "$MDF" && echo 0 || echo 1)"
+ck "§27b ...and the deploy table calls it deployed-but-NOT-activated, never 'current'" \
+   "$(qF 'deployed-but-NOT-activated' "$MDF" && nq '| cell-1 | '"$MAIN12"' [current] | RUNNING(pid 4242) | idle | current |' "$MDF" && echo 0 || echo 1)"
+# A payload whose status command does not answer the question at all (an older `box-status.sh`) may not
+# be counted either: silence is not activation. Fail-closed, the same rule the roles read follows.
+write_no_landing; reset_o
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nroles: idle\n' \
+  "$MAIN12" > "$FX/box.norunning.txt"
+cat > "$TMP/box-norun.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.norunning.txt"
+STUB
+chmod +x "$TMP/box-norun.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-norun.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27b a status command that never answers the running tree is NOT activated (fail-closed)" \
+   "$(qF 'running=NOT-REPORTED' "$MDF" && qF 'STANDING=MARKERS-BROKEN' "$MDF" && echo 0 || echo 1)"
+ck "§27b ...and it is not counted either (0/1)" \
+   "$(qF '0/1 box(es) on this cycle' "$MDF" && echo 0 || echo 1)"
+# The running-tree reader is a COMPARISON, not a constant: if the `running:` line agrees with the pin the
+# box counts (the baseline fixtures prove the HOLD side; this proves the same fixture flips on ONE field).
+write_no_landing; reset_o
+printf 'harness: %s [current] source=pin\ncontroller: RUNNING(pid 4242)\nrunning: %s\nroles: idle\n' \
+  "$MAIN12" "$MAIN12" > "$FX/box.samerun.txt"
+cat > "$TMP/box-samerun.sh" <<'STUB'
+#!/usr/bin/env bash
+cat "$FIXTURE/box.samerun.txt"
+STUB
+chmod +x "$TMP/box-samerun.sh"
+printf 'cell-1\tbash %s\t\n' "$TMP/box-samerun.sh" > "$O/state/boxes.tsv"
+out="$(run_sut)"; rc=$?
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+ck "§27b the SAME fixture with running==pin counts (the term is the comparison, not the line)" \
+   "$(qF 'STANDING=MARKERS-HOLD' "$MDF" && qF '1/1 box(es) on this cycle' "$MDF" && echo 0 || echo 1)"
+
+# ⛔ #2683 ROUND 1 — THE RESOLUTION MUST WORK IN THE CONFIGURATION THE TOOL ITSELF INSTALLS. The first
+# cut consulted `HARNESS_REPO` and `$O` only. The timer exports neither (`O`/`HOME`/`PATH`), and `--o`
+# defaults to `$HOME/orchestrator`, which on the hub is NOT a checkout — so the resolution returned None,
+# the caller fell back to the SWEPT repo's main, and the header printed a tortoise sha under a
+# `**harness main:**` label. The third candidate (this script's own checkout) is what makes it work; the
+# fourth is the documented `--o` default. Driven here from a COPY of the SUT outside every checkout,
+# with `HARNESS_REPO` unset and a `$HOME` that has no `orchestrator/`: the honest answer is UNRESOLVED,
+# never the swept repo's main.
+write_no_landing; reset_o
+mkdir -p "$TMP/nowhere"
+cp "$SUT" "$TMP/nowhere/mr.py"
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 "$TMP/nowhere/mr.py" --o "$O" --reviews "$REV" --repo "$SLUG" --rail "$TMP/rail.sh" \
+     --rail-wait-s 5 --verify-deploy-s 3 --retry-s 900 --no-act --json 2>/dev/null)"
+ck "§27b a SUT outside every checkout with no HARNESS_REPO reports harness_main as UNRESOLVED, not the swept main" \
+   "$(printf '%s' "$out" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print(0 if d.get("harness_main") == "" and (d.get("main") or "") != "" else 1)' 2>/dev/null || echo 1)"
+MDF="$(cat "$O/MERGE-REMINDER.md" 2>/dev/null)"
+# The value is EXTRACTED from the header line rather than grepped as a substring: the line carries
+# backticks, and a fixed-string pattern around them is a pattern no reader can verify by eye.
+# The header is read from the FILE, not from a captured copy: the report the copy-run wrote is the
+# artifact under test, and a stale `$MDF` from an earlier case in the same block is exactly the kind of
+# two-readers disagreement this file keeps repairing.
+ck "§27b ...and the header says UNRESOLVED instead of printing a foreign sha" \
+   "$([ "$(sed -n 's/.*harness main:\*\*[[:space:]]*`\([^`]*\)`.*/\1/p' "$O/MERGE-REMINDER.md" | head -1)" = "UNRESOLVED" ] && echo 0 || echo 1)"
+ck "§27b ...and goal 2 is NOT-MEASURED for that reason, never compared against the swept repo" \
+   "$(qF 'the harness repo could not be resolved' "$MDF" && nq 'a different commit from this cycle' "$MDF" && echo 0 || echo 1)"
+# ...and the SUT DOES resolve its own checkout (the case the fix exists for): no copy is made, because
+# the script under test is ALREADY inside a checkout and running the copy would test the copy's location.
+# ⛔ NO APOSTROPHE (or any unbalanced quote) IN THE PYTHON BELOW: bash 3.2 — `/bin/bash` on macOS, what
+# `install.sh` runs — does not skip a heredoc body when it scans `$( )` for quotes, so one apostrophe
+# here reads as an unterminated string, the file fails `bash -n`, and the harness cannot re-stamp (#2976).
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+# candidate 3 is the checkout THIS script lives in: the resolution must find it even with nothing exported
+got = m.harness_repo_of(Path("/nonexistent-o"))
+here = Path(sys.argv[1]).resolve().parents[2]
+print(0 if got is not None and Path(got) == here.resolve() else 1)
+PYMOD
+)"
+ck "§27b ...and a SUT inside a checkout resolves it from its own location (no env needed)" \
+   "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
+
+# ⛔ #2683 ROUND 1 — THE VERIFY LOOP WROTE `VERIFIED` OVER A BOX THAT WAS NOT ACTIVATED. Its criterion
+# checked main/relation/controller/new-pid and never the executed tree, so a controller that survived a
+# failed `stop` (old tree) plus a started replacement (new pid) satisfied every term while
+# `box-status.sh` reported `running: MIXED`. That wrote a false VERIFIED into the deploy LEDGER, which is
+# later quoted back as "our activation at this pin VERIFIED" — the sentence that stops the arm repairing
+# a box it itself broke.
+write_no_landing; reset_o
+printf 'harness: ffffffffffff [behind] source=pin\nstamp: ffffffffffff    pin: ffffffffffff\ncontroller: RUNNING(pid 7)\nrunning: ffffffffffff\nroles: idle\n' > "$FX/box.txt"
+cat > "$TMP/box-newpid-oldtree.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "activate-ran" >> "$FIXTURE/activate.txt"
+# The pin arrived and a NEW pid answers — but the process executes the OLD tree.
+printf 'harness: %s [current] source=pin\nstamp: %s    pin: %s\ncontroller: RUNNING(pid 99)\nrunning: ffffffffffff\nroles: idle\n' \
+  "$(sed -n 's/^harness: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")" \
+  "$(sed -n 's/^stamp: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")" \
+  "$(sed -n 's/^stamp: \([0-9a-f]*\) .*/\1/p' "$FIXTURE/box.current.txt")" > "$FIXTURE/box.txt"
+exit 0
+STUB
+chmod +x "$TMP/box-newpid-oldtree.sh"
+printf 'local\tbash %s --o %s\tbash %s\n' "$TMP/box-status-stub.sh" "$O" "$TMP/box-newpid-oldtree.sh" > "$O/state/boxes.tsv"
+out="$(run_sut --verify-deploy-s 1)"; rc=$?
+# ⛔ `nq 'VERIFIED'` WOULD PASS ON "UNVERIFIED" — the substring is inside the failure word, so the
+# assertion has to look for the recorded verdict, which only a pass writes as `=VERIFIED`.
+ck "§23g a NEW pid that still executes the OLD tree is UNVERIFIED, never VERIFIED" \
+   "$(qF 'UNVERIFIED' "$out" && nq '=VERIFIED' "$out" && echo 0 || echo 1)"
+ck "§23g ...and it names the activation gap that failed the check" \
+   "$(qF 'activation: restart-pending(running=ffffffffffff)' "$out" && echo 0 || echo 1)"
+ck "§23g ...and the ledger does NOT record a VERIFIED attempt" \
+   "$(! grep -q '=VERIFIED' "$O/state/merge-reminder.deploys" 2>/dev/null && echo 0 || echo 1)"
+# The contrast: the SAME fixture with running==pin IS verified (§14's armed case), so the term is a
+# comparison and not a blanket refusal.
+
+# ⛔ A SHALLOW COPY MUST NOT CRASH THE CYCLE (#2683 round-1 review). `Path(__file__).parents[2]` raises
+# IndexError on a file with two parents — a flat `/tmp/mr.py`, which is exactly the shape the issue
+# describes for the ORIGINAL pre-port deployment (`~/.pi/agent/state/merge-reminder.py`). The exception
+# escaped from inside the cycle's try, so the run produced NO report at all: the deliverable lost, from
+# an expression that reads as a constant. Both call sites use the bounded `script_checkout()`.
+SHALLOW="/tmp/mr-shallow.$$.py"
+cp "$SUT" "$SHALLOW"
+out="$(python3 - "$SHALLOW" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+try:
+    here = m.script_checkout()
+    rp = m.repo_path_of(Path("/nonexistent-o"))
+    hr = m.harness_repo_of(Path("/nonexistent-o"))
+except Exception as e:                       # noqa: BLE001 - the point is that nothing raises
+    print(1); raise SystemExit
+print(0 if here is None and isinstance(rp, Path) and hr is None else 1)
+PYMOD
+)"
+ck "§27b a SCRIPT WITH TWO PARENTS (/tmp/x.py) resolves instead of raising IndexError" \
+   "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
+rm -f "$SHALLOW"
+
+# ⛔ #2683 ROUND 2 — A CANDIDATE MUST CARRY THE HARNESS, NOT MERELY BE A CHECKOUT. `$O` and
+# `$HOME/orchestrator` are paths an operator or a deploy script chose; on this fleet `$HOME/orchestrator`
+# has been measured as a TORTOISE checkout (`origin/main=5f40d832c254`). Accepting either on a
+# `--show-toplevel` test alone brought #2679 back SILENTLY: when the wrong repo IS the swept repo, the
+# caller sees "same repo" and reuses the swept main — the exact foreign-sha comparison goal 2 must never
+# make — and the header prints it under a `**harness main:**` label with no caveat (the caveat only fires
+# when the two mains DIFFER).
+write_no_landing; reset_o
+# A checkout that is NOT the harness: no `scripts/orchestrator-harness/box-status.sh` anywhere in it.
+PLAIN="$FX/plainrepo"
+rm -rf "$PLAIN" "$FX/plain-origin.git"
+git init --quiet -b main "$PLAIN" 2>/dev/null
+git -C "$PLAIN" config user.email t@example.invalid
+git -C "$PLAIN" config user.name t
+: > "$PLAIN/README"
+git -C "$PLAIN" add README
+git -C "$PLAIN" commit --quiet -m "a repo that is not the harness"
+git init --quiet --bare "$FX/plain-origin.git"
+git -C "$PLAIN" remote add origin "$FX/plain-origin.git"
+git -C "$PLAIN" push --quiet origin main
+ck "§27b the plain fixture really is a checkout without the harness marker" \
+   "$([ -d "$PLAIN/.git" ] && [ ! -e "$PLAIN/scripts/orchestrator-harness/box-status.sh" ] && echo 0 || echo 1)"
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$PLAIN" <<'PYMOD'
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+plain = Path(sys.argv[2]).resolve()
+here = Path(sys.argv[1]).resolve().parents[2]
+# A checkout that does NOT carry the harness must be SKIPPED: the resolution may fall through to the
+# checkout THIS script lives in (which does carry it), but it must never RETURN the plain repo.
+got_o = m.harness_repo_of(plain)
+# ...and the same for the conventional "$HOME/orchestrator" location.
+hdir = plain.parent / "homeplain"
+(hdir / "orchestrator").parent.mkdir(parents=True, exist_ok=True)
+if not (hdir / "orchestrator").exists():
+    os.symlink(str(plain), str(hdir / "orchestrator"))
+os.environ["HOME"] = str(hdir)
+got_home = m.harness_repo_of(Path("/nonexistent-o"))
+ok = (got_o is not None and Path(got_o).resolve() == here
+      and got_home is not None and Path(got_home).resolve() == here)
+print(0 if ok else 1)
+PYMOD
+)"
+ck "§27b a checkout that does NOT carry the harness is SKIPPED (falls through to the real harness, never returned)" \
+   "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
+# ...and the REAL harness checkout still resolves (the opposite direction, so the test cannot pass by
+# refusing everything): this suite's own tree carries `scripts/orchestrator-harness/box-status.sh`.
+out="$(python3 - "$SUT" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+got = m.harness_repo_of(Path("/nonexistent-o"))
+here = Path(sys.argv[1]).resolve().parents[2]
+print(0 if got is not None and Path(got) == here.resolve() else 1)
+PYMOD
+)"
+ck "§27b ...and a checkout that DOES carry the harness is accepted (the check is the marker, not a refusal)" \
+   "$([ "${out##*$'\n'}" = "0" ] && echo 0 || echo 1)"
+
+# ⛔ THE `running:` READER ON ITS OWN (#2683 round-2 follow-up). It decides what "activated" means, and
+# every other case reaches it through a STUB that prints the line — so the reader that produces it had no
+# coverage at all: `MIXED`, the `/proc`→`ps` fallback, and a harness path containing a space were never
+# produced by any test. Driven here against REAL controller argv, with a stub `ps` standing in for the
+# process table.
+write_no_landing; reset_o
+# Two real trees, so "which commit does the controller execute" has two answers to distinguish.
+for t in rt-a rt-b; do
+  rm -rf "$FX/$t"
+  git init --quiet -b main "$FX/$t" 2>/dev/null
+  git -C "$FX/$t" config user.email t@example.invalid
+  git -C "$FX/$t" config user.name t
+  mkdir -p "$FX/$t/scripts/orchestrator-harness"
+  : > "$FX/$t/scripts/orchestrator-harness/box-status.sh"
+  # `sleep` is the controller body: a real process is what the relative-argv case below needs.
+  printf '#!/usr/bin/env bash\nsleep 120\n' > "$FX/$t/scripts/orchestrator-harness/orch-loop.sh"
+  git -C "$FX/$t" add -A
+  git -C "$FX/$t" commit --quiet -m "$t"
+done
+RTA="$(git -C "$FX/rt-a" rev-parse HEAD | cut -c1-12)"
+RTB="$(git -C "$FX/rt-b" rev-parse HEAD | cut -c1-12)"
+ck "§27b the two running-tree fixtures really are distinct commits" \
+   "$([ "$RTA" != "$RTB" ] && echo 0 || echo 1)"
+run_box() { # status_command_for_ps, then run box-status with that table
+  printf '%s\n' "$1" > "$FX/ps-rt.txt"
+  # The stub answers BOTH shapes box-status asks: the full table (`ps -axo pid=,command=`, for the
+  # controller list) and a single pid (`ps -p <pid> -o command=`, the non-/proc fallback for argv). A
+  # stub that ignored `-p` answered EVERY pid query with the whole table, so both controllers resolved
+  # to whichever tree came last — which is how this case first read `running: <one sha>` instead of
+  # `MIXED`, i.e. the FIXTURE was broken, not the reader.
+  cat > "$TMP/ps" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-p" ]; then
+  want="${2:-}"
+  while read -r p rest; do
+    [ -n "${p:-}" ] || continue
+    if [ "$p" = "$want" ]; then printf '%s %s\n' "$p" "$rest"; fi
+  done < "$FIXTURE/ps-rt.txt"
+else
+  cat "$FIXTURE/ps-rt.txt"
+fi
+STUB
+  chmod +x "$TMP/ps"
+  env FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" PATH="$TMP:/usr/bin:/bin:/usr/local/bin" \
+    bash "$BOX" --o "$O" --repo "$FX/rt-a" 2>&1
+}
+out="$(run_box "4242 bash $FX/rt-a/scripts/orchestrator-harness/orch-loop.sh")"
+ck "§27b box-status: ONE controller reports the commit its own argv resolves to" \
+   "$(grep -qx "running: $RTA" <<<"$out" && echo 0 || echo 1)"
+out="$(run_box "4242 bash $FX/rt-a/scripts/orchestrator-harness/orch-loop.sh
+4243 bash $FX/rt-b/scripts/orchestrator-harness/orch-loop.sh")"
+ck "§27b box-status: TWO controllers on TWO trees is MIXED, not one of them" \
+   "$(grep -qx 'running: MIXED' <<<"$out" && echo 0 || echo 1)"
+# ⛔ A PATH WITH A SPACE, PROVEN AT RUNTIME. `cmdline` is NUL-delimited so an element survives whole; a
+# whitespace split left a fragment that does not exist, so an ACTIVATED box answered
+# `running: UNREADABLE` (fail-closed, but wrong). `/proc` cannot be faked, so this case launches a REAL
+# controller from a REAL path containing a space and lets the reader resolve it from `/proc/<pid>/cmdline`
+# — a source grep would be satisfied by a comment, which is why it is not the assertion.
+SPACED="$FX/rt a"
+rm -rf "$SPACED"
+git init --quiet -b main "$SPACED" 2>/dev/null
+git -C "$SPACED" config user.email t@example.invalid
+git -C "$SPACED" config user.name t
+mkdir -p "$SPACED/scripts/orchestrator-harness"
+: > "$SPACED/scripts/orchestrator-harness/box-status.sh"
+# The controller is a real process this case starts and stops: `sleep` stands in for the loop body.
+printf '#!/usr/bin/env bash\nsleep 120\n' > "$SPACED/scripts/orchestrator-harness/orch-loop.sh"
+chmod +x "$SPACED/scripts/orchestrator-harness/orch-loop.sh"
+git -C "$SPACED" add -A
+git -C "$SPACED" commit --quiet -m "spaced"
+SPACED_SHA="$(git -C "$SPACED" rev-parse HEAD | cut -c1-12)"
+bash "$SPACED/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 &
+SPACED_PID=$!
+# ⛔ NO `trap … EXIT` HERE. The suite already owns the only cleanup trap (`rm -rf "$TMP"`); a second one
+# REPLACES it, so every run leaked its whole fixture tree (round-3 review). The controller is killed
+# explicitly below, and it is a bounded `sleep`, so an interrupted run leaves a short-lived process at
+# worst — never a fixture directory.
+# ⛔ POLL, DO NOT RACE THE `fork`/`exec` WINDOW. Immediately after `&` the child's `/proc/<pid>/cmdline`
+# can still be the bare `bash` — the exec has not happened yet — and under load (a parallel selftest run
+# on this box) that window is wide enough to read the fixture as a FAILURE that is really a timing
+# artifact. 2 s in 50 ms steps: the argv is stable once exec lands.
+spaced_ready=1
+for _ in $(seq 1 40); do
+  if grep -q "rt a" "/proc/$SPACED_PID/cmdline" 2>/dev/null; then spaced_ready=0; break; fi
+  sleep 0.05
+done
+ck "§27b the spaced-path controller really is running with a SPACE in its argv" "$spaced_ready"
+out="$(run_box "$SPACED_PID bash $SPACED/scripts/orchestrator-harness/orch-loop.sh")"
+ck "§27b box-status: an argv element with a SPACE resolves to its commit, not UNREADABLE" \
+   "$(grep -qx "running: $SPACED_SHA" <<<"$out" && echo 0 || echo 1)"
+kill "$SPACED_PID" 2>/dev/null
+wait "$SPACED_PID" 2>/dev/null
+# The negative control: the flattened shape that WOULD have failed on this path must not come back. It
+# looks at the executable line only — the comment above the reader quotes the old shape on purpose.
+ck "§27b ...and no whitespace split of a flattened cmdline remains in the reader" \
+   "$(! grep -qE '^[[:space:]]*cmd=.*tr .*0.* ' "$BOX" && echo 0 || echo 1)"
+
+# ⛔ THE SAME RULE IN THE BOX PROBE. `box-status.sh` prints a HARNESS identity, so the `origin/main` it
+# compares against must be the harness repo's — and its own candidate list has the same two
+# human-chosen paths (`$O`, `$HOME/orchestrator`). A checkout that does not carry the harness is
+# refused and NAMED, because a missing `ref:` line reads as "no opinion" when the answer is "compared
+# against nothing".
+out="$(env FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" PATH="$TMP:/usr/bin:/bin:/usr/local/bin" \
+  bash "$BOX" --o "$O" --repo "$PLAIN" 2>&1)"
+ck "§27b box-status REFUSES an explicit --repo that does not carry the harness" \
+   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'has NO INDEX ENTRY for scripts/orchestrator-harness/box-status.sh' <<<"$out" && ! grep -qE '\(mode ;' <<<"$out" && echo 0 || echo 1)"
+ck "§27b ...and it says so instead of omitting the ref line (an absent line is not an opinion)" \
+   "$(grep -q "does not carry the harness" <<<"$out" && echo 0 || echo 1)"
+# ⛔ EVERY CANDIDATE AT ONCE, including this script's own checkout — which is why the probe runs from a
+# FLAT COPY outside any checkout. Run from `$BOX` itself, candidate 3 would be this very worktree (a real
+# harness repo) and the case would pass for the wrong reason: it would prove the fallback works, not that
+# a non-harness checkout is skipped.
+mkdir -p "$TMP/flat" "$TMP/homeplain"
+# ⛔ `$HOME/orchestrator` IS A REAL CHECKOUT that is not the harness — otherwise this case would pass
+# because `rev-parse` skipped an empty directory, and would prove nothing about the marker.
+rm -rf "$TMP/homeplain/orchestrator"
+git init --quiet -b main "$TMP/homeplain/orchestrator" 2>/dev/null
+git -C "$TMP/homeplain/orchestrator" config user.email t@example.invalid
+git -C "$TMP/homeplain/orchestrator" config user.name t
+: > "$TMP/homeplain/orchestrator/README"
+git -C "$TMP/homeplain/orchestrator" add README
+git -C "$TMP/homeplain/orchestrator" commit --quiet -m "a checkout that is not the harness"
+ck "§27b the \$HOME/orchestrator fixture really is a checkout (so the MARKER must be what skips it)" \
+   "$(git -C "$TMP/homeplain/orchestrator" rev-parse --git-dir >/dev/null 2>&1 && echo 0 || echo 1)"
+cp "$BOX" "$TMP/flat/box-status.sh"
+# ⛔ `REPO=` IS CLEARED ON PURPOSE. `box-status.sh` honours an ambient `REPO` (the deploy arm exports
+# `REPO=<harness repo>` into every probe, #2680), and this shell's ambient value is the SWEPT repo — so
+# leaving it set would test "the inherited swept repo is refused", not the candidate resolution.
+out="$(env REPO= HARNESS_REPO="$PLAIN" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b the flat-copy probe really is outside every checkout (its own checkout candidate is unusable)" \
+   "$(! git -C "$TMP/flat" rev-parse --git-dir >/dev/null 2>&1 && echo 0 || echo 1)"
+# ...`$HARNESS_REPO` and `$O` are the same non-harness checkout and `$HOME/orchestrator` is a DIFFERENT
+# one; none of the three may be adopted, and the flat copy's own directory is not a checkout at all. The
+# answer is UNRESOLVED with the reason, never a foreign `origin/main`.
+ck "§27b box-status skips EVERY non-harness candidate (env, \$O, \$HOME/orchestrator) and says why" \
+   "$(! grep -q '^ref: origin/main=' <<<"$out" && grep -q '^ref: UNRESOLVED (' <<<"$out" && grep -q 'does not carry the harness:' <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ A RELATIVE CONTROLLER PATH RESOLVES AGAINST THE **CONTROLLER's** CWD, NOT THE READER's (round-3
+# review follow-up, measured on the real fleet shape: a controller started as `bash ./orch-loop.sh` in
+# tree A, with the probe run from tree B, printed `running: <B's HEAD>` — a WRONG tree, which is the one
+# thing this reader must never produce while the README promises it cannot). Driven with a REAL process
+# started by relative path from tree A, while the probe runs from tree B.
+( cd "$FX/rt-a" && exec bash ./scripts/orchestrator-harness/orch-loop.sh ) >/dev/null 2>&1 &
+REL_PID=$!
+# `cmdline` is NUL-SEPARATED, so the field is compared whole (a pattern spanning "bash" and the path can
+# never match the raw file — the very mistake this reader's `/proc` fix is about).
+rel_ready=1
+for _ in $(seq 1 40); do
+  if tr '\0' '\n' < "/proc/$REL_PID/cmdline" 2>/dev/null | grep -qx './scripts/orchestrator-harness/orch-loop.sh'; then
+    rel_ready=0; break
+  fi
+  sleep 0.05
+done
+ck "§27b the relative-argv controller really runs with a RELATIVE argv" "$rel_ready"
+printf '%s bash ./scripts/orchestrator-harness/orch-loop.sh\n' "$REL_PID" > "$FX/ps-rt.txt"
+out="$( cd "$FX/rt-b" && env FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" PATH="$TMP:/usr/bin:/bin:/usr/local/bin" \
+  bash "$BOX" --o "$O" --repo "$FX/rt-b" 2>&1)"
+ck "§27b ...and \`running:\` names the CONTROLLER's tree ($RTA), not the reader's cwd ($RTB)" \
+   "$(grep -qx "running: $RTA" <<<"$out" && ! grep -qx "running: $RTB" <<<"$out" && echo 0 || echo 1)"
+kill "$REL_PID" 2>/dev/null
+wait "$REL_PID" 2>/dev/null
+
+# ⛔ THE CANONICAL CHECKOUT SHAPE, WHICH A PATH-EXISTENCE TEST RE-ADMITTED (round-3 review, BLOCKING).
+# Every tortoise/eldato checkout carries a GITIGNORED `scripts -> $AGENT_INFRA_PATH/scripts` pointer
+# (#9475), so `scripts/orchestrator-harness/box-status.sh` EXISTS in it and a marker test written as
+# `[ -f … ]` certified a TORTOISE checkout as the harness repo — #2679 back, for the shape two of the
+# fleet's cells run. The marker must be TRACKED by the candidate's own repo.
+HERE_TOP="$(cd "$(dirname "$0")/../.." && pwd)"
+SHAPED="$FX/tortoise-shape"
+rm -rf "$SHAPED"
+git init --quiet -b main "$SHAPED" 2>/dev/null
+git -C "$SHAPED" config user.email t@example.invalid
+git -C "$SHAPED" config user.name t
+: > "$SHAPED/README"
+ln -s "$HERE_TOP/scripts" "$SHAPED/scripts"
+git -C "$SHAPED" add README
+git -C "$SHAPED" commit --quiet -m "a checkout with the gitignored scripts pointer"
+ck "§27b the shaped fixture really has \$AGENT_INFRA_PATH's scripts through a symlink, untracked" \
+   "$([ -f "$SHAPED/scripts/orchestrator-harness/box-status.sh" ] && ! git -C "$SHAPED" ls-files --error-unmatch scripts/orchestrator-harness/box-status.sh >/dev/null 2>&1 && echo 0 || echo 1)"
+# The reminder's resolver: it must NOT return the shaped repo (it may fall through to this script's own
+# checkout, which IS the harness — what it must never do is hand a tortoise repo back as the harness).
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$SHAPED" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+shaped = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(shaped)
+ok = got is not None and Path(got).resolve() != shaped
+print(0 if ok else 1)
+PYMOD
+)"
+ck "§27b harness_repo_of REFUSES a checkout whose harness path is only the gitignored scripts pointer" \
+   "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+# ...and the box probe, which names WHY (the pointer is the whole trap, so it has to be in the message).
+out="$(env REPO= HARNESS_REPO="$SHAPED" HOME="$TMP/home" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$BOX" --o "$SHAPED" --repo "$SHAPED" 2>&1)"
+ck "§27b box-status REFUSES the same shape and names the pointer as the reason" \
+   "$(grep -q '^ref: UNRESOLVED (--repo: ' <<<"$out" && grep -q 'has NO INDEX ENTRY' <<<"$out" && grep -q 'pointer makes the PATH exist' <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ `GIT_COMMON_DIR` IS OBSERVABLE ONLY ON AN **ACCEPTED** CANDIDATE (round-9 review, measured): on a repo the
+# marker test already refuses it changes nothing, so a pin there is vacuous. The read it corrupts is the
+# RELATION — git takes OBJECTS from the inherited common dir, so a pin that is not an object in THIS repo is
+# reported `[diverged]` instead of `[unknown]`, i.e. a claim that the box ran a rewritten history. Asserted
+# against `$HERE_TOP`, which IS the harness repo.
+# The pin is a commit that EXISTS in the FOREIGN repo and NOT in this one: an inherited common dir makes
+# `cat-file -e` succeed for it, which is what turns `[unknown]` into `[diverged]`. A synthetic zero sha would
+# be absent from both repos and the case would pass for the wrong reason.
+git -C "$PLAIN" rev-parse HEAD > "$TMP/pin-foreign"
+out="$(env REPO= HARNESS_PIN="$TMP/pin-foreign" GIT_COMMON_DIR="$PLAIN/.git" HOME="$TMP/home" FIXTURE="$FX" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$TMP/o" --repo "$HERE_TOP" 2>&1)"
+ck "§27b box-status is not hijacked by an inherited GIT_COMMON_DIR (an absent pin stays [unknown])" \
+   "$(grep -q 'harness: .*\[unknown\]' <<<"$out" && ! grep -q '\[diverged\]' <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ A **TRACKED SYMLINK** AT THE MARKER PATH IS NOT THE HARNESS (round-4 review follow-up, BLOCKING-adjacent:
+# measured that `git ls-files --error-unmatch` is satisfied by a mode-120000 index entry, so a repo that
+# ships no harness bytes was accepted and its own `origin/main` became the value goal 2 measured against).
+# The marker must be a TRACKED REGULAR FILE, so the index MODE is what decides.
+LINKSHAPE="$FX/link-shape"
+rm -rf "$LINKSHAPE"
+git init --quiet -b main "$LINKSHAPE" 2>/dev/null
+git -C "$LINKSHAPE" config user.email t@example.invalid
+git -C "$LINKSHAPE" config user.name t
+: > "$LINKSHAPE/README"
+mkdir -p "$LINKSHAPE/scripts/orchestrator-harness"
+ln -s ../../../README "$LINKSHAPE/scripts/orchestrator-harness/box-status.sh"
+git -C "$LINKSHAPE" add -A
+git -C "$LINKSHAPE" commit --quiet -m "a repo that tracks a symlink at the marker path"
+ck "§27b the tracked-link fixture really has a mode-120000 index entry at the marker path" \
+   "$(git -C "$LINKSHAPE" ls-files -s scripts/orchestrator-harness/box-status.sh | grep -q '^120000 ' && echo 0 || echo 1)"
+out="$(env REPO= HARNESS_REPO="$LINKSHAPE" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b box-status REFUSES a repo that ships a TRACKED SYMLINK as the harness file" \
+   "$(grep -q '^ref: UNRESOLVED (.*not a TRACKED REGULAR FILE there (mode 120000' <<<"$out" && echo 0 || echo 1)"
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$LINKSHAPE" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+shaped = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(shaped)
+print(0 if (got is None or Path(got).resolve() != shaped) else 1)
+PYMOD
+)"
+ck "§27b harness_repo_of REFUSES the same tracked-symlink shape" \
+   "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ A GITLINK IS NOT THE HARNESS EITHER, and the refusal must say so: `160000` is a submodule entry, not a
+# symlink, so a message that names only symlinks mis-describes the cause it actually found.
+LINKGIT="$FX/gitlink-shape"
+rm -rf "$LINKGIT"
+git init --quiet -b main "$LINKGIT" 2>/dev/null
+git -C "$LINKGIT" config user.email t@example.invalid
+git -C "$LINKGIT" config user.name t
+: > "$LINKGIT/README"
+git -C "$LINKGIT" add README
+git -C "$LINKGIT" commit --quiet -m "base"
+git -C "$LINKGIT" update-index --add --cacheinfo 160000,"$(git -C "$LINKGIT" rev-parse HEAD)",scripts/orchestrator-harness/box-status.sh
+ck "§27b the gitlink fixture really has a mode-160000 index entry at the marker path" \
+   "$(git -C "$LINKGIT" ls-files -s -- scripts/orchestrator-harness/box-status.sh | grep -q '^160000 ' && echo 0 || echo 1)"
+out="$(env REPO= HARNESS_REPO="$LINKGIT" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b box-status REFUSES a gitlink (160000) and names a gitlink, not only a symlink" \
+   "$(grep -q 'mode 160000' <<<"$out" && grep -q 'gitlink/submodule' <<<"$out" && echo 0 || echo 1)"
+# ...and the reminder's reader must refuse the same shape: a widened mode list (`"160000"` added) would
+# otherwise ship green, since only the box probe was pinned against it.
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$LINKGIT" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+shaped = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(shaped)
+print(0 if (got is None or Path(got).resolve() != shaped) else 1)
+PYMOD
+)"
+ck "§27b harness_repo_of REFUSES the same gitlink shape" \
+   "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ AN INHERITED GIT ENVIRONMENT MUST NOT HIJACK THE PROBE (round-6 review, measured: with
+# `GIT_DIR=<harness>/.git`, a non-harness checkout was returned as the harness repo because the index read
+# answered from the HARNESS). A probe describes the directory it was pointed at.
+# ⛔ `GIT_DIR` AND `GIT_INDEX_FILE` ARE BOTH MEASURED HIJACKS (round-7 review: pinning only `GIT_DIR` lets a
+# narrowing of the unset list ship green, with the hijack back). With `GIT_DIR` alone the index read answered
+# from the harness while `top` came from the candidate, so a NON-harness checkout was returned as the harness
+# repo; `GIT_INDEX_FILE` alone did the same through the index path.
+# ⛔ TWO VARIABLES, TWO CASES. `GIT_DIR` redirects the whole repository; `GIT_INDEX_FILE` redirects only the
+# index read. A single case that swaps one for the other leaves the other unpinned (round-8 review: that is
+# exactly how the `GIT_DIR` pin died here). And each variable is given a path that EXISTS in this checkout:
+# `$HERE_TOP/.git` is a 47-byte gitdir FILE in a linked worktree, so `…/.git/index` is not a file there and
+# the pin would be vacuous in the very lane the suite runs in.
+# ⛔ AN ABSOLUTE INDEX PATH, OR THE PIN IS VACUOUS IN CI (round-8 review, BLOCKING). `--git-path index`
+# answers a CWD-RELATIVE `.git/index` in a MAIN worktree (absolute only in a linked one), and a relative
+# `GIT_INDEX_FILE` does not hijack at all — git resolves it against the candidate after `-C`. CI runs this
+# shard from a main worktree with no `cd`, so the pin was green there while the reader it pins was broken.
+HARNESS_GITDIR="$(git -C "$HERE_TOP" rev-parse --absolute-git-dir)"
+HARNESS_INDEX="$HARNESS_GITDIR/index"
+ck "§27b the pin fixtures are real ABSOLUTE paths (a relative index path cannot hijack, so a pin on one is vacuous)" \
+   "$(case "$HARNESS_INDEX" in /*) [ -e "$HARNESS_INDEX" ] && echo 0 || echo 1 ;; *) echo 1 ;; esac)"
+# ⛔ THREE VARIABLES, THREE CASES: `GIT_DIR` (whole repository), `GIT_INDEX_FILE` (the index read) and
+# `GIT_COMMON_DIR` (measured in round 8: with it set, `repo_slug()`/`github_origin()` answered a FOREIGN slug
+# for an agent-infra-origin repo, so the checkout-vs-flag mismatch guard failed open again).
+for hijack in GIT_DIR GIT_INDEX_FILE; do
+  case "$hijack" in
+    GIT_DIR)         hval="$HERE_TOP/.git" ;;
+    GIT_INDEX_FILE)  hval="$HARNESS_INDEX" ;;
+  esac
+  out="$(env REPO= HARNESS_REPO="$PLAIN" "$hijack"="$hval" \
+    HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+    PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+  ck "§27b box-status is not hijacked by an inherited $hijack (the plain repo is still refused)" \
+     "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+done
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   GIT_DIR="$HERE_TOP/.git" \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$PLAIN" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+plain = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(plain)
+print(0 if (got is None or Path(got).resolve() != plain) else 1)
+PYMOD
+)"
+# ⛔ AND THE MAIN READ, not just the identity probe: `origin_main()` feeds the PR gates, the drift table and
+# goal 2, so an inherited `GIT_DIR` there would print ANOTHER repo's main as this cycle's main.
+out_main="$(env REPO="$REPO_SRC" GIT_DIR="$FX/plainrepo/.git" HOME="$TMP/home" FIXTURE="$FX" \
+   PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$REPO_SRC" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+repo = Path(sys.argv[2])
+# the truth, read with NO ambient git env at all
+truth = m.run(["git", "-C", str(repo), "rev-parse", "--verify", "origin/main"], env=m.git_env())[1].strip()
+got = m.main_sha(repo)          # ambient GIT_DIR points at a DIFFERENT repo, with no origin/main
+print(0 if truth and got == truth else 1)
+PYMOD
+)"
+# ⛔ AND EVERY *OTHER* GIT READ TOO (round-8 review, measured): eight of twelve `run(["git", …])` calls
+# inherited the environment, and under `GIT_DIR=<a foreign repo>/.git` the checkout-vs-flag MISMATCH GUARD
+# (`github_origin`) returned "" — i.e. it failed OPEN — while `git_dir` named another repository. The rule is
+# enforced once, in `run()`; this case pins it there rather than at each call site, so a call added later is
+# covered the day it is written.
+# `$HERE_TOP` (not the fixture repo): `github_origin` answers "" for a non-github origin BY DESIGN, so the
+# fixture would make this case vacuous for the wrong reason. Both relocating variables are exercised here,
+# because THIS is where they are observable — `repo_slug()`/`github_origin()` read the checkout's own
+# origin, and a foreign `GIT_DIR` or `GIT_COMMON_DIR` made them answer the FOREIGN repo's slug, i.e. the
+# checkout-vs-flag mismatch guard failed OPEN.
+for hijack in GIT_DIR GIT_COMMON_DIR; do
+  case "$hijack" in
+    GIT_DIR)        hval="$FX/plainrepo/.git" ;;
+    GIT_COMMON_DIR) hval="$FX/plainrepo/.git" ;;
+  esac
+  out_all="$(env "$hijack"="$hval" HOME="$TMP/home" FIXTURE="$FX" \
+     PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+     python3 - "$SUT" "$HERE_TOP" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+repo = Path(sys.argv[2])
+slug = m.github_origin(repo)          # the mismatch guard: must NOT fail open under a foreign git dir
+gdir = m.git_dir(repo)
+truth_gdir = m.run(["git", "-C", str(repo), "rev-parse", "--absolute-git-dir"],
+                   env=m.git_env())[1].strip()
+ok = (slug != "" and truth_gdir and gdir.strip() == truth_gdir)
+print(0 if ok else 1)
+PYMOD
+)"
+  ck "§27b every git read is sanitised (github_origin does not fail open under a foreign $hijack)" \
+     "$(grep -qx 0 <<<"$out_all" && echo 0 || echo 1)"
+done
+
+
+ck "§27b main_sha ignores an inherited GIT_DIR (it reads the repo it was pointed at)" \
+   "$(grep -qx 0 <<<"$out_main" && echo 0 || echo 1)"
+
+for hijack in GIT_DIR GIT_INDEX_FILE GIT_COMMON_DIR; do
+  case "$hijack" in
+    GIT_DIR)         hval="$HERE_TOP/.git" ;;
+    GIT_INDEX_FILE)  hval="$HARNESS_INDEX" ;;
+    GIT_COMMON_DIR)  hval="$PLAIN/.git" ;;
+  esac
+  out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+     "$hijack"="$hval" HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" \
+     PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+     python3 - "$SUT" "$PLAIN" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+plain = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(plain)
+print(0 if (got is None or Path(got).resolve() != plain) else 1)
+PYMOD
+)"
+  ck "§27b harness_repo_of is not hijacked by an inherited $hijack either" \
+     "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+done
+
+# ⛔ A DIRECTORY OF THAT NAME IS NOT THE FILE (round-5 review follow-up, measured: with the index holding
+# `…/box-status.sh/x`, the pathspec matched THAT entry, so a repo whose harness path is a directory was
+# accepted). The index entry's RECORDED PATH is compared, not just its mode.
+DIRSHAPE="$FX/dir-shape"
+rm -rf "$DIRSHAPE"
+git init --quiet -b main "$DIRSHAPE" 2>/dev/null
+git -C "$DIRSHAPE" config user.email t@example.invalid
+git -C "$DIRSHAPE" config user.name t
+: > "$DIRSHAPE/README"
+mkdir -p "$DIRSHAPE/scripts/orchestrator-harness/box-status.sh"
+: > "$DIRSHAPE/scripts/orchestrator-harness/box-status.sh/nested"
+git -C "$DIRSHAPE" add -A
+git -C "$DIRSHAPE" commit --quiet -m "a directory where the marker file should be"
+ck "§27b the dir-shape fixture really tracks a file BESIDE the marker path, not at it" \
+   "$(git -C "$DIRSHAPE" ls-files -s --error-unmatch -- scripts/orchestrator-harness/box-status.sh >/dev/null 2>&1 && ! git -C "$DIRSHAPE" ls-files -s --error-unmatch -- scripts/orchestrator-harness/box-status.sh | grep -q "box-status.sh$" && echo 0 || echo 1)"
+out="$(env REPO= HARNESS_REPO="$DIRSHAPE" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b box-status REFUSES a DIRECTORY at the marker path (records the nested file it found)" \
+   "$(grep -q 'records scripts/orchestrator-harness/box-status.sh/nested instead' <<<"$out" && echo 0 || echo 1)"
+out="$(env -u HARNESS_REPO -u OR -u O -u MERGE_REMINDER_ACT -u MERGE_REMINDER_REVIEWS -u HARNESS_PIN \
+   HOME="$TMP/home" FIXTURE="$FX" REPO="$REPO_SRC" PATH="$BIN:/usr/bin:/bin:/usr/local/bin" \
+   python3 - "$SUT" "$DIRSHAPE" <<'PYMOD'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+shaped = Path(sys.argv[2]).resolve()
+got = m.harness_repo_of(shaped)
+print(0 if (got is None or Path(got).resolve() != shaped) else 1)
+PYMOD
+)"
+ck "§27b harness_repo_of REFUSES the same directory-at-marker-path shape" \
+   "$(grep -qx 0 <<<"$out" && echo 0 || echo 1)"
+
+# ⛔ A SUBDIRECTORY CANDIDATE — DRIVEN FROM THE FLAT COPY, BECAUSE THAT IS THE ONLY PLACE THE QUESTION IS
+# VISIBLE (round-3 review, BLOCKING: the first version of this case ran `$BOX`, whose own checkout IS the
+# harness, so candidate 3 printed a `ref:` line and the case passed whether the subdir was accepted or
+# refused — i.e. a regression to a literal-path marker shipped green).
+# `harness-refresh.sh` and `check-deployed-drift.sh` accept a subdir for `HARNESS_REPO`; a reader that
+# tested the literal path would refuse it and the deploy probe would read CANNOT VERIFY forever.
+out="$(env REPO= HARNESS_REPO="$HERE_TOP/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b box-status ACCEPTS a SUBDIRECTORY candidate of the harness repo" \
+   "$(grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
+# ...and the negative control uses an EXISTING directory: a `scripts/` subdirectory of a checkout whose
+# index does not track the harness file. A nonexistent path would be refused for being no checkout at all,
+# which says nothing about the marker (round-4 review follow-up: the first version proved only that).
+mkdir -p "$PLAIN/scripts/orchestrator-harness"
+out="$(env REPO= HARNESS_REPO="$PLAIN/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
+ck "§27b ...and refuses an EXISTING subdirectory of a checkout that does not track the harness" \
+   "$(grep -q '^ref: UNRESOLVED (' <<<"$out" && grep -q 'does not carry the harness:' <<<"$out" && ! grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
 
 # ═══ §28 the four defects a REVIEW of the arm found ═══════════════════════════════════════════
 echo "-- §28 the arm the list endpoint had made inert"
