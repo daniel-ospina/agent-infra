@@ -891,7 +891,7 @@ inflight_gate() { # 0 = a restart would interrupt nothing MEASURED; 1 = it would
   fi
   case "${TREE_DISC:-unknown}" in
     unknown) GATE_CODE=tree-unreadable
-             GATE_WHY="the controller's process tree is UNREADABLE, so a lane child cannot be excluded (a 'pi -p --no-session' child leaves no other trace)"
+             GATE_WHY="the controller's process tree is UNREADABLE, so a lane child cannot be excluded (a print-mode pi lane child leaves no other trace)"
              return 1 ;;
   esac
   if [ "$TREE_N" -gt 0 ]; then
