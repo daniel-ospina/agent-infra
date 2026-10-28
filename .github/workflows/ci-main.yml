@@ -134,6 +134,17 @@ jobs:
         npx tsx extensions/auto-sync.test.ts || failures=$((failures+1))
         mark "extensions/session-checks.test.ts"
         npx tsx extensions/session-checks.test.ts || failures=$((failures+1))
+        # #2932 — task-signal-forensics: when 17 dispatched children were SIGTERM'd
+        # inside 3 s, nothing on the box recorded a sender and three worktrees lost
+        # 16 uncommitted files. This suite spawns a REAL lane, sends it a REAL
+        # SIGTERM, and asserts both arms (the sender is named; the work is pinned by
+        # a checkpoint ref) plus the non-behaviour-change control (still exits by
+        # SIGTERM/143). Zero-dep: node stdlib + git only; needs Node >= 22.18 for
+        # `--experimental-strip-types`, which the fixture uses to import the`.ts`
+        # source from a plain `.mjs` bootstrap. Its mutation driver is a bash shard
+        # (`tests/lane-signal-forensics/run.sh`, discovered by run-bash-shards.sh).
+        mark "extensions/task-signal-forensics.test.ts"
+        npx tsx extensions/task-signal-forensics.test.ts || failures=$((failures+1))
         # #611 — reflect-hook capture attribution: first reflect-hook tests.
         # Zero-dep: stdlib-only; uses dynamic require for env ordering.
         mark "extensions/reflect-hook.test.ts"
@@ -222,6 +233,11 @@ jobs:
         mark "extensions/review-enforcer/index.test.ts"
         (cd extensions/review-enforcer && npm ci --no-audit --no-fund --loglevel=error) && \
           NODE_ENV=test npx tsx extensions/review-enforcer/index.test.ts || failures=$((failures+1))
+        # #2287/#2148 — a SPAWNED reviewer process satisfies the ≥1-dispatch floor (a
+        # record-review.sh verdict bound to the pushed head), and nothing else does: no
+        # record / an older head / a foreign repo each still refuse. Same npm ci as above.
+        mark "extensions/review-enforcer/index.spawn-evidence.test.ts"
+        NODE_ENV=test npx tsx extensions/review-enforcer/index.spawn-evidence.test.ts || failures=$((failures+1))
         # #379 — verification-gate: the commit-gate suite (unit + e2e)
         # was unwired. Same route as review-enforcer above (real runtime pi
         # import — isToolCallEventType): pi devDep pinned 0.85.1, npm ci once, run
@@ -241,6 +257,11 @@ jobs:
         npx tsx extensions/verification-gate/tool-call-event-parity.test.ts || failures=$((failures+1))
         mark "extensions/verification-gate/index.e2e.test.ts"
         npx tsx extensions/verification-gate/index.e2e.test.ts || failures=$((failures+1))
+        # #1460/#540 — the LANE-SATISFIABLE suite: the three refusals a `pi -p` lane could
+        # not clear (md5-digest "mismatched", digest-free re-verify, and the in-batch chain's
+        # split form). Runs off the same npm ci as its siblings; hermetic (HOME → temp dir).
+        mark "extensions/verification-gate/index.lane-satisfiable.test.ts"
+        npx tsx extensions/verification-gate/index.lane-satisfiable.test.ts || failures=$((failures+1))
         # #755 — the merge-scope subtraction suite. SDK-FREE by construction
         # (index.js is a TYPE-only import), so it runs off the npm ci above with
         # no extra dependency.
@@ -375,15 +396,58 @@ jobs:
 
   script-validate:
     runs-on: ubuntu-latest
+    # #2055: the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job calls the one
+    # runner below, UNSHARDED (main runs once per merge, so the queue a hang would starve is
+    # smaller than the PR lane's 80 open PRs), and it also runs the parity guard plus its mutation
+    # self-test.
+    #
+    # ⛔ THE 38m41s SELF-TEST FIGURE THIS COMMENT USED TO CARRY IS STALE, and the bound that was
+    # sized from it (70 min on a step that now runs in ~6-9 s) was protecting nothing. That
+    # measurement is PR #2412's (job 120365087427, 2026-10-23T10:25Z) and predates #2529
+    # (`00814821`, 16:09Z same day), which stopped the self-test's fixture re-running the real
+    # shard list. MEASURED AFTER #2529 (2026-10-24, this job, 8 successful main runs pulled from the
+    # Actions API): step 6, the self-test, **6-9 s**; step 7, the shards, **46m38s-54m32s**. The PR
+    # lane's equivalent step, 17 runs sampled: 6-12 s with one 17 s outlier. What remains expensive
+    # here is the SHARDS step — that is what the 110 min bound below is sized for, and what sharding
+    # main (the separate change named below) would cut.
+    #
+    # ⛔ A bound BELOW the measured run is worse than no bound: it false-blocks main on every merge
+    # cycle, and a red that is not a defect is how a gate loses its authority. This bound is sized
+    # only to catch a HANG (which, before this line, could hold a runner indefinitely — #2055);
+    # the real fix for the main lane's duration is sharding it like the PR lane, which is a
+    # separate change (it needs its own parity-guard review: `check-ci-lane-parity` asserts THIS
+    # job makes the bare call).
+    #
+    # ⛔ THE JOB BOUND IS A PURE BACKSTOP; THE BLOCKING BOUNDS ARE ON THE STEPS BELOW. A job that
+    # trips `jobs.<id>.timeout-minutes` is reported `cancelled` — the service cancels the job, the
+    # job-cancellation callback sets `jobContext.Result = TaskResult.Canceled`
+    # (`StepsRunner.cs:149-155`, the `Canceled` arm at :154), and a step still running then takes
+    # `TaskResult.Canceled` (`StepsRunner.cs:331-336`). `JobRunner.cs` has NO timeout handling — its
+    # `TaskResult.Canceled` at :198 is the *initialize* cancel path, not this one.
+    # `cancelled` is NON-RED to this repo's rail (`scripts/admin-merge.sh` NON_RED_CONC) — so a
+    # job-only bound on MAIN would let a hang certify as a non-red and the tree's only unsharded
+    # sweep would silently stop gating. A STEP bound is `TaskResult.Failed` (`StepsRunner.cs:324-329`)
+    # = `failure` = red.
+    #
+    # ⛔ AND THE JOB BOUND SITS ABOVE THE SUM OF THE STEP BOUNDS, so it can never pre-empt a step:
+    # 10 (checkout) + 10 (node) + 10 (node --check) + 5 (parity) + 15 (self-test) + 110 (shards) =
+    # 160 < 230. Below the sum, the non-red job-level `cancelled` could win instead of the red
+    # step-level `failure` — the whole defect this block exists to close, re-entering through the
+    # backstop. 230 also stays ~2.1x the 110 min shard step it backstops, so it cannot
+    # false-block.
+    timeout-minutes: 230
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       # Node is pinned because the shards below include `tests/search-cost/run.sh` (Node >= 22.13 —
       # see ci.yml's `search-cost` job). ci.yml's `bash-suites` carries the identical pin, so the two
       # lanes run the same list under the same runtime.
       - uses: actions/setup-node@v4
+        timeout-minutes: 10
         with:
           node-version: '22'
       - name: Validate Node.js scripts
+        timeout-minutes: 10
         run: |
           errors=0
           for f in scripts/*.{cjs,mjs,js} bin/*.js; do
@@ -399,8 +463,13 @@ jobs:
         # Bare call: its exit code IS the step's. `runner || errors=$((errors+1))` was the old
         # form and is REFUSED by scripts/check-ci-lane-parity.sh — the guard cannot see whether
         # an accumulator is ever read, so accepting it accepts "count the failure and exit 0".
+        timeout-minutes: 5
         run: bash scripts/check-ci-lane-parity.sh
       - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        # 6-9 s measured on this job since #2529 (8 successful main runs, 2026-10-24; 6-12 s with
+        # one 17 s outlier on the PR lane, 17 runs). 15 min ≈ 100x the 9 s worst observed here; the
+        # old 70 min was sized from a measurement taken before #2529 and could not fail fast.
+        timeout-minutes: 15
         run: bash tests/ci-lane-parity/run.sh
       - name: Bash shards — the ONE list both lanes run (#1369)
         # #1369 — the ONE list of bash shards is scripts/run-bash-shards.sh, and BOTH lanes
@@ -408,6 +477,13 @@ jobs:
         # cannot recur by drift. The runner's runtime self-checks (executed == listed, a sweep
         # sentinel, a failure-recording sentinel) fail the step if its arms are disabled.
         # Bare call, one step: a shard failure must fail the RUN, not just a counter.
+        # 46m38s-54m32s measured on this job (8 successful main runs, 2026-10-24) for the whole
+        # unsharded list; 110 min is ~2.0x the top of that range. (The 73m37s figure this comment
+        # used to carry is PR #2412's,
+        # before the shard work that followed.) STEP-level for the reason in this job's header: a
+        # job-level trip is `cancelled` and non-red to the rail, a step-level trip is `failure`
+        # and red.
+        timeout-minutes: 110
         run: bash scripts/run-bash-shards.sh
 
   skill-lint:
@@ -450,10 +526,13 @@ jobs:
 
   pi-config-extensions-guard:
     # #498/#502 — post-merge re-check of the pi-config extension-farm parity gate
-    # (issue #95 invariant): every extensions/ top-level entry except
-    # *.test.ts must be farm-wired into pi-bootstrap/pi-config/extensions AND
+    # (issue #95 invariant): every TRACKED extensions/ top-level entry except
+    # *.test.ts, and except dot-named repo furniture such as .gitkeep, must be
+    # farm-wired into pi-bootstrap/pi-config/extensions AND
     # listed in manifest.json files.extensions.entries (consumer ship-list —
     # #502 closes the manifest↔tree drift class; #498 fixed one stale row).
+    # #2425: "tracked" = git lists it under extensions/; an untracked, ignored
+    # node_modules-only directory is not an extension and cannot false-block.
     # Catches the "PR merged without wiring" drift class that per-PR CI cannot
     # see when the farm edit and the extension land on different branches.
     runs-on: ubuntu-latest
@@ -481,7 +560,10 @@ jobs:
       # half of tortoise#3761; the canonical module never leaves this repo.
       # #1552 — same reasoning, same list: test_objective.py + test_turn_classify_state.py
       # were laptop-only until #1552 and are named here so the repo RUNS them.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py -x --timeout=60 -q'
+      # #2139 — test_beta_progress.py rides the same list (byte-identical to the PR lane's
+      # `test` job): the DELIVERY line's REST second source was live on four boxes and in no
+      # repo file, so nothing in CI exercised the fallback it now ships.
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''
@@ -536,7 +618,8 @@ jobs:
             // enforce-skills.yml:109), so an issue stays open after main recovers and later
             // same-set failures append to it. Both are bounded and disclosed rather than fixed
             // here — close-on-success is a new mechanism, not a dedup fix.
-            // `|| {}` after the parse too: NEEDS is `${{ toJSON(needs) }}`, and a literal `null`
+            // `|| {}` after the parse too: NEEDS is the JSON rendering of `needs` (the
+            // `toJSON` env injection in the `env:` block above), and a literal `null`
             // (not `{}`) makes Object.entries throw BEFORE the try/catch below, so the run would
             // error out having filed nothing. Not reachable today (all 7 jobs are wired into
             // `needs:`, so it is always a populated object) — but it is the only throw-before-filing

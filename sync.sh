@@ -93,11 +93,14 @@ if [ -x ./scripts/check-cost-config.sh ]; then
 fi
 
 # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
-# every extensions/ top-level entry except *.test.ts must be farm-wired into
-# pi-bootstrap/pi-config/extensions (single source of truth) AND listed in
-# manifest.json files.extensions.entries (consumer ship-list, #502 — closes
-# the tree↔manifest drift class). A merged-but-unwired extension would ship on
-# NO machine — BLOCK loudly (same semantics as the cost-config guard above).
+# every extensions/ top-level entry GIT TRACKS (except *.test.ts, and except
+# dot-named repo furniture such as .gitkeep) must be
+# farm-wired into pi-bootstrap/pi-config/extensions (single source of truth) AND
+# listed in manifest.json files.extensions.entries (consumer ship-list, #502 —
+# closes the tree↔manifest drift class). A merged-but-unwired extension would
+# ship on NO machine — BLOCK loudly (same semantics as the cost-config guard
+# above). #2425: the set is read from the git index, so an untracked/ignored
+# directory (e.g. a node_modules tree under extensions/<x>/) cannot false-block.
 # Repo-tree only; no live ~/.pi/agent dep.
 if [ -x ./scripts/check-pi-config-extensions.sh ]; then
   echo "==> pi-config extensions parity gate"
