@@ -214,9 +214,10 @@ ck "the excluded ai-drainer.sh is a NON-launcher in CODE (it only DISPATCHES gat
 # `systemctl show -p ExecStart`, so WITH the comments stripped neither the flag nor its `--no-session`
 # partner survives as a pair. A real launch added to that file (in code) puts the pair back and this
 # arm goes RED — the exclusion cannot swallow one, and it is the detector's own predicate, not a list
-# of verbs this test hopes is complete.
-_nl_code="$(sed 's/#.*//' "$HERE/orphaned-harness.sh" 2>/dev/null)"
-if grep -qE -e "$_nl_flag" <<<"$_nl_code" && grep -qF -- '--no-session' <<<"$_nl_code"; then rc=1; else rc=0; fi
+# of verbs this test hopes is complete. (`_oh_code`, not a reuse of `_nl_code`: the ai-drainer arm
+# above keeps its own captured code, so neither arm can be read as asserting the other's file.)
+_oh_code="$(sed 's/#.*//' "$HERE/orphaned-harness.sh" 2>/dev/null)"
+if grep -qE -e "$_nl_flag" <<<"$_oh_code" && grep -qF -- '--no-session' <<<"$_oh_code"; then rc=1; else rc=0; fi
 ck "the excluded orphaned-harness.sh is a NON-launcher in CODE (a read-only orphan REPORT whose -p tokens are ps/systemctl flags; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
@@ -578,11 +579,16 @@ printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' 
 printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
 # ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
-# `ci-queue.sh` now gates EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue defers
-# (fail-closed — an unreadable queue is not an empty one). The `gh` stub above FAILS every call by
-# design (the arms below need a failing `gh pr view`), so without a genuine reading every fixer arm
-# would be deferred before it ever reached the load/disk gate it exists to test: six "load-gate
-# regressions" that are not regressions. That is what these seven arms reported before this stub
+# ⛔ THIS RIG IS NOW A PRECONDITION WITH NOTHING BEHIND IT, KEPT DELIBERATELY (#2927). It was added
+# because `ci-queue.sh` gated EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue
+# defers (fail-closed — an unreadable queue is not an empty one), while the `gh` stub above FAILS
+# every call by design (the arms below need a failing `gh pr view`) — so without a genuine reading
+# every fixer arm was deferred before it reached the load/disk gate it exists to test. The fixer arms
+# no longer consult the module at all (a fixer is REPAIR), so this rig currently changes no verdict.
+# It stays because (a) `fix-one.sh`/`adopt-fix.sh` and the arms must still pass on a box where the
+# module IS installed and answering, which is the production shape, and (b) it is the seam that goes
+# live again the moment any arm re-acquires a read — and a future lane deleting it as "dead setup"
+# would be re-introducing exactly the six false "load-gate regressions" it was written to stop. That is what these seven arms reported before this stub
 # existed, on a tree where nothing was wrong with the load gate.
 # ⛔ THE READING IS SUPPLIED, NOT THE GATE SWITCHED OFF. `gh-queue` answers ONLY the three endpoints
 # `ci-queue.sh` reads, with a SHALLOW queue (1 queued, 0 running, 3 runners → ceiling 6) — the
@@ -1590,6 +1596,19 @@ CWT="$CREPO/.worktrees/cap-1"
 # A linked worktree shares the repository config, so this origin is what `git -C "$CWT" remote`
 # answers for the arms' cwd.
 git -C "$CREPO" remote add origin https://github.com/owner/repo.git
+# ⛔ AND ITS TRANSPORT IS LOCAL (agent-infra#2834). The exit-path rescue now runs at the end of EVERY
+# `run_agent`, so the cap arms below — which leave the worktree DIRTY on purpose — would otherwise
+# attempt a real `git fetch`/`git push` against github.com from a test suite that promises to touch no
+# real state. `url.<bare>.insteadOf` rewrites the TRANSPORT only: `repo-slug.sh` reads
+# `git config --local --get remote.origin.url` and still sees the GitHub slug the creation gate needs
+# (a local `remote set-url` would be refused 74 by THAT gate), while the rescue's fetch and push land
+# in this bare repo. Hermetic, and it lets these arms exercise the rescue instead of skipping it.
+git init -q --bare -b main "$CAPRIG/origin.git"
+git -C "$CREPO" config url."$CAPRIG/origin.git".insteadOf https://github.com/owner/repo.git
+# The rescue builds its archive with `git commit-tree`, which needs an AUTHOR IDENTITY of its own; the
+# fixture's per-commit `-c user.email=…` would leave it with none, and the arm would then be measuring
+# a missing identity rather than the cap.
+git -C "$CREPO" config user.name t; git -C "$CREPO" config user.email t@t
 printf '#!/bin/sh\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$CAPRIG/bin/gh"
 chmod +x "$CAPRIG/bin/gh"
 # A worker that never finishes inside the cap. (arm 6 replaces it with one that IGNORES SIGTERM;

@@ -469,6 +469,7 @@ a killed worker cannot take the controller down with it.
 | `logs/` | one log per worker: `lane-*.log`, `lane-merge-<PR>.log` (the lane's merge-loop chain), `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` — `merge-rate.sh` deliberately does NOT count `lane-merge-*.log` as a lane |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6), plus one `capwip-<stamp>-<pid>/` per lane KILLED AT ITS WALL-CLOCK CAP (#2045): `tracked.patch`, `untracked.tgz`, `untracked.list`, `tracked.numstat` (the re-parse's own output, kept as evidence that the patch was verified) and `SNAPSHOT.txt`. The newest `WIP_SNAPSHOT_KEEP` (10) directories are kept — a cell's disk is the first thing that stops dispatch, so this is a bounded directory, not a log |
 | `state/capwip.tsv` | one row per cap kill **on every path** — epoch, label, cap seconds, elapsed, exit status, the verdict (`COMPLETE`/`PARTIAL`/`NOTHING-LOST`/`LOST`/`UNSNAPSHOTABLE`) and the snapshot dir (empty where no directory exists). The companion to `state/walltime.tsv` (`report.sh` computes the cap-hit RATE there; this is what says whether the kill cost any work) and the reason a cap hit is no longer an absence in the fleet's accounting |
+| `state/lane-end.tsv` | one row per **terminal agent transition, cap or not** (#2834) — epoch, label, exit status, cap flag, the tree verdict (`dirty`/`clean`/`unpushed-only`/`cannot-verify`/`not-a-worktree`/`not-measured`), the rescue (`refs/wip/<slug>`/`archived-local`/`nothing`/`FAILED`/`UNAVAILABLE`/`DISABLED`), the local ref that pins the archived commit, the unpushed-commit count, and **the root that was measured** (`root` — the only column that can expose a wrong-tree archive). ⛔ **Every path writes through ONE writer** (`lane_end_record`), including the two that return BEFORE the measurement — `not-measured` (the operator hatch) and `not-a-worktree` (a root that is not a worktree ROOT: not a repository at all, or a path *inside* one) — because an absence used to be indistinguishable from a lane that never ended. ⛔ The root rule is the CALLEE'S (`bg-rescue-wip.sh:96-103`, `--show-toplevel` = `pwd -P`), not a weaker one (`rev-parse --git-dir` succeeds anywhere inside a repo, so it used to ratify a corner of a checkout and then fail one layer down as `rescue=FAILED`); what it does **not** catch — and does not claim to — is a caller that sets no `WIP_PATH` while its cwd sits at the ROOT of another checkout, which is why the measured root is a recorded column rather than an assumed one. ⛔ **`FAILED` means the rescue failed AND no ref pins anything**; `archived-local` is the third state, `bg-rescue-wip.sh` having exited 2 while `refs/wip-local/<slug>` is valid (a PARTIAL archive and a failed push both land there — the replayed callee lines above say which). ⛔ **The `ref` column names the LOCAL `refs/wip-local` pin and is EMPTY over an archive in exactly one case**: `bg-rescue-wip.sh` pushed `refs/wip/<slug>` and could not write that pin (it is guarded — `:246-252` warns and carries on), so the row reads `rescue=refs/wip/<slug>` with an empty ref and a loud line saying so. An empty ref alone is **not** "nothing was archived". The exit-path companion to `capwip.tsv`: the cap is not the common termination (`hit its … cap` appeared in **0** of 373 lane logs on the measured session), so without this row a lane that simply ENDED left no trace at all — its report said IN PROGRESS, the branch had no new commit, and the only copy of the work was a scratch worktree a reaper eventually deletes |
 
 ### Why the *reviewer* is a separate process from the *controller*
 
@@ -516,6 +517,44 @@ worker staged, its branch or its stash (it runs `git status --no-optional-locks`
 `git status` refreshes the stat cache under `.git/index.lock` and could make a surviving writer's next
 git command fail on a lock the rescue took), and it calls a backup
 `COMPLETE` only after re-parsing it.
+
+⛔ **AND A LANE THAT ENDS IS ITS OWN FACT TOO (#2834).** The cap is the RARE termination: on one
+measured fleet session of 373 dispatched lanes, `hit its … cap` appeared in **zero** lane logs, while
+**148** worktrees were left holding uncommitted or unpushed work and `origin` held no `refs/wip/*` from
+that session. So `run_agent` now ALSO runs the shipped `scripts/bg-rescue-wip.sh` at the end of every
+invocation **that started an agent** — after `wait`, after the cap snapshot, before it returns — and the
+tool puts the work on
+**origin** under `refs/wip/<branch-slug>` (built with `git commit-tree` through a throwaway index, never
+`git stash`, whose ref is repo-global and whose `pop` can silently drop a PEER lane's entry). Three
+things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
+  * the root is `WIP_PATH` when the caller sets it and `$PWD` otherwise, because `fix-one.sh` `cd`s into
+    the MAIN checkout while the work lives in the fixer's worktree — archiving the wrong tree would be
+    worse than no rescue, since it reports a capture the lane never received;
+  * it costs a network call only when there IS something to save (one `git status` + one `rev-list`
+    otherwise), and it never changes the lane's exit status: a lane's status and the fate of its
+    worktree are different facts;
+  * `unpushed-only` is MEASURED and NAMED but never archived **here**, and the reason is the callee's
+    contract rather than branch safety: `bg-rescue-wip.sh` archives only a NON-EMPTY `git status`
+    (`:150-166`), so a clean-but-unpushed tree makes it exit 0 having done nothing, and `refs/wip/<slug>`
+    is a non-force ref built with `commit-tree` — not a branch. Teaching it to archive `HEAD`'s tree is a
+    change to that shipped tool's contract and is deliberately out of scope, so #2834's ask 1 is met for
+    the DIRTY half and recorded for the unpushed half: the commits live in the repo's object database and
+    survive the WORKTREE being removed, but not the BRANCH being deleted.
+  * ⛔ **THE SCOPE IS "AN AGENT STARTED", NOT "EVERY CALL"** — the ten GATE REFUSALS inside `run_agent`
+    (brief gate, fork, disk/no-headroom, load, land-backlog, pi's own load/fork refusal) `return` before
+    the spawn and therefore reach neither the rescue nor the ledger. That is the honest reading: nothing
+    ran, so there is no terminal transition to record, and a refused lane writes NO `lane-end.tsv` row —
+    an absent row is not "the lane ended clean", which is why the remedy for a fleet-wide gap here is the
+    log of the refusal, not this table.
+A rescuer that cannot be FOUND is `rescue=UNAVAILABLE` and a loud line naming the homes it searched —
+never a silent skip, which is how an operator's own copy of this call was a no-op for a whole session
+(`cd` before `_HERE` was resolved from a relative `BASH_SOURCE`, so `[ -f … ] && bash …` degenerated to
+`false`). ⛔ **`UNAVAILABLE` carries TWO causes, and the `tree` column says which**: `tree=not-a-worktree`
+means the ROOT was refused and no search happened at all (the rescuer is usually present), while any other
+`tree` value means the rescuer was genuinely not found. A count of `UNAVAILABLE` rows is therefore not a
+count of boxes missing the script — read the `tree` column with it. The launcher publishes the verdict in `$D/<name>.end`, so `--status` answers "what happened to
+the work" as well as "what was the exit code":
+`caplane failed rc=143 (cap 1s hit — …) end: tree=dirty rescue=refs/wip/work (refs/wip-local/work@87d4aba)`.
 
 ⛔ **Nothing here reviews anything.** The worker runs with `AGENT_SKIP_REVIEW_GATE=1` (a child has no
 `task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
@@ -908,9 +947,27 @@ green `CELL READY` means a guarded lane: two components that decide whether the 
 cells today. `cell-install.sh --verify` now prints one `activation:` line for the shim, resolved
 through the **same** candidates `review-enforcer` reads, so the row is checked rather than asserted.
 
+#### When a cell says it is provisioned and is not — the eight measured signatures
+
+Measured 2026-10-27 while provisioning `pi-cell-1` / cell 3 / cell 4: every row below is a failure an
+operator hit **after** some step had reported success. **The gate is the authority; this table is its
+index** — `scripts/cloud-cell-bringup.sh --check` fails closed with `CHECK FAILED [<check name>]` (or a
+supervisor `FATAL`) and prints the FIX line, so read the refusal, not this table, for the current state
+of any single check. Nothing here is a procedure to run *instead* of `--check`.
+
+| failure signature | cause | the command that fixes it |
+|---|---|---|
+| `cell-install.sh --install` ends right after `LAYER VERIFIED`, and no pin is recorded | the layer is not the cell: the harness pin is created by a **separate** gate, so an install can succeed over a cell that has none (#2909) | `HOME=$HOME CELL_HOME=$HOME bash scripts/cloud-cell-bringup.sh --check` — `check_harness_pin` **refuses** a cell with no pin now; it is the only writer, so there is nothing to run first |
+| `FAIL com.eldato.ai-drainer: placeholder(s) this runtime does not know: {{AI_DRAINER_O}}`, `no StartInterval…`, then `the declared job set is BROKEN — refusing …` and the controller dies `rc=1` | shipped job declarations vs shipped runtime (#2908) | fix the declaration in `templates/launchd` and re-run `--check`; `check_schedule` refuses a non-zero `fleet-schedule.py --verify` **or any `FAIL` line** |
+| `REPO is not set and no single checkout could be derived` | TWO homes — `/home/cmux` (checkout) and `/tmp/cell-home` (farm/state/keys) | `CELL_HOME=$HOME WORKDIR=$HOME/<repo> bash scripts/cloud-cell-bringup.sh --check`; `check_one_home env` refuses a `CELL_HOME` that is not this box's home, and any cell-state path in `/tmp` outside it |
+| 17 jobs `broken target: …/.pi/agent/scripts/… does not resolve — the farm is INCOMPLETE` **while the farm is installed** | the same two homes: the declarations expand `{{HOME}}` to the home the farm is NOT under | the same fix as the row above — one home, re-run `--check` |
+| `install-*-timer.sh --status` prints `installed` for a 7-line hand-written `/tmp` shim | a hand-written unit is indistinguishable from a rendered one by name | re-render it: `scripts/cloud-cell-supervisor.sh apply` (or the owning installer's `--install`); `check_one_home units` refuses a rendered unit whose `Environment=`/`ExecStart=` carries a `/tmp` path, and the installer `--status` DRIFT arm (drainer lane) refuses a unit it did not render |
+| `FATAL: doctor session 'cell-doctor' belongs to another state dir (…)` | a stale tmux session minted by a **previous** state dir blocks the doctor role | `tmux kill-session -t cell-doctor` — the `FATAL` prints it with the owning state dir; the supervisor never clears another state dir's session (#1856) |
+| `FATAL: a controller runs from this machine's shared harness path (pid …)` | a leftover inner-chain member (`tmux → bash -c → orch-loop.sh`) from a previous state dir blocks the first start | `kill <pid>` — the `FATAL` now prints it with each pid's state dir; the supervisor does not signal a pid it cannot prove it owns |
+| `claims.sh: line 1205: printf: write error: No space left on device`, controller dead, on a cell that printed `CELL READY` | no reaping **before** lanes: the reaper came from the scheduler that would not start | `bash scripts/orchestrator-harness/disk-reaper.sh --apply --repo <checkout>`; `check_reaping_armed` runs the shared `disk-floor.sh` floor+reclaim pass and refuses a cell still under it after the pass |
+
 **On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
 checkout:
-
 ```bash
 # 1. Run all four steps from the ROOT of an agent-infra checkout — the harness now lives there.
 #    Put it where $O will point (default ~/orchestrator): the daemon executes $O/<script>,
@@ -1828,7 +1885,7 @@ Every entry point this directory's consolidation carried, classified against the
 | `scripts/merge-queue.py` | the DRAIN line for the heartbeat (open PRs vs merged-today, and which lane is on it) | runs INSIDE `orchestrator-heartbeat.sh` | no unit of its own | no unit of its own | current — but it is **not a merge-queue runner**, despite the name: landings are performed by `cloud-cell-doctor.sh merge` (cell) and `orch-loop.sh`'s own sweep (Mac) |
 | `scripts/orchestrator-harness/claims.sh` | cross-box claim registry — a **LIBRARY** (sourced by the controller and the lanes) | sourced; the registry itself is DATA on the remote (`refs/claims/*`) | none needed | none needed | current (not a service: `up` never installs it) |
 | `scripts/orchestrator-harness/capacity.sh` | measured placement — a **LIBRARY** plus a `probe` CLI | sourced per dispatch | none needed | none needed | current |
-| `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch and before every push | none needed | none needed | current |
+| `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch of NEW-PR work and before a CI rerun — **never** by a repair push (#2927) | none needed | none needed | current |
 | `scripts/orchestrator-harness/disk-floor.sh` | the pre-dispatch disk floor — a **LIBRARY** | sourced by the controller | none needed | none needed | current |
 | `scripts/deploy-mac-orchestrator.sh` | copies the harness into `$O` and stamps the commit | by hand (§4 step 1) | — | — | current for the DEPLOY; ACTIVATION is `install.sh --start` / `harness-up up` |
 | `scripts/cloud-cell-bringup.sh` | full cell PROVISIONING (clone, keys, farm, units) | by hand, once per cell | installs several units | — | current — provisioning is not convergence: `up` does not run it |
@@ -4249,19 +4306,23 @@ The remedy is `ci-queue.sh`: one sourced module (also runnable standalone —
 question — may this box send more CI-spending work yet. The ceiling is **derived**, not a constant:
 `ceil(runners × horizon_min ÷ job_p90_min)`, and it is a **measured queue read, NOT a lane cap**: the
 owner ruling of 2026-10-17 ("dispatch should be gated on capacity, not on number of lanes") is why
-nothing here re-states a lane ceiling. Three surfaces read it, so they cannot disagree: `orch-loop.sh`
-(one read per PASS — the sweep's and the dispatch block's, so at most TWO live reads per cycle —
-in-shell, before dispatch — and THREE fixer spawn arms: the CONFLICTED one, the
-CI-red one, and the review-gate one, whose product is also a new head — plus the CI RERUN, which is
-the only other surface in the sweep that ADDS queue), `fix-one.sh` (the lane
-whose whole product is a NEW HEAD), and `dispatch-merge.sh` (the batch that stampedes). ⛔ The FOURTH
-fixer spawn arm — the RED-TREE one — is NOT gated yet: it books its attempt and spawns before any
-`ciq_push_ok` call, so a deep queue still starts that lane and `fix-one.sh` defers its first push.
-Disclosed rather than implied; home agent-infra #2408. ⛔ That census is the SWEEP's, not the
-fleet's: `pr-doctor`'s `prfix` workers are a **second** ungated pusher and are not an orch-loop arm
-at all — `pr-doctor.py` spawns up to `MAX_FIX` of them to `fetch -> rebase -> fix -> push` (or
-`gh run rerun`) with no queue read (`rg -c 'ciq|ci-queue' scripts/pr-doctor.py` = 0), so a launchd
-job still adds CI behind a deep queue; wiring that surface is agent-infra #2540.
+nothing here re-states a lane ceiling. ⛔ **Repair does not read it at all (#2927).** The two actions
+that DO — the two that add a run to the queue — are `orch-loop.sh` (one read per PASS — the sweep's
+and the dispatch block's, so at most TWO live reads per cycle — in-shell, before the ISSUE dispatch,
+plus the CI RERUN site, which queues a fresh run for the same head) and `dispatch-merge.sh` (the batch
+that stampedes, issue→PR). ⛔ THE FIXER ARMS AND `fix-one.sh` ARE NO LONGER ON THAT LIST, AND THAT IS
+THE CHANGE: a fixer is REPAIR on a PR that already exists, bounded by lane slots, the cross-box claim
+and the load/disk gate. The depth this module prices is CI concurrency belonging to NEW-PR work; gating
+repair with it skipped 41 consecutive repair dispatches while 8 runners and ~11 lane slots sat idle.
+The former FOURTH-arm disclosure (the RED-TREE fixer spawning before any `ciq_push_ok` call, home
+#2408) is therefore moot — nothing on the repair path reads this module, so a started lane pushes
+instead of being turned away. ⛔ That census is the SWEEP's, not the fleet's: `pr-doctor`'s `prfix`
+workers remain an **ungated** pusher and are not an orch-loop arm at all — `pr-doctor.py` spawns up to
+`MAX_FIX` of them to `fetch -> rebase -> fix -> push` (or `gh run rerun`) with no queue read
+(`rg -c 'ciq|ci-queue' scripts/pr-doctor.py` = 0), so a launchd job still adds CI behind a deep queue.
+⚠️ #2540 asked for the OPPOSITE — more gating on repair pushes — and #2927 records why its premise (a
+fixer push is the queue pressure) is what the measurement contradicts; wiring that surface is a
+re-open of #2927, not an execution of #2540.
 
 Two properties are the point, and both are pinned by `ci-queue.test.sh` (wired into
 `run-bash-shards.sh`): an **UNREADABLE** queue is UNKNOWN and UNKNOWN defers CI-spending work
@@ -4291,7 +4352,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | Reaching `MAX_FIX_TRIES` fell through to the re-record branch | an unfixable PR burned a full fresh-context review **every cycle, forever** | terminal `state/parked-<PR>` state, keyed to the head so a new push re-arms it |
 | `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … \| grep -qx`) |
 | `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
-| **the scout worktree was created once and never updated** — the pass pre-flighted with whatever copy `chore/dispatch-scout` froze at (measured 2026-10-19: **191** commits behind `origin/main`; re-measured 2026-10-20 on a cell: **258** behind, the branch tip still `430ff7cce` from 2026-10-16) | a fix to the gate could not reach the harness that runs it: the cell pre-flighted with a lane-liveness reader whose cmux verb that build no longer has, so **every** candidate came back `INCOMPLETE`, the pass ABORTED `judged 12 / usable 0`, and the cell dispatched nothing behind a log line that read `FAILED rc=1 (transient — retried next cycle)` (agent-infra#2174) | the pass now `git fetch` es `main` into `refs/remotes/origin/main` (destination named, so a mis-mapped `remote.origin.fetch` cannot make a no-op fetch look like currency) and moves the scout to that tip **on every pass**, logging the gate it judged with (`[refresh] gate: <path> cksum=<n>`, plus `unversioned=1` when the gate lives in a tree this pass cannot version); a scout that cannot be refreshed **refuses to judge**, naming the sha and the failed step, with rc=3 (`NOT PROVISIONABLE`: `.git` link that does not resolve, no `origin`, no `main`, no `origin/main` after a fetch, a gate whose bytes are not the ones at the checked-out commit) or rc=1 (`TRANSIENT`: network, uncommitted tracked work, commits not in `origin/main`, an untracked file in the way) — so the loop writes a MERGE-ONLY marker only for the permanent causes, quoting the refusal; `--check` refuses the offline-judgeable causes too, read-only: a scout whose `.git` link does not resolve, a worktree with no `origin`, commits ahead of `origin/main`, or (when a move is needed) uncommitted tracked work — the last two as rc=1 with a `TRANSIENT: scout` token, so the two consumers' diagnosis follows the refusal instead of always naming a provisioning defect — plus, for a scout that is its own worktree, a gate that is untracked or edited relative to `HEAD`; remote reachability, a trunk that is not `main`, and that byte test on a NON-worktree scout are deliberately left to nobody: the byte test is skipped on both paths for that shape, whose whole protection is the announced `unversioned=1` (#2217); uncommitted work in the scout is never discarded |
+| **the scout worktree was created once and never updated** — the pass pre-flighted with whatever copy `chore/dispatch-scout` froze at (measured 2026-10-19: **191** commits behind `origin/main`; re-measured 2026-10-20 on a cell: **258** behind, the branch tip still `430ff7cce` from 2026-10-16) | a fix to the gate could not reach the harness that runs it: the cell pre-flighted with a lane-liveness reader whose cmux verb that build no longer has, so **every** candidate came back `INCOMPLETE`, the pass ABORTED `judged 12 / usable 0`, and the cell dispatched nothing behind a log line that read `FAILED rc=1 (transient — retried next cycle)` (agent-infra#2174) | the pass now `git fetch` es `main` into `refs/remotes/origin/main` (destination named, so a mis-mapped `remote.origin.fetch` cannot make a no-op fetch look like currency) and moves the scout to that tip **on every pass**, logging the gate it judged with (`[refresh] gate: <path> cksum=<n>`, plus `unversioned=1` when the gate lives in a tree this pass cannot version); a scout that cannot be refreshed **refuses to judge**, naming the sha and the failed step, with rc=3 (`NOT PROVISIONABLE`: `.git` link that does not resolve, no `origin`, no `main`, no `origin/main` after a fetch, a gate whose bytes are not the ones at the checked-out commit) or rc=1 (`TRANSIENT`: network, uncommitted tracked work, commits not in `origin/main`, an untracked file in the way) — so the loop writes a MERGE-ONLY marker only for the permanent causes, quoting the refusal; `--check` refuses the offline-judgeable causes too, read-only: a scout whose `.git` link does not resolve, a worktree with no `origin`, an UNRELATED history that shares no ancestor with `origin/main` (a fetch cannot connect it), or (when a move is needed) uncommitted tracked work — those as rc=1 with a `TRANSIENT: scout` token, so the two consumers' diagnosis follows the refusal instead of always naming a provisioning defect — plus, for a scout that is its own worktree, a gate that is untracked or edited relative to `HEAD`; `--check` **WARNS** instead of refusing when it holds a count it cannot ATTRIBUTE offline — a SHALLOW checkout whose graph does not connect to the trunk (#2953), and a CONNECTED count in a FULL checkout, which reads identically for local commits and for commits a STALE `refs/remotes/origin/main` has not fetched (#2956) — because the run path fetches before it decides and a false FAIL there refuses to START a cell (`cloud-cell-bringup.sh` `die`s on a non-zero `--check`); remote reachability, a trunk that is not `main`, and that byte test on a NON-worktree scout are deliberately left to nobody: the byte test is skipped on both paths for that shape, whose whole protection is the announced `unversioned=1` (#2217); uncommitted work in the scout is never discarded |
 | `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
 | **`refresh-candidates.sh` hardcoded a tortoise/Python shape** (`uv sync --extra embeddings --extra parity` and tortoise's `tools/collision_preflight.py`) | a cell pointed at a non-Python repo (agent-infra has no `pyproject.toml`) aborted **every** cycle, and because `orch-loop.sh` runs the refresh in a **backgrounded subshell** the non-zero exit could not fail the loop: the controller reported `RUNNING` with `lanes: 0` **forever** — a cell that looks alive and can only merge (agent-infra#1736) | the venv step is skipped only when it is genuinely **not applicable** (no `pyproject.toml`) — a real `uv sync` failure is still fatal, loud, and prints uv's own output; the extras are read from the project; the tool is resolved per repo (own copy, else a `TORTOISE_REPO` checkout) and its absence is a **permanent** `rc=3`; `--check` gives the same verdict read-only so `cloud-cell-supervisor.sh check`/`start` refuse a merge-only repo with the reason; and `orch-loop.sh` now reads the rc — permanent writes a `MERGE-ONLY` marker and stops retrying, transient still retries |
 | **the merge-key preflight asked "is there a key?" in four mutually inconsistent ways** | every divergence is a false green on the one check that decides whether a cell signs its reviews: `install.sh` and `cmd_check` tested the key **file** by *size*, and a 1-byte newline — exactly what `echo "$KEY" > file` writes for an unset variable — read as present; `cmd_check` tested the **`keys.env` value** for raw non-emptiness, while the consumer strips whitespace and treats the result as absent; the **precedence was file-first** while the consumer is env-first, so a whitespace-only value shadowed a valid file (its fallback never runs on a non-empty raw value); and the file was read from `$HOME`, which `keys.env` may repoint while the session forces `HOME` back to `$CELL_HOME` after the source | both the file and the value are tested for **normalized content** at every site, the order matches the consumer (env first, the file as its fallback), the file is read from `$CELL_HOME` — the home the session actually uses (`keyfile_has_key` states it explicitly, and the supervisor re-exports `HOME=$CELL_HOME` after sourcing so both agree on every path) — and each of the four cases has a check that a mutation turns red, except that the two HOME guards are now equivalent: with the re-export in place, reading `$HOME` or `$CELL_HOME` gives the same answer, so the behavioural pin is the check that a keys.env `HOME=` cannot change the verdict. |

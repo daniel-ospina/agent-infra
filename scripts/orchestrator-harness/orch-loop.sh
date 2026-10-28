@@ -884,7 +884,15 @@ fi
 # is `! 127` = TRUE, i.e. a box that shipped no module would defer every fixer forever while
 # reporting a healthy controller.
 if [ "${CIQ:-0}" = "1" ]; then
-  # ⛔ THE PREDICATE CAPTURES THE VERDICT **AND** MEMOIZES IT FOR THE CYCLE.
+  # ⛔ ONE CONSUMER LEFT, AND THAT IS THE POINT (#2927). `ciq_push_ok` gates the CI-RERUN site only.
+  # The three FIXER spawn arms no longer call it: they are REPAIR (an existing PR), and the class rule
+  # in `ci-queue.sh`'s header says only work that ADDS a new CI run is queue-gated. ⛔ The old gloss here
+  # — "whose CI pass is already spent" — was wrong (a repair push DOES start a fresh run); the basis is
+  # #2927's decision plus the measurement that the number was demand read as supply. A rerun is exactly that — it queues a fresh run for the same head — so it keeps
+  # the gate. Measured 2026-10-27: the fixer arms' call to this predicate was the last-line half of a
+  # gate that skipped 41 consecutive repair dispatches with 8 idle runners and ~11 free lane slots.
+  # The predicate itself is unchanged (capture + memo); if a future arm needs it, it must be a
+  # CI-SPENDING one, and the wiring arms in ci-queue.test.sh count the call sites.
   #   * CAPTURES (#2296 cycle 4, P2): `ciq_ci_allowed` reads in the CALLER's shell, so after it runs
   #     the CIQ_* record IS this decision's reading. The deferral rows below print `${CIQ_VER:-…}`,
   #     and `CIQ_VER` is otherwise assigned only later, in the dispatch block — so they used to render
@@ -951,7 +959,13 @@ if [ -n "$_pss_mod" ]; then
 fi
 if declare -f ps_select ps_decide ps_polarity ps_verdict ps_held >/dev/null 2>&1; then
   PRSICK=1
-  ps_load_ci_queue >/dev/null 2>&1 || true
+  # ⛔ NO QUEUE MODULE IS LOADED FOR THE PR-SICKNESS QUEUE (#2927): every dispatch it makes is
+  # REPAIR, which is NOT queue-gated. ⛔ The gloss this line used to carry — "adds no new CI run" — is
+  # wrong and is refuted above in `ciq_push_ok`'s note: a repair push DOES start a fresh run. The
+  # exclusion rests on #2927's decision plus the measurement that the number was demand read as
+  # supply, not on repair being free. Its bound is `--max-spawn` (the fix-lane headroom `fix_slots`
+  # computes) exactly as before. The CI-queue read this loop still needs is the dispatch block's own,
+  # below.
 else
   PRSICK=0
   # ⛔ A MISSING SELECTOR IS NAMED, NOT ASSUMED. Without this line a box that was never re-seeded
@@ -4563,48 +4577,25 @@ while true; do
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            # ⛔ ONE PREDICATE, ONE SITE: THE QUEUE GATE NESTS INSIDE THE ELIGIBILITY IT QUALIFIES
-            # (#2333 cycle 7 P2, kept through the merge with main). Evaluated as a separate `elif`
-            # the predicate would be duplicated — and a duplicated predicate is what lets the DEFER
-            # arm drift from the SPAWN arm it is supposed to mirror: evaluated in the other order, a
-            # box with every fix lane busy AND a deep queue reported `ci-queue(deep(…))` as the
-            # binding reason and never printed its own `NO fixer slot` diagnosis, a disposition the
-            # capacity gate — not the queue — was binding. Nested, the deferral is reachable ONLY
-            # through the spawn's own predicate, so a non-eligible PR can never be reported as
-            # deferred, and no second copy can drift. (The review-gate fixer arm below cannot nest —
-            # it is a two-arm `if`/`elif` chain — so it hoists `_fix_eligible` for the same reason;
-            # see its own ⛔.) It also keeps ONE comparison against the drain-aware `$MF` per spawn
-            # site, which is the count `test-gates.sh` asserts as "every fixer spawn site uses the
-            # drain-aware budget" — a second copy of the comparison is not a second spawn site.
-            if ciq_push_ok; then
-              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
-                echo $((NFC + 1)) > "$CF"
-                echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
-              else
-                echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
-              fi
+            # ⛔ NO CI-QUEUE GATE ON THIS SPAWN, AND THIS IS THE ARM THAT PROVES THE RULE (#2927).
+            # A CONFLICTED fixer is REPAIR: the PR and its head already exist. ⛔ Not "and its CI pass
+            # has already been paid for" — a repair push DOES start a fresh run; the basis is #2927's
+            # decision plus the measurement below. Measured 2026-10-27 on cell 4, the queue gate that used to wrap
+            # this spawn deferred 41 consecutive repair dispatches against a queue that belonged to
+            # GitHub-HOSTED concurrency, while 8 self-hosted runners and ~11 lane slots sat idle —
+            # and it reported `ci-queue(deep(…))` as the binding reason for a box whose lanes were
+            # free. The REAL bounds on this spawn are the two conditions above it (the `$MF` fix-lane
+            # ceiling, the cross-box claim and `can_spawn`'s load/disk/memory gate) plus
+            # `fix-one.sh`'s own spawn gate. `ci-queue.sh`'s header states the class rule: only work
+            # that ADDS a new CI run is queue-gated. Do not re-nest it here.
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+              echo $((NFC + 1)) > "$CF"
+              echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
             else
-              # ⛔ THE PUSH ARM (the rule this change exists for). A CONFLICTED fixer's entire purpose
-              # is to PUSH A NEW HEAD, and a push now would (a) queue behind a backlog it cannot
-              # finish inside its own lease and (b) invalidate this PR's head-bound review record —
-              # the attestation is bound to a SHA, so the push destroys the artifact it exists to
-              # produce. Deferred, not dropped: NO attempt is consumed (the counter is incremented
-              # only after a spawn), the PR keeps its place in the sweep, and the next cycle's FRESH
-              # read decides again — that is what makes the deferral non-sticky.
-              # ⛔ THE MEMOIZED VERDICT, WHICH THIS CYCLE DID MEASURE (#2333 review P2). `ciq_push_ok`
-              # reads on the COLD path (`orch-loop.sh`'s predicate), and this arm is only reached
-              # *through* it — so `CIQ_VER` is SET here and `${…:-unmeasured}` never fires. The old
-              # comment claimed the opposite ("the cycle's own read has not run yet"), i.e. it
-              # documented the cycle-6 P0 it was written to fix; an editor trusting it would
-              # "restore" a cold-path-less predicate and refuse every fixer for ever. The
-              # `unmeasured` default is kept as a defensive floor for the arm that cannot reach the
-              # read — precisely because the exact verdict also rides the `[ci-queue] DEFERRED …`
-              # line above, verbatim.
-              ciq_defer_note_here "CONFLICTED fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
-              disp "$PR" "${HEAD_N:-}" CONFLICTED wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
+              echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
             fi
           else
             # ⛔ THE SILENT REFUSAL (#2126 T5). Five capacity sites used to test their ceiling in an
@@ -4767,13 +4758,14 @@ while true; do
             is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
-            # ⛔ THE QUEUE GATE APPLIES TO THIS ARM TOO (#2333 cycle 3, P2). This spawn is a PUSHER as
-            # well — `fix-one.sh`'s product is a new head — so it obeys the same rule the other two
-            # fixer arms do: on a deep or unreadable queue the push would void this PR's head-bound
-            # review record and queue behind a backlog it cannot outlast. (The README and the suite
-            # both said "both fixer spawn arms"; there are three, and the suite pinned the gap.)
-            # The eligibility predicate is hoisted so the DEFER arm below can share it verbatim rather
-            # than duplicating the guard, and so a non-eligible PR can never be reported as deferred.
+            # ⛔ NO CI-QUEUE GATE ON THIS SPAWN EITHER (#2927): a review-findings fixer is REPAIR (its
+            # head already exists), so the class rule in `ci-queue.sh`'s header excludes it — same
+            # measurement, same 41 skips, same idle fleet as the CONFLICTED arm above. ⛔ Not because its
+            # "pass is already spent" (a repair push does start a run): the basis is the decision plus
+            # the wrong-number measurement. What stays: the eligibility predicate is still HOISTED into
+            # `_fix_eligible`, because the arms BELOW it (the attempt cap / park arm and the re-record
+            # chain) must ask exactly the question the spawn arm asks — capacity, findings and the
+            # attempt budget — and must not drift from it.
             _fix_eligible=0
             if [ -n "${HEAD_N:-}" ] && [ "$_rgs" = "NEEDS-FIX" ] \
                && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
@@ -4781,7 +4773,7 @@ while true; do
                && [ "$(wt_count fix-)" -lt "$MF" ]; then
               _fix_eligible=1
             fi
-            if [ "$_fix_eligible" = "1" ] && ciq_push_ok; then
+            if [ "$_fix_eligible" = "1" ]; then
               # Spawn FIRST, bookkeep only on success: recording the attempt before the spawn
               # means a killed/failed spawn consumes one of MAX_FIX_TRIES and deletes the
               # findings marker, so no fixer ever runs and the findings are lost.
@@ -4807,9 +4799,6 @@ while true; do
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "review-gate fixer spawn FAILED (attempt not consumed)"
               fi
-            elif [ "$_fix_eligible" = "1" ]; then
-              ciq_defer_note_here "review-gate fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
-              disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
             elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ "$_rgs" = "NEEDS-FIX" ]; then
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
@@ -4980,27 +4969,17 @@ while true; do
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
-            # ONE PREDICATE, ONE SITE — the CONFLICTED arm above carries the full reasoning (#2333
-            # cycle 7 P2): the queue decision nests inside the eligibility it qualifies, so a deep
-            # queue is the BINDING reason only for a PR that could otherwise have spawned, and there
-            # is no second copy of the `$MF` comparison to drift from this one.
-            if ciq_push_ok; then
-              printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
-                echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
-                echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
-              else
-                echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
-                disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
-              fi
+            # NO CI-QUEUE GATE — see the CONFLICTED arm above for the rule and the measurement
+            # (#2927): a CI-red fixer is REPAIR, and the bounds on it are this `$MF` fix-lane ceiling,
+            # `can_spawn`'s load/disk/memory gate and the cross-box claim.
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+              echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
+              echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
             else
-              # Same push arm as the CONFLICTED site above, for the other lane whose whole job is a
-              # new head: a CI-red fixer pushes a fix commit. Deferred with no attempt consumed --
-              # `fixcount-<PR>` is written only after a spawn, so the PR is not one attempt poorer
-              # for a cycle in which nothing was even started.
-              ciq_defer_note_here "CI-red fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
-              disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
+              echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
             fi
           else
             echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, $(spawn_gate_tok))" >>"$LOG"
@@ -5225,7 +5204,7 @@ while true; do
     # ⛔ A FAILED PASS IS ITS OWN LINE, never an empty one. `ps_select` already names the cause (its
     # ENUMERATION FAILED / NOREAD lines land in $LOG above); this records that the QUEUE was not
     # evaluated, so "no [prsick] decisions" can never be read as "no sick PRs".
-    [ "$_ps_rc" -ne 0 ] && echo "[prsick] pass did not complete (rc=$_ps_rc) — the PR sickness queue was NOT evaluated this cycle; see the ENUMERATION/backpressure line above" >> "$LOG"
+    [ "$_ps_rc" -ne 0 ] && echo "[prsick] pass did not complete (rc=$_ps_rc) — the PR sickness queue was NOT evaluated this cycle; see the ENUMERATION FAILED / NOREAD line above" >> "$LOG"
   fi
   # [prsick-pass:end]
 
@@ -5582,27 +5561,61 @@ PY
     echo "[ci-queue] ci-queue.sh is NOT available (looked in \$O and the script directory) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
   fi
   GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
-  if [ -n "$GATE_WHY" ]; then :
+  # ── THE GATE VECTOR, AND WHY THE ARMS STOPPED BEING ONE `elif` CHAIN (#2924, #2927) ──────────────
+  # ⛔ ONLY THE FIRST GATE THAT FIRED WAS EVER VISIBLE. `GATE_WHY` is ONE string and the arms were an
+  # `elif` chain, so the first arm that fired MASKED every arm behind it — and the arm that fires first
+  # is `merge-priority`, which is set whenever any workable un-owned PR exists. Measured 2026-10-27:
+  # 349 of 384 cycles closed the issue path with `merge-priority` named, while the box had **25 free
+  # lane slots**; of those gated cycles **88.5% also had a capacity gate that would have refused**, and
+  # **64** were refused with `ci-queue=ok`. So an idle cycle could not say whether it was waiting for
+  # the PR sweep (normal, healthy) or being throttled by a capacity gate (a defect) — and the PR side,
+  # which is the only population whose movement can lift `merge-priority`, was itself being deferred.
+  #
+  # ⛔ THE FIX IS NOT A SECOND COPY OF THE PREDICATES. The arms are INDEPENDENT predicates, and the
+  # chain encoded exactly one thing with `elif`: the ORDER in which a winner is chosen. Each arm is now
+  # its own guard that (a) assigns `GATE_WHY` ONLY IF IT IS STILL UNSET — identical first-wins
+  # semantics, byte-for-byte the same winner — and (b) appends its own verdict to `GATE_VEC` whether it
+  # won or not. A future arm added here is therefore visible in the vector by construction, and a
+  # predicate is never written down twice (the defect that lets a gate and its report drift apart).
+  # [gatevec:begin] (extracted and DRIVEN by test-gates.sh — keep the markers)
+  GATE_VEC=""
+  if [ -n "$GATE_WHY" ]; then
+    GATE_VEC="merge-priority(${UPN_WORK:-${UPN:-?}} un-owned PR(s) workable, ${SEL_TOTAL:-${OPEN_N:-?}} candidate(s))"
+  else
+    GATE_VEC="merge-priority=clear"
+  fi
   # ⛔ FORK HEADROOM IS THE FIRST CAPACITY GATE, AHEAD OF LOAD (agent-infra#2293). A box at 0.32x load
   # can be completely unable to spawn, so a chain that reports `load=` first describes the wrong
   # resource and points the operator at a remedy (wait) that cannot work. The order is
   # FORK -> DISK -> LOAD here as it is in capacity.sh's `cap_bound_hit`; DISK is not repeated here
   # because the spawn point (`spawn-gate.sh`) is its ONE implementation and it now runs it after this
   # same fork read.
-  elif [ "${FORK_STARVED:-0}" = "1" ]; then
-    GATE_WHY="${FORK_WHY:-fork_headroom_below_margin}"
-  elif [ -n "${CAP_FORK_BOUND_SELF:-}" ]; then
-    GATE_WHY="fork_${CAP_FORK_BOUND_SELF#fork_}(procs=${FORK_PROCS:-?}/${FORK_MAX:-?})"
-  elif [ "${LANES_UNKNOWN:-0}" = "1" ]; then GATE_WHY="lanes_unknown (the lane census could not be read -> do not add work)"
-  elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
+  if [ "${FORK_STARVED:-0}" = "1" ]; then
+    GATE_WHY="${GATE_WHY:-${FORK_WHY:-fork_headroom_below_margin}}"
+    GATE_VEC="$GATE_VEC fork=REFUSE(${FORK_WHY:-headroom_below_margin})"
+  else GATE_VEC="$GATE_VEC fork=ok"; fi
+  if [ -n "${CAP_FORK_BOUND_SELF:-}" ]; then
+    GATE_WHY="${GATE_WHY:-fork_${CAP_FORK_BOUND_SELF#fork_}(procs=${FORK_PROCS:-?}/${FORK_MAX:-?})}"
+    GATE_VEC="$GATE_VEC fork_bound=REFUSE(procs=${FORK_PROCS:-?}/${FORK_MAX:-?} by ${CAP_FORK_BOUND_SELF#fork_})"
+  else GATE_VEC="$GATE_VEC fork_bound=ok(procs=${FORK_PROCS:-?}/${FORK_MAX:-?})"; fi
+  if [ "${LANES_UNKNOWN:-0}" = "1" ]; then
+    GATE_WHY="${GATE_WHY:-lanes_unknown (the lane census could not be read -> do not add work)}"
+    GATE_VEC="$GATE_VEC lanes=UNKNOWN(the census could not be read)"
+  else GATE_VEC="$GATE_VEC lanes=$LANES/${MAX_LANES:-?}"; fi
+  if [ "$L" -ge "$MAX_LOAD" ]; then
+    GATE_WHY="${GATE_WHY:-load=$L>=max_load=$MAX_LOAD}"
+    GATE_VEC="$GATE_VEC load=REFUSE($L>=${MAX_LOAD:-?})"
+  else GATE_VEC="$GATE_VEC load=ok($L<${MAX_LOAD:-?})"; fi
   # ⛔ NO ELIGIBLE BOX ANYWHERE => NO NEW LANE ANYWHERE (measured placement, 2026-10-21). This arm is
   # reachable only when `cap_place` found a fleet with ZERO eligible boxes; it names the BOUND the
   # refusal hit (load_per_cpu / disk / memory / probe_stale / probe_unreadable / no_probe) so the
   # operator learns which resource to add, instead of reading a bare "skipped". A box that is merely
   # NOT the least-loaded one does NOT reach here — it is `place=<peer>`, which yields the item below
   # so the eligible box can actually take it (a refusal would strand it on a box that is fine).
-  elif [ "${CAP_STATE:-unavailable}" = "refuse" ] && [ -z "${CAP_PLACE:-}" ]; then
-    GATE_WHY="capacity-placement(bound=${CAP_BOUND:-unknown} no-eligible-box)"
+  if [ "${CAP_STATE:-unavailable}" = "refuse" ] && [ -z "${CAP_PLACE:-}" ]; then
+    GATE_WHY="${GATE_WHY:-capacity-placement(bound=${CAP_BOUND:-unknown} no-eligible-box)}"
+    GATE_VEC="$GATE_VEC placement=REFUSE(bound=${CAP_BOUND:-unknown} no-eligible-box)"
+  else GATE_VEC="$GATE_VEC placement=${CAP_PLACE:-${CAP_STATE:-unavailable}}"; fi
   # ⛔ THE CI-QUEUE ARM: deep (or UNKNOWN) => the ISSUE path is CLOSED, and that is the "prefer work
   # that does not need CI" rule made executable rather than advisory. Issue work opens NEW PRs, and
   # every new PR is another full CI pass queued behind the backlog; the PR sweep above already ran
@@ -5611,8 +5624,28 @@ PY
   # UNKNOWN defers too (fail closed): an unreadable queue is not an empty one, and a gh outage would
   # otherwise buy exactly the stampede on the one cycle the fleet could not see. The cache in
   # ci-queue.sh keeps that from firing on a transient error (it reports state=cache, with its age).
-  elif [ "${CIQ:-0}" = "1" ] && [ "${CIQ_RC:-1}" != "1" ]; then GATE_WHY="ci-queue($CIQ_VER)"
-  elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
+  # [ciq-arm:begin] (extracted and DRIVEN by ci-queue.test.sh (h6) — keep the markers)
+  if [ "${CIQ:-0}" = "1" ]; then
+    if [ "${CIQ_RC:-1}" != "1" ]; then
+      GATE_WHY="${GATE_WHY:-ci-queue($CIQ_VER)}"
+      GATE_VEC="$GATE_VEC ci-queue=REFUSE(${CIQ_VER:-unmeasured})"
+    else
+      # ⛔ THE QUEUE THAT WAS READ IS PRINTED EVEN WHEN IT PERMITS (#2927): an `ok` that hides the number
+      # it was derived from is the inference-as-measurement class this module exists to end, and on the
+      # idle line it is the difference between "the queue is fine" and "the queue is fine on 1 runner".
+      GATE_VEC="$GATE_VEC ci-queue=${CIQ_VER:-ok}"
+    fi
+  else GATE_VEC="$GATE_VEC ci-queue=UNMEASURED(the module is not available this cycle -> this arm is INERT)"; fi
+  # [ciq-arm:end]
+  if [ "$LANES" -ge "$MAX_LANES" ]; then
+    GATE_WHY="${GATE_WHY:-lanes=$LANES>=max_lanes=$MAX_LANES}"
+    GATE_VEC="$GATE_VEC lanes_full=$LANES>=${MAX_LANES:-?}(0 slots free)"
+  else
+    # ⛔ AN UNREADABLE CENSUS IS NOT "20 SLOTS FREE": the lanes token above already says UNKNOWN, and a
+    # slot count derived from a count nobody read would be the same inference-as-measurement defect.
+    if [ "${LANES_UNKNOWN:-0}" = "1" ]; then GATE_VEC="$GATE_VEC slots=UNKNOWN"
+    else GATE_VEC="$GATE_VEC slots=$(( ${MAX_LANES:-0} - ${LANES:-0} )) free of ${MAX_LANES:-?}"; fi
+  fi
   # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
   # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the
   # box had 1.4 GB available RAM (53 MB free + 1297 MB inactive) and 20 of 20 lane slots idle:
@@ -5621,16 +5654,25 @@ PY
   # indistinguishable from "nothing to do".
   # Swap exhaustion only matters when RAM is ALSO tight, so require both. An UNKNOWN memory read
   # keeps the veto (fail closed) — never let a probe failure open the gate.
-  elif [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ] \
+  if [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ] \
        && { [ "${MEM_UNKNOWN:-0}" = "1" ] || [ "${MEMAVAIL_MB:-0}" -le "$(( MIN_MEM_FREE_MB * 2 ))" ]; }; then
-    GATE_WHY="swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M AND mem_avail=${MEMAVAIL_MB}M<=$(( MIN_MEM_FREE_MB * 2 ))M (both tight)"
+    GATE_WHY="${GATE_WHY:-swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M AND mem_avail=${MEMAVAIL_MB}M<=$(( MIN_MEM_FREE_MB * 2 ))M (both tight)}"
+    GATE_VEC="$GATE_VEC swap=REFUSE(swap_free=${SWFREE}M<=${MIN_SWAP_FREE:-600}M AND mem tight)"
+  else GATE_VEC="$GATE_VEC swap=ok(free=${SWFREE}M, min=${MIN_SWAP_FREE:-600}M)"; fi
   # "A failed probe is UNKNOWN, not ample" is only true if MEM_UNKNOWN can be SET, and it is set
   # from mem_avail_mb()'s EXIT STATUS (its awk `exit 1`s on absent fields) rather than from an empty
   # string: awk's END block always ran, so `printf "%d"` yielded 0 for unset fields and a test for
   # an empty MEMAVAIL_MB could never be true. The helper is therefore tested on its own, above.
-  elif [ "${MEM_UNKNOWN:-0}" = "1" ]; then GATE_WHY="mem_probe_failed (capacity unknown -> do not add work)"
-  elif [ "$MEMAVAIL_MB" -le "$MIN_MEM_FREE_MB" ]; then GATE_WHY="mem_avail=${MEMAVAIL_MB}M<=min_mem_free_mb=${MIN_MEM_FREE_MB}M"
+  if [ "${MEM_UNKNOWN:-0}" = "1" ]; then
+    GATE_WHY="${GATE_WHY:-mem_probe_failed (capacity unknown -> do not add work)}"
+    GATE_VEC="$GATE_VEC mem=UNKNOWN(the probe failed -> capacity unknown, do not add work)"
+  else
+    if [ "$MEMAVAIL_MB" -le "$MIN_MEM_FREE_MB" ]; then
+      GATE_WHY="${GATE_WHY:-mem_avail=${MEMAVAIL_MB}M<=min_mem_free_mb=${MIN_MEM_FREE_MB}M}"
+      GATE_VEC="$GATE_VEC mem=REFUSE(avail=${MEMAVAIL_MB}M<=min=${MIN_MEM_FREE_MB}M)"
+    else GATE_VEC="$GATE_VEC mem=ok(avail=${MEMAVAIL_MB}M>min=${MIN_MEM_FREE_MB}M)"; fi
   fi
+  # [gatevec:end]
   # ── THE FUNNEL: ONE AUDITABLE LINE PER CYCLE (owner ruling, 2026-10-18) ────────────────────
   # The choice between "work the PR queue" and "open more work" is printed, not inferred: the counts
   # it was made from, the PR it will take first, and — when the issue path is shut — WHY. Without
@@ -6343,6 +6385,12 @@ PY
     # [prtail:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
     _prtail="${_prtail}${_refsuf:-}"
     # [prtail:end]
+    # ⛔ THE GATE VECTOR RIDES THE GATE LINE (agent-infra#2924 indicator (a), #2927's owner-visible
+    # requirement). It is APPENDED, after every existing field, so every parser of this line keeps
+    # working unchanged and the reason a cycle idled is readable in one place instead of inferred from
+    # a single masking arm. Printed on the idle path only: a cycle that DISPATCHED has nothing to
+    # explain, and `GATE_VEC` describes refusals, not the work it did.
+    _prtail="${_prtail} | gates: ${GATE_VEC:-UNMEASURED}"
     dispatch_gate_line "$GATE_WHY" "${LANES_DISPLAY:-$LANES}" "$WORKERS" "$_prtail" >> "$LOG"
   fi
   heartbeat

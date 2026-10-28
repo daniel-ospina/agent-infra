@@ -1310,8 +1310,9 @@ DRIFTED=""
 # worker-terminal.sh (#2210) is SOURCED by both controllers: their own guard only checks that the
 # verbs EXIST, so a partial older copy at $O passes it and the box silently executes a stale launcher
 # (a census that reads 0 workers, a reap that cannot prove a kill).
-# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by THREE
-# daemons (`orch-loop.sh`, `fix-one.sh`, `dispatch-merge.sh`), each of which only checks that the
+# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by the
+# controller `orch-loop.sh` and by `dispatch-merge.sh` (#2927 removed `fix-one.sh`'s copy — repair does
+# not read the queue), each of which only checks that the
 # verbs exist — so a stale `$O/ci-queue.sh` passes every interface guard and the box keeps deriving
 # its ceiling with the pre-review runner-count read (the 3x over-permissive one). A sourced module
 # that is not in this list is the drift the list exists to catch.
