@@ -105,8 +105,9 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land` and returns 0 iff THIS di
   # of turning the slack negative — it buys no slack, exactly as documented above.
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
-  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (73 fork / 74 land-backlog /
-  # 75 load / 77 disk), not a gate: an unrecognised value is reported as `load` because the refusal
+  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability /
+  # 73 fork / 74 land-backlog / 75 load / 77 disk), not a gate: an unrecognised value is reported as
+  # `load` because the refusal
   # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
   # fleet-wide idleness R8 removes. `fork` is named rather than folded into `load` because its remedy is
   # the OPPOSITE of a load wait — the box must be restarted or drained from OUTSIDE (agent-infra#2293) —
@@ -117,7 +118,22 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land` and returns 0 iff THIS di
   # Field 2 is deliberately NOT consulted here — the yield window is the controller's
   # business (`capacity_yield_live`), and an incoherent window must not make a proven refusal
   # unreadable. README §7.2d states exactly this per-reader split.
-  case "${gate:-}" in disk) printf 'disk' ;; fork) printf 'fork' ;; land) printf 'land' ;; *) printf 'load' ;; esac
+  #
+  # ⛔ EVERY GATE THIS CHAIN CAN REPORT AN EXIT CODE FOR MUST BE NAMED *HERE*, OR ITS ARM BELOW IS
+  # DEAD CODE (follow-up to #2991, P1, measured). This normaliser decides which arm of the loop's
+  # `case "$_cap_gate"` runs, so a value it folds into `*` can never reach its own arm — however
+  # carefully that arm was written. `capability` was missing here while its arm existed below, so a
+  # CAPABILITY refusal exited 75 and the operator was sent to a LOAD reading that cannot explain it:
+  # measured on the merged tree with a `gate=capability` record, `exit=75`, log `refused at the load
+  # gate`. The arm below and this line are ONE unit; a suite arm now drives each gate through this
+  # file and pins the exit code, so the pair cannot drift apart again.
+  case "${gate:-}" in
+    disk) printf 'disk' ;;
+    fork) printf 'fork' ;;
+    land) printf 'land' ;;
+    capability) printf 'capability' ;;
+    *) printf 'load' ;;
+  esac
   return 0
 }
 
@@ -250,6 +266,11 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # handing the issue to a peer box is exactly right (unlike `land`, which follows the item, or a
       # brief refusal, which no peer can clear). Without this arm the chain exited 75 and told the
       # operator to look at a LOAD reading for a refusal that load cannot explain.
+      # ⛔ AND IT NEEDS ITS NAME IN `cap_refusal_gate`'s NORMALISER TOO — that function proves the
+      # refusal, but its `case` chooses the VALUE this arm dispatches on, so folding `capability` into
+      # its `*` arm made this one unreachable and put the load remedy back (follow-up to #2991, P1,
+      # measured: `gate=capability` → `exit=75`, "refused at the load gate"). Both halves are pinned
+      # by one behavioural table in `spawn-gate.test.sh` ("EVERY REFUSAL CODE …").
       capability) _cap_rc=71 ;;
       *)    _cap_rc=75 ;;
     esac

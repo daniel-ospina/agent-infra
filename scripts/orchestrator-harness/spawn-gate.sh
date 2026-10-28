@@ -1961,42 +1961,68 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # default, not a tighter number: a healthy box measured 25 s worst case, so a 30 s bound left ~1 s of
   # slack for the post-answer exit and could refuse a working box on one slow sample).
   if [ "${LANE_PREFLIGHT:-1}" != "0" ]; then
-    local _pf_sh="" _pf_line="" _pf_rc=0 _pf_remedy=""
+    local _pf_sh="" _pf_line="" _pf_rc=0 _pf_remedy="" _pf_reason="" _pf_rest=""
     if _pf_sh="$(cell_preflight_path)"; then
       _pf_line="$(bash "$_pf_sh" --quiet --bound "${LANE_PREFLIGHT_BOUND:-45}" \
                     --provider "$lane_provider" --model "$lane_model" 2>>"$log")"
       _pf_rc=$?
       echo "[capability-gate] $_pf_line" >> "$log"
+      # ⛔ THE REASON IS PARSED FROM ITS STRUCTURAL POSITION, NOT MATCHED ANYWHERE IN THE LINE
+      # (follow-up to #2991, P3, measured). `_pf_line` ends in fields this gate does not own —
+      # `tail=<last 240 bytes of pi's own output>` on `no-return` and `call-failed` — and the arms
+      # below are chosen by a substring test, so ANY such reading that happened to embed the transient
+      # word was classified as one: measured a `why=call-failed … tail=pi: provider said why=no-answer~`
+      # line → `run_agent rc=0, agent launched`. That is a fail-open on arbitrary remote text, which is
+      # the worst kind: the reading that refutes the box is swallowed by the box's own output.
+      # So the reason is taken as the FIRST `why=` token immediately after `LANE_CAPABILITY=refused`
+      # (the format `emit` writes, one writer), and nothing after it can move the classification. Arm
+      # ORDER therefore stops being load-bearing: `no-answer` is matched against a parsed token, not
+      # against a prefix that could shadow a later arm.
+      case "$_pf_line" in *LANE_CAPABILITY=refused*) _pf_rest="${_pf_line#*LANE_CAPABILITY=refused}" ;; esac
+      case "$_pf_rest" in
+        [[:space:]]why=?*)
+          _pf_reason="${_pf_rest#*why=}"
+          _pf_reason="${_pf_reason%%[!a-z0-9-]*}" ;;
+      esac
       case "$_pf_line" in
-        *why=no-answer*)
-          echo "[capability-gate] WARN $label: the probe RETURNED without an answer (rc=$_pf_rc) — PROCEEDING, because a transient cannot arm a refusal and this is the only shape a transient takes. If lanes on this box stall, the line above is the reading to start from." >> "$log" ;;
         *LANE_CAPABILITY=refused*)
           # The remedy follows the REASON. They are not interchangeable, and naming the wrong one is the
           # P0 this file records twice for the fork code: an operator told "repair the extension set"
           # on a box with no key, or "re-dispatch elsewhere" on a lane whose model id is empty, waits
           # for an event that cannot arrive.
-          case "$_pf_line" in
-            *why=exit-hang*|*why=no-return*)
+          case "$_pf_reason" in
+            no-answer)
+              # `why=no-answer` is the ONLY transient: the process RETURNED without answering. It is
+              # also the only reason that does not refuse, so it is the only one that leaves this block.
+              : ;;
+            exit-hang|no-return)
               _pf_remedy="This does NOT clear by waiting: repair the box's installed pi/extension set (the line above carries the reading) or dispatch elsewhere." ;;
-            *why=call-failed*)
+            call-failed)
               _pf_remedy="This does NOT clear by waiting on load: the request RESOLVED and the call errored — read the provider/key error in the line above and repair THAT." ;;
-            *why=keys-unreadable*)
+            keys-unreadable)
               _pf_remedy="This does NOT clear by waiting: the provider credential could not be read on this box — fix keys.env / the ambient <PROVIDER>_API_KEY before re-dispatching (the probe would have measured nothing)." ;;
-            *why=pi-missing*)
+            pi-missing)
               _pf_remedy="This does NOT clear by waiting: there is no pi on this box's PATH — install/repair the harness on the box before re-dispatching." ;;
-            *why=misconfigured*)
+            misconfigured)
               _pf_remedy="This does NOT clear by waiting: the lane's model/provider PAIR is empty, so no box could run it — fix the dispatch, not the box." ;;
+            usage)
+              # Version skew, not a property of the box: the probe rejected an argument it was handed.
+              _pf_remedy="This does NOT clear by waiting: the probe REJECTED its own arguments (the usage-error in the line above), which is a helper/consumer VERSION SKEW rather than a reading about this box — sync it: cp scripts/orchestrator-harness/*.sh \$O/ ." ;;
             *)  _pf_remedy="This does NOT clear by waiting: the reading above names the refusal." ;;
           esac
-          AGENT_STARTED=0
-          echo "[capability-gate] REFUSED $label: LANE_CAPABILITY (exit $_pf_rc) — no agent was started, so nothing was consumed and no 3300s slot is spent on a box that cannot complete one call and return. $_pf_remedy Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
-          # ⛔ JOB CONTROL IS RESTORED BEFORE THE EARLY RETURN (review P2). `set -m` was turned on
-          # above for the launch, and the restore line lives after it — so this return is the one path
-          # that used to leave the CALLER with job control ON when it did not have it. With `set -m`
-          # on, bash stops redirecting an async command's stdin from /dev/null, so a later background
-          # command in the caller can inherit the pane's pty or a CLOSED fd 0 (#2163).
-          [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
-          return "$AGENT_CAPABILITY_REFUSED" ;;
+          if [ "$_pf_reason" = "no-answer" ]; then
+            echo "[capability-gate] WARN $label: the probe RETURNED without an answer (rc=$_pf_rc) — PROCEEDING, because a transient cannot arm a refusal and this is the only shape a transient takes. If lanes on this box stall, the line above is the reading to start from." >> "$log"
+          else
+            AGENT_STARTED=0
+            echo "[capability-gate] REFUSED $label: LANE_CAPABILITY (exit $_pf_rc) — no agent was started, so nothing was consumed and no 3300s slot is spent on a box that cannot complete one call and return. $_pf_remedy Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
+            # ⛔ JOB CONTROL IS RESTORED BEFORE THE EARLY RETURN (review P2). `set -m` was turned on
+            # above for the launch, and the restore line lives after it — so this return is the one path
+            # that used to leave the CALLER with job control ON when it did not have it. With `set -m`
+            # on, bash stops redirecting an async command's stdin from /dev/null, so a later background
+            # command in the caller can inherit the pane's pty or a CLOSED fd 0 (#2163).
+            [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
+            return "$AGENT_CAPABILITY_REFUSED"
+          fi ;;
         *LANE_CAPABILITY=ok*) : ;;
         *)
           echo "[capability-gate] WARN $label: the capability probe produced no verdict at all (rc=$_pf_rc) — PROCEEDING, because a probe that cannot run is not a verdict about the box. If lanes on this box stall, start from the absence of a LANE_CAPABILITY line above." >> "$log" ;;
