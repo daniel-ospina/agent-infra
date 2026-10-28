@@ -187,8 +187,22 @@ ABSORPTION_QUEUED=""
 #   all-offline  registrations exist, NONE is online (the third state the fleet needs)
 #   stranded     mode=local and NOT ONE online runner can accept the queue's own demand
 #   unknown      the inventory could not be read — no capacity claim is made at all
+# `--status` prints ONE more word, `unmeasured`, for the same `capacity=` key: it is the manual read
+# verb and computes no verdict, so it says so in the SAME vocabulary rather than inventing a seventh
+# word (`measured`, which named neither a verdict nor an absence) that a scheduler would have to
+# special-case (#3002 review P2).
 CENSUS_VERDICT=""
 CENSUS_BLIND=0         # 1 only when the CAPACITY read failed (the condition the alarm is about)
+# ⛔ A LABEL'S CONTENT IS NOT ROW STRUCTURE (#3002 review P1). The census reads EVERY runner attached
+# to the repo, so one runner labelled `my gpu box` — a name this gate can neither emit nor forbid —
+# used to make the whole inventory UNREADABLE, i.e. exit 2 forever: the fleet's only CI routing
+# instrument frozen, with an alarm blaming a permission problem on a read that answered perfectly.
+# So labels are no longer character-policed at all; only the ROW shape is. The one thing label
+# content can still spoil is the match, and it is DETECTED instead of refused: the inventory reports
+# each runner's own label COUNT, and if the count disagrees with the comma-split we performed, a
+# label contains the delimiter and `offers_all` cannot be trusted — `CENSUS_LABEL_AMBIGUOUS=1`, which
+# NARROWS the claim (never a `stranded` deny) rather than voiding the pass.
+CENSUS_LABEL_AMBIGUOUS=0
 CENSUS_KV=""           # the measured counts, machine-readable
 CENSUS_DETAIL=""       # the same counts as "2 of 8 online (idle=0 busy=2 never-online=6)"
 CENSUS_ON_IDLE=0
@@ -228,8 +242,11 @@ need gh; need curl; need python3
 # that cannot, the caller turns the failure into `capacity=unknown` rather than into a count of zero.
 RUNNER_LIST_PATH="repos/$REPO/actions/runners"
 runner_census() {
+  # FOUR fields, the last one OPTIONAL (see CENSUS_LABEL_AMBIGUOUS): `<status> TAB <busy> TAB
+  # <labels,comma> TAB <label count>`. The count is what lets the reader tell a 3-label set from a
+  # 2-label set whose second label contains a comma, which the join above cannot distinguish.
   gh api --paginate "$RUNNER_LIST_PATH" \
-    --jq '.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))"' 2>"$GH_ERR"
+    --jq '.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)"' 2>"$GH_ERR"
 }
 
 # census_capability <body> — WHICH permission the read needed, named from the response itself.
@@ -250,8 +267,15 @@ census_capability() {
 # offers_all <runner-label-set> <job-label-set> — GitHub's semantics are AND: a job runs on a runner
 # that carries EVERY label the job requires. Empty demand is NOT a match (it would claim a match this
 # function never checked).
+# ⛔ GITHUB'S LABEL MATCHING IS CASE-INSENSITIVE, so this is too (#3002 review P2). Compared literally,
+# a workflow writing `runs-on: Ubuntu-Latest` selected exactly the runners this function said offered
+# nothing: `demanding_idle=0 demanding_busy=0`, and in mode=local a FALSE `stranded` deny whose reason
+# claimed "not one online runner can accept the queue's demand" about runners that would have taken it.
+# `tr` rather than `${x,,}`, because the harness still runs on macOS bash 3.2 (#2976).
 offers_all() {
-  local have=",$1," want="$2" l
+  local have want l
+  have=",$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]'),"
+  want="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
   [ -n "$want" ] || return 1
   for l in ${want//,/ }; do
     case "$have" in *",$l,"*) ;; *) return 1 ;; esac
@@ -263,17 +287,38 @@ offers_all() {
 # rc 0 = measured (zero rows is a readable zero) · rc 1 = unreadable rows (a schema change, a
 # truncated body, gh's own error text) — never counted as zero runners.
 census_classify() {
-  local rows="$1" row st busy labels n=0
+  local rows="$1" row st busy rest labels lcount nl commas n=0
   CENSUS_ON_IDLE=0; CENSUS_ON_BUSY=0; CENSUS_NEVER_ONLINE=0; CENSUS_DEMAND_IDLE=0; CENSUS_DEMAND_BUSY=0
+  CENSUS_LABEL_AMBIGUOUS=0
+  # ⛔ THE DERIVED FIELDS ARE CLEARED AT ENTRY, not only written on success (#3002 review P2): after an
+  # early `return 1` the counters were half-counted and the KV still described the PREVIOUS body — an
+  # artifact that does not match its measurement, which is the shape this change removes elsewhere.
+  CENSUS_KV=""; CENSUS_DETAIL=""
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     case "$row" in *$'\t'*) ;; *) return 1 ;; esac
-    st="${row%%$'\t'*}"; row="${row#*$'\t'}"
-    case "$row" in *$'\t'*) ;; *) return 1 ;; esac
-    busy="${row%%$'\t'*}"; labels="${row#*$'\t'}"
+    st="${row%%$'\t'*}"; rest="${row#*$'\t'}"
+    case "$rest" in *$'\t'*) ;; *) return 1 ;; esac
+    busy="${rest%%$'\t'*}"; labels="${rest#*$'\t'}"
     case "$st" in online|offline) ;; *) return 1 ;; esac
     case "$busy" in true|false) ;; *) return 1 ;; esac
-    case "$labels" in *[!A-Za-z0-9._,+-]*) return 1 ;; esac
+    # The 4th field is OPTIONAL so a body that has only ever carried three still parses (#3002): an
+    # absent count leaves the ambiguity check with nothing to compare and it is simply not run.
+    lcount=""
+    case "$labels" in
+      *$'\t'*) lcount="${labels#*$'\t'}"; labels="${labels%%$'\t'*}"
+               case "$lcount" in ''|*[!0-9]*) return 1 ;; esac ;;
+    esac
+    # A TAB left in the label field is still a broken ROW (it means a label carries the row separator
+    # and the columns after it are lost). Every OTHER character is allowed — see CENSUS_LABEL_AMBIGUOUS.
+    case "$labels" in *$'\t'*) return 1 ;; esac
+    if [ -n "$lcount" ]; then
+      # Count the labels we actually split out: 0 for an empty field, else commas + 1. Pure bash, so
+      # no per-runner subprocess and no dependence on anything the harness may not ship.
+      nl=0
+      if [ -n "$labels" ]; then commas="${labels//[!,]/}"; nl=$(( ${#commas} + 1 )); fi
+      [ "$nl" = "$lcount" ] || CENSUS_LABEL_AMBIGUOUS=1
+    fi
     n=$((n+1))
     if [ "$st" = online ]; then
       # ⛔ THE THREE STATES COME FROM THE API, PER RUNNER — never from a count of registrations.
@@ -285,7 +330,7 @@ census_classify() {
       CENSUS_NEVER_ONLINE=$((CENSUS_NEVER_ONLINE+1))
     fi
   done <<<"$rows"
-  CENSUS_KV="runners=$n online_idle=$CENSUS_ON_IDLE online_busy=$CENSUS_ON_BUSY never_online=$CENSUS_NEVER_ONLINE demanding_idle=$CENSUS_DEMAND_IDLE demanding_busy=$CENSUS_DEMAND_BUSY demand=${DEMAND_LABELS:-unknown}"
+  CENSUS_KV="runners=$n online_idle=$CENSUS_ON_IDLE online_busy=$CENSUS_ON_BUSY never_online=$CENSUS_NEVER_ONLINE demanding_idle=$CENSUS_DEMAND_IDLE demanding_busy=$CENSUS_DEMAND_BUSY label_ambiguity=$CENSUS_LABEL_AMBIGUOUS demand=${DEMAND_LABELS:-unknown}"
   CENSUS_DETAIL="$((CENSUS_ON_IDLE+CENSUS_ON_BUSY)) of $n online (idle=$CENSUS_ON_IDLE busy=$CENSUS_ON_BUSY never-online=$CENSUS_NEVER_ONLINE)"
   return 0
 }
@@ -331,7 +376,14 @@ capacity_verdict() {
     if [ "$m" = local ] && [ -n "$DEMAND_LABELS" ]; then CENSUS_VERDICT=stranded; return 1; fi
     CENSUS_VERDICT=all-offline; return 0
   fi
-  if [ "$m" = local ] && [ -n "$DEMAND_LABELS" ]; then
+  # ⛔ AN AMBIGUOUS LABEL SET NEVER DENIES (#3002 review P1). `label_ambiguity=1` means a label carried
+  # the comma this pass splits on, so the split — and therefore every demand MATCH — is untrustworthy.
+  # A match we cannot trust must not become the evidence for a `stranded` deny; it NARROWS the claim to
+  # the runner STATES instead, which is exactly the reading the mode=github arm below already takes for
+  # a demand that could not be measured. Fail-closed here means "make no deny", not "refuse the pass".
+  local demand_usable=0
+  [ -n "$DEMAND_LABELS" ] && [ "$CENSUS_LABEL_AMBIGUOUS" = 0 ] && demand_usable=1
+  if [ "$m" = local ] && [ "$demand_usable" = 1 ]; then
     if [ "$CENSUS_DEMAND_IDLE" -eq 0 ] && [ "$CENSUS_DEMAND_BUSY" -eq 0 ]; then
       # The pool is supposed to serve and NOT ONE online runner can accept the queue's own demand:
       # the fallback label is not where the queue needs it, or every listener that carried it died.
@@ -341,10 +393,10 @@ capacity_verdict() {
     if [ "$CENSUS_DEMAND_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi
     CENSUS_VERDICT=saturated; return 0
   fi
-  # mode=github, or a demand this pass could not measure: the pool's LABEL SET is not evidence here
-  # (in mode=github it is stripped by design), so the reading is only ever about the pool's own
-  # state, and it never denies.
-  if [ -n "$DEMAND_LABELS" ] && [ "$CENSUS_DEMAND_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi
+  # mode=github, or a demand this pass could not measure or could not trust: the pool's LABEL SET is
+  # not evidence here (in mode=github it is stripped by design), so the reading is only ever about the
+  # pool's own state, and it never denies.
+  if [ "$demand_usable" = 1 ] && [ "$CENSUS_DEMAND_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi
   if [ "$CENSUS_ON_BUSY" -gt 0 ]; then CENSUS_VERDICT=saturated; return 0; fi
   CENSUS_VERDICT=idle-unused; return 0
 }
@@ -520,6 +572,15 @@ print(age)
     '' | *[!0-9]*) log "queue stuck-after floor UNREADABLE ('${QUEUE_STUCK_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
     ??????????*)  log "queue stuck-after floor OUT OF RANGE ('${QUEUE_STUCK_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
+  # ⛔ THE ALARM'S OWN FLOOR IS A BOUND LIKE ANY OTHER, and it was the one operand in this script never
+  # shape-checked (#3002 review P2). `[ "$((now-last))" -lt "$BLIND_ALARM_EVERY_S" ]` on a non-numeric
+  # value ERRORS, the `if` reads that as FALSE, and the alarm fires on EVERY pass — the exact unbounded
+  # alarm the bound exists to prevent, with a diagnostic that renders as `one per abcs`. Reachable from
+  # an env-overriding caller, which is the same reachability class every other bound here guards.
+  case "$BLIND_ALARM_EVERY_S" in
+    '' | *[!0-9]*) log "blind-alarm floor UNREADABLE ('${BLIND_ALARM_EVERY_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "blind-alarm floor OUT OF RANGE ('${BLIND_ALARM_EVERY_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
 
   # ⛔ THE CAPACITY CENSUS IS READ BEFORE ANY LEG DECIDES, AND ITS FAILURE IS A VERDICT (#2897).
   # The healthy verdict now DEPENDS on a per-runner capacity reading, so a pass that cannot read it
@@ -560,6 +621,11 @@ print(age)
   # Re-classify with the demand now known: the first pass classified the label sets before there was
   # anything to match them against. Cheap (it reads the rows already in memory) and it keeps the
   # counts and the matches derived from ONE body rather than two reads that could disagree.
+  # ⛔ THIS CANNOT FAIL INDEPENDENTLY: the same rows passed `census_classify` at the top of this leg and
+  # returned 2 there, and nothing about them changes in between — the only input that moves is
+  # DEMAND_LABELS, which affects the MATCH counts and never the shapes. The guard stays so a future
+  # caller cannot reach the deny arms having skipped a classification, but it is a guard, not a second
+  # check — it does not make the unreadable-body arm more proven than the one above (#3002 review P2).
   census_classify "$census_rows" || { log "runner census UNREADABLE on re-classify — FAIL-CLOSED, changing nothing"; CENSUS_VERDICT=unknown; CENSUS_BLIND=1; return 2; }
   # The counts AND the verdict are computed on EVERY pass, before any leg decides: this line is the
   # instrument's raw reading, so "why did it say that" is answerable from the durable log alone —
@@ -887,8 +953,18 @@ if [ "$STATUS_ONLY" = 1 ]; then
   # could not be read: a narrowed claim is never exit 0.
   status_rc=0
   [ "$MODE_SOURCE" = runners ] || status_rc=2
-  if census_rows="$(runner_census)" && census_classify "$census_rows"; then
-    :
+  # ⛔ "THE READ FAILED" AND "THE READ ANSWERED WITH A BODY THIS PASS CANNOT CLASSIFY" ARE TWO
+  # DIFFERENT FAILURES, and collapsing them threw away the body (#3002 review P2). The old `&&` sent
+  # BOTH into a branch that then read `$GH_ERR` — which the SUCCESSFUL call had just truncated to empty
+  # — so the operator's diagnostic verb reported `capability=runner_inventory:empty-response` with no
+  # body, inventing a cause for a read that answered. `evaluate` gets this right; this surface did not.
+  if census_rows="$(runner_census)"; then
+    if ! census_classify "$census_rows"; then
+      CAPABILITY="$(census_capability "$census_rows")"
+      CENSUS_VERDICT=unknown; CENSUS_KV=""; CENSUS_DETAIL="(unread)"
+      status_rc=2
+      log "runner census UNREADABLE endpoint=$RUNNER_LIST_PATH capability=${CAPABILITY}; body said: ${census_rows:0:300}"
+    fi
   else
     census_rows="$(cat "$GH_ERR" 2>/dev/null)"
     CAPABILITY="$(census_capability "$census_rows")"
@@ -896,7 +972,9 @@ if [ "$STATUS_ONLY" = 1 ]; then
     status_rc=2
     log "runner census FAILED endpoint=$RUNNER_LIST_PATH capability=${CAPABILITY}; gh said: ${census_rows:0:300}"
   fi
-  echo "mode=$mode repo=$REPO source=$MODE_SOURCE capacity=${CENSUS_VERDICT:-measured} ${CENSUS_KV} capability=${CAPABILITY:-none} detail=\"${CENSUS_DETAIL}\""
+  # `unmeasured`, not `measured`: this verb reports the STATES and computes no verdict, and inventing a
+  # word outside the documented vocabulary made the two schedulable surfaces disagree about `capacity=`.
+  echo "mode=$mode repo=$REPO source=$MODE_SOURCE capacity=${CENSUS_VERDICT:-unmeasured} ${CENSUS_KV} capability=${CAPABILITY:-none} detail=\"${CENSUS_DETAIL}\""
   exit "$status_rc"
 fi
 
@@ -909,12 +987,35 @@ if [ "$healthy" = 2 ]; then
   # already refuses correctly and must keep writing no inbox record and sending no notification
   # (the suite pins that, e.g. an unreadable queue count). "BLIND" means *cannot see capacity*, which
   # is the condition nobody could see; it is not a synonym for "could not measure something".
+  # ⛔ THE MEASURED FIGURES COME FROM THE ABSORPTION GLOBALS, NOT FROM `queued` (#3002 review P1).
+  # `queued` is declared `local` INSIDE `evaluate`, so out here it is unset and `${queued:-unmeasured}`
+  # structurally ALWAYS took the default: the alarm and the verdict file — the two artifacts this pass
+  # exists to produce — could not tell a 0-deep queue from an 80-deep one, and the scheduler key §5
+  # advertises was a constant on exactly the path that needs it. `ABSORPTION_*` are globals set by the
+  # probe, and they are what the success path already reads, so both paths now speak from one source.
+  blind_queued="${ABSORPTION_QUEUED:-unmeasured}"
+  blind_in_progress="${ABSORPTION_IN_PROGRESS:-unmeasured}"
+  blind_oldest="${ABSORPTION_OLDEST_S:-unmeasured}"
   if [ "$CENSUS_BLIND" = 1 ]; then
-    alarm_blind "capacity=unknown capability=${CAPABILITY:-runner_inventory:unreadable} endpoint=$RUNNER_LIST_PATH queued=${queued:-unmeasured} (see ${LOG_FILE})"
+    if [ "$DRY" = 1 ]; then
+      # ⛔ A READ VERB CHANGES NOTHING (#3002 review P1): `--dry-run` is documented as "evaluate and
+      # report, change nothing", and it used to send a real alarm, create the stamp file and overwrite
+      # the verdict file — because `evaluate` runs before the DRY gate below. The consequence was worse
+      # than untidy: the next SCHEDULED pass then logged `BLIND alarm SUPPRESSED (sent 1s ago)`, so an
+      # operator triaging a blind box silenced the alarm for up to BLIND_ALARM_EVERY_S — the #2897
+      # silence, reintroduced by a human poking the gate. `--status`, the sibling read verb, already
+      # exits before this branch; the two now agree.
+      log "BLIND alarm SUPPRESSED: --dry-run reports and changes nothing (capacity=unknown capability=${CAPABILITY:-runner_inventory:unreadable} queued=$blind_queued) — a read verb must not consume the ${BLIND_ALARM_EVERY_S}s alarm window the scheduled pass needs"
+    else
+      alarm_blind "capacity=unknown capability=${CAPABILITY:-runner_inventory:unreadable} endpoint=$RUNNER_LIST_PATH queued=$blind_queued in_progress=$blind_in_progress oldest_queued_s=$blind_oldest (see ${LOG_FILE})"
+      # ⛔ FIELD PARITY WITH `write_verdict` (#3002 review P1): the unknown verdict used to carry a
+      # DIFFERENT key set than the success verdict, so a strict parser saw MISSING keys rather than an
+      # explicit `unmeasured`. Same keys, same order, in both writers.
+      printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — capacity was not read\n' \
+        "$mode" "$MODE_SOURCE" "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-runner_inventory:unreadable}" \
+        > "$VERDICT_FILE" 2>/dev/null || true
+    fi
   fi
-  printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown queued=%s capability=%s reason=cannot measure — capacity was not read\n' \
-    "$mode" "$MODE_SOURCE" "${queued:-unmeasured}" "${CAPABILITY:-runner_inventory:unreadable}" \
-    > "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null || true
   log "cannot measure — FAIL-CLOSED, changing nothing (leaving mode=$mode)"
   exit 2
 fi
