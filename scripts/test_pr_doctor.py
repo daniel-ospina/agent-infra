@@ -671,16 +671,204 @@ def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
     monkeypatch.setenv("MAX_REVIEW", "12")
-    assert pr.main() == 0
+    # ⛔ 3, NOT 0 (agent-infra#2710, measured 2026-10-27). This assertion used to be `== 0`, and it
+    # was pinning the defect: a pass whose ONLY outcome was a recorded refusal reported the code
+    # this file defines as "readable, nothing to do" while the PR sat behind a 45-minute cooldown.
+    # One refusal is a fact about the tree; `0` is a claim that the pass had nothing to do, and it
+    # had something to do and could not deliver it. Measured: `dispatched 0 of 4 queued —
+    # refused-recorded=4` + `EXIT rc=0`, five times in one day, each cleared by hand.
+    assert pr.main() == 3
     # ⛔ AND THE PASS LINE NAMES IT. A pass whose only outcome was a recorded refusal printed
     # `dispatched 0 of 1 queued — nothing to do`, which contradicts the row it just wrote and reads
     # as a quiet queue. The refusal is a stall, so it is counted and named.
     joined = "\n".join(logs)
     assert "refused-recorded=1" in joined, joined
     assert "nothing to do" not in joined, joined
+    # The refusal's own words are the NEXT ACTION (`... -- refusing to switch it; inspect and clean
+    # it`), so the record carries them rather than a bare counter.
     assert saved.get("1", {}).get("head") == "a" * 40, "a persistent refusal must record a row"
     assert saved["1"]["kind"] == "refused", \
         "a refusal row must be stamped `refused`, or void_refused_rows will delete it on the next pass"
+    assert saved["1"]["refusals"] == 1, "the row carries the consecutive-refusal count (#2710)"
+    assert "worktree dirty -- refusing" in saved["1"]["why"], \
+        "the row must carry the reason and its next action, not only a count"
+
+
+def _refusing_pass(monkeypatch, seed_refusals, logs):
+    """Drive ONE pass in which the only order is refused and recorded; return its rc."""
+    saved = {}
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "a" * 40, "at": "earlier",
+              # PAST the cooldown, or the guard would skip dispatch and the pass would test nothing.
+              "at_epoch": pr.now() - pr.COOLDOWN_S - 1,
+              "refusals": seed_refusals}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True))
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    rc = pr.main()
+    return rc, saved, "\n".join(logs)
+
+
+def test_a_refusal_ESCALATES_by_name_and_repair_after_N_consecutive_passes(monkeypatch):
+    """A row refused N times in a row is named, with its repair -- never a silent cooldown loop.
+
+    ⛔ THIS IS THE MEASURED FAILURE (agent-infra#2710, 2026-10-27): five stalls in one day, each one
+    the identical silent sequence -- refuse, cooldown, retry, refuse -- with the row never named and
+    nothing escalating. The pass must refuse (rc 3) AND name the row.
+    """
+    logs = []
+    rc, saved, joined = _refusing_pass(monkeypatch, pr.REFUSAL_ESCALATE_AT - 1, logs)
+    assert rc == 3, rc
+    assert "ESCALATE #1" in joined, joined
+    assert "refused %d consecutive times" % pr.REFUSAL_ESCALATE_AT in joined, joined
+    assert "repair:" in joined, joined
+    assert saved["1"]["refusals"] == pr.REFUSAL_ESCALATE_AT, saved
+    # ⛔ AND IT IS ON THE VERDICT LINE, NOT ONLY IN THE LOG: the log is a file a non-terminal reader
+    # does not get. The row is what an operator acts on, so the pass line names it.
+    assert "ESCALATE #1 refused %d+ consecutive times" % pr.REFUSAL_ESCALATE_AT in joined, joined
+
+
+def test_a_refusal_below_the_threshold_does_NOT_escalate(monkeypatch):
+    """One or two refusals are a fact about the tree; they must not cry wolf."""
+    logs = []
+    rc, saved, joined = _refusing_pass(monkeypatch, 1, logs)
+    assert rc == 3, rc                     # still a refusal, never a clean pass
+    assert "ESCALATE" not in joined, joined
+    assert saved["1"]["refusals"] == 2, saved
+
+
+def test_a_pass_WAITING_OUT_a_refusal_cooldown_is_not_a_clean_pass(monkeypatch):
+    """⛔ THE 44-MINUTES-OUT-OF-45 HOLE (#2710 review round 1, P1 -- reproduced).
+
+    The refusal branch only runs on the pass that RECORDS the refusal. Every pass inside the
+    45-minute cooldown took the cooldown `continue`, so `undeliverable` stayed 0 and `_finish`
+    returned EXIT_CLEAN: `rc=0`, this file's word for "readable, nothing to do", beside a PR stuck
+    behind a durable refusal -- for 44 minutes of every 45. Reproduced before the fix with a row
+    `kind=refused, refusals=5` one minute into its cooldown:
+    `dispatched 0 of 1 queued -- cooldown=1` + `EXIT rc=0`.
+
+    A `kind=spawn` row in its cooldown is the OPPOSITE case (a worker in flight, which really is
+    nothing to do) and is asserted here too, so the count cannot be widened by accident.
+    """
+    saved = {}
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+              "refusals": 1, "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (_ for _ in ()).throw(AssertionError(
+                            "a row inside its own cooldown must not be dispatched")))
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    rc = pr.main()
+    joined = "\n".join(logs)
+    assert rc == pr.EXIT_UNDELIVERED == 3, (rc, joined)
+    assert "cooldown=1" in joined, joined
+    assert "nothing to do" not in joined, joined
+    assert saved["1"]["refusals"] == 1, "a cooldown pass must not touch the row's count"
+
+    # ...and a SPAWN row in its cooldown is still a clean pass: a worker in flight is nothing to do.
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "spawn",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60}})
+    assert pr.main() == pr.EXIT_CLEAN == 0
+
+
+def test_the_cooldown_of_an_ESCALATED_row_keeps_naming_it(monkeypatch):
+    """An escalated row must not go quiet for 45 minutes: the stored count is the escalation state."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "7": {"action": "fix-ci", "worker": pr.worker_name("7"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+              "refusals": pr.REFUSAL_ESCALATE_AT, "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(7)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (_ for _ in ()).throw(AssertionError("no spawn")))
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 3
+    joined = "\n".join(logs)
+    assert "ESCALATE #7" in joined, joined
+    assert "repair: worktree dirty -- refusing" in joined, joined
+    assert "ESCALATE #7 refused %d+ consecutive times" % pr.REFUSAL_ESCALATE_AT in joined, joined
+
+
+def test_a_HEAD_MOVE_starts_a_NEW_refusal_episode(monkeypatch):
+    """⛔ `consecutive` must be true, and the reset is not free (#2710 review round 1, P2).
+
+    Nothing deletes a `kind: refused` row when the PR head moves (`void_refused_rows` skips every
+    non-spawn row, and it is the only row-deleting code), so a counter read unconditionally from the
+    row escalated on the FIRST refusal at a new head and printed a provenance ("at head <new>") that
+    was not true. Reproduced before the fix: row at head `b…`, PR at head `a…`, `refusals=2` ->
+    `ESCALATE #1 refused 3 consecutive times at head aaaaaaaaaaaa`.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "b" * 40, "at": "earlier", "at_epoch": pr.now() - pr.COOLDOWN_S - 1,
+              "refusals": pr.REFUSAL_ESCALATE_AT}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])          # head is `a`*40
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True))
+    saved = {}
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 3               # still a refusal, never a clean pass
+    assert saved["1"]["refusals"] == 1, saved
+    joined = "\n".join(logs)
+    assert "ESCALATE" not in joined, joined
+
+
+def test_a_successful_spawn_RESETS_the_consecutive_refusal_count(monkeypatch):
+    """`consecutive` is the claim, so a dispatch that went out must clear the counter."""
+    saved = {}
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "a" * 40, "at": "earlier",
+              "at_epoch": pr.now() - pr.COOLDOWN_S - 1, "refusals": 2}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d, *_rest: (True, "spawned", True))
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 0
+    assert saved["1"]["kind"] == "spawn", saved
+    assert "refusals" not in saved["1"], \
+        "a dispatched row must not carry the old refusal count -- 'consecutive' would be a lie"
 
 
 def test_dispatch_reports_a_failed_worktree_instead_of_spawning(monkeypatch, tmp_path):
@@ -6307,3 +6495,253 @@ def test_HALF_a_rubric_seam_is_a_hybrid_rubric_and_refuses_even_the_built_in_rep
             assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False)
     finally:
         pr.canonical_paths()
+
+
+# ── REVIEW ROUND 2 (#2710): the budget gate ran BEFORE the refusal accounting ─────────────────────
+def _four_refused_rows(monkeypatch, logs, refusals, orch_dir):
+    """The incident's own shape: four rows in their cooldown, an EMPTY `$O/bg`, shipped defaults.
+
+    ⛔ `ORCH_DIR` IS PINNED TO AN EMPTY DIRECTORY, AND THAT IS THE WHOLE POINT (review round 2). A
+    refused row never launched a worker, so it has no `bg/<worker>.pid` -- which is exactly the state
+    `_worker_state` answers "unknown" (charged) or "gone" (free) from. Left on the box's real
+    `ORCH_DIR`, a stray pid file made the rows read "gone" and the budget interaction this test
+    exists for never happened: the assertion passed for a reason it does not name.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(orch_dir))
+    rows = {}
+    for n in (1, 2, 3, 4):
+        rows[str(n)] = {"action": "fix-ci", "worker": pr.worker_name(str(n)), "kind": "refused",
+                        "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+                        "refusals": refusals, "why": "worktree dirty -- refusing"}
+    monkeypatch.setattr(pr, "load_state", lambda: dict(rows))
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(n) for n in (1, 2, 3, 4)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    # An EMPTY ORCH_DIR is the state of a PR that never spawned a worker -- i.e. every refused row.
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError(
+                            "a row inside its own cooldown must not be dispatched")))
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    # ⛔ THE SHIPPED CAPS, DELIBERATELY. Every other pass test raises MAX_FIX/MAX_REVIEW, which is
+    # exactly why one row hid this: at the defaults, three refused rows exhaust the fix budget.
+    for v in ("MAX_FIX", "MAX_REVIEW", "MAX_TOTAL"):
+        monkeypatch.delenv(v, raising=False)
+
+
+def test_FOUR_refused_rows_at_the_SHIPPED_caps_still_refuse_and_escalate(monkeypatch, tmp_path):
+    """⛔ THE BUDGET GATE RAN BEFORE THE REFUSAL ACCOUNTING (review round 2, P1 -- reproduced).
+
+    A refused row never launched a worker, so it has no `$O/bg/<worker>.pid`; `_worker_state`
+    answers "unknown", and `pass_budgets` charged the row to its class. At the SHIPPED defaults
+    (`DEFAULT_MAX_FIX=3`) the incident's four rows exhausted the fix budget, and the budget gate sits
+    ABOVE the cooldown arm -- so the pass skipped it entirely and printed
+    `dispatched 0 of 4 queued — budget=4` with `EXIT rc=0`: this file's word for "readable, nothing to
+    do", at the defaults, with the row count the incident actually measured. `void_refused_rows`
+    already states the rule this contradicted: *"A refusal consumed nothing, so it must not hold a
+    cooldown and a budget slot"*.
+    """
+    logs = []
+    _four_refused_rows(monkeypatch, logs, pr.REFUSAL_ESCALATE_AT, tmp_path)
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3, "\n".join(logs)
+    joined = "\n".join(logs)
+    assert "budget=" not in joined.split("dispatched")[-1], joined
+    # ⛔ AND EVERY ONE IS NAMED ON THE VERDICT LINE -- this is the sentence the contract states:
+    # "EVERY PASS THAT COVERS THE ROW, not only the one that records it".
+    assert "4 PR(s) still undeliverable" in joined, joined
+    assert "refused in an earlier pass" in joined, joined
+    assert "ESCALATE #1" in joined, joined
+
+
+def test_a_cooldown_pass_does_not_claim_an_order_was_rejected(monkeypatch, tmp_path):
+    """⛔ ONE COUNT, TWO CAUSES, ONE FALSE SENTENCE (review round 2, P2).
+
+    `undeliverable` decides the CODE on both arms, but its sentence said "no worker accepted" -- a
+    transport failure. On a cooldown pass NO ORDER WAS PLACED, so that sentence sent an operator
+    hunting a transport fault in a pass that attempted nothing.
+    """
+    logs = []
+    _four_refused_rows(monkeypatch, logs, 1, tmp_path)
+    assert pr.main() == 3
+    joined = "\n".join(logs)
+    assert "no worker accepted" not in joined, joined
+    assert "still undeliverable" in joined, joined
+    # below the threshold, an escalation would be crying wolf
+    assert "ESCALATE" not in joined, joined
+
+
+def test_a_CORRUPTED_refusal_count_degrades_instead_of_crashing(monkeypatch, tmp_path):
+    """⛔ `int("3x")` RAISED, AND THE BAD ROW WAS NEVER REWRITTEN (review round 2).
+
+    `__main__` records a crash as `EXIT_CRASH=4`; because the cooldown arm never rewrites the row,
+    the bad value survived and EVERY later pass crashed before dispatching anything for any PR -- a
+    corrupted counter turned a named refusal into a permanently silent doctor. A bad count means
+    "unknown count": never escalate, never crash.
+    """
+    logs = []
+    _four_refused_rows(monkeypatch, logs, "3x", tmp_path)
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3, "\n".join(logs)
+    joined = "\n".join(logs)
+    assert "ESCALATE" not in joined, joined
+    assert pr._as_int("3x") == 0 and pr._as_int(None) == 0 and pr._as_int("3") == 3
+
+
+def test_a_refused_row_no_longer_holds_a_budget_slot(monkeypatch, tmp_path):
+    """The rule `void_refused_rows` states, applied where the budget is actually COUNTED."""
+    st = {str(n): {"action": "fix-ci", "worker": pr.worker_name(str(n)), "kind": "refused",
+                   "head": "a" * 40, "at_epoch": pr.now() - 60, "refusals": 1}
+          for n in (1, 2, 3, 4)}
+    # an EMPTY bg dir: no pid file, which is what every refused row looks like
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    budgets = pr.pass_budgets(st, {"max_fix": 3, "max_review": 4})
+    assert budgets["used"] == 0, budgets
+    assert budgets["unknown"] == 0, budgets
+    # ⛔ NON-VACUITY: a row that IS waiting on a worker still holds its slot.
+    st["9"] = {"action": "fix-ci", "worker": pr.worker_name("9"), "kind": "spawn",
+               "head": "a" * 40, "at_epoch": pr.now() - 60}
+    assert pr.pass_budgets(st, {"max_fix": 3, "max_review": 4})["used"] == 1
+
+
+# ── REVIEW ROUND 2, SECOND PASS: the accounting must not depend on PR-number ordering ─────────────
+def test_a_SATURATED_pass_still_refuses_and_names_a_refused_row(monkeypatch, tmp_path):
+    """⛔ `rc=0` DEPENDED ON WHICH PR SORTED FIRST (review round 2, P1 — reproduced).
+
+    The accounting was hoisted above `dispatched >= budgets["total"]` but the dispatch loop still
+    `break`s there, so with `budgets["total"] == 0` (a saturated box, and `--max 0` by construction) it
+    broke on the FIRST row that was not in a cooldown. Measured, same two rows, only the numbers
+    swapped: `EXIT rc=3` + `ESCALATE` when the refused row sorted first, and
+    `dispatched 0 of 2 queued — no capacity budget (…); budget=1` + `EXIT rc=0` with no escalation
+    when it sorted second. A verdict that depends on PR-number ordering is not a verdict.
+    """
+    for refused_first in (True, False):
+        logs = []
+        refused_key, fresh_key = ("1", "2") if refused_first else ("2", "1")
+        monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path / str(refused_first)))
+        st = {refused_key: {"action": "fix-ci", "worker": pr.worker_name(refused_key),
+                            "kind": "refused", "head": "a" * 40, "at": "1 min ago",
+                            "at_epoch": pr.now() - 60, "refusals": pr.REFUSAL_ESCALATE_AT,
+                            "why": "worktree dirty -- refusing"}}
+        monkeypatch.setattr(pr, "load_state", lambda: dict(st))
+        monkeypatch.setattr(pr, "open_prs",
+                            lambda: [_pr(int(refused_key)), _pr(int(fresh_key))])
+        monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+        monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+        monkeypatch.setattr(pr, "log", logs.append)
+        monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+        monkeypatch.setattr(pr, "worker_live_for", lambda k: False)
+        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True))
+        monkeypatch.setattr(pr, "save_state", lambda s: None)
+        # ⛔ ZERO TOTAL BUDGET: the saturated box, produced here the way the CLI produces it.
+        monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--max", "0"])
+        rc = pr.main()
+        joined = "\n".join(logs)
+        assert rc == pr.EXIT_UNDELIVERED == 3, (refused_first, rc, joined)
+        assert ("ESCALATE #%s" % refused_key) in joined, (refused_first, joined)
+
+
+def test_the_REFUSING_arms_do_not_claim_an_order_the_pass_never_placed(monkeypatch, tmp_path):
+    """⛔ THE CONTRADICTION CAME BACK ONE BRANCH DOWN (review round 2, P2 — reproduced).
+
+    The `parts` line was split into placed/carried, but the two `REFUSING:` sentences above it still
+    interpolated raw `undeliv`. Measured with one unreadable PR and one carried refusal: the verdict
+    said "1 order(s) no worker accepted" AND "1 PR(s) still undeliverable -- refused in an earlier
+    pass", in one pass where no order was placed.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "2": {"action": "fix-ci", "worker": pr.worker_name("2"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60, "refusals": 5,
+              "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    # PR 1 unreadable, PR 2 the carried refusal.
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: None if p["number"] == 1 else ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda s: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    pr.main()
+    joined = "\n".join(logs)
+    assert "no worker accepted" not in joined, joined
+    assert "refused in an earlier pass" in joined, joined
+
+
+def test_as_int_survives_INFINITY_and_NEGATIVES(monkeypatch, tmp_path):
+    """⛔ `int(float("inf"))` RAISED `OverflowError`, WHICH `_as_int` DID NOT CATCH (review round 2).
+
+    `json.loads` accepts `1e999` / `Infinity` and yields `inf`, so a corrupted state file crashed
+    every later pass. A NEGATIVE count was passed through instead (recorded as -4, -3, …, eight
+    refusals of silence), so a count below zero is treated as unusable too.
+    """
+    assert pr._as_int(float("inf")) == 0
+    assert pr._as_int(float("-inf")) == 0
+    assert pr._as_int(float("nan")) == 0        # `int(nan)` is ValueError; pinned for completeness
+    assert pr._as_int(-5) == 0
+    assert pr._as_int("3") == 3 and pr._as_int(3) == 3
+    # ...and the pass itself survives a row carrying one.
+    logs = []
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+              "refusals": float("inf"), "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda s: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3, "\n".join(logs)
+    assert "ESCALATE" not in "\n".join(logs)
+
+
+def test_MORE_than_four_escalated_rows_are_not_silently_dropped(monkeypatch, tmp_path):
+    """⛔ A TRUNCATED LIST WITH NO MARKER READS AS THE WHOLE LIST (review round 2, P3)."""
+    logs = []
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    rows = {str(n): {"action": "fix-ci", "worker": pr.worker_name(str(n)), "kind": "refused",
+                     "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+                     "refusals": pr.REFUSAL_ESCALATE_AT, "why": "worktree dirty -- refusing"}
+            for n in range(1, 8)}
+    monkeypatch.setattr(pr, "load_state", lambda: dict(rows))
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(n) for n in range(1, 8)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda s: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == 3
+    joined = "\n".join(logs)
+    assert "ESCALATE #1 #2 #3 #4 +3 more" in joined, joined
+
+
+def test_an_EXPIRED_cooldown_refusal_is_not_dropped_by_a_saturated_pass(monkeypatch, tmp_path):
+    """⛔ 46 MINUTES LATER THE SAME FALSE CLEAN CAME BACK (review round 3 — reproduced).
+
+    The accounting only covered a row INSIDE its cooldown. Once the 45-minute window expires, a
+    saturated pass (`total == 0`, and `--max 0` by construction) broke out of the dispatch loop before
+    reaching the row and printed `no capacity budget (...); budget=1` + `EXIT rc=0` over a
+    `kind: refused` row AT the current head. The budget is the only reason the row is not retried, so
+    the budget is what decides whether the pass may still call itself clean.
+    """
+    for refused_last in (True, False):
+        logs = []
+        monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path / str(refused_last)))
+        st = {"2": {"action": "fix-ci", "worker": pr.worker_name("2"), "kind": "refused",
+                    "head": "a" * 40, "at": "an hour ago",
+                    "at_epoch": pr.now() - pr.COOLDOWN_S - 60,   # EXPIRED, not in cooldown
+                    "refusals": pr.REFUSAL_ESCALATE_AT, "why": "worktree dirty -- refusing"}}
+        monkeypatch.setattr(pr, "load_state", lambda: dict(st))
+        order = [2, 1] if refused_last else [1, 2]
+        monkeypatch.setattr(pr, "open_prs", lambda: [_pr(n) for n in order])
+        monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+        monkeypatch.setattr(pr, "log", logs.append)
+        monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+        monkeypatch.setattr(pr, "worker_live_for", lambda k: False)
+        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True))
+        monkeypatch.setattr(pr, "save_state", lambda s: None)
+        monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--max", "0"])
+        rc = pr.main()
+        joined = "\n".join(logs)
+        assert rc == pr.EXIT_UNDELIVERED == 3, (refused_last, rc, joined)
+        assert "ESCALATE #2" in joined, (refused_last, joined)

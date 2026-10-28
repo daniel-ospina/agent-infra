@@ -2647,6 +2647,12 @@ echo "=== #2132: a head nobody reviewed is NEEDS-REVIEW, never a fixer authorisa
   awk '/^verdict_class\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_clear\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  # ⛔ THE SHARED (PR, head) REVIEW BUDGET IS PART OF THE PRODUCER NOW (agent-infra#2971): the
+  # verdict-less branch Spends `state/reviewdisp-<PR>` through these helpers instead of its own
+  # private counter, so an extraction without them leaves `rev_budget_spend` undefined (127) and the
+  # branch silently writes a marker but never counts or parks — the unbounded loop, wearing a green
+  # face. Extracted, never stubbed, for the same reason as the two functions above.
+  sed -n '/# \[revbudget:begin\]/,/# \[revbudget:end\]/p' "$MERGE" | sed '1d;$d'
 } > "$TMP/reviewstate.sh"
 ex review_gate_state > "$TMP/fn_review_gate_state.sh"
 # ⛔ NON-EMPTY AND DEFINED, not merely `bash -n`-clean (P2, first review round): `bash -n` on an EMPTY
@@ -2658,6 +2664,7 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
    && grep -q '^verdict_class() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_record() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_clear() {' "$TMP/reviewstate.sh" \
+   && grep -q '^rev_budget_spend() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_gate_state() {' "$TMP/fn_review_gate_state.sh" \
    && bash -n "$TMP/reviewstate.sh" 2>/dev/null && bash -n "$TMP/fn_review_gate_state.sh" 2>/dev/null; then
   RS="$TMP/rso"; mkdir -p "$RS/state"
@@ -2675,7 +2682,10 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   _rgs() { ( O="$RS"; . "$TMP/fn_review_gate_state.sh"; review_gate_state "$1" "$2" ); }
   # _rc <head> — drive the CLEAR path (verified evidence) against the same state dir.
   _rc() { ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$1"; . "$TMP/reviewstate.sh"; review_state_clear ); }
-  _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS/parkreason"; : > "$RS/merge.log"; }
+  # ⛔ AND THE SHARED (PR, head) RECORD (agent-infra#2971): `reviewdisp-<PR>` is the ONE review budget
+# — the controller spends it on dispatch, merge-one.sh spends it on a verdict-less run — so a
+# leftover record here would make a later "one timeout" drive read as a cap that had been hit.
+_clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS"/state/reviewdisp-* "$RS/parkreason"; : > "$RS/merge.log"; }
 
   eqv "an ISSUES verdict is a FIXER state" "ISSUES" "$(_vc 'ISSUES 3')"
   eqv "a CLEAN verdict keeps its own class" "CLEAN" "$(_vc 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
@@ -2772,18 +2782,18 @@ ISSUES 2')"
   # reviewed at a head that had been. Both resets are driven.
   _clean; _rs NO-VERDICT 9999aaaa; _rs NO-VERDICT 9999aaaa; _rc 9999aaaa
   _rs NO-VERDICT 9999aaaa
-  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
     echo "  ✅ a verified CLEAN resets the verdict-less counter (one timeout after it does not park)"; PASS=$((PASS+1))
   else
-    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewdisp-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
   fi
   _clean; _rs NO-VERDICT 7777bbbb; _rs NO-VERDICT 7777bbbb; _rs ISSUES 7777bbbb
   rm -f "$RS/state/needsfix-2132-7777bbbb"; : > "$RS/state/fixspend-2132-7777bbbb"
   _rs NO-VERDICT 7777bbbb
-  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewdisp-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
     echo "  ✅ a FINDINGS verdict resets it too (a fixer is the remedy, not a park)"; PASS=$((PASS+1))
   else
-    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewdisp-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
   fi
   # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
   # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
