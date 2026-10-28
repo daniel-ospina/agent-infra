@@ -396,7 +396,11 @@ run_gate() {
   build_farm "$mode" || { fail "$label — fixture build failed ($mode)"; return; }
   TMP="$FIXTURE_TMP"
   # Check 5 is aimed at the fixture dir in every case (see the suite header), so
-  # the verdict is hermetic and the real ~/.pi never participates.
+  # the verdict is hermetic and the real ~/.pi never participates. #3002: the CI
+  # marker is cleared for the same reason — a case must not change meaning
+  # because the suite happens to run inside Actions (it does). The two cases that
+  # DO pin CI behaviour set it explicitly, with PI_EXTENSIONS_DIR unset.
+  unset GITHUB_ACTIONS CI
   export PI_EXTENSIONS_DIR="$TMP/live-extensions"
   bash "${FIXTURE_GATE:-$TMP/scripts/check-pi-config-extensions.sh}" >"$OUT" 2>&1
   local code=$?
@@ -641,6 +645,64 @@ run_gate 0 "a directory named like a test is not a test file" live-dir-named-lik
   "symlink farm into extensions/" \
   "!test file(s) in the live extension farm" \
   "!weird.test.ts"
+
+echo ""
+echo "33. #3002 — a CI verdict is NOT decided by the runner box's own ~/.pi farm"
+# Measured 2026-10-28 on PR #3002: `pi-config-extensions` reddened on
+# ai-runner-cell3-x64-3, a self-hosted pi box whose ~/.pi/agent/extensions held
+# 12 stale top-level *.test.ts copies, over a diff that touched neither
+# extensions/ nor the farm. The gate read ${HOME:-}/.pi/agent/extensions with no
+# CI awareness at all, so which box served the job decided the repo's verdict.
+# The arm below is the defect: CI + a contaminated AMBIENT farm + no named farm
+# must be a NAMED skip, not a red — and must not indite the ambient file either.
+build_farm live-test-file || fail "CI ambient-farm case — fixture build failed"
+TMP="$FIXTURE_TMP"
+mkdir -p "$TMP/ambient-home/.pi/agent/extensions" || fail "CI ambient-farm case — mkdir failed"
+: > "$TMP/ambient-home/.pi/agent/extensions/leaked-ambient.test.ts"
+unset PI_EXTENSIONS_DIR
+HOME="$TMP/ambient-home" GITHUB_ACTIONS=true bash "${FIXTURE_GATE:-$TMP/scripts/check-pi-config-extensions.sh}" >"$OUT" 2>&1
+ci_ambient_code=$?
+if [ "$ci_ambient_code" -eq 0 ]; then
+  pass "contaminated ambient farm in CI: exit 0 (box state is not this repo's verdict)"
+else
+  fail "contaminated ambient farm in CI — expected exit 0, got $ci_ambient_code (the runner box decided the verdict)"
+  sed -n '1,40p' "$OUT"
+fi
+if grep -q 'live extension farm NOT READ' "$OUT"; then
+  pass "diagnostic present: live extension farm NOT READ (the skip is named, not silent)"
+else
+  fail "diagnostic absent: live extension farm NOT READ"
+  sed -n '1,40p' "$OUT"
+fi
+if grep -q 'leaked-ambient.test.ts' "$OUT"; then
+  fail "forbidden present: leaked-ambient.test.ts (the ambient file was still indited)"
+else
+  pass "forbidden absent: leaked-ambient.test.ts"
+fi
+
+echo ""
+echo "34. #3002 — the CI refusal is not a blanket off-switch: a NAMED farm is still gated"
+# The anti-fail-open half. Case 33 must not be satisfiable by turning checks 5/6
+# off whenever CI is set: a farm named by PI_EXTENSIONS_DIR is read and gated
+# even in CI, which is exactly how .github/workflows/ci.yml keeps real
+# discriminating power over the farm this repo ships.
+build_farm live-test-file || fail "CI named-farm case — fixture build failed"
+TMP="$FIXTURE_TMP"
+HOME="$TMP/ambient-home" GITHUB_ACTIONS=true PI_EXTENSIONS_DIR="$TMP/live-extensions" \
+  bash "${FIXTURE_GATE:-$TMP/scripts/check-pi-config-extensions.sh}" >"$OUT" 2>&1
+ci_named_code=$?
+if [ "$ci_named_code" -eq 1 ]; then
+  pass "named farm in CI is still gated (exit 1)"
+else
+  fail "named farm in CI — expected exit 1, got $ci_named_code (the CI branch swallowed a real farm)"
+  sed -n '1,40p' "$OUT"
+fi
+if grep -q 'test file(s) in the live extension farm' "$OUT"; then
+  pass "diagnostic present: test file(s) in the live extension farm"
+else
+  fail "diagnostic absent: test file(s) in the live extension farm"
+  sed -n '1,40p' "$OUT"
+fi
 
 echo ""
 if [ "$failures" -gt 0 ]; then

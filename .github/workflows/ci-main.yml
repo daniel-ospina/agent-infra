@@ -535,6 +535,11 @@ jobs:
     # node_modules-only directory is not an extension and cannot false-block.
     # Catches the "PR merged without wiring" drift class that per-PR CI cannot
     # see when the farm edit and the extension land on different branches.
+    # #3002 — the machine-local farm checks read a farm NAMED by the job, never
+    # the runner box's own ~/.pi farm (a host-dependent post-merge verdict is
+    # the same defect as a host-dependent per-PR one).
+    env:
+      PI_EXTENSIONS_DIR: ${{ github.workspace }}/pi-bootstrap/pi-config/extensions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
