@@ -1190,6 +1190,302 @@ _hr_call_ctx="$(awk '{ w[NR%32]=$0 }
   && ok "orch-loop.sh releases the latch at the call site (a per-process latch would refresh once, ever)" \
   || bad "orch-loop.sh does not reset _HR_DONE before its call — the refresh runs once per PROCESS"
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# agent-infra#2641 — `restart-pending` as a STATE WITH A TRANSITION, and the RUNNING identity read
+# from the CONTROLLER'S OWN ARGV.
+#
+# THE DEFECT. MEASURED 2026-10-24 on pi-cell-3: `running` == `pin` == `ref` == 848ba4b1 and the record
+# still said `restart-pending`, every cycle, since activation. A cell's `$O` is a FLAT SEED with no git
+# identity, so `git -C "$SELF"` never resolved there, the identity fell back to the STAMP (a claim
+# `apply` writes, not evidence of what is executing), and the `stamp:*` arm correctly downgraded every
+# `current` to `restart-pending` — correctly, because it could not prove otherwise. The defect was
+# upstream: the truthful answer WAS available (the controller's argv names the tree it executes) and
+# nothing read it. So the token rode on every spawn line for ever (an always-on alarm carries no
+# information), and when a restart really was needed the only way to apply it was a hand restart that
+# reaps in-flight work — which is what every harness change that night needed.
+#
+# HOW THESE CASES ARE WRITTEN. Every one drives the SHIPPED script, with a REAL controller process (a
+# real `bash <tree>/scripts/orchestrator-harness/orch-loop.sh` in a real git worktree) so the identity
+# arm is exercised as it is on a cell — never a stub that asserts its own opinion. The pin roots are
+# real per-commit worktrees. Each refusal arm is driven with the shape that would produce a FALSE
+# `current` if its bound were dropped, because a false `current` is the failure that matters here: a
+# box certified as executing code it is not.
+
+# mk_pin_tree <pinroot> <sha> -> the tree (a real detached worktree of the fixture repo, as `apply` makes)
+mk_pin_tree() {
+  local root="$1" sha="$2" d
+  d="$root/$(printf '%s' "$sha" | cut -c1-12)"
+  [ -d "$d" ] || { mkdir -p "$root"; git -C "$T/src" worktree add --detach "$d" "$sha" >/dev/null 2>&1; }
+  printf '%s\n' "$d"
+}
+# start_ctrl <tree> -> the pid of a LIVE controller executing that tree; leaves it in $CTRL_PID_T
+# The script is overwritten AFTER the worktree exists: identity comes from `git rev-parse HEAD`, which a
+# dirty worktree does not change, and the fixture's own `orch-loop.sh` just echoes a label (it would
+# exit before it could be observed).
+start_ctrl() {
+  # ⛔ `sleep 300` WOULD FORK, and a forked child of the controller is (correctly) counted by the `tree`
+  # population — so the fixture would read as "1 lane child" and `actuation=safe` would be unreachable
+  # for a reason that is about the FIXTURE, not the box. A `read` on a fifo blocks INSIDE bash.
+  local f; f="$(mktemp -u "${TMPDIR:-/tmp}/ctrl-fifo.XXXXXX")"; mkfifo "$f" 2>/dev/null
+  printf 'read -r _ < %s\n' "$f" > "$1/scripts/orchestrator-harness/orch-loop.sh"
+  bash "$1/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 &
+  CTRL_PID_T=$!
+  printf '%s\n' "$CTRL_PID_T"
+}
+stop_ctrl() { [ -n "${1:-}" ] && { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }; }
+# req_of <O> <field> -> the field's value from the request record
+req_of() { sed -n "s/.*[[:space:]]$2=\([^[:space:]]*\).*/\1/p" "$1/state/restart-request" 2>/dev/null | awk 'NF{print; exit}'; }
+
+_CASE=$((_CASE+1)); echo "=== A36: a CELL whose live controller executes the pinned tree reports CURRENT (#2641) ==="
+D="$T/a36"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+PIN="$D/cellhome/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '%s\n' "$TREE2" > "$D/pinfile"
+CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+# A real stamp naming the SAME commit: the point is that the record must NOT be resting on it.
+printf '{"commit": "%s", "harness": "%s"}\n' "$C2" "$TREE2" > "$D/O/.agent-infra-stamp.json"
+R="$(O="$D/O" CELL_HOME="$D/cellhome" HARNESS_PIN_DIR="$D/pinroot" HARNESS_PIN_FILE="$D/pinfile" \
+      bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$D/O" 2>&1)"; RC=$?
+stop_ctrl "$CTRL"
+[ "$RC" = 0 ] && ok "exit 0 (the pin already names the tip — no advance was needed)" \
+              || bad "exit $RC, expected 0 — output: $(printf '%s' "$R" | tail -2 | tr '\n' ' ')"
+case "$R" in *"relation=current"*"running=$(short "$C2")"*) ok "relation=current, running=$(short "$C2") — read from the CONTROLLER'S ARGV, not from the stamp" ;;
+              *) bad "a cell executing the pinned tree was NOT reported current (the #2641 defect itself): $R" ;; esac
+case "$R" in *"pending=none"*) ok "…and \`pending=none\`: the state is not restart-pending at all" ;;
+              *) bad "the record still carries a pending reason on a current box: $R" ;; esac
+# The assertion that makes the one above non-vacuous: the stamp is NOT what answered. Point the stamp at a
+# foreign commit and the answer must not move — an identity read from the stamp would follow it.
+printf '{"commit": "%s"}\n' "$C3" > "$D/O/.agent-infra-stamp.json"
+CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R2="$(O="$D/O" CELL_HOME="$D/cellhome" HARNESS_PIN_DIR="$D/pinroot" HARNESS_PIN_FILE="$D/pinfile" \
+      bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$D/O" 2>&1)"
+stop_ctrl "$CTRL"
+case "$R2" in *"relation=current"*"running=$(short "$C2")"*) ok "…and it does not follow the STAMP: a stamp naming a foreign commit leaves the verdict unchanged (the read is from the process)" ;;
+              *) bad "the running identity followed the stamp — the #2641 defect wearing a different hat: $R2" ;; esac
+
+_CASE=$((_CASE+1)); echo "=== A36b: a process that MENTIONS the harness path does not answer (invocation, not mention) ==="
+D="$T/a36b"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+PIN="$D/cellhome/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"; printf '%s\n' "$TREE2" > "$D/pinfile"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+# A live process whose ARGUMENT is the controller script: the path is in the argv, the invocation is
+# not. ⛔ THIS IS THE MEASURED FALSE POSITIVE, not a contrived one: cloud-cell-supervisor.sh records that
+# a `bash -c` whose script text merely MENTIONS the path matched a substring test and read as a live
+# controller. The shell is `bash` (so the shell-name bound does NOT save us) and the path is tok4 —
+# only the POSITIONAL shape refuses it. (`sed`/`tail -f` were the first fixtures; both are refused by the
+# shell-name bound as well, which would make this case pass for a reason other than the one it names.)
+# ⛔ TWO COMMANDS, not one: bash EXECS a lone simple command (`bash -c 'sleep 300' <path>` collapses to
+# `sleep 300` and the mention is gone — measured, and the case would then pass for the wrong reason).
+bash -c 'sleep 300; :' "$TREE2/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 &
+MENTION=$!; printf '%s\n' "$MENTION" > "$D/O/.orch.lock"
+R="$(O="$D/O" CELL_HOME="$D/cellhome" HARNESS_PIN_DIR="$D/pinroot" HARNESS_PIN_FILE="$D/pinfile" \
+      bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$D/O" 2>&1)"; RC=$?
+stop_ctrl "$MENTION"
+case "$R" in *"relation=restart-pending"*) ok "a MENTION (sed reading the script) does not answer: still restart-pending, never a blessed current" ;;
+              *) bad "a process that only MENTIONS the path was accepted as the running controller: $R" ;; esac
+case "$R" in *"pending=unprovable"*) ok "…and it says WHY: pending=unprovable (the stamp is a claim, not evidence)" ;;
+              *) bad "the unprovable state is not named in the record: $R" ;; esac
+# The refusal is RECORDED, not just printed — "refused because Y" is the requirement.
+case "$(cat "$D/O/state/restart-request" 2>/dev/null)" in
+  "restart request=refused"*"reason=running-identity-unprovable"*"actuation=blocked"*)
+    ok "…and the request record says it REFUSED to ask for a restart, with the reason" ;;
+  *) bad "no refused-request record: $(cat "$D/O/state/restart-request" 2>/dev/null)" ;;
+esac
+
+_CASE=$((_CASE+1)); echo "=== A36c: a tree OUTSIDE every recorded pin root does not answer (a peer repo's controller) ==="
+D="$T/a36c"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+PIN="$D/cellhome/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"; printf '%s\n' "$TREE2" > "$D/pinfile"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+# A controller at C1 living in a harness dir that belongs to NO pin root on this box.
+FOREIGN="$(harness_at "$C1")"
+CTRL="$(start_ctrl "$(dirname "$FOREIGN")/..")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R="$(O="$D/O" CELL_HOME="$D/cellhome" HARNESS_PIN_DIR="$D/pinroot" HARNESS_PIN_FILE="$D/pinfile" \
+      bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$D/O" 2>&1)"
+stop_ctrl "$CTRL"
+case "$R" in *"running=$(short "$C1")"*) bad "a FOREIGN tree answered for this box (running=$(short "$C1")) — a peer's controller certified this cell: $R" ;;
+              *) ok "the foreign tree did NOT answer (running is not $(short "$C1"))" ;; esac
+case "$R" in *"relation=restart-pending"*"pending=unprovable"*) ok "…and the verdict fails closed: restart-pending/unprovable, not current" ;;
+              *) bad "expected restart-pending/unprovable over a foreign controller: $R" ;; esac
+
+_CASE=$((_CASE+1)); echo "=== A36d: a pin-root child with no git identity cannot ascend into an enclosing worktree ==="
+D="$T/a36d"; mkdir -p "$D/O/state" "$D/cellhome"
+PIN="$D/cellhome/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN"
+TREE2="$(mk_pin_tree "$T/src/pins" "$C2")"; printf '%s\n' "$TREE2" > "$D/pinfile"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+# The measured shape: a pin child that carries no git identity of its own (an `apply` that half-finished)
+# and therefore sits INSIDE the `$T/src` checkout. A naive `rev-parse --show-toplevel` answers $T/src —
+# whose HEAD is C3, a commit that is not even on the remote. That wrong answer is what this case refuses.
+# ⛔ NOT a real worktree: a sha-shaped child of the pin root that carries NO git identity of its own
+# (a half-finished `apply`). A real `git worktree add` child would resolve its own toplevel and the arm
+# under test would never be reached — the case would pass for the wrong reason.
+DEAD="$T/src/pins/feedfacecafe"
+mkdir -p "$DEAD/scripts/orchestrator-harness"
+printf 'sleep 300\n' > "$DEAD/scripts/orchestrator-harness/orch-loop.sh"
+bash "$DEAD/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 &
+CTRL=$!; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+# ⛔ THE PIN ROOT **IS** THE ENCLOSING CHECKOUT HERE, which is the DOCUMENTED legacy flat-pin layout
+# ("the ROOT is the worktree", cloud-cell-bringup.sh). That is what makes this case discriminate: with
+# the root-membership bound doing the work, the ascent would be refused anyway and the own-toplevel
+# bound could be deleted without any test noticing (measured — the first version of this case stayed
+# green with that bound removed). Here membership PASSES and only the own-toplevel bound refuses.
+R="$(O="$D/O" CELL_HOME="$D/cellhome" HARNESS_PIN_DIR="$T/src" HARNESS_PIN_FILE="$D/pinfile" \
+      bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$D/O" 2>&1)"
+stop_ctrl "$CTRL"
+case "$R" in *"running=$(short "$C3")"*) bad "a tree with no git identity ASCENDED into an enclosing worktree and reported ITS head ($(short "$C3")) — the own-toplevel bound is missing: $R" ;;
+              *) ok "the git-less child did NOT ascend (running is not the enclosing checkout's $(short "$C3"))" ;; esac
+case "$R" in *"relation=restart-pending"*"pending=unprovable"*) ok "…and it fails closed to restart-pending/unprovable" ;;
+              *) bad "expected restart-pending/unprovable over an unreadable pin child: $R" ;; esac
+
+_CASE=$((_CASE+1)); echo "=== A36e: an UNREADABLE process table is unprovable, never a blessed current ==="
+D="$T/a36e"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+PIN="$D/cellhome/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"; printf '%s\n' "$TREE2" > "$D/pinfile"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R="$(PS_BIN=/nonexistent/ps O="$D/O" CELL_HOME="$D/cellhome" HARNESS_PIN_DIR="$D/pinroot" \
+      HARNESS_PIN_FILE="$D/pinfile" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$D/O" 2>&1)"
+stop_ctrl "$CTRL"
+case "$R" in *"relation=current"*) bad "an unreadable ps produced 'current' — cannot-verify was read as a pass: $R" ;;
+              *) ok "an unreadable process table does NOT produce current" ;; esac
+case "$R" in *"pending=unprovable"*) ok "…it is named: pending=unprovable" ;;
+              *) bad "expected pending=unprovable with ps unreadable: $R" ;; esac
+
+# ── THE STATE MACHINE: deferred / safe / honoured ────────────────────────────────────────────────
+# cell_case <D> <pin-sha> <pinroot> <pinfile-tree> <O> ; prints the script's output. `--self $O` is the
+# flat seed a cell has (no git identity), which is what makes the controller arm the only readable one.
+cell_case() {
+  local D="$1" pinsha="$2" root="$3" ptree="$4" o="$5"
+  local pin="$D/cellhome/HARNESS-PIN"
+  printf '%s\n' "$pinsha" > "$pin"; printf '%s\n' "$ptree" > "$D/pinfile"
+  O="$o" CELL_HOME="$D/cellhome" HARNESS_PIN_DIR="$root" HARNESS_PIN_FILE="$D/pinfile" \
+    bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$pin" --self "$o" 2>&1
+}
+
+_CASE=$((_CASE+1)); echo "=== S1: a restart that IS needed with a lane in flight -> REQUESTED, actuation=blocked, lane named ==="
+D="$T/s1"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE1="$(mk_pin_tree "$D/pinroot" "$C1")"; TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+CTRL="$(start_ctrl "$TREE1")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+# A lane wrapper in $O, as a real cell has (`lane.sh`, `fix-one.sh`, …): the argv population.
+printf 'sleep 300\n' > "$D/O/lane.sh"; bash "$D/O/lane.sh" >/dev/null 2>&1 &
+LANE=$!
+R="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+case "$R" in *"relation=restart-pending"*"pending=deferred"*) ok "running=$(short "$C1") vs pin $(short "$C2") with a lane live: restart-pending, pending=deferred" ;;
+              *) bad "expected restart-pending/deferred: $R" ;; esac
+# ⛔ `pending=` and `actuation=` ARE TWO FIELDS, and the operator line is where they get conflated: the
+# first draft printed `actuation=deferred`. A `deferred` REQUEST is `actuation=blocked` — the reason and
+# the verdict must not swap places in the one sentence a human reads.
+case "$R" in *"pending=deferred, actuation=blocked"*) ok "…and the operator line keeps pending= and actuation= distinct (deferred / blocked)" ;;
+              *) bad "the prose conflates the pending reason with the actuation verdict: $R" ;; esac
+REQB="$D/O/state/restart-request"
+case "$(cat "$REQB" 2>/dev/null)" in
+  "restart request=pending"*) ok "a REQUEST was recorded (the state has a transition, not just a word)" ;;
+  *) bad "no request record was written: $(cat "$REQB" 2>/dev/null)" ;; esac
+[ "$(req_of "$D/O" actuation)" = blocked ] && ok "actuation=blocked — the loop refuses to apply it" \
+  || bad "actuation=$(req_of "$D/O" actuation), expected blocked"
+[ "$(req_of "$D/O" blocked)" = lanes ] && ok "blocked=lanes — the population that blocks it is NAMED, not implied" \
+  || bad "blocked=$(req_of "$D/O" blocked), expected lanes"
+# ⛔ `pin=` must name the DEPLOYED TIP the process should be on (`RUN_SHORT` vs `pin` is the whole
+# question), never the sha record and never `unknown` — a record that cannot say what it is waiting for
+# is the same defect as a word with no transition.
+[ "$(req_of "$D/O" pin)" = "$(short "$C2")" ] && ok "…and pin= names the deployed tip ($(short "$C2")) the restart would land on" \
+  || bad "pin=$(req_of "$D/O" pin), expected $(short "$C2") — the record cannot say what it is waiting for"
+case "$(cat "$REQB" 2>/dev/null)" in
+  *"checked=argv,roles,tree"*) ok "…and the populations actually consulted are recorded (checked=argv,roles,tree)" ;;
+  *) bad "the record does not say which populations were consulted: $(cat "$REQB" 2>/dev/null)" ;; esac
+case "$(cat "$REQB" 2>/dev/null)" in
+  *"blind=reparented-no-wrapper"*) ok "…and the DECLARED blind spot is recorded (a reparented lane child that runs no \$O/*.sh is in none of them)" ;;
+  *) bad "the blind spot is undeclared — 'safe' would read as a guarantee: $(cat "$REQB" 2>/dev/null)" ;; esac
+# The reader the requirement asks for: `--print-restart` answers without git, repo or network.
+PR="$(O="$D/O" bash "$RR" --print-restart 2>&1)"
+case "$PR" in "restart request=pending"*"pending=deferred"*) ok "--print-restart prints the same state (the reader needs no repo, no network)" ;;
+              *) bad "--print-restart did not report the pending request: $PR" ;; esac
+stop_ctrl "$LANE"; stop_ctrl "$CTRL"
+
+_CASE=$((_CASE+1)); echo "=== S2: nothing in flight -> actuation=safe; a role pass ALONE is enough to block it ==="
+D="$T/s2"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot" "$D/O/state/roles"
+TREE1="$(mk_pin_tree "$D/pinroot" "$C1")"; TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+CTRL="$(start_ctrl "$TREE1")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+case "$R" in *"pending=safe"*) ok "no lane, no role pass, no controller child: pending=safe" ;;
+              *) bad "expected pending=safe on an idle box: $R" ;; esac
+[ "$(req_of "$D/O" actuation)" = safe ] && ok "actuation=safe — the request is addressed to an actuator, and this script still applies nothing" \
+  || bad "actuation=$(req_of "$D/O" actuation), expected safe"
+[ "$(req_of "$D/O" lanes)" = 0 ] && ok "lanes=0 is a MEASURED zero (the populations were read), not an absent field" \
+  || bad "lanes=$(req_of "$D/O" lanes), expected a measured 0"
+# …and ONE role lock (a reap/merge/hygiene pass, which merge-reminder.py already refuses to restart under)
+# flips it to blocked. Without this arm, `actuation=safe` could be a constant.
+mkdir -p "$D/O/state/roles/.reap.lock"; printf '%s|t\n' "$$" > "$D/O/state/roles/.reap.lock/own"
+R="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+[ "$(req_of "$D/O" blocked)" = roles ] && ok "…a live role lock alone makes blocked=roles (the safe verdict is not a constant)" \
+  || bad "with a live role lock, blocked=$(req_of "$D/O" blocked), expected roles — $R"
+stop_ctrl "$CTRL"
+
+_CASE=$((_CASE+1)); echo "=== S3: the transition is OBSERVABLE — requested at T, HONOURED at T+n when the process moves ==="
+D="$T/s3"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE1="$(mk_pin_tree "$D/pinroot" "$C1")"; TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+CTRL="$(start_ctrl "$TREE1")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R1="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+case "$(cat "$D/O/state/restart-request" 2>/dev/null)" in
+  "restart request=pending"*"requested_at="*) ok "cycle 1: a request is recorded with requested_at" ;;
+  *) bad "cycle 1 recorded no request: $(cat "$D/O/state/restart-request" 2>/dev/null)" ;; esac
+AT1="$(req_of "$D/O" requested_at)"
+# The actuator does its job: the controller is relaunched ON THE PINNED TREE — exactly what
+# `stop -> apply -> start` produces. Nothing else about the box changes.
+stop_ctrl "$CTRL"
+CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R2="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+case "$R2" in *"relation=current"*) ok "cycle 2: the box is current now (running == pin)" ;;
+              *) bad "cycle 2 did not report current: $R2" ;; esac
+RQ="$(cat "$D/O/state/restart-request" 2>/dev/null)"
+case "$RQ" in
+  "restart request=honoured"*) ok "…and the request became request=honoured — the transition is recorded, not inferred" ;;
+  *) bad "the honoured transition was not recorded: $RQ" ;; esac
+case "$RQ" in *"was=$(short "$C1")"*"now=$(short "$C2")"*) ok "…naming both ends (was=$(short "$C1") now=$(short "$C2"))" ;;
+              *) bad "the honoured record does not name what moved: $RQ" ;; esac
+case "$RQ" in *"after="*s*) ok "…and how long it took (after=<n>s)" ;;
+              *) bad "the honoured record carries no interval: $RQ" ;; esac
+[ "$(req_of "$D/O" requested_at)" = "$AT1" ] && ok "…and requested_at is the ORIGINAL ask, not the cycle that noticed" \
+  || bad "requested_at moved from '$AT1' to '$(req_of "$D/O" requested_at)' — the clock reset, so 'pending for days' is unreadable"
+stop_ctrl "$CTRL"
+
+_CASE=$((_CASE+1)); echo "=== B6: the spawn-line token carries WHICH pending state (and stays bare for every other relation) ==="
+D="$T/b6"; mkdir -p "$D/O/state" "$D/O/logs"
+cat > "$D/O/harness-refresh.sh" <<'SH'
+#!/bin/bash
+echo "harness relation=restart-pending running=111111111111 ref=222222222222 pin=111111111111 action=none pending=deferred"
+exit 0
+SH
+chmod +x "$D/O/harness-refresh.sh"
+(
+  O="$D/O"; LOG="$D/O/logs/orch-loop.log"; HARNESS_REF=origin/main; : > "$LOG"
+  . "$BLK/block.sh"; harness_refresh_cycle; printf 'T=%s\n' "$HARNESS_TOKEN" > "$D/tok"
+)
+[ "$(cat "$D/tok")" = "T=restart-pending:deferred:111111111111" ] \
+  && ok "the token names the state AND why (restart-pending:deferred:<running>)" \
+  || bad "token was '$(cat "$D/tok")', expected T=restart-pending:deferred:111111111111"
+grep -q 'pending=deferred' "$D/O/state/harness-refresh" 2>/dev/null \
+  && ok "…and the per-cycle record keeps the field for later readers" \
+  || bad "state/harness-refresh dropped the pending field"
+# A non-restart relation that also reports pending=none must NOT grow the field on the token: a constant
+# segment on every line is the always-on shape this whole change removes.
+cat > "$D/O/harness-refresh.sh" <<'SH'
+#!/bin/bash
+echo "harness relation=behind running=111111111111 ref=222222222222 pin=111111111111 action=refused pending=none"
+exit 25
+SH
+(
+  O="$D/O"; LOG="$D/O/logs/orch-loop.log"; HARNESS_REF=origin/main; _HR_DONE=0
+  . "$BLK/block.sh"; harness_refresh_cycle; printf 'T=%s\n' "$HARNESS_TOKEN" > "$D/tok2"
+)
+[ "$(cat "$D/tok2")" = "T=behind:111111111111" ] \
+  && ok "…and every other relation keeps the bare <relation>:<running> token (no ':none' grew on it)" \
+  || bad "token was '$(cat "$D/tok2")', expected T=behind:111111111111"
+
 echo
 # ⛔ A SWALLOWED BLOCK IS A SILENT SKIP. Found in review round 3: ONE unbalanced quote turned the A15-A17
 # blocks into an argument of a `bad` that never ran, and the suite still printed "68 passed, 0 failed" —

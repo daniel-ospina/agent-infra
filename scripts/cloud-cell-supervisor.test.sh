@@ -1072,6 +1072,34 @@ case "$PROV_OUT" in
   *"self-refresh STALE"*) ok "status flags a verdict older than two of the LOOP's cycles (CYC default 240)" ;;
   *) bad "status did not flag a 1000s-old self-refresh verdict: $PROV_OUT" ;;
 esac
+# (e3b) THE RESTART DECISION IS READABLE FROM `status` (agent-infra#2641). `restart-pending` used to be
+# a word with no transition, and on a cell it was PERMANENT (the running identity was unreadable there),
+# so `status` printed `harness: …[current]` and `self-refresh: restart-pending` about the same box for
+# ever. The per-cycle record now carries the pending REASON and a request; `status` must print it,
+# because an operator acts from this verb and a recorded decision nobody can read is not a decision.
+printf 'restart request=pending requested_at=%s waited=12s requested_by=harness-refresh.sh@abc running=abc123 pin=def456 pending=deferred actuation=blocked blocked=lanes lanes=2 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(( $(date +%s) - 12 ))" > "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"request=pending"*"pending=deferred"*) ok "status prints the restart REQUEST (the state, not just the word)" ;;
+  *) bad "status does not surface the restart request: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"actuation=blocked"*"blocked=lanes"*) ok "…including what would be interrupted (blocked=lanes)" ;;
+  *) bad "status hides what blocks the restart: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"a restart is PENDING and was NOT applied"*) ok "…and says in words that nothing was applied, naming the actuator" ;;
+  *) bad "status prints the record but not what it means: $PROV_OUT" ;;
+esac
+# An ABSENT record is not "nothing pending": no cycle has ever recorded one.
+rm -f "$P/o/state/restart-request"
+prov status
+case "$PROV_OUT" in
+  *"NO REQUEST RECORD"*) ok "…and an absent record is reported as absent, not as 'nothing pending'" ;;
+  *) bad "an absent request record was silent: $PROV_OUT" ;;
+esac
+
 prov apply >/dev/null 2>&1   # leave the record and the seed consistent for the cases below
 
 # (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.
