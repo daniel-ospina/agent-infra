@@ -1274,6 +1274,130 @@ else
      "$( has "$mline" 'actions/runners --paginate'; [ $? -ne 0 ]; echo $? )"
 fi
 
+# ── (p) THE SHAPE `bash -n` CANNOT SEE: a `case` INSIDE `$( )` (#2969) ───────────────────────
+# ⛔ WHY A `bash -n` ARM WOULD HAVE PROVED NOTHING. `bash -n` parses the OUTER script only, so it
+# answered rc 0 on a module that could not run: the substitution is re-parsed at EXECUTION, and on
+# bash 3.2 — macOS's `/bin/bash`, which is the interpreter `launchd` starts the controller with
+# (`com.eldato.orchestrator-loop.plist` → `/bin/bash …/launchd-controller.sh`) — the `)` that closes
+# a `case` PATTERN is read as the closer of the `$( )`. Measured on the box that filed the defect:
+#
+#   $ /bin/bash ci-queue.sh status --repo daniel-ospina/agent-infra
+#   deep(queued=55 running=5 runners=2 busy=2 ceiling=4 derived=ceil(2*20/10) state=fresh)
+#   ci-queue.sh: command substitution: line 596: syntax error near unexpected token `newline'
+#   ci-queue.sh: command substitution: line 596: ` case "${CIQ_STATE}" in fresh'
+#   repo=… state=fresh source= printf 'gh' ;; cache) printf 'record(cache)' ;; … esac ) age=0s
+#   rc=0      ← a CORRUPTED field under a GREEN exit
+#
+# ⛔ AND WHY THE OBVIOUS FIX IS NOT A FIX, which is why this arm forbids the CONSTRUCT rather than one
+# spelling of it. Every shape below measured with /bin/bash 3.2.57, the box's own interpreter:
+#   in fresh)                  → the substitution closes at `fresh)`; `source=` is literal leftovers
+#   in *fr*)                   → same
+#   in (fresh) … *) …          → STILL FAILS: `(` shields only its own pattern, and the `*)`
+#                                catch-all's `)` closes the substitution
+#   in (fresh) … (*) …         → parses — but only while EVERY pattern stays parenthesised, which is
+#                                a trap for the next editor rather than a rule
+#   if/then/else, or hoisted   → parses, because no `)` in the text terminates a pattern
+# A `case` is therefore allowed DIRECTLY in a shell script and NOT allowed inside a command
+# substitution: hoist it into a variable first. (bash 4.4+ parse every shape above correctly, which
+# is exactly why the defect could not be seen on the machine that wrote it — the failing population
+# is bash 3.2, the version the controller actually runs.)
+# ⛔ WHAT THIS ARM CAN AND CANNOT FIRE, DECLARED RATHER THAN IMPLIED: the DETECTOR (p1)-(p2) is
+# portable and carries the red-proof on EVERY host, including CI's bash 5 where the runtime shape
+# parses fine. The RUNTIME arm (p3)-(p4) needs a bash 3.x interpreter to fire, and on a box whose
+# only bash is 4.4+ it reports a DECLARED notice instead of a pass — a runtime arm that silently
+# cannot run is the same lie as a gate that cannot run.
+
+# cis_in_comsub <file> -> "<file>:<line>" for every `case` that sits inside a `$( )` on one line.
+# THE RULE, PRECISELY: walk each `$(` left to right; for the text that follows it, the `case` keyword
+# is INSIDE the substitution when no `)` appears before it. The `)` guard is what keeps a legitimate
+# `x="$(probe)"; case … in` (substitution already closed on that line) out of the report.
+cis_in_comsub() {
+  local f="$1" n=0 line rest head found
+  while IFS= read -r line; do
+    n=$((n + 1)); rest="$line"; found=0
+    while :; do
+      case "$rest" in *'$('*) ;; *) break ;; esac
+      rest="${rest#*'$('}"
+      head="${rest%%case*}"
+      case "$head" in
+        "$rest") continue ;;                 # no `case` after this `$(`, keep walking
+        *')'*)    continue ;;                 # this substitution closed before the `case`
+      esac
+      found=1; break
+    done
+    [ "$found" -eq 1 ] && printf '%s:%s\n' "$f" "$n"
+  done < "$f"
+}
+
+hits="$(cis_in_comsub "$MOD")"
+ck "(p1) the module carries NO \`case\` inside a \`\$( )\` (${hits:-none}) — the shape bash 3.2 re-parses at execution" \
+   "$( [ -z "$hits" ]; echo $? )"
+
+# ⛔ MUTANT: reinstate the CONSTRUCT from the module's own hoisted block — not a hand-written
+# imitation of it, so the control cannot drift from the code it guards. The relocation is exactly the
+# pre-fix semantics: the same `case`, moved back inside the substitution.
+mutp="$T/mut-comsub"
+mkdir -p "$mutp"
+# ⛔ awk, NOT python3: this arm must not go RED on a host that merely lacks an interpreter, and the
+# siblings that use python3 all live outside the bash suites. RULE: wherever the hoisted `case` block
+# starts, emit the SAME case back inside a `$( )` and drop the block — the pre-fix semantics exactly.
+awk '
+  skip && /^      esac$/ { skip = 0; next }          # the block ends here
+  skip { next }
+  /^      case "\$\{CIQ_STATE\}" in$/ {
+    print "      src=\"$( case \"${CIQ_STATE}\" in fresh) printf '"'"'gh'"'"' ;; cache) printf '"'"'record(cache)'"'"' ;; *) printf '"'"'unknown'"'"' ;; esac )\""
+    skip = 1; next
+  }
+  { print }
+' "$MOD" > "$mutp/ci-queue.sh" 2>/dev/null
+if [ $? -ne 0 ] || cmp -s "$MOD" "$mutp/ci-queue.sh"; then
+  bad "(p2) the shape mutation did not apply — (p1) would prove nothing"
+elif ! bash -n "$mutp/ci-queue.sh" 2>/dev/null; then
+  bad "(p2) the mutant does not pass \`bash -n\` — it must, because THAT blindness is the finding"
+else
+  mhits="$(cis_in_comsub "$mutp/ci-queue.sh")"
+  ck "(p2) MUTANT — reinstating the construct is CAUGHT (${mhits:-<missed>}) while \`bash -n\` still exits 0, so (p1) is not always-green and is not a re-run of the parse gate" \
+     "$( [ -n "$mhits" ]; echo $? )"
+fi
+
+# ── (p3)-(p4) the RUNTIME arm: the same bytes, on an interpreter that has the defect ─────────────
+# Find a bash 3.x. `/bin/bash` is 3.2 on macOS (the affected population) and 5.x on the CI runners
+# (where the shape parses, so the arm cannot fire there — declared, below).
+B3=""
+for c in /bin/bash /usr/bin/bash /usr/local/bin/bash /opt/homebrew/bin/bash; do
+  [ -x "$c" ] || continue
+  case "$($c -c 'printf %s "$BASH_VERSION"' 2>/dev/null)" in 3.*) B3="$c"; break ;; esac
+done
+legal_source() { [ "${1:-}" = gh ] || [ "${1:-}" = 'record(cache)' ] || [ "${1:-}" = unknown ]; }
+cli_source() { # <module> <state-dir> -> the `source=` field of the status line, as printed
+  mkdir -p "$2"
+  CIQ_GH="$STUB" CIQ_TEST_QUEUED=1 CIQ_TEST_RUNNING=0 CIQ_TEST_RUNNERS=5 CIQ_TEST_BUSY=true \
+  CIQ_TEST_OFFLINE=0 CIQ_TEST_NOTOTAL=0 CIQ_TTL=0 CIQ_STALE_MAX=0 \
+    "$B3" "$1" status --repo "$OR" --state-dir "$2" 2>/dev/null \
+    | sed -n 's/.*source=\(.*\) age=[^ ]*$/\1/p' | head -1
+}
+if [ -z "$B3" ]; then
+  printf '  ⚠️  (p3) DECLARED, NOT SKIPPED — no bash 3.x on this host (%s); bash 4.4+ parse this shape\n' \
+    "$(bash --version 2>/dev/null | head -1)"
+  printf '      correctly, so the RUNTIME arm cannot fire here. The detector (p1)/(p2) is the arm\n'
+  printf '      carrying the red-proof on this host.\n'
+else
+  got="$(cli_source "$MOD" "$T/rt-fixed")"
+  ck "(p3) on bash 3.2 ($B3) the CLI reports a DERIVED source= ('${got:-<none>}'), never the literal remainder of the printf" \
+     "$( legal_source "$got"; echo $? )"
+  # ⛔ THE CONTROL NEEDS A MUTANT TO DRIVE. When (p2) could not build one — which is what a REVERTED
+  # module looks like, since there is no hoisted block to relocate — this arm must go RED, not pass
+  # because an absent file's empty output happens to be "not a legal source". Measured on the
+  # reverted bytes: the earlier spelling of this arm reported ✅ for a mutant that did not exist.
+  if [ ! -f "$mutp/ci-queue.sh" ] || cmp -s "$MOD" "$mutp/ci-queue.sh"; then
+    bad "(p4) there is no mutant to drive — the runtime control would prove nothing (measured on a reverted module: this arm used to pass VACUOUSLY)"
+  else
+    mgot="$(cli_source "$mutp/ci-queue.sh" "$T/rt-mut")"
+    ck "(p4) MUTANT — on bash 3.2 the reinstated construct CORRUPTS source= ('${mgot:-<none>}'), so (p3) is not always-green" \
+       "$( { legal_source "$mgot"; } ; [ $? -ne 0 ]; echo $? )"
+  fi
+fi
+
 printf '\n──────────────────────────────────────────────────────────────────────\n'
 printf 'ci-queue.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then printf '%s' "$FAILED_LINES" | sed 's/^/  - /'; exit 1; fi
