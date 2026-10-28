@@ -35,6 +35,14 @@ else
 fi
 
 section "3/6  the upgrade-proof extension guard (change b, extension layer)"
+# ⛔ THIS SCRIPT IS THE DECLARATION `clamp-output-floor.test.ts` requires (#2643 review, 2026-10-24).
+# The suite's live-install arm asserts "this box carries the source patch" only where a caller
+# DECLARES that the box must be patched — because an unpatched install (a CI runner's npm pi, an
+# upgraded box whose chunk moved) is not a defect in the checkout, and asserting it there reddened
+# every PR's evaluated tree. `verify.sh` IS that caller: it is the one place that runs the whole
+# patch set against this box and reports whether the patch holds, so it declares the requirement
+# here and the arm fails for the right reason if `apply.sh --check` ever regresses.
+export PI_SOURCE_PATCH_REQUIRED=1
 if npx --yes tsx "$REPO_ROOT/extensions/clamp-output-floor.test.ts"; then
 	printf '\n✅ change (b) extension layer holds\n'
 else
