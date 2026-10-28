@@ -1,0 +1,13 @@
+# The GREEN-direction pin for the indented flow mapping: a CORRECT PR workflow written with the flow
+# mapping on its own line. Reading it must produce the group and cancel (so R1 is satisfied);
+# without the indented-flow parse the group is unreadable and this is refused (#2660 round 7).
+name: PR concurrency flow child
+on:
+  pull_request:
+concurrency:
+  {group: "pr-concurrency-flow-child-${{ github.ref }}", cancel-in-progress: true}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
