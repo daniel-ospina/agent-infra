@@ -429,6 +429,39 @@ else
 fi
 
 echo ""
+echo "8e. a FULL BOX (rc=6) is reported as WAITING, not as RED (agent-infra#2291)"
+# ⛔ `pr-doctor`'s rc=6 is NO-CAPACITY: the spawn gate refused every order, nothing was consumed, and
+# it clears by itself. Reported as `RED` it sends an operator to repair an install that is working --
+# the same collapse the exit-code split exists to remove, one layer up in the reader. The control
+# (rc=3, the TRANSPORT) is asserted in the same shape so this arm cannot pass by labelling every
+# non-zero code WAITING.
+FIX8E="$(mkfix nocapacity 0)"; LOG8E="$(logof "$FIX8E")"
+printf '6\n' > "$FIX8E/agent/state/pr-doctor.rc"
+: > "$FIX8E/agent/state/PR-DOCTOR-OFF"        # no launch: this arm is about the READER
+run_pass "$FIX8E"
+LOG8ETXT="$(cat "$LOG8E" 2>/dev/null)"
+if has "$LOG8ETXT" "PR-DOCTOR WAITING rc=6"; then
+  pass "a no-capacity pass is reported as 'PR-DOCTOR WAITING rc=6'"
+else
+  fail "rc=6 was not reported as WAITING (got: $(grep -m1 'PR-DOCTOR' "$LOG8E" 2>/dev/null | cut -c1-140))"
+fi
+if has "$LOG8ETXT" "PR-DOCTOR RED rc=6"; then
+  fail "a no-capacity pass was ALSO reported as RED — a full box is not a broken one"
+else
+  pass "   …and it is NOT also claimed as RED"
+fi
+FIX8F="$(mkfix undelivered 0)"; LOG8F="$(logof "$FIX8F")"
+printf '3\n' > "$FIX8F/agent/state/pr-doctor.rc"
+: > "$FIX8F/agent/state/PR-DOCTOR-OFF"
+run_pass "$FIX8F"
+LOG8FTXT="$(cat "$LOG8F" 2>/dev/null)"
+if has "$LOG8FTXT" "PR-DOCTOR RED rc=3" && ! has "$LOG8FTXT" "PR-DOCTOR WAITING"; then
+  pass "   and the TRANSPORT (rc=3) still reads RED — the word is chosen, not blanket-softened"
+else
+  fail "rc=3 was not reported as RED (got: $(grep -m1 'PR-DOCTOR' "$LOG8F" 2>/dev/null | cut -c1-140))"
+fi
+
+echo ""
 echo "9. the WORD is chosen by the rc: a crash is not a refusal (REFUSED is #1872's exit-2 word)"
 FIX9="$(mkfix crash 4)"; LOG9="$(logof "$FIX9")"
 run_pass "$FIX9"

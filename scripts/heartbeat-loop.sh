@@ -220,15 +220,18 @@ mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 
 # "$STERR"` is "whoever wrote last", which is routinely a LATER step, not this failure's cause.
 # A diagnosis line that names the wrong component is worse than a bare rc: it sends the reader to
 # the wrong file. Each detached child therefore owns `<child>.stderr`, truncated at launch.
-# report_detached_rc <log-prefix> <rc-sidecar> <child-stderr> [<label-at-rc-2>]
+# report_detached_rc <log-prefix> <rc-sidecar> <child-stderr> [<label-at-rc-2>] [<label-at-rc-6>]
 #   <log-prefix> is the word for any non-zero rc; <label-at-rc-2>, when given, replaces it for
 #   rc=2 ONLY (see the header: `REFUSED` is exit-2 vocabulary, so it must not decorate a crash).
+#   <label-at-rc-6> does the same for rc=6 — `pr-doctor`'s NO-CAPACITY, where the box refused the
+#   order and nothing is broken (agent-infra#2291). Without it a full box printed `PR-DOCTOR RED`,
+#   the same word as a broken install, and the two need opposite responses.
 report_detached_rc() {
   # ⛔ `_src` IS ASSIGNED ON ITS OWN LINE, NOT IN THE `local` LIST. `local a="$1" b="$a"` does NOT
   # see the local `a`: the shell expands every word BEFORE it runs the `local` builtin, so `b` gets
   # the GLOBAL (here: empty) value and the drain returns early on `[ -f "" ]` — measured: the whole
   # suite went to 14 failures because `_src` was empty and NOTHING was ever reported.
-  local label="$1" rcfile="$2" errfile="$3" rc2_label="${4:-}" rc="" _reported=0 _src="" _tail="" _word=""
+  local label="$1" rcfile="$2" errfile="$3" rc2_label="${4:-}" rc6_label="${5:-}" rc="" _reported=0 _src="" _tail="" _word=""
   _src="$rcfile"
   # ⛔ A PENDING CARRIER OUTRANKS THIS RUN'S SIDECAR (review P3-2, MEASURED). Gating the unlink is
   # not enough on its own: the next LAUNCH writes the same path, so a value retained through a log
@@ -265,9 +268,14 @@ report_detached_rc() {
       else
         _tail="$(cat "$rcfile.tail" 2>/dev/null | cut -c1-200)"
       fi
-      # ⛔ THE WORD IS CHOSEN BY THE RC (review P1, #1954). `REFUSED` for rc=2 only; anything else
+      # ⛔ THE WORD IS CHOSEN BY THE RC (review P1, #1954). `REFUSED` for rc=2 only, `WAITING` for
+      # rc=6 only (agent-infra#2291: the box refused the order and nothing is broken); anything else
       # is RED, matching the record reader's vocabulary for the same pass.
-      if [ "$rc" = 2 ] && [ -n "$rc2_label" ]; then _word="$rc2_label"; else _word="$label"; fi
+      case "$rc" in
+        2) if [ -n "$rc2_label" ]; then _word="$rc2_label"; else _word="$label"; fi ;;
+        6) if [ -n "$rc6_label" ]; then _word="$rc6_label"; else _word="$label"; fi ;;
+        *) _word="$label" ;;
+      esac
       printf '%s %s rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$_word" "$rc" "$_tail" \
         2>/dev/null >> "$LOG" && _reported=1 ;;
   esac
@@ -744,7 +752,9 @@ while :; do
   # cannot be launched any more. The surviving line is still pinned by `scripts/heartbeat-loop.test.sh`.
   # rc=2 -> `PR-DOCTOR REFUSED` (#1933's vocabulary); any other non-zero rc -> `PR-DOCTOR RED rc=N`,
   # never a refusal claim.
-  report_detached_rc "PR-DOCTOR RED"   "$STATE/pr-doctor.rc"      "$STATE/pr-doctor.stderr" "PR-DOCTOR REFUSED"
+  # rc=6 -> `PR-DOCTOR WAITING`: the box had no room, nothing was consumed, and the order clears by
+  # itself (agent-infra#2291). A full box is not a failure, and the word a reader acts on must say so.
+  report_detached_rc "PR-DOCTOR RED"   "$STATE/pr-doctor.rc"      "$STATE/pr-doctor.stderr" "PR-DOCTOR REFUSED" "PR-DOCTOR WAITING"
 
 
   # ---------------------------------------------------------------------------------------
@@ -853,7 +863,14 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
       # ⛔ A STALE VERDICT IS NOT `ok` (2026-10-18, review). The whole point of reading a record is
       # to notice when nothing is writing it; printing `ok` from a week-old file reproduces exactly
       # the failure this block was added to end. Bound = two 1200s dispatch intervals.
-      if [ "${_prc:-0}" -ne 0 ]; then
+      if [ "${_prc:-0}" -eq 6 ]; then
+        # ⛔ NOT RED (agent-infra#2291). The box's own gate refused the order and consumed nothing, so
+        # the recorded verdict says NO-CAPACITY and the next action is wait/prune/add capacity. Named
+        # here because this line is where an operator reads the pass, and "RED" would send them to
+        # repair an install that is working.
+        printf '%s PR-DOCTOR WAITING rc=6 (%ss ago) :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "${_page:-?}" "$_pwhy" >> "$LOG"
+      elif [ "${_prc:-0}" -ne 0 ]; then
         printf '%s PR-DOCTOR RED rc=%s (%ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "$_prc" "${_page:-?}" "$_pwhy" >> "$LOG"
       elif [ "${_pdry:-0}" = "1" ]; then

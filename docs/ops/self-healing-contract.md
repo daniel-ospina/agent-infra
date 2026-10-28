@@ -308,11 +308,13 @@ fix the red).
 deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doctor.status.json` with
 `rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` **NOT DELIVERED** — the work was
 legible and none of it went out: no worker took an order that was placed, **or** a durable state (a
-worktree holding uncommitted work, a refusing transport) stopped the order before delivery; `4` crash;
-`64` the command line is unusable (**not** 2, so a launchd typo cannot masquerade as a refusal).
-⛔ The sidecar **must** be overwritten by a refusing pass — otherwise the previous pass's `ok` stands
-and *"a failure only `launchctl list` can witness is a silent failure"*.
-`scripts/test_pr_doctor.py` §10 pins exactly that agreement.
+worktree holding uncommitted work, a refusing transport) stopped the order before delivery; `6`
+**NO-CAPACITY** — the spawn GATE refused the order (its own bound: `load` | `disk` |
+`land-backlog`), nothing was consumed, and it clears by itself, so the response is wait/prune/add
+capacity and **not** a repair; `4` crash; `64` the command line is unusable (**not** 2, so a launchd
+typo cannot masquerade as a refusal). ⛔ The sidecar **must** be overwritten by a refusing pass —
+otherwise the previous pass's `ok` stands and *"a failure only `launchctl list` can witness is a
+silent failure"*. `scripts/test_pr_doctor.py` §10 pins exactly that agreement.
 ⛔ **AND `0` IS NOT REACHABLE FROM A PASS THAT REFUSED AN ORDER** (#2710, measured 2026-10-27). A
 worktree refusal that will not clear by waiting (uncommitted work, commits the PR head does not have)
 records a row and a cooldown; until #2710 it did **not** join the `undeliverable` axis, so a pass whose
@@ -325,8 +327,8 @@ returned to `0` for the 44 minutes of the row's own cooldown, which is the loop 
 its cooldown is a worker in flight, and stays clean), the row carries its own `refusals` count, and
 after `REFUSAL_ESCALATE_AT` consecutive refusals **at one head** the pass prints `ESCALATE #<n>` naming
 the worktree and the repair — on the verdict line too, not only in the log. A head move starts a new
-episode. The two *causes* (a box with no room vs the transport refusing) still produce different
-responses and are #2291's to separate; what is decided here is that neither may read as a clean pass.
+episode. The two *causes* — a box with no room vs the transport refusing — are separated into `6` and
+`3` by agent-infra#2291 (below); what is decided here is that neither may read as a clean pass.
 ⛔ **AND THE ACCOUNTING IS ITS OWN PASS OVER THE QUEUE** (review round 2, P1 — reproduced, twice).
 The first attempt only hoisted it above the class-budget `continue`; the dispatch loop still `break`s on
 `dispatched >= budgets["total"]`, so with a zero total (a saturated box, or `--max 0`) it broke on the
@@ -365,6 +367,36 @@ WHICH copy judged it. `nonblocking-dispatch.sh` resolved `brief-gate.sh` from fo
 said only that "the gate" refused, so after the 2026-10-28 case 3 measurement (the driver resolved
 `$O/objective.py` while the fix landed on `~/.pi/agent/scripts/objective.py`) an operator was sent to
 the copy they had just repaired. The refusal now names `$bg_lib`.
+
+⚠️ **Re-read against #2710, which landed first:** `3` was later BROADENED to *"legible work, none of it
+out"* so that a durable pre-delivery refusal (a dirty worktree, a refusing transport) no longer reads
+`0`. That is the same axis this split moves to `6` — and the two do not overlap: `3` is **"the chain
+would not take it"** (repair it), `6` is **"the GATE measured the box and said not now"** (wait, or
+prune/add capacity). A gate refusal consumes nothing and clears by itself; nothing about it needs
+repairing. The rebase that merged the two kept both statements of the axis in this file.
+
+**`3` and `6` are the same sentence in two different worlds (agent-infra#2291).** Both used to be `3`
+with `N order(s) no worker accepted`, because a gate refusal and a transport failure are both
+`record=False` in `dispatch()`. Measured, same pass shape on 2026-10-27:
+`EXIT rc=3 -- refused-recorded=4; 4 order(s) no worker accepted` — four stale-worktree refusals (repair
+the tree) reporting the code a genuinely overloaded box produces (wait). So:
+
+- the code is split, and `6` is **not a new number**: `scripts/pr-repair-loop.sh` (the cell's repair
+  unit, which runs this actuator) already declares `EXIT_DEFERRED=6` for "the machine said not now", and
+  it maps `pr-doctor`'s `6` onto that same row (`decision=deferred`, `reason=dispatcher-no-capacity`);
+- the **verdict is named** in the sidecar for every exit — `verdict` (`OK` | `REFUSING` |
+  `UNDELIVERED` | `NO-CAPACITY`), `reason`, `next_action`, plus `no_room`, `no_room_bound` and `room`
+  (the box's own measurement) on the `6` path;
+- the **box measurement is the fleet's existing one**, not a second one: `room` is the raw record from
+  `bash $O/capacity.sh probe <checkout>` (`host ncpu load1 lpc lanes disk_free_mb mem_free_mb at procs
+  procs_max fork src`, agent-infra#2253), read once *after* the decision and **never** used to take it —
+  the gate already decided, on its own numbers. An unreadable probe is recorded as
+  `room_read: false` with the reason and does not change the code, because the refusal stands on the
+  gate's measurement (`capacity.sh` exits 254 when the read itself could not fork, 2 when a core field
+  could not be measured);
+- the readers agree on the word: `heartbeat-loop.sh` prints `PR-DOCTOR WAITING rc=6`,
+  `objective.py::pr_doctor_last_run` renders `WAITING (no capacity)`, `repo_row()` says `verdict=WAITING`.
+  **None of them reads `6` as `ok`** (§2: cannot-verify is never a pass) and none reads it as `RED`.
 
 **What repairs it.** Read `read=` and `reason=` from the sidecar, then: `read=transport` +
 `predates the repair kind` → refresh `$O` with `install.sh` (a stale dispatcher silently downgrades

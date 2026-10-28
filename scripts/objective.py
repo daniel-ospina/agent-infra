@@ -3292,8 +3292,15 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
     if age > 2400:
         return "PR-DOCTOR(last run): UNREPORTED (verdict is STALE, %dm old: %s)" % (
             age // 60, reason)
+    # ⛔ "RED" IS A CLAIM ABOUT A FAILURE, AND A FULL BOX IS NOT ONE (agent-infra#2291). rc=6 is
+    # pr-doctor's NO-CAPACITY: the spawn gate refused on its own measurement, nothing was consumed,
+    # and it clears by itself -- `docs/ops/self-healing-contract.md` 3.6 calls that state REFUSING,
+    # and the response is to WAIT or add capacity, never to repair an install. It is still NOT `ok`
+    # (a pass that placed nothing must never read green in the beat), so it gets its own word rather
+    # than borrowing either neighbour's.
+    word = "WAITING (no capacity)" if rc == 6 else ("RED" if rc else "ok")
     return "PR-DOCTOR(last run): %s rc=%d %dm ago — %s" % (
-        "RED" if rc else "ok", rc, age // 60, reason)
+        word, rc, age // 60, reason)
 
 
 def build(prev=None):

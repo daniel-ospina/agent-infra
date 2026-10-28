@@ -557,7 +557,7 @@ def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
         return "", "", 0
 
     monkeypatch.setattr(pr, "sh_err", fake_sh_err)
-    ok, _, record = pr.dispatch(_pr(9), "fix-ci", _OK_BRIEF, dry=False)
+    ok, _, record, _bound = pr.dispatch(_pr(9), "fix-ci", _OK_BRIEF, dry=False)
     assert ok is True and record is True
     assert calls, "dispatch did not invoke the spawn command"
     argv, capture = calls[-1]
@@ -600,9 +600,98 @@ def test_dispatch_does_not_record_a_gate_refusal(tmp_path, monkeypatch):
     # ⛔ `fix-ci`, not a placeholder label: `brief()` returns "" for an unknown action, and an EMPTY
     # brief is refused by the research gate (80) before the stub `run_agent` below is ever reached —
     # so the 75 this test is about would never be produced (#2258).
-    ok, detail, record = pr.dispatch(_pr(11), "fix-ci", _OK_BRIEF, dry=False)
+    ok, detail, record, bound = pr.dispatch(_pr(11), "fix-ci", _OK_BRIEF, dry=False)
     assert ok is False and record is False
     assert "refused" in detail.lower() and "75" in detail
+    # ⛔ AND THE AXIS COMES OUT OF THE PRODUCTION PATH (agent-infra#2291). `bound` is what lets
+    # `_finish` tell "the box has no room" (wait) from "the transport refused it" (repair); if this
+    # field is lost here, both facts land in `undeliverable` again and share rc=3, which is the
+    # defect. Read from `spawn-gate.sh`'s own code (75 = load), never guessed from the message.
+    assert bound == "load", bound
+
+
+def test_the_dispatch_arity_is_four_on_EVERY_return(monkeypatch, tmp_path):
+    """⛔ A CONTRACT THAT IS ONLY MOSTLY APPLIED IS A CRASH DELAYED (caught by VGATE on this change).
+
+    `dispatch()` gained a fourth field so `_finish` can tell "the box has no room" from "the
+    transport refused it". Eleven of its twelve returns were updated and ONE — the successful
+    `--dry-run` path — was not, so `main()`'s four-way unpack raised
+    `UNCAUGHT ValueError: not enough values to unpack` and a rehearsal exited EXIT_CRASH (4). The
+    suite stayed green because every `dry=True` test in it takes a REFUSAL path and asserts
+    `ok is False`, so the success return was never executed.
+
+    Two arms, because either alone is escapable: the AST scan cannot be satisfied by a partial
+    edit, and the behavioural arm proves the dry-run really works (it is the mode an operator uses
+    to rehearse before a pass, so a crash here is a crash in the one place a human is watching).
+    """
+    import ast as _ast
+    tree = _ast.parse((_REPO / "scripts" / "pr-doctor.py").read_text())
+    fn = [n for n in _ast.walk(tree)
+          if isinstance(n, _ast.FunctionDef) and n.name == "dispatch"][0]
+    shapes = [len(n.value.elts) for n in _ast.walk(fn)
+              if isinstance(n, _ast.Return) and isinstance(n.value, _ast.Tuple)]
+    assert shapes, "dispatch() has no tuple returns — this test is no longer looking at anything"
+    assert set(shapes) == {4}, "every `return` in dispatch() must be a 4-tuple: %r" % (shapes,)
+    # …and the one return that was missed is exercised for real: a SUCCESSFUL dry run.
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(tmp_path), ""))
+    monkeypatch.setattr(pr, "worker_live_for", lambda n: False)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    out = pr.dispatch(_pr(1), "fix-ci", _OK_BRIEF, dry=True)
+    assert out == (True, "dry-run", False, ""), out
+
+
+def test_a_disk_gate_refusal_carries_ITS_OWN_axis_not_loads(tmp_path, monkeypatch):
+    """The axis is the gate's CODE, not a default: 77 is disk, and its remedy is not "wait"."""
+    d = tmp_path / "orch"
+    d.mkdir()
+    (d / "spawn-gate.sh").write_text(
+        'run_agent() { echo "[disk-gate] REFUSED bg: only 400MB free" >> "$2"; return 77; }\n')
+    shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setenv("O", str(d))
+    ok, detail, record, bound = pr.dispatch(_pr(12), "fix-ci", _OK_BRIEF, dry=False)
+    assert (ok, record) == (False, False), detail
+    assert bound == "disk", bound
+    assert pr.GATE_REFUSAL_ACTION["disk"] != pr.GATE_REFUSAL_ACTION["load"]
+
+
+def test_a_TRANSPORT_failure_carries_NO_axis(tmp_path, monkeypatch):
+    """The control: a dispatcher that fails outright is the TRANSPORT, so `bound` stays empty.
+
+    `rc=78` is "spawn-gate.sh not found" — the FOREGROUND dispatcher refusing to start anything.
+    It is permanent, fleet-wide, and nothing about it is the box saying "not now".
+    """
+    d = tmp_path / "orch"
+    d.mkdir()
+    (d / "spawn-gate.sh").write_text('run_agent() { return 78; }\n')
+    (d / "nonblocking-dispatch.sh").write_text('#!/usr/bin/env bash\nexit 78\n')
+    shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(d / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
+    # Liveness is asked FIRST (one worker per PR) and the stub dispatcher cannot answer it, so the
+    # answer is pinned here: a free slot, then a dispatcher that fails.
+    monkeypatch.setattr(pr, "worker_live_for", lambda n: False)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setenv("O", str(d))
+    ok, detail, record, bound = pr.dispatch(_pr(13), "fix-ci", _OK_BRIEF, dry=False)
+    assert (ok, record) == (False, False), detail
+    assert "78" in detail, detail
+    assert bound == "", "a transport failure is not the box saying no: %r" % bound
 
 
 def test_dispatch_records_an_unmaterialisable_worktree(tmp_path, monkeypatch):
@@ -619,7 +708,7 @@ def test_dispatch_records_an_unmaterialisable_worktree(tmp_path, monkeypatch):
                             "worktree prd-3/fix/x is dirty -- refusing to reset it", persistent=True)))
     called = []
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: called.append(a) or ("", "", 0))
-    ok, detail, record = pr.dispatch(_pr(3), "fix-ci", _OK_BRIEF, dry=False)
+    ok, detail, record, _bound = pr.dispatch(_pr(3), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, True)
     assert "dirty" in detail
     assert not called, "nothing must be spawned when the worktree could not be materialised"
@@ -638,7 +727,7 @@ def test_a_TRANSIENT_worktree_failure_is_not_recorded(monkeypatch, tmp_path):
                         lambda p: ("", "cannot materialise fix/x: origin/fix/x could not be "
                                         "fetched (boom)"))
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: ("", "", 0))
-    ok, detail, record = pr.dispatch(_pr(3), "fix-ci", _OK_BRIEF, dry=False)
+    ok, detail, record, _bound = pr.dispatch(_pr(3), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, False), (ok, detail, record)
 
 
@@ -650,16 +739,22 @@ def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
     monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "failed")
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d, *_rest: (False, "gate refused rc=75", False))
+    # ⛔ THE FOURTH FIELD SAYS WHICH REFUSAL THIS IS (agent-infra#2291): `load` is the SPAWN GATE
+    # refusing on its own measurement, so the order was never offered to a worker and nothing was
+    # consumed. Without it this fake is indistinguishable from a transport failure, which is the
+    # defect the sibling test below pins.
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d, *_rest: (False, "gate REFUSED rc=75", False, "load"))
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
     monkeypatch.setenv("MAX_REVIEW", "12")
-    # rc=3, not 0: a pass with legible work that placed NOTHING is not a clean pass ("0 is reserved
-    # for readable, nothing to do"), and since 2026-10-18 the UNDELIVERABLE class has its own code
-    # (3) so a launcher can tell it from a blind read (2). The property this test pins is the STATE
-    # ROW -- a gate refusal must not be recorded.
-    assert pr.main() == 3
+    # rc=6, not 0 and not 3. Not 0: a pass with legible work that placed NOTHING is not a clean pass
+    # ("0 is reserved for readable, nothing to do"). Not 3: a gate refusal is the BOX saying "not
+    # now" -- it consumed nothing and clears by itself -- while 3 means the TRANSPORT dropped an
+    # order an operator must repair (#2291). The property this test pins is the STATE ROW -- a gate
+    # refusal must not be recorded -- and the code now says the same thing the row does not.
+    assert pr.main() == pr.EXIT_NO_CAPACITY == 6
     assert not [k for k in saved if not k.startswith("_")], \
         "a refused spawn must not consume a state row / budget slot"
 
@@ -675,7 +770,7 @@ def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True))
+                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True, ""))
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -718,7 +813,7 @@ def _refusing_pass(monkeypatch, seed_refusals, logs):
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True))
+                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True, ""))
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -845,7 +940,7 @@ def test_a_HEAD_MOVE_starts_a_NEW_refusal_episode(monkeypatch):
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True))
+                        lambda p, a, t, d, *_rest: (False, "worktree dirty -- refusing", True, ""))
     saved = {}
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
@@ -869,7 +964,7 @@ def test_a_successful_spawn_RESETS_the_consecutive_refusal_count(monkeypatch):
     monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d, *_rest: (True, "spawned", True))
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d, *_rest: (True, "spawned", True, ""))
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -888,7 +983,7 @@ def test_dispatch_reports_a_failed_worktree_instead_of_spawning(monkeypatch, tmp
                         lambda p: ("", "worktree add failed rc=1: boom"))
     called = []
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: called.append(a) or ("", "", 0))
-    ok, detail, _ = pr.dispatch(_pr(3), "fix-ci", _OK_BRIEF, dry=False)
+    ok, detail, _, _bound = pr.dispatch(_pr(3), "fix-ci", _OK_BRIEF, dry=False)
     assert ok is False
     assert "worktree add failed" in detail
     assert not called, "nothing must be spawned when the worktree could not be materialised"
@@ -1724,7 +1819,7 @@ def test_the_action_for_a_free_workspace_is_a_BACKGROUND_SPAWN_not_a_workspace_s
                         lambda argv, timeout=180, cwd=None, env=None, capture=True:
                         (calls.append(argv), ("", "", 0))[1])
 
-    ok, detail, _ = pr.dispatch(_pr(9), "failing", "brief text", dry=False)
+    ok, detail, _, _bound = pr.dispatch(_pr(9), "failing", "brief text", dry=False)
     assert ok is True, detail
     assert calls, "nothing was dispatched"
     argv = calls[-1]
@@ -1794,7 +1889,7 @@ def _drive(monkeypatch, *, prs, action, cap_env, dispatch=None):
     if dispatch is None:
         def dispatch(p, a, text, dry, *_rest):
             sent.append("prd-%s" % p["number"])
-            return True, "", False
+            return True, "", False, ""
     monkeypatch.setattr(pr, "dispatch", dispatch)
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
@@ -1938,7 +2033,7 @@ def test_dispatch_returns_promptly_whatever_the_worker_does(monkeypatch, tmp_pat
     d, wt = _orch(tmp_path, _WORKERS[label])
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
     t0 = time.monotonic()
-    ok, detail, record = pr.dispatch(_pr(5), "fix-ci", _OK_BRIEF, dry=False)
+    ok, detail, record, _bound = pr.dispatch(_pr(5), "fix-ci", _OK_BRIEF, dry=False)
     elapsed = time.monotonic() - t0
     assert ok is True and record is True, (ok, detail)
     assert elapsed < 3.0, "dispatch took %.2fs -- it waited for the worker" % elapsed
@@ -1988,11 +2083,11 @@ def test_a_live_worker_is_never_spawned_over(monkeypatch, tmp_path):
     # alive however slow the runner is (nothing waits on it -- it is disowned by the harness).
     d, wt = _orch(tmp_path, "run_agent() { sleep 30; return 0; }\n")
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
-    ok1, detail1, record1 = pr.dispatch(_pr(7), "fix-ci", _OK_BRIEF, dry=False)
+    ok1, detail1, record1, bound1 = pr.dispatch(_pr(7), "fix-ci", _OK_BRIEF, dry=False)
     assert ok1 is True and record1 is True, detail1
     before = _artifacts(d)
     assert "pid" in before and "log" in before, before
-    ok2, detail2, record2 = pr.dispatch(_pr(7), "fix-ci", _OK_BRIEF, dry=False)
+    ok2, detail2, record2, bound2 = pr.dispatch(_pr(7), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok2, record2) == (False, False), "a live worker must not be spawned over"
     assert "still running" in detail2
     assert _artifacts(d) == before, "the live worker's pid/log/rc must be untouched"
@@ -2014,7 +2109,7 @@ def test_a_head_change_does_not_bypass_the_live_worker_guard(monkeypatch):
     monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "running")   # prd-7 is alive
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d, *_rest: calls.append(p["number"]) or (True, "", True))
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d, *_rest: calls.append(p["number"]) or (True, "", True, ""))
     monkeypatch.setattr(pr, "save_state", lambda st2: None)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -2065,7 +2160,7 @@ def test_adopting_an_unsafe_lane_worktree_refuses_AND_records_a_row(monkeypatch,
     monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     _stub_the_spawn(monkeypatch)
-    ok, detail, record = pr.dispatch(_prb(42, c2, "fix/abc"), "fix-ci", "brief", dry=False)
+    ok, detail, record, _bound = pr.dispatch(_prb(42, c2, "fix/abc"), "fix-ci", "brief", dry=False)
     assert (ok, record) == (False, True), (ok, detail, record)
     assert "uncommitted" in detail and str(lane) in detail, detail
     assert (lane / "f.txt").read_text() == "a lane's uncommitted work\n", \
@@ -2236,7 +2331,7 @@ def test_an_adopted_lane_worktree_at_the_pr_head_is_dispatched(monkeypatch, tmp_
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.5)
     seen = _stub_the_spawn(monkeypatch, rc_ok=True)
-    ok, detail, record = pr.dispatch(_prb(42, head, "fix/abc"), "fix-ci", "brief", dry=False)
+    ok, detail, record, _bound = pr.dispatch(_prb(42, head, "fix/abc"), "fix-ci", "brief", dry=False)
     assert ok is True and record is True, detail
     assert seen and os.path.realpath(seen[-1][3]) == os.path.realpath(str(lane)), seen
 
@@ -2281,7 +2376,7 @@ def test_a_refusal_split_across_two_writes_is_finally_read(monkeypatch, tmp_path
 
     monkeypatch.setattr(pr, "sh_err", fake_sh_err)
     monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 2.0)
-    ok, detail, record = pr.dispatch(_pr(8), "fix-ci", _OK_BRIEF, dry=False)
+    ok, detail, record, _bound = pr.dispatch(_pr(8), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, False), (ok, detail, record)
     assert "75" in detail
 
@@ -2431,7 +2526,7 @@ def test_an_unreadable_worker_status_REFUSES_to_spawn(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "worker_status", lambda name: None)      # --status unanswerable
     spawned = []
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: spawned.append(a) or ("", "", 0))
-    ok, detail, record = pr.dispatch(_pr(12), "fix-ci", _OK_BRIEF, dry=False)
+    ok, detail, record, _bound = pr.dispatch(_pr(12), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, False)
     assert "liveness" in detail
     assert not spawned, "nothing may be spawned when liveness cannot be read"
@@ -2474,7 +2569,7 @@ def test_a_dispatcher_failure_reports_the_dispatchers_own_stderr(monkeypatch, tm
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "log", lambda m: None)
-    ok, detail, record = pr.dispatch(_pr(13), "fix-ci", _OK_BRIEF, dry=False)
+    ok, detail, record, _bound = pr.dispatch(_pr(13), "fix-ci", _OK_BRIEF, dry=False)
     assert (ok, record) == (False, False)
     assert "78" in detail and "spawn-gate.sh" in detail, detail
 
@@ -2792,7 +2887,7 @@ def test_dry_run_reports_the_worktree_refusal(monkeypatch, tmp_path):
     for name in ("prd-5", "prd-5-d"):          # both candidates occupied, neither disposable
         (repo / ".worktrees" / name).mkdir(parents=True)
         (repo / ".worktrees" / name / "precious.txt").write_text("work\n")
-    ok, detail, record = pr.dispatch(_prb(5, head, "feat/x"), "fix-ci", "brief", dry=True)
+    ok, detail, record, _bound = pr.dispatch(_prb(5, head, "feat/x"), "fix-ci", "brief", dry=True)
     assert ok is False, "a dry run claimed it would spawn although both candidate paths are blocked"
     assert "unusable" in detail
     assert record is False
@@ -3077,7 +3172,7 @@ def test_a_running_pr_is_never_dispatched(monkeypatch):
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
     sent = []
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry, *_rest: sent.append("prd-%s" % p["number"]) or (True, "", False))
+                        lambda p, a, t, dry, *_rest: sent.append("prd-%s" % p["number"]) or (True, "", False, ""))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
     assert sent == ["prd-2"], sent                       # the running PR got NO order
@@ -3123,7 +3218,7 @@ def test_a_partly_blind_pass_that_DID_work_is_a_clean_pass(monkeypatch):
     # that path does not exist -- the pass would refuse to spawn BLIND (correctly) and this test
     # would read rc 2 for the wrong reason.
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry, *_rest: (True, "", False))
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry, *_rest: (True, "", False, ""))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
     assert any("UNREADABLE" in m for m in logs), logs
@@ -3162,7 +3257,7 @@ def test_a_pass_whose_every_order_was_refused_is_not_a_clean_pass(monkeypatch):
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry, *_rest: (False, "dispatcher exited rc=78", False))
+                        lambda p, a, t, dry, *_rest: (False, "dispatcher exited rc=78", False, ""))
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     # ⛔ 3, NOT 2 (2026-10-18). "I could not READ" and "I read, I placed, nobody took it" are
@@ -3191,7 +3286,8 @@ def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monk
 
     # PR #1 is placed. PR #2's spawn fails transiently (not recorded -> undeliverable).
     def dispatch(p, a, t, dry, *_rest):
-        return (True, "", False) if p["number"] == 1 else (False, "dispatcher exited rc=78", False)
+        return ((True, "", False, "") if p["number"] == 1
+                else (False, "dispatcher exited rc=78", False, ""))
 
     monkeypatch.setattr(pr, "dispatch", dispatch)
     monkeypatch.setattr(pr, "log", logs.append)
@@ -4031,7 +4127,7 @@ def test_a_recovered_pass_is_published_as_a_degradation_not_a_plain_ok(monkeypat
     # `(launched, detail, record)`, and `worker_live()` is the per-PR liveness probe. Stubbing the
     # old `idle_lanes`/`dispatch -> bool` pair is what made this helper-shaped test inert on main.
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry, *_rest: (True, "spawned", False))
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry, *_rest: (True, "spawned", False, ""))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--repo", _TEST_REPO])
     assert pr.main() == 0, "\n".join(logs)
     import json as _json
@@ -4545,7 +4641,7 @@ def test_a_stale_sibling_objective_is_a_RECORDED_refusal(tmp_path):
 # unreadable queue, and a lane that fails to start. All four must carry a DISTINCT, LOGGED reason.
 
 def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("pr-doctor.py",),
-                state=None, live=False):
+                state=None, live=False, bound=""):
     """Run one pass against a synthetic world; return (rc, joined log, status payload).
 
     ⛔ THE TRANSPORT IS THE WORKER ONE (#1890): `dispatch(pr, action, text, dry)` returns
@@ -4566,9 +4662,12 @@ def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("p
     monkeypatch.setattr(pr, "classify", lambda p: classified)
     monkeypatch.setattr(pr, "worker_live", live if callable(live) else (lambda name: live))
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    # ⛔ THE FOURTH FIELD IS THE GATE'S OWN BOUND (#2291). "" is the transport (a dispatcher that
+    # exited, a worktree refusal, an unconfirmed spawn); "load"/"disk"/"land-backlog" is the SPAWN
+    # GATE refusing, which is a different fact about a different thing needing the opposite response.
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry, *_rest: ((True, "spawned", False) if launched
-                                              else (False, "dispatcher exited rc=78", False)))
+                        lambda p, a, t, dry, *_rest: ((True, "spawned", False, "") if launched
+                                              else (False, "dispatcher exited rc=78", False, bound)))
     monkeypatch.setattr(pr, "log", logs.append)
     # The repo-resolution tests are their OWN section; every other pass test names the repo it
     # grades so it keeps testing the thing it is about (a pass with no resolvable repo now REFUSES
@@ -4771,7 +4870,7 @@ def test_un_owned_prs_are_dispatched_before_owned_ones(monkeypatch):
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "dispatch",
-                        lambda p, a, t, dry, *_rest: order.append("prd-%s" % p["number"]) or (True, "", False))
+                        lambda p, a, t, dry, *_rest: order.append("prd-%s" % p["number"]) or (True, "", False, ""))
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
@@ -4972,14 +5071,20 @@ def _seed_status(home, payload):
     return p
 
 
-def test_the_exit_contract_is_one_table_with_five_distinct_codes():
+def test_the_exit_contract_is_one_table_with_six_distinct_codes():
     """A code that two facts share is a code that answers neither. Each meaning is its own value."""
     table = {"clean": pr.EXIT_CLEAN, "refusing": pr.EXIT_REFUSING,
-             "undelivered": pr.EXIT_UNDELIVERED, "crash": pr.EXIT_CRASH,
-             "usage": pr.EXIT_USAGE}
+             "undelivered": pr.EXIT_UNDELIVERED, "no_capacity": pr.EXIT_NO_CAPACITY,
+             "crash": pr.EXIT_CRASH, "usage": pr.EXIT_USAGE}
     assert pr.EXIT_CLEAN == 0
     assert pr.EXIT_REFUSING == 2, "2 is the fleet's refusal code — it may not be reassigned"
     assert pr.EXIT_USAGE == 64, "usage errors take sysexits.h EX_USAGE (64), not 2"
+    # ⛔ 6 IS THE FLEET'S EXISTING `DEFERRED`, NOT A FRESH NUMBER (agent-infra#2291).
+    # `scripts/pr-repair-loop.sh` — the cell's repair unit, which runs THIS script — declares
+    # `EXIT_DEFERRED=6` for "the machine said not now". A gate refusal is that same fact, so it
+    # borrows the same number instead of inventing a fourth; a fresh one would make the two
+    # dispatchers two tables.
+    assert pr.EXIT_NO_CAPACITY == 6, "6 is pr-repair-loop.sh's EXIT_DEFERRED, kept identical"
     assert len(set(table.values())) == len(table), table
 
 
@@ -6402,7 +6507,7 @@ def test_a_repo_whose_rubric_was_not_supplied_is_refused_not_graded(monkeypatch)
         assert _REPO_A in note, note
         # The refusal is a GATE-class refusal: nothing consumed, no state row, and the pass reports
         # EXIT_UNDELIVERABLE rather than a confident wrong order.
-        assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False)
+        assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False, "")
         # …and a DRY RUN says the same thing, so an operator cannot read a plan the pass would refuse.
         assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=True)[0] is False
     finally:
@@ -6593,7 +6698,7 @@ def test_a_machine_wide_rubric_cannot_attribute_a_SET_of_repos(tmp_path, monkeyp
     # The refusal is a REFUSAL on the dispatch path too, so a set that skips `run_pass` cannot
     # still place an order.
     assert pr.dispatch({"number": 1}, "rerun-checks", "brief", True,
-                       seen[0][1]) == (False, seen[0][1], False)
+                       seen[0][1]) == (False, seen[0][1], False, "")
 
 
 def test_the_machine_wide_status_view_NAMES_its_own_age_and_the_per_repo_records(tmp_path,
@@ -6794,7 +6899,7 @@ def test_the_POST_MATERIALISE_recheck_asks_BOTH_worker_names(monkeypatch):
     monkeypatch.setattr(pr, "materialise_worktree", _materialise)
     monkeypatch.setattr(pr, "worker_live", _worker_live)
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: spawned.append(a) or ("", "", 0))
-    ok, detail, record = pr.dispatch(_pr(3), "fix", "x", dry=False)
+    ok, detail, record, _bound = pr.dispatch(_pr(3), "fix", "x", dry=False)
     assert ok is False, "a live worker's worktree was adopted for a SECOND agent"
     assert "appeared" in detail, detail
     assert record is False, "a liveness probe is not a verdict about the PR; nothing is recorded"
@@ -6836,7 +6941,7 @@ def test_HALF_a_rubric_seam_is_a_hybrid_rubric_and_refuses_even_the_built_in_rep
             assert "HYBRID" in note and named in note, note
             # …and the refusal reaches the only path that spawns, for that repo too.
             pr.apply_repo(_REPO_B, "")
-            assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False)
+            assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False, "")
     finally:
         pr.canonical_paths()
 
@@ -6978,7 +7083,7 @@ def test_a_SATURATED_pass_still_refuses_and_names_a_refused_row(monkeypatch, tmp
         monkeypatch.setattr(pr, "log", logs.append)
         monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
         monkeypatch.setattr(pr, "worker_live_for", lambda k: False)
-        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True))
+        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True, ""))
         monkeypatch.setattr(pr, "save_state", lambda s: None)
         # ⛔ ZERO TOTAL BUDGET: the saturated box, produced here the way the CLI produces it.
         monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--max", "0"])
@@ -7085,7 +7190,7 @@ def test_an_EXPIRED_cooldown_refusal_is_not_dropped_by_a_saturated_pass(monkeypa
         monkeypatch.setattr(pr, "log", logs.append)
         monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
         monkeypatch.setattr(pr, "worker_live_for", lambda k: False)
-        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True))
+        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True, ""))
         monkeypatch.setattr(pr, "save_state", lambda s: None)
         monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--max", "0"])
         rc = pr.main()
@@ -7183,3 +7288,189 @@ def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, 
     finally:
         shutil.rmtree(str(short), ignore_errors=True)
     assert logged, "the refusal produced no log line at all"
+
+
+# ── 13. #2291 — "the box has no room" and "the transport refused it" are TWO codes ──────────────
+#
+# THE MEASURED DEFECT, reproduced on `main` through the REAL `dispatch()` -> `_confirm()` ->
+# `gate_refused()` chain (both arms below run that chain, not a stub of it):
+#
+#   A. the box has no room — `spawn prd-9: gate REFUSED rc=75 — no agent started, nothing consumed`
+#   B. the transport refused — `spawn prd-9 -> …: FAIL rc=78: spawn-gate.sh: not found`
+#
+#   both:  `EXIT rc=3 -- 1 order(s) no worker accepted`
+#
+# A is "wait"; B is "repair the install". A watchdog keyed on the code could not tell them apart,
+# and the fleet measured FIVE hand-actions in one day from that ambiguity (#2700's comment of
+# 2026-10-27), plus the live `EXIT rc=3 -- refused-recorded=4; 4 order(s) no worker accepted` whose
+# four orders were stale-worktree refusals — nothing to wait for, everything to repair.
+#
+# The fix keeps the code split AND names the verdict (`verdict`, `reason`, `next_action`) in the
+# sidecar a non-terminal reader parses, with the box's own measurement cited from the fleet's ONE
+# measurement (`$O/capacity.sh probe`), never a second set of thresholds in this file.
+
+def _fake_capacity(tmp_path, record):
+    """An `$O` with a `capacity.sh` that answers `probe` with `record` (a real one costs a fork)."""
+    o = tmp_path / "orch"
+    o.mkdir(parents=True, exist_ok=True)
+    p = o / "capacity.sh"
+    p.write_text("#!/usr/bin/env bash\n[ \"$1\" = probe ] || exit 2\n"
+                 "cat <<'REC'\n" + record + "\nREC\n")
+    p.chmod(0o755)
+    return str(p)
+
+
+RECORD = ("host=pi-cell-3 ncpu=8 load1=4520 lpc=565 lanes=9 disk_free_mb=8120 mem_free_mb=2400 "
+          "at=1793165644 procs=5400 procs_max=4692 fork=0 src=cgroup")
+
+
+def test_no_room_gets_its_own_code_and_a_named_verdict(monkeypatch, tmp_path):
+    """Arm A: the SPAWN GATE refused. Nothing consumed, it clears by itself — rc 6, WAIT."""
+    monkeypatch.setattr(pr, "CAPACITY_SH", _fake_capacity(tmp_path, RECORD))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(9)], ("fix-ci", "red", []),
+                                     launched=False, bound="load")
+    assert rc == pr.EXIT_NO_CAPACITY == 6, joined
+    assert payload.get("verdict") == "NO-CAPACITY", payload
+    assert payload.get("no_room") == 1 and payload.get("undeliverable") == 0, payload
+    assert payload.get("no_room_bound") == "load", payload
+    assert "wait" in payload.get("next_action", ""), payload
+    assert "NO-CAPACITY" in joined, joined
+    # ⛔ THE LINE SAYS IT IS NOT A FAILURE. The old wording ("N order(s) no worker accepted") is
+    # exactly what a broken dispatcher printed, so an operator reading the log had no way to know
+    # whether to wait or to go and fix something.
+    assert "not a failure and not a clean pass" in joined, joined
+
+
+def test_the_transport_keeps_3_and_says_repair(monkeypatch):
+    """Arm B: the TRANSPORT refused. An operator must repair it — rc 3, and it will not clear."""
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(9)], ("fix-ci", "red", []),
+                                     launched=False, bound="")
+    assert rc == pr.EXIT_UNDELIVERED == 3, joined
+    assert payload.get("verdict") == "UNDELIVERED", payload
+    assert payload.get("no_room") == 0, payload
+    assert "repair" in payload.get("next_action", ""), payload
+    assert "waiting will not clear it" in payload.get("next_action", ""), payload
+
+
+def test_one_pass_cannot_report_the_two_facts_with_one_code(monkeypatch, tmp_path):
+    """THE ACCEPTANCE TEST: same pass shape, opposite causes, DIFFERENT codes and DIFFERENT words."""
+    monkeypatch.setattr(pr, "CAPACITY_SH", _fake_capacity(tmp_path, RECORD))
+    room = _drive_pass(monkeypatch, [_pr(9)], ("fix-ci", "red", []), launched=False, bound="load")
+    wire = _drive_pass(monkeypatch, [_pr(9)], ("fix-ci", "red", []), launched=False, bound="")
+    assert room[0] != wire[0], (room[0], wire[0])
+    assert {room[0], wire[0]} == {6, 3}, (room[0], wire[0])
+    assert room[2].get("verdict") != wire[2].get("verdict"), (room[2], wire[2])
+    assert room[2].get("next_action") != wire[2].get("next_action"), (room[2], wire[2])
+    # …and neither of them may read as a PASS: 6 is a refusal that clears, never "ok".
+    assert 0 not in (room[0], wire[0])
+
+
+def test_a_mixed_pass_keeps_the_actionable_code_and_names_both(monkeypatch, tmp_path):
+    """A set with BOTH: the repair wins the code, and the no-room half is still named."""
+    monkeypatch.setattr(pr, "CAPACITY_SH", _fake_capacity(tmp_path, RECORD))
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "red", []))
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    logs = []
+
+    def dispatch(p, a, t, dry, *_rest):
+        # #1: the gate refused (box). #2: the transport dropped it (repair).
+        return ((False, "gate REFUSED rc=75", False, "load") if p["number"] == 1
+                else (False, "rc=78: dispatcher missing", False, ""))
+    monkeypatch.setattr(pr, "dispatch", dispatch)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--repo", _TEST_REPO])
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3
+    payload = json.load(open(pr.STATUS))
+    assert payload.get("no_room") == 1 and payload.get("undeliverable") == 1, payload
+    joined = "\n".join(logs)
+    assert "1 order(s) REFUSED by the box's own gate (bound=load)" in joined, joined
+    assert "1 order(s) no worker accepted" in joined, joined
+
+
+def test_the_box_measurement_is_the_FLEETS_ONE_and_is_quoted(monkeypatch, tmp_path):
+    """`room=` is `capacity.sh probe`'s own record — the measured primitive, cited verbatim."""
+    monkeypatch.setattr(pr, "CAPACITY_SH", _fake_capacity(tmp_path, RECORD))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(9)], ("fix-ci", "red", []),
+                                     launched=False, bound="load")
+    assert rc == 6
+    assert payload.get("room") == RECORD, payload.get("room")
+    assert payload.get("room_read") is True, payload
+    # The citation is human-legible too: load PER CPU is the number the bound is about.
+    assert "load 45.20/8 cpu" in joined and "lpc 5.65" in joined, joined
+    assert "fork=0" in joined, joined
+
+
+def test_an_unreadable_box_probe_is_named_and_never_softens_the_verdict(monkeypatch, tmp_path):
+    """CANNOT-VERIFY IS NEVER A PASS — and it is never a second gate either."""
+    missing = str(tmp_path / "orch" / "capacity.sh")
+    monkeypatch.setattr(pr, "CAPACITY_SH", missing)
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(9)], ("fix-ci", "red", []),
+                                     launched=False, bound="disk")
+    # The refusal stands on the GATE's measurement, so an unreadable probe changes nothing.
+    assert rc == 6, joined
+    assert payload.get("room") == "" and payload.get("room_read") is False, payload
+    assert "UNREADABLE" in joined and "not installed" in joined, joined
+    assert payload.get("no_room_bound") == "disk"
+    assert "reclaim disk" in payload.get("next_action", ""), payload
+
+
+def test_pr_doctor_owns_no_SECOND_set_of_capacity_thresholds():
+    """REUSE, PINNED: the fix must consult the fleet's measurement, not grow its own.
+
+    A second `CAP_LPC_CEILING`/`CAP_MIN_DISK_MB` in this file would be a second instrument, and two
+    instruments eventually disagree about the same box — which is the defect class this whole file
+    keeps removing (one authority per fact).
+    """
+    src = (_REPO / "scripts" / "pr-doctor.py").read_text()
+    for own in ("CAP_LPC_CEILING", "CAP_MIN_DISK_MB", "CAP_MIN_MEM_MB", "CAP_YIELD_AT_LPC",
+                "LOAD_MULTIPLE_OF_CORES", "DEFAULT_DISK_MIN_FREE_MB"):
+        assert own not in src, "%s is the fleet's measurement, not this file's" % own
+    assert "capacity.sh" in src and '"probe"' in src, \
+        "the box's state must come from `capacity.sh probe` (agent-infra#2253)"
+
+
+def test_the_gate_axis_table_is_the_GATES_own_numbers():
+    """The axis is read from `spawn-gate.sh`'s literals, so a renumbered gate reddens this suite."""
+    gate = (_HARNESS / "spawn-gate.sh").read_text()
+    lit = {}
+    for name in ("AGENT_LOAD_REFUSED", "AGENT_DISK_REFUSED", "AGENT_LAND_BACKLOG"):
+        m = re.search(r"^%s=(\d+)\s*$" % name, gate, re.M)
+        assert m, "spawn-gate.sh no longer declares %s" % name
+        lit[int(m.group(1))] = name
+    assert set(lit) == set(pr.GATE_REFUSAL_BOUND), (lit, pr.GATE_REFUSAL_BOUND)
+    # Each axis names a DIFFERENT remedy, so a reader is told what to do and not just what happened.
+    for bound in pr.GATE_REFUSAL_BOUND.values():
+        assert pr.GATE_REFUSAL_ACTION.get(bound), bound
+    assert pr.GATE_REFUSAL_ACTION["load"] != pr.GATE_REFUSAL_ACTION["disk"]
+
+
+def test_a_no_capacity_pass_is_NOT_reported_as_RED_by_the_beat(tmp_path):
+    """The readers must agree with the writer. `objective.py` said `RED rc=6` for a full box."""
+    sd = tmp_path / "state"
+    sd.mkdir()
+    (sd / "pr-doctor.status.json").write_text(json.dumps({
+        "rc": 6, "reason": "1 order(s) REFUSED by the box's own gate (bound=load)",
+        "at_epoch": int(time.time()), "verdict": "NO-CAPACITY", "dry_run": False}))
+    line = pr.CLASSIFIER.pr_doctor_last_run(str(sd))
+    assert "WAITING" in line, line
+    assert "RED" not in line and "ok" not in line, line
+    # …and a real refusal still says RED, so this did not soften the one word that means "broken".
+    (sd / "pr-doctor.status.json").write_text(json.dumps({
+        "rc": 3, "reason": "1 order(s) no worker accepted",
+        "at_epoch": int(time.time()), "verdict": "UNDELIVERED", "dry_run": False}))
+    assert "RED" in pr.CLASSIFIER.pr_doctor_last_run(str(sd))
+
+
+def test_the_per_repo_row_says_WAITING_and_a_set_never_lets_6_mask_a_repair():
+    row = pr.repo_row("o/r", 6, {"open_prs": 3, "dispatched": 0, "undeliverable": 0, "no_room": 1})
+    assert "verdict=WAITING" in row, row
+    # 6 is the WEAKEST non-clean code: an actionable failure in any repo of the set must win.
+    assert pr._worst_rc([0, 6]) == 6
+    assert pr._worst_rc([6, 3]) == 3
+    assert pr._worst_rc([6, 2]) == 2
+    assert pr._worst_rc([6, 4]) == 4
+    assert pr._worst_rc([0, 0]) == 0

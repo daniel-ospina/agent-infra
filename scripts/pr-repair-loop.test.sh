@@ -124,8 +124,8 @@ reason_is "invalid-knob"
 # ── the dispatch verdict follows the dispatcher's OWN rc (round-2 review) ────────────────────────
 # A fake dispatcher: the loop must record what pr-doctor said, not that it returned. `refused` keeps
 # the pass's exit code at 2; `undelivered` is a readable pass whose work nobody took.
-mkdir -p "$TMP/farm-refuse" "$TMP/farm-undeliver" "$TMP/farm-ok" "$TMP/farm-crash"
-for d in farm-refuse farm-undeliver farm-ok farm-crash; do
+mkdir -p "$TMP/farm-refuse" "$TMP/farm-undeliver" "$TMP/farm-ok" "$TMP/farm-crash" "$TMP/farm-nocap"
+for d in farm-refuse farm-undeliver farm-ok farm-crash farm-nocap; do
     # ⛔ THE REAPER LOGS ITS ARGV (round-4 review): a dry-run that reaps must be OBSERVABLE, or the
     # dry-run guard can be deleted and the suite stays green while a "preview" removes worktrees.
     printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${REAP_OUT:-/dev/null}"\nexit 0\n' >"$TMP/$d/pi-reap-worktrees.sh"
@@ -143,6 +143,11 @@ printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' >"$TMP/farm-ok/pr-doc
 # legitimate "could not read the world", and because 2 is a VERDICT the crash consumed the backstop
 # window instead of being retried. The assertion is the DISTINCTION, not just the new code.
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(4)\n' >"$TMP/farm-crash/pr-doctor.py"
+# agent-infra#2291: NO-CAPACITY. The box's own gate refused every order and nothing was consumed,
+# so the dispatcher returns 6 -- which must reach the row as `deferred` and the caller as 6, NOT as
+# the `*)` arm's "could not read the world" (rc=2). Getting this wrong is what sent five operators
+# to repair a box that only needed to drain (#2700's comment of 2026-10-27).
+printf '#!/usr/bin/env python3\nimport sys\nsys.exit(6)\n' >"$TMP/farm-nocap/pr-doctor.py"
 rm -f "$ROW"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-refuse" \
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
@@ -172,6 +177,18 @@ if grep -q '"decision": "refusing"' "$ROW" 2>/dev/null; then
     ok "a genuine REFUSAL still records decision=refusing (the catch-all did not eat it)"
 else
     bad "a genuine refusal no longer records as refusing (row: $(tr -d '\n' <"$ROW" 2>/dev/null | cut -c1-200))"
+fi
+# The no-capacity arm (agent-infra#2291): the box's own gate refused, nothing consumed -> DEFERRED.
+# This is the third pole of the same discrimination: 6 is a verdict to WAIT on, 2 and 4 are not.
+rm -f "$ROW"
+env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-nocap" \
+    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
+check "a NO-CAPACITY dispatch is rc=6 (deferred), NOT rc=2" 6 "$?"
+reason_is "dispatcher-no-capacity"
+if grep -q '"decision": "deferred"' "$ROW" 2>/dev/null; then
+    ok "the row says decision=deferred — the same verdict as the loop's own gates"
+else
+    bad "the row does not say deferred (row: $(tr -d '\n' <"$ROW" 2>/dev/null | cut -c1-200))"
 fi
 rm -f "$ROW" "$TMP/reap.out"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-ok" \

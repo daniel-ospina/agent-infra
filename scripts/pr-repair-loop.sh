@@ -98,7 +98,12 @@
 #      durable refusal (a dirty worktree, an order the transport will not take) stopped it before
 #      delivery (agent-infra#2710). pr-doctor's own 3, kept verbatim: a monitor keyed on this pass
 #      must not read green over work nobody accepted
-#   6  DEFERRED — the machine said not now; the status row carries which measurement said so
+#   6  DEFERRED — the machine said not now; the status row carries which measurement said so.
+#      ⛔ THIS INCLUDES A PR-DOCTOR PASS THAT REPORTED THE SAME FACT ABOUT THE BOX (agent-infra#2291):
+#      pr-doctor returns 6 when the SPAWN GATE refused every order (load/disk/land-backlog) and nothing
+#      was consumed. Before this, such a pass reached the `*)` arm below and was re-labelled `REFUSING`
+#      — "could not read the world" — which is the exact conflation #2291 removes, reintroduced one
+#      layer up by the caller that reads the code.
 #   4  PASS-FAILED — the dispatcher CRASHED (or exited with a code that is not a verdict above).
 #      ⛔ NEVER RECORDED AS `refusing` (ai#2922): a crash and a refusal are DIFFERENT facts with
 #      different remedies, and this loop used to write both into the same `decision` and return 2,
@@ -384,6 +389,7 @@ one_pass() { # <dry-run:0|1>
         0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
         3) err "dispatch: NOT DELIVERED (rc=3) — legible work, none of it out: no worker took an order that was placed, or a refusal stopped one before delivery. NOT an empty queue." ;;
+        6) say "dispatch: DEFERRED (rc=6) — the box had no room, nothing was consumed; WAIT (it clears by itself) or add/prune capacity." ;;
         # ⛔ A NON-VERDICT IS A FAILURE, AND IT IS NAMED AS ONE (ai#2922). `timeout` alone gives 124,
         # a signal gives 128+n, and `pr-doctor` gives 4 for an uncaught exception -- the code an
         # unreadable cwd produced under launchd. Calling any of them "a refusal" told an operator to
@@ -408,6 +414,13 @@ one_pass() { # <dry-run:0|1>
         # collapsing the two facts from the other side. Named here, the refusal keeps its own row and
         # its own verdict code, and the catch-all is free to mean only what it says.
         2) write_status refusing "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-refused"; return "$EXIT_REFUSING" ;;
+        # ⛔ 6 IS THIS LOOP'S OWN `deferred`, KEPT AS ONE VERDICT (agent-infra#2291). pr-doctor refuses
+        # for the same reason this loop does — the machine measured itself over a bound — so the row
+        # says `deferred` and the exit says 6, instead of the `*)` arm relabelling a full box as a
+        # broken read. WAIT vs REPAIR is the only distinction a caller can act on. ⛔ IT IS NAMED
+        # BEFORE THE CATCH-ALL for the same reason `2)` is (ai#2922): the catch-all now means ONLY
+        # "the dispatcher crashed", so a full box must never reach it.
+        6) write_status deferred "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-no-capacity"; return "$EXIT_DEFERRED" ;;
         # ⛔ THE ROW AND THE EXIT CODE BOTH SAY `pass-failed` (ai#2922). This arm used to write
         # `refusing` / `dispatcher-refused` and return 2 -- the VERDICT code -- so a crashed
         # dispatcher produced a row and an exit byte-identical to a genuine "could not read the

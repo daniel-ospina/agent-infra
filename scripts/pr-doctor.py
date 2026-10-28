@@ -196,9 +196,35 @@ NOT_A_FLEET_READING = ""      # "" = a real pass; else WHY this run must not be 
 # consistency sweep that finds these two numbers must NOT collapse them.
 EXIT_CLEAN = 0        # a readable pass: it dispatched, or there was genuinely nothing to do
 EXIT_REFUSING = 2     # I could not read the world, or could not deliver to it -- 2's only meaning
-EXIT_UNDELIVERED = 3  # I read it, I placed the work, no worker took it
+EXIT_UNDELIVERED = 3  # I read it, I placed the work, and the TRANSPORT refused the order
+EXIT_NO_CAPACITY = 6  # the BOX refused the order (spawn gate: load/disk/land-backlog) -- nothing
+                      # was consumed and it clears by itself; the response is to WAIT, not to repair
 EXIT_CRASH = 4        # an uncaught exception (see __main__)
 EXIT_USAGE = 64       # the COMMAND LINE is unusable -- nothing was attempted
+#
+# ⛔ 3 AND 6 ARE TWO FACTS, AND MERGING THEM IS #2291 (reproduced on `main`, both paths through the
+# REAL `dispatch()` -> `_confirm()` -> `gate_refused()` chain):
+#
+#   rc=3, `spawn prd-9 -> …: FAIL rc=78: spawn-gate.sh: not found`   -- REPAIR the install/worktree
+#   rc=3, `spawn prd-9: gate REFUSED rc=75 -- no agent started, nothing consumed` -- WAIT
+#
+# The same code for both means a watchdog cannot act: a box that is merely busy and a dispatcher that
+# is broken need opposite responses, and the fleet recorded five hand-actions in one day from exactly
+# this ambiguity (#2700's comment of 2026-10-27).
+#
+# ⛔ 6 IS NOT INVENTED HERE. `scripts/pr-repair-loop.sh` -- the cell's own repair unit, which runs
+# THIS script and takes its verdict -- already declares `EXIT_DEFERRED=6` with the same meaning ("the
+# machine said not now; the status row carries which measurement said so", from the disk-reaper's
+# vocabulary). Reusing it is what makes the two dispatchers readable as ONE table; picking a fresh
+# number would have made a third.
+#
+# ⛔ WHAT THIS COSTS A CALLER THAT KEYS ON 3, stated rather than hidden. A gate refusal no longer
+# reports 3, so a monitor keyed on *exactly 3* stops alerting for "the box is full" -- which is the
+# intent (nothing is broken, it clears). Everything that treats any non-zero rc as not-a-pass is
+# unaffected: 6 is non-zero, so no reader can read it as green. The three in-repo readers are
+# updated in the same change: `scripts/pr-repair-loop.sh` (maps 6 to its own `deferred` row),
+# `scripts/objective.py::pr_doctor_last_run` (`WAITING`, not RED) and
+# `scripts/heartbeat-loop.sh` (`PR-DOCTOR WAITING rc=6`).
 # A DECLARED partial ownership read (e.g. the branch map is unreadable under TCC). Empty on a
 # complete read; `main()` logs it so a weaker predicate is never mistaken for a full one.
 OWNERSHIP_NOTE = ""
@@ -1124,6 +1150,22 @@ CONFIRM_WINDOW_S = 1.0
 # Require the trailing newline, so a partial write is never a verdict.
 _RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
 GATE_REFUSALS = (75, 77, 74)
+# ⛔ THE GATE'S OWN BOUND, BY ITS OWN CODE (agent-infra#2291). `spawn-gate.sh` refuses on ONE measured
+# bound per spawn and names it in the code it writes, so the axis is READ (`dispatch()` carries it out)
+# rather than re-derived here from load/disk thresholds -- a second set of thresholds in this file would
+# be a second instrument, and the two would eventually disagree about the same box (this file's own
+# rule: exactly one authority per fact). The three literals are `spawn-gate.sh`'s exits, and
+# `test_the_capacity_seams_are_the_gates_own_numbers` extracts them from that script so a renumbered
+# gate reddens the suite instead of silently losing the axis.
+GATE_REFUSAL_BOUND = {75: "load", 77: "disk", 74: "land-backlog"}
+# What to DO about each bound. The axis decides the operator's next action, and `spawn-gate.sh`
+# documents each remedy beside its own refusal line: load clears by itself; a full disk never does;
+# the land-backlog gate opens when the open-PR backlog is landed.
+GATE_REFUSAL_ACTION = {
+    "load": "wait -- a load refusal clears by itself as the box drains (or add capacity)",
+    "disk": "reclaim disk (prune caches/scratch) -- waiting does NOT clear this",
+    "land-backlog": "land the open-PR backlog -- creation is held, the drain is not",
+}
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
 # gate refused, nothing consumed" from "a `pi` exited 75 for its own reason" -- the ambiguity
@@ -3542,8 +3584,8 @@ def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
     return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S), "prfix"]
 
 
-def _confirm(name: str) -> tuple[str, str]:
-    """('launched' | 'refused' | 'unconfirmed', detail) for a just-spawned worker -- BOUNDED.
+def _confirm(name: str) -> tuple[str, str, str]:
+    """('launched' | 'refused' | 'unconfirmed', detail, bound) for a just-spawned worker -- BOUNDED.
 
     Two steps, in order of authority:
 
@@ -3554,6 +3596,10 @@ def _confirm(name: str) -> tuple[str, str]:
          is still caught, a live pid is positive proof of a launch, and `lost` means the worker
          vanished without a verdict -- neither a launch nor a refusal, and never a row.
 
+    `bound` is the GATE's own axis (`load` | `disk` | `land-backlog`) for a gate refusal, and ""
+    for every other verdict. It is returned rather than re-derived downstream: the code that
+    recognised the refusal is the only one that knows the code it recognised (agent-infra#2291).
+
     A partial `.rc` is never a verdict (see `_RC_RE`): `7` may be the first byte of `75\n`.
     """
     rc_file = bg_path(name, "rc")
@@ -3562,22 +3608,22 @@ def _confirm(name: str) -> tuple[str, str]:
         code = read_rc(rc_file)
         if code is not None:
             if gate_refused(name, code):
-                return "refused", "gate REFUSED rc=%d" % code
-            return "launched", "worker exited rc=%d" % code
+                return "refused", "gate REFUSED rc=%d" % code, GATE_REFUSAL_BOUND.get(code, "")
+            return "launched", "worker exited rc=%d" % code, ""
         time.sleep(0.05)
     st = worker_status(name)
     code = read_rc(rc_file)
     if gate_refused(name, code):
-        return "refused", "gate REFUSED rc=%d" % code
+        return "refused", "gate REFUSED rc=%d" % code, GATE_REFUSAL_BOUND.get(code, "")
     if st == "running":
-        return "launched", "launched, running"
+        return "launched", "launched, running", ""
     if code is not None:
-        return "launched", "worker exited rc=%d" % code
+        return "launched", "worker exited rc=%d" % code, ""
     if st in ("done", "failed"):
-        return "launched", "worker exited (%s)" % st
+        return "launched", "worker exited (%s)" % st, ""
     if st == "lost":
-        return "unconfirmed", "the worker recorded no exit status and no live pid"
-    return "unconfirmed", "`--status` could not be read (the harness is missing or broken)"
+        return "unconfirmed", "the worker recorded no exit status and no live pid", ""
+    return "unconfirmed", "`--status` could not be read (the harness is missing or broken)", ""
 
 
 def set_rubric_note(entries: list[str]) -> str:
@@ -3721,9 +3767,85 @@ def set_tag_collisions(entries: list[str]) -> str:
             "in its own pass, or rename one of them (agent-infra#2281 removes this mode).")
 
 
+# The fleet's ONE measured primitives (`scripts/orchestrator-harness/capacity.sh`, agent-infra#2253):
+# `probe` returns `host ncpu load1 lpc lanes disk_free_mb mem_free_mb at procs procs_max fork src` for
+# the box it runs on. `pr-doctor` CONSULTS it -- it does not measure load/disk/memory itself, and it
+# does not carry a second copy of the thresholds. A second measurement with its own numbers is how two
+# readers of one box start disagreeing, and `capacity.sh`'s header already states the order the bounds
+# are read in (FORK -> DISK -> LOAD) and why.
+CAPACITY_SH = os.path.join(ORCH_DIR, "capacity.sh")
+CAPACITY_PROBE_TIMEOUT_S = 30
+
+
+def _kv(record: str, key: str) -> str:
+    """One `key=value` field out of a capacity record ("" when absent -- never a zero)."""
+    for field in (record or "").split():
+        if field.startswith(key + "="):
+            return field[len(key) + 1:]
+    return ""
+
+
+def box_room() -> dict:
+    """The box's own measured state, from the fleet's ONE measurement -- or an explicit UNREADABLE.
+
+    ⛔ THIS IS REPORTING, NEVER A GATE (agent-infra#2291). The decision to refuse was already taken by
+    `spawn-gate.sh`, on ITS measurements, at the moment of the spawn; re-deciding it here would be a
+    second instrument with a second answer. What was missing was the EVIDENCE: an operator told "no
+    worker accepted" could not see `load 45.2 on 8 cpu`, so "wait" and "repair" looked the same.
+
+    ⛔ AND AN UNREADABLE PROBE IS NOT AN EMPTY ONE. `{"read": False}` is returned with the reason, and
+    the verdict says `room=UNREADABLE (<why>)` -- `capacity.sh` exits 254 when the read could not FORK,
+    2 when a core field could not be measured, and a missing file exits 127. None of those is "the box
+    is fine"; the refusal still stands on the gate's own code, and the citation says what is missing.
+    """
+    try:
+        out, err, rc = sh_err(["bash", CAPACITY_SH, "probe", REPO_DIR or STATE_DIR],
+                              timeout=CAPACITY_PROBE_TIMEOUT_S, cwd=HOME)
+    except Exception as e:                     # a probe may never raise out of a verdict
+        return {"read": False, "why": "%s: %s" % (type(e).__name__, str(e)[:120]),
+                "record": "", "cited": "UNREADABLE"}
+    record = (out or "").strip()
+    if rc != 0 or not record:
+        why = (err or "").strip().splitlines()
+        if not os.path.exists(CAPACITY_SH):
+            # ⛔ THE MISSING INSTRUMENT IS NAMED AS SUCH, not as bash's "No such file or directory":
+            # the operator's repair is "install `$O/capacity.sh`", and an `$O` that predates it is
+            # the NORMAL case on a cell whose pin has not advanced (#2278).
+            why = ("%s is not installed at $O -- the box cannot be measured; reinstall the harness "
+                   "(`install.sh`) to get the fleet's probe" % CAPACITY_SH)
+        elif why:
+            why = why[0][:160]
+        elif rc == 254:
+            why = "the probe could not FORK (rc=254): this box cannot spawn right now"
+        else:
+            why = "the probe exited rc=%s and printed no record" % rc
+        return {"read": False, "why": why, "record": "", "cited": "UNREADABLE"}
+    # The citation is the record's own fields, in the record's own order: whatever a peer box would
+    # read from the same line. `lpc` is load-per-CPU x100 (integer, so bash 3.2 can compare it).
+    lpc = _kv(record, "lpc")
+    ncpu = _kv(record, "ncpu")
+    load1 = _kv(record, "load1")
+    cited = "%s load %s/%s cpu (lpc %s) disk_free=%sMB mem_free=%sMB fork=%s procs=%s/%s" % (
+        _kv(record, "host"), ("%.2f" % (int(load1) / 100.0)) if load1.isdigit() else "?",
+        ncpu or "?", ("%.2f" % (int(lpc) / 100.0)) if lpc.isdigit() else "?",
+        _kv(record, "disk_free_mb") or "?", _kv(record, "mem_free_mb") or "?",
+        _kv(record, "fork") or "?", _kv(record, "procs") or "?",
+        _kv(record, "procs_max") or "?")
+    return {"read": True, "why": "", "record": record, "cited": cited}
+
+
 def dispatch(pr: dict, action: str, text: str, dry: bool,
-             rubric_note: str = "") -> tuple[bool, str, bool]:
-    """Spawn a background worker for one PR. Returns (launched, detail, record).
+             rubric_note: str = "") -> tuple[bool, str, bool, str]:
+    """Spawn a background worker for one PR. Returns (launched, detail, record, bound).
+
+    ⛔ `bound` IS THE FOURTH FACT AND IT IS WHY THIS FILE CAN TELL TWO REFUSALS APART (#2291). It
+    is the GATE's own axis (`load` | `disk` | `land-backlog`) when the SPAWN GATE refused -- nothing
+    was consumed, the box simply has no room, and the order clears by itself -- and "" for every
+    other cause, which is the transport: a missing/stale dispatcher, a worktree that would destroy
+    work, an unconfirmed spawn, an unreadable liveness. Those two need OPPOSITE responses (wait vs
+    repair), so they may not leave here looking identical. `record` cannot carry it: a gate refusal
+    and a transient worktree failure are both `record=False`, which is exactly the collapse
+    `_finish` used to inherit.
 
     ⛔ THIS IS THE ONLY DISPATCH PATH. The lane-table path (`idle_lanes()` + a cmux send to a
     workspace) is GONE, not merely unused: a replacement that is added but not switched on is
@@ -3761,7 +3883,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # same thing a real pass would do.
     note = rubric_note or contract_note(REPO)
     if note:
-        return False, note, False
+        return False, note, False, ""
     if dry:
         # ⛔ A DRY RUN THAT SKIPS THE WORKTREE LIES ABOUT THE ONE STEP THAT BLOCKS. It used to
         # return here, so it reported "would spawn" precisely when the worktree was what would
@@ -3769,16 +3891,16 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         wt, werr = materialise_worktree(pr, dry=True)
         if not wt:
             log("DRY-RUN %s would NOT spawn: %s" % (name, werr[:160]))
-            return False, werr, False
+            return False, werr, False, ""
         live = worker_live_for(n)
         if live is not False:
             log("DRY-RUN %s would NOT spawn: %s"
                 % (name, "worker still running" if live else "worker liveness unreadable"))
             return (False, "worker %s is %s -- one worker per PR"
-                    % (name, "still running" if live else "of unknown liveness"), False)
+                    % (name, "still running" if live else "of unknown liveness"), False, "")
         log("DRY-RUN would spawn %s in %s for %s (%d bytes)"
             % (name, wt, pr["headRefName"], len(text)))
-        return True, "dry-run", False
+        return True, "dry-run", False, ""
     # ⛔ ONE WORKER PER PR, EVEN ACROSS A HEAD CHANGE. main()'s cooldown is keyed on the head, so a
     # worker that PUSHES re-arms dispatch while it is still running -- and the worker name and its
     # worktree are both deterministic, so the second spawn lands ON TOP of the live one in the same
@@ -3791,22 +3913,25 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # are named in the refusal because either one may be the one that answered (`worker_names_for`).
     live = worker_live_for(n)
     if live:
-        return False, ("worker %s is still running -- one worker per PR"
-                       % " / ".join(worker_names_for(n))), False
+        # union of both sides: #2980's BOTH-names wording (the pre-#2725 `prd-<n>` may be the one
+        # that answered) and this branch's four-tuple arity (the fourth element is the GATE AXIS;
+        # a live worker is a transport cause, so it is empty here).
+        return (False, "worker %s is still running -- one worker per PR"
+                       % " / ".join(worker_names_for(n)), False, "")
     if live is None:
         # ⛔ UNANSWERABLE IS NOT "FREE". Spawning on an unreadable status would re-create the exact
         # defect this guard exists for -- two workers in one deterministic directory, the second
         # destroying the first's log/.rc/.pid. It clears by itself as soon as `--status` answers.
         return (False, "worker liveness could not be read (`%s --status` failed) -- refusing to "
                        "spawn blind: a live worker would be destroyed" % NONBLOCKING_DISPATCH,
-                False)
+                False, "")
     path = os.path.join(STATE_DIR, "pr-doctor-brief-%s.txt" % name)
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(path, "w") as f:
         f.write(text)
     wt, err = materialise_worktree(pr)
     if not wt:
-        return False, err, bool(getattr(err, "persistent", False))
+        return False, err, bool(getattr(err, "persistent", False)), ""
     # ⛔ THE GUARD IS CHECK-THEN-ACT, AND THE ACT IS MINUTES LATER. `materialise_worktree` can fetch
     # (300 s timeouts) and add a worktree; another pr-doctor invocation (a manual `--only`, which
     # the heartbeat lock does not cover) can pass the same guard inside that window. Re-asking here
@@ -3814,7 +3939,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     again = worker_live_for(n)            # BOTH names: the pre-#2725 `prd-<n>` too, if it is ours
     if again is not False:
         return (False, "worker %s appeared (or its liveness became unreadable) while the worktree "
-                       "was being prepared -- refusing to spawn a second one" % name, False)
+                       "was being prepared -- refusing to spawn a second one" % name, False, "")
     # cwd is HOME for the same TCC reason the old cmux path used it: a cwd under ~/Documents is
     # protected and a launchd-spawned caller has no Full Disk Access. The dispatcher takes absolute
     # paths and does its own `cd "$WT"` internally.
@@ -3836,19 +3961,24 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         detail = "rc=%s: %s" % (rc, (errout or "").strip()
                                 or "the dispatcher exited non-zero with no stderr")
         log("spawn %s -> %s: FAIL %s" % (name, wt, detail[:200]))
-        return False, detail, False
-    verdict, detail = _confirm(name)
+        return False, detail, False, ""
+    verdict, detail, bound = _confirm(name)
     if verdict == "refused":
-        log("spawn %s: %s -- no agent started, nothing consumed" % (name, detail))
-        return False, detail, False
+        # ⛔ THE BOX HAS NO ROOM, AND SAYS SO IN ITS OWN WORDS (#2291). `nothing consumed` was
+        # already here; what was missing is that this is NOT the same fact as a transport failure,
+        # so the order is counted on the no-room axis instead of `undeliverable`, and the log line
+        # carries the gate's own bound -- the value that made the decision.
+        log("spawn %s: %s -- no agent started, nothing consumed; the box has NO ROOM (bound=%s) "
+            "and it clears by itself" % (name, detail, bound or "unknown"))
+        return False, detail, False, bound
     if verdict == "unconfirmed":
         # Nothing durable says either way. NOT recorded, and that is safe BECAUSE liveness is
         # checked before every spawn: if the worker did start, the next pass sees it running.
         log("spawn %s -> %s: UNCONFIRMED (%s) -- no state row; liveness is re-checked next pass"
             % (name, wt, detail))
-        return False, detail, False
+        return False, detail, False, ""
     log("spawn %s -> %s: %s" % (name, wt, detail))
-    return True, detail, True
+    return True, detail, True, ""
 
 
 def load_state() -> dict:
@@ -4229,15 +4359,25 @@ def repo_row(slug: str, rc: int, p: dict) -> str:
     # 3 = "I read it, I placed the work, and NO WORKER TOOK IT". Re-collapsing them under one word
     # is what `_finish`'s exit-code split exists to prevent, and an operator scanning a per-repo
     # table would be sent after a broken read instead of a broken transport.
-    verdict = {0: "clean", 2: "REFUSING", 3: "UNPLACED", 4: "CRASH"}.get(rc, "RED")
+    # ⛔ 6 JOINS THE TABLE WITH ITS OWN WORD (#2291): "the box said not now" is not "the transport
+    # dropped it", and an operator scanning a per-repo table must not be sent to repair a box that
+    # only needs to drain. `WAITING` is the vocabulary `docs/ops/self-healing-contract.md` uses for a
+    # refusal that clears by itself; it is NOT a pass, so it never reads as `clean`.
+    verdict = {0: "clean", 2: "REFUSING", 3: "UNPLACED", 4: "CRASH",
+               6: "WAITING"}.get(rc, "RED")
     return ("repo=%-34s open_prs=%-5s unplaced=%-5s dispatched=%-5s verdict=%s rc=%s"
             % (slug, "?" if op is None else op, "?" if un is None else un,
                p.get("dispatched", "?"), verdict, rc))
 
 
 def _worst_rc(rcs: list[int]) -> int:
-    """The overall exit for a set of passes: crash > could-not-read > nobody-took-it > clean."""
-    for code in (4, 2, 3):
+    """The overall exit for a set of passes: crash > could-not-read > nobody-took-it > no-room > clean.
+
+    ⛔ 6 GOES LAST ON PURPOSE (#2291). A set where one repo's transport dropped an order and another
+    repo's box was merely full is a set with work to REPAIR, so the actionable code must win; 6 is the
+    weakest non-clean code in the table, and it is never allowed to mask a 2, 3 or 4.
+    """
+    for code in (4, 2, 3, 6):
         if code in rcs:
             return code
     return next((c for c in rcs if c), 0)
@@ -4824,14 +4964,17 @@ def run_pass(args, rubric_note: str = "") -> int:
     # closure's cell unbound and the pass died with `NameError: free variable 'delivered'` -- on
     # the empty-budget path, i.e. exactly the saturated-fleet pass this change is about.
     dispatched = 0
-    undeliverable = 0        # legible work whose order NO WORKER accepted (see `_finish`)
+    undeliverable = 0        # legible work the TRANSPORT refused or dropped (see `_finish`)
+    no_room = 0              # order(s) the BOX's own gate refused; nothing consumed (#2291)
+    no_room_bound = ""       # the gate's own axis behind the last of them (load|disk|land-backlog)
     delivered = []           # WHICH PRs actually went out -- the record must name them
     escalated = []           # rows refused >= REFUSAL_ESCALATE_AT times in a row (#2710)
     carried = 0              # of `undeliverable`: refused in an EARLIER pass, still in cooldown
     stalled = {"cooldown": 0, "budget": 0, "brief": 0}
     spent = {"fix": 0, "review": 0}
 
-    def _finish(dispatched: int = 0, undeliverable: int = 0, stalled: dict | None = None) -> int:
+    def _finish(dispatched: int = 0, undeliverable: int = 0, stalled: dict | None = None,
+                no_room: int = 0, no_room_bound: str = "") -> int:
         """The ONE exit: it prints `dispatched N of M queued — <why>`, records it, and returns rc.
 
         `0` IS RESERVED FOR READABLE, NOTHING TO DO (#1872 review rounds 4-5, 15).
@@ -4855,9 +4998,25 @@ def run_pass(args, rubric_note: str = "") -> int:
         word for "readable, nothing to do", printed while four PRs were stuck behind a refusal.
         Nothing was delivered in that pass, so it refuses; the row's own `ESCALATE` line names the
         worktree and its repair once the same row has refused `REFUSAL_ESCALATE_AT` times in a row.
-        The two causes still need different responses -- that distinction is #2291's (a measurement
-        of the box separates "no room" from "the transport refused"); what is decided HERE is that
-        neither of them may read as a clean pass.
+        Those causes still need different responses, and the two that a single code used to merge
+        are separated below: what is decided HERE is that neither of them may read as a clean pass.
+
+        ⛔ AND THE BOX SAYING NO IS A THIRD AXIS, WITH ITS OWN CODE (agent-infra#2291). A spawn
+        GATE refusal ("load 45.2/8 cpu", "only 400MB free", "creation held by the land backlog") means
+        the ORDER WAS NEVER OFFERED TO A WORKER: nothing was consumed, and it clears by itself. A
+        TRANSPORT failure means the order was offered and dropped by a broken chain. Both used to
+        increment `undeliverable` (both are `record=False` in `dispatch()`), so both printed
+        `N order(s) no worker accepted` and returned 3 -- reproduced on `main` through the real
+        `dispatch()` -> `_confirm()` -> `gate_refused()` chain, and it is the same shape the fleet
+        measured on 2026-10-27 (`EXIT rc=3 -- refused-recorded=4; 4 order(s) no worker accepted`,
+        four of them stale-worktree refusals: nothing to wait for, everything to repair).
+        `no_room` is therefore its own counter and `EXIT_NO_CAPACITY` (6) its own code, and the
+        verdict NAMES the gate's bound plus the box's measured state (`box_room()`), because "wait"
+        and "repair" are opposite responses and a code that serves both serves neither.
+
+        ORDER OF PRECEDENCE, stated so it cannot drift: blindness (2) > transport (3) > no-room (6).
+        A pass that hit a transport failure describes work that is NOT going to land without an
+        operator, so it keeps the actionable code, and the no-room count still appears on the line.
 
         ⛔ AND THE DENOMINATOR IS THE FIX (2026-10-18, owner-reported). `dispatched 0` is what this
         job printed on every pass for days while it was actually REFUSING at the lane read, and
@@ -4915,6 +5074,17 @@ def run_pass(args, rubric_note: str = "") -> int:
                 else:
                     log("REFUSING: %d order(s) no worker accepted and nothing was dispatched -- not"
                         " a clean pass" % (undeliv - carried))
+            elif no_room:
+                # ⛔ NOT `REFUSING`: nothing is broken. The box measured itself over the bound and
+                # the gate consumed nothing, so the honest word is NO-CAPACITY and the honest next
+                # action is the one the bound implies (#2291, and the vocabulary `pr-repair-loop.sh`
+                # already uses for its own `EXIT_DEFERRED=6`).
+                log("NO-CAPACITY: %d order(s) refused by the spawn gate (bound=%s) and nothing was "
+                    "dispatched -- the box has no room, so this is not a failure and not a clean "
+                    "pass either. Next: %s"
+                    % (no_room, no_room_bound or "unknown",
+                       GATE_REFUSAL_ACTION.get(no_room_bound)
+                       or "wait for the box to drain, then re-run"))
         # WHY nothing (or something) went out. Named in the line itself, so the log answers the
         # question an operator actually asks -- never a bare number.
         parts = []
@@ -4955,6 +5125,11 @@ def run_pass(args, rubric_note: str = "") -> int:
             if carried:
                 parts.append("%d PR(s) still undeliverable -- refused in an earlier pass, waiting"
                              " out a refusal cooldown" % carried)
+        if no_room:
+            # Stated even when the verdict is 3 (a mixed pass): the operator is told how much of the
+            # shortfall is "the box said not now", which is the half nobody has to repair.
+            parts.append("%d order(s) REFUSED by the box's own gate (bound=%s)"
+                         % (no_room, no_room_bound or "unknown"))
         if unread:
             parts.append("%d PR(s) with UNREADABLE checks" % unread)
         # ⛔ THE ESCALATION IS ON THE VERDICT LINE, NOT ONLY IN THE LOG (#2710). A row refused N
@@ -4993,7 +5168,33 @@ def run_pass(args, rubric_note: str = "") -> int:
             code = EXIT_REFUSING
         elif not dispatched and undeliv:
             code = EXIT_UNDELIVERED
-        return record_exit(code, why, queued=queued, dispatched=dispatched, prs=delivered,
+        elif not dispatched and no_room:
+            code = EXIT_NO_CAPACITY
+        # ⛔ THE MEASUREMENT IS TAKEN AT DECISION TIME, AND ONLY WHEN IT IS THE EVIDENCE (#2291).
+        # The gate already decided; this is what the verdict CITES, so it is read once here, after
+        # the decision, from the fleet's one measurement (`capacity.sh probe`). Nothing about the
+        # code above depends on it -- a box that cannot be measured still reports 6, because the
+        # refusal it stands on was the GATE's measurement, not this one.
+        room = box_room() if code == EXIT_NO_CAPACITY else None
+        if room is not None:
+            log("box: room=%s (%s)"
+                % (room["cited"], "measured" if room["read"] else room["why"]))
+        verdict = {EXIT_CLEAN: "OK", EXIT_REFUSING: "REFUSING",
+                   EXIT_UNDELIVERED: "UNDELIVERED", EXIT_NO_CAPACITY: "NO-CAPACITY",
+                   EXIT_CRASH: "CRASH"}.get(code, "UNKNOWN")
+        next_action = {
+            EXIT_CLEAN: "",
+            EXIT_REFUSING: "repair the read/delivery named in `reason` -- nothing was dispatched",
+            EXIT_UNDELIVERED: "repair the transport named in `reason` (the install, the worktree, "
+                              "or the worker liveness read) -- waiting will not clear it",
+            EXIT_NO_CAPACITY: GATE_REFUSAL_ACTION.get(no_room_bound)
+                              or "wait for the box to drain, then re-run",
+        }.get(code, "read `reason`")
+        return record_exit(code, why, verdict=verdict, next_action=next_action,
+                           no_room=no_room, no_room_bound=no_room_bound,
+                           room=((room or {}).get("record") or ""),
+                           room_read=(room or {}).get("read"),
+                           queued=queued, dispatched=dispatched, prs=delivered,
                            open_prs=queue_n,
                            dry_run=bool(args.dry_run),
                            issue_work=issue_work,
@@ -5135,7 +5336,7 @@ def run_pass(args, rubric_note: str = "") -> int:
             stalled["brief"] += 1
             undeliverable += 1
             continue
-        ok, detail, record = dispatch(p, action, text, args.dry_run, rubric_note)
+        ok, detail, record, bound = dispatch(p, action, text, args.dry_run, rubric_note)
         if not ok:
             if record and not args.dry_run:
                 # RECORDED ANYWAY: a refusal that does not clear by waiting (uncommitted work in
@@ -5180,6 +5381,14 @@ def run_pass(args, rubric_note: str = "") -> int:
                 log("#%s (%s): REFUSED and RECORDED -- this will not clear by waiting, so the row "
                     "holds a %d-min cooldown (refusal %d of %d before escalation); fix the cause: %s"
                     % (key, action, COOLDOWN_S // 60, n_ref, REFUSAL_ESCALATE_AT, detail[:160]))
+            elif bound:
+                # ⛔ THE BOX SAID NO -- nothing was consumed, so nothing is broken (#2291). Counted
+                # apart from `undeliverable`; `bound` is the gate's own axis, carried out of
+                # `dispatch()` by the code that recognised the refusal.
+                no_room += 1
+                no_room_bound = bound
+                log("#%s (%s): the box has no room (bound=%s) -- the gate consumed nothing: %s"
+                    % (key, action, bound, GATE_REFUSAL_ACTION.get(bound, "wait, then re-run")))
             else:
                 log("#%s (%s): not dispatched -- retried on the next pass: %s"
                     % (key, action, detail[:160]))
@@ -5196,7 +5405,7 @@ def run_pass(args, rubric_note: str = "") -> int:
         save_state(st)
     # A partial blindness that DID dispatch stays a clean pass, because then the readable half was
     # WORKED; zero dispatches rides the same helper as the two early exits above.
-    return _finish(dispatched, undeliverable, stalled)
+    return _finish(dispatched, undeliverable, stalled, no_room, no_room_bound)
 
 
 if __name__ == "__main__":
