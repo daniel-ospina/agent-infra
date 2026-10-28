@@ -355,9 +355,10 @@ REAP_LOG="$WORK/reap.log"
 # unreadable script could discard any checkout.
 # ⛔ REAP_WT_MIN_AGE_MINUTES=0 IS PART OF THE FIXTURE, NOT A CONVENIENCE (#2721, found while
 # landing #2708). These trees are created SECONDS before the pass, so under rule 7 — the 45-minute
-# hard floor, applied ON TOP of the two age knobs above — every one of them is `too-young` and
-# NOTHING is removable. Measured on a clean box: `reasons=too-young:2,live-cwd:1` and both §3
-# removal arms red — i.e. this section could never PASS anywhere, so the live-cwd gate it exists to
+# hard floor, applied ON TOP of the two age knobs above — the REMOVABLE ones are `too-young` and
+# nothing is deleted (the live holder's own row is `live-cwd`, which is exactly why the preserve arm
+# passed while the removal arms failed). Measured on a clean box:
+# `reasons=too-young:2,main-checkout:1,live-cwd:1` and both §3 removal arms red — i.e. this section could never PASS anywhere, so the live-cwd gate it exists to
 # pin had no working test at all while the suite reported covering it. The floor is not what §3 is
 # about (it is pinned by `scripts/pi-reap-worktrees.test.sh` R7); the same override, with the same
 # rationale, is what that suite uses in its own A7 fixture.

@@ -6526,7 +6526,10 @@ def _four_refused_rows(monkeypatch, logs, refusals, orch_dir):
     monkeypatch.setattr(pr, "save_state", lambda st: None)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     # ⛔ THE SHIPPED CAPS, DELIBERATELY. Every other pass test raises MAX_FIX/MAX_REVIEW, which is
-    # exactly why one row hid this: at the defaults, three refused rows exhaust the fix budget.
+    # exactly why one row hid this: at the defaults, three refused rows USED TO exhaust the fix budget
+    # (`pass_budgets()` charged them, because a row that never spawned has no pid file). #2710 voids a
+    # refused row's slot, so the caps stay here as the configuration that cannot be talked round by
+    # capacity: the accounting must refuse whether or not there is room.
     for v in ("MAX_FIX", "MAX_REVIEW", "MAX_TOTAL"):
         monkeypatch.delenv(v, raising=False)
 
@@ -6781,7 +6784,8 @@ def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, 
     monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(_wt), ""))
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
-    monkeypatch.setattr(pr, "log", lambda m: None)
+    logged = []
+    monkeypatch.setattr(pr, "log", logged.append)
     monkeypatch.setenv("O", str(d))
     ok_d, detail, record = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
     assert (ok_d, record) == (False, False), (ok_d, detail, record)
@@ -6789,3 +6793,20 @@ def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, 
     assert str(d / "brief-gate.sh") in detail, (
         "the refusal did not name WHICH brief-gate.sh judged the brief, so an operator is sent to "
         "the copy they just fixed rather than the copy that refused: %r" % (detail,))
+
+    # ⛔ AND IT MUST SURVIVE THE CUT THE OPERATOR ACTUALLY READS (#2708 review, P2 — reproduced).
+    # Naming the copy in a string no reader renders is the same defect one layer down. `pr-doctor`
+    # logs SLICES of this stderr -- `detail[:200]` on the FAIL line (`scripts/pr-doctor.py:3768`) and
+    # `detail[:160]` on the pass line (`:5090`, the rc=80 path, which writes no state row) -- and the
+    # gate's own teaching block is ~3.3 KB. Measured BEFORE the reorder that follows from this arm:
+    # the path sat at byte ~3290 of a ~3655-byte capture, so `in detail[:160]` was **False** and the
+    # operator still could not tell which copy refused. The dispatcher therefore emits the naming
+    # line FIRST and re-emits the block after it; this assertion grades the rendered line, not the
+    # buffer it was cut from.
+    # The SMALLEST slice either line applies is 160 chars (`detail[:160]` on the pass line), so that
+    # is the bound this asserts -- asserted on `detail` rather than on a logged line because a log
+    # line carries a prefix whose length depends on the worktree path, i.e. on the box.
+    assert str(d / "brief-gate.sh") in detail[:160], (
+        "the copy that judged the brief is outside the 160-char slice pr-doctor renders, so the "
+        "operator is still sent to the copy they just fixed. detail[:200]=%r" % (detail[:200],))
+    assert logged, "the refusal produced no log line at all"
