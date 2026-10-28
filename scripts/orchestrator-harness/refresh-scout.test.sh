@@ -3611,7 +3611,10 @@ rf "$D" check
 [ "$RC" -eq 1 ] && ok "--check: commits ahead of origin/main are REFUSED (rc=1) with no network call" \
                 || bad "--check: rc=$RC (want 1) — $OUT"
 case "$OUT" in
-  *"commits that are NOT in origin/main"*) ok "--check: the refusal names the commits the move would orphan" ;;
+  # #2953: same arm, new wording — the `--check` FAIL names the commits the move would orphan and says
+  # the verdict was PROVEN on the checkout's own graph (so an operator can tell it from the WARN, which
+  # is the shallow/unprovable case).
+  *"commit(s) that origin/main does not have"*) ok "--check: the refusal names the commits the move would orphan" ;;
   *) bad "--check: no commits-ahead reason — $OUT" ;;
 esac
 # ⛔ THE PREFIX IS A CONTRACT WITH TWO CONSUMERS (review cycle 8, P2): `cloud-cell-supervisor.sh` and
@@ -3682,7 +3685,10 @@ rf "$D" refresh TOOL_LOG="$D/tool.log"
 [ "$RC" -eq 1 ] && ok "scout-ahead: rc=1 TRANSIENT (the operator saves or drops the commit, then re-runs)" \
                 || bad "scout-ahead: rc=$RC (want 1) — output: $OUT"
 case "$OUT" in
-  *"commit(s) not in origin/main"*) ok "scout-ahead: the refusal names the commits the move would orphan" ;;
+  # #2953: the wording now says WHICH difference it is — `LOCAL commit(s)` (preserve) vs `commit(s) the
+  # REMOTE-TRACKING REF HAS NOT FETCHED` (fetch). The arm's intent is unchanged: the refusal must NAME
+  # the commits the move would orphan, and for a genuine local commit that is the LOCAL spelling.
+  *"LOCAL commit(s) that origin/main does not have"*) ok "scout-ahead: the refusal names the commits the move would orphan" ;;
   *) bad "scout-ahead: no commits-ahead reason — output: $OUT" ;;
 esac
 [ "$(git -C "$D/repo"/.worktrees/dispatch-scout rev-parse HEAD 2>/dev/null)" = "$ahead" ] \
