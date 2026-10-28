@@ -329,6 +329,64 @@ export O="${O:-$HOME/orchestrator}"
 # needed, but never omit this one silently.
 export PATH="/Users/danielospina/bin:/Applications/cmux.app/Contents/Resources/bin:/Users/danielospina/.pi/agent/bin:/Users/danielospina/.pi/agent/shims:/Users/danielospina/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export CMUX_QUIET=1     # the deprecation notice otherwise PREFIXES --json output
+
+# ⛔ REPO EVIDENCE FOR THE DETACHED PASS, PINNED HERE BECAUSE THIS LOOP *IS* THE LAUNCHER (agent-infra#2280).
+# The PR-DOCTOR step below launches `pr-doctor.py` with NO ARGUMENTS (deliberately — that pin is
+# what stops an argument turning the pass into a no-op, see test_dispatch_wiring.py), so the child's
+# only repo evidence is what it inherits from HERE. It inherits nothing: this block pins HOME, O and
+# PATH and nothing else, and launchd gives the job no PATH at all — measured. And pr-doctor no longer
+# has a module-level default repo: it resolves its target from evidence (`--repo` > `OR` > `REPO`'s
+# git origin > cwd's origin) and REFUSES (exit 2) when none answers. Unpinned, the beat's only
+# dispatch entry point would therefore refuse on every pass — the same "armed but dispatching
+# nothing, for ever" failure the #2280 change fixed in the launchd template, one launcher over.
+#
+# The box's own declared target is the orchestrator plist `install.sh` renders (`OR` = slug,
+# `REPO` = the checkout whose `origin` proves it). It is EVIDENCE, not a default: it is the
+# per-box declaration the controller itself runs on, it is read only when the variable is unset
+# (an operator pin, or a supervisor-launched cell that already exported OR/REPO, still wins), and
+# when the plist is absent or names nothing this function prints nothing — the pass then refuses
+# LOUDLY, naming every source it looked at, instead of grading a repo nobody named.
+_beat_repo_evidence() {
+  local plist="$1/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+  [ -f "$plist" ] || return 0
+  # ONE PHYSICAL LINE on purpose (beyond the usual reason): the wiring tests walk this file's
+  # executable lines as SHELL, and a python line artfully shaped like `for k in (...)` reads to
+  # that walker as an unclosed shell `for` — which moved the launch's enclosing constructs and
+  # reddened three unrelated reachability pins. `|| return 0` covers an unreadable/corrupt plist.
+  /usr/bin/python3 -c 'import plistlib,sys;e=(plistlib.load(open(sys.argv[1],"rb")).get("EnvironmentVariables") or {});print("\n".join(["%s=%s"%(k,(e.get(k) or "").strip()) for k in ("OR","REPO") if (e.get(k) or "").strip()]))' "$plist" 2>/dev/null || return 0
+}
+
+# The wiring the child depends on, split from the reader so each is testable on its own.
+#
+# ⛔ THE PLIST IS ONE DECLARATION, SO IT IS FILLED AS ONE (review cycle 4, P2). Filling OR and REPO
+# INDEPENDENTLY completed a half-pin from the box's declaration: an operator who re-pointed the
+# drain with `OR=other/repo` still received the plist's `REPO` — a checkout of a DIFFERENT repo — and
+# `resolve_repo()` then refused with "the launcher named two different repos" on every pass, for
+# ever, while the operator believed their pin had taken effect. That is the "armed but dispatching
+# nothing" failure this whole block exists to prevent, one input shape over. So:
+#   * nothing set        -> take both halves from the plist (it is one record of one repo);
+#   * OR set, REPO unset -> take the plist's REPO only when the plist agrees on the SLUG (a
+#                          re-point to another repo must not inherit a foreign checkout); with no
+#                          agreement the pass grades that repo's queue read-only, which is the
+#                          documented behaviour of an `OR`-only pin;
+#   * REPO set, OR unset -> leave OR alone: rank 3 reads that checkout's own `origin` and PROVES
+#                          the slug, which is strictly better evidence than an invented OR.
+_beat_pin_repo_evidence() {
+  local _ev _pl_or _pl_repo
+  if [ -n "${OR:-}" ] && [ -n "${REPO:-}" ]; then return 0; fi
+  _ev="$(_beat_repo_evidence "$HOME" 2>/dev/null || true)"
+  [ -n "$_ev" ] || return 0
+  _pl_or="$(printf '%s\n' "$_ev" | sed -n 's/^OR=//p' | head -1)"
+  _pl_repo="$(printf '%s\n' "$_ev" | sed -n 's/^REPO=//p' | head -1)"
+  if [ -z "${OR:-}" ] && [ -z "${REPO:-}" ]; then
+    if [ -n "$_pl_or" ]; then export OR="$_pl_or"; fi
+    if [ -n "$_pl_repo" ]; then export REPO="$_pl_repo"; fi
+  elif [ -z "${REPO:-}" ] && [ -n "$_pl_or" ] && [ "$_pl_or" = "${OR:-}" ]; then
+    # the operator pinned the SAME repo the box declares -- its checkout is still that repo's.
+    if [ -n "$_pl_repo" ]; then export REPO="$_pl_repo"; fi
+  fi
+}
+_beat_pin_repo_evidence
 cd "$HOME" || exit 0
 
 echo $$ > "$PIDFILE"
