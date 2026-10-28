@@ -45,6 +45,25 @@ ck() { # <label> <rc>
 mkdir -p "$TMP/bin"
 printf '#!/bin/sh\ncase "$1 $2" in "auth token") echo ghp_fixture; exit 0 ;; esac\nexit 0\n' > "$TMP/bin/gh"
 chmod +x "$TMP/bin/gh"
+# ⛔ A tmux that EXPRESSES the states the gate asks about, so the caller/server arms are deterministic.
+# Whether a real box happens to have a running server is history, not a property of the gate, and the
+# caller arm's verdict DEPENDS on it (a server's environment shadows the caller's).
+#   TMUX_SERVER_EXISTS=1     a server answers (a zero-session one does too)
+#   TMUX_SERVER_EXISTS=0     no server at all (the default)
+#   TMUX_SERVER_PROVIDER=1   that server carries the model credential in its global environment
+printf '%s\n' '#!/bin/sh
+case "${1:-}" in
+  show-environment)
+    [ "${TMUX_SERVER_EXISTS:-0}" = "1" ] || { echo "no server running on /tmp/tmux-501/default"; exit 1; }
+    if [ -z "${3:-}" ]; then echo "PATH=/usr/bin:/bin"; exit 0; fi
+    case "${3:-}" in GH_TOKEN|GITHUB_TOKEN) echo "unknown variable: ${3}"; exit 1 ;; esac
+    if [ "${TMUX_SERVER_PROVIDER:-0}" = "1" ] && [ "${3:-}" = "${TMUX_SERVER_PROVIDER_NAME:-DEEPSEEK_API_KEY}" ]; then
+      echo "${3}=sk_from_server"; exit 0
+    fi
+    echo "unknown variable: ${3}"; exit 1 ;;
+esac
+exit 0' > "$TMP/bin/tmux"
+chmod +x "$TMP/bin/tmux"
 
 mkhome() { # <home> [<provider-json>]
   local h="$1" body="${2:-}"
@@ -67,6 +86,9 @@ O="$4"; WT_DIR="$O/state"; mkdir -p "$WT_DIR"
 wt_gh_hosts_token() { return 0; }
 unset DEEPSEEK_API_KEY
 if [ "${WITH_KEY:-0}" = "1" ]; then export DEEPSEEK_API_KEY=sk_caller_value; fi
+# `WITH_KEY=shell` — the SAME value as a plain SHELL VARIABLE, not in the environment. A tmux client
+# never carries it, so crediting it is the measured "0 key occurrences in the worker env" defect.
+if [ "${WITH_KEY:-0}" = "shell" ]; then DEEPSEEK_API_KEY=sk_caller_plain; fi
 if out="$(wt_launcher_env "$HOME_" 2>"$O/err.txt")"; then
   printf 'RC=0\n'; printf 'PFX<<%s>>\n' "$out"
 else
@@ -103,7 +125,7 @@ h="$TMP/h-absent";    mkhome "$h" ABSENT;                    polar_ck absent "$h
 h="$TMP/h-noprov";    mkhome "$h" '{"providers":{"zai":{"apiKey":"$ZAI_API_KEY"}}}'; polar_ck noprov "$h"; ck "the lane provider is absent from models.json => nothing to check, no refusal" $?
 h="$TMP/h-literal";   mkhome "$h" '{"providers":{"deepseek":{"apiKey":"sk_literal"}}}'; polar_ck literal "$h"; ck "a LITERAL apiKey needs no environment variable => no refusal" $?
 h="$TMP/h-garbage";   mkdir -p "$h/.pi/agent"; printf 'not json at all\n' > "$h/.pi/agent/models.json"; polar_ck garbage "$h"; ck "an UNPARSEABLE models.json is not proof of absence => no refusal (our blindness must not stop the fleet)" $?
-h="$TMP/h-unread";    mkhome "$h"; chmod 000 "$h/.pi/agent/models.json"; polar_ck unread "$h"; chmod 644 "$h/.pi/agent/models.json"; ck "an UNREADABLE models.json is not proof of absence => no refusal" $?
+h="$TMP/h-unread";    mkhome "$h"; rm -f "$h/.pi/agent/models.json"; mkdir -p "$h/.pi/agent/models.json"; polar_ck unread "$h"; ck "an UNREADABLE models.json is not proof of absence => no refusal" $?
 
 # ── 3. DELIVERY: the box-local key file is sourced and the value LANDS in the worker ───────────
 # Driven for real: the emitted prefix is EXECUTED and `env` is read back. A grep of the prefix would
@@ -131,14 +153,45 @@ ck "…and the refusal names the VARIABLE that is missing (not the reviewer, not
 printf '%s' "$err" | grep -q 'pi-keys.env' && printf '%s' "$err" | grep -q 'keys.env' && rc=0 || rc=1
 ck "…and every file it looked in, so the operator is sent to a real path" $rc
 
-# ── 5. POLARITY, the other direction: a caller that ALREADY carries it is not second-guessed ────
+# ── 5. THE CALLER'S OWN VALUE: credited only when it can REACH the pane, and then PROVEN there ──
+# ⛔ THIS ARM USED TO CERTIFY THE DEFECT (P2 review finding, 2026-10-27). It ended on `no pi-keys.env
+# source is emitted` — true before AND after the fix, because this fixture has no such file, so nothing
+# it asserted could redden for the broken caller arm. Measured on the pre-fix head: an exported caller
+# var gave 0 key occurrences in the worker env.
+# The delivery on this arm is INHERITANCE, not a source line, so it is measured where it can be observed:
+# the emitted prefix is EXECUTED with and without the value in the environment (as arm 3 does for the
+# file arm). A pane that does not hold the key must REFUSE rather than start a lane that cannot
+# authenticate; a pane that holds it must keep it and proceed.
 h="$TMP/h-caller"; mkhome "$h"
-out="$(WITH_KEY=1 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-caller" 2>&1)"
+out="$(WITH_KEY=1 TMUX_SERVER_EXISTS=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-caller" 2>&1)"
 printf '%s\n' "$out" | grep -q '^RC=0$' && rc=0 || { rc=1; echo "      $out"; }
-ck "the caller's own exported value is a credential => no refusal and no extra source needed" $rc
+ck "an EXPORTED caller value, on a spawn that creates the server, is a credential => no refusal" $rc
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 printf '%s' "$pfx" | grep -q 'pi-keys.env' && rc=1 || rc=0
 ck "…and no pi-keys.env source is emitted for a box that has no such file" $rc
+rcs="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-caller" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; echo $?)"
+[ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      the prefix let a worker start with NO model credential (rc=$rcs)"; }
+ck "…and that prefix REFUSES (98) when the pane does NOT hold the value — the blank-key lane cannot start" $rc
+envout="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-caller" DEEPSEEK_API_KEY=sk_caller_value "$BASH" -c "$pfx; printf 'V=[%s]' \"\${DEEPSEEK_API_KEY:-}\"" 2>&1)"
+case "$envout" in *"V=[sk_caller_value]") rc=0 ;; *) rc=1; echo "      $envout" ;; esac
+ck "…and WITH the value in the pane it proceeds and keeps it (the delivery LANDS, nothing clobbers it)" $rc
+# ⛔ AND THE SECOND CONDITION — the NORMAL case on a steady-state box. `tmux new-session` inherits the
+# caller's environment only when it CREATES the server; against a running one the pane gets that
+# server's. Crediting the caller there is the measured 0-occurrence defect, so it must fall through and,
+# with no file either, REFUSE.
+h="$TMP/h-caller-plain"; mkhome "$h"
+out="$(WITH_KEY=shell TMUX_SERVER_EXISTS=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-caller-plain" 2>&1)"
+printf '%s\n' "$out" | grep -q '^RC=1$' && rc=0 || { rc=1; echo "      $out"; }
+ck "the SAME value as a plain (non-exported) shell variable is NOT a credential => refused, not spawned blank" $rc
+h="$TMP/h-caller-srv"; mkhome "$h"
+out="$(WITH_KEY=1 TMUX_SERVER_EXISTS=1 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-caller-srv" 2>&1)"
+printf '%s\n' "$out" | grep -q '^RC=1$' && rc=0 || { rc=1; echo "      $out"; }
+ck "…and it is NOT a credential against an ALREADY-RUNNING server either (that pane inherits the SERVER's env)" $rc
+# ── 5b. …while a box whose SERVER carries the key is a working shape, not a refusal ───────────
+h="$TMP/h-srvkey"; mkhome "$h"
+out="$(WITH_KEY=0 TMUX_SERVER_EXISTS=1 TMUX_SERVER_PROVIDER=1 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-srvkey" 2>&1)"
+printf '%s\n' "$out" | grep -q '^RC=0$' && rc=0 || { rc=1; echo "      $out"; }
+ck "a tmux SERVER whose own environment carries the key => no refusal (the pane inherits it)" $rc
 
 # ── 6. MUTATION: remove the apiKey-ref detection and arm 4 MUST redden ──────────────────────────
 # The mutation is the defect in its original form: the gate holds the datum (models.json names the
