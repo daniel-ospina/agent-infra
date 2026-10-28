@@ -295,12 +295,21 @@ def derive_rows(workspaces: list[dict]) -> tuple[list[tuple[str, str, str]], lis
     for ws in workspaces:
         wsid = ws.get("id") or ws.get("workspaceId") or ws.get("uuid")
         cwd = ws.get("current_directory") or ws.get("currentDirectory") or ws.get("cwd")
-        title = ws.get("custom_title") or ws.get("customTitle") or ws.get("title") or ""
+        title = (ws.get("custom_title") or ws.get("customTitle") or ws.get("title")
+                 or ws.get("name") or "")
         if not isinstance(wsid, str) or not wsid.strip():
             excluded.append(f"{title or '?'}: no workspace id in the answer")
             continue
         if not isinstance(cwd, str) or not cwd.strip():
-            excluded.append(f"{title or wsid[:8]}: no cwd in the answer (identity unreadable)")
+            # ⛔ A WORKSPACE WITH NO CWD IS NOT ROSTERED, and the reason is PROVENANCE, not
+            # tidiness: a row is an attribution, and the reader attributes a lane from its cwd /
+            # branch / session text. Measured on cell 3 (2026-10-28): `cmux list-workspaces --json`
+            # there answers `{"id":…, "name":"wt-lane-7", "session_id":…}` and nothing else — the
+            # lane's identity would rest on a NAME, which #8177 refuses in code. Its lanes are
+            # still enumerated for the board by the process store; only the roster declines to
+            # claim them.
+            excluded.append(
+                f"{title or wsid[:8]}: no cwd in the answer (unplaceable, so unattributable)")
             continue
         if not is_fleet_worktree(cwd):
             excluded.append(f"{title or wsid[:8]} ({cwd}): not a fleet worktree")
