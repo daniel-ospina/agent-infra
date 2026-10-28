@@ -2154,6 +2154,32 @@ case "$R5Q" in
 case "$R5Q" in *"identity=unprovable"*) ok "…and the record still discloses WHY it cannot be proven" ;;
   *) bad "the pending record does not disclose the unprovable identity: $R5Q" ;; esac
 
+# ⛔ S6: A MOVE OUT OF A CLAIM IS NOT A RESTART — EVEN WHEN THE PROCESS REALLY IS ON THE PIN NOW. S5 leaves
+# exactly this shape behind: an `unprovable` cycle writes `request=pending … running_from=stamp:<C1>`, so
+# the FIRST readable cycle afterwards sees an outstanding ask whose recorded identity was a CLAIM. If that
+# cycle then reports `honoured`, the record certifies a restart nobody observed — the identity SOURCE moved
+# (stamp -> controller), which is not the process moving. This is the case that made the bound NON-INERT:
+# the guard was first written `[ "$x" != stamp:* ]`, which is always TRUE (`[`/test does no pattern
+# matching — only `[[ ]]` and `case` do), so it read as protection while permitting precisely this.
+_CASE=$((_CASE+1)); echo "=== S6: a pending ask recorded against a STAMP claim is cleared, never certified honoured ==="
+D="$T/s6"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
+TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C1" > "$D/O/.agent-infra-stamp.json"
+printf 'restart request=pending requested_at=1700000000 requested_by=harness-refresh.sh@%s running=%s running_from=stamp:%s pin=%s pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=unknown checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  "$(short "$C1")" "$(short "$C1")" "$(short "$C1")" "$(short "$C2")" > "$D/O/state/restart-request"
+CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R6="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+stop_ctrl "$CTRL"
+R6Q="$(cat "$D/O/state/restart-request" 2>/dev/null)"
+case "$R6" in *"relation=current"*) ok "the box is current with the controller on the pinned tree, so the bait is live (the mock restart really did happen)" ;;
+              *) bad "the box was not current, so this case proves nothing about the claim bound: $R6" ;; esac
+case "$R6Q" in
+  "restart request=honoured"*) bad "a move OUT OF A STAMP CLAIM was certified 'honoured' — an identity-source change recorded as a restart that happened: $R6Q" ;;
+  "restart request=cleared"*) ok "…a pending ask recorded against a CLAIM is CLEARED (the process was not observed to move), never honoured" ;;
+  *) bad "unexpected record after a claim-sourced prior: $R6Q" ;; esac
+case "$R6Q" in *"reason=no-longer-pending"*) ok "…and the reason names the premise going away, not a move" ;;
+  *) bad "the cleared record does not say why it was cleared: $R6Q" ;; esac
+
 _CASE=$((_CASE+1)); echo "=== B6: the spawn-line token carries WHICH pending state (and stays bare for every other relation) ==="
 D="$T/b6"; mkdir -p "$D/O/state" "$D/O/logs"
 cat > "$D/O/harness-refresh.sh" <<'SH'

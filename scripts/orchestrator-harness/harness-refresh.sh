@@ -922,7 +922,7 @@ req_field() { # <name> -> value from the last request record (empty when the rec
   sed -n "s/.*[[:space:]]$1=\([^[:space:]]*\).*/\1/p" "$REQ" 2>/dev/null | awk 'NF{print; exit}'
 }
 restart_request_record() { # <relation>  (reads PENDING/GATE_CODE/GATE_WHY/RUN_SHORT/TIP/LANES_DISC)
-  local rel="$1" now prev_req prev_at prev_run prev_by prev_act prev_block prev_from act line
+  local rel="$1" now prev_req prev_at prev_run prev_by prev_act prev_block prev_from act line claim
   local was at waited after
   now="$(date +%s)"
   [ -n "$REQ" ] || return 0
@@ -930,6 +930,16 @@ restart_request_record() { # <relation>  (reads PENDING/GATE_CODE/GATE_WHY/RUN_S
   prev_run="$(req_field running)";  prev_by="$(req_field requested_by)"
   prev_act="$(req_field actuation)"; prev_block="$(req_field blocked)"
   prev_from="$(req_field running_from)"
+  # ⛔ `[` DOES NOT PATTERN-MATCH, SO `[ "$x" != stamp:* ]` IS ALWAYS TRUE. The first version of the
+  # claim-bound below was written exactly that way, which made it an INERT ENFORCER: `stamp:abc` and the
+  # literal `stamp:*` are simply different strings to `test`, so the clause passed every time and the
+  # bound refused NOTHING while reading as protection. Only `[[ ]]` and `case` glob; this file's static
+  # reader treats `|` as a pipeline (#2175), so this is two `case` arms and not one alternation.
+  # `claim=1` means at least one END of the comparison is a CLAIM (a stamp `apply` wrote), so a difference
+  # between the two ends is NOT evidence that the PROCESS moved — witnessed by S6.
+  claim=0
+  case "${prev_from:-}" in stamp:*) claim=1 ;; esac
+  case "${RUNNING_FROM:-}" in stamp:*) claim=1 ;; esac
   case "${prev_at:-}" in ''|*[!0-9]*) prev_at="" ;; esac
   # `after=` only ever claims a real interval: an unparseable/absent stamp yields `after=unknown`, never 0.
   after=unknown; [ -n "$prev_at" ] && after=$(( now - prev_at ))s
@@ -944,7 +954,7 @@ restart_request_record() { # <relation>  (reads PENDING/GATE_CODE/GATE_WHY/RUN_S
       was="${prev_run:-unknown}"; at="${prev_at:-$now}"
       line="restart request=cleared requested_at=$at cleared_at=$now after=$after requested_by=${prev_by:-unknown} was=$was now=${RUN_SHORT:-unknown} reason=no-live-controller"
     elif [ "$prev_req" = pending ] && [ -n "${prev_run:-}" ] && [ "$prev_run" != "${RUN_SHORT:-unknown}" ] \
-         && [ "${prev_from:-}" != stamp:* ] && [ "${RUNNING_FROM:-}" != stamp:* ]; then
+         && [ "$claim" = 0 ]; then
       # ⛔ ONLY AN OUTSTANDING REQUEST (`pending`) MAY BE HONOURED, AND NEVER A MOVE OUT OF A CLAIM. A
       # `cleared`/`refused` record's `running=` is a STAMP value; comparing it to a later
       # controller-derived `RUN_SHORT` fired `honoured` on an identity-SOURCE change with the controller
