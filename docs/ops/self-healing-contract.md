@@ -566,14 +566,22 @@ the caller sees a `RATE-LIMITED` verdict rather than an in-call sleep that outli
 issue→PR path, batch dispatch, and a rerun. **Repair is never queue-gated** — a red-check fixer, a
 review-findings fixer, a conflict fixer and the PR-sickness queue all act on a PR that already exists,
 so their bound is this box's lane slots and load gate instead. The basis is a decision plus a
-measurement, **not** a cost claim: a repair push *does* start a fresh run. On this repo it usually also
-supersedes that PR's own run — `.github/workflows/ci.yml` (`group: ci-${{ github.ref }}`) and
-`.github/workflows/harness-single-source.yml` both pin `cancel-in-progress: true` — so it adds no queue
-depth there. ⛔ But NOT everywhere: `.github/workflows/workflow-lock.yml` has **no** `concurrency:`
-block, deliberately (#2474 — a per-PR group cannot tell a head from its successor, and a cancelled
-guard leg reads non-red), so a repair push DOES stack a run on that one. Supersession is therefore a
-detail of two workflows, not the reason repair is ungated: what the measurement showed is that the
-number being gated on was the wrong quantity. Gating repair on the queue skipped **41 consecutive
+measurement, **not** a cost claim: a repair push *does* start a fresh run. On this repo many of them
+also supersede that PR's own earlier run — but **supersession is a property of the workflow, not of
+"a repair push"**: only a workflow that declares a `concurrency:` group cancels its predecessor, and
+a workflow with **no** `concurrency:` block stacks the new run. Enumerated by trigger at this commit,
+the four workflows that fire on a PR push are `.github/workflows/ci.yml` (`group:
+ci-${{ github.ref }}`, `cancel-in-progress: true`) and `.github/workflows/harness-single-source.yml`
+(same shape) — these **supersede** — and `.github/workflows/pipeline-compliance.yml` plus
+`.github/workflows/workflow-lock.yml`, both `pull_request*` with `[opened, synchronize, reopened,
+edited]` and **no** `concurrency:` block, deliberately (#2474: a per-PR group cannot tell a head from
+its successor, and a cancelled leg reads non-red — which on `pipeline-compliance` would leave the
+repo's ONLY required check green-with-no-verdict on the newest tree) — these **stack**. So a repair
+push DOES add a run on the required check, every time. **Name the property, not a list:** the previous
+revision of this passage named one stacking workflow and there are two, which is what a hand-kept
+list of filenames buys. Supersession is therefore a per-workflow detail, not the reason repair is
+ungated: what the measurement showed is that the number being gated on was the wrong quantity.
+Gating repair on the queue skipped **41 consecutive
 dispatches in one window** while 8 self-hosted
 runners and ~11 lane slots sat idle: the queue being read belonged to GitHub-HOSTED concurrency.
 The ceiling's `runners` term is the fleet's registered/online size, or the account's hosted allowance

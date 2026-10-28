@@ -145,15 +145,40 @@
 #       (i) the NUMBER was the wrong quantity — `queued=33 running=2` derived `ceiling=4` and read
 #           DEEP off demand-as-supply, so the gate was refusing repair on a reading of the box's own
 #           load rather than of the world's capacity; and
-#       (ii) on this repo MOST repair pushes SUPERSEDE rather than stack — `.github/workflows/ci.yml`
-#           (`group: ci-${{ github.ref }}`, `cancel-in-progress: true`, :12-14) and
-#           `.github/workflows/harness-single-source.yml` (same shape, :41-45) each supersede, so the
-#           run a push replaces leaves the queue with it.
-#           ⛔ ONE WORKFLOW IS THE EXCEPTION AND IT STACKS — `.github/workflows/workflow-lock.yml`
-#           fires on `pull_request_target: [synchronize]` with NO `concurrency:` block (deliberate,
-#           #2474: a per-PR group cannot tell a head from its successor, and a cancelled guard leg
-#           reads non-red), so a repair push DOES add a run there. That is why the exclusion does not
-#           rest on supersession — it rests on the decision plus (i).
+#       (ii) ON THIS REPO SOME REPAIR PUSHES SUPERSEDE — AND SUPERSESSION IS A PROPERTY OF THE
+#           WORKFLOW, NOT OF "A REPAIR PUSH". A `pull_request` / `pull_request_target` workflow
+#           supersedes its PR's earlier run only if it declares a `concurrency:` GROUP; a workflow
+#           with NO `concurrency:` block STACKS, and a repair push adds a run to it. ⛔ SO ENUMERATE
+#           BY TRIGGER + CONCURRENCY, NEVER BY MEMORY: the previous revision of this paragraph
+#           named ONE stacking workflow and there are TWO — a hand-maintained list of filenames is
+#           the defect that produced that round, which is why the PROPERTY above is the rule and
+#           the four names below are only its measurement at this commit. Every workflow in
+#           `.github/workflows/` that fires on a PR push:
+#             ci.yml                     `pull_request` (default opened/synchronize/reopened),
+#                                        `group: ci-${{ github.ref }}`, cancel-in-progress: true
+#                                                                             → SUPERSEDES
+#             harness-single-source.yml  `pull_request` (same defaults), `group:
+#                                        harness-single-source-${{ github.ref }}`, same flag
+#                                                                             → SUPERSEDES
+#             pipeline-compliance.yml    `pull_request` on main, types [opened, synchronize,
+#                                        reopened, edited], NO `concurrency:` block
+#                                                                             → STACKS (#2474)
+#             workflow-lock.yml          `pull_request_target`, the same four types, NO
+#                                        `concurrency:` block                    → STACKS (#2474)
+#           BOTH stacking files omit the block deliberately (#2474): a per-PR group cannot tell a
+#           head from its successor, and a cancelled leg reads NON-RED — which on
+#           `pipeline-compliance` means the repo's ONLY required check (#646) would read
+#           green-with-no-verdict on the newest tree, and on `workflow-lock` would satisfy the
+#           guard-generation wait while contributing no verdict. So the required check is one of the
+#           two that DOES stack, and a repair push costs a run there every time.
+#           NOT in the set, and why: `ci-main.yml` (`push: [main]`) and `enforce-skills.yml`
+#           (`schedule` + `push: [main]`) never fire on a PR push, and `admin-merge-detector.yml`
+#           fires on `workflow_run` of main's CI. The four reusable `workflow_call` files
+#           (`docs-ci`, `drift-check`, `node-ci`, `python-ci`) run as JOBS inside a caller's RUN,
+#           so they inherit the CALLER's concurrency group and add no run of their own.
+#           That is why the exclusion does not rest on supersession — it rests on the decision plus
+#           (i): the reading that skipped 41 deploys was wrong about the QUANTITY, not merely
+#           silent about one of the two stacking workflows.
 #     What does NOT change, and a fixer must still expect: the push voids that PR's head-bound review
 #     attestation (#2148), so the review chain re-runs.
 #     Gating repair on this number is what produced 41 skips while 11 lane slots and 8 runners sat
@@ -282,9 +307,24 @@ ciq_record_usable() {
 # record's own `fleet=` line IS the key; this re-attaches it. An EMPTY stored value (the honest value
 # for every branch that DID measure, and for every older record that has no `fleet=` line at all)
 # restores as empty, never as `fleet=`.
+# ⛔ THE RECORD OUTLIVES THE MODULE, SO THIS READ ACCEPTS BOTH SHAPES (#2928 review, P3). A record is
+# permanent text in a state dir shared with whatever else runs out of it, so a `fleet=fleet=…` line
+# written by the PRE-FIX writer can still be read HERE, after the writer changed — the mixed-version
+# direction (old record, new reader) that a reader CAN close from its own side. `${v#fleet=}` strips
+# a STORED key before this function attaches its own, so an old-format and a new-format record both
+# restore keyed exactly ONCE. It is a tolerance rather than a version field because the strip can
+# never eat a real payload: `CIQ_FLEET`'s only producer is branch (c), whose text always begins
+# `unreadable(`, so a value that itself starts `fleet=` can only be the doubled legacy form.
+# The OPPOSITE direction — an OLD reader meeting a NEW record — needs nothing here and cannot
+# mis-decide: that reader strips one `fleet=` and prints the disclosure WITHOUT its label
+# (`unreadable(…) fallback=…`); `fleet=` is a human-facing disclosure that no branch of `ciq_eval`
+# does arithmetic on, so the numbers, the ceiling and the verdict are byte-identical, only a label is
+# lost, and it returns by itself when the reader is upgraded. That is why the window is tolerable
+# rather than a version negotiation.
 ciq_fleet_restore() {
   local v
   v="$(printf '%s\n' "${1:-}" | sed -n 's/^fleet=//p' | head -1)"
+  v="${v#fleet=}"
   if [ -n "$v" ]; then printf 'fleet=%s\n' "$v"; fi
 }
 

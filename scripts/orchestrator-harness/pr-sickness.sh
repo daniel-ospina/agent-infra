@@ -27,11 +27,14 @@
 # under review. ⛔ A REPAIR PUSH IS NOT FREE — it DOES start a fresh CI run (`ci-queue.sh`'s header
 # records "its pass is already spent" as NOT TRUE, and that is why the exclusion does not rest on it).
 # The CI queue still says nothing about whether these dispatches may proceed: a spent QUEUE SLOT is
-# not a reason to withhold repair from a PR that already has a head to repair — and gating on it was
-# MEASURED to cost throughput directly: 2026-10-27 on cell 4,
-# `queued=33 running=2 runners=~2 => ceiling=4` deferred 41 consecutive PR-repair dispatches (all of
-# them this file's own `skip #<n>: backpressure(q=…,r=…)`) while 11 lane slots and an 8-runner
-# self-hosted fleet sat idle.
+# not a reason to withhold repair from a PR that already has a head to repair. ⛔ AND THE REASON IS
+# NOT "a queue slot costs nothing" — that is the COST CLAIM `ci-queue.sh`'s header records as
+# refutable. `ci-queue.sh` states the basis as a DECISION PLUS A MEASUREMENT, and what the measurement
+# showed is that the NUMBER was the wrong quantity, not that repair is cheap: 2026-10-27 on cell 4,
+# `queued=33 running=2 runners=~2 => ceiling=4` derived its ceiling off demand-as-supply — a reading
+# of THIS BOX's own load presented as the world's capacity — and deferred 41 consecutive PR-repair
+# dispatches (all of them this file's own `skip #<n>: backpressure(q=…,r=…)`) while 11 lane slots and
+# an 8-runner self-hosted fleet sat idle.
 # The queue it was reading belonged to GitHub-HOSTED concurrency and to the ISSUE→PR path.
 # So this file sources no CI-queue module and reads no queue depth. Its real bounds, all of which stay:
 #   * LANE SLOTS — the caller's `--max-spawn` allowance (orch-loop.sh passes the remaining fix-lane

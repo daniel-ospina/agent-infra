@@ -432,6 +432,21 @@ ck "(c6e) a record with NO fleet= line (an older record) still serves (rc=$rc)" 
    "$( [ "$rc" -eq 0 ]; echo $? )"
 has "$v" 'fleet='
 ck "(c6f) …and it INVENTS no disclosure (got: ${v})" "$( [ $? -ne 0 ]; echo $? )"
+# ⛔ A RECORD WRITTEN BY THE PRE-FIX WRITER CAN STILL BE ON DISK (#2928 review, P3). The record is
+# permanent text in a state dir shared with whatever else runs out of it, so the mixed-version
+# direction a reader CAN close from its own side — an OLD record read by THIS reader — must be
+# tolerated rather than stepped over: `ciq_fleet_restore` strips a stored `fleet=` before attaching
+# its own, so both shapes restore keyed exactly ONCE. (c6g') is the assertion that goes red if that
+# tolerance is dropped (the token would render `fleet=fleet=unreadable(…)` — the doubled form back).
+printf 'repo=%s\nqueued=4\nrunning=2\nrunners=~1\nbusy=\nfleet=fleet=unreadable(the actions/runners endpoint refused: HTTP 404) fallback=runners=~1\nat=%s\n' \
+  "$OR" "$(date +%s)" > "$REC"
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+v="$(ciq_eval)"
+ck "(c6g) a PRE-FIX record (doubled key on disk) still serves as a reading (rc=$rc)" \
+   "$( [ "$rc" -eq 0 ]; echo $? )"
+has "$v" 'fleet=unreadable('
+ck "(c6g') …and the key is restored exactly ONCE, not doubled (got: ${v})" \
+   "$( [ $? -eq 0 ] && ! grep -q -F -- 'fleet=fleet=' <<<"$v"; echo $? )"
 
 printf '\n── (c7) UNKNOWN defers (fail closed), and says which it was ───────────────\n'
 state
