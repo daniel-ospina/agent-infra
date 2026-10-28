@@ -54,6 +54,12 @@ bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi; }
 assert_ne() { if [ "$1" != "$2" ]; then ok "$3"; else bad "$3 (both: $1)"; fi; }
 assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+# ⛔ THE NEGATIVE OF assert_contains: "no directory was created" is a statement about ABSENCE that a
+#   positive assertion cannot make, and a case that only ever asserts presence passes just as happily
+#   against a launcher that creates the directory unconditionally and wrongly.
+assert_omits() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpectedly present: $2)"; else ok "$3"; fi; }
+# mode_of <path> — the permission bits, portably (GNU first; BSD on the macOS lane).
+mode_of() { if stat -c '%a' "$1" >/dev/null 2>&1; then stat -c '%a' "$1"; else stat -f '%Lp' "$1"; fi; }
 assert_absent() { if [ -e "$1" ]; then bad "$2 (exists: $1)"; else ok "$2"; fi; }
 assert_file() { if [ -f "$1" ]; then ok "$2"; else bad "$2 (absent: $1)"; fi; }
 count_lines() { local n; n="$(wc -l <"$1" 2>/dev/null)" || n=0; printf '%s' "$((n))"; }
@@ -247,6 +253,19 @@ cat >"$TEMPLATE/run.sh" <<'STUB'
 SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 cd "$DIR"
+# ⛔ GITHUB'S run.sh SOURCES `.env` — so this stub is the ONE place the real contract is observable:
+#   whatever `.env` names becomes the environment the listener and every job step run under. A stub
+#   that skipped it would pass while the SHIPPED launcher left a TMPDIR nobody created, because the
+#   only thing that consumes `TMPDIR=` is the file this stub was ignoring (agent-infra#2937).
+if [ -f .env ]; then . ./.env; fi
+# ⛔ AND IT RECORDS WHAT IT INHERITED, from INSIDE the listener, at the instant the real run.sh would
+#   hand that env to a job. `absent` here is precisely the state in which every job on the instance
+#   dies at `mktemp` while GitHub reports the runner `online` — so the ordering the fix claims
+#   (directory created BEFORE exec) is asserted, not merely the directory's existence afterwards.
+if [ -n "${FIXTURE_TMPDIR_LOG:-}" ]; then
+  if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR:-}" ]; then printf 'present %s\n' "$TMPDIR"
+  else printf 'absent %s\n' "${TMPDIR:-<unset>}"; fi >>"$FIXTURE_TMPDIR_LOG"
+fi
 exec "$DIR/bin/Runner.Listener" run
 STUB
 cat >"$TEMPLATE/bin/Runner.Listener" <<'STUB'
@@ -1107,6 +1126,132 @@ out="$(RUNNER_TOKEN=tok-fixture FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcil
 assert_eq "$?" "2" "reconcile refuses an inherited single-use RUNNER_TOKEN (rc 2)"
 assert_contains "$out" "why=runner-token-single-use" "naming the reason the ADD arm did not run"
 assert_eq "$(slots)" "0" "nothing was added"
+
+# ══ TMPDIR: the directory `.env` names is CREATED BY THE LAUNCHER (agent-infra#2937) ══════════
+# The measured failure: an instance's `.env` carried `TMPDIR=/tmp/ci-actions-runner-N`, the instance dir
+# is persistent and its unit enabled, and NOTHING creates that directory — so after a reboot the
+# listener survives and its TMPDIR does not. GitHub reports the runner `online`, the job is PICKED UP,
+# and it dies in its first seconds at `mktemp` (job 122457527181: exit 2). Because only jobs that use
+# `mktemp` fail, a host-wide fault presented as a flaky, PR-specific defect and cost a full
+# investigation of an unrelated PR.
+# These cases assert the ORDERING the fix claims — the directory exists BEFORE `run.sh` is exec'd — by
+# recording what the listener inherited from INSIDE the stub, which is the only place the real contract
+# (GitHub's `run.sh` sources `.env`) is observable. A case that only checked `[ -d ]` afterwards would
+# pass against a launcher that created the directory after the listener could already read it.
+echo "── tmpdir: a missing TMPDIR target is created before the listener starts ──"
+fresh_pool tmpdir; reset_logs
+register pi-runner-tmp
+TMPLOG="$T/tmpdir.log"; : >"$TMPLOG"
+printf 'LANG=en_US.UTF-8\nTMPDIR=%s/pi-runner-tmp/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-tmp/.env"
+assert_absent "$RUNNER_ROOT/pi-runner-tmp/tmp" "the TMPDIR the instance's .env names does not exist yet (the post-reboot state)"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-tmp)"
+assert_eq "$?" "0" "restart SUCCEEDS although the TMPDIR target was missing"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-tmp/tmp" \
+  "the launcher PRINTS the path it created (a gate that refuses without its reading is a wish)"
+if [ -d "$RUNNER_ROOT/pi-runner-tmp/tmp" ]; then ok "the directory now exists"; else bad "the directory was NOT created"; fi
+assert_eq "$(mode_of "$RUNNER_ROOT/pi-runner-tmp/tmp")" "700" "it is created 700 — a private per-runner temp dir"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-tmp") ))" "1" "the listener is running"
+# ⛔ THE ASSERTION THAT PINS THE ORDER, not just the outcome: the listener was exec'd WITH a usable TMPDIR.
+assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-tmp/tmp" \
+  "the listener inherited a TMPDIR that EXISTS at exec time (the creation precedes the start)"
+assert_eq "$(TMPDIR="$RUNNER_ROOT/pi-runner-tmp/tmp" mktemp -d >/dev/null 2>&1; printf '%s' "$?")" "0" \
+  "and the operation that failed in the incident (mktemp) now works"
+
+# ── (1) idempotence: an EXISTING directory is left exactly as it is ─────────────────────────
+# `mkdir -p` never chmods what already exists, so a hand-repaired box (the operative ones carry 755)
+# must not be silently tightened — and a second start must not re-report a creation that did not happen.
+echo "── tmpdir: an existing directory keeps its owner and mode ──"
+fresh_pool tmpkeep; reset_logs
+register pi-runner-keep
+mkdir -p "$RUNNER_ROOT/pi-runner-keep/tmp"; chmod 755 "$RUNNER_ROOT/pi-runner-keep/tmp"
+printf 'TMPDIR=%s/pi-runner-keep/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-keep/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-keep)"
+assert_eq "$?" "0" "restart succeeds when the TMPDIR already exists"
+assert_eq "$(mode_of "$RUNNER_ROOT/pi-runner-keep/tmp")" "755" "a pre-existing directory keeps its mode (no chmod)"
+assert_omits "$out" "created tmpdir=" "and it does NOT claim to have created anything"
+
+# ── (2) an instance whose .env names NO TMPDIR is untouched ────────────────────────────────
+echo "── tmpdir: an instance that names none ──"
+fresh_pool tmpnone; reset_logs
+register pi-runner-none
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-none)"
+assert_eq "$?" "0" "restart of an instance with no .env is unaffected"
+assert_omits "$out" "created tmpdir=" "no directory is invented"
+
+# ── (3) a RELATIVE value resolves against the INSTANCE dir ─────────────────────────────────
+# `run.sh` `cd`s to the instance dir before the listener reads TMPDIR, so a relative value means a
+# path UNDER that dir. Creating it anywhere else would make a directory the runner never uses.
+echo "── tmpdir: a relative value resolves under the instance dir ──"
+fresh_pool tmprel; reset_logs
+register pi-runner-rel
+printf 'TMPDIR=scratch-here\n' >"$RUNNER_ROOT/pi-runner-rel/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-rel)"
+assert_eq "$?" "0" "restart succeeds with a relative TMPDIR"
+if [ -d "$RUNNER_ROOT/pi-runner-rel/scratch-here" ]; then ok "it was created under the instance dir"; else bad "it was not created under the instance dir"; fi
+
+# ── (4) FAIL CLOSED: a target that CANNOT be created starts nothing ────────────────────────
+# ⛔ The failure being prevented IS "the listener starts anyway". Starting it here would reproduce the
+# incident deliberately: a healthy, online runner on which every job dies at mktemp. A refusal that
+# names the path is strictly better than a runner that silently cannot work.
+echo "── tmpdir: an uncreatable target refuses, starting nothing ──"
+fresh_pool tmpbad; reset_logs
+register pi-runner-bad
+: >"$RUNNER_ROOT/pi-runner-bad/blocker"   # a FILE where a parent directory must be (ENOTDIR, portable)
+printf 'TMPDIR=%s/pi-runner-bad/blocker/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-bad/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-bad)"
+assert_eq "$?" "2" "it is cannot-act (rc 2), never a start"
+assert_contains "$out" "cannot-act why=tmpdir-uncreatable" "naming the failure"
+assert_contains "$out" "path=$RUNNER_ROOT/pi-runner-bad/blocker/tmp" "and the path it could not create"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-bad")" "0" "NO listener was started for it"
+
+# ── (5) STATUS: a LIVE row with a missing TMPDIR is a defect that exits 3 ──────────────────
+# This is the presentation that does the damage: the row says `live`, GitHub says `online`, and the
+# instance cannot run a job. rc 0 over it is a false PASS a caller would act on.
+echo "── tmpdir: status reports it on a LIVE listener, and exits 3 ──"
+fresh_pool tmpstat; reset_logs
+register pi-runner-stat
+FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-stat >/dev/null
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-stat")" "1" "the instance has a live listener and no TMPDIR yet"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "0" "with no TMPDIR named, status is clean (control)"
+assert_omits "$out" "defect tmpdir-missing" "and reports no defect"
+printf 'TMPDIR=%s/pi-runner-stat/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-stat/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "3" "a LIVE row carrying a missing TMPDIR exits 3 (a defect, not a healthy report)"
+assert_contains "$out" "defect tmpdir-missing name=pi-runner-stat path=$RUNNER_ROOT/pi-runner-stat/tmp" \
+  "the defect names the instance and the path"
+assert_contains "$out" "restart --name pi-runner-stat" "and the action that clears it"
+assert_contains "$out" "tmpdir_defects=1" "the summary counts it, so a caller need not parse the table"
+mkdir -p "$RUNNER_ROOT/pi-runner-stat/tmp"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status --all)"
+assert_eq "$?" "0" "once the directory exists the report is clean again"
+assert_contains "$out" "tmpdir_defects=0" "and the count returns to zero"
+
+# ── MUTATION: removing the creation must break these cases ────────────────────────────────
+# ⛔ A CASE THAT PASSES AGAINST THE MUTANT PINS NOTHING. The copy below is the shipped script with the
+#   single `ensure_tmpdir` call deleted from `start_listener` — the fix's entire effect. If the
+#   launcher-creation cases above still passed against it, they would be asserting something else.
+echo "── tmpdir: mutation — without the mkdir the listener is left unsatisfiable ──"
+fresh_pool tmpmut; reset_logs
+MUTTMP="$T/mutant-tmpdir.sh"
+python3 - "$POOL" "$MUTTMP" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read()
+needle = '  ensure_tmpdir "$d" || return 2\n'
+assert text.count(needle) == 1, "the ensure_tmpdir call moved: update the mutation target"
+open(dst, "w", encoding="utf-8").write(text.replace(needle, ""))
+PY
+assert_file "$MUTTMP" "the mutation copy was produced"
+register pi-runner-mut-tmp
+MUTLOG="$T/mut-tmpdir.log"; : >"$MUTLOG"
+printf 'TMPDIR=%s/pi-runner-mut-tmp/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-mut-tmp/.env"
+mut_out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$MUTLOG" bash "$MUTTMP" restart --name pi-runner-mut-tmp 2>&1)"
+assert_omits "$mut_out" "created tmpdir=" "the MUTANT never creates the directory (so the cases above are live)"
+assert_absent "$RUNNER_ROOT/pi-runner-mut-tmp/tmp" "the mutant leaves the target missing — the exact post-reboot state"
+assert_contains "$(cat "$MUTLOG")" "absent $RUNNER_ROOT/pi-runner-mut-tmp/tmp" \
+  "and its listener comes up under a TMPDIR that does not exist — the state in which every job dies at mktemp"
+pkill -f "$RUNNER_ROOT/pi-runner-mut-tmp/bin/Runner.Listener" 2>/dev/null || true
 
 # ══ 10. MUTATION: removing the floor check must break the suite ═════════════════════════════
 # The floor is the owner-mandated predicate (#2344 comment 6347825624). A copy with the comparison

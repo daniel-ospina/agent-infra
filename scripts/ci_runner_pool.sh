@@ -51,6 +51,18 @@
 #   2): `ps` failing is the one input here whose absence would produce an ACTION (a double-started
 #   listener) rather than a refusal, so it fails closed like every other reading.
 #
+# ⛔ THE ENV A LISTENER INHERITS IS PART OF STARTING IT (agent-infra#2937). An instance's `.env` can
+#   name a TMPDIR (`TMPDIR=/tmp/ci-actions-runner-N` on the pi-runner VM, hand-written 2026-09-30), and
+#   NOTHING creates that directory: GitHub's `run.sh` sources `.env` and runs every job step under it,
+#   and the runner has no mkdir of its own. The instance dir is persistent and its unit is enabled, so
+#   after a reboot the LISTENER survives and its TMPDIR does not — `mktemp: failed to create file via
+#   template '/tmp/ci-actions-runner-2/tmp.XXXXXXXXXX'`, exit 2, on a runner GitHub reports `online`.
+#   That presentation is the damage: jobs that use `mktemp` fail identically and jobs that do not, pass,
+#   so a HOST-WIDE fault reads as a flaky, PR-specific one (measured: it cost a full investigation of
+#   an unrelated PR before the `mktemp` line was read). So `start_listener` now satisfies the env it is
+#   about to hand over (create it, idempotently, before exec) and `status` reports a missing target as
+#   a DEFECT rather than leaving the next job to discover it.
+#
 # ⛔ THE LABEL DESCRIBES THE RUNNER. `ci_runner_gate.sh` selects the pool by `self-hosted-arm64` /
 #   `self-hosted-x64`, and its invariant is "a runner's labels must describe that runner". A runner
 #   registered with no pool marker is invisible to that gate forever and matches no `runs-on:` job —
@@ -85,6 +97,9 @@
 #                                                  nothing. The cross-box view is capacity.sh / the
 #                                                  fleet inventory, which this script does not
 #                                                  duplicate.)
+#                                                 A row whose instance `.env` names a TMPDIR that does
+#                                                 NOT exist is reported as `defect tmpdir-missing` and
+#                                                 is NOT a healthy row — see agent-infra#2937 below.
 #   ci_runner_pool.sh add      --name <name> [--dry-run]
 #   ci_runner_pool.sh restart  --name <name> [--dry-run]
 #   ci_runner_pool.sh reconcile [--dry-run]        # the pass: restart dead listeners, add to ceiling
@@ -106,7 +121,8 @@
 #       nothing changed — `add`: a gate verdict (a floor/ceiling refusal); `restart`: that name has no
 #       registration under $RUNNER_ROOT, or its dir exists without a `.runner` (NOT a capacity verdict —
 #       the message names the state and the action that clears it); `status`: the report
-#       it produced contains a DEAD listener (see below) · 4 name not available (that name is taken;
+#       it produced contains a DEAD listener, or a `defect tmpdir-missing` row (see below) · 4 name not
+#       available (that name is taken;
 #       nothing changed, try another name) · 5 this name could not be REGISTERED (config.sh failed, or
 #       it left no `.runner`): a per-name failure, so the pass tries the next name rather than ending
 #       ⛔ 4 IS CHECKED BEFORE 3: a name that is already taken reports 4 even on a box that is also
@@ -117,6 +133,14 @@
 # the table. It exits 2 (never 0, never 3) when it could not measure — including a pool it can only
 # PARTLY see (a live listener outside `RUNNER_ROOT`, `why=pool-root-incomplete`), because the rows and
 # the slot count it prints would then describe part of the box as if it were all of it.
+#
+# ⛔ A `defect tmpdir-missing` ROW ALSO EXITS 3 (agent-infra#2937): a LIVE listener whose `.env` names
+# a TMPDIR that does not exist is reported `online` by GitHub, runs its unit happily, PICKS UP jobs,
+# and fails each one in its first seconds at `mktemp`. That is a report containing a runner nobody can
+# use, so rc 0 over it would be a false PASS. `start_listener` — the single path `add`, `restart` and
+# `reconcile` all start through — now creates the directory (`mkdir -p`, mode 700, owner = the
+# listener's own user) before it execs `run.sh`, so a reboot cannot leave the listener without it and
+# no systemd drop-in has to be remembered per instance.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -495,12 +519,79 @@ probe_listener() {
   return 0
 }
 
+# instance_tmpdir <dir> — the TMPDIR the instance's own `.env` names, as an ABSOLUTE path, or empty
+# when it names none. ⛔ NOTHING CREATES THAT DIRECTORY (agent-infra#2937). GitHub's `run.sh` sources
+# `.env` and runs every job step under that TMPDIR; the runner has no mkdir of its own, and this tool
+# neither wrote the `.env` nor ever looked at it. So an instance whose `.env` names a VOLATILE path
+# (`/tmp/ci-actions-runner-N`, hand-written on the pi-runner VM) keeps a HEALTHY listener across a
+# reboot while its TMPDIR is gone: the job is PICKED UP, starts, and dies in its first seconds at
+# `mktemp` — which reads as "this workflow is broken", not "this host is". Measured job 122457527181:
+# `mktemp: failed to create file via template '/tmp/ci-actions-runner-2/tmp.XXXXXXXXXX'`, exit 2, on a
+# box GitHub reported `online`.
+# A relative value resolves against the INSTANCE DIR, because `run.sh` `cd`s there before the listener
+# reads the variable — resolving it anywhere else would create a directory the runner never uses.
+instance_tmpdir() {
+  local d="$1" t
+  [ -f "$d/.env" ] || return 0
+  # LAST assignment wins, which is what a shell sourcing the file would do.
+  t="$(sed -n 's/^[[:space:]]*TMPDIR=//p' "$d/.env" 2>/dev/null | tail -n 1)"
+  t="${t%$'\r'}"   # a `.env` edited on a CRLF host would otherwise name a path with a CR in it
+  case "$t" in     # strip ONE layer of matching quotes; the value is a path, not a shell word
+    \"*\") t="${t#\"}"; t="${t%\"}" ;;
+    \'*\') t="${t#\'}"; t="${t%\'}" ;;
+  esac
+  [ -n "$t" ] || return 0
+  case "$t" in /*) : ;; *) t="$d/$t" ;; esac
+  printf '%s' "$t"
+}
+
+# ensure_tmpdir <dir> — create the TMPDIR the instance's `.env` names, IDEMPOTENTLY, before the
+# listener is exec'd. rc 0 = satisfiable (created, or already there) · 2 = cannot-act, nothing started.
+# ⛔ OWNER AND MODE. The directory is created BY THE USER THAT WILL RUN THE LISTENER, which is the only
+# owner that can be right here: `start_listener` execs `run.sh` as this same process's user, so a
+# `mkdir` needs no chown and cannot pick the wrong one. Mode 700 is what a private per-runner temp dir
+# should be, and `mkdir -p` does NOT touch the mode of a directory that already exists — so the
+# operative boxes (hand-repaired, carrying 755) are left exactly as they are, and only a directory
+# this tool creates is tightened.
+# ⛔ AND A CREATION THAT FAILED IS A REFUSAL, NOT A WARNING. Starting the listener anyway is the whole
+# defect: it comes up healthy and every job on it dies at `mktemp`. `mkdir`'s exit code alone is not
+# the verdict either (the `-p` arm can succeed while the target is still not a directory) — the test
+# is that the directory EXISTS and this user can write it, which is what `mktemp` will do next.
+ensure_tmpdir() {
+  local d="$1" t created=0
+  t="$(instance_tmpdir "$d")"
+  [ -n "$t" ] || return 0
+  if [ ! -d "$t" ]; then
+    mkdir -p -m 700 "$t" 2>/dev/null || true
+    [ -d "$t" ] || {
+      err "cannot-act why=tmpdir-uncreatable path=$t (named by $d/.env) — nothing started: the listener would come up healthy and every job on it would die at mktemp; check the parent directory's permissions and that no FILE sits on the path"
+      return 2
+    }
+    created=1
+  fi
+  [ -w "$t" ] || {
+    err "cannot-act why=tmpdir-unwritable path=$t (named by $d/.env) — nothing started: the listener would come up healthy and every job on it would die at mktemp"
+    return 2
+  }
+  # PRINT THE PATH, as the memory floor prints its reading: a creation nobody can see is one the
+  # operator cannot audit, and this is the line that distinguishes a repaired box from a lucky one.
+  [ "$created" = 1 ] && log_line "created tmpdir=$t (named by $d/.env; nothing else creates it)"
+  return 0
+}
+
 # start_listener <dir> — start run.sh from the instance dir, then PROVE a listener appeared.
 # A pid we just forked exists for one instant; a registration whose listener dies on connect (GitHub
 # refusing a duplicate, a revoked token) would otherwise be reported "restarted" every pass, forever.
 start_listener() {
   local d="$1" i=0 rc
   [ -x "$d/run.sh" ] || { err "cannot-act why=runner-not-installed path=$d/run.sh"; return 2; }
+  # ⛔ THE ENV THE LISTENER INHERITS MUST BE SATISFIABLE BEFORE IT IS EXEC'D (agent-infra#2937). This is
+  # the ONE place a listener is started — `add`, `restart` and `reconcile` all come through here — so
+  # the creation is at START TIME and survives a reboot with no systemd drop-in to remember. A
+  # `--dry-run` is deliberately NOT special-cased: creating a missing directory is not a refusal, and
+  # a preview that announces a start the real pass then refuses would be the lying preview this file
+  # already refuses elsewhere.
+  ensure_tmpdir "$d" || return 2
   ( cd "$d" && exec "$d/run.sh" ) >>"$d/listener.log" 2>&1 &
   while [ "$i" -lt $((SETTLE_S * 2)) ]; do
     rc=0; probe_listener "$d" || rc=$?
@@ -516,7 +607,7 @@ start_listener() {
 
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────
 cmd_status() {
-  local dead=0 live=0 d rc dirs outside
+  local dead=0 live=0 d rc dirs outside t tmpdir_defects=0
   # `--all` is ACCEPTED AND CHANGES NOTHING, DELIBERATELY: #2373 names a `status --all`, and the
   # default view already IS every runner on this box, so there is no narrower form for the flag to
   # widen. It is documented as such (USAGE) rather than left as a flag a reader assumes reveals more
@@ -548,19 +639,34 @@ cmd_status() {
       # verdict a caller acts on, and rc 3 would claim it measured something.
       *) return 2 ;;
     esac
+    # ⛔ A LIVE ROW UNDER A MISSING TMPDIR IS NOT A HEALTHY ROW (agent-infra#2937). This is the exact
+    # shape that cost a full investigation of an unrelated PR: GitHub says `online`, the unit says
+    # `active (running)`, the job is PICKED UP — and every job on the instance dies at `mktemp` in its
+    # first seconds, so the failure presents as "this workflow is broken". The tool holds the datum
+    # (`.env`) and now reads it, instead of leaving the next job to discover it.
+    # ⛔ MISSING ONLY, NOT UNWRITABLE: `status` may legitimately run as a different user from the one
+    # that owns the runner, so a `-w` test here would report a defect on a healthy box. The launcher
+    # runs as the listener's own user and DOES refuse an unwritable target.
+    t="$(instance_tmpdir "$d")"
+    if [ -n "$t" ] && [ ! -d "$t" ]; then
+      err "defect tmpdir-missing name=$(basename "$d") path=$t — the listener row above (and GitHub) report it healthy, and every job on it dies at mktemp; run: $SELF restart --name $(basename "$d")"
+      tmpdir_defects=$((tmpdir_defects + 1))
+    fi
   done <<<"$dirs"
   # ⛔ THE SUMMARY NAMES THE READING IT IS (#2381 review round 6, P1). The rows come from the PROCESS
   # TABLE, which only holds LIVE listeners: an instance dir outside RUNNER_ROOT whose listener is DEAD
   # is invisible here, and a bare `slots=N` over it read as "the box's pool" in exactly the incident
   # `restart` exists for (two runners GitHub showed OFFLINE). The caveat travels WITH the count.
-  printf 'summary live=%s dead=%s slots=%s ceiling=%s pool_read=process-table-live-only\n' "$live" "$dead" "$SLOTS" "$CEILING"
+  printf 'summary live=%s dead=%s slots=%s ceiling=%s pool_read=process-table-live-only tmpdir_defects=%s\n' "$live" "$dead" "$SLOTS" "$CEILING" "$tmpdir_defects"
   # After the measured rows, so the report is visible — but the count it publishes is NOT this box's
   # pool, so the rc must not claim a complete measurement.
   if [ -n "$outside" ]; then
     err "cannot-measure why=pool-root-incomplete root=$RUNNER_ROOT outside=$(join_lines "$outside") — a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT, so slots=$SLOTS counts a PARTIAL pool; set RUNNER_ROOT to the directory that CONTAINS every instance dir (one level above them) and re-read — ⚠️ this reading is the process table, so consolidating the parents is what makes it complete; an instance dir outside RUNNER_ROOT whose listener is DEAD is not enumerable at all"
     return 2
   fi
-  [ "$dead" -eq 0 ] || return 3
+  # ⛔ A MISSING TMPDIR IS A DEFECT THE CALLER MUST BE ABLE TO BRANCH ON, like a DEAD listener: rc 0
+  # over a row whose jobs cannot run is the false PASS this arm exists to refuse.
+  [ "$dead" -eq 0 ] && [ "$tmpdir_defects" -eq 0 ] || return 3
   return 0
 }
 
