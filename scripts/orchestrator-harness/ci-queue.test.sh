@@ -574,7 +574,10 @@ ck "(e2) orch-loop.sh reads the queue IN THIS SHELL (not a subshell), once per P
    "$( { [ "$(grep -cF 'ciq_read "${OR:-}"' "$LOOP")" -eq 2 ] \
         && [ "$(grep -cF 'ciq_read "${OR:-}" >/dev/null 2>&1 || true' "$LOOP")" -eq 1 ] \
         && [ "$(grep -cF 'CIQ_VER="$(ciq_eval)"; CIQ_RC=$?' "$LOOP")" -eq 2 ]; } ; echo $? )"
-grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
+# ⛔ THE SHIPPED FORM, NOT THE RENDERED VALUE (#2927): the gate VECTOR made every arm assign through
+# `${GATE_WHY:-…}` so a later arm cannot overwrite the first one that fired. The rendered `GATE_WHY`
+# is unchanged — `ci-queue($CIQ_VER)` — so this pin follows the assignment the module actually performs.
+grep -F -q 'GATE_WHY="${GATE_WHY:-ci-queue($CIQ_VER)}"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
 n="$(grep -cF 'if ciq_push_ok; then' "$LOOP")"
 # ⛔ THE THREE FIXER SPAWN ARMS NO LONGER CONSULT THE QUEUE AT ALL (#2927). They are REPAIR — they act
@@ -825,11 +828,19 @@ ck "(h5) an UNREADABLE queue DEFERS through the shipped predicate (rc=$rc) — f
 # driven in four states, the way (h0)/(h0b) drive the predicate and its reset.
 printf '\n── (h6) the ISSUE-path gate ARM, EXTRACTED and driven in both polarities ──────\n'
 ARM_RAW="$T/gatearm.raw"
-awk '/^  elif \[ "\$\{CIQ:-0}" = "1" \] && \[ "\$\{CIQ_RC:-1}" != "1" \]; then/{print; exit}' "$LOOP" > "$ARM_RAW"
+# ⛔ EXTRACTED BY ITS OWN BOUNDARIES, NOT BY AN `elif` LINE (#2927). The arm was one `elif … then`
+# before the gate VECTOR; it is a nested guard now (the outer `if` closes on its `else …; fi` line, so
+# a `/^  fi$/` range would still be right — but an `elif` anchor matches NOTHING and this rig then
+# graded an EMPTY file: (h6) and its three sisters went red while (h6a)/(h6d)/(h6f) passed vacuously
+# on nothing, which is the shape a polarity pin must never have. The range is now the arm's OWN
+# markers: this file's other `if [ "${CIQ:-0}" = "1" ]` is the READ, not the gate, so a bare pattern
+# anchor cannot tell the two apart.
+sed -n '/# \[ciq-arm:begin\]/,/# \[ciq-arm:end\]/p' "$LOOP" | sed '1d;$d' > "$ARM_RAW"
 ck "(h6) the ISSUE-path ci-queue arm was EXTRACTED from orch-loop.sh (not a restatement)" \
-   "$( { [ -s "$ARM_RAW" ] && grep -q 'CIQ_RC' "$ARM_RAW" && grep -qF 'ci-queue($CIQ_VER)' "$ARM_RAW"; } ; echo $? )"
-mkarm() { # <raw elif line> <out> — wrap the shipped line in a drivable if/elif chain
-  { printf 'GATE_WHY=""\nif false; then :\n'; sed 's/^ *elif /elif /' "$1"; printf 'fi\nprintf "%%s" "$GATE_WHY"\n'; } > "$2"
+   "$( { [ -s "$ARM_RAW" ] && grep -q 'CIQ_RC' "$ARM_RAW" && grep -qF 'ci-queue($CIQ_VER)' "$ARM_RAW" \
+        && grep -qF 'GATE_VEC=' "$ARM_RAW"; } ; echo $? )"
+mkarm() { # <raw arm block> <out> — run the shipped block with GATE_WHY pre-set empty
+  { printf 'GATE_WHY=""\nGATE_VEC=""\n'; cat "$1"; printf '\nprintf "%%s" "$GATE_WHY"\n'; } > "$2"
 }
 ARM="$T/gatearm.sh"; mkarm "$ARM_RAW" "$ARM"
 gaw() { # <arm-file> <CIQ> <CIQ_RC> -> GATE_WHY as the arm renders it

@@ -3294,6 +3294,137 @@ else
   echo "  ❌ could not extract the funnel-record block from refresh-candidates.sh (or it is not valid shell) — the writer's arithmetic is ungraded"; FAIL=$((FAIL+1))
 fi
 
+# ── THE GATE VECTOR: every arm that fired, with the winner UNCHANGED (#2924 indicator (a), #2927) ──
+# ⛔ THE MEASURED DEFECT THIS GRADES. `GATE_WHY` is one string assigned by an `elif` chain, so the
+# first arm that fires MASKS every arm behind it — and the first is `merge-priority`, which is set
+# whenever any workable un-owned PR exists. Measured 2026-10-27: 349/384 cycles named merge-priority
+# with 25 free lane slots, 88.5% of those gated cycles ALSO had a capacity gate that would have
+# refused, and 64 were refused while `ci-queue=ok`. An operator reading the line could not tell
+# "waiting for the PR sweep" (healthy) from "throttled by a gate" (the defect).
+# The block is EXTRACTED from the live controller, never mirrored, so a reformat or a replaced arm
+# fails here instead of silently ungrading the suite.
+echo
+echo "══ the gate vector: EVERY arm that fired, and the winner is exactly what the old chain chose"
+GV="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$ORCH" | sed '1d;$d')"
+if [ "$(printf '%s' "$GV" | grep -c .)" -lt 10 ]; then
+  echo "  ❌ could not extract the gate-vector block from $ORCH — the idle reason is ungraded"; FAIL=$((FAIL+1))
+else
+  gv() { # gv [VAR=value ...] -> "GATE_WHY<TAB>GATE_VEC"; sane defaults, then the caller's overrides
+    ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=0
+      FORK_STARVED=0; FORK_WHY=""; CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000
+      LANES_UNKNOWN=0; LANES=0; MAX_LANES=20; L=1; MAX_LOAD=12
+      CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none
+      CIQ=1; CIQ_RC=1; CIQ_VER="ok(queued=3 running=1 runners=20 ceiling=40)"
+      SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+      for _a in "$@"; do export "$_a"; done
+      eval "$GV"
+      printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-<EMPTY>}" )
+  }
+  _t="$(gv)"; _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  [ "$_why" = "<open>" ] && echo "  ok (v1) a box with no gate reports NO winner" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v1) a clean box reported a winner: $_why"; FAIL=$((FAIL+1)); }
+  # ⛔ EVERY ARM IS ON THE LINE, in evaluation order, on the IDLE case. Ten tokens is the arm count
+  # this block has; an arm DELETED from the vector while its predicate stays reddens here.
+  _missing=""
+  for _arm in 'merge-priority' 'fork=' 'fork_bound=' 'lanes=' 'load=' 'placement=' 'ci-queue=' 'slots=' 'swap=' 'mem='; do
+    case "$_vec" in *"$_arm"*) ;; *) _missing="$_missing $_arm" ;; esac
+  done
+  [ -z "$_missing" ] && echo "  ok (v2) every gate arm has its own verdict on the idle line" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v2) the vector does not name:$_missing"; FAIL=$((FAIL+1)); }
+  # ⛔ THE MEASURED CO-BINDING CASE (#2924 indicator (b)). merge-priority fires AND the queue is deep
+  # AND slots are free. The winner must STILL be merge-priority — the vector is additive, never a
+  # change of decision — while the queue arm is now VISIBLE beside it.
+  _t="$(gv GATE_WHY='merge-priority(2 un-owned PR(s))' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
+           CIQ_VER='deep(queued=44 running=5 runners=~3 ceiling=6)' LANES=3 MAX_LANES=20)"
+  _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  case "$_why" in
+    merge-priority*) echo "  ok (v3) the winner is UNCHANGED (merge-priority still decides the cycle)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v3) the vector changed the DECISION (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'merge-priority('*) echo "  ok (v4) …and merge-priority is in the vector" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v4) merge-priority is missing from the vector: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'ci-queue=REFUSE('*) echo "  ok (v5) …and the capacity gate it MASKED is now visible too (the 2026-10-27 shape)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v5) the mask is back — a co-binding ci-queue refusal is invisible: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'slots=17 free of 20'*) echo "  ok (v6) …and the free lane slots it was throttled WITH (17 of 20)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v6) the free-slot count is not on the line: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ FIRST-WINS IS THE OLD CHAIN'S SEMANTICS, and it is the half a naive rewrite breaks: with the
+  # load arm and the lanes arm both firing, the winner must be the EARLIER one (load), not the last.
+  _why="$(gv LANES=20 MAX_LANES=20 L=13 MAX_LOAD=12 | cut -f1)"
+  case "$_why" in
+    load=*) echo "  ok (v7) two arms firing ⇒ the EARLIER one wins, exactly as the elif chain did" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v7) the arm ORDER changed (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ THE DRIFT GUARD, and it is STRUCTURAL rather than prose: every arm that can ASSIGN `GATE_WHY`
+  # must also write its verdict to `GATE_VEC` in the SAME block, within three lines. A new arm added
+  # without its token reddens here — which is the only way this stays true as arms are added, and the
+  # exact defect that produced #2924 (a gate whose own report did not exist).
+  printf '%s\n' "$GV" > "$TMP/gv-block.sh"
+  if python3 - "$TMP/gv-block.sh" <<'ARMS'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+bad = []
+n = 0
+for i, ln in enumerate(lines):
+    if 'GATE_WHY="${GATE_WHY:-' in ln:
+        n += 1
+        window = " ".join(lines[i:i + 3])
+        if "GATE_VEC=" not in window:
+            bad.append(i + 1)
+print("ARMS=%d BAD=%s" % (n, ",".join(map(str, bad)) or "none"))
+sys.exit(1 if bad or n < 9 else 0)
+ARMS
+  then echo "  ok (v8) all $(grep -c 'GATE_WHY="\${GATE_WHY:-' <<<"$GV") GATE_WHY arms write a GATE_VEC verdict beside them" && PASS=$((PASS+1))
+  else echo "  ❌ (v8) an arm assigns GATE_WHY without a vector verdict — it can fire invisibly"; FAIL=$((FAIL+1)); fi
+  # ⛔ NO `elif AMONG THE VECTORED ARMS: a chain is how the mask comes back (#2924). The winner is
+  # chosen by `GATE_WHY="${GATE_WHY:-…}"`, which is order-preserving and chain-free.
+  if printf '%s' "$GV" | grep -qE '^[[:space:]]*elif '; then
+    echo "  ❌ (v9) an \`elif\` is back inside the vector block — the first arm masks the rest again"; FAIL=$((FAIL+1))
+  else echo "  ok (v9) the arms are independent guards, not a masking chain"; PASS=$((PASS+1)); fi
+  # ── the two mutants ────────────────────────────────────────────────────────────────────────────
+  mut_gv() { # <name> <old> <new> -> path to the mutant block
+    printf '%s\n' "$GV" > "$TMP/gv-$1.in"
+    python3 - "$TMP/gv-$1.in" "$TMP/gv-$1.sh" "$2" "$3" <<'MUT'
+import sys
+src = open(sys.argv[1]).read(); old, new = sys.argv[3], sys.argv[4]
+assert old in src, "mutation target not found: " + old
+open(sys.argv[2], "w").write(src.replace(old, new))
+MUT
+    printf '%s' "$TMP/gv-$1.sh"
+  }
+  # (m1) RESTORE THE OLD BEHAVIOUR: the vector is not built at all (as a chain that only names its
+  # winner). (v5) is the arm that must redden.
+  _m="$(mut_gv novec 'GATE_VEC="$GATE_VEC ' 'GATE_VEC_UNUSED="${GATE_VEC:-}' 2>/dev/null)"
+  if [ -n "$_m" ] && [ -f "$_m" ]; then
+    GV="$(cat "$_m")"
+    _vec="$(gv GATE_WHY='merge-priority(2 un-owned PR(s))' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
+               CIQ_VER='deep(queued=44 running=5 runners=~3 ceiling=6)' LANES=3 MAX_LANES=20 | cut -f2)"
+    case "$_vec" in
+      *'ci-queue=REFUSE('*) echo "  ❌ (m1) the no-vector mutant STILL reports the masked arm — (v5) is not load-bearing"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ok (m1) FAILS when the vector is removed: a co-binding capacity refusal goes invisible again"; PASS=$((PASS+1)) ;;
+    esac
+  else echo "  ❌ (m1) could not build the no-vector mutant"; FAIL=$((FAIL+1)); fi
+  # (m2) RESTORE THE CHAIN: EVERY arm assigns unconditionally — which is exactly what a chain does —
+  # so the LAST arm that fires wins instead of the first. (v7) is the arm that must redden.
+  printf '%s\n' "$GV" > "$TMP/gv-lastwins.sh"
+  if python3 - "$TMP/gv-lastwins.sh" <<'MUT2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+n = s.count('GATE_WHY="${GATE_WHY:-')
+assert n >= 9, "only %d arms to rewrite" % n
+open(p, 'w').write(s.replace('GATE_WHY="${GATE_WHY:-', 'GATE_WHY="'))
+MUT2
+  then
+    GV="$(cat "$TMP/gv-lastwins.sh")"
+    _why="$(gv LANES=20 MAX_LANES=20 L=13 MAX_LOAD=12 | cut -f1)"
+    case "$_why" in
+      load=*) echo "  ❌ (m2) the last-wins mutant still reports the EARLIER arm — (v7) does not test the order"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ok (m2) FAILS when an arm stops honouring first-wins (winner became '$_why')"; PASS=$((PASS+1)) ;;
+    esac
+  else echo "  ❌ (m2) could not build the last-wins mutant"; FAIL=$((FAIL+1)); fi
+  GV="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$ORCH" | sed '1d;$d')"
+fi
+
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

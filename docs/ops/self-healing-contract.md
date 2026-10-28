@@ -197,6 +197,26 @@ the writer's branch order is the authority.
 `dispatched=0` and a `gate:merge-priority` refusal. That is deliberate (a draining box *is* healthy)
 but it means **a reader that prints only the verdict is reading a cycling-ness test, not an effect
 test** — which is exactly the confusion this epic is about.
+⛔ **AND ONE NAMED GATE IS NOT A REASON (#2924, #2927).** The gate arms are evaluated in order and
+`GATE_WHY` keeps only the **first** that fired, so the first arm — `merge-priority`, set whenever any
+workable un-owned PR exists — MASKS every capacity gate behind it. Measured on the Mac controller over
+**385 instrumented cycles** (2026-10-24→27, of which **384** reached the gate): **349** of those 384
+closed the issue path naming `merge-priority` with **25 of 25 lane slots free**; **88.5%** of the
+gated cycles *also* had a capacity gate that would have refused, and **64** were refused while
+`ci-queue` itself read `ok`. So the `[dispatch]` line's `(<gate>)` field
+alone could not tell "waiting for the PR sweep" (healthy, and the sweep is what clears it) from
+"throttled by a gate nobody can see" (the defect). The line now carries an appended, additive
+**gate vector** — `| gates: merge-priority(<n> un-owned) fork=ok fork_bound=ok(…) lanes=<n>/<max>
+load=ok(<l>/<max>) placement=… ci-queue=<verdict> slots=<n> free of <max> swap=… mem=…` — one named
+verdict per arm, **in evaluation order, whether the arm won or not**, with the measured number it was
+decided on. The two lane tokens are mutually exclusive by construction: `slots=<n> free of <max>`
+when a slot remains, `lanes_full=<n>>=<max>(0 slots free)` when none does. It is produced by the arms themselves (each assigns `GATE_WHY` only if still unset — the
+old first-wins semantics, byte for byte — and appends its own verdict), so a new arm cannot be added
+invisibly; `test-gates.sh` grades the co-binding case, the first-wins order, and two mutants (vector
+removed ⇒ a masked capacity refusal goes invisible again; arms made unconditional ⇒ the order
+flips). ⛔ **Scope, stated rather than implied:** the CYCLE RECORD still carries the winning arm only
+(`nothing=gate:<first>`); the vector rides the log line, and moving it into the record is #2924's
+remaining half.
 **Do not read `$O/logs/controller.log`.** Measured today: mtime **10 h stale**, **0** `[cap]` lines,
 last line `date: write error: No space left on device` — while the controller was cycling and landing.
 
@@ -713,7 +733,7 @@ prove it was safe" — which it must say.
 not act as one rate-limited account.
 
 **ALIVE vs REFUSING vs IDLE.** `ci-queue.sh` produces the verdict; the **consumers** are `orch-loop.sh` — which
-turns it into the named gate line `GATE_WHY="ci-queue($CIQ_VER)"` for the ISSUE path and withholds the CI
+turns it into the named gate line `GATE_WHY="${GATE_WHY:-ci-queue($CIQ_VER)}"` for the ISSUE path and withholds the CI
 RERUN — and `dispatch-merge.sh`, which defers an issue→PR batch. `gh-limit` **records the limit and returns at once** (`NO_WAIT`), so
 the caller sees a `RATE-LIMITED` verdict rather than an in-call sleep that outlives it.
 
