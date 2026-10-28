@@ -97,8 +97,10 @@ esac
 # duplicate dispatch this file exists to prevent happens anyway. The arithmetic, from the shipped
 # defaults (orch-loop.sh's LANE_TIMEOUT is orch-loop.sh's own variable and is NOT readable here):
 #
-#   lane (LANE_TIMEOUT)            3300s   (~55 min — spawn-gate.sh's wall clock; raised from 2400
-#                                            when a lane took ownership of its merge, #2029)
+#   lane (LANE_BACKSTOP_S)        7200s   (~2 h — spawn-gate.sh's ABSOLUTE BACKSTOP; the lane's
+#                                            PRIMARY bound is lane-bound.sh's 2700 s progress
+#                                            allowance. This term was 3300s until agent-infra#2888
+#                                            demoted the wall clock to a backstop)
 #   chain-merge.sh waits for the PR 5400s  (90 x 60s) — it exits AT ONCE when the lane recorded a
 #                                           capacity refusal, releasing this claim within a poll
 #                                           interval (agent-infra#1909), so the ceiling below is a
@@ -106,7 +108,7 @@ esac
 #   chain-merge.sh merge-phase wait 1890s  (LANE_PHASE_GRACE 90 + LANE_HANDOFF_WAIT 1800, #2029)
 #   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + the 1200s bound)
 #                                 ------  =======
-#                                 13590s  -> 14400s (4 h)
+#                                 17490s  -> 18000s (5 h)
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
@@ -115,12 +117,14 @@ esac
 # DUPLICATE DISPATCH this file exists to prevent (agent-infra#1850). #2029 raised TWO terms
 # (LANE_TIMEOUT +900s, and the new merge-phase wait +1890s) and this default moved with them in the
 # same commit; any future change to one of the four must do the same, or override CLAIM_ISSUE_TTL
-# (env, or the cell's keys.env).
+# (env, or the cell's keys.env). ⛔ #2888 RAISED THE FIRST TERM (3300 -> 7200) and this default moved
+# with it in the same commit (14400 -> 18000) — the review caught it moving WITHOUT the default, which
+# is exactly the mid-flight expiry this paragraph predicts.
 # The same digit clamp as CLAIM_TTL: an unparseable lease is worse than the default (see above).
-CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-14400}"
+CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-18000}"
 case "${CLAIM_ISSUE_TTL:-}" in
-  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=14400 ;;
-  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=14400 ;;
+  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=18000 ;;
+  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=18000 ;;
 esac
 
 # ── THE LEASE CEILING (agent-infra#2094) ──────────────────────────────────────────────────────
@@ -128,7 +132,8 @@ esac
 # merge/fix paths lease a PR claim for MORE than `CLAIM_TTL` on purpose, because the lease must cover
 # the review+merge the claim is taken for:
 #     merge-one.sh   CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))  -> 3000s
-#     fix-one.sh     FIX_LEASE=$(( FIX_TIMEOUT + 1200 ))      -> 3600s
+#     fix-one.sh     FIX_LEASE=$(( ${FIX_TIMEOUT:-$LANE_BACKSTOP_S} + 1200 )) -> 8400s
+#                    (3600s before agent-infra#2888: the fixer ran 2400 s, now the 7200 s backstop)
 # So a clamp at 1800 would expire a claim MID-MERGE and hand the same head to a peer — the duplicate
 # work this registry exists to prevent. But before this bound there was no ceiling at ALL: the only
 # check was "at most 9 digits", so a caller could mint `lease_until = now + 999999999` (31 years) —
@@ -138,10 +143,10 @@ esac
 # lease below the review window, which is the mid-review expiry this block exists to prevent — so raise
 # CLAIM_TTL_MAX at the same time. The clamp is not silent: it reports itself on stderr.
 # Same digit clamp as the two TTLs above: an unparseable ceiling is worse than the default.
-CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-7200}"   # 2 h — twice fix-one's 3600s lease, the longest shipped one
+CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-9600}"   # 2 h 40 m — above fix-one's 8400s lease, the longest shipped one
 case "${CLAIM_TTL_MAX:-}" in
-  ''|*[!0-9]*|0*) CLAIM_TTL_MAX=7200 ;;
-  *) [ "${#CLAIM_TTL_MAX}" -le 9 ] || CLAIM_TTL_MAX=7200 ;;
+  ''|*[!0-9]*|0*) CLAIM_TTL_MAX=9600 ;;
+  *) [ "${#CLAIM_TTL_MAX}" -le 9 ] || CLAIM_TTL_MAX=9600 ;;
 esac
 [ "$CLAIM_TTL_MAX" -ge "$CLAIM_TTL" ] || CLAIM_TTL_MAX="$CLAIM_TTL"
 # The repository every git call runs against. Resolution order:

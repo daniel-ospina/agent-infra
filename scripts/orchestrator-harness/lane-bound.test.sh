@@ -216,33 +216,44 @@ ck "(d) …and it was NOT the silence bound that fired (silent=$(nfield "$TMP/lo
 # THE MEASURED DEFECT: `prfix` rows read median = p90 = 2400 s in `walltime.tsv` (the cap IS the
 # median), and five of five lanes in one batch ended at `elapsed == cap` with zero commits and 144 KB
 # of finished, uncommitted work. A lane that is WORKING must not be killed for taking long; a lane with
-# no completed work for the allowance must be. (i1)/(i2) are the SAME fixture under two bounds — that
-# pair is the censoring, red then green, and neither half is allowed to stand alone.
+# no completed work for the allowance must be.
+#
+# ⛔ WHAT (i1)/(i2)/(i3) ARE, AND WHAT THEY ARE NOT (review finding, P2 — corrected label). They drive
+# this helper with EXPLICIT `--idle`/`--wall` flags, and the complete functional diff of `lane-bound.sh`
+# for #2888 is the two DEFAULT literals plus the new WARN — so these three cases exercise the
+# already-shipped interaction between two explicit bounds and PASS UNCHANGED on the pre-fix tree. They
+# are PINNED BEHAVIOUR, not a red→green pair, and must not be read as pre-fix-detecting. The property
+# that #2888 actually moves — that the shipped DEFAULTS order the backstop above the allowance, that
+# they are the fleet's declared numbers, and that the env seam reaches the run — is carried by (i0),
+# (i4) and (h3), which DO fail on the pre-fix tree.
 #
 # A unit of work every 1 s, for 8 s: it is still working at 6 s and at 8 s.
 UNIT_LANE=8
 
-# (i1) GREEN: progress allowance governs, backstop above it → the lane finishes, nothing censors it.
+# (i1) PINNED: with the allowance governing and a backstop above it, the lane finishes uncensored.
+# (Not a pre-fix detector — see the label note above; `--wall 12` also means the old flat cap is never
+# crossed here, so "survives past the old cap" would be an over-claim for this fixture.)
 res="$(drive "$BOUND" i1 2 12 "$TMP/logs/i1.log" "$TMP/bin/units.sh" "$TMP/logs/i1.log" "$UNIT_LANE")"
-[ "$res" = "rc=0 verdict=finished" ]; ck "(i1) a lane that keeps COMPLETING units survives past the old flat cap → $res" $?
+[ "$res" = "rc=0 verdict=finished" ]; ck "(i1) [PINNED] a lane that keeps COMPLETING units finishes with the bound silent → $res" $?
 sil_i1="$(nfield "$TMP/logs/i1.log" silent)"
 [ -n "$sil_i1" ] && [ "$sil_i1" -lt 2 ]; rc=$?
 ck "(i1) …and it really was progressing the whole way (silent=${sil_i1:-?}s < 2s, elapsed=$(nfield "$TMP/logs/i1.log" elapsed)s)" $rc
 
-# (i2) RED — the mutation is the SHIPPED pair (backstop below the work): the same fixture is killed.
-# Asserted on the verdict AND on `silent`, because "killed at the wall" is only censoring when the
-# lane was in fact still working; a wall kill of a quiet lane is the correct behaviour.
+# (i2) PINNED: the same working lane IS killed when the backstop sits below its work (the shipped
+# 2400 < 2700 shape, armed explicitly). Asserted on the verdict AND on `silent`, because "killed at the
+# wall" is only censoring when the lane was in fact still working; a wall kill of a quiet lane is
+# correct behaviour.
 res="$(drive "$BOUND" i2 2 6 "$TMP/logs/i2.log" "$TMP/bin/units.sh" "$TMP/logs/i2.log" "$UNIT_LANE")"
-[ "$res" = "rc=143 verdict=exceeded-wallclock" ]; ck "(i2) MUTATION (the flat cap): the SAME working lane IS killed at the backstop → $res" $?
+[ "$res" = "rc=143 verdict=exceeded-wallclock" ]; ck "(i2) [PINNED] the SAME working lane IS killed when the backstop sits below its work → $res" $?
 sil_i2="$(nfield "$TMP/logs/i2.log" silent)"
 [ -n "$sil_i2" ] && [ "$sil_i2" -lt 2 ]; rc=$?
 ck "(i2) …and it was KILLED WHILE WORKING (silent=${sil_i2:-?}s < 2s) — that is the censoring, not a stall" $rc
 
-# (i3) THE WEDGE KILL IS NOT TRADED AWAY. The backstop still ends a lane that never stops working
-# (the "creeps forward for ever" class the progress rule cannot bound), so demoting the wall did not
-# remove it — it moved the PROGRESS rule in front of it.
+# (i3) PINNED: the backstop still ends a lane that never stops working (the "creeps forward for ever"
+# class the progress rule cannot bound) — demoting the wall did not remove it, it moved the PROGRESS
+# rule in front of it.
 res="$(drive "$BOUND" i3 2 5 "$TMP/logs/i3.log" "$TMP/bin/units.sh" "$TMP/logs/i3.log" 60)"
-[ "$res" = "rc=143 verdict=exceeded-wallclock" ]; ck "(i3) the BACKSTOP still kills a lane that keeps working for ever → $res" $?
+[ "$res" = "rc=143 verdict=exceeded-wallclock" ]; ck "(i3) [PINNED] the BACKSTOP still kills a lane that keeps working for ever → $res" $?
 
 # (i4) A BACKSTOP BELOW THE ALLOWANCE IS LOUD, because that ordering is the defect itself: it lets the
 # wall pre-empt the progress rule so the rule can never reach its verdict. A WARN, not a refusal — a
@@ -464,6 +475,33 @@ want "$res" "bound=exceeded-wallclock"; rc=$?
 ck "(h3) LANE_BOUND_WALL_S reaches the bound through run_agent (it used to be an inert knob) ($res)" $rc
 grep -q 'backstop OVERRIDDEN by LANE_BOUND_WALL_S=3' "$TMP/logs/h3.log"; rc=$?
 ck "(h3) …and the override is NAMED in the lane log, so the bound that ran and the bound reported cannot disagree" $rc
+
+# ── (k) THE VERDICT SURVIVES A TERM→KILL ESCALATION (review finding, NEW — MEASURED) ──────────
+# `emit_line` wrote the verdict file with `>`, so each line REPLACED the last: on a KILL escalation the
+# file held ONLY `[lane-bound] KILL … still alive Ns after TERM`, and spawn-gate.sh's
+# `sed -n 's/.*verdict=\([a-z-]*\).*/\1/p' | head -1` then returned EMPTY — `AGENT_BOUND_VERDICT`
+# blank for exactly the lane the bound killed. The (a)/(h) arms above cannot see it: their fixture dies
+# on TERM, so there is never a third line to overwrite the verdict. This arm forces the escalation.
+cat > "$TMP/bin/stubborn.sh" <<'EOF'
+#!/bin/sh
+# A lane that IGNORES TERM: the only way to end it is the bound's KILL escalation after the grace.
+# Bounded at 30s so a broken arm cannot leave a spinner behind.
+trap '' TERM
+i=0
+while [ "$i" -lt 30 ]; do sleep 1; i=$((i+1)); done
+EOF
+chmod +x "$TMP/bin/stubborn.sh"
+rm -f "$TMP/logs/k.log" "$TMP/logs/k.log.v"
+# --tol-cs 100: this arm measures the KILL path, not the CPU tolerance, and the fixture forks one
+# `sleep` per second — on a loaded box that fork noise can exceed the 10 cs default and the arm would
+# intermittently measure a NON-stall instead of the escalation.
+sh "$BOUND" run --log "$TMP/logs/k.log" --idle 2 --wall 60 --grace 1 --tol-cs 100 --tag k \
+  --verdict-file "$TMP/logs/k.log.v" -- "$TMP/bin/stubborn.sh" >/dev/null 2>&1
+krc=$?
+[ "$krc" -eq 137 ]; ck "(k) FIXTURE: the lane really had to be KILLed (rc=$krc — TERM ignored), so the escalation path ran" $?
+grep -q 'lane-bound\] KILL tag=k' "$TMP/logs/k.log.v"; ck "(k) FIXTURE: …and the KILL line is IN the verdict file (so a third write really happened)" $?
+kv="$(sed -n 's/.*verdict=\([a-z-]*\).*/\1/p' "$TMP/logs/k.log.v" 2>/dev/null | head -1)"
+[ "$kv" = "stalled" ]; ck "(k) …and the verdict FILE still yields verdict=stalled (got '${kv:-<empty>}') — the machine-readable surface keeps the verdict the human one always had" $?
 
 # ── (g) THE CALLER'S CONTRACT: `run_agent` reads the verdict, and a stale one cannot be mistaken ──
 # A caller that cannot tell "the lane finished" from "the bound ended it" reports a wedged lane as a

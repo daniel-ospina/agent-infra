@@ -473,13 +473,26 @@ trap 'exit 130' INT
 if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
   # shellcheck source=/dev/null
   . "$O/claims.sh"
-  if ! is_limit "${FIX_TIMEOUT:-2400}"; then
-    echo "[fix $PR] FIX_TIMEOUT='${FIX_TIMEOUT:-}' is not an integer in range (at most 9 digits) — using 2400 (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
-    FIX_TIMEOUT=2400
+  # The fallback used when a malformed FIX_TIMEOUT is refused: the SAME value the run would take.
+  _FIX_BOUND_FALLBACK="${LANE_BACKSTOP_S:-7200}"
+  is_limit "$_FIX_BOUND_FALLBACK" || _FIX_BOUND_FALLBACK=7200
+  FIX_BOUND="${FIX_TIMEOUT:-$_FIX_BOUND_FALLBACK}"
+  if ! is_limit "$FIX_BOUND"; then
+    echo "[fix $PR] FIX_TIMEOUT='${FIX_TIMEOUT:-}' (resolved to '$FIX_BOUND') is not an integer in range (at most 9 digits) — using ${_FIX_BOUND_FALLBACK} (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
+    FIX_BOUND="$_FIX_BOUND_FALLBACK"
   fi
+  # ⛔ ONE RESOLVED BOUND DRIVES BOTH THE LEASE AND THE RUN (agent-infra#2888 review, P1 — verified).
+  # They were two independent literals: the run moved to the `${FIX_TIMEOUT:-$LANE_BACKSTOP_S}` backstop
+  # (7200 s) while this lease stayed `FIX_TIMEOUT:-2400 + 1200` = 3600 s. With `FIX_TIMEOUT` unset — the
+  # shipped default; nothing outside the test suite sets it — the claim then expired an HOUR before the
+  # fixer's own bound, a peer read the head as free and ran a SECOND fixer on the same branch: exactly
+  # the duplicate dispatch `claims.sh`'s lease/ceiling block says the lease exists to prevent. Resolving
+  # the bound ONCE removes the class instead of re-syncing two numbers on every future change.
+  FIX_TIMEOUT="$FIX_BOUND"
   # Overflow-safe by construction: the guard above leaves FIX_TIMEOUT <= 999999999, so this sum is
-  # < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site.
-  FIX_LEASE=$(( ${FIX_TIMEOUT:-2400} + 1200 ))
+  # < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site — `CLAIM_TTL_MAX` is
+  # sized ABOVE this lease (claims.sh), and a lease reaching the ceiling is reported, never silent.
+  FIX_LEASE=$(( FIX_BOUND + 1200 ))
   claim_acquire "$REPO" "$PR" "$HEAD" "$FIX_LEASE" >/dev/null
   CROSS_RC=$?
   case "$CROSS_RC" in

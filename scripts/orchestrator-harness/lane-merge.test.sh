@@ -1018,16 +1018,24 @@ ck "the supervision budget is DERIVED from the lane's wall clock and RESERVES im
 # out of the lane's implementation time.
 _ps="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 # lane.sh invokes it as `run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" …` (agent-infra#2888: the wall
-# became a BACKSTOP, so the lane's default is now the harness seam), so read the default out of THAT
-# call and, when it names the seam, resolve the seam from spawn-gate.sh. The check must keep measuring
-# the LANE's own clock — falling back to 0 here would make the arithmetic vacuous.
-_lt="$(grep -o 'LANE_TIMEOUT:-*[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
-[ -n "$_lt" ] || _lt="$(grep -o 'LANE_BACKSTOP_S:-[0-9]*' "$HERE/spawn-gate.sh" | head -1 | tr -dc '0-9')"
+# became a BACKSTOP, so the lane's default is now the harness seam).
+# ⛔ READ BOTH SIDES FROM THE FILES THAT COMPUTE THEM (review finding, P3 — verified). The previous
+# version resolved `_lt` from lane.sh (7200, via the seam) and asserted the arithmetic against it while
+# the arithmetic that actually RAN was still clamped by lane-merge.sh's own `${LANE_TIMEOUT:-3300}`
+# literal — so the check passed on a wider margin and would ALSO have passed if that default drifted,
+# which is exactly the property it exists to protect. Now `_lt` is lane-merge.sh's OWN resolved
+# default, and a second assertion requires the two files to name the SAME bound.
+_lt="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
+[ -n "$_lt" ] || _lt="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
+_LANE_SIDE="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
+[ -n "$_LANE_SIDE" ] || _LANE_SIDE="$(grep -o 'LANE_BACKSTOP_S:-[0-9]*' "$HERE/spawn-gate.sh" | head -1 | tr -dc '0-9')"
+ck "lane-merge.sh's OWN supervision clock (${_lt:-?}s) is the SAME bound lane.sh hands the lane (${_LANE_SIDE:-?}s) — two files, one number" \
+   $([ -n "$_lt" ] && [ "$_lt" = "$_LANE_SIDE" ] && echo 0 || echo 1)
 _ws="$(sed -n 's/.*LANE_MERGE_WAIT:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 [ -n "$_ws" ] || _ws="$(grep -o 'LANE_MERGE_WAIT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
 _ir="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 [ -n "$_ps" ] && [ -n "$_lt" ] && [ -n "$_ws" ] && [ -n "$_ir" ] && _mw=$(( (_lt - _ws - _ir) / _ps )) || _mw=0
-ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) ≤ lane.sh LANE_TIMEOUT ($_lt) — by ARITHMETIC across the two files, with a NON-ZERO implementation reserve" \
+ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) ≤ lane-merge.sh's OWN LANE_WALL_S ($_lt) — by ARITHMETIC across the two files, with a NON-ZERO implementation reserve" \
    $([ -n "$_mw" ] && [ "${_ir:-0}" -gt 0 ] && [ "${_mw:-0}" -ge 1 ] && [ $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) -le "$_lt" ] && echo 0 || echo 1)
 # ⛔ AND THE ARITHMETIC IS NOT THE RUNTIME (this suite's own lesson: a source-shape assertion passes on a
 # script whose runtime lost the property). Drive the DERIVED cap through --watch with a SHRUNK

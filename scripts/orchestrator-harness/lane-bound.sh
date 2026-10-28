@@ -92,7 +92,9 @@
 #     --poll <secs>       sampling interval. Default min(60, max(1, idle/4)).
 #     --grace <secs>      TERM → KILL grace. Default 15 (unchanged from `run_agent`).
 #     --tag <label>       named in every line. Default `lane`.
-#     --verdict-file <f>  where the one-line verdict is also written.
+#     --verdict-file <f>  where the one-line verdict is also written. It is TRUNCATED at arm time and
+#                         APPENDED to per line, so on a TERM→KILL escalation it holds the verdict line
+#                         FOLLOWED by the kill outcome: a reader takes the first `verdict=` match.
 #
 #   `watch` supervises an EXISTING pid and kills it LEADER-ONLY, so the caller's own post-`wait`
 #   group reap (spawn-gate.sh) keeps working exactly as before. `run` spawns the command, supervises
@@ -296,7 +298,15 @@ V_START=0; V_UNREADABLE=0; V_EMITTED=0
 emit_line() { # emit_line <line>
   printf '%s\n' "$1"
   [ -n "$LOGF" ] && printf '%s\n' "$1" >> "$LOGF" 2>/dev/null
-  [ -n "$VFILE" ] && printf '%s\n' "$1" > "$VFILE" 2>/dev/null
+  # ⛔ APPEND, NEVER `>` (agent-infra#2888 review, NEW finding — MEASURED on a real killed lane). With
+  # `>` each emitted line REPLACED the previous one, so on a TERM→KILL escalation the file ended up
+  # holding ONLY `[lane-bound] KILL … still alive 15s after TERM`; `spawn-gate.sh` reads it back with
+  # `sed -n 's/.*verdict=\([a-z-]*\).*/\1/p' | head -1` and got NOTHING, so `AGENT_BOUND_VERDICT` was
+  # blank for exactly the lane the bound killed (the human surface — the log — was intact, the
+  # machine-readable one was not). The verdict line is emitted BEFORE the kill by design (`enforce`),
+  # so appending keeps it FIRST in the file and `head -1` stays the right reader; the caller truncates
+  # the file at arm time (`rm -f`, both modes below), so nothing accumulates across runs.
+  [ -n "$VFILE" ] && printf '%s\n' "$1" >> "$VFILE" 2>/dev/null
   return 0
 }
 
