@@ -3628,9 +3628,21 @@ def _started_worktree(name: str) -> str:
     tree did this worker take" -- not an inference from the worker's name. Bounded read and
     `errors="replace"` for the reason `_read_pid` gives: a record is an artifact, and an artifact
     must not be able to abort a pass. An unreadable record answers "" (no evidence), never a guess.
+
+    ⛔ `isfile` BEFORE THE OPEN, BECAUSE A FIFO IS NOT AN UNREADABLE FILE (#2980 review cycle 5,
+    P1). `open()` on a writer-less FIFO BLOCKS instead of raising, so the `except OSError` below
+    never fires and the pass hangs on an artifact for ever -- no verdict, no heartbeat, no dispatch.
+    This is not a theoretical shape: it is the exact rule `_worker_pid_files` already states one
+    function away (`:1312-1314`, "a FIFO is not -- `open()` on one BLOCKS with no writer"), and
+    this reader sits on the hot path, once per queued PR. `isfile` (which follows symlinks and is
+    False for a FIFO/device/directory) is the guard; the safe answer is unchanged, because no
+    readable record is no evidence.
     """
+    started = bg_path(name, "started")
+    if not os.path.isfile(started):
+        return ""                        # absent, or a FIFO/device that would block the open
     try:
-        with open(bg_path(name, "started"), errors="replace") as fh:
+        with open(started, errors="replace") as fh:
             data = fh.read(4096)
     except OSError:
         return ""
@@ -3690,9 +3702,22 @@ def _in_this_checkout(worktree: str) -> bool:
     arm enumerates through the SAME call, so in that same state it cannot hand back that path
     either, and no dispatch can reach a tree this function declined to attribute. The unsafe
     direction would need both reads to disagree inside one process, and they cannot.
+    ⛔ A BROTHER CHECKOUT OF THE SAME REPO IS STILL THIS REPO (#2980 review cycle 5, P2). The two
+    arms above are both CHECKOUT-scoped: `WORKTREE_ROOT` is this pass's own root, and `_worktrees()`
+    is this CLONE's registry. But the granularity this change writes with is the REPO, not the
+    checkout, deliberately (`:269-271`: two clones of one slug share the tag because they share the
+    register). A second clone has its OWN worktree registry, so a live pre-#2725 worker sitting in
+    it matched neither arm, read as foreign, and the pass dispatched a SECOND worker onto the same
+    branch -- and the no-row path explicitly relies on the next pass seeing a running worker
+    (`:3905-3906`), which a next pass in the other clone then would not. So the recorded tree's OWN
+    `origin` settles it: a worktree that PROVES it is this slug is ours wherever it is checked out,
+    and one that proves it is another slug stays foreign. A relative path is resolved against OUR
+    cwd, which is no evidence at all -- this file already rules that at `:2247` -- so it probes.
     """
     if not worktree or not WORKTREE_ROOT:
         return True                       # nothing to attribute it with: do not narrow on a guess
+    if not os.path.isabs(worktree):
+        return True                       # relative: resolved against OUR cwd -- no evidence
     root, wt = _rp(WORKTREE_ROOT), _rp(worktree)
     if not root or not wt:
         return True                       # unresolvable: unreadable evidence never narrows
@@ -3701,7 +3726,11 @@ def _in_this_checkout(worktree: str) -> bool:
     for path, _branch in _worktrees():     # the ADOPT arm's population, everywhere it lives
         if _rp(path) == wt:
             return True
-    return False
+    # a brother checkout of the SAME repo (its own registry cannot list this clone's worktrees)
+    slug, _why = _origin_slug(wt)         # total: ("", why) on any failure, never raises
+    if not slug:
+        return True                       # unattributable tree: no evidence, so do not narrow
+    return slug.lower() == (REPO or "").lower()
 
 
 def worker_live_for(number) -> object:
