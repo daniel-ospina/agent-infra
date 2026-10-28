@@ -285,7 +285,7 @@ The gate's existing handshake is unchanged; the new sender is bolted on **downst
 
 1. A lane posts its question as one comment beginning with the declaration line
    (`RESEARCH: skill=… sources=… refs=…`) and runs `python3 scripts/ask-owner.py <repo> <n>`.
-2. The gate makes **one Jev call** (`JEV_MODEL = jev-1.13.0`), scoring four structural marks
+2. The gate makes **one Jev call** (`JEV_MODEL = jev-1.13.0` as measured 2026-10-21; the model is now the vendor alias `jev-latest` per the owner ruling of 2026-10-27, agent-infra#2915), scoring four structural marks
    (`has_options`, `has_analysis`, `has_recommendation`, `contradiction_test`) at 0.80, `has_context`
    at `THRESHOLD_LANGUAGE = 0.70`, and the two mechanical language marks (`jargon_free`,
    `understandable`) at `THRESHOLD_JARGON = 0.55`; on a pass it adds the `owner-decision` label and
@@ -462,7 +462,7 @@ belongs on the issue, per `AGENTS.md`):
 ## 8. Sources
 
 **Internal (measured in this repo / the fleet, 2026-10-21):**
-- `scripts/ask-owner.py` (1,531 lines) — Jev call, `JEV_MODEL = jev-1.13.0`, `THRESHOLD = 0.80` /
+- `scripts/ask-owner.py` (1,531 lines) — Jev call, `JEV_MODEL = jev-1.13.0` (as measured 2026-10-21; now the alias `jev-latest` per agent-infra#2915), `THRESHOLD = 0.80` /
   `THRESHOLD_LANGUAGE = 0.70` / `THRESHOLD_JARGON = 0.55`, the `owner-decision` / `question-bounced`
   / `owner-answered` / `answer-delivered` label handshake, `notify_lane()` (line 1039).
 - `scripts/undelivered-answers.py` (236 lines) — the delivery predicate and why silence is invisible.

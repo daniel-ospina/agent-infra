@@ -29,6 +29,37 @@ gh issue view <ISSUE> --repo <OWNER/REPO> --comments --json comments --jq '.comm
 The comment thread supersedes the body where they disagree. Re-measure anything labelled
 provenance-stale before trusting the body.
 
+## Your research contract — this section is REQUIRED, and the dispatch is REFUSED without it
+(agent-infra#2258)
+
+The block below is the canonical text `scripts/orchestrator-harness/brief-gate.sh --section lane`
+renders, and it is the SAME text every generated brief carries. Copy it, fill the `<…>` slots with
+YOUR pass, and keep the four labels: `nonblocking-dispatch.sh`, `orch-send.sh`, `safe-send.sh` and the
+lane/fixer/bg launch seams refuse a brief without them (exit 80), naming what is missing. Do not
+delete the labels to save space — a brief that carries the heading but no `RUNG:`/`CONTRADICTION TEST:`
+is refused too.
+
+## RESEARCH FIRST — before you decide anything (agent-infra#2258)
+
+⛔ This is not a formality and it is not deep research. Do this pass BEFORE you write code, file an
+issue, or open a PR, and state its outcome in your final message. It exists because two lanes in one
+day acted on a false premise: one re-derived a root the tracker already held, one opened a duplicate
+PR. Both were brief defects — the lane was never asked to look first.
+
+INTERNAL: read what this repo and its tracker ALREADY hold, before you decide anything: the issue AND every comment (root-cause corrections live there), `git log --all --grep` for a prior attempt, the open PRs touching the same files, the architecture doc for the seam you are about to change. Quote file:line, issue and PR numbers. If the work is ALREADY DONE, already decided, or already decomposed into other issues, STOP and report that with evidence instead of re-deriving it.
+EXTERNAL: look OUTSIDE this repo for how comparable systems solve this — vendor docs, specs, the
+    `research` skill (state the rung in the RUNG line below). Say what you looked up and what you
+    took from it. Skipping the rung is not allowed; `web_fetch` on a primary source always exists.
+RUNG: 2 — web_search model="sonar"   ⛔ REPLACE with the rung you will actually use, naming the tool:
+    1 = perplexity MCP (`mcp__seo-intelligence__perplexity_search`) · 2 = `web_search` with the model
+    passed explicitly (`sonar`) · 3 = `web_fetch` / exa (`mcp_load exa`). If the rung you wanted does
+    not load, name the rung you took AND the error you saw — a silent fallback erases the config gap.
+CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling, a decision section in
+    a plan doc, a decision comment on an issue, a Tortoise point carrying one? Quote it, and say
+    `no recorded decision reaches this work` if none does. If a finding contradicts a recorded
+    decision, it is NOT a candidate for adoption: reopen the decision and argue it in its own home;
+    never adopt over it.
+
 ## Setup
 
 You are ALREADY inside your own worktree (that is your cwd, on branch `<BRANCH>`). Do NOT create,
@@ -45,6 +76,42 @@ switch, or remove worktrees, and never touch the repo's main checkout.
 - Use the research skill for non-trivial research; never call `web_search` directly.
 - Never ask the human anything. File a pre-existing bug with an issue instead of fixing it silently.
 
+<!-- BEGIN delivery-contract — drift-pinned from scripts/orchestrator-harness/reviewer-preflight.sh --delivery-brief lane; edit THERE, not here (reviewer-preflight.test.sh §G compares this block byte for byte) -->
+## COMMIT AS YOU GO — a killed lane must leave a PR behind (agent-infra#2981)
+
+**Commit as soon as you have a coherent unit, push it, then KEEP IMPROVING it.** Do not save your
+work for one commit at the end. The wall clock does not warn before it fires: a lane killed at its
+cap takes the uncommitted tree with it, so a lane that holds everything delivers NOTHING — its work
+is indistinguishable from no work at all while it exists only in a worktree that is about to be
+reaped.
+
+MEASURED 2026-10-27/28 (agent-infra#2981): five repair lanes in one batch, all five killed at their
+2400 s cap — **0 commits, 0 PRs, 144 KB of work** recovered only as rescue patch files. Not one of
+them had done the wrong work. Not one of them had delivered it.
+
+- A commit is a checkpoint, not a ceremony: commit when what you have BUILDS, or when the next thing
+  you are about to write would make the tree worse. Several small commits are the deliverable; one
+  perfect commit that never happens is not.
+- **Open the PR as soon as the first commit is pushed**, then keep improving it — the PR
+  being open is a starting line, not a finish line. Once it exists you do NOT open a second PR for
+  the same work.
+- **Push after every commit**, not once at the end — a commit that exists only in your worktree does
+  not survive the worktree being reaped, and it is not what the merge chain reads.
+- Keep working on the SAME branch once the PR exists. Do not restate the whole change in one final
+  commit at the end of the run; that is the shape this rule exists to remove.
+
+## ON RESUME — read the tree before you touch it
+
+If you did not write the tree you just found, **read `git status` and `git diff` FIRST** — before
+any edit, and before any checkout. An uncommitted tree in THIS worktree is your PREDECESSOR's work on
+this same task: a lane killed at its cap leaves exactly that, and it can be tens of KB of finished,
+tested work.
+
+Adopt it: read the diff, keep what is right, finish what is unfinished, commit it. ⛔ **Never discard
+it** — no `git checkout -- .`, no `git stash`, no `git clean`, no `git reset --hard` over
+uncommitted work, and never "start from a clean tree". Discarding it is how the same work dies twice.
+<!-- END delivery-contract -->
+
 <!-- BEGIN landing-artifacts — drift-pinned from scripts/orchestrator-harness/reviewer-preflight.sh --landing-brief self; edit THERE, not here (reviewer-preflight.test.sh §F compares this block byte for byte) -->
 ## Landing artifacts — what makes this PR pass `pipeline-compliance` (agent-infra#2325)
 
@@ -59,7 +126,8 @@ it). Four of them are only producible while you work, so produce them as you go.
   `Refs #<ISSUE>` when something genuinely stays open). A mid-sentence `(fixes #N)` does NOT
   count, and an unintended closing keyword can auto-close an issue on merge.
 - **[b] the scoping comment, whose FIRST CONTENT LINE is the marker — `<!-- issue-scoping: … -->`
-  (the producer, `skills/issue-scoping`, writes `<!-- issue-scoping: v5.1 double diamond + verify -->`;
+  (the producer is `skills/issue-scoping` for the epic/project tiers, or `skills/task-workflow-standard`
+  for the task tier — the version varies (`v5.1 double diamond + verify`, `merged scope+plan`);
   only the `<!-- issue-scoping:` prefix is examined). Then the scoping content: boundaries,
   alternatives considered, the wiring table. POSITION is the contract — the check matches at column
   0, so ANY leading whitespace fails (at four columns it is also rendered as a CODE BLOCK, i.e. a
@@ -137,6 +205,21 @@ flag does either.
    ```
    scripts/admin-merge.sh <PR>
    ```
+
+   ⛔ **NOT INSIDE A BLOCKING TOOL CALL.** Your tool call is capped at 1800s while the rail's own
+   wait ceiling is 18064s, so a HEALTHY rail still waiting on CI gets SIGTERMed mid-wait and reports
+   NO verdict (agent-infra#2885: PR #2873 was cut off at 23:10:47Z and merged 4h45m later). Start it
+   detached and poll instead:
+
+   ```bash
+   bash scripts/rail-run.sh start  <PR> ARGS...   # returns at once, prints the run id + log
+   bash scripts/rail-run.sh status <PR> (--repo owner/repo) --run <run-id>
+   ```
+   `status` exits 10 running · 0 landed · 20 refused · 21 killed · 22 gone-without-verdict · 25 unknown
+   (an evidence read abstained) — a run that produced NO verdict is never reported as a landing, and
+   `landed` requires the PR's url to name THIS repo and THIS PR (a same-numbered PR elsewhere is not
+   yours). `start` records the repo identity from `--repo` or `origin`; poll with the SAME `--repo`
+   if you passed one. See `docs/ops/rail-run.md`.
 
    ⛔ **The ONE-COMMAND alternative to steps 1-3.** If you would otherwise assemble a reviewer prompt
    by hand, do not: `~/.pi/agent/scripts/review-pr.sh <PR>` spawns a genuinely fresh-context

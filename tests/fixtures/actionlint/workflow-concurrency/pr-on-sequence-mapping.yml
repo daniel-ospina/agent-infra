@@ -1,0 +1,15 @@
+# A sequence entry that is a MAPPING (`- pull_request:`) must be read as its key; recorded verbatim it
+# became a trigger named `pull_request:` and the file passed with zero PR entry points checked
+# (#2660 round 9).
+name: PR on sequence mapping
+on:
+  - pull_request:
+      branches: [main]
+concurrency:
+  group: pr-on-sequence-mapping-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
