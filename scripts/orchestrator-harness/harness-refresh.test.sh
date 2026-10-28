@@ -27,6 +27,18 @@ DM="$HERE/dispatch-merge.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
+# ⛔ REAP A PLANT AND ITS CHILDREN. Every plant in this suite is `bash <script>` where the script's last
+# command is `sleep 120`, so the process the case holds the pid of is the WRAPPER and the sleeper is its
+# CHILD. `kill "$_Pxx"` alone therefore kills the wrapper and orphans a two-minute sleeper at ppid 1 on
+# every run (MEASURED: 9 survivors after one suite run). `-P` targets exactly that wrapper's children, so
+# no other fixture's plant — and nothing else on the host — can be signalled. Falls back to the old
+# behaviour (a leak) if `pkill` is absent, so a box without it still runs the suite.
+reap() {
+  command -v pkill >/dev/null 2>&1 && pkill -9 -P "$1" 2>/dev/null
+  kill "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+  return 0
+}
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-refresh.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 echo "==> harness-refresh contract ($HERE)"
@@ -281,7 +293,32 @@ lane_alive "$LANEPID" && ok "the in-flight lane process was NOT signalled (pid $
 case "$R" in *lanes=1*) ok "the record discloses lanes=1 — the deferred restart is visible, not silent" ;; *) bad "no lane disclosure in the record: $R" ;; esac
 case "$R" in *"IN-FLIGHT at the advance"*) ok "…and the prose says nothing was signalled" ;; *) bad "the in-flight fact is unstated: $R" ;; esac
 case "$(cat "$D/mat.calls" 2>/dev/null)" in *--pin-only*) ok "the advance used --pin-only (a new per-commit tree; \$O untouched)" ;; *) bad "the advance did not use --pin-only: $(cat "$D/mat.calls" 2>/dev/null)" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
+
+# ⛔ A22b: AN AMBIENT `COLUMNS` MUST NOT HIDE A LIVE LANE (#2926). `in_flight_pids` reads `ps … command=`
+# and matches the token `$O/<name>.sh`. `ps(1)` honours `COLUMNS` BEFORE its "not a tty ⇒ unlimited"
+# default (FreeBSD/Apple ps(1): "the default output width is that requested by the COLUMNS environment
+# variable if present"), and the path is the LAST token of the line, so an exported COLUMNS cuts it first.
+# Measured on the cell: `COLUMNS=40 ps -o command= -p $$` → 41 bytes; the same read with `-ww` → the whole
+# 305-byte line. Truncated, this read answers lanes=0 for a LIVE lane — and lanes=0 is exactly what lets
+# `--re-seed` swap `$O` under it, so the direction is DESTRUCTIVE, not cosmetic. The width is 20 on
+# purpose: below any fixture path, so the truncation is certain rather than lucky. Asserting only `lanes=1`
+# would under-test it — the destructive ARMS are asserted too.
+_CASE=$((_CASE+1)); echo "=== A22b: an ambient COLUMNS cannot hide a live lane from the in-flight read (ps -ww) ==="
+D="$T/a38"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+printf '%s\n' "$$" > "$D/O/.orch.lock"     # a live controller, as on a real cell
+LANEPID="$(mk_fake_lane "$D/O")"
+MAT="$(mk_stub_mat "$D")"
+R="$(COLUMNS=20 O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" \
+      --ref origin/main --pin "$PIN" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC=$?
+lane_alive "$LANEPID" && ok "the live lane was NOT signalled under a narrow COLUMNS" \
+                     || bad "a COLUMNS-truncated lane count let the re-seed kill lane $LANEPID"
+[ "$RC" = 26 ] && ok "exit 26 — a lane invisible only because of COLUMNS still refuses the destructive advance" \
+                || bad "exit $RC, expected 26 — a truncated table let --re-seed through: $R"
+case "$R" in *lanes=1*) ok "the lane is still counted with COLUMNS=20 — the table read is width-independent" ;;
+             *lanes=0*) bad "COLUMNS truncated the process table and hid a LIVE lane (lanes=0) — the #2926 defect" ;;
+             *) bad "no lane count in the record: $R" ;; esac
+reap "$LANEPID"
 
 _CASE=$((_CASE+1)); echo "=== A23: the DESTRUCTIVE advance (--re-seed) under a mid-turn lane -> REFUSES 26, names what blocks it ==="
 D="$T/a23"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
@@ -329,7 +366,7 @@ R7="$(O="$D6/O" HARNESS_PIN_FILE="$D6/path-pin" HARNESS_MATERIALISER="$(mk_stub_
 [ "$RC7" = 26 ] && ok "a sha-record-at-tip box refuses 26 like any other live box" || bad "exit $RC7, expected 26 — output: $R7"
 case "$R7" in *"the pin moves to"*) bad "the remedy promises a pin move the sha record already made" ;; *) ok "…and does not promise a pin move the record already made" ;; esac
 case "$R7" in *"deployed tree"*) ok "…it names the deployed tree as what advances" ;; *) bad "the deployed tree is unnamed: $R7" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 _CASE=$((_CASE+1)); echo "=== A24: --re-seed --force -> the deliberate override goes through (the gate is not a wall) ==="
 D="$T/a24"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
@@ -346,7 +383,7 @@ lane_alive "$LANEPID" && ok "even the forced re-seed signalled no lane" || bad "
 # the harness does not ship, so "no lane tree was touched" would be false on THIS arm.
 case "$R" in *"no lane tree was touched"*) bad "the re-seed arm claims no lane tree was touched (it re-seeds \$O)" ;; *) ok "…and does not claim the lane tree was untouched" ;; esac
 case "$R" in *"RE-SEEDED"*) ok "…it discloses that \$O was re-seeded" ;; *) bad "the re-seed is not disclosed on the kept line: $R" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 _CASE=$((_CASE+1)); echo "=== A25: the controller and the launcher's log path are NOT lanes (token match, not substring) ==="
 D="$T/a25"; mkdir -p "$D/pin" "$D/O/logs"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
@@ -455,7 +492,7 @@ R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" 
 lane_alive "$LANEPID" && ok "the in-flight lane is untouched" || bad "a no-op refresh killed a lane"
 case "$R" in *action=none*) ok "record: action=none (nothing was done, and it says so)" ;; *) bad "record wrong: $R" ;; esac
 case "$R" in *lanes=1*) ok "…and it still discloses the lane that was in flight" ;; *) bad "no lane disclosure: $R" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 _CASE=$((_CASE+1)); echo "=== A28: a DIRTY harness surface refuses AND discards nothing (the operator's patch survives) ==="
 D="$T/a28"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
@@ -632,7 +669,7 @@ case "$KEPT" in *"${C1:0:12} -> ${C2:0:12}"*) ok "…and it carries old -> new" 
 case "$KEPT" in *"$MAT"*) ok "…and the materialiser that did it" ;; *) bad "the materialiser is not in the kept line: $KEPT" ;; esac
 case "$KEPT" in *"lane process(es)"*|*lanes=*) ok "…and what was in flight (the disclosure survives the filter)" ;; *) bad "the lane disclosure is not in the kept line: $KEPT" ;; esac
 case "$KEPT" in *'\$O'*) bad "the kept line prints a literal backslash-\$O" ;; *) ok "…with no literal backslash in the operator-facing text" ;; esac
-kill "$LANEPID" 2>/dev/null || true
+reap "$LANEPID"
 
 # ── the loop's per-cycle block, driven as shipped ────────────────────────────────────────────────
 # Placed INSIDE a scripts/orchestrator-harness/ path in the sandbox so the block's own fallback
@@ -1093,6 +1130,558 @@ R="$(O="$D/o" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PI
 rm -f "$D/o/.orch.lock"
 case "$R" in *relation=restart-pending*) ok "a live controller whose identity comes only from the stamp is restart-pending, not current" ;;
               *) bad "a live controller on stamp-only identity was reported: $R" ;; esac
+
+# ⛔ A36 (#2641): THE CELL THAT IS ACTIVATED AND STILL SAYS `restart-pending`. MEASURED 2026-10-24 on
+# pi-cell-3, twelve minutes after a correct activation: pin == `$O`'s stamp == the tree the controller
+# executed == `848ba4b1`, and the record still printed `relation=restart-pending running=848ba4b133a7`.
+# Cause: `$SELF` is `$O`, a cell's `$O` is a flat seed with NO git identity, so `self:` never resolves
+# there and the stamp fallback (then the `stamp:*` downgrade) owns the answer forever. The running
+# identity IS available — `$O/.orch.lock` names the owning controller and ITS argv names the tree it
+# executes — so this case drives a real process with that argv and requires the record to name ITS
+# commit, not the stale stamp's.
+_CASE=$((_CASE+1)); echo "=== A36: a pin-per-commit cell resolves RUNNING from the live controller's tree, not the flat seed's stamp ==="
+D="$T/a24"; mkdir -p "$D/o/state" "$D/pins" "$D/pin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C2" > "$PIN"
+# The seed's stamp names C1: the STALE answer this case must not accept.
+printf '{"commit": "%s"}\n' "$C1" > "$D/o/.agent-infra-stamp.json"
+_T24="$D/pins/$(short "$C2")"
+git -C "$T/src" worktree add --detach "$_T24" "$C2" >/dev/null 2>&1
+# A controller-shaped process: `bash <tree>/scripts/orchestrator-harness/orch-loop.sh` — the exact argv
+# `cloud-cell-supervisor.sh start` launches, and the shape both sibling readers match on. The fixture's
+# orch-loop.sh is a one-line echo, so it is replaced with a sleeper; the tree stays a valid git worktree
+# whose HEAD is still $C2 (`rev-parse` ignores the working tree), which is the only thing read here.
+printf '#!/bin/bash\nsleep 120\n' > "$_T24/scripts/orchestrator-harness/orch-loop.sh"
+_O26="$_T24/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_O26" & _P24=$!
+sleep 1
+printf '%s\n' "$_P24" > "$D/o/.orch.lock"
+R="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$D/o" 2>&1)"; RC=$?
+rm -f "$D/o/.orch.lock"
+case "$R" in *relation=current*) ok "a correctly-activated cell reports current — not restart-pending forever" ;;
+              *restart-pending*) bad "an activated cell still reads restart-pending (the always-on alarm): $R" ;;
+              *) bad "unexpected record: $R" ;; esac
+case "$R" in *"running=$(short "$C2")"*) ok "…and running= names the tree the controller EXECUTES" ;;
+              *"running=$(short "$C1")"*) bad "running= still came from the (stale) seed stamp: $R" ;;
+              *) bad "running= is neither the running tree nor the seed stamp: $R" ;; esac
+
+# ⛔ A36c: A PROCESS THAT ONLY MENTIONS THE PATH IS NOT THE CONTROLLER. This is the false-PASS direction
+# the repo already settled twice (supervisor `_controller_ps_awk`: "Match the INVOCATION, not the
+# string"; drift tool: shell at `t[1]`, path at `t[2]`): a `sed`/`tail`/`diff` that merely READS the new
+# tree would report `current` while the controller still executes the old one — and would fire the
+# ahead/diverged refusals off a reader's argv on a healthy box. The real controller is killed first and
+# the LOCK names the reader, so a mention-based read answers C2 (tip) while the invocation rule must
+# leave RUNNING on the stamp (C1).
+_CASE=$((_CASE+1)); echo "=== A36c: a process that only MENTIONS the harness path (a reader) is not the controller ==="
+reap "$_P24"
+_O26R="$_T24/scripts/orchestrator-harness/orch-loop.sh"
+tail -f "$_O26R" >/dev/null 2>&1 & _R24=$!
+sleep 1
+printf '%s\n' "$_R24" > "$D/o/.orch.lock"
+R3="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC3=$?
+rm -f "$D/o/.orch.lock"; kill "$_R24" 2>/dev/null; wait "$_R24" 2>/dev/null
+case "$R3" in *"running=$(short "$C2")"*) bad "a READER of the tip tree answered for the box (false current): $R3" ;;
+               *"running=$(short "$C1")"*) ok "a mention of the path does not resolve RUNNING (the lock named a live reader)" ;;
+               *) bad "the record named neither tree — the stage was skipped, not exercised: $R3" ;; esac
+
+# ⛔ A36i: AN AMBIENT `COLUMNS` MUST NOT TRUNCATE THE ARGV READ (#2926), and A36 cannot see this — the
+# fixture runs with COLUMNS unset, so the witness has to SET it rather than hope. Same mechanism as A22b:
+# `ps(1)` honours COLUMNS before its unlimited-width default, and the path is the LAST token, so a narrow
+# COLUMNS cuts `*/orchestrator-harness/orch-loop.sh` mid-name — no match, the stage falls through to the
+# stamp SILENTLY, and #2641's permanent `restart-pending` is back with the fix looking present. Not
+# hypothetical: a real cell controller's invocation on this box measures EXACTLY 80 characters
+# (`bash /home/cmux/harness/04bc1ddefed6/scripts/orchestrator-harness/orch-loop.sh`), one column from
+# "no controller" at the 80-column tmux default. Re-driven on A36's fixture, which keeps a live
+# controller shape and a pin root that already resolves.
+_CASE=$((_CASE+1)); echo "=== A36i: a narrow COLUMNS cannot truncate the controller's argv (ps -ww) ==="
+bash "$_O26" & _P31=$!
+sleep 1
+printf '%s\n' "$_P31" > "$D/o/.orch.lock"
+R9="$(COLUMNS=20 O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"
+rm -f "$D/o/.orch.lock"; reap "$_P31"
+case "$R9" in *"running=$(short "$C2")"*)
+                ok "the running tree is still resolved with COLUMNS=20 — the argv read is width-independent" ;;
+             *) bad "a narrow COLUMNS truncated the argv read — the stage gave up silently and #2641 returns: $R9" ;; esac
+
+# ⛔ A36j: THE SHELL ALLOW-LIST IS ITS OWN GUARD AND HAD NO WITNESS (review cycle 6, measured: deleting the
+# `case " bash sh dash zsh ksh " in` arm left the suite green at 211/211). A36c cannot be its witness — its
+# reader is `tail -f <path>`, whose argv[1] is `-f`, so the SHAPE test rejects it before the shell test is
+# ever evaluated. The arm is load-bearing: it is what stops a process whose argv[1] IS the path but whose
+# argv[0] is not a shell — a `cat <path> -f`, a `diff`, an editor. Without it that reader's tree resolves
+# `current` for a tree the controller is not executing, and `current` feeds `REL_RUN` (the ahead/diverged
+# refusals). The plant is asserted to be argv-shaped before the outcome is read (the A25 lesson: a dead or
+# unnamed plant makes every assertion below vacuously pass).
+#
+# ⛔ AND THE PLANT MUST BE PORTABLE (review cycle 10, P2 — the macOS measurement is this PR's own
+# 2026-10-27T22:03Z review comment). The first version drove `tail <path> -f`: GNU tail permutes a trailing
+# option, but BSD/macOS tail uses getopt and STOPS at the first operand, so `<path> -f` became TWO file
+# operands — tail printed, exited, `ps` was empty, the plant assertion below redded, and the Mac half of the
+# fleet got a red suite on a change that is green in CI (CI has no macos runner). Moving `-f` in front of
+# the operand is not a fix either: argv[1] then holds the flag and the case witnesses nothing. So the
+# OPERAND blocks by itself — a FIFO at the harness path, held open by a writer, and `tail` with NO flag
+# blocks reading it. Same shape on Linux and BSD, and argv stays `cat <path>` with the path at argv[1].
+# The tree is a real worktree INSIDE the pin root, so the recorded-root bound, the toplevel guard and the
+# age rule all accept it: the shell allow-list is the ONLY thing that can reject this plant.
+_CASE=$((_CASE+1)); echo "=== A36j: argv[1] IS the path but argv[0] is NOT a shell -> cannot answer (allow-list) ==="
+_T36J="$D/pins/jtree"
+git -C "$T/src" worktree add --detach "$_T36J" "$C2" >/dev/null 2>&1
+_F36J="$_T36J/scripts/orchestrator-harness/orch-loop.sh"
+rm -f "$_F36J"; mkfifo "$_F36J" 2>/dev/null
+if [ ! -p "$_F36J" ]; then
+  ok "mkfifo is unavailable on this host — nothing to block on (A36c/A36h/A36o still witness the allow-list)"
+else
+  sleep 120 > "$_F36J" & _W36J=$!
+  bash -c 'exec -a cat tail "$1"' _ "$_F36J" >/dev/null 2>&1 & _P32=$!
+  sleep 1
+  case "$(ps -ww -o command= -p "$_P32" 2>/dev/null)" in
+    "cat "*"orch-loop.sh"*) ok "the plant's argv really is `cat <path>` (argv[1] = the path, argv[0] not a shell)" ;;
+    *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P32" 2>/dev/null)" ;; esac
+  printf '%s\n' "$_P32" > "$D/o/.orch.lock"
+  RA="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+         --pin "$PIN" --self "$D/o" 2>&1)"
+  rm -f "$D/o/.orch.lock"; reap "$_P32"; reap "$_W36J"; rm -f "$_F36J"
+  case "$RA" in *"running=$(short "$C2")"*)
+                  bad "a NON-SHELL argv[1] answered for the box (false current) — the shell allow-list is gone: $RA" ;;
+               *"running=$(short "$C1")"*)
+                  ok "a non-shell that names the path as an argument cannot answer — the shell allow-list holds" ;;
+               *) bad "the record named neither tree: $RA" ;; esac
+fi
+
+# ⛔ A36k: THE PIN-FILE ARM IS THE ONLY RECORD THAT CAN NAME A READ DIR OUTSIDE THE PIN ROOT (#2216), AND IT
+# HAD NO WITNESS (review cycle 6, measured: deleting the block left the suite green at 211/211 — every A36*
+# invocation passes HARNESS_PIN_DIR and none passes HARNESS_PIN_FILE). Without it every box of that shape
+# falls back to `stamp:*` → `restart-pending`, which is #2641 itself. Driven with HARNESS_PIN_DIR UNSET so
+# the arm is the only thing that can resolve, and the file holds the first line a real one holds
+# (`<tree>/scripts/orchestrator-harness`, written by install.sh).
+_CASE=$((_CASE+1)); echo "=== A36k: with NO pin root, the HARNESS_PIN_FILE tree still resolves RUNNING ==="
+_P33="$T/a24/path-pin"
+printf '%s\n' "$_T24/scripts/orchestrator-harness" > "$_P33"
+bash "$_O26" & _P34=$!
+sleep 1
+printf '%s\n' "$_P34" > "$D/o/.orch.lock"
+RB="$(env -u HARNESS_PIN_DIR O="$D/o" HARNESS_PIN_FILE="$_P33" bash "$RR" --no-fetch --repo "$T/src" \
+       --ref origin/main --pin "$PIN" --self "$D/o" 2>&1)"
+rm -f "$D/o/.orch.lock"; rm -f "$_P33"; reap "$_P34"
+case "$RB" in *"running=$(short "$C2")"*)
+                ok "the pin-file tree answers with NO pin root — the #2216 shape is not left on the stamp" ;;
+             *"running=$(short "$C1")"*)
+                bad "the HARNESS_PIN_FILE arm did not resolve (dead code in CI): RUNNING fell to the stamp: $RB" ;;
+             *) bad "the record named neither tree: $RB" ;; esac
+
+# ⛔ A36l: THE LEGACY FLAT-PIN ARM HAS ITS OWN WITNESS (review cycle 7, measured: deleting the arm's one
+# line at `_acc` left the suite green at 218/218). A flat pin is a DIFFERENT recorded root shape from the
+# per-commit child `apply` creates: there the pin root IS the worktree, so the controller tree is
+# `<HARNESS_PIN_DIR>/scripts` with NO sha12 component. Every other A36* case drives either a child
+# (`$D/pins/<sha12>/scripts`), the pin-file tree (A36k), or nothing, and the generic
+# `<pin-root>/<one component>/scripts` fallback CANNOT serve this shape — `_rest` is then the literal
+# `scripts`, which does not match its `*/scripts` prefix test (verified: `case scripts in */scripts)` is
+# no match). So this arm is the ONLY thing that resolves a box on a flat pin, and without it that box
+# keeps the permanent `restart-pending` this whole change exists to remove. Driven on its own seed (its
+# own stale stamp at C1) so no earlier case can supply the answer.
+_CASE=$((_CASE+1)); echo "=== A36l: a LEGACY FLAT pin (the pin root IS the worktree) still resolves RUNNING ==="
+D="$T/a24"; _T25="$D/flatpin"
+git -C "$T/src" worktree add --detach "$_T25" "$C2" >/dev/null 2>&1
+printf '#!/bin/bash\nsleep 120\n' > "$_T25/scripts/orchestrator-harness/orch-loop.sh"
+_O27="$_T25/scripts/orchestrator-harness/orch-loop.sh"
+mkdir -p "$D/o2/state"
+printf '{"commit": "%s"}\n' "$C1" > "$D/o2/.agent-infra-stamp.json"
+bash "$_O27" & _P35=$!
+sleep 1
+# The plant is asserted to be argv-shaped BEFORE the outcome is read (the A25 lesson: a dead or unnamed
+# plant makes every assertion below vacuously pass).
+case "$(ps -ww -o command= -p "$_P35" 2>/dev/null)" in
+  *"$_O27"*) ok "the plant really executes <flat-pin-root>/scripts/orchestrator-harness/orch-loop.sh" ;;
+  *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P35" 2>/dev/null)" ;;
+esac
+printf '%s\n' "$_P35" > "$D/o2/.orch.lock"
+RL="$(O="$D/o2" HARNESS_PIN_DIR="$_T25" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o2" 2>&1)"; RCL=$?
+rm -f "$D/o2/.orch.lock"; reap "$_P35"
+case "$RL" in *"running=$(short "$C2")"*)
+                ok "the flat-pin tree answers — <pin-root>/scripts passes the recorded-root bound" ;;
+             *"running=$(short "$C1")"*)
+                bad "the flat-pin arm did not resolve (dead code): RUNNING fell to the seed stamp: $RL" ;;
+             *) bad "the record named neither tree — the stage was skipped, not exercised: $RL" ;; esac
+case "$RL" in *relation=current*) ok "…and a correctly-activated flat-pin cell reports current, not restart-pending forever" ;;
+              *) bad "a flat-pin cell still cannot say it is current: $RL" ;; esac
+[ "$RCL" = 0 ] || bad "exit $RCL on the flat-pin read: $RL"
+
+# ⛔ A36m: A NON-REGULAR `HARNESS_PIN_FILE` MUST NOT HANG THE REFRESH (review cycle 8, P3). The block that
+# reads the pin guards the LOCK against a FIFO eighty lines earlier (`:321`) for exactly this reason —
+# `head` BLOCKS ON OPEN on a non-regular file — and then read the PIN with `-r`, which is TRUE for a FIFO.
+# On a cell that is a hang with no output, EVERY cycle, silently: the refresh is a synchronous child of
+# `orch-loop.sh`, so the whole controller cycle stops. `-f` is the gate this same file already uses for
+# this same path at the `DEPLOYED` read, and the one `launchd-cycle.sh`/`install.sh` use.
+#
+# ⛔ THE PLANT AND THE LOCK ARE LOAD-BEARING, NOT DECORATION. The pin-file read sits inside
+# `if [ -n "$_ctrl_tree" ]`, and `_ctrl_tree` is resolved from the LOCKED process's argv — so a fixture
+# with no live controller never reaches line 403 at all and the case passes without touching the gate
+# (MEASURED: the first draft of this case had no plant and stayed GREEN with the gate mutated back to
+# `-r` — vacuous, the exact A36h/A36l defect). So the shape is A36k's: a real `orch-loop.sh`-argv sleeper
+# at C2, the lock naming it, `HARNESS_PIN_DIR` UNSET so the pin-file arm is the only accept-root entry.
+#
+# ⛔ BOTH ARMS ARE ASSERTED, AND THAT IS WHAT MAKES THE FIXTURE SELF-PROVING (review cycle 9, P3). `-f`
+# makes the FIFO contribute nothing, `_ok` stays 0 and RUNNING falls to the seed stamp's C1 — but C1 is
+# ALSO what a fixture whose plant died or whose lock was never written prints, so an arm asserting only
+# C1 would read `ok` on a rotted fixture and the vacuity above could silently return. So the SAME fixture
+# is driven first with a REGULAR pin file (which must resolve C2 — proving the stage is reached and the
+# plant is live) and only then with the FIFO (which must fall to C1). Neither arm alone is evidence.
+_CASE=$((_CASE+1)); echo "=== A36m: a FIFO HARNESS_PIN_FILE does not hang the refresh (the gate is -f, not -r) ==="
+_F26="$T/a24/path-fifo"
+rm -f "$_F26"; mkfifo "$_F26" 2>/dev/null
+if [ ! -p "$_F26" ]; then
+  ok "mkfifo is unavailable on this host — nothing to hang on (A36k still pins the -f read on a regular file)"
+else
+  rm -f "$D/o/fifo.out"
+  bash "$_O26" & _P36=$!
+  sleep 1
+  printf '%s\n' "$_P36" > "$D/o/.orch.lock"
+  # The plant is asserted to be argv-shaped BEFORE either outcome is read (the A25/A36l lesson).
+  case "$(ps -ww -o command= -p "$_P36" 2>/dev/null)" in
+    *"$_O26"*) ok "the plant really executes <pin-tree>/scripts/orchestrator-harness/orch-loop.sh" ;;
+    *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P36" 2>/dev/null)" ;;
+  esac
+  # CONTROL ARM — a REGULAR pin file on this same fixture must resolve C2. This is what proves the stage
+  # is reached, so the FIFO arm's C1 below cannot be a skip wearing an ok.
+  _K26="$T/a24/path-ctrl"
+  printf '%s\n' "$_T24/scripts/orchestrator-harness" > "$_K26"
+  _KC26="$(env -u HARNESS_PIN_DIR O="$D/o" HARNESS_PIN_FILE="$_K26" bash "$RR" --no-fetch --repo "$T/src" \
+            --ref origin/main --pin "$PIN" --self "$D/o" 2>&1)"
+  case "$_KC26" in
+    *"running=$(short "$C2")"*) ok "control: the same fixture with a REGULAR pin file resolves C2 — the stage is reached" ;;
+    *) bad "control: a REGULAR pin file did not resolve C2, so this case proves nothing about the FIFO: $_KC26" ;;
+  esac
+  rm -f "$_K26"
+  env -u HARNESS_PIN_DIR O="$D/o" HARNESS_PIN_FILE="$_F26" bash "$RR" --no-fetch --repo "$T/src" \
+      --ref origin/main --pin "$PIN" --self "$D/o" >"$D/o/fifo.out" 2>&1 & _R36=$!
+  _i26=0
+  while kill -0 "$_R36" 2>/dev/null && [ "$_i26" -lt 60 ]; do sleep 0.25; _i26=$((_i26+1)); done
+  if kill -0 "$_R36" 2>/dev/null; then
+    # Regression branch: clean up BOTH the refresh and any `head` blocked on the FIFO, by the FIFO's own
+    # unique path so nothing else on the host can be signalled, and never let a red test leak a hang.
+    kill -9 "$_R36" 2>/dev/null; pkill -9 -f "$_F26" 2>/dev/null; wait "$_R36" 2>/dev/null
+    bad "the refresh was still blocked after 15s on a FIFO pin file — head blocks on open; the gate must be -f, not -r"
+  else
+    wait "$_R36" 2>/dev/null
+    ok "the refresh returned instead of blocking on the FIFO — the -f gate rejected a non-regular pin"
+    case "$(cat "$D/o/fifo.out")" in
+      *"running=$(short "$C1")"*)
+        ok "…and RUNNING fell to the seed stamp (the safe direction) — the FIFO was not accepted as a root" ;;
+      *"running=$(short "$C2")"*)
+        bad "the FIFO was accepted as a recorded root — the gate is not filtering non-regular files" ;;
+      *relation=*)
+        bad "the refresh wrote a record but named neither tree — the pin stage was skipped, not exercised: $(cat "$D/o/fifo.out")" ;;
+      *)
+        bad "the refresh returned but produced no record: $(cat "$D/o/fifo.out")" ;;
+    esac
+  fi
+  # ⛔ `reap`, not `kill`: `$_O26` is `#!/bin/bash` + `sleep 120`, so the pid this case holds is the
+  # WRAPPER and the sleeper is its CHILD — a bare `kill` orphans a 2-minute sleeper at ppid 1.
+  reap "$_P36"
+  rm -f "$D/o/.orch.lock" "$_F26" "$D/o/fifo.out"
+fi
+
+# ⛔ A36n: THE LOCK READ'S `-f` IS LOAD-BEARING AND HAD NO WITNESS (review cycle 10, P2). The stage guards
+# `$O/.orch.lock` with `-f` for exactly the reason A36m guards the pin file with it — `head` BLOCKS ON OPEN
+# on a non-regular file — and nothing distinguished `-f` from `-r` there: MEASURED on a scratch copy,
+# `-f` → `-r` at the lock read left the suite at 226 passed / 0 failed. On a cell that is a silent hang of
+# the controller's WHOLE cycle, every cycle (the refresh is a synchronous child of `orch-loop.sh`).
+#
+# ⛔ THE CONTROL ARM COMES FIRST, AND THAT IS WHAT KEEPS THIS CASE FROM BEING A SKIP IN DISGUISE: a REGULAR
+# lock on the same fixture must resolve C2, so the FIFO arm's C1 cannot be read as "the stage never ran"
+# (the A36m lesson).
+_CASE=$((_CASE+1)); echo "=== A36n: a FIFO \$O/.orch.lock does not hang the refresh (the gate is -f, not -r) ==="
+_L36N="$D/o/.orch.lock"
+rm -f "$_L36N"
+bash "$_O26" & _P36N=$!
+sleep 1
+case "$(ps -ww -o command= -p "$_P36N" 2>/dev/null)" in
+  *"$_O26"*) ok "the plant really executes <pin-tree>/scripts/orchestrator-harness/orch-loop.sh" ;;
+  *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P36N" 2>/dev/null)" ;; esac
+printf '%s\n' "$_P36N" > "$_L36N"
+_KC36N="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_KC36N" in
+  *"running=$(short "$C2")"*) ok "control: a REGULAR lock on this fixture resolves C2 — the stage is reached" ;;
+  *) bad "control: a REGULAR lock did not resolve C2, so this case proves nothing about the FIFO: $_KC36N" ;; esac
+rm -f "$_L36N"; mkfifo "$_L36N" 2>/dev/null
+if [ ! -p "$_L36N" ]; then
+  ok "mkfifo is unavailable on this host — nothing to hang on (A36m pins the same gate on the pin file)"
+else
+  O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$D/o" >"$D/o/lockfifo.out" 2>&1 & _R36N=$!
+  _i36n=0
+  while kill -0 "$_R36N" 2>/dev/null && [ "$_i36n" -lt 60 ]; do sleep 0.25; _i36n=$((_i36n+1)); done
+  if kill -0 "$_R36N" 2>/dev/null; then
+    # Clean up BOTH the refresh and any `head` blocked on the FIFO, by the FIFO's own unique path so nothing
+    # else on the host can be signalled, and never let a red test leak a hang.
+    kill -9 "$_R36N" 2>/dev/null; pkill -9 -f "$_L36N" 2>/dev/null; wait "$_R36N" 2>/dev/null
+    bad "the refresh was still blocked after 15s on a FIFO lock — head blocks on open; the gate must be -f, not -r"
+  else
+    wait "$_R36N" 2>/dev/null
+    ok "the refresh returned instead of blocking on the FIFO lock — the -f gate rejected a non-regular lock"
+    case "$(cat "$D/o/lockfifo.out")" in
+      *"running=$(short "$C1")"*)
+        ok "…and RUNNING fell to the seed stamp (the safe direction) — the FIFO was not read as an owner" ;;
+      *"running=$(short "$C2")"*)
+        bad "the FIFO lock was read as a controller's pid file" ;;
+      *relation=*)
+        bad "the refresh wrote a record but named neither tree — the lock stage was skipped, not exercised: $(cat "$D/o/lockfifo.out")" ;;
+      *)
+        bad "the refresh returned but produced no record: $(cat "$D/o/lockfifo.out")" ;;
+    esac
+  fi
+fi
+rm -f "$_L36N" "$D/o/lockfifo.out"; reap "$_P36N"
+
+# ⛔ A36o: THE TOKEN SPLIT MUST NOT GLOB (review cycle 10, P2). `for _w in $_argv` splits the ONE `ps`
+# string on whitespace, which is the point — but with globbing ON a `*`/`?` token is expanded against the
+# filesystem, so a word that was never in argv can be INVENTED, and an invented word that looks like a
+# controller path then answers for the box. MEASURED on a scratch copy: replacing the
+# `case $- in *f*) … set -f ;; esac` line with `_glob_had=0` left the suite at 226 passed / 0 failed.
+#
+# ⛔ THE TWO ARMS DIFFER IN ONE CHARACTER — `?` vs `h` — so this case cannot pass by the stage being
+# skipped: argv[1] = the REAL path must resolve C2 (control), and argv[1] = the GLOB that matches that same
+# file must not. The plant is `yes`: it never OPENS its argument (so the literal glob really survives in the
+# process table) and never exits (so `ps` has something to read). Both are asserted before the outcome.
+_CASE=$((_CASE+1)); echo "=== A36o: a glob token in argv is not expanded into a controller path (set -f) ==="
+_G36O="$_T24/scripts/orchestrator-harness/orch-loop.s?"
+bash -c 'exec -a bash yes "$1"' _ "$_G36O" >/dev/null 2>&1 & _P36O=$!
+sleep 1
+case "$(ps -ww -o command= -p "$_P36O" 2>/dev/null)" in
+  "bash "*"orch-loop.s?") ok "the plant's argv[1] really is the GLOB, and argv[0] is a shell (the allow-list cannot be what rejects it)" ;;
+  *) bad "the plant did not keep the literal glob in argv[1]: $(ps -ww -o command= -p "$_P36O" 2>/dev/null)" ;; esac
+printf '%s\n' "$_P36O" > "$D/o/.orch.lock"
+_RO36O="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_RO36O" in *"running=$(short "$C2")"*) bad "a GLOB token was expanded into a controller path (globbing on in the token split): $_RO36O" ;;
+                 *"running=$(short "$C1")"*) ok "a glob token is not expanded — an invented word cannot answer for the box" ;;
+                 *) bad "the record named neither tree — the stage was skipped, not exercised: $_RO36O" ;; esac
+reap "$_P36O"
+bash -c 'exec -a bash yes "$1"' _ "$_T24/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 & _P36Q=$!
+sleep 1
+printf '%s\n' "$_P36Q" > "$D/o/.orch.lock"
+_RC36O="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_RC36O" in *"running=$(short "$C2")"*) ok "control: the same plant naming the REAL path resolves C2 — the stage is reached" ;;
+                 *) bad "control: the real path did not resolve C2, so the glob arm proves nothing: $_RC36O" ;; esac
+rm -f "$D/o/.orch.lock"; reap "$_P36Q"
+
+# ⛔ A36p: THE RECORDED-ROOT BOUND IS WHOLE-PATH, NOT A SUFFIX MATCH (review cycle 10, P2). `_nl=$'\n'` is
+# what keeps the membership test an EQUALITY between one recorded entry and one candidate path; with it
+# empty, `_acc` is one run-on string and the test degrades to a SUBSTRING match — a tree whose raw path is
+# only a textual SUFFIX of a recorded path then answers for this box. MEASURED on a scratch copy:
+# `_nl=$'\n'` → `_nl=""` left the suite at 226 passed / 0 failed.
+#
+# The fixture makes the raw strings differ while the recorded entry still ENDS WITH the controller's path:
+# the pin root is `<…>/nlroot` CONCATENATED with the controller tree's own path, so `_acc` ends with
+# `<ctrl>/scripts/…` while `<ctrl>` is a real worktree — its own toplevel — OUTSIDE that pin root.
+#
+# ⛔ AND THE CONTROL ARM IS THE POINT: the same plant under a pin root that legitimately CONTAINS it (the
+# single-child arm) must resolve C2, so the negative arm cannot be a skipped stage in disguise.
+_CASE=$((_CASE+1)); echo "=== A36p: a tree that is only a textual SUFFIX of a recorded root cannot answer (whole-path bound) ==="
+_T36P="$T/a24/nlsuffix"
+git -C "$T/src" worktree add --detach "$_T36P" "$C2" >/dev/null 2>&1
+printf '#!/bin/bash\nsleep 120\n' > "$_T36P/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_T36P/scripts/orchestrator-harness/orch-loop.sh" & _P36R=$!
+sleep 1
+case "$(ps -ww -o command= -p "$_P36R" 2>/dev/null)" in
+  *"$_T36P/scripts/orchestrator-harness/orch-loop.sh"*) ok "the plant really executes its own tree's harness path" ;;
+  *) bad "the plant is not the shape this case exists to test: $(ps -ww -o command= -p "$_P36R" 2>/dev/null)" ;; esac
+printf '%s\n' "$_P36R" > "$D/o/.orch.lock"
+_RC36P="$(O="$D/o" HARNESS_PIN_DIR="$T/a24" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_RC36P" in *"running=$(short "$C2")"*) ok "control: the SAME plant under a pin root that CONTAINS it resolves C2 — the stage is reached" ;;
+                 *) bad "control: the containing pin root did not resolve C2, so the suffix arm proves nothing: $_RC36P" ;; esac
+_P36PR="$T/a24/nlroot$_T36P"
+mkdir -p "$_P36PR"
+_RS36P="$(O="$D/o" HARNESS_PIN_DIR="$_P36PR" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+           --pin "$PIN" --self "$D/o" 2>&1)"
+case "$_RS36P" in *"running=$(short "$C2")"*) bad "a tree that is only a textual SUFFIX of the pin root answered (the bound degraded to a substring match): $_RS36P" ;;
+                 *"running=$(short "$C1")"*) ok "a suffix of a recorded root is not a recorded root — the stamp stands" ;;
+                 *) bad "the record named neither tree — the stage was skipped, not exercised: $_RS36P" ;; esac
+rm -f "$D/o/.orch.lock"; reap "$_P36R"
+
+# ⛔ A36b: A TREE OUTSIDE EVERY RECORDED ROOT CANNOT ANSWER FOR THIS BOX. The harness path is SHARED
+# across repos on one machine, so "a controller is running" and "MY controller is running" are different
+# questions (the #1856 shape the supervisor answers with its ownership read). A peer repo's controller
+# must never supply this box's commit — that would report `current` from another repo's tree — so with
+# the lock naming a controller OUTSIDE `HARNESS_PIN_DIR`, RUNNING must stay on the stamp.
+_CASE=$((_CASE+1)); echo "=== A36b: a controller outside the recorded pin root cannot answer for this box ==="
+_T24B="$D/elsewhere/src-other"
+_mkdir_p="$(dirname "$_T24B")"
+mkdir -p "$_mkdir_p"
+git -C "$T/src" worktree add --detach "$_T24B" "$C2" >/dev/null 2>&1
+printf '#!/bin/bash\nsleep 120\n' > "$_T24B/scripts/orchestrator-harness/orch-loop.sh"
+_O26B="$_T24B/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_O26B" & _P24C=$!
+sleep 1
+printf '%s\n' "$_P24C" > "$D/o/.orch.lock"
+R2="$(O="$D/o" HARNESS_PIN_DIR="$D/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC2=$?
+rm -f "$D/o/.orch.lock"; reap "$_P24C"
+case "$R2" in *relation=current*) bad "a foreign controller's tree bought a current verdict: $R2" ;;
+               *relation=restart-pending*) ok "a foreign controller's tree does not buy a current verdict" ;;
+               *) bad "unexpected record: $R2" ;; esac
+case "$R2" in *"running=$(short "$C1")"*) ok "…and RUNNING stayed on the stamp, not on the foreign tree" ;;
+               *) bad "the fallback did not name the stamp's commit: $R2" ;; esac
+
+# ⛔ A36d: THE OWN-TOPLEVEL GUARD HAS A WITNESS. Cycle-3 review found the guard at `_want_root` had NO
+# case that could distinguish its removal: delete it and the suite stayed green while `git -C` on a
+# stale child that LOST its `.git` ASCENDED into the enclosing worktree and reported ITS head — a
+# `current` for a tree the controller is not executing, i.e. the false-PASS defence deletable in
+# silence. The pin root here IS a worktree at the TIP; inside it sits a stale `<sha12>/` copy without a
+# `.git`, which is exactly what a killed `apply` leaves behind. RUNNING must stay on the stamp (C1).
+_CASE=$((_CASE+1)); echo "=== A36d: a stale copy that lost its own .git cannot ascend into an enclosing worktree ==="
+D="$T/a25"; mkdir -p "$D/o/state" "$D/pin" "$D/pin2"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C2" > "$PIN"
+printf '{"commit": "%s"}\n' "$C1" > "$D/o/.agent-infra-stamp.json"
+_P25="$D/pin2"
+git -C "$T/src" worktree add --detach "$_P25" "$C2" >/dev/null 2>&1
+mkdir -p "$_P25/$(short "$C1")/scripts/orchestrator-harness"
+printf '#!/bin/bash\nsleep 120\n' > "$_P25/$(short "$C1")/scripts/orchestrator-harness/orch-loop.sh"
+_O27="$_P25/$(short "$C1")/scripts/orchestrator-harness/orch-loop.sh"
+# The lock is written AFTER the process starts, as `orch-loop.sh` does: the age half must ACCEPT this
+# owner (shape+age), so the case exercises the TOPLEVEL guard and nothing else.
+bash "$_O27" & _P26=$!
+sleep 1
+printf '%s\n' "$_P26" > "$D/o/.orch.lock"
+R4="$(O="$D/o" HARNESS_PIN_DIR="$_P25" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC4=$?
+rm -f "$D/o/.orch.lock"; reap "$_P26"
+case "$R4" in *"running=$(short "$C2")"*) bad "a stale copy without .git ascended into the enclosing worktree (false current): $R4" ;;
+               *"running=$(short "$C1")"*) ok "a tree that is not its own toplevel cannot answer — the stamp stands" ;;
+               *) bad "the record named neither tree — the stage was skipped, not exercised: $R4" ;; esac
+
+# ⛔ A36e: PATHS ARE COMPARED PHYSICALLY — the witness for the `pwd -P` normalisation that cycle-4 review
+# found MISSING (it was measured on a Mac: the fixture root is `TMPDIR`, and `/var` is a symlink into
+# `/private/var`, so A36 redded there while CI — Linux-only — went green). A symlinked pin root makes
+# the same defect reproducible on Linux: the argv token carries the LOGICAL path the launcher wrote,
+# `git rev-parse --show-toplevel` answers PHYSICAL, and compared raw they never match — the stage then
+# gives up silently and #2641's permanent `restart-pending` is back. This case MUST report `current`
+# from the controller's tree.
+_CASE=$((_CASE+1)); echo "=== A36e: a pin root reached through a SYMLINK still resolves RUNNING (physical compare) ==="
+mkdir -p "$D/link-target"
+git -C "$T/src" worktree add --detach "$D/link-target/$(short "$C2")" "$C2" >/dev/null 2>&1
+ln -s "$D/link-target" "$D/link2"
+printf '#!/bin/bash\nsleep 120\n' > "$D/link-target/$(short "$C2")/scripts/orchestrator-harness/orch-loop.sh"
+# The controller is launched through the SYMLINKED path — the shape a symlinked cell home produces.
+_O28="$D/link2/$(short "$C2")/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_O28" & _P27=$!
+sleep 1
+printf '%s\n' "$_P27" > "$D/o/.orch.lock"
+R5="$(O="$D/o" HARNESS_PIN_DIR="$D/link2" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC5=$?
+rm -f "$D/o/.orch.lock"; reap "$_P27"
+case "$R5" in *relation=current*) ok "a symlinked pin root still resolves the running tree — not a silent give-up" ;;
+               *restart-pending*) bad "a symlinked pin root silently gave up (logical vs physical compare): $R5" ;;
+               *) bad "unexpected record: $R5" ;; esac
+case "$R5" in *"running=$(short "$C2")"*) ok "…and running= names the controller's tree, not the seed stamp" ;;
+               *) bad "running= did not come from the controller's tree: $R5" ;; esac
+
+# ⛔ A36f: A RECYCLED-PID LOCK IS NOT AN OWNER (the age half, review P1 twice). `$O/.orch.lock` is data on
+# disk and outlives a `kill -9`/OOM/reboot; the OS can RECYCLE the pid onto a peer lane's controller,
+# which on a cell is the SAME basename from the SAME shared harness path — so the argv SHAPE matches
+# perfectly and a shape-only read reports `current` for a tree this box is not executing. A controller
+# writes `$LOCK` AFTER it starts, so a process that BEGAN after the lock was written cannot be its
+# owner. Driven by backdating the LOCK: the live controller began long after it, so the stage must
+# refuse it and leave RUNNING on the stamp (C1) instead of certifying C2.
+_CASE=$((_CASE+1)); echo "=== A36f: a lock whose pid began AFTER the lock was written is not the controller (age) ==="
+printf '#!/bin/bash\nsleep 120\n' > "$_T24/scripts/orchestrator-harness/orch-loop.sh"
+bash "$_O26" & _P28=$!
+printf '%s\n' "$_P28" > "$D/o/.orch.lock"
+# BACKDATE the lock by an hour: this process provably began after the lock was written, which is the
+# recycled-pid shape the age rule exists for (the pid is alive and its argv matches).
+touch -t 202001010000 "$D/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00' "$D/o/.orch.lock" 2>/dev/null || true
+R6="$(O="$D/o" HARNESS_PIN_DIR="$T/a24/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$D/o" 2>&1)"; RC6=$?
+rm -f "$D/o/.orch.lock"; reap "$_P28"
+case "$R6" in *"running=$(short "$C2")"*) bad "a recycled-pid lock certified the tree it names (no age test): $R6" ;;
+               *"running=$(short "$C1")"*) ok "a process that began after the lock was written is not its owner" ;;
+               *) bad "the record named neither tree — the age path was skipped, not exercised: $R6" ;; esac
+
+# ⛔ A36g: AN AGE THAT CANNOT BE READ IS NOT OWNERSHIP (review P1, cycle 5). The `|| return 1` arm this
+# case drives is the one that stops a stale lock buying `current` when `ps` is broken — and it had NO
+# witness, so it could be flipped to "unreadable ⇒ I own it" with the suite green. Driven through the
+# `PS_BIN` seam the three canonical copies already carry, because a bare `ps` left this arm untestable.
+_CASE=$((_CASE+1)); echo "=== A36g: an unreadable age is not ownership — a failing ps leaves RUNNING on the stamp ==="
+mkdir -p "$T/a25/bin"
+# ⛔ THE SHIM FAILS THE AGE READ ONLY. `PS_BIN` feeds BOTH reads in this stage: the age read
+# (`-o etime=`, harness-refresh.sh:299) AND the argv read (`-ww -o command=`, :343). A shim that failed
+# unconditionally therefore emptied `_argv` too, so RUNNING fell to the stamp whether or not the arm
+# under test existed — the first version of this case was VACUOUS, and the body's mutation claim about
+# it was false (MEASURED: flipping BOTH `|| return 1` unreadable-age arms to `|| return 0` left the
+# suite at 225 passed / 0 failed). Passing the argv read through to the real `ps` keeps the plant's
+# tree resolvable, so the ONLY thing between it and a false `current` is the arm this case witnesses.
+REAL_PS_BIN="$(command -v ps)"
+cat > "$T/a25/bin/ps-noage" <<SH
+#!/bin/sh
+case "\$*" in *etime*) exit 1 ;; esac
+exec "$REAL_PS_BIN" "\$@"
+SH
+chmod +x "$T/a25/bin/ps-noage"
+# …and the shim must still ANSWER the argv read, or this case degrades silently back to vacuous and a
+# future reader inherits a green that witnesses nothing.
+case "$("$T/a25/bin/ps-noage" -ww -o command= -p "$$" 2>/dev/null)" in
+  '') bad "the ps-noage shim cannot answer the argv read — the unreadable-age case is vacuous again" ;;
+   *) ok "…and the shim still answers the argv read, so the unreadable-age arm is the only thing under test" ;; esac
+bash "$_O26" & _P29=$!
+sleep 1
+printf '%s\n' "$_P29" > "$T/a25/o/.orch.lock"
+R7="$(O="$T/a25/o" HARNESS_PIN_DIR="$T/a24/pins" PS_BIN="$T/a25/bin/ps-noage" bash "$RR" --no-fetch \
+       --repo "$T/src" --ref origin/main --pin "$PIN" --self "$T/a25/o" 2>&1)"
+rm -f "$T/a25/o/.orch.lock"; reap "$_P29"
+case "$R7" in *"running=$(short "$C2")"*) bad "an unreadable age was read as ownership (false current): $R7" ;;
+               *"running=$(short "$C1")"*) ok "an age that cannot be read is not ownership — the stamp stands" ;;
+               *) bad "the record named neither tree: $R7" ;; esac
+
+# ⛔ A36h: THE PATH MUST BE THE SHELL'S SCRIPT OPERAND (argv[1]), NOT A WORD ANYWHERE IN THE ARGUMENTS.
+# Cycle-5 review measured this through the shipped script: `perl -e 'sleep 120' bash <path>` resolved
+# `relation=current` under a predecessor-token rule, although every precedent (`_controller_ps_awk`
+# `tok[2]`, `lock_controller_pid` `${2##*/}`, `check-deployed-drift.sh` `t[2]`) reads POSITIONALLY. Here
+# the wrapper is `bash -c 'sleep 120 & wait' bash <path>`: the same words in the same order, one wrapper
+# deep, with the path as ARGUMENT rather than as the script being executed.
+#
+# ⛔ THE PLANT MUST NOT BE EXEC'D, OR THIS CASE WITNESSES NOTHING (review cycle 11, P1). The first
+# version drove `bash -c 'sleep 120' bash <path>` — a SINGLE-COMMAND `-c`, which bash optimises into an
+# `execve`: measured, `ps -ww -o command= -p <pid>` answers `sleep 120`, with NO shell token and no
+# harness path anywhere in argv. Nothing can resolve a tree from that — not the shipped rule, not a
+# predecessor-token rule, not a whole-argv scan — so the `bad` arm below was UNREACHABLE and the case
+# passed on the PRE-FIX code as well (measured: reverting the read to a predecessor-token rule left the
+# suite at 236 passed / 0 failed, A36h ✅ in both). The `& wait` keeps bash in the parent role, so argv
+# stays `bash -c sleep 120 & wait bash <path>` and the path is genuinely an argument. Asserted BEFORE the
+# outcome is read (the A25/A36j lesson: an unnamed or mis-shaped plant makes everything below vacuous).
+_CASE=$((_CASE+1)); echo "=== A36h: a wrapper that only PASSES the path as an argument is not the controller ==="
+bash -c 'sleep 120 & wait' bash "$_O26" & _P30=$!
+sleep 1
+case "$(ps -ww -o command= -p "$_P30" 2>/dev/null)" in
+  *bash*"orch-loop.sh"*) ok "the plant's argv really carries the path as an ARGUMENT, with the shell still in flight" ;;
+  *) bad "the plant is not the shape this case exists to test (exec'd single-command -c drops the path): $(ps -ww -o command= -p "$_P30" 2>/dev/null)" ;; esac
+printf '%s\n' "$_P30" > "$T/a25/o/.orch.lock"
+R8="$(O="$T/a25/o" HARNESS_PIN_DIR="$T/a24/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$T/a25/o" 2>&1)"
+rm -f "$T/a25/o/.orch.lock"; reap "$_P30"
+case "$R8" in *"running=$(short "$C2")"*) bad "a wrapper's ARGUMENT list resolved RUNNING (not argv[1] of the shell): $R8" ;;
+               *"running=$(short "$C1")"*) ok "the pair is read positionally — an argument-list mention is not the invocation" ;;
+               *) bad "the record named neither tree: $R8" ;; esac
+
+# ⛔ A37: THE SLACK IS THE FLEET'S ONE VALUE, NOT THIS FILE'S (#1856: "one predicate, three answers").
+# This script is a FOURTH standalone copy of the ownership rule (it is farmed into a flat `$O` and
+# cannot source `scripts/lib/`), so its slack must be PUSHED from the canonical declaration instead of
+# remembered. Without this arm, moving the shared default leaves this reader at the old value — and a
+# pid that began after the lock is then accepted as its owner.
+_CASE=$((_CASE+1)); echo "=== A37: the lock-age slack is the same value as scripts/lib/pid-identity.sh ==="
+_ROOT="$(cd "$HERE/../.." && pwd)"
+_canon="$(grep -oE 'PID_START_SLACK_SECONDS(:-|=)[0-9]+' "$_ROOT/scripts/lib/pid-identity.sh" 2>/dev/null | head -1 | sed -E 's/.*(:-|=)//')"
+_here="$(grep -oE 'HARNESS_LOCK_START_SLACK_SECONDS(:-|=)[0-9]+' "$RR" 2>/dev/null | head -1 | sed -E 's/.*(:-|=)//')"
+[ -n "$_canon" ] && [ -n "$_here" ] \
+  && ok "both copies declare a numeric default (pid-identity=$_canon harness-refresh=$_here)" \
+  || bad "a copy no longer declares its slack (pid-identity=[$_canon] harness-refresh=[$_here]) — the drift arm cannot compare"
+[ "$_canon" = "$_here" ] \
+  && ok "the lock-age slack is the canonical value ($_canon s), not a stale literal" \
+  || bad "lock-age slack DIVERGED — pid-identity=$_canon harness-refresh=$_here (a pid that began after the lock would be accepted)"
 
 # ⛔ A20: THE BOUND MUST EXIST ON macOS, WHERE `timeout` DOES NOT. A bare `timeout` call is rc=127 on the
 # Mac half of the fleet, and `if !` reads 127 as a FAILED FETCH — so the box would never fetch and would
