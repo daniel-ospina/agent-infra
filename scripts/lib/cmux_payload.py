@@ -154,12 +154,52 @@ def _marker_matches(text: str | None, marker: str) -> bool:
     not manufacture a false negative, and 16+ characters of a payload are not something a lane's
     unrelated output contains by accident. Short markers must equal the whole candidate, because a
     shorter string is a common word and any `in` / boundary test over prose certifies it.
+
+    ⛔ THIS IS THE **TRANSCRIPT** RULE. A transcript candidate is a single message value, so equality
+    is the right test there. It is the WRONG test for the rendered PANE (see `_pane_matches`): a
+    200-line pane render never equals a nine-character order, so this rule made `PANE_ONLY`
+    unreachable for exactly the short orders its sibling rule was written about.
     """
     if not marker or not text:
         return False
     if len(marker) >= MIN_WHOLE_VALUE_MARKER:
         return marker in compact(text)
     return compact(text) == marker
+
+
+def _is_word_char(ch: str | None) -> bool:
+    """Whether `ch` continues a WORD — the boundary test `_pane_matches` needs for short markers."""
+    return bool(ch) and (ch.isalnum() or ch == "_")
+
+
+def _pane_matches(text: str | None, marker: str) -> bool:
+    """Whether `marker` appears on a rendered SURFACE — a DIFFERENT question from a transcript value.
+
+    ⛔ TWO CHANNELS, TWO RULES (#1881 review P1). A transcript candidate is one message value, so a
+    short marker must EQUAL it (`_marker_matches`). A pane render is not a value: it is the last 200
+    lines of a TUI, so `compact(screen) == marker` can never hold and `PANE_ONLY` — the verdict whose
+    remedy is "check the pane, press Enter, do NOT re-send" — never fired for `resume it` / `do it
+    now` / `go on`. Those orders then fell to the catch-all arm, which diagnoses "cmux refused the
+    send or delivered a PREFIX" — a truncation story with no evidence behind it.
+
+    The pane rule is a TOKEN-BOUNDARY substring in the compacted domain: a short marker must not sit
+    inside a longer word (`ok` is not certified by "token", `continue` not by "continued"). This
+    cannot re-open a false PASS, because a pane match is never delivery evidence — it only selects
+    `PANE_ONLY`, which `orch-send.sh` reports as NOT SUBMITTED (exit 6).
+    """
+    flat = compact(text)
+    if not marker or not flat:
+        return False
+    if len(marker) >= MIN_WHOLE_VALUE_MARKER:
+        return marker in flat
+    start = flat.find(marker)
+    while start != -1:
+        end = start + len(marker)
+        if not _is_word_char(flat[start - 1] if start else None) \
+                and not _is_word_char(flat[end] if end < len(flat) else None):
+            return True
+        start = flat.find(marker, start + 1)
+    return False
 
 
 def screen_has_payload(screen: str | None, sent_text: str,
@@ -172,10 +212,11 @@ def screen_has_payload(screen: str | None, sent_text: str,
     marker = tail_marker(sent_text, tail_chars)
     if not marker:
         return False
-    return _marker_matches(screen, marker)
+    return _pane_matches(screen, marker)
 
 
-def resolve_session_id(workspace: str, run) -> str | None:
+def resolve_session_id(workspace: str, run, attempts: int = 3,
+                       retry_s: float = 0.5, sleep=time.sleep) -> str | None:
     """The pane's bound session id, or None when the pane does not NAME one.
 
     ⛔ SPLIT FROM THE FILE LOOKUP (#1881 review P1). `resolve_session_file` used to answer None for
@@ -186,16 +227,27 @@ def resolve_session_id(workspace: str, run) -> str | None:
     body certified a send whose tail was never submitted: the occurrence-identity false pass,
     reopened by the fix that closed it. "No id" and "no file for that id" are different facts and
     only the second one can establish that a file appearing later was written by this send.
+
+    ⛔ AND THIS READ IS NOT ALLOWED TO BE A ONE-SHOT (#1881 review P1). `cmux` is intermittently
+    EMPTY on a live pane — `orch-send.sh` retries its own footer read four times for that reason —
+    and the id is resolved ONCE, before the send, because a later resolution could name a DIFFERENT
+    session. So one transient hiccup used to make `VERIFIED` unreachable for that whole dispatch: a
+    message that really was submitted then reads as "not submitted", with a remedy that invites the
+    operator to re-send it. A bounded retry costs nothing in soundness (nothing has been sent yet)
+    and cannot pick up a new session: the pane that names an id at all is the one that held it.
     """
-    try:
-        proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace],
-                   timeout=45)
-        out = getattr(proc, "stdout", "") or ""
-    except Exception:                                          # noqa: BLE001
-        return None
-    for tok in out.replace("'", " ").split():
-        if len(tok) == 36 and tok.count("-") == 4:
-            return tok
+    for attempt in range(max(1, attempts)):
+        try:
+            proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace],
+                       timeout=45)
+            out = getattr(proc, "stdout", "") or ""
+        except Exception:                                      # noqa: BLE001
+            out = ""
+        for tok in out.replace("'", " ").split():
+            if len(tok) == 36 and tok.count("-") == 4:
+                return tok
+        if attempt + 1 < max(1, attempts):
+            sleep(retry_s)
     return None
 
 
@@ -227,8 +279,12 @@ def session_files_state(session_id: str | None) -> bool | None:
     both, "no file" was inferred, and the search reopened at offset 0 over a pre-existing transcript.
     An existence read that ERRORED is `None` here, and `None` never licenses the 2 MB window.
     """
+    # ⛔ AN ID WE WERE NEVER GIVEN ANSWERS "COULD NOT LOOK", NOT "NO FILE" (#1881 review P2). The
+    # call site today guards with `bool(session_id)`, so this arm is unreachable from `send_verified`
+    # — but `False` here means "a file was PROVEN absent", which licenses the offset-0 window, and a
+    # future caller passing a None id must not inherit that licence from a read it never made.
     if not session_id:
-        return False
+        return None
     root = os.path.join(os.path.expanduser("~"), ".pi", "agent", "sessions")
     try:
         with os.scandir(root) as it:
@@ -350,8 +406,6 @@ def transcript_has_payload(path: str, sent_text: str,
             chunk = fh.read().decode("utf-8", "replace")
     except Exception:                                          # noqa: BLE001
         return False
-    if _marker_matches(chunk, marker):
-        return True
     # Decode the JSONL records the send appended. A fragment at either edge of the window may not
     # parse; that is fine, a partial line can only ever ADD candidates, never remove one.
     # ⛔ EACH STRING VALUE IS ITS OWN CANDIDATE — NEVER A JOINED ONE (#1881 review, round 5 P1). The
@@ -360,7 +414,14 @@ def transcript_has_payload(path: str, sent_text: str,
     # certified the payload `check the pane first`, which the lane never sent. A whole-value rule on
     # the join can never match at all, so the join was wrong in both directions and is gone. Each
     # string value is offered separately, which is what a message actually is.
-    candidates = [chunk, *chunk.splitlines()]
+    #
+    # ⛔ AND THE WINDOW ITSELF IS NOT A CANDIDATE EITHER (#1881 review P2). `chunk` — every appended
+    # record, several lines, joined — was still offered to `_marker_matches`, and `compact()` strips
+    # whitespace AND newlines, so a >=16-char marker could be STITCHED from the tail of one record and
+    # the head of the next. The comment above claimed the joined class was closed while `chunk` kept
+    # it open. Payloads are flattened to one line before they are sent, so `splitlines()` loses
+    # nothing a real submission needs: one message is one line.
+    candidates: list[str] = list(chunk.splitlines())
     for line in chunk.splitlines():
         candidates.extend(_json_strings_of(line))
     return any(_marker_matches(candidate, marker) for candidate in candidates)
@@ -378,6 +439,21 @@ def transcript_offset(path: str | None) -> int | None:
 
 def _default_run(argv, timeout=45):
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+
+def _warn(message: str) -> None:
+    """Record a non-fatal cause on stderr, which the caller KEEPS and shows to the operator.
+
+    ⛔ THE CALLER'S DIAGNOSTIC ARM PROMISES THIS (#1881 review P2). `orch-send.sh`'s catch-all arm
+    says "the checker's diagnostics below say which when it printed any", naming the exact branch it
+    was written for — a `cmux` whose send exits 1 ("Access denied"). Nothing was written on that
+    path, so the arm promised evidence that could not exist. One line per failed call fixes it;
+    stdout stays reserved for the VERDICT, so a diagnostic can never contaminate the `case` on it.
+    """
+    try:
+        sys.stderr.write(message + "\n")
+    except Exception:                                          # noqa: BLE001
+        pass
 
 
 def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
@@ -398,12 +474,19 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     re-opens #1187. ``SUBMIT_FAILED`` means the terminating Enter failed (it raised, or `cmux` exited
     non-zero): submission was never attempted, and the remedy is to submit in that pane, never to
     re-send. A non-zero exit from the PAYLOAD send itself folds into ``UNVERIFIED`` — nothing was
-    typed, so there is no submission to reason about.
+    typed, so there is no submission to reason about — and its cause is written to stderr, because the
+    caller's arm promises the operator those diagnostics.
+
+    ⛔ THE PAYLOAD IS FLATTENED HERE, IN THE SHARED SEAM (#1881 review P2). It used to be flattened in
+    `_main` only, so the module's own documented API — and every adopter the PR body names — still
+    submitted a multi-line order one Enter per line, re-opening #1799 one call level below the only
+    place that closed it.
 
     `run` and `sleep` are seams so the send/verify loop can be exercised without
     a live cmux.
     """
     run = run or _default_run
+    text = flatten(text)
 
     def cmux(*args):
         return run(["cmux", *args], timeout=45)
@@ -417,7 +500,7 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     # by this send (or later) — only that case may reopen the search at offset 0. An id this read
     # could not obtain says nothing about whether a transcript existed, so it must never license the
     # 2 MB window: without a baseline the verdict stays below VERIFIED (PANE_ONLY at best).
-    session_id = resolve_session_id(workspace, run)
+    session_id = resolve_session_id(workspace, run, sleep=sleep)
     # ⛔ EXISTENCE IS A READ, NOT AN INFERENCE (#1881 review, rounds 4 and 5): `session_file_for`
     # answers None for "no file", "stat failed" AND "could not look", and only the FIRST of those may
     # reopen the search at offset 0. `session_files_state` reports unreadability as None, which never
@@ -429,14 +512,21 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
 
     try:
         sent = cmux("send", "--workspace", workspace, text)
-    except Exception:                                          # noqa: BLE001
+    except Exception as exc:                                   # noqa: BLE001
+        # ⛔ A FAILED SEND IS NOT A SILENT ONE (#1881 review P2). The caller's catch-all arm tells the
+        # operator "the checker's diagnostics below say which when it printed any", so this path must
+        # print something: the alternative is a message promising evidence that does not exist.
+        _warn(f"cmux send raised {type(exc).__name__}: {exc}")
         return UNVERIFIED, ""
     # ⛔ A NON-ZERO `cmux` EXIT IS NOT A SEND (#1881 review P2). `_default_run` does not raise on a
     # non-zero status, so the module's own docstring ("a non-zero `cmux` exit … folds into
     # UNVERIFIED") described a branch that did not exist: the payload send's status was never read,
-    # and the Enter's was not either. A status we cannot read (None) is treated as non-zero-safe:
-    # only an explicit 0 passes.
-    if getattr(sent, "returncode", 0) != 0:
+    # and the Enter's was not either. A status we cannot read is treated as FAILURE — the default is
+    # 1, not 0: only an explicit 0 passes, or a duck-typed seam that never set a status would read as
+    # a successful send (a false PASS, the one direction this module may not fail in).
+    if getattr(sent, "returncode", 1) != 0:
+        _warn(f"cmux send exited {getattr(sent, 'returncode', 1)}: "
+              f"{(getattr(sent, 'stderr', '') or '').strip()[:200]}")
         return UNVERIFIED, ""
 
     sleep(2)
@@ -448,9 +538,12 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
         # ⛔ A NON-ZERO EXIT FROM THE ENTER IS A DROPPED ENTER (#1881 review P2). Only the raised
         # case used to clear `entered`, so a `cmux` that exited 2 instead of raising left the flag
         # True and the verdict PANE_ONLY — whose remedy is the re-send this flag exists to forbid.
-        if getattr(enter, "returncode", 0) != 0:
+        if getattr(enter, "returncode", 1) != 0:
             entered = False
-    except Exception:                                          # noqa: BLE001
+            _warn(f"cmux send (the terminating Enter) exited "
+                  f"{getattr(enter, 'returncode', 1)}: "
+                  f"{(getattr(enter, 'stderr', '') or '').strip()[:200]}")
+    except Exception as exc:                                   # noqa: BLE001
         # ⛔ AN ENTER THAT DID NOT HAPPEN IS NOT A DETAIL (#1881 review P0). This used to be
         # swallowed, and the loop below then found the payload ON THE PANE — the composer renders
         # its content whether or not it was submitted — and returned VERIFIED. The lane never got
@@ -462,6 +555,7 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
         # than raising) left it True. The stale claim that it was "assigned and never read" is
         # corrected here: the residual defect was the missing non-zero arm above, and the pin in
         # the suite predates this round (it fails on the FIRST pre-fix bytes, not on round 3).
+        _warn(f"cmux send (the terminating Enter) raised {type(exc).__name__}: {exc}")
         entered = False
     sleep(2)
 
@@ -559,7 +653,8 @@ def _main(argv: list[str] | None = None) -> int:
     # the raw body: a `cmux send` payload's newlines are individual Enters, so a multi-line order is
     # submitted line by line, each line an independent chance at the #1187 truncation, and the tail
     # marker certifies only the last one — a lost MIDDLE line verifies. One message, one submission.
-    text = flatten(text)
+    # It happens INSIDE `send_verified` (the shared seam), not here, so a direct caller of the API
+    # cannot re-open the hole this line used to close for the CLI only.
     verdict, screen = send_verified(args.workspace, text, tail_chars=args.tail_chars,
                                     screen_lines=args.screen_lines,
                                     timeout_s=args.timeout)
