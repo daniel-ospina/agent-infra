@@ -134,10 +134,10 @@ h="$TMP/h-unread";    mkhome "$h"; rm -f "$h/.pi/agent/models.json"; mkdir -p "$
 h="$TMP/h-deliver"; mkhome "$h"
 printf 'export DEEPSEEK_API_KEY=sk_from_pi_keys\n' > "$h/pi-keys.env"
 out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-deliver" 2>&1)"
-printf '%s\n' "$out" | grep -q '^RC=0$' && rc=0 || { rc=1; echo "      $out"; }
+grep -q '^RC=0$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "a box that holds the key ONLY in pi-keys.env still PRODUCES a launch contract (no refusal)" $rc
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-printf '%s' "$pfx" | grep -q "pi-keys.env" && rc=0 || rc=1
+grep -q "pi-keys.env" <<<"$pfx" && rc=0 || rc=1
 ck "…and the launch line sources \$HOME/pi-keys.env (the file this box's own ~/.zshrc sources)" $rc
 seen="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-deliver" "$BASH" -c "$pfx; env" 2>/dev/null | grep -c '^DEEPSEEK_API_KEY=sk_from_pi_keys$')"
 [ "$seen" = "1" ] && rc=0 || { rc=1; echo "      prefix executed WITHOUT delivering the key"; }
@@ -147,11 +147,11 @@ ck "…and the EXECUTED prefix leaves the value in the worker's environment (the
 h="$TMP/h-refuse"; mkhome "$h"   # no pi-keys.env, no caller value
 out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-refuse" 2>&1)"
 err="$(cat "$TMP/O-refuse/err.txt" 2>/dev/null)"
-printf '%s\n' "$out" | grep -q '^RC=1$' && rc=0 || { rc=1; echo "      $out"; }
+grep -q '^RC=1$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "nothing provides the model credential => wt_launcher_env REFUSES (no worker is started)" $rc
-printf '%s' "$err" | grep -q 'DEEPSEEK_API_KEY' && rc=0 || { rc=1; echo "      stderr=$err"; }
+grep -q 'DEEPSEEK_API_KEY' <<<"$err" && rc=0 || { rc=1; echo "      stderr=$err"; }
 ck "…and the refusal names the VARIABLE that is missing (not the reviewer, not its output format)" $rc
-printf '%s' "$err" | grep -q 'pi-keys.env' && printf '%s' "$err" | grep -q 'keys.env' && rc=0 || rc=1
+grep -q 'pi-keys.env' <<<"$err" && grep -q 'keys.env' <<<"$err" && rc=0 || rc=1
 ck "…and every file it looked in, so the operator is sent to a real path" $rc
 
 # ── 5. THE CALLER'S OWN VALUE: credited only when it can REACH the pane, and then PROVEN there ──
@@ -165,10 +165,10 @@ ck "…and every file it looked in, so the operator is sent to a real path" $rc
 # authenticate; a pane that holds it must keep it and proceed.
 h="$TMP/h-caller"; mkhome "$h"
 out="$(WITH_KEY=1 TMUX_SERVER_EXISTS=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-caller" 2>&1)"
-printf '%s\n' "$out" | grep -q '^RC=0$' && rc=0 || { rc=1; echo "      $out"; }
+grep -q '^RC=0$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "an EXPORTED caller value, on a spawn that creates the server, is a credential => no refusal" $rc
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-printf '%s' "$pfx" | grep -q 'pi-keys.env' && rc=1 || rc=0
+grep -q 'pi-keys.env' <<<"$pfx" && rc=1 || rc=0
 ck "…and no pi-keys.env source is emitted for a box that has no such file" $rc
 rcs="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-caller" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; echo $?)"
 [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      the prefix let a worker start with NO model credential (rc=$rcs)"; }
@@ -247,7 +247,7 @@ ck "the mutation applies (the apiKey-ref detection is replaced with 'm = None')"
 h="$TMP/h-mut"; mkhome "$h"
 mut_out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$MUT" "$h" "$TMP/bin" "$TMP/O-mut" 2>&1)"
 # ARM 4's predicate, verbatim, evaluated against the mutant.
-printf '%s\n' "$mut_out" | grep -q '^RC=1$' && mutred=0 || mutred=1
+grep -q '^RC=1$' <<<"$mut_out" && mutred=0 || mutred=1
 [ "$mutred" = "1" ] && rc=0 || { rc=1; echo "      mutant ALSO refused — arm 4 tests nothing"; }
 ck "MUTANT: arm 4's predicate (\"nothing provides it => REFUSE\") FAILS — the mutant answers RC=0 and spawns a lane that cannot authenticate" $rc
 
