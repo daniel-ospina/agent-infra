@@ -1,0 +1,15 @@
+# FAILURE-CLASS FIXTURE (R2): `cancel-in-progress: True` — YAML 1.1 spelling, which GitHub reads as
+# true. A reader that only compares against the lowercase literal lets a cancelling push workflow
+# through (round-3 P2: the "not the literal false" arm was untested).
+name: push-cancel-true-capital
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: push-cancel-true-capital-${{ github.ref }}
+  cancel-in-progress: True
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
