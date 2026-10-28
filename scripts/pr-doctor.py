@@ -1021,6 +1021,15 @@ def rubric_report(note: str = "") -> str:
 
 # Guards
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
+# ⛔ HOW MANY CONSECUTIVE REFUSALS BEFORE THE ROW IS ESCALATED BY NAME (#2710). Measured
+# 2026-10-27: five stalls in one day, each time the SAME sequence and each time cleared by hand --
+# refuse, record a 45-min cooldown, retry into the same refusal, `EXIT rc=3` written into a log
+# beside successful passes, nothing escalating. One refusal is a fact about the tree; three in a row
+# at the same head is a row nobody is going to fix by waiting, and it must say so on the surface a
+# non-terminal reader parses. WHY 3: the cooldown means a refusal can only recur this many times
+# after ~2 h of the same broken worktree, which is longer than a lane takes to produce or abandon
+# one; below 3 the noise is a single transient, above it the first two passes have already reported.
+REFUSAL_ESCALATE_AT = 3
 STALE_DISPATCH_S = 90 * 60    # a dispatch with no state change this old is retryable
 
 # ── CAPACITY: the machine's own thresholds, never a private literal ─────────────────────
@@ -1352,6 +1361,30 @@ def _worker_state(worker) -> str:
     return "gone" if readable and not unreadable else "unknown"
 
 
+def _as_int(value, default=0) -> int:
+    """`value` as an int, or `default` — NEVER an exception (agent-infra#2710 review round 2).
+
+    The consecutive-refusal count is read from a JSON state file that a killed pass, a hand edit or an
+    older framework version wrote. `int("3x")` raised `ValueError`, which `__main__` records as
+    EXIT_CRASH=4: the cooldown arm never rewrites the row, so the bad value SURVIVED and every later
+    pass crashed before dispatching anything for any PR — a corrupted counter turned a named refusal
+    into a permanently silent doctor. A bad count means "unknown count", which must never escalate
+    and must never crash.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        # ⛔ `OverflowError` TOO (review round 2, P2 — reproduced). `json.loads` accepts `1e999` and
+        # `Infinity` and yields `inf`; `int(float("inf"))` raises `OverflowError`, which this guard
+        # did not catch, so a hand-edited `state/pr-doctor.json` crashed EVERY later pass exactly as
+        # the `ValueError` case did. The cooldown arm never rewrites the row, so the value survives.
+        return default
+    # ⛔ AND A NEGATIVE COUNT IS NOT A COUNT (review round 2, P2). `_as_int(-5)` was passed through,
+    # so `n_ref` recorded -4, -3, … and the row could not escalate until it climbed back to 3 —
+    # eight refusals of silence. A count below zero is as unusable as a non-number.
+    return n if n >= 0 else default
+
+
 def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> dict:
     """Available dispatches this pass, per work class and in total.
 
@@ -1387,6 +1420,18 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
         state = _worker_state(v.get("worker"))
         if state == "gone":
             continue          # the worker is PROVABLY gone: the slot is free again
+        # ⛔ A REFUSAL CONSUMED NOTHING, SO IT MAY NOT HOLD A SLOT (agent-infra#2710 review round 2,
+        # P1 — reproduced). A refused row never launched a worker, so it has no `$O/bg/<worker>.pid`;
+        # `_worker_state` answers "unknown" ("no pid file is NOT proof of absence"), and the row was
+        # therefore charged to its class. Measured at the SHIPPED defaults (MAX_FIX=3): the four
+        # refusals of the 2026-10-27 incident exhausted the fix budget, the budget gate below ran
+        # BEFORE the cooldown arm, and the pass printed `dispatched 0 of 4 queued — budget=4` with
+        # `EXIT rc=0` — the silent clean pass this issue exists to remove, at the defaults, with the
+        # incident's own row count. `void_refused_rows` already states the rule in its own words: *"A
+        # refusal consumed nothing, so it must not hold a cooldown and a budget slot"* — this is that
+        # rule where the budget is actually counted.
+        if (v.get("kind") or "") == "refused":
+            continue          # counted as undelivered work in the pass, never as capacity
         if state == "alive":
             alive += 1
         else:
@@ -4738,6 +4783,8 @@ def run_pass(args, rubric_note: str = "") -> int:
     dispatched = 0
     undeliverable = 0        # legible work whose order NO WORKER accepted (see `_finish`)
     delivered = []           # WHICH PRs actually went out -- the record must name them
+    escalated = []           # rows refused >= REFUSAL_ESCALATE_AT times in a row (#2710)
+    carried = 0              # of `undeliverable`: refused in an EARLIER pass, still in cooldown
     stalled = {"cooldown": 0, "budget": 0, "brief": 0}
     spent = {"fix": 0, "review": 0}
 
@@ -4757,6 +4804,17 @@ def run_pass(args, rubric_note: str = "") -> int:
         nothing had been delivered: the same outcome as blindness by a different route. It gets
         its OWN exit code (3) so a launcher, a reader, or a test can tell "I could not read" (2)
         from "I read, I placed, nobody took it" (3).
+
+        ⛔ AND A DURABLE WORKTREE REFUSAL IS ON THAT SAME AXIS (#2710, measured 2026-10-27). A
+        refusal that will not clear by waiting -- dirty worktree, commits the PR head does not
+        have -- records a row and a 45-min cooldown. Until this change it did NOT reach
+        `undeliverable`, so a pass whose only outcome was four of them exited 0: this file's own
+        word for "readable, nothing to do", printed while four PRs were stuck behind a refusal.
+        Nothing was delivered in that pass, so it refuses; the row's own `ESCALATE` line names the
+        worktree and its repair once the same row has refused `REFUSAL_ESCALATE_AT` times in a row.
+        The two causes still need different responses -- that distinction is #2291's (a measurement
+        of the box separates "no room" from "the transport refused"); what is decided HERE is that
+        neither of them may read as a clean pass.
 
         ⛔ AND THE DENOMINATOR IS THE FIX (2026-10-18, owner-reported). `dispatched 0` is what this
         job printed on every pass for days while it was actually REFUSING at the lane read, and
@@ -4782,21 +4840,38 @@ def run_pass(args, rubric_note: str = "") -> int:
             _more = (" (%d usable-PR(s) still held for a changed-file read)" % _held
                      if _held and unread else "")
             if unread and undeliv:
-                log("REFUSING: %d PR(s) were UNREADABLE and %d order(s) no worker accepted,"
-                    " with nothing dispatched -- not a clean pass%s" % (unread, undeliv, _more))
+                # ⛔ `undeliv - carried`, NOT `undeliv` (review round 2, P2 — reproduced). The
+                # sentence says "no worker accepted", which is a TRANSPORT fact; a row carried from
+                # an earlier pass's refusal had no order placed at all. One unreadable PR plus one
+                # carried refusal printed both a transport claim and "refused in an earlier pass" in
+                # the same verdict — the contradiction the `parts` split above removed, one branch
+                # down. ⛔ AND A ZERO-COUNT CLAUSE IS STILL A FALSE CLAIM: when nothing was placed the
+                # clause is OMITTED, not printed with `0`.
+                _placed = undeliv - carried
+                _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
+                _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
+                log("REFUSING: %d PR(s) were UNREADABLE%s, with nothing dispatched -- not a clean"
+                    " pass%s%s" % (unread, _pl, _carried, _more))
             elif unread:
                 log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean"
                     " pass%s" % (unread, _more))
             elif _held and undeliv:
-                log("REFUSING: %d PR(s) had an unusable changed-file list and %d order(s) no"
-                    " worker accepted, with nothing dispatched -- not a clean pass"
-                    % (_held, undeliv))
+                _placed = undeliv - carried
+                _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
+                _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
+                log("REFUSING: %d PR(s) had an unusable changed-file list%s, with nothing"
+                    " dispatched -- not a clean pass%s" % (_held, _pl, _carried))
             elif _held:
                 log("REFUSING: %d PR(s) had an unusable changed-file list and nothing was"
                     " dispatched -- not a clean pass" % _held)
             elif undeliv:
-                log("REFUSING: %d order(s) no worker accepted and nothing was dispatched -- not"
-                    " a clean pass" % undeliv)
+                if carried and carried == undeliv:
+                    log("REFUSING: %d PR(s) still undeliverable -- refused in an EARLIER pass and"
+                        " waiting out its cooldown; nothing was dispatched -- not a clean pass"
+                        % undeliv)
+                else:
+                    log("REFUSING: %d order(s) no worker accepted and nothing was dispatched -- not"
+                        " a clean pass" % (undeliv - carried))
         # WHY nothing (or something) went out. Named in the line itself, so the log answers the
         # question an operator actually asks -- never a bare number.
         parts = []
@@ -4817,20 +4892,45 @@ def run_pass(args, rubric_note: str = "") -> int:
                     parts.append("%s=%d" % (k, v))
         # These two are worth stating on a pass that DID dispatch: work was left behind, and why.
         if undeliv:
-            # ⛔ NAME THE CAUSE ON THE SAME LINE. `undeliverable` covers two transport failures --
-            # a spawn that was placed and failed, and an order WITHHELD because the harness could
-            # not answer liveness -- and they need different fixes (a harness that ran and exited
-            # vs a harness that is not installed). Both refuse, so both are rc 3; only the sentence
-            # tells an operator which one they have.
+            # ⛔ NAME THE CAUSE ON THE SAME LINE. `undeliverable` covers THREE causes -- a spawn that
+            # was placed and failed, an order WITHHELD because the harness could not answer liveness,
+            # and (since #2710) a row still waiting out the cooldown of a DURABLE REFUSAL -- and they
+            # need different fixes. All three refuse, so all three are rc 3; only the sentence tells
+            # an operator which one they have. ⛔ AND THEY MAY NOT SHARE ONE SENTENCE: "no worker
+            # accepted" on a cooldown pass asserts a transport failure in a pass where NO ORDER WAS
+            # PLACED (review round 2, P2 -- the one number sent an operator hunting the wrong fault).
             # The withheld cause is stated only on a pass that DID dispatch: when nothing went out
             # the stall counters are already on this line (`live-unreadable=N`), and repeating them
             # here would say the same fact twice in one verdict.
             withheld = (stalls.get("live-unreadable") or 0) if dispatched else 0
-            parts.append("%d order(s) no worker accepted%s"
-                         % (undeliv, " (%d withheld: worker liveness unreadable)" % withheld
-                            if withheld else ""))
+            placed_and_refused = undeliv - carried
+            if placed_and_refused:
+                parts.append("%d order(s) no worker accepted%s"
+                             % (placed_and_refused,
+                                " (%d withheld: worker liveness unreadable)" % withheld
+                                if withheld else ""))
+            if carried:
+                parts.append("%d PR(s) still undeliverable -- refused in an earlier pass, waiting"
+                             " out a refusal cooldown" % carried)
         if unread:
             parts.append("%d PR(s) with UNREADABLE checks" % unread)
+        # ⛔ THE ESCALATION IS ON THE VERDICT LINE, NOT ONLY IN THE LOG (#2710). A row refused N
+        # consecutive times is the one state this job used to hide behind a 45-min cooldown: the
+        # pass line said `refused-recorded=4`, which names the COUNT and not the row, so a reader
+        # could not tell which PR was stuck or what to repair. The row and its repair are the
+        # actionable half. ⛔ AND IT IS RESTATED ON EVERY PASS THE ROW SPENDS IN ITS COOLDOWN —
+        # deliberately, so the row cannot go quiet for 45 minutes — which at the shipped cadence
+        # (heartbeat every ~9 min, launchd every 30) is ~2-5 lines per episode, not one (review
+        # round 2, P2: this comment used to claim "it can only fire once per 45 min", which the
+        # sibling arm 40 lines below contradicts by inheriting the count on purpose).
+        if escalated:
+            # ⛔ THE TRUNCATION IS MARKED, NOT SILENT (review round 2, P3 — reproduced). This line is
+            # the surface a non-terminal reader parses, so naming 4 of 7 stuck rows with no marker
+            # under-reports the stuck set while looking complete.
+            _esc = " ".join(escalated[:4]) + (" +%d more" % (len(escalated) - 4)
+                                             if len(escalated) > 4 else "")
+            parts.append("ESCALATE %s refused %d+ consecutive times -- repair the named worktree(s)"
+                         % (_esc, REFUSAL_ESCALATE_AT))
         if blind_surface or blind_partial or blind_abandoned:
             parts.append("%d PR(s) HELD for an unusable changed-file list (%s)"
                          % (blind_surface + blind_partial + blind_abandoned, _surface_how(skipped)))
@@ -4856,24 +4956,91 @@ def run_pass(args, rubric_note: str = "") -> int:
                            issue_work=issue_work,
                            un_owned=len(un_owned), owned=len(owners),
                            undeliverable=undeliv, unreadable=unread,
+                           escalated=escalated,
                            surface_unreadable=blind_surface,
                            surface_partial=blind_partial,
                            surface_abandoned=blind_abandoned,
                            ownership_read_failed=own_err[:160] if own_err else "",
                            ownership_note=OWNERSHIP_NOTE[:160])
+    # ⛔ ACCOUNTING IS ITS OWN PASS OVER THE QUEUE, AND THAT IS THE FIX (review round 2, P1 --
+    # reproduced). The accounting below dispatches NOTHING, so it has no reason to live inside the
+    # dispatch loop and every reason not to: that loop `break`s on `dispatched >= budgets["total"]`,
+    # and with `budgets["total"] == 0` (a saturated box, or `--max 0`) it breaks on the FIRST row that
+    # is not in a cooldown. Measured: the same two rows -- one fresh, one `kind=refused, refusals=5`
+    # in its cooldown -- produce `EXIT rc=3` + `ESCALATE` when the refused row sorts first, and
+    # `dispatched 0 of 2 queued -- no capacity budget (...); budget=1` + `EXIT rc=0` with NO
+    # escalation when it sorts second. A verdict that depends on PR-number ordering is not a verdict,
+    # and `rc=0` over a stuck row is the defect this issue removes. Every classified row is therefore
+    # ACCOUNTED for first; the dispatch loop then covers only the rest.
+    covered = set()
     for p, action, why, cr in classified:
+        key = str(p["number"])
+        prev = st.get(key) or {}
+        # GUARD: cooldown, and never re-dispatch while the last one may still be live
+        if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S and prev.get("head") == p["headRefOid"]:
+            covered.add(key)
+            stalled["cooldown"] += 1
+            # ⛔ A ROW WAITING OUT A **REFUSAL** COOLDOWN IS NOT "NOTHING TO DO" (#2710, review
+            # round 1 P1/measured). The refusal branch below only runs on the pass that RECORDS the
+            # refusal; every pass inside the 45-minute cooldown returned here, so `undeliverable`
+            # stayed 0 and `_finish` returned EXIT_CLEAN -- `rc=0`, "readable, nothing to do" -- for
+            # 44 minutes of every 45, beside a PR stuck behind a durable refusal. Reproduced: a row
+            # `kind=refused, refusals=5` one minute into its cooldown printed
+            # `dispatched 0 of 1 queued -- cooldown=1` and `EXIT rc=0`. The measured five stalls
+            # were exactly this shape, so a fix that only refused on the recording pass would have
+            # left the loop the issue is about untouched.
+            #
+            # A `kind=spawn` row in its cooldown is a WORKER IN FLIGHT: that really is nothing to
+            # do (it will land or push by itself), so it stays out of this count -- the same
+            # distinction `worker-running` makes below.
+            if (prev.get("kind") or "") == "refused":
+                undeliverable += 1
+                # ⛔ COUNTED SEPARATELY, BECAUSE THE CAUSE IS DIFFERENT (#2710 review round 2, P2).
+                # `undeliverable` decides the CODE (3) on both arms, but its one sentence says "no
+                # worker accepted" -- a transport failure -- and on a cooldown pass NO ORDER WAS
+                # PLACED AT ALL. Left as one number, the verdict line sent an operator hunting a
+                # transport fault in a pass that attempted nothing.
+                carried += 1
+                # The row's OWN count is the escalation state, so the cooldown passes inherit it
+                # instead of going quiet until the next attempt (~45 min later).
+                if _as_int(prev.get("refusals")) >= REFUSAL_ESCALATE_AT:
+                    escalated.append("#%s" % key)
+                    log("ESCALATE #%s (%s): refused %d consecutive times, now waiting out a %d-min "
+                        "cooldown -- repair: %s"
+                        % (key, action, _as_int(prev.get("refusals")), COOLDOWN_S // 60,
+                           (prev.get("why") or "see the earlier refusal line")[:160]))
+        elif ((prev.get("kind") or "") == "refused"
+              # ⛔ A REFUSAL WHOSE COOLDOWN HAS EXPIRED IS STILL UNDELIVERED WORK WHEN THIS PASS
+              # CANNOT RETRY IT (review round 3 — reproduced). The arm above only covers a row
+              # INSIDE its cooldown. Six minutes after it expires, a SATURATED pass (`total == 0`, and
+              # `--max 0` by construction) broke out of the dispatch loop before reaching the row, so
+              # `undeliverable` stayed 0 and the pass printed
+              # `no capacity budget (...); budget=1` + `EXIT rc=0` over a `kind=refused` row AT the
+              # current head — the same false clean, reached 46 minutes later instead of never. The
+              # budget is the only reason the row is not retried here, so the budget is what decides.
+              and (dispatched >= budgets["total"]
+                   or spent[ACTION_CLASS.get(action, "fix")]
+                   >= budgets[ACTION_CLASS.get(action, "fix")])):
+            covered.add(key)
+            undeliverable += 1
+            carried += 1
+            if _as_int(prev.get("refusals")) >= REFUSAL_ESCALATE_AT:
+                escalated.append("#%s" % key)
+                log("ESCALATE #%s (%s): refused %d consecutive times and this pass has no budget to "
+                    "retry it (fix=%d review=%d left) -- repair: %s"
+                    % (key, action, _as_int(prev.get("refusals")), budgets["fix"],
+                       budgets["review"], (prev.get("why") or "see the earlier refusal line")[:160]))
+    for p, action, why, cr in classified:
+        key = str(p["number"])
+        if key in covered:
+            continue
+        prev = st.get(key) or {}
         if dispatched >= budgets["total"]:
             stalled["budget"] += 1
             break
         cls = ACTION_CLASS.get(action, "fix")
         if spent[cls] >= budgets[cls]:
             stalled["budget"] += 1
-            continue
-        key = str(p["number"])
-        prev = st.get(key) or {}
-        # GUARD: cooldown, and never re-dispatch while the last one may still be live
-        if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S and prev.get("head") == p["headRefOid"]:
-            stalled["cooldown"] += 1
             continue
         # ⛔ A LIVE WORKER IS IN FLIGHT, NOT A FREE SLOT -- REGARDLESS OF HEAD MOVEMENT. The
         # cooldown above is keyed on the head, so a worker that pushes re-arms dispatch at T+2min
@@ -4929,15 +5096,40 @@ def run_pass(args, rubric_note: str = "") -> int:
                 # the pass logs the same line for ever and the PR is never dispatched and never
                 # visible in `--status`. NOTE the row consumes the class slot on the NEXT pass via
                 # pass_budgets(), so it must not also be charged to this pass's `spent`.
+                #
+                # ⛔ AND IT IS UNDELIVERED WORK, SO THE PASS MAY NOT EXIT 0 (#2710). `undeliverable`
+                # is "work that was legible and no worker took it", and a worktree refusal is
+                # exactly that: measured 2026-10-27, a pass whose ONLY outcome was four recorded
+                # refusals printed `dispatched 0 of 4 queued — refused-recorded=4` and exited 0 --
+                # which this file's own table defines as "readable, nothing to do". A launcher
+                # reading the code saw a quiet queue while four PRs were stuck, and the heartbeat
+                # printing `rc=0` beside them is how the loop ran silently for hours. Refusing is
+                # still correct; exiting CLEAN on it is not.
+                #
+                # ⛔ AND THE COUNT IS CARRIED ON THE ROW (#2710), because "once" and "every pass
+                # for two hours" need different responses. It is CONSECUTIVE BY CONSTRUCTION, and
+                # the reset is IN THIS EXPRESSION -- a moved head starts a NEW episode (review round
+                # 1, P2: nothing deletes a refused row when the head moves, so the first version
+                # escalated a row that had refused ONCE at the current head and printed a provenance
+                # that was not true). A spawn replaces the row (`kind=spawn`), which also resets it.
+                n_ref = (1 if (prev or {}).get("head") != p["headRefOid"]
+                         else _as_int((prev or {}).get("refusals")) + 1)
                 st[key] = {"action": action, "worker": worker_name(key), "kind": "refused",
-                           "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
+                           "head": p["headRefOid"], "at": ts(), "at_epoch": now(),
+                           "refusals": n_ref, "why": detail[:300]}
                 # COUNTED for the same reason as the two liveness skips above: a pass whose only
                 # outcome was refusals must not summarize itself as "nothing to do". The row makes
                 # the refusal durable (`--status`), and this makes the PASS LINE agree with it.
                 stalled["refused-recorded"] = stalled.get("refused-recorded", 0) + 1
+                undeliverable += 1
+                if n_ref >= REFUSAL_ESCALATE_AT:
+                    escalated.append("#%s" % key)
+                    log("ESCALATE #%s (%s): refused %d consecutive times at head %s -- this row is "
+                        "not going to clear by waiting; repair: %s"
+                        % (key, action, n_ref, (p["headRefOid"] or "?")[:12], detail[:200]))
                 log("#%s (%s): REFUSED and RECORDED -- this will not clear by waiting, so the row "
-                    "holds a %d-min cooldown; fix the cause: %s"
-                    % (key, action, COOLDOWN_S // 60, detail[:160]))
+                    "holds a %d-min cooldown (refusal %d of %d before escalation); fix the cause: %s"
+                    % (key, action, COOLDOWN_S // 60, n_ref, REFUSAL_ESCALATE_AT, detail[:160]))
             else:
                 log("#%s (%s): not dispatched -- retried on the next pass: %s"
                     % (key, action, detail[:160]))
