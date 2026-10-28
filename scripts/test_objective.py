@@ -3933,39 +3933,63 @@ def test_an_error_token_inside_a_THIRD_PARTY_name_does_not_refuse_a_readable_lin
 
 
 def test_a_FOREIGN_required_set_is_UNKNOWN_and_never_GREEN(monkeypatch):
-    """⛔ THE WORST SHAPE THIS ISSUE NAMES: A FALSE PASS (review round 2, reproduced).
+    """⛔ THE WORST SHAPE THIS ISSUE NAMES: A FALSE PASS (review round 2, P1 -- reproduced).
 
     `REQUIRED` is TORTOISE's set by default and #2710 made `REPO` follow the checkout/`OR`, so on any
-    other repo every required name is simply ABSENT from the rollup: `req_red` empty, nothing in
-    flight, GREEN. Measured on this worktree with the bundled set and three all-red checks:
-    `main_health() -> ('GREEN', [])`. The repo half of the seam landed in round 1; this is the half
-    that says "I cannot judge this repo with another repo's gates".
+    other repo those gates are not the ones being run: `req_red` empty, nothing in flight, GREEN.
+    Measured on this worktree with the bundled set and three ALL-RED checks:
+    `main_health() -> ('GREEN', [])`.
+
+    ⛔ AND A PRESENCE TEST WOULD HAVE BROKEN THE PRIMARY BOX (review round 2, P1 -- measured live).
+    On tortoise main `ef02b7acd` the five reusable-workflow gates are published as
+    `main-health / docs` (not `docs`) and GraphQL returned seven names containing none of them, so
+    "no required name present" is TRUE on the very repo the rubric describes. The guard therefore asks
+    about the REPO (`REQUIRED_REPO`), and this test pins that direction too: tortoise must never be
+    refused by it.
     """
-    monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
     monkeypatch.setattr(objective, "gql_commit_checks", lambda sha: [{"name": "stub"}])
-    # Three checks, ALL RED, none of them in this file's bundled required set.
-    monkeypatch.setattr(objective, "rollup_checks",
-                        lambda cr: ({"python-ci", "docs-ci", "script-validate"}, set()))
     monkeypatch.setattr(objective, "newest_attempts", lambda cr: [])
+    monkeypatch.setattr(objective, "rollup_checks", lambda cr: ({"python-ci"}, set()))
+
+    # A repo the bundled rubric does NOT describe, with the built-in set: cannot verify -> UNKNOWN.
+    monkeypatch.setattr(objective, "REPO", "acme/widget")
+    monkeypatch.setattr(objective, "REQUIRED_SUPPLIED", False)
     assert objective.main_health("abc") == ("UNKNOWN", [])
 
-    # ⛔ NON-VACUITY 1: the same red surface WITH a required name present is still RED, not UNKNOWN.
-    monkeypatch.setattr(objective, "rollup_checks",
-                        lambda cr: ({"python-ci-gate", "python-ci"}, set()))
-    assert objective.main_health("abc") == ("RED", ["python-ci-gate"])
-
-    # ⛔ NON-VACUITY 2: a required name that is present and GREEN is GREEN -- the fix must not turn
-    # every healthy main into UNKNOWN.
-    monkeypatch.setattr(objective, "rollup_checks", lambda cr: (set(), set()))
-    monkeypatch.setattr(objective, "newest_attempts", lambda cr: [("python-ci-gate", {})])
+    # ⛔ NON-VACUITY 1: THE RUBRIC'S OWN REPO IS JUDGED, WHATEVER ITS SURFACE LOOKS LIKE. Even with
+    # a rollup whose names match nothing (the shape the presence test mistook for "foreign"), tortoise
+    # must not be refused -- its gates are rendered as `main-health / docs`, and GraphQL omits them.
+    monkeypatch.setattr(objective, "REPO", "daniel-ospina/tortoise")
     assert objective.main_health("abc") == ("GREEN", [])
 
-    # ⛔ NON-VACUITY 3: a SUPPLIED set is the repo's own, so it is judged rather than refused.
-    # (Both halves at once, because `REQUIRED` and `REQUIRED_SUPPLIED` are bound together at import --
-    # patching only the env after import is the inconsistency the code now refuses to have.)
+    # ⛔ NON-VACUITY 2: a SUPPLIED set on a foreign repo is the repo's own -- judged, not refused.
+    monkeypatch.setattr(objective, "REPO", "acme/widget")
     monkeypatch.setattr(objective, "REQUIRED", ("python-ci",))
     monkeypatch.setattr(objective, "REQUIRED_SUPPLIED", True)
-    monkeypatch.setenv("OBJECTIVE_REQUIRED", "python-ci")
-    monkeypatch.setattr(objective, "rollup_checks",
-                        lambda cr: ({"python-ci", "docs-ci"}, set()))
+    monkeypatch.setattr(objective, "rollup_checks", lambda cr: ({"python-ci", "docs-ci"}, set()))
     assert objective.main_health("abc") == ("RED", ["python-ci"])
+
+
+def test_a_RED_reusable_workflow_gate_is_SEEN(monkeypatch):
+    """⛔ A REQUIRED CONTEXT NAME IS NOT A CHECK-RUN NAME (review round 2, P1 -- measured).
+
+    Branch protection requires the context `docs`; a reusable workflow publishes the check-run as
+    `main-health / docs`. A bare `c in red` therefore could not see a red required gate AT ALL:
+    measured on tortoise main `ef02b7acd`, the surface carries `main-health / docs`,
+    `main-health / legal-e2e`, `main-health / license-surface`, `main-health / pricing-artifact`,
+    `main-health / test-isolation` while the required contexts are the leaves -- so `main=GREEN` could
+    sit over a red required gate. This is a PRE-EXISTING false PASS, closed by the same helper that
+    makes the foreign-rubric guard safe.
+    """
+    monkeypatch.setattr(objective, "REPO", "daniel-ospina/tortoise")
+    monkeypatch.setattr(objective, "REQUIRED_SUPPLIED", False)
+    monkeypatch.setattr(objective, "gql_commit_checks", lambda sha: [{"name": "stub"}])
+    monkeypatch.setattr(objective, "newest_attempts", lambda cr: [])
+    # The measured shape: the red gate is the LEAF under a caller workflow.
+    monkeypatch.setattr(objective, "rollup_checks",
+                        lambda cr: ({"main-health / docs", "lint"}, set()))
+    assert objective.main_health("abc") == ("RED", ["docs"])
+    # ...and IN FLIGHT too, so a queued required gate is not "green" either.
+    monkeypatch.setattr(objective, "rollup_checks",
+                        lambda cr: (set(), {"main-health / legal-e2e"}))
+    assert objective.main_health("abc") == ("FLIGHT", [])

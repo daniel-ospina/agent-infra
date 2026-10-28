@@ -6602,3 +6602,114 @@ def test_a_refused_row_no_longer_holds_a_budget_slot(monkeypatch, tmp_path):
     st["9"] = {"action": "fix-ci", "worker": pr.worker_name("9"), "kind": "spawn",
                "head": "a" * 40, "at_epoch": pr.now() - 60}
     assert pr.pass_budgets(st, {"max_fix": 3, "max_review": 4})["used"] == 1
+
+
+# ── REVIEW ROUND 2, SECOND PASS: the accounting must not depend on PR-number ordering ─────────────
+def test_a_SATURATED_pass_still_refuses_and_names_a_refused_row(monkeypatch, tmp_path):
+    """⛔ `rc=0` DEPENDED ON WHICH PR SORTED FIRST (review round 2, P1 — reproduced).
+
+    The accounting was hoisted above `dispatched >= budgets["total"]` but the dispatch loop still
+    `break`s there, so with `budgets["total"] == 0` (a saturated box, and `--max 0` by construction) it
+    broke on the FIRST row that was not in a cooldown. Measured, same two rows, only the numbers
+    swapped: `EXIT rc=3` + `ESCALATE` when the refused row sorted first, and
+    `dispatched 0 of 2 queued — no capacity budget (…); budget=1` + `EXIT rc=0` with no escalation
+    when it sorted second. A verdict that depends on PR-number ordering is not a verdict.
+    """
+    for refused_first in (True, False):
+        logs = []
+        refused_key, fresh_key = ("1", "2") if refused_first else ("2", "1")
+        monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path / str(refused_first)))
+        st = {refused_key: {"action": "fix-ci", "worker": pr.worker_name(refused_key),
+                            "kind": "refused", "head": "a" * 40, "at": "1 min ago",
+                            "at_epoch": pr.now() - 60, "refusals": pr.REFUSAL_ESCALATE_AT,
+                            "why": "worktree dirty -- refusing"}}
+        monkeypatch.setattr(pr, "load_state", lambda: dict(st))
+        monkeypatch.setattr(pr, "open_prs",
+                            lambda: [_pr(int(refused_key)), _pr(int(fresh_key))])
+        monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+        monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: _OK_BRIEF)
+        monkeypatch.setattr(pr, "log", logs.append)
+        monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+        monkeypatch.setattr(pr, "worker_live_for", lambda k: False)
+        monkeypatch.setattr(pr, "dispatch", lambda *a, **k: (True, "spawned", True))
+        monkeypatch.setattr(pr, "save_state", lambda s: None)
+        # ⛔ ZERO TOTAL BUDGET: the saturated box, produced here the way the CLI produces it.
+        monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--max", "0"])
+        rc = pr.main()
+        joined = "\n".join(logs)
+        assert rc == pr.EXIT_UNDELIVERED == 3, (refused_first, rc, joined)
+        assert ("ESCALATE #%s" % refused_key) in joined, (refused_first, joined)
+
+
+def test_the_REFUSING_arms_do_not_claim_an_order_the_pass_never_placed(monkeypatch, tmp_path):
+    """⛔ THE CONTRADICTION CAME BACK ONE BRANCH DOWN (review round 2, P2 — reproduced).
+
+    The `parts` line was split into placed/carried, but the two `REFUSING:` sentences above it still
+    interpolated raw `undeliv`. Measured with one unreadable PR and one carried refusal: the verdict
+    said "1 order(s) no worker accepted" AND "1 PR(s) still undeliverable -- refused in an earlier
+    pass", in one pass where no order was placed.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "2": {"action": "fix-ci", "worker": pr.worker_name("2"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60, "refusals": 5,
+              "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    # PR 1 unreadable, PR 2 the carried refusal.
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: None if p["number"] == 1 else ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda s: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    pr.main()
+    joined = "\n".join(logs)
+    assert "no worker accepted" not in joined, joined
+    assert "refused in an earlier pass" in joined, joined
+
+
+def test_as_int_survives_INFINITY_and_NEGATIVES(monkeypatch, tmp_path):
+    """⛔ `int(float("inf"))` RAISED `OverflowError`, WHICH `_as_int` DID NOT CATCH (review round 2).
+
+    `json.loads` accepts `1e999` / `Infinity` and yields `inf`, so a corrupted state file crashed
+    every later pass. A NEGATIVE count was passed through instead (recorded as -4, -3, …, eight
+    refusals of silence), so a count below zero is treated as unusable too.
+    """
+    assert pr._as_int(float("inf")) == 0
+    assert pr._as_int(float("-inf")) == 0
+    assert pr._as_int(float("nan")) == 0        # `int(nan)` is ValueError; pinned for completeness
+    assert pr._as_int(-5) == 0
+    assert pr._as_int("3") == 3 and pr._as_int(3) == 3
+    # ...and the pass itself survives a row carrying one.
+    logs = []
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "load_state", lambda: {
+        "1": {"action": "fix-ci", "worker": pr.worker_name("1"), "kind": "refused",
+              "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+              "refusals": float("inf"), "why": "worktree dirty -- refusing"}})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda s: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == pr.EXIT_UNDELIVERED == 3, "\n".join(logs)
+    assert "ESCALATE" not in "\n".join(logs)
+
+
+def test_MORE_than_four_escalated_rows_are_not_silently_dropped(monkeypatch, tmp_path):
+    """⛔ A TRUNCATED LIST WITH NO MARKER READS AS THE WHOLE LIST (review round 2, P3)."""
+    logs = []
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    rows = {str(n): {"action": "fix-ci", "worker": pr.worker_name(str(n)), "kind": "refused",
+                     "head": "a" * 40, "at": "1 min ago", "at_epoch": pr.now() - 60,
+                     "refusals": pr.REFUSAL_ESCALATE_AT, "why": "worktree dirty -- refusing"}
+            for n in range(1, 8)}
+    monkeypatch.setattr(pr, "load_state", lambda: dict(rows))
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(n) for n in range(1, 8)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "save_state", lambda s: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == 3
+    joined = "\n".join(logs)
+    assert "ESCALATE #1 #2 #3 #4 +3 more" in joined, joined

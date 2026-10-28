@@ -325,6 +325,15 @@ after `REFUSAL_ESCALATE_AT` consecutive refusals **at one head** the pass prints
 the worktree and the repair — on the verdict line too, not only in the log. A head move starts a new
 episode. The two *causes* (a box with no room vs the transport refusing) still produce different
 responses and are #2291's to separate; what is decided here is that neither may read as a clean pass.
+⛔ **AND THE ACCOUNTING IS ITS OWN PASS OVER THE QUEUE** (review round 2, P1 — reproduced, twice).
+The first attempt only hoisted it above the class-budget `continue`; the dispatch loop still `break`s on
+`dispatched >= budgets["total"]`, so with a zero total (a saturated box, or `--max 0`) it broke on the
+first row not in a cooldown. Measured, same two rows, only the PR numbers swapped: `EXIT rc=3` +
+`ESCALATE` when the refused row sorted first, `EXIT rc=0` with no escalation when it sorted second — a
+verdict that depends on PR-number ordering is not a verdict. Every classified row is now ACCOUNTED for
+first, in its own loop, and the dispatch loop covers only the rest. A corrupted count (a non-number,
+`inf` from `1e999`, or a negative) degrades to "unknown count" rather than crashing the pass, and the
+escalation list marks its truncation (`+N more`) instead of silently naming the first four.
 ⛔ **AND THE ACCOUNTING PRECEDES THE BUDGET GATE** (review round 2, P1 — reproduced). A `kind: refused`
 row never launched a worker, so it has no `$O/bg/<worker>.pid`; `_worker_state` answers `unknown` for it,
 and `pass_budgets` was charging it to its class. At the SHIPPED defaults (`MAX_FIX=3`) the incident's
@@ -373,11 +382,27 @@ not, because it is a decided non-blind degradation. `error=` is matched as a FIE
 required check legitimately named `pytest (error=timeout)` was refusing a fully readable line.
 ⛔ **And a required set that does not describe this repo is `UNKNOWN`, never `GREEN`** (review round 2, P1 —
 reproduced, and it is the worst shape this issue names). `REQUIRED` is tortoise's set by default and this
-change made `REPO` follow the checkout/`OR`, so on any other repo every required name is merely ABSENT:
+change made `REPO` follow the checkout/`OR`, so on any other repo those gates are not the ones being run:
 `req_red` empty, nothing in flight, `GREEN` — measured with three ALL-RED checks on the head,
 `main_health() -> ('GREEN', [])`. The repo half of the seam landed in round 1; this is the half that says
-"I cannot judge this repo with another repo's gates". A supplied set (`OBJECTIVE_REQUIRED`, resolved from
-branch protection) is judged as before; only the foreign-rubric case changes, and it changes to the truth.
+"I cannot judge this repo with another repo's gates". ⛔ **And the question is asked of the REPO, never of
+the name list** — the second review round measured why a presence test is wrong: on tortoise main
+`ef02b7acd` the five reusable-workflow gates are published as `main-health / docs` (not `docs`), and the
+GraphQL `statusCheckRollup` returned seven names containing none of them, so "no required name present"
+is TRUE on the very repo the rubric describes. A presence-based guard would have made the primary box a
+permanent refusal (exit 2 every tick) with no shipped remedy. `REQUIRED_REPO` names the repo the bundled
+set was read from; a supplied set (`OBJECTIVE_REQUIRED`, resolved from branch protection) is judged as
+before. ⛔ **One residual is named, not hidden:** a SUPPLIED set whose names have gone stale still answers
+`GREEN`, because absence cannot distinguish a stale declaration from a transport that renders names
+differently (measured above: GraphQL 7 names, REST 22, same sha); refusing on absence would be a
+permanent over-block on a correct configuration, and the seam repair is `#2518`.
+✅ **A required CONTEXT name is not a check-run name — a PRE-EXISTING false PASS, closed here.** Branch
+protection requires `docs`; a reusable workflow publishes `main-health / docs`. A bare `c in red` could
+not see a red required gate at all (measured on the same head: the surface carries `main-health / docs`,
+`main-health / legal-e2e`, `main-health / license-surface`, `main-health / pricing-artifact`,
+`main-health / test-isolation`; the required contexts are the leaves). Required names are now matched on
+the exact name OR its ` / ` leaf, in BOTH directions, so `main=GREEN` can no longer sit over a red
+required gate. Matching only ADDS names, so it cannot turn a RED into a GREEN.
 ⛔ **The repo is an input with a NAMED source, and a mismatch refuses.** `REPO_DEFAULT`
 (`daniel-ospina/tortoise`) was `OBJECTIVE_REPO or <that literal>`: silent, and never compared with the
 checkout the process stands in — so measured 2026-10-24 an agent-infra doctor read tortoise's check-runs

@@ -392,11 +392,20 @@ def _required_from_env():
 
 
 REQUIRED = _required_from_env()
-# ⛔ READ AT IMPORT, WITH `REQUIRED` (review round 2). The guard in `main_health` asks "was this set
-# SUPPLIED?", and reading that answer at CALL time while `REQUIRED` was bound at IMPORT time made the
-# two disagree: a caller (or a test) that exports `OBJECTIVE_REQUIRED` after import gets
-# `from_env=True` beside the still-bundled `REQUIRED` -- the foreign-rubric case would then skip the
-# guard and answer GREEN from a set nobody supplied. One binding, one answer.
+# ⛔ THE REPO THE BUNDLED SET WAS READ FROM (review round 2, P1 — reproduced, and it nearly broke the
+# primary box). `REQUIRED_DEFAULT` is tortoise's branch-protection contexts, read and verified there.
+# The foreign-rubric guard below may NOT be expressed as "no required name appears on the surface",
+# because that is transport-dependent and, on tortoise itself, FALSE: measured on main `ef02b7acd`, the
+# REST surface publishes the five reusable-workflow gates as `main-health / docs`, … and GraphQL's
+# `statusCheckRollup.contexts` returned a SEVEN-name list containing none of them. A presence test
+# would therefore have answered UNKNOWN for ever on the one repo the rubric describes — converting a
+# silent false pass into a loud permanent refusal with no shipped remedy. The guard is about WHICH
+# REPO, so it asks that question directly instead of inferring it from a name list.
+REQUIRED_REPO = "daniel-ospina/tortoise"
+# ⛔ READ AT IMPORT, WITH `REQUIRED` (review round 2). The guard asks "was this set SUPPLIED?", and
+# reading that answer at CALL time while `REQUIRED` was bound at IMPORT time made the two disagree: a
+# caller (or a test) that exports `OBJECTIVE_REQUIRED` after import gets `from_env=True` beside the
+# still-bundled `REQUIRED`. One binding, one answer.
 REQUIRED_SUPPLIED = bool((os.environ.get("OBJECTIVE_REQUIRED") or "").strip())
 
 GREEN = {"success", "neutral", "skipped"}
@@ -739,6 +748,30 @@ def main_sha():
     return None
 
 
+def _req_leaves(names):
+    """`names` plus the reusable-workflow LEAF of each (`main-health / docs` -> `docs`).
+
+    ⛔ REQUIREMENT NAMES DO NOT EQUAL CHECK-RUN NAMES (review round 2, P1 — measured). Branch
+    protection names a required CONTEXT (`docs`); when that context is produced by a reusable
+    workflow, the check-run GitHub publishes is `<caller> / <job>` (`main-health / docs`). A bare
+    `c in red` therefore could not see a RED required gate at all — measured on tortoise main
+    `ef02b7acd`: the surface carries `main-health / docs`, `main-health / legal-e2e`,
+    `main-health / license-surface`, `main-health / pricing-artifact`, `main-health / test-isolation`,
+    and the required contexts are the leaves. So `main=GREEN` has been able to sit over a red
+    required gate: a false PASS of exactly the class #2710 exists to remove, pre-existing this
+    change and fixed by the same helper. Matching only ADDS names (exact match is included), so it
+    cannot turn a RED into a GREEN.
+    """
+    out = set()
+    for n in names or ():
+        n = (n or "").strip()
+        if not n:
+            continue
+        out.add(n)
+        out.add(n.rsplit(" / ", 1)[-1].strip())
+    return out
+
+
 def main_health(sha):
     """(state, failing_required) judged by polarity on the newest attempt per group."""
     global GH_BLOCKED
@@ -760,27 +793,30 @@ def main_health(sha):
         _note_gh_failure(GH_LAST_ERROR, "main", transport=None)
         return "UNKNOWN", []
     red, flight = rollup_checks(cr)
-    # ⛔ AND AN ABSENT REQUIRED SET IS NOT A GREEN MAIN (review round 2, P1 — reproduced, and it is
-    # the WORST shape this issue names: a false PASS). `REQUIRED` is TORTOISE's set by default, and
-    # #2710 made `REPO` follow the checkout/`OR` — so on any other repo every one of those names is
-    # simply NOT PRESENT in the rollup: `req_red` is empty, nothing is in flight, and the function
-    # answered GREEN for a head whose checks were ALL RED. Measured on this worktree with the
-    # bundled set and three all-red checks: `main_health() -> ('GREEN', [])`. The repo half of the
-    # seam landed; this is the half that says "I cannot judge this repo with another repo's gates".
-    # CANNOT-VERIFY IS NEVER A PASS: if not one required name appears on the surface at all, the
-    # required set does not describe this repo, and the honest answer is UNKNOWN — which
-    # `_exit_for()` also refuses on. `_supply_required()`'s caller (a consumer that resolved the set
-    # from branch protection) supplies names that DO appear, so a correctly-configured repo is
-    # unaffected; only the foreign-rubric case changes, and it changes to the truth.
-    from_env = REQUIRED_SUPPLIED
-    if not from_env and not (set(REQUIRED) & (red | flight)):
-        _seen = {n for n, _newest in newest_attempts(cr)}
-        if not (set(REQUIRED) & _seen):
-            return "UNKNOWN", []
-    req_red = [c for c in REQUIRED if c in red]
+    # ⛔ AND A FOREIGN RUBRIC IS NOT A GREEN MAIN (review round 2, P1 — reproduced, and it is the
+    # WORST shape this issue names: a false PASS). `REQUIRED` is TORTOISE's set by default, and #2710
+    # made `REPO` follow the checkout/`OR` — so on any OTHER repo those gates are not the ones being
+    # run: `req_red` is empty, nothing is in flight, and the answer was GREEN. Measured on this
+    # worktree with the bundled set and three ALL-RED checks: `main_health() -> ('GREEN', [])`. The
+    # repo half of the seam landed in round 1; this is the half that says "I cannot judge this repo
+    # with another repo's gates". CANNOT-VERIFY IS NEVER A PASS, so the answer is UNKNOWN (which
+    # `_exit_for()` also refuses on).
+    #
+    # ⛔ IT IS ASKED OF THE REPO, NOT OF THE NAME LIST (see `REQUIRED_REPO`): a presence test is
+    # transport-dependent and answers UNKNOWN on tortoise itself.
+    #
+    # ⚠️ A SUPPLIED SET IS NOT RE-CHECKED THIS WAY, deliberately, and the residual is named: a
+    # supplied set whose names have gone stale (a renamed job) still answers GREEN, because "absent
+    # from this surface" cannot distinguish a stale declaration from a transport that renders names
+    # differently — measured above: GraphQL returned 7 names, REST returned 22, same sha. Refusing on
+    # absence would be a permanent over-block on a correct configuration; a stale supplied set is a
+    # seam to repair, tracked on #2518 with the rest of the rubric seam.
+    if not REQUIRED_SUPPLIED and (REPO or "").lower() != REQUIRED_REPO.lower():
+        return "UNKNOWN", []
+    req_red = [c for c in REQUIRED if _req_leaves([c]) & _req_leaves(red)]
     if req_red:
         return "RED", req_red
-    if any(c in flight for c in REQUIRED):
+    if any(_req_leaves([c]) & _req_leaves(flight) for c in REQUIRED):
         return "FLIGHT", []
     return "GREEN", []
 

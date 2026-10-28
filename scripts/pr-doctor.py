@@ -1372,9 +1372,17 @@ def _as_int(value, default=0) -> int:
     and must never crash.
     """
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        # ⛔ `OverflowError` TOO (review round 2, P2 — reproduced). `json.loads` accepts `1e999` and
+        # `Infinity` and yields `inf`; `int(float("inf"))` raises `OverflowError`, which this guard
+        # did not catch, so a hand-edited `state/pr-doctor.json` crashed EVERY later pass exactly as
+        # the `ValueError` case did. The cooldown arm never rewrites the row, so the value survives.
         return default
+    # ⛔ AND A NEGATIVE COUNT IS NOT A COUNT (review round 2, P2). `_as_int(-5)` was passed through,
+    # so `n_ref` recorded -4, -3, … and the row could not escalate until it climbed back to 3 —
+    # eight refusals of silence. A count below zero is as unusable as a non-number.
+    return n if n >= 0 else default
 
 
 def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> dict:
@@ -4787,15 +4795,27 @@ def run_pass(args, rubric_note: str = "") -> int:
             _more = (" (%d usable-PR(s) still held for a changed-file read)" % _held
                      if _held and unread else "")
             if unread and undeliv:
-                log("REFUSING: %d PR(s) were UNREADABLE and %d order(s) no worker accepted,"
-                    " with nothing dispatched -- not a clean pass%s" % (unread, undeliv, _more))
+                # ⛔ `undeliv - carried`, NOT `undeliv` (review round 2, P2 — reproduced). The
+                # sentence says "no worker accepted", which is a TRANSPORT fact; a row carried from
+                # an earlier pass's refusal had no order placed at all. One unreadable PR plus one
+                # carried refusal printed both a transport claim and "refused in an earlier pass" in
+                # the same verdict — the contradiction the `parts` split above removed, one branch
+                # down. ⛔ AND A ZERO-COUNT CLAUSE IS STILL A FALSE CLAIM: when nothing was placed the
+                # clause is OMITTED, not printed with `0`.
+                _placed = undeliv - carried
+                _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
+                _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
+                log("REFUSING: %d PR(s) were UNREADABLE%s, with nothing dispatched -- not a clean"
+                    " pass%s%s" % (unread, _pl, _carried, _more))
             elif unread:
                 log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean"
                     " pass%s" % (unread, _more))
             elif _held and undeliv:
-                log("REFUSING: %d PR(s) had an unusable changed-file list and %d order(s) no"
-                    " worker accepted, with nothing dispatched -- not a clean pass"
-                    % (_held, undeliv))
+                _placed = undeliv - carried
+                _carried = (" (%d refused in an earlier pass)" % carried) if carried else ""
+                _pl = (" and %d order(s) no worker accepted" % _placed) if _placed else ""
+                log("REFUSING: %d PR(s) had an unusable changed-file list%s, with nothing"
+                    " dispatched -- not a clean pass%s" % (_held, _pl, _carried))
             elif _held:
                 log("REFUSING: %d PR(s) had an unusable changed-file list and nothing was"
                     " dispatched -- not a clean pass" % _held)
@@ -4859,8 +4879,13 @@ def run_pass(args, rubric_note: str = "") -> int:
         # round 2, P2: this comment used to claim "it can only fire once per 45 min", which the
         # sibling arm 40 lines below contradicts by inheriting the count on purpose).
         if escalated:
+            # ⛔ THE TRUNCATION IS MARKED, NOT SILENT (review round 2, P3 — reproduced). This line is
+            # the surface a non-terminal reader parses, so naming 4 of 7 stuck rows with no marker
+            # under-reports the stuck set while looking complete.
+            _esc = " ".join(escalated[:4]) + (" +%d more" % (len(escalated) - 4)
+                                             if len(escalated) > 4 else "")
             parts.append("ESCALATE %s refused %d+ consecutive times -- repair the named worktree(s)"
-                         % (" ".join(escalated[:4]), REFUSAL_ESCALATE_AT))
+                         % (_esc, REFUSAL_ESCALATE_AT))
         if blind_surface or blind_partial or blind_abandoned:
             parts.append("%d PR(s) HELD for an unusable changed-file list (%s)"
                          % (blind_surface + blind_partial + blind_abandoned, _surface_how(skipped)))
@@ -4892,17 +4917,23 @@ def run_pass(args, rubric_note: str = "") -> int:
                            surface_abandoned=blind_abandoned,
                            ownership_read_failed=own_err[:160] if own_err else "",
                            ownership_note=OWNERSHIP_NOTE[:160])
+    # ⛔ ACCOUNTING IS ITS OWN PASS OVER THE QUEUE, AND THAT IS THE FIX (review round 2, P1 --
+    # reproduced). The accounting below dispatches NOTHING, so it has no reason to live inside the
+    # dispatch loop and every reason not to: that loop `break`s on `dispatched >= budgets["total"]`,
+    # and with `budgets["total"] == 0` (a saturated box, or `--max 0`) it breaks on the FIRST row that
+    # is not in a cooldown. Measured: the same two rows -- one fresh, one `kind=refused, refusals=5`
+    # in its cooldown -- produce `EXIT rc=3` + `ESCALATE` when the refused row sorts first, and
+    # `dispatched 0 of 2 queued -- no capacity budget (...); budget=1` + `EXIT rc=0` with NO
+    # escalation when it sorts second. A verdict that depends on PR-number ordering is not a verdict,
+    # and `rc=0` over a stuck row is the defect this issue removes. Every classified row is therefore
+    # ACCOUNTED for first; the dispatch loop then covers only the rest.
+    covered = set()
     for p, action, why, cr in classified:
         key = str(p["number"])
         prev = st.get(key) or {}
-        # ⛔ THE COOLDOWN/REFUSAL ACCOUNTING COMES BEFORE THE BUDGET GATE (#2710 review round 2, P1 —
-        # reproduced). This block dispatches NOTHING, so whether the pass has budget left is
-        # irrelevant to it -- but it used to sit BELOW `spent[cls] >= budgets[cls]: continue`, so a
-        # pass whose fix budget was held by refused rows (see `pass_budgets`) skipped this arm
-        # entirely and returned rc 0. Hoisting it makes the sentence the contract now states true:
-        # EVERY pass that COVERS a refused row counts it, whatever the pass's budget.
         # GUARD: cooldown, and never re-dispatch while the last one may still be live
         if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S and prev.get("head") == p["headRefOid"]:
+            covered.add(key)
             stalled["cooldown"] += 1
             # ⛔ A ROW WAITING OUT A **REFUSAL** COOLDOWN IS NOT "NOTHING TO DO" (#2710, review
             # round 1 P1/measured). The refusal branch below only runs on the pass that RECORDS the
@@ -4933,7 +4964,11 @@ def run_pass(args, rubric_note: str = "") -> int:
                         "cooldown -- repair: %s"
                         % (key, action, _as_int(prev.get("refusals")), COOLDOWN_S // 60,
                            (prev.get("why") or "see the earlier refusal line")[:160]))
+    for p, action, why, cr in classified:
+        key = str(p["number"])
+        if key in covered:
             continue
+        prev = st.get(key) or {}
         if dispatched >= budgets["total"]:
             stalled["budget"] += 1
             break
