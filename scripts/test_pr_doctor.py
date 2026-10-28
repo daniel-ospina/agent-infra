@@ -6796,7 +6796,7 @@ def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, 
 
     # ⛔ AND IT MUST SURVIVE THE CUT THE OPERATOR ACTUALLY READS (#2708 review, P2 — reproduced).
     # Naming the copy in a string no reader renders is the same defect one layer down. `pr-doctor`
-    # logs SLICES of this stderr -- `detail[:200]` on the FAIL line (`scripts/pr-doctor.py:3771`) and
+    # logs SLICES of this stderr -- `detail[:200]` on the FAIL line (`scripts/pr-doctor.py:3768`) and
     # `detail[:160]` on the NOT-DISPATCHED line (`:5093`, the rc=80 path, which writes no state row;
     # `:5090` is the REFUSED-and-RECORDED line, which rc=80 never takes) -- and the gate's own
     # teaching block is ~3.3 KB. Measured BEFORE the reorder that follows from this arm: the path sat

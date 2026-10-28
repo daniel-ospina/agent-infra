@@ -137,7 +137,7 @@ if [ -z "$bg_lib" ]; then
 fi
 # ⛔ THE NAMING LINE GOES FIRST, ON THE OUTSIDE OF THE GATE'S OWN OUTPUT (#2708 review, P2 —
 # reproduced). The gate prints a ~3.5 KB teaching block on refusal, and `pr-doctor` logs only SLICES
-# of the captured stderr: `detail[:200]` on its FAIL line (`scripts/pr-doctor.py:3771`) and
+# of the captured stderr: `detail[:200]` on its FAIL line (`scripts/pr-doctor.py:3768`) and
 # `detail[:160]` on its NOT-DISPATCHED line (`:5093`; `:5090` is the REFUSED-and-RECORDED line, which
 # rc=80 never reaches). With the path APPENDED after that block it lands at byte ~3290 of ~3655 —
 # measured on the fixture in `test_pr_doctor.py`, `'brief-gate.sh' in detail[:160]` was False and
