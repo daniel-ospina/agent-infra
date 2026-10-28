@@ -2427,9 +2427,10 @@ the two cannot disagree), and re-offers the DEAD ones **through the one dispatch
 dispatcher itself recorded** (`name worktree prompt cap kind`).
 
 ⛔ **AND THE LIVENESS QUESTION IS ASKED OF THE WORKTREE, NOT OF ONE NAME.** `pr-doctor.worker_name()`
-is MODE-QUALIFIED (`prd-<tag>-42` in a multi-repo pass) while the worktree is `prd-42` in **both**
-modes, so two orders can name one directory — the #2280 defect, which `worker_live_for()`
-(`pr-doctor.py:3526`) fixes on the doctor's side and which this supervisor must not reintroduce one
+is REPO-QUALIFIED (`prd-<repo-tag>-42`, in **every** mode since #2725) while the worktree is
+`prd-42` in **both** modes, so two orders can name one directory — the #2280 defect, which
+`worker_live_for()` (`pr-doctor.py:3638`) fixes on the doctor's side and which this supervisor must
+not reintroduce one
 layer down (`nonblocking-dispatch.sh` performs **no** liveness check of its own, so this is the only
 guard there is). Before every re-offer it asks `--status` for **every order that records the same
 worktree**, plus the doctor's own alias `prd-<n>` when that differs from the order's name: a `running`

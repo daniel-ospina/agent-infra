@@ -3608,14 +3608,31 @@ def _in_this_checkout(worktree: str) -> bool:
     (`scripts -> $AGENT_INFRA_PATH/scripts`) -- must not be able to produce it.
 
     `realpath` resolves the links on both sides, so two spellings of one directory ATTRIBUTE (probe
-    it: the safe direction) while two genuinely different trees still do not. It never widens the
-    answer past the real root, and a path that does not exist resolves to itself, so this cannot
-    throw on a pruned worktree either.
+    it: the safe direction) while two genuinely different trees still do not.
+
+    ⛔ AND IT RESOLVES THROUGH `_rp()`, NOT `os.path.realpath()` DIRECTLY (#2725 review cycle 2, P1).
+    `worktree` is a string read out of a box-global `.started` ARTIFACT, so it is poisoned-value
+    input, and `realpath` has a VERSION-DEPENDENT failure on it that makes this function decide the
+    UNSAFE direction on the runtime that actually runs here:
+
+      * on Python >= 3.10 (CI pins 3.12) `realpath` RAISES `ValueError` for an embedded NUL, and an
+        uncaught one propagates `worker_live_for -> dispatch -> main -> EXIT_CRASH`: zero dispatches
+        on EVERY pass until a human deletes the file (the measured `_read_pid`/#2746 class);
+      * on Python 3.9 -- `/usr/bin/python3` on this box, and the interpreter the orchestrator
+        scripts invoke -- `realpath` returns the poisoned path UNCHANGED, `startswith` is False, and
+        a live pre-#2725 worker is read as FOREIGN, which is the T2 work-destroying hole above.
+
+    `_rp()` is this file's answer to exactly that split (`:2106`): it rejects an embedded NUL before
+    calling `realpath` and returns "" for anything unresolvable, never raising. An empty resolution
+    is UNREADABLE EVIDENCE, and the safe answer to unreadable evidence is to probe anyway -- the
+    same fail-closed rule `_rp()`'s own docstring states.
     """
     if not worktree or not WORKTREE_ROOT:
         return True                       # nothing to attribute it with: do not narrow on a guess
-    root = os.path.realpath(WORKTREE_ROOT)
-    return os.path.realpath(worktree).startswith(root + os.sep)
+    root, wt = _rp(WORKTREE_ROOT), _rp(worktree)
+    if not root or not wt:
+        return True                       # unresolvable: unreadable evidence never narrows
+    return wt.startswith(root + os.sep)
 
 
 def worker_live_for(number) -> object:

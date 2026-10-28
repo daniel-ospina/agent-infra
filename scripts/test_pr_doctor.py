@@ -5632,6 +5632,47 @@ def test_the_same_worktree_spelled_two_ways_is_still_THIS_checkouts(tmp_path, mo
     pr.canonical_paths()
 
 
+def test_a_poisoned_started_record_neither_crashes_the_pass_nor_reads_as_foreign(tmp_path, monkeypatch):
+    """⛔ AN ARTIFACT MUST NOT BE ABLE TO DECIDE THE UNSAFE DIRECTION (#2725 review cycle 2, P1).
+
+    `_in_this_checkout()` resolves a string read out of the box-global `.started` file, so it is
+    poisoned-value input, and `os.path.realpath` has a VERSION-DEPENDENT failure on it:
+
+      * Python >= 3.10 raises `ValueError` for an embedded NUL. Uncaught, it propagates
+        `worker_live_for -> dispatch -> main -> EXIT_CRASH`: ZERO dispatches on every pass until a
+        human deletes the file (the measured `_read_pid`/#2746 class);
+      * Python 3.9 -- `/usr/bin/python3` here, and the interpreter the orchestrator scripts invoke --
+        returns the poisoned path UNCHANGED, `startswith` is False, so a live pre-#2725 worker is
+        read as FOREIGN. That is the work-destroying direction: the pass adopts the worktree and
+        `nonblocking-dispatch.sh` does `rm -f "$RC"; : > "$LOG"` under a running agent.
+
+    So the attribution routes through `_rp()` (which rejects an embedded NUL and returns "" for
+    anything unresolvable, never raising), and an empty resolution means UNREADABLE EVIDENCE -- which
+    must PROBE, never narrow. Both arms are asserted here because the two Pythons fail differently
+    and only one of them is the CI interpreter.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+
+    # (a) an embedded NUL: the record is unreadable evidence -> probe anyway, and do NOT raise
+    with open(pr.bg_path("prd-42", "started"), "w") as fh:
+        fh.write("name=prd-42\nworktree=%s\x00x\nkind=prfix\n"
+                 % os.path.join(pr.WORKTREE_ROOT, "prd-42"))
+    assert pr._in_this_checkout(pr._started_worktree("prd-42")) is True, \
+        "a poisoned record narrowed the attribution instead of refusing to decide"
+    assert pr.worker_live_for(42) is True, asked          # and above all: it did not raise
+    assert "prd-42" in asked, asked
+
+    # (b) an unresolvable root is the same class: unreadable evidence, so probe
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "wt") + "\x00")
+    asked.clear()
+    assert pr._in_this_checkout(os.path.join(str(tmp_path), "wt", "prd-42")) is True, asked
+    pr.canonical_paths()
+
+
 def test_a_row_written_before_the_rename_still_holds_and_frees_its_slot(tmp_path, monkeypatch):
     """⛔ IN-FLIGHT ROWS SURVIVE THE RENAME (#2725), both directions.
 
