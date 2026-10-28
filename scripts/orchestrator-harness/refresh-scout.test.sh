@@ -4041,7 +4041,13 @@ grep -q 'SKIPPED' <<<"$OUT" && ok "no PR listing: the pass says it skipped the c
 [ ! -s "$D/o/candidates.txt" ] && ok "no PR listing: nothing was queued" \
   || bad "no PR listing: something was queued — $(tr '\n' ' ' < "$D/o/candidates.txt")"
 
-# ── Control G — no registry installed: the documented LOUD fallback still releases ─────────────
+# ── Control G — no registry installed: the release REFUSES, it does not fall back ──────────────
+# ⛔ THIS CONTROL USED TO PIN THE OPPOSITE (agent-infra#2466, review P2). It asserted that a box with
+# no `$O/claims.sh` "still releases on local facts" and fills the queue — the documented fallthrough.
+# That fallback is GONE: missing, unreadable and stale are ONE polarity in this file now (see the
+# `--check` arm, the walk's ICR=2 arm and the dispatch arm), and the release arm is where the rule was
+# broken last. Keeping the old assertion would have pinned the defect, so it is inverted rather than
+# deleted: the same fixture now proves the suppression SURVIVES a box that cannot consult the registry.
 mk_case checked-no-registry
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_one_issue "$D"
@@ -4049,22 +4055,23 @@ mk_tmux "$D"
 printf '42\n' > "$D/o/checked.txt"
 rm -f "$D/o/claims.sh"
 rf "$D" refresh
-grep -qx 42 "$D/o/candidates.txt" 2>/dev/null \
-  && ok "no registry: the documented fallback releases on local facts and the queue fills" \
-  || bad "no registry: nothing was queued although no registry exists to hold it — output: $OUT"
+grep -qx 42 "$D/o/checked.txt" 2>/dev/null \
+  && ok "no registry: #42 is NOT released — an absent registry is not evidence of freedom (agent-infra#2466)" \
+  || bad "no registry: #42 was RELEASED although no registry exists to consult — the fail-open this control now pins against ($(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null))"
+[ ! -s "$D/o/candidates.txt" ] && ok "no registry: nothing was queued on a release the registry never sanctioned" \
+  || bad "no registry: something was queued — output: $OUT"
 case "$OUT" in
-  *"claim registry"*"NOT INSTALLED"*) ok "no registry: the fallback is LOUD (it names the missing registry)" ;;
-  *) bad "no registry: the fallback released silently — output: $OUT" ;;
+  *"claim registry"*"NOT INSTALLED"*) ok "no registry: the refusal is LOUD (it names the missing registry and its INCOMPLETE polarity)" ;;
+  *) bad "no registry: the refusal does not name the missing registry — output: $OUT" ;;
 esac
-# ⛔ AND THE RECORD SAYS WHICH CHECK WAS MISSING (review). The fallback sets
-# `CHECKED_REFUSED=claim-registry-absent` so the dispatch line can distinguish a release made WITHOUT
-# the cross-box claim read from a fully claim-checked one — and until this assertion existed, nothing
-# wrote that value into `state/checked-reap` and the funnel's reader re-initialised it from there, so
-# the funnel published `checked_refused=none` for the one release that skipped the claim check. A
-# passing assertion here is the only thing that keeps the assignment from going dead again.
+# ⛔ AND THE RECORD SAYS THE CLAIM READ WAS MISSING (review E, cycle 5). `CHECKED_REFUSED` is published
+# into `state/checked-reap` and the funnel re-reads it from there; before that write existed the funnel
+# printed `checked_refused=none` on a box with no registry, i.e. a pass that never answered the holder
+# question was byte-identical on the operator line to one that did. The slug described a REFUSAL then
+# and still does — the arm that used it to license a release is the part that changed.
 case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
-  *checked_refused=claim-registry-absent*) ok "no registry: the funnel records WHY the release skipped the claim read (checked_refused=claim-registry-absent)" ;;
-  *) bad "no registry: the funnel says checked_refused=$(sed -n 's/.*checked_refused=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — a release made without the claim read is then indistinguishable from a claim-checked one" ;;
+  *checked_refused=claim-registry-absent*) ok "no registry: the funnel records WHY the release refused (checked_refused=claim-registry-absent)" ;;
+  *) bad "no registry: the funnel says checked_refused=$(sed -n 's/.*checked_refused=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — a pass that could not consult the claim read is then indistinguishable from one that did" ;;
 esac
 
 # ── Control H — the release cap defers, and the CURSOR rotates past a permanently-held head ────

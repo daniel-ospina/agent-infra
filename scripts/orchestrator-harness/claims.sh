@@ -1349,23 +1349,48 @@ claim_snapshot_verdict() { # <snapshot-file> <ref> -> verdict word on stdout
   fi
   if [ ! -f "$f" ]; then
     why="no claim snapshot at $f — the registry has never been read on this box, so its silence is not evidence of freedom"
+  elif ! hdr="$(head -n 1 "$f" 2>/dev/null)"; then
+    # ⛔ A SNAPSHOT THAT EXISTS BUT CANNOT BE READ IS UNREADABLE, NOT ABSENT (review, P1). `[ -f ]` is
+    # a STAT, so it passes on a file this process cannot OPEN (mode 000, an ownership change from a
+    # `sudo` deploy or a restore) — and the old `head … || true` turned that EACCES/EIO into an EMPTY
+    # `hdr`, which the `case` below read as "a writer older than this reader" and answered from mtime
+    # (stat needs no read permission) → `claim-absent` → rc 0 → THE SWEEP ACTS. Measured: a mode-000
+    # snapshot whose ref WAS held read `claim-absent … no entry … read 0s ago`, a reason that is not
+    # merely empty but confidently wrong. Fail closed on the read itself: the direction that costs a
+    # beat of delay, never a duplicate dispatch.
+    why="the claim snapshot at $f could not be READ (this process cannot open it — permissions or an I/O error) — an unreadable file is not an empty registry"
   else
-    hdr="$(head -n 1 "$f" 2>/dev/null || true)"
     case "$hdr" in
       '#claim-snapshot'*)
         read_at="$(printf '%s' "$hdr" | cut -f2)"
-        fetch="$(printf '%s' "$hdr" | cut -f3)" ;;
+        fetch="$(printf '%s' "$hdr" | cut -f3)"
+        # ⛔ A HEADER THAT CANNOT STATE ITS OWN READ INSTANT IS UNREADABLE, NOT OLD (review, P2). The
+        # mtime fallback exists for a writer that predates the header — a first line that is NOT a
+        # header at all. A line that IS the header with a missing/non-numeric instant is a writer
+        # this reader cannot parse, and falling back to mtime would believe it on the strength of the
+        # copy that carried it. Say so instead.
+        case "${read_at:-}" in
+          ''|*[!0-9]*) why="the claim snapshot at $f carries a '#claim-snapshot' header with no usable read instant ('${read_at:-}') — the writer is not one this reader can parse" ;;
+        esac ;;
       *) read_at=""; fetch="" ;;   # a writer older than this reader: mtime is the only age available
     esac
-    [ -n "$read_at" ] || read_at="$(claim_file_mtime "$f")"
+    [ -n "$why" ] || [ -n "$read_at" ] || read_at="$(claim_file_mtime "$f")"
     now="$(date +%s 2>/dev/null || true)"
-    case "${now:-}" in ''|*[!0-9]*) why="the local clock is unreadable (date +%s -> '${now:-}')" ;; esac
+    case "${now:-}" in ''|*[!0-9]*) [ -n "$why" ] || why="the local clock is unreadable (date +%s -> '${now:-}')" ;; esac
     case "${read_at:-}" in
       ''|*[!0-9]*) [ -n "$why" ] || why="the snapshot's read instant could not be read (header and mtime both unusable)" ;;
     esac
     if [ -z "$why" ]; then
-      age=$(( now - read_at )); [ "$age" -lt 0 ] && age=0
-      if [ "$fetch" = "failed" ]; then
+      age=$(( now - read_at ))
+      # ⛔ A FUTURE STAMP IS DROPPED, NEVER TRUSTED (review, P2; the same one-sided-age rule AGENTS.md
+      # records for `skill-reads.json`, now applied here because this is the fleet's cross-box
+      # duplicate signal). The old arm CLAMPED a stamp ahead of the local clock to fresh (`age=0`),
+      # i.e. the further ahead the stamp, the longer it was believed — with NO age bound at all.
+      # A snapshot whose read instant is in the future was written by a clock this box cannot
+      # reconcile with its own, so its age is unknown: unreadable, not eternally fresh.
+      if [ "$age" -lt 0 ]; then
+        why="the snapshot's read instant is ${read_at}, ${age#-}s AHEAD of this box's clock — its age cannot be established, and a future stamp is dropped rather than trusted"
+      elif [ "$fetch" = "failed" ]; then
         # ⛔ THE FETCH ITSELF DID NOT ANSWER: the entries below are the LAST GOOD read, so a claim
         # published (or released) since then is invisible. That is a stale read, not a snapshot.
         why="the snapshot was written from a FAILED fetch (its entries are the last good read, ${age}s old)"
@@ -1378,7 +1403,14 @@ claim_snapshot_verdict() { # <snapshot-file> <ref> -> verdict word on stdout
     CLAIM_VERDICT="claim-unreadable"; CLAIM_VERDICT_WHY="$why"
     echo "$CLAIM_VERDICT"; return 2
   fi
-  entry="$(awk -F'\t' -v r="$ref" '$1==r{print; exit}' "$f" 2>/dev/null || true)"
+  # ⛔ THE ENTRY READ'S OWN STATUS IS THE ANSWER TOO (review, P1). `awk` exits 2 on an unreadable file
+  # and the old `|| true` threw that away, so a failed read degraded to the ABSENT verdict — the one
+  # verdict that licenses a spawn. Keep it.
+  if ! entry="$(awk -F'\t' -v r="$ref" '$1==r{print; exit}' "$f" 2>/dev/null)"; then
+    CLAIM_VERDICT="claim-unreadable"
+    CLAIM_VERDICT_WHY="the claim snapshot at $f could not be READ for $ref (the entry lookup failed) — a failed read is not an absent entry"
+    echo "$CLAIM_VERDICT"; return 2
+  fi
   if [ -z "$entry" ]; then
     CLAIM_VERDICT="claim-absent"; CLAIM_VERDICT_WHY="no entry for $ref in a snapshot read ${age}s ago"
     echo "$CLAIM_VERDICT"; return 0
