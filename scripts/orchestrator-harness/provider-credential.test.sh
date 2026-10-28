@@ -46,8 +46,7 @@ ck() { # <label> <rc>
 mkdir -p "$TMP/bin"
 printf '#!/bin/sh\ncase "$1 $2" in "auth token") echo ghp_fixture; exit 0 ;; esac\nexit 0\n' > "$TMP/bin/gh"
 chmod +x "$TMP/bin/gh"
-# ⛔ A tmux that EXPRESSES the states the gate asks about, so the caller/server arms are deterministic.
-# Whether a real box happens to have a running server is history, not a property of the gate, and the
+# ⛔ A tmux that EXPRESSES the states the gate asks about, so the caller/server arms are deterministic.# Whether a real box happens to have a running server is history, not a property of the gate, and the
 # caller arm's verdict DEPENDS on it (a server's environment shadows the caller's).
 #   TMUX_SERVER_EXISTS=1     a server answers (a zero-session one does too)
 #   TMUX_SERVER_EXISTS=0     no server at all (the default)
@@ -62,6 +61,10 @@ case "${1:-}" in
       echo "${3}=sk_from_server"; exit 0
     fi
     echo "unknown variable: ${3}"; exit 1 ;;
+  # A tmux that CANNOT start the session — the shape whose refusal normally carries a worker NAME, so
+  # the refusal-record arm below can show that the name column still works when there is a name.
+  new-session) [ "${TMUX_SPAWN_FAIL:-0}" = "1" ] && { echo "tmux: create session failed" >&2; exit 1; }
+               exit 0 ;;
 esac
 exit 0' > "$TMP/bin/tmux"
 chmod +x "$TMP/bin/tmux"
@@ -85,7 +88,7 @@ PATH="$3:$PATH"
 O="$4"; WT_DIR="$O/state"; mkdir -p "$WT_DIR"
 . "$LIB"
 wt_gh_hosts_token() { return 0; }
-unset DEEPSEEK_API_KEY
+unset DEEPSEEK_API_KEY ZAI_API_KEY
 if [ "${WITH_KEY:-0}" = "1" ]; then export DEEPSEEK_API_KEY=sk_caller_value; fi
 # `WITH_KEY=shell` — the SAME value as a plain SHELL VARIABLE, not in the environment. A tmux client
 # never carries it, so crediting it is the measured "0 key occurrences in the worker env" defect.
@@ -193,6 +196,55 @@ h="$TMP/h-srvkey"; mkhome "$h"
 out="$(WITH_KEY=0 TMUX_SERVER_EXISTS=1 TMUX_SERVER_PROVIDER=1 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-srvkey" 2>&1)"
 grep -q '^RC=0$' <<<"$out" && rc=0 || { rc=1; echo "      $out"; }
 ck "a tmux SERVER whose own environment carries the key => no refusal (the pane inherits it)" $rc
+# ⛔ AND THE SPAWN — NOT ONLY THE GATE — MUST ACCEPT IT (P1 review finding, 2026-10-27, MEASURED).
+# The arm above drives `wt_launcher_env` only, which returns the VERDICT. `wt_spawn` then EXECUTES the
+# contract it produced as a caller-side pre-check, and that pre-check runs in a shell holding neither
+# variable: on exactly this shape the gate answered RC=0 and the pre-check exited 98, so the spawn was
+# REFUSED on a box whose worker would have worked — measured `main rc=0 (worker started)` against
+# `HEAD rc=1 (REFUSED)`, with the refusal blaming "this spawn's environment". So §5b certified a
+# property the arm exists for while the spawn it gates could never happen: a false PASS.
+# These arms therefore drive the REAL `wt_spawn`, which needs a launcher: the surface stub below makes
+# the cmux daemon ABSENT so the tmux arm is the one under test (and the tmux stub then records the
+# session the spawn would create).
+printf '#!/bin/sh\necho "cmux: no daemon in this fixture" >&2\nexit 1\n' > "$TMP/bin/cmux"
+chmod +x "$TMP/bin/cmux"
+cat > "$TMP/spawn.sh" <<'SH'
+set -u
+LIB="$1"; HOME_="$2"
+PATH="$3:$PATH"
+O="$4"; WT_DIR="$O/state"; LOG="$O/log.txt"; mkdir -p "$WT_DIR"
+export WT_WORKER_HOME="$HOME_"
+# The caller holds NEITHER credential: that is the measured shape (the box's key lives only on the
+# tmux server), and it is what makes the pre-check's environment the thing under test.
+unset DEEPSEEK_API_KEY ZAI_API_KEY
+. "$LIB"
+wt_spawn "lane-1" "/tmp" 'true'; printf 'SPAWN rc=%s\n' "$?"
+SH
+h="$TMP/h-srvkey-spawn"; mkhome "$h"
+out="$(TMUX_SERVER_EXISTS=1 TMUX_SERVER_PROVIDER=1 bash "$TMP/spawn.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-srvkey-spawn" 2>&1)"
+case "$out" in *"SPAWN rc=0"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "SPAWN-level: a server carrying the key SPAWNS the worker (the pre-check judges the pane's environment, not the caller's)" $rc
+# CONTROL, not a mutation arm: the same spawn WITHOUT the server's credential must still be REFUSED,
+# or the assertion above would pass on a driver that never reaches the gate at all.
+out="$(TMUX_SERVER_EXISTS=1 TMUX_SERVER_PROVIDER=0 bash "$TMP/spawn.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-srvkey-none" 2>&1)"
+case "$out" in *"SPAWN rc=1"*) rc=0 ;; *) rc=1; echo "      $out" ;; esac
+ck "control: the SAME box without that credential is still REFUSED (nothing is credited, no session starts)" $rc
+# ⛔ AND A FILE THE LAUNCH LINE SOURCES BEATS THE SERVER'S COPY (P1 review finding, 2026-10-27). The
+# server arm used to be evaluated FIRST, so a box whose server also carried the key never sourced
+# `pi-keys.env` at all: writing the key into a file did not change the spawn (only killing the server
+# did), and the value the worker ran with was the SERVER's, not the one the gate measured in the file.
+# The file is sourced AFTER the pane inherits the server's env, so it wins in the pane; the gate credits
+# it in that same order now, and this arm pins the WORKER's value, not the gate's verdict.
+h="$TMP/h-both"; mkhome "$h"
+printf 'export DEEPSEEK_API_KEY=sk_from_pi_keys\n' > "$h/pi-keys.env"
+out="$(WITH_KEY=0 TMUX_SERVER_EXISTS=1 TMUX_SERVER_PROVIDER=1 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-both" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+if [ -z "$pfx" ]; then rc=1; echo "      no launch prefix was emitted (the spawn was refused) — nothing to execute"
+else
+  envout="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-both" "$BASH" -c "$pfx; printf 'K=[%s]' \"\${DEEPSEEK_API_KEY:-}\"" 2>&1)"
+  case "$envout" in *"K=[sk_from_pi_keys]") rc=0 ;; *) rc=1; echo "      $envout (the SERVER's value was used, or no file was sourced at all)" ;; esac
+fi
+ck "…and when BOTH carry it, the FILE's value is what reaches the worker (the file arm is not short-circuited)" $rc
 
 # ── 6. THE GATE AND THE LANE RESOLVE THE SAME PROVIDER (P3b) ────────────────────────────────
 # The gate decides WHICH credential this spawn must be able to deliver; `lane-exec.sh`, `merge-one.sh`
@@ -228,6 +280,94 @@ else
   case "$envout" in *"P=[deepseek]") rc=0 ;; *) rc=1; echo "      $envout (an ambient PI_LANE_PROVIDER=zai shadowed the provider the gate checked)" ;; esac
 fi
 ck "…and a value inherited from the SERVER cannot shadow it: the launch line PINS what the gate resolved" $rc
+# (c) BOTH MEMBERS OF THE PAIR ARE PINNED, FROM ONE MEASUREMENT — AND `pi-keys.env` IS MEASURED
+# (P2 review finding, 2026-10-27, MEASURED). The resolution read `keys.env` only while the launch line
+# also sources `$HOME/pi-keys.env`, so on a box whose pair lives in `pi-keys.env` (the ONLY env file on
+# this Mac) the gate resolved the caller's ambient default while the pane took the MODEL from the file:
+# measured `gate resolves [deepseek]` and `PANE PAIR provider=[deepseek] model=[qwen3.8-max]`. One
+# decision, two measurements — the provider pinned to what the gate checked, the model left as the file
+# wrote it. Both members are pinned from `wt_lane_pair` now, and the model is pinned AGAINST a stale
+# inherited one, which is what the ambient value below stands for.
+h="$TMP/h-pair"; mkhome "$h" '{"providers":{"deepseek":{"apiKey":"$DEEPSEEK_API_KEY"},"zai":{"apiKey":"$ZAI_API_KEY"}}}'
+printf 'export DEEPSEEK_API_KEY=sk_ds\nexport ZAI_API_KEY=sk_zai\nPI_LANE_PROVIDER=zai\nPI_LANE_MODEL=qwen3.8-max\n' > "$h/pi-keys.env"
+got="$(bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
+[ "$got" = "zai" ] && rc=0 || { rc=1; echo "      wt_lane_provider -> '$got' (pi-keys.env was not measured)"; }
+ck "wt_lane_provider measures \$HOME/pi-keys.env as well as keys.env (the only env file on this Mac)" $rc
+out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-pair" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+if [ -z "$pfx" ]; then rc=1; echo "      no launch prefix was emitted (the spawn was refused) — nothing to execute"
+else
+  # `PI_LANE_MODEL=stale-from-server` models the value a tmux SERVER created months ago still carries: the
+  # pin must overwrite it, or the lane runs a pair the gate never measured.
+  envout="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-pair" PI_LANE_MODEL=stale-from-server "$BASH" -c "$pfx; printf 'PAIR=[%s/%s]' \"\${PI_LANE_PROVIDER:-}\" \"\${PI_LANE_MODEL:-}\"" 2>&1)"
+  case "$envout" in *"PAIR=[zai/qwen3.8-max]") rc=0 ;; *) rc=1; echo "      $envout (the pair was assembled from two measurements, or a stale inherited model survived)" ;; esac
+fi
+ck "…and BOTH members are pinned from that one measurement (provider=[zai] model=[qwen3.8-max], not a half-pinned pair)" $rc
+# …and when NO source names a model, an inherited one is CLEARED rather than left beside a pinned provider.
+h="$TMP/h-pair-nomodel"; mkhome "$h"
+printf 'export DEEPSEEK_API_KEY=sk_from_pi_keys\n' > "$h/pi-keys.env"
+out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-pair-nomodel" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+if [ -z "$pfx" ]; then rc=1; echo "      no launch prefix was emitted (the spawn was refused) — nothing to execute"
+else
+  envout="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-pair-nomodel" PI_LANE_MODEL=stale-from-server "$BASH" -c "$pfx; printf 'MODEL=[%s]' \"\${PI_LANE_MODEL:-}\"" 2>&1)"
+  case "$envout" in *"MODEL=[]") rc=0 ;; *) rc=1; echo "      $envout (a model no source named was left to shadow the pinned provider)" ;; esac
+fi
+ck "…and a model NO source names is CLEARED, so the lane's own default applies instead of a stale pair" $rc
+
+# ── 6b. THE CALLER-SIDE SOURCES ARE BOUNDED ────────────────────────────────────────────────────
+# ⛔ P1 review finding, 2026-10-27, MEASURED: `wt_lane_provider` did `. "$home/keys.env"` (and
+# `wt_provider_key_var` ran `python3`) with NO `wt_bounded`, on the controller's SYNCHRONOUS spawn path.
+# Measured with a `keys.env` containing `sleep 5`: 10.28 s at the head under review (sourced twice)
+# against 0.06 s on main — i.e. an env file could freeze the cycle's critical path, which is the same
+# failure `wt_bounded` exists to prevent for every other probe in the module. The wall clock IS the
+# property here (there is no other observable of "did it wait"), so these arms measure it.
+h="$TMP/h-sleep"; mkhome "$h"
+printf 'sleep 6\nexport DEEPSEEK_API_KEY=sk_after_sleep\n' > "$h/keys.env"
+t0="$(date +%s)"
+got="$(WT_PROBE_TIMEOUT=1 bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
+dt=$(( $(date +%s) - t0 ))
+[ "$dt" -le 4 ] && rc=0 || { rc=1; echo "      wt_lane_provider took ${dt}s on a keys.env that sleeps 6 (no bound was applied)"; }
+ck "a keys.env that sleeps 6 s is CUT at WT_PROBE_TIMEOUT=1 by wt_lane_provider (measured ${dt}s)" $rc
+h="$TMP/h-sleep-spawn"; mkhome "$h"
+printf 'sleep 6\nexport DEEPSEEK_API_KEY=sk_after_sleep\n' > "$h/keys.env"
+t0="$(date +%s)"
+out="$(WT_PROBE_TIMEOUT=1 WT_PRE_TIMEOUT=2 bash "$TMP/spawn.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-sleep" 2>&1)"
+dt=$(( $(date +%s) - t0 ))
+# The unbounded shape spends the file's 6 s TWICE in the caller-side resolution before the pre-check even
+# starts (~18 s measured); the bounded one spends 1 s per source. 13 s separates them with slack for a
+# loaded box, and the rc pins the DIRECTION: a bound that fires is a REFUSAL, never a started lane.
+if printf '%s\n' "$out" | grep -q 'SPAWN rc=1' && [ "$dt" -le 13 ]; then rc=0
+else rc=1; echo "      rc/wall: dt=${dt}s out=$out"; fi
+ck "…and a SPAWN on that box is REFUSED in bounded time (${dt}s), not left to wait on the env file" $rc
+
+# ── 6c. THE REFUSAL RECORD NAMES A WORKER OR NOTHING ─────────────────────────────────────────────
+# ⛔ P2 review finding, 2026-10-27, MEASURED: `state/spawn-refused.tsv`'s first column is `<worker
+# name>`, and the writer filled it from the text before the first colon of the refusal — so the MODEL
+# CREDENTIAL gate, which refuses before any session is named, wrote the SENTENCE `a worker on 'deepseek'`
+# into the identifier column. A reader (and a human scanning the TSV) reads that column as an ID; a
+# value that LOOKS attributable to a worker that does not exist is worse than a blank, which is honestly
+# unknown. The column now takes the same rule that admits a worker name in `wt_spawn`.
+name_col() { awk -F'\t' 'NR==1{print $1}' "$1" 2>/dev/null; }
+# (i) a refusal that DOES have a worker name still records it (the control: the column is not simply
+# always blank now).
+h="$TMP/h-rec-named"; mkhome "$h"; printf 'export DEEPSEEK_API_KEY=sk_present\n' > "$h/pi-keys.env"
+out="$(TMUX_SPAWN_FAIL=1 bash "$TMP/spawn.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-rec-named" 2>&1)"
+col="$(name_col "$TMP/O-rec-named/state/spawn-refused.tsv")"
+# Both branches SET rc: a bare `… || { rc=1; }` would let a red from the PREVIOUS arm leak in, which is
+# exactly how a green arm reports itself as failed.
+if [ "$col" = "lane-1" ]; then rc=0
+else rc=1; echo "      first column=[$col] (a named refusal must still record its name)"; fi
+ck "a refused spawn records its WORKER NAME in the first column of state/spawn-refused.tsv" $rc
+# (ii) the gate's own refusal carries no worker name, so the column must be EMPTY and the reason column
+# must still say what happened.
+h="$TMP/h-rec-gate"; mkhome "$h"
+out="$(bash "$TMP/spawn.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-rec-gate" 2>&1)"
+col="$(name_col "$TMP/O-rec-gate/state/spawn-refused.tsv")"
+reason="$(awk -F'\t' 'NR==1{print $2}' "$TMP/O-rec-gate/state/spawn-refused.tsv" 2>/dev/null)"
+if [ -z "$col" ] && printf '%s' "$reason" | grep -q 'DEEPSEEK_API_KEY'; then rc=0
+else rc=1; echo "      first column=[$col] reason=[${reason:0:80}]"; fi
+ck "…and the MODEL-CREDENTIAL gate's refusal leaves that column EMPTY (never the sentence \"a worker on 'deepseek'\")" $rc
 
 # ── 7. MUTATION: remove the apiKey-ref detection and arm 4 MUST redden ──────────────────────────
 # The mutation is the defect in its original form: the gate holds the datum (models.json names the

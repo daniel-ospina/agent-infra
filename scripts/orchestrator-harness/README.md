@@ -640,7 +640,16 @@ Around the spawn, three properties hold:
   `state/env-<worker>.sh` (mode 0600, the controller's exported names) and the run script sources it.
   On a **tmux** surface (macOS launchd, or a Linux cell) the contract is different and explicit: the
   launch line exports `HOME` — the one that actually holds the `gh` credential — sources that HOME's
-  `keys.env` when it exists, and exports `O`; a box where that produces no credential is REFUSED.
+  `keys.env` (and `pi-keys.env`, where the LANE MODEL credential lives on a Mac) when they exist, and
+  exports `O`; a box where that produces no credential is REFUSED. Two credentials are gated, both
+  BEFORE any session exists: the `gh` token and the model key `models.json` names for the lane
+  provider. The model key may come from the caller (only when this spawn creates the server), from a
+  file the launch line sources, or from the tmux SERVER's own global environment — and the caller-side
+  pre-check is given exactly the environment the pane would inherit, so the gate's answer and the
+  pre-check's answer cannot disagree. The launch line also **pins the pair** it resolved
+  (`PI_LANE_PROVIDER` and `PI_LANE_MODEL`, measured from `keys.env` then `pi-keys.env`, last value
+  wins) so the lane runs, and bills, the provider whose credential was checked; a model NO source
+  names is cleared rather than inherited.
 
 The stale-worker reap targets the same census (`reap_stale_workers()` → `wt_close`), because the
 workspace, not a session name, is now the identity: `wt_close` closes the terminal + workspace and
