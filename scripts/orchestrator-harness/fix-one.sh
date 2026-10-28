@@ -687,6 +687,15 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # no attempt was consumed. Tolerant reference for the same $O-skew reason as the disk code.
   if [ "$ar" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
     why="BRIEF gate: the generated fixer brief failed brief-gate.sh (a HARNESS defect, not a capacity refusal and not a finding about this PR) — read the [brief-gate] block in the log; the fix is in the brief's own build, not in the box"
+  elif [ "$ar" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
+    # ⛔ A FIFTH REMEDY, AND THE ONE THAT IS NEITHER "wait" NOR "reclaim" (review of #2991, P1): the
+    # box could not complete one model call and RETURN (agent-infra#2935). It does NOT clear by waiting
+    # — the box has to be repaired (its installed pi/extension set, or its provider credential) or the
+    # PR dispatched elsewhere. Without this arm the fixer published `load gate: re-dispatched when 1-min
+    # load falls below MAX_LOAD`, i.e. the opposite remedy, one line under `[capability-gate] REFUSED`.
+    # Tolerant default for the same $O-skew reason as the codes below: a helper predating the code can
+    # never return it, so the arm is inert there and the code falls through as before.
+    why="CAPABILITY gate: this box could not complete one model call and RETURN (#2935) — read the [capability-gate] REFUSED line in the log for WHICH reading refused; waiting cannot clear it, so repair the box (installed pi/extension set, provider credential) or dispatch the PR elsewhere. Nothing was consumed"
   elif [ "$ar" = "${AGENT_FORK_REFUSED:-73}" ]; then
     why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
   elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
