@@ -1,0 +1,14 @@
+# FAILURE-CLASS FIXTURE (R1, shared group — pair with pr-shared-group-b.yml): `github.workflow` is
+# the workflow's NAME, so two workflows that share a name share a cancellation domain and cancel
+# each other's runs on the same PR. Only a cross-file rule can see this.
+name: pr-shared-group
+on:
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
