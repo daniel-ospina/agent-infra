@@ -5870,18 +5870,50 @@ def test_a_fifo_at_the_started_path_does_not_hang_the_pass(tmp_path, monkeypatch
     rather than raising -- so the `except OSError` never fires. It is on the hot path
     (`worker_live_for()` is asked about every queued PR), so one planted FIFO would stop the drain
     silently: no verdict, no heartbeat, no dispatch, for ever. That is the class the file already
-    guards for the `.pid` path (`test_a_fifo_at_the_pid_path_does_not_hang_the_pass`), and the rule
-    its docstring states -- `isfile` FIRST, because a FIFO is not an unreadable file.
+    guards for the `.pid` path (`test_a_directory_at_the_pid_path_neither_crashes_nor_frees_the_slot`),
+    and the rule its docstring states -- `isfile` FIRST, because a FIFO is not an unreadable file.
     """
     monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
     (tmp_path / "bg").mkdir()
     pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
+    # ⛔ THE HARNESS'S VERDICT IS NOT WHAT THIS TEST IS ABOUT (#2980, measured in CI). `worker_status`
+    # SHELLS OUT to `nonblocking-dispatch.sh --status`, and on a bare runner that question is
+    # legitimately UNANSWERABLE -- so `worker_live_for()` answers `None` ("do not spawn") there, and
+    # an `is not None` assertion reded `python-ci / test` over a CORRECT behaviour. Pin the verdict
+    # the way this file's other worker tests pin it: the FIFO guard is upstream of it either way,
+    # because `worker_live_for()` evaluates `_started_worktree(plain)` to build its name list FIRST.
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     fifo = pr.bg_path("prd-42", "started")
     os.mkfifo(fifo)
     try:
-        assert pr._started_worktree("prd-42") == "", "a FIFO was read as a record (or blocked)"
-        # and the liveness question still ANSWERS instead of wedging the pass
-        assert pr.worker_live_for(42) is not None
+        # ⛔ BOTH CALLS BELOW MUST BE BOUNDED, because a blocked `open()` cannot be detected by merely
+        # AWAITING it: the main thread would HANG rather than FAIL, which is the one thing this test
+        # exists to rule out (under the mutated guard, the unbounded first assertion hung the suite
+        # until pytest-timeout fired at 120 s instead of failing in 15). The call is therefore made on
+        # a daemon thread that can be abandoned and that dies with the interpreter.
+        def answered(fn, what):
+            box = {}
+
+            def run():
+                try:
+                    box["v"] = fn()
+                except BaseException as exc:         # surface it as a finding, never swallow it
+                    box["err"] = exc
+
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            t.join(15)
+            assert not t.is_alive(), (
+                "%s blocked on a FIFO at .started — one planted FIFO would stop the drain "
+                "silently: no verdict, no heartbeat, no dispatch, for ever" % what)
+            assert "err" not in box, "%s raised on a FIFO: %r" % (what, box.get("err"))
+            return box["v"]
+
+        assert answered(lambda: pr._started_worktree("prd-42"),
+                        "_started_worktree()") == "", "a FIFO was read as a record"
+        # ...and the liveness question still ANSWERS instead of wedging the pass
+        assert answered(lambda: pr.worker_live_for(42),
+                        "worker_live_for()") is False, "a FIFO is not evidence of a live worker"
     finally:
         os.unlink(fifo)
     pr.canonical_paths()
