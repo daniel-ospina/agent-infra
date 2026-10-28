@@ -2591,17 +2591,22 @@ fi
 # recorded line AND pin that line's operands to the rows the artifact shows, so the
 # log and the output cannot agree on a wrong number.
 _adv="$(grep -m1 'OFFSET advanced ' "$T/$ENV/r1.log" 2>/dev/null)"
-_adv_old="$(printf '%s\n' "$_adv" | awk '{print $3}')"
-_adv_new="$(printf '%s\n' "$_adv" | awk '{print $5}')"
+# ⛔ PARSE THE SENTENCE, NEVER POSITIONAL FIELDS: `log_line` writes to stdout AND
+# to the artifact through `log`, which prefixes every line with `REAP `, so awk
+# field numbers are off by one and `$3` is the word "advanced". (Measured: the
+# first version of this leg died with `advanced: unbound variable` under `set -u`.)
+_adv_pair="$(printf '%s\n' "$_adv" | sed -n 's/.*OFFSET advanced \([0-9][0-9]*\) -> \([0-9][0-9]*\).*/\1 \2/p')"
+_adv_old="${_adv_pair%% *}"
+_adv_new="${_adv_pair##* }"
 _adv_tot="$(printf '%s\n' "$_adv" | grep -o 'total=[0-9]*' | cut -d= -f2)"
 _adv_def="$(printf '%s\n' "$_adv" | grep -o 'deferred=[0-9]*' | cut -d= -f2)"
 _def_rows="$(grep -c 'reason=deferred' "$T/$ENV/r1.log" 2>/dev/null || true)"
 _cls_rows="$(grep -cE '^CLASSIFY (remove|preserve) ' "$T/$ENV/r1.log" 2>/dev/null || true)"
 case "$_adv_tot" in ''|*[!0-9]*|0)
     bad "R2b the pass did not RECORD the rotation offset advance (line: '$_adv') — the cursor is unanswerable from the artifact" ;;
-*) if [ "$_adv_def" = "$_def_rows" ] \
+*) if [ "$_adv_def" = "${_def_rows:-0}" ] \
         && [ "$(( ${_cls_rows:-0} + ${_def_rows:-0} ))" = "$_adv_tot" ] \
-        && [ "$_adv_new" = "$(( (${_adv_old:-0} + _adv_tot - _def_rows) % _adv_tot ))" ]; then
+        && [ "$_adv_new" = "$(( (${_adv_old:-0} + _adv_tot - ${_def_rows:-0}) % _adv_tot ))" ]; then
         ok "R2b the offset advanced by EXACTLY the rows consumed ($_adv_old -> $_adv_new of total=$_adv_tot, deferred=$_def_rows): the next pass starts at the first deferred row"
     else
         bad "R2b the offset advance is not 'what was consumed' (recorded $_adv_old -> $_adv_new, total=$_adv_tot, deferred=$_adv_def; artifact shows $_def_rows deferred + ${_cls_rows:-0} classified) — the deferred tail is not reached next pass"
