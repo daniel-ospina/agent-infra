@@ -275,8 +275,10 @@ PY
     # UNDEFINED command returns 127 — `! 127` is TRUE, so every arm here would take the DEFERRAL path
     # and the driver could never reach a spawn it is supposed to prove. That is the same `! 127`
     # polarity trap the loop's own top-level definition carries a ⛔ comment about, reproduced one
-    # layer down. `CIQ_PUSH_RC=1` is how an arm asks for the deferred world.
-    ciq_push_ok() { return "${CIQ_PUSH_RC:-0}"; }
+    # layer down. ⛔ AND IT RECORDS THAT IT RAN (#2927): the three FIXER arms must no longer consult
+    # it at all, and a stub that refuses silently would make "not called" and "called and ignored"
+    # indistinguishable. `CIQ_PUSH_RC=1` is how an arm asks for the refused world.
+    ciq_push_ok() { printf 'CALLED\n' >> "$TMP/ciqspy"; return "${CIQ_PUSH_RC:-0}"; }
     ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
     # The refusal line prints `$(spawn_gate_tok)`; give it the shipped function and real inputs so the
     # driven line carries a reading instead of an empty field (see the extraction above).
@@ -347,8 +349,9 @@ PY
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
     # …and the CI-queue predicate for the same reason as `drive()` above: the CONFLICTING arm now
     # calls `ciq_push_ok`, and an undefined command is `! 127` = TRUE = DEFER, which would make this
-    # rig unable to prove the conflict path ever dispatches.
-    ciq_push_ok() { return "${CIQ_PUSH_RC:-0}"; }
+    # rig unable to prove the conflict path ever dispatches. It records its calls for the same reason
+    # as `drive()` above (#2927): the conflict arm must not consult it any more.
+    ciq_push_ok() { printf 'CALLED\n' >> "$TMP/ciqspy"; return "${CIQ_PUSH_RC:-0}"; }
     ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
     . "$TMP/shq.sh"
     . "$TMP/spawntok.sh"
@@ -549,30 +552,6 @@ drive_conflict 0 0
 [ "$(acts)" = "0" ] && grep -qi 'fixer spawn FAILED' "$TMP/d.log" \
   && ok "CONFLICTING: a FAILED conflict-fixer spawn is a wait + a printed line (never a phantom act)" \
   || bad "CONFLICTING: a failed spawn recorded acts=$(acts) — the record claims work that did not happen"
-# ⛔ THE DEFERRAL ITSELF IS DRIVEN, NOT MERELY STUBBED (#2333 review cycle 2, P1). Without this arm
-# the new gate is exercised only by its own module suite, and the wiring's failure mode — a deferral
-# that spawns anyway, or one that is recorded as an ACT — would be invisible here.
-CIQ_PUSH_RC=1; drive_conflict 0; unset CIQ_PUSH_RC
-[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
-  && ok "CONFLICTING on a deep/unknown CI queue: NO spawn, ONE wait row, and the deferral is NAMED" \
-  || bad "CONFLICTING on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
-# ⛔ THE OTHER TWO PUSHERS' DEFER ARMS ARE DRIVEN TOO, NOT MERELY GREPPED (#2333 review, P2). The
-# review-gate fixer and the CI-red fixer each carry a defer arm of their own, and before these arms
-# they were pinned ONLY by text greps on the call site (`ci-queue.test.sh` e4b/e4c/e6) — so a defer
-# branch that ALSO SPAWNED (moving the `printf … > argv-$PR` / `wt_spawn` into the defer body) kept
-# every arm green while the gate silently stopped deferring on two of the four CI-spending surfaces.
-# That is exactly the class the CONFLICTED drive above was added for, one arm short.
-CIQ_PUSH_RC=1; drive 'FAILED:pipeline-compliance' rail 0 1; unset CIQ_PUSH_RC
-[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
-  && ok "CI-red fixer on a deep/unknown CI queue: NO spawn, a wait row, and the deferral is NAMED" \
-  || bad "CI-red fixer on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
-# The review-gate arm only reaches ITS defer branch for a PR with FINDINGS at this head (a head with
-# none is a re-record, which spends no CI), so the needsfix marker is supplied — otherwise this drive
-# would exercise the re-record path and prove nothing about the defer arm.
-NEEDSFIX=1; CIQ_PUSH_RC=1; drive 'FAILED:ai-review-gate' rail 0 1; unset NEEDSFIX CIQ_PUSH_RC
-[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" -ge 1 ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
-  && ok "review-gate fixer on a deep/unknown CI queue: NO spawn, a wait row, and the deferral is NAMED" \
-  || bad "review-gate fixer on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
 drive GREEN rail 9 1
 [ "$(acts)" = "0" ] && grep -qi 'NO merge slot' "$TMP/d.log" \
   && ok "GREEN+rail at the merge-lane ceiling: refused and named" \
@@ -597,6 +576,41 @@ drive 'FAILED:docs-lint' rail 0 1
   && ok "a red that is not a required check: nothing spawned, but the PR is NAMED (no silent red)" \
   || bad "a non-required red is still unattributed (acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';'))"
 
+# ⛔ THE THREE DRIVES ABOVE SPAWN, SO THEY CONSUME THE SHARED `fixcount-4242` AND LEAVE A `fixspend`
+# RECORD BEHIND (the defer arms they replaced changed no state at all). Each one therefore starts from
+# a cleared counter: without it the third drive reads an exhausted attempt cap and parks instead of
+# spawning, which would make it assert the wrong branch. `mv`, never `rm` on a `$TMP/…` path (#709).
+t5_clear() {
+  for _f in fixcount-4242 fixspend-4242-abc1234 parked-4242 parkreason-4242 argv-4242; do
+    [ -e "$TMP/O/state/$_f" ] && mv "$TMP/O/state/$_f" "$TMP/state.spent.$_f.$RANDOM" 2>/dev/null
+  done
+  return 0
+}
+
+# ⛔ THE CI-QUEUE GATE IS GONE FROM ALL THREE FIXER ARMS, AND THESE DRIVE THAT (#2927). Until this
+# change each of them deferred on `ciq_push_ok`, so a deep queue stopped PR-REPAIR work: measured
+# 2026-10-27 on cell 4, 41 consecutive repair dispatches were skipped while 8 self-hosted runners and
+# ~11 lane slots sat idle. The predicate is stubbed to REFUSE (`CIQ_PUSH_RC=1`) *and* to record being
+# asked — so "the arm no longer consults the queue" is measured, not inferred from a missing log line.
+t5_clear; : > "$TMP/ciqspy"
+CIQ_PUSH_RC=1; drive_conflict 0; unset CIQ_PUSH_RC
+[ "$(spawns)" -ge 1 ] && [ "$(acts)" = "1" ] && [ ! -s "$TMP/ciqspy" ] && ! grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "CONFLICTING with a REFUSING queue predicate: the fixer is spawned AND the predicate is never consulted" \
+  || bad "CONFLICTING still consults the queue: spawns=$(spawns) acts=$(acts) called=$([ -s "$TMP/ciqspy" ] && echo yes || echo no) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
+: > "$TMP/ciqspy"
+CIQ_PUSH_RC=1; drive 'FAILED:pipeline-compliance' rail 0 1; unset CIQ_PUSH_RC
+[ "$(spawns)" -ge 1 ] && [ "$(acts)" = "1" ] && [ ! -s "$TMP/ciqspy" ] && ! grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "CI-red fixer with a REFUSING queue predicate: spawned, and the predicate is never consulted" \
+  || bad "CI-red fixer still consults the queue: spawns=$(spawns) acts=$(acts) called=$([ -s "$TMP/ciqspy" ] && echo yes || echo no)"
+# The review-gate arm only reaches ITS fixer branch for a PR with FINDINGS at this head (a head with
+# none is a re-record, which spends no CI), so the needsfix marker is supplied.
+t5_clear; : > "$TMP/ciqspy"
+NEEDSFIX=1; CIQ_PUSH_RC=1; drive 'FAILED:ai-review-gate' rail 0 1; unset NEEDSFIX CIQ_PUSH_RC
+[ "$(spawns)" -ge 1 ] && [ "$(acts)" = "1" ] && [ ! -s "$TMP/ciqspy" ] && ! grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "review-gate fixer with a REFUSING queue predicate: spawned, and the predicate is never consulted" \
+  || bad "review-gate fixer still consults the queue: spawns=$(spawns) acts=$(acts) called=$([ -s "$TMP/ciqspy" ] && echo yes || echo no)"
+
+
 echo
 echo "=== T7: the review remedy is DISPATCHABLE, keyed on (PR, head), and BOUNDED (agent-infra#2653) ==="
 # ⛔ WHAT THIS SECTION IS FOR. The controller printed the correct remedy (`NEEDS-REVIEW — the remedy is
@@ -612,10 +626,12 @@ STORE="$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-4242.json"
 clear_revdisp() { mv "$REV_DISP" "$TMP/revdisp.spent.$RANDOM" 2>/dev/null || true; }
 clear_store()   { mv "$STORE" "$TMP/store.spent.$RANDOM" 2>/dev/null || true; }
 seed_revdisp()  { printf '%s %s\n' "$1" "$2" > "$REV_DISP"; }
-# ⛔ THE REVIEW-GATE ARM IS ONLY REACHED FOR A HEAD WITH NO FINDINGS (#2132). The T5 drives above leave
-# a `needsfix-4242-abc1234` marker behind (they need it to exercise the DEFER arm), and every drive
-# here shares ONE `$O/state`. Leaving it in place routes these drives into the FIXER arm and the whole
-# section would then grade a path it never reached — measured: (a) reported "spawns=1" for a fixer.
+# ⛔ THE REVIEW-GATE ARM IS ONLY REACHED FOR A HEAD WITH NO FINDINGS (#2132). The T5 drives above may
+# leave a `needsfix-4242-abc1234` marker behind (the review-gate arm there supplies one; since #2927 it
+# CONSUMES it by spawning rather than deferring, but the clearing must not depend on which branch T5
+# took), and every drive here shares ONE `$O/state`. Leaving it in place routes these drives into the
+# FIXER arm and the whole section would then grade a path it never reached — measured: (a) reported
+# "spawns=1" for a fixer.
 clear_needsfix() { mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.spent.$RANDOM" 2>/dev/null || true; }
 # ⛔ A DRIVE THAT SPAWNS LEAVES A WORKER RECORD, WHICH INFLATES THE NEXT DRIVE'S CENSUS (measured):
 # the `lanes-in-use` fixture says 9, and a leftover `worker-merge-4242` made the same assertion read

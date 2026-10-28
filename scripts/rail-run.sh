@@ -65,7 +65,12 @@
 #   RAIL_RUN_REPO_SLUG   the repo identity to record and key on (default: resolved from `origin`)
 #   RAIL_RUN_DIR         run-state root (default ${O:-$HOME/orchestrator}/state/rail-run)
 #   RAIL_RUN_RAIL        the rail (default: admin-merge.sh beside this script)
-#   RAIL_RUN_GH          the gh command (default: gh)
+#   RAIL_RUN_GH  the gh command (default: gh)
+#   RAIL_RUN_GH_HOST     the WEB host the artifact url must name (default: from the identity value,
+#                        else `origin`, else github.com) — read at `start` ONLY, and only when the
+#                        identity named no host: a host-naming `--repo`/`RAIL_RUN_REPO_SLUG` outranks it
+#   RAIL_RUN_CLAIM_MAX   seconds an incarnation-less claim may look in flight (default 60)
+#   RAIL_RUN_RECORD_MAX  seconds a run record whose liveness ABSTAINS may block a start (default 86400)
 #   RAIL_RUN_NO_SETSID   1 = do NOT start a new session — the shared-group risk is then NAMED,
 #                        never silently assumed away (see SESSION ISOLATION below)
 #
@@ -381,26 +386,39 @@ pr_url_names() {
   [ "$rest" = "/${lslug}/pull/${pr}" ] || [ "$rest" = "/${lslug}/pull/${pr}/" ]
 }
 
-# pr_state <pr> <slug|""> <unused> <host-file> -> "<STATE> <mergedAt|-> <url>", or nothing when the
-# read ABSTAINED. Nothing is the important answer: a failed artifact read is never a landing, a
-# refusal or a kill claim — callers must fold it into `unknown` for EVERY exit status, which is what
-# derive does. `$3` is deliberately unused and kept for the existing call sites; the host file is 4th.
+# pr_state <pr> <slug|""|> <unused> <host-file> -> "<STATE> <mergedAt|-> <url>" on success. On an
+# ABSTENTION it prints NOTHING and the EXIT CODE NAMES THE CAUSE — because one empty answer collapsed
+# three causes with three DIFFERENT, mutually-wrong remedies into a single sentence that every cause
+# got to read (#2959 review, cycle 4, P2):
+#   0 success · 11 no slug · 12 the gh read failed (no comparison happened) ·
+#   13 the url named a DIFFERENT host · 14 the url named THIS host but another repo/PR
+# Every non-zero is still an ABSTENTION: callers must fold it into `unknown` for EVERY exit status,
+# never into a landing/refusal/kill claim. `$3` is unused and kept for the existing call sites.
 pr_state() {
-  local pr="$1" slug="${2:-}" host_file="${4:-}" out url
+  local pr="$1" slug="${2:-}" host_file="${4:-}" out url uhost rhost
   # ⛔ NO SLUG, NO READ. An unqualified `gh pr view <N>` is resolved by `gh` against its own ambient
   # configuration, so an empty slug is an ABSTENTION — the caller folds it into `unknown`.
-  [ -n "$slug" ] || return 0
+  [ -n "$slug" ] || return 11
   out="$("$GH" pr view "$pr" --repo "$slug" --json state,mergedAt,url \
-        --jq '"\(.state) \(.mergedAt // "-") \(.url // "-")"' 2>/dev/null)" || return 0
+        --jq '"\(.state) \(.mergedAt // "-") \(.url // "-")"' 2>/dev/null)" || return 12
   case "$out" in
     MERGED\ *|OPEN\ *|CLOSED\ *|DRAFT\ *) : ;;
-    *) return 0 ;;
+    *) return 12 ;;
   esac
   url="${out##* }"
   # The identity proof. A read that names another repo, another host (or no URL at all) is not a fact
-  # about THIS PR.
-  pr_url_names "$url" "$slug" "$pr" "$(file_or_empty "$host_file")" || return 0
-  printf '%s' "$out"
+  # about THIS PR. Where it fails, WHICH half failed decides the remedy: another host is a RECORDED
+  # host that no re-poll can change, while a same-host mismatch is a wrong `--repo`.
+  rhost="$(file_or_empty "$host_file")"; rhost="${rhost:-github.com}"
+  pr_url_names "$url" "$slug" "$pr" "$rhost" && { printf '%s' "$out"; return 0; }
+  # A read that produced NO URL never reached a comparison at all, so it stays the READ's failure
+  # rather than being blamed on a host.
+  case "$url" in ''|-) return 12 ;; esac
+  uhost="${url#*://}"; uhost="${uhost%%/*}"
+  if [ "$(printf '%s' "$uhost" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$rhost" | tr '[:upper:]' '[:lower:]')" ]; then
+    return 14
+  fi
+  return 13
 }
 
 sig_name() { # <signal-number> -> its name when it is one this box meets daily
@@ -802,22 +820,109 @@ derive() {
       "${prst:-not-read}" "$merged" "${started:--}" "${bytes:-0}" "${age:--}" \
       "${2:+ $2}"
   }
-  # read_artifact — ONE gh read, setting prst+merged. An empty prst means the read ABSTAINED, and
-  # every branch below must treat that as `unknown`, never as a landing/refusal/kill claim: a merge
-  # the API could not report is exactly what a wrong-direction signal here would hide.
+  # read_artifact <run_over 0|1> — ONE gh read, setting prst+merged. An empty prst means the read
+  # ABSTAINED, and every branch below must treat that as `unknown`, never as a landing/refusal/kill
+  # claim: a merge the API could not report is exactly what a wrong-direction signal here would hide.
+  # `run_over` says whether the RUN is POSITIVELY finished (an exit status exists, or the recorder AND
+  # the rail are both gone). It gates the remedies that start a SECOND merge attempt (causes 13 and 14,
+  # the two a re-poll cannot move), so those may only be prescribed without the "while this record may
+  # still look live" caveat when no live run would refuse the start (#2959 review, cycles 4-5, P1).
   read_artifact() {
-    local out
+    local out src run_over="${1:-0}"
     abstain_why=""
     if [ -z "$slug" ]; then
       abstain_why="this run records no repo and this poll named none, so WHICH repo PR $pr belongs to is unknown — start or poll with --repo owner/repo"
       prst=""; merged="-"; return 0
     fi
     out="$(pr_state "$pr" "$slug" "" "$rd/host")"
+    src=$?
     prst="$(printf '%s' "$out" | cut -d' ' -f1)"
     merged="$(printf '%s' "$out" | cut -d' ' -f2)"
     [ -n "$merged" ] || merged="-"
     if [ -z "$prst" ]; then
-      abstain_why="the read of PR $pr in $slug abstained, or its url did not name $slug/pull/$pr — so the API did not confirm which PR this is"
+      # ⛔ NAME THE HOST THAT WAS COMPARED, AND THE ONE ACTION THAT CAN CHANGE IT (review round 7).
+      # `unknown` is the right answer and it is useless without the value that produced it: the run
+      # records the host at `start`, and a lane reading only "the read abstained" cannot tell "my
+      # origin names a mirror" from "the API is down" — so it re-polls a run that can never resolve.
+      # ⛔ THE DEFAULT IS SPELLED OUT WHEN THE RUN RECORDED NONE — and it MUST be shell parameter
+      # expansion, not `sed 's/^$/…/'`. `file_or_empty` `tr -d`s every newline, so a missing or empty
+      # host file yields ZERO bytes, and sed emits nothing for empty input (a substitution needs a
+      # LINE to sit on): the default never fired and the row rendered an EMPTY host — the very value
+      # `pr_url_names` compared with its own `${4:-github.com}` (measured, #2959 review).
+      # ⛔ AND IT NAMES A REMEDY THAT CAN ACTUALLY WORK. `RAIL_RUN_GH_HOST` is read by `resolve_host`,
+      # whose ONLY caller is `start`; `derive` reads the RECORDED file, so setting the knob and
+      # re-polling the SAME run reproduces this identical row — the re-poll loop this line exists to
+      # stop. The host is fixed at start, so the fix is a NEW run (measured, #2959 review).
+      # ⛔ AND THE ADVICE MUST BE TRUE FOR EVERY CAUSE THIS SENTENCE COVERS. An earlier version named
+      # only "set RAIL_RUN_GH_HOST and start a new run", which is WRONG for two of the three shapes it
+      # is printed over (#2959 review, cycle 3, P1):
+      #   • same host, different repo/PR — the HOST matched; following the advice records a different,
+      #     also-wrong host, so that case must be pointed at `--repo` instead;
+      #   • a FAILED read (`gh` 502) — `pr_state` returns at its `|| return 12` BEFORE `pr_url_names` is
+      #     called, so no comparison happened at all, and prescribing "start a new run" (a second merge
+      #     attempt) for a transient read is exactly backwards;
+      #   • and it CONTRADICTED the line above it on the `gone` branch, which says "re-poll rather than
+      #     concluding either way" — only the HOST is frozen at `start`, the artifact read is not.
+      # Each cause now carries only the remedy that can actually move it.
+      local host; host="$(file_or_empty "$rd/host")"; host="${host:-github.com}"
+      # ⛔ A START-BLOCKING REFUSAL IS BOUNDED, SO "until this one is positively gone" IS FALSE (#2959
+      # review, cycle 5, P1). `prev_in_flight` blocks a start on THREE bounded windows, none of which is
+      # `positivity`: a live incarnation blocks; an ABSTAINING one blocks only while `record_young`
+      # (RAIL_RUN_RECORD_MAX, 24 h); and a record with NO incarnation blocks only while `younger_than`
+      # CLAIM_MAX (60 s) — after which `start` proceeds on a record that still reads `unknown`. The old
+      # sentence told such a reader to "re-poll first" until a proof that never arrives, which is the
+      # stale-flag defect (#8175) `docs/ops/rail-run.md` says this bound exists to prevent. It also
+      # contradicted the `gone` branch's own line above it.
+      # ⛔ AND THE KNOB IS NOT THE ONLY INPUT TO THE HOST. `start` writes `${host_hint:-$(resolve_host)}`,
+      # so when a host-naming `--repo`/`RAIL_RUN_REPO_SLUG` supplied the identity the knob is never read:
+      # an imperative that leads with `RAIL_RUN_GH_HOST=` sends that reader to re-record the SAME host
+      # and read this identical row again. The precedence is stated first, so the advice is not inert.
+      # ⛔ AND A POLL CANNOT MOVE CAUSE 14 AT ALL (#2959 review, cycle 5, P1). The identity half is
+      # recorded too: re-polling with the RECORDED slug reproduces the same url, and naming a DIFFERENT
+      # `--repo` is refused as an identity mismatch (`derive`'s `cli_slug != rec` guard). `--repo` is
+      # therefore not a fix — the only thing that records a new identity is a new run, which is why
+      # cause 14 prescribes one and 13 names the knob conditionally.
+      # ⛔ ONE CAUSE, ONE REMEDY — SELECTED FROM THE EXIT CODE, NOT ENUMERATED (#2959 review, cycle 4).
+      # The previous version was ONE static string listing all three remedies, so a transient `gh` 502
+      # was handed "start a new run" — a SECOND merge attempt for a read that just needs a re-poll — and
+      # a run whose liveness was unresolved was told to do the one thing `start` REFUSES while it may
+      # still be alive (`prev_in_flight`, bounded by RAIL_RUN_RECORD_MAX). Each cause now says only what
+      # can actually move it, and the host remedy is gated on `run_over`.
+      case "$src" in
+        13)
+          # Another HOST. Only `start` writes `rd/host` (`resolve_host`), so a re-poll is powerless.
+          if [ "$run_over" = "1" ]; then
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr on host $host — it is on a DIFFERENT host, and the host is RECORDED at start, so a re-poll cannot change it. The remedy is to start a new run: pin the web host with RAIL_RUN_GH_HOST=<web host> ONLY if this run recorded the host bare, because a host-naming --repo or RAIL_RUN_REPO_SLUG outranks it — if one of those recorded $host, THAT is what must change"
+          else
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr on host $host — it is on a DIFFERENT host, and the host is RECORDED at start, so this run can never land this PR. The remedy is a NEW run (pin the web host with RAIL_RUN_GH_HOST=<web host> ONLY if this run recorded the host bare — a host-naming --repo or RAIL_RUN_REPO_SLUG outranks it). A start can be REFUSED while THIS record still looks live, and that refusal is BOUNDED, not indefinite: it ends at RAIL_RUN_CLAIM_MAX when no incarnation was recorded, and at RAIL_RUN_RECORD_MAX (24 h) when a probe abstains — re-poll, and start once the bound passes"
+          fi ;;
+        14)
+          # Same host, wrong repo/PR: the host is RIGHT, so the fault is the IDENTITY, and no poll can
+          # move it (`derive` refuses a poll that names a different `--repo`). Only a new run records one.
+          # ⛔ AND THAT RUN MUST SPELL THE HOST (#2959 review, cycle 6, P2). The bare form `--repo
+          # owner/repo` supplies no host — `host_from_slug_arg` returns nothing for it (`:319`) — so
+          # `start` records `${host_hint:-$(resolve_host)}`, i.e. the knob and then `origin`. Measured:
+          # the remedy "start a new run with --repo <owner/repo>" written for a run whose host IS
+          # `ghe.example.com` re-recorded `github.com` and produced cause 13 on the very next poll — a
+          # second merge attempt that could never land, plus a third run. Spelling the host is the ONE
+          # form that re-records both halves this message just proved: the identity from the argv value,
+          # the host from the same value.
+          if [ "$run_over" = "1" ]; then
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY (a renamed or transferred repo, or the wrong slug for PR $pr), and no poll can change an identity a run recorded, because naming a different --repo is refused as an identity mismatch. The remedy is to start a new run naming BOTH halves — --repo $host/<the owner/repo the url actually names> — because a BARE owner/repo supplies no host, so start would record RAIL_RUN_GH_HOST and then origin instead of the $host this run proves is right"
+          else
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY, and no poll can change an identity a run recorded. The remedy is a new run naming BOTH halves — --repo $host/<the owner/repo the url actually names> — because a BARE owner/repo supplies no host and would re-record RAIL_RUN_GH_HOST/origin instead of $host; and a start can be refused while THIS record still looks live — that refusal is BOUNDED (RAIL_RUN_CLAIM_MAX / RAIL_RUN_RECORD_MAX), so re-poll and start once the bound passes"
+          fi ;;
+        *)
+          # The READ failed: nothing was compared, so there is no host verdict to give. A second run
+          # would reproduce the same transient failure on the same head. `src` is 12 for a `gh` that
+          # errored, answered an unrecognised shape, or answered NO url at all — and in every one of the
+          # three NO HOST VERDICT EXISTS: `pr_url_names` (called at `:413`) never runs for the first two,
+          # and for the third it returns at its own empty-url guard (`:378`) BEFORE comparing any host or
+          # path. (It DOES run for that third cause — the earlier wording here said it never ran, which is
+          # false about the call order even though the message's claim holds: #2959 review, cycle 6, P3.)
+          # So the sentence must not name a host as the cause.
+          abstain_why="the read of PR $pr in $slug on host $host did not complete — gh did not answer, or answered something that names no url for this PR, so NOTHING was compared and no host verdict exists. This abstains about the READ, not the host: re-poll, because a new run would not fix a transient read" ;;
+      esac
     fi
     return 0
   }
@@ -833,7 +938,7 @@ derive() {
       printf '  the exit-status file %s/rc is not a number, so this run has no readable verdict\n' "$rd"
       return 25 ;;
     esac
-    read_artifact
+    read_artifact 1
     # The ARTIFACT outranks the status: a rail that merged and then died of a signal still produced a
     # MERGED PR, so `killed` must never be printed over a real merge.
     if [ "$prst" = "MERGED" ]; then
@@ -962,6 +1067,10 @@ derive() {
       row "unknown" "verdict=none liveness=unknown"
       printf '  %s — with no exit status this is an ABSTENTION: neither a death nor a success.\n' "$probe"
       printf '  read %s and re-poll\n' "$log"
+      # ⛔ THE REASON IS ALREADY COMPUTED — NOT PRINTING IT IS THE DEFECT THIS FILE CALLS OUT (#2959
+      # review, cycle 3, P2): `read_artifact` set `abstain_why` above, and this branch dropped it, so a
+      # reader saw `pr_state=not-read` with no cause. `note_abstain` is a no-op when nothing abstained.
+      note_abstain
       return 25 ;;
   esac
 
@@ -990,11 +1099,13 @@ derive() {
         row "unknown" "verdict=none rail_liveness=unknown"
         printf '  the recorder is gone and the RAIL'"'"'s liveness could not be read (%s) — an\n' "$rprobe"
         printf '  ABSTENTION: it may still be running and may still merge. Re-poll; do not re-run\n'
+        # ⛔ the datum was in hand and unread (#2959 review, cycle 3, P2) — see the note on case 3).
+        note_abstain
         return 25 ;;
     esac
   fi
 
-  read_artifact
+  read_artifact 1
   if [ "$prst" = "MERGED" ]; then
     row "landed" "verdict=artifact"
     printf '  the PR is MERGED (merged=%s). The recorder is gone and wrote NO exit status, so the\n' "$merged"

@@ -190,8 +190,9 @@ git fetch origin main --quiet 2>/dev/null
 # every lane ends in a PR that needs a full CI pass. Measured 2026-10-22 13:40 the queue was
 # queued=92/in_progress=6 on 5 runners (tortoise) and queued=97/in_progress=7 (agent-infra) — a batch
 # dispatched into that finishes nothing and makes the backlog worse. The read is the SAME module the
-# controller and fix-one.sh read (`ci-queue.sh`), so the three surfaces cannot disagree about the
-# queue. ⛔ BUT A DEFERRAL HERE IS NOT FREE (#2296 review cycle 4, P1): the controller takes the
+# controller reads (`ci-queue.sh`), so the two NEW-PR surfaces cannot disagree about the queue.
+# ⛔ NOT SHARED WITH `fix-one.sh` ANY MORE (#2927): a fixer is REPAIR, so it stopped reading the module
+# altogether rather than reading it and deferring. ⛔ BUT A DEFERRAL HERE IS NOT FREE (#2296 review cycle 4, P1): the controller takes the
 # claim (`claim_issue_acquire "" "$ISS"` in orch-loop.sh's dispatch block) and appends N to `.batch`
 # AND `dispatched.txt` BEFORE it hands the batch to this script, so "deferring claims nothing" was
 # FALSE. Without the release below, every issue in a deferred batch would sit on a 3 h cross-box
