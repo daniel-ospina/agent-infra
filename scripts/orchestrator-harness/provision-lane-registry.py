@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""provision-lane-registry.py — derive this box's LANE ROSTER from its own lane population.
+
+WHY THIS EXISTS (agent-infra#1935, measured 2026-10-28 on cell 1 vm-efa6cc8f)
+----------------------------------------------------------------------------
+The dispatch pre-flight's holder surface asks the FLEET BOARD "who is working this issue?".
+The board is built FROM `$HOME/.pi/agent/state/lane-registry.tsv` (tortoise
+`tools/fleet_state.py`), and that file was written only by the RETIRED cmux dispatcher. A box
+that never ran it has no roster, so `fleet_state.load_registry` reports `measured=False`, so
+`collision_preflight._board_can_answer` refuses, so EVERY candidate is INCOMPLETE and the
+cell dispatches nothing — while the controller keeps reporting RUNNING:
+
+    issue assignee/holder  INCOMPLETE  claim gate: the FLEET BOARD could not answer — the
+      board's lane registry could not be read (FileNotFoundError: … lane-registry.tsv) —
+      the roster was NEVER PROVISIONED in this cell
+    [refresh] ABORT: none of the 12 candidate(s) … judged NOTHING
+
+Read on cell 1 the same day (verbatim):
+
+    $ cmux list-workspaces --json
+    cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui
+    $ .venv/bin/python -c 'import fleet_state as fs; print(fs.live_sessions().measured)'
+    True                      # the PROCESS store answers: 2 lanes published as PROC:<pid>
+    $ ls "$HOME/Library/Application Support/cmux/session-com.cmuxterm.app.json"
+    (absent — this box has never persisted a cmux workspace layout)
+
+⛔ SO THE ROSTER IS NOT UNKNOWN — IT IS EMPTY, AND THE TOOL'S OWN REMEDY CANNOT BE FOLLOWED.
+`fleet_state.registry_remedy` tells the reader to take each lane's workspace uuid from the
+cell's own `cmux list-workspaces --json`; on a Linux cell that command cannot answer at all
+(worker-terminal.sh records the same measurement — agent-infra#2368), so the prescribed
+population is unobtainable there. What IS true on such a box is that NO cmux-workspace lane
+exists, because no cmux workspace was ever created — a reading this file MEASURES (see
+`cmux_layout_store`), never infers from the producer's prose.
+
+WHAT THIS SCRIPT IS, AND IS NOT
+-------------------------------
+It is a PROVISIONER, not a reader and not a repair for a failed read. It writes the roster the
+reader will later consume, and it has exactly three arms — each decided by a MEASUREMENT:
+
+  derive          the cmux daemon answers AND `cmux list-workspaces --json` parses. One row per
+                  workspace whose cwd is a DEMONSTRABLE fleet worktree. Everything else is
+                  excluded BY NAME (an owner's project, the shared checkout, a workspace whose
+                  cwd could not be resolved), because a roster row is an ATTRIBUTION: a row for
+                  the owner's own window reports a holder that does not exist (#8177/#2213).
+  not-applicable  the daemon does not answer, and this box has never persisted a cmux workspace
+                  layout ⇒ it has no cmux-workspace lanes at all. The roster's truthful content
+                  is ZERO rows, and it is WRITTEN — an absent file is read by the board as
+                  "never provisioned" and refuses every candidate, which is the defect.
+  refused         the daemon answers but the list could not be READ, or the box HAS a persisted
+                  layout it cannot read, or there is no lane surface at all (no cmux, no tmux).
+                  NOTHING is written. An unreadable read must never become an empty roster:
+                  that is the false-CLEAN #8175 exists to prevent, and it is the one direction a
+                  provisioning tool must never fail in.
+
+⛔ A HAND-MAINTAINED ROSTER IS NEVER REPLACED. Provenance decides: a file carrying this script's
+own marker is ours to refresh; a file without it (the Mac's curated roster, 96 rows of human
+labels) is reported as drift and left alone unless `--force` is given. The Mac's roster is
+better than anything derivable from workspace cwds, and a bring-up step that overwrote it would
+be destroying the fleet's own attribution to satisfy a form.
+
+Usage
+-----
+    provision-lane-registry.py                     # report only (same as --check)
+    provision-lane-registry.py --check             # report; exit 2 when the box is not provisioned
+    provision-lane-registry.py --apply             # write the roster (idempotent, atomic)
+    provision-lane-registry.py --apply --force     # replace even a hand-maintained roster
+    provision-lane-registry.py --print             # print the rows that would be written
+    provision-lane-registry.py --roster PATH       # seam for tests (never an operator knob)
+
+Exit codes
+----------
+    0  provisioned — the roster now states this box's truth (written, already current, or a
+       hand-maintained roster left in place)
+    2  ACTION NEEDED — the roster is absent or stale and this invocation was not allowed to
+       write it (`--check`, or a hand-maintained roster without `--force`)
+    3  REFUSED — the population could not be MEASURED; nothing was written, and the reason is
+       printed (the caller must not read this as "provisioned")
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+#: The marker that says "this file was derived by this script", so a refresh can tell its own
+#: output from a hand-maintained roster. It is a COMMENT in the reader's grammar
+#: (`fleet_state.load_registry` skips `#`), so carrying it cannot change what the board reads.
+MARKER = "# provisioned-by: provision-lane-registry.py"
+
+#: Where the readers look (`tortoise tools/fleet_state.py: REGISTRY`, `scripts/lane-status.py: REG`).
+ROSTER_REL = os.path.join(".pi", "agent", "state", "lane-registry.tsv")
+
+#: Where cmux persists its live workspace layout. Its PRESENCE is the measurement that decides
+#: `refused` from `not-applicable` when the CLI cannot answer: a box that has persisted a layout
+#: HAS cmux workspaces, so an unreadable list is a failed read, never an empty fleet. Every
+#: candidate is checked, because the path is platform-shaped and the fleet runs both platforms.
+LAYOUT_CANDIDATES = (
+    ("Library", "Application Support", "cmux", "session-com.cmuxterm.app.json"),
+    (".config", "cmux", "session-com.cmuxterm.app.json"),
+    (".cmux", "session-com.cmuxterm.app.json"),
+)
+
+
+def home() -> str:
+    return os.environ.get("HOME") or os.path.expanduser("~")
+
+
+def roster_path(override: str | None) -> str:
+    return override or os.path.join(home(), ROSTER_REL)
+
+
+def cmux_layout_store() -> str | None:
+    """The persisted cmux workspace layout, or None when this box has none.
+
+    ⛔ THIS IS THE MEASUREMENT, NOT A GUESS. It answers "has this box ever had cmux
+    workspaces?" — which is the question that separates a FAILED READ (the layout exists and
+    the CLI could not read it) from an EMPTY POPULATION (no layout was ever written here). The
+    two have opposite remedies and opposite polarities: the first must refuse, the second must
+    provision a zero-row roster. Matching the CLI's error text instead would repeat the
+    phrase-pin class that silently removed the holder re-route (#2848).
+    """
+    for parts in LAYOUT_CANDIDATES:
+        p = os.path.join(home(), *parts)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def run(argv: list[str], timeout: int = 45) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, "", f"{type(exc).__name__}: {exc}"
+
+
+def cmux_answers() -> bool:
+    """Does the cmux DAEMON answer on this box?
+
+    ⛔ THE SAME PROBE `worker-terminal.sh:wt_launcher` USES (`cmux tree --json`), deliberately:
+    one definition of "this box has a cmux surface". A second, differently-shaped probe would
+    let the roster claim lanes on a box whose launcher says there are none — the disagreement
+    the launcher's OWN comment warns about, one subsystem over.
+    """
+    if not _which("cmux"):
+        return False
+    rc, _out, _err = run(["cmux", "tree", "--json"], timeout=45)
+    return rc == 0
+
+
+def _which(binary: str) -> str | None:
+    for d in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not d:
+            continue
+        cand = os.path.join(d, binary)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def parse_workspaces(payload: str) -> list[dict] | None:
+    """The workspace objects in a `cmux list-workspaces --json` answer, or None if unreadable.
+
+    Both shapes the CLI has shipped are accepted (a bare list, and `{"workspaces": [...]}`),
+    and anything else is UNREADABLE — never an empty list, because "0 workspaces" and "I could
+    not read this" are the two facts this script exists to keep apart.
+    """
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return None
+    if isinstance(data, dict):
+        data = data.get("workspaces")
+    if not isinstance(data, list):
+        return None
+    return [w for w in data if isinstance(w, dict)]
+
+
+def real(path: str) -> str | None:
+    if not path or not isinstance(path, str) or "\x00" in path:
+        return None
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return None
+
+
+def linked_worktree(path: str) -> bool:
+    """True when `path` sits inside a REAL linked git worktree (the `.git` FILE `git worktree
+    add` writes at or above it, pointing into `<main>/.git/worktrees/<name>`).
+
+    A `.git` DIRECTORY means a main checkout, which is not a lane. A `.git` file that points
+    anywhere else (`git submodule`, `--separate-git-dir`) is not one either — the pointer is
+    what is required. This mirrors `scripts/lane-actions.py:_is_linked_worktree`, whose
+    documented cases are re-driven in the suite so the two cannot drift silently.
+    """
+    cur = path
+    for _ in range(64):
+        g = os.path.join(cur, ".git")
+        try:
+            if os.path.isdir(g):
+                return False
+            if os.path.isfile(g):
+                with open(g, errors="ignore") as fh:
+                    head = fh.read(512)
+                line = head.strip().splitlines()[0] if head.strip() else ""
+                if not line.startswith("gitdir:"):
+                    return False
+                target = line.split(":", 1)[1].strip().replace(os.sep, "/")
+                return "/worktrees/" in (target + "/")
+        except (OSError, IndexError):
+            return False
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+    return False
+
+
+def is_fleet_worktree(cwd: str) -> bool:
+    """True ONLY when `cwd` is DEMONSTRABLY a fleet lane's worktree.
+
+    Fail-closed: an unreadable path, a non-absolute path and anything that is not a linked
+    worktree under `.worktrees/` or a `wt-*` lane root is NOT a lane, so it gets no row. The
+    cost of a wrong FALSE here is one fewer derived row on a box whose roster we are deriving
+    because it has none; the cost of a wrong TRUE is a roster row attributing an issue to the
+    OWNER's window — a manufactured holder, which is a blocking false COLLISION (#8177).
+    """
+    p = real(cwd)
+    if not p or not p.startswith("/"):
+        return False
+    parts = [x for x in p.split("/") if x]
+    if not parts:
+        return False
+    if ".worktrees" in parts and linked_worktree(p):
+        return True
+    return parts[-1].startswith("wt-")
+
+
+def lane_label(cwd: str) -> str:
+    """The row's label: the lane worktree's own name, minus the `wt-` spelling prefix.
+
+    The reader uses this as the lane's NAME, so it must be the name a human and the harness
+    already use for that worktree (`lane-1935`, `w-review10143`, `fix-1935-tests`), not a
+    synthesised id. A path that yields nothing usable falls back to nothing, and the row is
+    skipped rather than labelled with a placeholder.
+    """
+    base = os.path.basename((cwd or "").rstrip("/"))
+    if base.startswith("wt-") and len(base) > 3:
+        base = base[3:]
+    return base
+
+
+def issue_label(label: str) -> str:
+    """The row's third column: `lane:<N>` when the lane's own name carries a work-item number.
+
+    The reader treats this column as the lane's OWN `lane:` annotation (`fleet_state` prefers
+    the last non-empty value per label), and a number in the lane's name is the same mechanical
+    evidence `attribute_claims` uses — never a title or a comment (#8175). No number ⇒ EMPTY,
+    not a guess.
+    """
+    digits = ""
+    for ch in label:
+        if ch.isdigit():
+            digits += ch
+        else:
+            if digits:
+                break
+            continue
+    if not digits:
+        # a trailing/embedded number (`lane-1935`, `w-review10143`, `fix-1935-tests`)
+        cur = ""
+        for ch in label:
+            if ch.isdigit():
+                cur += ch
+            elif cur:
+                break
+        digits = cur
+    return f"lane:{digits}" if digits else ""
+
+
+def derive_rows(workspaces: list[dict]) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """(rows, excluded) — one row per DEMONSTRABLE fleet workspace.
+
+    `excluded` names every workspace that was NOT rostered, with its reason, so a derived
+    roster can never quietly hide the box's other windows: reading "8 windows, 3 rostered"
+    is a measurement; reading "3 rows" alone is not.
+    """
+    rows: list[tuple[str, str, str]] = []
+    excluded: list[str] = []
+    seen: set[str] = set()
+    for ws in workspaces:
+        wsid = ws.get("id") or ws.get("workspaceId") or ws.get("uuid")
+        cwd = ws.get("current_directory") or ws.get("currentDirectory") or ws.get("cwd")
+        title = ws.get("custom_title") or ws.get("customTitle") or ws.get("title") or ""
+        if not isinstance(wsid, str) or not wsid.strip():
+            excluded.append(f"{title or '?'}: no workspace id in the answer")
+            continue
+        if not isinstance(cwd, str) or not cwd.strip():
+            excluded.append(f"{title or wsid[:8]}: no cwd in the answer (identity unreadable)")
+            continue
+        if not is_fleet_worktree(cwd):
+            excluded.append(f"{title or wsid[:8]} ({cwd}): not a fleet worktree")
+            continue
+        label = lane_label(cwd)
+        if not label:
+            excluded.append(f"{title or wsid[:8]} ({cwd}): no usable lane name")
+            continue
+        key = wsid.upper()
+        if key in seen:
+            excluded.append(f"{label}: duplicate row for workspace {wsid[:8]}")
+            continue
+        seen.add(key)
+        rows.append((label, wsid.upper(), issue_label(label)))
+    rows.sort(key=lambda r: (r[0].lower(), r[1]))
+    return rows, excluded
+
+
+def render(rows: list[tuple[str, str, str]], arm: str, note: str) -> str:
+    """The roster file this script writes: the marker, the arm it was derived under, the rows.
+
+    Layout follows the reader's grammar exactly (`label<TAB>workspace<TAB>issue-label`, `#`
+    comments ignored, blank lines ignored), and the format line is printed in the file because
+    a human who opens it is the next person to edit it.
+    """
+    out = [
+        MARKER,
+        f"# arm: {arm}",
+        f"# {note}",
+        "#",
+        "# label<TAB>workspace-uuid<TAB>issue-label — one row per cmux-workspace lane. Derived from",
+        "# this box's own lane population; edit by hand only if you mean to override the derivation",
+        "# (a hand-edited file loses the marker, and this script will then never replace it).",
+    ]
+    for label, wsid, lane in rows:
+        out.append("\t".join([label, wsid, lane]))
+    return "\n".join(out) + "\n"
+
+
+def existing(path: str) -> tuple[bool, bool, list[str]]:
+    """(present, ours, rows) — whether the roster exists, whether WE wrote it, and its rows.
+
+    Provenance is the marker LINE, never a heuristic on the content: a hand-curated roster may
+    contain anything, and guessing at "looks derived" would eventually overwrite it.
+    """
+    try:
+        with open(path, errors="ignore") as fh:
+            text = fh.read()
+    except OSError:
+        return False, False, []
+    rows = [ln for ln in text.splitlines()
+            if ln.strip() and not ln.startswith("#") and "\t" in ln]
+    ours = any(ln.strip() == MARKER for ln in text.splitlines())
+    return True, ours, rows
+
+
+def write_atomic(path: str, text: str) -> None:
+    """Write via a sibling temp file + rename, so a reader never sees a half roster."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".lane-registry.", dir=d)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__.splitlines()[0])
+    ap.add_argument("--check", action="store_true", help="report only (the default)")
+    ap.add_argument("--apply", action="store_true", help="write the roster")
+    ap.add_argument("--force", action="store_true",
+                    help="replace a HAND-MAINTAINED roster (never implied by --apply)")
+    ap.add_argument("--print", dest="print_rows", action="store_true",
+                    help="print the rows that would be written")
+    ap.add_argument("--roster", default=None, help="roster path (test seam)")
+    args = ap.parse_args(argv)
+    if args.force and not args.apply:
+        args.apply = True
+
+    path = roster_path(args.roster)
+    present, ours, rows_now = existing(path)
+
+    # ── MEASURE ────────────────────────────────────────────────────────────────────────────
+    measured = False
+    workspaces: list[dict] = []
+    refusal = ""
+    if cmux_answers():
+        rc, out, err = run(["cmux", "list-workspaces", "--json"], timeout=45)
+        parsed = parse_workspaces(out) if rc == 0 else None
+        if parsed is None:
+            detail = (err or out or "").strip().splitlines()
+            refusal = (
+                "the cmux daemon answers, but its workspace list could not be READ"
+                + (f" (`cmux list-workspaces --json` exit {rc}: {detail[-1][:160]})" if detail else "")
+            )
+        else:
+            measured = True
+            workspaces = parsed
+            arm = "derive"
+    if not measured and not refusal:
+        # The daemon does not answer. WHICH FACT IS THAT? A box with a persisted layout HAS
+        # cmux workspaces and its list could not be read (refuse); a box with no layout has
+        # none at all (a truthful zero-row roster).
+        layout = cmux_layout_store()
+        if layout:
+            refusal = (
+                "the cmux daemon does not answer and this box HAS a persisted workspace layout "
+                f"({layout}) — so it has cmux-workspace lanes its roster could not enumerate. "
+                "An unreadable population is not an empty one"
+            )
+        elif _which("tmux"):
+            arm = "not-applicable"
+            measured = True
+        else:
+            refusal = (
+                "no lane surface at all: the cmux daemon does not answer, this box has no "
+                "persisted cmux layout, and tmux is not on PATH — there is no lane population "
+                "to provision from"
+            )
+    if not measured:
+        print(f"REFUSED: {refusal}")
+        print(f"  roster: {path} ({'present' if present else 'absent'} — left untouched)")
+        return 3
+
+    if arm == "derive":
+        rows, excluded = derive_rows(workspaces)
+        note = (f"derived from {len(workspaces)} live cmux workspace(s); "
+                f"{len(rows)} rostered, {len(excluded)} excluded")
+        text = render(rows, arm, note)
+        for why in excluded:
+            print(f"  excluded: {why}")
+    else:
+        layout = cmux_layout_store()
+        note = ("this box has NO cmux-workspace lanes: the cmux daemon does not answer here and "
+                "no workspace layout has ever been persisted"
+                + (f" (looked for {', '.join(os.path.join(home(), *p) for p in LAYOUT_CANDIDATES)})"
+                   ) + " — its lanes are enumerated from the process store instead, so the "
+                "roster's truthful content is ZERO rows (an ABSENT file would be read as "
+                "'never provisioned' and would refuse every candidate)")
+        rows: list[tuple[str, str, str]] = []
+        text = render(rows, arm, note)
+        del layout
+
+    if args.print_rows:
+        for label, wsid, lane in rows:
+            print("\t".join([label, wsid, lane]))
+
+    # ── DECIDE WHAT MAY BE WRITTEN ────────────────────────────────────────────────────────
+    if present and not ours and not args.force:
+        print(f"HAND-MAINTAINED roster left in place: {path} ({len(rows_now)} row(s))")
+        if rows:
+            print(f"  derivation offers {len(rows)} row(s); a hand-curated roster is not "
+                  "replaced without --force")
+        print("  (this is a deliberate non-destructive rule: the file is another box-wide "
+              "attribution, and a bring-up must not overwrite it to satisfy a form)")
+        return 0
+    if present and ours:
+        try:
+            with open(path, errors="ignore") as fh:
+                current = fh.read()
+        except OSError:
+            current = ""
+        if current == text:
+            print(f"CURRENT: {path} ({len(rows)} row(s), arm={arm})")
+            return 0
+
+    if not args.apply:
+        state = "present" if present else "absent"
+        print(f"ACTION NEEDED: {path} is {state} and does not state this box's truth "
+              f"(arm={arm}, {len(rows)} row(s)) — re-run with --apply")
+        return 2
+
+    write_atomic(path, text)
+    print(f"PROVISIONED: {path} ({len(rows)} row(s), arm={arm})")
+    if arm == "not-applicable":
+        print("  the roster is EMPTY on purpose: this box has NO cmux-workspace lanes (the cmux "
+              "daemon does not answer here and no workspace layout was ever persisted — its "
+              "lanes are enumerated from the process store), and an ABSENT file is what the "
+              "board refuses as 'never provisioned'")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
