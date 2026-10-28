@@ -4,16 +4,21 @@
 WHY: the deliverable is "an automatic process" that decides which lanes to dispatch and which to
 unblock. Its value is that it is REPEATABLE and WRONG IN KNOWN DIRECTIONS, so the step ordering that
 produces those directions has to be pinned by a test rather than by a comment. The Jev layer (Step
-5) is not called here: it is not deterministic, and it is asserted only through its FAILURE DIRECTION
-(the words layer unread must land in REPORT ONLY, never in an action list).
+5) is non-deterministic, so the DETERMINISTIC tests here stub it out; its own request plumbing and
+the two constants it posts with are pinned at the END of this file (their fail-closed arms — no key,
+HTTP error — are NOT yet pinned; that gap is agent-infra#2860).
 
-Run: /usr/bin/python3 scripts/test_lane_actions.py
+Run: /usr/bin/python3 scripts/test_lane_actions.py      (requires pytest — the module-level
+     `import pytest` and the `@pytest.mark.parametrize` leg below are the house convention, as in
+     the other scripts/test_*.py files; with pytest absent run `python3 -m pytest <this file>`
+     from an environment that has it, never a bare interpreter.)
 """
 import importlib.util
 import atexit
 import hashlib
 import json
 import os
+import pytest
 import shutil
 import tempfile
 
@@ -2642,3 +2647,173 @@ def test_a_degraded_FIRST_read_is_still_a_hard_REFUSAL(monkeypatch):
         assert "DEGRADED" in str(e), e
         return
     raise AssertionError("a degraded FIRST read must still refuse")
+
+
+# ── STEP 5's OWN PLUMBING, AND THE DEPLOYED COPY OF THE CONSTANTS (review 2026-10-26) ─────────
+# ⛔ THE DEFECT THESE EXIST FOR. `jev_step5` is stubbed out by every other leg in this file (it is
+# non-deterministic), so the code that actually POSTs with `LV.JEV_URL` / `LV.JEV_MODEL` was
+# exercised by NOTHING — and one copy of the constants lives in the deployed
+# `~/.pi/agent/state/lane-verdict.py`, which no repo test could see. A partial rotation (host
+# migrated in the tracked files, missed in the deployed one) would keep billing the lookalike host
+# with the suite fully green.
+#
+# COPY INVENTORY — the set a rotation must sweep. If you change it, change every site:
+#   `scripts/turn-classify.py`, `scripts/ask-owner.py`,
+#   `~/.pi/agent/state/lane-verdict.py` (deployed, untracked — read by lane-actions as `LV.*`),
+#   `~/.pi/agent/scripts/{turn-classify,ask-owner}.py` (deployed copies of the two above).
+#   `lane-actions.py` holds NO copy of its own: it reads `LV.JEV_URL` / `LV.JEV_MODEL`.
+
+
+def _deployed_lane_verdict():
+    """The deployed LV module, or None when this box has none (CI, a fresh clone)."""
+    path = getattr(LA, "LV_PATH", None)
+    if not path or not os.path.exists(path):
+        return None
+    return load("lane_verdict_deployed", path)
+
+
+def test_the_deployed_lane_verdict_constant_points_at_the_real_vendor():
+    """SKIP on a machine without the deployed file — but where it IS deployed, it is the copy
+    `lane-actions.py` really calls, so it must be pinned like the others.
+
+    ⛔ SKIP, NOT RETURN. A bare `return` reports this leg as PASSED with its subject absent — a
+    false green of exactly the kind this repo refuses elsewhere ("a missing check is not a green
+    check"). No deployed file on the box is NOT a pass; it is no measurement."""
+    lv = _deployed_lane_verdict()
+    if lv is None:
+        pytest.skip("no deployed ~/.pi/agent/state/lane-verdict.py on this box — nothing measured")
+    assert lv.JEV_URL == "https://api.typesafe.ai/v1/systemone", lv.JEV_URL
+    assert lv.JEV_MODEL == "jev-latest", (
+        "the deployed words layer must carry the SAME model as the tracked copies (the vendor "
+        "alias, by owner ruling 2026-10-27) — a copy left on the old pin is the partial-rotation "
+        "class this leg exists for: %r" % (lv.JEV_MODEL,))
+
+
+def test_jev_step5_posts_the_current_model_to_the_vendor_endpoint(monkeypatch):
+    """The request `lane-actions.py` actually builds: `LV.JEV_URL` + `LV.JEV_MODEL` from the
+    loaded module, a name-keyed `questions` map (one per lane, each with `instructions`), and a
+    `choice` answer read back per lane.
+
+    ⛔ `instructions` is asserted because it carries the judgement text, NOT because the endpoint
+    refuses without it: measured 2026-10-26, a question with criteria (or with instructions only)
+    returns 200, while an ARRAY of questions is 422 and a question with NEITHER field is 400.
+    Stating a refusal that does not happen is how a generated negative test ends up encoding a
+    rule the API never enforced."""
+    import types
+
+    LV = types.SimpleNamespace(
+        JEV_URL="https://api.typesafe.ai/v1/systemone",
+        JEV_MODEL="jev-latest",
+        jev_key=lambda: "test-key",
+        CRITERIA={"WORKING": "it is producing output right now"},
+    )
+    seen = {}
+
+    class _Resp:
+        def __init__(self, payload):
+            self._b = json.dumps(payload).encode()
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["body"] = json.loads(req.data.decode())
+        seen["auth"] = req.get_header("Authorization")
+        # ⛔ THE FIXTURE'S VALUES ARE DELIBERATELY DIFFERENT. The stub SENDS `jev-latest` and
+        # ANSWERS `jev-1.14.0`, precisely so that a `meta["model"]` regressed to
+        # `LV.JEV_MODEL` is caught by the assertion below (measured: that mutation reds it).
+        # Had the fixture ANSWERED the alias, both values would be identical and the assertion
+        # would be a tautology — it is the fixture, not the vest, that would be wrong.
+        return _Resp({"model": "jev-1.14.0",
+                      "answers": {"lane_00": {"type": "choice", "choice": "DONE_READY",
+                                              "confidence": 0.9}},
+                      "usage": {"input_tokens": 10, "output_tokens": 2}})
+
+    monkeypatch.setattr(LA.urllib.request, "urlopen", fake_urlopen)
+    rows = [{"lane": "demo", "last_message": "done, PR open", "said_age": 300,
+             "stale": 300, "spinner": None, "tool_desc": None}]
+    answers, meta = LA.jev_step5(rows, LV)
+
+    assert seen["url"] == "https://api.typesafe.ai/v1/systemone", seen["url"]
+    assert seen["body"]["model"] == "jev-latest", seen["body"]
+    assert seen["auth"] == "Bearer test-key", seen["auth"]
+    q = seen["body"]["questions"]["lane_00"]
+    assert q["type"] == "choice" and isinstance(q["instructions"], str) and q["instructions"], q
+    assert answers == {"demo": ("DONE_READY", 0.9)}, answers
+    assert meta["source"] == "JEV" and meta["error"] is None, meta
+    # ⛔ THE ECHO, FOR THIS LAYER TOO. The alias makes the reported version the only evidence of
+    # what answered: delete `meta["model"] = d.get("model")` in `lane-actions.py` and the daily
+    # report header silently reads `Jev ?`, with nothing red. It is asserted here — against the
+    # version the fixture ANSWERED with, not the alias — so that removal is a failure.
+    assert meta["model"] == "jev-1.14.0" and meta["model"] != "jev-latest", (
+        "the report must carry the version the API ANSWERED with, not the alias sent: %r" % (meta,))
+
+
+def test_the_report_header_prints_the_echoed_version_not_the_alias():
+    """⛔ THE HEADER A HUMAN READS, ASSERTED (review 2026-10-27).
+
+    `render_md` builds `READ (Jev <model>: n of m lanes answered)` from `meta["model"]`, and
+    NOTHING asserted that string: the leg above pins `meta["model"]` -- the header's INPUT, not
+    the header -- and the only other mention of `render_md` in this file monkeypatches it away
+    (`:2152`). Measured: hardcoding the header to `jev-latest` left this file's failure set
+    byte-identically green. With a vendor ALIAS, the header is the ONLY place a reader learns
+    which version judged the lanes, so it is asserted here against a version the fixture
+    ANSWERED with, never the alias we send.
+    """
+    res = {
+        "meta": {"source": "JEV", "error": None, "model": "jev-1.14.0",
+                 "answered": 1, "asked": 1},
+        "n_lanes": 1, "procmap": "ok", "sampled": "",
+        "quiet": [], "idle": [], "wip": [], "wedged": [], "report": [],
+    }
+    md = LA.render_md(res, snapshot_age=5, source="test")
+    assert "Jev jev-1.14.0" in md, md
+    assert "Jev jev-latest" not in md, md
+
+
+def _deployed_constants(filename):
+    """`{name: literal}` for the module-level endpoint/model assignments in a DEPLOYED copy.
+
+    Parsed with `ast`, not imported: the deployed files are the fleet's live artifacts, and
+    parsing compares the VALUES the beat will use without side effects. It also tolerates
+    comment drift, which a byte-identity check would red on for no behavioural reason."""
+    import ast
+    import os as _os
+
+    path = _os.path.join(_os.path.expanduser("~/.pi/agent/scripts"), filename)
+    if not _os.path.exists(path):
+        return None
+    found = {}
+    for node in ast.parse(open(path).read(), filename=path).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            tgt = node.targets[0]
+            if isinstance(tgt, ast.Name) and tgt.id in ("JEV_URL", "JEV_MODEL"):
+                try:
+                    found[tgt.id] = ast.literal_eval(node.value)
+                except ValueError:                    # not a literal constant
+                    found[tgt.id] = object()
+    return found
+
+
+@pytest.mark.parametrize("filename", ["turn-classify.py", "ask-owner.py"])
+def test_the_deployed_scripts_carry_the_real_vendor_and_the_model(filename):
+    """⛔ THE FILES THE BEAT ACTUALLY EXECUTES. The sweep list names
+    `~/.pi/agent/scripts/{turn-classify,ask-owner}.py`, and nothing pinned them: a rotation that
+    updated the repo and missed the deployed copy would keep the fleet on the lookalike host with
+    the suite fully green — the same partial-rotation class as the lane-verdict leg above, on the
+    more dangerous subject (those two files ARE the scheduled jobs; lane-verdict.py is loaded by
+    one of them).
+
+    SKIPS when the copy is absent (CI, a fresh clone): absent is not measured, never a pass."""
+    consts = _deployed_constants(filename)
+    if consts is None:
+        pytest.skip("no ~/.pi/agent/scripts/%s on this box — nothing measured" % filename)
+    assert consts.get("JEV_URL") == "https://api.typesafe.ai/v1/systemone", (filename, consts)
+    assert consts.get("JEV_MODEL") == "jev-latest", (filename, consts)
