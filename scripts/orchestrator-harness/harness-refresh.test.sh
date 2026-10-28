@@ -1641,11 +1641,24 @@ case "$R7" in *"running=$(short "$C2")"*) bad "an unreadable age was read as own
 # Cycle-5 review measured this through the shipped script: `perl -e 'sleep 120' bash <path>` resolved
 # `relation=current` under a predecessor-token rule, although every precedent (`_controller_ps_awk`
 # `tok[2]`, `lock_controller_pid` `${2##*/}`, `check-deployed-drift.sh` `t[2]`) reads POSITIONALLY. Here
-# the wrapper is `bash -c 'sleep 120' bash <path>`: the same two words in the same order, one wrapper
+# the wrapper is `bash -c 'sleep 120 & wait' bash <path>`: the same words in the same order, one wrapper
 # deep, with the path as ARGUMENT rather than as the script being executed.
+#
+# ⛔ THE PLANT MUST NOT BE EXEC'D, OR THIS CASE WITNESSES NOTHING (review cycle 11, P1). The first
+# version drove `bash -c 'sleep 120' bash <path>` — a SINGLE-COMMAND `-c`, which bash optimises into an
+# `execve`: measured, `ps -ww -o command= -p <pid>` answers `sleep 120`, with NO shell token and no
+# harness path anywhere in argv. Nothing can resolve a tree from that — not the shipped rule, not a
+# predecessor-token rule, not a whole-argv scan — so the `bad` arm below was UNREACHABLE and the case
+# passed on the PRE-FIX code as well (measured: reverting the read to a predecessor-token rule left the
+# suite at 236 passed / 0 failed, A36h ✅ in both). The `& wait` keeps bash in the parent role, so argv
+# stays `bash -c sleep 120 & wait bash <path>` and the path is genuinely an argument. Asserted BEFORE the
+# outcome is read (the A25/A36j lesson: an unnamed or mis-shaped plant makes everything below vacuous).
 _CASE=$((_CASE+1)); echo "=== A36h: a wrapper that only PASSES the path as an argument is not the controller ==="
-bash -c 'sleep 120' bash "$_O26" & _P30=$!
+bash -c 'sleep 120 & wait' bash "$_O26" & _P30=$!
 sleep 1
+case "$(ps -ww -o command= -p "$_P30" 2>/dev/null)" in
+  *bash*"orch-loop.sh"*) ok "the plant's argv really carries the path as an ARGUMENT, with the shell still in flight" ;;
+  *) bad "the plant is not the shape this case exists to test (exec'd single-command -c drops the path): $(ps -ww -o command= -p "$_P30" 2>/dev/null)" ;; esac
 printf '%s\n' "$_P30" > "$T/a25/o/.orch.lock"
 R8="$(O="$T/a25/o" HARNESS_PIN_DIR="$T/a24/pins" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$T/a25/o" 2>&1)"
