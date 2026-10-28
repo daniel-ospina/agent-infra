@@ -1,0 +1,14 @@
+# FAILURE-CLASS FIXTURE (positive, pair with pr-nameless-b.yml): NO `name:` at all (it is optional).
+# `github.workflow` then resolves to the workflow FILE PATH at runtime, so two nameless files have
+# DIFFERENT groups. Resolving it to the empty string would false-red them as one shared group
+# (round-3 P1).
+on:
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
