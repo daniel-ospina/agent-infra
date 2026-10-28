@@ -817,12 +817,21 @@ derive() {
     merged="$(printf '%s' "$out" | cut -d' ' -f2)"
     [ -n "$merged" ] || merged="-"
     if [ -z "$prst" ]; then
-      # ⛔ NAME THE HOST THAT WAS COMPARED (review round 7). `unknown` is the right answer and it is
-      # useless without the value that produced it: the run records the host at `start`, and a lane
-      # reading only "the read abstained" cannot tell "my origin names a mirror" from "the API is
-      # down" — so it re-polls a run that can never resolve. The host is printed as recorded (and the
-      # default is spelled out when the run recorded none), with the knob that overrides it.
-      abstain_why="the read of PR $pr in $slug abstained, or its url did not name $slug/pull/$pr on host $(file_or_empty "$rd/host" | sed 's/^$/github.com/') — so the API did not confirm which PR this is. If this checkout's origin cannot attest its host, set RAIL_RUN_GH_HOST=<web host> for the run"
+      # ⛔ NAME THE HOST THAT WAS COMPARED, AND THE ONE ACTION THAT CAN CHANGE IT (review round 7).
+      # `unknown` is the right answer and it is useless without the value that produced it: the run
+      # records the host at `start`, and a lane reading only "the read abstained" cannot tell "my
+      # origin names a mirror" from "the API is down" — so it re-polls a run that can never resolve.
+      # ⛔ THE DEFAULT IS SPELLED OUT WHEN THE RUN RECORDED NONE — and it MUST be shell parameter
+      # expansion, not `sed 's/^$/…/'`. `file_or_empty` `tr -d`s every newline, so a missing or empty
+      # host file yields ZERO bytes, and sed emits nothing for empty input (a substitution needs a
+      # LINE to sit on): the default never fired and the row rendered an EMPTY host — the very value
+      # `pr_url_names` compared with its own `${4:-github.com}` (measured, #2959 review).
+      # ⛔ AND IT NAMES A REMEDY THAT CAN ACTUALLY WORK. `RAIL_RUN_GH_HOST` is read by `resolve_host`,
+      # whose ONLY caller is `start`; `derive` reads the RECORDED file, so setting the knob and
+      # re-polling the SAME run reproduces this identical row — the re-poll loop this line exists to
+      # stop. The host is fixed at start, so the fix is a NEW run (measured, #2959 review).
+      local host; host="$(file_or_empty "$rd/host")"
+      abstain_why="the read of PR $pr in $slug abstained, or its url did not name $slug/pull/$pr on host ${host:-github.com} — so the API did not confirm which PR this is. The host is RECORDED at start, so re-polling cannot change it: if this checkout's origin cannot attest its host, set RAIL_RUN_GH_HOST=<web host> and start a new run"
     fi
     return 0
   }

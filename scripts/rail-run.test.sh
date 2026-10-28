@@ -724,6 +724,20 @@ assert_rc 25 "$RC" "HOST-ABSTAIN: a github.com URL is not this run's landing"
 assert_contains "$TXT" "on host ghe.example.com" "HOST-ABSTAIN: the abstention names the RECORDED host"
 assert_contains "$TXT" "RAIL_RUN_GH_HOST" "HOST-ABSTAIN: and names the knob that pins it"
 
+# ── AG1c: a run that recorded NO host spells out the default it actually compared ─────────────
+# The tempting implementation is `sed 's/^$/github.com/'` over `file_or_empty "$rd/host"` — and it is
+# WRONG: `file_or_empty` `tr -d`s every newline, so a missing/empty host file yields ZERO BYTES and sed
+# emits NOTHING for empty input (a substitution needs a line to sit on). The row then reads `on host  —`
+# with an empty host, in exactly the branch whose comment promises the default. `github.com` here is not
+# decoration: it is the value `pr_url_names` compared with (`${4:-github.com}`), so a row that omits it
+# tells the reader nothing about what failed. This arm reddens if the default is ever moved back into
+# sed, which is how the empty-host rendering was found (#2959 review, P1).
+craft 185 nohost rc=0 >/dev/null   # no `host=` kv: this run recorded none
+OUT="$(GH_MODE=fail poll 185)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HOST-DEFAULT: an unreadable artifact abstains"
+assert_contains "$TXT" "on host github.com" "HOST-DEFAULT: the abstention spells out the DEFAULT host it compared"
+assert_contains "$TXT" "start a new run" "HOST-DEFAULT: and the remedy names the action that can change a RECORDED host (a re-poll cannot)"
+
 # ── AG2: the host is RESOLVED from `origin`, not assumed to be github.com ────────────────────
 # Every arm above PINS the host (`RAIL_RUN_GH_HOST` or a hand-built run dir), so `resolve_host` had
 # no coverage at all — and it validated the host BEFORE stripping the `user@` prefix, so an ssh
