@@ -75,6 +75,13 @@ CMUX_LOG="$T/cmux.log"
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${GH_LOG:?}"
+# ⛔ A WRAPPER'S DIAGNOSTIC ON STDERR, WHILE THE CALL SUCCEEDS — the measured shape (this box runs a
+# `gh` wrapper that prints `gh-gate: the gate mutex is unavailable … running this call UNGATED
+# (announced)`). A gate that captures `2>&1` reads that sentence as a COUNT (or as a census row), so
+# the pass reports `mode=unknown` or raises a false BLIND alarm on a perfectly readable inventory.
+if [ -n "${GH_NOISE:-}" ]; then
+  printf 'gh-gate: the gate mutex is unavailable (lock_acquire spent 2000ms) — running this call UNGATED (announced)\n' >&2
+fi
 # The age fixture is rendered HERE, at call time: the gate turns it into a real age, so a timestamp
 # minted when the suite starts would drift across (or into) the threshold while the suite runs.
 queue_oldest_at() {
@@ -105,6 +112,56 @@ if [[ "$*" == *"--input -"* ]]; then
   printf 'PUT %s BODY %s\n' "${put_id:-?}" "$put_body" >> "$GH_LOG"
 fi
 case "$*" in
+  # ── `/actions/runs/{id}/jobs` serves TWO callers, told apart by the jq they ask for ────────
+  #   demand (queue_demand)           → the `labels` of the queued jobs
+  #   mode inference (mode_from_jobs) → `runner_group_name` of the executing jobs
+  *"/jobs"*)
+    case "$*" in
+      *runner_group_name*)
+        case "${GH_JOBS_MODE:-hosted}" in
+          fail)   printf 'HTTP 500: upstream error\n' >&2; exit 1 ;;
+          *)      printf '%s\n' "${GH_RUNNER_GROUP-GitHub Actions}" ;;
+        esac
+        exit 0 ;;
+    esac
+    case "${GH_DEMAND_MODE:-ok}" in
+      fail) printf 'HTTP 500: upstream error\n' >&2; exit 1 ;;
+      none) exit 0 ;;
+      *)    printf '%s\n' "${GH_DEMAND-ubuntu-latest}" ;;
+    esac
+    exit 0 ;;
+  # The in-progress run ids the mode substitute inspects (a DIFFERENT read from the count above, and
+  # deliberately not shaped as one: `per_page=20` with no status filter).
+  *"per_page=20"*)
+    case "${GH_JOBS_MODE:-hosted}" in
+      fail|none) : ;;
+      *)         printf '%s\n' "${GH_INFER_RUN_IDS:-5001}" ;;
+    esac
+    exit 0 ;;
+  # ── THE CAPACITY CENSUS (agent-infra#2904 · #2897 · #2931) ──────────────────
+  # The SAME endpoint as `current_mode`, a DIFFERENT jq — it asks for per-runner `status`/`busy`
+  # rather than a count, so it is routed separately. `GH_CENSUS` is a comma list of runner tokens:
+  #   idle / busy / off = a runner of the live pool (ARM64, carries ubuntu-latest)
+  #   any other TOKEN   = emitted verbatim, which is how a malformed row is built
+  # `GH_CENSUS_LABELS` replaces the label set, which is how "the pool does not carry the demand" is
+  # built — the state that is CORRECT in mode=github and conclusive only in mode=local.
+  *".status"*)
+    case "${GH_CENSUS_MODE:-ok}" in
+      forbidden)      printf '{"message":"Resource not accessible by personal access token","documentation_url":"https://docs.github.com/rest/actions/self-hosted-runners#list-self-hosted-runners-for-a-repository","status":"403"}\ngh: Resource not accessible by personal access token (HTTP 403)\n' >&2; exit 1 ;;
+      forbidden-bare) printf 'gh: Resource not accessible by personal access token (HTTP 403)\n' >&2; exit 1 ;;
+      garbage)        printf 'null\n' ;;
+      empty)          : ;;
+      *)              _census="${GH_CENSUS:-busy}"; _census="${_census//,/ }"
+                      for _c in $_census; do
+                        case "$_c" in
+                          idle) printf 'online\tfalse\t%s\n' "${GH_CENSUS_LABELS-self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest}" ;;
+                          busy) printf 'online\ttrue\t%s\n'  "${GH_CENSUS_LABELS-self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest}" ;;
+                          off)  printf 'offline\tfalse\t%s\n' "${GH_CENSUS_LABELS-self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest}" ;;
+                          *)    printf '%s\n' "$_c" ;;
+                        esac
+                      done ;;
+    esac
+    exit 0 ;;
   *"-X PUT"*)
     # GH_PUT_FAIL_ID lets a case fail ONE runner's PUT, which is how a PARTIAL relabel is built.
     case "$*" in *"/runners/${GH_PUT_FAIL_ID:-none}/labels"*) exit 1 ;; esac
@@ -120,17 +177,18 @@ case "$*" in
     esac
     exit 0 ;;
   *"status=queued"*)
-    # The stub speaks the REAL jq shape: `<count> TAB <oldest created_at>` (`@tsv`), with an empty
-    # second field when nothing is queued.
+    # The stub speaks the REAL jq shape: `<count> TAB <oldest created_at> TAB <oldest run id>`
+    # (`@tsv`), with empty trailing fields when nothing is queued. The head run id is the third field
+    # because the DEMAND read (`/actions/runs/{id}/jobs`, `actions:read`) hangs off it — agent-infra#2931.
     case "${GH_MODE:-ok}" in
       queued-null)  printf 'null\t\n' ;;
       queued-empty) printf '\n' ;;
-      oldest-junk)  printf '%s\tWed Oct 27 13:00:00 2026\n' "${GH_QUEUED:-5}" ;;
+      oldest-junk)  printf '%s\tWed Oct 27 13:00:00 2026\t%s\n' "${GH_QUEUED:-5}" "${GH_HEAD_RUN_ID-4001}" ;;
       *)
         if [ "${GH_QUEUED:-5}" = 0 ]; then
           printf '0\t\n'
         else
-          printf '%s\t%s\n' "${GH_QUEUED:-5}" "$(queue_oldest_at)"
+          printf '%s\t%s\t%s\n' "${GH_QUEUED:-5}" "$(queue_oldest_at)" "${GH_HEAD_RUN_ID-4001}"
         fi ;;
     esac
     exit 0 ;;
@@ -776,6 +834,273 @@ then
     "(d) and it fails EXACTLY as the defect did: the x86 runner is stamped ARM64 and loses its own marker"
 else
   bad "(d) the mutant gate could not be generated (the mutation anchor moved) — (a) is unproven"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# THE CAPACITY INSTRUMENT — agent-infra#2904 · #2897 · #2931
+#
+# One defect, three faces: the instrument could not MEASURE, so the fleet read healthy while running
+# at 2 of 8, and the shortage was rediscovered by hand every few hours.
+#
+#   #2904 — the gate certified hosted as healthy from component status + queue length, none of which
+#           can observe ABSORPTION or CAPACITY. (The throughput leg that landed for it still cannot
+#           see the pool: `in_progress` is a REPO count, not a per-runner one.)
+#   #2897 — the gate probed an admin-only endpoint with a token that cannot have that scope, so it
+#           never measured, never alarmed, and `launchctl` showed exit 2 for hours.
+#   #2931 — with the inventory unreadable, the fallback could neither read nor write labels, so a
+#           deep queue had no route onto the idle pool.
+#
+# What is pinned below, in the order the fleet needs it:
+#   (1) the THREE STATES come from the API per runner — online-idle, online-busy, and
+#       registered-but-never-online. A count of registrations cannot tell them apart, and conflating
+#       them is how "9 online" was read while 7 were idle.
+#   (2) IDLE WHILE WORK WAITS is never certified. The verdict says what it measured.
+#   (3) AN UNREADABLE CAPACITY READ IS `UNKNOWN`, ALARMS, AND IS NOT A GUESS. The token is never
+#       widened; the MODE question falls back to a readable substitute (jobs), the CAPACITY question
+#       does not, and it says so.
+#   (4) the pool being STRIPPED IN mode=github is CORRECT (#2327) and must never trip the deny — the
+#       arm that keeps this fix from re-engaging the fallback on every healthy tick.
+#
+# The fixtures are the live measurements of 2026-10-28 12:42-12:57Z, not inventions:
+#   daniel-ospina/agent-infra : 8 registrations, 2 online (both busy), 6 never online, 52-56 queued
+#   daniel-ospina/tortoise    : 9 online, all busy, 73-78 queued; head job asked `ubuntu-latest`
+#   daniel-ospina/agent-infra : census read → 200 HERE, 403 on the cell boxes (same script, other token)
+echo "── #2904/#2897/#2931: the census reports the THREE STATES per runner (a count cannot) ──"
+run_gate census-2of8 GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=6 \
+  GH_CENSUS="busy,busy,off,off,off,off,off,off" --
+assert_eq "$RC" "0" "(1) a readable census with work queued and every ONLINE runner busy exits 0"
+assert_contains "$OUT" "busy=2" "(1) online-busy is counted from the API's per-runner busy flag"
+assert_contains "$OUT" "never_online=6" "(1) registered-but-never-online is its OWN state, not 'not busy'"
+assert_contains "$OUT" "online_idle=0" "(1) online-idle is reported even when it is zero"
+assert_contains "$OUT" "2 of 8 online" "(1) the human form says how much of the pool is actually up"
+assert_contains "$OUT" "capacity=saturated" "(1) work waiting + every online runner busy is SATURATED (busy is real)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "(1) the mode file keeps its single-word shape"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "never_online=6" \
+  "(1) the verdict file carries the per-runner counts a fleet report can branch on"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capacity=saturated" \
+  "(1) and the current capacity verdict"
+
+# ⛔ THE MEASURED MISREADING. 9 online, 7 of them IDLE, 54 queued. The pre-fix gate had no reading at
+# all that could distinguish this from "9 busy" — so it certified the state that keeps the pool out of
+# the queue while seven runners sat unused.
+echo "── #2904: IDLE CAPACITY WHILE WORK WAITS is measured, named, and NEVER certified ──"
+run_gate census-idle-unused GH_QUEUED=54 GH_FALLBACK_N=0 GH_INPROGRESS=2 \
+  GH_CENSUS="idle,idle,idle,idle,idle,idle,idle,busy,busy" --
+assert_eq "$RC" "0" "(2) idle capacity is a report, not an action — the pass still completes"
+assert_contains "$OUT" "online_idle=7" "(2) the SEVEN IDLE runners are counted, per runner"
+assert_contains "$OUT" "online_busy=2" "(2) …separately from the two that are busy"
+assert_contains "$OUT" "capacity=idle-unused" "(2) the verdict names the state instead of hiding behind a count"
+assert_contains "$OUT" "CAPACITY NOT CERTIFIED" "(2) the reason refuses to certify capacity"
+assert_not_contains "$OUT" "GitHub Actions healthy" "(2) and never prints the word 'healthy' over it"
+
+# The third state, and the ONLY place it is conclusive: in mode=local the pool is SUPPOSED to serve,
+# so "not one online runner can accept the queue's demand" is a fault the gate can act on.
+echo "── #2931: in mode=local, a pool that cannot accept the queue's demand is STRANDED (a deny) ──"
+run_gate census-stranded GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
+  GH_CENSUS="idle,idle" GH_CENSUS_LABELS="self-hosted,Linux,ARM64,self-hosted-arm64" --
+assert_eq "$RC" "0" "(3) a stranded pool still completes the pass (it ACTS, it does not crash)"
+assert_contains "$OUT" "demand=ubuntu-latest" "(3) the queue's OWN demand is read from the jobs endpoint (actions:read)"
+assert_contains "$OUT" "demanding_idle=0" "(3) no idle runner carries the demanded label"
+assert_contains "$OUT" "capacity=stranded" "(3) the verdict is stranded, not 'healthy'"
+assert_contains "$OUT" "capacity leg" "(3) the leg that decided is NAMED, as every other leg here is"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(3) the pool stays engaged"
+
+# ⛔ THE ANTI-FLAPPER (#2327's decision). In mode=github the pool is stripped ON PURPOSE, so "no online
+# runner offers ubuntu-latest" is the CORRECT state. Denying on it would re-engage the fallback on
+# every healthy tick and fight the recorded decision forever. Same census as above, opposite mode.
+echo "── #2327 GUARD: a STRIPPED pool in mode=github is CORRECT, never stranded ──"
+run_gate census-stripped-pool GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=6 \
+  GH_CENSUS="off,off,off,off" --
+assert_eq "$RC" "0" "(4) a stripped, dark pool in mode=github exits 0"
+assert_contains "$OUT" "capacity=all-offline" "(4) the state is still REPORTED (registrations exist, none online)"
+assert_not_contains "$OUT" "capacity leg" "(4) and it does NOT deny — that would fight the fallback-only decision"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "(4) mode stays github"
+
+# ── #2897: THE BLIND PASS ─────────────────────────────────────────────────────────────────────────
+# The measured failure: `403 Resource not accessible by personal access token` from the launchd-run
+# copy, every ~5 min, exiting 2 with ONE log line. The fail-closed exit was right; the SILENCE was the
+# defect. An unreadable capacity read is now `UNKNOWN` — a verdict, with the missing capability named
+# from the response body, an alarm that REPEATS, and no claim anywhere.
+echo "── #2897: an unreadable capacity census is UNKNOWN + an ALARM, never a guess ──"
+run_gate census-403 GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden --
+assert_eq "$RC" "2" "(5) a 403 on the census → exit 2 (could-not-measure), as before"
+assert_contains "$OUT" "capacity=unknown" "(5) the verdict is UNKNOWN — the word the gate could never say"
+assert_contains "$OUT" "capability=runner_inventory:needs-admin" "(5) the MISSING CAPABILITY is named (#2931 indicator 2)"
+assert_contains "$OUT" "Resource not accessible" "(5) the 403 body is carried, not swallowed"
+assert_contains "$OUT" "endpoint=repos/test-org/test-repo/actions/runners" "(5) the ENDPOINT is named"
+assert_contains "$OUT" "BLIND alarm SENT" "(5) the pass ALARMS — silence was the defect"
+assert_contains "$(cat "$STATE_DIR/orchestrator-inbox.log" 2>/dev/null)" "BLIND" "(5) the alarm reached the durable inbox"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "(5) a blind pass advances no mode"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(5) and relabels nothing"
+assert_not_contains "$OUT" "healthy" "(5) a blind pass never says healthy"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "verdict=unknown" \
+  "(5) a scheduler reading the verdict file sees UNKNOWN, not a green word"
+
+# …and the alarm REPEATS but does not spam: suppressed inside the window, re-sent once past it. A
+# one-shot alarm on a condition that lasts hours is the same silence one step later.
+echo "── #2897: the blind alarm repeats WITHOUT spamming (dedupe window + re-arm) ──"
+KEEP_STATE=1
+run_gate census-403 GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden --
+assert_eq "$RC" "2" "(6) the second blind pass still refuses"
+assert_contains "$OUT" "BLIND alarm SUPPRESSED" "(6) inside the window the alarm does not re-send"
+assert_eq "$(grep -c BLIND "$STATE_DIR/orchestrator-inbox.log" 2>/dev/null || echo 0)" "1" \
+  "(6) exactly one inbox record so far"
+run_gate census-403 ReAlarm GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden CI_GATE_BLIND_ALARM_EVERY_S=0 --
+assert_contains "$OUT" "BLIND alarm SENT" "(6) past the window the alarm re-sends (a lasting condition is not silenced)"
+assert_eq "$(grep -c BLIND "$STATE_DIR/orchestrator-inbox.log" 2>/dev/null || echo 0)" "2" \
+  "(6) two records — repeating, bounded"
+
+# An unreadable capacity read must also be distinguished from a READABLE ZERO: a body that is not rows
+# (a schema change, `null`, a proxy) is not "no runners", which would be a measured fact.
+echo "── #2904: a non-row census body is UNREADABLE, not 'zero runners' ──"
+run_gate census-garbage GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=garbage --
+assert_eq "$RC" "2" "(7) a null census body → exit 2"
+assert_contains "$OUT" "census UNREADABLE" "(7) the failure is named as a body/schema problem"
+assert_not_contains "$OUT" "never_online=0" "(7) 'no runners' is never invented from an unreadable body"
+run_gate census-empty GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=empty --
+assert_eq "$RC" "0" "(7) an EMPTY census is a readable zero, not a failed read"
+assert_contains "$OUT" "runners=0" "(7) and it says so"
+
+# ── #2897 option B: the MODE question HAS a readable substitute; the CAPACITY one does not ───────
+echo "── #2897: an inventory-blind box still reports a REAL mode (jobs inference), narrowed ──"
+run_gate status-inferred-local GH_FALLBACK_N=null GH_RUNNER_GROUP="Default" -- --status
+assert_eq "$RC" "2" "(8) --status with no inventory read exits 2 (a narrowed claim is never 0)"
+assert_contains "$OUT" "mode=local" "(8) the mode is still resolved — from runner_group_name (actions:read)"
+assert_contains "$OUT" "source=jobs-inference" "(8) and it SAYS the answer is inferred, not read"
+run_gate status-inferred-github GH_FALLBACK_N=null GH_RUNNER_GROUP="GitHub Actions" -- --status
+assert_contains "$OUT" "mode=github" "(8) the same substitute resolves github when only hosted is serving"
+run_gate status-inferred-none GH_FALLBACK_N=null GH_JOBS_MODE=none -- --status
+assert_contains "$OUT" "mode=unknown source=none" "(8) with nothing executing there is nothing to infer — UNKNOWN, not a guess"
+
+# `--status` is a READ verb: it reports the three states and the capability, and it does not alarm.
+echo "── #2904: --status reports the census (the three states) without acting or alarming ──"
+run_gate status-census GH_FALLBACK_N=1 GH_CENSUS="busy,off,off" -- --status
+assert_eq "$RC" "0" "(9) --status with both reads available exits 0"
+assert_contains "$OUT" "capacity=measured" "(9) --status reports a MEASURED capacity"
+assert_contains "$OUT" "online_busy=1" "(9) …with the per-runner states"
+assert_contains "$OUT" "never_online=2" "(9) …including the registrations that never came online"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "(9) --status advances no mode"
+assert_absent "$STATE_DIR/orchestrator-inbox.log" "(9) --status alarms nobody"
+run_gate status-blind GH_FALLBACK_N=1 GH_CENSUS_MODE=forbidden -- --status
+assert_eq "$RC" "2" "(9) --status with an unreadable census exits 2"
+assert_contains "$OUT" "capacity=unknown" "(9) and says UNKNOWN rather than reporting a count it did not read"
+assert_contains "$OUT" "capability=runner_inventory:needs-admin" "(9) naming the capability"
+
+# ── MUTATIONS — each arm must be load-bearing ────────────────────────────────────────────────────
+# Without these, (1)-(9) could be satisfied by a script that prints the right words. Each mutation
+# restores a specific PRE-FIX behaviour and must redden a specific arm above.
+echo "── MUTATIONS: every arm of the capacity instrument is load-bearing ──"
+mutate_gate() { # <out> <exact anchor (must be unique)> <replacement>
+  python3 - "$GATE" "$1" "$2" "$3" <<'PY'
+import sys
+src, dst, anchor, repl = sys.argv[1:5]
+text = open(src, encoding="utf-8").read()
+if text.count(anchor) != 1:
+    sys.exit("mutation anchor is not unique (or is absent) — the code moved, so this mutation is stale")
+open(dst, "w", encoding="utf-8").write(text.replace(anchor, repl, 1))
+PY
+}
+
+# (m1) THE OLD READING: `busy` collapsed into a count, so an idle runner is indistinguishable.
+MUT1="$T/ci_runner_gate.mutant-count.sh"
+if mutate_gate "$MUT1" \
+  '      if [ "$busy" = true ]; then CENSUS_ON_BUSY=$((CENSUS_ON_BUSY+1)); else CENSUS_ON_IDLE=$((CENSUS_ON_IDLE+1)); fi
+      if offers_all "$labels" "$DEMAND_LABELS"; then' \
+  '      CENSUS_ON_BUSY=$((CENSUS_ON_BUSY+1))   # MUTANT::m1 — a count, not a state
+      if false; then                          # MUTANT::m1 — and no demand match either'; then
+  ok "(m1) the count-not-state mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT1"
+  run_gate mutant-count GH_QUEUED=54 GH_FALLBACK_N=0 GH_INPROGRESS=2 \
+    GH_CENSUS="idle,idle,idle,idle,idle,idle,idle,busy,busy" --
+  GATE_UNDER_TEST=""
+  assert_eq "$RC" "0" "(m1) the mutant still RUNS — so the red below is the property, not a crash"
+  if grep -qF "capacity=idle-unused" <<<"$OUT"; then
+    bad "(m1) MUTATION SURVIVED: with per-runner state collapsed to a count, 7 idle runners still read idle-unused"
+  else
+    ok "(m1) mutation killed: 7 idle runners read as busy — the '9 busy / 7 idle' misreading, restored"
+  fi
+else
+  bad "(m1) the mutant could not be generated (anchor moved) — the three-state split is unproven"
+fi
+
+# (m2) THE OLD FAILURE MODE: an unreadable body read as "no rows", i.e. as a measured zero.
+MUT2="$T/ci_runner_gate.mutant-zerofill.sh"
+if mutate_gate "$MUT2" \
+  '    case "$row" in *$'"'"'\t'"'"'*) ;; *) return 1 ;; esac
+    st="${row%%$'"'"'\t'"'"'*}"' \
+  '    case "$row" in *$'"'"'\t'"'"'*) ;; *) continue ;; esac   # MUTANT::m2 — an unreadable body is read as zero rows
+    st="${row%%$'"'"'\t'"'"'*}"'; then
+  ok "(m2) the zero-fill mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT2"
+  run_gate mutant-zerofill GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=garbage --
+  GATE_UNDER_TEST=""
+  if [ "$RC" = "2" ] && grep -qF "census UNREADABLE" <<<"$OUT"; then
+    bad "(m2) MUTATION SURVIVED: a null census body still refused — the readable-zero distinction is not load-bearing"
+  else
+    ok "(m2) mutation killed: a null body is now read as 'zero runners' (rc=$RC) — a measured fact invented from an unreadable read"
+  fi
+else
+  bad "(m2) the mutant could not be generated (anchor moved) — the readable-zero distinction is unproven"
+fi
+
+# (m3) THE FLAPPER: the mode gate dropped, so a pool stripped BY DESIGN reads as stranded and the
+# fallback is re-engaged on every healthy tick — fighting #2327's recorded decision.
+MUT3="$T/ci_runner_gate.mutant-flap.sh"
+if mutate_gate "$MUT3" \
+  '  if [ "$m" = local ] && [ -n "$DEMAND_LABELS" ]; then
+    if [ "$CENSUS_DEMAND_IDLE" -eq 0 ]' \
+  '  if [ -n "$DEMAND_LABELS" ]; then   # MUTANT::m3 — no mode gate: the pool stripped by design reads as stranded
+    if [ "$CENSUS_DEMAND_IDLE" -eq 0 ]'; then  ok "(m3) the flapper mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT3"
+  run_gate mutant-flap GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=6 \
+    GH_CENSUS="idle,idle" GH_CENSUS_LABELS="self-hosted,Linux,ARM64,self-hosted-arm64" --
+  GATE_UNDER_TEST=""
+  if [ "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" = "github" ]; then
+    bad "(m3) MUTATION SURVIVED: without the mode gate, a correctly-stripped pool in mode=github still stayed github"
+  else
+    ok "(m3) mutation killed: the fallback is re-engaged on a healthy tick — exactly the fight with #2327 the gate must not pick"
+  fi
+else
+  bad "(m3) the mutant could not be generated (anchor moved) — the mode gate is unproven"
+fi
+
+# ── A WRAPPER'S STDERR IS NOT A MEASUREMENT ───────────────────────────────────────────────────────
+# Every read above is a VALUE; the noise below is commentary. Captured together they are
+# indistinguishable, and the measured consequence was a gate that reported `mode=unknown` (and, against
+# the census, a FALSE blind alarm) while the API answered perfectly.
+echo "── #2897: a wrapper diagnostic on stderr never becomes a measured value ──"
+run_gate noise GH_NOISE=1 GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=2 GH_CENSUS="busy,busy,off" --
+assert_eq "$RC" "0" "(10) a diagnostic on stderr does not fail a readable pass"
+assert_contains "$OUT" "TRANSITION unknown -> github" "(10) the MODE is still read (the count survived the noise)"
+assert_contains "$OUT" "never_online=1" "(10) the CENSUS is still read"
+assert_contains "$OUT" "capacity=saturated" "(10) and the capacity verdict is a measurement"
+assert_not_contains "$OUT" "BLIND" "(10) noise never raises a blind alarm — that alarm means 'unreadable', nothing else"
+assert_not_contains "$OUT" "mode=unknown" "(10) and the mode is never degraded to unknown by commentary"
+assert_not_contains "$OUT" "mode INFERRED" "(10) the mode was READ from the inventory, not inferred around it"
+run_gate noise-status GH_NOISE=1 GH_FALLBACK_N=1 GH_CENSUS="idle,busy" -- --status
+assert_eq "$RC" "0" "(10) --status is not degraded by noise either"
+assert_contains "$OUT" "mode=local" "(10) --status still resolves the mode"
+assert_contains "$OUT" "online_idle=1" "(10) --status still reports the per-runner states"
+
+# (m4) THE OLD CAPTURE: `2>&1` merges the diagnostic into the value.
+MUT4="$T/ci_runner_gate.mutant-stderr.sh"
+if mutate_gate "$MUT4" \
+  '--jq "[.runners[] | select([.labels[].name] | index(\"$FALLBACK_LABEL\"))] | length" 2>"$GH_ERR")" || {' \
+  '--jq "[.runners[] | select([.labels[].name] | index(\"$FALLBACK_LABEL\"))] | length" 2>&1)" || {   # MUTANT::m4'; then
+  ok "(m4) the merged-stderr mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT4"
+  run_gate mutant-stderr GH_NOISE=1 GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=2 GH_CENSUS="busy,busy,off" --
+  GATE_UNDER_TEST=""
+  # The mutant still reaches `mode=github` — via the jobs SUBSTITUTE, which is the point of having one.
+  # What must change is that the inventory read is no longer usable: the pass has to INFER instead of
+  # read, and it says so. (Without the substitute it would be `unknown`; either way the read is lost.)
+  if grep -qF "mode INFERRED" <<<"$OUT"; then
+    ok "(m4) mutation killed: one wrapper diagnostic on stderr makes the inventory UNREADABLE — the mode has to be inferred instead of read"
+  else
+    bad "(m4) MUTATION SURVIVED: with stderr merged into the count, the mode was still READ from the inventory"
+  fi
+else
+  bad "(m4) the mutant could not be generated (anchor moved) — the stderr split is unproven"
 fi
 
 echo "── --dry-run and --status stay read-only ──"

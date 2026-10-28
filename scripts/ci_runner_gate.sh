@@ -28,18 +28,52 @@
 #   GitHub-hosted CAPACITY/queue problems — a full Actions control-plane outage also
 #   disables self-hosted job dispatch (GitHub's scheduler is the same one).
 #
+# THE CAPACITY INSTRUMENT (agent-infra#2904 · #2897 · #2931)
+#   This script is also the fleet's only CAPACITY instrument for the self-hosted pool, and it used
+#   to report a COUNT of registrations. A count cannot tell `online-idle` from `online-busy` from
+#   `registered-but-never-online`, so the fleet read 9 busy runners while 7 were idle, and read
+#   "healthy" while running at 2 of 8. The census below reads `status` and `busy` PER RUNNER and
+#   says which of the three states each runner is in, and which of them can accept the queue's own
+#   demand (`jobs[].labels`, readable without admin).
+#
+# ⛔ THE TOKEN IS NEVER WIDENED TO MAKE A GATE WORK (the constraint this fix is built on). The fleet
+#   token is `gist, read:org, repo, workflow`; on the cell boxes the runner inventory answers
+#   `403 Resource not accessible by personal access token`, and the billing endpoint answers 404
+#   without `user` scope. Each unreadable endpoint therefore gets exactly one of two answers:
+#     * the MODE question has a readable substitute — recent jobs' `runner_group_name`, which
+#       `actions:read` DOES expose — so an inventory-blind box still knows who is serving;
+#     * the CAPACITY question has no substitute, so it becomes `capacity=unknown` and the pass is
+#       REFUSED (exit 2) with the missing capability and the 403 body named, plus an alarm.
+#   A gate that cannot see capacity may not certify it. UNKNOWN is a verdict; "green" is a guess,
+#   and guessing green is the whole defect: nothing pages, nothing reddens, and a human rediscovers
+#   the shortage by hand every few hours.
+#
 # USAGE
 #   ci_runner_gate.sh            # evaluate + act + notify
 #   ci_runner_gate.sh --dry-run  # evaluate and report, change nothing
-#   ci_runner_gate.sh --status   # print current mode, exit 0 (2 when the pool read fails)
+#   ci_runner_gate.sh --status   # print mode + capacity census, exit 0 (2 when either is unmeasured)
 #
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act (fail-closed: changes nothing)
+#
+# OUTPUT A SCHEDULER CAN BRANCH ON: `$STATE_DIR/ci-runner-gate.verdict`, one `key=value` line per
+# run — `verdict=`, `capacity=`, the per-runner counts, `capability=`, `reason=` (last). The mode
+# file (`ci-runner-gate.state`) keeps its single-word shape, so existing readers are unaffected.
 set -uo pipefail
 
 REPO="${CI_GATE_REPO:-daniel-ospina/tortoise}"
 STATE_DIR="${CI_GATE_STATE_DIR:-$HOME/.pi/agent/state}"
 STATE_FILE="$STATE_DIR/ci-runner-gate.state"
+VERDICT_FILE="$STATE_DIR/ci-runner-gate.verdict"
 LOG_FILE="$STATE_DIR/ci-runner-gate.log"
+# ⛔ gh ITSELF WRITES DIAGNOSTICS TO STDERR, AND THIS SCRIPT READS gh's OUTPUT AS VALUES (agent-infra#2897,
+# measured on this box). A wrapper on PATH printed
+#   `gh-gate: the gate mutex is unavailable (lock_acquire spent 2000ms) — running this call UNGATED (announced)`
+# on stderr while the call SUCCEEDED. Captured with `2>&1` — the pre-existing shape — that line joins the
+# numeric read, the count fails its shape check, and the mode resolves `unknown`; against the CENSUS it
+# is worse, because a non-row line reads as an unreadable inventory and raises a FALSE blind alarm. A
+# diagnostic is not a measurement: stdout is read as data, stderr goes here and is quoted only when the
+# call FAILED.
+GH_ERR="$STATE_DIR/ci-runner-gate.gh.err"
 QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"   # queued runs = GitHub-hosted backlog
 # The runs endpoint's maximum page size, and therefore the deepest queue one read can measure. The
 # throughput leg's age is only the HEAD's age when the page held the WHOLE queue; a saturated page
@@ -110,6 +144,14 @@ QUEUE_PAGE=100
 # bound suffix, so the #1068 reverse scan SEES this declaration and its registry row is enforced
 # (see `QUEUE_STUCK_AFTER_S` there) rather than escaping both scan directions.
 QUEUE_STUCK_AFTER_S="${CI_GATE_QUEUE_STUCK_AFTER_S:-1800}"   # seconds of queue wait, see above
+# How often the blind alarm may repeat while the capacity census stays unreadable. The gate runs
+# every ~5 min from launchd; alarming every tick is noise nobody reads, alarming once and never
+# again is the failure #2897 measured (`launchctl list` showed last exit status 2, silently, for as
+# long as the state existed). 1800 s = at most one alarm per half hour, and it REPEATS.
+BLIND_ALARM_EVERY_S="${CI_GATE_BLIND_ALARM_EVERY_S:-1800}"
+# How many in-progress runs the mode substitute inspects. Bounded, and the bound is stated: an
+# idle repo has none, which is the hole this substitute cannot fill — it says `unknown` there.
+MODE_INFER_RUNS="${CI_GATE_MODE_INFER_RUNS:-3}"
 # The custom label that makes a job land on the LOCAL pool.
 FALLBACK_LABEL="ubuntu-latest"
 # ⛔ THERE IS NO LONGER A SINGLE "pool label" (agent-infra#2327). The pool holds two
@@ -131,6 +173,33 @@ AUTO_LABELS=" self-hosted Linux $FALLBACK_LABEL "
 UNHEALTHY_LEG=""
 ABSORPTION_OLDEST_S=""
 ABSORPTION_IN_PROGRESS=""
+ABSORPTION_QUEUED=""
+
+# ── capacity census state (agent-infra#2904 · #2897 · #2931) ───────────────────────────────────
+# CENSUS_VERDICT is the CAPACITY question's answer, kept separate from the MODE answer on purpose:
+# "is the pool able to take this work" and "which pool should take it" are different questions with
+# different fallbacks (see the header), and collapsing them is how "9 busy" got read while 7 were
+# idle.
+#   absorbing    nothing is queued, so capacity is not the question this pass
+#   saturated    work is waiting and every ONLINE runner is busy — the busy reading is real
+#   idle-unused  work is waiting and at least one ONLINE runner is IDLE — capacity exists and is
+#                not being used. REPORTED, never certified as healthy.
+#   all-offline  registrations exist, NONE is online (the third state the fleet needs)
+#   stranded     mode=local and NOT ONE online runner can accept the queue's own demand
+#   unknown      the inventory could not be read — no capacity claim is made at all
+CENSUS_VERDICT=""
+CENSUS_BLIND=0         # 1 only when the CAPACITY read failed (the condition the alarm is about)
+CENSUS_KV=""           # the measured counts, machine-readable
+CENSUS_DETAIL=""       # the same counts as "2 of 8 online (idle=0 busy=2 never-online=6)"
+CENSUS_ON_IDLE=0
+CENSUS_ON_BUSY=0
+CENSUS_NEVER_ONLINE=0
+CENSUS_DEMAND_IDLE=0
+CENSUS_DEMAND_BUSY=0
+DEMAND_LABELS=""       # comma-joined label set the queue HEAD is asking for ("" = not measured)
+CAPABILITY=""          # which permission the inventory read needed, when it could not be read
+MODE_SOURCE="runners"  # runners | jobs-inference | none — how `mode` was obtained
+CAP_DENY=0             # set by capacity_verdict: 1 = this pass may not certify capacity
 
 DRY=0; STATUS_ONLY=0
 for a in "$@"; do
@@ -146,6 +215,139 @@ log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG_FI
 
 need() { command -v "$1" >/dev/null 2>&1 || { log "FATAL: '$1' not on PATH"; exit 2; }; }
 need gh; need curl; need python3
+
+# ── runner capacity census ──────────────────────────────────────────────────────
+# ONE paginated read of the runner inventory, reduced to the three fields that carry the answer.
+# `<status> TAB <busy> TAB <labels,comma>` — comma is safe as a separator because a runner label is
+# restricted to `[A-Za-z0-9._-]` and can never contain one.
+#
+# ⛔ THIS READ IS THE ONE THAT NEEDS `Administration: read` (classic: `repo` on an owned repo), and
+# the fleet token does not have it on every box (agent-infra#2897: `403 Resource not accessible by
+# personal access token` from `launchctl`-run copies). The call is made anyway, because on the boxes
+# that CAN read it, it is the only surface that distinguishes the three states — and on the boxes
+# that cannot, the caller turns the failure into `capacity=unknown` rather than into a count of zero.
+RUNNER_LIST_PATH="repos/$REPO/actions/runners"
+runner_census() {
+  gh api --paginate "$RUNNER_LIST_PATH" \
+    --jq '.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))"' 2>"$GH_ERR"
+}
+
+# census_capability <body> — WHICH permission the read needed, named from the response itself.
+# #2931's indicator 2: `cannot read runner labels` alone names our symptom, not the capability, so
+# nobody can tell a scope problem from an outage from a schema change. Never used to demand a wider
+# token — the token is not widened anywhere in this script (see the header).
+census_capability() {
+  case "$1" in
+    *403*|*"not accessible"*)                      printf 'runner_inventory:needs-admin(read) http=403' ;;
+    *404*|*"Not Found"*)                           printf 'runner_inventory:absent http=404' ;;
+    *401*|*"Bad credentials"*)                     printf 'runner_inventory:unauthenticated http=401' ;;
+    *5[0-9][0-9]*|*"upstream error"*|*"HTTP 500"*) printf 'runner_inventory:upstream http=5xx' ;;
+    '')                                            printf 'runner_inventory:empty-response' ;;
+    *)                                             printf 'runner_inventory:unreadable' ;;
+  esac
+}
+
+# offers_all <runner-label-set> <job-label-set> — GitHub's semantics are AND: a job runs on a runner
+# that carries EVERY label the job requires. Empty demand is NOT a match (it would claim a match this
+# function never checked).
+offers_all() {
+  local have=",$1," want="$2" l
+  [ -n "$want" ] || return 1
+  for l in ${want//,/ }; do
+    case "$have" in *",$l,"*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+# census_classify <rows> — the three states, PER RUNNER, and the demand match.
+# rc 0 = measured (zero rows is a readable zero) · rc 1 = unreadable rows (a schema change, a
+# truncated body, gh's own error text) — never counted as zero runners.
+census_classify() {
+  local rows="$1" row st busy labels n=0
+  CENSUS_ON_IDLE=0; CENSUS_ON_BUSY=0; CENSUS_NEVER_ONLINE=0; CENSUS_DEMAND_IDLE=0; CENSUS_DEMAND_BUSY=0
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    case "$row" in *$'\t'*) ;; *) return 1 ;; esac
+    st="${row%%$'\t'*}"; row="${row#*$'\t'}"
+    case "$row" in *$'\t'*) ;; *) return 1 ;; esac
+    busy="${row%%$'\t'*}"; labels="${row#*$'\t'}"
+    case "$st" in online|offline) ;; *) return 1 ;; esac
+    case "$busy" in true|false) ;; *) return 1 ;; esac
+    case "$labels" in *[!A-Za-z0-9._,+-]*) return 1 ;; esac
+    n=$((n+1))
+    if [ "$st" = online ]; then
+      # ⛔ THE THREE STATES COME FROM THE API, PER RUNNER — never from a count of registrations.
+      if [ "$busy" = true ]; then CENSUS_ON_BUSY=$((CENSUS_ON_BUSY+1)); else CENSUS_ON_IDLE=$((CENSUS_ON_IDLE+1)); fi
+      if offers_all "$labels" "$DEMAND_LABELS"; then
+        if [ "$busy" = true ]; then CENSUS_DEMAND_BUSY=$((CENSUS_DEMAND_BUSY+1)); else CENSUS_DEMAND_IDLE=$((CENSUS_DEMAND_IDLE+1)); fi
+      fi
+    else
+      CENSUS_NEVER_ONLINE=$((CENSUS_NEVER_ONLINE+1))
+    fi
+  done <<<"$rows"
+  CENSUS_KV="runners=$n online_idle=$CENSUS_ON_IDLE online_busy=$CENSUS_ON_BUSY never_online=$CENSUS_NEVER_ONLINE demanding_idle=$CENSUS_DEMAND_IDLE demanding_busy=$CENSUS_DEMAND_BUSY demand=${DEMAND_LABELS:-unknown}"
+  CENSUS_DETAIL="$((CENSUS_ON_IDLE+CENSUS_ON_BUSY)) of $n online (idle=$CENSUS_ON_IDLE busy=$CENSUS_ON_BUSY never-online=$CENSUS_NEVER_ONLINE)"
+  return 0
+}
+
+# queue_demand <run id> — WHAT THE QUEUE IS ASKING FOR, from the jobs endpoint.
+# ⛔ THIS IS THE READABLE SUBSTITUTE, and it is readable on the boxes where the inventory is not:
+# `GET /repos/{o}/{r}/actions/runs/{id}/jobs` needs `actions:read` (measured 200 with the fleet
+# token), and each job carries the `labels` it requires. Measured 2026-10-28: the head job of
+# daniel-ospina/tortoise's 74-deep queue asked for exactly `ubuntu-latest`.
+# BOUND, stated: the demand is the label set of the QUEUED jobs of ONE run — normally the head (the
+# run that has waited longest, the one that decides whether the queue can move at all), with the
+# NEWEST queued run as a one-shot fallback when the head is a stale entry with no queued job left.
+# A queue whose other runs ask for something else is not measured here, and the KV says `demand=`
+# per run, not "the whole queue".
+queue_demand() {
+  local rid="$1" out
+  case "$rid" in ''|*[!0-9]*) return 1 ;; esac
+  out="$(gh api "repos/$REPO/actions/runs/$rid/jobs" \
+        --jq '[.jobs[]|select(.status=="queued")|.labels[]]|unique|join(",")' 2>"$GH_ERR")" || return 1
+  # An empty answer is NOT "no demand": a matrix/`runs-on` form this read does not resolve leaves
+  # the demand unmeasured, and an unmeasured demand must not become a claim about matching.
+  [ -n "$out" ] || return 1
+  case "$out" in *[!A-Za-z0-9._,+-]*) return 1 ;; esac
+  printf '%s' "$out"
+}
+
+# capacity_verdict <mode> — the CAPACITY answer from the counts above.
+# rc 0 = no capacity deny · rc 1 = DENY (this pass may not certify healthy capacity).
+# ⛔ THE MODE GATES THE DENY, and that is not incidental — it is what keeps the gate from fighting
+# the recorded #2327 decision. In mode=github the pool is STRIPPED ON PURPOSE, so "no online runner
+# offers ubuntu-latest" is the CORRECT state and denying on it would re-engage the fallback on every
+# healthy tick, forever. Only in mode=local is the pool supposed to serve, and only there is
+# "nothing online can take the demand" a conclusive fault.
+capacity_verdict() {
+  local m="$1" online
+  online=$((CENSUS_ON_IDLE + CENSUS_ON_BUSY))
+  if [ "$queued" -eq 0 ]; then CENSUS_VERDICT=absorbing; return 0; fi
+  if [ "$online" -eq 0 ]; then
+    # Registrations that never came online. This is the third state, and it is the one a count of
+    # registrations hides: measured 2026-10-28 12:54Z, daniel-ospina/agent-infra held 8
+    # registrations with 2 online and 6 offline, and every reading the gate made was compatible
+    # with healthy.
+    if [ "$m" = local ] && [ -n "$DEMAND_LABELS" ]; then CENSUS_VERDICT=stranded; return 1; fi
+    CENSUS_VERDICT=all-offline; return 0
+  fi
+  if [ "$m" = local ] && [ -n "$DEMAND_LABELS" ]; then
+    if [ "$CENSUS_DEMAND_IDLE" -eq 0 ] && [ "$CENSUS_DEMAND_BUSY" -eq 0 ]; then
+      # The pool is supposed to serve and NOT ONE online runner can accept the queue's own demand:
+      # the fallback label is not where the queue needs it, or every listener that carried it died.
+      # This is #2931's mechanism, made measurable without admin.
+      CENSUS_VERDICT=stranded; return 1
+    fi
+    if [ "$CENSUS_DEMAND_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi
+    CENSUS_VERDICT=saturated; return 0
+  fi
+  # mode=github, or a demand this pass could not measure: the pool's LABEL SET is not evidence here
+  # (in mode=github it is stripped by design), so the reading is only ever about the pool's own
+  # state, and it never denies.
+  if [ -n "$DEMAND_LABELS" ] && [ "$CENSUS_DEMAND_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi
+  if [ "$CENSUS_ON_BUSY" -gt 0 ]; then CENSUS_VERDICT=saturated; return 0; fi
+  CENSUS_VERDICT=idle-unused; return 0
+}
 
 # ── health probe ────────────────────────────────────────────────────────────────
 # Unhealthy if: the Actions component is not operational, OR an incident mentions
@@ -213,17 +415,28 @@ print(comp, len(inc))
   # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
   # that case is now refused by name, before the throughput leg, further down.
   queue_row="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE" \
-      --jq '[.total_count, (([.workflow_runs[].created_at]|min)//"")]|@tsv' 2>/dev/null)" \
+      --jq '[.total_count, (([.workflow_runs[]]|min_by(.created_at)|.created_at)//""), (([.workflow_runs[]]|min_by(.created_at)|.id)//""), ((.workflow_runs[0].id)//"")]|@tsv' 2>/dev/null)" \
     || { log "queue probe FAILED (gh api)"; return 2; }
-  queued="${queue_row%%$'\t'*}"; oldest_created="${queue_row#*$'\t'}"
+  # FOUR fields from one read: the count the length leg uses, the head's age for the throughput leg,
+  # and TWO run ids for the DEMAND read (agent-infra#2931 — "which label is the queue asking for" is
+  # answerable with `actions:read`, which the fleet token HAS, even where the runner inventory is
+  # 403): the OLDEST queued run (the head that has waited longest) and the NEWEST one. Both are
+  # needed because a STALE head has nothing to ask — measured 2026-10-28, daniel-ospina/agent-infra's
+  # queue head was 20.9 days old and its run returned ZERO jobs, so a head-only demand read reported
+  # `demand=unknown` over a queue that was asking for `ubuntu-latest` all along. Extra fields are
+  # optional: a two-field body still parses, and an absent id leaves the demand unmeasured instead of
+  # failing a pass that needs nothing else from it.
+  local q1 q2 q3 q4
+  IFS=$'\t' read -r q1 q2 q3 q4 <<<"$queue_row"
+  queued="${q1:-}"; oldest_created="${q2:-}"; head_run_id="${q3:-}"; newest_run_id="${q4:-}"
   # ⛔ THE SECOND READ IS THE ABSORPTION FIELD, and it is the ONLY input the throughput leg adds
   # (#2904). `in_progress` is the count of runs GitHub is currently executing for this repo; in
   # mode=github that is hosted executing, because the pool does not advertise `ubuntu-latest` and no
   # workflow asks for a `self-hosted` label. One extra API call per scheduled pass. gh's stderr is
   # captured so a failed read CARRIES ITS REASON (the #1704 enumeration lesson: a failure reported
   # without what the API said is a failure nobody can act on).
-  in_progress_raw="$(gh api "repos/$REPO/actions/runs?status=in_progress&per_page=1" --jq '.total_count' 2>&1)" \
-    || { log "in-progress probe FAILED (gh api) — FAIL-CLOSED, changing nothing; ${in_progress_raw:0:300}"; return 2; }
+  in_progress_raw="$(gh api "repos/$REPO/actions/runs?status=in_progress&per_page=1" --jq '.total_count' 2>"$GH_ERR")" \
+    || { log "in-progress probe FAILED (gh api) — FAIL-CLOSED, changing nothing; $(head -c 300 "$GH_ERR" 2>/dev/null)"; return 2; }
   in_progress="${in_progress_raw%%$'\n'*}"
   # THE QUEUE-WAIT CLOCK, computed here so the log line can carry seconds rather than a timestamp.
   # Empty when there is no queued run to age (a readable zero, not a failed read); a timestamp that
@@ -253,7 +466,7 @@ print(age)
   if [ "$queued" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
 
   log "probe: actions_component=$comp actions_incidents=$incident queued=$queued threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
-  ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"
+  ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
 
   # ⛔ SHAPE-CHECK THE COUNT TOO (agent-infra#1704). `comp` was shape-checked; `queued` was not, so
   # a successful probe that yielded `null`/empty (a schema change, a proxy body, a truncated read)
@@ -308,6 +521,53 @@ print(age)
     ??????????*)  log "queue stuck-after floor OUT OF RANGE ('${QUEUE_STUCK_AFTER_S}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
+  # ⛔ THE CAPACITY CENSUS IS READ BEFORE ANY LEG DECIDES, AND ITS FAILURE IS A VERDICT (#2897).
+  # The healthy verdict now DEPENDS on a per-runner capacity reading, so a pass that cannot read it
+  # has no capacity claim to make — and the answer to "I cannot see" is UNKNOWN + an alarm, never
+  # the silent `exit 2` with one log line that the fleet read as "nothing to say" for hours.
+  # ⛔ THE PASS IS REFUSED EVEN WHEN THE QUEUE LEGS WOULD DENY: the read and the WRITE are the same
+  # admin-only endpoint, so a blind box cannot relabel anything either — refusing loses no capability
+  # and gains no false claim. Uniform with every other unread operand in this script.
+  local census_rows census_err
+  if census_rows="$(runner_census)"; then
+    if ! census_classify "$census_rows"; then
+      CAPABILITY="$(census_capability "$census_rows")"
+      log "runner census UNREADABLE (schema/body): ${census_rows:0:300} — capacity=unknown capability=${CAPABILITY} — FAIL-CLOSED, changing nothing"
+      CENSUS_VERDICT=unknown; CENSUS_BLIND=1
+      return 2
+    fi
+  else
+    census_err="$(cat "$GH_ERR" 2>/dev/null)"
+    CAPABILITY="$(census_capability "$census_err")"
+    census_rows="$census_err"
+    log "runner census FAILED endpoint=$RUNNER_LIST_PATH capability=${CAPABILITY} — capacity=unknown; probe: queued=$queued in_progress=$in_progress; FAIL-CLOSED, changing nothing; gh said: ${census_rows:0:300}"
+    CENSUS_VERDICT=unknown; CENSUS_BLIND=1
+    return 2
+  fi
+  # ⛔ THE DEMAND READ NEEDS `actions:read`, NOT `Administration: read` — that asymmetry is the whole
+  # reason the queue's side of the question stays measurable on a box whose inventory is 403. It does
+  # NOT fail the pass: an unmeasured demand narrows the capacity claim (`demand=unknown`) instead of
+  # erasing it, because the three STATES are still measured and are still worth reporting.
+  DEMAND_LABELS=""
+  if [ "$queued" -gt 0 ] && [ -n "$head_run_id" ]; then
+    DEMAND_LABELS="$(queue_demand "$head_run_id")" || DEMAND_LABELS=""
+    if [ -z "$DEMAND_LABELS" ] && [ -n "$newest_run_id" ] && [ "$newest_run_id" != "$head_run_id" ]; then
+      DEMAND_LABELS="$(queue_demand "$newest_run_id")" || DEMAND_LABELS=""
+      [ -n "$DEMAND_LABELS" ] && log "demand: the queue HEAD (run $head_run_id) has no QUEUED job — read from the newest queued run ($newest_run_id) instead"
+    fi
+    [ -n "$DEMAND_LABELS" ] || log "demand: UNMEASURED for queued=$queued (neither the head nor the newest queued run reported a queued job's labels) — the capacity claim is narrowed to the runner states only"
+  fi
+  # Re-classify with the demand now known: the first pass classified the label sets before there was
+  # anything to match them against. Cheap (it reads the rows already in memory) and it keeps the
+  # counts and the matches derived from ONE body rather than two reads that could disagree.
+  census_classify "$census_rows" || { log "runner census UNREADABLE on re-classify — FAIL-CLOSED, changing nothing"; CENSUS_VERDICT=unknown; CENSUS_BLIND=1; return 2; }
+  # The counts AND the verdict are computed on EVERY pass, before any leg decides: this line is the
+  # instrument's raw reading, so "why did it say that" is answerable from the durable log alone —
+  # including on the paths where a QUEUE leg denies first and the capacity verdict is only reported.
+  CAP_DENY=0
+  capacity_verdict "${mode:-unknown}" || CAP_DENY=1
+  log "capacity: verdict=${CENSUS_VERDICT} ${CENSUS_KV} (${CENSUS_DETAIL})"
+
   if [ "$comp" != "operational" ] || [ "$incident" != "0" ] || [ "$queued" -ge "$QUEUE_THRESHOLD" ]; then
     UNHEALTHY_LEG="queue/component/incident leg: queued=$queued (threshold $QUEUE_THRESHOLD), component=$comp, incidents=$incident"
     return 1   # unhealthy -> prefer local
@@ -339,6 +599,17 @@ print(age)
   if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then
     UNHEALTHY_LEG="throughput leg: queued=$queued and NO run executing while the oldest queued run has waited ${oldest_queued_s}s > ${QUEUE_STUCK_AFTER_S}s — GitHub-hosted is not absorbing the queue"
     return 1   # not absorbing -> prefer local
+  fi
+
+  # ⛔ THE CAPACITY LEG (agent-infra#2904 · #2931). The legs above read the QUEUE and the PLATFORM;
+  # none of them can see the POOL — which is how a fleet ran at 2 of 8 while every reading said
+  # healthy. This leg answers from per-runner state plus the queue's own demand, and it denies only
+  # where the deny is conclusive AND mode-appropriate (`capacity_verdict` documents the mode gate:
+  # in mode=github the pool is stripped by design, so "nothing offers ubuntu-latest" is CORRECT
+  # there and denying on it would re-engage the fallback on every healthy tick).
+  if [ "$CAP_DENY" = 1 ]; then
+    UNHEALTHY_LEG="capacity leg: mode=${mode:-unknown} and ${CENSUS_DETAIL}, not one online runner can accept the queue's demand (${DEMAND_LABELS}) while queued=$queued — the pool cannot take the work it is supposed to be serving"
+    return 1
   fi
   return 0     # healthy   -> prefer GitHub
 }
@@ -428,8 +699,10 @@ labels_for() { # $1 = rows, $2 = runner id, $3 = on|off
 # success — that is a readable zero, not a failed read.
 set_labels() { # $1 = on|off
   local eng="$1" id row rid name ok=0 fail=0 rows body bad=0
-  if ! rows="$(runner_rows 2>&1)"; then
-    log "WARNING: runner enumeration FAILED — no labels changed; ${rows:0:300}"
+  if ! rows="$(runner_rows 2>"$GH_ERR")"; then
+    rows="$(cat "$GH_ERR" 2>/dev/null)"
+    CAPABILITY="$(census_capability "$rows")"
+    log "WARNING: runner enumeration FAILED endpoint=repos/$REPO/actions/runners capability=${CAPABILITY} — no labels changed; ${rows:0:300}"
     return 1
   fi
   # SHAPE-CHECK EVERY ROW before anything is PUT: `<digits> TAB <label>`. A row without a tab has no
@@ -479,7 +752,14 @@ current_mode() {  # github | local | unknown
   # non-numeric read still returns 1 (unknown), never a guessed mode.
   local n pages
   pages="$(gh api --paginate "repos/$REPO/actions/runners" \
-        --jq "[.runners[] | select([.labels[].name] | index(\"$FALLBACK_LABEL\"))] | length" 2>&1)" || { log "gh api failed: ${pages:0:300}"; return 1; }
+        --jq "[.runners[] | select([.labels[].name] | index(\"$FALLBACK_LABEL\"))] | length" 2>"$GH_ERR")" || {
+    # ⛔ NAME THE MISSING CAPABILITY, NOT JUST OUR SYMPTOM (agent-infra#2931 indicator 2). `gh api
+    # failed: …` left the reader unable to tell a scope problem from an outage, and the token is
+    # NEVER widened to fix it — the caller narrows the claim instead (see the header).
+    local mode_err; mode_err="$(cat "$GH_ERR" 2>/dev/null)"
+    log "gh api failed endpoint=repos/$REPO/actions/runners capability=$(census_capability "$mode_err"): ${mode_err:0:300}"
+    return 1
+  }
   # ⛔ SHAPE-CHECK, AND REQUIRE A DIGIT (review B2-1). `[:space:]` alone admits a read that contains
   # NO number at all (a blank/whitespace body from a proxy or a gh change) — the `awk` reduction then
   # sums nothing to 0 and the mode resolves `github` at exit 0, i.e. a verdict AND a recorded
@@ -491,6 +771,39 @@ current_mode() {  # github | local | unknown
   n="$(printf '%s\n' "$pages" | awk '{s+=$1} END{printf "%d", s+0}')" || { log "runner-count reduction FAILED (awk)"; return 1; }
   case "$n" in ''|*[!0-9]*) log "runner-count reduction unreadable: '${n}'"; return 1 ;; esac
   if [ "$n" -gt 0 ]; then echo local; else echo github; fi
+}
+
+# mode_from_jobs — the READABLE SUBSTITUTE for the MODE question (agent-infra#2897 option B).
+# ⛔ WHAT IT CANNOT DO, stated where it is used: it answers "which pool is serving", NOT "how much
+# capacity is online". `runner_group_name` is populated from `actions:read` (measured 200 with the
+# fleet token) where the runner INVENTORY is 403, so an inventory-blind box can still SAY which mode
+# it is in — but it cannot count idle/busy/never-online runners, so the capacity verdict stays
+# `unknown` and the pass stays refused. Narrow the claim; do not widen the token.
+# GitHub's hosted group is named exactly `GitHub Actions` — WITH A SPACE — so the group list is joined
+# on `|` and split on IFS: a space-separated list splits that name into `GitHub` + `Actions` and reads
+# every hosted group as "not hosted". (Caught by the suite's github arm, which is why that arm exists.)
+# ANY other group name is not hosted. A job with no group yet (`-`, `""`) is ambiguous and is skipped
+# rather than guessed.
+# BOUND: at most MODE_INFER_RUNS in-progress runs are inspected (one jobs read each). An IDLE repo
+# has no in-progress run, which is the hole this substitute cannot fill — it returns 1 (unknown).
+mode_from_jobs() {
+  local ids id groups out="" g IFS_SAVE
+  ids="$(gh api "repos/$REPO/actions/runs?per_page=20" \
+        --jq '[.workflow_runs[]|select(.status=="in_progress")|.id]|.[0:'"$MODE_INFER_RUNS"']|map(tostring)|join(" ")' 2>/dev/null)" || return 1
+  [ -n "${ids// /}" ] || return 1          # nothing executing ⇒ nothing to infer from
+  for id in $ids; do
+    case "$id" in ''|*[!0-9]*) return 1 ;; esac
+    groups="$(gh api "repos/$REPO/actions/runs/$id/jobs" \
+          --jq '[.jobs[]|select(.status=="in_progress")|(.runner_group_name // "-")]|join("|")' 2>/dev/null)" || return 1
+    out="$out|$groups"
+  done
+  IFS_SAVE="$IFS"; IFS='|'
+  for g in $out; do
+    case "$g" in 'GitHub Actions'|'-'|'') ;; *) IFS="$IFS_SAVE"; echo local; return 0 ;; esac
+  done
+  IFS="$IFS_SAVE"
+  case "|$out|" in *"|GitHub Actions|"*) echo github; return 0 ;; esac
+  return 1
 }
 
 # ── notify ──────────────────────────────────────────────────────────────────────
@@ -524,12 +837,84 @@ notify() { # $1 = text
   return 0
 }
 
+# alarm_blind — THE GATE MUST SAY SO ON EVERY CYCLE IT CANNOT MEASURE (agent-infra#2897).
+# ⛔ The defect was not the fail-closed exit; it was that the failure never left the log. `launchctl
+# list` showed the job at last exit status 2 for as long as the state existed, and nobody knew,
+# because a gate that cannot measure looked identical to a gate with nothing to say. So a blind pass
+# ALARMS: through `notify()` (the durable inbox + the orchestrator lane), at most once per
+# BLIND_ALARM_EVERY_S — repeating, because a one-shot alarm on a condition that lasts hours is the
+# same silence one step later. The stamp file means a restarting job cannot spam the lane.
+alarm_blind() { # $1 = the signature (what could not be measured, and why)
+  local sig="$1" now last=0 stamp="$STATE_DIR/ci-runner-gate.blind"
+  now="$(date -u +%s)"
+  if [ -f "$stamp" ]; then
+    last="$(sed -n 1p "$stamp" 2>/dev/null)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  fi
+  if [ "$last" -gt 0 ] && [ "$((now - last))" -lt "$BLIND_ALARM_EVERY_S" ]; then
+    log "BLIND alarm SUPPRESSED (sent $((now - last))s ago, floor ${BLIND_ALARM_EVERY_S}s) — ${sig}"
+    return 0
+  fi
+  printf '%s\n' "$now" > "$stamp"
+  notify ":warning: CI runner gate is BLIND — ${sig}. It is refusing to certify capacity (exit 2, changing nothing). Repo: ${REPO}."
+  log "BLIND alarm SENT (at most one per ${BLIND_ALARM_EVERY_S}s while the condition lasts)"
+}
+
 # ── main ────────────────────────────────────────────────────────────────────────
-mode="$(current_mode)" || { log "cannot read runner labels"; exit 2; }
-if [ "$STATUS_ONLY" = 1 ]; then echo "mode=$mode repo=$REPO"; exit 0; fi
+# ⛔ THE MODE READ HAS A SUBSTITUTE; THE CAPACITY READ DOES NOT (agent-infra#2897). `current_mode()`
+# needs the admin-only inventory. When that 403s, the gate does NOT fall back to `unknown` and stop
+# talking — it reads WHO IS SERVING from the jobs endpoint (`actions:read`, which the token has) and
+# labels the answer as a NARROWED claim (`source=jobs-inference`), so an inventory-blind box still
+# reports a real mode instead of `cannot read runner labels` forever. The capacity question is left
+# UNKNOWN on purpose: no substitute can see per-runner idle/busy, and a guessed capacity is the
+# defect this change exists to remove.
+mode=""
+if mode="$(current_mode)"; then
+  MODE_SOURCE="runners"
+else
+  if mode="$(mode_from_jobs)"; then
+    MODE_SOURCE="jobs-inference"
+    log "runner inventory UNREADABLE — mode INFERRED from recent jobs: mode=$mode source=jobs-inference (narrowed claim: the inventory was not read, so capacity is not claimed from it)"
+  else
+    mode="unknown"; MODE_SOURCE="none"
+    log "runner inventory UNREADABLE and no in-progress job to infer from — mode=unknown source=none"
+  fi
+fi
+
+if [ "$STATUS_ONLY" = 1 ]; then
+  # The census is the three states, PER RUNNER, and `--status` reports them — but a manual read verb
+  # does not ALARM (the scheduled pass does). Exit 2 whenever either answer required a substitute or
+  # could not be read: a narrowed claim is never exit 0.
+  status_rc=0
+  [ "$MODE_SOURCE" = runners ] || status_rc=2
+  if census_rows="$(runner_census)" && census_classify "$census_rows"; then
+    :
+  else
+    census_rows="$(cat "$GH_ERR" 2>/dev/null)"
+    CAPABILITY="$(census_capability "$census_rows")"
+    CENSUS_VERDICT=unknown; CENSUS_KV=""; CENSUS_DETAIL="(unread)"
+    status_rc=2
+    log "runner census FAILED endpoint=$RUNNER_LIST_PATH capability=${CAPABILITY}; gh said: ${census_rows:0:300}"
+  fi
+  echo "mode=$mode repo=$REPO source=$MODE_SOURCE capacity=${CENSUS_VERDICT:-measured} ${CENSUS_KV} capability=${CAPABILITY:-none} detail=\"${CENSUS_DETAIL}\""
+  exit "$status_rc"
+fi
 
 evaluate; healthy=$?          # 0 = github, 1 = unhealthy, 2 = cannot measure
 if [ "$healthy" = 2 ]; then
+  # ⛔ A BLIND PASS ALARMS (#2897): the fail-closed exit is right and it is also INVISIBLE, so the
+  # one thing that must not happen again is a gate that spends a morning at exit 2 while the fleet
+  # reads the absence of a complaint as health.
+  # ⛔ SCOPED TO THE CAPACITY READ, deliberately: every other could-not-measure path in this script
+  # already refuses correctly and must keep writing no inbox record and sending no notification
+  # (the suite pins that, e.g. an unreadable queue count). "BLIND" means *cannot see capacity*, which
+  # is the condition nobody could see; it is not a synonym for "could not measure something".
+  if [ "$CENSUS_BLIND" = 1 ]; then
+    alarm_blind "capacity=unknown capability=${CAPABILITY:-runner_inventory:unreadable} endpoint=$RUNNER_LIST_PATH queued=${queued:-unmeasured} (see ${LOG_FILE})"
+  fi
+  printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown queued=%s capability=%s reason=cannot measure — capacity was not read\n' \
+    "$mode" "$MODE_SOURCE" "${queued:-unmeasured}" "${CAPABILITY:-runner_inventory:unreadable}" \
+    > "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null || true
   log "cannot measure — FAIL-CLOSED, changing nothing (leaving mode=$mode)"
   exit 2
 fi
@@ -545,11 +930,34 @@ if [ "$healthy" = 0 ]; then
   else
     absorption="absorption NOT attributable in mode=$mode (in_progress includes pool runs): oldest_queued_s=$ABSORPTION_OLDEST_S in_progress=$ABSORPTION_IN_PROGRESS"
   fi
-  reason="GitHub Actions healthy (component operational, no Actions incident, queue < $QUEUE_THRESHOLD, $absorption)"
+  # ⛔ THE CAPACITY READING IS QUOTED IN EVERY VERDICT, AND IT CAN VETO THE WORD "healthy" (#2904).
+  # The legs above can pass while the pool is at 2 of 8 with 6 registrations that never came online,
+  # and calling that "healthy" is what sent a human out to rediscover the shortage by hand. Where
+  # capacity is IDLE while work waits — or where no registration is online at all — the verdict still
+  # routes to GitHub (nothing a relabel could fix, and in mode=github the pool is stripped by design)
+  # but it must NOT be certified, and the reason says so instead.
+  case "$CENSUS_VERDICT" in
+    idle-unused|all-offline|unknown)
+      reason="GitHub-hosted legs pass BUT CAPACITY NOT CERTIFIED (capacity=$CENSUS_VERDICT: $CENSUS_DETAIL; $absorption)" ;;
+    *)
+      reason="GitHub Actions healthy (component operational, no Actions incident, queue < $QUEUE_THRESHOLD, $absorption; capacity=$CENSUS_VERDICT: $CENSUS_DETAIL)" ;;
+  esac
 else
   want="local"
-  reason="GitHub-hosted UNHEALTHY — ${UNHEALTHY_LEG:-unknown leg}; routed CI to the local pool"
+  reason="GitHub-hosted UNHEALTHY — ${UNHEALTHY_LEG:-unknown leg}; routed CI to the local pool (capacity=$CENSUS_VERDICT: $CENSUS_DETAIL)"
 fi
+
+# ⛔ THE VERDICT FILE IS WHAT MAKES THE INSTRUMENT READABLE BY SOMETHING OTHER THAN A HUMAN (#2931):
+# one `key=value` line per pass, so a scheduler or a fleet report can branch on `capacity=` and on the
+# per-runner counts instead of parsing prose. `ci-runner-gate.state` keeps its single-word shape (its
+# readers compare it verbatim), and this file is OVERWRITTEN — it is the CURRENT verdict, not a log;
+# the log is the history.
+write_verdict() { # $1 = the verdict word (want); all other fields come from the run's globals
+  printf 'verdict=%s mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=%s\n' \
+    "$1" "$mode" "$MODE_SOURCE" "$CENSUS_VERDICT" "$CENSUS_KV" \
+    "${ABSORPTION_QUEUED:-unmeasured}" "${ABSORPTION_IN_PROGRESS:-unmeasured}" "${ABSORPTION_OLDEST_S:-unmeasured}" \
+    "${CAPABILITY:-none}" "$reason" > "$VERDICT_FILE" 2>/dev/null || true
+}
 
 prev="$(cat "$STATE_FILE" 2>/dev/null || echo unknown)"
 
@@ -561,8 +969,13 @@ log "reason=$reason"
 
 if [ "$DRY" = 1 ]; then
   echo "dry-run: mode=$mode want=$want prev=$prev reason=$reason"
+  echo "dry-run: capacity=${CENSUS_VERDICT} ${CENSUS_KV} mode_source=${MODE_SOURCE}"
   exit 0
 fi
+
+# The current verdict is recorded BEFORE the action, so a relabel that fails still leaves the
+# measurement it acted on visible to whoever reads the state next.
+write_verdict "$want"
 
 # ⛔ RE-CONVERGE UNTIL THE TRANSITION IS RECORDED (review B2-3). `mode != want` is a cheap
 # approximation of "the pool matches the desired labels", and it is not equivalent: a PARTIAL relabel
