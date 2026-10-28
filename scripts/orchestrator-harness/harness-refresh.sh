@@ -182,14 +182,28 @@ log_line() { [ "$QUIET" -eq 1 ] || echo "$@"; }
 # ⛔ AN ABSENT RECORD IS NOT `none`: nothing has ever recorded a request, which is a different fact
 # from "nothing is pending" — the same absence-vs-empty rule the whole file follows.
 if [ "$PRINT_RESTART" = 1 ]; then
-  # ⛔ `O` IS DEFAULTED HERE, AND NOWHERE ELSE IN THIS SCRIPT. It was previously REQUIRED, but nothing in
-  # this file ever sets it (`grep -n '^O='` → none) — only `PIN` gets a default (see case A18: "an
-  # operator shell is not the controller"). So this reader — the surface an operator is told to run
-  # precisely when the checkout is broken, because it needs no git, no network and no repo — printed
-  # `request=unknown reason=no-O-set` on EVERY box from an operator shell: it answered `unknown` in
-  # exactly the situation it exists for. Same expression as the pin default, so the record it reads is
-  # the one the loop wrote.
-  [ -n "${O:-}" ] || O="${CELL_HOME:-${HOME:-}}/.pi/agent"
+  # ⛔ `O` IS DEFAULTED HERE, AND NOWHERE ELSE IN THIS SCRIPT, AND IT IS `$CELL_HOME/orchestrator` —
+  # NOT the pin's `.pi/agent`. It was previously REQUIRED, but nothing in this file ever sets it
+  # (`grep -n '^O='` → none), so this reader — the surface an operator is told to run precisely when the
+  # checkout is broken, because it needs no git, no network and no repo — printed
+  # `request=unknown reason=no-O-set` on EVERY box from an operator shell: it abstained in exactly the
+  # situation it exists for.
+  # ⛔ BUT THE FIX MUST NAME THE DIRECTORY THE LOOP ACTUALLY WROTE. The pin default above is
+  # `${CELL_HOME:-$HOME}/.pi/agent/state/HARNESS-PIN` — the PIN's tree — while the record lives at
+  # `$O/state/restart-request`, and `O` is a DIFFERENT directory: `$HOME/orchestrator` (`orch-loop.sh:37`)
+  # or `$CELL_HOME/orchestrator` (`cloud-cell-supervisor.sh:146`), which is also what the box's other
+  # documented reader uses (`cloud-cell-supervisor.sh status`). Defaulting to the pin's `.pi/agent` here
+  # would not abstain — it would assert `request=none reason=no-cycle-has-recorded-one` about a box that
+  # HAS a request, i.e. a confident false ABSENCE, which is strictly worse than the `unknown` it replaced.
+  # That is the same defect case A18 records for the pin ("a bare $HOME default mended a file nothing
+  # reads"), one directory over. So the default mirrors the fleet's own `O`, and when neither CELL_HOME
+  # nor HOME is available it still abstains rather than guessing a path.
+  if [ -z "${O:-}" ]; then
+    case "${CELL_HOME:-${HOME:-}}" in
+      '') printf 'restart request=unknown reason=no-O-set\n'; exit 0 ;;
+      *)  O="${CELL_HOME:-${HOME}}/orchestrator" ;;
+    esac
+  fi
   if [ -f "$O/state/restart-request" ]; then cat "$O/state/restart-request"
   else printf 'restart request=none reason=no-cycle-has-recorded-one o=%s\n' "$O"; fi
   exit 0
@@ -747,7 +761,15 @@ role_pids() { # live role-lock owners on stdout; rc 1 when the population exists
     own="$(cat "$d/own" 2>/dev/null)" || return 1
     pid="${own%%|*}"
     case "${pid:-}" in ''|*[!0-9]*) continue ;; esac
-    kill -0 "$pid" 2>/dev/null || continue
+    # ⛔ `kill -0` ALONE CANNOT TELL "GONE" FROM "EPERM", AND HERE THAT IS A FAIL-OPEN. A role lock
+    # owned by a process this refresh may not signal answers EPERM, `kill -0` returns non-zero, and the
+    # owner is SKIPPED — so a live reap/merge/hygiene pass is counted as an EMPTY population, `ROLES_DISC`
+    # lands 0, and `inflight_gate` hands an actuator `actuation=safe` over it. That is the direction this
+    # file's own contract forbids ("Unreadable in ANY population is `unknown`, and unknown is BLOCKED"),
+    # and it is the SAME predicate the `CONTROLLER_LIVE` read above already pairs with `ps -p` for the
+    # same reason. `ps -p` reads across users, so existence is confirmed independently: under EPERM the
+    # pid PROVABLY EXISTS, so the owner is counted (BLOCKED), never skipped.
+    kill -0 "$pid" 2>/dev/null || "${PS_BIN:-ps}" -p "$pid" >/dev/null 2>&1 || continue
     out="$out $pid"
   done
   printf '%s\n' "${out# }"

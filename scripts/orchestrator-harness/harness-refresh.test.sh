@@ -2011,6 +2011,60 @@ mkdir -p "$D/O/state/roles/.reap.lock"; printf '%s|t\n' "$$" > "$D/O/state/roles
 R="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
 [ "$(req_of "$D/O" blocked)" = roles ] && ok "…a live role lock alone makes blocked=roles (the safe verdict is not a constant)" \
   || bad "with a live role lock, blocked=$(req_of "$D/O" blocked), expected roles — $R"
+# ⛔ S2b: AN UNREADABLE / UNSIGNALABLE ROLE POPULATION IS NOT AN EMPTY ONE. `role_pids` ends with a
+# `kill -0 … || continue`, and `kill -0` answers EPERM (rc 1) for a process that EXISTS but that this
+# user may not signal — so a live reap/merge/hygiene pass owned by ANOTHER USER was skipped, the
+# population read EMPTY, and `inflight_gate` answered `actuation=safe` over it. Driven with pid 1: it is
+# always live and, on a non-root runner, always EPERM. `ps -p` is the second opinion that closes it.
+# ⛔ THE ARM CANNOT BE DRIVEN AS ROOT (`kill -0 1` succeeds), so this case SAYS SO instead of passing
+# quietly — a silently-vacuous case is the defect this suite records three times (A36g, A36o, A36h).
+_CASE=$((_CASE+1)); echo "=== S2b: a live role owner this user may not signal still BLOCKS the actuation (EPERM is not gone) ==="
+D="$T/s2b"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot" "$D/O/state/roles/.reap.lock"
+TREE1="$(mk_pin_tree "$D/pinroot" "$C1")"; TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
+printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
+printf '%s|t\n' 1 > "$D/O/state/roles/.reap.lock/own"     # a live owner we do not own
+if kill -0 1 2>/dev/null; then
+  echo "  ⚠️  NOT A WITNESS ON THIS HOST: running as $(id -un) can signal pid 1, so the EPERM arm is" \
+       "unreachable here. The count assertion below still runs; the `ps -p` second opinion is not exercised."
+else
+  ok "the plant really is unsignalable by us (kill -0 1 → EPERM), so the arm under test is the one driven"
+fi
+ps -p 1 >/dev/null 2>&1 && ok "…and it provably EXISTS (ps -p 1 answers), which is what makes it an owner" \
+                           || bad "pid 1 is not readable by ps on this host — the plant proves nothing"
+CTRL="$(start_ctrl "$TREE1")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
+R="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
+stop_ctrl "$CTRL"
+[ "$(req_of "$D/O" blocked)" = roles ] && ok "…an unsignalable but LIVE role owner makes blocked=roles, not actuation=safe" \
+  || bad "an unsignalable live role owner was read as absent: actuation=$(req_of "$D/O" actuation) blocked=$(req_of "$D/O" blocked), expected blocked=roles — $R"
+
+# ⛔ S2c: THE `--print-restart` DEFAULT MUST NAME THE DIRECTORY THE LOOP WROTE. `O` is
+# `$CELL_HOME/orchestrator` (`cloud-cell-supervisor.sh:146`) or `$HOME/orchestrator` (`orch-loop.sh:37`)
+# — NOT the pin's `$CELL_HOME/.pi/agent`. A default pointing at the pin's tree does not abstain; it
+# asserts `request=none` about a box that HAS a request, a confident false absence. This is case A18's
+# defect one directory over ("a bare $HOME default mended a file nothing reads"). Driven from an
+# OPERATOR shell: `O` unset, so only the default can find the record.
+_CASE=$((_CASE+1)); echo "=== S2c: --print-restart finds the record without O set (an operator shell is not the controller) ==="
+D="$T/s2c"; mkdir -p "$D/cellhome/orchestrator/state" "$D/home"
+printf 'restart request=pending requested_at=1700000000 requested_by=x running=aaaa11112222 pin=bbbb33334444 pending=deferred actuation=blocked blocked=lanes lanes=2 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+  > "$D/cellhome/orchestrator/state/restart-request"
+PRU="$(env -u O CELL_HOME="$D/cellhome" HOME="$D/home" bash "$RR" --print-restart 2>&1)"
+case "$PRU" in
+  "restart request=pending"*) ok "the default located $CELL_HOME/orchestrator/state/restart-request — the record the loop writes" ;;
+  *no-O-set*) bad "the operator-shell reader abstained instead of reading the record: $PRU" ;;
+  *) bad "the reader asserted an absence about a box that HAS a request: $PRU" ;; esac
+case "$PRU" in *"pending=deferred"*) ok "…and it printed the state verbatim, including pending=deferred" ;;
+  *) bad "the record was not printed verbatim: $PRU" ;; esac
+# The laptop shape: CELL_HOME unset, so the default must be $HOME/orchestrator (orch-loop.sh:37).
+mkdir -p "$D/home/orchestrator/state"
+printf 'restart request=honoured requested_at=1700000000 honoured_at=1700000400 after=400s was=aaaa11112222 now=bbbb33334444\n' \
+  > "$D/home/orchestrator/state/restart-request"
+PRH="$(env -u O -u CELL_HOME HOME="$D/home" bash "$RR" --print-restart 2>&1)"
+case "$PRH" in "restart request=honoured"*) ok "…and with no CELL_HOME it reads \$HOME/orchestrator, the laptop controller's \$O" ;;
+  *) bad "the laptop shape did not find \$HOME/orchestrator: $PRH" ;; esac
+# …and with NOTHING to derive from it still ABSTAINS rather than inventing a path.
+PRA="$(env -u O -u CELL_HOME -u HOME bash "$RR" --print-restart 2>&1)"
+case "$PRA" in *no-O-set*) ok "…and with neither CELL_HOME nor HOME it abstains (unknown), it does not guess" ;;
+  *) bad "an underivable O answered instead of abstaining: $PRA" ;; esac
 stop_ctrl "$CTRL"
 
 _CASE=$((_CASE+1)); echo "=== S3: the transition is OBSERVABLE — requested at T, HONOURED at T+n when the process moves ==="
