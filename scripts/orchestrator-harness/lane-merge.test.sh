@@ -1017,8 +1017,12 @@ ck "the supervision budget is DERIVED from the lane's wall clock and RESERVES im
 # by the lane that owns it — and it must leave a NON-ZERO reserve, or the merge phase is again paid for
 # out of the lane's implementation time.
 _ps="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
-# lane.sh invokes it as `run_agent "${LANE_TIMEOUT:-3300}" …`, so read the default out of THAT call.
-_lt="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
+# lane.sh invokes it as `run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" …` (agent-infra#2888: the wall
+# became a BACKSTOP, so the lane's default is now the harness seam), so read the default out of THAT
+# call and, when it names the seam, resolve the seam from spawn-gate.sh. The check must keep measuring
+# the LANE's own clock — falling back to 0 here would make the arithmetic vacuous.
+_lt="$(grep -o 'LANE_TIMEOUT:-*[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
+[ -n "$_lt" ] || _lt="$(grep -o 'LANE_BACKSTOP_S:-[0-9]*' "$HERE/spawn-gate.sh" | head -1 | tr -dc '0-9')"
 _ws="$(sed -n 's/.*LANE_MERGE_WAIT:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 [ -n "$_ws" ] || _ws="$(grep -o 'LANE_MERGE_WAIT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
 _ir="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"

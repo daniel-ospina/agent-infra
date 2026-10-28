@@ -1394,11 +1394,35 @@ terminal_wip_rescue() {
 # minutes and were killed BY HAND. Nothing bounded a lane's SILENCE — only its total duration — and a
 # total-duration bound is a choice between killing a lane that is mid-merge and holding a lane that is
 # a corpse. `lane-bound.sh` (beside this file) adds the missing axis: NO OUTPUT GROWTH **and** NO CPU
-# DELTA for `LANE_BOUND_IDLE_S` (default 20 min, the same silence bound the `task` tool applies to a
-# sub-agent) ends the lane with a NAMED verdict (`stalled` / `exceeded-wallclock`) carrying the last
-# output size, the CPU delta and the elapsed time. Either signal advancing keeps the lane alive however
-# long it runs, which is what makes a legitimately slow lane (an 11 h test against a 26 m slowest
-# shard) safe.
+# DELTA for the PROGRESS allowance ends the lane with a NAMED verdict (`stalled` /
+# `exceeded-wallclock`) carrying the last output size, the CPU delta and the elapsed time. Either
+# signal advancing keeps the lane alive however long it runs, which is what makes a legitimately slow
+# lane (an 11 h test against a 26 m slowest shard) safe.
+#
+# ⛔ THE PROGRESS ALLOWANCE IS THE FLEET'S OWN, NOT A NUMBER OF THIS FILE'S (agent-infra#2888). It is
+# `lane-bound.sh`'s default (45 min = `DEFAULT_PROGRESS_AGE_MS`, the builtin-tools `no-progress`
+# clause #5195, `docs/ops/load-policy.md` §3) and it is deliberately NOT repeated here: one allowance,
+# one place. A second constant for the same concept is how the shipped tree came to kill a lane 5
+# minutes BEFORE anything could ask whether it was working.
+#
+# ⛔ AND `run_agent`'s FIRST ARGUMENT IS NOW A BACKSTOP, NOT THE PRIMARY BOUND (#2888). It used to be
+# the flat 40-minute total that censored ≥50% of `prfix` lanes at their median (`walltime.tsv`: median
+# = p90 = 2400 s). The bound that decides wedged-vs-slow is the progress allowance; the wall is the
+# absolute ceiling for a lane that creeps forward for ever, so it must sit ABOVE the allowance or it
+# pre-empts it and the progress rule can never fire (shipped: 2400 < 2700 — that WAS the defect).
+#
+#   LANE_BACKSTOP_S — the ONE default, in seconds. 7200 (2 h) PROVISIONAL, per #2888: today's prfix
+#   distribution is censored by the value being replaced, so the ceiling cannot be sized from it.
+#   Landing the seam first is what makes the real distribution observable; #2888 owns the re-measure
+#   and the re-size. Env-overridable, and a typo must never silently disarm it — the `0`-means-off
+#   convention of the `task` family is NOT applied here, because this is the default for every lane on
+#   the box and an unbounded default is indistinguishable from a typo'd one. A caller that genuinely
+#   wants no backstop passes `0` EXPLICITLY as its own argument (lane-bound treats `--wall 0` as the
+#   documented off switch, loudly).
+LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-7200}"
+case "$LANE_BACKSTOP_S" in
+  ''|*[!0-9]*|0) LANE_BACKSTOP_S=7200 ;;
+esac
 #
 # ⛔ RESOLVED, NOT ASSUMED, AND ITS ABSENCE IS LOUD (the `reap_lane_venv_path` pattern below). `$O` is
 # seeded file by file, so a NEW `spawn-gate.sh` can run on a box whose `$O` predates `lane-bound.sh`.
@@ -1698,7 +1722,7 @@ brief_gate_run() { # brief_gate_run <brief-file> <role>
   bash "$lib" --check "$f" "$role"
 }
 run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
-  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed was_m jobctl _lb_sh
+  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed was_m jobctl _lb_sh _lb_wall
   AGENT_STARTED=0
   # The cap signal is per-invocation state, like AGENT_STARTED: a caller that reads it after a
   # refusal or a clean run must see 0, never a previous lane's answer.
@@ -2013,21 +2037,32 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # never reached by the group kill below — a no-op dressed as a reap. Both children are group
   # leaders only if both are started while `set -m` is ON.
   # ── THE LIFETIME BOUND (2026-10-27) ──────────────────────────────────────────────────────────
-  # The watchdog is now `lane-bound.sh watch`: the SAME wall clock (`$t`, unchanged, so `AGENT_CAP_HIT`
-  # and its worktree snapshot keep firing on exactly the same condition), plus the idle axis that did
-  # not exist. It kills the LEADER ONLY, exactly as the subshell it replaces did — this function's own
-  # group reap below is unchanged and still the thing that collects the turn's stragglers.
-  # ⛔ THE VERDICT FILE IS REMOVED FIRST. A leftover from an earlier run of the same log would be read
-  # as THIS run's outcome — the stale-flag class this harness names in its own instructions.
+  # The watchdog is `lane-bound.sh watch`: the PROGRESS allowance (`--idle`, resolved inside that
+  # helper from `LANE_BOUND_IDLE_S` or its 45-min default) is the bound that decides wedged-vs-slow,
+  # plus the ABSOLUTE BACKSTOP that is this argument (`$t`, the caller's `LANE_BACKSTOP_S`).
+  # ⛔ `AGENT_CAP_HIT` AND ITS WORKTREE SNAPSHOT KEEP FIRING ON EXACTLY THE SAME CONDITION (`elapsed
+  # >= t`) — the backstop is where the cap-kill rescue still lives, unchanged.
+  # ⛔ `LANE_BOUND_WALL_S` IS CONSULTED HERE, BECAUSE OTHERWISE IT IS AN INERT KNOB (agent-infra#2888).
+  # lane-bound resolves flag → env → default, so `--wall "$t"` always being passed made its own
+  # documented env seam unreachable on every path that goes through `run_agent` — an operator setting
+  # it would have changed nothing, which is the "knob that does nothing" shape. When it is set it WINS
+  # (an operator escape outranks a caller's default) and the override is named in the log, so the
+  # bound that ran and the bound that was reported cannot silently disagree.
   AGENT_BOUND_VERDICT=""
   rm -f "$log.lanebound" 2>/dev/null || true
+  _lb_wall="$t"
+  case "${LANE_BOUND_WALL_S:-}" in
+    ''|*[!0-9]*) : ;;
+    *) _lb_wall="$LANE_BOUND_WALL_S"
+       echo "[lane-bound] NOTE $label: backstop OVERRIDDEN by LANE_BOUND_WALL_S=$_lb_wall (caller asked for ${t}s) — the PROGRESS allowance is unchanged (agent-infra#2888)" >> "$log" ;;
+  esac
   _lb_sh="$(lane_bound_path)"
   if [ -n "$_lb_sh" ]; then
-    sh "$_lb_sh" watch --pid "$pid" --log "$log" --wall "$t" --tag "$label" \
+    sh "$_lb_sh" watch --pid "$pid" --log "$log" --wall "$_lb_wall" --tag "$label" \
        --verdict-file "$log.lanebound" >/dev/null 2>&1 &
   else
     echo "[lane-bound] WARN $label: lane-bound.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this lane has the WALL CLOCK only (${t}s) and NO silence bound, so a lane that parks produces nothing until the clock expires. Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
-    ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    ( sleep "$_lb_wall"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   fi
   w=$!
   [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }

@@ -1388,8 +1388,10 @@ lane-reap.sh reap [--dry-run]       report what WOULD be reaped (the default)
 lane-reap.sh reap --apply           signal the lanes that pass all three gates
 ```
 
-**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (45 min — above
-`lane.sh`'s 2400 s wall limit, so a long silent tool call is not read as death), OR its log was
+**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (125 min — above the
+lane's wall BACKSTOP (`LANE_BACKSTOP_S` = 7200 s), so a long silent tool call is not read as death;
+when the wall was the PRIMARY bound of a lane this window followed the wall, and `agent-infra#2888`
+demoted the wall to a backstop without demoting the window's reason), OR its log was
 deleted while the tree lives (a prune can do that to a working lane; a possibly-live lane must not
 count `0` against a capacity gate). The `[cap]` line also carries `lanes_src=census|terminals|unknown`,
 so a lower-bound terminal count (a `$O` that predates the tool) is never printed as a census. **total** = every

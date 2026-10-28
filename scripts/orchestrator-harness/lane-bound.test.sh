@@ -91,6 +91,18 @@ cat > "$TMP/bin/busy.sh" <<'EOF'
 end=$(( $(date +%s) + ${1:-5} ))
 while [ "$(date +%s)" -lt "$end" ]; do j=0; while [ "$j" -lt 100000 ]; do j=$((j+1)); done; done
 EOF
+cat > "$TMP/bin/units.sh" <<'EOF'
+#!/bin/sh
+# A lane COMPLETING UNITS OF WORK: one appended result + real CPU, every second. This is the fixture
+# the censoring needs, because it is the one a progress bound must spare and a flat cap must not.
+# $1 = the lane log it writes to, $2 = how many units.
+log="$1"; n="${2:-8}"; i=0
+while [ "$i" -lt "$n" ]; do
+  printf 'completed unit %d\n' "$i" >> "$log"
+  j=0; while [ "$j" -lt 50000 ]; do j=$((j+1)); done
+  sleep 1; i=$((i+1))
+done
+EOF
 cat > "$TMP/bin/parentidle.sh" <<'EOF'
 #!/bin/sh
 # THE REAL `pi` + TOOL SHAPE: the lane itself is silent AND flat, and the CPU belongs to its child.
@@ -200,7 +212,70 @@ res="$(drive "$BOUND" d 600 2 "$TMP/logs/d.log" "$TMP/bin/chatty.sh" "$TMP/logs/
 [ "$(nfield "$TMP/logs/d.log" silent)" -lt 2 ] 2>/dev/null; rc=$?
 ck "(d) …and it was NOT the silence bound that fired (silent=$(nfield "$TMP/logs/d.log" silent)s)" $rc
 
-# ── (e) MUTATIONS — EACH LIMIT MUST BE LOAD-BEARING ─────────────────────────────────────────────
+# ── (i) PROGRESS OVER THE WALL — the agent-infra#2888 regression, both directions ──────────────
+# THE MEASURED DEFECT: `prfix` rows read median = p90 = 2400 s in `walltime.tsv` (the cap IS the
+# median), and five of five lanes in one batch ended at `elapsed == cap` with zero commits and 144 KB
+# of finished, uncommitted work. A lane that is WORKING must not be killed for taking long; a lane with
+# no completed work for the allowance must be. (i1)/(i2) are the SAME fixture under two bounds — that
+# pair is the censoring, red then green, and neither half is allowed to stand alone.
+#
+# A unit of work every 1 s, for 8 s: it is still working at 6 s and at 8 s.
+UNIT_LANE=8
+
+# (i1) GREEN: progress allowance governs, backstop above it → the lane finishes, nothing censors it.
+res="$(drive "$BOUND" i1 2 12 "$TMP/logs/i1.log" "$TMP/bin/units.sh" "$TMP/logs/i1.log" "$UNIT_LANE")"
+[ "$res" = "rc=0 verdict=finished" ]; ck "(i1) a lane that keeps COMPLETING units survives past the old flat cap → $res" $?
+sil_i1="$(nfield "$TMP/logs/i1.log" silent)"
+[ -n "$sil_i1" ] && [ "$sil_i1" -lt 2 ]; rc=$?
+ck "(i1) …and it really was progressing the whole way (silent=${sil_i1:-?}s < 2s, elapsed=$(nfield "$TMP/logs/i1.log" elapsed)s)" $rc
+
+# (i2) RED — the mutation is the SHIPPED pair (backstop below the work): the same fixture is killed.
+# Asserted on the verdict AND on `silent`, because "killed at the wall" is only censoring when the
+# lane was in fact still working; a wall kill of a quiet lane is the correct behaviour.
+res="$(drive "$BOUND" i2 2 6 "$TMP/logs/i2.log" "$TMP/bin/units.sh" "$TMP/logs/i2.log" "$UNIT_LANE")"
+[ "$res" = "rc=143 verdict=exceeded-wallclock" ]; ck "(i2) MUTATION (the flat cap): the SAME working lane IS killed at the backstop → $res" $?
+sil_i2="$(nfield "$TMP/logs/i2.log" silent)"
+[ -n "$sil_i2" ] && [ "$sil_i2" -lt 2 ]; rc=$?
+ck "(i2) …and it was KILLED WHILE WORKING (silent=${sil_i2:-?}s < 2s) — that is the censoring, not a stall" $rc
+
+# (i3) THE WEDGE KILL IS NOT TRADED AWAY. The backstop still ends a lane that never stops working
+# (the "creeps forward for ever" class the progress rule cannot bound), so demoting the wall did not
+# remove it — it moved the PROGRESS rule in front of it.
+res="$(drive "$BOUND" i3 2 5 "$TMP/logs/i3.log" "$TMP/bin/units.sh" "$TMP/logs/i3.log" 60)"
+[ "$res" = "rc=143 verdict=exceeded-wallclock" ]; ck "(i3) the BACKSTOP still kills a lane that keeps working for ever → $res" $?
+
+# (i4) A BACKSTOP BELOW THE ALLOWANCE IS LOUD, because that ordering is the defect itself: it lets the
+# wall pre-empt the progress rule so the rule can never reach its verdict. A WARN, not a refusal — a
+# caller (and every case above) may arm a short wall deliberately to exercise the ceiling.
+out="$(sh "$BOUND" run --log "$TMP/logs/i4.log" --idle 8 --wall 2 --grace 1 --tag i4 -- "$TMP/bin/silent.sh" 4 2>&1 || true)"
+grep -q 'BACKSTOP (wall=2s) is NOT above the PROGRESS allowance (idle=8s)' <<<"$out"; rc=$?
+ck "(i4) a backstop below the progress allowance WARNS that it will pre-empt it" $rc
+
+# (i0) THE DOCTRINE COUPLING — one allowance, one backstop, and the numbers that must agree in the
+# shipped tree. These are the assertions that stop a future edit from re-introducing the defect by
+# raising one number and not the other (which is precisely how 2400 outlived 2700).
+TS_EDGES="$HERE/../../extensions/shared/heartbeat-progress-edges.ts"
+# The registry entry, not a bare literal search: the number must be read from the entry that OWNS it
+# (`DEFAULT_PROGRESS_AGE_MS`) so this check tracks the doctrine rather than a comment beside it.
+DOC_ALLOW_MS="$(awk '/name: "DEFAULT_PROGRESS_AGE_MS"/{f=1; next} f == 1 && /value:/{gsub(/[^0-9]/, ""); print; exit}' "$TS_EDGES" 2>/dev/null)"
+DOC_ALLOW_S="$(( ${DOC_ALLOW_MS:-0} / 1000 ))"
+[ "$DOC_ALLOW_S" = "2700" ]; ck "(i0) FIXTURE: the doctrine's allowance is readable from heartbeat-progress-edges.ts (${DOC_ALLOW_MS:-unreadable} ms)" $?
+IDLE_DEF="$(sed -n 's/.*num_or "${LANE_BOUND_IDLE_S:-}" \([0-9][0-9]*\)).*/\1/p' "$BOUND" | head -1)"
+[ "${IDLE_DEF:-x}" = "$DOC_ALLOW_S" ]; ck "(i0) the PROGRESS allowance default (${IDLE_DEF:-?}s) IS the fleet's declared no-progress allowance (${DOC_ALLOW_S}s) — one number, not two" $?
+WALL_DEF="$(sed -n 's/.*num_or "${LANE_BOUND_WALL_S:-}" \([0-9][0-9]*\)).*/\1/p' "$BOUND" | head -1)"
+[ -n "${WALL_DEF:-}" ] && [ "$WALL_DEF" -gt "${IDLE_DEF:-0}" ]; rc=$?
+ck "(i0) the BACKSTOP default (${WALL_DEF:-?}s) sits ABOVE the allowance (${IDLE_DEF:-?}s), so it cannot pre-empt it" $rc
+SEAM="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' "$GATE" | head -1)"
+[ -n "${SEAM:-}" ] && [ "$SEAM" -gt "${IDLE_DEF:-0}" ]; rc=$?
+ck "(i0) the shipped lane BACKSTOP (LANE_BACKSTOP_S=${SEAM:-?}s) is above the allowance, so a wedged lane dies by PROGRESS, never by the wall" $rc
+PRD="$HERE/../pr-doctor.py"
+PRD_DEF="$(sed -n 's/^DEFAULT_SPAWN_BACKSTOP_S = \([0-9][0-9]*\).*/\1/p' "$PRD" | head -1)"
+[ -n "${PRD_DEF:-}" ] && [ "$PRD_DEF" = "$SEAM" ]; rc=$?
+ck "(i0) pr-doctor's backstop default (${PRD_DEF:-?}s) equals the harness seam (${SEAM:-?}s) — a python/branch literal pair that CANNOT drift" $rc
+REAP_LIVE="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/lane-reap.sh" | head -1)"
+[ -n "${REAP_LIVE:-}" ] && [ $(( REAP_LIVE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
+ck "(i0) the reaper's LIVE window (${REAP_LIVE:-?} min) stays above the BACKSTOP (${SEAM:-?}s) — a live lane is not counted dead for capacity" $rc
+
 # A literal-substring replacement, so no regex/`$` quoting can silently no-op the mutation, and the
 # replacement is ASSERTED to have landed: a mutant identical to the original would make every
 # "the case reddens" check vacuous, which is the "test that cannot fail" class.
@@ -357,6 +432,19 @@ ticks="$(grep -c '^tick ' "$TMP/logs/h2.log" 2>/dev/null || true)"
 [ "${ticks:-0}" -ge 10 ]; rc=$?
 ck "(h) …and the control stub really produced output past the idle bound (${ticks:-0} ticks)" $rc
 
+# ⛔ (h3) THE BACKSTOP SEAM IS REACHABLE THROUGH `run_agent` (agent-infra#2888). `lane-bound.sh`
+# documents `LANE_BOUND_WALL_S` (flag → env → default), but `run_agent` passes `--wall "$t"` on EVERY
+# run, so before this change that knob was INERT on every wired path — an operator setting it would
+# have changed nothing while believing the bound had moved. Driven, not grepped: a chatty lane and a
+# 3 s backstop; if the seam is dead the lane finishes and this stays RED.
+res="$(PATH="$TMP/bin:$PATH" O="$TMP/o" HOME="$TMP/fakehome" FIXREPO="$FIXREPO" MAX_LOAD=1000 \
+        DISK_MIN_FREE_MB=1 KIND=lane LANE_BOUND_IDLE_S=30 LANE_BOUND_WALL_S=3 \
+        bash "$TMP/bin/drive_ra.sh" "$GATE" 120 "$TMP/logs/h3.log" "$TMP/brief.txt")"
+want "$res" "bound=exceeded-wallclock"; rc=$?
+ck "(h3) LANE_BOUND_WALL_S reaches the bound through run_agent (it used to be an inert knob) ($res)" $rc
+grep -q 'backstop OVERRIDDEN by LANE_BOUND_WALL_S=3' "$TMP/logs/h3.log"; rc=$?
+ck "(h3) …and the override is NAMED in the lane log, so the bound that ran and the bound reported cannot disagree" $rc
+
 # ── (g) THE CALLER'S CONTRACT: `run_agent` reads the verdict, and a stale one cannot be mistaken ──
 # A caller that cannot tell "the lane finished" from "the bound ended it" reports a wedged lane as a
 # completed one. The wiring is asserted against the SHIPPED spawn-gate.sh, not against a copy.
@@ -367,7 +455,7 @@ grep -q 'AGENT_BOUND_VERDICT' "$GATE"; ck "(g) …and exposes its verdict to cal
 # fallback exists is the other half of "a version skew must never halt every lane": the failure this
 # guards is a future edit that deletes the subshell while keeping the WARN, which would advertise a
 # bound the box does not have.
-grep -qF 'sleep "$t"; kill -TERM "$pid"' "$GATE"; ck "(g) …and a \$O without lane-bound.sh still gets the WALL CLOCK (loudly), never an unbounded lane" $?
+grep -qF 'sleep "$_lb_wall"; kill -TERM "$pid"' "$GATE"; ck "(g) …and a \$O without lane-bound.sh still gets the WALL CLOCK (loudly), never an unbounded lane" $?
 # ⛔ THE VERDICT FILE IS REMOVED BEFORE EACH RUN. A leftover from a previous invocation of the same log
 # would be read as THIS run's outcome — the stale-flag class the harness names in its own instructions.
 awk '/rm -f "\$log.lanebound"/{f=1} /sh "\$_lb_sh" watch/{w=1} END{exit !(f && w && NR>0)}' "$GATE" \
