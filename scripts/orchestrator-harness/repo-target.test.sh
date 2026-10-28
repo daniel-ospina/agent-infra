@@ -263,14 +263,14 @@ FO="$T/o-fix"; mkdir -p "$FO/logs" "$FO/state"
 gh() { return 1; }
 export -f gh 2>/dev/null || true
 
-REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 \
+REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$TT" daniel-ospina/agent-infra 4001 work >/dev/null 2>&1
 c1=$?
 { [ "$c1" -eq 72 ] && grep -q 'daniel-ospina/tortoise' "$FO/logs/fix-4001.log" 2>/dev/null \
     && grep -q 'daniel-ospina/agent-infra' "$FO/logs/fix-4001.log" 2>/dev/null \
     && [ ! -e "$TT/.worktrees/fix-4001" ]; }; ck "C1 PR lane with a checkout/target mismatch -> REFUSED (72), no worktree built" $?
 
-REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 \
+REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$AI" daniel-ospina/agent-infra 4002 feat/not-there >/dev/null 2>&1
 c2=$?
 { [ "$c2" -eq 72 ] \
@@ -290,14 +290,14 @@ c2=$?
 printf '%s\n' "2" > "$FO/state/fixcount-4004"
 printf '%s\n' "$TT" daniel-ospina/agent-infra 4004 work > "$T/argv-4004"
 ( gh() { case "$*" in *headRefOid*) echo "cafebabe"; return 0 ;; esac; return 1; }; export -f gh
-  REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 \
+  REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
     bash "$FIX" --argv "$T/argv-4004" ) >/dev/null 2>&1
 c4=$?
 { [ "$c4" -eq 72 ] && [ -f "$FO/state/fixgate-4004-cafebabe" ] \
     && [ "$(cat "$FO/state/fixcount-4004" 2>/dev/null)" = "1" ]; }; ck "C4 --argv (CTRL=1) identity refusal -> REFUNDS fixcount AND writes fixgate-<PR>-<head> (rc=$c4)" $?
 
 "$REAL_GIT" -C "$AI" branch work >/dev/null 2>&1 || true
-REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 \
+REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$AI" daniel-ospina/agent-infra 4003 work >/dev/null 2>&1
 c3=$?
 { grep -q 'fixer #4003 target check=ok repo=daniel-ospina/agent-infra' "$FO/logs/fix-4003.log" 2>/dev/null \
