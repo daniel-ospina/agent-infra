@@ -94,8 +94,10 @@
 # Exit codes (the `pr-doctor`/`disk-reaper` vocabulary, kept identical on purpose):
 #   0  a pass completed — it dispatched, or there was genuinely nothing to do
 #   2  REFUSING — a read a pass needs could not be taken (a miss is never "nothing to do")
-#   3  UNDELIVERED — the work was placed and no worker took it (pr-doctor's own 3, kept verbatim: a
-#      monitor keyed on this pass must not read green over work nobody accepted)
+#   3  UNDELIVERED — legible work, NONE of it out: the work was placed and no worker took it, OR a
+#      durable refusal (a dirty worktree, an order the transport will not take) stopped it before
+#      delivery (agent-infra#2708). pr-doctor's own 3, kept verbatim: a monitor keyed on this pass
+#      must not read green over work nobody accepted
 #   6  DEFERRED — the machine said not now; the status row carries which measurement said so
 set -uo pipefail
 
@@ -128,7 +130,8 @@ STATUS="$STATE_DIR/pr-repair.status.json"
 
 EXIT_OK=0
 EXIT_REFUSING=2
-EXIT_UNDELIVERED=3   # placed, and no worker took it -- pr-doctor's own 3, kept verbatim
+EXIT_UNDELIVERED=3   # legible work, NONE of it out -- no worker took the order that was placed, or a
+                     # durable refusal stopped it before delivery (#2708). pr-doctor's own 3, kept verbatim
 EXIT_DEFERRED=6
 
 log_line() { printf '[%s] pr-repair: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -371,7 +374,7 @@ one_pass() { # <dry-run:0|1>
     case "$rc_dispatch" in
         0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
-        3) err "dispatch: UNDELIVERED (rc=3) — the work was placed and no worker took it." ;;
+        3) err "dispatch: NOT DELIVERED (rc=3) — legible work, none of it out: no worker took an order that was placed, or a refusal stopped one before delivery. NOT an empty queue." ;;
         *) err "dispatch: unexpected rc=$rc_dispatch from pr-doctor." ;;
     esac
     # ⛔ THE RECORD FOLLOWS THE DISPATCHER'S OWN VERDICT, not the fact that it returned. A pass whose
@@ -380,6 +383,11 @@ one_pass() { # <dry-run:0|1>
     # queue nobody could read. The exit code carries the same verdict the row does.
     case "$rc_dispatch" in
         0) write_status dispatched "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "pass-complete"; return "$EXIT_OK" ;;
+        # ⚠️ THE TOKEN `no-worker-took-it` IS KEPT AND ITS CAUSE IS NOT (agent-infra#2708): rc=3 now
+        # covers a durable refusal BEFORE delivery as well, so the token under-describes its own row.
+        # It is not renamed here because it is a shipped monitor vocabulary (`pr-repair-loop.test.sh`
+        # pins it) and renaming it mid-change would break a reader this lane cannot verify. The
+        # KIND (`placed-undelivered`) is accurate for both, and the human line above names both.
         3) write_status placed-undelivered "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "no-worker-took-it"; return "$EXIT_UNDELIVERED" ;;
         *) write_status refusing "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-refused"; return "$EXIT_REFUSING" ;;
     esac

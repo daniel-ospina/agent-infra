@@ -136,7 +136,7 @@ if [ -z "$bg_lib" ]; then
   exit 78
 fi
 bash "$bg_lib" --check "$PROMPT" worker || {
-  echo "nonblocking-dispatch.sh: REFUSED — the brief at $PROMPT did not pass the research-first gate (agent-infra#2258). NOTHING WAS STARTED: no worker, no session, no model call. The [brief-gate] block above names every missing element and prints the canonical section." >&2
+  echo "nonblocking-dispatch.sh: REFUSED — the brief at $PROMPT did not pass the research-first gate at $bg_lib (agent-infra#2258). NOTHING WAS STARTED: no worker, no session, no model call. The [brief-gate] block above names every missing element and prints the canonical section." >&2
   exit 80
 }
 

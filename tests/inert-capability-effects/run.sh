@@ -353,8 +353,17 @@ REAP_LOG="$WORK/reap.log"
 # ⛔ THE SCRIPT PATH IS LITERAL (#709's script-content gate): a reaper invoked through a variable
 # path is a script the guard cannot statically read, and it fails closed — correctly, since an
 # unreadable script could discard any checkout.
+# ⛔ REAP_WT_MIN_AGE_MINUTES=0 IS PART OF THE FIXTURE, NOT A CONVENIENCE (#2721, found while
+# landing #2708). These trees are created SECONDS before the pass, so under rule 7 — the 45-minute
+# hard floor, applied ON TOP of the two age knobs above — every one of them is `too-young` and
+# NOTHING is removable. Measured on a clean box: `reasons=too-young:2,live-cwd:1` and both §3
+# removal arms red — i.e. this section could never PASS anywhere, so the live-cwd gate it exists to
+# pin had no working test at all while the suite reported covering it. The floor is not what §3 is
+# about (it is pinned by `scripts/pi-reap-worktrees.test.sh` R7); the same override, with the same
+# rationale, is what that suite uses in its own A7 fixture.
 ( cd "$ROOT" && REAP_WT_STATE_DIR="$WORK/reap-state" REAP_WT_AGED_DAYS=0 \
-    REAP_WT_MERGED_AGE_DAYS=0 PS_BIN=/bin/ps LSOF_BIN="$STUB_LSOF" GH_BIN="$STUB/gh" \
+    REAP_WT_MERGED_AGE_DAYS=0 REAP_WT_MIN_AGE_MINUTES=0 \
+    PS_BIN=/bin/ps LSOF_BIN="$STUB_LSOF" GH_BIN="$STUB/gh" \
     bash scripts/pi-reap-worktrees.sh --apply --repo "$FIXTURE" ) >"$REAP_LOG" 2>&1
 reap_rc=$?
 REAP_TAIL="$(tail -c 700 "$REAP_LOG")"

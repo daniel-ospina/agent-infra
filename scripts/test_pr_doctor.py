@@ -6745,3 +6745,47 @@ def test_an_EXPIRED_cooldown_refusal_is_not_dropped_by_a_saturated_pass(monkeypa
         joined = "\n".join(logs)
         assert rc == pr.EXIT_UNDELIVERED == 3, (refused_last, rc, joined)
         assert "ESCALATE #2" in joined, (refused_last, joined)
+
+
+# ── WHICH COPY JUDGED THE BRIEF (#2708, retained through the rebase onto #2978) ────────────────────
+def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, tmp_path):
+    """⛔ THE STALE-COPY CLASS (measured 2026-10-28, case 3): a capability resolves a helper from the
+    FIRST candidate on a search path, and nothing compares the copy it RESOLVED with the copy the
+    other half of the contract will use.
+
+    Case 2 was a 9-hour-stale `pr-doctor.py` whose briefs carried no research contract while the gate
+    that judged them DID require one: every spawn refused `rc=80` for 9 hours. The effect assertion is
+    agreement, not construction: the brief the doctor COMPOSES must be ACCEPTED by the gate the
+    dispatcher RESOLVES. And when it is not, the refusal must name the copy that judged it — otherwise
+    the operator fixes the file they installed while the box keeps running the other one (case 3's
+    exact shape: the fix went to `~/.pi/agent/scripts/objective.py`, and the driver resolved
+    `$O/objective.py`).
+    """
+    d, _wt = _orch(tmp_path, "run_agent() { :; }\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    # ⛔ `research_section()` CACHES A SUCCESS (deliberately — a failure is what is re-tried), so a
+    # section resolved by an earlier test in this process would make this arm read that copy.
+    monkeypatch.setattr(pr, "_RESEARCH_SECTION", None, raising=False)
+
+    composed = pr.brief(_pr(7), "fix-ci", "python-ci-gate", [])
+    assert "## RESEARCH FIRST" in composed, composed[:400]
+    prompt = tmp_path / "brief.txt"
+    prompt.write_text(composed)
+    ok = subprocess.run(["bash", str(_HARNESS / "brief-gate.sh"), "--check", str(prompt), "worker"],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ("the doctor composed a brief the shipped gate REFUSES — every "
+                                "spawn on the box would exit 80:\n%s%s" % (ok.stdout, ok.stderr))
+
+    # ── and the refusal NAMES the resolved copy ────────────────────────────────────────────────
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(_wt), ""))
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setenv("O", str(d))
+    ok_d, detail, record = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
+    assert (ok_d, record) == (False, False), (ok_d, detail, record)
+    assert "rc=80" in detail, detail
+    assert str(d / "brief-gate.sh") in detail, (
+        "the refusal did not name WHICH brief-gate.sh judged the brief, so an operator is sent to "
+        "the copy they just fixed rather than the copy that refused: %r" % (detail,))
