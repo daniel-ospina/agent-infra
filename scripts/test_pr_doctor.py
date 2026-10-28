@@ -6526,7 +6526,10 @@ def _four_refused_rows(monkeypatch, logs, refusals, orch_dir):
     monkeypatch.setattr(pr, "save_state", lambda st: None)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     # ⛔ THE SHIPPED CAPS, DELIBERATELY. Every other pass test raises MAX_FIX/MAX_REVIEW, which is
-    # exactly why one row hid this: at the defaults, three refused rows exhaust the fix budget.
+    # exactly why one row hid this: at the defaults, three refused rows USED TO exhaust the fix budget
+    # (`pass_budgets()` charged them, because a row that never spawned has no pid file). #2710 voids a
+    # refused row's slot, so the caps stay here as the configuration that cannot be talked round by
+    # capacity: the accounting must refuse whether or not there is room.
     for v in ("MAX_FIX", "MAX_REVIEW", "MAX_TOTAL"):
         monkeypatch.delenv(v, raising=False)
 
@@ -6745,3 +6748,94 @@ def test_an_EXPIRED_cooldown_refusal_is_not_dropped_by_a_saturated_pass(monkeypa
         joined = "\n".join(logs)
         assert rc == pr.EXIT_UNDELIVERED == 3, (refused_last, rc, joined)
         assert "ESCALATE #2" in joined, (refused_last, joined)
+
+
+# ── WHICH COPY JUDGED THE BRIEF (#2708, retained through the rebase onto #2978) ────────────────────
+def test_a_refused_brief_NAMES_the_copy_of_the_gate_that_judged_it(monkeypatch, tmp_path):
+    """⛔ THE STALE-COPY CLASS (measured 2026-10-28, case 3): a capability resolves a helper from the
+    FIRST candidate on a search path, and nothing compares the copy it RESOLVED with the copy the
+    other half of the contract will use.
+
+    Case 2 was a 9-hour-stale `pr-doctor.py` whose briefs carried no research contract while the gate
+    that judged them DID require one: every spawn refused `rc=80` for 9 hours. The effect assertion is
+    agreement, not construction: the brief the doctor COMPOSES must be ACCEPTED by the gate the
+    dispatcher RESOLVES. And when it is not, the refusal must name the copy that judged it — otherwise
+    the operator fixes the file they installed while the box keeps running the other one (case 3's
+    exact shape: the fix went to `~/.pi/agent/scripts/objective.py`, and the driver resolved
+    `$O/objective.py`).
+    """
+    d, _wt = _orch(tmp_path, "run_agent() { :; }\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    # ⛔ `research_section()` CACHES A SUCCESS (deliberately — a failure is what is re-tried), so a
+    # section resolved by an earlier test in this process would make this arm read that copy.
+    monkeypatch.setattr(pr, "_RESEARCH_SECTION", None, raising=False)
+
+    composed = pr.brief(_pr(7), "fix-ci", "python-ci-gate", [])
+    assert "## RESEARCH FIRST" in composed, composed[:400]
+    prompt = tmp_path / "brief.txt"
+    prompt.write_text(composed)
+    ok = subprocess.run(["bash", str(_HARNESS / "brief-gate.sh"), "--check", str(prompt), "worker"],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ("the doctor composed a brief the shipped gate REFUSES — every "
+                                "spawn on the box would exit 80:\n%s%s" % (ok.stdout, ok.stderr))
+
+    # ── and the refusal NAMES the resolved copy ────────────────────────────────────────────────
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(_wt), ""))
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    logged = []
+    monkeypatch.setattr(pr, "log", logged.append)
+    monkeypatch.setenv("O", str(d))
+    ok_d, detail, record = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
+    assert (ok_d, record) == (False, False), (ok_d, detail, record)
+    assert "rc=80" in detail, detail
+    assert str(d / "brief-gate.sh") in detail, (
+        "the refusal did not name WHICH brief-gate.sh judged the brief, so an operator is sent to "
+        "the copy they just fixed rather than the copy that refused: %r" % (detail,))
+
+    # ⛔ AND IT MUST SURVIVE THE CUT THE OPERATOR ACTUALLY READS (#2708 review, P2 — reproduced).
+    # Naming the copy in a string no reader renders is the same defect one layer down. `pr-doctor`
+    # logs SLICES of this stderr -- `detail[:200]` on the FAIL line (`scripts/pr-doctor.py:3768`) and
+    # `detail[:160]` on the NOT-DISPATCHED line (`:5093`, the rc=80 path, which writes no state row;
+    # `:5090` is the REFUSED-and-RECORDED line, which rc=80 never takes) -- and the gate's own
+    # teaching block is ~3.3 KB. Measured BEFORE the reorder that follows from this arm: the path sat
+    # at byte ~3290 of a ~3655-byte capture, so `in detail[:160]` was **False** and the operator still
+    # could not tell which copy refused. The dispatcher therefore emits the naming line FIRST and
+    # re-emits the block after it.
+    #
+    # ⛔ THE PROPERTY IS THE ORDERING, NOT THE END OF THE PATH (#2986 review, P1 -- MEASURED RED on
+    # macOS). The earlier form of this arm read `str(d / "brief-gate.sh") in detail[:160]`, and
+    # `str(d / "brief-gate.sh")` here is a PYTEST TEMP PATH: with this fleet's own
+    # `TMPDIR=/var/folders/...` it is ~141 chars, so the path ends at char ~194 and the arm failed on
+    # every macOS box while passing on `ubuntu-latest` (whose temp root is shorter) -- a verdict
+    # decided by the box's `$TMPDIR` grades the box, not the ordering. So the ordering is asserted at
+    # its EXACT OFFSET (box-independent), and the 160-char property is asserted separately against
+    # an `$O` no LONGER than production's (the block after it): `/tmp/oXXXXXX` is 14 chars, against
+    # the real `$O/brief-gate.sh` = 27 + len($HOME) = 41 in this fleet (`$O` defaults to
+    # `$HOME/orchestrator`), so that assertion is CONSERVATIVE rather than box-dependent.
+    # `$HOME/.pi/…` is only the FOURTH candidate (32 + len($HOME)) and is NOT the path a real box
+    # resolves — the first candidate, `$O/brief-gate.sh`, always exists on an installed box.
+    path = str(d / "brief-gate.sh")
+    prefix = "rc=80: nonblocking-dispatch.sh: REFUSED — brief-gate="
+    assert detail.splitlines()[0].startswith(prefix + path), (
+        "the naming line did not LEAD with brief-gate=<resolved path> at char %d, so the path is "
+        "still behind the gate's teaching block: %r" % (len(prefix), detail[:200]))
+
+    # ── AND THE 160-CHAR SLICE IS REAL FOR AN `$O` NO LONGER THAN A REAL BOX'S ─────────────
+    # `/tmp/oXXXXXX` (14 chars) rather than `tmp_path`: on macOS `tmp_path` nests under
+    # /private/var/folders and no preamble short enough to name the copy would rescue a 141-char path.
+    short = pathlib.Path(tempfile.mkdtemp(dir="/tmp", prefix="o"))
+    try:
+        for f in ("brief-gate.sh", "spawn-gate.sh"):
+            shutil.copy(str(d / f), str(short / f))
+        monkeypatch.setattr(pr, "ORCH_DIR", str(short))
+        monkeypatch.setenv("O", str(short))
+        ok_s, detail_s, record_s = pr.dispatch(_pr(7), "fix-ci", "no contract in this brief", dry=False)
+        assert (ok_s, record_s) == (False, False), (ok_s, detail_s, record_s)
+        assert str(short / "brief-gate.sh") in detail_s[:160], (
+            "a production-length `$O` does not fit the 160-char slice pr-doctor renders, so the "
+            "operator is still sent to the copy they just fixed. detail[:200]=%r" % (detail_s[:200],))
+    finally:
+        shutil.rmtree(str(short), ignore_errors=True)
+    assert logged, "the refusal produced no log line at all"

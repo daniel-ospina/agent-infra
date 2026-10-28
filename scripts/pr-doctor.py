@@ -5049,8 +5049,11 @@ def run_pass(args, rubric_note: str = "") -> int:
                 # RECORDED ANYWAY: a refusal that does not clear by waiting (uncommitted work in
                 # the PR's own worktree, commits the head does not have) must reach a cooldown, or
                 # the pass logs the same line for ever and the PR is never dispatched and never
-                # visible in `--status`. NOTE the row consumes the class slot on the NEXT pass via
-                # pass_budgets(), so it must not also be charged to this pass's `spent`.
+                # visible in `--status`. ⛔ NOTE A REFUSAL HOLDS **NO** CLASS SLOT AT ALL (#2710):
+                # pass_budgets() skips `kind == "refused"` -- "a refusal consumed nothing, so it must
+                # not hold a cooldown and a budget slot" -- so the row is not charged on the next pass
+                # either, and it must not be charged to this pass's `spent`. (This comment said the
+                # opposite until #2708's rebase: it predates the #2710 fix and was false in tree.)
                 #
                 # ⛔ AND IT IS UNDELIVERED WORK, SO THE PASS MAY NOT EXIT 0 (#2710). `undeliverable`
                 # is "work that was legible and no worker took it", and a worktree refusal is
