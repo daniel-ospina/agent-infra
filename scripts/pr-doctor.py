@@ -3594,11 +3594,28 @@ def _started_worktree(name: str) -> str:
 
 
 def _in_this_checkout(worktree: str) -> bool:
-    """True when `worktree` is under THIS pass's `.worktrees` root (or cannot be attributed)."""
+    """True when `worktree` is under THIS pass's `.worktrees` root (or cannot be attributed).
+
+    ⛔ COMPARED AS REAL PATHS, NOT AS SPELLINGS (#2725 review). The two sides do not come from one
+    process: `WORKTREE_ROOT` is this pass's own configuration, while the `.started` record carries
+    the path the DISPATCHER was handed. `abspath` only normalises `.`/`..`, so one directory spelled
+    two ways compares UNEQUAL -- and on macOS that is the default, not an edge case (`/tmp` is a
+    symlink to `/private/tmp`, so a `TMPDIR`-rooted worktree root and a `/tmp`-rooted record are one
+    directory with two names). Unequal means "not ours", which SKIPS probing a live pre-#2725
+    worker: the pass adopts its worktree, `nonblocking-dispatch.sh` does `rm -f "$RC"` and
+    `: > "$LOG"`, and the running agent's evidence is destroyed by a second agent in one git index.
+    That is the UNSAFE direction, so a symlinked checkout root -- which this repo already ships
+    (`scripts -> $AGENT_INFRA_PATH/scripts`) -- must not be able to produce it.
+
+    `realpath` resolves the links on both sides, so two spellings of one directory ATTRIBUTE (probe
+    it: the safe direction) while two genuinely different trees still do not. It never widens the
+    answer past the real root, and a path that does not exist resolves to itself, so this cannot
+    throw on a pruned worktree either.
+    """
     if not worktree or not WORKTREE_ROOT:
         return True                       # nothing to attribute it with: do not narrow on a guess
-    root = os.path.abspath(WORKTREE_ROOT)
-    return os.path.abspath(worktree).startswith(root + os.sep)
+    root = os.path.realpath(WORKTREE_ROOT)
+    return os.path.realpath(worktree).startswith(root + os.sep)
 
 
 def worker_live_for(number) -> object:

@@ -5540,6 +5540,47 @@ def test_a_pre_2725_worker_from_ANOTHER_checkout_is_NOT_this_PRs_holder(tmp_path
     pr.canonical_paths()
 
 
+def test_the_same_worktree_spelled_two_ways_is_still_THIS_checkouts(tmp_path, monkeypatch):
+    """⛔ THE ATTRIBUTION IS BY REAL PATH, NOT BY SPELLING (#2725 review).
+
+    `WORKTREE_ROOT` is this pass's configuration; the `.started` record carries the path the
+    DISPATCHER was handed. They are two different strings for one directory whenever a symlink is
+    involved -- and on macOS that is the DEFAULT (`/tmp` -> `/private/tmp`), as it is in this repo
+    (`scripts -> $AGENT_INFRA_PATH/scripts`). `abspath` cannot reconcile them, so the attribution
+    answered "not ours" and SKIPPED a live pre-#2725 worker: the pass adopts its worktree and
+    `nonblocking-dispatch.sh` destroys its `.rc`/`.log` under the running agent. A false "not live"
+    destroys work; a false "live" costs one pass of throughput, so the tie goes to probing.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    spelled = tmp_path / "link"
+    os.symlink(str(real_root), str(spelled))       # one directory, two names
+
+    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(spelled))     # this pass's configuration
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+
+    # the record names the REAL path, the config names the SYMLINK -> still this checkout
+    with open(pr.bg_path("prd-42", "started"), "w") as fh:
+        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n"
+                 % os.path.join(str(real_root), "prd-42"))
+    assert pr.worker_live_for(42) is True, asked
+    assert "prd-42" in asked, "a two-spelling worktree was read as another repo's: %r" % (asked,)
+
+    # and the CONVERSE spelling (config real, record symlinked) attributes the same way
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(real_root))
+    asked.clear()
+    with open(pr.bg_path("prd-42", "started"), "w") as fh:
+        fh.write("name=prd-42\nworktree=%s/\nkind=prfix\n"
+                 % os.path.join(str(spelled), "prd-42"))      # trailing slash too
+    assert pr.worker_live_for(42) is True, asked
+    assert "prd-42" in asked, asked
+    pr.canonical_paths()
+
+
 def test_a_row_written_before_the_rename_still_holds_and_frees_its_slot(tmp_path, monkeypatch):
     """⛔ IN-FLIGHT ROWS SURVIVE THE RENAME (#2725), both directions.
 
