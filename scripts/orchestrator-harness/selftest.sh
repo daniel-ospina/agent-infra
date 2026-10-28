@@ -1895,7 +1895,12 @@ mem_def="$(dval MIN_MEM_FREE_MB)"
 swp_def="$(dval MIN_SWAP_FREE)"
 [ "$mem_def" = "512" ] && rcd=0 || { rcd=1; echo "      MIN_MEM_FREE_MB resolves to '$mem_def' -- README documents 512"; }
 ck "MIN_MEM_FREE_MB resolves to the documented 512MB default in the shipped files" $rcd
-GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/^  fi$/p' "$LOOP")"
+# ⛔ BY THE MARKERS, NOT BY `^  fi$` (agent-infra#2924/#2927). The chain's closing `fi` used to be the
+# only bare `  fi` after the entry line, so the extraction could stop there; the gate VECTOR put each
+# arm in its own guard, and several of those guards close on a bare `  fi` — the first one truncated
+# the block to the merge-priority arm, ELEVEN assertions still passed and the three below went red.
+# A marker is the range the code itself declares, so adding an arm cannot silently shorten the test.
+GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/# \[gatevec:end\]/p' "$LOOP")"
 [ -n "$GATE_BLOCK" ] && rcg=0 || { rcg=1; echo "      the gate chain could not be extracted from $LOOP"; }
 ck "the dispatch gate chain is extractable from the shipped loop" $rcg
 mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM [WORKERS]
@@ -3419,24 +3424,21 @@ fi
 # NOTE (#2223): the `^fix-` selector now appears at THREE SPAWN sites — conflict, CI-red, and the
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
-# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY (#2333 review P1). The defer arms
-# must not be miscounted as spawn sites, and a defer arm that stops deferring must still redden.
-# ⛔ …AND THEY NO LONGER OVERLAP AT ALL (#2333 merge review P1). The deferral now NESTS inside the
-# spawn arm's own eligibility (`if ciq_push_ok; then <spawn> else <defer> fi`) instead of being a
-# sibling `elif … && ! ciq_push_ok; then`: one predicate per spawn site, which is also the count
-# test-gates.sh asserts ("every fixer spawn site compares against the drain-aware budget") — a
-# duplicated predicate would have inflated that count from 3 to 5 purely to express one decision.
-# With nesting, the two populations are disjoint by construction, so each is counted directly. The
-# stated power is kept in both directions: a spawn site that loses (or gains, ungated) its load gate
-# reddens `fixer_sites`, and a spawn site whose deferral is removed reddens `fixer_defer_sites`.
-# ⛔ THREE fixer defer arms, in TWO spellings (#2333 review, P2). Two sites write the predicate as
-# the WHOLE condition (`if ciq_push_ok; then`, counted by `fixer_defer_sites`); the REVIEW-GATE site
-# SHARES the condition with its own eligibility (`if [ "$_fix_eligible" = "1" ] && ciq_push_ok;
-# then`), which the literal pattern cannot see — so without `fixer_defer_shared`, deleting that
-# `&& ciq_push_ok` left this check green while the site stopped deferring. (The fourth CI-queue
-# defer, the #PR CI RERUN, is not a fixer spawn and is pinned by ci-queue.test.sh's wiring arms.)
+# ⛔ SPAWN SITES AND CI-QUEUE DEFER ARMS ARE COUNTED SEPARATELY, AND IN BOTH DIRECTIONS.
+# ⛔ THE FIXER DEFER COUNT IS NOW ZERO ON PURPOSE (#2927). The three fixer spawn sites used to nest a
+# `ciq_push_ok` deferral inside their own eligibility. They no longer do: a fixer is REPAIR — it acts
+# on a PR that already exists — so the class rule in ci-queue.sh's header excludes it from queue
+# gating. ⛔ NOT because "its pass is already spent" (a repair push DOES start a fresh run): the basis
+# is #2927's decision plus the measurement that the NUMBER was demand read as supply. Measured 2026-10-27 on cell 4, that gate skipped 41
+# consecutive repair dispatches while 8 self-hosted runners and ~11 lane slots sat idle, against a
+# queue depth that belonged to GitHub-HOSTED concurrency and to NEW-PR work.
+# So `fixer_defer_sites`/`fixer_defer_shared` are pinned at 0: a gate RE-ADDED to any fixer arm
+# reddens this line, and `fixer_sites` still pins the load gate each one carries. The one CI-queue
+# defer that survives is the #PR CI RERUN (`! ciq_push_ok`), which genuinely ADDS a run to the queue;
+# it is not a fixer spawn and is pinned both here and by ci-queue.test.sh's wiring arms.
 fixer_defer_sites=$(grep -cF 'if ciq_push_ok; then' "$LOOP")
 fixer_defer_shared=$(grep -cF '] && ciq_push_ok; then' "$LOOP")
+rerun_gate=$(grep -cF '! ciq_push_ok' "$LOOP")
 fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
 # ⛔ AND THE REVIEW ORDER IS ITS OWN SPAWN SITE (agent-infra#2971). The re-record arm used to spawn
 # under the `merge-<PR>` tag and compare against `wt_count merge-)`; it now dispatches `review-<PR>`
@@ -3447,10 +3449,12 @@ merge_site=$(grep -E 'wt_count (review- )?merge-\)"' "$LOOP" | grep -cF can_spaw
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
-[ "$fixer_defer_sites" = "2" ] && rc=0 || rc=1
-ck "the two wholly-predicated CI-queue defer arms NEST inside a spawn site's load-gated eligibility (they are not spawn sites of their own)" $rc
-[ "$fixer_defer_shared" = "1" ] && rc=0 || rc=1
-ck "the review-gate fixer's SHARED-eligibility CI-queue defer arm is present (three fixer defer arms, two spellings)" $rc
+[ "$fixer_defer_sites" = "0" ] && rc=0 || rc=1
+ck "NO fixer spawn arm is CI-queue-gated (#2927 — a fixer is REPAIR; found $fixer_defer_sites, expected 0)" $rc
+[ "$fixer_defer_shared" = "0" ] && rc=0 || rc=1
+ck "…and the review-gate fixer's eligibility no longer shares a queue gate either (found $fixer_defer_shared, expected 0)" $rc
+[ "$rerun_gate" = "1" ] && rc=0 || rc=1
+ck "…while the one act that ADDS a run to the queue — the CI rerun — is still gated (found $rerun_gate, expected 1)" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
 ck "both merge spawn sites (the review order review-<PR> + rail-mode GREEN merge-<PR>) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
