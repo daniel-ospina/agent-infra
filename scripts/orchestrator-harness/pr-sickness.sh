@@ -398,6 +398,9 @@ ps_held() {
   fi
   if ps_alive "fix-$pr"; then printf 'live session fix-%s' "$pr"; return 0; fi
   if ps_alive "merge-$pr"; then printf 'live session merge-%s' "$pr"; return 0; fi
+  # The review order is its own worker tag since agent-infra#2971; without this a PR whose REVIEW is
+  # in flight reads as un-held and this selector would brief a second worker at the same head.
+  if ps_alive "review-$pr"; then printf 'live session review-%s' "$pr"; return 0; fi
   # ⛔ TWO KEYS, TWO QUESTIONS, AND BOTH ARE ASKED. A fixer/reviewer holds the PER-HEAD key
   # (`<PR>-<sha12>`); only the landing path holds the coarse `pr-<N>` key. Reading the coarse one
   # alone made this guard inert for exactly the peer we must not duplicate (measured: two boxes each
