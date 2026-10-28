@@ -253,12 +253,23 @@ OWNERSHIP_NOTE = ""
 # believed it had spent is indistinguishable from a budget it had spent -- `dispatched 0` is what an
 # empty queue looks like, which is exactly the ALIVE/IDLE confusion #2700 exists to remove.
 #
-# ⚠️ THIS SCOPES THE **REGISTER**, NOT THE WORKER IDENTITY. `dispatch()` still names a worker
-# `prd-<N>` under the box-global `$O/bg`, so two repos on one box still share one worker identity --
-# repo B's PR #N is skipped as "still running" because repo A's worker holds it, and a gate refusal
-# in repo A's `.rc` can be read as repo B's verdict. Same "keyed by PR number" class, one layer
-# down, and NOT closed here: filed as #2725 with the two measured outcomes. Do not read this comment
-# as saying the class is gone.
+# ⛔ AND THE WORKER IDENTITY IS SCOPED THE SAME WAY, BY THE SAME TAG (#2725). The register fix
+# above closed one layer; `dispatch()` named its worker `prd-<N>` under the box-global `$O/bg`, so
+# the layer under it still shared an identity between two repos on one box. Both outcomes were
+# reproduced against the real module before the change (2026-10-27):
+#
+#     repo A (agent-infra) worker=prd-42  rc=$O/bg/prd-42.rc
+#     repo B (tortoise)    worker=prd-42  rc=$O/bg/prd-42.rc     <- same .rc, .pid, .log, brief
+#     repo B: worker_live_for(42) -> True   (repo B had spawned nothing)
+#     repo B: _confirm('prd-42') -> ('refused', 'gate REFUSED rc=75')   <- repo A's refusal
+#
+# `worker_name()` already had the tag; it was applied only in `--all-repos` mode. `apply_repo()` now
+# sets it in BOTH modes, from `repo_tag()` -- the one derivation `_state_file()` and the collision
+# guard already use, so the register and the worker it records a row about cannot be spelled two
+# ways. ⛔ THE GRANULARITY IS THE REPO, NOT THE CHECKOUT, deliberately: two clones of one slug share
+# the tag because they share the register (#2700 scopes that to the slug), and a worker tag finer
+# than the register would put a row in a file the other clone also owns. See `worker_live_for()`
+# for what that means for a pre-rename `prd-<N>` worker.
 #
 # ⛔ THE ORDER IS NO LONGER LOAD-BEARING, AND THAT IS THE RECONCILIATION (see the block above): the
 # register is named from the RESOLVED slug inside `apply_repo()`, not from a module-level `REPO`,
@@ -353,8 +364,10 @@ LAST_PASS: dict = {}
 # pass too (#2700), so `canonical_paths()` re-derives it from the resolved slug rather than
 # restoring this tuple's first element -- see the note there.
 _CANONICAL = (STATE, STATUS, LOG)
-# Non-empty only in `--all-repos` mode: prefixes the per-repo worker name so two repos' PR #42
-# cannot share one `$O/bg/prd-42.*` record (and one worktree slot's liveness answer).
+# The repo's `repo_tag()` plus a hyphen; it prefixes the worker name so two repos' PR #42 cannot
+# share one `$O/bg/prd-42.*` record (and one worktree slot's liveness answer). ⛔ SET IN BOTH MODES
+# (#2725): `--all-repos` was the only mode that set it, so the ONE-DOCTOR-PER-REPO deployment -- the
+# shape #2700's own evidence records on this box -- was exactly the case with no tag at all.
 _WORKER_TAG = ""
 
 
@@ -743,14 +756,19 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
         # so every repo in a set appended to the ONE canonical file while the README promised a
         # per-repo one.
         LOG_BASENAME = "pr-doctor.%s.log" % tag
-        _WORKER_TAG = tag + "-"
     else:
         # ⛔ A SINGLE-REPO PASS TOUCHES NO STATUS/LOG. Those ARE the canonical files, so re-deriving
         # them here would overwrite a caller's seam (`STATE_DIR`, `STATUS`) with a second opinion
         # about where they live -- the same "two authorities for one path" defect `--status` was
         # just given a single reader for.
         LOG_BASENAME = "pr-doctor.log"
-        _WORKER_TAG = ""
+    # ⛔ THE WORKER TAG IS SET IN BOTH MODES, THROUGH THE SAME `repo_tag()` (#2725). It used to be
+    # assigned only in the `multi` branch, which left the ONE-DOCTOR-PER-REPO deployment -- one
+    # process per repo, the shape the box actually runs -- naming its worker `prd-<n>` under the
+    # box-global `$O/bg`, i.e. sharing one `.rc`/`.pid`/`.log`/brief with the other repo's PR #n.
+    # Through `repo_tag()`, never a second `.replace()`: the register's name and the worker names its
+    # rows record must be derived once, or a pass writes rows its own file cannot be matched in.
+    _WORKER_TAG = repo_tag(slug) + "-"
     # ⛔ THE AMBIENT SELECTOR IS PINNED TO THE RESOLVED REPO, IN THAT DIRECTION ONLY. Inheriting it
     # is the #2235 hazard; OVERRIDING it with the repo evidence already selected is safe, and it is
     # what stops a worker this pass spawns from having its own rail answer about another repo.
@@ -775,12 +793,17 @@ def apply_repo(slug: str, checkout: str = "", multi: bool = False, source: str =
 
 
 def worker_name(number) -> str:
-    """The worker's name for a PR, qualified by the repo only when more than one is in scope.
+    """The worker's name for a PR: `prd-<repo_tag>-<n>`, qualified by the repo IN BOTH MODES.
 
     Two repos can both have a PR #42, and the worker name keys `$O/bg/<name>.*` (liveness, `.rc`,
-    the log). A single-repo pass keeps the historical `prd-<n>` -- the fleet's readers and
-    `--status` rows are pinned to it -- while a multi-repo pass prefixes the repo so one repo's
-    live worker cannot be read as the other's.
+    the log) and `$STATE_DIR/pr-doctor-brief-<name>.txt` -- BOTH box-global, neither per repo. So
+    every mode prefixes the repo, from the register's own `repo_tag()` (#2725).
+
+    ⛔ THE UNQUALIFIED `prd-<n>` IS STILL READ (#2725), never written: a worker started before this
+    change holds `$O/bg/prd-<n>.{rc,pid,started}`, and `worker_live_for()` asks for that name too --
+    bounded to this checkout -- so a rename cannot turn a running worker into an idle slot. What
+    `--status` prints is unchanged in shape (`<name> running|done|failed|lost …`); only the `<name>`
+    it is asked about, and prints, carries the tag.
     """
     return "prd-%s%s" % (_WORKER_TAG, number)
 
@@ -1206,16 +1229,16 @@ def capacity() -> dict:
 # resolved twice). An empty register, an unreadable pid file, a row with no `worker` at all -- all
 # read ALIVE.
 #
-# ⚠️ AND THE NAME IS NOT AN IDENTITY. This file's own `dispatch()` writes the SHORT worker name
-# (`prd-2035`, `name = "prd-%d" % n`) under a box-global `$O/bg`, but the repo-scoped form
-# (`prd-agent-infra-2035.pid`) is what the MULTI-REPO launcher writes (`worker_name()` in
-# `fix/pr-doctor-repo-resolution`, #2280) and what the Mac's deployed copy wrote in the measurement
-# above (`spawn prd-agent-infra-2027`). A doctor in that mode writes scoped pid files while a
-# register carried over from single-repo mode still holds short names -- and an exact-name lookup
-# then finds NOTHING, where "nothing found => assume alive" (the safe direction) faithfully keeps
-# every ghost. So the TRAILING NUMBER is matched as well. That over-matches deliberately: another
-# repo's LIVE worker with the same PR number keeps a slot (throughput), and it never frees one (a
-# duplicate dispatch).
+# ⚠️ AND A ROW'S NAME IS NOT NECESSARILY THIS FILE'S CURRENT SPELLING (#2725). Rows written before
+# the worker identity was repo-scoped hold the SHORT name (`prd-2035`); every row written now holds
+# `prd-<repo-tag>-2035` (`worker_name()`), and a register carried over from before the change holds
+# both. An exact-name lookup therefore finds NOTHING for a row from the other spelling -- where
+# "nothing found => assume alive" (the safe direction) would faithfully keep every ghost. So the
+# TRAILING NUMBER is matched as well. That over-matches deliberately: another repo's LIVE worker
+# with the same PR number keeps a slot (throughput), and it never frees one (a duplicate dispatch).
+# ⛔ Liveness is a DIFFERENT question and is answered differently: `worker_live_for()` attributes
+# the unqualified name to a checkout from the dispatcher's own `.started` record, because a slot
+# held too long costs throughput while a worker read as dead costs two agents in one index.
 #
 # ⛔ AND THE SELF-REPORT NEEDS THREE STATES, NOT TWO (#2746 review). `alive` used to mean "not provably
 # gone", which counts a row with no `worker`, a row whose pid file was pruned, and a pid file we
@@ -3549,21 +3572,58 @@ def set_rubric_note(entries: list[str]) -> str:
             % (len(slugs), ",".join(sorted(slugs))))
 
 
+_STARTED_WT_RE = re.compile(r"^worktree=(.*)$", re.MULTILINE)
+
+
+def _started_worktree(name: str) -> str:
+    """The `worktree=` a worker's own `.started` record names, or "" when there is none to read.
+
+    `nonblocking-dispatch.sh` writes that record when it ACCEPTS an order (`name= / worktree= /
+    branch= / kind= / prompt= / started= / cap=`), so it is the dispatcher's own answer to "which
+    tree did this worker take" -- not an inference from the worker's name. Bounded read and
+    `errors="replace"` for the reason `_read_pid` gives: a record is an artifact, and an artifact
+    must not be able to abort a pass. An unreadable record answers "" (no evidence), never a guess.
+    """
+    try:
+        with open(bg_path(name, "started"), errors="replace") as fh:
+            data = fh.read(4096)
+    except OSError:
+        return ""
+    m = _STARTED_WT_RE.search(data)
+    return (m.group(1) or "").strip() if m else ""
+
+
+def _in_this_checkout(worktree: str) -> bool:
+    """True when `worktree` is under THIS pass's `.worktrees` root (or cannot be attributed)."""
+    if not worktree or not WORKTREE_ROOT:
+        return True                       # nothing to attribute it with: do not narrow on a guess
+    root = os.path.abspath(WORKTREE_ROOT)
+    return os.path.abspath(worktree).startswith(root + os.sep)
+
+
 def worker_live_for(number) -> object:
     """Liveness of ANY worker that would use this PR's worktree, whatever mode named it.
 
-    ⛔ ONE WORKTREE, TWO NAMES (#2280 review cycle 3, P2). `worker_name()` is MODE-QUALIFIED
-    (`prd-<tag>-42` in a set) while the worktree is `prd-42` in BOTH modes, so a single-repo pass and
-    an `--all-repos` pass over the SAME repo can look at one directory while calling it two things.
-    Probing only this mode's name reports a live worker as ABSENT; the pass then adopts that
-    worktree and spawns a second agent into it -- two agents, one git index, one branch. So the
-    question for a PR is asked of every name that resolves to its worktree, and an UNANSWERABLE
-    reading (`None`) wins over a negative one: the safe direction is not to spawn.
+    ⛔ ONE WORKTREE, TWO NAMES (#2280 review cycle 3, P2). `worker_name()` is repo-qualified while
+    the WORKTREE is `prd-<n>`, so a worker started before #2725 (or by a launcher that named it the
+    old way) is live under `prd-<n>` while this pass asks about `prd-<repo-tag>-<n>`. Probing only
+    this mode's name reports a live worker as ABSENT; the pass then adopts that worktree and spawns
+    a second agent into it -- two agents, one git index, one branch. So the question for a PR is
+    asked of every name that resolves to its worktree, and an UNANSWERABLE reading (`None`) wins
+    over a negative one: the safe direction is not to spawn.
+
+    ⛔ AND THE OLD NAME IS ONLY OURS WHERE THE DISPATCHER'S OWN RECORD SAYS SO (#2725). Probing a
+    box-global `prd-<n>` unconditionally is the very collision this change removes, merely on the
+    read side: repo A's pre-rename worker would hold repo B's PR #n as "still running" for as long
+    as its artifacts live. So the unqualified name is probed only when its `.started` record names
+    a tree under THIS checkout. The narrowing requires POSITIVE evidence -- an unreadable record, a
+    record with no `worktree=`, or a pass with no checkout are all probed anyway, because a false
+    "not live" destroys a running worker and a false "live" costs one pass of throughput.
     """
     names = [worker_name(number)]
     plain = "prd-%s" % number
-    if plain not in names:
-        names.append(plain)              # the single-repo pass's name for the SAME worktree
+    if plain not in names and _in_this_checkout(_started_worktree(plain)):
+        names.append(plain)              # the pre-#2725 name for the SAME worktree
     for nm in names:
         live = worker_live(nm)
         if live is None:                  # unanswerable: do not spawn
@@ -3673,8 +3733,9 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # `nonblocking-dispatch.sh` starts by `rm -f "$RC"`, `: > "$LOG"`, `echo … > "$PIDF"`, which
     # deterministically destroys the live worker's log, exit status and pid. So liveness is asked
     # (the harness owns the question), never inferred from the state row.
-    # ⛔ BOTH NAMES: the worktree is `prd-<n>` in EVERY mode, so a live worker started by the OTHER
-    # mode owns the same directory (see `worker_live_for()`).
+    # ⛔ BOTH NAMES: the worktree is `prd-<n>`, and a worker started before #2725 is live under the
+    # UNQUALIFIED `prd-<n>` -- `worker_live_for()` asks that name too, attributed to this checkout by
+    # the dispatcher's own `.started` record (see there).
     live = worker_live_for(n)
     if live:
         return False, "worker %s is still running -- one worker per PR" % name, False
@@ -3696,7 +3757,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # (300 s timeouts) and add a worktree; another pr-doctor invocation (a manual `--only`, which
     # the heartbeat lock does not cover) can pass the same guard inside that window. Re-asking here
     # costs one `--status` on the only path that spawns anything.
-    again = worker_live_for(n)            # BOTH names: the worktree is `prd-<n>` in every mode
+    again = worker_live_for(n)            # BOTH names: the pre-#2725 `prd-<n>` too, if it is ours
     if again is not False:
         return (False, "worker %s appeared (or its liveness became unreadable) while the worktree "
                        "was being prepared -- refusing to spawn a second one" % name, False)
@@ -4125,7 +4186,11 @@ def canonical_paths() -> None:
     STATE = _state_file(REPO) if REPO else _CANONICAL[0]
     STATUS, LOG = _CANONICAL[1], _CANONICAL[2]
     LOG_BASENAME = "pr-doctor.log"
-    _WORKER_TAG = ""
+    # ⛔ THE WORKER TAG IS RE-DERIVED FROM `REPO` TOO, FOR THE REASON ONE LINE ABOVE (#2725). The tag
+    # is `repo_tag()` of the repo this process grades, in BOTH modes, so restoring it to the empty
+    # string would be a SECOND authority on the worker's name -- and it would name the next worker
+    # `prd-<n>` again, inside a process whose register is already repo-scoped.
+    _WORKER_TAG = (repo_tag(REPO) + "-") if REPO else ""
 
 
 def clear_repo_target() -> None:

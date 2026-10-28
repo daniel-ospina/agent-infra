@@ -132,6 +132,15 @@ def _clean_env(monkeypatch, tmp_path_factory):
     # an earlier test's env would become this one's inheritance (measured: the ambient-GH_REPO test
     # went red for exactly that reason).
     monkeypatch.setattr(pr, "_INHERITED_GH_REPO", None, raising=False)
+    # ⛔ AND THE REPO-RESOLUTION GLOBALS (#2725). A test that drives a whole pass calls `main()`,
+    # which calls `apply_repo()` -- so it leaves `REPO`, its CHECKOUT, the worktree root and the
+    # worker tag pointed at the repo IT graded. That was invisible while the worker tag was empty
+    # outside `--all-repos` mode; now that every mode tags the worker, the leak renames the NEXT
+    # test's worker (`prd-daniel-ospina-agent-infra-9` in a test that never resolved a repo) and
+    # fails it for a reason it does not test. The empty values are what a fresh process has.
+    for _name, _val in (("REPO", ""), ("REPO_DIR", ""), ("REPO_DIR_ERROR", ""),
+                        ("WORKTREE_ROOT", ""), ("_WORKER_TAG", "")):
+        monkeypatch.setattr(pr, _name, _val, raising=False)
     # ⛔ AND THE TRANSPORT'S CAPABILITY IS NOT THE BOX'S (agent-infra#2409). `main()` refuses a pass when
     # the DEPLOYED `$O/nonblocking-dispatch.sh` predates the `[bg|prfix]` argument, because such a copy
     # would silently spawn every repair as `KIND=bg` and the creation gate would hold them. That is the
@@ -1548,6 +1557,7 @@ def test_a_worktree_root_the_job_does_not_own_is_refused_before_any_git_call(
     directory in the owner's own project) would create and dispatch `prd-<n>` inside work that is
     not ours. It must refuse BEFORE any git operation, not fail halfway through.
     """
+    monkeypatch.setattr(pr, "REPO_DIR", str(tmp_path))     # a checkout exists; the ROOT is what refuses
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "Personal website"))
 
@@ -1766,7 +1776,9 @@ def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, t
     monkeypatch.setenv("MAX_REVIEW", "12")
     assert pr.main() == 0
     row = saved.get("5") or {}
-    assert row.get("head") == "a" * 40 and row.get("worker") == "prd-5", \
+    # ⛔ THE NAME CARRIES THE REPO (#2725): `$O/bg` is box-global, so `prd-5` here was also the
+    # tortoise doctor's PR #5. The row records the SCOPED name it actually spawned.
+    assert row.get("head") == "a" * 40 and row.get("worker") == "prd-daniel-ospina-agent-infra-5", \
         "a launched worker must consume a state row / cooldown: %r" % (saved,)
     assert row.get("kind") == "spawn", "a launched worker's row must be a spawn row"
 
@@ -5411,17 +5423,153 @@ def test_the_classifier_follows_the_doctor_to_the_same_repo(monkeypatch, tmp_pat
 
 
 def test_multi_repo_worker_names_cannot_collide(monkeypatch, tmp_path):
-    """Two repos can both have a PR #42; the worker name keys `$O/bg/<name>.*` on this machine."""
+    """Two repos can both have a PR #42; the worker name keys `$O/bg/<name>.*` on this machine.
+
+    ⛔ THE TAG IS NOT A MULTI-REPO FEATURE (#2725). It was assigned only in `--all-repos` mode, so
+    the ONE-DOCTOR-PER-REPO deployment -- one process per repo, which is what the box runs -- named
+    its worker `prd-42` and shared the `.rc`, `.pid`, the log, the brief AND the liveness answer
+    with the other repo's PR #42. Every mode tags now, from the register's own `repo_tag()`.
+    """
     try:
         pr.apply_repo(_REPO_A, "")
-        assert pr.worker_name(42) == "prd-42", "a single-repo pass keeps the historical name"
+        single = pr.worker_name(42)
+        assert single == "prd-daniel-ospina-agent-infra-42", \
+            "a single-repo pass names its worker by REPO, not by PR number"
         pr.apply_repo(_REPO_A, "", multi=True)
-        assert pr.worker_name(42) == "prd-daniel-ospina-agent-infra-42"
+        assert pr.worker_name(42) == single, \
+            "the mode is not part of the identity: one repo, one worker name"
         pr.apply_repo(_REPO_B, "", multi=True)
-        assert pr.worker_name(42) != "prd-daniel-ospina-agent-infra-42"
+        other = pr.worker_name(42)
+        assert other != single and other == "prd-daniel-ospina-tortoise-42"
+        pr.apply_repo(_REPO_B, "")
+        assert pr.worker_name(42) == other, "a single-repo pass over B is B, not A"
+        # ⛔ AND RESTORING THE MODULE STATE RE-DERIVES THE TAG FROM `REPO`, exactly as it re-derives
+        # the register: `canonical_paths()` blanking it would leave this process naming its next
+        # worker `prd-<n>` again, one line after it re-scoped the register to the repo.
+        pr.canonical_paths()
+        assert pr.worker_name(42) == other, "canonical_paths() is a second authority on the name"
     finally:
         pr.canonical_paths()
         pr._WORKER_TAG = ""
+
+
+def test_two_repos_PRN_share_no_worker_artifact(tmp_path, monkeypatch):
+    """⛔ THE MEASURED DEFECT (#2725): one identity, five files, two repos.
+
+    Reproduced against the real module before the change — both doctors named the worker `prd-42`,
+    so `$O/bg/prd-42.{rc,pid,log,started}` and `$STATE_DIR/pr-doctor-brief-prd-42.txt` were ONE set
+    of files for two different PRs. The `.rc` read is the dangerous one: `_confirm()` reads it to
+    decide whether a spawn was launched, so repo A's gate refusal became repo B's verdict.
+    """
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(tmp_path / "nonblocking-dispatch.sh"))
+    paths = {}
+    for slug in (_REPO_A, _REPO_B):
+        pr.apply_repo(slug, "")
+        name = pr.worker_name(42)
+        paths[slug] = {"name": name, "rc": pr.bg_path(name, "rc"),
+                       "pid": pr.bg_path(name, "pid"), "log": pr.bg_path(name, "log"),
+                       "brief": os.path.join(pr.STATE_DIR, "pr-doctor-brief-%s.txt" % name)}
+    a, b = paths[_REPO_A], paths[_REPO_B]
+    assert a["name"] != b["name"], "two repos' PR #42 are the SAME worker: %r" % (a["name"],)
+    shared = [k for k in a if a[k] == b[k]]
+    assert not shared, "worker artifacts shared between repos: %r" % (shared,)
+
+    # And the CONSEQUENCE: repo A's gate refusal must not answer for repo B's spawn.
+    os.makedirs(os.path.dirname(a["rc"]), exist_ok=True)
+    with open(a["rc"], "w") as fh:
+        fh.write("75\n")                       # load-gate refusal, written by repo A's worker
+    with open(a["log"], "w") as fh:
+        fh.write("[load-gate] REFUSED: load1 96 > ceiling 80\n")
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")   # B's own worker vanished
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
+    verdict, detail = pr._confirm(b["name"])
+    assert verdict != "refused", "repo B read repo A's 75 as its own verdict: %r" % (detail,)
+    pr.canonical_paths()
+
+
+def test_a_pre_2725_worker_ON_THIS_CHECKOUT_still_blocks_a_spawn(tmp_path, monkeypatch):
+    """⛔ BACK-COMPAT, AND IT IS THE UNSAFE DIRECTION (#2725).
+
+    A worker started before the rename lives under `$O/bg/prd-<n>`, and `worker_live_for()` must
+    still find it: reporting a running worker as ABSENT adopts its worktree and starts a second
+    agent in it (`rm -f "$RC"`, `: > "$LOG"` — the live worker's evidence is gone). So the
+    unqualified name is probed whenever the dispatcher's own `.started` record attributes it to THIS
+    checkout — including when there is no record to read at all.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_A, str(tmp_path / "repo"))
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+
+    # (a) its record names THIS checkout's worktree -> it is ours, ask it
+    with open(pr.bg_path("prd-42", "started"), "w") as fh:
+        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n"
+                 % os.path.join(pr.WORKTREE_ROOT, "prd-42"))
+    assert pr.worker_live_for(42) is True, asked
+    assert "prd-42" in asked, asked
+
+    # (b) no record at all (pruned, or a superseded order) -> unattributable, so still ask it
+    os.unlink(pr.bg_path("prd-42", "started"))
+    asked.clear()
+    assert pr.worker_live_for(42) is True, asked
+    assert "prd-42" in asked, asked
+    pr.canonical_paths()
+
+
+def test_a_pre_2725_worker_from_ANOTHER_checkout_is_NOT_this_PRs_holder(tmp_path, monkeypatch):
+    """⛔ THE OTHER HALF (#2725): the old name is box-global, so probing it unconditionally RE-CREATES
+    the collision on the read side — repo A's pre-rename worker would hold repo B's PR #n as "still
+    running" for as long as its artifacts live. The dispatcher's own `.started` record settles it:
+    a worktree outside this checkout is somebody else's worker.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    (tmp_path / "bg").mkdir()
+    pr.apply_repo(_REPO_B, str(tmp_path / "tortoise"))
+    asked = []
+    monkeypatch.setattr(pr, "worker_live", lambda n: asked.append(n) or (n == "prd-42"))
+    with open(pr.bg_path("prd-42", "started"), "w") as fh:
+        fh.write("name=prd-42\nworktree=%s\nkind=prfix\n"
+                 % os.path.join(str(tmp_path), "agent-infra", ".worktrees", "prd-42"))
+    assert pr.worker_live_for(42) is False, asked
+    assert "prd-42" not in asked, asked
+    assert "prd-daniel-ospina-tortoise-42" in asked, asked
+    pr.canonical_paths()
+
+
+def test_a_row_written_before_the_rename_still_holds_and_frees_its_slot(tmp_path, monkeypatch):
+    """⛔ IN-FLIGHT ROWS SURVIVE THE RENAME (#2725), both directions.
+
+    A pending row names the worker it spawned. Rows written before the change say `prd-5` and their
+    pid file is spelled that way too, so the EXACT name still matches and nothing is lost. Rows
+    written after say `prd-daniel-ospina-agent-infra-5`. Neither type may be forgotten: a live
+    worker counted as dead is a second agent on the same PR, and a dead one counted as live is a
+    slot held for ever.
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    cap = {"max_fix": 1, "max_review": 1}
+    dead = _a_dead_pid()
+
+    # (a) a pre-rename row, its pid file live -> the slot is HELD
+    (bg / "prd-5.pid").write_text("%d\n" % os.getpid())
+    st = {"5": {"action": "fix-ci", "worker": "prd-5", "at_epoch": now}}
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0
+
+    # (b) the same row, its worker provably gone -> the slot is FREED (no ghost)
+    (bg / "prd-5.pid").write_text("%d\n" % dead)
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 1
+
+    # (c) a post-rename row is charged the same way, by its own exact name
+    st = {"5": {"action": "fix-ci", "worker": "prd-daniel-ospina-agent-infra-5",
+                "at_epoch": now}}
+    (bg / "prd-daniel-ospina-agent-infra-5.pid").write_text("%d\n" % os.getpid())
+    assert pr.pass_budgets(st, cap, now_epoch=now)["fix"] == 0
 
 
 def test_a_pass_with_no_checkout_grades_the_queue_and_says_it_cannot_spawn(monkeypatch, tmp_path):
