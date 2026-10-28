@@ -40,6 +40,9 @@ bash -n "$0" || { echo "FATAL: the suite itself does not parse (see above)" >&2;
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WTL="$HERE/wt-lifecycle.sh"
 LANE="$HERE/lane.sh"
+# The GitHub slug `mk_lane_box` points the fixture's origin at, and — because lane.sh asserts the
+# checkout's own origin against its target (#2724/#2694) — the ONLY target L6/L7 may pass it.
+LANE_OR="daniel-ospina/agent-infra"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
@@ -128,7 +131,14 @@ SH
     # touches the network (wt_reap_if_empty reads the LOCAL `refs/remotes/origin/<br>`, never
     # ls-remote), so repointing origin here cannot make the arms reach out. Every other arm keeps
     # mk_repo's local bare origin, because THOSE do push and fetch.
-    "$REAL_GIT" -C "$repo" remote set-url origin https://github.com/daniel-ospina/agent-infra.git
+    #
+    # ⛔ AND THE LANE MUST BE TOLD THE **SAME** SLUG. `lane.sh` now asserts the checkout's own origin
+    # against the target before it starts anything (#2724/#2694), so invoking it with a made-up
+    # `owner/repo` while this box's origin is `$LANE_OR` makes it refuse with `repo-target REFUSED`
+    # (exit 72) — and the trap then reaps the empty checkout, which L6's assertions would read as "the
+    # trap worked" and L7's as "the lane produced nothing". Measured 2026-10-28: 4 arms red for a
+    # reason none of them tests. One constant, used by both.
+    "$REAL_GIT" -C "$repo" remote set-url origin "https://github.com/$LANE_OR.git"
 }
 
 # mk_failing_git <dir> <repo> <branch> — a `git` that performs the real `worktree add`, then makes
@@ -476,8 +486,12 @@ in_wt "wt_provision '$REPO' .worktrees/tm-15 feat/15-tm origin/main" "$REPO" >/d
 OUT="$( cd "$REPO/.worktrees/tm-15" && \
         O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
         REAP_LANE_VENV_DISABLE=1 AGENT_INFRA_PATH="$T/.." \
-        bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" "$@"' "$LANE" 15 feat/15-tm owner/repo 2>&1 )"
+        bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" "$@"' "$LANE" 15 feat/15-tm "$LANE_OR" 2>&1 )"
 assert_contains "$(cat "$T/$ENV/o/logs/lane-15.log" 2>/dev/null)" "exited" "L6 the shipped lane.sh ran to its exit path"
+# The repo-identity gate must not be what refused: with the target naming this box's origin it must
+# PASS, otherwise "the trap reaped an empty checkout" is a statement about a lane that never started.
+assert_not_contains "$(cat "$T/$ENV/o/logs/lane-15.log" 2>/dev/null)" "repo-target REFUSED" \
+    "L6 the repo-identity gate PASSED (the fixture's origin and the target are one repo)"
 # ⛔ THE AGENT MUST HAVE ACTUALLY RUN. Without this the arm cannot tell "the trap reaped a 0-commit
 # lane" from "the lane refused to start and the trap reaped what provisioning left" — and the second
 # is exactly what the #2409 creation gate produced once main merged in.
@@ -508,10 +522,16 @@ mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-16 feat/16-tm origin/main" "$REPO" >/dev/null
 ( cd "$REPO/.worktrees/tm-16" && O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
   REAP_LANE_VENV_DISABLE=1 \
-  bash -c '. "$1"; exec bash "$2" 16 feat/16-tm owner/repo' _ "$T/$ENV/o/stub-pi.sh" "$LANE" \
+  bash -c '. "$1"; exec bash "$2" 16 feat/16-tm "$3"' _ "$T/$ENV/o/stub-pi.sh" "$LANE" "$LANE_OR" \
   >/dev/null 2>&1 )
 assert_not_contains "$(cat "$T/$ENV/o/logs/lane-16.log" 2>/dev/null)" "land-backlog] REFUSED" \
     "L7 the lane REACHED its agent (the creation gate did not refuse the fixture)"
+# ⛔ AND THE IDENTITY GATE PASSED TOO — otherwise "the lane produced nothing" is a statement about a
+# lane that never started. ($LANE_OR is passed as `$3`, not spliced into the `bash -c` body: inside
+# that body it is an UNSET variable and the target arrived EMPTY — measured, and it made this arm read
+# as "the trap reaped a committing lane" when the lane had been refused at the identity gate.)
+assert_not_contains "$(cat "$T/$ENV/o/logs/lane-16.log" 2>/dev/null)" "repo-target REFUSED" \
+    "L7 the repo-identity gate PASSED (the fixture's origin and the target are one repo)"
 assert_dir "$REPO/.worktrees/tm-16" "L7 a lane that committed keeps its worktree"
 assert_branch "$REPO" feat/16-tm "L7 and its branch"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count "origin/main..feat/16-tm")" "1" \
