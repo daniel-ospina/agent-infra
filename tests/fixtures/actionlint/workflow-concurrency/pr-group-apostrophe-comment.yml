@@ -1,0 +1,14 @@
+# An apostrophe in a plain scalar is not a string, so the comment after it IS a comment. Treating the
+# line as quoted kept `# not ${{ github.sha }}` as part of the value and refused a correct workflow,
+# quoting the comment as if it were the group (#2660 round 9).
+name: PR group apostrophe comment
+on:
+  pull_request:
+concurrency:
+  group: pr-group-apostrophe-comment-don't-${{ github.ref }}   # not ${{ github.sha }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

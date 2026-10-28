@@ -118,7 +118,7 @@ ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 ACTION=--install
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 
 # help_text — print the header comments. The range is DERIVED from the `set -uo pipefail` line, never a
@@ -770,8 +770,8 @@ do_install() {
     render "$tpl" "$tmpd/$UNIT_NAME" || { rm -rf "$tmpd"; return 1; }
 
     if [ "${DRY_RUN:-0}" = 1 ]; then
-        say "dry-run: would install $UNIT_DIR/$UNIT_NAME (target=$TARGET) and enable it"
-        say "--- $UNIT_NAME ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME"
+        log_line "dry-run: would install $UNIT_DIR/$UNIT_NAME (target=$TARGET) and enable it"
+        log_line "--- $UNIT_NAME ---"; sed 's/^/  /' "$tmpd/$UNIT_NAME"
         rm -rf "$tmpd"; return 0
     fi
     verify_unit "$tmpd/$UNIT_NAME" || { rm -rf "$tmpd"; return 1; }
@@ -855,7 +855,7 @@ do_install() {
             _proc_began_after "$_pre_pid" "$_pre_hb"; _pre_rc=$?
             case "$_pre_rc" in
                 1) pre_active=1 ;;
-                2) say "warning: cannot date MainPID $_pre_pid - NOT treating $UNIT_NAME as pre-active; a heartbeat predating this start will not certify it" ;;
+                2) log_line "warning: cannot date MainPID $_pre_pid - NOT treating $UNIT_NAME as pre-active; a heartbeat predating this start will not certify it" ;;
                 *) : ;;
             esac
         fi
@@ -977,10 +977,10 @@ do_install() {
         fi
     fi
 
-    say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
-    say "  unit:    $UNIT_NAME (Restart=always, RestartSec=${RESTART_SEC}s, After=network-online.target,"
-    say "           WantedBy=$WANTED_BY,"
-    say "           StartLimitBurst=3/300s so a configuration fault converges to 'failed' instead of looping)"
+    log_line "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
+    log_line "  unit:    $UNIT_NAME (Restart=always, RestartSec=${RESTART_SEC}s, After=network-online.target,"
+    log_line "           WantedBy=$WANTED_BY,"
+    log_line "           StartLimitBurst=3/300s so a configuration fault converges to 'failed' instead of looping)"
     # ⛔ THE ORDERING DOES NOT BIND IN THE USER SCOPE, AND SAYING SO IS PART OF THE INSTALL (review P1,
     # #2402). `network-online.target` exists only in the SYSTEM manager (`/usr/lib/systemd/system`); a
     # per-user manager ships default/basic/graphical-session/timers and no network target, so systemd DROPS
@@ -990,22 +990,22 @@ do_install() {
     # re-arms a `failed` unit automatically. The bound is DISCLOSED here rather than hidden behind a dependency
     # that silently vanished, and the recovery is named. The SYSTEM scope has the ordering.
     if [ "$TARGET" = "user" ]; then
-        say "  ordering: ⚠️  After=/Wants=network-online.target does NOT bind in this (USER) scope — a per-user"
-        say "            manager ships no network-online.target, so systemd drops the dependency. A boot whose"
-        say "            network is not up yet can fill StartLimitBurst and converge to 'failed' with no unattended"
-        say "            recovery: re-arm with 'bash $0 --install' or 'ORCH_FOREGROUND=0 bash $SUPERVISOR start'."
-        say "            The SYSTEM scope has the ordering. (The pin matters: a lane shell inside a service-managed"
-        say "            controller's tree inherits ORCH_FOREGROUND=1, and an unpinned start would re-parent the"
-        say "            controller into that shell while the unit stays enabled.)"
+        log_line "  ordering: ⚠️  After=/Wants=network-online.target does NOT bind in this (USER) scope — a per-user"
+        log_line "            manager ships no network-online.target, so systemd drops the dependency. A boot whose"
+        log_line "            network is not up yet can fill StartLimitBurst and converge to 'failed' with no unattended"
+        log_line "            recovery: re-arm with 'bash $0 --install' or 'ORCH_FOREGROUND=0 bash $SUPERVISOR start'."
+        log_line "            The SYSTEM scope has the ordering. (The pin matters: a lane shell inside a service-managed"
+        log_line "            controller's tree inherits ORCH_FOREGROUND=1, and an unpinned start would re-parent the"
+        log_line "            controller into that shell while the unit stays enabled.)"
     fi
-    say "  exec:    /bin/bash $SUPERVISOR start   (ORCH_FOREGROUND=1 — the controller is the unit's main process)"
-    say "  state:   $O   (env: $ENV_FILE)"
-    say "  controller pid: $pid"
+    log_line "  exec:    /bin/bash $SUPERVISOR start   (ORCH_FOREGROUND=1 — the controller is the unit's main process)"
+    log_line "  state:   $O   (env: $ENV_FILE)"
+    log_line "  controller pid: $pid"
     local age
     # ⛔ NAME THE DIR THAT WAS READ (review P2, #2402): with a `keys.env` `O=` line the controller writes to
     # the RESOLVED dir, and a report that points at $O sends the operator to a file nothing writes.
-    if age="$(heartbeat_age "${proof_o:-$O}")"; then say "  heartbeat: ${age}s ago"; else say "  heartbeat: not yet (the loop writes ${proof_o:-$O}/heartbeat after its first cycle)"; fi
-    say "  stop it: bash $SUPERVISOR stop   |   supervise state: bash $0 --status"
+    if age="$(heartbeat_age "${proof_o:-$O}")"; then log_line "  heartbeat: ${age}s ago"; else log_line "  heartbeat: not yet (the loop writes ${proof_o:-$O}/heartbeat after its first cycle)"; fi
+    log_line "  stop it: bash $SUPERVISOR stop   |   supervise state: bash $0 --status"
     return 0
 }
 
@@ -1025,14 +1025,14 @@ do_status() {
             choose_target || { err "no service manager available — nothing is supervising the controller"; return 1; }
         fi
     fi
-    say "unit=$UNIT_NAME target=$TARGET"
+    log_line "unit=$UNIT_NAME target=$TARGET"
     # ⛔ NAME A COPY THAT IS NOT THIS STATE DIR'S, INSTEAD OF ANSWERING FOR IT (review P1, #2402). Silence
     # here is what made this verb's rc 0 readable as "my cell is supervised" on a box whose only unit belongs
     # to another state dir. It is reported on its own line and never addressed: the manager answers about the
     # unit NAME, which is machine-scoped.
     while IFS= read -r _f; do
         [ -n "$_f" ] || continue
-        say "other_unit=$_f (supervises $(unit_owner_dir "$_f") — NOT this state dir's; NOT read, NOT addressed)"
+        log_line "other_unit=$_f (supervises $(unit_owner_dir "$_f") — NOT this state dir's; NOT read, NOT addressed)"
     done < <(foreign_units)
     # ⛔ AND DO NOT ASK THE MANAGER ABOUT A NAME THAT IS PROVABLY SOMEONE ELSE'S (review P1, #2402). The
     # `is-enabled`/`is-active`/`show -p MainPID` reads below are answered by the unit NAME, so on the
@@ -1058,17 +1058,17 @@ do_status() {
         1) active="not-active" ;;
         *) active="UNREADABLE" ;;
     esac
-    say "enabled=$enabled"
-    say "active=$active"
+    log_line "enabled=$enabled"
+    log_line "active=$active"
     if pid="$(unit_main_pid 2>/dev/null)"; then
-        say "main_pid=$pid"
+        log_line "main_pid=$pid"
         # ⛔ MainPID 0 IS NOT A CONTROLLER (review P1, #2402; do_install already refuses it). `is-active`
         # reports `activating` during a RestartSec wait and this installer maps that to "active", so a
         # readable-but-old heartbeat let `--status` return 0 for a unit with no controller process — while
         # the doc promises it requires BOTH an active/enabled unit AND a controller MainPID. A heartbeat is
         # evidence the loop TICKED once; it is not evidence one is running now.
         [ "${pid:-0}" != "0" ] || { err "the unit is active with MainPID 0 — no controller process (the RestartSec/activating state, or a start that died): journalctl -u $UNIT_NAME -n 40"; rc=1; }
-    else say "main_pid=UNREADABLE"; rc=1; fi
+    else log_line "main_pid=UNREADABLE"; rc=1; fi
     # ⛔ MainPID IS THE UNIT'S MAIN PROCESS, NOT NECESSARILY THE CONTROLLER (review P2, #2402). Under
     # Type=simple the main process is the launcher (`… start`), which spends harness_apply/cmd_check — and
     # up to CONTROLLER_HANDOVER_TIMEOUT — before it `exec`s the loop, so a live MainPID alone can be a
@@ -1083,15 +1083,15 @@ do_status() {
     local _st_o=""
     _st_o="$(unit_owner_dir "$UNIT_DIR/$UNIT_NAME" 2>/dev/null || true)"
     if controller_proof 0 "$_st_o"; then
-        say "controller=proved (an owned lock holder, or a heartbeat newer than 2*CYC)"
+        log_line "controller=proved (an owned lock holder, or a heartbeat newer than 2*CYC)"
     else
-        say "controller=none-proved yet (no owned lock holder and no plausible heartbeat — expected during the first CYC after a start; the heartbeat bound above is what refuses a dead one)"
+        log_line "controller=none-proved yet (no owned lock holder and no plausible heartbeat — expected during the first CYC after a start; the heartbeat bound above is what refuses a dead one)"
     fi
     # NRestarts is the direct evidence for the issue's bullet 3/5 ("it comes back on its own"): a unit
     # that has restarted had a controller that died and was brought back without a human.
-    local nr; nr="$(sc_run show -p NRestarts "$UNIT_NAME" 2>/dev/null)"; case "$nr" in NRestarts=*) say "restarts=${nr#NRestarts=}" ;; *) say "restarts=unreadable" ;; esac
+    local nr; nr="$(sc_run show -p NRestarts "$UNIT_NAME" 2>/dev/null)"; case "$nr" in NRestarts=*) log_line "restarts=${nr#NRestarts=}" ;; *) log_line "restarts=unreadable" ;; esac
     if age="$(heartbeat_age "${_st_o:-$O}")"; then
-        say "heartbeat_age_s=$age"
+        log_line "heartbeat_age_s=$age"
         # Two cycles + 300s is the same staleness bound install.sh uses for launchd: a quiet cell is not a
         # wedged one, and a wedged one must not read as fresh.
         # ⛔ AND NEVER TIGHTER THAN THE DOCTOR'S DEFAULT (review P2, #2402): `cloud-cell-doctor.sh` bounds
@@ -1115,7 +1115,7 @@ do_status() {
         # the controller's can legitimately differ — and the first cycle writes the file minutes later
         # (CYC). Failing the verb over that was a false red on a healthy service-managed cell. The unit's
         # own MainPID is the proof that a controller is running; the heartbeat is a fresher fact, not a gate.
-        say "heartbeat_age_s=UNREADABLE (no READABLE $O/heartbeat — path read: \$O=$O, unit dir=${_st_o:-<same>}; the file can be absent, or present with a value that is not a plausible instant (too small to be an epoch second, future-dated beyond 60s of skew, or over-long), and a keys.env 'O=' line moves the controller's state dir; the first cycle writes the file after one CYC)"
+        log_line "heartbeat_age_s=UNREADABLE (no READABLE $O/heartbeat — path read: \$O=$O, unit dir=${_st_o:-<same>}; the file can be absent, or present with a value that is not a plausible instant (too small to be an epoch second, future-dated beyond 60s of skew, or over-long), and a keys.env 'O=' line moves the controller's state dir; the first cycle writes the file after one CYC)"
         if [ "${pid:-0}" = "0" ]; then
             err "no heartbeat AND no MainPID — nothing is running under the unit: journalctl -u $UNIT_NAME -n 40"
             rc=1
@@ -1142,9 +1142,19 @@ do_status() {
 # (or a silent no-op on a unit that is not there) and then report on the wrong unit. Three callers share
 # this: --status, --uninstall, and the supervisor's own scope helper.
 scope_for_dir() { # <unit dir> -> sets TARGET and SC
+    # ⛔ THE SCOPE IS "IS THIS THE SYSTEM DIRECTORY", NOT "IS IT THE CALLER'S HOME" (review P1 round 19, #2402 / B+D).
+    # This compared the directory to `$HOME/.config/systemd/user` — the CALLER's home — while the find beside it
+    # was widened to the passwd home of the invoking uid and `SUDO_USER`'s passwd home. Every copy found
+    # through those candidates is by construction NOT `$HOME/.config/systemd/user`, so it was classified
+    # SYSTEM and handed to the system manager: a healthy enabled user unit answered `enabled=not-enabled
+    # active=not-active` and `--status` exited 1 over it (the false red the widening was meant to fix), a
+    # foreign same-named system unit was read and reported as OURS (false green), and `--uninstall` could
+    # `disable --now` another cell's supervisor after printing that it had left that unit untouched. This is
+    # the supervisor's own rule (`sup_systemctl`: anything that is not the system dir is user scope), and the
+    # two must agree — one definition of "which manager owns this file".
     case "$1" in
-        "$HOME/.config/systemd/user") TARGET="user";   SC="${SYSTEMCTL:-systemctl} --user" ;;
-        *)                            TARGET="system"
+        "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}"|"${SYSTEMD_UNIT_DIR:-}")
+                                      TARGET="system"
                                       # ⛔ THE SYSTEM SCOPE NEEDS THE PRIVILEGE THE INSTALL USED (review P2,
                                       # #2402). `choose_target` resolves it as `sudo -n systemctl`; deriving
                                       # a bare `systemctl` here meant `--uninstall` issued an UNPRIVILEGED
@@ -1155,6 +1165,7 @@ scope_for_dir() { # <unit dir> -> sets TARGET and SC
                                       if [ -n "${SYSTEMCTL:-}" ]; then SC="$SYSTEMCTL"
                                       elif [ -n "${SUDO+x}" ]; then SC="${SUDO:+$SUDO }systemctl"
                                       else SC="sudo -n systemctl"; fi ;;
+        *)                            TARGET="user";   SC="${SYSTEMCTL:-systemctl} --user" ;;
     esac
 }
 # ⛔ A UNIT FILE'S PRESENCE IS NOT AN OWNERSHIP CLAIM (review P1, #2402). The unit NAME is machine-scoped
@@ -1435,7 +1446,7 @@ do_uninstall() {
     p="$(find_installed_unit)" || p="${UNIT_DIR:+$UNIT_DIR/$UNIT_NAME}"
     while IFS= read -r _f; do
         [ -n "$_f" ] || continue
-        say "other_unit=$_f (supervises $(unit_owner_dir "$_f") — NOT this state dir's; left untouched)"
+        log_line "other_unit=$_f (supervises $(unit_owner_dir "$_f") — NOT this state dir's; left untouched)"
     done < <(foreign_units)
     # ⛔ THE FALLBACK PATH IS NOT A LICENCE TO ADDRESS SOMEONE ELSE'S UNIT (review P1, #2402). When no copy
     # of OURS is installed, `p` falls back to the path THIS box would choose — which on a two-state-dir box
@@ -1443,7 +1454,7 @@ do_uninstall() {
     # --now` and `rm -f` that copy: it stops another cell's controller and strips its Restart=always. There
     # is nothing of ours to uninstall here, so report that and change nothing.
     if [ -n "$p" ] && [ -f "$p" ] && ! unit_is_ours "$p"; then
-        say "not installed for $O: the unit at $p supervises $(unit_owner_dir "$p") — nothing to do"
+        log_line "not installed for $O: the unit at $p supervises $(unit_owner_dir "$p") — nothing to do"
         return 0
     fi
     if [ -z "$p" ]; then err "no unit scope resolved — nothing to uninstall"; return 1; fi
@@ -1459,7 +1470,7 @@ do_uninstall() {
             err "  re-run --uninstall so the installed copy decides the scope"
             return 1
         fi
-        say "not installed: $p"; return 0
+        log_line "not installed: $p"; return 0
     fi
     # ⛔ NOT SWALLOWED (review P2). A failed disable leaves the `…target.wants` symlink in place, so the
     # unit is still enabled after its file is gone — and removing the file does not stop a running
@@ -1481,7 +1492,23 @@ do_uninstall() {
         err "  that unit is still installed (and may still be enabled) — remove it too: re-run --uninstall"
         return 1
     fi
-    say "uninstalled $p — the controller is no longer supervised: start it by hand with 'bash $SUPERVISOR start', and note that a tmux controller is NOT restarted by anything (#2402)"
+    # ⛔ THE REMEDY MUST BE RUNNABLE (review P2 round 19, #2402 / C). `$SUPERVISOR` is resolved only on the
+    # INSTALL path (`resolve_supervisor` was called by `do_install` alone), so this printed
+    # `start it by hand with 'bash  start'` — the one instruction an operator is left with after removing the
+    # supervisor, and it cannot be followed. Resolve it here too, and fall back to the shipped script's own
+    # path so the sentence is never empty.
+    local _sup="${SUPERVISOR:-}"
+    if [ -z "$_sup" ]; then
+        # `resolve_supervisor` ERRS when it finds nothing, which would abort the message; the uninstall has
+        # already succeeded at this point, so take its candidates without the hard failure.
+        for _sup in "${ORCH_SUPERVISOR:-}" \
+                    "$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh" \
+                    "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"; do
+            [ -n "$_sup" ] && [ -f "$_sup" ] && break || _sup=""
+        done
+        [ -n "$_sup" ] || _sup="cloud-cell-supervisor.sh (farm it: bash pi-bootstrap/setup.sh)"
+    fi
+    log_line "uninstalled $p — the controller is no longer supervised: start it by hand with 'bash $_sup start', and note that a tmux controller is NOT restarted by anything (#2402)"
     return 0
 }
 
