@@ -28,7 +28,7 @@
  * and git on PATH. No npm ci.
  */
 import { ok, equal } from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -98,7 +98,15 @@ const FIXTURE = (() => {
   // `scratch` + a branch carrying the issue: the TAG can only come from the BRANCH.
   const wtBranchNamed = join(hub, ".worktrees", "scratch");
   git(["worktree", "add", "-q", "-b", "fix/20248-bump", wtBranchNamed], hub);
-  return { base, hub, wtDirNamed, wtBranchNamed };
+  // A checkout whose git dir is NOT `<top>/.git`: `--separate-git-dir` gives
+  // `git-dir == git-common-dir` (so it is NOT a linked worktree, and it is NOT a
+  // lane) while its top level resolves. Used by A5b: the guarded verdict must not
+  // claim "the HUB" for a shape that is not the hub (review cycle 3, F1).
+  const sepTop = join(base, "sep");
+  const sepGit = join(base, "sep.git");
+  mkdirSync(sepTop, { recursive: true });
+  git(["init", "-q", "--separate-git-dir", sepGit, "-b", "main"], sepTop);
+  return { base, hub, wtDirNamed, wtBranchNamed, sepTop, sepGit, wtGitDir: join(hub, ".git", "worktrees", "w-10137") };
 })();
 
 const PRINT_ENV = { PI_MODE: "print" } as Record<string, string | undefined>;
@@ -191,6 +199,44 @@ async function main() {
     const c = deriveLaneContract({ env: INTERACTIVE_ENV, argv: BARE_ARGV, cwd: FIXTURE.wtDirNamed });
     equal(c.headless, false, "headless: expected false for an interactive argv with no PI_MODE");
     equal(c.lane, false, "lane: an interactive session in a worktree is not a lane");
+    // Review cycle 3, F3: the fields are UNMEASURED for an interactive session (no
+    // git is spawned — that is the documented cost decision). Pin that, so a
+    // consumer (#2966) cannot read `linkedWorktree: false` as "not a worktree".
+    equal(
+      c.linkedWorktree,
+      false,
+      "linkedWorktree: an interactive session reports false — UNMEASURED, because no probe runs; consumers must gate on headless/lane, never on this field alone",
+    );
+    equal(c.topLevel, null, "topLevel: an interactive session is unmeasured, so this is null — not `no top level exists`");
+    equal(c.gitDir, null, "gitDir: an interactive session is unmeasured, so this is null");
+  });
+
+  await test("A5b — a checkout whose git dir is NOT <top>/.git is guarded, and the verdict does NOT claim it is the HUB", () => {
+    const c = deriveLaneContract({ env: PRINT_ENV, argv: BARE_ARGV, cwd: FIXTURE.sepTop });
+    equal(c.lane, false, `lane: expected false for a --separate-git-dir checkout (git-dir ${c.gitDir} == common-dir ${c.commonDir}), got true`);
+    ok(c.topLevel, `topLevel: expected the checkout to resolve, got ${c.topLevel} — this arm must not be the "no checkout" one`);
+    equal(
+      /HUB/.test(c.why),
+      false,
+      `why: must not name ${FIXTURE.sepTop} as the HUB — HUB is reserved for a MAIN checkout, where the git dir IS <top>/.git (review cycle 3, F1). Got ${JSON.stringify(c.why)}`,
+    );
+    ok(/non-worktree checkout/.test(c.why), `why: the guarded verdict must name the shape it measured, got ${JSON.stringify(c.why)}`);
+  });
+
+  await test("A5c — a cwd inside a linked worktree's GIT DIR derives the lane, and its `why` prints no literal `null`", () => {
+    const c = deriveLaneContract({ env: PRINT_ENV, argv: BARE_ARGV, cwd: FIXTURE.wtGitDir });
+    // The structural test is git-dir ≠ common-dir; both halves resolve here, so the
+    // arm is the lane one and the process can act on that worktree's branch. Only
+    // `--show-toplevel` is unavailable (there is no working tree), and it is
+    // NAMING-ONLY — never part of the predicate (review cycle 3, F2).
+    equal(c.lane, true, `lane: expected true inside a linked worktree's git dir (git-dir ${c.gitDir} ≠ common-dir ${c.commonDir}), got false — ${c.why}`);
+    equal(c.topLevel, null, "topLevel: git reports no working tree from a git dir, so this is null");
+    equal(
+      /\bnull\b/.test(c.why),
+      false,
+      `why: the operator-facing line must not interpolate a null top level, got ${JSON.stringify(c.why)}`,
+    );
+    ok(/no working tree to name/.test(c.why), `why: it must say WHY there is no path, got ${JSON.stringify(c.why)}`);
   });
 
   await test("A4 — a bare `pi -p` (no PI_MODE) is headless via argv, which is the shape that failed", () => {
@@ -330,6 +376,94 @@ async function main() {
       if (saved.PI_MODE === undefined) delete process.env.PI_MODE;
       else process.env.PI_MODE = saved.PI_MODE;
     }
+  });
+
+  await test("A12 — the derived-lane announcement is ONE line per process: the LOAD site, and never also `session_start`", () => {
+    // ⛔ Why this has to be a CHILD PROCESS (review cycle 3, F4): the announcement
+    // state (`DERIVED_ANNOUNCED_AT_LOAD`) is module-level in skill-enforcer, and this
+    // suite imports that module at startup — so in-process the load site has already
+    // run, with the RUNNER's cwd and env, not the fixture's. Only a child, started in
+    // a linked worktree, exercises both sites as one process's log.
+    //
+    // The defect this pins is the round-2 one: both sites interpolated the same `why`,
+    // so a raw `pi -p` in a linked worktree printed the identical sentence twice (#172
+    // is the class). The assertions below discriminate in BOTH failure directions — a
+    // flag that is never set leaves 2 lines (assert 2), a flag that is INVERTED leaves
+    // 1 line but the wrong SITE (asserts 3 and 4). Both were measured RED against a
+    // mutated `skill-enforcer.ts` before this pin was committed: dropping
+    // `DERIVED_ANNOUNCED_AT_LOAD = true` → `A12 ❌` (2 lines); flipping the
+    // `session_start` condition to `else if (DERIVED_ANNOUNCED_AT_LOAD)` → `A12 ❌`
+    // (one line, wrong site). A pin that cannot fail is not a pin.
+    const dir = tmpDir("hl-announce-");
+    const driver = join(dir, "driver.mjs");
+    const reads = join(dir, "skill-reads.json");
+    const modUrl = pathToFileURL(join(HERE, "..", "skill-enforcer.ts")).href;
+    writeFileSync(
+      driver,
+      `
+const logs = [];
+const ol = console.log, oe = console.error;
+console.log = (...a) => logs.push("log: " + a.join(" "));
+console.error = (...a) => logs.push("err: " + a.join(" "));
+let loadError = null;
+(async () => {
+  try {
+    const ns = await import(${JSON.stringify(modUrl)});
+    const hook = typeof ns.default === "function" ? ns.default : ns.default && ns.default.default;
+    if (typeof ns._setSkillReadsFileForTest === "function") ns._setSkillReadsFileForTest(${JSON.stringify(reads)});
+    const handlers = {};
+    const pi = { on(n, fn) { (handlers[n] = handlers[n] || []).push(fn); } };
+    hook(pi);
+    for (const fn of handlers["session_start"] || []) await fn({}, {});
+  } catch (e) { loadError = String((e && e.stack) || e); }
+  console.log = ol; console.error = oe;
+  process.stdout.write(JSON.stringify({ loadError, logs }));
+})();
+`,
+    );
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of [
+      "SKILL_ENFORCER_DISABLED",
+      "LOOP_ENFORCER_DISABLED",
+      "AGENT_ALLOW_MAIN_EDITS",
+      "ELDATO_ALLOW_MAIN_EDITS",
+      "KIND",
+      "TAG",
+      "TASK_HEARTBEAT",
+      "AGENT_SKIP_REVIEW_GATE",
+      "PI_MODE",
+    ]) delete env[k];
+    // print mode carries it: the child's argv has no `-p`, so `PI_MODE` is the only
+    // channel — and every launcher affordance is gone, so the DERIVATION is the only
+    // thing that can lift the gates.
+    env.PI_MODE = "print";
+    const res = spawnSync("npx", ["tsx", driver], {
+      cwd: FIXTURE.wtDirNamed,
+      env,
+      encoding: "utf8",
+      timeout: 240000,
+    });
+    const stdout = res.stdout ?? "";
+    const start = stdout.indexOf("{");
+    ok(start >= 0, `the child printed no JSON report — status ${res.status}; stderr: ${(res.stderr ?? "").slice(0, 600)}`);
+    const report = JSON.parse(stdout.slice(start)) as { loadError: string | null; logs: string[] };
+    ok(!report.loadError, `the child failed to load skill-enforcer: ${report.loadError}`);
+    const logs = report.logs;
+    const why = logs.filter((l) => /headless in linked worktree/.test(l));
+    equal(
+      why.length,
+      1,
+      `the same derivation line must appear EXACTLY ONCE in one process's log (a flag that is never set prints it twice), got ${why.length}:\n     ${why.join("\n     ")}\n   full log:\n     ${logs.join("\n     ")}`,
+    );
+    ok(
+      /^err: .*Lane contract DERIVED/.test(why[0]),
+      `the ONE line must be the module-load site (\`Lane contract DERIVED\`, stderr) — an INVERTED flag leaves one line at the wrong site. Got ${JSON.stringify(why[0])}`,
+    );
+    equal(
+      logs.filter((l) => /Disabled — derived lane contract/.test(l)).length,
+      0,
+      `\`session_start\` must NOT repeat the derived \`why\` when the load site already announced it. Full log:\n     ${logs.join("\n     ")}`,
+    );
   });
 
   // ── B. the wiring: what the enforcer actually decides about `git commit` ──

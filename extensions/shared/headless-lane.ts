@@ -121,19 +121,27 @@ import { isPrintMode } from "./print-mode.js";
 export interface LaneContract {
   /** print mode (`-p`/`--print`, or `PI_MODE=print`) */
   headless: boolean;
-  /** cwd is a LINKED worktree (structural git test — never a path substring) */
+  /**
+   * cwd is a LINKED worktree (structural git test — never a path substring).
+   *
+   * ⛔ MEASURED ONLY FOR A HEADLESS PROCESS. `deriveLaneContract` spawns NO git for
+   * an interactive session (a hub session must not pay for this module), so it
+   * returns `false` there WITHOUT probing — `false` means **not established**, not
+   * "not a worktree". A consumer must gate on `headless`/`lane`; reading this field
+   * on its own is the trap #2966's consumer must not fall into (review cycle 3, F3).
+   */
   linkedWorktree: boolean;
   /** headless AND in a linked worktree — the predicate the gate bypasses use */
   lane: boolean;
   /** the process's own cwd, as it was measured */
   cwd: string;
-  /** `git rev-parse --show-toplevel`, or null */
+  /** `git rev-parse --show-toplevel`, or null (also null for an interactive session — unmeasured) */
   topLevel: string | null;
-  /** `git rev-parse --git-dir` (realpath'd), or null */
+  /** `git rev-parse --git-dir` (realpath'd), or null (also null for an interactive session — unmeasured) */
   gitDir: string | null;
-  /** `git rev-parse --git-common-dir` (realpath'd), or null */
+  /** `git rev-parse --git-common-dir` (realpath'd), or null (also null for an interactive session — unmeasured) */
   commonDir: string | null;
-  /** current branch, or null */
+  /** current branch, or null (also null for an interactive session — unmeasured) */
   branch: string | null;
   /** `KIND` as observed, or inferred ("lane") for a derived lane */
   kind: string | null;
@@ -256,6 +264,39 @@ function classifyCheckout(
 }
 
 /**
+ * Name the GUARDED arm by what was actually measured (review cycle 3, F1).
+ *
+ * ⛔ `HUB` is reserved for a MAIN checkout — the shape `A2` pins, where the git dir
+ * IS `<top>/.git`. A submodule, a `--separate-git-dir` checkout and a
+ * `core.worktree` checkout all fail the structural test too (their git dir lives
+ * elsewhere), and calling each of them "the HUB checkout" asserted a fact that is
+ * false. The VERDICT was always right; the operator-facing evidence was not — and
+ * "linked worktree vs hub" is the one distinction this whole module exists to
+ * make, so a line that misnames it is the misreport the file's own `A2` prose
+ * argues against.
+ */
+function guardedWhy(checkout: {
+  topLevel: string | null;
+  gitDir: string | null;
+  commonDir: string | null;
+}): string {
+  if (!checkout.topLevel) {
+    // A bare repo (or a `git rev-parse` run with no working tree): git resolved,
+    // there is simply no top level to name. Distinct from "not a git checkout".
+    return checkout.gitDir
+      ? `headless in a work-tree-less checkout ${checkout.gitDir} — there is no lane to derive (guarded)`
+      : `headless outside any git checkout — there is no lane to derive (guarded)`;
+  }
+  if (checkout.gitDir && checkout.gitDir === resolve(checkout.topLevel, ".git")) {
+    return `headless in the HUB checkout ${checkout.topLevel} — the hub stays guarded`;
+  }
+  return (
+    `headless in a non-worktree checkout ${checkout.topLevel} (its git dir ${checkout.gitDir} ` +
+    `is not <top>/.git, and it has no separate common dir) — there is no lane to derive (guarded)`
+  );
+}
+
+/**
  * A TAG from the worktree directory name — `w-10137`, `lane-10137`, `10137` —
  * which is how the fleet names them (`<repo>/.worktrees/w-<issue>`). Used only
  * to NAME the lane; it never decides whether this IS one.
@@ -331,11 +372,18 @@ export function deriveLaneContract(options: LaneContractOptions = {}): LaneContr
       branch,
       kind: env.KIND ?? null,
       tag: env.TAG ?? null,
-      why: checkout.topLevel
-        ? `headless in the HUB checkout ${checkout.topLevel} — the hub stays guarded`
-        : `headless outside any git checkout — there is no lane to derive (guarded)`,
+      why: guardedWhy(checkout),
     };
   }
+
+  // ⛔ `--show-toplevel` is NAMING-ONLY, never part of the structural test (the
+  // test is git-dir ≠ common-dir, and both halves resolved to reach this arm). A
+  // cwd INSIDE a linked worktree's git dir — `<hub>/.git/worktrees/<name>` — is a
+  // lane by that test and can act on the worktree's branch, but git reports no
+  // working tree, so there is no top level to name. Interpolating it raw printed
+  // the literal `null` into the one line an operator reads as evidence (review
+  // cycle 3, F2): the verdict was right, the line was not. Say where it is.
+  const where = checkout.topLevel ?? `${checkout.gitDir} (a linked worktree's git dir — no working tree to name)`;
 
   return {
     headless,
@@ -349,8 +397,8 @@ export function deriveLaneContract(options: LaneContractOptions = {}): LaneContr
     kind: env.KIND ?? (inferAudience ? "lane" : null),
     tag: env.TAG ?? (inferAudience ? inferredTag : null),
     why: supervised
-      ? `headless in linked worktree ${checkout.topLevel} (git-dir ${checkout.gitDir} ≠ common ${checkout.commonDir}) — lane; KIND/TAG NOT inferred (supervised child: its launcher owns the audience)`
-      : `headless in linked worktree ${checkout.topLevel} (git-dir ${checkout.gitDir} ≠ common ${checkout.commonDir})`,
+      ? `headless in linked worktree ${where} (git-dir ${checkout.gitDir} ≠ common ${checkout.commonDir}) — lane; KIND/TAG NOT inferred (supervised child: its launcher owns the audience)`
+      : `headless in linked worktree ${where} (git-dir ${checkout.gitDir} ≠ common ${checkout.commonDir})`,
   };
 }
 
