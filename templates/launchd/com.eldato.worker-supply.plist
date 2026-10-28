@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- worker-supply: KEEP THE REPAIR WORKER POOL SUPPLIED.
+
+         ⛔ WHY (measured 2026-10-27T03:30Z-03:45Z on this box). `pr-doctor` printed, three passes in
+         a row:
+
+             pass: 22 open PRs :: rerun-checks=6 resolve-conflict=10 skipped-running=6
+                   (capacity fix=16 review=12, inflight=0 (alive=0 unknown=0), budget fix=16 review=12 total=28)
+             REFUSING: 16 order(s) no worker accepted and nothing was dispatched — not a clean pass
+             EXIT rc=3
+
+         while the same daemon had logged `dispatched 3 of 4 queued — ok` five hours earlier. Capacity
+         configured, orders graded, workers ZERO, and nothing in the fleet refilled the pool: dispatch
+         was the only thing that had ever created a repair worker. A worker killed mid-order (a machine
+         sleep, a cap kill, an OOM) leaves its order recorded in $O/bg/<name>.started with no process
+         behind it, and that order then waits for the doctor's own cooldown — and for a later pass that
+         can still place work at all.
+
+         ⛔ IT IS NOT A SECOND DISPATCHER AND NOT A MERGE AUTHORITY. It never spawns `pi`: it re-offers
+         the DEAD order through the ONE dispatcher ($O/nonblocking-dispatch.sh) with the argv that
+         dispatcher itself recorded, so the load/disk/brief gates are the same gates. It never calls
+         `gh`, never calls admin-merge.sh, never records a review. It supplies workers; it never lands
+         a PR.
+
+         ⛔ AND A DOUBLE HYPHEN IS ILLEGAL INSIDE AN XML COMMENT, which is why every dash pair above is
+         an em dash: this file is read by python3 `plistlib` (install-launchd.sh's primary reader), and
+         one doubled hyphen in a comment makes the whole document a parse failure — measured on this
+         template: the ONLY plist in templates/launchd that plistlib refused, which silently demoted the
+         install-time `verify_targets()` check to the PlistBuddy fallback. Keep prose here em-dashed.
+
+         ⛔ THE TARGET IS THE CHECKOUT'S SCRIPT, NOT A FARMED COPY, so the `<string>` resolves on a
+         fresh box (install-launchd.sh hard-fails a job whose target does not resolve, and that check
+         must not be defeated). {{AGENT_INFRA_PATH}} is this repo's MAIN checkout, worktree-safe, so a
+         passing worktree's teardown cannot leave this job pointing at nothing — the same choice
+         com.eldato.controller-watchdog makes.
+
+         ⛔ THE BOUNDS ARE IN THE PLIST, NOT INHERITED. A launchd job gets neither the operator's shell
+         env nor its rc files, so an unset variable silently keeps the script's default — and for THIS
+         job the defaults are the contract:
+           WORKER_SUPPLY_INTERVAL_S=60  the refill interval. The pass is a handful of status probes
+                                        probes over $O/bg/*.started, so 60 s is a liveness choice.
+           WORKER_SUPPLY_PREFIX=prd-    the worker NAMESPACE this job supplies (the repair pool).
+           WORKER_SUPPLY_MAX_REFILLS=2  re-offers per ORDER; a worker that keeps dying is a DIAGNOSIS,
+                                        so after two the pass DEFERS and names it instead of spinning.
+         ⛔ MAX_FIX / MAX_REVIEW ARE DELIBERATELY NOT SET HERE: the machine's budget has ONE home (the
+         orchestrator's EnvironmentVariables, which pr-doctor.capacity() reads). A second copy in this
+         plist would drift, and the supervisor's `status` verb prints what it actually read.
+
+         KEEPALIVE rather than StartInterval: this is a long-lived loop that must come back from a
+         crash, a kill and an orderly exit. ThrottleInterval=15 keeps a crash loop to one start per
+         15 s instead of launchd's respawn storm.
+
+         NO StandardOutPath for the decision stream: the supervisor appends its own bounded log
+         (~/orchestrator/state/worker-supply.log, rotated) and its last-pass record
+         (~/orchestrator/state/worker-supply.state) — the surfaces `worker-supply.sh status`
+         reprints. Those paths are `$O/state`, with `O` defaulting to `$HOME/orchestrator`
+         (worker-supply.sh:110-111,129) and NOT overridden by this plist; a comment naming
+         ~/.pi/agent/state/ pointed an operator at a file that is never written, so an incident
+         looked like "the supervisor never ran" beside an equally empty launchd.err.
+         The stderr capture below exists ONLY for a death before the script can log anything (a bash
+         syntax error, a missing interpreter), which is the class that leaves no other trace.
+         Rendered by scripts/install-launchd.sh (#304) — placeholders only. -->
+    <key>Label</key>
+    <string>com.eldato.worker-supply</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{AGENT_INFRA_PATH}}/scripts/orchestrator-harness/worker-supply.sh</string>
+        <string>--loop</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>WORKER_SUPPLY_INTERVAL_S</key>
+        <string>60</string>
+        <key>WORKER_SUPPLY_PREFIX</key>
+        <string>prd-</string>
+        <key>WORKER_SUPPLY_MAX_REFILLS</key>
+        <string>2</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/.pi/agent/state/worker-supply.launchd.err</string>
+</dict>
+</plist>
