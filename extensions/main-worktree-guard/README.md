@@ -102,6 +102,17 @@ SHELL expands at runtime — `$`/backtick, glob (`*`, `?`, `[...]`), brace
 command word (`~/undo.sh`, `sub/undo.sh` is READ instead), inside an
 interpreter `-c` payload / `eval` payload / a nested script, or as a piped
 producer (`cat ./undo*.sh | bash`, `F=./undo.sh; cat $F | bash`; #1228),
+**except in a SANCTIONED script's own body** — `SANCTIONED_SCRIPT_RELPATHS`
+entries are exempted from the whole content walk, path-keyed for the guard's own
+module root (the #1129 anchor, unchanged) and digest-plus-closure-keyed inside
+any other framework checkout (#2332 arm 2). **This (#1228) arm is now
+digest-keyed on BOTH arms**, because it is raised while READING the file:
+`scripts/gh-shim/gh` carries
+`grep -qa '<marker>' <(head -c 8192 2>/dev/null < "$1")`, whose process
+substitution matches the expansion predicate, so path-spelled invocations of the
+shim were refused as an unreadable script (measured 2026-10-24). So arbitrary
+bytes at a sanctioned relpath no longer stand down the expansion refusal — the
+shipped bytes do — and the `#1228` arm still fires for every unaudited script,
 a command-position `$NAME` whose assignment in effect at that point is
 path-shaped but not statically readable (`S=$(pwd)/undo.sh; $S`, `+=` onto a base
 it cannot read), or whose parameter expansion uses a SUBSTRING operator
@@ -363,6 +374,21 @@ own location** (the closure is recomputed from the script text, so a new
 `$SELF_DIR/helper.sh` appears automatically); `test-sanctioned-identity.mjs`
 reds when the pin is stale, when a listed script is DELETED without re-cutting,
 and when the closure is incomplete — so none of those can reach main silently.
+
+**Freshness is a property of a COMMIT (#2818).** The pin and the sanctioned
+surface it pins are read from ONE tree: the working tree by default (a push to
+`main`, or a checkout of the change itself) or the commit named by
+`--ref <rev>`, which is what the PR job passes (the PR head). It must NOT be
+judged on GitHub's synthetic merge of head onto the base tip — a merge result
+takes each file from whichever side changed it, so a branch that re-cut its pin
+beside its OWN sanctioned-script edit ended up carrying that pin next to scripts
+an unrelated merge had changed on `main`. The verdict then tracked how far `main`
+had moved, and every merge re-opened the failure on every other open PR. The
+polarity is unchanged — untouched surface ⇒ pass however far the base moved;
+edited surface without a re-cut ⇒ fail; edited + re-cut ⇒ pass — and is pinned,
+together with the merged-tree inversion that proves the fix is load-bearing, by
+`test-sanctioned-pin-merge-base.mjs`.
+
 Every failure path (no pin, no framework root, unreadable file, hash mismatch,
 missing or changed delegate, empty closure) returns "not exempt" — the content
 walk then runs exactly as before, so the guard's fail-closed direction is
