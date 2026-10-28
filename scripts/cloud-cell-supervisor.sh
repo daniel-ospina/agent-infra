@@ -2265,6 +2265,31 @@ cmd_check() {
   # being discovered later as silence. The probe is refresh-candidates.sh's own read-only `--check`.
   [ -f "$HARNESS/refresh-candidates.sh" ] \
     || die "$HARNESS/refresh-candidates.sh missing — cannot judge whether this repo can be provisioned for dispatch"
+  # ── the LANE ROSTER, provisioned from THIS box's own population (agent-infra#1935) ────────
+  # The probe below answers "can this repo be pre-flighted?" and its holder surface is built FROM
+  # `$HOME/.pi/agent/state/lane-registry.tsv` — written only by the RETIRED cmux dispatcher, so a
+  # cell had none and EVERY candidate came back INCOMPLETE while the controller reported RUNNING
+  # (measured on cell 1, 2026-10-28). `check` is the last gate before a cell is started, so the
+  # roster is provisioned HERE, from the box's own lane population, and the arm it took is printed.
+  # ⛔ Idempotent and non-destructive: a hand-maintained roster is never replaced, and a second run
+  # on an unchanged box writes nothing (the provisioner's own rules, pinned in its suite).
+  # ⛔ A REFUSAL (rc 3) is REPORTED, not fatal: it means this box's population could not be
+  # MEASURED, which the harness's reduced-surface path (#2848) can still dispatch through. Failing
+  # the cell here would be a false block; writing an empty roster instead would be the fail-open
+  # that #8175 exists to prevent, and the provisioner refuses to do it.
+  if [ -f "$HARNESS/provision-lane-registry.py" ]; then
+    local rv rvrc
+    rv=""; rvrc=0
+    rv="$(HOME="$CELL_HOME" python3 "$HARNESS/provision-lane-registry.py" --apply 2>&1)" || rvrc=$?
+    printf '%s\n' "$rv" | sed 's/^/    /'
+    if [ "$rvrc" -eq 3 ]; then
+      log_line "warn: lane roster NOT provisioned — the population is unmeasurable on this box (see above); the pre-flight's holder surface will refuse candidates until it is (agent-infra#1935)"
+    else
+      log_line "ok: lane roster — provisioned from this box's own population (agent-infra#1935)"
+    fi
+  else
+    log_line "warn: $HARNESS/provision-lane-registry.py missing — the lane roster cannot be provisioned, so the pre-flight's holder surface will refuse every candidate (agent-infra#1935)"
+  fi
   local pv pvrc
   pv=""
   pvrc=0
