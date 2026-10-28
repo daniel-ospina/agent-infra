@@ -170,9 +170,25 @@ apply_gate_policy nonblocking-dispatch
 # and the ONE place that decides a role is valid is the helper's own `*)` arm below: it returns 2 for
 # an unknown role, and the `|| exit 78` refuses the dispatch. Fail-closed in one home, not two.
 NB_DELIVERY_ROLE="$WK"
-NB_DELIVERY_SH="$SELF/reviewer-preflight.sh"
-[ -f "$NB_DELIVERY_SH" ] || {
-  echo "nonblocking-dispatch.sh: reviewer-preflight.sh not found at $NB_DELIVERY_SH — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
+# ⛔ THE HELPER IS RESOLVED THE WAY THIS FILE ALREADY RESOLVES `brief-gate.sh` ABOVE — NEVER FROM `$SELF`
+# ALONE (review of #2981, P2). The `$O`-SKEW paragraph on the gate resolver is 30 lines up: "`$O` is
+# seeded file by file, so a NEW dispatcher can run against an OLD `$O/spawn-gate.sh`", and that is why
+# that resolver searches FOUR homes instead of pinning one. A `$SELF`-only pin here re-creates the
+# class one screen below the comment that documents it: on a half-seeded `$O` (new
+# `nonblocking-dispatch.sh`, helper not seeded beside it) EVERY dispatch on the box would exit 78 — a
+# fleet that cannot dispatch, caused by the rule whose whole purpose is that a lane delivers
+# something. Corpus precedent, same failure: `install.sh` on `brief-gate.sh` — "a $O copy that
+# predates it makes every one of those refuse (78 = cannot verify) — a whole fleet that cannot
+# dispatch". Nearest copy wins, so the executing script's own directory is still first, and STILL
+# fail-closed if no home has it.
+NB_DELIVERY_SH=""
+for _rp in "$SELF/reviewer-preflight.sh" "${HARNESS:-}/reviewer-preflight.sh" "$O/reviewer-preflight.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/reviewer-preflight.sh" \
+           "${HOME:-}/.pi/agent/scripts/orchestrator-harness/reviewer-preflight.sh"; do
+  [ -n "$_rp" ] && [ -f "$_rp" ] && { NB_DELIVERY_SH="$_rp"; break; }
+done
+[ -n "$NB_DELIVERY_SH" ] || {
+  echo "nonblocking-dispatch.sh: reviewer-preflight.sh not found (looked in $SELF, $O, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts/orchestrator-harness) — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
 NB_DELIVERY="$(bash "$NB_DELIVERY_SH" --delivery-brief "$NB_DELIVERY_ROLE")" || {
   echo "nonblocking-dispatch.sh: reviewer-preflight.sh --delivery-brief $NB_DELIVERY_ROLE failed — refusing to start a worker whose brief never tells it to commit as it goes (#2981)" >&2; exit 78; }
 NB_DELIVERY_HEADING="$(printf '%s\n' "$NB_DELIVERY" | head -1)"

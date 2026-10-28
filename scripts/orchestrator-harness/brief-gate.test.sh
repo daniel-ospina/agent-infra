@@ -310,6 +310,25 @@ ck $? "…and the notice lands BEFORE the true sentence, so the last word the wo
 # would be a false claim of its own (and it would break the byte-for-byte promise above).
 case "$(cat "$AUTH_PRFIX")" in *"SUPERSEDES ANY COPY ABOVE THIS LINE"*) rc=0;; *) rc=1;; esac
 [ "$rc" -ne 0 ]; ck $? "…and a brief that was ALREADY role-correct gets NO supersession notice (idempotent, no false claim)"
+# ── §D.3 #2981 — THE HELPER IS RESOLVED LIKE EVERYTHING ELSE IN THIS FILE, NOT FROM `$SELF` ALONE.
+# ⛔ THIS IS THE BOX-WIDE-STANDSTILL CLASS THE DISPATCHER ITSELF DOCUMENTS, ONE SCREEN ABOVE THE CODE
+# UNDER TEST: "`$O` is seeded file by file, so a NEW dispatcher can run against an OLD
+# `$O/spawn-gate.sh`" — and its brief-gate resolver searches FOUR homes for exactly that reason. A
+# `$SELF`-only pin on `reviewer-preflight.sh` turns a half-seeded `$O` into "every dispatch on this
+# box exits 78": the fleet stops dispatching, which is the outcome #2981 exists to prevent, caused by
+# the rule that prevents it (`install.sh` names the same failure for `brief-gate.sh`). The fixture is
+# the skew faithfully — every harness script seeded into one directory EXCEPT the helper, which is
+# reachable only through `$AGENT_INFRA_PATH` — so a pin that only looks beside itself goes red here.
+SKEW="$TMP/skew"; mkdir -p "$SKEW"
+cp "$HERE"/*.sh "$SKEW"/ 2>/dev/null; cp "$HERE"/*.py "$SKEW"/ 2>/dev/null
+rm -f "$SKEW/reviewer-preflight.sh"
+[ -f "$SKEW/nonblocking-dispatch.sh" ] && [ ! -f "$SKEW/reviewer-preflight.sh" ]; ck $? "fixture: a seeded harness dir WITHOUT reviewer-preflight.sh (the half-synced \$O shape)"
+SKEWBRIEF="$TMP/skew-brief.txt"; cp "$CANON" "$SKEWBRIEF"
+out="$( cd "$FIXREPO" && O="$TMP/bg-o" AGENT_INFRA_PATH="$ROOT" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+       bash "$SKEW/nonblocking-dispatch.sh" bgskew "$TMP/wt" "$SKEWBRIEF" 20 prfix 2>&1 )"; rc=$?
+[ "$rc" -eq 0 ]; ck $? "⛔ …and the skew copy still LAUNCHES: the helper is found through the fallback homes, not \$SELF alone (rc=$rc: $(printf '%s' "$out" | tail -1))"
+for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgskew.rc" ] && break; sleep 0.1; done
+grep -qF -- "$DELIVERY_HEAD" "$SKEWBRIEF"; ck $? "…and the worker's brief CARRIES the section, rendered by the helper it resolved (the fallback is not an empty pass)"
 
 # ── orch-send.sh + safe-send.sh: the pane-order paths. Stub `cmux` records every call, so "refused"
 # is again proven by absence.
