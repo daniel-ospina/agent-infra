@@ -447,7 +447,7 @@ channel is keyed `refs/boxes/<host>/<boxid>/…`, so three `cmux` boxes hold thr
 prunes only refs its local ledger proves it wrote plus STALE ones. `foreign=` reports a second writer under
 this box's key, and the reader marks such a record `collide=1`, which `cap_place` refuses on
 (`bound=identity_collision`) instead of picking the newest. Residual, stated: two boxes sharing key AND
-`ncpu` AND `boot` carry no distinguishing fact in the channel, so the reader keeps the newest of that key —
+`ncpu` AND a `boot` reading that is equal *or unreadable* carry no distinguishing fact in the channel, so the reader keeps the newest of that key —
 neither box destroys the other's record any more, and the identity sources are restricted to the
 measured-unique ones so that case is not reachable by the cloned-image path. Rollout: a box still on the
 old tree prunes host-wide with no authorship test and will delete upgraded peers' records — upgrade a
@@ -455,8 +455,9 @@ whole hostname group together.
 
 **state.** cell-4: `lpc=66` (0.66×) eligible, published every cycle; cell-3: publishing (inferred);
 Mac: published at **14:36:29Z**, `ncpu=8 load1=514 lanes=0 disk_free=39881MB mem_free=997MB` (6-slot
-legacy form, no `boxid` ⇒ `box_unknown` ⇒ **ineligible** to a peer on current code; identity is checked
-before fork, so the identity bound is the one that names it).
+legacy form, no `boxid` ⇒ **ineligible** to a peer on current code: it is now ~34 h old so the bound that
+names it is `probe_stale` — age is checked before identity — and once a fresh record carries no `boxid` the
+bound is `box_unknown`, which is the one that survives self-healing).
 
 ### 3.11 Claims — `claims.sh` (+ `claim-reaper.sh`)
 

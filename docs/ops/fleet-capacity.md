@@ -85,17 +85,23 @@ IDENTICAL on all three (cloned image), so neither is a fallback: a box with no d
 never see a record they cannot attribute. `CAP_BOXID` pins one explicitly for a deploy that must.
 
 A box deletes a ref only when (a) a **local authorship ledger** proves this box wrote that exact ref
-(recorded at publish time under `CAP_STATE_DIR`, default `${TMPDIR:-/tmp}/pi-capacity`, one directory per
+(recorded at publish time under `CAP_STATE_DIR`, default `${TMPDIR:-/tmp}/pi-capacity`, one file per
 repo, ring-bounded at `CAP_LEDGER_KEEP=32` refs and one filesystem per box), or (b) the record is STALE.
 A wiped `TMPDIR` therefore degrades pruning to STALE-only — refs leak for at most `CAP_PROBE_TTL` (900 s)
 and are then collected; it never causes a delete.
 Anything else is a peer's and is kept; a fresh record under this box's own key that it cannot prove it
-wrote is counted `foreign=<n>` and the reader marks the key `collide=1`, on which `cap_place` REFUSES
-(`bound=identity_collision`) rather than placing on a box the fleet cannot name. ⛔ `(key, boot)` equality
+wrote is counted `foreign=<n>`. When two fresh refs under one key disagree on `ncpu` or on `boot`, the
+reader marks the key `collide=1` and `cap_place` REFUSES (`bound=identity_collision`) rather than placing
+on a box the fleet cannot name. `foreign>0` alone is a *reading*, not a refusal: a box's own unprovable
+prior ref (a wiped `TMPDIR`) raises it without any collision. ⛔ `(key, boot)` equality
 is NOT authorship — a mis-keyed peer satisfies it, and reading it as proof deleted live peer records
 (reproduced; see `capacity.sh`'s header).
 
 ## 4. The order: FORK HEADROOM, then disk, then load
+
+⛔ Two bounds precede these, in this order: **`probe_stale`/`probe_unreadable`** (the reading's age is
+checked first) and **`box_unknown`** (a record that names no box is not judged on its numbers at all —
+`cap_bound_hit` checks identity before fork, because every other bound is a statement *about a box*).
 
 **Measured 2026-10-21 19:50–20:10 UTC (#2293).** Cloud **cell-4** (8 vCPU) could not spawn at all:
 

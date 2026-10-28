@@ -197,9 +197,9 @@
 # matter what it shares with us, and a same-key record we cannot prove we wrote is counted in `foreign=`
 # so the operator sees it.
 #
-# The one residual, stated rather than hidden: two boxes that share key AND `ncpu` AND `boot` are
-# indistinguishable in the channel (there is no fourth fact in it), so the reader keeps the newest of
-# that key. They no longer destroy each other's records, and the identity sources are restricted to the
+# The one residual, stated rather than hidden: two boxes that share key AND `ncpu` AND a boot reading
+# that is equal OR unreadable (`boot=0` is unknown, so it cannot discriminate) are indistinguishable in
+# the channel — there is no fourth fact in it — so the reader keeps the newest of that key. They no longer destroy each other's records, and the identity sources are restricted to the
 # measured-unique ones so the case is not reachable by the cloned-image path that produced it.
 #
 # ⛔ THE LEDGER'S PRECONDITION is one filesystem per box (each cell has its own), which is what makes
@@ -1167,8 +1167,8 @@ cap_publish() {
     orec="$(cap_record_from_ref "$old" 2>/dev/null)" || continue
     [ -n "$orec" ] || continue
     if cap_ref_deletable "$orec" "$old" "$ledger" "$now"; then
-      git -C "$repo" push -q origin ":$old" >/dev/null 2>&1 || true
-      cap_ledger_drop "$ledger" "$old"
+      # Same rule as the ledger arm above: forget the proof only when the delete SUCCEEDED.
+      if git -C "$repo" push -q origin ":$old" >/dev/null 2>&1; then cap_ledger_drop "$ledger" "$old"; fi
       continue
     fi
     # ⛔ ONLY OUR OWN KEY IS OURS TO JUDGE (see cap_ref_deletable). A peer with its own boxid is the
