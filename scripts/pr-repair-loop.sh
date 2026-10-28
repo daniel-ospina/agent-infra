@@ -94,9 +94,18 @@
 # Exit codes (the `pr-doctor`/`disk-reaper` vocabulary, kept identical on purpose):
 #   0  a pass completed — it dispatched, or there was genuinely nothing to do
 #   2  REFUSING — a read a pass needs could not be taken (a miss is never "nothing to do")
-#   3  UNDELIVERED — the work was placed and no worker took it (pr-doctor's own 3, kept verbatim: a
-#      monitor keyed on this pass must not read green over work nobody accepted)
+#   3  UNDELIVERED — legible work, NONE of it out: the work was placed and no worker took it, OR a
+#      durable refusal (a dirty worktree, an order the transport will not take) stopped it before
+#      delivery (agent-infra#2710). pr-doctor's own 3, kept verbatim: a monitor keyed on this pass
+#      must not read green over work nobody accepted
 #   6  DEFERRED — the machine said not now; the status row carries which measurement said so
+#   4  PASS-FAILED — the dispatcher CRASHED (or exited with a code that is not a verdict above).
+#      ⛔ NEVER RECORDED AS `refusing` (ai#2922): a crash and a refusal are DIFFERENT facts with
+#      different remedies, and this loop used to write both into the same `decision` and return 2,
+#      so a dispatcher that died (an unreadable cwd under launchd, `EXIT_CRASH=4`) read exactly like
+#      "I could not read the world". 2 is a VERDICT — see `docs/ops/pr-repair-service.md`, "the
+#      pass's exit codes are the trigger's vocabulary" — so a laundered crash consumed the backstop
+#      window instead of retrying. 4 is the same code `pr-doctor` uses for an uncaught exception.
 set -uo pipefail
 
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
@@ -128,7 +137,9 @@ STATUS="$STATE_DIR/pr-repair.status.json"
 
 EXIT_OK=0
 EXIT_REFUSING=2
-EXIT_UNDELIVERED=3   # placed, and no worker took it -- pr-doctor's own 3, kept verbatim
+EXIT_UNDELIVERED=3   # legible work, NONE of it out -- no worker took the order that was placed, or a
+                     # durable refusal stopped it before delivery (#2710). pr-doctor's own 3, kept verbatim
+EXIT_CRASH=4         # the dispatcher crashed / returned a non-verdict -- pr-doctor's own 4
 EXIT_DEFERRED=6
 
 log_line() { printf '[%s] pr-repair: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -200,7 +211,8 @@ decision, cap, free_mb, load1, rc_reap, rc_dispatch, reason, slug, path = sys.ar
 row = {
     "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "epoch": int(time.time()),
-    # dispatched | idle(dry-run) | deferred | refusing | placed-undelivered | skipped(own file)
+    # dispatched | idle(dry-run) | deferred | refusing | placed-undelivered | pass-failed
+    # | skipped(own file)
     "decision": decision,
     "reason": reason,
     "cap": int(cap) if cap.isdigit() else cap,
@@ -371,8 +383,12 @@ one_pass() { # <dry-run:0|1>
     case "$rc_dispatch" in
         0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
-        3) err "dispatch: UNDELIVERED (rc=3) — the work was placed and no worker took it." ;;
-        *) err "dispatch: unexpected rc=$rc_dispatch from pr-doctor." ;;
+        3) err "dispatch: NOT DELIVERED (rc=3) — legible work, none of it out: no worker took an order that was placed, or a refusal stopped one before delivery. NOT an empty queue." ;;
+        # ⛔ A NON-VERDICT IS A FAILURE, AND IT IS NAMED AS ONE (ai#2922). `timeout` alone gives 124,
+        # a signal gives 128+n, and `pr-doctor` gives 4 for an uncaught exception -- the code an
+        # unreadable cwd produced under launchd. Calling any of them "a refusal" told an operator to
+        # look for a broken read while the dispatcher was dead.
+        *) err "dispatch: PASS-FAILED (rc=$rc_dispatch) — the dispatcher did not return a verdict; this is a CRASH to diagnose, not a refusal and not an empty queue." ;;
     esac
     # ⛔ THE RECORD FOLLOWS THE DISPATCHER'S OWN VERDICT, not the fact that it returned. A pass whose
     # dispatcher REFUSED (rc=2, "could not read the world") recorded as `dispatched` is the exact
@@ -380,8 +396,25 @@ one_pass() { # <dry-run:0|1>
     # queue nobody could read. The exit code carries the same verdict the row does.
     case "$rc_dispatch" in
         0) write_status dispatched "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "pass-complete"; return "$EXIT_OK" ;;
+        # ⚠️ THE TOKEN `no-worker-took-it` IS KEPT AND ITS CAUSE IS NOT (agent-infra#2710): rc=3 now
+        # covers a durable refusal BEFORE delivery as well, so the token under-describes its own row.
+        # It is not renamed here because it is a shipped monitor vocabulary (`pr-repair-loop.test.sh`
+        # pins it) and renaming it mid-change would break a reader this lane cannot verify. The
+        # KIND (`placed-undelivered`) is accurate for both, and the human line above names both.
         3) write_status placed-undelivered "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "no-worker-took-it"; return "$EXIT_UNDELIVERED" ;;
-        *) write_status refusing "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-refused"; return "$EXIT_REFUSING" ;;
+        # ⛔ 2 IS WRITTEN EXPLICITLY, NOT VIA `*)` (ai#2922). The record arm never had a `2)` case: it
+        # reached `refusing` through the catch-all, so the moment a catch-all had to mean "a crash"
+        # (below), a genuine REFUSAL would have been recorded as `pass-failed` and returned 4 —
+        # collapsing the two facts from the other side. Named here, the refusal keeps its own row and
+        # its own verdict code, and the catch-all is free to mean only what it says.
+        2) write_status refusing "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-refused"; return "$EXIT_REFUSING" ;;
+        # ⛔ THE ROW AND THE EXIT CODE BOTH SAY `pass-failed` (ai#2922). This arm used to write
+        # `refusing` / `dispatcher-refused` and return 2 -- the VERDICT code -- so a crashed
+        # dispatcher produced a row and an exit byte-identical to a genuine "could not read the
+        # world" (measured: rc=4 and rc=2 both gave `decision='refusing' reason='dispatcher-refused'`,
+        # LOOP-EXIT=2). 2 is a verdict a caller acts on; 4 is not, so a later tick retries instead
+        # of waiting out the backstop window on a crash.
+        *) write_status pass-failed "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-crashed"; return "$EXIT_CRASH" ;;
     esac
 }
 
