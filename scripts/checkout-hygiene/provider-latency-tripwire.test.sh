@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off NO CI run site in either lane (pre-existing; tracked in agent-infra#2610) - wiring it is a coverage decision, not a side effect of a refactor
 # provider-latency-tripwire.test.sh — self-check for scripts/checkout-hygiene/provider-latency-tripwire.sh
 # (#413/#424). Network-free: PLT_CURL_OUT supplies canned probe output, GH_BIN
 # stubs the gh CLI, PLT_KEY bypasses key resolution.

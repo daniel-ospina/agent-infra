@@ -1,0 +1,8 @@
+# A flow-style `jobs:` hides a JOB-level `concurrency:` from a line-prefix test, so an unmodelled,
+# GitHub-honoured block reached GREEN. The reader does not model flow-style jobs, so it refuses it
+# (R0) rather than passing a shape it cannot see (#2660 round 4).
+name: Push jobs flow
+on:
+  push:
+    branches: [main]
+jobs: {build: {runs-on: ubuntu-latest, concurrency: {group: "push-jobs-flow-${{ github.ref }}", cancel-in-progress: true}, steps: [{run: "echo ok"}]}}
