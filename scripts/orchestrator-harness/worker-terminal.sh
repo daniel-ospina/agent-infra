@@ -614,7 +614,16 @@ wt_launcher_env() {
       # pre-check's answer are the SAME answer, on EVERY arm.
       case "$(wt_tmux_server_token_value "$pvar" 2>/dev/null)" in *[![:space:]]*)
         phave=1
-        pdeliv="inherited from the tmux SERVER's global environment (\`tmux show-environment -g $pvar\`; no file here assigns it) — to stop depending on the server, put a non-blank $pvar in $home/pi-keys.env or $keys, which this launch line sources with set -a and which OVERRIDES the server's value" ;;
+        # ⛔ NO BACKTICKS EITHER, AND THAT IS A CREDENTIAL LEAK, NOT TYPOGRAPHY (review finding,
+        # 2026-10-28, MEASURED). `pdeliv` is interpolated into the launch line, which is EVALUATED again
+        # (the caller-side pre-check, then the pane), so a backtick in it is COMMAND SUBSTITUTION. With a
+        # server carrying the key and a `keys.env` holding a blank `export DEEPSEEK_API_KEY=` (the shape
+        # that blanks the pane's inherited value), the refusal printed
+        # `DEEPSEEK_API_KEY=sk_…from_server` — the SERVER'S CREDENTIAL VALUE — and `wt_spawn` carries that
+        # very line into the controller's log (`${premsg:0:300}`) and the pane's stderr, while the guidance
+        # the message exists to give was replaced by the command's output. The `$` rule above is the same
+        # rule; the command is NAMED here, never executed.
+        pdeliv="inherited from the tmux SERVER's global environment (the value behind 'tmux show-environment -g $pvar'; no file here assigns it) — to stop depending on the server, put a non-blank $pvar in $home/pi-keys.env or $keys, which this launch line sources with set -a and which OVERRIDES the server's value" ;;
       esac
     fi
     if [ "$phave" = "0" ]; then
@@ -1636,7 +1645,20 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
         if [ -n "$pre_where" ]; then
           pre_where=" (this caller's environment plus the tmux SERVER's own global $pre_where, which is what the pane inherits)"
         else
-          pre_where=" (this caller's environment; the tmux server carries neither name)"
+          # ⛔ THE SERVER'S ANSWER IS THREE-VALUED, so the REFUSAL may not assert absence (review finding,
+          # 2026-10-28). An empty `srv_val`/`srv_pval` collapses three different states — the server holds
+          # neither name, there IS no server, and the probe could not answer at all (`wt_bounded` fired,
+          # rc 142/124; or no `tmux`). The old wording said "the tmux server carries neither name" for all
+          # three, i.e. it named a cause it had not established, which is the rule this file states for
+          # itself at the launcher and `env` sites. `wt_tmux_has_server` is the existing three-valued
+          # probe (0 = answers · 1 = none · 3 = no answer), so it decides the clause.
+          local _pwrc=0
+          wt_tmux_has_server || _pwrc=$?
+          case "$_pwrc" in
+            0) pre_where=" (this caller's environment; a tmux server ANSWERED and carries neither name)" ;;
+            1) pre_where=" (this caller's environment; no tmux server answers on this socket, so the pane inherits only this)" ;;
+            *) pre_where=" (this caller's environment; the tmux server did NOT answer within ${WT_PROBE_TIMEOUT:-15}s, so what it carries is UNKNOWN — not established as absent)" ;;
+          esac
         fi
         wt_warn "REFUSED $name: the credential contract this launch line carries FAILS when it is executed (rc=$pre_rc), so the worker would die at once and be recorded as a started lane. The pre-check ran with the environment the PANE would inherit$pre_where — so this is not a caller-side artefact, and the pane-side line carried below names the credential and every source it checked: ${premsg:0:300}"
         return 1

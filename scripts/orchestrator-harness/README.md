@@ -641,16 +641,22 @@ Around the spawn, three properties hold:
   `state/env-<worker>.sh` (mode 0600, the controller's exported names) and the run script sources it.
   On a **tmux** surface (macOS launchd, or a Linux cell) the contract is different and explicit: the
   launch line exports `HOME` — the one that actually holds the `gh` credential — sources that HOME's
-  `keys.env` (and `pi-keys.env`, where the LANE MODEL credential lives on a Mac) when they exist, and
-  exports `O`; a box where that produces no credential is REFUSED. Two credentials are gated, both
+  `keys.env` when it exists, sources `pi-keys.env` **when it is the file that assigns the model-key
+  variable** (that file is `<home>/pi-keys.env` on a Mac, where the LANE MODEL credential lives; one
+  carrying only other settings is NOT sourced, so box-local knobs do not belong there), and exports
+  `O`; a box where that produces no credential is REFUSED. Two credentials are gated, both
   BEFORE any session exists: the `gh` token and the model key `models.json` names for the lane
   provider. The model key may come from the caller (only when this spawn creates the server), from a
   file the launch line sources, or from the tmux SERVER's own global environment — and the caller-side
   pre-check is given exactly the environment the pane would inherit, so the gate's answer and the
   pre-check's answer cannot disagree. The launch line also **pins the pair** it resolved
-  (`PI_LANE_PROVIDER` and `PI_LANE_MODEL`, measured from `keys.env` then `pi-keys.env`, last value
-  wins) so the lane runs, and bills, the provider whose credential was checked; a model NO source
-  names is cleared rather than inherited.
+  (`PI_LANE_PROVIDER` and `PI_LANE_MODEL`) so the lane runs, and bills, the provider whose credential
+  was checked. The pair is resolved in the order the launch line establishes it: `keys.env` then
+  `pi-keys.env` (last non-blank value wins), and **then the caller's own exported
+  `PI_LANE_PROVIDER`/`PI_LANE_MODEL`** — the caller is a source too, and a value it names is measured
+  and pinned like any other. What is *cleared* rather than inherited is a model **no** source names, so
+  a stale value on the tmux server cannot land beside a provider the gate checked; the lane's own
+  `${PI_LANE_MODEL:-deepseek-flash}` default then applies.
 
 The stale-worker reap targets the same census (`reap_stale_workers()` → `wt_close`), because the
 workspace, not a session name, is now the identity: `wt_close` closes the terminal + workspace and

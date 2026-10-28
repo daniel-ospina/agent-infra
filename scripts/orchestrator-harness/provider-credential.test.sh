@@ -38,6 +38,14 @@ ck() { # <label> <rc>
   if [ "$2" -eq 0 ]; then PASS=$((PASS + 1)); printf 'PASS  %s\n' "$1"
   else FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$1"; fi
 }
+# ⛔ EVERY CALLER-SIDE PROBE RUNS UNDER A PAIR-FREE ENVIRONMENT (F5, review finding 2026-10-28,
+# MEASURED). `wt_provider_key_var`/`wt_lane_provider` resolve the LANE provider, whose last fallback is
+# the CALLER's own `PI_LANE_PROVIDER`/`PI_LANE_MODEL` — and the fleet exports those into every lane. A
+# probe that inherits one answers for a provider this fixture never named, so the assertion's premise is
+# the ambient shell's instead of the fixture's: measured under `PI_LANE_PROVIDER=zai`, 4 of these arms
+# reddened on a tree that is green without it. The driver and the spawn driver isolate the same two names
+# for the same reason; this is the third caller, and the isolation belongs on all three.
+probe() { env -u PI_LANE_PROVIDER -u PI_LANE_MODEL "$@"; }
 
 # ── the fixtures ────────────────────────────────────────────────────────────────────────────────
 # A `gh` that answers `auth token` with a value: the gh guard must PASS so each arm measures the
@@ -50,10 +58,13 @@ chmod +x "$TMP/bin/gh"
 # caller arm's verdict DEPENDS on it (a server's environment shadows the caller's).
 #   TMUX_SERVER_EXISTS=1     a server answers (a zero-session one does too)
 #   TMUX_SERVER_EXISTS=0     no server at all (the default)
+#   TMUX_SERVER_HANG=1       a server that never answers (the probe must be BOUNDED, and "no answer" is
+#                            NOT "no server" — the third state `wt_tmux_has_server` distinguishes)
 #   TMUX_SERVER_PROVIDER=1   that server carries the model credential in its global environment
 printf '%s\n' '#!/bin/sh
 case "${1:-}" in
   show-environment)
+    [ "${TMUX_SERVER_HANG:-0}" = "1" ] && { sleep 30; exit 0; }
     [ "${TMUX_SERVER_EXISTS:-0}" = "1" ] || { echo "no server running on /tmp/tmux-501/default"; exit 1; }
     if [ -z "${3:-}" ]; then echo "PATH=/usr/bin:/bin"; exit 0; fi
     case "${3:-}" in GH_TOKEN|GITHUB_TOKEN) echo "unknown variable: ${3}"; exit 1 ;; esac
@@ -121,7 +132,7 @@ for spec in \
 ; do
   name="${spec%%:*}"; rest="${spec#*:}"; val="${rest%:*}"; want="${rest##*:}"
   h="$TMP/h-key-$name"; mkhome "$h" "{\"providers\":{\"deepseek\":{\"apiKey\":\"$val\"}}}"
-  got="$(bash -c '. "$1" >/dev/null 2>&1; wt_provider_key_var "$2"' _ "$LIB" "$h" 2>/dev/null)"
+  got="$(probe bash -c '. "$1" >/dev/null 2>&1; wt_provider_key_var "$2"' _ "$LIB" "$h" 2>/dev/null)"
   [ "$got" = "$want" ] && rc=0 || { rc=1; echo "      spec=$name got='$got' want='$want'"; }
   ck "wt_provider_key_var($name) -> '${want:-<empty>}' (the NAME the provider's apiKey resolves from)" $rc
 done
@@ -130,7 +141,7 @@ done
 # Each of these must leave wt_provider_key_var EMPTY, and an empty answer must not refuse a spawn.
 polar_ck() { # <label> <home-maker>
   local label="$1" h="$2"
-  local pvar; pvar="$(bash -c '. "$1" >/dev/null 2>&1; wt_provider_key_var "$2"' _ "$LIB" "$h" 2>/dev/null)"
+  local pvar; pvar="$(probe bash -c '. "$1" >/dev/null 2>&1; wt_provider_key_var "$2"' _ "$LIB" "$h" 2>/dev/null)"
   local rc1=0 rc2=0
   [ -z "$pvar" ] || rc1=1
   WITH_KEY=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-pol-$label" >/dev/null 2>&1 || rc2=1
@@ -229,6 +240,13 @@ export WT_WORKER_HOME="$HOME_"
 # The caller holds NEITHER credential: that is the measured shape (the box's key lives only on the
 # tmux server), and it is what makes the pre-check's environment the thing under test.
 unset DEEPSEEK_API_KEY ZAI_API_KEY
+# ⛔ AND NEITHER MEMBER OF THE LANE PAIR, for the same reason `driver.sh` does it (F5, review finding
+# 2026-10-28, MEASURED): the fleet exports `PI_LANE_PROVIDER`/`PI_LANE_MODEL` into every lane, and an
+# ambient provider the fixture's models.json does not name makes `wt_provider_key_var` answer EMPTY —
+# the gate is then INERT and `wt_spawn` returns 0, so the server-credential arm passed VACUOUSLY while
+# the control arm beside it reddened (measured under `PI_LANE_PROVIDER=zai`: 6 red, and the vacuous arm
+# among them). An arm whose premise is "the caller holds neither credential" must say so, not inherit it.
+unset PI_LANE_PROVIDER PI_LANE_MODEL
 . "$LIB"
 wt_spawn "lane-1" "/tmp" 'true'; printf 'SPAWN rc=%s\n' "$?"
 SH
@@ -266,7 +284,7 @@ ck "…and when BOTH carry it, the FILE's value is what reaches the worker (the 
 # (a) the gate follows the pane's channel: a keys.env naming `zai` must be the provider checked.
 h="$TMP/h-prov"; mkhome "$h" '{"providers":{"deepseek":{"apiKey":"$DEEPSEEK_API_KEY"},"zai":{"apiKey":"$ZAI_API_KEY"}}}'
 printf 'PI_LANE_PROVIDER=zai\nexport ZAI_API_KEY=sk_zai_from_keys\n' > "$h/keys.env"
-got="$(bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
+got="$(probe bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
 [ "$got" = "zai" ] && rc=0 || { rc=1; echo "      wt_lane_provider -> '$got' (the caller's ambient default was used instead)"; }
 ck "wt_lane_provider resolves the provider the PANE runs (keys.env), not the caller's ambient default" $rc
 out="$(WITH_KEY=0 CALLER_PROVIDER=deepseek bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-prov" 2>&1)"
@@ -302,7 +320,7 @@ ck "…and a value inherited from the SERVER cannot shadow it: the launch line P
 # inherited one, which is what the ambient value below stands for.
 h="$TMP/h-pair"; mkhome "$h" '{"providers":{"deepseek":{"apiKey":"$DEEPSEEK_API_KEY"},"zai":{"apiKey":"$ZAI_API_KEY"}}}'
 printf 'export DEEPSEEK_API_KEY=sk_ds\nexport ZAI_API_KEY=sk_zai\nPI_LANE_PROVIDER=zai\nPI_LANE_MODEL=qwen3.8-max\n' > "$h/pi-keys.env"
-got="$(bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
+got="$(probe bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
 [ "$got" = "zai" ] && rc=0 || { rc=1; echo "      wt_lane_provider -> '$got' (pi-keys.env was not measured)"; }
 ck "wt_lane_provider measures \$HOME/pi-keys.env as well as keys.env (the only env file on this Mac)" $rc
 out="$(WITH_KEY=0 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-pair" 2>&1)"
@@ -340,6 +358,84 @@ else
   case "$envout" in *"MODEL=[qwen3.8-max]") rc=0 ;; *) rc=1; echo "      $envout (a caller-named model was not the pinned one — gate and pane disagree)" ;; esac
 fi
 ck "…and when the CALLER names one, THAT source is pinned, so the pane cannot keep a stale server value" $rc
+# …and NO BACKTICK MAY REACH THE LAUNCH LINE (review finding, 2026-10-28, MEASURED). The prefix is a
+# shell string that is EVALUATED twice more — the caller-side pre-check, then the pane — so a backtick
+# in any text interpolated into it is command substitution. Measured before the fix, on the server
+# credential arm with a `keys.env` that holds a BLANK assignment (which blanks the pane's inherited
+# value): the refusal printed the SERVER's credential value, and `wt_spawn` writes that line into the
+# controller's log. This arm drives the message that carried it.
+h="$TMP/h-srv-deliv"; mkhome "$h"
+printf 'export DEEPSEEK_API_KEY=\n' > "$h/keys.env"
+out="$(WITH_KEY=0 TMUX_SERVER_EXISTS=1 TMUX_SERVER_PROVIDER=1 bash "$TMP/driver.sh" "$LIB" "$h" "$TMP/bin" "$TMP/O-srv-deliv" 2>&1)"
+pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+if [ -z "$pfx" ]; then rc=1; echo "      no launch prefix was emitted — the server arm did not credit the value, so this arm proves nothing"
+else
+  case "$pfx" in
+    *'`'*) rc=1; echo "      the emitted launch line carries a BACKTICK, and that line is EVALUATED again: $(printf '%s' "$pfx" | tail -c 240)" ;;
+    *) rc=0 ;;
+  esac
+fi
+ck "…and the emitted launch line carries NO backtick — it is re-evaluated, so a backtick there EXECUTES" $rc
+if [ -z "$pfx" ]; then rc=1; echo "      nothing to execute"
+else
+  envout="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-srv-deliv" "$BASH" -c "$pfx; :" 2>&1)"
+  case "$envout" in
+    *sk_from_server*) rc=1; echo "      the refusal PRINTED THE SERVER'S CREDENTIAL VALUE (it was substituted, not named)" ;;
+    *'tmux show-environment -g DEEPSEEK_API_KEY'*) rc=0 ;;
+    *) rc=1; echo "      the refusal does not name the command whose answer clears it: $envout" ;;
+  esac
+fi
+ck "…and executing it NAMES that command without printing its answer (no credential value reaches the log)" $rc
+# …and the PRE-CHECK'S own refusal names what it MEASURED about the server (review finding, 2026-10-28).
+# `wt_spawn` words this clause from `wt_tmux_has_server`'s THREE-VALUED answer (0 answers · 1 none ·
+# 3 no answer). The wording it replaced said "the tmux server carries neither name" for all three — an
+# absence the probe had not established — which is the rule this file states for itself at the launcher
+# and `env` sites: a refusal names the places it looked, not a guess at them.
+# ⛔ EACH ARM MUST SET THE SERVER'S STATE, OR THE CLAUSE IT MEANS TO READ IS NEVER REACHED (measured while
+# writing this arm: it first drove `TMUX_SERVER_PROVIDER=1` — a server that CARRIES the name — so
+# `srv_pval` was non-empty, `pre_where` took the "plus the tmux SERVER's own global $pvar" branch, and the
+# three-valued `else` was dead code under this arm; the assertion then reddened on a tree where the
+# behaviour was correct. `TMUX_SERVER_PROVIDER=0` is the shape the `else` exists for: a server that
+# ANSWERS and carries neither name.
+prewhere_ck() { # <label> <want> <forbid> <server-state env assignment...>
+  local label="$1" want="$2" forbid="$3"; shift 3
+  local h o l rc=0
+  h="$(mktemp -d "$TMP/pw-XXXXXX")"; mkhome "$h"
+  # ⛔ THE FILE MUST BE ONE THE GATE *CREDITS* AND THE PREFIX EXECUTION *FAILS* ON, or the pre-check is
+  # never reached: `wt_provider_credit` is a STATIC match ("this file assigns a non-blank value"), while
+  # the pre-check SOURCES the file. A `keys.env` that sleeps past WT_PRE_TIMEOUT is credited statically and
+  # times the execution out (rc 142), which is exactly the measured shape that reaches this clause — first
+  # tried here with a blank `export DEEPSEEK_API_KEY=`, which refused at the MODEL gate instead and never
+  # entered `wt_spawn`'s pre-check at all.
+  printf 'sleep 6\nexport DEEPSEEK_API_KEY=sk_after_sleep\n' > "$h/keys.env"
+  o="$(env "$@" WT_PROBE_TIMEOUT=1 WT_PRE_TIMEOUT=2 bash "$TMP/spawn.sh" "$LIB" "$h" "$TMP/bin" "$h/O" 2>&1)"
+  l="$(cat "$h/O/log.txt" 2>/dev/null)"
+  if [ -z "$l" ]; then rc=1; echo "      the pre-check did not refuse through wt_warn — nothing was logged to read: $o"
+  else
+    case "$l" in
+      *"$want"*) ;; # the clause this arm drives is present
+      *"$forbid"*) rc=1; echo "      the refusal ASSERTED '$forbid' — a state the probe did not establish: $(printf '%s' "$l" | head -c 300)" ;;
+      *) rc=1; echo "      the refusal does not say '$want': $(printf '%s' "$l" | head -c 300)" ;;
+    esac
+  fi
+  ck "$label" $rc
+}
+# 0 — a server that ANSWERS and carries neither name. ⛔ THIS IS WHERE THE OLD WORDING WAS FALSE: it said
+# "the tmux server carries neither name", which is TRUE here — the point is that it was said for all three
+# states, including the two below where the probe had established nothing about a server's contents.
+prewhere_ck "…and a refusal on a box whose server ANSWERED without the name says so, not an absence" \
+  'a tmux server ANSWERED and carries neither name' 'the tmux server carries neither name' \
+  TMUX_SERVER_EXISTS=1 TMUX_SERVER_PROVIDER=0
+# 1 — no server at all: a POSITIVE absence, which the refusal MAY state (and still not as "carries").
+prewhere_ck "…and a refusal on a box with NO server says THAT, rather than blaming a server that is absent" \
+  'no tmux server answers on this socket' 'the tmux server carries neither name' \
+  TMUX_SERVER_EXISTS=0
+# 3 — the probe did not answer: UNKNOWN, which must be reported as UNKNOWN and never as an absence. This
+# is the branch the whole three-valued probe exists for; on it the file arm still credits, so the gate
+# emits a prefix and the pre-check is genuinely reached.
+prewhere_ck "…and a refusal on a box whose server did NOT answer says UNKNOWN, never 'carries neither name'" \
+  'what it carries is UNKNOWN — not established as absent' 'the tmux server carries neither name' \
+  TMUX_SERVER_HANG=1
 
 # ── 6b. THE CALLER-SIDE SOURCES ARE BOUNDED ────────────────────────────────────────────────────
 # ⛔ P1 review finding, 2026-10-27, MEASURED: `wt_lane_provider` did `. "$home/keys.env"` (and
@@ -351,7 +447,7 @@ ck "…and when the CALLER names one, THAT source is pinned, so the pane cannot 
 h="$TMP/h-sleep"; mkhome "$h"
 printf 'sleep 6\nexport DEEPSEEK_API_KEY=sk_after_sleep\n' > "$h/keys.env"
 t0="$(date +%s)"
-got="$(WT_PROBE_TIMEOUT=1 bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
+got="$(probe env WT_PROBE_TIMEOUT=1 bash -c '. "$1" >/dev/null 2>&1; wt_lane_provider "$2"' _ "$LIB" "$h" 2>/dev/null)"
 dt=$(( $(date +%s) - t0 ))
 [ "$dt" -le 4 ] && rc=0 || { rc=1; echo "      wt_lane_provider took ${dt}s on a keys.env that sleeps 6 (no bound was applied)"; }
 ck "a keys.env that sleeps 6 s is CUT at WT_PROBE_TIMEOUT=1 by wt_lane_provider (measured ${dt}s)" $rc
