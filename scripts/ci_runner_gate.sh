@@ -185,7 +185,9 @@ ABSORPTION_QUEUED=""
 #   idle-unused  work is waiting and at least one ONLINE runner is IDLE — capacity exists and is
 #                not being used. REPORTED, never certified as healthy.
 #   all-offline  registrations exist, NONE is online (the third state the fleet needs)
-#   stranded     mode=local and NOT ONE online runner can accept the queue's own demand
+#   stranded     mode=local, the POOL CLAIMS the queue's demand, and NOT ONE online runner can
+#                accept it (see `pool_claims_demand` — a demand the pool never advertised is never
+#                a fault of the pool, so it narrows instead of denying)
 #   unknown      the inventory could not be read — no capacity claim is made at all
 # `--status` prints ONE more word, `unmeasured`, for the same `capacity=` key: it is the manual read
 # verb and computes no verdict, so it says so in the SAME vocabulary rather than inventing a seventh
@@ -203,6 +205,15 @@ CENSUS_BLIND=0         # 1 only when the CAPACITY read failed (the condition the
 # label contains the delimiter and `offers_all` cannot be trusted — `CENSUS_LABEL_AMBIGUOUS=1`, which
 # NARROWS the claim (never a `stranded` deny) rather than voiding the pass.
 CENSUS_LABEL_AMBIGUOUS=0
+# ⛔ WHAT THE POOL CLAIMS TO OFFER, and why it is not the same question as what is ONLINE (#3002
+# review P1). The queue's demand is the OLDEST queued run's label set, which can ask for something this
+# pool never advertised — `macos-latest`, a `gpu` label, a matrix axis nobody registered. "No online
+# runner can accept it" is then not a fault of the pool: it is work the pool was never supposed to
+# serve, and denying on it pinned mode=local forever on a healthy repo (the pool keeps `ubuntu-latest`
+# while hosted sits idle) with a reason line that read "GitHub-hosted UNHEALTHY". A registration —
+# online OR offline — carrying the label IS a claim the pool makes, so an offline `gpu` runner plus a
+# `gpu` demand still denies: that is #2931's mechanism, and it is the case this must keep.
+CENSUS_OFFERED=""      # union of every label on every registration, comma-joined (as the API spelled them)
 CENSUS_KV=""           # the measured counts, machine-readable
 CENSUS_DETAIL=""       # the same counts as "2 of 8 online (idle=0 busy=2 offline=6)"
 # The same eight census keys, for the writer that runs when the census could NOT be read (#3002 review
@@ -302,6 +313,9 @@ census_classify() {
   # early `return 1` the counters were half-counted and the KV still described the PREVIOUS body — an
   # artifact that does not match its measurement, which is the shape this change removes elsewhere.
   CENSUS_KV=""; CENSUS_DETAIL=""
+  # The OFFERED set is built here, from the same rows, so "what the pool claims" and "what is online"
+  # can never drift into two reads that disagree (see CENSUS_OFFERED).
+  CENSUS_OFFERED=""
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     case "$row" in *$'\t'*) ;; *) return 1 ;; esac
@@ -326,6 +340,14 @@ census_classify() {
       nl=0
       if [ -n "$labels" ]; then commas="${labels//[!,]/}"; nl=$(( ${#commas} + 1 )); fi
       [ "$nl" = "$lcount" ] || CENSUS_LABEL_AMBIGUOUS=1
+    fi
+    # Every registration contributes its labels to the OFFERED set — an offline runner's label is
+    # still something the pool says it serves, and that is what makes a stranded deny meaningful.
+    if [ -n "$labels" ]; then
+      case "$CENSUS_OFFERED" in
+        '') CENSUS_OFFERED="$labels" ;;
+        *)  CENSUS_OFFERED="$CENSUS_OFFERED,$labels" ;;
+      esac
     fi
     n=$((n+1))
     if [ "$st" = online ]; then
@@ -378,49 +400,89 @@ queue_demand() {
 # offers ubuntu-latest" is the CORRECT state and denying on it would re-engage the fallback on every
 # healthy tick, forever. Only in mode=local is the pool supposed to serve, and only there is
 # "nothing online can take the demand" a conclusive fault.
+# pool_claims_demand — does THIS pool advertise every label the queue's head asks for?
+# rc 0 = yes, the pool claims this work (so "nobody online can take it" is a fault of the pool).
+# rc 1 = no / cannot tell, so the deny must NOT be made.
+# ⛔ A MATCH WE CANNOT TRUST IS NOT A CLAIM (#3002 review P1, same rule as the demand counters): an
+# ambiguous label set means the split is untrustworthy, and a truncated label must never be read as
+# "the pool does not offer this" — that would be a false NARROWING, which is the safe direction, but it
+# is still an unmeasured claim, so it is refused rather than guessed.
+# ⛔ THE FALLBACK LABEL IS ALWAYS A CLAIM even when no runner currently carries it: in mode=local the
+# gate's whole purpose is that `runs-on: ubuntu-latest` work runs on this pool, and the window between
+# "fallback engaged" and "every runner relabelled" must not read as `stranded`.
+pool_claims_demand() {
+  local have want l
+  [ -n "$DEMAND_LABELS" ] || return 1
+  [ "$CENSUS_LABEL_AMBIGUOUS" = 0 ] || return 1
+  [ -n "$CENSUS_OFFERED" ] || return 1
+  have=",$(printf '%s' "$CENSUS_OFFERED" | tr '[:upper:]' '[:lower:]'),"
+  want="$(printf '%s' "$DEMAND_LABELS" | tr '[:upper:]' '[:lower:]')"
+  for l in ${want//,/ }; do
+    [ "$l" = "$FALLBACK_LABEL" ] && continue
+    case "$have" in *",$l,"*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
 capacity_verdict() {
-  local m="$1" online
+  local m="$1" online demand_usable demand_usable_early
   online=$((CENSUS_ON_IDLE + CENSUS_ON_BUSY))
+  # A demand is usable as EVIDENCE only when it was measured AND the split that matched it is sound
+  # (an ambiguous label set makes every MATCH untrustworthy — never the deny's evidence).
+  demand_usable_early=0
+  [ -n "$DEMAND_LABELS" ] && [ "$CENSUS_LABEL_AMBIGUOUS" = 0 ] && demand_usable_early=1
   if [ "$queued" -eq 0 ]; then CENSUS_VERDICT=absorbing; return 0; fi
   if [ "$online" -eq 0 ]; then
     # Registrations that never came online. This is the third state, and it is the one a count of
     # registrations hides: measured 2026-10-28 12:54Z, daniel-ospina/agent-infra held 8
     # registrations with 2 online and 6 offline, and every reading the gate made was compatible
     # with healthy.
-    if [ "$m" = local ] && [ -n "$DEMAND_LABELS" ]; then CENSUS_VERDICT=stranded; return 1; fi
+    # ⛔ THE CLAIM RULE APPLIES TO THIS ARM TOO (#3002 review P1, third round): a demand the pool never
+    # advertised (a `macos-latest` head, say) is not "registration exists, nothing online can serve the
+    # work" — it is work this pool was never supposed to serve, and denying on it pins mode=local on a
+    # healthy repo for as long as that run heads the queue. One rule, both deny candidates.
+    if [ "$m" = local ] && [ "$demand_usable_early" = 1 ] && pool_claims_demand; then CENSUS_VERDICT=stranded; return 1; fi
     CENSUS_VERDICT=all-offline; return 0
   fi
   # ⛔ AN AMBIGUOUS LABEL SET NEVER DENIES (#3002 review P1). `label_ambiguity=1` means a label carried
-  # the comma this pass splits on, so the split — and therefore every demand MATCH — is untrustworthy.
-  # A match we cannot trust must not become the evidence for a `stranded` deny; it NARROWS the claim to
-  # the runner STATES instead, which is exactly the reading the mode=github arm below already takes for
-  # a demand that could not be measured. Fail-closed here means "make no deny", not "refuse the pass".
-  local demand_usable=0
-  [ -n "$DEMAND_LABELS" ] && [ "$CENSUS_LABEL_AMBIGUOUS" = 0 ] && demand_usable=1
+  # the comma this pass splits on, so the split — and therefore every demand MATCH and every claim made
+  # from the OFFERED union — is untrustworthy. A match we cannot trust must not become the evidence for
+  # a `stranded` deny; it NARROWS the claim to the runner STATES instead, which is exactly the reading
+  # the mode=github arm below already takes for a demand that could not be measured. Fail-closed here
+  # means "make no deny", not "refuse the pass".
+  demand_usable="$demand_usable_early"
+  # ── THE ONE DENY ARM, and its scope is two conditions, not one ────────────────────────────────
+  # mode=local: the pool is SUPPOSED to serve. And `pool_claims_demand`: the work it is supposed to
+  # serve is THIS work. "Not one online runner can accept the queue's demand" is a fault of the pool
+  # only when the pool advertised that demand; otherwise it is a `macos-latest`/`gpu`/matrix job the
+  # pool never claimed, and denying on it pinned mode=local on a healthy repo forever (#3002 review
+  # P1). When the deny does not apply the reading narrows to the runner STATES, which is exactly the
+  # narrowing the unmeasurable-demand arm already takes — no claim is invented, and none is dropped.
+  # This is #2931's mechanism, made measurable without admin.
   if [ "$m" = local ] && [ "$demand_usable" = 1 ]; then
-    if [ "$CENSUS_DEMAND_IDLE" -eq 0 ] && [ "$CENSUS_DEMAND_BUSY" -eq 0 ]; then
-      # The pool is supposed to serve and NOT ONE online runner can accept the queue's own demand:
-      # the fallback label is not where the queue needs it, or every listener that carried it died.
-      # This is #2931's mechanism, made measurable without admin.
+    if [ "$CENSUS_DEMAND_IDLE" -eq 0 ] && [ "$CENSUS_DEMAND_BUSY" -eq 0 ] && pool_claims_demand; then
       CENSUS_VERDICT=stranded; return 1
     fi
-    if [ "$CENSUS_DEMAND_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi
-    CENSUS_VERDICT=saturated; return 0
   fi
-  # mode=github, or a demand this pass could not measure or could not trust: the pool's LABEL SET is
-  # not evidence here (in mode=github it is stripped by design), so the reading is only ever about the
-  # pool's own state, and it never denies.
-  # ⛔ IDLE IS TESTED BEFORE BUSY (#3002 review P1). `saturated` means EVERY online runner is busy, so
-  # a pool with idle runners must never be labelled with it — and `saturated` is a CERTIFYING word
-  # (:1043-1049 routes it to "GitHub Actions healthy"), so the mislabel is not cosmetic: it restores
-  # the very "9 busy while 7 idle" reading this instrument exists to remove. Measured on the pre-fix
-  # gate with 7 idle / 2 busy / 54 queued: `capacity=saturated … (idle=7 busy=2)` and the reason read
-  # "GitHub Actions healthy". Both arms that land here reach it — an unmeasurable demand
-  # (`demand=unknown`, e.g. a space-bearing label `queue_demand` rejects) and every mode=github tick.
-  # `demand_usable=1 && DEMAND_IDLE>0` used to be tested here; it is SUBSET of `ON_IDLE>0` (a demanding
-  # idle runner IS an idle runner), so it added no reach and is subsumed rather than kept as dead code.
+  # ── THE STATE READING, ONE ARMSET FOR EVERY ARM THAT DOES NOT DENY ────────────────────────────
+  # mode=github (pool stripped by design, #2327), an unmeasurable/untrustworthy demand, or mode=local
+  # with a demand the pool never claimed: the pool's LABEL SET is not evidence, so the verdict is the
+  # pool's own state.
+  # ⛔ IDLE IS TESTED BEFORE BUSY (#3002 review P1, and again in round 3). `saturated` means EVERY
+  # ONLINE runner is busy, so a pool with idle runners must never be labelled with it — and `saturated`
+  # is a CERTIFYING word (:1049 routes it to "GitHub Actions healthy"), so the mislabel is not
+  # cosmetic: it restores the very "9 busy while 7 idle" reading this instrument exists to remove.
+  # ⛔ THE TWO ARMS USED TO READ THE STATES SEPARATELY, and that divergence produced the same defect
+  # twice: the demand arm returned `saturated` whenever no DEMAND-matching runner was idle, even with
+  # other online runners idle — so 1 busy + 7 idle printed `capacity=saturated` and certified. There is
+  # now ONE state reading for every non-denying arm, so the two cannot disagree again. `DEMAND_IDLE`
+  # needs no test of its own: a demand-matching idle runner IS an idle runner (census_classify only
+  # counts it for `online` rows), so it is a SUBSET of `ON_IDLE`, and `demand_usable && DEMAND_IDLE>0`
+  # was subsumed rather than kept as dead code.
   if [ "$CENSUS_ON_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi
   if [ "$CENSUS_ON_BUSY" -gt 0 ]; then CENSUS_VERDICT=saturated; return 0; fi
+  # Unreachable while online>0 (idle+busy == online), and deliberately NON-CERTIFYING: if a future
+  # count ever became inconsistent, the one thing this default must never do is certify.
   CENSUS_VERDICT=idle-unused; return 0
 }
 
@@ -984,14 +1046,19 @@ if [ "$STATUS_ONLY" = 1 ]; then
   if census_rows="$(runner_census)"; then
     if ! census_classify "$census_rows"; then
       CAPABILITY="$(census_capability "$census_rows")"
-      CENSUS_VERDICT=unknown; CENSUS_KV=""; CENSUS_DETAIL="(unread)"
+      # ⛔ THE EIGHT CENSUS KEYS ARE CARRIED AS `unmeasured`, NOT DROPPED (#3002 review P2). Both
+      # unreadable branches used to set `CENSUS_KV=""`, so this surface printed
+      # `capacity=unknown  capability=…` — a key set NO other writer emits, which a parser reads as
+      # "this writer does not report those" instead of "they were not measured". `CENSUS_KV_UNMEASURED`
+      # exists for exactly this and the success/blind writers already use it.
+      CENSUS_VERDICT=unknown; CENSUS_KV="$CENSUS_KV_UNMEASURED"; CENSUS_DETAIL="(unread)"
       status_rc=2
       log "runner census UNREADABLE endpoint=$RUNNER_LIST_PATH capability=${CAPABILITY}; body said: ${census_rows:0:300}"
     fi
   else
     census_rows="$(cat "$GH_ERR" 2>/dev/null)"
     CAPABILITY="$(census_capability "$census_rows")"
-    CENSUS_VERDICT=unknown; CENSUS_KV=""; CENSUS_DETAIL="(unread)"
+    CENSUS_VERDICT=unknown; CENSUS_KV="$CENSUS_KV_UNMEASURED"; CENSUS_DETAIL="(unread)"
     status_rc=2
     log "runner census FAILED endpoint=$RUNNER_LIST_PATH capability=${CAPABILITY}; gh said: ${census_rows:0:300}"
   fi
@@ -1041,6 +1108,24 @@ if [ "$healthy" = 2 ]; then
       # `unmeasured` — recorded, never assumed, and never absent.
       printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — capacity was not read\n' \
         "$mode" "$MODE_SOURCE" "$CENSUS_KV_UNMEASURED" "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-runner_inventory:unreadable}" \
+        > "$VERDICT_FILE" 2>/dev/null || true
+    fi
+  else
+    # ⛔ A COULD-NOT-MEASURE PASS MUST NOT LEAVE THE PREVIOUS PASS'S ANSWER STANDING (#3002 review P2).
+    # Only the CENSUS_BLIND branch wrote `verdict=unknown`; the script's other could-not-measure exits
+    # (a failed queue probe, an unreadable queued/in_progress/age/threshold/floor operand, a saturated
+    # page) wrote nothing and deleted nothing, so the file went on saying `verdict=github … queued=5
+    # in_progress=2` after every pass since had failed to measure. This file's own contract is "the
+    # CURRENT verdict, not a log", so a consumer could not tell a current green from a stale one.
+    # The line is written on the same shape as the other two writers (same keys, same order), and the
+    # capacity fields are the ones this pass actually reached — `CENSUS_KV_UNMEASURED` where the census
+    # never ran, `unmeasured` where the probe never answered. `--dry-run` still changes nothing.
+    if [ "$DRY" = 1 ]; then
+      log "verdict NOT updated: --dry-run reports and changes nothing (the previous verdict file is left untouched; this pass measured nothing it could stand behind)"
+    else
+      printf 'verdict=unknown mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — a leg could not be read, so this pass changed nothing (the FAIL-CLOSED line in the log names which)\n' \
+        "$mode" "$MODE_SOURCE" "${CENSUS_VERDICT:-unknown}" "${CENSUS_KV:-$CENSUS_KV_UNMEASURED}" \
+        "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-none}" \
         > "$VERDICT_FILE" 2>/dev/null || true
     fi
   fi

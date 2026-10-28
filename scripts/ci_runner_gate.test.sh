@@ -147,6 +147,9 @@ case "$*" in
   # built — the state that is CORRECT in mode=github and conclusive only in mode=local.
   # `GH_CENSUS_LABELCOUNT` emits the inventory's OPTIONAL 4th field (the runner's own label count),
   # which is the only way to build "a label contains the comma this pass splits on".
+  # `token@l1|l2|l3` gives ONE runner its own label set (`|` because the token list is comma-split),
+  # which is the only way to build "one demand-matching runner among idle ones that cannot take it"
+  # — the state that used to be certified as `saturated` (#3002 review P1, round 3).
   *".status"*)
     case "${GH_CENSUS_MODE:-ok}" in
       forbidden)      printf '{"message":"Resource not accessible by personal access token","documentation_url":"https://docs.github.com/rest/actions/self-hosted-runners#list-self-hosted-runners-for-a-repository","status":"403"}\ngh: Resource not accessible by personal access token (HTTP 403)\n' >&2; exit 1 ;;
@@ -156,10 +159,14 @@ case "$*" in
       *)              _census="${GH_CENSUS:-busy}"; _census="${_census//,/ }"
                       _lc=""; [ -n "${GH_CENSUS_LABELCOUNT:-}" ] && _lc=$'\t'"$GH_CENSUS_LABELCOUNT"
                       for _c in $_census; do
+                        _cl="${GH_CENSUS_LABELS-self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest}"
                         case "$_c" in
-                          idle) printf 'online\tfalse\t%s%s\n' "${GH_CENSUS_LABELS-self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest}" "$_lc" ;;
-                          busy) printf 'online\ttrue\t%s%s\n'  "${GH_CENSUS_LABELS-self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest}" "$_lc" ;;
-                          off)  printf 'offline\tfalse\t%s%s\n' "${GH_CENSUS_LABELS-self-hosted,Linux,ARM64,self-hosted-arm64,ubuntu-latest}" "$_lc" ;;
+                          ?*@*) _cl="${_c#*@}"; _cl="${_cl//|/,}"; _c="${_c%%@*}" ;;
+                        esac
+                        case "$_c" in
+                          idle) printf 'online\tfalse\t%s%s\n' "$_cl" "$_lc" ;;
+                          busy) printf 'online\ttrue\t%s%s\n'  "$_cl" "$_lc" ;;
+                          off)  printf 'offline\tfalse\t%s%s\n' "$_cl" "$_lc" ;;
                           *)    printf '%s\n' "$_c" ;;
                         esac
                       done ;;
@@ -922,6 +929,24 @@ assert_not_contains "$OUT" "capacity=saturated" "(2b) 'saturated' means EVERY on
 assert_contains "$OUT" "CAPACITY NOT CERTIFIED" "(2b) and the certifying branch is not entered"
 assert_not_contains "$OUT" "GitHub Actions healthy" "(2b) the words 'healthy' never appear over idle capacity"
 
+# ⛔ THE SAME MISREADING, ONE ARM OVER (#3002 review P1, round 3). The DEMAND arm read the states itself:
+# "no DEMAND-matching runner is idle" → `saturated`, without ever consulting whether some OTHER online
+# runner was idle. So 1 busy runner that carries `ubuntu-latest` + 2 IDLE runners that do not printed
+# `capacity=saturated … (idle=2 busy=1)` and, because `saturated` CERTIFIES, the reason read "GitHub
+# Actions healthy". The pool is exhausted FOR THIS DEMAND while capacity sits idle — a report an
+# operator needs (it may mean the label reached only one runner), never a certification.
+echo "── #3002 P1 (round 3): demand-matching exhaustion is NOT 'saturated' while other runners idle ──"
+run_gate census-demand-busy-idle-other GH_QUEUED=54 GH_FALLBACK_N=1 GH_INPROGRESS=2 \
+  GH_CENSUS="busy@self-hosted|Linux|X64|self-hosted-x64|ubuntu-latest,idle@self-hosted|Linux|X64|self-hosted-x64,idle@self-hosted|Linux|X64|self-hosted-x64" --
+assert_eq "$RC" "0" "(2c) the pass completes (a report, not a deny)"
+assert_contains "$OUT" "demanding_busy=1" "(2c) the ONE demand-matching runner is busy"
+assert_contains "$OUT" "demanding_idle=0" "(2c) no demand-matching runner is idle"
+assert_contains "$OUT" "online_idle=2" "(2c) …while two ONLINE runners ARE idle"
+assert_contains "$OUT" "capacity=idle-unused" "(2c) so the verdict is idle-unused, NOT saturated"
+assert_not_contains "$OUT" "capacity=saturated" "(2c) 'saturated' means EVERY online runner is busy — never this"
+assert_contains "$OUT" "CAPACITY NOT CERTIFIED" "(2c) and the certifying branch is not entered"
+assert_not_contains "$OUT" "GitHub Actions healthy" "(2c) the words 'healthy' never appear over idle capacity"
+
 # The third state, and the ONLY place it is conclusive: in mode=local the pool is SUPPOSED to serve,
 # so "not one online runner can accept the queue's demand" is a fault the gate can act on.
 echo "── #2931: in mode=local, a pool that cannot accept the queue's demand is STRANDED (a deny) ──"
@@ -933,6 +958,36 @@ assert_contains "$OUT" "demanding_idle=0" "(3) no idle runner carries the demand
 assert_contains "$OUT" "capacity=stranded" "(3) the verdict is stranded, not 'healthy'"
 assert_contains "$OUT" "capacity leg" "(3) the leg that decided is NAMED, as every other leg here is"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(3) the pool stays engaged"
+
+# ⛔ THE DENY'S SCOPE IS TWO CONDITIONS, NOT ONE (#3002 review P1, round 3). The queue's demand is the
+# OLDEST queued run's label set, and that run can ask for something this pool never advertised
+# (`macos-latest`, a `gpu` matrix axis, a label added this morning). "No online runner can accept it"
+# is then not a fault of the pool — it is work the pool was never supposed to serve — but the deny
+# fired anyway and pinned mode=local on a healthy repo for as long as that run headed the queue, with
+# a reason line reading "GitHub-hosted UNHEALTHY". A demand the pool never claimed NARROWS.
+echo "── #3002 P1 (round 3): a demand the POOL NEVER ADVERTISED is not 'stranded' ──"
+run_gate census-demand-unclaimed GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
+  GH_DEMAND="macos-latest" GH_CENSUS="idle,idle" --
+assert_eq "$RC" "0" "(3b) the pass completes"
+assert_contains "$OUT" "demand=macos-latest" "(3b) the queue head really asks for a label no registration carries"
+assert_not_contains "$OUT" "capacity=stranded" "(3b) the pool never claimed macos-latest, so nothing is stranded"
+assert_not_contains "$OUT" "capacity leg" "(3b) and the deny arm is not entered"
+assert_not_contains "$OUT" "GitHub-hosted UNHEALTHY" "(3b) the reason does not blame hosted for work the pool never served"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "(3b) …so a healthy repo returns to github and the pool is released"
+run_gate census-demand-unclaimed-dark GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
+  GH_DEMAND="macos-latest" GH_CENSUS="off,off" --
+assert_not_contains "$OUT" "capacity=stranded" "(3c) nothing online + a demand the pool never claimed is NOT a deny either"
+assert_contains "$OUT" "capacity=all-offline" "(3c) the state is still REPORTED, as all-offline"
+# …and the OTHER half of the rule: a registration carrying the demanded label IS a claim the pool
+# makes, offline or not, so "nobody ONLINE can take it" is conclusive. This is #2931's mechanism and
+# the arm that keeps the narrowing above from swallowing the deny it was carved out of.
+echo "── #2931 GUARD: a registration that CARRIES the demand is a claim — an offline one still denies ──"
+run_gate census-claim-from-offline-reg GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
+  GH_DEMAND="ubuntu-latest,gpu" \
+  GH_CENSUS="idle@self-hosted|Linux|X64|ubuntu-latest,off@self-hosted|Linux|X64|ubuntu-latest|gpu" --
+assert_contains "$OUT" "demanding_idle=0" "(3d) the only demand-matching runner is the OFFLINE registration"
+assert_contains "$OUT" "capacity=stranded" "(3d) the pool advertised gpu, so no online runner taking it IS the fault"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "(3d) and the deny keeps the pool engaged"
 
 # ⛔ THE ANTI-FLAPPER (#2327's decision). In mode=github the pool is stripped ON PURPOSE, so "no online
 # runner offers ubuntu-latest" is the CORRECT state. Denying on it would re-engage the fallback on
@@ -1031,6 +1086,30 @@ KEEP_STATE=1
 run_gate dry-blind Scheduled GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=forbidden --
 assert_contains "$OUT" "BLIND alarm SENT" "(12) the next SCHEDULED pass still alarms — the dry-run did not silence it"
 
+# ⛔ (16) A COULD-NOT-MEASURE PASS LEFT THE PREVIOUS PASS'S GREEN STANDING (#3002 review P2, round 3).
+# The verdict file's own contract is "the CURRENT verdict, not a log" — AND it is what a scheduler
+# branches on. Only the CENSUS_BLIND branch wrote `verdict=unknown`; the script's other could-not-measure
+# exits (a failed queue probe, an unreadable count/age/threshold/floor, a saturated page) wrote nothing
+# and deleted nothing, so the file went on advertising the last GREEN through a run of failed passes.
+echo "── #3002 P2 (round 3): a could-not-measure pass must not leave the previous GREEN standing ──"
+run_gate stale-verdict GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=2 GH_CENSUS="busy,busy" --
+assert_eq "$RC" "0" "(16) a readable pass routes and writes its verdict"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "verdict=github" \
+  "(16) the file carries THIS pass's answer"
+KEEP_STATE=1
+run_gate stale-verdict Unreadable GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=null --
+assert_eq "$RC" "2" "(16) an unreadable in_progress count is could-not-measure (no action either way)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "verdict=unknown" \
+  "(16) the verdict file says UNKNOWN — the stale green does not survive a pass that measured nothing"
+assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "verdict=github" \
+  "(16) the old bug, pinned: a green from a previous pass readable as the CURRENT answer"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "runners=unmeasured" \
+  "(16) FIELD PARITY: a census that was never read is unmeasured, not absent"
+KEEP_STATE=1
+run_gate stale-verdict DryRun GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=null -- --dry-run
+assert_eq "$RC" "2" "(16b) --dry-run still reports the refusal"
+assert_contains "$OUT" "verdict NOT updated: --dry-run" "(16b) and SAYS it left the file alone"
+
 # ⛔ (13) A LABEL'S CONTENT IS NOT ROW STRUCTURE. The census reads EVERY runner in the repo, so one
 # runner labelled `my gpu box` used to make the whole inventory UNREADABLE — exit 2 forever, the
 # fleet's only CI routing instrument frozen, with an alarm blaming a permission problem on a read that
@@ -1101,6 +1180,13 @@ run_gate status-blind GH_FALLBACK_N=1 GH_CENSUS_MODE=forbidden -- --status
 assert_eq "$RC" "2" "(9) --status with an unreadable census exits 2"
 assert_contains "$OUT" "capacity=unknown" "(9) and says UNKNOWN rather than reporting a count it did not read"
 assert_contains "$OUT" "capability=runner_inventory:needs-admin" "(9) naming the capability"
+# ⛔ THE KEY SET IS A PROPERTY OF THE SURFACE, NOT OF A WRITER (#3002 review P2, round 3): the success
+# arm above asserts the eight census keys and THIS arm used to print `capacity=unknown  capability=…`
+# — no census keys at all — so a parser could not tell "not measured" from "this writer does not emit
+# that key". Every writer of `capacity=` now speaks the same key set.
+assert_contains "$OUT" "online_idle=unmeasured" "(9b) an unread census is emitted as unmeasured, not omitted"
+assert_contains "$OUT" "runners=unmeasured" "(9b) …including the runner count"
+assert_contains "$OUT" "demand=unmeasured" "(9b) …and the demand key"
 
 # ── MUTATIONS — each arm must be load-bearing ────────────────────────────────────────────────────
 # Without these, (1)-(9) could be satisfied by a script that prints the right words. Each mutation
@@ -1223,6 +1309,72 @@ if mutate_gate "$MUT4" \
   fi
 else
   bad "(m4) the mutant could not be generated (anchor moved) — the stderr split is unproven"
+fi
+
+# (m5) THE DENY'S SCOPE COLLAPSED BACK TO ONE CONDITION: every demand counts as "claimed", so the
+# pool's own advertisement is no longer consulted and a `macos-latest` queue head pins mode=local.
+MUT5="$T/ci_runner_gate.mutant-claim.sh"
+if mutate_gate "$MUT5" \
+  '  [ -n "$CENSUS_OFFERED" ] || return 1' \
+  '  return 0   # MUTANT::m5 — every demand is "claimed", the pool is never asked what it advertises'; then
+  ok "(m5) the always-claimed mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT5"
+  run_gate mutant-claim GH_QUEUED=5 GH_FALLBACK_N=2 GH_INPROGRESS=2 \
+    GH_DEMAND="macos-latest" GH_CENSUS="idle,idle" --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  assert_eq "$RC" "0" "(m5) the mutant still RUNS — so the red below is the property, not a crash"
+  if grep -qF "capacity=stranded" <<<"$OUT"; then
+    ok "(m5) mutation killed: with every demand claimed, a macos-latest head reads as STRANDED — the deny that pinned mode=local forever, restored (arm 3b reddens)"
+  else
+    bad "(m5) MUTATION SURVIVED: a demand the pool never advertised is the point, and it did NOT deny"
+  fi
+else
+  bad "(m5) the mutant could not be generated (anchor moved) — the claim rule is unproven"
+fi
+
+# (m6) THE DEMAND ARM READS THE STATES ITSELF AGAIN: demand-matching exhaustion with OTHER runners idle
+# certifies `saturated` — the "9 busy while 7 idle" misreading, one arm over.
+MUT6="$T/ci_runner_gate.mutant-demand-arm.sh"
+if mutate_gate "$MUT6" \
+  '  if [ "$CENSUS_ON_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi' \
+  '  if [ "$demand_usable" = 1 ] && [ "$CENSUS_DEMAND_IDLE" -eq 0 ] && [ "$CENSUS_DEMAND_BUSY" -gt 0 ]; then CENSUS_VERDICT=saturated; return 0; fi   # MUTANT::m6 — the demand arm read the states itself
+  if [ "$CENSUS_ON_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi'; then
+  ok "(m6) the demand-arm mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT6"
+  run_gate mutant-demand-arm GH_QUEUED=54 GH_FALLBACK_N=1 GH_INPROGRESS=2 \
+    GH_CENSUS="busy@self-hosted|Linux|X64|self-hosted-x64|ubuntu-latest,idle@self-hosted|Linux|X64|self-hosted-x64,idle@self-hosted|Linux|X64|self-hosted-x64" --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  assert_eq "$RC" "0" "(m6) the mutant still RUNS — so the red below is the property, not a crash"
+  if grep -qF "capacity=saturated" <<<"$OUT"; then
+    ok "(m6) mutation killed: the demand arm certifies saturated over 2 idle runners — the misreading the PR exists to remove, restored (arm 2c reddens)"
+  else
+    bad "(m6) MUTATION SURVIVED: 1 busy demand-matching runner + 2 idle others did NOT certify as saturated"
+  fi
+else
+  bad "(m6) the mutant could not be generated (anchor moved) — the one-state-reading rule is unproven"
+fi
+
+# (m7) A COULD-NOT-MEASURE PASS WRITES NOTHING AGAIN, so the previous pass's GREEN survives it.
+MUT7="$T/ci_runner_gate.mutant-stale-verdict.sh"
+if mutate_gate "$MUT7" \
+  '    if [ "$DRY" = 1 ]; then
+      log "verdict NOT updated: --dry-run' \
+  '    if true; then   # MUTANT::m7 — the non-blind could-not-measure path writes nothing, as before
+      log "verdict NOT updated: --dry-run'; then
+  ok "(m7) the stale-verdict mutant was generated from the SHIPPED gate"
+  GATE_UNDER_TEST="$MUT7"
+  run_gate mutant-stale-verdict GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=2 GH_CENSUS="busy,busy" --
+  KEEP_STATE=1
+  run_gate mutant-stale-verdict Unreadable GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=null --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  assert_eq "$RC" "2" "(m7) the mutant still RUNS the refusal — so the red below is the property, not a crash"
+  if [ "$(grep -c 'verdict=github' "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" != "0" ]; then
+    ok "(m7) mutation killed: the previous pass's green is left standing over a pass that measured nothing (arm 16 reddens)"
+  else
+    bad "(m7) MUTATION SURVIVED: the stale GREEN did not stand after a could-not-measure pass"
+  fi
+else
+  bad "(m7) the mutant could not be generated (anchor moved) — the current-verdict contract is unproven"
 fi
 
 echo "── --dry-run and --status stay read-only ──"
