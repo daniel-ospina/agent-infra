@@ -46,7 +46,20 @@ reap() {
 # `fixture-hermetic.sh` starts each fixture in its own group, records the group, and on EXIT reaps it
 # and VERIFIES it is gone (a survivor fails the suite, because a false PASS is half the defect).
 # shellcheck source=/dev/null
+# ⛔ FAIL CLOSED ON THE LOAD ITSELF (review, cycle 2). Under `set -uo pipefail` (no `set -e`) a failed
+# `.` prints a diagnostic and the script CONTINUES: `fixture_guard_placement` then dies with 127, the
+# suite runs unguarded, and there is no EXIT reaper — the exact pre-#3011 behaviour, while looking
+# normal. `run-bash-shards.sh` already refuses in this situation; a suite run directly owes the same
+# contract, or the "enforcer that cannot fire" class returns through the other door.
+[ -r "$HERE/fixture-hermetic.sh" ] || {
+  echo "  ❌ missing $HERE/fixture-hermetic.sh — refusing to run fixtures that cannot be guarded or reaped" >&2
+  exit 2
+}
 . "$HERE/fixture-hermetic.sh"
+command -v fixture_guard_placement >/dev/null 2>&1 || {
+  echo "  ❌ $HERE/fixture-hermetic.sh did not define the placement guard — refusing to run unguarded" >&2
+  exit 2
+}
 # ⛔ AND REFUSE TO RUN AT ALL ON A LIVE CELL (#3011): a cell is a capacity resource, and its load is
 # the fleet's own dispatch signal. Keyed on a controller EXECUTING from a cell root, never on the
 # directory existing — a stale `/tmp/cell-home` on a laptop must not block a local run.

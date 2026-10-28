@@ -38,7 +38,13 @@ fixture_hermetic_init "$T/.pgids" "$T"
 plant() { # plant <dir> -> prints pid
   local d="$1" f
   mkdir -p "$d/scripts/orchestrator-harness"
-  f="$(mktemp -u "${TMPDIR:-/tmp}/fixture-hermetic-fifo.XXXXXX")"; mkfifo "$f" 2>/dev/null
+  # ⛔ THE FIFO LIVES INSIDE $T, NOT IN /tmp (agent-infra#3011 residue). `mktemp -u` never creates a
+  # file, so a /tmp path here leaves one junk fifo per plant (4+ per run) — the same residue the
+  # sibling fix in harness-refresh.test.sh moved inside its own temp dir. AND `mkfifo` MUST SUCCEED:
+  # a failing one leaves a plant whose `read` exits immediately, which turns H8 into a full recursive
+  # shard run, with the guard under test as its only bound.
+  f="$(mktemp -u "$T/fixture-hermetic-fifo.XXXXXX")"
+  mkfifo "$f" || { echo "  ❌ plant: mkfifo failed at $f"; exit 1; }
   printf 'read -r _ < %s\n' "$f" > "$d/scripts/orchestrator-harness/orch-loop.sh"
   fixture_start_group bash "$d/scripts/orchestrator-harness/orch-loop.sh"
 }
@@ -113,6 +119,15 @@ grep -q 'fixture_hermetic_init' "$REFRESH_TEST"; ck "harness-refresh.test.sh ins
 grep -qE "^[[:space:]]*trap 'rm -rf" "$REFRESH_TEST"; rc=$?
 ck "…and no bare 'rm -rf'-only trap remains in CODE (it reaped nothing)" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)"
 grep -q 'fixture_guard_placement' "$REFRESH_TEST"; ck "…and it refuses to run on a live cell" $?
+# ⛔ AND PIN THE START ITSELF, NOT JUST THE TRAP (review, cycle 2). With the arms above satisfied, a
+# revert of `start_ctrl` to the old `bash … &` leaves EVERY arm green: the trap still exists, the
+# guard still exists, the ledger merely stays empty because nothing records a group — and the suite
+# passes while leaking again. That is precisely the false PASS this change exists to close, one
+# layer up. Anchored to `^[[:space:]]*` so the explanation in that file's own comment cannot satisfy
+# it (the same trap the bare-`rm -rf` arm above was already fixed for).
+grep -qE '^[[:space:]]*fixture_start_group bash ' "$REFRESH_TEST"; ck "…and start_ctrl starts the controller in its OWN group" $?
+grep -qE '^[[:space:]]*bash "\$1/scripts/orchestrator-harness/orch-loop\.sh"' "$REFRESH_TEST"; rc=$?
+ck "…and no bare background 'bash …' start remains in CODE (it is not its own group)" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)"
 
 echo "=== H7: the single shard seam guards every suite it runs ==="
 grep -q 'fixture_guard_placement' "$SHARDS"; ck "run-bash-shards.sh calls the placement guard" $?
@@ -130,6 +145,11 @@ ck "--list still works on an ordinary box (rc=$rc)" "$([ "$rc" -eq 0 ] && echo 0
 case "$LIST_OUT" in *fixture-hermetic.test.sh*) ok "…and it derives this new suite into the shard list (wired by the file, not by an edit)" ;;
                               *) bad "the new suite is not in the derived list" ;; esac
 ROOT8="$T/root8"; P8="$(plant "$ROOT8" | tail -1)"
+# ⛔ WITHOUT THIS PRECONDITION H8 MEASURES NOTHING: a dead plant means the guard correctly finds no
+# controller, rc is 0, and the assertion fails for a reason that is about the FIXTURE, not the guard —
+# or, worse, the full shard list executes (H4 already carries the same precondition; H8 lacked it).
+sleep 0.3
+ck "…and the plant is ALIVE before driving the driver (pid $P8) — otherwise the refusal is vacuous" "$(alive "$P8" && echo 0 || echo 1)"
 OUT="$(FIXTURE_LIVE_ROOTS="$ROOT8" bash "$SHARDS" 2>&1)"; rc=$?
 ck "the shipped driver REFUSES to run shards on a live cell (rc=$rc, want 78)" "$([ "$rc" -eq 78 ] && echo 0 || echo 1)"
 case "$OUT" in *"REFUSES TO RUN ON A LIVE CELL"*) ok "…with its own refusal, not a shard failure" ;;
