@@ -5934,8 +5934,13 @@ def test_two_repos_PRN_share_no_worker_artifact(tmp_path, monkeypatch):
         fh.write("[load-gate] REFUSED: load1 96 > ceiling 80\n")
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")   # B's own worker vanished
     monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
-    verdict, detail = pr._confirm(b["name"])
+    # ⛔ THREE-TUPLE (#2291): `_confirm()` carries the GATE's axis as its third element.
+    # The arity is not cosmetic here -- the axis is what makes the "did B read A's refusal?"
+    # question answerable in the machine surface, so the arm pins BOTH: B's verdict is not
+    # `refused`, and it carries no axis (a `load` bound arriving here would be A's 75).
+    verdict, detail, bound = pr._confirm(b["name"])
     assert verdict != "refused", "repo B read repo A's 75 as its own verdict: %r" % (detail,)
+    assert bound == "", "repo B inherited repo A's gate axis: %r" % (bound,)
     pr.canonical_paths()
 
 
