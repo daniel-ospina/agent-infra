@@ -1012,6 +1012,186 @@ cap_wip_snapshot() {
   return 1
 }
 
+# ── THE EXIT PATH: a lane that ENDS preserves its work too, not only one that is KILLED (#2834) ──
+# ⛔ THE MEASUREMENT (#2834). `cap_wip_snapshot` above fires on ONE termination path — the wall-clock
+# cap — and that path is not the common one. On a single fleet session of 373 dispatched lanes,
+# `hit its … cap` appeared in ZERO lane logs, and 148 of those 373 worktrees were left holding
+# uncommitted or unpushed work. So the cap-kill data-loss mechanism (#2045) was fixed and THE
+# COMMONER ONE WAS NOT: a lane that finishes its turn, stops at a gate, or decides to restart simply
+# ends, and nothing ever looked at its tree. The failure is silent in exactly the #2045 shape — the
+# report says the lane is IN PROGRESS, the branch has no new commit, and the only copy of the work is
+# a scratch worktree a reaper will eventually remove.
+#
+# ⛔ THE SHIPPED `scripts/bg-rescue-wip.sh` (#2045) WAS WIRED TO *NOTHING* IN THIS REPO. Its contract
+# is the one that actually survives a reaped worktree — a commit under `refs/wip/<slug>` ON ORIGIN,
+# built through a throwaway index with `commit-tree` (never `git stash`, whose ref is repo-global and
+# whose `pop` silently drops a PEER lane's entry). The operator copy was called only from an
+# unshipped `bg-dispatch.sh`, and the operator's own copy of that call was a SILENT NO-OP for a whole
+# session: `cd "$WT"` ran before `_HERE` was resolved from a RELATIVE `BASH_SOURCE`, so every call
+# named `<worktree>/bg-rescue-wip.sh`, and `[ -f … ] && bash …` degenerated to `false`. Both halves of
+# this leg are therefore load-bearing: the CALL here, and the LOUD line when the script cannot be
+# found (a missing rescuer must never read as "nothing to rescue" — that is the same silent skip one
+# layer down, and it is what let 148 dirty worktrees accumulate while a rescue "existed").
+#
+# ⛔ WHY HERE, AT THE END OF `run_agent`, AND NOT IN EACH LAUNCHER. `lane.sh`, `fix-one.sh` and
+# `nonblocking-dispatch.sh` are three entry points with three exit paths and three report formats;
+# `merge-one.sh` has a fourth `run_agent` of its own. At the END of `run_agent` "the agent has stopped"
+# is KNOWN (the hard kill, if any, has already landed), so every caller in the tree gets the guarantee
+# by construction — the same argument #1932 used to put the venv teardown beside the spawn. A
+# launcher that adds its own copy would be the `fourth launch path` this file's census exists to
+# refuse.
+#
+# ⛔ THE ROOT IS `WIP_PATH`, THEN `$PWD` — NEVER A GUESS. `fix-one.sh` `cd`s into the MAIN checkout and
+# only NAMES the fixer's worktree in the agent's prompt, so `$PWD` there is NOT the tree the work is in;
+# it already sets `WIP_PATH="$WT"` for the cap snapshot, for exactly this reason. Archiving the main
+# checkout instead would be worse than no rescue: it would report a capture the lane never received,
+# and it would push a ref of a tree nobody was working in.
+#
+# ⛔ THREE VERDICTS, AND `cannot-verify` IS NOT `clean`. A `git status` that cannot run (corrupt
+# index, ENOSPC, EACCES, safe.directory) is CANNOT-VERIFY — the repo's own ruling for this call, and
+# the reason the pre-check is fail-closed rather than a `[ -z "$(git status)" ]` one-liner.
+#
+# ⛔ UNPUSHED COMMITS ARE MEASURED, AND DELIBERATELY NOT PUSHED. #2834 asks for "a dirty tree OR
+# unpushed commits"; the rescue archives UNCOMMITTED work and says so in its own declared LIMITS
+# (pushing a branch is a different, destructive-shaped operation: `refs/wip/<slug>` is keyed by branch
+# name, so a rescue from a reused branch must never move the branch, and a lane must never push a
+# branch that is not its own). What the exit path owes in that case is that the fact stops being
+# silent, so it is MEASURED and NAMED in the terminal record: a branch's commits live in the repo's
+# own object database and survive the WORKTREE being removed, so the residual risk is the BRANCH being
+# deleted — which is a different defect with a different fix, and it is not claimed here.
+#
+# ⛔ IT RUNS ON THE CAP PATH TOO. The cap snapshot is LOCAL (`$O/wip/capwip-*`, on the box that may be
+# about to be reaped or wiped); the ref is off-box. #2834's ask 1 says the timeout watcher keeps its
+# own call and that a double rescue is harmless (it accumulates onto the previous archive commit).
+#
+# ⛔ AND IT COSTS A NETWORK CALL ONLY WHEN THERE IS SOMETHING TO SAVE. The majority of lanes end with a
+# clean tree; the pre-check below is one `git status` and one `rev-list`, and the rescue (whose own
+# network calls are internally bounded: 25 s fetch, 45 s push) is reached only for a tree that is
+# dirty or unreadable. A per-lane push for every clean lane would be a rate-limit defect of its own, on
+# an account 22 concurrent landers already share.
+LANE_END_TREE=""        # dirty | clean | unpushed-only | cannot-verify | not-a-worktree | not-measured
+LANE_END_RESCUE=""      # refs/wip/<slug>@<sha> | nothing | FAILED | UNAVAILABLE | DISABLED
+LANE_END_REF=""         # the local ref that pins the archived commit (empty when nothing was archived)
+LANE_END_UNPUSHED=0     # commits on this branch that exist only locally — NAMED, never pushed (above)
+LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
+
+# wip_rescue_path — resolve scripts/bg-rescue-wip.sh the way the other helpers are resolved. `$O` is
+# seeded FILE BY FILE, so a new spawn-gate.sh can run beside an `$O` that predates the rescue; the
+# harness dir is the second home, and the two farmed copies are last so an operator's install wins.
+wip_rescue_path() {
+  local c here
+  if [ -n "$LANE_WIP_RESCUE_SH" ]; then printf '%s\n' "$LANE_WIP_RESCUE_SH"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+  for c in "${O:-}/bg-rescue-wip.sh" "$here/bg-rescue-wip.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/bg-rescue-wip.sh" \
+           "${HOME:-}/.pi/agent/scripts/bg-rescue-wip.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    LANE_WIP_RESCUE_SH="$c"
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
+# terminal_wip_rescue <label> <rc> <cap-hit> <logfile>
+# Sets LANE_END_TREE / LANE_END_RESCUE / LANE_END_REF / LANE_END_UNPUSHED, appends the terminal record
+# to `state/lane-end.tsv` and writes the human line into the agent's log. Returns 0 always (a rescue
+# must never change the lane's exit status — the lane's work and its status are different facts).
+terminal_wip_rescue() {
+  local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" log="${4:-/dev/null}"
+  local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 at_risk=0 l
+  root="${WIP_PATH:-$PWD}"
+  LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0
+  if [ "${WIP_RESCUE_DISABLE:-0}" = "1" ]; then
+    LANE_END_TREE="not-measured"; LANE_END_RESCUE="DISABLED"
+    echo "[wip] end label=$label rc=$rc cap=$cap tree=not-measured rescue=DISABLED — WIP_RESCUE_DISABLE=1 (an operator escape hatch, not a default): the tree at $root was NOT examined, so this lane's uncommitted work (if any) is on this disk only" >> "$log" 2>/dev/null || true
+    return 0
+  fi
+  if ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+    LANE_END_TREE="not-a-worktree"; LANE_END_RESCUE="UNAVAILABLE"
+    echo "[wip] end label=$label rc=$rc cap=$cap tree=not-a-worktree rescue=UNAVAILABLE — $root is not a git worktree, so a rescue cannot be pointed at it. If this lane's work lives elsewhere, the caller must pass WIP_PATH=<that worktree> (fix-one.sh does); nothing was examined here and this line is NOT a verdict that the worktree was clean" >> "$log"
+    return 0
+  fi
+  # ── one read, and it must be able to FAIL ────────────────────────────────────────────────────
+  st_out="$(GIT_OPTIONAL_LOCKS=0 git -C "$root" status --porcelain -uall 2>/dev/null)"; st_rc=$?
+  head_ok=0
+  git -C "$root" rev-parse -q --verify HEAD >/dev/null 2>&1 && head_ok=1
+  if [ "$head_ok" = 1 ]; then
+    unpushed="$(git -C "$root" rev-list --count HEAD --not --remotes 2>/dev/null)"
+    is_num "${unpushed:-}" || unpushed=0
+  fi
+  LANE_END_UNPUSHED="$unpushed"
+  if [ "$st_rc" -ne 0 ]; then
+    LANE_END_TREE="cannot-verify"; at_risk=1
+  elif [ -n "$st_out" ]; then
+    LANE_END_TREE="dirty"; at_risk=1
+  elif [ "$unpushed" -gt 0 ] 2>/dev/null; then
+    LANE_END_TREE="unpushed-only"
+  else
+    LANE_END_TREE="clean"
+  fi
+  br="$(git -C "$root" branch --show-current 2>/dev/null)"
+  [ -n "$br" ] || br="detached-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unborn)"
+  slug="$(printf '%s' "$br" | tr '/' '-')"
+  if [ "$at_risk" -eq 0 ]; then
+    LANE_END_RESCUE="nothing"
+    echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=nothing unpushed=$unpushed ref=<none> — the worktree at $root holds no uncommitted work, so nothing was lost and no rescue was attempted" >> "$log"
+    if [ "$unpushed" -gt 0 ] 2>/dev/null; then
+      echo "[wip] NOTE label=$label: $unpushed commit(s) on $br exist ONLY locally. bg-rescue-wip.sh archives UNCOMMITTED work by design and does not push a branch, so they were not pushed. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log"
+    fi
+  else
+    if ! out="$(wip_rescue_path)"; then
+      LANE_END_RESCUE="UNAVAILABLE"
+      echo "[wip] ⛔ end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=UNAVAILABLE — the worktree at $root has work that is NOT archived and bg-rescue-wip.sh was NOT FOUND (looked in \$O, the harness dir, \$AGENT_INFRA_PATH/scripts and ~/.pi/agent/scripts). That work is on this disk ONLY and is lost if the worktree is reaped. This line exists because a MISSING rescuer used to be a silent skip (see the #2834 note above), which is how dirty worktrees accumulated while a rescue 'existed'" >> "$log"
+    else
+      case "$cap" in
+        1) note="lane hit its cap (rc=$rc)" ;;
+        *) note="lane ended before its cap (rc=$rc)" ;;
+      esac
+      # Output is CAPTURED and replayed rather than streamed, so a partial write cannot interleave on
+      # the lane's own log, and so the verdict below follows the SHIPPED script's exit status rather
+      # than a grep of prose it might change.
+      outf="$(mktemp "${TMPDIR:-/tmp}/wip-exit.XXXXXX" 2>/dev/null)"
+      if [ -n "$outf" ]; then
+        bash "$out" "$root" "$note" > "$outf" 2>&1; rc2=$?
+        if [ -s "$outf" ]; then
+          while IFS= read -r l; do printf '[wip]   %s\n' "$l" >> "$log"; done < "$outf"
+        fi
+        rm -f "$outf"
+      else
+        bash "$out" "$root" "$note" >> "$log" 2>&1; rc2=$?
+      fi
+      if [ "$rc2" -eq 0 ]; then
+        # The archive commit is pinned by `refs/wip-local/<slug>` in this clone (bg-rescue-wip sets it
+        # under a checked update-ref) and pushed to `refs/wip/<slug>` on origin. Read the LOCAL ref for
+        # the sha: it is the same commit, and it is readable without a network round trip.
+        if git -C "$root" rev-parse -q --verify "refs/wip-local/$slug" >/dev/null 2>&1; then
+          LANE_END_REF="refs/wip-local/$slug@$(git -C "$root" rev-parse --short "refs/wip-local/$slug" 2>/dev/null)"
+          LANE_END_RESCUE="refs/wip/$slug"
+        else
+          LANE_END_RESCUE="nothing"
+        fi
+      else
+        LANE_END_RESCUE="FAILED"
+      fi
+      echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=$LANE_END_RESCUE unpushed=$unpushed ref=${LANE_END_REF:-<none>} — trigger: $note" >> "$log"
+      if [ "$LANE_END_RESCUE" = "FAILED" ]; then
+        echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
+      fi
+    fi
+  fi
+  # The append-only ledger, beside capwip.tsv: "the lane finished" and "the lane vanished" used to
+  # read identically in `bg/dispatch.log`, which records only the START. One row per terminal, on
+  # every path — the same rule cap_wip_record follows, for the same reason (an absence must not be the
+  # only signal).
+  local o_root="${O:-${HOME:-$PWD}/orchestrator}"
+  mkdir -p "$o_root/state" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$rc" "$cap" \
+    "$LANE_END_TREE" "$LANE_END_RESCUE" "${LANE_END_REF:-}" "$unpushed" \
+    >> "$o_root/state/lane-end.tsv" 2>/dev/null
+  return 0
+}
+
 # ── the lane LIFETIME bound (2026-10-27) ────────────────────────────────────────────────────────
 # THE WALL CLOCK WAS THE ONLY AXIS, AND IT CANNOT TELL SLOW FROM STALLED. Measured 2026-10-27: nine
 # lanes across two cloud cells parked with 0 bytes of output and `00:00:00` CPU, the oldest for
@@ -1610,6 +1790,18 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     AGENT_CAP_HIT=1
     cap_wip_snapshot "$label" "$t" "$elapsed" "$rc" "$log" || true
   fi
+  # ── THE EXIT PATH (#2834) — the COMMONER termination, and until now the uncovered one ──────
+  # `cap_wip_snapshot` above fires only when `elapsed >= t`; a lane that finishes its turn, stops at
+  # a gate or restarts reaches HERE instead, and its uncommitted work used to be looked at by
+  # nothing (measured: 148 of 373 worktrees left dirty, `hit its … cap` in 0 lane logs). The
+  # shipped `scripts/bg-rescue-wip.sh` is the tool that puts the work on ORIGIN under
+  # `refs/wip/<slug>`, where a reaped worktree cannot take it — and it was wired to nothing in this
+  # repo. See the block above `terminal_wip_rescue` for the mechanism, the three verdicts and the
+  # two things it deliberately does not claim.
+  # ⛔ AFTER the cap snapshot and AFTER the walltime row, so a rescue can never delay the kill, and
+  # never changes `rc`: a lane's exit status and the fate of its worktree are different facts, and a
+  # caller that conflated them would re-run a lane because a PUSH failed.
+  terminal_wip_rescue "$label" "$rc" "$AGENT_CAP_HIT" "$log"
   return "$rc"
 }
 
