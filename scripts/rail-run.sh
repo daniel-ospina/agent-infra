@@ -817,7 +817,12 @@ derive() {
     merged="$(printf '%s' "$out" | cut -d' ' -f2)"
     [ -n "$merged" ] || merged="-"
     if [ -z "$prst" ]; then
-      abstain_why="the read of PR $pr in $slug abstained, or its url did not name $slug/pull/$pr — so the API did not confirm which PR this is"
+      # ⛔ NAME THE HOST THAT WAS COMPARED (review round 7). `unknown` is the right answer and it is
+      # useless without the value that produced it: the run records the host at `start`, and a lane
+      # reading only "the read abstained" cannot tell "my origin names a mirror" from "the API is
+      # down" — so it re-polls a run that can never resolve. The host is printed as recorded (and the
+      # default is spelled out when the run recorded none), with the knob that overrides it.
+      abstain_why="the read of PR $pr in $slug abstained, or its url did not name $slug/pull/$pr on host $(file_or_empty "$rd/host" | sed 's/^$/github.com/') — so the API did not confirm which PR this is. If this checkout's origin cannot attest its host, set RAIL_RUN_GH_HOST=<web host> for the run"
     fi
     return 0
   }

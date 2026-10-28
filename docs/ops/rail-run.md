@@ -51,6 +51,9 @@ State lives under `${RAIL_RUN_DIR:-${O:-$HOME/orchestrator}/state/rail-run}/<rep
 joined into a
 path; a directory with neither a `log` nor a `repo` — e.g. the `.starting` claim — is not a run). Knobs: `RAIL_RUN_DIR`, `RAIL_RUN_RAIL` (the rail, default `admin-merge.sh` beside
 this script), `RAIL_RUN_REPO_SLUG` (pin the repo identity instead of resolving `origin`),
+`RAIL_RUN_GH_HOST` (pin the **web host** the artifact URL must name — for a checkout whose `origin`
+names a mirror, an ssh alias, or a transport port that the web URL never carries; unset, the host is
+resolved from `origin`, `--repo`, or the identity pin, and defaults to `github.com`),
 `RAIL_RUN_CLAIM_MAX` (60 s) and `RAIL_RUN_RECORD_MAX` (24 h). **Both must be positive integers**: an
 unreadable value is refused at load (`exit 2`, naming the knob) rather than silently used, because an
 erroring `[ -le ]` answers "not young", which would judge a live claim stale and let a second rail

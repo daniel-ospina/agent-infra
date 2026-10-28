@@ -713,6 +713,17 @@ assert_rc 25 "$RC" "HOST: a MERGED read from another host is NOT a landing"
 assert_state "$TXT" unknown "HOST: it abstains"
 OUT="$(GH_MODE=merged poll 163)"; assert_rc 0 "${OUT%%|*}" "HOST: the same run lands when the host matches"
 
+# ── AG1b: the abstention NAMES the host it compared, and the knob that pins it ─────────────────
+# `unknown` is the correct state here, and on its own it is not actionable: the run RECORDS the host
+# at `start`, so a line that omits it leaves a lane unable to tell "my origin names a mirror" from
+# "the forge is down" — and it re-polls a run that can never resolve. The line names the recorded
+# host and the override, so the reader's next action is visible in the same row.
+craft 184 hostmismatch rc=0 host=ghe.example.com >/dev/null
+OUT="$(GH_MODE=merged poll 184)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "HOST-ABSTAIN: a github.com URL is not this run's landing"
+assert_contains "$TXT" "on host ghe.example.com" "HOST-ABSTAIN: the abstention names the RECORDED host"
+assert_contains "$TXT" "RAIL_RUN_GH_HOST" "HOST-ABSTAIN: and names the knob that pins it"
+
 # ── AG2: the host is RESOLVED from `origin`, not assumed to be github.com ────────────────────
 # Every arm above PINS the host (`RAIL_RUN_GH_HOST` or a hand-built run dir), so `resolve_host` had
 # no coverage at all — and it validated the host BEFORE stripping the `user@` prefix, so an ssh
