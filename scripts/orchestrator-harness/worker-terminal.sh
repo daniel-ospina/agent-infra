@@ -409,10 +409,12 @@ wt_tmux_server_token() { wt_tmux_server_token_value >/dev/null 2>&1; }
 # the verdict: on the server-token arm the launch line neither exports a token nor reads a file for it
 # — the pane inherits it from the SERVER — so the caller-side pre-flight of the launch line has to be
 # given what the pane would inherit, or it would judge an arm it cannot see (`wt_spawn`, the P1 fix).
-wt_tmux_server_token_value() {
+wt_tmux_server_token_value() { # [<name>] — with a name, asks the SERVER about that ONE variable
   local n v
   command -v tmux >/dev/null 2>&1 || return 1
-  for n in GH_TOKEN GITHUB_TOKEN; do
+  # `$1` narrows the probe to a single name (the lane MODEL credential, whose provider models.json
+  # names); no argument keeps the original question, the two names gh honours.
+  for n in ${1:-GH_TOKEN GITHUB_TOKEN}; do
     v="$(wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux show-environment -g "$n" 2>/dev/null)" || continue
     case "$v" in
       "$n="*) case "${v#"$n="}" in *[![:space:]]*) printf '%s\n' "${v#"$n="}"; return 0 ;; esac ;;
@@ -479,22 +481,48 @@ wt_launcher_env() {
   # cannot provision is refused BEFORE `tmux new-session`, because after it `wt_spawn` has already
   # reported success and the caller books an attempt for a lane that will die in seconds — the
   # measured shape that parked 12 PRs as "the reviewer produced no usable verdict".
-  local pvar="" pkeys="" phave=0 _pf
+  local pvar="" pkeys="" phave=0 _pf pdeliv=""
   pvar="$(wt_provider_key_var "$home")"
   if [ -n "$pvar" ]; then
-    wt_env_nonblank "$pvar" && phave=1
+    # ⛔ THE CALLER'S OWN VALUE IS CREDITED ON TWO CONDITIONS, NOT ONE (P1 review finding, 2026-10-27,
+    # MEASURED — this arm delivered NOTHING). It used to be `wt_env_nonblank` alone, which credits a
+    # value the pane will never hold, twice over:
+    #   (1) EXPORTED. A tmux client hands the server only EXPORTED variables, so a plain
+    #       `DEEPSEEK_API_KEY=x` satisfied the read here and reached no pane at all. Same rule, same
+    #       reason, as the gh arm's `_wt_exported` below.
+    #   (2) NO SERVER. `tmux new-session` inherits the CALLER's environment only when it CREATES the
+    #       server; against a running one the pane gets that server's global env. Measured on this box
+    #       (2026-10-27): exported caller var => 0 key occurrences in the worker env, plain var => 0,
+    #       the file arm => 1. A steady-state box has a server, so (2) is the NORMAL case.
+    # Without both, arm 3 (a file) and arm 2 (the server's own env) answer instead, and a box where
+    # neither does is REFUSED rather than handed a lane that dies at its first model call.
+    if wt_env_nonblank "$pvar" && _wt_exported "$pvar"; then
+      local _srv_rc=0
+      command -v tmux >/dev/null 2>&1 || return 1
+      wt_tmux_has_server || _srv_rc=$?
+      [ "$_srv_rc" = "1" ] && phave=1
+    fi
     if [ "$phave" = "0" ]; then
-      # Precedence: the box-local operator file first (what this box's own shell sources), then the
-      # cell's `keys.env` (the operator-pushed contract on a cell). Whichever ASSIGNS it is used.
+      # arm 2 — THE SERVER'S OWN ENVIRONMENT, which is what an already-running server hands the pane.
+      # Asked of the server for THIS name; a box whose supervisor exported the key is a working shape
+      # and must not be refused (the same arm the gh gate carries as `wt_tmux_server_token`).
+      case "$(wt_tmux_server_token_value "$pvar" 2>/dev/null)" in *[![:space:]]*) phave=1 ;; esac
+    fi
+    if [ "$phave" = "0" ]; then
+      # arm 3 — DELIVERY FROM A FILE this launch line sources. Precedence: the box-local operator file
+      # first (what this box's own shell sources), then the cell's `keys.env` (the operator-pushed
+      # contract on a cell). Whichever ASSIGNS it is used.
       for _pf in "$home/pi-keys.env" "$keys"; do
         [ -n "$_pf" ] && [ -f "$_pf" ] || continue
         wt_provider_credit "$pvar" "$_pf" && { pkeys="$_pf"; phave=1; break; }
       done
     fi
     if [ "$phave" = "0" ]; then
-      wt_warn "REFUSED a worker on '$(wt_lane_provider)': models.json resolves its credential from \$$pvar and NO source provides a value — not this caller's environment, not $home/pi-keys.env, not $keys. A worker started now dies at its first model call within seconds (pi: 'No API key found for $(wt_lane_provider)'), and the caller books that as a review that produced NO verdict and, at MAX_REVIEW_TRIES, PARKS the PR — measured 2026-10-26/27, 69 lane logs and 12 parked PRs. Refusing here spends nothing and leaves the PR queued, which is the honest state. Put the key where the worker can read it (a non-blank \$$pvar in $home/pi-keys.env or $home/keys.env)."
+      wt_warn "REFUSED a worker on '$(wt_lane_provider)': models.json resolves its credential from \$$pvar and NO source DELIVERS a value — not this caller's environment (a caller value counts only when it is EXPORTED *and* this spawn creates the tmux server, since a running server's environment shadows it), not the tmux server's own environment, not $home/pi-keys.env, not $keys. A worker started now dies at its first model call within seconds (pi: 'No API key found for $(wt_lane_provider)'), and the caller books that as a review that produced NO verdict and, at MAX_REVIEW_TRIES, PARKS the PR — measured 2026-10-26/27, 69 lane logs and 12 parked PRs. Refusing here spends nothing and leaves the PR queued, which is the honest state. Put the key where the worker can read it: a non-blank \$$pvar in $home/pi-keys.env or $home/keys.env, which this launch line sources with set -a."
       return 1
     fi
+    # What the pane check below should name as the delivery, so its refusal is diagnosable.
+    if [ -n "$pkeys" ]; then pdeliv="sourced from $pkeys"; else pdeliv="inherited from this spawn's environment (caller or tmux server; no file sourced)"; fi
   fi
   # ⛔ THE CALLER'S CREDIT MUST BE **EXPORTED** (P1 review finding, 2026-10-23, measured). A tmux client
   # hands the server — and therefore the pane — only EXPORTED variables, so a `GH_TOKEN=x` that is a plain
@@ -677,12 +705,18 @@ wt_launcher_env() {
   printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s || exit 98 ;; esac' "$_guard"
   # ── AND THE MODEL CREDENTIAL IS VERIFIED WHERE THE gh ONE IS — AFTER every source, against the
   # environment the worker will actually run with. This is the question a static grep cannot answer: did
-  # the delivery LAND? It is asked only when this spawn DELIVERED it (`pkeys`), so a box whose credential
-  # arrives by a path this gate did not model is unaffected — the same polarity as the gh guard's
-  # "a static grep is not proof the source exports it", without turning an unmodelled path into a refusal.
-  if [ -n "$pkeys" ]; then
-    printf '; case "${%s:-}" in *[![:space:]]*) : ;; *) echo "[worker-terminal] REFUSED: the model credential \$%s is still blank after sourcing %s — this lane could not authenticate a single model call" >&2; exit 98 ;; esac' \
-      "$pvar" "$pvar" "$pkeys"
+  # the delivery LAND?
+  # ⛔ IT RUNS ON EVERY ARM (P1 review finding, 2026-10-27, MEASURED) — it used to be gated on `pkeys`,
+  # i.e. on the FILE arm, so the CALLER arm (this box's normal one) emitted no check at all: the pane
+  # started with a blank key and died at its first model call on a spawn that reported provisioned. That
+  # is exactly the gate-on-the-file-credit mistake the gh guard above was fixed for, one credential over,
+  # so it takes the gh guard's shape: whenever the required NAME is positively known, the pane proves it
+  # holds a VALUE or refuses. Where the name is NOT known (`pvar` empty: an unreadable models.json, a
+  # literal apiKey, a provider pi authenticates itself) nothing is emitted and nothing refuses — our own
+  # blindness must never become a refusal loop (#2210).
+  if [ -n "$pvar" ]; then
+    printf '; case "${%s:-}" in *[![:space:]]*) : ;; *) echo "[worker-terminal] REFUSED: the model credential \$%s is blank in the worker (%s) — this lane could not authenticate a single model call" >&2; exit 98 ;; esac' \
+      "$pvar" "$pvar" "$pdeliv"
   fi
   return 0
 }
