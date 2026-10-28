@@ -163,8 +163,6 @@ async function commitDecision(contract: LaneContract): Promise<{ blocked: boolea
 
 // ════════════════════════════════════════════════════════════════════════════
 async function main() {
-  applyLaneContract; // imported for the KIND/TAG legs below
-
   // ── A. the derivation itself: what a process can observe about itself ─────
   section("A. derivation — headless + LINKED worktree is a lane; the hub is not");
 
@@ -245,6 +243,31 @@ async function main() {
     equal(childEnv.TAG, undefined, `a supervised child must keep TAG unset, got ${childEnv.TAG}`);
   });
 
+  await test("A9b — an INHERITED KIND (the child of a derived lane) is KEPT as observed, and still not inferred", () => {
+    // Review cycle 1, P1: `builtin-tools` spreads `process.env` into a child's
+    // env, so a `task` child of a DERIVED lane already carries the parent's
+    // `KIND=lane`/`TAG` — a shape A9 (which builds the child env from scratch)
+    // can never produce. Pinned here so nobody reads A9 as covering inheritance.
+    //
+    // The distinction is deliberate and load-bearing: A8 says a launcher-set
+    // value WINS, and this value was set by the launcher (the parent process).
+    // So `kind` reports what was OBSERVED and `why` truthfully says nothing was
+    // INFERRED — the two agree. What the child is then DISCLOSED as is
+    // `review-enforcer`'s audience model, which is agent-infra#2966's subject and
+    // is NOT decided here; this leg exists so the composition is visible.
+    const inheritedEnv: Record<string, string | undefined> = {
+      PI_MODE: "print",
+      TASK_HEARTBEAT: "1",
+      KIND: "lane",
+      TAG: "10137",
+    };
+    const c = deriveLaneContract({ env: inheritedEnv, argv: BARE_ARGV, cwd: FIXTURE.wtDirNamed });
+    equal(c.kind, "lane", "kind: an INHERITED KIND is OBSERVED and kept (a launcher-set value always wins — A8)");
+    equal(c.tag, "10137", "tag: an INHERITED TAG is kept, not replaced by the inferred one");
+    ok(/NOT inferred/.test(c.why), `why: nothing was INFERRED, which stays true beside an observed kind, got ${JSON.stringify(c.why)}`);
+    equal(applyLaneContract(inheritedEnv, c).kind, null, "applyLaneContract: still writes nothing over an inherited value");
+  });
+
   await test("A10 — a supervised child in the HUB is STILL guarded (the marker never touches the lane predicate)", async () => {
     // The fail-open this pins: "supervised ⇒ lane:true regardless of checkout"
     // would lift the hub gate for every task child in the hub, while A9 only
@@ -256,6 +279,55 @@ async function main() {
     equal(c.lane, false, `lane: expected false — TASK_HEARTBEAT must not make the HUB a lane, got true (${c.why})`);
     const { blocked } = await commitDecision(c);
     ok(blocked, "expected `git commit` to be blocked for a supervised child in the HUB — the hub gate was lifted");
+  });
+
+  // ── A11 — `GIT_*` cannot relocate the answer (T1, review cycle 1 P0) ──────
+  await test("A11 — an exported GIT_DIR at a linked worktree's gitdir does NOT turn the HUB into a lane", () => {
+    // The window A2 does not cover: `git rev-parse` honours an exported
+    // `GIT_DIR`, which OVERRIDES the cwd. Measured with real git from the hub —
+    // `--git-dir` = <hub>/.git/worktrees/w-10137, `--git-common-dir` = <hub>/.git,
+    // `--show-toplevel` = <hub> — so an UNSCRUBBED probe derives `lane: true` for
+    // a process sitting in the hub and lifts every skill gate there. The vector is
+    // proved real below before the derivation is asserted against it, so this
+    // test cannot pass by being vacuous.
+    const gitDir = join(FIXTURE.hub, ".git", "worktrees", "w-10137");
+    const saved = { GIT_DIR: process.env.GIT_DIR, PI_MODE: process.env.PI_MODE };
+    process.env.GIT_DIR = gitDir;
+    process.env.PI_MODE = "print";
+    try {
+      const raw = (flag: string) =>
+        execFileSync("git", ["rev-parse", flag], {
+          cwd: FIXTURE.hub,
+          env: { ...process.env, GIT_DIR: gitDir } as NodeJS.ProcessEnv,
+          encoding: "utf-8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+      const rawGitDir = realpathSync(resolve(FIXTURE.hub, raw("--git-dir")));
+      const rawCommonDir = realpathSync(resolve(FIXTURE.hub, raw("--git-common-dir")));
+      ok(
+        rawGitDir !== rawCommonDir,
+        `VECTOR NOT REAL: git under GIT_DIR=${gitDir} must report two DIFFERENT dirs from the hub, got ${rawGitDir} and ${rawCommonDir} — this test proves nothing unless it does`,
+      );
+      // …and the derivation must still refuse to call the HUB a lane. It reads
+      // process.env here (no `env` passed) because THAT is the real call site.
+      const c = deriveLaneContract({ argv: BARE_ARGV, cwd: FIXTURE.hub });
+      equal(
+        c.linkedWorktree,
+        false,
+        `linkedWorktree: expected false for the hub with GIT_DIR=${gitDir} exported — the probe must not be relocatable (git-dir=${c.gitDir} common=${c.commonDir})`,
+      );
+      equal(c.lane, false, `lane: expected false — an exported GIT_DIR must not derive a lane in the HUB, got true (${c.why})`);
+      // The same vector must not land through the TEST SEAM either: `options.env`
+      // has to be the env the probes actually run with, or the pin above is the
+      // only thing between an inherited GIT_DIR and the hub gate.
+      const viaSeam = deriveLaneContract({ env: { ...PRINT_ENV, GIT_DIR: gitDir }, argv: BARE_ARGV, cwd: FIXTURE.hub });
+      equal(viaSeam.lane, false, `lane: expected false with GIT_DIR supplied through options.env, got true (${viaSeam.why})`);
+    } finally {
+      if (saved.GIT_DIR === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = saved.GIT_DIR;
+      if (saved.PI_MODE === undefined) delete process.env.PI_MODE;
+      else process.env.PI_MODE = saved.PI_MODE;
+    }
   });
 
   // ── B. the wiring: what the enforcer actually decides about `git commit` ──
@@ -359,6 +431,16 @@ async function main() {
         blocked,
         `expected \`git commit\` to STILL be blocked with cwd=${FIXTURE.hub} (a headless run in the hub derives no lane) — it was allowed`,
       );
+    });
+
+    // M3: the GIT_* scrub (review cycle 1, P0). Reintroduce the defect by handing
+    // the probes the RAW environment, so an exported GIT_DIR relocates the read
+    // and the HUB derives a lane.
+    await expectRed("M3 — hub arm vs an exported GIT_DIR (the scrub is reverted)", async () => {
+      const mod = await mutatedModule("m3", "const gitEnv = scrubbedGitEnv(env);", "const gitEnv = env as Record<string, string>;");
+      const gitDir = join(FIXTURE.hub, ".git", "worktrees", "w-10137");
+      const c = mod.deriveLaneContract({ env: { ...PRINT_ENV, GIT_DIR: gitDir }, argv: BARE_ARGV, cwd: FIXTURE.hub });
+      equal(c.lane, false, `lane: expected false — an exported GIT_DIR must not derive a lane in the HUB, got true (${c.why})`);
     });
   }
 

@@ -61,14 +61,41 @@
  * the child in the hub, are pinned in
  * `extensions/shared/headless-lane.test.ts` with a mutation per arm.
  *
+ * ── ⛔ `GIT_*` MUST NOT BE ABLE TO RELOCATE THE ANSWER (T1, review cycle 1) ──
+ * The structural test is only as good as the repository git was asked about, and
+ * an EXPORTED `GIT_DIR` overrides the cwd. Measured with real git: from the hub
+ * with `GIT_DIR=<hub>/.git/worktrees/wt1`,
+ *
+ *     git rev-parse --git-dir         → <hub>/.git/worktrees/wt1
+ *     git rev-parse --git-common-dir  → <hub>/.git
+ *     git rev-parse --show-toplevel  → <hub>
+ *
+ * — two different directories, so an unscrubbed read derives `lane: true` for a
+ * process sitting IN THE HUB and lifts every skill gate there, while `why`
+ * reports a worktree that is the hub. `scripts/orchestrator-harness/merge-reminder.py`
+ * already keeps the same list (`GIT_ENV_DROP`) for the same reason: a git read
+ * must not be relocatable by an inherited environment. The list below is kept
+ * textually identical to it — two languages, so no shared constant is possible,
+ * but ONE list to keep in step, and this comment names the other copy.
+ *
  * ── WHY IT WRITES `KIND`/`TAG` BACK INTO THE ENVIRONMENT ───────────────────
  * `KIND`/`TAG` are the harness's own vocabulary, and consumers read them from
- * the ENVIRONMENT rather than from a derivation: the launcher-ownership reapers
- * match `TAG` against the process's own environ, and a child process inherits
- * whatever this process exports. A derived lane that left them empty would keep
- * working as a lane while being described, and cleaned up, as an anonymous
- * session. So `applyLaneContract` fills them in ONLY when absent (a launcher that
- * set them always wins) and only for a derived lane.
+ * the ENVIRONMENT rather than from a derivation. The write reaches exactly two
+ * places: (a) CHILD PROCESSES, which exec with the mutated environment, and
+ * (b) in-process consumers that read `process.env` LAZILY (after module load).
+ * A derived lane that left them empty would keep working as a lane while every
+ * child it spawned and every later reader described it as anonymous. So
+ * `applyLaneContract` fills them in ONLY when absent (a launcher that set them
+ * always wins) and only for a derived lane.
+ *
+ * ⛔ AND IT DOES **NOT** REACH THE REAPER FOR THIS PROCESS — a correction: the
+ * first version of this paragraph claimed the launcher-ownership reapers would
+ * see the inferred `TAG`, and `/proc/<pid>/environ` is fixed at EXEC, so a
+ * post-load `process.env.TAG = …` can never appear there. Verified: the value is
+ * in `process.env` and in a child's environ, and absent from this process's own
+ * `/proc/self/environ`. Reaper ownership for a derived lane is therefore NOT
+ * fixed by this write; that would be a reaper-side change (`pi-done-not-exited.py`
+ * reads the exec-time block on purpose) and is deliberately not attempted here.
  *
  * ⛔ WHAT THE WRITE DOES **NOT** REACH — stated because the first version of this
  * comment claimed it did, and a fresh reviewer falsified it. `review-enforcer`
@@ -142,11 +169,39 @@ function isSupervisedChild(env: Record<string, string | undefined>): boolean {
   return env.TASK_HEARTBEAT === "1" || env.AGENT_SKIP_REVIEW_GATE === "1";
 }
 
-/** `git <args>` in `cwd`, trimmed; null on any failure (absent git, not a repo, timeout). */
-function git(args: string[], cwd: string): string | null {
+/**
+ * The `GIT_*` variables that can RELOCATE a git read away from the cwd, dropped
+ * before any probe (see the header). Kept identical to
+ * `scripts/orchestrator-harness/merge-reminder.py`'s `GIT_ENV_DROP`.
+ */
+const GIT_ENV_DROP = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+] as const;
+
+/**
+ * The environment every `git` probe runs with: the caller's (or the process's),
+ * minus anything that would answer about a repository other than the one at
+ * `cwd`. Threading the CALLER's env here is what makes the derivation testable —
+ * a probe that silently read `process.env` instead could not be pinned at all.
+ */
+function scrubbedGitEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) if (typeof v === "string") out[k] = v;
+  for (const k of GIT_ENV_DROP) delete out[k];
+  return out;
+}
+
+/** `git <args>` in `cwd`, with `env`, trimmed; null on any failure (absent git, not a repo, timeout). */
+function git(args: string[], cwd: string, env: Record<string, string>): string | null {
   try {
     const out = execFileSync("git", args, {
       cwd,
+      env,
       encoding: "utf-8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
@@ -174,15 +229,18 @@ function realpathOrNull(p: string | null): string | null {
  * SUPPLIED cwd spelling traverses a symlink — mixing the two bases lands them in
  * different repos (#1129).
  */
-function classifyCheckout(cwd: string): {
+function classifyCheckout(
+  cwd: string,
+  env: Record<string, string>,
+): {
   topLevel: string | null;
   gitDir: string | null;
   commonDir: string | null;
   linkedWorktree: boolean;
 } {
-  const topLevel = git(["rev-parse", "--show-toplevel"], cwd);
-  const rawGitDir = git(["rev-parse", "--git-dir"], cwd);
-  const rawCommonDir = git(["rev-parse", "--git-common-dir"], cwd);
+  const topLevel = git(["rev-parse", "--show-toplevel"], cwd, env);
+  const rawGitDir = git(["rev-parse", "--git-dir"], cwd, env);
+  const rawCommonDir = git(["rev-parse", "--git-common-dir"], cwd, env);
   if (!rawGitDir || !rawCommonDir) {
     return { topLevel, gitDir: null, commonDir: null, linkedWorktree: false };
   }
@@ -245,8 +303,12 @@ export function deriveLaneContract(options: LaneContractOptions = {}): LaneContr
   // its behaviour, and a hub session pays nothing for this module.
   if (!headless) return guarded("interactive session — not a lane");
 
-  const checkout = classifyCheckout(cwd);
-  const branch = checkout.linkedWorktree ? git(["rev-parse", "--abbrev-ref", "HEAD"], cwd) : null;
+  // ⛔ The probes run with the SCRUBBED env, never the raw one: an exported
+  // `GIT_DIR` pointing at a linked worktree's gitdir would otherwise make the HUB
+  // report two different git dirs and derive a lane there (see the header).
+  const gitEnv = scrubbedGitEnv(env);
+  const checkout = classifyCheckout(cwd, gitEnv);
+  const branch = checkout.linkedWorktree ? git(["rev-parse", "--abbrev-ref", "HEAD"], cwd, gitEnv) : null;
   const inferredTag = tagFromWorktree(checkout.topLevel) ?? tagFromBranch(branch);
   // KIND/TAG are the harness's AUDIENCE vocabulary, so a supervised child is not
   // given an inferred one (see isSupervisedChild) — and it is not given the

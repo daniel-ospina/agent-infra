@@ -762,18 +762,30 @@ reportManifestState();
 // Emitted on STDERR and NOT print-mode gated, for the same reason
 // `reportManifestState` is: a headless lane that suddenly acts differently is
 // exactly the process whose log an operator reads afterwards, and it must be
-// able to see that the affordance was INFERRED rather than launched. Nothing is
-// printed for a guarded session (hub, non-git, interactive), so no ordinary run
-// gains a line.
+// able to see that the affordance was INFERRED rather than launched.
+//
+// ⛔ PRINTED ONLY WHEN THE DERIVATION ACTUALLY APPLIED SOMETHING (review cycle 1,
+// P2). The first version printed for every derived lane and claimed "no ordinary
+// run gains a line" — false for the fleet's MOST COMMON headless run: a
+// `task`/`subagent` child in a linked worktree is a derived lane, and `#172`
+// records added sub-agent startup lines as a defect class. A child (and any
+// launcher that already set `KIND`/`TAG`) has nothing applied, so it prints
+// nothing; a session that actually gained an affordance prints exactly one line.
+// The guards the OPERATOR needs are unchanged: a launcher-set lane still prints
+// "⏸️ Disabled" at `session_start`, and one that bypasses through THIS derivation
+// prints the "derived lane contract: <why>" form there — so every process that
+// acts with the gates off still says so, once.
 const DERIVED_LANE = laneContract();
 if (DERIVED_LANE.lane) {
   const applied = applyLaneContract();
   const named = [applied.kind ? `KIND=${applied.kind}` : "", applied.tag ? `TAG=${applied.tag}` : ""].filter(Boolean).join(" ");
-  console.error(
-    `[skill-enforcer] ⏸️  Lane contract DERIVED — ${DERIVED_LANE.why}; skill gates are off for this process` +
-      (named ? ` (inferred ${named})` : "") +
-      ` — a launcher-set SKILL_ENFORCER_DISABLED/AGENT_ALLOW_MAIN_EDITS still wins where present`,
-  );
+  if (named) {
+    console.error(
+      `[skill-enforcer] ⏸️  Lane contract DERIVED — ${DERIVED_LANE.why}; skill gates are off for this process` +
+        ` (inferred ${named})` +
+        ` — a launcher-set SKILL_ENFORCER_DISABLED/AGENT_ALLOW_MAIN_EDITS still wins where present`,
+    );
+  }
 }
 
 const readFiles = new Set<string>();
