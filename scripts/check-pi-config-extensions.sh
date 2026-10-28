@@ -404,9 +404,18 @@ fi
 #   * pi `dist/core/package-manager.js::collectAutoExtensionEntries` — reads this
 #     directory's OWN resolution FIRST (`resolveExtensionEntries(dir)`) and returns
 #     it, so when the farm root resolves extension entries the directory scan below
-#     NEVER RUNS. `resolveExtensionEntries(dir)` is: the `extensions[]` rows of
-#     `dir`'s own `package.json` (each resolved against `dir`, keeping only rows
-#     whose target EXISTS), else `dir/index.ts`, else `dir/index.js`, else null.
+#     NEVER RUNS. `resolveExtensionEntries(dir)` is: the `extensions` rows of
+#     `dir`'s own `package.json` **under its `pi` object** (each row resolved
+#     against `dir`, keeping only rows whose target EXISTS), else `dir/index.ts`,
+#     else `dir/index.js`, else null.
+#     ⛔ THE KEY IS `pi.extensions`, NOT a top-level `extensions`. The rows are read
+#     by `pi-manifest.js::readPiManifest`, which returns null unless the file is an
+#     object carrying a `pi` OBJECT, and only then reads `pkg.pi.extensions` (an
+#     array of strings). A top-level `"extensions": [...]` is IGNORED by the loader
+#     — this repo's own manifests say `{"pi": {"extensions": ["./index.ts"]}}`
+#     (`extensions/builtin-tools/package.json`) — so a check reading the top-level
+#     key models a schema pi never reads: it would FAIL a farm pi leaves alone and
+#     stay GREEN over the rows pi actually executes. Case 31 pins that inversion.
 #   * the directory scan, reached only when nothing above resolved: a TOP-LEVEL
 #     entry whose name ends `.ts` or `.js` is pushed as an extension (dot-named
 #     entries and `node_modules` are skipped); a subdirectory contributes ONLY its
@@ -417,10 +426,10 @@ fi
 #       `*.spec.ts`, `*.test.js`, `*.spec.js` (the pre-#2841 check matched
 #       `*.test.ts` only, so the other three were executed while this gate stayed
 #       GREEN: a false PASS over precisely the condition it exists for);
-#   (b) a subdirectory whose `package.json` `extensions[]` row names such a file —
+#   (b) a subdirectory whose `package.json` `pi.extensions` row names such a file —
 #       `resolveExtensionEntries` executes those rows verbatim, and no filename glob
 #       can see one;
-#   (c) a ROW IN THE FARM ROOT'S OWN `package.json` `extensions[]` (or the root
+#   (c) a ROW IN THE FARM ROOT'S OWN `package.json` `pi.extensions` (or the root
 #       `index.ts`/`index.js` it falls back to) naming such a file — the first
 #       branch of the loader quoted above, and the shape a filename glob cannot see
 #       (the entry's basename is the SUBDIRECTORY, `pkg`, not the row's target).
@@ -477,26 +486,36 @@ test_names = ('.test.ts', '.spec.ts', '.test.js', '.spec.js')
 def is_test(path):
     return path.endswith(test_names)
 
+def pi_rows(d):
+    """pi pi-manifest.js::readPiManifest — null unless the file is an object with a
+    `pi` OBJECT; `extensions` must then be an array of strings. A top-level
+    `extensions` key is NOT read by pi, and must not be read here either.
+    utf-8-sig mirrors the stripBom that readPiManifest applies."""
+    try:
+        with open(os.path.join(d, 'package.json'), encoding='utf-8-sig') as f:
+            pkg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(pkg, dict) or not isinstance(pkg.get('pi'), dict):
+        return None
+    rows = pkg['pi'].get('extensions')
+    if isinstance(rows, list) and all(isinstance(row, str) for row in rows):
+        return rows
+    return None
+
 def resolve_entries(d):
     """pi package-manager.js::resolveExtensionEntries, same order: this dir's
-    package.json extensions[] rows that EXIST (resolved against it), else
-    index.ts, else index.js, else None."""
-    pkg_path = os.path.join(d, 'package.json')
-    if os.path.exists(pkg_path):
-        try:
-            with open(pkg_path) as f:
-                pkg = json.load(f)
-        except (OSError, ValueError):
-            pkg = None
-        rows = pkg.get('extensions') if isinstance(pkg, dict) else None
-        if isinstance(rows, list) and rows:
-            kept = []
-            for row in rows:
-                target = os.path.normpath(os.path.join(d, str(row)))
-                if os.path.exists(target):
-                    kept.append(target)
-            if kept:
-                return kept
+    `pi.extensions` rows that EXIST (resolved against it), else index.ts, else
+    index.js, else None."""
+    rows = pi_rows(d)
+    if rows:
+        kept = []
+        for row in rows:
+            target = os.path.normpath(os.path.join(d, row))
+            if os.path.exists(target):
+                kept.append(target)
+        if kept:
+            return kept
     for name in ('index.ts', 'index.js'):
         entry = os.path.join(d, name)
         if os.path.exists(entry):
@@ -510,7 +529,7 @@ if short:
     print('short\t1\t')
     for target in short:
         if is_test(target):
-            print('executed\t%s\t%s: package.json extensions[]/index entry -> %s'
+            print('executed\t%s\t%s: pi.extensions row -> %s'
                   % (target, root, os.path.relpath(target, root)))
     sys.exit(0)
 try:
@@ -525,7 +544,7 @@ for name in names:
         continue
     for target in resolve_entries(sub) or []:
         if is_test(target):
-            print('executed\t%s\t%s: package.json extensions[] -> %s'
+            print('executed\t%s\t%s: pi.extensions row -> %s'
                   % (target, sub, os.path.relpath(target, sub)))
 PYEOF
 )"
@@ -540,14 +559,18 @@ PYEOF
       esac
     done <<< "$loader_rows"
   else
-    echo "⏭️  check 6's loader arm skipped (no python3) — a farm subdir's package.json extensions[] row, or a ROOT row, naming a test file would not be seen (arm (a) still runs); this run already FAILED at check 4 for the same missing python3, so the verdict is not a silent pass"
+    echo "⏭️  check 6's loader arm skipped (no python3) — a farm subdir's `pi.extensions` row, or a ROOT row, naming a test file would not be seen (arm (a) still runs); this run already FAILED at check 4 for the same missing python3, so the verdict is not a silent pass"
   fi
   # (a) top-level entries: the loader's own scan, spelled the same way — the glob
-  #     skips dot-named names exactly as `collectAutoExtensionEntries` does. When
-  #     the ROOT resolves entries, the scan that would load these never runs, so
-  #     they are NAMED as inert instead (the #2425 false-block class).
+  #     skips dot-named names exactly as `collectAutoExtensionEntries` does, and
+  #     `-f` (which follows symlinks) is the loader's `isFile` branch: a DIRECTORY
+  #     named `foo.test.ts` is routed to `resolveExtensionEntries` by the loader,
+  #     not executed, so inditing it would be this gate's own false block
+  #     (case 32). A BROKEN symlink is skipped too — `statSync` throws and the
+  #     loader `continue`s. When the ROOT resolves entries, the scan that would
+  #     load these never runs, so they are NAMED as inert instead (#2425).
   for lap in "$LIVE_FARM"/*; do
-    [ -e "$lap" ] || [ -L "$lap" ] || continue
+    [ -f "$lap" ] || continue
     case "$(basename "$lap")" in
       *.test.ts|*.spec.ts|*.test.js|*.spec.js)
         if [ "$short_circuit" -eq 1 ]; then
@@ -580,7 +603,7 @@ PYEOF
     inert="$inert$lap"$'\n'
   done <<< "$(find "$LIVE_FARM" -mindepth 2 -maxdepth 3 -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) 2>/dev/null | grep -v '/node_modules/' | head -10)"
   if [ -n "$inert" ]; then
-    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json extensions[]/index.ts entry, so this file is never loaded):"
+    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json `pi.extensions` row/index.ts entry, so this file is never loaded):"
     printf '%s' "$inert" | while IFS= read -r lap; do [ -n "$lap" ] && echo "   $lap"; done
     echo "   → \`pi-bootstrap/setup.sh\` sweeps these on the next sync; nothing here executes today."
   fi
