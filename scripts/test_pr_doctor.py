@@ -5885,6 +5885,32 @@ def test_a_zero_padded_ARTIFACT_is_not_a_sibling_and_the_slot_is_HELD(tmp_path, 
         "a miss is UNKNOWN, which holds the slot -- never a free slot: %r" % (b,)
 
 
+def test_the_pre_2725_MULTI_REPO_spelling_is_still_seen_by_the_budget(tmp_path, monkeypatch):
+    """A live `prd-<repo-NAME>-<n>` worker must never be MISSED -- a miss frees its slot (#2725 r2).
+
+    Three generations of the name are live on a mixed box: `prd-<n>` (pre-#2725 single-repo),
+    `prd-<full-slug>-<n>` (this change) and `prd-<repo-NAME>-<n>` (the pre-#2725 multi-repo path,
+    whose tag was owner-blind `REPO.split("/")[-1]`). Measured before this was closed: a DEAD
+    `prd-42.pid` beside a LIVE `prd-agent-infra-42.pid` read `fix: 1` -- the slot was freed while
+    that worker was running, and a second agent could be placed in its worktree.
+    """
+    now = 1_000_000.0
+    bg = tmp_path / "bg"
+    bg.mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "REPO", _REPO_A)
+    monkeypatch.setattr(pr, "_WORKER_TAG", "daniel-ospina-agent-infra-")
+    st = {"42": {"action": "fix-ci", "worker": "prd-42", "at_epoch": now}}
+    (bg / "prd-42.pid").write_text("%d\n" % _a_dead_pid())                    # exact: gone
+    (bg / "prd-agent-infra-42.pid").write_text("%d\n" % os.getpid())           # old multi-repo: LIVE
+    assert pr._worker_pid_files("prd-42") == [pr.bg_path("prd-42", "pid"),
+                                               pr.bg_path("prd-agent-infra-42", "pid")], \
+        "every generation of THIS PR's name must be a candidate: %r" % (pr._worker_pid_files("prd-42"),)
+    b = pr.pass_budgets(st, {"max_fix": 1, "max_review": 1}, now_epoch=now)
+    assert (b["fix"], b["alive"], b["unknown"]) == (0, 1, 0), \
+        "a live worker in ANY generation of the name holds the slot: %r" % (b,)
+
+
 def test_a_pass_with_no_checkout_grades_the_queue_and_says_it_cannot_spawn(monkeypatch, tmp_path):
     """No checkout is a DECLARED read-only pass, not `git -C ""` in whatever cwd we happen to have."""
     logs = []
