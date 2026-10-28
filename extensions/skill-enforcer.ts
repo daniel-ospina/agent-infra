@@ -63,6 +63,15 @@ import { resolve, join, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { isPrintMode } from "./shared/print-mode.js";
 import { register } from "./shared/health.js";
+// #2965 — the lane contract is DERIVED, not demanded. `lane.sh` exports
+// SKILL_ENFORCER_DISABLED=1 for its own lanes; a headless run started any other
+// way (a cloud-cell dispatch, a hand-run `pi -p … --no-session`) got the gates
+// WITH the work and none of the affordances, so its `git commit` was refused and
+// the lane exited with zero commits. `shared/headless-lane.ts` derives the same
+// contract from what the process can observe (print mode + a LINKED worktree),
+// and is consulted by `_isBypassEnv` below. The hub arm is unchanged: headless
+// in the hub checkout derives nothing and stays guarded.
+import { laneContract, applyLaneContract } from "./shared/headless-lane.js";
 // #1321/#1330 — the inlined copy of pi's `isToolCallEventType` now has ONE home
 // (shared/tool-call-event.ts) and is pinned against the real export by
 // extensions/verification-gate/tool-call-event-parity.test.ts. It is imported
@@ -222,7 +231,26 @@ function _getEnv(name: string): string | undefined {
   return process.env[`AGENT_${name}`] ?? process.env[`ELDATO_${name}`];
 }
 function _isBypassEnv(): boolean {
-  return process.env.SKILL_ENFORCER_DISABLED === "1" || _getEnv("ALLOW_MAIN_EDITS") === "1";
+  return process.env.SKILL_ENFORCER_DISABLED === "1" || _getEnv("ALLOW_MAIN_EDITS") === "1" || _isDerivedLane();
+}
+/**
+ * #2965 — the SAME affordance `lane.sh` gives its lanes by exporting
+ * SKILL_ENFORCER_DISABLED=1, derived instead of demanded. A guard must judge what
+ * the process IS: a headless run in a LINKED WORKTREE is a lane however it was
+ * launched. Deriving it through `laneContract()`, which MEMOISES, rather than
+ * inline here keeps that cost off the per-tool-call path: the subprocesses run
+ * once per process (the `--show-toplevel` / `--git-dir` / `--git-common-dir`
+ * trio, plus `--abbrev-ref HEAD` only in a linked worktree), and an interactive
+ * session runs none at all — the helper returns before it shells out.
+ *
+ * ⛔ The hub arm is deliberately NOT covered: a headless `pi -p` whose cwd is the
+ * hub checkout still has every gate armed, because that is the direction
+ * `extensions/main-worktree-guard` protects. The distinction is linked-worktree
+ * vs hub, never headless vs interactive — pinned in both directions by
+ * `extensions/shared/headless-lane.test.ts`.
+ */
+function _isDerivedLane(): boolean {
+  return laneContract().lane;
 }
 // Prefix override (Phase 1 default: operations/skills/). DISPLAY only since
 // #1322 — never the source of truth for read-tracking. It may also name an extra
@@ -719,6 +747,35 @@ export function reportManifestState(): void {
 }
 reportManifestState();
 
+// ── #2965 — derive the lane contract at LOAD, not on the first tool call ────
+// The derivation shells out to git; `laneContract()` memoises it, so this is the
+// only time the cost is paid (and an interactive session pays nothing — the
+// helper never runs git unless the process is headless).
+//
+// It is here, at module scope, so `KIND`/`TAG` are in the environment before any
+// SESSION runs — that is what a child process spawned later inherits, and what
+// any consumer reading `KIND` lazily sees. ⛔ It does NOT reach `review-enforcer`'s
+// #2148 audience disclosure, which resolves its role at factory-invoke time from
+// a module pi loads BEFORE this one (measured — see the header of
+// `shared/headless-lane.ts`). Correcting that is agent-infra#2966.
+//
+// Emitted on STDERR and NOT print-mode gated, for the same reason
+// `reportManifestState` is: a headless lane that suddenly acts differently is
+// exactly the process whose log an operator reads afterwards, and it must be
+// able to see that the affordance was INFERRED rather than launched. Nothing is
+// printed for a guarded session (hub, non-git, interactive), so no ordinary run
+// gains a line.
+const DERIVED_LANE = laneContract();
+if (DERIVED_LANE.lane) {
+  const applied = applyLaneContract();
+  const named = [applied.kind ? `KIND=${applied.kind}` : "", applied.tag ? `TAG=${applied.tag}` : ""].filter(Boolean).join(" ");
+  console.error(
+    `[skill-enforcer] ⏸️  Lane contract DERIVED — ${DERIVED_LANE.why}; skill gates are off for this process` +
+      (named ? ` (inferred ${named})` : "") +
+      ` — a launcher-set SKILL_ENFORCER_DISABLED/AGENT_ALLOW_MAIN_EDITS still wins where present`,
+  );
+}
+
 const readFiles = new Set<string>();
 
 // Per-skill bypass counter — tracks how many times each skill gate has been bypassed this session.
@@ -807,7 +864,14 @@ export default function (pi: ExtensionAPI) {
     reportManifestState();
     // ponytail: AGENT_ALLOW_MAIN_EDITS / ELDATO_ALLOW_MAIN_EDITS also bypasses skill-enforcer (not just worktree-guard), #7470 / #7549
     if (_isBypassEnv()) {
-      console.log(`[skill-enforcer] ⏸️  Disabled`);
+      // #2965 — say WHICH affordance applied. "Disabled" alone left an operator
+      // unable to tell a launcher's env var from a DERIVED lane contract, which
+      // is the difference between "someone set this" and "this was inferred".
+      const derived = laneContract();
+      const viaEnv = process.env.SKILL_ENFORCER_DISABLED === "1" || _getEnv("ALLOW_MAIN_EDITS") === "1";
+      console.log(
+        viaEnv ? `[skill-enforcer] ⏸️  Disabled` : `[skill-enforcer] ⏸️  Disabled — derived lane contract: ${derived.why}`,
+      );
     }
   });
 
