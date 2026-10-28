@@ -251,11 +251,15 @@ channel verdicts — the first one **is**, and it is listed with them only to sa
   Mac-side symptom, so a local app restart is not the cause) — a fresh server pid every ~3 s, each dying with `cmux-tui: flush
   terminal journal during mux drop: session journal stopped` + `cmux-tui: multiple interrupted resource creations cannot be
   recovered atomically`. So the session daemon never stays up, nothing answers on `:1337`, and **every spawn verb fails while
-  the read path and `exec` keep working** — which is why the error's own advice ("check the machine's status") sends the reader
+  the PROVIDER-CHANNEL verbs (`cloud exec`, `cloud push`) keep working — the guest's own read path does NOT** (`cmux tree --json`
+  → rc 3, measured above) — which is why the error's own advice ("check the machine's status") sends the reader
   to a healthy machine. ⛔ **The space lever does NOT apply here:** that volume read `3996 MB · 1892 used · 2089 free · 48 %`
   holding a **1.9 GB** `workspace-registry.sqlite3`, so growing the loop file (step 5 below) changes nothing — this refusal is
-  **state** ("interrupted resource creations"), not a full volume. The repair is the owner-gated registry reset in
-  **agent-infra#2312**; until it is taken, **`tmux` is the surface that still starts a worker** on that box, and `cmux vm ls`
+  **state** ("interrupted resource creations"), not a full volume. The **candidate** repair is the owner-gated registry reset
+  tracked in **agent-infra#2312** — **NOT measured against this state**: that issue's own repro is a FULL volume
+  (`database or disk is full`, `0 bytes free`), and step 5 below frames the reset as the space-reclaim fallback. Take it only
+  as an owner decision, and treat it as unverified for spawn until `cmux cloud agent … -- "reply OK"` returns a `terminal_id`
+  on that box afterwards. Until it is taken, **`tmux` is the surface that still starts a worker** on that box, and `cmux vm ls`
   reading `reachable linked` for a peer says nothing about whether its link opens (#2345).
   ⛔ **The guest-CLI advice in this bullet and every bullet above assumes the guest CLI RUNS AT ALL, and on a measured cell shape it does
   not:** `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui` — the `cmux-tui` symlink dangling and no daemon
