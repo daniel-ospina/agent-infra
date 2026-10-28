@@ -38,6 +38,11 @@
  *   • delete `scheduler.unref?.()` in scheduler.ts → the exit-probe arm reddens (the child
  *     hangs, `spawnSync` kills it at 15 s, status ≠ 0), and arm 1's `hasRef() === false` pin
  *     reddens in-process.
+ *   • delete `if (cronTimer) { clearInterval(cronTimer); cronTimer = null; }` in `armCronScheduler`
+ *     → the un-paired `session_start` pin reddens ("an un-paired session_start must CLEAR the
+ *     still-live timer before arming …"): 30 passed, 1 failed. Arms 1–3 stay green, because they
+ *     are paired and `cronTimer` is null when they re-arm — the leaked interval is only visible
+ *     where no shutdown separates one arm from the next.
  *
  * Run: npx tsx extensions/loop-enforcer/cron-rearm.test.ts
  */
@@ -250,8 +255,19 @@ async function main(): Promise<void> {
     // "Armed" is only worth asserting if the thing that is armed can still do its job: an
     // interval that exists but whose callback is dead would pass a handle-only check.
     console.log("\nArm — the re-armed tick fires a due cron manifest:");
+    // This `session_start` is deliberately UN-PAIRED — no `session_shutdown` between it and
+    // the re-arm that preceded it, so `cronTimer` still points at a LIVE handle. Arms 1–3 are
+    // paired, so they cannot exercise the clear-then-set half of the arm path (`cronTimer` is
+    // already null when they re-arm); this is the only pairing that does. Delete
+    // `if (cronTimer) clearInterval(cronTimer)` from `armCronScheduler` and every other arm
+    // stays green while one interval leaks (probe: captured=5, live=2) — hence this pin.
+    const priorHandle = captures[captures.length - 1]!;
     await pi.emit("session_start", { reason: "startup" });
     const live = captures[captures.length - 1]!;
+    assert(
+      isCleared(priorHandle.handle),
+      "an un-paired session_start must CLEAR the still-live timer before arming: a re-arm that only sets leaks one interval per extra session_start (clear-then-set is what makes the double call safe)",
+    );
     assert(
       !isCleared(live.handle),
       "the tick we fire is the LIVE handle, not a cleared/retired one — otherwise this arm would pass on a dead timer",
