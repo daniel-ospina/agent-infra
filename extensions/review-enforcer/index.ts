@@ -5667,8 +5667,14 @@ function withoutAssignmentPrefix(word: string): string {
  * i.e. the tokens `$` + `X}` — is accepted only where the `${` itself begins a simple command.
  *
  * ⛔ NOT POSITION-GATED otherwise, deliberately: a wrapper's arguments put the command word out
- * of the position model's reach, and requiring command position lost 168 real admin merges
- * (`timeout 5 g$'h' $'pr' "merge" 999 --admin`) that `78d897fa1` refuses.
+ * of the position model's reach, and requiring command position then stops reading the merge at
+ * all. The payload row is `timeout 5 g$'h' $'pr' "merge" 999 --admin` — a real admin merge that
+ * `78d897fa1` refuses — and it is pinned in `index.test.ts`'s `assembled` block, so this bound
+ * cannot be tightened without a red. ⚠️ NO MAGNITUDE IS QUOTED HERE: earlier revisions of this
+ * comment said position-gating "lost 168 real admin merges", and no artifact in the repo produced
+ * that 168 (the generated corpus it came from was never landed), so the number could not be
+ * reproduced by any later lane — the same defect this file deletes for the `hasGhCommandWord`
+ * conjunct further down. The pinned ROW survives; the unreproducible count does not.
  *
  * NAMING THE BASES: `78d897fa1` is the merged #2907 head (it WAS `origin/main` when these were
  * measured) and `04bc1dde` is the pre-#3953 base. This file names the two SHAs rather than the ref
@@ -5685,8 +5691,9 @@ function isGhCommandWordAt(scan: ScanTokens, i: number): boolean {
   if (w === "gh") return true;
   // A construct that CARRIES ITS INTRODUCER: `$GH`, `$'gh'`, `g$'h'`, `x${X}`, or a backtick.
   // Position does not matter — a wrapper's arguments put the command word out of the position
-  // model's reach (`timeout 5 g$'h' $'pr' "merge" 999 --admin`, measured: position-gating this
-  // lost 168 real admin merges that `78d897fa1` refuses).
+  // model's reach (`timeout 5 g$'h' $'pr' "merge" 999 --admin`, refused at `78d897fa1` and pinned
+  // in the `assembled` block; the magnitude this comment used to quote was unreproducible and is
+  // deleted — see the note on the function's own doc comment).
   if (/[$`]/.test(raw)) return true;
   // A BRACE-EXPANSION word (`{pr,merge}`) is a construct too.
   if (/^\w*\{/.test(raw)) return true;
@@ -5707,8 +5714,10 @@ function isGhCommandWordAt(scan: ScanTokens, i: number): boolean {
  * NOT position-gated: this question is only ever asked TOGETHER with something else that is
  * already narrow (a merge-verb window, or a top-level `ghGroupIsUnreadable` that does its own
  * position test), and a wrapper's arguments put the command word out of the position model's
- * reach — position-gating it lost 168 real admin merges (`timeout 5 g$'h' $'pr' "merge" 999
- * --admin`) that `78d897fa1` refuses.
+ * reach. The payload row is `timeout 5 g$'h' $'pr' "merge" 999 --admin` — a real admin merge
+ * `78d897fa1` refuses — and it is pinned in `index.test.ts`'s `assembled` block. ⚠️ NO MAGNITUDE:
+ * the "168 real admin merges" this comment used to quote came from a generated corpus that was
+ * never landed, so no later lane could reproduce it; the pinned ROW is the evidence now.
  */
 export function hasGhCommandWord(command: string): boolean {
   const scan = scanTokens(command);
@@ -5770,10 +5779,15 @@ function ghGroupIsUnreadable(command: string): boolean {
  * Two orderings are OR-ed, and the reason is measured. At the group stage a CONSTRUCT is
  * ambiguous: it can be the GROUP slot of an all-assembled invocation (`GH=gh; ${GH} ${P} $M 999
  * --admin`) or a fresh COMMAND word (`GH=gh; g$'h' "pr" merge 999 --admin`, where the `GH=gh`
- * assignment already opened the group stage). A single ordering loses one of the two — measured:
- * group-first lost 88 real admin merges that `78d897fa1` refuses, command-first lost 128. Both
- * orderings only ADD candidates, so OR-ing cannot widen the rule in a direction the other does
- * not already reach.
+ * assignment already opened the group stage). A single ordering loses one of the two, and each
+ * losing row is PINNED, so neither arm can be dropped silently (mutants M19 and M20 in review
+ * cycle 8): the group-first row is `GH=gh; ${GH} ${P} $M 999 --admin` and the command-first row is
+ * `GH=gh; g$'h' "pr" merge 999 --admin`, both in the `assembled` block and both refused at
+ * `78d897fa1` AND `04bc1dde`. Both orderings only ADD candidates, so OR-ing cannot widen the rule
+ * in a direction the other does not already reach.
+ * ⚠️ THE COUNTS THIS COMMENT USED TO CARRY ("group-first lost 88 … command-first lost 128") ARE
+ * DELETED: they came from a generated corpus that was never landed, so no later lane could
+ * reproduce them — and an unpinned count is exactly the failure this test now prevents.
  */
 function mergeVerbSequenceInTokens(command: string): boolean {
   return mergeVerbWalk(command, true) || mergeVerbWalk(command, false);
@@ -5815,12 +5829,30 @@ function isVerbSlotConstruct(raw: string, w: string): boolean {
  * before gh sees argv (`$PR`, `"$PR"`, `${PR}`, `$N`, `$PR_URL`). Reusing `PR_URL_RE` here is
  * deliberate — a second notion of "a PR" in this file is how the gate and the shim came to
  * disagree about which PR a URL names (#1007).
+ *
+ * ⛔ EVERY ARM HERE IS PINNED BY A ROW THAT ACTUALLY FAILS WITHOUT IT (review cycle 8, P2), and
+ * the row for each is named in `index.test.ts`'s #3953 test so the next lane can see which assertion
+ * holds which arm up:
+ *   - the `/^\d+$/` arm — the `assembled` block (`… $M 999 --admin`).
+ *   - the `PR_URL_RE` arm — `timeout 5 ${GH} ${P} ${M} https://…/pull/9 --admin` in
+ *     `assembledSelector`. ⚠️ It was UNPINNED for a whole cycle, and the reason is worth keeping:
+ *     the other URL rows in that block are read by the GROUP-slot ask before this arm is ever
+ *     consulted (measured: `GH=gh; ${GH} ${P} ${M} <url> --admin` is still refused with this arm
+ *     deleted), so only a shape where the URL is the sole readable selector faults it. Over a
+ *     5 680-literal corpus this arm decides ZERO times — a corpus cannot pin it, only a row can.
+ *   - the `/[$`]/` (construct) arm — `${PR}` and `$PR_URL` in `assembledSelector`.
+ * ⛔ AND THE `\w*\}` ARM IS GONE: it answered for a bare `X}` tail, which reaches this function
+ * only when `shellWordAt`'s `${X}` pair branch did NOT fire. Measured over the same 5 680-literal
+ * corpus plus an ~130-row hand-built set of merge shapes, it decided exactly ONCE and that one
+ * input was a TypeScript object-literal fragment, not a command — i.e. it could only ever widen the
+ * read on garbage. An arm no assertion can see is an arm the next lane can delete; this one was
+ * deleted deliberately, with the measurement, rather than left for someone to find unpinned.
  */
 function isMergeSelectorToken(tok: string): boolean {
   const w = shellWord(tok);
   if (/^\d+$/.test(w)) return true;
   if (PR_URL_RE.test(w)) return true;
-  return /[$`]/.test(tok) || /^\w*\}$/.test(tok);
+  return /[$`]/.test(tok);
 }
 
 /**
