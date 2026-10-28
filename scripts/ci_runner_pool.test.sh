@@ -1304,8 +1304,9 @@ chmod 600 "$RUNNER_ROOT/pi-runner-lock/.env"
 # ⛔ `run.sh` SOURCES `.env`; a `sed` read does not. `TMPDIR=$HOME/ci-tmp` therefore had this tool create
 #   a directory literally named `$HOME` (under the instance dir, because the value is not `/`-leading),
 #   print `created tmpdir=…` and exit 0 — while the listener inherited an ABSENT /home/…/ci-tmp. The
-#   same for a trailing comment, which is where the value ENDS for a sourcing shell (#3004 review, P1).
-echo "── tmpdir: a \$VAR value and a trailing comment are refused, not mis-created ──"
+#   (a trailing comment is the opposite case — a sourcing shell ENDS the value at the whitespace, so it
+#   is TOLERATED; see case 9 below.)
+echo "── tmpdir: a \$VAR value is refused, not mis-created ──"
 fresh_pool tmpexp; reset_logs
 register pi-runner-exp
 printf 'TMPDIR=$HOME/ci-tmp\n' >"$RUNNER_ROOT/pi-runner-exp/.env"
@@ -1314,6 +1315,30 @@ assert_eq "$?" "2" "a \$VAR value is cannot-act (rc 2), never a guessed director
 assert_contains "$out" "cannot-act why=tmpdir-value-not-literal" "naming the shape it refused"
 assert_contains "$out" "value=\$HOME/ci-tmp" "and the value it read"
 assert_absent "$RUNNER_ROOT/pi-runner-exp/\$HOME" "no literal '\$HOME' directory was created (the false PASS this replaces)"
+
+# ── (9a) SHELL SYNTAX THIS PARSER DOES NOT MODEL IS REFUSED, NEVER TRUNCATED ────────────────
+# ⛔ Truncating at syntax instead of refusing it created a DIFFERENT directory and reported
+#   `created tmpdir=…` with rc 0 over the real path's absence — measured on the round-2 shape:
+#     `TMPDIR=/tmp/x/a\ b`       → created `a\`       (the shell's value is `/tmp/x/a b`)
+#     `TMPDIR=/tmp/x/x; echo hi` → created `x;`       (the shell's value is `/tmp/x/x`)
+#     `TMPDIR='/tmp/adj'x`       → created `/tmp/adj` (adjacent segments concatenate: `/tmp/adjx`)
+#   A backslash, a separator, a redirection or a subshell is EVALUATION, and this tool will not
+#   evaluate another user's `.env` (`status` may run as root) — so each is `cannot-act` (#3004 review
+#   round 3, P1).
+echo "── tmpdir: backslash / separator / adjacent-segment values are refused, not truncated ──"
+syn_expect() { # <case#> <value> <truncated-path-that-must-NOT-exist>
+  fresh_pool "tmpsyn$1"; reset_logs
+  register "pi-runner-syn$1"
+  printf 'TMPDIR=%s\n' "$2" >"$RUNNER_ROOT/pi-runner-syn$1/.env"
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name "pi-runner-syn$1")"
+  assert_eq "$?" "2" "value [$2] is cannot-act (rc 2), never a truncated path"
+  assert_contains "$out" "cannot-act why=tmpdir-value-" "naming the shape it refused"
+  assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-syn$1") ))" "0" "and it started nothing"
+  assert_absent "$RUNNER_ROOT/pi-runner-syn$1/$3" "the truncated path [$3] was NOT created"
+}
+syn_expect 1 '/tmp/x/a\ b'      'a\'
+syn_expect 2 '/tmp/x/x; echo hi' 'x;'
+syn_expect 3 "/tmp/x/adj'x"     "x/adj'x"
 assert_absent "$RUNNER_ROOT/pi-runner-exp/ci-tmp" "and nothing was guessed at either"
 assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-exp") ))" "0" "nothing was started"
 fresh_pool tmpcmt; reset_logs

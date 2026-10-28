@@ -528,8 +528,10 @@ probe_listener() {
 # `mktemp` — which reads as "this workflow is broken", not "this host is". Measured job 122457527181:
 # `mktemp: failed to create file via template '/tmp/ci-actions-runner-2/tmp.XXXXXXXXXX'`, exit 2, on a
 # box GitHub reported `online`.
-# A relative value resolves against the INSTANCE DIR, because `run.sh` `cd`s there before the listener
-# reads the variable — resolving it anywhere else would create a directory the runner never uses.
+# A relative value is REFUSED, not resolved: `run.sh` `cd`s into the instance dir before the listener
+# READS the variable, but the listener hands the value to each JOB, whose working directory is
+# `_work/<repo>/<repo>` — so a relative TMPDIR resolves THERE, and any directory this tool created
+# would be one no job uses. See the refusal at the end of `instance_tmpdir` (#3004 review, P2).
 #
 # ⛔ THREE STATES, NOT TWO (#3004 review, P1). Returning empty for BOTH "the file names no TMPDIR" AND
 # "the file could not be read" made an unreadable `.env` collapse into "names none": `[ -f ]` is TRUE
@@ -559,7 +561,7 @@ probe_listener() {
 #   "double"  · spaces are part of the value; `$`/`` ` `` expand; `~` does not
 # Anything whose meaning depends on evaluation is refused, naming the value and the remedy.
 instance_tmpdir() {
-  local d="$1" raw t
+  local d="$1" raw t rest
   [ -f "$d/.env" ] || return 0
   # An EXISTING but unreadable `.env` is cannot-measure. `-r` is the read this function actually does
   # (and it is FALSE for a mode-000 file, which `-f` alone happily accepts).
@@ -570,18 +572,33 @@ instance_tmpdir() {
   # be visible, not silently equal to "names none".
   raw="$(sed -n 's/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}TMPDIR=//p' "$d/.env" | tail -n 1)" || return 2
   raw="${raw%$'\r'}"   # a `.env` edited on a CRLF host would otherwise name a path with a CR in it
+  # ⛔ ANY SHELL SYNTAX THIS PARSER DOES NOT MODEL IS REFUSED UP FRONT, because truncating at it would
+  # silently create a DIFFERENT directory and report `created tmpdir=…` over the real one's absence.
+  # Measured on the round-2 shape, each accepted with rc 0 and the WRONG path created:
+  #   `TMPDIR=/tmp/x/a\ b`      → created `a\`      (the shell's value is `/tmp/x/a b`)
+  #   `TMPDIR=/tmp/x/x; echo hi` → created `x;`      (the shell's value is `/tmp/x/x`)
+  #   `TMPDIR="/tmp/a\"b"`       → created `/tmp/a\`   (the shell's value is `/tmp/a"b`)
+  #   `TMPDIR='/tmp/a'x`         → created `/tmp/a`  (adjacent segments concatenate: `/tmp/ax`)
+  # A backslash, a command separator, a redirection or a subshell is EVALUATION, and evaluation is the
+  # one thing this function may not do (`.env` is another user's file; `status` may run as root). So the
+  # presence of any of them is `cannot-act` — refused, never guessed at (#3004 review round 3, P1).
+  case "$raw" in
+    *'\'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*)
+      err "cannot-act why=tmpdir-value-not-literal value=$raw (named by $d/.env) — the value contains shell syntax (a backslash, a separator, a redirection or a subshell) that only EVALUATION could resolve, and this tool will not evaluate another user's .env; write a plain absolute path in $d/.env"
+      return 2 ;;
+  esac
   case "$raw" in
     \'*)
       # A closing quote is part of the value's MEANING — without it the string written is not the path
       # the listener resolves, so an unterminated one is refused rather than turned into a directory.
       case "${raw#\'}" in
-        *\'*) t="${raw#\'}"; t="${t%%\'*}" ;;
+        *\'*) t="${raw#\'}"; rest="${t#*\'}"; t="${t%%\'*}" ;;
         *) err "cannot-act why=tmpdir-value-unterminated-quote value=$raw (named by $d/.env) — single quotes are taken LITERALLY by the listener, so nothing but a closing quote makes this a path; write the path, or close the quote, in $d/.env"
            return 2 ;;
       esac ;;
     \"*)
       case "${raw#\"}" in
-        *\"*) t="${raw#\"}"; t="${t%%\"*}" ;;
+        *\"*) t="${raw#\"}"; rest="${t#*\"}"; t="${t%%\"*}" ;;
         *) err "cannot-act why=tmpdir-value-unterminated-quote value=$raw (named by $d/.env) — a double-quoted value ends at its closing quote, so this names no path; write the path, or close the quote, in $d/.env"
            return 2 ;;
       esac
@@ -594,11 +611,28 @@ instance_tmpdir() {
       esac ;;
     *)
       t="${raw%%[[:space:]]*}"   # an unquoted assignment ENDS at the first whitespace
+      rest="${raw#"${raw%%[[:space:]]*}"}"
+      # ⛔ A QUOTE INSIDE AN UNQUOTED VALUE IS STILL QUOTING SYNTAX, and a sourcing shell would USE it:
+      # `/tmp/x/adj'x` is `/tmp/x/adjx` to the listener. Unmodelled, it was accepted verbatim and the
+      # tool created a directory whose name carries the quote (#3004 review round 3, P1).
       case "$t" in
-        '~'*|*'$'*|*'`'*)
+        *"'"*|*'"'*|'~'*|*'$'*|*'`'*)
           err "cannot-act why=tmpdir-value-not-literal value=$t (named by $d/.env) — the listener SOURCES .env, so this value is expanded there and cannot be satisfied from the raw text; write a literal absolute path in $d/.env"
           return 2 ;;
       esac ;;
+  esac
+  # ⛔ WHAT FOLLOWS THE VALUE MUST BE BLANK OR A COMMENT. Anything else is a second shell word that a
+  # sourcing shell would either CONCATENATE (`'/tmp/a'x` → `/tmp/ax`) or run (`… ; rm -rf /`), and this
+  # parser models neither — so it refuses rather than create the path it happened to read (#3004
+  # review round 3, P1). Only a `#` that a sourcing shell would also treat as a comment start is
+  # tolerated, and only after whitespace (an unquoted `#` mid-word is part of the value, not a comment).
+  case "$rest" in
+    ''|'#'*) : ;;
+    [[:space:]]*) case "${rest#"${rest%%[![:space:]]*}"}" in ''|'#'*) : ;; *)
+        err "cannot-act why=tmpdir-value-trailing-syntax value=$raw (named by $d/.env) — a sourcing shell would CONCATENATE or EXECUTE what follows the value (${rest}), so the path this tool read is not the path the listener uses; write one plain absolute path in $d/.env"
+        return 2 ;; esac ;;
+    *) err "cannot-act why=tmpdir-value-trailing-syntax value=$raw (named by $d/.env) — a sourcing shell would CONCATENATE or EXECUTE what follows the value (${rest}), so the path this tool read is not the path the listener uses; write one plain absolute path in $d/.env"
+       return 2 ;;
   esac
   [ -n "$t" ] || return 0
   case "$t" in /*) printf '%s' "$t"; return 0 ;; esac
