@@ -124,7 +124,7 @@ chmod +x "$LSHIMDIR/sysctl"
 # ⛔ MEM_MIN_AVAIL_MB=1 IS THE MEMORY GATE'S NEUTRALISER, for the same reason $LSHIMDIR stubs the LOAD
 # probe: every arm below is about the LOAD ceiling, and since agent-infra#2387 the shim consults
 # available memory BEFORE load. Without this a memory-tight box answers 72 to a load arm and the arm
-# reports a #1884 regression that is not one. Section 6 drives the memory arm on purpose, at a floor
+# reports a #1884 regression that is not one. Section 12 drives the memory arm on purpose, at a floor
 # this box cannot meet; the SHIPPED default floor is asserted in spawn-gate.test.sh (env -u), which owns
 # the arithmetic.
 run_shim() { # run_shim runner|direct [argv…]
@@ -272,7 +272,11 @@ FAKE_LOAD=9 MAX_LOAD=10 run_shim direct -p "just under" >/dev/null 2>&1; rc=$?
 mkdir -p "$TMP/neutral"
 ln -sf "$SHIM" "$TMP/neutral/pi"
 reset_probe
-PI_PROBE="$TMP/probe" FAKE_LOAD=1 MAX_LOAD=10 \
+# ⛔ AND THE NEUTRALISER REACHES EVERY ARM THAT BYPASSES run_shim (review, P2). This one calls `pi`
+# directly (its whole point is a PATH shape), so it missed the floor that run_shim injects: on a
+# memory-tight box the symlink-farm arm was refused by the MEMORY gate with rc=72 and reported "a
+# symlink-farm installation could not find the real pi" — a #1884 regression that is not one.
+PI_PROBE="$TMP/probe" FAKE_LOAD=1 MAX_LOAD=10 MEM_MIN_AVAIL_MB=1 \
   PATH="$LSHIMDIR:$TMP/neutral:$TMP/real:$PATH" pi -p "through a symlink farm" >"$TMP/out8" 2>&1 &
 p8=$!
 ( sleep 10; kill -KILL "$p8" 2>/dev/null ) >/dev/null 2>&1 &
