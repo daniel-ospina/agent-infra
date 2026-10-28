@@ -1357,8 +1357,24 @@ REPORT
   ck "(2952g) …with an UNREADABLE registry the SAME report is still INCOMPLETE — the cause keys the arm, not the count" $rc
   case "$(tr '\n' ' ' < "$CELL2952G/checked.txt")" in *10*) rc=1 ;; *) rc=0 ;; esac
   ck "(2952g) …and not retired (a claim is a window, so the candidate is re-attempted next pass)" $rc
+  # ⛔ A READABLE REGISTRY IS WHAT MAKES (h) AND (i) FALSIFIABLE (review P1, this round). (g) leaves
+  # the shared stub at rc 2, and with an UNREADABLE registry EVERY candidate below is refused by the
+  # registry requirement ALONE — so both arms read green even with the whole cause-set condition
+  # deleted, and the membership test they are recorded as pinning had NO assertion that could turn
+  # red (measured: the mutant queues neither, on either stub). Re-stub it READABLE: the refusal must
+  # then come from the membership test and nothing else, or the two arms are decoration.
+  {
+    printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'
+    cat "$TMP/refreshloop.sh"
+  } > "$TMP/refreshloop-2952.sh"
   # (2952h) A BOARD-CAUSED SET WITHOUT THE HOLDER SURFACE. The cause matches, so the cause alone would
   # re-route it — but there is no holder answer to substitute, so nothing may be judged.
+  # ⛔ WHAT THIS ARM DOES *NOT* PIN (review P1, this round): it cannot red from the cause-set condition
+  # alone. With the condition DELETED the candidate is still refused, because the substitution's own
+  # downstream requirement — a parsed `issue assignee/holder` ROW whose note is the board's (the
+  # `holder_note` gate below, #1935/#1977) — has nothing to match. So this arm is a pin on the
+  # COMPOSITE refusal (defence in depth: it reds only if BOTH that gate and the condition are gone),
+  # and it is NOT the assertion that condition 3 is live. (2952i) is, and was rebuilt to be.
   CELL2952H="$(holder_report x 'issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
 
 INCOMPLETE SURFACES
@@ -1371,12 +1387,22 @@ VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be FULLY queried (issue 
   # (2952i) A SURFACE THE VERDICT LINE NAMES, WITH NO CAUSE THIS READER CAN FIND. The cause test is
   # SET MEMBERSHIP over the parsed rows, so an unparsed surface has no cause at all — and "no cause"
   # must never read as "the board's cause", or the arm fails OPEN on a parser miss.
+  # ⛔ THE HOLDER ROW *IS* PARSED HERE, DELIBERATELY (review P1, this round). The earlier fixture named
+  # the holder in the verdict line and left its row out, which meant the downstream `holder_note` gate
+  # refused the candidate whatever this condition did — the arm read green with the whole condition
+  # deleted (measured, M4), so it pinned nothing. The absent surface is therefore a THIRD one (`open
+  # PRs`, a real slug — see the D5 fixture above) while BOTH board-caused rows are present: the holder
+  # answer exists and the registry is READABLE, so the ONLY thing between this candidate and the
+  # registry is the membership test. That is what makes the arm able to fail, and it is the FAIL-OPEN
+  # it now pins: a surface the tool could not read is queued as verified.
   CELL2952I="$(holder_report x 'issue landed                    INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
 
 INCOMPLETE SURFACES
   [issue landed] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board lane registry could not be read
 
-VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be FULLY queried (issue landed, issue assignee/holder); this is NOT clean')"
+VERDICT: INCOMPLETE (exit 2) — 3 surface(s) could not be FULLY queried (issue landed, issue assignee/holder, open PRs); this is NOT clean')"
   r2952_run "$CELL2952I" f4
   if r2952_is_queued "$CELL2952I"; then rc=1; else rc=0; fi
   ck "(2952i) a surface NAMED by the verdict line but ABSENT from the parsed set is REFUSED (no cause is not the board's)" $rc

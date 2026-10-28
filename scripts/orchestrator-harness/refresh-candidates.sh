@@ -3756,7 +3756,11 @@ while read -r N; do
   V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION|LANDED|INCOMPLETE).*/\1/')"
   # A DEGRADED answer is not a verdict — for ANY non-landed verdict. The canonical producer prints the
   # `ALSO INCOMPLETE:` marker beside a COLLISION or a LANDED answer (an INCOMPLETE verdict IS the
-  # degraded reading and prints "N surface(s) could not be queried" with no marker), and
+  # degraded reading and prints its `surface(s) could not be … queried (…)` list with no marker), and
+  # ⛔ THAT ADVERB IS THE PRODUCER'S PROSE, NOT THE CONTRACT (#2952). tortoise `fa7b27b66` (#9423) made
+  # it `could not be FULLY queried`, and the arm that keyed on the old exact phrase was a silent no-op
+  # for six days; a precise quotation here is the same trap seeded for the next reader, so no arm of
+  # this pass may be written against one.
   # `resolve_preflight` prefers the repo's OWN copy, so a VENDORED producer could pair it with CLEAN and
   # reproduce the healthy-looking reading this pass exists to refuse (#1853 review). LANDED is exempt:
   # the producer's contract makes a terminal signal decisive over an incomplete one.
