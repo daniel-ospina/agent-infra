@@ -58,7 +58,19 @@ LIB="$HARNESS/launchd-cycle.sh"
 README="$HARNESS/README.md"
 SELF="$HARNESS/selftest.sh"
 PLATFORM="$(uname)"
-LABEL="com.eldato.orchestrator-loop"
+# ⛔ THE FIXTURE INSTALLS A **TEST** LABEL (agent-infra#1996). launchd resolves a label in the user
+# domain and IGNORES `$HOME`, so a plist rendered under this sandbox home with the PRODUCTION label
+# still addresses the live controller — and `ELDATO_ALLOW_TEST_HOME=1` (which this suite must set so
+# launchd-cycle.sh's #446 guard permits a sandbox run) says nothing about WHICH job is addressed.
+# `install.sh`'s `label_guard` therefore refuses a production label outside the real `$HOME`, and
+# this suite renders its own label instead. Everything below derives its label/plist from $LABEL, so
+# the stub, the `path =` ownership guard and every assertion follow it.
+LABEL="com.eldato.orchestrator-loop-test"
+export LABEL_OVERRIDE="$LABEL"
+# The `launchctl` stub answers for THIS label (its `${FAKE_LABEL:-<production>}` defaults would
+# otherwise name the production job, and the `print-disabled` arms — which model an override written
+# for OUR label — would then report a label the installer never asked about).
+export FAKE_LABEL="$LABEL"
 
 PASS=0; FAIL=0; SKIP=0
 ok()    { PASS=$((PASS + 1)); printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
@@ -862,7 +874,12 @@ fi
 # The installer is driven from a STAGE copy so it cannot reach this checkout's neighbours, and so
 # the only scripts its `bash -n` sweep sees are the ones under test.
 STAGE="$T/stage"; mkdir -p "$STAGE"
-cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$HARNESS/merge-reminder.py" "$STAGE/" 2>/dev/null
+# ⛔ EVERY FILE THE INSTALLER GATES ON MUST BE STAGED (agent-infra#2719). `install.sh` parse-gates
+# `check-class.py` and `nochk-resolve.py` (the controller cannot classify a single PR without the
+# first), so a fixture that stages four files makes the installer DIE — measured: §F went 31 red the
+# moment that gate landed, and the gate was right, the fixture was incomplete.
+cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$HARNESS/merge-reminder.py" \
+   "$HARNESS/check-class.py" "$HARNESS/nochk-resolve.py" "$STAGE/" 2>/dev/null
 SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin" \
   "$SHOME/.pi/agent/scripts"
 # install.sh probes the real binaries: gh (network), tmux, pi, uv.
@@ -897,12 +914,32 @@ mutating() { mutating_calls; }   # ONE definition (the two drifted apart once al
 fresh
 out="$(ORUN 2>&1)"; rc=$?
 assert_eq "$rc" "0" "plain install exits 0"
-[ -f "$PLIST" ] && ok "plain install rendered the plist" || bad "plain install rendered no plist"
+if [ -f "$PLIST" ]; then ok "plain install rendered the plist"; else bad "plain install rendered no plist"; fi
+# ⛔ XML VALIDITY IS ASSERTED HERE, WITHOUT plutil (agent-infra#1990 merge, 2026-10-24). `plutil -lint`
+# used to be the ONLY XML gate, and it is stubbed on Linux — so a template COMMENT containing `--`
+# (forbidden by the XML spec) shipped green on main: install.sh died `rendered plist is invalid` on a
+# mac while this suite reported PASS, because the very line below said the XML half "is not exercised
+# here". A stub makes the lint half a no-op, which is indistinguishable from success — so the gate
+# that matters (is the file PARSEABLE?) is asserted independently of the tool being stubbed.
+if [ -f "$PLIST" ]; then
+  # Strip the comment DELIMITERS first, then any `--` left is inside a comment and is illegal. Filtering
+  # whole LINES that contain `<!--` would miss a single-line comment (`<!-- a -- b -->`).
+  _dashes="$(sed -e 's|<!--||g' -e 's|-->||g' "$PLIST" | grep -n -- '--' || true)"
+  if [ -z "$_dashes" ]; then ok "the rendered plist carries no '--' inside an XML comment (XML forbids it; plutil -lint dies on exactly this)"
+  else bad "the rendered plist has '--' inside an XML comment, which XML forbids — plutil -lint would refuse this file: $_dashes"; fi
+  if command -v python3 >/dev/null 2>&1; then
+    _xmlwhy="$(python3 -c 'import sys,xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$PLIST" 2>&1)"
+    if [ -z "$_xmlwhy" ]; then ok "the rendered plist is WELL-FORMED XML (parsed by python3, NOT plutil — so this half IS exercised where plutil is stubbed)"
+    else bad "the rendered plist is NOT well-formed XML: $(printf '%s' "$_xmlwhy" | tail -1)"; fi
+  else
+    skipd "python3 is absent — the well-formedness half of §F is NOT exercised here (the '--'-in-comment check above still ran)"
+  fi
+fi
+if [ -n "${STUBBED_PLUTIL:-}" ]; then
+  ok "plutil was STUBBED on this platform — the <plutil>-only lint half is not exercised here, the launchd half and the python3 well-formedness half above are"
+fi
 if [ -z "$(mutating)" ]; then ok "plain install made ZERO mutating launchctl calls (a validation run cannot disturb a live controller)"
 else bad "plain install MUTATED launchd: $(mutating)"; fi
-if [ -n "${STUBBED_PLUTIL:-}" ]; then
-  ok "plutil was STUBBED on this platform — the XML-lint half of this section is not exercised here, the launchd half is"
-fi
 
 # --start with a healthy box: the job comes up and the start is PROVEN.
 fresh "$(( $(date +%s) - 5 ))"
