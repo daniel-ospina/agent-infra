@@ -5499,8 +5499,9 @@ test("mergeInvocationInText: TEXT is not an invocation, and an all-assembled com
     // ⛔ AND `isMergeSelectorToken`'s `PR_URL_RE` arm, pinned the same way (mutant M15). A URL
     // selector is otherwise ALWAYS shielded: `GH=gh; ${GH} ${P} ${M} <url> --admin` is still
     // refused with the arm deleted, because the GROUP-slot ask reads `${GH}`/`${P}` first. Only a
-    // shape whose URL is the SOLE readable selector faults it — measured: over a 5 680-literal
-    // corpus the arm decides ZERO times, so no corpus can pin it and only a row can. This row is
+    // shape whose URL is the SOLE readable selector faults it. A corpus cannot pin this arm at all —
+    // over every string literal in the three review-enforcer sources it is never the deciding one —
+    // so it is pinned by a ROW or by nothing. This row is
     // `timeout 5 gh pr merge <url> --admin` and is REFUSED at `78d897fa1` and here.
     `timeout 5 ${"$"}{GH} ${"$"}{P} ${"$"}{M} https://github.com/o/r/pull/9 --admin`,
     // ⛔ AND THE COMMAND-FIRST ORDERING of `mergeVerbSequenceInTokens`, pinned on its own (review

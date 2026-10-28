@@ -5805,9 +5805,10 @@ const COMMAND_SEPARATOR = /[;&|(){!\n\r]/;
  * `<!-- admin-merge-safety: ${head} -->` therefore has no reachable `gh`→group→verb triple: its
  * `<`, `<<'EOF'` and `-->` tokens are all excluded, and what remains (`head}`) cannot complete a
  * sequence — `04bc1dde` (measured there) admits that heredoc, and the arms that refused it are the
- * ones this PR narrows (measured, review cycles 4 and 5). ONE definition, THREE readers (the walk's
- * three slots and the assembled-argv test below): two notions of "a construct in a word slot" is
- * how this file's reads start disagreeing about the same token.
+ * ones this PR narrows (measured, review cycles 4 and 5). ONE definition, FOUR slots — the walk's
+ * command, group and verb slots, plus the FLAG slot reached through `isAdminFlagSlot` from the
+ * assembled-argv test: two notions of "a construct in a word slot" is how this file's reads start
+ * disagreeing about the same token.
  */
 function isVerbSlotConstruct(raw: string, w: string): boolean {
   return (
@@ -5837,16 +5838,19 @@ function isVerbSlotConstruct(raw: string, w: string): boolean {
  *   - the `PR_URL_RE` arm — `timeout 5 ${GH} ${P} ${M} https://…/pull/9 --admin` in
  *     `assembledSelector`. ⚠️ It was UNPINNED for a whole cycle, and the reason is worth keeping:
  *     the other URL rows in that block are read by the GROUP-slot ask before this arm is ever
- *     consulted (measured: `GH=gh; ${GH} ${P} ${M} <url> --admin` is still refused with this arm
- *     deleted), so only a shape where the URL is the sole readable selector faults it. Over a
- *     5 680-literal corpus this arm decides ZERO times — a corpus cannot pin it, only a row can.
+ *     consulted (`GH=gh; ${GH} ${P} ${M} <url> --admin` is still refused with this arm deleted), so
+ *     only a shape where the URL is the sole readable selector faults it. A corpus cannot pin it at
+ *     all — over every string literal in the three review-enforcer sources the arm is NEVER the
+ *     deciding one; only a row can.
  *   - the `/[$`]/` (construct) arm — `${PR}` and `$PR_URL` in `assembledSelector`.
  * ⛔ AND THE `\w*\}` ARM IS GONE: it answered for a bare `X}` tail, which reaches this function
- * only when `shellWordAt`'s `${X}` pair branch did NOT fire. Measured over the same 5 680-literal
- * corpus plus an ~130-row hand-built set of merge shapes, it decided exactly ONCE and that one
- * input was a TypeScript object-literal fragment, not a command — i.e. it could only ever widen the
- * read on garbage. An arm no assertion can see is an arm the next lane can delete; this one was
- * deleted deliberately, with the measurement, rather than left for someone to find unpinned.
+ * only when `shellWordAt`'s `${X}` pair branch did NOT fire. To see why it went, run the procedure
+ * rather than trusting a number — extract every string literal from the three review-enforcer
+ * sources, run `isAdminMergeCommand` over them with and without the arm, and diff: the arm decides
+ * once, and that input is a TypeScript object-literal fragment, not a command, i.e. it could only
+ * ever widen the read on text that is not a shell command. (No magnitude is quoted here: an earlier
+ * revision of this very comment quoted corpus counts that no later lane could reproduce, which is
+ * the defect this PR deletes elsewhere. The procedure above is the reproducible artifact.)
  */
 function isMergeSelectorToken(tok: string): boolean {
   const w = shellWord(tok);
