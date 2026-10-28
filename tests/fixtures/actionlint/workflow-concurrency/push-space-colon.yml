@@ -1,0 +1,15 @@
+# FAILURE-CLASS FIXTURE (R2, readability): `push :` — a space before the mapping colon is valid YAML and
+# parses as the key `push`. A reader that requires the colon adjacent to the key drops the trigger
+# entirely, so R2 is never evaluated and the file reports GREEN.
+name: push-space-colon
+on:
+  push :
+    branches: [main]
+concurrency:
+  group: push-space-colon-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
