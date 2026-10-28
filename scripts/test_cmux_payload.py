@@ -478,6 +478,130 @@ def test_a_short_multi_word_payload_still_verifies(P, tmp_path):
         assert P.transcript_has_payload(str(f), payload) is True, payload
 
 
+# ── the two CHANNELS need two rules: transcript value vs rendered surface (#1881 review P1) ────────
+
+def test_a_short_payload_reaches_pane_only_on_a_rendered_surface(P):
+    """⛔ `PANE_ONLY` WAS UNREACHABLE FOR EVERY SHORT ORDER (#1881 review P1). The whole-value rule is
+    right for a transcript VALUE, but `screen_has_payload` applied it to a 200-line TUI render — which
+    can never EQUAL a nine-character order. So `resume it` / `do it now` / `go on` fell to the
+    catch-all arm, whose text diagnoses "cmux refused the send or delivered a PREFIX under load" — a
+    truncation story with no evidence — instead of the one verdict whose remedy is "check the pane,
+    press Enter, do not re-send".
+
+    Fails on the pre-fix bytes: `screen_has_payload` returns False for every payload here."""
+    for payload in ("resume it", "do it now", "check pane", "go on", "retry it", "ok"):
+        assert P.screen_has_payload(f"Working... (turn started)\n{payload}\n> ", payload) is True, payload
+
+
+def test_a_short_payload_on_the_pane_still_needs_a_TOKEN_BOUNDARY(P):
+    """NON-VACUITY for the pane rule: relaxing it must not turn a substring into a match. `ok` inside
+    `token` is not the order, and `continue` inside `continued` is not either."""
+    assert P.screen_has_payload("assistant: checking the token now", "ok") is False
+    assert P.screen_has_payload("I continued with the next item", "continue") is False
+    assert P.screen_has_payload("resume items were skipped", "resume it") is False
+
+
+def test_a_marker_is_never_stitched_across_two_appended_records(P, tmp_path):
+    """⛔ THE JOINED CANDIDATE WAS STILL THERE (#1881 review P2). The comment said "each string value
+    is its own candidate — never a joined one", but `candidates` still started with the WHOLE window
+    `chunk`, and `compact()` strips newlines, so a >= 16-char marker could be stitched from the tail of
+    one record and the head of the next. Two unrelated records the lane wrote are not a message it
+    received.
+
+    Fails on the pre-fix bytes: the window-join matches and a delivery verdict is reported."""
+    # A PLAIN-TEXT transcript, where the join really was live: with JSONL syntax between two records
+    # (`…"content":"` / `"}{…`) the stitched marker is unreachable by accident, which is exactly why
+    # this survived — the class was closed on the record-shaped fixture and open on the other one.
+    f = tmp_path / "session.txt"
+    f.write_text("the pane first\nSO the check ran\n", encoding="utf-8")
+    assert P.transcript_has_payload(str(f), "the pane first SO the check ran") is False
+
+
+def test_session_files_state_of_an_unknown_id_is_UNKNOWN_not_absent(P):
+    """⛔ `False` MEANS "A FILE WAS PROVEN ABSENT", WHICH LICENSES THE OFFSET-0 WINDOW (#1881 review
+    P2). An id we were never given answers "could not look" (`None`) — today's only call site guards
+    with `bool(session_id)`, but the read must not carry a licence it never earned."""
+    assert P.session_files_state(None) is None
+    assert P.session_files_state("") is None
+
+
+def test_the_session_id_read_is_RETRIED_before_the_send(P):
+    """⛔ ONE TRANSIENT `cmux` HICCUP MADE `VERIFIED` UNREACHABLE FOR A WHOLE DISPATCH (#1881 review
+    P1). The id is resolved ONCE, before the send, and a single empty read (cmux is intermittently
+    empty on a live pane — `orch-send.sh` retries its own footer four times for that reason) left
+    `session_file` None for the run, so a message that really was submitted exited 6 and told the
+    operator to re-send it. Nothing has been sent when this read runs, so a bounded retry costs no
+    soundness.
+
+    Fails on the pre-fix bytes: the first empty answer is returned as None and nothing is retried."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    reads = {"n": 0}
+
+    def run(argv, timeout=None):
+        reads["n"] += 1
+        return _Proc("" if reads["n"] == 1 else f"{sid}\n")
+
+    assert P.resolve_session_id("ws-1", run, sleep=_noop_sleep) == sid
+    assert reads["n"] == 2
+
+
+def test_a_nonzero_payload_send_states_its_cause_on_stderr(P, capsys):
+    """⛔ THE CALLER'S ARM PROMISES THESE DIAGNOSTICS (#1881 review P2). `orch-send.sh`'s catch-all
+    arm says "the checker's diagnostics below say which when it printed any" — naming exactly the
+    branch it was written for, a `cmux` whose send exits 1 ("Access denied"). Nothing was written
+    there, so the promise pointed at evidence that could not exist, and the operator could not tell
+    "nothing was typed, safe to retry" from "a prefix landed, do not re-send"."""
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            proc = _Proc("", returncode=1)
+            proc.stderr = "Access denied - only processes started inside cmux can connect"
+            return proc
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict == P.UNVERIFIED
+    err = capsys.readouterr().err
+    assert "cmux send exited 1" in err
+    assert "Access denied" in err
+
+
+def test_a_send_status_that_cannot_be_read_is_a_FAILURE_not_a_success(P):
+    """⛔ `getattr(…, "returncode", 0)` DEFAULTED A MISSING STATUS TO SUCCESS (#1881 review P2). The
+    comment above it said "only an explicit 0 passes" and the code did the opposite: a duck-typed
+    process object from the `run` seam — the seam this module is built around — certified a send it
+    never reported on. Wrong in the one direction this module may not fail in."""
+    class _NoStatus:
+        stdout = ""
+
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            return _NoStatus()
+        return _Proc(LONG)                     # the payload IS on the pane
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict == P.UNVERIFIED, "a send with no readable status was treated as a success"
+    assert verdict != P.PANE_ONLY, "a send we could not read was reasoned about as if it happened"
+
+
+def test_a_direct_caller_gets_the_flattened_payload_too(P):
+    """⛔ `flatten()` ONLY RAN IN `_main` (#1881 review P2). The module docstring offers `send_verified`
+    as the shared seam and the PR body names its future adopters, so a direct caller still submitted a
+    multi-line order ONE ENTER PER LINE — re-opening #1799 one call level below the only place that
+    closed it, with the tail check certifying only the last fragment."""
+    sent = []
+
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            sent.append(argv[-1])
+            return _Proc("OK")
+        return _Proc("")
+
+    P.send_verified("ws-1", "line one\nline two\nTAIL", run=run, sleep=_noop_sleep, timeout_s=0)
+    assert sent, "nothing was sent"
+    assert "\n" not in sent[0], "a direct caller sent a multi-line payload"
+    assert sent[0] == "line one line two TAIL"
+
+
 def test_a_short_payload_is_not_certified_by_the_lanes_own_prose(P, tmp_path):
     """⛔ A TOKEN BOUNDARY WAS NOT ENOUGH (#1881 review, round 5 P1). The lane's own output is prose
     the check runs over, so `continue` was certified by "I will continue with the next item" and `ok`
@@ -868,6 +992,11 @@ def _run_orch_send(bindir, screen, message, home=None, session=None, sid=None, s
     env["ORCH_SEND_VERIFY_TIMEOUT"] = "0"
     if home:
         env["HOME"] = str(home)
+    else:
+        # A CLEAN RUNNER'S HOME: no `~/orchestrator/brief-gate.sh` to fall back to (#1881 review P1).
+        env["HOME"] = str(bindir.parent / "home")
+        (bindir.parent / "home").mkdir(exist_ok=True)
+    env = _runner_env(env)
     if session:
         env["FAKE_SESSION_FILE"] = str(session)
     if sid:
@@ -934,16 +1063,39 @@ def _farmed_copy(tmp_path, checker_body=None):
     sibling at `<root>/scripts/lib/cmux_payload.py` — present only when `checker_body` is given.
 
     `SCRIPTS` is derived from the script's OWN location, so a copy in its own root is how a farm
-    missing a sibling is reproduced without touching this checkout."""
+    missing a sibling is reproduced without touching this checkout.
+
+    ⛔ AND IT MUST CARRY THE BRIEF GATE TOO (#1881 review P1, BLOCKING). The copy reproduced a farm
+    that had never existed: `orch-send.sh` resolves `orchestrator-harness/brief-gate.sh` beside
+    itself (fallback 2 of three) and runs it BEFORE target resolution and BEFORE the checker guard
+    these arms pin, so with no gate in the root all three arms exited **78** — on the CI runner,
+    where `AGENT_INFRA_PATH` is unset and `$HOME/orchestrator` does not exist. They passed on this
+    laptop only because fallback 3 found the operator's own `~/orchestrator/brief-gate.sh`: a
+    box-dependent green, in the suite whose whole purpose is to be runnable by CI.
+
+    The REAL gate is copied, not stubbed, so the arms still exercise the real validation and the
+    fixtures still have to be conforming briefs.
+    """
     root = tmp_path / "farmed"
     (root / "scripts").mkdir(parents=True)
     script = root / "scripts" / "orch-send.sh"
     with open(_ORCH_SEND, encoding="utf8") as fh:
         script.write_text(fh.read())
+    (root / "scripts" / "orchestrator-harness").mkdir()
+    (root / "scripts" / "orchestrator-harness" / "brief-gate.sh").write_text(
+        open(_BRIEF_GATE, encoding="utf8").read(), encoding="utf8")
     if checker_body is not None:
         (root / "scripts" / "lib").mkdir()
         (root / "scripts" / "lib" / "cmux_payload.py").write_text(checker_body)
     return script
+
+
+def _runner_env(env):
+    """The env a CLEAN CI runner has — no `AGENT_INFRA_PATH`, no `$O`, an empty `$HOME` (#1881
+    review P1). Without this the farmed-copy arms pass on a developer box and redden on the runner."""
+    env.pop("AGENT_INFRA_PATH", None)
+    env.pop("O", None)
+    return env
 
 
 def test_orch_send_refuses_when_the_checker_is_missing(tmp_path):
@@ -955,6 +1107,10 @@ def test_orch_send_refuses_when_the_checker_is_missing(tmp_path):
     sent_log = tmp_path / "sent.log"
     bindir, screen = _fake_cmux_path(tmp_path, "Working... (turn started)\n")
     r = _run_orch_send(bindir, screen, LONG, script=script, session=sent_log)
+    # ⛔ NOT 78: the farmed copy carries the brief gate beside itself, so a CLEAN RUNNER (no
+    # AGENT_INFRA_PATH, no $HOME/orchestrator) reaches the checker guard this arm pins. 78 is the
+    # "brief-gate.sh not found" refusal, which made this arm red for a reason unrelated to its name.
+    assert r.returncode != 78, r.stdout + r.stderr
     assert r.returncode == 7, r.stdout + r.stderr
     assert "NOT SENT" in r.stdout
     # The pre-fix wording is the false claim this pin exists to forbid.
