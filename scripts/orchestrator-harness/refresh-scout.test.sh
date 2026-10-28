@@ -34,6 +34,25 @@ LOOP="$HERE/orch-loop.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
+ck()  { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
+# mut <out-path> — produce a MUTATION COPY of the shipped script by running the Python program on stdin
+# (`python3 - "$REFRESH" <out-path>`). Returns 0 only when the copy was WRITTEN; on a drifted anchor, on
+# a NO-OP revert, or on anything else it prints ONE line and removes the partial file.
+# ⛔ WHY THIS EXISTS (#2956 review, cosmetic). These controls guarded themselves with bare `assert`
+# statements, so a control whose anchor had moved died with a PYTHON TRACEBACK — and a `src.replace()`
+# that matched nothing wrote a copy IDENTICAL to the shipped script, i.e. a control that proves nothing
+# while the suite still prints `ok`. A traceback is not a diagnosis and a vacuous control is not a
+# control; both are now one clean ❌ on the arm's own `ck` line.
+mut() {
+  local out="$1" err
+  if err="$(python3 - "$REFRESH" "$out" 2>&1)"; then
+    [ -s "$out" ] && return 0
+    err="the mutation program wrote nothing"
+  fi
+  rm -f "$out"
+  echo "  (control not produced: ${err//$'\n'/ })"
+  return 1
+}
 T="$(mktemp -d "${TMPDIR:-/tmp}/refresh-scout.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 echo "==> refresh-candidates scout-provisioning contract ($HERE)"
@@ -3601,6 +3620,15 @@ rf "$D" check
                 || bad "--check: rc=$RC (want 0) — $OUT"
 
 # ⛔ COMMITS AHEAD IS A LOCAL QUESTION: the probe must fire without a fetch (review cycle 5, P2).
+# ⛔ AND A CONNECTED COUNT IS NOT AN ATTRIBUTION (#2956 review P2 — the other half of #2174's arm).
+# This arm plants a REAL local commit in a FULL checkout, and until #2956 it pinned a `--check` FAIL
+# reading "PROVEN on this checkout's own graph, so the refresh will refuse to move it". The run path
+# fetches FIRST, and on a STALE `refs/remotes/origin/main` those commits are the TRUNK's, not the
+# scout's — so the FAIL refused what the refresh itself accepts, and `cloud-cell-bringup.sh` `die`s on
+# any non-zero `--check`: a healthy cell could not START. Offline, "N local commits" and "N commits a
+# stale ref has not fetched" are the SAME reading (ahead>0, behind=0, connected), so this mode cannot
+# attribute them and WARNS. What it still refuses is pinned by the arms below (the stale-ref case that
+# made this a P2, and the unrelated history a fetch cannot connect).
 mk_case check-scout-ahead
 rm -rf "$D/repo/.worktrees/dispatch-scout"
 mk_scout_fixture "$D" answering
@@ -3608,23 +3636,146 @@ git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch
 echo '# committed in the scout' >> "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 git -C "$D/repo"/.worktrees/dispatch-scout commit -qam "scout: local commit"
 rf "$D" check
-[ "$RC" -eq 1 ] && ok "--check: commits ahead of origin/main are REFUSED (rc=1) with no network call" \
-                || bad "--check: rc=$RC (want 1) — $OUT"
+[ "$RC" -eq 0 ] && ok "--check: a commit in a FULL checkout WARNS instead of FAILing (rc=0) — the run path fetches before it decides" \
+                || bad "--check: rc=$RC (want 0) — a count it cannot attribute refused a cell start: $OUT"
 case "$OUT" in
-  # #2953: same arm, new wording — the `--check` FAIL names the commits the move would orphan and says
-  # the verdict was PROVEN on the checkout's own graph (so an operator can tell it from the WARN, which
-  # is the shallow/unprovable case).
-  *"commit(s) that origin/main does not have"*) ok "--check: the refusal names the commits the move would orphan" ;;
-  *) bad "--check: no commits-ahead reason — $OUT" ;;
+  *"check: FAIL the scout"*) bad "--check: it FAILs on a count that reads IDENTICALLY for local work and a stale ref — $OUT" ;;
+  *) ok "--check: no 'check: FAIL the scout' line — the false block is gone" ;;
 esac
-# ⛔ THE PREFIX IS A CONTRACT WITH TWO CONSUMERS (review cycle 8, P2): `cloud-cell-supervisor.sh` and
-# `cloud-cell-bringup.sh` match `*"TRANSIENT: scout"*` to choose their diagnosis, and nothing pinned
-# that literal — so an edit to either side left the suite green while the operator got the wrong
-# remedy (which is exactly how the match became unreachable once already).
 case "$OUT" in
-  *"TRANSIENT: scout"*) ok "--check: the transient scout refusal carries the prefix the two consumers match on" ;;
-  *) bad "--check: no 'TRANSIENT: scout' prefix — the consumers would print the generic remedy — $OUT" ;;
+  # The count must still be REPORTED (the reading is downgraded, not dropped) and the verdict must be
+  # NAMED, so an operator can see which kind the count may be.
+  *"carries 1 commit(s)"*"local-or-unfetched"*) ok "--check: the WARN still carries the COUNT and names the verdict" ;;
+  *) bad "--check: the WARN drops the count or the verdict — $OUT" ;;
 esac
+case "$OUT" in
+  *"LOCAL commit(s)"*"STALE tracking ref"*) ok "--check: it names BOTH readings, so the operator is not told one is proven" ;;
+  *) bad "--check: the WARN names only one reading — $OUT" ;;
+esac
+
+# ── (p0-p1) THE STALE TRACKING REF: a CLEAN scout at the trunk's REAL tip, behind a stale ref ──────
+# THE MEASURED SHAPE, and the one the previous arm could not tell from local work: the trunk moved on,
+# this checkout has not fetched since, and the scout is a CLEAN copy of the NEW tip. `origin/main..HEAD`
+# reads 1 — the same number a local commit produces — while the run path's fetch resolves it to `none`.
+# ⛔ THE FIXTURE IS ASSERTED BEFORE THE RUN: every arm here would pass by measuring a tree that never
+# had the shape (a fresh ref reads `none`, and proves nothing about the WARN).
+mk_stale_ref_case() {   # <name> — sets $D, $SD, $STALE_N
+  mk_case "$1"
+  rm -rf "$D/repo/.worktrees/dispatch-scout"
+  mk_scout_fixture "$D" answering
+  git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+  SD="$D/repo/.worktrees/dispatch-scout"
+  git -C "$SD" checkout --quiet -B chore/dispatch-scout origin/main >/dev/null 2>&1
+  STALE_REF="$(git -C "$D/repo" rev-parse refs/remotes/origin/main)"
+  # THE TRUNK MOVES ON: this commit is really pushed to origin/main (the end state is identical whether
+  # another box advanced it or this one did), and only the LOCAL tracking ref is then set back — which
+  # is exactly what "this checkout has not fetched since" means. The tree stays CLEAN: this is not
+  # local work, and that is the whole point.
+  echo '# gate v3 (the trunk moved on)' >> "$SD/tools/collision_preflight.py"
+  git -C "$SD" -c user.email=t@t -c user.name=t commit -qam "gate v3"
+  git -C "$SD" push -q origin HEAD:refs/heads/main
+  git -C "$D/repo" update-ref refs/remotes/origin/main "$STALE_REF"
+  STALE_N="$(git -C "$SD" rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null)"
+}
+SD=""; STALE_REF=""; STALE_N=""
+mk_stale_ref_case check-scout-stale-ref
+ck "(p0) the tracking ref IS stale — origin/main's real tip is not refs/remotes/origin/main" \
+    "$([ "$(git -C "$D/repo" ls-remote origin refs/heads/main | cut -f1)" != "$(git -C "$D/repo" rev-parse refs/remotes/origin/main)" ]; echo $?)"
+ck "(p0) the checkout is FULL, not shallow" \
+    "$([ "$(git -C "$D/repo" rev-parse --is-shallow-repository)" != true ]; echo $?)"
+ck "(p0) the histories are CONNECTED (a merge base exists — so this is the 'local' arm's shape)" \
+    "$(git -C "$SD" merge-base HEAD refs/remotes/origin/main >/dev/null 2>&1; echo $?)"
+ck "(p0) the count the guard reads is ${STALE_N} (want >0)" \
+    "$([ "${STALE_N:-0}" -gt 0 ]; echo $?)"
+ck "(p0) the scout tree is CLEAN — the state a cell was refused to START on" \
+    "$([ -z "$(git -C "$SD" status --porcelain --untracked-files=no)" ]; echo $?)"
+rf "$D" check
+ck "(p1) --check does NOT fail a stale-tracking-ref FULL checkout (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+case "$OUT" in
+  *"check: FAIL the scout"*) r=1 ;;
+  *) r=0 ;;
+esac
+ck "(p1) no 'check: FAIL the scout' line — the pre-#2956 false block" "$r"
+case "$OUT" in
+  *"check: WARN the scout"*"STALE tracking ref"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p1) it WARNS and names the stale tracking ref as one of the two readings" "$r"
+case "$OUT" in
+  *"carries ${STALE_N} commit(s)"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p1) the WARN carries the COUNT (${STALE_N}) — the reading is downgraded, not dropped" "$r"
+# ⛔ AND THE RUN PATH AGREES, on the SAME tree: this is the assertion that makes the downgrade right
+# rather than merely quieter. The fetch resolves the count to `none` and the pass proceeds.
+mk_gh_rest "$D" 5151
+rf "$D" refresh
+ck "(p1) the RUN PATH proceeds on that same tree (rc=$RC) — so the old FAIL refused what the refresh accepts" \
+    "$([ "$RC" -eq 0 ]; echo $?)"
+ck "(p1) the run path moved the scout to origin/main's REAL tip (the tracking ref it fetched)" \
+    "$(git -C "$SD" diff --quiet origin/main --; echo $?)"
+case "$OUT" in
+  *"LOCAL commit(s)"*) r=1 ;;
+  *) r=0 ;;
+esac
+ck "(p1) it never claimed these were LOCAL commits (the claim a fetch disproved)" "$r"
+
+# ── (p2) NON-VACUITY: restoring the old `local` verdict turns (p1) RED ───────────────────────────
+# A copy of the SHIPPED script with ONE line reverted — the `noconnect` attribution dropped, so the
+# verdict is `local` for a stale full checkout, exactly as before #2956. Nothing else differs, so a
+# difference in outcome is attributable to the verdict. It ALSO proves the `*)` arm (a verdict this
+# check has no reading for) is live rather than dead code.
+mk_stale_ref_case check-scout-stale-prefix
+MUTP="$T/refresh-noconnect-prefix.sh"
+mut "$MUTP" <<'PY5'
+import sys
+src = open(sys.argv[1]).read()
+needle = "      SCOUT_AHEAD_VERDICT=local-or-unfetched\n"
+if needle not in src:
+    sys.exit("the noconnect verdict is missing — the anchor moved; this control would be vacuous")
+out = src.replace(needle, "      SCOUT_AHEAD_VERDICT=local\n")
+if out == src:
+    sys.exit("the verdict revert was a NO-OP — this control would prove nothing")
+open(sys.argv[2], "w").write(out)
+PY5
+ck "(p2) the pre-#2956 control was actually produced (the noconnect verdict reverted to 'local')" "$([ -s "$MUTP" ]; echo $?)"
+if [ -s "$MUTP" ]; then
+OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
+        HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$MUTP" --check 2>&1)"
+RC=$?
+ck "(p2) WITHOUT the fix --check FAILS the stale-tracking-ref checkout (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+case "$OUT" in
+  *"check: FAIL the scout"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p2) …and it is a 'check: FAIL the scout' line, so (p1)'s no-FAIL assertion reddens" "$r"
+fi
+
+# ── (p3) AN UNRELATED HISTORY STILL FAILS `--check` — the downgrade is not a blanket one ──────────
+# A count a fetch CANNOT change is still refused: the trunk resolving to a history that shares no
+# ancestor with the scout (an orphan branch / a rewritten trunk) refuses after any fetch, so `--check`
+# must refuse it too. This is also where the `TRANSIENT: scout` consumer contract lives now that the
+# commits-ahead arm above WARNS: `cloud-cell-supervisor.sh` and `cloud-cell-bringup.sh` match that
+# literal to choose their diagnosis, so it must remain pinned by an arm that really prints it.
+mk_case check-scout-unrelated
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D" answering
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+SD="$D/repo/.worktrees/dispatch-scout"
+git -C "$SD" checkout -q --orphan orphan-work
+git -C "$SD" -c user.email=t@t -c user.name=t commit -qm "orphan work"
+rf "$D" check
+ck "(p3) an orphan (unrelated) history is still REFUSED by --check (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
+case "$OUT" in
+  *"shares NO common ancestor"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p3) the refusal says a FETCH cannot connect it — the reason the FAIL survives the downgrade" "$r"
+case "$OUT" in
+  *"TRANSIENT: scout"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(p3) the transient scout refusal carries the prefix the two consumers match on" "$r"
 
 # ⛔ THE UNTRACKED-GATE ARM: it sat ABOVE `resolve_preflight` once, where `PREFLIGHT` is empty, so it
 # could never fire and `--check` certified a tree whose every pass returns rc=3 (review cycle 4, P0).

@@ -1091,16 +1091,33 @@ cmd_check() {
       # fetch allowed in this mode the history cannot be connected, so an UNPROVABLE count is a WARN
       # naming both readings; the RUN PATH fetches/deepens and refuses only when the commits are genuinely
       # local (PROVEN by a merge base). One derivation, both paths — see `scout_ahead_verdict`.
+      # ⛔ THE OTHER HALF OF "STALE TRACKING REF vs LOCAL WORK" IS THE FULL CHECKOUT (#2956 review P2).
+      # The shallow arm above was only one arm: on a FULL checkout whose `refs/remotes/origin/main` is
+      # STALE, `n>0` plus a merge base reads `local`, and this check FAILed with "PROVEN on this
+      # checkout's own graph, so the refresh will refuse to move it" — while the run path fetches FIRST
+      # and then finds HEAD already AT the (advanced) trunk tip and proceeds. Same false block, same
+      # consequence: `cloud-cell-bringup.sh` `die`s on any non-zero `--check`, so a healthy cell could
+      # not START. The attribution is what is unprovable offline, not the count: a merge base proves
+      # HEAD carries N commits the LOCAL ref does not have, and a stale ref produces exactly the same
+      # local reading as a local commit (measured: both are ahead>0, behind=0, connected). Only a fetch
+      # separates them, and this mode may not fetch — so the verdict is `local-or-unfetched` and this
+      # check WARNS. What it still FAILs is what a fetch cannot change: an `unrelated` history (a fetch
+      # of the trunk cannot connect a disjoint one) and a verdict it has no reading for.
       if [ -n "$sc_main" ] && [ "$sc_head" != "$sc_main" ]; then
         scout_ahead_verdict refs/remotes/origin/main noconnect
         case "$SCOUT_AHEAD_VERDICT" in
           none) ;;
-          local|unrelated)
-            echo "[refresh] check: FAIL the scout at $SC carries $SCOUT_AHEAD_COUNT commit(s) that origin/main does not have ($SCOUT_AHEAD_VERDICT — PROVEN on this checkout's own graph), so the refresh will refuse to move it"
+          unrelated)
+            echo "[refresh] check: FAIL the scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) on a history that shares NO common ancestor with refs/remotes/origin/main ($SCOUT_AHEAD_VERDICT — a FETCH cannot connect a disjoint history, so the refresh will refuse to move it)"
             echo "[refresh] TRANSIENT: scout commits ahead — the move would orphan those commits; save them (git -C $SC branch scout-work-<date> or push them), then re-run"
             return "$EXIT_TRANSIENT" ;;
-          *)
+          unfetched)
             echo "[refresh] check: WARN the scout at $SC is ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) off refs/remotes/origin/main and this checkout CANNOT SAY WHICH KIND: it is a SHALLOW checkout whose history does not connect to the trunk (or its tracking ref is stale), so these may be commit(s) the ref has not fetched rather than local work. The run path fetches (and deepens a shallow checkout) before deciding, and refuses only if they are genuinely local — it is NOT refusible here without the network (#2953)" ;;
+          local-or-unfetched)
+            echo "[refresh] check: WARN the scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) that refs/remotes/origin/main does not have, and this checkout CANNOT SAY WHICH KIND ($SCOUT_AHEAD_VERDICT): the count is PROVEN on this checkout's own graph, but a CONNECTED count is not an ATTRIBUTION — these are either LOCAL commit(s) or commit(s) a STALE tracking ref has not fetched, and the two read IDENTICALLY offline (ahead=$SCOUT_AHEAD_COUNT, behind=0, connected). The run path fetches first and refuses only if they are genuinely local, so a FAIL here would refuse a healthy cell without the network to prove it — this is NOT refusible in this mode (#2956)" ;;
+          *)
+            echo "[refresh] check: FAIL the scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) off refs/remotes/origin/main and this check has NO READING for them ('$SCOUT_AHEAD_VERDICT') — REFUSING TO CERTIFY a verdict it does not understand rather than blessing a cell on it"
+            return "$EXIT_TRANSIENT" ;;
         esac
       fi
       # ⛔ AN UNANSWERABLE PROBE IS NAMED, NOT SILENT (review cycle 7, P2). With no local
@@ -1356,6 +1373,13 @@ scout_connect_history() {   # <ref>
 #               trunk, an orphan branch, or local work on a history main never had) → PRESERVE.
 #   unfetched — the checkout is SHALLOW and deepening could NOT connect it, so N counts "commit(s) the
 #               remote-tracking ref has not fetched" and says NOTHING about local work → FETCH/retry.
+#   local-or-unfetched — `noconnect` ONLY: the count is PROVEN on a connected graph (a merge base), but
+#               a CONNECTED COUNT IS NOT AN ATTRIBUTION — HEAD carrying N commits the LOCAL ref lacks is
+#               the same reading for "N local commits" and for "N commits a STALE ref has not fetched"
+#               (ahead>0, behind=0, connected, in both). Only a fetch separates them, and `noconnect` may
+#               not fetch, so this is WARNed, never refused (#2956 review, the other half of #2174's arm;
+#               the reviewer's suggested name was `unfetched-full` — named for BOTH readings instead,
+#               because the token is read by operators in the message and neither reading is proven).
 # ⛔ `unrelated` EXISTS SO THAT (b) CANNOT LEAK THROUGH THE NEW ARM (measured in this change's own
 # prototype): a scout on an ORPHAN branch is not shallow and has no merge base, and folding it into
 # `unfetched` would have printed "nothing needs preserving" over commits that exist in no other place.
@@ -1393,7 +1417,18 @@ scout_ahead_verdict() {   # <ref> <connect|noconnect>; sets SCOUT_AHEAD_VERDICT,
   # verdict immune to the graph artifact this helper exists for.
   [ -n "$n" ] && [ "$n" -eq 0 ] 2>/dev/null && { SCOUT_AHEAD_VERDICT=none; return 0; }
   if [ -n "$n" ] && git -C "$SC" merge-base HEAD "$ref" >/dev/null 2>&1; then
-    SCOUT_AHEAD_VERDICT=local; return 0
+    # ⛔ THE COUNT IS PROVEN; ITS ATTRIBUTION IS NOT — AND `noconnect` CANNOT BUY ONE (#2956 review P2).
+    # Measured shape: a FULL checkout whose `refs/remotes/origin/main` is STALE (the trunk moved on, this
+    # checkout has not fetched since) has HEAD carrying exactly the commits the ref lacks — which is the
+    # SAME local reading a genuinely-local commit produces. The run path fetches first (so this resolves
+    # to `none` or to `local` there); `--check` may not, so it must not claim what only a fetch can
+    # prove. Refusing on it refused a healthy cell at `cloud-cell-bringup.sh --check`.
+    if [ "$mode" = noconnect ]; then
+      SCOUT_AHEAD_VERDICT=local-or-unfetched
+    else
+      SCOUT_AHEAD_VERDICT=local
+    fi
+    return 0
   fi
   # ⛔ NO MERGE BASE: shallow ⇒ the graph is severed (the artifact this change exists for); not shallow
   # ⇒ the histories really are disjoint, which is WORK OR A REWRITE and must be preserved.
@@ -1646,7 +1681,9 @@ scout_sync() {
          # ⛔ NOT FOLDED INTO `unfetched` (#2953 review of this same change): these histories share NO
          # ancestor and the checkout is NOT shallow, so this is local work (or a rewrite) — the one
          # shape where "nothing needs preserving" would be a lie over commits that exist nowhere else.
-         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries $SCOUT_AHEAD_COUNT commit(s) on a history that shares NO common ancestor with origin/main — moving the gate would orphan them. That is either local work or a rewritten trunk, and deciding between those is an operator call, not a scheduled one. Inspect them (git -C $SC log --oneline --graph origin/main..HEAD), save anything real with: git -C $SC branch scout-work-$(date +%s)"
+         # The count can be UNREADABLE on this arm (it is reached when `rev-list` failed, not only when it
+         # answered), so it prints a WORD rather than `carries  commit(s)` (#2956 review, cosmetic).
+         scout_refuse "$EXIT_TRANSIENT" "scout at $SC carries ${SCOUT_AHEAD_COUNT:-an unreadable number of} commit(s) on a history that shares NO common ancestor with origin/main — moving the gate would orphan them. That is either local work or a rewritten trunk, and deciding between those is an operator call, not a scheduled one. Inspect them (git -C $SC log --oneline --graph origin/main..HEAD), save anything real with: git -C $SC branch scout-work-$(date +%s)"
          return 1 ;;
       *)
          # REFUSED, and it says WHICH kind of difference this is — FETCH, not preserve. A deepening that

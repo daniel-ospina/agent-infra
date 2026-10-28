@@ -66,6 +66,26 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 ck()  { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
+# mut <out-path> — produce a MUTATION COPY of the shipped script by running the Python program on stdin
+# (`python3 - "$REFRESH" <out-path>`), and say cleanly when it could not:
+#   * the copy was WRITTEN  ⇒ 0;
+#   * the anchor DRIFTED, the revert was a NO-OP, or anything else failed ⇒ print ONE line and remove
+#     the partial file.
+# ⛔ WHY THIS EXISTS (#2956 review, cosmetic). These controls used to guard themselves with bare
+# `assert` statements, so a control whose anchor had moved died with a PYTHON TRACEBACK — and, worse, a
+# `src.replace()` that matched nothing produced a copy IDENTICAL to the shipped script, i.e. a control
+# that proves nothing while the suite still prints `ok`. A traceback is not a diagnosis, and a vacuous
+# control is not a control: both now come out as one ❌ on the arm's own `ck` line.
+mut() {
+  local out="$1" err
+  if err="$(python3 - "$REFRESH" "$out" 2>&1)"; then
+    [ -s "$out" ] && return 0
+    err="the mutation program wrote nothing"
+  fi
+  rm -f "$out"
+  echo "  (control not produced: ${err//$'\n'/ })"
+  return 1
+}
 # ⛔ RESOLVED, not the raw mktemp string: $TMPDIR on macOS ends in `/`, so `mktemp -d "$TMPDIR/x.XXXXXX"`
 # yields a path with a DOUBLED slash (`…/T//refresh-provision.X`). git answers `--absolute-git-dir`
 # with its own normalised form, so a raw-$T comparison of the lock path against the script's own
@@ -337,20 +357,31 @@ mk_case status-arm
 LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
 : > "$LOCK"
 MUT="$D/refresh-no-guards.sh"
-python3 - "$REFRESH" "$MUT" <<'PY2'
+mut "$MUT" <<'PY2'
 import sys
 src = open(sys.argv[1]).read()
 canon = "    ''|*[!0-9]*|0*)"
-assert canon in src, "canonical-form arm missing — this control would be vacuous"
-src = src.replace(canon, "    ''|*[!0-9]*|0)")
-i = src.index('  if [ "${#SCOUT_LOCK_STALE_SECS}" -gt 9 ]; then')
-j = src.index('  fi\n', i) + len('  fi\n')
-src = src[:i] + src[j:]
-assert 'SCOUT_LOCK_STALE_SECS}" -gt 9' not in src, "length guard still present — control vacuous"
-assert '0*)' not in src, "canonical arm still present — control vacuous"
-open(sys.argv[2], "w").write(src)
+if canon not in src:
+    sys.exit("canonical-form arm missing — this control would be vacuous")
+out = src.replace(canon, "    ''|*[!0-9]*|0)")
+if out == src:
+    sys.exit("the canonical-form revert was a NO-OP — this control would prove nothing")
+start = '  if [ "${#SCOUT_LOCK_STALE_SECS}" -gt 9 ]; then'
+if start not in out:
+    sys.exit("the length guard is missing — this control would be vacuous")
+i = out.index(start)
+end = out.find('  fi\n', i)
+if end < 0:
+    sys.exit("the length guard's 'fi' was not found — this control would be vacuous")
+out = out[:i] + out[end + len('  fi\n'):]
+if 'SCOUT_LOCK_STALE_SECS}" -gt 9' in out:
+    sys.exit("length guard still present — control vacuous")
+if '0*)' in out:
+    sys.exit("canonical arm still present — control vacuous")
+open(sys.argv[2], "w").write(out)
 PY2
 ck "(c3) the no-guards control was actually produced" "$([ -s "$MUT" ]; echo $?)"
+if [ -s "$MUT" ]; then
 OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
         SCOUT_LOCK_STALE_SECS=9223372036854775808 \
         HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" \
@@ -362,6 +393,7 @@ case "$(rec why)" in *"could not be compared"*) r=0 ;; *) r=1 ;; esac
 ck "(c3) the cause says the comparison could not be performed (why=$(rec why | cut -c1-90))" "$r"
 case "$OUT" in *"REPAIR: removed"*) r=1 ;; *) r=0 ;; esac
 ck "(c3) no REPAIR line was printed on the uncomparable bound" "$r"
+fi
 
 # ── (d) NON-VACUITY: revert the cause-recording, and (a) MUST go red ────────────────────────────────
 # A copy of the SHIPPED script with ONE line reverted to the pre-fix shape (`|| exit "$SCOUT_REFUSE_RC"`
@@ -369,14 +401,19 @@ ck "(c3) no REPAIR line was printed on the uncomparable bound" "$r"
 # attributable to the cause-recording itself.
 mk_case nonvacuity
 PRE="$T/refresh-candidates.prefix.sh"
-python3 - "$REFRESH" "$PRE" <<'PY'
+mut "$PRE" <<'PY'
 import sys
 src = open(sys.argv[1]).read()
 needle = 'scout_sync || provision_fail "$SCOUT_REFUSE_RC" "sub-step=scout-sync: ${SCOUT_REFUSE_WHY:-scout_sync refused without a recorded reason}"'
-assert needle in src, "the cause-recording line is missing — this control would be vacuous"
-open(sys.argv[2], "w").write(src.replace(needle, 'scout_sync || exit "$SCOUT_REFUSE_RC"'))
+if needle not in src:
+    sys.exit("the cause-recording line is missing — this control would be vacuous")
+out = src.replace(needle, 'scout_sync || exit "$SCOUT_REFUSE_RC"')
+if out == src:
+    sys.exit("the cause-recording revert was a NO-OP — this control would prove nothing")
+open(sys.argv[2], "w").write(out)
 PY
 ck "(d) the pre-fix control was actually produced (one line reverted)" "$([ -s "$PRE" ]; echo $?)"
+if [ -s "$PRE" ]; then
 LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
 : > "$LOCK"
 rp "$D" "$PRE"
@@ -385,6 +422,7 @@ case "$WHY" in *"recorded no cause"*) r=0 ;; *) r=1 ;; esac
 ck "(d) WITHOUT the fix the record says 'recorded no cause' (why=${WHY:0:100})" "$r"
 case "$WHY" in *"sub-step=scout-sync"*) r=1 ;; *) r=0 ;; esac
 ck "(d) WITHOUT the fix the sub-step is NOT named" "$r"
+fi
 
 # ══ #2953: A SHALLOW GRAFT IS NOT LOCAL WORK ═══════════════════════════════════════════════════════
 # MEASURED on cell4, 2026-10-27: a CLEAN scout with ZERO local commits was refused on every pass —
@@ -430,24 +468,30 @@ ck "(s1) the old 'carries N commit(s) not in origin/main' refusal is NOT printed
 # outcome is attributable to the verdict itself.
 mk_shallow_case shallow-prefix
 MUT="$T/refresh-ahead-prefix.sh"
-python3 - "$REFRESH" "$MUT" <<'PY3'
+mut "$MUT" <<'PY3'
 import sys
 src = open(sys.argv[1]).read()
 needle = ('    scout_ahead_verdict refs/remotes/origin/main connect\n'
           '    case "$SCOUT_AHEAD_VERDICT" in')
-assert needle in src, "the verdict call is missing — this control would be vacuous"
+if needle not in src:
+    sys.exit("the verdict call is missing — this control would be vacuous")
 pre = ('    SCOUT_AHEAD_COUNT="$(git -C "$SC" rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null || echo 0)"\n'
        '    SCOUT_AHEAD_VERDICT=local\n'
        '    case "$SCOUT_AHEAD_VERDICT" in')
-open(sys.argv[2], "w").write(src.replace(needle, pre))
+out = src.replace(needle, pre)
+if out == src:
+    sys.exit("the verdict revert was a NO-OP — this control would prove nothing")
+open(sys.argv[2], "w").write(out)
 PY3
 ck "(s2) the pre-fix control was actually produced (one line reverted)" "$([ -s "$MUT" ]; echo $?)"
+if [ -s "$MUT" ]; then
 rp "$D" "$MUT"
 ck "(s2) WITHOUT the fix the CLEAN shallow scout is REFUSED (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
 case "$(rec why)" in *"LOCAL commit(s)"*) r=0 ;; *) r=1 ;; esac
 ck "(s2) WITHOUT the fix the cause calls the artifact 'LOCAL commit(s)' — the false PRESERVE remedy" "$r"
 ck "(s2) and the scout was NOT moved (the refusal is the blocker)" \
    "$(git -C "$D/repo/.worktrees/dispatch-scout" diff --quiet origin/main -- 2>/dev/null; [ $? -ne 0 ]; echo $?)"
+fi
 
 # ── (s3) A REAL LOCAL COMMIT IS STILL REFUSED — the arm that must never weaken ───────────────────────
 # The scout is the same severed shape, plus ONE commit of its own. After the repair the graph is
@@ -524,24 +568,30 @@ ck "(s7) it prints no 'check: FAIL the scout' line" "$r"
 # is the arm that proves the second copy was a real blocker rather than a cosmetic edit.
 mk_shallow_case check-prefix
 MUT2="$T/refresh-check-prefix.sh"
-python3 - "$REFRESH" "$MUT2" <<'PY4'
+mut "$MUT2" <<'PY4'
 import sys
 src = open(sys.argv[1]).read()
 needle = ('        scout_ahead_verdict refs/remotes/origin/main noconnect\n'
           '        case "$SCOUT_AHEAD_VERDICT" in')
-assert needle in src, "the --check verdict call is missing — this control would be vacuous"
+if needle not in src:
+    sys.exit("the --check verdict call is missing — this control would be vacuous")
 pre = ('        SCOUT_AHEAD_VERDICT=local\n'
        '        SCOUT_AHEAD_COUNT="$(git -C "$SC" rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null || echo 0)"\n'
        '        case "$SCOUT_AHEAD_VERDICT" in')
-open(sys.argv[2], "w").write(src.replace(needle, pre))
+out = src.replace(needle, pre)
+if out == src:
+    sys.exit("the --check revert was a NO-OP — this control would prove nothing")
+open(sys.argv[2], "w").write(out)
 PY4
 ck "(s8) the pre-fix --check control was actually produced" "$([ -s "$MUT2" ]; echo $?)"
+if [ -s "$MUT2" ]; then
 OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
         HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$MUT2" --check 2>&1)"
 RC=$?
 ck "(s8) WITHOUT the fix --check FAILS the clean shallow scout (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
 case "$OUT" in *"check: FAIL the scout"*) r=0 ;; *) r=1 ;; esac
 ck "(s8) …and it is that FAIL line, so a cell would refuse to START" "$r"
+fi
 
 echo
 echo "==> $PASS passed, $FAIL failed"
