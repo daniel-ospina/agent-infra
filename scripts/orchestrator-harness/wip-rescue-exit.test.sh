@@ -522,5 +522,70 @@ ck "K5 …and the rescue still never changes the lane's exit status (the functio
 git -C "$WT" update-ref -d "refs/wip-local/$SLUG/dfblock" 2>/dev/null
 rm -f "$WT/early.txt"
 echo
+# ── L) AN UNREADABLE `rev-list` IS NOT A MEASURED ZERO (review P2, round 6, PR #2975) ──────────────
+# ⛔ The unpushed count used to be read as `rev-list … || 0`, so a FAILED read — a partial/promisor
+# clone that cannot see the objects, a corrupt odb, a permission problem — landed as `unpushed=0` and
+# the verdict fell through to `tree=clean` over a lane that may hold commits only locally. `0` has to
+# MEAN measured zero, so this arm injects the failure and requires the tree to stop being certified.
+# The wrapper fails ONLY `rev-list` (a `status` failure is arm J's, and would test the wrong branch),
+# and L0 proves the injection worked on THIS host rather than trusting the wrapper.
+mkdir -p "$TMP/bin-norev"
+{ printf '#!/usr/bin/env bash\nREAL=%s\n' "'$REAL_GIT'"
+  cat <<'WRAP'
+is_rev=0
+for a in "$@"; do [ "$a" = "rev-list" ] && is_rev=1; done
+[ "$is_rev" -eq 1 ] || exec "$REAL" "$@"
+printf 'fatal: could not read object database\n' >&2
+exit 128
+WRAP
+} > "$TMP/bin-norev/git"
+chmod +x "$TMP/bin-norev/git"
+# A COMPLETE, EMPTY listing, so the ONLY thing that can stop a `clean` verdict is the unpushed read.
+git -C "$WT" reset -q --hard HEAD && git -C "$WT" clean -q -xdf
+injected="$(PATH="$TMP/bin-norev:$PATH" git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null)"; injrc=$?
+ck "L0 the fixture really makes the unpushed count UNREADABLE on this host (rc=$injrc, out='${injected}')" \
+  $([ "$injrc" -ne 0 ] && [ -z "$injected" ] && echo 0 || echo 1)
+realcount="$(git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null)"
+case "${realcount:-}" in ''|*[!0-9]*) rcl0=1 ;; *) rcl0=0 ;; esac
+ck "L1 …and the REAL git still answers, so the arm is not vacuous on a host that cannot count at all ('${realcount}')" $rcl0
+: > "$O/logs/norev.log"
+PATH="$TMP/bin-norev:$PATH" O="$O" WIP_PATH="$WT" bash -c '
+  . "$1"
+  terminal_wip_rescue "unreadable unpushed" 0 0 "$2"
+' _ "$GATE" "$O/logs/norev.log" 2>/dev/null
+rcnorev=$?
+awk -F'\t' '$2=="unreadable unpushed" && $5=="cannot-verify" && $8=="?" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcl1=$?
+ck "L2 an unreadable unpushed count is recorded as tree=cannot-verify with the column '?', never as a measured 0" $rcl1
+awk -F'\t' '$2=="unreadable unpushed" && $5=="clean" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcl2=$?
+ck "L3 …and NOTHING in that transition says tree=clean (the fail-open this arm exists to catch)" \
+  $([ "$rcl2" -ne 0 ] && echo 0 || echo 1)
+grep -q 'unpushed-commit count could NOT be read' "$O/logs/norev.log"; rcl3=$?
+ck "L4 …and a loud line NAMES the unreadable count as its own cause, not the status wording (which would send an operator to the wrong command)" $rcl3
+ck "L5 …and the rescue still never changes the lane's exit status (the function returned $rcnorev)" \
+  $([ "$rcnorev" -eq 0 ] && echo 0 || echo 1)
+rm -rf "$TMP/bin-norev"
+echo
+# ── M) A READING THAT WAS NEVER TAKEN IS NOT REPORTED (review P2, round 6, PR #2975) ──────────────
+# ⛔ When `mktemp` fails there is no place for `git status`'s stderr to land, so the pre-check forces
+# `st_rc=1` — and the cannot-verify line then printed `git status rc=1, 0 stderr line(s)` for a command
+# that NEVER RAN. Two problems in one sentence: a fabricated reading, and a pointer at git where the
+# cause is `TMPDIR`. The line must say which of the two it is.
+git -C "$WT" reset -q --hard HEAD && git -C "$WT" clean -q -xdf
+: > "$O/logs/notmp.log"
+TMPDIR="$TMP/does-not-exist" O="$O" WIP_PATH="$WT" bash -c '
+  . "$1"
+  terminal_wip_rescue "no temp dir" 0 0 "$2"
+' _ "$GATE" "$O/logs/notmp.log" 2>/dev/null
+rcnotmp=$?
+grep -q 'NO status reading was taken' "$O/logs/notmp.log"; rcm1=$?
+ck "M1 a failed mktemp is reported as 'NO status reading was taken', naming TMPDIR" $rcm1
+grep -q 'git status rc=' "$O/logs/notmp.log"; rcm2=$?
+ck "M2 …and the line carries NO 'git status rc=…' parenthetical, so it never reports a reading that was not taken" \
+  $([ "$rcm2" -ne 0 ] && echo 0 || echo 1)
+awk -F'\t' '$2=="no temp dir" && $5=="cannot-verify" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcm3=$?
+ck "M3 …and the verdict is still cannot-verify (fail-closed), so the wording fix did not weaken the gate" $rcm3
+ck "M4 …and the rescue still never changes the lane's exit status (the function returned $rcnotmp)" \
+  $([ "$rcnotmp" -eq 0 ] && echo 0 || echo 1)
+echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
