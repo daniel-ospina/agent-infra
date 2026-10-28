@@ -223,6 +223,10 @@ jobs:
         # green while the real module drifts. The suite lives here, loads the
         # canonical file BY LOCATION and pins `__file__` to it. This step is what
         # keeps it non-inert — an unwired suite passes in CI by never running.
+        # #2139 — `scripts/test_beta_progress.py` is named for the same reason as the two
+        # suites above: the DELIVERY line's REST second source lives in a file CI could not
+        # execute, so the fallback, the same-source rule and the paged window were pinned by
+        # nothing. A suite the repo does not RUN is a suite it does not HAVE.
         # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
         # #1552 — `scripts/test_objective.py` and `scripts/test_turn_classify_state.py`
         # are named here for the SAME reason: both lived ONLY on the laptop
@@ -230,7 +234,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -244,6 +248,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # #2818 — the pin-freshness gate below judges the PR's OWN COMMIT, not
+          # the synthetic merge GitHub checks out for `pull_request` (a merge
+          # result mixes the branch's pin with `main`'s scripts, so the verdict
+          # tracked how far `main` had moved). Depth 2 = the merge commit plus its
+          # two parents, i.e. the head tree, without a full clone.
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -298,6 +309,20 @@ jobs:
         # catch it. python3 + bash only; its own step so one
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
+      - name: PR state router suite (#2866, zero-dep)
+        # #2866 — the router is the ONE answer to "what does this PR need next, and should anything
+        # be running for it right now". Its rules are what decide whether CI is spent (a `cancelled`
+        # check is NOT a failure; an empty surface is NOT green; `attested_sha` must be the merged
+        # head — with the gate's own `carried` arm honoured), so an unwired suite would leave the
+        # whole policy unmeasured. Zero-dep by construction: a stub `gh` answers every read from
+        # fixtures, and a stub `record-review.sh` answers the diff-hash seam — no network.
+        run: python3.12 tools/fleet/pr_state.test.py
+      - name: PR state router mutation evidence (#2866, zero-dep)
+        # The suite above is only a pin if it can FAIL. `--mutations` reverts each rule in a TEMP copy
+        # of the module and re-runs the paired test against it in a subprocess — a mutation whose
+        # test still passes is reported as a suite failure. Its own step, so one verdict cannot
+        # suppress the other (the same rule the two fleet-liveness steps above follow).
+        run: python3.12 tools/fleet/pr_state.test.py --mutations
       - name: pi pool reaper gate suite (zero-dep)
         # The `pi` session pool had NO owner: the `ppid=1 + our-checkout + testish` orphan class
         # cannot see a lane's `pi` (bare argv, reparented to launchd or under tmux), so days-old
@@ -310,6 +335,29 @@ jobs:
         # pass requires each of gates 1-3 to be load-bearing (drop one and its paired test must
         # go RED). Its own step, so one verdict cannot suppress another.
         run: python3.12 scripts/orphan-reap.test.py --mutations
+      - name: finished-lane reaper suite (#2163, zero-dep)
+        # A lane's reader treats a missing `<tag>.rc` as RUNNING, so a print-mode `pi` whose turn
+        # ended but which never exited reads as work in progress for hours (measured 2026-10-23:
+        # 46 bare `pi`, 27 finished, oldest 6 h 21 m). `pi-done-not-exited.py` imports the canon's
+        # turn boundary (`tools/fleet/liveness.py`) and the pool owner's session binding / gate 2
+        # (`scripts/orphan-reap.py`) and adds ONE predicate: launcher ownership (`TAG` in the
+        # process's own environ). The suite builds NINETEEN real process trees (a script named `pi`, a
+        # real launcher, a real fd-1 log, a pi-named transcript) plus a control lane, and requires
+        # BOTH directions: the finished ones are reaped, while a growing log, an OPEN turn, an
+        # ABSTAINING turn boundary, a shared log, a live child, a SIGTERM-ignoring target and a
+        # no-owner `pi` all survive — plus the silence bound, the arming gate (#2391) and the
+        # refusal bucket. Its own step, so one verdict cannot suppress another.
+        run: python3.12 scripts/orchestrator-harness/pi-done-not-exited.test.py
+      - name: finished-lane reaper — mutation control (#2163, zero-dep)
+        # The repo's rule for a zero-dep suite: a suite whose ability to go RED is only CLAIMED in
+        # prose is the false-PASS shape (see the siblings' --mutations/--red-control steps). This
+        # patches a temp copy of the tool with each defect the suite claims to guard — an abstaining
+        # turn boundary folded into `turn-ended` (the state that shipped a P0 in cycle 1), the
+        # log-growth veto dropped, the open-turn veto dropped, the log-only arm's silence bound
+        # dropped, the pre-signal log re-read removed, `tag` granted for ANY TAG, the argv ownership
+        # rung deleted, the print-mode predicate deleted, the peer-claimed guard disabled, and `--pid`
+        # binding only the requested subset, and `code_only()` reverted — and requires the suite to fail.
+        run: python3.12 scripts/orchestrator-harness/pi-done-not-exited.test.py --mutations
       - name: Ref-claim registry reader suite (#1777, zero-dep)
         # #1777 — an orchestrator lane runs `pi -p --no-session`, so it writes no
         # transcript and no cmux store record and is in NO population
@@ -380,6 +428,31 @@ jobs:
         # second command in the step above — sequencing would suppress one
         # verdict when the other fails (the same rule as every suite here).
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
+      - name: Dispatch-preflight suite (zero-dep)
+        # The complementary question to the successor preflight above: that tool
+        # asks "is a predecessor still ALIVE", this one asks "is there anything
+        # left to LAND". Measured 2026-10-18: 12 of 15 dispatched worktrees sat on
+        # a HEAD that origin/main already contained, and ALL 12 produced +0 commits
+        # — a whole lane spent discovering there was nothing to do. The suite is
+        # zero-dep and hermetic (temp git repos, a refs/remotes/origin/main base,
+        # no network, and the process's GIT_* environment cleared so a leaked
+        # GIT_DIR cannot redirect a fixture into the caller's repo), and it carries
+        # its own RED control: 16 mutations of the shipped file (the contained-delta
+        # read skipped, the merge result trusted on its own, a merge conflict
+        # treated as an error, an unsupported merge-tree losing its name, a
+        # `--help` exit reported as HAS-WORK, dirty files ignored,
+        # `--untracked-files=normal` dropped, dirty gated behind base resolution,
+        # the work-tree-root identity check dropped, and six fail-closed reads
+        # turned into HAS-WORK) must each turn their paired leg RED. The control
+        # refuses to run at all if the unmutated suite is not green.
+        # Visible, not merge-blocking, for the same reason as its sibling above:
+        # `pipeline-compliance` is the repo's only required check.
+        run: python3.12 tools/fleet/dispatch_preflight.test.py
+      - name: Dispatch-preflight mutation evidence (zero-dep)
+        # Its own step, not a second command in the step above — sequencing would
+        # suppress one verdict when the other fails (the rule every suite here
+        # follows).
+        run: python3.12 tools/fleet/dispatch_preflight.test.py --red-control
       - name: fleet-health REAPER-table suite (#1862, zero-dep)
         # #1862 — the restored orphan reaper (`com.eldato.pi-reap-orphans`) is installed
         # unconditionally by install-launchd.sh, but `fleet-health.py`'s `reaper_section()` reads a
@@ -603,6 +676,30 @@ jobs:
         # class-keyed ceiling. Its mutation section deletes the ceiling and flattens the
         # class caps, so a suite that only proves the acceptance path cannot stay green.
         run: npx tsx extensions/loop-enforcer/review-scale.test.ts
+      - name: Loop-enforcer cron exit property (#2935/#2944 — the interval must not hold the event loop)
+        # #2935 — every cell lane printed its answer and then never exited; the
+        # cause was THIS module's `setInterval`, a REF'd handle nothing cleared.
+        # The suite was wired only into ci-main.yml's
+        # `extensions/loop-enforcer/*.test.ts` glob, so a mutation that
+        # reintroduced the hang was caught POST-merge, on main, not on the PR
+        # that caused it. Zero-dep (`node:*` + `./scheduler.ts`, whose only import
+        # is `./manifest.ts`, itself `node:*` only), so it runs in THIS job, which
+        # performs no `npm ci`. The assertion is `hasRef() === false` — the exact
+        # property, and timing-free, so the mutation fails immediately instead of
+        # hanging the suite.
+        run: npx tsx extensions/loop-enforcer/scheduler-unref.test.ts
+      - name: Loop-enforcer cron re-arm across session replacement (#2948)
+        # #2948 — #2944 cleared the tick on `session_shutdown`, which pi also emits
+        # on session REPLACEMENT ("new" | "resume" | "fork"), and those flows do
+        # not re-run extension factories — so the timer was never recreated and
+        # every cron-type loop silently stopped firing until a `/reload`.
+        # Both directions are pinned (replacement re-arms and still fires; quit
+        # stays cleared), plus a child-process exit probe so #2944's fix cannot
+        # regress. Zero-dep: it drives the real factory via `./index.ts`, whose pi
+        # import is TYPE-only, with a hermetic $HOME — so it runs in THIS job.
+        # Wired here as well as into ci-main.yml's glob: a suite that lives only
+        # behind the post-merge glob reports this class of regression on main.
+        run: npx tsx extensions/loop-enforcer/cron-rearm.test.ts
       - name: Shipped-default failover coverage pin (#715)
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the
@@ -686,6 +783,27 @@ jobs:
         # Zero-dep (`node:*` only) so it runs in THIS job (no `npm ci`); the BLOCKING backstop is the
         # post-merge ci-main.yml `extensions/shared/*.test.ts` glob, which picks this file up too.
         run: npx tsx extensions/shared/reviewer-preflight.test.ts
+      - name: Headless-lane contract suite (#2965, zero-dep)
+        # #2965 — a guard must judge what the process IS, not who launched it. `lane.sh` exports
+        # SKILL_ENFORCER_DISABLED=1 for its own lanes; a headless `pi -p` started any other way (a
+        # cloud-cell dispatch, a hand-run "pi -p … --no-session") got the gates and none of the
+        # affordances, so its `git commit` was refused and the lane exited with ZERO commits —
+        # measured 2026-10-27, and silent, because nothing fails loudly when a gate simply says no.
+        # This suite builds a REAL hub and REAL linked worktrees with git and pins BOTH arms: a
+        # derived lane acts, the hub stays guarded. Both halves matter — a suite that only pinned
+        # the worktree arm would accept a change that lifted the hub gate (what #618/#621 measured).
+        # Zero-dep (`node:*`, ./headless-lane.js, ../skill-enforcer.js, the `git` binary), so it runs
+        # in THIS job (no `npm ci`); the BLOCKING backstop is the post-merge ci-main.yml
+        # `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/headless-lane.test.ts
+      - name: Headless-lane contract MUTATION evidence (#2965, zero-dep)
+        # The suite above is only a pin if it can FAIL. Mutations reintroduce each arm's defect —
+        # the derivation reverted so a linked worktree no longer derives a lane, and the historical
+        # path-insensitive fail-open that treats EVERY checkout as a linked worktree (#618/#621) —
+        # into a TEMP copy of the module, and into the wiring through the contract seam, requiring
+        # each paired assertion to go RED and printing it verbatim. Its own step so neither verdict
+        # can suppress the other (the rule every sibling suite here follows).
+        run: npx tsx extensions/shared/headless-lane.test.ts --mutations
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets
@@ -764,10 +882,38 @@ jobs:
         # them executes by its own location — without re-cutting
         # `sanctioned-scripts.pin.json` reds here, so a stale pin cannot reach
         # main and silently block the rail.
-        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~2s. Its own step
+        #
+        # ⛔ #2818 — `--ref` is the whole fix for the treadmill. Without it the
+        # gate reads the pin and the scripts out of the SAME CHECKOUT, which here
+        # is GitHub's synthetic MERGE of head onto the base TIP: a merge result
+        # takes each file from whichever side changed it, so a branch that re-cut
+        # its pin beside ITS OWN sanctioned-script edit carried that pin next to
+        # scripts an unrelated merge had since changed — red until someone re-cut,
+        # and every new merge re-opened it on every other open PR. Naming the head
+        # commit answers the question the gate exists to answer ("did THIS change
+        # drift the sanctioned surface without re-cutting?"), which no unrelated
+        # merge can invalidate. The polarity is unchanged and is pinned by
+        # `test-sanctioned-pin-merge-base.mjs`: untouched surface ⇒ pass however
+        # far main moved; edited surface without a re-cut ⇒ fail; edited +
+        # re-cut ⇒ pass.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~3s. Its own step
         # for the same reason as the suite above: the `extensions/*/test*.mjs`
         # glob in ci-main.yml is POST-MERGE only.
-        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs
+        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs --ref "${{ github.event.pull_request.head.sha }}"
+      - name: main-worktree-guard pin freshness is a property of ONE commit (#2818)
+        # The non-vacuity rig for the line above. Hermetic git repos build the
+        # treadmill: a branch re-cuts its pin beside its OWN sanctioned-script
+        # edit, an unrelated merge moves another sanctioned script on `main`, and
+        # the merge GitHub would build then carries the branch's pin beside main's
+        # scripts. Asserts (a) the change PASSES judged on its own commit; (a′)
+        # the SAME change FAILS judged on the merged tree — the pre-#2818 reading,
+        # so dropping `--ref` reds this suite instead of silently restoring the
+        # treadmill; (b) an edit without a re-cut still FAILS; (b′) a deletion
+        # without one still FAILS; (c) edit + re-cut PASSES, base moved or not.
+        # It also asserts this wiring (`--ref`, `fetch-depth: 2`, this step),
+        # because an unwired suite passes by never running.
+        # Zero-dep (`node:*` + the `git` binary), ~2s.
+        run: node extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked

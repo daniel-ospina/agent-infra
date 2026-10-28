@@ -1,0 +1,11 @@
+# FAILURE-CLASS FIXTURE (R0): a `concurrency:` value that is a SEQUENCE — valid YAML, not a mapping the
+# reader models. An unreadable cancellation policy must be refused, never read as "no cancel key".
+name: pr-concurrency-sequence
+on:
+  pull_request:
+concurrency: [pr-concurrency-sequence, some-other-group]
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'

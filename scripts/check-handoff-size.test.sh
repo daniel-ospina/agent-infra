@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shard: off NO CI run site in either lane (pre-existing; tracked in agent-infra#2610) - wiring it is a coverage decision, not a side effect of a refactor
 # check-handoff-size.test.sh — self-check for scripts/check-handoff-size.sh
 # (#365 indicator 2). Run:
 #   bash scripts/check-handoff-size.test.sh
