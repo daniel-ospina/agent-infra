@@ -1120,7 +1120,7 @@ case "$LAST" in
       # The reviewer said CLEAN but named no comment, so there is no artifact to sign — the gate can
       # NEVER go green at this head. Park it: the pre-fix bare `exit 2` left no marker, so the loop
       # re-paid for a fresh review every cycle (#1717).
-      park "reviewer reported CLEAN but posted no comment URL — no evidence artifact to sign, so ai-review-gate can never go green at this head. The comment usually EXISTS (the reviewer posts it before the verdict): find it on PR #$PR and record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:<id>), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      park "reviewer reported CLEAN but posted no comment URL — no evidence artifact to sign, so ai-review-gate can never go green at this head. The comment usually EXISTS (the reviewer posts it before the verdict): find it on PR #$PR and record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:<id> --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
       echo "[merge $PR] ABORT: no comment id" >> "$L.log"; exit 2
     fi
     # ── 2) record the review (writes the signed marker into the PR body) ──
@@ -1151,22 +1151,38 @@ case "$LAST" in
     cat "$REC_OUT" >> "$L.log" 2>/dev/null || true
     echo "[merge $PR] record-review rc=$rc" >> "$L.log"
     if [ $rc -ne 0 ]; then
-      # ⛔ THE PIN'S REFUSAL IS ITS OWN NAMED FAILURE (#2572), read from THIS call's output only —
-      # grepping `$L.log` would match a pin refusal from an EARLIER cycle and reclassify this one.
-      # rc=3 with the pin named means the PR head moved inside the window between the review and the
-      # record: the verdict is intact and its subject moved, so the parking reason must say that a
-      # fresh review is owed. Advising a hand re-record (the generic rc!=0 wording below) would tell
-      # the operator to carry a stale verdict onto a head nobody read — the exact failure being fixed.
-      if [ $rc -eq 3 ] && grep -q -- '--expect-head' "$REC_OUT" 2>/dev/null; then
+      # ⛔ THE RECORDER HAS **TWO** EXIT-3 REFUSALS THAT NAME THE PIN, WITH OPPOSITE REMEDIES (P2, fresh
+      # review of PR #2988). Keying on the FLAG's presence — `grep -q -- '--expect-head'`, which is
+      # what shipped — merges them, because both arms print the flag:
+      #   * record-review.sh:2884 `--expect-head: the PR head is <live>, NOT the <pin> you named`
+      #     ⇒ the head genuinely MOVED inside the window between the review and the record. The verdict
+      #       is intact and its subject moved, so a FRESH review at the new head is owed, and advising a
+      #       hand re-record (the generic arm below) would carry a stale verdict onto a head nobody read.
+      #   * record-review.sh:3029 `--expect-head: could not verify the PR head against <pin>`
+      #     ⇒ the pin could not be CHECKED: a transient gh/API failure (403 secondary rate limit, 5xx,
+      #       expired token; the #784 population) left the PR's live head unreadable. THE HEAD DID NOT
+      #       MOVE, and the artifact this lane just paid for is still valid AT this head — so the remedy
+      #       is to RE-TRY THE RECORD, not to park with a fresh PAID review (REVIEW_TIMEOUT = 1800 s)
+      #       owed, which is the #1717 shape this file fights everywhere else.
+      # So classify on the PRODUCER'S OWN WORDS. `tests/review-pr/run.sh` §A3(5) greps record-review.sh
+      # for both literals, so a reword on either side turns CI RED instead of silently re-grading.
+      PIN_MOVED_LIT='--expect-head: the PR head is '
+      PIN_UNCHECKABLE_LIT='could not verify the PR head against'
+      if [ $rc -eq 3 ] && grep -qF -- "$PIN_MOVED_LIT" "$REC_OUT" 2>/dev/null; then
         rec_out_cleanup
         park "the PR head MOVED between the review and the record at head=$HEAD — record-review.sh REFUSED the --expect-head pin (rc=3) rather than attest a head the reviewer never read; its refusal in the log names both shas. The review artifact exists for the REVIEWED head only, so a FRESH review at the new head is owed (a hand re-record would carry a stale verdict)."
         echo "[merge $PR] ABORT: head moved before the record — refusing to bind a stale verdict" >> "$L.log"; exit 3
+      fi
+      if [ $rc -eq 3 ] && grep -qF -- "$PIN_UNCHECKABLE_LIT" "$REC_OUT" 2>/dev/null; then
+        rec_out_cleanup
+        park "record-review.sh could NOT CHECK the --expect-head pin at head=$HEAD (rc=3) — the recorder could not READ the PR's live head, i.e. a gh/API TRANSPORT failure (secondary rate limit, 5xx, expired token), NOT a moved head and NOT a reason to re-review: the review this lane paid for is still the artifact for $HEAD. NOTHING was recorded. Re-run the RECORD once gh is healthy (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD — idempotent at this head), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        echo "[merge $PR] ABORT: pin unverifiable (gh/API) — record retry owed, no re-review" >> "$L.log"; exit 3
       fi
       rec_out_cleanup
       # No signed marker exists, so the gate cannot pass and the PR cannot merge. The pre-fix
       # `exit 3` left no marker at ALL, so the next cycle saw an unmarked FAILED:ai-review-gate and
       # spawned another fresh (paid) review — forever (#1717). Park, and name the failing rc.
-      park "record-review.sh failed rc=$rc at head=$HEAD — the signed marker is NOT in the PR body, so the loop would re-pay for a fresh review every cycle. Re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      park "record-review.sh failed rc=$rc at head=$HEAD — the signed marker is NOT in the PR body, so the loop would re-pay for a fresh review every cycle. Re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
       echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3
     fi
     # the recorder's output is already in `$L.log`; the temp file is only here so THIS call's
@@ -1256,12 +1272,12 @@ case "$LAST" in
       marker_how="Install openssl (a hard dependency of this path — the recorder signs with it and this worker verifies with it), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
     elif [ -z "$MARK_CAND" ]; then
       marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body"
-      marker_how="the recorder's evidence post is best-effort and skips silently when the body read or PATCH fails, or gh/repo is unavailable, so ai-review-gate can never go green at this head and the loop would re-pay for a fresh review every cycle. If the reviewer's comment exists, record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      marker_how="the recorder's evidence post is best-effort and skips silently when the body read or PATCH fails, or gh/repo is unavailable, so ai-review-gate can never go green at this head and the loop would re-pay for a fresh review every cycle. If the reviewer's comment exists, record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
     elif printf '%s\n' "$MARK_CAND" | verify_any_marker "$MARK_KEY"; then
       marker_ok=1
     else
       marker_why="NO marker for head=$LIVE_HEAD in the PR body VERIFIES against its signature — the PR body is not a trust boundary, so a forged, re-keyed or unsigned line is NOT evidence (#784)"
-      marker_how="re-record the review at this head so a freshly signed marker is appended (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      marker_how="re-record the review at this head so a freshly signed marker is appended (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
     fi
     if [ "$marker_ok" -ne 1 ]; then
       park "record-review.sh returned rc=0, but the signed marker ai-review-gate reads is not verifiably there: $marker_why — $marker_how"
