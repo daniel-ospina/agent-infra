@@ -67,6 +67,14 @@ DISK_MIN_FREE_MB=1; export DISK_MIN_FREE_MB
 # would look like a no-op. `999999` is six digits, so three further digits still fit and the fourth
 # breaches: real margin, and unmistakably not a ceiling anyone mistook for a device limit.
 MAX_LOAD=999999; export MAX_LOAD
+
+# ⛔ AND THE THIRD GATE (agent-infra#2387). This file's header states the rule for the OTHER two
+# ("the shipped load gate is a pure CONFOUNDER here … the suite reports its own SUBJECT as broken on a
+# box where nothing is wrong with it") and pins `DISK_MIN_FREE_MB=1` + `MAX_LOAD=999999` for exactly
+# that reason. `run_agent` now consults available MEMORY before load, so on a box under the 2048 MB
+# floor every arm below would be decided by the memory gate instead — the same false red, one gate over.
+# `exec env` passes the exported value through to the fix-one.sh children this suite drives.
+MEM_MIN_AVAIL_MB=1; export MEM_MIN_AVAIL_MB
 REF="$CLAIM_NS/777777-${SHA:0:12}"
 PRREF="$CLAIM_NS/pr-777777"          # the LANDING key (agent-infra#1952): one ref per PR, any head
 REF2="$CLAIM_NS/888888-${SHA:0:12}"

@@ -2315,6 +2315,12 @@ check_fix_markers "$DEST/extensions" "run6"
 # gate must sit where `pi` is born, not where a caller remembers to source it. Pinned BY ARTIFACT and
 # BY BEHAVIOUR (a byte comparison alone would pass on a copy that cannot run): the INSTALLED file is
 # driven as `pi`, with MAX_LOAD=0 as the deterministic refusal lever and a fake real pi behind it.
+# ⛔ MEM_MIN_AVAIL_MB=1 NEUTRALISES THE MEMORY ARM (#2387), and the exit code is ASSERTED — both
+# because of the same defect, measured here: the shim now checks MEMORY BEFORE load, so on a
+# memory-tight box the refusal arm "passed" on a MEMORY refusal (it only asserted that the real `pi`
+# did not run — no exit code at all) while the positive control FAILED. A green refusal over a red
+# control is the false-pass shape this suite exists to remove, so the arm now pins 76 AND the floor
+# is pinned out of the way.
 # The defect this exists for: a hand-written runner that sourced nothing started lanes on a box at
 # load 258 against its own ceiling of 100, with no refusal, no log line and no count.
 echo "== the pi spawn-point gate (#1884)"
@@ -2334,13 +2340,19 @@ mkdir -p "$TMP/gate-real"
 printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
 chmod +x "$TMP/gate-real/pi"
 rm -f "$TMP/gate-ran"
-HOME="$HOME_DIR" MAX_LOAD=0 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
-if [ ! -e "$TMP/gate-ran" ]; then
-  echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 (the real pi never ran)"
+HOME="$HOME_DIR" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
+_grc=$?
+if [ "$_grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
+  echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 with the LOAD code 76 (the real pi never ran)"
+elif [ ! -e "$TMP/gate-ran" ]; then
+  # ⛔ A REFUSAL FOR ANOTHER CAUSE IS NOT THIS ARM'S SUBJECT (review, P2). Without the code check a
+  # memory (72) or fork (73) refusal satisfied a LOAD assertion, and the positive control below then
+  # failed — the suite reporting its own subject as broken on a box where nothing was wrong with it.
+  fail "the installed gate refused at MAX_LOAD=0 for some OTHER cause (rc=$_grc, expected 76) — the load arm cannot be asserted over it"
 else
   fail "the installed gate allowed a spawn at MAX_LOAD=0 — 'spawn nothing' is not enforced"
 fi
-HOME="$HOME_DIR" MAX_LOAD=999999999 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+HOME="$HOME_DIR" MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
 if [ -e "$TMP/gate-ran" ]; then
   echo "ok: POSITIVE CONTROL — below the ceiling the installed gate EXECs the real pi"
 else
