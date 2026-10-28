@@ -276,6 +276,26 @@ REAP_LIVE="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p
 [ -n "${REAP_LIVE:-}" ] && [ $(( REAP_LIVE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
 ck "(i0) the reaper's LIVE window (${REAP_LIVE:-?} min) stays above the BACKSTOP (${SEAM:-?}s) — a live lane is not counted dead for capacity" $rc
 
+# ⛔ THE TWO CONSUMERS THAT OUTLIVE THE LANE, AND THEREFORE READ ITS CLOCK THEMSELVES (agent-infra#2888).
+# Neither sources spawn-gate.sh, so each carries the seam as a literal fallback — which is exactly the
+# drift this pins. A `3320e-11`-era default here is not cosmetic: `chain-merge.sh` DELETES a merge marker
+# it judges stale and reviews at the tip, and `ai-drainer.sh` re-dispatches a slice it judges unheld, so
+# a value below the backstop makes a LIVE lane look gone. Driven from the shipped files, not from prose.
+DRAIN_DEF="$(sed -n 's/^LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$HERE/ai-drainer.sh" | head -1)"
+[ -n "${DRAIN_DEF:-}" ] && [ "$DRAIN_DEF" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) ai-drainer's LANE_TIMEOUT (${DRAIN_DEF:-?}s) is the harness BACKSTOP (${SEAM:-?}s), not a 3000 s literal below it" $rc
+# ...and its coercion fallback too: `_num` on a malformed value must land on the same number, or a typo
+# shortens the window the same way the literal did.
+DRAIN_COERCE="$(sed -n 's/^LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" \([0-9][0-9]*\))".*/\1/p' "$HERE/ai-drainer.sh" | head -1)"
+[ -n "${DRAIN_COERCE:-}" ] && [ "$DRAIN_COERCE" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) …and its malformed-value fallback (${DRAIN_COERCE:-?}s) is the same number, so a typo cannot shorten it" $rc
+CHAIN_FB="$(sed -n 's/.*_PHASE_STALE_AFTER="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$HERE/chain-merge.sh" | head -1)"
+[ -n "${CHAIN_FB:-}" ] && [ "$CHAIN_FB" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) chain-merge's stale-marker fallback (${CHAIN_FB:-?}s) is the harness BACKSTOP, so a working lane's marker is not declared stale" $rc
+# The seam itself must REACH those children: an unexported variable leaves an operator's override at
+# home while the child reads the compiled default (the "knob that does nothing" shape again).
+grep -q '^export LANE_BACKSTOP_S$' "$GATE"; ck "(i0) spawn-gate.sh EXPORTS LANE_BACKSTOP_S, so a lane's children agree with the clock it runs under" $?
+
 # A literal-substring replacement, so no regex/`$` quoting can silently no-op the mutation, and the
 # replacement is ASSERTED to have landed: a mutant identical to the original would make every
 # "the case reddens" check vacuous, which is the "test that cannot fail" class.

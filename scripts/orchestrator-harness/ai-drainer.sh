@@ -85,8 +85,9 @@
 #     N DISJOINT windows. Rotation is capped at the number of distinct slices
 #     (`SLICE_TOTAL/SLICE_WIDTH`), because a 13th lane on 7 windows would land on lane 6's: fewer
 #     lanes is the correct answer, not overlapping ones. ⛔ AND ACROSS TICKS: a lane keeps its window
-#     for up to LANE_TIMEOUT (~2.5 ticks), so the windows LIVE lanes hold are read from their records
-#     and skipped — a tick whose ring is fully held dispatches nothing and says so.
+#     for up to LANE_TIMEOUT (the 2 h backstop, ~6 ticks at the shipped cadence), so the windows LIVE
+#     lanes hold are read from their records and skipped — a tick whose ring is fully held dispatches
+#     nothing and says so.
 #   * NO RUN-AWAY — the tick can never start more than `target − alive`, `target` is bounded by memory
 #     AND by the cpu ceiling, and each lane is one dispatcher call (not a fork fan-out).
 #
@@ -108,7 +109,8 @@
 #   MIN_MEM_FREE_MB   memory floor a lane may not eat into (MB)       default: 512
 #   MIN_SWAP_MB       swap floor, applied only where swap EXISTS (MB) default: 700
 #   LPC_CEILING       load-per-cpu at which no lane is added          default: 8
-#   LANE_TIMEOUT      the lane's own wall-clock cap (seconds)         default: 3000
+#   LANE_TIMEOUT      the lane's BACKSTOP (seconds) — the absolute ceiling, not the primary bound
+#                                                            default: $LANE_BACKSTOP_S (7200)
 #   RC_GRACE_S        grace after a lane's pid dies for its status file (s)  default: 30
 #   PR_BUDGET         PRs one lane may process                        default: 6
 #   SLICE_WIDTH       PRs per slice                                   default: 10
@@ -150,7 +152,16 @@ MEM_BUDGET_PCT="${MEM_BUDGET_PCT:-75}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 MIN_SWAP_MB="${MIN_SWAP_MB:-700}"
 LPC_CEILING="${LPC_CEILING:-8}"
-LANE_TIMEOUT="${LANE_TIMEOUT:-3000}"
+# ⛔ THIS IS THE BACKSTOP, NOT THE LANE'S PRIMARY BOUND (agent-infra#2888), and it takes the harness
+# seam rather than a literal of its own. Two things read it, and a flat 3000 broke BOTH once the wall
+# stopped being the primary bound:
+#   * it is passed to `nonblocking-dispatch.sh` as the spawn's ceiling, and 3000 sat above the 2700
+#     progress allowance by only 5 minutes, so a lane doing real work was still wall-killed at 50 min;
+#   * it is the window a LIVE lane holds its rotation window for (§ rotation), so a lane allowed to run
+#     past it gets its slice re-dispatched to a second lane — duplicate work on the same PRs.
+# `LANE_BACKSTOP_S` is spawn-gate.sh's one default; it is not sourced here, so the literal fallback is
+# pinned to that seam by `lane-bound.test.sh` (i0).
+LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"
 PR_BUDGET="${PR_BUDGET:-6}"
 SLICE_WIDTH="${SLICE_WIDTH:-10}"
 SLICE_TOTAL="${SLICE_TOTAL:-70}"
@@ -191,7 +202,7 @@ MEM_BUDGET_PCT="$(_num MEM_BUDGET_PCT "$MEM_BUDGET_PCT" 75)"
 [ "$MEM_BUDGET_PCT" -le 100 ] || { log_line "WARN: MEM_BUDGET_PCT=$MEM_BUDGET_PCT > 100 — using 100"; MEM_BUDGET_PCT=100; }
 LPC_CEILING="$(_num LPC_CEILING "$LPC_CEILING" 8)"
 [ "$LPC_CEILING" -ge 1 ] || { log_line "WARN: LPC_CEILING=0 — using 1"; LPC_CEILING=1; }
-LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 3000)"
+LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 7200)"
 # (No LANE_WAIT_MAX any more — but `LANE_TIMEOUT` still feeds the dispatcher, so it still gets the
 # validation that `30m` used to defeat: an unvalidated value made bash print "value too great for
 # base" and left a variable UNSET, which under `set -u` killed the tick mid-lock.)
@@ -566,7 +577,8 @@ _census_launcher() { # prints the count, or nothing when unreadable
 # ── WHICH SLICES ARE ALREADY BEING WORKED ────────────────────────────────────────────────────
 # ⛔ THE RING CLAMP ALONE DOES NOT PREVENT A DOUBLE-DISPATCH ACROSS TICKS. `n` is capped at the
 # number of distinct windows (SLICE_TOTAL/SLICE_WIDTH = 7 at the shipped defaults), but a LIVE lane
-# keeps its window for up to LANE_TIMEOUT (3000 s ≈ 2.5 ticks): tick 1 takes offsets 0…60, tick 2
+# keeps its window for up to LANE_TIMEOUT (~2 backstop-hours ≈ 6 ticks at the shipped 20 m cadence):
+# tick 1 takes offsets 0…60, tick 2
 # walks the ring from cursor=7 back to 0 and hands 0/10/20 to NEW lanes while the first lanes are
 # still on them — two lanes per window, two reviews per head, two merge attempts per PR. So the
 # cursor alone is not enough: the offsets a live lane HOLDS are read from the lane records and
