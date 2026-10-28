@@ -4413,11 +4413,16 @@ def _unplaced(p: dict):
     It is the same blindness axis `_finish` refuses on -- unreadable checks, an unusable
     changed-file list, an order no worker accepted -- summed into ONE number, because the question
     a per-repo row answers is "did this repo's queue get worked", not "which read failed".
+
+    ⛔ AND IT COUNTS A BOX REFUSAL (review P2, #2291). `no_capacity` is work that was legible and
+    that the BOX's own spawn gate refused: it did not go out, so a row that reported `unplaced=0`
+    beside `verdict=NO-CAPACITY` would state the opposite of what happened. The three axes are
+    counted here for the same reason -- they all answer "did this repo's queue get worked".
     """
     if "dispatched" not in p:
         return None                    # the pass never got as far as counting (a blind queue read)
     return sum(p.get(k) or 0 for k in ("unreadable", "surface_unreadable", "surface_partial",
-                                       "surface_abandoned", "undeliverable"))
+                                       "surface_abandoned", "undeliverable", "no_capacity"))
 
 
 def repo_row(slug: str, rc: int, p: dict) -> str:
@@ -4434,7 +4439,14 @@ def repo_row(slug: str, rc: int, p: dict) -> str:
     # 3 = "I read it, I placed the work, and NO WORKER TOOK IT". Re-collapsing them under one word
     # is what `_finish`'s exit-code split exists to prevent, and an operator scanning a per-repo
     # table would be sent after a broken read instead of a broken transport.
-    verdict = {0: "clean", 2: "REFUSING", 3: "UNPLACED", 4: "CRASH"}.get(rc, "RED")
+    # ⛔ AND 6 IS A THIRD WORD (review P2, #2291). `RED` was the generic fallback, so a repo whose
+    # pass ended NO-CAPACITY printed `verdict=RED rc=6` -- the pre-fix mislabel, on the one reader
+    # INSIDE this file that did not know the code, and on a surface
+    # (`orchestrator-harness/README.md`) documented as "the exit codes' own vocabulary … stay
+    # distinct". A box refusal is not a crash and not a broken read: it is `NO-CAPACITY`, the same
+    # token `_finish` emits, so a reader of this table and a reader of the beat agree.
+    verdict = {0: "clean", 2: "REFUSING", 3: "UNPLACED", 4: "CRASH",
+               6: "NO-CAPACITY"}.get(rc, "RED")
     return ("repo=%-34s open_prs=%-5s unplaced=%-5s dispatched=%-5s verdict=%s rc=%s"
             % (slug, "?" if op is None else op, "?" if un is None else un,
                p.get("dispatched", "?"), verdict, rc))
