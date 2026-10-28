@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds] [kind]
+# nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [backstop-seconds] [kind]
 # nonblocking-dispatch.sh --status <name>
+#
+# ⛔ `backstop-seconds` IS A BACKSTOP, NOT THE LANE'S PRIMARY BOUND (agent-infra#2888). It is the
+# ABSOLUTE ceiling handed to `run_agent` -> `lane-bound.sh --wall`; the bound that decides wedged-vs-slow
+# is the PROGRESS allowance (45 min, the fleet's own declared no-progress window), which a caller does
+# not pass here because it must be the same number on every lane. Omitted, it defaults to
+# `LANE_BACKSTOP_S` from spawn-gate.sh — one default, not a fourth literal in this file.
 #
 # `kind` declares WHAT is being spawned, because `KIND` is not a creation/repair discriminator: the
 # creation back-pressure gate (spawn-gate.sh, agent-infra#2409) holds every KIND except the ones whose
@@ -60,9 +66,9 @@ if [ "$NAME" = "--status" ]; then
   fi
   exit 0
 fi
-WT="${2:-}"; PROMPT="${3:-}"; T="${4:-3000}"; WK="${5:-bg}"
+WT="${2:-}"; PROMPT="${3:-}"; T="${4:-}"; WK="${5:-bg}"
 if [ -z "$NAME" ] || [ -z "$WT" ] || [ -z "$PROMPT" ]; then
-  echo "usage: nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds] [bg|prfix]" >&2
+  echo "usage: nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [backstop-seconds] [bg|prfix]" >&2
   echo "       nonblocking-dispatch.sh --status <name>" >&2
   exit 2
 fi
@@ -74,7 +80,6 @@ case "$WK" in
   bg|prfix) ;;
   *) echo "nonblocking-dispatch.sh: kind '$WK' is not bg or prfix" >&2; exit 2 ;;
 esac
-case "${T:-}" in ''|*[!0-9]*) echo "nonblocking-dispatch.sh: timeout '$T' is not a positive integer" >&2; exit 2 ;; esac
 
 O="${O:-$HOME/orchestrator}"; D="$O/bg"; mkdir -p "$D" "$O/state"
 # ⛔ PATH FIRST, then source — this part IS lane.sh/fix-one.sh's rule. spawn-gate.sh derives `_NCPU`
@@ -100,6 +105,17 @@ else
 fi
 command -v run_agent >/dev/null 2>&1 \
   || { echo "nonblocking-dispatch.sh: spawn-gate.sh is stale (no run_agent) — refusing to start an ungated worker" >&2; exit 78; }
+
+# ⛔ THE BACKSTOP DEFAULT IS RESOLVED HERE BECAUSE IT LIVES IN spawn-gate.sh, WHICH IS SOURCED ABOVE
+# (agent-infra#2888). An OMITTED timeout takes the one default; an EXPLICIT non-numeric one is still a
+# caller bug and refuses; and on a box whose `$O/spawn-gate.sh` predates the seam the value cannot be
+# resolved at all — that is a broken install (78), never a silent fall back to a literal, because a
+# guessed backstop is the flat cap this issue removes, back again under a new name.
+if [ -z "$T" ]; then
+  T="${LANE_BACKSTOP_S:-}"
+  [ -n "$T" ] || { echo "nonblocking-dispatch.sh: no timeout was given and this box's spawn-gate.sh has no LANE_BACKSTOP_S (stale \$O) — refusing to guess the backstop; pass it explicitly or sync the harness" >&2; exit 78; }
+fi
+case "$T" in ''|*[!0-9]*) echo "nonblocking-dispatch.sh: backstop '$T' is not a positive integer" >&2; exit 2 ;; esac
 
 [ -d "$WT" ]     || { echo "nonblocking-dispatch.sh: no worktree $WT" >&2; exit 2; }
 [ -f "$PROMPT" ] || { echo "nonblocking-dispatch.sh: no prompt file $PROMPT" >&2; exit 2; }
