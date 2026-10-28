@@ -45,7 +45,9 @@ WHAT IT DOES
     its last rc — or the reason it does not run on this machine, NAMED (never silently absent),
   * `--verify` FAILS when the loop is dead, its tick is stale, a job could not be scheduled, a
     job is overdue with no run, the declarations are EMPTY (zero jobs is a false PASS, not a clean
-    run), or a job's calendar can never come due again. A skipped job is reported as SKIP (with its
+    run), a job's calendar can never come due again, or the STAGED copy this runtime was launched
+    from differs from the checkout (`--check` reports that last one as a DRIFT note instead, since
+    a Mac's farmed copy legitimately lags a working tree). A skipped job is reported as SKIP (with its
     reason) rather than failing: a Mac-free dependency (a tortoise venv, a swarm root) is a
     legitimate per-machine absence, and refusing to certify the whole layer over it would block a
     cell that can run every other job. A job that is RUNNING explains a stale tick (state/busy/,
@@ -55,6 +57,12 @@ WHAT IT DOES
 `scripts/install-launchd.sh`, which is unchanged. The loop exists only where launchd does not.
 
 CONTRACT
+  python3 fleet-schedule.py --check       DECLARATIONS only: parse every template with this
+                                         runtime's loader, print ERROR/SKIP/ok per job, write
+                                         nothing, need no loop. Exit 1 if any declaration cannot
+                                         be run (or if every job is skipped), 3 if there are no
+                                         declarations at all. Runs on EVERY platform including
+                                         macOS — it is the pre-merge gate for the shipped set.
   python3 fleet-schedule.py --install     parse, run the DUE jobs now, start the loop, verify.
                                          Non-zero if the job set cannot be parsed, a job target
                                          is broken, or the loop does not come up.
@@ -101,9 +109,20 @@ STATE = ""
 TICK = 0
 JOB_TIMEOUT = 0
 
-# The placeholder set — the SAME ten `scripts/install-launchd.sh` renders (its own
-# `for ph in …` list at install-launchd.sh:462 is the contract; a name added there and not
-# here turns every cell's --install/--start into a refusal, so the two lists move together).
+# The placeholder set — the SAME names `scripts/install-launchd.sh` renders, whose own
+# PLIST_PLACEHOLDERS array is the contract. A name added there and not here turns every cell's
+# --install/--start into a refusal, so the two lists must move together — and they DID drift:
+# #2639 added AI_DRAINER_* / AI_MULTI_REPO_* to the installer only, which made the shipped
+# ai-drainer template an ERROR on every cell and left cell4 with no scheduler at all (measured
+# 2026-10-27: MainPID=0, no controller, no reaping, no liveness, no canary). agent-infra#2804 is
+# that placeholder half on its own; #2908 is the cell-level symptom.
+#
+# ⛔ THE LISTS ARE COMPARED, NOT TRUSTED. `scripts/fleet-schedule.test.sh` reads this tuple and
+# install-launchd.sh's array and fails on ANY difference, and it self-proves the check by running
+# it against a mutated copy (a guard that cannot fail is the defect this repo keeps re-finding).
+# That is why a third copy of the set — the `{{NAME}}` tokens actually present in
+# templates/launchd/*.plist — is checked too.
+#
 # A template that carries any OTHER {{NAME}} is an error here, not an empty string: the launchd
 # renderer would substitute empty for a name it does not know too, so the two backends agree
 # only because the list is a contract, and this one refuses rather than guesses.
@@ -118,6 +137,16 @@ PLACEHOLDERS = (
     "PI_BIN_DIR",
     "WORKTREE_HYGIENE_MODE",
     "REAP_ORPHAN_MODE",
+    # ⛔ ENV-ONLY WITH NO DEFAULT, exactly like install-launchd.sh treats them — and here the
+    # reason is the same one that put them there: a plain placeholder would put a LANE DISPATCHER
+    # (ai-drainer) and a SECOND CONTROLLER (ai-multi-repo, which double-dispatches every queue)
+    # on every machine in the fleet. Unset ⇒ the template is SKIPPED, named and loud; that is the
+    # designed arm, not a degraded one.
+    "AI_DRAINER_O",
+    "AI_DRAINER_STATE",
+    "AI_MULTI_REPO_SLUG",
+    "AI_MULTI_REPO_REPO",
+    "AI_MULTI_REPO_STATE",
 )
 PLACEHOLDER_RE = re.compile(r"\{\{([A-Z_][A-Z0-9_]*)\}\}")
 
@@ -191,7 +220,7 @@ def reap_orphan_mode(home: str) -> str:
 
 
 def placeholder_values() -> dict:
-    """Resolve the ten placeholders. Empty string means 'unresolved' (the job is SKIPPED)."""
+    """Resolve every placeholder in PLACEHOLDERS. Empty string means 'unresolved' (SKIPPED)."""
     home = os.environ.get("CELL_HOME") or os.environ.get("HOME") or ""
     infra = INFRA_ROOT
     tortoise = os.environ.get("TORTOISE_REPO", "")
@@ -233,6 +262,14 @@ def placeholder_values() -> dict:
         "PI_BIN_DIR": pi_bin_dir,
         "WORKTREE_HYGIENE_MODE": wt_hygiene_mode(home),
         "REAP_ORPHAN_MODE": reap_orphan_mode(home),
+        # ⛔ ENV-ONLY, EMPTY MEANS SKIP — never defaulted. These three pairs identify a SECOND
+        # dispatcher and a SECOND controller; a default here would put both on every box that
+        # installed the layer (see the comment at PLACEHOLDERS). Empty ⇒ named SKIP.
+        "AI_DRAINER_O": os.environ.get("AI_DRAINER_O", ""),
+        "AI_DRAINER_STATE": os.environ.get("AI_DRAINER_STATE", ""),
+        "AI_MULTI_REPO_SLUG": os.environ.get("AI_MULTI_REPO_SLUG", ""),
+        "AI_MULTI_REPO_REPO": os.environ.get("AI_MULTI_REPO_REPO", ""),
+        "AI_MULTI_REPO_STATE": os.environ.get("AI_MULTI_REPO_STATE", ""),
     }
 
 
@@ -267,9 +304,12 @@ class Job:
         self.stderr = stderr
         self.skip = ""   # non-empty → this machine does not run it (named, never silent)
         self.error = ""  # non-empty → the declaration itself is broken (verify FAILS)
+        self.daemon = False  # KeepAlive/RunAtLoad: a long-lived service, not a periodic job
 
     @property
     def cadence(self):
+        if self.daemon:
+            return "daemon (KeepAlive)"
         if self.calendar is not None:
             c = self.calendar
             if "_all" in c:
@@ -313,8 +353,14 @@ def human_secs(seconds: float) -> str:
     return "%dd" % round(seconds / 86400)
 
 
-def load_jobs() -> list:
+def load_jobs(check_targets: bool = True) -> list:
     """Parse every plist in TEMPLATES_DIR into a Job. Raises ScheduleError for a broken set.
+
+    `check_targets=False` grades the DECLARATIONS only, and is what `--check` uses: whether
+    `{{HOME}}/.pi/agent/scripts/x.sh` exists is a fact about the MACHINE (a farm that is or is
+    not installed here), never about the declaration — grading it in CI, where no farm is
+    installed, would refuse a perfectly good template set for the runner's own missing layering.
+    The layer's real existence is already the cell's gate: `--install`/`--verify`.
 
     RETIRED labels are read from the same manifest install-launchd.sh uses; a retired label that
     still has a template is a loud error in both backends (that file says so). A label in
@@ -382,10 +428,21 @@ def load_jobs() -> list:
             # multi-entry one is matched as "any of these", which is what launchd does with it.
             job.calendar = {"_all": raw_calendar} if len(raw_calendar) > 1 else raw_calendar[0]
         else:
-            job.error = (
-                "no StartInterval and no StartCalendarInterval — a job with no schedule would "
-                "never run (launchd accepts it silently; this runtime does not)"
-            )
+            # ⛔ A KeepAlive DAEMON IS A VALID DECLARATION, but not a periodic one. launchd runs it
+            # once and restarts it on exit; a tick loop has no supervisor, so it can only start the
+            # process and kill it at JOB_TIMEOUT — a restart every ceiling, not a service. Accepting
+            # it as "scheduled" would be the false PASS this file exists to close; refusing the whole
+            # LAYER over it is what left cell4 with no scheduler at all (measured 2026-10-27). So it
+            # is a NAMED SKIP below, and `--check` reports it on every machine — including the ones
+            # where launchd does run it.
+            if data.get("KeepAlive") is True or data.get("RunAtLoad") is True:
+                job.daemon = True
+            else:
+                job.error = (
+                    "no StartInterval and no StartCalendarInterval — a job with no schedule would "
+                    "never run (launchd accepts it silently; this runtime does not). If it is a "
+                    "long-lived service, declare KeepAlive/RunAtLoad and it is a named SKIP instead"
+                )
 
         argv = data.get("ProgramArguments") or []
         if not isinstance(argv, list) or not argv:
@@ -435,7 +492,7 @@ def load_jobs() -> list:
                 % ", ".join("{{%s}}" % u for u in sorted(used_empty))
             )
 
-        if not job.error and not job.skip:
+        if check_targets and not job.error and not job.skip:
             # "A dead job must never be installed" — the same rule install-launchd.sh enforces
             # before it bootstraps a plist: every absolute path in argv must resolve. WHERE it is
             # missing decides whether that is fatal, and the split is the layer's OWN files versus
@@ -489,6 +546,13 @@ def load_jobs() -> list:
                 else:
                     job.skip = "target absent on this machine: %s" % arg
                 break
+        # ⛔ PLACED AFTER THE TARGET CHECKS ON PURPOSE: a daemon's paths must still be validated, so
+        # a KeepAlive template pointed at a missing script is an ERROR (a broken farm), never a skip.
+        if job.daemon and not job.error and not job.skip:
+            job.skip = (
+                "declared KeepAlive/RunAtLoad — a long-lived DAEMON. The tick loop supervises nothing, "
+                "so it would start it and kill it at JOB_TIMEOUT; this machine runs no service for it"
+            )
         jobs.append(job)
     # ⛔ ZERO JOBS IS A FAILURE, not a clean run. A templates dir that EXISTS but holds no
     # *.plist (a sparse checkout, a stale TEMPLATES_DIR pointer, a dir that only has RETIRED)
@@ -1051,6 +1115,91 @@ def print_table(jobs, now):
         )
 
 
+def staged_copy_drift() -> str:
+    """Empty unless THIS file is a copy OUTSIDE the checkout that differs from the checkout's.
+
+    ⛔ THE DEFECT THIS CLOSES. A cell does not run this file from the checkout: the supervisor
+    stages a copy at `$CELL_HOME/.pi/agent/scripts/fleet-schedule.py` (cloud-cell-supervisor.sh:2383,
+    farmed by pi-bootstrap/setup.sh's `fleet_srcs`) and the loop executes THAT, every tick. So a fix
+    landed in the checkout changes nothing on a running cell until the farm is refreshed — measured
+    2026-10-27: a checkout fix for the placeholder drift “did not take” because the staged copy still
+    carried the old PLACEHOLDERS tuple. The refresh path already exists and is the ONLY one
+    (`cell-install.sh --install`, whose own `verify_layer` byte-compares the farm); what was missing
+    is the scheduler SAYING so, in the terms its own contract uses.
+
+    Reported as a DRIFT line by `--check` (never fatal: a Mac's farmed copy legitimately lags a
+    working tree) and as a named FAILURE by `--verify` on a cell, where a staged copy that differs
+    from the checkout is precisely the state that makes a landing invisible.
+    """
+    me = os.path.abspath(__file__)
+    if not INFRA_ROOT:
+        return ""
+    root = os.path.abspath(INFRA_ROOT)
+    checkout_copy = os.path.join(root, "scripts", "fleet-schedule.py")
+    if me == checkout_copy or me.startswith(root + os.sep):
+        return ""  # this IS a checkout's copy (or another worktree of one): nothing is staged
+    if not os.path.isfile(checkout_copy):
+        return ""  # a checkout that predates this file ships no scheduler to compare against
+    try:
+        with open(me, "rb") as a, open(checkout_copy, "rb") as b:
+            same = a.read() == b.read()
+    except OSError as exc:
+        return "the staged scheduler could not be compared with the checkout (%s)" % exc
+    if same:
+        return ""
+    return (
+        "the STAGED scheduler differs from the checkout: %s is not %s — this cell runs the staged "
+        "copy, so a fix landed in the checkout has NOT reached it. Refresh the farm: "
+        "bash %s/pi-bootstrap/cell-install.sh --install" % (me, checkout_copy, root)
+    )
+
+
+def cmd_check():
+    """The DECLARATION gate: parse every template with this runtime's loader, write nothing.
+
+    ⛔ WHY THIS VERB EXISTS. `--verify` is the cell's gate and needs a LIVE LOOP, so before this
+    existed nothing graded the shipped declaration set on the machine that AUTHORS it: on macOS
+    `--verify` delegates to launchd, which knows nothing about this runtime's placeholder contract.
+    That is how #2639 added `{{AI_DRAINER_O}}` to a template without teaching the runtime, reached
+    main, and made every cell refuse to start a scheduler at all (measured 2026-10-27: cell4
+    MainPID=0 — no reaping, no liveness, no canary). `--check` runs on every platform, needs no
+    state, no loop and no lock, and answers exactly one question: can this runtime run the job set
+    it ships? Target EXISTENCE is deliberately not graded here (see load_jobs); it is a fact about
+    the machine, graded by `--install`/`--verify`.
+    """
+    jobs = load_jobs(check_targets=False)
+    print_table(jobs, time.time())
+    errors = [j for j in jobs if j.error]
+    skipped = [j for j in jobs if j.skip and not j.error]
+    live = [j for j in jobs if not j.error and not j.skip]
+    drift = staged_copy_drift()
+    if drift:
+        print("  DRIFT  %s" % drift, file=sys.stderr)
+    for job in errors:
+        print("  FAIL   %s: %s" % (job.label, job.error), file=sys.stderr)
+    if errors:
+        print(
+            "DECLARATIONS BROKEN — %d of %d job(s) cannot be run by this runtime, of %s. A cell "
+            "refuses to start a scheduler over this set, so it would run no reap, no liveness and "
+            "no canary job (#1864)." % (len(errors), len(jobs), TEMPLATES_DIR),
+            file=sys.stderr,
+        )
+        return 1
+    if not live:
+        print(
+            "DECLARATIONS INERT — %d job(s) declared and every one SKIPPED for a named reason, so "
+            "nothing would run here: a set that is entirely skips is not a working schedule"
+            % len(jobs),
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "DECLARATIONS OK — %d job(s) runnable by this runtime, %d skipped for a named reason, "
+        "0 errors (%s)" % (len(live), len(skipped), TEMPLATES_DIR)
+    )
+    return 0
+
+
 def cmd_status():
     jobs = load_jobs()
     pid = loop_pid()
@@ -1072,6 +1221,15 @@ def cmd_verify():
     failures = []
     jobs = load_jobs()
     now = time.time()
+
+    # ⛔ A STAGED COPY THAT IS NOT THE CHECKOUT IS A FAILURE HERE, not a note: a cell runs
+    # $CELL_HOME/.pi/agent/scripts/fleet-schedule.py, so when it differs from the checkout this cell
+    # was installed from, the layer being certified is not the layer in the repo — the state in
+    # which a landing is invisible on every running cell (measured 2026-10-27). See
+    # staged_copy_drift(). Never raised by --check, where a Mac's farmed copy legitimately lags.
+    drift = staged_copy_drift()
+    if drift:
+        failures.append(drift)
 
     pid = loop_pid()
     if not pid:
@@ -1414,7 +1572,7 @@ def cmd_darwin(mode):
             "remove the jobs (there is no loop process to stop)"
         )
         return 0
-    print("usage: %s [--install|--status|--verify|--start|--stop|--help]" % os.path.basename(sys.argv[0]), file=sys.stderr)
+    print("usage: %s [--install|--status|--check|--verify|--start|--stop|--help]" % os.path.basename(sys.argv[0]), file=sys.stderr)
     return 2
 
 
@@ -1424,8 +1582,8 @@ def main(argv):
     if mode in ("--help", "-h"):
         print(__doc__)
         return 0
-    if mode not in ("--install", "--status", "--verify", "--start", "--stop", "--loop"):
-        print("usage: %s [--install|--status|--verify|--start|--stop|--help]" % os.path.basename(argv[0]), file=sys.stderr)
+    if mode not in ("--install", "--status", "--check", "--verify", "--start", "--stop", "--loop"):
+        print("usage: %s [--install|--status|--check|--verify|--start|--stop|--help]" % os.path.basename(argv[0]), file=sys.stderr)
         return 2
 
     INFRA_ROOT = resolve_infra_root()
@@ -1452,6 +1610,17 @@ def main(argv):
     JOB_TIMEOUT = int(os.environ.get("FLEET_SCHEDULE_JOB_TIMEOUT") or 1800)
 
     if sys.platform == "darwin":
+        if mode == "--check":
+            # ⛔ BEFORE THE DELEGATION, DELIBERATELY. The declaration set is the SAME files on both
+            # platforms, and macOS is where they are authored — but every other verb delegates to
+            # launchd, which knows nothing about this runtime's placeholder contract. So before
+            # this verb, NOTHING graded the shipped templates on the machine that writes them: that
+            # is how a template carrying {{AI_DRAINER_O}} reached main and refused every cell.
+            try:
+                return cmd_check()
+            except ScheduleError as exc:
+                print("FAIL: %s" % exc, file=sys.stderr)
+                return 3 if not os.path.isdir(TEMPLATES_DIR or "-") else 1
         if not INFRA_ROOT:
             print("FAIL: no agent-infra checkout found (set INFRA_ROOT or AGENT_INFRA_PATH)", file=sys.stderr)
             return 1
@@ -1471,6 +1640,8 @@ def main(argv):
             return cmd_install()
         if mode == "--status":
             return cmd_status()
+        if mode == "--check":
+            return cmd_check()
         if mode == "--verify":
             return cmd_verify()
         if mode == "--start":

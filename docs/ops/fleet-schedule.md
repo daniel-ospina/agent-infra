@@ -53,7 +53,39 @@ it already runs lanes on: tmux. So the schedule lives in a loop under the cell's
 (`Label`, `ProgramArguments`, `EnvironmentVariables`, `StartInterval`/`StartCalendarInterval`,
 `StandardOutPath`/`StandardErrorPath`) and renders the same `{{PLACEHOLDER}}` set as
 `install-launchd.sh`. A placeholder it does not know is a **loud refusal**, never an empty
-argument — that is the one place the two renderers could drift, so it fails closed.
+argument.
+
+⛔ **The two placeholder lists ARE the contract, and they drifted once — at the cost of a whole
+cell** (agent-infra#2908, and #2804 for the placeholder half, measured 2026-10-27 on
+`vm-ce2c2fc9fd844a32851d46c3723b903e`). #2639 added
+`{{AI_DRAINER_O}}` / `{{AI_DRAINER_STATE}}` (and the three `AI_MULTI_REPO_*`) to
+`install-launchd.sh` only, where an unset value is the designed **SKIP**; the runtime's
+`PLACEHOLDERS` tuple did not know them, where the same template is a hard **ERROR**. cell4's
+`systemctl start eldato-orchestrator` then came up `active (activating)` with `MainPID=0`: the
+runtime refused the whole set, so the cell ran **no controller, no reaping, no liveness detection
+and no canary**. The refusal is correct — the *input* was wrong.
+
+So: `install-launchd.sh` declares the names once (`PLIST_PLACEHOLDERS`) and both `render()` and its
+unset-placeholder check read that one array; `scripts/fleet-schedule.py` holds the tuple (it is
+farmed to cells as a SINGLE file, so it cannot read a sibling manifest); and
+`scripts/fleet-schedule.test.sh` **compares three lists** — the installer's array, the runtime's
+tuple, and the `{{NAME}}` tokens actually present in `templates/launchd/*.plist` — with floors so a
+truncated parse cannot read as agreement, and a **mutation arm** that removes `AI_DRAINER_O` from a
+copy of the tuple and requires the comparison to REDDEN. Add a name in both files, or the suite
+fails.
+
+**Two declaration shapes the tick loop cannot run, both NAMED skips:**
+
+- an **unset identity placeholder** (`{{AI_DRAINER_O}}`, `{{AI_MULTI_REPO_SLUG}}`, …) — env-only with
+  no default on purpose: a default would put a lane dispatcher and a second controller on every box
+  in the fleet;
+- a **`KeepAlive`/`RunAtLoad` daemon** (`com.eldato.worker-supply`). launchd runs it once and restarts
+  it on exit; the loop supervises nothing, so it would start the process and kill it at
+  `FLEET_SCHEDULE_JOB_TIMEOUT` — a restart every ceiling, not a service. It is a valid declaration,
+  so it is a skip rather than an error: refusing the entire layer over it is what went dark above.
+  A resident daemon on a cell belongs to the cell's own supervisor, not to this loop.
+  A template with **neither** a schedule nor `KeepAlive`/`RunAtLoad` is still a hard **ERROR** — on
+  launchd that shape loads silently and never runs, which is the original defect (#1864).
 
 ## Lifecycle
 
@@ -169,12 +201,48 @@ target inside the layer) is exit **1** there too.
 ## Commands
 
 ```bash
+python3 scripts/fleet-schedule.py --check     # DECLARATIONS only: exit 1 if this runtime cannot run the shipped set
 python3 scripts/fleet-schedule.py --install   # converge, run the due jobs NOW, start the loop, verify
 python3 scripts/fleet-schedule.py --status    # the table above
 python3 scripts/fleet-schedule.py --verify    # exit 1 on any arm above
 python3 scripts/fleet-schedule.py --start     # idempotent; clears the OFF switch, replaces a recycled pid
 python3 scripts/fleet-schedule.py --stop      # OFF switch + SIGTERM (creates the state dir if needed)
 ```
+
+**`--check` runs on EVERY platform, including macOS** — deliberately *before* the launchd delegation
+that every other verb takes. It is the only verb that grades the shipped declaration set on the
+machine that authors it (a Mac), needs no loop, no state and no lock, and does not grade target
+EXISTENCE: whether `<home>/.pi/agent/scripts` is farmed is a fact about the host, graded by
+`--install`/`--verify`, and grading it in CI (where no farm exists) would refuse a good template
+set. It prints the same `ERROR`/`SKIP`/`ok` table and ends with `DECLARATIONS OK — …` or
+`DECLARATIONS BROKEN — …`; a set that is entirely skips is refused as `DECLARATIONS INERT`.
+
+⛔ **Why it exists: the previous guard was blind, so a broken set reached main green.** The old
+assertion in `scripts/fleet-schedule.test.sh` grepped `--status` output for the runtime's own
+"does not know" wording — on macOS `--status` delegates to `install-launchd.sh`, which has no notion
+of that contract, so the check was structurally vacuous on the machine where templates are written;
+and the suite was **not in the shard list at all** when the drift landed (the list was hand-
+enumerated then: `git show 427f64950:scripts/run-bash-shards.sh | grep fleet-schedule` → nothing,
+while the 21,778-line `script-validate` log of that very commit never mentions the suite). The list
+is DERIVED now, so the suite runs; the assertion is a verdict on the parsed declarations, so it can
+fail.
+
+### The staged copy — why a checkout fix does not reach a running cell
+
+A cell does **not** run this file from the checkout. The supervisor executes
+`$CELL_HOME/.pi/agent/scripts/fleet-schedule.py`, farmed there by `pi-bootstrap/setup.sh`
+(`fleet_srcs`) and byte-verified by `pi-bootstrap/cell-install.sh --verify`. So the refresh path is
+that one installer — there is no second one. What was missing was the scheduler SAYING so:
+
+- `--check` prints a `DRIFT` line when the file it is running is outside the checkout and differs
+  from `<INFRA_ROOT>/scripts/fleet-schedule.py` (never fatal — a Mac's farmed copy legitimately lags
+  a working tree);
+- `--verify` counts it as a **failure**, because a cell certifying a layer while running a copy that
+  is not the checkout's is precisely the state in which "I fixed it and it did not take" is true.
+
+Measured cause: a checkout fix for the placeholder drift did nothing on a running cell until the
+farm was refreshed. Refresh with
+`bash <checkout>/pi-bootstrap/cell-install.sh --install`, then `fleet-schedule.py --verify`.
 
 `FLEET_SCHEDULE_TICK` (60 s), `FLEET_SCHEDULE_JOB_TIMEOUT` (1800 s), `FLEET_SCHEDULE_STATE`,
 `TEMPLATES_DIR`, `INFRA_ROOT` override the defaults. A killed job is stamped `rc=124` and logged —
