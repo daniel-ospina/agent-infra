@@ -1456,12 +1456,16 @@ write_pin "$APPLIED" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
 # saying `current` would be the false PASS (an operator reads "current" about last week's code).
 _rel=restart-pending
 [ "$RUNNING" = "$TIP" ] && _rel=current
-# ⛔ THE SAME CANNOT-VERIFY DOWNGRADE THE CURRENT-PIN PATH MAKES, MADE HERE TOO. The advance branch is the
-# ONE cycle where the pin has just moved, and `apply` rewrites the STAMP in that same cycle — so
-# `RUNNING` here can be the stamp's CLAIM naming the NEW tip while the controller still executes the OLD
-# tree. `[ "$RUNNING" = "$TIP" ]` then reads that claim as agreement and reports `current`: the exact
-# false PASS this job exists to end, on the path an operator reaches right after deploying. A live
-# controller whose identity comes only from the stamp cannot be certified, so it is restart-pending — and
+# ⛔ THE SAME CANNOT-VERIFY DOWNGRADE THE CURRENT-PIN PATH MAKES, MADE HERE TOO. This is the branch where
+# the pin has just moved, and `RUNNING` here can be the stamp's CLAIM naming the NEW tip while the
+# controller still executes the OLD tree. ⛔ AND DO NOT EXPLAIN THAT BY "apply rewrites the stamp": the
+# DEFAULT advance is `apply --force --pin-only` (:1422-1423), which deliberately leaves `$O` — and so the
+# stamp — alone (`cloud-cell-supervisor.sh` returns before `seed_and_stamp` on `--pin-only`). A stamp that
+# already names the tip comes from `start`'s `seed_and_stamp`, from a `--re-seed` advance, or from a hand
+# seed, and it remains only a CLAIM about what was SEEDED, never proof of what is EXECUTING.
+# `[ "$RUNNING" = "$TIP" ]` then reads that claim as agreement and reports `current`: the exact false PASS
+# this job exists to end, with no `pending=` on the spawn line and no request recorded. A live controller
+# whose identity comes only from the stamp cannot be certified, so it is restart-pending — and
 # `set_pending` then records WHY (`pending=unprovable`), which the `current` arm would have skipped.
 case "$RUNNING_FROM" in
   stamp:*) [ "${CONTROLLER_LIVE:-0}" = 1 ] && [ "$_rel" = current ] && _rel=restart-pending ;;

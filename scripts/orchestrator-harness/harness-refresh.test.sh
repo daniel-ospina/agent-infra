@@ -2373,12 +2373,14 @@ case "$R13" in *"running=$(short "$C2")"*) ok "…the QUOTED path resolved to th
                *) bad "the record named neither tree: $R13" ;; esac
 
 # ⛔ S14: THE ADVANCE PATH MUST MAKE THE SAME CANNOT-VERIFY DOWNGRADE AS THE CURRENT-PIN PATH. This is the
-# one cycle where the pin has just moved, and `apply` rewrites the STAMP in that same cycle — so `RUNNING`
-# can be the stamp's CLAIM naming the NEW tip while the controller still executes the OLD tree. The
-# advance branch used to compare `RUNNING` to `TIP` alone and report `current`: a false PASS on the path an
-# operator reaches immediately after deploying, with no `pending=` on the spawn line and no request
-# recorded. Driven with an unreadable identity (`PS_BIN=/nonexistent/ps`) so the only source left is the
-# stamp, which is deliberately made to name the TIP while the pinned tree is an older commit.
+# branch where the pin has just moved, and `RUNNING` can be the stamp's CLAIM naming the NEW tip while the
+# controller still executes the OLD tree. ⛔ THE STAMP IS NOT REWRITTEN BY THIS CYCLE: the default advance
+# is `apply --force --pin-only`, which leaves `$O` (and the stamp) alone — a stamp naming the tip is written
+# by `start`'s `seed_and_stamp`, a `--re-seed` advance, or a hand seed, and it is only ever a CLAIM about
+# what was SEEDED. The advance branch used to compare `RUNNING` to `TIP` alone and report `current`: a false
+# PASS with no `pending=` on the spawn line and no request recorded. Driven with an unreadable identity
+# (`PS_BIN=/nonexistent/ps`) so the only source left is the stamp, planted naming the TIP while the pin
+# names an older commit — the shape a cell is in after a previous `start` seeded `$O` ahead of a re-pin.
 _CASE=$((_CASE+1)); echo "=== S14: a stamp-only identity naming the tip is NOT 'current' on the advance path ==="
 D="$T/s14"; mkdir -p "$D/o/state" "$D/pin" "$D/mat"
 PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"     # behind the tip, so the advance fires
