@@ -1949,6 +1949,18 @@ ov="$(MEM_LANE_RESERVE_MB=999999999 MEM_SPAWN_RESERVE_LANES=999999999 bash -c '
   else echo "out-of-range floor=$MEM_MIN_AVAIL_MB (len=${#MEM_MIN_AVAIL_MB})"; fi' _ "$GATE")"
 [ "$ov" = "ok" ]; rc=$?
 ck "an absurd reserve is REPAIRED so the derived floor stays inside is_limit's range ($ov)" $rc
+# ⛔ AND EACH FACTOR IS REPAIRED AT SOURCE, NOT ONLY BECAUSE THE PRODUCT FAILED LATER (review, P2).
+# The reserve carried an upper guard and the LANE FACTOR did not, so an absurd lane factor was caught
+# one level down: the 13-digit product failed `is_limit`, the FLOOR was repaired to 2048, and the
+# factor an operator reads stayed at 999999999 — a value the gate silently does not use, which is the
+# "accepted value must be the used value" contract broken in the other direction. Both factors now
+# repair to their shipped defaults, and the assertion is on the FACTOR because that is the input.
+lf="$(MEM_LANE_RESERVE_MB=1024 MEM_SPAWN_RESERVE_LANES=999999999 bash -c '. "$1"; printf "%s" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$lf" = "2" ]; rc=$?
+ck "an absurd LANE FACTOR is REPAIRED to the shipped default at source (got '${lf:-<empty>}', want 2) — not merely masked by the floor's own range net" $rc
+lz="$(MEM_SPAWN_RESERVE_LANES=0 bash -c '. "$1"; printf "%s" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$lz" = "2" ]; rc=$?
+ck "…and a zeroed lane factor is repaired too (got '$lz') — a 0x floor is the no-op gate" $rc
 
 # ── the VERDICT, end to end through the SHIPPED run_agent: FABRICATED readings ────────────────────
 # POSITIVE CONTROL FIRST (this file's rule): the same driver, a high reading, the agent must RUN —
