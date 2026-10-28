@@ -122,8 +122,46 @@ REPOS = ("daniel-ospina/tortoise",
          "daniel-ospina/premise-labs",
          "daniel-ospina/agent-infra")
 
-JEV_URL = "https://jevtypesafeai.com/api/v1/decide"
-JEV_MODEL = "jev-1.13.0"      # pinned, exactly as the gate pins it
+# ⛔ THE VENDOR IS TYPESAFE — AND IT USED TO BE THE WRONG HOST (2026-10-26 owner report).
+# Every caller in the fleet POSTed to `jevtypesafeai.com`, which is NOT TypeSafe's API: it
+# is a lookalike host that billed on its own account (the balance declared in tortoise#7864
+# was paid THERE, not to the vendor whose docs this code cites). The real endpoint is
+# `api.typesafe.ai/v1/systemone`, and the key comes from console.typesafe.ai.
+# The endpoint is duplicated in exactly three places plus their deployed copies —
+# `scripts/ask-owner.py` and this file, and `~/.pi/agent/state/lane-verdict.py` (deployed,
+# untracked; `scripts/lane-actions.py` reads it as `LV.JEV_URL` / `LV.JEV_MODEL` and holds no
+# copy of its own), plus `~/.pi/agent/scripts/{turn-classify,ask-owner}.py`. A rotation is a
+# SWEEP over that list, never a one-line edit:
+#     grep -rn 'api.typesafe.ai' ~/.pi/agent/scripts ~/.pi/agent/state/lane-verdict.py \
+#         ~/Documents/GitHub/agent-infra/scripts
+# (scoped to the LIVE files on purpose: `~/.pi/agent/state/*` also holds archived copies and
+# mutation-test fixture trees that legitimately still contain the old host.)
+JEV_URL = "https://api.typesafe.ai/v1/systemone"
+# ⛔ THE MODEL IS THE ALIAS, BY OWNER RULING (2026-10-27): "let's use jev latest".
+#
+# `MIN_CONFIDENCE` above and every JEV-SCORED per-mark bar in `ask-owner.py` (`THRESHOLD`,
+# `THRESHOLD_LANGUAGE` — NOT `THRESHOLD_JARGON`, which sits over the mechanical marks and cannot
+# move with the model) were calibrated on the LOOKALIKE host's `jev-1.13.0` and not re-measured
+# since the migration (tortoise#7864), so re-deriving them is a FIRST real calibration, not a
+# repeat. `jev-latest` already resolves to
+# `jev-1.14.0` on the live API — so the marks are now scored by a model that moves when the
+# vendor ships, with no change to this file. The vendor's own guidance warns about exactly
+# this ("an alias moves when a new release
+# ships ... if you have tuned confidence thresholds against one version, send that version's
+# ID instead of the alias").
+# ⚠️ What makes that survivable is the ECHO: the response carries the concrete version that
+# answered, and `jev_choice` returns it as `meta["model"]` — so a verdict that shifted for a
+# reason no diff explains is visible in the log (`model=jev-1.14.0` against bars measured on
+# 1.13) instead of being inferred later from behaviour. Every path that records a JEV-DERIVED
+# verdict logs it — acted, the below-bar SKIP, no-action, and "already sent recently" — because a
+# model-induced confidence drop shows up as a SKIP, and the below-bar SKIP and the no-action path
+# originally carried no model at all (review 2026-10-27). The per-tick CAP logs it too, though it
+# records nothing; the structural idle path makes no Jev call, so it carries no model by design.
+# Re-derive the bars FIRST when a `model=` moves. Pinning a version again is a one-line change in EACH of the five copies the sweep
+# note above lists (these two tracked callers, the two deployed ~/.pi/agent/scripts copies, and
+# the deployed state/lane-verdict.py) — a partial re-pin is the same split-brain this round
+# fixed in the other direction.
+JEV_MODEL = "jev-latest"
 
 # The three outcomes Jev chooses between. The FOURTH case the owner named —
 # "a question, protocol used" — is not a Jev question: it is decided by the label.
@@ -287,9 +325,17 @@ def last_turn_text(path: str) -> str:
 
 
 def jev_key() -> str | None:
-    k = os.environ.get("JEV_API_KEY")
-    if k:
-        return k
+    """The TypeSafe key. `TYPESAFE_API_KEY` is the vendor's own name for it; `JEV_API_KEY`
+    stays accepted because a plist, shell or cell env may set that older name
+    (agent-infra#2642), and a migration that silently unkeys the fleet is worse than one that
+    reads two names. The file is the same 0600 store it always was — and on this box it is the
+    only source, so the file fallback below is load-bearing, not a courtesy."""
+    for var in ("TYPESAFE_API_KEY", "JEV_API_KEY"):
+        k = os.environ.get(var)
+        # ⛔ `.strip()` FIRST — a whitespace-only value is truthy, so `if k:` let it win over the
+        # populated store and send `Bearer ` (a 401 whose cause looks like a set env var).
+        if k and k.strip():
+            return k.strip()
     try:
         return json.load(open(f"{HOME}/.pi/agent/jev-config.json")).get("apiKey")
     except Exception:                                            # noqa: BLE001
@@ -326,8 +372,19 @@ def jev_choice(state: str) -> tuple[str | None, dict]:
     if choice not in OUTCOMES:
         log(f"ERR jev choice not recognised: {choice!r}")
         return None, {}
-    return choice, {"confidence": ans.get("confidence"),
-                    "cost_usd": (d.get("usage") or {}).get("cost_usd")}
+    # THE REAL API REPORTS TOKENS, NOT MONEY: `usage` is `{input_tokens, output_tokens}`.
+    # The old host also returned `cost_usd`/`credits_remaining_usd`; those keys are read
+    # when present (so a future metered response is not silently dropped) and omitted
+    # rather than faked when absent — an invented 0.0 cost is a false measurement.
+    usage = d.get("usage") or {}
+    meta = {"confidence": ans.get("confidence"),
+            "model": d.get("model"),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens")}
+    for money in ("cost_usd", "credits_remaining_usd"):
+        if money in usage:
+            meta[money] = usage[money]
+    return choice, meta
 
 
 def lanes_with_open_question() -> tuple[set, bool]:
@@ -1176,10 +1233,11 @@ def main(argv: list[str]) -> int:
         conf = meta.get("confidence")
         if kind and conf is not None and conf < MIN_CONFIDENCE:
             log(f"SKIP {lane}: {choice} at confidence {conf} < {MIN_CONFIDENCE} "
+                f"(model={meta.get('model')}) "
                 f"-- unknown, not acting (not claimed, so this turn stays open)")
             continue
         if kind and sent >= MAX_PER_TICK:
-            log(f"CAP {MAX_PER_TICK}: {lane} deferred")
+            log(f"CAP {MAX_PER_TICK}: {lane} deferred (model={meta.get('model')})")
             break
 
         # Claim the turn in BOTH cases. A "no action" decision must be recorded,
@@ -1191,13 +1249,15 @@ def main(argv: list[str]) -> int:
                 write_marker(lane, sid=sid, size=size, last=int(time.time()),
                              verdict=choice, acted=False)
             log(f"{lane}: {choice} -> no action "
-                f"(protocol={'yes' if used_protocol else 'no'}, conf={conf})")
+                f"(protocol={'yes' if used_protocol else 'no'}, conf={conf}, "
+                f"model={meta.get('model')})")
             continue
 
         now = time.time()
         gap = IDLE_GAP_S if kind == "idle_next_work" else MIN_GAP_S
         if now - (m.get("last") or 0) < gap and m.get("verdict") == choice:
-            log(f"SKIP {lane}: {kind} already sent recently")
+            log(f"SKIP {lane}: {kind} already sent recently "
+                f"(model={meta.get('model')})")
             if not a.dry_run:
                 write_marker(lane, sid=sid, size=size, last=m.get("last", now),
                              verdict=choice, acted=True)
@@ -1209,8 +1269,10 @@ def main(argv: list[str]) -> int:
         if not a.dry_run:
             write_marker(lane, sid=sid, size=after, last=int(now),
                          verdict=choice, acted=True, result=result)
+        spend = (f"cost=${meta['cost_usd']}" if "cost_usd" in meta
+                 else f"tokens={meta.get('input_tokens')}/{meta.get('output_tokens')}")
         log(f"{lane}: {choice} -> {kind} :: {result} "
-            f"(conf={conf}, cost=${meta.get('cost_usd')})")
+            f"(conf={conf}, model={meta.get('model')}, {spend})")
         sent += 1
 
     if sent == 0 and not a.print_turn:
