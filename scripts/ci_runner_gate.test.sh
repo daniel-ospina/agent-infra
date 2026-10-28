@@ -864,7 +864,7 @@ fi
 #
 # What is pinned below, in the order the fleet needs it:
 #   (1) the THREE STATES come from the API per runner — online-idle, online-busy, and
-#       registered-but-never-online. A count of registrations cannot tell them apart, and conflating
+#       registered-but-OFFLINE (the read reports `status`, never "has it EVER been online"). A count of registrations cannot tell them apart, and conflating
 #       them is how "9 online" was read while 7 were idle.
 #   (2) IDLE WHILE WORK WAITS is never certified. The verdict says what it measured.
 #   (3) AN UNREADABLE CAPACITY READ IS `UNKNOWN`, ALARMS, AND IS NOT A GUESS. The token is never
@@ -874,7 +874,7 @@ fi
 #       arm that keeps this fix from re-engaging the fallback on every healthy tick.
 #
 # The fixtures are the live measurements of 2026-10-28 12:42-12:57Z, not inventions:
-#   daniel-ospina/agent-infra : 8 registrations, 2 online (both busy), 6 never online, 52-56 queued
+#   daniel-ospina/agent-infra : 8 registrations, 2 online (both busy), 6 offline, 52-56 queued
 #   daniel-ospina/tortoise    : 9 online, all busy, 73-78 queued; head job asked `ubuntu-latest`
 #   daniel-ospina/agent-infra : census read → 200 HERE, 403 on the cell boxes (same script, other token)
 echo "── #2904/#2897/#2931: the census reports the THREE STATES per runner (a count cannot) ──"
@@ -882,12 +882,12 @@ run_gate census-2of8 GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=6 \
   GH_CENSUS="busy,busy,off,off,off,off,off,off" --
 assert_eq "$RC" "0" "(1) a readable census with work queued and every ONLINE runner busy exits 0"
 assert_contains "$OUT" "busy=2" "(1) online-busy is counted from the API's per-runner busy flag"
-assert_contains "$OUT" "never_online=6" "(1) registered-but-never-online is its OWN state, not 'not busy'"
+assert_contains "$OUT" "offline=6" "(1) registered-but-OFFLINE is its OWN state, not 'not busy' (and NOT 'never online' — the API reports status, not history)"
 assert_contains "$OUT" "online_idle=0" "(1) online-idle is reported even when it is zero"
 assert_contains "$OUT" "2 of 8 online" "(1) the human form says how much of the pool is actually up"
 assert_contains "$OUT" "capacity=saturated" "(1) work waiting + every online runner busy is SATURATED (busy is real)"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "(1) the mode file keeps its single-word shape"
-assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "never_online=6" \
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "offline=6" \
   "(1) the verdict file carries the per-runner counts a fleet report can branch on"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capacity=saturated" \
   "(1) and the current capacity verdict"
@@ -904,6 +904,23 @@ assert_contains "$OUT" "online_busy=2" "(2) …separately from the two that are 
 assert_contains "$OUT" "capacity=idle-unused" "(2) the verdict names the state instead of hiding behind a count"
 assert_contains "$OUT" "CAPACITY NOT CERTIFIED" "(2) the reason refuses to certify capacity"
 assert_not_contains "$OUT" "GitHub Actions healthy" "(2) and never prints the word 'healthy' over it"
+
+# ⛔ THE FALL-THROUGH RE-CREATED THE MISREADING (#3002 review P1). The arm above is mode=local with a
+# READABLE demand; when the demand cannot be measured (a space-bearing label `queue_demand` rejects, or
+# any mode=github tick) the verdict used to fall through to `saturated` whenever ANY runner was busy —
+# so 7 IDLE runners and 2 busy ones printed `capacity=saturated … (idle=7 busy=2)` and, because
+# `saturated` is a CERTIFYING word, the reason read "GitHub Actions healthy". Same census, same queue,
+# demand unmeasurable: the pool's own state still decides, and it has idle capacity.
+echo "── #3002 P1: an UNMEASURABLE demand must not turn 7 idle runners into 'saturated' ──"
+run_gate census-mixed-demand-unknown GH_QUEUED=54 GH_FALLBACK_N=0 GH_INPROGRESS=2 GH_DEMAND_MODE=fail \
+  GH_CENSUS="idle,idle,idle,idle,idle,idle,idle,busy,busy" --
+assert_eq "$RC" "0" "(2b) the pass completes (idle capacity is a report, not a deny)"
+assert_contains "$OUT" "demand=unknown" "(2b) the demand really was unmeasured in this state"
+assert_contains "$OUT" "online_idle=7" "(2b) seven online runners are idle"
+assert_contains "$OUT" "capacity=idle-unused" "(2b) the verdict is idle-unused, NOT saturated"
+assert_not_contains "$OUT" "capacity=saturated" "(2b) 'saturated' means EVERY online runner is busy — never this"
+assert_contains "$OUT" "CAPACITY NOT CERTIFIED" "(2b) and the certifying branch is not entered"
+assert_not_contains "$OUT" "GitHub Actions healthy" "(2b) the words 'healthy' never appear over idle capacity"
 
 # The third state, and the ONLY place it is conclusive: in mode=local the pool is SUPPOSED to serve,
 # so "not one online runner can accept the queue's demand" is a fault the gate can act on.
@@ -968,7 +985,7 @@ echo "── #2904: a non-row census body is UNREADABLE, not 'zero runners' ─�
 run_gate census-garbage GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=garbage --
 assert_eq "$RC" "2" "(7) a null census body → exit 2"
 assert_contains "$OUT" "census UNREADABLE" "(7) the failure is named as a body/schema problem"
-assert_not_contains "$OUT" "never_online=0" "(7) 'no runners' is never invented from an unreadable body"
+assert_not_contains "$OUT" "offline=0" "(7) 'no runners' is never invented from an unreadable body"
 run_gate census-empty GH_QUEUED=5 GH_FALLBACK_N=0 GH_CENSUS_MODE=empty --
 assert_eq "$RC" "0" "(7) an EMPTY census is a readable zero, not a failed read"
 assert_contains "$OUT" "runners=0" "(7) and it says so"
@@ -989,6 +1006,15 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "in_pro
   "(11) FIELD PARITY with the success verdict — same keys, not missing ones"
 assert_not_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "queued=unmeasured" \
   "(11) the old bug, pinned: a measured 54 rendered as the 'unmeasured' default"
+# ⛔ (11b) THE CENSUS KEYS WERE STILL MISSING ON THIS PATH (#3002 review P2). The comment claimed "same
+# keys, same order, in both writers" while the blind line carried nine keys and the success line
+# seventeen, so a strict parser saw ABSENT census fields rather than an explicit `unmeasured`.
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "runners=unmeasured" \
+  "(11b) an unread census is RECORDED as unmeasured, not omitted"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "demand=unmeasured" \
+  "(11b) …including the demand key"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "label_ambiguity=unmeasured" \
+  "(11b) …and the ambiguity key: parity is a property of the surface, not of a comment"
 
 # ⛔ (12) `--dry-run` DOCUMENTS "change nothing" AND USED TO MUTATE. `evaluate` runs BEFORE the DRY
 # gate, so a blind dry-run sent a real alarm, wrote the stamp file and overwrote the verdict — and the
@@ -1068,7 +1094,7 @@ assert_eq "$RC" "0" "(9) --status with both reads available exits 0"
 assert_contains "$OUT" "capacity=unmeasured" "(9) --status computes no verdict, and says so in the SAME vocabulary the verdict file uses"
 assert_not_contains "$OUT" "capacity=measured" "(9) and never invents a seventh word a scheduler would have to special-case"
 assert_contains "$OUT" "online_busy=1" "(9) …with the per-runner states"
-assert_contains "$OUT" "never_online=2" "(9) …including the registrations that never came online"
+assert_contains "$OUT" "offline=2" "(9) …including the registered runners that are offline"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "(9) --status advances no mode"
 assert_absent "$STATE_DIR/orchestrator-inbox.log" "(9) --status alarms nobody"
 run_gate status-blind GH_FALLBACK_N=1 GH_CENSUS_MODE=forbidden -- --status
@@ -1167,7 +1193,7 @@ echo "── #2897: a wrapper diagnostic on stderr never becomes a measured valu
 run_gate noise GH_NOISE=1 GH_QUEUED=5 GH_FALLBACK_N=0 GH_INPROGRESS=2 GH_CENSUS="busy,busy,off" --
 assert_eq "$RC" "0" "(10) a diagnostic on stderr does not fail a readable pass"
 assert_contains "$OUT" "TRANSITION unknown -> github" "(10) the MODE is still read (the count survived the noise)"
-assert_contains "$OUT" "never_online=1" "(10) the CENSUS is still read"
+assert_contains "$OUT" "offline=1" "(10) the CENSUS is still read"
 assert_contains "$OUT" "capacity=saturated" "(10) and the capacity verdict is a measurement"
 assert_not_contains "$OUT" "BLIND" "(10) noise never raises a blind alarm — that alarm means 'unreadable', nothing else"
 assert_not_contains "$OUT" "mode=unknown" "(10) and the mode is never degraded to unknown by commentary"

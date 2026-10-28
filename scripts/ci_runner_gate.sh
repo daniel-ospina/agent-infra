@@ -31,7 +31,7 @@
 # THE CAPACITY INSTRUMENT (agent-infra#2904 · #2897 · #2931)
 #   This script is also the fleet's only CAPACITY instrument for the self-hosted pool, and it used
 #   to report a COUNT of registrations. A count cannot tell `online-idle` from `online-busy` from
-#   `registered-but-never-online`, so the fleet read 9 busy runners while 7 were idle, and read
+#   `registered-but-offline`, so the fleet read 9 busy runners while 7 were idle, and read
 #   "healthy" while running at 2 of 8. The census below reads `status` and `busy` PER RUNNER and
 #   says which of the three states each runner is in, and which of them can accept the queue's own
 #   demand (`jobs[].labels`, readable without admin).
@@ -204,10 +204,14 @@ CENSUS_BLIND=0         # 1 only when the CAPACITY read failed (the condition the
 # NARROWS the claim (never a `stranded` deny) rather than voiding the pass.
 CENSUS_LABEL_AMBIGUOUS=0
 CENSUS_KV=""           # the measured counts, machine-readable
-CENSUS_DETAIL=""       # the same counts as "2 of 8 online (idle=0 busy=2 never-online=6)"
+CENSUS_DETAIL=""       # the same counts as "2 of 8 online (idle=0 busy=2 offline=6)"
+# The same eight census keys, for the writer that runs when the census could NOT be read (#3002 review
+# P2): the 403 path used to emit a DIFFERENT key set, so a strict parser saw absent keys instead of an
+# explicit `unmeasured` — the same defect that comment claimed to have fixed. Order matches CENSUS_KV.
+CENSUS_KV_UNMEASURED="runners=unmeasured online_idle=unmeasured online_busy=unmeasured offline=unmeasured demanding_idle=unmeasured demanding_busy=unmeasured label_ambiguity=unmeasured demand=unmeasured"
 CENSUS_ON_IDLE=0
 CENSUS_ON_BUSY=0
-CENSUS_NEVER_ONLINE=0
+CENSUS_OFFLINE=0
 CENSUS_DEMAND_IDLE=0
 CENSUS_DEMAND_BUSY=0
 DEMAND_LABELS=""       # comma-joined label set the queue HEAD is asking for ("" = not measured)
@@ -232,8 +236,12 @@ need gh; need curl; need python3
 
 # ── runner capacity census ──────────────────────────────────────────────────────
 # ONE paginated read of the runner inventory, reduced to the three fields that carry the answer.
-# `<status> TAB <busy> TAB <labels,comma>` — comma is safe as a separator because a runner label is
-# restricted to `[A-Za-z0-9._-]` and can never contain one.
+# `<status> TAB <busy> TAB <labels,comma>`. ⛔ THE COMMA IS NOT ASSERTED SAFE (#3002 review P2): labels
+# are no longer character-policed (:197-206 — policing them froze the fleet on somebody else's label
+# name), so one CAN contain the delimiter, and the split is then untrustworthy. That is not ignored: it
+# is DETECTED (`CENSUS_LABEL_AMBIGUOUS`) and it narrows every demand claim below. Do not restore a
+# "can never contain one" claim here — it would re-justify deleting the only guard against a false
+# `stranded` deny.
 #
 # ⛔ THIS READ IS THE ONE THAT NEEDS `Administration: read` (classic: `repo` on an owned repo), and
 # the fleet token does not have it on every box (agent-infra#2897: `403 Resource not accessible by
@@ -288,7 +296,7 @@ offers_all() {
 # truncated body, gh's own error text) — never counted as zero runners.
 census_classify() {
   local rows="$1" row st busy rest labels lcount nl commas n=0
-  CENSUS_ON_IDLE=0; CENSUS_ON_BUSY=0; CENSUS_NEVER_ONLINE=0; CENSUS_DEMAND_IDLE=0; CENSUS_DEMAND_BUSY=0
+  CENSUS_ON_IDLE=0; CENSUS_ON_BUSY=0; CENSUS_OFFLINE=0; CENSUS_DEMAND_IDLE=0; CENSUS_DEMAND_BUSY=0
   CENSUS_LABEL_AMBIGUOUS=0
   # ⛔ THE DERIVED FIELDS ARE CLEARED AT ENTRY, not only written on success (#3002 review P2): after an
   # early `return 1` the counters were half-counted and the KV still described the PREVIOUS body — an
@@ -327,11 +335,17 @@ census_classify() {
         if [ "$busy" = true ]; then CENSUS_DEMAND_BUSY=$((CENSUS_DEMAND_BUSY+1)); else CENSUS_DEMAND_IDLE=$((CENSUS_DEMAND_IDLE+1)); fi
       fi
     else
-      CENSUS_NEVER_ONLINE=$((CENSUS_NEVER_ONLINE+1))
+      # ⛔ `offline` IS THE FACT; "never online" IS NOT (#3002 review P2). The runner object carries
+      # `id os status busy labels` and NOTHING that says a registration has EVER connected — `status`
+      # is validated to be `online|offline` (:302). Measured 2026-10-28 on this repo: 5 of 8 offline,
+      # and they are long-standing pool members (cell3-x64-4, cell4-1), i.e. runners that were online
+      # earlier and dropped. Reporting those as "never came online" states a fact the read cannot
+      # establish, and it was used as the operational diagnosis in the PR body.
+      CENSUS_OFFLINE=$((CENSUS_OFFLINE+1))
     fi
   done <<<"$rows"
-  CENSUS_KV="runners=$n online_idle=$CENSUS_ON_IDLE online_busy=$CENSUS_ON_BUSY never_online=$CENSUS_NEVER_ONLINE demanding_idle=$CENSUS_DEMAND_IDLE demanding_busy=$CENSUS_DEMAND_BUSY label_ambiguity=$CENSUS_LABEL_AMBIGUOUS demand=${DEMAND_LABELS:-unknown}"
-  CENSUS_DETAIL="$((CENSUS_ON_IDLE+CENSUS_ON_BUSY)) of $n online (idle=$CENSUS_ON_IDLE busy=$CENSUS_ON_BUSY never-online=$CENSUS_NEVER_ONLINE)"
+  CENSUS_KV="runners=$n online_idle=$CENSUS_ON_IDLE online_busy=$CENSUS_ON_BUSY offline=$CENSUS_OFFLINE demanding_idle=$CENSUS_DEMAND_IDLE demanding_busy=$CENSUS_DEMAND_BUSY label_ambiguity=$CENSUS_LABEL_AMBIGUOUS demand=${DEMAND_LABELS:-unknown}"
+  CENSUS_DETAIL="$((CENSUS_ON_IDLE+CENSUS_ON_BUSY)) of $n online (idle=$CENSUS_ON_IDLE busy=$CENSUS_ON_BUSY offline=$CENSUS_OFFLINE)"
   return 0
 }
 
@@ -396,7 +410,16 @@ capacity_verdict() {
   # mode=github, or a demand this pass could not measure or could not trust: the pool's LABEL SET is
   # not evidence here (in mode=github it is stripped by design), so the reading is only ever about the
   # pool's own state, and it never denies.
-  if [ "$demand_usable" = 1 ] && [ "$CENSUS_DEMAND_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi
+  # ⛔ IDLE IS TESTED BEFORE BUSY (#3002 review P1). `saturated` means EVERY online runner is busy, so
+  # a pool with idle runners must never be labelled with it — and `saturated` is a CERTIFYING word
+  # (:1043-1049 routes it to "GitHub Actions healthy"), so the mislabel is not cosmetic: it restores
+  # the very "9 busy while 7 idle" reading this instrument exists to remove. Measured on the pre-fix
+  # gate with 7 idle / 2 busy / 54 queued: `capacity=saturated … (idle=7 busy=2)` and the reason read
+  # "GitHub Actions healthy". Both arms that land here reach it — an unmeasurable demand
+  # (`demand=unknown`, e.g. a space-bearing label `queue_demand` rejects) and every mode=github tick.
+  # `demand_usable=1 && DEMAND_IDLE>0` used to be tested here; it is SUBSET of `ON_IDLE>0` (a demanding
+  # idle runner IS an idle runner), so it added no reach and is subsumed rather than kept as dead code.
+  if [ "$CENSUS_ON_IDLE" -gt 0 ]; then CENSUS_VERDICT=idle-unused; return 0; fi
   if [ "$CENSUS_ON_BUSY" -gt 0 ]; then CENSUS_VERDICT=saturated; return 0; fi
   CENSUS_VERDICT=idle-unused; return 0
 }
@@ -843,7 +866,7 @@ current_mode() {  # github | local | unknown
 # ⛔ WHAT IT CANNOT DO, stated where it is used: it answers "which pool is serving", NOT "how much
 # capacity is online". `runner_group_name` is populated from `actions:read` (measured 200 with the
 # fleet token) where the runner INVENTORY is 403, so an inventory-blind box can still SAY which mode
-# it is in — but it cannot count idle/busy/never-online runners, so the capacity verdict stays
+# it is in — but it cannot count idle/busy/offline runners, so the capacity verdict stays
 # `unknown` and the pass stays refused. Narrow the claim; do not widen the token.
 # GitHub's hosted group is named exactly `GitHub Actions` — WITH A SPACE — so the group list is joined
 # on `|` and split on IFS: a space-separated list splits that name into `GitHub` + `Actions` and reads
@@ -1010,9 +1033,14 @@ if [ "$healthy" = 2 ]; then
       alarm_blind "capacity=unknown capability=${CAPABILITY:-runner_inventory:unreadable} endpoint=$RUNNER_LIST_PATH queued=$blind_queued in_progress=$blind_in_progress oldest_queued_s=$blind_oldest (see ${LOG_FILE})"
       # ⛔ FIELD PARITY WITH `write_verdict` (#3002 review P1): the unknown verdict used to carry a
       # DIFFERENT key set than the success verdict, so a strict parser saw MISSING keys rather than an
-      # explicit `unmeasured`. Same keys, same order, in both writers.
-      printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — capacity was not read\n' \
-        "$mode" "$MODE_SOURCE" "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-runner_inventory:unreadable}" \
+      # explicit `unmeasured`. Same keys, same order, in both writers — INCLUDING the eight census
+      # keys, which this writer used to omit outright (#3002 review P2, measured: the blind line
+      # carried `verdict mode mode_source capacity queued in_progress oldest_queued_s capability
+      # reason` while the success line also carried `runners online_idle online_busy offline
+      # demanding_idle demanding_busy label_ambiguity demand`). A census that was not read is
+      # `unmeasured` — recorded, never assumed, and never absent.
+      printf 'verdict=unknown mode=%s mode_source=%s capacity=unknown %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=cannot measure — capacity was not read\n' \
+        "$mode" "$MODE_SOURCE" "$CENSUS_KV_UNMEASURED" "$blind_queued" "$blind_in_progress" "$blind_oldest" "${CAPABILITY:-runner_inventory:unreadable}" \
         > "$VERDICT_FILE" 2>/dev/null || true
     fi
   fi
@@ -1032,7 +1060,8 @@ if [ "$healthy" = 0 ]; then
     absorption="absorption NOT attributable in mode=$mode (in_progress includes pool runs): oldest_queued_s=$ABSORPTION_OLDEST_S in_progress=$ABSORPTION_IN_PROGRESS"
   fi
   # ⛔ THE CAPACITY READING IS QUOTED IN EVERY VERDICT, AND IT CAN VETO THE WORD "healthy" (#2904).
-  # The legs above can pass while the pool is at 2 of 8 with 6 registrations that never came online,
+  # The legs above can pass while the pool is at 2 of 8 with 6 registrations OFFLINE (and the read
+  # cannot say whether any of them ever connected — see `offline` above),
   # and calling that "healthy" is what sent a human out to rediscover the shortage by hand. Where
   # capacity is IDLE while work waits — or where no registration is online at all — the verdict still
   # routes to GitHub (nothing a relabel could fix, and in mode=github the pool is stripped by design)

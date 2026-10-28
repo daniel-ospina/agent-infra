@@ -705,6 +705,42 @@ else
 fi
 
 echo ""
+echo "35. #3002 — the CI wiring that keeps the shipped farm gated cannot be deleted and stay green"
+# ⛔ THE FAIL-OPEN ARM (#3002 review P2). In CI the gate refuses the runner box's ambient farm and
+# reads only a NAMED one, so `PI_EXTENSIONS_DIR` on the two jobs is the ONLY thing that keeps checks
+# 5/6 doing any work in CI. Without it the gate takes its named-skip branch and exits 0 — so a PR that
+# simply DELETES that env line from ci.yml would leave every check green while the shipped farm lost
+# its test-file and dangling-link coverage. Nothing else reads the workflows for this, so the wiring
+# is pinned here: both jobs that run this gate must aim it at the farm this repo ships, and the value
+# must be the workspace-relative shipped farm (not a `$HOME` path, which is the defect again).
+# #1719 precedent: "the scheduled job, the farm and the script must agree" (ci_runner_gate.test.sh).
+WANT_FARM='${{ github.workspace }}/pi-bootstrap/pi-config/extensions'
+assert_wired() { # <workflow file> <job id>
+  local wf="$ROOT/.github/workflows/$1" job="$2" got
+  if [ ! -f "$wf" ]; then
+    fail "wiring: .github/workflows/$1 is missing — the job list is not what this case assumed"
+    return
+  fi
+  # The job block runs from its `^  <job>:` line to the next top-level-keyed job line (2-space indent).
+  got="$(awk -v want="$job" '
+    $0 ~ "^  "want":" { injob=1; next }
+    injob && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { injob=0 }
+    injob && /PI_EXTENSIONS_DIR:/ { sub(/^[[:space:]]*PI_EXTENSIONS_DIR:[[:space:]]*/, ""); print; exit }
+  ' "$wf")"
+  if [ -z "$got" ]; then
+    fail "wiring: $1 job '$job' does NOT set PI_EXTENSIONS_DIR — the gate would skip checks 5/6 in CI and stay green (the #3002 fail-open)"
+    return
+  fi
+  if [ "$got" != "$WANT_FARM" ]; then
+    fail "wiring: $1 job '$job' sets PI_EXTENSIONS_DIR='$got' — want the SHIPPED farm '$WANT_FARM' (a \$HOME path reintroduces the host-dependent verdict)"
+    return
+  fi
+  pass "wiring: $1 job '$job' aims the machine-local checks at the shipped farm"
+}
+assert_wired ci.yml pi-config-extensions
+assert_wired ci-main.yml pi-config-extensions-guard
+
+echo ""
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures pi-config extension gate test(s) failed"
   exit 1
