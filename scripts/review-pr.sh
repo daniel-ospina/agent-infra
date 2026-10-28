@@ -139,7 +139,7 @@ set -uo pipefail
 PROG="review-pr"
 E_USAGE=2 E_EVIDENCE=3 E_NOPI=4 E_ALREADY=5 E_NOVERDICT=6 E_ISSUES=7 E_MOVED=8 E_RECORD=9 E_SCAN=10
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "$*" >&2; }
 die() { local rc="$1"; shift; err "$PROG: $*"; exit "$rc"; }
 usage() {
@@ -818,7 +818,7 @@ run_reviewer() { # <secs> <log> <prompt-file>
   printf '%s\n' "[review-pr] reviewer pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc capped=${alive_after_cap}" >> "$log"
   return "$rc"
 }
-say "review-pr: reviewing $REPO#$PR at ${HEAD:0:12}… with a fresh-context reviewer (cap ${TIMEOUT}s)"
+log_line "review-pr: reviewing $REPO#$PR at ${HEAD:0:12}… with a fresh-context reviewer (cap ${TIMEOUT}s)"
 run_reviewer "$TIMEOUT" "$LOG" "$PROMPT"
 AGENT_RC=$?
 cp "$LOG" "$TRANSCRIPT" 2>/dev/null || true
@@ -2508,7 +2508,7 @@ else
     die "$E_MOVED" "the diff CHANGED during the record step (head unchanged: a BASE retarget) and the record carries no diff= group to prove otherwise — re-run this command at the new base."
   fi
 fi
-say "review-pr: ✅ $REPO#$PR recorded clean at ${HEAD:0:12}… — evidence comment:$CID, and a SIGNED marker bound to this head is present in the PR body (check (c)'s artifact). The HMAC is verified by the gate, not here."
+log_line "review-pr: ✅ $REPO#$PR recorded clean at ${HEAD:0:12}… — evidence comment:$CID, and a SIGNED marker bound to this head is present in the PR body (check (c)'s artifact). The HMAC is verified by the gate, not here."
 # ⛔ THE CLEAN PATH DOES NOT LEAVE THE SCRATCH TRANSCRIPT BEHIND (P3, fresh review of #2288):
 # `cleanup` removes only $RUN_DIR, so every invocation — success included — left
 # `$TMPDIR/review-pr-<PR>.XXXXXX/reviewer.log` with the reviewer's FULL, UNREDACTED output on disk,
