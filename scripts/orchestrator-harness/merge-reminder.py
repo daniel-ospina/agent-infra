@@ -216,13 +216,24 @@ class Skipped(Exception):
     """A cycle that could not be measured. Reported by name; NEVER an empty answer."""
 
 
-def run(cmd, timeout=60, cwd=None):
-    """Run a command with a hard bound. Returns (rc, stdout, stderr); rc 124 on timeout."""
+def run(cmd, timeout=60, cwd=None, env=None):
+    """Run a command with a hard bound. Returns (rc, stdout, stderr); rc 124 on timeout.
+
+    ⛔ EVERY `git` INVOCATION IS SANITISED HERE, IN ONE PLACE (round-8 review, measured). Eight of twelve
+    git reads still inherited the ambient environment (8 of the 11 call sites), and
+    `GIT_DIR=<a foreign repo>/.git` made
+    `claim_state()` report a holder that existed only in THAT repo, `repo_slug()` answer a foreign slug,
+    `github_origin()` — the checkout-vs-flag MISMATCH GUARD — return "" (fail open), and `git_dir()` name
+    another repository. A defaulted `env` here closes the whole class, including calls added later; a
+    caller that really needs a specific environment still passes one.
+    """
+    if env is None and cmd and os.path.basename(str(cmd[0])) == "git":
+        env = git_env()
     try:
         # ⛔ `errors="replace"`: a command's non-UTF-8 output is a READING problem, and a UnicodeDecode
         # error here would escape every handler (same class as the boxes.tsv decode above).
         p = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                           timeout=timeout, cwd=cwd)
+                           timeout=timeout, cwd=cwd, env=env)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, "", f"timeout after {timeout}s: {' '.join(cmd[:3])}"
@@ -938,11 +949,26 @@ def local_activate(o: Path, platform: str | None = None) -> str:
     return ""
 
 
-def probe_box(name: str, status_cmd: str, timeout: int = 90) -> dict:
+def probe_box(name: str, status_cmd: str, timeout: int = 90,
+              harness_repo: Path | None = None) -> dict:
+    """Run ONE box's status command. -> its parsed reading.
+
+    ⛔ `harness_repo` IS EXPORTED INTO THE CHILD, AND THAT IS NOT DECORATION (#2679). A box's status
+    command answers a HARNESS identity, so the `origin/main` it compares against must be the HARNESS
+    repo's — and a status command inherits this process's `REPO`, which the fleet sets to the repo the
+    cycle SWEEPS. Measured 2026-10-24 on the hub: `REPO=/tmp/cell-t3` (tortoise) reached a
+    `box-status.sh` whose `ref:` line then compared the agent-infra pin against a TORTOISE main and
+    answered `[unknown]` for a box sitting exactly on the pin. Setting it here fixes every status
+    command — the synthesized local one AND the human-provisioned `boxes.tsv` rows, which nothing else
+    could reach. An explicit `--repo` inside a row's own command still wins: it is the box's own
+    choice about its own probe.
+    """
+    if harness_repo is not None:
+        status_cmd = f"REPO={shell_quote(str(harness_repo))} {status_cmd}"
     rc, out, err = run(["bash", "-c", status_cmd], timeout=timeout)
     text = (out or "") + ("\n" + err if err else "")
     d = {"name": name, "rc": rc, "raw": text, "harness": "", "relation": "", "source": "",
-         "controller": "", "ctrl_pids": [], "roles": "", "readable": True}
+         "controller": "", "ctrl_pids": [], "roles": "", "running": "", "readable": True}
     for line in text.splitlines():
         line = line.strip()
         m = re.match(r"harness:\s*([0-9a-f]{7,40})\s*\[([^\]]+)\]\s*(?:source=(\S+))?", line)
@@ -956,12 +982,55 @@ def probe_box(name: str, status_cmd: str, timeout: int = 90) -> dict:
             # box's own verb failed to perform leaves the OLD process running, and its pid is what
             # tells the two apart (#2603 review: "verified by artifact" accepted one).
             d["ctrl_pids"] = [x for x in re.split(r"[,\s]+", m.group(2) or "") if x.isdigit()]
+        # ⛔ THE TREE THE CONTROLLER **EXECUTES**, WHICH THE PIN DOES NOT SAY. `box-status.sh`
+        # answers both: `harness:`/`pin:` name what the NEXT launch runs (`harness-refresh.sh`
+        # advances the pin for the next launch — the running process keeps executing the tree it
+        # booted from), and `running:` names that tree. Reading only the pin certified a box as
+        # deployed-and-activated while it executed pre-fix code (#2680).
+        m = re.match(r"running:\s*(\S+)\s*$", line)
+        if m:
+            d["running"] = m.group(1).strip().lower()
         m = re.match(r"roles:\s*(.*)$", line)
         if m:
             d["roles"] = m.group(1).strip()
     if rc != 0 or not d["harness"]:
         d["readable"] = False
     return d
+
+
+def activation_gap(d: dict) -> str:
+    """WHY a box that already names this cycle's harness main is not ACTIVATED — "" when it is.
+
+    ⛔ "ACTIVATED" IS THE TREE THE CONTROLLER EXECUTES, NOT THE PIN A FILE NAMES (#2680). Measured on
+    the hub 2026-10-24: the pin and the deployed tree had just been advanced to `f9381dae2ee5`, the
+    live controller (pid 1561548) still exec'd
+    `/tmp/cell-home/harness/f6a1a01772bd/.../orch-loop.sh`, and `harness-refresh.sh` named that state
+    `restart-pending` in its own verdict — while the goal block, reading `controller=RUNNING` off the
+    pin, reported "1/1 box(es) ... deployed AND activated". The one state goal 2 exists to catch (a
+    merge that is not in effect anywhere) was the state it certified as met.
+
+    Six answers, each a fact about the read and never a default:
+      ""                      the controller's argv resolves to this cycle's harness main;
+      `restart-pending(...)`  it resolves to a DIFFERENT commit — the pin advanced, the process did not;
+      `running=NONE`          no controller process was found to ask (the STOPPED reason owns that);
+      `running=UNREADABLE`    a controller is running but its tree could not be resolved;
+      `running=MIXED`         two controllers exec two different trees (a restart mid-flight);
+      `running=NOT-REPORTED`  the box's status command does not answer the question at all.
+
+    ⛔ A STATUS COMMAND THAT DOES NOT ANSWER IS NOT AN ANSWER. `NOT-REPORTED` exists so an older
+    payload (one whose `box-status.sh` predates this line) reads as UNPROVEN here instead of silently
+    counting as activated — the same fail-closed rule the roles read already follows.
+    """
+    if d.get("controller") != "RUNNING":
+        return ""                       # STOPPED already names it; saying it twice is a dup reason
+    run = (d.get("running") or "").strip().lower()
+    if not run:
+        return "running=NOT-REPORTED"
+    if run in ("none", "unreadable", "mixed"):
+        return f"running={run.upper()}"
+    if d.get("harness") and run[:12] != d["harness"][:12]:
+        return f"restart-pending(running={run[:12]})"
+    return ""
 
 
 DEPLOYS = "merge-reminder.deploys"
@@ -1053,7 +1122,8 @@ def _controller_pids(d: dict) -> list[str]:
 
 
 def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
-               dry: bool, act: bool = True, retry_s: int = RETRY_S) -> list[dict]:
+               dry: bool, act: bool = True, retry_s: int = RETRY_S,
+               harness_repo: Path | None = None) -> list[dict]:
     """Question 2 made actionable. Runs AFTER the landing decision by construction (the caller
     passes `dispatched_landing`, and a dispatch in the same cycle suppresses this arm: restarting a
     controller under the rail we just started destroys the run we just paid for).
@@ -1078,9 +1148,10 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
     """
     results: list[dict] = []
     if not main_sha:
-        return [{"box": "<origin/main>", "harness": "", "relation": "", "source": "",
-                 "controller": "", "roles": "", "drift": False, "log": "",
-                 "verdict": "UNREADABLE origin/main — no activation (nothing to compare a box with)"}]
+        return [{"box": "<harness origin/main>", "harness": "", "relation": "", "source": "",
+                 "controller": "", "roles": "", "running": "", "drift": False, "log": "",
+                 "verdict": "UNREADABLE harness origin/main — no activation (nothing to compare a "
+                            "box with)"}]
     try:
         boxes = read_inventory(o)
     except Skipped as e:
@@ -1096,12 +1167,13 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
     held_deploy_lock = False
     try:
         for name, status_cmd, activate_cmd in boxes:
-            d = probe_box(name, status_cmd)
+            d = probe_box(name, status_cmd, harness_repo=harness_repo)
             drift = ((not d["readable"]) or (d["harness"][:12] != main_sha[:12])
                      or (d["relation"] != "current"))
             entry = {"box": name, "harness": d["harness"], "relation": d["relation"],
                      "source": d.get("source", ""), "controller": d["controller"],
-                     "roles": d["roles"], "drift": drift, "verdict": "", "log": ""}
+                     "roles": d["roles"], "running": (d.get("running") or ""),
+                     "drift": drift, "verdict": "", "log": ""}
             if not d["readable"]:
                 entry["verdict"] = f"UNREADABLE harness={d['harness'] or '<none>'} rc={d['rc']}"
                 results.append(entry)
@@ -1151,7 +1223,30 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
                            "no activation of this box is recorded at this pin, so this arm cannot tell "
                            "an operator's stop from its own failed activation and does not start it"))
                 else:
-                    entry["verdict"] = "current"
+                    gap = activation_gap(d)
+                    if gap:
+                        # ⛔ THE PIN SAYS THE VERSION, THE PROCESS SAYS WHETHER IT RUNS. A box whose
+                        # pin already names this cycle's main but whose controller still executes the
+                        # previous tree is the `restart-pending` state `harness-refresh.sh` refuses to
+                        # call current — so this table must not call it `current` either (#2680).
+                        # It is NOT a drift, so no activation is dispatched: the arm restarts a box
+                        # that is on the WRONG commit, and a restart here would kill whatever the live
+                        # controller is mid-flight on to gain a deploy the next launch gets anyway.
+                        # ⛔ "STILL EXECUTES <sha>" IS A READING, so it is only said when a tree was
+                        # READ. For `running=NONE|UNREADABLE|MIXED|NOT-REPORTED` no single executed tree
+                        # exists, and asserting one would be the same defect in the other direction —
+                        # the verdict word and the action are identical either way.
+                        run = (d.get("running") or "").strip().lower()
+                        what = (f"the RUNNING controller still EXECUTES {run[:12]}" if run and
+                                run not in ("none", "unreadable", "mixed") else
+                                "no single executed tree could be read")
+                        entry["verdict"] = (
+                            f"deployed-but-NOT-activated — harness {d['harness'][:12]} [current] is "
+                            f"the pin, but {what} ({gap}). The pin names what the NEXT launch runs; "
+                            f"the restart is what activates this box, and this arm does not restart a "
+                            f"controller that is mid-flight")
+                    else:
+                        entry["verdict"] = "current"
                 results.append(entry)
                 continue
             if dispatched_landing:
@@ -1260,28 +1355,40 @@ def deploy_arm(o: Path, main_sha: str, dispatched_landing: bool, verify_s: int,
             last = None
             while True:
                 time.sleep(min(15, max(1, verify_s // 6)))
-                last = probe_box(name, status_cmd)
+                last = probe_box(name, status_cmd, harness_repo=harness_repo)
                 post_pids = set(_controller_pids(last))
                 # ⛔ NO "BEFORE" PID MEANS A NEW PROCESS CANNOT BE PROVEN. Falling back to "any pid
                 # at all" is exactly wrong here: the pre-read that carries no pid is a box one deploy
                 # BEHIND (an older status command, which is the state this arm exists to fix), and the
                 # pid it then finds is the pre-existing controller the check was added to exclude.
                 fresh = bool(pre_pids) and bool(post_pids - pre_pids)
+                # ⛔ AND THE BOX MUST BE **ACTIVATED**, BY THE SAME PREDICATE THE GOALS USE. Without
+                # this term the verify loop wrote `VERIFIED … controller=RUNNING` for a box whose
+                # controller still executed the OLD tree — a false PASS recorded in the deploy LEDGER
+                # and later quoted back as "our activation at this pin VERIFIED", which stops the arm
+                # repairing a box it itself broke. Reachable in the exact state the comment above names:
+                # a controller that survived a FAILED stop keeps the old tree, the started replacement
+                # supplies the FRESH pid, and the pid satisfies every other term while `box-status.sh`
+                # reports `running: MIXED` (or the old sha). One predicate, both readers (#2680).
+                gap = activation_gap(last)
                 if last["readable"] and last["harness"][:12] == main_sha[:12] \
                         and last["relation"] == "current" and last["controller"] == "RUNNING" \
-                        and fresh:
+                        and fresh and not gap:
                     verified = True
                     break
                 if time.time() >= deadline:
                     break
-            entry["verdict"] = (f"VERIFIED harness={last['harness'][:12]} [current] controller=RUNNING"
+            entry["verdict"] = (f"VERIFIED harness={last['harness'][:12]} [current] controller=RUNNING "
+                                f"running={(last.get('running') or '?')[:12]}"
                                 if verified else
                                 f"UNVERIFIED harness={(last or {}).get('harness', '')[:12] or '<none>'} "
                                 f"relation={(last or {}).get('relation') or '<none>'} "
                                 f"controller={(last or {}).get('controller') or '<none>'} "
+                                f"running={(last or {}).get('running') or '<not reported>'} "
                                 f"pids={(','.join(_controller_pids(last or {})) or '<none>')} "
                                 f"(a NEW pid is required: {','.join(sorted(pre_pids)) or '<none>'} "
-                                f"before)")
+                                f"before"
+                                + (f"; activation: {gap}" if (last and gap) else "") + ")")
             if not record_deploy(o, name, d["harness"], main_sha, entry["verdict"]):
                 entry["verdict"] += (" [⚠️ the deploy ledger could NOT be written — the attempt "
                                      "bound is inert until $O/state is writable]")
@@ -1824,7 +1931,7 @@ def landing_cycle(args, o: Path, slug: str, repo_path: Path, budget: Budget):
 
 # ── the goals (measured BEFORE the PR reads) ───────────────────────────────────────────────
 
-def drift_rows(o: Path, main_sha: str) -> list[dict]:
+def drift_rows(o: Path, main_sha: str, harness_repo: Path | None = None) -> list[dict]:
     """Where each box's harness stands WITHOUT ACTING — the cheap half of the deploy arm.
 
     ⛔ MEASURED FIRST, BEFORE THE PR READS. The goals are what the PR queue is FOR, and a cycle that
@@ -1874,7 +1981,7 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
         # OWN moment-of-action probe — that reading gates an activation, and a cached one would be
         # evidence from minutes ago — which is why the two can disagree within one report: the deploy
         # table is the later, authoritative read.
-        d = probe_box(name, status_cmd, timeout=15)
+        d = probe_box(name, status_cmd, timeout=15, harness_repo=harness_repo)
         # ⛔ `read_inventory` SYNTHESISES a one-row "local" fleet when `boxes.tsv` is absent, so
         # MARKERS-HOLD could be printed over a ONE-BOX read while goal 2 says "the local box AND all
         # three cmux cells" — and nothing distinguished "a one-box fleet" from "the inventory is
@@ -1902,9 +2009,17 @@ def drift_rows(o: Path, main_sha: str) -> list[dict]:
                 reasons.append("source=stamp(seeded, not running)")
             if d["controller"] != "RUNNING":
                 reasons.append(f"controller={d['controller'] or '<unread>'}")
+            # ⛔ AND THE ACTIVATION TERM, WHICH IS THE TREE THE CONTROLLER EXECUTES (#2680). Only
+            # asked when nothing else already explains the row: a box that is behind says WHY it is
+            # behind, and a second reason about a tree that is older by definition is noise in the
+            # sentence the owner acts on.
+            if not reasons:
+                gap = activation_gap(d)
+                if gap:
+                    reasons.append(gap)
         rows.append({"box": name, "harness": d["harness"][:12], "relation": d["relation"],
                      "source": d.get("source", ""), "controller": d["controller"],
-                     "roles": d["roles"], "readable": bool(d["readable"]),
+                     "roles": d["roles"], "running": (d.get("running") or ""), "readable": bool(d["readable"]),
                      "on_pin": bool(d["readable"] and not reasons), "reasons": reasons,
                      "inventory": "file" if (o / "state" / "boxes.tsv").is_file() else "absent",
                      "note": ""})
@@ -1936,7 +2051,8 @@ def _drift_text(rows: list[dict]) -> str:
 
 
 def goal_progress(drift: list[dict], budget: Budget, slug: str,
-                  skipped: str = "", main_sha: str = "") -> tuple[list[str], list[str]]:
+                  skipped: str = "", main_sha: str = "",
+                  main_why: str = "") -> tuple[list[str], list[str]]:
     """Measure BOTH goals. -> (the readings as markdown lines, what to do IN GOAL ORDER).
 
     ⛔ A COUNT THAT COULD NOT BE READ IS `NOT-MEASURED`, NEVER `0`. Zero is a claim ("there are
@@ -2002,7 +2118,7 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
     compared = (bool(drift) and not placeholder and bool(main_sha)
                 and all(r.get("readable") for r in drift))
     why_not_compared = (
-        "`origin/main` was unreadable" if not main_sha else
+        (main_why or "the harness repo's `origin/main` was unreadable") if not main_sha else
         "the box inventory could not be read" if any(r.get("inventory") == "unread" for r in drift) else
         "the inventory exists and lists NO boxes" if any(
             r.get("inventory") == "empty" for r in drift) else
@@ -2051,8 +2167,8 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
         f"  queue ({slug}): open PRs={qo} · merged today={qm}",
     ]
     if not main_sha:
-        lines.append("  ⚠️ harness: `origin/main` could not be read, so 'the same version everywhere' "
-                     "cannot be asserted at all")
+        lines.append("  ⚠️ harness: " + (main_why or "the harness repo's `origin/main` could not be "
+                     "read") + ", so 'the same version everywhere' cannot be asserted at all")
     if local_only:
         lines.append("  ⚠️ harness: no `state/boxes.tsv` — only THIS box was probed; the cells were "
                      "never read, so this is not 'the fleet is on the pin'")
@@ -2164,7 +2280,8 @@ def goal_progress(drift: list[dict], budget: Budget, slug: str,
 def compose(md: Path, slug: str, main_sha: str, budget: Budget,
             landing: list[dict], deploy: list[dict], skipped: str, line: str,
             goal_lines: list[str] | None = None,
-            goal_actions: list[str] | None = None) -> str:
+            goal_actions: list[str] | None = None,
+            harness_main: str = "") -> str:
     """Write the reminder file. -> "" on success, the failure reason otherwise (the caller turns it
     into a SKIPPED cycle: the file IS the deliverable)."""
     rows = []
@@ -2182,6 +2299,7 @@ def compose(md: Path, slug: str, main_sha: str, budget: Budget,
     body = f"""# Merge reminder — {now_iso()}
 
 **Target:** `{slug}` · **origin/main:** `{main_sha[:12] or 'UNREADABLE'}` ·
+**harness main:** `{(harness_main or 'UNRESOLVED')[:12]}`{'' if (not harness_main or harness_main == main_sha) else f' (the harness repo\'s `origin/main` — what goal 2 compares a box against, NOT `{slug}`\'s)'} ·
 **REST:** {budget.calls}/{REST_BUDGET} metered (+1 exempt `rate_limit`) ·
 **search:** {budget.search_calls}/{GOAL_SEARCH_BUDGET} (the goal readings; a SEPARATE quota) ·
 **core:** {(str(budget.core_remaining) + '/' + str(budget.core_limit)) if budget.core_limit else 'UNREADABLE (rate_limit was not reached)'}
@@ -2486,18 +2604,151 @@ def github_origin(repo_path: Path) -> str:
 def repo_path_of(o: Path) -> Path:
     explicit = os.environ.get("REPO")
     cands = [explicit] if explicit else []
-    cands += [str(Path(__file__).resolve().parents[2]), str(Path.home() / "orchestrator")]
+    # ⛔ THE SAME SHALLOW-COPY CRASH AS `script_checkout` (PR #2683 round-1 review). `parents[2]` raises
+    # IndexError on a copy with fewer than three parents, and this line runs INSIDE the cycle's try — so
+    # the traceback escaped as "no report written at all", the one failure mode the OSError handlers
+    # exist to prevent. It was found by the verifier AFTER the guard was added to `harness_repo_of`,
+    # because a mutation run had restored a pre-guard copy: the fix is only real once both call sites
+    # use it, and only a read of the file (not a memory of the patch) shows that.
+    cands += [str(script_checkout() or ""), str(Path.home() / "orchestrator")]
     for c in cands:
         if c and run(["git", "-C", c, "rev-parse", "--git-dir"], timeout=15)[0] == 0:
             return Path(c).resolve()
     return Path.cwd()
 
 
+def git_dir(path: Path) -> str:
+    """The ABSOLUTE git dir of `path` — the identity two checkouts are compared by.
+
+    ⛔ NOT the toplevel and NOT the path: a linked worktree has its own gitdir but shares the repo, so
+    `/tmp/cell-ai` and `/tmp/cell-home/harness` are the SAME repo while their toplevels differ. That is
+    the comparison this file needs (two paths, one `origin/main`), and comparing paths instead made the
+    reminder read a second, independent main for a checkout that was the same repo — a divergence
+    source of exactly the kind the one-read rule exists to remove.
+    """
+    rc, out, _ = run(["git", "-C", str(path), "rev-parse", "--absolute-git-dir"], timeout=15)
+    return (out or "").strip() if rc == 0 else ""
+
+
+def script_checkout() -> Path | None:
+    """`Path(__file__).parents[2]`, BOUNDED — the harness checkout this script lives in.
+
+    ⛔ `parents[2]` RAISES IndexError ON A SHALLOW COPY. A deployed flat copy at `/tmp/mr.py` has two
+    parents, and indexing the third escaped as a traceback with no report written at all — the same
+    "no deliverable" failure the OSError handlers exist to prevent, from an expression that reads as a
+    constant. A script outside any checkout has no checkout, which is a state to answer (None), not to
+    crash on.
+    """
+    ps = Path(__file__).resolve().parents
+    return ps[2] if len(ps) > 2 else None
+
+
+MANIFEST_MARKER = "scripts/orchestrator-harness/box-status.sh"
+
+
+def harness_repo_of(o: Path) -> Path | None:
+    """The checkout the DEPLOYED harness belongs to — the repo goal 2's "same version" means.
+
+    ⛔ TWO MAINS, AND THEY ARE NOT INTERCHANGEABLE (#2679). `repo_path_of` answers "which repo does this
+    cycle SWEEP" — its `origin/main` is the right comparison for the PR and claim gates, because those
+    refs live in the swept repo. The harness, however, is an agent-infra artifact: a box's harness sha
+    can ONLY be compared with agent-infra's main. Measured on the hub 2026-10-24 with the sweep repo set
+    to a tortoise checkout (`REPO=/tmp/cell-t3`, the fleet's default shape for two of its cells): the
+    goal read `local=f9381dae2ee5 [unknown] — a different commit from this cycle's main (0/1 ...)` and
+    ordered a deploy against `main=5f40d832c254`, which is a TORTOISE commit — an instruction to deploy
+    the harness at a sha that does not exist in agent-infra. Pointed at the harness repo the same box
+    reads `[current]`.
+
+    Resolution: `HARNESS_REPO` first (the variable the fleet's supervisor already exports), then the
+    checkout containing `$O`, then the checkout containing THIS script, then the conventional
+    `$HOME/orchestrator` — and each candidate must CARRY THE HARNESS, meaning
+    `scripts/orchestrator-harness/box-status.sh` is TRACKED by that candidate's own repo (see the
+    round-3 note on the tracked check below), so a candidate that is merely some checkout is skipped.
+    """
+    # ⛔ FOUR CANDIDATES, BECAUSE THE TIMER EXPORTS NONE OF THE FIRST TWO. Measured (round-1 review of
+    # PR #2683): the timer this file installs exports only `O`/`HOME`/`PATH` (see the timer installer),
+    # and `--o` defaults to `$HOME/orchestrator` — which on the hub is NOT a checkout. So a resolution
+    # that consulted `HARNESS_REPO` and `$O` alone returned None in the DEFAULT and TIMER
+    # configurations, the caller fell back to the swept repo's main, and the report printed
+    # `**harness main:** 5f40d832c254` — a tortoise sha labelled as the harness main — over the very
+    # #2679 reading this change exists to remove. The third candidate fixes that: this script lives
+    # inside the harness payload (`$O/scripts/orchestrator-harness/merge-reminder.py`, and the same
+    # relative position in a repo checkout), so `parents[2]` IS the harness checkout. The fourth is the
+    # conventional location, kept only because it is the documented `--o` default.
+    #
+    # ⛔ AND A CANDIDATE MUST PROVE IT **IS** THE HARNESS REPO, NOT MERELY THAT IT IS A CHECKOUT (#2683
+    # round 2). `git rev-parse --show-toplevel` succeeding says "a repo", and two of the four candidates
+    # are paths an operator or a deploy script chose: `$O` (a flat payload can land anywhere) and
+    # `$HOME/orchestrator` (measured on this fleet as a TORTOISE checkout, `origin/main=5f40d832c254`).
+    # Accepting either on a checkout test alone brought #2679 back in full — and SILENTLY, because when
+    # that wrong repo happens to be the SWEPT repo the caller sees "same repo" and reuses the swept
+    # main, which is precisely the foreign-sha comparison the goal must never make. So a candidate
+    # qualifies only if it CARRIES THE HARNESS. That is an offline, local fact about the tree — never a
+    # remote URL, which forks legitimately change.
+    #
+    # ⛔ THE MARKER MUST BE **TRACKED**, NOT MERELY PRESENT (round-3 review of PR #2683, BLOCKING). A
+    # PATH-existence test re-admitted the tortoise repo for the shape this fleet actually runs: the
+    # canonical tortoise/eldato checkout carries a GITIGNORED `scripts -> $AGENT_INFRA_PATH/scripts`
+    # pointer (this repo's AGENTS.md, #9475), so `scripts/orchestrator-harness/box-status.sh` EXISTS in
+    # every such checkout through it. Measured on `/tmp/cell-wt-greenmain` (origin = tortoise.git):
+    # `is_file()` true, and the resolution returned that repo with a TORTOISE `origin/main`
+    # (`49dca29bb124…`) — #2679 in full, for the shape two of the fleet's cells run. The candidate's OWN
+    # repo is asked, and the question is about the INDEX ENTRY: `git ls-files -s` gives `<mode> <object>
+    # <stage>\t<path>`, and only a regular blob recorded at the exact path is the harness file. A
+    # path-existence test follows the pointer; `--error-unmatch` alone is a PATHSPEC match, satisfied by a
+    # mode-120000 symlink and by a tracked file BESIDE a directory of that name (both measured accepted).
+    # ⛔ AND THE PROBE MUST NOT INHERIT A GIT ENVIRONMENT (round-6 review, measured: with
+    # `GIT_DIR=<harness>/.git` in the environment, `git -C <a non-harness checkout> ls-files` answered from
+    # the HARNESS's index, so the non-harness repo was accepted and its main measured as the harness main).
+    # A probe describes the directory it is pointed at; the variables are dropped for these reads only.
+    genv = git_env()
+    here = script_checkout()
+    cands = [os.environ.get("HARNESS_REPO") or "", str(o), str(here or ""),
+             str(Path.home() / "orchestrator")]
+    for c in cands:
+        if not c:
+            continue
+        rc, out, _ = run(["git", "-C", c, "rev-parse", "--show-toplevel"], timeout=15, env=genv)
+        top = (out or "").strip()
+        if rc != 0 or not top:
+            continue
+        # A TRACKED SYMLINK IS NOT THE HARNESS: `ls-files --error-unmatch` is satisfied by a mode-120000
+        # entry too, so a repo that ships no harness bytes would be taken for the harness repo and its own
+        # main measured against (round-4 review follow-up, measured). And the PATH must match exactly
+        # (round-5 follow-up): a pathspec also matches a tracked file BESIDE a directory of that name.
+        rc2, entry, _ = run(["git", "-C", top, "ls-files", "-s", "--error-unmatch", "--",
+                             MANIFEST_MARKER], timeout=15, env=genv)
+        line = (entry or "").strip().splitlines()[0] if (entry or "").strip() else ""
+        head, _, ipath = line.partition("\t")          # `<mode> <object> <stage>\t<path>`
+        mode = head.split(" ", 1)[0] if head else ""
+        if rc2 == 0 and mode in ("100644", "100755") and ipath.strip() == MANIFEST_MARKER:
+            return Path(top)
+    return None
+
+
+# ⛔ NO INHERITED GIT ENVIRONMENT, FOR ANY READ (round-7 review note, then measured). `GIT_DIR`,
+# `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES` and
+# `GIT_COMMON_DIR` (measured in round 8: with THAT one set, `repo_slug()`/`github_origin()` answered a
+# FOREIGN slug for an agent-infra-origin repo, so the mismatch guard failed open again) all
+# redirect `git -C <path>` at ANOTHER repository, so a cycle launched from a shell that exports one would
+# read a foreign main/index/repo and print it as this repo's — the #2679/#2680 false-reading class,
+# reached through the environment rather than through a path. Every git invocation this file makes goes
+# through this env; a probe describes the directory it was POINTED AT, never the caller's.
+GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR")
+
+
+def git_env() -> dict:
+    """The environment for a git read: ours, minus every variable that relocates the repository."""
+    return {k: v for k, v in os.environ.items() if k not in GIT_ENV_DROP}
+
+
 def main_sha(repo_path: Path) -> str:
     """`origin/main` read WITHOUT a fetch: the question is "what has merged", and the timer must not
     spend a network round trip on it. An unreadable ref is returned as "" and REPORTED — never
     treated as "up to date" (that is the false-green this whole file exists against)."""
-    rc, out, _ = run(["git", "-C", str(repo_path), "rev-parse", "--verify", "origin/main"], timeout=15)
+    rc, out, _ = run(["git", "-C", str(repo_path), "rev-parse", "--verify", "origin/main"], timeout=15,
+                     env=git_env())
     if rc != 0:
         return ""
     return (out or "").strip()
@@ -2585,6 +2836,13 @@ def main(argv=None) -> int:
     budget = Budget("gh")          # replaced once gh resolves; carries the header's numbers
     dispatched = False
     main = ""
+    # ⛔ BOTH MAINS EXIST FROM THE FIRST LINE OF THE CYCLE. `hmain` is assigned inside the try (it needs
+    # the repo resolution that the MISMATCHED-repo REFUSE raises out of), and the goal block runs on the
+    # REFUSAL path too — so an unset name there turned a clean `STANDING=NOT-MEASURED (MISMATCHED repo…)`
+    # into an UnboundLocalError with no report written (caught by §28's mismatch test, which is the
+    # only path that reaches the goal block with the resolution never run).
+    hmain = ""
+    main_why = ""
     slug = args.repo or "<unresolved>"
     drift: list[dict] = []
     goal_lines: list[str] = []
@@ -2607,6 +2865,28 @@ def main(argv=None) -> int:
         # ⛔ ONE READ, BEFORE ANYTHING THAT COMPARES AGAINST IT. The goal block, the deploy table,
         # the header and `--json` all consume THIS value; there is no later read to diverge from it.
         main = origin_main(repo_path)
+        # ⛔ THE HARNESS MAIN IS ITS OWN READ, AND ONLY WHEN IT IS A DIFFERENT REPO (#2679). Goal 2
+        # compares harness shas, which are agent-infra commits, against "the same version everywhere"
+        # — so the comparison must use the HARNESS repo's `origin/main`, never the swept repo's. When
+        # the two are the same repo (the normal agent-infra sweep) this REUSES the single read, so the
+        # one-read discipline is untouched and there is no second value to diverge from.
+        hrepo = harness_repo_of(o)
+        if hrepo is None:
+            # ⛔ UNRESOLVED IS NOT "THE SWEPT REPO". The first cut defaulted `hmain` to the swept repo's
+            # main whenever the harness repo could not be resolved, so the goals compared a harness sha
+            # against a foreign main AND the header printed that foreign sha under a `**harness main:**`
+            # label — an assertion about a read that never happened, in the block the owner acts on.
+            hmain = ""
+            main_why = ("the harness repo could not be resolved (no `HARNESS_REPO`, no checkout beside "
+                        "`$O`, and none containing this script)")
+        elif git_dir(hrepo) and git_dir(hrepo) == git_dir(repo_path):
+            hmain = main          # ONE repo, ONE read: the one-read discipline is untouched here
+            main_why = ""
+        else:
+            hmain = origin_main(hrepo)
+            main_why = ""
+            if not hmain:
+                main_why = "the harness repo's `origin/main` was unreadable"
         budget = Budget(resolve_gh(o))
         budget.rate_limit()
         # ⛔ ORDER: DRIFT → THE TWO GOALS → THE PR READS (owner's ask, 2026-10-24).
@@ -2615,8 +2895,9 @@ def main(argv=None) -> int:
         # measured" — a reminder that reported on PRs and forgot what the PRs are for. Drift is a
         # LOCAL artifact read (no REST), the goals spend the SEARCH quota (a different bucket), so
         # neither can starve the landing arm's documented `REST_BUDGET`.
-        drift = drift_rows(o, main)
-        goal_lines, goal_actions = goal_progress(drift, budget, slug, main_sha=main)
+        drift = drift_rows(o, hmain, harness_repo=hrepo)
+        goal_lines, goal_actions = goal_progress(drift, budget, slug, main_sha=hmain,
+                                                 main_why=main_why)
         landing, dispatched = landing_cycle(args, o, slug, repo_path, budget)
     except Skipped as e:
         skipped = str(e)
@@ -2635,14 +2916,15 @@ def main(argv=None) -> int:
         # whole file exists to prevent.
         goal_lines, goal_actions = goal_progress(
             drift, budget, slug,
-            skipped=skipped or "the cycle did not reach the goal read", main_sha=main)
+            skipped=skipped or "the cycle did not reach the goal read", main_sha=hmain,
+            main_why=main_why)
     if not skipped:
         # The deploy arm runs AFTER the landing decision, and a landing dispatched this cycle
         # DEFERS it: restarting a controller under the rail we just started destroys that run.
         # `args.act` is passed because `--no-act` is the INSPECT mode and it covers both arms.
         try:
-            deploy = deploy_arm(o, main, dispatched, args.verify_deploy_s, args.dry_run,
-                                args.act, args.retry_s)
+            deploy = deploy_arm(o, hmain, dispatched, args.verify_deploy_s, args.dry_run,
+                                args.act, args.retry_s, harness_repo=hrepo)
         except (Skipped, OSError) as e:
             # The deploy arm can refuse a whole cycle (a malformed inventory) or hit an environment
             # error. Neither may leave the deliverable unwritten — say it in the table instead.
@@ -2656,7 +2938,7 @@ def main(argv=None) -> int:
     # never compared against (round-4 review, proved with a stub that fails the first reads only).
     line = one_line_of(landing, deploy, skipped, dispatched)
     err = compose(md, slug, main, budget, landing, deploy, skipped, line,
-                  goal_lines, goal_actions)
+                  goal_lines, goal_actions, harness_main=hmain)
     if err:
         # ⛔ THE REMINDER IS THE DELIVERABLE: a cycle whose file could not be written did not run,
         # whatever else it managed to do. Saying "ran" (exit 0) over a missing file is the same
@@ -2667,7 +2949,8 @@ def main(argv=None) -> int:
 
     if args.json:
         print(json.dumps({
-            "ts": now_iso(), "repo": slug, "main": main, "skipped": skipped,
+            "ts": now_iso(), "repo": slug, "main": main, "harness_main": hmain,
+            "skipped": skipped,
             "rest_calls": budget.calls, "rest_budget": REST_BUDGET,
             "core": {"remaining": budget.core_remaining, "limit": budget.core_limit},
             "search_calls": budget.search_calls, "search_budget": GOAL_SEARCH_BUDGET,
@@ -2678,6 +2961,7 @@ def main(argv=None) -> int:
             "drift": [{"box": r["box"], "harness": r["harness"],
                        "relation": r["relation"], "readable": r["readable"],
                        "source": r.get("source", ""), "controller": r.get("controller", ""),
+                       "running": r.get("running", ""),
                        "on_pin": bool(r.get("on_pin")), "reasons": list(r.get("reasons") or []),
                        "inventory": r.get("inventory", ""), "note": r.get("note", "")}
                       for r in drift],
