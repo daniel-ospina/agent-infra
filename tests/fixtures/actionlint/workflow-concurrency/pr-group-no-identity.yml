@@ -1,0 +1,13 @@
+# FAILURE-CLASS FIXTURE (R1): per-ref but WITHOUT this workflow's own identity — a second
+# workflow on the same PR (any file that writes the same group) cancels this one.
+name: pr-group-no-identity
+on:
+  pull_request:
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
