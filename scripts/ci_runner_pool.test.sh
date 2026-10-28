@@ -1178,16 +1178,23 @@ out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-none)"
 assert_eq "$?" "0" "restart of an instance with no .env is unaffected"
 assert_omits "$out" "created tmpdir=" "no directory is invented"
 
-# ── (3) a RELATIVE value resolves against the INSTANCE dir ─────────────────────────────────
-# `run.sh` `cd`s to the instance dir before the listener reads TMPDIR, so a relative value means a
-# path UNDER that dir. Creating it anywhere else would make a directory the runner never uses.
-echo "── tmpdir: a relative value resolves under the instance dir ──"
+# ── (3) a RELATIVE value is REFUSED, because no directory here could be the one a job uses ──
+# ⛔ `run.sh` `cd`s to the instance dir before the listener READS TMPDIR — but the listener hands that
+# value to each JOB, whose working directory is `_work/<repo>/<repo>`. So `TMPDIR=scratch-here`
+# resolves under the WORKSPACE, not the instance dir: creating `$d/scratch-here` (what this case used
+# to assert as success) made a directory no job ever used, while the run printed `created tmpdir=…`,
+# exited 0, and `status` called the row clean — a false PASS in the dimension this arm adds. The
+# value is the listener's, not ours, so it is refused and the remedy is named (#3004 review, P2).
+echo "── tmpdir: a relative value is refused, not resolved somewhere a job never looks ──"
 fresh_pool tmprel; reset_logs
 register pi-runner-rel
 printf 'TMPDIR=scratch-here\n' >"$RUNNER_ROOT/pi-runner-rel/.env"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-rel)"
-assert_eq "$?" "0" "restart succeeds with a relative TMPDIR"
-if [ -d "$RUNNER_ROOT/pi-runner-rel/scratch-here" ]; then ok "it was created under the instance dir"; else bad "it was not created under the instance dir"; fi
+assert_eq "$?" "2" "restart refuses a relative TMPDIR (rc 2) instead of starting on a guess"
+assert_contains "$out" "cannot-act why=tmpdir-value-relative" "naming the shape it refused"
+assert_contains "$out" "value=scratch-here" "and the value it read"
+assert_absent "$RUNNER_ROOT/pi-runner-rel/scratch-here" "no instance-dir directory was invented for it"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-rel") ))" "0" "and nothing was started"
 
 # ── (4) FAIL CLOSED: a target that CANNOT be created starts nothing ────────────────────────
 # ⛔ The failure being prevented IS "the listener starts anyway". Starting it here would reproduce the
@@ -1312,10 +1319,47 @@ assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-exp") ))" "0" "nothing wa
 fresh_pool tmpcmt; reset_logs
 register pi-runner-cmt
 printf 'TMPDIR=%s/pi-runner-cmt/tmp  # scratch\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-cmt/.env"
-out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-cmt)"
-assert_eq "$?" "2" "a trailing comment is refused too (the listener would see only the first word)"
-assert_omits "$out" "created tmpdir=" "and it claims no creation it cannot honour"
-assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-cmt") ))" "0" "nothing was started"
+: >"$TMPLOG"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-cmt)"
+assert_eq "$?" "0" "a trailing comment is TOLERATED — an unquoted assignment ends at the whitespace"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-cmt/tmp (named by" "so the value BEFORE the comment is created"
+assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-cmt/tmp" "and that is the path the listener inherits"
+assert_absent "$RUNNER_ROOT/pi-runner-cmt/tmp  # scratch" "no directory whose NAME carries the comment was made"
+
+# ── (9b) LEGAL VALUES THE OLD REFUSAL TOOK WITH IT ──────────────────────────────────────────
+# ⛔ The previous shape stripped quotes FIRST and then refused the remainder for whitespace/`$`/`~`,
+# i.e. it removed exactly the characters that had made the value legal. A quoted path with a SPACE
+# and a single-quoted `$` are values the sourcing listener honours EXACTLY, yet both were `cannot-act`,
+# so `restart` — the remedy `status` prints — started NOTHING on a legal `.env` (#3004 review, P2).
+echo "── tmpdir: a quoted path with a space, and a single-quoted dollar, are ACCEPTED ──"
+fresh_pool tmpq; reset_logs
+register pi-runner-q
+printf 'TMPDIR="%s/pi-runner-q/dir with space"\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-q/.env"
+: >"$TMPLOG"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-q)"
+assert_eq "$?" "0" "a double-quoted path containing a space is accepted"
+if [ -d "$RUNNER_ROOT/pi-runner-q/dir with space" ]; then ok "and the directory is created with that name"; else bad "the space-bearing directory was not created"; fi
+assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-q/dir with space" "and the listener inherits it"
+fresh_pool tmpq2; reset_logs
+register pi-runner-q2
+printf "TMPDIR='%s/pi-runner-q2/\$lit'\n" "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-q2/.env"
+: >"$TMPLOG"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-q2)"
+assert_eq "$?" "0" "a single-quoted value containing a dollar is accepted (single quotes are LITERAL)"
+if [ -d "$RUNNER_ROOT/pi-runner-q2/\$lit" ]; then ok "the literal-dollar directory is created, not an expanded one"; else bad "the literal-dollar directory was not created"; fi
+
+# ── (9c) AN UNTERMINATED QUOTE NAMES NO PATH ────────────────────────────────────────────────
+# `TMPDIR="/tmp/x` has no closing quote, so the string written is not a path the listener resolves.
+# The old code created a directory literally named after the stray quote — a false success.
+echo "── tmpdir: an unterminated quote is refused, not turned into a directory ──"
+fresh_pool tmpuq; reset_logs
+register pi-runner-uq
+printf 'TMPDIR="/tmp/unterminated\n' >"$RUNNER_ROOT/pi-runner-uq/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-uq)"
+assert_eq "$?" "2" "an unterminated quote is cannot-act (rc 2)"
+assert_contains "$out" "cannot-act why=tmpdir-value-unterminated-quote" "naming the shape"
+assert_absent "$RUNNER_ROOT/pi-runner-uq/\"" "no directory named after the stray quote was created"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-uq") ))" "0" "nothing was started"
 
 # ── (10) `export TMPDIR=` IS THE SAME ASSIGNMENT TO A SOURCING SHELL ─────────────────────
 # `. ./.env` honours `export TMPDIR=…`; requiring a bare `TMPDIR=` made the assignment invisible to BOTH
@@ -1382,6 +1426,81 @@ else
 fi
 chmod 700 "$RUNNER_ROOT/pi-runner-unw/tmp"
 
+# ── (13b) WRITE IS NOT SEARCH: mode 200 has `-w` and NO `-x`, and `mktemp` fails in it ─────
+# ⛔ `[ -w ]` alone returned 0 SILENTLY — no `created`, no `cannot-act` — over a TMPDIR `mktemp` fails
+# in (measured: rc 1), which is the false PASS the function's header says it refuses. Case (13) cannot
+# see it: mode 500 has no WRITE bit, so it exercises the arm that was already there.
+echo "── tmpdir: a target with WRITE but no SEARCH refuses (mode 200) ──"
+fresh_pool tmpsrch; reset_logs
+register pi-runner-srch
+mkdir -p "$RUNNER_ROOT/pi-runner-srch/tmp"; chmod 200 "$RUNNER_ROOT/pi-runner-srch/tmp"
+printf 'TMPDIR=%s/pi-runner-srch/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-srch/.env"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "a search-bit-only defect (root bypasses the execute bit)"
+else
+  out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-srch)"
+  assert_eq "$?" "2" "a target with no SEARCH bit is cannot-act (rc 2), not a silent success"
+  assert_contains "$out" "cannot-act why=tmpdir-unwritable" "and it says which bit is missing"
+  assert_contains "$out" "w=y x=n" "naming the two readings that disagree"
+  assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-srch") ))" "0" "NO listener was started"
+fi
+chmod 700 "$RUNNER_ROOT/pi-runner-srch/tmp"
+
+# ── (13c) THE LIVE ARM MAY NOT CREATE A DIRECTORY IN ANOTHER USER'S NAME ─────────────────────
+# ⛔ The owner claim (`created BY THE USER THAT WILL RUN THE LISTENER`) holds for the START path only.
+# A LIVE listener may belong to another user — the systemd unit that survived the reboot started it —
+# so a mode-700 directory made by an operator running this as root would belong to ROOT: the runner
+# could not write it, jobs would still die (EACCES instead of ENOENT), `[ -w ]` is trivially true for
+# root and `status` tests existence only, so every instrument would call the row clean. pid 1 is a
+# real live process owned by a DIFFERENT user on every non-root host, which is the whole guard.
+echo "── tmpdir: the live arm refuses to create a TMPDIR owned by another user ──"
+fresh_pool tmpown; reset_logs
+register pi-runner-own
+register pi-runner-own-shim
+printf 'TMPDIR=%s/pi-runner-own/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-own/.env"
+printf 'TMPDIR=%s/pi-runner-own-shim/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-own-shim/.env"
+# ⛔ TWO CONDITIONS MAKE THIS UNTESTABLE HERE, AND BOTH ARE `skip`, NOT A SILENT PASS: a root shell
+# owns every process it could compare against, and a container's pid 1 IS the invoking user. The
+# comparison below is run against the REAL `ps` (`$BIN` is dropped from PATH) because this suite
+# deliberately replaces `ps` with a table shim — and the guard is written to treat a shim-shaped read
+# as "no mismatch proven", so asserting the refusal through the stub would pin the opposite.
+if [ "$(id -u)" -eq 0 ]; then
+  skip "an owner mismatch (a root shell owns every process it can compare against)"
+elif [ "$(PATH=/usr/bin:/bin:/usr/sbin:/sbin ps -o user= -p 1 2>/dev/null | tr -d '[:space:]')" = "$(id -un)" ]; then
+  skip "an owner mismatch (pid 1 in this container already runs as $(id -un))"
+else
+  # Reach the shipped functions directly, EXTRACTED VERBATIM (never a re-typed copy): `main` runs only
+  # at the bottom of the script, so extracting the two functions is how a unit-level arm is asserted.
+  own_out="$(POOL="$POOL" ROOT="$RUNNER_ROOT" PATH=/usr/bin:/bin:/usr/sbin:/sbin bash -c '
+    eval "$(sed -n "/^instance_tmpdir() {/,/^}/p" "$POOL")"
+    eval "$(sed -n "/^ensure_tmpdir() {/,/^}/p" "$POOL")"
+    err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
+    ensure_tmpdir "$ROOT/pi-runner-own" 1
+  ' 2>&1)"
+  assert_contains "$own_out" "cannot-act why=tmpdir-owner-mismatch" "the live arm refuses an owner it cannot be"
+  assert_contains "$own_out" "pid=1 runs as user=" "naming the live listener it compared"
+  assert_absent "$RUNNER_ROOT/pi-runner-own/tmp" "and it created nothing under the wrong owner"
+  POOL="$POOL" ROOT="$RUNNER_ROOT" PATH=/usr/bin:/bin:/usr/sbin:/sbin bash -c '
+    eval "$(sed -n "/^instance_tmpdir() {/,/^}/p" "$POOL")"
+    eval "$(sed -n "/^ensure_tmpdir() {/,/^}/p" "$POOL")"
+    err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
+    ensure_tmpdir "$ROOT/pi-runner-own"
+  ' >/dev/null 2>&1
+  if [ -d "$RUNNER_ROOT/pi-runner-own/tmp" ]; then ok "the START path (no live listener) still creates it"; else bad "the start path stopped creating the directory"; fi
+fi
+# ⛔ AND THE SHIM ITSELF MUST NOT BECOME A REFUSAL: with the fixture's `ps` in PATH (a garbage-shaped
+# table), the live repair still has to go through — the false block this guard would otherwise create
+# on every box whose `ps` is not a real one.
+own_shim="$(POOL="$POOL" ROOT="$RUNNER_ROOT" bash -c '
+  eval "$(sed -n "/^instance_tmpdir() {/,/^}/p" "$POOL")"
+  eval "$(sed -n "/^ensure_tmpdir() {/,/^}/p" "$POOL")"
+  err() { echo "$*"; }; log_line() { echo "$*"; }; DRY=0
+  ensure_tmpdir "$ROOT/pi-runner-own-shim" 1
+' 2>&1)"
+assert_omits "$own_shim" "tmpdir-owner-mismatch" "a shim-shaped ps reading is NOT turned into a refusal"
+if [ -d "$RUNNER_ROOT/pi-runner-own-shim/tmp" ]; then ok "and the live repair still creates the directory under it"; else bad "a shim-shaped ps blocked the repair"; fi
+
+
 # ── MUTATION: removing the creation must break these cases ────────────────────────────────
 # ⛔ A CASE THAT PASSES AGAINST THE MUTANT PINS NOTHING. The copy below is the shipped script with the
 #   creation DEFUSED at its single source — `ensure_tmpdir` returns immediately, so every call site
@@ -1423,7 +1542,7 @@ python3 - "$POOL" "$MUTLIVE" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src, encoding="utf-8").read()
-needle = '    0) ensure_tmpdir "$dir" || return 2\n'
+needle = '    0) ensure_tmpdir "$dir" "$LISTENER_PID" || return 2\n'
 assert text.count(needle) == 1, "the live-arm ensure_tmpdir call moved: update the mutation target"
 open(dst, "w", encoding="utf-8").write(text.replace(needle, '    0)\n'))
 PY

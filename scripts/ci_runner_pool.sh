@@ -540,14 +540,26 @@ probe_listener() {
 #   0, no output    · it names none (the agent-infra `ai-runner-*` shape) — nothing to create
 #   2               · CANNOT MEASURE (unreadable `.env`), or a value no shell-free read can satisfy
 #
-# ⛔ AND THE VALUE MUST BE LITERAL (#3004 review, P1). `run.sh` SOURCES `.env`, so the listener sees
-# the EXPANDED value while a `sed` read sees the raw text: `TMPDIR=$HOME/ci-tmp` had this tool create a
-# directory literally named `$HOME` under the instance dir and print `created tmpdir=…` (rc 0) over a
-# runner that still inherited an ABSENT TMPDIR — a false PASS in the exact dimension this arm adds.
-# The same went for a trailing comment (`…/tmp  # scratch`). A value needing shell evaluation is
-# refused rather than guessed at: the refusal names the value and the remedy, and it starts nothing.
+# ⛔ AND THE VALUE IS PARSED THE WAY A SOURCING SHELL PARSES IT, NOT LIKE A SHELL WORD (#3004 review,
+# P1 + P2). `run.sh` SOURCES `.env`, so the listener sees the EXPANDED value while a `sed` read sees
+# the raw text: `TMPDIR=$HOME/ci-tmp` had this tool create a directory literally named `$HOME` under
+# the instance dir and print `created tmpdir=…` (rc 0) over a runner that still inherited an ABSENT
+# TMPDIR — a false PASS in the exact dimension this arm adds. A value needing shell evaluation is
+# refused rather than guessed at.
+# ⛔ BUT THE REFUSAL MUST NOT TAKE LEGAL VALUES WITH IT. The first shape stripped quotes FIRST and then
+# refused the unquoted remainder for whitespace/`$`/`~`, i.e. it removed exactly the characters that
+# had made the value legal. Measured refusals on values the listener honours EXACTLY:
+# `TMPDIR="/tmp/a b"` (a quoted path with a space) and `TMPDIR='/tmp/a$b'` (single quotes are
+# literal) were both `cannot-act`, so `restart` — the remedy `status` prints — started NOTHING on a
+# legal `.env`; and `TMPDIR=/tmp/x  # scratch` was refused although an unquoted assignment ENDS at
+# the first whitespace, so `/tmp/x` is not a guess but the value. The shell's own rules:
+#   unquoted  · ends at the first whitespace (which is also where a trailing comment starts);
+#               `~` expands ONLY as the FIRST character; `$`/`` ` `` expand
+#   'single'  · everything up to the closing quote is LITERAL — nothing expands
+#   "double"  · spaces are part of the value; `$`/`` ` `` expand; `~` does not
+# Anything whose meaning depends on evaluation is refused, naming the value and the remedy.
 instance_tmpdir() {
-  local d="$1" t
+  local d="$1" raw t
   [ -f "$d/.env" ] || return 0
   # An EXISTING but unreadable `.env` is cannot-measure. `-r` is the read this function actually does
   # (and it is FALSE for a mode-000 file, which `-f` alone happily accepts).
@@ -556,26 +568,56 @@ instance_tmpdir() {
   # honoured too — `. ./.env` accepts it, so requiring a bare `TMPDIR=` made a legal .env invisible to
   # BOTH the creation and the detection. The `2>/dev/null` is gone on purpose: a read that failed must
   # be visible, not silently equal to "names none".
-  t="$(sed -n 's/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}TMPDIR=//p' "$d/.env" | tail -n 1)" || return 2
-  t="${t%$'\r'}"   # a `.env` edited on a CRLF host would otherwise name a path with a CR in it
-  case "$t" in     # strip ONE layer of matching quotes; the value is a path, not a shell word
-    \"*\") t="${t#\"}"; t="${t%\"}" ;;
-    \'*\') t="${t#\'}"; t="${t%\'}" ;;
+  raw="$(sed -n 's/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}TMPDIR=//p' "$d/.env" | tail -n 1)" || return 2
+  raw="${raw%$'\r'}"   # a `.env` edited on a CRLF host would otherwise name a path with a CR in it
+  case "$raw" in
+    \'*)
+      # A closing quote is part of the value's MEANING — without it the string written is not the path
+      # the listener resolves, so an unterminated one is refused rather than turned into a directory.
+      case "${raw#\'}" in
+        *\'*) t="${raw#\'}"; t="${t%%\'*}" ;;
+        *) err "cannot-act why=tmpdir-value-unterminated-quote value=$raw (named by $d/.env) — single quotes are taken LITERALLY by the listener, so nothing but a closing quote makes this a path; write the path, or close the quote, in $d/.env"
+           return 2 ;;
+      esac ;;
+    \"*)
+      case "${raw#\"}" in
+        *\"*) t="${raw#\"}"; t="${t%%\"*}" ;;
+        *) err "cannot-act why=tmpdir-value-unterminated-quote value=$raw (named by $d/.env) — a double-quoted value ends at its closing quote, so this names no path; write the path, or close the quote, in $d/.env"
+           return 2 ;;
+      esac
+      # INSIDE double quotes a `$` or a backtick IS expanded by the sourcing listener, so it still
+      # cannot be honoured from the raw text; a space or a `~` inside them is LITERAL.
+      case "$t" in
+        *'$'*|*'`'*)
+          err "cannot-act why=tmpdir-value-not-literal value=$raw (named by $d/.env) — the listener SOURCES .env, so this value is expanded there and cannot be satisfied from the raw text; write a literal absolute path in $d/.env"
+          return 2 ;;
+      esac ;;
+    *)
+      t="${raw%%[[:space:]]*}"   # an unquoted assignment ENDS at the first whitespace
+      case "$t" in
+        '~'*|*'$'*|*'`'*)
+          err "cannot-act why=tmpdir-value-not-literal value=$t (named by $d/.env) — the listener SOURCES .env, so this value is expanded there and cannot be satisfied from the raw text; write a literal absolute path in $d/.env"
+          return 2 ;;
+      esac ;;
   esac
   [ -n "$t" ] || return 0
-  # A `$`, a backtick or a `~` is EXPANDED by the sourcing listener; whitespace is where a value ends
-  # and a comment begins. None of them can be honoured from the raw text, so none is guessed at.
-  case "$t" in
-    *'$'*|*'`'*|*'~'*|*[[:space:]]*)
-      err "cannot-act why=tmpdir-value-not-literal value=$t (named by $d/.env) — the listener SOURCES .env, so this value is expanded there and cannot be satisfied from the raw text; write a literal absolute path in $d/.env"
-      return 2 ;;
-  esac
-  case "$t" in /*) : ;; *) t="$d/$t" ;; esac
-  printf '%s' "$t"
+  case "$t" in /*) printf '%s' "$t"; return 0 ;; esac
+  # ⛔ A RELATIVE VALUE IS REFUSED, NOT RESOLVED (#3004 review, P2). This arm used to create
+  # `$d/<value>`, on the claim that `run.sh` `cd`s into the instance dir before the listener reads the
+  # variable. That is true of the READ and false at USE: the listener hands the env to each JOB, whose
+  # working directory is `_work/<repo>/<repo>`, so a relative TMPDIR resolves THERE — never under the
+  # instance dir. The directory this arm created was therefore one no job ever used, while it printed
+  # `created tmpdir=…`, exited 0, and `status` called the row clean: a false PASS in the exact
+  # dimension this arm adds. Nothing here can make a relative value true (the value is the listener's,
+  # not ours — rewriting another tool's `.env` is not this function's to do), so it is refused.
+  err "cannot-act why=tmpdir-value-relative value=$t (named by $d/.env) — a relative TMPDIR is resolved against each JOB's working directory (_work/<repo>/<repo>), not the instance dir, so no directory created here would be the one a job uses; write an absolute path in $d/.env"
+  return 2
 }
 
-# ensure_tmpdir <dir> — create the TMPDIR the instance's `.env` names, IDEMPOTENTLY, before the
-# listener is exec'd. rc 0 = satisfiable (created, or already there) · 2 = cannot-act, nothing started.
+# ensure_tmpdir <dir> [live_listener_pid] — create the TMPDIR the instance's `.env` names,
+# IDEMPOTENTLY, before the listener is exec'd. rc 0 = satisfiable (created, or already there) ·
+# 2 = cannot-act, nothing started. The optional pid is the LIVE listener the caller is repairing
+# (the post-reboot arms); it makes the ownership check below possible.
 # ⛔ OWNER AND MODE. The directory is created BY THE USER THAT WILL RUN THE LISTENER, which is the only
 # owner that can be right here: `start_listener` execs `run.sh` as this same process's user, so a
 # `mkdir` needs no chown and cannot pick the wrong one. Mode 700 is what a private per-runner temp dir
@@ -587,7 +629,7 @@ instance_tmpdir() {
 # the verdict either (the `-p` arm can succeed while the target is still not a directory) — the test
 # is that the directory EXISTS and this user can write it, which is what `mktemp` will do next.
 ensure_tmpdir() {
-  local d="$1" t created=0 rc=0 p
+  local d="$1" live_pid="${2:-}" t created=0 rc=0 p lu
   t="$(instance_tmpdir "$d")" || rc=$?
   # cannot-measure (`tmpdir-unreadable`) and a non-literal value are BOTH cannot-act here: the reason
   # was already named by `instance_tmpdir`, so this arm does not invent a second one. Starting the
@@ -595,6 +637,29 @@ ensure_tmpdir() {
   [ "$rc" -eq 0 ] || return 2
   [ -n "$t" ] || return 0
   if [ ! -d "$t" ]; then
+    # ⛔ THE INVOKER IS NOT NECESSARILY THE LISTENER'S USER (#3004 review, P1). The owner claim below
+    # holds for the START path: `start_listener` execs `run.sh` as this same process's user. The LIVE
+    # arms are different — they repair a listener that is ALREADY RUNNING, possibly started by a
+    # systemd unit as another user, which is exactly the post-reboot state. A mode-700 directory
+    # created there by an operator running this as root would belong to root: the runner could not
+    # write it, its jobs would still die (EACCES instead of ENOENT), and every instrument in this file
+    # would call the row clean — `[ -w ]` is trivially true for root and `status` tests existence only.
+    # This tool cannot create a directory in another user's name, so it REFUSES and names both users.
+    # ⛔ Exempt from dry-run: a preview must predict the SAME refusal as the real pass, not a start.
+    if [ -n "$live_pid" ]; then
+      lu="$(ps -o user= -p "$live_pid" 2>/dev/null | tr -d '[:space:]')"
+      # ⛔ ONLY A READING THAT LOOKS LIKE A USER MAY REFUSE. `ps` is a READ this file already treats as
+      # fallible, and this repo's own suite replaces it (`$BIN/ps` models the process table), so a
+      # garbage line must degrade to "no mismatch proven" — NOT to a refusal that would block a legal
+      # repair on every box whose `ps` is a shim. A refusal is only ever minted from a name-shaped read.
+      case "$lu" in
+        ''|*[!A-Za-z0-9_.-]*) lu="" ;;
+      esac
+      if [ -n "$lu" ] && [ "$lu" != "$(id -un 2>/dev/null)" ]; then
+        err "cannot-act why=tmpdir-owner-mismatch path=$t (named by $d/.env) — the live listener pid=$live_pid runs as user=$lu and this pass runs as user=$(id -un 2>/dev/null), so a mode-700 directory created here would belong to the wrong user and every job on it would still die; create it as $lu, or run this pass as $lu"
+        return 2
+      fi
+    fi
     # ⛔ A PREVIEW MAY NOT MUTATE, AND IT MAY NOT LIE (#3004 review, P2). `--dry-run` used to skip this
     # check entirely (it sat downstream of the DRY return), so an uncreatable target previewed as
     # "would start the listener" (rc 0) and then refused for real (rc 2) — the lying preview this file
@@ -603,7 +668,7 @@ ensure_tmpdir() {
     if [ "$DRY" = 1 ]; then
       p="$t"
       while [ ! -e "$p" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do p="$(dirname "$p")"; done
-      if [ -d "$p" ] && [ -w "$p" ]; then
+      if [ -d "$p" ] && [ -w "$p" ] && [ -x "$p" ]; then
         log_line "dry-run: would create tmpdir=$t (named by $d/.env)"
         return 0
       fi
@@ -617,8 +682,14 @@ ensure_tmpdir() {
     }
     created=1
   fi
-  [ -w "$t" ] || {
-    err "cannot-act why=tmpdir-unwritable path=$t (named by $d/.env) — nothing started: the listener would come up healthy and every job on it would die at mktemp"
+  # ⛔ WRITE IS NOT ENOUGH — `mktemp` needs SEARCH too (#3004 review, P2). `[ -w ]` is true for a
+  # mode-200 directory, and `mktemp` in that same directory fails (measured: rc 1), so a `-w`-only
+  # verdict returned 0 SILENTLY — no `created`, no `cannot-act` — over a TMPDIR every job dies in:
+  # the false PASS this function's own header says it refuses. `-x` is the missing bit of the same
+  # question, and the DRY ancestor test above asks it too (otherwise the preview promises a creation
+  # the real `mkdir -p` then refuses).
+  [ -w "$t" ] && [ -x "$t" ] || {
+    err "cannot-act why=tmpdir-unwritable path=$t (named by $d/.env) — nothing started: this user needs WRITE and SEARCH (w=$([ -w "$t" ] && echo y || echo n) x=$([ -x "$t" ] && echo y || echo n)) on it, and every job on it would otherwise die at mktemp"
     return 2
   }
   # PRINT THE PATH, as the memory floor prints its reading: a creation nobody can see is one the
@@ -984,7 +1055,7 @@ cmd_restart() {
     # ("start-time, so a reboot cannot undo it") false for the reboot it documents. Creating a
     # directory does not touch, restart or double-start a listener — the invariant this line states
     # still holds; the env the listener ALREADY has is simply made satisfiable at last.
-    0) ensure_tmpdir "$dir" || return 2
+    0) ensure_tmpdir "$dir" "$LISTENER_PID" || return 2
        log_line "live name=$name pid=$LISTENER_PID — not touched"; return 0 ;;
     2) return 2 ;;   # cannot measure: START NOTHING (a blind start is how a listener is doubled)
   esac
@@ -1035,7 +1106,7 @@ cmd_reconcile() {
       # listener survived, its TMPDIR did not, and nothing below this line runs for it. Repairing the
       # env does not touch the listener, so "not touched" stays true while the box stops being broken.
       # An unrepairable TMPDIR is `cannot`, not a clean pass.
-      0) ensure_tmpdir "$d" || cannot=$((cannot + 1)); continue ;;
+      0) ensure_tmpdir "$d" "$LISTENER_PID" || cannot=$((cannot + 1)); continue ;;
       2) cannot=$((cannot + 1)); continue ;;   # cannot measure: start nothing
     esac
     dead=$((dead + 1))
