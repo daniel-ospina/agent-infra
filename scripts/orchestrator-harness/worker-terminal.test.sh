@@ -526,12 +526,20 @@ case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "a worker that would start with NO gh credential is REFUSED (loud, not a silent dead lane)" $rc
 grep -q 'new-session' "$TMP/tmux4b.log" && rc=1 || rc=0
 ck "…and tmux is never asked to START one (the credential probe is the only call it makes)" $rc
-grep -q 'NO gh credential' "$TMP/O4b/test.log" \
+# ⛔ THE MESSAGE MUST NOT NAME A CAUSE THE GATE DID NOT ESTABLISH (2026-10-27). This assertion used to
+# pin `NO gh credential`, which was a FALSE DIAGNOSIS as soon as the gate learned to refuse on the MODEL
+# credential too: an operator whose provider key was missing was told to fix a gh credential that was
+# fine. So it pins the honest shape instead — the refusal says the environment contract could not be
+# built, names BOTH surfaces it requires, and still lists every path it looked at.
+grep -q 'could NOT build the worker' "$TMP/O4b/test.log" \
   && grep -qF 'hosts.yml' "$TMP/O4b/test.log" \
   && grep -qF 'keys.env (no GH_TOKEN/GITHUB_TOKEN value)' "$TMP/O4b/test.log" \
   && grep -qF "tmux server's GH_TOKEN/GITHUB_TOKEN" "$TMP/O4b/test.log" \
   && rc=0 || { rc=1; cat "$TMP/O4b/test.log" 2>/dev/null; }
 ck "…naming every place it looked (hosts.yml, keys.env, the caller's env, the tmux server)" $rc
+# …and it must name the MODEL surface too, because that is the other credential the gate now refuses on.
+grep -qF 'LANE MODEL credential' "$TMP/O4b/test.log" && grep -qF 'pi-keys.env' "$TMP/O4b/test.log" && rc=0 || { rc=1; cat "$TMP/O4b/test.log" 2>/dev/null; }
+ck "…and does not claim a gh-only cause: the refusal names the LANE MODEL credential as the other surface" $rc
 [ -f "$TMP/O4b/state/worker-lane-8" ] && rc=1 || rc=0
 ck "…and leaving NO worker record behind (a refusal is not a worker)" $rc
 # POSITIVE CONTROL: the same empty HOME is FINE when the tmux server's own environment carries the
