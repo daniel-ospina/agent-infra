@@ -78,9 +78,15 @@ def _objective():
     if not os.environ.get("OBJECTIVE_REPO"):
         derived, why = _checkout_repo()
         if not derived:
-            # ⛔ TWO CAUSES, TWO REMEDIES, NAMED SEPARATELY. Collapsing them made the operator apply
-            # the stated remedy ("run from the checkout you mean") forever on a box that is in fact
-            # MISSING the deriver — the loop stays dead and the message points elsewhere.
+            # ⛔ THREE CAUSES, THREE REMEDIES, NAMED SEPARATELY (ai#2922). Collapsing them made the
+            # operator apply the stated remedy ("run from the checkout you mean") forever on a box
+            # that was in fact MISSING the deriver — the loop stays dead and the message points
+            # elsewhere. ⛔ `cwd-unreadable` is the SECOND instance of that same lie, and the worse
+            # one: "run from the checkout you mean" is advice a launchd box CANNOT TAKE, because the
+            # working directory is precisely what the OS refuses to report. It used to reach the
+            # catch-all below as `underivable` (the accessor's OSError landed in its broad `except`),
+            # so the twin accessors in `objective.py` and here agreed on the WORD and disagreed on
+            # the MESSAGE — one fact, reported two ways.
             if why == "deriver-missing":
                 raise SystemExit(
                     "pr-loop: cannot bind this checkout's repo — the ONE slug deriver is MISSING "
@@ -88,6 +94,14 @@ def _objective():
                     "repo-slug.sh). Refusing to grade ANOTHER repo (the classifier's fallback is "
                     "daniel-ospina/tortoise). Remedy: deploy scripts/orchestrator-harness/repo-slug.sh "
                     "with this file, or export OBJECTIVE_REPO=<owner/name>.")
+            if why == "cwd-unreadable":
+                raise SystemExit(
+                    "pr-loop: cannot bind this checkout's repo — the OS REFUSES to report this "
+                    "process's working directory (`os.getcwd()` raised; under launchd that is TCC "
+                    "denying an unreadable/deleted `WorkingDirectory`, not a bad path). Refusing to "
+                    "grade ANOTHER repo (the classifier's fallback is daniel-ospina/tortoise). "
+                    "Remedy: move the job's WorkingDirectory out of the TCC-protected tree, or "
+                    "export OBJECTIVE_REPO=<owner/name>.")
             raise SystemExit(
                 "pr-loop: cannot derive this checkout's repo from its origin remote — refusing to "
                 "grade ANOTHER repo (the classifier's fallback is daniel-ospina/tortoise). Run from "

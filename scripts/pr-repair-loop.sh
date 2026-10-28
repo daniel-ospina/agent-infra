@@ -387,9 +387,12 @@ one_pass() { # <dry-run:0|1>
         # ⛔ A NON-VERDICT IS A FAILURE, AND IT IS NAMED AS ONE (ai#2922). `timeout` alone gives 124,
         # a signal gives 128+n, and `pr-doctor` gives 4 for an uncaught exception -- the code an
         # unreadable cwd produced under launchd. Calling any of them "a refusal" told an operator to
-        # look for a broken read while the dispatcher was dead. `pr-doctor` returns no `6` today, so
-        # this catch-all cannot swallow the DEFERRED code a sibling adds; when one lands, its `6)`
-        # arm matches before this one.
+        # look for a broken read while the dispatcher was dead. `pr-doctor` returns no `6` today
+        # (`scripts/pr-doctor.py`: 0/2/3/4/64 only) and every `EXIT_DEFERRED` return in this file is
+        # a pre-dispatch gate, so rc=6 is unreachable here and this catch-all cannot swallow it.
+        # ⚠️ WHEN a sibling teaches the dispatcher to defer, it needs a `6)` arm in BOTH this `case`
+        # and the RECORD `case` below -- the record arm is the one that writes the row and the exit
+        # code, so a `6)` added only here would log "deferred" and then record `pass-failed`/`4`.
         *) err "dispatch: PASS-FAILED (rc=$rc_dispatch) — the dispatcher did not return a verdict; this is a CRASH to diagnose, not a refusal and not an empty queue." ;;
     esac
     # ⛔ THE RECORD FOLLOWS THE DISPATCHER'S OWN VERDICT, not the fact that it returned. A pass whose
@@ -416,6 +419,9 @@ one_pass() { # <dry-run:0|1>
         # world" (measured: rc=4 and rc=2 both gave `decision='refusing' reason='dispatcher-refused'`,
         # LOOP-EXIT=2). 2 is a verdict a caller acts on; 4 is not, so a later tick retries instead
         # of waiting out the backstop window on a crash.
+        # ⚠️ A DEFERRED code needs its `6)` arm HERE, before this catch-all -- see the note on the log
+        # `case` above. This is the arm that WRITES the row and returns the code, so a `6)` that
+        # landed only in the log arm would still record a deferral as `pass-failed` and return 4.
         *) write_status pass-failed "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "dispatcher-crashed"; return "$EXIT_CRASH" ;;
     esac
 }

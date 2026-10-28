@@ -3916,18 +3916,29 @@ def test_an_UNREADABLE_CWD_is_a_NAMED_cause_and_not_a_laundered_underivable(monk
 
 
 def test_an_explicit_path_never_touches_the_cwd(monkeypatch, tmp_path):
-    """The other half of totality: a caller that SUPPLIES a path must not call `os.getcwd()` at all.
+    """The other half of totality: a caller that SUPPLIES a path must not ask the cwd at all.
 
     `REPO`, `PR_DOCTOR_REPO_DIR` and `--repo` are explicit, and on a launchd box the cwd is the one
     input that may be unreadable. Resolving it anyway is how a pass that already held the datum for
     the repo died asking a question it did not need answered (agent-infra#2913, #2922).
+
+    ⛔ THIS ARM IS AN OVER-REACH GUARD, NOT A MUTATION-PINNED REGRESSION ARM, and it must be read as
+    one (review finding, #3000). It stays GREEN when the #2922 fix is reverted, and it cannot do
+    otherwise: the pre-fix shape is `str(path or os.getcwd())`, which ALREADY short-circuits on a
+    truthy path, so there is no pre-fix behaviour for it to fail against. Its job is to catch a fix
+    that OVER-REACHES — one that routes an explicit path THROUGH the accessor (e.g.
+    `path = _safe_cwd() or path`, or a `_safe_cwd()` call hoisted above the `if not path:` guard) and
+    so turns a box that held the datum into a `cwd-unreadable` refusal. Hence it patches the
+    ACCESSOR as well as `os.getcwd`: patching only `os.getcwd` would miss exactly that shape.
     """
 
     def boom():
         raise PermissionError(1, "Operation not permitted")
 
     monkeypatch.setattr(objective.os, "getcwd", boom)
-    # an explicit path still resolves normally -- the deriver answers, no cwd is consulted
+    monkeypatch.setattr(objective, "_safe_cwd", boom)
+    # an explicit path still resolves normally -- the deriver answers, and neither the accessor nor
+    # the raw call is consulted
     assert objective._checkout_repo(str(tmp_path)) == (None, "underivable")
 
 

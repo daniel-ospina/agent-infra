@@ -348,3 +348,61 @@ def test_the_two_shims_agree_on_the_cwd_reason(monkeypatch):
 
     monkeypatch.setattr(pl.os, "getcwd", boom)
     assert pl._checkout_repo()[1] == objective._checkout_repo()[1] == "cwd-unreadable"
+
+
+def test_the_cwd_refusal_MESSAGE_does_not_advise_the_cwd(monkeypatch):
+    """⛔ THE WORD ALONE WAS NOT ENOUGH (review finding, #3000; reproduced before the fix).
+
+    `_checkout_repo()` returning `cwd-unreadable` fixes the ACCESSOR. The one renderer that turns it
+    into something an operator reads — `_objective()`'s refusal — branched only on `deriver-missing`
+    and funnelled every other cause into the `underivable` text: *"cannot derive this checkout's
+    repo from its origin remote ... Run from the checkout you mean, or export OBJECTIVE_REPO=…"*.
+
+    On a launchd box that is the exact wrong remedy #2922 exists to end: the process's cwd is
+    PRECISELY what the OS refuses to report, so "run from the checkout you mean" is advice the box
+    cannot take, and it sends the operator to debug a `git`/`origin` that is perfectly healthy. The
+    twin files had therefore agreed on the reason token while disagreeing on the message — one fact
+    reported two ways, which is the failure this resolution is about.
+
+    Reproduced before the fix: with `_checkout_repo` stubbed to `(None, "cwd-unreadable")` and
+    `OBJECTIVE_REPO` unset, the message printed was verbatim the `underivable` one.
+    """
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    monkeypatch.setattr(pl, "_checkout_repo", lambda *a, **k: (None, "cwd-unreadable"))
+
+    try:
+        pl._objective()
+    except SystemExit as exc:
+        msg = str(exc)
+    else:                                                  # pragma: no cover - a refusal must raise
+        raise AssertionError("_objective() did not refuse on cwd-unreadable")
+
+    low = msg.lower()
+    # it must NAME the working directory as the cause...
+    assert "working directory" in low, msg
+    # ...and must NOT carry the `underivable` remedy set, which is advice this box cannot take.
+    assert "origin remote" not in low, msg
+    assert "run from the checkout" not in low, msg
+    # it is still a fail-closed refusal that names the fallback it refuses to adopt.
+    assert "daniel-ospina/tortoise" in msg, msg
+    # ...and it names a remedy that a launchd box can actually perform.
+    assert "objective_repo" in low, msg
+
+
+def test_the_UNREADABLE_refusal_is_not_the_UNDERIVABLE_one(monkeypatch):
+    """The two facts stay apart in the MESSAGE too, not only in the accessor's return value.
+
+    A fix that renamed every reason would satisfy this arm's neighbour and destroy this one.
+    """
+    monkeypatch.delenv("OBJECTIVE_REPO", raising=False)
+    monkeypatch.setattr(pl, "_checkout_repo", lambda *a, **k: (None, "underivable"))
+
+    try:
+        pl._objective()
+    except SystemExit as exc:
+        msg = str(exc)
+    else:                                                  # pragma: no cover
+        raise AssertionError("_objective() did not refuse on underivable")
+
+    assert "origin remote" in msg.lower(), msg
+    assert "working directory" not in msg.lower(), msg
