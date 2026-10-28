@@ -228,13 +228,43 @@ grep -q 'RESEARCH FIRST' <<<"$out"; ck $? "…and the teaching message reached t
 [ ! -f "$TMP/bg-o/bg/bgtest.pid" ]; ck $? "…and NO worker was started (no pid file, so no launch to report)"
 [ -s "$PI_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and no agent ran"
+# ⛔ ITS OWN COPY OF THE FIXTURE, not `$CANON`. The dispatch below APPENDS the COMMIT-AS-YOU-GO
+# section (#2981) to whatever brief it is handed — so handing it the shared `$CANON` mutated the
+# suite's own canonical fixture mid-run, which is the kind of hidden coupling that makes a later
+# arm's precondition true for a reason nobody chose. One brief, one test.
+OKNB="$TMP/nonblocking-ok.txt"; cp "$CANON" "$OKNB"
 out="$( cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
-       bash "$NB" bgok "$TMP/wt" "$CANON" 20 2>&1 )"; rc=$?
+       bash "$NB" bgok "$TMP/wt" "$OKNB" 20 2>&1 )"; rc=$?
 [ "$rc" -eq 0 ]; ck $? "POSITIVE CONTROL: nonblocking-dispatch.sh LAUNCHES for a valid brief ($(printf '%s' "$out" | tail -1))"
 # The worker is backgrounded; wait for its durable verdict rather than sleeping a guess.
 for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgok.rc" ] && break; sleep 0.1; done
 [ "$(cat "$TMP/bg-o/bg/bgok.rc" 2>/dev/null)" = "0" ]; ck $? "…and the worker reached a SUCCESSFUL durable exit status (a 74 refusal also produces a file, so existence alone proves nothing)"
 grep -q 'PI_RAN' "$PI_LOG"; ck $? "…with the stub pi actually invoked"
+
+# ── §D.2 #2981 — the AUTHORED brief gets COMMIT AS YOU GO APPENDED, idempotently.
+# The measured batch behind #2981 was five `prfix` workers dispatched through THIS path, and every one
+# held its single commit for the end and was killed at its cap with 0 commits. The research contract
+# above is REFUSED when absent (80) because a worker that never looked first is that gate's defect;
+# this one is APPENDED, because an otherwise complete authored brief must not become a dead dispatch
+# over one missing sentence — so the assertion is on the FILE the worker receives, not the source.
+DELIVERY_HEAD="$(bash "$HERE/reviewer-preflight.sh" --delivery-brief prfix | head -1)"
+[ -n "$DELIVERY_HEAD" ]; ck $? "the delivery section renders a heading ($(printf '%.40s' "$DELIVERY_HEAD"))"
+AUTH="$TMP/authored.txt"; cp "$CANON" "$AUTH"
+grep -qF -- "$DELIVERY_HEAD" "$AUTH"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "fixture: the authored brief does NOT already carry the section (so the append is what puts it there)"
+cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+  bash "$NB" bgdelivery "$TMP/wt" "$AUTH" 20 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and a dispatch through nonblocking-dispatch.sh still LAUNCHES (rc=$rc)"
+for _i in $(seq 1 100); do [ -s "$TMP/bg-o/bg/bgdelivery.rc" ] && break; sleep 0.1; done
+grep -qF -- "$DELIVERY_HEAD" "$AUTH"; ck $? "…and the brief the worker received CARRIES it (appended, never refused)"
+[ "$(grep -cF -- "$DELIVERY_HEAD" "$AUTH")" -eq 1 ]; ck $? "…exactly once"
+# ⛔ IDEMPOTENCE IS THE POINT: a re-dispatch on the same brief file must not grow it. Without this arm
+# an append that concatenated the section on every attempt would pass every assertion above.
+cd "$FIXREPO" && O="$TMP/bg-o" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+  bash "$NB" bgdelivery2 "$TMP/wt" "$AUTH" 20 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && [ "$(grep -cF -- "$DELIVERY_HEAD" "$AUTH")" -eq 1 ]; ck $? "…and a SECOND dispatch does NOT append a second copy (idempotent, rc=$rc)"
+# A role-correct negative: the `prfix` text must not order a worker to open a PR it already has.
+grep -qF 'Your PR is ALREADY OPEN' "$AUTH"; ck $? "…and the appended text is the prfix role (never 'open the PR' on an existing one)"
 
 # ── orch-send.sh + safe-send.sh: the pane-order paths. Stub `cmux` records every call, so "refused"
 # is again proven by absence.

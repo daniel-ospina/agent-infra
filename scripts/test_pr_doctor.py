@@ -3266,6 +3266,31 @@ def test_the_new_arms_render_a_brief_that_names_the_work(monkeypatch):
     assert pr.brief(ready, "running", None, _cr()) == ""
 
 
+def test_every_prfix_brief_teaches_commit_as_you_go(monkeypatch):
+    """⛔ THE BRIEF THIS FILE COMPOSES IS THE ONE THE MEASUREMENT BLAMED (#2981).
+
+    Measured 2026-10-27/28: five `prfix` workers whose briefs came from `brief()` were killed at
+    their 2400 s cap with 0 commits and 0 PRs -- 144 KB of work recovered only as rescue patch
+    files. A worker that holds its single commit for the end delivers nothing when the end is a
+    `kill -TERM`, so the rule has to be IN the brief, not in a doc the worker might read.
+
+    ⛔ AND IT IS `prfix`-ROLE: a repair worker is dispatched TO an already-open PR, so a brief that
+    orders it to "open the PR" is a false order -- the class #2325 removed from the landing section.
+    """
+    section = pr.delivery_section()
+    assert section, "the delivery section rendered nothing -- the helper was not found"
+    heading = section.splitlines()[0]
+    for klass in ("call-rail", "blocked-by-rail", "rerun-checks", "resolve-conflict", "fix-ci"):
+        text = pr.brief(dict(_pr(2)), klass, "why", _cr())
+        assert text.count(heading) == 1, (klass, text.count(heading))
+        # the PR sentence is the prfix one, and the lane one is ABSENT
+        assert "Your PR is ALREADY OPEN" in text, klass
+        assert "Open the PR as soon as the first commit is pushed" not in text, klass
+    # ⛔ NO EMPTY ORDER GETS A SECTION: `spawn()` reads "" as "nothing to dispatch", so prepending
+    # to one would manufacture a dispatch of nothing.
+    assert pr.brief(dict(_pr(2)), "running", None, _cr()) == ""
+
+
 # ── 5. an unreadable queue is NOT an empty one: the exit codes differ ────────────────────
 
 def test_a_failed_pr_read_refuses_with_its_own_exit_code(monkeypatch):
