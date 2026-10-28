@@ -830,13 +830,19 @@ derive() {
       # whose ONLY caller is `start`; `derive` reads the RECORDED file, so setting the knob and
       # re-polling the SAME run reproduces this identical row — the re-poll loop this line exists to
       # stop. The host is fixed at start, so the fix is a NEW run (measured, #2959 review).
-      # ⛔ AND THE KNOB IS NOT THE WHOLE REMEDY: `start` writes `${host_hint:-$(resolve_host)}`, so a
-      # host-naming `--repo`/`RAIL_RUN_REPO_SLUG` makes the knob UNREAD (measured: `--repo
-      # pin.example.com/o/r` with `RAIL_RUN_GH_HOST=knob.example.com` records `pin.example.com`).
-      # Naming only the knob left the same inert-advice defect one input shape over — a lane told to
-      # set it and start again records the pin's host again (#2959 review, cycle 2).
+      # ⛔ AND THE ADVICE MUST BE TRUE FOR EVERY CAUSE THIS SENTENCE COVERS. An earlier version named
+      # only "set RAIL_RUN_GH_HOST and start a new run", which is WRONG for two of the three shapes it
+      # is printed over (#2959 review, cycle 3, P1):
+      #   • same host, different repo/PR — the HOST matched; following the advice records a different,
+      #     also-wrong host, so that case must be pointed at `--repo` instead;
+      #   • a FAILED read (`gh` 502) — `pr_state` returns at its `|| return 0` BEFORE `pr_url_names` is
+      #     called, so no comparison happened at all, and prescribing "start a new run" (a second merge
+      #     attempt) for a transient read is exactly backwards;
+      #   • and it CONTRADICTED the line above it on the `gone` branch, which says "re-poll rather than
+      #     concluding either way" — only the HOST is frozen at `start`, the artifact read is not.
+      # Each cause now carries only the remedy that can actually move it.
       local host; host="$(file_or_empty "$rd/host")"
-      abstain_why="the read of PR $pr in $slug abstained, or its url did not name $slug/pull/$pr on host ${host:-github.com} — so the API did not confirm which PR this is. The host is RECORDED at start, so re-polling cannot change it: set RAIL_RUN_GH_HOST=<web host> and start a new run — but a host-naming --repo or RAIL_RUN_REPO_SLUG outranks that knob, so if one of those supplied the host, correct it there"
+      abstain_why="the read of PR $pr in $slug abstained, or its url did not name $slug/pull/$pr on host ${host:-github.com} — so the API did not confirm which PR this is. If the url named a DIFFERENT host, the host is RECORDED at start: set RAIL_RUN_GH_HOST=<web host> (a host-naming --repo or RAIL_RUN_REPO_SLUG outranks it) and start a new run, because a re-poll cannot change a recorded host. If the host matched but the repo/PR in the url did not, this run is pointed at the wrong identity: check --repo. If the read itself failed, re-poll"
     fi
     return 0
   }
@@ -981,6 +987,10 @@ derive() {
       row "unknown" "verdict=none liveness=unknown"
       printf '  %s — with no exit status this is an ABSTENTION: neither a death nor a success.\n' "$probe"
       printf '  read %s and re-poll\n' "$log"
+      # ⛔ THE REASON IS ALREADY COMPUTED — NOT PRINTING IT IS THE DEFECT THIS FILE CALLS OUT (#2959
+      # review, cycle 3, P2): `read_artifact` set `abstain_why` above, and this branch dropped it, so a
+      # reader saw `pr_state=not-read` with no cause. `note_abstain` is a no-op when nothing abstained.
+      note_abstain
       return 25 ;;
   esac
 
@@ -1009,6 +1019,8 @@ derive() {
         row "unknown" "verdict=none rail_liveness=unknown"
         printf '  the recorder is gone and the RAIL'"'"'s liveness could not be read (%s) — an\n' "$rprobe"
         printf '  ABSTENTION: it may still be running and may still merge. Re-poll; do not re-run\n'
+        # ⛔ the datum was in hand and unread (#2959 review, cycle 3, P2) — see the note on case 3).
+        note_abstain
         return 25 ;;
     esac
   fi
