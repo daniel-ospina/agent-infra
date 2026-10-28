@@ -353,7 +353,12 @@ PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
 [ -s "$CMUX_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and cmux was never called (the refusal precedes target resolution — the defect is the brief, not the pane)"
 : > "$CMUX_LOG"
-PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
+# ⛔ THE STUB NEVER SUBMITS, SO WITHOUT A WINDOW THIS ARM WAITS ONE OUT (#1881 review P2). The stub
+# `cmux` records calls and never names a session, so nothing can ever verify: `orch-send.sh` polls
+# `read-screen` to its deadline (90 s default + the helper's two 2 s sleeps ≈ 95 s of a CI shard) and
+# the assertion below — satisfied by the footer probe — uses none of it. `ORCH_SEND_VERIFY_TIMEOUT=0`
+# is what the Python suite sets for the same reason: it changes WHAT the arm costs, not what it proves.
+PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" ORCH_SEND_VERIFY_TIMEOUT=0 \
   bash "$ROOT/scripts/orch-send.sh" 00000000-0000-0000-0000-000000000000 test "@$CANON" >/dev/null 2>&1
 [ -s "$CMUX_LOG" ]; ck $? "POSITIVE CONTROL: a compliant @file order passes the gate and reaches cmux"
 : > "$CMUX_LOG"
@@ -475,7 +480,18 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # in one commit (capacity-transfer and tests/pi-shim — the latter with a brief that was never created
 # at all). Declared here so the reference is accounted for; the broader class is named in the STATED
 # LIMIT below rather than silently believed to be covered.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+# the at all). Declared here so the reference is accounted for; the broader class is named in the STATED
+# LIMIT below rather than silently believed to be covered.
+#
+# ⛔ AND A SUITE THAT BUILDS ITS OWN FIXTURES FROM THIS VALIDATOR IS A MEMBER TOO (#1881 review P2).
+# `scripts/test_cmux_payload.py` asks `brief-gate.sh --section lane` for the RESEARCH contract its
+# dispatch fixtures must carry (the same construction `capacity-transfer.test.sh` uses, and for the
+# same reason: a hard-coded block would drift from the gate and the suite would pin a brief no
+# dispatcher accepts). It reaches the gate through `orch-send.sh`, which this census already counts,
+# so it is a deliberate NAMER of the gate rather than a new dispatch path — but it is a REFERENCER,
+# and an undeclared one reddens this equality. Measured: unregistered, this arm fails with
+# `ADDED: scripts/test_cmux_payload.py`, which is exactly the attributable red the census exists for.
+EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"
