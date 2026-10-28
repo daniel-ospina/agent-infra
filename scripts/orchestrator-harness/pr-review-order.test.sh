@@ -158,7 +158,7 @@ if [ "$_names" = "review-$PR_SICK" ]; then
 else
   bad "D1(b) the dispatch was not a review order — spawned=[${_names:-none}]. The remedy NEEDS-REVIEW names is a review for (PR, head); a pass that spawns merge-$PR_SICK again is the 2026-10-28 livelock"
 fi
-if printf '%s\n' "$_names" | grep -qx "merge-$PR_SICK"; then
+if grep -qx "merge-$PR_SICK" <<< "$_names"; then
   bad "D1(c) a MERGE worker (merge-$PR_SICK) was spawned at a head nobody has reviewed — the refusal was acted on as if it were an order to merge"
 else
   ok "D1(c) …and NO merge worker: merge-$PR_SICK is not in this pass's spawns"
