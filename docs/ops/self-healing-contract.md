@@ -351,20 +351,14 @@ cooldown/refusal arm now runs BEFORE the gate: a pass over its dispatch budget s
 refusals it covers. The cooldown and placed-order causes are also counted separately, so the verdict line
 cannot say "no worker accepted" about a pass in which no order was placed.
 
-⛔ **`0` IS RESERVED FOR READABLE, NOTHING TO DO, AND A REFUSED ORDER IS NEITHER (#2710, landed).**
-Measured 2026-10-28: the doctor refused **every** order on drifted worktrees for five consecutive
-45-minute windows — 18–25 PRs sitting unmoving — while the pass exited `0`, the heartbeat stayed fresh
-and the watchdog read HEALTHY. The landed fix (`#2710`, PR #2978) puts a pre-delivery refusal on the
-SAME axis as an order no worker accepted: the refusal adds to `undeliverable` (so the verdict is `3`),
-the row carries a consecutive `refusals` count that the cooldown passes INHERIT, and
-`REFUSAL_ESCALATE_AT` consecutive refusals print `ESCALATE #<n>` naming the worktree and its repair.
-The refused rows are counted in their OWN pass over the queue, before the dispatch loop and before the
-budget gate, so the verdict cannot depend on which gate the loop evaluated first. `scripts/test_pr_doctor.py`
-(#2710's block: `test_FOUR_refused_rows_at_the_SHIPPED_caps_still_refuse_and_escalate`,
-`test_a_SATURATED_pass_still_refuses_and_names_a_refused_row`,
-`test_an_EXPIRED_cooldown_refusal_is_not_dropped_by_a_saturated_pass`) drives those arms, including the
-expired-cooldown case, plus the opposite verdict, so the rule cannot be satisfied by answering "not
-clean" to everything.
+⛔ **AND THE PASS VERDICT ON THAT AXIS IS PINNED BY NAME (#2710; measured 2026-10-28 — five
+consecutive 45-minute windows, 18–25 PRs unmoving, `rc=0` while the heartbeat stayed fresh).**
+`scripts/test_pr_doctor.py`'s #2710 block drives it: `test_FOUR_refused_rows_at_the_SHIPPED_caps_still_refuse_and_escalate`
+(the shipped `MAX_FIX`=3 path), `test_a_pass_WAITING_OUT_a_refusal_cooldown_is_not_a_clean_pass` (the
+44-minutes-out-of-45 hole — **and** the opposite verdict, since a `kind: spawn` row in its cooldown must
+still be `0`), `test_a_SATURATED_pass_still_refuses_and_names_a_refused_row`, and
+`test_an_EXPIRED_cooldown_refusal_is_not_dropped_by_a_saturated_pass` (both row orderings, because that
+defect was ordering-dependent). So the rule cannot be satisfied by answering "not clean" to everything.
 
 ⛔ **#2708's remaining cut is the STALE-HELPER half of the same class** — a refusal that does not say
 WHICH copy judged it. `nonblocking-dispatch.sh` resolved `brief-gate.sh` from four candidates and then
