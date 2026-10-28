@@ -5692,6 +5692,40 @@ def test_two_repos_do_not_share_a_worker_identity(monkeypatch, tmp_path):
     assert name_b == "prd-daniel-ospina-tortoise-1234"
 
 
+def test_forgetting_the_repo_also_forgets_the_worker_tag(monkeypatch):
+    """`REPO` and `_WORKER_TAG` are ONE fact: a target that forgot its repo must not name its worker.
+
+    #2725 review, P2. `clear_repo_target()` exists so a `--all-repos` pass cannot grade a new repo
+    with the previous one's identity; it reset `REPO` but not the tag, so the process that had just
+    decided to grade a different repo still produced `prd-<repo-A's tag>-42` -- #2725's collision in
+    the one process that is supposed to be switching away from it.
+    """
+    monkeypatch.setattr(pr, "ORCH_DIR", "/tmp/none-such-orch")
+    pr.apply_repo(_REPO_A, "")
+    assert pr.worker_name(42) == "prd-%s-42" % pr.repo_tag(_REPO_A)
+    pr.clear_repo_target()
+    assert (pr.REPO, pr._WORKER_TAG) == ("", ""), \
+        "the tag must be cleared WITH the repo: REPO=%r tag=%r" % (pr.REPO, pr._WORKER_TAG)
+    assert pr.worker_name(42) == "prd-42", "no repo resolved -> the repo-blind legacy name"
+    assert pr._worker_spellings("prd-42", 42) == ["prd-42"], \
+        "a caller with no repo must not probe a repo's name: %r" % (pr._worker_spellings("prd-42", 42),)
+
+
+def test_a_REPO_without_the_tag_still_probes_the_qualified_name(monkeypatch):
+    """The mirror half: `_WORKER_TAG` empty must not drop the qualified arm (the MISS direction).
+
+    #2725 review, P2. Dropping it makes `worker_live_which()` answer `False` for a live qualified
+    worker, and `dispatch()` then resets that worktree and spawns a second agent into it. The tag is
+    therefore derived from `REPO` when the field is empty, in ONE place (`_worker_tag()`).
+    """
+    monkeypatch.setattr(pr, "REPO", _REPO_A)
+    monkeypatch.setattr(pr, "_WORKER_TAG", "")
+    qualified = "prd-%s-42" % pr.repo_tag(_REPO_A)
+    assert pr.worker_name(42) == qualified
+    assert qualified in pr._worker_spellings("prd-42", 42)
+    assert pr._worker_spellings(qualified, 42)[0] == qualified
+
+
 def test_a_LIVE_worker_of_the_THIRD_generation_is_not_reported_absent(monkeypatch, tmp_path):
     """LIVENESS must ask the SAME closed set the budget accounts for (#2725 cycle 3, P1).
 

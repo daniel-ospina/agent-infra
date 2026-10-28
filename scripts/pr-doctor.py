@@ -814,7 +814,21 @@ def worker_name(number) -> str:
     The WORKTREE is NOT part of this: it stays `prd-<n>` in every mode because it lives inside the
     repo's own checkout (`<repo>/.worktrees/prd-<n>`), where the directory already scopes it.
     """
-    return "prd-%s%s" % (_WORKER_TAG, number)
+    return "prd-%s%s" % (_worker_tag(), number)
+
+
+def _worker_tag() -> str:
+    """The ONE derivation of the tag every worker name carries -- `""` when no repo is known.
+
+    ⛔ `_WORKER_TAG` AND `REPO` ARE ONE FACT IN TWO FIELDS (#2725 review): the tag is set from the
+    resolved slug and cleared with it, but a caller can hold only one of them -- a fresh process that
+    assigned `REPO` itself, or one that cleared `REPO` and kept the tag. Reading the tag through here
+    means NEITHER state can produce a repo-blind name (the collision #2725 removes) or drop the
+    qualified arm from the probe set (the MISS that frees a live worker's slot).
+    """
+    if _WORKER_TAG:
+        return _WORKER_TAG
+    return (repo_tag(REPO) + "-") if REPO else ""
 
 
 # ⛔ THE CLASSIFIER IS NOT OURS TO OWN (#1872, merged as #1930). `objective.py` owns the class
@@ -1378,8 +1392,9 @@ def _worker_spellings(worker: str, n: int) -> list:
     HOLDS a slot rather than freeing one -- the safe direction this reader is required to fail in.
     """
     names = [worker, "prd-%d" % n]
-    if _WORKER_TAG:
-        names.append("prd-%s%d" % (_WORKER_TAG, n))
+    tag = _worker_tag()
+    if tag:
+        names.append("prd-%s%d" % (tag, n))
     if REPO:
         names.append("prd-%s-%d" % (REPO.split("/")[-1], n))
     out = []
@@ -3713,6 +3728,17 @@ def worker_live_for(number) -> object:
     this change lands. The alias therefore lives as long as those `.started` records do. It cannot
     hold for ever (see the stamp bound in `worker_live`), and the arm goes when no box carries a
     pre-#2725 worker record.
+
+    ⚠️ THE OWNER-BLIND ARM (`prd-<repo-NAME>-<n>`) CARRIES THE SAME RESIDUAL, AND IT COSTS A SPAWN.
+    It is the generation the pre-#2725 MULTI-REPO path wrote, whose tag was `REPO.split("/")[-1]`, so
+    `daniel-ospina/tortoise` and any other `*/tortoise` on the box share it: repo A's live
+    `prd-tortoise-42` makes repo B's pass answer "running" for ITS #42 -- symptom 1 of #2725,
+    narrowed to same-name repos and bounded by those `.started` records. It is kept because the
+    alternative is the unrecoverable direction (a live worker read as absent, its worktree reset, a
+    second agent spawned into it), and the cost is the visible one: a refused spawn and a 90-min
+    cooldown that names the answering file. Narrowing it is possible -- `<name>.started` records the
+    `worktree=`, which `_under_repo_dir()` can test -- but that narrowing must be applied to the plain
+    `prd-<n>` arm too, or the two aliases would answer by different rules.
     """
     return worker_live_which(number)[0]
 
@@ -4351,9 +4377,15 @@ def clear_repo_target() -> None:
     in sequence, and a repo whose evidence does not answer must not inherit the PREVIOUS repo's
     slug, checkout or worktree root -- that would grade the wrong repo while reporting a refusal.
     A fresh process starts here by construction; this makes an in-process pass say the same.
+
+    ⛔ AND THE WORKER TAG GOES WITH IT (#2725 review). `_WORKER_TAG` is derived FROM the slug, so a
+    target that forgot its repo but kept the tag still names -- and still probes -- the PREVIOUS
+    repo's worker: `worker_name(42)` would return repo A's name while `REPO` is empty, i.e. the
+    #2725 collision in the one process that just decided to grade a different repo.
     """
-    global REPO, REPO_DIR, REPO_DIR_ERROR, WORKTREE_ROOT
+    global REPO, REPO_DIR, REPO_DIR_ERROR, WORKTREE_ROOT, _WORKER_TAG
     REPO = REPO_DIR = REPO_DIR_ERROR = WORKTREE_ROOT = ""
+    _WORKER_TAG = ""
 
 
 def run_all_repos(args, explicit) -> int:
