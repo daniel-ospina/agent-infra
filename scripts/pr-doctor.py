@@ -1191,7 +1191,13 @@ _RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
 # waiting or disk reclaiming will fix, and the gate says so in as many words.
 # ⛔ 76 (PI_GATE_REFUSED) and 78 (PI_FORK_REFUSED) are NOT here: `run_agent` translates both into the
 # first gate's code before any caller sees them, so no caller can be handed one.
-GATE_REFUSALS = (75, 77, 74, 73, 80)
+# ⛔ 71 (AGENT_CAPABILITY_REFUSED) is the FIFTH code (agent-infra#2935): the box could not complete one
+# model call and return, so `spawn-gate.sh` refuses immediately before the launch. It is a gate refusal
+# like the rest -- nothing was consumed -- and it must be here for the same reason 73 is: without the
+# code `gate_refused()` reads the refusal as a LAUNCH, so a box that cannot answer a single call keeps
+# reporting successful dispatches and burns a cooldown + budget slot per order. Its remedy is neither
+# "wait" nor a transport repair, which is why it also carries its own axis below.
+GATE_REFUSALS = (75, 77, 74, 73, 80, 71)
 # ⛔ THE GATE'S OWN BOUND, BY ITS OWN CODE (agent-infra#2291). `spawn-gate.sh` refuses on ONE measured
 # bound per spawn and names it in the code it writes, so the axis is READ (`dispatch()` carries it out)
 # rather than re-derived here from load/disk thresholds -- a second set of thresholds in this file would
@@ -1202,7 +1208,7 @@ GATE_REFUSALS = (75, 77, 74, 73, 80)
 # its axis -- which is how 73 stayed invisible while the comment here claimed the table was complete.
 # ⛔ THIS MAP IS A SUBSET OF `GATE_REFUSALS`, NOT ALL OF IT: a refusal with no capacity bound (80, the
 # brief gate) belongs on the tuple above and nowhere here.
-GATE_REFUSAL_BOUND = {75: "load", 77: "disk", 74: "land-backlog", 73: "fork"}
+GATE_REFUSAL_BOUND = {75: "load", 77: "disk", 74: "land-backlog", 73: "fork", 71: "capability"}
 # What to DO about each bound. The axis decides the operator's next action, and `spawn-gate.sh`
 # documents each remedy beside its own refusal line: load clears by itself; a full disk never does;
 # the land-backlog gate opens when the open-PR backlog is landed; a fork refusal needs the box
@@ -1214,6 +1220,9 @@ GATE_REFUSAL_ACTION = {
     "land-backlog": "land the open-PR backlog -- creation is held, the drain is not",
     "fork": "this box is out of PROCESSES -- restart it from outside or let its lanes drain; "
             "waiting does NOT clear this",
+    "capability": "this box cannot complete ONE model call and return -- measure it by hand and "
+                  "repair it (or override with LANE_PREFLIGHT=0 once measured); waiting does NOT "
+                  "clear this",
 }
 # The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
 # run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
@@ -1232,8 +1241,11 @@ GATE_REFUSAL_ACTION = {
 # ⛔ `[pi-gate] REFUSED` IS DELIBERATELY NOT HERE. It is the SPAWN POINT's own line, written with
 # `printf` to the shim's stderr rather than `echo … >> "$log"`, and it can never fire on its own:
 # `gate_refused()` tests the CODE first and no caller is ever handed 76/78 (both are translated).
+# `[capability-gate]` is the pre-launch capability gate (agent-infra#2935, exit 71), written to `$log`
+# immediately before the launch -- so it is a gate refusal at the same seam, and it belongs on this
+# tuple for exactly the reason 73 does (the CODE alone is not enough: `gate_refused()` requires both).
 REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED", "[land-backlog] REFUSED",
-                   "[fork-gate] REFUSED", "[brief-gate] REFUSED")
+                   "[fork-gate] REFUSED", "[brief-gate] REFUSED", "[capability-gate] REFUSED")
 # `run_agent` appends this line only AFTER `pi` has been waited on (spawn-gate.sh starts `pi >> $LOG`
 # and writes this line after `wait`), so its presence in a log PROVES an agent ran -- and a gate
 # refusal is written strictly BEFORE any agent starts. That makes it a one-way discriminator: agent

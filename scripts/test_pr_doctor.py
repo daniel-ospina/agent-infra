@@ -7616,6 +7616,12 @@ def test_the_gate_axis_table_is_the_GATES_own_numbers():
         "AGENT_BRIEF_REFUSED": "a property of the BRIEF: waiting and reclaiming both leave it "
                                "refused, so it is a repair (rc 3), not a wait (rc 6)",
     }
+    # ⛔ AND THE FIFTH CODE IS CLASSIFIED, NOT EXEMPTED (#2935). `AGENT_CAPABILITY_REFUSED` (71) is an
+    # agent-facing refusal written into a backgrounded worker's `.rc`, so it belongs on BOTH tables --
+    # the enumeration above reddens this suite if it is missing from either. Recorded here as its own
+    # assertion so a future reader can see it was considered rather than merely enumerated.
+    assert expected["AGENT_CAPABILITY_REFUSED"] == 71
+    assert pr.GATE_REFUSAL_BOUND[71] == "capability"
     assert set(pr.GATE_REFUSAL_BOUND) == {code for name, code in expected.items()
                                           if name not in NO_CAPACITY_AXIS}, \
         (expected, pr.GATE_REFUSAL_BOUND, NO_CAPACITY_AXIS)
@@ -7630,7 +7636,7 @@ def test_the_gate_axis_table_is_the_GATES_own_numbers():
     # The remedies must not merge back: the two that a single sentence used to cover ("it clears by
     # itself") are the two the gate says the opposite about.
     assert "clears by itself" in pr.GATE_REFUSAL_ACTION["load"]
-    for axis in ("disk", "fork"):
+    for axis in ("disk", "fork", "capability"):
         assert "does NOT clear" in pr.GATE_REFUSAL_ACTION[axis], pr.GATE_REFUSAL_ACTION[axis]
 
 

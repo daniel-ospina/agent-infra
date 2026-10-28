@@ -104,7 +104,7 @@
 #      must not read green over work nobody accepted
 #   6  DEFERRED — the machine said not now; the status row carries which measurement said so.
 #      ⛔ THIS INCLUDES A PR-DOCTOR PASS THAT REPORTED THE SAME FACT ABOUT THE BOX (agent-infra#2291):
-#      pr-doctor returns 6 when the SPAWN GATE refused every order (load/disk/land-backlog/fork) and
+#      pr-doctor returns 6 when the SPAWN GATE refused every order (load/disk/land-backlog/fork/capability) and
 #      nothing was consumed. Before this, such a pass reached the `*)` arm below and was re-labelled `REFUSING`
 #      — "could not read the world" — which is the exact conflation #2291 removes, reintroduced one
 #      layer up by the caller that reads the code.
@@ -463,7 +463,7 @@ one_pass() { # <dry-run:0|1>
         0) log_line "dispatch: pass completed (rc=0)" ;;
         2) err "dispatch: REFUSING (rc=2) — pr-doctor could not read the world or could not deliver; this is NOT an empty queue." ;;
         3) err "dispatch: NOT DELIVERED (rc=3) — legible work, none of it out: no worker took an order that was placed, or a refusal stopped one before delivery. NOT an empty queue." ;;
-        6) say "dispatch: DEFERRED (rc=6) — the box's own gate refused every order and nothing was consumed; the AXIS names the remedy (load/land-backlog clear by themselves, disk needs a reclaim, fork needs a restart from OUTSIDE — the dispatcher's own status record carries `no_room_bound` and the exact `next_action`)." ;;
+        6) log_line "dispatch: DEFERRED (rc=6) — the box's own gate refused every order and nothing was consumed; the AXIS names the remedy (load/land-backlog clear by themselves, disk needs a reclaim, fork needs a restart from OUTSIDE, capability needs the box measured and repaired by hand — the dispatcher's own status record carries `no_room_bound` and the exact `next_action`)." ;;
         # ⛔ A NON-VERDICT IS A FAILURE, AND IT IS NAMED AS ONE (ai#2922). `timeout` alone gives 124,
         # a signal gives 128+n, and `pr-doctor` gives 4 for an uncaught exception -- the code an
         # unreadable cwd produced under launchd. Calling any of them "a refusal" told an operator to

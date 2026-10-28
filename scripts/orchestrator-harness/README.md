@@ -540,8 +540,9 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     change to that shipped tool's contract and is deliberately out of scope, so #2834's ask 1 is met for
     the DIRTY half and recorded for the unpushed half: the commits live in the repo's object database and
     survive the WORKTREE being removed, but not the BRANCH being deleted.
-  * ⛔ **THE SCOPE IS "AN AGENT STARTED", NOT "EVERY CALL"** — the ten GATE REFUSALS inside `run_agent`
-    (brief gate, fork, disk/no-headroom, load, land-backlog, pi's own load/fork refusal) `return` before
+  * ⛔ **THE SCOPE IS "AN AGENT STARTED", NOT "EVERY CALL"** — the gate refusals inside `run_agent`
+    (brief gate, fork, disk/no-headroom, load, land-backlog, capability, pi's own load/fork refusal)
+    `return` before
     the spawn and therefore reach neither the rescue nor the ledger. That is the honest reading: nothing
     ran, so there is no terminal transition to record, and a refused lane writes NO `lane-end.tsv` row —
     an absent row is not "the lane ended clean", which is why the remedy for a fleet-wide gap here is the

@@ -330,10 +330,12 @@ deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doct
 legible and none of it went out: no worker took an order that was placed, **or** a durable state (a
 worktree holding uncommitted work, a refusing transport) stopped the order before delivery; `6`
 **NO-CAPACITY** — the spawn GATE refused the order (its own bound: `load` | `disk` | `land-backlog` |
-`fork`), nothing was consumed and no transport was involved, so the response is the BOUND's own remedy
-and never a repair — `load`/`land-backlog` clear by themselves, `disk` needs a reclaim, and `fork`
+`fork` | `capability`), nothing was consumed and no transport was involved, so the response is the
+BOUND's own remedy
+and never a repair — `load`/`land-backlog` clear by themselves, `disk` needs a reclaim, `fork`
 needs the box restarted or drained **from outside** (it is out of processes, and waiting on load will
-never clear it); `4` crash; `64` the command line is unusable (**not** 2, so a launchd
+never clear it), and `capability` needs the box measured and repaired by hand (it could not complete
+one model call and return); `4` crash; `64` the command line is unusable (**not** 2, so a launchd
 typo cannot masquerade as a refusal). ⛔ The sidecar **must** be overwritten by a refusing pass —
 otherwise the previous pass's `ok` stands and *"a failure only `launchctl list` can witness is a
 silent failure"*. `scripts/test_pr_doctor.py` §10 pins exactly that agreement.
@@ -396,7 +398,8 @@ out"* so that a durable pre-delivery refusal (a dirty worktree, a refusing trans
 would not take it"** (repair it), `6` is **"the GATE measured the box and said not now"** (wait, or
 prune/add capacity). A gate refusal consumes nothing, and **whether it clears by itself is the AXIS's
 answer, not a property of the code** — `load`/`land-backlog` clear as the box drains, `disk` needs a
-reclaim, `fork` needs a restart from outside; in none of the four is the remedy a repair of the
+reclaim, `fork` needs a restart from outside, `capability` needs a hand repair (the box cannot finish
+one call), and in none of the five is the remedy a repair of the
 transport (`GATE_REFUSAL_ACTION`, and `scripts/test_pr_doctor.py`'s
 `test_the_gate_axis_table_is_the_GATES_own_numbers`). ⛔ So `6` must never be reported with a universal
 *"it clears by itself"* — that sentence is the same class of collapse as the one this change removes,

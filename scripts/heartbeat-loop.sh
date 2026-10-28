@@ -881,7 +881,8 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
       elif [ "${_prc:-0}" -eq 6 ]; then
         # ⛔ NOT RED (agent-infra#2291). The box's own gate refused the order and consumed nothing, so
         # the recorded verdict says NO-CAPACITY and the next action is the bound's remedy (`reason`
-        # carries it: load clears, disk needs a reclaim, fork needs a restart from outside). Named
+        # carries it: load clears, disk needs a reclaim, fork needs a restart from outside, capability
+        # needs a hand repair). Named
         # here because this line is where an operator reads the pass, and "RED" would send them to
         # repair an install that is working.
         printf '%s PR-DOCTOR WAITING rc=6 (%ss ago) :: %s\n' \

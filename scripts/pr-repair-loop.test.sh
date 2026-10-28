@@ -181,10 +181,21 @@ fi
 # The no-capacity arm (agent-infra#2291): the box's own gate refused, nothing consumed -> DEFERRED.
 # This is the third pole of the same discrimination: 6 is a verdict to WAIT on, 2 and 4 are not.
 rm -f "$ROW"
+# ⛔ THE OUTPUT IS CAPTURED, NOT DISCARDED (#2291 review, P1 -- reproduced). This arm used to run the
+# pass as `>/dev/null 2>&1` and assert only the exit code and the row, so the verdict's own message
+# `case` was unasserted -- and it called `say`, which is undefined in this script (macOS: the
+# text-to-speech binary, which SPEAKS the sentence; Linux: `command not found`). The code and the row
+# were right while the operator-facing sentence never reached pr-repair.log at all. The capture below
+# is what makes "the word a reader acts on" assertable instead of assumed.
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-nocap" \
-    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
+    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >"$TMP/nocap.out" 2>&1
 check "a NO-CAPACITY dispatch is rc=6 (deferred), NOT rc=2" 6 "$?"
 reason_is "dispatcher-no-capacity"
+if grep -q 'DEFERRED (rc=6)' "$TMP/nocap.out" 2>/dev/null; then
+    ok "...and the pass SAYS so — the DEFERRED (rc=6) line is emitted by a defined function"
+else
+    bad "the DEFERRED (rc=6) line never reached the pass output (out: $(tr -d '\n' <"$TMP/nocap.out" 2>/dev/null | cut -c1-300))"
+fi
 if grep -q '"decision": "deferred"' "$ROW" 2>/dev/null; then
     ok "the row says decision=deferred — the same verdict as the loop's own gates"
 else
