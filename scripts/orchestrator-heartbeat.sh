@@ -19,7 +19,9 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 # 2. OFF BY DEFAULT via a kill file:   touch ~/.pi/agent/state/HEARTBEAT-OFF
 # 3. BOUNDED LOG (last 2000 lines).
 # 4. IT VERIFIES ITS OWN DELIVERY and records delivered=yes|UNVERIFIED.
-# 5. IT DOES NOT READ ~/Documents (macOS TCC denies a launchd-spawned bash that tree —
+# 5. ONE INSTANCE PER $STATE, enforced in-process so EVERY entry point gets it (#2890 — see the
+#    SINGLE-INSTANCE GUARD block below; a $STATE that cannot hold the lock runs unguarded and says so).
+# 6. IT DOES NOT READ ~/Documents (macOS TCC denies a launchd-spawned bash that tree —
 #    see com.tortoise.worktree-reaper.plist). Everything here is under ~/.pi/agent,
 #    which is why a plain `bash` entry point is sound where the reaper needs the
 #    checkout's own interpreter.
@@ -65,6 +67,234 @@ PULSE_MIN=5           # send the short form anyway if nothing has been said for 
 NOW=$(date +%s); TS=$(date +%H:%M:%S)
 
 log() { printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null; }
+
+# ⛔ SINGLE-INSTANCE GUARD — ONE HEARTBEAT PER $STATE (agent-infra#2890) ───────────────────────
+# WHAT IT PREVENTS, MEASURED (2026-10-27): two `orchestrator-heartbeat.sh` processes coexisting on
+# one state dir — `ps` showed `2283 etime 04:55` beside `8835 etime 01:23`, and after killing the
+# older one and `kickstart`ing the launchd job TWO APPEARED AGAIN within three minutes. So it is not
+# a leftover; every entry point (StartInterval, a manual run, `launchctl kickstart -k`) can add an
+# instance, and each one runs the same per-pass work against the same $STATE. The consequence class
+# is #2557 one level up: `pr-doctor` claimed the same rows twice, and the signature was a
+# same-second duplicate spawn for one `prd-` id — 106 times over 2026-10-21..24.
+#
+# ⛔ THIS IS DEFENCE IN DEPTH, NOT A FIX FOR A LIVE OUTAGE. That duplicate-spawn count has been ZERO
+# since 2026-10-25 — because `pr-doctor` gained its own "one worker per PR" guard, not because
+# anything here changed. This guard removes the reason two heartbeats existed at all; it does not
+# replace that downstream guard, and it cannot (a detached pr-doctor child OUTLIVES this lock — see
+# "WHAT THIS LOCK IS NOT" below).
+#
+# ⛔ AND IT FIXES THE VERSIONED FILE ONLY. The live box runs `/Users/home/orchestrator/
+# orchestrator-heartbeat.sh`, which has drifted from this one (1209 vs 1199 lines, 6 hunks), so the
+# running copy is unaffected until that drift is closed (#1552 unversioned scripts, #1738 an edit is
+# inert until the job restarts, #1694 the tick is version-controlled nowhere).
+#
+# THE HOUSE PATTERNS THIS IS BUILT FROM (none invented here):
+#   · `$STATE/pr-doctor.lock` in `heartbeat-loop.sh` — `mkdir` the lock, and treat an OLD lock as
+#     reclaimable (`find -mmin +30`). That age rule is the anti-wedge arm below, same 30 minutes.
+#   · `ai-drainer.sh` GUARD 1 — stage the lock ALREADY LABELLED and `mv` it into place (a bare
+#     `mkdir` then writing the pid leaves a window where the lock exists and names nobody, and a
+#     contender that sees a pid-less lock calls it stale and takes it: two ticks); reclaim with an
+#     atomic `mv`, never `rm -rf` followed by `mkdir` (two contenders both delete, both claim); and
+#     release ONLY a lock whose pid file names us (an exiting tick must not delete its successor's
+#     lock — the #1761 shape).
+#   · `watchdog-loop.sh` — how this repo treats a $STATE it cannot write (see the UNWRITABLE arm).
+#
+# ⛔ LIVENESS IS NOT IDENTITY (agent-infra#1985). A lock naming a bare pid reclaims on `kill -0`, so
+# a pid the OS recycled after a SIGKILL reads as "the holder is alive" — it stops the box silently
+# AND blocks its own recovery, because a start that defers to a wrong pid can never fix the lock it
+# defers to. So the lock records `<pid>` AND the holder's own START TIME (`ps -o lstart=`), and
+# defers only when BOTH match; a recycled pid has a different start time and is reclaimed, as it
+# should be. The start time is read through `ps`, not `/proc` (macOS has no /proc) and with
+# `LC_ALL=C` on both reads, so the two readings are formatted by the same clock in the same locale —
+# a locale-dependent mismatch would read as `recycled` and let two passes run.
+#   NOTE the honest limit: this compares a formatted time on one machine. Two processes starting in
+#   the SAME SECOND on one recycled pid would compare equal; that is not reachable in practice (the
+#   second must start after the first is gone), and the age bound caps any residue at one pass, not
+#   forever.
+#
+# ⛔ A LIVE HOLDER CAN STILL NOT WEDGE THE BOX — THE BOUND IS BY AGE, NOT BY LIVENESS ALONE.
+# `orch-loop.sh`'s lock (the #1985 defect) has no second opinion: if the holder never dies, nothing
+# ever starts. Here a lock older than `HB_LOCK_STALE_MIN` is reclaimed EVEN WHEN ITS PID LOOKS LIVE,
+# because a heartbeat pass cannot legitimately run that long: its target cadence is 540 s and it
+# carries its own stall killer (`STALL … exceeded 390s`). 30 minutes is the bound pr-doctor's own
+# lock already uses. That is the arm that turns "a wedged holder" from a dead box into one lost pass.
+#
+# ⛔ A REFUSAL TOUCHES NOTHING. The guard sits ABOVE the log truncation and above every write below,
+# AND a held lock is detected before the claim stages anything (see hb_claim), so a contended tick
+# creates no file, no directory and no mtime change under $STATE — the property the suite asserts by
+# comparing a file+directory checksum set taken before and after, plus a source-order pin that the
+# exists-check precedes the staging `mkdir`. Its reason therefore goes to STDOUT (the terminal, and
+# launchd's StandardOutPath) and NOT into `orchestrator-heartbeat.log`, which lives in $STATE.
+# The trade is stated rather than hidden: a refused tick leaves no line in the heartbeat log.
+#
+# ⛔ A REFUSAL EXITS 0 — A DELIBERATE DEPARTURE FROM THE ISSUE'S "exits non-zero" INDICATOR.
+# `scripts/lib/fleet-inventory.sh` renders a job's last exit status as its verdict, so a non-zero
+# exit here would paint the heartbeat FAILING on most ticks: at a 5-minute StartInterval against a
+# 6–9 minute pass, "a second start while one is live" is the EXPECTED, FREQUENT, entirely healthy
+# case, not a failure. A false FAILING on the one component whose job is to report the box's state
+# is worse than the silence it replaces — and this file's own contract (header, EXIT) is "always 0".
+# The signal the operator actually gets is the DUPLICATE row disappearing from the inventory, which
+# is the state this guard removes.
+#
+# ⛔ THE BOUNDED SETTLE (`HB_LOCK_WAIT_S`, default 10 s) IS FOR `kickstart -k`, NOT FOR CADENCE.
+# `launchctl kickstart -k` SIGTERMs the running instance and starts the replacement IMMEDIATELY, and
+# a trapped TERM only exits after the command in flight finishes (a `sleep 5` poll, a `gh` call).
+# Without a settle the replacement would find a live holder and refuse — the operator's repair verb
+# would silently do nothing. So a live holder is re-probed for a few seconds before refusing. A
+# scheduled tick pays the same few seconds and then refuses, which is why it is seconds, not a minute.
+#
+# ⛔ WHAT THIS LOCK IS NOT: it serializes the PASS. A detached queue drain (and, on the live copy,
+# the detached `pr-doctor` run) outlives the pass that launched it, and this lock is released when
+# the pass exits — those children are serialized by their OWN locks ($STATE/pr-doctor.lock). Do not
+# extend this one to cover them.
+HB_LOCK="$STATE/heartbeat.lock"
+# 30 minutes, matching `$STATE/pr-doctor.lock` (`find -mmin +30`) — see the age arm above.
+HB_LOCK_STALE_MIN="${HB_LOCK_STALE_MIN:-30}"
+HB_LOCK_WAIT_S="${HB_LOCK_WAIT_S:-10}"
+# ⛔ A LEADING ZERO IS NOT A NUMBER HERE EITHER. `08` passes a `[!0-9]` test but `$(( ))` and `[ -lt ]`
+# read it as OCTAL on the /bin/bash 3.2 this box runs (watchdog-loop.sh records the same lesson), which
+# would abort the arithmetic inside a guard whose job is to fail closed. `0` stays legal for the settle
+# (the suite drives it to zero, and a zero-second settle is a coherent setting); `0<n>` falls back.
+case "$HB_LOCK_STALE_MIN" in ''|*[!0-9]*|0?*) HB_LOCK_STALE_MIN=30 ;; esac
+case "$HB_LOCK_WAIT_S" in ''|*[!0-9]*|0?*) HB_LOCK_WAIT_S=10 ;; esac
+# ⛔ AND ZERO IS NOT A SETTING FOR THE AGE BOUND (watchdog-loop.sh's MAX_CONSEC lesson, same shape): the
+# bound is `find -mmin +N`, so N=0 means "reclaim a lock older than a minute" — a live pass holding the
+# lock for 60 s would be joined by a second one, i.e. an explicit misconfiguration would re-create the
+# very defect this guard exists to remove. Below 1 falls back to the 30-minute default.
+[ "$HB_LOCK_STALE_MIN" -ge 1 ] || HB_LOCK_STALE_MIN=30
+
+# The process's own START TIME, or empty when it is not running. `ps` (not /proc: macOS has none),
+# `LC_ALL=C` so a claim-time and a probe-time reading cannot differ by locale.
+hb_ident() { LC_ALL=C ps -p "${1:-0}" -o lstart= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+# hb_claim → 0 the lock is OURS · 1 $STATE cannot hold a lock · 2 someone else holds it.
+# ⛔ STAGED AND ALREADY LABELLED, THEN `mv` (ai-drainer.sh's measured fix): `mkdir` + write leaves a
+# pid-less lock that the next contender calls stale, which is two ticks. `mv` moves INTO an existing
+# directory rather than replacing it, so a lost race leaves our staging dir inside the winner's lock —
+# hence the ownership check after the move, and its cleanup, instead of assuming the move won.
+hb_claim() {
+  local stage="$STATE/.heartbeat.lock.$$"
+  # ⛔ THE ATOMIC CLAIM IS STAGED, SO THE *REFUSAL* PATH MUST NOT REACH IT (review P1, measured with
+  # strace): `mkdir $STATE/.heartbeat.lock.$$` + its two files + `rmdir` is a WRITE UNDER $STATE, and a
+  # refused tick used to make one per attempt — 11 at the default settle, and it moved $STATE's own
+  # mtime. "A refusal touches nothing" is a claim this file makes twice, so the exists-check comes
+  # FIRST and a held lock never stages anything. The check is racy by nature (that is what the staged
+  # rename is for); losing that race is caught by the ownership check below, not by this line.
+  if [ -e "$HB_LOCK" ]; then return 2; fi
+  # ⛔ DEBRIS SWEEP. A claim that is SIGKILLed between its `mkdir` and its `mv`/cleanup leaves
+  # `$STATE/.heartbeat.lock.<pid>` behind, and NOTHING ELSE in the tree reaps that name (grep: no other
+  # reader) — so the claim does. Bounded twice over: `-maxdepth 1` on one directory, and only entries
+  # older than the same age bound that makes a lock stale. A live claim's staging dir is milliseconds
+  # old, so it is never a candidate.
+  find "$STATE" -maxdepth 1 -name '.heartbeat.lock.*' -mmin +"$HB_LOCK_STALE_MIN" -exec rm -rf {} + 2>/dev/null
+  rm -rf "$stage" 2>/dev/null
+  mkdir "$stage" 2>/dev/null || return 1
+  printf '%s\n' "$$" > "$stage/pid" 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 1; }
+  printf '%s\n' "$(hb_ident "$$")" > "$stage/start" 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 1; }
+  mv "$stage" "$HB_LOCK" 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 2; }
+  [ "$(cat "$HB_LOCK/pid" 2>/dev/null | tr -d '[:space:]')" = "$$" ] && return 0
+  rm -rf "$HB_LOCK/.heartbeat.lock.$$" 2>/dev/null
+  return 2
+}
+
+# hb_probe <lockdir> → "<state> <pid>": dead · recycled · live · unverifiable · nopid.
+# `unverifiable` is a LIVE pid whose start time was not recorded (claim-time `ps` failed): the pid is
+# real, the identity is not provable, so it is deferred to — BOUNDED by the age arm, never forever.
+hb_probe() {
+  local pid rec now
+  pid="$(cat "$1/pid" 2>/dev/null | tr -d '[:space:]')"
+  case "$pid" in ''|*[!0-9]*) printf 'nopid %s' "${pid:-?}"; return 0 ;; esac
+  now="$(hb_ident "$pid")"
+  [ -n "$now" ] || { printf 'dead %s' "$pid"; return 0; }
+  rec="$(cat "$1/start" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [ -n "$rec" ] || { printf 'unverifiable %s' "$pid"; return 0; }
+  [ "$now" = "$rec" ] && { printf 'live %s' "$pid"; return 0; }
+  printf 'recycled %s' "$pid"
+}
+
+# Release is OWNERSHIP-CHECKED (ai-drainer.sh, the #1761 shape): a finished tick must never delete a
+# successor's lock, and a signal path that ran it once must not run it again over someone else's.
+hb_release() {
+  [ "$(cat "$HB_LOCK/pid" 2>/dev/null | tr -d '[:space:]')" = "$$" ] || return 0
+  rm -rf "$HB_LOCK" 2>/dev/null
+  return 0
+}
+
+hb_owned=0
+hb_waited=0
+hb_attempt=0
+hb_max_attempt=$((HB_LOCK_WAIT_S + 8))
+while [ "$hb_attempt" -lt "$hb_max_attempt" ]; do
+  hb_attempt=$((hb_attempt + 1))
+  hb_claim
+  hb_rc=$?
+  if [ "$hb_rc" = "0" ]; then hb_owned=1; break; fi
+  if [ "$hb_rc" = "1" ]; then
+    # ⛔ UNWRITABLE $STATE: THE GUARD PERMITS, AND SAYS SO OUT LOUD.
+    # The decision, and why it is this arm: the guard's only job is to serialize a shared $STATE, and
+    # a state dir that cannot hold it is a state dir that is already broken — full, read-only, wrong
+    # owner. Refusing here would take the box's ONLY alarm (this tick's message to the orchestrator)
+    # offline at exactly the moment the box is in trouble, and the refusal could not even be logged,
+    # because the log lives in that same dir. So the pass runs unguarded — the pre-guard status quo,
+    # whose worst case is the duplicate dispatch that `pr-doctor`'s own "one worker per PR" guard
+    # already blocks. This is the opposite arm to `watchdog-loop.sh`, deliberately: THERE the guarded
+    # action is a RESTART, and restarting on a counter that never advances is the tight loop that file
+    # exists to prevent. A heartbeat pass cannot loop. ⛔ The message is load-bearing, not decoration:
+    # a guard that disables itself silently is a no-op gate that reports protection while enforcing
+    # nothing, so it says so on STDOUT (the only sink left) on every such tick.
+    printf '%s\n' "orchestrator-heartbeat: WARN $STATE cannot be written (absent, full, or read-only), so the single-instance lock (#2890) cannot be taken here — running WITHOUT it. Two concurrent passes are possible until $STATE is writable again; the heartbeat itself still runs, because a broken state dir is exactly when the box needs its alarm."
+    break
+  fi
+  hb_peek="$(hb_probe "$HB_LOCK")"
+  hb_state="${hb_peek%% *}"
+  hb_pid="${hb_peek#* }"
+  if [ "$DRY" = "1" ]; then
+    # ⛔ A DIAGNOSTIC MUST ANSWER ON A RUNNING BOX, AND MUST NOT MUTATE ONE. `--dry-run` claims the
+    # lock when it is free (so it cannot race a real pass) but NEVER reclaims a held or stale one and
+    # NEVER refuses: `origination-funnel.test.sh` pins the same rule for `--check-refresh` — a verb that
+    # exits "already running" on a live box has not answered the question it was run to answer.
+    printf '%s\n' "orchestrator-heartbeat: DRY-RUN — the single-instance lock is not held by this run (pid $hb_pid holds $HB_LOCK, identity $hb_state); continuing WITHOUT it, because a dry run must answer on a live box and must not reclaim (see #2890)."
+    break
+  fi
+  case "$hb_state" in
+    live|unverifiable)
+      if [ -n "$(find "$HB_LOCK" -maxdepth 0 -mmin +"$HB_LOCK_STALE_MIN" 2>/dev/null)" ]; then
+        hb_state="aged"      # live by pid, but too old to be a real pass — see the age arm above
+      elif [ "$hb_waited" -lt "$HB_LOCK_WAIT_S" ]; then
+        hb_waited=$((hb_waited + 1)); sleep 1; continue
+      else
+        # ⛔ THE REFUSAL: no write under $STATE (see the header) — the reason leaves on STDOUT, and the
+        # exit is 0 (see the header: a non-zero exit would paint the heartbeat FAILING on most ticks).
+        printf '%s\n' "orchestrator-heartbeat: SKIP — another instance is live (pid $hb_pid holds $STATE, identity $hb_state) — this tick did nothing. One heartbeat per state dir (#2890)."
+        exit 0
+      fi ;;
+  esac
+  # A stale holder (dead · recycled · nopid · aged): reclaim ATOMICALLY. `mv` succeeds for exactly one
+  # contender; `rm -rf` + `mkdir` is the measured two-tick race (ai-drainer.sh). Never `rm` a lock we
+  # have not first taken ownership of. ⛔ The moved-aside stash is named with the SAME prefix the debris
+  # sweep matches (`.heartbeat.lock.*`), so a SIGKILL between the `mv` and its `rm -rf` leaves something
+  # the next claim reaps — one rule for every scratch dir this guard can leave behind.
+  if mv "$HB_LOCK" "$STATE/.heartbeat.lock.stale.$$" 2>/dev/null; then
+    rm -rf "$STATE/.heartbeat.lock.stale.$$" 2>/dev/null
+    printf '%s\n' "orchestrator-heartbeat: reclaimed a stale lock (pid $hb_pid, reason: $hb_state) at $HB_LOCK (#2890)"
+  else
+    rm -rf "$STATE/.heartbeat.lock.stale.$$" 2>/dev/null
+  fi
+done
+# ⛔ NOT `hb_owned` — a claim can be WON on the last allowed attempt, and reporting that as a refusal
+# would exit 0 one line after taking the lock, leaving it behind for the next tick to reap as dead.
+if [ "$hb_owned" != "1" ] && [ "$hb_attempt" -ge "$hb_max_attempt" ]; then
+  printf '%s\n' "orchestrator-heartbeat: SKIP — the lock at $HB_LOCK could not be taken or reclaimed after $hb_attempt attempts (a peer keeps winning it) — this tick did nothing."
+  exit 0
+fi
+# ⛔ THE LOCK IS THE PASS'S, AND THE PASS'S ALONE. TERM/INT EXIT (they do not merely return —
+# orch-loop.sh's measured #1715 defect) so the EXIT trap is the ONE release point: "the lock is gone"
+# and "the process is gone" become the same event, and a SIGTERM from `kickstart -k` releases here.
+if [ "$hb_owned" = "1" ]; then
+  trap 'hb_release' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+fi
 
 # -- bounded log --------------------------------------------------------------
 if [ -f "$LOG" ]; then
