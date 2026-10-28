@@ -123,11 +123,12 @@
 #         parked run has no drain time to model — so the exclusion is deliberate, and its direction
 #         is stated rather than fixed. Home: agent-infra #2497.
 #     (ii) THE WINDOW IS THE READ, NOT THE PUSH (#2333 review, P3). `fix-one.sh` reads ONCE when the
-#         LANE STARTS, and its agent pushes up to `FIX_TIMEOUT` (default 2400 s) later, so a lane can
-#         be allowed on a shallow queue and push into a deep one — a window 2.7x `CIQ_STALE_MAX`,
-#         which no cache bound describes. A re-read at the push site would close it; it is disclosed
-#         instead because the push runs in the AGENT's own shell and a second reading there has to
-#         answer what a refusal would do to work that is already done.
+#         LANE STARTS, and its agent pushes up to `FIX_TIMEOUT` (the `LANE_BACKSTOP_S` seam, 7200 s)
+#         later, so a lane can be allowed on a shallow queue and push into a deep one — a window 8x
+#         `CIQ_STALE_MAX` (agent-infra#2888 moved `FIX_TIMEOUT` up from 2400 s and widened it from
+#         2.7x), which no cache bound describes. A re-read at the push site would close it; it is
+#         disclosed instead because the push runs in the AGENT's own shell and a second reading there
+#         has to answer what a refusal would do to work that is already done.
 
 # `is_num` — the shared shape predicate (no leading zeros, exactly like spawn-gate.sh: a value that
 # reaches `$(( ))` must not be an invalid octal, and a non-number in a threshold makes `[ -gt ]`

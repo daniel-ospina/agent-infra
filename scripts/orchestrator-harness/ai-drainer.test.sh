@@ -734,6 +734,21 @@ SC_EOF
       && grep -q "active" <<<"$out"' "rc=$rc · $(printf "%s" "$out" | tail -1)"
   check "installer: the installed service carries an ExecStart" \
     'grep -q "^ExecStart=" "$T/units/eldato-ai-drainer.service"'
+  # ⛔ THE INSTALLED UNIT MUST NOT OUT-PIN THE SCRIPT (agent-infra#2888 review, P2). `Environment=` is a
+  # PIN the script never recomputes, so an installer that renders a LITERAL cancels ai-drainer.sh's own
+  # default on every box it touched: it shipped `${LANE_TIMEOUT:-3000}`, which beat the new
+  # `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` and kept drainer lanes wall-killed at 50 min — 300 s
+  # above the 2700 s progress allowance — with an operator's `LANE_BACKSTOP_S` invisible there. Blank is
+  # the convention the template already documents for MAX_LANES: derive it every tick. Asserted on the
+  # INSTALLED BYTES, because that is what systemd reads, not on the template.
+  check "installer: LANE_TIMEOUT is rendered BLANK, so ai-drainer.sh's own seam default applies every tick" \
+    'grep -qx "Environment=LANE_TIMEOUT=" "$T/units/eldato-ai-drainer.service"'
+  # …and the operator escape still works: an EXPLICIT value is a deliberate pin and must survive.
+  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T/units" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T/state" DRAINER_O="$T" LANE_TIMEOUT=5400 bash "$INSTALLER" 2>&1)"; rc=$?
+  check "installer: an EXPLICIT LANE_TIMEOUT is still pinned into the unit (an operator's deliberate choice)" \
+    '[ "$rc" -eq 0 ] && grep -qx "Environment=LANE_TIMEOUT=5400" "$T/units/eldato-ai-drainer.service"' \
+    "rc=$rc"
 else
   bad "installer missing at $INSTALLER"
 fi
