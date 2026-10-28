@@ -96,7 +96,7 @@
 #   2  REFUSING — a read a pass needs could not be taken (a miss is never "nothing to do")
 #   3  UNDELIVERED — legible work, NONE of it out: the work was placed and no worker took it, OR a
 #      durable refusal (a dirty worktree, an order the transport will not take) stopped it before
-#      delivery (agent-infra#2708). pr-doctor's own 3, kept verbatim: a monitor keyed on this pass
+#      delivery (agent-infra#2710). pr-doctor's own 3, kept verbatim: a monitor keyed on this pass
 #      must not read green over work nobody accepted
 #   6  DEFERRED — the machine said not now; the status row carries which measurement said so
 set -uo pipefail
@@ -131,7 +131,7 @@ STATUS="$STATE_DIR/pr-repair.status.json"
 EXIT_OK=0
 EXIT_REFUSING=2
 EXIT_UNDELIVERED=3   # legible work, NONE of it out -- no worker took the order that was placed, or a
-                     # durable refusal stopped it before delivery (#2708). pr-doctor's own 3, kept verbatim
+                     # durable refusal stopped it before delivery (#2710). pr-doctor's own 3, kept verbatim
 EXIT_DEFERRED=6
 
 log_line() { printf '[%s] pr-repair: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -383,7 +383,7 @@ one_pass() { # <dry-run:0|1>
     # queue nobody could read. The exit code carries the same verdict the row does.
     case "$rc_dispatch" in
         0) write_status dispatched "$cap" "$free_mb" "$load1" "${rc_reap:--}" "$rc_dispatch" "pass-complete"; return "$EXIT_OK" ;;
-        # ⚠️ THE TOKEN `no-worker-took-it` IS KEPT AND ITS CAUSE IS NOT (agent-infra#2708): rc=3 now
+        # ⚠️ THE TOKEN `no-worker-took-it` IS KEPT AND ITS CAUSE IS NOT (agent-infra#2710): rc=3 now
         # covers a durable refusal BEFORE delivery as well, so the token under-describes its own row.
         # It is not renamed here because it is a shipped monitor vocabulary (`pr-repair-loop.test.sh`
         # pins it) and renaming it mid-change would break a reader this lane cannot verify. The
