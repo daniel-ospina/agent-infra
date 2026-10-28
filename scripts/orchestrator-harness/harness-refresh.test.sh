@@ -2096,19 +2096,19 @@ case "$RQ" in *"after="*s*) ok "…and how long it took (after=<n>s)" ;;
   || bad "requested_at moved from '$AT1' to '$(req_of "$D/O" requested_at)' — the clock reset, so 'pending for days' is unreadable"
 stop_ctrl "$CTRL"
 
-# ⛔ S4: ONLY AN OUTSTANDING `pending` MAY BE HONOURED, AND NEVER A MOVE OUT OF A CLAIM. Without the
-# `prev_req = pending` guard, ANY prior record whose `running=` differs from the current one is certified
-# `honoured` — and a `refused`/`cleared` record's `running=` is a STAMP value, so an identity-SOURCE
-# change with the controller never restarted would be recorded as a restart that HAPPENED. That is the
-# one thing this record's own contract forbids ("Only the process moving can honour a request; a pin or
-# a stamp changing cannot"). Driven by planting a `refused` record whose `running=` is the OTHER commit,
-# then running a cycle in which the box really is current — the strongest possible bait.
+# ⛔ S4: ONLY AN OUTSTANDING `pending` MAY BE HONOURED. Without the `prev_req = pending` guard, ANY prior
+# record whose `running=` differs from the current one is certified `honoured` — so a `refused` record,
+# which is NOT an ask, would be closed out as a restart that HAPPENED.
+# ⛔ THE PRIOR MUST BE FACT-SOURCED (`running_from=self:`), NOT `stamp:`-SOURCED. The claim bound (S6)
+# clears a `stamp:` prior before this guard is ever consulted, so a `stamp:` fixture would let this case
+# stay GREEN with the guard deleted — measured: guard removed + `stamp:` fixture = 289 passed / 0 failed.
+# A `self:` prior isolates the `prev_req` bound, which is the only thing this case is here to witness.
 _CASE=$((_CASE+1)); echo "=== S4: a refused record is never certified honoured (only an outstanding pending can be) ==="
 D="$T/s4"; mkdir -p "$D/O/state" "$D/cellhome" "$D/pinroot"
 TREE2="$(mk_pin_tree "$D/pinroot" "$C2")"
 printf '{"commit": "%s"}\n' "$C2" > "$D/O/.agent-infra-stamp.json"
-printf 'restart request=refused reason=running-identity-unprovable requested_at=1700000000 refused_at=1700000060 requested_by=harness-refresh.sh@%s running=%s running_from=stamp:%s pin=%s pending=unprovable actuation=blocked blocked=identity actuator=none\n' \
-  "$(short "$C1")" "$(short "$C1")" "$(short "$C1")" "$(short "$C2")" > "$D/O/state/restart-request"
+printf 'restart request=refused reason=running-identity-unprovable requested_at=1700000000 refused_at=1700000060 requested_by=harness-refresh.sh@%s running=%s running_from=self:%s pin=%s pending=unprovable actuation=blocked blocked=identity actuator=none\n' \
+  "$(short "$C1")" "$(short "$C1")" "$D/O" "$(short "$C2")" > "$D/O/state/restart-request"
 CTRL="$(start_ctrl "$TREE2")"; printf '%s\n' "$CTRL" > "$D/O/.orch.lock"
 R4="$(cell_case "$D" "$C2" "$D/pinroot" "$TREE2" "$D/O")"
 stop_ctrl "$CTRL"
