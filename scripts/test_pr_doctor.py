@@ -2330,6 +2330,57 @@ def test_main_shows_a_refused_row_as_refused_in_status(monkeypatch, capsys):
     assert "kind=spawn" not in out, "a real dispatch must print exactly what it always did"
 
 
+def test_status_prints_the_whole_repo_qualified_worker_name(monkeypatch, capsys):
+    """⛔ THE OPERATOR'S VERB MUST NOT TRUNCATE THE IDENTITY (#2725 review, P2).
+
+    `_print_state()` formatted the worker into a hard `%-12s` column and sliced it with `[:12]`.
+    That was harmless while a name was `prd-<n>` (7 chars) and stopped being harmless the moment the
+    name carried the repo: `prd-daniel-ospina-agent-infra-5` printed as `prd-daniel-o`, which drops
+    the PR NUMBER -- the one component that says which PR the row is about -- and renders two repos
+    under one owner IDENTICALLY (`prd-daniel-o` for tortoise's #5 too). `--status` is the operator's
+    only window on this register, so a truncated identity there is the very mis-attribution this
+    change removes, printed by the verb that reports it.
+
+    The column is now as wide as the names in it; a floor of 12 keeps the historical alignment for
+    short names, so old output is unchanged.
+    """
+    a = "prd-daniel-ospina-agent-infra-5"
+    b = "prd-daniel-ospina-tortoise-5"
+    monkeypatch.setattr(pr, "load_state",
+                        lambda: {"5": {"action": "failing", "worker": a, "kind": "spawn",
+                                       "head": "a" * 40, "at": "2026-01-01T00:00:00Z",
+                                       "at_epoch": 0},
+                                 "6": {"action": "failing", "worker": b, "kind": "spawn",
+                                       "head": "b" * 40, "at": "2026-01-01T00:00:00Z",
+                                       "at_epoch": 0}})
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--status"])
+    assert pr.main() == 0
+    out = capsys.readouterr().out
+    # the WHOLE name, PR number included, for each row -- and the two must not read alike
+    assert ("worker=%s " % a) in out, "a repo-qualified worker name was truncated: %r" % (out,)
+    assert ("worker=%s " % b) in out, "a repo-qualified worker name was truncated: %r" % (out,)
+    assert "prd-daniel-o " not in out, "the worker name is still sliced to 12 chars: %r" % (out,)
+
+
+def test_status_output_for_short_names_is_unchanged(monkeypatch, capsys):
+    """⛔ AND THE FIX IS NOT A FORMAT CHANGE FOR EVERYONE (#2725 review).
+
+    The column width is `max(12, longest name)`, so a register of pre-rename `prd-<n>` rows prints
+    the same alignment it always did -- an operator's existing log greps and the reaper's habit of
+    reading this by eye must not be disturbed by a fix that only needed to stop truncating.
+    """
+    monkeypatch.setattr(pr, "load_state",
+                        lambda: {"7": {"action": "failing", "worker": "prd-7", "kind": "spawn",
+                                       "head": "a" * 40, "at": "2026-01-01T00:00:00Z",
+                                       "at_epoch": 0}})
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--status"])
+    assert pr.main() == 0
+    out = capsys.readouterr().out
+    line = [ln for ln in out.splitlines() if ln.startswith("7")][0]
+    assert line.startswith("7        failing     worker=prd-7        "), \
+        "historical alignment changed for a short name: %r" % (line,)
+
+
 def test_an_agents_own_output_cannot_forge_a_refusal(tmp_path, monkeypatch):
     """The worker log is shared with the AGENT. A `pi` that prints the marker and then exits 75
     must be read as "an agent ran and failed", not as a gate refusal -- otherwise its row is

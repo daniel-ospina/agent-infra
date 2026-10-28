@@ -4072,6 +4072,7 @@ def _print_state(path: str, label: str = "") -> None:
               "repo this invocation resolves to, or `--all-repos` for the whole set -- but only "
               "after a pass has graded this repo, which is when a register exists to read.")
         return
+    rows: list[tuple[str, dict]] = []
     if path == STATE:
         st = load_state()
         note = _status_age_note()
@@ -4086,12 +4087,25 @@ def _print_state(path: str, label: str = "") -> None:
     for k, v in sorted(st.items()):
         if k.startswith("_"):
             continue
+        rows.append((k, v))
+    # ⛔ THE WORKER COLUMN IS AS WIDE AS THE NAMES IN IT, NEVER A SLICE OF THEM (#2725 review).
+    # It was a hard `%-12s` with a `[:12]` slice, which was harmless while a name was `prd-<n>`
+    # (<=7 chars) and is not any more: `prd-daniel-ospina-agent-infra-5` renders as
+    # `prd-daniel-o`, which drops the PR NUMBER -- the one component that says WHICH PR the row is
+    # about -- and two repos under one owner render IDENTICALLY (`prd-daniel-o` for both).
+    # `--status` is the operator's only window on this register, so a truncated identity there is
+    # the same mis-attribution this whole change removes, printed by the verb that reports it.
+    # A floor of 12 keeps the historical alignment (and therefore the existing output) byte-for-byte
+    # for short names; past that the line simply grows, because a wrapped line is legible and a
+    # truncated identity is not.
+    width = max([12] + [len((v.get("worker") or v.get("lane") or "?")) for _k, v in rows])
+    for k, v in rows:
         # `kind` is shown only when it is NOT "spawn", so a real dispatch prints exactly what
         # it always did -- and a row that exists because the PR was REFUSED can no longer be
         # read as "a worker was dispatched for this".
         kind = v.get("kind") or "spawn"
-        print("%-8s %-11s worker=%-12s %s%s" % (k, v.get("action"),
-                                                (v.get("worker") or v.get("lane") or "?")[:12],
+        print("%-8s %-11s worker=%-*s %s%s" % (k, v.get("action"), width,
+                                                (v.get("worker") or v.get("lane") or "?"),
                                                 v.get("at"),
                                                 "" if kind == "spawn" else "  kind=" + kind))
 
