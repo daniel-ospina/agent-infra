@@ -1,0 +1,15 @@
+# FAILURE-CLASS FIXTURE (positive): a `run: |` body that CONTAINS the text `concurrency:` /
+# `cancel-in-progress: true`. A block scalar body is text, not keys — reading it as a job-level
+# `concurrency:` is a false red pointing at a change that does not exist in the file (round-2 P2).
+name: push-block-scalar
+on:
+  push:
+    branches: [main]
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "concurrency:"
+          echo "  group: not-a-real-key"
+          echo "  cancel-in-progress: true"
